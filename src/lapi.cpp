@@ -1365,7 +1365,7 @@ LUA_API void *lua_newuserdatauv (lua_State *L, size_t size, int nuvalue) {
 
 
 static const char *aux_upvalue (TValue *fi, int n, TValue **val,
-                                int*owner) {
+                                GCObject **owner) {
   switch (ttypetag(fi)) {
     case LUA_VCCL: {  /* C closure */
       CClosure *f = clCvalue(fi);
@@ -1408,7 +1408,7 @@ LUA_API const char *lua_getupvalue (lua_State *L, int funcindex, int n) {
 LUA_API const char *lua_setupvalue (lua_State *L, int funcindex, int n) {
   const char *name;
   TValue *val = NULL;  /* to avoid warnings */
-  int owner = NULL;  /* to avoid warnings */
+  GCObject *owner = NULL;  /* to avoid warnings */
   TValue *fi;
   lua_lock(L);
   fi = index2value(L, funcindex);

@@ -7,6 +7,11 @@
 #ifndef lopcodes_h
 #define lopcodes_h
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
 #include "llimits.h"
 #include "lobject.h"
 
@@ -435,5 +440,10 @@ LUAI_DDEC(const lu_byte luaP_opmodes[NUM_OPCODES];)
 LUAI_FUNC int luaP_isOT (Instruction i);
 LUAI_FUNC int luaP_isIT (Instruction i);
 
+
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

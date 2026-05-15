@@ -7,6 +7,11 @@
 #ifndef lstate_h
 #define lstate_h
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
 #include "lua.h"
 
 
@@ -446,6 +451,11 @@ LUAI_FUNC void luaE_warning (lua_State *L, const char *msg, int tocont);
 LUAI_FUNC void luaE_warnerror (lua_State *L, const char *where);
 LUAI_FUNC TStatus luaE_resetthread (lua_State *L, TStatus status);
 
+
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
 

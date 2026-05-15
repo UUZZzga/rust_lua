@@ -7,6 +7,11 @@
 #ifndef llex_h
 #define llex_h
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
 #include <limits.h>
 
 #include "lobject.h"
@@ -89,5 +94,10 @@ LUAI_FUNC int luaX_lookahead (LexState *ls);
 LUAI_FUNC l_noret luaX_syntaxerror (LexState *ls, const char *s);
 LUAI_FUNC const char *luaX_token2str (LexState *ls, int token);
 
+
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

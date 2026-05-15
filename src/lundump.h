@@ -7,6 +7,11 @@
 #ifndef lundump_h
 #define lundump_h
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
 #include <limits.h>
 
 #include "llimits.h"
@@ -36,5 +41,10 @@ LUAI_FUNC LClosure* luaU_undump (lua_State* L, ZIO* Z, const char* name,
 /* dump one chunk; from ldump.c */
 LUAI_FUNC int luaU_dump (lua_State* L, const Proto* f, lua_Writer w,
                          void* data, int strip);
+
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

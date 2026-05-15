@@ -7,6 +7,11 @@
 #ifndef ltable_h
 #define ltable_h
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
 #include "lobject.h"
 
 
@@ -180,5 +185,10 @@ LUAI_FUNC lua_Unsigned luaH_getn (lua_State *L, Table *t);
 LUAI_FUNC Node *luaH_mainposition (const Table *t, const TValue *key);
 #endif
 
+
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

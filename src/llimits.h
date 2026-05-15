@@ -7,6 +7,11 @@
 #ifndef llimits_h
 #define llimits_h
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
 
 #include <limits.h>
 #include <stddef.h>
@@ -352,6 +357,11 @@ typedef unsigned long l_uint32;
 #endif
 
 /* }================================================================== */
+
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
 

@@ -7,6 +7,11 @@
 #ifndef lvm_h
 #define lvm_h
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
 
 #include "ldo.h"
 #include "lobject.h"
@@ -132,5 +137,10 @@ LUAI_FUNC lua_Integer luaV_mod (lua_State *L, lua_Integer x, lua_Integer y);
 LUAI_FUNC lua_Number luaV_modf (lua_State *L, lua_Number x, lua_Number y);
 LUAI_FUNC lua_Integer luaV_shiftl (lua_Integer x, lua_Integer y);
 LUAI_FUNC void luaV_objlen (lua_State *L, StkId ra, const TValue *rb);
+
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

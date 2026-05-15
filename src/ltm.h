@@ -7,6 +7,11 @@
 #ifndef ltm_h
 #define ltm_h
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
 
 #include "lobject.h"
 
@@ -101,5 +106,10 @@ LUAI_FUNC void luaT_getvararg (CallInfo *ci, StkId ra, TValue *rc);
 LUAI_FUNC void luaT_getvarargs (lua_State *L, struct CallInfo *ci, StkId where,
                                               int wanted, int vatab);
 
+
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

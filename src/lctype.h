@@ -7,6 +7,11 @@
 #ifndef lctype_h
 #define lctype_h
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+
 #include "lua.h"
 
 
@@ -96,6 +101,11 @@ LUAI_DDEC(const lu_byte luai_ctype_[UCHAR_MAX + 2];)
 #define ltolower(c)	(tolower(c))
 
 #endif			/* } */
+
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
 
