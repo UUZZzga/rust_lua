@@ -61,12 +61,12 @@ target_compile_options(lualib PRIVATE ${LUA_COMPILE_OPTIONS})
 target_link_libraries(lualib PUBLIC m)
 
 if(UNIX AND NOT APPLE)
-    target_compile_definitions(lualib PRIVATE LUA_USE_LINUX)
+    target_compile_definitions(lualib PUBLIC LUA_USE_LINUX)
     target_link_libraries(lualib PUBLIC ${CMAKE_DL_LIBS})
 endif()
 
 if(APPLE)
-    target_compile_definitions(lualib PRIVATE LUA_USE_MACOSX)
+    target_compile_definitions(lualib PUBLIC LUA_USE_MACOSX)
 endif()
 
 set_source_files_properties(
@@ -81,6 +81,7 @@ endif()
 add_executable(lua src/lua.cpp)
 target_link_libraries(lua lualib)
 target_compile_options(lua PRIVATE ${LUA_COMPILE_OPTIONS})
+set_target_properties(lua PROPERTIES ENABLE_EXPORTS TRUE)
 
 add_executable(luac src/luac.cpp)
 target_link_libraries(luac lualib)
