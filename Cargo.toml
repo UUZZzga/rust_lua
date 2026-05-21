@@ -1,0 +1,20 @@
+[package]
+name = "lua-rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "lua_rs"
+path = "src_rs/lib.rs"
+crate-type = ["rlib", "staticlib"]
+
+[features]
+ffi = []
+
+[dependencies]
+libc = "0.2"
+arc-swap = "1"
+hashbrown = "0.15"
+
+[build-dependencies]
+cc = "1.0"

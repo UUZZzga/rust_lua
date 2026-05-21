@@ -1,1 +1,14 @@
-/build
+.cache
+build
+target
+
+# Rust/Cargo
+Cargo.lock
+**/*.rs.bk
+
+# IDE
+/.idea/
+/.vscode/
+/*.swp
+/*.swo
+/tests/libs/*.so
