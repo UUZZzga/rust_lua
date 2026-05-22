@@ -49,5 +49,5 @@ pub mod gc;
 pub mod mem;
 
 // FFI 接口，用于与 C/C++ 代码交互
-#[cfg(feature = "ffi")]
-pub mod ffi;
+// C Lua API FFI 声明（lua.h / lauxlib.h）
+pub mod lua_ffi;

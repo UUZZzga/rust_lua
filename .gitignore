@@ -11,4 +11,4 @@ Cargo.lock
 /.vscode/
 /*.swp
 /*.swo
-/tests/libs/*.so
+/tests_lua/libs/*.so

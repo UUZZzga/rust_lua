@@ -8,6 +8,14 @@ name = "lua_rs"
 path = "src_rs/lib.rs"
 crate-type = ["rlib", "staticlib"]
 
+[[bin]]
+name = "lua"
+path = "src_rs/main.rs"
+
+[[test]]
+name = "integration_tests"
+path = "tests_rs/integration_tests.rs"
+
 [features]
 ffi = []
 

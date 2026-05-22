@@ -30,13 +30,9 @@ use std::rc::Rc;
 // 虚拟机主解释器循环 (原 lvm.cpp 中的 luaV_execute)
 // ============================================================================
 
-/// 通过 `#[path]` 引用同目录下的 execute.rs，保持代码独立不迁移。
-#[path = "execute.rs"]
-pub mod execute;
-
-pub use execute::VmExecutor;
-pub use execute::VmResult;
-pub use execute::VmError;
+pub use crate::execute::VmExecutor;
+pub use crate::execute::VmResult;
+pub use crate::execute::VmError;
 pub use crate::state::VmState;
 
 // ============================================================================
