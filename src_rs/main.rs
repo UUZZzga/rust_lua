@@ -44,7 +44,7 @@ fn writeline() {
 
 fn print_version() {
     writestring(concat!(
-        "Lua 5.5.0  Copyright (C) 1994-2025 Lua.org, PUC-Rio [Rust Edition]\n"
+        "Lua 5.5.0  Copyright (C) 1994-2025 Lua.org, PUC-Rio\n"
     ));
 }
 
@@ -91,7 +91,7 @@ impl Interpreter {
         1
     }
 
-    fn report(l: *mut lua_State, status: c_int) -> c_int {
+    fn report(l: *mut lua_State, status: c_int, progname: &str) -> c_int {
         if status != LUA_OK {
             let msg_ptr = unsafe { lua_tolstring(l, -1, ptr::null_mut()) };
             let msg = if msg_ptr.is_null() {
@@ -100,7 +100,7 @@ impl Interpreter {
                 unsafe { CStr::from_ptr(msg_ptr).to_str().unwrap_or("(error)") }
             };
             let mut stderr = io::stderr().lock();
-            let _ = write!(stderr, "{}: {}\n", LUA_PROGNAME, msg);
+            let _ = write!(stderr, "{}: {}\n", progname, msg);
             unsafe { lua_pop(l, 1) };
         }
         status
@@ -125,7 +125,7 @@ impl Interpreter {
         } else {
             status
         };
-        Self::report(self.l, status)
+        Self::report(self.l, status, &self.progname)
     }
 
     unsafe fn dostring(&mut self, s: &str, name: &str) -> c_int {
@@ -168,7 +168,7 @@ impl Interpreter {
             let c_global = CString::new(global_name).unwrap();
             lua_setglobal(self.l, c_global.as_ptr());
         }
-        Self::report(self.l, status)
+        Self::report(self.l, status, &self.progname)
     }
 
     unsafe fn handle_luainit(&mut self) -> c_int {
@@ -253,13 +253,13 @@ impl Interpreter {
         if status == LUA_OK {
             if lua_getglobal(self.l, c"arg".as_ptr()) != LUA_TTABLE {
                 lua_pushstring(self.l, c"'arg' is not a table".as_ptr());
-                return Self::report(self.l, LUA_ERRRUN);
+                return Self::report(self.l, LUA_ERRRUN, &self.progname);
             }
             let n = self.push_args();
             let call_status = self.docall(n, LUA_MULTRET);
-            Self::report(self.l, call_status)
+            Self::report(self.l, call_status, &self.progname)
         } else {
-            Self::report(self.l, status)
+            Self::report(self.l, status, &self.progname)
         }
     }
 
@@ -312,9 +312,31 @@ impl Interpreter {
         false
     }
 
+    unsafe fn get_prompt(&mut self, firstline: bool) -> String {
+        let global_name = if firstline { "_PROMPT" } else { "_PROMPT2" };
+        let c_name = CString::new(global_name).unwrap();
+        if lua_getglobal(self.l, c_name.as_ptr()) == LUA_TNIL {
+            (if firstline { LUA_PROMPT } else { LUA_PROMPT2 }).to_string()
+        } else {
+            let p = luaL_tolstring(self.l, -1, ptr::null_mut());
+            let result = if p.is_null() {
+                (if firstline { LUA_PROMPT } else { LUA_PROMPT2 }).to_string()
+            } else {
+                CStr::from_ptr(p)
+                    .to_str()
+                    .unwrap_or(if firstline { LUA_PROMPT } else { LUA_PROMPT2 })
+                    .to_string()
+            };
+            lua_rotate(self.l, -2, -1);
+            lua_pop(self.l, 1);
+            result
+        }
+    }
+
     unsafe fn pushline(&mut self, firstline: bool) -> bool {
-        let prompt = if firstline { LUA_PROMPT } else { LUA_PROMPT2 };
-        match Self::readline(prompt) {
+        let prompt = self.get_prompt(firstline);
+        lua_pop(self.l, 1);
+        match Self::readline(&prompt) {
             None => false,
             Some(line) => {
                 let c_line = CString::new(line.as_str()).unwrap();
@@ -437,7 +459,7 @@ impl Interpreter {
             if status == LUA_OK {
                 self.l_print();
             } else {
-                Self::report(self.l, status);
+                Self::report(self.l, status, &self.progname);
             }
         }
         lua_settop(self.l, 0);
@@ -567,6 +589,13 @@ impl Interpreter {
                 .collect()
         };
 
+        if !argv_cstrings.is_empty() {
+            ip.progname = argv_cstrings[0]
+                .to_str()
+                .unwrap_or(LUA_PROGNAME)
+                .to_string();
+        }
+
         let mut script: isize = 0;
         let args = Self::collect_args(&argv_cstrings, &mut script);
         let optlim = if script > 0 {
@@ -647,7 +676,7 @@ impl Interpreter {
 
         let status = lua_pcall(self.l, 2, 1, 0);
         let result = lua_toboolean(self.l, -1);
-        Self::report(self.l, status);
+        Self::report(self.l, status, &self.progname);
         GLOBAL_L.store(ptr::null_mut(), Ordering::SeqCst);
         result != 0 && status == LUA_OK
     }
@@ -668,9 +697,10 @@ impl Drop for Interpreter {
 // ============================================================================
 
 unsafe extern "C" fn lstop(_l: *mut lua_State, _ar: *mut c_void) {
-    let msg = c"interrupted!";
-    luaL_error(_l, msg.as_ptr());
-}
+        lua_sethook(_l, None, 0, 0);
+        let msg = c"interrupted!";
+        luaL_error(_l, msg.as_ptr());
+    }
 
 unsafe extern "C" fn laction(_sig: c_int) {
     let flag = LUA_MASKCALL | LUA_MASKRET | LUA_MASKLINE | LUA_MASKCOUNT;

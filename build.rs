@@ -18,6 +18,7 @@ fn main() {
         .flag("-Wextra")
         .flag("-Wno-unused-parameter")
         .define("LUA_USE_LINUX", None)
+        .define("LUA_USE_LONGJMP", None)
         .define("LUA_COMPAT_5_3", None);
 
     let is_debug = env::var("PROFILE").unwrap() == "debug";
