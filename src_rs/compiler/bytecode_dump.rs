@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use crate::lua_ffi;
-use std::ffi::{c_int, c_void, CString};
+use std::ffi::{c_int, c_void};
 use std::ptr;
 
 #[derive(Debug, Clone)]
@@ -268,7 +268,7 @@ pub fn parse_dump(data: Vec<u8>) -> Result<DumpedFunction, String> {
     Ok(func)
 }
 
-pub unsafe fn compile_with_c_lua(source: &str) -> Result<Vec<u8>, String> {
+pub unsafe fn compile_with_c_lua(source: &[u8]) -> Result<Vec<u8>, String> {
     let L = lua_ffi::luaL_newstate();
     if L.is_null() {
         return Err("failed to create lua state".to_string());
@@ -276,14 +276,11 @@ pub unsafe fn compile_with_c_lua(source: &str) -> Result<Vec<u8>, String> {
     lua_ffi::luaL_checkversion(L);
     lua_ffi::luaL_openselectedlibs(L, 0, 0);
 
-    let c_source = CString::new(source).map_err(|e| format!("{}", e))?;
-    let c_name = CString::new("=test").map_err(|e| format!("{}", e))?;
-
     let load_result = lua_ffi::luaL_loadbufferx(
         L,
-        c_source.as_ptr(),
+        source.as_ptr() as *const i8,
         source.len(),
-        c_name.as_ptr(),
+        c"=test".as_ptr(),
         ptr::null(),
     );
 

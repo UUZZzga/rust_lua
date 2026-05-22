@@ -46,22 +46,32 @@ pub struct LuaVM {
 }
 
 impl LuaVM {
+    /// 对应 C 的 lua_newstate → stack_init: 分配栈空间，填充函数入口 nil
     pub fn new() -> Self {
+        let mut stack = Vec::with_capacity(crate::state::BASIC_STACK_SIZE + crate::state::EXTRA_STACK);
+        stack.push(crate::objects::TValue::Nil(crate::objects::NilKind::Strict));
         LuaVM {
-            stack: Vec::with_capacity(20),
+            stack,
             gc: Rc::new(GCState::default_incremental()),
         }
     }
 
     pub fn with_gc(gc: Rc<GCState>) -> Self {
+        let mut stack = Vec::with_capacity(crate::state::BASIC_STACK_SIZE + crate::state::EXTRA_STACK);
+        stack.push(crate::objects::TValue::Nil(crate::objects::NilKind::Strict));
         LuaVM {
-            stack: Vec::with_capacity(20),
+            stack,
             gc,
         }
     }
 
-    /// 执行一段 Lua 字节码
+    /// 执行一段 Lua 字节码 (顶层主函数)
+    /// base=0: stack[0] 兼作函数入口和寄存器 0
     pub fn execute(&mut self, proto: &crate::objects::Proto) -> Result<VmResult, VmError> {
+        // 确保函数入口槽存在
+        if self.stack.is_empty() {
+            self.stack.push(crate::objects::TValue::Nil(crate::objects::NilKind::Strict));
+        }
         VmExecutor::execute(proto, 0, std::mem::take(&mut self.stack), self.gc.clone())
     }
 }

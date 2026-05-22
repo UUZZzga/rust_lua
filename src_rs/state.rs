@@ -10,7 +10,12 @@ const EOFMARK: &str = "<eof>";
 pub const ERR_RUN: i32 = 2;
 pub const ERR_SYNTAX: i32 = 3;
 pub const MULT_RET: i32 = -1;
-pub const MIN_STACK: usize = 20;
+
+pub const LUA_MINSTACK: usize = 20;
+pub const BASIC_STACK_SIZE: usize = 2 * LUA_MINSTACK;
+pub const EXTRA_STACK: usize = 5;
+
+pub const MIN_STACK: usize = LUA_MINSTACK;
 
 // ============================================================================
 // LuaState — 合并 VmState + LuaState 的所有字段
@@ -49,6 +54,11 @@ pub struct LuaState {
 
 impl LuaState {
     /// 创建一个空的高层状态（用于 main.rs 的独立解释器）
+    ///
+    /// 对应 C 源码: lua_newstate → stack_init + resetCI
+    /// stack_init: 分配 BASIC_STACK_SIZE + EXTRA_STACK 个槽位，全部初始化为 nil
+    /// resetCI: ci->func = stack[0], ci->top = stack[0] + 1 + LUA_MINSTACK
+    /// L->top = stack + 1  (函数入口槽在位索引 0)
     pub fn new() -> Self {
         let gc = Rc::new(GCState::default_incremental());
         let mut registry = Table::new();
@@ -57,6 +67,12 @@ impl LuaState {
             TValue::Integer(2),
             TValue::Table(globals.clone()),
         );
+
+        // 对应 stack_init: 预分配栈空间容量 = BASIC_STACK_SIZE + EXTRA_STACK
+        // 对应 L->top = stack + 1: 函数入口 nil 在位索引 0
+        let mut stack = Vec::with_capacity(BASIC_STACK_SIZE + EXTRA_STACK);
+        stack.push(TValue::Nil(NilKind::Strict));
+
         LuaState {
             constants: Vec::new(),
             code: Vec::new(),
@@ -72,7 +88,7 @@ impl LuaState {
             tbc_list: None,
             twups_linked: false,
             is_in_twups: false,
-            stack: Vec::with_capacity(MIN_STACK),
+            stack,
             gc,
             globals,
             registry,
@@ -81,7 +97,16 @@ impl LuaState {
     }
 
     /// 从 Proto 构建执行上下文（原 VmState::new）
-    pub fn from_proto(proto: &Proto, base: usize, stack: Vec<TValue>, gc: Rc<GCState>) -> Self {
+    ///
+    /// 函数帧布局: stack[base-1] = 函数入口, stack[base+0..base+N] = 寄存器/参数
+    /// 当 base=0 时，stack[0] 兼作函数入口和寄存器 0（主函数场景）
+    pub fn from_proto(proto: &Proto, base: usize, mut stack: Vec<TValue>, gc: Rc<GCState>) -> Self {
+        // 防御: 当 base > 0 时确保函数入口槽 stack[base-1] 存在
+        if base > 0 {
+            while stack.len() < base {
+                stack.push(TValue::Nil(NilKind::Strict));
+            }
+        }
         LuaState {
             constants: proto.constants.clone(),
             code: proto.code.clone(),
@@ -572,8 +597,15 @@ impl LuaState {
             TValue::LClosure(closure) => {
                 let args_start = func_idx + 1;
                 let args_end = total;
-                let mut exec_stack: Vec<TValue> = self.stack[args_start..args_end].to_vec();
-                
+                let nargs_actual = args_end.saturating_sub(args_start);
+
+                // 对应 C 的 luaD_precall → 函数帧布局:
+                // stack[0] = 函数入口 nil (ci->func)
+                // stack[1..1+nargs] = 参数 (ci->u.l.base = ci->func + 1)
+                let mut exec_stack: Vec<TValue> = Vec::with_capacity(1 + nargs_actual + MIN_STACK);
+                exec_stack.push(TValue::Nil(NilKind::Strict));
+                exec_stack.extend_from_slice(&self.stack[args_start..args_end]);
+
                 let upval_val = UpVal::Closed {
                     value: Box::new(TValue::Table(self.globals.clone())),
                 };
@@ -581,7 +613,7 @@ impl LuaState {
 
                 let mut exec_state = LuaState::from_proto(
                     &closure.proto,
-                    exec_stack.len(),
+                    1,
                     exec_stack,
                     self.gc.clone(),
                 );

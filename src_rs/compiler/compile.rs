@@ -686,43 +686,60 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             let r = fs.expr_to_reg(&ec);
             fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_CONCAT + 1);
-            let r2 = fs.expr_to_reg(&e2.exp);
-            fs.code_abc(OpCode::CONCAT, r, r, r2);
+            let _r2 = fs.expr_to_reg(&e2.exp);
+            fs.code_abc(OpCode::CONCAT, r, 2, 0);
             e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r) };
             matched = true;
         }
         
         if limit <= PREC_ADD && check_addop(fs) {
             let ec = e.exp.clone();
-            let r = fs.expr_to_reg(&ec);
             let is_add = check(fs, &Token::Plus);
             fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_ADD + 1);
-            let r2 = fs.expr_to_reg(&e2.exp);
             match (&ec.kind, &e2.exp.kind) {
                 (ExpKind::Int, ExpKind::Int) => {
+                    let val = if is_add { ec.info + e2.exp.info } else { ec.info - e2.exp.info };
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
+                }
+                (ExpKind::Int, _) => {
+                    let r = fs.expr_to_reg(&ec);
+                    let r2 = fs.expr_to_reg(&e2.exp);
                     fs.code_abc(if is_add { OpCode::ADDI } else { OpCode::SUBK }, r, r2, ec.info as i32);
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r) };
                 }
                 _ => {
+                    let r = fs.expr_to_reg(&ec);
+                    let r2 = fs.expr_to_reg(&e2.exp);
                     let op = if is_add { OpCode::ADD } else { OpCode::SUB };
                     fs.code_abc(op, r, r, r2);
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r) };
                 }
             }
-            e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r) };
             matched = true;
         }
         
         if limit <= PREC_MUL && check_mulop(fs) {
             let ec = e.exp.clone();
-            let r = fs.expr_to_reg(&ec);
             let is_mul = check(fs, &Token::Star);
             let is_div = check(fs, &Token::Slash);
             fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_MUL + 1);
-            let r2 = fs.expr_to_reg(&e2.exp);
-            let op = if is_mul { OpCode::MUL } else if is_div { OpCode::DIV } else { OpCode::MOD };
-            fs.code_abc(op, r, r, r2);
-            e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r) };
+            match (&ec.kind, &e2.exp.kind) {
+                (ExpKind::Int, ExpKind::Int) => {
+                    let val = if is_mul { ec.info * e2.exp.info }
+                        else if is_div { ec.info / e2.exp.info }
+                        else { ec.info % e2.exp.info };
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
+                }
+                _ => {
+                    let r = fs.expr_to_reg(&ec);
+                    let r2 = fs.expr_to_reg(&e2.exp);
+                    let op = if is_mul { OpCode::MUL } else if is_div { OpCode::DIV } else { OpCode::MOD };
+                    fs.code_abc(op, r, r, r2);
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r) };
+                }
+            }
             matched = true;
         }
         
@@ -1001,7 +1018,7 @@ fn parse_local(fs: &mut FuncState) {
 fn parse_return(fs: &mut FuncState) {
     fs.ls_mut().next();
     if block_follow(fs, true) || check(fs, &Token::Semi) {
-        fs.return_stat_gen(0, 0);
+        fs.return_stat_gen(fs.nvarstack(), 0);
         if check(fs, &Token::Semi) { fs.ls_mut().next(); }
         return;
     }
@@ -1011,8 +1028,8 @@ fn parse_return(fs: &mut FuncState) {
     
     if check(fs, &Token::Comma) {
         fs.ls_mut().next();
-        let n = 1 + parse_expr_list(fs);
-        fs.return_stat_gen(r, LUA_MULTRET);
+        let nret = 1 + parse_expr_list(fs);
+        fs.return_stat_gen(r, nret);
     } else {
         fs.return_stat_gen(r, 1);
     }
