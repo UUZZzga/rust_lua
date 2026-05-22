@@ -239,14 +239,20 @@ impl LuaState {
         self.stack.truncate(new_len);
     }
 
+    /// 对应 C 的 lua_absindex:
+    ///   return (idx > 0 || is_pseudo(idx)) ? idx : cast_int(L->top - L->ci->func) + idx + 1
+    /// 其中 L->top - L->ci->func 等价于 stack.len()（函数帧内有效元素数）
     pub fn abs_index(&self, idx: isize) -> usize {
         let len = self.stack.len() as isize;
-        if idx >= 0 {
+        if idx > 0 {
             idx as usize
-        } else if len + idx >= 0 {
-            (len + idx) as usize
         } else {
-            0
+            let abs = len + idx + 1;
+            if abs > 0 {
+                abs as usize
+            } else {
+                0
+            }
         }
     }
 
