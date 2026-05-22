@@ -580,12 +580,29 @@ pub enum UpVal {
     Open {
         /// 栈上位置索引
         stack_index: usize,
+        /// 链表中的下一个上值索引
+        next: Option<usize>,
+        /// 链表中的上一个上值索引
+        previous: Option<usize>,
     },
     /// 关闭的上值（持有值的副本）
     Closed {
         /// 存储的值
         value: Box<TValue>,
     },
+}
+
+impl UpVal {
+    pub fn is_open(&self) -> bool {
+        matches!(self, UpVal::Open { .. })
+    }
+
+    pub fn level(&self) -> Option<usize> {
+        match self {
+            UpVal::Open { stack_index, .. } => Some(*stack_index),
+            UpVal::Closed { .. } => None,
+        }
+    }
 }
 
 // ============================================================================
@@ -2004,11 +2021,18 @@ mod tests {
 
     #[test]
     fn test_upval_open() {
-        let uv = UpVal::Open { stack_index: 3 };
+        let uv = UpVal::Open { stack_index: 3, next: None, previous: None };
         match uv {
-            UpVal::Open { stack_index } => assert_eq!(stack_index, 3),
+            UpVal::Open { stack_index, .. } => assert_eq!(stack_index, 3),
             _ => panic!("expected Open"),
         }
+    }
+
+    #[test]
+    fn test_upval_open_is_open() {
+        let uv = UpVal::Open { stack_index: 3, next: None, previous: None };
+        assert!(uv.is_open());
+        assert_eq!(uv.level(), Some(3));
     }
 
     #[test]
@@ -2018,6 +2042,13 @@ mod tests {
             UpVal::Closed { value } => assert_eq!(*value, TValue::Integer(42)),
             _ => panic!("expected Closed"),
         }
+    }
+
+    #[test]
+    fn test_upval_closed_not_open() {
+        let uv = UpVal::Closed { value: Box::new(TValue::Integer(42)) };
+        assert!(!uv.is_open());
+        assert_eq!(uv.level(), None);
     }
 
     // ========================================================================

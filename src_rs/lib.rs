@@ -21,8 +21,17 @@ pub mod parser;
 // Lua 对象和值的表示
 pub mod objects;
 
+// 解释器状态
+pub mod state;
+
 // 虚拟机核心 (lvm.h/lvm.cpp — 转换、比较、算术、表访问、解释器循环)
 pub mod vm;
+
+// 虚拟机执行器 (lvm.cpp — 指令分发、运算实现)
+pub mod execute;
+
+// 函数/闭包管理 (lfunc.h/lfunc.cpp — 原型、闭包、上值)
+pub mod func;
 
 // 字符串处理
 pub mod strings;

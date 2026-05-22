@@ -12,49 +12,17 @@
 //! ## 规约驱动开发 (spec-driven-tdd)
 //! 每个公开函数都包含规约注释。
 
-use crate::objects::{Instruction, LClosure, NilKind, Proto, TValue, UpVal, UpvalDesc};
+use crate::objects::{Instruction, LClosure, NilKind, Proto, TValue, UpVal};
 use crate::opcodes::{self, OpCode};
 use crate::table::Table;
 use crate::tm::{
     TagMethod, TagMethodError,
-    try_bin_tm, try_bin_assoc_tm,
+    try_bin_tm, try_bin_assoc_tm, DefaultMetatables,
 };
-
-// ============================================================================
-// VmState: 解释器状态
-// ============================================================================
-
-pub struct VmState {
-    pub constants: Vec<TValue>,
-    pub code: Vec<Instruction>,
-    pub upval_descs: Vec<UpvalDesc>,
-    pub protos: Vec<Proto>,
-    pub base: usize,
-    pub pc: usize,
-    pub stack: Vec<TValue>,
-    pub trap: bool,
-    pub num_params: u8,
-    pub is_vararg: bool,
-    pub closure_upvals: Vec<UpVal>,
-}
-
-impl VmState {
-    pub fn new(proto: &Proto, base: usize, stack: Vec<TValue>) -> Self {
-        VmState {
-            constants: proto.constants.clone(),
-            code: proto.code.clone(),
-            upval_descs: proto.upvalues.clone(),
-            protos: proto.protos.clone(),
-            base,
-            pc: 0,
-            stack,
-            trap: false,
-            num_params: proto.num_params,
-            is_vararg: proto.is_vararg(),
-            closure_upvals: Vec::new(),
-        }
-    }
-}
+use crate::vm::{to_number_ns, to_integer_ns, F2IMode, shiftl, is_false, objlen,
+    concat_stack, equal, less_than, less_equal, raw_equal, float_to_integer,
+    modulus, modulus_float, idiv};
+use crate::state::VmState;
 
 // ============================================================================
 // VmResult / VmError
@@ -343,7 +311,7 @@ impl VmExecutor {
         if b < state.closure_upvals.len() {
             let val = match &state.closure_upvals[b] {
                 UpVal::Closed { value } => (**value).clone(),
-                UpVal::Open { stack_index } => {
+                UpVal::Open { stack_index, next: _, previous: _ } => {
                     state.stack.get(*stack_index).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
                 }
             };
@@ -360,7 +328,7 @@ impl VmExecutor {
         if b < state.closure_upvals.len() {
             match &mut state.closure_upvals[b] {
                 UpVal::Closed { value } => **value = val,
-                UpVal::Open { stack_index } => {
+                UpVal::Open { stack_index, next: _, previous: _ } => {
                     if *stack_index < state.stack.len() {
                         state.stack[*stack_index] = val;
                     }
@@ -379,7 +347,7 @@ impl VmExecutor {
         let upval_val = if b < state.closure_upvals.len() {
             match &state.closure_upvals[b] {
                 UpVal::Closed { value } => (**value).clone(),
-                UpVal::Open { stack_index } => state.stack.get(*stack_index).cloned().unwrap_or(TValue::Nil(NilKind::Strict)),
+                UpVal::Open { stack_index, .. } => state.stack.get(*stack_index).cloned().unwrap_or(TValue::Nil(NilKind::Strict)),
             }
         } else {
             TValue::Nil(NilKind::Strict)
@@ -435,7 +403,7 @@ impl VmExecutor {
         let upval_val = if a < state.closure_upvals.len() {
             match &state.closure_upvals[a] {
                 UpVal::Closed { value } => (**value).clone(),
-                UpVal::Open { stack_index } => state.stack.get(*stack_index).cloned().unwrap_or(TValue::Nil(NilKind::Strict)),
+                UpVal::Open { stack_index, .. } => state.stack.get(*stack_index).cloned().unwrap_or(TValue::Nil(NilKind::Strict)),
             }
         } else {
             TValue::Nil(NilKind::Strict)
@@ -578,7 +546,7 @@ impl VmExecutor {
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
         let v1 = Self::read_stack(state, b);
-        if let (Some(n1), Some(n2)) = (super::to_number_ns(v1), super::to_number_ns(&v2)) {
+        if let (Some(n1), Some(n2)) = (to_number_ns(v1), to_number_ns(&v2)) {
             Self::write_stack(state, a, TValue::Float(n1.powf(n2)));
         }
         state.pc += 1;
@@ -591,7 +559,7 @@ impl VmExecutor {
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
         let v1 = Self::read_stack(state, b);
-        if let (Some(n1), Some(n2)) = (super::to_number_ns(v1), super::to_number_ns(&v2)) {
+        if let (Some(n1), Some(n2)) = (to_number_ns(v1), to_number_ns(&v2)) {
             Self::write_stack(state, a, TValue::Float(n1 / n2));
         }
         state.pc += 1;
@@ -616,7 +584,7 @@ impl VmExecutor {
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
         let v1 = Self::read_stack(state, b);
-        if let (Some(i1), TValue::Integer(i2)) = (super::to_integer_ns(v1, super::F2IMode::Eq), &v2) {
+        if let (Some(i1), TValue::Integer(i2)) = (to_integer_ns(v1, F2IMode::Eq), &v2) {
             Self::write_stack(state, a, TValue::Integer(i1 & i2));
         }
         state.pc += 1;
@@ -629,7 +597,7 @@ impl VmExecutor {
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
         let v1 = Self::read_stack(state, b);
-        if let (Some(i1), TValue::Integer(i2)) = (super::to_integer_ns(v1, super::F2IMode::Eq), &v2) {
+        if let (Some(i1), TValue::Integer(i2)) = (to_integer_ns(v1, F2IMode::Eq), &v2) {
             Self::write_stack(state, a, TValue::Integer(i1 | i2));
         }
         state.pc += 1;
@@ -642,7 +610,7 @@ impl VmExecutor {
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
         let v1 = Self::read_stack(state, b);
-        if let (Some(i1), TValue::Integer(i2)) = (super::to_integer_ns(v1, super::F2IMode::Eq), &v2) {
+        if let (Some(i1), TValue::Integer(i2)) = (to_integer_ns(v1, F2IMode::Eq), &v2) {
             Self::write_stack(state, a, TValue::Integer(i1 ^ i2));
         }
         state.pc += 1;
@@ -654,8 +622,8 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let ic = opcodes::getarg_c(inst) as i64;
         let v = Self::read_stack(state, b);
-        if let Some(ib) = super::to_integer_ns(v, super::F2IMode::Eq) {
-            Self::write_stack(state, a, TValue::Integer(super::shiftl(ic, ib)));
+        if let Some(ib) = to_integer_ns(v, F2IMode::Eq) {
+            Self::write_stack(state, a, TValue::Integer(shiftl(ic, ib)));
         }
         state.pc += 1;
         Ok(())
@@ -666,8 +634,8 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let ic = opcodes::getarg_c(inst) as i64;
         let v = Self::read_stack(state, b);
-        if let Some(ib) = super::to_integer_ns(v, super::F2IMode::Eq) {
-            Self::write_stack(state, a, TValue::Integer(super::shiftl(ib, -ic)));
+        if let Some(ib) = to_integer_ns(v, F2IMode::Eq) {
+            Self::write_stack(state, a, TValue::Integer(shiftl(ib, -ic)));
         }
         state.pc += 1;
         Ok(())
@@ -727,7 +695,7 @@ impl VmExecutor {
         let c = Self::rc(state, inst);
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
-        if let (Some(n1), Some(n2)) = (super::to_number_ns(v1), super::to_number_ns(v2)) {
+        if let (Some(n1), Some(n2)) = (to_number_ns(v1), to_number_ns(v2)) {
             Self::write_stack(state, a, TValue::Float(n1.powf(n2)));
         }
         state.pc += 1;
@@ -740,7 +708,7 @@ impl VmExecutor {
         let c = Self::rc(state, inst);
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
-        if let (Some(n1), Some(n2)) = (super::to_number_ns(v1), super::to_number_ns(v2)) {
+        if let (Some(n1), Some(n2)) = (to_number_ns(v1), to_number_ns(v2)) {
             Self::write_stack(state, a, TValue::Float(n1 / n2));
         }
         state.pc += 1;
@@ -766,8 +734,8 @@ impl VmExecutor {
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if let (Some(i1), Some(i2)) = (
-            super::to_integer_ns(v1, super::F2IMode::Eq),
-            super::to_integer_ns(v2, super::F2IMode::Eq),
+            to_integer_ns(v1, F2IMode::Eq),
+            to_integer_ns(v2, F2IMode::Eq),
         ) {
             Self::write_stack(state, a, TValue::Integer(i1 & i2));
         }
@@ -782,8 +750,8 @@ impl VmExecutor {
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if let (Some(i1), Some(i2)) = (
-            super::to_integer_ns(v1, super::F2IMode::Eq),
-            super::to_integer_ns(v2, super::F2IMode::Eq),
+            to_integer_ns(v1, F2IMode::Eq),
+            to_integer_ns(v2, F2IMode::Eq),
         ) {
             Self::write_stack(state, a, TValue::Integer(i1 | i2));
         }
@@ -798,8 +766,8 @@ impl VmExecutor {
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if let (Some(i1), Some(i2)) = (
-            super::to_integer_ns(v1, super::F2IMode::Eq),
-            super::to_integer_ns(v2, super::F2IMode::Eq),
+            to_integer_ns(v1, F2IMode::Eq),
+            to_integer_ns(v2, F2IMode::Eq),
         ) {
             Self::write_stack(state, a, TValue::Integer(i1 ^ i2));
         }
@@ -814,10 +782,10 @@ impl VmExecutor {
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if let (Some(i1), Some(i2)) = (
-            super::to_integer_ns(v1, super::F2IMode::Eq),
-            super::to_integer_ns(v2, super::F2IMode::Eq),
+            to_integer_ns(v1, F2IMode::Eq),
+            to_integer_ns(v2, F2IMode::Eq),
         ) {
-            Self::write_stack(state, a, TValue::Integer(super::shiftl(i1, i2)));
+            Self::write_stack(state, a, TValue::Integer(shiftl(i1, i2)));
         }
         state.pc += 1;
         Ok(())
@@ -830,10 +798,10 @@ impl VmExecutor {
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if let (Some(i1), Some(i2)) = (
-            super::to_integer_ns(v1, super::F2IMode::Eq),
-            super::to_integer_ns(v2, super::F2IMode::Eq),
+            to_integer_ns(v1, F2IMode::Eq),
+            to_integer_ns(v2, F2IMode::Eq),
         ) {
-            Self::write_stack(state, a, TValue::Integer(super::shiftl(i1, -i2)));
+            Self::write_stack(state, a, TValue::Integer(shiftl(i1, -i2)));
         }
         state.pc += 1;
         Ok(())
@@ -850,7 +818,7 @@ impl VmExecutor {
         let p2 = Self::read_stack(state, b);
         let tm_idx = opcodes::getarg_c(inst) as u8;
         if let Some(tm) = TagMethod::from_u8(tm_idx) {
-            let dmt = super::DefaultMetatables::new();
+            let dmt = DefaultMetatables::new();
             let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
                 Err(TagMethodError::NoMetamethod(tm))
             };
@@ -876,7 +844,7 @@ impl VmExecutor {
         let flip = opcodes::testarg_k(inst);
         let tm_idx = opcodes::getarg_c(inst) as u8;
         if let Some(tm) = TagMethod::from_u8(tm_idx) {
-            let dmt = super::DefaultMetatables::new();
+            let dmt = DefaultMetatables::new();
             let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
                 Err(TagMethodError::NoMetamethod(tm))
             };
@@ -904,7 +872,7 @@ impl VmExecutor {
         let flip = opcodes::testarg_k(inst);
         let tm_idx = opcodes::getarg_c(inst) as u8;
         if let Some(tm) = TagMethod::from_u8(tm_idx) {
-            let dmt = super::DefaultMetatables::new();
+            let dmt = DefaultMetatables::new();
             let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
                 Err(TagMethodError::NoMetamethod(tm))
             };
@@ -925,7 +893,7 @@ impl VmExecutor {
             TValue::Integer(i) => Self::write_stack(state, a, TValue::Integer(i.wrapping_neg())),
             TValue::Float(f) => Self::write_stack(state, a, TValue::Float(-f)),
             _ => {
-                let dmt = super::DefaultMetatables::new();
+                let dmt = DefaultMetatables::new();
                 match try_bin_tm(v, v, TagMethod::Unm, &dmt, &mut |_f, _args| {
                     Err(crate::tm::TagMethodError::NoMetamethod(TagMethod::Unm))
                 }) {
@@ -942,10 +910,10 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v = Self::read_stack(state, b);
-        if let Some(i) = super::to_integer_ns(v, super::F2IMode::Eq) {
+        if let Some(i) = to_integer_ns(v, F2IMode::Eq) {
             Self::write_stack(state, a, TValue::Integer(!i));
         } else {
-            let dmt = super::DefaultMetatables::new();
+            let dmt = DefaultMetatables::new();
             match try_bin_tm(v, v, TagMethod::BNot, &dmt, &mut |_f, _args| {
                 Err(crate::tm::TagMethodError::NoMetamethod(TagMethod::BNot))
             }) {
@@ -961,7 +929,7 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v = Self::read_stack(state, b);
-        let result = if super::is_false(v) { TValue::Boolean(true) } else { TValue::Boolean(false) };
+        let result = if is_false(v) { TValue::Boolean(true) } else { TValue::Boolean(false) };
         Self::write_stack(state, a, result);
         state.pc += 1;
         Ok(())
@@ -971,11 +939,11 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v = Self::read_stack(state, b);
-        let dmt = super::DefaultMetatables::new();
+        let dmt = DefaultMetatables::new();
         let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
             Err(TagMethodError::NoMetamethod(TagMethod::Len))
         };
-        let result = match super::objlen(v, Some(&dmt), Some(&mut call_fn)) {
+        let result = match objlen(v, Some(&dmt), Some(&mut call_fn)) {
             Ok(Some(val)) => val,
             Ok(None) => TValue::Integer(0),
             Err(_) => TValue::Integer(0),
@@ -992,8 +960,8 @@ impl VmExecutor {
         for i in 0..n {
             vals.push(Self::read_stack(state, a + i).clone());
         }
-        let dmt = super::DefaultMetatables::new();
-        match super::concat_stack(&mut vals, n, &dmt) {
+        let dmt = DefaultMetatables::new();
+        match concat_stack(&mut vals, n, &dmt) {
             Ok(()) => {
                 let result = vals.into_iter().next()
                     .unwrap_or(TValue::Str(crate::strings::LuaString::Short(
@@ -1013,13 +981,15 @@ impl VmExecutor {
     }
 
     fn op_close(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
-        let _a = Self::ra(state, inst);
+        let a = Self::ra(state, inst);
+        crate::func::close(state, a, 0, 1);
         state.pc += 1;
         Ok(())
     }
 
     fn op_tbc(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
-        let _a = Self::ra(state, inst);
+        let a = Self::ra(state, inst);
+        crate::func::new_tbc_upval(state, a);
         state.pc += 1;
         Ok(())
     }
@@ -1037,11 +1007,11 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let v1 = Self::read_stack(state, a);
         let v2 = Self::read_stack(state, b);
-        let dmt = super::DefaultMetatables::new();
+        let dmt = DefaultMetatables::new();
         let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
             Err(TagMethodError::NoMetamethod(TagMethod::Eq))
         };
-        let cond = match super::equal(v1, v2, Some(&dmt), Some(&mut call_fn)) {
+        let cond = match equal(v1, v2, Some(&dmt), Some(&mut call_fn)) {
             Ok(b) => b,
             Err(_) => false,
         };
@@ -1055,11 +1025,11 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let v1 = Self::read_stack(state, a);
         let v2 = Self::read_stack(state, b);
-        let dmt = super::DefaultMetatables::new();
+        let dmt = DefaultMetatables::new();
         let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
             Err(TagMethodError::NoMetamethod(TagMethod::Lt))
         };
-        let cond = match super::less_than(v1, v2, Some(&dmt), Some(&mut call_fn)) {
+        let cond = match less_than(v1, v2, Some(&dmt), Some(&mut call_fn)) {
             Ok(b) => b,
             Err(_) => false,
         };
@@ -1073,11 +1043,11 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let v1 = Self::read_stack(state, a);
         let v2 = Self::read_stack(state, b);
-        let dmt = super::DefaultMetatables::new();
+        let dmt = DefaultMetatables::new();
         let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
             Err(TagMethodError::NoMetamethod(TagMethod::Le))
         };
-        let cond = match super::less_equal(v1, v2, Some(&dmt), Some(&mut call_fn)) {
+        let cond = match less_equal(v1, v2, Some(&dmt), Some(&mut call_fn)) {
             Ok(b) => b,
             Err(_) => false,
         };
@@ -1091,7 +1061,7 @@ impl VmExecutor {
         let b_key = opcodes::getarg_b(inst) as usize;
         let v1 = Self::read_stack(state, a);
         let v2 = state.constants.get(b_key).unwrap();
-        let cond = super::raw_equal(v1, v2);
+        let cond = raw_equal(v1, v2);
         Self::do_conditional_jump(state, inst, cond);
         state.pc += 1;
         Ok(())
@@ -1170,7 +1140,7 @@ impl VmExecutor {
     fn op_test(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let v = Self::read_stack(state, a);
-        let cond = !super::is_false(v);
+        let cond = !is_false(v);
         // For TEST, the expected condition is reversed: jump if is_false(v) XOR expected
         let take_jump = cond;
         if !take_jump {
@@ -1189,7 +1159,7 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v = Self::read_stack(state, b).clone();
-        let cond = !super::is_false(&v);
+        let cond = !is_false(&v);
         let expected = opcodes::testarg_k(inst);
         if cond == expected {
             Self::write_stack(state, a, v);
@@ -1319,9 +1289,9 @@ impl VmExecutor {
                     TValue::Integer(i) => *i,
                     TValue::Float(f) => {
                         if *step_i < 0 {
-                            super::float_to_integer(*f, super::F2IMode::Ceil).unwrap_or(*init_i)
+                            float_to_integer(*f, F2IMode::Ceil).unwrap_or(*init_i)
                         } else {
-                            super::float_to_integer(*f, super::F2IMode::Floor).unwrap_or(*init_i)
+                            float_to_integer(*f, F2IMode::Floor).unwrap_or(*init_i)
                         }
                     }
                     _ => { state.pc += 1; return Ok(()); }
@@ -1445,7 +1415,7 @@ impl VmExecutor {
         let bx = opcodes::getarg_sbx(inst) as usize;
         if bx < state.protos.len() {
             let proto = state.protos[bx].clone();
-            let closure = LClosure { proto, upvals: state.closure_upvals.clone() };
+            let closure = LClosure { proto, upvals: Vec::new() };
             Self::write_stack(state, ra, TValue::LClosure(closure));
         }
         state.pc += 1;
@@ -1522,7 +1492,7 @@ impl VmExecutor {
         match (v1, v2) {
             (TValue::Integer(i1), TValue::Integer(i2)) => TValue::Integer(int_op(*i1, *i2)),
             _ => {
-                if let (Some(n1), Some(n2)) = (super::to_number_ns(v1), super::to_number_ns(v2)) {
+                if let (Some(n1), Some(n2)) = (to_number_ns(v1), to_number_ns(v2)) {
                     TValue::Float(float_op(n1, n2))
                 } else {
                     TValue::Nil(NilKind::Strict)
@@ -1534,12 +1504,12 @@ impl VmExecutor {
     fn arith_mod(v1: &TValue, v2: &TValue) -> Result<TValue, VmError> {
         match (v1, v2) {
             (TValue::Integer(i1), TValue::Integer(i2)) => {
-                let r = super::modulus(*i1, *i2).map_err(|_| VmError::ModuloByZero)?;
+                let r = modulus(*i1, *i2).map_err(|_| VmError::ModuloByZero)?;
                 Ok(TValue::Integer(r))
             }
             _ => {
-                if let (Some(n1), Some(n2)) = (super::to_number_ns(v1), super::to_number_ns(v2)) {
-                    Ok(TValue::Float(super::modulus_float(n1, n2)))
+                if let (Some(n1), Some(n2)) = (to_number_ns(v1), to_number_ns(v2)) {
+                    Ok(TValue::Float(modulus_float(n1, n2)))
                 } else {
                     Ok(TValue::Nil(NilKind::Strict))
                 }
@@ -1550,11 +1520,11 @@ impl VmExecutor {
     fn arith_idiv(v1: &TValue, v2: &TValue) -> Result<TValue, VmError> {
         match (v1, v2) {
             (TValue::Integer(i1), TValue::Integer(i2)) => {
-                let r = super::idiv(*i1, *i2).map_err(|_| VmError::DivisionByZero)?;
+                let r = idiv(*i1, *i2).map_err(|_| VmError::DivisionByZero)?;
                 Ok(TValue::Integer(r))
             }
             _ => {
-                if let (Some(n1), Some(n2)) = (super::to_number_ns(v1), super::to_number_ns(v2)) {
+                if let (Some(n1), Some(n2)) = (to_number_ns(v1), to_number_ns(v2)) {
                     Ok(TValue::Float((n1 / n2).floor()))
                 } else {
                     Ok(TValue::Nil(NilKind::Strict))
@@ -1735,21 +1705,21 @@ mod tests {
 
     #[test]
     fn test_format_float() {
-        assert_eq!(super::format_float(f64::NAN), "nan");
-        assert_eq!(super::format_float(f64::INFINITY), "inf");
-        assert_eq!(super::format_float(f64::NEG_INFINITY), "-inf");
+        assert_eq!(format_float(f64::NAN), "nan");
+        assert_eq!(format_float(f64::INFINITY), "inf");
+        assert_eq!(format_float(f64::NEG_INFINITY), "-inf");
     }
 
     #[test]
     fn test_format_float_zero() {
-        assert_eq!(super::format_float(0.0), "0.0");
-        assert_eq!(super::format_float(-0.0), "0.0");
+        assert_eq!(format_float(0.0), "0.0");
+        assert_eq!(format_float(-0.0), "0.0");
     }
 
     #[test]
     fn test_format_float_normal() {
-        assert_eq!(super::format_float(42.0), "42.0");
-        assert_eq!(super::format_float(3.5), "3.5");
+        assert_eq!(format_float(42.0), "42.0");
+        assert_eq!(format_float(3.5), "3.5");
     }
 
     // ========================================================================

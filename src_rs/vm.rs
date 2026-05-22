@@ -35,7 +35,7 @@ pub mod execute;
 pub use execute::VmExecutor;
 pub use execute::VmResult;
 pub use execute::VmError;
-pub use execute::VmState;
+pub use crate::state::VmState;
 
 // ============================================================================
 // LuaVM — 集成层
@@ -1267,7 +1267,11 @@ pub fn push_closure(
         if i < proto.upvalues.len() && proto.upvalues[i].in_stack {
             let idx = _base + proto.upvalues[i].idx as usize;
             if idx < stack.len() {
-                upvals.push(crate::objects::UpVal::Open { stack_index: idx });
+                upvals.push(crate::objects::UpVal::Open {
+                    stack_index: idx,
+                    next: None,
+                    previous: None,
+                });
             } else {
                 upvals.push(crate::objects::UpVal::Closed {
                     value: Box::new(TValue::Nil(crate::objects::NilKind::Strict)),
