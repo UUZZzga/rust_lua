@@ -33,54 +33,8 @@ use std::rc::Rc;
 pub use crate::execute::VmExecutor;
 pub use crate::execute::VmResult;
 pub use crate::execute::VmError;
+// LuaState 已合并 LuaVM，统一在 state.rs 中管理
 pub use crate::state::LuaState;
-
-// ============================================================================
-// LuaVM — 集成层
-// ============================================================================
-
-/// Lua 虚拟机 — 集成 lvm 核心操作 + execute 解释器循环
-pub struct LuaVM {
-    pub stack: Vec<crate::objects::TValue>,
-    pub gc: Rc<GCState>,
-}
-
-impl LuaVM {
-    /// 对应 C 的 lua_newstate → stack_init: 分配栈空间，填充函数入口 nil
-    pub fn new() -> Self {
-        let mut stack = Vec::with_capacity(crate::state::BASIC_STACK_SIZE + crate::state::EXTRA_STACK);
-        stack.push(crate::objects::TValue::Nil(crate::objects::NilKind::Strict));
-        LuaVM {
-            stack,
-            gc: Rc::new(GCState::default_incremental()),
-        }
-    }
-
-    pub fn with_gc(gc: Rc<GCState>) -> Self {
-        let mut stack = Vec::with_capacity(crate::state::BASIC_STACK_SIZE + crate::state::EXTRA_STACK);
-        stack.push(crate::objects::TValue::Nil(crate::objects::NilKind::Strict));
-        LuaVM {
-            stack,
-            gc,
-        }
-    }
-
-    /// 执行一段 Lua 字节码 (顶层主函数)
-    /// base=0: stack[0] 兼作函数入口和寄存器 0
-    pub fn execute(&mut self, proto: &crate::objects::Proto) -> Result<VmResult, VmError> {
-        // 确保函数入口槽存在
-        if self.stack.is_empty() {
-            self.stack.push(crate::objects::TValue::Nil(crate::objects::NilKind::Strict));
-        }
-        VmExecutor::execute(proto, 0, std::mem::take(&mut self.stack), self.gc.clone())
-    }
-}
-
-impl Default for LuaVM {
-    fn default() -> Self {
-        Self::new()
-    }
-}
 
 // ============================================================================
 // F2IMode: 浮点数到整数的转换模式
@@ -1378,20 +1332,21 @@ mod tests {
     }
 
     // ========================================================================
-    // LuaVM 集成测试
+    // LuaState 集成测试 (合并后 LuaVM 已纳入 LuaState)
     // ========================================================================
 
     #[test]
-    fn test_lua_vm_integration() {
-        let vm = LuaVM::new();
-        assert_eq!(vm.stack.len(), 0);
-        assert_eq!(vm.stack.capacity(), 20);
+    fn test_lua_state_new_stack_init() {
+        let l = LuaState::new();
+        // 对应 C 的 stack_init: top = stack + 1, stacksize = BASIC_STACK_SIZE + EXTRA_STACK
+        assert_eq!(l.gettop(), 1, "stack must have function entry slot");
+        assert_eq!(l.stack.capacity(), crate::state::BASIC_STACK_SIZE + crate::state::EXTRA_STACK);
     }
 
     #[test]
-    fn test_lua_vm_default() {
-        let vm = LuaVM::default();
-        assert_eq!(vm.stack.capacity(), 20);
+    fn test_lua_state_default_stack_init() {
+        let l = LuaState::default();
+        assert_eq!(l.gettop(), 1, "Default must also init stack");
     }
 
     #[test]

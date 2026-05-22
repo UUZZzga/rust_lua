@@ -2,7 +2,7 @@ use crate::objects::{Instruction, LClosure, LuaType, NilKind, Proto, TValue, UpV
 use crate::strings::{LuaString, StringTable};
 use crate::table::Table;
 use crate::gc::{GCObjectHeader, GCState};
-use crate::execute::{VmExecutor, VmResult};
+use crate::execute::{VmExecutor, VmResult, VmError};
 use std::rc::Rc;
 
 const EOFMARK: &str = "<eof>";
@@ -53,12 +53,14 @@ pub struct LuaState {
 // ============================================================================
 
 impl LuaState {
-    /// 创建一个空的高层状态（用于 main.rs 的独立解释器）
+    /// 对应 C 的 lua_newstate → stack_init + resetCI
     ///
-    /// 对应 C 源码: lua_newstate → stack_init + resetCI
-    /// stack_init: 分配 BASIC_STACK_SIZE + EXTRA_STACK 个槽位，全部初始化为 nil
+    /// stack_init: 预分配 BASIC_STACK_SIZE + EXTRA_STACK 个槽位容量
+    /// L->stack_last = stack + BASIC_STACK_SIZE
     /// resetCI: ci->func = stack[0], ci->top = stack[0] + 1 + LUA_MINSTACK
-    /// L->top = stack + 1  (函数入口槽在位索引 0)
+    /// L->top = stack + 1  (函数入口 nil 在位索引 0)
+    ///
+    /// 验证: gettop() 必须返回 1（函数入口槽）
     pub fn new() -> Self {
         let gc = Rc::new(GCState::default_incremental());
         let mut registry = Table::new();
@@ -68,10 +70,7 @@ impl LuaState {
             TValue::Table(globals.clone()),
         );
 
-        // 对应 stack_init: 预分配栈空间容量 = BASIC_STACK_SIZE + EXTRA_STACK
-        // 对应 L->top = stack + 1: 函数入口 nil 在位索引 0
-        let mut stack = Vec::with_capacity(BASIC_STACK_SIZE + EXTRA_STACK);
-        stack.push(TValue::Nil(NilKind::Strict));
+        let mut stack = Self::init_stack();
 
         LuaState {
             constants: Vec::new(),
@@ -94,6 +93,58 @@ impl LuaState {
             registry,
             string_table: StringTable::new(),
         }
+    }
+
+    /// 初始化栈: 对应 C 的 stack_init
+    /// 分配 BASIC_STACK_SIZE + EXTRA_STACK 容量，推入函数入口 nil
+    /// stack[0] = nil (函数入口, ci->func)
+    /// top = stack + 1 (1 个元素在用)
+    fn init_stack() -> Vec<TValue> {
+        let mut stack = Vec::with_capacity(BASIC_STACK_SIZE + EXTRA_STACK);
+        stack.push(TValue::Nil(NilKind::Strict));
+        stack
+    }
+
+    /// 使用已有的 GCState 创建 LuaState
+    pub fn with_gc(gc: Rc<GCState>) -> Self {
+        let mut registry = Table::new();
+        let globals = Table::new();
+        registry.set(
+            TValue::Integer(2),
+            TValue::Table(globals.clone()),
+        );
+
+        let mut state = LuaState {
+            constants: Vec::new(),
+            code: Vec::new(),
+            upval_descs: Vec::new(),
+            protos: Vec::new(),
+            base: 0,
+            pc: 0,
+            trap: false,
+            num_params: 0,
+            is_vararg: false,
+            closure_upvals: Vec::new(),
+            open_upval: None,
+            tbc_list: None,
+            twups_linked: false,
+            is_in_twups: false,
+            stack: Self::init_stack(),
+            gc,
+            globals,
+            registry,
+            string_table: StringTable::new(),
+        };
+        state
+    }
+
+    /// 执行 Lua 字节码 (顶层主函数)
+    /// base=0: stack[0] 兼作函数入口和寄存器 0
+    pub fn execute(&mut self, proto: &Proto) -> Result<VmResult, VmError> {
+        if self.stack.is_empty() {
+            self.stack.push(TValue::Nil(NilKind::Strict));
+        }
+        VmExecutor::execute(proto, 0, std::mem::take(&mut self.stack), self.gc.clone())
     }
 
     /// 从 Proto 构建执行上下文（原 VmState::new）
@@ -128,6 +179,12 @@ impl LuaState {
             registry: Table::new(),
             string_table: StringTable::new(),
         }
+    }
+}
+
+impl Default for LuaState {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -713,5 +770,81 @@ impl LuaState {
 
     pub fn intern(&self, s: &str) -> LuaString {
         str_to_ls(&self.string_table, s)
+    }
+}
+
+// ============================================================================
+// 测试
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_stack_init_matches_cpp() {
+        // 验证 stack_init: 参考 lstate.cpp L158-169
+        let state = LuaState::new();
+        // L->top = stack + 1 → gettop() 必须返回 1
+        assert_eq!(state.gettop(), 1, "stack length must be 1 (function entry slot)");
+        // stack[0] 必须是函数入口 nil
+        assert!(matches!(state.stack[0], TValue::Nil(NilKind::Strict)));
+        // 容量 = BASIC_STACK_SIZE + EXTRA_STACK
+        assert_eq!(state.stack.capacity(), BASIC_STACK_SIZE + EXTRA_STACK);
+    }
+
+    #[test]
+    fn test_stack_init_from_proto() {
+        // 验证 from_proto 的栈初始化: base > 0 时必须保证函数入口槽
+        let proto = Proto {
+            num_params: 0, flag: 0, max_stack_size: 10,
+            size_upvalues: 0, size_k: 0, size_code: 0, size_line_info: 0,
+            size_p: 0, size_loc_vars: 0, size_abs_line_info: 0,
+            line_defined: 0, last_line_defined: 0,
+            constants: vec![],
+            code: vec![],
+            protos: vec![],
+            upvalues: vec![],
+            line_info: vec![],
+            abs_line_info: vec![],
+            loc_vars: vec![],
+            source: None,
+        };
+        let gc = Rc::new(GCState::default_incremental());
+
+        // case 1: base=0, empty stack → main function scenario
+        let state = LuaState::from_proto(&proto, 0, vec![], gc.clone());
+        assert_eq!(state.base, 0);
+        assert_eq!(state.stack.len(), 0, "base=0 allows empty stack (function entry IS register 0)");
+
+        // case 2: base=1, empty stack → called function scenario
+        let state = LuaState::from_proto(&proto, 1, vec![], gc.clone());
+        assert_eq!(state.base, 1);
+        assert!(state.stack.len() >= 1, "base>0 must have stack[base-1] = stack[0] as function entry");
+        assert!(matches!(state.stack[0], TValue::Nil(NilKind::Strict)));
+
+        // case 3: base=1, stack with args → called function
+        let state = LuaState::from_proto(&proto, 1, vec![
+            TValue::Nil(NilKind::Strict),
+            TValue::Integer(42),
+        ], gc.clone());
+        assert_eq!(state.base, 1);
+        assert_eq!(state.stack.len(), 2);
+        assert!(matches!(state.stack[0], TValue::Nil(NilKind::Strict)));
+        assert_eq!(state.stack[1], TValue::Integer(42));
+    }
+
+    #[test]
+    fn test_stack_init_with_gc() {
+        let gc = Rc::new(GCState::default_incremental());
+        let state = LuaState::with_gc(gc);
+        assert_eq!(state.gettop(), 1, "with_gc must also init stack");
+        assert_eq!(state.stack.capacity(), BASIC_STACK_SIZE + EXTRA_STACK);
+    }
+
+    #[test]
+    fn test_stack_init_default() {
+        let state = LuaState::default();
+        assert_eq!(state.gettop(), 1, "Default must init stack via new()");
     }
 }
