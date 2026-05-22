@@ -1,4 +1,6 @@
 use crate::objects::{Proto, TValue, UpVal, UpvalDesc, Instruction};
+use crate::gc::GCState;
+use std::rc::Rc;
 
 pub struct VmState {
     pub constants: Vec<TValue>,
@@ -16,10 +18,11 @@ pub struct VmState {
     pub tbc_list: Option<usize>,
     pub twups_linked: bool,
     pub is_in_twups: bool,
+    pub gc: Rc<GCState>,
 }
 
 impl VmState {
-    pub fn new(proto: &Proto, base: usize, stack: Vec<TValue>) -> Self {
+    pub fn new(proto: &Proto, base: usize, stack: Vec<TValue>, gc: Rc<GCState>) -> Self {
         VmState {
             constants: proto.constants.clone(),
             code: proto.code.clone(),
@@ -36,6 +39,7 @@ impl VmState {
             tbc_list: None,
             twups_linked: false,
             is_in_twups: false,
+            gc,
         }
     }
 }

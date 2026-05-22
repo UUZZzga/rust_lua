@@ -8,6 +8,7 @@
 //! - `LuaTable` 封装为未来元方法支持预留接口
 
 use crate::objects::{NilKind, TValue};
+use crate::gc::GCObjectHeader;
 
 pub use crate::objects::Table;
 
@@ -18,6 +19,7 @@ pub use crate::objects::Table;
 impl Table {
     pub fn new() -> Self {
         Table {
+            gc_header: GCObjectHeader::new(),
             array: Vec::new(),
             hash: hashbrown::HashMap::new(),
             metatable: None,
@@ -27,6 +29,7 @@ impl Table {
 
     pub fn with_capacity(narray: usize, nhash: usize) -> Self {
         Table {
+            gc_header: GCObjectHeader::new(),
             array: (0..narray).map(|_| TValue::Nil(NilKind::Empty)).collect(),
             hash: hashbrown::HashMap::with_capacity(nhash),
             metatable: None,

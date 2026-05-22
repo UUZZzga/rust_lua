@@ -23,6 +23,8 @@ use crate::tm::{
     TagMethod, TagMethodError, DefaultMetatables,
     get_tm_by_obj, obj_type_name,
 };
+use crate::gc::GCState;
+use std::rc::Rc;
 
 // ============================================================================
 // 虚拟机主解释器循环 (原 lvm.cpp 中的 luaV_execute)
@@ -44,18 +46,27 @@ pub use crate::state::VmState;
 /// Lua 虚拟机 — 集成 lvm 核心操作 + execute 解释器循环
 pub struct LuaVM {
     pub stack: Vec<crate::objects::TValue>,
+    pub gc: Rc<GCState>,
 }
 
 impl LuaVM {
     pub fn new() -> Self {
         LuaVM {
             stack: Vec::with_capacity(20),
+            gc: Rc::new(GCState::default_incremental()),
+        }
+    }
+
+    pub fn with_gc(gc: Rc<GCState>) -> Self {
+        LuaVM {
+            stack: Vec::with_capacity(20),
+            gc,
         }
     }
 
     /// 执行一段 Lua 字节码
     pub fn execute(&mut self, proto: &crate::objects::Proto) -> Result<VmResult, VmError> {
-        VmExecutor::execute(proto, 0, std::mem::take(&mut self.stack))
+        VmExecutor::execute(proto, 0, std::mem::take(&mut self.stack), self.gc.clone())
     }
 }
 
@@ -1259,6 +1270,7 @@ pub fn push_closure(
     _enc_upvals: &[crate::objects::UpVal],
     _base: usize,
     ra: usize,
+    gc: &GCState,
 ) {
     let nup = proto.size_upvalues as usize;
     let mut upvals = Vec::with_capacity(nup);
@@ -1286,15 +1298,48 @@ pub fn push_closure(
         }
     }
 
+    let closure_id = gc.register_object(std::mem::size_of::<crate::objects::LClosure>());
     let closure = crate::objects::LClosure {
+        gc_header: crate::gc::GCObjectHeader::new(),
         proto: proto.clone(),
         upvals,
     };
+    closure.gc_header.set_id(closure_id);
+
+    // GC barrier (luaC_objbarrier): for each upvalue, if closure is black
+    // and upvalue value is a white GC object, make it gray
+    for uv in &closure.upvals {
+        match uv {
+            crate::objects::UpVal::Closed { value } => {
+                if let Some(val_gc_id) = gc_id_of_tvalue(value) {
+                    gc.obj_barrier(closure_id, val_gc_id);
+                }
+            }
+            crate::objects::UpVal::Open { stack_index, .. } => {
+                if *stack_index < stack.len() {
+                    let val = &stack[*stack_index];
+                    if let Some(val_gc_id) = gc_id_of_tvalue(val) {
+                        gc.obj_barrier(closure_id, val_gc_id);
+                    }
+                }
+            }
+        }
+    }
+
     if ra < stack.len() {
         stack[ra] = TValue::LClosure(closure);
     } else {
         stack.resize(ra + 1, TValue::Nil(crate::objects::NilKind::Strict));
         stack[ra] = TValue::LClosure(closure);
+    }
+}
+
+/// 从 TValue 中提取 GCObjectId（如果值是 GC 对象）
+pub fn gc_id_of_tvalue(val: &TValue) -> Option<crate::gc::GCObjectId> {
+    match val {
+        TValue::Table(t) => t.gc_header.id(),
+        TValue::LClosure(c) => c.gc_header.id(),
+        _ => None,
     }
 }
 
@@ -1320,6 +1365,11 @@ mod tests {
     use super::*;
     use crate::objects::{NilKind, Proto, LClosure, Instruction, UpVal, UpvalDesc};
     use crate::strings::{LuaString, StringTable};
+    use std::rc::Rc;
+
+    fn make_gc() -> Rc<crate::gc::GCState> {
+        Rc::new(crate::gc::GCState::default_incremental())
+    }
 
     // ========================================================================
     // LuaVM 集成测试
@@ -2438,7 +2488,7 @@ mod tests {
             source: None,
         };
         let mut stack = vec![TValue::Nil(NilKind::Strict); 5];
-        push_closure(&mut stack, &proto, &[], 0, 0);
+        push_closure(&mut stack, &proto, &[], 0, 0, &make_gc());
         match &stack[0] {
             TValue::LClosure(_) => {}
             _ => panic!("Expected LClosure"),
@@ -2468,7 +2518,7 @@ mod tests {
             loc_vars: vec![],
             source: None,
         };
-        push_closure(&mut stack, &proto, &[], 0, 3);
+        push_closure(&mut stack, &proto, &[], 0, 3, &make_gc());
         match &stack[3] {
             TValue::LClosure(c) => {
                 assert_eq!(c.upvals.len(), 1);

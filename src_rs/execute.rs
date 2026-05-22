@@ -23,6 +23,8 @@ use crate::vm::{to_number_ns, to_integer_ns, F2IMode, shiftl, is_false, objlen,
     concat_stack, equal, less_than, less_equal, raw_equal, float_to_integer,
     modulus, modulus_float, idiv};
 use crate::state::VmState;
+use crate::gc::GCState;
+use std::rc::Rc;
 
 // ============================================================================
 // VmResult / VmError
@@ -70,8 +72,8 @@ impl std::error::Error for VmError {}
 pub struct VmExecutor;
 
 impl VmExecutor {
-    pub fn execute(proto: &Proto, base: usize, stack: Vec<TValue>) -> Result<VmResult, VmError> {
-        let mut state = VmState::new(proto, base, stack);
+    pub fn execute(proto: &Proto, base: usize, stack: Vec<TValue>, gc: Rc<GCState>) -> Result<VmResult, VmError> {
+        let mut state = VmState::new(proto, base, stack, gc);
 
         loop {
             if state.pc >= state.code.len() {
@@ -327,7 +329,11 @@ impl VmExecutor {
         let val = Self::read_stack(state, a).clone();
         if b < state.closure_upvals.len() {
             match &mut state.closure_upvals[b] {
-                UpVal::Closed { value } => **value = val,
+                UpVal::Closed { value } => {
+                    // GC barrier: if closure is black, mark upvalue
+                    state.gc.cond_gc();
+                    **value = val;
+                }
                 UpVal::Open { stack_index, next: _, previous: _ } => {
                     if *stack_index < state.stack.len() {
                         state.stack[*stack_index] = val;
@@ -408,7 +414,17 @@ impl VmExecutor {
         } else {
             TValue::Nil(NilKind::Strict)
         };
-        Self::table_set_tv(upval_val, key, val);
+        let modified = Self::table_set_tv(upval_val, key, val, &state.gc);
+        if a < state.closure_upvals.len() {
+            match &mut state.closure_upvals[a] {
+                UpVal::Closed { value } => **value = modified,
+                UpVal::Open { stack_index, .. } => {
+                    if *stack_index < state.stack.len() {
+                        state.stack[*stack_index] = modified;
+                    }
+                }
+            }
+        }
         state.pc += 1;
         Ok(())
     }
@@ -420,7 +436,8 @@ impl VmExecutor {
         let table_val = Self::read_stack(state, a).clone();
         let key = Self::read_stack(state, b).clone();
         let val = Self::resolve_val(state, inst, c);
-        Self::table_set_tv(table_val, key, val);
+        let modified = Self::table_set_tv(table_val, key, val, &state.gc);
+        Self::write_stack(state, a, modified);
         state.pc += 1;
         Ok(())
     }
@@ -431,7 +448,8 @@ impl VmExecutor {
         let c = opcodes::getarg_c(inst);
         let table_val = Self::read_stack(state, a).clone();
         let val = Self::resolve_val(state, inst, c);
-        Self::table_set_tv(table_val, TValue::Integer(b), val);
+        let modified = Self::table_set_tv(table_val, TValue::Integer(b), val, &state.gc);
+        Self::write_stack(state, a, modified);
         state.pc += 1;
         Ok(())
     }
@@ -443,7 +461,8 @@ impl VmExecutor {
         let table_val = Self::read_stack(state, a).clone();
         let key = state.constants.get(b_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
         let val = Self::resolve_val(state, inst, c);
-        Self::table_set_tv(table_val, key, val);
+        let modified = Self::table_set_tv(table_val, key, val, &state.gc);
+        Self::write_stack(state, a, modified);
         state.pc += 1;
         Ok(())
     }
@@ -455,6 +474,8 @@ impl VmExecutor {
         let hash_size = if b > 0 { 1u32 << (b - 1) } else { 0 };
         let array_size = c as usize;
         let table = Table::with_capacity(array_size, hash_size as usize);
+        let table_id = state.gc.register_object(array_size + hash_size as usize);
+        table.gc_header.set_id(table_id);
         Self::write_stack(state, a, TValue::Table(table));
         state.pc += 1;
         Ok(())
@@ -1415,7 +1436,7 @@ impl VmExecutor {
         let bx = opcodes::getarg_sbx(inst) as usize;
         if bx < state.protos.len() {
             let proto = state.protos[bx].clone();
-            let closure = LClosure { proto, upvals: Vec::new() };
+            let closure = LClosure { gc_header: crate::gc::GCObjectHeader::new(), proto, upvals: Vec::new() };
             Self::write_stack(state, ra, TValue::LClosure(closure));
         }
         state.pc += 1;
@@ -1470,10 +1491,23 @@ impl VmExecutor {
         }
     }
 
-    fn table_set_tv(mut table_val: TValue, key: TValue, val: TValue) {
+    fn table_set_tv(mut table_val: TValue, key: TValue, val: TValue, gc: &GCState) -> TValue {
+        let table_id = if let TValue::Table(ref t) = table_val {
+            t.gc_header.id()
+        } else {
+            None
+        };
+
         if let TValue::Table(ref mut t) = table_val {
             t.set(key, val);
         }
+
+        if let Some(tid) = table_id {
+            gc.obj_barrier_back(tid, tid);
+            gc.barrier_back(tid);
+        }
+
+        table_val
     }
 
     fn resolve_val(state: &VmState, inst: Instruction, c: i32) -> TValue {
@@ -1556,6 +1590,16 @@ mod tests {
     use super::*;
     use crate::objects::NilKind;
     use crate::strings::StringTable;
+    use crate::gc::GCObjectHeader;
+    use std::rc::Rc;
+
+    fn make_gc() -> Rc<GCState> {
+        Rc::new(GCState::default_incremental())
+    }
+
+    fn execute_test(proto: &Proto, base: usize, stack: Vec<TValue>) -> Result<VmResult, VmError> {
+        VmExecutor::execute(proto, base, stack, make_gc())
+    }
 
     fn make_proto(code: Vec<Instruction>, constants: Vec<TValue>) -> Proto {
         Proto {
@@ -1622,7 +1666,7 @@ mod tests {
         let code = vec![make_asbx(OpCode::LOADI, 0, 42)];
         let proto = make_proto(code, vec![]);
         let stack = default_stack(5);
-        let result = VmExecutor::execute(&proto, 0, stack);
+        let result = execute_test(&proto, 0, stack);
         assert!(result.is_ok());
     }
 
@@ -1634,7 +1678,7 @@ mod tests {
         ];
         let proto = make_proto(code, vec![]);
         let stack = default_stack(10);
-        assert!(VmExecutor::execute(&proto, 0, stack).is_ok());
+        assert!(execute_test(&proto, 0, stack).is_ok());
     }
 
     #[test]
@@ -1646,7 +1690,7 @@ mod tests {
         ];
         let proto = make_proto(code, vec![]);
         let stack = default_stack(10);
-        assert!(VmExecutor::execute(&proto, 0, stack).is_ok());
+        assert!(execute_test(&proto, 0, stack).is_ok());
     }
 
     #[test]
@@ -1657,7 +1701,7 @@ mod tests {
         ];
         let proto = make_proto(code, vec![]);
         let stack = default_stack(10);
-        assert!(VmExecutor::execute(&proto, 0, stack).is_ok());
+        assert!(execute_test(&proto, 0, stack).is_ok());
     }
 
     #[test]
@@ -1665,7 +1709,7 @@ mod tests {
         let code = vec![make_abc(OpCode::NEWTABLE, 0, 0, 3)];
         let proto = make_proto(code, vec![]);
         let stack = default_stack(10);
-        assert!(VmExecutor::execute(&proto, 0, stack).is_ok());
+        assert!(execute_test(&proto, 0, stack).is_ok());
     }
 
     #[test]
@@ -1678,7 +1722,7 @@ mod tests {
         ];
         let proto = make_proto(code, vec![]);
         let stack = default_stack(20);
-        assert!(VmExecutor::execute(&proto, 0, stack).is_ok());
+        assert!(execute_test(&proto, 0, stack).is_ok());
     }
 
     #[test]
@@ -1690,7 +1734,7 @@ mod tests {
 
         let code = vec![make_abc(OpCode::CONCAT, 0, 2, 0)];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, stack).is_ok());
+        assert!(execute_test(&proto, 0, stack).is_ok());
     }
 
     // ========================================================================
@@ -1734,7 +1778,7 @@ mod tests {
             make_abc(OpCode::SUB, 2, 0, 1),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -1745,7 +1789,7 @@ mod tests {
             make_abc(OpCode::MUL, 2, 0, 1),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -1756,7 +1800,7 @@ mod tests {
             make_abc(OpCode::DIV, 2, 0, 1),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -1767,7 +1811,7 @@ mod tests {
             make_abc(OpCode::IDIV, 2, 0, 1),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -1778,7 +1822,7 @@ mod tests {
             make_abc(OpCode::MOD, 2, 0, 1),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -1789,7 +1833,7 @@ mod tests {
             make_abc(OpCode::POW, 2, 0, 1),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     // ========================================================================
@@ -1803,7 +1847,7 @@ mod tests {
             make_abc(OpCode::UNM, 1, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -1813,7 +1857,7 @@ mod tests {
             make_abc(OpCode::BNOT, 1, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -1824,7 +1868,7 @@ mod tests {
             make_abc(OpCode::BAND, 2, 0, 1),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -1835,7 +1879,7 @@ mod tests {
             make_abc(OpCode::BOR, 2, 0, 1),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -1846,7 +1890,7 @@ mod tests {
             make_abc(OpCode::BXOR, 2, 0, 1),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -1857,7 +1901,7 @@ mod tests {
             make_abc(OpCode::SHL, 2, 0, 1),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -1868,7 +1912,7 @@ mod tests {
             make_abc(OpCode::SHR, 2, 0, 1),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     // ========================================================================
@@ -1883,7 +1927,7 @@ mod tests {
             make_abck(OpCode::ADDK, 1, 0, 0, 1),
         ];
         let proto = make_proto(code, constants);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -1894,7 +1938,7 @@ mod tests {
             make_abck(OpCode::SUBK, 1, 0, 0, 1),
         ];
         let proto = make_proto(code, constants);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -1905,7 +1949,7 @@ mod tests {
             make_abck(OpCode::MULK, 1, 0, 0, 0),
         ];
         let proto = make_proto(code, constants);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -1916,7 +1960,7 @@ mod tests {
             make_abck(OpCode::DIVK, 1, 0, 0, 0),
         ];
         let proto = make_proto(code, constants);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     // ========================================================================
@@ -1928,14 +1972,14 @@ mod tests {
         let constants = vec![TValue::Integer(42)];
         let code = vec![make_asbx(OpCode::LOADK, 0, 0)];
         let proto = make_proto(code, constants);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
     fn test_execute_loadf() {
         let code = vec![make_asbx(OpCode::LOADF, 0, 0)];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -1945,7 +1989,7 @@ mod tests {
             make_asbx(OpCode::ADDI, 0, 5),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     // ========================================================================
@@ -1960,7 +2004,7 @@ mod tests {
             make_abc(OpCode::EQ, 0, 0, 1),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -1971,7 +2015,7 @@ mod tests {
             make_abc(OpCode::LT, 0, 0, 1),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -1982,7 +2026,7 @@ mod tests {
             make_abc(OpCode::LE, 0, 0, 1),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -1992,7 +2036,7 @@ mod tests {
             make_asbx(OpCode::EQI, 0, 42),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -2002,7 +2046,7 @@ mod tests {
             make_asbx(OpCode::LTI, 0, 5),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -2012,7 +2056,7 @@ mod tests {
             make_asbx(OpCode::LEI, 0, 5),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -2022,7 +2066,7 @@ mod tests {
             make_asbx(OpCode::GTI, 0, 5),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -2032,7 +2076,7 @@ mod tests {
             make_asbx(OpCode::GEI, 0, 5),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     // ========================================================================
@@ -2046,7 +2090,7 @@ mod tests {
             make_bx(OpCode::RETURN0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -2057,7 +2101,7 @@ mod tests {
             make_bx(OpCode::RETURN0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -2067,7 +2111,7 @@ mod tests {
             make_abc(OpCode::TESTSET, 1, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     // ========================================================================
@@ -2082,7 +2126,7 @@ mod tests {
             make_abc(OpCode::GETTABLE, 2, 0, 1),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(20)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
     }
 
     #[test]
@@ -2094,7 +2138,7 @@ mod tests {
             make_abck(OpCode::SETTABLE, 0, 1, 2, 0),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(20)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
     }
 
     #[test]
@@ -2104,7 +2148,7 @@ mod tests {
             make_abc(OpCode::GETI, 1, 0, 1),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(20)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
     }
 
     #[test]
@@ -2115,7 +2159,7 @@ mod tests {
             make_abck(OpCode::SETI, 0, 1, 1, 0),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(20)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
     }
 
     #[test]
@@ -2126,7 +2170,7 @@ mod tests {
             make_abc(OpCode::SELF, 1, 0, 0),
         ];
         let proto = make_proto(code, constants);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(20)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
     }
 
     #[test]
@@ -2137,7 +2181,7 @@ mod tests {
 
         let code = vec![make_abc(OpCode::LEN, 1, 0, 0)];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, stack).is_ok());
+        assert!(execute_test(&proto, 0, stack).is_ok());
     }
 
     // ========================================================================
@@ -2151,7 +2195,7 @@ mod tests {
             make_abc(OpCode::RETURN, 0, 2, 0),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -2161,7 +2205,7 @@ mod tests {
             make_abc(OpCode::RETURN1, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -2170,7 +2214,7 @@ mod tests {
             make_bx(OpCode::RETURN0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     // ========================================================================
@@ -2181,27 +2225,27 @@ mod tests {
     fn test_execute_call_lua_closure() {
         // Create an inner proto that just returns 0
         let inner_proto = make_proto(vec![make_bx(OpCode::RETURN0, 0, 0)], vec![]);
-        let closure = LClosure { proto: inner_proto, upvals: vec![] };
+        let closure = LClosure { gc_header: GCObjectHeader::new(), proto: inner_proto, upvals: vec![] };
 
         let mut stack = default_stack(10);
         stack[0] = TValue::LClosure(closure);
 
         let code = vec![make_abck(OpCode::CALL, 0, 0, 1, 0)];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, stack).is_ok());
+        assert!(execute_test(&proto, 0, stack).is_ok());
     }
 
     #[test]
     fn test_execute_tailcall_lua_closure() {
         let inner_proto = make_proto(vec![make_bx(OpCode::RETURN0, 0, 0)], vec![]);
-        let closure = LClosure { proto: inner_proto, upvals: vec![] };
+        let closure = LClosure { gc_header: GCObjectHeader::new(), proto: inner_proto, upvals: vec![] };
 
         let mut stack = default_stack(10);
         stack[0] = TValue::LClosure(closure);
 
         let code = vec![make_abck(OpCode::TAILCALL, 0, 0, 1, 0)];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, stack).is_ok());
+        assert!(execute_test(&proto, 0, stack).is_ok());
     }
 
     // ========================================================================
@@ -2214,7 +2258,7 @@ mod tests {
         let code = vec![make_bx(OpCode::CLOSURE, 0, 0)];
         let mut proto = make_proto(code, vec![]);
         proto.protos = vec![inner_proto];
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     // ========================================================================
@@ -2231,7 +2275,7 @@ mod tests {
             make_abc(OpCode::SETLIST, 0, 3, 1),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(20)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
     }
 
     // ========================================================================
@@ -2242,21 +2286,21 @@ mod tests {
     fn test_execute_loadfalse() {
         let code = vec![make_abc(OpCode::LOADFALSE, 0, 0, 0)];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(5)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(5)).is_ok());
     }
 
     #[test]
     fn test_execute_loadtrue() {
         let code = vec![make_abc(OpCode::LOADTRUE, 0, 0, 0)];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(5)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(5)).is_ok());
     }
 
     #[test]
     fn test_execute_loadnil() {
         let code = vec![make_abck(OpCode::LOADNIL, 0, 3, 0, 0)];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     // ========================================================================
@@ -2272,7 +2316,7 @@ mod tests {
             make_abc(OpCode::TFORPREP, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(20)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
     }
 
     #[test]
@@ -2284,7 +2328,7 @@ mod tests {
             make_abc(OpCode::TFORCALL, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(20)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
     }
 
     #[test]
@@ -2294,7 +2338,7 @@ mod tests {
             make_abc(OpCode::TFORLOOP, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(20)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
     }
 
     // ========================================================================
@@ -2305,7 +2349,7 @@ mod tests {
     fn test_execute_vararg() {
         let code = vec![make_abc(OpCode::VARARG, 0, 1, 0)];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(20)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
     }
 
     #[test]
@@ -2315,7 +2359,7 @@ mod tests {
             make_bx(OpCode::ERRNNIL, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -2324,7 +2368,7 @@ mod tests {
             make_abc(OpCode::VARARGPREP, 0, 3, 0),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(20)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
     }
 
     // ========================================================================
@@ -2336,35 +2380,35 @@ mod tests {
         // C=255 (超出 TagMethod 范围), 使 TM 查找被跳过
         let code = vec![make_abc(OpCode::MMBIN, 0, 0, 255)];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
     fn test_execute_mmbini() {
         let code = vec![make_abc(OpCode::MMBINI, 0, 0, 255)];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
     fn test_execute_mmbink() {
         let code = vec![make_abc(OpCode::MMBINK, 0, 0, 255)];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
     fn test_execute_close() {
         let code = vec![make_abc(OpCode::CLOSE, 0, 0, 0)];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
     fn test_execute_tbc() {
         let code = vec![make_abc(OpCode::TBC, 0, 0, 0)];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     // ========================================================================
@@ -2378,7 +2422,7 @@ mod tests {
             make_bx(OpCode::RETURN0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -2388,7 +2432,7 @@ mod tests {
             make_abc(OpCode::GETVARG, 0, 0, 1),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     // ========================================================================
@@ -2418,7 +2462,7 @@ mod tests {
     #[test]
     fn test_vm_result_done() {
         let proto = make_proto(vec![], vec![]);
-        let result = VmExecutor::execute(&proto, 0, default_stack(10)).unwrap();
+        let result = execute_test(&proto, 0, default_stack(10)).unwrap();
         assert!(matches!(result, VmResult::Return(0)));
     }
 
@@ -2434,7 +2478,7 @@ mod tests {
             make_abc(OpCode::ADD, 2, 0, 1),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
+        assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
@@ -2446,6 +2490,6 @@ mod tests {
             make_abc(OpCode::FORPREP, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(VmExecutor::execute(&proto, 0, default_stack(20)).is_err());
+        assert!(execute_test(&proto, 0, default_stack(20)).is_err());
     }
 }

@@ -138,12 +138,17 @@ fn new_upval(state: &mut VmState, level: usize, prev: Option<usize>) -> usize {
 }
 
 pub fn close_upval(state: &mut VmState, uv_idx: usize) {
+    state.gc.cond_gc();
     let val = match &state.closure_upvals[uv_idx] {
         UpVal::Open { stack_index, .. } => {
             state.stack.get(*stack_index).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
         }
         UpVal::Closed { value } => (**value).clone(),
     };
+    // GC barrier: when upvalue is closed, mark the value
+    if let Some(gc_id) = crate::vm::gc_id_of_tvalue(&val) {
+        state.gc.mark_object(gc_id);
+    }
     unlink_upval(state, uv_idx);
     state.closure_upvals[uv_idx] = UpVal::Closed {
         value: Box::new(val),
@@ -264,6 +269,7 @@ mod tests {
             trap: false,
             num_params: 0,
             is_vararg: false,
+            gc: std::rc::Rc::new(crate::gc::GCState::default_incremental()),
         }
     }
 

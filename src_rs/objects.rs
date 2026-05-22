@@ -25,6 +25,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 
 use crate::strings::LuaString;
+use crate::gc::GCObjectHeader;
 
 // ============================================================================
 // 规约：Lua 基础类型标签
@@ -504,6 +505,7 @@ pub struct LCFunction {
 /// 方法实现见 [crate::table]。
 #[derive(Debug, Clone)]
 pub struct Table {
+    pub gc_header: GCObjectHeader,
     /// 数组部分（1-based，索引 0 对应键 1）
     pub array: Vec<TValue>,
     /// 哈希部分（非整数键以及超出数组范围的整数键）
@@ -517,6 +519,7 @@ pub struct Table {
 impl Default for Table {
     fn default() -> Self {
         Table {
+            gc_header: GCObjectHeader::new(),
             array: Vec::new(),
             hash: hashbrown::HashMap::new(),
             metatable: None,
@@ -537,6 +540,7 @@ impl Default for Table {
 /// Then: nupvalues = 3, p 指向该 Proto
 #[derive(Debug, Clone)]
 pub struct LClosure {
+    pub gc_header: GCObjectHeader,
     /// 函数原型
     pub proto: Proto,
     /// 上值列表
