@@ -14,6 +14,7 @@ pub type lua_KFunction =
     unsafe extern "C" fn(L: *mut lua_State, status: c_int, ctx: lua_KContext) -> c_int;
 
 pub const LUA_OK: c_int = 0;
+pub const LUA_ERRRUN: c_int = 2;
 pub const LUA_ERRSYNTAX: c_int = 3;
 pub const LUA_MULTRET: c_int = -1;
 pub const LUA_REGISTRYINDEX: c_int = -(c_int::MAX / 2 + 1000);
@@ -119,6 +120,7 @@ extern "C" {
     pub fn luaL_len(L: *mut lua_State, idx: c_int) -> lua_Integer;
     pub fn luaL_checkstack(L: *mut lua_State, sz: c_int, msg: *const c_char);
     pub fn luaL_error(L: *mut lua_State, fmt: *const c_char, ...) -> !;
+    pub fn lua_error(L: *mut lua_State) -> !;
 }
 
 pub unsafe fn to_cstr(s: &str) -> CString {

@@ -17,7 +17,7 @@ fn main() {
         .flag("-Wall")
         .flag("-Wextra")
         .flag("-Wno-unused-parameter")
-        .define("LUA_USE_POSIX", None)
+        .define("LUA_USE_LINUX", None)
         .define("LUA_COMPAT_5_3", None);
 
     let is_debug = env::var("PROFILE").unwrap() == "debug";
@@ -73,4 +73,5 @@ fn main() {
 
     println!("cargo:rustc-link-lib=m");
     println!("cargo:rustc-link-lib=dl");
+    println!("cargo:rustc-link-arg=-Wl,--export-dynamic");
 }

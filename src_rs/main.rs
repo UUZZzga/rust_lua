@@ -229,14 +229,11 @@ impl Interpreter {
         true
     }
 
-    unsafe fn push_args(&mut self, _argv: &[CString], _argc: usize, _script: isize) -> c_int {
-        if lua_getglobal(self.l, c"arg".as_ptr()) != LUA_TTABLE {
-            luaL_error(self.l, c"'arg' is not a table".as_ptr());
-        }
+    unsafe fn push_args(&mut self) -> c_int {
         let n = luaL_len(self.l, -1) as c_int;
         luaL_checkstack(self.l, n + 3, c"too many arguments to script".as_ptr());
         for i in 1..=n {
-            lua_rawgeti(self.l, -(i + 1), i as i64);
+            lua_rawgeti(self.l, -i, i as i64);
         }
         lua_rotate(self.l, -(n + 1), -1);
         lua_pop(self.l, 1);
@@ -254,7 +251,11 @@ impl Interpreter {
         };
         let status = luaL_loadfile(self.l, fname_ptr);
         if status == LUA_OK {
-            let n = self.push_args(argv, argv.len(), script);
+            if lua_getglobal(self.l, c"arg".as_ptr()) != LUA_TTABLE {
+                lua_pushstring(self.l, c"'arg' is not a table".as_ptr());
+                return Self::report(self.l, LUA_ERRRUN);
+            }
+            let n = self.push_args();
             let call_status = self.docall(n, LUA_MULTRET);
             Self::report(self.l, call_status)
         } else {
@@ -340,10 +341,8 @@ impl Interpreter {
             c"=stdin".as_ptr(),
         );
         if status == LUA_OK {
-            lua_rotate(self.l, -2, -1);
-            lua_pop(self.l, 1);
         } else {
-            lua_settop(self.l, lua_gettop(self.l) - 2);
+            lua_pop(self.l, 1);
         }
         status
     }
@@ -396,6 +395,16 @@ impl Interpreter {
         if n > 0 {
             luaL_checkstack(self.l, LUA_MINSTACK, c"too many results to print".as_ptr());
             lua_getglobal(self.l, c"print".as_ptr());
+            if lua_type(self.l, -1) != LUA_TFUNCTION {
+                lua_pop(self.l, n + 1);
+                let mut stderr = io::stderr().lock();
+                let _ = write!(
+                    stderr,
+                    "{}: error calling 'print' (value is not a function)\n",
+                    self.progname
+                );
+                return;
+            }
             lua_rotate(self.l, 1, 1);
             if lua_pcall(self.l, n, 0, 0) != LUA_OK {
                 let err_ptr = lua_tolstring(self.l, -1, ptr::null_mut());
