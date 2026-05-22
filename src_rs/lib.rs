@@ -21,20 +21,17 @@ pub mod parser;
 // Lua 对象和值的表示
 pub mod objects;
 
-// 虚拟机核心实现
+// 虚拟机核心 (lvm.h/lvm.cpp — 转换、比较、算术、表访问、解释器循环)
 pub mod vm;
-
-// 虚拟机核心操作 (lvm.h / lvm.cpp — 转换、比较、算术、表访问等)
-pub mod lvm;
-
-// 虚拟机主解释器循环 (luaV_execute)
-pub mod execute;
 
 // 字符串处理
 pub mod strings;
 
 // 表实现
 pub mod table;
+
+// 标签方法 / 元方法 (ltm.h / ltm.cpp)
+pub mod tm;
 
 // 垃圾回收
 pub mod gc;

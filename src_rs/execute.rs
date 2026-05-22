@@ -12,11 +12,13 @@
 //! ## 规约驱动开发 (spec-driven-tdd)
 //! 每个公开函数都包含规约注释。
 
-use crate::lvm;
 use crate::objects::{Instruction, LClosure, NilKind, Proto, TValue, UpVal, UpvalDesc};
 use crate::opcodes::{self, OpCode};
-use crate::strings::LuaString;
 use crate::table::Table;
+use crate::tm::{
+    TagMethod, TagMethodError,
+    try_bin_tm, try_bin_assoc_tm,
+};
 
 // ============================================================================
 // VmState: 解释器状态
@@ -74,6 +76,7 @@ pub enum VmError {
     StackOverflow,
     IllegalOpcode(u8),
     RuntimeError(String),
+    MetaMethodNotImplemented(String),
 }
 
 impl std::fmt::Display for VmError {
@@ -85,6 +88,7 @@ impl std::fmt::Display for VmError {
             VmError::StackOverflow => write!(f, "stack overflow"),
             VmError::IllegalOpcode(op) => write!(f, "illegal opcode: {}", op),
             VmError::RuntimeError(msg) => write!(f, "runtime error: {}", msg),
+            VmError::MetaMethodNotImplemented(name) => write!(f, "metamethod '{}' not implemented", name),
         }
     }
 }
@@ -574,7 +578,7 @@ impl VmExecutor {
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
         let v1 = Self::read_stack(state, b);
-        if let (Some(n1), Some(n2)) = (lvm::to_number_ns(v1), lvm::to_number_ns(&v2)) {
+        if let (Some(n1), Some(n2)) = (super::to_number_ns(v1), super::to_number_ns(&v2)) {
             Self::write_stack(state, a, TValue::Float(n1.powf(n2)));
         }
         state.pc += 1;
@@ -587,7 +591,7 @@ impl VmExecutor {
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
         let v1 = Self::read_stack(state, b);
-        if let (Some(n1), Some(n2)) = (lvm::to_number_ns(v1), lvm::to_number_ns(&v2)) {
+        if let (Some(n1), Some(n2)) = (super::to_number_ns(v1), super::to_number_ns(&v2)) {
             Self::write_stack(state, a, TValue::Float(n1 / n2));
         }
         state.pc += 1;
@@ -612,7 +616,7 @@ impl VmExecutor {
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
         let v1 = Self::read_stack(state, b);
-        if let (Some(i1), TValue::Integer(i2)) = (lvm::to_integer_ns(v1, lvm::F2IMode::Eq), &v2) {
+        if let (Some(i1), TValue::Integer(i2)) = (super::to_integer_ns(v1, super::F2IMode::Eq), &v2) {
             Self::write_stack(state, a, TValue::Integer(i1 & i2));
         }
         state.pc += 1;
@@ -625,7 +629,7 @@ impl VmExecutor {
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
         let v1 = Self::read_stack(state, b);
-        if let (Some(i1), TValue::Integer(i2)) = (lvm::to_integer_ns(v1, lvm::F2IMode::Eq), &v2) {
+        if let (Some(i1), TValue::Integer(i2)) = (super::to_integer_ns(v1, super::F2IMode::Eq), &v2) {
             Self::write_stack(state, a, TValue::Integer(i1 | i2));
         }
         state.pc += 1;
@@ -638,7 +642,7 @@ impl VmExecutor {
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
         let v1 = Self::read_stack(state, b);
-        if let (Some(i1), TValue::Integer(i2)) = (lvm::to_integer_ns(v1, lvm::F2IMode::Eq), &v2) {
+        if let (Some(i1), TValue::Integer(i2)) = (super::to_integer_ns(v1, super::F2IMode::Eq), &v2) {
             Self::write_stack(state, a, TValue::Integer(i1 ^ i2));
         }
         state.pc += 1;
@@ -650,8 +654,8 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let ic = opcodes::getarg_c(inst) as i64;
         let v = Self::read_stack(state, b);
-        if let Some(ib) = lvm::to_integer_ns(v, lvm::F2IMode::Eq) {
-            Self::write_stack(state, a, TValue::Integer(lvm::shiftl(ic, ib)));
+        if let Some(ib) = super::to_integer_ns(v, super::F2IMode::Eq) {
+            Self::write_stack(state, a, TValue::Integer(super::shiftl(ic, ib)));
         }
         state.pc += 1;
         Ok(())
@@ -662,8 +666,8 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let ic = opcodes::getarg_c(inst) as i64;
         let v = Self::read_stack(state, b);
-        if let Some(ib) = lvm::to_integer_ns(v, lvm::F2IMode::Eq) {
-            Self::write_stack(state, a, TValue::Integer(lvm::shiftl(ib, -ic)));
+        if let Some(ib) = super::to_integer_ns(v, super::F2IMode::Eq) {
+            Self::write_stack(state, a, TValue::Integer(super::shiftl(ib, -ic)));
         }
         state.pc += 1;
         Ok(())
@@ -723,7 +727,7 @@ impl VmExecutor {
         let c = Self::rc(state, inst);
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
-        if let (Some(n1), Some(n2)) = (lvm::to_number_ns(v1), lvm::to_number_ns(v2)) {
+        if let (Some(n1), Some(n2)) = (super::to_number_ns(v1), super::to_number_ns(v2)) {
             Self::write_stack(state, a, TValue::Float(n1.powf(n2)));
         }
         state.pc += 1;
@@ -736,7 +740,7 @@ impl VmExecutor {
         let c = Self::rc(state, inst);
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
-        if let (Some(n1), Some(n2)) = (lvm::to_number_ns(v1), lvm::to_number_ns(v2)) {
+        if let (Some(n1), Some(n2)) = (super::to_number_ns(v1), super::to_number_ns(v2)) {
             Self::write_stack(state, a, TValue::Float(n1 / n2));
         }
         state.pc += 1;
@@ -762,8 +766,8 @@ impl VmExecutor {
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if let (Some(i1), Some(i2)) = (
-            lvm::to_integer_ns(v1, lvm::F2IMode::Eq),
-            lvm::to_integer_ns(v2, lvm::F2IMode::Eq),
+            super::to_integer_ns(v1, super::F2IMode::Eq),
+            super::to_integer_ns(v2, super::F2IMode::Eq),
         ) {
             Self::write_stack(state, a, TValue::Integer(i1 & i2));
         }
@@ -778,8 +782,8 @@ impl VmExecutor {
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if let (Some(i1), Some(i2)) = (
-            lvm::to_integer_ns(v1, lvm::F2IMode::Eq),
-            lvm::to_integer_ns(v2, lvm::F2IMode::Eq),
+            super::to_integer_ns(v1, super::F2IMode::Eq),
+            super::to_integer_ns(v2, super::F2IMode::Eq),
         ) {
             Self::write_stack(state, a, TValue::Integer(i1 | i2));
         }
@@ -794,8 +798,8 @@ impl VmExecutor {
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if let (Some(i1), Some(i2)) = (
-            lvm::to_integer_ns(v1, lvm::F2IMode::Eq),
-            lvm::to_integer_ns(v2, lvm::F2IMode::Eq),
+            super::to_integer_ns(v1, super::F2IMode::Eq),
+            super::to_integer_ns(v2, super::F2IMode::Eq),
         ) {
             Self::write_stack(state, a, TValue::Integer(i1 ^ i2));
         }
@@ -810,10 +814,10 @@ impl VmExecutor {
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if let (Some(i1), Some(i2)) = (
-            lvm::to_integer_ns(v1, lvm::F2IMode::Eq),
-            lvm::to_integer_ns(v2, lvm::F2IMode::Eq),
+            super::to_integer_ns(v1, super::F2IMode::Eq),
+            super::to_integer_ns(v2, super::F2IMode::Eq),
         ) {
-            Self::write_stack(state, a, TValue::Integer(lvm::shiftl(i1, i2)));
+            Self::write_stack(state, a, TValue::Integer(super::shiftl(i1, i2)));
         }
         state.pc += 1;
         Ok(())
@@ -826,26 +830,89 @@ impl VmExecutor {
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if let (Some(i1), Some(i2)) = (
-            lvm::to_integer_ns(v1, lvm::F2IMode::Eq),
-            lvm::to_integer_ns(v2, lvm::F2IMode::Eq),
+            super::to_integer_ns(v1, super::F2IMode::Eq),
+            super::to_integer_ns(v2, super::F2IMode::Eq),
         ) {
-            Self::write_stack(state, a, TValue::Integer(lvm::shiftl(i1, -i2)));
+            Self::write_stack(state, a, TValue::Integer(super::shiftl(i1, -i2)));
         }
         state.pc += 1;
         Ok(())
     }
 
-    fn op_mmbin(state: &mut VmState, _inst: Instruction) -> Result<(), VmError> {
+    fn op_mmbin(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+        // C: ra = RA(i) → A 字段 = 第一操作数栈位置
+        // C: rb = vRB(i) → B 字段 = 第二操作数栈位置
+        // C: tm = GETARG_C(i) → C 字段 = 元方法事件
+        // C: result = RA(pi) → 原始算术指令的 A 字段 (此处简化为 a)
+        let a = Self::ra(state, inst);
+        let b = Self::rb(state, inst);
+        let p1 = Self::read_stack(state, a);
+        let p2 = Self::read_stack(state, b);
+        let tm_idx = opcodes::getarg_c(inst) as u8;
+        if let Some(tm) = TagMethod::from_u8(tm_idx) {
+            let dmt = super::DefaultMetatables::new();
+            let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
+                Err(TagMethodError::NoMetamethod(tm))
+            };
+            match try_bin_tm(p1, p2, tm, &dmt, &mut call_fn) {
+                Ok(result) => { Self::write_stack(state, a, result); }
+                Err(_) => { return Err(VmError::MetaMethodNotImplemented(tm.name().to_string())); }
+            }
+        }
         state.pc += 1;
         Ok(())
     }
 
-    fn op_mmbini(state: &mut VmState, _inst: Instruction) -> Result<(), VmError> {
+    fn op_mmbini(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+        // C: ra = RA(i) → A 字段 = 第一操作数
+        // C: imm = GETARG_sB(i) = GETARG_B(i) - OFFSET_sC → 有符号立即数
+        // C: tm = GETARG_C(i) → C 字段 = 元方法事件
+        // C: flip = GETARG_k(i) → k 位 = 翻转标志
+        // C: result = RA(pi)
+        let a = Self::ra(state, inst);
+        let imm = opcodes::getarg_b(inst) - 127;
+        let p1 = Self::read_stack(state, a);
+        let p2 = TValue::Integer(imm as i64);
+        let flip = opcodes::testarg_k(inst);
+        let tm_idx = opcodes::getarg_c(inst) as u8;
+        if let Some(tm) = TagMethod::from_u8(tm_idx) {
+            let dmt = super::DefaultMetatables::new();
+            let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
+                Err(TagMethodError::NoMetamethod(tm))
+            };
+            match try_bin_assoc_tm(p1, &p2, flip, tm, &dmt, &mut call_fn) {
+                Ok(result) => { Self::write_stack(state, a, result); }
+                Err(_) => { return Err(VmError::MetaMethodNotImplemented(tm.name().to_string())); }
+            }
+        }
         state.pc += 1;
         Ok(())
     }
 
-    fn op_mmbink(state: &mut VmState, _inst: Instruction) -> Result<(), VmError> {
+    fn op_mmbink(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+        // C: ra = RA(i) → A 字段 = 第一操作数
+        // C: imm = KB(i) → 常量 (从 proto 中读取)
+        // C: tm = GETARG_C(i) → C 字段 = 元方法事件
+        // C: flip = GETARG_k(i) → k 位 = 翻转标志
+        // C: result = RA(pi)
+        let a = Self::ra(state, inst);
+        let b = opcodes::getarg_b(inst) as usize;
+        let p1 = Self::read_stack(state, a);
+        let p2 = state.constants.get(b)
+            .cloned()
+            .unwrap_or(TValue::Nil(NilKind::Strict));
+        let flip = opcodes::testarg_k(inst);
+        let tm_idx = opcodes::getarg_c(inst) as u8;
+        if let Some(tm) = TagMethod::from_u8(tm_idx) {
+            let dmt = super::DefaultMetatables::new();
+            let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
+                Err(TagMethodError::NoMetamethod(tm))
+            };
+            match try_bin_assoc_tm(p1, &p2, flip, tm, &dmt, &mut call_fn) {
+                Ok(result) => { Self::write_stack(state, a, result); }
+                Err(_) => { return Err(VmError::MetaMethodNotImplemented(tm.name().to_string())); }
+            }
+        }
         state.pc += 1;
         Ok(())
     }
@@ -857,7 +924,15 @@ impl VmExecutor {
         match v {
             TValue::Integer(i) => Self::write_stack(state, a, TValue::Integer(i.wrapping_neg())),
             TValue::Float(f) => Self::write_stack(state, a, TValue::Float(-f)),
-            _ => {}
+            _ => {
+                let dmt = super::DefaultMetatables::new();
+                match try_bin_tm(v, v, TagMethod::Unm, &dmt, &mut |_f, _args| {
+                    Err(crate::tm::TagMethodError::NoMetamethod(TagMethod::Unm))
+                }) {
+                    Ok(result) => { Self::write_stack(state, a, result); }
+                    Err(_) => { return Err(VmError::MetaMethodNotImplemented("__unm".to_string())); }
+                }
+            }
         }
         state.pc += 1;
         Ok(())
@@ -867,8 +942,16 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v = Self::read_stack(state, b);
-        if let Some(i) = lvm::to_integer_ns(v, lvm::F2IMode::Eq) {
+        if let Some(i) = super::to_integer_ns(v, super::F2IMode::Eq) {
             Self::write_stack(state, a, TValue::Integer(!i));
+        } else {
+            let dmt = super::DefaultMetatables::new();
+            match try_bin_tm(v, v, TagMethod::BNot, &dmt, &mut |_f, _args| {
+                Err(crate::tm::TagMethodError::NoMetamethod(TagMethod::BNot))
+            }) {
+                Ok(result) => { Self::write_stack(state, a, result); }
+                Err(_) => { return Err(VmError::MetaMethodNotImplemented("__bnot".to_string())); }
+            }
         }
         state.pc += 1;
         Ok(())
@@ -878,7 +961,7 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v = Self::read_stack(state, b);
-        let result = if lvm::is_false(v) { TValue::Boolean(true) } else { TValue::Boolean(false) };
+        let result = if super::is_false(v) { TValue::Boolean(true) } else { TValue::Boolean(false) };
         Self::write_stack(state, a, result);
         state.pc += 1;
         Ok(())
@@ -888,7 +971,15 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v = Self::read_stack(state, b);
-        let result = lvm::objlen(v).unwrap_or(TValue::Integer(0));
+        let dmt = super::DefaultMetatables::new();
+        let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
+            Err(TagMethodError::NoMetamethod(TagMethod::Len))
+        };
+        let result = match super::objlen(v, Some(&dmt), Some(&mut call_fn)) {
+            Ok(Some(val)) => val,
+            Ok(None) => TValue::Integer(0),
+            Err(_) => TValue::Integer(0),
+        };
         Self::write_stack(state, a, result);
         state.pc += 1;
         Ok(())
@@ -897,19 +988,26 @@ impl VmExecutor {
     fn op_concat(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let n = opcodes::getarg_b(inst) as usize;
-        let mut result = String::new();
+        let mut vals: Vec<TValue> = Vec::with_capacity(n);
         for i in 0..n {
-            let val = Self::read_stack(state, a + i as usize);
-            match val {
-                TValue::Str(s) => result.push_str(s.as_str()),
-                TValue::Integer(i) => result.push_str(&i.to_string()),
-                TValue::Float(f) => result.push_str(&format_float(*f)),
-                _ => {}
+            vals.push(Self::read_stack(state, a + i).clone());
+        }
+        let dmt = super::DefaultMetatables::new();
+        match super::concat_stack(&mut vals, n, &dmt) {
+            Ok(()) => {
+                let result = vals.into_iter().next()
+                    .unwrap_or(TValue::Str(crate::strings::LuaString::Short(
+                        std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: String::new() })
+                    )));
+                Self::write_stack(state, a, result);
+            }
+            Err(crate::tm::TagMethodError::ConcatError { .. }) => {
+                return Err(VmError::MetaMethodNotImplemented("__concat".to_string()));
+            }
+            Err(_) => {
+                return Err(VmError::MetaMethodNotImplemented("__concat".to_string()));
             }
         }
-        use crate::strings::ShortString;
-        let ls = LuaString::Short(std::sync::Arc::new(ShortString { hash: 0, contents: result }));
-        Self::write_stack(state, a, TValue::Str(ls));
         state.pc += 1;
         Ok(())
     }
@@ -939,7 +1037,14 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let v1 = Self::read_stack(state, a);
         let v2 = Self::read_stack(state, b);
-        let cond = lvm::raw_equal(v1, v2);
+        let dmt = super::DefaultMetatables::new();
+        let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
+            Err(TagMethodError::NoMetamethod(TagMethod::Eq))
+        };
+        let cond = match super::equal(v1, v2, Some(&dmt), Some(&mut call_fn)) {
+            Ok(b) => b,
+            Err(_) => false,
+        };
         Self::do_conditional_jump(state, inst, cond);
         state.pc += 1;
         Ok(())
@@ -950,7 +1055,14 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let v1 = Self::read_stack(state, a);
         let v2 = Self::read_stack(state, b);
-        let cond = lvm::less_than(v1, v2);
+        let dmt = super::DefaultMetatables::new();
+        let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
+            Err(TagMethodError::NoMetamethod(TagMethod::Lt))
+        };
+        let cond = match super::less_than(v1, v2, Some(&dmt), Some(&mut call_fn)) {
+            Ok(b) => b,
+            Err(_) => false,
+        };
         Self::do_conditional_jump(state, inst, cond);
         state.pc += 1;
         Ok(())
@@ -961,7 +1073,14 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let v1 = Self::read_stack(state, a);
         let v2 = Self::read_stack(state, b);
-        let cond = lvm::less_equal(v1, v2);
+        let dmt = super::DefaultMetatables::new();
+        let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
+            Err(TagMethodError::NoMetamethod(TagMethod::Le))
+        };
+        let cond = match super::less_equal(v1, v2, Some(&dmt), Some(&mut call_fn)) {
+            Ok(b) => b,
+            Err(_) => false,
+        };
         Self::do_conditional_jump(state, inst, cond);
         state.pc += 1;
         Ok(())
@@ -972,7 +1091,7 @@ impl VmExecutor {
         let b_key = opcodes::getarg_b(inst) as usize;
         let v1 = Self::read_stack(state, a);
         let v2 = state.constants.get(b_key).unwrap();
-        let cond = lvm::raw_equal(v1, v2);
+        let cond = super::raw_equal(v1, v2);
         Self::do_conditional_jump(state, inst, cond);
         state.pc += 1;
         Ok(())
@@ -1051,7 +1170,7 @@ impl VmExecutor {
     fn op_test(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let v = Self::read_stack(state, a);
-        let cond = !lvm::is_false(v);
+        let cond = !super::is_false(v);
         // For TEST, the expected condition is reversed: jump if is_false(v) XOR expected
         let take_jump = cond;
         if !take_jump {
@@ -1070,7 +1189,7 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v = Self::read_stack(state, b).clone();
-        let cond = !lvm::is_false(&v);
+        let cond = !super::is_false(&v);
         let expected = opcodes::testarg_k(inst);
         if cond == expected {
             Self::write_stack(state, a, v);
@@ -1200,9 +1319,9 @@ impl VmExecutor {
                     TValue::Integer(i) => *i,
                     TValue::Float(f) => {
                         if *step_i < 0 {
-                            lvm::float_to_integer(*f, lvm::F2IMode::Ceil).unwrap_or(*init_i)
+                            super::float_to_integer(*f, super::F2IMode::Ceil).unwrap_or(*init_i)
                         } else {
-                            lvm::float_to_integer(*f, lvm::F2IMode::Floor).unwrap_or(*init_i)
+                            super::float_to_integer(*f, super::F2IMode::Floor).unwrap_or(*init_i)
                         }
                     }
                     _ => { state.pc += 1; return Ok(()); }
@@ -1403,7 +1522,7 @@ impl VmExecutor {
         match (v1, v2) {
             (TValue::Integer(i1), TValue::Integer(i2)) => TValue::Integer(int_op(*i1, *i2)),
             _ => {
-                if let (Some(n1), Some(n2)) = (lvm::to_number_ns(v1), lvm::to_number_ns(v2)) {
+                if let (Some(n1), Some(n2)) = (super::to_number_ns(v1), super::to_number_ns(v2)) {
                     TValue::Float(float_op(n1, n2))
                 } else {
                     TValue::Nil(NilKind::Strict)
@@ -1415,12 +1534,12 @@ impl VmExecutor {
     fn arith_mod(v1: &TValue, v2: &TValue) -> Result<TValue, VmError> {
         match (v1, v2) {
             (TValue::Integer(i1), TValue::Integer(i2)) => {
-                let r = lvm::modulus(*i1, *i2).map_err(|_| VmError::ModuloByZero)?;
+                let r = super::modulus(*i1, *i2).map_err(|_| VmError::ModuloByZero)?;
                 Ok(TValue::Integer(r))
             }
             _ => {
-                if let (Some(n1), Some(n2)) = (lvm::to_number_ns(v1), lvm::to_number_ns(v2)) {
-                    Ok(TValue::Float(lvm::modulus_float(n1, n2)))
+                if let (Some(n1), Some(n2)) = (super::to_number_ns(v1), super::to_number_ns(v2)) {
+                    Ok(TValue::Float(super::modulus_float(n1, n2)))
                 } else {
                     Ok(TValue::Nil(NilKind::Strict))
                 }
@@ -1431,11 +1550,11 @@ impl VmExecutor {
     fn arith_idiv(v1: &TValue, v2: &TValue) -> Result<TValue, VmError> {
         match (v1, v2) {
             (TValue::Integer(i1), TValue::Integer(i2)) => {
-                let r = lvm::idiv(*i1, *i2).map_err(|_| VmError::DivisionByZero)?;
+                let r = super::idiv(*i1, *i2).map_err(|_| VmError::DivisionByZero)?;
                 Ok(TValue::Integer(r))
             }
             _ => {
-                if let (Some(n1), Some(n2)) = (lvm::to_number_ns(v1), lvm::to_number_ns(v2)) {
+                if let (Some(n1), Some(n2)) = (super::to_number_ns(v1), super::to_number_ns(v2)) {
                     Ok(TValue::Float((n1 / n2).floor()))
                 } else {
                     Ok(TValue::Nil(NilKind::Strict))
@@ -2244,21 +2363,22 @@ mod tests {
 
     #[test]
     fn test_execute_mmbin() {
-        let code = vec![make_abc(OpCode::MMBIN, 0, 0, 0)];
+        // C=255 (超出 TagMethod 范围), 使 TM 查找被跳过
+        let code = vec![make_abc(OpCode::MMBIN, 0, 0, 255)];
         let proto = make_proto(code, vec![]);
         assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
     fn test_execute_mmbini() {
-        let code = vec![make_abc(OpCode::MMBINI, 0, 0, 0)];
+        let code = vec![make_abc(OpCode::MMBINI, 0, 0, 255)];
         let proto = make_proto(code, vec![]);
         assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
     fn test_execute_mmbink() {
-        let code = vec![make_abc(OpCode::MMBINK, 0, 0, 0)];
+        let code = vec![make_abc(OpCode::MMBINK, 0, 0, 255)];
         let proto = make_proto(code, vec![]);
         assert!(VmExecutor::execute(&proto, 0, default_stack(10)).is_ok());
     }

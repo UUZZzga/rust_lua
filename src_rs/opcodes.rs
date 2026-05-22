@@ -1,8 +1,6 @@
-//! Lua 5.5 操作码 FFI 绑定（lopcodes.h）
+//! Lua 5.5 操作码编解码（纯 Rust 实现）
 //!
-//! 通过 bindings.rs 直接调用 C 的 luaP_opmodes / luaP_isOT / luaP_isIT。
-
-use crate::bindings;
+//! 操作模式表与 C 的 luaP_opmodes 完全一致。
 
 // ============================================================================
 // 操作码枚举
@@ -55,14 +53,16 @@ impl OpCode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
-pub enum OpMode { IABC = 0, IvABC = 1, IABx = 2, IAsBx = 3, IAx = 4, IsJ = 5 }
+pub enum OpMode { IABC = 0, IABx = 1, IAsBx = 2, IAx = 3, IsJ = 4, IvABC = 5 }
 
 pub const SIZE_C: u32 = 8;   pub const SIZE_B: u32 = 8;
+pub const SIZE_VB: u32 = 6;
 pub const SIZE_BX: u32 = SIZE_C + SIZE_B + 1;
 pub const SIZE_A: u32 = 8;   pub const SIZE_OP: u32 = 7;
 pub const POS_OP: u32 = 0;   pub const POS_A: u32 = POS_OP + SIZE_OP;
 pub const POS_K: u32 = POS_A + SIZE_A;
 pub const POS_B: u32 = POS_K + 1;
+pub const POS_VB: u32 = POS_K + 1;
 pub const POS_C: u32 = POS_B + SIZE_B;
 pub const POS_BX: u32 = POS_K;
 pub const POS_SJ: u32 = POS_A;
@@ -93,6 +93,7 @@ pub const MAX_FSTACK: u8 = NO_REG;
 }
 #[inline] pub fn getarg_a(i: Instruction) -> i32 { getarg(i, POS_A, SIZE_A) }
 #[inline] pub fn getarg_b(i: Instruction) -> i32 { getarg(i, POS_B, SIZE_B) }
+#[inline] pub fn getarg_vb(i: Instruction) -> i32 { getarg(i, POS_VB, SIZE_VB) }
 #[inline] pub fn getarg_c(i: Instruction) -> i32 { getarg(i, POS_C, SIZE_C) }
 #[inline] pub fn testarg_k(i: Instruction) -> bool { (i & (1u32 << POS_K)) != 0 }
 #[inline] pub fn getarg_sbx(i: Instruction) -> i32 { getarg(i, POS_BX, SIZE_BX) - OFFSET_SBX }
@@ -102,30 +103,132 @@ pub const MAX_FSTACK: u8 = NO_REG;
 }
 
 // ============================================================================
-// FFI — 直接读 C 的 luaP_opmodes 全局数组
+// 操作模式表 — 纯 Rust 实现，与 C 的 luaP_opmodes 完全一致
 // ============================================================================
 
+const fn opmode_entry(mm: u8, ot: u8, it: u8, t: u8, a: u8, m: OpMode) -> u8 {
+    ((mm) << 7) | ((ot) << 6) | ((it) << 5) | ((t) << 4) | ((a) << 3) | (m as u8)
+}
+
+static OP_MODES: [u8; NUM_OPCODES] = [
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),   // MOVE
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IAsBx),   // LOADI
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IAsBx),   // LOADF
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABx),    // LOADK
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABx),    // LOADKX
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // LOADFALSE
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // LFALSESKIP
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // LOADTRUE
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // LOADNIL
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // GETUPVAL
+    opmode_entry(0, 0, 0, 0, 0, OpMode::IABC),    // SETUPVAL
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // GETTABUP
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // GETTABLE
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // GETI
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // GETFIELD
+    opmode_entry(0, 0, 0, 0, 0, OpMode::IABC),    // SETTABUP
+    opmode_entry(0, 0, 0, 0, 0, OpMode::IABC),    // SETTABLE
+    opmode_entry(0, 0, 0, 0, 0, OpMode::IABC),    // SETI
+    opmode_entry(0, 0, 0, 0, 0, OpMode::IABC),    // SETFIELD
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IvABC),   // NEWTABLE
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // SELF
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // ADDI
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // ADDK
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // SUBK
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // MULK
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // MODK
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // POWK
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // DIVK
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // IDIVK
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // BANDK
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // BORK
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // BXORK
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // SHLI
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // SHRI
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // ADD
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // SUB
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // MUL
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // MOD
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // POW
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // DIV
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // IDIV
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // BAND
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // BOR
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // BXOR
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // SHL
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // SHR
+    opmode_entry(1, 0, 0, 0, 0, OpMode::IABC),    // MMBIN
+    opmode_entry(1, 0, 0, 0, 0, OpMode::IABC),    // MMBINI
+    opmode_entry(1, 0, 0, 0, 0, OpMode::IABC),    // MMBINK
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // UNM
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // BNOT
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // NOT
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // LEN
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // CONCAT
+    opmode_entry(0, 0, 0, 0, 0, OpMode::IABC),    // CLOSE
+    opmode_entry(0, 0, 0, 0, 0, OpMode::IABC),    // TBC
+    opmode_entry(0, 0, 0, 0, 0, OpMode::IsJ),     // JMP
+    opmode_entry(0, 0, 0, 1, 0, OpMode::IABC),    // EQ
+    opmode_entry(0, 0, 0, 1, 0, OpMode::IABC),    // LT
+    opmode_entry(0, 0, 0, 1, 0, OpMode::IABC),    // LE
+    opmode_entry(0, 0, 0, 1, 0, OpMode::IABC),    // EQK
+    opmode_entry(0, 0, 0, 1, 0, OpMode::IABC),    // EQI
+    opmode_entry(0, 0, 0, 1, 0, OpMode::IABC),    // LTI
+    opmode_entry(0, 0, 0, 1, 0, OpMode::IABC),    // LEI
+    opmode_entry(0, 0, 0, 1, 0, OpMode::IABC),    // GTI
+    opmode_entry(0, 0, 0, 1, 0, OpMode::IABC),    // GEI
+    opmode_entry(0, 0, 0, 1, 0, OpMode::IABC),    // TEST
+    opmode_entry(0, 0, 0, 1, 1, OpMode::IABC),    // TESTSET
+    opmode_entry(0, 1, 1, 0, 1, OpMode::IABC),    // CALL
+    opmode_entry(0, 1, 1, 0, 1, OpMode::IABC),    // TAILCALL
+    opmode_entry(0, 0, 1, 0, 0, OpMode::IABC),    // RETURN
+    opmode_entry(0, 0, 0, 0, 0, OpMode::IABC),    // RETURN0
+    opmode_entry(0, 0, 0, 0, 0, OpMode::IABC),    // RETURN1
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABx),    // FORLOOP
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABx),    // FORPREP
+    opmode_entry(0, 0, 0, 0, 0, OpMode::IABx),    // TFORPREP
+    opmode_entry(0, 0, 0, 0, 0, OpMode::IABC),    // TFORCALL
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABx),    // TFORLOOP
+    opmode_entry(0, 0, 1, 0, 0, OpMode::IvABC),   // SETLIST
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABx),    // CLOSURE
+    opmode_entry(0, 1, 0, 0, 1, OpMode::IABC),    // VARARG
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IABC),    // GETVARG
+    opmode_entry(0, 0, 0, 0, 0, OpMode::IABx),    // ERRNNIL
+    opmode_entry(0, 0, 1, 0, 1, OpMode::IABC),    // VARARGPREP
+    opmode_entry(0, 0, 0, 0, 0, OpMode::IAx),     // EXTRAARG
+];
+
 pub fn opmodes() -> &'static [u8] {
-    unsafe { &bindings::LUA_P_OPMODES[..] }
+    &OP_MODES
 }
 
 #[inline]
 pub fn get_opmode(op: OpCode) -> OpMode {
-    unsafe { std::mem::transmute::<u8, OpMode>(opmodes()[op as usize] & 7) }
+    let raw = OP_MODES[op as usize] & 7;
+    unsafe { std::mem::transmute::<u8, OpMode>(raw) }
 }
 
-// ============================================================================
-// FFI — 直接调用 C 的 luaP_isOT / luaP_isIT
-// ============================================================================
+#[inline] pub fn is_ot(i: Instruction) -> bool {
+    let op = get_opcode(i);
+    match op {
+        OpCode::TAILCALL => true,
+        _ => test_ot_mode(op) && getarg_c(i) == 0,
+    }
+}
 
-#[inline] pub fn is_ot(i: Instruction) -> bool { unsafe { bindings::luaP_isOT(i) != 0 } }
-#[inline] pub fn is_it(i: Instruction) -> bool { unsafe { bindings::luaP_isIT(i) != 0 } }
+#[inline] pub fn is_it(i: Instruction) -> bool {
+    let op = get_opcode(i);
+    match op {
+        OpCode::SETLIST => test_it_mode(op) && getarg_vb(i) == 0,
+        _ => test_it_mode(op) && getarg_b(i) == 0,
+    }
+}
 
-#[inline] pub fn test_a_mode(op: OpCode) -> bool { opmodes()[op as usize] & (1 << 3) != 0 }
-#[inline] pub fn test_t_mode(op: OpCode) -> bool { opmodes()[op as usize] & (1 << 4) != 0 }
-#[inline] pub fn test_it_mode(op: OpCode) -> bool { opmodes()[op as usize] & (1 << 5) != 0 }
-#[inline] pub fn test_ot_mode(op: OpCode) -> bool { opmodes()[op as usize] & (1 << 6) != 0 }
-#[inline] pub fn test_mm_mode(op: OpCode) -> bool { opmodes()[op as usize] & (1 << 7) != 0 }
+#[inline] pub fn test_a_mode(op: OpCode) -> bool { OP_MODES[op as usize] & (1 << 3) != 0 }
+#[inline] pub fn test_t_mode(op: OpCode) -> bool { OP_MODES[op as usize] & (1 << 4) != 0 }
+#[inline] pub fn test_it_mode(op: OpCode) -> bool { OP_MODES[op as usize] & (1 << 5) != 0 }
+#[inline] pub fn test_ot_mode(op: OpCode) -> bool { OP_MODES[op as usize] & (1 << 6) != 0 }
+#[inline] pub fn test_mm_mode(op: OpCode) -> bool { OP_MODES[op as usize] & (1 << 7) != 0 }
 
 // ============================================================================
 // 指令创建
