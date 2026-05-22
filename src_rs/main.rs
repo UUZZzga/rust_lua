@@ -338,16 +338,6 @@ impl Interpreter {
         if n > 0 {
             self.l.check_stack(MIN_STACK);
             self.l.get_global("print");
-            if self.l.get_type(-1) != LuaType::Function {
-                self.l.pop(n + 1);
-                let mut stderr = io::stderr().lock();
-                let _ = write!(
-                    stderr,
-                    "{}: error calling 'print' (value is not a function)\n",
-                    self.progname
-                );
-                return;
-            }
             self.l.rotate(1, 1);
             if self.l.pcall(n, 0, 0) != 0 {
                 let err_msg = self.l.to_string(-1).unwrap_or_else(|| "(error)".to_string());

@@ -5,13 +5,21 @@
     "version": "0.2.0",
     "configurations": [
         {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Launch Rust Lua",
+            "program": "${workspaceFolder}/target/debug/lua",
+            "args": ["tests/all.lua"],
+            "cwd": "${workspaceFolder}/tests_lua",
+        },
+        {
             "name": "(gdb) 启动",
             "type": "cppdbg",
             "request": "launch",
             "program": "${workspaceFolder}/build/lua",
             "args": ["tests/all.lua"],
             "stopAtEntry": false,
-            "cwd": "${workspaceFolder}/tests",
+            "cwd": "${workspaceFolder}/tests_lua",
             "environment": [],
             "externalConsole": false,
             "MIMode": "gdb",

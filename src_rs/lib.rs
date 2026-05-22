@@ -23,6 +23,8 @@ pub mod objects;
 
 // 解释器状态
 pub mod state;
+// 编译器 — 纯 Rust 实现的词法分析器 + 解析器 + 代码生成器
+pub mod compiler;
 
 // 虚拟机核心 (lvm.h/lvm.cpp — 转换、比较、算术、表访问、解释器循环)
 pub mod vm;

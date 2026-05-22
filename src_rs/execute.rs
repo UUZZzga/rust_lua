@@ -74,6 +74,14 @@ pub struct VmExecutor;
 impl VmExecutor {
     pub fn execute(proto: &Proto, base: usize, stack: Vec<TValue>, gc: Rc<GCState>) -> Result<VmResult, VmError> {
         let mut state = LuaState::from_proto(proto, base, stack, gc);
+        Self::execute_loop(&mut state)
+    }
+
+    pub fn execute_with_state(state: &mut LuaState) -> Result<VmResult, VmError> {
+        Self::execute_loop(state)
+    }
+
+    fn execute_loop(state: &mut LuaState) -> Result<VmResult, VmError> {
 
         loop {
             if state.pc >= state.code.len() {
@@ -84,90 +92,95 @@ impl VmExecutor {
             let op = opcodes::get_opcode(inst);
 
             match op {
-                OpCode::MOVE => Self::op_move(&mut state, inst),
-                OpCode::LOADI => Self::op_loadi(&mut state, inst),
-                OpCode::LOADF => Self::op_loadf(&mut state, inst),
-                OpCode::LOADK => Self::op_loadk(&mut state, inst),
-                OpCode::LOADKX => Self::op_loadkx(&mut state, inst),
-                OpCode::LOADFALSE => Self::op_loadfalse(&mut state, inst),
-                OpCode::LFALSESKIP => Self::op_lfalseskip(&mut state, inst),
-                OpCode::LOADTRUE => Self::op_loadtrue(&mut state, inst),
-                OpCode::LOADNIL => Self::op_loadnil(&mut state, inst),
-                OpCode::GETUPVAL => Self::op_getupval(&mut state, inst),
-                OpCode::SETUPVAL => Self::op_setupval(&mut state, inst),
-                OpCode::GETTABUP => Self::op_gettabup(&mut state, inst),
-                OpCode::GETTABLE => Self::op_gettable(&mut state, inst),
-                OpCode::GETI => Self::op_geti(&mut state, inst),
-                OpCode::GETFIELD => Self::op_getfield(&mut state, inst),
-                OpCode::SETTABUP => Self::op_settabup(&mut state, inst),
-                OpCode::SETTABLE => Self::op_settable(&mut state, inst),
-                OpCode::SETI => Self::op_seti(&mut state, inst),
-                OpCode::SETFIELD => Self::op_setfield(&mut state, inst),
-                OpCode::NEWTABLE => Self::op_newtable(&mut state, inst),
-                OpCode::SELF => Self::op_self(&mut state, inst),
-                OpCode::ADDI => Self::op_addi(&mut state, inst),
-                OpCode::ADDK => Self::op_addk(&mut state, inst),
-                OpCode::SUBK => Self::op_subk(&mut state, inst),
-                OpCode::MULK => Self::op_mulk(&mut state, inst),
-                OpCode::MODK => Self::op_modk(&mut state, inst),
-                OpCode::POWK => Self::op_powk(&mut state, inst),
-                OpCode::DIVK => Self::op_divk(&mut state, inst),
-                OpCode::IDIVK => Self::op_idivk(&mut state, inst),
-                OpCode::BANDK => Self::op_bandk(&mut state, inst),
-                OpCode::BORK => Self::op_bork(&mut state, inst),
-                OpCode::BXORK => Self::op_bxork(&mut state, inst),
-                OpCode::SHLI => Self::op_shli(&mut state, inst),
-                OpCode::SHRI => Self::op_shri(&mut state, inst),
-                OpCode::ADD => Self::op_add(&mut state, inst),
-                OpCode::SUB => Self::op_sub(&mut state, inst),
-                OpCode::MUL => Self::op_mul(&mut state, inst),
-                OpCode::MOD => Self::op_mod(&mut state, inst),
-                OpCode::POW => Self::op_pow(&mut state, inst),
-                OpCode::DIV => Self::op_div(&mut state, inst),
-                OpCode::IDIV => Self::op_idiv(&mut state, inst),
-                OpCode::BAND => Self::op_band(&mut state, inst),
-                OpCode::BOR => Self::op_bor(&mut state, inst),
-                OpCode::BXOR => Self::op_bxor(&mut state, inst),
-                OpCode::SHL => Self::op_shl(&mut state, inst),
-                OpCode::SHR => Self::op_shr(&mut state, inst),
-                OpCode::MMBIN => Self::op_mmbin(&mut state, inst),
-                OpCode::MMBINI => Self::op_mmbini(&mut state, inst),
-                OpCode::MMBINK => Self::op_mmbink(&mut state, inst),
-                OpCode::UNM => Self::op_unm(&mut state, inst),
-                OpCode::BNOT => Self::op_bnot(&mut state, inst),
-                OpCode::NOT => Self::op_not(&mut state, inst),
-                OpCode::LEN => Self::op_len(&mut state, inst),
-                OpCode::CONCAT => Self::op_concat(&mut state, inst),
-                OpCode::CLOSE => Self::op_close(&mut state, inst),
-                OpCode::TBC => Self::op_tbc(&mut state, inst),
-                OpCode::JMP => Self::op_jmp(&mut state, inst),
-                OpCode::EQ => Self::op_eq(&mut state, inst),
-                OpCode::LT => Self::op_lt(&mut state, inst),
-                OpCode::LE => Self::op_le(&mut state, inst),
-                OpCode::EQK => Self::op_eqk(&mut state, inst),
-                OpCode::EQI => Self::op_eqi(&mut state, inst),
-                OpCode::LTI => Self::op_lti(&mut state, inst),
-                OpCode::LEI => Self::op_lei(&mut state, inst),
-                OpCode::GTI => Self::op_gti(&mut state, inst),
-                OpCode::GEI => Self::op_gei(&mut state, inst),
-                OpCode::TEST => Self::op_test(&mut state, inst),
-                OpCode::TESTSET => Self::op_testset(&mut state, inst),
-                OpCode::CALL => return Self::op_call(&mut state, inst),
-                OpCode::TAILCALL => return Self::op_tailcall(&mut state, inst),
-                OpCode::RETURN => return Self::op_return(&mut state, inst),
+                OpCode::MOVE => Self::op_move(state, inst),
+                OpCode::LOADI => Self::op_loadi(state, inst),
+                OpCode::LOADF => Self::op_loadf(state, inst),
+                OpCode::LOADK => Self::op_loadk(state, inst),
+                OpCode::LOADKX => Self::op_loadkx(state, inst),
+                OpCode::LOADFALSE => Self::op_loadfalse(state, inst),
+                OpCode::LFALSESKIP => Self::op_lfalseskip(state, inst),
+                OpCode::LOADTRUE => Self::op_loadtrue(state, inst),
+                OpCode::LOADNIL => Self::op_loadnil(state, inst),
+                OpCode::GETUPVAL => Self::op_getupval(state, inst),
+                OpCode::SETUPVAL => Self::op_setupval(state, inst),
+                OpCode::GETTABUP => Self::op_gettabup(state, inst),
+                OpCode::GETTABLE => Self::op_gettable(state, inst),
+                OpCode::GETI => Self::op_geti(state, inst),
+                OpCode::GETFIELD => Self::op_getfield(state, inst),
+                OpCode::SETTABUP => Self::op_settabup(state, inst),
+                OpCode::SETTABLE => Self::op_settable(state, inst),
+                OpCode::SETI => Self::op_seti(state, inst),
+                OpCode::SETFIELD => Self::op_setfield(state, inst),
+                OpCode::NEWTABLE => Self::op_newtable(state, inst),
+                OpCode::SELF => Self::op_self(state, inst),
+                OpCode::ADDI => Self::op_addi(state, inst),
+                OpCode::ADDK => Self::op_addk(state, inst),
+                OpCode::SUBK => Self::op_subk(state, inst),
+                OpCode::MULK => Self::op_mulk(state, inst),
+                OpCode::MODK => Self::op_modk(state, inst),
+                OpCode::POWK => Self::op_powk(state, inst),
+                OpCode::DIVK => Self::op_divk(state, inst),
+                OpCode::IDIVK => Self::op_idivk(state, inst),
+                OpCode::BANDK => Self::op_bandk(state, inst),
+                OpCode::BORK => Self::op_bork(state, inst),
+                OpCode::BXORK => Self::op_bxork(state, inst),
+                OpCode::SHLI => Self::op_shli(state, inst),
+                OpCode::SHRI => Self::op_shri(state, inst),
+                OpCode::ADD => Self::op_add(state, inst),
+                OpCode::SUB => Self::op_sub(state, inst),
+                OpCode::MUL => Self::op_mul(state, inst),
+                OpCode::MOD => Self::op_mod(state, inst),
+                OpCode::POW => Self::op_pow(state, inst),
+                OpCode::DIV => Self::op_div(state, inst),
+                OpCode::IDIV => Self::op_idiv(state, inst),
+                OpCode::BAND => Self::op_band(state, inst),
+                OpCode::BOR => Self::op_bor(state, inst),
+                OpCode::BXOR => Self::op_bxor(state, inst),
+                OpCode::SHL => Self::op_shl(state, inst),
+                OpCode::SHR => Self::op_shr(state, inst),
+                OpCode::MMBIN => Self::op_mmbin(state, inst),
+                OpCode::MMBINI => Self::op_mmbini(state, inst),
+                OpCode::MMBINK => Self::op_mmbink(state, inst),
+                OpCode::UNM => Self::op_unm(state, inst),
+                OpCode::BNOT => Self::op_bnot(state, inst),
+                OpCode::NOT => Self::op_not(state, inst),
+                OpCode::LEN => Self::op_len(state, inst),
+                OpCode::CONCAT => Self::op_concat(state, inst),
+                OpCode::CLOSE => Self::op_close(state, inst),
+                OpCode::TBC => Self::op_tbc(state, inst),
+                OpCode::JMP => Self::op_jmp(state, inst),
+                OpCode::EQ => Self::op_eq(state, inst),
+                OpCode::LT => Self::op_lt(state, inst),
+                OpCode::LE => Self::op_le(state, inst),
+                OpCode::EQK => Self::op_eqk(state, inst),
+                OpCode::EQI => Self::op_eqi(state, inst),
+                OpCode::LTI => Self::op_lti(state, inst),
+                OpCode::LEI => Self::op_lei(state, inst),
+                OpCode::GTI => Self::op_gti(state, inst),
+                OpCode::GEI => Self::op_gei(state, inst),
+                OpCode::TEST => Self::op_test(state, inst),
+                OpCode::TESTSET => Self::op_testset(state, inst),
+                OpCode::CALL => {
+                    if let Some(result) = Self::op_call(state, inst)? {
+                        return Ok(result);
+                    }
+                    Ok(())
+                }
+                OpCode::TAILCALL => return Self::op_tailcall(state, inst),
+                OpCode::RETURN => return Self::op_return(state, inst),
                 OpCode::RETURN0 => return Ok(VmResult::Return(0)),
-                OpCode::RETURN1 => return Self::op_return1(&mut state, inst),
-                OpCode::FORLOOP => Self::op_forloop(&mut state, inst),
-                OpCode::FORPREP => Self::op_forprep(&mut state, inst),
-                OpCode::TFORPREP => Self::op_tforprep(&mut state, inst),
-                OpCode::TFORCALL => Self::op_tforcall(&mut state, inst),
-                OpCode::TFORLOOP => Self::op_tforloop(&mut state, inst),
-                OpCode::SETLIST => Self::op_setlist(&mut state, inst),
-                OpCode::CLOSURE => Self::op_closure(&mut state, inst),
-                OpCode::VARARG => Self::op_vararg(&mut state, inst),
-                OpCode::GETVARG => Self::op_getvarg(&mut state, inst),
-                OpCode::ERRNNIL => Self::op_errnnil(&mut state, inst),
-                OpCode::VARARGPREP => Self::op_varargprep(&mut state, inst),
+                OpCode::RETURN1 => return Self::op_return1(state, inst),
+                OpCode::FORLOOP => Self::op_forloop(state, inst),
+                OpCode::FORPREP => Self::op_forprep(state, inst),
+                OpCode::TFORPREP => Self::op_tforprep(state, inst),
+                OpCode::TFORCALL => Self::op_tforcall(state, inst),
+                OpCode::TFORLOOP => Self::op_tforloop(state, inst),
+                OpCode::SETLIST => Self::op_setlist(state, inst),
+                OpCode::CLOSURE => Self::op_closure(state, inst),
+                OpCode::VARARG => Self::op_vararg(state, inst),
+                OpCode::GETVARG => Self::op_getvarg(state, inst),
+                OpCode::ERRNNIL => Self::op_errnnil(state, inst),
+                OpCode::VARARGPREP => Self::op_varargprep(state, inst),
                 OpCode::EXTRAARG => {
                     return Err(VmError::IllegalOpcode(OpCode::EXTRAARG as u8));
                 }
@@ -258,7 +271,7 @@ impl VmExecutor {
 
     fn op_loadk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
-        let idx = opcodes::getarg_sbx(inst) as usize;
+        let idx = opcodes::getarg_bx(inst) as usize;
         let val = state.constants[idx].clone();
         Self::write_stack(state, a, val);
         state.pc += 1;
@@ -498,8 +511,9 @@ impl VmExecutor {
 
     fn op_addi(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
-        let imm = opcodes::getarg_sbx(inst) as i64;
-        let val = Self::read_stack(state, a).clone();
+        let b = Self::rb(state, inst);
+        let imm = (opcodes::getarg_c(inst) as i8) as i64;
+        let val = Self::read_stack(state, b).clone();
         match val {
             TValue::Integer(iv) => {
                 Self::write_stack(state, a, TValue::Integer(iv.wrapping_add(imm)));
@@ -976,10 +990,12 @@ impl VmExecutor {
 
     fn op_concat(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
-        let n = opcodes::getarg_b(inst) as usize;
+        let c_val = opcodes::getarg_c(inst) as usize;
+        let n = if c_val >= a { c_val - a + 1 } else { 1 };
         let mut vals: Vec<TValue> = Vec::with_capacity(n);
         for i in 0..n {
-            vals.push(Self::read_stack(state, a + i).clone());
+            let val = Self::read_stack(state, a + i).clone();
+            vals.push(val);
         }
         let dmt = DefaultMetatables::new();
         match concat_stack(&mut vals, n, &dmt) {
@@ -989,6 +1005,15 @@ impl VmExecutor {
                         std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: String::new() })
                     )));
                 Self::write_stack(state, a, result);
+                let top = a + n;
+                let size = state.stack.len();
+                if top < size {
+                    for i in (a + 1)..top {
+                        if i < state.stack.len() {
+                            state.stack[i] = TValue::Nil(NilKind::Strict);
+                        }
+                    }
+                }
             }
             Err(crate::tm::TagMethodError::ConcatError { .. }) => {
                 return Err(VmError::MetaMethodNotImplemented("__concat".to_string()));
@@ -1198,18 +1223,51 @@ impl VmExecutor {
 
     // ---- 调用 / 返回 ----
 
-    fn op_call(state: &mut LuaState, inst: Instruction) -> Result<VmResult, VmError> {
+    fn op_call(state: &mut LuaState, inst: Instruction) -> Result<Option<VmResult>, VmError> {
         let a = Self::ra(state, inst);
+        let b = opcodes::getarg_b(inst);
+        let c = opcodes::getarg_c(inst);
         let func_val = Self::read_stack(state, a).clone();
         match func_val {
-            TValue::LClosure(closure) => Ok(VmResult::Call {
+            TValue::LClosure(closure) => Ok(Some(VmResult::Call {
                 proto: closure.proto,
                 base: a + 1,
-                num_results: opcodes::getarg_c(inst) - 1,
-            }),
+                num_results: c - 1,
+            })),
+            TValue::LightUserData(tag) => {
+                let tag_val = tag as usize;
+                if tag_val == 1 {
+                    let mut s = String::new();
+                    for i in (a + 1)..(a + b as usize) {
+                        if i > a + 1 { s.push('\t'); }
+                        let val = Self::read_stack(state, i);
+                        match val {
+                            TValue::Nil(_) => s.push_str("nil"),
+                            TValue::Boolean(bv) => s.push_str(if *bv { "true" } else { "false" }),
+                            TValue::Integer(n) => s.push_str(&n.to_string()),
+                            TValue::Float(n) => {
+                                if n.is_nan() { s.push_str("nan"); }
+                                else if n.is_infinite() { s.push_str(if *n > 0.0 { "inf" } else { "-inf" }); }
+                                else { s.push_str(&n.to_string()); }
+                            }
+                            TValue::Str(lst) => s.push_str(&lst.as_str()),
+                            TValue::Table(_) => s.push_str("table: 0x0"),
+                            TValue::LClosure(_) | TValue::LCFn(_) | TValue::CClosure(_) => s.push_str("function: 0x0"),
+                            _ => s.push_str(&format!("{:?}", val)),
+                        }
+                    }
+                    println!("{}", s);
+                }
+                let nresults = if c >= 1 { c - 1 } else { 0 };
+                for i in 0..nresults {
+                    Self::write_stack(state, a + i as usize, TValue::Nil(NilKind::Strict));
+                }
+                state.pc += 1;
+                Ok(None)
+            }
             _ => {
                 state.pc += 1;
-                Ok(VmResult::Done)
+                Ok(Some(VmResult::Done))
             }
         }
     }
@@ -1433,7 +1491,7 @@ impl VmExecutor {
 
     fn op_closure(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let ra = Self::ra(state, inst);
-        let bx = opcodes::getarg_sbx(inst) as usize;
+        let bx = opcodes::getarg_bx(inst) as usize;
         if bx < state.protos.len() {
             let proto = state.protos[bx].clone();
             let closure = LClosure { gc_header: crate::gc::GCObjectHeader::new(), proto, upvals: Vec::new() };
@@ -1970,7 +2028,7 @@ mod tests {
     #[test]
     fn test_execute_loadk() {
         let constants = vec![TValue::Integer(42)];
-        let code = vec![make_asbx(OpCode::LOADK, 0, 0)];
+        let code = vec![make_bx(OpCode::LOADK, 0, 0)];
         let proto = make_proto(code, constants);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }

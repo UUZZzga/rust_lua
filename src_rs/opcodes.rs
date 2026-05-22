@@ -96,6 +96,7 @@ pub const MAX_FSTACK: u8 = NO_REG;
 #[inline] pub fn getarg_vb(i: Instruction) -> i32 { getarg(i, POS_VB, SIZE_VB) }
 #[inline] pub fn getarg_c(i: Instruction) -> i32 { getarg(i, POS_C, SIZE_C) }
 #[inline] pub fn testarg_k(i: Instruction) -> bool { (i & (1u32 << POS_K)) != 0 }
+#[inline] pub fn getarg_bx(i: Instruction) -> i32 { getarg(i, POS_BX, SIZE_BX) }
 #[inline] pub fn getarg_sbx(i: Instruction) -> i32 { getarg(i, POS_BX, SIZE_BX) - OFFSET_SBX }
 #[inline] pub fn getarg_sj(i: Instruction) -> i32 {
     let v = getarg(i, POS_SJ, SIZE_BX + SIZE_A);

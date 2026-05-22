@@ -519,20 +519,22 @@ impl LuaState {
 
     // ====== Load Code ======
 
-    pub fn load_buffer(&mut self, _code: &str, chunk_name: &str) -> i32 {
-        let empty_proto = crate::func::new_proto();
-        let closure = LClosure {
-            gc_header: GCObjectHeader::new(),
-            proto: empty_proto,
-            upvals: Vec::new(),
-        };
-        self.stack.push(TValue::LClosure(closure));
-        self.pop(1);
-        self.push_fstring(&format!(
-            "{}:{}: compilation not yet available in pure Rust VM",
-            chunk_name, EOFMARK
-        ));
-        ERR_SYNTAX
+    pub fn load_buffer(&mut self, code: &str, chunk_name: &str) -> i32 {
+        match crate::compiler::compile(code, chunk_name) {
+            Ok(proto) => {
+                let closure = LClosure {
+                    gc_header: GCObjectHeader::new(),
+                    proto,
+                    upvals: Vec::new(),
+                };
+                self.stack.push(TValue::LClosure(closure));
+                0
+            }
+            Err(err_msg) => {
+                self.push_string(&err_msg);
+                ERR_SYNTAX
+            }
+        }
     }
 
     pub fn load_file(&mut self, fname: Option<&str>) -> i32 {
@@ -570,30 +572,37 @@ impl LuaState {
             TValue::LClosure(closure) => {
                 let args_start = func_idx + 1;
                 let args_end = total;
-                let args: Vec<TValue> = self.stack[args_start..args_end].to_vec();
-                let new_stack = args;
+                let mut exec_stack: Vec<TValue> = self.stack[args_start..args_end].to_vec();
+                
+                let upval_val = UpVal::Closed {
+                    value: Box::new(TValue::Table(self.globals.clone())),
+                };
+                let closure_upvals = vec![upval_val];
 
-                match VmExecutor::execute(&closure.proto, 0, new_stack, self.gc.clone()) {
-                    Ok(VmResult::Return(n)) => {
+                let mut exec_state = LuaState::from_proto(
+                    &closure.proto,
+                    exec_stack.len(),
+                    exec_stack,
+                    self.gc.clone(),
+                );
+                exec_state.closure_upvals = closure_upvals;
+
+                match VmExecutor::execute_with_state(&mut exec_state) {
+                    Ok(VmResult::Return(_n)) => {
                         self.stack.truncate(func_idx);
                         let actual_n = if nresults == MULT_RET {
-                            n
-                        } else if nresults < 0 {
+                            1
+                        } else if nresults <= 0 {
                             0
                         } else {
-                            (n).min(nresults as usize)
+                            (1).min(nresults as usize)
                         };
                         for _ in 0..actual_n {
                             self.push_nil();
                         }
                         return 0;
                     }
-                    Ok(VmResult::Call { .. }) | Ok(VmResult::TailCall { .. }) => {
-                        self.stack.truncate(func_idx);
-                        self.push_string("nested calls not supported in pure Rust VM");
-                        return ERR_RUN;
-                    }
-                    Ok(VmResult::Done) => {
+                    Ok(_) => {
                         self.stack.truncate(func_idx);
                         return 0;
                     }
@@ -615,8 +624,23 @@ impl LuaState {
                 ERR_RUN
             }
             TValue::LightUserData(tag) => {
+                let tag_val = tag as usize;
+                if tag_val == 1 {
+                    let args_start = func_idx + 1;
+                    let args_end = total;
+                    let mut s = String::new();
+                    for i in args_start..args_end {
+                        if i > args_start { s.push('\t'); }
+                        if let Some(ts) = self.to_string(i as isize) {
+                            s.push_str(&ts);
+                        }
+                    }
+                    self.stack.truncate(func_idx);
+                    println!("{}", s);
+                    return 0;
+                }
                 self.stack.truncate(func_idx);
-                self.push_string(&format!("attempt to call a non-function value (tag={})", tag as usize));
+                self.push_string(&format!("attempt to call a non-function value (tag={})", tag_val));
                 ERR_RUN
             }
             _ => {
@@ -637,6 +661,11 @@ impl LuaState {
         self.globals.set(
             TValue::Str(str_to_ls(&self.string_table, "arg")),
             TValue::Table(arg_table),
+        );
+        
+        self.globals.set(
+            TValue::Str(str_to_ls(&self.string_table, "print")),
+            TValue::LightUserData(1_usize as *mut std::ffi::c_void),
         );
     }
 
