@@ -12,6 +12,7 @@ pub type lua_Unsigned = u64;
 pub type lua_KContext = isize;
 pub type lua_KFunction =
     unsafe extern "C" fn(L: *mut lua_State, status: c_int, ctx: lua_KContext) -> c_int;
+pub type lua_Writer = unsafe extern "C" fn(L: *mut lua_State, p: *const c_void, sz: usize, ud: *mut c_void) -> c_int;
 
 pub const LUA_OK: c_int = 0;
 pub const LUA_ERRRUN: c_int = 2;
@@ -91,6 +92,13 @@ extern "C" {
     pub fn lua_sethook(L: *mut lua_State, func: Option<lua_Hook>, mask: c_int, count: c_int) -> c_int;
 
     pub fn lua_warning(L: *mut lua_State, msg: *const c_char, tocont: c_int);
+
+    pub fn lua_dump(
+        L: *mut lua_State,
+        writer: lua_Writer,
+        data: *mut c_void,
+        strip: c_int,
+    ) -> c_int;
 
     pub fn luaL_loadfilex(
         L: *mut lua_State,

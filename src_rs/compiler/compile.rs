@@ -62,9 +62,10 @@ pub struct FuncState {
 pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
     let mut fs = FuncState::new(ls);
     fs.proto.num_params = 0;
-    fs.proto.flag = 0;
+    fs.proto.flag = PF_VAHID;
 
     ls.next();
+    fs.code_abc(OpCode::VARARGPREP, 0, 0, 0);
     parse_chunk(&mut fs);
 
     if !fs.errors.is_empty() {
@@ -294,11 +295,29 @@ impl FuncState {
     }
 
     fn return_stat_gen(&mut self, first: i32, nret: i32) {
+        let is_vararg = (self.proto.flag & PF_VAHID) != 0;
+        let c = if is_vararg { self.proto.num_params as i32 + 1 } else { 0 };
         match nret {
-            0 => { self.code_ax(OpCode::RETURN0, 0); }
-            1 => { self.code_abc(OpCode::RETURN1, first, 0, 0); }
-            _ => { self.code_abc(OpCode::RETURN, first, nret + 1, 0); }
+            0 => {
+                if is_vararg {
+                    self.code_abc(OpCode::RETURN, first, 1, c);
+                } else {
+                    self.code_abc(OpCode::RETURN0, first, 1, 0);
+                }
+            }
+            1 => {
+                if is_vararg {
+                    self.code_abc(OpCode::RETURN, first, 2, c);
+                } else {
+                    self.code_abc(OpCode::RETURN1, first, 2, 0);
+                }
+            }
+            _ => { self.code_abc(OpCode::RETURN, first, nret + 1, c); }
         }
+    }
+
+    fn nvarstack(&self) -> i32 {
+        self.proto.num_params as i32
     }
 }
 
@@ -359,11 +378,16 @@ fn parse_chunk(fs: &mut FuncState) {
     if !is_last {
         parse_block(fs);
     }
-    fs.return_stat_gen(0, 0);
+    let nvarstack = fs.nvarstack();
+    fs.return_stat_gen(nvarstack, 0);
 }
 
 fn parse_block(fs: &mut FuncState) {
-    while !block_follow(fs, true) && !check(fs, &Token::Return) {
+    while !block_follow(fs, true) {
+        if check(fs, &Token::Return) {
+            parse_statement(fs);
+            return;
+        }
         parse_statement(fs);
     }
 }
@@ -379,8 +403,24 @@ fn parse_statement(fs: &mut FuncState) {
         Token::Local => parse_local(fs),
         Token::Return => parse_return(fs),
         Token::Semi => { fs.ls_mut().next(); }
-        Token::Name(_) | Token::LParen => {
-            parse_assign_or_call(fs);
+        Token::Break => { fs.ls_mut().next(); }
+        Token::Name(_)
+        | Token::LParen
+        | Token::Nil
+        | Token::False
+        | Token::True
+        | Token::Int(_)
+        | Token::Float(_)
+        | Token::String(_)
+        | Token::LBrace
+        | Token::Minus
+        | Token::Not
+        | Token::Hash
+        | Token::Tilde => {
+            let ei = parse_expr(fs);
+            let _r = fs.expr_to_reg(&ei.exp);
+            fs.free_reg();
+            if check(fs, &Token::Semi) { fs.ls_mut().next(); }
         }
         _ => {
             fs.error(&format!("unexpected token: {:?}", fs.ls().token));
@@ -583,12 +623,11 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
     let mut e = parse_simple_exp(fs);
     
     loop {
-        let ec = e.exp.clone();
-        let r = fs.expr_to_reg(&ec);
-        
         let mut matched = false;
         
         if limit <= PREC_OR && (check(fs, &Token::Or) || check(fs, &Token::And)) {
+            let ec = e.exp.clone();
+            let r = fs.expr_to_reg(&ec);
             let is_and = check(fs, &Token::And);
             fs.ls_mut().next();
             let e2 = parse_subexpr(fs, if is_and { PREC_AND + 1 } else { PREC_OR + 1 });
@@ -611,6 +650,8 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         }
         
         if limit <= PREC_COMP && check_compare(fs) {
+            let ec = e.exp.clone();
+            let r = fs.expr_to_reg(&ec);
             let op_tok = fs.ls().token.clone();
             fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_COMP + 1);
@@ -641,6 +682,8 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         }
         
         if limit <= PREC_CONCAT && check(fs, &Token::DotDot) {
+            let ec = e.exp.clone();
+            let r = fs.expr_to_reg(&ec);
             fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_CONCAT + 1);
             let r2 = fs.expr_to_reg(&e2.exp);
@@ -650,6 +693,8 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         }
         
         if limit <= PREC_ADD && check_addop(fs) {
+            let ec = e.exp.clone();
+            let r = fs.expr_to_reg(&ec);
             let is_add = check(fs, &Token::Plus);
             fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_ADD + 1);
@@ -668,6 +713,8 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         }
         
         if limit <= PREC_MUL && check_mulop(fs) {
+            let ec = e.exp.clone();
+            let r = fs.expr_to_reg(&ec);
             let is_mul = check(fs, &Token::Star);
             let is_div = check(fs, &Token::Slash);
             fs.ls_mut().next();

@@ -745,11 +745,8 @@ static int pmain (lua_State *L) {
   return 1;
 }
 
-extern "C" lua_State *lua_rs_newstate();
-
 int main (int argc, char **argv) {
   int status, result;
-  lua_rs_newstate();
   lua_State *L = luaL_newstate();  /* create state */
   if (L == NULL) {
     l_message(argv[0], "cannot create state: not enough memory");

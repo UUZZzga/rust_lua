@@ -1,5 +1,8 @@
 pub mod lexer;
 pub mod compile;
+pub mod bytecode_dump;
+#[cfg(test)]
+mod cmp_tests;
 
 use crate::objects::Proto;
 

@@ -10,10 +10,19 @@ option(LUA_USE_READLINE "Enable readline support" OFF)
 option(LUA_COMPAT_MATHLIB "Enable deprecated math functions" OFF)
 
 # Compile options
+include(CheckCCompilerFlag)
+include(CheckCXXCompilerFlag)
+
+# 检查 C++ 编译器是否支持 -g3
+check_cxx_compiler_flag("-g3" CXX_COMPILER_SUPPORTS_G3)
+if(CXX_COMPILER_SUPPORTS_G3)
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g3")
+endif()
+
 set(LUA_COMPILE_OPTIONS -Wall -Wextra)
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
-    list(APPEND LUA_COMPILE_OPTIONS -g -O0)
+    list(APPEND LUA_COMPILE_OPTIONS -O0)
 else()
     list(APPEND LUA_COMPILE_OPTIONS -O2)
 endif()
