@@ -21,14 +21,14 @@ pub enum ExpKind {
 #[derive(Debug, Clone)]
 pub struct ExpDesc {
     pub kind: ExpKind,
-    pub info: i32,
+    pub info: i64,
     pub info2: i32,
     pub t: i32,
     pub f: i32,
 }
 
 impl ExpDesc {
-    pub fn new(kind: ExpKind, info: i32) -> Self {
+    pub fn new(kind: ExpKind, info: i64) -> Self {
         ExpDesc { kind, info, info2: 0, t: NO_JUMP, f: NO_JUMP }
     }
 }
@@ -97,7 +97,7 @@ impl FuncState {
     fn ls_mut(&mut self) -> &mut LexState { unsafe { &mut *self.ls } }
 
     fn error(&mut self, msg: &str) {
-        self.errors.push(format!("{}: {}", self.ls().chunk_name, msg));
+        self.errors.push(format!("{}:{}: {}", self.ls().chunk_name, self.ls().pos, msg));
     }
 }
 
@@ -133,10 +133,10 @@ impl FuncState {
         self.emit(ins)
     }
 
-    fn code_sj(&mut self, op: OpCode, sj: i32) -> i32 {
-        let offset: i32 = ((((1i64 << (SIZE_BX + SIZE_A)) - 1) >> 1) as i32);
+    fn code_sj(&mut self, op: OpCode, sj: i32, k: i32) -> i32 {
         let ins = ((op as u32) << POS_OP)
-            | ((((sj + offset) as u32) & mask1(SIZE_BX + SIZE_A, 0)) << POS_A);
+            | ((((sj + OFFSET_sJ) as u32) & mask1(SIZE_sJ, 0)) << POS_SJ)
+            | (((k & 1) as u32) << POS_K);
         self.emit(ins)
     }
 
@@ -168,14 +168,14 @@ impl FuncState {
                 setarg(i, offset, POS_BX, SIZE_BX);
             }
             OpMode::IsJ => {
-                setarg(i, dest - pc, POS_SJ, SIZE_BX + SIZE_A);
+                setarg(i, (dest - pc - 1) + OFFSET_sJ, POS_SJ, SIZE_sJ);
             }
             _ => {}
         }
     }
 
     fn jump(&mut self) -> i32 {
-        self.code_sj(OpCode::JMP, NO_JUMP)
+        self.code_sj(OpCode::JMP, NO_JUMP, 0)
     }
 
     fn const_k(&mut self, value: TValue) -> i32 {
@@ -253,7 +253,7 @@ impl FuncState {
             }
             ExpKind::Int => {
                 let r = self.alloc_reg();
-                let val = e.info as i64;
+                let val = e.info;
                 if val <= i16::MAX as i64 && val >= i16::MIN as i64 {
                     self.code_asbx(OpCode::LOADI, r, val as i32);
                 } else {
@@ -265,22 +265,27 @@ impl FuncState {
             ExpKind::Float => {
                 let r = self.alloc_reg();
                 let f = f64::from_bits(e.info as u64);
-                let k = self.float_k(f);
-                self.code_abx(OpCode::LOADK, r, k);
+                let fi = f as i64;
+                if (fi as f64) == f && fits_sbx(fi) {
+                    self.code_asbx(OpCode::LOADF, r, fi as i32);
+                } else {
+                    let k = self.float_k(f);
+                    self.code_abx(OpCode::LOADK, r, k);
+                }
                 r
             }
             ExpKind::Str => {
                 let r = self.alloc_reg();
-                self.code_abx(OpCode::LOADK, r, e.info);
+                self.code_abx(OpCode::LOADK, r, e.info as i32);
                 r
             }
-            ExpKind::NonReloc => e.info,
+            ExpKind::NonReloc => e.info as i32,
             ExpKind::Relocable | ExpKind::Call | ExpKind::Vararg => {
-                if e.info == self.freereg - 1 {
-                    e.info
+                if e.info as i32 == self.freereg - 1 {
+                    e.info as i32
                 } else {
                     let r = self.alloc_reg();
-                    self.code_abc(OpCode::MOVE, r, e.info, 0);
+                    self.code_abc(OpCode::MOVE, r, e.info as i32, 0);
                     r
                 }
             }
@@ -289,7 +294,7 @@ impl FuncState {
 
     fn discharge_to_any_reg(&mut self, e: &ExpDesc) -> (i32, ExpDesc) {
         let r = self.expr_to_reg(e);
-        let mut ne = ExpDesc::new(ExpKind::NonReloc, r);
+        let mut ne = ExpDesc::new(ExpKind::NonReloc, r as i64);
         ne.info2 = e.info2;
         (r, ne)
     }
@@ -404,8 +409,11 @@ fn parse_statement(fs: &mut FuncState) {
         Token::Return => parse_return(fs),
         Token::Semi => { fs.ls_mut().next(); }
         Token::Break => { fs.ls_mut().next(); }
-        Token::Name(_)
-        | Token::LParen
+        Token::Name(_) => {
+            parse_assign_or_call(fs);
+            if check(fs, &Token::Semi) { fs.ls_mut().next(); }
+        }
+        Token::LParen
         | Token::Nil
         | Token::False
         | Token::True
@@ -435,13 +443,11 @@ fn parse_statement(fs: &mut FuncState) {
 
 fn parse_assign_or_call(fs: &mut FuncState) {
     let first = parse_prefix_exp(fs);
-    let has_reg = first.reg.is_some();
     
     if check(fs, &Token::LParen) || check(fs, &Token::Colon) || check(fs, &Token::Dot) || check(fs, &Token::LBrace) || matches!(&fs.ls().token, Token::String(..)) {
-        parse_func_args(fs, first);
-        if has_reg {
-            fs.free_reg();
-        }
+        let freg = load_func(fs, &first);
+        parse_func_args(fs, freg);
+        fs.free_reg();
         return;
     }
     
@@ -452,29 +458,75 @@ fn parse_assign_or_call(fs: &mut FuncState) {
             vars.push(parse_prefix_exp(fs));
         }
         expect(fs, &Token::Eq);
-        let _n_vals = parse_expr_list(fs);
-        for v in vars.iter().rev() {
-            if let Some(ref name) = v.var_name {
-                let val_reg = fs.freereg - 1;
-                fs.free_reg();
-                let k = fs.string_k(name);
-                fs.code_abc(OpCode::SETTABUP, 0, k, val_reg);
-            } else if let Some(idx) = v.local_idx {
-                let val_reg = fs.freereg - 1;
-                fs.free_reg();
-                if idx != val_reg {
-                    fs.code_abc(OpCode::MOVE, idx, val_reg, 0);
+        
+        let mut exps: Vec<ExpDesc> = Vec::new();
+        loop {
+            let ei = parse_expr(fs);
+            exps.push(ei.exp);
+            if !check(fs, &Token::Comma) { break; }
+            fs.ls_mut().next();
+        }
+        
+        for (i, v) in vars.iter().enumerate() {
+            if i < exps.len() {
+                let val = &exps[i];
+                if let Some(ref name) = v.var_name {
+                    let k_name = fs.string_k(name);
+                    if let Some(k_val) = exp_to_k(fs, val) {
+                        fs.code_abc_k(OpCode::SETTABUP, 0, k_name, k_val, true);
+                    } else {
+                        let val_reg = fs.expr_to_reg(val);
+                        fs.code_abc(OpCode::SETTABUP, 0, k_name, val_reg);
+                        fs.free_reg();
+                    }
+                } else if let Some(idx) = v.local_idx {
+                    let val_reg = fs.expr_to_reg(val);
+                    if idx != val_reg {
+                        fs.code_abc(OpCode::MOVE, idx, val_reg, 0);
+                    }
+                    fs.free_reg();
                 }
             }
         }
-    } else {
-        if has_reg {
-            fs.free_reg();
+        return;
+    }
+    
+    let _r = load_func(fs, &first);
+    fs.free_reg();
+}
+
+fn exp_to_k(fs: &mut FuncState, e: &ExpDesc) -> Option<i32> {
+    let info = match e.kind {
+        ExpKind::Int => fs.int_k(e.info),
+        ExpKind::Float => {
+            let f = f64::from_bits(e.info as u64);
+            fs.float_k(f)
         }
+        ExpKind::Str => e.info as i32,
+        ExpKind::Boolean => {
+            let tv = if e.info != 0 { TValue::Boolean(true) } else { TValue::Boolean(false) };
+            fs.const_k(tv)
+        }
+        ExpKind::Nil => fs.const_k(TValue::Nil(NilKind::Strict)),
+        _ => return None,
+    };
+    if info <= 255 { Some(info) } else { None }
+}
+
+fn load_func(fs: &mut FuncState, p: &PrefixResult) -> i32 {
+    if let Some(reg) = p.local_idx {
+        reg
+    } else if let Some(key) = p.key {
+        let r = fs.alloc_reg();
+        fs.code_abc(OpCode::GETTABUP, r, 0, key);
+        r
+    } else {
+        // Should not happen, but handle gracefully
+        fs.alloc_reg()
     }
 }
 
-fn parse_func_args(fs: &mut FuncState, func: PrefixResult) {
+fn parse_func_args(fs: &mut FuncState, freg: i32) {
     if matches!(&fs.ls().token, Token::String(..)) {
         let str_s = match &fs.ls().token {
             Token::String(s) => s.clone(),
@@ -482,24 +534,16 @@ fn parse_func_args(fs: &mut FuncState, func: PrefixResult) {
         };
         fs.ls_mut().next();
         let k = fs.string_k(&str_s);
-        if let Some(freg) = func.reg {
-            let nr = fs.alloc_reg();
-            fs.code_abc(OpCode::MOVE, nr, freg, 0);
-            let kr = fs.alloc_reg();
-            fs.code_abx(OpCode::LOADK, kr, k);
-            fs.code_abc(OpCode::CALL, nr, 2, 1);
-        }
+        let kr = fs.alloc_reg();
+        fs.code_abx(OpCode::LOADK, kr, k);
+        fs.code_abc(OpCode::CALL, freg, 2, 1);
         return;
     }
     
     if check(fs, &Token::LBrace) {
         let (tr, _n) = parse_constructor(fs);
-        if let Some(freg) = func.reg {
-            let nr = fs.alloc_reg();
-            fs.code_abc(OpCode::MOVE, nr, freg, 0);
-            fs.code_abc(OpCode::MOVE, nr + 1, tr, 0);
-            fs.code_abc(OpCode::CALL, nr, 2, 1);
-        }
+        fs.code_abc(OpCode::MOVE, freg + 1, tr, 0);
+        fs.code_abc(OpCode::CALL, freg, 2, 1);
         return;
     }
     
@@ -507,16 +551,12 @@ fn parse_func_args(fs: &mut FuncState, func: PrefixResult) {
         fs.ls_mut().next();
         let method = get_name(fs);
         let k = fs.string_k(&method);
-        if let Some(freg) = func.reg {
-            let nr = fs.alloc_reg();
-            fs.code_abc(OpCode::MOVE, nr, freg, 0);
-            fs.code_abc(OpCode::GETTABLE, nr + 1, freg, k);
-            if check(fs, &Token::LParen) {
-                fs.ls_mut().next();
-                let na = parse_args(fs);
-                expect(fs, &Token::RParen);
-                fs.code_abc(OpCode::CALL, nr, na + 1, 1);
-            }
+        fs.code_abc(OpCode::GETTABLE, freg + 1, freg, k);
+        if check(fs, &Token::LParen) {
+            fs.ls_mut().next();
+            let na = parse_args(fs);
+            expect(fs, &Token::RParen);
+            fs.code_abc(OpCode::CALL, freg, na + 1, 1);
         }
         return;
     }
@@ -525,18 +565,7 @@ fn parse_func_args(fs: &mut FuncState, func: PrefixResult) {
         fs.ls_mut().next();
         let nparams = parse_args(fs);
         expect(fs, &Token::RParen);
-        if let Some(freg) = func.reg {
-            let nr = fs.alloc_reg();
-            fs.code_abc(OpCode::MOVE, nr, freg, 0);
-            for i in 0..nparams {
-                let old_reg = freg + 1 + i;
-                let new_reg = nr + 1 + i;
-                if old_reg != new_reg {
-                    fs.code_abc(OpCode::MOVE, new_reg, old_reg, 0);
-                }
-            }
-            fs.code_abc(OpCode::CALL, nr, nparams + 1, 1);
-        }
+        fs.code_abc(OpCode::CALL, freg, nparams + 1, 1);
         return;
     }
 }
@@ -559,11 +588,10 @@ fn parse_args(fs: &mut FuncState) -> i32 {
 
 #[derive(Debug, Clone)]
 struct PrefixResult {
-    kind: ExpKind,
-    reg: Option<i32>,
-    info: i32,
     var_name: Option<String>,
     local_idx: Option<i32>,
+    key: Option<i32>,
+    reg: Option<i32>,
 }
 
 fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
@@ -573,12 +601,10 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
             fs.ls_mut().next();
             
             if let Some(reg) = fs.find_local(&name) {
-                PrefixResult { kind: ExpKind::Relocable, reg: Some(reg), info: reg, var_name: None, local_idx: Some(reg) }
+                PrefixResult { var_name: None, local_idx: Some(reg), key: None, reg: Some(reg) }
             } else {
-                let r = fs.alloc_reg();
                 let k = fs.string_k(&name);
-                fs.code_abc(OpCode::GETTABUP, r, 0, k);
-                PrefixResult { kind: ExpKind::Relocable, reg: Some(r), info: r, var_name: Some(name), local_idx: None }
+                PrefixResult { var_name: Some(name), local_idx: None, key: Some(k), reg: None }
             }
         }
         Token::LParen => {
@@ -586,13 +612,12 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
             let e = parse_expr(fs);
             expect(fs, &Token::RParen);
             let r = fs.expr_to_reg(&e.exp);
-            PrefixResult { kind: ExpKind::Relocable, reg: Some(r), info: r, var_name: None, local_idx: None }
+            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r) }
         }
-        // method/field access
         _ => {
             let e = parse_simple_exp(fs);
             let r = fs.expr_to_reg(&e.exp);
-            PrefixResult { kind: ExpKind::Relocable, reg: Some(r), info: r, var_name: None, local_idx: None }
+            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r) }
         }
     }
 }
@@ -632,7 +657,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             fs.ls_mut().next();
             let e2 = parse_subexpr(fs, if is_and { PREC_AND + 1 } else { PREC_OR + 1 });
             let r2 = fs.expr_to_reg(&e2.exp);
-            let lhs_int = ec.info as i64;
+            let lhs_int = ec.info;
             let lhs_kind = ec.kind.clone();
             match (lhs_kind.clone(), e2.exp.kind.clone()) {
                 (ExpKind::Int, _) | (ExpKind::Float, _) => {
@@ -645,39 +670,65 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     fs.code_abc(op, r, r, r2);
                 }
             }
-            e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r) };
+            e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
             matched = true;
         }
         
         if limit <= PREC_COMP && check_compare(fs) {
             let ec = e.exp.clone();
-            let r = fs.expr_to_reg(&ec);
             let op_tok = fs.ls().token.clone();
             fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_COMP + 1);
-            let r2 = fs.expr_to_reg(&e2.exp);
-            let op = match op_tok {
-                Token::EqEq => OpCode::EQ,
-                Token::TildeEq => OpCode::EQ,
-                Token::Lt => OpCode::LT,
-                Token::LtEq => OpCode::LE,
-                Token::Gt => OpCode::LT,
-                Token::GtEq => OpCode::LE,
-                _ => OpCode::EQ,
-            };
-            let b = if matches!(op_tok, Token::Gt | Token::GtEq) { r2 } else { r };
-            let c = if matches!(op_tok, Token::Gt | Token::GtEq) { r } else { r2 };
-            let cmp_pc = fs.code_abc(op, b, c, 0);
-            let true_pc = fs.jump();
-            let false_pc = fs.jump();
-            let r_result = fs.alloc_reg();
-            fs.code_abc(OpCode::LOADTRUE, r_result, 0, 0);
-            let end_pc = fs.jump();
-            fs.fix_jump(true_pc, fs.pc);
-            fs.code_abc(OpCode::LOADFALSE, r_result, 0, 0);
-            fs.fix_jump(false_pc, fs.pc);
-            fs.fix_jump(end_pc, fs.pc);
-            e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r_result) };
+            let is_gt = matches!(op_tok, Token::Gt | Token::GtEq);
+            let is_eq = matches!(op_tok, Token::EqEq | Token::TildeEq);
+            let k = if matches!(op_tok, Token::TildeEq) { 0 } else { 1 };
+
+            if fits_sc(&ec) && fits_sc(&e2.exp) {
+                let (reg, imm) = if is_eq {
+                    let reg = fs.expr_to_reg(&e2.exp);
+                    (reg, int_to_sc(ec.info))
+                } else if is_gt {
+                    let reg = fs.expr_to_reg(&e2.exp);
+                    (reg, int_to_sc(ec.info))
+                } else {
+                    let reg = fs.expr_to_reg(&ec);
+                    (reg, int_to_sc(e2.exp.info))
+                };
+                let imm_op = match op_tok {
+                    Token::EqEq | Token::TildeEq => OpCode::EQI,
+                    Token::Lt | Token::Gt => OpCode::LTI,
+                    Token::LtEq | Token::GtEq => OpCode::LEI,
+                    _ => OpCode::EQI,
+                };
+                fs.code_abc_k(imm_op, reg, imm, 0, k != 0);
+                let jmp_pc = fs.jump();
+                fs.free_reg();
+                let r_result = fs.alloc_reg();
+                fs.code_abc(OpCode::LFALSESKIP, r_result, 0, 0);
+                let load_true_pc = fs.code_abc(OpCode::LOADTRUE, r_result, 0, 0);
+                fs.fix_jump(jmp_pc, load_true_pc);
+                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r_result as i64) };
+            } else {
+                let r = fs.expr_to_reg(&ec);
+                let r2 = fs.expr_to_reg(&e2.exp);
+                let (b, c) = if is_gt { (r2, r) } else { (r, r2) };
+                let (op, k) = match op_tok {
+                    Token::EqEq => (OpCode::EQ, 1),
+                    Token::TildeEq => (OpCode::EQ, 0),
+                    Token::Lt | Token::Gt => (OpCode::LT, 1),
+                    Token::LtEq | Token::GtEq => (OpCode::LE, 1),
+                    _ => (OpCode::EQ, 1),
+                };
+                fs.code_abc_k(op, b, c, 0, k != 0);
+                let jmp_pc = fs.jump();
+                fs.free_reg();
+                fs.free_reg();
+                let r_result = fs.alloc_reg();
+                fs.code_abc(OpCode::LFALSESKIP, r_result, 0, 0);
+                let load_true_pc = fs.code_abc(OpCode::LOADTRUE, r_result, 0, 0);
+                fs.fix_jump(jmp_pc, load_true_pc);
+                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r_result as i64) };
+            }
             matched = true;
         }
         
@@ -685,10 +736,24 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             let ec = e.exp.clone();
             let r = fs.expr_to_reg(&ec);
             fs.ls_mut().next();
-            let e2 = parse_subexpr(fs, PREC_CONCAT + 1);
+            let e2 = parse_subexpr(fs, PREC_CONCAT);
             let _r2 = fs.expr_to_reg(&e2.exp);
-            fs.code_abc(OpCode::CONCAT, r, 2, 0);
-            e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r) };
+            fs.free_reg();
+            let merged = if !fs.proto.code.is_empty() {
+                let last = fs.proto.code[fs.proto.code.len() - 1];
+                get_opcode(last) == OpCode::CONCAT && getarg_a(last) as i32 == r + 1
+            } else {
+                false
+            };
+            if merged {
+                let n = getarg_b(fs.proto.code[fs.proto.code.len() - 1]);
+                fs.proto.code.pop();
+                fs.pc -= 1;
+                fs.code_abc(OpCode::CONCAT, r, n + 1, 0);
+            } else {
+                fs.code_abc(OpCode::CONCAT, r, 2, 0);
+            }
+            e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
             matched = true;
         }
         
@@ -706,14 +771,14 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     let r = fs.expr_to_reg(&ec);
                     let r2 = fs.expr_to_reg(&e2.exp);
                     fs.code_abc(if is_add { OpCode::ADDI } else { OpCode::SUBK }, r, r2, ec.info as i32);
-                    e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r) };
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
                 }
                 _ => {
                     let r = fs.expr_to_reg(&ec);
                     let r2 = fs.expr_to_reg(&e2.exp);
                     let op = if is_add { OpCode::ADD } else { OpCode::SUB };
                     fs.code_abc(op, r, r, r2);
-                    e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r) };
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
                 }
             }
             matched = true;
@@ -727,17 +792,20 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             let e2 = parse_subexpr(fs, PREC_MUL + 1);
             match (&ec.kind, &e2.exp.kind) {
                 (ExpKind::Int, ExpKind::Int) => {
-                    let val = if is_mul { ec.info * e2.exp.info }
-                        else if is_div { ec.info / e2.exp.info }
-                        else { ec.info % e2.exp.info };
-                    e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
+                    if is_div {
+                        let val = ec.info as f64 / e2.exp.info as f64;
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                    } else {
+                        let val = if is_mul { ec.info * e2.exp.info } else { ec.info % e2.exp.info };
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
+                    }
                 }
                 _ => {
                     let r = fs.expr_to_reg(&ec);
                     let r2 = fs.expr_to_reg(&e2.exp);
                     let op = if is_mul { OpCode::MUL } else if is_div { OpCode::DIV } else { OpCode::MOD };
                     fs.code_abc(op, r, r, r2);
-                    e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r) };
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
                 }
             }
             matched = true;
@@ -753,6 +821,25 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
 
 fn check_compare(fs: &FuncState) -> bool {
     matches!(fs.ls().token, Token::EqEq | Token::TildeEq | Token::Lt | Token::LtEq | Token::Gt | Token::GtEq)
+}
+
+const OFFSET_SC: i64 = 127;
+
+fn fits_sc(desc: &ExpDesc) -> bool {
+    if let ExpKind::Int = desc.kind {
+        let v = desc.info;
+        (v as i8 as i64) == v
+    } else {
+        false
+    }
+}
+
+fn int_to_sc(v: i64) -> i32 {
+    ((v as u64).wrapping_add(OFFSET_SC as u64)) as i32
+}
+
+fn fits_sbx(v: i64) -> bool {
+    v >= -(OFFSET_SBX as i64) && v <= (OFFSET_SBX as i64) + 1
 }
 
 fn check_addop(fs: &FuncState) -> bool {
@@ -780,39 +867,39 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
         Token::Int(v) => {
             let val = *v;
             fs.ls_mut().next();
-            ExpDesc::new(ExpKind::Int, val as i32)
+            ExpDesc::new(ExpKind::Int, val)
         }
         Token::Float(v) => {
             let val = *v;
             fs.ls_mut().next();
-            ExpDesc::new(ExpKind::Float, val.to_bits() as i32)
+            ExpDesc::new(ExpKind::Float, val.to_bits() as i64)
         }
         Token::String(s) => {
             let s = s.clone();
             fs.ls_mut().next();
             let k = fs.string_k(&s);
-            ExpDesc::new(ExpKind::Str, k)
+            ExpDesc::new(ExpKind::Str, k as i64)
         }
         Token::DotDotDot => {
             fs.ls_mut().next();
             let r = fs.alloc_reg();
             fs.code_abc(OpCode::VARARG, r, 0, 0);
-            ExpDesc::new(ExpKind::Vararg, r)
+            ExpDesc::new(ExpKind::Vararg, r as i64)
         }
         Token::LBrace => {
             let (r, _n) = parse_constructor(fs);
-            ExpDesc::new(ExpKind::Relocable, r)
+            ExpDesc::new(ExpKind::Relocable, r as i64)
         }
         Token::Name(name) => {
             let name = name.clone();
             fs.ls_mut().next();
             if let Some(reg) = fs.find_local(&name) {
-                ExpDesc::new(ExpKind::NonReloc, reg)
+                ExpDesc::new(ExpKind::NonReloc, reg as i64)
             } else {
                 let r = fs.alloc_reg();
                 let k = fs.string_k(&name);
                 fs.code_abc(OpCode::GETTABUP, r, 0, k);
-                ExpDesc::new(ExpKind::Relocable, r)
+                ExpDesc::new(ExpKind::Relocable, r as i64)
             }
         }
         Token::LParen => {
@@ -820,7 +907,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
             let ei = parse_expr(fs);
             expect(fs, &Token::RParen);
             let r = fs.expr_to_reg(&ei.exp);
-            ExpDesc::new(ExpKind::Relocable, r)
+            ExpDesc::new(ExpKind::Relocable, r as i64)
         }
         Token::Not | Token::Minus | Token::Hash | Token::Tilde => {
             let op_tok = fs.ls().token.clone();
@@ -835,12 +922,12 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 Token::Tilde => { fs.code_abc(OpCode::BNOT, nr, r, 0); }
                 _ => {}
             }
-            ExpDesc::new(ExpKind::Relocable, nr)
+            ExpDesc::new(ExpKind::Relocable, nr as i64)
         }
         Token::Function => {
             fs.ls_mut().next();
             let r = parse_body(fs);
-            ExpDesc::new(ExpKind::Relocable, r)
+            ExpDesc::new(ExpKind::Relocable, r as i64)
         }
         _ => {
             fs.error(&format!("unexpected token in expression: {:?}", fs.ls().token));

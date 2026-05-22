@@ -68,6 +68,9 @@ pub const POS_BX: u32 = POS_K;
 pub const POS_SJ: u32 = POS_A;
 pub const OFFSET_SBX: i32 = (((1i64 << SIZE_BX) - 1) >> 1) as i32;
 
+pub const SIZE_sJ: u32 = SIZE_BX + SIZE_A;
+pub const OFFSET_sJ: i32 = (((1i64 << SIZE_sJ) - 1) >> 1) as i32;
+
 pub const NO_REG: u8 = ((1u16 << SIZE_A) - 1) as u8;
 pub const MAX_FSTACK: u8 = NO_REG;
 
