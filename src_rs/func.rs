@@ -1,5 +1,5 @@
 use crate::objects::*;
-use crate::state::VmState;
+use crate::state::LuaState;
 
 pub fn new_proto() -> Proto {
     Proto {
@@ -49,7 +49,7 @@ fn tvalue_size(v: &TValue) -> usize {
     }
 }
 
-pub fn new_c_closure(state: &mut VmState, _nupvals: usize) -> usize {
+pub fn new_c_closure(state: &mut LuaState, _nupvals: usize) -> usize {
     let idx = state.closure_upvals.len();
     state.closure_upvals.push(UpVal::Closed {
         value: Box::new(TValue::Nil(NilKind::Strict)),
@@ -57,7 +57,7 @@ pub fn new_c_closure(state: &mut VmState, _nupvals: usize) -> usize {
     idx
 }
 
-pub fn new_l_closure(state: &mut VmState, nupvals: usize) -> usize {
+pub fn new_l_closure(state: &mut LuaState, nupvals: usize) -> usize {
     let idx = state.closure_upvals.len();
     for _ in 0..nupvals {
         state.closure_upvals.push(UpVal::Closed {
@@ -68,13 +68,13 @@ pub fn new_l_closure(state: &mut VmState, nupvals: usize) -> usize {
 }
 
 pub fn init_upvals(
-    _state: &mut VmState,
+    _state: &mut LuaState,
     _closure_start: usize,
     _proto: &Proto,
 ) {
 }
 
-pub fn find_upval(state: &mut VmState, level: usize) -> usize {
+pub fn find_upval(state: &mut LuaState, level: usize) -> usize {
     if !state.is_in_twups {
         state.twups_linked = true;
     }
@@ -107,7 +107,7 @@ pub fn find_upval(state: &mut VmState, level: usize) -> usize {
     new_upval(state, level, prev)
 }
 
-fn new_upval(state: &mut VmState, level: usize, prev: Option<usize>) -> usize {
+fn new_upval(state: &mut LuaState, level: usize, prev: Option<usize>) -> usize {
     let uv_idx = state.closure_upvals.len();
     let mut next: Option<usize> = None;
     match prev {
@@ -137,7 +137,7 @@ fn new_upval(state: &mut VmState, level: usize, prev: Option<usize>) -> usize {
     uv_idx
 }
 
-pub fn close_upval(state: &mut VmState, uv_idx: usize) {
+pub fn close_upval(state: &mut LuaState, uv_idx: usize) {
     state.gc.cond_gc();
     let val = match &state.closure_upvals[uv_idx] {
         UpVal::Open { stack_index, .. } => {
@@ -155,7 +155,7 @@ pub fn close_upval(state: &mut VmState, uv_idx: usize) {
     };
 }
 
-fn unlink_upval(state: &mut VmState, uv_idx: usize) {
+fn unlink_upval(state: &mut LuaState, uv_idx: usize) {
     let (prev, nxt) = match &state.closure_upvals[uv_idx] {
         UpVal::Open {
             previous,
@@ -181,7 +181,7 @@ fn unlink_upval(state: &mut VmState, uv_idx: usize) {
     }
 }
 
-pub fn close(state: &mut VmState, level: usize, _status: i32, _nresults: i32) {
+pub fn close(state: &mut LuaState, level: usize, _status: i32, _nresults: i32) {
     let mut current = state.open_upval;
     while let Some(uv_idx) = current {
         let should_close = match &state.closure_upvals[uv_idx] {
@@ -202,7 +202,7 @@ pub fn close(state: &mut VmState, level: usize, _status: i32, _nresults: i32) {
     state.twups_linked = false;
 }
 
-pub fn new_tbc_upval(state: &mut VmState, level: usize) -> Option<usize> {
+pub fn new_tbc_upval(state: &mut LuaState, level: usize) -> Option<usize> {
     let uv_idx = state.closure_upvals.len();
     state.closure_upvals.push(UpVal::Open {
         stack_index: level,
@@ -221,7 +221,7 @@ pub fn new_tbc_upval(state: &mut VmState, level: usize) -> Option<usize> {
     Some(uv_idx)
 }
 
-pub fn pop_tbc_list(state: &mut VmState, level: usize) {
+pub fn pop_tbc_list(state: &mut LuaState, level: usize) {
     let head = match state.tbc_list {
         Some(h) => h,
         None => return,
@@ -250,10 +250,10 @@ pub fn get_local_name(_proto: &Proto, _local_number: usize, _pc: usize) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::VmState;
+    use crate::state::LuaState;
 
-    fn make_vm_state() -> VmState {
-        VmState {
+    fn make_vm_state() -> LuaState {
+        LuaState {
             pc: 0,
             stack: Vec::new(),
             base: 0,
@@ -270,6 +270,9 @@ mod tests {
             num_params: 0,
             is_vararg: false,
             gc: std::rc::Rc::new(crate::gc::GCState::default_incremental()),
+            globals: crate::table::Table::new(),
+            registry: crate::table::Table::new(),
+            string_table: crate::strings::StringTable::new(),
         }
     }
 

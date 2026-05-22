@@ -33,7 +33,7 @@ use std::rc::Rc;
 pub use crate::execute::VmExecutor;
 pub use crate::execute::VmResult;
 pub use crate::execute::VmError;
-pub use crate::state::VmState;
+pub use crate::state::LuaState;
 
 // ============================================================================
 // LuaVM — 集成层

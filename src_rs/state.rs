@@ -1,15 +1,29 @@
-use crate::objects::{Proto, TValue, UpVal, UpvalDesc, Instruction};
-use crate::gc::GCState;
+use crate::objects::{Instruction, LClosure, LuaType, NilKind, Proto, TValue, UpVal, UpvalDesc};
+use crate::strings::{LuaString, StringTable};
+use crate::table::Table;
+use crate::gc::{GCObjectHeader, GCState};
+use crate::execute::{VmExecutor, VmResult};
 use std::rc::Rc;
 
-pub struct VmState {
+const EOFMARK: &str = "<eof>";
+
+pub const ERR_RUN: i32 = 2;
+pub const ERR_SYNTAX: i32 = 3;
+pub const MULT_RET: i32 = -1;
+pub const MIN_STACK: usize = 20;
+
+// ============================================================================
+// LuaState — 合并 VmState + LuaState 的所有字段
+// ============================================================================
+
+pub struct LuaState {
+    // 执行上下文（原 VmState）
     pub constants: Vec<TValue>,
     pub code: Vec<Instruction>,
     pub upval_descs: Vec<UpvalDesc>,
     pub protos: Vec<Proto>,
     pub base: usize,
     pub pc: usize,
-    pub stack: Vec<TValue>,
     pub trap: bool,
     pub num_params: u8,
     pub is_vararg: bool,
@@ -18,19 +32,63 @@ pub struct VmState {
     pub tbc_list: Option<usize>,
     pub twups_linked: bool,
     pub is_in_twups: bool,
+
+    // 公用字段
+    pub stack: Vec<TValue>,
     pub gc: Rc<GCState>,
+
+    // 高层 API 字段（原 LuaState）
+    pub globals: Table,
+    pub registry: Table,
+    pub string_table: StringTable,
 }
 
-impl VmState {
-    pub fn new(proto: &Proto, base: usize, stack: Vec<TValue>, gc: Rc<GCState>) -> Self {
-        VmState {
+// ============================================================================
+// 构造
+// ============================================================================
+
+impl LuaState {
+    /// 创建一个空的高层状态（用于 main.rs 的独立解释器）
+    pub fn new() -> Self {
+        let gc = Rc::new(GCState::default_incremental());
+        let mut registry = Table::new();
+        let globals = Table::new();
+        registry.set(
+            TValue::Integer(2),
+            TValue::Table(globals.clone()),
+        );
+        LuaState {
+            constants: Vec::new(),
+            code: Vec::new(),
+            upval_descs: Vec::new(),
+            protos: Vec::new(),
+            base: 0,
+            pc: 0,
+            trap: false,
+            num_params: 0,
+            is_vararg: false,
+            closure_upvals: Vec::new(),
+            open_upval: None,
+            tbc_list: None,
+            twups_linked: false,
+            is_in_twups: false,
+            stack: Vec::with_capacity(MIN_STACK),
+            gc,
+            globals,
+            registry,
+            string_table: StringTable::new(),
+        }
+    }
+
+    /// 从 Proto 构建执行上下文（原 VmState::new）
+    pub fn from_proto(proto: &Proto, base: usize, stack: Vec<TValue>, gc: Rc<GCState>) -> Self {
+        LuaState {
             constants: proto.constants.clone(),
             code: proto.code.clone(),
             upval_descs: proto.upvalues.clone(),
             protos: proto.protos.clone(),
             base,
             pc: 0,
-            stack,
             trap: false,
             num_params: proto.num_params,
             is_vararg: proto.is_vararg(),
@@ -39,7 +97,560 @@ impl VmState {
             tbc_list: None,
             twups_linked: false,
             is_in_twups: false,
+            stack,
             gc,
+            globals: Table::new(),
+            registry: Table::new(),
+            string_table: StringTable::new(),
         }
+    }
+}
+
+// ============================================================================
+// 字符串工具
+// ============================================================================
+
+fn str_to_ls(table: &StringTable, s: &str) -> LuaString {
+    crate::strings::new_lstr(table, s)
+}
+
+fn format_float(f: f64) -> String {
+    if f.is_nan() {
+        return "nan".to_string();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { "inf".to_string() } else { "-inf".to_string() };
+    }
+    if f == 0.0 {
+        return "0.0".to_string();
+    }
+    let s = format!("{:.15}", f);
+    let s = s.trim_end_matches('0');
+    if s.ends_with('.') {
+        format!("{}0", s)
+    } else {
+        s.to_string()
+    }
+}
+
+// ============================================================================
+// 高层 API 方法（原 LuaState）
+// ============================================================================
+
+impl LuaState {
+    // ====== Stack ======
+
+    pub fn gettop(&self) -> usize {
+        self.stack.len()
+    }
+
+    pub fn settop(&mut self, idx: usize) {
+        if idx < self.stack.len() {
+            self.stack.truncate(idx);
+        } else {
+            self.stack.resize(idx, TValue::Nil(NilKind::Strict));
+        }
+    }
+
+    pub fn pop(&mut self, n: usize) {
+        let new_len = self.stack.len().saturating_sub(n);
+        self.stack.truncate(new_len);
+    }
+
+    pub fn abs_index(&self, idx: isize) -> usize {
+        let len = self.stack.len() as isize;
+        if idx >= 0 {
+            idx as usize
+        } else if len + idx >= 0 {
+            (len + idx) as usize
+        } else {
+            0
+        }
+    }
+
+    pub fn rotate(&mut self, idx: isize, n: isize) {
+        let abs = self.abs_index(idx);
+        if abs == 0 || abs > self.stack.len() {
+            return;
+        }
+        if n > 0 {
+            for _ in 0..n {
+                let val = self.stack.remove(abs - 1);
+                self.stack.push(val);
+            }
+        } else {
+            let count = (-n) as usize;
+            for _ in 0..count {
+                let val = self.stack.pop().unwrap();
+                self.stack.insert(abs - 1, val);
+            }
+        }
+    }
+
+    pub fn copy(&mut self, from_idx: isize, to_idx: isize) {
+        let from = self.abs_index(from_idx);
+        if from > 0 && from <= self.stack.len() {
+            let val = self.stack[from - 1].clone();
+            let to = self.abs_index(to_idx);
+            if to > 0 {
+                if to > self.stack.len() {
+                    self.stack.resize(to, TValue::Nil(NilKind::Strict));
+                }
+                self.stack[to - 1] = val;
+            }
+        }
+    }
+
+    // ====== Push ======
+
+    pub fn push_nil(&mut self) {
+        self.stack.push(TValue::Nil(NilKind::Strict));
+    }
+
+    pub fn push_boolean(&mut self, b: bool) {
+        self.stack.push(TValue::Boolean(b));
+    }
+
+    pub fn push_integer(&mut self, n: i64) {
+        self.stack.push(TValue::Integer(n));
+    }
+
+    pub fn push_float(&mut self, n: f64) {
+        self.stack.push(TValue::Float(n));
+    }
+
+    pub fn push_string(&mut self, s: &str) {
+        let ls = str_to_ls(&self.string_table, s);
+        self.stack.push(TValue::Str(ls));
+    }
+
+    pub fn push_lstring(&mut self, s: &[u8]) {
+        let text = String::from_utf8_lossy(s).into_owned();
+        let ls = str_to_ls(&self.string_table, &text);
+        self.stack.push(TValue::Str(ls));
+    }
+
+    pub fn push_value(&mut self, val: TValue) {
+        self.stack.push(val);
+    }
+
+    pub fn push_light_userdata(&mut self, p: *mut std::ffi::c_void) {
+        self.stack.push(TValue::LightUserData(p));
+    }
+
+    pub fn push_fstring(&mut self, fmt: &str) {
+        self.push_string(fmt);
+    }
+
+    pub fn push_lua_value(&mut self, val: &TValue) {
+        self.stack.push(val.clone());
+    }
+
+    // ====== Access / Type ======
+
+    pub fn obj_at(&self, idx: isize) -> Option<&TValue> {
+        let abs = self.abs_index(idx);
+        if abs > 0 && abs <= self.stack.len() {
+            Some(&self.stack[abs - 1])
+        } else {
+            None
+        }
+    }
+
+    pub fn obj_at_mut(&mut self, idx: isize) -> Option<&mut TValue> {
+        let abs = self.abs_index(idx);
+        if abs > 0 && abs <= self.stack.len() {
+            Some(&mut self.stack[abs - 1])
+        } else {
+            None
+        }
+    }
+
+    pub fn get_type(&self, idx: isize) -> LuaType {
+        self.obj_at(idx).map(|v| v.ty()).unwrap_or(LuaType::Nil)
+    }
+
+    pub fn typename(&self, tp: LuaType) -> &'static str {
+        match tp {
+            LuaType::Nil => "nil",
+            LuaType::Boolean => "boolean",
+            LuaType::LightUserData => "lightuserdata",
+            LuaType::Number => "number",
+            LuaType::String => "string",
+            LuaType::Table => "table",
+            LuaType::Function => "function",
+            LuaType::UserData => "userdata",
+            LuaType::Thread => "thread",
+        }
+    }
+
+    pub fn to_integer(&self, idx: isize) -> Option<i64> {
+        match self.obj_at(idx) {
+            Some(TValue::Integer(i)) => Some(*i),
+            Some(TValue::Float(f)) => crate::vm::float_to_integer(*f, crate::vm::F2IMode::Eq),
+            Some(TValue::Str(s)) => s.as_str().parse::<i64>().ok(),
+            _ => None,
+        }
+    }
+
+    pub fn to_number(&self, idx: isize) -> Option<f64> {
+        match self.obj_at(idx) {
+            Some(TValue::Integer(i)) => Some(*i as f64),
+            Some(TValue::Float(f)) => Some(*f),
+            Some(TValue::Str(s)) => s.as_str().parse::<f64>().ok(),
+            _ => None,
+        }
+    }
+
+    pub fn to_boolean(&self, idx: isize) -> bool {
+        !matches!(self.obj_at(idx), Some(TValue::Nil(_)) | Some(TValue::Boolean(false)))
+    }
+
+    pub fn to_string(&self, idx: isize) -> Option<String> {
+        match self.obj_at(idx) {
+            Some(TValue::Str(s)) => Some(s.as_str().to_string()),
+            Some(TValue::Integer(i)) => Some(i.to_string()),
+            Some(TValue::Float(f)) => Some(format_float(*f)),
+            _ => None,
+        }
+    }
+
+    pub fn to_lstring(&self, idx: isize) -> Option<(String, usize)> {
+        match self.obj_at(idx) {
+            Some(TValue::Str(s)) => {
+                let text = s.as_str().to_string();
+                let len = s.len();
+                Some((text, len))
+            }
+            _ => None,
+        }
+    }
+
+    pub fn to_userdata(&self, idx: isize) -> *mut std::ffi::c_void {
+        match self.obj_at(idx) {
+            Some(TValue::LightUserData(p)) => *p,
+            _ => std::ptr::null_mut(),
+        }
+    }
+
+    // ====== Globals ======
+
+    pub fn get_global(&mut self, name: &str) -> LuaType {
+        let key = TValue::Str(str_to_ls(&self.string_table, name));
+        match self.globals.get(&key) {
+            Some(val) => {
+                let ty = val.ty();
+                self.stack.push(val.clone());
+                ty
+            }
+            None => {
+                self.stack.push(TValue::Nil(NilKind::Strict));
+                LuaType::Nil
+            }
+        }
+    }
+
+    pub fn set_global(&mut self, name: &str) {
+        let key = TValue::Str(str_to_ls(&self.string_table, name));
+        if let Some(val) = self.stack.pop() {
+            self.globals.set(key, val);
+        }
+    }
+
+    pub fn set_field(&mut self, idx: isize, key_name: &str) {
+        let abs = self.abs_index(idx);
+        let val = self.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        let key = TValue::Str(str_to_ls(&self.string_table, key_name));
+        if abs > 0 && abs <= self.stack.len() {
+            let tbl = &mut self.stack[abs - 1];
+            if let TValue::Table(ref mut t) = tbl {
+                t.set(key, val);
+            }
+        }
+    }
+
+    pub fn get_field(&mut self, idx: isize, key_name: &str) -> LuaType {
+        let abs = self.abs_index(idx);
+        let key = TValue::Str(str_to_ls(&self.string_table, key_name));
+        if abs > 0 && abs <= self.stack.len() {
+            let val = if let TValue::Table(ref t) = &self.stack[abs - 1] {
+                t.get(&key).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
+            } else {
+                TValue::Nil(NilKind::Strict)
+            };
+            let ty = val.ty();
+            self.stack.push(val);
+            ty
+        } else {
+            self.stack.push(TValue::Nil(NilKind::Strict));
+            LuaType::Nil
+        }
+    }
+
+    // ====== Table ======
+
+    pub fn create_table(&mut self, narr: usize, nrec: usize) {
+        let t = Table::with_capacity(narr, nrec);
+        self.stack.push(TValue::Table(t));
+    }
+
+    pub fn new_table(&mut self) {
+        let t = Table::new();
+        self.stack.push(TValue::Table(t));
+    }
+
+    pub fn raw_get_i(&mut self, idx: isize, i: i64) -> LuaType {
+        let abs = self.abs_index(idx);
+        if abs > 0 && abs <= self.stack.len() {
+            let val = if let TValue::Table(ref t) = &self.stack[abs - 1] {
+                let tkey = TValue::Integer(i);
+                t.get(&tkey).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
+            } else {
+                TValue::Nil(NilKind::Strict)
+            };
+            let ty = val.ty();
+            self.stack.push(val);
+            ty
+        } else {
+            self.stack.push(TValue::Nil(NilKind::Strict));
+            LuaType::Nil
+        }
+    }
+
+    pub fn raw_set_i(&mut self, idx: isize, i: i64) {
+        let abs = self.abs_index(idx);
+        let val = self.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        if abs > 0 && abs <= self.stack.len() {
+            if let TValue::Table(ref mut t) = self.stack[abs - 1] {
+                t.set_int(i, val);
+            }
+        }
+    }
+
+    pub fn raw_get(&mut self, idx: isize) -> LuaType {
+        let key = self.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        let abs = self.abs_index(idx);
+        if abs > 0 && abs <= self.stack.len() {
+            let val = if let TValue::Table(ref t) = &self.stack[abs - 1] {
+                t.get(&key).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
+            } else {
+                TValue::Nil(NilKind::Strict)
+            };
+            let ty = val.ty();
+            self.stack.push(val);
+            ty
+        } else {
+            self.stack.push(TValue::Nil(NilKind::Strict));
+            LuaType::Nil
+        }
+    }
+
+    pub fn raw_set(&mut self, idx: isize) {
+        let val = self.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        let key = self.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        let abs = self.abs_index(idx);
+        if abs > 0 && abs <= self.stack.len() {
+            if let TValue::Table(ref mut t) = self.stack[abs - 1] {
+                t.set(key, val);
+            }
+        }
+    }
+
+    // ====== Len ======
+
+    pub fn len(&self, idx: isize) -> usize {
+        let abs = self.abs_index(idx);
+        if abs > 0 && abs <= self.stack.len() {
+            match &self.stack[abs - 1] {
+                TValue::Table(t) => t.len() as usize,
+                TValue::Str(s) => s.len(),
+                TValue::Integer(_) | TValue::Float(_) => 0,
+                _ => 0,
+            }
+        } else {
+            0
+        }
+    }
+
+    // ====== Check stack ======
+
+    pub fn check_stack(&mut self, extra: usize) -> bool {
+        let needed = self.stack.len() + extra;
+        if needed > self.stack.capacity() {
+            self.stack.reserve(extra);
+        }
+        true
+    }
+
+    // ====== Garbage Collection ======
+
+    pub fn gc_stop(&self) {}
+
+    pub fn gc_restart(&self) {}
+
+    pub fn gc_gen(&self) {}
+
+    // ====== Diagnostics ======
+
+    pub fn warning(&mut self, _msg: &str, _tocont: bool) {}
+
+    pub fn check_version(&self) {}
+
+    // ====== Call Meta ======
+
+    pub fn call_meta(&self, _idx: isize, _event: &str) -> bool {
+        false
+    }
+
+    pub fn traceback(&mut self, msg: &str, _level: usize) {
+        let trace = format!("stack traceback:\n\t...\n{}", msg);
+        self.push_string(&trace);
+    }
+
+    pub fn error(&mut self, msg: &str) -> String {
+        msg.to_string()
+    }
+
+    // ====== Push C Function ======
+
+    pub fn push_rust_fn(&mut self, _f: fn(&mut LuaState) -> i32, tag: usize) {
+        self.push_light_userdata(tag as *mut std::ffi::c_void);
+    }
+
+    // ====== Load Code ======
+
+    pub fn load_buffer(&mut self, _code: &str, chunk_name: &str) -> i32 {
+        let empty_proto = crate::func::new_proto();
+        let closure = LClosure {
+            gc_header: GCObjectHeader::new(),
+            proto: empty_proto,
+            upvals: Vec::new(),
+        };
+        self.stack.push(TValue::LClosure(closure));
+        self.pop(1);
+        self.push_fstring(&format!(
+            "{}:{}: compilation not yet available in pure Rust VM",
+            chunk_name, EOFMARK
+        ));
+        ERR_SYNTAX
+    }
+
+    pub fn load_file(&mut self, fname: Option<&str>) -> i32 {
+        if let Some(name) = fname {
+            match std::fs::read_to_string(name) {
+                Ok(content) => self.load_buffer(&content, name),
+                Err(_) => {
+                    self.push_fstring(&format!("cannot open {}: No such file or directory", name));
+                    ERR_RUN
+                }
+            }
+        } else {
+            let mut buf = String::new();
+            match std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf) {
+                Ok(_) => self.load_buffer(&buf, "=stdin"),
+                Err(_) => {
+                    self.push_string("cannot read from stdin");
+                    ERR_RUN
+                }
+            }
+        }
+    }
+
+    // ====== pcall ======
+
+    pub fn pcall(&mut self, nargs: usize, nresults: i32, _errfunc: isize) -> i32 {
+        let total = self.gettop();
+        let func_idx = total.saturating_sub(nargs + 1);
+        if func_idx >= total {
+            return ERR_RUN;
+        }
+
+        let func_val = self.stack[func_idx].clone();
+        match func_val {
+            TValue::LClosure(closure) => {
+                let args_start = func_idx + 1;
+                let args_end = total;
+                let args: Vec<TValue> = self.stack[args_start..args_end].to_vec();
+                let new_stack = args;
+
+                match VmExecutor::execute(&closure.proto, 0, new_stack, self.gc.clone()) {
+                    Ok(VmResult::Return(n)) => {
+                        self.stack.truncate(func_idx);
+                        let actual_n = if nresults == MULT_RET {
+                            n
+                        } else if nresults < 0 {
+                            0
+                        } else {
+                            (n).min(nresults as usize)
+                        };
+                        for _ in 0..actual_n {
+                            self.push_nil();
+                        }
+                        return 0;
+                    }
+                    Ok(VmResult::Call { .. }) | Ok(VmResult::TailCall { .. }) => {
+                        self.stack.truncate(func_idx);
+                        self.push_string("nested calls not supported in pure Rust VM");
+                        return ERR_RUN;
+                    }
+                    Ok(VmResult::Done) => {
+                        self.stack.truncate(func_idx);
+                        return 0;
+                    }
+                    Err(e) => {
+                        self.stack.truncate(func_idx);
+                        self.push_string(&format!("{}", e));
+                        return ERR_RUN;
+                    }
+                }
+            }
+            TValue::LCFn(_f) => {
+                self.stack.truncate(func_idx);
+                self.push_string("C functions not supported in pure Rust VM");
+                ERR_RUN
+            }
+            TValue::CClosure(_) => {
+                self.stack.truncate(func_idx);
+                self.push_string("C closures not supported in pure Rust VM");
+                ERR_RUN
+            }
+            TValue::LightUserData(tag) => {
+                self.stack.truncate(func_idx);
+                self.push_string(&format!("attempt to call a non-function value (tag={})", tag as usize));
+                ERR_RUN
+            }
+            _ => {
+                self.stack.truncate(func_idx);
+                self.push_string(&format!(
+                    "attempt to call a {} value",
+                    self.typename(func_val.ty())
+                ));
+                ERR_RUN
+            }
+        }
+    }
+
+    // ====== Open Libs ======
+
+    pub fn open_selected_libs(&mut self, _mask: i32, _ignored: i32) {
+        let arg_table = Table::new();
+        self.globals.set(
+            TValue::Str(str_to_ls(&self.string_table, "arg")),
+            TValue::Table(arg_table),
+        );
+    }
+
+    // ====== Hook ======
+
+    pub fn set_hook(&mut self, _hook: Option<(usize, usize)>, _mask: i32, _count: i32) {}
+
+    // ====== String Helpers ======
+
+    pub fn intern_str(&self, s: &str) -> LuaString {
+        str_to_ls(&self.string_table, s)
+    }
+
+    pub fn intern(&self, s: &str) -> LuaString {
+        str_to_ls(&self.string_table, s)
     }
 }

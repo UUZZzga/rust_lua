@@ -4,7 +4,7 @@
 //!
 //! ## 设计原则
 //! - 使用 Rust `match` 替代 C 的 `switch` + `goto`
-//! - `VmState` 结构体封装所有解释器状态，替代 C 的局部变量 + 宏
+//! - `LuaState` 结构体封装所有解释器状态，替代 C 的局部变量 + 宏
 //! - 使用 `Result` 传播错误，替代 C 的 longjmp 错误处理
 //! - 操作码处理用独立方法，提高可读性和可测试性
 //! - 使用 Rust 的 trait 和方法传递代替 C 宏
@@ -22,7 +22,7 @@ use crate::tm::{
 use crate::vm::{to_number_ns, to_integer_ns, F2IMode, shiftl, is_false, objlen,
     concat_stack, equal, less_than, less_equal, raw_equal, float_to_integer,
     modulus, modulus_float, idiv};
-use crate::state::VmState;
+use crate::state::LuaState;
 use crate::gc::GCState;
 use std::rc::Rc;
 
@@ -73,7 +73,7 @@ pub struct VmExecutor;
 
 impl VmExecutor {
     pub fn execute(proto: &Proto, base: usize, stack: Vec<TValue>, gc: Rc<GCState>) -> Result<VmResult, VmError> {
-        let mut state = VmState::new(proto, base, stack, gc);
+        let mut state = LuaState::from_proto(proto, base, stack, gc);
 
         loop {
             if state.pc >= state.code.len() {
@@ -179,41 +179,41 @@ impl VmExecutor {
     // 辅助方法
     // ========================================================================
 
-    fn ra(state: &VmState, inst: Instruction) -> usize {
+    fn ra(state: &LuaState, inst: Instruction) -> usize {
         state.base + opcodes::getarg_a(inst) as usize
     }
 
-    fn rb(state: &VmState, inst: Instruction) -> usize {
+    fn rb(state: &LuaState, inst: Instruction) -> usize {
         state.base + opcodes::getarg_b(inst) as usize
     }
 
-    fn rc(state: &VmState, inst: Instruction) -> usize {
+    fn rc(state: &LuaState, inst: Instruction) -> usize {
         state.base + opcodes::getarg_c(inst) as usize
     }
 
-    fn ensure_stack(state: &mut VmState, idx: usize) {
+    fn ensure_stack(state: &mut LuaState, idx: usize) {
         if idx >= state.stack.len() {
             state.stack.resize(idx + 1, TValue::Nil(NilKind::Strict));
         }
     }
 
-    fn read_stack(state: &VmState, idx: usize) -> &TValue {
+    fn read_stack(state: &LuaState, idx: usize) -> &TValue {
         if idx < state.stack.len() { &state.stack[idx] } else { panic!("stack underflow") }
     }
 
-    fn write_stack(state: &mut VmState, idx: usize, val: TValue) {
+    fn write_stack(state: &mut LuaState, idx: usize, val: TValue) {
         Self::ensure_stack(state, idx);
         state.stack[idx] = val;
     }
 
     #[allow(dead_code)]
-    fn push_stack(state: &mut VmState, val: TValue) -> usize {
+    fn push_stack(state: &mut LuaState, val: TValue) -> usize {
         let idx = state.stack.len();
         state.stack.push(val);
         idx
     }
 
-    fn do_conditional_jump(state: &mut VmState, inst: Instruction, cond: bool) {
+    fn do_conditional_jump(state: &mut LuaState, inst: Instruction, cond: bool) {
         let expected = opcodes::testarg_k(inst);
         if cond == expected {
             // Take the jump
@@ -231,7 +231,7 @@ impl VmExecutor {
     // 操作码实现
     // ========================================================================
 
-    fn op_move(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_move(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let val = Self::read_stack(state, b).clone();
@@ -240,7 +240,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_loadi(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_loadi(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let val = opcodes::getarg_sbx(inst) as i64;
         Self::write_stack(state, a, TValue::Integer(val));
@@ -248,7 +248,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_loadf(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_loadf(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let val = opcodes::getarg_sbx(inst) as f64;
         Self::write_stack(state, a, TValue::Float(val));
@@ -256,7 +256,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_loadk(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_loadk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let idx = opcodes::getarg_sbx(inst) as usize;
         let val = state.constants[idx].clone();
@@ -265,7 +265,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_loadkx(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_loadkx(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         state.pc += 1;
         let extra = state.code[state.pc];
@@ -276,28 +276,28 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_loadfalse(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_loadfalse(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         Self::write_stack(state, a, TValue::Boolean(false));
         state.pc += 1;
         Ok(())
     }
 
-    fn op_lfalseskip(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_lfalseskip(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         Self::write_stack(state, a, TValue::Boolean(false));
         state.pc += 2;
         Ok(())
     }
 
-    fn op_loadtrue(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_loadtrue(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         Self::write_stack(state, a, TValue::Boolean(true));
         state.pc += 1;
         Ok(())
     }
 
-    fn op_loadnil(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_loadnil(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst);
         for i in 0..=b {
@@ -307,7 +307,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_getupval(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_getupval(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as usize;
         if b < state.closure_upvals.len() {
@@ -323,7 +323,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_setupval(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_setupval(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as usize;
         let val = Self::read_stack(state, a).clone();
@@ -345,7 +345,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_gettabup(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_gettabup(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as usize;
         let kb_idx = opcodes::getarg_c(inst) as usize;
@@ -364,7 +364,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_gettable(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_gettable(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -376,7 +376,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_geti(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_geti(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = opcodes::getarg_c(inst) as i64;
@@ -388,7 +388,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_getfield(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_getfield(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -400,7 +400,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_settabup(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_settabup(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = opcodes::getarg_a(inst) as usize;
         let b_key = opcodes::getarg_b(inst) as usize;
         let c = opcodes::getarg_c(inst);
@@ -429,7 +429,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_settable(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_settable(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = opcodes::getarg_c(inst);
@@ -442,7 +442,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_seti(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_seti(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as i64;
         let c = opcodes::getarg_c(inst);
@@ -454,7 +454,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_setfield(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_setfield(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b_key = opcodes::getarg_b(inst) as usize;
         let c = opcodes::getarg_c(inst);
@@ -467,7 +467,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_newtable(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_newtable(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as u32;
         let c = opcodes::getarg_c(inst) as u32;
@@ -481,7 +481,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_self(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_self(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let key = state.constants.get(opcodes::getarg_c(inst) as usize)
@@ -496,7 +496,7 @@ impl VmExecutor {
 
     // ---- 算术运算 ----
 
-    fn op_addi(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_addi(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let imm = opcodes::getarg_sbx(inst) as i64;
         let val = Self::read_stack(state, a).clone();
@@ -513,7 +513,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_addk(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_addk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -525,7 +525,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_subk(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_subk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -537,7 +537,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_mulk(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_mulk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -549,7 +549,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_modk(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_modk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -561,7 +561,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_powk(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_powk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -574,7 +574,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_divk(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_divk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -587,7 +587,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_idivk(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_idivk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -599,7 +599,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_bandk(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_bandk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -612,7 +612,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_bork(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_bork(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -625,7 +625,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_bxork(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_bxork(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -638,7 +638,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_shli(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_shli(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let ic = opcodes::getarg_c(inst) as i64;
@@ -650,7 +650,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_shri(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_shri(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let ic = opcodes::getarg_c(inst) as i64;
@@ -662,7 +662,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_add(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_add(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -674,7 +674,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_sub(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_sub(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -686,7 +686,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_mul(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_mul(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -698,7 +698,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_mod(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_mod(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -710,7 +710,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_pow(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_pow(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -723,7 +723,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_div(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_div(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -736,7 +736,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_idiv(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_idiv(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -748,7 +748,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_band(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_band(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -764,7 +764,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_bor(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_bor(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -780,7 +780,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_bxor(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_bxor(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -796,7 +796,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_shl(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_shl(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -812,7 +812,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_shr(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_shr(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -828,7 +828,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_mmbin(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_mmbin(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         // C: ra = RA(i) → A 字段 = 第一操作数栈位置
         // C: rb = vRB(i) → B 字段 = 第二操作数栈位置
         // C: tm = GETARG_C(i) → C 字段 = 元方法事件
@@ -852,7 +852,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_mmbini(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_mmbini(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         // C: ra = RA(i) → A 字段 = 第一操作数
         // C: imm = GETARG_sB(i) = GETARG_B(i) - OFFSET_sC → 有符号立即数
         // C: tm = GETARG_C(i) → C 字段 = 元方法事件
@@ -878,7 +878,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_mmbink(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_mmbink(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         // C: ra = RA(i) → A 字段 = 第一操作数
         // C: imm = KB(i) → 常量 (从 proto 中读取)
         // C: tm = GETARG_C(i) → C 字段 = 元方法事件
@@ -906,7 +906,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_unm(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_unm(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v = Self::read_stack(state, b);
@@ -927,7 +927,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_bnot(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_bnot(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v = Self::read_stack(state, b);
@@ -946,7 +946,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_not(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_not(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v = Self::read_stack(state, b);
@@ -956,7 +956,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_len(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_len(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v = Self::read_stack(state, b);
@@ -974,7 +974,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_concat(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_concat(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let n = opcodes::getarg_b(inst) as usize;
         let mut vals: Vec<TValue> = Vec::with_capacity(n);
@@ -1001,21 +1001,21 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_close(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_close(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         crate::func::close(state, a, 0, 1);
         state.pc += 1;
         Ok(())
     }
 
-    fn op_tbc(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_tbc(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         crate::func::new_tbc_upval(state, a);
         state.pc += 1;
         Ok(())
     }
 
-    fn op_jmp(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_jmp(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let sj = opcodes::getarg_sj(inst);
         state.pc = ((state.pc as i32) + sj + 1) as usize;
         Ok(())
@@ -1023,7 +1023,7 @@ impl VmExecutor {
 
     // ---- 比较运算 ----
 
-    fn op_eq(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_eq(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v1 = Self::read_stack(state, a);
@@ -1041,7 +1041,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_lt(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_lt(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v1 = Self::read_stack(state, a);
@@ -1059,7 +1059,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_le(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_le(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v1 = Self::read_stack(state, a);
@@ -1077,7 +1077,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_eqk(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_eqk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b_key = opcodes::getarg_b(inst) as usize;
         let v1 = Self::read_stack(state, a);
@@ -1088,7 +1088,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_eqi(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_eqi(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let im = opcodes::getarg_sbx(inst) as i64;
         let v = Self::read_stack(state, a);
@@ -1102,7 +1102,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_lti(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_lti(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let im = opcodes::getarg_sbx(inst) as i64;
         let v = Self::read_stack(state, a);
@@ -1116,7 +1116,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_lei(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_lei(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let im = opcodes::getarg_sbx(inst) as i64;
         let v = Self::read_stack(state, a);
@@ -1130,7 +1130,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_gti(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_gti(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let im = opcodes::getarg_sbx(inst) as i64;
         let v = Self::read_stack(state, a);
@@ -1144,7 +1144,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_gei(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_gei(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let im = opcodes::getarg_sbx(inst) as i64;
         let v = Self::read_stack(state, a);
@@ -1158,7 +1158,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_test(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_test(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let v = Self::read_stack(state, a);
         let cond = !is_false(v);
@@ -1176,7 +1176,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_testset(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_testset(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v = Self::read_stack(state, b).clone();
@@ -1198,7 +1198,7 @@ impl VmExecutor {
 
     // ---- 调用 / 返回 ----
 
-    fn op_call(state: &mut VmState, inst: Instruction) -> Result<VmResult, VmError> {
+    fn op_call(state: &mut LuaState, inst: Instruction) -> Result<VmResult, VmError> {
         let a = Self::ra(state, inst);
         let func_val = Self::read_stack(state, a).clone();
         match func_val {
@@ -1214,7 +1214,7 @@ impl VmExecutor {
         }
     }
 
-    fn op_tailcall(state: &mut VmState, inst: Instruction) -> Result<VmResult, VmError> {
+    fn op_tailcall(state: &mut LuaState, inst: Instruction) -> Result<VmResult, VmError> {
         let a = Self::ra(state, inst);
         let func_val = Self::read_stack(state, a).clone();
         match func_val {
@@ -1226,14 +1226,14 @@ impl VmExecutor {
         }
     }
 
-    fn op_return(state: &mut VmState, inst: Instruction) -> Result<VmResult, VmError> {
+    fn op_return(state: &mut LuaState, inst: Instruction) -> Result<VmResult, VmError> {
         let a = Self::ra(state, inst);
         let n = opcodes::getarg_b(inst) as i32 - 1;
         let nresults = if n < 0 { state.stack.len().saturating_sub(a) as i32 } else { n };
         Ok(VmResult::Return(nresults as usize))
     }
 
-    fn op_return1(state: &mut VmState, inst: Instruction) -> Result<VmResult, VmError> {
+    fn op_return1(state: &mut LuaState, inst: Instruction) -> Result<VmResult, VmError> {
         let a = Self::ra(state, inst);
         let val = Self::read_stack(state, a).clone();
         if state.base > 0 {
@@ -1244,7 +1244,7 @@ impl VmExecutor {
 
     // ---- 循环 ----
 
-    fn op_forloop(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_forloop(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let ra = Self::ra(state, inst);
 
         // Check if this is an integer or float loop
@@ -1294,7 +1294,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_forprep(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_forprep(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let ra = Self::ra(state, inst);
 
         let init_val = Self::read_stack(state, ra).clone();
@@ -1373,7 +1373,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_tforprep(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_tforprep(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let ra = Self::ra(state, inst);
         let tmp = Self::read_stack(state, ra + 2).clone();
         let closing = Self::read_stack(state, ra + 3).clone();
@@ -1384,7 +1384,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_tforcall(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_tforcall(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let ra = Self::ra(state, inst);
         let f = Self::read_stack(state, ra).clone();
         let s = Self::read_stack(state, ra + 1).clone();
@@ -1396,7 +1396,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_tforloop(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_tforloop(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let ra = Self::ra(state, inst);
         let control = Self::read_stack(state, ra + 3);
         match control {
@@ -1409,7 +1409,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_setlist(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_setlist(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let ra = Self::ra(state, inst);
         let n = opcodes::getarg_b(inst) as usize;
         let mut last = opcodes::getarg_c(inst) as usize;
@@ -1431,7 +1431,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_closure(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_closure(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let ra = Self::ra(state, inst);
         let bx = opcodes::getarg_sbx(inst) as usize;
         if bx < state.protos.len() {
@@ -1443,7 +1443,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_vararg(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_vararg(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let ra = Self::ra(state, inst);
         let n = opcodes::getarg_c(inst) as usize;
         let n_actual = if n == 0 { state.stack.len().saturating_sub(ra) } else { n.saturating_sub(1) };
@@ -1456,7 +1456,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_getvarg(state: &mut VmState, inst: Instruction) -> Result<(), VmError> {
+    fn op_getvarg(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let ra = Self::ra(state, inst);
         let c = Self::rc(state, inst);
         let idx = match Self::read_stack(state, c) {
@@ -1470,12 +1470,12 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_errnnil(state: &mut VmState, _inst: Instruction) -> Result<(), VmError> {
+    fn op_errnnil(state: &mut LuaState, _inst: Instruction) -> Result<(), VmError> {
         state.pc += 1;
         Ok(())
     }
 
-    fn op_varargprep(state: &mut VmState, _inst: Instruction) -> Result<(), VmError> {
+    fn op_varargprep(state: &mut LuaState, _inst: Instruction) -> Result<(), VmError> {
         state.pc += 1;
         Ok(())
     }
@@ -1510,7 +1510,7 @@ impl VmExecutor {
         table_val
     }
 
-    fn resolve_val(state: &VmState, inst: Instruction, c: i32) -> TValue {
+    fn resolve_val(state: &LuaState, inst: Instruction, c: i32) -> TValue {
         if opcodes::testarg_k(inst) {
             state.constants.get(c as usize).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
         } else {

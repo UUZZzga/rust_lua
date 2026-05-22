@@ -51,6 +51,3 @@ pub mod mem;
 // FFI 接口，用于与 C/C++ 代码交互
 // C Lua API FFI 声明（lua.h / lauxlib.h）
 pub mod lua_ffi;
-
-// Lua 状态管理 — 纯 Rust 重写，替代 C 的 lua_State
-pub mod lua_state;

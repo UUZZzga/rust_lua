@@ -1,4 +1,5 @@
-use lua_rs::lua_state::LuaState;
+use lua_rs::state::LuaState;
+use lua_rs::state::{ERR_RUN, ERR_SYNTAX, MULT_RET, MIN_STACK};
 use lua_rs::objects::LuaType;
 
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -17,8 +18,6 @@ const HAS_I: i32 = 2;
 const HAS_V: i32 = 4;
 const HAS_E: i32 = 8;
 const HAS_EE: i32 = 16;
-
-const MULT_RET: i32 = -1;
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
@@ -207,7 +206,7 @@ impl Interpreter {
         if status == 0 {
             if self.l.get_global("arg") != LuaType::Table {
                 self.l.push_string("'arg' is not a table");
-                return Self::report(&mut self.l, lua_rs::lua_state::ERR_RUN, &self.progname);
+                return Self::report(&mut self.l, ERR_RUN, &self.progname);
             }
             let n = self.push_args();
             let call_status = self.docall(n, MULT_RET);
@@ -246,7 +245,7 @@ impl Interpreter {
     }
 
     fn incomplete(&self, status: i32) -> bool {
-        if status == lua_rs::lua_state::ERR_SYNTAX {
+        if status == ERR_SYNTAX {
             if let Some(msg) = self.l.to_string(-1) {
                 if msg.len() >= EOFMARK.len()
                     && &msg[msg.len() - EOFMARK.len()..] == EOFMARK
@@ -288,7 +287,7 @@ impl Interpreter {
     fn addreturn(&mut self) -> i32 {
         let text = self.l.to_string(-1).unwrap_or_default();
         if text.is_empty() {
-            return lua_rs::lua_state::ERR_SYNTAX;
+            return ERR_SYNTAX;
         }
         let retline = format!("return {};", text);
         let status = self.l.load_buffer(&retline, "=stdin");
@@ -337,7 +336,7 @@ impl Interpreter {
     fn l_print(&mut self) {
         let n = self.l.gettop();
         if n > 0 {
-            self.l.check_stack(lua_rs::lua_state::MIN_STACK);
+            self.l.check_stack(MIN_STACK);
             self.l.get_global("print");
             if self.l.get_type(-1) != LuaType::Function {
                 self.l.pop(n + 1);
