@@ -394,7 +394,7 @@ fn get_name(fs: &mut FuncState) -> String {
             name
         }
         _ => {
-            fs.error("expected identifier");
+            fs.error(&format!("expected identifier {:?}", fs.ls().token));
             String::new()
         }
     }
