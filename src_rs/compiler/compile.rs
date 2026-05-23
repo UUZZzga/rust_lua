@@ -372,7 +372,10 @@ impl FuncState {
                 }
             }
             OpMode::IABx => {
-                let offset = (dest - pc - 1) as i32;
+                let mut offset = dest - (pc + 1);
+                if back {
+                    offset = -offset;
+                }
                 setarg(i, offset, POS_BX, SIZE_BX);
             }
             OpMode::IAsBx => {
@@ -2040,10 +2043,10 @@ fn parse_for(fs: &mut FuncState) {
         fs.add_local_kind_reg("(for state)", fs.pc, RDKCONST, base + 1);
         fs.add_local_kind_reg(&name, fs.pc, RDKCONST, base + 2);
         
-        let prep = fs.code_asbx(OpCode::FORPREP, base, 0);
+        let prep = fs.code_abx(OpCode::FORPREP, base, 0);
         parse_block(fs);
-        let loop_pc = fs.code_asbx(OpCode::FORLOOP, base, 0);
         fs.fix_jump(prep, fs.pc, false);
+        let loop_pc = fs.code_abx(OpCode::FORLOOP, base, 0);
         fs.fix_jump(loop_pc, prep + 1, true);
         expect(fs, &Token::End);
     } else {
@@ -2098,14 +2101,14 @@ fn parse_for(fs: &mut FuncState) {
         
         expect(fs, &Token::Do);
         
-        let prep = fs.code_asbx(OpCode::TFORPREP, base, 0);
+        let prep = fs.code_abx(OpCode::TFORPREP, base, 0);
         fs.freereg -= 1;
         
         parse_block(fs);
         
         fs.fix_jump(prep, fs.pc, false);
         fs.code_abc(OpCode::TFORCALL, base, 0, ncontrol);
-        let loop_pc = fs.code_asbx(OpCode::TFORLOOP, base, 0);
+        let loop_pc = fs.code_abx(OpCode::TFORLOOP, base, 0);
         fs.fix_jump(loop_pc, prep + 1, true);
         
         expect(fs, &Token::End);
