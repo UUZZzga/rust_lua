@@ -8,6 +8,11 @@ use crate::objects::Instruction;
 const NO_JUMP: i32 = -1;
 const LUA_MULTRET: i32 = -1;
 
+const VDKREG: i32 = 0;
+const RDKCONST: i32 = 1;
+const RDKTOCLOSE: i32 = 3;
+const RDKCTC: i32 = 4;
+
 // ============================================================================
 // Expression descriptor
 // ============================================================================
@@ -43,6 +48,7 @@ struct LocalVar {
     start_pc: i32,
     active: bool,
     reg: i32,
+    kind: i32,
 }
 
 // ============================================================================
@@ -222,6 +228,19 @@ impl FuncState {
             start_pc,
             active: true,
             reg,
+            kind: VDKREG,
+        });
+        reg
+    }
+
+    fn add_local_kind(&mut self, name: &str, start_pc: i32, kind: i32) -> i32 {
+        let reg = if kind != RDKCTC { self.alloc_reg() } else { 0 };
+        self.locals.push(LocalVar {
+            name: name.to_string(),
+            start_pc,
+            active: true,
+            reg,
+            kind,
         });
         reg
     }
@@ -394,6 +413,23 @@ fn parse_block(fs: &mut FuncState) {
             return;
         }
         parse_statement(fs);
+    }
+}
+
+fn getvarattribute(fs: &mut FuncState, df: i32) -> i32 {
+    if test_next(fs, &Token::Lt) {
+        let attr = get_name(fs);
+        expect(fs, &Token::Gt);
+        match attr.as_str() {
+            "const" => RDKCONST,
+            "close" => RDKTOCLOSE,
+            _ => {
+                fs.error(&format!("unknown attribute '{}'", attr));
+                df
+            }
+        }
+    } else {
+        df
     }
 }
 
@@ -1069,34 +1105,93 @@ fn parse_local(fs: &mut FuncState) {
         let r = parse_body(fs);
         fs.code_abc(OpCode::MOVE, reg, r, 0);
     } else {
-        let mut names = Vec::new();
+        let defkind = getvarattribute(fs, VDKREG);
+        let mut names: Vec<String> = Vec::new();
+        let mut kinds: Vec<i32> = Vec::new();
+
         loop {
             let name = get_name(fs);
+            let kind = getvarattribute(fs, defkind);
+            if kind == RDKTOCLOSE {
+                if kinds.iter().any(|&k| k == RDKTOCLOSE) {
+                    fs.error("multiple to-be-closed variables in local list");
+                }
+            }
             names.push(name);
+            kinds.push(kind);
             if !check(fs, &Token::Comma) { break; }
             fs.ls_mut().next();
         }
-        
-        let mut regs = Vec::new();
-        for name in &names {
-            regs.push(fs.add_local(name, fs.pc));
-        }
-        
-        if check(fs, &Token::Eq) {
+
+        let nvars = names.len();
+
+        let has_init = check(fs, &Token::Eq);
+        let mut exps: Vec<ExpDesc> = Vec::new();
+        let n_vals: i32;
+
+        if has_init {
             fs.ls_mut().next();
-            let n_vals = parse_expr_list(fs);
+            loop {
+                let ei = parse_expr(fs);
+                exps.push(ei.exp);
+                if !check(fs, &Token::Comma) { break; }
+                fs.ls_mut().next();
+            }
+            n_vals = exps.len() as i32;
+        } else {
+            n_vals = 0;
+        }
+
+        let last_is_ctc = n_vals as usize == nvars
+            && nvars > 0
+            && kinds[nvars - 1] == RDKCONST
+            && exps.last().map(|e| matches!(e.kind,
+                ExpKind::Int | ExpKind::Float | ExpKind::Str | ExpKind::Boolean | ExpKind::Nil
+            )).unwrap_or(false);
+
+        let n_reg = if last_is_ctc { nvars as i32 - 1 } else { nvars as i32 };
+        let n_val_regs = if last_is_ctc { n_vals - 1 } else { n_vals };
+
+        let mut regs = Vec::new();
+        for i in 0..n_reg as usize {
+            let reg = fs.add_local_kind(&names[i], fs.pc, kinds[i]);
+            regs.push(reg);
+        }
+        if last_is_ctc {
+            fs.add_local_kind(&names[nvars - 1], fs.pc, RDKCTC);
+        }
+
+        if has_init {
+            for i in 0..n_val_regs as usize {
+                let _r = fs.expr_to_reg(&exps[i]);
+            }
+            let base_val = fs.freereg - n_val_regs;
             for (i, &reg) in regs.iter().enumerate() {
-                if (i as i32) < n_vals {
-                    let val_r = fs.freereg - n_vals as i32 + i as i32;
-                    fs.code_abc(OpCode::MOVE, reg, val_r, 0);
+                if (i as i32) < n_val_regs {
+                    let val_r = base_val + i as i32;
+                    if reg != val_r {
+                        fs.code_abc(OpCode::MOVE, reg, val_r, 0);
+                    }
                 }
             }
-            for _ in 0..n_vals {
+            for _ in 0..n_val_regs {
                 fs.free_reg();
+            }
+            for i in n_val_regs as usize..n_reg as usize {
+                fs.code_abc(OpCode::LOADNIL, regs[i], 0, 0);
             }
         } else {
             for &reg in &regs {
                 fs.code_abc(OpCode::LOADNIL, reg, 0, 0);
+            }
+        }
+
+        for (i, &kind) in kinds.iter().enumerate() {
+            if kind == RDKTOCLOSE {
+                if let Some(reg) = fs.find_local(&names[i]) {
+                    fs.code_abc(OpCode::TBC, reg, 0, 0);
+                    break;
+                }
             }
         }
     }
