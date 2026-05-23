@@ -97,7 +97,7 @@ impl FuncState {
     fn ls_mut(&mut self) -> &mut LexState { unsafe { &mut *self.ls } }
 
     fn error(&mut self, msg: &str) {
-        self.errors.push(format!("{}:{}: {}", self.ls().chunk_name, self.ls().pos, msg));
+        self.errors.push(format!("{}:{}: {}", self.ls().chunk_name, self.ls().lastline, msg));
     }
 }
 

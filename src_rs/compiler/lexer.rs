@@ -55,6 +55,8 @@ pub struct LexState {
     pub chunk_name: String,
     pub pos: usize,
     pub current: char,
+    pub linenumber: i32,
+    pub lastline: i32,
     pub token: Token,
     pub token_info: String,
     pub lookahead: Option<(Token, String)>,
@@ -70,6 +72,8 @@ impl LexState {
             chunk_name: chunk_name.to_string(),
             pos: 0,
             current: first,
+            linenumber: 1,
+            lastline: 1,
             token: Token::Eof,
             token_info: String::new(),
             lookahead: None,
@@ -78,6 +82,9 @@ impl LexState {
     }
 
     fn next_char(&mut self) {
+        if self.current == '\n' {
+            self.linenumber += 1;
+        }
         if self.pos < self.source.len() {
             let bytes = self.source.as_bytes();
             if bytes[self.pos] < 0x80 {
@@ -161,10 +168,11 @@ impl LexState {
     }
 
     pub fn error(&mut self, msg: &str) {
-        self.errors.push(format!("{}: {}", self.chunk_name, msg));
+        self.errors.push(format!("{}:{}: {}", self.chunk_name, self.linenumber, msg));
     }
 
     pub fn next(&mut self) {
+        self.lastline = self.linenumber;
         if let Some((tok, info)) = self.lookahead.take() {
             self.token = tok;
             self.token_info = info;
