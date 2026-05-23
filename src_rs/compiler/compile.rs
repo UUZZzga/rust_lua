@@ -18,60 +18,194 @@ const GDKCONST: i32 = 6;
 // ============================================================================
 // !! 禁止删除、修改 meta-language 注释 !!
 // ============================================================================
-// Meta-Language: Lua 语法 → Rust 函数映射表
+// Meta-Language (ANTLR4): Lua 5.5 语法规则 → Rust 编译器函数映射
 // ============================================================================
 //
-// Lua 语法结构                  → Rust 编译器函数
+// grammar Lua5_5;
+//
+// chunk
+//   : block                                        // → compile_chunk() → parse_chunk()
+//   ;
+//
+// block
+//   : statement*                                   // → parse_block()
+//   ;
+//
+// statement
+//   : ';'                                          // → parse_statement()
+//   | 'if' expr 'then' block
+//     ('elseif' expr 'then' block)*
+//     ('else' block)? 'end'                        // → parse_if()
+//   | 'while' expr 'do' block 'end'                // → parse_while()
+//   | 'do' block 'end'                             // → parse_do()
+//   | 'repeat' block 'until' expr                  // → parse_repeat()
+//   | 'for' NAME '=' expr ',' expr (',' expr)?
+//     'do' block 'end'                             // → parse_for() (numeric for)
+//   | 'for' namelist 'in' explist
+//     'do' block 'end'                             // → parse_for() (generic for)
+//   | 'function' funcname funcbody                 // → parse_func_stat()
+//   | 'local' 'function' NAME funcbody             // → parse_local() (local func)
+//   | 'local' attnamelist ('=' explist)?           // → parse_local()
+//   | 'return' explist? (';')?                     // → parse_return()
+//   | varlist '=' explist                          // → parse_assign_or_call() (赋值)
+//   | functioncall                                 // → parse_assign_or_call() (调用)
+//   | expr                                         // → parse_statement() expression
+//   ;
+//
+// varlist
+//   : var (',' var)*                               // → parse_assign_or_call()
+//   ;
+//
+// var
+//   : NAME                                         // → parse_prefix_exp()
+//   | prefixexp '[' expr ']'                       // → parse_prefix_exp() LBracket
+//   | prefixexp '.' NAME                           // → parse_prefix_exp() Dot
+//   ;
+//
+// functioncall
+//   : prefixexp args                               // → load_func() → parse_func_args()
+//   | prefixexp ':' NAME args                      // → parse_func_args() method call
+//   ;
+//
+// args
+//   : '(' explist? ')'                             // → parse_args()
+//   | tableconstructor                             // → parse_func_args() (table arg)
+//   | STRING                                       // → parse_func_args() (string arg)
+//   ;
+//
+// funcname
+//   : NAME ('.' NAME)* (':' NAME)?                 // → parse_func_stat()
+//   ;
+//
+// namelist
+//   : NAME (',' NAME)*                             // → parse_for() / parse_local()
+//   ;
+//
+// attnamelist
+//   : NAME attrib? (',' NAME attrib?)*             // → parse_local() + getvarattribute()
+//   ;
+//
+// attrib
+//   : '<' NAME '>'                                 // → getvarattribute()
+//   ;
+//
+// explist
+//   : expr (',' expr)*                             // → parse_expr_list()
+//   ;
+//
+// expr
+//   : simpleExp                                    // → parse_expr() → parse_subexpr()
+//   | expr binop expr                              // → parse_subexpr() Pratt parser
+//   | unop expr                                    // → parse_simple_exp()
+//   ;
+//
+// simpleExp
+//   : 'nil'                                        // → parse_simple_exp()
+//   | 'false'                                      // → parse_simple_exp()
+//   | 'true'                                       // → parse_simple_exp()
+//   | NUMBER                                       // → parse_simple_exp()
+//   | STRING                                       // → parse_simple_exp()
+//   | '...'                                        // → parse_simple_exp()
+//   | '{' fieldlist? '}'                           // → parse_constructor()
+//   | 'function' funcbody                          // → parse_body()
+//   | prefixexp                                    // → parse_prefix_exp()
+//   ;
+//
+// prefixexp
+//   : varOrExp                                     // → parse_prefix_exp()
+//   | functioncall                                 // → parse_prefix_exp()
+//   | '(' expr ')'                                 // → parse_prefix_exp()
+//   ;
+//
+// binop
+//   : '+' | '-' | '*' | '/' | '//' | '%'           // → parse_subexpr() PREC_ADD/PREC_MUL
+//   | '^'                                          // → parse_subexpr() PREC_POW
+//   | '..'                                         // → parse_subexpr() PREC_CONCAT
+//   | '<' | '<=' | '>' | '>=' | '==' | '~='        // → parse_subexpr() PREC_COMP
+//   | 'and' | 'or'                                 // → parse_subexpr() PREC_AND/PREC_OR
+//   | '|' | '&' | '~' | '<<' | '>>'                // → parse_subexpr() PREC_BOR/BAND/BXOR/SHL
+//   ;
+//
+// unop
+//   : 'not' | '-' | '#' | '~'                      // → parse_simple_exp()
+//   ;
+//
+// tableconstructor
+//   : '{' fieldlist? '}'                           // → parse_constructor()
+//   ;
+//
+// fieldlist
+//   : field (fieldsep field)* fieldsep?            // → parse_constructor()
+//   ;
+//
+// field
+//   : '[' expr ']' '=' expr                        // → parse_constructor() SETTABLE
+//   | NAME '=' expr                                // → parse_constructor() SETI
+//   | expr                                         // → parse_constructor() SETI (array)
+//   ;
+//
+// fieldsep
+//   : ',' | ';'
+//   ;
+//
+// funcbody
+//   : '(' parlist? ')' block 'end'                 // → parse_body() / parse_body_ex()
+//   ;
+//
+// parlist
+//   : namelist (',' '...')?                        // → parse_body_ex()
+//   | '...'                                        // → parse_body_ex()
+//   ;
+//
 // ---------------------------------------------------------------------------
-// chunk (顶层脚本)              → compile_chunk() → parse_chunk()
-// block (代码块)                → parse_block()
-// statement (语句)              → parse_statement()
-//   if ... then ... else ... end → parse_if()
-//   while ... do ... end         → parse_while()
-//   do ... end                   → parse_do()
-//   repeat ... until ...         → parse_repeat()
-//   for ... do ... end           → parse_for()
-//     numeric for                → (base=freereg, FORPREP/FORLOOP)
-//     generic for                → (base=freereg, TFORPREP/TFORCALL/TFORLOOP)
-//   function name() ... end      → parse_func_stat()
-//   local ... = ...              → parse_local()
-//   return ...                   → parse_return()
-// 赋值/调用                      → parse_assign_or_call()
-//   函数调用 f(args)             → load_func() → parse_args()
-//   Dot 访问 f().x               → (Call + Dot 链式处理)
-//   下标赋值 t[k] = v            → SETTABLE/SETI/SETFIELD
+// 寄存器管理与指令生成 (FuncState 辅助方法)
 // ---------------------------------------------------------------------------
-// 表达式 (expression)            → parse_expr() → parse_subexpr()
-//   简单表达式                   → parse_simple_exp()
-//   前缀表达式                   → parse_prefix_exp()
-//   二元运算 + - * / ^ % etc.    → parse_subexpr(limit=PREC_*)
-//     POW (^, 幂运算)            → PREC_POW, OpCode::POW/POWK
-//   table 构造器 {}              → parse_constructor()
-// ---------------------------------------------------------------------------
-// 寄存器管理
-//   alloc_reg()                  → 分配新寄存器 (freereg++)
-//   free_reg()                   → 释放寄存器 (freereg--)
-//   expr_to_reg()                → 确保表达式结果在寄存器中
-//   局部变量追踪                 → add_local/add_local_kind/add_local_kind_reg
-//   find_local()                 → 查找局部变量
-// ---------------------------------------------------------------------------
-// 指令生成
-//   code_abc()                   → IABC 模式指令
-//   code_abc_k()                 → IABC + k 位 指令
-//   code_abx()                   → IABx 模式指令
-//   code_asbx()                  → IAsBx 模式指令 (有符号偏移)
-//   code_sj()                    → IsJ 模式指令
-//   code_ax()                    → 扩展 A 字段指令
-// ---------------------------------------------------------------------------
-// 跳转修复
-//   fix_jump(pc, dest, back)     → 修复跳转指令的偏移量
-// ---------------------------------------------------------------------------
-// FuncState 关键字段
-//   freereg                      → 当前空闲寄存器
-//   max_freereg                  → 编译过程中的最大寄存器使用
-//   pc                           → 当前指令指针
-//   locals                       → 局部变量列表
-//   proto                        → 生成的函数原型
+// FuncState::alloc_reg()           → 分配寄存器(freereg++, max_freereg追踪)
+// FuncState::free_reg()            → 释放寄存器(freereg--)
+// FuncState::expr_to_reg()         → 确保表达式值在寄存器中
+// FuncState::add_local()           → 添加局部变量 (VDKREG)
+// FuncState::add_local_kind()      → 添加带类型局部变量
+// FuncState::add_local_kind_reg()  → 添加带指定寄存器局部变量
+// FuncState::find_local()          → 查找局部变量
+// FuncState::code_abc(op, a, b, c)    → 生成 IABC 模式指令
+// FuncState::code_abc_k(op, a, b, c, k) → 生成 IABC+k 位指令
+// FuncState::code_abx(op, a, bx)   → 生成 IABx 模式指令
+// FuncState::code_asbx(op, a, sbx) → 生成 IAsBx 模式有符号偏移指令
+// FuncState::code_sj(op, sj, k)    → 生成 IsJ 模式跳转指令
+// FuncState::code_ax(op, ax)       → 生成扩展A字段指令
+// FuncState::emit(ins)             → 发射指令到原型
+// FuncState::fix_jump(pc, dest, back) → 修复跳转指令偏移量
+// FuncState::set_c(pc, c)          → 设置指令C参数
+// FuncState::jump() → JMP          → 生成无条件跳转
+// FuncState::negate_condition()    → 反转条件跳转语义
+// FuncState::get_jump()            → 获取跳转目标地址
+// FuncState::concat_jump()         → 串联跳转链表
+// FuncState::const_k(value)        → 查找/添加常量
+// FuncState::string_k(s)           → 字符串常量
+// FuncState::int_k(i)              → 整型常量
+// FuncState::float_k(f)            → 浮点常量
+// FuncState::nvarstack()           → 计算当前变量栈大小
+// FuncState::return_stat_gen()     → 生成RETURN指令
+// FuncState::patch_true_jumps()    → 修复真分支跳转链表
+// FuncState::patch_false_jumps()   → 修复假分支跳转链表
+// FuncState::discharge_to_any_reg() → 表达式值移到任意寄存器
+//
+// 辅助函数:
+//   check(fs, tok)                 → 检查当前token匹配
+//   test_next(fs, tok)             → 检查并消费token
+//   expect(fs, tok)                → 期望token(否则报错)
+//   block_follow(fs, withUntil)    → 判断是否代码块结束标记
+//   get_name(fs)                   → 获取NAME标识符
+//   check_compare(fs)              → 检查比较运算符token
+//   fits_sc(desc)                  → 判断Int是否适合SC参数
+//   fits_sc_neg(v)                 → 判断Int取负后是否适合SC参数
+//   int_to_sc(v)                   → Int转SC参数编码
+//   fits_sbx(v)                    → 判断是否适合AsBx模式偏移
+//   exp_to_const_k(fs, e)          → 表达式转常量索引
+//   exp_to_k(fs, e)                → 表达式转常量索引(≤255)
+//   check_addop(fs)                → 检查加减运算符(+/-)
+//   check_mulop(fs)                → 检查乘除运算符(*/- // %)
+//   tvalue_eq(a, b)                → TValue比较(常量去重)
 // ---------------------------------------------------------------------------
 
 // ============================================================================
@@ -127,6 +261,7 @@ pub struct FuncState {
     ls: *mut LexState,
 }
 
+/// ANTLR4: `chunk: block ;` — 编译器入口，初始化 FuncState，解析整个脚本块并生成原型
 pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
     let mut fs = FuncState::new(ls);
     fs.proto.num_params = 0;
@@ -175,6 +310,7 @@ impl FuncState {
 // ============================================================================
 
 impl FuncState {
+    /// 发射指令到原型代码数组，返回当前 pc 并自增
     fn emit(&mut self, ins: Instruction) -> i32 {
         self.proto.code.push(ins);
         let cur = self.pc;
@@ -182,19 +318,23 @@ impl FuncState {
         cur
     }
 
+    /// 生成 IABC 模式指令: `op a b c` (无 k 位)
     fn code_abc(&mut self, op: OpCode, a: i32, b: i32, c: i32) -> i32 {
         self.emit(create_abck(op, a, b, c, 0))
     }
 
+    /// 生成 IABC+k 位模式指令: `op a b c k`
     fn code_abc_k(&mut self, op: OpCode, a: i32, b: i32, c: i32, k: bool) -> i32 {
         self.emit(create_abck(op, a, b, c, if k { 1 } else { 0 }))
     }
 
+    /// 生成 IABx 模式指令: `op a bx` (无符号偏移)
     fn code_abx(&mut self, op: OpCode, a: i32, bx: i32) -> i32 {
         let ins = ((op as u32) << POS_OP) | ((a as u32) << POS_A) | ((bx as u32) << POS_BX);
         self.emit(ins)
     }
 
+    /// 生成 IAsBx 模式指令: `op a sbx` (有符号偏移, 加 OFFSET_SBX)
     fn code_asbx(&mut self, op: OpCode, a: i32, sbx: i32) -> i32 {
         let ins = ((op as u32) << POS_OP)
             | ((a as u32) << POS_A)
@@ -202,6 +342,7 @@ impl FuncState {
         self.emit(ins)
     }
 
+    /// 生成 IsJ 模式跳转指令: `op sj k` (有符号跳转偏移 + k 位)
     fn code_sj(&mut self, op: OpCode, sj: i32, k: i32) -> i32 {
         let ins = ((op as u32) << POS_OP)
             | ((((sj + OFFSET_sJ) as u32) & mask1(SIZE_sJ, 0)) << POS_SJ)
@@ -209,11 +350,13 @@ impl FuncState {
         self.emit(ins)
     }
 
+    /// 生成扩展 A 字段指令: `op ax` (A 占满剩余位)
     fn code_ax(&mut self, op: OpCode, ax: i32) -> i32 {
         let ins = ((op as u32) << POS_OP) | ((ax as u32) << POS_A);
         self.emit(ins)
     }
 
+    /// 修复跳转指令偏移量: 根据 OpMode 计算 dest 与 pc 之差写入指令
     fn fix_jump(&mut self, pc: i32, dest: i32, back: bool) {
         let i = &mut self.proto.code[pc as usize];
         let op = get_opcode(*i);
@@ -247,15 +390,18 @@ impl FuncState {
         }
     }
 
+    /// 设置指定指令的 C 参数
     fn set_c(&mut self, pc: i32, c: i32) {
         let i = &mut self.proto.code[pc as usize];
         setarg(i, c, POS_C, SIZE_C);
     }
 
+    /// 生成 JMP 无条件跳转指令，返回指令 pc 位置
     fn jump(&mut self) -> i32 {
         self.code_sj(OpCode::JMP, NO_JUMP, 0)
     }
 
+    /// 反转条件跳转语义: 翻转前一条指令的 k 位
     fn negate_condition(&mut self, jmp_pc: i32) {
         let ctrl_pc = jmp_pc - 1;
         if ctrl_pc >= 0 && ctrl_pc < self.proto.code.len() as i32 {
@@ -265,6 +411,7 @@ impl FuncState {
         }
     }
 
+    /// 获取跳转目标地址: 从 JMP 指令解码偏移量
     fn get_jump(&self, pc: i32) -> i32 {
         if pc == NO_JUMP {
             return NO_JUMP;
@@ -277,6 +424,7 @@ impl FuncState {
         }
     }
 
+    /// 串联跳转链表: 将 list2 追加到 list1 链尾
     fn concat_jump(&mut self, list1: &mut i32, list2: i32) {
         if list2 == NO_JUMP {
             return;
@@ -297,6 +445,7 @@ impl FuncState {
         setarg(&mut self.proto.code[list as usize], offset + OFFSET_sJ, POS_SJ, SIZE_sJ);
     }
 
+    /// 查找或添加常量到常量表: 去重后返回常量索引
     fn const_k(&mut self, value: TValue) -> i32 {
         for (i, c) in self.proto.constants.iter().enumerate() {
             if tvalue_eq(c, &value) {
@@ -308,20 +457,24 @@ impl FuncState {
         idx
     }
 
+    /// 创建字符串常量并添加到常量表
     fn string_k(&mut self, s: &str) -> i32 {
         let t = crate::strings::StringTable::new();
         let ls = crate::strings::new_lstr(&t, s);
         self.const_k(TValue::Str(ls))
     }
 
+    /// 创建整型常量并添加到常量表
     fn int_k(&mut self, i: i64) -> i32 {
         self.const_k(TValue::Integer(i))
     }
 
+    /// 创建浮点常量并添加到常量表
     fn float_k(&mut self, f: f64) -> i32 {
         self.const_k(TValue::Float(f))
     }
 
+    /// 分配新寄存器: freereg++ 并追踪 max_freereg
     fn alloc_reg(&mut self) -> i32 {
         let r = self.freereg;
         self.freereg += 1;
@@ -331,12 +484,14 @@ impl FuncState {
         r
     }
 
+    /// 释放最后一个寄存器: freereg--
     fn free_reg(&mut self) {
         if self.freereg > 0 {
             self.freereg -= 1;
         }
     }
 
+    /// 添加局部变量 (VDKREG)，分配寄存器并返回
     fn add_local(&mut self, name: &str, start_pc: i32) -> i32 {
         let reg = self.alloc_reg();
         self.locals.push(LocalVar {
@@ -349,6 +504,7 @@ impl FuncState {
         reg
     }
 
+    /// 添加带类型局部变量 (RDKCONST/RDKTOCLOSE 等)，自动分配寄存器
     fn add_local_kind(&mut self, name: &str, start_pc: i32, kind: i32) -> i32 {
         let in_reg = kind <= RDKTOCLOSE;
         let reg = if in_reg && kind != RDKCTC {
@@ -366,6 +522,7 @@ impl FuncState {
         reg
     }
 
+    /// 添加指定寄存器的局部变量
     fn add_local_kind_reg(&mut self, name: &str, start_pc: i32, kind: i32, reg: i32) {
         self.locals.push(LocalVar {
             name: name.to_string(),
@@ -376,6 +533,7 @@ impl FuncState {
         });
     }
 
+    /// 在当前作用域中查找局部变量 (从后往前)
     fn find_local(&self, name: &str) -> Option<i32> {
         for lv in self.locals.iter().rev() {
             if lv.active && lv.name == name {
@@ -385,6 +543,7 @@ impl FuncState {
         None
     }
 
+    /// 将表达式结果确保在寄存器中: 根据 ExpKind 生成相应 LOAD/MOVE 指令
     fn expr_to_reg(&mut self, e: &ExpDesc) -> i32 {
         match e.kind {
             ExpKind::Void | ExpKind::Nil => {
@@ -475,6 +634,7 @@ impl FuncState {
         }
     }
 
+    /// 修复真分支跳转链表: 遍历链表将所有 JMP 指向 target
     fn patch_true_jumps(&mut self, list: i32, target: i32) {
         let mut cur = list;
         while cur != NO_JUMP {
@@ -484,6 +644,7 @@ impl FuncState {
         }
     }
 
+    /// 修复假分支跳转链表: 遍历链表将所有 JMP 指向 target
     fn patch_false_jumps(&mut self, list: i32, target: i32) {
         let mut cur = list;
         while cur != NO_JUMP {
@@ -493,6 +654,7 @@ impl FuncState {
         }
     }
 
+    /// 将表达式值移到任意寄存器 (未使用)
     fn discharge_to_any_reg(&mut self, e: &ExpDesc) -> (i32, ExpDesc) {
         let r = self.expr_to_reg(e);
         let mut ne = ExpDesc::new(ExpKind::NonReloc, r as i64);
@@ -500,6 +662,7 @@ impl FuncState {
         (r, ne)
     }
 
+    /// 生成 RETURN 指令: 根据 vararg 标志和返回值数量选择 RETURN0/RETURN1/RETURN
     fn return_stat_gen(&mut self, first: i32, nret: i32) {
         let is_vararg = (self.proto.flag & PF_VAHID) != 0;
         let c = if is_vararg { self.proto.num_params as i32 + 1 } else { 0 };
@@ -522,6 +685,7 @@ impl FuncState {
         }
     }
 
+    /// 计算当前作用域变量栈大小: 遍历 active locals 找出最大 reg+1
     fn nvarstack(&self) -> i32 {
         let mut reglevel = 0;
         for local in &self.locals {
@@ -537,10 +701,12 @@ impl FuncState {
 // Token utilities
 // ============================================================================
 
+/// ANTLR4: 终端匹配 — 检查当前 token 是否与给定 token 类型相同
 fn check(fs: &FuncState, t: &Token) -> bool {
     std::mem::discriminant(&fs.ls().token) == std::mem::discriminant(t)
 }
 
+/// ANTLR4: 终端匹配+消费 — 检查并消费当前 token
 fn test_next(fs: &mut FuncState, t: &Token) -> bool {
     let l = fs.ls_mut();
     if std::mem::discriminant(&l.token) == std::mem::discriminant(t) {
@@ -551,6 +717,7 @@ fn test_next(fs: &mut FuncState, t: &Token) -> bool {
     }
 }
 
+/// ANTLR4: 终端匹配断言 — 期望当前 token 匹配，否则报错并跳过
 fn expect(fs: &mut FuncState, t: &Token) {
     if !check(fs, t) {
         fs.error(&format!("expected {:?}, got {:?}", t, fs.ls().token));
@@ -559,6 +726,7 @@ fn expect(fs: &mut FuncState, t: &Token) {
     }
 }
 
+/// ANTLR4: 判断是否代码块结束标记 — 'end' | 'else' | 'elseif' | 'until' | EOF
 fn block_follow(fs: &FuncState, with_until: bool) -> bool {
     match &fs.ls().token {
         Token::Else | Token::Elseif | Token::End | Token::Eof => true,
@@ -567,6 +735,7 @@ fn block_follow(fs: &FuncState, with_until: bool) -> bool {
     }
 }
 
+/// ANTLR4: NAME — 获取标识符名称并消费当前 token
 fn get_name(fs: &mut FuncState) -> String {
     match &fs.ls().token {
         Token::Name(s) => {
@@ -585,6 +754,7 @@ fn get_name(fs: &mut FuncState) -> String {
 // Parser entry
 // ============================================================================
 
+/// ANTLR4: `chunk: block ;` — 解析顶层脚本块，末了生成 RETURN 指令
 fn parse_chunk(fs: &mut FuncState) {
     let is_last = block_follow(fs, true);
     if !is_last {
@@ -594,6 +764,7 @@ fn parse_chunk(fs: &mut FuncState) {
     fs.return_stat_gen(nvarstack, 0);
 }
 
+/// ANTLR4: `block: statement* ;` — 解析代码块语句序列，直到遇到块结束标记
 fn parse_block(fs: &mut FuncState) {
     while !block_follow(fs, true) {
         if check(fs, &Token::Return) {
@@ -604,6 +775,7 @@ fn parse_block(fs: &mut FuncState) {
     }
 }
 
+/// ANTLR4: `attrib: '<' NAME '>' ;` — 获取变量属性标志 (const/close)
 fn getvarattribute(fs: &mut FuncState, df: i32) -> i32 {
     if test_next(fs, &Token::Lt) {
         let attr = get_name(fs);
@@ -621,6 +793,7 @@ fn getvarattribute(fs: &mut FuncState, df: i32) -> i32 {
     }
 }
 
+/// ANTLR4: 全局变量属性获取 — to-be-closed 报错
 fn getglobalattribute(fs: &mut FuncState, df: i32) -> i32 {
     let kind = getvarattribute(fs, df);
     match kind {
@@ -633,6 +806,7 @@ fn getglobalattribute(fs: &mut FuncState, df: i32) -> i32 {
     }
 }
 
+/// 检查全局变量是否存在: GETTABUP + ERRNNIL
 fn checkglobal(fs: &mut FuncState, varname: &str, _line: i32) {
     let r = fs.alloc_reg();
     let k = fs.string_k(varname);
@@ -642,6 +816,7 @@ fn checkglobal(fs: &mut FuncState, varname: &str, _line: i32) {
     fs.free_reg();
 }
 
+/// ANTLR4: 全局变量声明 — 解析带有 global 前缀的属性变量声明列表
 fn globalnames(fs: &mut FuncState, defkind: i32) {
     let mut names: Vec<String> = Vec::new();
     let mut kinds: Vec<i32> = Vec::new();
@@ -694,6 +869,7 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
     }
 }
 
+/// ANTLR4: `'global' namelist ;` — 处理 global 变量声明
 fn globalstat(fs: &mut FuncState) {
     let defkind = getglobalattribute(fs, GDKREG);
     if !test_next(fs, &Token::Star) {
@@ -703,6 +879,7 @@ fn globalstat(fs: &mut FuncState) {
     }
 }
 
+/// ANTLR4: `'global' 'function' NAME funcbody ;` — 处理 global function
 fn globalfunc(fs: &mut FuncState, _line: i32) {
     let fname = get_name(fs);
     fs.add_local_kind(&fname, fs.pc, GDKREG);
@@ -712,6 +889,7 @@ fn globalfunc(fs: &mut FuncState, _line: i32) {
     checkglobal(fs, &fname, _line);
 }
 
+/// ANTLR4: global 分发 — 判断 global function 或 global 变量声明
 fn globalstatfunc(fs: &mut FuncState, line: i32) {
     fs.ls_mut().next();
     if test_next(fs, &Token::Function) {
@@ -721,6 +899,7 @@ fn globalstatfunc(fs: &mut FuncState, line: i32) {
     }
 }
 
+/// ANTLR4: `statement: ';' | 'if' ... | 'while' ... | 'do' ... | 'for' ... | 'repeat' ... | 'function' ... | 'local' ... | 'return' ... | functioncall | varlist '=' explist | expr ;`
 fn parse_statement(fs: &mut FuncState) {
     match &fs.ls().token {
         Token::If => parse_if(fs),
@@ -775,6 +954,7 @@ fn parse_statement(fs: &mut FuncState) {
 // Assignments and function calls
 // ============================================================================
 
+/// ANTLR4: `varlist '=' explist | functioncall ;` — 解析赋值语句或函数调用
 fn parse_assign_or_call(fs: &mut FuncState) {
     let mut first = parse_prefix_exp(fs);
     
@@ -894,6 +1074,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
     fs.free_reg();
 }
 
+/// 将常量表达式转换为常量表索引 (≤255 则返回)
 fn exp_to_k(fs: &mut FuncState, e: &ExpDesc) -> Option<i32> {
     let info = match e.kind {
         ExpKind::Int => fs.int_k(e.info),
@@ -912,6 +1093,7 @@ fn exp_to_k(fs: &mut FuncState, e: &ExpDesc) -> Option<i32> {
     if info <= 255 { Some(info) } else { None }
 }
 
+/// ANTLR4: functioncall 帮助 — 将函数值加载到寄存器以便调用
 fn load_func(fs: &mut FuncState, p: &PrefixResult) -> i32 {
     if let (Some(table_reg), Some(table_key)) = (p.table_reg, p.table_key) {
         let r = fs.alloc_reg();
@@ -942,6 +1124,7 @@ fn load_func(fs: &mut FuncState, p: &PrefixResult) -> i32 {
     }
 }
 
+/// ANTLR4: `args: '(' explist? ')' | tableconstructor | STRING ;` 及 `':' NAME args ;` — 解析函数参数并生成 CALL 指令
 fn parse_func_args(fs: &mut FuncState, freg: i32) {
     if matches!(&fs.ls().token, Token::String(..)) {
         let str_s = match &fs.ls().token {
@@ -994,6 +1177,7 @@ fn parse_func_args(fs: &mut FuncState, freg: i32) {
     }
 }
 
+/// ANTLR4: `explist: expr (',' expr)* ;` — 解析函数调用参数列表
 fn parse_args(fs: &mut FuncState) -> i32 {
     if check(fs, &Token::RParen) || check(fs, &Token::RBrace) {
         return 0;
@@ -1020,6 +1204,7 @@ struct PrefixResult {
     table_key: Option<i32>,
 }
 
+/// ANTLR4: `prefixexp: varOrExp | functioncall | '(' expr ')' ;` 以及 `var: NAME | prefixexp '[' expr ']' | prefixexp '.' NAME ;`
 fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
     match &fs.ls().token {
         Token::Name(name) => {
@@ -1100,6 +1285,7 @@ struct ExprItem {
     exp: ExpDesc,
 }
 
+/// ANTLR4: `expr: simpleExp | expr binop expr | unop expr ;` — 表达式解析入口，调用 Pratt 解析器
 fn parse_expr(fs: &mut FuncState) -> ExprItem {
     parse_subexpr(fs, 0)
 }
@@ -1117,6 +1303,7 @@ const PREC_MUL: i32 = 11;
 const PREC_UNARY: i32 = 12;
 const PREC_POW: i32 = 14;
 
+/// ANTLR4: `expr: expr binop expr ;` — Pratt 递归下降二元表达式解析器
 fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
     let mut e = parse_simple_exp(fs);
     
@@ -1552,12 +1739,14 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
     e
 }
 
+/// ANTLR4: 检查比较运算符 token: `==` | `~=` | `<` | `<=` | `>` | `>=`
 fn check_compare(fs: &FuncState) -> bool {
     matches!(fs.ls().token, Token::EqEq | Token::TildeEq | Token::Lt | Token::LtEq | Token::Gt | Token::GtEq)
 }
 
 const OFFSET_SC: i64 = 127;
 
+/// 判断整型常量是否适合 SC 参数编码 (i8 范围内)
 fn fits_sc(desc: &ExpDesc) -> bool {
     if let ExpKind::Int = desc.kind {
         let v = desc.info;
@@ -1567,18 +1756,22 @@ fn fits_sc(desc: &ExpDesc) -> bool {
     }
 }
 
+/// 判断整型常量取负后是否适合 SC 编码
 fn fits_sc_neg(v: i64) -> bool {
     (v as i8 as i64) == v && ((-v) as i8 as i64) == -v
 }
 
+/// 将整型常量转换为 SC 参数编码 (加 OFFSET_SC 偏移)
 fn int_to_sc(v: i64) -> i32 {
     ((v as u64).wrapping_add(OFFSET_SC as u64)) as i32
 }
 
+/// 判断整型值是否适合 AsBx 模式的有符号偏移量
 fn fits_sbx(v: i64) -> bool {
     v >= -(OFFSET_SBX as i64) && v <= (OFFSET_SBX as i64) + 1
 }
 
+/// 将表达式转换为常量表索引 (用于 EQK 等比较指令)
 fn exp_to_const_k(fs: &mut FuncState, e: &ExpDesc) -> Option<i32> {
     let k = match e.kind {
         ExpKind::Str => e.info as i32,
@@ -1602,14 +1795,17 @@ fn exp_to_const_k(fs: &mut FuncState, e: &ExpDesc) -> Option<i32> {
     if k <= 255 { Some(k) } else { None }
 }
 
+/// ANTLR4: 检查加减运算符 token: `+` | `-`
 fn check_addop(fs: &FuncState) -> bool {
     matches!(fs.ls().token, Token::Plus | Token::Minus)
 }
 
+/// ANTLR4: 检查乘除运算符 token: `*` | `/` | `%` | `//`
 fn check_mulop(fs: &FuncState) -> bool {
     matches!(fs.ls().token, Token::Star | Token::Slash | Token::Percent | Token::SlashSlash)
 }
 
+/// ANTLR4: `simpleExp: 'nil' | 'false' | 'true' | NUMBER | STRING | '...' | tableconstructor | 'function' funcbody | prefixexp ;` 以及 `unop expr`
 fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
     let mut e = match &fs.ls().token {
         Token::Nil => {
@@ -1732,6 +1928,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
 // Statements
 // ============================================================================
 
+/// ANTLR4: `'if' expr 'then' block ('elseif' expr 'then' block)* ('else' block)? 'end' ;`
 fn parse_if(fs: &mut FuncState) {
     fs.ls_mut().next();
     let ei = parse_expr(fs);
@@ -1769,6 +1966,7 @@ fn parse_if(fs: &mut FuncState) {
     }
 }
 
+/// ANTLR4: `'while' expr 'do' block 'end' ;`
 fn parse_while(fs: &mut FuncState) {
     fs.ls_mut().next();
     let loop_start = fs.pc;
@@ -1782,12 +1980,14 @@ fn parse_while(fs: &mut FuncState) {
     expect(fs, &Token::End);
 }
 
+/// ANTLR4: `'do' block 'end' ;`
 fn parse_do(fs: &mut FuncState) {
     fs.ls_mut().next();
     parse_block(fs);
     expect(fs, &Token::End);
 }
 
+/// ANTLR4: `'repeat' block 'until' expr ;`
 fn parse_repeat(fs: &mut FuncState) {
     fs.ls_mut().next();
     let loop_start = fs.pc;
@@ -1799,6 +1999,7 @@ fn parse_repeat(fs: &mut FuncState) {
     fs.fix_jump(fs.pc - 1, loop_start, true);
 }
 
+/// ANTLR4: `'for' NAME '=' expr ',' expr (',' expr)? 'do' block 'end' ;` (numeric for) 以及 `'for' namelist 'in' explist 'do' block 'end' ;` (generic for)
 fn parse_for(fs: &mut FuncState) {
     fs.ls_mut().next();
     let name = get_name(fs);
@@ -1914,6 +2115,7 @@ fn parse_for(fs: &mut FuncState) {
     }
 }
 
+/// ANTLR4: `'function' funcname funcbody ;`
 fn parse_func_stat(fs: &mut FuncState) {
     fs.ls_mut().next();
     let name = get_name(fs);
@@ -1965,6 +2167,7 @@ fn parse_func_stat(fs: &mut FuncState) {
     fs.code_abc(OpCode::SETTABLE, base_reg, fk, freg);
 }
 
+/// ANTLR4: `'local' 'function' NAME funcbody | 'local' attnamelist ('=' explist)? ;`
 fn parse_local(fs: &mut FuncState) {
     fs.ls_mut().next();
     
@@ -2072,6 +2275,7 @@ fn parse_local(fs: &mut FuncState) {
     }
 }
 
+/// ANTLR4: `'return' explist? (';')? ;`
 fn parse_return(fs: &mut FuncState) {
     fs.ls_mut().next();
     if block_follow(fs, true) || check(fs, &Token::Semi) {
@@ -2093,6 +2297,7 @@ fn parse_return(fs: &mut FuncState) {
     if check(fs, &Token::Semi) { fs.ls_mut().next(); }
 }
 
+/// ANTLR4: `explist: expr (',' expr)* ;` — 解析逗号分隔的表达式列表
 fn parse_expr_list(fs: &mut FuncState) -> i32 {
     let ei = parse_expr(fs);
     let _r = fs.expr_to_reg(&ei.exp);
@@ -2106,6 +2311,7 @@ fn parse_expr_list(fs: &mut FuncState) -> i32 {
     n
 }
 
+/// ANTLR4: `tableconstructor: '{' fieldlist? '}' ;`
 fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
     fs.ls_mut().next();
     let table_r = fs.alloc_reg();
@@ -2161,10 +2367,12 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
     (table_r, n_arr)
 }
 
+/// ANTLR4: `funcbody: '(' parlist? ')' block 'end' ;` — 解析函数体 (非 method)
 fn parse_body(fs: &mut FuncState) -> i32 {
     parse_body_ex(fs, false)
 }
 
+/// ANTLR4: `funcbody: '(' parlist? ')' block 'end' ;` — 解析函数体 (可指定 method 添加 self 参数)
 fn parse_body_ex(fs: &mut FuncState, ismethod: bool) -> i32 {
     expect(fs, &Token::LParen);
     let has_params = !check(fs, &Token::RParen);
@@ -2218,6 +2426,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool) -> i32 {
 // Value comparison for constant dedup
 // ============================================================================
 
+/// TValue 比较: 用于常量去重，支持 nil/bool/int/float/string 类型
 fn tvalue_eq(a: &TValue, b: &TValue) -> bool {
     match (a, b) {
         (TValue::Nil(_), TValue::Nil(_)) => true,
