@@ -124,9 +124,9 @@ impl VmExecutor {
 
             let inst = state.code[state.pc];
             let op = opcodes::get_opcode(inst);
-            eprintln!("DEBUG EXEC: pc={}, op={:?}({}), A={}, B={}, C={}, stack.len={}, base={}", 
-                state.pc, op, inst, opcodes::getarg_a(inst), opcodes::getarg_b(inst), 
-                opcodes::getarg_c(inst), state.stack.len(), state.base);
+            // eprintln!("DEBUG EXEC: pc={}, op={:?}({}), A={}, B={}, C={}, stack.len={}, base={}", 
+            //     state.pc, op, inst, opcodes::getarg_a(inst), opcodes::getarg_b(inst), 
+            //     opcodes::getarg_c(inst), state.stack.len(), state.base);
 
             match op {
                 OpCode::MOVE => Self::op_move(state, inst),

@@ -529,49 +529,67 @@ pub fn compare_instructions(rust_code: &[u32], c_code: &[DumpInstruction]) -> Ve
 
         match (r_inst, c_inst) {
             (Some(r), Some(c)) => {
-                let r_op = r & 0x7f;
-                let c_op = c.opcode as u32;
-                if r_op != c_op {
+                let r_a = getarg_a(r);
+                let r_b = getarg_b(r);
+                let r_c = getarg_c(r);
+                let r_k = testarg_k(r);
+                let r_bx = getarg_bx(r);
+                let r_sbx = getarg_sbx(r);
+                let r_sj = getarg_sj(r);
+                let r_opcode = get_opcode(r);
+                let r_name = OPNAMES[r_opcode as usize];
+                let r_ops = format_operands(r, r_a, r_b, r_c, r_bx, r_sbx, r_sj, r_k);
+                let r_formatted = format!("{}\t{}", r_name, r_ops);
+
+                let c_a = c.a as i32;
+                let c_b = c.b as i32;
+                let c_c = c.c as i32;
+                let c_k = c.k != 0;
+                let c_bx = c.bx as i32;
+                let c_sbx = c_bx - opcodes::OFFSET_SBX;
+                let c_sj = getarg_sj(c.opcode as u32);
+                let c_raw = c.opcode as u32;
+                let c_name = OPNAMES[c.opcode as usize];
+                let c_ops = format_operands(c_raw, c_a, c_b, c_c, c_bx, c_sbx, c_sj, c_k);
+                let c_formatted = format!("{}\t{}", c_name, c_ops);
+
+                if r_formatted != c_formatted {
                     diffs.push(format!(
-                        "PC {}: opcode mismatch: Rust={:?}, C={:?}",
-                        i, r_op, c_op
-                    ));
-                }
-                let r_a = (r >> 7) & 0xff;
-                let c_a = c.a;
-                if r_a != c_a {
-                    diffs.push(format!(
-                        "PC {}: A field mismatch: Rust={}, C={} (op={:?})",
-                        i, r_a, c_a, r_op
-                    ));
-                }
-                let r_b = (r >> 16) & 0xff;
-                let c_b = c.b;
-                if r_b != c_b {
-                    diffs.push(format!(
-                        "PC {}: B field mismatch: Rust={}, C={} (op={:?})",
-                        i, r_b, c_b, r_op
-                    ));
-                }
-                let r_c = (r >> 24) & 0xff;
-                let c_c = c.c;
-                if r_c != c_c {
-                    diffs.push(format!(
-                        "PC {}: C field mismatch: Rust={}, C={} (op={:?})",
-                        i, r_c, c_c, r_op
+                        "PC {}: Rust [{}] C [{}]",
+                        i, r_formatted, c_formatted
                     ));
                 }
             }
             (Some(r), None) => {
+                let r_a = getarg_a(r);
+                let r_b = getarg_b(r);
+                let r_c = getarg_c(r);
+                let r_k = testarg_k(r);
+                let r_bx = getarg_bx(r);
+                let r_sbx = getarg_sbx(r);
+                let r_sj = getarg_sj(r);
+                let r_opcode = get_opcode(r);
+                let r_name = OPNAMES[r_opcode as usize];
+                let r_ops = format_operands(r, r_a, r_b, r_c, r_bx, r_sbx, r_sj, r_k);
                 diffs.push(format!(
-                    "PC {}: extra Rust instruction: {:08x}",
-                    i, r
+                    "PC {}: extra Rust: {}\t{}",
+                    i, r_name, r_ops
                 ));
             }
             (None, Some(c)) => {
+                let c_a = c.a as i32;
+                let c_b = c.b as i32;
+                let c_c = c.c as i32;
+                let c_k = c.k != 0;
+                let c_bx = c.bx as i32;
+                let c_sbx = c_bx - opcodes::OFFSET_SBX;
+                let c_sj = getarg_sj(c.opcode as u32);
+                let c_raw = c.opcode as u32;
+                let c_name = OPNAMES[c.opcode as usize];
+                let c_ops = format_operands(c_raw, c_a, c_b, c_c, c_bx, c_sbx, c_sj, c_k);
                 diffs.push(format!(
-                    "PC {}: extra C instruction: op={}, A={}, B={}, C={}",
-                    i, c.opcode, c.a, c.b, c.c
+                    "PC {}: extra C: {}\t{}",
+                    i, c_name, c_ops
                 ));
             }
             (None, None) => {}

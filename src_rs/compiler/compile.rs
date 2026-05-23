@@ -16,6 +16,65 @@ const GDKREG: i32 = 5;
 const GDKCONST: i32 = 6;
 
 // ============================================================================
+// !! 禁止删除、修改 meta-language 注释 !!
+// ============================================================================
+// Meta-Language: Lua 语法 → Rust 函数映射表
+// ============================================================================
+//
+// Lua 语法结构                  → Rust 编译器函数
+// ---------------------------------------------------------------------------
+// chunk (顶层脚本)              → compile_chunk() → parse_chunk()
+// block (代码块)                → parse_block()
+// statement (语句)              → parse_statement()
+//   if ... then ... else ... end → parse_if()
+//   while ... do ... end         → parse_while()
+//   do ... end                   → parse_do()
+//   repeat ... until ...         → parse_repeat()
+//   for ... do ... end           → parse_for()
+//     numeric for                → (base=freereg, FORPREP/FORLOOP)
+//     generic for                → (base=freereg, TFORPREP/TFORCALL/TFORLOOP)
+//   function name() ... end      → parse_func_stat()
+//   local ... = ...              → parse_local()
+//   return ...                   → parse_return()
+// 赋值/调用                      → parse_assign_or_call()
+//   函数调用 f(args)             → load_func() → parse_args()
+//   Dot 访问 f().x               → (Call + Dot 链式处理)
+//   下标赋值 t[k] = v            → SETTABLE/SETI/SETFIELD
+// ---------------------------------------------------------------------------
+// 表达式 (expression)            → parse_expr() → parse_subexpr()
+//   简单表达式                   → parse_simple_exp()
+//   前缀表达式                   → parse_prefix_exp()
+//   二元运算 + - * / ^ % etc.    → parse_subexpr(limit=PREC_*)
+//     POW (^, 幂运算)            → PREC_POW, OpCode::POW/POWK
+//   table 构造器 {}              → parse_constructor()
+// ---------------------------------------------------------------------------
+// 寄存器管理
+//   alloc_reg()                  → 分配新寄存器 (freereg++)
+//   free_reg()                   → 释放寄存器 (freereg--)
+//   expr_to_reg()                → 确保表达式结果在寄存器中
+//   局部变量追踪                 → add_local/add_local_kind/add_local_kind_reg
+//   find_local()                 → 查找局部变量
+// ---------------------------------------------------------------------------
+// 指令生成
+//   code_abc()                   → IABC 模式指令
+//   code_abc_k()                 → IABC + k 位 指令
+//   code_abx()                   → IABx 模式指令
+//   code_asbx()                  → IAsBx 模式指令 (有符号偏移)
+//   code_sj()                    → IsJ 模式指令
+//   code_ax()                    → 扩展 A 字段指令
+// ---------------------------------------------------------------------------
+// 跳转修复
+//   fix_jump(pc, dest, back)     → 修复跳转指令的偏移量
+// ---------------------------------------------------------------------------
+// FuncState 关键字段
+//   freereg                      → 当前空闲寄存器
+//   max_freereg                  → 编译过程中的最大寄存器使用
+//   pc                           → 当前指令指针
+//   locals                       → 局部变量列表
+//   proto                        → 生成的函数原型
+// ---------------------------------------------------------------------------
+
+// ============================================================================
 // Expression descriptor
 // ============================================================================
 
