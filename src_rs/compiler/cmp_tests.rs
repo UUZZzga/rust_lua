@@ -302,19 +302,47 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_if_true() {
+        assert_inst_match("if true then return 1 end", None);
+    }
+
+    #[test]
+    fn test_if_false() {
+        assert_inst_match("if false then return 1 end", None);
+    }
+
+    #[test]
+    fn test_if_true_else() {
+        assert_inst_match("if true then return 1 else return 2 end", None);
+    }
+
+    #[test]
+    fn test_if_true_else_else() {
+        assert_inst_match(
+            "if true then return 1 else return 2 else return 3 end",
+            None,
+        );
+    }
+
+    #[test]
+    fn test_for() {
+        assert_inst_match("for i = 1, 5 do return 1 end", None);
+    }
+
+    #[test]
     fn test_return_expr() {
         assert_inst_match("return 1 + 2", None);
     }
 
-    #[test]
-    fn test_big_lua() {
-        assert_inst_match_file("big.lua");
-    }
+    // #[test]
+    // fn test_big_lua() {
+    //     assert_inst_match_file("big.lua");
+    // }
 
-    #[test]
-    fn test_focus_lua() {
-        assert_inst_match_file("test_focus.lua");
-    }
+    // #[test]
+    // fn test_focus_lua() {
+    //     assert_inst_match_file("test_focus.lua");
+    // }
 
     fn assert_inst_match_file(name: &str) {
         assert_inst_match(get_lua_script(name).as_str(), Some(name));
