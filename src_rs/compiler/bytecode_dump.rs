@@ -2,7 +2,7 @@ use crate::lua_ffi;
 use crate::opcodes::{
     self, OPNAMES, TM_EVENT_NAMES, get_opcode, getarg_a, getarg_b, getarg_c,
     getarg_bx, getarg_sbx, getarg_sj,
-    getarg_vb, testarg_k, getarg, POS_A, SIZE_BX, SIZE_A,
+    getarg_vb, testarg_k, getarg, POS_A, SIZE_BX, SIZE_A, POS_K, POS_B, POS_C, OFFSET_sJ,
 };
 use std::ffi::{c_int, c_void};
 use std::ptr;
@@ -473,8 +473,8 @@ fn format_c_comment(inst: &DumpInstruction, constants: &[DumpConstant]) -> Strin
             s
         }
         opcodes::OpCode::JMP => {
-            let sj = (inst.a as i32) | ((inst.b as i32) << 8) | ((inst.c as i32) << 16) | ((inst.k as i32) << 17);
-            let sj_signed = sj - opcodes::OFFSET_sJ;
+            let sj_raw = inst.a | (inst.bx << 8);
+            let sj_signed = sj_raw as i32 - OFFSET_sJ;
             format!("\t; to {}", sj_signed + pc as i32 + 2)
         }
         opcodes::OpCode::EQK => {
@@ -520,6 +520,14 @@ fn format_c_comment(inst: &DumpInstruction, constants: &[DumpConstant]) -> Strin
     }
 }
 
+fn dump_inst_to_raw(inst: &DumpInstruction) -> u32 {
+    (inst.opcode as u32)
+        | ((inst.a as u32) << POS_A)
+        | ((inst.k as u32) << POS_K)
+        | ((inst.b as u32) << POS_B)
+        | ((inst.c as u32) << POS_C)
+}
+
 pub fn compare_instructions(rust_code: &[u32], c_code: &[DumpInstruction]) -> Vec<String> {
     let mut diffs = Vec::new();
     let max_len = rust_code.len().max(c_code.len());
@@ -541,14 +549,14 @@ pub fn compare_instructions(rust_code: &[u32], c_code: &[DumpInstruction]) -> Ve
                 let r_ops = format_operands(r, r_a, r_b, r_c, r_bx, r_sbx, r_sj, r_k);
                 let r_formatted = format!("{}\t{}", r_name, r_ops);
 
+                let c_raw = dump_inst_to_raw(c);
                 let c_a = c.a as i32;
                 let c_b = c.b as i32;
                 let c_c = c.c as i32;
                 let c_k = c.k != 0;
                 let c_bx = c.bx as i32;
                 let c_sbx = c_bx - opcodes::OFFSET_SBX;
-                let c_sj = getarg_sj(c.opcode as u32);
-                let c_raw = c.opcode as u32;
+                let c_sj = getarg_sj(c_raw);
                 let c_name = OPNAMES[c.opcode as usize];
                 let c_ops = format_operands(c_raw, c_a, c_b, c_c, c_bx, c_sbx, c_sj, c_k);
                 let c_formatted = format!("{}\t{}", c_name, c_ops);
@@ -577,14 +585,14 @@ pub fn compare_instructions(rust_code: &[u32], c_code: &[DumpInstruction]) -> Ve
                 ));
             }
             (None, Some(c)) => {
+                let c_raw = dump_inst_to_raw(c);
                 let c_a = c.a as i32;
                 let c_b = c.b as i32;
                 let c_c = c.c as i32;
                 let c_k = c.k != 0;
                 let c_bx = c.bx as i32;
                 let c_sbx = c_bx - opcodes::OFFSET_SBX;
-                let c_sj = getarg_sj(c.opcode as u32);
-                let c_raw = c.opcode as u32;
+                let c_sj = getarg_sj(c_raw);
                 let c_name = OPNAMES[c.opcode as usize];
                 let c_ops = format_operands(c_raw, c_a, c_b, c_c, c_bx, c_sbx, c_sj, c_k);
                 diffs.push(format!(
@@ -623,7 +631,8 @@ pub fn dump_instructions(code: &[u32]) -> String {
 }
 
 pub fn format_c_instruction(inst: &DumpInstruction, constants: &[DumpConstant]) -> String {
-    let opcode = get_opcode(inst.opcode as u32);
+    let raw = dump_inst_to_raw(inst);
+    let opcode = get_opcode(raw);
     let op_name = OPNAMES[opcode as usize];
     let a = inst.a as i32;
     let b = inst.b as i32;
@@ -631,9 +640,9 @@ pub fn format_c_instruction(inst: &DumpInstruction, constants: &[DumpConstant]) 
     let k = inst.k != 0;
     let bx = inst.bx as i32;
     let sbx = bx - opcodes::OFFSET_SBX;
-    let sj = getarg_sj(inst.opcode as u32);
+    let sj = getarg_sj(raw);
 
-    let operands = format_operands(inst.opcode as u32, a, b, c, bx, sbx, sj, k);
+    let operands = format_operands(raw, a, b, c, bx, sbx, sj, k);
     let comment = format_c_comment(inst, constants);
     format!("{}\t{}\t{}", op_name, operands, comment)
 }
