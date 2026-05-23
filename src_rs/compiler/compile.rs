@@ -12,6 +12,8 @@ const VDKREG: i32 = 0;
 const RDKCONST: i32 = 1;
 const RDKTOCLOSE: i32 = 3;
 const RDKCTC: i32 = 4;
+const GDKREG: i32 = 5;
+const GDKCONST: i32 = 6;
 
 // ============================================================================
 // Expression descriptor
@@ -234,7 +236,12 @@ impl FuncState {
     }
 
     fn add_local_kind(&mut self, name: &str, start_pc: i32, kind: i32) -> i32 {
-        let reg = if kind != RDKCTC { self.alloc_reg() } else { 0 };
+        let in_reg = kind <= RDKTOCLOSE;
+        let reg = if in_reg && kind != RDKCTC {
+            self.alloc_reg()
+        } else {
+            0
+        };
         self.locals.push(LocalVar {
             name: name.to_string(),
             start_pc,
@@ -433,6 +440,106 @@ fn getvarattribute(fs: &mut FuncState, df: i32) -> i32 {
     }
 }
 
+fn getglobalattribute(fs: &mut FuncState, df: i32) -> i32 {
+    let kind = getvarattribute(fs, df);
+    match kind {
+        RDKTOCLOSE => {
+            fs.error("global variables cannot be to-be-closed");
+            kind
+        }
+        RDKCONST => GDKCONST,
+        _ => kind,
+    }
+}
+
+fn checkglobal(fs: &mut FuncState, varname: &str, _line: i32) {
+    let r = fs.alloc_reg();
+    let k = fs.string_k(varname);
+    fs.code_abc(OpCode::GETTABUP, r, 0, k);
+    let k_bx = if k >= 256 { 0 } else { k + 1 };
+    fs.code_abx(OpCode::ERRNNIL, r, k_bx);
+    fs.free_reg();
+}
+
+fn globalnames(fs: &mut FuncState, defkind: i32) {
+    let mut names: Vec<String> = Vec::new();
+    let mut kinds: Vec<i32> = Vec::new();
+
+    loop {
+        let name = get_name(fs);
+        let kind = getglobalattribute(fs, defkind);
+        names.push(name);
+        kinds.push(kind);
+        if !check(fs, &Token::Comma) { break; }
+        fs.ls_mut().next();
+    }
+
+    let nvars = names.len();
+    let has_init = check(fs, &Token::Eq);
+
+    let mut regs = Vec::new();
+        for i in 0..nvars {
+            let reg = fs.add_local_kind(&names[i], fs.pc, kinds[i]);
+            regs.push(reg);
+        }
+
+        if has_init {
+        fs.ls_mut().next();
+        let mut exps: Vec<ExpDesc> = Vec::new();
+        loop {
+            let ei = parse_expr(fs);
+            exps.push(ei.exp);
+            if !check(fs, &Token::Comma) { break; }
+            fs.ls_mut().next();
+        }
+        let nexps = exps.len();
+
+        for i in (0..nvars).rev() {
+            if i < nexps {
+                let val = &exps[i];
+                let k_name = fs.string_k(&names[i]);
+                if let Some(k_val) = exp_to_k(fs, val) {
+                    fs.code_abc_k(OpCode::SETTABUP, 0, k_name, k_val, true);
+                } else {
+                    let val_reg = fs.expr_to_reg(val);
+                    fs.code_abc(OpCode::SETTABUP, 0, k_name, val_reg);
+                    fs.free_reg();
+                }
+            }
+        }
+        for i in 0..nvars {
+            checkglobal(fs, &names[i], 0);
+        }
+    }
+}
+
+fn globalstat(fs: &mut FuncState) {
+    let defkind = getglobalattribute(fs, GDKREG);
+    if !test_next(fs, &Token::Star) {
+        globalnames(fs, defkind);
+    } else {
+        fs.add_local_kind("(global *)", fs.pc, defkind);
+    }
+}
+
+fn globalfunc(fs: &mut FuncState, _line: i32) {
+    let fname = get_name(fs);
+    fs.add_local_kind(&fname, fs.pc, GDKREG);
+    let r = parse_body(fs);
+    let k = fs.string_k(&fname);
+    fs.code_abc(OpCode::SETTABUP, 0, k, r);
+    checkglobal(fs, &fname, _line);
+}
+
+fn globalstatfunc(fs: &mut FuncState, line: i32) {
+    fs.ls_mut().next();
+    if test_next(fs, &Token::Function) {
+        globalfunc(fs, line);
+    } else {
+        globalstat(fs);
+    }
+}
+
 fn parse_statement(fs: &mut FuncState) {
     match &fs.ls().token {
         Token::If => parse_if(fs),
@@ -445,9 +552,19 @@ fn parse_statement(fs: &mut FuncState) {
         Token::Return => parse_return(fs),
         Token::Semi => { fs.ls_mut().next(); }
         Token::Break => { fs.ls_mut().next(); }
-        Token::Name(_) => {
-            parse_assign_or_call(fs);
-            if check(fs, &Token::Semi) { fs.ls_mut().next(); }
+        Token::Name(name) => {
+            let line = fs.ls().lastline;
+            let is_global = name == "global" && {
+                let l = fs.ls_mut();
+                let lk = &l.lookahead_next().0;
+                matches!(lk, Token::Lt | Token::Name(_) | Token::Star | Token::Function)
+            };
+            if is_global {
+                globalstatfunc(fs, line);
+            } else {
+                parse_assign_or_call(fs);
+                if check(fs, &Token::Semi) { fs.ls_mut().next(); }
+            }
         }
         Token::LParen
         | Token::Nil
