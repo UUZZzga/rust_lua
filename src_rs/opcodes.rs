@@ -106,6 +106,11 @@ pub const MAX_FSTACK: u8 = NO_REG;
     v - ((((1i64 << (SIZE_BX + SIZE_A)) - 1) >> 1) as i32)
 }
 
+pub const OFFSET_SC: i32 = (((1 << SIZE_C) - 1) >> 1) as i32;
+
+#[inline] pub fn getarg_sc(i: Instruction) -> i32 { getarg_c(i) - OFFSET_SC }
+#[inline] pub fn getarg_sb(i: Instruction) -> i32 { getarg_b(i) - OFFSET_SC }
+
 // ============================================================================
 // 操作模式表 — 纯 Rust 实现，与 C 的 luaP_opmodes 完全一致
 // ============================================================================
@@ -255,6 +260,15 @@ pub static OPNAMES: &[&str] = &[
     "CALL","TAILCALL","RETURN","RETURN0","RETURN1",
     "FORLOOP","FORPREP","TFORPREP","TFORCALL","TFORLOOP",
     "SETLIST","CLOSURE","VARARG","GETVARG","ERRNNIL","VARARGPREP","EXTRAARG",
+];
+
+pub static TM_EVENT_NAMES: &[&str] = &[
+    "__index", "__newindex", "__gc", "__mode", "__len", "__eq",
+    "__add", "__sub", "__mul", "__mod", "__pow",
+    "__div", "__idiv",
+    "__band", "__bor", "__bxor", "__shl", "__shr",
+    "__unm", "__bnot", "__lt", "__le",
+    "__concat", "__call", "__close",
 ];
 
 // ============================================================================

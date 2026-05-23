@@ -1,5 +1,9 @@
-use std::collections::HashMap;
 use crate::lua_ffi;
+use crate::opcodes::{
+    self, OPNAMES, TM_EVENT_NAMES, get_opcode, getarg_a, getarg_b, getarg_c,
+    getarg_bx, getarg_sbx, getarg_sj,
+    getarg_vb, testarg_k, getarg, POS_A, SIZE_BX, SIZE_A,
+};
 use std::ffi::{c_int, c_void};
 use std::ptr;
 
@@ -316,6 +320,206 @@ pub unsafe fn compile_with_c_lua(source: &[u8]) -> Result<Vec<u8>, String> {
     Ok(result_data)
 }
 
+fn format_constant(constants: &[DumpConstant], idx: usize) -> String {
+    if idx >= constants.len() {
+        return format!("?{}", idx);
+    }
+    match &constants[idx] {
+        DumpConstant::Nil => "nil".to_string(),
+        DumpConstant::Boolean(b) => if *b { "true" } else { "false" }.to_string(),
+        DumpConstant::Integer(i) => format!("{}", i),
+        DumpConstant::Float(f) => {
+            let s = format!("{}", f);
+            if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+                format!("{}.0", s)
+            } else {
+                s
+            }
+        }
+        DumpConstant::String(s) => format!("\"{}\"", s.escape_debug()),
+    }
+}
+
+fn format_operands(op: u32, a: i32, b: i32, c: i32, bx: i32, sbx: i32, sj: i32, k: bool) -> String {
+    let isk = if k { "k" } else { "" };
+    let sc = c - 127;
+    let sb = b - 127;
+
+    match get_opcode(op) {
+        opcodes::OpCode::MOVE => format!("{} {}", a, b),
+        opcodes::OpCode::LOADI | opcodes::OpCode::LOADF => format!("{} {}", a, sbx),
+        opcodes::OpCode::LOADK => format!("{} {}", a, bx),
+        opcodes::OpCode::LOADKX => format!("{}", a),
+        opcodes::OpCode::LOADFALSE | opcodes::OpCode::LFALSESKIP | opcodes::OpCode::LOADTRUE => format!("{}", a),
+        opcodes::OpCode::LOADNIL => format!("{} {}", a, b),
+        opcodes::OpCode::GETUPVAL | opcodes::OpCode::SETUPVAL => format!("{} {}", a, b),
+        opcodes::OpCode::GETTABUP | opcodes::OpCode::GETTABLE => format!("{} {} {}", a, b, c),
+        opcodes::OpCode::GETI | opcodes::OpCode::GETFIELD => format!("{} {} {}", a, b, c),
+        opcodes::OpCode::SETTABUP | opcodes::OpCode::SETTABLE | opcodes::OpCode::SETI
+        | opcodes::OpCode::SETFIELD => format!("{} {} {}{}", a, b, c, isk),
+        opcodes::OpCode::NEWTABLE => {
+            let vb = getarg_vb(op);
+            format!("{} {} {}{}", a, vb, c, isk)
+        }
+        opcodes::OpCode::SELF => format!("{} {} {}{}", a, b, c, isk),
+        opcodes::OpCode::ADDI | opcodes::OpCode::SHLI | opcodes::OpCode::SHRI => format!("{} {} {}", a, b, sc),
+        opcodes::OpCode::ADDK | opcodes::OpCode::SUBK | opcodes::OpCode::MULK
+        | opcodes::OpCode::MODK | opcodes::OpCode::POWK | opcodes::OpCode::DIVK
+        | opcodes::OpCode::IDIVK | opcodes::OpCode::BANDK | opcodes::OpCode::BORK
+        | opcodes::OpCode::BXORK => format!("{} {} {}", a, b, c),
+        opcodes::OpCode::ADD | opcodes::OpCode::SUB | opcodes::OpCode::MUL
+        | opcodes::OpCode::MOD | opcodes::OpCode::POW | opcodes::OpCode::DIV
+        | opcodes::OpCode::IDIV | opcodes::OpCode::BAND | opcodes::OpCode::BOR
+        | opcodes::OpCode::BXOR | opcodes::OpCode::SHL | opcodes::OpCode::SHR
+        => format!("{} {} {}", a, b, c),
+        opcodes::OpCode::MMBIN => format!("{} {} {}", a, b, c),
+        opcodes::OpCode::MMBINI => format!("{} {} {} {}", a, sb, c, isk),
+        opcodes::OpCode::MMBINK => format!("{} {} {} {}", a, b, c, isk),
+        opcodes::OpCode::UNM | opcodes::OpCode::BNOT | opcodes::OpCode::NOT
+        | opcodes::OpCode::LEN => format!("{} {}", a, b),
+        opcodes::OpCode::CONCAT => format!("{} {}", a, b),
+        opcodes::OpCode::CLOSE | opcodes::OpCode::TBC => format!("{}", a),
+        opcodes::OpCode::JMP => format!("{}", sj),
+        opcodes::OpCode::EQ | opcodes::OpCode::LT | opcodes::OpCode::LE
+        => format!("{} {} {}", a, b, isk),
+        opcodes::OpCode::EQK => format!("{} {} {}", a, b, isk),
+        opcodes::OpCode::EQI | opcodes::OpCode::LTI | opcodes::OpCode::LEI
+        | opcodes::OpCode::GTI | opcodes::OpCode::GEI => format!("{} {} {}", a, sb, isk),
+        opcodes::OpCode::TEST => format!("{} {}", a, isk),
+        opcodes::OpCode::TESTSET => format!("{} {} {}", a, b, isk),
+        opcodes::OpCode::CALL => format!("{} {} {}", a, b, c),
+        opcodes::OpCode::TAILCALL => format!("{} {} {}{}", a, b, c, isk),
+        opcodes::OpCode::RETURN => format!("{} {} {}{}", a, b, c, isk),
+        opcodes::OpCode::RETURN0 => String::new(),
+        opcodes::OpCode::RETURN1 => format!("{}", a),
+        opcodes::OpCode::FORLOOP | opcodes::OpCode::FORPREP
+        | opcodes::OpCode::TFORPREP | opcodes::OpCode::TFORLOOP => format!("{} {}", a, bx),
+        opcodes::OpCode::TFORCALL => format!("{} {}", a, c),
+        opcodes::OpCode::SETLIST => {
+            let vb = getarg_vb(op);
+            format!("{} {} {}{}", a, vb, c, isk)
+        }
+        opcodes::OpCode::CLOSURE => format!("{} {}", a, bx),
+        opcodes::OpCode::VARARG => format!("{} {} {}{}", a, b, c, isk),
+        opcodes::OpCode::GETVARG => format!("{} {} {}", a, b, c),
+        opcodes::OpCode::ERRNNIL => format!("{} {}", a, bx),
+        opcodes::OpCode::VARARGPREP => format!("{}", a),
+        opcodes::OpCode::EXTRAARG => {
+            let ax = getarg(op, POS_A, SIZE_BX + SIZE_A) as i32;
+            format!("{}", ax)
+        }
+    }
+}
+
+fn format_c_comment(inst: &DumpInstruction, constants: &[DumpConstant]) -> String {
+    let op = get_opcode(inst.opcode as u32);
+    let c = inst.c as i32;
+    let isk = inst.k != 0;
+    let pc = 0;
+
+    match op {
+        opcodes::OpCode::LOADK | opcodes::OpCode::LOADKX => {
+            let idx = if op == opcodes::OpCode::LOADKX { inst.c as usize } else { inst.bx as usize };
+            if idx < constants.len() {
+                format!("\t; {}", format_constant(constants, idx))
+            } else { String::new() }
+        }
+        opcodes::OpCode::GETTABUP | opcodes::OpCode::GETFIELD => {
+            format!("\t; {}", format_constant(constants, c as usize))
+        }
+        opcodes::OpCode::SETTABUP | opcodes::OpCode::SETFIELD => {
+            let b_const = format_constant(constants, inst.b as usize);
+            let mut s = format!("\t; {}", b_const);
+            if isk { s.push_str(&format!(" {}", format_constant(constants, c as usize))); }
+            s
+        }
+        opcodes::OpCode::SETTABLE | opcodes::OpCode::SETI => {
+            if isk { format!("\t; {}", format_constant(constants, c as usize)) } else { String::new() }
+        }
+        opcodes::OpCode::NEWTABLE => {
+            let total = c as usize + opcodes::SIZE_C as usize + 1;
+            format!("\t; {}", total)
+        }
+        opcodes::OpCode::SELF => {
+            if isk { format!("\t; {}", format_constant(constants, c as usize)) } else { String::new() }
+        }
+        opcodes::OpCode::ADDK | opcodes::OpCode::SUBK | opcodes::OpCode::MULK
+        | opcodes::OpCode::MODK | opcodes::OpCode::POWK | opcodes::OpCode::DIVK
+        | opcodes::OpCode::IDIVK | opcodes::OpCode::BANDK | opcodes::OpCode::BORK
+        | opcodes::OpCode::BXORK => {
+            format!("\t; {}", format_constant(constants, c as usize))
+        }
+        opcodes::OpCode::MMBIN => {
+            let event_idx = c as usize;
+            if event_idx < TM_EVENT_NAMES.len() {
+                format!("\t; {}", TM_EVENT_NAMES[event_idx])
+            } else { String::new() }
+        }
+        opcodes::OpCode::MMBINI => {
+            let event_idx = c as usize;
+            let mut s = if event_idx < TM_EVENT_NAMES.len() {
+                format!("\t; {}", TM_EVENT_NAMES[event_idx])
+            } else { String::new() };
+            if isk { s.push_str(" flip"); }
+            s
+        }
+        opcodes::OpCode::MMBINK => {
+            let event_idx = c as usize;
+            let mut s = if event_idx < TM_EVENT_NAMES.len() {
+                format!("\t; {} ", TM_EVENT_NAMES[event_idx])
+            } else { String::new() };
+            s.push_str(&format_constant(constants, inst.b as usize));
+            if isk { s.push_str(" flip"); }
+            s
+        }
+        opcodes::OpCode::JMP => {
+            let sj = (inst.a as i32) | ((inst.b as i32) << 8) | ((inst.c as i32) << 16) | ((inst.k as i32) << 17);
+            let sj_signed = sj - opcodes::OFFSET_sJ;
+            format!("\t; to {}", sj_signed + pc as i32 + 2)
+        }
+        opcodes::OpCode::EQK => {
+            format!("\t; {}", format_constant(constants, inst.b as usize))
+        }
+        opcodes::OpCode::CALL => {
+            let in_args = if inst.b == 0 { "all in".to_string() } else { format!("{} in", inst.b as i32 - 1) };
+            let out_args = if inst.c == 0 { "all out".to_string() } else { format!("{} out", inst.c as i32 - 1) };
+            format!("\t; {} {}", in_args, out_args)
+        }
+        opcodes::OpCode::TAILCALL => {
+            format!("\t; {} in", inst.b as i32 - 1)
+        }
+        opcodes::OpCode::RETURN => {
+            if inst.b == 0 { "\t; all out".to_string() } else { format!("\t; {} out", inst.b as i32 - 1) }
+        }
+        opcodes::OpCode::FORLOOP => {
+            format!("\t; to {}", pc as i32 - inst.bx as i32 + 2)
+        }
+        opcodes::OpCode::FORPREP => {
+            format!("\t; exit to {}", pc as i32 + inst.bx as i32 + 3)
+        }
+        opcodes::OpCode::TFORPREP => {
+            format!("\t; to {}", pc as i32 + inst.bx as i32 + 2)
+        }
+        opcodes::OpCode::TFORLOOP => {
+            format!("\t; to {}", pc as i32 - inst.bx as i32 + 2)
+        }
+        opcodes::OpCode::SETLIST => {
+            if isk { format!("\t; {}", c as usize + opcodes::SIZE_C as usize + 1) } else { String::new() }
+        }
+        opcodes::OpCode::LOADNIL => {
+            format!("\t; {} out", inst.b as i32 + 1)
+        }
+        opcodes::OpCode::VARARG => {
+            if inst.c == 0 { "\t; all out".to_string() } else { format!("\t; {} out", inst.c as i32 - 1) }
+        }
+        opcodes::OpCode::ERRNNIL => {
+            if inst.bx == 0 { "\t; ?".to_string() }
+            else { format!("\t; {}", format_constant(constants, (inst.bx as usize) - 1)) }
+        }
+        _ => String::new(),
+    }
+}
+
 pub fn compare_instructions(rust_code: &[u32], c_code: &[DumpInstruction]) -> Vec<String> {
     let mut diffs = Vec::new();
     let max_len = rust_code.len().max(c_code.len());
@@ -377,31 +581,49 @@ pub fn compare_instructions(rust_code: &[u32], c_code: &[DumpInstruction]) -> Ve
 }
 
 pub fn format_instruction(raw: u32) -> String {
-    let op = raw & 0x7f;
-    let a = (raw >> 7) & 0xff;
-    let b = (raw >> 16) & 0xff;
-    let c = (raw >> 24) & 0xff;
-    let k = (raw >> 15) & 1;
-    format!("{:08x} op={:3} A={:3} B={:3} C={:3} k={}", raw, op, a, b, c, k)
+    let op = raw;
+    let a = getarg_a(op);
+    let b = getarg_b(op);
+    let c = getarg_c(op);
+    let k = testarg_k(op);
+    let bx = getarg_bx(op);
+    let sbx = getarg_sbx(op);
+    let sj = getarg_sj(op);
+
+    let opcode = get_opcode(op);
+    let op_name = OPNAMES[opcode as usize];
+    let operands = format_operands(op, a, b, c, bx, sbx, sj, k);
+    format!("{:08x}\t{}\t{}", raw, op_name, operands)
 }
 
 pub fn dump_instructions(code: &[u32]) -> String {
     code.iter()
         .enumerate()
-        .map(|(i, inst)| format!("  [{}] {}", i, format_instruction(*inst)))
+        .map(|(i, inst)| format!("{}\t[-]\t{}", i + 1, format_instruction(*inst)))
         .collect::<Vec<_>>()
         .join("\n")
 }
 
-pub fn dump_c_instructions(code: &[DumpInstruction]) -> String {
+pub fn format_c_instruction(inst: &DumpInstruction, constants: &[DumpConstant]) -> String {
+    let opcode = get_opcode(inst.opcode as u32);
+    let op_name = OPNAMES[opcode as usize];
+    let a = inst.a as i32;
+    let b = inst.b as i32;
+    let c = inst.c as i32;
+    let k = inst.k != 0;
+    let bx = inst.bx as i32;
+    let sbx = bx - opcodes::OFFSET_SBX;
+    let sj = getarg_sj(inst.opcode as u32);
+
+    let operands = format_operands(inst.opcode as u32, a, b, c, bx, sbx, sj, k);
+    let comment = format_c_comment(inst, constants);
+    format!("{}\t{}\t{}", op_name, operands, comment)
+}
+
+pub fn dump_c_instructions(code: &[DumpInstruction], constants: &[DumpConstant]) -> String {
     code.iter()
         .enumerate()
-        .map(|(i, inst)| {
-            format!(
-                "  [{}] op={:3} A={:3} B={:3} C={:3} k={}",
-                i, inst.opcode, inst.a, inst.b, inst.c, inst.k
-            )
-        })
+        .map(|(i, inst)| format!("{}\t[-]\t{}", i + 1, format_c_instruction(inst, constants)))
         .collect::<Vec<_>>()
         .join("\n")
 }

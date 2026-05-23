@@ -19,7 +19,7 @@ mod compiler_compare_tests {
         let diffs = bytecode_dump::compare_instructions(&rust_proto.code, &c_func.code);
         if !diffs.is_empty() {
             let rust_dump = bytecode_dump::dump_instructions(&rust_proto.code);
-            let c_dump = bytecode_dump::dump_c_instructions(&c_func.code);
+            let c_dump = bytecode_dump::dump_c_instructions(&c_func.code, &c_func.constants);
             panic!(
                 "Instruction mismatch for source: {}\n\
                  Differences:\n  {}\n\n\
@@ -46,7 +46,7 @@ mod compiler_compare_tests {
             .collect();
         if !filtered.is_empty() {
             let rust_dump = bytecode_dump::dump_instructions(&rust_proto.code);
-            let c_dump = bytecode_dump::dump_c_instructions(&c_func.code);
+            let c_dump = bytecode_dump::dump_c_instructions(&c_func.code, &c_func.constants);
             panic!(
                 "Instruction mismatch for source: {}\n\
                  Differences:\n  {}\n\n\
