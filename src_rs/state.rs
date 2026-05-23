@@ -152,11 +152,14 @@ impl LuaState {
     /// 函数帧布局: stack[base-1] = 函数入口, stack[base+0..base+N] = 寄存器/参数
     /// 当 base=0 时，stack[0] 兼作函数入口和寄存器 0（主函数场景）
     pub fn from_proto(proto: &Proto, base: usize, mut stack: Vec<TValue>, gc: Rc<GCState>) -> Self {
-        // 防御: 当 base > 0 时确保函数入口槽 stack[base-1] 存在
         if base > 0 {
             while stack.len() < base {
                 stack.push(TValue::Nil(NilKind::Strict));
             }
+        }
+        let needed = base + proto.max_stack_size as usize;
+        while stack.len() < needed {
+            stack.push(TValue::Nil(NilKind::Strict));
         }
         LuaState {
             constants: proto.constants.clone(),

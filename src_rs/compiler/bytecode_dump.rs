@@ -593,7 +593,7 @@ pub fn format_instruction(raw: u32) -> String {
     let opcode = get_opcode(op);
     let op_name = OPNAMES[opcode as usize];
     let operands = format_operands(op, a, b, c, bx, sbx, sj, k);
-    format!("{:08x}\t{}\t{}", raw, op_name, operands)
+    format!("{}\t{}", op_name, operands)
 }
 
 pub fn dump_instructions(code: &[u32]) -> String {

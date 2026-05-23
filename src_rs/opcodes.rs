@@ -193,11 +193,11 @@ static OP_MODES: [u8; NUM_OPCODES] = [
     opmode_entry(0, 0, 1, 0, 0, OpMode::IABC),    // RETURN
     opmode_entry(0, 0, 0, 0, 0, OpMode::IABC),    // RETURN0
     opmode_entry(0, 0, 0, 0, 0, OpMode::IABC),    // RETURN1
-    opmode_entry(0, 0, 0, 0, 1, OpMode::IABx),    // FORLOOP
-    opmode_entry(0, 0, 0, 0, 1, OpMode::IABx),    // FORPREP
-    opmode_entry(0, 0, 0, 0, 0, OpMode::IABx),    // TFORPREP
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IAsBx),    // FORLOOP
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IAsBx),    // FORPREP
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IAsBx),    // TFORPREP
     opmode_entry(0, 0, 0, 0, 0, OpMode::IABC),    // TFORCALL
-    opmode_entry(0, 0, 0, 0, 1, OpMode::IABx),    // TFORLOOP
+    opmode_entry(0, 0, 0, 0, 1, OpMode::IAsBx),    // TFORLOOP
     opmode_entry(0, 0, 1, 0, 0, OpMode::IvABC),   // SETLIST
     opmode_entry(0, 0, 0, 0, 1, OpMode::IABx),    // CLOSURE
     opmode_entry(0, 1, 0, 0, 1, OpMode::IABC),    // VARARG

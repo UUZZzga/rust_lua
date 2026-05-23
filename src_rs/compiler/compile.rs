@@ -62,6 +62,7 @@ pub struct FuncState {
     pub prev: Option<Box<FuncState>>,
     pub pc: i32,
     pub freereg: i32,
+    pub max_freereg: i32,
     pub locals: Vec<LocalVar>,
     pub errors: Vec<String>,
     ls: *mut LexState,
@@ -81,7 +82,7 @@ pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
     }
 
     let mut proto = fs.proto;
-    proto.max_stack_size = (fs.freereg + 2) as u8;
+    proto.max_stack_size = (fs.max_freereg + 2) as u8;
     proto.size_code = proto.code.len() as i32;
     proto.size_k = proto.constants.len() as i32;
     proto.size_p = proto.protos.len() as i32;
@@ -95,6 +96,7 @@ impl FuncState {
             prev: None,
             pc: 0,
             freereg: 0,
+            max_freereg: 0,
             locals: Vec::new(),
             errors: Vec::new(),
             ls: ls as *mut LexState,
@@ -153,7 +155,7 @@ impl FuncState {
         self.emit(ins)
     }
 
-    fn fix_jump(&mut self, pc: i32, dest: i32) {
+    fn fix_jump(&mut self, pc: i32, dest: i32, back: bool) {
         let i = &mut self.proto.code[pc as usize];
         let op = get_opcode(*i);
         match get_opmode(op) {
@@ -172,7 +174,11 @@ impl FuncState {
                 setarg(i, offset, POS_BX, SIZE_BX);
             }
             OpMode::IAsBx => {
-                let offset = dest - pc - 1;
+                let offset = if back {
+                    pc + 1 - dest + OFFSET_SBX
+                } else {
+                    dest - pc - 1 + OFFSET_SBX
+                };
                 setarg(i, offset, POS_BX, SIZE_BX);
             }
             OpMode::IsJ => {
@@ -260,6 +266,9 @@ impl FuncState {
     fn alloc_reg(&mut self) -> i32 {
         let r = self.freereg;
         self.freereg += 1;
+        if self.freereg > self.max_freereg {
+            self.max_freereg = self.freereg;
+        }
         r
     }
 
@@ -361,7 +370,15 @@ impl FuncState {
                 self.code_abx(OpCode::LOADK, r, e.info as i32);
                 r
             }
-            ExpKind::NonReloc => e.info as i32,
+            ExpKind::NonReloc => {
+                if e.info as i32 == self.freereg - 1 {
+                    e.info as i32
+                } else {
+                    let r = self.alloc_reg();
+                    self.code_abc(OpCode::MOVE, r, e.info as i32, 0);
+                    r
+                }
+            }
             ExpKind::Relocable | ExpKind::Call | ExpKind::Vararg => {
                 if e.info as i32 == self.freereg - 1 {
                     e.info as i32
@@ -403,7 +420,7 @@ impl FuncState {
         let mut cur = list;
         while cur != NO_JUMP {
             let next = self.get_jump(cur);
-            self.fix_jump(cur, target);
+            self.fix_jump(cur, target, false);
             cur = next;
         }
     }
@@ -412,7 +429,7 @@ impl FuncState {
         let mut cur = list;
         while cur != NO_JUMP {
             let next = self.get_jump(cur);
-            self.fix_jump(cur, target);
+            self.fix_jump(cur, target, false);
             cur = next;
         }
     }
@@ -700,11 +717,13 @@ fn parse_statement(fs: &mut FuncState) {
 // ============================================================================
 
 fn parse_assign_or_call(fs: &mut FuncState) {
-    let first = parse_prefix_exp(fs);
+    let mut first = parse_prefix_exp(fs);
     
+    let mut has_call = false;
     if check(fs, &Token::LParen) || check(fs, &Token::Colon) || check(fs, &Token::LBrace) || matches!(&fs.ls().token, Token::String(..)) {
+        has_call = true;
         let freg = load_func(fs, &first);
-        let start_pc = fs.pc;
+        let _start_pc = fs.pc;
         parse_func_args(fs, freg);
         loop {
             match &fs.ls().token {
@@ -714,8 +733,52 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 _ => break,
             }
         }
-        let last_pc = fs.pc - 1;
-        fs.set_c(last_pc, 1);
+        if has_call {
+            let last_pc = fs.pc - 1;
+            fs.set_c(last_pc, 1);
+        }
+    }
+    
+    loop {
+        match &fs.ls().token {
+            Token::Dot => {
+                fs.ls_mut().next();
+                let field = get_name(fs);
+                let k = fs.string_k(&field);
+                let base_reg = if let Some(r) = first.reg { r } else {
+                    let r = fs.alloc_reg();
+                    if let Some(key) = first.key {
+                        fs.code_abc(OpCode::GETTABUP, r, 0, key);
+                    }
+                    r
+                };
+                first = PrefixResult {
+                    var_name: None, local_idx: None, key: None, reg: Some(base_reg),
+                    table_reg: Some(base_reg), table_key: Some(k),
+                };
+            }
+            Token::LBracket => {
+                fs.ls_mut().next();
+                let ei = parse_expr(fs);
+                expect(fs, &Token::RBracket);
+                let base_reg = if let Some(r) = first.reg { r } else {
+                    let r = fs.alloc_reg();
+                    if let Some(key) = first.key {
+                        fs.code_abc(OpCode::GETTABUP, r, 0, key);
+                    }
+                    r
+                };
+                let kr = fs.expr_to_reg(&ei.exp);
+                first = PrefixResult {
+                    var_name: None, local_idx: None, key: None, reg: Some(base_reg),
+                    table_reg: Some(base_reg), table_key: Some(kr),
+                };
+            }
+            _ => break,
+        }
+    }
+    
+    if has_call && !check(fs, &Token::Eq) && !check(fs, &Token::Comma) {
         fs.free_reg();
         return;
     }
@@ -796,13 +859,25 @@ fn load_func(fs: &mut FuncState, p: &PrefixResult) -> i32 {
         fs.code_abc(OpCode::GETTABLE, r, table_reg, table_key);
         r
     } else if let Some(reg) = p.local_idx {
-        reg
+        if reg == fs.freereg - 1 {
+            reg
+        } else {
+            let r = fs.alloc_reg();
+            fs.code_abc(OpCode::MOVE, r, reg, 0);
+            r
+        }
     } else if let Some(key) = p.key {
         let r = fs.alloc_reg();
         fs.code_abc(OpCode::GETTABUP, r, 0, key);
         r
     } else if let Some(reg) = p.reg {
-        reg
+        if reg == fs.freereg - 1 {
+            reg
+        } else {
+            let r = fs.alloc_reg();
+            fs.code_abc(OpCode::MOVE, r, reg, 0);
+            r
+        }
     } else {
         fs.alloc_reg()
     }
@@ -1360,6 +1435,56 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             matched = true;
         }
         
+        if limit <= PREC_POW && check(fs, &Token::Caret) {
+            let ec = e.exp.clone();
+            fs.ls_mut().next();
+            let e2 = parse_subexpr(fs, PREC_POW);
+            match (&ec.kind, &e2.exp.kind) {
+                (ExpKind::Int, ExpKind::Int) => {
+                    let base = ec.info;
+                    let exp = e2.exp.info;
+                    if exp >= 0 && exp <= 63 {
+                        let mut result: i64 = 1;
+                        for _ in 0..exp { result *= base; }
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Int, result) };
+                    } else {
+                        let r = fs.expr_to_reg(&ec);
+                        let r2 = fs.expr_to_reg(&e2.exp);
+                        let dest = fs.alloc_reg();
+                        fs.code_abc(OpCode::POW, dest, r, r2);
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
+                    }
+                }
+                _ => {
+                    let r = fs.expr_to_reg(&ec);
+                    let k_idx = match &e2.exp.kind {
+                        ExpKind::Int => {
+                            let k = fs.int_k(e2.exp.info);
+                            if k <= 255 { Some(k) } else { None }
+                        }
+                        ExpKind::Float => {
+                            let f = f64::from_bits(e2.exp.info as u64);
+                            let k = fs.float_k(f);
+                            if k <= 255 { Some(k) } else { None }
+                        }
+                        _ => None,
+                    };
+                    if let Some(k) = k_idx {
+                        let dest = fs.alloc_reg();
+                        fs.code_abc(OpCode::POWK, dest, r, k);
+                        fs.code_abc(OpCode::MMBINK, r, k, 10);
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
+                    } else {
+                        let r2 = fs.expr_to_reg(&e2.exp);
+                        let dest = fs.alloc_reg();
+                        fs.code_abc(OpCode::POW, dest, r, r2);
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
+                    }
+                }
+            }
+            matched = true;
+        }
+        
         if !matched {
             break;
         }
@@ -1560,7 +1685,7 @@ fn parse_if(fs: &mut FuncState) {
     while check(fs, &Token::Elseif) {
         let j = fs.jump();
         exit_jumps.push(j);
-        fs.fix_jump(jmp, fs.pc);
+        fs.fix_jump(jmp, fs.pc, false);
         fs.ls_mut().next();
         let ei2 = parse_expr(fs);
         let cr2 = fs.expr_to_reg(&ei2.exp);
@@ -1572,16 +1697,16 @@ fn parse_if(fs: &mut FuncState) {
     if check(fs, &Token::Else) {
         let j = fs.jump();
         exit_jumps.push(j);
-        fs.fix_jump(jmp, fs.pc);
+        fs.fix_jump(jmp, fs.pc, false);
         fs.ls_mut().next();
         parse_block(fs);
     } else {
-        fs.fix_jump(jmp, fs.pc);
+        fs.fix_jump(jmp, fs.pc, false);
     }
     expect(fs, &Token::End);
 
     for j in exit_jumps {
-        fs.fix_jump(j, fs.pc);
+        fs.fix_jump(j, fs.pc, false);
     }
 }
 
@@ -1594,7 +1719,7 @@ fn parse_while(fs: &mut FuncState) {
     expect(fs, &Token::Do);
     parse_block(fs);
     fs.code_asbx(OpCode::JMP, 0, loop_start - fs.pc - 1);
-    fs.fix_jump(jmp, fs.pc);
+    fs.fix_jump(jmp, fs.pc, false);
     expect(fs, &Token::End);
 }
 
@@ -1612,7 +1737,7 @@ fn parse_repeat(fs: &mut FuncState) {
     let ei = parse_expr(fs);
     let r = fs.expr_to_reg(&ei.exp);
     fs.code_abc(OpCode::EQ, r, 0, 0);
-    fs.fix_jump(fs.pc - 1, loop_start);
+    fs.fix_jump(fs.pc - 1, loop_start, true);
 }
 
 fn parse_for(fs: &mut FuncState) {
@@ -1621,6 +1746,7 @@ fn parse_for(fs: &mut FuncState) {
     
     if check(fs, &Token::Eq) {
         fs.ls_mut().next();
+        let base = fs.freereg;
         let ei = parse_expr(fs);
         let init_r = fs.expr_to_reg(&ei.exp);
         expect(fs, &Token::Comma);
@@ -1637,19 +1763,95 @@ fn parse_for(fs: &mut FuncState) {
             r
         };
         
-        expect(fs, &Token::Do);
-        let idx = fs.add_local(&name, fs.pc);
-        fs.code_abc(OpCode::MOVE, idx, init_r, 0);
+        if init_r != base {
+            fs.code_abc(OpCode::MOVE, base, init_r, 0);
+        }
+        if limit_r != base + 1 {
+            fs.code_abc(OpCode::MOVE, base + 1, limit_r, 0);
+        }
+        if step_r != base + 2 {
+            fs.code_abc(OpCode::MOVE, base + 2, step_r, 0);
+        }
+        fs.freereg = base + 3;
         
-        let prep = fs.code_asbx(OpCode::FORPREP, idx, 0);
+        expect(fs, &Token::Do);
+        
+        fs.add_local_kind_reg("(for state)", fs.pc, RDKCONST, base);
+        fs.add_local_kind_reg("(for state)", fs.pc, RDKCONST, base + 1);
+        fs.add_local_kind_reg(&name, fs.pc, RDKCONST, base + 2);
+        
+        let prep = fs.code_asbx(OpCode::FORPREP, base, 0);
         parse_block(fs);
-        fs.code_asbx(OpCode::FORLOOP, idx, 0);
-        fs.fix_jump(prep, fs.pc);
+        let loop_pc = fs.code_asbx(OpCode::FORLOOP, base, 0);
+        fs.fix_jump(prep, fs.pc, false);
+        fs.fix_jump(loop_pc, prep + 1, true);
         expect(fs, &Token::End);
     } else {
-        fs.error("generic for not yet supported");
-        fs.ls_mut().next();
+        let mut vars = vec![name];
+        while check(fs, &Token::Comma) {
+            fs.ls_mut().next();
+            let var = get_name(fs);
+            vars.push(var);
+        }
+        expect(fs, &Token::In);
+        
+        let saved_nlocals = fs.locals.len();
+        let saved_freereg = fs.freereg;
+        let base = fs.freereg;
+        
+        fs.add_local_kind("(for state)", fs.pc, RDKCONST);
+        fs.add_local_kind("(for state)", fs.pc, RDKCONST);
+        fs.add_local_kind("(for state)", fs.pc, RDKTOCLOSE);
+        let ncontrol = vars.len() as i32;
+        for var_name in &vars {
+            fs.add_local_kind(var_name, fs.pc, RDKCONST);
+        }
+        
+        fs.freereg = base;
+        let pc_before = fs.pc;
+        loop {
+            parse_expr(fs);
+            if !check(fs, &Token::Comma) { break; }
+            fs.ls_mut().next();
+        }
+        
+        if fs.pc > pc_before {
+            for i in (pc_before..fs.pc).rev() {
+                if get_opcode(fs.proto.code[i as usize]) == OpCode::CALL {
+                    let needed = (3.max(ncontrol) + 1).min(255);
+                    setarg(&mut fs.proto.code[i as usize], needed, POS_C, SIZE_C);
+                    break;
+                }
+            }
+        }
+        
+        fs.freereg = base + 3 + ncontrol;
+        if fs.freereg > fs.max_freereg {
+            fs.max_freereg = fs.freereg;
+        }
+        fs.code_abc(OpCode::TBC, base + 2, 0, 0);
+        
+        fs.alloc_reg();
+        fs.alloc_reg();
+        fs.free_reg();
+        fs.free_reg();
+        
+        expect(fs, &Token::Do);
+        
+        let prep = fs.code_asbx(OpCode::TFORPREP, base, 0);
+        fs.freereg -= 1;
+        
+        parse_block(fs);
+        
+        fs.fix_jump(prep, fs.pc, false);
+        fs.code_abc(OpCode::TFORCALL, base, 0, ncontrol);
+        let loop_pc = fs.code_asbx(OpCode::TFORLOOP, base, 0);
+        fs.fix_jump(loop_pc, prep + 1, true);
+        
         expect(fs, &Token::End);
+        
+        fs.freereg = saved_freereg;
+        fs.locals.truncate(saved_nlocals);
     }
 }
 
