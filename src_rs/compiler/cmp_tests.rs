@@ -307,8 +307,8 @@ mod compiler_compare_tests {
     }
 
     #[test]
-    fn test_calls_lua() {
-        assert_inst_match(get_lua_script("calls.lua").as_str(), Some("calls.lua"));
+    fn test_focus_lua() {
+        assert_inst_match(get_lua_script("test_focus.lua").as_str(), Some("test_focus.lua"));
     }
 
     fn get_lua_script(name: &str) -> String {

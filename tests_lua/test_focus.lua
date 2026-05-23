@@ -1,0 +1,11 @@
+local a = 1 + 2
+local b = a * 3
+local c = a - 1
+local d = a + 5
+local e = a & 2
+local f = a | 4
+local g = a ~ 1
+local h = a << 1
+local i = a >> 1
+local s = "hello" .. "world"
+local fn = function(x) return x + 1 end

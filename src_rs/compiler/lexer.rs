@@ -185,14 +185,10 @@ impl LexState {
         if self.lookahead.is_none() {
             let saved_token = self.token.clone();
             let saved_info = self.token_info.clone();
-            let saved_pos = self.pos;
-            let saved_ch = self.current;
             self.read_token();
             self.lookahead = Some((self.token.clone(), self.token_info.clone()));
             self.token = saved_token;
             self.token_info = saved_info;
-            self.pos = saved_pos;
-            self.current = saved_ch;
         }
         self.lookahead.as_ref().unwrap()
     }
