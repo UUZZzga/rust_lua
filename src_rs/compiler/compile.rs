@@ -1377,16 +1377,22 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             let is_eq = matches!(op_tok, Token::EqEq | Token::TildeEq);
             let k = if matches!(op_tok, Token::TildeEq) { 0 } else { 1 };
 
-            if fits_sc(&ec) && fits_sc(&e2.exp) {
+            let sc_imm = if is_eq || is_gt {
+                is_sc_number(&ec)
+            } else {
+                is_sc_number(&e2.exp)
+            };
+
+            if let Some(sc_val) = sc_imm {
                 let (reg, imm) = if is_eq {
                     let reg = fs.expr_to_reg(&e2.exp);
-                    (reg, int_to_sc(ec.info))
+                    (reg, int_to_sc(sc_val))
                 } else if is_gt {
                     let reg = fs.expr_to_reg(&e2.exp);
-                    (reg, int_to_sc(ec.info))
+                    (reg, int_to_sc(sc_val))
                 } else {
                     let reg = fs.expr_to_reg(&ec);
-                    (reg, int_to_sc(e2.exp.info))
+                    (reg, int_to_sc(sc_val))
                 };
                 let imm_op = match op_tok {
                     Token::EqEq | Token::TildeEq => OpCode::EQI,
@@ -1590,6 +1596,22 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     let val = if is_add { ec.info + e2.exp.info } else { ec.info - e2.exp.info };
                     e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
                 }
+                (ExpKind::Float, ExpKind::Int) => {
+                    let f = f64::from_bits(ec.info as u64);
+                    let val = if is_add { f + (e2.exp.info as f64) } else { f - (e2.exp.info as f64) };
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                }
+                (ExpKind::Int, ExpKind::Float) => {
+                    let f = f64::from_bits(e2.exp.info as u64);
+                    let val = if is_add { (ec.info as f64) + f } else { (ec.info as f64) - f };
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                }
+                (ExpKind::Float, ExpKind::Float) => {
+                    let f1 = f64::from_bits(ec.info as u64);
+                    let f2 = f64::from_bits(e2.exp.info as u64);
+                    let val = if is_add { f1 + f2 } else { f1 - f2 };
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                }
                 (ExpKind::Int, _) => {
                     let r = fs.expr_to_reg(&ec);
                     let r2 = fs.expr_to_reg(&e2.exp);
@@ -1655,6 +1677,94 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     } else {
                         let val = if is_mul { ec.info * e2.exp.info } else { ec.info % e2.exp.info };
                         e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
+                    }
+                }
+                (ExpKind::Float, ExpKind::Int) => {
+                    let f = f64::from_bits(ec.info as u64);
+                    if is_mul {
+                        let val = f * (e2.exp.info as f64);
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                    } else if is_div {
+                        let val = f / (e2.exp.info as f64);
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                    } else {
+                        let r = fs.expr_to_reg(&ec);
+                        let k_idx = {
+                            let k = fs.int_k(e2.exp.info);
+                            if k <= 255 { Some(k) } else { None }
+                        };
+                        if let Some(k) = k_idx {
+                            let dest = fs.alloc_reg();
+                            let op = if is_idiv { OpCode::IDIVK } else { OpCode::MODK };
+                            fs.code_abc(op, dest, r, k);
+                            let tm = if is_idiv { 12 } else { 9 };
+                            fs.code_abc(OpCode::MMBINK, r, k, tm);
+                            e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
+                        } else {
+                            let r2 = fs.expr_to_reg(&e2.exp);
+                            let op = if is_idiv { OpCode::IDIV } else { OpCode::MOD };
+                            fs.code_abc(op, r, r, r2);
+                            e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                        }
+                    }
+                }
+                (ExpKind::Int, ExpKind::Float) => {
+                    let f = f64::from_bits(e2.exp.info as u64);
+                    if is_mul {
+                        let val = (ec.info as f64) * f;
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                    } else if is_div {
+                        let val = (ec.info as f64) / f;
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                    } else {
+                        let r = fs.expr_to_reg(&ec);
+                        let k_idx = {
+                            let k = fs.float_k(f);
+                            if k <= 255 { Some(k) } else { None }
+                        };
+                        if let Some(k) = k_idx {
+                            let dest = fs.alloc_reg();
+                            let op = if is_idiv { OpCode::IDIVK } else { OpCode::MODK };
+                            fs.code_abc(op, dest, r, k);
+                            let tm = if is_idiv { 12 } else { 9 };
+                            fs.code_abc(OpCode::MMBINK, r, k, tm);
+                            e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
+                        } else {
+                            let r2 = fs.expr_to_reg(&e2.exp);
+                            let op = if is_idiv { OpCode::IDIV } else { OpCode::MOD };
+                            fs.code_abc(op, r, r, r2);
+                            e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                        }
+                    }
+                }
+                (ExpKind::Float, ExpKind::Float) => {
+                    let f1 = f64::from_bits(ec.info as u64);
+                    let f2 = f64::from_bits(e2.exp.info as u64);
+                    if is_mul {
+                        let val = f1 * f2;
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                    } else if is_div {
+                        let val = f1 / f2;
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                    } else {
+                        let r = fs.expr_to_reg(&ec);
+                        let k_idx = {
+                            let k = fs.float_k(f2);
+                            if k <= 255 { Some(k) } else { None }
+                        };
+                        if let Some(k) = k_idx {
+                            let dest = fs.alloc_reg();
+                            let op = if is_idiv { OpCode::IDIVK } else { OpCode::MODK };
+                            fs.code_abc(op, dest, r, k);
+                            let tm = if is_idiv { 12 } else { 9 };
+                            fs.code_abc(OpCode::MMBINK, r, k, tm);
+                            e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
+                        } else {
+                            let r2 = fs.expr_to_reg(&e2.exp);
+                            let op = if is_idiv { OpCode::IDIV } else { OpCode::MOD };
+                            fs.code_abc(op, r, r, r2);
+                            e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                        }
                     }
                 }
                 _ => {
@@ -1781,6 +1891,33 @@ fn fits_sc_neg(v: i64) -> bool {
 /// 将整型常量转换为 SC 参数编码 (加 OFFSET_SC 偏移)
 fn int_to_sc(v: i64) -> i32 {
     ((v as u64).wrapping_add(OFFSET_SC as u64)) as i32
+}
+
+/// 获取表达式的 SC 整数值 (C 的 isSCnumber 对应)
+/// 如果 Int 常量适合 SC，返回 Some(整数值)；
+/// 如果 Float 常量可精确转为 Int 且适合 SC，返回 Some(整数值)；
+/// 否则返回 None。
+fn is_sc_number(desc: &ExpDesc) -> Option<i64> {
+    match desc.kind {
+        ExpKind::Int => {
+            let v = desc.info;
+            if (v as i8 as i64) == v {
+                Some(v)
+            } else {
+                None
+            }
+        }
+        ExpKind::Float => {
+            let f = f64::from_bits(desc.info as u64);
+            let i = f as i64;
+            if (i as f64 - f).abs() < f64::EPSILON && (i as i8 as i64) == i {
+                Some(i)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 /// 判断整型值是否适合 AsBx 模式的有符号偏移量
