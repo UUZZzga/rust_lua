@@ -372,6 +372,11 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_return_expr_complex14() {
+        assert_inst_match("return -3+4*5//2^3^2//9+4%10/3 == (-3)+(((4*5)//(2^(3^2)))//9)+((4%10)/3)", None);
+    }
+
+    #[test]
     fn test_return_expr_len() {
         assert_inst_match("return #a", None);
     }

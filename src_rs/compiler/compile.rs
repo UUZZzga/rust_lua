@@ -1429,7 +1429,11 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 fs.free_reg();
                 e = ExprItem { exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64) };
             } else {
-                let r = fs.expr_to_reg(&ec);
+                let r = if matches!(ec.kind, ExpKind::Relocable | ExpKind::NonReloc) {
+                    ec.info as i32
+                } else {
+                    fs.expr_to_reg(&ec)
+                };
                 let const_k = if is_eq {
                     exp_to_const_k(fs, &e2.exp)
                 } else {
@@ -1442,7 +1446,11 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     fs.free_reg();
                     e = ExprItem { exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64) };
                 } else {
-                    let r2 = fs.expr_to_reg(&e2.exp);
+                    let r2 = if matches!(e2.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) {
+                        e2.exp.info as i32
+                    } else {
+                        fs.expr_to_reg(&e2.exp)
+                    };
                     let (b, c) = if is_gt { (r2, r) } else { (r, r2) };
                     let (op, k) = match op_tok {
                         Token::EqEq => (OpCode::EQ, 1),
@@ -1662,33 +1670,57 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
                 }
                 (ExpKind::Int, _) => {
-                    let r = fs.expr_to_reg(&ec);
-                    let r2 = fs.expr_to_reg(&e2.exp);
-                    if is_add && fits_sc(&ec) {
-                        fs.code_abc(OpCode::ADDI, r, r2, int_to_sc(ec.info));
-                        fs.code_abc(OpCode::MMBINI, r2, int_to_sc(ec.info), 6);
+                    if is_add {
+                        let r2 = fs.expr_to_reg(&e2.exp);
+                        if fits_sc(&ec) {
+                            let sc = int_to_sc(ec.info);
+                            fs.code_abc(OpCode::ADDI, r2, r2, sc);
+                            fs.code_abc_k(OpCode::MMBINI, r2, sc, 6, true);
+                        } else {
+                            let k = fs.int_k(ec.info);
+                            if k <= 255 {
+                                fs.code_abc(OpCode::ADDK, r2, r2, k);
+                                fs.code_abc_k(OpCode::MMBINK, r2, k, 6, true);
+                            } else {
+                                let r = fs.expr_to_reg(&ec);
+                                fs.code_abc(OpCode::ADD, r2, r2, r);
+                            }
+                        }
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r2 as i64) };
                     } else {
-                        fs.code_abc(if is_add { OpCode::ADDI } else { OpCode::SUBK }, r, r2, ec.info as i32);
+                        let r = fs.expr_to_reg(&ec);
+                        let r2 = fs.expr_to_reg(&e2.exp);
+                        fs.code_abc(OpCode::SUBK, r, r, r2);
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
                     }
-                    e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
                 }
                 _ => {
                     let r = fs.expr_to_reg(&ec);
                     if !is_add && matches!(e2.exp.kind, ExpKind::Int) && fits_sc(&e2.exp) && fits_sc_neg(e2.exp.info) {
                         let v = e2.exp.info;
-                        let dest = fs.alloc_reg();
                         let sc_neg = int_to_sc(-v);
                         let sc_pos = int_to_sc(v);
-                        fs.code_abc(OpCode::ADDI, dest, r, sc_neg);
+                        fs.code_abc(OpCode::ADDI, r, r, sc_neg);
                         fs.code_abc(OpCode::MMBINI, r, sc_pos, 7);
-                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
                     } else if is_add && matches!(e2.exp.kind, ExpKind::Int) && fits_sc(&e2.exp) {
                         let v = e2.exp.info;
-                        let dest = fs.alloc_reg();
                         let sc = int_to_sc(v);
-                        fs.code_abc(OpCode::ADDI, dest, r, sc);
+                        fs.code_abc(OpCode::ADDI, r, r, sc);
                         fs.code_abc(OpCode::MMBINI, r, sc, 6);
-                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                    } else if is_add && matches!(e2.exp.kind, ExpKind::Float) {
+                        let f = f64::from_bits(e2.exp.info as u64);
+                        let k = fs.float_k(f);
+                        if k <= 255 {
+                            fs.code_abc(OpCode::ADDK, r, r, k);
+                            fs.code_abc(OpCode::MMBINK, r, k, 6);
+                            e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                        } else {
+                            let r2 = fs.expr_to_reg(&e2.exp);
+                            fs.code_abc(OpCode::ADD, r, r, r2);
+                            e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                        }
                     } else {
                         let r2 = fs.expr_to_reg(&e2.exp);
                         let op = if is_add { OpCode::ADD } else { OpCode::SUB };
@@ -1744,17 +1776,42 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     } else if is_div {
                         let val = f / (e2.exp.info as f64);
                         e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                    } else if is_idiv {
+                        let denom = e2.exp.info as f64;
+                        if denom != 0.0 {
+                            let val = (f / denom).floor();
+                            if val != 0.0 && !val.is_nan() {
+                                e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                            } else {
+                                let r = fs.expr_to_reg(&ec);
+                                let k = fs.int_k(e2.exp.info);
+                                if k <= 255 {
+                                    fs.code_abc(OpCode::IDIVK, r, r, k);
+                                    fs.code_abc(OpCode::MMBINK, r, k, 12);
+                                } else {
+                                    let r2 = fs.expr_to_reg(&e2.exp);
+                                    fs.code_abc(OpCode::IDIV, r, r, r2);
+                                }
+                                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                            }
+                        } else {
+                            let r = fs.expr_to_reg(&ec);
+                            let k = fs.int_k(e2.exp.info);
+                            if k <= 255 {
+                                fs.code_abc(OpCode::IDIVK, r, r, k);
+                                fs.code_abc(OpCode::MMBINK, r, k, 12);
+                            } else {
+                                let r2 = fs.expr_to_reg(&e2.exp);
+                                fs.code_abc(OpCode::IDIV, r, r, r2);
+                            }
+                            e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                        }
                     } else {
                         let denom = e2.exp.info as f64;
                         if denom != 0.0 {
-                            if is_idiv {
-                                let val = (f / denom).floor();
-                                e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
-                            } else {
-                                let r = f % denom;
-                                let val = if (r > 0.0) == (denom < 0.0) && r != 0.0 { r + denom } else { r };
-                                e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
-                            }
+                            let r = f % denom;
+                            let val = if (r > 0.0) == (denom < 0.0) && r != 0.0 { r + denom } else { r };
+                            e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
                         } else {
                             let r = fs.expr_to_reg(&ec);
                             let k_idx = {
@@ -1763,15 +1820,12 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             };
                             if let Some(k) = k_idx {
                                 let dest = fs.alloc_reg();
-                                let op = if is_idiv { OpCode::IDIVK } else { OpCode::MODK };
-                                fs.code_abc(op, dest, r, k);
-                                let tm = if is_idiv { 12 } else { 9 };
-                                fs.code_abc(OpCode::MMBINK, r, k, tm);
+                                fs.code_abc(OpCode::MODK, dest, r, k);
+                                fs.code_abc(OpCode::MMBINK, r, k, 9);
                                 e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
                             } else {
                                 let r2 = fs.expr_to_reg(&e2.exp);
-                                let op = if is_idiv { OpCode::IDIV } else { OpCode::MOD };
-                                fs.code_abc(op, r, r, r2);
+                                fs.code_abc(OpCode::MOD, r, r, r2);
                                 e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
                             }
                         }
@@ -1785,17 +1839,42 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     } else if is_div {
                         let val = (ec.info as f64) / f;
                         e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                    } else if is_idiv {
+                        if f != 0.0 {
+                            let n = ec.info as f64;
+                            let val = (n / f).floor();
+                            if val != 0.0 && !val.is_nan() {
+                                e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                            } else {
+                                let r = fs.expr_to_reg(&ec);
+                                let k = fs.float_k(f);
+                                if k <= 255 {
+                                    fs.code_abc(OpCode::IDIVK, r, r, k);
+                                    fs.code_abc(OpCode::MMBINK, r, k, 12);
+                                } else {
+                                    let r2 = fs.expr_to_reg(&e2.exp);
+                                    fs.code_abc(OpCode::IDIV, r, r, r2);
+                                }
+                                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                            }
+                        } else {
+                            let r = fs.expr_to_reg(&ec);
+                            let k = fs.float_k(f);
+                            if k <= 255 {
+                                fs.code_abc(OpCode::IDIVK, r, r, k);
+                                fs.code_abc(OpCode::MMBINK, r, k, 12);
+                            } else {
+                                let r2 = fs.expr_to_reg(&e2.exp);
+                                fs.code_abc(OpCode::IDIV, r, r, r2);
+                            }
+                            e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                        }
                     } else {
                         if f != 0.0 {
                             let n = ec.info as f64;
-                            if is_idiv {
-                                let val = (n / f).floor();
-                                e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
-                            } else {
-                                let r = n % f;
-                                let val = if (r > 0.0) == (f < 0.0) && r != 0.0 { r + f } else { r };
-                                e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
-                            }
+                            let r = n % f;
+                            let val = if (r > 0.0) == (f < 0.0) && r != 0.0 { r + f } else { r };
+                            e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
                         } else {
                             let r = fs.expr_to_reg(&ec);
                             let k_idx = {
@@ -1804,15 +1883,12 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             };
                             if let Some(k) = k_idx {
                                 let dest = fs.alloc_reg();
-                                let op = if is_idiv { OpCode::IDIVK } else { OpCode::MODK };
-                                fs.code_abc(op, dest, r, k);
-                                let tm = if is_idiv { 12 } else { 9 };
-                                fs.code_abc(OpCode::MMBINK, r, k, tm);
+                                fs.code_abc(OpCode::MODK, dest, r, k);
+                                fs.code_abc(OpCode::MMBINK, r, k, 9);
                                 e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
                             } else {
                                 let r2 = fs.expr_to_reg(&e2.exp);
-                                let op = if is_idiv { OpCode::IDIV } else { OpCode::MOD };
-                                fs.code_abc(op, r, r, r2);
+                                fs.code_abc(OpCode::MOD, r, r, r2);
                                 e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
                             }
                         }
@@ -1827,16 +1903,40 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     } else if is_div {
                         let val = f1 / f2;
                         e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
-                    } else {
+                    } else if is_idiv {
                         if f2 != 0.0 {
-                            if is_idiv {
-                                let val = (f1 / f2).floor();
+                            let val = (f1 / f2).floor();
+                            if val != 0.0 && !val.is_nan() {
                                 e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
                             } else {
-                                let r = f1 % f2;
-                                let val = if (r > 0.0) == (f2 < 0.0) && r != 0.0 { r + f2 } else { r };
-                                e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                                let r = fs.expr_to_reg(&ec);
+                                let k = fs.float_k(f2);
+                                if k <= 255 {
+                                    fs.code_abc(OpCode::IDIVK, r, r, k);
+                                    fs.code_abc(OpCode::MMBINK, r, k, 12);
+                                } else {
+                                    let r2 = fs.expr_to_reg(&e2.exp);
+                                    fs.code_abc(OpCode::IDIV, r, r, r2);
+                                }
+                                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
                             }
+                        } else {
+                            let r = fs.expr_to_reg(&ec);
+                            let k = fs.float_k(f2);
+                            if k <= 255 {
+                                fs.code_abc(OpCode::IDIVK, r, r, k);
+                                fs.code_abc(OpCode::MMBINK, r, k, 12);
+                            } else {
+                                let r2 = fs.expr_to_reg(&e2.exp);
+                                fs.code_abc(OpCode::IDIV, r, r, r2);
+                            }
+                            e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                        }
+                    } else {
+                        if f2 != 0.0 {
+                            let r = f1 % f2;
+                            let val = if (r > 0.0) == (f2 < 0.0) && r != 0.0 { r + f2 } else { r };
+                            e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
                         } else {
                             let r = fs.expr_to_reg(&ec);
                             let k_idx = {
@@ -1845,15 +1945,12 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             };
                             if let Some(k) = k_idx {
                                 let dest = fs.alloc_reg();
-                                let op = if is_idiv { OpCode::IDIVK } else { OpCode::MODK };
-                                fs.code_abc(op, dest, r, k);
-                                let tm = if is_idiv { 12 } else { 9 };
-                                fs.code_abc(OpCode::MMBINK, r, k, tm);
+                                fs.code_abc(OpCode::MODK, dest, r, k);
+                                fs.code_abc(OpCode::MMBINK, r, k, 9);
                                 e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
                             } else {
                                 let r2 = fs.expr_to_reg(&e2.exp);
-                                let op = if is_idiv { OpCode::IDIV } else { OpCode::MOD };
-                                fs.code_abc(op, r, r, r2);
+                                fs.code_abc(OpCode::MOD, r, r, r2);
                                 e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
                             }
                         }
@@ -1873,16 +1970,25 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         }
                         _ => None,
                     };
-                    if let Some(k) = k_idx {
+                    if is_idiv {
+                        if let Some(k) = k_idx {
+                            fs.code_abc(OpCode::IDIVK, r, r, k);
+                            fs.code_abc(OpCode::MMBINK, r, k, 12);
+                        } else {
+                            let r2 = fs.expr_to_reg(&e2.exp);
+                            fs.code_abc(OpCode::IDIV, r, r, r2);
+                        }
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                    } else if let Some(k) = k_idx {
                         let dest = fs.alloc_reg();
-                        let op = if is_mul { OpCode::MULK } else if is_div { OpCode::DIVK } else if is_idiv { OpCode::IDIVK } else { OpCode::MODK };
+                        let op = if is_mul { OpCode::MULK } else if is_div { OpCode::DIVK } else { OpCode::MODK };
                         fs.code_abc(op, dest, r, k);
-                        let tm = if is_mul { 8 } else if is_div { 11 } else if is_idiv { 12 } else { 9 };
+                        let tm = if is_mul { 8 } else if is_div { 11 } else { 9 };
                         fs.code_abc(OpCode::MMBINK, r, k, tm);
                         e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
                     } else {
                         let r2 = fs.expr_to_reg(&e2.exp);
-                        let op = if is_mul { OpCode::MUL } else if is_div { OpCode::DIV } else if is_idiv { OpCode::IDIV } else { OpCode::MOD };
+                        let op = if is_mul { OpCode::MUL } else if is_div { OpCode::DIV } else { OpCode::MOD };
                         fs.code_abc(op, r, r, r2);
                         e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
                     }
