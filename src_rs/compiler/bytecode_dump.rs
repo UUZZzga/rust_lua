@@ -6,6 +6,7 @@ use crate::opcodes::{
 };
 use std::ffi::{c_int, c_void};
 use std::ptr;
+use imara_diff::{Algorithm, Diff, InternedInput};
 
 #[derive(Debug, Clone)]
 pub struct DumpInstruction {
@@ -530,79 +531,54 @@ fn dump_inst_to_raw(inst: &DumpInstruction) -> u32 {
 
 pub fn compare_instructions(rust_code: &[u32], c_code: &[DumpInstruction]) -> Vec<String> {
     let mut diffs = Vec::new();
-    let max_len = rust_code.len().max(c_code.len());
-    for i in 0..max_len {
-        let r_inst = rust_code.get(i).copied();
-        let c_inst = c_code.get(i);
 
-        match (r_inst, c_inst) {
-            (Some(r), Some(c)) => {
-                let r_a = getarg_a(r);
-                let r_b = getarg_b(r);
-                let r_c = getarg_c(r);
-                let r_k = testarg_k(r);
-                let r_bx = getarg_bx(r);
-                let r_sbx = getarg_sbx(r);
-                let r_sj = getarg_sj(r);
-                let r_opcode = get_opcode(r);
-                let r_name = OPNAMES[r_opcode as usize];
-                let r_ops = format_operands(r, r_a, r_b, r_c, r_bx, r_sbx, r_sj, r_k);
-                let r_formatted = format!("{}\t{}", r_name, r_ops);
+    let rust_formatted: Vec<String> = rust_code.iter().map(|&raw| format_instruction(raw)).collect();
 
-                let c_raw = dump_inst_to_raw(c);
-                let c_a = c.a as i32;
-                let c_b = c.b as i32;
-                let c_c = c.c as i32;
-                let c_k = c.k != 0;
-                let c_bx = c.bx as i32;
-                let c_sbx = c_bx - opcodes::OFFSET_SBX;
-                let c_sj = getarg_sj(c_raw);
-                let c_name = OPNAMES[c.opcode as usize];
-                let c_ops = format_operands(c_raw, c_a, c_b, c_c, c_bx, c_sbx, c_sj, c_k);
-                let c_formatted = format!("{}\t{}", c_name, c_ops);
+    let c_formatted: Vec<String> = c_code
+        .iter()
+        .map(|inst| format_instruction(dump_inst_to_raw(inst)))
+        .collect();
 
-                if r_formatted != c_formatted {
+    let rust_str = rust_formatted.join("\n");
+    let c_str = c_formatted.join("\n");
+    let input = InternedInput::new(rust_str.as_str(), c_str.as_str());
+    let diff = Diff::compute(Algorithm::Myers, &input);
+
+    for hunk in diff.hunks() {
+        let before_start = hunk.before.start as usize;
+        let before_end = hunk.before.end as usize;
+        let after_start = hunk.after.start as usize;
+        let after_end = hunk.after.end as usize;
+
+        if before_start == before_end {
+            for j in after_start..after_end {
+                diffs.push(format!("PC {}: extra C: {}", j, c_formatted[j]));
+            }
+        } else if after_start == after_end {
+            for i in before_start..before_end {
+                diffs.push(format!("PC {}: extra Rust: {}", i, rust_formatted[i]));
+            }
+        } else {
+            let before_count = before_end - before_start;
+            let after_count = after_end - after_start;
+            let max_count = before_count.max(after_count);
+            for k in 0..max_count {
+                let ri = before_start + k;
+                let ci = after_start + k;
+                if k < before_count && k < after_count {
                     diffs.push(format!(
                         "PC {}: Rust [{}] C [{}]",
-                        i, r_formatted, c_formatted
+                        ri, rust_formatted[ri], c_formatted[ci]
                     ));
+                } else if k < before_count {
+                    diffs.push(format!("PC {}: extra Rust: {}", ri, rust_formatted[ri]));
+                } else {
+                    diffs.push(format!("PC {}: extra C: {}", ci, c_formatted[ci]));
                 }
             }
-            (Some(r), None) => {
-                let r_a = getarg_a(r);
-                let r_b = getarg_b(r);
-                let r_c = getarg_c(r);
-                let r_k = testarg_k(r);
-                let r_bx = getarg_bx(r);
-                let r_sbx = getarg_sbx(r);
-                let r_sj = getarg_sj(r);
-                let r_opcode = get_opcode(r);
-                let r_name = OPNAMES[r_opcode as usize];
-                let r_ops = format_operands(r, r_a, r_b, r_c, r_bx, r_sbx, r_sj, r_k);
-                diffs.push(format!(
-                    "PC {}: extra Rust: {}\t{}",
-                    i, r_name, r_ops
-                ));
-            }
-            (None, Some(c)) => {
-                let c_raw = dump_inst_to_raw(c);
-                let c_a = c.a as i32;
-                let c_b = c.b as i32;
-                let c_c = c.c as i32;
-                let c_k = c.k != 0;
-                let c_bx = c.bx as i32;
-                let c_sbx = c_bx - opcodes::OFFSET_SBX;
-                let c_sj = getarg_sj(c_raw);
-                let c_name = OPNAMES[c.opcode as usize];
-                let c_ops = format_operands(c_raw, c_a, c_b, c_c, c_bx, c_sbx, c_sj, c_k);
-                diffs.push(format!(
-                    "PC {}: extra C: {}\t{}",
-                    i, c_name, c_ops
-                ));
-            }
-            (None, None) => {}
         }
     }
+
     diffs
 }
 

@@ -24,6 +24,7 @@ libc = "0.2"
 arc-swap = "1"
 hashbrown = "0.15"
 bitflags = "2"
+imara-diff = "0.2"
 
 [build-dependencies]
 cc = "1.0"
