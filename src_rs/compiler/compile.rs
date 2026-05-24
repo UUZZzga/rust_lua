@@ -1935,32 +1935,60 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
 fn parse_if(fs: &mut FuncState) {
     fs.ls_mut().next();
     let ei = parse_expr(fs);
-    let cond_reg = fs.expr_to_reg(&ei.exp);
-    let jmp = fs.code_abc(OpCode::TEST, cond_reg, 0, 0);
+
+    let is_const_true = matches!(ei.exp.kind, ExpKind::Boolean) && ei.exp.info != 0;
+
+    let mut if_jmp = NO_JUMP;
+
+    if !is_const_true {
+        let cond_reg = fs.expr_to_reg(&ei.exp);
+        fs.code_abc(OpCode::TEST, cond_reg, 0, 0);
+        if_jmp = fs.jump();
+        fs.free_reg();
+    }
+
     expect(fs, &Token::Then);
+    let block_freereg = fs.freereg;
     parse_block(fs);
+    fs.freereg = block_freereg;
     let mut exit_jumps = Vec::new();
 
     while check(fs, &Token::Elseif) {
         let j = fs.jump();
         exit_jumps.push(j);
-        fs.fix_jump(jmp, fs.pc, false);
+        if if_jmp != NO_JUMP {
+            fs.fix_jump(if_jmp, fs.pc, false);
+        }
         fs.ls_mut().next();
         let ei2 = parse_expr(fs);
-        let cr2 = fs.expr_to_reg(&ei2.exp);
-        let _jmp2 = fs.code_abc(OpCode::TEST, cr2, 0, 0);
+        let is_const_true2 = matches!(ei2.exp.kind, ExpKind::Boolean) && ei2.exp.info != 0;
+        if !is_const_true2 {
+            let cr2 = fs.expr_to_reg(&ei2.exp);
+            fs.code_abc(OpCode::TEST, cr2, 0, 0);
+            if_jmp = fs.jump();
+            fs.free_reg();
+        } else {
+            if_jmp = NO_JUMP;
+        }
         expect(fs, &Token::Then);
+        fs.freereg = block_freereg;
         parse_block(fs);
+        fs.freereg = block_freereg;
     }
 
     if check(fs, &Token::Else) {
         let j = fs.jump();
         exit_jumps.push(j);
-        fs.fix_jump(jmp, fs.pc, false);
+        if if_jmp != NO_JUMP {
+            fs.fix_jump(if_jmp, fs.pc, false);
+        }
         fs.ls_mut().next();
+        fs.freereg = block_freereg;
         parse_block(fs);
     } else {
-        fs.fix_jump(jmp, fs.pc, false);
+        if if_jmp != NO_JUMP {
+            fs.fix_jump(if_jmp, fs.pc, false);
+        }
     }
     expect(fs, &Token::End);
 
@@ -1975,7 +2003,9 @@ fn parse_while(fs: &mut FuncState) {
     let loop_start = fs.pc;
     let ei = parse_expr(fs);
     let r = fs.expr_to_reg(&ei.exp);
-    let jmp = fs.code_abc(OpCode::TEST, r, 0, 0);
+    fs.code_abc(OpCode::TEST, r, 0, 0);
+    let jmp = fs.jump();
+    fs.free_reg();
     expect(fs, &Token::Do);
     parse_block(fs);
     fs.code_asbx(OpCode::JMP, 0, loop_start - fs.pc - 1);
@@ -2009,7 +2039,9 @@ fn parse_for(fs: &mut FuncState) {
     
     if check(fs, &Token::Eq) {
         fs.ls_mut().next();
+        let saved_nlocals = fs.locals.len();
         let base = fs.freereg;
+        let saved_freereg = fs.freereg;
         let ei = parse_expr(fs);
         let init_r = fs.expr_to_reg(&ei.exp);
         expect(fs, &Token::Comma);
@@ -2048,6 +2080,11 @@ fn parse_for(fs: &mut FuncState) {
         fs.fix_jump(prep, fs.pc, false);
         let loop_pc = fs.code_abx(OpCode::FORLOOP, base, 0);
         fs.fix_jump(loop_pc, prep + 1, true);
+        
+        for local in &mut fs.locals[saved_nlocals..] {
+            local.active = false;
+        }
+        fs.freereg = saved_freereg;
         expect(fs, &Token::End);
     } else {
         let mut vars = vec![name];

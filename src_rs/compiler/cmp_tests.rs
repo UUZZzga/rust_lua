@@ -317,9 +317,9 @@ mod compiler_compare_tests {
     }
 
     #[test]
-    fn test_if_true_else_else() {
+    fn test_if_true_elseif_else() {
         assert_inst_match(
-            "if true then return 1 else return 2 else return 3 end",
+            "if true then return 1 elseif true then return 2 else return 3 end",
             None,
         );
     }
