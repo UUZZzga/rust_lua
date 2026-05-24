@@ -357,6 +357,21 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_return_expr_complex11() {
+        assert_inst_match("return 0xFD & 0xAA ~ 0xCC | 0xF0 == 0xF4", None);
+    }
+
+    #[test]
+    fn test_return_expr_complex12() {
+        assert_inst_match("return 0xF0 & 0x0F + 1 == 0x10", None);
+    }
+
+    #[test]
+    fn test_return_expr_complex13() {
+        assert_inst_match("return 3^4//2^3//5 == 2", None);
+    }
+
+    #[test]
     fn test_return_expr_len() {
         assert_inst_match("return #a", None);
     }
