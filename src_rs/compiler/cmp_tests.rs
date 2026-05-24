@@ -302,6 +302,16 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_return_expr() {
+        assert_inst_match("return 1 + 2", None);
+    }
+
+    #[test]
+    fn test_return_expr_len() {
+        assert_inst_match("return #a", None);
+    }
+
+    #[test]
     fn test_if_true() {
         assert_inst_match("if true then return 1 end", None);
     }
@@ -330,13 +340,13 @@ mod compiler_compare_tests {
     }
 
     #[test]
-    fn test_for_in() {
-        assert_inst_match("for k,v,w in a do end", None);
+    fn test_for_len() {
+        assert_inst_match("for i = 1, #a do end", None);
     }
 
     #[test]
-    fn test_return_expr() {
-        assert_inst_match("return 1 + 2", None);
+    fn test_for_in() {
+        assert_inst_match("for k,v,w in a do end", None);
     }
 
     // #[test]

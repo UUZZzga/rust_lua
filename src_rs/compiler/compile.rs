@@ -1877,15 +1877,14 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
             fs.ls_mut().next();
             let ei = parse_subexpr(fs, PREC_UNARY);
             let r = fs.expr_to_reg(&ei.exp);
-            let nr = fs.alloc_reg();
             match op_tok {
-                Token::Not => { fs.code_abc(OpCode::NOT, nr, r, 0); }
-                Token::Minus => { fs.code_abc(OpCode::UNM, nr, r, 0); }
-                Token::Hash => { fs.code_abc(OpCode::LEN, nr, r, 0); }
-                Token::Tilde => { fs.code_abc(OpCode::BNOT, nr, r, 0); }
+                Token::Not => { fs.code_abc(OpCode::NOT, r, r, 0); }
+                Token::Minus => { fs.code_abc(OpCode::UNM, r, r, 0); }
+                Token::Hash => { fs.code_abc(OpCode::LEN, r, r, 0); }
+                Token::Tilde => { fs.code_abc(OpCode::BNOT, r, r, 0); }
                 _ => {}
             }
-            ExpDesc::new(ExpKind::Relocable, nr as i64)
+            ExpDesc::new(ExpKind::Relocable, r as i64)
         }
         Token::Function => {
             fs.ls_mut().next();
