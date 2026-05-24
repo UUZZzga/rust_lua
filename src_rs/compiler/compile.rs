@@ -641,15 +641,40 @@ impl FuncState {
     fn exp_to_reg(&mut self, e: &ExpDesc) -> i32 {
         let r = self.expr_to_reg(e);
         if e.kind != ExpKind::VJMP && (e.t != NO_JUMP || e.f != NO_JUMP) {
-            let fj = self.jump();
-            let p_f = self.code_abc(OpCode::LFALSESKIP, r, 0, 0);
-            let p_t = self.code_abc(OpCode::LOADTRUE, r, 0, 0);
+            let need_f = self.need_value(e.f);
+            let need_t = self.need_value(e.t);
+            let p_f;
+            let p_t;
+            if need_f || need_t {
+                let fj = self.jump();
+                p_f = self.code_abc(OpCode::LFALSESKIP, r, 0, 0);
+                p_t = self.code_abc(OpCode::LOADTRUE, r, 0, 0);
+                let fix_to = self.pc;
+                self.fix_jump(fj, fix_to, false);
+            } else {
+                p_f = NO_JUMP;
+                p_t = NO_JUMP;
+            }
             let final_pc = self.pc;
-            self.fix_jump(fj, final_pc, false);
             self.patch_list_aux(e.f, final_pc, r, p_f);
             self.patch_list_aux(e.t, final_pc, r, p_t);
         }
         r
+    }
+
+    fn need_value(&self, list: i32) -> bool {
+        let mut cur = list;
+        while cur != NO_JUMP {
+            if cur < 1 || cur as usize >= self.proto.code.len() {
+                return true;
+            }
+            let ctrl_inst = self.proto.code[(cur - 1) as usize];
+            if get_opcode(ctrl_inst) != OpCode::TESTSET {
+                return true;
+            }
+            cur = self.get_jump(cur);
+        }
+        false
     }
 
     fn patch_true_jumps(&mut self, list: i32, target: i32) {
@@ -1374,73 +1399,79 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
     loop {
         let mut matched = false;
         
-        if limit <= PREC_OR && (check(fs, &Token::Or) || check(fs, &Token::And)) {
+        if limit <= PREC_AND && check(fs, &Token::And) {
             let mut e_left = e.exp.clone();
-            let is_and = check(fs, &Token::And);
             fs.ls_mut().next();
             
             if e_left.kind == ExpKind::VJMP && e_left.info != NO_JUMP as i64 {
                 let saved_jmp = e_left.info as i32;
-                if is_and {
-                    fs.negate_condition(saved_jmp);
-                    fs.concat_jump(&mut e_left.f, saved_jmp);
+                fs.negate_condition(saved_jmp);
+                fs.concat_jump(&mut e_left.f, saved_jmp);
+                let here = fs.pc;
+                fs.patch_true_jumps(e_left.t, here);
+                e_left.t = NO_JUMP;
+            } else {
+                let skip_test =
+                    matches!(e_left.kind, ExpKind::Boolean if e_left.info != 0)
+                    || matches!(e_left.kind, ExpKind::Int | ExpKind::Float | ExpKind::Str);
+
+                if skip_test {
                     let here = fs.pc;
                     fs.patch_true_jumps(e_left.t, here);
                     e_left.t = NO_JUMP;
                 } else {
-                    fs.concat_jump(&mut e_left.t, saved_jmp);
-                    let here = fs.pc;
-                    fs.patch_false_jumps(e_left.f, here);
-                    e_left.f = NO_JUMP;
-                }
-            } else {
-                let skip_test = if is_and {
-                    matches!(e_left.kind, ExpKind::Boolean if e_left.info != 0)
-                        || matches!(e_left.kind, ExpKind::Int | ExpKind::Float | ExpKind::Str)
-                } else {
-                    matches!(e_left.kind, ExpKind::Nil | ExpKind::Boolean if e_left.info == 0)
-                };
-
-                if skip_test {
-                    if is_and {
-                        let here = fs.pc;
-                        fs.patch_true_jumps(e_left.t, here);
-                        e_left.t = NO_JUMP;
-                    } else {
-                        let here = fs.pc;
-                        fs.patch_false_jumps(e_left.f, here);
-                        e_left.f = NO_JUMP;
-                    }
-                } else {
                     let reg = fs.expr_to_reg(&e_left);
-                    let k = if is_and { 0 } else { 1 };
-                    fs.code_abc_k(OpCode::TESTSET, reg, reg, 0, k != 0);
+                    fs.code_abc_k(OpCode::TESTSET, reg, reg, 0, false);
                     let jmp_pc = fs.jump();
-                    if is_and {
-                        fs.concat_jump(&mut e_left.f, jmp_pc);
-                        let here = fs.pc;
-                        fs.patch_true_jumps(e_left.t, here);
-                        e_left.t = NO_JUMP;
-                    } else {
-                        fs.concat_jump(&mut e_left.t, jmp_pc);
-                        let here = fs.pc;
-                        fs.patch_false_jumps(e_left.f, here);
-                        e_left.f = NO_JUMP;
-                    }
+                    fs.concat_jump(&mut e_left.f, jmp_pc);
+                    let here = fs.pc;
+                    fs.patch_true_jumps(e_left.t, here);
+                    e_left.t = NO_JUMP;
                     fs.free_reg();
                 }
             }
             
-            let e2 = parse_subexpr(fs, if is_and { PREC_AND + 1 } else { PREC_OR + 1 });
+            let e2 = parse_subexpr(fs, PREC_AND + 1);
             let mut e2_exp = e2.exp.clone();
+            fs.concat_jump(&mut e2_exp.f, e_left.f);
             
-            if is_and {
-                fs.concat_jump(&mut e2_exp.f, e_left.f);
-                e2_exp.t = e_left.t;
+            e = ExprItem { exp: e2_exp };
+            matched = true;
+        }
+        
+        if limit <= PREC_OR && check(fs, &Token::Or) {
+            let mut e_left = e.exp.clone();
+            fs.ls_mut().next();
+            
+            if e_left.kind == ExpKind::VJMP && e_left.info != NO_JUMP as i64 {
+                let saved_jmp = e_left.info as i32;
+                fs.concat_jump(&mut e_left.t, saved_jmp);
+                let here = fs.pc;
+                fs.patch_false_jumps(e_left.f, here);
+                e_left.f = NO_JUMP;
             } else {
-                fs.concat_jump(&mut e2_exp.t, e_left.t);
-                e2_exp.f = e_left.f;
+                let skip_test =
+                    matches!(e_left.kind, ExpKind::Nil | ExpKind::Boolean if e_left.info == 0);
+
+                if skip_test {
+                    let here = fs.pc;
+                    fs.patch_false_jumps(e_left.f, here);
+                    e_left.f = NO_JUMP;
+                } else {
+                    let reg = fs.expr_to_reg(&e_left);
+                    fs.code_abc_k(OpCode::TESTSET, reg, reg, 0, true);
+                    let jmp_pc = fs.jump();
+                    fs.concat_jump(&mut e_left.t, jmp_pc);
+                    let here = fs.pc;
+                    fs.patch_false_jumps(e_left.f, here);
+                    e_left.f = NO_JUMP;
+                    fs.free_reg();
+                }
             }
+            
+            let e2 = parse_subexpr(fs, PREC_AND);
+            let mut e2_exp = e2.exp.clone();
+            fs.concat_jump(&mut e2_exp.t, e_left.t);
             
             e = ExprItem { exp: e2_exp };
             matched = true;
