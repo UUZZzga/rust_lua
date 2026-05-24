@@ -615,7 +615,6 @@ impl FuncState {
                 let r = self.alloc_reg();
                 let jmp_pc = e.info as i32;
                 
-                // Move VJMP's own JMP into true-list, then handle t/f lists
                 let mut my_true_list = e.t;
                 let my_false_list = e.f;
                 
@@ -631,30 +630,87 @@ impl FuncState {
                     let p_f = self.code_abc(OpCode::LFALSESKIP, r, 0, 0);
                     let load_true_pc = self.code_abc(OpCode::LOADTRUE, r, 0, 0);
                     let final_pc = self.pc;
-                    self.patch_true_jumps(my_true_list, load_true_pc);
-                    self.patch_false_jumps(my_false_list, p_f);
+                    self.patch_list_aux(my_true_list, final_pc, r, load_true_pc);
+                    self.patch_list_aux(my_false_list, final_pc, r, p_f);
                 }
                 r
             }
         }
     }
 
-    /// 修复真分支跳转链表: 遍历链表将所有 JMP 指向 target
+    fn exp_to_reg(&mut self, e: &ExpDesc) -> i32 {
+        let r = self.expr_to_reg(e);
+        if e.kind != ExpKind::VJMP && (e.t != NO_JUMP || e.f != NO_JUMP) {
+            let fj = self.jump();
+            let p_f = self.code_abc(OpCode::LFALSESKIP, r, 0, 0);
+            let p_t = self.code_abc(OpCode::LOADTRUE, r, 0, 0);
+            let final_pc = self.pc;
+            self.fix_jump(fj, final_pc, false);
+            self.patch_list_aux(e.f, final_pc, r, p_f);
+            self.patch_list_aux(e.t, final_pc, r, p_t);
+        }
+        r
+    }
+
     fn patch_true_jumps(&mut self, list: i32, target: i32) {
         let mut cur = list;
         while cur != NO_JUMP {
             let next = self.get_jump(cur);
+            self.patch_test_reg(cur, NO_REG as i32);
             self.fix_jump(cur, target, false);
             cur = next;
         }
     }
 
-    /// 修复假分支跳转链表: 遍历链表将所有 JMP 指向 target
     fn patch_false_jumps(&mut self, list: i32, target: i32) {
         let mut cur = list;
         while cur != NO_JUMP {
             let next = self.get_jump(cur);
+            self.patch_test_reg(cur, NO_REG as i32);
             self.fix_jump(cur, target, false);
+            cur = next;
+        }
+    }
+
+    fn remove_values(&mut self, list: i32) {
+        let mut cur = list;
+        while cur != NO_JUMP {
+            let next = self.get_jump(cur);
+            self.patch_test_reg(cur, NO_REG as i32);
+            cur = next;
+        }
+    }
+
+    fn patch_test_reg(&mut self, node: i32, reg: i32) -> bool {
+        if node < 1 || node as usize >= self.proto.code.len() {
+            return false;
+        }
+        let i = self.proto.code[(node - 1) as usize];
+        if get_opcode(i) != OpCode::TESTSET {
+            return false;
+        }
+        let b = getarg_b(i);
+        if reg != NO_REG as i32 && reg != b {
+            setarg(&mut self.proto.code[(node - 1) as usize], reg, POS_A, SIZE_A);
+        } else {
+            let k = testarg_k(i);
+            self.proto.code[(node - 1) as usize] =
+                ((OpCode::TEST as u32) << POS_OP)
+                | ((b as u32) << POS_A)
+                | (if k { 1u32 << POS_K } else { 0 });
+        }
+        true
+    }
+
+    fn patch_list_aux(&mut self, list: i32, vtarget: i32, reg: i32, dtarget: i32) {
+        let mut cur = list;
+        while cur != NO_JUMP {
+            let next = self.get_jump(cur);
+            if self.patch_test_reg(cur, reg) {
+                self.fix_jump(cur, vtarget, false);
+            } else {
+                self.fix_jump(cur, dtarget, false);
+            }
             cur = next;
         }
     }
@@ -1191,7 +1247,7 @@ fn parse_args(fs: &mut FuncState) -> i32 {
         return 0;
     }
     let ei = parse_expr(fs);
-    let r = fs.expr_to_reg(&ei.exp);
+    let r = fs.exp_to_reg(&ei.exp);
     let mut n = 1;
     while check(fs, &Token::Comma) {
         fs.ls_mut().next();
@@ -1323,7 +1379,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             let is_and = check(fs, &Token::And);
             fs.ls_mut().next();
             
-            if e_left.kind == ExpKind::VJMP {
+            if e_left.kind == ExpKind::VJMP && e_left.info != NO_JUMP as i64 {
                 let saved_jmp = e_left.info as i32;
                 if is_and {
                     fs.negate_condition(saved_jmp);
@@ -1360,13 +1416,18 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     let k = if is_and { 0 } else { 1 };
                     fs.code_abc_k(OpCode::TESTSET, reg, reg, 0, k != 0);
                     let jmp_pc = fs.jump();
-                    let mut vexp = ExpDesc::new(ExpKind::VJMP, NO_JUMP as i64);
                     if is_and {
-                        fs.concat_jump(&mut vexp.f, jmp_pc);
+                        fs.concat_jump(&mut e_left.f, jmp_pc);
+                        let here = fs.pc;
+                        fs.patch_true_jumps(e_left.t, here);
+                        e_left.t = NO_JUMP;
                     } else {
-                        fs.concat_jump(&mut vexp.t, jmp_pc);
+                        fs.concat_jump(&mut e_left.t, jmp_pc);
+                        let here = fs.pc;
+                        fs.patch_false_jumps(e_left.f, here);
+                        e_left.f = NO_JUMP;
                     }
-                    e_left = vexp;
+                    fs.free_reg();
                 }
             }
             
@@ -1379,13 +1440,6 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             } else {
                 fs.concat_jump(&mut e2_exp.t, e_left.t);
                 e2_exp.f = e_left.f;
-            }
-            
-            if e2_exp.kind != ExpKind::VJMP && (e2_exp.t != NO_JUMP || e2_exp.f != NO_JUMP) {
-                let mut vexp = ExpDesc::new(ExpKind::VJMP, NO_JUMP as i64);
-                vexp.f = e2_exp.f;
-                vexp.t = e2_exp.t;
-                e2_exp = vexp;
             }
             
             e = ExprItem { exp: e2_exp };
@@ -2224,16 +2278,28 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 Token::Not => {
                     match ei.exp.kind {
                         ExpKind::Nil | ExpKind::Boolean if ei.exp.info == 0 => {
-                            ExpDesc::new(ExpKind::Boolean, 1)
+                            let mut e = ExpDesc::new(ExpKind::Boolean, 1);
+                            e.t = ei.exp.f;
+                            e.f = ei.exp.t;
+                            fs.remove_values(e.t);
+                            fs.remove_values(e.f);
+                            e
                         }
                         ExpKind::Int | ExpKind::Float | ExpKind::Str
                             | ExpKind::Boolean => {
-                            ExpDesc::new(ExpKind::Boolean, 0)
+                            let mut e = ExpDesc::new(ExpKind::Boolean, 0);
+                            e.t = ei.exp.f;
+                            e.f = ei.exp.t;
+                            fs.remove_values(e.t);
+                            fs.remove_values(e.f);
+                            e
                         }
                         ExpKind::VJMP => {
                             let mut e = ei.exp.clone();
                             fs.negate_condition(e.info as i32);
                             std::mem::swap(&mut e.t, &mut e.f);
+                            fs.remove_values(e.t);
+                            fs.remove_values(e.f);
                             e
                         }
                         _ => {
@@ -2729,7 +2795,7 @@ fn parse_return(fs: &mut FuncState) {
     }
     
     let ei = parse_expr(fs);
-    let r = fs.expr_to_reg(&ei.exp);
+    let r = fs.exp_to_reg(&ei.exp);
     
     if check(fs, &Token::Comma) {
         fs.ls_mut().next();
