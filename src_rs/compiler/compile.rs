@@ -1325,24 +1325,49 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             
             if e_left.kind == ExpKind::VJMP {
                 let saved_jmp = e_left.info as i32;
-                fs.negate_condition(saved_jmp);
                 if is_and {
+                    fs.negate_condition(saved_jmp);
                     fs.concat_jump(&mut e_left.f, saved_jmp);
+                    let here = fs.pc;
+                    fs.patch_true_jumps(e_left.t, here);
+                    e_left.t = NO_JUMP;
                 } else {
                     fs.concat_jump(&mut e_left.t, saved_jmp);
+                    let here = fs.pc;
+                    fs.patch_false_jumps(e_left.f, here);
+                    e_left.f = NO_JUMP;
                 }
             } else {
-                let reg = fs.expr_to_reg(&e_left);
-                let k = if is_and { 0 } else { 1 };
-                fs.code_abc_k(OpCode::TESTSET, reg, reg, 0, k != 0);
-                let jmp_pc = fs.jump();
-                let mut vexp = ExpDesc::new(ExpKind::VJMP, NO_JUMP as i64);
-                if is_and {
-                    fs.concat_jump(&mut vexp.f, jmp_pc);
+                let skip_test = if is_and {
+                    matches!(e_left.kind, ExpKind::Boolean if e_left.info != 0)
+                        || matches!(e_left.kind, ExpKind::Int | ExpKind::Float | ExpKind::Str)
                 } else {
-                    fs.concat_jump(&mut vexp.t, jmp_pc);
+                    matches!(e_left.kind, ExpKind::Nil | ExpKind::Boolean if e_left.info == 0)
+                };
+
+                if skip_test {
+                    if is_and {
+                        let here = fs.pc;
+                        fs.patch_true_jumps(e_left.t, here);
+                        e_left.t = NO_JUMP;
+                    } else {
+                        let here = fs.pc;
+                        fs.patch_false_jumps(e_left.f, here);
+                        e_left.f = NO_JUMP;
+                    }
+                } else {
+                    let reg = fs.expr_to_reg(&e_left);
+                    let k = if is_and { 0 } else { 1 };
+                    fs.code_abc_k(OpCode::TESTSET, reg, reg, 0, k != 0);
+                    let jmp_pc = fs.jump();
+                    let mut vexp = ExpDesc::new(ExpKind::VJMP, NO_JUMP as i64);
+                    if is_and {
+                        fs.concat_jump(&mut vexp.f, jmp_pc);
+                    } else {
+                        fs.concat_jump(&mut vexp.t, jmp_pc);
+                    }
+                    e_left = vexp;
                 }
-                e_left = vexp;
             }
             
             let e2 = parse_subexpr(fs, if is_and { PREC_AND + 1 } else { PREC_OR + 1 });
@@ -1356,8 +1381,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 e2_exp.f = e_left.f;
             }
             
-            if e2_exp.kind != ExpKind::VJMP {
-                let reg = fs.expr_to_reg(&e2_exp);
+            if e2_exp.kind != ExpKind::VJMP && (e2_exp.t != NO_JUMP || e2_exp.f != NO_JUMP) {
                 let mut vexp = ExpDesc::new(ExpKind::VJMP, NO_JUMP as i64);
                 vexp.f = e2_exp.f;
                 vexp.t = e2_exp.t;
@@ -2031,6 +2055,12 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                         ExpKind::Int | ExpKind::Float | ExpKind::Str
                             | ExpKind::Boolean => {
                             ExpDesc::new(ExpKind::Boolean, 0)
+                        }
+                        ExpKind::VJMP => {
+                            let mut e = ei.exp.clone();
+                            fs.negate_condition(e.info as i32);
+                            std::mem::swap(&mut e.t, &mut e.f);
+                            e
                         }
                         _ => {
                             let r = fs.expr_to_reg(&ei.exp);

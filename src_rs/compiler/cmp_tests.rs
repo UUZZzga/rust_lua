@@ -322,6 +322,11 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_return_expr_complex4() {
+        assert_inst_match("return not nil and 2 and not(2>3 or 3<2)", None);
+    }
+
+    #[test]
     fn test_return_expr_len() {
         assert_inst_match("return #a", None);
     }
