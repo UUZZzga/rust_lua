@@ -258,6 +258,7 @@ pub struct FuncState {
     pub max_freereg: i32,
     pub locals: Vec<LocalVar>,
     pub errors: Vec<String>,
+    pub needclose: bool,
     ls: *mut LexState,
 }
 
@@ -293,6 +294,7 @@ impl FuncState {
             max_freereg: 0,
             locals: Vec::new(),
             errors: Vec::new(),
+            needclose: false,
             ls: ls as *mut LexState,
         }
     }
@@ -671,20 +673,23 @@ impl FuncState {
         let c = if is_vararg { self.proto.num_params as i32 + 1 } else { 0 };
         match nret {
             0 => {
-                if is_vararg {
-                    self.code_abc(OpCode::RETURN, first, 1, c);
+                if is_vararg || self.needclose {
+                    let k = self.needclose;
+                    self.code_abc_k(OpCode::RETURN, first, 1, c, k);
                 } else {
                     self.code_abc(OpCode::RETURN0, first, 1, 0);
                 }
             }
             1 => {
                 if is_vararg {
-                    self.code_abc(OpCode::RETURN, first, 2, c);
+                    self.code_abc(OpCode::RETURN, first, 2, self.proto.num_params as i32 + 1);
                 } else {
                     self.code_abc(OpCode::RETURN1, first, 2, 0);
                 }
             }
-            _ => { self.code_abc(OpCode::RETURN, first, nret + 1, c); }
+            _ => {
+                self.code_abc(OpCode::RETURN, first, nret + 1, c);
+            }
         }
     }
 
@@ -2125,16 +2130,12 @@ fn parse_for(fs: &mut FuncState) {
             }
         }
         
+        fs.code_abc(OpCode::LOADNIL, base + 1, base + 2, 0);
         fs.freereg = base + 3 + ncontrol;
+        fs.needclose = true;
         if fs.freereg > fs.max_freereg {
             fs.max_freereg = fs.freereg;
         }
-        fs.code_abc(OpCode::TBC, base + 2, 0, 0);
-        
-        fs.alloc_reg();
-        fs.alloc_reg();
-        fs.free_reg();
-        fs.free_reg();
         
         expect(fs, &Token::Do);
         
@@ -2150,6 +2151,7 @@ fn parse_for(fs: &mut FuncState) {
         
         expect(fs, &Token::End);
         
+        fs.code_abc(OpCode::CLOSE, base, 0, 0);
         fs.freereg = saved_freereg;
         fs.locals.truncate(saved_nlocals);
     }

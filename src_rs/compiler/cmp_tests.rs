@@ -330,6 +330,11 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_for_in() {
+        assert_inst_match("for k,v,w in a do end", None);
+    }
+
+    #[test]
     fn test_return_expr() {
         assert_inst_match("return 1 + 2", None);
     }
