@@ -628,11 +628,11 @@ impl FuncState {
                 }
                 
                 if my_true_list != NO_JUMP || my_false_list != NO_JUMP {
-                    self.code_abc(OpCode::LFALSESKIP, r, 0, 0);
+                    let p_f = self.code_abc(OpCode::LFALSESKIP, r, 0, 0);
                     let load_true_pc = self.code_abc(OpCode::LOADTRUE, r, 0, 0);
                     let final_pc = self.pc;
                     self.patch_true_jumps(my_true_list, load_true_pc);
-                    self.patch_false_jumps(my_false_list, final_pc);
+                    self.patch_false_jumps(my_false_list, p_f);
                 }
                 r
             }
@@ -2022,15 +2022,68 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
             let op_tok = fs.ls().token.clone();
             fs.ls_mut().next();
             let ei = parse_subexpr(fs, PREC_UNARY);
-            let r = fs.expr_to_reg(&ei.exp);
             match op_tok {
-                Token::Not => { fs.code_abc(OpCode::NOT, r, r, 0); }
-                Token::Minus => { fs.code_abc(OpCode::UNM, r, r, 0); }
-                Token::Hash => { fs.code_abc(OpCode::LEN, r, r, 0); }
-                Token::Tilde => { fs.code_abc(OpCode::BNOT, r, r, 0); }
-                _ => {}
+                Token::Not => {
+                    match ei.exp.kind {
+                        ExpKind::Nil | ExpKind::Boolean if ei.exp.info == 0 => {
+                            ExpDesc::new(ExpKind::Boolean, 1)
+                        }
+                        ExpKind::Int | ExpKind::Float | ExpKind::Str
+                            | ExpKind::Boolean => {
+                            ExpDesc::new(ExpKind::Boolean, 0)
+                        }
+                        _ => {
+                            let r = fs.expr_to_reg(&ei.exp);
+                            fs.code_abc(OpCode::NOT, r, r, 0);
+                            ExpDesc::new(ExpKind::Relocable, r as i64)
+                        }
+                    }
+                }
+                Token::Minus => {
+                    match ei.exp.kind {
+                        ExpKind::Int => {
+                            ExpDesc::new(ExpKind::Int, -(ei.exp.info))
+                        }
+                        ExpKind::Float => {
+                            let f = f64::from_bits(ei.exp.info as u64);
+                            let result = -f;
+                            if result.is_nan() || result == 0.0 {
+                                let r = fs.expr_to_reg(&ei.exp);
+                                fs.code_abc(OpCode::UNM, r, r, 0);
+                                ExpDesc::new(ExpKind::Relocable, r as i64)
+                            } else {
+                                ExpDesc::new(ExpKind::Float, result.to_bits() as i64)
+                            }
+                        }
+                        _ => {
+                            let r = fs.expr_to_reg(&ei.exp);
+                            fs.code_abc(OpCode::UNM, r, r, 0);
+                            ExpDesc::new(ExpKind::Relocable, r as i64)
+                        }
+                    }
+                }
+                Token::Hash => {
+                    let r = fs.expr_to_reg(&ei.exp);
+                    fs.code_abc(OpCode::LEN, r, r, 0);
+                    ExpDesc::new(ExpKind::Relocable, r as i64)
+                }
+                Token::Tilde => {
+                    match ei.exp.kind {
+                        ExpKind::Int => {
+                            ExpDesc::new(ExpKind::Int, !(ei.exp.info))
+                        }
+                        _ => {
+                            let r = fs.expr_to_reg(&ei.exp);
+                            fs.code_abc(OpCode::BNOT, r, r, 0);
+                            ExpDesc::new(ExpKind::Relocable, r as i64)
+                        }
+                    }
+                }
+                _ => {
+                    let r = fs.expr_to_reg(&ei.exp);
+                    ExpDesc::new(ExpKind::Relocable, r as i64)
+                }
             }
-            ExpDesc::new(ExpKind::Relocable, r as i64)
         }
         Token::Function => {
             fs.ls_mut().next();
