@@ -1687,7 +1687,8 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     if is_idiv {
                         let denom = e2.exp.info;
                         if denom != 0 {
-                            let val = ec.info.wrapping_div_euclid(denom);
+                            let q = ec.info / denom;
+                            let val = if (ec.info ^ denom) < 0 && ec.info % denom != 0 { q - 1 } else { q };
                             e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
                         } else {
                             let r = fs.expr_to_reg(&ec);
@@ -1699,7 +1700,14 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         let val = ec.info as f64 / e2.exp.info as f64;
                         e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
                     } else {
-                        let val = if is_mul { ec.info * e2.exp.info } else { ec.info % e2.exp.info };
+                        let val = if is_mul {
+                            ec.info * e2.exp.info
+                        } else {
+                            let m = ec.info;
+                            let n = e2.exp.info;
+                            let r = m % n;
+                            if r != 0 && (r ^ n) < 0 { r + n } else { r }
+                        };
                         e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
                     }
                 }

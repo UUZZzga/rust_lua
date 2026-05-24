@@ -327,6 +327,21 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_return_expr_complex5() {
+        assert_inst_match("return -3-1-5 == 0+0-9", None);
+    }
+
+    #[test]
+    fn test_return_expr_complex6() {
+        assert_inst_match("return -2^2 == -4 and (-2)^2 == 4 and 2*2-3-1 == 0", None);
+    }
+
+    #[test]
+    fn test_return_expr_complex7() {
+        assert_inst_match("return -3%5 == 2 and -3+5 == 2", None);
+    }
+
+    #[test]
     fn test_return_expr_len() {
         assert_inst_match("return #a", None);
     }
