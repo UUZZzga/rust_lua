@@ -116,7 +116,7 @@ impl LexState {
                     self.next_char();
                     self.next_char();
                     if self.current == '[' {
-                        let start = self.pos;
+                         let start = self.pos;
                         let equals = self.count_equals();
                         if self.current == '[' {
                             self.read_long_comment(equals);
@@ -320,7 +320,7 @@ impl LexState {
     }
 
     fn read_number(&mut self) {
-        let start = self.pos;
+        let mut start = self.pos;
         let mut is_float = false;
         let mut is_hex = false;
 
@@ -330,6 +330,7 @@ impl LexState {
                 is_hex = true;
                 self.next_char();
                 self.next_char();
+                start = self.pos;
             }
         }
 

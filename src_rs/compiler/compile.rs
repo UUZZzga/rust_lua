@@ -1463,75 +1463,100 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         
         if limit <= PREC_BOR && check(fs, &Token::Pipe) {
             let ec = e.exp.clone();
-            let r = fs.expr_to_reg(&ec);
             fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_BOR + 1);
-            let k_idx = match &e2.exp.kind {
-                ExpKind::Int => {
-                    let k = fs.int_k(e2.exp.info);
-                    if k <= 255 { Some(k) } else { None }
+            match (&ec.kind, &e2.exp.kind) {
+                (ExpKind::Int, ExpKind::Int) => {
+                    let val = ec.info | e2.exp.info;
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
                 }
-                _ => None,
-            };
-            if let Some(k) = k_idx {
-                let dest = fs.alloc_reg();
-                fs.code_abc(OpCode::BORK, dest, r, k);
-                fs.code_abc(OpCode::MMBINK, r, k, 14);
-                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
-            } else {
-                let r2 = fs.expr_to_reg(&e2.exp);
-                fs.code_abc(OpCode::BOR, r, r, r2);
-                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                _ => {
+                    let r = fs.expr_to_reg(&ec);
+                    let k_idx = match &e2.exp.kind {
+                        ExpKind::Int => {
+                            let k = fs.int_k(e2.exp.info);
+                            if k <= 255 { Some(k) } else { None }
+                        }
+                        _ => None,
+                    };
+                    if let Some(k) = k_idx {
+                        let dest = fs.alloc_reg();
+                        fs.code_abc(OpCode::BORK, dest, r, k);
+                        fs.code_abc(OpCode::MMBINK, r, k, 14);
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
+                    } else {
+                        let r2 = fs.expr_to_reg(&e2.exp);
+                        fs.code_abc(OpCode::BOR, r, r, r2);
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                    }
+                }
             }
             matched = true;
         }
         
         if limit <= PREC_BXOR && check(fs, &Token::Tilde) {
             let ec = e.exp.clone();
-            let r = fs.expr_to_reg(&ec);
             fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_BXOR + 1);
-            let k_idx = match &e2.exp.kind {
-                ExpKind::Int => {
-                    let k = fs.int_k(e2.exp.info);
-                    if k <= 255 { Some(k) } else { None }
+            match (&ec.kind, &e2.exp.kind) {
+                (ExpKind::Int, ExpKind::Int) => {
+                    let val = ec.info ^ e2.exp.info;
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
                 }
-                _ => None,
-            };
-            if let Some(k) = k_idx {
-                let dest = fs.alloc_reg();
-                fs.code_abc(OpCode::BXORK, dest, r, k);
-                fs.code_abc(OpCode::MMBINK, r, k, 15);
-                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
-            } else {
-                let r2 = fs.expr_to_reg(&e2.exp);
-                fs.code_abc(OpCode::BXOR, r, r, r2);
-                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                _ => {
+                    let r = fs.expr_to_reg(&ec);
+                    let k_idx = match &e2.exp.kind {
+                        ExpKind::Int => {
+                            let k = fs.int_k(e2.exp.info);
+                            if k <= 255 { Some(k) } else { None }
+                        }
+                        _ => None,
+                    };
+                    if let Some(k) = k_idx {
+                        let dest = fs.alloc_reg();
+                        fs.code_abc(OpCode::BXORK, dest, r, k);
+                        fs.code_abc(OpCode::MMBINK, r, k, 15);
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
+                    } else {
+                        let r2 = fs.expr_to_reg(&e2.exp);
+                        fs.code_abc(OpCode::BXOR, r, r, r2);
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                    }
+                }
             }
             matched = true;
         }
         
         if limit <= PREC_BAND && check(fs, &Token::Ampersand) {
             let ec = e.exp.clone();
-            let r = fs.expr_to_reg(&ec);
             fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_BAND + 1);
-            let k_idx = match &e2.exp.kind {
-                ExpKind::Int => {
-                    let k = fs.int_k(e2.exp.info);
-                    if k <= 255 { Some(k) } else { None }
+            match (&ec.kind, &e2.exp.kind) {
+                (ExpKind::Int, ExpKind::Int) => {
+                    let val = ec.info & e2.exp.info;
+                    eprintln!("DEBUG BAND fold: {} & {} = {}", ec.info, e2.exp.info, val);
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
                 }
-                _ => None,
-            };
-            if let Some(k) = k_idx {
-                let dest = fs.alloc_reg();
-                fs.code_abc(OpCode::BANDK, dest, r, k);
-                fs.code_abc(OpCode::MMBINK, r, k, 13);
-                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
-            } else {
-                let r2 = fs.expr_to_reg(&e2.exp);
-                fs.code_abc(OpCode::BAND, r, r, r2);
-                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                _ => {
+                    let r = fs.expr_to_reg(&ec);
+                    let k_idx = match &e2.exp.kind {
+                        ExpKind::Int => {
+                            let k = fs.int_k(e2.exp.info);
+                            if k <= 255 { Some(k) } else { None }
+                        }
+                        _ => None,
+                    };
+                    if let Some(k) = k_idx {
+                        let dest = fs.alloc_reg();
+                        fs.code_abc(OpCode::BANDK, dest, r, k);
+                        fs.code_abc(OpCode::MMBINK, r, k, 13);
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
+                    } else {
+                        let r2 = fs.expr_to_reg(&e2.exp);
+                        fs.code_abc(OpCode::BAND, r, r, r2);
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                    }
+                }
             }
             matched = true;
         }
