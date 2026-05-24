@@ -1695,19 +1695,28 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             let e2 = parse_subexpr(fs, PREC_POW);
             match (&ec.kind, &e2.exp.kind) {
                 (ExpKind::Int, ExpKind::Int) => {
-                    let base = ec.info;
+                    let base = ec.info as f64;
                     let exp = e2.exp.info;
-                    if exp >= 0 && exp <= 63 {
-                        let mut result: i64 = 1;
-                        for _ in 0..exp { result *= base; }
-                        e = ExprItem { exp: ExpDesc::new(ExpKind::Int, result) };
-                    } else {
-                        let r = fs.expr_to_reg(&ec);
-                        let r2 = fs.expr_to_reg(&e2.exp);
-                        let dest = fs.alloc_reg();
-                        fs.code_abc(OpCode::POW, dest, r, r2);
-                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
-                    }
+                    let result = base.powi(exp as i32);
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Float, result.to_bits() as i64) };
+                }
+                (ExpKind::Float, ExpKind::Int) => {
+                    let base = f64::from_bits(ec.info as u64);
+                    let exp = e2.exp.info;
+                    let result = base.powi(exp as i32);
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Float, result.to_bits() as i64) };
+                }
+                (ExpKind::Int, ExpKind::Float) => {
+                    let base = ec.info as f64;
+                    let exp = f64::from_bits(e2.exp.info as u64);
+                    let result = base.powf(exp);
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Float, result.to_bits() as i64) };
+                }
+                (ExpKind::Float, ExpKind::Float) => {
+                    let base = f64::from_bits(ec.info as u64);
+                    let exp = f64::from_bits(e2.exp.info as u64);
+                    let result = base.powf(exp);
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Float, result.to_bits() as i64) };
                 }
                 _ => {
                     let r = fs.expr_to_reg(&ec);
