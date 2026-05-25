@@ -1494,13 +1494,13 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
 
             if let Some(sc_val) = sc_imm {
                 let (reg, imm) = if is_eq {
-                    let reg = fs.expr_to_reg(&e2.exp);
+                    let reg = fs.exp_to_reg(&e2.exp);
                     (reg, int_to_sc(sc_val))
                 } else if is_gt {
-                    let reg = fs.expr_to_reg(&e2.exp);
+                    let reg = fs.exp_to_reg(&e2.exp);
                     (reg, int_to_sc(sc_val))
                 } else {
-                    let reg = fs.expr_to_reg(&ec);
+                    let reg = fs.exp_to_reg(&ec);
                     (reg, int_to_sc(sc_val))
                 };
                 let imm_op = match op_tok {
@@ -1517,7 +1517,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 let r = if matches!(ec.kind, ExpKind::Relocable | ExpKind::NonReloc) {
                     ec.info as i32
                 } else {
-                    fs.expr_to_reg(&ec)
+                    fs.exp_to_reg(&ec)
                 };
                 let const_k = if is_eq {
                     exp_to_const_k(fs, &e2.exp)
@@ -1534,7 +1534,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     let r2 = if matches!(e2.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) {
                         e2.exp.info as i32
                     } else {
-                        fs.expr_to_reg(&e2.exp)
+                        fs.exp_to_reg(&e2.exp)
                     };
                     let (b, c) = if is_gt { (r2, r) } else { (r, r2) };
                     let (op, k) = match op_tok {

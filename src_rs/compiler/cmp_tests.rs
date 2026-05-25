@@ -387,6 +387,11 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_return_expr_complex17() {
+        assert_inst_match("return (((1 or false) and true) or false) == true", None);
+    }
+
+    #[test]
     fn test_return_expr_len() {
         assert_inst_match("return #a", None);
     }
