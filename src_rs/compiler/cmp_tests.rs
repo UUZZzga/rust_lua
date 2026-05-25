@@ -422,6 +422,16 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_return_table1() {
+        assert_inst_match("return {123456789}", None);
+    }
+
+    #[test]
+    fn test_return_table2() {
+        assert_inst_match("return {'123456789'}", None);
+    }
+
+    #[test]
     fn test_if_true() {
         assert_inst_match("if true then return 1 end", None);
     }

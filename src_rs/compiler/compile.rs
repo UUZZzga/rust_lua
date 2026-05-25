@@ -2978,12 +2978,21 @@ fn parse_expr_list(fs: &mut FuncState) -> i32 {
 fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
     fs.ls_mut().next();
     let table_r = fs.alloc_reg();
-    fs.code_ax(OpCode::NEWTABLE, 0);
-    let mut n_arr: i32 = 0;
-    
+    fs.code_abc_k(OpCode::NEWTABLE, 0, 0, 0, false);
+    fs.code_ax(OpCode::EXTRAARG, 0);
+    let mut na: i32 = 0;
+    let mut tostore: i32 = 0;
+    let mut _nh: i32 = 0;
+
     if !check(fs, &Token::RBrace) {
         loop {
             if check(fs, &Token::LBracket) {
+                if tostore > 0 {
+                    fs.code_abc(OpCode::SETLIST, table_r, tostore, na);
+                    na += tostore;
+                    tostore = 0;
+                    fs.freereg = table_r + 1;
+                }
                 fs.ls_mut().next();
                 let ek = parse_expr(fs);
                 let k_r = fs.expr_to_reg(&ek.exp);
@@ -2994,10 +3003,17 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                 fs.code_abc(OpCode::SETTABLE, table_r, k_r, v_r);
                 fs.free_reg();
                 fs.free_reg();
+                _nh += 1;
             } else if let Token::Name(s) = &fs.ls().token {
                 let name = s.clone();
                 let next_is_eq = fs.ls_mut().lookahead_next().0 == Token::Eq;
                 if next_is_eq {
+                    if tostore > 0 {
+                        fs.code_abc(OpCode::SETLIST, table_r, tostore, na);
+                        na += tostore;
+                        tostore = 0;
+                        fs.freereg = table_r + 1;
+                    }
                     fs.ls_mut().next();
                     fs.ls_mut().next();
                     let ev = parse_expr(fs);
@@ -3005,29 +3021,33 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                     let k = fs.string_k(&name);
                     fs.code_abc(OpCode::SETI, table_r, k, v_r);
                     fs.free_reg();
+                    _nh += 1;
                 } else {
-                    n_arr += 1;
+                    tostore += 1;
                     let ev = parse_expr(fs);
-                    let v_r = fs.expr_to_reg(&ev.exp);
-                    fs.code_abc(OpCode::SETI, table_r, n_arr, v_r);
-                    fs.free_reg();
+                    fs.expr_to_reg(&ev.exp);
                 }
             } else {
-                n_arr += 1;
+                tostore += 1;
                 let ev = parse_expr(fs);
-                let v_r = fs.expr_to_reg(&ev.exp);
-                fs.code_abc(OpCode::SETI, table_r, n_arr, v_r);
-                fs.free_reg();
+                fs.expr_to_reg(&ev.exp);
             }
-            
+
             if !check(fs, &Token::Comma) && !check(fs, &Token::Semi) { break; }
             fs.ls_mut().next();
             if check(fs, &Token::RBrace) { break; }
         }
     }
+
+    if tostore > 0 {
+        fs.code_abc(OpCode::SETLIST, table_r, tostore, na);
+        na += tostore;
+        fs.freereg = table_r + 1;
+    }
+
     expect(fs, &Token::RBrace);
-    
-    (table_r, n_arr)
+
+    (table_r, na)
 }
 
 /// ANTLR4: `funcbody: '(' parlist? ')' block 'end' ;` — 解析函数体 (非 method)
