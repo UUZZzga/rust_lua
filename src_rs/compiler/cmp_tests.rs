@@ -417,6 +417,11 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_return_expr_complex23() {
+        assert_inst_match("local x = ((b or a)+1 == 2 and (10 or a)+1 == 11); return x", None);
+    }
+
+    #[test]
     fn test_return_expr_len() {
         assert_inst_match("return #a", None);
     }

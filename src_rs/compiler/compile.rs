@@ -1509,7 +1509,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     let here = fs.pc;
                     fs.patch_true_jumps(e_left.t, here);
                     e_left.t = NO_JUMP;
-                    if reg_alloc { fs.free_reg(); }
+                    if reg_alloc || matches!(e_left.kind, ExpKind::Relocable) { fs.free_reg(); }
                 }
             }
             
@@ -1552,7 +1552,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     let here = fs.pc;
                     fs.patch_false_jumps(e_left.f, here);
                     e_left.f = NO_JUMP;
-                    if reg_alloc { fs.free_reg(); }
+                    if reg_alloc || matches!(e_left.kind, ExpKind::Relocable) { fs.free_reg(); }
                 }
             }
             
