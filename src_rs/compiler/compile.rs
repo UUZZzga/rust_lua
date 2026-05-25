@@ -229,7 +229,11 @@ pub struct ExpDesc {
 
 impl ExpDesc {
     pub fn new(kind: ExpKind, info: i64) -> Self {
-        ExpDesc { kind, info, info2: 0, t: NO_JUMP, f: NO_JUMP }
+        ExpDesc { kind, info, info2: -1, t: NO_JUMP, f: NO_JUMP }
+    }
+
+    pub fn new_reloc_with_pc(info: i64, pc: i32) -> Self {
+        ExpDesc { kind: ExpKind::Relocable, info, info2: pc, t: NO_JUMP, f: NO_JUMP }
     }
 
     fn has_jumps(&self) -> bool {
@@ -403,6 +407,12 @@ impl FuncState {
     fn set_c(&mut self, pc: i32, c: i32) {
         let i = &mut self.proto.code[pc as usize];
         setarg(i, c, POS_C, SIZE_C);
+    }
+
+    /// 设置指定指令的 A 参数 (用于延迟寄存器分配)
+    fn set_a(&mut self, pc: i32, a: i32) {
+        let i = &mut self.proto.code[pc as usize];
+        setarg(i, a, POS_A, SIZE_A);
     }
 
     /// 生成 JMP 无条件跳转指令，返回指令 pc 位置
@@ -609,6 +619,10 @@ impl FuncState {
             ExpKind::Relocable | ExpKind::Call | ExpKind::Vararg => {
                 if e.info as i32 == self.freereg - 1 {
                     e.info as i32
+                } else if e.info2 >= 0 {
+                    let r = self.alloc_reg();
+                    self.set_a(e.info2, r);
+                    r
                 } else {
                     let r = self.alloc_reg();
                     self.code_abc(OpCode::MOVE, r, e.info as i32, 0);
@@ -1232,9 +1246,13 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
             fs.code_abx(OpCode::LOADK, dest, e.info as i32);
         }
         _ => {
-            let val_reg = fs.expr_to_reg(e);
-            if dest != val_reg {
-                fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
+            if e.info2 >= 0 {
+                fs.set_a(e.info2, dest);
+            } else {
+                let val_reg = fs.expr_to_reg(e);
+                if dest != val_reg {
+                    fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
+                }
             }
             fs.free_reg();
         }
@@ -1944,13 +1962,14 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             let r = fs.expr_to_reg(&ec);
                             let k = fs.int_k(e2.exp.info);
                             if k <= 255 {
-                                fs.code_abc(OpCode::IDIVK, r, r, k);
+                                let pc = fs.code_abc(OpCode::IDIVK, r, r, k);
                                 fs.code_abc(OpCode::MMBINK, r, k, 12);
+                                e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r as i64, pc) };
                             } else {
                                 let r2 = fs.expr_to_reg(&e2.exp);
-                                fs.code_abc(OpCode::IDIV, r, r, r2);
+                                let pc = fs.code_abc(OpCode::IDIV, r, r, r2);
+                                e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r as i64, pc) };
                             }
-                            e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
                         }
                     } else if is_div {
                         let val = ec.info as f64 / e2.exp.info as f64;
@@ -1969,13 +1988,13 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             let r = fs.expr_to_reg(&ec);
                             let k = fs.int_k(e2.exp.info);
                             if k <= 255 {
-                                fs.code_abc(OpCode::MODK, r, r, k);
+                                let pc = fs.code_abc(OpCode::MODK, r, r, k);
                                 fs.code_abc(OpCode::MMBINK, r, k, 9);
-                                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                                e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r as i64, pc) };
                             } else {
                                 let r2 = fs.expr_to_reg(&e2.exp);
-                                fs.code_abc(OpCode::MOD, r, r, r2);
-                                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                                let pc = fs.code_abc(OpCode::MOD, r, r, r2);
+                                e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r as i64, pc) };
                             }
                         }
                     }

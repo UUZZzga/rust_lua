@@ -457,7 +457,7 @@ mod compiler_compare_tests {
     #[test]
     fn test_if_false_raise_error() {
         assert_inst_match(
-            "if false then a = 3 // 0; a = 0 % 0 end",
+            "local a; if false then a = 3 // 0; a = 0 % 0 end",
             None,
         );
     }
