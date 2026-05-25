@@ -1126,13 +1126,20 @@ fn parse_assign_or_call(fs: &mut FuncState) {
         let mut exps: Vec<ExpDesc> = Vec::new();
         loop {
             let ei = parse_expr(fs);
-            exps.push(ei.exp);
-            if !check(fs, &Token::Comma) { break; }
-            fs.ls_mut().next();
+            let has_comma = check(fs, &Token::Comma);
+            if has_comma {
+                let r = fs.expr_to_reg(&ei.exp);
+                exps.push(ExpDesc::new(ExpKind::NonReloc, r as i64));
+                fs.ls_mut().next();
+            } else {
+                exps.push(ei.exp);
+                break;
+            }
         }
         
-        for (i, v) in vars.iter().enumerate() {
+        for i in (0..vars.len()).rev() {
             if i < exps.len() {
+                let v = &vars[i];
                 let val = &exps[i];
                 if let (Some(table_reg), Some(table_key)) = (v.table_reg, v.table_key) {
                     if let Some(k_val) = exp_to_k(fs, val) {
@@ -1152,11 +1159,15 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         fs.free_reg();
                     }
                 } else if let Some(idx) = v.local_idx {
-                    let val_reg = fs.expr_to_reg(val);
-                    if idx != val_reg {
-                        fs.code_abc(OpCode::MOVE, idx, val_reg, 0);
+                    if i == exps.len() - 1 {
+                        store_expr_to_local(fs, val, idx);
+                    } else {
+                        let val_reg = val.info as i32;
+                        if idx != val_reg {
+                            fs.code_abc(OpCode::MOVE, idx, val_reg, 0);
+                        }
+                        fs.free_reg();
                     }
-                    fs.free_reg();
                 }
             }
         }
@@ -1184,6 +1195,50 @@ fn exp_to_k(fs: &mut FuncState, e: &ExpDesc) -> Option<i32> {
         _ => return None,
     };
     if info <= 255 { Some(info) } else { None }
+}
+
+fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
+    match e.kind {
+        ExpKind::Void | ExpKind::Nil => {
+            fs.code_abc(OpCode::LOADNIL, dest, 0, 0);
+        }
+        ExpKind::Boolean => {
+            if e.info != 0 {
+                fs.code_abc(OpCode::LOADTRUE, dest, 0, 0);
+            } else {
+                fs.code_abc(OpCode::LOADFALSE, dest, 0, 0);
+            }
+        }
+        ExpKind::Int => {
+            let v = e.info;
+            if v <= i16::MAX as i64 && v >= i16::MIN as i64 {
+                fs.code_asbx(OpCode::LOADI, dest, v as i32);
+            } else {
+                let k = fs.int_k(v);
+                fs.code_abx(OpCode::LOADK, dest, k);
+            }
+        }
+        ExpKind::Float => {
+            let f = f64::from_bits(e.info as u64);
+            let fi = f as i64;
+            if (fi as f64) == f && fits_sbx(fi) {
+                fs.code_asbx(OpCode::LOADF, dest, fi as i32);
+            } else {
+                let k = fs.float_k(f);
+                fs.code_abx(OpCode::LOADK, dest, k);
+            }
+        }
+        ExpKind::Str => {
+            fs.code_abx(OpCode::LOADK, dest, e.info as i32);
+        }
+        _ => {
+            let val_reg = fs.expr_to_reg(e);
+            if dest != val_reg {
+                fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
+            }
+            fs.free_reg();
+        }
+    }
 }
 
 /// ANTLR4: functioncall 帮助 — 将函数值加载到寄存器以便调用
