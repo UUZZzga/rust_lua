@@ -455,6 +455,14 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_if_false_raise_error() {
+        assert_inst_match(
+            "if false then a = 3 // 0; a = 0 % 0 end",
+            None,
+        );
+    }
+
+    #[test]
     fn test_for() {
         assert_inst_match("for i = 1, 5 do return 1 end", None);
     }
@@ -477,6 +485,11 @@ mod compiler_compare_tests {
     // #[test]
     // fn test_big_lua() {
     //     assert_inst_match_file("big.lua");
+    // }
+
+    // #[test]
+    // fn test_constructs_lua() {
+    //     assert_inst_match_file("constructs.lua");
     // }
 
     // #[test]

@@ -1942,23 +1942,42 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
                         } else {
                             let r = fs.expr_to_reg(&ec);
-                            let r2 = fs.expr_to_reg(&e2.exp);
-                            fs.code_abc(OpCode::IDIV, r, r, r2);
+                            let k = fs.int_k(e2.exp.info);
+                            if k <= 255 {
+                                fs.code_abc(OpCode::IDIVK, r, r, k);
+                                fs.code_abc(OpCode::MMBINK, r, k, 12);
+                            } else {
+                                let r2 = fs.expr_to_reg(&e2.exp);
+                                fs.code_abc(OpCode::IDIV, r, r, r2);
+                            }
                             e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
                         }
                     } else if is_div {
                         let val = ec.info as f64 / e2.exp.info as f64;
                         e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
-                    } else {
-                        let val = if is_mul {
-                            ec.info * e2.exp.info
-                        } else {
-                            let m = ec.info;
-                            let n = e2.exp.info;
-                            let r = m % n;
-                            if r != 0 && (r ^ n) < 0 { r + n } else { r }
-                        };
+                    } else if is_mul {
+                        let val = ec.info * e2.exp.info;
                         e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
+                    } else {
+                        let m = ec.info;
+                        let n = e2.exp.info;
+                        if n != 0 {
+                            let r = m % n;
+                            let val = if r != 0 && (r ^ n) < 0 { r + n } else { r };
+                            e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
+                        } else {
+                            let r = fs.expr_to_reg(&ec);
+                            let k = fs.int_k(e2.exp.info);
+                            if k <= 255 {
+                                fs.code_abc(OpCode::MODK, r, r, k);
+                                fs.code_abc(OpCode::MMBINK, r, k, 9);
+                                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                            } else {
+                                let r2 = fs.expr_to_reg(&e2.exp);
+                                fs.code_abc(OpCode::MOD, r, r, r2);
+                                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                            }
+                        }
                     }
                 }
                 (ExpKind::Float, ExpKind::Int) if !ec.has_jumps() && !e2.exp.has_jumps() => {
