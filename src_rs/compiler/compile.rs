@@ -976,7 +976,7 @@ fn globalstat(fs: &mut FuncState) {
 fn globalfunc(fs: &mut FuncState, _line: i32) {
     let fname = get_name(fs);
     fs.add_local_kind(&fname, fs.pc, GDKREG);
-    let r = parse_body(fs);
+    let r = parse_body(fs, None);
     let k = fs.string_k(&fname);
     fs.code_abc(OpCode::SETTABUP, 0, k, r);
     checkglobal(fs, &fname, _line);
@@ -2511,7 +2511,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
         }
         Token::Function => {
             fs.ls_mut().next();
-            let r = parse_body(fs);
+            let r = parse_body(fs, None);
             ExpDesc::new(ExpKind::Relocable, r as i64)
         }
         _ => {
@@ -2794,7 +2794,7 @@ fn parse_func_stat(fs: &mut FuncState) {
 
     if chain.len() == 1 {
         let name = &chain[0].1;
-        let r = parse_body_ex(fs, false);
+        let r = parse_body_ex(fs, false, None);
         if let Some(reg) = fs.find_local(name) {
             fs.code_abc(OpCode::MOVE, reg, r, 0);
         } else {
@@ -2826,7 +2826,7 @@ fn parse_func_stat(fs: &mut FuncState) {
     }
 
     let (is_colon, last_name) = &chain[last_idx];
-    let freg = parse_body_ex(fs, *is_colon);
+    let freg = parse_body_ex(fs, *is_colon, None);
     let fk = fs.string_k(last_name);
     fs.code_abc(OpCode::SETTABLE, base_reg, fk, freg);
 }
@@ -2839,8 +2839,7 @@ fn parse_local(fs: &mut FuncState) {
         fs.ls_mut().next();
         let name = get_name(fs);
         let reg = fs.add_local(&name, fs.pc);
-        let r = parse_body(fs);
-        fs.code_abc(OpCode::MOVE, reg, r, 0);
+        parse_body(fs, Some(reg));
     } else {
         let defkind = getvarattribute(fs, VDKREG);
         let mut names: Vec<String> = Vec::new();
@@ -3032,12 +3031,12 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
 }
 
 /// ANTLR4: `funcbody: '(' parlist? ')' block 'end' ;` — 解析函数体 (非 method)
-fn parse_body(fs: &mut FuncState) -> i32 {
-    parse_body_ex(fs, false)
+fn parse_body(fs: &mut FuncState, target: Option<i32>) -> i32 {
+    parse_body_ex(fs, false, target)
 }
 
 /// ANTLR4: `funcbody: '(' parlist? ')' block 'end' ;` — 解析函数体 (可指定 method 添加 self 参数)
-fn parse_body_ex(fs: &mut FuncState, ismethod: bool) -> i32 {
+fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32 {
     expect(fs, &Token::LParen);
     let has_params = !check(fs, &Token::RParen);
     let mut is_vararg = false;
@@ -3081,7 +3080,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool) -> i32 {
     let proto = new_fs.proto;
     let p_idx = fs.proto.protos.len() as i32;
     fs.proto.protos.push(proto);
-    let r = fs.alloc_reg();
+    let r = target.unwrap_or_else(|| fs.alloc_reg());
     fs.code_abx(OpCode::CLOSURE, r, p_idx);
     r
 }
