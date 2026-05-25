@@ -412,6 +412,11 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_return_expr_complex22() {
+        assert_inst_match("return 1234567890 == tonumber('1234567890') and 1234567890+1 == 1234567891", None);
+    }
+
+    #[test]
     fn test_return_expr_len() {
         assert_inst_match("return #a", None);
     }
