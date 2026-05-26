@@ -1454,12 +1454,24 @@ fn parse_args(fs: &mut FuncState) -> i32 {
         return 0;
     }
     let ei = parse_expr(fs);
-    let r = fs.exp_to_reg(&ei.exp);
+    let _r = fs.exp_to_reg(&ei.exp);
+    if matches!(ei.exp.kind, ExpKind::NonReloc) && (ei.exp.info as i32) < fs.nvarstack() {
+        let target = fs.alloc_reg();
+        if ei.exp.info as i32 != target {
+            fs.code_abc(OpCode::MOVE, target, ei.exp.info as i32, 0);
+        }
+    }
     let mut n = 1;
     while check(fs, &Token::Comma) {
         fs.ls_mut().next();
         let ei2 = parse_expr(fs);
-        let _r2 = fs.expr_to_reg(&ei2.exp);
+        let _r2 = fs.exp_to_reg(&ei2.exp);
+        if matches!(ei2.exp.kind, ExpKind::NonReloc) && (ei2.exp.info as i32) < fs.nvarstack() {
+            let target = fs.alloc_reg();
+            if ei2.exp.info as i32 != target {
+                fs.code_abc(OpCode::MOVE, target, ei2.exp.info as i32, 0);
+            }
+        }
         n += 1;
     }
     n

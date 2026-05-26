@@ -507,6 +507,11 @@ mod compiler_compare_tests {
         assert_inst_match("assert(-3+4*5//2^3^2//9+4%10/3 == (-3)+(((4*5)//(2^(3^2)))//9)+((4%10)/3))", None);
     }
 
+    #[test]
+    fn test_assert_var1() {
+        assert_inst_match("local x = ((b or a)+1 == 2 and (10 or a)+1 == 11); assert(x);", None);
+    }
+
     // #[test]
     // fn test_big_lua() {
     //     assert_inst_match_file("big.lua");
