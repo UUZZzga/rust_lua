@@ -1201,7 +1201,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 };
                 first = PrefixResult {
                     var_name: None, local_idx: None, key: None, reg: Some(base_reg),
-                    table_reg: Some(base_reg), table_key: Some(k),
+                    table_reg: Some(base_reg), table_key: Some(k), table_key_is_const: true,
                 };
             }
             Token::LBracket => {
@@ -1215,10 +1215,14 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     }
                     r
                 };
-                let kr = fs.expr_to_reg(&ei.exp);
+                let (kr, key_is_const) = if ei.exp.kind == ExpKind::Str {
+                    (ei.exp.info as i32, true)
+                } else {
+                    (fs.expr_to_reg(&ei.exp), false)
+                };
                 first = PrefixResult {
                     var_name: None, local_idx: None, key: None, reg: Some(base_reg),
-                    table_reg: Some(base_reg), table_key: Some(kr),
+                    table_reg: Some(base_reg), table_key: Some(kr), table_key_is_const: key_is_const,
                 };
             }
             _ => break,
@@ -1262,6 +1266,9 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     } else {
                         let val_reg = fs.expr_to_reg(val);
                         fs.code_abc(OpCode::SETFIELD, table_reg, table_key, val_reg);
+                        fs.free_reg();
+                    }
+                    if !v.table_key_is_const {
                         fs.free_reg();
                     }
                 } else if let Some(ref name) = v.var_name {
@@ -1507,6 +1514,7 @@ struct PrefixResult {
     reg: Option<i32>,
     table_reg: Option<i32>,
     table_key: Option<i32>,
+    table_key_is_const: bool,
 }
 
 /// ANTLR4: `prefixexp: varOrExp | functioncall | '(' expr ')' ;` 以及 `var: NAME | prefixexp '[' expr ']' | prefixexp '.' NAME ;`
@@ -1517,10 +1525,10 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
             fs.ls_mut().next();
 
             let mut result = if let Some(reg) = fs.find_local(&name) {
-                PrefixResult { var_name: None, local_idx: Some(reg), key: None, reg: Some(reg), table_reg: None, table_key: None }
+                PrefixResult { var_name: None, local_idx: Some(reg), key: None, reg: Some(reg), table_reg: None, table_key: None, table_key_is_const: false }
             } else {
                 let k = fs.string_k(&name);
-                PrefixResult { var_name: Some(name), local_idx: None, key: Some(k), reg: None, table_reg: None, table_key: None }
+                PrefixResult { var_name: Some(name), local_idx: None, key: Some(k), reg: None, table_reg: None, table_key: None, table_key_is_const: false }
             };
 
             loop {
@@ -1539,7 +1547,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         };
                         result = PrefixResult {
                             var_name: None, local_idx: None, key: None, reg: Some(base_reg),
-                            table_reg: Some(base_reg), table_key: Some(k),
+                            table_reg: Some(base_reg), table_key: Some(k), table_key_is_const: true,
                         };
                     }
                     Token::LBracket => {
@@ -1554,10 +1562,14 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                             fs.code_abc(OpCode::GETTABUP, r, 0, gk);
                             r
                         };
-                        let kr = fs.expr_to_reg(&ei.exp);
+                        let (kr, key_is_const) = if ei.exp.kind == ExpKind::Str {
+                            (ei.exp.info as i32, true)
+                        } else {
+                            (fs.expr_to_reg(&ei.exp), false)
+                        };
                         result = PrefixResult {
                             var_name: None, local_idx: None, key: None, reg: Some(base_reg),
-                            table_reg: Some(base_reg), table_key: Some(kr),
+                            table_reg: Some(base_reg), table_key: Some(kr), table_key_is_const: key_is_const,
                         };
                     }
                     _ => break,
@@ -1571,12 +1583,12 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
             let e = parse_expr(fs);
             expect(fs, &Token::RParen);
             let r = fs.expr_to_reg(&e.exp);
-            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None }
+            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false }
         }
         _ => {
             let e = parse_simple_exp(fs);
             let r = fs.expr_to_reg(&e.exp);
-            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None }
+            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false }
         }
     }
 }
