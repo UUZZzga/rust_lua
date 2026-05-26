@@ -512,4 +512,120 @@ mod compiler_compare_tests {
         path.push(name);
         std::fs::read_to_string(path.as_path()).unwrap()
     }
+
+    fn assert_compile_ok(source: &str, name: Option<&str>) {
+        let result = crate::compiler::compile(source, name.unwrap_or("=test_assert"));
+        assert!(result.is_ok(), "Compile failed: {:?}", result.err());
+    }
+
+    #[test]
+    fn test_reg_no_leak_basic_expr() {
+        assert_compile_ok("return 1 + 2", None);
+    }
+
+    #[test]
+    fn test_reg_no_leak_complex_expr() {
+        assert_compile_ok("return (1 + 2) * (3 + 4) / (5 - 6)", None);
+    }
+
+    #[test]
+    fn test_reg_no_leak_if_else() {
+        assert_compile_ok("if true then return 1 else return 2 end", None);
+        assert_compile_ok("if false then return 1 else return 2 end", None);
+    }
+
+    #[test]
+    fn test_reg_no_leak_if_elseif() {
+        assert_compile_ok(
+            "if true then return 1 elseif true then return 2 else return 3 end",
+            None,
+        );
+        assert_compile_ok(
+            "if false then a=1 elseif true then a=2 else a=3 end",
+            None,
+        );
+    }
+
+    #[test]
+    fn test_reg_no_leak_nested_if() {
+        assert_compile_ok(
+            "if true then if true then return 1 else return 2 end else return 3 end",
+            None,
+        );
+        assert_compile_ok(
+            "if true then if false then a=1 elseif true then a=2 else a=3 end else a=4 end",
+            None,
+        );
+    }
+
+    #[test]
+    fn test_reg_no_leak_function_call() {
+        assert_compile_ok("local function f(x, y) return x + y end; local a = f(1, 2)", None);
+    }
+
+    #[test]
+    fn test_reg_no_leak_method_call() {
+        assert_compile_ok("local t = {}; local function m(t, x) return x end; local a = m(t, 1)", None);
+    }
+
+    #[test]
+    fn test_reg_no_leak_string_concat() {
+        assert_compile_ok("return 'hello' .. ' ' .. 'world'", None);
+        assert_compile_ok("local a = 'x'; local b = 'y'; local c = a .. b", None);
+    }
+
+    #[test]
+    fn test_reg_no_leak_table_constructor() {
+        assert_compile_ok("return {1, 2, 3, 4, 5}", None);
+        assert_compile_ok("return {a=1, b=2, c=3}", None);
+        assert_compile_ok("return {[1]=1, [2]=2, [3]=3, 4, 5, 6}", None);
+    }
+
+    #[test]
+    fn test_reg_no_leak_for_numeric() {
+        assert_compile_ok("for i=1,10 do local x = i end", None);
+        assert_compile_ok("for i=1,10,2 do if i==5 then break end end", None);
+    }
+
+    #[test]
+    fn test_reg_no_leak_for_generic() {
+        assert_compile_ok("for i=1,3 do local x = i end", None);
+    }
+
+
+
+    #[test]
+    fn test_reg_no_leak_local_decls() {
+        assert_compile_ok("local a, b, c = 1, 2, 3", None);
+        assert_compile_ok("local a <const> = 42", None);
+        assert_compile_ok("local a = 1; local b = a + 2; local c = b * 3", None);
+    }
+
+    #[test]
+    fn test_reg_no_leak_function_def() {
+        assert_compile_ok("local function f(a, b, c) return a + b + c end", None);
+        assert_compile_ok("local f = function(...) return ... end", None);
+    }
+
+    #[test]
+    fn test_reg_no_leak_global_assign() {
+        assert_compile_ok("local a = 1; local b = 2; local c = a + b", None);
+    }
+
+    #[test]
+    fn test_reg_no_leak_unary_ops() {
+        assert_compile_ok("return -1; return not true; return #'abc'; return ~0", None);
+    }
+
+    #[test]
+    fn test_reg_no_leak_bitwise_ops() {
+        assert_compile_ok("return 1 & 2 | 3 ~ 4", None);
+        assert_compile_ok("local a = 1 << 2; local b = a >> 1", None);
+    }
+
+    #[test]
+    fn test_reg_no_leak_multiple_return() {
+        assert_compile_ok("return 1, 2, 3", None);
+        assert_compile_ok("local function f() return 1, 2 end; local a, b = f()", None);
+    }
 }

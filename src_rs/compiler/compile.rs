@@ -258,6 +258,14 @@ struct LocalVar {
 // FuncState
 // ============================================================================
 
+#[cfg(debug_assertions)]
+struct RegAllocEntry {
+    file: &'static str,
+    line: u32,
+    column: u32,
+    idx: i32,
+}
+
 pub struct FuncState {
     pub proto: Proto,
     pub prev: Option<Box<FuncState>>,
@@ -268,6 +276,10 @@ pub struct FuncState {
     pub errors: Vec<String>,
     pub needclose: bool,
     ls: *mut LexState,
+    #[cfg(debug_assertions)]
+    reg_alloc_stack: Vec<RegAllocEntry>,
+    #[cfg(debug_assertions)]
+    reg_alloc_counter: i32,
 }
 
 /// ANTLR4: `chunk: block ;` — 编译器入口，初始化 FuncState，解析整个脚本块并生成原型
@@ -304,6 +316,10 @@ impl FuncState {
             errors: Vec::new(),
             needclose: false,
             ls: ls as *mut LexState,
+            #[cfg(debug_assertions)]
+            reg_alloc_stack: Vec::new(),
+            #[cfg(debug_assertions)]
+            reg_alloc_counter: 0,
         }
     }
 
@@ -494,11 +510,23 @@ impl FuncState {
     }
 
     /// 分配新寄存器: freereg++ 并追踪 max_freereg
+    #[cfg_attr(debug_assertions, track_caller)]
     fn alloc_reg(&mut self) -> i32 {
         let r = self.freereg;
         self.freereg += 1;
         if self.freereg > self.max_freereg {
             self.max_freereg = self.freereg;
+        }
+        #[cfg(debug_assertions)]
+        {
+            let caller = std::panic::Location::caller();
+            self.reg_alloc_counter += 1;
+            self.reg_alloc_stack.push(RegAllocEntry {
+                file: caller.file(),
+                line: caller.line(),
+                column: caller.column(),
+                idx: self.reg_alloc_counter,
+            });
         }
         r
     }
@@ -508,6 +536,61 @@ impl FuncState {
         if self.freereg > 0 {
             self.freereg -= 1;
         }
+        #[cfg(debug_assertions)]
+        {
+            self.reg_alloc_stack.pop();
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn reg_alloc_entry_desc(entry: &RegAllocEntry) -> String {
+        format!(
+            "  #{}: register allocated at {}:{}:{}",
+            entry.idx, entry.file, entry.line, entry.column
+        )
+    }
+
+    #[cfg(debug_assertions)]
+    fn assert_regs_at(&self, expected_nregs: i32, context: &str) {
+        let leaked = self.freereg - expected_nregs;
+        if leaked != 0 {
+            let mut details = String::new();
+            let start = self
+                .reg_alloc_stack
+                .len()
+                .saturating_sub(leaked.abs() as usize);
+            for entry in &self.reg_alloc_stack[start..] {
+                details.push_str(&Self::reg_alloc_entry_desc(entry));
+                details.push('\n');
+            }
+            panic!(
+                "REGISTER LEAK DETECTED [{}]: expected {} registers, found {} (leaked {}):\n{}",
+                context, expected_nregs, self.freereg, leaked, details
+            );
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn assert_regs_clean(&self, context: &str) {
+        let expected = self.nvarstack();
+        self.assert_regs_at(expected, context);
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn assert_regs_at(&self, _expected_nregs: i32, _context: &str) {}
+
+    #[cfg(not(debug_assertions))]
+    fn assert_regs_clean(&self, _context: &str) {}
+
+    fn set_freereg(&mut self, new_val: i32) {
+        #[cfg(debug_assertions)]
+        {
+            let diff = (self.freereg - new_val).max(0) as usize;
+            for _ in 0..diff.min(self.reg_alloc_stack.len()) {
+                self.reg_alloc_stack.pop();
+            }
+        }
+        self.freereg = new_val;
     }
 
     /// 添加局部变量 (VDKREG)，分配寄存器并返回
@@ -1008,17 +1091,18 @@ fn globalstatfunc(fs: &mut FuncState, line: i32) {
 
 /// ANTLR4: `statement: ';' | 'if' ... | 'while' ... | 'do' ... | 'for' ... | 'repeat' ... | 'function' ... | 'local' ... | 'return' ... | functioncall | varlist '=' explist | expr ;`
 fn parse_statement(fs: &mut FuncState) {
-    match &fs.ls().token {
-        Token::If => parse_if(fs),
-        Token::While => parse_while(fs),
-        Token::Do => parse_do(fs),
-        Token::For => parse_for(fs),
-        Token::Repeat => parse_repeat(fs),
-        Token::Function => parse_func_stat(fs),
-        Token::Local => parse_local(fs),
-        Token::Return => parse_return(fs),
-        Token::Semi => { fs.ls_mut().next(); }
-        Token::Break => { fs.ls_mut().next(); }
+    fs.assert_regs_clean("parse_statement entry");
+    let result = match &fs.ls().token {
+        Token::If => { parse_if(fs); None },
+        Token::While => { parse_while(fs); None },
+        Token::Do => { parse_do(fs); None },
+        Token::For => { parse_for(fs); None },
+        Token::Repeat => { parse_repeat(fs); None },
+        Token::Function => { parse_func_stat(fs); None },
+        Token::Local => { parse_local(fs); None },
+        Token::Return => { parse_return(fs); Some("return") },
+        Token::Semi => { fs.ls_mut().next(); None },
+        Token::Break => { fs.ls_mut().next(); None },
         Token::Name(name) => {
             let line = fs.ls().lastline;
             let is_global = name == "global" && {
@@ -1032,6 +1116,7 @@ fn parse_statement(fs: &mut FuncState) {
                 parse_assign_or_call(fs);
                 if check(fs, &Token::Semi) { fs.ls_mut().next(); }
             }
+            None
         }
         Token::LParen
         | Token::Nil
@@ -1049,11 +1134,16 @@ fn parse_statement(fs: &mut FuncState) {
             let _r = fs.expr_to_reg(&ei.exp);
             fs.free_reg();
             if check(fs, &Token::Semi) { fs.ls_mut().next(); }
+            None
         }
         _ => {
             fs.error(&format!("unexpected token: {:?}", fs.ls().token));
             fs.ls_mut().next();
+            None
         }
+    };
+    if result.is_none() {
+        fs.assert_regs_clean("parse_statement exit");
     }
 }
 
@@ -1248,13 +1338,17 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
         _ => {
             if e.info2 >= 0 {
                 fs.set_a(e.info2, dest);
+                fs.free_reg();
             } else {
+                let saved_freereg = fs.freereg;
                 let val_reg = fs.expr_to_reg(e);
                 if dest != val_reg {
                     fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
                 }
+                if fs.freereg > saved_freereg || dest != val_reg {
+                    fs.free_reg();
+                }
             }
-            fs.free_reg();
         }
     }
 }
@@ -2615,7 +2709,7 @@ fn parse_if(fs: &mut FuncState) {
     expect(fs, &Token::Then);
     let block_freereg = fs.freereg;
     parse_block(fs);
-    fs.freereg = block_freereg;
+    fs.set_freereg(block_freereg);
     let mut exit_jumps = Vec::new();
 
     while check(fs, &Token::Elseif) {
@@ -2636,9 +2730,9 @@ fn parse_if(fs: &mut FuncState) {
             if_jmp = NO_JUMP;
         }
         expect(fs, &Token::Then);
-        fs.freereg = block_freereg;
+        fs.set_freereg(block_freereg);
         parse_block(fs);
-        fs.freereg = block_freereg;
+        fs.set_freereg(block_freereg);
     }
 
     if check(fs, &Token::Else) {
@@ -2648,8 +2742,9 @@ fn parse_if(fs: &mut FuncState) {
             fs.fix_jump(if_jmp, fs.pc, false);
         }
         fs.ls_mut().next();
-        fs.freereg = block_freereg;
+        fs.set_freereg(block_freereg);
         parse_block(fs);
+        fs.set_freereg(block_freereg);
     } else {
         if if_jmp != NO_JUMP {
             fs.fix_jump(if_jmp, fs.pc, false);
@@ -2732,7 +2827,7 @@ fn parse_for(fs: &mut FuncState) {
         if step_r != base + 2 {
             fs.code_abc(OpCode::MOVE, base + 2, step_r, 0);
         }
-        fs.freereg = base + 3;
+        fs.set_freereg(base + 3);
         
         expect(fs, &Token::Do);
         
@@ -2749,7 +2844,7 @@ fn parse_for(fs: &mut FuncState) {
         for local in &mut fs.locals[saved_nlocals..] {
             local.active = false;
         }
-        fs.freereg = saved_freereg;
+        fs.set_freereg(saved_freereg);
         expect(fs, &Token::End);
     } else {
         let mut vars = vec![name];
@@ -2772,7 +2867,7 @@ fn parse_for(fs: &mut FuncState) {
             fs.add_local_kind(var_name, fs.pc, RDKCONST);
         }
         
-        fs.freereg = base;
+        fs.set_freereg(base);
         let pc_before = fs.pc;
         loop {
             parse_expr(fs);
@@ -2791,7 +2886,7 @@ fn parse_for(fs: &mut FuncState) {
         }
         
         fs.code_abc(OpCode::LOADNIL, base + 1, base + 2, 0);
-        fs.freereg = base + 3 + ncontrol;
+        fs.set_freereg(base + 3 + ncontrol);
         fs.needclose = true;
         if fs.freereg > fs.max_freereg {
             fs.max_freereg = fs.freereg;
@@ -2800,7 +2895,8 @@ fn parse_for(fs: &mut FuncState) {
         expect(fs, &Token::Do);
         
         let prep = fs.code_abx(OpCode::TFORPREP, base, 0);
-        fs.freereg -= 1;
+        let cur_freereg = fs.freereg;
+        fs.set_freereg(cur_freereg - 1);
         
         parse_block(fs);
         
@@ -2812,7 +2908,7 @@ fn parse_for(fs: &mut FuncState) {
         expect(fs, &Token::End);
         
         fs.code_abc(OpCode::CLOSE, base, 0, 0);
-        fs.freereg = saved_freereg;
+        fs.set_freereg(saved_freereg);
         fs.locals.truncate(saved_nlocals);
     }
 }
@@ -2926,7 +3022,7 @@ fn parse_local(fs: &mut FuncState) {
                         last_exp = Some(ExpDesc::new(ExpKind::Relocable, target as i64));
                     }
                     _ => {
-                        fs.freereg = target;
+                        fs.set_freereg(target);
                         let _ = fs.expr_to_reg(&ei.exp);
                         last_exp = Some(ei.exp.clone());
                     }
@@ -2952,7 +3048,7 @@ fn parse_local(fs: &mut FuncState) {
                 fs.add_local_kind(&names[nvars - 1], fs.pc, RDKCTC);
             }
 
-            fs.freereg = saved_freereg + n_reg as i32;
+            fs.set_freereg(saved_freereg + n_reg as i32);
 
             for _ in n_vals..n_reg {
                 fs.code_abc(OpCode::LOADNIL, saved_freereg + n_vals as i32, 0, 0);
@@ -3029,7 +3125,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                     fs.code_abc(OpCode::SETLIST, table_r, tostore, na);
                     na += tostore;
                     tostore = 0;
-                    fs.freereg = table_r + 1;
+                    fs.set_freereg(table_r + 1);
                 }
                 fs.ls_mut().next();
                 let ek = parse_expr(fs);
@@ -3050,7 +3146,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                         fs.code_abc(OpCode::SETLIST, table_r, tostore, na);
                         na += tostore;
                         tostore = 0;
-                        fs.freereg = table_r + 1;
+                        fs.set_freereg(table_r + 1);
                     }
                     fs.ls_mut().next();
                     fs.ls_mut().next();
@@ -3080,7 +3176,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
     if tostore > 0 {
         fs.code_abc(OpCode::SETLIST, table_r, tostore, na);
         na += tostore;
-        fs.freereg = table_r + 1;
+        fs.set_freereg(table_r + 1);
     }
 
     expect(fs, &Token::RBrace);
