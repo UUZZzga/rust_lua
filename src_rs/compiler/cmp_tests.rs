@@ -498,8 +498,13 @@ mod compiler_compare_tests {
     }
 
     #[test]
-    fn test_for_generic() {
+    fn test_for_generic1() {
         assert_inst_match("local a = {} for _, __ in ipairs(a) do end", None);
+    }
+
+    #[test]
+    fn test_for_generic2() {
+        assert_inst_match("local a = {} for _, __ in ipairs(a) do local b end", None);
     }
 
     #[test]

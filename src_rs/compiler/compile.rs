@@ -3020,9 +3020,6 @@ fn parse_for(fs: &mut FuncState) {
         expect(fs, &Token::Do);
         
         let prep = fs.code_abx(OpCode::TFORPREP, base, 0);
-        let cur_freereg = fs.freereg;
-        fs.set_freereg(cur_freereg - 1);
-        
         parse_block(fs);
         
         fs.fix_jump(prep, fs.pc, false);
