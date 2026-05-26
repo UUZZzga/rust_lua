@@ -695,12 +695,11 @@ impl FuncState {
                 r
             }
             ExpKind::NonReloc => {
-                if e.info as i32 == self.freereg - 1 {
+                if (e.info as i32) < self.nvarstack() {
                     e.info as i32
                 } else {
-                    let r = self.alloc_reg();
-                    self.code_abc(OpCode::MOVE, r, e.info as i32, 0);
-                    r
+                    debug_assert!(e.info as i32 == self.freereg - 1);
+                    e.info as i32
                 }
             }
             ExpKind::Relocable | ExpKind::Call | ExpKind::Vararg => {

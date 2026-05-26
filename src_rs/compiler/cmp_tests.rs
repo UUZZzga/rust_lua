@@ -224,6 +224,11 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_assign_local2() {
+        assert_inst_match("local a = 1 + 2\nlocal d = a + 5\nlocal e = a & 2", None);
+    }
+
+    #[test]
     fn test_assign_integer() {
         assert_inst_match("x = 42", None);
     }
