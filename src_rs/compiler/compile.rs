@@ -1258,10 +1258,10 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 let val = &exps[i];
                 if let (Some(table_reg), Some(table_key)) = (v.table_reg, v.table_key) {
                     if let Some(k_val) = exp_to_k(fs, val) {
-                        fs.code_abc_k(OpCode::SETTABLE, table_reg, table_key, k_val, true);
+                        fs.code_abc_k(OpCode::SETFIELD, table_reg, table_key, k_val, true);
                     } else {
                         let val_reg = fs.expr_to_reg(val);
-                        fs.code_abc(OpCode::SETTABLE, table_reg, table_key, val_reg);
+                        fs.code_abc(OpCode::SETFIELD, table_reg, table_key, val_reg);
                         fs.free_reg();
                     }
                 } else if let Some(ref name) = v.var_name {

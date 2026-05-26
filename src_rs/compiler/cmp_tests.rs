@@ -517,6 +517,11 @@ mod compiler_compare_tests {
         assert_inst_match("local x\nx = (((2<3) or 1) == true and (2<3 and 4) == 4); assert(x);", None);
     }
 
+    #[test]
+    fn test_table_field_assign1() {
+        assert_inst_match("local A = {};A.a = nil;A.b = false;A.c = 123", None);
+    }
+
     // #[test]
     // fn test_big_lua() {
     //     assert_inst_match_file("big.lua");
@@ -527,10 +532,10 @@ mod compiler_compare_tests {
     //     assert_inst_match_file("constructs.lua");
     // }
 
-    // #[test]
-    // fn test_focus_lua() {
-    //     assert_inst_match_file("test_focus.lua");
-    // }
+    #[test]
+    fn test_focus_lua() {
+        assert_inst_match_file("test_focus.lua");
+    }
 
     fn assert_inst_match_file(name: &str) {
         assert_inst_match(get_lua_script(name).as_str(), Some(name));
