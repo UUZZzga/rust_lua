@@ -512,6 +512,11 @@ mod compiler_compare_tests {
         assert_inst_match("local x = ((b or a)+1 == 2 and (10 or a)+1 == 11); assert(x);", None);
     }
 
+    #[test]
+    fn test_assert_var2() {
+        assert_inst_match("local x\nx = (((2<3) or 1) == true and (2<3 and 4) == 4); assert(x);", None);
+    }
+
     // #[test]
     // fn test_big_lua() {
     //     assert_inst_match_file("big.lua");

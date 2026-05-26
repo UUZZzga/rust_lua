@@ -1346,6 +1346,28 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
         ExpKind::Str => {
             fs.code_abx(OpCode::LOADK, dest, e.info as i32);
         }
+        ExpKind::VJMP => {
+            let jmp_pc = e.info as i32;
+
+            let mut my_true_list = e.t;
+            let my_false_list = e.f;
+
+            if jmp_pc != NO_JUMP {
+                if my_true_list == NO_JUMP {
+                    my_true_list = jmp_pc;
+                } else {
+                    fs.concat_jump(&mut my_true_list, jmp_pc);
+                }
+            }
+
+            if my_true_list != NO_JUMP || my_false_list != NO_JUMP {
+                let p_f = fs.code_abc(OpCode::LFALSESKIP, dest, 0, 0);
+                let load_true_pc = fs.code_abc(OpCode::LOADTRUE, dest, 0, 0);
+                let final_pc = fs.pc;
+                fs.patch_list_aux(my_true_list, final_pc, dest, load_true_pc);
+                fs.patch_list_aux(my_false_list, final_pc, dest, p_f);
+            }
+        }
         _ => {
             if e.info2 >= 0 {
                 fs.set_a(e.info2, dest);
