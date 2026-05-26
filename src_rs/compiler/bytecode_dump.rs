@@ -1,8 +1,9 @@
 use crate::lua_ffi;
 use crate::opcodes::{
-    self, OPNAMES, TM_EVENT_NAMES, get_opcode, getarg_a, getarg_b, getarg_c,
+    self, OPNAMES, TM_EVENT_NAMES, get_opcode, getarg_a, getarg_b, getarg_c, getarg_vc,
     getarg_bx, getarg_sbx, getarg_sj,
-    getarg_vb, testarg_k, getarg, POS_A, SIZE_BX, SIZE_A, POS_K, POS_B, POS_C, OFFSET_sJ,
+    getarg_vb, testarg_k, getarg, POS_A, SIZE_BX, SIZE_A, POS_K, POS_B, POS_C, POS_VB, POS_VC, OFFSET_sJ,
+    OpCode, OpMode, get_opmode,
 };
 use std::ffi::{c_int, c_void};
 use std::ptr;
@@ -125,11 +126,14 @@ impl BytecodeReader {
 
     fn read_instruction(&mut self, raw: u32) -> DumpInstruction {
         use crate::opcodes;
+        let opcode_val = (raw & 0x7f) as u8;
+        let op = opcodes::OpCode::from_u8(opcode_val).unwrap_or(opcodes::OpCode::MOVE);
+        let is_vabc = opcodes::get_opmode(op) == opcodes::OpMode::IvABC;
         DumpInstruction {
-            opcode: (raw & 0x7f) as u8,
+            opcode: opcode_val,
             a: opcodes::getarg_a(raw) as u32,
-            b: opcodes::getarg_b(raw) as u32,
-            c: opcodes::getarg_c(raw) as u32,
+            b: if is_vabc { opcodes::getarg_vb(raw) as u32 } else { opcodes::getarg_b(raw) as u32 },
+            c: if is_vabc { opcodes::getarg_vc(raw) as u32 } else { opcodes::getarg_c(raw) as u32 },
             k: (raw >> opcodes::POS_K) & 1,
             bx: opcodes::getarg(raw, opcodes::POS_BX, opcodes::SIZE_BX) as u32,
         }
@@ -360,7 +364,8 @@ fn format_operands(op: u32, a: i32, b: i32, c: i32, bx: i32, sbx: i32, sj: i32, 
         | opcodes::OpCode::SETFIELD => format!("{} {} {}{}", a, b, c, isk),
         opcodes::OpCode::NEWTABLE => {
             let vb = getarg_vb(op);
-            format!("{} {} {}{}", a, vb, c, isk)
+            let vc = getarg_vc(op);
+            format!("{} {} {}{}", a, vb, vc, isk)
         }
         opcodes::OpCode::SELF => format!("{} {} {}{}", a, b, c, isk),
         opcodes::OpCode::ADDI | opcodes::OpCode::SHLI | opcodes::OpCode::SHRI => format!("{} {} {}", a, b, sc),
@@ -398,7 +403,8 @@ fn format_operands(op: u32, a: i32, b: i32, c: i32, bx: i32, sbx: i32, sj: i32, 
         opcodes::OpCode::TFORCALL => format!("{} {}", a, c),
         opcodes::OpCode::SETLIST => {
             let vb = getarg_vb(op);
-            format!("{} {} {}{}", a, vb, c, isk)
+            let vc = getarg_vc(op);
+            format!("{} {} {}{}", a, vb, vc, isk)
         }
         opcodes::OpCode::CLOSURE => format!("{} {}", a, bx),
         opcodes::OpCode::VARARG => format!("{} {} {}{}", a, b, c, isk),
@@ -438,8 +444,7 @@ fn format_c_comment(inst: &DumpInstruction, constants: &[DumpConstant]) -> Strin
             if isk { format!("\t; {}", format_constant(constants, c as usize)) } else { String::new() }
         }
         opcodes::OpCode::NEWTABLE => {
-            let total = c as usize + opcodes::SIZE_C as usize + 1;
-            format!("\t; {}", total)
+            format!("\t; {}", c)
         }
         opcodes::OpCode::SELF => {
             if isk { format!("\t; {}", format_constant(constants, c as usize)) } else { String::new() }
@@ -522,11 +527,21 @@ fn format_c_comment(inst: &DumpInstruction, constants: &[DumpConstant]) -> Strin
 }
 
 fn dump_inst_to_raw(inst: &DumpInstruction) -> u32 {
-    (inst.opcode as u32)
-        | ((inst.a as u32) << POS_A)
-        | ((inst.k as u32) << POS_K)
-        | ((inst.b as u32) << POS_B)
-        | ((inst.c as u32) << POS_C)
+    let op = OpCode::from_u8(inst.opcode).unwrap_or(OpCode::MOVE);
+    let is_vabc = get_opmode(op) == OpMode::IvABC;
+    if is_vabc {
+        (inst.opcode as u32)
+            | ((inst.a as u32) << POS_A)
+            | ((inst.k as u32) << POS_K)
+            | ((inst.b as u32) << POS_VB)
+            | ((inst.c as u32) << POS_VC)
+    } else {
+        (inst.opcode as u32)
+            | ((inst.a as u32) << POS_A)
+            | ((inst.k as u32) << POS_K)
+            | ((inst.b as u32) << POS_B)
+            | ((inst.c as u32) << POS_C)
+    }
 }
 
 pub fn compare_instructions(rust_code: &[u32], c_code: &[DumpInstruction]) -> Vec<String> {

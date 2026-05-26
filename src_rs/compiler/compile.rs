@@ -350,12 +350,20 @@ impl FuncState {
 
     /// 生成 IABC 模式指令: `op a b c` (无 k 位)
     fn code_abc(&mut self, op: OpCode, a: i32, b: i32, c: i32) -> i32 {
-        self.emit(create_abck(op, a, b, c, 0))
+        if get_opmode(op) == OpMode::IvABC {
+            self.emit(create_vabck(op, a, b, c, 0))
+        } else {
+            self.emit(create_abck(op, a, b, c, 0))
+        }
     }
 
     /// 生成 IABC+k 位模式指令: `op a b c k`
     fn code_abc_k(&mut self, op: OpCode, a: i32, b: i32, c: i32, k: bool) -> i32 {
-        self.emit(create_abck(op, a, b, c, if k { 1 } else { 0 }))
+        if get_opmode(op) == OpMode::IvABC {
+            self.emit(create_vabck(op, a, b, c, if k { 1 } else { 0 }))
+        } else {
+            self.emit(create_abck(op, a, b, c, if k { 1 } else { 0 }))
+        }
     }
 
     /// 生成 IABx 模式指令: `op a bx` (无符号偏移)
@@ -433,6 +441,21 @@ impl FuncState {
     fn set_a(&mut self, pc: i32, a: i32) {
         let i = &mut self.proto.code[pc as usize];
         setarg(i, a, POS_A, SIZE_A);
+    }
+
+    fn set_tablesize(&mut self, pc: i32, ra: i32, asize: i32, hsize: i32) {
+        let max_vc = (1 << SIZE_VC) as i32;
+        let extra = asize / max_vc;
+        let rc = asize % max_vc;
+        let k = extra > 0;
+        let hsize = if hsize != 0 {
+            crate::objects::ceil_log2(hsize as u32) as i32 + 1
+        } else {
+            0
+        };
+        let inst = create_vabck(OpCode::NEWTABLE, ra, hsize, rc, if k { 1 } else { 0 });
+        self.proto.code[pc as usize] = inst;
+        self.proto.code[(pc + 1) as usize] = ((OpCode::EXTRAARG as u32) << POS_OP) | ((extra as u32) << POS_A);
     }
 
     /// 生成 JMP 无条件跳转指令，返回指令 pc 位置
@@ -3208,18 +3231,18 @@ fn parse_expr_list(fs: &mut FuncState) -> i32 {
 fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
     fs.ls_mut().next();
     let table_r = fs.alloc_reg();
-    fs.code_abc_k(OpCode::NEWTABLE, 0, 0, 0, false);
+    let pc = fs.code_abc_k(OpCode::NEWTABLE, 0, 0, 0, false);
     fs.code_ax(OpCode::EXTRAARG, 0);
-    let mut na: i32 = 0;
+    let mut need_array: i32 = 0;
     let mut tostore: i32 = 0;
-    let mut _nh: i32 = 0;
+    let mut need_hash: i32 = 0;
 
     if !check(fs, &Token::RBrace) {
         loop {
             if check(fs, &Token::LBracket) {
                 if tostore > 0 {
-                    fs.code_abc(OpCode::SETLIST, table_r, tostore, na);
-                    na += tostore;
+                    fs.code_abc(OpCode::SETLIST, table_r, tostore, need_array);
+                    need_array += tostore;
                     tostore = 0;
                     fs.set_freereg(table_r + 1);
                 }
@@ -3233,14 +3256,14 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                 fs.code_abc(OpCode::SETTABLE, table_r, k_r, v_r);
                 fs.free_reg();
                 fs.free_reg();
-                _nh += 1;
+                need_hash += 1;
             } else if let Token::Name(s) = &fs.ls().token {
                 let name = s.clone();
                 let next_is_eq = fs.ls_mut().lookahead_next().0 == Token::Eq;
                 if next_is_eq {
                     if tostore > 0 {
-                        fs.code_abc(OpCode::SETLIST, table_r, tostore, na);
-                        na += tostore;
+                        fs.code_abc(OpCode::SETLIST, table_r, tostore, need_array);
+                        need_array += tostore;
                         tostore = 0;
                         fs.set_freereg(table_r + 1);
                     }
@@ -3251,7 +3274,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                     let k = fs.string_k(&name);
                     fs.code_abc(OpCode::SETI, table_r, k, v_r);
                     fs.free_reg();
-                    _nh += 1;
+                    need_hash += 1;
                 } else {
                     tostore += 1;
                     let ev = parse_expr(fs);
@@ -3270,14 +3293,16 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
     }
 
     if tostore > 0 {
-        fs.code_abc(OpCode::SETLIST, table_r, tostore, na);
-        na += tostore;
+        fs.code_abc(OpCode::SETLIST, table_r, tostore, need_array);
+        need_array += tostore;
         fs.set_freereg(table_r + 1);
     }
 
     expect(fs, &Token::RBrace);
 
-    (table_r, na)
+    fs.set_tablesize(pc, table_r, need_array, need_hash);
+
+    (table_r, need_array)
 }
 
 /// ANTLR4: `funcbody: '(' parlist? ')' block 'end' ;` — 解析函数体 (非 method)

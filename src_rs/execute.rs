@@ -789,8 +789,13 @@ impl VmExecutor {
 
     fn op_newtable(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
-        let b = opcodes::getarg_b(inst) as u32;
-        let c = opcodes::getarg_c(inst) as u32;
+        let b = opcodes::getarg_vb(inst) as u32;
+        let mut c = opcodes::getarg_vc(inst) as u32;
+        if opcodes::testarg_k(inst) {
+            let extra = opcodes::getarg_a(state.code[state.pc + 1]);
+            c += (extra as u32) * ((1u32 << opcodes::SIZE_VC));
+            state.pc += 1;
+        }
         let hash_size = if b > 0 { 1u32 << (b - 1) } else { 0 };
         let array_size = c as usize;
         let table = Table::with_capacity(array_size, hash_size as usize);
@@ -1779,8 +1784,13 @@ impl VmExecutor {
 
     fn op_setlist(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let ra = Self::ra(state, inst);
-        let n = opcodes::getarg_b(inst) as usize;
-        let mut last = opcodes::getarg_c(inst) as usize;
+        let n = opcodes::getarg_vb(inst) as usize;
+        let mut last = opcodes::getarg_vc(inst) as usize;
+        if opcodes::testarg_k(inst) {
+            let extra = opcodes::getarg_a(state.code[state.pc + 1]);
+            last += (extra as usize) * ((1usize << opcodes::SIZE_VC));
+            state.pc += 1;
+        }
 
         let n_actual = if n == 0 { state.stack.len().saturating_sub(ra + 1) } else { n };
         last += n_actual;
@@ -1985,12 +1995,18 @@ mod tests {
 
     #[allow(dead_code)]
     fn make_abck(op: OpCode, a: i32, b: i32, c: i32, k: i32) -> Instruction {
+        let is_vabc = opcodes::get_opmode(op) == opcodes::OpMode::IvABC;
         let mut inst = 0u32;
         inst |= (op as u32) << opcodes::POS_OP;
         inst |= (a as u32 & 0xFF) << opcodes::POS_A;
         inst |= (k as u32 & 1) << opcodes::POS_K;
-        inst |= (b as u32 & 0xFF) << opcodes::POS_B;
-        inst |= (c as u32 & 0xFF) << opcodes::POS_C;
+        if is_vabc {
+            inst |= (b as u32 & 0x3F) << opcodes::POS_VB;
+            inst |= (c as u32 & 0x3FF) << opcodes::POS_VC;
+        } else {
+            inst |= (b as u32 & 0xFF) << opcodes::POS_B;
+            inst |= (c as u32 & 0xFF) << opcodes::POS_C;
+        }
         inst
     }
 
@@ -2013,11 +2029,17 @@ mod tests {
     }
 
     fn make_abc(op: OpCode, a: i32, b: i32, c: i32) -> Instruction {
+        let is_vabc = opcodes::get_opmode(op) == opcodes::OpMode::IvABC;
         let mut inst = 0u32;
         inst |= (op as u32) << opcodes::POS_OP;
         inst |= (a as u32 & 0xFF) << opcodes::POS_A;
-        inst |= (b as u32 & 0xFF) << opcodes::POS_B;
-        inst |= (c as u32 & 0xFF) << opcodes::POS_C;
+        if is_vabc {
+            inst |= (b as u32 & 0x3F) << opcodes::POS_VB;
+            inst |= (c as u32 & 0x3FF) << opcodes::POS_VC;
+        } else {
+            inst |= (b as u32 & 0xFF) << opcodes::POS_B;
+            inst |= (c as u32 & 0xFF) << opcodes::POS_C;
+        }
         inst
     }
 

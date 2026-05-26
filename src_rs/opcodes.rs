@@ -57,12 +57,14 @@ pub enum OpMode { IABC = 0, IABx = 1, IAsBx = 2, IAx = 3, IsJ = 4, IvABC = 5 }
 
 pub const SIZE_C: u32 = 8;   pub const SIZE_B: u32 = 8;
 pub const SIZE_VB: u32 = 6;
+pub const SIZE_VC: u32 = 10;
 pub const SIZE_BX: u32 = SIZE_C + SIZE_B + 1;
 pub const SIZE_A: u32 = 8;   pub const SIZE_OP: u32 = 7;
 pub const POS_OP: u32 = 0;   pub const POS_A: u32 = POS_OP + SIZE_OP;
 pub const POS_K: u32 = POS_A + SIZE_A;
 pub const POS_B: u32 = POS_K + 1;
 pub const POS_VB: u32 = POS_K + 1;
+pub const POS_VC: u32 = POS_VB + SIZE_VB;
 pub const POS_C: u32 = POS_B + SIZE_B;
 pub const POS_BX: u32 = POS_K;
 pub const POS_SJ: u32 = POS_A;
@@ -97,6 +99,7 @@ pub const MAX_FSTACK: u8 = NO_REG;
 #[inline] pub fn getarg_a(i: Instruction) -> i32 { getarg(i, POS_A, SIZE_A) }
 #[inline] pub fn getarg_b(i: Instruction) -> i32 { getarg(i, POS_B, SIZE_B) }
 #[inline] pub fn getarg_vb(i: Instruction) -> i32 { getarg(i, POS_VB, SIZE_VB) }
+#[inline] pub fn getarg_vc(i: Instruction) -> i32 { getarg(i, POS_VC, SIZE_VC) }
 #[inline] pub fn getarg_c(i: Instruction) -> i32 { getarg(i, POS_C, SIZE_C) }
 #[inline] pub fn testarg_k(i: Instruction) -> bool { (i & (1u32 << POS_K)) != 0 }
 #[inline] pub fn getarg_bx(i: Instruction) -> i32 { getarg(i, POS_BX, SIZE_BX) }
@@ -246,6 +249,11 @@ pub fn get_opmode(op: OpCode) -> OpMode {
 #[inline] pub fn create_abck(o: OpCode, a: i32, b: i32, c: i32, k: i32) -> Instruction {
     ((o as u32) << POS_OP) | ((a as u32) << POS_A) | ((b as u32) << POS_B)
         | ((c as u32) << POS_C) | ((k as u32) << POS_K)
+}
+
+#[inline] pub fn create_vabck(o: OpCode, a: i32, b: i32, c: i32, k: i32) -> Instruction {
+    ((o as u32) << POS_OP) | ((a as u32) << POS_A) | ((b as u32) << POS_VB)
+        | ((c as u32) << POS_VC) | ((k as u32) << POS_K)
 }
 
 pub static OPNAMES: &[&str] = &[
