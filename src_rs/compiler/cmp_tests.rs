@@ -498,6 +498,11 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_for_generic() {
+        assert_inst_match("local a = {} for _, __ in ipairs(a) do end", None);
+    }
+
+    #[test]
     fn test_function_upvalue() {
         assert_inst_match("local a; local function f(x) x={a=1}; x={x=1}; x={G=1} end", None);
     }
@@ -646,8 +651,6 @@ mod compiler_compare_tests {
     fn test_reg_no_leak_for_generic() {
         assert_compile_ok("for i=1,3 do local x = i end", None);
     }
-
-
 
     #[test]
     fn test_reg_no_leak_local_decls() {

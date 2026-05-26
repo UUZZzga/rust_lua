@@ -2988,23 +2988,29 @@ fn parse_for(fs: &mut FuncState) {
         
         fs.set_freereg(base);
         let pc_before = fs.pc;
+        let mut nexps = 0;
         loop {
             parse_expr(fs);
+            nexps += 1;
             if !check(fs, &Token::Comma) { break; }
             fs.ls_mut().next();
         }
         
+        let mut last_is_call = false;
         if fs.pc > pc_before {
             for i in (pc_before..fs.pc).rev() {
                 if get_opcode(fs.proto.code[i as usize]) == OpCode::CALL {
-                    let needed = (3.max(ncontrol) + 1).min(255);
+                    let needed = (6 - nexps).max(1).min(255);
                     setarg(&mut fs.proto.code[i as usize], needed, POS_C, SIZE_C);
+                    last_is_call = true;
                     break;
                 }
             }
         }
         
-        fs.code_abc(OpCode::LOADNIL, base + 1, base + 2, 0);
+        if !last_is_call && nexps < 4 {
+            fs.code_abc(OpCode::LOADNIL, base + nexps, 3 - nexps, 0);
+        }
         fs.set_freereg(base + 3 + ncontrol);
         fs.needclose = true;
         if fs.freereg > fs.max_freereg {
