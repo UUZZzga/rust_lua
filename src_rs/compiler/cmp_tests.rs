@@ -537,6 +537,11 @@ mod compiler_compare_tests {
         assert_inst_match("A.aa = nil", None);
     }
 
+    #[test]
+    fn test_do_local() {
+        assert_inst_match("do local a = {} end", None);
+    }
+
     // #[test]
     // fn test_big_lua() {
     //     assert_inst_match_file("big.lua");

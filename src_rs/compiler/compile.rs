@@ -2889,7 +2889,13 @@ fn parse_while(fs: &mut FuncState) {
 /// ANTLR4: `'do' block 'end' ;`
 fn parse_do(fs: &mut FuncState) {
     fs.ls_mut().next();
+    let saved_nlocals = fs.locals.len();
+    let saved_freereg = fs.freereg;
     parse_block(fs);
+    for local in &mut fs.locals[saved_nlocals..] {
+        local.active = false;
+    }
+    fs.set_freereg(saved_freereg);
     expect(fs, &Token::End);
 }
 
