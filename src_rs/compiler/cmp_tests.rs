@@ -219,6 +219,11 @@ mod compiler_compare_tests {
     // ===== 赋值测试 (Rust 编译器暂不支持，编译时需先支持) =====
 
     #[test]
+    fn test_assign_local() {
+        assert_inst_match("local a = 1 + 2\nlocal b = a * 3\nlocal c = a - 1", None);
+    }
+
+    #[test]
     fn test_assign_integer() {
         assert_inst_match("x = 42", None);
     }
