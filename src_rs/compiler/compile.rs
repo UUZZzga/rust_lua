@@ -1190,9 +1190,11 @@ fn parse_assign_or_call(fs: &mut FuncState) {
     let mut first = parse_prefix_exp(fs);
     
     let mut has_call = false;
+    let mut extra_free = false;
     if check(fs, &Token::LParen) || check(fs, &Token::Colon) || check(fs, &Token::LBrace) || matches!(&fs.ls().token, Token::String(..)) {
         has_call = true;
-        let freg = load_func(fs, &first);
+        let (freg, ef) = load_func(fs, &first);
+        extra_free = ef;
         let _start_pc = fs.pc;
         parse_func_args(fs, freg);
         loop {
@@ -1225,7 +1227,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 first = PrefixResult {
                     var_name: None, local_idx: None, key: None, reg: Some(base_reg),
                     table_reg: Some(base_reg), table_key: Some(k), table_key_is_const: true,
-                    allocated_reg: first.reg.is_none(),
+                    allocated_reg: first.allocated_reg || first.reg.is_none(),
                 };
             }
             Token::LBracket => {
@@ -1247,7 +1249,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 first = PrefixResult {
                     var_name: None, local_idx: None, key: None, reg: Some(base_reg),
                     table_reg: Some(base_reg), table_key: Some(kr), table_key_is_const: key_is_const,
-                    allocated_reg: first.reg.is_none(),
+                    allocated_reg: first.allocated_reg || first.reg.is_none(),
                 };
             }
             _ => break,
@@ -1256,6 +1258,9 @@ fn parse_assign_or_call(fs: &mut FuncState) {
     
     if has_call && !check(fs, &Token::Eq) && !check(fs, &Token::Comma) {
         fs.free_reg();
+        if first.allocated_reg && extra_free {
+            fs.free_reg();
+        }
         return;
     }
     
@@ -1324,7 +1329,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
         return;
     }
     
-    let _r = load_func(fs, &first);
+    let (_r, _) = load_func(fs, &first);
     fs.free_reg();
 }
 
@@ -1422,33 +1427,39 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
 }
 
 /// ANTLR4: functioncall 帮助 — 将函数值加载到寄存器以便调用
-fn load_func(fs: &mut FuncState, p: &PrefixResult) -> i32 {
+/// 返回 (函数寄存器, 是否需要额外释放基寄存器)
+fn load_func(fs: &mut FuncState, p: &PrefixResult) -> (i32, bool) {
     if let (Some(table_reg), Some(table_key)) = (p.table_reg, p.table_key) {
-        let r = fs.alloc_reg();
-        fs.code_abc(OpCode::GETTABLE, r, table_reg, table_key);
-        r
+        if p.table_key_is_const {
+            fs.code_abc(OpCode::GETFIELD, table_reg, table_reg, table_key);
+            (table_reg, false)
+        } else {
+            let r = fs.alloc_reg();
+            fs.code_abc(OpCode::GETTABLE, r, table_reg, table_key);
+            (r, true)
+        }
     } else if let Some(reg) = p.local_idx {
         if reg == fs.freereg - 1 {
-            reg
+            (reg, false)
         } else {
             let r = fs.alloc_reg();
             fs.code_abc(OpCode::MOVE, r, reg, 0);
-            r
+            (r, false)
         }
     } else if let Some(key) = p.key {
         let r = fs.alloc_reg();
         fs.code_abc(OpCode::GETTABUP, r, 0, key);
-        r
+        (r, false)
     } else if let Some(reg) = p.reg {
         if reg == fs.freereg - 1 {
-            reg
+            (reg, false)
         } else {
             let r = fs.alloc_reg();
             fs.code_abc(OpCode::MOVE, r, reg, 0);
-            r
+            (r, false)
         }
     } else {
-        fs.alloc_reg()
+        (fs.alloc_reg(), false)
     }
 }
 
@@ -1575,33 +1586,33 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                             r
                         };
                         result = PrefixResult {
-                            var_name: None, local_idx: None, key: None, reg: Some(base_reg),
-                            table_reg: Some(base_reg), table_key: Some(k), table_key_is_const: true,
-                            allocated_reg: result.reg.is_none(),
-                        };
-                    }
-                    Token::LBracket => {
-                        fs.ls_mut().next();
-                        let ei = parse_expr(fs);
-                        expect(fs, &Token::RBracket);
-                        let base_reg = if let Some(r) = result.reg {
-                            r
-                        } else {
-                            let r = fs.alloc_reg();
-                            let gk = result.key.unwrap_or(0);
-                            fs.code_abc(OpCode::GETTABUP, r, 0, gk);
-                            r
-                        };
-                        let (kr, key_is_const) = if ei.exp.kind == ExpKind::Str {
-                            (ei.exp.info as i32, true)
-                        } else {
-                            (fs.expr_to_reg(&ei.exp), false)
-                        };
-                        result = PrefixResult {
-                            var_name: None, local_idx: None, key: None, reg: Some(base_reg),
-                            table_reg: Some(base_reg), table_key: Some(kr), table_key_is_const: key_is_const,
-                            allocated_reg: result.reg.is_none(),
-                        };
+                        var_name: None, local_idx: None, key: None, reg: Some(base_reg),
+                        table_reg: Some(base_reg), table_key: Some(k), table_key_is_const: true,
+                        allocated_reg: result.allocated_reg || result.reg.is_none(),
+                    };
+                }
+                Token::LBracket => {
+                    fs.ls_mut().next();
+                    let ei = parse_expr(fs);
+                    expect(fs, &Token::RBracket);
+                    let base_reg = if let Some(r) = result.reg {
+                        r
+                    } else {
+                        let r = fs.alloc_reg();
+                        let gk = result.key.unwrap_or(0);
+                        fs.code_abc(OpCode::GETTABUP, r, 0, gk);
+                        r
+                    };
+                    let (kr, key_is_const) = if ei.exp.kind == ExpKind::Str {
+                        (ei.exp.info as i32, true)
+                    } else {
+                        (fs.expr_to_reg(&ei.exp), false)
+                    };
+                    result = PrefixResult {
+                        var_name: None, local_idx: None, key: None, reg: Some(base_reg),
+                        table_reg: Some(base_reg), table_key: Some(kr), table_key_is_const: key_is_const,
+                        allocated_reg: result.allocated_reg || result.reg.is_none(),
+                    };
                     }
                     _ => break,
                 }

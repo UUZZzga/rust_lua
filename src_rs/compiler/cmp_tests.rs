@@ -548,6 +548,11 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_table_field_call() {
+        assert_inst_match("string.format('%s', op)", None);
+    }
+
+    #[test]
     fn test_do_local() {
         assert_inst_match("do local a = {} end", None);
     }
