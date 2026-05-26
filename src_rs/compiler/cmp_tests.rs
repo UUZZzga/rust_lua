@@ -553,6 +553,11 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_load_string() {
+        assert_inst_match("load(string.format('', 123))", None);
+    }
+
+    #[test]
     fn test_do_local() {
         assert_inst_match("do local a = {} end", None);
     }

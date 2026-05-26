@@ -6,7 +6,6 @@ use super::lexer::{LexState, Token};
 use crate::objects::Instruction;
 
 const NO_JUMP: i32 = -1;
-const LUA_MULTRET: i32 = -1;
 
 const VDKREG: i32 = 0;
 const RDKCONST: i32 = 1;
@@ -725,7 +724,16 @@ impl FuncState {
                     e.info as i32
                 }
             }
-            ExpKind::Relocable | ExpKind::Call | ExpKind::Vararg => {
+            ExpKind::Call => {
+                if e.info as i32 == self.freereg - 1 {
+                    e.info as i32
+                } else {
+                    let r = self.alloc_reg();
+                    self.code_abc(OpCode::MOVE, r, e.info as i32, 0);
+                    r
+                }
+            }
+            ExpKind::Relocable | ExpKind::Vararg => {
                 if e.info as i32 == self.freereg - 1 {
                     if e.info2 >= 0 {
                         self.set_a(e.info2, e.info as i32);
@@ -1464,7 +1472,7 @@ fn load_func(fs: &mut FuncState, p: &PrefixResult) -> (i32, bool) {
 }
 
 /// ANTLR4: `args: '(' explist? ')' | tableconstructor | STRING ;` 及 `':' NAME args ;` — 解析函数参数并生成 CALL 指令
-fn parse_func_args(fs: &mut FuncState, freg: i32) {
+fn parse_func_args(fs: &mut FuncState, freg: i32) -> i32 {
     if matches!(&fs.ls().token, Token::String(..)) {
         let str_s = match &fs.ls().token {
             Token::String(s) => s.clone(),
@@ -1474,17 +1482,17 @@ fn parse_func_args(fs: &mut FuncState, freg: i32) {
         let k = fs.string_k(&str_s);
         let kr = fs.alloc_reg();
         fs.code_abx(OpCode::LOADK, kr, k);
-        fs.code_abc(OpCode::CALL, freg, 2, 2);
+        let pc = fs.code_abc(OpCode::CALL, freg, 2, 2);
         fs.free_reg();
-        return;
+        return pc;
     }
     
     if check(fs, &Token::LBrace) {
         let (tr, _n) = parse_constructor(fs);
         fs.code_abc(OpCode::MOVE, freg + 1, tr, 0);
-        fs.code_abc(OpCode::CALL, freg, 2, 2);
+        let pc = fs.code_abc(OpCode::CALL, freg, 2, 2);
         fs.free_reg();
-        return;
+        return pc;
     }
     
     if check(fs, &Token::Colon) {
@@ -1494,34 +1502,40 @@ fn parse_func_args(fs: &mut FuncState, freg: i32) {
         fs.code_abc(OpCode::GETTABLE, freg + 1, freg, k);
         if check(fs, &Token::LParen) {
             fs.ls_mut().next();
-            let na = parse_args(fs);
+            let (na, na_multret) = parse_args(fs);
             expect(fs, &Token::RParen);
-            fs.code_abc(OpCode::CALL, freg, na + 1, 2);
+            let na_adj = if na_multret { 0 } else { na + 1 };
+            let pc = fs.code_abc(OpCode::CALL, freg, na_adj, 2);
             for _ in 0..na {
                 fs.free_reg();
             }
+            return pc;
         }
-        return;
+        return -1;
     }
     
     if check(fs, &Token::LParen) {
         fs.ls_mut().next();
-        let nparams = parse_args(fs);
+        let (nparams, nparams_multret) = parse_args(fs);
         expect(fs, &Token::RParen);
-        fs.code_abc(OpCode::CALL, freg, nparams + 1, 2);
+        let nparams_adj = if nparams_multret { 0 } else { nparams + 1 };
+        let pc = fs.code_abc(OpCode::CALL, freg, nparams_adj, 2);
         for _ in 0..nparams {
             fs.free_reg();
         }
-        return;
+        return pc;
     }
+    -1
 }
 
 /// ANTLR4: `explist: expr (',' expr)* ;` — 解析函数调用参数列表
-fn parse_args(fs: &mut FuncState) -> i32 {
+fn parse_args(fs: &mut FuncState) -> (i32, bool) {
     if check(fs, &Token::RParen) || check(fs, &Token::RBrace) {
-        return 0;
+        return (0, false);
     }
     let ei = parse_expr(fs);
+    let mut last_is_call = ei.exp.kind == ExpKind::Call;
+    let mut last_call_pc = if last_is_call { ei.exp.info2 } else { -1 };
     let _r = fs.exp_to_reg(&ei.exp);
     if matches!(ei.exp.kind, ExpKind::NonReloc) && (ei.exp.info as i32) < fs.nvarstack() {
         let target = fs.alloc_reg();
@@ -1533,6 +1547,8 @@ fn parse_args(fs: &mut FuncState) -> i32 {
     while check(fs, &Token::Comma) {
         fs.ls_mut().next();
         let ei2 = parse_expr(fs);
+        last_is_call = ei2.exp.kind == ExpKind::Call;
+        last_call_pc = if last_is_call { ei2.exp.info2 } else { -1 };
         let _r2 = fs.exp_to_reg(&ei2.exp);
         if matches!(ei2.exp.kind, ExpKind::NonReloc) && (ei2.exp.info as i32) < fs.nvarstack() {
             let target = fs.alloc_reg();
@@ -1542,7 +1558,10 @@ fn parse_args(fs: &mut FuncState) -> i32 {
         }
         n += 1;
     }
-    n
+    if last_is_call {
+        fs.set_c(last_call_pc, 0);
+    }
+    (n, last_is_call)
 }
 
 #[derive(Debug, Clone)]
@@ -2780,15 +2799,19 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
         match &fs.ls().token {
             Token::LParen | Token::LBrace | Token::String(..) | Token::Colon => {
                 let freg = fs.expr_to_reg(&e);
-                parse_func_args(fs, freg);
-                e = ExpDesc::new(ExpKind::Relocable, freg as i64);
+                let call_pc = parse_func_args(fs, freg);
+                e = if call_pc >= 0 {
+                    ExpDesc { kind: ExpKind::Call, info: freg as i64, info2: call_pc, t: NO_JUMP, f: NO_JUMP }
+                } else {
+                    ExpDesc::new(ExpKind::Relocable, freg as i64)
+                };
             }
             Token::Dot => {
                 fs.ls_mut().next();
                 let field = get_name(fs);
                 let k = fs.string_k(&field);
                 let base_reg = fs.expr_to_reg(&e);
-                fs.code_abc(OpCode::GETTABLE, base_reg, base_reg, k);
+                fs.code_abc(OpCode::GETFIELD, base_reg, base_reg, k);
                 e = ExpDesc::new(ExpKind::Relocable, base_reg as i64);
             }
             Token::LBracket => {
