@@ -2002,18 +2002,18 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         let r2 = fs.exp_to_reg(&e2.exp);
                         if fits_sc(&ec) {
                             let sc = int_to_sc(ec.info);
-                            let pc = fs.code_abc(OpCode::ADDI, 0, r2, sc);
+                            let pc = fs.code_abc(OpCode::ADDI, r2, r2, sc);
                             fs.code_abc_k(OpCode::MMBINI, r2, sc, 6, true);
                             e = ExprItem { exp: ec.into_reloc_with_pc(r2 as i64, pc) };
                         } else {
                             let k = fs.int_k(ec.info);
                             if k <= 255 {
-                                let pc = fs.code_abc(OpCode::ADDK, 0, r2, k);
+                                let pc = fs.code_abc(OpCode::ADDK, r2, r2, k);
                                 fs.code_abc_k(OpCode::MMBINK, r2, k, 6, true);
                                 e = ExprItem { exp: ec.into_reloc_with_pc(r2 as i64, pc) };
                             } else {
                                 let r = fs.expr_to_reg(&ec);
-                                let pc = fs.code_abc(OpCode::ADD, 0, r2, r);
+                                let pc = fs.code_abc(OpCode::ADD, r2, r2, r);
                                 e = ExprItem { exp: ec.into_reloc_with_pc(r2 as i64, pc) };
                             }
                         }
@@ -2040,31 +2040,31 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         let v = e2.exp.info;
                         let sc_neg = int_to_sc(-v);
                         let sc_pos = int_to_sc(v);
-                        let pc = fs.code_abc(OpCode::ADDI, 0, r, sc_neg);
+                        let pc = fs.code_abc(OpCode::ADDI, r, r, sc_neg);
                         fs.code_abc(OpCode::MMBINI, r, sc_pos, 7);
                         e = ExprItem { exp: ec.into_reloc_with_pc(r as i64, pc) };
                     } else if is_add && matches!(e2.exp.kind, ExpKind::Int) && fits_sc(&e2.exp) {
                         let v = e2.exp.info;
                         let sc = int_to_sc(v);
-                        let pc = fs.code_abc(OpCode::ADDI, 0, r, sc);
+                        let pc = fs.code_abc(OpCode::ADDI, r, r, sc);
                         fs.code_abc(OpCode::MMBINI, r, sc, 6);
                         e = ExprItem { exp: ec.into_reloc_with_pc(r as i64, pc) };
                     } else if is_add && matches!(e2.exp.kind, ExpKind::Float) {
                         let f = f64::from_bits(e2.exp.info as u64);
                         let k = fs.float_k(f);
                         if k <= 255 {
-                            let pc = fs.code_abc(OpCode::ADDK, 0, r, k);
+                            let pc = fs.code_abc(OpCode::ADDK, r, r, k);
                             fs.code_abc(OpCode::MMBINK, r, k, 6);
                             e = ExprItem { exp: ec.into_reloc_with_pc(r as i64, pc) };
                         } else {
                             let r2 = fs.expr_to_reg(&e2.exp);
-                            let pc = fs.code_abc(OpCode::ADD, 0, r, r2);
+                            let pc = fs.code_abc(OpCode::ADD, r, r, r2);
                             e = ExprItem { exp: ec.into_reloc_with_pc(r as i64, pc) };
                         }
                     } else {
                         let r2 = fs.expr_to_reg(&e2.exp);
                         let op = if is_add { OpCode::ADD } else { OpCode::SUB };
-                        let pc = fs.code_abc(op, 0, r, r2);
+                        let pc = fs.code_abc(op, r, r, r2);
                         e = ExprItem { exp: ec.into_reloc_with_pc(r as i64, pc) };
                     }
                 }

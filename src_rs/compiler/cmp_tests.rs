@@ -502,6 +502,11 @@ mod compiler_compare_tests {
         assert_inst_match("function checkload (s, msg) assert(string.find(select(2, load(s)), msg)) end", None);
     }
 
+    #[test]
+    fn test_assert_expr1() {
+        assert_inst_match("assert(-3+4*5//2^3^2//9+4%10/3 == (-3)+(((4*5)//(2^(3^2)))//9)+((4%10)/3))", None);
+    }
+
     // #[test]
     // fn test_big_lua() {
     //     assert_inst_match_file("big.lua");
