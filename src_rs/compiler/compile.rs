@@ -1086,6 +1086,7 @@ fn globalfunc(fs: &mut FuncState, _line: i32) {
     let r = parse_body(fs, None);
     let k = fs.string_k(&fname);
     fs.code_abc(OpCode::SETTABUP, 0, k, r);
+    fs.free_reg();
     checkglobal(fs, &fname, _line);
 }
 
@@ -2699,9 +2700,8 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 let field = get_name(fs);
                 let k = fs.string_k(&field);
                 let base_reg = fs.expr_to_reg(&e);
-                let result_reg = fs.alloc_reg();
-                fs.code_abc(OpCode::GETTABLE, result_reg, base_reg, k);
-                e = ExpDesc::new(ExpKind::Relocable, result_reg as i64);
+                fs.code_abc(OpCode::GETTABLE, base_reg, base_reg, k);
+                e = ExpDesc::new(ExpKind::Relocable, base_reg as i64);
             }
             Token::LBracket => {
                 fs.ls_mut().next();
@@ -2709,9 +2709,11 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 expect(fs, &Token::RBracket);
                 let base_reg = fs.expr_to_reg(&e);
                 let key_reg = fs.expr_to_reg(&ei.exp);
-                let result_reg = fs.alloc_reg();
-                fs.code_abc(OpCode::GETTABLE, result_reg, base_reg, key_reg);
-                e = ExpDesc::new(ExpKind::Relocable, result_reg as i64);
+                fs.code_abc(OpCode::GETTABLE, base_reg, base_reg, key_reg);
+                if key_reg == fs.freereg - 1 {
+                    fs.free_reg();
+                }
+                e = ExpDesc::new(ExpKind::Relocable, base_reg as i64);
             }
             _ => break,
         }
@@ -2969,6 +2971,7 @@ fn parse_func_stat(fs: &mut FuncState) {
             let k = fs.string_k(name);
             fs.code_abc(OpCode::SETTABUP, 0, k, r);
         }
+        fs.free_reg();
         return;
     }
 
@@ -2988,15 +2991,15 @@ fn parse_func_stat(fs: &mut FuncState) {
     for i in 1..last_idx {
         let (_col, fname) = &chain[i];
         let k = fs.string_k(fname);
-        let next_reg = fs.alloc_reg();
-        fs.code_abc(OpCode::GETTABLE, next_reg, base_reg, k);
-        base_reg = next_reg;
+        fs.code_abc(OpCode::GETTABLE, base_reg, base_reg, k);
     }
 
     let (is_colon, last_name) = &chain[last_idx];
     let freg = parse_body_ex(fs, *is_colon, None);
     let fk = fs.string_k(last_name);
     fs.code_abc(OpCode::SETTABLE, base_reg, fk, freg);
+    fs.free_reg();
+    fs.free_reg();
 }
 
 /// ANTLR4: `'local' 'function' NAME funcbody | 'local' attnamelist ('=' explist)? ;`

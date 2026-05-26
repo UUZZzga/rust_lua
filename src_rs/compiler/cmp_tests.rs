@@ -497,6 +497,11 @@ mod compiler_compare_tests {
         assert_inst_match("local a; local function f(x) x={a=1}; x={x=1}; x={G=1} end", None);
     }
 
+    #[test]
+    fn test_function_2() {
+        assert_inst_match("function checkload (s, msg) assert(string.find(select(2, load(s)), msg)) end", None);
+    }
+
     // #[test]
     // fn test_big_lua() {
     //     assert_inst_match_file("big.lua");
