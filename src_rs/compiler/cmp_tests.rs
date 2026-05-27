@@ -558,6 +558,12 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_load_call() {
+        assert_inst_match("load()()", None);
+        assert_inst_match("(load())()", None);
+    }
+
+    #[test]
     fn test_do_local() {
         assert_inst_match("do local a = {} end", None);
     }

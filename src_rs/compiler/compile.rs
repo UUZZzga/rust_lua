@@ -1173,6 +1173,9 @@ fn parse_statement(fs: &mut FuncState) {
         | Token::Hash
         | Token::Tilde => {
             let ei = parse_expr(fs);
+            if ei.exp.kind == ExpKind::Call {
+                fs.set_c(ei.exp.info2, 1);
+            }
             let _r = fs.expr_to_reg(&ei.exp);
             fs.free_reg();
             if check(fs, &Token::Semi) { fs.ls_mut().next(); }
