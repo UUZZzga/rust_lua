@@ -546,6 +546,7 @@ mod compiler_compare_tests {
     fn test_table_field_assign3() {
         assert_inst_match("A.aa = nil", None);
         assert_inst_match("_ENV.aa = nil", None);
+        assert_inst_match("local aa = 1; _ENV.aa = aa", None);
     }
 
     #[test]
