@@ -144,7 +144,23 @@ impl LuaState {
         if self.stack.is_empty() {
             self.stack.push(TValue::Nil(NilKind::Strict));
         }
-        VmExecutor::execute(proto, 0, std::mem::take(&mut self.stack), self.gc.clone())
+        let fsize = proto.max_stack_size as usize;
+        self.code = proto.code.clone();
+        self.constants = proto.constants.clone();
+        self.upval_descs = proto.upvalues.clone();
+        self.protos = proto.protos.clone();
+        self.base = 0;
+        self.pc = 0;
+        self.num_params = proto.num_params;
+        self.is_vararg = proto.is_vararg();
+        self.closure_upvals = Vec::new();
+        self.tbc_list = None;
+        self.open_upval = None;
+
+        while self.stack.len() < fsize {
+            self.stack.push(TValue::Nil(NilKind::Strict));
+        }
+        VmExecutor::execute_loop(self)
     }
 
     /// 从 Proto 构建执行上下文（原 VmState::new）
@@ -661,53 +677,96 @@ impl LuaState {
         let func_val = self.stack[func_idx].clone();
         match func_val {
             TValue::LClosure(closure) => {
-                let args_start = func_idx + 1;
-                let args_end = total;
-                let nargs_actual = args_end.saturating_sub(args_start);
+                let nargs_actual = total.saturating_sub(func_idx + 1);
+                let fsize = closure.proto.max_stack_size as usize;
+                let nfixparams = closure.proto.num_params as usize;
 
-                // 对应 C 的 luaD_precall → 函数帧布局:
-                // stack[0] = 函数入口 nil (ci->func)
-                // stack[1..1+nargs] = 参数 (ci->u.l.base = ci->func + 1)
-                let mut exec_stack: Vec<TValue> = Vec::with_capacity(1 + nargs_actual + MIN_STACK);
-                exec_stack.push(TValue::Nil(NilKind::Strict));
-                exec_stack.extend_from_slice(&self.stack[args_start..args_end]);
+                let saved_code = std::mem::take(&mut self.code);
+                let saved_constants = std::mem::take(&mut self.constants);
+                let saved_upval_descs = std::mem::take(&mut self.upval_descs);
+                let saved_protos = std::mem::take(&mut self.protos);
+                let saved_base = self.base;
+                let saved_num_params = self.num_params;
+                let saved_is_vararg = self.is_vararg;
+                let saved_closure_upvals = std::mem::take(&mut self.closure_upvals);
+                let saved_tbc_list = self.tbc_list.take();
+                let saved_open_upval = self.open_upval.take();
 
+                self.code = closure.proto.code.clone();
+                self.constants = closure.proto.constants.clone();
+                self.upval_descs = closure.proto.upvalues.clone();
+                self.protos = closure.proto.protos.clone();
+                self.base = func_idx + 1;
+                self.pc = 0;
+                self.num_params = closure.proto.num_params;
+                self.is_vararg = closure.proto.is_vararg();
                 let upval_val = UpVal::Closed {
                     value: Box::new(TValue::Table(self.globals.clone())),
                 };
-                let closure_upvals = vec![upval_val];
+                self.closure_upvals = vec![upval_val];
+                self.tbc_list = None;
+                self.open_upval = None;
 
-                let mut exec_state = LuaState::from_proto(
-                    &closure.proto,
-                    1,
-                    exec_stack,
-                    self.gc.clone(),
-                );
-                exec_state.closure_upvals = closure_upvals;
+                let frame_end = func_idx + 1 + fsize;
+                while self.stack.len() < frame_end {
+                    self.stack.push(TValue::Nil(NilKind::Strict));
+                }
+                for i in nargs_actual..nfixparams {
+                    self.stack[func_idx + 1 + i] = TValue::Nil(NilKind::Strict);
+                }
 
-                match VmExecutor::execute_with_state(&mut exec_state) {
-                    Ok(VmResult::Return(_n)) => {
-                        self.stack.truncate(func_idx);
-                        let actual_n = if nresults == MULT_RET {
-                            1
+                let result = VmExecutor::execute_loop(self);
+
+                self.code = saved_code;
+                self.constants = saved_constants;
+                self.upval_descs = saved_upval_descs;
+                self.protos = saved_protos;
+                self.base = saved_base;
+                self.pc = 0;
+                self.num_params = saved_num_params;
+                self.is_vararg = saved_is_vararg;
+                self.closure_upvals = saved_closure_upvals;
+                self.tbc_list = saved_tbc_list;
+                self.open_upval = saved_open_upval;
+
+                match result {
+                    Ok(VmResult::Return(nret)) => {
+                        let expected = if nresults == MULT_RET {
+                            nret
                         } else if nresults <= 0 {
                             0
                         } else {
-                            (1).min(nresults as usize)
+                            (nret).min(nresults as usize)
                         };
-                        for _ in 0..actual_n {
-                            self.push_nil();
+
+                        // Move results from callee's register area (func_idx + 1 + ...)
+                        // down to func_idx (replacing the function)
+                        let mut tmp_results = Vec::new();
+                        for i in 0..nret {
+                            if func_idx + 1 + i < self.stack.len() {
+                                tmp_results.push(std::mem::take(&mut self.stack[func_idx + 1 + i]));
+                            } else {
+                                tmp_results.push(TValue::Nil(NilKind::Strict));
+                            }
                         }
-                        return 0;
+                        self.stack.truncate(func_idx);
+                        for i in 0..expected {
+                            if i < tmp_results.len() {
+                                self.stack.push(std::mem::take(&mut tmp_results[i]));
+                            } else {
+                                self.stack.push(TValue::Nil(NilKind::Strict));
+                            }
+                        }
+                        0
                     }
                     Ok(_) => {
                         self.stack.truncate(func_idx);
-                        return 0;
+                        0
                     }
                     Err(e) => {
                         self.stack.truncate(func_idx);
                         self.push_string(&format!("{}", e));
-                        return ERR_RUN;
+                        ERR_RUN
                     }
                 }
             }
@@ -824,12 +883,12 @@ mod tests {
         // case 1: base=0, empty stack → main function scenario
         let state = LuaState::from_proto(&proto, 0, vec![], gc.clone());
         assert_eq!(state.base, 0);
-        assert_eq!(state.stack.len(), 0, "base=0 allows empty stack (function entry IS register 0)");
+        assert_eq!(state.stack.len(), 10, "base=0 with max_stack_size=10 must allocate 10 register slots");
 
         // case 2: base=1, empty stack → called function scenario
         let state = LuaState::from_proto(&proto, 1, vec![], gc.clone());
         assert_eq!(state.base, 1);
-        assert!(state.stack.len() >= 1, "base>0 must have stack[base-1] = stack[0] as function entry");
+        assert_eq!(state.stack.len(), 11, "base=1 with max_stack_size=10 must allocate 1+10=11 slots");
         assert!(matches!(state.stack[0], TValue::Nil(NilKind::Strict)));
 
         // case 3: base=1, stack with args → called function
@@ -838,7 +897,7 @@ mod tests {
             TValue::Integer(42),
         ], gc.clone());
         assert_eq!(state.base, 1);
-        assert_eq!(state.stack.len(), 2);
+        assert_eq!(state.stack.len(), 11, "base=1 with max_stack_size=10 must allocate 1+10=11 slots");
         assert!(matches!(state.stack[0], TValue::Nil(NilKind::Strict)));
         assert_eq!(state.stack[1], TValue::Integer(42));
     }
