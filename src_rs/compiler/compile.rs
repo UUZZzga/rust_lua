@@ -3187,8 +3187,13 @@ fn parse_local(fs: &mut FuncState) {
                         }
                     }
                     _ => {
-                        fs.set_freereg(target);
-                        let _ = fs.expr_to_reg(&ei.exp);
+                        let r = ei.exp.info as i32;
+                        if matches!(ei.exp.kind, ExpKind::Call) && r == target {
+                            fs.freereg = target + 1;
+                        } else {
+                            fs.set_freereg(target);
+                            let _ = fs.expr_to_reg(&ei.exp);
+                        }
                         last_exp = Some(ei.exp.clone());
                     }
                 }
