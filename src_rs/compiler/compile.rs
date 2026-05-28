@@ -1328,13 +1328,12 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         if let Some(k_val) = exp_to_k(fs, val) {
                             fs.code_abc_k(OpCode::SETTABUP, 0, adjusted_key, k_val, true);
                         } else {
-                        let saved_freereg = fs.freereg;
-                        let val_reg = fs.expr_to_reg(val);
-                        fs.code_abc(OpCode::SETTABUP, 0, adjusted_key, val_reg);
-                        if fs.freereg > saved_freereg {
-                            fs.free_reg();
+                            let val_reg = fs.expr_to_reg(val);
+                            fs.code_abc(OpCode::SETTABUP, 0, adjusted_key, val_reg);
+                            if val_reg >= fs.nvarstack() {
+                                fs.free_reg();
+                            }
                         }
-                    }
                         if v.allocated_reg {
                             fs.free_reg();
                         }
@@ -1343,13 +1342,12 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         if let Some(k_val) = exp_to_k(fs, val) {
                             fs.code_abc_k(set_op, table_reg, table_key, k_val, true);
                         } else {
-                        let saved_freereg = fs.freereg;
-                        let val_reg = fs.expr_to_reg(val);
-                        fs.code_abc_k(set_op, table_reg, table_key, val_reg, false);
-                        if fs.freereg > saved_freereg {
-                            fs.free_reg();
+                            let val_reg = fs.expr_to_reg(val);
+                            fs.code_abc_k(set_op, table_reg, table_key, val_reg, false);
+                            if val_reg >= fs.nvarstack() {
+                                fs.free_reg();
+                            }
                         }
-                    }
                         if v.key_allocated_reg {
                             fs.free_reg();
                         }
@@ -1364,7 +1362,9 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     } else {
                         let val_reg = fs.expr_to_reg(val);
                         fs.code_abc(OpCode::SETTABUP, 0, k_name, val_reg);
-                        fs.free_reg();
+                        if val_reg >= fs.nvarstack() {
+                            fs.free_reg();
+                        }
                     }
                 } else if let Some(idx) = v.local_idx {
                     if i == exps.len() - 1 {
