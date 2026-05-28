@@ -518,6 +518,7 @@ mod compiler_compare_tests {
     #[test]
     fn test_function_upvalue() {
         assert_inst_match("local a; local function f(x) x={a=1}; x={x=1}; x={G=1} end", None);
+        assert_inst_match("local a; local function f(x) local b=a .. '' end", None);
     }
 
     #[test]
