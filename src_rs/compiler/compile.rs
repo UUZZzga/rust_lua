@@ -782,6 +782,16 @@ impl FuncState {
         r
     }
 
+    fn cond_to_reg(&mut self, e: &ExpDesc) -> i32 {
+        if matches!(e.kind, ExpKind::Void | ExpKind::Nil) {
+            let r = self.alloc_reg();
+            self.code_abc(OpCode::LOADFALSE, r, 0, 0);
+            r
+        } else {
+            self.expr_to_reg(e)
+        }
+    }
+
     fn resolve_jumps(&mut self, e: &ExpDesc, r: i32) {
         if e.kind != ExpKind::VJMP && (e.t != NO_JUMP || e.f != NO_JUMP) {
             let need_f = self.need_value(e.f);
@@ -1290,7 +1300,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
             let ei = parse_expr(fs);
             let has_comma = check(fs, &Token::Comma);
             if has_comma {
-                let r = fs.expr_to_reg(&ei.exp);
+                 let r = fs.expr_to_reg(&ei.exp);
                 exps.push(ExpDesc::new(ExpKind::NonReloc, r as i64));
                 fs.ls_mut().next();
             } else {
@@ -2897,7 +2907,7 @@ fn parse_if(fs: &mut FuncState) {
     let mut if_jmp = NO_JUMP;
 
     if !is_const_true {
-        let cond_reg = fs.expr_to_reg(&ei.exp);
+        let cond_reg = fs.cond_to_reg(&ei.exp);
         fs.code_abc(OpCode::TEST, cond_reg, 0, 0);
         if_jmp = fs.jump();
         fs.free_reg();
@@ -2919,7 +2929,7 @@ fn parse_if(fs: &mut FuncState) {
         let ei2 = parse_expr(fs);
         let is_const_true2 = matches!(ei2.exp.kind, ExpKind::Boolean) && ei2.exp.info != 0;
         if !is_const_true2 {
-            let cr2 = fs.expr_to_reg(&ei2.exp);
+            let cr2 = fs.cond_to_reg(&ei2.exp);
             fs.code_abc(OpCode::TEST, cr2, 0, 0);
             if_jmp = fs.jump();
             fs.free_reg();
@@ -2959,13 +2969,13 @@ fn parse_while(fs: &mut FuncState) {
     fs.ls_mut().next();
     let loop_start = fs.pc;
     let ei = parse_expr(fs);
-    let r = fs.expr_to_reg(&ei.exp);
+    let r = fs.cond_to_reg(&ei.exp);
     fs.code_abc(OpCode::TEST, r, 0, 0);
     let jmp = fs.jump();
     fs.free_reg();
     expect(fs, &Token::Do);
     parse_block(fs);
-    fs.code_asbx(OpCode::JMP, 0, loop_start - fs.pc - 1);
+    fs.code_sj(OpCode::JMP, loop_start - fs.pc - 1, 0);
     fs.fix_jump(jmp, fs.pc, false);
     expect(fs, &Token::End);
 }
@@ -2995,7 +3005,7 @@ fn parse_repeat(fs: &mut FuncState) {
         || matches!(ei.exp.kind, ExpKind::Int | ExpKind::Float | ExpKind::Str);
 
     if !is_const_true {
-        let r = fs.expr_to_reg(&ei.exp);
+        let r = fs.cond_to_reg(&ei.exp);
         fs.code_abc_k(OpCode::EQ, r, 0, 0, true);
         let jmp = fs.jump();
         fs.free_reg();

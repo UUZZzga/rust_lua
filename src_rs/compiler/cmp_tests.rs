@@ -483,6 +483,12 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_while() {
+        assert_inst_match("while false do end", None);
+        assert_inst_match("while nil do end;", None);
+    }
+
+    #[test]
     fn test_for() {
         assert_inst_match("for i = 1, 5 do return 1 end", None);
     }
