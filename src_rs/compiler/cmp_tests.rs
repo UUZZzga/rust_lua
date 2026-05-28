@@ -529,6 +529,8 @@ mod compiler_compare_tests {
     #[test]
     fn test_function_close() {
         assert_inst_match("do local a = {} local function f () local b = a end f() end", None);
+        assert_inst_match("do local a, b = {}, {} local function f () local c = a end f() end", None);
+        assert_inst_match("do local a, b = {}, {} local function f () local c = b end f() end", None);
     }
 
     #[test]
@@ -600,6 +602,7 @@ mod compiler_compare_tests {
         assert_inst_match("a = b('', 1 + 2)", None);
         assert_inst_match("a = b('', 1 << 2)", None);
         assert_inst_match("local function a() end\na()", None);
+        assert_inst_match("x = {f(1), f(2), f(3);};", None);
     }
 
     #[test]

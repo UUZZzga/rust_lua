@@ -3443,10 +3443,15 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
     let mut need_array: i32 = 0;
     let mut tostore: i32 = 0;
     let mut need_hash: i32 = 0;
+    let mut last_list_exp: Option<ExpDesc> = None;
 
     if !check(fs, &Token::RBrace) {
         loop {
             if check(fs, &Token::LBracket) {
+                if let Some(prev) = last_list_exp.take() {
+                    fs.expr_to_reg(&prev);
+                    tostore += 1;
+                }
                 if tostore > 0 {
                     fs.code_abc(OpCode::SETLIST, table_r, tostore, need_array);
                     need_array += tostore;
@@ -3468,6 +3473,10 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                 let name = s.clone();
                 let next_is_eq = fs.ls_mut().lookahead_next().0 == Token::Eq;
                 if next_is_eq {
+                    if let Some(prev) = last_list_exp.take() {
+                        fs.expr_to_reg(&prev);
+                        tostore += 1;
+                    }
                     if tostore > 0 {
                         fs.code_abc(OpCode::SETLIST, table_r, tostore, need_array);
                         need_array += tostore;
@@ -3483,14 +3492,18 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                     fs.free_reg();
                     need_hash += 1;
                 } else {
-                    tostore += 1;
-                    let ev = parse_expr(fs);
-                    fs.expr_to_reg(&ev.exp);
+                    if let Some(prev) = last_list_exp.take() {
+                        fs.expr_to_reg(&prev);
+                        tostore += 1;
+                    }
+                    last_list_exp = Some(parse_expr(fs).exp);
                 }
             } else {
-                tostore += 1;
-                let ev = parse_expr(fs);
-                fs.expr_to_reg(&ev.exp);
+                if let Some(prev) = last_list_exp.take() {
+                    fs.expr_to_reg(&prev);
+                    tostore += 1;
+                }
+                last_list_exp = Some(parse_expr(fs).exp);
             }
 
             if !check(fs, &Token::Comma) && !check(fs, &Token::Semi) { break; }
@@ -3499,7 +3512,26 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
         }
     }
 
-    if tostore > 0 {
+    if let Some(last) = last_list_exp {
+        if last.kind == ExpKind::Call {
+            fs.set_c(last.info2, 0);
+            fs.code_abc(OpCode::SETLIST, table_r, 0, need_array);
+            need_array += tostore;
+            fs.set_freereg(table_r + 1);
+        } else if last.kind == ExpKind::Vararg {
+            fs.code_abc(OpCode::SETLIST, table_r, 0, need_array);
+            need_array += tostore;
+            fs.set_freereg(table_r + 1);
+        } else {
+            fs.expr_to_reg(&last);
+            tostore += 1;
+            if tostore > 0 {
+                fs.code_abc(OpCode::SETLIST, table_r, tostore, need_array);
+                need_array += tostore;
+                fs.set_freereg(table_r + 1);
+            }
+        }
+    } else if tostore > 0 {
         fs.code_abc(OpCode::SETLIST, table_r, tostore, need_array);
         need_array += tostore;
         fs.set_freereg(table_r + 1);
