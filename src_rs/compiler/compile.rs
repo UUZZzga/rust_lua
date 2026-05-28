@@ -2071,47 +2071,63 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             let ec = e.exp.clone();
             fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_SHL + 1);
-            if matches!(ec.kind, ExpKind::Int) && fits_sc(&ec) {
-                let r2 = fs.expr_to_reg(&e2.exp);
-                let dest = fs.alloc_reg();
-                let sc = int_to_sc(ec.info);
-                fs.code_abc(OpCode::SHLI, dest, r2, sc);
-                fs.code_abc(OpCode::MMBINI, r2, sc, 16);
-                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
-            } else if matches!(e2.exp.kind, ExpKind::Int) && fits_sc(&e2.exp) && fits_sc_neg(e2.exp.info) {
-                let r = fs.expr_to_reg(&ec);
-                let v = e2.exp.info;
-                let dest = fs.alloc_reg();
-                let sc_neg = int_to_sc(-v);
-                let sc_pos = int_to_sc(v);
-                fs.code_abc(OpCode::SHRI, dest, r, sc_neg);
-                fs.code_abc(OpCode::MMBINI, r, sc_pos, 16);
-                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
-            } else {
-                let r = fs.expr_to_reg(&ec);
-                let r2 = fs.expr_to_reg(&e2.exp);
-                fs.code_abc(OpCode::SHL, r, r, r2);
-                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+            match (&ec.kind, &e2.exp.kind) {
+                (ExpKind::Int, ExpKind::Int) => {
+                    let val = ec.info.wrapping_shl(e2.exp.info as u32);
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
+                }
+                _ => {
+                    if matches!(ec.kind, ExpKind::Int) && fits_sc(&ec) {
+                        let r2 = fs.expr_to_reg(&e2.exp);
+                        let dest = fs.alloc_reg();
+                        let sc = int_to_sc(ec.info);
+                        fs.code_abc(OpCode::SHLI, dest, r2, sc);
+                        fs.code_abc(OpCode::MMBINI, r2, sc, 16);
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
+                    } else if matches!(e2.exp.kind, ExpKind::Int) && fits_sc(&e2.exp) && fits_sc_neg(e2.exp.info) {
+                        let r = fs.expr_to_reg(&ec);
+                        let v = e2.exp.info;
+                        let dest = fs.alloc_reg();
+                        let sc_neg = int_to_sc(-v);
+                        let sc_pos = int_to_sc(v);
+                        fs.code_abc(OpCode::SHRI, dest, r, sc_neg);
+                        fs.code_abc(OpCode::MMBINI, r, sc_pos, 16);
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
+                    } else {
+                        let r = fs.expr_to_reg(&ec);
+                        let r2 = fs.expr_to_reg(&e2.exp);
+                        fs.code_abc(OpCode::SHL, r, r, r2);
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                    }
+                }
             }
             matched = true;
         }
         
         if limit <= PREC_SHL && check(fs, &Token::GtGt) {
             let ec = e.exp.clone();
-            let r = fs.expr_to_reg(&ec);
             fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_SHL + 1);
-            if matches!(e2.exp.kind, ExpKind::Int) && fits_sc(&e2.exp) {
-                let v = e2.exp.info;
-                let dest = fs.alloc_reg();
-                let sc = int_to_sc(v);
-                fs.code_abc(OpCode::SHRI, dest, r, sc);
-                fs.code_abc(OpCode::MMBINI, r, sc, 17);
-                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
-            } else {
-                let r2 = fs.expr_to_reg(&e2.exp);
-                fs.code_abc(OpCode::SHR, r, r, r2);
-                e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+            match (&ec.kind, &e2.exp.kind) {
+                (ExpKind::Int, ExpKind::Int) => {
+                    let val = ec.info.wrapping_shr(e2.exp.info as u32);
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
+                }
+                _ => {
+                    let r = fs.expr_to_reg(&ec);
+                    if matches!(e2.exp.kind, ExpKind::Int) && fits_sc(&e2.exp) {
+                        let v = e2.exp.info;
+                        let dest = fs.alloc_reg();
+                        let sc = int_to_sc(v);
+                        fs.code_abc(OpCode::SHRI, dest, r, sc);
+                        fs.code_abc(OpCode::MMBINI, r, sc, 17);
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
+                    } else {
+                        let r2 = fs.expr_to_reg(&e2.exp);
+                        fs.code_abc(OpCode::SHR, r, r, r2);
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
+                    }
+                }
             }
             matched = true;
         }
