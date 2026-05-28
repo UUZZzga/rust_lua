@@ -1573,9 +1573,11 @@ fn parse_func_args(fs: &mut FuncState, freg: i32) -> i32 {
     
     if check(fs, &Token::LBrace) {
         let (tr, _n) = parse_constructor(fs);
-        fs.code_abc(OpCode::MOVE, freg + 1, tr, 0);
+        if freg + 1 != tr {
+            fs.code_abc(OpCode::MOVE, freg + 1, tr, 0);
+            fs.free_reg();
+        }
         let pc = fs.code_abc(OpCode::CALL, freg, 2, 2);
-        fs.free_reg();
         return pc;
     }
     

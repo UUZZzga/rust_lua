@@ -251,28 +251,13 @@ mod compiler_compare_tests {
     // ===== 函数调用测试 (C++ Lua 允许函数调用作为表达式语句) =====
 
     #[test]
-    fn test_call_no_args() {
+    fn test_call() {
         assert_inst_match("f()", None);
-    }
-
-    #[test]
-    fn test_call_one_arg() {
         assert_inst_match("f(42)", None);
-    }
-
-    #[test]
-    fn test_call_two_args() {
         assert_inst_match("f(1, 2)", None);
-    }
-
-    #[test]
-    fn test_call_string_arg() {
         assert_inst_match("f('hello')", None);
-    }
-
-    #[test]
-    fn test_call_literal_string() {
         assert_inst_match("print'hello'", None);
+        assert_inst_match("x = {f{}}", None);
     }
 
     // ===== 注释测试 =====
