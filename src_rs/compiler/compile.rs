@@ -2118,7 +2118,12 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         
         if limit <= PREC_CONCAT && check(fs, &Token::DotDot) {
             let ec = e.exp.clone();
-            let r = fs.expr_to_reg(&ec);
+            let mut r = fs.expr_to_reg(&ec);
+            if r < fs.nvarstack() {
+                let new_r = fs.alloc_reg();
+                fs.code_abc(OpCode::MOVE, new_r, r, 0);
+                r = new_r;
+            }
             fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_CONCAT);
             let _r2 = fs.expr_to_reg(&e2.exp);

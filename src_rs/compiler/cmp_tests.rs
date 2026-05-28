@@ -299,6 +299,11 @@ mod compiler_compare_tests {
         assert_inst_match("return 1 + 2", None);
     }
 
+    #[test]
+    fn test_expr_concat() {
+        assert_inst_match("local a; local b  = a .. '123'", None);
+    }
+
     // ===== return 语句测试 =====
 
     #[test]
