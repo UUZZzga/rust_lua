@@ -2990,9 +2990,17 @@ fn parse_repeat(fs: &mut FuncState) {
     parse_block(fs);
     expect(fs, &Token::Until);
     let ei = parse_expr(fs);
-    let r = fs.expr_to_reg(&ei.exp);
-    fs.code_abc(OpCode::EQ, r, 0, 0);
-    fs.fix_jump(fs.pc - 1, loop_start, true);
+
+    let is_const_true = matches!(ei.exp.kind, ExpKind::Boolean if ei.exp.info != 0)
+        || matches!(ei.exp.kind, ExpKind::Int | ExpKind::Float | ExpKind::Str);
+
+    if !is_const_true {
+        let r = fs.expr_to_reg(&ei.exp);
+        fs.code_abc_k(OpCode::EQ, r, 0, 0, true);
+        let jmp = fs.jump();
+        fs.free_reg();
+        fs.fix_jump(jmp, loop_start, true);
+    }
 }
 
 /// ANTLR4: `'for' NAME '=' expr ',' expr (',' expr)? 'do' block 'end' ;` (numeric for) 以及 `'for' namelist 'in' explist 'do' block 'end' ;` (generic for)
