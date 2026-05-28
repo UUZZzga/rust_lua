@@ -536,13 +536,10 @@ mod compiler_compare_tests {
     }
 
     #[test]
-    fn test_table_field_assign1() {
+    fn test_table_field_assign() {
         assert_inst_match("local A = {};A.a = nil;A.b = false;A.c = 123", None);
-    }
-
-    #[test]
-    fn test_table_field_assign2() {
         assert_inst_match("local A = {};A['a'] = nil;A['b'] = false;A['c'] = 123", None);
+        assert_inst_match("local a = {1}; a[#a + 1] = 2", None);
     }
 
     #[test]
