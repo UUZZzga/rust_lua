@@ -2958,10 +2958,17 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 let ei = parse_expr(fs);
                 expect(fs, &Token::RBracket);
                 let base_reg = fs.expr_to_reg(&e);
-                let key_reg = fs.expr_to_reg(&ei.exp);
-                fs.code_abc(OpCode::GETTABLE, base_reg, base_reg, key_reg);
-                if key_reg == fs.freereg - 1 {
-                    fs.free_reg();
+                if ei.exp.kind == ExpKind::Int
+                    && ei.exp.info >= 0
+                    && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
+                {
+                    fs.code_abc(OpCode::GETI, base_reg, base_reg, ei.exp.info as i32);
+                } else {
+                    let key_reg = fs.expr_to_reg(&ei.exp);
+                    fs.code_abc(OpCode::GETTABLE, base_reg, base_reg, key_reg);
+                    if key_reg == fs.freereg - 1 {
+                        fs.free_reg();
+                    }
                 }
                 e = ExpDesc::new(ExpKind::Relocable, base_reg as i64);
             }

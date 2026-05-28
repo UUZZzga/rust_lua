@@ -539,13 +539,10 @@ mod compiler_compare_tests {
     }
 
     #[test]
-    fn test_assert_var1() {
+    fn test_assert_var() {
         assert_inst_match("local x = ((b or a)+1 == 2 and (10 or a)+1 == 11); assert(x);", None);
-    }
-
-    #[test]
-    fn test_assert_var2() {
         assert_inst_match("local x\nx = (((2<3) or 1) == true and (2<3 and 4) == 4); assert(x);", None);
+        assert_inst_match("assert(x[1] == 3 and x[2] == 5 and x[3] == 10 and x[4] == 9 and x[12] == 1)", None);
     }
 
     #[test]
