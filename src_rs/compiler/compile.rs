@@ -1448,8 +1448,15 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
         }
         _ => {
             if e.info2 >= 0 {
-                fs.set_a(e.info2, dest);
-                fs.free_reg();
+                if e.kind == ExpKind::Call {
+                    if e.info as i32 != dest {
+                        fs.code_abc(OpCode::MOVE, dest, e.info as i32, 0);
+                        fs.free_reg();
+                    }
+                } else {
+                    fs.set_a(e.info2, dest);
+                    fs.free_reg();
+                }
             } else {
                 let saved_freereg = fs.freereg;
                 let val_reg = fs.expr_to_reg(e);

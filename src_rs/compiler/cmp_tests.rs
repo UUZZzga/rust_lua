@@ -572,6 +572,7 @@ mod compiler_compare_tests {
     #[test]
     fn test_call_function() {
         assert_inst_match("local f, a, b; local c = f(a, b)", None);
+        assert_inst_match("local a = b(); a = b()", None);
     }
 
     // #[test]
