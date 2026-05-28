@@ -1255,9 +1255,6 @@ fn parse_assign_or_call(fs: &mut FuncState) {
             }
             Token::LBracket => {
                 fs.ls_mut().next();
-                let saved_freereg_before = fs.freereg;
-                let ei = parse_expr(fs);
-                expect(fs, &Token::RBracket);
                 let base_reg = if let Some(r) = first.reg { r } else {
                     let r = fs.alloc_reg();
                     if let Some(key) = first.key {
@@ -1265,6 +1262,9 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     }
                     r
                 };
+                let saved_freereg_before = fs.freereg;
+                let ei = parse_expr(fs);
+                expect(fs, &Token::RBracket);
                 let (kr, key_is_const) = if ei.exp.kind == ExpKind::Str {
                     (ei.exp.info as i32, true)
                 } else {
@@ -1669,9 +1669,6 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                 }
                 Token::LBracket => {
                     fs.ls_mut().next();
-                    let saved_freereg_before = fs.freereg;
-                    let ei = parse_expr(fs);
-                    expect(fs, &Token::RBracket);
                     let base_reg = if let Some(r) = result.reg {
                         r
                     } else {
@@ -1680,6 +1677,9 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         fs.code_abc(OpCode::GETTABUP, r, 0, gk);
                         r
                     };
+                    let saved_freereg_before = fs.freereg;
+                    let ei = parse_expr(fs);
+                    expect(fs, &Token::RBracket);
                     let (kr, key_is_const) = if ei.exp.kind == ExpKind::Str {
                         (ei.exp.info as i32, true)
                     } else {
