@@ -195,239 +195,20 @@ impl VmExecutor {
                 OpCode::GEI => Self::op_gei(state, inst),
                 OpCode::TEST => Self::op_test(state, inst),
                 OpCode::TESTSET => Self::op_testset(state, inst),
-                OpCode::CALL => {
-                    let a = Self::ra(state, inst);
-                    let b = opcodes::getarg_b(inst) as usize;
-                    let c = opcodes::getarg_c(inst) as i32;
-                    let func_val = Self::read_stack(state, a).clone();
-                    match func_val {
-                        TValue::LClosure(closure) => {
-                            let nargs = if b == 0 { state.stack.len().saturating_sub(a + 1) } else { b.saturating_sub(1) };
-                            let nresults = if c == 1 { 0 } else { (c - 1) as usize };
-                            let fsize = closure.proto.max_stack_size as usize;
-                            let nfixparams = closure.proto.num_params as usize;
-
-                            call_stack.push(CallFrame {
-                                code: std::mem::take(&mut state.code),
-                                constants: std::mem::take(&mut state.constants),
-                                upval_descs: std::mem::take(&mut state.upval_descs),
-                                protos: std::mem::take(&mut state.protos),
-                                base: state.base,
-                                return_pc: state.pc + 1,
-                                return_base: a,
-                                num_results: nresults,
-                                num_params: state.num_params,
-                                is_vararg: state.is_vararg,
-                                closure_upvals: std::mem::take(&mut state.closure_upvals),
-                                tbc_list: state.tbc_list.take(),
-                                open_upval: state.open_upval.take(),
-                            });
-
-                            state.code = closure.proto.code.clone();
-                            state.constants = closure.proto.constants.clone();
-                            state.upval_descs = closure.proto.upvalues.clone();
-                            state.protos = closure.proto.protos.clone();
-                            state.base = a + 1;
-                            state.pc = 0;
-                            state.num_params = closure.proto.num_params;
-                            state.is_vararg = closure.proto.is_vararg();
-                            state.closure_upvals = Vec::new();
-                            state.tbc_list = None;
-                            state.open_upval = None;
-
-                            let frame_end = a + 1 + fsize;
-                            while state.stack.len() < frame_end {
-                                state.stack.push(TValue::Nil(NilKind::Strict));
-                            }
-                            for i in nargs..nfixparams {
-                                state.stack[a + 1 + i] = TValue::Nil(NilKind::Strict);
-                            }
-                            Ok(())
-                        }
-                        TValue::LightUserData(tag) => {
-                            let tag_val = tag as usize;
-                            if tag_val == 1 {
-                                let mut s = String::new();
-                                let nargs = if b == 0 { state.stack.len().saturating_sub(a + 1) } else { b.saturating_sub(1) };
-                                for i in 0..nargs {
-                                    if i > 0 { s.push('\t'); }
-                                    let val = Self::read_stack(state, a + 1 + i);
-                                    match val {
-                                        TValue::Nil(_) => s.push_str("nil"),
-                                        TValue::Boolean(bv) => s.push_str(if *bv { "true" } else { "false" }),
-                                        TValue::Integer(n) => s.push_str(&n.to_string()),
-                                        TValue::Float(n) => {
-                                            if n.is_nan() { s.push_str("nan"); }
-                                            else if n.is_infinite() { s.push_str(if *n > 0.0 { "inf" } else { "-inf" }); }
-                                            else { s.push_str(&n.to_string()); }
-                                        }
-                                        TValue::Str(lst) => s.push_str(&lst.as_str()),
-                                        TValue::Table(_) => s.push_str("table: 0x0"),
-                                        TValue::LClosure(_) | TValue::LCFn(_) | TValue::CClosure(_) => s.push_str("function: 0x0"),
-                                        _ => s.push_str(&format!("{:?}", val)),
-                                    }
-                                }
-                                println!("{}", s);
-                            }
-                            state.pc += 1;
-                            Ok(())
-                        }
-                        _ => {
-                            state.pc += 1;
-                            Ok(())
-                        }
-                    }
-                }
-                OpCode::TAILCALL => {
-                    let a = Self::ra(state, inst);
-                    let func_val = Self::read_stack(state, a).clone();
-                    match func_val {
-                        TValue::LClosure(closure) => {
-                            let nargs_total = state.stack.len().saturating_sub(a);
-                            let fsize = closure.proto.max_stack_size as usize;
-                            let nfixparams = closure.proto.num_params as usize;
-                            let nargs = nargs_total.saturating_sub(1);
-                            let func_slot = state.base.saturating_sub(1);
-
-                            for i in 0..nargs_total {
-                                let src = a + i;
-                                let dst = func_slot + i;
-                                if dst < state.stack.len() {
-                                    state.stack[dst] = std::mem::take(&mut state.stack[src]);
-                                }
-                            }
-
-                            state.code = closure.proto.code.clone();
-                            state.constants = closure.proto.constants.clone();
-                            state.upval_descs = closure.proto.upvalues.clone();
-                            state.protos = closure.proto.protos.clone();
-                            state.pc = 0;
-                            state.num_params = closure.proto.num_params;
-                            state.is_vararg = closure.proto.is_vararg();
-                            state.closure_upvals = Vec::new();
-                            state.tbc_list = None;
-                            state.open_upval = None;
-
-                            let frame_end = func_slot + 1 + fsize;
-                            while state.stack.len() < frame_end {
-                                state.stack.push(TValue::Nil(NilKind::Strict));
-                            }
-                            for i in nargs..nfixparams {
-                                state.stack[func_slot + 1 + i] = TValue::Nil(NilKind::Strict);
-                            }
-                            Ok(())
-                        }
-                        _ => Ok(())
-                    }
-                }
-                OpCode::RETURN => {
-                    let a = Self::ra(state, inst);
-                    let n = opcodes::getarg_b(inst) as i32 - 1;
-                    let nresults = if n < 0 { state.stack.len().saturating_sub(a) } else { n as usize };
-
-                    if let Some(frame) = call_stack.pop() {
-                        let return_base = frame.return_base;
-                        let num_results = frame.num_results;
-                        let mut results = Vec::new();
-                        for i in 0..nresults {
-                            if a + i < state.stack.len() {
-                                results.push(std::mem::take(&mut state.stack[a + i]));
-                            } else {
-                                results.push(TValue::Nil(NilKind::Strict));
-                            }
-                        }
-                        state.code = frame.code;
-                        state.constants = frame.constants;
-                        state.upval_descs = frame.upval_descs;
-                        state.protos = frame.protos;
-                        state.base = frame.base;
-                        state.pc = frame.return_pc;
-                        state.num_params = frame.num_params;
-                        state.is_vararg = frame.is_vararg;
-                        state.closure_upvals = frame.closure_upvals;
-                        state.tbc_list = frame.tbc_list;
-                        state.open_upval = frame.open_upval;
-
-                        while state.stack.len() <= return_base + num_results.saturating_sub(1) {
-                            state.stack.push(TValue::Nil(NilKind::Strict));
-                        }
-                        let copy_count = results.len().min(num_results);
-                        for i in 0..copy_count {
-                            state.stack[return_base + i] = std::mem::take(&mut results[i]);
-                        }
-                        for i in copy_count..num_results {
-                            state.stack[return_base + i] = TValue::Nil(NilKind::Strict);
-                        }
-                        state.stack.truncate(return_base + num_results);
-                        Ok(())
-                    } else {
-                        return Ok(VmResult::Return(nresults));
-                    }
-                }
-                OpCode::RETURN0 => {
-                    if let Some(frame) = call_stack.pop() {
-                        let return_base = frame.return_base;
-                        let num_results = frame.num_results;
-                        state.code = frame.code;
-                        state.constants = frame.constants;
-                        state.upval_descs = frame.upval_descs;
-                        state.protos = frame.protos;
-                        state.base = frame.base;
-                        state.pc = frame.return_pc;
-                        state.num_params = frame.num_params;
-                        state.is_vararg = frame.is_vararg;
-                        state.closure_upvals = frame.closure_upvals;
-                        state.tbc_list = frame.tbc_list;
-                        state.open_upval = frame.open_upval;
-                        while state.stack.len() <= return_base + num_results.saturating_sub(1) {
-                            state.stack.push(TValue::Nil(NilKind::Strict));
-                        }
-                        for i in 0..num_results {
-                            state.stack[return_base + i] = TValue::Nil(NilKind::Strict);
-                        }
-                        state.stack.truncate(return_base + num_results);
-                        Ok(())
-                    } else {
-                        return Ok(VmResult::Return(0));
-                    }
-                }
-                OpCode::RETURN1 => {
-                    let a = Self::ra(state, inst);
-                    let val = if a < state.stack.len() {
-                        std::mem::take(&mut state.stack[a])
-                    } else {
-                        TValue::Nil(NilKind::Strict)
-                    };
-                    if let Some(frame) = call_stack.pop() {
-                        let return_base = frame.return_base;
-                        let num_results = frame.num_results;
-                        state.code = frame.code;
-                        state.constants = frame.constants;
-                        state.upval_descs = frame.upval_descs;
-                        state.protos = frame.protos;
-                        state.base = frame.base;
-                        state.pc = frame.return_pc;
-                        state.num_params = frame.num_params;
-                        state.is_vararg = frame.is_vararg;
-                        state.closure_upvals = frame.closure_upvals;
-                        state.tbc_list = frame.tbc_list;
-                        state.open_upval = frame.open_upval;
-                        while state.stack.len() <= return_base + num_results.saturating_sub(1) {
-                            state.stack.push(TValue::Nil(NilKind::Strict));
-                        }
-                        state.stack[return_base] = val;
-                        for i in 1..num_results {
-                            state.stack[return_base + i] = TValue::Nil(NilKind::Strict);
-                        }
-                        state.stack.truncate(return_base + num_results);
-                        Ok(())
-                    } else {
-                        if state.base > 0 && state.base - 1 < state.stack.len() {
-                            state.stack[state.base - 1] = val;
-                        }
-                        return Ok(VmResult::Return(1));
-                    }
-                }
+                OpCode::CALL => Self::op_call(state, inst, &mut call_stack),
+                OpCode::TAILCALL => Self::op_tailcall(state, inst),
+                OpCode::RETURN => match Self::op_return(state, inst, &mut call_stack)? {
+                    Some(vr) => return Ok(vr),
+                    None => Ok(()),
+                },
+                OpCode::RETURN0 => match Self::op_return0(state, inst, &mut call_stack)? {
+                    Some(vr) => return Ok(vr),
+                    None => Ok(()),
+                },
+                OpCode::RETURN1 => match Self::op_return1(state, inst, &mut call_stack)? {
+                    Some(vr) => return Ok(vr),
+                    None => Ok(()),
+                },
                 OpCode::FORLOOP => Self::op_forloop(state, inst),
                 OpCode::FORPREP => Self::op_forprep(state, inst),
                 OpCode::TFORPREP => Self::op_tforprep(state, inst),
@@ -1556,24 +1337,63 @@ impl VmExecutor {
 
     // ---- 调用 / 返回 ----
 
-    fn op_call(state: &mut LuaState, inst: Instruction) -> Result<Option<VmResult>, VmError> {
+    fn op_call(state: &mut LuaState, inst: Instruction, call_stack: &mut Vec<CallFrame>) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
-        let b = opcodes::getarg_b(inst);
-        let c = opcodes::getarg_c(inst);
+        let b = opcodes::getarg_b(inst) as usize;
+        let c = opcodes::getarg_c(inst) as i32;
         let func_val = Self::read_stack(state, a).clone();
         match func_val {
-            TValue::LClosure(closure) => Ok(Some(VmResult::Call {
-                proto: closure.proto,
-                base: a + 1,
-                num_results: c - 1,
-            })),
+            TValue::LClosure(closure) => {
+                let nargs = if b == 0 { state.stack.len().saturating_sub(a + 1) } else { b.saturating_sub(1) };
+                let nresults = if c == 1 { 0 } else { (c - 1) as usize };
+                let fsize = closure.proto.max_stack_size as usize;
+                let nfixparams = closure.proto.num_params as usize;
+
+                call_stack.push(CallFrame {
+                    code: std::mem::take(&mut state.code),
+                    constants: std::mem::take(&mut state.constants),
+                    upval_descs: std::mem::take(&mut state.upval_descs),
+                    protos: std::mem::take(&mut state.protos),
+                    base: state.base,
+                    return_pc: state.pc + 1,
+                    return_base: a,
+                    num_results: nresults,
+                    num_params: state.num_params,
+                    is_vararg: state.is_vararg,
+                    closure_upvals: std::mem::take(&mut state.closure_upvals),
+                    tbc_list: state.tbc_list.take(),
+                    open_upval: state.open_upval.take(),
+                });
+
+                state.code = closure.proto.code.clone();
+                state.constants = closure.proto.constants.clone();
+                state.upval_descs = closure.proto.upvalues.clone();
+                state.protos = closure.proto.protos.clone();
+                state.base = a + 1;
+                state.pc = 0;
+                state.num_params = closure.proto.num_params;
+                state.is_vararg = closure.proto.is_vararg();
+                state.closure_upvals = Vec::new();
+                state.tbc_list = None;
+                state.open_upval = None;
+
+                let frame_end = a + 1 + fsize;
+                while state.stack.len() < frame_end {
+                    state.stack.push(TValue::Nil(NilKind::Strict));
+                }
+                for i in nargs..nfixparams {
+                    state.stack[a + 1 + i] = TValue::Nil(NilKind::Strict);
+                }
+                Ok(())
+            }
             TValue::LightUserData(tag) => {
                 let tag_val = tag as usize;
                 if tag_val == 1 {
                     let mut s = String::new();
-                    for i in (a + 1)..(a + b as usize) {
-                        if i > a + 1 { s.push('\t'); }
-                        let val = Self::read_stack(state, i);
+                    let nargs = if b == 0 { state.stack.len().saturating_sub(a + 1) } else { b.saturating_sub(1) };
+                    for i in 0..nargs {
+                        if i > 0 { s.push('\t'); }
+                        let val = Self::read_stack(state, a + 1 + i);
                         match val {
                             TValue::Nil(_) => s.push_str("nil"),
                             TValue::Boolean(bv) => s.push_str(if *bv { "true" } else { "false" }),
@@ -1591,46 +1411,168 @@ impl VmExecutor {
                     }
                     println!("{}", s);
                 }
-                let nresults = if c >= 1 { c - 1 } else { 0 };
-                for i in 0..nresults {
-                    Self::write_stack(state, a + i as usize, TValue::Nil(NilKind::Strict));
-                }
                 state.pc += 1;
-                Ok(None)
+                Ok(())
             }
             _ => {
                 state.pc += 1;
-                Ok(Some(VmResult::Done))
+                Ok(())
             }
         }
     }
 
-    fn op_tailcall(state: &mut LuaState, inst: Instruction) -> Result<VmResult, VmError> {
+    fn op_tailcall(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let func_val = Self::read_stack(state, a).clone();
         match func_val {
-            TValue::LClosure(closure) => Ok(VmResult::TailCall {
-                proto: closure.proto,
-                base: a + 1,
-            }),
-            _ => Ok(VmResult::Return(0)),
+            TValue::LClosure(closure) => {
+                let nargs_total = state.stack.len().saturating_sub(a);
+                let fsize = closure.proto.max_stack_size as usize;
+                let nfixparams = closure.proto.num_params as usize;
+                let nargs = nargs_total.saturating_sub(1);
+                let func_slot = state.base.saturating_sub(1);
+
+                for i in 0..nargs_total {
+                    let src = a + i;
+                    let dst = func_slot + i;
+                    if dst < state.stack.len() {
+                        state.stack[dst] = std::mem::take(&mut state.stack[src]);
+                    }
+                }
+
+                state.code = closure.proto.code.clone();
+                state.constants = closure.proto.constants.clone();
+                state.upval_descs = closure.proto.upvalues.clone();
+                state.protos = closure.proto.protos.clone();
+                state.pc = 0;
+                state.num_params = closure.proto.num_params;
+                state.is_vararg = closure.proto.is_vararg();
+                state.closure_upvals = Vec::new();
+                state.tbc_list = None;
+                state.open_upval = None;
+
+                let frame_end = func_slot + 1 + fsize;
+                while state.stack.len() < frame_end {
+                    state.stack.push(TValue::Nil(NilKind::Strict));
+                }
+                for i in nargs..nfixparams {
+                    state.stack[func_slot + 1 + i] = TValue::Nil(NilKind::Strict);
+                }
+                Ok(())
+            }
+            _ => Ok(())
         }
     }
 
-    fn op_return(state: &mut LuaState, inst: Instruction) -> Result<VmResult, VmError> {
+    fn op_return(state: &mut LuaState, inst: Instruction, call_stack: &mut Vec<CallFrame>) -> Result<Option<VmResult>, VmError> {
         let a = Self::ra(state, inst);
         let n = opcodes::getarg_b(inst) as i32 - 1;
-        let nresults = if n < 0 { state.stack.len().saturating_sub(a) as i32 } else { n };
-        Ok(VmResult::Return(nresults as usize))
+        let nresults = if n < 0 { state.stack.len().saturating_sub(a) } else { n as usize };
+
+        if let Some(frame) = call_stack.pop() {
+            let return_base = frame.return_base;
+            let num_results = frame.num_results;
+            let mut results = Vec::new();
+            for i in 0..nresults {
+                if a + i < state.stack.len() {
+                    results.push(std::mem::take(&mut state.stack[a + i]));
+                } else {
+                    results.push(TValue::Nil(NilKind::Strict));
+                }
+            }
+            state.code = frame.code;
+            state.constants = frame.constants;
+            state.upval_descs = frame.upval_descs;
+            state.protos = frame.protos;
+            state.base = frame.base;
+            state.pc = frame.return_pc;
+            state.num_params = frame.num_params;
+            state.is_vararg = frame.is_vararg;
+            state.closure_upvals = frame.closure_upvals;
+            state.tbc_list = frame.tbc_list;
+            state.open_upval = frame.open_upval;
+
+            while state.stack.len() <= return_base + num_results.saturating_sub(1) {
+                state.stack.push(TValue::Nil(NilKind::Strict));
+            }
+            let copy_count = results.len().min(num_results);
+            for i in 0..copy_count {
+                state.stack[return_base + i] = std::mem::take(&mut results[i]);
+            }
+            for i in copy_count..num_results {
+                state.stack[return_base + i] = TValue::Nil(NilKind::Strict);
+            }
+            state.stack.truncate(return_base + num_results);
+            Ok(None)
+        } else {
+            Ok(Some(VmResult::Return(nresults)))
+        }
     }
 
-    fn op_return1(state: &mut LuaState, inst: Instruction) -> Result<VmResult, VmError> {
-        let a = Self::ra(state, inst);
-        let val = Self::read_stack(state, a).clone();
-        if state.base > 0 {
-            Self::write_stack(state, state.base - 1, val);
+    fn op_return0(state: &mut LuaState, _inst: Instruction, call_stack: &mut Vec<CallFrame>) -> Result<Option<VmResult>, VmError> {
+        if let Some(frame) = call_stack.pop() {
+            let return_base = frame.return_base;
+            let num_results = frame.num_results;
+            state.code = frame.code;
+            state.constants = frame.constants;
+            state.upval_descs = frame.upval_descs;
+            state.protos = frame.protos;
+            state.base = frame.base;
+            state.pc = frame.return_pc;
+            state.num_params = frame.num_params;
+            state.is_vararg = frame.is_vararg;
+            state.closure_upvals = frame.closure_upvals;
+            state.tbc_list = frame.tbc_list;
+            state.open_upval = frame.open_upval;
+            while state.stack.len() <= return_base + num_results.saturating_sub(1) {
+                state.stack.push(TValue::Nil(NilKind::Strict));
+            }
+            for i in 0..num_results {
+                state.stack[return_base + i] = TValue::Nil(NilKind::Strict);
+            }
+            state.stack.truncate(return_base + num_results);
+            Ok(None)
+        } else {
+            Ok(Some(VmResult::Return(0)))
         }
-        Ok(VmResult::Return(1))
+    }
+
+    fn op_return1(state: &mut LuaState, inst: Instruction, call_stack: &mut Vec<CallFrame>) -> Result<Option<VmResult>, VmError> {
+        let a = Self::ra(state, inst);
+        let val = if a < state.stack.len() {
+            std::mem::take(&mut state.stack[a])
+        } else {
+            TValue::Nil(NilKind::Strict)
+        };
+        if let Some(frame) = call_stack.pop() {
+            let return_base = frame.return_base;
+            let num_results = frame.num_results;
+            state.code = frame.code;
+            state.constants = frame.constants;
+            state.upval_descs = frame.upval_descs;
+            state.protos = frame.protos;
+            state.base = frame.base;
+            state.pc = frame.return_pc;
+            state.num_params = frame.num_params;
+            state.is_vararg = frame.is_vararg;
+            state.closure_upvals = frame.closure_upvals;
+            state.tbc_list = frame.tbc_list;
+            state.open_upval = frame.open_upval;
+            while state.stack.len() <= return_base + num_results.saturating_sub(1) {
+                state.stack.push(TValue::Nil(NilKind::Strict));
+            }
+            state.stack[return_base] = val;
+            for i in 1..num_results {
+                state.stack[return_base + i] = TValue::Nil(NilKind::Strict);
+            }
+            state.stack.truncate(return_base + num_results);
+            Ok(None)
+        } else {
+            if state.base > 0 && state.base - 1 < state.stack.len() {
+                state.stack[state.base - 1] = val;
+            }
+            Ok(Some(VmResult::Return(1)))
+        }
     }
 
     // ---- 循环 ----
