@@ -1212,9 +1212,11 @@ fn parse_assign_or_call(fs: &mut FuncState) {
     
     let mut has_call = false;
     let mut extra_free = false;
+    let mut freg: i32 = 0;
     if check(fs, &Token::LParen) || check(fs, &Token::Colon) || check(fs, &Token::LBrace) || matches!(&fs.ls().token, Token::String(..)) {
         has_call = true;
-        let (freg, ef) = load_func(fs, &first);
+        let (fr, ef, _) = load_func(fs, &first);
+        freg = fr;
         extra_free = ef;
         let _start_pc = fs.pc;
         parse_func_args(fs, freg);
@@ -1284,7 +1286,9 @@ fn parse_assign_or_call(fs: &mut FuncState) {
     }
     
     if has_call && !check(fs, &Token::Eq) && !check(fs, &Token::Comma) {
-        fs.free_reg();
+        if freg >= fs.nvarstack() {
+            fs.free_reg();
+        }
         if first.allocated_reg && extra_free {
             fs.free_reg();
         }
@@ -1382,7 +1386,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
         return;
     }
     
-    let (_r, _) = load_func(fs, &first);
+    let (_r, _, _) = load_func(fs, &first);
     fs.free_reg();
 }
 
@@ -1488,38 +1492,30 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
 
 /// ANTLR4: functioncall 帮助 — 将函数值加载到寄存器以便调用
 /// 返回 (函数寄存器, 是否需要额外释放基寄存器)
-fn load_func(fs: &mut FuncState, p: &PrefixResult) -> (i32, bool) {
+fn load_func(fs: &mut FuncState, p: &PrefixResult) -> (i32, bool, bool) {
     if let (Some(table_reg), Some(table_key)) = (p.table_reg, p.table_key) {
         if p.table_key_is_const {
             fs.code_abc(OpCode::GETFIELD, table_reg, table_reg, table_key);
-            (table_reg, false)
+            (table_reg, false, false)
         } else {
             let r = fs.alloc_reg();
             fs.code_abc(OpCode::GETTABLE, r, table_reg, table_key);
-            (r, true)
+            (r, true, true)
         }
     } else if let Some(reg) = p.local_idx {
-        if reg == fs.freereg - 1 {
-            (reg, false)
-        } else {
-            let r = fs.alloc_reg();
-            fs.code_abc(OpCode::MOVE, r, reg, 0);
-            (r, false)
-        }
+        let r = fs.alloc_reg();
+        fs.code_abc(OpCode::MOVE, r, reg, 0);
+        (r, false, true)
     } else if let Some(key) = p.key {
         let r = fs.alloc_reg();
         fs.code_abc(OpCode::GETTABUP, r, 0, key);
-        (r, false)
+        (r, false, true)
     } else if let Some(reg) = p.reg {
-        if reg == fs.freereg - 1 {
-            (reg, false)
-        } else {
-            let r = fs.alloc_reg();
-            fs.code_abc(OpCode::MOVE, r, reg, 0);
-            (r, false)
-        }
+        let r = fs.alloc_reg();
+        fs.code_abc(OpCode::MOVE, r, reg, 0);
+        (r, false, true)
     } else {
-        (fs.alloc_reg(), false)
+        (fs.alloc_reg(), false, true)
     }
 }
 

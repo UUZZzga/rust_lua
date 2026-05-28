@@ -593,6 +593,7 @@ mod compiler_compare_tests {
         assert_inst_match("a = b('', 1 | 2)", None);
         assert_inst_match("a = b('', 1 + 2)", None);
         assert_inst_match("a = b('', 1 << 2)", None);
+        assert_inst_match("local function a() end\na()", None);
     }
 
     #[test]
