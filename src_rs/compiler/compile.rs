@@ -1893,7 +1893,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                                 let r2 = fs.expr_to_reg(&e2.exp);
                                 fs.code_abc_k(OpCode::EQ, r, r2, 0, is_eq_op);
                                 let jmp_pc = fs.jump();
-                                fs.free_reg();
+                                if !(matches!(e2.exp.kind, ExpKind::NonReloc) && (e2.exp.info as i32) < fs.nvarstack()) {
+                                    fs.free_reg();
+                                }
                                 if r_alloc || matches!(ec.kind, ExpKind::Relocable) { fs.free_reg(); }
                                 e = ExprItem { exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64) };
                             }
@@ -3057,8 +3059,12 @@ fn parse_for(fs: &mut FuncState) {
         fs.add_local_kind("(for state)", fs.pc, RDKCONST);
         fs.add_local_kind("(for state)", fs.pc, RDKTOCLOSE);
         let ncontrol = vars.len() as i32;
+        let var_locals_start = fs.locals.len();
         for var_name in &vars {
             fs.add_local_kind(var_name, fs.pc, RDKCONST);
+        }
+        for lv in &mut fs.locals[var_locals_start..] {
+            lv.active = false;
         }
         
         fs.set_freereg(base);
@@ -3069,6 +3075,9 @@ fn parse_for(fs: &mut FuncState) {
             nexps += 1;
             if !check(fs, &Token::Comma) { break; }
             fs.ls_mut().next();
+        }
+        for lv in &mut fs.locals[var_locals_start..] {
+            lv.active = true;
         }
         
         let mut last_is_call = false;
