@@ -2832,7 +2832,14 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
     loop {
         match &fs.ls().token {
             Token::LParen | Token::LBrace | Token::String(..) | Token::Colon => {
-                let freg = fs.expr_to_reg(&e);
+                let mut freg = fs.expr_to_reg(&e);
+                if matches!(e.kind, ExpKind::NonReloc) && freg < fs.nvarstack() {
+                    let new_freg = fs.alloc_reg();
+                    if new_freg != freg {
+                        fs.code_abc(OpCode::MOVE, new_freg, freg, 0);
+                    }
+                    freg = new_freg;
+                }
                 let call_pc = parse_func_args(fs, freg);
                 e = if call_pc >= 0 {
                     ExpDesc { kind: ExpKind::Call, info: freg as i64, info2: call_pc, t: NO_JUMP, f: NO_JUMP }
@@ -3251,15 +3258,16 @@ fn parse_local(fs: &mut FuncState) {
 
             fs.set_freereg(saved_freereg + n_reg as i32);
 
-            for _ in n_vals..n_reg {
-                fs.code_abc(OpCode::LOADNIL, saved_freereg + n_vals as i32, 0, 0);
-                n_vals += 1;
+            if n_vals < n_reg {
+                let remaining = n_reg - n_vals;
+                fs.code_abc(OpCode::LOADNIL, saved_freereg + n_vals as i32, remaining as i32 - 1, 0);
             }
         } else {
-            for i in 0..nvars {
-                let reg = fs.add_local_kind(&names[i], fs.pc, kinds[i]);
-                fs.code_abc(OpCode::LOADNIL, reg, 0, 0);
+            let start_reg = fs.add_local_kind(&names[0], fs.pc, kinds[0]);
+            for i in 1..nvars {
+                fs.add_local_kind(&names[i], fs.pc, kinds[i]);
             }
+            fs.code_abc(OpCode::LOADNIL, start_reg, nvars as i32 - 1, 0);
         }
 
         for (i, &kind) in kinds.iter().enumerate() {

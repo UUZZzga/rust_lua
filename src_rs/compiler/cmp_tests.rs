@@ -571,6 +571,11 @@ mod compiler_compare_tests {
         assert_inst_match("do local a = {} end", None);
     }
 
+    #[test]
+    fn test_call_function() {
+        assert_inst_match("local f, a, b; local c = f(a, b)", None);
+    }
+
     // #[test]
     // fn test_big_lua() {
     //     assert_inst_match_file("big.lua");
