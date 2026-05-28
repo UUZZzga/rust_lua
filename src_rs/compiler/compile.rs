@@ -3064,7 +3064,11 @@ fn parse_do(fs: &mut FuncState) {
     fs.ls_mut().next();
     let saved_nlocals = fs.locals.len();
     let saved_freereg = fs.freereg;
+    let saved_needclose = fs.needclose;
     parse_block(fs);
+    if fs.needclose && !saved_needclose {
+        fs.code_abc(OpCode::CLOSE, saved_freereg, 0, 0);
+    }
     for local in &mut fs.locals[saved_nlocals..] {
         local.active = false;
     }

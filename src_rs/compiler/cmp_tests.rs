@@ -527,6 +527,11 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_function_close() {
+        assert_inst_match("do local a = {} local function f () local b = a end f() end", None);
+    }
+
+    #[test]
     fn test_assert_expr1() {
         assert_inst_match("assert(-3+4*5//2^3^2//9+4%10/3 == (-3)+(((4*5)//(2^(3^2)))//9)+((4%10)/3))", None);
     }
