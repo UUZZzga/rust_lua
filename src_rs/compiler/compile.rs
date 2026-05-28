@@ -1310,7 +1310,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         fs.pc -= 1;
                         let env_k = getarg_c(gettabup_inst);
                         fs.proto.constants.remove(env_k as usize);
-                        let adjusted_key = table_key - 1;
+                        let adjusted_key = if (env_k as i32) < table_key { table_key - 1 } else { table_key };
                         if let Some(k_val) = exp_to_k(fs, val) {
                             fs.code_abc_k(OpCode::SETTABUP, 0, adjusted_key, k_val, true);
                         } else {

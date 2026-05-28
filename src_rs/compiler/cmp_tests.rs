@@ -544,6 +544,7 @@ mod compiler_compare_tests {
         assert_inst_match("A.aa = nil", None);
         assert_inst_match("_ENV.aa = nil", None);
         assert_inst_match("local aa = 1; _ENV.aa = aa", None);
+        assert_inst_match("local aa = 1; _ENV.aa = aa; _ENV.aa = nil", None);
     }
 
     #[test]
