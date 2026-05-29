@@ -526,6 +526,8 @@ mod compiler_compare_tests {
     #[test]
     fn test_assert_expr1() {
         assert_inst_match("assert(-3+4*5//2^3^2//9+4%10/3 == (-3)+(((4*5)//(2^(3^2)))//9)+((4%10)/3))", None);
+        assert_inst_match("assert(a == n*(n+1)/2 and i==3)", None);
+        assert_inst_match("assert(t[1] and t[n] and not t[0] and not t[n+1])", None);
     }
 
     #[test]
