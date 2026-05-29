@@ -1547,8 +1547,11 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
                         fs.free_reg();
                     }
                 } else {
+                    let prev_dest = e.info as i32;
                     fs.set_a(e.info2, dest);
-                    fs.free_reg();
+                    if prev_dest != dest && (prev_dest >= fs.nvarstack() || prev_dest == fs.freereg - 1) {
+                        fs.free_reg();
+                    }
                 }
             } else {
                 let saved_freereg = fs.freereg;

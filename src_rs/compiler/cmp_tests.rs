@@ -482,7 +482,8 @@ mod compiler_compare_tests {
     #[test]
     fn test_for() {
         assert_inst_match("for i = 1, 5 do return 1 end", None);
-        assert_inst_match("for i = 1 , 1000 do break; end", None);
+        assert_inst_match("for i = 1, 1000 do break; end", None);
+        assert_inst_match("local a = nil; for i = i, 1, -1 do a = a + 1 end", None);
     }
 
     #[test]
