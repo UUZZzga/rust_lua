@@ -3253,31 +3253,35 @@ fn parse_for(fs: &mut FuncState) {
         let saved_nlocals = fs.locals.len();
         let base = fs.freereg;
         let saved_freereg = fs.freereg;
+
+        fs.set_freereg(base);
         let ei = parse_expr(fs);
         let init_r = fs.expr_to_reg(&ei.exp);
-        expect(fs, &Token::Comma);
-        let ei2 = parse_expr(fs);
-        let limit_r = fs.expr_to_reg(&ei2.exp);
-        
-        let step_r = if check(fs, &Token::Comma) {
-            fs.ls_mut().next();
-            let ei3 = parse_expr(fs);
-            fs.expr_to_reg(&ei3.exp)
-        } else {
-            let r = fs.alloc_reg();
-            fs.code_asbx(OpCode::LOADI, r, 1);
-            r
-        };
-        
         if init_r != base {
             fs.code_abc(OpCode::MOVE, base, init_r, 0);
         }
+        expect(fs, &Token::Comma);
+
+        fs.set_freereg(base + 1);
+        let ei2 = parse_expr(fs);
+        let limit_r = fs.expr_to_reg(&ei2.exp);
         if limit_r != base + 1 {
             fs.code_abc(OpCode::MOVE, base + 1, limit_r, 0);
         }
-        if step_r != base + 2 {
-            fs.code_abc(OpCode::MOVE, base + 2, step_r, 0);
+
+        if check(fs, &Token::Comma) {
+            fs.ls_mut().next();
+            fs.set_freereg(base + 2);
+            let ei3 = parse_expr(fs);
+            let step_r = fs.expr_to_reg(&ei3.exp);
+            if step_r != base + 2 {
+                fs.code_abc(OpCode::MOVE, base + 2, step_r, 0);
+            }
+        } else {
+            fs.set_freereg(base + 2);
+            fs.code_asbx(OpCode::LOADI, base + 2, 1);
         }
+
         fs.set_freereg(base + 3);
         
         expect(fs, &Token::Do);
