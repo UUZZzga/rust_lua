@@ -279,6 +279,7 @@ pub struct FuncState {
     pub errors: Vec<String>,
     pub needclose: bool,
     pub parent_locals: Vec<(String, i32)>,
+    pub break_list: i32,
     ls: *mut LexState,
     #[cfg(debug_assertions)]
     reg_alloc_stack: Vec<RegAllocEntry>,
@@ -320,6 +321,7 @@ impl FuncState {
             errors: Vec::new(),
             needclose: false,
             parent_locals: Vec::new(),
+            break_list: NO_JUMP,
             ls: ls as *mut LexState,
             #[cfg(debug_assertions)]
             reg_alloc_stack: Vec::new(),
@@ -506,6 +508,22 @@ impl FuncState {
         }
         let offset = list2 - list - 1;
         setarg(&mut self.proto.code[list as usize], offset + OFFSET_sJ, POS_SJ, SIZE_sJ);
+    }
+
+    fn new_break(&mut self) -> i32 {
+        let pc = self.jump();
+        self.code_abc(OpCode::CLOSE, 0, 1, 0);
+        pc
+    }
+
+    fn patch_breaks(&mut self, target: i32) {
+        let mut cur = self.break_list;
+        while cur != NO_JUMP {
+            let next = self.get_jump(cur);
+            self.fix_jump(cur, target, false);
+            cur = next;
+        }
+        self.break_list = NO_JUMP;
     }
 
     /// 查找或添加常量到常量表: 去重后返回常量索引
@@ -1181,7 +1199,27 @@ fn parse_statement(fs: &mut FuncState) {
         Token::Local => { parse_local(fs); None },
         Token::Return => { parse_return(fs); Some("return") },
         Token::Semi => { fs.ls_mut().next(); None },
-        Token::Break => { fs.ls_mut().next(); None },
+        Token::Break => {
+            let jmp_pc = fs.new_break();
+            let mut break_list = fs.break_list;
+            if break_list == NO_JUMP {
+                break_list = jmp_pc;
+            } else {
+                let mut cur = break_list;
+                loop {
+                    let next_pc = fs.get_jump(cur);
+                    if next_pc == NO_JUMP {
+                        break;
+                    }
+                    cur = next_pc;
+                }
+                let offset = jmp_pc - cur - 1;
+                setarg(&mut fs.proto.code[cur as usize], offset + OFFSET_sJ, POS_SJ, SIZE_sJ);
+            }
+            fs.break_list = break_list;
+            fs.ls_mut().next();
+            None
+        },
         Token::Name(name) => {
             let line = fs.ls().lastline;
             let is_global = name == "global" && {
@@ -3091,9 +3129,18 @@ fn parse_while(fs: &mut FuncState) {
     let jmp = fs.jump();
     fs.free_reg();
     expect(fs, &Token::Do);
+
+    let saved_breaklist = fs.break_list;
+    fs.break_list = NO_JUMP;
+
     parse_block(fs);
+
     fs.code_sj(OpCode::JMP, loop_start - fs.pc - 1, 0);
     fs.fix_jump(jmp, fs.pc, false);
+
+    fs.patch_breaks(fs.pc);
+    fs.break_list = saved_breaklist;
+
     expect(fs, &Token::End);
 }
 
@@ -3118,6 +3165,10 @@ fn parse_do(fs: &mut FuncState) {
 fn parse_repeat(fs: &mut FuncState) {
     fs.ls_mut().next();
     let loop_start = fs.pc;
+
+    let saved_breaklist = fs.break_list;
+    fs.break_list = NO_JUMP;
+
     parse_block(fs);
     expect(fs, &Token::Until);
     let ei = parse_expr(fs);
@@ -3130,7 +3181,14 @@ fn parse_repeat(fs: &mut FuncState) {
         fs.code_abc_k(OpCode::EQ, r, 0, 0, true);
         let jmp = fs.jump();
         fs.free_reg();
+
+        fs.patch_breaks(fs.pc);
+        fs.break_list = saved_breaklist;
+
         fs.fix_jump(jmp, loop_start, true);
+    } else {
+        fs.patch_breaks(fs.pc);
+        fs.break_list = saved_breaklist;
     }
 }
 
@@ -3178,11 +3236,19 @@ fn parse_for(fs: &mut FuncState) {
         fs.add_local_kind_reg(&name, fs.pc, RDKCONST, base + 2);
         
         let prep = fs.code_abx(OpCode::FORPREP, base, 0);
+
+        let saved_breaklist = fs.break_list;
+        fs.break_list = NO_JUMP;
+
         parse_block(fs);
+
         fs.fix_jump(prep, fs.pc, false);
         let loop_pc = fs.code_abx(OpCode::FORLOOP, base, 0);
         fs.fix_jump(loop_pc, prep + 1, true);
-        
+
+        fs.patch_breaks(fs.pc);
+        fs.break_list = saved_breaklist;
+
         for local in &mut fs.locals[saved_nlocals..] {
             local.active = false;
         }
@@ -3248,7 +3314,10 @@ fn parse_for(fs: &mut FuncState) {
         }
         
         expect(fs, &Token::Do);
-        
+
+        let saved_breaklist = fs.break_list;
+        fs.break_list = NO_JUMP;
+
         let prep = fs.code_abx(OpCode::TFORPREP, base, 0);
         parse_block(fs);
         
@@ -3256,7 +3325,10 @@ fn parse_for(fs: &mut FuncState) {
         fs.code_abc(OpCode::TFORCALL, base, 0, ncontrol);
         let loop_pc = fs.code_abx(OpCode::TFORLOOP, base, 0);
         fs.fix_jump(loop_pc, prep + 1, true);
-        
+
+        fs.patch_breaks(fs.pc);
+        fs.break_list = saved_breaklist;
+
         expect(fs, &Token::End);
         
         fs.code_abc(OpCode::CLOSE, base, 0, 0);
