@@ -618,8 +618,7 @@ impl FuncState {
 
     #[cfg(debug_assertions)]
     fn assert_regs_clean(&self, context: &str) {
-        let expected = self.nvarstack();
-        self.assert_regs_at(expected, context);
+        self.assert_regs_at(self.nvarstack(), context);
     }
 
     #[cfg(not(debug_assertions))]
@@ -2234,7 +2233,6 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             match (&ec.kind, &e2.exp.kind) {
                 (ExpKind::Int, ExpKind::Int) => {
                     let val = ec.info & e2.exp.info;
-                    eprintln!("DEBUG BAND fold: {} & {} = {}", ec.info, e2.exp.info, val);
                     e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
                 }
                 _ => {
@@ -3346,13 +3344,16 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 let field = get_name(fs);
                 let k = fs.string_k(&field);
                 let base_reg = fs.expr_to_reg(&e);
-                fs.code_abc(OpCode::GETFIELD, base_reg, base_reg, k);
-                e = ExpDesc::new(ExpKind::Relocable, base_reg as i64);
+                let result_reg = if matches!(e.kind, ExpKind::NonReloc) && (e.info as i32) < fs.nvarstack() {
+                    fs.alloc_reg()
+                } else {
+                    base_reg
+                };
+                fs.code_abc(OpCode::GETFIELD, result_reg, base_reg, k);
+                e = ExpDesc::new(ExpKind::Relocable, result_reg as i64);
             }
             Token::LBracket => {
                 fs.ls_mut().next();
-                let ei = parse_expr(fs);
-                expect(fs, &Token::RBracket);
                 let base_reg = if matches!(e.kind, ExpKind::Relocable | ExpKind::NonReloc) && !e.has_jumps() {
                     if e.info2 >= 0 {
                         fs.set_a(e.info2, e.info as i32);
@@ -3361,11 +3362,20 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 } else {
                     fs.expr_to_reg(&e)
                 };
+                let base_is_nonreloc_local = matches!(e.kind, ExpKind::NonReloc) && (e.info as i32) < fs.nvarstack();
+                let ei = parse_expr(fs);
+                expect(fs, &Token::RBracket);
+                let result_reg;
                 if ei.exp.kind == ExpKind::Int
                     && ei.exp.info >= 0
                     && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
                 {
-                    fs.code_abc(OpCode::GETI, base_reg, base_reg, ei.exp.info as i32);
+                    result_reg = if base_is_nonreloc_local {
+                        fs.alloc_reg()
+                    } else {
+                        base_reg
+                    };
+                    fs.code_abc(OpCode::GETI, result_reg, base_reg, ei.exp.info as i32);
                 } else {
                     let key_reg = if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei.exp.has_jumps() {
                         if ei.exp.info2 >= 0 {
@@ -3375,12 +3385,17 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     } else {
                         fs.expr_to_reg(&ei.exp)
                     };
-                    fs.code_abc(OpCode::GETTABLE, base_reg, base_reg, key_reg);
-                    if key_reg == fs.freereg - 1 {
+                    result_reg = if base_is_nonreloc_local {
+                        key_reg
+                    } else {
+                        base_reg
+                    };
+                    fs.code_abc(OpCode::GETTABLE, result_reg, base_reg, key_reg);
+                    if result_reg != key_reg && key_reg == fs.freereg - 1 {
                         fs.free_reg();
                     }
                 }
-                e = ExpDesc::new(ExpKind::Relocable, base_reg as i64);
+                e = ExpDesc::new(ExpKind::Relocable, result_reg as i64);
             }
             _ => break,
         }
