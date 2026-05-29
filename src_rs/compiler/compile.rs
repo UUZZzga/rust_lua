@@ -3062,10 +3062,22 @@ fn parse_if(fs: &mut FuncState) {
     let mut if_jmp = NO_JUMP;
 
     if !is_const_true {
+        let pre_freereg = fs.freereg;
         let cond_reg = fs.cond_to_reg(&ei.exp);
-        fs.code_abc(OpCode::TEST, cond_reg, 0, 0);
+        if matches!(ei.exp.kind, ExpKind::Relocable)
+            && !fs.proto.code.is_empty()
+            && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT
+        {
+            fs.proto.code.pop();
+            fs.pc -= 1;
+            fs.code_abc_k(OpCode::TEST, cond_reg, 0, 0, true);
+        } else {
+            fs.code_abc(OpCode::TEST, cond_reg, 0, 0);
+        }
         if_jmp = fs.jump();
-        fs.free_reg();
+        if fs.freereg > pre_freereg {
+            fs.free_reg();
+        }
     }
 
     expect(fs, &Token::Then);
@@ -3084,10 +3096,22 @@ fn parse_if(fs: &mut FuncState) {
         let ei2 = parse_expr(fs);
         let is_const_true2 = matches!(ei2.exp.kind, ExpKind::Boolean) && ei2.exp.info != 0;
         if !is_const_true2 {
+            let pre_freereg2 = fs.freereg;
             let cr2 = fs.cond_to_reg(&ei2.exp);
-            fs.code_abc(OpCode::TEST, cr2, 0, 0);
+            if matches!(ei2.exp.kind, ExpKind::Relocable)
+                && !fs.proto.code.is_empty()
+                && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT
+            {
+                fs.proto.code.pop();
+                fs.pc -= 1;
+                fs.code_abc_k(OpCode::TEST, cr2, 0, 0, true);
+            } else {
+                fs.code_abc(OpCode::TEST, cr2, 0, 0);
+            }
             if_jmp = fs.jump();
-            fs.free_reg();
+            if fs.freereg > pre_freereg2 {
+                fs.free_reg();
+            }
         } else {
             if_jmp = NO_JUMP;
         }
@@ -3124,10 +3148,22 @@ fn parse_while(fs: &mut FuncState) {
     fs.ls_mut().next();
     let loop_start = fs.pc;
     let ei = parse_expr(fs);
+    let pre_freereg = fs.freereg;
     let r = fs.cond_to_reg(&ei.exp);
-    fs.code_abc(OpCode::TEST, r, 0, 0);
+    if matches!(ei.exp.kind, ExpKind::Relocable)
+        && !fs.proto.code.is_empty()
+        && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT
+    {
+        fs.proto.code.pop();
+        fs.pc -= 1;
+        fs.code_abc_k(OpCode::TEST, r, 0, 0, true);
+    } else {
+        fs.code_abc(OpCode::TEST, r, 0, 0);
+    }
     let jmp = fs.jump();
-    fs.free_reg();
+    if fs.freereg > pre_freereg {
+        fs.free_reg();
+    }
     expect(fs, &Token::Do);
 
     let saved_breaklist = fs.break_list;
@@ -3177,10 +3213,22 @@ fn parse_repeat(fs: &mut FuncState) {
         || matches!(ei.exp.kind, ExpKind::Int | ExpKind::Float | ExpKind::Str);
 
     if !is_const_true {
+        let pre_freereg = fs.freereg;
         let r = fs.cond_to_reg(&ei.exp);
-        fs.code_abc_k(OpCode::EQ, r, 0, 0, true);
+        if matches!(ei.exp.kind, ExpKind::Relocable)
+            && !fs.proto.code.is_empty()
+            && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT
+        {
+            fs.proto.code.pop();
+            fs.pc -= 1;
+            fs.code_abc_k(OpCode::EQ, r, 0, 0, false);
+        } else {
+            fs.code_abc_k(OpCode::EQ, r, 0, 0, true);
+        }
         let jmp = fs.jump();
-        fs.free_reg();
+        if fs.freereg > pre_freereg {
+            fs.free_reg();
+        }
 
         fs.patch_breaks(fs.pc);
         fs.break_list = saved_breaklist;

@@ -476,6 +476,7 @@ mod compiler_compare_tests {
     fn test_while() {
         assert_inst_match("while false do end", None);
         assert_inst_match("while nil do end;", None);
+        assert_inst_match("local a=nil; while not a do end", None);
     }
 
     #[test]
