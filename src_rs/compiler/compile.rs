@@ -139,7 +139,7 @@ const GDKCONST: i32 = 6;
 //
 // field
 //   : '[' expr ']' '=' expr                        // → parse_constructor() SETTABLE
-//   | NAME '=' expr                                // → parse_constructor() SETI
+//   | NAME '=' expr                                // → parse_constructor() SETFIELD
 //   | expr                                         // → parse_constructor() SETI (array)
 //   ;
 //
@@ -4039,7 +4039,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                     let ev = parse_expr(fs);
                     let v_r = fs.exp_to_reg(&ev.exp);
                     let k = fs.string_k(&name);
-                    fs.code_abc(OpCode::SETI, table_r, k, v_r);
+                    fs.code_abc(OpCode::SETFIELD, table_r, k, v_r);
                     fs.free_reg();
                     need_hash += 1;
                 } else {
