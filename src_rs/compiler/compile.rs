@@ -3449,7 +3449,11 @@ fn parse_if(fs: &mut FuncState) {
 
     expect(fs, &Token::Then);
     let block_freereg = fs.freereg;
+    let saved_nlocals = fs.locals.len();
     parse_block(fs);
+    for local in &mut fs.locals[saved_nlocals..] {
+        local.active = false;
+    }
     fs.set_freereg(block_freereg);
     let mut exit_jumps = Vec::new();
 
@@ -3484,7 +3488,11 @@ fn parse_if(fs: &mut FuncState) {
         }
         expect(fs, &Token::Then);
         fs.set_freereg(block_freereg);
+        let saved_nlocals = fs.locals.len();
         parse_block(fs);
+        for local in &mut fs.locals[saved_nlocals..] {
+            local.active = false;
+        }
         fs.set_freereg(block_freereg);
     }
 
@@ -3496,7 +3504,11 @@ fn parse_if(fs: &mut FuncState) {
         }
         fs.ls_mut().next();
         fs.set_freereg(block_freereg);
+        let saved_nlocals = fs.locals.len();
         parse_block(fs);
+        for local in &mut fs.locals[saved_nlocals..] {
+            local.active = false;
+        }
         fs.set_freereg(block_freereg);
     } else {
         if if_jmp != NO_JUMP {

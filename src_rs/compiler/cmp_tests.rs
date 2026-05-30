@@ -514,6 +514,7 @@ mod compiler_compare_tests {
     fn test_function_2() {
         assert_inst_match("function checkload (s, msg) assert(string.find(select(2, load(s)), msg)) end", None);
         assert_inst_match("function f(i) if i < 10 then end end", None);
+        assert_inst_match("function f(i) if i < 10 then local i = 0 end end", None);
     }
 
     #[test]
