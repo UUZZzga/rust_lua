@@ -826,8 +826,18 @@ impl FuncState {
 
     fn exp_to_reg(&mut self, e: &ExpDesc) -> i32 {
         let r = self.expr_to_reg(e);
-        self.resolve_jumps(e, r);
-        r
+        if e.kind == ExpKind::NonReloc
+            && (e.info as i32) < self.nvarstack()
+            && (e.t != NO_JUMP || e.f != NO_JUMP)
+        {
+            let new_r = self.alloc_reg();
+            self.code_abc(OpCode::MOVE, new_r, r, 0);
+            self.resolve_jumps(e, new_r);
+            new_r
+        } else {
+            self.resolve_jumps(e, r);
+            r
+        }
     }
 
     fn cond_to_reg(&mut self, e: &ExpDesc) -> i32 {
