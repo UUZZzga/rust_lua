@@ -4096,7 +4096,7 @@ fn parse_local(fs: &mut FuncState) {
                             fs.freereg = target + 1;
                         } else {
                             fs.set_freereg(target);
-                            let _ = fs.expr_to_reg(&ei.exp);
+                            let _ = fs.exp_to_reg(&ei.exp);
                         }
                         last_exp = Some(ei.exp.clone());
                     }
