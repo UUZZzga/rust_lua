@@ -257,6 +257,7 @@ struct LocalVar {
     kind: i32,
     ctc_kind: Option<ExpKind>,
     ctc_info: Option<i64>,
+    ctc_str: Option<String>,
 }
 
 // ============================================================================
@@ -651,6 +652,7 @@ impl FuncState {
             kind: VDKREG,
             ctc_kind: None,
             ctc_info: None,
+            ctc_str: None,
         });
         reg
     }
@@ -671,6 +673,7 @@ impl FuncState {
             kind,
             ctc_kind: None,
             ctc_info: None,
+            ctc_str: None,
         });
         reg
     }
@@ -685,6 +688,7 @@ impl FuncState {
             kind,
             ctc_kind: None,
             ctc_info: None,
+            ctc_str: None,
         });
     }
 
@@ -698,7 +702,27 @@ impl FuncState {
         None
     }
 
-    fn find_local_ctc(&self, name: &str) -> Option<(ExpKind, i64)> {
+    fn find_local_ctc(&mut self, name: &str) -> Option<(ExpKind, i64)> {
+        let ctc_str = {
+            let mut found = None;
+            for lv in self.locals.iter().rev() {
+                if lv.active && lv.name == name && lv.kind == RDKCTC {
+                    let kind = lv.ctc_kind.clone().unwrap();
+                    if kind == ExpKind::Str {
+                        if let Some(ref s) = lv.ctc_str {
+                            found = Some(s.clone());
+                            break;
+                        }
+                    }
+                    break;
+                }
+            }
+            found
+        };
+        if let Some(s) = ctc_str {
+            let k = self.string_k(&s);
+            return Some((ExpKind::Str, k as i64));
+        }
         for lv in self.locals.iter().rev() {
             if lv.active && lv.name == name && lv.kind == RDKCTC {
                 return Some((lv.ctc_kind.clone().unwrap(), lv.ctc_info.unwrap()));
@@ -4068,6 +4092,7 @@ fn parse_local(fs: &mut FuncState) {
 
             if last_is_ctc {
                 fs.proto.code.pop();
+                fs.pc -= 1;
             }
 
             let last_is_call = last_exp.as_ref().map(|e| matches!(e.kind, ExpKind::Call)).unwrap_or(false);
@@ -4087,6 +4112,13 @@ fn parse_local(fs: &mut FuncState) {
             if last_is_ctc {
                 let pc = fs.pc;
                 let last_e = last_exp.as_ref().unwrap();
+                let (ctc_info, ctc_str) = if last_e.kind == ExpKind::Str {
+                    let s = fs.proto.constants.pop()
+                        .and_then(|tv| if let TValue::Str(s) = tv { Some(s.as_str().to_string()) } else { None });
+                    (0, s)
+                } else {
+                    (last_e.info, None)
+                };
                 fs.locals.push(LocalVar {
                     name: names[nvars - 1].clone(),
                     start_pc: pc,
@@ -4094,7 +4126,8 @@ fn parse_local(fs: &mut FuncState) {
                     reg: 0,
                     kind: RDKCTC,
                     ctc_kind: Some(last_e.kind.clone()),
-                    ctc_info: Some(last_e.info),
+                    ctc_info: Some(ctc_info),
+                    ctc_str,
                 });
             }
 
