@@ -520,6 +520,7 @@ mod compiler_compare_tests {
         assert_inst_match("function f () return 1,2,3; end; local a, b, c; a, b, c = f()", None);
         assert_inst_match("function f () return 1,2,3; end; local a, b, c; a, b, c = (f())", None);
         assert_inst_match("local a, b = 3 and f()", None);
+        assert_inst_match("local function h(a,b,c,d,e) while (a>=b or c or (d and e) or nil) do return 1; end; return 0; end", None);
     }
 
     #[test]

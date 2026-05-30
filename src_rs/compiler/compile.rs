@@ -3731,7 +3731,9 @@ fn parse_while(fs: &mut FuncState) {
     let saved_breaklist = fs.break_list;
     fs.break_list = NO_JUMP;
 
+    let block_freereg = fs.freereg;
     parse_block(fs);
+    fs.set_freereg(block_freereg);
 
     fs.code_sj(OpCode::JMP, loop_start - fs.pc - 1, 0);
     fs.fix_jump(jmp, fs.pc, false);
@@ -3767,7 +3769,9 @@ fn parse_repeat(fs: &mut FuncState) {
     let saved_breaklist = fs.break_list;
     fs.break_list = NO_JUMP;
 
+    let block_freereg = fs.freereg;
     parse_block(fs);
+    fs.set_freereg(block_freereg);
     expect(fs, &Token::Until);
     let ei = parse_expr(fs);
 
@@ -4161,6 +4165,7 @@ fn parse_return(fs: &mut FuncState) {
     fs.ls_mut().next();
     if block_follow(fs, true) || check(fs, &Token::Semi) {
         fs.return_stat_gen(fs.nvarstack(), 0);
+        fs.set_freereg(fs.nvarstack());
         if check(fs, &Token::Semi) { fs.ls_mut().next(); }
         return;
     }
@@ -4175,6 +4180,7 @@ fn parse_return(fs: &mut FuncState) {
     } else {
         fs.return_stat_gen(r, 1);
     }
+    fs.set_freereg(fs.nvarstack());
     if check(fs, &Token::Semi) { fs.ls_mut().next(); }
 }
 
