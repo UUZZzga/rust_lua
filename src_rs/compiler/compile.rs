@@ -1901,6 +1901,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             
             let e2 = parse_subexpr(fs, PREC_AND + 1);
             let mut e2_exp = e2.exp.clone();
+            if e2_exp.kind == ExpKind::Call {
+                e2_exp.kind = ExpKind::NonReloc;
+            }
             fs.concat_jump(&mut e2_exp.f, e_left.f);
             
             e = ExprItem { exp: e2_exp };
@@ -1949,6 +1952,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             
             let e2 = parse_subexpr(fs, PREC_AND);
             let mut e2_exp = e2.exp.clone();
+            if e2_exp.kind == ExpKind::Call {
+                e2_exp.kind = ExpKind::NonReloc;
+            }
             fs.concat_jump(&mut e2_exp.t, e_left.t);
             
             e = ExprItem { exp: e2_exp };
