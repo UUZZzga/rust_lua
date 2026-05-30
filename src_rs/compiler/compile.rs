@@ -3239,7 +3239,16 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
             fs.ls_mut().next();
             let ei = parse_expr(fs);
             expect(fs, &Token::RParen);
-            ei.exp
+            match ei.exp.kind {
+                ExpKind::Call => {
+                    let call_pc = ei.exp.info2;
+                    if call_pc >= 0 {
+                        setarg(&mut fs.proto.code[call_pc as usize], 2, POS_C, SIZE_C);
+                    }
+                    ExpDesc { kind: ExpKind::NonReloc, info: ei.exp.info, info2: 0, t: NO_JUMP, f: NO_JUMP }
+                }
+                _ => ei.exp,
+            }
         }
         Token::Not | Token::Minus | Token::Hash | Token::Tilde => {
             let op_tok = fs.ls().token.clone();
