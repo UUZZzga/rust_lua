@@ -2935,17 +2935,24 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         } else {
                             fs.exp_to_reg(&e2.exp)
                         };
+                        let r_dest = if matches!(ec.kind, ExpKind::NonReloc) && (ec.info as i32) < fs.nvarstack() {
+                            r2
+                        } else {
+                            r
+                        };
                         let op = if is_mul { OpCode::MUL } else if is_div { OpCode::DIV } else { OpCode::MOD };
-                        let pc = fs.code_abc(op, r, r, r2);
+                        let pc = fs.code_abc(op, r_dest, r, r2);
                         let tm = if is_mul { 8 } else if is_div { 11 } else { 9 };
                         fs.code_abc(OpCode::MMBIN, r, r2, tm);
-                        let e2_reloc = matches!(e2.exp.kind, ExpKind::Relocable);
-                        if e2_reloc || (!matches!(e2.exp.kind, ExpKind::NonReloc) && !e2.exp.has_jumps()) {
-                            if r2 == fs.freereg - 1 && r2 != r {
-                                fs.free_reg();
+                        if r_dest != r2 {
+                            let e2_reloc = matches!(e2.exp.kind, ExpKind::Relocable);
+                            if e2_reloc || (!matches!(e2.exp.kind, ExpKind::NonReloc) && !e2.exp.has_jumps()) {
+                                if r2 == fs.freereg - 1 && r2 != r {
+                                    fs.free_reg();
+                                }
                             }
                         }
-                        e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r as i64, pc) };
+                        e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r_dest as i64, pc) };
                     }
                 }
             }
