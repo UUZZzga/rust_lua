@@ -3943,6 +3943,17 @@ fn parse_local(fs: &mut FuncState) {
 
             let n_reg = if last_is_ctc { nvars - 1 } else { nvars };
 
+            let last_is_call = last_exp.as_ref().map(|e| matches!(e.kind, ExpKind::Call)).unwrap_or(false);
+            if last_is_call {
+                if let Some(ref last_e) = last_exp {
+                    let call_pc = last_e.info2;
+                    if call_pc >= 0 {
+                        let needed = ((n_reg - n_vals + 2) as i32).min(255);
+                        setarg(&mut fs.proto.code[call_pc as usize], needed, POS_C, SIZE_C);
+                    }
+                }
+            }
+
             for i in 0..n_reg {
                 fs.add_local_kind_reg(&names[i], fs.pc, kinds[i], saved_freereg + i as i32);
             }
@@ -3952,7 +3963,7 @@ fn parse_local(fs: &mut FuncState) {
 
             fs.set_freereg(saved_freereg + n_reg as i32);
 
-            if n_vals < n_reg {
+            if !last_is_call && n_vals < n_reg {
                 let remaining = n_reg - n_vals;
                 fs.code_abc(OpCode::LOADNIL, saved_freereg + n_vals as i32, remaining as i32 - 1, 0);
             }
