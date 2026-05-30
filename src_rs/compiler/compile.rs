@@ -255,6 +255,8 @@ struct LocalVar {
     active: bool,
     reg: i32,
     kind: i32,
+    ctc_kind: Option<ExpKind>,
+    ctc_info: Option<i64>,
 }
 
 // ============================================================================
@@ -647,6 +649,8 @@ impl FuncState {
             active: true,
             reg,
             kind: VDKREG,
+            ctc_kind: None,
+            ctc_info: None,
         });
         reg
     }
@@ -665,6 +669,8 @@ impl FuncState {
             active: true,
             reg,
             kind,
+            ctc_kind: None,
+            ctc_info: None,
         });
         reg
     }
@@ -677,6 +683,8 @@ impl FuncState {
             active: true,
             reg,
             kind,
+            ctc_kind: None,
+            ctc_info: None,
         });
     }
 
@@ -685,6 +693,15 @@ impl FuncState {
         for lv in self.locals.iter().rev() {
             if lv.active && lv.name == name {
                 return Some(lv.reg);
+            }
+        }
+        None
+    }
+
+    fn find_local_ctc(&self, name: &str) -> Option<(ExpKind, i64)> {
+        for lv in self.locals.iter().rev() {
+            if lv.active && lv.name == name && lv.kind == RDKCTC {
+                return Some((lv.ctc_kind.clone().unwrap(), lv.ctc_info.unwrap()));
             }
         }
         None
@@ -1788,7 +1805,42 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
         Token::Name(name) => {
             let name = name.clone();
             fs.ls_mut().next();
-            let mut result = if let Some(reg) = fs.find_local(&name) {
+            let mut result = if let Some((ctc_kind, ctc_info)) = fs.find_local_ctc(&name) {
+                let r = fs.alloc_reg();
+                match ctc_kind {
+                    ExpKind::Int => {
+                        let val = ctc_info;
+                        if val <= i16::MAX as i64 && val >= i16::MIN as i64 {
+                            fs.code_asbx(OpCode::LOADI, r, val as i32);
+                        } else {
+                            let k = fs.int_k(val);
+                            fs.code_abx(OpCode::LOADK, r, k);
+                        }
+                    }
+                    ExpKind::Float => {
+                        let f = f64::from_bits(ctc_info as u64);
+                        let k = fs.float_k(f);
+                        fs.code_abx(OpCode::LOADK, r, k);
+                    }
+                    ExpKind::Str => {
+                        fs.code_abx(OpCode::LOADK, r, ctc_info as i32);
+                    }
+                    ExpKind::Boolean => {
+                        if ctc_info != 0 {
+                            fs.code_abc(OpCode::LOADTRUE, r, 0, 0);
+                        } else {
+                            fs.code_abc(OpCode::LOADFALSE, r, 0, 0);
+                        }
+                    }
+                    ExpKind::Nil => {
+                        fs.code_abc(OpCode::LOADNIL, r, 0, 0);
+                    }
+                    _ => {
+                        fs.code_abx(OpCode::LOADK, r, ctc_info as i32);
+                    }
+                };
+                PrefixResult { var_name: None, local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None }
+            } else if let Some(reg) = fs.find_local(&name) {
                 PrefixResult { var_name: None, local_idx: Some(reg), key: None, reg: Some(reg), table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: None }
             } else if let Some(upval_idx) = fs.find_upvalue(&name) {
                 let r = fs.alloc_reg();
@@ -3282,7 +3334,9 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
         Token::Name(name) => {
             let name = name.clone();
             fs.ls_mut().next();
-            if let Some(reg) = fs.find_local(&name) {
+            if let Some((kind, info)) = fs.find_local_ctc(&name) {
+                ExpDesc::new(kind, info)
+            } else if let Some(reg) = fs.find_local(&name) {
                 ExpDesc::new(ExpKind::NonReloc, reg as i64)
             } else if let Some(upval_idx) = fs.find_upvalue(&name) {
                 let r = fs.alloc_reg();
@@ -4012,6 +4066,10 @@ fn parse_local(fs: &mut FuncState) {
 
             let n_reg = if last_is_ctc { nvars - 1 } else { nvars };
 
+            if last_is_ctc {
+                fs.proto.code.pop();
+            }
+
             let last_is_call = last_exp.as_ref().map(|e| matches!(e.kind, ExpKind::Call)).unwrap_or(false);
             if last_is_call {
                 if let Some(ref last_e) = last_exp {
@@ -4027,7 +4085,17 @@ fn parse_local(fs: &mut FuncState) {
                 fs.add_local_kind_reg(&names[i], fs.pc, kinds[i], saved_freereg + i as i32);
             }
             if last_is_ctc {
-                fs.add_local_kind(&names[nvars - 1], fs.pc, RDKCTC);
+                let pc = fs.pc;
+                let last_e = last_exp.as_ref().unwrap();
+                fs.locals.push(LocalVar {
+                    name: names[nvars - 1].clone(),
+                    start_pc: pc,
+                    active: true,
+                    reg: 0,
+                    kind: RDKCTC,
+                    ctc_kind: Some(last_e.kind.clone()),
+                    ctc_info: Some(last_e.info),
+                });
             }
 
             fs.set_freereg(saved_freereg + n_reg as i32);
