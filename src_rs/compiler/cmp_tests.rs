@@ -550,6 +550,7 @@ mod compiler_compare_tests {
         assert_inst_match("local a = {1}; a[#a + 1] = {1}", None);
         assert_inst_match("local a = {1}; a[#a + 1] = function (b) return {b + 1 + ''} end", None);
         assert_inst_match("a[#a + 1] = 2 .. ''", None);
+        assert_inst_match("local a, b = nil, 23; local x = {a or b+2}", None);
     }
 
     #[test]

@@ -3990,7 +3990,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
         loop {
             if check(fs, &Token::LBracket) {
                 if let Some(prev) = last_list_exp.take() {
-                    fs.expr_to_reg(&prev);
+                    fs.exp_to_reg(&prev);
                     tostore += 1;
                 }
                 if tostore > 0 {
@@ -4001,11 +4001,11 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                 }
                 fs.ls_mut().next();
                 let ek = parse_expr(fs);
-                let k_r = fs.expr_to_reg(&ek.exp);
+                let k_r = fs.exp_to_reg(&ek.exp);
                 expect(fs, &Token::RBracket);
                 expect(fs, &Token::Eq);
                 let ev = parse_expr(fs);
-                let v_r = fs.expr_to_reg(&ev.exp);
+                let v_r = fs.exp_to_reg(&ev.exp);
                 fs.code_abc(OpCode::SETTABLE, table_r, k_r, v_r);
                 fs.free_reg();
                 fs.free_reg();
@@ -4015,7 +4015,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                 let next_is_eq = fs.ls_mut().lookahead_next().0 == Token::Eq;
                 if next_is_eq {
                     if let Some(prev) = last_list_exp.take() {
-                        fs.expr_to_reg(&prev);
+                        fs.exp_to_reg(&prev);
                         tostore += 1;
                     }
                     if tostore > 0 {
@@ -4027,21 +4027,21 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                     fs.ls_mut().next();
                     fs.ls_mut().next();
                     let ev = parse_expr(fs);
-                    let v_r = fs.expr_to_reg(&ev.exp);
+                    let v_r = fs.exp_to_reg(&ev.exp);
                     let k = fs.string_k(&name);
                     fs.code_abc(OpCode::SETI, table_r, k, v_r);
                     fs.free_reg();
                     need_hash += 1;
                 } else {
                     if let Some(prev) = last_list_exp.take() {
-                        fs.expr_to_reg(&prev);
+                        fs.exp_to_reg(&prev);
                         tostore += 1;
                     }
                     last_list_exp = Some(parse_expr(fs).exp);
                 }
             } else {
                 if let Some(prev) = last_list_exp.take() {
-                    fs.expr_to_reg(&prev);
+                    fs.exp_to_reg(&prev);
                     tostore += 1;
                 }
                 last_list_exp = Some(parse_expr(fs).exp);
@@ -4064,7 +4064,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
             need_array += tostore;
             fs.set_freereg(table_r + 1);
         } else {
-            fs.expr_to_reg(&last);
+            fs.exp_to_reg(&last);
             tostore += 1;
             if tostore > 0 {
                 fs.code_abc(OpCode::SETLIST, table_r, tostore, need_array);
