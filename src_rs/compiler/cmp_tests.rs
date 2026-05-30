@@ -529,6 +529,7 @@ mod compiler_compare_tests {
         assert_inst_match("assert(a == n*(n+1)/2 and i==3)", None);
         assert_inst_match("assert(t[1] and t[n] and not t[0] and not t[n+1])", None);
         assert_inst_match("local t = {}; assert(t[1] and t[n] and not t[0] and not t[n+1])", None);
+        assert_inst_match("local t, n = {}, 100; assert(t[1] and t[n] and not t[0] and not t[n+1])", None);
     }
 
     #[test]

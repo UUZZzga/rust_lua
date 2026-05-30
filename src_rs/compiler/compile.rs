@@ -770,7 +770,7 @@ impl FuncState {
                 }
             }
             ExpKind::Call => {
-                if e.info as i32 == self.freereg - 1 {
+                if e.info as i32 >= self.nvarstack() && e.info as i32 == self.freereg - 1 {
                     e.info as i32
                 } else {
                     let r = self.alloc_reg();
@@ -869,7 +869,8 @@ impl FuncState {
                 return true;
             }
             let ctrl_inst = self.proto.code[(cur - 1) as usize];
-            if get_opcode(ctrl_inst) != OpCode::TESTSET {
+            let op = get_opcode(ctrl_inst);
+            if op != OpCode::TESTSET {
                 return true;
             }
             cur = self.get_jump(cur);
@@ -1355,12 +1356,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
     }
     
     if has_call && !check(fs, &Token::Eq) && !check(fs, &Token::Comma) {
-        if freg >= fs.nvarstack() {
-            fs.free_reg();
-        }
-        if first.allocated_reg && extra_free {
-            fs.free_reg();
-        }
+        fs.set_freereg(fs.nvarstack());
         return;
     }
     
@@ -1928,7 +1924,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     };
                     let k = e_left.info2 == -2;
                     if k {
-                        fs.code_abc_k(OpCode::TEST, reg, 0, 0, false);
+                        fs.code_abc_k(OpCode::TESTSET, NO_REG as i32, reg, 0, k);
                     } else {
                         fs.code_abc_k(OpCode::TESTSET, NO_REG as i32, reg, 0, true);
                     }
@@ -2548,7 +2544,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     }
                 }
                 _ => {
-                    let r = if ec.has_jumps() {
+                    let r_src = if ec.has_jumps() {
                         let r = fs.exp_to_reg(&ec);
                         ec.t = NO_JUMP;
                         ec.f = NO_JUMP;
@@ -2561,25 +2557,30 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     } else {
                         fs.expr_to_reg(&ec)
                     };
+                    let r = if matches!(ec.kind, ExpKind::NonReloc) && (ec.info as i32) < fs.nvarstack() {
+                        fs.alloc_reg()
+                    } else {
+                        r_src
+                    };
                     if !is_add && matches!(e2.exp.kind, ExpKind::Int) && fits_sc(&e2.exp) && fits_sc_neg(e2.exp.info) {
                         let v = e2.exp.info;
                         let sc_neg = int_to_sc(-v);
                         let sc_pos = int_to_sc(v);
-                        let pc = fs.code_abc(OpCode::ADDI, r, r, sc_neg);
-                        fs.code_abc(OpCode::MMBINI, r, sc_pos, 7);
+                        let pc = fs.code_abc(OpCode::ADDI, r, r_src, sc_neg);
+                        fs.code_abc(OpCode::MMBINI, r_src, sc_pos, 7);
                         e = ExprItem { exp: ec.into_reloc_with_pc(r as i64, pc) };
                     } else if is_add && matches!(e2.exp.kind, ExpKind::Int) && fits_sc(&e2.exp) {
                         let v = e2.exp.info;
                         let sc = int_to_sc(v);
-                        let pc = fs.code_abc(OpCode::ADDI, r, r, sc);
-                        fs.code_abc(OpCode::MMBINI, r, sc, 6);
+                        let pc = fs.code_abc(OpCode::ADDI, r, r_src, sc);
+                        fs.code_abc(OpCode::MMBINI, r_src, sc, 6);
                         e = ExprItem { exp: ec.into_reloc_with_pc(r as i64, pc) };
                     } else if is_add && matches!(e2.exp.kind, ExpKind::Float) {
                         let f = f64::from_bits(e2.exp.info as u64);
                         let k = fs.float_k(f);
                         if k <= 255 {
-                            let pc = fs.code_abc(OpCode::ADDK, r, r, k);
-                            fs.code_abc(OpCode::MMBINK, r, k, 6);
+                            let pc = fs.code_abc(OpCode::ADDK, r, r_src, k);
+                            fs.code_abc(OpCode::MMBINK, r_src, k, 6);
                             e = ExprItem { exp: ec.into_reloc_with_pc(r as i64, pc) };
                         } else {
                             let r2 = if matches!(e2.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !e2.exp.has_jumps() {
@@ -2591,7 +2592,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             } else {
                                 fs.exp_to_reg(&e2.exp)
                             };
-                            let pc = fs.code_abc(OpCode::ADD, r, r, r2);
+                            let pc = fs.code_abc(OpCode::ADD, r, r_src, r2);
                             let e2_reloc = matches!(e2.exp.kind, ExpKind::Relocable);
                             if e2_reloc || (!matches!(e2.exp.kind, ExpKind::NonReloc) && !e2.exp.has_jumps()) {
                                 if r2 == fs.freereg - 1 && r2 != r {
@@ -2611,7 +2612,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             fs.exp_to_reg(&e2.exp)
                         };
                         let op = if is_add { OpCode::ADD } else { OpCode::SUB };
-                        let pc = fs.code_abc(op, r, r, r2);
+                        let pc = fs.code_abc(op, r, r_src, r2);
                         let e2_reloc = matches!(e2.exp.kind, ExpKind::Relocable);
                         if e2_reloc || (!matches!(e2.exp.kind, ExpKind::NonReloc) && !e2.exp.has_jumps()) {
                             if r2 == fs.freereg - 1 && r2 != r {
@@ -3385,8 +3386,11 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     } else {
                         fs.expr_to_reg(&ei.exp)
                     };
+                    if base_is_nonreloc_local && key_reg >= fs.nvarstack() && key_reg == fs.freereg - 1 {
+                        fs.free_reg();
+                    }
                     result_reg = if base_is_nonreloc_local {
-                        key_reg
+                        fs.alloc_reg()
                     } else {
                         base_reg
                     };
