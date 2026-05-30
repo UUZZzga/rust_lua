@@ -1392,6 +1392,27 @@ fn parse_assign_or_call(fs: &mut FuncState) {
             }
         }
         
+        let last_is_call = exps.last().map_or(false, |e| e.kind == ExpKind::Call && e.info2 >= 0);
+        let extra_vars = if vars.len() > exps.len() {
+            vars.len() - exps.len()
+        } else {
+            0
+        };
+        let nil_reg_start = if extra_vars > 0 && !last_is_call {
+            let start = fs.freereg;
+            for _ in 0..extra_vars {
+                fs.alloc_reg();
+            }
+            fs.code_abc(OpCode::LOADNIL, start, extra_vars as i32 - 1, 0);
+            start
+        } else {
+            -1
+        };
+        if extra_vars > 0 && last_is_call {
+            let nresults = (extra_vars + 1) as i32;
+            fs.set_c(exps.last().unwrap().info2, nresults + 1);
+        }
+        
         for i in (0..vars.len()).rev() {
             if i < exps.len() {
                 let v = &vars[i];
@@ -1463,7 +1484,32 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         fs.free_reg();
                     }
                 }
+            } else if extra_vars > 0 {
+                let v = &vars[i];
+                let result_reg = if last_is_call {
+                    let freg = exps.last().unwrap().info as i32;
+                    freg + (i - exps.len() + 1) as i32
+                } else {
+                    nil_reg_start + (i - exps.len()) as i32
+                };
+                if let Some(idx) = v.local_idx {
+                    fs.code_abc(OpCode::MOVE, idx, result_reg, 0);
+                } else if let Some(upval_idx) = v.upval_idx {
+                    fs.code_abc(OpCode::SETUPVAL, result_reg, upval_idx, 0);
+                } else if let Some(ref name) = v.var_name {
+                    let k_name = fs.string_k(name);
+                    fs.code_abc(OpCode::SETTABUP, 0, k_name, result_reg);
+                } else if let (Some(table_reg), Some(table_key)) = (v.table_reg, v.table_key) {
+                    if v.table_key_is_const {
+                        fs.code_abc_k(OpCode::SETFIELD, table_reg, table_key, result_reg, false);
+                    } else {
+                        fs.code_abc_k(OpCode::SETTABLE, table_reg, table_key, result_reg, false);
+                    }
+                }
             }
+        }
+        if extra_vars > 0 {
+            fs.set_freereg(fs.nvarstack());
         }
         return;
     }
@@ -1548,7 +1594,7 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
             }
         }
         _ => {
-            if e.info2 >= 0 {
+            if e.info2 > 0 {
                 if e.kind == ExpKind::Call {
                     if e.info as i32 != dest {
                         fs.code_abc(OpCode::MOVE, dest, e.info as i32, 0);
@@ -1560,6 +1606,14 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
                     if prev_dest != dest && (prev_dest >= fs.nvarstack() || prev_dest == fs.freereg - 1) {
                         fs.free_reg();
                     }
+                }
+            } else if e.kind == ExpKind::NonReloc && e.info2 == 0 {
+                let val_reg = e.info as i32;
+                if dest != val_reg {
+                    fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
+                }
+                if val_reg >= fs.nvarstack() && val_reg == fs.freereg - 1 {
+                    fs.free_reg();
                 }
             } else {
                 let saved_freereg = fs.freereg;
