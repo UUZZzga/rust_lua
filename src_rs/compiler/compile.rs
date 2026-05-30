@@ -3142,6 +3142,32 @@ fn exp_to_const_k(fs: &mut FuncState, e: &ExpDesc) -> Option<i32> {
     if k <= 255 { Some(k) } else { None }
 }
 
+fn exp2rk(fs: &mut FuncState, e: &ExpDesc) -> (i32, bool) {
+    if e.t == NO_JUMP && e.f == NO_JUMP {
+        let info = match e.kind {
+            ExpKind::Boolean => {
+                fs.const_k(if e.info != 0 { TValue::Boolean(true) } else { TValue::Boolean(false) })
+            }
+            ExpKind::Nil => fs.const_k(TValue::Nil(NilKind::Strict)),
+            ExpKind::Int => fs.int_k(e.info),
+            ExpKind::Float => {
+                let f = f64::from_bits(e.info as u64);
+                fs.float_k(f)
+            }
+            ExpKind::Str => e.info as i32,
+            _ => {
+                let r = fs.exp_to_reg(e);
+                return (r, false);
+            }
+        };
+        if info <= 255 {
+            return (info, true);
+        }
+    }
+    let r = fs.exp_to_reg(e);
+    (r, false)
+}
+
 /// ANTLR4: 检查加减运算符 token: `+` | `-`
 fn check_addop(fs: &FuncState) -> bool {
     matches!(fs.ls().token, Token::Plus | Token::Minus)
@@ -4015,9 +4041,11 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                 expect(fs, &Token::RBracket);
                 expect(fs, &Token::Eq);
                 let ev = parse_expr(fs);
-                let v_r = fs.exp_to_reg(&ev.exp);
-                fs.code_abc(OpCode::SETTABLE, table_r, k_r, v_r);
-                fs.free_reg();
+                let (v_rk, is_k) = exp2rk(fs, &ev.exp);
+                fs.code_abc_k(OpCode::SETTABLE, table_r, k_r, v_rk, is_k);
+                if !is_k {
+                    fs.free_reg();
+                }
                 fs.free_reg();
                 need_hash += 1;
             } else if let Token::Name(s) = &fs.ls().token {
@@ -4037,10 +4065,12 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                     fs.ls_mut().next();
                     fs.ls_mut().next();
                     let ev = parse_expr(fs);
-                    let v_r = fs.exp_to_reg(&ev.exp);
                     let k = fs.string_k(&name);
-                    fs.code_abc(OpCode::SETFIELD, table_r, k, v_r);
-                    fs.free_reg();
+                    let (v_rk, is_k) = exp2rk(fs, &ev.exp);
+                    fs.code_abc_k(OpCode::SETFIELD, table_r, k, v_rk, is_k);
+                    if !is_k {
+                        fs.free_reg();
+                    }
                     need_hash += 1;
                 } else {
                     if let Some(prev) = last_list_exp.take() {
