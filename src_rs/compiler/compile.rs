@@ -449,6 +449,12 @@ impl FuncState {
         setarg(i, a, POS_A, SIZE_A);
     }
 
+    /// 设置指定指令的 B 参数
+    fn set_b(&mut self, pc: i32, b: i32) {
+        let i = &mut self.proto.code[pc as usize];
+        setarg(i, b, POS_B, SIZE_B);
+    }
+
     fn set_tablesize(&mut self, pc: i32, ra: i32, asize: i32, hsize: i32) {
         let max_vc = (1 << SIZE_VC) as i32;
         let extra = asize / max_vc;
@@ -761,6 +767,21 @@ impl FuncState {
     fn expr_to_reg(&mut self, e: &ExpDesc) -> i32 {
         match e.kind {
             ExpKind::Void | ExpKind::Nil => {
+                if self.pc > 0 {
+                    let last_ins = self.proto.code[self.pc as usize - 1];
+                    if get_opcode(last_ins) == OpCode::LOADNIL {
+                        let last_a = getarg_a(last_ins);
+                        let last_b = getarg_b(last_ins);
+                        if last_a + last_b + 1 == self.freereg {
+                            self.set_b(self.pc - 1, last_b + 1);
+                            self.freereg += 1;
+                            if self.freereg > self.max_freereg {
+                                self.max_freereg = self.freereg;
+                            }
+                            return self.freereg - 1;
+                        }
+                    }
+                }
                 let r = self.alloc_reg();
                 self.code_abc(OpCode::LOADNIL, r, 0, 0);
                 r
