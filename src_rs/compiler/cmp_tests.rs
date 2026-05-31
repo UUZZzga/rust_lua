@@ -293,153 +293,37 @@ mod compiler_compare_tests {
     // ===== return 语句测试 =====
 
     #[test]
-    fn test_return_int() {
+    fn test_return() {
         assert_inst_match("return 42", None);
-    }
-
-    #[test]
-    fn test_return_multi() {
         assert_inst_match("return 1, 2, 3", None);
-    }
-
-    #[test]
-    fn test_return_expr() {
         assert_inst_match("return 1 + 2", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex1() {
         assert_inst_match("return 2^3^2 == 2^(3^2)", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex2() {
         assert_inst_match("return 2^3*4 == (2^3)*4", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex3() {
         assert_inst_match("return 2.0^-2 == 1/4 and -2^- -2 == - - -4", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex4() {
         assert_inst_match("return not nil and 2 and not(2>3 or 3<2)", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex5() {
         assert_inst_match("return -3-1-5 == 0+0-9", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex6() {
         assert_inst_match("return -2^2 == -4 and (-2)^2 == 4 and 2*2-3-1 == 0", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex7() {
         assert_inst_match("return -3%5 == 2 and -3+5 == 2", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex8() {
         assert_inst_match("return 2*1+3/3 == 3 and 1+2 .. 3*1 == \"33\"", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex9() {
         assert_inst_match("return not(2+1 > 3*1) and \"a\"..\"b\" > \"a\"", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex10() {
         assert_inst_match("return 0xF0 | 0xCC ~ 0xAA & 0xFD == 0xF4", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex11() {
         assert_inst_match("return 0xFD & 0xAA ~ 0xCC | 0xF0 == 0xF4", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex12() {
         assert_inst_match("return 0xF0 & 0x0F + 1 == 0x10", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex13() {
         assert_inst_match("return 3^4//2^3//5 == 2", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex14() {
         assert_inst_match("return -3+4*5//2^3^2//9+4%10/3 == (-3)+(((4*5)//(2^(3^2)))//9)+((4%10)/3)", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex15() {
         assert_inst_match("return not ((true or false) and nil)", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex16() {
         assert_inst_match("return true or false  and nil", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex17() {
         assert_inst_match("return (((1 or false) and true) or false) == true", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex18() {
         assert_inst_match("return (((nil and true) or false) and true) == false", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex19() {
         assert_inst_match("return -(1 or 2) == -1 and (1 and 2)+(-1.25 or -4) == 0.75", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex20() {
         assert_inst_match("local x, y = 1, 2; return (x>y) and x or y == 2", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex21() {
         assert_inst_match("local x, y = 1, 2; x,y=2,1; return (x>y) and x or y == 2", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex22() {
         assert_inst_match("return 1234567890 == tonumber('1234567890') and 1234567890+1 == 1234567891", None);
-    }
-
-    #[test]
-    fn test_return_expr_complex23() {
         assert_inst_match("local x = ((b or a)+1 == 2 and (10 or a)+1 == 11); return x", None);
         assert_inst_match("local a,b = 1,nil; local x = ((b or a)+1 == 2 and (10 or a)+1 == 11); return x", None);
-    }
-
-    #[test]
-    fn test_return_expr_len() {
         assert_inst_match("return #a", None);
-    }
-
-    #[test]
-    fn test_return_table1() {
         assert_inst_match("return {123456789}", None);
-    }
-
-    #[test]
-    fn test_return_table2() {
         assert_inst_match("return {'123456789'}", None);
-    }
-
-    #[test]
-    fn test_return_table3() {
         assert_inst_match("return {3, 100, 5.0, -10}", None);
     }
 
