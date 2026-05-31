@@ -567,6 +567,7 @@ mod compiler_compare_tests {
         assert_inst_match("local a = nil; local x = {f(100)*2+3 or a}", None);
         assert_inst_match("local a, b = nil, 23; local x = {f=2+3 or a, a = b+2}", None);
         assert_inst_match("local a; a={y=1}", None);
+        assert_inst_match("local abc = {{'(0==_ENV.a)', 0 == _ENV.a}}", None);
     }
 
     #[test]

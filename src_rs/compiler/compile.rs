@@ -3481,6 +3481,10 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 let r = fs.alloc_reg();
                 fs.code_abc(OpCode::GETUPVAL, r, upval_idx, 0);
                 ExpDesc::new(ExpKind::Relocable, r as i64)
+            } else if name == "_ENV" {
+                let r = fs.alloc_reg();
+                fs.code_abc(OpCode::GETUPVAL, r, 0, 0);
+                ExpDesc::new(ExpKind::Relocable, r as i64)
             } else {
                 let r = fs.alloc_reg();
                 let k = fs.string_k(&name);
@@ -3650,13 +3654,25 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 let field = get_name(fs);
                 let k = fs.string_k(&field);
                 let base_reg = fs.expr_to_reg(&e);
-                let result_reg = if matches!(e.kind, ExpKind::NonReloc) && (e.info as i32) < fs.nvarstack() {
-                    fs.alloc_reg()
-                } else {
-                    base_reg
+                let is_env_upval = {
+                    let last_ins = fs.proto.code[fs.pc as usize - 1];
+                    get_opcode(last_ins) == OpCode::GETUPVAL && getarg_b(last_ins) == 0
                 };
-                fs.code_abc(OpCode::GETFIELD, result_reg, base_reg, k);
-                e = ExpDesc::new(ExpKind::Relocable, result_reg as i64);
+                if is_env_upval {
+                    let last_idx = fs.pc as usize - 1;
+                    fs.proto.code.remove(last_idx);
+                    fs.pc -= 1;
+                    fs.code_abc(OpCode::GETTABUP, base_reg, 0, k);
+                    e = ExpDesc::new(ExpKind::Relocable, base_reg as i64);
+                } else {
+                    let result_reg = if matches!(e.kind, ExpKind::NonReloc) && (e.info as i32) < fs.nvarstack() {
+                        fs.alloc_reg()
+                    } else {
+                        base_reg
+                    };
+                    fs.code_abc(OpCode::GETFIELD, result_reg, base_reg, k);
+                    e = ExpDesc::new(ExpKind::Relocable, result_reg as i64);
+                }
             }
             Token::LBracket => {
                 fs.ls_mut().next();
@@ -3669,42 +3685,59 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     fs.expr_to_reg(&e)
                 };
                 let base_is_nonreloc_local = matches!(e.kind, ExpKind::NonReloc) && (e.info as i32) < fs.nvarstack();
+                let saved_pc_before_expr = fs.pc;
+                let is_env_before = {
+                    if fs.pc > 0 {
+                        let last_ins = fs.proto.code[fs.pc as usize - 1];
+                        get_opcode(last_ins) == OpCode::GETUPVAL && getarg_b(last_ins) == 0
+                    } else {
+                        false
+                    }
+                };
                 let ei = parse_expr(fs);
                 expect(fs, &Token::RBracket);
-                let result_reg;
-                if ei.exp.kind == ExpKind::Int
-                    && ei.exp.info >= 0
-                    && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
-                {
-                    result_reg = if base_is_nonreloc_local {
-                        fs.alloc_reg()
-                    } else {
-                        base_reg
-                    };
-                    fs.code_abc(OpCode::GETI, result_reg, base_reg, ei.exp.info as i32);
+                if is_env_before && ei.exp.kind == ExpKind::Str {
+                    fs.proto.code.truncate((saved_pc_before_expr - 1) as usize);
+                    fs.pc = saved_pc_before_expr - 1;
+                    let k = ei.exp.info as i32;
+                    fs.code_abc(OpCode::GETTABUP, base_reg, 0, k);
+                    e = ExpDesc::new(ExpKind::Relocable, base_reg as i64);
                 } else {
-                    let key_reg = if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei.exp.has_jumps() {
-                        if ei.exp.info2 >= 0 {
-                            fs.set_a(ei.exp.info2, ei.exp.info as i32);
+                    let result_reg;
+                    if ei.exp.kind == ExpKind::Int
+                        && ei.exp.info >= 0
+                        && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
+                    {
+                        result_reg = if base_is_nonreloc_local {
+                            fs.alloc_reg()
+                        } else {
+                            base_reg
+                        };
+                        fs.code_abc(OpCode::GETI, result_reg, base_reg, ei.exp.info as i32);
+                    } else {
+                        let key_reg = if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei.exp.has_jumps() {
+                            if ei.exp.info2 >= 0 {
+                                fs.set_a(ei.exp.info2, ei.exp.info as i32);
+                            }
+                            ei.exp.info as i32
+                        } else {
+                            fs.expr_to_reg(&ei.exp)
+                        };
+                        if base_is_nonreloc_local && key_reg >= fs.nvarstack() && key_reg == fs.freereg - 1 {
+                            fs.free_reg();
                         }
-                        ei.exp.info as i32
-                    } else {
-                        fs.expr_to_reg(&ei.exp)
-                    };
-                    if base_is_nonreloc_local && key_reg >= fs.nvarstack() && key_reg == fs.freereg - 1 {
-                        fs.free_reg();
+                        result_reg = if base_is_nonreloc_local {
+                            fs.alloc_reg()
+                        } else {
+                            base_reg
+                        };
+                        fs.code_abc(OpCode::GETTABLE, result_reg, base_reg, key_reg);
+                        if result_reg != key_reg && key_reg == fs.freereg - 1 {
+                            fs.free_reg();
+                        }
                     }
-                    result_reg = if base_is_nonreloc_local {
-                        fs.alloc_reg()
-                    } else {
-                        base_reg
-                    };
-                    fs.code_abc(OpCode::GETTABLE, result_reg, base_reg, key_reg);
-                    if result_reg != key_reg && key_reg == fs.freereg - 1 {
-                        fs.free_reg();
-                    }
+                    e = ExpDesc::new(ExpKind::Relocable, result_reg as i64);
                 }
-                e = ExpDesc::new(ExpKind::Relocable, result_reg as i64);
             }
             _ => break,
         }
