@@ -63,19 +63,21 @@ mod compiler_compare_tests {
     #[test]
     fn debug_dump_return_42() {
         unsafe {
+            let src = b"local a, b; assert(a * b > 2.0^32)";
             let dump_data =
-                bytecode_dump::compile_with_c_lua(b"return 42").expect("C compile failed");
-            eprintln!("DUMP size: {} bytes", dump_data.len());
-            eprintln!(
-                "DUMP hex (first 100 bytes): {:02x?}",
-                &dump_data[..dump_data.len().min(100)]
-            );
-
+                bytecode_dump::compile_with_c_lua(src).expect("C compile failed");
+            
+            eprintln!("DUMP hex (first 200 bytes): {:02x?}", &dump_data[..dump_data.len().min(200)]);
+    
             match bytecode_dump::parse_dump(dump_data) {
                 Ok(func) => {
                     eprintln!("Parsed C OK: numparams={}, flag={}, maxstack={}, code_len={}, constants_len={}",
                         func.numparams, func.flag, func.maxstacksize, func.code.len(), func.constants.len());
-                    eprintln!("C Code: {:?}", func.code);
+                    eprintln!("C Code:");
+                    for (i, inst) in func.code.iter().enumerate() {
+                        eprintln!("  C[{:2}]: op={:3} A={:3} B={:3} C={:3} k={} bx={}",
+                            i, inst.opcode, inst.a, inst.b, inst.c, inst.k, inst.bx);
+                    }
                 }
                 Err(e) => eprintln!("Parse error: {}", e),
             }
@@ -228,6 +230,7 @@ mod compiler_compare_tests {
         assert_inst_match("local a <const> = 123; assert(a)", None);
         assert_inst_match("local a <const> = '123'; assert(a)", None);
         assert_inst_match("local f; f, X = nil", None);
+        assert_inst_match("local a, b; assert(a * b > 2.0^32)", None);
     }
 
     #[test]

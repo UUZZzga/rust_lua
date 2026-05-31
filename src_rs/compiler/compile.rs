@@ -2424,8 +2424,8 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     }
                     e = ExprItem { exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64) };
                 } else {
-                    let r_alloc = !matches!(ec.kind, ExpKind::Relocable | ExpKind::NonReloc | ExpKind::Call | ExpKind::Vararg);
-                    let r = if r_alloc {
+                    let r_alloc = !matches!(ec.kind, ExpKind::NonReloc | ExpKind::Call | ExpKind::Vararg);
+                    let r = if r_alloc || matches!(ec.kind, ExpKind::Relocable) {
                         fs.exp_to_reg(&ec)
                     } else if ec.has_jumps() {
                         let reg = ec.info as i32;
