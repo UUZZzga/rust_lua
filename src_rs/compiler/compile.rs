@@ -3937,6 +3937,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
 
 /// ANTLR4: `'if' expr 'then' block ('elseif' expr 'then' block)* ('else' block)? 'end' ;`
 fn parse_if(fs: &mut FuncState) {
+    let entry_freereg = fs.freereg;
     fs.ls_mut().next();
     let ei = parse_expr(fs);
 
@@ -3973,7 +3974,8 @@ fn parse_if(fs: &mut FuncState) {
     }
 
     expect(fs, &Token::Then);
-    let block_freereg = fs.freereg;
+    let block_freereg = entry_freereg;
+    fs.set_freereg(block_freereg);
     let saved_nlocals = fs.locals.len();
     parse_block(fs);
     for local in &mut fs.locals[saved_nlocals..] {
@@ -4058,6 +4060,7 @@ fn parse_if(fs: &mut FuncState) {
 
 /// ANTLR4: `'while' expr 'do' block 'end' ;`
 fn parse_while(fs: &mut FuncState) {
+    let entry_freereg = fs.freereg;
     fs.ls_mut().next();
     let loop_start = fs.pc;
     let ei = parse_expr(fs);
@@ -4082,7 +4085,8 @@ fn parse_while(fs: &mut FuncState) {
     let saved_breaklist = fs.break_list;
     fs.break_list = NO_JUMP;
 
-    let block_freereg = fs.freereg;
+    let block_freereg = entry_freereg;
+    fs.set_freereg(block_freereg);
     let saved_nlocals = fs.locals.len();
     parse_block(fs);
     for local in &mut fs.locals[saved_nlocals..] {
@@ -4120,13 +4124,15 @@ fn parse_do(fs: &mut FuncState) {
 
 /// ANTLR4: `'repeat' block 'until' expr ;`
 fn parse_repeat(fs: &mut FuncState) {
+    let entry_freereg = fs.freereg;
     fs.ls_mut().next();
     let loop_start = fs.pc;
 
     let saved_breaklist = fs.break_list;
     fs.break_list = NO_JUMP;
 
-    let block_freereg = fs.freereg;
+    let block_freereg = entry_freereg;
+    fs.set_freereg(block_freereg);
     let saved_nlocals = fs.locals.len();
     parse_block(fs);
     fs.set_freereg(block_freereg);
@@ -4179,6 +4185,7 @@ fn parse_repeat(fs: &mut FuncState) {
     for local in &mut fs.locals[saved_nlocals..] {
         local.active = false;
     }
+    fs.set_freereg(block_freereg);
 }
 
 /// ANTLR4: `'for' NAME '=' expr ',' expr (',' expr)? 'do' block 'end' ;` (numeric for) 以及 `'for' namelist 'in' explist 'do' block 'end' ;` (generic for)
