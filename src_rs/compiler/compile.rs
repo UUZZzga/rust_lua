@@ -1859,16 +1859,20 @@ fn parse_func_args(fs: &mut FuncState, freg: i32) -> i32 {
         fs.ls_mut().next();
         let method = get_name(fs);
         let k = fs.string_k(&method);
-        fs.code_abc(OpCode::GETTABLE, freg + 1, freg, k);
+        fs.code_abc(OpCode::SELF, freg, freg, k);
         if check(fs, &Token::LParen) {
             fs.ls_mut().next();
+            if fs.freereg <= freg + 1 {
+                fs.alloc_reg();
+            }
             let (na, na_multret) = parse_args(fs);
             expect(fs, &Token::RParen);
-            let na_adj = if na_multret { 0 } else { na + 1 };
+            let na_adj = if na_multret { 0 } else { na + 2 };
             let pc = fs.code_abc(OpCode::CALL, freg, na_adj, 2);
             for _ in 0..na {
                 fs.free_reg();
             }
+            fs.free_reg();
             return pc;
         }
         return -1;

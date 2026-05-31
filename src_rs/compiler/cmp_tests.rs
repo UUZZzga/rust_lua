@@ -575,6 +575,7 @@ mod compiler_compare_tests {
     #[test]
     fn test_table_field_call() {
         assert_inst_match("string.format('%s', op)", None);
+        assert_inst_match("local t = {}; t[#t + 1] = (''):format(1, 2)", None);
     }
 
     #[test]
