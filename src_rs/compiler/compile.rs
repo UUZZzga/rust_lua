@@ -2234,7 +2234,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         if limit <= PREC_OR && check(fs, &Token::Or) {
             let mut e_left = e.exp.clone();
             fs.ls_mut().next();
-            
+
             if e_left.kind == ExpKind::VJMP && e_left.info != NO_JUMP as i64 {
                 let saved_jmp = e_left.info as i32;
                 fs.concat_jump(&mut e_left.t, saved_jmp);
@@ -2911,6 +2911,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         let r = fs.exp_to_reg(&ec);
                         ec.t = NO_JUMP;
                         ec.f = NO_JUMP;
+                        ec.info = r as i64;
                         r
                     } else if matches!(ec.kind, ExpKind::NonReloc | ExpKind::Relocable) {
                         if ec.info2 >= 0 {
