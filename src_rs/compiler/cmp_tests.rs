@@ -452,6 +452,7 @@ mod compiler_compare_tests {
         assert_inst_match("local aa = 1; _ENV.aa = aa; _ENV.aa = nil", None);
         assert_inst_match("_ENV.a = b.c(0, 1)", None);
         assert_inst_match("local a = {}; getmetatable(a).__index = function () end", None);
+        assert_inst_match("local e, m; assert(not e and m:find(\"'newindex'\"))", None);
     }
 
     #[test]

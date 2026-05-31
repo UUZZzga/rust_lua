@@ -1394,14 +1394,15 @@ fn parse_assign_or_call(fs: &mut FuncState) {
     let mut call_pc: i32 = -1;
     if check(fs, &Token::LParen) || check(fs, &Token::Colon) || check(fs, &Token::LBrace) || matches!(&fs.ls().token, Token::String(..)) {
         has_call = true;
-        let (fr, ef, func_allocated) = load_func(fs, &first);
+        let is_method = check(fs, &Token::Colon);
+        let (fr, ef, func_allocated, src_reg) = load_func(fs, &first, is_method);
         freg = fr;
         extra_free = ef;
-        call_pc = parse_func_args(fs, freg);
+        call_pc = parse_func_args(fs, freg, src_reg);
         loop {
             match &fs.ls().token {
                 Token::LParen | Token::LBrace | Token::String(_) | Token::Colon => {
-                    call_pc = parse_func_args(fs, freg);
+                    call_pc = parse_func_args(fs, freg, None);
                 }
                 _ => break,
             }
@@ -1672,7 +1673,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
         return;
     }
     
-    let (_r, _, _) = load_func(fs, &first);
+    let (_r, _, _, _) = load_func(fs, &first, false);
     fs.free_reg();
 }
 
@@ -1833,36 +1834,44 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
 }
 
 /// ANTLR4: functioncall 帮助 — 将函数值加载到寄存器以便调用
-/// 返回 (函数寄存器, 是否需要额外释放基寄存器)
-fn load_func(fs: &mut FuncState, p: &PrefixResult) -> (i32, bool, bool) {
+/// 返回 (函数寄存器, 是否需要额外释放基寄存器, 是否已分配寄存器, 方法调用原始源寄存器)
+fn load_func(fs: &mut FuncState, p: &PrefixResult, is_method: bool) -> (i32, bool, bool, Option<i32>) {
     if let (Some(table_reg), Some(table_key)) = (p.table_reg, p.table_key) {
         if p.table_key_is_const {
             fs.code_abc(OpCode::GETFIELD, table_reg, table_reg, table_key);
-            (table_reg, false, false)
+            (table_reg, false, false, None)
         } else {
             let r = fs.alloc_reg();
             fs.code_abc(OpCode::GETTABLE, r, table_reg, table_key);
-            (r, true, true)
+            (r, true, true, None)
         }
     } else if let Some(reg) = p.local_idx {
         let r = fs.alloc_reg();
-        fs.code_abc(OpCode::MOVE, r, reg, 0);
-        (r, false, true)
+        if is_method {
+            (r, false, true, Some(reg))
+        } else {
+            fs.code_abc(OpCode::MOVE, r, reg, 0);
+            (r, false, true, None)
+        }
     } else if let Some(key) = p.key {
         let r = fs.alloc_reg();
         fs.code_abc(OpCode::GETTABUP, r, 0, key);
-        (r, false, true)
+        (r, false, true, None)
     } else if let Some(reg) = p.reg {
         let r = fs.alloc_reg();
-        fs.code_abc(OpCode::MOVE, r, reg, 0);
-        (r, false, true)
+        if is_method {
+            (r, false, true, Some(reg))
+        } else {
+            fs.code_abc(OpCode::MOVE, r, reg, 0);
+            (r, false, true, None)
+        }
     } else {
-        (fs.alloc_reg(), false, true)
+        (fs.alloc_reg(), false, true, None)
     }
 }
 
 /// ANTLR4: `args: '(' explist? ')' | tableconstructor | STRING ;` 及 `':' NAME args ;` — 解析函数参数并生成 CALL 指令
-fn parse_func_args(fs: &mut FuncState, freg: i32) -> i32 {
+fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
     if matches!(&fs.ls().token, Token::String(..)) {
         let str_s = match &fs.ls().token {
             Token::String(s) => s.clone(),
@@ -1891,7 +1900,8 @@ fn parse_func_args(fs: &mut FuncState, freg: i32) -> i32 {
         fs.ls_mut().next();
         let method = get_name(fs);
         let k = fs.string_k(&method);
-        fs.code_abc(OpCode::SELF, freg, freg, k);
+        let src = src_reg.unwrap_or(freg);
+        fs.code_abc(OpCode::SELF, freg, src, k);
         if check(fs, &Token::LParen) {
             fs.ls_mut().next();
             if fs.freereg <= freg + 1 {
@@ -3856,14 +3866,26 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
         match &fs.ls().token {
             Token::LParen | Token::LBrace | Token::String(..) | Token::Colon => {
                 let mut freg = fs.expr_to_reg(&e);
-                if matches!(e.kind, ExpKind::NonReloc) && freg < fs.nvarstack() {
-                    let new_freg = fs.alloc_reg();
-                    if new_freg != freg {
-                        fs.code_abc(OpCode::MOVE, new_freg, freg, 0);
+                let is_method = matches!(&fs.ls().token, Token::Colon);
+                let src_reg = if matches!(e.kind, ExpKind::NonReloc) && freg < fs.nvarstack() {
+                    if is_method {
+                        let src = freg;
+                        freg = fs.alloc_reg();
+                        Some(src)
+                    } else {
+                        let new_freg = fs.alloc_reg();
+                        if new_freg != freg {
+                            fs.code_abc(OpCode::MOVE, new_freg, freg, 0);
+                        }
+                        freg = new_freg;
+                        None
                     }
-                    freg = new_freg;
-                }
-                let call_pc = parse_func_args(fs, freg);
+                } else if is_method {
+                    Some(freg)
+                } else {
+                    None
+                };
+                let call_pc = parse_func_args(fs, freg, src_reg);
                 e = if call_pc >= 0 {
                     ExpDesc { kind: ExpKind::Call, info: freg as i64, info2: call_pc, t: NO_JUMP, f: NO_JUMP }
                 } else {
