@@ -442,34 +442,16 @@ mod compiler_compare_tests {
     }
 
     #[test]
-    fn test_if_true() {
+    fn test_if() {
         assert_inst_match("if true then return 1 end", None);
-    }
-
-    #[test]
-    fn test_if_false() {
         assert_inst_match("if false then return 1 end", None);
-    }
-
-    #[test]
-    fn test_if_true_else() {
         assert_inst_match("if true then return 1 else return 2 end", None);
-    }
-
-    #[test]
-    fn test_if_true_elseif_else() {
-        assert_inst_match(
-            "if true then return 1 elseif true then return 2 else return 3 end",
-            None,
-        );
-    }
-
-    #[test]
-    fn test_if_false_raise_error() {
-        assert_inst_match(
-            "local a; if false then a = 3 // 0; a = 0 % 0 end",
-            None,
-        );
+        assert_inst_match("if true then return 1 elseif true then return 2 else return 3 end",None);
+        assert_inst_match("local a; if false then a = 3 // 0; a = 0 % 0 end",None);
+        assert_inst_match("if a.b == 0 then end",None);
+        assert_inst_match("if a.b ~= 0 then end",None);
+        assert_inst_match("if _ENV.b == 0 then end",None);
+        assert_inst_match("if _ENV.b ~= 0 then end",None);
     }
 
     #[test]

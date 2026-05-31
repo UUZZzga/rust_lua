@@ -3829,21 +3829,30 @@ fn parse_if(fs: &mut FuncState) {
     let mut if_jmp = NO_JUMP;
 
     if !is_const_true {
-        let pre_freereg = fs.freereg;
-        let cond_reg = fs.cond_to_reg(&ei.exp);
-        if matches!(ei.exp.kind, ExpKind::Relocable)
-            && !fs.proto.code.is_empty()
-            && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT
-        {
-            fs.proto.code.pop();
-            fs.pc -= 1;
-            fs.code_abc_k(OpCode::TEST, cond_reg, 0, 0, true);
+        if ei.exp.kind == ExpKind::VJMP {
+            let jmp_pc = ei.exp.info as i32;
+            fs.negate_condition(jmp_pc);
+            let mut false_list = ei.exp.f;
+            fs.concat_jump(&mut false_list, jmp_pc);
+            fs.patch_true_jumps(ei.exp.t, fs.pc);
+            if_jmp = false_list;
         } else {
-            fs.code_abc(OpCode::TEST, cond_reg, 0, 0);
-        }
-        if_jmp = fs.jump();
-        if fs.freereg > pre_freereg {
-            fs.free_reg();
+            let pre_freereg = fs.freereg;
+            let cond_reg = fs.cond_to_reg(&ei.exp);
+            if matches!(ei.exp.kind, ExpKind::Relocable)
+                && !fs.proto.code.is_empty()
+                && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT
+            {
+                fs.proto.code.pop();
+                fs.pc -= 1;
+                fs.code_abc_k(OpCode::TEST, cond_reg, 0, 0, true);
+            } else {
+                fs.code_abc(OpCode::TEST, cond_reg, 0, 0);
+            }
+            if_jmp = fs.jump();
+            if fs.freereg > pre_freereg {
+                fs.free_reg();
+            }
         }
     }
 
@@ -3867,21 +3876,30 @@ fn parse_if(fs: &mut FuncState) {
         let ei2 = parse_expr(fs);
         let is_const_true2 = matches!(ei2.exp.kind, ExpKind::Boolean) && ei2.exp.info != 0;
         if !is_const_true2 {
-            let pre_freereg2 = fs.freereg;
-            let cr2 = fs.cond_to_reg(&ei2.exp);
-            if matches!(ei2.exp.kind, ExpKind::Relocable)
-                && !fs.proto.code.is_empty()
-                && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT
-            {
-                fs.proto.code.pop();
-                fs.pc -= 1;
-                fs.code_abc_k(OpCode::TEST, cr2, 0, 0, true);
+            if ei2.exp.kind == ExpKind::VJMP {
+                let jmp_pc = ei2.exp.info as i32;
+                fs.negate_condition(jmp_pc);
+                let mut false_list = ei2.exp.f;
+                fs.concat_jump(&mut false_list, jmp_pc);
+                fs.patch_true_jumps(ei2.exp.t, fs.pc);
+                if_jmp = false_list;
             } else {
-                fs.code_abc(OpCode::TEST, cr2, 0, 0);
-            }
-            if_jmp = fs.jump();
-            if fs.freereg > pre_freereg2 {
-                fs.free_reg();
+                let pre_freereg2 = fs.freereg;
+                let cr2 = fs.cond_to_reg(&ei2.exp);
+                if matches!(ei2.exp.kind, ExpKind::Relocable)
+                    && !fs.proto.code.is_empty()
+                    && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT
+                {
+                    fs.proto.code.pop();
+                    fs.pc -= 1;
+                    fs.code_abc_k(OpCode::TEST, cr2, 0, 0, true);
+                } else {
+                    fs.code_abc(OpCode::TEST, cr2, 0, 0);
+                }
+                if_jmp = fs.jump();
+                if fs.freereg > pre_freereg2 {
+                    fs.free_reg();
+                }
             }
         } else {
             if_jmp = NO_JUMP;
