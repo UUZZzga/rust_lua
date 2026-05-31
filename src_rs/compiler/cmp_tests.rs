@@ -227,6 +227,7 @@ mod compiler_compare_tests {
         assert_inst_match("local a <const> = '123'; return a", None);
         assert_inst_match("local a <const> = 123; assert(a)", None);
         assert_inst_match("local a <const> = '123'; assert(a)", None);
+        assert_inst_match("local f; f, X = nil", None);
     }
 
     #[test]

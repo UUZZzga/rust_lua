@@ -1519,25 +1519,16 @@ fn parse_assign_or_call(fs: &mut FuncState) {
         } else {
             0
         };
-        let last_exp_reg = if extra_vars > 0 && !last_is_call {
+        let (last_exp_reg, nil_reg_start) = if extra_vars > 0 && !last_is_call {
             let last_exp = exps.last().unwrap();
-            if matches!(last_exp.kind, ExpKind::VJMP) || last_exp.has_jumps() {
-                Some(fs.exp_to_reg(last_exp))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-        let nil_reg_start = if extra_vars > 0 && !last_is_call {
-            let start = fs.freereg;
+            let exp_reg = fs.expr_to_reg(last_exp);
             for _ in 0..extra_vars {
                 fs.alloc_reg();
             }
-            fs.code_nil(start, extra_vars as i32);
-            start
+            fs.code_nil(exp_reg + 1, extra_vars as i32);
+            (Some(exp_reg), exp_reg + 1)
         } else {
-            -1
+            (None, -1)
         };
         if extra_vars > 0 && last_is_call {
             let nresults = (extra_vars + 1) as i32;
