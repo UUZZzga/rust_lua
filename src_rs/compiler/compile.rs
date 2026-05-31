@@ -1395,7 +1395,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 };
                 first = PrefixResult {
                     var_name: None, local_idx: None, key: None, reg: Some(base_reg),
-                    table_reg: Some(base_reg), table_key: Some(k), table_key_is_const: true,
+                    table_reg: Some(base_reg), table_key: Some(k), table_key_is_const: true, table_key_is_int: false,
                     key_allocated_reg: false,
                     allocated_reg: if first.is_env_upvalue { false } else { first.allocated_reg || first.reg.is_none() },
                     is_env_upvalue: first.is_env_upvalue,
@@ -1421,15 +1421,20 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 let saved_freereg_before = fs.freereg;
                 let ei = parse_expr(fs);
                 expect(fs, &Token::RBracket);
-                let (kr, key_is_const) = if ei.exp.kind == ExpKind::Str {
-                    (ei.exp.info as i32, true)
+                let (kr, key_is_const, key_is_int) = if ei.exp.kind == ExpKind::Str {
+                    (ei.exp.info as i32, true, false)
+                } else if ei.exp.kind == ExpKind::Int
+                    && ei.exp.info >= 0
+                    && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
+                {
+                    (ei.exp.info as i32, true, true)
                 } else {
-                    (fs.expr_to_reg(&ei.exp), false)
+                    (fs.expr_to_reg(&ei.exp), false, false)
                 };
                 let key_allocated = !key_is_const && fs.freereg > saved_freereg_before;
                 first = PrefixResult {
                     var_name: None, local_idx: None, key: None, reg: Some(base_reg),
-                    table_reg: Some(base_reg), table_key: Some(kr), table_key_is_const: key_is_const,
+                    table_reg: Some(base_reg), table_key: Some(kr), table_key_is_const: key_is_const, table_key_is_int: key_is_int,
                     key_allocated_reg: key_allocated,
                     allocated_reg: if first.is_env_upvalue { false } else { first.allocated_reg || first.reg.is_none() },
                     is_env_upvalue: first.is_env_upvalue,
@@ -1504,7 +1509,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 let v = &vars[i];
                 let val = &exps[i];
                 if let (Some(table_reg), Some(table_key)) = (v.table_reg, v.table_key) {
-                    let can_settabup = v.is_env_upvalue && v.table_key_is_const;
+                    let can_settabup = v.is_env_upvalue && v.table_key_is_const && !v.table_key_is_int;
                     if can_settabup {
                         let gettabup_pc = v.env_gettabup_pc;
                         let (env_k, adjusted_key) = if gettabup_pc >= 0 && (gettabup_pc as usize) < fs.proto.code.len() {
@@ -1534,7 +1539,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                             fs.free_reg();
                         }
                     } else {
-                        let set_op = if v.table_key_is_const { OpCode::SETFIELD } else { OpCode::SETTABLE };
+                        let set_op = if v.table_key_is_int { OpCode::SETI } else if v.table_key_is_const { OpCode::SETFIELD } else { OpCode::SETTABLE };
                         if let Some(k_val) = exp_to_k(fs, val) {
                             fs.code_abc_k(set_op, table_reg, table_key, k_val, true);
                         } else {
@@ -1925,6 +1930,7 @@ struct PrefixResult {
     table_reg: Option<i32>,
     table_key: Option<i32>,
     table_key_is_const: bool,
+    table_key_is_int: bool,
     key_allocated_reg: bool,
     allocated_reg: bool,
     is_env_upvalue: bool,
@@ -1972,17 +1978,17 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         fs.code_abx(OpCode::LOADK, r, ctc_info as i32);
                     }
                 };
-                PrefixResult { var_name: None, local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1 }
+                PrefixResult { var_name: None, local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1 }
             } else if let Some(reg) = fs.find_local(&name) {
-                PrefixResult { var_name: None, local_idx: Some(reg), key: None, reg: Some(reg), table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1 }
+                PrefixResult { var_name: None, local_idx: Some(reg), key: None, reg: Some(reg), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1 }
             } else if let Some(upval_idx) = fs.find_upvalue(&name) {
                 let r = fs.alloc_reg();
                 fs.code_abc(OpCode::GETUPVAL, r, upval_idx, 0);
-                PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: Some(upval_idx), env_gettabup_pc: -1 }
+                PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: Some(upval_idx), env_gettabup_pc: -1 }
             } else {
                 let is_env = name == "_ENV";
                 let k = if is_env { 0 } else { fs.string_k(&name) };
-                PrefixResult { var_name: Some(name), local_idx: None, key: Some(k), reg: None, table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: is_env, upval_idx: None, env_gettabup_pc: -1 }
+                PrefixResult { var_name: Some(name), local_idx: None, key: Some(k), reg: None, table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: is_env, upval_idx: None, env_gettabup_pc: -1 }
             };
 
             loop {
@@ -1991,6 +1997,32 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         fs.ls_mut().next();
                         let field = get_name(fs);
                         let k = fs.string_k(&field);
+                        if result.table_reg.is_some() {
+                            let prev_table = result.table_reg.unwrap();
+                            let prev_key = result.table_key.unwrap();
+                            if result.table_key_is_int {
+                                let r = fs.alloc_reg();
+                                fs.code_abc(OpCode::GETI, r, prev_table, prev_key);
+                                result.reg = Some(r);
+                                result.allocated_reg = true;
+                            } else if result.table_key_is_const {
+                                fs.code_abc(OpCode::GETFIELD, prev_table, prev_table, prev_key);
+                                result.reg = Some(prev_table);
+                            } else {
+                                if result.key_allocated_reg {
+                                    fs.free_reg();
+                                }
+                                let r = fs.alloc_reg();
+                                fs.code_abc(OpCode::GETTABLE, r, prev_table, prev_key);
+                                result.reg = Some(r);
+                                result.allocated_reg = true;
+                            }
+                            result.table_reg = None;
+                            result.table_key = None;
+                            result.table_key_is_const = false;
+                            result.table_key_is_int = false;
+                            result.key_allocated_reg = false;
+                        }
                         let (base_reg, gettabup_pc) = if let Some(r) = result.reg {
                             (r, -1)
                         } else if result.is_env_upvalue {
@@ -2003,7 +2035,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         };
                         result = PrefixResult {
                         var_name: None, local_idx: None, key: None, reg: Some(base_reg),
-                        table_reg: Some(base_reg), table_key: Some(k), table_key_is_const: true,
+                        table_reg: Some(base_reg), table_key: Some(k), table_key_is_const: true, table_key_is_int: false,
                         key_allocated_reg: false,
                         allocated_reg: if result.is_env_upvalue { false } else { result.allocated_reg || result.reg.is_none() },
                         is_env_upvalue: result.is_env_upvalue,
@@ -2013,6 +2045,32 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                 }
                 Token::LBracket => {
                     fs.ls_mut().next();
+                    if result.table_reg.is_some() {
+                        let prev_table = result.table_reg.unwrap();
+                        let prev_key = result.table_key.unwrap();
+                        if result.table_key_is_int {
+                            let r = fs.alloc_reg();
+                            fs.code_abc(OpCode::GETI, r, prev_table, prev_key);
+                            result.reg = Some(r);
+                            result.allocated_reg = true;
+                        } else if result.table_key_is_const {
+                            fs.code_abc(OpCode::GETFIELD, prev_table, prev_table, prev_key);
+                            result.reg = Some(prev_table);
+                        } else {
+                            if result.key_allocated_reg {
+                                fs.free_reg();
+                            }
+                            let r = fs.alloc_reg();
+                            fs.code_abc(OpCode::GETTABLE, r, prev_table, prev_key);
+                            result.reg = Some(r);
+                            result.allocated_reg = true;
+                        }
+                        result.table_reg = None;
+                        result.table_key = None;
+                        result.table_key_is_const = false;
+                        result.table_key_is_int = false;
+                        result.key_allocated_reg = false;
+                    }
                     let (base_reg, gettabup_pc) = if let Some(r) = result.reg {
                         (r, -1)
                     } else if result.is_env_upvalue {
@@ -2026,20 +2084,25 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     let saved_freereg_before = fs.freereg;
                     let ei = parse_expr(fs);
                     expect(fs, &Token::RBracket);
-                    let (kr, key_is_const) = if ei.exp.kind == ExpKind::Str {
-                        (ei.exp.info as i32, true)
+                    let (kr, key_is_const, key_is_int) = if ei.exp.kind == ExpKind::Str {
+                        (ei.exp.info as i32, true, false)
+                    } else if ei.exp.kind == ExpKind::Int
+                        && ei.exp.info >= 0
+                        && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
+                    {
+                        (ei.exp.info as i32, true, true)
                     } else if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei.exp.has_jumps() {
                         if ei.exp.info2 >= 0 {
                             fs.set_a(ei.exp.info2, ei.exp.info as i32);
                         }
-                        (ei.exp.info as i32, false)
+                        (ei.exp.info as i32, false, false)
                     } else {
-                        (fs.expr_to_reg(&ei.exp), false)
+                        (fs.expr_to_reg(&ei.exp), false, false)
                     };
                     let key_allocated = !key_is_const && fs.freereg > saved_freereg_before;
                     result = PrefixResult {
                         var_name: None, local_idx: None, key: None, reg: Some(base_reg),
-                        table_reg: Some(base_reg), table_key: Some(kr), table_key_is_const: key_is_const,
+                        table_reg: Some(base_reg), table_key: Some(kr), table_key_is_const: key_is_const, table_key_is_int: key_is_int,
                         key_allocated_reg: key_allocated,
                         allocated_reg: if result.is_env_upvalue { false } else { result.allocated_reg || result.reg.is_none() },
                         is_env_upvalue: result.is_env_upvalue,
@@ -2058,12 +2121,12 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
             let e = parse_expr(fs);
             expect(fs, &Token::RParen);
             let r = fs.expr_to_reg(&e.exp);
-            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1 }
+            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1 }
         }
         _ => {
             let e = parse_simple_exp(fs);
             let r = fs.expr_to_reg(&e.exp);
-            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1 }
+            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1 }
         }
     }
 }
