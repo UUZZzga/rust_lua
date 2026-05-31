@@ -609,6 +609,7 @@ mod compiler_compare_tests {
     #[test]
     fn test_repeat() {
         assert_inst_match("repeat until 1; repeat until true;", None);
+        assert_inst_match("local x = 1; repeat local a until x>=12", None);
     }
 
     // #[test]
