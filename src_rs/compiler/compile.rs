@@ -1595,7 +1595,13 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     }
                 } else if let Some(idx) = v.local_idx {
                     if i == exps.len() - 1 {
-                        store_expr_to_local(fs, val, idx);
+                        if let Some(val_reg) = last_exp_reg {
+                            if idx != val_reg {
+                                fs.code_abc(OpCode::MOVE, idx, val_reg, 0);
+                            }
+                        } else {
+                            store_expr_to_local(fs, val, idx);
+                        }
                     } else {
                         let val_reg = val.info as i32;
                         if idx != val_reg {

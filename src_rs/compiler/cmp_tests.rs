@@ -604,6 +604,8 @@ mod compiler_compare_tests {
         assert_inst_match("a = b('', 1 << 2)", None);
         assert_inst_match("local function a() end\na()", None);
         assert_inst_match("x = {f(1), f(2), f(3);};", None);
+        assert_inst_match("local a,b;a,b = F(1)~=nil", None);
+        assert_inst_match("local a,b;a,b = F(nil)==nil", None);
     }
 
     #[test]
