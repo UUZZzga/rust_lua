@@ -4027,9 +4027,11 @@ fn parse_do(fs: &mut FuncState) {
     fs.ls_mut().next();
     let saved_nlocals = fs.locals.len();
     let saved_freereg = fs.freereg;
-    let saved_needclose = fs.needclose;
+    let saved_nprotos = fs.proto.protos.len();
     parse_block(fs);
-    if fs.needclose && !saved_needclose {
+    let has_tbc = fs.locals[saved_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
+    let has_new_upvalue = fs.proto.protos[saved_nprotos..].iter().any(|p| !p.upvalues.is_empty());
+    if has_tbc || has_new_upvalue {
         fs.code_abc(OpCode::CLOSE, saved_freereg, 0, 0);
     }
     for local in &mut fs.locals[saved_nlocals..] {
