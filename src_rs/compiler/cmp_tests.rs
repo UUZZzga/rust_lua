@@ -452,6 +452,7 @@ mod compiler_compare_tests {
         assert_inst_match("if a.b ~= 0 then end",None);
         assert_inst_match("if _ENV.b == 0 then end",None);
         assert_inst_match("if _ENV.b ~= 0 then end",None);
+        assert_inst_match("local i = 0; if i % 60000 == 0 then end",None);
     }
 
     #[test]

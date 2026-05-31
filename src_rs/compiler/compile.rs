@@ -2209,7 +2209,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     let here = fs.pc;
                     fs.patch_true_jumps(e_left.t, here);
                     e_left.t = NO_JUMP;
-                    if reg_alloc || matches!(e_left.kind, ExpKind::Relocable) { fs.free_reg(); }
+                    if reg_alloc || (matches!(e_left.kind, ExpKind::Relocable) && reg >= fs.nvarstack()) { fs.free_reg(); }
                 }
             }
             
@@ -2260,7 +2260,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     let here = fs.pc;
                     fs.patch_false_jumps(e_left.f, here);
                     e_left.f = NO_JUMP;
-                    if reg_alloc || matches!(e_left.kind, ExpKind::Relocable) { fs.free_reg(); }
+                    if reg_alloc || (matches!(e_left.kind, ExpKind::Relocable) && reg >= fs.nvarstack()) { fs.free_reg(); }
                 }
             }
             
@@ -2336,7 +2336,10 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 };
                 fs.code_abc_k(imm_op, reg, imm, 0, k != 0);
                 let jmp_pc = fs.jump();
-                if reg_alloc || matches!(ec.kind, ExpKind::Relocable) || matches!(e2.exp.kind, ExpKind::Relocable) {
+                if reg_alloc
+                    || (matches!(ec.kind, ExpKind::Relocable) && reg >= fs.nvarstack())
+                    || (matches!(e2.exp.kind, ExpKind::Relocable) && reg >= fs.nvarstack())
+                {
                     fs.free_reg();
                 }
                 e = ExprItem { exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64) };
@@ -2357,7 +2360,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         };
                         fs.code_abc_k(OpCode::EQK, r2, k_idx, 0, is_eq_op);
                         let jmp_pc = fs.jump();
-                        if r2_alloc || matches!(e2.exp.kind, ExpKind::Relocable) { fs.free_reg(); }
+                        if r2_alloc || (matches!(e2.exp.kind, ExpKind::Relocable) && r2 >= fs.nvarstack()) { fs.free_reg(); }
                         e = ExprItem { exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64) };
                     } else {
                         let r_alloc = !matches!(ec.kind, ExpKind::Relocable | ExpKind::NonReloc);
@@ -2374,14 +2377,14 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             let sc = int_to_sc(e2.exp.info);
                             fs.code_abc_k(OpCode::EQI, r, sc, 0, is_eq_op);
                             let jmp_pc = fs.jump();
-                            if r_alloc || matches!(ec.kind, ExpKind::Relocable) { fs.free_reg(); }
+                            if r_alloc || (matches!(ec.kind, ExpKind::Relocable) && r >= fs.nvarstack()) { fs.free_reg(); }
                             e = ExprItem { exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64) };
                         } else {
                             let const_k = exp_to_const_k(fs, &e2.exp);
                             if let Some(k_idx) = const_k {
                                 fs.code_abc_k(OpCode::EQK, r, k_idx, 0, is_eq_op);
                                 let jmp_pc = fs.jump();
-                                if r_alloc || matches!(ec.kind, ExpKind::Relocable) { fs.free_reg(); }
+                                if r_alloc || (matches!(ec.kind, ExpKind::Relocable) && r >= fs.nvarstack()) { fs.free_reg(); }
                                 e = ExprItem { exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64) };
                             } else {
                                 let r2 = fs.expr_to_reg(&e2.exp);
@@ -2390,7 +2393,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                                 if !(matches!(e2.exp.kind, ExpKind::NonReloc) && (e2.exp.info as i32) < fs.nvarstack()) {
                                     fs.free_reg();
                                 }
-                                if r_alloc || matches!(ec.kind, ExpKind::Relocable) { fs.free_reg(); }
+                                if r_alloc || (matches!(ec.kind, ExpKind::Relocable) && r >= fs.nvarstack()) { fs.free_reg(); }
                                 e = ExprItem { exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64) };
                             }
                         }
@@ -2426,8 +2429,8 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     };
                     fs.code_abc_k(op, b, c, 0, k != 0);
                     let jmp_pc = fs.jump();
-                    if r2_alloc || matches!(e2.exp.kind, ExpKind::Relocable) { fs.free_reg(); }
-                    if r_alloc || matches!(ec.kind, ExpKind::Relocable) { fs.free_reg(); }
+                    if r2_alloc || (matches!(e2.exp.kind, ExpKind::Relocable) && r2 >= fs.nvarstack()) { fs.free_reg(); }
+                    if r_alloc || (matches!(ec.kind, ExpKind::Relocable) && r >= fs.nvarstack()) { fs.free_reg(); }
                     e = ExprItem { exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64) };
                 }
             }
@@ -3251,10 +3254,16 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
                     } else if let Some(k) = k_idx {
                         let op = if is_mul { OpCode::MULK } else if is_div { OpCode::DIVK } else { OpCode::MODK };
-                        let pc = fs.code_abc(op, r, r, k);
+                        let r_dest = if matches!(ec.kind, ExpKind::NonReloc) && (ec.info as i32) < fs.nvarstack() {
+                            fs.alloc_reg();
+                            (fs.freereg - 1) as i32
+                        } else {
+                            r
+                        };
+                        let pc = fs.code_abc(op, r_dest, r, k);
                         let tm = if is_mul { 8 } else if is_div { 11 } else { 9 };
                         fs.code_abc(OpCode::MMBINK, r, k, tm);
-                        e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r as i64, pc) };
+                        e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r_dest as i64, pc) };
                     } else {
                         let r2 = if matches!(e2.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !e2.exp.has_jumps() {
                             let reg = e2.exp.info as i32;
