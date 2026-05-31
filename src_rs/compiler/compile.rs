@@ -1669,14 +1669,21 @@ fn exp_to_k(fs: &mut FuncState, e: &ExpDesc) -> Option<i32> {
 fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
     match e.kind {
         ExpKind::Void | ExpKind::Nil => {
+            if e.t != NO_JUMP || e.f != NO_JUMP {
+                fs.code_nil(dest, 1);
+                fs.resolve_jumps(e, dest);
+                return;
+            }
             fs.code_nil(dest, 1);
         }
         ExpKind::Boolean => {
             if e.t != NO_JUMP || e.f != NO_JUMP {
-                let val_reg = fs.exp_to_reg(e);
-                if val_reg != dest {
-                    fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
+                if e.info != 0 {
+                    fs.code_abc(OpCode::LOADTRUE, dest, 0, 0);
+                } else {
+                    fs.code_abc(OpCode::LOADFALSE, dest, 0, 0);
                 }
+                fs.resolve_jumps(e, dest);
                 return;
             }
             if e.info != 0 {
@@ -1687,10 +1694,14 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
         }
         ExpKind::Int => {
             if e.t != NO_JUMP || e.f != NO_JUMP {
-                let val_reg = fs.exp_to_reg(e);
-                if val_reg != dest {
-                    fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
+                let v = e.info;
+                if v <= i16::MAX as i64 && v >= i16::MIN as i64 {
+                    fs.code_asbx(OpCode::LOADI, dest, v as i32);
+                } else {
+                    let k = fs.int_k(v);
+                    fs.code_abx(OpCode::LOADK, dest, k);
                 }
+                fs.resolve_jumps(e, dest);
                 return;
             }
             let v = e.info;
@@ -1703,10 +1714,15 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
         }
         ExpKind::Float => {
             if e.t != NO_JUMP || e.f != NO_JUMP {
-                let val_reg = fs.exp_to_reg(e);
-                if val_reg != dest {
-                    fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
+                let f = f64::from_bits(e.info as u64);
+                let fi = f as i64;
+                if (fi as f64) == f && fits_sbx(fi) {
+                    fs.code_asbx(OpCode::LOADF, dest, fi as i32);
+                } else {
+                    let k = fs.float_k(f);
+                    fs.code_abx(OpCode::LOADK, dest, k);
                 }
+                fs.resolve_jumps(e, dest);
                 return;
             }
             let f = f64::from_bits(e.info as u64);
@@ -1720,23 +1736,11 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
         }
         ExpKind::Str => {
             if e.t != NO_JUMP || e.f != NO_JUMP {
-                let val_reg = fs.exp_to_reg(e);
-                if val_reg != dest {
-                    fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
-                }
+                fs.code_abx(OpCode::LOADK, dest, e.info as i32);
+                fs.resolve_jumps(e, dest);
                 return;
             }
             fs.code_abx(OpCode::LOADK, dest, e.info as i32);
-        }
-        ExpKind::Void | ExpKind::Nil => {
-            if e.t != NO_JUMP || e.f != NO_JUMP {
-                let val_reg = fs.exp_to_reg(e);
-                if val_reg != dest {
-                    fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
-                }
-                return;
-            }
-            fs.code_nil(dest, 1);
         }
         ExpKind::VJMP => {
             let jmp_pc = e.info as i32;

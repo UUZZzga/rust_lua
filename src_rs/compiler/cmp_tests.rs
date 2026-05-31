@@ -532,6 +532,8 @@ mod compiler_compare_tests {
         assert_inst_match("a,b = F(1)~=nil", None);
         assert_inst_match("local a,b = F(1)~=nil", None);
         assert_inst_match("assert(a() == b[2] and c == not not b[2])", None);
+        assert_inst_match("local x; x = 2<3 and not 3", None);
+        assert_inst_match("local x; x = 2<1 or (2>1 and 'a')", None);
     }
 
     #[test]
