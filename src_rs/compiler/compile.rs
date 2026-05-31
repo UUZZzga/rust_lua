@@ -1490,7 +1490,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         if let Some(k_val) = exp_to_k(fs, val) {
                             fs.code_abc_k(OpCode::SETTABUP, 0, adjusted_key, k_val, true);
                         } else {
-                            let val_reg = fs.expr_to_reg(val);
+                            let val_reg = fs.exp_to_reg(val);
                             fs.code_abc(OpCode::SETTABUP, 0, adjusted_key, val_reg);
                             if val_reg >= fs.nvarstack() {
                                 fs.free_reg();
@@ -1504,7 +1504,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         if let Some(k_val) = exp_to_k(fs, val) {
                             fs.code_abc_k(set_op, table_reg, table_key, k_val, true);
                         } else {
-                            let val_reg = fs.expr_to_reg(val);
+                            let val_reg = fs.exp_to_reg(val);
                             fs.code_abc_k(set_op, table_reg, table_key, val_reg, false);
                             if val_reg >= fs.nvarstack() {
                                 fs.free_reg();
@@ -1518,7 +1518,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         }
                     }
                 } else if let Some(upval_idx) = v.upval_idx {
-                    let val_reg = fs.expr_to_reg(val);
+                    let val_reg = fs.exp_to_reg(val);
                     fs.code_abc(OpCode::SETUPVAL, val_reg, upval_idx, 0);
                     fs.free_reg();
                     if v.allocated_reg {
@@ -1529,7 +1529,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     if let Some(k_val) = exp_to_k(fs, val) {
                         fs.code_abc_k(OpCode::SETTABUP, 0, k_name, k_val, true);
                     } else {
-                        let val_reg = fs.expr_to_reg(val);
+                        let val_reg = fs.exp_to_reg(val);
                         fs.code_abc(OpCode::SETTABUP, 0, k_name, val_reg);
                         if val_reg >= fs.nvarstack() {
                             fs.free_reg();
@@ -1582,6 +1582,9 @@ fn parse_assign_or_call(fs: &mut FuncState) {
 
 /// 将常量表达式转换为常量表索引 (≤255 则返回)
 fn exp_to_k(fs: &mut FuncState, e: &ExpDesc) -> Option<i32> {
+    if e.t != NO_JUMP || e.f != NO_JUMP {
+        return None;
+    }
     let info = match e.kind {
         ExpKind::Int => fs.int_k(e.info),
         ExpKind::Float => {
@@ -1605,6 +1608,13 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
             fs.code_abc(OpCode::LOADNIL, dest, 0, 0);
         }
         ExpKind::Boolean => {
+            if e.t != NO_JUMP || e.f != NO_JUMP {
+                let val_reg = fs.exp_to_reg(e);
+                if val_reg != dest {
+                    fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
+                }
+                return;
+            }
             if e.info != 0 {
                 fs.code_abc(OpCode::LOADTRUE, dest, 0, 0);
             } else {
@@ -1612,6 +1622,13 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
             }
         }
         ExpKind::Int => {
+            if e.t != NO_JUMP || e.f != NO_JUMP {
+                let val_reg = fs.exp_to_reg(e);
+                if val_reg != dest {
+                    fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
+                }
+                return;
+            }
             let v = e.info;
             if v <= i16::MAX as i64 && v >= i16::MIN as i64 {
                 fs.code_asbx(OpCode::LOADI, dest, v as i32);
@@ -1621,6 +1638,13 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
             }
         }
         ExpKind::Float => {
+            if e.t != NO_JUMP || e.f != NO_JUMP {
+                let val_reg = fs.exp_to_reg(e);
+                if val_reg != dest {
+                    fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
+                }
+                return;
+            }
             let f = f64::from_bits(e.info as u64);
             let fi = f as i64;
             if (fi as f64) == f && fits_sbx(fi) {
@@ -1631,7 +1655,24 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
             }
         }
         ExpKind::Str => {
+            if e.t != NO_JUMP || e.f != NO_JUMP {
+                let val_reg = fs.exp_to_reg(e);
+                if val_reg != dest {
+                    fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
+                }
+                return;
+            }
             fs.code_abx(OpCode::LOADK, dest, e.info as i32);
+        }
+        ExpKind::Void | ExpKind::Nil => {
+            if e.t != NO_JUMP || e.f != NO_JUMP {
+                let val_reg = fs.exp_to_reg(e);
+                if val_reg != dest {
+                    fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
+                }
+                return;
+            }
+            fs.code_abc(OpCode::LOADNIL, dest, 0, 0);
         }
         ExpKind::VJMP => {
             let jmp_pc = e.info as i32;
