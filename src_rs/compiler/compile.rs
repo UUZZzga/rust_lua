@@ -372,6 +372,25 @@ impl FuncState {
         }
     }
 
+    fn code_nil(&mut self, from: i32, n: i32) {
+        let l = from + n - 1;
+        if self.pc > 0 {
+            let previous = self.proto.code[self.pc as usize - 1];
+            if get_opcode(previous) == OpCode::LOADNIL {
+                let pfrom = getarg_a(previous);
+                let pl = pfrom + getarg_b(previous);
+                if (pfrom <= from && from <= pl + 1) || (from <= pfrom && pfrom <= l + 1) {
+                    let new_from = if pfrom < from { pfrom } else { from };
+                    let new_l = if pl > l { pl } else { l };
+                    self.set_a(self.pc - 1, new_from);
+                    self.set_b(self.pc - 1, new_l - new_from);
+                    return;
+                }
+            }
+        }
+        self.code_abc(OpCode::LOADNIL, from, n - 1, 0);
+    }
+
     /// 生成 IABx 模式指令: `op a bx` (无符号偏移)
     fn code_abx(&mut self, op: OpCode, a: i32, bx: i32) -> i32 {
         let ins = ((op as u32) << POS_OP) | ((a as u32) << POS_A) | ((bx as u32) << POS_BX);
@@ -767,23 +786,8 @@ impl FuncState {
     fn expr_to_reg(&mut self, e: &ExpDesc) -> i32 {
         match e.kind {
             ExpKind::Void | ExpKind::Nil => {
-                if self.pc > 0 {
-                    let last_ins = self.proto.code[self.pc as usize - 1];
-                    if get_opcode(last_ins) == OpCode::LOADNIL {
-                        let last_a = getarg_a(last_ins);
-                        let last_b = getarg_b(last_ins);
-                        if last_a + last_b + 1 == self.freereg {
-                            self.set_b(self.pc - 1, last_b + 1);
-                            self.freereg += 1;
-                            if self.freereg > self.max_freereg {
-                                self.max_freereg = self.freereg;
-                            }
-                            return self.freereg - 1;
-                        }
-                    }
-                }
                 let r = self.alloc_reg();
-                self.code_abc(OpCode::LOADNIL, r, 0, 0);
+                self.code_nil(r, 1);
                 r
             }
             ExpKind::Boolean => {
@@ -1494,7 +1498,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
             for _ in 0..extra_vars {
                 fs.alloc_reg();
             }
-            fs.code_abc(OpCode::LOADNIL, start, extra_vars as i32 - 1, 0);
+            fs.code_nil(start, extra_vars as i32);
             start
         } else {
             -1
@@ -1656,7 +1660,7 @@ fn exp_to_k(fs: &mut FuncState, e: &ExpDesc) -> Option<i32> {
 fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
     match e.kind {
         ExpKind::Void | ExpKind::Nil => {
-            fs.code_abc(OpCode::LOADNIL, dest, 0, 0);
+            fs.code_nil(dest, 1);
         }
         ExpKind::Boolean => {
             if e.t != NO_JUMP || e.f != NO_JUMP {
@@ -1723,7 +1727,7 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
                 }
                 return;
             }
-            fs.code_abc(OpCode::LOADNIL, dest, 0, 0);
+            fs.code_nil(dest, 1);
         }
         ExpKind::VJMP => {
             let jmp_pc = e.info as i32;
@@ -1972,7 +1976,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         }
                     }
                     ExpKind::Nil => {
-                        fs.code_abc(OpCode::LOADNIL, r, 0, 0);
+                        fs.code_nil(r, 1);
                     }
                     _ => {
                         fs.code_abx(OpCode::LOADK, r, ctc_info as i32);
@@ -4167,7 +4171,7 @@ fn parse_for(fs: &mut FuncState) {
         }
         
         if !last_is_call && nexps < 4 {
-            fs.code_abc(OpCode::LOADNIL, base + nexps, 3 - nexps, 0);
+            fs.code_nil(base + nexps, 4 - nexps);
         }
         fs.set_freereg(base + 3 + ncontrol);
         fs.needclose = true;
@@ -4383,14 +4387,14 @@ fn parse_local(fs: &mut FuncState) {
 
             if !last_is_call && n_vals < n_reg {
                 let remaining = n_reg - n_vals;
-                fs.code_abc(OpCode::LOADNIL, saved_freereg + n_vals as i32, remaining as i32 - 1, 0);
+                fs.code_nil(saved_freereg + n_vals as i32, remaining as i32);
             }
         } else {
             let start_reg = fs.add_local_kind(&names[0], fs.pc, kinds[0]);
             for i in 1..nvars {
                 fs.add_local_kind(&names[i], fs.pc, kinds[i]);
             }
-            fs.code_abc(OpCode::LOADNIL, start_reg, nvars as i32 - 1, 0);
+            fs.code_nil(start_reg, nvars as i32);
         }
 
         for (i, &kind) in kinds.iter().enumerate() {

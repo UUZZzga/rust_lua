@@ -220,6 +220,7 @@ mod compiler_compare_tests {
 
     #[test]
     fn test_assign_local() {
+        assert_inst_match("local a\nlocal b\nlocal c", None);
         assert_inst_match("local a = 1 + 2\nlocal b = a * 3\nlocal c = a - 1", None);
         assert_inst_match("local a = 1 + 2\nlocal d = a + 5\nlocal e = a & 2", None);
         assert_inst_match("local a <const> = 123; return a", None);
