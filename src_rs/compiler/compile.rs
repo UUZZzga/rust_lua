@@ -2049,6 +2049,9 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         let prev_table = result.table_reg.unwrap();
                         let prev_key = result.table_key.unwrap();
                         if result.table_key_is_int {
+                            if result.allocated_reg {
+                                fs.free_reg();
+                            }
                             let r = fs.alloc_reg();
                             fs.code_abc(OpCode::GETI, r, prev_table, prev_key);
                             result.reg = Some(r);
@@ -2058,6 +2061,9 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                             result.reg = Some(prev_table);
                         } else {
                             if result.key_allocated_reg {
+                                fs.free_reg();
+                            }
+                            if result.allocated_reg {
                                 fs.free_reg();
                             }
                             let r = fs.alloc_reg();

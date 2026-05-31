@@ -569,6 +569,7 @@ mod compiler_compare_tests {
         assert_inst_match("local a; a={y=1}", None);
         assert_inst_match("local abc = {{'(0==_ENV.a)', 0 == _ENV.a}}", None);
         assert_inst_match("local a = {{'a', 1}}; a[1][2] = 2", None);
+        assert_inst_match("a[1][2] = 2", None);
     }
 
     #[test]
