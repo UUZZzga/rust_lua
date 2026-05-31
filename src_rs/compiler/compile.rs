@@ -1065,6 +1065,36 @@ impl FuncState {
     }
 }
 
+/// 编译后处理：对 RETURN 指令做最终优化和调整
+/// 参照 C++ luaK_finish 实现
+fn parse_chunk_finish(fs: &mut FuncState) {
+    let proto = &mut fs.proto;
+    for i in 0..proto.code.len() {
+        let inst = &mut proto.code[i];
+        let op = get_opcode(*inst);
+        match op {
+            OpCode::RETURN0 | OpCode::RETURN1 => {
+                if !(fs.needclose || (proto.flag & PF_VAHID) != 0) {
+                    continue;
+                }
+                SET_OPCODE(inst, OpCode::RETURN);
+            }
+            _ => {}
+        }
+        match op {
+            OpCode::RETURN0 | OpCode::RETURN1 | OpCode::RETURN | OpCode::TAILCALL => {
+                if fs.needclose {
+                    SETARG_k(inst, 1);
+                }
+                if (proto.flag & PF_VAHID) != 0 {
+                    SETARG_C(inst, proto.num_params as i32 + 1);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 // ============================================================================
 // Token utilities
 // ============================================================================
@@ -1130,6 +1160,7 @@ fn parse_chunk(fs: &mut FuncState) {
     }
     let nvarstack = fs.nvarstack();
     fs.return_stat_gen(nvarstack, 0);
+    parse_chunk_finish(fs);
 }
 
 /// ANTLR4: `block: statement* ;` — 解析代码块语句序列，直到遇到块结束标记

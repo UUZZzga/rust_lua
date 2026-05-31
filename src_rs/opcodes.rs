@@ -103,6 +103,9 @@ pub const MAX_FSTACK: u8 = NO_REG;
 #[inline] pub fn getarg_c(i: Instruction) -> i32 { getarg(i, POS_C, SIZE_C) }
 #[inline] pub fn testarg_k(i: Instruction) -> bool { (i & (1u32 << POS_K)) != 0 }
 #[inline] pub fn getarg_bx(i: Instruction) -> i32 { getarg(i, POS_BX, SIZE_BX) }
+#[inline] pub fn SET_OPCODE(i: &mut Instruction, o: OpCode) { *i = (*i & mask0(SIZE_OP, POS_OP)) | ((o as u32) << POS_OP); }
+#[inline] pub fn SETARG_k(i: &mut Instruction, v: u32) { setarg(i, v as i32, POS_K, 1); }
+#[inline] pub fn SETARG_C(i: &mut Instruction, v: i32) { setarg(i, v, POS_C, SIZE_C); }
 #[inline] pub fn getarg_sbx(i: Instruction) -> i32 { getarg(i, POS_BX, SIZE_BX) - OFFSET_SBX }
 #[inline] pub fn getarg_sj(i: Instruction) -> i32 {
     let v = getarg(i, POS_SJ, SIZE_BX + SIZE_A);

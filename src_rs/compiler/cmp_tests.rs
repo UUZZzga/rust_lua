@@ -325,6 +325,7 @@ mod compiler_compare_tests {
         assert_inst_match("return {123456789}", None);
         assert_inst_match("return {'123456789'}", None);
         assert_inst_match("return {3, 100, 5.0, -10}", None);
+        assert_inst_match("if a then return 'a' end; local b = {}; for _ in pairs(b) do end", None);
     }
 
     #[test]
