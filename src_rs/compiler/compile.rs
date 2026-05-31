@@ -1391,25 +1391,23 @@ fn parse_assign_or_call(fs: &mut FuncState) {
     let mut has_call = false;
     let mut extra_free = false;
     let mut freg: i32 = 0;
+    let mut call_pc: i32 = -1;
     if check(fs, &Token::LParen) || check(fs, &Token::Colon) || check(fs, &Token::LBrace) || matches!(&fs.ls().token, Token::String(..)) {
         has_call = true;
-        let (fr, ef, _) = load_func(fs, &first);
+        let (fr, ef, func_allocated) = load_func(fs, &first);
         freg = fr;
         extra_free = ef;
-        let _start_pc = fs.pc;
-        parse_func_args(fs, freg);
+        call_pc = parse_func_args(fs, freg);
         loop {
             match &fs.ls().token {
                 Token::LParen | Token::LBrace | Token::String(_) | Token::Colon => {
-                    parse_func_args(fs, freg);
+                    call_pc = parse_func_args(fs, freg);
                 }
                 _ => break,
             }
         }
-        if has_call {
-            let last_pc = fs.pc - 1;
-            fs.set_c(last_pc, 1);
-        }
+        first.reg = Some(freg);
+        first.allocated_reg = func_allocated;
     }
     
     loop {
@@ -1485,6 +1483,9 @@ fn parse_assign_or_call(fs: &mut FuncState) {
     }
     
     if has_call && !check(fs, &Token::Eq) && !check(fs, &Token::Comma) {
+        if call_pc >= 0 {
+            fs.set_c(call_pc, 1);
+        }
         fs.set_freereg(fs.nvarstack());
         return;
     }
