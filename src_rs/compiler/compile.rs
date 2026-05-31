@@ -1380,30 +1380,43 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 fs.ls_mut().next();
                 let field = get_name(fs);
                 let k = fs.string_k(&field);
-                let base_reg = if let Some(r) = first.reg { r } else {
+                let (base_reg, gettabup_pc) = if let Some(r) = first.reg {
+                    (r, -1)
+                } else if first.is_env_upvalue {
+                    (0, -1)
+                } else {
                     let r = fs.alloc_reg();
-                    if let Some(key) = first.key {
-                        fs.code_abc(OpCode::GETTABUP, r, 0, key);
-                    }
-                    r
+                    let pc = if let Some(key) = first.key {
+                        fs.code_abc(OpCode::GETTABUP, r, 0, key)
+                    } else {
+                        -1
+                    };
+                    (r, pc)
                 };
                 first = PrefixResult {
                     var_name: None, local_idx: None, key: None, reg: Some(base_reg),
                     table_reg: Some(base_reg), table_key: Some(k), table_key_is_const: true,
                     key_allocated_reg: false,
-                    allocated_reg: first.allocated_reg || first.reg.is_none(),
+                    allocated_reg: if first.is_env_upvalue { false } else { first.allocated_reg || first.reg.is_none() },
                     is_env_upvalue: first.is_env_upvalue,
                     upval_idx: first.upval_idx,
+                    env_gettabup_pc: if first.is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { first.env_gettabup_pc } },
                 };
             }
             Token::LBracket => {
                 fs.ls_mut().next();
-                let base_reg = if let Some(r) = first.reg { r } else {
+                let (base_reg, gettabup_pc) = if let Some(r) = first.reg {
+                    (r, -1)
+                } else if first.is_env_upvalue {
+                    (0, -1)
+                } else {
                     let r = fs.alloc_reg();
-                    if let Some(key) = first.key {
-                        fs.code_abc(OpCode::GETTABUP, r, 0, key);
-                    }
-                    r
+                    let pc = if let Some(key) = first.key {
+                        fs.code_abc(OpCode::GETTABUP, r, 0, key)
+                    } else {
+                        -1
+                    };
+                    (r, pc)
                 };
                 let saved_freereg_before = fs.freereg;
                 let ei = parse_expr(fs);
@@ -1418,9 +1431,10 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     var_name: None, local_idx: None, key: None, reg: Some(base_reg),
                     table_reg: Some(base_reg), table_key: Some(kr), table_key_is_const: key_is_const,
                     key_allocated_reg: key_allocated,
-                    allocated_reg: first.allocated_reg || first.reg.is_none(),
+                    allocated_reg: if first.is_env_upvalue { false } else { first.allocated_reg || first.reg.is_none() },
                     is_env_upvalue: first.is_env_upvalue,
                     upval_idx: first.upval_idx,
+                    env_gettabup_pc: if first.is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { first.env_gettabup_pc } },
                 };
             }
             _ => break,
@@ -1492,11 +1506,17 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 if let (Some(table_reg), Some(table_key)) = (v.table_reg, v.table_key) {
                     let can_settabup = v.is_env_upvalue && v.table_key_is_const;
                     if can_settabup {
-                        let gettabup_inst = fs.proto.code.pop().unwrap();
-                        fs.pc -= 1;
-                        let env_k = getarg_c(gettabup_inst);
-                        fs.proto.constants.remove(env_k as usize);
-                        let adjusted_key = if (env_k as i32) < table_key { table_key - 1 } else { table_key };
+                        let gettabup_pc = v.env_gettabup_pc;
+                        let (env_k, adjusted_key) = if gettabup_pc >= 0 && (gettabup_pc as usize) < fs.proto.code.len() {
+                            let gettabup_inst = fs.proto.code.remove(gettabup_pc as usize);
+                            fs.pc -= 1;
+                            let env_k = getarg_c(gettabup_inst);
+                            fs.proto.constants.remove(env_k as usize);
+                            let adjusted_key = if (env_k as i32) < table_key { table_key - 1 } else { table_key };
+                            (env_k, adjusted_key)
+                        } else {
+                            (0i32, table_key)
+                        };
                         if let Some(k_val) = exp_to_k(fs, val) {
                             fs.code_abc_k(OpCode::SETTABUP, 0, adjusted_key, k_val, true);
                         } else {
@@ -1909,6 +1929,7 @@ struct PrefixResult {
     allocated_reg: bool,
     is_env_upvalue: bool,
     upval_idx: Option<i32>,
+    env_gettabup_pc: i32,
 }
 
 /// ANTLR4: `prefixexp: varOrExp | functioncall | '(' expr ')' ;` 以及 `var: NAME | prefixexp '[' expr ']' | prefixexp '.' NAME ;`
@@ -1951,17 +1972,17 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         fs.code_abx(OpCode::LOADK, r, ctc_info as i32);
                     }
                 };
-                PrefixResult { var_name: None, local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None }
+                PrefixResult { var_name: None, local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1 }
             } else if let Some(reg) = fs.find_local(&name) {
-                PrefixResult { var_name: None, local_idx: Some(reg), key: None, reg: Some(reg), table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: None }
+                PrefixResult { var_name: None, local_idx: Some(reg), key: None, reg: Some(reg), table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1 }
             } else if let Some(upval_idx) = fs.find_upvalue(&name) {
                 let r = fs.alloc_reg();
                 fs.code_abc(OpCode::GETUPVAL, r, upval_idx, 0);
-                PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: Some(upval_idx) }
+                PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: Some(upval_idx), env_gettabup_pc: -1 }
             } else {
-                let k = fs.string_k(&name);
                 let is_env = name == "_ENV";
-                PrefixResult { var_name: Some(name), local_idx: None, key: Some(k), reg: None, table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: is_env, upval_idx: None }
+                let k = if is_env { 0 } else { fs.string_k(&name) };
+                PrefixResult { var_name: Some(name), local_idx: None, key: Some(k), reg: None, table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: is_env, upval_idx: None, env_gettabup_pc: -1 }
             };
 
             loop {
@@ -1970,32 +1991,37 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         fs.ls_mut().next();
                         let field = get_name(fs);
                         let k = fs.string_k(&field);
-                        let base_reg = if let Some(r) = result.reg {
-                            r
+                        let (base_reg, gettabup_pc) = if let Some(r) = result.reg {
+                            (r, -1)
+                        } else if result.is_env_upvalue {
+                            (0, -1)
                         } else {
                             let r = fs.alloc_reg();
                             let gk = result.key.unwrap_or(0);
-                            fs.code_abc(OpCode::GETTABUP, r, 0, gk);
-                            r
+                            let pc = fs.code_abc(OpCode::GETTABUP, r, 0, gk);
+                            (r, pc)
                         };
                         result = PrefixResult {
                         var_name: None, local_idx: None, key: None, reg: Some(base_reg),
                         table_reg: Some(base_reg), table_key: Some(k), table_key_is_const: true,
                         key_allocated_reg: false,
-                        allocated_reg: result.allocated_reg || result.reg.is_none(),
+                        allocated_reg: if result.is_env_upvalue { false } else { result.allocated_reg || result.reg.is_none() },
                         is_env_upvalue: result.is_env_upvalue,
                         upval_idx: result.upval_idx,
+                        env_gettabup_pc: if result.is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { result.env_gettabup_pc } },
                     };
                 }
                 Token::LBracket => {
                     fs.ls_mut().next();
-                    let base_reg = if let Some(r) = result.reg {
-                        r
+                    let (base_reg, gettabup_pc) = if let Some(r) = result.reg {
+                        (r, -1)
+                    } else if result.is_env_upvalue {
+                        (0, -1)
                     } else {
                         let r = fs.alloc_reg();
                         let gk = result.key.unwrap_or(0);
-                        fs.code_abc(OpCode::GETTABUP, r, 0, gk);
-                        r
+                        let pc = fs.code_abc(OpCode::GETTABUP, r, 0, gk);
+                        (r, pc)
                     };
                     let saved_freereg_before = fs.freereg;
                     let ei = parse_expr(fs);
@@ -2015,9 +2041,10 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         var_name: None, local_idx: None, key: None, reg: Some(base_reg),
                         table_reg: Some(base_reg), table_key: Some(kr), table_key_is_const: key_is_const,
                         key_allocated_reg: key_allocated,
-                        allocated_reg: result.allocated_reg || result.reg.is_none(),
+                        allocated_reg: if result.is_env_upvalue { false } else { result.allocated_reg || result.reg.is_none() },
                         is_env_upvalue: result.is_env_upvalue,
                         upval_idx: result.upval_idx,
+                        env_gettabup_pc: if result.is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { result.env_gettabup_pc } },
                     };
                     }
                     _ => break,
@@ -2031,12 +2058,12 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
             let e = parse_expr(fs);
             expect(fs, &Token::RParen);
             let r = fs.expr_to_reg(&e.exp);
-            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None }
+            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1 }
         }
         _ => {
             let e = parse_simple_exp(fs);
             let r = fs.expr_to_reg(&e.exp);
-            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None }
+            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1 }
         }
     }
 }
