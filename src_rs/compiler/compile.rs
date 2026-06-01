@@ -4658,16 +4658,27 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                 }
                 fs.ls_mut().next();
                 let ek = parse_expr(fs);
-                let k_r = fs.exp_to_reg(&ek.exp);
                 expect(fs, &Token::RBracket);
                 expect(fs, &Token::Eq);
                 let ev = parse_expr(fs);
                 let (v_rk, is_k) = exp2rk(fs, &ev.exp);
-                fs.code_abc_k(OpCode::SETTABLE, table_r, k_r, v_rk, is_k);
+                if ek.exp.kind == ExpKind::Str {
+                    let k = ek.exp.info as i32;
+                    fs.code_abc_k(OpCode::SETFIELD, table_r, k, v_rk, is_k);
+                } else if ek.exp.kind == ExpKind::Int
+                    && ek.exp.info >= 0
+                    && ek.exp.info <= ((1u32 << SIZE_C) - 1) as i64
+                {
+                    let k = ek.exp.info as i32;
+                    fs.code_abc_k(OpCode::SETI, table_r, k, v_rk, is_k);
+                } else {
+                    let k_r = fs.exp_to_reg(&ek.exp);
+                    fs.code_abc_k(OpCode::SETTABLE, table_r, k_r, v_rk, is_k);
+                    fs.free_reg();
+                }
                 if !is_k {
                     fs.free_reg();
                 }
-                fs.free_reg();
                 need_hash += 1;
             } else if let Token::Name(s) = &fs.ls().token {
                 let name = s.clone();

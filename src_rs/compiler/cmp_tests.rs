@@ -461,6 +461,7 @@ mod compiler_compare_tests {
         assert_inst_match("_ENV.a = b.c(0, 1)", None);
         assert_inst_match("local a = {}; getmetatable(a).__index = function () end", None);
         assert_inst_match("local e, m; assert(not e and m:find(\"'newindex'\"))", None);
+        assert_inst_match("local a = {['a'] = '', ['b'] = '', ['c'] = '', ['d'] = '', ['e'] = '', ['f'] = '', ['g'] = ''}", None);
     }
 
     #[test]
