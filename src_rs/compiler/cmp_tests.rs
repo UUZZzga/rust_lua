@@ -231,6 +231,7 @@ mod compiler_compare_tests {
         assert_inst_match("local a <const> = '123'; assert(a)", None);
         assert_inst_match("local f; f, X = nil", None);
         assert_inst_match("local a, b; assert(a * b > 2.0^32)", None);
+        assert_inst_match("local max, s, err; assert(not s and string.find(err, string.rep('', 10)) and #string.gsub(err, '', '') >= max)", None);
     }
 
     #[test]
