@@ -409,6 +409,7 @@ mod compiler_compare_tests {
         assert_inst_match("do local a = {} local function f () local b = a end f() end", None);
         assert_inst_match("do local a, b = {}, {} local function f () local c = a end f() end", None);
         assert_inst_match("do local a, b = {}, {} local function f () local c = b end f() end", None);
+        assert_inst_match("if not a then local b local function f(x) local x = t.f(x) return b .. x end end ", None);
     }
 
     #[test]

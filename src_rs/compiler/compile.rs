@@ -4029,7 +4029,13 @@ fn parse_if(fs: &mut FuncState) {
     let block_freereg = entry_freereg;
     fs.set_freereg(block_freereg);
     let saved_nlocals = fs.locals.len();
+    let pre_close = fs.needclose;
+    fs.needclose = false;
     parse_block(fs);
+    if fs.needclose {
+        fs.code_abc(OpCode::CLOSE, block_freereg, 0, 0);
+    }
+    fs.needclose = pre_close || fs.needclose;
     for local in &mut fs.locals[saved_nlocals..] {
         local.active = false;
     }
@@ -4077,7 +4083,13 @@ fn parse_if(fs: &mut FuncState) {
         expect(fs, &Token::Then);
         fs.set_freereg(block_freereg);
         let saved_nlocals = fs.locals.len();
+        let pre_close = fs.needclose;
+        fs.needclose = false;
         parse_block(fs);
+        if fs.needclose {
+            fs.code_abc(OpCode::CLOSE, block_freereg, 0, 0);
+        }
+        fs.needclose = pre_close || fs.needclose;
         for local in &mut fs.locals[saved_nlocals..] {
             local.active = false;
         }
@@ -4093,7 +4105,13 @@ fn parse_if(fs: &mut FuncState) {
         fs.ls_mut().next();
         fs.set_freereg(block_freereg);
         let saved_nlocals = fs.locals.len();
+        let pre_close = fs.needclose;
+        fs.needclose = false;
         parse_block(fs);
+        if fs.needclose {
+            fs.code_abc(OpCode::CLOSE, block_freereg, 0, 0);
+        }
+        fs.needclose = pre_close || fs.needclose;
         for local in &mut fs.locals[saved_nlocals..] {
             local.active = false;
         }
@@ -4140,7 +4158,13 @@ fn parse_while(fs: &mut FuncState) {
     let block_freereg = entry_freereg;
     fs.set_freereg(block_freereg);
     let saved_nlocals = fs.locals.len();
+    let pre_close = fs.needclose;
+    fs.needclose = false;
     parse_block(fs);
+    if fs.needclose {
+        fs.code_abc(OpCode::CLOSE, block_freereg, 0, 0);
+    }
+    fs.needclose = pre_close || fs.needclose;
     for local in &mut fs.locals[saved_nlocals..] {
         local.active = false;
     }
@@ -4186,7 +4210,13 @@ fn parse_repeat(fs: &mut FuncState) {
     let block_freereg = entry_freereg;
     fs.set_freereg(block_freereg);
     let saved_nlocals = fs.locals.len();
+    let pre_close = fs.needclose;
+    fs.needclose = false;
     parse_block(fs);
+    if fs.needclose {
+        fs.code_abc(OpCode::CLOSE, block_freereg, 0, 0);
+    }
+    fs.needclose = pre_close || fs.needclose;
     fs.set_freereg(block_freereg);
     expect(fs, &Token::Until);
     let ei = parse_expr(fs);
