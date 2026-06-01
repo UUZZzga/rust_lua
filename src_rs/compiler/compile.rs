@@ -4322,7 +4322,13 @@ fn parse_for(fs: &mut FuncState) {
         let saved_breaklist = fs.break_list;
         fs.break_list = NO_JUMP;
 
+        let pre_close = fs.needclose;
+        fs.needclose = false;
         parse_block(fs);
+        if fs.needclose {
+            fs.code_abc(OpCode::CLOSE, base + 3, 0, 0);
+        }
+        fs.needclose = pre_close || fs.needclose;
 
         fs.fix_jump(prep, fs.pc, false);
         let loop_pc = fs.code_abx(OpCode::FORLOOP, base, 0);
@@ -4401,7 +4407,13 @@ fn parse_for(fs: &mut FuncState) {
         fs.break_list = NO_JUMP;
 
         let prep = fs.code_abx(OpCode::TFORPREP, base, 0);
+        let pre_close = fs.needclose;
+        fs.needclose = false;
         parse_block(fs);
+        if fs.needclose {
+            fs.code_abc(OpCode::CLOSE, base + 3 + ncontrol, 0, 0);
+        }
+        fs.needclose = pre_close || fs.needclose;
         
         fs.fix_jump(prep, fs.pc, false);
         fs.code_abc(OpCode::TFORCALL, base, 0, ncontrol);
