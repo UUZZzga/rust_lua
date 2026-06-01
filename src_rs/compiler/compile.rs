@@ -3870,7 +3870,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
     loop {
         match &fs.ls().token {
             Token::LParen | Token::LBrace | Token::String(..) | Token::Colon => {
-                let mut freg = fs.expr_to_reg(&e);
+                let mut freg = fs.exp_to_reg(&e);
                 let is_method = matches!(&fs.ls().token, Token::Colon);
                 let src_reg = if matches!(e.kind, ExpKind::NonReloc) && freg < fs.nvarstack() {
                     if is_method {
