@@ -1653,19 +1653,22 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 } else {
                     nil_reg_start + (i - exps.len()) as i32
                 };
-                if let Some(idx) = v.local_idx {
-                    fs.code_abc(OpCode::MOVE, idx, result_reg, 0);
+                if let (Some(table_reg), Some(table_key)) = (v.table_reg, v.table_key) {
+                    let can_settabup = v.is_env_upvalue && v.table_key_is_const && !v.table_key_is_int;
+                    if can_settabup {
+                        fs.code_abc(OpCode::SETTABUP, 0, table_key, result_reg);
+                    } else if v.table_key_is_const {
+                        fs.code_abc_k(OpCode::SETFIELD, table_reg, table_key, result_reg, false);
+                    } else {
+                        fs.code_abc_k(OpCode::SETTABLE, table_reg, table_key, result_reg, false);
+                    }
                 } else if let Some(upval_idx) = v.upval_idx {
                     fs.code_abc(OpCode::SETUPVAL, result_reg, upval_idx, 0);
                 } else if let Some(ref name) = v.var_name {
                     let k_name = fs.string_k(name);
                     fs.code_abc(OpCode::SETTABUP, 0, k_name, result_reg);
-                } else if let (Some(table_reg), Some(table_key)) = (v.table_reg, v.table_key) {
-                    if v.table_key_is_const {
-                        fs.code_abc_k(OpCode::SETFIELD, table_reg, table_key, result_reg, false);
-                    } else {
-                        fs.code_abc_k(OpCode::SETTABLE, table_reg, table_key, result_reg, false);
-                    }
+                } else if let Some(idx) = v.local_idx {
+                    fs.code_abc(OpCode::MOVE, idx, result_reg, 0);
                 }
             }
         }
