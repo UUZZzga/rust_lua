@@ -375,6 +375,8 @@ mod compiler_compare_tests {
     #[test]
     fn test_for_in() {
         assert_inst_match("for k,v,w in a do end", None);
+        assert_inst_match("for _ in a.b('1'..';'..'2', '2') do end", None);
+        assert_inst_match("for _ in a:b('1'..';'..'2', '2') do end", None);
     }
 
     #[test]

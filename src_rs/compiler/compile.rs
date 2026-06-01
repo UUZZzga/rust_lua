@@ -4369,7 +4369,7 @@ fn parse_for(fs: &mut FuncState) {
         for var_name in &vars {
             fs.add_local_kind(var_name, fs.pc, RDKCONST);
         }
-        for lv in &mut fs.locals[var_locals_start..] {
+        for lv in &mut fs.locals[saved_nlocals..] {
             lv.active = false;
         }
         
@@ -4382,7 +4382,7 @@ fn parse_for(fs: &mut FuncState) {
             if !check(fs, &Token::Comma) { break; }
             fs.ls_mut().next();
         }
-        for lv in &mut fs.locals[var_locals_start..] {
+        for lv in &mut fs.locals[saved_nlocals..] {
             lv.active = true;
         }
         
