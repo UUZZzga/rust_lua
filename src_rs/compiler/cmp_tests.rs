@@ -432,6 +432,7 @@ mod compiler_compare_tests {
         assert_inst_match("local x; x = 2<3 and not 3", None);
         assert_inst_match("local x; x = 2<1 or (2>1 and 'a')", None);
         assert_inst_match("if not a then assert(b.c(d'') == d'') end", None);
+        assert_inst_match("if not a then b, c, d, e = nil end", None);
     }
 
     #[test]

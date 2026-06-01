@@ -1553,10 +1553,12 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         } else {
                             (0i32, table_key)
                         };
-                        if let Some(k_val) = exp_to_k(fs, val) {
+                        let use_last_reg = i == exps.len() - 1 && last_exp_reg.is_some();
+                        let k_opt = if use_last_reg { None } else { exp_to_k(fs, val) };
+                        if let Some(k_val) = k_opt {
                             fs.code_abc_k(OpCode::SETTABUP, 0, adjusted_key, k_val, true);
                         } else {
-                            let val_reg = if i == exps.len() - 1 && last_exp_reg.is_some() {
+                            let val_reg = if use_last_reg {
                                 last_exp_reg.unwrap()
                             } else {
                                 fs.exp_to_reg(val)
@@ -1571,10 +1573,12 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         }
                     } else {
                         let set_op = if v.table_key_is_int { OpCode::SETI } else if v.table_key_is_const { OpCode::SETFIELD } else { OpCode::SETTABLE };
-                        if let Some(k_val) = exp_to_k(fs, val) {
+                        let use_last_reg = i == exps.len() - 1 && last_exp_reg.is_some();
+                        let k_opt = if use_last_reg { None } else { exp_to_k(fs, val) };
+                        if let Some(k_val) = k_opt {
                             fs.code_abc_k(set_op, table_reg, table_key, k_val, true);
                         } else {
-                            let val_reg = if i == exps.len() - 1 && last_exp_reg.is_some() {
+                            let val_reg = if use_last_reg {
                                 last_exp_reg.unwrap()
                             } else {
                                 fs.exp_to_reg(val)
@@ -1604,10 +1608,12 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     }
                 } else if let Some(ref name) = v.var_name {
                     let k_name = fs.string_k(name);
-                    if let Some(k_val) = exp_to_k(fs, val) {
+                    let use_last_reg = i == exps.len() - 1 && last_exp_reg.is_some();
+                    let k_opt = if use_last_reg { None } else { exp_to_k(fs, val) };
+                    if let Some(k_val) = k_opt {
                         fs.code_abc_k(OpCode::SETTABUP, 0, k_name, k_val, true);
                     } else {
-                        let val_reg = if i == exps.len() - 1 && last_exp_reg.is_some() {
+                        let val_reg = if use_last_reg {
                             last_exp_reg.unwrap()
                         } else {
                             fs.exp_to_reg(val)
