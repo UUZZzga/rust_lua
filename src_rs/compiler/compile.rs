@@ -2074,8 +2074,10 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                                 result.reg = Some(r);
                                 result.allocated_reg = true;
                             } else if result.table_key_is_const {
-                                fs.code_abc(OpCode::GETFIELD, prev_table, prev_table, prev_key);
-                                result.reg = Some(prev_table);
+                                let r = fs.alloc_reg();
+                                fs.code_abc(OpCode::GETFIELD, r, prev_table, prev_key);
+                                result.reg = Some(r);
+                                result.allocated_reg = true;
                             } else {
                                 if result.key_allocated_reg {
                                     fs.free_reg();
