@@ -2913,7 +2913,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             }
             fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_CONCAT);
-            let _r2 = if matches!(e2.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !e2.exp.has_jumps() {
+            let r2 = if matches!(e2.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !e2.exp.has_jumps() {
                 let reg = e2.exp.info as i32;
                 if e2.exp.info2 >= 0 {
                     fs.set_a(e2.exp.info2, reg);
@@ -2922,6 +2922,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             } else {
                 fs.exp_to_reg(&e2.exp)
             };
+            if r2 != r + 1 {
+                fs.code_abc(OpCode::MOVE, r + 1, r2, 0);
+            }
             fs.free_reg();
             let merged = if !fs.proto.code.is_empty() {
                 let last = fs.proto.code[fs.proto.code.len() - 1];
