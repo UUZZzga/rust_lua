@@ -438,6 +438,7 @@ mod compiler_compare_tests {
         assert_inst_match("if not a then assert(b.c(d'') == d'') end", None);
         assert_inst_match("if not a then b, c, d, e = nil end", None);
         assert_inst_match("_ENV = _G", None);
+        assert_inst_match("local a; _ENV = a", None);
     }
 
     #[test]

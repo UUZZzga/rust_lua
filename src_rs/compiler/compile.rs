@@ -1605,7 +1605,9 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         fs.exp_to_reg(val)
                     };
                     fs.code_abc(OpCode::SETUPVAL, val_reg, upval_idx, 0);
-                    fs.free_reg();
+                    if val_reg >= fs.nvarstack() {
+                        fs.free_reg();
+                    }
                     if v.allocated_reg {
                         fs.free_reg();
                     }
