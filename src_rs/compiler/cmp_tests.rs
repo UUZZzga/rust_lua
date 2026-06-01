@@ -350,6 +350,7 @@ mod compiler_compare_tests {
         assert_inst_match("if not a then --[\n local b = {} end --",None);
         assert_inst_match("if not a then --[\n local b = {}\n local c = [[]]\n end --",None);
         assert_inst_match("if not a then local d = b.c() local e = '' .. d end",None);
+        assert_inst_match("local a, b, c; if not a then end",None);
     }
 
     #[test]
