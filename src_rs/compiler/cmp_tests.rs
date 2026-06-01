@@ -347,6 +347,8 @@ mod compiler_compare_tests {
         assert_inst_match("local i = 0; if i % 60000 == 0 then end",None);
         assert_inst_match("if a then return 'a' end",None);
         assert_inst_match("if a then else return 'a' end",None);
+        assert_inst_match("if not a then --[\n local b = {} end --",None);
+        assert_inst_match("if not a then --[\n local b = {}\n local c = [[]]\n end --",None);
     }
 
     #[test]

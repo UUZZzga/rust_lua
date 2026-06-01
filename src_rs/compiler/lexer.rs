@@ -116,16 +116,11 @@ impl LexState {
                     self.next_char();
                     self.next_char();
                     if self.current == '[' {
-                         let start = self.pos;
+                        self.next_char();
                         let equals = self.count_equals();
                         if self.current == '[' {
                             self.read_long_comment(equals);
                             continue;
-                        } else {
-                            self.pos = start;
-                            self.current = '-';
-                            self.next_char();
-                            self.next_char();
                         }
                     }
                     while self.current != '\n' && self.current != '\0' {
