@@ -2335,7 +2335,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     };
                     let k = e_left.info2 == -2;
                     if k {
-                        fs.code_abc_k(OpCode::TESTSET, NO_REG as i32, reg, 0, k);
+                        fs.code_abc_k(OpCode::TEST, reg, 0, 0, false);
                     } else {
                         fs.code_abc_k(OpCode::TESTSET, NO_REG as i32, reg, 0, true);
                     }
