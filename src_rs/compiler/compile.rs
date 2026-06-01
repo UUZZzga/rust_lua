@@ -2069,17 +2069,26 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                             let prev_table = result.table_reg.unwrap();
                             let prev_key = result.table_key.unwrap();
                             if result.table_key_is_int {
+                                if result.allocated_reg {
+                                    fs.free_reg();
+                                }
                                 let r = fs.alloc_reg();
                                 fs.code_abc(OpCode::GETI, r, prev_table, prev_key);
                                 result.reg = Some(r);
                                 result.allocated_reg = true;
                             } else if result.table_key_is_const {
+                                if result.allocated_reg {
+                                    fs.free_reg();
+                                }
                                 let r = fs.alloc_reg();
                                 fs.code_abc(OpCode::GETFIELD, r, prev_table, prev_key);
                                 result.reg = Some(r);
                                 result.allocated_reg = true;
                             } else {
                                 if result.key_allocated_reg {
+                                    fs.free_reg();
+                                }
+                                if result.allocated_reg {
                                     fs.free_reg();
                                 }
                                 let r = fs.alloc_reg();
@@ -2127,8 +2136,13 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                             result.reg = Some(r);
                             result.allocated_reg = true;
                         } else if result.table_key_is_const {
-                            fs.code_abc(OpCode::GETFIELD, prev_table, prev_table, prev_key);
-                            result.reg = Some(prev_table);
+                            if result.allocated_reg {
+                                fs.free_reg();
+                            }
+                            let r = fs.alloc_reg();
+                            fs.code_abc(OpCode::GETFIELD, r, prev_table, prev_key);
+                            result.reg = Some(r);
+                            result.allocated_reg = true;
                         } else {
                             if result.key_allocated_reg {
                                 fs.free_reg();

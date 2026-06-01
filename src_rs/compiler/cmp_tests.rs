@@ -475,6 +475,9 @@ mod compiler_compare_tests {
         assert_inst_match("local a = {}; getmetatable(a).__index = function () end", None);
         assert_inst_match("local e, m; assert(not e and m:find(\"'newindex'\"))", None);
         assert_inst_match("local a = {['a'] = '', ['b'] = '', ['c'] = '', ['d'] = '', ['e'] = '', ['f'] = '', ['g'] = ''}", None);
+        assert_inst_match("a.b.c = nil; a.b.c.d = nil; a.b.c.d.e = nil; a.b.c.d.e.f = nil; a.b.c.d.e.f.g = nil; a.b.c.d.e.f.g.h = nil; a.b.c.d.e.f.g.h.i = nil; a.b.c.d.e.f.g.h.i.g = nil; a.b.c.d.e.f.g.h.i.g.k = nil", None);
+        assert_inst_match("a.b.c = 1; a.b.c.d = 1; a.b.c.d.e = 1; a.b.c.d.e.f = 1; a.b.c.d.e.f.g = 1; a.b.c.d.e.f.g.h = 1; a.b.c.d.e.f.g.h.i = 1; a.b.c.d.e.f.g.h.i.g = 1; a.b.c.d.e.f.g.h.i.g.k = 1", None);
+        assert_inst_match("a.b.c = '1'; a.b.c.d = '1'; a.b.c.d.e = '1'; a.b.c.d.e.f = '1'; a.b.c.d.e.f.g = '1'; a.b.c.d.e.f.g.h = '1'; a.b.c.d.e.f.g.h.i = '1'; a.b.c.d.e.f.g.h.i.g = '1'; a.b.c.d.e.f.g.h.i.g.k = '1'", None);
     }
 
     #[test]
