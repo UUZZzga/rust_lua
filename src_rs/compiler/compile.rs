@@ -1591,10 +1591,10 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                                 fs.free_reg();
                             }
                         }
-                        if v.key_allocated_reg {
+                        if v.key_allocated_reg && table_key == fs.freereg - 1 {
                             fs.free_reg();
                         }
-                        if v.allocated_reg {
+                        if v.allocated_reg && table_reg == fs.freereg - 1 {
                             fs.free_reg();
                         }
                     }
@@ -1675,6 +1675,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
         if extra_vars > 0 {
             fs.set_freereg(fs.nvarstack());
         }
+        fs.set_freereg(fs.nvarstack());
         return;
     }
     
