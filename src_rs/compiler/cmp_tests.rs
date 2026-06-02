@@ -443,6 +443,7 @@ mod compiler_compare_tests {
         assert_inst_match("(Message or print)('123456')", None);
         assert_inst_match("_ENV.x, _ENV.y = nil", None);
         assert_inst_match("assert((10 or assert(nil)) == 10)", None);
+        assert_inst_match("assert(not (nil and assert(nil)))", None);
     }
 
     #[test]

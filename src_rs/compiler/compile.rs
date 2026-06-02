@@ -3821,21 +3821,32 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                             e
                         }
                         _ => {
-                            let r = if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc | ExpKind::Call) && !ei.exp.has_jumps() {
-                                let r = ei.exp.info as i32;
-                                if ei.exp.info2 >= 0 {
-                                    fs.set_a(ei.exp.info2, r);
-                                }
-                                if ei.exp.info2 == -2 || matches!(ei.exp.kind, ExpKind::Call) {
-                                    fs.code_abc(OpCode::NOT, r, r, 0);
-                                }
-                                r
+                            if ei.exp.has_jumps() {
+                                let r = fs.expr_to_reg(&ei.exp);
+                                let mut e = ExpDesc::new(ExpKind::Relocable, r as i64);
+                                e.info2 = -2;
+                                e.t = ei.exp.f;
+                                e.f = ei.exp.t;
+                                fs.remove_values(e.t);
+                                fs.remove_values(e.f);
+                                e
                             } else {
-                                fs.expr_to_reg(&ei.exp)
-                            };
-                            let mut e = ExpDesc::new(ExpKind::Relocable, r as i64);
-                            e.info2 = -2;
-                            e
+                                let r = if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc | ExpKind::Call) {
+                                    let r = ei.exp.info as i32;
+                                    if ei.exp.info2 >= 0 {
+                                        fs.set_a(ei.exp.info2, r);
+                                    }
+                                    if ei.exp.info2 == -2 || matches!(ei.exp.kind, ExpKind::Call) {
+                                        fs.code_abc(OpCode::NOT, r, r, 0);
+                                    }
+                                    r
+                                } else {
+                                    fs.expr_to_reg(&ei.exp)
+                                };
+                                let mut e = ExpDesc::new(ExpKind::Relocable, r as i64);
+                                e.info2 = -2;
+                                e
+                            }
                         }
                     }
                 }
