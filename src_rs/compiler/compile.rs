@@ -1545,7 +1545,27 @@ fn parse_assign_or_call(fs: &mut FuncState) {
             let nresults = (extra_vars + 1) as i32;
             fs.set_c(exps.last().unwrap().info2, nresults + 1);
         }
-        
+        if exps.len() > vars.len() {
+            if last_is_call {
+                fs.set_c(exps.last().unwrap().info2, 1);
+            }
+            for i in (vars.len()..exps.len()).rev() {
+                let e = &exps[i];
+                match e.kind {
+                    ExpKind::NonReloc => {
+                        if e.info as i32 >= fs.nvarstack() && e.info as i32 == fs.freereg - 1 {
+                            fs.free_reg();
+                        }
+                    }
+                    ExpKind::Relocable | ExpKind::Call | ExpKind::Vararg => {
+                        if e.info as i32 >= fs.nvarstack() && e.info as i32 == fs.freereg - 1 {
+                            fs.free_reg();
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
         for i in (0..vars.len()).rev() {
             if i < exps.len() {
                 let v = &vars[i];
