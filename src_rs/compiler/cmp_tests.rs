@@ -480,6 +480,8 @@ mod compiler_compare_tests {
         assert_inst_match("a.b.c = '1'; a.b.c.d = '1'; a.b.c.d.e = '1'; a.b.c.d.e.f = '1'; a.b.c.d.e.f.g = '1'; a.b.c.d.e.f.g.h = '1'; a.b.c.d.e.f.g.h.i = '1'; a.b.c.d.e.f.g.h.i.g = '1'; a.b.c.d.e.f.g.h.i.g.k = '1'", None);
         assert_inst_match("assert(not a or a.b(c) == a.b(d))", None);
         assert_inst_match("a[f()], b, a[f()+3] = f(), a, 'x'", None);
+        assert_inst_match("local a; a[f()], b, a[f()+3] = f(), a, 'x'", None);
+        assert_inst_match("local a, b, f; a[f()], b, a[f()+3] = f(), a, 'x'", None);
     }
 
     #[test]

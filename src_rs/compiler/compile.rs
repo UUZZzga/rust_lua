@@ -1507,7 +1507,15 @@ fn parse_assign_or_call(fs: &mut FuncState) {
             let ei = parse_expr(fs);
             let has_comma = check(fs, &Token::Comma);
             if has_comma {
-                 let r = fs.expr_to_reg(&ei.exp);
+                let r = if ei.exp.kind == ExpKind::NonReloc && (ei.exp.info as i32) < fs.nvarstack() {
+                    let new_r = fs.alloc_reg();
+                    if ei.exp.info as i32 != new_r {
+                        fs.code_abc(OpCode::MOVE, new_r, ei.exp.info as i32, 0);
+                    }
+                    new_r
+                } else {
+                    fs.expr_to_reg(&ei.exp)
+                };
                 exps.push(ExpDesc::new(ExpKind::NonReloc, r as i64));
                 fs.ls_mut().next();
             } else {
