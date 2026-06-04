@@ -224,19 +224,27 @@ pub struct ExpDesc {
     pub info2: i32,
     pub t: i32,
     pub f: i32,
+    /// For ExpKind::Str: stores the string value before it's added to the constant table.
+    /// When Some(s), the string hasn't been added yet (info is unused).
+    /// When None, the string has been added and info stores the constant index.
+    pub str_val: Option<String>,
 }
 
 impl ExpDesc {
     pub fn new(kind: ExpKind, info: i64) -> Self {
-        ExpDesc { kind, info, info2: -1, t: NO_JUMP, f: NO_JUMP }
+        ExpDesc { kind, info, info2: -1, t: NO_JUMP, f: NO_JUMP, str_val: None }
+    }
+
+    pub fn new_str(s: String) -> Self {
+        ExpDesc { kind: ExpKind::Str, info: -1, info2: -1, t: NO_JUMP, f: NO_JUMP, str_val: Some(s) }
     }
 
     pub fn new_reloc_with_pc(info: i64, pc: i32) -> Self {
-        ExpDesc { kind: ExpKind::Relocable, info, info2: pc, t: NO_JUMP, f: NO_JUMP }
+        ExpDesc { kind: ExpKind::Relocable, info, info2: pc, t: NO_JUMP, f: NO_JUMP, str_val: None }
     }
 
     pub fn into_reloc_with_pc(self, info: i64, pc: i32) -> Self {
-        ExpDesc { kind: ExpKind::Relocable, info, info2: pc, t: self.t, f: self.f }
+        ExpDesc { kind: ExpKind::Relocable, info, info2: pc, t: self.t, f: self.f, str_val: None }
     }
 
     fn has_jumps(&self) -> bool {
@@ -573,6 +581,29 @@ impl FuncState {
         self.const_k(TValue::Str(ls))
     }
 
+    /// 将 ExpKind::Str 表达式的字符串添加到常量表（如果尚未添加），
+    /// 返回常量索引。这实现了延迟添加，与 C++ 编译器的 VKSTR 行为一致。
+    fn discharge_str(&mut self, e: &mut ExpDesc) -> i32 {
+        if let Some(ref s) = e.str_val {
+            let k = self.string_k(s);
+            e.info = k as i64;
+            e.str_val = None;
+            k
+        } else {
+            e.info as i32
+        }
+    }
+
+    /// 获取 ExpKind::Str 表达式的常量索引（不修改 ExpDesc）。
+    /// 如果字符串尚未添加到常量表，则添加之。
+    fn get_str_k(&mut self, e: &ExpDesc) -> i32 {
+        if let Some(ref s) = e.str_val {
+            self.string_k(s)
+        } else {
+            e.info as i32
+        }
+    }
+
     /// 创建整型常量并添加到常量表
     fn int_k(&mut self, i: i64) -> i32 {
         self.const_k(TValue::Integer(i))
@@ -753,7 +784,7 @@ impl FuncState {
         None
     }
 
-    fn find_local_ctc(&mut self, name: &str) -> Option<(ExpKind, i64)> {
+    fn find_local_ctc(&mut self, name: &str) -> Option<ExpDesc> {
         let ctc_str = {
             let mut found = None;
             for lv in self.locals.iter().rev() {
@@ -771,12 +802,11 @@ impl FuncState {
             found
         };
         if let Some(s) = ctc_str {
-            let k = self.string_k(&s);
-            return Some((ExpKind::Str, k as i64));
+            return Some(ExpDesc::new_str(s));
         }
         for lv in self.locals.iter().rev() {
             if lv.active && lv.name == name && lv.kind == RDKCTC {
-                return Some((lv.ctc_kind.clone().unwrap(), lv.ctc_info.unwrap()));
+                return Some(ExpDesc::new(lv.ctc_kind.clone().unwrap(), lv.ctc_info.unwrap()));
             }
         }
         None
@@ -850,7 +880,8 @@ impl FuncState {
             }
             ExpKind::Str => {
                 let r = self.alloc_reg();
-                self.code_abx(OpCode::LOADK, r, e.info as i32);
+                let k = self.get_str_k(e);
+                self.code_abx(OpCode::LOADK, r, k);
                 r
             }
             ExpKind::NonReloc => {
@@ -1488,7 +1519,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 let ei = parse_expr(fs);
                 expect(fs, &Token::RBracket);
                 let (kr, key_is_const, key_is_int) = if ei.exp.kind == ExpKind::Str {
-                    (ei.exp.info as i32, true, false)
+                    (fs.get_str_k(&ei.exp), true, false)
                 } else if ei.exp.kind == ExpKind::Int
                     && ei.exp.info >= 0
                     && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
@@ -1748,7 +1779,7 @@ fn exp_to_k(fs: &mut FuncState, e: &ExpDesc) -> Option<i32> {
             let f = f64::from_bits(e.info as u64);
             fs.float_k(f)
         }
-        ExpKind::Str => e.info as i32,
+        ExpKind::Str => fs.get_str_k(e),
         ExpKind::Boolean => {
             let tv = if e.info != 0 { TValue::Boolean(true) } else { TValue::Boolean(false) };
             fs.const_k(tv)
@@ -1828,12 +1859,13 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
             }
         }
         ExpKind::Str => {
+            let k = fs.get_str_k(e);
             if e.t != NO_JUMP || e.f != NO_JUMP {
-                fs.code_abx(OpCode::LOADK, dest, e.info as i32);
+                fs.code_abx(OpCode::LOADK, dest, k);
                 fs.resolve_jumps(e, dest);
                 return;
             }
-            fs.code_abx(OpCode::LOADK, dest, e.info as i32);
+            fs.code_abx(OpCode::LOADK, dest, k);
         }
         ExpKind::VJMP => {
             let jmp_pc = e.info as i32;
@@ -2070,11 +2102,11 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
         Token::Name(name) => {
             let name = name.clone();
             fs.ls_mut().next();
-            let mut result = if let Some((ctc_kind, ctc_info)) = fs.find_local_ctc(&name) {
+            let mut result = if let Some(mut ctc) = fs.find_local_ctc(&name) {
                 let r = fs.alloc_reg();
-                match ctc_kind {
+                match ctc.kind {
                     ExpKind::Int => {
-                        let val = ctc_info;
+                        let val = ctc.info;
                         if val <= i16::MAX as i64 && val >= i16::MIN as i64 {
                             fs.code_asbx(OpCode::LOADI, r, val as i32);
                         } else {
@@ -2083,15 +2115,16 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         }
                     }
                     ExpKind::Float => {
-                        let f = f64::from_bits(ctc_info as u64);
+                        let f = f64::from_bits(ctc.info as u64);
                         let k = fs.float_k(f);
                         fs.code_abx(OpCode::LOADK, r, k);
                     }
                     ExpKind::Str => {
-                        fs.code_abx(OpCode::LOADK, r, ctc_info as i32);
+                        let k = fs.discharge_str(&mut ctc);
+                        fs.code_abx(OpCode::LOADK, r, k);
                     }
                     ExpKind::Boolean => {
-                        if ctc_info != 0 {
+                        if ctc.info != 0 {
                             fs.code_abc(OpCode::LOADTRUE, r, 0, 0);
                         } else {
                             fs.code_abc(OpCode::LOADFALSE, r, 0, 0);
@@ -2101,7 +2134,8 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         fs.code_nil(r, 1);
                     }
                     _ => {
-                        fs.code_abx(OpCode::LOADK, r, ctc_info as i32);
+                        let k = fs.discharge_str(&mut ctc);
+                        fs.code_abx(OpCode::LOADK, r, k);
                     }
                 };
                 PrefixResult { var_name: None, local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1 }
@@ -2233,7 +2267,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     let ei = parse_expr(fs);
                     expect(fs, &Token::RBracket);
                     let (kr, key_is_const, key_is_int) = if ei.exp.kind == ExpKind::Str {
-                        (ei.exp.info as i32, true, false)
+                        (fs.get_str_k(&ei.exp), true, false)
                     } else if ei.exp.kind == ExpKind::Int
                         && ei.exp.info >= 0
                         && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
@@ -3780,7 +3814,7 @@ fn fits_sbx(v: i64) -> bool {
 /// 将表达式转换为常量表索引 (用于 EQK 等比较指令)
 fn exp_to_const_k(fs: &mut FuncState, e: &ExpDesc) -> Option<i32> {
     let k = match e.kind {
-        ExpKind::Str => e.info as i32,
+        ExpKind::Str => fs.get_str_k(e),
         ExpKind::Boolean => {
             let tv = if e.info != 0 { TValue::Boolean(true) } else { TValue::Boolean(false) };
             fs.const_k(tv)
@@ -3813,7 +3847,7 @@ fn exp2rk(fs: &mut FuncState, e: &ExpDesc) -> (i32, bool) {
                 let f = f64::from_bits(e.info as u64);
                 fs.float_k(f)
             }
-            ExpKind::Str => e.info as i32,
+            ExpKind::Str => fs.get_str_k(e),
             _ => {
                 let r = fs.exp_to_reg(e);
                 return (r, false);
@@ -3865,8 +3899,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
         Token::String(s) => {
             let s = s.clone();
             fs.ls_mut().next();
-            let k = fs.string_k(&s);
-            ExpDesc::new(ExpKind::Str, k as i64)
+            ExpDesc::new_str(s)
         }
         Token::DotDotDot => {
             fs.ls_mut().next();
@@ -3881,8 +3914,8 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
         Token::Name(name) => {
             let name = name.clone();
             fs.ls_mut().next();
-            if let Some((kind, info)) = fs.find_local_ctc(&name) {
-                ExpDesc::new(kind, info)
+            if let Some(ctc) = fs.find_local_ctc(&name) {
+                ctc
             } else if let Some(reg) = fs.find_local(&name) {
                 ExpDesc::new(ExpKind::NonReloc, reg as i64)
             } else if let Some(upval_idx) = fs.find_upvalue(&name) {
@@ -3910,7 +3943,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     if call_pc >= 0 {
                         setarg(&mut fs.proto.code[call_pc as usize], 2, POS_C, SIZE_C);
                     }
-                    ExpDesc { kind: ExpKind::NonReloc, info: ei.exp.info, info2: 0, t: NO_JUMP, f: NO_JUMP }
+                    ExpDesc { kind: ExpKind::NonReloc, info: ei.exp.info, info2: 0, t: NO_JUMP, f: NO_JUMP, str_val: None }
                 }
                 _ => ei.exp,
             }
@@ -4092,7 +4125,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 };
                 let call_pc = parse_func_args(fs, freg, src_reg);
                 e = if call_pc >= 0 {
-                    ExpDesc { kind: ExpKind::Call, info: freg as i64, info2: call_pc, t: NO_JUMP, f: NO_JUMP }
+                    ExpDesc { kind: ExpKind::Call, info: freg as i64, info2: call_pc, t: NO_JUMP, f: NO_JUMP, str_val: None }
                 } else {
                     ExpDesc::new(ExpKind::Relocable, freg as i64)
                 };
@@ -4147,7 +4180,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 if is_env_before && ei.exp.kind == ExpKind::Str {
                     fs.proto.code.truncate((saved_pc_before_expr - 1) as usize);
                     fs.pc = saved_pc_before_expr - 1;
-                    let k = ei.exp.info as i32;
+                    let k = fs.get_str_k(&ei.exp);
                     fs.code_abc(OpCode::GETTABUP, base_reg, 0, k);
                     e = ExpDesc::new(ExpKind::Relocable, base_reg as i64);
                 } else {
@@ -4990,10 +5023,15 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                 let ek = parse_expr(fs);
                 expect(fs, &Token::RBracket);
                 expect(fs, &Token::Eq);
+                // Discharge key constant first to match C++ constant table order
+                let key_k = if ek.exp.kind == ExpKind::Str {
+                    Some(fs.get_str_k(&ek.exp))
+                } else {
+                    None
+                };
                 let ev = parse_expr(fs);
                 let (v_rk, is_k) = exp2rk(fs, &ev.exp);
-                if ek.exp.kind == ExpKind::Str {
-                    let k = ek.exp.info as i32;
+                if let Some(k) = key_k {
                     fs.code_abc_k(OpCode::SETFIELD, table_r, k, v_rk, is_k);
                 } else if ek.exp.kind == ExpKind::Int
                     && ek.exp.info >= 0

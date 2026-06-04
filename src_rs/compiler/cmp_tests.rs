@@ -449,6 +449,7 @@ mod compiler_compare_tests {
         assert_inst_match("assert(not (nil and assert(nil)))", None);
         assert_inst_match("assert(not not a == true)", None);
         assert_inst_match("local a; assert(not not a == true)", None);
+        assert_inst_match("assert(not 'x' == false)", None);
     }
 
     #[test]
