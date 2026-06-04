@@ -380,6 +380,7 @@ mod compiler_compare_tests {
         assert_inst_match("for k,v,w in a do end", None);
         assert_inst_match("for _ in a.b('1'..';'..'2', '2') do end", None);
         assert_inst_match("for _ in a:b('1'..';'..'2', '2') do end", None);
+        assert_inst_match("for _, _ in ipairs({}) do for _, _ in ipairs({}) do end end", None);
     }
 
     #[test]

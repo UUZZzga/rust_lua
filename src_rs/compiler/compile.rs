@@ -4258,13 +4258,13 @@ fn parse_if(fs: &mut FuncState) {
     let block_freereg = entry_freereg;
     fs.set_freereg(block_freereg);
     let saved_nlocals = fs.locals.len();
-    let pre_close = fs.needclose;
-    fs.needclose = false;
+    let saved_nprotos = fs.proto.protos.len();
     parse_block(fs);
-    if fs.needclose {
+    let has_tbc = fs.locals[saved_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
+    let has_new_upvalue = fs.proto.protos[saved_nprotos..].iter().any(|p| !p.upvalues.is_empty());
+    if has_tbc || has_new_upvalue {
         fs.code_abc(OpCode::CLOSE, block_freereg, 0, 0);
     }
-    fs.needclose = pre_close || fs.needclose;
     for local in &mut fs.locals[saved_nlocals..] {
         local.active = false;
     }
@@ -4330,13 +4330,13 @@ fn parse_if(fs: &mut FuncState) {
         expect(fs, &Token::Then);
         fs.set_freereg(block_freereg);
         let saved_nlocals = fs.locals.len();
-        let pre_close = fs.needclose;
-        fs.needclose = false;
+        let saved_nprotos = fs.proto.protos.len();
         parse_block(fs);
-        if fs.needclose {
+        let has_tbc = fs.locals[saved_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
+        let has_new_upvalue = fs.proto.protos[saved_nprotos..].iter().any(|p| !p.upvalues.is_empty());
+        if has_tbc || has_new_upvalue {
             fs.code_abc(OpCode::CLOSE, block_freereg, 0, 0);
         }
-        fs.needclose = pre_close || fs.needclose;
         for local in &mut fs.locals[saved_nlocals..] {
             local.active = false;
         }
@@ -4352,13 +4352,13 @@ fn parse_if(fs: &mut FuncState) {
         fs.ls_mut().next();
         fs.set_freereg(block_freereg);
         let saved_nlocals = fs.locals.len();
-        let pre_close = fs.needclose;
-        fs.needclose = false;
+        let saved_nprotos = fs.proto.protos.len();
         parse_block(fs);
-        if fs.needclose {
+        let has_tbc = fs.locals[saved_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
+        let has_new_upvalue = fs.proto.protos[saved_nprotos..].iter().any(|p| !p.upvalues.is_empty());
+        if has_tbc || has_new_upvalue {
             fs.code_abc(OpCode::CLOSE, block_freereg, 0, 0);
         }
-        fs.needclose = pre_close || fs.needclose;
         for local in &mut fs.locals[saved_nlocals..] {
             local.active = false;
         }
@@ -4423,13 +4423,13 @@ fn parse_while(fs: &mut FuncState) {
     let block_freereg = entry_freereg;
     fs.set_freereg(block_freereg);
     let saved_nlocals = fs.locals.len();
-    let pre_close = fs.needclose;
-    fs.needclose = false;
+    let saved_nprotos = fs.proto.protos.len();
     parse_block(fs);
-    if fs.needclose {
+    let has_tbc = fs.locals[saved_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
+    let has_new_upvalue = fs.proto.protos[saved_nprotos..].iter().any(|p| !p.upvalues.is_empty());
+    if has_tbc || has_new_upvalue {
         fs.code_abc(OpCode::CLOSE, block_freereg, 0, 0);
     }
-    fs.needclose = pre_close || fs.needclose;
     for local in &mut fs.locals[saved_nlocals..] {
         local.active = false;
     }
@@ -4475,13 +4475,13 @@ fn parse_repeat(fs: &mut FuncState) {
     let block_freereg = entry_freereg;
     fs.set_freereg(block_freereg);
     let saved_nlocals = fs.locals.len();
-    let pre_close = fs.needclose;
-    fs.needclose = false;
+    let saved_nprotos = fs.proto.protos.len();
     parse_block(fs);
-    if fs.needclose {
+    let has_tbc = fs.locals[saved_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
+    let has_new_upvalue = fs.proto.protos[saved_nprotos..].iter().any(|p| !p.upvalues.is_empty());
+    if has_tbc || has_new_upvalue {
         fs.code_abc(OpCode::CLOSE, block_freereg, 0, 0);
     }
-    fs.needclose = pre_close || fs.needclose;
     fs.set_freereg(block_freereg);
     expect(fs, &Token::Until);
     let ei = parse_expr(fs);
@@ -4605,13 +4605,14 @@ fn parse_for(fs: &mut FuncState) {
         let saved_breaklist = fs.break_list;
         fs.break_list = NO_JUMP;
 
-        let pre_close = fs.needclose;
-        fs.needclose = false;
+        let body_nlocals = fs.locals.len();
+        let body_nprotos = fs.proto.protos.len();
         parse_block(fs);
-        if fs.needclose {
+        let has_tbc = fs.locals[body_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
+        let has_new_upvalue = fs.proto.protos[body_nprotos..].iter().any(|p| !p.upvalues.is_empty());
+        if has_tbc || has_new_upvalue {
             fs.code_abc(OpCode::CLOSE, base + 3, 0, 0);
         }
-        fs.needclose = pre_close || fs.needclose;
 
         fs.fix_jump(prep, fs.pc, false);
         let loop_pc = fs.code_abx(OpCode::FORLOOP, base, 0);
@@ -4690,13 +4691,14 @@ fn parse_for(fs: &mut FuncState) {
         fs.break_list = NO_JUMP;
 
         let prep = fs.code_abx(OpCode::TFORPREP, base, 0);
-        let pre_close = fs.needclose;
-        fs.needclose = false;
+        let body_nlocals = fs.locals.len();
+        let body_nprotos = fs.proto.protos.len();
         parse_block(fs);
-        if fs.needclose {
+        let has_tbc = fs.locals[body_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
+        let has_new_upvalue = fs.proto.protos[body_nprotos..].iter().any(|p| !p.upvalues.is_empty());
+        if has_tbc || has_new_upvalue {
             fs.code_abc(OpCode::CLOSE, base + 3 + ncontrol, 0, 0);
         }
-        fs.needclose = pre_close || fs.needclose;
         
         fs.fix_jump(prep, fs.pc, false);
         fs.code_abc(OpCode::TFORCALL, base, 0, ncontrol);
