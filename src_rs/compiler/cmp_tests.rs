@@ -13,8 +13,10 @@ mod compiler_compare_tests {
     }
 
     fn assert_inst_match(source: &str, name: Option<&str>) {
+        eprintln!("ASSERT_INST_MATCH: compiling source=[{}]", source);
         let rust_proto = compile_rust(source, name);
         let c_func = unsafe { compile_c(source) };
+        eprintln!("ASSERT_INST_MATCH: rust_code_len={} c_code_len={}", rust_proto.code.len(), c_func.code.len());
 
         let diffs = bytecode_dump::compare_instructions(&rust_proto.code, &c_func.code);
         if !diffs.is_empty() {
@@ -444,6 +446,8 @@ mod compiler_compare_tests {
         assert_inst_match("_ENV.x, _ENV.y = nil", None);
         assert_inst_match("assert((10 or assert(nil)) == 10)", None);
         assert_inst_match("assert(not (nil and assert(nil)))", None);
+        assert_inst_match("assert(not not a == true)", None);
+        assert_inst_match("local a; assert(not not a == true)", None);
     }
 
     #[test]
