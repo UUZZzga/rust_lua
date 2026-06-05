@@ -499,6 +499,7 @@ mod compiler_compare_tests {
         assert_inst_match("local a, b, c; a[1], f(a)[2], b, c = {['alo']=assert}, 10, a[1], a[f], 6, 10, 23, f(a), 2", None);
         assert_inst_match("local a; a.aVeryLongName012345678901234567890123456789012345678901234567890123456789 = 10", None);
         assert_inst_match("local a; local function foo () end; assert(foo() == 10 and a.aVeryLongName012345678901234567890123456789012345678901234567890123456789 == 10)", None);
+        assert_inst_match("local a, b; a[-b] = 12; a[-b + 1.0] = 13", None);
     }
 
     #[test]

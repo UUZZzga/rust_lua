@@ -905,18 +905,19 @@ impl FuncState {
                 }
             }
             ExpKind::Relocable | ExpKind::Vararg => {
-                if e.info as i32 == self.freereg - 1 {
-                    if e.info2 >= 0 {
-                        self.set_a(e.info2, e.info as i32);
+                if e.info2 >= 0 {
+                    // 模拟 C 的 freeexps: 非局部寄存器且位于 freereg-1 时先释放
+                    if e.info as i32 == self.freereg - 1 && e.info as i32 >= self.nvarstack() {
+                        self.free_reg();
                     }
+                    let r = self.alloc_reg();
+                    self.set_a(e.info2, r);
+                    r
+                } else if e.info as i32 == self.freereg - 1 {
                     if e.info2 == -2 {
                         self.code_abc(OpCode::NOT, e.info as i32, e.info as i32, 0);
                     }
                     e.info as i32
-                } else if e.info2 >= 0 {
-                    let r = self.alloc_reg();
-                    self.set_a(e.info2, r);
-                    r
                 } else {
                     let r = self.alloc_reg();
                     self.code_abc(OpCode::MOVE, r, e.info as i32, 0);
@@ -2321,10 +2322,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
                     {
                         (ei.exp.info as i32, true, true)
-                    } else if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei.exp.has_jumps() {
-                        if ei.exp.info2 >= 0 {
-                            fs.set_a(ei.exp.info2, ei.exp.info as i32);
-                        }
+                    } else if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei.exp.has_jumps() && ei.exp.info2 < 0 {
                         (ei.exp.info as i32, false, false)
                     } else {
                         (fs.expr_to_reg(&ei.exp), false, false)
@@ -3338,10 +3336,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         ec.info = r as i64;
                         r
                     } else if matches!(ec.kind, ExpKind::NonReloc | ExpKind::Relocable) {
-                        if ec.info2 >= 0 {
-                            fs.set_a(ec.info2, ec.info as i32);
-                        }
-                        ec.info as i32
+                        fs.expr_to_reg(&ec)
                     } else {
                         fs.expr_to_reg(&ec)
                     };
@@ -4144,8 +4139,8 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 Token::Minus => {
                     if ei.exp.has_jumps() {
                         let r = fs.exp_to_reg(&ei.exp);
-                        fs.code_abc(OpCode::UNM, r, r, 0);
-                        ExpDesc::new(ExpKind::Relocable, r as i64)
+                        let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
+                        ExpDesc::new_reloc_with_pc(r as i64, pc)
                     } else {
                         match ei.exp.kind {
                             ExpKind::Int => {
@@ -4156,16 +4151,16 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                                 let result = -f;
                                 if result.is_nan() || result == 0.0 {
                                     let r = fs.expr_to_reg(&ei.exp);
-                                    fs.code_abc(OpCode::UNM, r, r, 0);
-                                    ExpDesc::new(ExpKind::Relocable, r as i64)
+                                    let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
+                                    ExpDesc::new_reloc_with_pc(r as i64, pc)
                                 } else {
                                     ExpDesc::new(ExpKind::Float, result.to_bits() as i64)
                                 }
                             }
                             _ => {
                                 let r = fs.expr_to_reg(&ei.exp);
-                                fs.code_abc(OpCode::UNM, r, r, 0);
-                                ExpDesc::new(ExpKind::Relocable, r as i64)
+                                let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
+                                ExpDesc::new_reloc_with_pc(r as i64, pc)
                             }
                         }
                     }
