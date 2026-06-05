@@ -4096,7 +4096,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
         }
         Token::LBrace => {
             let (r, _n) = parse_constructor(fs);
-            ExpDesc::new(ExpKind::Relocable, r as i64)
+            return ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
         }
         Token::Name(name) => {
             let name = name.clone();
