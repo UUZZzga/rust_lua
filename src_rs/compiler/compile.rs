@@ -1933,6 +1933,15 @@ fn load_func(fs: &mut FuncState, p: &PrefixResult, is_method: bool) -> (i32, boo
             fs.code_abc(OpCode::GETFIELD, table_reg, table_reg, table_key);
             (table_reg, false, false, None)
         } else {
+            // Free key register if it was allocated as a temporary (it's at freereg-1)
+            if p.key_allocated_reg {
+                fs.free_reg();
+            }
+            // Free table register if it was allocated as a temporary (now at freereg-1 after freeing key)
+            if p.allocated_reg {
+                fs.free_reg();
+            }
+            // Allocate result register (reuses the just-freed register(s))
             let r = fs.alloc_reg();
             fs.code_abc(OpCode::GETTABLE, r, table_reg, table_key);
             (r, true, true, None)
