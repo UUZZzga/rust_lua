@@ -4242,7 +4242,14 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     } else {
                         base_reg
                     };
-                    fs.code_abc(OpCode::GETFIELD, result_reg, base_reg, k);
+                    // C++ compiler: isKstr checks ttisshrstring — only short strings can use GETFIELD
+                    if let TValue::Str(crate::strings::LuaString::Short(_)) = fs.proto.constants[k as usize] {
+                        fs.code_abc(OpCode::GETFIELD, result_reg, base_reg, k);
+                    } else {
+                        // Long string: load key into register, use GETTABLE
+                        fs.code_abx(OpCode::LOADK, result_reg, k);
+                        fs.code_abc(OpCode::GETTABLE, result_reg, base_reg, result_reg);
+                    }
                     e = ExpDesc::new(ExpKind::Relocable, result_reg as i64);
                 }
             }
