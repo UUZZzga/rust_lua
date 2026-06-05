@@ -5202,8 +5202,6 @@ fn tvalue_eq(a: &TValue, b: &TValue) -> bool {
         (TValue::Boolean(a), TValue::Boolean(b)) => a == b,
         (TValue::Integer(a), TValue::Integer(b)) => a == b,
         (TValue::Float(a), TValue::Float(b)) => a.to_bits() == b.to_bits(),
-        (TValue::Integer(a), TValue::Float(b)) => (*a as f64).to_bits() == b.to_bits(),
-        (TValue::Float(a), TValue::Integer(b)) => a.to_bits() == (*b as f64).to_bits(),
         (TValue::Str(a), TValue::Str(b)) => a.as_str() == b.as_str(),
         _ => false,
     }
