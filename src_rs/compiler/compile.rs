@@ -1446,6 +1446,66 @@ fn parse_statement(fs: &mut FuncState) {
 // ============================================================================
 
 /// ANTLR4: `varlist '=' explist | functioncall ;` — 解析赋值语句或函数调用
+/// check_conflict: if a non-indexed variable (local or upvalue) conflicts with
+/// previously parsed indexed variables (same table/key register), save the
+/// original value to a temp register so the indexed variable uses the correct
+/// table/key after the local/upvalue is overwritten.
+/// Matches C's check_conflict in lparser.cpp.
+fn check_conflict_for_var(fs: &mut FuncState, prev_vars: &mut Vec<PrefixResult>, new_var: &PrefixResult) {
+    let local_idx = new_var.local_idx;
+    let upval_idx = new_var.upval_idx;
+    if local_idx.is_none() && upval_idx.is_none() {
+        return;
+    }
+
+    let mut has_conflict = false;
+    for u in prev_vars.iter() {
+        if u.table_reg.is_some() {
+            if let Some(lidx) = local_idx {
+                if u.table_reg == Some(lidx) {
+                    has_conflict = true;
+                    break;
+                }
+                if !u.table_key_is_const && !u.table_key_is_int && u.table_key == Some(lidx) {
+                    has_conflict = true;
+                    break;
+                }
+            }
+            if let Some(uidx) = upval_idx {
+                if u.is_env_upvalue && u.table_reg == Some(uidx) {
+                    has_conflict = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    if has_conflict {
+        let saved_reg = fs.alloc_reg();
+        if let Some(lidx) = local_idx {
+            fs.code_abc(OpCode::MOVE, saved_reg, lidx, 0);
+        } else if let Some(uidx) = upval_idx {
+            fs.code_abc(OpCode::GETUPVAL, saved_reg, uidx, 0);
+        }
+        for u in prev_vars.iter_mut() {
+            if let Some(lidx) = local_idx {
+                if u.table_reg == Some(lidx) {
+                    u.table_reg = Some(saved_reg);
+                }
+                if !u.table_key_is_const && !u.table_key_is_int && u.table_key == Some(lidx) {
+                    u.table_key = Some(saved_reg);
+                }
+            }
+            if let Some(uidx) = upval_idx {
+                if u.is_env_upvalue && u.table_reg == Some(uidx) {
+                    u.table_reg = Some(saved_reg);
+                    u.is_env_upvalue = false;
+                }
+            }
+        }
+    }
+}
+
 fn parse_assign_or_call(fs: &mut FuncState) {
     let mut first = parse_prefix_exp(fs);
     
@@ -1573,7 +1633,14 @@ fn parse_assign_or_call(fs: &mut FuncState) {
         let mut vars = vec![first];
         while check(fs, &Token::Comma) {
             fs.ls_mut().next();
-            vars.push(parse_prefix_exp(fs));
+            let new_var = parse_prefix_exp(fs);
+            // check_conflict: if a non-indexed variable conflicts with previous
+            // indexed variables (same table/key register), save the original
+            // value to a temp register (matching C's check_conflict in lparser.cpp).
+            if new_var.table_reg.is_none() {
+                check_conflict_for_var(fs, &mut vars, &new_var);
+            }
+            vars.push(new_var);
         }
         expect(fs, &Token::Eq);
         
@@ -3304,6 +3371,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             } else {
                                 let r = fs.expr_to_reg(&ec);
                                 let pc = fs.code_abc(OpCode::ADD, r2, r2, r);
+                                fs.code_abc(OpCode::MMBIN, r2, r, 6);
                                 e = ExprItem { exp: ec.into_reloc_with_pc(r2 as i64, pc) };
                             }
                         }
@@ -3382,6 +3450,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                                     fs.free_reg();
                                 }
                             }
+                            fs.code_abc(OpCode::MMBIN, r_src, r2, 6);
                             e = ExprItem { exp: ec.into_reloc_with_pc(r as i64, pc) };
                         }
                     } else if !is_add && matches!(e2.exp.kind, ExpKind::Float) {
@@ -3408,6 +3477,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                                     fs.free_reg();
                                 }
                             }
+                            fs.code_abc(OpCode::MMBIN, r_src, r2, 7);
                             e = ExprItem { exp: ec.into_reloc_with_pc(r as i64, pc) };
                         }
                     } else {
@@ -3422,6 +3492,8 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         };
                         let op = if is_add { OpCode::ADD } else { OpCode::SUB };
                         let pc = fs.code_abc(op, r, r_src, r2);
+                        let mm_tm = if is_add { 6 } else { 7 };
+                        fs.code_abc(OpCode::MMBIN, r_src, r2, mm_tm);
                         let e2_reloc = matches!(e2.exp.kind, ExpKind::Relocable);
                         if e2_reloc || (!matches!(e2.exp.kind, ExpKind::NonReloc) && !e2.exp.has_jumps()) {
                             if r2 == fs.freereg - 1 && r2 != r {
