@@ -1448,16 +1448,14 @@ fn parse_statement(fs: &mut FuncState) {
 fn parse_assign_or_call(fs: &mut FuncState) {
     let mut first = parse_prefix_exp(fs);
     
-    let mut has_call = false;
-    let mut extra_free = false;
-    let mut freg: i32 = 0;
-    let mut call_pc: i32 = -1;
-    if check(fs, &Token::LParen) || check(fs, &Token::Colon) || check(fs, &Token::LBrace) || matches!(&fs.ls().token, Token::String(..)) {
+    let mut has_call = first.has_call;
+    let mut freg: i32 = first.reg.unwrap_or(-1);
+    let mut call_pc: i32 = first.call_pc;
+    if !has_call && (check(fs, &Token::LParen) || check(fs, &Token::Colon) || check(fs, &Token::LBrace) || matches!(&fs.ls().token, Token::String(..))) {
         has_call = true;
         let is_method = check(fs, &Token::Colon);
-        let (fr, ef, func_allocated, src_reg) = load_func(fs, &first, is_method);
+        let (fr, _ef, func_allocated, src_reg) = load_func(fs, &first, is_method);
         freg = fr;
-        extra_free = ef;
         call_pc = parse_func_args(fs, freg, src_reg);
         loop {
             match &fs.ls().token {
@@ -1498,6 +1496,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     is_env_upvalue: first.is_env_upvalue,
                     upval_idx: first.upval_idx,
                     env_gettabup_pc: if first.is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { first.env_gettabup_pc } },
+                    has_call: false, call_pc: -1,
                 };
             }
             Token::LBracket => {
@@ -1537,6 +1536,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     is_env_upvalue: first.is_env_upvalue,
                     upval_idx: first.upval_idx,
                     env_gettabup_pc: if first.is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { first.env_gettabup_pc } },
+                    has_call: false, call_pc: -1,
                 };
             }
             _ => break,
@@ -1605,23 +1605,14 @@ fn parse_assign_or_call(fs: &mut FuncState) {
         if exps.len() > vars.len() {
             if last_is_call {
                 fs.set_c(exps.last().unwrap().info2, 1);
+            } else {
+                // Match C original: adjust_assign calls luaK_exp2nextreg for last exp
+                let last_exp = exps.last().unwrap();
+                fs.exp_to_reg(last_exp);
             }
-            for i in (vars.len()..exps.len()).rev() {
-                let e = &exps[i];
-                match e.kind {
-                    ExpKind::NonReloc => {
-                        if e.info as i32 >= fs.nvarstack() && e.info as i32 == fs.freereg - 1 {
-                            fs.free_reg();
-                        }
-                    }
-                    ExpKind::Relocable | ExpKind::Call | ExpKind::Vararg => {
-                        if e.info as i32 >= fs.nvarstack() && e.info as i32 == fs.freereg - 1 {
-                            fs.free_reg();
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            // Match C original: freereg -= (nexps - nvars)
+            let excess = (exps.len() - vars.len()) as i32;
+            fs.set_freereg(fs.freereg - excess);
         }
         for i in (0..vars.len()).rev() {
             if i < exps.len() {
@@ -1764,8 +1755,10 @@ fn parse_assign_or_call(fs: &mut FuncState) {
         return;
     }
     
-    let (_r, _, _, _) = load_func(fs, &first, false);
-    fs.free_reg();
+    if !has_call {
+        let (_r, _, _, _) = load_func(fs, &first, false);
+        fs.free_reg();
+    }
 }
 
 /// 将常量表达式转换为常量表索引 (≤255 则返回)
@@ -2103,6 +2096,8 @@ struct PrefixResult {
     is_env_upvalue: bool,
     upval_idx: Option<i32>,
     env_gettabup_pc: i32,
+    has_call: bool,
+    call_pc: i32,
 }
 
 /// ANTLR4: `prefixexp: varOrExp | functioncall | '(' expr ')' ;` 以及 `var: NAME | prefixexp '[' expr ']' | prefixexp '.' NAME ;`
@@ -2147,17 +2142,17 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         fs.code_abx(OpCode::LOADK, r, k);
                     }
                 };
-                PrefixResult { var_name: None, local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1 }
+                PrefixResult { var_name: None, local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1 }
             } else if let Some(reg) = fs.find_local(&name) {
-                PrefixResult { var_name: None, local_idx: Some(reg), key: None, reg: Some(reg), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1 }
+                PrefixResult { var_name: None, local_idx: Some(reg), key: None, reg: Some(reg), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1 }
             } else if let Some(upval_idx) = fs.find_upvalue(&name) {
                 let r = fs.alloc_reg();
                 fs.code_abc(OpCode::GETUPVAL, r, upval_idx, 0);
-                PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: Some(upval_idx), env_gettabup_pc: -1 }
+                PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: Some(upval_idx), env_gettabup_pc: -1, has_call: false, call_pc: -1 }
             } else {
                 let is_env = name == "_ENV";
                 let k = if is_env { 0 } else { fs.string_k(&name) };
-                PrefixResult { var_name: Some(name), local_idx: None, key: Some(k), reg: None, table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: is_env, upval_idx: if is_env { Some(0) } else { None }, env_gettabup_pc: -1 }
+                PrefixResult { var_name: Some(name), local_idx: None, key: Some(k), reg: None, table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: is_env, upval_idx: if is_env { Some(0) } else { None }, env_gettabup_pc: -1, has_call: false, call_pc: -1 }
             };
 
             loop {
@@ -2221,6 +2216,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         is_env_upvalue: result.is_env_upvalue,
                         upval_idx: result.upval_idx,
                         env_gettabup_pc: if result.is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { result.env_gettabup_pc } },
+                        has_call: false, call_pc: -1,
                     };
                 }
                 Token::LBracket => {
@@ -2299,7 +2295,50 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         is_env_upvalue: result.is_env_upvalue,
                         upval_idx: result.upval_idx,
                         env_gettabup_pc: if result.is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { result.env_gettabup_pc } },
+                        has_call: false, call_pc: -1,
                     };
+                    }
+                    Token::LParen | Token::LBrace | Token::String(..) | Token::Colon => {
+                        let is_method = matches!(&fs.ls().token, Token::Colon);
+                        // If result is already a call result in the right position, reuse freg
+                        let (freg, _ef, func_allocated, src_reg) = if is_method {
+                            load_func(fs, &result, true)
+                        } else if result.has_call {
+                            if let Some(reg) = result.reg {
+                                if reg == fs.freereg - 1 {
+                                    // Already in the right position, no need to load
+                                    (reg, false, result.allocated_reg, None)
+                                } else {
+                                    load_func(fs, &result, false)
+                                }
+                            } else {
+                                load_func(fs, &result, false)
+                            }
+                        } else {
+                            load_func(fs, &result, false)
+                        };
+                        let mut last_call_pc = parse_func_args(fs, freg, src_reg);
+                        // Match C original: funcargs sets fs->freereg = base + 1
+                        fs.set_freereg(freg + 1);
+                        loop {
+                            match &fs.ls().token {
+                                Token::LParen | Token::LBrace | Token::String(_) | Token::Colon => {
+                                    last_call_pc = parse_func_args(fs, freg, None);
+                                    fs.set_freereg(freg + 1);
+                                }
+                                _ => break,
+                            }
+                        }
+                        result = PrefixResult {
+                            var_name: None, local_idx: None, key: None, reg: Some(freg),
+                            table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false,
+                            key_allocated_reg: false,
+                            allocated_reg: func_allocated,
+                            is_env_upvalue: false,
+                            upval_idx: None,
+                            env_gettabup_pc: -1,
+                            has_call: true, call_pc: last_call_pc,
+                        };
                     }
                     _ => break,
                 }
@@ -2312,12 +2351,12 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
             let e = parse_expr(fs);
             expect(fs, &Token::RParen);
             let r = fs.expr_to_reg(&e.exp);
-            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1 }
+            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1 }
         }
         _ => {
             let e = parse_simple_exp(fs);
             let r = fs.expr_to_reg(&e.exp);
-            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1 }
+            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1 }
         }
     }
 }

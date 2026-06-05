@@ -495,6 +495,7 @@ mod compiler_compare_tests {
         assert_inst_match("local a, b, f; a,b = f(), 1, 2, 3, f()", None);
         assert_inst_match("local a = {}; a[print](a[a[f]] == a[print])", None);
         assert_inst_match("local a, b, c; a = {10,9,8,7,6,5,4,3,2; [-3]='a', [f]=print, a='a', b='ab'}", None);
+        assert_inst_match("local a, b, c; a[1], f(a)[2], b, c = {['alo']=assert}, 10, a[1], a[f], 6, 10, 23, f(a), 2", None);
     }
 
     #[test]
