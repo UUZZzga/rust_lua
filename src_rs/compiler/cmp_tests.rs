@@ -360,6 +360,7 @@ mod compiler_compare_tests {
         assert_inst_match("while false do end", None);
         assert_inst_match("while nil do end;", None);
         assert_inst_match("local a=nil; while not a do end", None);
+        assert_inst_match("local a; while a ~= (a + 0.0) or (a - 1) ~= (a - 1.0) do a = a // 2 end", None);
     }
 
     #[test]

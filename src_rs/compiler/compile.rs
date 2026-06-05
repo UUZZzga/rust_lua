@@ -3389,6 +3389,32 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             }
                             e = ExprItem { exp: ec.into_reloc_with_pc(r as i64, pc) };
                         }
+                    } else if !is_add && matches!(e2.exp.kind, ExpKind::Float) {
+                        let f = f64::from_bits(e2.exp.info as u64);
+                        let k = fs.float_k(f);
+                        if k <= 255 {
+                            let pc = fs.code_abc(OpCode::SUBK, r, r_src, k);
+                            fs.code_abc(OpCode::MMBINK, r_src, k, 7);
+                            e = ExprItem { exp: ec.into_reloc_with_pc(r as i64, pc) };
+                        } else {
+                            let r2 = if matches!(e2.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !e2.exp.has_jumps() {
+                                let reg = e2.exp.info as i32;
+                                if e2.exp.info2 >= 0 {
+                                    fs.set_a(e2.exp.info2, reg);
+                                }
+                                reg
+                            } else {
+                                fs.exp_to_reg(&e2.exp)
+                            };
+                            let pc = fs.code_abc(OpCode::SUB, r, r_src, r2);
+                            let e2_reloc = matches!(e2.exp.kind, ExpKind::Relocable);
+                            if e2_reloc || (!matches!(e2.exp.kind, ExpKind::NonReloc) && !e2.exp.has_jumps()) {
+                                if r2 == fs.freereg - 1 && r2 != r {
+                                    fs.free_reg();
+                                }
+                            }
+                            e = ExprItem { exp: ec.into_reloc_with_pc(r as i64, pc) };
+                        }
                     } else {
                         let r2 = if matches!(e2.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !e2.exp.has_jumps() {
                             let reg = e2.exp.info as i32;
@@ -4511,41 +4537,54 @@ fn parse_while(fs: &mut FuncState) {
     let entry_freereg = fs.freereg;
     fs.ls_mut().next();
     let loop_start = fs.pc;
-    let ei = parse_expr(fs);
+    let mut ei = parse_expr(fs);
     let pre_freereg = fs.freereg;
-    let is_not_vreloc = ei.exp.info2 >= 0
-        && (ei.exp.info2 as usize) < fs.proto.code.len()
-        && get_opcode(fs.proto.code[ei.exp.info2 as usize]) == OpCode::NOT;
-    let (r, test_with_k) = if (ei.exp.info2 == -2 || is_not_vreloc)
-        && matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc)
-    {
-        let reg = ei.exp.info as i32;
-        if is_not_vreloc {
-            fs.pc -= 1;
-            fs.proto.code.pop();
-        } else if !fs.proto.code.is_empty()
-            && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT
-        {
-            fs.proto.code.pop();
-            fs.pc -= 1;
-        }
-        (reg, true)
+    
+    let condexit = if ei.exp.kind == ExpKind::VJMP {
+        // Handle VJMP like luaK_goiftrue in C: negate condition, 
+        // add JMP to false list, patch true list to here (body start)
+        let saved_jmp = ei.exp.info as i32;
+        fs.negate_condition(saved_jmp);
+        fs.concat_jump(&mut ei.exp.f, saved_jmp);
+        let here = fs.pc;
+        fs.patch_true_jumps(ei.exp.t, here);
+        ei.exp.f
     } else {
-        let reg = fs.cond_to_reg(&ei.exp);
-        let k = matches!(ei.exp.kind, ExpKind::Relocable)
-            && !fs.proto.code.is_empty()
-            && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT;
-        if k {
-            fs.proto.code.pop();
-            fs.pc -= 1;
+        let is_not_vreloc = ei.exp.info2 >= 0
+            && (ei.exp.info2 as usize) < fs.proto.code.len()
+            && get_opcode(fs.proto.code[ei.exp.info2 as usize]) == OpCode::NOT;
+        let (r, test_with_k) = if (ei.exp.info2 == -2 || is_not_vreloc)
+            && matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc)
+        {
+            let reg = ei.exp.info as i32;
+            if is_not_vreloc {
+                fs.pc -= 1;
+                fs.proto.code.pop();
+            } else if !fs.proto.code.is_empty()
+                && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT
+            {
+                fs.proto.code.pop();
+                fs.pc -= 1;
+            }
+            (reg, true)
+        } else {
+            let reg = fs.cond_to_reg(&ei.exp);
+            let k = matches!(ei.exp.kind, ExpKind::Relocable)
+                && !fs.proto.code.is_empty()
+                && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT;
+            if k {
+                fs.proto.code.pop();
+                fs.pc -= 1;
+            }
+            (reg, k)
+        };
+        fs.code_abc_k(OpCode::TEST, r, 0, 0, test_with_k);
+        let jmp = fs.jump();
+        if fs.freereg > pre_freereg {
+            fs.free_reg();
         }
-        (reg, k)
+        jmp
     };
-    fs.code_abc_k(OpCode::TEST, r, 0, 0, test_with_k);
-    let jmp = fs.jump();
-    if fs.freereg > pre_freereg {
-        fs.free_reg();
-    }
     expect(fs, &Token::Do);
 
     let saved_breaklist = fs.break_list;
@@ -4567,7 +4606,13 @@ fn parse_while(fs: &mut FuncState) {
     fs.set_freereg(block_freereg);
 
     fs.code_sj(OpCode::JMP, loop_start - fs.pc - 1, 0);
-    fs.fix_jump(jmp, fs.pc, false);
+    // Patch the condexit (false exits) to after the loop
+    let mut cur = condexit;
+    while cur != NO_JUMP {
+        let next = fs.get_jump(cur);
+        fs.fix_jump(cur, fs.pc, false);
+        cur = next;
+    }
 
     fs.patch_breaks(fs.pc);
     fs.break_list = saved_breaklist;
