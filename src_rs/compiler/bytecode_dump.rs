@@ -143,12 +143,9 @@ impl BytecodeReader {
         let sizecode = self.read_int() as usize;
         self.align(4);
         let mut code = Vec::with_capacity(sizecode);
-        for i in 0..sizecode {
+        for _i in 0..sizecode {
             let bytes = self.read_bytes(4);
             let raw = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            if i <= 5 || (raw & 0x7f) == 66 || (raw & 0x7f) == 67 {
-                eprintln!("DEBUG_READ_CODE: i={} raw=0x{:08x} bytes={:02x?}", i, raw, bytes);
-            }
             code.push(self.read_instruction(raw));
         }
         code
@@ -553,11 +550,8 @@ pub fn compare_instructions(rust_code: &[u32], c_code: &[DumpInstruction]) -> Ve
     let rust_formatted: Vec<String> = rust_code
         .iter()
         .enumerate()
-        .map(|(i, &raw)| {
+        .map(|(_i, &raw)| {
             let formatted = format_instruction(raw);
-            if i == 4 || i == 9 {
-                eprintln!("COMPARE_DEBUG: pc={} raw=0x{:08x} formatted={}", i, raw, formatted);
-            }
             formatted
         })
         .collect();
@@ -645,11 +639,6 @@ pub fn format_c_instruction(inst: &DumpInstruction, constants: &[DumpConstant]) 
     let bx = inst.bx as i32;
     let sbx = bx - opcodes::OFFSET_SBX;
     let sj = getarg_sj(raw);
-
-    if opcode == OpCode::TEST || opcode == OpCode::TESTSET {
-        eprintln!("DEBUG_FORMAT_C_INST: inst.opcode={} raw=0x{:x} opcode={:?} op_name={} a={} b={} c={} k={}",
-            inst.opcode, raw, opcode, op_name, a, b, c, k);
-    }
 
     let operands = format_operands(raw, a, b, c, bx, sbx, sj, k);
     let comment = format_c_comment(inst, constants);

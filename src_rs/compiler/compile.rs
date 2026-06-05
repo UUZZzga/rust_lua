@@ -4317,9 +4317,16 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     } else {
                         let key_reg = if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei.exp.has_jumps() {
                             if ei.exp.info2 >= 0 {
-                                fs.set_a(ei.exp.info2, ei.exp.info as i32);
+                                // 模拟 C 的 luaK_exp2anyreg：如果源寄存器在栈顶且非局部变量，先释放再分配（复用同一寄存器）
+                                if (ei.exp.info as i32) == fs.freereg - 1 && (ei.exp.info as i32) >= fs.nvarstack() {
+                                    fs.free_reg();
+                                }
+                                let r = fs.alloc_reg();
+                                fs.set_a(ei.exp.info2, r);
+                                r
+                            } else {
+                                ei.exp.info as i32
                             }
-                            ei.exp.info as i32
                         } else {
                             fs.expr_to_reg(&ei.exp)
                         };
@@ -5103,10 +5110,7 @@ fn parse_return(fs: &mut FuncState) {
     }
     
     let ei = parse_expr(fs);
-    eprintln!("DEBUG_RET: expr_kind={:?} expr_info={} t={} f={} freereg_before_exp_to_reg={}",
-        ei.exp.kind, ei.exp.info, ei.exp.t, ei.exp.f, fs.freereg);
     let r = fs.exp_to_reg(&ei.exp);
-    eprintln!("DEBUG_RET: r={} freereg_after={}", r, fs.freereg);
 
     if check(fs, &Token::Comma) {
         fs.ls_mut().next();
