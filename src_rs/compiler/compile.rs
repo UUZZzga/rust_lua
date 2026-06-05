@@ -5004,6 +5004,19 @@ fn parse_expr_list(fs: &mut FuncState) -> i32 {
     n
 }
 
+/// Compute a limit for how many registers a constructor can use before
+/// emitting a SETLIST instruction, based on how many registers are available.
+fn maxtostore(fs: &FuncState) -> i32 {
+    let numfreeregs = (MAX_FSTACK as i32) - fs.freereg;
+    if numfreeregs >= 160 {
+        numfreeregs / 5
+    } else if numfreeregs >= 80 {
+        10
+    } else {
+        1
+    }
+}
+
 /// ANTLR4: `tableconstructor: '{' fieldlist? '}' ;`
 fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
     fs.ls_mut().next();
@@ -5014,20 +5027,25 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
     let mut tostore: i32 = 0;
     let mut need_hash: i32 = 0;
     let mut last_list_exp: Option<ExpDesc> = None;
+    let maxtostore = maxtostore(fs);
 
     if !check(fs, &Token::RBrace) {
         loop {
             if check(fs, &Token::LBracket) {
+                // closelistfield: discharge previous list item
                 if let Some(prev) = last_list_exp.take() {
                     fs.exp_to_reg(&prev);
                     tostore += 1;
                 }
-                if tostore > 0 {
+                // Only flush SETLIST if tostore >= maxtostore
+                if tostore > 0 && tostore >= maxtostore {
                     fs.code_abc(OpCode::SETLIST, table_r, tostore, need_array);
                     need_array += tostore;
                     tostore = 0;
                     fs.set_freereg(table_r + 1);
                 }
+                // recfield: save freereg, process, restore freereg
+                let saved_freereg = fs.freereg;
                 fs.ls_mut().next();
                 let ek = parse_expr(fs);
                 expect(fs, &Token::RBracket);
@@ -5038,48 +5056,53 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                 } else {
                     None
                 };
+                let is_seti = ek.exp.kind == ExpKind::Int
+                    && ek.exp.info >= 0
+                    && ek.exp.info <= ((1u32 << SIZE_C) - 1) as i64;
+                // For SETTABLE, discharge key to register before parsing value,
+                // so key's register is at freereg-1 when discharged
+                let k_r = if key_k.is_none() && !is_seti {
+                    Some(fs.exp_to_reg(&ek.exp))
+                } else {
+                    None
+                };
                 let ev = parse_expr(fs);
                 let (v_rk, is_k) = exp2rk(fs, &ev.exp);
                 if let Some(k) = key_k {
                     fs.code_abc_k(OpCode::SETFIELD, table_r, k, v_rk, is_k);
-                } else if ek.exp.kind == ExpKind::Int
-                    && ek.exp.info >= 0
-                    && ek.exp.info <= ((1u32 << SIZE_C) - 1) as i64
-                {
+                } else if is_seti {
                     let k = ek.exp.info as i32;
                     fs.code_abc_k(OpCode::SETI, table_r, k, v_rk, is_k);
                 } else {
-                    let k_r = fs.exp_to_reg(&ek.exp);
-                    fs.code_abc_k(OpCode::SETTABLE, table_r, k_r, v_rk, is_k);
-                    fs.free_reg();
+                    fs.code_abc_k(OpCode::SETTABLE, table_r, k_r.unwrap(), v_rk, is_k);
                 }
-                if !is_k {
-                    fs.free_reg();
-                }
+                fs.freereg = saved_freereg;  /* free registers used by recfield */
                 need_hash += 1;
             } else if let Token::Name(s) = &fs.ls().token {
                 let name = s.clone();
                 let next_is_eq = fs.ls_mut().lookahead_next().0 == Token::Eq;
                 if next_is_eq {
+                    // closelistfield: discharge previous list item
                     if let Some(prev) = last_list_exp.take() {
                         fs.exp_to_reg(&prev);
                         tostore += 1;
                     }
-                    if tostore > 0 {
+                    // Only flush SETLIST if tostore >= maxtostore
+                    if tostore > 0 && tostore >= maxtostore {
                         fs.code_abc(OpCode::SETLIST, table_r, tostore, need_array);
                         need_array += tostore;
                         tostore = 0;
                         fs.set_freereg(table_r + 1);
                     }
+                    // recfield: save freereg, process, restore freereg
+                    let saved_freereg = fs.freereg;
                     fs.ls_mut().next();
                     fs.ls_mut().next();
                     let ev = parse_expr(fs);
                     let k = fs.string_k(&name);
                     let (v_rk, is_k) = exp2rk(fs, &ev.exp);
                     fs.code_abc_k(OpCode::SETFIELD, table_r, k, v_rk, is_k);
-                    if !is_k {
-                        fs.free_reg();
-                    }
+                    fs.freereg = saved_freereg;  /* free registers used by recfield */
                     need_hash += 1;
                 } else {
                     if let Some(prev) = last_list_exp.take() {
@@ -5102,6 +5125,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
         }
     }
 
+    // lastlistfield
     if let Some(last) = last_list_exp {
         if last.kind == ExpKind::Call {
             fs.set_c(last.info2, 0);
