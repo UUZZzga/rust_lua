@@ -410,6 +410,7 @@ mod compiler_compare_tests {
         assert_inst_match("local function h(a,b,c,d,e) while (a>=b or c or (d and e) or nil) do return 1; end; return 0; end", None);
         assert_inst_match("assert(not a(b, 'c'))", None);
         assert_inst_match("local a; a.b.c = function (...) end", None);
+        assert_inst_match("local a,i,j,b; local function foo() i, a[i], a, j, a[j], a[i+j] = j, i, i, b, j, i end", None);
     }
 
     #[test]
