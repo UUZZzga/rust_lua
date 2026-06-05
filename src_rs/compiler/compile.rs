@@ -1488,10 +1488,18 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     };
                     (r, pc)
                 };
+                let is_short_str = field.len() <= crate::strings::LUAI_MAXSHORTLEN;
+                let (table_key, table_key_is_const, key_allocated_reg) = if is_short_str {
+                    (k, true, false)
+                } else {
+                    let kr = fs.alloc_reg();
+                    fs.code_abx(OpCode::LOADK, kr, k);
+                    (kr, false, true)
+                };
                 first = PrefixResult {
                     var_name: None, local_idx: None, key: None, reg: Some(base_reg),
-                    table_reg: Some(base_reg), table_key: Some(k), table_key_is_const: true, table_key_is_int: false,
-                    key_allocated_reg: false,
+                    table_reg: Some(base_reg), table_key: Some(table_key), table_key_is_const: table_key_is_const, table_key_is_int: false,
+                    key_allocated_reg: key_allocated_reg,
                     allocated_reg: if first.is_env_upvalue { false } else { first.allocated_reg || first.reg.is_none() },
                     is_env_upvalue: first.is_env_upvalue,
                     upval_idx: first.upval_idx,
@@ -1518,7 +1526,16 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 let ei = parse_expr(fs);
                 expect(fs, &Token::RBracket);
                 let (kr, key_is_const, key_is_int) = if ei.exp.kind == ExpKind::Str {
-                    (fs.get_str_k(&ei.exp), true, false)
+                    let k = fs.get_str_k(&ei.exp);
+                    // C++ compiler: isKstr checks ttisshrstring — only short strings can use SETFIELD/GETFIELD
+                    if let TValue::Str(crate::strings::LuaString::Short(_)) = fs.proto.constants[k as usize] {
+                        (k, true, false)
+                    } else {
+                        // Long string: load into register, use SETTABLE/GETTABLE
+                        let kr = fs.alloc_reg();
+                        fs.code_abx(OpCode::LOADK, kr, k);
+                        (kr, false, false)
+                    }
                 } else if ei.exp.kind == ExpKind::Int
                     && ei.exp.info >= 0
                     && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
@@ -1995,7 +2012,17 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
         let method = get_name(fs);
         let k = fs.string_k(&method);
         let src = src_reg.unwrap_or(freg);
-        fs.code_abc(OpCode::SELF, freg, src, k);
+        // C++ compiler: luaK_self checks strisshr — long method names can't use SELF opcode
+        if method.len() <= crate::strings::LUAI_MAXSHORTLEN {
+            fs.code_abc(OpCode::SELF, freg, src, k);
+        } else {
+            // Long method name: use MOVE + GETTABLE instead of SELF
+            let kr = fs.alloc_reg();
+            fs.code_abx(OpCode::LOADK, kr, k);
+            fs.code_abc(OpCode::MOVE, freg + 1, src, 0);
+            fs.code_abc(OpCode::GETTABLE, freg, src, kr);
+            fs.free_reg();  // free key register
+        }
         if check(fs, &Token::LParen) {
             fs.ls_mut().next();
             if fs.freereg <= freg + 1 {
@@ -2208,10 +2235,18 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                             let pc = fs.code_abc(OpCode::GETTABUP, r, 0, gk);
                             (r, pc)
                         };
+                        let is_short_str = field.len() <= crate::strings::LUAI_MAXSHORTLEN;
+                        let (table_key, table_key_is_const, key_allocated_reg) = if is_short_str {
+                            (k, true, false)
+                        } else {
+                            let kr = fs.alloc_reg();
+                            fs.code_abx(OpCode::LOADK, kr, k);
+                            (kr, false, true)
+                        };
                         result = PrefixResult {
                         var_name: None, local_idx: None, key: None, reg: Some(base_reg),
-                        table_reg: Some(base_reg), table_key: Some(k), table_key_is_const: true, table_key_is_int: false,
-                        key_allocated_reg: false,
+                        table_reg: Some(base_reg), table_key: Some(table_key), table_key_is_const: table_key_is_const, table_key_is_int: false,
+                        key_allocated_reg: key_allocated_reg,
                         allocated_reg: if result.is_env_upvalue { false } else { result.allocated_reg || result.reg.is_none() },
                         is_env_upvalue: result.is_env_upvalue,
                         upval_idx: result.upval_idx,
@@ -2272,7 +2307,15 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     let ei = parse_expr(fs);
                     expect(fs, &Token::RBracket);
                     let (kr, key_is_const, key_is_int) = if ei.exp.kind == ExpKind::Str {
-                        (fs.get_str_k(&ei.exp), true, false)
+                        let k = fs.get_str_k(&ei.exp);
+                        // C++ compiler: isKstr checks ttisshrstring — only short strings can use SETFIELD/GETFIELD
+                        if let TValue::Str(crate::strings::LuaString::Short(_)) = fs.proto.constants[k as usize] {
+                            (k, true, false)
+                        } else {
+                            let kr = fs.alloc_reg();
+                            fs.code_abx(OpCode::LOADK, kr, k);
+                            (kr, false, false)
+                        }
                     } else if ei.exp.kind == ExpKind::Int
                         && ei.exp.info >= 0
                         && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
@@ -5108,7 +5151,15 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                 let ev = parse_expr(fs);
                 let (v_rk, is_k) = exp2rk(fs, &ev.exp);
                 if let Some(k) = key_k {
-                    fs.code_abc_k(OpCode::SETFIELD, table_r, k, v_rk, is_k);
+                    // C++ compiler: isKstr checks ttisshrstring — only short strings use SETFIELD
+                    if let TValue::Str(crate::strings::LuaString::Short(_)) = fs.proto.constants[k as usize] {
+                        fs.code_abc_k(OpCode::SETFIELD, table_r, k, v_rk, is_k);
+                    } else {
+                        // Long string: load key into register, use SETTABLE
+                        let kr = fs.alloc_reg();
+                        fs.code_abx(OpCode::LOADK, kr, k);
+                        fs.code_abc_k(OpCode::SETTABLE, table_r, kr, v_rk, is_k);
+                    }
                 } else if is_seti {
                     let k = ek.exp.info as i32;
                     fs.code_abc_k(OpCode::SETI, table_r, k, v_rk, is_k);
@@ -5140,7 +5191,14 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                     let ev = parse_expr(fs);
                     let k = fs.string_k(&name);
                     let (v_rk, is_k) = exp2rk(fs, &ev.exp);
-                    fs.code_abc_k(OpCode::SETFIELD, table_r, k, v_rk, is_k);
+                    // C++ compiler: isKstr checks ttisshrstring — only short strings use SETFIELD
+                    if name.len() <= crate::strings::LUAI_MAXSHORTLEN {
+                        fs.code_abc_k(OpCode::SETFIELD, table_r, k, v_rk, is_k);
+                    } else {
+                        let kr = fs.alloc_reg();
+                        fs.code_abx(OpCode::LOADK, kr, k);
+                        fs.code_abc_k(OpCode::SETTABLE, table_r, kr, v_rk, is_k);
+                    }
                     fs.freereg = saved_freereg;  /* free registers used by recfield */
                     need_hash += 1;
                 } else {
