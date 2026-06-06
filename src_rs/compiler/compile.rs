@@ -4372,7 +4372,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 let field = get_name(fs);
                 let k = fs.string_k(&field);
                 let base_reg = fs.expr_to_reg(&e);
-                let is_env_upval = {
+                let is_env_upval = fs.pc > 0 && {
                     let last_ins = fs.proto.code[fs.pc as usize - 1];
                     get_opcode(last_ins) == OpCode::GETUPVAL && getarg_b(last_ins) == 0
                 };
