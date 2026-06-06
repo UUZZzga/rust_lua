@@ -973,6 +973,24 @@ impl FuncState {
         }
     }
 
+    /// Like exp_to_reg, but always places the result in a newly allocated register.
+    /// Equivalent to C++ luaK_exp2nextreg. Used in table constructors where
+    /// array values must occupy consecutive registers after the table register.
+    fn exp_to_next_reg(&mut self, e: &ExpDesc) -> i32 {
+        let r = self.expr_to_reg(e);
+        if r == self.freereg - 1 {
+            // Already in the last allocated register
+            self.resolve_jumps(e, r);
+            r
+        } else {
+            // Need to move to a new register
+            let dst = self.alloc_reg();
+            self.code_abc(OpCode::MOVE, dst, r, 0);
+            self.resolve_jumps(e, dst);
+            dst
+        }
+    }
+
     fn cond_to_reg(&mut self, e: &ExpDesc) -> i32 {
         if matches!(e.kind, ExpKind::Void | ExpKind::Nil) {
             let r = self.alloc_reg();
@@ -5393,7 +5411,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
             if check(fs, &Token::LBracket) {
                 // closelistfield: discharge previous list item
                 if let Some(prev) = last_list_exp.take() {
-                    fs.exp_to_reg(&prev);
+                    fs.exp_to_next_reg(&prev);
                     tostore += 1;
                 }
                 // Only flush SETLIST if tostore >= maxtostore
@@ -5451,7 +5469,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                 if next_is_eq {
                     // closelistfield: discharge previous list item
                     if let Some(prev) = last_list_exp.take() {
-                        fs.exp_to_reg(&prev);
+                        fs.exp_to_next_reg(&prev);
                         tostore += 1;
                     }
                     // Only flush SETLIST if tostore >= maxtostore
@@ -5488,14 +5506,14 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                     need_hash += 1;
                 } else {
                     if let Some(prev) = last_list_exp.take() {
-                        fs.exp_to_reg(&prev);
+                        fs.exp_to_next_reg(&prev);
                         tostore += 1;
                     }
                     last_list_exp = Some(parse_expr(fs).exp);
                 }
             } else {
                 if let Some(prev) = last_list_exp.take() {
-                    fs.exp_to_reg(&prev);
+                    fs.exp_to_next_reg(&prev);
                     tostore += 1;
                 }
                 last_list_exp = Some(parse_expr(fs).exp);
@@ -5519,7 +5537,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
             need_array += tostore;
             fs.set_freereg(table_r + 1);
         } else {
-            fs.exp_to_reg(&last);
+            fs.exp_to_next_reg(&last);
             tostore += 1;
             if tostore > 0 {
                 fs.code_abc(OpCode::SETLIST, table_r, tostore, need_array);

@@ -416,6 +416,7 @@ mod compiler_compare_tests {
         assert_inst_match("local t = {} (function (a) t[a], a = 10, 20  end)(1)", None);
         assert_inst_match("local T local a = {T.f[[]]} assert(T.f('', 2, 0) == 10.0/0) a = T.f('')", None);
         assert_inst_match("local t = setmetatable({x = 20}, {__len = function (t) return t.x end})", None);
+        assert_inst_match("local a, t; f(t, {n=1,a})", None);
     }
 
     #[test]
