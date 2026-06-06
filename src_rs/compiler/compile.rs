@@ -1269,11 +1269,54 @@ fn getglobalattribute(fs: &mut FuncState, df: i32) -> i32 {
     }
 }
 
+/// Emit GETTABUP or fallback to GETUPVAL+LOADK+GETTABLE when constant index > MAXINDEXRK
+fn code_gettabup(fs: &mut FuncState, r: i32, upval: i32, k: i32) {
+    if (k as u32) <= crate::opcodes::MAXINDEXRK {
+        fs.code_abc(OpCode::GETTABUP, r, upval, k);
+    } else {
+        fs.code_abc(OpCode::GETUPVAL, r, upval, 0);
+        let kr = fs.alloc_reg();
+        fs.code_abx(OpCode::LOADK, kr, k);
+        fs.code_abc(OpCode::GETTABLE, r, r, kr);
+        fs.free_reg();
+    }
+}
+
+/// Emit SETTABUP or fallback to GETUPVAL+LOADK+SETTABLE when constant index > MAXINDEXRK
+fn code_settabup(fs: &mut FuncState, upval: i32, k: i32, val: i32) {
+    if (k as u32) <= crate::opcodes::MAXINDEXRK {
+        fs.code_abc(OpCode::SETTABUP, upval, k, val);
+    } else {
+        let r = fs.alloc_reg();
+        fs.code_abc(OpCode::GETUPVAL, r, upval, 0);
+        let kr = fs.alloc_reg();
+        fs.code_abx(OpCode::LOADK, kr, k);
+        fs.code_abc_k(OpCode::SETTABLE, r, kr, val, false);
+        fs.free_reg(); // kr
+        fs.free_reg(); // r
+    }
+}
+
+/// Emit SETTABUP with k-bit or fallback to GETUPVAL+LOADK+SETTABLE when constant index > MAXINDEXRK
+fn code_settabup_k(fs: &mut FuncState, upval: i32, k: i32, val: i32, is_k: bool) {
+    if (k as u32) <= crate::opcodes::MAXINDEXRK {
+        fs.code_abc_k(OpCode::SETTABUP, upval, k, val, is_k);
+    } else {
+        let r = fs.alloc_reg();
+        fs.code_abc(OpCode::GETUPVAL, r, upval, 0);
+        let kr = fs.alloc_reg();
+        fs.code_abx(OpCode::LOADK, kr, k);
+        fs.code_abc_k(OpCode::SETTABLE, r, kr, val, is_k);
+        fs.free_reg(); // kr
+        fs.free_reg(); // r
+    }
+}
+
 /// 检查全局变量是否存在: GETTABUP + ERRNNIL
 fn checkglobal(fs: &mut FuncState, varname: &str, _line: i32) {
     let r = fs.alloc_reg();
     let k = fs.string_k(varname);
-    fs.code_abc(OpCode::GETTABUP, r, 0, k);
+    code_gettabup(fs, r, 0, k);
     let k_bx = if k >= 256 { 0 } else { k + 1 };
     fs.code_abx(OpCode::ERRNNIL, r, k_bx);
     fs.free_reg();
@@ -1318,10 +1361,10 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
                 let val = &exps[i];
                 let k_name = fs.string_k(&names[i]);
                 if let Some(k_val) = exp_to_k(fs, val) {
-                    fs.code_abc_k(OpCode::SETTABUP, 0, k_name, k_val, true);
+                    code_settabup_k(fs, 0, k_name, k_val, true);
                 } else {
                     let val_reg = fs.expr_to_reg(val);
-                    fs.code_abc(OpCode::SETTABUP, 0, k_name, val_reg);
+                    code_settabup(fs, 0, k_name, val_reg);
                     fs.free_reg();
                 }
             }
@@ -1348,7 +1391,7 @@ fn globalfunc(fs: &mut FuncState, _line: i32) {
     fs.add_local_kind(&fname, fs.pc, GDKREG);
     let r = parse_body(fs, None);
     let k = fs.string_k(&fname);
-    fs.code_abc(OpCode::SETTABUP, 0, k, r);
+    code_settabup(fs, 0, k, r);
     fs.free_reg();
     checkglobal(fs, &fname, _line);
 }
@@ -1546,13 +1589,14 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 } else {
                     let r = fs.alloc_reg();
                     let pc = if let Some(key) = first.key {
-                        fs.code_abc(OpCode::GETTABUP, r, 0, key)
+                        code_gettabup(fs, r, 0, key);
+                        fs.pc - 1
                     } else {
                         -1
                     };
                     (r, pc)
                 };
-                let is_short_str = field.len() <= crate::strings::LUAI_MAXSHORTLEN;
+                let is_short_str = field.len() <= crate::strings::LUAI_MAXSHORTLEN && (k as u32) <= crate::opcodes::MAXINDEXRK;
                 let (table_key, table_key_is_const, key_allocated_reg) = if is_short_str {
                     (k, true, false)
                 } else {
@@ -1580,7 +1624,8 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 } else {
                     let r = fs.alloc_reg();
                     let pc = if let Some(key) = first.key {
-                        fs.code_abc(OpCode::GETTABUP, r, 0, key)
+                        code_gettabup(fs, r, 0, key);
+                        fs.pc - 1
                     } else {
                         -1
                     };
@@ -1723,14 +1768,14 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         let use_last_reg = i == exps.len() - 1 && last_exp_reg.is_some();
                         let k_opt = if use_last_reg { None } else { exp_to_k(fs, val) };
                         if let Some(k_val) = k_opt {
-                            fs.code_abc_k(OpCode::SETTABUP, 0, adjusted_key, k_val, true);
+                            code_settabup_k(fs, 0, adjusted_key, k_val, true);
                         } else {
                             let val_reg = if use_last_reg {
                                 last_exp_reg.unwrap()
                             } else {
                                 fs.exp_to_reg(val)
                             };
-                            fs.code_abc(OpCode::SETTABUP, 0, adjusted_key, val_reg);
+                            code_settabup(fs, 0, adjusted_key, val_reg);
                             if val_reg >= fs.nvarstack() {
                                 fs.free_reg();
                             }
@@ -1780,14 +1825,14 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     let use_last_reg = i == exps.len() - 1 && last_exp_reg.is_some();
                     let k_opt = if use_last_reg { None } else { exp_to_k(fs, val) };
                     if let Some(k_val) = k_opt {
-                        fs.code_abc_k(OpCode::SETTABUP, 0, k_name, k_val, true);
+                        code_settabup_k(fs, 0, k_name, k_val, true);
                     } else {
                         let val_reg = if use_last_reg {
                             last_exp_reg.unwrap()
                         } else {
                             fs.exp_to_reg(val)
                         };
-                        fs.code_abc(OpCode::SETTABUP, 0, k_name, val_reg);
+                        code_settabup(fs, 0, k_name, val_reg);
                         if val_reg >= fs.nvarstack() {
                             fs.free_reg();
                         }
@@ -1820,7 +1865,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 if let (Some(table_reg), Some(table_key)) = (v.table_reg, v.table_key) {
                     let can_settabup = v.is_env_upvalue && v.table_key_is_const && !v.table_key_is_int;
                     if can_settabup {
-                        fs.code_abc(OpCode::SETTABUP, 0, table_key, result_reg);
+                        code_settabup(fs, 0, table_key, result_reg);
                     } else if v.table_key_is_const {
                         fs.code_abc_k(OpCode::SETFIELD, table_reg, table_key, result_reg, false);
                     } else {
@@ -1830,7 +1875,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     fs.code_abc(OpCode::SETUPVAL, result_reg, upval_idx, 0);
                 } else if let Some(ref name) = v.var_name {
                     let k_name = fs.string_k(name);
-                    fs.code_abc(OpCode::SETTABUP, 0, k_name, result_reg);
+                    code_settabup(fs, 0, k_name, result_reg);
                 } else if let Some(idx) = v.local_idx {
                     fs.code_abc(OpCode::MOVE, idx, result_reg, 0);
                 }
@@ -2037,7 +2082,7 @@ fn load_func(fs: &mut FuncState, p: &PrefixResult, is_method: bool) -> (i32, boo
         }
     } else if let Some(key) = p.key {
         let r = fs.alloc_reg();
-        fs.code_abc(OpCode::GETTABUP, r, 0, key);
+        code_gettabup(fs, r, 0, key);
         (r, false, true, None)
     } else if let Some(reg) = p.reg {
         let r = fs.alloc_reg();
@@ -2303,10 +2348,10 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         } else {
                             let r = fs.alloc_reg();
                             let gk = result.key.unwrap_or(0);
-                            let pc = fs.code_abc(OpCode::GETTABUP, r, 0, gk);
-                            (r, pc)
+                            code_gettabup(fs, r, 0, gk);
+                            (r, fs.pc - 1)
                         };
-                        let is_short_str = field.len() <= crate::strings::LUAI_MAXSHORTLEN;
+                        let is_short_str = field.len() <= crate::strings::LUAI_MAXSHORTLEN && (k as u32) <= crate::opcodes::MAXINDEXRK;
                         let (table_key, table_key_is_const, key_allocated_reg) = if is_short_str {
                             (k, true, false)
                         } else {
@@ -2371,17 +2416,23 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     } else {
                         let r = fs.alloc_reg();
                         let gk = result.key.unwrap_or(0);
-                        let pc = fs.code_abc(OpCode::GETTABUP, r, 0, gk);
-                        (r, pc)
+                        code_gettabup(fs, r, 0, gk);
+                        (r, fs.pc - 1)
                     };
                     let saved_freereg_before = fs.freereg;
                     let ei = parse_expr(fs);
                     expect(fs, &Token::RBracket);
                     let (kr, key_is_const, key_is_int) = if ei.exp.kind == ExpKind::Str {
                         let k = fs.get_str_k(&ei.exp);
-                        // C++ compiler: isKstr checks ttisshrstring — only short strings can use SETFIELD/GETFIELD
+                        // C++ compiler: isKstr checks ttisshrstring AND k <= MAXINDEXRK
                         if let TValue::Str(crate::strings::LuaString::Short(_)) = fs.proto.constants[k as usize] {
-                            (k, true, false)
+                            if (k as u32) <= crate::opcodes::MAXINDEXRK {
+                                (k, true, false)
+                            } else {
+                                let kr = fs.alloc_reg();
+                                fs.code_abx(OpCode::LOADK, kr, k);
+                                (kr, false, false)
+                            }
                         } else {
                             let kr = fs.alloc_reg();
                             fs.code_abx(OpCode::LOADK, kr, k);
@@ -4216,7 +4267,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
             } else {
                 let r = fs.alloc_reg();
                 let k = fs.string_k(&name);
-                fs.code_abc(OpCode::GETTABUP, r, 0, k);
+                code_gettabup(fs, r, 0, k);
                 ExpDesc::new(ExpKind::NonReloc, r as i64)
             }
         }
@@ -4430,7 +4481,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     let last_idx = fs.pc as usize - 1;
                     fs.proto.code.remove(last_idx);
                     fs.pc -= 1;
-                    fs.code_abc(OpCode::GETTABUP, base_reg, 0, k);
+                    code_gettabup(fs, base_reg, 0, k);
                     e = ExpDesc::new(ExpKind::Relocable, base_reg as i64);
                 } else {
                     let result_reg = if matches!(e.kind, ExpKind::NonReloc) && (e.info as i32) < fs.nvarstack() {
@@ -4475,7 +4526,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     fs.proto.code.truncate((saved_pc_before_expr - 1) as usize);
                     fs.pc = saved_pc_before_expr - 1;
                     let k = fs.get_str_k(&ei.exp);
-                    fs.code_abc(OpCode::GETTABUP, base_reg, 0, k);
+                    code_gettabup(fs, base_reg, 0, k);
                     e = ExpDesc::new(ExpKind::Relocable, base_reg as i64);
                 } else {
                     let result_reg;
@@ -5089,7 +5140,7 @@ fn parse_func_stat(fs: &mut FuncState) {
             fs.code_abc(OpCode::MOVE, reg, r, 0);
         } else {
             let k = fs.string_k(name);
-            fs.code_abc(OpCode::SETTABUP, 0, k, r);
+            code_settabup(fs, 0, k, r);
         }
         fs.free_reg();
         return;
@@ -5103,7 +5154,7 @@ fn parse_func_stat(fs: &mut FuncState) {
     } else {
         let r = fs.alloc_reg();
         let k = fs.string_k(first_name);
-        fs.code_abc(OpCode::GETTABUP, r, 0, k);
+        code_gettabup(fs, r, 0, k);
         r
     };
 

@@ -578,6 +578,23 @@ mod compiler_compare_tests {
         assert_inst_match_file("test_setfield_overflow.lua");
     }
 
+    #[test]
+    fn test_const_index_overflow_gettabup() {
+        // When constant pool index exceeds MAXINDEXRK (255),
+        // GETTABUP must fall back to GETUPVAL+LOADK+GETTABLE,
+        // and SETTABUP must fall back to GETUPVAL+LOADK+SETTABLE,
+        // and SETFIELD must fall back to LOADK+SETTABLE.
+        let mut source = String::new();
+        // Generate 256 short string constants to push subsequent constants past MAXINDEXRK
+        for i in 0..256 {
+            if i % 5 == 0 { source.push('\n'); }
+            source.push_str(&format!("_ = \"s{:03}\"; ", i));
+        }
+        // Now "getmetatable" and "__index" will have constant indices > 255
+        source.push_str("local b; getmetatable(b).__index = function (t, i) return t.p[i] end");
+        assert_inst_match(&source, None);
+    }
+
     fn assert_inst_match_file(name: &str) {
         assert_inst_match(get_lua_script(name).as_str(), Some(name));
     }
