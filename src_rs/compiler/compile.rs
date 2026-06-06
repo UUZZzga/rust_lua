@@ -1288,15 +1288,17 @@ fn getglobalattribute(fs: &mut FuncState, df: i32) -> i32 {
 }
 
 /// Emit GETTABUP or fallback to GETUPVAL+LOADK+GETTABLE when constant index > MAXINDEXRK
-fn code_gettabup(fs: &mut FuncState, r: i32, upval: i32, k: i32) {
+/// Returns the PC of the instruction that produces the result.
+fn code_gettabup(fs: &mut FuncState, r: i32, upval: i32, k: i32) -> i32 {
     if (k as u32) <= crate::opcodes::MAXINDEXRK {
-        fs.code_abc(OpCode::GETTABUP, r, upval, k);
+        fs.code_abc(OpCode::GETTABUP, r, upval, k)
     } else {
         fs.code_abc(OpCode::GETUPVAL, r, upval, 0);
         let kr = fs.alloc_reg();
         fs.code_abx(OpCode::LOADK, kr, k);
-        fs.code_abc(OpCode::GETTABLE, r, r, kr);
+        let pc = fs.code_abc(OpCode::GETTABLE, r, r, kr);
         fs.free_reg();
+        pc
     }
 }
 
@@ -1331,19 +1333,21 @@ fn code_settabup_k(fs: &mut FuncState, upval: i32, k: i32, val: i32, is_k: bool)
 }
 
 /// Emit GETFIELD or fallback to LOADK+GETTABLE when constant index > MAXINDEXRK
-fn code_getfield(fs: &mut FuncState, r: i32, table: i32, k: i32) {
+/// Returns the PC of the instruction that produces the result.
+fn code_getfield(fs: &mut FuncState, r: i32, table: i32, k: i32) -> i32 {
     if (k as u32) <= crate::opcodes::MAXINDEXRK {
-        fs.code_abc(OpCode::GETFIELD, r, table, k);
+        fs.code_abc(OpCode::GETFIELD, r, table, k)
     } else if r != table {
         // Optimization: use result register for LOADK (same as C++ compiler's codegetfield)
         fs.code_abx(OpCode::LOADK, r, k);
-        fs.code_abc(OpCode::GETTABLE, r, table, r);
+        fs.code_abc(OpCode::GETTABLE, r, table, r)
     } else {
         // r == table: can't use r for LOADK as it would overwrite the table value
         let kr = fs.alloc_reg();
         fs.code_abx(OpCode::LOADK, kr, k);
-        fs.code_abc(OpCode::GETTABLE, r, table, kr);
+        let pc = fs.code_abc(OpCode::GETTABLE, r, table, kr);
         fs.free_reg(); // kr
+        pc
     }
 }
 
@@ -4372,17 +4376,17 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 ExpDesc::new(ExpKind::NonReloc, reg as i64)
             } else if let Some(upval_idx) = fs.find_upvalue(&name) {
                 let r = fs.alloc_reg();
-                fs.code_abc(OpCode::GETUPVAL, r, upval_idx, 0);
-                ExpDesc::new(ExpKind::NonReloc, r as i64)
+                let pc = fs.code_abc(OpCode::GETUPVAL, r, upval_idx, 0);
+                ExpDesc { kind: ExpKind::NonReloc, info: r as i64, info2: pc, t: NO_JUMP, f: NO_JUMP, str_val: None }
             } else if name == "_ENV" {
                 let r = fs.alloc_reg();
-                fs.code_abc(OpCode::GETUPVAL, r, 0, 0);
-                ExpDesc::new(ExpKind::NonReloc, r as i64)
+                let pc = fs.code_abc(OpCode::GETUPVAL, r, 0, 0);
+                ExpDesc { kind: ExpKind::NonReloc, info: r as i64, info2: pc, t: NO_JUMP, f: NO_JUMP, str_val: None }
             } else {
                 let r = fs.alloc_reg();
                 let k = fs.string_k(&name);
-                code_gettabup(fs, r, 0, k);
-                ExpDesc::new(ExpKind::NonReloc, r as i64)
+                let pc = code_gettabup(fs, r, 0, k);
+                ExpDesc { kind: ExpKind::NonReloc, info: r as i64, info2: pc, t: NO_JUMP, f: NO_JUMP, str_val: None }
             }
         }
         Token::LParen => {
@@ -4595,8 +4599,8 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     let last_idx = fs.pc as usize - 1;
                     fs.proto.code.remove(last_idx);
                     fs.pc -= 1;
-                    code_gettabup(fs, base_reg, 0, k);
-                    e = ExpDesc::new(ExpKind::Relocable, base_reg as i64);
+                    let pc = code_gettabup(fs, base_reg, 0, k);
+                    e = ExpDesc::new_reloc_with_pc(base_reg as i64, pc);
                 } else {
                     let result_reg = if matches!(e.kind, ExpKind::NonReloc) && (e.info as i32) < fs.nvarstack() {
                         fs.alloc_reg()
@@ -4604,14 +4608,14 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                         base_reg
                     };
                     // C++ compiler: isKstr checks ttisshrstring — only short strings can use GETFIELD
-                    if let TValue::Str(crate::strings::LuaString::Short(_)) = fs.proto.constants[k as usize] {
-                        code_getfield(fs, result_reg, base_reg, k);
+                    let inst_pc = if let TValue::Str(crate::strings::LuaString::Short(_)) = fs.proto.constants[k as usize] {
+                        code_getfield(fs, result_reg, base_reg, k)
                     } else {
                         // Long string: load key into register, use GETTABLE
                         fs.code_abx(OpCode::LOADK, result_reg, k);
-                        fs.code_abc(OpCode::GETTABLE, result_reg, base_reg, result_reg);
-                    }
-                    e = ExpDesc::new(ExpKind::Relocable, result_reg as i64);
+                        fs.code_abc(OpCode::GETTABLE, result_reg, base_reg, result_reg)
+                    };
+                    e = ExpDesc { kind: ExpKind::NonReloc, info: result_reg as i64, info2: inst_pc, t: NO_JUMP, f: NO_JUMP, str_val: None };
                 }
             }
             Token::LBracket => {
@@ -4640,10 +4644,11 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     fs.proto.code.truncate((saved_pc_before_expr - 1) as usize);
                     fs.pc = saved_pc_before_expr - 1;
                     let k = fs.get_str_k(&ei.exp);
-                    code_gettabup(fs, base_reg, 0, k);
-                    e = ExpDesc::new(ExpKind::Relocable, base_reg as i64);
+                    let pc = code_gettabup(fs, base_reg, 0, k);
+                    e = ExpDesc::new_reloc_with_pc(base_reg as i64, pc);
                 } else {
                     let result_reg;
+                    let inst_pc;
                     if ei.exp.kind == ExpKind::Int
                         && ei.exp.info >= 0
                         && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
@@ -4653,7 +4658,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                         } else {
                             base_reg
                         };
-                        fs.code_abc(OpCode::GETI, result_reg, base_reg, ei.exp.info as i32);
+                        inst_pc = fs.code_abc(OpCode::GETI, result_reg, base_reg, ei.exp.info as i32);
                     } else {
                         let key_reg = if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei.exp.has_jumps() {
                             if ei.exp.info2 >= 0 {
@@ -4678,12 +4683,12 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                         } else {
                             base_reg
                         };
-                        fs.code_abc(OpCode::GETTABLE, result_reg, base_reg, key_reg);
+                        inst_pc = fs.code_abc(OpCode::GETTABLE, result_reg, base_reg, key_reg);
                         if result_reg != key_reg && key_reg == fs.freereg - 1 {
                             fs.free_reg();
                         }
                     }
-                    e = ExpDesc::new(ExpKind::NonReloc, result_reg as i64);
+                    e = ExpDesc { kind: ExpKind::NonReloc, info: result_reg as i64, info2: inst_pc, t: NO_JUMP, f: NO_JUMP, str_val: None };
                 }
             }
             _ => break,
