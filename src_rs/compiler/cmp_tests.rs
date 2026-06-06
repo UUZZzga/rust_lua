@@ -458,6 +458,7 @@ mod compiler_compare_tests {
         assert_inst_match("local a, b; assert(a[b] == 10 and a[b - 1] == 11 and a[-b] == 12 and a[-b + 1] == 13)", None);
         assert_inst_match("local a; assert(a == 3.0 and math.type(a) == 'float')", None);
         assert_inst_match("local a, x, y; assert(x == a..a and y == 5)", None);
+        assert_inst_match("local lim = 12000; local a = {}; a[#a + 1] = '' .. -(2*lim + 2)", None);
     }
 
     #[test]

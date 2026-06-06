@@ -3805,6 +3805,53 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         }
                     }
                 }
+                (ExpKind::Int, _) if is_mul => {
+                    let r2 = if matches!(e2.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !e2.exp.has_jumps() {
+                        let reg = e2.exp.info as i32;
+                        if e2.exp.info2 >= 0 {
+                            fs.set_a(e2.exp.info2, reg);
+                        }
+                        reg
+                    } else {
+                        fs.exp_to_reg(&e2.exp)
+                    };
+                    let k = fs.int_k(ec.info);
+                    if k <= 255 {
+                        let r_dest = fs.alloc_reg();
+                        let pc = fs.code_abc(OpCode::MULK, r_dest, r2, k);
+                        fs.code_abc_k(OpCode::MMBINK, r2, k, 8, true);
+                        e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r_dest as i64, pc) };
+                    } else {
+                        let r = fs.expr_to_reg(&ec);
+                        let pc = fs.code_abc(OpCode::MUL, r2, r2, r);
+                        fs.code_abc(OpCode::MMBIN, r2, r, 8);
+                        e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r2 as i64, pc) };
+                    }
+                }
+                (ExpKind::Float, _) if is_mul => {
+                    let r2 = if matches!(e2.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !e2.exp.has_jumps() {
+                        let reg = e2.exp.info as i32;
+                        if e2.exp.info2 >= 0 {
+                            fs.set_a(e2.exp.info2, reg);
+                        }
+                        reg
+                    } else {
+                        fs.exp_to_reg(&e2.exp)
+                    };
+                    let f = f64::from_bits(ec.info as u64);
+                    let k = fs.float_k(f);
+                    if k <= 255 {
+                        let r_dest = fs.alloc_reg();
+                        let pc = fs.code_abc(OpCode::MULK, r_dest, r2, k);
+                        fs.code_abc_k(OpCode::MMBINK, r2, k, 8, true);
+                        e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r_dest as i64, pc) };
+                    } else {
+                        let r = fs.expr_to_reg(&ec);
+                        let pc = fs.code_abc(OpCode::MUL, r2, r2, r);
+                        fs.code_abc(OpCode::MMBIN, r2, r, 8);
+                        e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r2 as i64, pc) };
+                    }
+                }
                 _ => {
                     let r = if ec.has_jumps() {
                         let r = fs.exp_to_reg(&ec);
