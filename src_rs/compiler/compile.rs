@@ -2203,10 +2203,11 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
         let kr = fs.alloc_reg();
         fs.code_abx(OpCode::LOADK, kr, k);
         let pc = fs.code_abc(OpCode::CALL, freg, 2, 2);
-        fs.free_reg();
+        // C++ funcargs: call removes function and arguments and leaves one result
+        fs.set_freereg(freg + 1);
         return pc;
     }
-    
+
     if check(fs, &Token::LBrace) {
         let (tr, _n) = parse_constructor(fs);
         if freg + 1 != tr {
@@ -2214,6 +2215,8 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
             fs.free_reg();
         }
         let pc = fs.code_abc(OpCode::CALL, freg, 2, 2);
+        // C++ funcargs: call removes function and arguments and leaves one result
+        fs.set_freereg(freg + 1);
         return pc;
     }
     
@@ -2242,10 +2245,8 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
             expect(fs, &Token::RParen);
             let na_adj = if na_multret { 0 } else { na + 2 };
             let pc = fs.code_abc(OpCode::CALL, freg, na_adj, 2);
-            for _ in 0..na {
-                fs.free_reg();
-            }
-            fs.free_reg();
+            // C++ funcargs: call removes function and arguments and leaves one result
+            fs.set_freereg(freg + 1);
             return pc;
         }
         return -1;
@@ -2260,9 +2261,8 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
         expect(fs, &Token::RParen);
         let nparams_adj = if nparams_multret { 0 } else { nparams + 1 };
         let pc = fs.code_abc(OpCode::CALL, freg, nparams_adj, 2);
-        for _ in 0..nparams {
-            fs.free_reg();
-        }
+        // C++ funcargs: call removes function and arguments and leaves one result
+        fs.set_freereg(freg + 1);
         return pc;
     }
     -1
@@ -2792,24 +2792,44 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
 
             // C++ luaK_infix: 在解析右操作数前，先将左操作数放入寄存器
             // 对于 EQ/NE: exp2RK (尝试转为常量，否则放入寄存器)
+            //   C++ 对 VCALL 调用 dischargevars → setoneret，直接转为 VNONRELOC，不生成 MOVE
             // 对于 LT/LE/GT/GE: 如果不是 SC 数值，luaK_exp2anyreg
+            //   C++ 同样通过 dischargevars 将 VCALL 转为 VNONRELOC
             if is_eq {
                 if !matches!(ec.kind, ExpKind::Int | ExpKind::Float | ExpKind::Str | ExpKind::Boolean | ExpKind::Nil) {
-                    let r = fs.exp_to_reg(&ec);
-                    ec.kind = ExpKind::NonReloc;
-                    ec.info = r as i64;
-                    ec.info2 = -1;
-                    ec.t = NO_JUMP;
-                    ec.f = NO_JUMP;
+                    if matches!(ec.kind, ExpKind::Call) && !ec.has_jumps() {
+                        // 类似 C++ dischargevars + setoneret 对 VCALL 的处理:
+                        // 直接转为 NonReloc，不生成 MOVE
+                        ec.kind = ExpKind::NonReloc;
+                        ec.info2 = -1;
+                        ec.t = NO_JUMP;
+                        ec.f = NO_JUMP;
+                    } else {
+                        let r = fs.exp_to_reg(&ec);
+                        ec.kind = ExpKind::NonReloc;
+                        ec.info = r as i64;
+                        ec.info2 = -1;
+                        ec.t = NO_JUMP;
+                        ec.f = NO_JUMP;
+                    }
                 }
             } else {
                 if is_sc_number(&ec).is_none() && !matches!(ec.kind, ExpKind::NonReloc) {
-                    let r = fs.exp_to_reg(&ec);
-                    ec.kind = ExpKind::NonReloc;
-                    ec.info = r as i64;
-                    ec.info2 = -1;
-                    ec.t = NO_JUMP;
-                    ec.f = NO_JUMP;
+                    if matches!(ec.kind, ExpKind::Call) && !ec.has_jumps() {
+                        // 类似 C++ dischargevars + setoneret 对 VCALL 的处理:
+                        // 直接转为 NonReloc，不生成 MOVE
+                        ec.kind = ExpKind::NonReloc;
+                        ec.info2 = -1;
+                        ec.t = NO_JUMP;
+                        ec.f = NO_JUMP;
+                    } else {
+                        let r = fs.exp_to_reg(&ec);
+                        ec.kind = ExpKind::NonReloc;
+                        ec.info = r as i64;
+                        ec.info2 = -1;
+                        ec.t = NO_JUMP;
+                        ec.f = NO_JUMP;
+                    }
                 }
             }
 
