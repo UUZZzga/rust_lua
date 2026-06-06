@@ -3292,6 +3292,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             }
             fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_CONCAT);
+            let freereg_before_r2 = fs.freereg;
             let r2 = if matches!(e2.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !e2.exp.has_jumps() {
                 let reg = e2.exp.info as i32;
                 if e2.exp.info2 >= 0 {
@@ -3304,7 +3305,11 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             if r2 != r + 1 {
                 fs.code_abc(OpCode::MOVE, r + 1, r2, 0);
             }
-            fs.free_reg();
+            if fs.freereg > freereg_before_r2 {
+                fs.free_reg();
+            } else if r2 >= fs.nvarstack() && r2 == fs.freereg - 1 {
+                fs.free_reg();
+            }
             let merged = if !fs.proto.code.is_empty() {
                 let last = fs.proto.code[fs.proto.code.len() - 1];
                 get_opcode(last) == OpCode::CONCAT && getarg_a(last) as i32 == r + 1
