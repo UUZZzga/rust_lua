@@ -76,6 +76,9 @@ pub const OFFSET_sJ: i32 = (((1i64 << SIZE_sJ) - 1) >> 1) as i32;
 pub const NO_REG: u8 = ((1u16 << SIZE_A) - 1) as u8;
 pub const MAX_FSTACK: u8 = NO_REG;
 
+pub const MAXARG_B: u32 = (1u32 << SIZE_B) - 1;
+pub const MAXINDEXRK: u32 = MAXARG_B;
+
 // ============================================================================
 // 位操作
 // ============================================================================

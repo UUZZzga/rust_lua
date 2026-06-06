@@ -5411,19 +5411,27 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                         fs.set_freereg(table_r + 1);
                     }
                     // recfield: save freereg, process, restore freereg
+                    // C++ order: process key first (luaK_indexed may emit LOADK),
+                    // then parse value (expr), then store (luaK_storevar).
                     let saved_freereg = fs.freereg;
                     fs.ls_mut().next();
                     fs.ls_mut().next();
-                    let ev = parse_expr(fs);
                     let k = fs.string_k(&name);
-                    let (v_rk, is_k) = exp2rk(fs, &ev.exp);
-                    // C++ compiler: isKstr checks ttisshrstring — only short strings use SETFIELD
-                    if name.len() <= crate::strings::LUAI_MAXSHORTLEN {
-                        fs.code_abc_k(OpCode::SETFIELD, table_r, k, v_rk, is_k);
-                    } else {
+                    // C++ compiler: isKstr checks ttisshrstring AND k->u.info <= MAXINDEXRK
+                    let key_needs_reg = name.len() > crate::strings::LUAI_MAXSHORTLEN || (k as u32) > crate::opcodes::MAXINDEXRK;
+                    let kr = if key_needs_reg {
                         let kr = fs.alloc_reg();
                         fs.code_abx(OpCode::LOADK, kr, k);
+                        kr
+                    } else {
+                        -1
+                    };
+                    let ev = parse_expr(fs);
+                    let (v_rk, is_k) = exp2rk(fs, &ev.exp);
+                    if key_needs_reg {
                         fs.code_abc_k(OpCode::SETTABLE, table_r, kr, v_rk, is_k);
+                    } else {
+                        fs.code_abc_k(OpCode::SETFIELD, table_r, k, v_rk, is_k);
                     }
                     fs.freereg = saved_freereg;  /* free registers used by recfield */
                     need_hash += 1;

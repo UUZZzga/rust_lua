@@ -573,6 +573,11 @@ mod compiler_compare_tests {
         assert_inst_match_file("test_focus.lua");
     }
 
+    #[test]
+    fn test_setfield_overflow_lua() {
+        assert_inst_match_file("test_setfield_overflow.lua");
+    }
+
     fn assert_inst_match_file(name: &str) {
         assert_inst_match(get_lua_script(name).as_str(), Some(name));
     }
