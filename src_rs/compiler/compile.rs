@@ -2284,7 +2284,7 @@ fn parse_args(fs: &mut FuncState) -> (i32, bool) {
     } else {
         fs.exp_to_reg(&ei.exp)
     };
-    if matches!(ei.exp.kind, ExpKind::NonReloc) && (ei.exp.info as i32) < fs.nvarstack() {
+    if matches!(ei.exp.kind, ExpKind::NonReloc) && (ei.exp.info as i32) < fs.nvarstack() && !ei.exp.has_jumps() {
         let target = fs.alloc_reg();
         if ei.exp.info as i32 != target {
             fs.code_abc(OpCode::MOVE, target, ei.exp.info as i32, 0);
@@ -2304,7 +2304,7 @@ fn parse_args(fs: &mut FuncState) -> (i32, bool) {
         } else {
             fs.exp_to_reg(&ei2.exp)
         };
-        if matches!(ei2.exp.kind, ExpKind::NonReloc) && (ei2.exp.info as i32) < fs.nvarstack() {
+        if matches!(ei2.exp.kind, ExpKind::NonReloc) && (ei2.exp.info as i32) < fs.nvarstack() && !ei2.exp.has_jumps() {
             let target = fs.alloc_reg();
             if ei2.exp.info as i32 != target {
                 fs.code_abc(OpCode::MOVE, target, ei2.exp.info as i32, 0);
