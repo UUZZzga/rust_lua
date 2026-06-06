@@ -3539,8 +3539,16 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             }
                         }
                     } else if is_div {
-                        let val = ec.info as f64 / e2.exp.info as f64;
-                        e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                        if e2.exp.info != 0 {
+                            let val = ec.info as f64 / e2.exp.info as f64;
+                            e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                        } else {
+                            let r = fs.expr_to_reg(&ec);
+                            let k = fs.int_k(e2.exp.info);
+                            let pc = fs.code_abc(OpCode::DIVK, r, r, k);
+                            fs.code_abc(OpCode::MMBINK, r, k, 11);
+                            e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r as i64, pc) };
+                        }
                     } else if is_mul {
                         let val = ec.info * e2.exp.info;
                         e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
@@ -3572,8 +3580,16 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         let val = f * (e2.exp.info as f64);
                         e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
                     } else if is_div {
-                        let val = f / (e2.exp.info as f64);
-                        e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                        if e2.exp.info != 0 {
+                            let val = f / (e2.exp.info as f64);
+                            e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                        } else {
+                            let r = fs.expr_to_reg(&ec);
+                            let k = fs.int_k(e2.exp.info);
+                            let pc = fs.code_abc(OpCode::DIVK, r, r, k);
+                            fs.code_abc(OpCode::MMBINK, r, k, 11);
+                            e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r as i64, pc) };
+                        }
                     } else if is_idiv {
                         let denom = e2.exp.info as f64;
                         if denom != 0.0 {
@@ -3635,8 +3651,23 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         let val = (ec.info as f64) * f;
                         e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
                     } else if is_div {
-                        let val = (ec.info as f64) / f;
-                        e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                        if f != 0.0 {
+                            let val = (ec.info as f64) / f;
+                            e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                        } else {
+                            let r = fs.expr_to_reg(&ec);
+                            let k = fs.float_k(f);
+                            if k <= 255 {
+                                let pc = fs.code_abc(OpCode::DIVK, r, r, k);
+                                fs.code_abc(OpCode::MMBINK, r, k, 11);
+                                e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r as i64, pc) };
+                            } else {
+                                let r2 = fs.expr_to_reg(&e2.exp);
+                                let pc = fs.code_abc(OpCode::DIV, r, r, r2);
+                                fs.code_abc(OpCode::MMBIN, r, r2, 11);
+                                e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r as i64, pc) };
+                            }
+                        }
                     } else if is_idiv {
                         if f != 0.0 {
                             let n = ec.info as f64;
@@ -3699,8 +3730,23 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         let val = f1 * f2;
                         e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
                     } else if is_div {
-                        let val = f1 / f2;
-                        e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                        if f2 != 0.0 {
+                            let val = f1 / f2;
+                            e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
+                        } else {
+                            let r = fs.expr_to_reg(&ec);
+                            let k = fs.float_k(f2);
+                            if k <= 255 {
+                                let pc = fs.code_abc(OpCode::DIVK, r, r, k);
+                                fs.code_abc(OpCode::MMBINK, r, k, 11);
+                                e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r as i64, pc) };
+                            } else {
+                                let r2 = fs.expr_to_reg(&e2.exp);
+                                let pc = fs.code_abc(OpCode::DIV, r, r, r2);
+                                fs.code_abc(OpCode::MMBIN, r, r2, 11);
+                                e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r as i64, pc) };
+                            }
+                        }
                     } else if is_idiv {
                         if f2 != 0.0 {
                             let val = (f1 / f2).floor();

@@ -413,6 +413,7 @@ mod compiler_compare_tests {
         assert_inst_match("local a,i,j,b; local function foo() i, a[i], a, j, a[j], a[i+j] = j, i, i, b, j, i end", None);
         assert_inst_match("local t = {}; (function (a) t[a], a = 10, 20  end)(1)", None);
         assert_inst_match("local t = {} (function (a) t[a], a = 10, 20  end)(1)", None);
+        assert_inst_match("local T local a = {T.f[[]]} assert(T.f('', 2, 0) == 10.0/0) a = T.f('')", None);
     }
 
     #[test]
