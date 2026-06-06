@@ -2074,8 +2074,14 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
 fn load_func(fs: &mut FuncState, p: &PrefixResult, is_method: bool) -> (i32, bool, bool, Option<i32>) {
     if let (Some(table_reg), Some(table_key)) = (p.table_reg, p.table_key) {
         if p.table_key_is_const {
-            fs.code_abc(OpCode::GETFIELD, table_reg, table_reg, table_key);
-            (table_reg, false, false, None)
+            // Free table register if it was allocated as a temporary
+            if p.allocated_reg {
+                fs.free_reg();
+            }
+            // Allocate result register (reuses the just-freed register if applicable)
+            let r = fs.alloc_reg();
+            fs.code_abc(OpCode::GETFIELD, r, table_reg, table_key);
+            (r, true, true, None)
         } else {
             // Free key register if it was allocated as a temporary (it's at freereg-1)
             if p.key_allocated_reg {
