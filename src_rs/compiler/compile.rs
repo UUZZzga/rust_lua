@@ -1330,6 +1330,47 @@ fn code_settabup_k(fs: &mut FuncState, upval: i32, k: i32, val: i32, is_k: bool)
     }
 }
 
+/// Emit GETFIELD or fallback to LOADK+GETTABLE when constant index > MAXINDEXRK
+fn code_getfield(fs: &mut FuncState, r: i32, table: i32, k: i32) {
+    if (k as u32) <= crate::opcodes::MAXINDEXRK {
+        fs.code_abc(OpCode::GETFIELD, r, table, k);
+    } else if r != table {
+        // Optimization: use result register for LOADK (same as C++ compiler's codegetfield)
+        fs.code_abx(OpCode::LOADK, r, k);
+        fs.code_abc(OpCode::GETTABLE, r, table, r);
+    } else {
+        // r == table: can't use r for LOADK as it would overwrite the table value
+        let kr = fs.alloc_reg();
+        fs.code_abx(OpCode::LOADK, kr, k);
+        fs.code_abc(OpCode::GETTABLE, r, table, kr);
+        fs.free_reg(); // kr
+    }
+}
+
+/// Emit SETFIELD or fallback to LOADK+SETTABLE when constant index > MAXINDEXRK
+fn code_setfield(fs: &mut FuncState, table: i32, k: i32, val: i32) {
+    if (k as u32) <= crate::opcodes::MAXINDEXRK {
+        fs.code_abc_k(OpCode::SETFIELD, table, k, val, false);
+    } else {
+        let kr = fs.alloc_reg();
+        fs.code_abx(OpCode::LOADK, kr, k);
+        fs.code_abc_k(OpCode::SETTABLE, table, kr, val, false);
+        fs.free_reg(); // kr
+    }
+}
+
+/// Emit SETFIELD with k-bit or fallback to LOADK+SETTABLE when constant index > MAXINDEXRK
+fn code_setfield_k(fs: &mut FuncState, table: i32, k: i32, val: i32, is_k: bool) {
+    if (k as u32) <= crate::opcodes::MAXINDEXRK {
+        fs.code_abc_k(OpCode::SETFIELD, table, k, val, is_k);
+    } else {
+        let kr = fs.alloc_reg();
+        fs.code_abx(OpCode::LOADK, kr, k);
+        fs.code_abc_k(OpCode::SETTABLE, table, kr, val, is_k);
+        fs.free_reg(); // kr
+    }
+}
+
 /// 检查全局变量是否存在: GETTABUP + ERRNNIL
 fn checkglobal(fs: &mut FuncState, varname: &str, _line: i32) {
     let r = fs.alloc_reg();
@@ -1802,20 +1843,49 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                             fs.free_reg();
                         }
                     } else {
-                        let set_op = if v.table_key_is_int { OpCode::SETI } else if v.table_key_is_const { OpCode::SETFIELD } else { OpCode::SETTABLE };
                         let use_last_reg = i == exps.len() - 1 && last_exp_reg.is_some();
                         let k_opt = if use_last_reg { None } else { exp_to_k(fs, val) };
-                        if let Some(k_val) = k_opt {
-                            fs.code_abc_k(set_op, table_reg, table_key, k_val, true);
-                        } else {
-                            let val_reg = if use_last_reg {
-                                last_exp_reg.unwrap()
+                        if v.table_key_is_int {
+                            if let Some(k_val) = k_opt {
+                                fs.code_abc_k(OpCode::SETI, table_reg, table_key, k_val, true);
                             } else {
-                                fs.exp_to_reg(val)
-                            };
-                            fs.code_abc_k(set_op, table_reg, table_key, val_reg, false);
-                            if val_reg >= fs.nvarstack() {
-                                fs.free_reg();
+                                let val_reg = if use_last_reg {
+                                    last_exp_reg.unwrap()
+                                } else {
+                                    fs.exp_to_reg(val)
+                                };
+                                fs.code_abc_k(OpCode::SETI, table_reg, table_key, val_reg, false);
+                                if val_reg >= fs.nvarstack() {
+                                    fs.free_reg();
+                                }
+                            }
+                        } else if v.table_key_is_const {
+                            if let Some(k_val) = k_opt {
+                                code_setfield_k(fs, table_reg, table_key, k_val, true);
+                            } else {
+                                let val_reg = if use_last_reg {
+                                    last_exp_reg.unwrap()
+                                } else {
+                                    fs.exp_to_reg(val)
+                                };
+                                code_setfield(fs, table_reg, table_key, val_reg);
+                                if val_reg >= fs.nvarstack() {
+                                    fs.free_reg();
+                                }
+                            }
+                        } else {
+                            if let Some(k_val) = k_opt {
+                                fs.code_abc_k(OpCode::SETTABLE, table_reg, table_key, k_val, true);
+                            } else {
+                                let val_reg = if use_last_reg {
+                                    last_exp_reg.unwrap()
+                                } else {
+                                    fs.exp_to_reg(val)
+                                };
+                                fs.code_abc_k(OpCode::SETTABLE, table_reg, table_key, val_reg, false);
+                                if val_reg >= fs.nvarstack() {
+                                    fs.free_reg();
+                                }
                             }
                         }
                         if v.key_allocated_reg && table_key == fs.freereg - 1 {
@@ -1885,7 +1955,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     if can_settabup {
                         code_settabup(fs, 0, table_key, result_reg);
                     } else if v.table_key_is_const {
-                        fs.code_abc_k(OpCode::SETFIELD, table_reg, table_key, result_reg, false);
+                        code_setfield(fs, table_reg, table_key, result_reg);
                     } else {
                         fs.code_abc_k(OpCode::SETTABLE, table_reg, table_key, result_reg, false);
                     }
@@ -2080,7 +2150,7 @@ fn load_func(fs: &mut FuncState, p: &PrefixResult, is_method: bool) -> (i32, boo
             }
             // Allocate result register (reuses the just-freed register if applicable)
             let r = fs.alloc_reg();
-            fs.code_abc(OpCode::GETFIELD, r, table_reg, table_key);
+            code_getfield(fs, r, table_reg, table_key);
             (r, true, true, None)
         } else {
             // Free key register if it was allocated as a temporary (it's at freereg-1)
@@ -2344,7 +2414,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                                     fs.free_reg();
                                 }
                                 let r = fs.alloc_reg();
-                                fs.code_abc(OpCode::GETFIELD, r, prev_table, prev_key);
+                                code_getfield(fs, r, prev_table, prev_key);
                                 result.reg = Some(r);
                                 result.allocated_reg = true;
                             } else {
@@ -2412,7 +2482,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                                 fs.free_reg();
                             }
                             let r = fs.alloc_reg();
-                            fs.code_abc(OpCode::GETFIELD, r, prev_table, prev_key);
+                            code_getfield(fs, r, prev_table, prev_key);
                             result.reg = Some(r);
                             result.allocated_reg = true;
                         } else {
@@ -4515,7 +4585,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     };
                     // C++ compiler: isKstr checks ttisshrstring — only short strings can use GETFIELD
                     if let TValue::Str(crate::strings::LuaString::Short(_)) = fs.proto.constants[k as usize] {
-                        fs.code_abc(OpCode::GETFIELD, result_reg, base_reg, k);
+                        code_getfield(fs, result_reg, base_reg, k);
                     } else {
                         // Long string: load key into register, use GETTABLE
                         fs.code_abx(OpCode::LOADK, result_reg, k);
@@ -5454,7 +5524,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                 if let Some(k) = key_k {
                     // C++ compiler: isKstr checks ttisshrstring — only short strings use SETFIELD
                     if let TValue::Str(crate::strings::LuaString::Short(_)) = fs.proto.constants[k as usize] {
-                        fs.code_abc_k(OpCode::SETFIELD, table_r, k, v_rk, is_k);
+                        code_setfield_k(fs, table_r, k, v_rk, is_k);
                     } else {
                         // Long string: load key into register, use SETTABLE
                         let kr = fs.alloc_reg();

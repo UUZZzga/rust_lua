@@ -597,6 +597,48 @@ mod compiler_compare_tests {
         assert_inst_match(&source, None);
     }
 
+    #[test]
+    fn test_const_index_overflow_getfield() {
+        // When constant pool index exceeds MAXINDEXRK (255),
+        // GETFIELD must fall back to LOADK+GETTABLE,
+        // and SETFIELD must fall back to LOADK+SETTABLE.
+        let mut source = String::new();
+        // Generate 256 short string constants to push subsequent constants past MAXINDEXRK
+        for i in 0..256 {
+            if i % 5 == 0 { source.push('\n'); }
+            source.push_str(&format!("_ = \"s{:03}\"; ", i));
+        }
+        // Now "testKey" will have a constant index > 255, so GETFIELD must fall back
+        source.push_str("local t; local x = t.testKey; t.testKey = 42");
+        assert_inst_match(&source, None);
+    }
+
+    #[test]
+    fn test_const_index_overflow_getfield_chain() {
+        // Test GETFIELD overflow in chained field access (a.b.c where b's index > MAXINDEXRK)
+        let mut source = String::new();
+        for i in 0..256 {
+            if i % 5 == 0 { source.push('\n'); }
+            source.push_str(&format!("_ = \"s{:03}\"; ", i));
+        }
+        // "fieldA" and "fieldB" will have constant indices > 255
+        source.push_str("local a; local x = a.fieldA.fieldB");
+        assert_inst_match(&source, None);
+    }
+
+    #[test]
+    fn test_const_index_overflow_getfield_call() {
+        // Test GETFIELD overflow in function call context (a.method() where method's index > MAXINDEXRK)
+        let mut source = String::new();
+        for i in 0..256 {
+            if i % 5 == 0 { source.push('\n'); }
+            source.push_str(&format!("_ = \"s{:03}\"; ", i));
+        }
+        // "myMethod" will have a constant index > 255
+        source.push_str("local a; a.myMethod()");
+        assert_inst_match(&source, None);
+    }
+
     fn assert_inst_match_file(name: &str) {
         assert_inst_match(get_lua_script(name).as_str(), Some(name));
     }
