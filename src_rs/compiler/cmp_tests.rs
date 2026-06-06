@@ -368,6 +368,7 @@ mod compiler_compare_tests {
         assert_inst_match("local a = nil; for i = i, 1, -1 do a = a + 1 end", None);
         assert_inst_match("for i = 1, n do for i = i, 1, -1 do end end", None);
         assert_inst_match("if not a then b = 0 end; local c = {}; for i=3000,-3000,-1 do c[i + 0.0] = i; end", None);
+        assert_inst_match("local a, lim; for i = 1,lim do a[#a + 1] = '' .. -(2*(lim - i + 1) + 1) end", None);
     }
 
     #[test]

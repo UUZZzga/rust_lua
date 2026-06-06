@@ -3817,10 +3817,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     };
                     let k = fs.int_k(ec.info);
                     if k <= 255 {
-                        let r_dest = fs.alloc_reg();
-                        let pc = fs.code_abc(OpCode::MULK, r_dest, r2, k);
+                        let pc = fs.code_abc(OpCode::MULK, r2, r2, k);
                         fs.code_abc_k(OpCode::MMBINK, r2, k, 8, true);
-                        e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r_dest as i64, pc) };
+                        e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r2 as i64, pc) };
                     } else {
                         let r = fs.expr_to_reg(&ec);
                         let pc = fs.code_abc(OpCode::MUL, r2, r2, r);
@@ -3841,10 +3840,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     let f = f64::from_bits(ec.info as u64);
                     let k = fs.float_k(f);
                     if k <= 255 {
-                        let r_dest = fs.alloc_reg();
-                        let pc = fs.code_abc(OpCode::MULK, r_dest, r2, k);
+                        let pc = fs.code_abc(OpCode::MULK, r2, r2, k);
                         fs.code_abc_k(OpCode::MMBINK, r2, k, 8, true);
-                        e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r_dest as i64, pc) };
+                        e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r2 as i64, pc) };
                     } else {
                         let r = fs.expr_to_reg(&ec);
                         let pc = fs.code_abc(OpCode::MUL, r2, r2, r);
