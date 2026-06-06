@@ -2867,8 +2867,8 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         }
                         reg
                     };
-                    if matches!(e2.exp.kind, ExpKind::Int) && fits_sc(&e2.exp) {
-                            let sc = int_to_sc(e2.exp.info);
+                    if let Some(sc_val) = is_sc_number(&e2.exp) {
+                            let sc = int_to_sc(sc_val);
                             fs.code_abc_k(OpCode::EQI, r, sc, 0, is_eq_op);
                             let jmp_pc = fs.jump();
                             if r_alloc || (matches!(ec.kind, ExpKind::NonReloc | ExpKind::Call | ExpKind::Vararg) && r >= fs.nvarstack()) { fs.free_reg(); }
@@ -4055,6 +4055,10 @@ fn exp_to_const_k(fs: &mut FuncState, e: &ExpDesc) -> Option<i32> {
         ExpKind::Nil => fs.const_k(TValue::Nil(NilKind::Strict)),
         ExpKind::Float => {
             let f = f64::from_bits(e.info as u64);
+            let i = f as i64;
+            if (i as f64 - f).abs() < f64::EPSILON && (i as i8 as i64) == i {
+                return None;
+            }
             fs.float_k(f)
         }
         ExpKind::Int => {

@@ -455,6 +455,7 @@ mod compiler_compare_tests {
         assert_inst_match("local a; assert(not not a == true)", None);
         assert_inst_match("assert(not 'x' == false)", None);
         assert_inst_match("local a, b; assert(a[b] == 10 and a[b - 1] == 11 and a[-b] == 12 and a[-b + 1] == 13)", None);
+        assert_inst_match("local a; assert(a == 3.0 and math.type(a) == 'float')", None);
     }
 
     #[test]
