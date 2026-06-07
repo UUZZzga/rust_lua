@@ -858,7 +858,7 @@ impl FuncState {
             ExpKind::Int => {
                 let r = self.alloc_reg();
                 let val = e.info;
-                if val <= i16::MAX as i64 && val >= i16::MIN as i64 {
+                if fits_sbx(val) {
                     self.code_asbx(OpCode::LOADI, r, val as i32);
                 } else {
                     let k = self.int_k(val);
@@ -2111,7 +2111,7 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
         ExpKind::Int => {
             if e.t != NO_JUMP || e.f != NO_JUMP {
                 let v = e.info;
-                if v <= i16::MAX as i64 && v >= i16::MIN as i64 {
+                if fits_sbx(v) {
                     fs.code_asbx(OpCode::LOADI, dest, v as i32);
                 } else {
                     let k = fs.int_k(v);
@@ -2121,7 +2121,7 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
                 return;
             }
             let v = e.info;
-            if v <= i16::MAX as i64 && v >= i16::MIN as i64 {
+            if fits_sbx(v) {
                 fs.code_asbx(OpCode::LOADI, dest, v as i32);
             } else {
                 let k = fs.int_k(v);
@@ -2354,7 +2354,12 @@ fn parse_args(fs: &mut FuncState) -> (i32, bool) {
     let ei = parse_expr(fs);
     let mut last_is_call = ei.exp.kind == ExpKind::Call;
     let mut last_call_pc = if last_is_call { ei.exp.info2 } else { -1 };
-    let _r = if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei.exp.has_jumps() {
+    let _r = if matches!(ei.exp.kind, ExpKind::Relocable) && ei.exp.info2 >= 0 && !ei.exp.has_jumps() {
+        // For Relocable expressions with a pending instruction (info2 >= 0),
+        // allocate a new register and patch the instruction's A field.
+        // This matches C's luaK_exp2nextreg behavior for VRELOC expressions.
+        fs.exp_to_reg(&ei.exp)
+    } else if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei.exp.has_jumps() {
         if ei.exp.info2 >= 0 {
             fs.set_a(ei.exp.info2, ei.exp.info as i32);
         }
@@ -2374,7 +2379,9 @@ fn parse_args(fs: &mut FuncState) -> (i32, bool) {
         let ei2 = parse_expr(fs);
         last_is_call = ei2.exp.kind == ExpKind::Call;
         last_call_pc = if last_is_call { ei2.exp.info2 } else { -1 };
-        let _r2 = if matches!(ei2.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei2.exp.has_jumps() {
+        let _r2 = if matches!(ei2.exp.kind, ExpKind::Relocable) && ei2.exp.info2 >= 0 && !ei2.exp.has_jumps() {
+            fs.exp_to_reg(&ei2.exp)
+        } else if matches!(ei2.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei2.exp.has_jumps() {
             if ei2.exp.info2 >= 0 {
                 fs.set_a(ei2.exp.info2, ei2.exp.info as i32);
             }
@@ -2426,7 +2433,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                 match ctc.kind {
                     ExpKind::Int => {
                         let val = ctc.info;
-                        if val <= i16::MAX as i64 && val >= i16::MIN as i64 {
+                        if fits_sbx(val) {
                             fs.code_asbx(OpCode::LOADI, r, val as i32);
                         } else {
                             let k = fs.int_k(val);
@@ -3433,11 +3440,11 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         } else {
                             fs.expr_to_reg(&e2.exp)
                         };
-                        let dest = fs.alloc_reg();
                         let sc = int_to_sc(ec.info);
-                        fs.code_abc(OpCode::SHLI, dest, r2, sc);
-                        fs.code_abc(OpCode::MMBINI, r2, sc, 16);
-                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
+                        let pc = fs.code_abc(OpCode::SHLI, r2, r2, sc);
+                        fs.code_abc_k(OpCode::MMBINI, r2, sc, 16, true);
+                        fs.free_exp_reg(&e2.exp);
+                        e = ExprItem { exp: ExpDesc::new_reloc_with_pc(r2 as i64, pc) };
                     } else if matches!(e2.exp.kind, ExpKind::Int) && fits_sc(&e2.exp) && fits_sc_neg(e2.exp.info) {
                         let r = if ec.has_jumps() {
                             let r = fs.exp_to_reg(&ec);
@@ -3453,12 +3460,12 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             fs.expr_to_reg(&ec)
                         };
                         let v = e2.exp.info;
-                        let dest = fs.alloc_reg();
                         let sc_neg = int_to_sc(-v);
                         let sc_pos = int_to_sc(v);
-                        fs.code_abc(OpCode::SHRI, dest, r, sc_neg);
-                        fs.code_abc(OpCode::MMBINI, r, sc_pos, 16);
-                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
+                        let pc = fs.code_abc(OpCode::SHRI, r, r, sc_neg);
+                        fs.code_abc_k(OpCode::MMBINI, r, sc_pos, 16, false);
+                        fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
+                        e = ExprItem { exp: ec.into_reloc_with_pc(r as i64, pc) };
                     } else {
                         let r = if ec.has_jumps() {
                             let r = fs.exp_to_reg(&ec);
@@ -4595,6 +4602,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     if ei.exp.has_jumps() {
                         let r = fs.exp_to_reg(&ei.exp);
                         let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
+                        fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
                         ExpDesc::new_reloc_with_pc(r as i64, pc)
                     } else {
                         match ei.exp.kind {
@@ -4607,6 +4615,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                                 if result.is_nan() || result == 0.0 {
                                     let r = fs.expr_to_reg(&ei.exp);
                                     let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
+                                    fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
                                     ExpDesc::new_reloc_with_pc(r as i64, pc)
                                 } else {
                                     ExpDesc::new(ExpKind::Float, result.to_bits() as i64)
@@ -4615,6 +4624,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                             _ => {
                                 let r = fs.expr_to_reg(&ei.exp);
                                 let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
+                                fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
                                 ExpDesc::new_reloc_with_pc(r as i64, pc)
                             }
                         }

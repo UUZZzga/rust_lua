@@ -813,4 +813,24 @@ mod compiler_compare_tests {
         assert_compile_ok("return 1, 2, 3", None);
         assert_compile_ok("local function f() return 1, 2 end; local a, b = f()", None);
     }
+
+    #[test]
+    fn test_unm_as_func_arg() {
+        // UNM expression as a function argument must allocate a new register
+        // for the result, not reuse the operand register. This matches C's
+        // luaK_exp2nextreg behavior for VRELOC expressions.
+        // Before fix: Rust generated UNM r r (overwriting operand),
+        // C generated UNM new_r r (preserving operand).
+        assert_inst_match("local a,b,c; a(b,c,-a,c)", None);
+        assert_inst_match("local x; print(-x, x)", None);
+        assert_inst_match("local a,b,c,d; a(b,c,-d,d)", None);
+    }
+
+    #[test]
+    fn test_relocable_as_func_arg() {
+        // Other Relocable expressions (NEWTABLE, CLOSURE) as function
+        // arguments should also use exp_to_reg for proper register allocation.
+        assert_inst_match("local f; f({}, 1)", None);
+        assert_inst_match("local f; f(function() end)", None);
+    }
 }
