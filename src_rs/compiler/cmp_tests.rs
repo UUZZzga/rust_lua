@@ -642,6 +642,53 @@ mod compiler_compare_tests {
         assert_inst_match(&source, None);
     }
 
+    #[test]
+    fn test_const_index_overflow_settabup_assign() {
+        // When a global variable's key constant index exceeds MAXINDEXRK (255),
+        // the assignment must emit GETUPVAL+LOADK before evaluating the right side,
+        // matching C compiler's evaluation order (left side first).
+        // e.g., "L1 = T.newstate()" where "L1" has constant index > 255
+        let mut source = String::new();
+        for i in 0..256 {
+            if i % 5 == 0 { source.push('\n'); }
+            source.push_str(&format!("_ = \"s{:03}\"; ", i));
+        }
+        // "T" and "newstate" will have constant indices > 255
+        // The assignment target "L1" also has constant index > 255
+        source.push_str("L1 = T.newstate()");
+        assert_inst_match(&source, None);
+    }
+
+    #[test]
+    fn test_const_index_overflow_setfield_dot() {
+        // When _ENV.xxx = value and xxx's constant index exceeds MAXINDEXRK,
+        // the Dot branch must emit GETUPVAL before evaluating the value,
+        // matching C compiler's evaluation order.
+        let mut source = String::new();
+        for i in 0..256 {
+            if i % 5 == 0 { source.push('\n'); }
+            source.push_str(&format!("_ = \"s{:03}\"; ", i));
+        }
+        // "longFieldName" will have a constant index > 255
+        source.push_str("_ENV.longFieldName = true");
+        assert_inst_match(&source, None);
+    }
+
+    #[test]
+    fn test_const_index_overflow_settabup_bracket() {
+        // When _ENV[xxx] = value and xxx's constant index exceeds MAXINDEXRK,
+        // the LBracket branch must emit GETUPVAL before evaluating the value,
+        // matching C compiler's evaluation order.
+        let mut source = String::new();
+        for i in 0..256 {
+            if i % 5 == 0 { source.push('\n'); }
+            source.push_str(&format!("_ = \"s{:03}\"; ", i));
+        }
+        // "longKeyName" will have a constant index > 255
+        source.push_str("_ENV['longKeyName'] = true");
+        assert_inst_match(&source, None);
+    }
+
     fn assert_inst_match_file(name: &str) {
         assert_inst_match(get_lua_script(name).as_str(), Some(name));
     }

@@ -1645,10 +1645,18 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 fs.ls_mut().next();
                 let field = get_name(fs);
                 let k = fs.string_k(&field);
+                let is_short_str = field.len() <= crate::strings::LUAI_MAXSHORTLEN && (k as u32) <= crate::opcodes::MAXINDEXRK;
                 let (base_reg, gettabup_pc) = if let Some(r) = first.reg {
                     (r, -1)
                 } else if first.is_env_upvalue {
-                    (0, -1)
+                    if !is_short_str {
+                        // Key exceeds MAXINDEXRK: must load _ENV into a register
+                        let r = fs.alloc_reg();
+                        fs.code_abc(OpCode::GETUPVAL, r, 0, 0);
+                        (r, -1)
+                    } else {
+                        (0, -1)
+                    }
                 } else {
                     let r = fs.alloc_reg();
                     let pc = if let Some(key) = first.key {
@@ -1659,7 +1667,6 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     };
                     (r, pc)
                 };
-                let is_short_str = field.len() <= crate::strings::LUAI_MAXSHORTLEN && (k as u32) <= crate::opcodes::MAXINDEXRK;
                 let (table_key, table_key_is_const, key_allocated_reg) = if is_short_str {
                     (k, true, false)
                 } else {
@@ -1667,23 +1674,35 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     fs.code_abx(OpCode::LOADK, kr, k);
                     (kr, false, true)
                 };
+                let new_is_env_upvalue = first.is_env_upvalue && is_short_str;
                 first = PrefixResult {
                     var_name: None, local_idx: None, key: None, reg: Some(base_reg),
                     table_reg: Some(base_reg), table_key: Some(table_key), table_key_is_const: table_key_is_const, table_key_is_int: false,
                     key_allocated_reg: key_allocated_reg,
-                    allocated_reg: if first.is_env_upvalue { false } else { first.allocated_reg || first.reg.is_none() },
-                    is_env_upvalue: first.is_env_upvalue,
+                    allocated_reg: if new_is_env_upvalue { false } else { first.allocated_reg || first.reg.is_none() || (first.is_env_upvalue && !is_short_str) },
+                    is_env_upvalue: new_is_env_upvalue,
                     upval_idx: first.upval_idx,
-                    env_gettabup_pc: if first.is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { first.env_gettabup_pc } },
+                    env_gettabup_pc: if new_is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { first.env_gettabup_pc } },
                     has_call: false, call_pc: -1,
                 };
             }
             Token::LBracket => {
                 fs.ls_mut().next();
+                // For _ENV upvalue: we need to decide whether to load _ENV into a register
+                // before parsing the key expression. C compiler calls luaK_exp2anyregup
+                // before yindex, then luaK_indexed may call luaK_exp2anyreg for _ENV
+                // if the key is not a Kstr. To match C's instruction order (GETUPVAL
+                // before LOADK), we emit GETUPVAL now and remove it later if not needed.
+                let mut env_getupval_pc: i32 = -1;
+                let mut env_getupval_reg: i32 = -1;
                 let (base_reg, gettabup_pc) = if let Some(r) = first.reg {
                     (r, -1)
                 } else if first.is_env_upvalue {
-                    (0, -1)
+                    // Emit GETUPVAL now to match C's instruction order
+                    let r = fs.alloc_reg();
+                    env_getupval_pc = fs.code_abc(OpCode::GETUPVAL, r, 0, 0);
+                    env_getupval_reg = r;
+                    (r, -1)  // tentative; may be reverted
                 } else {
                     let r = fs.alloc_reg();
                     let pc = if let Some(key) = first.key {
@@ -1699,11 +1718,16 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 expect(fs, &Token::RBracket);
                 let (kr, key_is_const, key_is_int) = if ei.exp.kind == ExpKind::Str {
                     let k = fs.get_str_k(&ei.exp);
-                    // C++ compiler: isKstr checks ttisshrstring — only short strings can use SETFIELD/GETFIELD
+                    // C++ compiler: isKstr checks ttisshrstring AND k <= MAXINDEXRK
                     if let TValue::Str(crate::strings::LuaString::Short(_)) = fs.proto.constants[k as usize] {
-                        (k, true, false)
+                        if (k as u32) <= crate::opcodes::MAXINDEXRK {
+                            (k, true, false)
+                        } else {
+                            let kr = fs.alloc_reg();
+                            fs.code_abx(OpCode::LOADK, kr, k);
+                            (kr, false, false)
+                        }
                     } else {
-                        // Long string: load into register, use SETTABLE/GETTABLE
                         let kr = fs.alloc_reg();
                         fs.code_abx(OpCode::LOADK, kr, k);
                         (kr, false, false)
@@ -1713,18 +1737,37 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
                 {
                     (ei.exp.info as i32, true, true)
+                } else if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei.exp.has_jumps() && ei.exp.info2 < 0 {
+                    (ei.exp.info as i32, false, false)
                 } else {
                     (fs.expr_to_reg(&ei.exp), false, false)
                 };
                 let key_allocated = !key_is_const && fs.freereg > saved_freereg_before;
+                // Now decide: if _ENV was loaded but SETTABUP can be used, revert the GETUPVAL
+                let (base_reg, new_is_env_upvalue, allocated_reg) = if env_getupval_pc >= 0 {
+                    let can_use_settabup = key_is_const && !key_is_int
+                        && (kr as u32) <= crate::opcodes::MAXINDEXRK;
+                    if can_use_settabup {
+                        // Revert: remove GETUPVAL, free the register
+                        fs.proto.code.remove(env_getupval_pc as usize);
+                        fs.pc -= 1;
+                        fs.free_reg();
+                        (0, true, false)  // SETTABUP will be used, base_reg=0 is sentinel
+                    } else {
+                        // Keep GETUPVAL; _ENV is now in a register
+                        (env_getupval_reg, false, true)
+                    }
+                } else {
+                    (base_reg, first.is_env_upvalue, first.allocated_reg || first.reg.is_none())
+                };
                 first = PrefixResult {
                     var_name: None, local_idx: None, key: None, reg: Some(base_reg),
                     table_reg: Some(base_reg), table_key: Some(kr), table_key_is_const: key_is_const, table_key_is_int: key_is_int,
                     key_allocated_reg: key_allocated,
-                    allocated_reg: if first.is_env_upvalue { false } else { first.allocated_reg || first.reg.is_none() },
-                    is_env_upvalue: first.is_env_upvalue,
+                    allocated_reg: allocated_reg,
+                    is_env_upvalue: new_is_env_upvalue,
                     upval_idx: first.upval_idx,
-                    env_gettabup_pc: if first.is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { first.env_gettabup_pc } },
+                    env_gettabup_pc: if new_is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { first.env_gettabup_pc } },
                     has_call: false, call_pc: -1,
                 };
             }
@@ -1754,6 +1797,37 @@ fn parse_assign_or_call(fs: &mut FuncState) {
             vars.push(new_var);
         }
         expect(fs, &Token::Eq);
+        
+        // C compiler evaluates the left side before the right side.
+        // For var_name with key > MAXINDEXRK, SETTABUP can't be used, so we must
+        // emit GETUPVAL+LOADK now (before evaluating the right side), matching C's
+        // luaK_indexed which calls luaK_exp2anyreg for non-Kstr keys on upvalues.
+        // Skip _ENV itself (it uses SETUPVAL, not SETTABUP).
+        for v in &mut vars {
+            if let Some(ref name) = v.var_name {
+                if v.key.is_some() && !v.is_env_upvalue {
+                    let k_name = fs.string_k(name);
+                    if (k_name as u32) > crate::opcodes::MAXINDEXRK {
+                        let r = fs.alloc_reg();
+                        fs.code_abc(OpCode::GETUPVAL, r, 0, 0);
+                        let kr = fs.alloc_reg();
+                        fs.code_abx(OpCode::LOADK, kr, k_name);
+                        v.var_name = None;
+                        v.key = None;
+                        v.reg = Some(r);
+                        v.table_reg = Some(r);
+                        v.table_key = Some(kr);
+                        v.table_key_is_const = false;
+                        v.table_key_is_int = false;
+                        v.key_allocated_reg = true;
+                        v.allocated_reg = true;
+                        v.is_env_upvalue = false;
+                        v.upval_idx = None;
+                        v.env_gettabup_pc = -1;
+                    }
+                }
+            }
+        }
         
         let mut exps: Vec<ExpDesc> = Vec::new();
         loop {
@@ -2439,17 +2513,25 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                             result.table_key_is_int = false;
                             result.key_allocated_reg = false;
                         }
+                        let is_short_str = field.len() <= crate::strings::LUAI_MAXSHORTLEN && (k as u32) <= crate::opcodes::MAXINDEXRK;
                         let (base_reg, gettabup_pc) = if let Some(r) = result.reg {
                             (r, -1)
                         } else if result.is_env_upvalue {
-                            (0, -1)
+                            if !is_short_str {
+                                // Key exceeds MAXINDEXRK: must load _ENV into a register
+                                // before the value expression is evaluated (matching C compiler order)
+                                let r = fs.alloc_reg();
+                                fs.code_abc(OpCode::GETUPVAL, r, 0, 0);
+                                (r, -1)
+                            } else {
+                                (0, -1)
+                            }
                         } else {
                             let r = fs.alloc_reg();
                             let gk = result.key.unwrap_or(0);
                             code_gettabup(fs, r, 0, gk);
                             (r, fs.pc - 1)
                         };
-                        let is_short_str = field.len() <= crate::strings::LUAI_MAXSHORTLEN && (k as u32) <= crate::opcodes::MAXINDEXRK;
                         let (table_key, table_key_is_const, key_allocated_reg) = if is_short_str {
                             (k, true, false)
                         } else {
@@ -2457,14 +2539,15 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                             fs.code_abx(OpCode::LOADK, kr, k);
                             (kr, false, true)
                         };
+                        let new_is_env_upvalue = result.is_env_upvalue && is_short_str;
                         result = PrefixResult {
                         var_name: None, local_idx: None, key: None, reg: Some(base_reg),
                         table_reg: Some(base_reg), table_key: Some(table_key), table_key_is_const: table_key_is_const, table_key_is_int: false,
                         key_allocated_reg: key_allocated_reg,
-                        allocated_reg: if result.is_env_upvalue { false } else { result.allocated_reg || result.reg.is_none() },
-                        is_env_upvalue: result.is_env_upvalue,
+                        allocated_reg: if new_is_env_upvalue { false } else { result.allocated_reg || result.reg.is_none() || (result.is_env_upvalue && !is_short_str) },
+                        is_env_upvalue: new_is_env_upvalue,
                         upval_idx: result.upval_idx,
-                        env_gettabup_pc: if result.is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { result.env_gettabup_pc } },
+                        env_gettabup_pc: if new_is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { result.env_gettabup_pc } },
                         has_call: false, call_pc: -1,
                     };
                 }
@@ -2507,10 +2590,21 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         result.table_key_is_int = false;
                         result.key_allocated_reg = false;
                     }
+                    // For _ENV upvalue: we need to decide whether to load _ENV into a register
+                    // before parsing the key expression. C compiler calls luaK_exp2anyregup
+                    // before yindex, then luaK_indexed may call luaK_exp2anyreg for _ENV
+                    // if the key is not a Kstr. To match C's instruction order (GETUPVAL
+                    // before LOADK), we emit GETUPVAL now and remove it later if not needed.
+                    let mut env_getupval_pc: i32 = -1;
+                    let mut env_getupval_reg: i32 = -1;
                     let (base_reg, gettabup_pc) = if let Some(r) = result.reg {
                         (r, -1)
                     } else if result.is_env_upvalue {
-                        (0, -1)
+                        // Emit GETUPVAL now to match C's instruction order
+                        let r = fs.alloc_reg();
+                        env_getupval_pc = fs.code_abc(OpCode::GETUPVAL, r, 0, 0);
+                        env_getupval_reg = r;
+                        (r, -1)  // tentative; may be reverted
                     } else {
                         let r = fs.alloc_reg();
                         let gk = result.key.unwrap_or(0);
@@ -2547,14 +2641,31 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         (fs.expr_to_reg(&ei.exp), false, false)
                     };
                     let key_allocated = !key_is_const && fs.freereg > saved_freereg_before;
+                    // Now decide: if _ENV was loaded but SETTABUP can be used, revert the GETUPVAL
+                    let (base_reg, new_is_env_upvalue, allocated_reg) = if env_getupval_pc >= 0 {
+                        let can_use_settabup = key_is_const && !key_is_int
+                            && (kr as u32) <= crate::opcodes::MAXINDEXRK;
+                        if can_use_settabup {
+                            // Revert: remove GETUPVAL, free the register
+                            fs.proto.code.remove(env_getupval_pc as usize);
+                            fs.pc -= 1;
+                            fs.free_reg();
+                            (0, true, false)  // SETTABUP will be used, base_reg=0 is sentinel
+                        } else {
+                            // Keep GETUPVAL; _ENV is now in a register
+                            (env_getupval_reg, false, true)
+                        }
+                    } else {
+                        (base_reg, result.is_env_upvalue, result.allocated_reg || result.reg.is_none())
+                    };
                     result = PrefixResult {
                         var_name: None, local_idx: None, key: None, reg: Some(base_reg),
                         table_reg: Some(base_reg), table_key: Some(kr), table_key_is_const: key_is_const, table_key_is_int: key_is_int,
                         key_allocated_reg: key_allocated,
-                        allocated_reg: if result.is_env_upvalue { false } else { result.allocated_reg || result.reg.is_none() },
-                        is_env_upvalue: result.is_env_upvalue,
+                        allocated_reg: allocated_reg,
+                        is_env_upvalue: new_is_env_upvalue,
                         upval_idx: result.upval_idx,
-                        env_gettabup_pc: if result.is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { result.env_gettabup_pc } },
+                        env_gettabup_pc: if new_is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { result.env_gettabup_pc } },
                         has_call: false, call_pc: -1,
                     };
                     }
