@@ -827,6 +827,42 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_close_no_extra_for_outer_upvalue() {
+        // When a do-block contains a local function that captures upvalues
+        // from the OUTER scope (not from the block itself), no CLOSE instruction
+        // should be generated at the end of the block. Only when a variable
+        // defined IN the block is captured as an upvalue should CLOSE be emitted.
+        // Before fix: Rust generated extra CLOSE instruction because it checked
+        // whether sub-prototypes have ANY upvalues, not whether they reference
+        // variables defined in the current block.
+        assert_inst_match(
+            r#"do
+  local function f(n)
+    local s = string.format("x", n)
+    local r = assert(load(s))
+  end
+  f(1)
+  f(2)
+end"#,
+            None,
+        );
+    }
+
+    #[test]
+    fn test_close_needed_for_block_upvalue() {
+        // When a variable defined in a do-block IS captured as an upvalue
+        // by a sub-function, a CLOSE instruction SHOULD be generated.
+        assert_inst_match(
+            r#"do
+  local a = 10
+  local function f() return a end
+  f()
+end"#,
+            None,
+        );
+    }
+
+    #[test]
     fn test_relocable_as_func_arg() {
         // Other Relocable expressions (NEWTABLE, CLOSURE) as function
         // arguments should also use exp_to_reg for proper register allocation.

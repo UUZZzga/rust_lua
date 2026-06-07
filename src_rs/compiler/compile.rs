@@ -1139,11 +1139,26 @@ impl FuncState {
     fn nvarstack(&self) -> i32 {
         let mut reglevel = 0;
         for local in &self.locals {
-            if local.active && local.kind != RDKCTC {
+            if local.active && local.kind <= RDKTOCLOSE {
                 reglevel = local.reg + 1;
             }
         }
         reglevel
+    }
+
+    /// 检查块内是否有变量被作为 upvalue 引用（对应 C Lua 的 bl->upval）
+    /// 只有当子原型的 upvalue 引用了当前块内定义的局部变量时才需要 CLOSE
+    fn block_has_upvalue(&self, saved_nprotos: usize, saved_nlocals: usize) -> bool {
+        let block_local_regs: Vec<i32> = self.locals[saved_nlocals..]
+            .iter()
+            .filter(|l| l.active)
+            .map(|l| l.reg)
+            .collect();
+        self.proto.protos[saved_nprotos..].iter().any(|p| {
+            p.upvalues.iter().any(|uv| {
+                uv.in_stack && block_local_regs.contains(&(uv.idx as i32))
+            })
+        })
     }
 }
 
@@ -3528,11 +3543,13 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     };
                     if matches!(e2.exp.kind, ExpKind::Int) && fits_sc(&e2.exp) {
                         let v = e2.exp.info;
-                        let dest = fs.alloc_reg();
+                        // Reuse operand register if it's a temporary (>= nvarstack),
+                        // matching C compiler's behavior. Otherwise allocate new.
+                        let dest = if r >= fs.nvarstack() { r } else { fs.alloc_reg() };
                         let sc = int_to_sc(v);
-                        fs.code_abc(OpCode::SHRI, dest, r, sc);
+                        let pc = fs.code_abc(OpCode::SHRI, dest, r, sc);
                         fs.code_abc(OpCode::MMBINI, r, sc, 17);
-                        e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, dest as i64) };
+                        e = ExprItem { exp: ExpDesc::new_reloc_with_pc(dest as i64, pc) };
                     } else {
                         let r2 = if matches!(e2.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !e2.exp.has_jumps() {
                             let reg = e2.exp.info as i32;
@@ -4886,8 +4903,8 @@ fn parse_if(fs: &mut FuncState) {
     let saved_nprotos = fs.proto.protos.len();
     parse_block(fs);
     let has_tbc = fs.locals[saved_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
-    let has_new_upvalue = fs.proto.protos[saved_nprotos..].iter().any(|p| !p.upvalues.is_empty());
-    if has_tbc || has_new_upvalue {
+    let has_block_upval = fs.block_has_upvalue(saved_nprotos, saved_nlocals);
+    if has_tbc || has_block_upval {
         fs.code_abc(OpCode::CLOSE, block_freereg, 0, 0);
     }
     for local in &mut fs.locals[saved_nlocals..] {
@@ -4958,8 +4975,8 @@ fn parse_if(fs: &mut FuncState) {
         let saved_nprotos = fs.proto.protos.len();
         parse_block(fs);
         let has_tbc = fs.locals[saved_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
-        let has_new_upvalue = fs.proto.protos[saved_nprotos..].iter().any(|p| !p.upvalues.is_empty());
-        if has_tbc || has_new_upvalue {
+        let has_block_upval = fs.block_has_upvalue(saved_nprotos, saved_nlocals);
+        if has_tbc || has_block_upval {
             fs.code_abc(OpCode::CLOSE, block_freereg, 0, 0);
         }
         for local in &mut fs.locals[saved_nlocals..] {
@@ -4980,8 +4997,8 @@ fn parse_if(fs: &mut FuncState) {
         let saved_nprotos = fs.proto.protos.len();
         parse_block(fs);
         let has_tbc = fs.locals[saved_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
-        let has_new_upvalue = fs.proto.protos[saved_nprotos..].iter().any(|p| !p.upvalues.is_empty());
-        if has_tbc || has_new_upvalue {
+        let has_block_upval = fs.block_has_upvalue(saved_nprotos, saved_nlocals);
+        if has_tbc || has_block_upval {
             fs.code_abc(OpCode::CLOSE, block_freereg, 0, 0);
         }
         for local in &mut fs.locals[saved_nlocals..] {
@@ -5064,8 +5081,8 @@ fn parse_while(fs: &mut FuncState) {
     let saved_nprotos = fs.proto.protos.len();
     parse_block(fs);
     let has_tbc = fs.locals[saved_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
-    let has_new_upvalue = fs.proto.protos[saved_nprotos..].iter().any(|p| !p.upvalues.is_empty());
-    if has_tbc || has_new_upvalue {
+    let has_block_upval = fs.block_has_upvalue(saved_nprotos, saved_nlocals);
+    if has_tbc || has_block_upval {
         fs.code_abc(OpCode::CLOSE, block_freereg, 0, 0);
     }
     for local in &mut fs.locals[saved_nlocals..] {
@@ -5096,8 +5113,8 @@ fn parse_do(fs: &mut FuncState) {
     let saved_nprotos = fs.proto.protos.len();
     parse_block(fs);
     let has_tbc = fs.locals[saved_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
-    let has_new_upvalue = fs.proto.protos[saved_nprotos..].iter().any(|p| !p.upvalues.is_empty());
-    if has_tbc || has_new_upvalue {
+    let has_block_upval = fs.block_has_upvalue(saved_nprotos, saved_nlocals);
+    if has_tbc || has_block_upval {
         fs.code_abc(OpCode::CLOSE, saved_freereg, 0, 0);
     }
     for local in &mut fs.locals[saved_nlocals..] {
@@ -5122,8 +5139,8 @@ fn parse_repeat(fs: &mut FuncState) {
     let saved_nprotos = fs.proto.protos.len();
     parse_block(fs);
     let has_tbc = fs.locals[saved_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
-    let has_new_upvalue = fs.proto.protos[saved_nprotos..].iter().any(|p| !p.upvalues.is_empty());
-    if has_tbc || has_new_upvalue {
+    let has_block_upval = fs.block_has_upvalue(saved_nprotos, saved_nlocals);
+    if has_tbc || has_block_upval {
         fs.code_abc(OpCode::CLOSE, block_freereg, 0, 0);
     }
     fs.set_freereg(block_freereg);
@@ -5253,8 +5270,8 @@ fn parse_for(fs: &mut FuncState) {
         let body_nprotos = fs.proto.protos.len();
         parse_block(fs);
         let has_tbc = fs.locals[body_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
-        let has_new_upvalue = fs.proto.protos[body_nprotos..].iter().any(|p| !p.upvalues.is_empty());
-        if has_tbc || has_new_upvalue {
+        let has_block_upval = fs.block_has_upvalue(body_nprotos, body_nlocals);
+        if has_tbc || has_block_upval {
             fs.code_abc(OpCode::CLOSE, base + 3, 0, 0);
         }
 
@@ -5339,8 +5356,8 @@ fn parse_for(fs: &mut FuncState) {
         let body_nprotos = fs.proto.protos.len();
         parse_block(fs);
         let has_tbc = fs.locals[body_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
-        let has_new_upvalue = fs.proto.protos[body_nprotos..].iter().any(|p| !p.upvalues.is_empty());
-        if has_tbc || has_new_upvalue {
+        let has_block_upval = fs.block_has_upvalue(body_nprotos, body_nlocals);
+        if has_tbc || has_block_upval {
             fs.code_abc(OpCode::CLOSE, base + 3 + ncontrol, 0, 0);
         }
         
@@ -5500,8 +5517,16 @@ fn parse_local(fs: &mut FuncState) {
             let n_reg = if last_is_ctc { nvars - 1 } else { nvars };
 
             if last_is_ctc {
-                fs.proto.code.pop();
+                let popped = fs.proto.code.pop();
                 fs.pc -= 1;
+                // If the popped instruction is LOADK, the constant it references
+                // was added for this CTC variable and should also be removed.
+                // (LOADI/LOADF don't add constants, so no pop needed for those.)
+                if let Some(inst) = popped {
+                    if crate::opcodes::get_opcode(inst) == OpCode::LOADK {
+                        fs.proto.constants.pop();
+                    }
+                }
             }
 
             let last_is_call = last_exp.as_ref().map(|e| matches!(e.kind, ExpKind::Call)).unwrap_or(false);
@@ -5521,13 +5546,14 @@ fn parse_local(fs: &mut FuncState) {
             if last_is_ctc {
                 let pc = fs.pc;
                 let last_e = last_exp.as_ref().unwrap();
-                let (ctc_info, ctc_str) = if last_e.kind == ExpKind::Str {
-                    let s = fs.proto.constants.pop()
-                        .and_then(|tv| if let TValue::Str(s) = tv { Some(s.as_str().to_string()) } else { None });
-                    (0, s)
+                let ctc_str = if last_e.kind == ExpKind::Str {
+                    // String constant was already popped above (LOADK case).
+                    // Reconstruct the string from the expression's str_val.
+                    last_e.str_val.clone()
                 } else {
-                    (last_e.info, None)
+                    None
                 };
+                let ctc_info = if last_e.kind == ExpKind::Str { 0 } else { last_e.info };
                 fs.locals.push(LocalVar {
                     name: names[nvars - 1].clone(),
                     start_pc: pc,
@@ -5825,7 +5851,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     }
 
     for local in &fs.locals {
-        if local.active && local.kind != RDKCTC {
+        if local.active && local.kind <= RDKTOCLOSE {
             new_fs.parent_locals.push((local.name.clone(), local.reg));
         }
     }
@@ -5834,7 +5860,11 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     parse_chunk(&mut new_fs);
     expect(&mut new_fs, &Token::End);
 
-    if !new_fs.proto.upvalues.is_empty() {
+    // Set needclose only if the sub-function captures a local variable
+    // from the current function as an upvalue (in_stack = true).
+    // Upvalues with in_stack = false reference outer function upvalues,
+    // which don't need closing by the current function.
+    if new_fs.proto.upvalues.iter().any(|uv| uv.in_stack) {
         fs.needclose = true;
     }
 
