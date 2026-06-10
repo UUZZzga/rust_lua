@@ -540,6 +540,29 @@ mod compiler_compare_tests {
     }
 
     #[test]
+    fn test_do_local_ref() {
+        // Test: do with local var reference - C should NOT generate CLOSE
+        assert_inst_match("do local a = {}; print(a) end", None);
+    }
+
+    #[test]
+    fn test_do_local_ref2() {
+        assert_inst_match("do local a = {}; local b = a end", None);
+    }
+
+    #[test]
+    fn test_do_nested_func() {
+        // Test: do with nested function that captures local var - C should generate CLOSE
+        assert_inst_match("do local a = {}; local function f() a.x = true end end", None);
+    }
+
+    #[test]
+    fn test_for_with_var_ref() {
+        // Test: for loop where control variable is referenced in body
+        assert_inst_match("local p = 2; for i=1,10 do local x = p + i end", None);
+    }
+
+    #[test]
     fn test_call_function() {
         assert_inst_match("local f, a, b; local c = f(a, b)", None);
         assert_inst_match("local a = b(); a = b()", None);
@@ -572,6 +595,41 @@ mod compiler_compare_tests {
     // fn test_constructs_lua() {
     //     assert_inst_match_file("constructs.lua");
     // }
+
+    #[test]
+    fn test_for_break_closure() {
+        // Numeric for loop with break and closure capturing loop variable
+        assert_inst_match("for i = 1, 3 do local f = function() return i end break end", None);
+    }
+
+    #[test]
+    fn test_env_closure_close() {
+        // do local _ENV with closure capturing _ENV - should generate CLOSE on block exit
+        assert_inst_match(r#"
+do
+  local _ENV = {}
+  function foo() return A end
+end
+"#, None);
+    }
+
+    #[test]
+    fn test_env_nested_closure_close() {
+        // Nested _ENV blocks with closures - tests multiple CLOSE instructions
+        assert_inst_match(r#"
+do
+  local mt = {}
+  do
+    local _ENV = mt
+    function foo(x)
+      A = x
+      do local _ENV = _G; A = 1000 end
+      return function(y) return A .. y end
+    end
+  end
+end
+"#, None);
+    }
 
     #[test]
     fn test_focus_lua() {
@@ -868,5 +926,229 @@ end"#,
         // arguments should also use exp_to_reg for proper register allocation.
         assert_inst_match("local f; f({}, 1)", None);
         assert_inst_match("local f; f(function() end)", None);
+    }
+
+    // ===== goto / label 测试 =====
+
+    #[test]
+    fn test_goto_simple() {
+        assert_inst_match("goto done; ::done::", None);
+    }
+
+    #[test]
+    fn test_goto_in_do_block() {
+        assert_inst_match("do goto done end; ::done::", None);
+    }
+
+    #[test]
+    fn test_goto_in_for_loop() {
+        assert_inst_match("for i = 1, 5 do if i > 3 then goto endloop end end; ::endloop::", None);
+    }
+
+    #[test]
+    fn test_goto_in_nested_for() {
+        assert_inst_match("local s = 0; for i = 1, 5 do for j = 1, 5 do if i + j < 5 then goto endloop end; s = s + i end end; ::endloop::", None);
+    }
+
+    #[test]
+    fn test_label_simple() {
+        assert_inst_match("::start::", None);
+    }
+
+    #[test]
+    fn test_label_with_goto() {
+        assert_inst_match("::loop::; goto loop", None);
+    }
+
+    // ===== ...t 命名 vararg 参数测试 =====
+
+    #[test]
+    fn test_named_vararg_simple() {
+        assert_inst_match("local function f(...t) return t end", None);
+    }
+
+    #[test]
+    fn test_named_vararg_with_params() {
+        assert_inst_match("local function f(a, b, ...t) return t end", None);
+    }
+
+    #[test]
+    fn test_named_vararg_index() {
+        assert_inst_match("local function f(...t) return t[1] end", None);
+    }
+
+    #[test]
+    fn test_named_vararg_field() {
+        assert_inst_match("local function f(...t) return t.n end", None);
+    }
+
+    #[test]
+    fn test_named_vararg_len() {
+        assert_inst_match("local function f(...t) return #t end", None);
+    }
+
+    #[test]
+    fn debug_global_const_star() {
+        // Test: local _ENV should make _ENV a local variable, causing GETFIELD instead of GETTABUP
+        let source = "do local _ENV = _G; assert(true) end";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn debug_upvalue_close_in_block() {
+        // Test: when a local function captures a local variable from a block,
+        // the block should generate CLOSE instruction
+        let source = "do local a = {}; local function f() a.x = true end end";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn debug_upvalue_close_in_if() {
+        // Test: when a local function inside an if block captures a local variable,
+        // the if block should generate CLOSE instruction
+        let source = "if true then local a = {}; local function f() a.x = true end end";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn debug_upvalue_close_shadowed_var() {
+        // Test: when a local variable is shadowed, the inner function should capture the inner variable
+        let source = "do local a = 1; local a = {}; local function f() a.x = true end end";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn debug_upvalue_close_with_global_const_star() {
+        // Test: upvalue close with global <const> * at top
+        let source = "global <const> *; do local a = {}; local function f() a.x = true end end";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn debug_upvalue_close_in_if_with_for_loop() {
+        // Test: when a local function inside an if block captures a local variable,
+        // and there's a for loop inside the if block, the if block should still
+        // generate CLOSE instruction
+        let source = "if true then local a = {}; local function f() a.x = true end; for i=1,1 do end end";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn debug_upvalue_close_in_if_with_for_loop_global_const() {
+        // Same as above but with global <const> * at top
+        let source = "global <const> *; if true then local a = {}; local function f() a.x = true end; for i=1,1 do end end";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn debug_upvalue_close_in_if_with_for_and_break() {
+        // Test: if block with upvalue capture, for loop, and break statement
+        let source = "global <const> *; if true then local a = {}; local function f() a.x = true end; for i=1,math.huge do if i>1 then break end end end";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn debug_upvalue_close_shadowed_var_in_if() {
+        // Test: two local a in the same if block, second one captured by nested function
+        let source = "global <const> *; if true then local a = 1; local a = {}; local function f() a.x = true end; for i=1,1 do end end";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn debug_upvalue_close_with_for_loops_before() {
+        // Test: if block with upvalue capture, but with for loops before the function definition
+        let source = "global <const> *; if true then local a = 1; for i=1,1 do end; local a = {}; local function f() a.x = true end; for i=1,1 do end end";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn debug_forstat_close_with_upvalue() {
+        // Test: for loop where the loop variable is captured by a closure inside the loop
+        // The forstat block should generate CLOSE
+        let source = "for i=1,10 do local function f() return i end end";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn debug_forstat_close_with_upvalue_global_const() {
+        // Same but with global <const> *
+        let source = "global <const> *; for i=1,10 do local function f() return i end end";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn debug_forstat_close_with_body_upvalue() {
+        // Test: for loop where a body variable is captured by a closure
+        let source = "for i=1,10 do local a = {}; local function f() a.x = true end end";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn debug_forstat_close_with_body_upvalue_global_const() {
+        // Same but with global <const> *
+        let source = "global <const> *; for i=1,10 do local a = {}; local function f() a.x = true end end";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn test_numeric_for_close() {
+        // Numeric for loop with closure capturing outer variable - forstat block needs CLOSE
+        assert_inst_match(r#"
+local a = {}
+local function additems()
+  a.x = true
+end
+for i = 1, 10 do
+  local st = pcall(additems)
+  local count = 0
+  for k, v in pairs(a) do
+    count = count + 1
+  end
+  if st then break end
+end
+"#, None);
+    }
+
+    #[test]
+    fn test_numeric_for_inner_generic_for_close() {
+        // Numeric for loop containing generic for loop with to-be-closed state
+        // The generic for's forstat block has marktobeclosed, which should propagate CLOSE
+        assert_inst_match(r#"
+local a = {}
+local function additems()
+  a.x = true
+end
+for i = 1, math.huge do
+  pcall(additems)
+  local count = 0
+  for k, v in pairs(a) do
+    count = count + 1
+  end
+  if count == 5 then break end
+end
+"#, None);
+    }
+
+    #[test]
+    fn test_numeric_for_inner_generic_for_close2() {
+        assert_inst_match(r#"
+do
+  local a = {}
+  local function additems ()
+    a.x = true; a.y = true; a.z = true
+    a[1] = true
+    a[2] = true
+  end
+  for i = 1, math.huge do
+    pcall(additems)
+    local count = 0
+    for k, v in pairs(a) do
+      assert(a[k] == v)
+      count = count + 1
+    end
+    if count == 5 then break end
+  end
+end
+"#, None);
     }
 }
