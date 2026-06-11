@@ -630,6 +630,9 @@ pub struct UpvalDesc {
     pub in_stack: bool,
     /// 索引（栈索引或外层函数上值列表索引）
     pub idx: u8,
+    /// For in_stack upvalues: index in parent's locals array (used by mark_block_upval)
+    /// For non-in_stack upvalues: unused (0)
+    pub parent_local_idx: usize,
 }
 
 /// 局部变量描述符（调试信息）

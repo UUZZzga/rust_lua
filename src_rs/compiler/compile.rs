@@ -258,6 +258,19 @@ impl ExpDesc {
 // Local variable tracking
 // ============================================================================
 
+/// Variable visible from a parent/grandparent function.
+/// Used by find_upvalue to create upvalue references.
+#[derive(Clone)]
+struct ParentVar {
+    name: String,
+    is_local: bool,       // true = direct parent's local, false = inherited from ancestor
+    // is_local=true:
+    reg: i32,             // register in direct parent
+    local_idx: usize,     // index in direct parent's locals array
+    // is_local=false:
+    upval_idx: usize,     // index in direct parent's upvalues array (0 = not yet created)
+}
+
 #[derive(Clone)]
 struct LocalVar {
     name: String,
@@ -268,12 +281,13 @@ struct LocalVar {
     ctc_kind: Option<ExpKind>,
     ctc_info: Option<i64>,
     ctc_str: Option<String>,
+    vidx: i32,  // variable index at declaration time (like C's vidx = nactvar at declaration)
 }
 
 struct LabelDesc {
     name: String,
     pc: i32,       // label 位置（跳转目标）
-    nactvar: i32,  // label 处活跃变量数
+    nactvar: i32,  // label 处的 locals 索引（对应 C 的 bl->nactvar，在紧凑数组中索引=计数）
     line: i32,
 }
 
@@ -281,15 +295,14 @@ struct GotoDesc {
     name: String,
     pc: i32,       // JMP 指令的 pc
     line: i32,
-    nactvar: i32,  // goto 处活跃变量数
+    nactvar: i32,  // goto 处的 locals 索引（对应 C 的 fs->nactvar）
     close: bool,   // 是否需要 CLOSE
 }
 
 /// Corresponds to C's BlockCnt - tracks block nesting and upvalue flags
 #[derive(Clone, Copy)]
 struct BlockEntry {
-    saved_nlocals: usize,   // locals index at block entry (like C's bl->nactvar as array index)
-    saved_nactvar: i32,     // active variable count at block entry (like C's bl->nactvar)
+    saved_nlocals: usize,   // locals index at block entry (like C's bl->nactvar in compact array)
     has_upval: bool,        // like C's bl->upval
     is_function_body: bool, // true for the function body block (C's bl->previous==NULL)
 }
@@ -308,14 +321,14 @@ struct RegAllocEntry {
 
 pub struct FuncState {
     pub proto: Proto,
-    pub prev: Option<Box<FuncState>>,
+    pub prev: *mut FuncState,  // raw pointer to parent FuncState (like C's fs->prev)
     pub pc: i32,
     pub freereg: i32,
     pub max_freereg: i32,
     pub locals: Vec<LocalVar>,
     pub errors: Vec<String>,
     pub needclose: bool,
-    pub parent_locals: Vec<(String, i32)>,
+    pub parent_locals: Vec<ParentVar>,  // variables visible from parent/grandparent functions
     pub break_list: i32,
     pub labels: Vec<LabelDesc>,
     pub gotos: Vec<GotoDesc>,
@@ -354,7 +367,7 @@ impl FuncState {
     fn new(ls: &mut LexState) -> Self {
         FuncState {
             proto: crate::func::new_proto(),
-            prev: None,
+            prev: std::ptr::null_mut(),
             pc: 0,
             freereg: 0,
             max_freereg: 0,
@@ -760,6 +773,7 @@ impl FuncState {
     /// 添加局部变量 (VDKREG)，分配寄存器并返回
     fn add_local(&mut self, name: &str, start_pc: i32) -> i32 {
         let reg = self.alloc_reg();
+        let vidx = self.locals.len() as i32;
         self.locals.push(LocalVar {
             name: name.to_string(),
             start_pc,
@@ -769,6 +783,7 @@ impl FuncState {
             ctc_kind: None,
             ctc_info: None,
             ctc_str: None,
+            vidx,
         });
         reg
     }
@@ -781,6 +796,7 @@ impl FuncState {
         } else {
             0
         };
+        let vidx = self.locals.len() as i32;
         self.locals.push(LocalVar {
             name: name.to_string(),
             start_pc,
@@ -790,6 +806,7 @@ impl FuncState {
             ctc_kind: None,
             ctc_info: None,
             ctc_str: None,
+            vidx,
         });
         // Like C's marktobeclosed: mark current block as needing CLOSE
         if kind == RDKTOCLOSE {
@@ -803,6 +820,7 @@ impl FuncState {
 
     /// 添加指定寄存器的局部变量
     fn add_local_kind_reg(&mut self, name: &str, start_pc: i32, kind: i32, reg: i32) {
+        let vidx = self.locals.len() as i32;
         self.locals.push(LocalVar {
             name: name.to_string(),
             start_pc,
@@ -812,6 +830,7 @@ impl FuncState {
             ctc_kind: None,
             ctc_info: None,
             ctc_str: None,
+            vidx,
         });
     }
 
@@ -862,21 +881,92 @@ impl FuncState {
                 }
             }
         }
-        for (pname, preg) in &self.parent_locals {
-            if pname == name {
+        // Search from the end (like C's searchvar which searches from nactvar-1 down)
+        // to find the innermost variable with the given name.
+        for (j, pvar) in self.parent_locals.iter().enumerate().rev() {
+            if pvar.name == name {
                 let idx = self.proto.upvalues.len() as i32;
                 let t = crate::strings::StringTable::new();
                 let ls = crate::strings::new_lstr(&t, name);
-                self.proto.upvalues.push(crate::objects::UpvalDesc {
-                    name: Some(ls),
-                    in_stack: true,
-                    idx: *preg as u8,
-                });
+                if pvar.is_local {
+                    // Variable is a local in the direct parent function
+                    self.proto.upvalues.push(crate::objects::UpvalDesc {
+                        name: Some(ls),
+                        in_stack: true,
+                        idx: pvar.reg as u8,
+                        parent_local_idx: pvar.local_idx,
+                    });
+                } else {
+                    // Variable is inherited from a grandparent function.
+                    // We need to find or create the corresponding upvalue in the
+                    // direct parent first, then reference it as in_stack=false.
+                    // Since we can't access the parent's FuncState here (it's in self.prev),
+                    // we search the parent's existing upvalues by name.
+                    // The parent's upvalues are accessible through self.prev.
+                    let parent_upval_idx = self.find_or_create_parent_upvalue(name);
+                    self.proto.upvalues.push(crate::objects::UpvalDesc {
+                        name: Some(ls),
+                        in_stack: false,
+                        idx: parent_upval_idx as u8,
+                        parent_local_idx: 0, // not applicable for in_stack=false
+                    });
+                }
                 self.proto.size_upvalues = self.proto.upvalues.len() as i32;
+                let _ = j; // index for potential future use
                 return Some(idx);
             }
         }
         None
+    }
+
+    /// Find or create an upvalue in the direct parent function for a variable
+    /// inherited from a grandparent. Returns the upvalue index in the parent.
+    fn find_or_create_parent_upvalue(&mut self, name: &str) -> usize {
+        let prev = self.prev;
+        if prev.is_null() {
+            return 0;
+        }
+        // SAFETY: prev is set in parse_body to point to the parent FuncState,
+        // which is guaranteed to be alive for the duration of the child's compilation.
+        let prev = unsafe { &mut *prev };
+        // First, check if the parent already has an upvalue for this name
+        for (i, uv) in prev.proto.upvalues.iter().enumerate() {
+            if let Some(ref n) = uv.name {
+                if n.as_str() == name {
+                    return i;
+                }
+            }
+        }
+        // Search parent_locals for the variable
+        for (j, pvar) in prev.parent_locals.iter().enumerate().rev() {
+            if pvar.name == name {
+                let t = crate::strings::StringTable::new();
+                let ls = crate::strings::new_lstr(&t, name);
+                let idx = prev.proto.upvalues.len();
+                if pvar.is_local {
+                    prev.proto.upvalues.push(crate::objects::UpvalDesc {
+                        name: Some(ls),
+                        in_stack: true,
+                        idx: pvar.reg as u8,
+                        parent_local_idx: pvar.local_idx,
+                    });
+                } else {
+                    // The parent also inherited this from its grandparent.
+                    // We need to recursively create upvalues up the chain.
+                    let grandparent_upval_idx = prev.find_or_create_parent_upvalue(name);
+                    prev.proto.upvalues.push(crate::objects::UpvalDesc {
+                        name: Some(ls),
+                        in_stack: false,
+                        idx: grandparent_upval_idx as u8,
+                        parent_local_idx: 0,
+                    });
+                }
+                prev.proto.size_upvalues = prev.proto.upvalues.len() as i32;
+                return idx;
+            }
+        }
+        // Should not happen if the variable exists somewhere in the chain
+        0
     }
 
     /// 查找局部变量并返回 (寄存器号, 种类)
@@ -1218,62 +1308,50 @@ impl FuncState {
         self.nvarstack_up_to(self.locals.len())
     }
 
-    /// 计算 up to saved_nlocals 的变量栈大小（对应 C 的 reglevel(fs, bl->nactvar)）
-    /// saved_nlocals 是块入口处 locals 的数量，只计算入口前已存在的变量
+    /// 计算 saved_nlocals 范围内活跃变量的寄存器层级
+    /// 用于 set_freereg（恢复寄存器），只计算当前活跃的变量
     fn nvarstack_up_to(&self, saved_nlocals: usize) -> i32 {
         let mut reglevel = 0;
-        for local in &self.locals[..saved_nlocals] {
-            if local.active && local.kind <= RDKTOCLOSE {
-                reglevel = local.reg + 1;
+        for i in 0..saved_nlocals {
+            if self.locals[i].active && self.locals[i].kind <= RDKTOCLOSE {
+                reglevel = self.locals[i].reg + 1;
             }
         }
         reglevel
     }
 
-    /// 将活动变量计数 nvar 转换为寄存器层级（对应 C 的 reglevel）
-    /// 遍历所有 locals，找到第 nvar 个 active 变量的 reg+1
+    /// 将变量索引 nvar 转换为寄存器层级（对应 C 的 reglevel）
+    /// C 的 reglevel 从 nvar-1 向下迭代到 0，找到第一个 varinreg 的变量
+    /// 不检查 active 状态：C 的紧凑数组中 0..nactvar 的所有变量都"活跃"，
+    /// Rust 的 locals 数组中有 inactive 变量，但 CLOSE 指令参数需要匹配 C 的行为
     fn reglevel(&self, nvar: i32) -> i32 {
-        let mut count = 0;
-        let mut max_reg = 0;
-        for local in self.locals.iter() {
-            if local.active && local.kind <= RDKTOCLOSE {
-                count += 1;
-                if count <= nvar {
-                    max_reg = local.reg + 1;
-                }
+        for i in (0..nvar as usize).rev() {
+            if i < self.locals.len() && self.locals[i].kind <= RDKTOCLOSE {
+                return self.locals[i].reg + 1;
             }
         }
-        max_reg
-    }
-
-    /// 计算 saved_nlocals 范围内活跃变量数（对应 C 的 fs->nactvar / bl->nactvar）
-    /// 用于 goto 的 nactvar 字段和 mark_block_upval，语义为 COUNT（不是 reglevel）
-    /// 注意：C 的 nactvar 包括 RDKCTC 变量
-    fn nactvar_count_at(&self, saved_nlocals: usize) -> i32 {
-        self.locals[..saved_nlocals].iter()
-            .filter(|lv| lv.active)
-            .count() as i32
+        0
     }
 
     // Like C's markupval: mark the block where the variable at the given
     // locals array index was declared as having upvalues.
-    // Uses saved_nlocals (locals array length at block entry) instead of
-    // saved_nactvar (active variable count) for block identification, because
-    // nactvar_count_at may not match C's fs->nactvar due to differences in
-    // variable activation/deactivation timing.
+    // Uses saved_nlocals (locals array length at block entry) for block identification.
+    // C's markupval uses bl->nactvar which is an index in the compact array;
+    // we use saved_nlocals which is the equivalent index in our sparse array.
     /// `var_idx` is the index in the `locals` array of the variable being captured.
     fn mark_block_upval(&mut self, var_idx: usize) {
         self.needclose = true;
-        eprintln!("[DEBUG R] mark_block_upval: var_idx={}, var_name={}, locals_len={}", var_idx, self.locals[var_idx].name, self.locals.len());
+        // Like C's markupval: find the first block where nactvar <= level.
+        // C's 'level' is the variable's vidx (nactvar at declaration time).
+        // In Rust, vidx = locals.len() at declaration time (index in locals array),
+        // and saved_nlocals is the block's nactvar equivalent.
+        let var_vidx = self.locals[var_idx].vidx;
         for i in (0..self.block_stack.len()).rev() {
-            eprintln!("[DEBUG R]   checking block[{}]: saved_nlocals={}, is_function_body={}", i, self.block_stack[i].saved_nlocals, self.block_stack[i].is_function_body);
-            if self.block_stack[i].saved_nlocals <= var_idx {
-                eprintln!("[DEBUG R]   MARKED block[{}]: saved_nlocals={}", i, self.block_stack[i].saved_nlocals);
+            if self.block_stack[i].saved_nlocals as i32 <= var_vidx {
                 self.block_stack[i].has_upval = true;
                 return;
             }
         }
-        eprintln!("[DEBUG R]   NO BLOCK MARKED!");
     }
 
     // Check if the current (innermost) block has been marked as having upvalues
@@ -1284,6 +1362,56 @@ impl FuncState {
     // Returns true if current block has to-be-closed variables
     fn current_block_has_tbc(&self, saved_nlocals: usize) -> bool {
         self.locals[saved_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active)
+    }
+
+    /// Mark the innermost non-function block as having upvalues.
+    /// Used for !in_stack upvalues where the parent also has an upvalue.
+    fn mark_block_for_upval(&mut self) {
+        self.needclose = true;
+        for i in (0..self.block_stack.len()).rev() {
+            if !self.block_stack[i].is_function_body {
+                self.block_stack[i].has_upval = true;
+                return;
+            }
+        }
+    }
+
+    /// For !in_stack upvalues, recursively mark ancestor functions' blocks.
+    /// The upvalue at `idx` in the current function references an upvalue
+    /// in the parent function. We need to ensure the parent's blocks are
+    /// also marked, using the correct vidx (like C's markupval).
+    fn mark_ancestor_blocks_for_upval(&mut self, idx: usize) {
+        let prev_ptr = self.prev;
+        if prev_ptr.is_null() { return; }
+        // SAFETY: prev is set in parse_body to point to the parent FuncState,
+        // which is guaranteed to be alive for the duration of the child's compilation.
+        let prev = unsafe { &mut *prev_ptr };
+        if idx < prev.proto.upvalues.len() {
+            let parent_uv = &prev.proto.upvalues[idx];
+            if parent_uv.in_stack {
+                // The parent's upvalue is in_stack, so the variable is a local
+                // in the parent. Call mark_block_upval with the local's index
+                // (like C's markupval with the variable's vidx).
+                let local_idx = parent_uv.parent_local_idx;
+                let is_active = local_idx < prev.locals.len() && prev.locals[local_idx].active;
+                if is_active {
+                    prev.mark_block_upval(local_idx);
+                }
+            } else {
+                // The parent's upvalue is also !in_stack, so we need to
+                // mark the parent's innermost non-function block and
+                // recursively continue up the chain.
+                prev.needclose = true;
+                for i in (0..prev.block_stack.len()).rev() {
+                    if !prev.block_stack[i].is_function_body {
+                        prev.block_stack[i].has_upval = true;
+                        break;
+                    }
+                }
+                let parent_uv_idx = parent_uv.idx as usize;
+                prev.mark_ancestor_blocks_for_upval(parent_uv_idx);
+            }
+        }
     }
 }
 
@@ -1418,12 +1546,12 @@ fn find_label_from(fs: &FuncState, name: &str, start_idx: usize) -> Option<usize
 fn create_label(fs: &mut FuncState, name: &str, line: i32) {
     let pc = fs.get_label();
     fs.lasttarget = fs.pc;  // mark label position as jump target (like luaK_getlabel)
-    // Use block_stack to get the outer block's active variable count (like C's fs->bl->nactvar)
+    // Use block_stack to get the outer block's saved_nlocals as nactvar index
+    // (like C's bl->nactvar, which is the nactvar at block entry)
     let nactvar = if let Some(blk) = fs.block_stack.last() {
-        fs.nactvar_count_at(blk.saved_nlocals)  // COUNT (like C fs->bl->nactvar)
+        blk.saved_nlocals as i32
     } else {
-        // Count all active locals (like C fs->nactvar)
-        fs.locals.iter().filter(|lv| lv.active && lv.kind <= RDKTOCLOSE).count() as i32
+        fs.locals.len() as i32
     };
 
     fs.labels.push(LabelDesc {
@@ -1432,7 +1560,8 @@ fn create_label(fs: &mut FuncState, name: &str, line: i32) {
         nactvar,
         line,
     });
-    solve_goto(fs, name);
+    // Don't solve goto here - defer to block exit (like C's solvegotos)
+    // so that bup (has_upval) is correctly determined
 
 }
 
@@ -1446,22 +1575,16 @@ fn solve_goto(fs: &mut FuncState, name: &str) {
                 let gt = fs.gotos.remove(i);
                 let mut gt_pc = gt.pc;
                 // C closegoto condition: gt->close || (label->nactvar < gt->nactvar && bup)
-                // In create_label, 'bup' / needclose is derived from the block that has the label
+                // nactvar is now an INDEX (like C), so compare directly
                 let lb = &fs.labels[lb_idx];
-                let gt_reglevel = fs.reglevel(gt.nactvar);  // gt.nactvar is COUNT
-                let lb_reglevel = fs.reglevel(lb.nactvar);  // lb.nactvar is COUNT, need reglevel
-                let need_close = gt.close || (lb_reglevel < gt_reglevel);
+                let need_close = gt.close || lb.nactvar < gt.nactvar;
 
                 if need_close {
-                    // Swap JMP (at gt_pc) and CLOSE (at gt_pc + 1)
-                    let jmp_inst = fs.proto.code[gt_pc as usize];
-                    let close_inst = fs.proto.code[(gt_pc + 1) as usize];
-                    fs.proto.code[gt_pc as usize] = close_inst;
-                    fs.proto.code[(gt_pc + 1) as usize] = jmp_inst;
-                    // Modify CLOSE instruction's A parameter to label's stack level
-                    let lb = &fs.labels[lb_idx];
-                    setarg(&mut fs.proto.code[gt_pc as usize], lb_reglevel, POS_A, SIZE_A);
-                    gt_pc += 1; // Now JMP is at gt_pc + 1
+                    // Like C's closegoto: move JMP to gt_pc+1, create new CLOSE at gt_pc
+                    let stklevel = fs.reglevel(lb.nactvar);
+                    fs.proto.code[(gt_pc + 1) as usize] = fs.proto.code[gt_pc as usize];
+                    fs.proto.code[gt_pc as usize] = create_abck(OpCode::CLOSE, stklevel, 0, 0, 0);
+                    gt_pc += 1; // Now JMP is at gt_pc
                 }
                 // Patch the JMP to jump to the label
                 let lb = &fs.labels[lb_idx];
@@ -1482,9 +1605,8 @@ fn parse_goto_stat(fs: &mut FuncState) {
     let line = fs.ls().lastline;
     let pc = fs.jump();
     fs.code_abc(OpCode::CLOSE, 0, 1, 0);
-    let nactvar = fs.locals.iter().rev()
-        .filter(|lv| lv.active && lv.kind <= RDKTOCLOSE)
-        .count() as i32;
+    // Like C's newgotoentry: nactvar = fs->nactvar (index of active variables)
+    let nactvar = fs.locals.len() as i32;
     fs.gotos.push(GotoDesc {
         name: name.clone(),
         pc,
@@ -1492,52 +1614,44 @@ fn parse_goto_stat(fs: &mut FuncState) {
         nactvar,
         close: false,
     });
-    // Try to resolve this goto against existing labels
-    solve_goto(fs, &name);
+    // Don't solve goto here - defer to block exit (like C's solvegotos)
+    // so that bup (has_upval) is correctly determined
 }
 
 /// 块退出时处理 goto：解决当前块中的 goto，清理 labels
 fn solve_gotos_for_block(fs: &mut FuncState, saved_nlabels: usize, saved_nlocals: usize, needclose: bool) {
-    let nactvar = fs.nvarstack_up_to(saved_nlocals);    // reglevel 用于 CLOSE 参数
-    let nactvar_count = fs.nactvar_count_at(saved_nlocals);  // COUNT（用于 gt.nactvar）
+    let nactvar = saved_nlocals as i32;  // block's nactvar (index, like C's bl->nactvar)
     let mut i = 0;
     while i < fs.gotos.len() {
         let gt_name = fs.gotos[i].name.clone();
         // Only resolve against labels that belong to this block (at or after saved_nlabels)
-        if let Some(_lb_idx) = find_label_from(fs, &gt_name, saved_nlabels) {
+        if let Some(lb_idx) = find_label_from(fs, &gt_name, saved_nlabels) {
             // Found a matching label in this block - solve it
             // (like C's closegoto)
             let gt = fs.gotos.remove(i);
             let mut gt_pc = gt.pc;
             // C closegoto condition: gt->close || (label->nactvar < gt->nactvar && bup)
-            let gt_reglevel = fs.reglevel(gt.nactvar);  // gt.nactvar is COUNT
-            // lb.nactvar is COUNT, need to convert via reglevel
-            let need_close = gt.close || (needclose && fs.labels.iter().any(|lb| lb.name == gt_name && fs.reglevel(lb.nactvar) < gt_reglevel));
+            let lb = &fs.labels[lb_idx];
+            let need_close = gt.close || (needclose && lb.nactvar < gt.nactvar);
 
             if need_close {
-                let jmp_inst = fs.proto.code[gt_pc as usize];
-                let close_inst = fs.proto.code[(gt_pc + 1) as usize];
-                fs.proto.code[gt_pc as usize] = close_inst;
-                fs.proto.code[(gt_pc + 1) as usize] = jmp_inst;
-                if let Some(lb_idx) = find_label_from(fs, &gt_name, saved_nlabels) {
-                    let lb = &fs.labels[lb_idx];
-                    let lb_reglevel = fs.reglevel(lb.nactvar);
-                    setarg(&mut fs.proto.code[gt_pc as usize], lb_reglevel, POS_A, SIZE_A);
-                }
+                // Like C's closegoto: move jump to CLOSE+1, put CLOSE at original position
+                let stklevel = fs.reglevel(lb.nactvar);
+                fs.proto.code[(gt_pc + 1) as usize] = fs.proto.code[gt_pc as usize];
+                fs.proto.code[gt_pc as usize] = create_abck(OpCode::CLOSE, stklevel, 0, 0, 0);
                 gt_pc += 1;
             }
-            if let Some(lb_idx) = find_label_from(fs, &gt_name, saved_nlabels) {
-                let lb = &fs.labels[lb_idx];
-                fs.fix_jump(gt_pc, lb.pc, false);
-            }
+            let lb = &fs.labels[lb_idx];
+            fs.fix_jump(gt_pc, lb.pc, false);
         } else {
-            // Unresolved goto: if block has upvalue, mark close=true
-            let gt_reglevel = fs.reglevel(fs.gotos[i].nactvar);
-            if needclose && gt_reglevel > nactvar {
+            // Unresolved goto: if block has upvalue and goto escapes scope, mark close=true
+            // C: if (bl->upval && reglevel(fs, gt->nactvar) > outlevel) gt->close = 1;
+            let outlevel = fs.reglevel(nactvar);
+            if needclose && fs.reglevel(fs.gotos[i].nactvar) > outlevel {
                 fs.gotos[i].close = true;
             }
-            // Keep as COUNT (like C: gt->nactvar = bl->nactvar)
-            fs.gotos[i].nactvar = nactvar_count;
+            // Like C: gt->nactvar = bl->nactvar
+            fs.gotos[i].nactvar = nactvar;
             i += 1;
         }
     }
@@ -1558,7 +1672,7 @@ fn parse_chunk(fs: &mut FuncState) {
     // bl->previous==NULL).
     let saved_nlocals = fs.locals.len();
     let saved_nlabels = fs.labels.len();
-    fs.block_stack.push(BlockEntry { saved_nlocals, saved_nactvar: 0, has_upval: false, is_function_body: true });
+    fs.block_stack.push(BlockEntry { saved_nlocals, has_upval: false, is_function_body: true });
 
     let is_last = block_follow(fs, true);
     if !is_last {
@@ -1569,7 +1683,16 @@ fn parse_chunk(fs: &mut FuncState) {
 
     // Leave function body block (like C's leaveblock for the function body block).
     // Don't generate CLOSE because this is the function body block (previous=NULL in C).
+    let has_upval = fs.current_block_has_upval();
     fs.block_stack.pop();
+    // Solve gotos for the function body block (like C's solvegotos in leaveblock)
+    solve_gotos_for_block(fs, saved_nlabels, saved_nlocals, has_upval);
+    // Check for unresolved gotos (like C's leaveblock: if bl->previous==NULL && pending gotos)
+    if !fs.gotos.is_empty() {
+        // There are unresolved gotos - this is an error
+        let gt = &fs.gotos[0];
+        fs.errors.push(format!("{}: no visible label '{}' for goto", gt.line, gt.name));
+    }
     // Deactivate any remaining variables (shouldn't be any, but just in case)
     for local in &mut fs.locals[saved_nlocals..] {
         local.active = false;
@@ -1583,8 +1706,7 @@ fn parse_chunk(fs: &mut FuncState) {
 fn parse_block(fs: &mut FuncState) {
     let saved_nlocals = fs.locals.len();
     let saved_nlabels = fs.labels.len();
-    let saved_nactvar = fs.nactvar_count_at(saved_nlocals);
-    fs.block_stack.push(BlockEntry { saved_nlocals, saved_nactvar, has_upval: false, is_function_body: false });
+    fs.block_stack.push(BlockEntry { saved_nlocals, has_upval: false, is_function_body: false });
 
     parse_chunk_stmts(fs);
 
@@ -1597,8 +1719,10 @@ fn parse_block(fs: &mut FuncState) {
         fs.code_abc(OpCode::CLOSE, close_reg, 0, 0);
     }
     solve_gotos_for_block(fs, saved_nlabels, saved_nlocals, has_tbc || has_upval);
-    // Like C's removevars: truncate locals array to remove block-local variables
-    fs.locals.truncate(saved_nlocals);
+    // Like C's removevars: deactivate block-local variables
+    for local in &mut fs.locals[saved_nlocals..] {
+        local.active = false;
+    }
     fs.set_freereg(close_reg);
 }
 
@@ -1853,9 +1977,7 @@ fn parse_statement(fs: &mut FuncState) {
             // Use goto mechanism like C does (newgotoentry with ls->brkn)
             let pc = fs.jump();
             fs.code_abc(OpCode::CLOSE, 0, 1, 0);  // placeholder CLOSE (B=1);
-            let nactvar = fs.locals.iter().rev()
-                .filter(|lv| lv.active && lv.kind <= RDKTOCLOSE)
-                .count() as i32;
+            let nactvar = fs.locals.len() as i32;  // like C's fs->nactvar (index)
             fs.gotos.push(GotoDesc {
                 name: "break".to_string(),
                 pc,
@@ -5682,8 +5804,7 @@ fn parse_while(fs: &mut FuncState) {
     // Push outer block (while loop block, like C's enterblock with isloop=1)
     let saved_nlocals = fs.locals.len();
     let saved_nlabels = fs.labels.len();
-    let saved_nactvar = fs.nactvar_count_at(saved_nlocals);
-    fs.block_stack.push(BlockEntry { saved_nlocals, saved_nactvar, has_upval: false, is_function_body: false });
+    fs.block_stack.push(BlockEntry { saved_nlocals, has_upval: false, is_function_body: false });
     fs.set_freereg(entry_freereg);
 
     parse_block(fs);  // inner body block (like C's block(ls))
@@ -5717,7 +5838,7 @@ fn parse_while(fs: &mut FuncState) {
     fs.labels.push(LabelDesc {
         name: "break".to_string(),
         pc: fs.pc,
-        nactvar: fs.nactvar_count_at(saved_nlocals),
+        nactvar: saved_nlocals as i32,
         line: 0,
     });
     fs.patch_breaks(fs.pc);
@@ -5746,14 +5867,12 @@ fn parse_repeat(fs: &mut FuncState) {
     // Push bl1 (loop block, like C's enterblock with isloop=1)
     let bl1_nlocals = fs.locals.len();
     let bl1_nlabels = fs.labels.len();
-    let bl1_nactvar = fs.nactvar_count_at(bl1_nlocals);
-    fs.block_stack.push(BlockEntry { saved_nlocals: bl1_nlocals, saved_nactvar: bl1_nactvar, has_upval: false, is_function_body: false });
+    fs.block_stack.push(BlockEntry { saved_nlocals: bl1_nlocals, has_upval: false, is_function_body: false });
 
     // Push bl2 (scope block, like C's enterblock with isloop=0)
     let bl2_nlocals = fs.locals.len();
     let bl2_nlabels = fs.labels.len();
-    let bl2_nactvar = fs.nactvar_count_at(bl2_nlocals);
-    fs.block_stack.push(BlockEntry { saved_nlocals: bl2_nlocals, saved_nactvar: bl2_nactvar, has_upval: false, is_function_body: false });
+    fs.block_stack.push(BlockEntry { saved_nlocals: bl2_nlocals, has_upval: false, is_function_body: false });
 
     fs.set_freereg(entry_freereg);
     parse_chunk_stmts(fs);  // Like C's statlist(ls)
@@ -5852,7 +5971,7 @@ fn parse_repeat(fs: &mut FuncState) {
     fs.labels.push(LabelDesc {
         name: "break".to_string(),
         pc: fs.pc,
-        nactvar: fs.nactvar_count_at(bl1_nlocals),
+        nactvar: bl1_nlocals as i32,
         line: 0,
     });
     fs.patch_breaks(fs.pc);
@@ -5886,8 +6005,7 @@ fn parse_for(fs: &mut FuncState) {
         // Push forstat block (like C's enterblock in forstat)
         let forstat_nlocals = fs.locals.len();
         let forstat_nlabels = fs.labels.len();
-        let forstat_nactvar = fs.nactvar_count_at(forstat_nlocals);
-        fs.block_stack.push(BlockEntry { saved_nlocals: forstat_nlocals, saved_nactvar: forstat_nactvar, has_upval: false, is_function_body: false });
+        fs.block_stack.push(BlockEntry { saved_nlocals: forstat_nlocals, has_upval: false, is_function_body: false });
 
         fs.set_freereg(base);
         let ei = parse_expr(fs);
@@ -5938,8 +6056,7 @@ fn parse_for(fs: &mut FuncState) {
         // Like C's forbody: enterblock BEFORE activating the loop variable
         let body_nlocals = fs.locals.len();  // Only 2 "(for state)" vars at this point
         let body_nlabels = fs.labels.len();
-        let body_nactvar = fs.nactvar_count_at(body_nlocals);
-        fs.block_stack.push(BlockEntry { saved_nlocals: body_nlocals, saved_nactvar: body_nactvar, has_upval: false, is_function_body: false });
+        fs.block_stack.push(BlockEntry { saved_nlocals: body_nlocals, has_upval: false, is_function_body: false });
 
         // Like C's adjustlocalvars(ls, nvars): activate loop variable INSIDE body block
         fs.add_local_kind_reg(&name, fs.pc, RDKCONST, base + 2);
@@ -5956,25 +6073,18 @@ fn parse_for(fs: &mut FuncState) {
             fs.code_abc(OpCode::CLOSE, body_close_reg, 0, 0);
         }
         solve_gotos_for_block(fs, body_nlabels, body_nlocals, body_has_tbc || has_body_upval);
-        // Like C's leaveblock: truncate locals and set freereg
-        fs.locals.truncate(body_nlocals);
+        // Like C's leaveblock: deactivate variables and set freereg
+        for local in &mut fs.locals[body_nlocals..] {
+            local.active = false;
+        }
         fs.set_freereg(body_close_reg);
 
         fs.fix_jump(prep, fs.pc, false);
         let loop_pc = fs.code_abx(OpCode::FORLOOP, base, 0);
         fs.fix_jump(loop_pc, prep + 1, true);
 
-        // Create break label at forstat exit point
-        fs.labels.push(LabelDesc {
-            name: "break".to_string(),
-            pc: fs.pc,
-            nactvar: fs.nactvar_count_at(forstat_nlocals),
-            line: 0,
-        });
-        fs.patch_breaks(fs.pc);
-        fs.break_list = saved_breaklist;
-
         // Handle forstat block exit (like C's leaveblock for forstat) [NUMERIC FOR]
+        // C order: 1) CLOSE  2) createlabel(break)  3) solvegotos
         let has_forstat_upval = fs.current_block_has_upval();
         let forstat_has_tbc = fs.locals[forstat_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
         let forstat_close_reg = fs.nvarstack_up_to(forstat_nlocals);
@@ -5982,6 +6092,17 @@ fn parse_for(fs: &mut FuncState) {
         if has_forstat_upval || forstat_has_tbc {
             fs.code_abc(OpCode::CLOSE, forstat_close_reg, 0, 0);
         }
+
+        // Create break label AFTER forstat CLOSE (like C's createlabel after CLOSE)
+        fs.labels.push(LabelDesc {
+            name: "break".to_string(),
+            pc: fs.pc,
+            nactvar: forstat_nlocals as i32,
+            line: 0,
+        });
+        fs.patch_breaks(fs.pc);
+        fs.break_list = saved_breaklist;
+
         solve_gotos_for_block(fs, forstat_nlabels, forstat_nlocals, has_forstat_upval || forstat_has_tbc);
 
         for local in &mut fs.locals[forstat_nlocals..] {
@@ -6004,8 +6125,7 @@ fn parse_for(fs: &mut FuncState) {
         // Push forstat block (like C's enterblock in forstat)
         let forstat_nlocals = fs.locals.len();
         let forstat_nlabels = fs.labels.len();
-        let forstat_nactvar = fs.nactvar_count_at(forstat_nlocals);
-        fs.block_stack.push(BlockEntry { saved_nlocals: forstat_nlocals, saved_nactvar: forstat_nactvar, has_upval: false, is_function_body: false });
+        fs.block_stack.push(BlockEntry { saved_nlocals: forstat_nlocals, has_upval: false, is_function_body: false });
         
         // Like C's forlist: declare all variables, but only activate the 3 internal
         // ones before expression parsing. User-declared variables are activated inside
@@ -6016,6 +6136,7 @@ fn parse_for(fs: &mut FuncState) {
         let ncontrol = vars.len() as i32;
         // Add user-declared variables as INACTIVE (they'll be activated inside body block)
         for var_name in &vars {
+            let vidx = fs.locals.len() as i32;
             fs.locals.push(LocalVar {
                 name: var_name.clone(),
                 start_pc: fs.pc,
@@ -6025,6 +6146,7 @@ fn parse_for(fs: &mut FuncState) {
                 ctc_kind: None,
                 ctc_info: None,
                 ctc_str: None,
+                vidx,
             });
         }
         // Deactivate internal variables too during expression parsing
@@ -6086,8 +6208,7 @@ fn parse_for(fs: &mut FuncState) {
         // body_nlocals = forstat_nlocals + 3 (only the 3 internal variables)
         let body_nlocals = fs.locals.len() - vars.len();  // Exclude user-declared vars
         let body_nlabels = fs.labels.len();
-        let body_nactvar = fs.nactvar_count_at(body_nlocals);
-        fs.block_stack.push(BlockEntry { saved_nlocals: body_nlocals, saved_nactvar: body_nactvar, has_upval: false, is_function_body: false });
+        fs.block_stack.push(BlockEntry { saved_nlocals: body_nlocals, has_upval: false, is_function_body: false });
 
         // Like C's adjustlocalvars(ls, nvars): activate user-declared variables INSIDE body block
         // Also assign registers to them (like C's luaK_reserveregs)
@@ -6119,19 +6240,8 @@ fn parse_for(fs: &mut FuncState) {
         let loop_pc = fs.code_abx(OpCode::TFORLOOP, base, 0);
         fs.fix_jump(loop_pc, prep + 1, true);
 
-        // Create break label at forstat exit point
-        fs.labels.push(LabelDesc {
-            name: "break".to_string(),
-            pc: fs.pc,
-            nactvar: fs.nactvar_count_at(forstat_nlocals),
-            line: 0,
-        });
-        fs.patch_breaks(fs.pc);
-        fs.break_list = saved_breaklist;
-
-        expect(fs, &Token::End);
-        
-        // Handle forstat block exit (like C's leaveblock for forstat)
+        // Handle forstat block exit (like C's leaveblock for forstat) [GENERIC FOR]
+        // C order: 1) CLOSE  2) createlabel(break)  3) solvegotos
         let has_forstat_upval = fs.current_block_has_upval();
         let forstat_has_tbc = fs.locals[forstat_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
         let forstat_close_reg = fs.nvarstack_up_to(forstat_nlocals);
@@ -6139,9 +6249,24 @@ fn parse_for(fs: &mut FuncState) {
         if has_forstat_upval || forstat_has_tbc {
             fs.code_abc(OpCode::CLOSE, forstat_close_reg, 0, 0);
         }
+
+        // Create break label AFTER forstat CLOSE (like C's createlabel after CLOSE)
+        fs.labels.push(LabelDesc {
+            name: "break".to_string(),
+            pc: fs.pc,
+            nactvar: forstat_nlocals as i32,
+            line: 0,
+        });
+        fs.patch_breaks(fs.pc);
+        fs.break_list = saved_breaklist;
+
+        expect(fs, &Token::End);
+
         solve_gotos_for_block(fs, forstat_nlabels, forstat_nlocals, has_forstat_upval || forstat_has_tbc);
+        for local in &mut fs.locals[forstat_nlocals..] {
+            local.active = false;
+        }
         fs.set_freereg(forstat_close_reg);
-        fs.locals.truncate(forstat_nlocals);
     }
 }
 
@@ -6359,6 +6484,7 @@ fn parse_local(fs: &mut FuncState) {
                     None
                 };
                 let ctc_info = if last_e.kind == ExpKind::Str { 0 } else { last_e.info };
+                let vidx = fs.locals.len() as i32;
                 fs.locals.push(LocalVar {
                     name: names[nvars - 1].clone(),
                     start_pc: pc,
@@ -6368,6 +6494,7 @@ fn parse_local(fs: &mut FuncState) {
                     ctc_kind: Some(last_e.kind.clone()),
                     ctc_info: Some(ctc_info),
                     ctc_str,
+                    vidx,
                 });
             }
 
@@ -6402,6 +6529,7 @@ fn parse_local(fs: &mut FuncState) {
 }
 
 /// ANTLR4: `'return' explist? (';')? ;`
+/// Matches C's retstat: when nret > 1, all values must go to the top of the stack.
 fn parse_return(fs: &mut FuncState) {
     fs.ls_mut().next();
     if block_follow(fs, true) || check(fs, &Token::Semi) {
@@ -6411,14 +6539,18 @@ fn parse_return(fs: &mut FuncState) {
         return;
     }
     
+    let first = fs.nvarstack();
     let ei = parse_expr(fs);
-    let r = fs.exp_to_reg(&ei.exp);
 
     if check(fs, &Token::Comma) {
         fs.ls_mut().next();
+        // Multiple return values: force first expression to next reg (like C's luaK_exp2nextreg)
+        fs.exp_to_next_reg(&ei.exp);
         let nret = 1 + parse_expr_list(fs);
-        fs.return_stat_gen(r, nret);
+        fs.return_stat_gen(first, nret);
     } else {
+        // Single return value: can use original slot (like C's luaK_exp2anyreg)
+        let r = fs.exp_to_reg(&ei.exp);
         fs.return_stat_gen(r, 1);
     }
     fs.set_freereg(fs.nvarstack());
@@ -6426,16 +6558,20 @@ fn parse_return(fs: &mut FuncState) {
 }
 
 /// ANTLR4: `explist: expr (',' expr)* ;` — 解析逗号分隔的表达式列表
+/// Matches C's explist: force each expression to next reg before parsing the next one.
+/// The last expression is NOT forced (caller decides).
 fn parse_expr_list(fs: &mut FuncState) -> i32 {
-    let ei = parse_expr(fs);
-    let _r = fs.expr_to_reg(&ei.exp);
+    let mut ei = parse_expr(fs);
     let mut n = 1;
     while check(fs, &Token::Comma) {
         fs.ls_mut().next();
-        let ei2 = parse_expr(fs);
-        let _r2 = fs.expr_to_reg(&ei2.exp);
+        // Force previous expression to next reg (like C's luaK_exp2nextreg in explist)
+        fs.exp_to_next_reg(&ei.exp);
+        ei = parse_expr(fs);
         n += 1;
     }
+    // Force the last expression to next reg too (for return context, caller handles this)
+    fs.exp_to_next_reg(&ei.exp);
     n
 }
 
@@ -6667,6 +6803,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     expect(fs, &Token::RParen);
     
     let mut new_fs = FuncState::new(fs.ls_mut());
+    new_fs.prev = fs as *mut FuncState;  // like C's fs->prev = ls->fs
     new_fs.proto.num_params = n_params;
     if is_vararg {
         new_fs.proto.flag = PF_VAHID;
@@ -6681,26 +6818,54 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
         }
     }
 
-    for local in &fs.locals {
+    for (i, local) in fs.locals.iter().enumerate() {
         if local.active && local.kind <= RDKTOCLOSE {
-            new_fs.parent_locals.push((local.name.clone(), local.reg));
+            new_fs.parent_locals.push(ParentVar {
+                name: local.name.clone(),
+                is_local: true,
+                reg: local.reg,
+                local_idx: i,
+                upval_idx: 0,
+            });
         }
     }
-    new_fs.parent_locals.extend(fs.parent_locals.iter().cloned());
+    // Inherit grandparent variables as is_local=false.
+    // upval_idx will be resolved lazily in find_upvalue.
+    for gp_var in fs.parent_locals.iter() {
+        new_fs.parent_locals.push(ParentVar {
+            name: gp_var.name.clone(),
+            is_local: false,
+            reg: 0,
+            local_idx: 0,
+            upval_idx: 0,
+        });
+    }
 
     parse_chunk(&mut new_fs);
     expect(&mut new_fs, &Token::End);
 
-    // Like C's markupval: for each in_stack upvalue captured by the child,
-    // mark the parent's block that contains that variable as needing CLOSE.
+    // Like C's markupval: for each upvalue captured by the child,
+    // mark the appropriate block as needing CLOSE.
+    // For in_stack upvalues: mark the parent's block containing the local variable.
+    // For !in_stack upvalues: mark the parent's block (since the parent also has
+    // an upvalue that needs closing), and recursively mark ancestor blocks.
     for uv in &new_fs.proto.upvalues {
         if uv.in_stack {
-            let reg = uv.idx as i32;
-            let var_idx = fs.locals.iter()
-                .position(|lv| lv.active && lv.reg == reg && lv.kind <= RDKTOCLOSE);
-            if let Some(idx) = var_idx {
-                fs.mark_block_upval(idx);
+            let local_idx = uv.parent_local_idx;
+            let is_active = local_idx < fs.locals.len() && fs.locals[local_idx].active;
+            if is_active {
+                fs.mark_block_upval(local_idx);
             }
+        } else {
+            // in_stack=false: the parent also has an upvalue for this variable.
+            // We need to mark the parent's block. Since we don't have a specific
+            // local_idx, we mark based on the upvalue chain.
+            // In C, singlevaraux calls markupval at each level when recursing.
+            // The parent has an upvalue, so its block needs to be marked.
+            // We use a simple heuristic: mark the current innermost non-function block.
+            fs.mark_block_for_upval();
+            // Also recursively mark ancestor functions' blocks
+            fs.mark_ancestor_blocks_for_upval(uv.idx as usize);
         }
     }
 

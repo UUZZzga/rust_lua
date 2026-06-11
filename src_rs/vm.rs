@@ -2473,7 +2473,7 @@ mod tests {
             constants: vec![],
             code: vec![],
             protos: vec![],
-            upvalues: vec![UpvalDesc { in_stack: true, idx: 0, name: None }],
+            upvalues: vec![UpvalDesc { in_stack: true, idx: 0, name: None, parent_local_idx: 0 }],
             line_info: vec![],
             abs_line_info: vec![],
             loc_vars: vec![],
