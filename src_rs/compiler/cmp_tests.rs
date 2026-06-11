@@ -1151,4 +1151,64 @@ do
 end
 "#, None);
     }
+
+    #[test]
+    fn test_goto_out_of_nested_generic_for_with_tbc() {
+        // goto jumping out of nested generic for loops with to-be-closed variables.
+        // The inner for loop's closing variable must be properly closed.
+        // Previous bug: reglevel didn't skip inactive variables from exited blocks,
+        // causing CLOSE operand to be too large (e.g., CLOSE 29 instead of CLOSE 26).
+        let source = r#"
+local func2close = function(f)
+  return setmetatable({}, {__close = f})
+end
+local numopen = 0
+local function open(x)
+  numopen = numopen + 1
+  return function() x = x - 1; if x > 0 then return x end end,
+         nil, nil,
+         func2close(function() numopen = numopen - 1 end)
+end
+do
+  local s = 0
+  for i in open(10) do
+    for j in open(10) do
+       if i + j < 5 then goto endloop end
+       s = s + i
+    end
+  end
+  ::endloop::
+end
+"#;
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn test_goto_out_of_nested_generic_for_with_prior_block() {
+        // Variant: a prior do-block creates inactive locals in the Vec,
+        // which reglevel must skip when computing CLOSE operand for goto.
+        let source = r#"
+local func2close = function(f)
+  return setmetatable({}, {__close = f})
+end
+do
+  local x = 1
+  do local y = 2 end
+  local function open(n)
+    return function() n = n - 1; if n > 0 then return n end end,
+           nil, nil,
+           func2close(function() end)
+  end
+  local s = 0
+  for i in open(5) do
+    for j in open(5) do
+      if i + j < 3 then goto endloop end
+      s = s + i
+    end
+  end
+  ::endloop::
+end
+"#;
+        assert_inst_match(source, None);
+    }
 }

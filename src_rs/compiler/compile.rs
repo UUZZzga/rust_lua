@@ -1322,11 +1322,12 @@ impl FuncState {
 
     /// 将变量索引 nvar 转换为寄存器层级（对应 C 的 reglevel）
     /// C 的 reglevel 从 nvar-1 向下迭代到 0，找到第一个 varinreg 的变量
-    /// 不检查 active 状态：C 的紧凑数组中 0..nactvar 的所有变量都"活跃"，
-    /// Rust 的 locals 数组中有 inactive 变量，但 CLOSE 指令参数需要匹配 C 的行为
+    /// C 的紧凑数组中 0..nactvar 的所有变量都"活跃"，但 Rust 的 locals 数组中
+    /// 有 inactive 变量（已退出块的变量仍保留在 Vec 中），需要跳过它们才能
+    /// 得到正确的寄存器层级，否则会找到已退出块的变量返回错误的 reg+1。
     fn reglevel(&self, nvar: i32) -> i32 {
         for i in (0..nvar as usize).rev() {
-            if i < self.locals.len() && self.locals[i].kind <= RDKTOCLOSE {
+            if i < self.locals.len() && self.locals[i].active && self.locals[i].kind <= RDKTOCLOSE {
                 return self.locals[i].reg + 1;
             }
         }
@@ -1542,17 +1543,23 @@ fn find_label_from(fs: &FuncState, name: &str, start_idx: usize) -> Option<usize
     None
 }
 
-/// 创建标签
-fn create_label(fs: &mut FuncState, name: &str, line: i32) {
+/// 创建标签 (like C's createlabel)
+/// `last`: whether the label is the last non-op statement in its block.
+/// When true, locals are assumed to already be out of scope, so nactvar
+/// is set to the block's entry level (bl->nactvar), not the current level.
+fn create_label(fs: &mut FuncState, name: &str, line: i32, last: bool) {
     let pc = fs.get_label();
     fs.lasttarget = fs.pc;  // mark label position as jump target (like luaK_getlabel)
-    // Use block_stack to get the outer block's saved_nlocals as nactvar index
-    // (like C's bl->nactvar, which is the nactvar at block entry)
-    let nactvar = if let Some(blk) = fs.block_stack.last() {
-        blk.saved_nlocals as i32
-    } else {
-        fs.locals.len() as i32
-    };
+    // C's newlabelentry uses ls->fs->nactvar (current count of active variables
+    // at label creation time). In Rust, fs.locals.len() is the equivalent.
+    let mut nactvar = fs.locals.len() as i32;
+    if last {
+        // C's createlabel: "assume that locals are already out of scope"
+        // Use the block's nactvar (saved_nlocals) instead of current level.
+        if let Some(blk) = fs.block_stack.last() {
+            nactvar = blk.saved_nlocals as i32;
+        }
+    }
 
     fs.labels.push(LabelDesc {
         name: name.to_string(),
@@ -1560,9 +1567,6 @@ fn create_label(fs: &mut FuncState, name: &str, line: i32) {
         nactvar,
         line,
     });
-    // Don't solve goto here - defer to block exit (like C's solvegotos)
-    // so that bup (has_upval) is correctly determined
-
 }
 
 /// 解决匹配的 goto：遍历 gotos，找到名字匹配的，修补跳转
@@ -1734,12 +1738,18 @@ fn parse_chunk_stmts(fs: &mut FuncState) {
             return;
         }
         if check(fs, &Token::ColonColon) {
+            let line = fs.ls().lastline;
             fs.ls_mut().next();  // skip '::'
             let name = get_name(fs);
             expect(fs, &Token::ColonColon);  // skip closing '::'
-            create_label(fs, &name, fs.ls().lastline);
-            // skip optional semicolons after label
+            // Like C's labelstat: skip other no-op statements before creating label,
+            // then check if label is last statement in block (block_follow with until=0).
             while check(fs, &Token::Semi) { fs.ls_mut().next(); }
+            while check(fs, &Token::ColonColon) {
+                // nested label statement (no-op)
+                parse_statement(fs);
+            }
+            create_label(fs, &name, line, block_follow(fs, false));
             continue;
         }
         parse_statement(fs);
