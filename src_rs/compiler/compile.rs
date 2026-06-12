@@ -265,6 +265,10 @@ struct ParentVar {
     name: String,
     is_local: bool,       // true = direct parent's local, false = inherited from ancestor
     is_global: bool,      // true = GDKREG/GDKCONST variable (global declaration)
+    is_ctc: bool,         // true = RDKCTC variable (compile-time constant, not an upvalue)
+    ctc_kind: Option<ExpKind>,  // constant kind (for is_ctc)
+    ctc_info: Option<i64>,      // constant info (for is_ctc)
+    ctc_str: Option<String>,    // constant string value (for is_ctc Str)
     // is_local=true:
     reg: i32,             // register in direct parent
     local_idx: usize,     // index in direct parent's locals array
@@ -284,6 +288,14 @@ struct LocalVar {
     ctc_str: Option<String>,
     vidx: i32,  // variable index at declaration time (like C's vidx = nactvar at declaration)
     nactvar: i32, // compact active variable count at declaration time (like C's fs->nactvar)
+}
+
+/// Result of searching for a variable in parent/grandparent scope.
+/// Like C's singlevaraux: VCONST variables are returned as constants,
+/// while VLOCAL/VUPVAL variables create upvalues.
+enum UpvalueOrCtc {
+    Upvalue(i32),
+    CtcConst(ExpDesc),
 }
 
 struct LabelDesc {
@@ -888,15 +900,16 @@ impl FuncState {
     }
 
     /// 在父作用域中查找上值，若找到则创建 UpvalDesc 并返回上值索引
-    /// 匹配 C 的 searchvar 逻辑：遇到 GDKREG/GDKCONST 变量时，
-    /// 名字匹配返回 None（全局变量，不是 upvalue），不匹配则继续搜索；
-    /// 遇到 RDKREG/RDKCONST/RDKTOCLOSE 变量时，名字匹配则创建 upvalue，
-    /// 不匹配则停止搜索。
-    fn find_upvalue(&mut self, name: &str) -> Option<i32> {
+    /// 匹配 C 的 searchvar + singlevaraux 逻辑：
+    /// - 遇到 GDKREG/GDKCONST 变量时，名字匹配返回 None（全局变量，不是 upvalue）
+    /// - 遇到 RDKCTC 变量时，名字匹配返回 CtcConst（编译时常量，不创建 upvalue）
+    ///   对应 C 中 singlevaraux 找到 VCONST 时不创建 upvalue 直接返回
+    /// - 遇到 RDKREG/RDKCONST/RDKTOCLOSE 变量时，名字匹配则创建 upvalue
+    fn find_upvalue(&mut self, name: &str) -> Option<UpvalueOrCtc> {
         for (i, uv) in self.proto.upvalues.iter().enumerate() {
             if let Some(ref n) = uv.name {
                 if n.as_str() == name {
-                    return Some(i as i32);
+                    return Some(UpvalueOrCtc::Upvalue(i as i32));
                 }
             }
         }
@@ -909,6 +922,16 @@ impl FuncState {
                 if pvar.is_global {
                     // Found a matching global declaration: variable is global, not an upvalue
                     return None;
+                }
+                if pvar.is_ctc {
+                    // Found a compile-time constant: like C's singlevaraux returning VCONST,
+                    // don't create an upvalue, return the constant value directly.
+                    let exp = if let Some(ref s) = pvar.ctc_str {
+                        ExpDesc::new_str(s.clone())
+                    } else {
+                        ExpDesc::new(pvar.ctc_kind.clone().unwrap(), pvar.ctc_info.unwrap())
+                    };
+                    return Some(UpvalueOrCtc::CtcConst(exp));
                 }
                 let idx = self.proto.upvalues.len() as i32;
                 let t = crate::strings::StringTable::new();
@@ -937,7 +960,7 @@ impl FuncState {
                 }
                 self.proto.size_upvalues = self.proto.upvalues.len() as i32;
                 let _ = j;
-                return Some(idx);
+                return Some(UpvalueOrCtc::Upvalue(idx));
             }
             // Non-matching variable (global or not): continue searching
             // C's searchvar never stops on non-matching non-global variables
@@ -947,7 +970,7 @@ impl FuncState {
 
     /// Find or create an upvalue in the direct parent function for a variable
     /// inherited from a grandparent. Returns the upvalue index in the parent.
-    /// Returns usize::MAX if the variable is a global declaration (not an upvalue).
+    /// Returns usize::MAX if the variable is a global declaration or CTC constant (not an upvalue).
     fn find_or_create_parent_upvalue(&mut self, name: &str) -> usize {
         let prev = self.prev;
         if prev.is_null() {
@@ -969,6 +992,11 @@ impl FuncState {
             if pvar.name == name {
                 if pvar.is_global {
                     // Found a matching global declaration: not an upvalue
+                    return usize::MAX;
+                }
+                if pvar.is_ctc {
+                    // CTC variables are constants, not upvalues.
+                    // Like C's singlevaraux returning VCONST: don't create upvalue.
                     return usize::MAX;
                 }
                 let t = crate::strings::StringTable::new();
@@ -3294,10 +3322,53 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
             } else if let Some((reg, kind)) = fs.find_local_ex(&name) {
                 let is_vvargvar = kind == RDKVAVAR;
                 PrefixResult { var_name: None, local_idx: Some(reg), key: None, reg: Some(reg), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar, is_readonly: false }
-            } else if let Some(upval_idx) = fs.find_upvalue(&name) {
-                let r = fs.alloc_reg();
-                fs.code_abc(OpCode::GETUPVAL, r, upval_idx, 0);
-                PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: Some(upval_idx), env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
+            } else if let Some(result) = fs.find_upvalue(&name) {
+                match result {
+                    UpvalueOrCtc::Upvalue(upval_idx) => {
+                        let r = fs.alloc_reg();
+                        fs.code_abc(OpCode::GETUPVAL, r, upval_idx, 0);
+                        PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: Some(upval_idx), env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
+                    }
+                    UpvalueOrCtc::CtcConst(mut ctc) => {
+                        // Like find_local_ctc handling: load constant into a register
+                        let r = fs.alloc_reg();
+                        match ctc.kind {
+                            ExpKind::Int => {
+                                let val = ctc.info;
+                                if fits_sbx(val) {
+                                    fs.code_asbx(OpCode::LOADI, r, val as i32);
+                                } else {
+                                    let k = fs.int_k(val);
+                                    fs.code_abx(OpCode::LOADK, r, k);
+                                }
+                            }
+                            ExpKind::Float => {
+                                let f = f64::from_bits(ctc.info as u64);
+                                let k = fs.float_k(f);
+                                fs.code_abx(OpCode::LOADK, r, k);
+                            }
+                            ExpKind::Str => {
+                                let k = fs.discharge_str(&mut ctc);
+                                fs.code_abx(OpCode::LOADK, r, k);
+                            }
+                            ExpKind::Boolean => {
+                                if ctc.info != 0 {
+                                    fs.code_abc(OpCode::LOADTRUE, r, 0, 0);
+                                } else {
+                                    fs.code_abc(OpCode::LOADFALSE, r, 0, 0);
+                                }
+                            }
+                            ExpKind::Nil => {
+                                fs.code_nil(r, 1);
+                            }
+                            _ => {
+                                let k = fs.discharge_str(&mut ctc);
+                                fs.code_abx(OpCode::LOADK, r, k);
+                            }
+                        };
+                        PrefixResult { var_name: None, local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
+                    }
+                }
             } else {
                 let is_env = name == "_ENV";
                 let k = if is_env { 0 } else { fs.string_k(&name) };
@@ -5505,10 +5576,15 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 } else {
                     ExpDesc::new(ExpKind::NonReloc, reg as i64)
                 }
-            } else if let Some(upval_idx) = fs.find_upvalue(&name) {
-                let r = fs.alloc_reg();
-                let pc = fs.code_abc(OpCode::GETUPVAL, r, upval_idx, 0);
-                ExpDesc { kind: ExpKind::NonReloc, info: r as i64, info2: pc, t: NO_JUMP, f: NO_JUMP, str_val: None }
+            } else if let Some(result) = fs.find_upvalue(&name) {
+                match result {
+                    UpvalueOrCtc::Upvalue(upval_idx) => {
+                        let r = fs.alloc_reg();
+                        let pc = fs.code_abc(OpCode::GETUPVAL, r, upval_idx, 0);
+                        ExpDesc { kind: ExpKind::NonReloc, info: r as i64, info2: pc, t: NO_JUMP, f: NO_JUMP, str_val: None }
+                    }
+                    UpvalueOrCtc::CtcConst(ctc) => ctc,
+                }
             } else if name == "_ENV" {
                 if let Some(env_reg) = fs.find_local("_ENV") {
                     ExpDesc::new(ExpKind::NonReloc, env_reg as i64)
@@ -5523,7 +5599,12 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
                     && (k as u32) <= crate::opcodes::MAXINDEXRK;
                 let env_local = fs.find_local("_ENV");
-                let env_upval = if env_local.is_none() { fs.find_upvalue("_ENV") } else { None };
+                let env_upval = if env_local.is_none() {
+                    match fs.find_upvalue("_ENV") {
+                        Some(UpvalueOrCtc::Upvalue(idx)) => Some(idx),
+                        _ => None,
+                    }
+                } else { None };
                 let (r, pc) = if let Some(env_reg) = env_local {
                     // _ENV is a local variable in current function: use GETFIELD
                     if is_short_str {
@@ -7202,10 +7283,15 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     for (i, local) in fs.locals.iter().enumerate() {
         if local.active {
             let is_global = local.kind >= GDKREG;
+            let is_ctc = local.kind == RDKCTC;
             new_fs.parent_locals.push(ParentVar {
                 name: local.name.clone(),
                 is_local: true,
                 is_global,
+                is_ctc,
+                ctc_kind: local.ctc_kind.clone(),
+                ctc_info: local.ctc_info,
+                ctc_str: local.ctc_str.clone(),
                 reg: local.reg,
                 local_idx: i,
                 upval_idx: 0,
@@ -7214,11 +7300,17 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     }
     // Inherit grandparent variables as is_local=false.
     // upval_idx will be resolved lazily in find_upvalue.
+    // CTC info is propagated so that grandchild functions can also
+    // inline the constant value instead of creating upvalues.
     for gp_var in fs.parent_locals.iter() {
         new_fs.parent_locals.push(ParentVar {
             name: gp_var.name.clone(),
             is_local: false,
             is_global: gp_var.is_global,
+            is_ctc: gp_var.is_ctc,
+            ctc_kind: gp_var.ctc_kind.clone(),
+            ctc_info: gp_var.ctc_info,
+            ctc_str: gp_var.ctc_str.clone(),
             reg: 0,
             local_idx: 0,
             upval_idx: 0,

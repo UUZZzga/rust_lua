@@ -682,6 +682,52 @@ end
     }
 
     #[test]
+    fn test_code_lua() {
+        assert_inst_match_file("code.lua");
+    }
+
+    /// Regression test: <const> variables referenced by child functions should NOT
+    /// be captured as upvalues, and should NOT cause extra CLOSE instructions.
+    /// Before the fix, RDKCTC variables in parent_locals were incorrectly treated
+    /// as regular locals, causing find_upvalue to create upvalues for them and
+    /// mark_block_upval to set has_upval=true, which generated extra CLOSE instructions.
+    #[test]
+    fn test_ctc_no_extra_close() {
+        // This is a minimal reproduction of the code.lua string constants test:
+        // local k0 <const> is referenced inside f1, but since it's a <const>,
+        // it should be inlined as a constant, not captured as an upvalue.
+        // The do...end block should NOT generate a CLOSE instruction.
+        assert_inst_match(r#"
+do
+  local k0 <const> = "hello"
+  local function f1 ()
+    local k <const> = k0
+    return function ()
+             return function () return k end
+           end
+  end
+  local f2 = f1()
+  local f3 = f2()
+end
+"#, None);
+    }
+
+    /// Test that <const> integer variables in parent scope are also
+    /// correctly inlined as constants in child functions, not captured as upvalues.
+    #[test]
+    fn test_ctc_int_no_extra_close() {
+        assert_inst_match(r#"
+do
+  local k0 <const> = 42
+  local function f1 ()
+    return function () return k0 end
+  end
+  local f2 = f1()
+end
+"#, None);
+    }
+
+    #[test]
     fn test_goto_lua() {
         assert_inst_match_file_allow_constants("goto.lua");
     }
