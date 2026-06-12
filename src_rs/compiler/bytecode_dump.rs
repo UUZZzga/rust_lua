@@ -526,7 +526,7 @@ fn format_c_comment(inst: &DumpInstruction, constants: &[DumpConstant]) -> Strin
     }
 }
 
-fn dump_inst_to_raw(inst: &DumpInstruction) -> u32 {
+pub fn dump_inst_to_raw(inst: &DumpInstruction) -> u32 {
     let op = OpCode::from_u8(inst.opcode).unwrap_or(OpCode::MOVE);
     let is_vabc = get_opmode(op) == OpMode::IvABC;
     if is_vabc {
@@ -544,16 +544,167 @@ fn dump_inst_to_raw(inst: &DumpInstruction) -> u32 {
     }
 }
 
+/// Normalize an instruction for comparison: replace constant indices with a placeholder.
+/// This allows comparing instruction structure while ignoring differences in constant pool ordering.
+fn normalize_instruction(raw: u32) -> String {
+    let opcode = get_opcode(raw);
+    let a = getarg_a(raw);
+    let b = getarg_b(raw);
+    let c = getarg_c(raw);
+    let k = testarg_k(raw);
+    let bx = getarg_bx(raw);
+    let sbx = getarg_sbx(raw);
+    let sj = getarg_sj(raw);
+    let op_name = OPNAMES[opcode as usize];
+
+    // Use format_operands to get the correct operand formatting,
+    // then replace constant indices with "K".
+    let operands = format_operands(raw, a, b, c, bx, sbx, sj, k);
+
+    // Determine which operands are constant references based on opcode
+    match opcode {
+        // IABx instructions: Bx is always a constant index
+        opcodes::OpCode::LOADK | opcodes::OpCode::CLOSURE | opcodes::OpCode::ERRNNIL
+        | opcodes::OpCode::FORLOOP | opcodes::OpCode::FORPREP
+        | opcodes::OpCode::TFORPREP | opcodes::OpCode::TFORLOOP => {
+            // operands is "A Bx" - replace the Bx part
+            let parts: Vec<&str> = operands.splitn(2, ' ').collect();
+            if parts.len() == 2 {
+                format!("{}\t{} K", op_name, parts[0])
+            } else {
+                format!("{}\t{}", op_name, operands)
+            }
+        }
+        // IABC instructions where B or C can be constant references (ISK bit set)
+        opcodes::OpCode::GETTABUP => {
+            // operands is "A B C" - C is always a constant index (K[C]:shortstring)
+            let parts: Vec<&str> = operands.split(' ').collect();
+            if parts.len() >= 3 {
+                format!("{}\t{} {} K", op_name, parts[0], parts[1])
+            } else {
+                format!("{}\t{}", op_name, operands)
+            }
+        }
+        opcodes::OpCode::GETTABLE | opcodes::OpCode::GETI => {
+            // operands is "A B C" - C is register/index for GETTABLE/GETI
+            format!("{}\t{}", op_name, operands)
+        }
+        opcodes::OpCode::GETFIELD => {
+            // operands is "A B C" - C is always a constant index (K[C]:shortstring)
+            let parts: Vec<&str> = operands.split(' ').collect();
+            if parts.len() >= 3 {
+                format!("{}\t{} {} K", op_name, parts[0], parts[1])
+            } else {
+                format!("{}\t{}", op_name, operands)
+            }
+        }
+        opcodes::OpCode::SETTABUP => {
+            // operands is "A B Ck" - B is always a constant index (K[B]:shortstring), C is RK(C)
+            // When k bit is set, C is a constant index; otherwise it's a register
+            let parts: Vec<&str> = operands.split(' ').collect();
+            if parts.len() >= 3 {
+                let c_norm = if k || c >= 256 { "K" } else { parts[2].trim_end_matches('k') };
+                let k_str = if k { "k" } else { "" };
+                format!("{}\t{} K {}{}", op_name, parts[0], c_norm, k_str)
+            } else {
+                format!("{}\t{}", op_name, operands)
+            }
+        }
+        opcodes::OpCode::SETTABLE | opcodes::OpCode::SETI => {
+            // operands is "A B Ck" - C is RK(C)
+            // When k bit is set, C is a constant index; otherwise it's a register
+            let parts: Vec<&str> = operands.split(' ').collect();
+            if parts.len() >= 3 {
+                let c_norm = if k || c >= 256 { "K" } else { parts[2].trim_end_matches('k') };
+                let k_str = if k { "k" } else { "" };
+                format!("{}\t{} {} {}{}", op_name, parts[0], parts[1], c_norm, k_str)
+            } else {
+                format!("{}\t{}", op_name, operands)
+            }
+        }
+        opcodes::OpCode::SETFIELD => {
+            // operands is "A B Ck" - B is always a constant index (K[B]:shortstring), C is RK(C)
+            // When k bit is set, C is a constant index; otherwise it's a register
+            let parts: Vec<&str> = operands.split(' ').collect();
+            if parts.len() >= 3 {
+                let c_norm = if k || c >= 256 { "K" } else { parts[2].trim_end_matches('k') };
+                let k_str = if k { "k" } else { "" };
+                format!("{}\t{} K {}{}", op_name, parts[0], c_norm, k_str)
+            } else {
+                format!("{}\t{}", op_name, operands)
+            }
+        }
+        opcodes::OpCode::SELF => {
+            // operands is "A B Ck" - C is always a constant index (K[C]:shortstring)
+            let parts: Vec<&str> = operands.split(' ').collect();
+            if parts.len() >= 3 {
+                let k_str = if k { "k" } else { "" };
+                format!("{}\t{} {} K{}", op_name, parts[0], parts[1], k_str)
+            } else {
+                format!("{}\t{}", op_name, operands)
+            }
+        }
+        opcodes::OpCode::ADDK | opcodes::OpCode::SUBK | opcodes::OpCode::MULK
+        | opcodes::OpCode::MODK | opcodes::OpCode::POWK | opcodes::OpCode::DIVK
+        | opcodes::OpCode::IDIVK | opcodes::OpCode::BANDK | opcodes::OpCode::BORK
+        | opcodes::OpCode::BXORK => {
+            // operands is "A B C" - C is always a constant index
+            let parts: Vec<&str> = operands.split(' ').collect();
+            if parts.len() >= 3 {
+                format!("{}\t{} {} K", op_name, parts[0], parts[1])
+            } else {
+                format!("{}\t{}", op_name, operands)
+            }
+        }
+        opcodes::OpCode::EQK => {
+            // operands is "A B k" - B is always a constant index
+            let parts: Vec<&str> = operands.split(' ').collect();
+            if parts.len() >= 2 {
+                let k_str = if k { "k" } else { "" };
+                format!("{}\t{} K {}", op_name, parts[0], k_str)
+            } else {
+                format!("{}\t{}", op_name, operands)
+            }
+        }
+        opcodes::OpCode::MMBINK => {
+            // operands is "A B C k" - B is always a constant index (K[B])
+            let parts: Vec<&str> = operands.split(' ').collect();
+            if parts.len() >= 3 {
+                let k_str = if k { "k" } else { "" };
+                format!("{}\t{} K {} {}", op_name, parts[0], parts[2].trim_end_matches('k'), k_str)
+            } else {
+                format!("{}\t{}", op_name, operands)
+            }
+        }
+        opcodes::OpCode::NEWTABLE => {
+            // operands is "A vb vc k" - vb and vc are not constant indices
+            format!("{}\t{}", op_name, operands)
+        }
+        opcodes::OpCode::SETLIST => {
+            // operands is "A vb vc k" - not constant indices
+            format!("{}\t{}", op_name, operands)
+        }
+        opcodes::OpCode::VARARG => {
+            // operands is "A B C k" - not constant indices
+            format!("{}\t{}", op_name, operands)
+        }
+        // IAx instructions
+        opcodes::OpCode::EXTRAARG => {
+            format!("{}\tK", op_name)
+        }
+        // All other instructions: use format_operands as-is (no constant indices)
+        _ => {
+            format!("{}\t{}", op_name, operands)
+        }
+    }
+}
+
 pub fn compare_instructions(rust_code: &[u32], c_code: &[DumpInstruction]) -> Vec<String> {
     let mut diffs = Vec::new();
 
     let rust_formatted: Vec<String> = rust_code
         .iter()
-        .enumerate()
-        .map(|(_i, &raw)| {
-            let formatted = format_instruction(raw);
-            formatted
-        })
+        .map(|&raw| format_instruction(raw))
         .collect();
 
     let c_formatted: Vec<String> = c_code
@@ -561,8 +712,19 @@ pub fn compare_instructions(rust_code: &[u32], c_code: &[DumpInstruction]) -> Ve
         .map(|inst| format_instruction(dump_inst_to_raw(inst)))
         .collect();
 
-    let rust_str = rust_formatted.join("\n");
-    let c_str = c_formatted.join("\n");
+    let rust_normalized: Vec<String> = rust_code
+        .iter()
+        .map(|&raw| normalize_instruction(raw))
+        .collect();
+
+    let c_normalized: Vec<String> = c_code
+        .iter()
+        .map(|inst| normalize_instruction(dump_inst_to_raw(inst)))
+        .collect();
+
+    // Use text diff on normalized instructions to find structural differences
+    let rust_str = rust_normalized.join("\n");
+    let c_str = c_normalized.join("\n");
     let input = InternedInput::new(rust_str.as_str(), c_str.as_str());
     let diff = Diff::compute(Algorithm::Myers, &input);
 

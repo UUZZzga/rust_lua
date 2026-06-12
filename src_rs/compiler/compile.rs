@@ -264,6 +264,7 @@ impl ExpDesc {
 struct ParentVar {
     name: String,
     is_local: bool,       // true = direct parent's local, false = inherited from ancestor
+    is_global: bool,      // true = GDKREG/GDKCONST variable (global declaration)
     // is_local=true:
     reg: i32,             // register in direct parent
     local_idx: usize,     // index in direct parent's locals array
@@ -282,12 +283,15 @@ struct LocalVar {
     ctc_info: Option<i64>,
     ctc_str: Option<String>,
     vidx: i32,  // variable index at declaration time (like C's vidx = nactvar at declaration)
+    nactvar: i32, // compact active variable count at declaration time (like C's fs->nactvar)
 }
 
 struct LabelDesc {
     name: String,
     pc: i32,       // label 位置（跳转目标）
-    nactvar: i32,  // label 处的 locals 索引（对应 C 的 bl->nactvar，在紧凑数组中索引=计数）
+    nactvar: i32,  // label 处的活跃变量计数（对应 C 的 bl->nactvar）
+    nlocals: usize, // label 处的 locals 数组长度（等价于 C 的 nactvar 作为紧凑数组索引）
+    reglevel: i32, // label 处的寄存器级别（对应 C 的 reglevel(fs, nactvar)）
     line: i32,
 }
 
@@ -295,7 +299,9 @@ struct GotoDesc {
     name: String,
     pc: i32,       // JMP 指令的 pc
     line: i32,
-    nactvar: i32,  // goto 处的 locals 索引（对应 C 的 fs->nactvar）
+    nactvar: i32,  // goto 处的活跃变量计数（对应 C 的 fs->nactvar）
+    nlocals: usize, // goto 处的 locals 数组长度（等价于 C 的 nactvar 作为紧凑数组索引）
+    reglevel: i32, // goto 处的寄存器级别
     close: bool,   // 是否需要 CLOSE
 }
 
@@ -303,8 +309,11 @@ struct GotoDesc {
 #[derive(Clone, Copy)]
 struct BlockEntry {
     saved_nlocals: usize,   // locals index at block entry (like C's bl->nactvar in compact array)
+    saved_ngotos: usize,    // gotos index at block entry (like C's bl->firstgoto)
     has_upval: bool,        // like C's bl->upval
     is_function_body: bool, // true for the function body block (C's bl->previous==NULL)
+    nactvar: i32,           // active variable count at block entry (like C's bl->nactvar)
+    reglevel: i32,          // register level at block entry (like C's reglevel(fs, bl->nactvar))
 }
 
 // ============================================================================
@@ -774,6 +783,7 @@ impl FuncState {
     fn add_local(&mut self, name: &str, start_pc: i32) -> i32 {
         let reg = self.alloc_reg();
         let vidx = self.locals.len() as i32;
+        let nactvar = self.active_nactvar();
         self.locals.push(LocalVar {
             name: name.to_string(),
             start_pc,
@@ -784,6 +794,7 @@ impl FuncState {
             ctc_info: None,
             ctc_str: None,
             vidx,
+            nactvar,
         });
         reg
     }
@@ -797,6 +808,7 @@ impl FuncState {
             0
         };
         let vidx = self.locals.len() as i32;
+        let nactvar = self.active_nactvar();
         self.locals.push(LocalVar {
             name: name.to_string(),
             start_pc,
@@ -807,6 +819,7 @@ impl FuncState {
             ctc_info: None,
             ctc_str: None,
             vidx,
+            nactvar,
         });
         // Like C's marktobeclosed: mark current block as needing CLOSE
         if kind == RDKTOCLOSE {
@@ -821,6 +834,7 @@ impl FuncState {
     /// 添加指定寄存器的局部变量
     fn add_local_kind_reg(&mut self, name: &str, start_pc: i32, kind: i32, reg: i32) {
         let vidx = self.locals.len() as i32;
+        let nactvar = self.active_nactvar();
         self.locals.push(LocalVar {
             name: name.to_string(),
             start_pc,
@@ -831,6 +845,7 @@ impl FuncState {
             ctc_info: None,
             ctc_str: None,
             vidx,
+            nactvar,
         });
     }
 
@@ -873,6 +888,10 @@ impl FuncState {
     }
 
     /// 在父作用域中查找上值，若找到则创建 UpvalDesc 并返回上值索引
+    /// 匹配 C 的 searchvar 逻辑：遇到 GDKREG/GDKCONST 变量时，
+    /// 名字匹配返回 None（全局变量，不是 upvalue），不匹配则继续搜索；
+    /// 遇到 RDKREG/RDKCONST/RDKTOCLOSE 变量时，名字匹配则创建 upvalue，
+    /// 不匹配则停止搜索。
     fn find_upvalue(&mut self, name: &str) -> Option<i32> {
         for (i, uv) in self.proto.upvalues.iter().enumerate() {
             if let Some(ref n) = uv.name {
@@ -883,8 +902,14 @@ impl FuncState {
         }
         // Search from the end (like C's searchvar which searches from nactvar-1 down)
         // to find the innermost variable with the given name.
+        // C's searchvar does NOT stop on non-matching non-global variables;
+        // it continues searching until it finds a match or exhausts all variables.
         for (j, pvar) in self.parent_locals.iter().enumerate().rev() {
             if pvar.name == name {
+                if pvar.is_global {
+                    // Found a matching global declaration: variable is global, not an upvalue
+                    return None;
+                }
                 let idx = self.proto.upvalues.len() as i32;
                 let t = crate::strings::StringTable::new();
                 let ls = crate::strings::new_lstr(&t, name);
@@ -898,29 +923,31 @@ impl FuncState {
                     });
                 } else {
                     // Variable is inherited from a grandparent function.
-                    // We need to find or create the corresponding upvalue in the
-                    // direct parent first, then reference it as in_stack=false.
-                    // Since we can't access the parent's FuncState here (it's in self.prev),
-                    // we search the parent's existing upvalues by name.
-                    // The parent's upvalues are accessible through self.prev.
                     let parent_upval_idx = self.find_or_create_parent_upvalue(name);
+                    if parent_upval_idx == usize::MAX {
+                        // Variable is a global declaration in an ancestor: not an upvalue
+                        return None;
+                    }
                     self.proto.upvalues.push(crate::objects::UpvalDesc {
                         name: Some(ls),
                         in_stack: false,
                         idx: parent_upval_idx as u8,
-                        parent_local_idx: 0, // not applicable for in_stack=false
+                        parent_local_idx: 0,
                     });
                 }
                 self.proto.size_upvalues = self.proto.upvalues.len() as i32;
-                let _ = j; // index for potential future use
+                let _ = j;
                 return Some(idx);
             }
+            // Non-matching variable (global or not): continue searching
+            // C's searchvar never stops on non-matching non-global variables
         }
         None
     }
 
     /// Find or create an upvalue in the direct parent function for a variable
     /// inherited from a grandparent. Returns the upvalue index in the parent.
+    /// Returns usize::MAX if the variable is a global declaration (not an upvalue).
     fn find_or_create_parent_upvalue(&mut self, name: &str) -> usize {
         let prev = self.prev;
         if prev.is_null() {
@@ -937,9 +964,13 @@ impl FuncState {
                 }
             }
         }
-        // Search parent_locals for the variable
+        // Search parent_locals for the variable (like C's searchvar)
         for (j, pvar) in prev.parent_locals.iter().enumerate().rev() {
             if pvar.name == name {
+                if pvar.is_global {
+                    // Found a matching global declaration: not an upvalue
+                    return usize::MAX;
+                }
                 let t = crate::strings::StringTable::new();
                 let ls = crate::strings::new_lstr(&t, name);
                 let idx = prev.proto.upvalues.len();
@@ -954,6 +985,9 @@ impl FuncState {
                     // The parent also inherited this from its grandparent.
                     // We need to recursively create upvalues up the chain.
                     let grandparent_upval_idx = prev.find_or_create_parent_upvalue(name);
+                    if grandparent_upval_idx == usize::MAX {
+                        return usize::MAX;
+                    }
                     prev.proto.upvalues.push(crate::objects::UpvalDesc {
                         name: Some(ls),
                         in_stack: false,
@@ -964,20 +998,71 @@ impl FuncState {
                 prev.proto.size_upvalues = prev.proto.upvalues.len() as i32;
                 return idx;
             }
+            // Non-matching variable (global or not): continue searching
+            // C's searchvar never stops on non-matching non-global variables
         }
         // Should not happen if the variable exists somewhere in the chain
         0
     }
 
     /// 查找局部变量并返回 (寄存器号, 种类)
-    /// 跳过 GDKREG/GDKCONST 类型的变量（它们应作为全局变量处理）
+    /// 匹配 C 的 searchvar 逻辑：遇到 GDKREG/GDKCONST 变量时，
+    /// 如果名字匹配则不继续搜索（返回 None 表示是全局变量）。
+    /// 遇到 global * 时不停止搜索，继续查找 local 变量。
     fn find_local_ex(&self, name: &str) -> Option<(i32, i32)> {
         for lv in self.locals.iter().rev() {
-            if lv.active && lv.name == name && lv.kind <= RDKTOCLOSE {
+            if !lv.active { continue; }
+            if lv.kind >= GDKREG {
+                // global declaration: if name matches, stop searching
+                // (the variable is global, not local)
+                if lv.name == name {
+                    return None;  // found named global declaration, not a local
+                }
+                // global * or non-matching named global: continue searching
+            } else if lv.name == name && lv.kind <= RDKTOCLOSE {
                 return Some((lv.reg, lv.kind));
             }
         }
         None
+    }
+
+    /// 搜索 global 声明，匹配 C 的 searchvar 逻辑。
+    /// 返回：
+    ///   Some(kind) - 找到匹配的 global 变量（GDKREG 或 GDKCONST）
+    ///   None - 没有找到匹配的 global 声明
+    ///   如果遇到 global * 但名字不匹配，会设置 global_star_active
+    fn find_global_decl(&self, name: &str) -> Option<i32> {
+        let mut global_star_active = false;
+        for lv in self.locals.iter().rev() {
+            if !lv.active { continue; }
+            if lv.kind >= GDKREG {
+                // global declaration
+                if lv.name == "(global *)" {
+                    // collective declaration (global *)
+                    if !global_star_active {
+                        global_star_active = true;
+                    }
+                } else if lv.name == name {
+                    // named global declaration matches
+                    return Some(lv.kind);
+                } else {
+                    // named global declaration doesn't match:
+                    // invalidate any previous global * declaration
+                    // (C: var->u.info = -2)
+                    global_star_active = false;
+                }
+            } else {
+                // non-global variable: stop searching for global declarations
+                // (in C, searchvar returns the local variable before checking globals)
+                break;
+            }
+        }
+        if global_star_active {
+            // global * covers this name
+            Some(GDKREG)
+        } else {
+            None
+        }
     }
 
     /// 获取当前标签位置（即下一个指令的 pc）
@@ -1334,21 +1419,76 @@ impl FuncState {
         0
     }
 
+    /// 计算当前活跃变量的数量（等价于 C 的 fs->nactvar）
+    /// C 中 nactvar 包含所有变量（包括 GDKREG/GDKCONST/RDKCTC），
+    /// 变量离开作用域时通过 removevars 减小。
+    /// Rust 中 locals 是稀疏数组，变量只是标记 active=false 而非移除，
+    /// 所以 locals.len() 包含 inactive 变量，不能直接用作 nactvar。
+    fn active_nactvar(&self) -> i32 {
+        self.locals.iter().filter(|l| l.active).count() as i32
+    }
+
+    /// 将 saved_nlocals（块入口时的 locals.len()）转换为等价的活跃变量计数
+    /// 用于 goto 传播时设置 gt.nactvar（等价于 C 的 gt->nactvar = bl->nactvar）
+    /// C 中 bl->nactvar 是块入口时的 fs->nactvar（活跃变量计数，包含所有变量），
+    /// Rust 中 saved_nlocals 是块入口时的 locals.len()（包含所有变量）。
+    /// 我们需要计算 saved_nlocals 之前有多少活跃变量。
+    fn nactvar_up_to(&self, saved_nlocals: usize) -> i32 {
+        self.locals[..saved_nlocals].iter().filter(|l| l.active).count() as i32
+    }
+
+    /// 给定 locals 数组长度 nlocals，计算对应的寄存器级别
+    /// 等价于 C 的 reglevel(fs, nvar)：遍历 locals[0..nlocals]，
+    /// 从后往前找第一个在寄存器中的变量（varinreg: kind <= RDKTOCLOSE），返回 reg+1。
+    /// 不依赖 active 标志，因为 locals[0..nlocals] 在创建时都是 active 的，
+    /// 即使后来被 deactivate，kind 和 reg 不变。
+    fn reglevel_for_nlocals(&self, nlocals: usize) -> i32 {
+        for i in (0..nlocals).rev() {
+            if self.locals[i].kind <= RDKTOCLOSE {
+                return self.locals[i].reg + 1;
+            }
+        }
+        0
+    }
+
+    /// 给定活跃变量计数 nactvar，计算对应的寄存器级别
+    /// 等价于 C 的 reglevel(fs, nvar)：从前 nvar 个变量中，
+    /// 从后往前找第一个在寄存器中的变量（varinreg: kind <= RDKTOCLOSE），返回 ridx+1。
+    /// C 的 nactvar 包含所有变量（含 GDKREG/GDKCONST），所以这里遍历前 nactvar 个
+    /// active 变量（不限 kind），找最后一个 kind <= RDKTOCLOSE 的变量。
+    fn reglevel_for_nactvar(&self, nactvar: i32) -> i32 {
+        if nactvar == 0 { return 0; }
+        // Collect the first nactvar active variables' indices
+        let mut count = 0;
+        let mut last_in_reg = -1i32;
+        for i in 0..self.locals.len() {
+            if self.locals[i].active {
+                count += 1;
+                if self.locals[i].kind <= RDKTOCLOSE {
+                    last_in_reg = i as i32;
+                }
+                if count == nactvar { break; }
+            }
+        }
+        if last_in_reg >= 0 {
+            self.locals[last_in_reg as usize].reg + 1
+        } else {
+            0
+        }
+    }
+
     // Like C's markupval: mark the block where the variable at the given
     // locals array index was declared as having upvalues.
-    // Uses saved_nlocals (locals array length at block entry) for block identification.
-    // C's markupval uses bl->nactvar which is an index in the compact array;
-    // we use saved_nlocals which is the equivalent index in our sparse array.
-    /// `var_idx` is the index in the `locals` array of the variable being captured.
+    // Uses nactvar (compact active variable count) for block identification,
+    // matching C's markupval which compares bl->nactvar with the variable's vidx.
     fn mark_block_upval(&mut self, var_idx: usize) {
         self.needclose = true;
         // Like C's markupval: find the first block where nactvar <= level.
         // C's 'level' is the variable's vidx (nactvar at declaration time).
-        // In Rust, vidx = locals.len() at declaration time (index in locals array),
-        // and saved_nlocals is the block's nactvar equivalent.
-        let var_vidx = self.locals[var_idx].vidx;
+        // We use the variable's cached nactvar and compare with block's nactvar.
+        let var_nactvar = self.locals[var_idx].nactvar;
         for i in (0..self.block_stack.len()).rev() {
-            if self.block_stack[i].saved_nlocals as i32 <= var_vidx {
+            if self.block_stack[i].nactvar <= var_nactvar {
                 self.block_stack[i].has_upval = true;
                 return;
             }
@@ -1419,6 +1559,17 @@ impl FuncState {
 /// 编译后处理：对 RETURN 指令做最终优化和调整
 /// 参照 C++ luaK_finish 实现
 fn parse_chunk_finish(fs: &mut FuncState) {
+    // JMP→JMP optimization: like C's luaK_finish, process in-place
+    // so that earlier optimizations are visible to later ones
+    let code_len = fs.proto.code.len();
+    for i in 0..code_len {
+        if get_opcode(fs.proto.code[i]) == OpCode::JMP {
+            let target = final_target(&fs.proto.code, i as i32);
+            fs.fix_jump(i as i32, target, false);
+        }
+    }
+
+    // Other optimizations
     let proto = &mut fs.proto;
     // If function uses a vararg table, it will not use hidden args
     if proto.flag & PF_VATAB != 0 {
@@ -1446,13 +1597,14 @@ fn parse_chunk_finish(fs: &mut FuncState) {
             }
             _ => {}
         }
+        let op = get_opcode(proto.code[i]);  // re-read after possible SET_OPCODE
         match op {
             OpCode::RETURN0 | OpCode::RETURN1 | OpCode::RETURN | OpCode::TAILCALL => {
                 if fs.needclose {
-                    SETARG_k(inst, 1);
+                    SETARG_k(&mut proto.code[i], 1);
                 }
                 if (proto.flag & PF_VAHID) != 0 {
-                    SETARG_C(inst, proto.num_params as i32 + 1);
+                    SETARG_C(&mut proto.code[i], proto.num_params as i32 + 1);
                 }
             }
             _ => {}
@@ -1464,6 +1616,19 @@ fn parse_chunk_finish(fs: &mut FuncState) {
         let gt = &fs.gotos[0];
         fs.error(&format!("no visible label '{}' for goto", gt.name));
     }
+}
+
+/// Like C's finaltarget: follow JMP chain to find the final target
+fn final_target(code: &[u32], mut i: i32) -> i32 {
+    for _ in 0..100 {  // avoid infinite loops
+        let inst = code[i as usize];
+        if get_opcode(inst) != OpCode::JMP {
+            break;
+        }
+        let sj = getarg_sj(inst);
+        i += sj + 1;
+    }
+    i
 }
 
 // ============================================================================
@@ -1551,20 +1716,34 @@ fn create_label(fs: &mut FuncState, name: &str, line: i32, last: bool) {
     let pc = fs.get_label();
     fs.lasttarget = fs.pc;  // mark label position as jump target (like luaK_getlabel)
     // C's newlabelentry uses ls->fs->nactvar (current count of active variables
-    // at label creation time). In Rust, fs.locals.len() is the equivalent.
-    let mut nactvar = fs.locals.len() as i32;
+    // at label creation time). Must use active_nactvar() to get the correct count,
+    // not locals.len() which includes inactive variables.
+    let mut nactvar = fs.active_nactvar();
     if last {
         // C's createlabel: "assume that locals are already out of scope"
         // Use the block's nactvar (saved_nlocals) instead of current level.
+        // Convert saved_nlocals to active variable count.
         if let Some(blk) = fs.block_stack.last() {
-            nactvar = blk.saved_nlocals as i32;
+            nactvar = fs.nactvar_up_to(blk.saved_nlocals);
         }
     }
 
+    let reglevel = fs.reglevel_for_nactvar(nactvar);
+    let nlocals = if last {
+        if let Some(blk) = fs.block_stack.last() {
+            blk.saved_nlocals
+        } else {
+            fs.locals.len()
+        }
+    } else {
+        fs.locals.len()
+    };
     fs.labels.push(LabelDesc {
         name: name.to_string(),
         pc,
         nactvar,
+        nlocals,
+        reglevel,
         line,
     });
 }
@@ -1609,13 +1788,18 @@ fn parse_goto_stat(fs: &mut FuncState) {
     let line = fs.ls().lastline;
     let pc = fs.jump();
     fs.code_abc(OpCode::CLOSE, 0, 1, 0);
-    // Like C's newgotoentry: nactvar = fs->nactvar (index of active variables)
-    let nactvar = fs.locals.len() as i32;
+    // C's newgotoentry: nactvar = fs->nactvar (count of active variables)
+    // Must use active_nactvar() to match C's behavior.
+    let nactvar = fs.active_nactvar();
+    let reglevel = fs.reglevel_for_nactvar(nactvar);
+    let nlocals = fs.locals.len();
     fs.gotos.push(GotoDesc {
         name: name.clone(),
         pc,
         line,
         nactvar,
+        nlocals,
+        reglevel,
         close: false,
     });
     // Don't solve goto here - defer to block exit (like C's solvegotos)
@@ -1623,24 +1807,22 @@ fn parse_goto_stat(fs: &mut FuncState) {
 }
 
 /// 块退出时处理 goto：解决当前块中的 goto，清理 labels
-fn solve_gotos_for_block(fs: &mut FuncState, saved_nlabels: usize, saved_nlocals: usize, needclose: bool) {
-    let nactvar = saved_nlocals as i32;  // block's nactvar (index, like C's bl->nactvar)
-    let mut i = 0;
+fn solve_gotos_for_block(fs: &mut FuncState, saved_nlabels: usize, saved_nlocals: usize, saved_ngotos: usize, needclose: bool, nactvar: i32, outlevel: i32) {
+    let mut i = saved_ngotos;
     while i < fs.gotos.len() {
         let gt_name = fs.gotos[i].name.clone();
         // Only resolve against labels that belong to this block (at or after saved_nlabels)
         if let Some(lb_idx) = find_label_from(fs, &gt_name, saved_nlabels) {
             // Found a matching label in this block - solve it
-            // (like C's closegoto)
+            // In C's solvegotos: if (gt->close) closegoto(...); else patchlist(...)
+            // Only gt->close determines whether to apply closegoto
             let gt = fs.gotos.remove(i);
             let mut gt_pc = gt.pc;
-            // C closegoto condition: gt->close || (label->nactvar < gt->nactvar && bup)
-            let lb = &fs.labels[lb_idx];
-            let need_close = gt.close || (needclose && lb.nactvar < gt.nactvar);
 
-            if need_close {
+            if gt.close || (fs.labels[lb_idx].nactvar < gt.nactvar && needclose) {
                 // Like C's closegoto: move jump to CLOSE+1, put CLOSE at original position
-                let stklevel = fs.reglevel(lb.nactvar);
+                // Use reglevel_for_nlocals to compute stklevel (like C's reglevel(fs, nactvar))
+                let stklevel = fs.reglevel_for_nlocals(fs.labels[lb_idx].nlocals);
                 fs.proto.code[(gt_pc + 1) as usize] = fs.proto.code[gt_pc as usize];
                 fs.proto.code[gt_pc as usize] = create_abck(OpCode::CLOSE, stklevel, 0, 0, 0);
                 gt_pc += 1;
@@ -1650,12 +1832,15 @@ fn solve_gotos_for_block(fs: &mut FuncState, saved_nlabels: usize, saved_nlocals
         } else {
             // Unresolved goto: if block has upvalue and goto escapes scope, mark close=true
             // C: if (bl->upval && reglevel(fs, gt->nactvar) > outlevel) gt->close = 1;
-            let outlevel = fs.reglevel(nactvar);
-            if needclose && fs.reglevel(fs.gotos[i].nactvar) > outlevel {
+            // Use reglevel_for_nlocals to compute reglevel (like C's reglevel(fs, gt->nactvar))
+            let gt_reglevel = fs.reglevel_for_nlocals(fs.gotos[i].nlocals);
+            if needclose && gt_reglevel > outlevel {
                 fs.gotos[i].close = true;
             }
             // Like C: gt->nactvar = bl->nactvar
             fs.gotos[i].nactvar = nactvar;
+            fs.gotos[i].reglevel = outlevel;
+            fs.gotos[i].nlocals = saved_nlocals;
             i += 1;
         }
     }
@@ -1676,7 +1861,10 @@ fn parse_chunk(fs: &mut FuncState) {
     // bl->previous==NULL).
     let saved_nlocals = fs.locals.len();
     let saved_nlabels = fs.labels.len();
-    fs.block_stack.push(BlockEntry { saved_nlocals, has_upval: false, is_function_body: true });
+    let saved_ngotos = fs.gotos.len();
+    let entry_nactvar = fs.active_nactvar();
+    let entry_reglevel = fs.reglevel_for_nactvar(entry_nactvar);
+    fs.block_stack.push(BlockEntry { saved_nlocals, saved_ngotos, has_upval: false, is_function_body: true, nactvar: entry_nactvar, reglevel: entry_reglevel });
 
     let is_last = block_follow(fs, true);
     if !is_last {
@@ -1688,18 +1876,19 @@ fn parse_chunk(fs: &mut FuncState) {
     // Leave function body block (like C's leaveblock for the function body block).
     // Don't generate CLOSE because this is the function body block (previous=NULL in C).
     let has_upval = fs.current_block_has_upval();
-    fs.block_stack.pop();
+    let has_tbc = fs.locals[saved_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
+    let block_entry = fs.block_stack.pop().unwrap();
+    // C's leaveblock order: removevars before solvegotos
+    for local in &mut fs.locals[saved_nlocals..] {
+        local.active = false;
+    }
     // Solve gotos for the function body block (like C's solvegotos in leaveblock)
-    solve_gotos_for_block(fs, saved_nlabels, saved_nlocals, has_upval);
+    solve_gotos_for_block(fs, saved_nlabels, saved_nlocals, block_entry.saved_ngotos, has_tbc || has_upval, block_entry.nactvar, block_entry.reglevel);
     // Check for unresolved gotos (like C's leaveblock: if bl->previous==NULL && pending gotos)
     if !fs.gotos.is_empty() {
         // There are unresolved gotos - this is an error
         let gt = &fs.gotos[0];
         fs.errors.push(format!("{}: no visible label '{}' for goto", gt.line, gt.name));
-    }
-    // Deactivate any remaining variables (shouldn't be any, but just in case)
-    for local in &mut fs.locals[saved_nlocals..] {
-        local.active = false;
     }
 
     parse_chunk_finish(fs);
@@ -1710,24 +1899,27 @@ fn parse_chunk(fs: &mut FuncState) {
 fn parse_block(fs: &mut FuncState) {
     let saved_nlocals = fs.locals.len();
     let saved_nlabels = fs.labels.len();
-    fs.block_stack.push(BlockEntry { saved_nlocals, has_upval: false, is_function_body: false });
+    let saved_ngotos = fs.gotos.len();
+    let entry_nactvar = fs.active_nactvar();
+    let entry_reglevel = fs.reglevel_for_nactvar(entry_nactvar);
+    fs.block_stack.push(BlockEntry { saved_nlocals, saved_ngotos, has_upval: false, is_function_body: false, nactvar: entry_nactvar, reglevel: entry_reglevel });
 
     parse_chunk_stmts(fs);
 
     // Leave block (like C's leaveblock)
     let has_upval = fs.current_block_has_upval();
-    fs.block_stack.pop();
+    let block_entry = fs.block_stack.pop().unwrap();
     let has_tbc = fs.locals[saved_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
     let close_reg = fs.nvarstack_up_to(saved_nlocals);
     if has_tbc || has_upval {
         fs.code_abc(OpCode::CLOSE, close_reg, 0, 0);
     }
-    solve_gotos_for_block(fs, saved_nlabels, saved_nlocals, has_tbc || has_upval);
-    // Like C's removevars: deactivate block-local variables
+    // Like C's leaveblock order: 1) CLOSE  2) freereg  3) removevars(deactivate)  4) solvegotos
     for local in &mut fs.locals[saved_nlocals..] {
         local.active = false;
     }
     fs.set_freereg(close_reg);
+    solve_gotos_for_block(fs, saved_nlabels, saved_nlocals, block_entry.saved_ngotos, has_tbc || has_upval, block_entry.nactvar, block_entry.reglevel);
 }
 
 /// Like C's chunk(): parse a sequence of statements without creating a block scope.
@@ -1746,8 +1938,13 @@ fn parse_chunk_stmts(fs: &mut FuncState) {
             // then check if label is last statement in block (block_follow with until=0).
             while check(fs, &Token::Semi) { fs.ls_mut().next(); }
             while check(fs, &Token::ColonColon) {
-                // nested label statement (no-op)
-                parse_statement(fs);
+                // nested label statement (like C's labelstat: while (testnext(ls, TK_DBCOLON)) labelstat(ls, line))
+                let line2 = fs.ls().lastline;
+                fs.ls_mut().next();  // skip '::'
+                let name2 = get_name(fs);
+                expect(fs, &Token::ColonColon);  // skip closing '::'
+                while check(fs, &Token::Semi) { fs.ls_mut().next(); }
+                create_label(fs, &name2, line2, block_follow(fs, false));
             }
             create_label(fs, &name, line, block_follow(fs, false));
             continue;
@@ -1886,6 +2083,7 @@ fn checkglobal(fs: &mut FuncState, varname: &str, _line: i32) {
 }
 
 /// ANTLR4: 全局变量声明 — 解析带有 global 前缀的属性变量声明列表
+/// C 的 initglobal 递归逻辑：对每个变量从后往前，checkglobal → storevartop
 fn globalnames(fs: &mut FuncState, defkind: i32) {
     let mut names: Vec<String> = Vec::new();
     let mut kinds: Vec<i32> = Vec::new();
@@ -1902,39 +2100,92 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
     let nvars = names.len();
     let has_init = check(fs, &Token::Eq);
 
-    let mut regs = Vec::new();
-        for i in 0..nvars {
-            let reg = fs.add_local_kind(&names[i], fs.pc, kinds[i]);
-            regs.push(reg);
-        }
+    // Like C's globalnames: declare variables first (new_varkind),
+    // but DON'T activate them yet (nactvar not increased).
+    // This ensures that in the initialization expressions, the right-hand side
+    // references outer locals, not the newly declared globals.
+    let first_local_idx = fs.locals.len();
+    let mut var_k_names: Vec<i32> = Vec::new();  // constant indices for variable names
+    for i in 0..nvars {
+        fs.add_local_kind(&names[i], fs.pc, kinds[i]);
+        // Like C's buildglobal: add the variable name to constant table now
+        // (in forward order, matching C's buildglobal which calls codestring)
+        let k = fs.string_k(&names[i]);
+        var_k_names.push(k);
+    }
 
-        if has_init {
+    // Mark the newly declared variables as inactive (C hasn't increased nactvar yet)
+    for i in first_local_idx..fs.locals.len() {
+        fs.locals[i].active = false;
+    }
+
+    if has_init {
         fs.ls_mut().next();
-        let mut exps: Vec<ExpDesc> = Vec::new();
+
+        // Like C's explist + adjust_assign:
+        // Parse expressions. For all but the last, exp2nextreg them into consecutive registers.
+        // The last expression is handled by adjust_assign logic.
+        let mut last_exp = ExpDesc::new(ExpKind::Void, 0);
+        let mut nexps = 0;
         loop {
             let ei = parse_expr(fs);
-            exps.push(ei.exp);
-            if !check(fs, &Token::Comma) { break; }
-            fs.ls_mut().next();
-        }
-        let nexps = exps.len();
-
-        for i in (0..nvars).rev() {
-            if i < nexps {
-                let val = &exps[i];
-                let k_name = fs.string_k(&names[i]);
-                if let Some(k_val) = exp_to_k(fs, val) {
-                    code_settabup_k(fs, 0, k_name, k_val, true);
-                } else {
-                    let val_reg = fs.expr_to_reg(val);
-                    code_settabup(fs, 0, k_name, val_reg);
-                    fs.free_reg();
-                }
+            nexps += 1;
+            if check(fs, &Token::Comma) {
+                // Not the last expression: evaluate to next register
+                fs.exp_to_next_reg(&ei.exp);
+                fs.ls_mut().next();
+            } else {
+                last_exp = ei.exp;
+                break;
             }
         }
-        for i in 0..nvars {
-            checkglobal(fs, &names[i], 0);
+
+        // Like C's adjust_assign: handle variable/expression count mismatch
+        let needed = nvars as i32 - nexps as i32;
+        if last_exp.kind == ExpKind::Vararg || last_exp.kind == ExpKind::Call {
+            // Like C's hasmultret: adjust the call to return extra values
+            let extra = if needed + 1 > 0 { needed + 1 } else { 0 };
+            if last_exp.kind == ExpKind::Call {
+                let call_pc = last_exp.info2;
+                if call_pc >= 0 {
+                    let c_val = extra + 1;
+                    fs.set_c(call_pc, c_val);
+                }
+            }
+            // For Vararg, similar adjustment would be needed
+        } else {
+            // Last expression is not multi-return: close it and fill with nils
+            if nexps > 0 {
+                fs.exp_to_next_reg(&last_exp);
+            }
+            if needed > 0 {
+                fs.code_abc(OpCode::LOADNIL, fs.freereg, needed - 1, 0);
+            }
         }
+        if needed > 0 {
+            // reserve_regs: allocate 'needed' extra registers
+            for _ in 0..needed {
+                fs.alloc_reg();
+            }
+        } else {
+            // needed is negative: remove extra values
+            fs.freereg = (fs.freereg as i32 + needed) as i32;
+        }
+
+        // Like C's initglobal unwind: for each variable from last to first,
+        // checkglobal then storevartop
+        for i in (0..nvars).rev() {
+            checkglobal(fs, &names[i], 0);
+            // storevartop: use freereg-1 as the value register, then free it
+            let val_reg = fs.freereg - 1;
+            code_settabup(fs, 0, var_k_names[i], val_reg);
+            fs.free_reg();  // storevartop frees the value register
+        }
+    }
+
+    // Like C's globalnames: now activate the declaration (fs->nactvar += nvars)
+    for i in first_local_idx..fs.locals.len() {
+        fs.locals[i].active = true;
     }
 }
 
@@ -1949,14 +2200,16 @@ fn globalstat(fs: &mut FuncState) {
 }
 
 /// ANTLR4: `'global' 'function' NAME funcbody ;` — 处理 global function
+/// C 顺序: buildglobal → body → checkglobal → storevar
 fn globalfunc(fs: &mut FuncState, _line: i32) {
     let fname = get_name(fs);
     fs.add_local_kind(&fname, fs.pc, GDKREG);
     let r = parse_body(fs, None);
+    // C order: checkglobal before storevar
+    checkglobal(fs, &fname, _line);
     let k = fs.string_k(&fname);
     code_settabup(fs, 0, k, r);
     fs.free_reg();
-    checkglobal(fs, &fname, _line);
 }
 
 /// ANTLR4: global 分发 — 判断 global function 或 global 变量声明
@@ -1987,12 +2240,16 @@ fn parse_statement(fs: &mut FuncState) {
             // Use goto mechanism like C does (newgotoentry with ls->brkn)
             let pc = fs.jump();
             fs.code_abc(OpCode::CLOSE, 0, 1, 0);  // placeholder CLOSE (B=1);
-            let nactvar = fs.locals.len() as i32;  // like C's fs->nactvar (index)
+            let nactvar = fs.active_nactvar();  // like C's fs->nactvar (active variable count)
+            let reglevel = fs.reglevel_for_nactvar(nactvar);
+            let nlocals = fs.locals.len();
             fs.gotos.push(GotoDesc {
                 name: "break".to_string(),
                 pc,
                 line: fs.ls().lastline,
                 nactvar,
+                nlocals,
+                reglevel,
                 close: false,
             });
             None
@@ -2165,7 +2422,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         key_allocated_reg: key_allocated_reg,
                         allocated_reg: true,
                         is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1,
-                        has_call: false, call_pc: -1, is_vvargvar: false,
+                        has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false,
                     };
                     continue;
                 }
@@ -2208,7 +2465,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     is_env_upvalue: new_is_env_upvalue,
                     upval_idx: first.upval_idx,
                     env_gettabup_pc: if new_is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { first.env_gettabup_pc } },
-                    has_call: false, call_pc: -1, is_vvargvar: false,
+                    has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false,
                 };
             }
             Token::LBracket => {
@@ -2229,7 +2486,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         table_reg: Some(r), table_key: Some(key_reg), table_key_is_const: false, table_key_is_int: false,
                         key_allocated_reg: false, allocated_reg: true,
                         is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1,
-                        has_call: false, call_pc: -1, is_vvargvar: false,
+                        has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false,
                     };
                     continue;
                 }
@@ -2314,7 +2571,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     is_env_upvalue: new_is_env_upvalue,
                     upval_idx: first.upval_idx,
                     env_gettabup_pc: if new_is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { first.env_gettabup_pc } },
-                    has_call: false, call_pc: -1, is_vvargvar: false,
+                    has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false,
                 };
             }
             _ => break,
@@ -2967,6 +3224,7 @@ struct PrefixResult {
     has_call: bool,
     call_pc: i32,
     is_vvargvar: bool,
+    is_readonly: bool,
 }
 
 /// ANTLR4: `prefixexp: varOrExp | functioncall | '(' expr ')' ;` 以及 `var: NAME | prefixexp '[' expr ']' | prefixexp '.' NAME ;`
@@ -3011,14 +3269,35 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         fs.code_abx(OpCode::LOADK, r, k);
                     }
                 };
-                PrefixResult { var_name: None, local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false }
+                PrefixResult { var_name: None, local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
+            } else if let Some(global_kind) = fs.find_global_decl(&name) {
+                // Found a global declaration (GDKREG or GDKCONST) for this name.
+                // Like C's buildvar: treat as _ENV[name] (buildglobal)
+                let is_readonly = global_kind == GDKCONST;
+                let is_env = name == "_ENV";
+                let k = if is_env { 0 } else { fs.string_k(&name) };
+                if let Some(env_reg) = fs.find_local("_ENV") {
+                    let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
+                        && (k as u32) <= crate::opcodes::MAXINDEXRK;
+                    if is_short_str {
+                        PrefixResult { var_name: Some(name.clone()), local_idx: None, key: None, reg: None, table_reg: Some(env_reg), table_key: Some(k), table_key_is_const: true, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
+                    } else {
+                        let env_r = fs.alloc_reg();
+                        fs.code_abc(OpCode::MOVE, env_r, env_reg, 0);
+                        let kr = fs.alloc_reg();
+                        fs.code_abx(OpCode::LOADK, kr, k);
+                        PrefixResult { var_name: Some(name.clone()), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
+                    }
+                } else {
+                    PrefixResult { var_name: Some(name.clone()), local_idx: None, key: Some(k), reg: None, table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: is_env, upval_idx: if is_env { Some(0) } else { None }, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
+                }
             } else if let Some((reg, kind)) = fs.find_local_ex(&name) {
                 let is_vvargvar = kind == RDKVAVAR;
-                PrefixResult { var_name: None, local_idx: Some(reg), key: None, reg: Some(reg), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar }
+                PrefixResult { var_name: None, local_idx: Some(reg), key: None, reg: Some(reg), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar, is_readonly: false }
             } else if let Some(upval_idx) = fs.find_upvalue(&name) {
                 let r = fs.alloc_reg();
                 fs.code_abc(OpCode::GETUPVAL, r, upval_idx, 0);
-                PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: Some(upval_idx), env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false }
+                PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: Some(upval_idx), env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
             } else {
                 let is_env = name == "_ENV";
                 let k = if is_env { 0 } else { fs.string_k(&name) };
@@ -3028,17 +3307,17 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
                         && (k as u32) <= crate::opcodes::MAXINDEXRK;
                     if is_short_str {
-                        PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: None, table_reg: Some(env_reg), table_key: Some(k), table_key_is_const: true, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false }
+                        PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: None, table_reg: Some(env_reg), table_key: Some(k), table_key_is_const: true, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
                     } else {
                         // _ENV is local but key is not short string: load _ENV into temp register
                         let env_r = fs.alloc_reg();
                         fs.code_abc(OpCode::MOVE, env_r, env_reg, 0);
                         let kr = fs.alloc_reg();
                         fs.code_abx(OpCode::LOADK, kr, k);
-                        PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false }
+                        PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
                     }
                 } else {
-                    PrefixResult { var_name: Some(name), local_idx: None, key: Some(k), reg: None, table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: is_env, upval_idx: if is_env { Some(0) } else { None }, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false }
+                    PrefixResult { var_name: Some(name), local_idx: None, key: Some(k), reg: None, table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_env_upvalue: is_env, upval_idx: if is_env { Some(0) } else { None }, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
                 }
             };
 
@@ -3060,7 +3339,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                                 table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false,
                                 key_allocated_reg: false, allocated_reg: true,
                                 is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1,
-                                has_call: false, call_pc: -1, is_vvargvar: false,
+                                has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false,
                             };
                             continue;
                         }
@@ -3137,7 +3416,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         is_env_upvalue: new_is_env_upvalue,
                         upval_idx: result.upval_idx,
                         env_gettabup_pc: if new_is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { result.env_gettabup_pc } },
-                        has_call: false, call_pc: -1, is_vvargvar: false,
+                        has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false,
                     };
                 }
                 Token::LBracket => {
@@ -3158,7 +3437,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                             table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false,
                             key_allocated_reg: false, allocated_reg: true,
                             is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1,
-                            has_call: false, call_pc: -1, is_vvargvar: false,
+                            has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false,
                         };
                         continue;
                     }
@@ -3276,7 +3555,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         is_env_upvalue: new_is_env_upvalue,
                         upval_idx: result.upval_idx,
                         env_gettabup_pc: if new_is_env_upvalue { -1 } else { if gettabup_pc >= 0 { gettabup_pc } else { result.env_gettabup_pc } },
-                        has_call: false, call_pc: -1, is_vvargvar: false,
+                        has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false,
                     };
                     }
                     Token::LParen | Token::LBrace | Token::String(..) | Token::Colon => {
@@ -3318,7 +3597,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                             is_env_upvalue: false,
                             upval_idx: None,
                             env_gettabup_pc: -1,
-                            has_call: true, call_pc: last_call_pc, is_vvargvar: false,
+                            has_call: true, call_pc: last_call_pc, is_vvargvar: false, is_readonly: false,
                         };
                     }
                     _ => break,
@@ -3332,12 +3611,12 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
             let e = parse_expr(fs);
             expect(fs, &Token::RParen);
             let r = fs.expr_to_reg(&e.exp);
-            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false }
+            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
         }
         _ => {
             let e = parse_simple_exp(fs);
             let r = fs.expr_to_reg(&e.exp);
-            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false }
+            PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
         }
     }
 }
@@ -5761,8 +6040,15 @@ fn parse_while(fs: &mut FuncState) {
     let mut ei = parse_expr(fs);
     let pre_freereg = fs.freereg;
     
-    let condexit = if ei.exp.kind == ExpKind::VJMP {
-        // Handle VJMP like luaK_goiftrue in C: negate condition, 
+    let is_const_true = matches!(ei.exp.kind, ExpKind::Boolean if ei.exp.info != 0)
+        || matches!(ei.exp.kind, ExpKind::Int | ExpKind::Float | ExpKind::Str);
+
+    let condexit = if is_const_true {
+        // Like C's luaK_goiftrue: always true; do nothing (NO_JUMP)
+        fs.patch_true_jumps(ei.exp.t, fs.pc);
+        NO_JUMP
+    } else if ei.exp.kind == ExpKind::VJMP {
+        // Handle VJMP like luaK_goiftrue in C: negate condition,
         // add JMP to false list, patch true list to here (body start)
         let saved_jmp = ei.exp.info as i32;
         fs.negate_condition(saved_jmp);
@@ -5814,7 +6100,10 @@ fn parse_while(fs: &mut FuncState) {
     // Push outer block (while loop block, like C's enterblock with isloop=1)
     let saved_nlocals = fs.locals.len();
     let saved_nlabels = fs.labels.len();
-    fs.block_stack.push(BlockEntry { saved_nlocals, has_upval: false, is_function_body: false });
+    let saved_ngotos = fs.gotos.len();
+    let entry_nactvar = fs.active_nactvar();
+    let entry_reglevel = fs.reglevel_for_nactvar(entry_nactvar);
+    fs.block_stack.push(BlockEntry { saved_nlocals, saved_ngotos, has_upval: false, is_function_body: false, nactvar: entry_nactvar, reglevel: entry_reglevel });
     fs.set_freereg(entry_freereg);
 
     parse_block(fs);  // inner body block (like C's block(ls))
@@ -5824,19 +6113,19 @@ fn parse_while(fs: &mut FuncState) {
 
     // Leave outer block (while loop block, like C's leaveblock)
     let has_upval = fs.current_block_has_upval();
-    fs.block_stack.pop();
+    let block_entry = fs.block_stack.pop().unwrap();
     let has_tbc = fs.locals[saved_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
     let close_reg = fs.nvarstack_up_to(saved_nlocals);
     if has_tbc || has_upval {
         fs.code_abc(OpCode::CLOSE, close_reg, 0, 0);
     }
-    solve_gotos_for_block(fs, saved_nlabels, saved_nlocals, has_tbc || has_upval);
+    // C's leaveblock order: CLOSE -> freereg -> removevars -> solvegotos
     for local in &mut fs.locals[saved_nlocals..] {
         local.active = false;
     }
     fs.set_freereg(close_reg);
+    solve_gotos_for_block(fs, saved_nlabels, saved_nlocals, block_entry.saved_ngotos, has_tbc || has_upval, block_entry.nactvar, block_entry.reglevel);
 
-    // Patch condexit (AFTER outer leaveblock, like C's luaK_patchtohere)
     let mut cur = condexit;
     while cur != NO_JUMP {
         let next = fs.get_jump(cur);
@@ -5845,10 +6134,13 @@ fn parse_while(fs: &mut FuncState) {
     }
 
     // Create break label for goto-based break resolution
+    let nactvar = fs.nactvar_up_to(saved_nlocals);
     fs.labels.push(LabelDesc {
         name: "break".to_string(),
         pc: fs.pc,
-        nactvar: saved_nlocals as i32,
+        nactvar,
+        nlocals: saved_nlocals,
+        reglevel: fs.reglevel_for_nactvar(nactvar),
         line: 0,
     });
     fs.patch_breaks(fs.pc);
@@ -5877,12 +6169,18 @@ fn parse_repeat(fs: &mut FuncState) {
     // Push bl1 (loop block, like C's enterblock with isloop=1)
     let bl1_nlocals = fs.locals.len();
     let bl1_nlabels = fs.labels.len();
-    fs.block_stack.push(BlockEntry { saved_nlocals: bl1_nlocals, has_upval: false, is_function_body: false });
+    let bl1_saved_ngotos = fs.gotos.len();
+    let bl1_entry_nactvar = fs.active_nactvar();
+    let bl1_entry_reglevel = fs.reglevel_for_nactvar(bl1_entry_nactvar);
+    fs.block_stack.push(BlockEntry { saved_nlocals: bl1_nlocals, saved_ngotos: bl1_saved_ngotos, has_upval: false, is_function_body: false, nactvar: bl1_entry_nactvar, reglevel: bl1_entry_reglevel });
 
     // Push bl2 (scope block, like C's enterblock with isloop=0)
     let bl2_nlocals = fs.locals.len();
     let bl2_nlabels = fs.labels.len();
-    fs.block_stack.push(BlockEntry { saved_nlocals: bl2_nlocals, has_upval: false, is_function_body: false });
+    let bl2_saved_ngotos = fs.gotos.len();
+    let bl2_entry_nactvar = fs.active_nactvar();
+    let bl2_entry_reglevel = fs.reglevel_for_nactvar(bl2_entry_nactvar);
+    fs.block_stack.push(BlockEntry { saved_nlocals: bl2_nlocals, saved_ngotos: bl2_saved_ngotos, has_upval: false, is_function_body: false, nactvar: bl2_entry_nactvar, reglevel: bl2_entry_reglevel });
 
     fs.set_freereg(entry_freereg);
     parse_chunk_stmts(fs);  // Like C's statlist(ls)
@@ -5894,13 +6192,17 @@ fn parse_repeat(fs: &mut FuncState) {
 
     // Leave bl2 (finish scope, like C's leaveblock)
     let bl2_has_upval = fs.current_block_has_upval();
-    fs.block_stack.pop();
+    let bl2_entry = fs.block_stack.pop().unwrap();
     let bl2_has_tbc = fs.locals[bl2_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
     let bl2_close_reg = fs.nvarstack_up_to(bl2_nlocals);
     if bl2_has_tbc || bl2_has_upval {
         fs.code_abc(OpCode::CLOSE, bl2_close_reg, 0, 0);
     }
-    solve_gotos_for_block(fs, bl2_nlabels, bl2_nlocals, bl2_has_tbc || bl2_has_upval);
+    for local in &mut fs.locals[bl2_nlocals..] {
+        local.active = false;
+    }
+    fs.set_freereg(bl2_close_reg);
+    solve_gotos_for_block(fs, bl2_nlabels, bl2_nlocals, bl2_entry.saved_ngotos, bl2_has_tbc || bl2_has_upval, bl2_entry.nactvar, bl2_entry.reglevel);
 
     let is_const_true = matches!(ei.exp.kind, ExpKind::Boolean if ei.exp.info != 0)
         || matches!(ei.exp.kind, ExpKind::Int | ExpKind::Float | ExpKind::Str);
@@ -5978,10 +6280,13 @@ fn parse_repeat(fs: &mut FuncState) {
     }
 
     // Create break label for goto-based break resolution
+    let nactvar = fs.nactvar_up_to(bl1_nlocals);
     fs.labels.push(LabelDesc {
         name: "break".to_string(),
         pc: fs.pc,
-        nactvar: bl1_nlocals as i32,
+        nactvar,
+        nlocals: bl1_nlocals,
+        reglevel: fs.reglevel_for_nactvar(nactvar),
         line: 0,
     });
     fs.patch_breaks(fs.pc);
@@ -5989,17 +6294,17 @@ fn parse_repeat(fs: &mut FuncState) {
 
     // Leave bl1 (finish loop, like C's leaveblock)
     let bl1_has_upval = fs.current_block_has_upval();
-    fs.block_stack.pop();
+    let bl1_entry = fs.block_stack.pop().unwrap();
     let bl1_has_tbc = fs.locals[bl1_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
     let bl1_close_reg = fs.nvarstack_up_to(bl1_nlocals);
     if bl1_has_tbc || bl1_has_upval {
         fs.code_abc(OpCode::CLOSE, bl1_close_reg, 0, 0);
     }
-    solve_gotos_for_block(fs, bl1_nlabels, bl1_nlocals, bl1_has_tbc || bl1_has_upval);
     for local in &mut fs.locals[bl1_nlocals..] {
         local.active = false;
     }
     fs.set_freereg(bl1_close_reg);
+    solve_gotos_for_block(fs, bl1_nlabels, bl1_nlocals, bl1_entry.saved_ngotos, bl1_has_tbc || bl1_has_upval, bl1_entry.nactvar, bl1_entry.reglevel);
 }
 
 /// ANTLR4: `'for' NAME '=' expr ',' expr (',' expr)? 'do' block 'end' ;` (numeric for) 以及 `'for' namelist 'in' explist 'do' block 'end' ;` (generic for)
@@ -6015,7 +6320,10 @@ fn parse_for(fs: &mut FuncState) {
         // Push forstat block (like C's enterblock in forstat)
         let forstat_nlocals = fs.locals.len();
         let forstat_nlabels = fs.labels.len();
-        fs.block_stack.push(BlockEntry { saved_nlocals: forstat_nlocals, has_upval: false, is_function_body: false });
+        let forstat_saved_ngotos = fs.gotos.len();
+        let forstat_entry_nactvar = fs.active_nactvar();
+        let forstat_entry_reglevel = fs.reglevel_for_nactvar(forstat_entry_nactvar);
+        fs.block_stack.push(BlockEntry { saved_nlocals: forstat_nlocals, saved_ngotos: forstat_saved_ngotos, has_upval: false, is_function_body: false, nactvar: forstat_entry_nactvar, reglevel: forstat_entry_reglevel });
 
         fs.set_freereg(base);
         let ei = parse_expr(fs);
@@ -6066,7 +6374,10 @@ fn parse_for(fs: &mut FuncState) {
         // Like C's forbody: enterblock BEFORE activating the loop variable
         let body_nlocals = fs.locals.len();  // Only 2 "(for state)" vars at this point
         let body_nlabels = fs.labels.len();
-        fs.block_stack.push(BlockEntry { saved_nlocals: body_nlocals, has_upval: false, is_function_body: false });
+        let body_saved_ngotos = fs.gotos.len();
+        let body_entry_nactvar = fs.active_nactvar();
+        let body_entry_reglevel = fs.reglevel_for_nactvar(body_entry_nactvar);
+        fs.block_stack.push(BlockEntry { saved_nlocals: body_nlocals, saved_ngotos: body_saved_ngotos, has_upval: false, is_function_body: false, nactvar: body_entry_nactvar, reglevel: body_entry_reglevel });
 
         // Like C's adjustlocalvars(ls, nvars): activate loop variable INSIDE body block
         fs.add_local_kind_reg(&name, fs.pc, RDKCONST, base + 2);
@@ -6076,49 +6387,51 @@ fn parse_for(fs: &mut FuncState) {
 
         // Leave body block (like C's leaveblock for forbody's block)
         let has_body_upval = fs.current_block_has_upval();
-        fs.block_stack.pop();
+        let body_entry = fs.block_stack.pop().unwrap();
         let body_has_tbc = fs.locals[body_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
         let body_close_reg = fs.nvarstack_up_to(body_nlocals);
         if body_has_tbc || has_body_upval {
             fs.code_abc(OpCode::CLOSE, body_close_reg, 0, 0);
         }
-        solve_gotos_for_block(fs, body_nlabels, body_nlocals, body_has_tbc || has_body_upval);
-        // Like C's leaveblock: deactivate variables and set freereg
+        // C's leaveblock order: CLOSE -> freereg -> removevars -> solvegotos
         for local in &mut fs.locals[body_nlocals..] {
             local.active = false;
         }
         fs.set_freereg(body_close_reg);
+        solve_gotos_for_block(fs, body_nlabels, body_nlocals, body_entry.saved_ngotos, body_has_tbc || has_body_upval, body_entry.nactvar, body_entry.reglevel);
 
         fs.fix_jump(prep, fs.pc, false);
         let loop_pc = fs.code_abx(OpCode::FORLOOP, base, 0);
         fs.fix_jump(loop_pc, prep + 1, true);
 
         // Handle forstat block exit (like C's leaveblock for forstat) [NUMERIC FOR]
-        // C order: 1) CLOSE  2) createlabel(break)  3) solvegotos
+        // C order: 1) CLOSE  2) removevars  3) freereg  4) createlabel(break)  5) solvegotos
         let has_forstat_upval = fs.current_block_has_upval();
         let forstat_has_tbc = fs.locals[forstat_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
         let forstat_close_reg = fs.nvarstack_up_to(forstat_nlocals);
-        fs.block_stack.pop();
+        let forstat_entry = fs.block_stack.pop().unwrap();
         if has_forstat_upval || forstat_has_tbc {
             fs.code_abc(OpCode::CLOSE, forstat_close_reg, 0, 0);
         }
+        // removevars + freereg (before createlabel and solvegotos, like C)
+        for local in &mut fs.locals[forstat_nlocals..] {
+            local.active = false;
+        }
+        fs.set_freereg(forstat_close_reg);
 
         // Create break label AFTER forstat CLOSE (like C's createlabel after CLOSE)
         fs.labels.push(LabelDesc {
             name: "break".to_string(),
             pc: fs.pc,
-            nactvar: forstat_nlocals as i32,
+            nactvar: forstat_entry.nactvar,
+            nlocals: forstat_nlocals,
+            reglevel: forstat_entry.reglevel,
             line: 0,
         });
         fs.patch_breaks(fs.pc);
         fs.break_list = saved_breaklist;
 
-        solve_gotos_for_block(fs, forstat_nlabels, forstat_nlocals, has_forstat_upval || forstat_has_tbc);
-
-        for local in &mut fs.locals[forstat_nlocals..] {
-            local.active = false;
-        }
-        fs.set_freereg(forstat_close_reg);
+        solve_gotos_for_block(fs, forstat_nlabels, forstat_nlocals, forstat_entry.saved_ngotos, forstat_has_tbc || has_forstat_upval, forstat_entry.nactvar, forstat_entry.reglevel);
         expect(fs, &Token::End);
     } else {
         let mut vars = vec![name];
@@ -6135,8 +6448,11 @@ fn parse_for(fs: &mut FuncState) {
         // Push forstat block (like C's enterblock in forstat)
         let forstat_nlocals = fs.locals.len();
         let forstat_nlabels = fs.labels.len();
-        fs.block_stack.push(BlockEntry { saved_nlocals: forstat_nlocals, has_upval: false, is_function_body: false });
-        
+        let forstat_saved_ngotos = fs.gotos.len();
+        let forstat_entry_nactvar = fs.active_nactvar();
+        let forstat_entry_reglevel = fs.reglevel_for_nactvar(forstat_entry_nactvar);
+        fs.block_stack.push(BlockEntry { saved_nlocals: forstat_nlocals, saved_ngotos: forstat_saved_ngotos, has_upval: false, is_function_body: false, nactvar: forstat_entry_nactvar, reglevel: forstat_entry_reglevel });
+
         // Like C's forlist: declare all variables, but only activate the 3 internal
         // ones before expression parsing. User-declared variables are activated inside
         // the body block (like C's adjustlocalvars in forbody).
@@ -6147,6 +6463,7 @@ fn parse_for(fs: &mut FuncState) {
         // Add user-declared variables as INACTIVE (they'll be activated inside body block)
         for var_name in &vars {
             let vidx = fs.locals.len() as i32;
+            let nactvar = fs.active_nactvar();
             fs.locals.push(LocalVar {
                 name: var_name.clone(),
                 start_pc: fs.pc,
@@ -6157,6 +6474,7 @@ fn parse_for(fs: &mut FuncState) {
                 ctc_info: None,
                 ctc_str: None,
                 vidx,
+                nactvar,
             });
         }
         // Deactivate internal variables too during expression parsing
@@ -6218,7 +6536,10 @@ fn parse_for(fs: &mut FuncState) {
         // body_nlocals = forstat_nlocals + 3 (only the 3 internal variables)
         let body_nlocals = fs.locals.len() - vars.len();  // Exclude user-declared vars
         let body_nlabels = fs.labels.len();
-        fs.block_stack.push(BlockEntry { saved_nlocals: body_nlocals, has_upval: false, is_function_body: false });
+        let body_saved_ngotos = fs.gotos.len();
+        let body_entry_nactvar = fs.active_nactvar();
+        let body_entry_reglevel = fs.reglevel_for_nactvar(body_entry_nactvar);
+        fs.block_stack.push(BlockEntry { saved_nlocals: body_nlocals, saved_ngotos: body_saved_ngotos, has_upval: false, is_function_body: false, nactvar: body_entry_nactvar, reglevel: body_entry_reglevel });
 
         // Like C's adjustlocalvars(ls, nvars): activate user-declared variables INSIDE body block
         // Also assign registers to them (like C's luaK_reserveregs)
@@ -6232,39 +6553,46 @@ fn parse_for(fs: &mut FuncState) {
 
         // Leave body block (like C's leaveblock for forbody's block) [GENERIC FOR]
         let has_body_upval = fs.current_block_has_upval();
-        fs.block_stack.pop();
+        let body_entry = fs.block_stack.pop().unwrap();
         let body_has_tbc = fs.locals[body_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
         let body_close_reg = fs.nvarstack_up_to(body_nlocals);
         if body_has_tbc || has_body_upval {
             fs.code_abc(OpCode::CLOSE, body_close_reg, 0, 0);
         }
-        solve_gotos_for_block(fs, body_nlabels, body_nlocals, body_has_tbc || has_body_upval);
-        // Like C's leaveblock: deactivate variables and set freereg
+        // C's leaveblock order: CLOSE -> freereg -> removevars -> solvegotos
         for local in &mut fs.locals[body_nlocals..] {
             local.active = false;
         }
         fs.set_freereg(body_close_reg);
-        
+        solve_gotos_for_block(fs, body_nlabels, body_nlocals, body_entry.saved_ngotos, body_has_tbc || has_body_upval, body_entry.nactvar, body_entry.reglevel);
+
         fs.fix_jump(prep, fs.pc, false);
         fs.code_abc(OpCode::TFORCALL, base, 0, ncontrol);
         let loop_pc = fs.code_abx(OpCode::TFORLOOP, base, 0);
         fs.fix_jump(loop_pc, prep + 1, true);
 
         // Handle forstat block exit (like C's leaveblock for forstat) [GENERIC FOR]
-        // C order: 1) CLOSE  2) createlabel(break)  3) solvegotos
+        // C order: 1) CLOSE  2) removevars  3) freereg  4) createlabel(break)  5) solvegotos
         let has_forstat_upval = fs.current_block_has_upval();
         let forstat_has_tbc = fs.locals[forstat_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
         let forstat_close_reg = fs.nvarstack_up_to(forstat_nlocals);
-        fs.block_stack.pop();
+        let forstat_entry = fs.block_stack.pop().unwrap();
         if has_forstat_upval || forstat_has_tbc {
             fs.code_abc(OpCode::CLOSE, forstat_close_reg, 0, 0);
         }
+        // removevars + freereg (before createlabel and solvegotos, like C)
+        for local in &mut fs.locals[forstat_nlocals..] {
+            local.active = false;
+        }
+        fs.set_freereg(forstat_close_reg);
 
         // Create break label AFTER forstat CLOSE (like C's createlabel after CLOSE)
         fs.labels.push(LabelDesc {
             name: "break".to_string(),
             pc: fs.pc,
-            nactvar: forstat_nlocals as i32,
+            nactvar: forstat_entry.nactvar,
+            nlocals: forstat_nlocals,
+            reglevel: forstat_entry.reglevel,
             line: 0,
         });
         fs.patch_breaks(fs.pc);
@@ -6272,11 +6600,7 @@ fn parse_for(fs: &mut FuncState) {
 
         expect(fs, &Token::End);
 
-        solve_gotos_for_block(fs, forstat_nlabels, forstat_nlocals, has_forstat_upval || forstat_has_tbc);
-        for local in &mut fs.locals[forstat_nlocals..] {
-            local.active = false;
-        }
-        fs.set_freereg(forstat_close_reg);
+        solve_gotos_for_block(fs, forstat_nlabels, forstat_nlocals, forstat_entry.saved_ngotos, forstat_has_tbc || has_forstat_upval, forstat_entry.nactvar, forstat_entry.reglevel);
     }
 }
 
@@ -6296,7 +6620,39 @@ fn parse_func_stat(fs: &mut FuncState) {
     if chain.len() == 1 {
         let name = &chain[0].1;
         let r = parse_body_ex(fs, false, None);
-        if let Some(reg) = fs.find_local(name) {
+        // Check for global declaration first (like C's searchvar/buildvar)
+        let global_kind = fs.find_global_decl(name);
+        if global_kind.is_some() {
+            // Variable is declared as global: store through _ENV
+            let k = fs.string_k(name);
+            let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
+                && (k as u32) <= crate::opcodes::MAXINDEXRK;
+            if let Some(env_reg) = fs.find_local("_ENV") {
+                if is_short_str {
+                    fs.code_abc(OpCode::SETFIELD, env_reg, k, r);
+                } else {
+                    let env_r = fs.alloc_reg();
+                    fs.code_abc(OpCode::MOVE, env_r, env_reg, 0);
+                    let kr = fs.alloc_reg();
+                    fs.code_abx(OpCode::LOADK, kr, k);
+                    fs.code_abc(OpCode::SETTABLE, env_r, kr, r);
+                    fs.free_reg();
+                    fs.free_reg();
+                }
+            } else {
+                if is_short_str {
+                    code_settabup(fs, 0, k, r);
+                } else {
+                    let env_r = fs.alloc_reg();
+                    fs.code_abc(OpCode::GETUPVAL, env_r, 0, 0);
+                    let kr = fs.alloc_reg();
+                    fs.code_abx(OpCode::LOADK, kr, k);
+                    fs.code_abc(OpCode::SETTABLE, env_r, kr, r);
+                    fs.free_reg();
+                    fs.free_reg();
+                }
+            }
+        } else if let Some(reg) = fs.find_local(name) {
             fs.code_abc(OpCode::MOVE, reg, r, 0);
         } else {
             // Like C's funcstat: resolve through _ENV (which may be local or upvalue)
@@ -6338,7 +6694,20 @@ fn parse_func_stat(fs: &mut FuncState) {
     }
 
     let first_name = &chain[0].1;
-    let mut base_reg = if let Some(reg) = fs.find_local(first_name) {
+    let mut base_reg = if fs.find_global_decl(first_name).is_some() {
+        // Variable is declared as global: load from _ENV
+        if let Some(env_reg) = fs.find_local("_ENV") {
+            let r = fs.alloc_reg();
+            let k = fs.string_k(first_name);
+            code_getfield(fs, r, env_reg, k);
+            r
+        } else {
+            let r = fs.alloc_reg();
+            let k = fs.string_k(first_name);
+            code_gettabup(fs, r, 0, k);
+            r
+        }
+    } else if let Some(reg) = fs.find_local(first_name) {
         let r = fs.alloc_reg();
         fs.code_abc(OpCode::MOVE, r, reg, 0);
         r
@@ -6495,6 +6864,7 @@ fn parse_local(fs: &mut FuncState) {
                 };
                 let ctc_info = if last_e.kind == ExpKind::Str { 0 } else { last_e.info };
                 let vidx = fs.locals.len() as i32;
+                let nactvar = fs.active_nactvar();
                 fs.locals.push(LocalVar {
                     name: names[nvars - 1].clone(),
                     start_pc: pc,
@@ -6505,6 +6875,7 @@ fn parse_local(fs: &mut FuncState) {
                     ctc_info: Some(ctc_info),
                     ctc_str,
                     vidx,
+                    nactvar,
                 });
             }
 
@@ -6829,10 +7200,12 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     }
 
     for (i, local) in fs.locals.iter().enumerate() {
-        if local.active && local.kind <= RDKTOCLOSE {
+        if local.active {
+            let is_global = local.kind >= GDKREG;
             new_fs.parent_locals.push(ParentVar {
                 name: local.name.clone(),
                 is_local: true,
+                is_global,
                 reg: local.reg,
                 local_idx: i,
                 upval_idx: 0,
@@ -6845,6 +7218,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
         new_fs.parent_locals.push(ParentVar {
             name: gp_var.name.clone(),
             is_local: false,
+            is_global: gp_var.is_global,
             reg: 0,
             local_idx: 0,
             upval_idx: 0,

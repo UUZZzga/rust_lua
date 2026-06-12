@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod compiler_compare_tests {
     use crate::compiler::bytecode_dump;
+    use crate::opcodes;
 
     fn compile_rust(source: &str, name: Option<&str>) -> crate::objects::Proto {
         crate::compiler::compile(source, name.unwrap_or("=test")).expect("Rust compile failed")
@@ -38,13 +39,7 @@ mod compiler_compare_tests {
         let c_func = unsafe { compile_c(source) };
 
         let diffs = bytecode_dump::compare_instructions(&rust_proto.code, &c_func.code);
-        let filtered: Vec<String> = diffs
-            .into_iter()
-            .filter(|d| {
-                !d.contains("constant index mismatch") && !d.contains("constant type mismatch")
-            })
-            .collect();
-        if !filtered.is_empty() {
+        if !diffs.is_empty() {
             let rust_dump = bytecode_dump::dump_instructions(&rust_proto.code);
             let c_dump = bytecode_dump::dump_c_instructions(&c_func.code, &c_func.constants);
             panic!(
@@ -53,49 +48,9 @@ mod compiler_compare_tests {
                  Rust instructions:\n{}\n\n\
                  C++ instructions:\n{}",
                 source,
-                filtered.join("\n  "),
+                diffs.join("\n  "),
                 rust_dump,
                 c_dump
-            );
-        }
-    }
-
-    #[test]
-    fn debug_dump_return_42() {
-        unsafe {
-            let src = b"local a, b; assert(a * b > 2.0^32)";
-            let dump_data =
-                bytecode_dump::compile_with_c_lua(src).expect("C compile failed");
-            
-            eprintln!("DUMP hex (first 200 bytes): {:02x?}", &dump_data[..dump_data.len().min(200)]);
-    
-            match bytecode_dump::parse_dump(dump_data) {
-                Ok(func) => {
-                    eprintln!("Parsed C OK: numparams={}, flag={}, maxstack={}, code_len={}, constants_len={}",
-                        func.numparams, func.flag, func.maxstacksize, func.code.len(), func.constants.len());
-                    eprintln!("C Code:");
-                    for (i, inst) in func.code.iter().enumerate() {
-                        eprintln!("  C[{:2}]: op={:3} A={:3} B={:3} C={:3} k={} bx={}",
-                            i, inst.opcode, inst.a, inst.b, inst.c, inst.k, inst.bx);
-                    }
-                }
-                Err(e) => eprintln!("Parse error: {}", e),
-            }
-        }
-
-        let rust_proto = compile_rust("return 42", None);
-        eprintln!("Rust proto code raw: {:?}", rust_proto.code);
-        eprintln!("Rust proto code len: {}", rust_proto.code.len());
-        for (i, inst) in rust_proto.code.iter().enumerate() {
-            eprintln!(
-                "  Rust[{}]: raw={:#010x} op={:3} A={:3} B={:3} C={:3} k={}",
-                i,
-                inst,
-                inst & 0x7f,
-                (inst >> 7) & 0xff,
-                (inst >> 16) & 0xff,
-                (inst >> 24) & 0xff,
-                (inst >> 15) & 1,
             );
         }
     }
@@ -632,6 +587,106 @@ end
     }
 
     #[test]
+    fn debug_goto_simple() {
+        // Minimal test: goto jumping out of a block with a local variable
+        // This matches the pattern in goto.lua that causes PC 54 difference
+        assert_inst_match(r#"local x; do local y = 12; goto l1; ::l2:: x = x + 1; goto l3; ::l1:: x = y; goto l2; end; ::l3:: return x"#, None);
+    }
+
+    #[test]
+    fn debug_goto_with_y() {
+        // Same but with local y inside the block (like goto.lua)
+        assert_inst_match(r#"
+local x
+do
+  local y = 12
+  goto l1
+  ::l2:: x = x + 1; goto l3
+  ::l1:: x = y; goto l2
+end
+::l3:: return x
+"#, None);
+    }
+
+    #[test]
+    fn debug_goto_while() {
+        // goto.lua lines 89-96: goto out of while loop with local variable
+        assert_inst_match(r#"
+local x = 13
+while true do
+  goto l4
+  goto l1
+  goto l1
+  local x = 45
+  ::l1:: ;;;
+end
+::l4:: assert(x == 13)
+"#, None);
+    }
+
+    #[test]
+    fn debug_goto_if() {
+        // goto.lua lines 98-104: goto inside if block with local variable
+        assert_inst_match(r#"
+if print then
+  goto l1
+  error("should not be here")
+  goto l2
+  local x
+  ::l1:: ; ::l2:: ;;
+else end
+"#, None);
+    }
+
+    #[test]
+    fn debug_goto_with_globals() {
+        // Like goto.lua: global declarations + goto jumping out of block with upvalue
+        assert_inst_match(r#"
+global<const> print, assert
+local x
+do
+  local y = 12
+  goto l1
+  ::l2:: x = x + 1; goto l3
+  ::l1:: x = y; goto l2
+end
+::l3:: assert(x == 13)
+"#, None);
+    }
+
+    #[test]
+    fn debug_global_func() {
+        // global function foo - foo should be resolved as global variable
+        assert_inst_match(r#"
+global<const> print, assert
+local foo = 20
+do
+  global function foo (x)
+    if x == 0 then return 1 else return 2 * foo(x - 1) end
+  end
+  assert(foo == _ENV.foo and foo(4) == 16)
+end
+"#, None);
+    }
+
+    #[test]
+    fn debug_global_init() {
+        // global X; X = 20 - test that SETTABUP uses constant for value
+        assert_inst_match(r#"
+global<const> print
+do
+  local X = 10
+  do global X; X = 20 end
+end
+"#, None);
+    }
+
+    #[test]
+    fn test_goto_lua() {
+        assert_inst_match_file_allow_constants("goto.lua");
+    }
+
+    #[test]
     fn test_focus_lua() {
         assert_inst_match_file("test_focus.lua");
     }
@@ -749,6 +804,10 @@ end
 
     fn assert_inst_match_file(name: &str) {
         assert_inst_match(get_lua_script(name).as_str(), Some(name));
+    }
+
+    fn assert_inst_match_file_allow_constants(name: &str) {
+        assert_inst_match_allow_constants(get_lua_script(name).as_str());
     }
 
     fn get_lua_script(name: &str) -> String {
@@ -1184,6 +1243,180 @@ end
     }
 
     #[test]
+    fn debug_while_true_goto() {
+        let source = r#"while true do
+  goto l4
+  goto l1
+  goto l1
+  local x = 45
+  ::l1:: ;;;
+end
+::l4:: assert(x == 13)"#;
+        let rust_proto = compile_rust(source, None);
+        let c_func = unsafe { compile_c(source) };
+
+        let diffs = bytecode_dump::compare_instructions(&rust_proto.code, &c_func.code);
+        let rust_dump = bytecode_dump::dump_instructions(&rust_proto.code);
+        let c_dump = bytecode_dump::dump_c_instructions(&c_func.code, &c_func.constants);
+
+        eprintln!("=== debug_while_true_goto ===");
+        eprintln!("Differences:\n  {}", diffs.join("\n  "));
+        eprintln!("\nRust instructions:\n{}", rust_dump);
+        eprintln!("\nC instructions:\n{}", c_dump);
+        eprintln!("\nC constants:");
+        for (i, c) in c_func.constants.iter().enumerate() {
+            eprintln!("  {}: {:?}", i, c);
+        }
+        if !diffs.is_empty() {
+            panic!("Instruction mismatch found!");
+        }
+    }
+
+    #[test]
+    fn debug_while_true_goto_simple() {
+        // Simplified variant to isolate the while-true-goto issue
+        let source = r#"while true do
+  goto l1
+  local x = 45
+  ::l1:: ;;;
+end"#;
+        let rust_proto = compile_rust(source, None);
+        let c_func = unsafe { compile_c(source) };
+
+        let diffs = bytecode_dump::compare_instructions(&rust_proto.code, &c_func.code);
+        let rust_dump = bytecode_dump::dump_instructions(&rust_proto.code);
+        let c_dump = bytecode_dump::dump_c_instructions(&c_func.code, &c_func.constants);
+
+        eprintln!("=== debug_while_true_goto_simple ===");
+        eprintln!("Differences:\n  {}", diffs.join("\n  "));
+        eprintln!("\nRust instructions:\n{}", rust_dump);
+        eprintln!("\nC instructions:\n{}", c_dump);
+        eprintln!("\nC constants:");
+        for (i, c) in c_func.constants.iter().enumerate() {
+            eprintln!("  {}: {:?}", i, c);
+        }
+        if !diffs.is_empty() {
+            panic!("Instruction mismatch found!");
+        }
+    }
+
+    #[test]
+    fn debug_while_simple() {
+        let source = r#"while true do
+  goto l1
+  local x = 45
+  ::l1:: ;;;
+end"#;
+        let rust_proto = compile_rust(source, None);
+        let c_func = unsafe { compile_c(source) };
+
+        eprintln!("=== Rust instructions ===");
+        for (i, inst) in rust_proto.code.iter().enumerate() {
+            let opcode = opcodes::get_opcode(*inst);
+            if opcode == opcodes::OpCode::JMP {
+                let sj_raw = opcodes::getarg(*inst, opcodes::POS_SJ, opcodes::SIZE_BX + opcodes::SIZE_A);
+                let sj = sj_raw - opcodes::OFFSET_sJ;
+                let target = i as i32 + sj + 1;
+                eprintln!("  PC {:3}: raw={:#010x} JMP sj_raw={} sj={} target={}", i, inst, sj_raw, sj, target);
+            } else {
+                eprintln!("  PC {:3}: raw={:#010x} {}", i, inst, bytecode_dump::format_instruction(*inst));
+            }
+        }
+
+        eprintln!("=== C instructions ===");
+        for (i, inst) in c_func.code.iter().enumerate() {
+            let raw = bytecode_dump::dump_inst_to_raw(inst);
+            let opcode = opcodes::get_opcode(raw);
+            if opcode == opcodes::OpCode::JMP {
+                let sj_raw = opcodes::getarg(raw, opcodes::POS_SJ, opcodes::SIZE_BX + opcodes::SIZE_A);
+                let sj = sj_raw - opcodes::OFFSET_sJ;
+                let target = i as i32 + sj + 1;
+                eprintln!("  PC {:3}: raw={:#010x} JMP sj_raw={} sj={} target={}", i, raw, sj_raw, sj, target);
+            } else {
+                eprintln!("  PC {:3}: raw={:#010x} {}", i, raw, bytecode_dump::format_c_instruction(inst, &c_func.constants));
+            }
+        }
+
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn debug_goto_if_print() {
+        // "if print then" section from goto.lua (lines 98-104)
+        let source = r#"if print then
+  goto l1
+  error("should not be here")
+  goto l2
+  local x
+  ::l1:: ; ::l2:: ;;
+else end"#;
+        let rust_proto = compile_rust(source, None);
+        let c_func = unsafe { compile_c(source) };
+
+        let diffs = bytecode_dump::compare_instructions(&rust_proto.code, &c_func.code);
+        let rust_dump = bytecode_dump::dump_instructions(&rust_proto.code);
+        let c_dump = bytecode_dump::dump_c_instructions(&c_func.code, &c_func.constants);
+
+        eprintln!("=== debug_goto_if_print ===");
+        eprintln!("Differences:\n  {}", diffs.join("\n  "));
+        eprintln!("\nRust instructions:\n{}", rust_dump);
+        eprintln!("\nC instructions:\n{}", c_dump);
+        eprintln!("\nC constants:");
+        for (i, c) in c_func.constants.iter().enumerate() {
+            eprintln!("  {}: {:?}", i, c);
+        }
+        if !diffs.is_empty() {
+            panic!("Instruction mismatch found!");
+        }
+    }
+
+    #[test]
+    fn debug_goto_closing_upvalues() {
+        // "closing upvalues" section from goto.lua (lines 168-190)
+        let source = r#"local function foo ()
+  local t = {}
+  do
+  local i = 1
+  local a, b, c, d
+  t[1] = function () return a, b, c, d end
+  ::l1::
+  local b
+  do
+    local c
+    t[#t + 1] = function () return a, b, c, d end
+    if i > 2 then goto l2 end
+    do
+      local d
+      t[#t + 1] = function () return a, b, c, d end
+      i = i + 1
+      local a
+      goto l1
+    end
+  end
+  end
+  ::l2:: return t
+end"#;
+        let rust_proto = compile_rust(source, None);
+        let c_func = unsafe { compile_c(source) };
+
+        let diffs = bytecode_dump::compare_instructions(&rust_proto.code, &c_func.code);
+        let rust_dump = bytecode_dump::dump_instructions(&rust_proto.code);
+        let c_dump = bytecode_dump::dump_c_instructions(&c_func.code, &c_func.constants);
+
+        eprintln!("=== debug_goto_closing_upvalues ===");
+        eprintln!("Differences:\n  {}", diffs.join("\n  "));
+        eprintln!("\nRust instructions:\n{}", rust_dump);
+        eprintln!("\nC instructions:\n{}", c_dump);
+        eprintln!("\nC constants:");
+        for (i, c) in c_func.constants.iter().enumerate() {
+            eprintln!("  {}: {:?}", i, c);
+        }
+        if !diffs.is_empty() {
+            panic!("Instruction mismatch found!");
+        }
+    }
+
+    #[test]
     fn test_goto_out_of_nested_generic_for_with_prior_block() {
         // Variant: a prior do-block creates inactive locals in the Vec,
         // which reglevel must skip when computing CLOSE operand for goto.
@@ -1210,5 +1443,79 @@ do
 end
 "#;
         assert_inst_match(source, None);
+    }
+
+    // ===== 修复回归测试：确保之前修复的 bug 不会复发 =====
+
+    #[test]
+    fn test_upvalue_search_past_non_matching_local() {
+        // Bug: find_upvalue stopped searching when encountering a non-global,
+        // non-matching variable. This caused 'a' to not be found as an upvalue
+        // because the search stopped at 'f' (a local function name).
+        // C's searchvar continues searching past non-matching variables.
+        let source = r#"
+local a = {}
+local function f()
+  a.x = true
+end
+"#;
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn test_for_loop_close_with_upvalue() {
+        // Bug: for loop missing CLOSE instruction because find_upvalue's
+        // break on non-matching non-global variable prevented mark_block_upval.
+        let source = r#"
+for i=1,10 do
+  local a = {}
+  local function f()
+    a.x = true
+  end
+end
+"#;
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn test_global_init_scope_ordering() {
+        // Bug: globalnames evaluated expressions before declaring variables,
+        // causing right-hand side to reference the newly declared global
+        // instead of the outer local. C declares first but doesn't activate
+        // (increase nactvar) until after expression evaluation.
+        let source = r#"
+global<const> print
+do
+  local a = 10
+  local b = 20
+  do global a, b; a, b = a, b end
+end
+"#;
+        assert_inst_match_allow_constants(source);
+    }
+
+    #[test]
+    fn test_global_function_upvalue() {
+        // Bug: global function's body couldn't reference the function itself
+        // as an upvalue because parent_locals excluded GDKREG variables.
+        let source = r#"
+global<const> print
+global function foo()
+  print(foo)
+end
+"#;
+        assert_inst_match_allow_constants(source);
+    }
+
+    #[test]
+    fn test_global_init_nil_fill() {
+        // Bug: global a, b, c = 10 didn't fill b and c with nil.
+        // C's initglobal uses adjust_assign which generates LOADNIL for
+        // missing initializers.
+        let source = r#"
+global<const> print
+do global a, b, c = 10 end
+"#;
+        assert_inst_match_allow_constants(source);
     }
 }
