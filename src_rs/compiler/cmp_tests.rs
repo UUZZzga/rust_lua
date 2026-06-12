@@ -541,6 +541,26 @@ mod compiler_compare_tests {
         assert_inst_match("local x = 1; repeat local a until x>=12", None);
     }
 
+    /// Test that repeat-until with `or` expression and upvalues generates
+    /// correct JMP targets. Before the fix, the `or` short-circuit jump
+    /// skipped the CLOSE instruction (JMP 8 → past CLOSE), but after the
+    /// fix it correctly goes through CLOSE (JMP 4 → CLOSE).
+    #[test]
+    fn test_repeat_until_or_with_upvalue() {
+        assert_inst_match(r#"
+local a = {}
+do
+  local x = 1
+  a[1] = function() return x end
+end
+local i = 0
+repeat
+  local x
+  i = i + 1
+until i > 3 or a[1]() ~= 1
+"#, None);
+    }
+
     // #[test]
     // fn test_big_lua() {
     //     assert_inst_match_file("big.lua");
@@ -681,11 +701,6 @@ end
 "#, None);
     }
 
-    #[test]
-    fn test_code_lua() {
-        assert_inst_match_file("code.lua");
-    }
-
     /// Regression test: <const> variables referenced by child functions should NOT
     /// be captured as upvalues, and should NOT cause extra CLOSE instructions.
     /// Before the fix, RDKCTC variables in parent_locals were incorrectly treated
@@ -725,6 +740,16 @@ do
   local f2 = f1()
 end
 "#, None);
+    }
+
+    #[test]
+    fn test_closure_lua() {
+        assert_inst_match_file("closure.lua");
+    }
+
+    #[test]
+    fn test_code_lua() {
+        assert_inst_match_file("code.lua");
     }
 
     #[test]

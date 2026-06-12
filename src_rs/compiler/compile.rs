@@ -1792,7 +1792,10 @@ fn solve_goto(fs: &mut FuncState, name: &str) {
 
                 if need_close {
                     // Like C's closegoto: move JMP to gt_pc+1, create new CLOSE at gt_pc
-                    let stklevel = fs.reglevel(lb.nactvar);
+                    // C uses reglevel(fs, label->nactvar), but in Rust we can't recompute
+                    // it after deactivation (locals array is sparse). Use the saved reglevel
+                    // from label creation time, which is equivalent.
+                    let stklevel = lb.reglevel;
                     fs.proto.code[(gt_pc + 1) as usize] = fs.proto.code[gt_pc as usize];
                     fs.proto.code[gt_pc as usize] = create_abck(OpCode::CLOSE, stklevel, 0, 0, 0);
                     gt_pc += 1; // Now JMP is at gt_pc
@@ -1849,8 +1852,10 @@ fn solve_gotos_for_block(fs: &mut FuncState, saved_nlabels: usize, saved_nlocals
 
             if gt.close || (fs.labels[lb_idx].nactvar < gt.nactvar && needclose) {
                 // Like C's closegoto: move jump to CLOSE+1, put CLOSE at original position
-                // Use reglevel_for_nlocals to compute stklevel (like C's reglevel(fs, nactvar))
-                let stklevel = fs.reglevel_for_nlocals(fs.labels[lb_idx].nlocals);
+                // C uses reglevel(fs, label->nactvar), but in Rust we can't recompute
+                // it after deactivation (locals array is sparse). Use the saved reglevel
+                // from label creation time, which is equivalent.
+                let stklevel = fs.labels[lb_idx].reglevel;
                 fs.proto.code[(gt_pc + 1) as usize] = fs.proto.code[gt_pc as usize];
                 fs.proto.code[gt_pc as usize] = create_abck(OpCode::CLOSE, stklevel, 0, 0, 0);
                 gt_pc += 1;
@@ -1860,8 +1865,9 @@ fn solve_gotos_for_block(fs: &mut FuncState, saved_nlabels: usize, saved_nlocals
         } else {
             // Unresolved goto: if block has upvalue and goto escapes scope, mark close=true
             // C: if (bl->upval && reglevel(fs, gt->nactvar) > outlevel) gt->close = 1;
-            // Use reglevel_for_nlocals to compute reglevel (like C's reglevel(fs, gt->nactvar))
-            let gt_reglevel = fs.reglevel_for_nlocals(fs.gotos[i].nlocals);
+            // Use the saved reglevel from goto creation time, as we can't recompute
+            // it after deactivation (locals array is sparse).
+            let gt_reglevel = fs.gotos[i].reglevel;
             if needclose && gt_reglevel > outlevel {
                 fs.gotos[i].close = true;
             }
@@ -6193,6 +6199,7 @@ fn parse_while(fs: &mut FuncState) {
     fs.code_sj(OpCode::JMP, loop_start - fs.pc - 1, 0);
 
     // Leave outer block (while loop block, like C's leaveblock)
+    // C's leaveblock order: CLOSE -> freereg -> removevars -> createlabel(break) -> solvegotos
     let has_upval = fs.current_block_has_upval();
     let block_entry = fs.block_stack.pop().unwrap();
     let has_tbc = fs.locals[saved_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
@@ -6200,32 +6207,31 @@ fn parse_while(fs: &mut FuncState) {
     if has_tbc || has_upval {
         fs.code_abc(OpCode::CLOSE, close_reg, 0, 0);
     }
-    // C's leaveblock order: CLOSE -> freereg -> removevars -> solvegotos
     for local in &mut fs.locals[saved_nlocals..] {
         local.active = false;
     }
     fs.set_freereg(close_reg);
-    solve_gotos_for_block(fs, saved_nlabels, saved_nlocals, block_entry.saved_ngotos, has_tbc || has_upval, block_entry.nactvar, block_entry.reglevel);
 
+    // Create break label AFTER CLOSE (like C's createlabel after CLOSE in leaveblock)
+    fs.labels.push(LabelDesc {
+        name: "break".to_string(),
+        pc: fs.pc,
+        nactvar: block_entry.nactvar,
+        nlocals: saved_nlocals,
+        reglevel: block_entry.reglevel,
+        line: 0,
+    });
+
+    solve_gotos_for_block(fs, saved_nlabels, saved_nlocals, block_entry.saved_ngotos, has_tbc || has_upval, block_entry.nactvar, block_entry.reglevel);
+    fs.break_list = saved_breaklist;
+
+    // Patch condexit AFTER leaveblock (like C's luaK_patchtohere after leaveblock)
     let mut cur = condexit;
     while cur != NO_JUMP {
         let next = fs.get_jump(cur);
         fs.fix_jump(cur, fs.pc, false);
         cur = next;
     }
-
-    // Create break label for goto-based break resolution
-    let nactvar = fs.nactvar_up_to(saved_nlocals);
-    fs.labels.push(LabelDesc {
-        name: "break".to_string(),
-        pc: fs.pc,
-        nactvar,
-        nlocals: saved_nlocals,
-        reglevel: fs.reglevel_for_nactvar(nactvar),
-        line: 0,
-    });
-    fs.patch_breaks(fs.pc);
-    fs.break_list = saved_breaklist;
 
     expect(fs, &Token::End);
 }
@@ -6271,24 +6277,11 @@ fn parse_repeat(fs: &mut FuncState) {
     // Parse condition INSIDE bl2 (like C's cond(ls) inside scope block)
     let ei = parse_expr(fs);
 
-    // Leave bl2 (finish scope, like C's leaveblock)
-    let bl2_has_upval = fs.current_block_has_upval();
-    let bl2_entry = fs.block_stack.pop().unwrap();
-    let bl2_has_tbc = fs.locals[bl2_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
-    let bl2_close_reg = fs.nvarstack_up_to(bl2_nlocals);
-    if bl2_has_tbc || bl2_has_upval {
-        fs.code_abc(OpCode::CLOSE, bl2_close_reg, 0, 0);
-    }
-    for local in &mut fs.locals[bl2_nlocals..] {
-        local.active = false;
-    }
-    fs.set_freereg(bl2_close_reg);
-    solve_gotos_for_block(fs, bl2_nlabels, bl2_nlocals, bl2_entry.saved_ngotos, bl2_has_tbc || bl2_has_upval, bl2_entry.nactvar, bl2_entry.reglevel);
-
+    // Handle condition BEFORE leaveblock (like C's cond → luaK_goiftrue)
+    // This patches true jumps to current PC, which is where CLOSE will be emitted
     let is_const_true = matches!(ei.exp.kind, ExpKind::Boolean if ei.exp.info != 0)
         || matches!(ei.exp.kind, ExpKind::Int | ExpKind::Float | ExpKind::Str);
 
-    // Handle condition and upvalue CLOSE logic (like C's repeatstat)
     let mut condexit: i32 = NO_JUMP;
 
     if !is_const_true {
@@ -6337,6 +6330,21 @@ fn parse_repeat(fs: &mut FuncState) {
         }
     }
 
+    // Leave bl2 (finish scope, like C's leaveblock)
+    // CLOSE will be emitted at current PC, which is where true jumps point
+    let bl2_has_upval = fs.current_block_has_upval();
+    let bl2_entry = fs.block_stack.pop().unwrap();
+    let bl2_has_tbc = fs.locals[bl2_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
+    let bl2_close_reg = fs.nvarstack_up_to(bl2_nlocals);
+    if bl2_has_tbc || bl2_has_upval {
+        fs.code_abc(OpCode::CLOSE, bl2_close_reg, 0, 0);
+    }
+    for local in &mut fs.locals[bl2_nlocals..] {
+        local.active = false;
+    }
+    fs.set_freereg(bl2_close_reg);
+    solve_gotos_for_block(fs, bl2_nlabels, bl2_nlocals, bl2_entry.saved_ngotos, bl2_has_tbc || bl2_has_upval, bl2_entry.nactvar, bl2_entry.reglevel);
+
     // If bl2 has upvalues, emit CLOSE fix (like C's repeatstat upvalue handling)
     if bl2_has_upval {
         let exit = fs.jump();  // normal exit must jump over fix
@@ -6360,20 +6368,8 @@ fn parse_repeat(fs: &mut FuncState) {
         cur = next;
     }
 
-    // Create break label for goto-based break resolution
-    let nactvar = fs.nactvar_up_to(bl1_nlocals);
-    fs.labels.push(LabelDesc {
-        name: "break".to_string(),
-        pc: fs.pc,
-        nactvar,
-        nlocals: bl1_nlocals,
-        reglevel: fs.reglevel_for_nactvar(nactvar),
-        line: 0,
-    });
-    fs.patch_breaks(fs.pc);
-    fs.break_list = saved_breaklist;
-
     // Leave bl1 (finish loop, like C's leaveblock)
+    // C's leaveblock order: CLOSE -> freereg -> removevars -> createlabel(break) -> solvegotos
     let bl1_has_upval = fs.current_block_has_upval();
     let bl1_entry = fs.block_stack.pop().unwrap();
     let bl1_has_tbc = fs.locals[bl1_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
@@ -6385,7 +6381,19 @@ fn parse_repeat(fs: &mut FuncState) {
         local.active = false;
     }
     fs.set_freereg(bl1_close_reg);
+
+    // Create break label AFTER CLOSE (like C's createlabel after CLOSE in leaveblock)
+    fs.labels.push(LabelDesc {
+        name: "break".to_string(),
+        pc: fs.pc,
+        nactvar: bl1_entry.nactvar,
+        nlocals: bl1_nlocals,
+        reglevel: bl1_entry.reglevel,
+        line: 0,
+    });
+
     solve_gotos_for_block(fs, bl1_nlabels, bl1_nlocals, bl1_entry.saved_ngotos, bl1_has_tbc || bl1_has_upval, bl1_entry.nactvar, bl1_entry.reglevel);
+    fs.break_list = saved_breaklist;
 }
 
 /// ANTLR4: `'for' NAME '=' expr ',' expr (',' expr)? 'do' block 'end' ;` (numeric for) 以及 `'for' namelist 'in' explist 'do' block 'end' ;` (generic for)
@@ -6509,10 +6517,9 @@ fn parse_for(fs: &mut FuncState) {
             reglevel: forstat_entry.reglevel,
             line: 0,
         });
-        fs.patch_breaks(fs.pc);
-        fs.break_list = saved_breaklist;
 
         solve_gotos_for_block(fs, forstat_nlabels, forstat_nlocals, forstat_entry.saved_ngotos, forstat_has_tbc || has_forstat_upval, forstat_entry.nactvar, forstat_entry.reglevel);
+        fs.break_list = saved_breaklist;
         expect(fs, &Token::End);
     } else {
         let mut vars = vec![name];
@@ -6676,12 +6683,11 @@ fn parse_for(fs: &mut FuncState) {
             reglevel: forstat_entry.reglevel,
             line: 0,
         });
-        fs.patch_breaks(fs.pc);
-        fs.break_list = saved_breaklist;
 
         expect(fs, &Token::End);
 
         solve_gotos_for_block(fs, forstat_nlabels, forstat_nlocals, forstat_entry.saved_ngotos, forstat_has_tbc || has_forstat_upval, forstat_entry.nactvar, forstat_entry.reglevel);
+        fs.break_list = saved_breaklist;
     }
 }
 
