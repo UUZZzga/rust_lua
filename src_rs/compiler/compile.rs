@@ -2018,10 +2018,10 @@ fn getglobalattribute(fs: &mut FuncState, df: i32) -> i32 {
     }
 }
 
-/// Emit GETTABUP or fallback to GETUPVAL+LOADK+GETTABLE when constant index > MAXINDEXRK
+/// Emit GETTABUP or fallback to GETUPVAL+LOADK+GETTABLE when constant is not a short string
 /// Returns the PC of the instruction that produces the result.
 fn code_gettabup(fs: &mut FuncState, r: i32, upval: i32, k: i32) -> i32 {
-    if (k as u32) <= crate::opcodes::MAXINDEXRK {
+    if is_kstr(fs, k) {
         fs.code_abc(OpCode::GETTABUP, r, upval, k)
     } else {
         fs.code_abc(OpCode::GETUPVAL, r, upval, 0);
@@ -2033,9 +2033,9 @@ fn code_gettabup(fs: &mut FuncState, r: i32, upval: i32, k: i32) -> i32 {
     }
 }
 
-/// Emit SETTABUP or fallback to GETUPVAL+LOADK+SETTABLE when constant index > MAXINDEXRK
+/// Emit SETTABUP or fallback to GETUPVAL+LOADK+SETTABLE when constant is not a short string
 fn code_settabup(fs: &mut FuncState, upval: i32, k: i32, val: i32) {
-    if (k as u32) <= crate::opcodes::MAXINDEXRK {
+    if is_kstr(fs, k) {
         fs.code_abc(OpCode::SETTABUP, upval, k, val);
     } else {
         let r = fs.alloc_reg();
@@ -2048,9 +2048,9 @@ fn code_settabup(fs: &mut FuncState, upval: i32, k: i32, val: i32) {
     }
 }
 
-/// Emit SETTABUP with k-bit or fallback to GETUPVAL+LOADK+SETTABLE when constant index > MAXINDEXRK
+/// Emit SETTABUP with k-bit or fallback to GETUPVAL+LOADK+SETTABLE when constant is not a short string
 fn code_settabup_k(fs: &mut FuncState, upval: i32, k: i32, val: i32, is_k: bool) {
-    if (k as u32) <= crate::opcodes::MAXINDEXRK {
+    if is_kstr(fs, k) {
         fs.code_abc_k(OpCode::SETTABUP, upval, k, val, is_k);
     } else {
         let r = fs.alloc_reg();
@@ -2063,10 +2063,25 @@ fn code_settabup_k(fs: &mut FuncState, upval: i32, k: i32, val: i32, is_k: bool)
     }
 }
 
-/// Emit GETFIELD or fallback to LOADK+GETTABLE when constant index > MAXINDEXRK
+/// Check if a constant at index k is a short string that can be used with
+/// GETFIELD/SETFIELD/GETTABUP/SETTABUP (matches C's isKstr).
+/// GETFIELD/SETFIELD can only encode short string constants in their operand;
+/// long strings must be loaded via LOADK + GETTABLE/SETTABLE.
+fn is_kstr(fs: &FuncState, k: i32) -> bool {
+    if (k as u32) > crate::opcodes::MAXINDEXRK {
+        return false;
+    }
+    if let Some(tv) = fs.proto.constants.get(k as usize) {
+        matches!(tv, TValue::Str(crate::strings::LuaString::Short(_)))
+    } else {
+        false
+    }
+}
+
+/// Emit GETFIELD or fallback to LOADK+GETTABLE when constant is not a short string
 /// Returns the PC of the instruction that produces the result.
 fn code_getfield(fs: &mut FuncState, r: i32, table: i32, k: i32) -> i32 {
-    if (k as u32) <= crate::opcodes::MAXINDEXRK {
+    if is_kstr(fs, k) {
         fs.code_abc(OpCode::GETFIELD, r, table, k)
     } else if r != table {
         // Optimization: use result register for LOADK (same as C++ compiler's codegetfield)
@@ -2082,9 +2097,9 @@ fn code_getfield(fs: &mut FuncState, r: i32, table: i32, k: i32) -> i32 {
     }
 }
 
-/// Emit SETFIELD or fallback to LOADK+SETTABLE when constant index > MAXINDEXRK
+/// Emit SETFIELD or fallback to LOADK+SETTABLE when constant is not a short string
 fn code_setfield(fs: &mut FuncState, table: i32, k: i32, val: i32) {
-    if (k as u32) <= crate::opcodes::MAXINDEXRK {
+    if is_kstr(fs, k) {
         fs.code_abc_k(OpCode::SETFIELD, table, k, val, false);
     } else {
         let kr = fs.alloc_reg();
@@ -2094,9 +2109,9 @@ fn code_setfield(fs: &mut FuncState, table: i32, k: i32, val: i32) {
     }
 }
 
-/// Emit SETFIELD with k-bit or fallback to LOADK+SETTABLE when constant index > MAXINDEXRK
+/// Emit SETFIELD with k-bit or fallback to LOADK+SETTABLE when constant is not a short string
 fn code_setfield_k(fs: &mut FuncState, table: i32, k: i32, val: i32, is_k: bool) {
-    if (k as u32) <= crate::opcodes::MAXINDEXRK {
+    if is_kstr(fs, k) {
         fs.code_abc_k(OpCode::SETFIELD, table, k, val, is_k);
     } else {
         let kr = fs.alloc_reg();
@@ -2634,7 +2649,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
             vars.push(new_var);
         }
         expect(fs, &Token::Eq);
-        
+
         // C compiler evaluates the left side before the right side.
         // For var_name with key > MAXINDEXRK, SETTABUP can't be used, so we must
         // emit GETUPVAL+LOADK now (before evaluating the right side), matching C's
@@ -3032,7 +3047,7 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
                         fs.free_reg();
                     }
                 }
-            } else if e.kind == ExpKind::NonReloc && e.info2 == 0 {
+            } else if e.kind == ExpKind::NonReloc && e.info2 < 0 {
                 let val_reg = e.info as i32;
                 if dest != val_reg {
                     fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
@@ -3145,7 +3160,12 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
             fs.code_abc(OpCode::SELF, freg, src, k);
         } else {
             // Long method name: use MOVE + GETTABLE instead of SELF
-            let kr = fs.alloc_reg();
+            // Like C's luaK_self: reserve base and base+1 first, then alloc key reg
+            // This ensures key reg is at base+2, not overlapping with base+1 (self copy)
+            while fs.freereg < freg + 2 {
+                fs.alloc_reg();
+            }
+            let kr = fs.alloc_reg();   // key reg at freg+2 or higher
             fs.code_abx(OpCode::LOADK, kr, k);
             fs.code_abc(OpCode::MOVE, freg + 1, src, 0);
             fs.code_abc(OpCode::GETTABLE, freg, src, kr);
@@ -4351,6 +4371,11 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         _ => None,
                     };
                     if let Some(k) = k_idx {
+                        // Like C's freeexps: free e1's register if it's a temporary
+                        if matches!(ec.kind, ExpKind::NonReloc | ExpKind::Relocable | ExpKind::Call)
+                            && r >= fs.nvarstack() && r == fs.freereg - 1 {
+                            fs.free_reg();
+                        }
                         let dest = fs.alloc_reg();
                         fs.code_abc(OpCode::BANDK, dest, r, k);
                         fs.code_abc(OpCode::MMBINK, r, k, 13);
@@ -5139,7 +5164,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         // free e2's register, allocate result register, set A.
                         let pc = fs.code_abc(OpCode::MULK, 0, r2, k);
                         // Free e2's register if it's a temp (not in varstack) - like C's freeexps
-                        if matches!(e2.exp.kind, ExpKind::NonReloc) && r2 >= fs.nvarstack() && r2 == fs.freereg - 1 {
+                        // C's dischargevars converts VCALL to VNONRELOC, then freeexps frees it.
+                        // In Rust, Call expressions keep their kind, so we need to handle them too.
+                        if matches!(e2.exp.kind, ExpKind::NonReloc | ExpKind::Call) && r2 >= fs.nvarstack() && r2 == fs.freereg - 1 {
                             fs.free_reg();
                         } else if matches!(e2.exp.kind, ExpKind::Relocable) && r2 == fs.freereg - 1 && r2 >= fs.nvarstack() {
                             fs.free_reg();
@@ -5156,7 +5183,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         if r >= fs.nvarstack() && r == fs.freereg - 1 && r != r2 {
                             fs.free_reg();
                         }
-                        if matches!(e2.exp.kind, ExpKind::NonReloc) && r2 >= fs.nvarstack() && r2 == fs.freereg - 1 {
+                        if matches!(e2.exp.kind, ExpKind::NonReloc | ExpKind::Call) && r2 >= fs.nvarstack() && r2 == fs.freereg - 1 {
                             fs.free_reg();
                         } else if matches!(e2.exp.kind, ExpKind::Relocable) && r2 == fs.freereg - 1 && r2 >= fs.nvarstack() {
                             fs.free_reg();
@@ -5185,7 +5212,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         // free e2's register, allocate result register, set A.
                         let pc = fs.code_abc(OpCode::MULK, 0, r2, k);
                         // Free e2's register if it's a temp (not in varstack) - like C's freeexps
-                        if matches!(e2.exp.kind, ExpKind::NonReloc) && r2 >= fs.nvarstack() && r2 == fs.freereg - 1 {
+                        // C's dischargevars converts VCALL to VNONRELOC, then freeexps frees it.
+                        // In Rust, Call expressions keep their kind, so we need to handle them too.
+                        if matches!(e2.exp.kind, ExpKind::NonReloc | ExpKind::Call) && r2 >= fs.nvarstack() && r2 == fs.freereg - 1 {
                             fs.free_reg();
                         } else if matches!(e2.exp.kind, ExpKind::Relocable) && r2 == fs.freereg - 1 && r2 >= fs.nvarstack() {
                             fs.free_reg();
@@ -5202,7 +5231,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         if r >= fs.nvarstack() && r == fs.freereg - 1 && r != r2 {
                             fs.free_reg();
                         }
-                        if matches!(e2.exp.kind, ExpKind::NonReloc) && r2 >= fs.nvarstack() && r2 == fs.freereg - 1 {
+                        if matches!(e2.exp.kind, ExpKind::NonReloc | ExpKind::Call) && r2 >= fs.nvarstack() && r2 == fs.freereg - 1 {
                             fs.free_reg();
                         } else if matches!(e2.exp.kind, ExpKind::Relocable) && r2 == fs.freereg - 1 && r2 >= fs.nvarstack() {
                             fs.free_reg();
@@ -5530,30 +5559,30 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
     let mut e = match &fs.ls().token {
         Token::Nil => {
             fs.ls_mut().next();
-            ExpDesc::new(ExpKind::Nil, 0)
+            return ExprItem { exp: ExpDesc::new(ExpKind::Nil, 0) };
         }
         Token::True => {
             fs.ls_mut().next();
-            ExpDesc::new(ExpKind::Boolean, 1)
+            return ExprItem { exp: ExpDesc::new(ExpKind::Boolean, 1) };
         }
         Token::False => {
             fs.ls_mut().next();
-            ExpDesc::new(ExpKind::Boolean, 0)
+            return ExprItem { exp: ExpDesc::new(ExpKind::Boolean, 0) };
         }
         Token::Int(v) => {
             let val = *v;
             fs.ls_mut().next();
-            ExpDesc::new(ExpKind::Int, val)
+            return ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
         }
         Token::Float(v) => {
             let val = *v;
             fs.ls_mut().next();
-            ExpDesc::new(ExpKind::Float, val.to_bits() as i64)
+            return ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
         }
         Token::String(s) => {
             let s = s.clone();
             fs.ls_mut().next();
-            ExpDesc::new_str(s)
+            return ExprItem { exp: ExpDesc::new_str(s) };
         }
         Token::DotDotDot => {
             fs.ls_mut().next();
@@ -5669,7 +5698,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     if call_pc >= 0 {
                         setarg(&mut fs.proto.code[call_pc as usize], 2, POS_C, SIZE_C);
                     }
-                    ExpDesc { kind: ExpKind::NonReloc, info: ei.exp.info, info2: 0, t: NO_JUMP, f: NO_JUMP, str_val: None }
+                    ExpDesc { kind: ExpKind::NonReloc, info: ei.exp.info, info2: -1, t: NO_JUMP, f: NO_JUMP, str_val: None }
                 }
                 _ => ei.exp,
             }
@@ -6781,6 +6810,12 @@ fn parse_func_stat(fs: &mut FuncState) {
     }
 
     let first_name = &chain[0].1;
+    // Like C's funcname: build the table expression, then store the closure.
+    // C uses delayed expression evaluation (VINDEXSTR), generating GETFIELD lazily.
+    // We simulate this by tracking the table register and freeing it before
+    // allocating the result register for GETFIELD (so the result reuses the
+    // table's register, matching C's behavior).
+    let saved_freereg = fs.freereg;
     let mut base_reg = if fs.find_global_decl(first_name).is_some() {
         // Variable is declared as global: load from _ENV
         if let Some(env_reg) = fs.find_local("_ENV") {
@@ -6795,9 +6830,11 @@ fn parse_func_stat(fs: &mut FuncState) {
             r
         }
     } else if let Some(reg) = fs.find_local(first_name) {
-        let r = fs.alloc_reg();
-        fs.code_abc(OpCode::MOVE, r, reg, 0);
-        r
+        // Like C's singlevar for VLOCAL: dischargevars makes it VNONRELOC,
+        // then luaK_exp2anyregup returns the register directly.
+        // The register will be freed when the first GETFIELD is generated
+        // (matching C's freereg in dischargevars for VINDEXSTR).
+        reg
     } else if let Some(env_reg) = fs.find_local("_ENV") {
         // _ENV is a local variable: use GETFIELD
         let r = fs.alloc_reg();
@@ -6811,19 +6848,52 @@ fn parse_func_stat(fs: &mut FuncState) {
         r
     };
 
+    // Process intermediate field accesses (like C's fieldsel loop).
+    // Each intermediate access generates a GETFIELD instruction.
+    // Like C: before generating GETFIELD, free the table register so the
+    // result register can reuse it (matching C's dischargevars+exp2nextreg).
+    // In C, dischargevars for VINDEXSTR calls freereg(ind.t), which frees
+    // the table register if it's a temporary (>= nvarstack). Then exp2nextreg
+    // allocates a new register that reuses the just-freed slot.
     let last_idx = chain.len() - 1;
     for i in 1..last_idx {
         let (_col, fname) = &chain[i];
         let k = fs.string_k(fname);
-        fs.code_abc(OpCode::GETTABLE, base_reg, base_reg, k);
+        // Free the table register if it's a temporary (like C's freereg in dischargevars)
+        if base_reg >= fs.nvarstack() && base_reg == fs.freereg - 1 {
+            fs.free_reg();
+        }
+        let r = fs.alloc_reg();
+        code_getfield(fs, r, base_reg, k);
+        base_reg = r;
     }
 
+    // Parse the function body and store the closure.
+    // Like C's funcstat: funcname calls luaK_indexed which may LOADK the key
+    // (if it's a long string) before body creates the closure.
     let (is_colon, last_name) = &chain[last_idx];
-    let freg = parse_body_ex(fs, *is_colon, None);
     let fk = fs.string_k(last_name);
-    fs.code_abc(OpCode::SETTABLE, base_reg, fk, freg);
-    fs.free_reg();
-    fs.free_reg();
+    let fk_is_kstr = is_kstr(fs, fk);
+    // If key is not a short string, load it into a register now (before parse_body_ex),
+    // matching C's luaK_indexed which calls luaK_exp2anyreg for non-Kstr keys.
+    let key_reg = if fk_is_kstr {
+        -1i32  // sentinel: will use SETFIELD with inline constant
+    } else {
+        let kr = fs.alloc_reg();
+        fs.code_abx(OpCode::LOADK, kr, fk);
+        kr
+    };
+    let freg = parse_body_ex(fs, *is_colon, None);
+    if fk_is_kstr {
+        // Key is a short string: use SETFIELD with inline constant
+        fs.code_abc_k(OpCode::SETFIELD, base_reg, fk, freg, false);
+    } else {
+        // Key was loaded to key_reg: use SETTABLE
+        fs.code_abc_k(OpCode::SETTABLE, base_reg, key_reg, freg, false);
+    }
+    // Free all temporary registers allocated above (base_reg for non-locals,
+    // intermediate GETFIELD results, and freg for the closure).
+    fs.set_freereg(saved_freereg);
 }
 
 /// ANTLR4: `'local' 'function' NAME funcbody | 'local' attnamelist ('=' explist)? ;`

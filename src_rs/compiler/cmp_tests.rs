@@ -743,6 +743,92 @@ end
     }
 
     #[test]
+    fn test_local_func_in_func() {
+        assert_inst_match(r#"
+local Z = function (le)
+      local function a (f)
+        return le(function (x) return f(f)(x) end)
+      end
+      return a(a)
+    end
+
+local F = function (f)
+      return function (n)
+               if n == 0 then return 1
+               else return n*f(n-1) end
+             end
+    end
+
+assert(5*Z(F)(4)==5 and Z(F)(5)==5*Z(F)(4))
+"#, None);
+    }
+
+    #[test]
+    fn test_local_shadow_assign() {
+        assert_inst_match(r#"
+local a = {i = 10}
+do
+  local a = {}
+  a = 1
+end
+a = nil
+(function (x) a=x end)(23)
+assert(a == 23)
+"#, None);
+    }
+
+    #[test]
+    fn test_nil_not_callable() {
+        // Constants (nil, true, false, numbers, strings) should NOT be treated
+        // as function calls. Before the fix, `nil(...)` was incorrectly parsed
+        // as a function call chain, producing extra CALL+MOVE instructions.
+        assert_inst_match(r#"
+local a = 1
+a = nil
+(function(x) a = x end)(23)
+assert(a == 23)
+"#, None);
+    }
+
+    #[test]
+    fn test_paren_const_method_call() {
+        // Parenthesized constants CAN have call suffixes.
+        // (''):format(...) is valid and must use LOADK+GETTABLE (not SELF)
+        // for long method names.
+        assert_inst_match("local x = (''):format('%d', 1)", None);
+    }
+
+    #[test]
+    fn test_long_method_name_func_stat() {
+        // Long method names (> LUAI_MAXSHORTLEN) in function definitions
+        // must use LOADK+SETTABLE instead of SETFIELD.
+        // Before the fix, SETFIELD was incorrectly used for long string keys.
+        assert_inst_match(r#"
+local t = {x = 1}
+function t:_012345678901234567890123456789012345678901234567890123456789 ()
+  return self.x
+end
+assert(t:_012345678901234567890123456789012345678901234567890123456789() == 1)
+"#, None);
+    }
+
+    #[test]
+    fn test_bandk_reg_reuse() {
+        // BANDK should reuse the left operand's register when it's a temporary.
+        // Before the fix, the left operand's register was not freed, causing
+        // a register offset of 1 in subsequent instructions.
+        assert_inst_match(r#"
+local a = (1 + 1) & 255
+assert(a == 2)
+"#, None);
+    }
+
+    #[test]
+    fn test_calls_lua() {
+        assert_inst_match_file("calls.lua");
+    }
+
+    #[test]
     fn test_closure_lua() {
         assert_inst_match_file("closure.lua");
     }
