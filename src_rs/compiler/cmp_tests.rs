@@ -996,6 +996,61 @@ assert(a == 2)
     }
 
     #[test]
+    fn test_events_lua() {
+        assert_inst_match_file("events.lua");
+    }
+
+    // ===== ADDK 交换律优化测试 =====
+    // Float 常量在加法左操作数时，应交换操作数使用 ADDK+MMBINK 而非 LOADK+ADD+MMBIN
+
+    #[test]
+    fn test_addk_float_commutative() {
+        // 5.2 + b => ADDK + MMBINK (flip=true)
+        // 如果缺少交换律优化，会生成 LOADK + ADD + MMBIN
+        let source = "local b = 1; return 5.2 + b";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn test_addk_float_commutative_global() {
+        // 全局变量的 Float 加法交换律优化
+        let source = "return 3.14 + x";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn test_addk_float_commutative_chain() {
+        // 链式 Float 加法：1.5 + a + b
+        let source = "local a = 1; local b = 2; return 1.5 + a + b";
+        assert_inst_match(source, None);
+    }
+
+    // ===== GETFIELD 短字符串索引优化测试 =====
+    // table["shortkey"] 中 key 为短字符串时，应使用 GETFIELD 而非 LOADK+GETTABLE
+
+    #[test]
+    fn test_getfield_bracket_short_string() {
+        // (10)["3"] => GETFIELD (key "3" 是短字符串)
+        // 如果缺少 GETFIELD 优化，会生成 LOADK + GETTABLE
+        let source = "return (10)['3']";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn test_getfield_bracket_short_string_local() {
+        // local t = {}; t["key"] => GETFIELD
+        let source = "local t = {}; return t['key']";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn test_getfield_bracket_short_string_global() {
+        // 全局表索引短字符串 key => GETFIELD
+        let source = "return x['name']";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
     fn test_goto_lua() {
         assert_inst_match_file_allow_constants("goto.lua");
     }
