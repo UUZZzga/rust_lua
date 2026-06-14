@@ -918,6 +918,29 @@ assert(a == 2)
     }
 
     #[test]
+    fn test_not_table_constructor() {
+        // Bug: constructor expression was incorrectly marked as Relocable instead of NonReloc,
+        // causing an extra MOVE instruction before NOT when applying 'not' to a table constructor.
+        assert_inst_match("return not {}", None);
+    }
+
+    #[test]
+    fn test_not_table_constructor_in_expr() {
+        // More complex case: not applied to table constructor in a comparison
+        assert_inst_match("return not {} == false", None);
+    }
+
+    #[test]
+    fn test_attrib_lua() {
+        assert_inst_match_file("attrib.lua");
+    }
+
+    #[test]
+    fn test_big_lua() {
+        assert_inst_match_file("big.lua");
+    }
+
+    #[test]
     fn test_bitwise_lua() {
         assert_inst_match_file("bitwise.lua");
     }
