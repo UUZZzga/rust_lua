@@ -7271,73 +7271,87 @@ fn parse_func_stat(fs: &mut FuncState) {
 
     if chain.len() == 1 {
         let name = &chain[0].1;
-        let r = parse_body_ex(fs, false, None);
         // Check for global declaration first (like C's searchvar/buildvar)
         let global_kind = fs.find_global_decl(name);
-        if global_kind.is_some() {
-            // Variable is declared as global: store through _ENV
-            let k = fs.string_k(name);
-            let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
-                && (k as u32) <= crate::opcodes::MAXINDEXRK;
-            if let Some(env_reg) = fs.find_local("_ENV") {
-                if is_short_str {
-                    fs.code_abc(OpCode::SETFIELD, env_reg, k, r);
-                } else {
+        let k = fs.string_k(name);
+        let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
+            && (k as u32) <= crate::opcodes::MAXINDEXRK;
+
+        // Like C's funcstat: for non-short-string keys, evaluate table and key
+        // BEFORE parse_body_ex (which generates CLOSURE), matching C's evaluation
+        // order: table -> key -> value (CLOSURE).
+        let mut pre_eval: Option<(i32, i32)> = None; // (table_reg, key_reg)
+        if !is_short_str {
+            if global_kind.is_some() {
+                if let Some(env_reg) = fs.find_local("_ENV") {
                     let env_r = fs.alloc_reg();
                     fs.code_abc(OpCode::MOVE, env_r, env_reg, 0);
                     let kr = fs.alloc_reg();
                     fs.code_abx(OpCode::LOADK, kr, k);
-                    fs.code_abc(OpCode::SETTABLE, env_r, kr, r);
-                    fs.free_reg();
-                    fs.free_reg();
-                }
-            } else {
-                if is_short_str {
-                    code_settabup(fs, 0, k, r);
+                    pre_eval = Some((env_r, kr));
                 } else {
                     let env_r = fs.alloc_reg();
                     fs.code_abc(OpCode::GETUPVAL, env_r, 0, 0);
                     let kr = fs.alloc_reg();
                     fs.code_abx(OpCode::LOADK, kr, k);
-                    fs.code_abc(OpCode::SETTABLE, env_r, kr, r);
-                    fs.free_reg();
-                    fs.free_reg();
+                    pre_eval = Some((env_r, kr));
+                }
+            } else if fs.find_local(name).is_none() {
+                // Like C's funcstat: resolve through _ENV
+                if let Some(env_reg) = fs.find_local("_ENV") {
+                    let env_r = fs.alloc_reg();
+                    fs.code_abc(OpCode::MOVE, env_r, env_reg, 0);
+                    let kr = fs.alloc_reg();
+                    fs.code_abx(OpCode::LOADK, kr, k);
+                    pre_eval = Some((env_r, kr));
+                } else {
+                    let env_r = fs.alloc_reg();
+                    fs.code_abc(OpCode::GETUPVAL, env_r, 0, 0);
+                    let kr = fs.alloc_reg();
+                    fs.code_abx(OpCode::LOADK, kr, k);
+                    pre_eval = Some((env_r, kr));
+                }
+            }
+        }
+
+        let r = parse_body_ex(fs, false, None);
+
+        if let Some((table_reg, key_reg)) = pre_eval {
+            fs.code_abc(OpCode::SETTABLE, table_reg, key_reg, r);
+            fs.free_reg(); // free key_reg
+            fs.free_reg(); // free table_reg
+        } else if global_kind.is_some() {
+            // Variable is declared as global: store through _ENV
+            if let Some(env_reg) = fs.find_local("_ENV") {
+                if is_short_str {
+                    fs.code_abc(OpCode::SETFIELD, env_reg, k, r);
+                } else {
+                    unreachable!(); // handled by pre_eval
+                }
+            } else {
+                if is_short_str {
+                    code_settabup(fs, 0, k, r);
+                } else {
+                    unreachable!(); // handled by pre_eval
                 }
             }
         } else if let Some(reg) = fs.find_local(name) {
             fs.code_abc(OpCode::MOVE, reg, r, 0);
         } else {
             // Like C's funcstat: resolve through _ENV (which may be local or upvalue)
-            let k = fs.string_k(name);
-            let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
-                && (k as u32) <= crate::opcodes::MAXINDEXRK;
             if let Some(env_reg) = fs.find_local("_ENV") {
                 // _ENV is a local variable: use SETFIELD
                 if is_short_str {
                     fs.code_abc(OpCode::SETFIELD, env_reg, k, r);
                 } else {
-                    // Key exceeds MAXINDEXRK: load _ENV into temp register first
-                    let env_r = fs.alloc_reg();
-                    fs.code_abc(OpCode::MOVE, env_r, env_reg, 0);
-                    let kr = fs.alloc_reg();
-                    fs.code_abx(OpCode::LOADK, kr, k);
-                    fs.code_abc(OpCode::SETTABLE, env_r, kr, r);
-                    fs.free_reg(); // free kr
-                    fs.free_reg(); // free env_r
+                    unreachable!(); // handled by pre_eval
                 }
             } else {
                 // _ENV is an upvalue: use SETTABUP
                 if is_short_str {
                     code_settabup(fs, 0, k, r);
                 } else {
-                    // Key exceeds MAXINDEXRK: load _ENV into temp register first
-                    let env_r = fs.alloc_reg();
-                    fs.code_abc(OpCode::GETUPVAL, env_r, 0, 0);
-                    let kr = fs.alloc_reg();
-                    fs.code_abx(OpCode::LOADK, kr, k);
-                    fs.code_abc(OpCode::SETTABLE, env_r, kr, r);
-                    fs.free_reg(); // free kr
-                    fs.free_reg(); // free env_r
+                    unreachable!(); // handled by pre_eval
                 }
             }
         }
@@ -7479,16 +7493,25 @@ fn parse_local(fs: &mut FuncState) {
                         if r != target {
                             fs.code_abc(OpCode::MOVE, target, r, 0);
                         }
+                        if ei.exp.t != NO_JUMP || ei.exp.f != NO_JUMP {
+                            fs.resolve_jumps(&ei.exp, target);
+                        }
                         last_exp = Some(ExpDesc::new(ExpKind::NonReloc, target as i64));
                     }
                     ExpKind::Relocable => {
                         if ei.exp.info2 >= 0 {
                             fs.set_a(ei.exp.info2, target);
+                            if ei.exp.t != NO_JUMP || ei.exp.f != NO_JUMP {
+                                fs.resolve_jumps(&ei.exp, target);
+                            }
                             last_exp = Some(ExpDesc::new(ExpKind::NonReloc, target as i64));
                         } else {
                             let r = ei.exp.info as i32;
                             if r != target {
                                 fs.code_abc(OpCode::MOVE, target, r, 0);
+                            }
+                            if ei.exp.t != NO_JUMP || ei.exp.f != NO_JUMP {
+                                fs.resolve_jumps(&ei.exp, target);
                             }
                             last_exp = Some(ExpDesc::new(ExpKind::Relocable, target as i64));
                         }

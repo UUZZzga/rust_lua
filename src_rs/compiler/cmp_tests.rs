@@ -991,6 +991,11 @@ assert(a == 2)
     }
 
     #[test]
+    fn test_errors_lua() {
+        assert_inst_match_file("errors.lua");
+    }
+
+    #[test]
     fn test_goto_lua() {
         assert_inst_match_file_allow_constants("goto.lua");
     }
@@ -1138,6 +1143,45 @@ assert(a == 2)
         }
         // "readField" will have a constant index > 255
         source.push_str("return _ENV.readField");
+        assert_inst_match(&source, None);
+    }
+
+    #[test]
+    fn test_or_with_relocable_in_local() {
+        // Test that TESTSET is converted to TEST when `or` expression with
+        // a Relocable right operand (e.g., NEWTABLE) is used in local declaration.
+        // Previously, parse_local did not call resolve_jumps for Relocable expressions,
+        // leaving TESTSET unconverted and JMP offset wrong.
+        assert_inst_match("local a; local mt = a or {}", None);
+    }
+
+    #[test]
+    fn test_or_with_relocable_nonrelloc_in_local() {
+        // Test that TESTSET is converted to TEST when `or` expression with
+        // a NonReloc right operand is used in local declaration.
+        assert_inst_match("local a,b; local c = a or b", None);
+    }
+
+    #[test]
+    fn test_and_with_relocable_in_local() {
+        // Test that TESTSET is converted to TEST when `and` expression with
+        // a Relocable right operand is used in local declaration.
+        assert_inst_match("local a; local b = a and a", None);
+    }
+
+    #[test]
+    fn test_func_stat_long_name_closure_order() {
+        // Test that for function declarations with non-short-string names
+        // (constant index > MAXINDEXRK), the compiler evaluates table and key
+        // BEFORE CLOSURE, matching C compiler's evaluation order.
+        // Previously, CLOSURE was emitted before GETUPVAL+LOADK.
+        let mut source = String::new();
+        for i in 0..256 {
+            if i % 5 == 0 { source.push('\n'); }
+            source.push_str(&format!("_ = \"s{:03}\"; ", i));
+        }
+        // "longFuncName" will have a constant index > 255
+        source.push_str("function longFuncName() end");
         assert_inst_match(&source, None);
     }
 
