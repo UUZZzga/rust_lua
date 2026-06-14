@@ -813,6 +813,100 @@ assert(t:_012345678901234567890123456789012345678901234567890123456789() == 1)
     }
 
     #[test]
+    fn test_not_in_if_condition() {
+        // NOT operator in if condition should produce TEST with NOT's B operand
+        // as the register, not VRELOC's info (which is 0).
+        // Before fix: TEST 0 k (wrong register 0)
+        // After fix: TEST 1 k (correct register from NOT's B operand)
+        assert_inst_match(r#"
+local x = true
+if not x then
+  x = false
+end
+"#, None);
+    }
+
+    #[test]
+    fn test_not_in_while_condition() {
+        // NOT operator in while condition should produce TEST with NOT's B operand.
+        // Before fix: TEST 0 k (wrong register)
+        assert_inst_match(r#"
+local x = true
+while not x do
+  x = false
+end
+"#, None);
+    }
+
+    #[test]
+    fn test_not_in_elseif_condition() {
+        // NOT operator in elseif condition should produce TEST with NOT's B operand.
+        assert_inst_match(r#"
+local x = true
+if x then
+  x = false
+elseif not x then
+  x = true
+end
+"#, None);
+    }
+
+    #[test]
+    fn test_not_in_repeat_until() {
+        // NOT operator in repeat-until condition should produce EQ with correct register.
+        assert_inst_match(r#"
+local x = false
+repeat
+  x = true
+until not x
+"#, None);
+    }
+
+    #[test]
+    fn test_and_with_comparison() {
+        // 'and' with comparison operators produces VJMP for each condition.
+        // The false list must contain all JMPs and be patched correctly.
+        // Before fix: second JMP was not patched (JMP -1 / infinite loop).
+        assert_inst_match(r#"
+if 1 < 2 and 3 < 4 then
+  local x = 1
+end
+"#, None);
+    }
+
+    #[test]
+    fn test_or_with_not() {
+        // 'or' with NOT should remove NOT and use TEST with NOT's B operand.
+        assert_inst_match(r#"
+local x = false
+if x or not x then
+  x = true
+end
+"#, None);
+    }
+
+    #[test]
+    fn test_and_or_combined() {
+        // Combined and/or with comparisons tests jump list patching.
+        assert_inst_match(r#"
+local a = 1
+if a < 2 and a > 0 or a == 3 then
+  a = 2
+end
+"#, None);
+    }
+
+    #[test]
+    fn test_not_preserves_jumps() {
+        // NOT should preserve and swap t/f jump lists from the operand.
+        // Before fix: NOT discarded jump lists, causing missing JMP+LFALSESKIP+LOADTRUE.
+        assert_inst_match(r#"
+local x = (not true)
+assert(x == false)
+"#, None);
+    }
+
+    #[test]
     fn test_bandk_reg_reuse() {
         // BANDK should reuse the left operand's register when it's a temporary.
         // Before the fix, the left operand's register was not freed, causing
@@ -821,6 +915,16 @@ assert(t:_012345678901234567890123456789012345678901234567890123456789() == 1)
 local a = (1 + 1) & 255
 assert(a == 2)
 "#, None);
+    }
+
+    #[test]
+    fn test_bitwise_lua() {
+        assert_inst_match_file("bitwise.lua");
+    }
+
+    #[test]
+    fn test_bwcoercion_lua() {
+        assert_inst_match_file("bwcoercion.lua");
     }
 
     #[test]
@@ -1080,6 +1184,44 @@ assert(a == 2)
     fn test_reg_no_leak_bitwise_ops() {
         assert_compile_ok("return 1 & 2 | 3 ~ 4", None);
         assert_compile_ok("local a = 1 << 2; local b = a >> 1", None);
+    }
+
+    #[test]
+    fn test_and_reg_leak() {
+        // This tests the register leak in 'and' expressions with comparisons
+        // Before fix: Rust generates ADDI 8 0 -1 (freereg=8), C generates ADDI 6 0 -1 (freereg=6)
+        assert_inst_match(r#"
+local a = 0
+assert(a == 0 and a == 0)
+assert(a == 0)
+"#, None);
+        // More complex: with bitwise operations and comparisons in 'and'
+        assert_inst_match(r#"
+local a, b, c, d
+a = 0xFF
+assert(a >> 4 == 0xF and a == 0xFF)
+assert(a == 0xFF)
+"#, None);
+        // Even more complex: matching the actual bitwise.lua pattern
+        assert_inst_match(r#"
+local a = 0
+assert(-1 >> 1 == (1 << 63) - 1 and 1 << 31 == 0x80000000)
+assert(a == 0)
+"#, None);
+    }
+
+    #[test]
+    fn test_shr_reg_order() {
+        // This tests the register allocation order in SHR expressions
+        // Before fix: Rust generates ADDI 7 0 -1 (freereg=7), C generates ADDI 6 0 -1 (freereg=6)
+        // Root cause: Rust compiles left operand before right operand in SHR general case,
+        // but C's codebinexpval compiles right operand first (e2), then left (e1).
+        // This causes different register allocation when both operands need temp registers.
+        // Minimal reproduction: -1 >> (numbits - 1) where both sides need a register.
+        assert_inst_match(r#"
+local numbits = 64
+assert(-1 >> (numbits - 1) == 1)
+"#, None);
     }
 
     #[test]

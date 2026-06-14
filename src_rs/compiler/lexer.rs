@@ -375,16 +375,39 @@ impl LexState {
 
         let s = &self.source[start..self.pos];
         if is_float {
-            match s.parse::<f64>() {
-                Ok(v) => self.token = Token::Float(v),
-                Err(_) => {
-                    self.error(&format!("malformed number: {}", s));
-                    self.token = Token::Float(0.0);
+            if is_hex {
+                match parse_hex_float(s) {
+                    Some(v) => self.token = Token::Float(v),
+                    None => {
+                        self.error(&format!("malformed number: 0x{}", s));
+                        self.token = Token::Float(0.0);
+                    }
+                }
+            } else {
+                match s.parse::<f64>() {
+                    Ok(v) => self.token = Token::Float(v),
+                    Err(_) => {
+                        self.error(&format!("malformed number: {}", s));
+                        self.token = Token::Float(0.0);
+                    }
                 }
             }
         } else {
             match i64::from_str_radix(s, if is_hex { 16 } else { 10 }) {
                 Ok(v) => self.token = Token::Int(v),
+                Err(_) if is_hex => {
+                    // Hex integers that overflow i64 may fit in u64 (e.g., 0xFFFFFFFFFFFFFFFF = -1)
+                    match u64::from_str_radix(s, 16) {
+                        Ok(v) => self.token = Token::Int(v as i64),
+                        Err(_) => match s.parse::<f64>() {
+                            Ok(v) => self.token = Token::Float(v),
+                            Err(_) => {
+                                self.error(&format!("malformed number: {}", s));
+                                self.token = Token::Int(0);
+                            }
+                        },
+                    }
+                }
                 Err(_) => match s.parse::<f64>() {
                     Ok(v) => self.token = Token::Float(v),
                     Err(_) => {
@@ -526,4 +549,50 @@ impl LexState {
             false
         }
     }
+}
+
+fn parse_hex_float(s: &str) -> Option<f64> {
+    // Parse hex float format: HH[.HHH][p[+/-]DD]
+    // s does not include "0x" prefix
+    let (mantissa_str, exponent_str) = match s.find(|c| c == 'p' || c == 'P') {
+        Some(pos) => (&s[..pos], Some(&s[pos + 1..])),
+        None => (s, None),
+    };
+
+    let (int_str, frac_str) = match mantissa_str.find('.') {
+        Some(pos) => (&mantissa_str[..pos], Some(&mantissa_str[pos + 1..])),
+        None => (mantissa_str, None),
+    };
+
+    if int_str.is_empty() && frac_str.map_or(true, |f| f.is_empty()) {
+        return None;
+    }
+
+    let int_part = if int_str.is_empty() {
+        0.0
+    } else {
+        u64::from_str_radix(int_str, 16).ok()? as f64
+    };
+
+    let frac_part = if let Some(frac) = frac_str {
+        if frac.is_empty() {
+            0.0
+        } else {
+            let frac_val = u64::from_str_radix(frac, 16).ok()? as f64;
+            frac_val / 16f64.powi(frac.len() as i32)
+        }
+    } else {
+        0.0
+    };
+
+    let exponent = if let Some(exp) = exponent_str {
+        if exp.is_empty() {
+            return None;
+        }
+        i32::from_str_radix(exp, 10).ok()?
+    } else {
+        0
+    };
+
+    Some((int_part + frac_part) * 2f64.powi(exponent))
 }
