@@ -1334,29 +1334,23 @@ impl FuncState {
     /// If NonReloc with jumps and reg >= nvarstack, resolve jumps to that register.
     /// Otherwise, use exp_to_next_reg (allocate new register).
     fn exp_to_reg(&mut self, e: &ExpDesc) -> i32 {
-        if e.kind == ExpKind::NonReloc {
+        // Like C's luaK_exp2anyreg: dischargevars first, then check VNONRELOC
+        // Call is like VNONRELOC after dischargevars (setoneret converts VCALL to VNONRELOC)
+        if e.kind == ExpKind::NonReloc || e.kind == ExpKind::Call {
+            let info_reg = e.info as i32;
             if e.t == NO_JUMP && e.f == NO_JUMP {
                 // No jumps, already in a register
-                return e.info as i32;
+                return info_reg;
             }
-            if (e.info as i32) >= self.nvarstack() {
+            if info_reg >= self.nvarstack() {
                 // Register is not a local, can resolve jumps to it
-                self.resolve_jumps(e, e.info as i32);
-                return e.info as i32;
+                self.resolve_jumps(e, info_reg);
+                return info_reg;
             }
             // Register is a local with jumps, need to move to new register
             // Like C: fall through to luaK_exp2nextreg
-        }
-        // Like C's luaK_exp2nextreg: discharge, free, reserve, exp2reg
-        // For NonReloc with jumps on a local register, we need to MOVE to a new register
-        if e.kind == ExpKind::NonReloc {
-            // Free old register if it's a temp
-            // (it's a local, so no need to free)
-            // Allocate new register
             let r = self.alloc_reg();
-            // MOVE from old register to new register
-            self.code_abc(OpCode::MOVE, r, e.info as i32, 0);
-            // Handle jumps
+            self.code_abc(OpCode::MOVE, r, info_reg, 0);
             self.resolve_jumps(e, r);
             return r;
         }
@@ -1419,7 +1413,7 @@ impl FuncState {
             self.code_abc(OpCode::LOADFALSE, r, 0, 0);
             r
         } else {
-            self.expr_to_reg(e)
+            self.exp_to_reg(e)
         }
     }
 
@@ -2485,7 +2479,7 @@ fn parse_statement(fs: &mut FuncState) {
             if ei.exp.kind == ExpKind::Call {
                 fs.set_c(ei.exp.info2, 1);
             }
-            let _r = fs.expr_to_reg(&ei.exp);
+            let _r = fs.exp_to_reg(&ei.exp);
             fs.free_reg();
             if check(fs, &Token::Semi) { fs.ls_mut().next(); }
             None
@@ -2671,7 +2665,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     let base_reg = first.reg.unwrap();
                     let ei = parse_expr(fs);
                     expect(fs, &Token::RBracket);
-                    let key_reg = fs.expr_to_reg(&ei.exp);
+                    let key_reg = fs.exp_to_reg(&ei.exp);
                     fs.proto.flag |= PF_VATAB;
                     let r = fs.alloc_reg();
                     fs.code_abc(OpCode::GETVARG, r, base_reg, key_reg);
@@ -2738,7 +2732,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 } else if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei.exp.has_jumps() && ei.exp.info2 < 0 {
                     (ei.exp.info as i32, false, false)
                 } else {
-                    (fs.expr_to_reg(&ei.exp), false, false)
+                    (fs.exp_to_reg(&ei.exp), false, false)
                 };
                 let key_allocated = !key_is_const && fs.freereg > saved_freereg_before;
                 // Now decide: if _ENV was loaded but SETTABUP can be used, revert the GETUPVAL
@@ -2839,7 +2833,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     }
                     new_r
                 } else {
-                    fs.expr_to_reg(&ei.exp)
+                    fs.exp_to_reg(&ei.exp)
                 };
                 exps.push(ExpDesc::new(ExpKind::NonReloc, r as i64));
                 fs.ls_mut().next();
@@ -2857,7 +2851,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
         };
         let (last_exp_reg, nil_reg_start) = if extra_vars > 0 && !last_is_call {
             let last_exp = exps.last().unwrap();
-            let exp_reg = fs.expr_to_reg(last_exp);
+            let exp_reg = fs.exp_to_reg(last_exp);
             for _ in 0..extra_vars {
                 fs.alloc_reg();
             }
@@ -3203,7 +3197,7 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
                 }
             } else {
                 let saved_freereg = fs.freereg;
-                let val_reg = fs.expr_to_reg(e);
+                let val_reg = fs.exp_to_reg(e);
                 if dest != val_reg {
                     fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
                 }
@@ -3670,7 +3664,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         let base_reg = result.reg.unwrap();
                         let ei = parse_expr(fs);
                         expect(fs, &Token::RBracket);
-                        let key_reg = fs.expr_to_reg(&ei.exp);
+                        let key_reg = fs.exp_to_reg(&ei.exp);
                         fs.proto.flag |= PF_VATAB;
                         let r = fs.alloc_reg();
                         fs.code_abc(OpCode::GETVARG, r, base_reg, key_reg);
@@ -3770,7 +3764,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     } else if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei.exp.has_jumps() && ei.exp.info2 < 0 {
                         (ei.exp.info as i32, false, false)
                     } else {
-                        (fs.expr_to_reg(&ei.exp), false, false)
+                        (fs.exp_to_reg(&ei.exp), false, false)
                     };
                     let key_allocated = !key_is_const && fs.freereg > saved_freereg_before;
                     // Now decide: if _ENV was loaded but SETTABUP can be used, revert the GETUPVAL
@@ -3853,12 +3847,12 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
             fs.ls_mut().next();
             let e = parse_expr(fs);
             expect(fs, &Token::RParen);
-            let r = fs.expr_to_reg(&e.exp);
+            let r = fs.exp_to_reg(&e.exp);
             PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
         }
         _ => {
             let e = parse_simple_exp(fs);
-            let r = fs.expr_to_reg(&e.exp);
+            let r = fs.exp_to_reg(&e.exp);
             PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_env_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
         }
     }
@@ -4416,9 +4410,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     } else if matches!(ec.kind, ExpKind::NonReloc) {
                         ec.info as i32
                     } else if matches!(ec.kind, ExpKind::Relocable) {
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     } else {
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     };
                     let pc = fs.code_abc(OpCode::BORK, 0, v1, k);
                     // Free v1 if it's a temp - like C's freeexps
@@ -4449,9 +4443,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     } else if matches!(ec.kind, ExpKind::NonReloc) {
                         ec.info as i32
                     } else if matches!(ec.kind, ExpKind::Relocable) {
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     } else {
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     };
                     let pc = fs.code_abc(OpCode::BOR, 0, v1, v2);
                     // Free registers in descending order - like C's freeregs
@@ -4513,9 +4507,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     } else if matches!(ec.kind, ExpKind::NonReloc) {
                         ec.info as i32
                     } else if matches!(ec.kind, ExpKind::Relocable) {
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     } else {
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     };
                     let pc = fs.code_abc(OpCode::BXORK, 0, v1, k);
                     // Free v1 if it's a temp - like C's freeexps
@@ -4546,9 +4540,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     } else if matches!(ec.kind, ExpKind::NonReloc) {
                         ec.info as i32
                     } else if matches!(ec.kind, ExpKind::Relocable) {
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     } else {
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     };
                     let pc = fs.code_abc(OpCode::BXOR, 0, v1, v2);
                     // Free registers in descending order - like C's freeregs
@@ -4610,9 +4604,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     } else if matches!(ec.kind, ExpKind::NonReloc) {
                         ec.info as i32
                     } else if matches!(ec.kind, ExpKind::Relocable) {
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     } else {
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     };
                     let pc = fs.code_abc(OpCode::BANDK, 0, v1, k);
                     // Free v1 if it's a temp - like C's freeexps
@@ -4643,9 +4637,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     } else if matches!(ec.kind, ExpKind::NonReloc) {
                         ec.info as i32
                     } else if matches!(ec.kind, ExpKind::Relocable) {
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     } else {
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     };
                     let pc = fs.code_abc(OpCode::BAND, 0, v1, v2);
                     // Free registers in descending order - like C's freeregs
@@ -4722,9 +4716,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         } else if matches!(ec.kind, ExpKind::NonReloc) {
                             ec.info as i32
                         } else if matches!(ec.kind, ExpKind::Relocable) {
-                            fs.expr_to_reg(&ec)
+                            fs.exp_to_reg(&ec)
                         } else {
-                            fs.expr_to_reg(&ec)
+                            fs.exp_to_reg(&ec)
                         };
                         let v = e2.exp.info;
                         let sc_neg = int_to_sc(-v);
@@ -4758,9 +4752,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         } else if matches!(ec.kind, ExpKind::NonReloc) {
                             ec.info as i32
                         } else if matches!(ec.kind, ExpKind::Relocable) {
-                            fs.expr_to_reg(&ec)
+                            fs.exp_to_reg(&ec)
                         } else {
-                            fs.expr_to_reg(&ec)
+                            fs.exp_to_reg(&ec)
                         };
                         let pc = fs.code_abc(OpCode::SHL, 0, v1, v2);
                         // Free registers in descending order - like C's freeregs
@@ -4821,9 +4815,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     } else if matches!(ec.kind, ExpKind::NonReloc) {
                         ec.info as i32
                     } else if matches!(ec.kind, ExpKind::Relocable) {
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     } else {
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     };
                     let v = e2.exp.info;
                     let sc = int_to_sc(v);
@@ -4856,9 +4850,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     } else if matches!(ec.kind, ExpKind::NonReloc) {
                         ec.info as i32
                     } else if matches!(ec.kind, ExpKind::Relocable) {
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     } else {
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     };
                     let pc = fs.code_abc(OpCode::SHR, 0, v1, v2);
                     // Free registers in descending order - like C's freeregs
@@ -4892,12 +4886,12 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             } else if matches!(ec.kind, ExpKind::Relocable) {
                 if ec.info2 >= 0 {
                     // VRELOC mode: need to allocate register
-                    fs.expr_to_reg(&ec)
+                    fs.exp_to_reg(&ec)
                 } else {
                     ec.info as i32
                 }
             } else {
-                fs.expr_to_reg(&ec)
+                fs.exp_to_reg(&ec)
             };
             if r < fs.nvarstack() {
                 let new_r = fs.alloc_reg();
@@ -5009,7 +5003,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                                 fs.code_abc_k(OpCode::MMBINK, r2, k, 6, true);
                                 e = ExprItem { exp: ExpDesc::new_reloc_with_pc(0, pc) };
                             } else {
-                                let r = fs.expr_to_reg(&ec);
+                                let r = fs.exp_to_reg(&ec);
                                 // Like C's finishbinexpval: generate ADD with A=0,
                                 // free registers, then VRELOC (no result register).
                                 let pc = fs.code_abc(OpCode::ADD, 0, r2, r);
@@ -5037,7 +5031,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     } else {
                         // !is_add with Int ec: use SUB (not SUBK, since e2 is not a constant)
                         // Like C's codearith -> codebinNoK
-                        let r = fs.expr_to_reg(&ec);
+                        let r = fs.exp_to_reg(&ec);
                         let r2 = if matches!(e2.exp.kind, ExpKind::NonReloc) && !e2.exp.has_jumps() {
                             let reg = e2.exp.info as i32;
                             if e2.exp.info2 >= 0 {
@@ -5086,9 +5080,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     } else if matches!(ec.kind, ExpKind::Relocable) {
                         // Relocable: like C's luaK_exp2anyreg for VRELOC,
                         // allocate register and set A of the relocatable instruction
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     } else {
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     };
                     if !is_add && matches!(e2.exp.kind, ExpKind::Int) && fits_sc(&e2.exp) && fits_sc_neg(e2.exp.info) {
                         let v = e2.exp.info;
@@ -5113,6 +5107,38 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         // Like C: don't alloc result reg, use VRELOC (info=0, info2=pc)
                         fs.code_abc(OpCode::MMBINI, r_src, sc, 6);
                         e = ExprItem { exp: ExpDesc::new_reloc_with_pc(0, pc) };
+                    } else if is_add && matches!(e2.exp.kind, ExpKind::Int) {
+                        // Int constant doesn't fit SC, try ADDK (like C's codearith → codebinK)
+                        let k = fs.int_k(e2.exp.info);
+                        if k <= 255 {
+                            let pc = fs.code_abc(OpCode::ADDK, 0, r_src, k);
+                            if r_src >= fs.nvarstack() && r_src == fs.freereg - 1 {
+                                fs.free_reg();
+                            }
+                            fs.code_abc_k(OpCode::MMBINK, r_src, k, 6, false);
+                            e = ExprItem { exp: ExpDesc::new_reloc_with_pc(0, pc) };
+                        } else {
+                            // Constant table index too large, fall back to LOADI + ADD
+                            let r2 = fs.exp_to_reg(&e2.exp);
+                            let pc = fs.code_abc(OpCode::ADD, 0, r_src, r2);
+                            if r_src > r2 {
+                                if r_src >= fs.nvarstack() && r_src == fs.freereg - 1 {
+                                    fs.free_reg();
+                                }
+                                if r2 >= fs.nvarstack() && r2 == fs.freereg - 1 {
+                                    fs.free_reg();
+                                }
+                            } else {
+                                if r2 >= fs.nvarstack() && r2 == fs.freereg - 1 {
+                                    fs.free_reg();
+                                }
+                                if r_src >= fs.nvarstack() && r_src == fs.freereg - 1 {
+                                    fs.free_reg();
+                                }
+                            }
+                            fs.code_abc(OpCode::MMBIN, r_src, r2, 6);
+                            e = ExprItem { exp: ExpDesc::new_reloc_with_pc(0, pc) };
+                        }
                     } else if is_add && matches!(e2.exp.kind, ExpKind::Float) {
                         let f = f64::from_bits(e2.exp.info as u64);
                         let k = fs.float_k(f);
@@ -5259,7 +5285,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             let val = if (ec.info ^ denom) < 0 && ec.info % denom != 0 { q - 1 } else { q };
                             e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
                         } else {
-                            let r = fs.expr_to_reg(&ec);
+                            let r = fs.exp_to_reg(&ec);
                             let k = fs.int_k(e2.exp.info);
                             if k <= 255 {
                                 let pc = fs.code_abc(OpCode::IDIVK, r, r, k);
@@ -5276,7 +5302,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             let val = ec.info as f64 / e2.exp.info as f64;
                             e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
                         } else {
-                            let r = fs.expr_to_reg(&ec);
+                            let r = fs.exp_to_reg(&ec);
                             let k = fs.int_k(e2.exp.info);
                             let pc = fs.code_abc(OpCode::DIVK, r, r, k);
                             fs.code_abc(OpCode::MMBINK, r, k, 11);
@@ -5293,7 +5319,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             let val = if r != 0 && (r ^ n) < 0 { r + n } else { r };
                             e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
                         } else {
-                            let r = fs.expr_to_reg(&ec);
+                            let r = fs.exp_to_reg(&ec);
                             let k = fs.int_k(e2.exp.info);
                             if k <= 255 {
                                 let pc = fs.code_abc(OpCode::MODK, r, r, k);
@@ -5317,7 +5343,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             let val = f / (e2.exp.info as f64);
                             e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
                         } else {
-                            let r = fs.expr_to_reg(&ec);
+                            let r = fs.exp_to_reg(&ec);
                             let k = fs.int_k(e2.exp.info);
                             let pc = fs.code_abc(OpCode::DIVK, r, r, k);
                             fs.code_abc(OpCode::MMBINK, r, k, 11);
@@ -5330,7 +5356,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             if val != 0.0 && !val.is_nan() {
                                 e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
                             } else {
-                                let r = fs.expr_to_reg(&ec);
+                                let r = fs.exp_to_reg(&ec);
                                 let k = fs.int_k(e2.exp.info);
                                 if k <= 255 {
                                     fs.code_abc(OpCode::IDIVK, r, r, k);
@@ -5342,7 +5368,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                                 e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
                             }
                         } else {
-                            let r = fs.expr_to_reg(&ec);
+                            let r = fs.exp_to_reg(&ec);
                             let k = fs.int_k(e2.exp.info);
                             if k <= 255 {
                                 fs.code_abc(OpCode::IDIVK, r, r, k);
@@ -5360,7 +5386,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             let val = if (r > 0.0) == (denom < 0.0) && r != 0.0 { r + denom } else { r };
                             e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
                         } else {
-                            let r = fs.expr_to_reg(&ec);
+                            let r = fs.exp_to_reg(&ec);
                             let k_idx = {
                                 let k = fs.int_k(e2.exp.info);
                                 if k <= 255 { Some(k) } else { None }
@@ -5388,7 +5414,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             let val = (ec.info as f64) / f;
                             e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
                         } else {
-                            let r = fs.expr_to_reg(&ec);
+                            let r = fs.exp_to_reg(&ec);
                             let k = fs.float_k(f);
                             if k <= 255 {
                                 let pc = fs.code_abc(OpCode::DIVK, r, r, k);
@@ -5408,7 +5434,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             if val != 0.0 && !val.is_nan() {
                                 e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
                             } else {
-                                let r = fs.expr_to_reg(&ec);
+                                let r = fs.exp_to_reg(&ec);
                                 let k = fs.float_k(f);
                                 if k <= 255 {
                                     fs.code_abc(OpCode::IDIVK, r, r, k);
@@ -5420,7 +5446,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                                 e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
                             }
                         } else {
-                            let r = fs.expr_to_reg(&ec);
+                            let r = fs.exp_to_reg(&ec);
                             let k = fs.float_k(f);
                             if k <= 255 {
                                 fs.code_abc(OpCode::IDIVK, r, r, k);
@@ -5438,7 +5464,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             let val = if (r > 0.0) == (f < 0.0) && r != 0.0 { r + f } else { r };
                             e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
                         } else {
-                            let r = fs.expr_to_reg(&ec);
+                            let r = fs.exp_to_reg(&ec);
                             let k_idx = {
                                 let k = fs.float_k(f);
                                 if k <= 255 { Some(k) } else { None }
@@ -5467,7 +5493,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             let val = f1 / f2;
                             e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
                         } else {
-                            let r = fs.expr_to_reg(&ec);
+                            let r = fs.exp_to_reg(&ec);
                             let k = fs.float_k(f2);
                             if k <= 255 {
                                 let pc = fs.code_abc(OpCode::DIVK, r, r, k);
@@ -5486,7 +5512,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             if val != 0.0 && !val.is_nan() {
                                 e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
                             } else {
-                                let r = fs.expr_to_reg(&ec);
+                                let r = fs.exp_to_reg(&ec);
                                 let k = fs.float_k(f2);
                                 if k <= 255 {
                                     fs.code_abc(OpCode::IDIVK, r, r, k);
@@ -5498,7 +5524,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                                 e = ExprItem { exp: ExpDesc::new(ExpKind::Relocable, r as i64) };
                             }
                         } else {
-                            let r = fs.expr_to_reg(&ec);
+                            let r = fs.exp_to_reg(&ec);
                             let k = fs.float_k(f2);
                             if k <= 255 {
                                 fs.code_abc(OpCode::IDIVK, r, r, k);
@@ -5515,7 +5541,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             let val = if (r > 0.0) == (f2 < 0.0) && r != 0.0 { r + f2 } else { r };
                             e = ExprItem { exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64) };
                         } else {
-                            let r = fs.expr_to_reg(&ec);
+                            let r = fs.exp_to_reg(&ec);
                             let k_idx = {
                                 let k = fs.float_k(f2);
                                 if k <= 255 { Some(k) } else { None }
@@ -5562,7 +5588,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         fs.code_abc_k(OpCode::MMBINK, r2, k, 8, true);
                         e = ExprItem { exp: ExpDesc::new_reloc_with_pc(0, pc) };
                     } else {
-                        let r = fs.expr_to_reg(&ec);
+                        let r = fs.exp_to_reg(&ec);
                         let pc = fs.code_abc(OpCode::MUL, 0, r2, r);
                         // Free registers in descending order - like C's freeexps/freeregs
                         if r > r2 {
@@ -5619,7 +5645,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         fs.code_abc_k(OpCode::MMBINK, r2, k, 8, true);
                         e = ExprItem { exp: ExpDesc::new_reloc_with_pc(0, pc) };
                     } else {
-                        let r = fs.expr_to_reg(&ec);
+                        let r = fs.exp_to_reg(&ec);
                         let pc = fs.code_abc(OpCode::MUL, 0, r2, r);
                         // Free registers in descending order - like C's freeexps/freeregs
                         if r > r2 {
@@ -5659,9 +5685,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         ec.info as i32
                     } else if matches!(ec.kind, ExpKind::Relocable) {
                         // Like C's luaK_exp2anyreg for VRELOC: allocate register and set A
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     } else {
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     };
                     let k_idx = match &e2.exp.kind {
                         ExpKind::Int => {
@@ -5814,12 +5840,12 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     } else if matches!(ec.kind, ExpKind::Relocable) {
                         if ec.info2 >= 0 {
                             // VRELOC mode: need to allocate register
-                            fs.expr_to_reg(&ec)
+                            fs.exp_to_reg(&ec)
                         } else {
                             ec.info as i32
                         }
                     } else {
-                        fs.expr_to_reg(&ec)
+                        fs.exp_to_reg(&ec)
                     };
                     let k_idx = match &e2.exp.kind {
                         ExpKind::Int => {
@@ -6244,7 +6270,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                                 let f = f64::from_bits(ei.exp.info as u64);
                                 let result = -f;
                                 if result.is_nan() || result == 0.0 {
-                                    let r = fs.expr_to_reg(&ei.exp);
+                                    let r = fs.exp_to_reg(&ei.exp);
                                     let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
                                     fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
                                     ExpDesc::new_reloc_with_pc(r as i64, pc)
@@ -6253,7 +6279,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                                 }
                             }
                             _ => {
-                                let r = fs.expr_to_reg(&ei.exp);
+                                let r = fs.exp_to_reg(&ei.exp);
                                 let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
                                 fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
                                 ExpDesc::new_reloc_with_pc(r as i64, pc)
@@ -6267,7 +6293,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                         fs.code_abc(OpCode::LEN, r, ei.exp.info as i32, 0);
                         ExpDesc::new(ExpKind::Relocable, r as i64)
                     } else {
-                        let r = fs.expr_to_reg(&ei.exp);
+                        let r = fs.exp_to_reg(&ei.exp);
                         fs.code_abc(OpCode::LEN, r, r, 0);
                         ExpDesc::new(ExpKind::Relocable, r as i64)
                     }
@@ -6288,7 +6314,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                                 ExpDesc::new(ExpKind::Int, !(ei.exp.info))
                             }
                             _ => {
-                                let r = fs.expr_to_reg(&ei.exp);
+                                let r = fs.exp_to_reg(&ei.exp);
                                 // Like C's codeunexpval: code with A=0, freeexp, VRELOC
                                 let pc = fs.code_abc(OpCode::BNOT, 0, r, 0);
                                 if r >= fs.nvarstack() && r == fs.freereg - 1 {
@@ -6301,7 +6327,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     }
                 }
                 _ => {
-                    let r = fs.expr_to_reg(&ei.exp);
+                    let r = fs.exp_to_reg(&ei.exp);
                     ExpDesc::new(ExpKind::Relocable, r as i64)
                 }
             }
@@ -6352,7 +6378,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 fs.ls_mut().next();
                 let field = get_name(fs);
                 let k = fs.string_k(&field);
-                let base_reg = fs.expr_to_reg(&e);
+                let base_reg = fs.exp_to_reg(&e);
                 let is_env_upval = fs.pc > 0 && {
                     let last_ins = fs.proto.code[fs.pc as usize - 1];
                     get_opcode(last_ins) == OpCode::GETUPVAL && getarg_b(last_ins) == 0
@@ -6403,7 +6429,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     }
                     e.info as i32
                 } else {
-                    fs.expr_to_reg(&e)
+                    fs.exp_to_reg(&e)
                 };
                 let base_is_nonreloc_local = matches!(e.kind, ExpKind::NonReloc) && (e.info as i32) < fs.nvarstack();
                 let saved_pc_before_expr = fs.pc;
@@ -6465,7 +6491,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                                 ei.exp.info as i32
                             }
                         } else {
-                            fs.expr_to_reg(&ei.exp)
+                            fs.exp_to_reg(&ei.exp)
                         };
                         if base_is_nonreloc_local && key_reg >= fs.nvarstack() && key_reg == fs.freereg - 1 {
                             fs.free_reg();
@@ -6498,7 +6524,12 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
 fn parse_if(fs: &mut FuncState) {
     let entry_freereg = fs.freereg;
     fs.ls_mut().next();
-    let ei = parse_expr(fs);
+    let mut ei = parse_expr(fs);
+    // Like C's cond: 'falses' are all equal here
+    if ei.exp.kind == ExpKind::Nil {
+        ei.exp.kind = ExpKind::Boolean;
+        ei.exp.info = 0;
+    }
 
     let is_const_true = matches!(ei.exp.kind, ExpKind::Boolean) && ei.exp.info != 0;
 
@@ -6513,49 +6544,43 @@ fn parse_if(fs: &mut FuncState) {
             fs.patch_true_jumps(ei.exp.t, fs.pc);
             if_jmp = false_list;
         } else {
-            let pre_freereg = fs.freereg;
+            // Like C's jumponcond: check for VRELOC+NOT first
             let is_not_vreloc = ei.exp.info2 >= 0
                 && (ei.exp.info2 as usize) < fs.proto.code.len()
-                && get_opcode(fs.proto.code[ei.exp.info2 as usize]) == OpCode::NOT;
-            let (cond_reg, test_with_k) = if (ei.exp.info2 == -2 || is_not_vreloc)
-                && matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc)
-            {
-                let reg = if is_not_vreloc {
-                    let not_inst = fs.proto.code[ei.exp.info2 as usize];
-                    getarg_b(not_inst)
-                } else {
-                    ei.exp.info as i32
-                };
-                if is_not_vreloc {
-                    fs.pc -= 1;
-                    fs.proto.code.pop();
-                } else if !fs.proto.code.is_empty()
-                    && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT
-                {
-                    fs.proto.code.pop();
-                    fs.pc -= 1;
-                }
-                (reg, true)
+                && get_opcode(fs.proto.code[ei.exp.info2 as usize]) == OpCode::NOT
+                && matches!(ei.exp.kind, ExpKind::Relocable);
+
+            if is_not_vreloc {
+                // VRELOC+NOT: remove NOT, emit TEST with inverted condition
+                let not_inst = fs.proto.code[ei.exp.info2 as usize];
+                let b = getarg_b(not_inst);
+                fs.pc -= 1;
+                fs.proto.code.pop();
+                // goiftrue: cond=0, !cond=1 → k=true
+                fs.code_abc_k(OpCode::TEST, b, 0, 0, true);
+                let jmp_pc = fs.jump();
+                let mut false_list = ei.exp.f;
+                fs.concat_jump(&mut false_list, jmp_pc);
+                fs.patch_true_jumps(ei.exp.t, fs.pc);
+                if_jmp = false_list;
             } else {
-                let reg = fs.cond_to_reg(&ei.exp);
-                let k = matches!(ei.exp.kind, ExpKind::Relocable)
-                    && !fs.proto.code.is_empty()
-                    && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT;
-                if k {
-                    fs.proto.code.pop();
-                    fs.pc -= 1;
+                // Like C's jumponcond default: discharge2anyreg + freeexp + TESTSET(NO_REG) + JMP
+                let pre_freereg = fs.freereg;
+                let r = fs.discharge_to_any_reg(&ei.exp);
+                // freeexp: free the register if it's a temp at top of stack
+                if r >= fs.nvarstack() && r == fs.freereg - 1 {
+                    fs.free_reg();
                 }
-                (reg, k)
-            };
-            fs.code_abc_k(OpCode::TEST, cond_reg, 0, 0, test_with_k);
-            let jmp_pc = fs.jump();
-            // Like C's goiftrue: concat JMP to false list, patch true list
-            let mut false_list = ei.exp.f;
-            fs.concat_jump(&mut false_list, jmp_pc);
-            fs.patch_true_jumps(ei.exp.t, fs.pc);
-            if_jmp = false_list;
-            if fs.freereg > pre_freereg {
-                fs.free_reg();
+                // goiftrue: cond=0 → k=false
+                fs.code_abc_k(OpCode::TESTSET, NO_REG as i32, r, 0, false);
+                let jmp_pc = fs.jump();
+                let mut false_list = ei.exp.f;
+                fs.concat_jump(&mut false_list, jmp_pc);
+                fs.patch_true_jumps(ei.exp.t, fs.pc);
+                if_jmp = false_list;
+                if fs.freereg > pre_freereg {
+                    fs.free_reg();
+                }
             }
         }
     }
@@ -6572,7 +6597,12 @@ fn parse_if(fs: &mut FuncState) {
             fs.patch_to_here(if_jmp);
         }
         fs.ls_mut().next();
-        let ei2 = parse_expr(fs);
+        let mut ei2 = parse_expr(fs);
+        // Like C's cond: 'falses' are all equal here
+        if ei2.exp.kind == ExpKind::Nil {
+            ei2.exp.kind = ExpKind::Boolean;
+            ei2.exp.info = 0;
+        }
         let is_const_true2 = matches!(ei2.exp.kind, ExpKind::Boolean) && ei2.exp.info != 0;
         if !is_const_true2 {
             if ei2.exp.kind == ExpKind::VJMP {
@@ -6583,49 +6613,38 @@ fn parse_if(fs: &mut FuncState) {
                 fs.patch_true_jumps(ei2.exp.t, fs.pc);
                 if_jmp = false_list;
             } else {
-                let pre_freereg2 = fs.freereg;
+                // Like C's jumponcond: check for VRELOC+NOT first
                 let is_not_vreloc2 = ei2.exp.info2 >= 0
                     && (ei2.exp.info2 as usize) < fs.proto.code.len()
-                    && get_opcode(fs.proto.code[ei2.exp.info2 as usize]) == OpCode::NOT;
-                let (cr2, test_with_k2) = if (ei2.exp.info2 == -2 || is_not_vreloc2)
-                    && matches!(ei2.exp.kind, ExpKind::Relocable | ExpKind::NonReloc)
-                {
-                    let reg = if is_not_vreloc2 {
-                        let not_inst = fs.proto.code[ei2.exp.info2 as usize];
-                        getarg_b(not_inst)
-                    } else {
-                        ei2.exp.info as i32
-                    };
-                    if is_not_vreloc2 {
-                        fs.pc -= 1;
-                        fs.proto.code.pop();
-                    } else if !fs.proto.code.is_empty()
-                        && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT
-                    {
-                        fs.proto.code.pop();
-                        fs.pc -= 1;
-                    }
-                    (reg, true)
+                    && get_opcode(fs.proto.code[ei2.exp.info2 as usize]) == OpCode::NOT
+                    && matches!(ei2.exp.kind, ExpKind::Relocable);
+
+                if is_not_vreloc2 {
+                    let not_inst = fs.proto.code[ei2.exp.info2 as usize];
+                    let b = getarg_b(not_inst);
+                    fs.pc -= 1;
+                    fs.proto.code.pop();
+                    fs.code_abc_k(OpCode::TEST, b, 0, 0, true);
+                    let jmp_pc2 = fs.jump();
+                    let mut false_list2 = ei2.exp.f;
+                    fs.concat_jump(&mut false_list2, jmp_pc2);
+                    fs.patch_true_jumps(ei2.exp.t, fs.pc);
+                    if_jmp = false_list2;
                 } else {
-                    let reg = fs.cond_to_reg(&ei2.exp);
-                    let k = matches!(ei2.exp.kind, ExpKind::Relocable)
-                        && !fs.proto.code.is_empty()
-                        && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT;
-                    if k {
-                        fs.proto.code.pop();
-                        fs.pc -= 1;
+                    let pre_freereg2 = fs.freereg;
+                    let r2 = fs.discharge_to_any_reg(&ei2.exp);
+                    if r2 >= fs.nvarstack() && r2 == fs.freereg - 1 {
+                        fs.free_reg();
                     }
-                    (reg, k)
-                };
-                fs.code_abc_k(OpCode::TEST, cr2, 0, 0, test_with_k2);
-                let jmp_pc2 = fs.jump();
-                // Like C's goiftrue: concat JMP to false list, patch true list
-                let mut false_list2 = ei2.exp.f;
-                fs.concat_jump(&mut false_list2, jmp_pc2);
-                fs.patch_true_jumps(ei2.exp.t, fs.pc);
-                if_jmp = false_list2;
-                if fs.freereg > pre_freereg2 {
-                    fs.free_reg();
+                    fs.code_abc_k(OpCode::TESTSET, NO_REG as i32, r2, 0, false);
+                    let jmp_pc2 = fs.jump();
+                    let mut false_list2 = ei2.exp.f;
+                    fs.concat_jump(&mut false_list2, jmp_pc2);
+                    fs.patch_true_jumps(ei2.exp.t, fs.pc);
+                    if_jmp = false_list2;
+                    if fs.freereg > pre_freereg2 {
+                        fs.free_reg();
+                    }
                 }
             }
         } else {
@@ -6664,6 +6683,11 @@ fn parse_while(fs: &mut FuncState) {
     let loop_start = fs.pc;
     fs.lasttarget = fs.pc;  // mark while start as jump target (like luaK_getlabel)
     let mut ei = parse_expr(fs);
+    // Like C's cond: 'falses' are all equal here
+    if ei.exp.kind == ExpKind::Nil {
+        ei.exp.kind = ExpKind::Boolean;
+        ei.exp.info = 0;
+    }
     let pre_freereg = fs.freereg;
     
     let is_const_true = matches!(ei.exp.kind, ExpKind::Boolean if ei.exp.info != 0)
@@ -6683,50 +6707,38 @@ fn parse_while(fs: &mut FuncState) {
         fs.patch_true_jumps(ei.exp.t, here);
         ei.exp.f
     } else {
+        // Like C's jumponcond: check for VRELOC+NOT first
         let is_not_vreloc = ei.exp.info2 >= 0
             && (ei.exp.info2 as usize) < fs.proto.code.len()
-            && get_opcode(fs.proto.code[ei.exp.info2 as usize]) == OpCode::NOT;
-        let (r, test_with_k) = if (ei.exp.info2 == -2 || is_not_vreloc)
-            && matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc)
-        {
-            let reg = if is_not_vreloc {
-                // Like C's jumponcond: use NOT's B operand as TEST's A
-                let not_inst = fs.proto.code[ei.exp.info2 as usize];
-                getarg_b(not_inst)
-            } else {
-                ei.exp.info as i32
-            };
-            if is_not_vreloc {
-                fs.pc -= 1;
-                fs.proto.code.pop();
-            } else if !fs.proto.code.is_empty()
-                && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT
-            {
-                fs.proto.code.pop();
-                fs.pc -= 1;
-            }
-            (reg, true)
+            && get_opcode(fs.proto.code[ei.exp.info2 as usize]) == OpCode::NOT
+            && matches!(ei.exp.kind, ExpKind::Relocable);
+
+        if is_not_vreloc {
+            let not_inst = fs.proto.code[ei.exp.info2 as usize];
+            let b = getarg_b(not_inst);
+            fs.pc -= 1;
+            fs.proto.code.pop();
+            fs.code_abc_k(OpCode::TEST, b, 0, 0, true);
+            let jmp = fs.jump();
+            let mut false_list = ei.exp.f;
+            fs.concat_jump(&mut false_list, jmp);
+            fs.patch_true_jumps(ei.exp.t, fs.pc);
+            false_list
         } else {
-            let reg = fs.cond_to_reg(&ei.exp);
-            let k = matches!(ei.exp.kind, ExpKind::Relocable)
-                && !fs.proto.code.is_empty()
-                && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT;
-            if k {
-                fs.proto.code.pop();
-                fs.pc -= 1;
+            let r = fs.discharge_to_any_reg(&ei.exp);
+            if r >= fs.nvarstack() && r == fs.freereg - 1 {
+                fs.free_reg();
             }
-            (reg, k)
-        };
-        fs.code_abc_k(OpCode::TEST, r, 0, 0, test_with_k);
-        let jmp = fs.jump();
-        // Like C's goiftrue: concat JMP to false list, patch true list
-        let mut false_list = ei.exp.f;
-        fs.concat_jump(&mut false_list, jmp);
-        fs.patch_true_jumps(ei.exp.t, fs.pc);
-        if fs.freereg > pre_freereg {
-            fs.free_reg();
+            fs.code_abc_k(OpCode::TESTSET, NO_REG as i32, r, 0, false);
+            let jmp = fs.jump();
+            let mut false_list = ei.exp.f;
+            fs.concat_jump(&mut false_list, jmp);
+            fs.patch_true_jumps(ei.exp.t, fs.pc);
+            if fs.freereg > pre_freereg {
+                fs.free_reg();
+            }
+            false_list
         }
-        false_list
     };
     expect(fs, &Token::Do);
 
@@ -6775,12 +6787,7 @@ fn parse_while(fs: &mut FuncState) {
     fs.break_list = saved_breaklist;
 
     // Patch condexit AFTER leaveblock (like C's luaK_patchtohere after leaveblock)
-    let mut cur = condexit;
-    while cur != NO_JUMP {
-        let next = fs.get_jump(cur);
-        fs.fix_jump(cur, fs.pc, false);
-        cur = next;
-    }
+    fs.patch_to_here(condexit);
 
     expect(fs, &Token::End);
 }
@@ -6824,7 +6831,12 @@ fn parse_repeat(fs: &mut FuncState) {
     expect(fs, &Token::Until);
 
     // Parse condition INSIDE bl2 (like C's cond(ls) inside scope block)
-    let ei = parse_expr(fs);
+    let mut ei = parse_expr(fs);
+    // Like C's cond: 'falses' are all equal here
+    if ei.exp.kind == ExpKind::Nil {
+        ei.exp.kind = ExpKind::Boolean;
+        ei.exp.info = 0;
+    }
 
     // Handle condition BEFORE leaveblock (like C's cond → luaK_goiftrue)
     // This patches true jumps to current PC, which is where CLOSE will be emitted
@@ -6843,48 +6855,37 @@ fn parse_repeat(fs: &mut FuncState) {
             condexit = false_list;
         } else {
             let pre_freereg = fs.freereg;
+            // Like C's jumponcond: check for VRELOC+NOT first
             let is_not_vreloc3 = ei.exp.info2 >= 0
                 && (ei.exp.info2 as usize) < fs.proto.code.len()
-                && get_opcode(fs.proto.code[ei.exp.info2 as usize]) == OpCode::NOT;
-            let (r, test_with_k) = if (ei.exp.info2 == -2 || is_not_vreloc3)
-                && matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc)
-            {
-                let reg = if is_not_vreloc3 {
-                    let not_inst = fs.proto.code[ei.exp.info2 as usize];
-                    getarg_b(not_inst)
-                } else {
-                    ei.exp.info as i32
-                };
-                if is_not_vreloc3 {
-                    fs.pc -= 1;
-                    fs.proto.code.pop();
-                } else if !fs.proto.code.is_empty()
-                    && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT
-                {
-                    fs.proto.code.pop();
-                    fs.pc -= 1;
-                }
-                (reg, true)
+                && get_opcode(fs.proto.code[ei.exp.info2 as usize]) == OpCode::NOT
+                && matches!(ei.exp.kind, ExpKind::Relocable);
+
+            if is_not_vreloc3 {
+                let not_inst = fs.proto.code[ei.exp.info2 as usize];
+                let b = getarg_b(not_inst);
+                fs.pc -= 1;
+                fs.proto.code.pop();
+                fs.code_abc_k(OpCode::TEST, b, 0, 0, true);
+                let jmp_pc3 = fs.jump();
+                let mut false_list3 = ei.exp.f;
+                fs.concat_jump(&mut false_list3, jmp_pc3);
+                fs.patch_true_jumps(ei.exp.t, fs.pc);
+                condexit = false_list3;
             } else {
-                let reg = fs.cond_to_reg(&ei.exp);
-                let k = matches!(ei.exp.kind, ExpKind::Relocable)
-                    && !fs.proto.code.is_empty()
-                    && get_opcode(*fs.proto.code.last().unwrap()) == OpCode::NOT;
-                if k {
-                    fs.proto.code.pop();
-                    fs.pc -= 1;
+                let r = fs.discharge_to_any_reg(&ei.exp);
+                if r >= fs.nvarstack() && r == fs.freereg - 1 {
+                    fs.free_reg();
                 }
-                (reg, k)
-            };
-            fs.code_abc_k(OpCode::TEST, r, 0, 0, test_with_k);
-            let jmp_pc3 = fs.jump();
-            // Like C's goiftrue: concat JMP to false list, patch true list
-            let mut false_list3 = ei.exp.f;
-            fs.concat_jump(&mut false_list3, jmp_pc3);
-            fs.patch_true_jumps(ei.exp.t, fs.pc);
-            condexit = false_list3;
-            if fs.freereg > pre_freereg {
-                fs.free_reg();
+                fs.code_abc_k(OpCode::TESTSET, NO_REG as i32, r, 0, false);
+                let jmp_pc3 = fs.jump();
+                let mut false_list3 = ei.exp.f;
+                fs.concat_jump(&mut false_list3, jmp_pc3);
+                fs.patch_true_jumps(ei.exp.t, fs.pc);
+                condexit = false_list3;
+                if fs.freereg > pre_freereg {
+                    fs.free_reg();
+                }
             }
         }
     }
@@ -6908,24 +6909,14 @@ fn parse_repeat(fs: &mut FuncState) {
     if bl2_has_upval {
         let exit = fs.jump();  // normal exit must jump over fix
         // Patch condexit to here: repetition must close upvalues
-        let mut cur = condexit;
-        while cur != NO_JUMP {
-            let next = fs.get_jump(cur);
-            fs.fix_jump(cur, fs.pc, false);
-            cur = next;
-        }
+        fs.patch_to_here(condexit);
         fs.code_abc(OpCode::CLOSE, bl2_close_reg, 0, 0);
         condexit = fs.jump();  // repeat after closing upvalues
         fs.fix_jump(exit, fs.pc, false);  // normal exit comes to here
     }
 
     // Patch condexit to loop_start (like C's luaK_patchlist)
-    let mut cur = condexit;
-    while cur != NO_JUMP {
-        let next = fs.get_jump(cur);
-        fs.fix_jump(cur, loop_start, true);
-        cur = next;
-    }
+    fs.patch_list(condexit, loop_start);
 
     // Leave bl1 (finish loop, like C's leaveblock)
     // C's leaveblock order: CLOSE -> freereg -> removevars -> createlabel(break) -> solvegotos
@@ -6975,7 +6966,7 @@ fn parse_for(fs: &mut FuncState) {
 
         fs.set_freereg(base);
         let ei = parse_expr(fs);
-        let init_r = fs.expr_to_reg(&ei.exp);
+        let init_r = fs.exp_to_reg(&ei.exp);
         if init_r != base {
             fs.code_abc(OpCode::MOVE, base, init_r, 0);
         }
@@ -6983,7 +6974,7 @@ fn parse_for(fs: &mut FuncState) {
 
         fs.set_freereg(base + 1);
         let ei2 = parse_expr(fs);
-        let limit_r = fs.expr_to_reg(&ei2.exp);
+        let limit_r = fs.exp_to_reg(&ei2.exp);
         if limit_r != base + 1 {
             fs.code_abc(OpCode::MOVE, base + 1, limit_r, 0);
         }
@@ -6992,7 +6983,7 @@ fn parse_for(fs: &mut FuncState) {
             fs.ls_mut().next();
             fs.set_freereg(base + 2);
             let ei3 = parse_expr(fs);
-            let step_r = fs.expr_to_reg(&ei3.exp);
+            let step_r = fs.exp_to_reg(&ei3.exp);
             if step_r != base + 2 {
                 fs.code_abc(OpCode::MOVE, base + 2, step_r, 0);
             }
@@ -7132,13 +7123,43 @@ fn parse_for(fs: &mut FuncState) {
         fs.set_freereg(base);
         let pc_before = fs.pc;
         let mut nexps = 0;
-        loop {
-            parse_expr(fs);
-            nexps += 1;
-            if !check(fs, &Token::Comma) { break; }
+        let mut last_ei = parse_expr(fs);
+        nexps += 1;
+        while check(fs, &Token::Comma) {
             fs.ls_mut().next();
+            // Like C's explist: put previous expression into next register
+            fs.exp_to_next_reg(&last_ei.exp);
+            last_ei = parse_expr(fs);
+            nexps += 1;
         }
+
+        // Like C's adjust_assign: handle last expression BEFORE adjustlocalvars
+        let mut last_is_call = false;
+        let is_multret = matches!(last_ei.exp.kind, ExpKind::Call | ExpKind::Vararg);
+        if is_multret {
+            // Multi-return: adjust the call's C field
+            let needed = (6 - nexps).max(1).min(255);
+            // Find the CALL instruction and adjust its C field
+            if fs.pc > pc_before {
+                for i in (pc_before..fs.pc).rev() {
+                    if get_opcode(fs.proto.code[i as usize]) == OpCode::CALL {
+                        setarg(&mut fs.proto.code[i as usize], needed, POS_C, SIZE_C);
+                        break;
+                    }
+                }
+            }
+            last_is_call = true;
+        } else {
+            // Single value: put into next register (like C's luaK_exp2nextreg in adjust_assign)
+            fs.exp_to_next_reg(&last_ei.exp);
+        }
+
+        if !last_is_call && nexps < 4 {
+            fs.code_nil(base + nexps, 4 - nexps);
+        }
+
         // Like C's adjustlocalvars(ls, 3): activate only the 3 internal variables
+        // AFTER adjust_assign (like C's order: adjust_assign then adjustlocalvars)
         for (i, lv) in fs.locals[forstat_nlocals..].iter_mut().enumerate() {
             if i < 3 {
                 lv.active = true;
@@ -7149,22 +7170,7 @@ fn parse_for(fs: &mut FuncState) {
         if let Some(block) = fs.block_stack.last_mut() {
             block.has_upval = true;
         }
-        
-        let mut last_is_call = false;
-        if fs.pc > pc_before {
-            for i in (pc_before..fs.pc).rev() {
-                if get_opcode(fs.proto.code[i as usize]) == OpCode::CALL {
-                    let needed = (6 - nexps).max(1).min(255);
-                    setarg(&mut fs.proto.code[i as usize], needed, POS_C, SIZE_C);
-                    last_is_call = true;
-                    break;
-                }
-            }
-        }
-        
-        if !last_is_call && nexps < 4 {
-            fs.code_nil(base + nexps, 4 - nexps);
-        }
+
         fs.set_freereg(base + 3 + ncontrol);
         fs.needclose = true;
         if fs.freereg > fs.max_freereg {
@@ -7606,7 +7612,7 @@ fn parse_return(fs: &mut FuncState) {
         if check(fs, &Token::Semi) { fs.ls_mut().next(); }
         return;
     }
-    
+
     let first = fs.nvarstack();
     let ei = parse_expr(fs);
 
@@ -7616,6 +7622,19 @@ fn parse_return(fs: &mut FuncState) {
         fs.exp_to_next_reg(&ei.exp);
         let nret = 1 + parse_expr_list(fs);
         fs.return_stat_gen(first, nret);
+    } else if matches!(ei.exp.kind, ExpKind::Call) {
+        // Like C's hasmultret(VCALL): set multret, then check for tail call
+        let call_pc = ei.exp.info2 as usize;
+        // Like C's luaK_setmultret: set CALL's C to 0 (LUA_MULTRET + 1)
+        setarg(&mut fs.proto.code[call_pc], 0, POS_C, SIZE_C);
+        // Check for tail call: must be single return value and not inside a TBC block
+        let has_tbc = fs.locals[first as usize..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
+        if !has_tbc {
+            // Convert CALL to TAILCALL (like C's SET_OPCODE)
+            SET_OPCODE(&mut fs.proto.code[call_pc], OpCode::TAILCALL);
+        }
+        // Generate RETURN with LUA_MULTRET (nret = -1, so B = nret+1 = 0)
+        fs.return_stat_gen(first, -1);
     } else {
         // Single return value: can use original slot (like C's luaK_exp2anyreg)
         let r = fs.exp_to_reg(&ei.exp);

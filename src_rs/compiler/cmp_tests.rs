@@ -971,6 +971,26 @@ assert(a == 2)
     }
 
     #[test]
+    fn test_constructs_lua() {
+        assert_inst_match_file("constructs.lua");
+    }
+
+    #[test]
+    fn test_coroutine_lua() {
+        assert_inst_match_file("coroutine.lua");
+    }
+
+    #[test]
+    fn test_cstack_lua() {
+        assert_inst_match_file("cstack.lua");
+    }
+
+    #[test]
+    fn test_db_lua() {
+        assert_inst_match_file("db.lua");
+    }
+
+    #[test]
     fn test_goto_lua() {
         assert_inst_match_file_allow_constants("goto.lua");
     }
@@ -1119,6 +1139,65 @@ assert(a == 2)
         // "readField" will have a constant index > 255
         source.push_str("return _ENV.readField");
         assert_inst_match(&source, None);
+    }
+
+    #[test]
+    fn test_and_or_testset_to_test() {
+        // Test that TESTSET is converted to TEST in and/or expressions
+        // When the result register is NO_REG or equals B, TESTSET should become TEST
+        assert_inst_match("local a; local b = a and 1", None);
+    }
+
+    #[test]
+    fn test_and_in_assign() {
+        // Test that TESTSET is converted to TEST when and expression is used in assignment
+        // like f(g).x = f(2) and f(10)+f(9)
+        assert_inst_match("local f,g; f(g).x = f(2) and f(10)+f(9)", None);
+    }
+
+    #[test]
+    fn test_and_or_in_if() {
+        // Test that TESTSET is converted to TEST in if conditions
+        assert_inst_match("local a; if a then return 1 end", None);
+    }
+
+    #[test]
+    fn test_or_in_for_limit() {
+        // Test that TESTSET is converted to TEST in for loop limit
+        assert_inst_match("local s; for i = 1, (s and 100 or 200) do end", None);
+    }
+
+    #[test]
+    fn test_while_nil_testset_to_test() {
+        // Test that Nil is converted to Boolean(false) in while condition,
+        // generating LOADFALSE (not LOADNIL) and TEST (not TESTSET)
+        assert_inst_match("while nil do end", None);
+    }
+
+    #[test]
+    fn test_while_false_testset_to_test() {
+        // Test that TESTSET is converted to TEST in while condition
+        assert_inst_match("while false do end", None);
+    }
+
+    #[test]
+    fn test_repeat_until_nil() {
+        // Test that Nil is converted to Boolean(false) in repeat-until condition
+        assert_inst_match("repeat local a = {} until nil", None);
+    }
+
+    #[test]
+    fn test_not_or_testset_to_test() {
+        // Test that TESTSET is converted to TEST in "if not (a and b or c)"
+        // This tests the full chain: or → not → if condition
+        assert_inst_match("local n; if not (n and n or n == \"x\") then end", None);
+    }
+
+    #[test]
+    fn test_for_in_no_extra_move() {
+        // Test that generic for loop doesn't generate extra MOVE instruction
+        // for the iterator expression
+        assert_inst_match("for k,v,w in a do end", None);
     }
 
     fn assert_inst_match_file(name: &str) {
