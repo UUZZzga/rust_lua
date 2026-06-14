@@ -1000,6 +1000,11 @@ assert(a == 2)
         assert_inst_match_file("events.lua");
     }
 
+    #[test]
+    fn test_files_lua() {
+        assert_inst_match_file("files.lua");
+    }
+
     // ===== ADDK 交换律优化测试 =====
     // Float 常量在加法左操作数时，应交换操作数使用 ADDK+MMBINK 而非 LOADK+ADD+MMBIN
 
@@ -2052,5 +2057,77 @@ global<const> print
 do global a, b, c = 10 end
 "#;
         assert_inst_match_allow_constants(source);
+    }
+
+    // ===== 冒号调用+字符串参数测试 =====
+    // obj:method"string" 应生成 SELF + LOADK + CALL B=3（而非 B=2）
+
+    #[test]
+    fn test_colon_call_string_arg() {
+        // Bug: colon call with string argument generated CALL B=2 instead of B=3.
+        // SELF puts method at freg and self at freg+1, string arg at freg+2,
+        // so CALL should have B=3 (method + self + 1 arg).
+        let source = r#"
+global<const> print
+local obj = {}
+function obj:write(s) end
+obj:write"hello"
+"#;
+        assert_inst_match(source, None);
+    }
+
+    // ===== 冒号调用+表构造器参数测试 =====
+    // obj:method{...} 应生成 SELF + table + CALL B=3（而非 B=2）
+
+    #[test]
+    fn test_colon_call_table_arg() {
+        // Bug: colon call with table constructor argument generated CALL B=2
+        // instead of B=3. Same issue as string argument case.
+        let source = r#"
+global<const> print
+local obj = {}
+function obj:configure(t) end
+obj:configure{x=1}
+"#;
+        assert_inst_match(source, None);
+    }
+
+    // ===== GEI 指令生成测试 =====
+    // 0 <= x 应生成 GEI x 0，而非 LOADI + LE
+
+    #[test]
+    fn test_le_const_left_gei() {
+        // Bug: "0 <= x" generated LOADI 0 + LE instead of GEI x 0.
+        // When the left operand of <= is a small integer constant and
+        // the right operand is not, the comparison should be flipped:
+        // (0 <= x) is equivalent to (x >= 0), generating GEI.
+        let source = r#"
+global<const> print
+local x = 1
+if 0 <= x then print("yes") end
+"#;
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn test_lt_const_left_gti() {
+        // Similar: "0 < x" should generate GTI x 0 (x > 0).
+        let source = r#"
+global<const> print
+local x = 1
+if 0 < x then print("yes") end
+"#;
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn test_le_neg_const_left_gei() {
+        // "-1 <= x" should generate GEI x -1.
+        let source = r#"
+global<const> print
+local x = 0
+if -1 <= x then print("yes") end
+"#;
+        assert_inst_match(source, None);
     }
 }

@@ -2266,13 +2266,14 @@ fn checkglobal(fs: &mut FuncState, varname: &str, _line: i32) {
     let r = fs.alloc_reg();
     let k = fs.string_k(varname);
     code_gettabup(fs, r, 0, k);
-    let k_bx = if k >= 256 { 0 } else { k + 1 };
+    let k_bx = if k >= crate::opcodes::MAXARG_BX as i32 { 0 } else { k + 1 };
     fs.code_abx(OpCode::ERRNNIL, r, k_bx);
     fs.free_reg();
 }
 
 /// ANTLR4: 全局变量声明 — 解析带有 global 前缀的属性变量声明列表
-/// C 的 initglobal 递归逻辑：对每个变量从后往前，checkglobal → storevartop
+/// C 的 initglobal 递归逻辑：对每个变量从后往前，buildglobal → (表达式) → checkglobal → storevartop
+/// 关键：当 key > MAXINDEXRK 时，buildglobal 会在解析表达式之前发射 GETUPVAL + LOADK
 fn globalnames(fs: &mut FuncState, defkind: i32) {
     let mut names: Vec<String> = Vec::new();
     let mut kinds: Vec<i32> = Vec::new();
@@ -2291,19 +2292,15 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
 
     // Like C's globalnames: declare variables first (new_varkind),
     // but DON'T activate them yet (nactvar not increased).
-    // This ensures that in the initialization expressions, the right-hand side
-    // references outer locals, not the newly declared globals.
     let first_local_idx = fs.locals.len();
     let mut var_k_names: Vec<i32> = Vec::new();  // constant indices for variable names
     for i in 0..nvars {
         fs.add_local_kind(&names[i], fs.pc, kinds[i]);
-        // Like C's buildglobal: add the variable name to constant table now
-        // (in forward order, matching C's buildglobal which calls codestring)
         let k = fs.string_k(&names[i]);
         var_k_names.push(k);
     }
 
-    // Mark the newly declared variables as inactive (C hasn't increased nactvar yet)
+    // Mark the newly declared variables as inactive
     for i in first_local_idx..fs.locals.len() {
         fs.locals[i].active = false;
     }
@@ -2311,16 +2308,38 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
     if has_init {
         fs.ls_mut().next();
 
-        // Like C's explist + adjust_assign:
-        // Parse expressions. For all but the last, exp2nextreg them into consecutive registers.
-        // The last expression is handled by adjust_assign logic.
+        // Like C's initglobal: for each variable, pre-evaluate the table/key
+        // BEFORE parsing expressions (matching C's buildglobal + luaK_indexed).
+        // When key is a Kstr (index <= MAXINDEXRK), no pre-evaluation is needed
+        // because SETTABUP can encode it directly. When key > MAXINDEXRK,
+        // we must emit GETUPVAL + LOADK before expressions are parsed.
+        // Structure: PreEvalInfo { table_reg, key_reg } for non-Kstr keys.
+        struct PreEvalInfo {
+            table_reg: i32,  // register holding _ENV (or -1 if not pre-evaluated)
+            key_reg: i32,    // register holding key constant (or -1)
+        }
+        let mut pre_evals: Vec<PreEvalInfo> = Vec::new();
+        for i in 0..nvars {
+            if !is_kstr(fs, var_k_names[i]) {
+                // Key is not a short string constant (index > MAXINDEXRK)
+                // Pre-emit GETUPVAL + LOADK, matching C's luaK_indexed behavior
+                let table_reg = fs.alloc_reg();
+                fs.code_abc(OpCode::GETUPVAL, table_reg, 0, 0);
+                let key_reg = fs.alloc_reg();
+                fs.code_abx(OpCode::LOADK, key_reg, var_k_names[i]);
+                pre_evals.push(PreEvalInfo { table_reg, key_reg });
+            } else {
+                pre_evals.push(PreEvalInfo { table_reg: -1, key_reg: -1 });
+            }
+        }
+
+        // Now parse expressions
         let mut last_exp = ExpDesc::new(ExpKind::Void, 0);
         let mut nexps = 0;
         loop {
             let ei = parse_expr(fs);
             nexps += 1;
             if check(fs, &Token::Comma) {
-                // Not the last expression: evaluate to next register
                 fs.exp_to_next_reg(&ei.exp);
                 fs.ls_mut().next();
             } else {
@@ -2329,10 +2348,9 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
             }
         }
 
-        // Like C's adjust_assign: handle variable/expression count mismatch
+        // Like C's adjust_assign
         let needed = nvars as i32 - nexps as i32;
         if last_exp.kind == ExpKind::Vararg || last_exp.kind == ExpKind::Call {
-            // Like C's hasmultret: adjust the call to return extra values
             let extra = if needed + 1 > 0 { needed + 1 } else { 0 };
             if last_exp.kind == ExpKind::Call {
                 let call_pc = last_exp.info2;
@@ -2341,9 +2359,7 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
                     fs.set_c(call_pc, c_val);
                 }
             }
-            // For Vararg, similar adjustment would be needed
         } else {
-            // Last expression is not multi-return: close it and fill with nils
             if nexps > 0 {
                 fs.exp_to_next_reg(&last_exp);
             }
@@ -2352,27 +2368,48 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
             }
         }
         if needed > 0 {
-            // reserve_regs: allocate 'needed' extra registers
             for _ in 0..needed {
                 fs.alloc_reg();
             }
         } else {
-            // needed is negative: remove extra values
             fs.freereg = (fs.freereg as i32 + needed) as i32;
         }
 
         // Like C's initglobal unwind: for each variable from last to first,
         // checkglobal then storevartop
         for i in (0..nvars).rev() {
-            checkglobal(fs, &names[i], 0);
-            // storevartop: use freereg-1 as the value register, then free it
-            let val_reg = fs.freereg - 1;
-            code_settabup(fs, 0, var_k_names[i], val_reg);
-            fs.free_reg();  // storevartop frees the value register
+            let pe = &pre_evals[i];
+            if pe.table_reg >= 0 {
+                // Key was pre-evaluated: checkglobal re-loads _ENV + key (like C's
+                // checkglobal which calls buildglobal again), then storevartop uses
+                // the pre-evaluated registers for SETTABLE.
+                // checkglobal: GETUPVAL + LOADK + GETTABLE + ERRNNIL
+                let cr = fs.alloc_reg();
+                fs.code_abc(OpCode::GETUPVAL, cr, 0, 0);
+                let ckr = fs.alloc_reg();
+                fs.code_abx(OpCode::LOADK, ckr, var_k_names[i]);
+                fs.code_abc(OpCode::GETTABLE, cr, cr, ckr);
+                let k_bx = if var_k_names[i] >= crate::opcodes::MAXARG_BX as i32 { 0 } else { var_k_names[i] + 1 };
+                fs.code_abx(OpCode::ERRNNIL, cr, k_bx);
+                fs.free_reg(); // ckr
+                fs.free_reg(); // cr
+                // storevartop: SETTABLE table_reg key_reg val_reg
+                let val_reg = fs.freereg - 1;
+                fs.code_abc_k(OpCode::SETTABLE, pe.table_reg, pe.key_reg, val_reg, false);
+                fs.free_reg(); // val_reg
+                fs.free_reg(); // key_reg
+                fs.free_reg(); // table_reg
+            } else {
+                // Key is a Kstr: use the simpler checkglobal + code_settabup path
+                checkglobal(fs, &names[i], 0);
+                let val_reg = fs.freereg - 1;
+                code_settabup(fs, 0, var_k_names[i], val_reg);
+                fs.free_reg();
+            }
         }
     }
 
-    // Like C's globalnames: now activate the declaration (fs->nactvar += nvars)
+    // Like C's globalnames: now activate the declaration
     for i in first_local_idx..fs.locals.len() {
         fs.locals[i].active = true;
     }
@@ -2393,12 +2430,43 @@ fn globalstat(fs: &mut FuncState) {
 fn globalfunc(fs: &mut FuncState, _line: i32) {
     let fname = get_name(fs);
     fs.add_local_kind(&fname, fs.pc, GDKREG);
-    let r = parse_body(fs, None);
-    // C order: checkglobal before storevar
-    checkglobal(fs, &fname, _line);
     let k = fs.string_k(&fname);
-    code_settabup(fs, 0, k, r);
-    fs.free_reg();
+
+    // Like C's buildglobal: if key is not a Kstr, pre-evaluate GETUPVAL + LOADK
+    // before parse_body, matching C's luaK_indexed behavior
+    let mut pre_eval: Option<(i32, i32)> = None;  // (table_reg, key_reg)
+    if !is_kstr(fs, k) {
+        let table_reg = fs.alloc_reg();
+        fs.code_abc(OpCode::GETUPVAL, table_reg, 0, 0);
+        let key_reg = fs.alloc_reg();
+        fs.code_abx(OpCode::LOADK, key_reg, k);
+        pre_eval = Some((table_reg, key_reg));
+    }
+
+    let r = parse_body(fs, None);
+
+    // C order: checkglobal before storevar
+    if let Some((table_reg, key_reg)) = pre_eval {
+        // checkglobal: re-load _ENV + key (like C's checkglobal which calls buildglobal again)
+        let cr = fs.alloc_reg();
+        fs.code_abc(OpCode::GETUPVAL, cr, 0, 0);
+        let ckr = fs.alloc_reg();
+        fs.code_abx(OpCode::LOADK, ckr, k);
+        fs.code_abc(OpCode::GETTABLE, cr, cr, ckr);
+        let k_bx = if k >= crate::opcodes::MAXARG_BX as i32 { 0 } else { k + 1 };
+        fs.code_abx(OpCode::ERRNNIL, cr, k_bx);
+        fs.free_reg(); // ckr
+        fs.free_reg(); // cr
+        // storevar: SETTABLE table_reg key_reg r
+        fs.code_abc_k(OpCode::SETTABLE, table_reg, key_reg, r, false);
+        fs.free_reg(); // r
+        fs.free_reg(); // key_reg
+        fs.free_reg(); // table_reg
+    } else {
+        checkglobal(fs, &fname, _line);
+        code_settabup(fs, 0, k, r);
+        fs.free_reg();
+    }
 }
 
 /// ANTLR4: global 分发 — 判断 global function 或 global 变量声明
@@ -3311,11 +3379,38 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
             fs.code_abc(OpCode::GETTABLE, freg, src, kr);
             fs.free_reg();  // free key register
         }
+        // After SELF (or MOVE+GETTABLE), freereg must be at least freg+2
+        // (freg=method, freg+1=self copy)
+        while fs.freereg < freg + 2 {
+            fs.alloc_reg();
+        }
+        if matches!(&fs.ls().token, Token::String(..)) {
+            // colon call with string argument: obj:method"string"
+            let str_s = match &fs.ls().token {
+                Token::String(s) => s.clone(),
+                _ => String::new(),
+            };
+            fs.ls_mut().next();
+            let k = fs.string_k(&str_s);
+            let kr = fs.alloc_reg();
+            fs.code_abx(OpCode::LOADK, kr, k);
+            let pc = fs.code_abc(OpCode::CALL, freg, 3, 2);
+            fs.set_freereg(freg + 1);
+            return pc;
+        }
+        if check(fs, &Token::LBrace) {
+            // colon call with table argument: obj:method{...}
+            let (tr, _n) = parse_constructor(fs);
+            if freg + 2 != tr {
+                fs.code_abc(OpCode::MOVE, freg + 2, tr, 0);
+                fs.free_reg();
+            }
+            let pc = fs.code_abc(OpCode::CALL, freg, 3, 2);
+            fs.set_freereg(freg + 1);
+            return pc;
+        }
         if check(fs, &Token::LParen) {
             fs.ls_mut().next();
-            if fs.freereg <= freg + 1 {
-                fs.alloc_reg();
-            }
             let (na, na_multret) = parse_args(fs);
             expect(fs, &Token::RParen);
             let na_adj = if na_multret { 0 } else { na + 2 };
@@ -4318,50 +4413,84 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         }
                     }
                 } else {
-                    let r_alloc = !matches!(ec.kind, ExpKind::NonReloc | ExpKind::Call | ExpKind::Vararg);
-                    let r = if r_alloc {
-                        fs.exp_to_reg(&ec)
-                    } else if ec.has_jumps() {
-                        let reg = ec.info as i32;
-                        fs.resolve_jumps(&ec, reg);
-                        reg
+                    // LT/LE case: check if left operand is SC number
+                    // (transform A < B to B > A, A <= B to B >= A)
+                    if let Some(sc_val) = is_sc_number(&ec) {
+                        let r_alloc = !matches!(e2.exp.kind, ExpKind::NonReloc | ExpKind::Call | ExpKind::Vararg);
+                        let reg = if r_alloc {
+                            fs.exp_to_reg(&e2.exp)
+                        } else if e2.exp.has_jumps() {
+                            let reg = e2.exp.info as i32;
+                            fs.resolve_jumps(&e2.exp, reg);
+                            reg
+                        } else {
+                            let reg = e2.exp.info as i32;
+                            if e2.exp.info2 >= 0 {
+                                fs.set_a(e2.exp.info2, reg);
+                            }
+                            if e2.exp.info2 == -2 {
+                                fs.code_abc(OpCode::NOT, reg, reg, 0);
+                            }
+                            reg
+                        };
+                        let imm = int_to_sc(sc_val);
+                        let imm_op = match op_tok {
+                            Token::Lt => OpCode::GTI,
+                            Token::LtEq => OpCode::GEI,
+                            _ => OpCode::GTI,
+                        };
+                        fs.code_abc_k(imm_op, reg, imm, 0, k != 0);
+                        let jmp_pc = fs.jump();
+                        if r_alloc || (matches!(e2.exp.kind, ExpKind::NonReloc | ExpKind::Call | ExpKind::Vararg) && reg >= fs.nvarstack()) {
+                            fs.free_reg();
+                        }
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64) };
                     } else {
-                        let reg = ec.info as i32;
-                        if ec.info2 >= 0 {
-                            fs.set_a(ec.info2, reg);
-                        }
-                        if ec.info2 == -2 {
-                            fs.code_abc(OpCode::NOT, reg, reg, 0);
-                        }
-                        reg
-                    };
-                    let r2_alloc = !matches!(e2.exp.kind, ExpKind::NonReloc | ExpKind::Call | ExpKind::Vararg);
-                    let r2 = if r2_alloc {
-                        fs.exp_to_reg(&e2.exp)
-                    } else if e2.exp.has_jumps() {
-                        let reg = e2.exp.info as i32;
-                        fs.resolve_jumps(&e2.exp, reg);
-                        reg
-                    } else {
-                        let reg = e2.exp.info as i32;
-                        if e2.exp.info2 >= 0 {
-                            fs.set_a(e2.exp.info2, reg);
-                        }
-                        if e2.exp.info2 == -2 {
-                            fs.code_abc(OpCode::NOT, reg, reg, 0);
-                        }
-                        reg
-                    };
-                    let (op, k) = match op_tok {
-                        Token::Lt => (OpCode::LT, 1),
-                        Token::LtEq => (OpCode::LE, 1),
-                        _ => (OpCode::LT, 1),
-                    };
-                    fs.code_abc_k(op, r, r2, 0, k != 0);
-                    let jmp_pc = fs.jump();
-                    if r2_alloc || (matches!(e2.exp.kind, ExpKind::NonReloc | ExpKind::Call | ExpKind::Vararg) && r2 >= fs.nvarstack()) { fs.free_reg(); }
-                    if r_alloc || (matches!(ec.kind, ExpKind::NonReloc | ExpKind::Call | ExpKind::Vararg) && r >= fs.nvarstack()) { fs.free_reg(); }
-                    e = ExprItem { exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64) };
+                        let r_alloc = !matches!(ec.kind, ExpKind::NonReloc | ExpKind::Call | ExpKind::Vararg);
+                        let r = if r_alloc {
+                            fs.exp_to_reg(&ec)
+                        } else if ec.has_jumps() {
+                            let reg = ec.info as i32;
+                            fs.resolve_jumps(&ec, reg);
+                            reg
+                        } else {
+                            let reg = ec.info as i32;
+                            if ec.info2 >= 0 {
+                                fs.set_a(ec.info2, reg);
+                            }
+                            if ec.info2 == -2 {
+                                fs.code_abc(OpCode::NOT, reg, reg, 0);
+                            }
+                            reg
+                        };
+                        let r2_alloc = !matches!(e2.exp.kind, ExpKind::NonReloc | ExpKind::Call | ExpKind::Vararg);
+                        let r2 = if r2_alloc {
+                            fs.exp_to_reg(&e2.exp)
+                        } else if e2.exp.has_jumps() {
+                            let reg = e2.exp.info as i32;
+                            fs.resolve_jumps(&e2.exp, reg);
+                            reg
+                        } else {
+                            let reg = e2.exp.info as i32;
+                            if e2.exp.info2 >= 0 {
+                                fs.set_a(e2.exp.info2, reg);
+                            }
+                            if e2.exp.info2 == -2 {
+                                fs.code_abc(OpCode::NOT, reg, reg, 0);
+                            }
+                            reg
+                        };
+                        let (op, k) = match op_tok {
+                            Token::Lt => (OpCode::LT, 1),
+                            Token::LtEq => (OpCode::LE, 1),
+                            _ => (OpCode::LT, 1),
+                        };
+                        fs.code_abc_k(op, r, r2, 0, k != 0);
+                        let jmp_pc = fs.jump();
+                        if r2_alloc || (matches!(e2.exp.kind, ExpKind::NonReloc | ExpKind::Call | ExpKind::Vararg) && r2 >= fs.nvarstack()) { fs.free_reg(); }
+                        if r_alloc || (matches!(ec.kind, ExpKind::NonReloc | ExpKind::Call | ExpKind::Vararg) && r >= fs.nvarstack()) { fs.free_reg(); }
+                        e = ExprItem { exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64) };
+                    }
                 }
             }
             matched = true;
@@ -5061,6 +5190,95 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             }
                         }
                         // Like C: don't alloc result reg, use VRELOC (info=0, info2=pc)
+                        fs.code_abc(OpCode::MMBIN, r, r2, 7);
+                        e = ExprItem { exp: ExpDesc::new_reloc_with_pc(0, pc) };
+                    }
+                }
+                (ExpKind::Float, _) => {
+                    // Like C's codecommutative: swap operands for commutative ops
+                    if is_add {
+                        // Swap: put e2 (non-Float) on the left, Float on the right
+                        // Like C's codearith -> codebinK: use ADDK + MMBINK
+                        let r2 = if matches!(e2.exp.kind, ExpKind::NonReloc) && !e2.exp.has_jumps() {
+                            let reg = e2.exp.info as i32;
+                            if e2.exp.info2 >= 0 {
+                                fs.set_a(e2.exp.info2, reg);
+                            }
+                            reg
+                        } else if matches!(e2.exp.kind, ExpKind::Relocable) && !e2.exp.has_jumps() && e2.exp.info2 < 0 {
+                            e2.exp.info as i32
+                        } else {
+                            fs.exp_to_reg(&e2.exp)
+                        };
+                        let f = f64::from_bits(ec.info as u64);
+                        let k = fs.float_k(f);
+                        if k <= 255 {
+                            // Like C's finishbinexpval: generate ADDK with A=0,
+                            // free e2's register, then VRELOC (no result register).
+                            let pc = fs.code_abc(OpCode::ADDK, 0, r2, k);
+                            // Free e2's register if it's a temp - like C's freeexps
+                            if r2 >= fs.nvarstack() && r2 == fs.freereg - 1 {
+                                fs.free_reg();
+                            }
+                            // Like C: don't alloc result reg, use VRELOC (info=0, info2=pc)
+                            // flip=1 because operands were swapped
+                            fs.code_abc_k(OpCode::MMBINK, r2, k, 6, true);
+                            e = ExprItem { exp: ExpDesc::new_reloc_with_pc(0, pc) };
+                        } else {
+                            // Constant table index too large, fall back to LOADK + ADD
+                            let r = fs.exp_to_reg(&ec);
+                            let pc = fs.code_abc(OpCode::ADD, 0, r2, r);
+                            // Free registers in descending order - like C's freeexps
+                            if r2 > r {
+                                if r2 >= fs.nvarstack() && r2 == fs.freereg - 1 {
+                                    fs.free_reg();
+                                }
+                                if r >= fs.nvarstack() && r == fs.freereg - 1 {
+                                    fs.free_reg();
+                                }
+                            } else {
+                                if r >= fs.nvarstack() && r == fs.freereg - 1 {
+                                    fs.free_reg();
+                                }
+                                if r2 >= fs.nvarstack() && r2 == fs.freereg - 1 {
+                                    fs.free_reg();
+                                }
+                            }
+                            fs.code_abc(OpCode::MMBIN, r2, r, 6);
+                            e = ExprItem { exp: ExpDesc::new_reloc_with_pc(0, pc) };
+                        }
+                    } else {
+                        // Subtraction: Float - something, not commutative
+                        // Discharge Float to register, then use SUB
+                        let r = fs.exp_to_reg(&ec);
+                        let r2 = if matches!(e2.exp.kind, ExpKind::NonReloc) && !e2.exp.has_jumps() {
+                            let reg = e2.exp.info as i32;
+                            if e2.exp.info2 >= 0 {
+                                fs.set_a(e2.exp.info2, reg);
+                            }
+                            reg
+                        } else if matches!(e2.exp.kind, ExpKind::Relocable) && !e2.exp.has_jumps() && e2.exp.info2 < 0 {
+                            e2.exp.info as i32
+                        } else {
+                            fs.exp_to_reg(&e2.exp)
+                        };
+                        let pc = fs.code_abc(OpCode::SUB, 0, r, r2);
+                        // Free registers in descending order - like C's freeexps
+                        if r > r2 {
+                            if r >= fs.nvarstack() && r == fs.freereg - 1 {
+                                fs.free_reg();
+                            }
+                            if r2 >= fs.nvarstack() && r2 == fs.freereg - 1 {
+                                fs.free_reg();
+                            }
+                        } else {
+                            if r2 >= fs.nvarstack() && r2 == fs.freereg - 1 {
+                                fs.free_reg();
+                            }
+                            if r >= fs.nvarstack() && r == fs.freereg - 1 {
+                                fs.free_reg();
+                            }
+                        }
                         fs.code_abc(OpCode::MMBIN, r, r2, 7);
                         e = ExprItem { exp: ExpDesc::new_reloc_with_pc(0, pc) };
                     }
@@ -6477,6 +6695,35 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                             base_reg
                         };
                         inst_pc = fs.code_abc(OpCode::GETI, result_reg, base_reg, ei.exp.info as i32);
+                    } else if ei.exp.kind == ExpKind::Str {
+                        // Key is a string constant: check if it's a short string
+                        // that can use GETFIELD (like C's luaK_indexed -> VINDEXSTR)
+                        let k = fs.get_str_k(&ei.exp);
+                        if is_kstr(fs, k) {
+                            // Short string: use GETFIELD
+                            result_reg = if base_is_nonreloc_local {
+                                fs.alloc_reg()
+                            } else {
+                                base_reg
+                            };
+                            inst_pc = code_getfield(fs, result_reg, base_reg, k);
+                        } else {
+                            // Long string or constant index too large: LOADK + GETTABLE
+                            result_reg = if base_is_nonreloc_local {
+                                fs.alloc_reg()
+                            } else {
+                                base_reg
+                            };
+                            if result_reg != base_reg {
+                                fs.code_abx(OpCode::LOADK, result_reg, k);
+                                inst_pc = fs.code_abc(OpCode::GETTABLE, result_reg, base_reg, result_reg);
+                            } else {
+                                let kr = fs.alloc_reg();
+                                fs.code_abx(OpCode::LOADK, kr, k);
+                                inst_pc = fs.code_abc(OpCode::GETTABLE, result_reg, base_reg, kr);
+                                fs.free_reg(); // kr
+                            }
+                        }
                     } else {
                         let key_reg = if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei.exp.has_jumps() {
                             if ei.exp.info2 >= 0 {

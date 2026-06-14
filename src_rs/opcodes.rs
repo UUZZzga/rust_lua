@@ -78,6 +78,7 @@ pub const MAX_FSTACK: u8 = NO_REG;
 
 pub const MAXARG_B: u32 = (1u32 << SIZE_B) - 1;
 pub const MAXINDEXRK: u32 = MAXARG_B;
+pub const MAXARG_BX: u32 = (1u32 << SIZE_BX) - 1;
 
 // ============================================================================
 // 位操作
