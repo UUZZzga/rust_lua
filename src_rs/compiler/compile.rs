@@ -6357,7 +6357,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     let last_ins = fs.proto.code[fs.pc as usize - 1];
                     get_opcode(last_ins) == OpCode::GETUPVAL && getarg_b(last_ins) == 0
                 };
-                if is_env_upval {
+                if is_env_upval && is_kstr(fs, k) {
                     let last_idx = fs.pc as usize - 1;
                     fs.proto.code.remove(last_idx);
                     fs.pc -= 1;
@@ -6369,6 +6369,15 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     }
                     let pc = code_gettabup(fs, 0, 0, k);
                     e = ExpDesc::new_reloc_with_pc(0, pc);
+                } else if is_env_upval {
+                    // Env upval with non-short key (constant index exceeds
+                    // MAXINDEXRK or long string). Keep the GETUPVAL instruction
+                    // and treat like normal NonReloc indexing.
+                    let kr = fs.alloc_reg();
+                    fs.code_abx(OpCode::LOADK, kr, k);
+                    let inst_pc = fs.code_abc(OpCode::GETTABLE, base_reg, base_reg, kr);
+                    fs.free_reg(); // kr
+                    e = ExpDesc { kind: ExpKind::NonReloc, info: base_reg as i64, info2: inst_pc, t: NO_JUMP, f: NO_JUMP, str_val: None };
                 } else {
                     let result_reg = if matches!(e.kind, ExpKind::NonReloc) && (e.info as i32) < fs.nvarstack() {
                         fs.alloc_reg()
@@ -6409,17 +6418,26 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 let ei = parse_expr(fs);
                 expect(fs, &Token::RBracket);
                 if is_env_before && ei.exp.kind == ExpKind::Str {
-                    fs.proto.code.truncate((saved_pc_before_expr - 1) as usize);
-                    fs.pc = saved_pc_before_expr - 1;
-                    // Like C: dischargevars for VINDEXUP generates GETTABUP with A=0
-                    // (placeholder), then marks as VRELOC. Free base_reg first since
-                    // the GETUPVAL that used it was just removed.
-                    if base_reg >= fs.nvarstack() && base_reg == fs.freereg - 1 {
-                        fs.free_reg();
-                    }
                     let k = fs.get_str_k(&ei.exp);
-                    let pc = code_gettabup(fs, 0, 0, k);
-                    e = ExpDesc::new_reloc_with_pc(0, pc);
+                    if is_kstr(fs, k) {
+                        // Key is a short string: can use GETTABUP
+                        fs.proto.code.truncate((saved_pc_before_expr - 1) as usize);
+                        fs.pc = saved_pc_before_expr - 1;
+                        if base_reg >= fs.nvarstack() && base_reg == fs.freereg - 1 {
+                            fs.free_reg();
+                        }
+                        let pc = code_gettabup(fs, 0, 0, k);
+                        e = ExpDesc::new_reloc_with_pc(0, pc);
+                    } else {
+                        // Key is a string but not a short string (constant index
+                        // too large or long string). Keep the GETUPVAL instruction
+                        // and treat like normal NonReloc indexing.
+                        let kr = fs.alloc_reg();
+                        fs.code_abx(OpCode::LOADK, kr, k);
+                        let inst_pc = fs.code_abc(OpCode::GETTABLE, base_reg, base_reg, kr);
+                        fs.free_reg(); // kr
+                        e = ExpDesc { kind: ExpKind::NonReloc, info: base_reg as i64, info2: inst_pc, t: NO_JUMP, f: NO_JUMP, str_val: None };
+                    }
                 } else {
                     let result_reg;
                     let inst_pc;

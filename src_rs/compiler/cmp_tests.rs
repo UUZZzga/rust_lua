@@ -931,6 +931,11 @@ assert(a == 2)
     }
 
     #[test]
+    fn test_api_lua() {
+        assert_inst_match_file("api.lua");
+    }
+  
+    #[test]
     fn test_attrib_lua() {
         assert_inst_match_file("attrib.lua");
     }
@@ -1083,6 +1088,36 @@ assert(a == 2)
         }
         // "longKeyName" will have a constant index > 255
         source.push_str("_ENV['longKeyName'] = true");
+        assert_inst_match(&source, None);
+    }
+
+    #[test]
+    fn test_const_index_overflow_gettabup_bracket_read() {
+        // When reading _ENV["key"] and key's constant index exceeds MAXINDEXRK,
+        // the compiler must keep the GETUPVAL instruction with the correct register
+        // (not register 0) and emit LOADK+GETTABLE, matching C compiler output.
+        let mut source = String::new();
+        for i in 0..256 {
+            if i % 5 == 0 { source.push('\n'); }
+            source.push_str(&format!("_ = \"s{:03}\"; ", i));
+        }
+        // "readKey" will have a constant index > 255
+        source.push_str("return _ENV['readKey']");
+        assert_inst_match(&source, None);
+    }
+
+    #[test]
+    fn test_const_index_overflow_gettabup_dot_read() {
+        // When reading _ENV.key and key's constant index exceeds MAXINDEXRK,
+        // the compiler must keep the GETUPVAL instruction with the correct register
+        // and emit LOADK+GETTABLE, matching C compiler output.
+        let mut source = String::new();
+        for i in 0..256 {
+            if i % 5 == 0 { source.push('\n'); }
+            source.push_str(&format!("_ = \"s{:03}\"; ", i));
+        }
+        // "readField" will have a constant index > 255
+        source.push_str("return _ENV.readField");
         assert_inst_match(&source, None);
     }
 
