@@ -1057,6 +1057,35 @@ assert(a == 2)
         assert_inst_match_file("pm.lua");
     }
 
+    #[test]
+    fn test_sort_lua() {
+        assert_inst_match_file("sort.lua");
+    }
+
+    #[test]
+    fn test_strings_lua() {
+        assert_inst_match_file("strings.lua");
+    }
+
+    // ===== Int 取负溢出（wrapping_neg）测试 =====
+    // -0x8000000000000000 即 -i64::MIN 会溢出，应使用 wrapping_neg 折叠为常量
+    // 而非 panic（debug 模式）或生成 UNM 指令
+
+    #[test]
+    fn test_negate_mininteger_hex() {
+        // -0x8000000000000000 应折叠为常量 LOADK，而非 LOADK + UNM
+        // 0x8000000000000000 被词法分析器解析为 i64::MIN，取负应使用 wrapping_neg
+        let source = "local min = -0x8000000000000000; return min";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn test_negate_mininteger_hex_in_expr() {
+        // 在表达式中使用 -0x8000000000000000
+        let source = "local max, min = 0x7fffffffffffffff, -0x8000000000000000; return max";
+        assert_inst_match(source, None);
+    }
+
     // ===== ADDK 交换律优化测试 =====
     // Float 常量在加法左操作数时，应交换操作数使用 ADDK+MMBINK 而非 LOADK+ADD+MMBIN
 
@@ -1368,7 +1397,8 @@ assert(a == 2)
         let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("tests_lua/");
         path.push(name);
-        std::fs::read_to_string(path.as_path()).unwrap()
+        let bytes = std::fs::read(path.as_path()).expect(&format!("Failed to read file: {:?}", path));
+        String::from_utf8_lossy(&bytes).into_owned()
     }
 
     fn assert_compile_ok(source: &str, name: Option<&str>) {

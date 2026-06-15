@@ -7107,7 +7107,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     } else {
                         match ei.exp.kind {
                             ExpKind::Int => {
-                                ExpDesc::new(ExpKind::Int, -(ei.exp.info))
+                                ExpDesc::new(ExpKind::Int, ei.exp.info.wrapping_neg())
                             }
                             ExpKind::Float => {
                                 let f = f64::from_bits(ei.exp.info as u64);
