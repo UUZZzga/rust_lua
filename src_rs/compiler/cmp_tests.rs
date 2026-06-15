@@ -13,46 +13,59 @@ mod compiler_compare_tests {
         bytecode_dump::parse_dump(dump_data).expect("dump parse failed")
     }
 
-    fn assert_inst_match(source: &str, name: Option<&str>) {
-        let rust_proto = compile_rust(source, name);
-        let c_func = unsafe { compile_c(source) };
-
+    fn compare_proto_recursive(
+        rust_proto: &crate::objects::Proto,
+        c_func: &bytecode_dump::DumpedFunction,
+        source: &str,
+        path: &str,
+    ) {
         let diffs = bytecode_dump::compare_instructions(&rust_proto.code, &c_func.code);
         if !diffs.is_empty() {
             let rust_dump = bytecode_dump::dump_instructions(&rust_proto.code);
             let c_dump = bytecode_dump::dump_c_instructions(&c_func.code, &c_func.constants);
             panic!(
                 "Instruction mismatch for source: {}\n\
+                 Function: {}\n\
                  Differences:\n  {}\n\n\
                  Rust instructions:\n{}\n\n\
                  C++ instructions:\n{}",
                 source,
+                path,
                 diffs.join("\n  "),
                 rust_dump,
                 c_dump
             );
         }
+        // 递归比较子函数（闭包对应的函数）
+        let rust_protos = &rust_proto.protos;
+        let c_protos = &c_func.protos;
+        if rust_protos.len() != c_protos.len() {
+            panic!(
+                "Sub-function count mismatch for source: {}\n\
+                 Function: {}\n\
+                 Rust has {} sub-functions, C has {}",
+                source,
+                path,
+                rust_protos.len(),
+                c_protos.len()
+            );
+        }
+        for (i, (rp, cp)) in rust_protos.iter().zip(c_protos.iter()).enumerate() {
+            let sub_path = format!("{}/proto[{}]", path, i);
+            compare_proto_recursive(rp, cp, source, &sub_path);
+        }
+    }
+
+    fn assert_inst_match(source: &str, name: Option<&str>) {
+        let rust_proto = compile_rust(source, name);
+        let c_func = unsafe { compile_c(source) };
+        compare_proto_recursive(&rust_proto, &c_func, source, "main");
     }
 
     fn assert_inst_match_allow_constants(source: &str) {
         let rust_proto = compile_rust(source, None);
         let c_func = unsafe { compile_c(source) };
-
-        let diffs = bytecode_dump::compare_instructions(&rust_proto.code, &c_func.code);
-        if !diffs.is_empty() {
-            let rust_dump = bytecode_dump::dump_instructions(&rust_proto.code);
-            let c_dump = bytecode_dump::dump_c_instructions(&c_func.code, &c_func.constants);
-            panic!(
-                "Instruction mismatch for source: {}\n\
-                 Differences:\n  {}\n\n\
-                 Rust instructions:\n{}\n\n\
-                 C++ instructions:\n{}",
-                source,
-                diffs.join("\n  "),
-                rust_dump,
-                c_dump
-            );
-        }
+        compare_proto_recursive(&rust_proto, &c_func, source, "main");
     }
 
     // ===== 字面量 return 测试 (C++ Lua 不支持裸表达式语句) =====
