@@ -61,6 +61,7 @@ pub struct LexState {
     pub token_info: String,
     pub lookahead: Option<(Token, String)>,
     pub errors: Vec<String>,
+    pub nesting_level: u32,  // recursion depth counter (like C's nCcalls)
 }
 
 impl LexState {
@@ -78,6 +79,7 @@ impl LexState {
             token_info: String::new(),
             lookahead: None,
             errors: Vec::new(),
+            nesting_level: 0,
         }
     }
 

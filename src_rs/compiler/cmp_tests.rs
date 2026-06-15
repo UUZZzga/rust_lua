@@ -1005,6 +1005,43 @@ assert(a == 2)
         assert_inst_match_file("files.lua");
     }
 
+    #[test]
+    fn test_gc_lua() {
+        assert_inst_match_file("gc.lua");
+    }
+
+    #[test]
+    fn test_gengc_lua() {
+        assert_inst_match_file("gengc.lua");
+    }
+
+    #[test]
+    fn test_heavy_lua() {
+        // Heavy.lua requires more stack space due to deep recursion in the compiler
+        let child = std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                assert_inst_match_file("heavy.lua");
+            })
+            .expect("thread spawn failed");
+        child.join().expect("test thread panicked");
+    }
+ 
+    #[test]
+    fn test_literals_lua() {
+        assert_inst_match_file("literals.lua");
+    }
+ 
+    #[test]
+    fn test_locals_lua() {
+        assert_inst_match_file("locals.lua");
+    }
+ 
+    #[test]
+    fn test_math_lua() {
+        assert_inst_match_file("math.lua");
+    }
+
     // ===== ADDK 交换律优化测试 =====
     // Float 常量在加法左操作数时，应交换操作数使用 ADDK+MMBINK 而非 LOADK+ADD+MMBIN
 
@@ -2129,5 +2166,84 @@ local x = 0
 if -1 <= x then print("yes") end
 "#;
         assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn test_const_div_compare() {
+        // local inf = math.huge * 2 + 1
+        // local mz <const> = -1/inf
+        // local z <const> = 1/inf
+        // assert(mz == z)
+        assert_inst_match(
+            r#"
+local inf = math.huge * 2 + 1
+local mz <const> = -1/inf
+local z <const> = 1/inf
+assert(mz == z)
+"#,
+            Some("test_const_div_compare")
+        );
+    }
+
+    // ===== CTC 变量遮蔽测试 =====
+    // 当 <const> 变量被同名非 CTC 变量遮蔽时，find_local_ctc 不应找到旧的 CTC 变量
+    // 修复前：find_local_ctc 跳过非 CTC 的同名变量，找到被遮蔽的旧 CTC 变量，
+    // 导致 -1/inf 被错误识别为 -0.0，生成 EQI 而非 EQ
+
+    #[test]
+    fn test_ctc_shadowing() {
+        // mz 先声明为 CTC(-0.0)，再重新声明为非 CTC(-1/inf)
+        // z 先声明为 CTC(0.0)，再重新声明为非 CTC(1/inf)
+        // 比较时应使用运行时值，生成 EQ 而非 EQI
+        assert_inst_match(
+            r#"
+local inf = math.huge * 2 + 1
+local mz <const> = -0.0
+local z <const> = 0.0
+local mz <const> = -1/inf
+local z <const> = 1/inf
+assert(mz == z)
+"#,
+            Some("test_ctc_shadowing")
+        );
+    }
+
+    // ===== Int/Int DIV 常量折叠 0.0 检查测试 =====
+    // 0/(-1) 结果为 -0.0，不应被常量折叠（C 的 constfolding 拒绝 0.0 结果）
+    // 修复前：0/(-1) 被折叠为 Float(-0.0)，is_sc_number 将其识别为 SC number 0，
+    // 生成 EQI 而非 EQ
+
+    #[test]
+    fn test_int_div_zero_result() {
+        // 0/x 其中 x=-1，结果为 -0.0，不应折叠
+        assert_inst_match(
+            r#"
+local x = -1
+local mz = 0/x
+assert(mz == 0)
+"#,
+            Some("test_int_div_zero_result")
+        );
+    }
+
+    // ===== BAND flip 操作数顺序测试 =====
+    // 当 BAND 的左操作数是整型常量时，C 的 codebitwise 会交换操作数并设 flip=1
+    // 在非 K 路径中，C 的 codebinNoK 会交换回原始顺序再调用 codebinexpval
+    // 修复前：Rust 未交换回原始顺序，导致常量先获得寄存器，非常量后获得
+    // 例如 BNOT 结果 & large_int 应生成 BAND 21 22 21 而非 BAND 21 21 21
+
+    #[test]
+    fn test_band_flip_operand_order() {
+        // ~(4 << -1) & 8822622750169614806
+        // BNOT 结果在 R21，常量应在 R22（而非 R21 覆盖 BNOT 结果）
+        assert_inst_match(
+            r#"
+local x = 4 << -1
+x = ~x
+x = x & 8822622750169614806
+return x
+"#,
+            Some("test_band_flip_operand_order")
+        );
     }
 }
