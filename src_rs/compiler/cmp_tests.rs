@@ -1067,6 +1067,31 @@ assert(a == 2)
         assert_inst_match_file("strings.lua");
     }
 
+    #[test]
+    fn test_tpack_lua() {
+        assert_inst_match_file("tpack.lua");
+    }
+
+    #[test]
+    fn test_tracegc_lua() {
+        assert_inst_match_file("tracegc.lua");
+    }
+
+    #[test]
+    fn test_utf8_lua() {
+        assert_inst_match_file("utf8.lua");
+    }
+
+    #[test]
+    fn test_vararg_lua() {
+        assert_inst_match_file("vararg.lua");
+    }
+
+    #[test]
+    fn test_verybig_lua() {
+        assert_inst_match_file("verybig.lua");
+    }
+
     // ===== Int 取负溢出（wrapping_neg）测试 =====
     // -0x8000000000000000 即 -i64::MIN 会溢出，应使用 wrapping_neg 折叠为常量
     // 而非 panic（debug 模式）或生成 UNM 指令
