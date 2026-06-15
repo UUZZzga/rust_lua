@@ -8135,8 +8135,25 @@ fn parse_func_stat(fs: &mut FuncState) {
 
     if chain.len() == 1 {
         let name = &chain[0].1;
-        // Check for global declaration first (like C's searchvar/buildvar)
-        let global_kind = fs.find_global_decl(name);
+        // Like C's searchvar: search from back to front, local variables
+        // can shadow global declarations (e.g., `local f` shadows `global <const> *`).
+        let local_result = fs.find_local_ex(name);
+        let global_kind = if local_result.is_none() {
+            fs.find_global_decl(name)
+        } else {
+            None
+        };
+
+        if let Some((reg, _kind)) = local_result {
+            // Variable is a local (including locals that shadow global declarations):
+            // store closure directly into the variable's register with MOVE.
+            // No need to add name to constant pool (matches C's VLOCAL path).
+            let r = parse_body_ex(fs, false, None);
+            fs.code_abc(OpCode::MOVE, reg, r, 0);
+            fs.free_reg();
+            return;
+        }
+
         let k = fs.string_k(name);
         let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
             && (k as u32) <= crate::opcodes::MAXINDEXRK;
@@ -8160,7 +8177,7 @@ fn parse_func_stat(fs: &mut FuncState) {
                     fs.code_abx(OpCode::LOADK, kr, k);
                     pre_eval = Some((env_r, kr));
                 }
-            } else if fs.find_local(name).is_none() {
+            } else {
                 // Like C's funcstat: resolve through _ENV
                 if let Some(env_reg) = fs.find_local("_ENV") {
                     let env_r = fs.alloc_reg();
@@ -8199,8 +8216,6 @@ fn parse_func_stat(fs: &mut FuncState) {
                     unreachable!(); // handled by pre_eval
                 }
             }
-        } else if let Some(reg) = fs.find_local(name) {
-            fs.code_abc(OpCode::MOVE, reg, r, 0);
         } else {
             // Like C's funcstat: resolve through _ENV (which may be local or upvalue)
             if let Some(env_reg) = fs.find_local("_ENV") {

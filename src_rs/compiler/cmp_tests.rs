@@ -1042,6 +1042,21 @@ assert(a == 2)
         assert_inst_match_file("math.lua");
     }
 
+    #[test]
+    fn test_memerr_lua() {
+        assert_inst_match_file("memerr.lua");
+    }
+
+    #[test]
+    fn test_nextvar_lua() {
+        assert_inst_match_file("nextvar.lua");
+    }
+
+    #[test]
+    fn test_pm_lua() {
+        assert_inst_match_file("pm.lua");
+    }
+
     // ===== ADDK 交换律优化测试 =====
     // Float 常量在加法左操作数时，应交换操作数使用 ADDK+MMBINK 而非 LOADK+ADD+MMBIN
 
@@ -2094,6 +2109,41 @@ global<const> print
 do global a, b, c = 10 end
 "#;
         assert_inst_match_allow_constants(source);
+    }
+
+    // ===== local function 遮蔽 global <const> * 回归测试 =====
+    // Bug: parse_func_stat 中 find_global_decl 优先于 find_local，
+    // 当 global <const> * 生效时，`function f() end` 会将 "f" 加入常量池，
+    // 导致后续常量索引偏移，使 setmetatable 的索引从 255 变为 256，
+    // 超过 MAXINDEXRK，触发 GETTABUP 回退为 GETUPVAL+LOADK+GETTABLE。
+    // 修复：find_local_ex 优先查找，local 变量正确遮蔽 global 声明，
+    // 不再将函数名加入常量池。
+
+    #[test]
+    fn test_local_func_shadows_global_const_star() {
+        // `local function f` should shadow `global <const> *` for variable `f`,
+        // generating MOVE instead of SETTABUP, and not adding "f" to constant pool.
+        let source = r#"
+global <const> *
+local function f(s, p)
+  return s
+end
+function f(a, b)
+  return string.gsub(a, '.', b)
+end
+"#;
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn test_local_func_shadows_global_const_star_simple() {
+        // Minimal case: local function f shadows global <const> *
+        let source = r#"
+global <const> *
+local function f() end
+function f() return 1 end
+"#;
+        assert_inst_match(source, None);
     }
 
     // ===== 冒号调用+字符串参数测试 =====
