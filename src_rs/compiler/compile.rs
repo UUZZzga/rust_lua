@@ -1234,7 +1234,17 @@ impl FuncState {
                     r
                 }
             }
-            ExpKind::Relocable | ExpKind::Vararg => {
+            ExpKind::Vararg => {
+                // Like C's setoneret for VVARARG: SETARG_C(pc, 2), then VRELOC
+                // info2 stores the VARARG instruction's PC
+                let pc = e.info2;
+                self.set_c(pc, 2);
+                // Now treat as VRELOC: allocate register and set A
+                let r = self.alloc_reg();
+                self.set_a(pc, r);
+                r
+            }
+            ExpKind::Relocable => {
                 if e.info2 >= 0 {
                     // VRELOC mode: info holds the register that was freed after
                     // generating the instruction (like C's freeexps before VRELOC).
@@ -1353,7 +1363,14 @@ impl FuncState {
                 let k = self.get_str_k(e);
                 self.code_abx(OpCode::LOADK, reg, k);
             }
-            ExpKind::Relocable | ExpKind::Vararg => {
+            ExpKind::Vararg => {
+                // Like C's setoneret for VVARARG: SETARG_C(pc, 2), then VRELOC
+                let pc = e.info2;
+                self.set_c(pc, 2);
+                // VRELOC: set A field of the VARARG instruction
+                self.set_a(pc, reg);
+            }
+            ExpKind::Relocable => {
                 if e.info2 >= 0 {
                     // VRELOC: set A field of the pending instruction
                     self.set_a(e.info2, reg);
@@ -2418,12 +2435,21 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
         let needed = nvars as i32 - nexps as i32;
         if last_exp.kind == ExpKind::Vararg || last_exp.kind == ExpKind::Call {
             let extra = if needed + 1 > 0 { needed + 1 } else { 0 };
+            eprintln!("DEBUG adjust_assign: nvars={}, nexps={}, needed={}, extra={}, last_exp.kind={:?}", nvars, nexps, needed, extra, last_exp.kind);
             if last_exp.kind == ExpKind::Call {
                 let call_pc = last_exp.info2;
                 if call_pc >= 0 {
                     let c_val = extra + 1;
                     fs.set_c(call_pc, c_val);
                 }
+            } else {
+                // Vararg: like C's luaK_setreturns for VVARARG
+                // SETARG_C(*pc, nresults + 1); SETARG_A(*pc, fs->freereg); reserveregs(1)
+                let pc = last_exp.info2;
+                let c_val = extra + 1;
+                fs.set_c(pc, c_val);
+                let r = fs.alloc_reg();
+                fs.set_a(pc, r);
             }
         } else {
             if nexps > 0 {
@@ -3602,10 +3628,14 @@ fn parse_args(fs: &mut FuncState) -> (i32, bool) {
     let ei = parse_expr(fs);
     let mut last_is_call = ei.exp.kind == ExpKind::Call;
     let mut last_call_pc = if last_is_call { ei.exp.info2 } else { -1 };
-    let _r = if matches!(ei.exp.kind, ExpKind::Relocable) && ei.exp.info2 >= 0 && !ei.exp.has_jumps() {
-        // For Relocable expressions with a pending instruction (info2 >= 0),
-        // allocate a new register and patch the instruction's A field.
-        // This matches C's luaK_exp2nextreg behavior for VRELOC expressions.
+    let mut last_is_vararg = ei.exp.kind == ExpKind::Vararg;
+    let mut last_vararg_pc = if last_is_vararg { ei.exp.info2 } else { -1 };
+    // Like C's explist: only force to next reg if not the last expression.
+    // For Call/Vararg (hasmultret), don't discharge - caller handles multret.
+    let _r = if last_is_call || last_is_vararg {
+        // Don't discharge Call/Vararg here; they'll be handled after the loop
+        -1
+    } else if matches!(ei.exp.kind, ExpKind::Relocable) && ei.exp.info2 >= 0 && !ei.exp.has_jumps() {
         fs.exp_to_reg(&ei.exp)
     } else if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei.exp.has_jumps() {
         if ei.exp.info2 >= 0 {
@@ -3615,7 +3645,7 @@ fn parse_args(fs: &mut FuncState) -> (i32, bool) {
     } else {
         fs.exp_to_reg(&ei.exp)
     };
-    if matches!(ei.exp.kind, ExpKind::NonReloc) && (ei.exp.info as i32) < fs.nvarstack() && !ei.exp.has_jumps() {
+    if !last_is_call && !last_is_vararg && matches!(ei.exp.kind, ExpKind::NonReloc) && (ei.exp.info as i32) < fs.nvarstack() && !ei.exp.has_jumps() {
         let target = fs.alloc_reg();
         if ei.exp.info as i32 != target {
             fs.code_abc(OpCode::MOVE, target, ei.exp.info as i32, 0);
@@ -3624,10 +3654,25 @@ fn parse_args(fs: &mut FuncState) -> (i32, bool) {
     let mut n = 1;
     while check(fs, &Token::Comma) {
         fs.ls_mut().next();
+        // Previous expression was not the last, force it to next reg
+        if last_is_call {
+            fs.set_c(last_call_pc, 2);  // setoneret: single return value
+            // Call is now NonReloc at call_reg
+            // Need to ensure it's in a register - Call's info is the register
+        } else if last_is_vararg {
+            // setoneret for Vararg: C=2, allocate register, set A
+            fs.set_c(last_vararg_pc, 2);
+            let r = fs.alloc_reg();
+            fs.set_a(last_vararg_pc, r);
+        }
         let ei2 = parse_expr(fs);
         last_is_call = ei2.exp.kind == ExpKind::Call;
         last_call_pc = if last_is_call { ei2.exp.info2 } else { -1 };
-        let _r2 = if matches!(ei2.exp.kind, ExpKind::Relocable) && ei2.exp.info2 >= 0 && !ei2.exp.has_jumps() {
+        last_is_vararg = ei2.exp.kind == ExpKind::Vararg;
+        last_vararg_pc = if last_is_vararg { ei2.exp.info2 } else { -1 };
+        let _r2 = if last_is_call || last_is_vararg {
+            -1
+        } else if matches!(ei2.exp.kind, ExpKind::Relocable) && ei2.exp.info2 >= 0 && !ei2.exp.has_jumps() {
             fs.exp_to_reg(&ei2.exp)
         } else if matches!(ei2.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei2.exp.has_jumps() {
             if ei2.exp.info2 >= 0 {
@@ -3637,7 +3682,7 @@ fn parse_args(fs: &mut FuncState) -> (i32, bool) {
         } else {
             fs.exp_to_reg(&ei2.exp)
         };
-        if matches!(ei2.exp.kind, ExpKind::NonReloc) && (ei2.exp.info as i32) < fs.nvarstack() && !ei2.exp.has_jumps() {
+        if !last_is_call && !last_is_vararg && matches!(ei2.exp.kind, ExpKind::NonReloc) && (ei2.exp.info as i32) < fs.nvarstack() && !ei2.exp.has_jumps() {
             let target = fs.alloc_reg();
             if ei2.exp.info as i32 != target {
                 fs.code_abc(OpCode::MOVE, target, ei2.exp.info as i32, 0);
@@ -3647,8 +3692,13 @@ fn parse_args(fs: &mut FuncState) -> (i32, bool) {
     }
     if last_is_call {
         fs.set_c(last_call_pc, 0);
+    } else if last_is_vararg {
+        // Like C's luaK_setmultret for VVARARG: SETARG_C(pc, 0), SETARG_A(pc, freereg), reserveregs(1)
+        fs.set_c(last_vararg_pc, 0);  // LUA_MULTRET + 1 = 0
+        let r = fs.alloc_reg();
+        fs.set_a(last_vararg_pc, r);
     }
-    (n, last_is_call)
+    (n, last_is_call || last_is_vararg)
 }
 
 #[derive(Debug, Clone)]
@@ -7090,15 +7140,14 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
         }
         Token::DotDotDot => {
             fs.ls_mut().next();
-            // Check if function has a named vararg parameter (RDKVAVAR)
-            let vararg_local = fs.locals.iter().rev().find(|lv| lv.active && lv.kind == RDKVAVAR);
-            if let Some(vl) = vararg_local {
-                ExpDesc::new(ExpKind::VVARGVAR, vl.reg as i64)
-            } else {
-                let r = fs.alloc_reg();
-                fs.code_abc(OpCode::VARARG, r, 0, 0);
-                ExpDesc::new(ExpKind::Vararg, r as i64)
-            }
+            // Like C: '...' always creates VVARARG, regardless of named vararg params.
+            // Named vararg params (RDKVAVAR) are accessed by their name, not by '...'.
+            // init_exp(v, VVARARG, luaK_codeABC(fs, OP_VARARG, 0, fs->f->numparams, 1));
+            // A=0 (placeholder, set later by setoneret/setreturns), B=numparams, C=1 (multret)
+            let numparams = fs.proto.num_params as i32;
+            let pc = fs.code_abc(OpCode::VARARG, 0, numparams, 1);
+            // info stores PC (like C's u.info), info2 also stores PC for set_c
+            ExpDesc { kind: ExpKind::Vararg, info: pc as i64, info2: pc, t: NO_JUMP, f: NO_JUMP, str_val: None }
         }
         Token::LBrace => {
             let (r, _n) = parse_constructor(fs);
@@ -8697,10 +8746,22 @@ fn parse_local(fs: &mut FuncState) {
             let saved_freereg = fs.freereg;
             let mut last_exp: Option<ExpDesc> = None;
             let mut n_vals = 0;
+            let mut last_is_vararg = false;
+            let mut last_vararg_pc: i32 = -1;
 
             loop {
                 let ei = parse_expr(fs);
                 let target = saved_freereg + n_vals as i32;
+                // Check if this is the last expression (no comma follows)
+                let is_last = !check(fs, &Token::Comma);
+                if is_last && matches!(ei.exp.kind, ExpKind::Vararg) {
+                    // Don't discharge Vararg now; handle after loop like C's adjust_assign
+                    last_is_vararg = true;
+                    last_vararg_pc = ei.exp.info2;
+                    last_exp = Some(ei.exp.clone());
+                    n_vals += 1;
+                    break;
+                }
                 match ei.exp.kind {
                     ExpKind::NonReloc => {
                         let r = ei.exp.info as i32;
@@ -8870,6 +8931,15 @@ fn parse_return(fs: &mut FuncState) {
             // Convert CALL to TAILCALL (like C's SET_OPCODE)
             SET_OPCODE(&mut fs.proto.code[call_pc], OpCode::TAILCALL);
         }
+        // Generate RETURN with LUA_MULTRET (nret = -1, so B = nret+1 = 0)
+        fs.return_stat_gen(first, -1);
+    } else if matches!(ei.exp.kind, ExpKind::Vararg) {
+        // Like C's hasmultret(VVARARG): luaK_setmultret sets C=0 (LUA_MULTRET+1),
+        // SETARG_A(pc, fs->freereg), reserveregs(1)
+        let pc = ei.exp.info2;
+        fs.set_c(pc, 0);  // LUA_MULTRET + 1 = 0
+        let r = fs.alloc_reg();
+        fs.set_a(pc, r);
         // Generate RETURN with LUA_MULTRET (nret = -1, so B = nret+1 = 0)
         fs.return_stat_gen(first, -1);
     } else {
@@ -9051,6 +9121,11 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
             need_array += tostore;
             fs.set_freereg(table_r + 1);
         } else if last.kind == ExpKind::Vararg {
+            // Like C's luaK_setmultret for VVARARG: SETARG_C(pc, 0), SETARG_A(pc, freereg), reserveregs(1)
+            let pc = last.info2;
+            fs.set_c(pc, 0);  // LUA_MULTRET + 1 = 0
+            let r = fs.alloc_reg();
+            fs.set_a(pc, r);
             fs.code_abc(OpCode::SETLIST, table_r, 0, need_array);
             need_array += tostore;
             fs.set_freereg(table_r + 1);
