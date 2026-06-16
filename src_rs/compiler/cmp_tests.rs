@@ -2462,4 +2462,54 @@ local function trymt(x, y, name)
 end
 "#, None);
     }
+
+    /// Regression test: upvalue indexed by another upvalue must emit
+    /// GETUPVAL for the key BEFORE GETUPVAL for the table, matching C's
+    /// order (yindex's luaK_exp2val emits key code first, then luaK_indexed
+    /// emits table GETUPVAL).
+    /// Before the fix, Rust emitted table GETUPVAL first, then key GETUPVAL,
+    /// causing instruction order mismatch.
+    /// Pattern from closure.lua: `local dummy = function () return a[A] end`
+    /// where both `a` and `A` are upvalues.
+    #[test]
+    fn test_upvalue_indexed_by_upvalue() {
+        // Minimal case: both table and key are upvalues.
+        // C order: GETUPVAL key (relocatable) → GETUPVAL table (relocatable)
+        //          → GETTABLE (relocatable)
+        // Before fix: GETUPVAL table → GETUPVAL key → GETTABLE (wrong order)
+        assert_inst_match(r#"
+local A = 1
+local a = {}
+local function f()
+  return a[A]
+end
+"#, None);
+    }
+
+    /// Variant: upvalue indexed by upvalue with the key declared first.
+    #[test]
+    fn test_upvalue_indexed_by_upvalue_key_first() {
+        // Key upvalue declared before table upvalue
+        assert_inst_match(r#"
+local a = {}
+local A = 1
+local function f()
+  return a[A]
+end
+"#, None);
+    }
+
+    /// Variant: upvalue indexed by upvalue used in a more complex expression.
+    #[test]
+    fn test_upvalue_indexed_by_upvalue_in_expr() {
+        // From closure.lua line 265: local dummy = function () return a[A] end
+        assert_inst_match(r#"
+local A, B = 0, {}
+local function f(x)
+  local a = {}
+  local dummy = function () return a[A] end
+  return dummy()
+end
+"#, None);
+    }
 }

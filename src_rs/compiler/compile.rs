@@ -7541,7 +7541,24 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     // Simple expression (VTRUE, etc.) or constant: luaK_exp2val doesn't emit code,
                     // so luaK_indexed emits GETUPVAL first, then luaK_exp2anyreg for key.
                     // So: GETUPVAL → key load code → GETTABLE/GETI
-                    // Emit GETUPVAL first (like C's luaK_indexed for VUPVAL with non-isKstr key)
+                    // Exception: VUPVAL key. C's luaK_exp2val calls dischargevars which
+                    // emits a relocatable GETUPVAL (A=0) for the key BEFORE luaK_indexed
+                    // emits GETUPVAL for the table. So the instruction order is:
+                    //   key GETUPVAL (relocatable) → table GETUPVAL (relocatable)
+                    // then register allocation sets A fields: table→reg0, key→reg1.
+                    // Handle VUPVAL key specially to match this order.
+                    let key_upval_idx = if ei.exp.kind == ExpKind::Upval {
+                        Some(ei.exp.info as i32)
+                    } else {
+                        None
+                    };
+                    let key_getupval_pc = if let Some(idx) = key_upval_idx {
+                        // Emit key GETUPVAL as relocatable (A=0), like C's dischargevars for VUPVAL
+                        Some(fs.code_abc(OpCode::GETUPVAL, 0, idx, 0))
+                    } else {
+                        None
+                    };
+                    // Emit table GETUPVAL (like C's luaK_indexed for VUPVAL with non-isKstr key)
                     let r = fs.alloc_reg();
                     fs.code_abc(OpCode::GETUPVAL, r, table_upval_idx, 0);
                     base_reg = r;
@@ -7571,6 +7588,27 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                             (base_reg, kr)
                         } else {
                             (kr, base_reg)
+                        };
+                        if high_reg >= fs.nvarstack() && high_reg == fs.freereg - 1 {
+                            fs.free_reg();
+                        }
+                        if low_reg >= fs.nvarstack() && low_reg == fs.freereg - 1 {
+                            fs.free_reg();
+                        }
+                        e = ExpDesc::new_reloc_with_pc(0, inst_pc);
+                        continue;
+                    } else if let Some(key_pc) = key_getupval_pc {
+                        // VUPVAL key: key GETUPVAL was already emitted (relocatable).
+                        // Allocate key register and set A field, like C's luaK_exp2anyreg
+                        // for VRELOC: alloc_reg + set_a.
+                        let key_reg = fs.alloc_reg();
+                        fs.set_a(key_pc, key_reg);
+                        let inst_pc = fs.code_abc(OpCode::GETTABLE, 0, base_reg, key_reg);
+                        // Free both table and key registers (high first)
+                        let (high_reg, low_reg) = if base_reg > key_reg {
+                            (base_reg, key_reg)
+                        } else {
+                            (key_reg, base_reg)
                         };
                         if high_reg >= fs.nvarstack() && high_reg == fs.freereg - 1 {
                             fs.free_reg();
