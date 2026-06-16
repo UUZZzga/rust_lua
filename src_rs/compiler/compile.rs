@@ -2964,6 +2964,14 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 // - Comparison key: key load code → GETUPVAL (luaK_exp2val emits first)
                 // - Simple key (true, nil, etc.): GETUPVAL → key load code (luaK_exp2anyreg emits after)
                 // - Short string key: GETTABUP/SETTABUP (no GETUPVAL needed)
+                //
+                // Key insight: C's luaK_indexed for VUPVAL + non-Kstr key does:
+                //   1. luaK_exp2anyreg(t) - allocate register for table FIRST
+                //   2. luaK_exp2anyreg(k) - allocate register for key SECOND
+                // But yindex already generated key's instruction (VRELOC, A=0 placeholder).
+                // So instruction order is: key's instruction, GETUPVAL table.
+                // But register allocation order is: table first, key second.
+                // This means GETUPVAL table gets the lower register, key gets the higher.
                 let is_upvalue_table = first.is_upvalue && first.reg.is_none();
                 let saved_upval_idx = first.upval_idx.unwrap_or(0);
                 let (base_reg, gettabup_pc) = if let Some(r) = first.reg {
@@ -2988,14 +2996,31 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 let key_has_jumps = ei.exp.has_jumps();
                 // For upvalue tables with non-constant, non-simple keys that have jumps:
                 // emit key load code first (like C's luaK_exp2val), then GETUPVAL
+                // Note: Upval key is handled separately (upval_key_placeholder_pc),
+                // because C's luaK_exp2val discharges VUPVAL to VRELOC (GETUPVAL key)
+                // before luaK_indexed emits GETUPVAL table.
                 let getupval_emitted_before_key = is_upvalue_table && !key_has_jumps
                     && !matches!(ei.exp.kind, ExpKind::Str | ExpKind::Int)
-                    && !matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc);
+                    && !matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc)
+                    && ei.exp.kind != ExpKind::Upval;
                 if getupval_emitted_before_key {
                     // Simple expression (VTRUE, etc.): emit GETUPVAL first (like C's luaK_indexed)
                     let r = fs.alloc_reg();
                     fs.code_abc(OpCode::GETUPVAL, r, saved_upval_idx, 0);
                 }
+                // For upvalue table + Upval key (like a[i]): C generates GETUPVAL key first
+                // (VRELOC, A=0 placeholder in yindex's luaK_exp2val), then GETUPVAL table
+                // (in luaK_indexed's luaK_exp2anyreg), then patches key's A.
+                // We need to emit GETUPVAL key now (placeholder), emit GETUPVAL table, then patch.
+                let upval_key_placeholder_pc = if is_upvalue_table && !getupval_emitted_before_key
+                    && ei.exp.kind == ExpKind::Upval && !key_has_jumps
+                {
+                    // Emit GETUPVAL key with A=0 placeholder (will be patched later)
+                    let pc = fs.code_abc(OpCode::GETUPVAL, 0, ei.exp.info as i32, 0);
+                    Some(pc)
+                } else {
+                    None
+                };
                 let (kr, key_is_const, key_is_int) = if ei.exp.kind == ExpKind::Str {
                     let k = fs.get_str_k(&ei.exp);
                     if let TValue::Str(crate::strings::LuaString::Short(_)) = fs.proto.constants[k as usize] {
@@ -3018,10 +3043,19 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     (ei.exp.info as i32, true, true)
                 } else if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei.exp.has_jumps() && ei.exp.info2 < 0 {
                     (ei.exp.info as i32, false, false)
+                } else if is_upvalue_table && upval_key_placeholder_pc.is_none()
+                    && !getupval_emitted_before_key
+                    && matches!(ei.exp.kind, ExpKind::Upval | ExpKind::Relocable)
+                    && !key_has_jumps
+                {
+                    // For upvalue table + Upval/Relocable key: defer key register allocation
+                    // until after table's GETUPVAL is emitted (matching C's luaK_indexed order).
+                    // Return placeholder; will be resolved after table GETUPVAL.
+                    (-1, false, false)
                 } else {
                     (fs.exp_to_reg(&ei.exp), false, false)
                 };
-                let key_allocated = !key_is_const && fs.freereg > saved_freereg_before;
+                let key_allocated = !key_is_const && kr != -1 && fs.freereg > saved_freereg_before;
                 // For upvalue tables: emit GETUPVAL at the right time based on key type
                 let (base_reg, new_is_upvalue, allocated_reg) = if is_upvalue_table {
                     let can_use_settabup = key_is_const && !key_is_int
@@ -3040,12 +3074,29 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         (fs.freereg - 1 - if key_allocated { 1 } else { 0 }, false, true)
                     } else {
                         // Comparison or constant key: emit GETUPVAL after key load code
+                        // (matching C's luaK_indexed: luaK_exp2anyreg(t) allocates table reg FIRST)
                         let r = fs.alloc_reg();
                         fs.code_abc(OpCode::GETUPVAL, r, saved_upval_idx, 0);
                         (r, false, true)
                     }
                 } else {
                     (base_reg, first.is_upvalue, first.allocated_reg || first.reg.is_none())
+                };
+                // Now resolve deferred key register allocation (Upval/Relocable key for upvalue table)
+                let (kr, key_allocated) = if kr == -1 && is_upvalue_table {
+                    // Key register allocation was deferred: now allocate after table's GETUPVAL
+                    if let Some(pc) = upval_key_placeholder_pc {
+                        // Upval key: patch the placeholder GETUPVAL's A with new register
+                        let key_r = fs.alloc_reg();
+                        fs.set_a(pc, key_r);
+                        (key_r, true)
+                    } else {
+                        // Relocable key (e.g., i+j): patch the VRELOC instruction's A
+                        let key_r = fs.exp_to_reg(&ei.exp);
+                        (key_r, true)
+                    }
+                } else {
+                    (kr, key_allocated)
                 };
                 first = PrefixResult {
                     var_name: None, local_idx: None, key: None, reg: Some(base_reg),
@@ -4286,14 +4337,33 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     let ei = parse_expr(fs);
                     expect(fs, &Token::RBracket);
                     let key_has_jumps = ei.exp.has_jumps();
-                    // For simple expressions (no jumps, not constant): emit GETUPVAL first
+                    // For upvalue tables with non-constant, non-simple keys that have jumps:
+                    // emit key load code first (like C's luaK_exp2val), then GETUPVAL
+                    // Note: Upval key is handled separately (upval_key_placeholder_pc),
+                    // because C's luaK_exp2val discharges VUPVAL to VRELOC (GETUPVAL key)
+                    // before luaK_indexed emits GETUPVAL table.
                     let getupval_emitted_before_key = is_upvalue_table && !key_has_jumps
                         && !matches!(ei.exp.kind, ExpKind::Str | ExpKind::Int)
-                        && !matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc);
+                        && !matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc)
+                        && ei.exp.kind != ExpKind::Upval;
                     if getupval_emitted_before_key {
+                        // Simple expression (VTRUE, etc.): emit GETUPVAL first (like C's luaK_indexed)
                         let r = fs.alloc_reg();
                         fs.code_abc(OpCode::GETUPVAL, r, saved_upval_idx, 0);
                     }
+                    // For upvalue table + Upval key (like a[i]): C generates GETUPVAL key first
+                    // (VRELOC, A=0 placeholder in yindex's luaK_exp2val), then GETUPVAL table
+                    // (in luaK_indexed's luaK_exp2anyreg), then patches key's A.
+                    let upval_key_placeholder_pc = if is_upvalue_table && !getupval_emitted_before_key
+                        && ei.exp.kind == ExpKind::Upval && !key_has_jumps
+                    {
+                        let pc = fs.code_abc(OpCode::GETUPVAL, 0, ei.exp.info as i32, 0);
+                        eprintln!("DEBUG prefix_exp: upval_key_placeholder_pc set, pc={}, upval_idx={}, saved_upval_idx={}", pc, ei.exp.info, saved_upval_idx);
+                        Some(pc)
+                    } else {
+                        eprintln!("DEBUG prefix_exp: upval_key_placeholder_pc NOT set, is_upvalue_table={}, getupval_emitted_before_key={}, kind={:?}", is_upvalue_table, getupval_emitted_before_key, ei.exp.kind);
+                        None
+                    };
                     let (kr, key_is_const, key_is_int) = if ei.exp.kind == ExpKind::Str {
                         let k = fs.get_str_k(&ei.exp);
                         if let TValue::Str(crate::strings::LuaString::Short(_)) = fs.proto.constants[k as usize] {
@@ -4316,10 +4386,18 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         (ei.exp.info as i32, true, true)
                     } else if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei.exp.has_jumps() && ei.exp.info2 < 0 {
                         (ei.exp.info as i32, false, false)
+                    } else if is_upvalue_table && upval_key_placeholder_pc.is_none()
+                        && !getupval_emitted_before_key
+                        && matches!(ei.exp.kind, ExpKind::Upval | ExpKind::Relocable)
+                        && !key_has_jumps
+                    {
+                        // For upvalue table + Upval/Relocable key: defer key register allocation
+                        // until after table's GETUPVAL is emitted (matching C's luaK_indexed order).
+                        (-1, false, false)
                     } else {
                         (fs.exp_to_reg(&ei.exp), false, false)
                     };
-                    let key_allocated = !key_is_const && fs.freereg > saved_freereg_before;
+                    let key_allocated = !key_is_const && kr != -1 && fs.freereg > saved_freereg_before;
                     let (base_reg, new_is_upvalue, allocated_reg) = if is_upvalue_table {
                         let can_use_settabup = key_is_const && !key_is_int
                             && (kr as u32) <= crate::opcodes::MAXINDEXRK;
@@ -4335,10 +4413,25 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         } else {
                             let r = fs.alloc_reg();
                             fs.code_abc(OpCode::GETUPVAL, r, saved_upval_idx, 0);
+                            eprintln!("DEBUG prefix_exp: table GETUPVAL emitted, pc={}, r={}, saved_upval_idx={}, freereg={}", fs.pc - 1, r, saved_upval_idx, fs.freereg);
                             (r, false, true)
                         }
                     } else {
                         (base_reg, result.is_upvalue, result.allocated_reg || result.reg.is_none())
+                    };
+                    // Resolve deferred key register allocation (Upval/Relocable key for upvalue table)
+                    let (kr, key_allocated) = if kr == -1 && is_upvalue_table {
+                        if let Some(pc) = upval_key_placeholder_pc {
+                            let key_r = fs.alloc_reg();
+                            fs.set_a(pc, key_r);
+                            eprintln!("DEBUG prefix_exp: deferred key resolved, pc={}, key_r={}, freereg={}", pc, key_r, fs.freereg);
+                            (key_r, true)
+                        } else {
+                            let key_r = fs.exp_to_reg(&ei.exp);
+                            (key_r, true)
+                        }
+                    } else {
+                        (kr, key_allocated)
                     };
                     result = PrefixResult {
                         var_name: None, local_idx: None, key: None, reg: Some(base_reg),
