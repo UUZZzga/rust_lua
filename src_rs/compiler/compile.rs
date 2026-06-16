@@ -279,6 +279,9 @@ struct ParentVar {
     local_idx: usize,     // index in direct parent's locals array
     // is_local=false:
     upval_idx: usize,     // index in direct parent's upvalues array (0 = not yet created)
+    // is_local=false && is_parent_upval=true: variable is an upvalue in the direct parent
+    // is_local=false && is_parent_upval=false: variable is inherited from a grandparent
+    is_parent_upval: bool,
 }
 
 #[derive(Clone)]
@@ -960,12 +963,87 @@ impl FuncState {
                 }
             }
         }
-        // Search from the end (like C's searchvar which searches from nactvar-1 down)
-        // to find the innermost variable with the given name.
-        // C's searchvar does NOT stop on non-matching non-global variables;
-        // it continues searching until it finds a match or exhausts all variables.
-        for (j, pvar) in self.parent_locals.iter().enumerate().rev() {
-            if pvar.name == name {
+        // Like C's singlevaraux(fs, n, var, base=1):
+        //   searchvar(fs, n)  -> not found (we're looking for an upvalue)
+        //   searchupvalue(fs, n) -> not found (checked above)
+        //   singlevaraux(fs->prev, n, var, 0):
+        //     searchvar(prev, n) -> if found, markupval + VLOCAL
+        //     searchupvalue(prev, n) -> if found, VUPVAL
+        //     singlevaraux(prev->prev, n, var, 0) -> recurse
+        //
+        // parent_locals layout (in order):
+        //   [0..A)   is_local=true                    -> parent's active locals (searchvar target)
+        //   [A..B)   is_local=false, is_parent_upval=true  -> parent's upvalues (searchupvalue target)
+        //   [B..)    is_local=false, is_parent_upval=false -> grandparent vars (recurse target)
+        //
+        // Step 1: search parent's locals (is_local=true), from end to start
+        //         (like C's searchvar which searches from nactvar-1 down)
+        //         This handles global declarations, CTC constants, and regular locals.
+        //         Like C's searchvar, we must handle the interaction between
+        //         collective (global *) and named global declarations.
+        //         Note: _ENV is special - in C it's a local, but in Rust it's an upvalue.
+        //         So _ENV should not be covered by global * declarations; it should
+        //         be found in Step 2 (parent's upvalues) instead.
+        {
+            let mut global_star_active = false;
+            for pvar in self.parent_locals.iter().rev() {
+                if !pvar.is_local { continue; }
+                if pvar.is_global {
+                    if pvar.name == "(global *)" {
+                        if !global_star_active {
+                            global_star_active = true;
+                        }
+                    } else if pvar.name == name {
+                        // named global declaration matches: variable is global, not an upvalue
+                        return None;
+                    } else {
+                        // named global declaration doesn't match:
+                        // invalidate any previous global * declaration
+                        global_star_active = false;
+                    }
+                } else if pvar.name == name {
+                    // Found a matching non-global variable in parent's locals
+                    if pvar.is_ctc {
+                        // Compile-time constant: like C's singlevaraux returning VCONST,
+                        // don't create an upvalue, return the constant value directly.
+                        let exp = if let Some(ref s) = pvar.ctc_str {
+                            ExpDesc::new_str(s.clone())
+                        } else {
+                            ExpDesc::new(pvar.ctc_kind.clone().unwrap(), pvar.ctc_info.unwrap())
+                        };
+                        return Some(UpvalueOrCtc::CtcConst(exp));
+                    }
+                    let pvar = pvar.clone();
+                    return Some(self.create_upvalue_from_parent_local(&pvar));
+                }
+            }
+            // global * covers this name: variable is global, not an upvalue.
+            // But _ENV is special: it's an upvalue in Rust, not covered by global *.
+            if global_star_active && name != "_ENV" {
+                return None;
+            }
+        }
+        // Step 2: search parent's upvalues (is_local=false, is_parent_upval=true)
+        //         (like C's searchupvalue)
+        for pvar in self.parent_locals.iter().rev() {
+            if !pvar.is_local && pvar.is_parent_upval && pvar.name == name {
+                // Found in parent's upvalues: create instack=false upvalue
+                let idx = self.proto.upvalues.len() as i32;
+                let ls = crate::strings::new_lstr(&crate::strings::StringTable::new(), name);
+                self.proto.upvalues.push(crate::objects::UpvalDesc {
+                    name: Some(ls),
+                    in_stack: false,
+                    idx: pvar.upval_idx as u8,
+                    parent_local_idx: 0,
+                });
+                self.proto.size_upvalues = self.proto.upvalues.len() as i32;
+                return Some(UpvalueOrCtc::Upvalue(idx));
+            }
+        }
+        // Step 3: search grandparent variables (is_local=false, is_parent_upval=false)
+        //         (like C's singlevaraux recursing to grandparent)
+        for pvar in self.parent_locals.iter().rev() {
+            if !pvar.is_local && !pvar.is_parent_upval && pvar.name == name {
                 if pvar.is_global {
                     // Found a matching global declaration: variable is global, not an upvalue
                     return None;
@@ -980,39 +1058,41 @@ impl FuncState {
                     };
                     return Some(UpvalueOrCtc::CtcConst(exp));
                 }
-                let idx = self.proto.upvalues.len() as i32;
-                let t = crate::strings::StringTable::new();
-                let ls = crate::strings::new_lstr(&t, name);
-                if pvar.is_local {
-                    // Variable is a local in the direct parent function
-                    self.proto.upvalues.push(crate::objects::UpvalDesc {
-                        name: Some(ls),
-                        in_stack: true,
-                        idx: pvar.reg as u8,
-                        parent_local_idx: pvar.local_idx,
-                    });
-                } else {
-                    // Variable is inherited from a grandparent function.
-                    let parent_upval_idx = self.find_or_create_parent_upvalue(name);
-                    if parent_upval_idx == usize::MAX {
-                        // Variable is a global declaration in an ancestor: not an upvalue
-                        return None;
-                    }
-                    self.proto.upvalues.push(crate::objects::UpvalDesc {
-                        name: Some(ls),
-                        in_stack: false,
-                        idx: parent_upval_idx as u8,
-                        parent_local_idx: 0,
-                    });
+                // Variable is inherited from a grandparent function.
+                // Need to create an upvalue in the parent first, then reference it.
+                let parent_upval_idx = self.find_or_create_parent_upvalue(name);
+                if parent_upval_idx == usize::MAX {
+                    // Variable is a global declaration in an ancestor: not an upvalue
+                    return None;
                 }
+                let idx = self.proto.upvalues.len() as i32;
+                let ls = crate::strings::new_lstr(&crate::strings::StringTable::new(), name);
+                self.proto.upvalues.push(crate::objects::UpvalDesc {
+                    name: Some(ls),
+                    in_stack: false,
+                    idx: parent_upval_idx as u8,
+                    parent_local_idx: 0,
+                });
                 self.proto.size_upvalues = self.proto.upvalues.len() as i32;
-                let _ = j;
                 return Some(UpvalueOrCtc::Upvalue(idx));
             }
-            // Non-matching variable (global or not): continue searching
-            // C's searchvar never stops on non-matching non-global variables
         }
         None
+    }
+
+    /// Helper: create an upvalue from a parent local variable (is_local=true).
+    /// Like C's newupvalue with VLOCAL: instack=true, idx=ridx.
+    fn create_upvalue_from_parent_local(&mut self, pvar: &ParentVar) -> UpvalueOrCtc {
+        let idx = self.proto.upvalues.len() as i32;
+        let ls = crate::strings::new_lstr(&crate::strings::StringTable::new(), &pvar.name);
+        self.proto.upvalues.push(crate::objects::UpvalDesc {
+            name: Some(ls),
+            in_stack: true,
+            idx: pvar.reg as u8,
+            parent_local_idx: pvar.local_idx,
+        });
+        self.proto.size_upvalues = self.proto.upvalues.len() as i32;
+        UpvalueOrCtc::Upvalue(idx)
     }
 
     /// Find or create an upvalue in the direct parent function for a variable
@@ -3792,7 +3872,63 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                 let is_readonly = global_kind == GDKCONST;
                 let is_env = name == "_ENV";
                 let k = if is_env { 0 } else { fs.string_k(&name) };
-                if let Some(env_reg) = fs.find_local("_ENV") {
+                // Like C's buildglobal: singlevaraux(fs, "_ENV", ...) finds _ENV.
+                // _ENV can be a local (VLOCAL), a local const (VCONST), or an upvalue (VUPVAL).
+                // For VCONST, luaK_exp2anyregup discharges it to a register first.
+                if let Some(env_ctc) = fs.find_local_ctc("_ENV") {
+                    // _ENV is a compile-time constant (local _ENV <const> = ...).
+                    // Like C's luaK_exp2anyregup + luaK_indexed:
+                    // discharge the constant to a register, then use GETFIELD/SETFIELD.
+                    let env_r = fs.alloc_reg();
+                    match env_ctc.kind {
+                        ExpKind::Int => {
+                            let val = env_ctc.info;
+                            if fits_sbx(val) {
+                                fs.code_asbx(OpCode::LOADI, env_r, val as i32);
+                            } else {
+                                let kk = fs.int_k(val);
+                                fs.code_abx(OpCode::LOADK, env_r, kk);
+                            }
+                        }
+                        ExpKind::Float => {
+                            let f = f64::from_bits(env_ctc.info as u64);
+                            let fi = f as i64;
+                            if (fi as f64) == f && fits_sbx(fi) {
+                                fs.code_asbx(OpCode::LOADF, env_r, fi as i32);
+                            } else {
+                                let kk = fs.float_k(f);
+                                fs.code_abx(OpCode::LOADK, env_r, kk);
+                            }
+                        }
+                        ExpKind::Str => {
+                            let kk = fs.get_str_k(&env_ctc);
+                            fs.code_abx(OpCode::LOADK, env_r, kk);
+                        }
+                        ExpKind::Boolean => {
+                            if env_ctc.info != 0 {
+                                fs.code_abc(OpCode::LOADTRUE, env_r, 0, 0);
+                            } else {
+                                fs.code_abc(OpCode::LOADFALSE, env_r, 0, 0);
+                            }
+                        }
+                        ExpKind::Nil => {
+                            fs.code_nil(env_r, 1);
+                        }
+                        _ => {
+                            let kk = fs.discharge_str(&mut env_ctc.clone());
+                            fs.code_abx(OpCode::LOADK, env_r, kk);
+                        }
+                    }
+                    let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
+                        && (k as u32) <= crate::opcodes::MAXINDEXRK;
+                    if is_short_str {
+                        PrefixResult { var_name: Some(name.clone()), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(k), table_key_is_const: true, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
+                    } else {
+                        let kr = fs.alloc_reg();
+                        fs.code_abx(OpCode::LOADK, kr, k);
+                        PrefixResult { var_name: Some(name.clone()), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
+                    }
+                } else if let Some(env_reg) = fs.find_local("_ENV") {
                     let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
                         && (k as u32) <= crate::opcodes::MAXINDEXRK;
                     if is_short_str {
@@ -3862,9 +3998,63 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
             } else {
                 let is_env = name == "_ENV";
                 let k = if is_env { 0 } else { fs.string_k(&name) };
-                // Like C buildglobal: check if _ENV is a local variable
-                // If so, use GETFIELD (table_reg + table_key); otherwise use GETTABUP (key + is_upvalue)
-                if let Some(env_reg) = fs.find_local("_ENV") {
+                // Like C buildglobal: singlevaraux(fs, "_ENV", ...) finds _ENV.
+                // _ENV can be a local (VLOCAL), a local const (VCONST), or an upvalue (VUPVAL).
+                // For VCONST, luaK_exp2anyregup discharges it to a register first.
+                if let Some(env_ctc) = fs.find_local_ctc("_ENV") {
+                    // _ENV is a compile-time constant (local _ENV <const> = ...).
+                    // Like C's luaK_exp2anyregup + luaK_indexed:
+                    // discharge the constant to a register, then use GETFIELD/SETFIELD.
+                    let env_r = fs.alloc_reg();
+                    match env_ctc.kind {
+                        ExpKind::Int => {
+                            let val = env_ctc.info;
+                            if fits_sbx(val) {
+                                fs.code_asbx(OpCode::LOADI, env_r, val as i32);
+                            } else {
+                                let kk = fs.int_k(val);
+                                fs.code_abx(OpCode::LOADK, env_r, kk);
+                            }
+                        }
+                        ExpKind::Float => {
+                            let f = f64::from_bits(env_ctc.info as u64);
+                            let fi = f as i64;
+                            if (fi as f64) == f && fits_sbx(fi) {
+                                fs.code_asbx(OpCode::LOADF, env_r, fi as i32);
+                            } else {
+                                let kk = fs.float_k(f);
+                                fs.code_abx(OpCode::LOADK, env_r, kk);
+                            }
+                        }
+                        ExpKind::Str => {
+                            let kk = fs.get_str_k(&env_ctc);
+                            fs.code_abx(OpCode::LOADK, env_r, kk);
+                        }
+                        ExpKind::Boolean => {
+                            if env_ctc.info != 0 {
+                                fs.code_abc(OpCode::LOADTRUE, env_r, 0, 0);
+                            } else {
+                                fs.code_abc(OpCode::LOADFALSE, env_r, 0, 0);
+                            }
+                        }
+                        ExpKind::Nil => {
+                            fs.code_nil(env_r, 1);
+                        }
+                        _ => {
+                            let kk = fs.discharge_str(&mut env_ctc.clone());
+                            fs.code_abx(OpCode::LOADK, env_r, kk);
+                        }
+                    }
+                    let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
+                        && (k as u32) <= crate::opcodes::MAXINDEXRK;
+                    if is_short_str {
+                        PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(k), table_key_is_const: true, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
+                    } else {
+                        let kr = fs.alloc_reg();
+                        fs.code_abx(OpCode::LOADK, kr, k);
+                        PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
+                    }
+                } else if let Some(env_reg) = fs.find_local("_ENV") {
                     let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
                         && (k as u32) <= crate::opcodes::MAXINDEXRK;
                     if is_short_str {
@@ -7839,7 +8029,56 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
 /// ANTLR4: `'if' expr 'then' block ('elseif' expr 'then' block)* ('else' block)? 'end' ;`
 fn parse_if(fs: &mut FuncState) {
     let entry_freereg = fs.freereg;
-    fs.ls_mut().next();
+    // Like C's ifstat: test_then_block (IF) + {test_then_block (ELSEIF)} + [ELSE block] END
+    let mut escapelist = NO_JUMP;  // exit list for finished parts
+
+    // First test_then_block (IF cond THEN block)
+    fs.ls_mut().next();  // skip IF
+    let mut if_jmp = parse_if_cond(fs, entry_freereg);  // cond
+    expect(fs, &Token::Then);
+    fs.set_freereg(entry_freereg);
+    parse_block(fs);  // 'then' part
+    // Like C's test_then_block: if followed by 'else'/'elseif', add jump to escapelist
+    if check(fs, &Token::Else) || check(fs, &Token::Elseif) {
+        let j = fs.jump();
+        fs.concat_jump(&mut escapelist, j);
+    }
+    if if_jmp != NO_JUMP {
+        fs.patch_to_here(if_jmp);
+    }
+
+    // Subsequent test_then_block (ELSEIF cond THEN block)
+    while check(fs, &Token::Elseif) {
+        fs.ls_mut().next();  // skip ELSEIF
+        if_jmp = parse_if_cond(fs, entry_freereg);  // cond
+        expect(fs, &Token::Then);
+        fs.set_freereg(entry_freereg);
+        parse_block(fs);  // 'then' part
+        // Like C's test_then_block: if followed by 'else'/'elseif', add jump to escapelist
+        if check(fs, &Token::Else) || check(fs, &Token::Elseif) {
+            let j = fs.jump();
+            fs.concat_jump(&mut escapelist, j);
+        }
+        if if_jmp != NO_JUMP {
+            fs.patch_to_here(if_jmp);
+        }
+    }
+
+    if check(fs, &Token::Else) {
+        fs.ls_mut().next();
+        fs.set_freereg(entry_freereg);
+        parse_block(fs);  // 'else' part
+    }
+    expect(fs, &Token::End);
+    // Like C's ifstat: patch escape list to 'if' end
+    if escapelist != NO_JUMP {
+        fs.patch_to_here(escapelist);
+    }
+}
+
+/// Helper for parse_if: parse condition and return false-list (condtrue patched to here).
+/// Like C's cond() + the condition handling in test_then_block.
+fn parse_if_cond(fs: &mut FuncState, entry_freereg: i32) -> i32 {
     let mut ei = parse_expr(fs);
     // Like C's cond: 'falses' are all equal here
     if ei.exp.kind == ExpKind::Nil {
@@ -7900,96 +8139,8 @@ fn parse_if(fs: &mut FuncState) {
             }
         }
     }
-
-    expect(fs, &Token::Then);
-    fs.set_freereg(entry_freereg);
-    parse_block(fs);  // Like C's block(ls) in test_then_block
-    let mut exit_jumps = Vec::new();
-
-    while check(fs, &Token::Elseif) {
-        let j = fs.jump();
-        exit_jumps.push(j);
-        if if_jmp != NO_JUMP {
-            fs.patch_to_here(if_jmp);
-        }
-        fs.ls_mut().next();
-        let mut ei2 = parse_expr(fs);
-        // Like C's cond: 'falses' are all equal here
-        if ei2.exp.kind == ExpKind::Nil {
-            ei2.exp.kind = ExpKind::Boolean;
-            ei2.exp.info = 0;
-        }
-        let is_const_true2 = matches!(ei2.exp.kind, ExpKind::Boolean) && ei2.exp.info != 0;
-        if !is_const_true2 {
-            if ei2.exp.kind == ExpKind::VJMP {
-                let jmp_pc = ei2.exp.info as i32;
-                fs.negate_condition(jmp_pc);
-                let mut false_list = ei2.exp.f;
-                fs.concat_jump(&mut false_list, jmp_pc);
-                fs.patch_true_jumps(ei2.exp.t, fs.pc);
-                if_jmp = false_list;
-            } else {
-                // Like C's jumponcond: check for VRELOC+NOT first
-                let is_not_vreloc2 = ei2.exp.info2 >= 0
-                    && (ei2.exp.info2 as usize) < fs.proto.code.len()
-                    && get_opcode(fs.proto.code[ei2.exp.info2 as usize]) == OpCode::NOT
-                    && matches!(ei2.exp.kind, ExpKind::Relocable);
-
-                if is_not_vreloc2 {
-                    let not_inst = fs.proto.code[ei2.exp.info2 as usize];
-                    let b = getarg_b(not_inst);
-                    fs.pc -= 1;
-                    fs.proto.code.pop();
-                    fs.code_abc_k(OpCode::TEST, b, 0, 0, true);
-                    let jmp_pc2 = fs.jump();
-                    let mut false_list2 = ei2.exp.f;
-                    fs.concat_jump(&mut false_list2, jmp_pc2);
-                    fs.patch_true_jumps(ei2.exp.t, fs.pc);
-                    if_jmp = false_list2;
-                } else {
-                    let pre_freereg2 = fs.freereg;
-                    let r2 = fs.discharge_to_any_reg(&ei2.exp);
-                    if r2 >= fs.nvarstack() && r2 == fs.freereg - 1 {
-                        fs.free_reg();
-                    }
-                    fs.code_abc_k(OpCode::TESTSET, NO_REG as i32, r2, 0, false);
-                    let jmp_pc2 = fs.jump();
-                    let mut false_list2 = ei2.exp.f;
-                    fs.concat_jump(&mut false_list2, jmp_pc2);
-                    fs.patch_true_jumps(ei2.exp.t, fs.pc);
-                    if_jmp = false_list2;
-                    if fs.freereg > pre_freereg2 {
-                        fs.free_reg();
-                    }
-                }
-            }
-        } else {
-            if_jmp = NO_JUMP;
-        }
-        expect(fs, &Token::Then);
-        fs.set_freereg(entry_freereg);
-        parse_block(fs);  // Like C's block(ls) in test_then_block
-    }
-
-    if check(fs, &Token::Else) {
-        let j = fs.jump();
-        exit_jumps.push(j);
-        if if_jmp != NO_JUMP {
-            fs.patch_to_here(if_jmp);
-        }
-        fs.ls_mut().next();
-        fs.set_freereg(entry_freereg);
-        parse_block(fs);  // Like C's block(ls) in ifstat's else part
-    } else {
-        if if_jmp != NO_JUMP {
-            fs.patch_to_here(if_jmp);
-        }
-    }
-    expect(fs, &Token::End);
-
-    for j in exit_jumps {
-        fs.patch_to_here(j);
-    }
+    let _ = entry_freereg;
+    if_jmp
 }
 
 /// ANTLR4: `'while' expr 'do' block 'end' ;`
@@ -9336,6 +9487,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
                 reg: local.reg,
                 local_idx: i,
                 upval_idx: 0,
+                is_parent_upval: false,
             });
         }
     }
@@ -9361,6 +9513,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
                     reg: 0,
                     local_idx: 0,
                     upval_idx: i,
+                    is_parent_upval: true,
                 });
             }
         }
@@ -9382,6 +9535,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
             reg: 0,
             local_idx: 0,
             upval_idx: 0,
+            is_parent_upval: false,
         });
     }
 
