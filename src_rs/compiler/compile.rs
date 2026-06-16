@@ -2435,7 +2435,6 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
         let needed = nvars as i32 - nexps as i32;
         if last_exp.kind == ExpKind::Vararg || last_exp.kind == ExpKind::Call {
             let extra = if needed + 1 > 0 { needed + 1 } else { 0 };
-            eprintln!("DEBUG adjust_assign: nvars={}, nexps={}, needed={}, extra={}, last_exp.kind={:?}", nvars, nexps, needed, extra, last_exp.kind);
             if last_exp.kind == ExpKind::Call {
                 let call_pc = last_exp.info2;
                 if call_pc >= 0 {
@@ -4388,6 +4387,18 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         ec.info2 = -1;
                         ec.t = NO_JUMP;
                         ec.f = NO_JUMP;
+                    } else if matches!(ec.kind, ExpKind::Vararg) && !ec.has_jumps() {
+                        // Like C's dischargevars + setoneret for VVARARG:
+                        // SETARG_C(pc, 2), then VRELOC → discharge to register
+                        let pc = ec.info2;
+                        fs.set_c(pc, 2);
+                        let r = fs.alloc_reg();
+                        fs.set_a(pc, r);
+                        ec.kind = ExpKind::NonReloc;
+                        ec.info = r as i64;
+                        ec.info2 = -1;
+                        ec.t = NO_JUMP;
+                        ec.f = NO_JUMP;
                     } else {
                         let r = fs.exp_to_reg(&ec);
                         ec.kind = ExpKind::NonReloc;
@@ -4403,6 +4414,17 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         // 类似 C++ dischargevars + setoneret 对 VCALL 的处理:
                         // 直接转为 NonReloc，不生成 MOVE
                         ec.kind = ExpKind::NonReloc;
+                        ec.info2 = -1;
+                        ec.t = NO_JUMP;
+                        ec.f = NO_JUMP;
+                    } else if matches!(ec.kind, ExpKind::Vararg) && !ec.has_jumps() {
+                        // Like C's dischargevars + setoneret for VVARARG
+                        let pc = ec.info2;
+                        fs.set_c(pc, 2);
+                        let r = fs.alloc_reg();
+                        fs.set_a(pc, r);
+                        ec.kind = ExpKind::NonReloc;
+                        ec.info = r as i64;
                         ec.info2 = -1;
                         ec.t = NO_JUMP;
                         ec.f = NO_JUMP;
@@ -4639,6 +4661,13 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                                 let r2_alloc = !matches!(e2.exp.kind, ExpKind::NonReloc | ExpKind::Call | ExpKind::Vararg);
                                 let r2 = if r2_alloc {
                                     fs.exp_to_reg(&e2.exp)
+                                } else if matches!(e2.exp.kind, ExpKind::Vararg) && !e2.exp.has_jumps() {
+                                    // Discharge Vararg: setoneret (C=2) + alloc reg + set A
+                                    let pc = e2.exp.info2;
+                                    fs.set_c(pc, 2);
+                                    let reg = fs.alloc_reg();
+                                    fs.set_a(pc, reg);
+                                    reg
                                 } else if e2.exp.has_jumps() {
                                     let reg = e2.exp.info as i32;
                                     fs.resolve_jumps(&e2.exp, reg);
@@ -8838,6 +8867,15 @@ fn parse_local(fs: &mut FuncState) {
                         setarg(&mut fs.proto.code[call_pc as usize], needed, POS_C, SIZE_C);
                     }
                 }
+            } else if last_is_vararg {
+                // Like C's adjust_assign for VVARARG: luaK_setreturns
+                // SETARG_C(*pc, nresults + 1); SETARG_A(*pc, fs->freereg); reserveregs(1)
+                let needed = n_reg as i32 - n_vals as i32;
+                let extra = if needed + 1 > 0 { needed + 1 } else { 0 };
+                let c_val = extra + 1;
+                fs.set_c(last_vararg_pc, c_val);
+                let r = fs.alloc_reg();
+                fs.set_a(last_vararg_pc, r);
             }
 
             for i in 0..n_reg {
@@ -8872,7 +8910,7 @@ fn parse_local(fs: &mut FuncState) {
 
             fs.set_freereg(saved_freereg + n_reg as i32);
 
-            if !last_is_call && n_vals < n_reg {
+            if !last_is_call && !last_is_vararg && n_vals < n_reg {
                 let remaining = n_reg - n_vals;
                 fs.code_nil(saved_freereg + n_vals as i32, remaining as i32);
             }
@@ -8918,8 +8956,35 @@ fn parse_return(fs: &mut FuncState) {
         fs.ls_mut().next();
         // Multiple return values: force first expression to next reg (like C's luaK_exp2nextreg)
         fs.exp_to_next_reg(&ei.exp);
-        let nret = 1 + parse_expr_list(fs);
-        fs.return_stat_gen(first, nret);
+        // Parse remaining expressions like C's explist: don't discharge last if hasmultret
+        let mut last_ei = parse_expr(fs);
+        let mut nret = 2;
+        while check(fs, &Token::Comma) {
+            fs.ls_mut().next();
+            fs.exp_to_next_reg(&last_ei.exp);
+            last_ei = parse_expr(fs);
+            nret += 1;
+        }
+        // Like C's retstat: if hasmultret, setmultret; else exp2nextreg
+        if matches!(last_ei.exp.kind, ExpKind::Call) {
+            let call_pc = last_ei.exp.info2 as usize;
+            setarg(&mut fs.proto.code[call_pc], 0, POS_C, SIZE_C);
+            // Check for tail call
+            let has_tbc = fs.locals[first as usize..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
+            if !has_tbc && nret == 1 {
+                SET_OPCODE(&mut fs.proto.code[call_pc], OpCode::TAILCALL);
+            }
+            fs.return_stat_gen(first, -1);
+        } else if matches!(last_ei.exp.kind, ExpKind::Vararg) {
+            let pc = last_ei.exp.info2;
+            fs.set_c(pc, 0);
+            let r = fs.alloc_reg();
+            fs.set_a(pc, r);
+            fs.return_stat_gen(first, -1);
+        } else {
+            fs.exp_to_next_reg(&last_ei.exp);
+            fs.return_stat_gen(first, nret);
+        }
     } else if matches!(ei.exp.kind, ExpKind::Call) {
         // Like C's hasmultret(VCALL): set multret, then check for tail call
         let call_pc = ei.exp.info2 as usize;
