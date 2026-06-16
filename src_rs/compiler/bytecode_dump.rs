@@ -37,6 +37,7 @@ pub struct DumpedFunction {
     pub maxstacksize: u8,
     pub code: Vec<DumpInstruction>,
     pub constants: Vec<DumpConstant>,
+    pub upvalues: Vec<(bool, u8, u8)>,  // (instack, idx, kind)
     pub protos: Vec<DumpedFunction>,
 }
 
@@ -170,13 +171,16 @@ impl BytecodeReader {
         constants
     }
 
-    fn read_upvalues(&mut self) {
+    fn read_upvalues(&mut self) -> Vec<(bool, u8, u8)> {
         let n = self.read_int() as usize;
+        let mut upvalues = Vec::with_capacity(n);
         for _ in 0..n {
-            let _instack = self.read_byte();
-            let _idx = self.read_byte();
-            let _kind = self.read_byte();
+            let instack = self.read_byte() != 0;
+            let idx = self.read_byte();
+            let kind = self.read_byte();
+            upvalues.push((instack, idx, kind));
         }
+        upvalues
     }
 
     fn read_function(&mut self) -> DumpedFunction {
@@ -187,7 +191,7 @@ impl BytecodeReader {
         let maxstacksize = self.read_byte();
         let code = self.read_code();
         let constants = self.read_constants();
-        self.read_upvalues();
+        let upvalues = self.read_upvalues();
         let nprotos = self.read_int() as usize;
         let mut protos = Vec::with_capacity(nprotos);
         for _ in 0..nprotos {
@@ -203,6 +207,7 @@ impl BytecodeReader {
             maxstacksize,
             code,
             constants,
+            upvalues,
             protos,
         }
     }

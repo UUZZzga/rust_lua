@@ -23,15 +23,27 @@ mod compiler_compare_tests {
         if !diffs.is_empty() {
             let rust_dump = bytecode_dump::dump_instructions(&rust_proto.code);
             let c_dump = bytecode_dump::dump_c_instructions(&c_func.code, &c_func.constants);
+            // Print upvalue info for debugging
+            let rust_uv: Vec<String> = rust_proto.upvalues.iter().map(|uv| {
+                let name_str = uv.name.as_ref().map(|s| s.to_string()).unwrap_or_else(|| "?".to_string());
+                format!("{}(instack={},idx={})", name_str, uv.in_stack, uv.idx)
+            }).collect();
+            let c_uv: Vec<String> = c_func.upvalues.iter().map(|(instack, idx, _kind)| {
+                format!("(instack={},idx={})", instack, idx)
+            }).collect();
             panic!(
                 "Instruction mismatch for source: {}\n\
                  Function: {}\n\
                  Differences:\n  {}\n\n\
+                 Rust upvalues: {}\n\
+                 C upvalues: {}\n\n\
                  Rust instructions:\n{}\n\n\
                  C++ instructions:\n{}",
                 source,
                 path,
                 diffs.join("\n  "),
+                rust_uv.join(", "),
+                c_uv.join(", "),
                 rust_dump,
                 c_dump
             );
