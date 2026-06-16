@@ -7307,6 +7307,10 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
             fs.ls_mut().next();
             let ei = parse_expr(fs);
             expect(fs, &Token::RParen);
+            // Like C's primaryexp: luaK_dischargevars(ls->fs, v);
+            // For VCALL/Vararg: setoneret sets C=2 (1 result) and converts to
+            // VNONRELOC (Call) or VRELOC (Vararg). This ensures `(...)` returns
+            // exactly one value, not multret.
             match ei.exp.kind {
                 ExpKind::Call => {
                     let call_pc = ei.exp.info2;
@@ -7314,6 +7318,14 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                         setarg(&mut fs.proto.code[call_pc as usize], 2, POS_C, SIZE_C);
                     }
                     ExpDesc { kind: ExpKind::NonReloc, info: ei.exp.info, info2: -1, t: NO_JUMP, f: NO_JUMP, str_val: None }
+                }
+                ExpKind::Vararg => {
+                    // Like C's setoneret for VVARARG: SETARG_C(pc, 2), then VRELOC
+                    let pc = ei.exp.info2;
+                    if pc >= 0 {
+                        fs.set_c(pc, 2);
+                    }
+                    ExpDesc { kind: ExpKind::Relocable, info: ei.exp.info, info2: pc, t: NO_JUMP, f: NO_JUMP, str_val: None }
                 }
                 _ => ei.exp,
             }
