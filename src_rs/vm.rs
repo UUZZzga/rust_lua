@@ -1323,7 +1323,7 @@ fn format_float(f: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::objects::{NilKind, Proto, LClosure, Instruction, UpVal, UpvalDesc};
+    use crate::objects::{NilKind, Proto, UpvalDesc};
     use crate::strings::{LuaString, StringTable};
     use std::rc::Rc;
 
@@ -2222,7 +2222,7 @@ mod tests {
         ];
         let len_before = stack.len();
         let dmt = DefaultMetatables::new();
-        concat_stack(&mut stack, 2, &dmt);
+        concat_stack(&mut stack, 2, &dmt).unwrap();
         assert_eq!(stack.len(), len_before - 1);
         if let TValue::Str(ref s) = stack[0] {
             assert_eq!(s.as_str(), "helloworld");
@@ -2236,7 +2236,7 @@ mod tests {
         let tb = StringTable::new();
         let mut stack = vec![TValue::Str(tb.intern("hello"))];
         let dmt = DefaultMetatables::new();
-        concat_stack(&mut stack, 1, &dmt);
+        concat_stack(&mut stack, 1, &dmt).unwrap();
         assert_eq!(stack.len(), 1);
     }
 
@@ -2249,7 +2249,7 @@ mod tests {
             TValue::Str(tb.intern("c")),
         ];
         let dmt = DefaultMetatables::new();
-        concat_stack(&mut stack, 3, &dmt);
+        concat_stack(&mut stack, 3, &dmt).unwrap();
         assert_eq!(stack.len(), 1);
         if let TValue::Str(ref s) = stack[0] {
             assert_eq!(s.as_str(), "abc");
@@ -2266,7 +2266,7 @@ mod tests {
             TValue::Integer(42),
         ];
         let dmt = DefaultMetatables::new();
-        concat_stack(&mut stack, 2, &dmt);
+        concat_stack(&mut stack, 2, &dmt).unwrap();
         if let TValue::Str(ref s) = stack[0] {
             assert_eq!(s.as_str(), "x=42");
         } else {
@@ -2282,7 +2282,7 @@ mod tests {
             TValue::Str(tb.intern("world")),
         ];
         let dmt = DefaultMetatables::new();
-        concat_stack(&mut stack, 2, &dmt);
+        concat_stack(&mut stack, 2, &dmt).unwrap();
         assert_eq!(stack.len(), 1);
         if let TValue::Str(ref s) = stack[0] {
             assert_eq!(s.as_str(), "world");

@@ -760,7 +760,7 @@ mod tests {
         assert_eq!(result.len(), 3);
     }
 
-    fn make_tm_tvalue_local(tm: TagMethod) -> TValue {
+    fn _make_tm_tvalue_local(tm: TagMethod) -> TValue {
         super::make_tm_tvalue(tm)
     }
 

@@ -232,8 +232,8 @@ impl VmExecutor {
                         let proto_num_params = closure.proto.num_params;
                         let proto_is_vararg = closure.proto.is_vararg();
                         let proto_max_stack = closure.proto.max_stack_size;
-                        drop(closure);
-                        drop(func_val);
+                        let _ = closure;
+                        let _ = func_val;
 
                         let nresults = c + 1;
                         let fsize = proto_max_stack as usize;

@@ -1706,6 +1706,59 @@ end"#,
         assert_inst_match("local function f(...t) return #t end", None);
     }
 
+    // ===== 命名 vararg 参数扩展测试 =====
+    // 以下测试覆盖 VVARGVAR 在各编译路径中的正确处理：
+    // - LOADK+GETVARG（Dot/LBracket 分支，不设 PF_VATAB）
+    // - LEN 对 VVARGVAR 分配新寄存器并设置 PF_VATAB
+    // - num_params 不包含 vararg 参数（RETURN C 操作数正确）
+    // - VVARGVAR 在赋值目标中的处理
+
+    #[test]
+    fn test_named_vararg_field_assign() {
+        // VVARGVAR as assignment target: t.x = 1
+        // This tests parse_assign_or_call Dot branch with VVARGVAR
+        assert_inst_match("local function f(...t) t.x = 1 end", None);
+    }
+
+    #[test]
+    fn test_named_vararg_index_assign() {
+        // VVARGVAR as assignment target: t[1] = 2
+        // This tests parse_assign_or_call LBracket branch with VVARGVAR
+        assert_inst_match("local function f(...t) t[1] = 2 end", None);
+    }
+
+    #[test]
+    fn test_named_vararg_field_in_expr() {
+        // VVARGVAR field access in expression: t.n + 1
+        assert_inst_match("local function f(...t) return t.n + 1 end", None);
+    }
+
+    #[test]
+    fn test_named_vararg_index_in_expr() {
+        // VVARGVAR index access in expression: t[1] + t[2]
+        assert_inst_match("local function f(...t) return t[1] + t[2] end", None);
+    }
+
+    #[test]
+    fn test_named_vararg_len_in_if() {
+        // VVARGVAR LEN in if condition: if #t > 0
+        assert_inst_match("local function f(...t) if #t > 0 then return 1 end end", None);
+    }
+
+    #[test]
+    fn test_named_vararg_with_regular_params() {
+        // VVARGVAR with regular parameters: f(a, b, ...t) - num_params should be 2 (not 3)
+        assert_inst_match("local function f(a, b, ...t) return t[a] end", None);
+    }
+
+    #[test]
+    fn test_named_vararg_return_c_operand() {
+        // This specifically tests that num_params does NOT include the vararg parameter.
+        // Before fix: num_params=1 (wrong), RETURN C=2
+        // After fix: num_params=0 (correct), RETURN C=1
+        assert_inst_match("local function f(...t) return t end", None);
+    }
+
     #[test]
     fn debug_global_const_star() {
         // Test: local _ENV should make _ENV a local variable, causing GETFIELD instead of GETTABUP

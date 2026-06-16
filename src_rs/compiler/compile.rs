@@ -1560,27 +1560,18 @@ impl FuncState {
         self.patch_list(list, self.pc);
     }
 
-    /// 生成 RETURN 指令: 根据 vararg 标志和返回值数量选择 RETURN0/RETURN1/RETURN
+    /// 生成 RETURN 指令: 像 C 的 luaK_ret 一样，仅根据 nret 选择 RETURN0/RETURN1/RETURN。
+    /// needclose 和 PF_VAHID 的调整由 parse_chunk_finish() 统一处理。
     fn return_stat_gen(&mut self, first: i32, nret: i32) {
-        let is_vararg = (self.proto.flag & PF_VAHID) != 0;
-        let c = if is_vararg { self.proto.num_params as i32 + 1 } else { 0 };
         match nret {
             0 => {
-                if is_vararg || self.needclose {
-                    self.code_abc_k(OpCode::RETURN, first, 1, c, self.needclose);
-                } else {
-                    self.code_abc(OpCode::RETURN0, first, 1, 0);
-                }
+                self.code_abc(OpCode::RETURN0, first, 1, 0);
             }
             1 => {
-                if is_vararg || self.needclose {
-                    self.code_abc_k(OpCode::RETURN, first, 2, c, self.needclose);
-                } else {
-                    self.code_abc(OpCode::RETURN1, first, 2, 0);
-                }
+                self.code_abc(OpCode::RETURN1, first, 2, 0);
             }
             _ => {
-                self.code_abc_k(OpCode::RETURN, first, nret + 1, c, self.needclose);
+                self.code_abc(OpCode::RETURN, first, nret + 1, 0);
             }
         }
     }
@@ -2694,27 +2685,21 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 let field = get_name(fs);
                 let k = fs.string_k(&field);
 
-                // Handle VVARGVAR: generate GETVARG instead of GETFIELD
+                // Handle VVARGVAR: like C's luaK_indexed, create VVARGIND-like PrefixResult
+                // (delay GETVARG generation until read; assignment uses SETTABLE with PF_VATAB)
+                // C's luaK_indexed always puts key in a register for VVARGVAR (luaK_exp2anyreg),
+                // so we always LOADK, never use SETFIELD/GETFIELD with constant index.
                 if first.is_vvargvar {
                     let base_reg = first.reg.unwrap();
-                    fs.proto.flag |= PF_VATAB;
-                    let r = fs.alloc_reg();
-                    fs.code_abc(OpCode::GETVARG, r, base_reg, k);
-                    let is_short_str = field.len() <= crate::strings::LUAI_MAXSHORTLEN && (k as u32) <= crate::opcodes::MAXINDEXRK;
-                    let (table_key, table_key_is_const, key_allocated_reg) = if is_short_str {
-                        (k, true, false)
-                    } else {
-                        let kr = fs.alloc_reg();
-                        fs.code_abx(OpCode::LOADK, kr, k);
-                        (kr, false, true)
-                    };
+                    let kr = fs.alloc_reg();
+                    fs.code_abx(OpCode::LOADK, kr, k);
                     first = PrefixResult {
-                        var_name: None, local_idx: None, key: None, reg: Some(r),
-                        table_reg: Some(r), table_key: Some(table_key), table_key_is_const: table_key_is_const, table_key_is_int: false,
-                        key_allocated_reg: key_allocated_reg,
-                        allocated_reg: true,
+                        var_name: None, local_idx: None, key: None, reg: Some(base_reg),
+                        table_reg: Some(base_reg), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false,
+                        key_allocated_reg: true,
+                        allocated_reg: false,
                         is_upvalue: false, upval_idx: None, env_gettabup_pc: -1,
-                        has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false,
+                        has_call: false, call_pc: -1, is_vvargvar: true, is_readonly: false,
                     };
                     continue;
                 }
@@ -2781,22 +2766,24 @@ fn parse_assign_or_call(fs: &mut FuncState) {
             Token::LBracket => {
                 fs.ls_mut().next();
 
-                // Handle VVARGVAR: generate GETVARG instead of GETTABLE
+                // Handle VVARGVAR: like C's luaK_indexed, create VVARGIND-like PrefixResult
+                // (delay GETVARG generation until read; assignment uses SETTABLE with PF_VATAB)
                 if first.is_vvargvar {
                     let base_reg = first.reg.unwrap();
                     let ei = parse_expr(fs);
                     expect(fs, &Token::RBracket);
-                    let key_reg = fs.exp_to_reg(&ei.exp);
-                    fs.proto.flag |= PF_VATAB;
-                    let r = fs.alloc_reg();
-                    fs.code_abc(OpCode::GETVARG, r, base_reg, key_reg);
-                    fs.free_reg(); // free key_reg
+                    // Like C's luaK_exp2anyreg: if key is already in a local register, use it directly
+                    let key_reg = if ei.exp.kind == ExpKind::NonReloc && (ei.exp.info as i32) < fs.nvarstack() {
+                        ei.exp.info as i32
+                    } else {
+                        fs.exp_to_next_reg(&ei.exp)
+                    };
                     first = PrefixResult {
-                        var_name: None, local_idx: None, key: None, reg: Some(r),
-                        table_reg: Some(r), table_key: Some(key_reg), table_key_is_const: false, table_key_is_int: false,
-                        key_allocated_reg: false, allocated_reg: true,
+                        var_name: None, local_idx: None, key: None, reg: Some(base_reg),
+                        table_reg: Some(base_reg), table_key: Some(key_reg), table_key_is_const: false, table_key_is_int: false,
+                        key_allocated_reg: false, allocated_reg: false,
                         is_upvalue: false, upval_idx: None, env_gettabup_pc: -1,
-                        has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false,
+                        has_call: false, call_pc: -1, is_vvargvar: true, is_readonly: false,
                     };
                     continue;
                 }
@@ -3002,6 +2989,11 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 let v = &vars[i];
                 let val = &exps[i];
                 if let (Some(table_reg), Some(table_key)) = (v.table_reg, v.table_key) {
+                    // VVARGVAR assignment: like C's luaK_storevar for VVARGIND,
+                    // set PF_VATAB then fall through to SETTABLE
+                    if v.is_vvargvar {
+                        fs.proto.flag |= PF_VATAB;
+                    }
                     let can_settabup = v.is_upvalue && v.table_key_is_const && !v.table_key_is_int;
                     if can_settabup {
                         let upval_idx = v.upval_idx.unwrap_or(0);
@@ -3143,6 +3135,11 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     nil_reg_start + (i - exps.len()) as i32
                 };
                 if let (Some(table_reg), Some(table_key)) = (v.table_reg, v.table_key) {
+                    // VVARGVAR assignment: like C's luaK_storevar for VVARGIND,
+                    // set PF_VATAB then fall through to SETTABLE
+                    if v.is_vvargvar {
+                        fs.proto.flag |= PF_VATAB;
+                    }
                     let can_settabup = v.is_upvalue && v.table_key_is_const && !v.table_key_is_int;
                     if can_settabup {
                         code_settabup(fs, v.upval_idx.unwrap_or(0), table_key, result_reg);
@@ -3335,7 +3332,15 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
 /// 返回 (函数寄存器, 是否需要额外释放基寄存器, 是否已分配寄存器, 方法调用原始源寄存器)
 fn load_func(fs: &mut FuncState, p: &PrefixResult, is_method: bool) -> (i32, bool, bool, Option<i32>) {
     if let (Some(table_reg), Some(table_key)) = (p.table_reg, p.table_key) {
-        if p.is_upvalue {
+        if p.is_vvargvar {
+            // VVARGVAR indexed: generate GETVARG (like C's VVARGIND discharge)
+            if p.key_allocated_reg {
+                fs.free_reg();
+            }
+            let r = fs.alloc_reg();
+            fs.code_abc(OpCode::GETVARG, r, table_reg, table_key);
+            (r, true, true, None)
+        } else if p.is_upvalue {
             // Upvalue table with short string key: use GETTABUP instead of GETFIELD
             let r = fs.alloc_reg();
             code_gettabup(fs, r, table_reg, table_key);
@@ -3724,18 +3729,20 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         let field = get_name(fs);
                         let k = fs.string_k(&field);
 
-                        // Handle VVARGVAR: generate GETVARG instead of GETFIELD
+                        // Handle VVARGVAR: like C's luaK_indexed, create VVARGIND-like PrefixResult
+                        // C's luaK_indexed always puts key in a register for VVARGVAR (luaK_exp2anyreg),
+                        // so we always LOADK, never use SETFIELD/GETFIELD with constant index.
                         if result.is_vvargvar {
                             let base_reg = result.reg.unwrap();
-                            fs.proto.flag |= PF_VATAB;
-                            let r = fs.alloc_reg();
-                            fs.code_abc(OpCode::GETVARG, r, base_reg, k);
+                            let kr = fs.alloc_reg();
+                            fs.code_abx(OpCode::LOADK, kr, k);
                             result = PrefixResult {
-                                var_name: None, local_idx: None, key: None, reg: Some(r),
-                                table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false,
-                                key_allocated_reg: false, allocated_reg: true,
+                                var_name: None, local_idx: None, key: None, reg: Some(base_reg),
+                                table_reg: Some(base_reg), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false,
+                                key_allocated_reg: true,
+                                allocated_reg: false,
                                 is_upvalue: false, upval_idx: None, env_gettabup_pc: -1,
-                                has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false,
+                                has_call: false, call_pc: -1, is_vvargvar: true, is_readonly: false,
                             };
                             continue;
                         }
@@ -3835,22 +3842,23 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                 Token::LBracket => {
                     fs.ls_mut().next();
 
-                    // Handle VVARGVAR: generate GETVARG instead of GETTABLE
+                    // Handle VVARGVAR: like C's luaK_indexed, create VVARGIND-like PrefixResult
                     if result.is_vvargvar {
                         let base_reg = result.reg.unwrap();
                         let ei = parse_expr(fs);
                         expect(fs, &Token::RBracket);
-                        let key_reg = fs.exp_to_reg(&ei.exp);
-                        fs.proto.flag |= PF_VATAB;
-                        let r = fs.alloc_reg();
-                        fs.code_abc(OpCode::GETVARG, r, base_reg, key_reg);
-                        fs.free_reg(); // free key_reg
+                        // Like C's luaK_exp2anyreg: if key is already in a local register, use it directly
+                        let key_reg = if ei.exp.kind == ExpKind::NonReloc && (ei.exp.info as i32) < fs.nvarstack() {
+                            ei.exp.info as i32
+                        } else {
+                            fs.exp_to_next_reg(&ei.exp)
+                        };
                         result = PrefixResult {
-                            var_name: None, local_idx: None, key: None, reg: Some(r),
-                            table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false,
-                            key_allocated_reg: false, allocated_reg: true,
+                            var_name: None, local_idx: None, key: None, reg: Some(base_reg),
+                            table_reg: Some(base_reg), table_key: Some(key_reg), table_key_is_const: false, table_key_is_int: false,
+                            key_allocated_reg: false, allocated_reg: false,
                             is_upvalue: false, upval_idx: None, env_gettabup_pc: -1,
-                            has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false,
+                            has_call: false, call_pc: -1, is_vvargvar: true, is_readonly: false,
                         };
                         continue;
                     }
@@ -7181,6 +7189,13 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                         let r = fs.alloc_reg();
                         fs.code_abc(OpCode::LEN, r, ei.exp.info as i32, 0);
                         ExpDesc::new(ExpKind::Relocable, r as i64)
+                    } else if ei.exp.kind == ExpKind::VVARGVAR {
+                        // VVARGVAR: like C's luaK_vapar2local, set PF_VATAB and allocate new register
+                        let src_reg = ei.exp.info as i32;
+                        fs.proto.flag |= PF_VATAB;
+                        let r = fs.alloc_reg();
+                        fs.code_abc(OpCode::LEN, r, src_reg, 0);
+                        ExpDesc::new(ExpKind::Relocable, r as i64)
                     } else {
                         let r = fs.exp_to_reg(&ei.exp);
                         fs.code_abc(OpCode::LEN, r, r, 0);
@@ -7259,6 +7274,20 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 fs.ls_mut().next();
                 let field = get_name(fs);
                 let k = fs.string_k(&field);
+                // Handle VVARGVAR: like C's luaK_indexed + VVARGIND discharge
+                if e.kind == ExpKind::VVARGVAR {
+                    let base_reg = e.info as i32;
+                    let kr = fs.alloc_reg();
+                    fs.code_abx(OpCode::LOADK, kr, k);  // load key into register
+                    // Free key register (like C's freeregs in VVARGIND discharge)
+                    if kr >= fs.nvarstack() && kr == fs.freereg - 1 {
+                        fs.free_reg();
+                    }
+                    // Generate GETVARG with A=0 (relocatable), like C compiler
+                    let pc = fs.code_abc(OpCode::GETVARG, 0, base_reg, kr);
+                    e = ExpDesc::new_reloc_with_pc(kr as i64, pc);
+                    continue;
+                }
                 let base_reg = fs.exp_to_reg(&e);
                 let is_short_str = is_kstr(fs, k);
                 // Check if the last instruction is GETUPVAL (any upvalue index, not just _ENV)
@@ -7307,6 +7336,26 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
             }
             Token::LBracket => {
                 fs.ls_mut().next();
+                // Handle VVARGVAR: like C's luaK_indexed + VVARGIND discharge
+                if e.kind == ExpKind::VVARGVAR {
+                    let base_reg = e.info as i32;
+                    let ei = parse_expr(fs);
+                    expect(fs, &Token::RBracket);
+                    // Like C's luaK_exp2anyreg: if key is already in a local register, use it directly
+                    let key_reg = if ei.exp.kind == ExpKind::NonReloc && (ei.exp.info as i32) < fs.nvarstack() {
+                        ei.exp.info as i32
+                    } else {
+                        fs.exp_to_next_reg(&ei.exp)
+                    };
+                    // Free key register (like C's freeregs in VVARGIND discharge)
+                    if key_reg >= fs.nvarstack() && key_reg == fs.freereg - 1 {
+                        fs.free_reg();
+                    }
+                    // Generate GETVARG with A=0 (relocatable), like C compiler
+                    let pc = fs.code_abc(OpCode::GETVARG, 0, base_reg, key_reg);
+                    e = ExpDesc::new_reloc_with_pc(key_reg as i64, pc);
+                    continue;
+                }
                 let base_reg = if matches!(e.kind, ExpKind::Relocable | ExpKind::NonReloc) && !e.has_jumps() {
                     if e.info2 >= 0 {
                         fs.set_a(e.info2, e.info as i32);
@@ -8817,14 +8866,12 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
                 if let Token::Name(name) = &fs.ls().token {
                     let name = name.clone();
                     fs.ls_mut().next();
-                    // Add as RDKVAVAR kind local variable
+                    // Add as RDKVAVAR kind local variable (not counted in n_params, like C)
                     param_names.push(name);
-                    n_params += 1;
                     vararg_named = true;
                 } else {
-                    // Traditional ... without name
+                    // Traditional ... without name (not counted in n_params, like C)
                     param_names.push("(vararg table)".to_string());
-                    n_params += 1;
                 }
                 break;
             }
