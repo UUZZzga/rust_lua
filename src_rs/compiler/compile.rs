@@ -270,6 +270,7 @@ struct ParentVar {
     is_local: bool,       // true = direct parent's local, false = inherited from ancestor
     is_global: bool,      // true = GDKREG/GDKCONST variable (global declaration)
     is_ctc: bool,         // true = RDKCTC variable (compile-time constant, not an upvalue)
+    is_vararg: bool,      // true = RDKVAVAR variable (named vararg parameter, needs PF_VATAB)
     ctc_kind: Option<ExpKind>,  // constant kind (for is_ctc)
     ctc_info: Option<i64>,      // constant info (for is_ctc)
     ctc_str: Option<String>,    // constant string value (for is_ctc Str)
@@ -1452,6 +1453,22 @@ impl FuncState {
                 // exp2reg: discharge2reg + patchlistaux
                 if reg != e.info as i32 {
                     self.code_abc(OpCode::MOVE, reg, e.info as i32, 0);
+                }
+                self.resolve_jumps(e, reg);
+                reg
+            }
+            ExpKind::VVARGVAR => {
+                // Like C's dischargevars for VVARGVAR: luaK_vapar2local sets PF_VATAB
+                // and converts to VLOCAL, then FALLTHROUGH to VLOCAL which converts to
+                // VNONRELOC with e.info = e.ridx. Then exp2nextreg allocates a new reg
+                // and exp2reg generates MOVE if needed.
+                self.proto.flag |= PF_VATAB;
+                let src_reg = e.info as i32;
+                // reserveregs(1): allocate a new register
+                let reg = self.alloc_reg();
+                // exp2reg: discharge2reg for VNONRELOC generates MOVE if reg != src_reg
+                if reg != src_reg {
+                    self.code_abc(OpCode::MOVE, reg, src_reg, 0);
                 }
                 self.resolve_jumps(e, reg);
                 reg
@@ -2770,23 +2787,28 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 }
 
                 let is_short_str = field.len() <= crate::strings::LUAI_MAXSHORTLEN && (k as u32) <= crate::opcodes::MAXINDEXRK;
-                // Check if we can revert a GETUPVAL and use SETTABUP/GETTABUP instead
+                // Check if we can revert a GETUPVAL and use SETTABUP/GETTABUP instead.
+                // Only attempt revert if the last instruction is actually a GETUPVAL
+                // generated for this result (i.e., result was just loaded from an upvalue
+                // and not yet indexed). This matches C's VINDEXUP optimization where
+                // _ENV (as upvalue) indexed by a short string stays as VINDEXUP.
                 let can_revert_getupval = first.reg.is_some() && first.upval_idx.is_some() && is_short_str
-                    && !first.is_upvalue && first.table_reg.is_none();
+                    && !first.is_upvalue && first.table_reg.is_none()
+                    && first.allocated_reg  // must be a register we allocated
+                    && (fs.pc > 0)  // safety check
+                    && {
+                        let last_inst = fs.proto.code[(fs.pc - 1) as usize];
+                        get_opcode(last_inst) == OpCode::GETUPVAL
+                            && getarg_a(last_inst) == first.reg.unwrap()
+                    };
                 let (base_reg, gettabup_pc) = if can_revert_getupval {
                     // Revert: remove the GETUPVAL instruction, free the register
                     let getupval_pc = fs.pc - 1;
-                    let last_inst = fs.proto.code[getupval_pc as usize];
-                    if get_opcode(last_inst) == OpCode::GETUPVAL && getarg_a(last_inst) == first.reg.unwrap() {
-                        fs.proto.code.remove(getupval_pc as usize);
-                        fs.pc -= 1;
-                        fs.free_reg();
-                        let uv_idx = first.upval_idx.unwrap();
-                        (uv_idx, -1)  // Use upvalue index as base_reg (for SETTABUP/GETTABUP)
-                    } else {
-                        // Can't revert: keep the register
-                        (first.reg.unwrap(), -1)
-                    }
+                    fs.proto.code.remove(getupval_pc as usize);
+                    fs.pc -= 1;
+                    fs.free_reg();
+                    let uv_idx = first.upval_idx.unwrap();
+                    (uv_idx, -1)  // Use upvalue index as base_reg (for SETTABUP/GETTABUP)
                 } else if let Some(r) = first.reg {
                     (r, -1)
                 } else if first.is_upvalue {
@@ -3930,23 +3952,28 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                             result.key_allocated_reg = false;
                         }
                         let is_short_str = field.len() <= crate::strings::LUAI_MAXSHORTLEN && (k as u32) <= crate::opcodes::MAXINDEXRK;
-                        // Check if we can revert a GETUPVAL and use SETTABUP/GETTABUP instead
+                        // Check if we can revert a GETUPVAL and use SETTABUP/GETTABUP instead.
+                        // Only attempt revert if the last instruction is actually a GETUPVAL
+                        // generated for this result (i.e., result was just loaded from an upvalue
+                        // and not yet indexed). This matches C's VINDEXUP optimization where
+                        // _ENV (as upvalue) indexed by a short string stays as VINDEXUP.
                         let can_revert_getupval = result.reg.is_some() && result.upval_idx.is_some() && is_short_str
-                            && !result.is_upvalue && result.table_reg.is_none();
+                            && !result.is_upvalue && result.table_reg.is_none()
+                            && result.allocated_reg  // must be a register we allocated
+                            && (fs.pc > 0)  // safety check
+                            && {
+                                let last_inst = fs.proto.code[(fs.pc - 1) as usize];
+                                get_opcode(last_inst) == OpCode::GETUPVAL
+                                    && getarg_a(last_inst) == result.reg.unwrap()
+                            };
                         let (base_reg, gettabup_pc) = if can_revert_getupval {
                             // Revert: remove the GETUPVAL instruction, free the register
                             let getupval_pc = fs.pc - 1;
-                            let last_inst = fs.proto.code[getupval_pc as usize];
-                            if get_opcode(last_inst) == OpCode::GETUPVAL && getarg_a(last_inst) == result.reg.unwrap() {
-                                fs.proto.code.remove(getupval_pc as usize);
-                                fs.pc -= 1;
-                                fs.free_reg();
-                                let uv_idx = result.upval_idx.unwrap();
-                                (uv_idx, -1)  // Use upvalue index as base_reg (for SETTABUP/GETTABUP)
-                            } else {
-                                // Can't revert: keep the register
-                                (result.reg.unwrap(), -1)
-                            }
+                            fs.proto.code.remove(getupval_pc as usize);
+                            fs.pc -= 1;
+                            fs.free_reg();
+                            let uv_idx = result.upval_idx.unwrap();
+                            (uv_idx, -1)  // Use upvalue index as base_reg (for SETTABUP/GETTABUP)
                         } else if let Some(r) = result.reg {
                             (r, -1)
                         } else if result.is_upvalue {
@@ -9284,11 +9311,13 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
         if local.active {
             let is_global = local.kind >= GDKREG;
             let is_ctc = local.kind == RDKCTC;
+            let is_vararg = local.kind == RDKVAVAR;
             new_fs.parent_locals.push(ParentVar {
                 name: local.name.clone(),
                 is_local: true,
                 is_global,
                 is_ctc,
+                is_vararg,
                 ctc_kind: local.ctc_kind.clone(),
                 ctc_info: local.ctc_info,
                 ctc_str: local.ctc_str.clone(),
@@ -9313,6 +9342,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
                     is_local: false,
                     is_global: false,
                     is_ctc: false,
+                    is_vararg: false,
                     ctc_kind: None,
                     ctc_info: None,
                     ctc_str: None,
@@ -9333,6 +9363,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
             is_local: false,
             is_global: gp_var.is_global,
             is_ctc: gp_var.is_ctc,
+            is_vararg: gp_var.is_vararg,
             ctc_kind: gp_var.ctc_kind.clone(),
             ctc_info: gp_var.ctc_info,
             ctc_str: gp_var.ctc_str.clone(),
@@ -9361,6 +9392,11 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
                 let local_name = fs.locals[local_idx].name.as_str();
                 let uv_name = uv.name.as_ref().map(|s| s.as_str()).unwrap_or("");
                 if local_name == uv_name {
+                    // Like C's singlevaraux: if the variable is a vararg parameter (VVARGVAR),
+                    // call luaK_vapar2local which sets PF_VATAB on the parent function.
+                    if fs.locals[local_idx].kind == RDKVAVAR {
+                        fs.proto.flag |= PF_VATAB;
+                    }
                     fs.mark_block_upval(local_idx);
                 } else {
                     // The upvalue references a variable that is not a local in the parent
