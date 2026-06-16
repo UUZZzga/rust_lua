@@ -3655,9 +3655,11 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
             } else if let Some(result) = fs.find_upvalue(&name) {
                 match result {
                     UpvalueOrCtc::Upvalue(upval_idx) => {
-                        let r = fs.alloc_reg();
-                        fs.code_abc(OpCode::GETUPVAL, r, upval_idx, 0);
-                        PrefixResult { var_name: None, local_idx: None, key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: false, upval_idx: Some(upval_idx), env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
+                        // Don't eagerly load the upvalue into a register.
+                        // Like C's singlevar which returns VUPVAL, we delay the GETUPVAL
+                        // until load_func or the Dot/LBracket suffix handlers need it.
+                        // This avoids duplicate GETUPVAL instructions and matches C's behavior.
+                        PrefixResult { var_name: None, local_idx: None, key: None, reg: None, table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: true, upval_idx: Some(upval_idx), env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
                     }
                     UpvalueOrCtc::CtcConst(mut ctc) => {
                         // Like find_local_ctc handling: load constant into a register

@@ -2417,4 +2417,37 @@ return x
             Some("test_band_flip_operand_order")
         );
     }
+
+    /// Regression test: upvalue used as function call should not generate
+    /// duplicate GETUPVAL instructions.
+    /// Before the fix, parse_prefix_exp eagerly loaded upvalues into registers
+    /// (generating GETUPVAL), then load_func matched the upval_idx branch first
+    /// and generated another GETUPVAL, causing all subsequent instructions to
+    /// use registers offset by 1.
+    /// The fix delays GETUPVAL generation until load_func, matching C's behavior.
+    #[test]
+    fn test_upvalue_call_no_duplicate_getupval() {
+        // Minimal case: outer local `f` is used as a function call inside inner function.
+        // Before fix: Rust generates GETUPVAL twice (one from parse_prefix_exp, one from load_func),
+        // causing an extra register to be consumed and CONCAT operands shifted.
+        // After fix: Rust generates GETUPVAL once, matching C compiler output.
+        assert_inst_match(r#"
+local f = error
+local function g(x)
+  f("attempt to '" .. x .. "' a value", 4)
+end
+"#, None);
+    }
+
+    /// Variant: upvalue call with string concatenation in arguments,
+    /// matching the pattern from bwcoercion.lua's trymt function.
+    #[test]
+    fn test_upvalue_call_concat_args() {
+        assert_inst_match(r#"
+local err, tp = error, type
+local function trymt(x, y, name)
+  err("attempt to '" .. name .. "' a " .. tp(x) .. " with a " .. tp(y), 4)
+end
+"#, None);
+    }
 }
