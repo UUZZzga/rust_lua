@@ -1384,13 +1384,13 @@ impl FuncState {
             }
             ExpKind::Relocable => {
                 if e.info2 >= 0 {
-                    // VRELOC mode: info holds the register that was freed after
-                    // generating the instruction (like C's freeexps before VRELOC).
-                    // If info > 0 and it's the top temp register, free it first
-                    // so alloc_reg reuses the same register (matching C's behavior).
-                    if e.info as i32 > 0 && e.info as i32 == self.freereg - 1 && e.info as i32 >= self.nvarstack() {
-                        self.free_reg();
-                    }
+                    // VRELOC mode: info2 holds the PC of the pending instruction.
+                    // Like C's luaK_reserveregs + exp2reg: always allocate a new
+                    // register and patch the instruction's A field.
+                    // (Do NOT try to reuse the freed operand register stored in
+                    // info, because it may have been reallocated for something
+                    // else between freeexp and this discharge — e.g. the table
+                    // register in luaK_indexed for `upval[#upval]`.)
                     let r = self.alloc_reg();
                     self.set_a(e.info2, r);
                     r
@@ -3068,11 +3068,16 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     && !matches!(ei.exp.kind, ExpKind::Str | ExpKind::Int)
                     && !matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc)
                     && ei.exp.kind != ExpKind::Upval;
-                if getupval_emitted_before_key {
+                // Save table register when GETUPVAL is emitted so we can use it later
+                // (key may have been allocated BEFORE the table, e.g. Call expressions)
+                let getupval_table_reg = if getupval_emitted_before_key {
                     // Simple expression (VTRUE, etc.): emit GETUPVAL first (like C's luaK_indexed)
                     let r = fs.alloc_reg();
                     fs.code_abc(OpCode::GETUPVAL, r, saved_upval_idx, 0);
-                }
+                    Some(r)
+                } else {
+                    None
+                };
                 // For upvalue table + Upval key (like a[i]): C generates GETUPVAL key first
                 // (VRELOC, A=0 placeholder in yindex's luaK_exp2val), then GETUPVAL table
                 // (in luaK_indexed's luaK_exp2anyreg), then patches key's A.
@@ -3148,8 +3153,10 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         }
                         (saved_upval_idx, true, false)
                     } else if getupval_emitted_before_key {
-                        // GETUPVAL already emitted before key load code (simple expression case)
-                        (fs.freereg - 1 - if key_allocated { 1 } else { 0 }, false, true)
+                        // GETUPVAL already emitted before key load code.
+                        // Use the saved table register (key may have been allocated
+                        // BEFORE the table, e.g. Call expressions like t[a()])
+                        (getupval_table_reg.unwrap(), false, true)
                     } else {
                         // Comparison or constant key: emit GETUPVAL after key load code
                         // (matching C's luaK_indexed: luaK_exp2anyreg(t) allocates table reg FIRST)
@@ -4478,11 +4485,16 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         && !matches!(ei.exp.kind, ExpKind::Str | ExpKind::Int)
                         && !matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc)
                         && ei.exp.kind != ExpKind::Upval;
-                    if getupval_emitted_before_key {
+                    // Save table register when GETUPVAL is emitted so we can use it later
+                    // (key may have been allocated BEFORE the table, e.g. Call expressions)
+                    let getupval_table_reg = if getupval_emitted_before_key {
                         // Simple expression (VTRUE, etc.): emit GETUPVAL first (like C's luaK_indexed)
                         let r = fs.alloc_reg();
                         fs.code_abc(OpCode::GETUPVAL, r, saved_upval_idx, 0);
-                    }
+                        Some(r)
+                    } else {
+                        None
+                    };
                     // For upvalue table + Upval key (like a[i]): C generates GETUPVAL key first
                     // (VRELOC, A=0 placeholder in yindex's luaK_exp2val), then GETUPVAL table
                     // (in luaK_indexed's luaK_exp2anyreg), then patches key's A.
@@ -4557,7 +4569,10 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                             }
                             (saved_upval_idx, true, false)
                         } else if getupval_emitted_before_key {
-                            (fs.freereg - 1 - if key_allocated { 1 } else { 0 }, false, true)
+                            // GETUPVAL already emitted before key load code.
+                            // Use the saved table register (key may have been allocated
+                            // BEFORE the table, e.g. Call expressions like t[a()])
+                            (getupval_table_reg.unwrap(), false, true)
                         } else {
                             let r = fs.alloc_reg();
                             fs.code_abc(OpCode::GETUPVAL, r, saved_upval_idx, 0);
