@@ -1260,9 +1260,12 @@ impl FuncState {
                     global_star_active = false;
                 }
             } else {
-                // non-global variable: stop searching for global declarations
-                // (in C, searchvar returns the local variable before checking globals)
-                break;
+                // non-global variable: like C's searchvar, check if name matches.
+                // If it matches, this is a local, not a global (return None).
+                // If it doesn't match, continue searching for global declarations.
+                if lv.name == name {
+                    return None;
+                }
             }
         }
         if global_star_active {
@@ -4037,97 +4040,6 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     }
                 };
                 PrefixResult { var_name: None, local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
-            } else if let Some(global_kind) = fs.find_global_decl(&name) {
-                eprintln!("DEBUG prefix_exp Name: {} found as global_decl", name);
-                // Found a global declaration (GDKREG or GDKCONST) for this name.
-                // Like C's buildvar: treat as _ENV[name] (buildglobal)
-                let is_readonly = global_kind == GDKCONST;
-                let is_env = name == "_ENV";
-                let k = if is_env { 0 } else { fs.string_k(&name) };
-                // Like C's buildglobal: singlevaraux(fs, "_ENV", ...) finds _ENV.
-                // _ENV can be a local (VLOCAL), a local const (VCONST), or an upvalue (VUPVAL).
-                // For VCONST, luaK_exp2anyregup discharges it to a register first.
-                if let Some(env_ctc) = fs.find_local_ctc("_ENV") {
-                    // _ENV is a compile-time constant (local _ENV <const> = ...).
-                    // Like C's luaK_exp2anyregup + luaK_indexed:
-                    // discharge the constant to a register, then use GETFIELD/SETFIELD.
-                    let env_r = fs.alloc_reg();
-                    match env_ctc.kind {
-                        ExpKind::Int => {
-                            let val = env_ctc.info;
-                            if fits_sbx(val) {
-                                fs.code_asbx(OpCode::LOADI, env_r, val as i32);
-                            } else {
-                                let kk = fs.int_k(val);
-                                fs.code_abx(OpCode::LOADK, env_r, kk);
-                            }
-                        }
-                        ExpKind::Float => {
-                            let f = f64::from_bits(env_ctc.info as u64);
-                            let fi = f as i64;
-                            if (fi as f64) == f && fits_sbx(fi) {
-                                fs.code_asbx(OpCode::LOADF, env_r, fi as i32);
-                            } else {
-                                let kk = fs.float_k(f);
-                                fs.code_abx(OpCode::LOADK, env_r, kk);
-                            }
-                        }
-                        ExpKind::Str => {
-                            let kk = fs.get_str_k(&env_ctc);
-                            fs.code_abx(OpCode::LOADK, env_r, kk);
-                        }
-                        ExpKind::Boolean => {
-                            if env_ctc.info != 0 {
-                                fs.code_abc(OpCode::LOADTRUE, env_r, 0, 0);
-                            } else {
-                                fs.code_abc(OpCode::LOADFALSE, env_r, 0, 0);
-                            }
-                        }
-                        ExpKind::Nil => {
-                            fs.code_nil(env_r, 1);
-                        }
-                        _ => {
-                            let kk = fs.discharge_str(&mut env_ctc.clone());
-                            fs.code_abx(OpCode::LOADK, env_r, kk);
-                        }
-                    }
-                    let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
-                        && (k as u32) <= crate::opcodes::MAXINDEXRK;
-                    if is_short_str {
-                        PrefixResult { var_name: Some(name.clone()), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(k), table_key_is_const: true, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
-                    } else {
-                        let kr = fs.alloc_reg();
-                        fs.code_abx(OpCode::LOADK, kr, k);
-                        PrefixResult { var_name: Some(name.clone()), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
-                    }
-                } else if let Some(env_reg) = fs.find_local("_ENV") {
-                    let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
-                        && (k as u32) <= crate::opcodes::MAXINDEXRK;
-                    if is_short_str {
-                        PrefixResult { var_name: Some(name.clone()), local_idx: None, key: None, reg: None, table_reg: Some(env_reg), table_key: Some(k), table_key_is_const: true, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
-                    } else {
-                        let env_r = fs.alloc_reg();
-                        fs.code_abc(OpCode::MOVE, env_r, env_reg, 0);
-                        let kr = fs.alloc_reg();
-                        fs.code_abx(OpCode::LOADK, kr, k);
-                        PrefixResult { var_name: Some(name.clone()), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
-                    }
-                } else {
-                    // _ENV is not a local or ctc: it must be an upvalue.
-                    // Like C's buildglobal calling singlevaraux(fs, "_ENV", ...),
-                    // call find_upvalue to create _ENV upvalue if it doesn't exist yet.
-                    // This ensures _ENV is registered as an upvalue in the correct order
-                    // (before any other upvalues created by subsequent variable accesses).
-                    let env_upval_idx = if is_env {
-                        0 // _ENV itself: use upvalue #0 (implicit in main, found above otherwise)
-                    } else {
-                        match fs.find_upvalue("_ENV") {
-                            Some(UpvalueOrCtc::Upvalue(idx)) => idx,
-                            _ => 0, // fallback: implicit _ENV at upvalue #0 (main function)
-                        }
-                    };
-                    PrefixResult { var_name: Some(name.clone()), local_idx: None, key: Some(k), reg: None, table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: is_env, upval_idx: Some(env_upval_idx), env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
-                }
             } else if let Some((reg, kind)) = fs.find_local_ex(&name) {
                 eprintln!("DEBUG prefix_exp Name: {} found as local_ex reg={}", name, reg);
                 let is_vvargvar = kind == RDKVAVAR;
@@ -4183,8 +4095,13 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     }
                 }
             } else {
+                // 全局变量（显式 global 声明或隐式全局）。
+                // 匹配 C 的 buildvar：先 singlevaraux 查找 local/upvalue（已在上面处理），
+                // 未找到则 buildglobal 通过 _ENV[name] 访问。
                 let is_env = name == "_ENV";
                 let k = if is_env { 0 } else { fs.string_k(&name) };
+                // 检查是否有 global <const> 声明（read-only）
+                let is_readonly = !is_env && fs.find_global_decl(&name) == Some(GDKCONST);
                 // Like C buildglobal: singlevaraux(fs, "_ENV", ...) finds _ENV.
                 // _ENV can be a local (VLOCAL), a local const (VCONST), or an upvalue (VUPVAL).
                 // For VCONST, luaK_exp2anyregup discharges it to a register first.
@@ -4235,24 +4152,24 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
                         && (k as u32) <= crate::opcodes::MAXINDEXRK;
                     if is_short_str {
-                        PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(k), table_key_is_const: true, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
+                        PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(k), table_key_is_const: true, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
                     } else {
                         let kr = fs.alloc_reg();
                         fs.code_abx(OpCode::LOADK, kr, k);
-                        PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
+                        PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
                     }
                 } else if let Some(env_reg) = fs.find_local("_ENV") {
                     let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
                         && (k as u32) <= crate::opcodes::MAXINDEXRK;
                     if is_short_str {
-                        PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: None, table_reg: Some(env_reg), table_key: Some(k), table_key_is_const: true, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
+                        PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: None, table_reg: Some(env_reg), table_key: Some(k), table_key_is_const: true, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
                     } else {
                         // _ENV is local but key is not short string: load _ENV into temp register
                         let env_r = fs.alloc_reg();
                         fs.code_abc(OpCode::MOVE, env_r, env_reg, 0);
                         let kr = fs.alloc_reg();
                         fs.code_abx(OpCode::LOADK, kr, k);
-                        PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
+                        PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
                     }
                 } else {
                     // _ENV is not a local: it must be an upvalue.
@@ -4262,7 +4179,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         Some(UpvalueOrCtc::Upvalue(idx)) => idx,
                         _ => 0, // fallback: implicit _ENV at upvalue #0
                     };
-                    PrefixResult { var_name: Some(name), local_idx: None, key: Some(k), reg: None, table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: is_env, upval_idx: if is_env { Some(env_upval_idx) } else { Some(env_upval_idx) }, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
+                    PrefixResult { var_name: Some(name), local_idx: None, key: Some(k), reg: None, table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: is_env, upval_idx: if is_env { Some(env_upval_idx) } else { Some(env_upval_idx) }, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
                 }
             };
 
@@ -7944,51 +7861,44 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
         Token::Name(name) => {
             let name = name.clone();
             fs.ls_mut().next();
-            // Check global declaration before local/upvalue, matching parse_prefix_exp.
-            // A name declared with `global` must be accessed via _ENV, not as an upvalue
-            // from the outer scope (e.g., when _ENV is a vararg parameter).
-            let is_global_decl = name != "_ENV" && fs.find_global_decl(&name).is_some();
+            // 匹配 C 的 buildvar：先 singlevaraux 查找 local/upvalue，
+            // 未找到则作为全局变量（显式 global 声明或隐式全局）通过 _ENV[name] 访问。
             if let Some(ctc) = fs.find_local_ctc(&name) {
                 eprintln!("DEBUG Name: {} found as ctc", name);
                 ctc
-            } else if !is_global_decl {
-                if let Some((reg, kind)) = fs.find_local_ex(&name) {
-                    eprintln!("DEBUG Name: {} found as local reg={}", name, reg);
-                    if kind == RDKVAVAR {
-                        ExpDesc::new(ExpKind::VVARGVAR, reg as i64)
-                    } else {
-                        ExpDesc::new(ExpKind::NonReloc, reg as i64)
-                    }
-                } else if let Some(result) = fs.find_upvalue(&name) {
-                    eprintln!("DEBUG Name: {} found as upvalue", name);
-                    match result {
-                        UpvalueOrCtc::Upvalue(upval_idx) => {
-                            // Like C's singlevar returning VUPVAL: delay GETUPVAL emission.
-                            // GETUPVAL is emitted when the value is needed (e.g., in expr_to_reg).
-                            ExpDesc { kind: ExpKind::Upval, info: upval_idx as i64, info2: 0, t: NO_JUMP, f: NO_JUMP, str_val: None }
-                        }
-                        UpvalueOrCtc::CtcConst(ctc) => ctc,
-                    }
-                } else if name == "_ENV" {
-                    if let Some(env_reg) = fs.find_local("_ENV") {
-                        ExpDesc::new(ExpKind::NonReloc, env_reg as i64)
-                    } else {
-                        // _ENV is an upvalue (not a local). Return ExpKind::Upval to delay
-                        // GETUPVAL emission, matching C's singlevar returning VUPVAL.
-                        // The LBracket/Dot handlers will emit GETUPVAL at the right time.
-                        // Use find_upvalue to get the correct upvalue index (not hardcoded 0).
-                        let env_idx = match fs.find_upvalue("_ENV") {
-                            Some(UpvalueOrCtc::Upvalue(idx)) => idx,
-                            _ => 0, // fallback: should not happen for _ENV
-                        };
-                        ExpDesc { kind: ExpKind::Upval, info: env_idx as i64, info2: 0, t: NO_JUMP, f: NO_JUMP, str_val: None }
-                    }
+            } else if let Some((reg, kind)) = fs.find_local_ex(&name) {
+                eprintln!("DEBUG Name: {} found as local reg={}", name, reg);
+                if kind == RDKVAVAR {
+                    ExpDesc::new(ExpKind::VVARGVAR, reg as i64)
                 } else {
-                    // implicit global via _ENV
-                    code_global_via_env(fs, &name)
+                    ExpDesc::new(ExpKind::NonReloc, reg as i64)
+                }
+            } else if let Some(result) = fs.find_upvalue(&name) {
+                eprintln!("DEBUG Name: {} found as upvalue", name);
+                match result {
+                    UpvalueOrCtc::Upvalue(upval_idx) => {
+                        // Like C's singlevar returning VUPVAL: delay GETUPVAL emission.
+                        // GETUPVAL is emitted when the value is needed (e.g., in expr_to_reg).
+                        ExpDesc { kind: ExpKind::Upval, info: upval_idx as i64, info2: 0, t: NO_JUMP, f: NO_JUMP, str_val: None }
+                    }
+                    UpvalueOrCtc::CtcConst(ctc) => ctc,
+                }
+            } else if name == "_ENV" {
+                if let Some(env_reg) = fs.find_local("_ENV") {
+                    ExpDesc::new(ExpKind::NonReloc, env_reg as i64)
+                } else {
+                    // _ENV is an upvalue (not a local). Return ExpKind::Upval to delay
+                    // GETUPVAL emission, matching C's singlevar returning VUPVAL.
+                    // The LBracket/Dot handlers will emit GETUPVAL at the right time.
+                    // Use find_upvalue to get the correct upvalue index (not hardcoded 0).
+                    let env_idx = match fs.find_upvalue("_ENV") {
+                        Some(UpvalueOrCtc::Upvalue(idx)) => idx,
+                        _ => 0, // fallback: should not happen for _ENV
+                    };
+                    ExpDesc { kind: ExpKind::Upval, info: env_idx as i64, info2: 0, t: NO_JUMP, f: NO_JUMP, str_val: None }
                 }
             } else {
-                // explicit global declaration: treat as _ENV[name]
+                // 全局变量（显式 global 声明或隐式全局）通过 _ENV[name] 访问
                 code_global_via_env(fs, &name)
             }
         }
