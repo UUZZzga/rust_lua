@@ -1584,6 +1584,35 @@ assert(a == 0)
     }
 
     #[test]
+    fn test_and_chain_jmp_debug() {
+        // Debug test for and chain JMP targets
+        assert_inst_match("local a,b,c,d; local x = a and b and c and d", None);
+        // With comparison (VJMP) as first operand
+        assert_inst_match("local a,b,c,d; local x = a <= b and c and d", None);
+        // Return with and chain
+        assert_inst_match("local a,b,c,d; local function f() return a and b and c and d end", None);
+        // Return with and chain and comparison
+        assert_inst_match("local a,b,c,d,e; local function f() return a <= b and c and d and e end", None);
+        // Return with and/or chain
+        assert_inst_match("local a,b,c,d,e; local function f() return a <= b and c and d and e or 1 end", None);
+        // More complex: and chain ending with false, then or true
+        assert_inst_match("local a,b,c,d,e; local function f() return a <= b and c and d and e and false or true end", None);
+        // With parameters (matching proto[12] pattern: LE + TEST + TEST + TEST)
+        assert_inst_match("local function f(a,b,c,d,e) return a <= b and c and d and e and false or true end", None);
+        // Matching constructs.lua proto[12]: not (a>=b or c or d and e or nil) with return 0/1
+        assert_inst_match("function g(a,b,c,d,e) if not (a>=b or c or d and e or nil) then return 0; else return 1; end end", None);
+    }
+
+    #[test]
+    fn test_or_band_debug() {
+        // Simple or + band: y or -1, then & 0xFFFFFFFF
+        assert_inst_match("local function f(x,y) return (x or -1) & 0xFFFFFFFF end", None);
+        assert_inst_match("local function f(x,y) return (y or -1) & 0xFFFFFFFF end", None);
+        // Both x or -1 and y or -1
+        assert_inst_match("local function f(x,y) return ((x or -1) & (y or -1)) & 0xFFFFFFFF end", None);
+    }
+
+    #[test]
     fn test_shr_reg_order() {
         // This tests the register allocation order in SHR expressions
         // Before fix: Rust generates ADDI 7 0 -1 (freereg=7), C generates ADDI 6 0 -1 (freereg=6)

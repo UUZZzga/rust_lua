@@ -1489,6 +1489,7 @@ impl FuncState {
     /// If NonReloc with jumps and reg >= nvarstack, resolve jumps to that register.
     /// Otherwise, use exp_to_next_reg (allocate new register).
     fn exp_to_reg(&mut self, e: &ExpDesc) -> i32 {
+        eprintln!("DEBUG exp_to_reg: kind={:?} info={} t={} f={}", e.kind, e.info, e.t, e.f);
         // Like C's luaK_exp2anyreg: dischargevars first, then check VNONRELOC
         // Call is like VNONRELOC after dischargevars (setoneret converts VCALL to VNONRELOC)
         if e.kind == ExpKind::NonReloc || e.kind == ExpKind::Call {
@@ -1592,6 +1593,7 @@ impl FuncState {
         if e.kind != ExpKind::VJMP && (e.t != NO_JUMP || e.f != NO_JUMP) {
             let need_f = self.need_value(e.f);
             let need_t = self.need_value(e.t);
+            eprintln!("DEBUG resolve_jumps: kind={:?} r={} t={} f={} need_f={} need_t={}", e.kind, r, e.t, e.f, need_f, need_t);
             let p_f;
             let p_t;
             if need_f || need_t {
@@ -1605,8 +1607,18 @@ impl FuncState {
                 p_t = NO_JUMP;
             }
             let final_pc = self.pc;
+            eprintln!("DEBUG resolve_jumps: final_pc={} patching f list {} to r={} p_f={}", final_pc, e.f, r, p_f);
             self.patch_list_aux(e.f, final_pc, r, p_f);
+            eprintln!("DEBUG resolve_jumps: patching t list {} to r={} p_t={}", e.t, r, p_t);
             self.patch_list_aux(e.t, final_pc, r, p_t);
+            // Debug: print TESTSET A after patching
+            if e.t != NO_JUMP {
+                let testset_pc = e.t - 1;
+                if testset_pc >= 0 && (testset_pc as usize) < self.proto.code.len() {
+                    let inst = self.proto.code[testset_pc as usize];
+                    eprintln!("DEBUG resolve_jumps: after patch, TESTSET at pc={} A={}", testset_pc, getarg_a(inst));
+                }
+            }
         }
     }
 
@@ -1657,15 +1669,19 @@ impl FuncState {
 
     fn patch_test_reg(&mut self, node: i32, reg: i32) -> bool {
         if node < 1 || (node as usize) >= self.proto.code.len() + 1 {
+            eprintln!("DEBUG patch_test_reg: node={} out of range, return false", node);
             return false;
         }
         let i = self.proto.code[(node - 1) as usize];
-        if get_opcode(i) != OpCode::TESTSET {
+        let op = get_opcode(i);
+        eprintln!("DEBUG patch_test_reg: node={} ctrl_inst_op={:?} reg={}", node, op, reg);
+        if op != OpCode::TESTSET {
             return false;
         }
         let b = getarg_b(i);
         let old_a = getarg_a(i);
         if reg != NO_REG as i32 && reg != b {
+            eprintln!("DEBUG patch_test_reg: setting A from {} to {} at pc={}", old_a, reg, node - 1);
             setarg(&mut self.proto.code[(node - 1) as usize], reg, POS_A, SIZE_A);
         } else {
             let k = testarg_k(i);
@@ -1679,8 +1695,10 @@ impl FuncState {
 
     fn patch_list_aux(&mut self, list: i32, vtarget: i32, reg: i32, dtarget: i32) {
         let mut cur = list;
+        eprintln!("DEBUG patch_list_aux: list={} vtarget={} reg={} dtarget={}", list, vtarget, reg, dtarget);
         while cur != NO_JUMP {
             let next = self.get_jump(cur);
+            eprintln!("DEBUG patch_list_aux: cur={} next={}", cur, next);
             if self.patch_test_reg(cur, reg) {
                 self.fix_jump(cur, vtarget, false);
             } else {
@@ -4358,10 +4376,8 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         && ei.exp.kind == ExpKind::Upval && !key_has_jumps
                     {
                         let pc = fs.code_abc(OpCode::GETUPVAL, 0, ei.exp.info as i32, 0);
-                        eprintln!("DEBUG prefix_exp: upval_key_placeholder_pc set, pc={}, upval_idx={}, saved_upval_idx={}", pc, ei.exp.info, saved_upval_idx);
                         Some(pc)
                     } else {
-                        eprintln!("DEBUG prefix_exp: upval_key_placeholder_pc NOT set, is_upvalue_table={}, getupval_emitted_before_key={}, kind={:?}", is_upvalue_table, getupval_emitted_before_key, ei.exp.kind);
                         None
                     };
                     let (kr, key_is_const, key_is_int) = if ei.exp.kind == ExpKind::Str {
@@ -4386,13 +4402,15 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         (ei.exp.info as i32, true, true)
                     } else if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc) && !ei.exp.has_jumps() && ei.exp.info2 < 0 {
                         (ei.exp.info as i32, false, false)
-                    } else if is_upvalue_table && upval_key_placeholder_pc.is_none()
+                    } else if is_upvalue_table
                         && !getupval_emitted_before_key
                         && matches!(ei.exp.kind, ExpKind::Upval | ExpKind::Relocable)
                         && !key_has_jumps
                     {
                         // For upvalue table + Upval/Relocable key: defer key register allocation
                         // until after table's GETUPVAL is emitted (matching C's luaK_indexed order).
+                        // Upval key: placeholder GETUPVAL already emitted, A will be patched later.
+                        // Relocable key: instruction already emitted, A will be patched later.
                         (-1, false, false)
                     } else {
                         (fs.exp_to_reg(&ei.exp), false, false)
@@ -4413,7 +4431,6 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         } else {
                             let r = fs.alloc_reg();
                             fs.code_abc(OpCode::GETUPVAL, r, saved_upval_idx, 0);
-                            eprintln!("DEBUG prefix_exp: table GETUPVAL emitted, pc={}, r={}, saved_upval_idx={}, freereg={}", fs.pc - 1, r, saved_upval_idx, fs.freereg);
                             (r, false, true)
                         }
                     } else {
@@ -4424,7 +4441,6 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         if let Some(pc) = upval_key_placeholder_pc {
                             let key_r = fs.alloc_reg();
                             fs.set_a(pc, key_r);
-                            eprintln!("DEBUG prefix_exp: deferred key resolved, pc={}, key_r={}, freereg={}", pc, key_r, fs.freereg);
                             (key_r, true)
                         } else {
                             let key_r = fs.exp_to_reg(&ei.exp);
@@ -4658,7 +4674,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         // or: goiffalse → jumponcond(cond=1) → TESTSET NO_REG r 0 true
                         fs.code_abc_k(OpCode::TESTSET, NO_REG as i32, r, 0, true);
                         let jmp_pc = fs.jump();
+                        eprintln!("DEBUG or: TESTSET+JMP at pc={}, jmp_pc={}, e_left.t before={}", jmp_pc - 1, jmp_pc, e_left.t);
                         fs.concat_jump(&mut e_left.t, jmp_pc);
+                        eprintln!("DEBUG or: e_left.t after={}", e_left.t);
                         let here = fs.pc;
                         fs.patch_false_jumps(e_left.f, here);
                         e_left.f = NO_JUMP;
@@ -5108,12 +5126,17 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 let val = v1_opt.unwrap() | v2_opt.unwrap();
                 e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
             } else {
-                let k_idx = match &e2.exp.kind {
-                    ExpKind::Int => {
-                        let k = fs.int_k(e2.exp.info);
-                        if k <= 255 { Some(k) } else { None }
+                // Like C's isSHint/isSCint: only use K variant if e2 has no jumps
+                let k_idx = if !e2.exp.has_jumps() {
+                    match &e2.exp.kind {
+                        ExpKind::Int => {
+                            let k = fs.int_k(e2.exp.info);
+                            if k <= 255 { Some(k) } else { None }
+                        }
+                        _ => None,
                     }
-                    _ => None,
+                } else {
+                    None
                 };
                 if let Some(k) = k_idx {
                     // BORK variant: like C's codebinK
@@ -5205,12 +5228,17 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 let val = v1_opt.unwrap() ^ v2_opt.unwrap();
                 e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
             } else {
-                let k_idx = match &e2.exp.kind {
-                    ExpKind::Int => {
-                        let k = fs.int_k(e2.exp.info);
-                        if k <= 255 { Some(k) } else { None }
+                // Like C's isSHint/isSCint: only use K variant if e2 has no jumps
+                let k_idx = if !e2.exp.has_jumps() {
+                    match &e2.exp.kind {
+                        ExpKind::Int => {
+                            let k = fs.int_k(e2.exp.info);
+                            if k <= 255 { Some(k) } else { None }
+                        }
+                        _ => None,
                     }
-                    _ => None,
+                } else {
+                    None
                 };
                 if let Some(k) = k_idx {
                     // BXORK variant: like C's codebinK
@@ -5302,12 +5330,17 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 let val = v1_opt.unwrap() & v2_opt.unwrap();
                 e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
             } else {
-                let k_idx = match &e2.exp.kind {
-                    ExpKind::Int => {
-                        let k = fs.int_k(e2.exp.info);
-                        if k <= 255 { Some(k) } else { None }
+                // Like C's isSHint/isSCint: only use K variant if e2 has no jumps
+                let k_idx = if !e2.exp.has_jumps() {
+                    match &e2.exp.kind {
+                        ExpKind::Int => {
+                            let k = fs.int_k(e2.exp.info);
+                            if k <= 255 { Some(k) } else { None }
+                        }
+                        _ => None,
                     }
-                    _ => None,
+                } else {
+                    None
                 };
                 if let Some(k) = k_idx {
                     // BANDK variant: like C's codebinK
@@ -5432,7 +5465,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         // Like C: don't alloc result reg, use VRELOC (info=0, info2=pc)
                         fs.code_abc_k(OpCode::MMBINI, v2, sc, 16, true);
                         e = ExprItem { exp: ExpDesc::new_reloc_with_pc(0, pc) };
-                    } else if matches!(e2.exp.kind, ExpKind::Int) && fits_sc(&e2.exp) && fits_sc_neg(e2.exp.info) {
+                    } else if matches!(e2.exp.kind, ExpKind::Int) && fits_sc(&e2.exp) && fits_sc_neg(e2.exp.info) && !e2.exp.has_jumps() {
                         // SHRI (for SHL): right operand is small constant, like C's finishbinexpneg
                         let v1 = if ec.has_jumps() {
                             let r = fs.exp_to_reg(&ec);
@@ -5530,7 +5563,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 };
                 e = ExprItem { exp: ExpDesc::new(ExpKind::Int, val) };
             } else {
-                if matches!(e2.exp.kind, ExpKind::Int) && fits_sc(&e2.exp) {
+                if matches!(e2.exp.kind, ExpKind::Int) && fits_sc(&e2.exp) && !e2.exp.has_jumps() {
                     // SHRI: right operand is small constant, like C's codebini(OP_SHRI, ..., flip=0)
                     // C's codebini calls finishbinexpval which compiles e1
                     let v1 = if ec.has_jumps() {
@@ -6934,17 +6967,22 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     }
                 }
                 _ => {
-                    let k_idx = match &e2.exp.kind {
-                        ExpKind::Int => {
-                            let k = fs.int_k(e2.exp.info);
-                            if k <= 255 { Some(k) } else { None }
+                    // Like C's isSHint/isSCint: only use K variant if e2 has no jumps
+                    let k_idx = if !e2.exp.has_jumps() {
+                        match &e2.exp.kind {
+                            ExpKind::Int => {
+                                let k = fs.int_k(e2.exp.info);
+                                if k <= 255 { Some(k) } else { None }
+                            }
+                            ExpKind::Float => {
+                                let f = f64::from_bits(e2.exp.info as u64);
+                                let k = fs.float_k(f);
+                                if k <= 255 { Some(k) } else { None }
+                            }
+                            _ => None,
                         }
-                        ExpKind::Float => {
-                            let f = f64::from_bits(e2.exp.info as u64);
-                            let k = fs.float_k(f);
-                            if k <= 255 { Some(k) } else { None }
-                        }
-                        _ => None,
+                    } else {
+                        None
                     };
                     if is_idiv {
                         if let Some(k) = k_idx {
@@ -7180,17 +7218,22 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 }
             }
             if pow_no_fold {
-                let k_idx = match &e2.exp.kind {
-                    ExpKind::Int => {
-                        let k = fs.int_k(e2.exp.info);
-                        if k <= 255 { Some(k) } else { None }
+                // Like C's isSHint/isSCint: only use K variant if e2 has no jumps
+                let k_idx = if !e2.exp.has_jumps() {
+                    match &e2.exp.kind {
+                        ExpKind::Int => {
+                            let k = fs.int_k(e2.exp.info);
+                            if k <= 255 { Some(k) } else { None }
+                        }
+                        ExpKind::Float => {
+                            let f = f64::from_bits(e2.exp.info as u64);
+                            let k = fs.float_k(f);
+                            if k <= 255 { Some(k) } else { None }
+                        }
+                        _ => None,
                     }
-                    ExpKind::Float => {
-                        let f = f64::from_bits(e2.exp.info as u64);
-                        let k = fs.float_k(f);
-                        if k <= 255 { Some(k) } else { None }
-                    }
-                    _ => None,
+                } else {
+                    None
                 };
                 if let Some(k) = k_idx {
                     // e2 is a K operand - like C's codebinK
@@ -8179,56 +8222,62 @@ fn parse_if_cond(fs: &mut FuncState, entry_freereg: i32) -> i32 {
         ei.exp.info = 0;
     }
 
-    let is_const_true = matches!(ei.exp.kind, ExpKind::Boolean) && ei.exp.info != 0;
+    // Like C's luaK_goiftrue: const true (VK/VKFLT/VKINT/VKSTR/VTRUE) → pc=NO_JUMP,
+    // but still concat f list and patch t list to here.
+    let is_const_true = matches!(ei.exp.kind, ExpKind::Boolean) && ei.exp.info != 0
+        || matches!(ei.exp.kind, ExpKind::Int | ExpKind::Float | ExpKind::Str);
 
     let mut if_jmp = NO_JUMP;
 
-    if !is_const_true {
-        if ei.exp.kind == ExpKind::VJMP {
-            let jmp_pc = ei.exp.info as i32;
-            fs.negate_condition(jmp_pc);
+    if is_const_true {
+        // Like C's luaK_goiftrue for VTRUE/VK: pc = NO_JUMP (no new jump).
+        // concat f with NO_JUMP (no-op), patch t list to here, return f.
+        fs.patch_true_jumps(ei.exp.t, fs.pc);
+        if_jmp = ei.exp.f;
+    } else if ei.exp.kind == ExpKind::VJMP {
+        let jmp_pc = ei.exp.info as i32;
+        fs.negate_condition(jmp_pc);
+        let mut false_list = ei.exp.f;
+        fs.concat_jump(&mut false_list, jmp_pc);
+        fs.patch_true_jumps(ei.exp.t, fs.pc);
+        if_jmp = false_list;
+    } else {
+        // Like C's jumponcond: check for VRELOC+NOT first
+        let is_not_vreloc = ei.exp.info2 >= 0
+            && (ei.exp.info2 as usize) < fs.proto.code.len()
+            && get_opcode(fs.proto.code[ei.exp.info2 as usize]) == OpCode::NOT
+            && matches!(ei.exp.kind, ExpKind::Relocable);
+
+        if is_not_vreloc {
+            // VRELOC+NOT: remove NOT, emit TEST with inverted condition
+            let not_inst = fs.proto.code[ei.exp.info2 as usize];
+            let b = getarg_b(not_inst);
+            fs.pc -= 1;
+            fs.proto.code.pop();
+            // goiftrue: cond=0, !cond=1 → k=true
+            fs.code_abc_k(OpCode::TEST, b, 0, 0, true);
+            let jmp_pc = fs.jump();
             let mut false_list = ei.exp.f;
             fs.concat_jump(&mut false_list, jmp_pc);
             fs.patch_true_jumps(ei.exp.t, fs.pc);
             if_jmp = false_list;
         } else {
-            // Like C's jumponcond: check for VRELOC+NOT first
-            let is_not_vreloc = ei.exp.info2 >= 0
-                && (ei.exp.info2 as usize) < fs.proto.code.len()
-                && get_opcode(fs.proto.code[ei.exp.info2 as usize]) == OpCode::NOT
-                && matches!(ei.exp.kind, ExpKind::Relocable);
-
-            if is_not_vreloc {
-                // VRELOC+NOT: remove NOT, emit TEST with inverted condition
-                let not_inst = fs.proto.code[ei.exp.info2 as usize];
-                let b = getarg_b(not_inst);
-                fs.pc -= 1;
-                fs.proto.code.pop();
-                // goiftrue: cond=0, !cond=1 → k=true
-                fs.code_abc_k(OpCode::TEST, b, 0, 0, true);
-                let jmp_pc = fs.jump();
-                let mut false_list = ei.exp.f;
-                fs.concat_jump(&mut false_list, jmp_pc);
-                fs.patch_true_jumps(ei.exp.t, fs.pc);
-                if_jmp = false_list;
-            } else {
-                // Like C's jumponcond default: discharge2anyreg + freeexp + TESTSET(NO_REG) + JMP
-                let pre_freereg = fs.freereg;
-                let r = fs.discharge_to_any_reg(&ei.exp);
-                // freeexp: free the register if it's a temp at top of stack
-                if r >= fs.nvarstack() && r == fs.freereg - 1 {
-                    fs.free_reg();
-                }
-                // goiftrue: cond=0 → k=false
-                fs.code_abc_k(OpCode::TESTSET, NO_REG as i32, r, 0, false);
-                let jmp_pc = fs.jump();
-                let mut false_list = ei.exp.f;
-                fs.concat_jump(&mut false_list, jmp_pc);
-                fs.patch_true_jumps(ei.exp.t, fs.pc);
-                if_jmp = false_list;
-                if fs.freereg > pre_freereg {
-                    fs.free_reg();
-                }
+            // Like C's jumponcond default: discharge2anyreg + freeexp + TESTSET(NO_REG) + JMP
+            let pre_freereg = fs.freereg;
+            let r = fs.discharge_to_any_reg(&ei.exp);
+            // freeexp: free the register if it's a temp at top of stack
+            if r >= fs.nvarstack() && r == fs.freereg - 1 {
+                fs.free_reg();
+            }
+            // goiftrue: cond=0 → k=false
+            fs.code_abc_k(OpCode::TESTSET, NO_REG as i32, r, 0, false);
+            let jmp_pc = fs.jump();
+            let mut false_list = ei.exp.f;
+            fs.concat_jump(&mut false_list, jmp_pc);
+            fs.patch_true_jumps(ei.exp.t, fs.pc);
+            if_jmp = false_list;
+            if fs.freereg > pre_freereg {
+                fs.free_reg();
             }
         }
     }
