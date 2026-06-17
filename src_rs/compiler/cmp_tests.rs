@@ -2541,4 +2541,55 @@ local function f(x)
 end
 "#, None);
     }
+
+    #[test]
+    fn debug_events_proto37() {
+        let source = std::fs::read_to_string("tests_lua/events.lua").unwrap();
+        let rust_proto = compile_rust(&source, None);
+        let c_func = unsafe { compile_c(&source) };
+        fn find_proto<'a>(p: &'a crate::objects::Proto, path: &str, target: &str) -> Option<&'a crate::objects::Proto> {
+            if path == target { return Some(p); }
+            for (i, sp) in p.protos.iter().enumerate() {
+                let sub_path = format!("{}/proto[{}]", path, i);
+                if let Some(found) = find_proto(sp, &sub_path, target) {
+                    return Some(found);
+                }
+            }
+            None
+        }
+        let rust_p37 = find_proto(&rust_proto, "main", "main/proto[37]").expect("proto[37] not found");
+        let c_p37 = &c_func.protos[37];
+        let mut out = String::new();
+        out.push_str("=== proto[37] ===\n");
+        out.push_str(&format!("Rust upvalues: {:?}\n", rust_p37.upvalues));
+        out.push_str(&format!("C upvalues: {:?}\n", c_p37.upvalues));
+        out.push_str(&format!("Rust num_params: {}, line: {}\n", rust_p37.num_params, rust_p37.line_defined));
+        out.push_str(&format!("C numparams: {}, flag: {}, line: {}\n", c_p37.numparams, c_p37.flag, c_p37.linedefined));
+        out.push_str(&format!("Rust instructions:\n{}\n", bytecode_dump::dump_instructions(&rust_p37.code)));
+        out.push_str(&format!("C instructions:\n{}\n", bytecode_dump::dump_c_instructions(&c_p37.code, &c_p37.constants)));
+        std::fs::write("/tmp/proto37_debug.txt", out).unwrap();
+    }
+
+    #[test]
+    fn debug_or_add_simple() {
+        // Simplified version of sort.lua proto[9]:
+        // function check(a, f)
+        //   f = f or function(x,y) return x<y end;
+        //   ...
+        // end
+        let source = "function check(a, f) f = f or function(x,y) return x<y end end";
+        let rust_proto = compile_rust(source, None);
+        let c_func = unsafe { compile_c(source) };
+        let mut out = String::new();
+        out.push_str("=== sort proto[9] simplified ===\n");
+        out.push_str(&format!("Rust has {} sub-protos\n", rust_proto.protos.len()));
+        if !rust_proto.protos.is_empty() {
+            let rust_p0 = &rust_proto.protos[0];
+            let c_p0 = &c_func.protos[0];
+            out.push_str(&format!("Rust proto[0] instructions:\n{}\n", bytecode_dump::dump_instructions(&rust_p0.code)));
+            out.push_str(&format!("C proto[0] instructions:\n{}\n", bytecode_dump::dump_c_instructions(&c_p0.code, &c_p0.constants)));
+        }
+        std::fs::write("/tmp/sort_debug.txt", out).unwrap();
+    }
+
 }
