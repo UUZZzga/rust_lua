@@ -2594,4 +2594,23 @@ end
         std::fs::write("/tmp/sort_debug.txt", out).unwrap();
     }
 
+    /// Simplified reproduction of db.lua proto[17] upvalue ordering issue:
+    /// _ENV must be upvalue #0, debug must be upvalue #1 (created after _ENV).
+    #[test]
+    fn test_env_upvalue_order_simple() {
+        // Child function accesses a global first (creating _ENV upvalue),
+        // then accesses parent's local (creating debug upvalue).
+        // _ENV must be upvalue #0, debug must be upvalue #1.
+        let source = "local debug = 1\nfunction f() collectgarbage() return debug end\n";
+        assert_inst_match(source, None);
+    }
+
+    /// Reproduction with global declaration (like db.lua proto[17]).
+    /// The global declaration must not prevent _ENV from being upvalue #0.
+    #[test]
+    fn test_env_upvalue_order_with_global_decl() {
+        let source = "local debug = 1\nfunction f() global collectgarbage; collectgarbage(); return debug end\n";
+        assert_inst_match(source, None);
+    }
+
 }
