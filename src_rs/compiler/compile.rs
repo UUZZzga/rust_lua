@@ -334,6 +334,7 @@ struct BlockEntry {
     is_function_body: bool, // true for the function body block (C's bl->previous==NULL)
     nactvar: i32,           // active variable count at block entry (like C's bl->nactvar)
     reglevel: i32,          // register level at block entry (like C's reglevel(fs, bl->nactvar))
+    insidetbc: bool,        // true if inside the scope of a to-be-closed var (inherited)
 }
 
 // ============================================================================
@@ -881,6 +882,7 @@ impl FuncState {
         if kind == RDKTOCLOSE {
             if let Some(blk) = self.block_stack.last_mut() {
                 blk.has_upval = true;
+                blk.insidetbc = true;  // like C's bl->insidetbc = 1
             }
             self.needclose = true;
         }
@@ -2264,7 +2266,7 @@ fn parse_chunk(fs: &mut FuncState) {
     let saved_ngotos = fs.gotos.len();
     let entry_nactvar = fs.active_nactvar();
     let entry_reglevel = fs.reglevel_for_nactvar(entry_nactvar);
-    fs.block_stack.push(BlockEntry { saved_nlocals, saved_ngotos, has_upval: false, is_function_body: true, nactvar: entry_nactvar, reglevel: entry_reglevel });
+    fs.block_stack.push(BlockEntry { saved_nlocals, saved_ngotos, has_upval: false, is_function_body: true, nactvar: entry_nactvar, reglevel: entry_reglevel, insidetbc: false });
 
     let is_last = block_follow(fs, true);
     if !is_last {
@@ -2302,7 +2304,8 @@ fn parse_block(fs: &mut FuncState) {
     let saved_ngotos = fs.gotos.len();
     let entry_nactvar = fs.active_nactvar();
     let entry_reglevel = fs.reglevel_for_nactvar(entry_nactvar);
-    fs.block_stack.push(BlockEntry { saved_nlocals, saved_ngotos, has_upval: false, is_function_body: false, nactvar: entry_nactvar, reglevel: entry_reglevel });
+    let parent_insidetbc = fs.block_stack.last().map(|b| b.insidetbc).unwrap_or(false);
+    fs.block_stack.push(BlockEntry { saved_nlocals, saved_ngotos, has_upval: false, is_function_body: false, nactvar: entry_nactvar, reglevel: entry_reglevel, insidetbc: parent_insidetbc });
 
     parse_chunk_stmts(fs);
 
@@ -3627,7 +3630,7 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
             // Like C's exp2reg: discharge2reg + patchlistaux (resolve jumps)
             if e.has_jumps() {
                 // Expression has jumps - must resolve them to target dest
-                if e.info2 > 0 {
+                if e.info2 >= 0 {
                     if e.kind == ExpKind::Call {
                         if e.info as i32 != dest {
                             fs.code_abc(OpCode::MOVE, dest, e.info as i32, 0);
@@ -3642,7 +3645,11 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
                         }
                         fs.resolve_jumps(e, dest);
                     }
-                } else if e.kind == ExpKind::NonReloc && e.info2 < 0 {
+                } else {
+                    // info2 < 0: expression is already in a register (like C's VNONRELOC).
+                    // This covers NonReloc, Call (already discharged), and Relocable with
+                    // info2 < 0 (e.g., CLOSURE result that was directly allocated to a reg).
+                    // Like C's exp2reg for VNONRELOC: MOVE if needed, then patchlistaux.
                     let val_reg = e.info as i32;
                     if dest != val_reg {
                         fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
@@ -3651,19 +3658,10 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
                         fs.free_reg();
                     }
                     fs.resolve_jumps(e, dest);
-                } else {
-                    let saved_freereg = fs.freereg;
-                    let val_reg = fs.exp_to_reg(e);
-                    if dest != val_reg {
-                        fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
-                    }
-                    if fs.freereg > saved_freereg || dest != val_reg {
-                        fs.free_reg();
-                    }
                 }
             } else {
-                // No jumps - original logic
-                if e.info2 > 0 {
+                // No jumps - original logic (same structure as above without resolve_jumps)
+                if e.info2 >= 0 {
                     if e.kind == ExpKind::Call {
                         if e.info as i32 != dest {
                             fs.code_abc(OpCode::MOVE, dest, e.info as i32, 0);
@@ -3676,21 +3674,13 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
                             fs.free_reg();
                         }
                     }
-                } else if e.kind == ExpKind::NonReloc && e.info2 < 0 {
+                } else {
+                    // info2 < 0: expression is already in a register (like C's VNONRELOC).
                     let val_reg = e.info as i32;
                     if dest != val_reg {
                         fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
                     }
                     if val_reg >= fs.nvarstack() && val_reg == fs.freereg - 1 {
-                        fs.free_reg();
-                    }
-                } else {
-                    let saved_freereg = fs.freereg;
-                    let val_reg = fs.exp_to_reg(e);
-                    if dest != val_reg {
-                        fs.code_abc(OpCode::MOVE, dest, val_reg, 0);
-                    }
-                    if fs.freereg > saved_freereg || dest != val_reg {
                         fs.free_reg();
                     }
                 }
@@ -7859,22 +7849,11 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     }
                 }
                 Token::Hash => {
-                    if ei.exp.kind == ExpKind::NonReloc && (ei.exp.info as i32) < fs.nvarstack() {
-                        let r = fs.alloc_reg();
-                        fs.code_abc(OpCode::LEN, r, ei.exp.info as i32, 0);
-                        ExpDesc::new(ExpKind::Relocable, r as i64)
-                    } else if ei.exp.kind == ExpKind::VVARGVAR {
-                        // VVARGVAR: like C's luaK_vapar2local, set PF_VATAB and allocate new register
-                        let src_reg = ei.exp.info as i32;
-                        fs.proto.flag |= PF_VATAB;
-                        let r = fs.alloc_reg();
-                        fs.code_abc(OpCode::LEN, r, src_reg, 0);
-                        ExpDesc::new(ExpKind::Relocable, r as i64)
-                    } else {
-                        let r = fs.exp_to_reg(&ei.exp);
-                        fs.code_abc(OpCode::LEN, r, r, 0);
-                        ExpDesc::new(ExpKind::Relocable, r as i64)
-                    }
+                    // Like C's codeunexpval: exp2anyreg + freeexp + codeABC(A=0) + VRELOC
+                    let r = fs.exp_to_reg(&ei.exp);
+                    fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
+                    let pc = fs.code_abc(OpCode::LEN, 0, r, 0);
+                    ExpDesc::new_reloc_with_pc(r as i64, pc)
                 }
                 Token::Tilde => {
                     if ei.exp.has_jumps() {
@@ -7886,6 +7865,19 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                         match ei.exp.kind {
                             ExpKind::Int => {
                                 ExpDesc::new(ExpKind::Int, !(ei.exp.info))
+                            }
+                            ExpKind::Float => {
+                                // Like C's constfolding: convert float to int, then BNOT
+                                let f = f64::from_bits(ei.exp.info as u64);
+                                let fi = f as i64;
+                                if (fi as f64) == f {
+                                    ExpDesc::new(ExpKind::Int, !fi)
+                                } else {
+                                    let r = fs.exp_to_reg(&ei.exp);
+                                    let pc = fs.code_abc(OpCode::BNOT, 0, r, 0);
+                                    fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
+                                    ExpDesc::new_reloc_with_pc(r as i64, pc)
+                                }
                             }
                             _ => {
                                 let r = fs.exp_to_reg(&ei.exp);
@@ -8479,7 +8471,8 @@ fn parse_while(fs: &mut FuncState) {
     let saved_ngotos = fs.gotos.len();
     let entry_nactvar = fs.active_nactvar();
     let entry_reglevel = fs.reglevel_for_nactvar(entry_nactvar);
-    fs.block_stack.push(BlockEntry { saved_nlocals, saved_ngotos, has_upval: false, is_function_body: false, nactvar: entry_nactvar, reglevel: entry_reglevel });
+    let parent_insidetbc = fs.block_stack.last().map(|b| b.insidetbc).unwrap_or(false);
+    fs.block_stack.push(BlockEntry { saved_nlocals, saved_ngotos, has_upval: false, is_function_body: false, nactvar: entry_nactvar, reglevel: entry_reglevel, insidetbc: parent_insidetbc });
     fs.set_freereg(entry_freereg);
 
     parse_block(fs);  // inner body block (like C's block(ls))
@@ -8543,7 +8536,8 @@ fn parse_repeat(fs: &mut FuncState) {
     let bl1_saved_ngotos = fs.gotos.len();
     let bl1_entry_nactvar = fs.active_nactvar();
     let bl1_entry_reglevel = fs.reglevel_for_nactvar(bl1_entry_nactvar);
-    fs.block_stack.push(BlockEntry { saved_nlocals: bl1_nlocals, saved_ngotos: bl1_saved_ngotos, has_upval: false, is_function_body: false, nactvar: bl1_entry_nactvar, reglevel: bl1_entry_reglevel });
+    let parent_insidetbc = fs.block_stack.last().map(|b| b.insidetbc).unwrap_or(false);
+    fs.block_stack.push(BlockEntry { saved_nlocals: bl1_nlocals, saved_ngotos: bl1_saved_ngotos, has_upval: false, is_function_body: false, nactvar: bl1_entry_nactvar, reglevel: bl1_entry_reglevel, insidetbc: parent_insidetbc });
 
     // Push bl2 (scope block, like C's enterblock with isloop=0)
     let bl2_nlocals = fs.locals.len();
@@ -8551,7 +8545,8 @@ fn parse_repeat(fs: &mut FuncState) {
     let bl2_saved_ngotos = fs.gotos.len();
     let bl2_entry_nactvar = fs.active_nactvar();
     let bl2_entry_reglevel = fs.reglevel_for_nactvar(bl2_entry_nactvar);
-    fs.block_stack.push(BlockEntry { saved_nlocals: bl2_nlocals, saved_ngotos: bl2_saved_ngotos, has_upval: false, is_function_body: false, nactvar: bl2_entry_nactvar, reglevel: bl2_entry_reglevel });
+    let parent_insidetbc = fs.block_stack.last().map(|b| b.insidetbc).unwrap_or(false);
+    fs.block_stack.push(BlockEntry { saved_nlocals: bl2_nlocals, saved_ngotos: bl2_saved_ngotos, has_upval: false, is_function_body: false, nactvar: bl2_entry_nactvar, reglevel: bl2_entry_reglevel, insidetbc: parent_insidetbc });
 
     fs.set_freereg(entry_freereg);
     parse_chunk_stmts(fs);  // Like C's statlist(ls)
@@ -8690,7 +8685,8 @@ fn parse_for(fs: &mut FuncState) {
         let forstat_saved_ngotos = fs.gotos.len();
         let forstat_entry_nactvar = fs.active_nactvar();
         let forstat_entry_reglevel = fs.reglevel_for_nactvar(forstat_entry_nactvar);
-        fs.block_stack.push(BlockEntry { saved_nlocals: forstat_nlocals, saved_ngotos: forstat_saved_ngotos, has_upval: false, is_function_body: false, nactvar: forstat_entry_nactvar, reglevel: forstat_entry_reglevel });
+        let parent_insidetbc = fs.block_stack.last().map(|b| b.insidetbc).unwrap_or(false);
+        fs.block_stack.push(BlockEntry { saved_nlocals: forstat_nlocals, saved_ngotos: forstat_saved_ngotos, has_upval: false, is_function_body: false, nactvar: forstat_entry_nactvar, reglevel: forstat_entry_reglevel, insidetbc: parent_insidetbc });
 
         fs.set_freereg(base);
         let ei = parse_expr(fs);
@@ -8744,7 +8740,8 @@ fn parse_for(fs: &mut FuncState) {
         let body_saved_ngotos = fs.gotos.len();
         let body_entry_nactvar = fs.active_nactvar();
         let body_entry_reglevel = fs.reglevel_for_nactvar(body_entry_nactvar);
-        fs.block_stack.push(BlockEntry { saved_nlocals: body_nlocals, saved_ngotos: body_saved_ngotos, has_upval: false, is_function_body: false, nactvar: body_entry_nactvar, reglevel: body_entry_reglevel });
+        let parent_insidetbc = fs.block_stack.last().map(|b| b.insidetbc).unwrap_or(false);
+        fs.block_stack.push(BlockEntry { saved_nlocals: body_nlocals, saved_ngotos: body_saved_ngotos, has_upval: false, is_function_body: false, nactvar: body_entry_nactvar, reglevel: body_entry_reglevel, insidetbc: parent_insidetbc });
 
         // Like C's adjustlocalvars(ls, nvars): activate loop variable INSIDE body block
         fs.add_local_kind_reg(&name, fs.pc, RDKCONST, base + 2);
@@ -8817,7 +8814,8 @@ fn parse_for(fs: &mut FuncState) {
         let forstat_saved_ngotos = fs.gotos.len();
         let forstat_entry_nactvar = fs.active_nactvar();
         let forstat_entry_reglevel = fs.reglevel_for_nactvar(forstat_entry_nactvar);
-        fs.block_stack.push(BlockEntry { saved_nlocals: forstat_nlocals, saved_ngotos: forstat_saved_ngotos, has_upval: false, is_function_body: false, nactvar: forstat_entry_nactvar, reglevel: forstat_entry_reglevel });
+        let parent_insidetbc = fs.block_stack.last().map(|b| b.insidetbc).unwrap_or(false);
+        fs.block_stack.push(BlockEntry { saved_nlocals: forstat_nlocals, saved_ngotos: forstat_saved_ngotos, has_upval: false, is_function_body: false, nactvar: forstat_entry_nactvar, reglevel: forstat_entry_reglevel, insidetbc: parent_insidetbc });
 
         // Like C's forlist: declare all variables, but only activate the 3 internal
         // ones before expression parsing. User-declared variables are activated inside
@@ -8920,7 +8918,8 @@ fn parse_for(fs: &mut FuncState) {
         let body_saved_ngotos = fs.gotos.len();
         let body_entry_nactvar = fs.active_nactvar();
         let body_entry_reglevel = fs.reglevel_for_nactvar(body_entry_nactvar);
-        fs.block_stack.push(BlockEntry { saved_nlocals: body_nlocals, saved_ngotos: body_saved_ngotos, has_upval: false, is_function_body: false, nactvar: body_entry_nactvar, reglevel: body_entry_reglevel });
+        let parent_insidetbc = fs.block_stack.last().map(|b| b.insidetbc).unwrap_or(false);
+        fs.block_stack.push(BlockEntry { saved_nlocals: body_nlocals, saved_ngotos: body_saved_ngotos, has_upval: false, is_function_body: false, nactvar: body_entry_nactvar, reglevel: body_entry_reglevel, insidetbc: parent_insidetbc });
 
         // Like C's adjustlocalvars(ls, nvars): activate user-declared variables INSIDE body block
         // Also assign registers to them (like C's luaK_reserveregs)
@@ -9378,8 +9377,10 @@ fn parse_local(fs: &mut FuncState) {
                 if let Some(reg) = fs.find_local(&names[i]) {
                     fs.code_abc(OpCode::TBC, reg, 0, 0);
                     // Like C's marktobeclosed(fs): mark current block as having upvalues
+                    // and insidetbc (inhibits tail calls)
                     if let Some(block) = fs.block_stack.last_mut() {
                         block.has_upval = true;
+                        block.insidetbc = true;
                     }
                     fs.needclose = true;
                     break;
@@ -9421,7 +9422,7 @@ fn parse_return(fs: &mut FuncState) {
             let call_pc = last_ei.exp.info2 as usize;
             setarg(&mut fs.proto.code[call_pc], 0, POS_C, SIZE_C);
             // Check for tail call
-            let has_tbc = fs.locals[first as usize..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
+            let has_tbc = fs.block_stack.last().map(|b| b.insidetbc).unwrap_or(false);
             if !has_tbc && nret == 1 {
                 SET_OPCODE(&mut fs.proto.code[call_pc], OpCode::TAILCALL);
             }
@@ -9441,8 +9442,8 @@ fn parse_return(fs: &mut FuncState) {
         let call_pc = ei.exp.info2 as usize;
         // Like C's luaK_setmultret: set CALL's C to 0 (LUA_MULTRET + 1)
         setarg(&mut fs.proto.code[call_pc], 0, POS_C, SIZE_C);
-        // Check for tail call: must be single return value and not inside a TBC block
-        let has_tbc = fs.locals[first as usize..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
+        // Check for tail call: must not be inside a TBC block (like C's !fs->bl->insidetbc)
+        let has_tbc = fs.block_stack.last().map(|b| b.insidetbc).unwrap_or(false);
         if !has_tbc {
             // Convert CALL to TAILCALL (like C's SET_OPCODE)
             SET_OPCODE(&mut fs.proto.code[call_pc], OpCode::TAILCALL);

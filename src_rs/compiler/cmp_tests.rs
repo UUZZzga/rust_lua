@@ -2577,17 +2577,19 @@ end
         //   f = f or function(x,y) return x<y end;
         //   ...
         // end
-        let source = "function check(a, f) f = f or function(x,y) return x<y end end";
+        let source = "function perm(s, n) n = n or #s end";
         let rust_proto = compile_rust(source, None);
         let c_func = unsafe { compile_c(source) };
         let mut out = String::new();
-        out.push_str("=== sort proto[9] simplified ===\n");
+        out.push_str("=== sort proto[10] simplified ===\n");
         out.push_str(&format!("Rust has {} sub-protos\n", rust_proto.protos.len()));
-        if !rust_proto.protos.is_empty() {
-            let rust_p0 = &rust_proto.protos[0];
-            let c_p0 = &c_func.protos[0];
-            out.push_str(&format!("Rust proto[0] instructions:\n{}\n", bytecode_dump::dump_instructions(&rust_p0.code)));
-            out.push_str(&format!("C proto[0] instructions:\n{}\n", bytecode_dump::dump_c_instructions(&c_p0.code, &c_p0.constants)));
+        out.push_str(&format!("Rust main instructions:\n{}\n", bytecode_dump::dump_instructions(&rust_proto.code)));
+        for (i, p) in rust_proto.protos.iter().enumerate() {
+            out.push_str(&format!("Rust proto[{}] instructions:\n{}\n", i, bytecode_dump::dump_instructions(&p.code)));
+        }
+        out.push_str(&format!("C main instructions:\n{}\n", bytecode_dump::dump_c_instructions(&c_func.code, &c_func.constants)));
+        for (i, p) in c_func.protos.iter().enumerate() {
+            out.push_str(&format!("C proto[{}] instructions:\n{}\n", i, bytecode_dump::dump_c_instructions(&p.code, &p.constants)));
         }
         std::fs::write("/tmp/sort_debug.txt", out).unwrap();
     }
