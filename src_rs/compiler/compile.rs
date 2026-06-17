@@ -2586,6 +2586,10 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
             key_reg: i32,    // register holding key constant (or -1)
         }
         let mut pre_evals: Vec<PreEvalInfo> = Vec::new();
+        // 检查 _ENV 是否是 VVARGVAR（命名 vararg 参数）
+        let env_local_ex = fs.find_local_ex("_ENV");
+        let env_is_vvargvar = env_local_ex.map(|(_, kind)| kind == RDKVAVAR).unwrap_or(false);
+        let env_reg = env_local_ex.map(|(reg, _)| reg).unwrap_or(-1);
         for i in 0..nvars {
             if !is_kstr(fs, var_k_names[i]) {
                 // Key is not a short string constant (index > MAXINDEXRK)
@@ -2595,6 +2599,12 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
                 let key_reg = fs.alloc_reg();
                 fs.code_abx(OpCode::LOADK, key_reg, var_k_names[i]);
                 pre_evals.push(PreEvalInfo { table_reg, key_reg });
+            } else if env_is_vvargvar {
+                // _ENV 是 VVARGVAR：预评估 key（LOADK），匹配 C 的 buildglobal
+                // （C 的 luaK_indexed 对 VVARGVAR 总是将 key 加载到寄存器）
+                let key_reg = fs.alloc_reg();
+                fs.code_abx(OpCode::LOADK, key_reg, var_k_names[i]);
+                pre_evals.push(PreEvalInfo { table_reg: env_reg, key_reg });
             } else {
                 pre_evals.push(PreEvalInfo { table_reg: -1, key_reg: -1 });
             }
@@ -2654,8 +2664,8 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
         // checkglobal then storevartop
         for i in (0..nvars).rev() {
             let pe = &pre_evals[i];
-            if pe.table_reg >= 0 {
-                // Key was pre-evaluated: checkglobal re-loads _ENV + key (like C's
+            if pe.table_reg >= 0 && !env_is_vvargvar {
+                // Key was pre-evaluated (not VVARGVAR): checkglobal re-loads _ENV + key (like C's
                 // checkglobal which calls buildglobal again), then storevartop uses
                 // the pre-evaluated registers for SETTABLE.
                 // checkglobal: GETUPVAL + LOADK + GETTABLE + ERRNNIL
@@ -2674,6 +2684,30 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
                 fs.free_reg(); // val_reg
                 fs.free_reg(); // key_reg
                 fs.free_reg(); // table_reg
+            } else if env_is_vvargvar {
+                // _ENV 是 VVARGVAR：checkglobal 使用 LOADK + GETVARG + ERRNNIL
+                // （GETVARG 会被 luaK_finish 转为 GETTABLE，因为有 PF_VATAB）
+                // storevartop 使用 SETTABLE + PF_VATAB
+                let kr = fs.alloc_reg();
+                fs.code_abx(OpCode::LOADK, kr, var_k_names[i]);
+                // Free key register (like C's freeregs in VVARGIND discharge)
+                if kr >= fs.nvarstack() && kr == fs.freereg - 1 {
+                    fs.free_reg();
+                }
+                // Generate GETVARG with A=0 (relocatable), like C compiler
+                let pc = fs.code_abc(OpCode::GETVARG, 0, env_reg, kr);
+                // Allocate result register (reuses kr)
+                let cr = fs.alloc_reg();
+                fs.set_a(pc, cr);
+                let k_bx = if var_k_names[i] >= crate::opcodes::MAXARG_BX as i32 { 0 } else { var_k_names[i] + 1 };
+                fs.code_abx(OpCode::ERRNNIL, cr, k_bx);
+                fs.free_reg(); // cr
+                // storevartop: SETTABLE + PF_VATAB (like C's needvatab for VVARGIND)
+                fs.proto.flag |= PF_VATAB;
+                let val_reg = fs.freereg - 1;
+                fs.code_abc_k(OpCode::SETTABLE, env_reg, pe.key_reg, val_reg, false);
+                fs.free_reg(); // val_reg
+                fs.free_reg(); // key_reg
             } else {
                 // Key is a Kstr: use the simpler checkglobal + code_settabup path
                 checkglobal(fs, &names[i], 0);
@@ -4091,9 +4125,12 @@ fn code_global_via_env_prefix(fs: &mut FuncState, name: &str) -> PrefixResult {
             // _ENV 是命名 vararg 参数（VVARGVAR）：键必须在寄存器中。
             // 匹配 C 的 luaK_indexed：对 VVARGVAR 调用 luaK_exp2anyreg 强制键到寄存器，
             // 使用 SETTABLE/GETTABLE 而非 SETFIELD/GETFIELD。
+            // is_vvargvar: true 让赋值时设置 PF_VATAB，这样：
+            // 1. GETVARG 会被 luaK_finish 转为 GETTABLE
+            // 2. RETURN1 不会被转为 RETURN（PF_VAHID 被清除）
             let kr = fs.alloc_reg();
             fs.code_abx(OpCode::LOADK, kr, k);
-            PrefixResult { var_name: Some(name.to_string()), local_idx: None, key: None, reg: None, table_reg: Some(env_reg), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: false, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
+            PrefixResult { var_name: Some(name.to_string()), local_idx: None, key: None, reg: None, table_reg: Some(env_reg), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: false, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: true, is_readonly }
         } else {
             let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
                 && (k as u32) <= crate::opcodes::MAXINDEXRK;
@@ -7816,14 +7853,20 @@ fn code_global_via_env(fs: &mut FuncState, name: &str) -> ExpDesc {
         let is_vvargvar = kind == RDKVAVAR;
         if is_vvargvar {
             // _ENV 是命名 vararg 参数（VVARGVAR）：键必须在寄存器中。
-            // 匹配 C 的 luaK_indexed：对 VVARGVAR 调用 luaK_exp2anyreg 强制键到寄存器，
-            // 使用 GETTABLE 而非 GETFIELD。
+            // 匹配 C 的 luaK_indexed + VVARGIND discharge：
+            // 1. LOADK 加载键到 kr
+            // 2. 释放 kr（freeregs）
+            // 3. 生成 GETVARG A=0（VRELOC），后续 exp_to_reg 会复用 kr 并 patch A
+            // 4. luaK_finish 将 GETVARG 转为 GETTABLE（因为有 PF_VATAB）
             let kr = fs.alloc_reg();
             fs.code_abx(OpCode::LOADK, kr, k);
-            let r = fs.alloc_reg();
-            let pc = fs.code_abc(OpCode::GETTABLE, r, env_reg, kr);
-            fs.free_reg(); // free kr
-            (r, pc)
+            // Free key register (like C's freeregs in VVARGIND discharge)
+            if kr >= fs.nvarstack() && kr == fs.freereg - 1 {
+                fs.free_reg();
+            }
+            // Generate GETVARG with A=0 (relocatable), like C compiler
+            let pc = fs.code_abc(OpCode::GETVARG, 0, env_reg, kr);
+            return ExpDesc::new_reloc_with_pc(kr as i64, pc);
         } else if is_short_str {
             // _ENV is a local variable in current function: use GETFIELD
             let r = fs.alloc_reg();

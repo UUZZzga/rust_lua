@@ -1800,6 +1800,41 @@ end"#,
         assert_inst_match("local function f(...t) return t end", None);
     }
 
+    // ===== ..._ENV 命名 vararg 参数作为 _ENV 的测试 =====
+    // 以下测试覆盖 _ENV 是 VVARGVAR 时全局变量访问的正确处理：
+    // - code_global_via_env 的 VVARGVAR 分支应复用 kr 寄存器（GETVARG A=0 + VRELOC）
+    // - code_global_via_env_prefix 的 VVARGVAR 分支应返回 is_vvargvar: true（设置 PF_VATAB）
+    // - globalnames 应在 _ENV 是 VVARGVAR 时使用 GETTABLE/SETTABLE + PF_VATAB
+    // - luaK_finish 将 GETVARG 转为 GETTABLE，RETURN1 不被转为 RETURN
+
+    #[test]
+    fn test_named_vararg_env_global_assign_and_read() {
+        // _ENV 作为命名 vararg 参数，全局变量赋值后读取
+        // 对应 vararg.lua proto[16]:
+        //   local function aux (..._ENV)
+        //     global a; a = 10
+        //     return a
+        //   end
+        // 修复前：Rust 生成 GETTABLE 2 0 1（多分配寄存器），C 生成 GETTABLE 1 0 1
+        // 修复后：Rust 复用 kr 寄存器，生成 GETTABLE 1 0 1
+        let source = "local function aux (..._ENV) global a; a = 10 return a end";
+        assert_inst_match(source, None);
+    }
+
+    #[test]
+    fn test_named_vararg_env_global_init() {
+        // _ENV 作为命名 vararg 参数，global 声明带初始化
+        // 对应 vararg.lua proto[17]:
+        //   local function aux (... _ENV)
+        //     global a = 10
+        //     return a
+        //   end
+        // 修复前：Rust 使用 GETTABUP/SETTABUP（错误），C 使用 GETTABLE/SETTABLE
+        // 修复后：Rust 使用 GETTABLE/SETTABLE + PF_VATAB
+        let source = "local function aux (... _ENV) global a = 10 return a end";
+        assert_inst_match(source, None);
+    }
+
     #[test]
     fn debug_global_const_star() {
         // Test: local _ENV should make _ENV a local variable, causing GETFIELD instead of GETTABUP
