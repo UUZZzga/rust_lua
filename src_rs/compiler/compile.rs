@@ -1276,6 +1276,31 @@ impl FuncState {
         }
     }
 
+    /// 只查找具名 global 声明（如 `global a`），不包含 collective `global *`。
+    /// 匹配 C 的 searchvar：具名 global 匹配时立即返回 VGLOBAL，优先于 upvalue 查找。
+    /// 而 `global *` 只记录不返回，upvalue 查找优先。
+    fn find_named_global_decl(&self, name: &str) -> Option<i32> {
+        for lv in self.locals.iter().rev() {
+            if !lv.active { continue; }
+            if lv.kind >= GDKREG {
+                if lv.name == "(global *)" {
+                    // collective declaration: skip (handled by find_global_decl)
+                    continue;
+                } else if lv.name == name {
+                    // named global declaration matches
+                    return Some(lv.kind);
+                }
+                // named global non-match: continue
+            } else {
+                // non-global variable: if name matches, it's a local, not a global
+                if lv.name == name {
+                    return None;
+                }
+            }
+        }
+        None
+    }
+
     /// 获取当前标签位置（即下一个指令的 pc）
     fn get_label(&self) -> i32 {
         self.pc
@@ -3996,6 +4021,105 @@ struct PrefixResult {
     is_readonly: bool,
 }
 
+/// 生成通过 _ENV[name] 访问全局变量的 PrefixResult。
+/// 匹配 C 的 buildglobal：_ENV 可以是 local、local const (CTC) 或 upvalue。
+/// 用于具名 global 声明（如 `global a`）、collective `global *` 和隐式全局。
+fn code_global_via_env_prefix(fs: &mut FuncState, name: &str) -> PrefixResult {
+    let is_env = name == "_ENV";
+    let k = if is_env { 0 } else { fs.string_k(name) };
+    // 检查是否有 global <const> 声明（read-only）
+    let is_readonly = !is_env && fs.find_global_decl(name) == Some(GDKCONST);
+    // Like C buildglobal: singlevaraux(fs, "_ENV", ...) finds _ENV.
+    // _ENV can be a local (VLOCAL), a local const (VCONST), or an upvalue (VUPVAL).
+    // For VCONST, luaK_exp2anyregup discharges it to a register first.
+    if let Some(env_ctc) = fs.find_local_ctc("_ENV") {
+        // _ENV is a compile-time constant (local _ENV <const> = ...).
+        // Like C's luaK_exp2anyregup + luaK_indexed:
+        // discharge the constant to a register, then use GETFIELD/SETFIELD.
+        let env_r = fs.alloc_reg();
+        match env_ctc.kind {
+            ExpKind::Int => {
+                let val = env_ctc.info;
+                if fits_sbx(val) {
+                    fs.code_asbx(OpCode::LOADI, env_r, val as i32);
+                } else {
+                    let kk = fs.int_k(val);
+                    fs.code_abx(OpCode::LOADK, env_r, kk);
+                }
+            }
+            ExpKind::Float => {
+                let f = f64::from_bits(env_ctc.info as u64);
+                let fi = f as i64;
+                if (fi as f64) == f && fits_sbx(fi) {
+                    fs.code_asbx(OpCode::LOADF, env_r, fi as i32);
+                } else {
+                    let kk = fs.float_k(f);
+                    fs.code_abx(OpCode::LOADK, env_r, kk);
+                }
+            }
+            ExpKind::Str => {
+                let kk = fs.get_str_k(&env_ctc);
+                fs.code_abx(OpCode::LOADK, env_r, kk);
+            }
+            ExpKind::Boolean => {
+                if env_ctc.info != 0 {
+                    fs.code_abc(OpCode::LOADTRUE, env_r, 0, 0);
+                } else {
+                    fs.code_abc(OpCode::LOADFALSE, env_r, 0, 0);
+                }
+            }
+            ExpKind::Nil => {
+                fs.code_nil(env_r, 1);
+            }
+            _ => {
+                let kk = fs.discharge_str(&mut env_ctc.clone());
+                fs.code_abx(OpCode::LOADK, env_r, kk);
+            }
+        }
+        let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
+            && (k as u32) <= crate::opcodes::MAXINDEXRK;
+        if is_short_str {
+            PrefixResult { var_name: Some(name.to_string()), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(k), table_key_is_const: true, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
+        } else {
+            let kr = fs.alloc_reg();
+            fs.code_abx(OpCode::LOADK, kr, k);
+            PrefixResult { var_name: Some(name.to_string()), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
+        }
+    } else if let Some((env_reg, kind)) = fs.find_local_ex("_ENV") {
+        let is_vvargvar = kind == RDKVAVAR;
+        if is_vvargvar {
+            // _ENV 是命名 vararg 参数（VVARGVAR）：键必须在寄存器中。
+            // 匹配 C 的 luaK_indexed：对 VVARGVAR 调用 luaK_exp2anyreg 强制键到寄存器，
+            // 使用 SETTABLE/GETTABLE 而非 SETFIELD/GETFIELD。
+            let kr = fs.alloc_reg();
+            fs.code_abx(OpCode::LOADK, kr, k);
+            PrefixResult { var_name: Some(name.to_string()), local_idx: None, key: None, reg: None, table_reg: Some(env_reg), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: false, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
+        } else {
+            let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
+                && (k as u32) <= crate::opcodes::MAXINDEXRK;
+            if is_short_str {
+                PrefixResult { var_name: Some(name.to_string()), local_idx: None, key: None, reg: None, table_reg: Some(env_reg), table_key: Some(k), table_key_is_const: true, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
+            } else {
+                // _ENV is local but key is not short string: load _ENV into temp register
+                let env_r = fs.alloc_reg();
+                fs.code_abc(OpCode::MOVE, env_r, env_reg, 0);
+                let kr = fs.alloc_reg();
+                fs.code_abx(OpCode::LOADK, kr, k);
+                PrefixResult { var_name: Some(name.to_string()), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
+            }
+        }
+    } else {
+        // _ENV is not a local: it must be an upvalue.
+        // Register _ENV as an upvalue first (like C's singlevaraux searching for _ENV),
+        // so it gets the correct upvalue index before any user upvalues are created.
+        let env_upval_idx = match fs.find_upvalue("_ENV") {
+            Some(UpvalueOrCtc::Upvalue(idx)) => idx,
+            _ => 0, // fallback: implicit _ENV at upvalue #0
+        };
+        PrefixResult { var_name: Some(name.to_string()), local_idx: None, key: Some(k), reg: None, table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: is_env, upval_idx: if is_env { Some(env_upval_idx) } else { Some(env_upval_idx) }, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
+    }
+}
+
 /// ANTLR4: `prefixexp: varOrExp | functioncall | '(' expr ')' ;` 以及 `var: NAME | prefixexp '[' expr ']' | prefixexp '.' NAME ;`
 fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
     match &fs.ls().token {
@@ -4044,6 +4168,11 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                 eprintln!("DEBUG prefix_exp Name: {} found as local_ex reg={}", name, reg);
                 let is_vvargvar = kind == RDKVAVAR;
                 PrefixResult { var_name: None, local_idx: Some(reg), key: None, reg: Some(reg), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar, is_readonly: false }
+            } else if fs.find_named_global_decl(&name).is_some() {
+                // 具名 global 声明（如 `global a`）：优先于 upvalue，通过 _ENV[name] 访问。
+                // 匹配 C 的 searchvar：具名 global 匹配时立即返回 VGLOBAL，优先于 upvalue 查找。
+                eprintln!("DEBUG prefix_exp Name: {} found as named global", name);
+                code_global_via_env_prefix(fs, &name)
             } else if let Some(result) = fs.find_upvalue(&name) {
                 eprintln!("DEBUG prefix_exp Name: {} found as upvalue", name);
                 match result {
@@ -4095,92 +4224,10 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     }
                 }
             } else {
-                // 全局变量（显式 global 声明或隐式全局）。
+                // 全局变量（collective `global *` 或隐式全局）通过 _ENV[name] 访问。
                 // 匹配 C 的 buildvar：先 singlevaraux 查找 local/upvalue（已在上面处理），
                 // 未找到则 buildglobal 通过 _ENV[name] 访问。
-                let is_env = name == "_ENV";
-                let k = if is_env { 0 } else { fs.string_k(&name) };
-                // 检查是否有 global <const> 声明（read-only）
-                let is_readonly = !is_env && fs.find_global_decl(&name) == Some(GDKCONST);
-                // Like C buildglobal: singlevaraux(fs, "_ENV", ...) finds _ENV.
-                // _ENV can be a local (VLOCAL), a local const (VCONST), or an upvalue (VUPVAL).
-                // For VCONST, luaK_exp2anyregup discharges it to a register first.
-                if let Some(env_ctc) = fs.find_local_ctc("_ENV") {
-                    // _ENV is a compile-time constant (local _ENV <const> = ...).
-                    // Like C's luaK_exp2anyregup + luaK_indexed:
-                    // discharge the constant to a register, then use GETFIELD/SETFIELD.
-                    let env_r = fs.alloc_reg();
-                    match env_ctc.kind {
-                        ExpKind::Int => {
-                            let val = env_ctc.info;
-                            if fits_sbx(val) {
-                                fs.code_asbx(OpCode::LOADI, env_r, val as i32);
-                            } else {
-                                let kk = fs.int_k(val);
-                                fs.code_abx(OpCode::LOADK, env_r, kk);
-                            }
-                        }
-                        ExpKind::Float => {
-                            let f = f64::from_bits(env_ctc.info as u64);
-                            let fi = f as i64;
-                            if (fi as f64) == f && fits_sbx(fi) {
-                                fs.code_asbx(OpCode::LOADF, env_r, fi as i32);
-                            } else {
-                                let kk = fs.float_k(f);
-                                fs.code_abx(OpCode::LOADK, env_r, kk);
-                            }
-                        }
-                        ExpKind::Str => {
-                            let kk = fs.get_str_k(&env_ctc);
-                            fs.code_abx(OpCode::LOADK, env_r, kk);
-                        }
-                        ExpKind::Boolean => {
-                            if env_ctc.info != 0 {
-                                fs.code_abc(OpCode::LOADTRUE, env_r, 0, 0);
-                            } else {
-                                fs.code_abc(OpCode::LOADFALSE, env_r, 0, 0);
-                            }
-                        }
-                        ExpKind::Nil => {
-                            fs.code_nil(env_r, 1);
-                        }
-                        _ => {
-                            let kk = fs.discharge_str(&mut env_ctc.clone());
-                            fs.code_abx(OpCode::LOADK, env_r, kk);
-                        }
-                    }
-                    let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
-                        && (k as u32) <= crate::opcodes::MAXINDEXRK;
-                    if is_short_str {
-                        PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(k), table_key_is_const: true, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
-                    } else {
-                        let kr = fs.alloc_reg();
-                        fs.code_abx(OpCode::LOADK, kr, k);
-                        PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
-                    }
-                } else if let Some(env_reg) = fs.find_local("_ENV") {
-                    let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
-                        && (k as u32) <= crate::opcodes::MAXINDEXRK;
-                    if is_short_str {
-                        PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: None, table_reg: Some(env_reg), table_key: Some(k), table_key_is_const: true, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
-                    } else {
-                        // _ENV is local but key is not short string: load _ENV into temp register
-                        let env_r = fs.alloc_reg();
-                        fs.code_abc(OpCode::MOVE, env_r, env_reg, 0);
-                        let kr = fs.alloc_reg();
-                        fs.code_abx(OpCode::LOADK, kr, k);
-                        PrefixResult { var_name: Some(name), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
-                    }
-                } else {
-                    // _ENV is not a local: it must be an upvalue.
-                    // Register _ENV as an upvalue first (like C's singlevaraux searching for _ENV),
-                    // so it gets the correct upvalue index before any user upvalues are created.
-                    let env_upval_idx = match fs.find_upvalue("_ENV") {
-                        Some(UpvalueOrCtc::Upvalue(idx)) => idx,
-                        _ => 0, // fallback: implicit _ENV at upvalue #0
-                    };
-                    PrefixResult { var_name: Some(name), local_idx: None, key: Some(k), reg: None, table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: is_env, upval_idx: if is_env { Some(env_upval_idx) } else { Some(env_upval_idx) }, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
-                }
+                code_global_via_env_prefix(fs, &name)
             };
 
             loop {
@@ -7758,16 +7805,27 @@ fn code_global_via_env(fs: &mut FuncState, name: &str) -> ExpDesc {
     // Like C's singlevar + luaK_indexed: resolve _ENV as local, upvalue, or implicit
     let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
         && (k as u32) <= crate::opcodes::MAXINDEXRK;
-    let env_local = fs.find_local("_ENV");
-    let env_upval = if env_local.is_none() {
+    let env_local_ex = fs.find_local_ex("_ENV");
+    let env_upval = if env_local_ex.is_none() {
         match fs.find_upvalue("_ENV") {
             Some(UpvalueOrCtc::Upvalue(idx)) => Some(idx),
             _ => None,
         }
     } else { None };
-    let (r, pc) = if let Some(env_reg) = env_local {
-        // _ENV is a local variable in current function: use GETFIELD
-        if is_short_str {
+    let (r, pc) = if let Some((env_reg, kind)) = env_local_ex {
+        let is_vvargvar = kind == RDKVAVAR;
+        if is_vvargvar {
+            // _ENV 是命名 vararg 参数（VVARGVAR）：键必须在寄存器中。
+            // 匹配 C 的 luaK_indexed：对 VVARGVAR 调用 luaK_exp2anyreg 强制键到寄存器，
+            // 使用 GETTABLE 而非 GETFIELD。
+            let kr = fs.alloc_reg();
+            fs.code_abx(OpCode::LOADK, kr, k);
+            let r = fs.alloc_reg();
+            let pc = fs.code_abc(OpCode::GETTABLE, r, env_reg, kr);
+            fs.free_reg(); // free kr
+            (r, pc)
+        } else if is_short_str {
+            // _ENV is a local variable in current function: use GETFIELD
             let r = fs.alloc_reg();
             let pc = code_getfield(fs, r, env_reg, k);
             (r, pc)
@@ -7861,8 +7919,11 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
         Token::Name(name) => {
             let name = name.clone();
             fs.ls_mut().next();
-            // 匹配 C 的 buildvar：先 singlevaraux 查找 local/upvalue，
-            // 未找到则作为全局变量（显式 global 声明或隐式全局）通过 _ENV[name] 访问。
+            // 匹配 C 的 buildvar/searchvar：
+            // 1. 查找 local（包括 CTC）
+            // 2. 查找具名 global 声明（如 `global a`），优先于 upvalue
+            // 3. 查找 upvalue（`global *` 不阻止 upvalue 查找）
+            // 4. 未找到则作为全局变量（`global *` 或隐式全局）通过 _ENV[name] 访问
             if let Some(ctc) = fs.find_local_ctc(&name) {
                 eprintln!("DEBUG Name: {} found as ctc", name);
                 ctc
@@ -7873,6 +7934,10 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 } else {
                     ExpDesc::new(ExpKind::NonReloc, reg as i64)
                 }
+            } else if let Some(_kind) = fs.find_named_global_decl(&name) {
+                // 具名 global 声明（如 `global a`）：优先于 upvalue，通过 _ENV[name] 访问
+                eprintln!("DEBUG Name: {} found as named global", name);
+                code_global_via_env(fs, &name)
             } else if let Some(result) = fs.find_upvalue(&name) {
                 eprintln!("DEBUG Name: {} found as upvalue", name);
                 match result {
@@ -7898,7 +7963,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     ExpDesc { kind: ExpKind::Upval, info: env_idx as i64, info2: 0, t: NO_JUMP, f: NO_JUMP, str_val: None }
                 }
             } else {
-                // 全局变量（显式 global 声明或隐式全局）通过 _ENV[name] 访问
+                // 全局变量（`global *` 或隐式全局）通过 _ENV[name] 访问
                 code_global_via_env(fs, &name)
             }
         }
@@ -9789,6 +9854,13 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                     if let Some(prev) = last_list_exp.take() {
                         fs.exp_to_next_reg(&prev);
                         tostore += 1;
+                        // Flush SETLIST if tostore >= maxtostore (like C's closelistfield)
+                        if tostore >= maxtostore {
+                            fs.code_abc(OpCode::SETLIST, table_r, tostore, need_array);
+                            need_array += tostore;
+                            tostore = 0;
+                            fs.set_freereg(table_r + 1);
+                        }
                     }
                     last_list_exp = Some(parse_expr(fs).exp);
                 }
@@ -9796,6 +9868,13 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                 if let Some(prev) = last_list_exp.take() {
                     fs.exp_to_next_reg(&prev);
                     tostore += 1;
+                    // Flush SETLIST if tostore >= maxtostore (like C's closelistfield)
+                    if tostore >= maxtostore {
+                        fs.code_abc(OpCode::SETLIST, table_r, tostore, need_array);
+                        need_array += tostore;
+                        tostore = 0;
+                        fs.set_freereg(table_r + 1);
+                    }
                 }
                 last_list_exp = Some(parse_expr(fs).exp);
             }
