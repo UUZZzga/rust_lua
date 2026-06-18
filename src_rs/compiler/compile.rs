@@ -296,6 +296,7 @@ struct LocalVar {
     ctc_str: Option<String>,
     vidx: i32,  // variable index at declaration time (like C's vidx = nactvar at declaration)
     nactvar: i32, // compact active variable count at declaration time (like C's fs->nactvar)
+    pidx: i32,  // index into proto.locvars (-1 if no debug info, like C's vd.pidx)
 }
 
 /// Result of searching for a variable in parent/grandparent scope.
@@ -365,6 +366,8 @@ pub struct FuncState {
     lasttarget: i32,
     block_stack: Vec<BlockEntry>,  // 每个块的信息，栈顶是当前块
     ls: *mut LexState,
+    // 每条指令对应的行号（与 code 数组平行），用于在 finalize 时计算 line_info
+    inst_lines: Vec<i32>,
     #[cfg(debug_assertions)]
     reg_alloc_stack: Vec<RegAllocEntry>,
     #[cfg(debug_assertions)]
@@ -401,10 +404,17 @@ pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
     }
 
     let mut proto = fs.proto;
-    proto.max_stack_size = (fs.max_freereg + 2) as u8;
+    // C: f->maxstacksize = 2 (init); luaK_checkstack: newstack = freereg + n;
+    // maxstacksize = max(maxstacksize, newstack). Rust 的 max_freereg 追踪了
+    // freereg 分配后的最大值，等价于 max(2, max_freereg)。
+    proto.max_stack_size = std::cmp::max(2, fs.max_freereg) as u8;
     proto.size_code = proto.code.len() as i32;
     proto.size_k = proto.constants.len() as i32;
     proto.size_p = proto.protos.len() as i32;
+    proto.size_upvalues = proto.upvalues.len() as i32;
+    proto.size_line_info = proto.line_info.len() as i32;
+    proto.size_loc_vars = proto.loc_vars.len() as i32;
+    proto.size_abs_line_info = proto.abs_line_info.len() as i32;
     Ok(proto)
 }
 
@@ -426,6 +436,7 @@ impl FuncState {
             lasttarget: 0,
             block_stack: Vec::new(),
             ls: ls as *mut LexState,
+            inst_lines: Vec::new(),
             #[cfg(debug_assertions)]
             reg_alloc_stack: Vec::new(),
             #[cfg(debug_assertions)]
@@ -466,10 +477,18 @@ impl FuncState {
 // Instruction emission
 // ============================================================================
 
+/// 行号差值限制 (C: LIMLINEDIFF = 0x80)
+const LIMLINEDIFF: i32 = 0x80;
+/// 绝对行号标记 (C: ABSLINEINFO = -0x80)
+const ABSLINEINFO: i8 = -0x80;
+/// 连续指令数上限，超过则插入绝对行号 (C: MAXIWTHABS = 128)
+const MAXIWTHABS: i32 = 128;
+
 impl FuncState {
     /// 发射指令到原型代码数组，返回当前 pc 并自增
     fn emit(&mut self, ins: Instruction) -> i32 {
         self.proto.code.push(ins);
+        self.inst_lines.push(self.ls().lastline);
         let cur = self.pc;
         self.pc += 1;
         cur
@@ -760,6 +779,21 @@ impl FuncState {
         }
     }
 
+    /// Deactivate locals from index `start` onward (like C's removevars).
+    /// 对 kind <= RDKTOCLOSE (varinreg) 的变量设置 proto.loc_vars[pidx].end_pc = pc。
+    fn deactivate_locals_range(&mut self, start: usize) {
+        let pc = self.pc;
+        let end = self.locals.len();
+        for i in start..end {
+            self.locals[i].active = false;
+            let pidx = self.locals[i].pidx;
+            let kind = self.locals[i].kind;
+            if kind <= RDKTOCLOSE && pidx >= 0 {
+                self.proto.loc_vars[pidx as usize].end_pc = pc;
+            }
+        }
+    }
+
     fn free_exp_reg(&mut self, e: &ExpDesc) {
         if matches!(e.kind, ExpKind::NonReloc | ExpKind::Relocable) && (e.info as i32) >= self.nvarstack() && (e.info as i32) == self.freereg - 1 {
             self.free_reg();
@@ -841,6 +875,15 @@ impl FuncState {
         let reg = self.alloc_reg();
         let vidx = self.locals.len() as i32;
         let nactvar = self.active_nactvar();
+        // 注册到 proto.locvars (对应 C 的 registerlocalvar)
+        let pidx = self.proto.loc_vars.len() as i32;
+        self.proto.loc_vars.push(LocVar {
+            varname: Some(crate::strings::LuaString::Short(std::sync::Arc::new(
+                crate::strings::ShortString { hash: 0, contents: name.to_string() }
+            ))),
+            start_pc,
+            end_pc: 0,
+        });
         self.locals.push(LocalVar {
             name: name.to_string(),
             start_pc,
@@ -852,6 +895,7 @@ impl FuncState {
             ctc_str: None,
             vidx,
             nactvar,
+            pidx,
         });
         reg
     }
@@ -866,6 +910,15 @@ impl FuncState {
         };
         let vidx = self.locals.len() as i32;
         let nactvar = self.active_nactvar();
+        // 注册到 proto.locvars (对应 C 的 registerlocalvar)
+        let pidx = self.proto.loc_vars.len() as i32;
+        self.proto.loc_vars.push(LocVar {
+            varname: Some(crate::strings::LuaString::Short(std::sync::Arc::new(
+                crate::strings::ShortString { hash: 0, contents: name.to_string() }
+            ))),
+            start_pc,
+            end_pc: 0,
+        });
         self.locals.push(LocalVar {
             name: name.to_string(),
             start_pc,
@@ -877,6 +930,7 @@ impl FuncState {
             ctc_str: None,
             vidx,
             nactvar,
+            pidx,
         });
         // Like C's marktobeclosed: mark current block as needing CLOSE
         if kind == RDKTOCLOSE {
@@ -893,6 +947,15 @@ impl FuncState {
     fn add_local_kind_reg(&mut self, name: &str, start_pc: i32, kind: i32, reg: i32) {
         let vidx = self.locals.len() as i32;
         let nactvar = self.active_nactvar();
+        // 注册到 proto.locvars (对应 C 的 registerlocalvar)
+        let pidx = self.proto.loc_vars.len() as i32;
+        self.proto.loc_vars.push(LocVar {
+            varname: Some(crate::strings::LuaString::Short(std::sync::Arc::new(
+                crate::strings::ShortString { hash: 0, contents: name.to_string() }
+            ))),
+            start_pc,
+            end_pc: 0,
+        });
         self.locals.push(LocalVar {
             name: name.to_string(),
             start_pc,
@@ -904,6 +967,7 @@ impl FuncState {
             ctc_str: None,
             vidx,
             nactvar,
+            pidx,
         });
     }
 
@@ -2044,6 +2108,26 @@ fn parse_chunk_finish(fs: &mut FuncState) {
         let gt = &fs.gotos[0];
         fs.error(&format!("no visible label '{}' for goto", gt.name));
     }
+
+    // 从 inst_lines 计算 line_info 和 abs_line_info
+    // (对应 C 的 savelineinfo，在 luaK_code 中每条指令发射时调用)
+    let mut previousline: i32 = 0;
+    let mut iwthabs: i32 = 0;
+    for (pc, &line) in fs.inst_lines.iter().enumerate() {
+        let linedif = line - previousline;
+        if linedif.abs() >= LIMLINEDIFF || iwthabs >= MAXIWTHABS {
+            fs.proto.abs_line_info.push(crate::objects::AbsLineInfo {
+                pc: pc as i32,
+                line,
+            });
+            fs.proto.line_info.push(ABSLINEINFO);
+            iwthabs = 1;
+        } else {
+            fs.proto.line_info.push(linedif as i8);
+            iwthabs += 1;
+        }
+        previousline = line;
+    }
 }
 
 /// Like C's finaltarget: follow JMP chain to find the final target
@@ -2313,9 +2397,7 @@ fn parse_chunk(fs: &mut FuncState) {
     let has_tbc = fs.locals[saved_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
     let block_entry = fs.block_stack.pop().unwrap();
     // C's leaveblock order: removevars before solvegotos
-    for local in &mut fs.locals[saved_nlocals..] {
-        local.active = false;
-    }
+    fs.deactivate_locals_range(saved_nlocals);
     // Solve gotos for the function body block (like C's solvegotos in leaveblock)
     solve_gotos_for_block(fs, saved_nlabels, saved_nlocals, block_entry.saved_ngotos, has_tbc || has_upval, block_entry.nactvar, block_entry.reglevel);
     // Check for unresolved gotos (like C's leaveblock: if bl->previous==NULL && pending gotos)
@@ -2350,9 +2432,7 @@ fn parse_block(fs: &mut FuncState) {
         fs.code_abc(OpCode::CLOSE, close_reg, 0, 0);
     }
     // Like C's leaveblock order: 1) CLOSE  2) freereg  3) removevars(deactivate)  4) solvegotos
-    for local in &mut fs.locals[saved_nlocals..] {
-        local.active = false;
-    }
+    fs.deactivate_locals_range(saved_nlocals);
     fs.set_freereg(close_reg);
     solve_gotos_for_block(fs, saved_nlabels, saved_nlocals, block_entry.saved_ngotos, has_tbc || has_upval, block_entry.nactvar, block_entry.reglevel);
 }
@@ -3006,6 +3086,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     // Revert: remove the GETUPVAL instruction, free the register
                     let getupval_pc = fs.pc - 1;
                     fs.proto.code.remove(getupval_pc as usize);
+                    fs.inst_lines.remove(getupval_pc as usize);
                     fs.pc -= 1;
                     fs.free_reg();
                     let uv_idx = first.upval_idx.unwrap();
@@ -3210,6 +3291,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         // If we emitted GETUPVAL before key load, revert it
                         if getupval_emitted_before_key {
                             fs.proto.code.remove(fs.pc as usize - 1);
+                            fs.inst_lines.remove(fs.pc as usize - 1);
                             fs.pc -= 1;
                             fs.free_reg();
                         }
@@ -3392,6 +3474,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         let gettabup_pc = v.env_gettabup_pc;
                         let (env_k, adjusted_key) = if gettabup_pc >= 0 && (gettabup_pc as usize) < fs.proto.code.len() {
                             let gettabup_inst = fs.proto.code.remove(gettabup_pc as usize);
+                            fs.inst_lines.remove(gettabup_pc as usize);
                             fs.pc -= 1;
                             let env_k = getarg_c(gettabup_inst);
                             fs.proto.constants.remove(env_k as usize);
@@ -4348,6 +4431,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                             // Revert: remove the GETUPVAL instruction, free the register
                             let getupval_pc = fs.pc - 1;
                             fs.proto.code.remove(getupval_pc as usize);
+                            fs.inst_lines.remove(getupval_pc as usize);
                             fs.pc -= 1;
                             fs.free_reg();
                             let uv_idx = result.upval_idx.unwrap();
@@ -4565,6 +4649,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         if can_use_settabup {
                             if getupval_emitted_before_key {
                                 fs.proto.code.remove(fs.pc as usize - 1);
+                                fs.inst_lines.remove(fs.pc as usize - 1);
                                 fs.pc -= 1;
                                 fs.free_reg();
                             }
@@ -4748,6 +4833,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         let not_inst = fs.proto.code[e_left.info2 as usize];
                         let b = getarg_b(not_inst);
                         fs.proto.code.remove(e_left.info2 as usize);
+                        fs.inst_lines.remove(e_left.info2 as usize);
                         fs.pc -= 1;
                         fs.code_abc_k(OpCode::TEST, b, 0, 0, true);
                         let jmp_pc = fs.jump();
@@ -4816,6 +4902,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         let not_inst = fs.proto.code[e_left.info2 as usize];
                         let b = getarg_b(not_inst);
                         fs.proto.code.remove(e_left.info2 as usize);
+                        fs.inst_lines.remove(e_left.info2 as usize);
                         fs.pc -= 1;
                         fs.code_abc_k(OpCode::TEST, b, 0, 0, false);
                         let jmp_pc = fs.jump();
@@ -5849,6 +5936,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             if merged {
                 let n = getarg_b(fs.proto.code[fs.proto.code.len() - 1]);
                 fs.proto.code.pop();
+                fs.inst_lines.pop();
                 fs.pc -= 1;
                 fs.code_abc(OpCode::CONCAT, r, n + 1, 0);
             } else {
@@ -8239,6 +8327,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     let last_ins = fs.proto.code[last_idx];
                     let uv_idx = getarg_b(last_ins);
                     fs.proto.code.remove(last_idx);
+                    fs.inst_lines.remove(last_idx);
                     fs.pc -= 1;
                     if base_reg >= fs.nvarstack() && base_reg == fs.freereg - 1 {
                         fs.free_reg();
@@ -8637,6 +8726,7 @@ fn parse_if_cond(fs: &mut FuncState, entry_freereg: i32) -> i32 {
             let b = getarg_b(not_inst);
             fs.pc -= 1;
             fs.proto.code.pop();
+            fs.inst_lines.pop();
             // goiftrue: cond=0, !cond=1 → k=true
             fs.code_abc_k(OpCode::TEST, b, 0, 0, true);
             let jmp_pc = fs.jump();
@@ -8710,6 +8800,7 @@ fn parse_while(fs: &mut FuncState) {
             let b = getarg_b(not_inst);
             fs.pc -= 1;
             fs.proto.code.pop();
+            fs.inst_lines.pop();
             fs.code_abc_k(OpCode::TEST, b, 0, 0, true);
             let jmp = fs.jump();
             let mut false_list = ei.exp.f;
@@ -8761,9 +8852,7 @@ fn parse_while(fs: &mut FuncState) {
     if has_tbc || has_upval {
         fs.code_abc(OpCode::CLOSE, close_reg, 0, 0);
     }
-    for local in &mut fs.locals[saved_nlocals..] {
-        local.active = false;
-    }
+    fs.deactivate_locals_range(saved_nlocals);
     fs.set_freereg(close_reg);
 
     // Create break label AFTER CLOSE (like C's createlabel after CLOSE in leaveblock)
@@ -8861,6 +8950,7 @@ fn parse_repeat(fs: &mut FuncState) {
                 let b = getarg_b(not_inst);
                 fs.pc -= 1;
                 fs.proto.code.pop();
+                fs.inst_lines.pop();
                 fs.code_abc_k(OpCode::TEST, b, 0, 0, true);
                 let jmp_pc3 = fs.jump();
                 let mut false_list3 = ei.exp.f;
@@ -8894,9 +8984,7 @@ fn parse_repeat(fs: &mut FuncState) {
     if bl2_has_tbc || bl2_has_upval {
         fs.code_abc(OpCode::CLOSE, bl2_close_reg, 0, 0);
     }
-    for local in &mut fs.locals[bl2_nlocals..] {
-        local.active = false;
-    }
+    fs.deactivate_locals_range(bl2_nlocals);
     fs.set_freereg(bl2_close_reg);
     solve_gotos_for_block(fs, bl2_nlabels, bl2_nlocals, bl2_entry.saved_ngotos, bl2_has_tbc || bl2_has_upval, bl2_entry.nactvar, bl2_entry.reglevel);
 
@@ -8922,9 +9010,7 @@ fn parse_repeat(fs: &mut FuncState) {
     if bl1_has_tbc || bl1_has_upval {
         fs.code_abc(OpCode::CLOSE, bl1_close_reg, 0, 0);
     }
-    for local in &mut fs.locals[bl1_nlocals..] {
-        local.active = false;
-    }
+    fs.deactivate_locals_range(bl1_nlocals);
     fs.set_freereg(bl1_close_reg);
 
     // Create break label AFTER CLOSE (like C's createlabel after CLOSE in leaveblock)
@@ -9030,9 +9116,7 @@ fn parse_for(fs: &mut FuncState) {
             fs.code_abc(OpCode::CLOSE, body_close_reg, 0, 0);
         }
         // C's leaveblock order: CLOSE -> freereg -> removevars -> solvegotos
-        for local in &mut fs.locals[body_nlocals..] {
-            local.active = false;
-        }
+        fs.deactivate_locals_range(body_nlocals);
         fs.set_freereg(body_close_reg);
         solve_gotos_for_block(fs, body_nlabels, body_nlocals, body_entry.saved_ngotos, body_has_tbc || has_body_upval, body_entry.nactvar, body_entry.reglevel);
 
@@ -9050,9 +9134,7 @@ fn parse_for(fs: &mut FuncState) {
             fs.code_abc(OpCode::CLOSE, forstat_close_reg, 0, 0);
         }
         // removevars + freereg (before createlabel and solvegotos, like C)
-        for local in &mut fs.locals[forstat_nlocals..] {
-            local.active = false;
-        }
+        fs.deactivate_locals_range(forstat_nlocals);
         fs.set_freereg(forstat_close_reg);
 
         // Create break label AFTER forstat CLOSE (like C's createlabel after CLOSE)
@@ -9111,6 +9193,7 @@ fn parse_for(fs: &mut FuncState) {
                 ctc_str: None,
                 vidx,
                 nactvar,
+                pidx: -1,
             });
         }
         // Deactivate internal variables too during expression parsing
@@ -9212,9 +9295,7 @@ fn parse_for(fs: &mut FuncState) {
             fs.code_abc(OpCode::CLOSE, body_close_reg, 0, 0);
         }
         // C's leaveblock order: CLOSE -> freereg -> removevars -> solvegotos
-        for local in &mut fs.locals[body_nlocals..] {
-            local.active = false;
-        }
+        fs.deactivate_locals_range(body_nlocals);
         fs.set_freereg(body_close_reg);
         solve_gotos_for_block(fs, body_nlabels, body_nlocals, body_entry.saved_ngotos, body_has_tbc || has_body_upval, body_entry.nactvar, body_entry.reglevel);
 
@@ -9233,9 +9314,7 @@ fn parse_for(fs: &mut FuncState) {
             fs.code_abc(OpCode::CLOSE, forstat_close_reg, 0, 0);
         }
         // removevars + freereg (before createlabel and solvegotos, like C)
-        for local in &mut fs.locals[forstat_nlocals..] {
-            local.active = false;
-        }
+        fs.deactivate_locals_range(forstat_nlocals);
         fs.set_freereg(forstat_close_reg);
 
         // Create break label AFTER forstat CLOSE (like C's createlabel after CLOSE)
@@ -9581,6 +9660,7 @@ fn parse_local(fs: &mut FuncState) {
 
             if last_is_ctc {
                 let popped = fs.proto.code.pop();
+                fs.inst_lines.pop();
                 fs.pc -= 1;
                 // If the popped instruction is LOADK, the constant it references
                 // was added for this CTC variable and should also be removed.
@@ -9639,6 +9719,7 @@ fn parse_local(fs: &mut FuncState) {
                     ctc_str,
                     vidx,
                     nactvar,
+                    pidx: -1,
                 });
             }
 
