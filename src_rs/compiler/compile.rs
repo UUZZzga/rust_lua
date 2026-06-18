@@ -404,17 +404,7 @@ pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
     }
 
     let mut proto = fs.proto;
-    // C: f->maxstacksize = 2 (init); luaK_checkstack: newstack = freereg + n;
-    // maxstacksize = max(maxstacksize, newstack). Rust 的 max_freereg 追踪了
-    // freereg 分配后的最大值，等价于 max(2, max_freereg)。
-    proto.max_stack_size = std::cmp::max(2, fs.max_freereg) as u8;
-    proto.size_code = proto.code.len() as i32;
-    proto.size_k = proto.constants.len() as i32;
-    proto.size_p = proto.protos.len() as i32;
-    proto.size_upvalues = proto.upvalues.len() as i32;
-    proto.size_line_info = proto.line_info.len() as i32;
-    proto.size_loc_vars = proto.loc_vars.len() as i32;
-    proto.size_abs_line_info = proto.abs_line_info.len() as i32;
+    // size/max_stack_size 字段已在 parse_chunk_finish 中设置
     Ok(proto)
 }
 
@@ -2141,6 +2131,17 @@ fn parse_chunk_finish(fs: &mut FuncState) {
         }
         previousline = line;
     }
+
+    // 设置 Proto 的 size 和 max_stack_size 字段
+    // (对应 C 的 close_func 中 luaK_finish 之后的处理)
+    fs.proto.max_stack_size = std::cmp::max(2, fs.max_freereg) as u8;
+    fs.proto.size_code = fs.proto.code.len() as i32;
+    fs.proto.size_k = fs.proto.constants.len() as i32;
+    fs.proto.size_p = fs.proto.protos.len() as i32;
+    fs.proto.size_upvalues = fs.proto.upvalues.len() as i32;
+    fs.proto.size_line_info = fs.proto.line_info.len() as i32;
+    fs.proto.size_loc_vars = fs.proto.loc_vars.len() as i32;
+    fs.proto.size_abs_line_info = fs.proto.abs_line_info.len() as i32;
 }
 
 /// Like C's finaltarget: follow JMP chain to find the final target
