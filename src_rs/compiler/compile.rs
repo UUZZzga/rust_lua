@@ -758,6 +758,15 @@ impl FuncState {
         r
     }
 
+    /// C 的 luaK_checkstack: 检查寄存器栈水平，更新 max_freereg
+    /// newstack = freereg + n; max_freereg = max(max_freereg, newstack)
+    fn checkstack(&mut self, n: i32) {
+        let newstack = self.freereg + n;
+        if newstack > self.max_freereg {
+            self.max_freereg = newstack;
+        }
+    }
+
     /// 释放最后一个寄存器: freereg--
     fn free_reg(&mut self) {
         if self.freereg > 0 {
@@ -2721,6 +2730,8 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
 
         // Like C's adjust_assign
         let needed = nvars as i32 - nexps as i32;
+        // C: luaK_checkstack(fs, needed) in adjust_assign
+        fs.checkstack(needed);
         if last_exp.kind == ExpKind::Vararg || last_exp.kind == ExpKind::Call {
             let extra = if needed + 1 > 0 { needed + 1 } else { 0 };
             if last_exp.kind == ExpKind::Call {
@@ -3437,7 +3448,11 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 break;
             }
         }
-        
+
+        // C: luaK_checkstack(fs, needed) in adjust_assign; needed = nvars - nexps
+        let needed_assign = vars.len() as i32 - exps.len() as i32;
+        fs.checkstack(needed_assign);
+
         let last_is_call = exps.last().map_or(false, |e| e.kind == ExpKind::Call && e.info2 >= 0);
         let extra_vars = if vars.len() > exps.len() {
             vars.len() - exps.len()
@@ -9228,6 +9243,9 @@ fn parse_for(fs: &mut FuncState) {
             nexps += 1;
         }
 
+        // C: luaK_checkstack(fs, needed) in adjust_assign; needed = 4 - nexps
+        fs.checkstack(4 - nexps);
+
         // Like C's adjust_assign: handle last expression BEFORE adjustlocalvars
         let mut last_is_call = false;
         let is_multret = matches!(last_ei.exp.kind, ExpKind::Call | ExpKind::Vararg);
@@ -9271,7 +9289,10 @@ fn parse_for(fs: &mut FuncState) {
         if fs.freereg > fs.max_freereg {
             fs.max_freereg = fs.freereg;
         }
-        
+
+        // C: luaK_checkstack(fs, 2);  /* extra space to call iterator */
+        fs.checkstack(2);
+
         expect(fs, &Token::Do);
 
         let saved_breaklist = fs.break_list;
@@ -9663,6 +9684,10 @@ fn parse_local(fs: &mut FuncState) {
                 fs.ls_mut().next();
             }
 
+            // C: luaK_checkstack(fs, needed) in adjust_assign; needed = nvars - nexps
+            let needed = nvars as i32 - n_vals as i32;
+            fs.checkstack(needed);
+
             let last_is_ctc = n_vals == nvars
                 && nvars > 0
                 && kinds[nvars - 1] == RDKCONST
@@ -9744,6 +9769,8 @@ fn parse_local(fs: &mut FuncState) {
                 fs.code_nil(saved_freereg + n_vals as i32, remaining as i32);
             }
         } else {
+            // C: luaK_checkstack(fs, needed) in adjust_assign; needed = nvars - 0 = nvars
+            fs.checkstack(nvars as i32);
             let start_reg = fs.add_local_kind(&names[0], fs.pc, kinds[0]);
             for i in 1..nvars {
                 fs.add_local_kind(&names[i], fs.pc, kinds[i]);
