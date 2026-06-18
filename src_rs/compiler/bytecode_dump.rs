@@ -40,6 +40,10 @@ pub struct DumpedFunction {
     pub constants: Vec<DumpConstant>,
     pub upvalues: Vec<(bool, u8, u8)>,  // (instack, idx, kind)
     pub protos: Vec<DumpedFunction>,
+    // 调试信息大小（用于对比）
+    pub size_line_info: i32,
+    pub size_abs_line_info: i32,
+    pub size_loc_vars: i32,
 }
 
 struct BytecodeReader {
@@ -199,7 +203,7 @@ impl BytecodeReader {
             protos.push(self.read_function());
         }
         let _source = self.read_string();
-        self.skip_debug();
+        let (size_line_info, size_abs_line_info, size_loc_vars) = self.read_debug();
         DumpedFunction {
             linedefined,
             lastlinedefined,
@@ -210,6 +214,9 @@ impl BytecodeReader {
             constants,
             upvalues,
             protos,
+            size_line_info,
+            size_abs_line_info,
+            size_loc_vars,
         }
     }
 
@@ -233,18 +240,18 @@ impl BytecodeReader {
         let _value = self.read_bytes(8);
     }
 
-    fn skip_debug(&mut self) {
-        let n_lineinfo = self.read_int() as usize;
-        if n_lineinfo > 0 {
-            self.pos += n_lineinfo;
+    fn read_debug(&mut self) -> (i32, i32, i32) {
+        let size_line_info = self.read_int() as i32;
+        if size_line_info > 0 {
+            self.pos += size_line_info as usize;
         }
-        let n_abslineinfo = self.read_int() as usize;
-        if n_abslineinfo > 0 {
+        let size_abs_line_info = self.read_int() as i32;
+        if size_abs_line_info > 0 {
             self.align(4);
-            self.pos += n_abslineinfo * std::mem::size_of::<i32>() * 2;
+            self.pos += size_abs_line_info as usize * std::mem::size_of::<i32>() * 2;
         }
-        let n_locvars = self.read_int() as usize;
-        for _ in 0..n_locvars {
+        let size_loc_vars = self.read_int() as i32;
+        for _ in 0..size_loc_vars {
             let _varname = self.read_string();
             let _startpc = self.read_int();
             let _endpc = self.read_int();
@@ -253,6 +260,7 @@ impl BytecodeReader {
         for _ in 0..n_upvnames {
             let _name = self.read_string();
         }
+        (size_line_info, size_abs_line_info, size_loc_vars)
     }
 }
 

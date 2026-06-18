@@ -104,6 +104,13 @@ impl VmExecutor {
     pub fn execute_loop(state: &mut LuaState) -> Result<VmResult, VmError> {
         let mut call_stack: Vec<CallFrame> = Vec::new();
 
+        // 调试跟踪：通过环境变量 LUA_VM_TRACE=1 启用
+        // LUA_VM_TRACE=2 时额外打印完整栈内容
+        let trace_level: u8 = std::env::var("LUA_VM_TRACE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
         loop {
             if state.pc >= state.code.len() {
                 if let Some(frame) = call_stack.pop() {
@@ -127,6 +134,22 @@ impl VmExecutor {
 
             let inst = state.code[state.pc];
             let op = opcodes::get_opcode(inst);
+
+            // 调试跟踪输出
+            if trace_level >= 1 {
+                // 检测是否支持 ANSI 颜色
+                let use_color = std::env::var("TERM").ok()
+                    .map(|t| t != "dumb")
+                    .unwrap_or(false);
+                
+                // 打印完整代码列表，标记当前 PC
+                eprint!("{}", Self::dump_code_with_pc(state, state.pc, use_color));
+                
+                if trace_level >= 2 {
+                    // 打印栈内容
+                    eprint!("{}", Self::dump_stack(state));
+                }
+            }
 
             match op {
                 OpCode::MOVE => Self::op_move(state, inst),
@@ -302,6 +325,53 @@ impl VmExecutor {
         }
     }
 
+    /// 格式化单条指令为 bytecode_dump 格式
+    /// 格式: "{pc}\t[-]\t{OP_NAME}\t{operands}"
+    pub fn format_instruction(state: &LuaState, inst: Instruction, pc: usize) -> String {
+        // 使用 bytecode_dump 的格式: pc [-] instruction
+        format!("{}\t[-]\t{}", pc + 1, crate::compiler::bytecode_dump::format_instruction(inst))
+    }
+
+    /// 打印完整代码列表，标记当前执行的 PC
+    /// 支持 ANSI 颜色高亮（终端）和 <- 标记
+    pub fn dump_code_with_pc(state: &LuaState, current_pc: usize, use_color: bool) -> String {
+        let mut output = String::new();
+        output.push_str(&format!("\n=== code ({} instructions, pc={}) ===\n", state.code.len(), current_pc));
+
+        for (i, &inst) in state.code.iter().enumerate() {
+            let inst_str = crate::compiler::bytecode_dump::format_instruction(inst);
+            let is_current = i == current_pc;
+
+            if is_current {
+                if use_color {
+                    // ANSI 黄色高亮 + <- 标记
+                    output.push_str(&format!("\x1b[33m{}\t[-]\t{}\t<-\x1b[0m\n", i + 1, inst_str));
+                } else {
+                    // 纯文本 <- 标记
+                    output.push_str(&format!("{}\t[-]\t{}\t<-\n", i + 1, inst_str));
+                }
+            } else {
+                output.push_str(&format!("{}\t[-]\t{}\n", i + 1, inst_str));
+            }
+        }
+        output.push_str("=== end code ===\n");
+        output
+    }
+
+    /// 打印完整栈内容（调试用）
+    pub fn dump_stack(state: &LuaState) -> String {
+        let mut output = String::new();
+        output.push_str(&format!("\n=== stack (len={}, base={}, pc={}) ===\n", state.stack.len(), state.base, state.pc));
+        for (i, val) in state.stack.iter().enumerate() {
+            let mut markers = String::new();
+            if i == state.base { markers.push_str(" <-- base"); }
+            if i == state.base + state.num_params as usize { markers.push_str(" <-- after params"); }
+            output.push_str(&format!("  [{:03}] {:<30}{}\n", i, format!("{}", val), markers));
+        }
+        output.push_str("=== end stack ===\n");
+        output
+    }
+
     // ========================================================================
     // 辅助方法
     // ========================================================================
@@ -325,7 +395,53 @@ impl VmExecutor {
     }
 
     fn read_stack(state: &LuaState, idx: usize) -> &TValue {
-        if idx < state.stack.len() { &state.stack[idx] } else { panic!("stack underflow: idx={}, stack.len={}, pc={}, base={}", idx, state.stack.len(), state.pc, state.base); }
+        if idx < state.stack.len() {
+            &state.stack[idx]
+        } else {
+            // 打印完整的调试信息
+            eprintln!("\n=== STACK UNDERFLOW PANIC ===");
+            eprintln!("尝试访问栈索引: {}, 栈大小: {}", idx, state.stack.len());
+            eprintln!("当前 PC: {}, Base: {}", state.pc, state.base);
+
+            // 打印完整指令列表，标记当前执行的指令
+            let use_color = std::env::var("TERM").ok()
+                .map(|t| t != "dumb")
+                .unwrap_or(false);
+            eprint!("{}", Self::dump_code_with_pc(state, state.pc, use_color));
+
+            // 打印完整栈内容
+            eprint!("{}", Self::dump_stack(state));
+
+            // 打印栈帧信息
+            eprintln!("\n--- 栈帧信息 ---");
+            eprintln!("  Base 寄存器起始: {}", state.base);
+            eprintln!("  参数数量: {}", state.num_params);
+            eprintln!("  是否可变参数: {}", state.is_vararg);
+            eprintln!("  代码长度: {} 条指令", state.code.len());
+            
+            // 打印 upval 信息
+            if !state.closure_upvals.is_empty() {
+                eprintln!("\n--- Upval 信息 (共 {} 个) ---", state.closure_upvals.len());
+                for (i, upval) in state.closure_upvals.iter().enumerate() {
+                    match upval {
+                        UpVal::Closed { value } => {
+                            eprintln!("  upval[{}] = Closed({})", i, value);
+                        }
+                        UpVal::Open { stack_index, .. } => {
+                            let val = if *stack_index < state.stack.len() {
+                                format!("{}", state.stack[*stack_index])
+                            } else {
+                                "<invalid>".to_string()
+                            };
+                            eprintln!("  upval[{}] = Open(stack_index={}, value={})", i, stack_index, val);
+                        }
+                    }
+                }
+            }
+
+            panic!("stack underflow: idx={}, stack.len={}, pc={}, base={}",
+                   idx, state.stack.len(), state.pc, state.base);
+        }
     }
 
     fn write_stack(state: &mut LuaState, idx: usize, val: TValue) {

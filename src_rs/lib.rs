@@ -59,6 +59,8 @@ pub mod lua_ffi;
 
 // C API 导出层（#[no_mangle] extern "C" fn）
 // 将 Rust VM 以 C ABI 形式导出，供第三方 Lua C 模块链接调用。
+// 启用 ffi feature 时禁用，避免与 C 库的符号冲突。
+#[cfg(not(feature = "ffi"))]
 pub mod capi;
 
 // 命令行解释器

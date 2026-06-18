@@ -19,6 +19,58 @@ mod compiler_compare_tests {
         source: &str,
         path: &str,
     ) {
+        // 对比 Proto 元数据字段
+        let mut meta_diffs = Vec::new();
+
+        if rust_proto.num_params != c_func.numparams {
+            meta_diffs.push(format!("num_params: Rust={}, C={}", rust_proto.num_params, c_func.numparams));
+        }
+        if rust_proto.flag != c_func.flag {
+            meta_diffs.push(format!("flag: Rust={}, C={}", rust_proto.flag, c_func.flag));
+        }
+        if rust_proto.max_stack_size != c_func.maxstacksize {
+            meta_diffs.push(format!("max_stack_size: Rust={}, C={}", rust_proto.max_stack_size, c_func.maxstacksize));
+        }
+        if rust_proto.line_defined != c_func.linedefined {
+            meta_diffs.push(format!("line_defined: Rust={}, C={}", rust_proto.line_defined, c_func.linedefined));
+        }
+        if rust_proto.last_line_defined != c_func.lastlinedefined {
+            meta_diffs.push(format!("last_line_defined: Rust={}, C={}", rust_proto.last_line_defined, c_func.lastlinedefined));
+        }
+        if rust_proto.size_upvalues as usize != c_func.upvalues.len() {
+            meta_diffs.push(format!("size_upvalues: Rust={}, C={}", rust_proto.size_upvalues, c_func.upvalues.len()));
+        }
+        if rust_proto.size_k as usize != c_func.constants.len() {
+            meta_diffs.push(format!("size_k: Rust={}, C={}", rust_proto.size_k, c_func.constants.len()));
+        }
+        if rust_proto.size_code as usize != c_func.code.len() {
+            meta_diffs.push(format!("size_code: Rust={}, C={}", rust_proto.size_code, c_func.code.len()));
+        }
+        if rust_proto.size_line_info != c_func.size_line_info {
+            meta_diffs.push(format!("size_line_info: Rust={}, C={}", rust_proto.size_line_info, c_func.size_line_info));
+        }
+        if rust_proto.size_abs_line_info != c_func.size_abs_line_info {
+            meta_diffs.push(format!("size_abs_line_info: Rust={}, C={}", rust_proto.size_abs_line_info, c_func.size_abs_line_info));
+        }
+        if rust_proto.size_loc_vars != c_func.size_loc_vars {
+            meta_diffs.push(format!("size_loc_vars: Rust={}, C={}", rust_proto.size_loc_vars, c_func.size_loc_vars));
+        }
+        // size_p 通过 protos.len() 对比
+        if rust_proto.size_p as usize != c_func.protos.len() {
+            meta_diffs.push(format!("size_p: Rust={}, C={}", rust_proto.size_p, c_func.protos.len()));
+        }
+
+        if !meta_diffs.is_empty() {
+            panic!(
+                "Proto metadata mismatch for source: {}\n\
+                 Function: {}\n\
+                 Differences:\n  {}\n",
+                source,
+                path,
+                meta_diffs.join("\n  ")
+            );
+        }
+
         let diffs = bytecode_dump::compare_instructions(&rust_proto.code, &c_func.code);
         if !diffs.is_empty() {
             let rust_dump = bytecode_dump::dump_instructions(&rust_proto.code);
