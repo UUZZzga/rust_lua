@@ -490,7 +490,7 @@ impl fmt::Display for TValue {
 /// Then: 可通过 .call() 调用该函数
 #[derive(Debug, Clone, Copy)]
 pub struct LCFunction {
-    pub func: extern "C" fn(*mut std::ffi::c_void) -> i32,
+    pub func: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
 }
 
 // ============================================================================
@@ -556,7 +556,7 @@ pub struct LClosure {
 #[derive(Debug, Clone)]
 pub struct CClosure {
     /// C 函数指针
-    pub f: extern "C" fn(*mut std::ffi::c_void) -> i32,
+    pub f: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
     /// 上值列表
     pub upvalue: Vec<TValue>,
 }

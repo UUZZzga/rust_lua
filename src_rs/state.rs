@@ -32,6 +32,10 @@ pub struct LuaState {
     pub trap: bool,
     pub num_params: u8,
     pub is_vararg: bool,
+    /// 当前执行函数原型的 flag（PF_VAHID / PF_VATAB / PF_FIXED）
+    pub proto_flag: u8,
+    /// PF_VAHID 模式下隐藏变参的数量（对应 C 的 ci->u.l.nextraargs）
+    pub nextraargs: i32,
     pub closure_upvals: Vec<UpVal>,
     pub open_upval: Option<usize>,
     pub tbc_list: Option<usize>,
@@ -46,6 +50,13 @@ pub struct LuaState {
     pub globals: Table,
     pub registry: Table,
     pub string_table: StringTable,
+
+    // C API 导出层使用：当前 C 函数帧的 func 位置（0-based 栈索引）。
+    // C API 的正索引相对于此位置；Lua 代码路径不使用此字段。
+    // 0 表示栈底（主线程初始状态）。
+    pub api_func_base: usize,
+    // C 函数调用嵌套计数（对应 C 的 L->nCcalls），用于检测 C 栈溢出
+    pub n_ccalls: u32,
 }
 
 // ============================================================================
@@ -82,6 +93,8 @@ impl LuaState {
             trap: false,
             num_params: 0,
             is_vararg: false,
+            proto_flag: 0,
+            nextraargs: 0,
             closure_upvals: Vec::new(),
             open_upval: None,
             tbc_list: None,
@@ -92,6 +105,8 @@ impl LuaState {
             globals,
             registry,
             string_table: StringTable::new(),
+            api_func_base: 0,
+            n_ccalls: 0,
         }
     }
 
@@ -124,6 +139,8 @@ impl LuaState {
             trap: false,
             num_params: 0,
             is_vararg: false,
+            proto_flag: 0,
+            nextraargs: 0,
             closure_upvals: Vec::new(),
             open_upval: None,
             tbc_list: None,
@@ -134,6 +151,8 @@ impl LuaState {
             globals,
             registry,
             string_table: StringTable::new(),
+            api_func_base: 0,
+            n_ccalls: 0,
         };
         state
     }
@@ -153,6 +172,8 @@ impl LuaState {
         self.pc = 0;
         self.num_params = proto.num_params;
         self.is_vararg = proto.is_vararg();
+        self.proto_flag = proto.flag;
+        self.nextraargs = 0;
         self.closure_upvals = Vec::new();
         self.tbc_list = None;
         self.open_upval = None;
@@ -187,6 +208,8 @@ impl LuaState {
             trap: false,
             num_params: proto.num_params,
             is_vararg: proto.is_vararg(),
+            proto_flag: proto.flag,
+            nextraargs: 0,
             closure_upvals: Vec::new(),
             open_upval: None,
             tbc_list: None,
@@ -197,6 +220,8 @@ impl LuaState {
             globals: Table::new(),
             registry: Table::new(),
             string_table: StringTable::new(),
+            api_func_base: 0,
+            n_ccalls: 0,
         }
     }
 }
@@ -211,7 +236,7 @@ impl Default for LuaState {
 // 字符串工具
 // ============================================================================
 
-fn str_to_ls(table: &StringTable, s: &str) -> LuaString {
+pub fn str_to_ls(table: &StringTable, s: &str) -> LuaString {
     crate::strings::new_lstr(table, s)
 }
 
@@ -668,18 +693,21 @@ impl LuaState {
     // ====== pcall ======
 
     pub fn pcall(&mut self, nargs: usize, nresults: i32, _errfunc: isize) -> i32 {
-        let total = self.gettop();
-        let func_idx = total.saturating_sub(nargs + 1);
-        if func_idx >= total {
+        // func_idx 是函数在栈中的 0-based 绝对索引。
+        // 栈布局: [... | func | arg1 | arg2 | ... | top]
+        // func_idx = stack.len() - nargs - 1
+        let func_idx = self.stack.len().saturating_sub(nargs + 1);
+        if func_idx >= self.stack.len() {
             return ERR_RUN;
         }
 
         let func_val = self.stack[func_idx].clone();
         match func_val {
             TValue::LClosure(closure) => {
-                let nargs_actual = total.saturating_sub(func_idx + 1);
+                let nargs_actual = self.stack.len().saturating_sub(func_idx + 1);
                 let fsize = closure.proto.max_stack_size as usize;
                 let nfixparams = closure.proto.num_params as usize;
+                let proto_is_vararg = closure.proto.is_vararg();
 
                 let saved_code = std::mem::take(&mut self.code);
                 let saved_constants = std::mem::take(&mut self.constants);
@@ -688,6 +716,8 @@ impl LuaState {
                 let saved_base = self.base;
                 let saved_num_params = self.num_params;
                 let saved_is_vararg = self.is_vararg;
+                let saved_proto_flag = self.proto_flag;
+                let saved_nextraargs = self.nextraargs;
                 let saved_closure_upvals = std::mem::take(&mut self.closure_upvals);
                 let saved_tbc_list = self.tbc_list.take();
                 let saved_open_upval = self.open_upval.take();
@@ -700,6 +730,8 @@ impl LuaState {
                 self.pc = 0;
                 self.num_params = closure.proto.num_params;
                 self.is_vararg = closure.proto.is_vararg();
+                self.proto_flag = closure.proto.flag;
+                self.nextraargs = 0;
                 let upval_val = UpVal::Closed {
                     value: Box::new(TValue::Table(self.globals.clone())),
                 };
@@ -707,12 +739,24 @@ impl LuaState {
                 self.tbc_list = None;
                 self.open_upval = None;
 
-                let frame_end = func_idx + 1 + fsize;
-                while self.stack.len() < frame_end {
-                    self.stack.push(TValue::Nil(NilKind::Strict));
-                }
-                for i in nargs_actual..nfixparams {
-                    self.stack[func_idx + 1 + i] = TValue::Nil(NilKind::Strict);
+                if proto_is_vararg {
+                    // vararg 函数: 截断栈到实际参数末尾，VARARGPREP 会处理
+                    self.stack.truncate(func_idx + 1 + nargs_actual);
+                    for i in nargs_actual..nfixparams {
+                        let idx = func_idx + 1 + i;
+                        while self.stack.len() <= idx {
+                            self.stack.push(TValue::Nil(NilKind::Strict));
+                        }
+                        self.stack[idx] = TValue::Nil(NilKind::Strict);
+                    }
+                } else {
+                    let frame_end = func_idx + 1 + fsize;
+                    while self.stack.len() < frame_end {
+                        self.stack.push(TValue::Nil(NilKind::Strict));
+                    }
+                    for i in nargs_actual..nfixparams {
+                        self.stack[func_idx + 1 + i] = TValue::Nil(NilKind::Strict);
+                    }
                 }
 
                 let result = VmExecutor::execute_loop(self);
@@ -725,12 +769,14 @@ impl LuaState {
                 self.pc = 0;
                 self.num_params = saved_num_params;
                 self.is_vararg = saved_is_vararg;
+                self.proto_flag = saved_proto_flag;
+                self.nextraargs = saved_nextraargs;
                 self.closure_upvals = saved_closure_upvals;
                 self.tbc_list = saved_tbc_list;
                 self.open_upval = saved_open_upval;
 
                 match result {
-                    Ok(VmResult::Return(nret)) => {
+                    Ok(VmResult::Return { nresults: nret, result_base }) => {
                         let expected = if nresults == MULT_RET {
                             nret
                         } else if nresults <= 0 {
@@ -739,12 +785,11 @@ impl LuaState {
                             (nret).min(nresults as usize)
                         };
 
-                        // Move results from callee's register area (func_idx + 1 + ...)
-                        // down to func_idx (replacing the function)
+                        // 从 result_base 位置取结果（可能是 VARARGPREP 调整后的 base）
                         let mut tmp_results = Vec::new();
                         for i in 0..nret {
-                            if func_idx + 1 + i < self.stack.len() {
-                                tmp_results.push(std::mem::take(&mut self.stack[func_idx + 1 + i]));
+                            if result_base + i < self.stack.len() {
+                                tmp_results.push(std::mem::take(&mut self.stack[result_base + i]));
                             } else {
                                 tmp_results.push(TValue::Nil(NilKind::Strict));
                             }
@@ -770,21 +815,17 @@ impl LuaState {
                     }
                 }
             }
-            TValue::LCFn(_f) => {
-                self.stack.truncate(func_idx);
-                self.push_string("C functions not supported in pure Rust VM");
-                ERR_RUN
+            TValue::LCFn(lcf) => {
+                Self::pcall_c_function(self, func_idx, nresults, lcf.func)
             }
-            TValue::CClosure(_) => {
-                self.stack.truncate(func_idx);
-                self.push_string("C closures not supported in pure Rust VM");
-                ERR_RUN
+            TValue::CClosure(cc) => {
+                Self::pcall_c_function(self, func_idx, nresults, cc.f)
             }
             TValue::LightUserData(tag) => {
                 let tag_val = tag as usize;
                 if tag_val == 1 {
                     let args_start = func_idx + 1;
-                    let args_end = total;
+                    let args_end = self.stack.len();
                     let mut s = String::new();
                     for i in args_start..args_end {
                         if i > args_start { s.push('\t'); }
@@ -809,6 +850,68 @@ impl LuaState {
                 ERR_RUN
             }
         }
+    }
+
+    /// 从 pcall 调用 C 函数（轻量 C 函数或 C 闭包）。
+    ///
+    /// 对应 C 的 precallC + luaD_poscall：
+    /// 1. 设置 api_func_base = func_idx，确保栈空间，调用 f(L)
+    /// 2. 把栈顶 n 个结果移动到 func_idx 位置
+    fn pcall_c_function(
+        &mut self,
+        func_idx: usize,
+        nresults: i32,
+        f: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
+    ) -> i32 {
+        use std::ffi::c_void;
+
+        // precallC: 设置 api_func_base，确保栈空间
+        let saved_api_base = self.api_func_base;
+        self.api_func_base = func_idx;
+        self.n_ccalls = self.n_ccalls.saturating_add(1);
+
+        let needed_top = self.stack.len() + MIN_STACK;
+        while self.stack.len() < needed_top {
+            self.stack.push(TValue::Nil(NilKind::Strict));
+        }
+
+        // 调用 C 函数: n = f(L)
+        let ptr: *mut LuaState = self;
+        let n = unsafe { f(ptr as *mut c_void) };
+
+        // poscall: 把栈顶 n 个结果移动到 func_idx 位置
+        let top = self.stack.len();
+        let n = n as usize;
+        let first_result = top.saturating_sub(n);
+
+        // 恢复 api_func_base 和 n_ccalls
+        self.api_func_base = saved_api_base;
+        self.n_ccalls = self.n_ccalls.saturating_sub(1);
+
+        // 计算期望结果数
+        let expected = if nresults == MULT_RET {
+            n
+        } else if nresults <= 0 {
+            0
+        } else {
+            n.min(nresults as usize)
+        };
+
+        // 把结果复制到临时 Vec，避免覆盖问题
+        let results: Vec<TValue> = (0..n)
+            .map(|i| self.stack[first_result + i].clone())
+            .collect();
+
+        // 截断到 func_idx，然后推入 expected 个结果
+        self.stack.truncate(func_idx);
+        for i in 0..expected {
+            if i < results.len() {
+                self.stack.push(results[i].clone());
+            } else {
+                self.stack.push(TValue::Nil(NilKind::Strict));
+            }
+        }
+        0
     }
 
     // ====== Open Libs ======

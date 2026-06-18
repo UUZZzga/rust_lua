@@ -52,4 +52,11 @@ pub mod mem;
 
 // FFI 接口，用于与 C/C++ 代码交互
 // C Lua API FFI 声明（lua.h / lauxlib.h）
+// 仅在 ffi feature 启用时编译（需要链接 C 实现的 liblua）。
+// 默认情况下 Rust 实现自给自足，capi.rs 导出 #[no_mangle] 符号供第三方使用。
+#[cfg(feature = "ffi")]
 pub mod lua_ffi;
+
+// C API 导出层（#[no_mangle] extern "C" fn）
+// 将 Rust VM 以 C ABI 形式导出，供第三方 Lua C 模块链接调用。
+pub mod capi;

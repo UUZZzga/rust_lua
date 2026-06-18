@@ -1351,7 +1351,7 @@ mod tests {
 
     #[test]
     fn test_vm_executor_reachable() {
-        let result: Result<VmResult, VmError> = Ok(VmResult::Return(0));
+        let result: Result<VmResult, VmError> = Ok(VmResult::Return { nresults: 0, result_base: 0 });
         assert!(result.is_ok());
     }
 

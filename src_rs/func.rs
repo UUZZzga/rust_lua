@@ -269,10 +269,14 @@ mod tests {
             trap: false,
             num_params: 0,
             is_vararg: false,
+            proto_flag: 0,
+            nextraargs: 0,
             gc: std::rc::Rc::new(crate::gc::GCState::default_incremental()),
             globals: crate::table::Table::new(),
             registry: crate::table::Table::new(),
             string_table: crate::strings::StringTable::new(),
+            api_func_base: 0,
+            n_ccalls: 0,
         }
     }
 

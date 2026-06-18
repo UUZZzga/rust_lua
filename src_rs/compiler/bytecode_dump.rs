@@ -1,3 +1,4 @@
+#[cfg(feature = "ffi")]
 use crate::lua_ffi;
 use crate::opcodes::{
     self, OPNAMES, TM_EVENT_NAMES, get_opcode, getarg_a, getarg_b, getarg_c, getarg_vc,
@@ -283,51 +284,59 @@ pub fn parse_dump(data: Vec<u8>) -> Result<DumpedFunction, String> {
 }
 
 pub unsafe fn compile_with_c_lua(source: &[u8]) -> Result<Vec<u8>, String> {
-    let L = lua_ffi::luaL_newstate();
-    if L.is_null() {
-        return Err("failed to create lua state".to_string());
-    }
-    lua_ffi::luaL_checkversion(L);
-    lua_ffi::luaL_openselectedlibs(L, 0, 0);
+    #[cfg(feature = "ffi")]
+    {
+        let L = lua_ffi::luaL_newstate();
+        if L.is_null() {
+            return Err("failed to create lua state".to_string());
+        }
+        lua_ffi::luaL_checkversion(L);
+        lua_ffi::luaL_openselectedlibs(L, 0, 0);
 
-    let load_result = lua_ffi::luaL_loadbufferx(
-        L,
-        source.as_ptr() as *const i8,
-        source.len(),
-        c"=test".as_ptr(),
-        ptr::null(),
-    );
+        let load_result = lua_ffi::luaL_loadbufferx(
+            L,
+            source.as_ptr() as *const i8,
+            source.len(),
+            c"=test".as_ptr(),
+            ptr::null(),
+        );
 
-    if load_result != lua_ffi::LUA_OK {
-        let err_ptr = lua_ffi::lua_tolstring(L, -1, ptr::null_mut());
-        let err = lua_ffi::from_cstr(err_ptr).unwrap_or("unknown error");
+        if load_result != lua_ffi::LUA_OK {
+            let err_ptr = lua_ffi::lua_tolstring(L, -1, ptr::null_mut());
+            let err = lua_ffi::from_cstr(err_ptr).unwrap_or("unknown error");
+            lua_ffi::lua_close(L);
+            return Err(format!("C compile error: {}", err));
+        }
+
+        let dump_data = Box::into_raw(Box::new(Vec::<u8>::new()));
+
+        extern "C" fn writer(_L: *mut lua_ffi::lua_State, p: *const c_void, sz: usize, ud: *mut c_void) -> c_int {
+            if sz == 0 { return 0; }
+            let data: &mut Vec<u8> = unsafe { &mut *(ud as *mut Vec<u8>) };
+            let slice = unsafe { std::slice::from_raw_parts(p as *const u8, sz) };
+            data.extend_from_slice(slice);
+            0
+        }
+
+        let result = lua_ffi::lua_dump(L, writer, dump_data as *mut c_void, 0);
+
+        if result != 0 {
+            let _ = Box::from_raw(dump_data);
+            lua_ffi::lua_close(L);
+            return Err("dump failed".to_string());
+        }
+
+        let result_data = *Box::from_raw(dump_data);
+
         lua_ffi::lua_close(L);
-        return Err(format!("C compile error: {}", err));
+
+        Ok(result_data)
     }
-
-    let dump_data = Box::into_raw(Box::new(Vec::<u8>::new()));
-
-    extern "C" fn writer(_L: *mut lua_ffi::lua_State, p: *const c_void, sz: usize, ud: *mut c_void) -> c_int {
-        if sz == 0 { return 0; }
-        let data: &mut Vec<u8> = unsafe { &mut *(ud as *mut Vec<u8>) };
-        let slice = unsafe { std::slice::from_raw_parts(p as *const u8, sz) };
-        data.extend_from_slice(slice);
-        0
+    #[cfg(not(feature = "ffi"))]
+    {
+        let _ = source;
+        Err("compile_with_c_lua requires the 'ffi' feature (links C lua)".to_string())
     }
-
-    let result = lua_ffi::lua_dump(L, writer, dump_data as *mut c_void, 0);
-
-    if result != 0 {
-        let _ = Box::from_raw(dump_data);
-        lua_ffi::lua_close(L);
-        return Err("dump failed".to_string());
-    }
-
-    let result_data = *Box::from_raw(dump_data);
-
-    lua_ffi::lua_close(L);
-
-    Ok(result_data)
 }
 
 fn format_constant(constants: &[DumpConstant], idx: usize) -> String {

@@ -7,6 +7,15 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", lua_src_dir.display());
+    println!("cargo:rerun-if-changed=Cargo.toml");
+
+    // 仅在启用 ffi feature 时编译 C 源码。
+    // 默认情况下 Rust 实现自给自足，capi.rs 导出 #[no_mangle] 符号；
+    // 若同时链接 C 库会导致符号重复定义。
+    let ffi_enabled = env::var("CARGO_FEATURE_FFI").is_ok();
+    if !ffi_enabled {
+        return;
+    }
 
     let mut build = cc::Build::new();
 

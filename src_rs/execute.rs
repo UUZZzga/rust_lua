@@ -12,7 +12,7 @@
 //! ## 规约驱动开发 (spec-driven-tdd)
 //! 每个公开函数都包含规约注释。
 
-use crate::objects::{Instruction, LClosure, NilKind, Proto, TValue, UpVal};
+use crate::objects::{Instruction, LClosure, NilKind, Proto, TValue, UpVal, PF_VAHID, PF_VATAB};
 use crate::opcodes::{self, OpCode};
 use crate::table::Table;
 use crate::tm::{
@@ -22,9 +22,10 @@ use crate::tm::{
 use crate::vm::{to_number_ns, to_integer_ns, F2IMode, shiftl, is_false, objlen,
     concat_stack, equal, less_than, less_equal, raw_equal, float_to_integer,
     modulus, modulus_float, idiv};
-use crate::state::LuaState;
+use crate::state::{LuaState, LUA_MINSTACK};
 use crate::gc::GCState;
 use std::rc::Rc;
+use std::ffi::c_void;
 
 // ============================================================================
 // VmResult / VmError
@@ -32,7 +33,7 @@ use std::rc::Rc;
 
 #[derive(Debug)]
 pub enum VmResult {
-    Return(usize),
+    Return { nresults: usize, result_base: usize },
     TailCall { proto: Proto, base: usize },
     Call { proto: Proto, base: usize, num_results: i32 },
     Done,
@@ -77,6 +78,8 @@ struct CallFrame {
     num_results: usize,
     num_params: u8,
     is_vararg: bool,
+    proto_flag: u8,
+    nextraargs: i32,
     closure_upvals: Vec<UpVal>,
     tbc_list: Option<usize>,
     open_upval: Option<usize>,
@@ -112,19 +115,18 @@ impl VmExecutor {
                     state.pc = frame.return_pc;
                     state.num_params = frame.num_params;
                     state.is_vararg = frame.is_vararg;
+                    state.proto_flag = frame.proto_flag;
+                    state.nextraargs = frame.nextraargs;
                     state.closure_upvals = frame.closure_upvals;
                     state.tbc_list = frame.tbc_list;
                     state.open_upval = frame.open_upval;
                     continue;
                 }
-                return Ok(VmResult::Return(0));
+                return Ok(VmResult::Return { nresults: 0, result_base: state.base });
             }
 
             let inst = state.code[state.pc];
             let op = opcodes::get_opcode(inst);
-            // eprintln!("DEBUG EXEC: pc={}, op={:?}({}), A={}, B={}, C={}, stack.len={}, base={}", 
-            //     state.pc, op, inst, opcodes::getarg_a(inst), opcodes::getarg_b(inst), 
-            //     opcodes::getarg_c(inst), state.stack.len(), state.base);
 
             match op {
                 OpCode::MOVE => Self::op_move(state, inst),
@@ -231,6 +233,7 @@ impl VmExecutor {
                         let proto_protos = closure.proto.protos.clone();
                         let proto_num_params = closure.proto.num_params;
                         let proto_is_vararg = closure.proto.is_vararg();
+                        let proto_flag = closure.proto.flag;
                         let proto_max_stack = closure.proto.max_stack_size;
                         let _ = closure;
                         let _ = func_val;
@@ -251,6 +254,8 @@ impl VmExecutor {
                             num_results: nresults,
                             num_params: state.num_params,
                             is_vararg: state.is_vararg,
+                            proto_flag: state.proto_flag,
+                            nextraargs: state.nextraargs,
                             closure_upvals: std::mem::take(&mut state.closure_upvals),
                             tbc_list: state.tbc_list.take(),
                             open_upval: state.open_upval.take(),
@@ -264,6 +269,8 @@ impl VmExecutor {
                         state.pc = 0;
                         state.num_params = proto_num_params;
                         state.is_vararg = proto_is_vararg;
+                        state.proto_flag = proto_flag;
+                        state.nextraargs = 0;
                         state.closure_upvals = Vec::new();
                         state.tbc_list = None;
                         state.open_upval = None;
@@ -1348,6 +1355,7 @@ impl VmExecutor {
                 let nresults = if c == 1 { 0 } else { (c - 1) as usize };
                 let fsize = closure.proto.max_stack_size as usize;
                 let nfixparams = closure.proto.num_params as usize;
+                let proto_is_vararg = closure.proto.is_vararg();
 
                 call_stack.push(CallFrame {
                     code: std::mem::take(&mut state.code),
@@ -1360,6 +1368,8 @@ impl VmExecutor {
                     num_results: nresults,
                     num_params: state.num_params,
                     is_vararg: state.is_vararg,
+                    proto_flag: state.proto_flag,
+                    nextraargs: state.nextraargs,
                     closure_upvals: std::mem::take(&mut state.closure_upvals),
                     tbc_list: state.tbc_list.take(),
                     open_upval: state.open_upval.take(),
@@ -1373,16 +1383,29 @@ impl VmExecutor {
                 state.pc = 0;
                 state.num_params = closure.proto.num_params;
                 state.is_vararg = closure.proto.is_vararg();
+                state.proto_flag = closure.proto.flag;
+                state.nextraargs = 0;
                 state.closure_upvals = Vec::new();
                 state.tbc_list = None;
                 state.open_upval = None;
 
-                let frame_end = a + 1 + fsize;
-                while state.stack.len() < frame_end {
-                    state.stack.push(TValue::Nil(NilKind::Strict));
-                }
-                for i in nargs..nfixparams {
-                    state.stack[a + 1 + i] = TValue::Nil(NilKind::Strict);
+                if proto_is_vararg {
+                    // vararg 函数: 截断栈到实际参数末尾，VARARGPREP 会处理变参并扩展栈
+                    // 对应 C 的 L->top = ra + b (OP_CALL 中设置)
+                    state.stack.truncate(a + 1 + nargs);
+                    // 填充不足的固定参数为 nil
+                    for i in nargs..nfixparams {
+                        Self::write_stack(state, a + 1 + i, TValue::Nil(NilKind::Strict));
+                    }
+                } else {
+                    // 非 vararg 函数: 直接扩展到 fsize
+                    let frame_end = a + 1 + fsize;
+                    while state.stack.len() < frame_end {
+                        state.stack.push(TValue::Nil(NilKind::Strict));
+                    }
+                    for i in nargs..nfixparams {
+                        state.stack[a + 1 + i] = TValue::Nil(NilKind::Strict);
+                    }
                 }
                 Ok(())
             }
@@ -1414,6 +1437,14 @@ impl VmExecutor {
                 state.pc += 1;
                 Ok(())
             }
+            TValue::LCFn(lcf) => {
+                Self::call_c_function(state, a, b, c, lcf.func)?;
+                Ok(())
+            }
+            TValue::CClosure(cc) => {
+                Self::call_c_function(state, a, b, c, cc.f)?;
+                Ok(())
+            }
             _ => {
                 state.pc += 1;
                 Ok(())
@@ -1421,8 +1452,93 @@ impl VmExecutor {
         }
     }
 
+    /// 调用 C 函数（轻量 C 函数或 C 闭包），对应 C 的 precallC + luaD_poscall。
+    ///
+    /// 语义:
+    /// 1. precallC: 设置 api_func_base = a，确保栈空间，调用 f(L)
+    /// 2. poscall: 把栈顶 n 个结果移动到 a 位置，根据 nresults 调整栈顶
+    ///
+    /// 参数:
+    /// - a: 函数在栈中的位置（0-based）
+    /// - b: 指令的 B 操作数（参数数+1，0 表示 MULTRET）
+    /// - c: 指令的 C 操作数（结果数+1，0 表示 MULTRET）
+    /// - f: C 函数指针
+    fn call_c_function(
+        state: &mut LuaState,
+        a: usize,
+        _b: usize,
+        c: i32,
+        f: unsafe extern "C" fn(*mut c_void) -> i32,
+    ) -> Result<(), VmError> {
+        // nresults: -1 = MULTRET, >=0 = 固定结果数
+        let nresults: i32 = if c == 0 { -1 } else { c - 1 };
+
+        // precallC: 设置 api_func_base，确保栈空间
+        let saved_api_base = state.api_func_base;
+        state.api_func_base = a;
+        state.n_ccalls = state.n_ccalls.saturating_add(1);
+
+        // 确保栈空间 (LUA_MINSTACK)
+        let needed_top = state.stack.len() + LUA_MINSTACK;
+        while state.stack.len() < needed_top {
+            state.stack.push(TValue::Nil(NilKind::Strict));
+        }
+
+        // 调用 C 函数: n = f(L)
+        // C 函数通过 capi.rs 导出的 API 操作栈，返回结果数 n
+        let ptr: *mut LuaState = state;
+        let n = unsafe { f(ptr as *mut c_void) };
+
+        // poscall: 把栈顶 n 个结果移动到 a 位置
+        let top = state.stack.len();
+        let n = n as usize;
+        let first_result = top.saturating_sub(n);
+
+        // 恢复 api_func_base 和 n_ccalls
+        state.api_func_base = saved_api_base;
+        state.n_ccalls = state.n_ccalls.saturating_sub(1);
+
+        // 移动结果到 a 位置（对应 C 的 moveresults）
+        if nresults >= 0 {
+            // 固定结果数
+            let nresults = nresults as usize;
+            let copy_count = n.min(nresults);
+            // 先把结果复制到临时 Vec，避免覆盖问题
+            let results: Vec<TValue> = (0..copy_count)
+                .map(|i| state.stack[first_result + i].clone())
+                .collect();
+            // 确保 a + nresults 在栈范围内
+            while state.stack.len() <= a + nresults {
+                state.stack.push(TValue::Nil(NilKind::Strict));
+            }
+            for i in 0..copy_count {
+                state.stack[a + i] = results[i].clone();
+            }
+            for i in copy_count..nresults {
+                state.stack[a + i] = TValue::Nil(NilKind::Strict);
+            }
+            state.stack.truncate(a + nresults);
+        } else {
+            // MULTRET: 保留所有 n 个结果
+            let results: Vec<TValue> = (0..n)
+                .map(|i| state.stack[first_result + i].clone())
+                .collect();
+            while state.stack.len() < a + n {
+                state.stack.push(TValue::Nil(NilKind::Strict));
+            }
+            for i in 0..n {
+                state.stack[a + i] = results[i].clone();
+            }
+            state.stack.truncate(a + n);
+        }
+
+        state.pc += 1;
+        Ok(())
+    }
+
     fn op_tailcall(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
+        let b = opcodes::getarg_b(inst) as usize;
         let func_val = Self::read_stack(state, a).clone();
         match func_val {
             TValue::LClosure(closure) => {
@@ -1431,6 +1547,7 @@ impl VmExecutor {
                 let nfixparams = closure.proto.num_params as usize;
                 let nargs = nargs_total.saturating_sub(1);
                 let func_slot = state.base.saturating_sub(1);
+                let proto_is_vararg = closure.proto.is_vararg();
 
                 for i in 0..nargs_total {
                     let src = a + i;
@@ -1447,20 +1564,42 @@ impl VmExecutor {
                 state.pc = 0;
                 state.num_params = closure.proto.num_params;
                 state.is_vararg = closure.proto.is_vararg();
+                state.proto_flag = closure.proto.flag;
+                state.nextraargs = 0;
                 state.closure_upvals = Vec::new();
                 state.tbc_list = None;
                 state.open_upval = None;
 
-                let frame_end = func_slot + 1 + fsize;
-                while state.stack.len() < frame_end {
-                    state.stack.push(TValue::Nil(NilKind::Strict));
-                }
-                for i in nargs..nfixparams {
-                    state.stack[func_slot + 1 + i] = TValue::Nil(NilKind::Strict);
+                if proto_is_vararg {
+                    // vararg 函数: 截断栈到实际参数末尾，VARARGPREP 会处理
+                    state.stack.truncate(func_slot + 1 + nargs);
+                    for i in nargs..nfixparams {
+                        Self::write_stack(state, func_slot + 1 + i, TValue::Nil(NilKind::Strict));
+                    }
+                } else {
+                    let frame_end = func_slot + 1 + fsize;
+                    while state.stack.len() < frame_end {
+                        state.stack.push(TValue::Nil(NilKind::Strict));
+                    }
+                    for i in nargs..nfixparams {
+                        state.stack[func_slot + 1 + i] = TValue::Nil(NilKind::Strict);
+                    }
                 }
                 Ok(())
             }
-            _ => Ok(())
+            TValue::LCFn(lcf) => {
+                // TAILCALL C 函数: 调用后结果放在 a 位置，后续 RETURN 指令处理返回
+                Self::call_c_function(state, a, b, 0, lcf.func)?;
+                Ok(())
+            }
+            TValue::CClosure(cc) => {
+                Self::call_c_function(state, a, b, 0, cc.f)?;
+                Ok(())
+            }
+            _ => {
+                state.pc += 1;
+                Ok(())
+            }
         }
     }
 
@@ -1488,6 +1627,8 @@ impl VmExecutor {
             state.pc = frame.return_pc;
             state.num_params = frame.num_params;
             state.is_vararg = frame.is_vararg;
+            state.proto_flag = frame.proto_flag;
+            state.nextraargs = frame.nextraargs;
             state.closure_upvals = frame.closure_upvals;
             state.tbc_list = frame.tbc_list;
             state.open_upval = frame.open_upval;
@@ -1505,7 +1646,7 @@ impl VmExecutor {
             state.stack.truncate(return_base + num_results);
             Ok(None)
         } else {
-            Ok(Some(VmResult::Return(nresults)))
+            Ok(Some(VmResult::Return { nresults, result_base: a }))
         }
     }
 
@@ -1521,6 +1662,8 @@ impl VmExecutor {
             state.pc = frame.return_pc;
             state.num_params = frame.num_params;
             state.is_vararg = frame.is_vararg;
+            state.proto_flag = frame.proto_flag;
+            state.nextraargs = frame.nextraargs;
             state.closure_upvals = frame.closure_upvals;
             state.tbc_list = frame.tbc_list;
             state.open_upval = frame.open_upval;
@@ -1533,7 +1676,7 @@ impl VmExecutor {
             state.stack.truncate(return_base + num_results);
             Ok(None)
         } else {
-            Ok(Some(VmResult::Return(0)))
+            Ok(Some(VmResult::Return { nresults: 0, result_base: state.base }))
         }
     }
 
@@ -1555,6 +1698,8 @@ impl VmExecutor {
             state.pc = frame.return_pc;
             state.num_params = frame.num_params;
             state.is_vararg = frame.is_vararg;
+            state.proto_flag = frame.proto_flag;
+            state.nextraargs = frame.nextraargs;
             state.closure_upvals = frame.closure_upvals;
             state.tbc_list = frame.tbc_list;
             state.open_upval = frame.open_upval;
@@ -1568,10 +1713,12 @@ impl VmExecutor {
             state.stack.truncate(return_base + num_results);
             Ok(None)
         } else {
-            if state.base > 0 && state.base - 1 < state.stack.len() {
-                state.stack[state.base - 1] = val;
+            // call_stack 为空（pcall 顶层 return 场景）：把返回值放到 base-1（func 位置）
+            let result_base = state.base.saturating_sub(1);
+            if state.base > 0 && result_base < state.stack.len() {
+                state.stack[result_base] = val;
             }
-            Ok(Some(VmResult::Return(1)))
+            Ok(Some(VmResult::Return { nresults: 1, result_base }))
         }
     }
 
@@ -1782,39 +1929,219 @@ impl VmExecutor {
         Ok(())
     }
 
+    /// VARARG: 获取变参列表（对应 C 的 OP_VARARG + luaT_getvarargs）
+    ///
+    /// 指令格式: A B C k
+    /// - A: 目标寄存器起始位置
+    /// - C - 1: 需要的结果数（0 = MULTRET，取全部）
+    /// - k 位 + B: 如果 k=1，B 是 vararg 表的寄存器偏移；否则无表（PF_VAHID 模式）
     fn op_vararg(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let ra = Self::ra(state, inst);
-        let n = opcodes::getarg_c(inst) as usize;
-        let n_actual = if n == 0 { state.stack.len().saturating_sub(ra) } else { n.saturating_sub(1) };
-        for i in 0..n_actual {
-            let src_idx = state.base + state.num_params as usize + i;
-            let val = if src_idx < state.stack.len() { state.stack[src_idx].clone() } else { TValue::Nil(NilKind::Strict) };
-            Self::write_stack(state, ra + i, val);
+        let c = opcodes::getarg_c(inst) as i32;
+        let wanted: i32 = c - 1;  // -1 = MULTRET
+        let has_vatab = opcodes::testarg_k(inst);
+        let vatab = if has_vatab { opcodes::getarg_b(inst) as usize } else { usize::MAX };
+
+        if has_vatab {
+            // PF_VATAB: 从 vararg 表取值
+            // 表在 state.base + vatab（对应 C 的 ci->func.p + vatab + 1，因为 state.base = func + 1）
+            let table_pos = state.base + vatab;
+            let table_val = Self::read_stack(state, table_pos).clone();
+            let nargs = if let TValue::Table(ref t) = table_val {
+                if let Some(TValue::Integer(n)) = t.get(&TValue::Str(state.string_table.intern("n"))) {
+                    *n as usize
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
+            let touse = if wanted < 0 { nargs } else { (wanted as usize).min(nargs) };
+            let need_fill = if wanted < 0 { 0 } else { (wanted as usize).saturating_sub(touse) };
+
+            for i in 0..touse {
+                let val = if let TValue::Table(ref t) = table_val {
+                    t.get_int((i + 1) as i64).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
+                } else {
+                    TValue::Nil(NilKind::Strict)
+                };
+                Self::write_stack(state, ra + i, val);
+            }
+            for i in 0..need_fill {
+                Self::write_stack(state, ra + touse + i, TValue::Nil(NilKind::Strict));
+            }
+            if wanted < 0 {
+                // MULTRET: 设置 top = ra + nargs
+                state.stack.truncate(ra + touse);
+            }
+        } else {
+            // PF_VAHID: 从隐藏变参取值
+            let nextra = state.nextraargs as usize;
+            // 变参在 state.base - 1 - nextra .. state.base - 2
+            let vararg_start = state.base.saturating_sub(1 + nextra);
+            let touse = if wanted < 0 { nextra } else { (wanted as usize).min(nextra) };
+            let need_fill = if wanted < 0 { 0 } else { (wanted as usize).saturating_sub(touse) };
+
+            for i in 0..touse {
+                let val = state.stack[vararg_start + i].clone();
+                Self::write_stack(state, ra + i, val);
+            }
+            for i in 0..need_fill {
+                Self::write_stack(state, ra + touse + i, TValue::Nil(NilKind::Strict));
+            }
+            if wanted < 0 {
+                // MULTRET: 设置 top = ra + nextra
+                state.stack.truncate(ra + touse);
+            }
         }
         state.pc += 1;
         Ok(())
     }
 
+    /// GETVARG: 获取单个变参（对应 C 的 OP_GETVARG + luaT_getvararg）
+    ///
+    /// 指令格式: A B C
+    /// - A: 目标寄存器
+    /// - R[C]: 键（整数 n 取第 n 个变参，字符串 "n" 返回变参数量）
+    ///
+    /// 仅用于 PF_VAHID 模式（PF_VATAB 模式下编译器会生成 GETTABLE）
     fn op_getvarg(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let ra = Self::ra(state, inst);
         let c = Self::rc(state, inst);
-        let idx = match Self::read_stack(state, c) {
-            TValue::Integer(i) => *i as usize,
-            _ => 0,
+        let key = Self::read_stack(state, c).clone();
+        let nextra = state.nextraargs;
+
+        let result = match &key {
+            TValue::Integer(n) => {
+                let n = *n;
+                if n >= 1 && (n as usize) <= nextra as usize {
+                    // 变参在 state.base - 1 - nextra .. state.base - 2
+                    // 第 n 个变参在 state.base - 1 - nextra + (n - 1) = state.base - nextra + n - 2
+                    let idx = state.base.saturating_sub(nextra as usize + 1).saturating_add(n as usize - 1);
+                    if idx < state.stack.len() {
+                        state.stack[idx].clone()
+                    } else {
+                        TValue::Nil(NilKind::Strict)
+                    }
+                } else {
+                    TValue::Nil(NilKind::Strict)
+                }
+            }
+            TValue::Str(s) => {
+                if s.as_str() == "n" {
+                    TValue::Integer(nextra as i64)
+                } else {
+                    TValue::Nil(NilKind::Strict)
+                }
+            }
+            _ => TValue::Nil(NilKind::Strict),
         };
-        let src_idx = state.base + state.num_params as usize + idx;
-        let val = if src_idx < state.stack.len() { state.stack[src_idx].clone() } else { TValue::Nil(NilKind::Strict) };
-        Self::write_stack(state, ra, val);
+        Self::write_stack(state, ra, result);
         state.pc += 1;
         Ok(())
     }
 
-    fn op_errnnil(state: &mut LuaState, _inst: Instruction) -> Result<(), VmError> {
+    /// ERRNNIL: 如果 R[A] 不为 nil，报 "global already defined" 错误
+    ///
+    /// 指令格式: A Bx
+    /// - A: 要检查的寄存器
+    /// - Bx: 常量表索引+1（Bx==0 表示索引不可用，用 "?" 作为名字）
+    ///
+    /// 对应 C 的 OP_ERRNNIL + luaG_errnnil
+    fn op_errnnil(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+        let a = Self::ra(state, inst);
+        let val = Self::read_stack(state, a);
+        if !matches!(val, TValue::Nil(_)) {
+            let bx = opcodes::getarg_bx(inst) as usize;
+            let globalname = if bx > 0 {
+                let k_idx = bx - 1;
+                if k_idx < state.constants.len() {
+                    if let TValue::Str(s) = &state.constants[k_idx] {
+                        s.as_str().to_string()
+                    } else {
+                        "?".to_string()
+                    }
+                } else {
+                    "?".to_string()
+                }
+            } else {
+                "?".to_string()
+            };
+            return Err(VmError::RuntimeError(format!("global '{}' already defined", globalname)));
+        }
         state.pc += 1;
         Ok(())
     }
 
+    /// VARARGPREP: 调整变参函数的栈布局（对应 C 的 luaT_adjustvarargs）
+    ///
+    /// 两种模式:
+    /// - PF_VAHID: 隐藏变参。把 func 和固定参数复制到变参之后，调整 base。
+    ///   变参留在原位，通过 state.nextraargs 记录数量。
+    /// - PF_VATAB: 建表模式。把变参打包成表，放到固定参数之后的位置。
+    ///
+    /// 调用前栈布局 (state.base = a + 1, func 在 state.base - 1):
+    ///   [func][arg1..argNfix][extra1..extraK]
+    ///   ^state.base-1        ^state.base     ^state.base+nfixparams
+    ///
+    /// totalargs = stack.len() - state.base (即 func 之后的所有参数)
     fn op_varargprep(state: &mut LuaState, _inst: Instruction) -> Result<(), VmError> {
+        let flag = state.proto_flag;
+        if flag & (PF_VAHID | PF_VATAB) == 0 {
+            // 非变参函数，无需调整
+            state.pc += 1;
+            return Ok(());
+        }
+
+        let nfixparams = state.num_params as usize;
+        // totalargs = L->top - ci->func - 1 = stack.len() - (base - 1) - 1 = stack.len() - base
+        let totalargs = state.stack.len().saturating_sub(state.base);
+        let nextra = totalargs.saturating_sub(nfixparams);
+
+        if flag & PF_VATAB != 0 {
+            // PF_VATAB: 创建 vararg 表
+            // 变参在 state.base + nfixparams .. state.base + nfixparams + nextra
+            let vatab_pos = state.base + nfixparams;
+            let mut table = Table::new();
+            for i in 0..nextra {
+                let val = state.stack[vatab_pos + i].clone();
+                table.set_int((i + 1) as i64, val);
+            }
+            // t.n = nextra
+            let key_n = state.string_table.intern("n");
+            table.set(TValue::Str(key_n), TValue::Integer(nextra as i64));
+            // 把表放到 vatab_pos 位置，截断后续
+            state.stack[vatab_pos] = TValue::Table(table);
+            state.stack.truncate(vatab_pos + 1);
+        } else {
+            // PF_VAHID: 隐藏变参 (buildhiddenargs)
+            state.nextraargs = nextra as i32;
+            let func_pos = state.base - 1;
+            // 把 func 副本复制到栈顶（变参之后）
+            let func_val = state.stack[func_pos].clone();
+            state.stack.push(func_val);
+            // 把固定参数复制到栈顶，原位置设为 nil
+            for i in 0..nfixparams {
+                let val = state.stack[state.base + i].clone();
+                state.stack.push(val);
+                state.stack[state.base + i] = TValue::Nil(NilKind::Strict);
+            }
+            // 调整 base: ci->func.p += totalargs + 1 → state.base += totalargs + 1
+            // 新的 func 在变参之后，变参在新 func 之前
+            state.base += totalargs + 1;
+            // vararg 参数位置（原固定参数之后）设为 nil
+            // 对应 C 的 setnilvalue(s2v(ci->func.p + nfixparams + 1))
+            // 此时 state.base 已调整，新 func 在 state.base - 1
+            // 原来的 vararg 位置 = 新 func - nextra - 1 = state.base - 1 - nextra - 1
+            // 但 C 是在调整前设置 nil，位置是 ci->func.p + nfixparams + 1（旧 func）
+            // 旧 func + nfixparams + 1 = 旧 base + nfixparams = 变参起始位置
+            // 这个位置在 buildhiddenargs 后已经是变参区域的一部分，不需要设 nil
+            // C 代码是在 buildhiddenargs 之后执行 setnilvalue(ci->func.p + nfixparams + 1)
+            // 但此时 ci->func.p 已调整，ci->func.p + nfixparams + 1 指向新区域的 vararg 槽
+            // 实际上这个 nil 是为了标记 vararg 参数槽为空（供 GC）
+            // 在 Rust 中我们不需要 GC 标记，跳过此步
+        }
+
         state.pc += 1;
         Ok(())
     }
@@ -2705,12 +3032,21 @@ mod tests {
 
     #[test]
     fn test_execute_errnnil() {
+        // R[0] = nil 时，ERRNNIL 不报错
         let code = vec![
-            make_asbx(OpCode::LOADI, 0, 42),
+            make_abc(OpCode::LOADNIL, 0, 0, 0),
             make_bx(OpCode::ERRNNIL, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
+
+        // R[0] = 42（非 nil）时，ERRNNIL 应报错
+        let code2 = vec![
+            make_asbx(OpCode::LOADI, 0, 42),
+            make_bx(OpCode::ERRNNIL, 0, 0),
+        ];
+        let proto2 = make_proto(code2, vec![]);
+        assert!(execute_test(&proto2, 0, default_stack(10)).is_err());
     }
 
     #[test]
@@ -2814,7 +3150,7 @@ mod tests {
     fn test_vm_result_done() {
         let proto = make_proto(vec![], vec![]);
         let result = execute_test(&proto, 0, default_stack(10)).unwrap();
-        assert!(matches!(result, VmResult::Return(0)));
+        assert!(matches!(result, VmResult::Return { nresults: 0, .. }));
     }
 
     // ========================================================================
