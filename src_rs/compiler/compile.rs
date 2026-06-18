@@ -2639,12 +2639,16 @@ fn code_setfield_k(fs: &mut FuncState, table: i32, k: i32, val: i32, is_k: bool)
 }
 
 /// 检查全局变量是否存在: GETTABUP + ERRNNIL
-fn checkglobal(fs: &mut FuncState, varname: &str, _line: i32) {
+fn checkglobal(fs: &mut FuncState, varname: &str, line: i32) {
     let r = fs.alloc_reg();
     let k = fs.string_k(varname);
     code_gettabup(fs, r, 0, k);
+    // Like C's luaK_codecheckglobal: luaK_fixline(fs, line) after exp2anyreg
+    fs.fixline(line);
     let k_bx = if k >= crate::opcodes::MAXARG_BX as i32 { 0 } else { k + 1 };
     fs.code_abx(OpCode::ERRNNIL, r, k_bx);
+    // Like C's luaK_codecheckglobal: luaK_fixline(fs, line) after ERRNNIL
+    fs.fixline(line);
     fs.free_reg();
 }
 
@@ -2854,7 +2858,7 @@ fn globalstat(fs: &mut FuncState) {
 
 /// ANTLR4: `'global' 'function' NAME funcbody ;` — 处理 global function
 /// C 顺序: buildglobal → body → checkglobal → storevar
-fn globalfunc(fs: &mut FuncState, _line: i32) {
+fn globalfunc(fs: &mut FuncState, line: i32) {
     let fname = get_name(fs);
     fs.add_local_kind(&fname, fs.pc, GDKREG);
     let k = fs.string_k(&fname);
@@ -2890,10 +2894,12 @@ fn globalfunc(fs: &mut FuncState, _line: i32) {
         fs.free_reg(); // key_reg
         fs.free_reg(); // table_reg
     } else {
-        checkglobal(fs, &fname, _line);
+        checkglobal(fs, &fname, line);
         code_settabup(fs, 0, k, r);
         fs.free_reg();
     }
+    // Like C's globalfunc: luaK_fixline(fs, line) after storevar
+    fs.fixline(line);
 }
 
 /// ANTLR4: global 分发 — 判断 global function 或 global 变量声明
@@ -3971,6 +3977,8 @@ fn load_func(fs: &mut FuncState, p: &PrefixResult, is_method: bool) -> (i32, boo
 
 /// ANTLR4: `args: '(' explist? ')' | tableconstructor | STRING ;` 及 `':' NAME args ;` — 解析函数参数并生成 CALL 指令
 fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
+    // Like C's funcargs: save line at start for luaK_fixline after CALL
+    let line = fs.ls().lastline;
     if matches!(&fs.ls().token, Token::String(..)) {
         let str_s = match &fs.ls().token {
             Token::String(s) => s.clone(),
@@ -3981,6 +3989,8 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
         let kr = fs.alloc_reg();
         fs.code_abx(OpCode::LOADK, kr, k);
         let pc = fs.code_abc(OpCode::CALL, freg, 2, 2);
+        // C++ funcargs: luaK_fixline(fs, line) after CALL
+        fs.fixline(line);
         // C++ funcargs: call removes function and arguments and leaves one result
         fs.set_freereg(freg + 1);
         return pc;
@@ -3993,6 +4003,8 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
             fs.free_reg();
         }
         let pc = fs.code_abc(OpCode::CALL, freg, 2, 2);
+        // C++ funcargs: luaK_fixline(fs, line) after CALL
+        fs.fixline(line);
         // C++ funcargs: call removes function and arguments and leaves one result
         fs.set_freereg(freg + 1);
         return pc;
@@ -4035,6 +4047,7 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
             let kr = fs.alloc_reg();
             fs.code_abx(OpCode::LOADK, kr, k);
             let pc = fs.code_abc(OpCode::CALL, freg, 3, 2);
+            fs.fixline(line);
             fs.set_freereg(freg + 1);
             return pc;
         }
@@ -4046,6 +4059,7 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
                 fs.free_reg();
             }
             let pc = fs.code_abc(OpCode::CALL, freg, 3, 2);
+            fs.fixline(line);
             fs.set_freereg(freg + 1);
             return pc;
         }
@@ -4055,13 +4069,15 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
             expect(fs, &Token::RParen);
             let na_adj = if na_multret { 0 } else { na + 2 };
             let pc = fs.code_abc(OpCode::CALL, freg, na_adj, 2);
+            // C++ funcargs: luaK_fixline(fs, line) after CALL
+            fs.fixline(line);
             // C++ funcargs: call removes function and arguments and leaves one result
             fs.set_freereg(freg + 1);
             return pc;
         }
         return -1;
     }
-    
+
     if check(fs, &Token::LParen) {
         fs.ls_mut().next();
         if fs.freereg <= freg {
@@ -4071,6 +4087,8 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
         expect(fs, &Token::RParen);
         let nparams_adj = if nparams_multret { 0 } else { nparams + 1 };
         let pc = fs.code_abc(OpCode::CALL, freg, nparams_adj, 2);
+        // C++ funcargs: luaK_fixline(fs, line) after CALL
+        fs.fixline(line);
         // C++ funcargs: call removes function and arguments and leaves one result
         fs.set_freereg(freg + 1);
         return pc;
@@ -9200,7 +9218,9 @@ fn parse_for(fs: &mut FuncState) {
             vars.push(var);
         }
         expect(fs, &Token::In);
-        
+
+        // C: line = ls->linenumber (line of 'in' keyword, used for luaK_fixline in forbody)
+        let for_line = fs.ls().lastline;
         let saved_freereg = fs.freereg;
         let base = fs.freereg;
 
@@ -9297,11 +9317,10 @@ fn parse_for(fs: &mut FuncState) {
             block.has_upval = true;
         }
 
-        fs.set_freereg(base + 3 + ncontrol);
+        // C: adjust_assign sets freereg = base + 4 (3 internal + 1 control var)
+        // User-declared variables (beyond the control var) are activated later in forbody.
+        fs.set_freereg(base + 4);
         fs.needclose = true;
-        if fs.freereg > fs.max_freereg {
-            fs.max_freereg = fs.freereg;
-        }
 
         // C: luaK_checkstack(fs, 2);  /* extra space to call iterator */
         fs.checkstack(2);
@@ -9324,6 +9343,9 @@ fn parse_for(fs: &mut FuncState) {
         let parent_insidetbc = fs.block_stack.last().map(|b| b.insidetbc).unwrap_or(false);
         fs.block_stack.push(BlockEntry { saved_nlocals: body_nlocals, saved_ngotos: body_saved_ngotos, has_upval: false, is_function_body: false, nactvar: body_entry_nactvar, reglevel: body_entry_reglevel, insidetbc: parent_insidetbc });
 
+        // Like C's forbody: fs->freereg-- (TFORPREP removes one register from stack)
+        fs.set_freereg(base + 4 - 1);  // base + 3
+
         // Like C's adjustlocalvars(ls, nvars): activate user-declared variables INSIDE body block
         // Also assign registers to them (like C's luaK_reserveregs)
         // C's adjustlocalvars calls registerlocalvar for each var, registering them to locvars
@@ -9344,6 +9366,11 @@ fn parse_for(fs: &mut FuncState) {
             }
         }
 
+        // Like C's luaK_reserveregs(fs, nvars): reserve registers for user variables
+        // nvars = ncontrol (number of user-declared variables including control var)
+        fs.checkstack(ncontrol);
+        fs.set_freereg(base + 3 + ncontrol);
+
         // parse_block creates the inner block (like C's block() in forbody)
         parse_block(fs);
 
@@ -9362,8 +9389,12 @@ fn parse_for(fs: &mut FuncState) {
 
         fs.fix_jump(prep, fs.pc, false);
         fs.code_abc(OpCode::TFORCALL, base, 0, ncontrol);
+        // Like C's forbody: luaK_fixline(fs, line) after TFORCALL
+        fs.fixline(for_line);
         let loop_pc = fs.code_abx(OpCode::TFORLOOP, base, 0);
         fs.fix_jump(loop_pc, prep + 1, true);
+        // Like C's forbody: luaK_fixline(fs, line) after FORLOOP
+        fs.fixline(for_line);
 
         // Handle forstat block exit (like C's leaveblock for forstat) [GENERIC FOR]
         // C order: 1) CLOSE  2) removevars  3) freereg  4) createlabel(break)  5) solvegotos
@@ -9397,6 +9428,8 @@ fn parse_for(fs: &mut FuncState) {
 
 /// ANTLR4: `'function' funcname funcbody ;`
 fn parse_func_stat(fs: &mut FuncState) {
+    // Like C's funcstat: save line for luaK_fixline after storevar
+    let line = fs.ls().lastline;
     fs.ls_mut().next();
     let name = get_name(fs);
 
@@ -9426,6 +9459,7 @@ fn parse_func_stat(fs: &mut FuncState) {
             let r = parse_body_ex(fs, false, None);
             fs.code_abc(OpCode::MOVE, reg, r, 0);
             fs.free_reg();
+            fs.fixline(line);
             return;
         }
 
@@ -9437,6 +9471,7 @@ fn parse_func_stat(fs: &mut FuncState) {
                 let r = parse_body_ex(fs, false, None);
                 fs.code_abc(OpCode::SETUPVAL, uv_idx, r, 0);
                 fs.free_reg();
+                fs.fixline(line);
                 return;
             }
         }
@@ -9522,6 +9557,7 @@ fn parse_func_stat(fs: &mut FuncState) {
             }
         }
         fs.free_reg();
+        fs.fixline(line);
         return;
     }
 
@@ -9610,6 +9646,8 @@ fn parse_func_stat(fs: &mut FuncState) {
     // Free all temporary registers allocated above (base_reg for non-locals,
     // intermediate GETFIELD results, and freg for the closure).
     fs.set_freereg(saved_freereg);
+    // Like C's funcstat: luaK_fixline(fs, line) after storevar
+    fs.fixline(line);
 }
 
 /// ANTLR4: `'local' 'function' NAME funcbody | 'local' attnamelist ('=' explist)? ;`
