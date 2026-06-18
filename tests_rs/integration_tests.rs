@@ -1,8 +1,8 @@
 use std::process::Command;
 use lua_rs::cli::Interpreter;
-use std::os::unix::io::AsRawFd;
-use std::io;
+use std::io::Write;
 use std::os::unix::process::ExitStatusExt;
+use std::sync::{Arc, Mutex};
 
 fn lua_path() -> String {
     let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -10,67 +10,45 @@ fn lua_path() -> String {
     path.to_str().unwrap().to_string()
 }
 
+// 可共享的 writer，用于捕获输出
+struct SharedWriter {
+    buffer: Arc<Mutex<Vec<u8>>>,
+}
+
+impl SharedWriter {
+    fn new() -> (Self, Arc<Mutex<Vec<u8>>>) {
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        (Self { buffer: buffer.clone() }, buffer)
+    }
+}
+
+impl Write for SharedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 fn run_lua(args: &[&str]) -> std::process::Output {
-    use std::io::{Read, Write};
-    use std::os::unix::io::FromRawFd;
+    let mut interpreter = Interpreter::new().unwrap();
 
-    // 创建管道用于捕获 stdout 和 stderr
-    let mut stdout_pipe = [0i32; 2];
-    let mut stderr_pipe = [0i32; 2];
-    let mut stdin_pipe = [0i32; 2];
-
-    unsafe {
-        libc::pipe(stdout_pipe.as_mut_ptr());
-        libc::pipe(stderr_pipe.as_mut_ptr());
-        libc::pipe(stdin_pipe.as_mut_ptr());
-    }
-
-    // 保存原始的 stdout, stderr 和 stdin
-    let stdout_fd = io::stdout().as_raw_fd();
-    let stderr_fd = io::stderr().as_raw_fd();
-    let stdin_fd = io::stdin().as_raw_fd();
-    let stdout_save = unsafe { libc::dup(stdout_fd) };
-    let stderr_save = unsafe { libc::dup(stderr_fd) };
-    let stdin_save = unsafe { libc::dup(stdin_fd) };
-
-    // 重定向 stdout 和 stderr 到管道，stdin 从空管道读取（立即 EOF）
-    unsafe {
-        libc::dup2(stdout_pipe[1], stdout_fd);
-        libc::dup2(stderr_pipe[1], stderr_fd);
-        libc::dup2(stdin_pipe[0], stdin_fd);
-        libc::close(stdin_pipe[1]); // 关闭写端，读端立即返回 EOF
-    }
+    // 注入自定义 writer 捕获输出
+    let (stdout_writer, stdout_buffer) = SharedWriter::new();
+    let (stderr_writer, stderr_buffer) = SharedWriter::new();
+    interpreter.set_stdout(Box::new(stdout_writer));
+    interpreter.set_stderr(Box::new(stderr_writer));
 
     // 执行 Interpreter（argv[0] 需要是程序名）
-    let mut interpreter = Interpreter::new().unwrap();
     let mut args_vec: Vec<String> = vec!["lua".to_string()];
     args_vec.extend(args.iter().map(|s| s.to_string()));
     let success = interpreter.pmain(&args_vec);
 
-    // 刷新并恢复原始的 stdout, stderr 和 stdin
-    io::stdout().flush().ok();
-    io::stderr().flush().ok();
-    unsafe {
-        libc::dup2(stdout_save, stdout_fd);
-        libc::dup2(stderr_save, stderr_fd);
-        libc::dup2(stdin_save, stdin_fd);
-        libc::close(stdout_save);
-        libc::close(stderr_save);
-        libc::close(stdin_save);
-        libc::close(stdout_pipe[1]);
-        libc::close(stderr_pipe[1]);
-    }
-
-    // 读取管道内容
-    let mut stdout_buf = Vec::new();
-    let mut stderr_buf = Vec::new();
-    unsafe {
-        let mut stdout_file = std::fs::File::from_raw_fd(stdout_pipe[0]);
-        let mut stderr_file = std::fs::File::from_raw_fd(stderr_pipe[0]);
-        stdout_file.read_to_end(&mut stdout_buf).ok();
-        stderr_file.read_to_end(&mut stderr_buf).ok();
-        // File::from_raw_fd 会获取 fd 的所有权，drop 时自动关闭，不需要手动 close
-    }
+    let stdout_buf = stdout_buffer.lock().unwrap().clone();
+    let stderr_buf = stderr_buffer.lock().unwrap().clone();
 
     // 打印输出
     let stdout_str = String::from_utf8_lossy(&stdout_buf);

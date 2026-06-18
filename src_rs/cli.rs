@@ -24,31 +24,11 @@ const HAS_EE: i32 = 16;
 
 static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
-fn writestring(s: &str) {
-    let mut stdout = io::stdout().lock();
-    let _ = stdout.write_all(s.as_bytes());
-}
-
-fn writestring_error(s: &str) {
-    let mut stderr = io::stderr().lock();
-    let _ = stderr.write_all(s.as_bytes());
-}
-
-fn writeline() {
-    let mut stdout = io::stdout().lock();
-    let _ = stdout.write_all(b"\n");
-    let _ = stdout.flush();
-}
-
-fn print_version() {
-    writestring(concat!(
-        "Lua 5.5.0 Rust Edition\n"
-    ));
-}
-
 pub struct Interpreter {
     l: LuaState,
     progname: String,
+    stdout: Box<dyn Write>,
+    stderr: Box<dyn Write>,
 }
 
 impl Interpreter {
@@ -58,15 +38,43 @@ impl Interpreter {
         Some(Interpreter {
             l,
             progname: LUA_PROGNAME.to_string(),
+            stdout: Box::new(io::stdout()),
+            stderr: Box::new(io::stderr()),
         })
     }
 
-    fn report(l: &mut LuaState, status: i32, progname: &str) -> i32 {
+    pub fn set_stdout(&mut self, writer: Box<dyn Write>) {
+        self.stdout = writer;
+    }
+
+    pub fn set_stderr(&mut self, writer: Box<dyn Write>) {
+        self.stderr = writer;
+    }
+
+    fn writestring(&mut self, s: &str) {
+        let _ = self.stdout.write_all(s.as_bytes());
+    }
+
+    fn writestring_error(&mut self, s: &str) {
+        let _ = self.stderr.write_all(s.as_bytes());
+    }
+
+    fn writeline(&mut self) {
+        let _ = self.stdout.write_all(b"\n");
+        let _ = self.stdout.flush();
+    }
+
+    fn print_version(&mut self) {
+        self.writestring(concat!(
+            "Lua 5.5.0 Rust Edition  Copyright (C) 1994-2025 Lua.org, PUC-Rio\n"
+        ));
+    }
+
+    fn report(&mut self, status: i32) -> i32 {
         if status != 0 {
-            let msg = l.to_string(-1).unwrap_or_else(|| "(error message not a string)".to_string());
-            let mut stderr = io::stderr().lock();
-            let _ = write!(stderr, "{}: {}\n", progname, msg);
-            l.pop(1);
+            let msg = self.l.to_string(-1).unwrap_or_else(|| "(error message not a string)".to_string());
+            let _ = write!(self.stderr, "{}: {}\n", self.progname, msg);
+            self.l.pop(1);
         }
         status
     }
@@ -88,7 +96,7 @@ impl Interpreter {
         } else {
             status
         };
-        Self::report(&mut self.l, status, &self.progname)
+        self.report(status)
     }
 
     fn dostring(&mut self, s: &str, name: &str) -> i32 {
@@ -127,7 +135,7 @@ impl Interpreter {
             };
             self.l.set_global(global_name);
         }
-        Self::report(&mut self.l, status, &self.progname)
+        self.report(status)
     }
 
     fn handle_luainit(&mut self) -> i32 {
@@ -209,20 +217,19 @@ impl Interpreter {
         if status == 0 {
             if self.l.get_global("arg") != LuaType::Table {
                 self.l.push_string("'arg' is not a table");
-                return Self::report(&mut self.l, ERR_RUN, &self.progname);
+                return self.report(ERR_RUN);
             }
             let n = self.push_args();
             let call_status = self.docall(n, MULT_RET);
-            Self::report(&mut self.l, call_status, &self.progname)
+            self.report(call_status)
         } else {
-            Self::report(&mut self.l, status, &self.progname)
+            self.report(status)
         }
     }
 
-    fn readline(prompt: &str) -> Option<String> {
-        let mut stdout = io::stdout().lock();
-        let _ = stdout.write_all(prompt.as_bytes());
-        let _ = stdout.flush();
+    fn readline(&mut self, prompt: &str) -> Option<String> {
+        let _ = self.stdout.write_all(prompt.as_bytes());
+        let _ = self.stdout.flush();
         let stdin = io::stdin();
         let mut line = String::with_capacity(LUA_MAXINPUT);
         match stdin.lock().read_line(&mut line) {
@@ -240,10 +247,10 @@ impl Interpreter {
         }
     }
 
-    fn check_local(line: &str) {
+    fn check_local(&mut self, line: &str) {
         let trimmed = line.trim_start_matches(&[' ', '\t']);
         if trimmed.starts_with("local ") {
-            writestring_error("warning: locals do not survive across lines in interactive mode\n");
+            self.writestring_error("warning: locals do not survive across lines in interactive mode\n");
         }
     }
 
@@ -276,7 +283,7 @@ impl Interpreter {
     fn pushline(&mut self, firstline: bool) -> bool {
         let prompt = self.get_prompt(firstline);
         self.l.pop(1);
-        match Self::readline(&prompt) {
+        match self.readline(&prompt) {
             None => false,
             Some(line) => {
                 let len = line.len();
@@ -302,7 +309,7 @@ impl Interpreter {
 
     fn multiline(&mut self) -> i32 {
         let first_line = self.l.to_string(1).unwrap_or_default();
-        Self::check_local(&first_line);
+        self.check_local(&first_line);
 
         loop {
             let line = self.l.to_string(1).unwrap_or_default();
@@ -344,9 +351,8 @@ impl Interpreter {
             self.l.rotate(1, 1);
             if self.l.pcall(n, 0, 0) != 0 {
                 let err_msg = self.l.to_string(-1).unwrap_or_else(|| "(error)".to_string());
-                let mut stderr = io::stderr().lock();
                 let _ = write!(
-                    stderr,
+                    self.stderr,
                     "{}: error calling 'print' ({})\n",
                     self.progname, err_msg
                 );
@@ -368,11 +374,11 @@ impl Interpreter {
             if status == 0 {
                 self.l_print();
             } else {
-                Self::report(&mut self.l, status, &self.progname);
+                self.report(status);
             }
         }
         self.l.settop(0);
-        writeline();
+        self.writeline();
     }
 
     fn collect_args(argv: &[String], out_script: &mut isize) -> i32 {
@@ -445,19 +451,18 @@ impl Interpreter {
         args
     }
 
-    fn print_usage(badoption: &str) {
-        let mut stderr = io::stderr().lock();
-        let _ = write!(stderr, "{}: ", LUA_PROGNAME);
+    fn print_usage(&mut self, badoption: &str) {
+        let _ = write!(self.stderr, "{}: ", LUA_PROGNAME);
         match badoption.chars().nth(1) {
             Some('e' | 'l') => {
-                let _ = writeln!(stderr, "'{}' needs argument", badoption);
+                let _ = writeln!(self.stderr, "'{}' needs argument", badoption);
             }
             _ => {
-                let _ = writeln!(stderr, "unrecognized option '{}'", badoption);
+                let _ = writeln!(self.stderr, "unrecognized option '{}'", badoption);
             }
         }
-        let _ = write!(
-            stderr,
+        let _ = writeln!(
+            self.stderr,
             "usage: {} [options] [script [args]]\n\
              Available options are:\n\
                -e stat   execute string 'stat'\n\
@@ -491,14 +496,14 @@ impl Interpreter {
         if args & HAS_ERROR != 0 {
             let bad_idx = script as usize;
             let bad = argv.get(bad_idx).map(|s| s.as_str()).unwrap_or("?");
-            Self::print_usage(bad);
+            self.print_usage(bad);
             return false;
         }
 
         self.l.check_version();
 
         if args & HAS_V != 0 {
-            print_version();
+            self.print_version();
         }
 
         if args & HAS_EE != 0 {
@@ -541,7 +546,7 @@ impl Interpreter {
             self.do_repl();
         } else if script < 1 && args & (HAS_E | HAS_V) == 0 {
             if io::stdin().is_terminal() {
-                print_version();
+                self.print_version();
                 self.do_repl();
             } else {
                 self.dofile(None);
