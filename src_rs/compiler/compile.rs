@@ -484,6 +484,15 @@ impl FuncState {
         cur
     }
 
+    /// Like C's luaK_fixline: change line information for the last instruction.
+    /// In Rust, we just update inst_lines; the final line_info/abs_line_info
+    /// computation in parse_chunk_finish will use the corrected value.
+    fn fixline(&mut self, line: i32) {
+        if let Some(last) = self.inst_lines.last_mut() {
+            *last = line;
+        }
+    }
+
     /// 生成 IABC 模式指令: `op a b c` (无 k 位)
     fn code_abc(&mut self, op: OpCode, a: i32, b: i32, c: i32) -> i32 {
         if get_opmode(op) == OpMode::IvABC {
@@ -867,6 +876,10 @@ impl FuncState {
             }
         }
         self.freereg = new_val;
+        // Like C's luaK_checkstack: update max_freereg when freereg increases
+        if new_val > self.max_freereg {
+            self.max_freereg = new_val;
+        }
     }
 
     /// 添加局部变量 (VDKREG)，分配寄存器并返回
@@ -9313,9 +9326,22 @@ fn parse_for(fs: &mut FuncState) {
 
         // Like C's adjustlocalvars(ls, nvars): activate user-declared variables INSIDE body block
         // Also assign registers to them (like C's luaK_reserveregs)
+        // C's adjustlocalvars calls registerlocalvar for each var, registering them to locvars
         for (i, lv) in fs.locals[body_nlocals..].iter_mut().enumerate() {
             lv.active = true;
             lv.reg = base + 3 + i as i32;
+            // Register to proto.loc_vars (like C's registerlocalvar in adjustlocalvars)
+            if lv.pidx < 0 && lv.kind <= RDKTOCLOSE {
+                let p = fs.proto.loc_vars.len() as i32;
+                fs.proto.loc_vars.push(LocVar {
+                    varname: Some(crate::strings::LuaString::Short(std::sync::Arc::new(
+                        crate::strings::ShortString { hash: 0, contents: lv.name.clone() }
+                    ))),
+                    start_pc: fs.pc,
+                    end_pc: 0,
+                });
+                lv.pidx = p;
+            }
         }
 
         // parse_block creates the inner block (like C's block() in forbody)
