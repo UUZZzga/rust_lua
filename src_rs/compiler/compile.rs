@@ -910,15 +910,21 @@ impl FuncState {
         };
         let vidx = self.locals.len() as i32;
         let nactvar = self.active_nactvar();
-        // 注册到 proto.locvars (对应 C 的 registerlocalvar)
-        let pidx = self.proto.loc_vars.len() as i32;
-        self.proto.loc_vars.push(LocVar {
-            varname: Some(crate::strings::LuaString::Short(std::sync::Arc::new(
-                crate::strings::ShortString { hash: 0, contents: name.to_string() }
-            ))),
-            start_pc,
-            end_pc: 0,
-        });
+        // C: registerlocalvar 只在 adjustlocalvars 中调用，只对 varinreg (kind <= RDKTOCLOSE)
+        // 的变量注册到 locvars。global 变量 (kind >= GDKREG) 不注册。
+        let pidx = if in_reg {
+            let p = self.proto.loc_vars.len() as i32;
+            self.proto.loc_vars.push(LocVar {
+                varname: Some(crate::strings::LuaString::Short(std::sync::Arc::new(
+                    crate::strings::ShortString { hash: 0, contents: name.to_string() }
+                ))),
+                start_pc,
+                end_pc: 0,
+            });
+            p
+        } else {
+            -1
+        };
         self.locals.push(LocalVar {
             name: name.to_string(),
             start_pc,
@@ -947,15 +953,22 @@ impl FuncState {
     fn add_local_kind_reg(&mut self, name: &str, start_pc: i32, kind: i32, reg: i32) {
         let vidx = self.locals.len() as i32;
         let nactvar = self.active_nactvar();
-        // 注册到 proto.locvars (对应 C 的 registerlocalvar)
-        let pidx = self.proto.loc_vars.len() as i32;
-        self.proto.loc_vars.push(LocVar {
-            varname: Some(crate::strings::LuaString::Short(std::sync::Arc::new(
-                crate::strings::ShortString { hash: 0, contents: name.to_string() }
-            ))),
-            start_pc,
-            end_pc: 0,
-        });
+        // C: registerlocalvar 只在 adjustlocalvars 中调用，只对 varinreg (kind <= RDKTOCLOSE)
+        // 的变量注册到 locvars。global 变量 (kind >= GDKREG) 不注册。
+        let in_reg = kind <= RDKTOCLOSE;
+        let pidx = if in_reg {
+            let p = self.proto.loc_vars.len() as i32;
+            self.proto.loc_vars.push(LocVar {
+                varname: Some(crate::strings::LuaString::Short(std::sync::Arc::new(
+                    crate::strings::ShortString { hash: 0, contents: name.to_string() }
+                ))),
+                start_pc,
+                end_pc: 0,
+            });
+            p
+        } else {
+            -1
+        };
         self.locals.push(LocalVar {
             name: name.to_string(),
             start_pc,
@@ -10054,6 +10067,8 @@ fn parse_body(fs: &mut FuncState, target: Option<i32>) -> i32 {
 
 /// ANTLR4: `funcbody: '(' parlist? ')' block 'end' ;` — 解析函数体 (可指定 method 添加 self 参数)
 fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32 {
+    // C: new_fs.f->linedefined = line (line is ls->linenumber after skipping FUNCTION)
+    let line_defined = fs.ls().linenumber;
     expect(fs, &Token::LParen);
     let has_params = !check(fs, &Token::RParen);
     let mut is_vararg = false;
@@ -10098,6 +10113,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     let mut new_fs = FuncState::new(fs.ls_mut());
     new_fs.prev = fs as *mut FuncState;  // like C's fs->prev = ls->fs
     new_fs.proto.num_params = n_params;
+    new_fs.proto.line_defined = line_defined;
     if is_vararg {
         new_fs.proto.flag = PF_VAHID;
         new_fs.code_abc(OpCode::VARARGPREP, 0, 0, 0);
@@ -10181,6 +10197,8 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     }
 
     parse_chunk(&mut new_fs);
+    // C: new_fs.f->lastlinedefined = ls->linenumber (before check_match(END))
+    new_fs.proto.last_line_defined = new_fs.ls().linenumber;
     expect(&mut new_fs, &Token::End);
 
     // Like C's markupval: for each upvalue captured by the child,
