@@ -476,7 +476,40 @@ impl LexState {
                     }
                 }
                 let val = u8::from_str_radix(&hex, 16).unwrap_or(0);
-                s.push(val as char);
+                // 直接 push 原始字节，与 C 版本 save(ls, c) 行为一致
+                unsafe { s.as_mut_vec().push(val); }
+            }
+            'u' => {
+                self.next_char();  // skip 'u'
+                if self.current != '{' {
+                    self.error("missing '{'");
+                    return;
+                }
+                self.next_char();  // skip '{'
+                let mut r: u32 = 0;
+                let mut has_digit = false;
+                while self.current.is_ascii_hexdigit() {
+                    has_digit = true;
+                    if r > (0x7FFFFFFFu32 >> 4) {
+                        self.error("UTF-8 value too large");
+                        return;
+                    }
+                    r = (r << 4) + (self.current.to_digit(16).unwrap() as u32);
+                    self.next_char();
+                }
+                if !has_digit {
+                    self.error("missing digits");
+                    return;
+                }
+                if self.current != '}' {
+                    self.error("missing '}'");
+                    return;
+                }
+                self.next_char();  // skip '}'
+                // 使用 UTF-8 编码（支持 1-6 字节，等价于 C 版本 luaO_utf8esc）
+                for b in utf8_encode(r) {
+                    unsafe { s.as_mut_vec().push(b); }
+                }
             }
             '0'..='9' => {
                 let mut digits = String::new();
@@ -490,7 +523,8 @@ impl LexState {
                 }
                 let val = u32::from_str_radix(&digits, 10).unwrap_or(0);
                 if val <= 0xFF {
-                    s.push(val as u8 as char);
+                    // 直接 push 原始字节，与 C 版本 save(ls, c) 行为一致
+                    unsafe { s.as_mut_vec().push(val as u8); }
                 } else {
                     s.push('?');
                 }
@@ -597,4 +631,34 @@ fn parse_hex_float(s: &str) -> Option<f64> {
     };
 
     Some((int_part + frac_part) * 2f64.powi(exponent))
+}
+
+/// UTF-8 编码：等价于 C 版本的 `luaO_utf8esc`，支持 1-6 字节序列。
+///
+/// 与标准 Rust `char::encode_utf8` 不同，此函数支持超出 Unicode 范围的码点
+/// （0x110000 到 0x7FFFFFFF），生成 5-6 字节的"扩展 UTF-8"序列，
+/// 与 Lua C 实现保持一致。
+fn utf8_encode(x: u32) -> Vec<u8> {
+    const UTF8BUFFSZ: usize = 8;
+    let mut buff = [0u8; UTF8BUFFSZ];
+    let mut n = 1usize;
+    if x < 0x80 {
+        // ASCII: 单字节序列
+        buff[UTF8BUFFSZ - 1] = x as u8;
+    } else {
+        // 多字节序列：从后向前填充续字节，最后写首字节
+        let mut x = x;
+        let mut mfb: u32 = 0x3f;  // 首字节可用的最大有效位
+        loop {
+            buff[UTF8BUFFSZ - n] = (0x80 | (x & 0x3f)) as u8;
+            n += 1;
+            x >>= 6;
+            mfb >>= 1;
+            if x <= mfb {
+                break;
+            }
+        }
+        buff[UTF8BUFFSZ - n] = (((!mfb) << 1) | x) as u8;
+    }
+    buff[UTF8BUFFSZ - n..UTF8BUFFSZ].to_vec()
 }

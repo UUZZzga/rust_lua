@@ -741,8 +741,32 @@ impl FuncState {
     }
 
     /// 创建浮点常量并添加到常量表
+    ///
+    /// 模拟 C 版本 `luaK_numberK` 的去重逻辑：
+    /// - 对于 `r == 0`，正常去重（C 版本使用 FuncState 指针作为 key，不会碰撞）
+    /// - 对于其他值，计算 `k = r * (1 + 2^-52)` 作为 key
+    /// - 如果 `k` 是整数值（即 `r >= 2^53` 或 `r` 是 `2^53` 的倍数），不去重，
+    ///   直接添加新常量。这是因为整数值的 key 会与整数常量的 key 碰撞。
+    /// - 否则，正常去重
     fn float_k(&mut self, f: f64) -> i32 {
-        self.const_k(TValue::Float(f))
+        if f == 0.0 {
+            // 零：正常去重（C 版本使用 FuncState 指针作为 key，不会碰撞）
+            self.const_k(TValue::Float(f))
+        } else {
+            // 计算 key：k = r * (1 + 2^-52)，等价于 C 版本的 r * (1 + q)
+            let q = 2f64.powi(-52);
+            let k = f * (1.0 + q);
+            // 检查 k 是否为整数值（等价于 C 版本 luaV_flttointeger(k, &ik, F2Ieq)）
+            if float_is_integer(k) {
+                // k 是整数值，不去重，直接添加新常量
+                let idx = self.proto.constants.len() as i32;
+                self.proto.constants.push(TValue::Float(f));
+                idx
+            } else {
+                // k 不是整数值，正常去重
+                self.const_k(TValue::Float(f))
+            }
+        }
     }
 
     /// 分配新寄存器: freereg++ 并追踪 max_freereg
@@ -10377,4 +10401,25 @@ fn tvalue_eq(a: &TValue, b: &TValue) -> bool {
         (TValue::Str(a), TValue::Str(b)) => a.as_str() == b.as_str(),
         _ => false,
     }
+}
+
+/// 检查 float 值是否为整数值且在 i64 范围内。
+///
+/// 等价于 C 版本 `luaV_flttointeger(n, p, F2Ieq)` 的判断逻辑：
+/// 1. n 必须是有限值
+/// 2. n 必须是整数值（n == floor(n)）
+/// 3. n 必须在 i64 范围内（i64::MIN <= n < 2^63）
+fn float_is_integer(k: f64) -> bool {
+    if !k.is_finite() {
+        return false;
+    }
+    // 检查是否为整数值（等价于 n != floor(n) 的反向判断）
+    if k.trunc() != k {
+        return false;
+    }
+    // 检查是否在 i64 范围内
+    // LUA_MININTEGER = i64::MIN = -2^63，可精确表示为 f64
+    // -LUA_MININTEGER = 2^63，可精确表示为 f64
+    // 条件：k >= i64::MIN && k < 2^63
+    k >= (i64::MIN as f64) && k < (1u64 << 63) as f64
 }
