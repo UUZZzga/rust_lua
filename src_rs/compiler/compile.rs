@@ -2136,7 +2136,8 @@ fn parse_chunk_finish(fs: &mut FuncState) {
 
     // 从 inst_lines 计算 line_info 和 abs_line_info
     // (对应 C 的 savelineinfo，在 luaK_code 中每条指令发射时调用)
-    let mut previousline: i32 = 0;
+    // C 的 open_func 中: fs->previousline = f->linedefined
+    let mut previousline: i32 = fs.proto.line_defined;
     let mut iwthabs: i32 = 0;
     for (pc, &line) in fs.inst_lines.iter().enumerate() {
         let linedif = line - previousline;
@@ -2687,6 +2688,9 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
 
     if has_init {
         fs.ls_mut().next();
+        // Like C's initglobal(ls, ..., ls->linenumber): capture the line number
+        // of the first expression token (after '=') for checkglobal's fixline.
+        let init_line = fs.ls().linenumber;
 
         // Now add variable names to constant table (like C's buildglobal->codestring)
         let mut var_k_names: Vec<i32> = Vec::new();
@@ -2796,8 +2800,12 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
                 let ckr = fs.alloc_reg();
                 fs.code_abx(OpCode::LOADK, ckr, var_k_names[i]);
                 fs.code_abc(OpCode::GETTABLE, cr, cr, ckr);
+                // Like C's luaK_codecheckglobal: luaK_fixline(fs, line) after exp2anyreg
+                fs.fixline(init_line);
                 let k_bx = if var_k_names[i] >= crate::opcodes::MAXARG_BX as i32 { 0 } else { var_k_names[i] + 1 };
                 fs.code_abx(OpCode::ERRNNIL, cr, k_bx);
+                // Like C's luaK_codecheckglobal: luaK_fixline(fs, line) after ERRNNIL
+                fs.fixline(init_line);
                 fs.free_reg(); // ckr
                 fs.free_reg(); // cr
                 // storevartop: SETTABLE table_reg key_reg val_reg
@@ -2821,8 +2829,12 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
                 // Allocate result register (reuses kr)
                 let cr = fs.alloc_reg();
                 fs.set_a(pc, cr);
+                // Like C's luaK_codecheckglobal: luaK_fixline(fs, line) after exp2anyreg
+                fs.fixline(init_line);
                 let k_bx = if var_k_names[i] >= crate::opcodes::MAXARG_BX as i32 { 0 } else { var_k_names[i] + 1 };
                 fs.code_abx(OpCode::ERRNNIL, cr, k_bx);
+                // Like C's luaK_codecheckglobal: luaK_fixline(fs, line) after ERRNNIL
+                fs.fixline(init_line);
                 fs.free_reg(); // cr
                 // storevartop: SETTABLE + PF_VATAB (like C's needvatab for VVARGIND)
                 fs.proto.flag |= PF_VATAB;
@@ -2832,7 +2844,7 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
                 fs.free_reg(); // key_reg
             } else {
                 // Key is a Kstr: use the simpler checkglobal + code_settabup path
-                checkglobal(fs, &names[i], 0);
+                checkglobal(fs, &names[i], init_line);
                 let val_reg = fs.freereg - 1;
                 code_settabup(fs, 0, var_k_names[i], val_reg);
                 fs.free_reg();
@@ -5980,6 +5992,13 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 fs.exp_to_reg(&e2.exp)
             };
             if r2 != r + 1 {
+                // Like C's luaK_exp2nextreg: ensure register r+1 is allocated
+                // before generating MOVE (updates max_freereg/maxstacksize).
+                // C calls luaK_reserveregs(1) which updates maxstacksize via
+                // luaK_checkstack before the MOVE.
+                if fs.freereg <= r + 1 {
+                    fs.alloc_reg();
+                }
                 fs.code_abc(OpCode::MOVE, r + 1, r2, 0);
             }
             if fs.freereg > freereg_before_r2 {
