@@ -3,7 +3,9 @@ use crate::strings::{LuaString, StringTable};
 use crate::table::Table;
 use crate::gc::{GCObjectHeader, GCState};
 use crate::execute::{VmExecutor, VmResult, VmError};
+use crate::tm::DefaultMetatables;
 use std::rc::Rc;
+use std::io::Write;
 
 const EOFMARK: &str = "<eof>";
 
@@ -57,6 +59,8 @@ pub struct LuaState {
     pub api_func_base: usize,
     // C 函数调用嵌套计数（对应 C 的 L->nCcalls），用于检测 C 栈溢出
     pub n_ccalls: u32,
+    pub dmt: DefaultMetatables,
+    pub stdout: Box<dyn Write>,
 }
 
 // ============================================================================
@@ -107,6 +111,8 @@ impl LuaState {
             string_table: StringTable::new(),
             api_func_base: 0,
             n_ccalls: 0,
+            dmt: DefaultMetatables::new(),
+            stdout: Box::new(std::io::stdout()),
         }
     }
 
@@ -153,6 +159,8 @@ impl LuaState {
             string_table: StringTable::new(),
             api_func_base: 0,
             n_ccalls: 0,
+            dmt: DefaultMetatables::new(),
+            stdout: Box::new(std::io::stdout()),
         };
         state
     }
@@ -222,6 +230,8 @@ impl LuaState {
             string_table: StringTable::new(),
             api_func_base: 0,
             n_ccalls: 0,
+            dmt: DefaultMetatables::new(),
+            stdout: Box::new(std::io::stdout()),
         }
     }
 }
@@ -834,7 +844,8 @@ impl LuaState {
                         }
                     }
                     self.stack.truncate(func_idx);
-                    println!("{}", s);
+                    let _ = writeln!(self.stdout, "{}", s);
+                    let _ = self.stdout.flush();
                     return 0;
                 }
                 self.stack.truncate(func_idx);

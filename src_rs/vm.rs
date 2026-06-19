@@ -911,7 +911,6 @@ fn format_float_len(f: f64) -> usize {
 pub fn concat_stack(
     stack: &mut Vec<TValue>,
     total: usize,
-    _default_mts: &DefaultMetatables,
 ) -> Result<(), TagMethodError> {
     if total <= 1 { return Ok(()); }
     let mut remaining = total;
@@ -2221,8 +2220,7 @@ mod tests {
             TValue::Str(tb.intern("world")),
         ];
         let len_before = stack.len();
-        let dmt = DefaultMetatables::new();
-        concat_stack(&mut stack, 2, &dmt).unwrap();
+        concat_stack(&mut stack, 2).unwrap();
         assert_eq!(stack.len(), len_before - 1);
         if let TValue::Str(ref s) = stack[0] {
             assert_eq!(s.as_str(), "helloworld");
@@ -2235,8 +2233,7 @@ mod tests {
     fn test_concat_stack_single_value() {
         let tb = StringTable::new();
         let mut stack = vec![TValue::Str(tb.intern("hello"))];
-        let dmt = DefaultMetatables::new();
-        concat_stack(&mut stack, 1, &dmt).unwrap();
+        concat_stack(&mut stack, 1).unwrap();
         assert_eq!(stack.len(), 1);
     }
 
@@ -2248,8 +2245,7 @@ mod tests {
             TValue::Str(tb.intern("b")),
             TValue::Str(tb.intern("c")),
         ];
-        let dmt = DefaultMetatables::new();
-        concat_stack(&mut stack, 3, &dmt).unwrap();
+        concat_stack(&mut stack, 3).unwrap();
         assert_eq!(stack.len(), 1);
         if let TValue::Str(ref s) = stack[0] {
             assert_eq!(s.as_str(), "abc");
@@ -2265,8 +2261,7 @@ mod tests {
             TValue::Str(tb.intern("x=")),
             TValue::Integer(42),
         ];
-        let dmt = DefaultMetatables::new();
-        concat_stack(&mut stack, 2, &dmt).unwrap();
+        concat_stack(&mut stack, 2).unwrap();
         if let TValue::Str(ref s) = stack[0] {
             assert_eq!(s.as_str(), "x=42");
         } else {
@@ -2281,8 +2276,7 @@ mod tests {
             TValue::Str(tb.intern("")),
             TValue::Str(tb.intern("world")),
         ];
-        let dmt = DefaultMetatables::new();
-        concat_stack(&mut stack, 2, &dmt).unwrap();
+        concat_stack(&mut stack, 2).unwrap();
         assert_eq!(stack.len(), 1);
         if let TValue::Str(ref s) = stack[0] {
             assert_eq!(s.as_str(), "world");

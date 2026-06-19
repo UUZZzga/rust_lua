@@ -277,6 +277,7 @@ mod tests {
             string_table: crate::strings::StringTable::new(),
             api_func_base: 0,
             n_ccalls: 0,
+            dmt: crate::tm::DefaultMetatables::new(),
         }
     }
 

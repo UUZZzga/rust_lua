@@ -27,7 +27,6 @@ static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 pub struct Interpreter {
     l: LuaState,
     progname: String,
-    stdout: Box<dyn Write>,
     stderr: Box<dyn Write>,
 }
 
@@ -38,13 +37,12 @@ impl Interpreter {
         Some(Interpreter {
             l,
             progname: LUA_PROGNAME.to_string(),
-            stdout: Box::new(io::stdout()),
             stderr: Box::new(io::stderr()),
         })
     }
 
     pub fn set_stdout(&mut self, writer: Box<dyn Write>) {
-        self.stdout = writer;
+        self.l.stdout = writer;
     }
 
     pub fn set_stderr(&mut self, writer: Box<dyn Write>) {
@@ -52,7 +50,7 @@ impl Interpreter {
     }
 
     fn writestring(&mut self, s: &str) {
-        let _ = self.stdout.write_all(s.as_bytes());
+        let _ = self.l.stdout.write_all(s.as_bytes());
     }
 
     fn writestring_error(&mut self, s: &str) {
@@ -60,8 +58,8 @@ impl Interpreter {
     }
 
     fn writeline(&mut self) {
-        let _ = self.stdout.write_all(b"\n");
-        let _ = self.stdout.flush();
+        let _ = self.l.stdout.write_all(b"\n");
+        let _ = self.l.stdout.flush();
     }
 
     fn print_version(&mut self) {
@@ -228,8 +226,8 @@ impl Interpreter {
     }
 
     fn readline(&mut self, prompt: &str) -> Option<String> {
-        let _ = self.stdout.write_all(prompt.as_bytes());
-        let _ = self.stdout.flush();
+        let _ = self.l.stdout.write_all(prompt.as_bytes());
+        let _ = self.l.stdout.flush();
         let stdin = io::stdin();
         let mut line = String::with_capacity(LUA_MAXINPUT);
         match stdin.lock().read_line(&mut line) {

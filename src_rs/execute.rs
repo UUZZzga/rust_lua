@@ -26,6 +26,7 @@ use crate::state::{LuaState, LUA_MINSTACK};
 use crate::gc::GCState;
 use std::rc::Rc;
 use std::ffi::c_void;
+use std::io::Write;
 
 // ============================================================================
 // VmResult / VmError
@@ -1090,11 +1091,10 @@ impl VmExecutor {
         let p2 = Self::read_stack(state, b);
         let tm_idx = opcodes::getarg_c(inst) as u8;
         if let Some(tm) = TagMethod::from_u8(tm_idx) {
-            let dmt = DefaultMetatables::new();
             let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
                 Err(TagMethodError::NoMetamethod(tm))
             };
-            match try_bin_tm(p1, p2, tm, &dmt, &mut call_fn) {
+            match try_bin_tm(p1, p2, tm, &state.dmt, &mut call_fn) {
                 Ok(result) => { Self::write_stack(state, a, result); }
                 Err(_) => { return Err(VmError::MetaMethodNotImplemented(tm.name().to_string())); }
             }
@@ -1116,11 +1116,10 @@ impl VmExecutor {
         let flip = opcodes::testarg_k(inst);
         let tm_idx = opcodes::getarg_c(inst) as u8;
         if let Some(tm) = TagMethod::from_u8(tm_idx) {
-            let dmt = DefaultMetatables::new();
             let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
                 Err(TagMethodError::NoMetamethod(tm))
             };
-            match try_bin_assoc_tm(p1, &p2, flip, tm, &dmt, &mut call_fn) {
+            match try_bin_assoc_tm(p1, &p2, flip, tm, &state.dmt, &mut call_fn) {
                 Ok(result) => { Self::write_stack(state, a, result); }
                 Err(_) => { return Err(VmError::MetaMethodNotImplemented(tm.name().to_string())); }
             }
@@ -1144,11 +1143,10 @@ impl VmExecutor {
         let flip = opcodes::testarg_k(inst);
         let tm_idx = opcodes::getarg_c(inst) as u8;
         if let Some(tm) = TagMethod::from_u8(tm_idx) {
-            let dmt = DefaultMetatables::new();
             let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
                 Err(TagMethodError::NoMetamethod(tm))
             };
-            match try_bin_assoc_tm(p1, &p2, flip, tm, &dmt, &mut call_fn) {
+            match try_bin_assoc_tm(p1, &p2, flip, tm, &state.dmt, &mut call_fn) {
                 Ok(result) => { Self::write_stack(state, a, result); }
                 Err(_) => { return Err(VmError::MetaMethodNotImplemented(tm.name().to_string())); }
             }
@@ -1165,8 +1163,7 @@ impl VmExecutor {
             TValue::Integer(i) => Self::write_stack(state, a, TValue::Integer(i.wrapping_neg())),
             TValue::Float(f) => Self::write_stack(state, a, TValue::Float(-f)),
             _ => {
-                let dmt = DefaultMetatables::new();
-                match try_bin_tm(v, v, TagMethod::Unm, &dmt, &mut |_f, _args| {
+                match try_bin_tm(v, v, TagMethod::Unm, &state.dmt, &mut |_f, _args| {
                     Err(crate::tm::TagMethodError::NoMetamethod(TagMethod::Unm))
                 }) {
                     Ok(result) => { Self::write_stack(state, a, result); }
@@ -1185,8 +1182,7 @@ impl VmExecutor {
         if let Some(i) = to_integer_ns(v, F2IMode::Eq) {
             Self::write_stack(state, a, TValue::Integer(!i));
         } else {
-            let dmt = DefaultMetatables::new();
-            match try_bin_tm(v, v, TagMethod::BNot, &dmt, &mut |_f, _args| {
+            match try_bin_tm(v, v, TagMethod::BNot, &state.dmt, &mut |_f, _args| {
                 Err(crate::tm::TagMethodError::NoMetamethod(TagMethod::BNot))
             }) {
                 Ok(result) => { Self::write_stack(state, a, result); }
@@ -1211,11 +1207,10 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v = Self::read_stack(state, b);
-        let dmt = DefaultMetatables::new();
         let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
             Err(TagMethodError::NoMetamethod(TagMethod::Len))
         };
-        let result = match objlen(v, Some(&dmt), Some(&mut call_fn)) {
+        let result = match objlen(v, Some(&state.dmt), Some(&mut call_fn)) {
             Ok(Some(val)) => val,
             Ok(None) => TValue::Integer(0),
             Err(_) => TValue::Integer(0),
@@ -1234,8 +1229,7 @@ impl VmExecutor {
             let val = Self::read_stack(state, a + i).clone();
             vals.push(val);
         }
-        let dmt = DefaultMetatables::new();
-        match concat_stack(&mut vals, n, &dmt) {
+        match concat_stack(&mut vals, n) {
             Ok(()) => {
                 let result = vals.into_iter().next()
                     .unwrap_or(TValue::Str(crate::strings::LuaString::Short(
@@ -1290,11 +1284,10 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let v1 = Self::read_stack(state, a);
         let v2 = Self::read_stack(state, b);
-        let dmt = DefaultMetatables::new();
         let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
             Err(TagMethodError::NoMetamethod(TagMethod::Eq))
         };
-        let cond = match equal(v1, v2, Some(&dmt), Some(&mut call_fn)) {
+        let cond = match equal(v1, v2, Some(&state.dmt), Some(&mut call_fn)) {
             Ok(b) => b,
             Err(_) => false,
         };
@@ -1308,11 +1301,10 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let v1 = Self::read_stack(state, a);
         let v2 = Self::read_stack(state, b);
-        let dmt = DefaultMetatables::new();
         let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
             Err(TagMethodError::NoMetamethod(TagMethod::Lt))
         };
-        let cond = match less_than(v1, v2, Some(&dmt), Some(&mut call_fn)) {
+        let cond = match less_than(v1, v2, Some(&state.dmt), Some(&mut call_fn)) {
             Ok(b) => b,
             Err(_) => false,
         };
@@ -1326,11 +1318,10 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let v1 = Self::read_stack(state, a);
         let v2 = Self::read_stack(state, b);
-        let dmt = DefaultMetatables::new();
         let mut call_fn = |_f: &TValue, _args: &[&TValue]| {
             Err(TagMethodError::NoMetamethod(TagMethod::Le))
         };
-        let cond = match less_equal(v1, v2, Some(&dmt), Some(&mut call_fn)) {
+        let cond = match less_equal(v1, v2, Some(&state.dmt), Some(&mut call_fn)) {
             Ok(b) => b,
             Err(_) => false,
         };
@@ -1548,7 +1539,8 @@ impl VmExecutor {
                             _ => s.push_str(&format!("{:?}", val)),
                         }
                     }
-                    println!("{}", s);
+                    let _ = writeln!(state.stdout, "{}", s);
+                    let _ = state.stdout.flush();
                 }
                 state.pc += 1;
                 Ok(())
