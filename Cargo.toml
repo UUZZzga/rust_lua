@@ -32,6 +32,10 @@ path = "tests_rs/arithmetic_tests.rs"
 name = "string_tests"
 path = "tests_rs/string_tests.rs"
 
+[[test]]
+name = "base_lib_tests"
+path = "tests_rs/base_lib_tests.rs"
+
 [features]
 ffi = []
 

@@ -7,13 +7,17 @@ use crate::execute::{VmExecutor, VmResult, VmError};
 use crate::tm::DefaultMetatables;
 use std::rc::Rc;
 use std::cell::RefCell;
-use std::io::Write;
+use std::io::{Read, Write};
 
 const EOFMARK: &str = "<eof>";
 
 pub const ERR_RUN: i32 = 2;
 pub const ERR_SYNTAX: i32 = 3;
+pub const ERR_FILE: i32 = 6;  // LUA_ERRERR + 1, used by luaL_loadfilex
 pub const MULT_RET: i32 = -1;
+
+const LUA_SIGNATURE: &[u8] = b"\x1bLua";
+const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
 pub const LUA_MINSTACK: usize = 20;
 pub const BASIC_STACK_SIZE: usize = 2 * LUA_MINSTACK;
@@ -423,6 +427,15 @@ impl LuaState {
         self.stack.truncate(new_len);
     }
 
+    /// 对应 C 的 lua_remove：删除指定索引处的元素，上方元素下移。
+    pub fn remove(&mut self, idx: isize) {
+        let abs = self.abs_index(idx);
+        if abs == 0 || abs > self.stack.len() {
+            return;
+        }
+        self.stack.remove(abs - 1);
+    }
+
     /// 对应 C 的 lua_absindex:
     ///   return (idx > 0 || is_pseudo(idx)) ? idx : cast_int(L->top - L->ci->func) + idx + 1
     /// 其中 L->top - L->ci->func 等价于 stack.len()（函数帧内有效元素数）
@@ -823,25 +836,75 @@ impl LuaState {
         }
     }
 
-    pub fn load_file(&mut self, fname: Option<&str>) -> i32 {
-        if let Some(name) = fname {
-            match std::fs::read_to_string(name) {
-                Ok(content) => self.load_buffer(&content, name),
+    /// 对应 C 的 `luaL_loadfilex`：从文件或 stdin 加载 Lua 代码。
+    ///
+    /// - `filename` 为 `Some(path)` 时读取文件；为 `None` 时读取 stdin。
+    /// - `mode` 用于控制是否允许文本/二进制块（当前仅文本块可实际加载）。
+    ///
+    /// 成功时返回 0，并将主闭包压入栈顶；失败时压入错误信息并返回错误码。
+    pub fn load_filex(&mut self, filename: Option<&str>, mode: Option<&str>) -> i32 {
+        let chunk_name = filename
+            .map(|f| format!("@{}", f))
+            .unwrap_or_else(|| "=stdin".to_string());
+
+        let bytes = match filename {
+            Some(name) => match std::fs::read(name) {
+                Ok(b) => b,
                 Err(err) => {
                     self.push_fstring(&format!("cannot open {}: {}", name, err));
-                    ERR_RUN
+                    return ERR_FILE;
                 }
-            }
-        } else {
-            let mut buf = String::new();
-            match std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf) {
-                Ok(_) => self.load_buffer(&buf, "=stdin"),
-                Err(_) => {
-                    self.push_string("cannot read from stdin");
-                    ERR_RUN
+            },
+            None => {
+                let mut buf = Vec::new();
+                if let Err(err) = std::io::stdin().read_to_end(&mut buf) {
+                    self.push_fstring(&format!("cannot read stdin: {}", err));
+                    return ERR_FILE;
                 }
+                buf
             }
+        };
+
+        self.load_bytes(&bytes, &chunk_name, mode)
+    }
+
+    pub fn load_file(&mut self, fname: Option<&str>) -> i32 {
+        self.load_filex(fname, None)
+    }
+
+    /// 从已读取的字节数组加载 Lua 代码。处理 BOM、shebang、编码与二进制签名。
+    fn load_bytes(&mut self, bytes: &[u8], chunk_name: &str, mode: Option<&str>) -> i32 {
+        let after_bom = skip_bom(bytes);
+        let (skipped_comment, first, rest) = skip_comment(after_bom);
+
+        let is_binary = first == Some(LUA_SIGNATURE[0]);
+
+        if is_binary && !mode_allows_binary(mode) {
+            self.push_string("attempt to load a binary chunk (mode is 'text')");
+            return ERR_SYNTAX;
         }
+        if !is_binary && !mode_allows_text(mode) {
+            self.push_string("attempt to load a text chunk (mode is 'binary')");
+            return ERR_SYNTAX;
+        }
+        if is_binary {
+            self.push_string("attempt to load a binary chunk");
+            return ERR_SYNTAX;
+        }
+
+        // 组装待编译的源码缓冲区：跳过的 shebang 用换行符补齐行号，
+        // 随后追加剩余字节。
+        let mut content = Vec::with_capacity(rest.len() + 2);
+        if skipped_comment {
+            content.push(b'\n');
+        }
+        if let Some(c) = first {
+            content.push(c);
+        }
+        content.extend_from_slice(rest);
+
+        let source = decode_source_bytes(&content);
+        self.load_buffer(&source, chunk_name)
     }
 
     /// 对应 C 的 getCcalls: 获取 C 调用嵌套数 (低 16 位)
@@ -1159,6 +1222,66 @@ impl LuaState {
 }
 
 // ============================================================================
+// load_file 辅助函数
+// ============================================================================
+
+/// 跳过 UTF-8 BOM（EF BB BF）。若 BOM 不完整则保留原字节，与 C 的 `skipBOM` 行为一致。
+fn skip_bom(bytes: &[u8]) -> &[u8] {
+    if bytes.starts_with(UTF8_BOM) {
+        &bytes[UTF8_BOM.len()..]
+    } else {
+        bytes
+    }
+}
+
+/// 跳过可选的首行注释（以 '#' 开头的 shebang/Unix exec 行）。
+///
+/// 返回三元组：`(是否跳过了首行, 首字符, 首字符之后的剩余字节)`。
+fn skip_comment(bytes: &[u8]) -> (bool, Option<u8>, &[u8]) {
+    if bytes.first() == Some(&b'#') {
+        let mut pos = 1;
+        while pos < bytes.len() && bytes[pos] != b'\n' {
+            pos += 1;
+        }
+        // 同时消费换行符本身，与 C 的 `skipcomment` 一致。
+        if pos < bytes.len() && bytes[pos] == b'\n' {
+            pos += 1;
+        }
+        (true, bytes.get(pos).copied(), &bytes[pos..])
+    } else {
+        (false, bytes.get(0).copied(), bytes)
+    }
+}
+
+/// 判断 `mode` 是否允许文本块。
+fn mode_allows_text(mode: Option<&str>) -> bool {
+    match mode {
+        None => true,
+        Some(m) => m.contains('t') || (!m.contains('b') && !m.contains('t')),
+    }
+}
+
+/// 判断 `mode` 是否允许二进制块。
+fn mode_allows_binary(mode: Option<&str>) -> bool {
+    match mode {
+        None => true,
+        Some(m) => m.contains('b'),
+    }
+}
+
+/// 将源码字节解码为 Rust `String`。
+///
+/// Lua 源码本质上是字节流。若字节序列是合法 UTF-8，则直接解码；
+/// 否则按 ISO-8859-1 逐字节映射为对应 Unicode 码点。这样既能正确处理
+/// 常见的 UTF-8 文件，也能处理 `tests_lua/strings.lua` 等 ISO-8859 文件。
+fn decode_source_bytes(bytes: &[u8]) -> String {
+    match std::str::from_utf8(bytes) {
+        Ok(s) => s.to_string(),
+        Err(_) => bytes.iter().map(|&b| b as char).collect(),
+    }
+}
+
+// ============================================================================
 // 测试
 // ============================================================================
 
@@ -1231,5 +1354,181 @@ mod tests {
     fn test_stack_init_default() {
         let state = LuaState::default();
         assert_eq!(state.gettop(), 1, "Default must init stack via new()");
+    }
+
+    // ------------------------------------------------------------------------
+    // load_file 编码与文件加载测试
+    // ------------------------------------------------------------------------
+
+    fn tmp_path(name: &str) -> std::path::PathBuf {
+        let mut p = std::env::temp_dir();
+        p.push(format!("lua_rs_load_file_test_{}_{}", name, std::process::id()));
+        p
+    }
+
+    fn write_tmp(name: &str, content: &[u8]) -> std::path::PathBuf {
+        let path = tmp_path(name);
+        std::fs::write(&path, content).unwrap();
+        path
+    }
+
+    #[test]
+    fn test_skip_bom() {
+        assert_eq!(skip_bom(b"\xef\xbb\xbfhello"), b"hello");
+        assert_eq!(skip_bom(b"\xef\xbbhello"), b"\xef\xbbhello");
+        assert_eq!(skip_bom(b"hello"), b"hello");
+    }
+
+    #[test]
+    fn test_skip_comment() {
+        let (skipped, first, rest) = skip_comment(b"#!/bin/lua\nprint(1)");
+        assert!(skipped);
+        assert_eq!(first, Some(b'p'));
+        assert_eq!(rest, b"print(1)");
+
+        let (skipped, first, rest) = skip_comment(b"-- no shebang\nreturn");
+        assert!(!skipped);
+        assert_eq!(first, Some(b'-'));
+        assert_eq!(rest, b"-- no shebang\nreturn");
+
+        let (skipped, first, rest) = skip_comment(b"#only shebang");
+        assert!(skipped);
+        assert_eq!(first, None);
+        assert!(rest.is_empty());
+    }
+
+    #[test]
+    fn test_decode_source_bytes_utf8() {
+        let bytes = "local x = 1 -- 中文".as_bytes();
+        assert_eq!(decode_source_bytes(bytes), "local x = 1 -- 中文");
+    }
+
+    #[test]
+    fn test_decode_source_bytes_iso8859() {
+        // ISO-8859-1 字节：á é í
+        // 在 Rust String 中每个字节被映射为对应 Unicode 码点，UTF-8 编码后长度会变化，
+        // 因此这里验证字符数量与码点值保持一致。
+        let bytes: Vec<u8> = vec![0xe1, 0xe9, 0xed];
+        let s = decode_source_bytes(&bytes);
+        let chars: Vec<char> = s.chars().collect();
+        assert_eq!(chars.len(), 3);
+        assert_eq!(chars[0] as u32, 0xe1);
+        assert_eq!(chars[1] as u32, 0xe9);
+        assert_eq!(chars[2] as u32, 0xed);
+    }
+
+    #[test]
+    fn test_load_file_decodes_iso8859_strings() {
+        let mut state = LuaState::new();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests_lua/strings.lua");
+        let status = state.load_file(Some(path));
+        assert_eq!(status, 0, "load_file should succeed: {:?}", state.to_string(-1));
+        assert!(
+            matches!(state.stack.last(), Some(TValue::LClosure(_))),
+            "stack top should be a closure"
+        );
+    }
+
+    #[test]
+    fn test_load_file_skips_shebang_all() {
+        let mut state = LuaState::new();
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests_lua/all.lua");
+        let status = state.load_file(Some(path));
+        assert_eq!(status, 0, "load_file should succeed: {:?}", state.to_string(-1));
+        assert!(matches!(state.stack.last(), Some(TValue::LClosure(_))));
+    }
+
+    #[test]
+    fn test_load_file_missing() {
+        let mut state = LuaState::new();
+        let status = state.load_file(Some("/nonexistent/path/file.lua"));
+        assert_eq!(status, ERR_FILE);
+        let msg = state.to_string(-1).unwrap_or_default();
+        assert!(msg.contains("cannot open"), "unexpected error: {}", msg);
+    }
+
+    #[test]
+    fn test_load_file_binary_signature() {
+        let mut content = b"\x1bLua\x55".to_vec();
+        content.extend_from_slice(&[0; 10]);
+        let path = write_tmp("binary", &content);
+        let mut state = LuaState::new();
+        let status = state.load_file(Some(path.to_str().unwrap()));
+        assert_eq!(status, ERR_SYNTAX);
+        let msg = state.to_string(-1).unwrap_or_default();
+        assert!(msg.contains("binary chunk"), "unexpected error: {}", msg);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_file_mode_text_rejects_binary() {
+        let mut content = b"\x1bLua\x55".to_vec();
+        content.extend_from_slice(&[0; 10]);
+        let path = write_tmp("bin_text_mode", &content);
+        let mut state = LuaState::new();
+        let status = state.load_filex(Some(path.to_str().unwrap()), Some("t"));
+        assert_eq!(status, ERR_SYNTAX);
+        let msg = state.to_string(-1).unwrap_or_default();
+        assert!(msg.contains("mode is 'text'"), "unexpected error: {}", msg);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_file_mode_binary_rejects_text() {
+        let path = write_tmp("text_bin_mode", b"return 42\n");
+        let mut state = LuaState::new();
+        let status = state.load_filex(Some(path.to_str().unwrap()), Some("b"));
+        assert_eq!(status, ERR_SYNTAX);
+        let msg = state.to_string(-1).unwrap_or_default();
+        assert!(msg.contains("mode is 'binary'"), "unexpected error: {}", msg);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_file_bom() {
+        let path = write_tmp("bom", b"\xef\xbb\xbfreturn 42\n");
+        let mut state = LuaState::new();
+        let status = state.load_file(Some(path.to_str().unwrap()));
+        assert_eq!(status, 0, "load_file should succeed: {:?}", state.to_string(-1));
+        assert!(matches!(state.stack.last(), Some(TValue::LClosure(_))));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_file_shebang_only() {
+        let path = write_tmp("shebang_only", b"#!/usr/bin/env lua\n");
+        let mut state = LuaState::new();
+        let status = state.load_file(Some(path.to_str().unwrap()));
+        assert_eq!(status, 0, "empty shebang file should load: {:?}", state.to_string(-1));
+        assert!(matches!(state.stack.last(), Some(TValue::LClosure(_))));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_file_latin1_in_string_literal() {
+        // ISO-8859-1 字节直接出现在字符串字面量中
+        let mut bytes: Vec<u8> = b"local s = \"".to_vec();
+        bytes.extend_from_slice(&[0xe1, 0xe9, 0xed]);
+        bytes.extend_from_slice(b"\"\nreturn #s\n");
+        let path = write_tmp("latin1_str", &bytes);
+        let mut state = LuaState::new();
+        let status = state.load_file(Some(path.to_str().unwrap()));
+        assert_eq!(status, 0, "latin1 string literal should load: {:?}", state.to_string(-1));
+        assert!(matches!(state.stack.last(), Some(TValue::LClosure(_))));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_load_file_shebang_with_latin1() {
+        // 首行是 shebang，后续包含 ISO-8859-1 字节
+        let mut bytes: Vec<u8> = b"#!/bin/lua\nlocal s = \"".to_vec();
+        bytes.extend_from_slice(&[0xc1, 0xc9, 0xcd]);
+        bytes.extend_from_slice(b"\"\n");
+        let path = write_tmp("shebang_latin1", &bytes);
+        let mut state = LuaState::new();
+        let status = state.load_file(Some(path.to_str().unwrap()));
+        assert_eq!(status, 0, "shebang + latin1 should load: {:?}", state.to_string(-1));
+        assert!(matches!(state.stack.last(), Some(TValue::LClosure(_))));
+        let _ = std::fs::remove_file(&path);
     }
 }
