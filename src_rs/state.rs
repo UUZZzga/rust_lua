@@ -827,8 +827,8 @@ impl LuaState {
         if let Some(name) = fname {
             match std::fs::read_to_string(name) {
                 Ok(content) => self.load_buffer(&content, name),
-                Err(_) => {
-                    self.push_fstring(&format!("cannot open {}: No such file or directory", name));
+                Err(err) => {
+                    self.push_fstring(&format!("cannot open {}: {}", name, err));
                     ERR_RUN
                 }
             }
@@ -1008,77 +1008,45 @@ impl LuaState {
             }
             TValue::LightUserData(tag) => {
                 let tag_val = tag as usize;
-                if tag_val == 1 {
-                    // print(...)
-                    let args_start = func_idx + 1;
-                    let args_end = self.stack.len();
-                    let mut s = String::new();
-                    for i in args_start..args_end {
-                        if i > args_start { s.push('\t'); }
-                        if let Some(ts) = self.to_string(i as isize) {
-                            s.push_str(&ts);
-                        }
-                    }
-                    self.stack.truncate(func_idx);
-                    let _ = writeln!(self.stdout, "{}", s);
-                    let _ = self.stdout.flush();
-                    return 0;
-                }
-                if tag_val == 2 {
-                    // setmetatable(t, mt)
-                    let arg2 = if func_idx + 2 < self.stack.len() {
-                        self.stack[func_idx + 2].clone()
-                    } else {
-                        TValue::Nil(NilKind::Strict)
-                    };
-                    match &mut self.stack[func_idx + 1] {
-                        TValue::Table(t) => {
-                            match &arg2 {
-                                TValue::Table(mt) => {
-                                    t.metatable = Some(Box::new(mt.clone()));
-                                }
-                                TValue::Nil(_) => {
-                                    t.metatable = None;
-                                }
-                                _ => {
-                                    self.stack.truncate(func_idx);
-                                    self.push_string("bad argument #2 to 'setmetatable' (nil or table expected)");
-                                    return ERR_RUN;
-                                }
-                            }
-                            // 返回表本身
-                            let ret = self.stack[func_idx + 1].clone();
+                let nargs = self.stack.len().saturating_sub(func_idx + 1);
+
+                // 基础库函数派发 (标签 1-19)
+                // 对应原 C 源码 lbaselib.cpp 的各个函数
+                // 注意: ipairsaux (迭代器) 只在 TFORCALL 中调用, 不在此处理
+                if crate::stdlib::base_lib::is_base_tag(tag_val) {
+                    match crate::stdlib::base_lib::call_base_function(
+                        tag_val, self, func_idx, nargs, nresults,
+                    ) {
+                        Ok(()) => return 0,
+                        Err(crate::execute::VmError::RuntimeError(msg)) => {
                             self.stack.truncate(func_idx);
-                            self.stack.push(ret);
-                            return 0;
+                            self.push_string(&msg);
+                            return ERR_RUN;
                         }
-                        _ => {
+                        Err(e) => {
                             self.stack.truncate(func_idx);
-                            self.push_string("bad argument #1 to 'setmetatable' (table expected)");
+                            self.push_string(&format!("{}", e));
                             return ERR_RUN;
                         }
                     }
                 }
-                if tag_val == 3 {
-                    // getmetatable(t)
-                    let mt = match &self.stack[func_idx + 1] {
-                        TValue::Table(t) => t.metatable.as_ref().map(|b| b.as_ref().clone()),
-                        _ => None,
-                    };
-                    self.stack.truncate(func_idx);
-                    match mt {
-                        Some(mt_table) => self.stack.push(TValue::Table(mt_table)),
-                        None => self.stack.push(TValue::Nil(NilKind::Strict)),
+                // 字符串库函数 (标签 100+)
+                if tag_val >= 100 {
+                    match crate::stdlib::string_lib::call_string_function(
+                        tag_val, self, func_idx, nargs, nresults,
+                    ) {
+                        Ok(()) => return 0,
+                        Err(crate::execute::VmError::RuntimeError(msg)) => {
+                            self.stack.truncate(func_idx);
+                            self.push_string(&msg);
+                            return ERR_RUN;
+                        }
+                        Err(e) => {
+                            self.stack.truncate(func_idx);
+                            self.push_string(&format!("{}", e));
+                            return ERR_RUN;
+                        }
                     }
-                    return 0;
-                }
-                if tag_val == 4 {
-                    // type(v)
-                    let ty = self.stack[func_idx + 1].ty();
-                    let name = self.typename(ty);
-                    self.stack.truncate(func_idx);
-                    self.push_string(name);
-                    return 0;
                 }
                 self.stack.truncate(func_idx);
                 self.push_string(&format!("attempt to call a non-function value (tag={})", tag_val));
@@ -1166,35 +1134,10 @@ impl LuaState {
             TValue::Table(arg_table),
         );
 
-        self.globals.set(
-            TValue::Str(str_to_ls(&self.string_table, "print")),
-            TValue::LightUserData(1_usize as *mut std::ffi::c_void),
-        );
-
-        self.globals.set(
-            TValue::Str(str_to_ls(&self.string_table, "setmetatable")),
-            TValue::LightUserData(2_usize as *mut std::ffi::c_void),
-        );
-
-        self.globals.set(
-            TValue::Str(str_to_ls(&self.string_table, "getmetatable")),
-            TValue::LightUserData(3_usize as *mut std::ffi::c_void),
-        );
-
-        self.globals.set(
-            TValue::Str(str_to_ls(&self.string_table, "type")),
-            TValue::LightUserData(4_usize as *mut std::ffi::c_void),
-        );
-
-        self.globals.set(
-            TValue::Str(str_to_ls(&self.string_table, "pcall")),
-            TValue::LightUserData(5_usize as *mut std::ffi::c_void),
-        );
-
-        self.globals.set(
-            TValue::Str(str_to_ls(&self.string_table, "error")),
-            TValue::LightUserData(6_usize as *mut std::ffi::c_void),
-        );
+        // 打开基础库 (注册 print, type, pcall, error, setmetatable, getmetatable,
+        // tonumber, tostring, assert, select, rawequal, rawlen, rawget, rawset,
+        // next, ipairs, pairs, xpcall, warn, _G, _VERSION 等全局函数)
+        crate::stdlib::base_lib::open_base_lib(self);
 
         // 打开字符串库 (创建字符串元表)
         crate::stdlib::string_lib::open_string_lib(self);

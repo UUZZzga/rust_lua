@@ -3256,9 +3256,6 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 // This means GETUPVAL table gets the lower register, key gets the higher.
                 let is_upvalue_table = first.is_upvalue && first.reg.is_none();
                 let saved_upval_idx = first.upval_idx.unwrap_or(0);
-                if is_upvalue_table || first.is_upvalue {
-                    eprintln!("DEBUG LBracket: is_upvalue_table={}, first.is_upvalue={}, first.reg={:?}, first.upval_idx={:?}", is_upvalue_table, first.is_upvalue, first.reg, first.upval_idx);
-                }
                 let (base_reg, gettabup_pc) = if let Some(r) = first.reg {
                     (r, -1)
                 } else if is_upvalue_table {
@@ -3279,9 +3276,6 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 // Check if key expression has jumps (like a comparison).
                 // In C, luaK_exp2val emits code for comparisons but not for simple exprs.
                 let key_has_jumps = ei.exp.has_jumps();
-                if is_upvalue_table {
-                    eprintln!("DEBUG LBracket upvalue_table: key_kind={:?}, key_info={}, key_has_jumps={}, freereg_before={}, freereg_after={}", ei.exp.kind, ei.exp.info, key_has_jumps, saved_freereg_before, fs.freereg);
-                }
                 // For upvalue tables with non-constant, non-simple keys that have jumps:
                 // emit key load code first (like C's luaK_exp2val), then GETUPVAL
                 // Note: Upval key is handled separately (upval_key_placeholder_pc),
@@ -3546,7 +3540,6 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 let v = &vars[i];
                 let val = &exps[i];
                 if let (Some(table_reg), Some(table_key)) = (v.table_reg, v.table_key) {
-                    eprintln!("DEBUG: i={}, table_reg={}, table_key={}, is_upvalue={}, upval_idx={:?}", i, table_reg, table_key, v.is_upvalue, v.upval_idx);
                     // VVARGVAR assignment: like C's luaK_storevar for VVARGIND,
                     // set PF_VATAB then fall through to SETTABLE
                     if v.is_vvargvar {
@@ -4343,7 +4336,6 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
             let name = name.clone();
             fs.ls_mut().next();
             let mut result = if let Some(mut ctc) = fs.find_local_ctc(&name) {
-                eprintln!("DEBUG prefix_exp Name: {} found as ctc", name);
                 let r = fs.alloc_reg();
                 match ctc.kind {
                     ExpKind::Int => {
@@ -4381,16 +4373,13 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                 };
                 PrefixResult { var_name: None, local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
             } else if let Some((reg, kind)) = fs.find_local_ex(&name) {
-                eprintln!("DEBUG prefix_exp Name: {} found as local_ex reg={}", name, reg);
                 let is_vvargvar = kind == RDKVAVAR;
                 PrefixResult { var_name: None, local_idx: Some(reg), key: None, reg: Some(reg), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar, is_readonly: false }
             } else if fs.find_named_global_decl(&name).is_some() {
                 // 具名 global 声明（如 `global a`）：优先于 upvalue，通过 _ENV[name] 访问。
                 // 匹配 C 的 searchvar：具名 global 匹配时立即返回 VGLOBAL，优先于 upvalue 查找。
-                eprintln!("DEBUG prefix_exp Name: {} found as named global", name);
                 code_global_via_env_prefix(fs, &name)
             } else if let Some(result) = fs.find_upvalue(&name) {
-                eprintln!("DEBUG prefix_exp Name: {} found as upvalue", name);
                 match result {
                     UpvalueOrCtc::Upvalue(upval_idx) => {
                         // Don't eagerly load the upvalue into a register.
@@ -4640,9 +4629,6 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     // - Short string key: GETTABUP/SETTABUP (no GETUPVAL needed)
                     let is_upvalue_table = result.is_upvalue && result.reg.is_none();
                     let saved_upval_idx = result.upval_idx.unwrap_or(0);
-                    if is_upvalue_table || result.is_upvalue {
-                        eprintln!("DEBUG parse_prefix_exp LBracket: is_upvalue_table={}, result.is_upvalue={}, result.reg={:?}, result.upval_idx={:?}", is_upvalue_table, result.is_upvalue, result.reg, result.upval_idx);
-                    }
                     let (base_reg, gettabup_pc) = if let Some(r) = result.reg {
                         (r, -1)
                     } else if is_upvalue_table {
@@ -4736,9 +4722,6 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         (fs.exp_to_reg(&ei.exp), false, false)
                     };
                     let key_allocated = !key_is_const && kr != -1 && fs.freereg > saved_freereg_before;
-                    if is_upvalue_table {
-                        eprintln!("DEBUG upvalue_table key: key_kind={:?}, kr={}, key_is_const={}, key_is_int={}, key_allocated={}, freereg_before={}, freereg_after={}", ei.exp.kind, kr, key_is_const, key_is_int, key_allocated, saved_freereg_before, fs.freereg);
-                    }
                     let (base_reg, new_is_upvalue, allocated_reg) = if is_upvalue_table {
                         let can_use_settabup = key_is_const && !key_is_int
                             && (kr as u32) <= crate::opcodes::MAXINDEXRK;
@@ -4758,15 +4741,11 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         } else {
                             let r = fs.alloc_reg();
                             fs.code_abc(OpCode::GETUPVAL, r, saved_upval_idx, 0);
-                            eprintln!("DEBUG upvalue_table GETUPVAL: r={}, freereg={}", r, fs.freereg);
                             (r, false, true)
                         }
                     } else {
                         (base_reg, result.is_upvalue, result.allocated_reg || result.reg.is_none())
                     };
-                    if is_upvalue_table {
-                        eprintln!("DEBUG upvalue_table result: base_reg={}, new_is_upvalue={}, allocated_reg={}", base_reg, new_is_upvalue, allocated_reg);
-                    }
                     // Now resolve deferred key register allocation (Upval/Relocable/Str key for upvalue table)
                     let (kr, key_allocated) = if kr == -1 && is_upvalue_table {
                         if let Some(pc) = upval_key_placeholder_pc {
@@ -8159,10 +8138,8 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
             // 3. 查找 upvalue（`global *` 不阻止 upvalue 查找）
             // 4. 未找到则作为全局变量（`global *` 或隐式全局）通过 _ENV[name] 访问
             if let Some(ctc) = fs.find_local_ctc(&name) {
-                eprintln!("DEBUG Name: {} found as ctc", name);
                 ctc
             } else if let Some((reg, kind)) = fs.find_local_ex(&name) {
-                eprintln!("DEBUG Name: {} found as local reg={}", name, reg);
                 if kind == RDKVAVAR {
                     ExpDesc::new(ExpKind::VVARGVAR, reg as i64)
                 } else {
@@ -8170,10 +8147,8 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 }
             } else if let Some(_kind) = fs.find_named_global_decl(&name) {
                 // 具名 global 声明（如 `global a`）：优先于 upvalue，通过 _ENV[name] 访问
-                eprintln!("DEBUG Name: {} found as named global", name);
                 code_global_via_env(fs, &name)
             } else if let Some(result) = fs.find_upvalue(&name) {
-                eprintln!("DEBUG Name: {} found as upvalue", name);
                 match result {
                     UpvalueOrCtc::Upvalue(upval_idx) => {
                         // Like C's singlevar returning VUPVAL: delay GETUPVAL emission.

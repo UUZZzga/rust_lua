@@ -28,7 +28,6 @@ use crate::gc::GCState;
 use std::rc::Rc;
 use std::cell::RefCell;
 use std::ffi::c_void;
-use std::io::Write;
 
 // ============================================================================
 // VmResult / VmError
@@ -310,6 +309,28 @@ impl VmExecutor {
                         for i in nargs..nfixparams {
                             state.stack[ra + 4 + i] = TValue::Nil(NilKind::Strict);
                         }
+                        Ok(())
+                    } else if let TValue::LightUserData(tag) = &func_val {
+                        // 处理 LightUserData 迭代器 (ipairs/pairs 返回的迭代器)
+                        let tag_val = *tag as usize;
+                        let nresults = (c + 1) as i32;
+                        let nargs = 2; // state 和 control
+                        if tag_val == crate::stdlib::base_lib::BASE_IPAIRS_AUX {
+                            // ipairs 迭代器 (ipairsaux)
+                            crate::stdlib::base_lib::call_ipairs_aux(
+                                state, ra + 3, nargs, nresults,
+                            )?;
+                        } else if tag_val == crate::stdlib::base_lib::BASE_NEXT_ITER {
+                            // pairs 迭代器 (next)
+                            crate::stdlib::base_lib::call_next_iter(
+                                state, ra + 3, nargs, nresults,
+                            )?;
+                        } else if crate::stdlib::base_lib::is_base_tag(tag_val) {
+                            crate::stdlib::base_lib::call_base_function(
+                                tag_val, state, ra + 3, nargs, nresults,
+                            )?;
+                        }
+                        state.pc += 1;
                         Ok(())
                     } else {
                         state.pc += 1;
@@ -1620,161 +1641,13 @@ impl VmExecutor {
                 let nargs = if b == 0 { state.stack.len().saturating_sub(a + 1) } else { b.saturating_sub(1) };
                 let nresults: i32 = if c == 0 { -1 } else { c - 1 };
 
-                if tag_val == 1 {
-                    // print(...)
-                    let mut s = String::new();
-                    for i in 0..nargs {
-                        if i > 0 { s.push('\t'); }
-                        let val = Self::read_stack(state, a + 1 + i);
-                        match val {
-                            TValue::Nil(_) => s.push_str("nil"),
-                            TValue::Boolean(bv) => s.push_str(if *bv { "true" } else { "false" }),
-                            TValue::Integer(n) => s.push_str(&n.to_string()),
-                            TValue::Float(n) => {
-                                if n.is_nan() { s.push_str("nan"); }
-                                else if n.is_infinite() { s.push_str(if *n > 0.0 { "inf" } else { "-inf" }); }
-                                else {
-                                    // 对应 C 的 tostringbuffFloat: 如果结果看起来像整数，添加 ".0"
-                                    let str = format!("{}", n);
-                                    let looks_like_int = str.chars().all(|c| c.is_ascii_digit() || c == '-');
-                                    if looks_like_int && !str.is_empty() {
-                                        s.push_str(&str);
-                                        s.push_str(".0");
-                                    } else {
-                                        s.push_str(&str);
-                                    }
-                                }
-                            }
-                            TValue::Str(lst) => s.push_str(&lst.as_str()),
-                            TValue::Table(_) => s.push_str("table: 0x0"),
-                            TValue::LClosure(_) | TValue::LCFn(_) | TValue::CClosure(_) => s.push_str("function: 0x0"),
-                            _ => s.push_str(&format!("{:?}", val)),
-                        }
-                    }
-                    let _ = writeln!(state.stdout, "{}", s);
-                    let _ = state.stdout.flush();
-                    // print 返回 0 个结果: 截断栈到 a
-                    state.stack.truncate(a);
-                } else if tag_val == 2 {
-                    // setmetatable(t, mt) -> 返回 t
-                    let arg2 = if a + 2 < state.stack.len() {
-                        state.stack[a + 2].clone()
-                    } else {
-                        TValue::Nil(NilKind::Strict)
-                    };
-                    let result = match &mut state.stack[a + 1] {
-                        TValue::Table(t) => {
-                            match &arg2 {
-                                TValue::Table(mt) => {
-                                    t.metatable = Some(Box::new(mt.clone()));
-                                }
-                                TValue::Nil(_) => {
-                                    t.metatable = None;
-                                }
-                                _ => {
-                                    return Err(VmError::RuntimeError(
-                                        "bad argument #2 to 'setmetatable' (nil or table expected)".to_string()
-                                    ));
-                                }
-                            }
-                            state.stack[a + 1].clone()
-                        }
-                        _ => {
-                            return Err(VmError::RuntimeError(
-                                "bad argument #1 to 'setmetatable' (table expected)".to_string()
-                            ));
-                        }
-                    };
-                    // 调整结果: 1 个返回值
-                    state.stack.truncate(a);
-                    if nresults < 0 || nresults >= 1 {
-                        state.stack.push(result);
-                    }
-                } else if tag_val == 3 {
-                    // getmetatable(t) -> 返回 mt 或 nil
-                    let mt = match &state.stack[a + 1] {
-                        TValue::Table(t) => t.metatable.as_ref().map(|b| b.as_ref().clone()),
-                        _ => None,
-                    };
-                    let ret = match mt {
-                        Some(mt_table) => TValue::Table(mt_table),
-                        None => TValue::Nil(NilKind::Strict),
-                    };
-                    state.stack.truncate(a);
-                    if nresults < 0 || nresults >= 1 {
-                        state.stack.push(ret);
-                    }
-                } else if tag_val == 4 {
-                    // type(v) -> 返回类型名字符串
-                    let ty = state.stack[a + 1].ty();
-                    let name = state.typename(ty);
-                    let ret = TValue::Str(crate::state::str_to_ls(&state.string_table, name));
-                    state.stack.truncate(a);
-                    if nresults < 0 || nresults >= 1 {
-                        state.stack.push(ret);
-                    }
-                } else if tag_val == 5 {
-                    // pcall(f, args...) -> true, 结果... 或 false, 错误消息
-                    // 参数: a+1 = f, a+2.. = args
-                    let func = if a + 1 < state.stack.len() {
-                        state.stack[a + 1].clone()
-                    } else {
-                        TValue::Nil(NilKind::Strict)
-                    };
-                    let pcall_nargs = nargs.saturating_sub(1);
-
-                    // 把 f 和 args 移到 a 位置（覆盖 pcall 函数本身）
-                    // 栈布局: [pcall_func | f | arg1 | arg2 | ...]
-                    // 调整为: [f | arg1 | arg2 | ...]
-                    if a + 1 < state.stack.len() {
-                        state.stack[a] = func;
-                        // 移除原来的 f 位置（a+1），使 args 紧跟 a
-                        if a + 1 < state.stack.len() {
-                            state.stack.remove(a + 1);
-                        }
-                    }
-
-                    let status = state.pcall(pcall_nargs, -1, 0);
-
-                    // pcall 后: 栈截断到 a，结果在 a..
-                    // pcall 返回 0 = 成功, 非 0 = 失败
-                    let nret = state.stack.len().saturating_sub(a);
-
-                    // 收集结果
-                    let mut results: Vec<TValue> = Vec::new();
-                    if status == 0 {
-                        // 成功: true, 结果...
-                        results.push(TValue::Boolean(true));
-                        for i in 0..nret {
-                            results.push(state.stack[a + i].clone());
-                        }
-                    } else {
-                        // 失败: false, 错误消息
-                        results.push(TValue::Boolean(false));
-                        if nret > 0 {
-                            results.push(state.stack[a].clone());
-                        } else {
-                            results.push(TValue::Nil(NilKind::Strict));
-                        }
-                    }
-
-                    // 写回结果
-                    state.stack.truncate(a);
-                    for r in results {
-                        state.stack.push(r);
-                    }
-                } else if tag_val == 6 {
-                    // error(msg) -> 抛出错误
-                    let msg = if a + 1 < state.stack.len() {
-                        state.stack[a + 1].clone()
-                    } else {
-                        TValue::Nil(NilKind::Strict)
-                    };
-                    let err_msg = match &msg {
-                        TValue::Str(s) => s.as_str().to_string(),
-                        _ => format!("{}", msg),
-                    };
-                    return Err(VmError::RuntimeError(err_msg));
+                // 基础库函数派发 (标签 1-19)
+                // 对应原 C 源码 lbaselib.cpp 的各个函数
+                // 注意: ipairsaux (迭代器) 只在 TFORCALL 中调用, 不在此处理
+                if crate::stdlib::base_lib::is_base_tag(tag_val) {
+                    crate::stdlib::base_lib::call_base_function(
+                        tag_val, state, a, nargs, nresults,
+                    )?;
                 } else if tag_val >= 100 {
                     // 字符串库函数（标签 100+）
                     crate::stdlib::string_lib::call_string_function(
@@ -1942,6 +1815,23 @@ impl VmExecutor {
             }
             TValue::CClosure(cc) => {
                 Self::call_c_function(state, a, b, 0, cc.f)?;
+                Ok(())
+            }
+            TValue::LightUserData(tag) => {
+                // TAILCALL LightUserData 函数 (基础库/字符串库函数)
+                // 注意: ipairsaux (迭代器) 只在 TFORCALL 中调用, 不在此处理
+                let tag_val = tag as usize;
+                let nargs = if b == 0 { state.stack.len().saturating_sub(a + 1) } else { b.saturating_sub(1) };
+                if crate::stdlib::base_lib::is_base_tag(tag_val) {
+                    crate::stdlib::base_lib::call_base_function(
+                        tag_val, state, a, nargs, -1,
+                    )?;
+                } else if tag_val >= 100 {
+                    crate::stdlib::string_lib::call_string_function(
+                        tag_val, state, a, nargs, -1,
+                    )?;
+                }
+                state.pc += 1;
                 Ok(())
             }
             _ => {
@@ -2262,7 +2152,8 @@ impl VmExecutor {
         let closing = Self::read_stack(state, ra + 3).clone();
         Self::write_stack(state, ra + 3, tmp);
         Self::write_stack(state, ra + 2, closing);
-        let bx = opcodes::getarg_sbx(inst);
+        // 对应 C: pc += GETARG_Bx(i) (使用无符号 Bx, 不是有符号 sBx)
+        let bx = opcodes::getarg_bx(inst);
         state.pc = ((state.pc as i32) + bx + 1) as usize;
         Ok(())
     }
@@ -2285,7 +2176,8 @@ impl VmExecutor {
         match control {
             TValue::Nil(_) => { state.pc += 1; }
             _ => {
-                let bx = opcodes::getarg_sbx(inst);
+                // 对应 C: pc -= GETARG_Bx(i) (使用无符号 Bx, 不是有符号 sBx)
+                let bx = opcodes::getarg_bx(inst);
                 state.pc = ((state.pc as i32) - bx + 1) as usize;
             }
         }
@@ -2591,9 +2483,34 @@ impl VmExecutor {
     // 辅助: 表操作
     // ========================================================================
 
-    fn table_get(state: &LuaState, table_val: &TValue, key: &TValue) -> TValue {
+    fn table_get(state: &mut LuaState, table_val: &TValue, key: &TValue) -> TValue {
         match table_val {
-            TValue::Table(t) => t.get(key).cloned().unwrap_or(TValue::Nil(NilKind::Strict)),
+            TValue::Table(t) => {
+                // 先直接查找表
+                if let Some(v) = t.get(key) {
+                    if !matches!(v, TValue::Nil(_)) {
+                        return v.clone();
+                    }
+                }
+                // 查找 __index 元方法
+                if let Some(ref mt) = t.metatable {
+                    let index_key = crate::tm::make_tm_tvalue(crate::tm::TagMethod::Index);
+                    if let Some(index_val) = mt.get(&index_key) {
+                        match index_val {
+                            TValue::Table(index_table) => {
+                                // __index 是表: 递归查找
+                                return Self::table_get(state, &TValue::Table(index_table.clone()), key);
+                            }
+                            TValue::LClosure(_) | TValue::LCFn(_) | TValue::CClosure(_) | TValue::LightUserData(_) => {
+                                // __index 是函数: 调用 __index(table, key)
+                                return Self::call_index_metamethod(state, index_val.clone(), table_val.clone(), key.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                TValue::Nil(NilKind::Strict)
+            }
             TValue::Str(_) => {
                 // 字符串类型: 查找字符串元表的 __index
                 if let Some(mt) = state.dmt.get(LuaType::String) {
@@ -2614,6 +2531,33 @@ impl VmExecutor {
             }
             _ => TValue::Nil(NilKind::Strict),
         }
+    }
+
+    /// 调用 __index 元方法函数: __index(table, key)
+    fn call_index_metamethod(state: &mut LuaState, index_fn: TValue, table: TValue, key: TValue) -> TValue {
+        // 保存当前栈长度
+        let saved_top = state.stack.len();
+        // 压入: func, table, key
+        state.stack.push(index_fn);
+        state.stack.push(table);
+        state.stack.push(key);
+        let func_idx = saved_top;
+        // 调用函数 (2 个参数, 1 个结果)
+        let status = state.pcall(2, 1, 0);
+        let result = if status == 0 {
+            // 成功: 取结果
+            if func_idx < state.stack.len() {
+                state.stack[func_idx].clone()
+            } else {
+                TValue::Nil(NilKind::Strict)
+            }
+        } else {
+            // 失败: 返回 nil
+            TValue::Nil(NilKind::Strict)
+        };
+        // 恢复栈
+        state.stack.truncate(saved_top);
+        result
     }
 
     fn table_set_tv(mut table_val: TValue, key: TValue, val: TValue, gc: &GCState) -> TValue {
