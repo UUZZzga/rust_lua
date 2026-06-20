@@ -16,7 +16,7 @@
 use std::cmp::Ordering;
 use std::ffi::CString;
 
-use crate::objects::TValue;
+use crate::objects::{TValue, UpVal, UpValRef, NilKind};
 use crate::strings::LuaString;
 use crate::table::Table;
 use crate::tm::{
@@ -25,6 +25,7 @@ use crate::tm::{
 };
 use crate::gc::GCState;
 use std::rc::Rc;
+use std::cell::RefCell;
 
 // ============================================================================
 // 虚拟机主解释器循环 (原 lvm.cpp 中的 luaV_execute)
@@ -417,99 +418,34 @@ pub fn raw_equal(t1: &TValue, t2: &TValue) -> bool {
     }
 }
 
-/// 比较两个 TValue 是否相等（支持元方法回退，仅对 table/userdata）。
-///
-/// 对应 C 源码: luaV_equalobj
-/// C 的 __eq 元方法仅在两个类型相同且变体相同的 table 或 userdata
-/// 不是同一对象时才被尝试。其他类型不尝试元方法。
-///
-/// `default_mts` 为类型默认元表；`call_fn` 用于实际调用元方法。
-/// 若为 `None` 则仅做原始比较（raw equality）。
-///
-/// Scenario: 不同 table 有 __eq
-/// Given: 两个不同指针的 Table，各自的元表中定义了 __eq
-/// When: 调用 equal(t1, t2, Some(&dmt), Some(&mut call_fn))
-/// Then: 调用 __eq 元方法，返回其结果
-pub fn equal(
-    t1: &TValue, t2: &TValue,
-    default_mts: Option<&DefaultMetatables>,
-    call_fn: Option<&mut dyn FnMut(&TValue, &[&TValue]) -> Result<TValue, TagMethodError>>,
-) -> Result<bool, TagMethodError> {
-    // C: if (ttype(t1) != ttype(t2)) return 0;
-    if std::mem::discriminant(t1) != std::mem::discriminant(t2) {
-        return Ok(false);
-    }
-    // raw_equal 已处理变体不同的情况 (integer/float, short/long string)
-    if raw_equal(t1, t2) {
-        return Ok(true);
-    }
-    // C: 只有同变体的 table 和 userdata 才尝试 __eq
-    match (t1, t2) {
-        (TValue::Table(_), TValue::Table(_)) | (TValue::UserData(_), TValue::UserData(_)) => {}
-        _ => return Ok(false),
-    }
-    let (default_mts, call_fn) = match (default_mts, call_fn) {
-        (Some(dmt), Some(f)) => (dmt, f),
-        _ => return Ok(false),
-    };
-    // C: fasttm(L, hvalue(t1)->metatable, TM_EQ) ?? fasttm(L, hvalue(t2)->metatable, TM_EQ)
-    let tm = crate::tm::get_tm_by_obj(t1, TagMethod::Eq, default_mts)
-        .or_else(|| crate::tm::get_tm_by_obj(t2, TagMethod::Eq, default_mts));
-    match tm {
-        Some(func) => {
-            let result = call_fn(func, &[t1, t2])?;
-            Ok(!is_false(&result))
-        }
-        None => Ok(false),
-    }
-}
-
 // ============================================================================
-// 小于比较
+// 小于比较 (原始比较，不含元方法 — 元方法在 tm.rs 的 call_order_tm 中处理)
 // ============================================================================
 
-/// 比较两个 TValue: 返回 l < r。
-///
-/// 数字比较用 lt_num，字符串比较用 strcmp。
-/// 其他类型时通过 `call_order_tm` 尝试 TM_LT 元方法（该函数在 tm.rs 中）。
-/// 若未提供 dmt/call_fn 则对非数非字符串返回 false。
-pub fn less_than(
-    l: &TValue, r: &TValue,
-    default_mts: Option<&DefaultMetatables>,
-    call_fn: Option<&mut dyn FnMut(&TValue, &[&TValue]) -> Result<TValue, TagMethodError>>,
-) -> Result<bool, TagMethodError> {
+/// 原始小于比较 (不含元方法): 数字用 lt_num，字符串用 strcmp。
+/// 其他类型返回 false。
+/// 对应 C 的 luaV_lessthan 中的快速路径 (非元方法部分)。
+pub fn less_than_raw(l: &TValue, r: &TValue) -> Option<bool> {
     if l.is_number() && r.is_number() {
-        return Ok(lt_num(l, r));
+        return Some(lt_num(l, r));
     }
     if let (TValue::Str(a), TValue::Str(b)) = (l, r) {
-        return Ok(strcmp(a, b) == Ordering::Less);
+        return Some(strcmp(a, b) == Ordering::Less);
     }
-    match (default_mts, call_fn) {
-        (Some(dmt), Some(cf)) => crate::tm::call_order_tm(l, r, TagMethod::Lt, dmt, cf),
-        _ => Ok(false),
-    }
+    None
 }
 
-/// 比较两个 TValue: 返回 l <= r。
-///
-/// 数字比较用 le_num，字符串比较用 strcmp。
-/// 其他类型时通过 `call_order_tm` 尝试 TM_LE 元方法（该函数在 tm.rs 中）。
-/// 若未提供 dmt/call_fn 则对非数非字符串返回 false。
-pub fn less_equal(
-    l: &TValue, r: &TValue,
-    default_mts: Option<&DefaultMetatables>,
-    call_fn: Option<&mut dyn FnMut(&TValue, &[&TValue]) -> Result<TValue, TagMethodError>>,
-) -> Result<bool, TagMethodError> {
+/// 原始小于等于比较 (不含元方法): 数字用 le_num，字符串用 strcmp。
+/// 其他类型返回 false。
+/// 对应 C 的 luaV_lessequal 中的快速路径 (非元方法部分)。
+pub fn less_equal_raw(l: &TValue, r: &TValue) -> Option<bool> {
     if l.is_number() && r.is_number() {
-        return Ok(le_num(l, r));
+        return Some(le_num(l, r));
     }
     if let (TValue::Str(a), TValue::Str(b)) = (l, r) {
-        return Ok(strcmp(a, b) != Ordering::Greater);
+        return Some(strcmp(a, b) != Ordering::Greater);
     }
-    match (default_mts, call_fn) {
-        (Some(dmt), Some(cf)) => crate::tm::call_order_tm(l, r, TagMethod::Le, dmt, cf),
-        _ => Ok(false),
-    }
+    None
 }
 
 // ============================================================================
@@ -631,64 +567,19 @@ pub fn shiftr(x: i64, y: i64) -> i64 {
 }
 
 // ============================================================================
-// objlen: # 操作符
+// objlen_raw: # 操作符的原始长度 (不含元方法 — 元方法在 tm.rs 的 obj_len 中处理)
 // ============================================================================
 
-/// 计算值的长度（# 操作符）。
-///
-/// `default_mts` 和 `call_fn` 用于元方法回退；
-/// 若 call_fn 为 None 则仅做原始比较。
-///
-/// Scenario: 表有 __len 元方法
-/// Given: 一个有 __len 元方法的表
-/// When: 调用 objlen(&table, ...)
-/// Then: 返回元方法的结果
-///
-/// Scenario: 字符串
-/// Given: Str("hello")
-/// When: 调用 objlen
-/// Then: 返回 Some(Integer(5))
-///
-/// Scenario: 无元方法的其他类型
-/// Given: Integer(42)
-/// When: 调用 objlen(..., None)
-/// Then: 返回 None
-pub fn objlen(
-    obj: &TValue,
-    default_mts: Option<&DefaultMetatables>,
-    call_fn: Option<&mut dyn FnMut(&TValue, &[&TValue]) -> Result<TValue, TagMethodError>>,
-) -> Result<Option<TValue>, TagMethodError> {
+/// 计算值的原始长度（# 操作符，不含元方法）。
+/// 对应 C 的 luaV_objlen 中的快速路径 (非元方法部分)。
+/// - Table: 返回表长度
+/// - String: 返回字符串长度
+/// - 其他: 返回 None (需要调用 __len 元方法)
+pub fn objlen_raw(obj: &TValue) -> Option<TValue> {
     match obj {
-        TValue::Table(t) => {
-            if let Some(_dmt) = default_mts {
-                let mt = t.metatable.as_ref().map(|b| b.as_ref());
-                let tm = mt.and_then(|m| {
-                    let mut meta = crate::tm::Metatable::new(m.clone());
-                    meta.get_tm(TagMethod::Len).cloned()
-                });
-                if let (Some(tm_val), Some(cf)) = (tm, call_fn) {
-                    let result = cf(&tm_val, &[obj])?;
-                    return Ok(Some(result));
-                }
-            }
-            Ok(Some(TValue::Integer(t.len())))
-        }
-        TValue::Str(s) => Ok(Some(TValue::Integer(s.len() as i64))),
-        _ => {
-            if let (Some(dmt), Some(cf)) = (default_mts, call_fn) {
-                let tm = get_tm_by_obj(obj, TagMethod::Len, dmt);
-                if let Some(tm_val) = tm {
-                    let result = cf(tm_val, &[obj])?;
-                    return Ok(Some(result));
-                }
-                Err(TagMethodError::TypeError {
-                    expected: "table, string, or object with __len".to_string(),
-                    got: obj_type_name(obj),
-                })
-            } else {
-                Ok(None)
-            }
-        }
+        TValue::Table(t) => Some(TValue::Integer(t.len())),
+        TValue::Str(s) => Some(TValue::Integer(s.len() as i64)),
+        _ => None,
     }
 }
 
@@ -1226,34 +1117,34 @@ pub fn float_for_loop(stack: &mut Vec<TValue>, ra: usize) -> bool {
 pub fn push_closure(
     stack: &mut Vec<TValue>,
     proto: &crate::objects::Proto,
-    _enc_upvals: &[crate::objects::UpVal],
+    _enc_upvals: &[UpValRef],
     _base: usize,
     ra: usize,
     gc: &GCState,
 ) {
     let nup = proto.size_upvalues as usize;
-    let mut upvals = Vec::with_capacity(nup);
+    let mut upvals: Vec<UpValRef> = Vec::with_capacity(nup);
 
     for i in 0..nup {
         if i < proto.upvalues.len() && proto.upvalues[i].in_stack {
             let idx = _base + proto.upvalues[i].idx as usize;
             if idx < stack.len() {
-                upvals.push(crate::objects::UpVal::Open {
+                upvals.push(Rc::new(RefCell::new(UpVal::Open {
                     stack_index: idx,
                     next: None,
                     previous: None,
-                });
+                })));
             } else {
-                upvals.push(crate::objects::UpVal::Closed {
-                    value: Box::new(TValue::Nil(crate::objects::NilKind::Strict)),
-                });
+                upvals.push(Rc::new(RefCell::new(UpVal::Closed {
+                    value: Box::new(TValue::Nil(NilKind::Strict)),
+                })));
             }
         } else if i < _enc_upvals.len() {
             upvals.push(_enc_upvals[i].clone());
         } else {
-            upvals.push(crate::objects::UpVal::Closed {
-                value: Box::new(TValue::Nil(crate::objects::NilKind::Strict)),
-            });
+            upvals.push(Rc::new(RefCell::new(UpVal::Closed {
+                value: Box::new(TValue::Nil(NilKind::Strict)),
+            })));
         }
     }
 
@@ -1268,13 +1159,14 @@ pub fn push_closure(
     // GC barrier (luaC_objbarrier): for each upvalue, if closure is black
     // and upvalue value is a white GC object, make it gray
     for uv in &closure.upvals {
-        match uv {
-            crate::objects::UpVal::Closed { value } => {
+        let uv_ref = uv.borrow();
+        match &*uv_ref {
+            UpVal::Closed { value } => {
                 if let Some(val_gc_id) = gc_id_of_tvalue(value) {
                     gc.obj_barrier(closure_id, val_gc_id);
                 }
             }
-            crate::objects::UpVal::Open { stack_index, .. } => {
+            UpVal::Open { stack_index, .. } => {
                 if *stack_index < stack.len() {
                     let val = &stack[*stack_index];
                     if let Some(val_gc_id) = gc_id_of_tvalue(val) {
@@ -1765,13 +1657,13 @@ mod tests {
     }
 
     // ========================================================================
-    // less_than / less_equal 测试
+    // less_than_raw / less_equal_raw 测试
     // ========================================================================
 
     #[test]
     fn test_less_than_numbers() {
-        assert!(less_than(&TValue::Integer(3), &TValue::Integer(5), None, None).unwrap());
-        assert!(!less_than(&TValue::Integer(5), &TValue::Integer(3), None, None).unwrap());
+        assert!(less_than_raw(&TValue::Integer(3), &TValue::Integer(5)).unwrap());
+        assert!(!less_than_raw(&TValue::Integer(5), &TValue::Integer(3)).unwrap());
     }
 
     #[test]
@@ -1779,19 +1671,19 @@ mod tests {
         let tb = StringTable::new();
         let a = TValue::Str(tb.intern("abc"));
         let b = TValue::Str(tb.intern("abd"));
-        assert!(less_than(&a, &b, None, None).unwrap());
+        assert!(less_than_raw(&a, &b).unwrap());
     }
 
     #[test]
     fn test_less_than_different_types() {
-        assert!(!less_than(&TValue::Integer(1), &TValue::Boolean(true), None, None).unwrap());
-        assert!(!less_than(&TValue::Nil(NilKind::Strict), &TValue::Integer(0), None, None).unwrap());
+        assert!(less_than_raw(&TValue::Integer(1), &TValue::Boolean(true)).is_none());
+        assert!(less_than_raw(&TValue::Nil(NilKind::Strict), &TValue::Integer(0)).is_none());
     }
 
     #[test]
     fn test_less_equal_equal() {
-        assert!(less_equal(&TValue::Integer(3), &TValue::Integer(3), None, None).unwrap());
-        assert!(!less_equal(&TValue::Integer(5), &TValue::Integer(3), None, None).unwrap());
+        assert!(less_equal_raw(&TValue::Integer(3), &TValue::Integer(3)).unwrap());
+        assert!(!less_equal_raw(&TValue::Integer(5), &TValue::Integer(3)).unwrap());
     }
 
     #[test]
@@ -1799,10 +1691,10 @@ mod tests {
         let tb = StringTable::new();
         let a = TValue::Str(tb.intern("abc"));
         let b = TValue::Str(tb.intern("abc"));
-        assert!(less_equal(&a, &b, None, None).unwrap());
+        assert!(less_equal_raw(&a, &b).unwrap());
         let c = TValue::Str(tb.intern("abd"));
-        assert!(less_equal(&a, &c, None, None).unwrap());
-        assert!(!less_equal(&c, &a, None, None).unwrap());
+        assert!(less_equal_raw(&a, &c).unwrap());
+        assert!(!less_equal_raw(&c, &a).unwrap());
     }
 
     // ========================================================================
@@ -1968,21 +1860,21 @@ mod tests {
     }
 
     // ========================================================================
-    // objlen 测试
+    // objlen_raw 测试
     // ========================================================================
 
     #[test]
     fn test_objlen_string() {
         let tb = StringTable::new();
         let s = TValue::Str(tb.intern("hello"));
-        assert_eq!(objlen(&s, None, None).unwrap(), Some(TValue::Integer(5)));
+        assert_eq!(objlen_raw(&s), Some(TValue::Integer(5)));
     }
 
     #[test]
     fn test_objlen_empty_string() {
         let tb = StringTable::new();
         let s = TValue::Str(tb.intern(""));
-        assert_eq!(objlen(&s, None, None).unwrap(), Some(TValue::Integer(0)));
+        assert_eq!(objlen_raw(&s), Some(TValue::Integer(0)));
     }
 
     #[test]
@@ -1992,12 +1884,12 @@ mod tests {
         t.set_int(2, TValue::Integer(20));
         t.set_int(3, TValue::Integer(30));
         let tv = TValue::Table(t);
-        assert_eq!(objlen(&tv, None, None).unwrap(), Some(TValue::Integer(3)));
+        assert_eq!(objlen_raw(&tv), Some(TValue::Integer(3)));
     }
 
     #[test]
     fn test_objlen_non_lenable() {
-        assert_eq!(objlen(&TValue::Integer(42), None, None).unwrap(), None);
+        assert_eq!(objlen_raw(&TValue::Integer(42)), None);
     }
 
     #[test]
@@ -2006,14 +1898,14 @@ mod tests {
         t.set_int(1, TValue::Integer(10));
         t.set_int(2, TValue::Integer(20));
         t.set_int(4, TValue::Integer(40));
-        assert_eq!(objlen(&TValue::Table(t), None, None).unwrap(), Some(TValue::Integer(2)));
+        assert_eq!(objlen_raw(&TValue::Table(t)), Some(TValue::Integer(2)));
     }
 
     #[test]
     fn test_objlen_table_hash_only() {
         let mut t = Table::new();
         t.set(TValue::Boolean(true), TValue::Integer(1));
-        assert_eq!(objlen(&TValue::Table(t), None, None).unwrap(), Some(TValue::Integer(0)));
+        assert_eq!(objlen_raw(&TValue::Table(t)), Some(TValue::Integer(0)));
     }
 
     // ========================================================================
@@ -2046,13 +1938,13 @@ mod tests {
     }
 
     // ========================================================================
-    // equal 测试
+    // equal 测试 (使用 raw_equal — 元方法版本在 tm.rs 的 equal_obj 中)
     // ========================================================================
 
     #[test]
     fn test_equal_basic() {
-        assert!(equal(&TValue::Integer(42), &TValue::Integer(42), None, None).unwrap());
-        assert!(!equal(&TValue::Integer(42), &TValue::Integer(43), None, None).unwrap());
+        assert!(raw_equal(&TValue::Integer(42), &TValue::Integer(42)));
+        assert!(!raw_equal(&TValue::Integer(42), &TValue::Integer(43)));
     }
 
     // ========================================================================

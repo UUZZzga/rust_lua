@@ -25,11 +25,18 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 
 use crate::strings::LuaString;
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use crate::gc::GCObjectHeader;
 
 // ============================================================================
 // 规约：Lua 基础类型标签
 // ============================================================================
+
+/// 共享上值引用 —— 多个闭包可以共享同一个 UpVal（对应 C 中 UpVal 是堆分配对象）。
+/// 当 Open 上值被关闭时，所有持有该引用的闭包都能看到 Closed 状态。
+pub type UpValRef = Rc<RefCell<UpVal>>;
 
 /// Lua 类型标签 —— 使用 Rust enum 替代 C 的整数常量 + 位掩码
 ///
@@ -543,8 +550,8 @@ pub struct LClosure {
     pub gc_header: GCObjectHeader,
     /// 函数原型
     pub proto: Proto,
-    /// 上值列表
-    pub upvals: Vec<UpVal>,
+    /// 上值列表（共享引用，多个闭包可共享同一个 UpVal）
+    pub upvals: Vec<UpValRef>,
 }
 
 /// C 闭包 —— C 函数 + 捕获的上值

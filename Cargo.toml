@@ -16,6 +16,18 @@ path = "src_rs/main.rs"
 name = "integration_tests"
 path = "tests_rs/integration_tests.rs"
 
+[[test]]
+name = "upvalue_tests"
+path = "tests_rs/upvalue_tests.rs"
+
+[[test]]
+name = "metamethod_tests"
+path = "tests_rs/metamethod_tests.rs"
+
+[[test]]
+name = "arithmetic_tests"
+path = "tests_rs/arithmetic_tests.rs"
+
 [features]
 ffi = []
 

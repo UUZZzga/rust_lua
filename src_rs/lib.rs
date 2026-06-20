@@ -50,6 +50,12 @@ pub mod gc;
 // 内存管理器（lmem.h / lmem.cpp）— 分配/释放/GC 集成
 pub mod mem;
 
+// 调试工具
+pub mod debug;
+
+// 标准库 (lstrlib.cpp, lmathlib.cpp 等)
+pub mod stdlib;
+
 // FFI 接口，用于与 C/C++ 代码交互
 // C Lua API FFI 声明（lua.h / lauxlib.h）
 // 仅在 ffi feature 启用时编译（需要链接 C 实现的 liblua）。

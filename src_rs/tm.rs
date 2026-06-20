@@ -7,16 +7,19 @@
 //! - 元方法名称通过 `TagMethod::name()` 方法获取，无需全局字符串表
 //! - 快速访问缓存使用 `bitflags` crate 的 `MetatableFlags`，类型安全
 //! - 元方法查找返回 `Option<&TValue>`，用类型系统替代 NULL 检查
-//! - 元方法调用用 call_fn 回调，支持不同类型的调用上下文
+//! - 元方法调用通过 state.pcall 实际执行，结果写回栈（与 C API 一致）
 //! - Vararg 处理用 Rust enum + Vec，消除 C 的手动栈操作
-//! - 错误处理使用 `Result<T, TagMethodError>` 替代 C 的 longjmp
+//! - 错误处理使用 `Result<(), VmError>` 替代 C 的 longjmp
 
 use std::fmt;
 
 use bitflags::bitflags;
 
+use crate::debug::{concaterror, ordererror, opinterror, tointerror};
+use crate::execute::VmError;
 use crate::objects::{Instruction, NilKind, TValue, Table, LuaType};
 use crate::strings::{LuaString, ShortString, rust_hash};
+use crate::vm::LuaState;
 
 // ============================================================================
 // get_mmbin_tm — 从 MM 系列指令中提取元方法事件索引
@@ -310,77 +313,426 @@ impl fmt::Display for TagMethodError {
 impl std::error::Error for TagMethodError {}
 
 // ============================================================================
-// 元方法调用 (ltm.c → Rust 惯用)
+// 元方法调用 (ltm.cpp → Rust) — 与 C API 完全一致
 // ============================================================================
 
-pub fn try_bin_tm(
+/// 调用元方法并将结果写入栈 — 对应 C 的 luaT_callTMres
+///
+/// C 实现:
+/// ```c
+/// lu_byte luaT_callTMres (lua_State *L, const TValue *f, const TValue *p1,
+///                         const TValue *p2, StkId res) {
+///   ptrdiff_t result = savestack(L, res);
+///   StkId func = L->top.p;
+///   setobj2s(L, func, f);     // push function
+///   setobj2s(L, func + 1, p1); // 1st argument
+///   setobj2s(L, func + 2, p2); // 2nd argument
+///   L->top.p += 3;
+///   luaD_callnoyield(L, func, 1);
+///   res = restorestack(L, result);
+///   setobjs2s(L, res, --L->top.p); // move result to its place
+///   return ttypetag(s2v(res));
+/// }
+/// ```
+///
+/// Rust 版本: 在栈顶压入函数和参数，调用 pcall，将结果写入 res 槽位。
+fn call_tm_res(
+    state: &mut LuaState,
+    f: &TValue,
     p1: &TValue,
     p2: &TValue,
+    res: usize,
+) -> Result<(), VmError> {
+    let func_idx = state.stack.len();
+    // 压入函数和两个参数 (对应 C 的 setobj2s)
+    state.stack.push(f.clone());
+    state.stack.push(p1.clone());
+    state.stack.push(p2.clone());
+    state.top = state.stack.len();
+
+    // 调用: 2 个参数, 1 个返回值 (对应 C 的 luaD_callnoyield(L, func, 1))
+    let status = state.pcall(2, 1, 0);
+
+    // pcall 后: 栈截断到 func_idx，1 个结果(或错误消息)在 func_idx
+    let result = if func_idx < state.stack.len() {
+        state.stack[func_idx].clone()
+    } else {
+        TValue::Nil(NilKind::Strict)
+    };
+
+    // 截断栈，移除临时压入的函数/参数/结果
+    state.stack.truncate(func_idx);
+
+    if status != 0 {
+        // 元方法调用失败 — 提取错误消息
+        state.top = state.stack.len();
+        let err_msg = match &result {
+            TValue::Str(s) => s.as_str().to_string(),
+            _ => format!("{}", result),
+        };
+        return Err(VmError::RuntimeError(err_msg));
+    }
+
+    // 将结果写入 res 槽位 (对应 C 的 setobjs2s(L, res, ...))
+    while state.stack.len() <= res {
+        state.stack.push(TValue::Nil(NilKind::Strict));
+    }
+    state.stack[res] = result;
+    state.top = state.stack.len();
+    Ok(())
+}
+
+/// 查找并调用二元元方法 — 对应 C 的 callbinTM
+///
+/// C 实现:
+/// ```c
+/// static int callbinTM (lua_State *L, const TValue *p1, const TValue *p2,
+///                       StkId res, TMS event) {
+///   const TValue *tm = luaT_gettmbyobj(L, p1, event);
+///   if (notm(tm)) tm = luaT_gettmbyobj(L, p2, event);
+///   if (notm(tm)) return -1;
+///   else return luaT_callTMres(L, tm, p1, p2, res);
+/// }
+/// ```
+///
+/// 返回 true 表示找到并调用了元方法，false 表示未找到。
+fn callbin_tm(
+    state: &mut LuaState,
+    p1: &TValue,
+    p2: &TValue,
+    res: usize,
     tm: TagMethod,
-    default_mts: &DefaultMetatables,
-    call_fn: &mut dyn FnMut(&TValue, &[&TValue]) -> Result<TValue, TagMethodError>,
-) -> Result<TValue, TagMethodError> {
-    let tm_val = get_tm_by_obj(p1, tm, default_mts)
-        .or_else(|| get_tm_by_obj(p2, tm, default_mts));
+) -> Result<bool, VmError> {
+    // 先从 p1 查找元方法，再从 p2 查找
+    let tm_val = get_tm_by_obj(p1, tm, &state.dmt)
+        .or_else(|| get_tm_by_obj(p2, tm, &state.dmt))
+        .cloned();
+
     match tm_val {
-        Some(func) => call_fn(func, &[p1, p2]),
-        None => Err(TagMethodError::NoMetamethod(tm)),
+        Some(f) => {
+            call_tm_res(state, &f, p1, p2, res)?;
+            Ok(true)
+        }
+        None => Ok(false),
     }
 }
 
+/// 尝试二元元方法 — 对应 C 的 luaT_trybinTM
+///
+/// C 实现:
+/// ```c
+/// void luaT_trybinTM (lua_State *L, const TValue *p1, const TValue *p2,
+///                     StkId res, TMS event) {
+///   if (l_unlikely(callbinTM(L, p1, p2, res, event) < 0)) {
+///     switch (event) {
+///       case TM_BAND: case TM_BOR: case TM_BXOR:
+///       case TM_SHL: case TM_SHR: case TM_BNOT: {
+///         if (ttisnumber(p1) && ttisnumber(p2))
+///           luaG_tointerror(L, p1, p2);
+///         else
+///           luaG_opinterror(L, p1, p2, "perform bitwise operation on");
+///       }
+///       default:
+///         luaG_opinterror(L, p1, p2, "perform arithmetic on");
+///     }
+///   }
+/// }
+/// ```
+///
+/// 找到元方法时调用它并将结果写入 res 槽位；未找到时返回 VmError。
+pub fn try_bin_tm(
+    state: &mut LuaState,
+    p1: &TValue,
+    p2: &TValue,
+    res: usize,
+    tm: TagMethod,
+) -> Result<(), VmError> {
+    if !callbin_tm(state, p1, p2, res, tm)? {
+        // 未找到元方法 — 根据事件类型报错
+        return Err(match tm {
+            TagMethod::BAnd | TagMethod::BOr | TagMethod::BXor
+            | TagMethod::Shl | TagMethod::Shr | TagMethod::BNot => {
+                if p1.is_number() && p2.is_number() {
+                    tointerror(p1, p2)
+                } else {
+                    opinterror(p1, p2, "perform bitwise operation on")
+                }
+            }
+            _ => opinterror(p1, p2, "perform arithmetic on"),
+        });
+    }
+    Ok(())
+}
+
+/// 尝试关联二元元方法 — 对应 C 的 luaT_trybinassocTM
+///
+/// C 实现:
+/// ```c
+/// void luaT_trybinassocTM (lua_State *L, const TValue *p1, const TValue *p2,
+///                          int flip, StkId res, TMS event) {
+///   if (flip) luaT_trybinTM(L, p2, p1, res, event);
+///   else      luaT_trybinTM(L, p1, p2, res, event);
+/// }
+/// ```
 pub fn try_bin_assoc_tm(
+    state: &mut LuaState,
     p1: &TValue,
     p2: &TValue,
     flip: bool,
+    res: usize,
     tm: TagMethod,
-    default_mts: &DefaultMetatables,
-    call_fn: &mut dyn FnMut(&TValue, &[&TValue]) -> Result<TValue, TagMethodError>,
-) -> Result<TValue, TagMethodError> {
-    if flip { try_bin_tm(p2, p1, tm, default_mts, call_fn) }
-    else { try_bin_tm(p1, p2, tm, default_mts, call_fn) }
+) -> Result<(), VmError> {
+    if flip {
+        try_bin_tm(state, p2, p1, res, tm)
+    } else {
+        try_bin_tm(state, p1, p2, res, tm)
+    }
 }
 
+/// 尝试整数二元元方法 — 对应 C 的 luaT_trybiniTM
+///
+/// C 实现:
+/// ```c
+/// void luaT_trybiniTM (lua_State *L, const TValue *p1, lua_Integer i2,
+///                      int flip, StkId res, TMS event) {
+///   TValue aux;
+///   setivalue(&aux, i2);
+///   luaT_trybinassocTM(L, p1, &aux, flip, res, event);
+/// }
+/// ```
+pub fn try_bini_tm(
+    state: &mut LuaState,
+    p1: &TValue,
+    i2: i64,
+    flip: bool,
+    res: usize,
+    tm: TagMethod,
+) -> Result<(), VmError> {
+    let aux = TValue::Integer(i2);
+    try_bin_assoc_tm(state, p1, &aux, flip, res, tm)
+}
+
+/// 尝试字符串拼接元方法 — 对应 C 的 luaT_tryconcatTM
+///
+/// C 实现:
+/// ```c
+/// void luaT_tryconcatTM (lua_State *L) {
+///   StkId p1 = L->top.p - 2;
+///   if (l_unlikely(callbinTM(L, s2v(p1), s2v(p1 + 1), p1, TM_CONCAT) < 0))
+///     luaG_concaterror(L, s2v(p1), s2v(p1 + 1));
+/// }
+/// ```
+///
+/// Rust 版本: p1, p2 为操作数，res 为结果槽位。
 pub fn try_concat_tm(
+    state: &mut LuaState,
     p1: &TValue,
     p2: &TValue,
-    default_mts: &DefaultMetatables,
-    call_fn: &mut dyn FnMut(&TValue, &[&TValue]) -> Result<TValue, TagMethodError>,
-) -> Result<TValue, TagMethodError> {
-    match try_bin_tm(p1, p2, TagMethod::Concat, default_mts, call_fn) {
-        Ok(v) => return Ok(v),
-        Err(TagMethodError::NoMetamethod(_)) => {}
-        Err(e) => return Err(e),
+    res: usize,
+) -> Result<(), VmError> {
+    if !callbin_tm(state, p1, p2, res, TagMethod::Concat)? {
+        return Err(concaterror(p1, p2));
     }
-    Err(TagMethodError::ConcatError { left: obj_type_name(p1), right: obj_type_name(p2) })
+    Ok(())
 }
 
+/// 调用顺序比较元方法 — 对应 C 的 luaT_callorderTM
+///
+/// C 实现:
+/// ```c
+/// int luaT_callorderTM (lua_State *L, const TValue *p1, const TValue *p2,
+///                       TMS event) {
+///   int tag = callbinTM(L, p1, p2, L->top.p, event);
+///   if (tag >= 0) return !tagisfalse(tag);
+///   luaG_ordererror(L, p1, p2);
+///   return 0;
+/// }
+/// ```
 pub fn call_order_tm(
+    state: &mut LuaState,
     p1: &TValue,
     p2: &TValue,
     tm: TagMethod,
-    default_mts: &DefaultMetatables,
-    call_fn: &mut dyn FnMut(&TValue, &[&TValue]) -> Result<TValue, TagMethodError>,
-) -> Result<bool, TagMethodError> {
+) -> Result<bool, VmError> {
     debug_assert!(tm == TagMethod::Lt || tm == TagMethod::Le);
-    match try_bin_tm(p1, p2, tm, default_mts, call_fn) {
-        Ok(v) => return Ok(!v.is_false()),
-        Err(TagMethodError::NoMetamethod(_)) => {}
-        Err(e) => return Err(e),
+    // 使用栈顶作为临时结果槽位
+    let res = state.stack.len();
+    state.stack.push(TValue::Nil(NilKind::Strict));
+
+    let found = callbin_tm(state, p1, p2, res, tm)?;
+
+    if found {
+        let result = state.stack[res].clone();
+        state.stack.truncate(res);
+        state.top = state.stack.len();
+        Ok(!result.is_false())
+    } else {
+        state.stack.truncate(res);
+        state.top = state.stack.len();
+        Err(ordererror(p1, p2))
     }
-    Err(TagMethodError::OrderError { left: obj_type_name(p1), right: obj_type_name(p2) })
 }
 
+/// 调用整数顺序比较元方法 — 对应 C 的 luaT_callorderiTM
 pub fn call_orderi_tm(
+    state: &mut LuaState,
     p1: &TValue,
     v2: i64,
     flip: bool,
     tm: TagMethod,
-    default_mts: &DefaultMetatables,
-    call_fn: &mut dyn FnMut(&TValue, &[&TValue]) -> Result<TValue, TagMethodError>,
-) -> Result<bool, TagMethodError> {
+) -> Result<bool, VmError> {
     let aux = TValue::Integer(v2);
-    if flip { call_order_tm(&aux, p1, tm, default_mts, call_fn) }
-    else { call_order_tm(p1, &aux, tm, default_mts, call_fn) }
+    let (a, b) = if flip { (&aux, p1) } else { (p1, &aux) };
+    call_order_tm(state, a, b, tm)
+}
+
+// ============================================================================
+// equal_obj — 对应 C 的 luaV_equalobj
+// ============================================================================
+
+/// 比较两个 TValue 是否相等（支持元方法回退）— 对应 C 的 luaV_equalobj
+///
+/// C 实现:
+/// ```c
+/// int luaV_equalobj (lua_State *L, const TValue *t1, const TValue *t2) {
+///   if (ttype(t1) != ttype(t2)) return 0;
+///   else if (ttypetag(t1) != ttypetag(t2)) { ... }
+///   else {  /* equal variants */
+///     switch (ttypetag(t1)) {
+///       case LUA_VTABLE: case LUA_VUSERDATA:
+///         if (same object) return 1;
+///         tm = fasttm(..., TM_EQ);
+///         if (tm == NULL) return 0;
+///         break;
+///       ...
+///     }
+///     if (tm == NULL) return 0;
+///     luaT_callTMres(L, tm, t1, t2, L->top.p);
+///     return !tagisfalse(tag);
+///   }
+/// }
+/// ```
+pub fn equal_obj(
+    state: &mut LuaState,
+    t1: &TValue,
+    t2: &TValue,
+) -> Result<bool, VmError> {
+    // C: if (ttype(t1) != ttype(t2)) return 0;
+    if std::mem::discriminant(t1) != std::mem::discriminant(t2) {
+        return Ok(false);
+    }
+    // raw_equal 处理值类型和引用类型（同对象）的相等
+    if crate::vm::raw_equal(t1, t2) {
+        return Ok(true);
+    }
+    // C: 只有 table 和 userdata 才尝试 __eq 元方法
+    match (t1, t2) {
+        (TValue::Table(_), TValue::Table(_)) | (TValue::UserData(_), TValue::UserData(_)) => {}
+        _ => return Ok(false),
+    }
+    // C: fasttm(L, hvalue(t1)->metatable, TM_EQ) ?? fasttm(L, hvalue(t2)->metatable, TM_EQ)
+    let tm = get_tm_by_obj(t1, TagMethod::Eq, &state.dmt)
+        .or_else(|| get_tm_by_obj(t2, TagMethod::Eq, &state.dmt))
+        .cloned();
+    match tm {
+        Some(f) => {
+            // C: luaT_callTMres(L, tm, t1, t2, L->top.p); return !tagisfalse(tag);
+            let res = state.stack.len();
+            state.stack.push(TValue::Nil(NilKind::Strict));
+            call_tm_res(state, &f, t1, t2, res)?;
+            let result = state.stack[res].clone();
+            state.stack.truncate(res);
+            state.top = state.stack.len();
+            Ok(!result.is_false())
+        }
+        None => Ok(false),
+    }
+}
+
+// ============================================================================
+// obj_len — 对应 C 的 luaV_objlen
+// ============================================================================
+
+/// 计算值的长度（# 操作符）并写入栈 — 对应 C 的 luaV_objlen
+///
+/// C 实现:
+/// ```c
+/// void luaV_objlen (lua_State *L, StkId ra, const TValue *rb) {
+///   const TValue *tm;
+///   switch (ttypetag(rb)) {
+///     case LUA_VTABLE: {
+///       Table *h = hvalue(rb);
+///       tm = fasttm(L, h->metatable, TM_LEN);
+///       if (tm) break;
+///       setivalue(s2v(ra), luaH_getn(L, h));
+///       return;
+///     }
+///     case LUA_VSHRSTR: case LUA_VLNGSTR: {
+///       setivalue(s2v(ra), tsvalue(rb)->len);
+///       return;
+///     }
+///     default: {
+///       tm = luaT_gettmbyobj(L, rb, TM_LEN);
+///       if (notm(tm)) luaG_typeerror(L, rb, "get length of");
+///       break;
+///     }
+///   }
+///   luaT_callTMres(L, tm, rb, rb, ra);
+/// }
+/// ```
+pub fn obj_len(
+    state: &mut LuaState,
+    ra: usize,
+    rb: &TValue,
+) -> Result<(), VmError> {
+    let tm: Option<TValue> = match rb {
+        TValue::Table(t) => {
+            // 先查表自身元表的 __len
+            let tm_val = t.metatable.as_ref().and_then(|mt| {
+                let mut meta = Metatable::new(mt.as_ref().clone());
+                meta.get_tm(TagMethod::Len).cloned()
+            });
+            if tm_val.is_some() {
+                tm_val
+            } else {
+                // 无元方法: 返回表长度
+                let len = t.len();
+                while state.stack.len() <= ra {
+                    state.stack.push(TValue::Nil(NilKind::Strict));
+                }
+                state.stack[ra] = TValue::Integer(len as i64);
+                state.top = state.stack.len();
+                return Ok(());
+            }
+        }
+        TValue::Str(s) => {
+            // 字符串: 返回长度
+            let len = s.len();
+            while state.stack.len() <= ra {
+                state.stack.push(TValue::Nil(NilKind::Strict));
+            }
+            state.stack[ra] = TValue::Integer(len as i64);
+            state.top = state.stack.len();
+            return Ok(());
+        }
+        _ => {
+            // 其他类型: 查找 __len 元方法
+            get_tm_by_obj(rb, TagMethod::Len, &state.dmt).cloned()
+        }
+    };
+
+    match tm {
+        Some(f) => {
+            // C: luaT_callTMres(L, tm, rb, rb, ra);
+            call_tm_res(state, &f, rb, rb, ra)
+        }
+        None => {
+            Err(VmError::RuntimeError(format!(
+                "attempt to get length of a {} value",
+                obj_type_name(rb)
+            )))
+        }
+    }
 }
 
 // ============================================================================
@@ -632,68 +984,54 @@ mod tests {
 
     #[test]
     fn test_try_bin_tm_not_found() {
-        let dmt = DefaultMetatables::new();
+        let mut state = LuaState::new();
         let p1 = TValue::Integer(1);
         let p2 = TValue::Integer(2);
-        let result = try_bin_tm(&p1, &p2, TagMethod::Add, &dmt, &mut |_f, _args| unreachable!());
-        assert_eq!(result, Err(TagMethodError::NoMetamethod(TagMethod::Add)));
+        // 整数没有 __add 元方法，应返回 RuntimeError
+        let result = try_bin_tm(&mut state, &p1, &p2, 0, TagMethod::Add);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, VmError::RuntimeError(_)));
     }
 
     #[test]
-    fn test_try_bin_tm_found() {
-        let mut mt_table = Table::new();
-        mt_table.set(make_tm_tvalue(TagMethod::Add), TValue::Integer(999));
-        let mut t = Table::new();
-        t.metatable = Some(Box::new(mt_table));
-        let p1 = TValue::Table(t);
+    fn test_try_bin_tm_nil_operand() {
+        // 对应闭包 n=n+1 时 n 为 nil 的场景
+        let mut state = LuaState::new();
+        let p1 = TValue::Nil(NilKind::Strict);
         let p2 = TValue::Integer(1);
-        let dmt = DefaultMetatables::new();
-        let mut called = false;
-        let result = try_bin_tm(&p1, &p2, TagMethod::Add, &dmt, &mut |_f, args| {
-            called = true;
-            assert_eq!(args.len(), 2);
-            Ok(TValue::Integer(100))
-        });
-        assert_eq!(result, Ok(TValue::Integer(100)));
-        assert!(called);
+        let result = try_bin_tm(&mut state, &p1, &p2, 0, TagMethod::Add);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, VmError::RuntimeError(_)));
+        // 错误消息应包含 "nil"
+        assert!(format!("{}", err).contains("nil"));
     }
 
     #[test]
     fn test_try_concat_tm_no_metamethod() {
-        let dmt = DefaultMetatables::new();
-        let result = try_concat_tm(&TValue::Integer(1), &TValue::Integer(2), &dmt, &mut |_f, _args| unreachable!());
-        assert!(matches!(result, Err(TagMethodError::ConcatError { .. })));
+        let mut state = LuaState::new();
+        // nil 不能拼接
+        let result = try_concat_tm(&mut state, &TValue::Nil(NilKind::Strict), &TValue::Integer(2), 0);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), VmError::RuntimeError(_)));
     }
 
     #[test]
     fn test_call_order_tm_no_metamethod() {
-        let dmt = DefaultMetatables::new();
-        let result = call_order_tm(&TValue::Integer(1), &TValue::Integer(2), TagMethod::Lt, &dmt, &mut |_f, _args| unreachable!());
-        assert!(matches!(result, Err(TagMethodError::OrderError { .. })));
+        let mut state = LuaState::new();
+        // nil 和 integer 无法比较
+        let result = call_order_tm(&mut state, &TValue::Nil(NilKind::Strict), &TValue::Integer(2), TagMethod::Lt);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), VmError::RuntimeError(_)));
     }
 
     #[test]
-    fn test_call_order_tm_true() {
-        let mut mt_table = Table::new();
-        mt_table.set(make_tm_tvalue(TagMethod::Lt), TValue::Integer(1));
-        let mut t = Table::new();
-        t.metatable = Some(Box::new(mt_table));
-        let p1 = TValue::Table(t);
-        let dmt = DefaultMetatables::new();
-        let result = call_order_tm(&p1, &TValue::Integer(2), TagMethod::Lt, &dmt, &mut |_f, _args| Ok(TValue::Boolean(true)));
-        assert_eq!(result, Ok(true));
-    }
-
-    #[test]
-    fn test_call_orderi_tm_no_flip() {
-        let mut mt_table = Table::new();
-        mt_table.set(make_tm_tvalue(TagMethod::Lt), TValue::Integer(1));
-        let mut t = Table::new();
-        t.metatable = Some(Box::new(mt_table));
-        let p1 = TValue::Table(t);
-        let dmt = DefaultMetatables::new();
-        let result = call_orderi_tm(&p1, 3, false, TagMethod::Lt, &dmt, &mut |_f, _args| Ok(TValue::Boolean(true)));
-        assert_eq!(result, Ok(true));
+    fn test_call_orderi_tm_no_metamethod() {
+        let mut state = LuaState::new();
+        let p1 = TValue::Nil(NilKind::Strict);
+        let result = call_orderi_tm(&mut state, &p1, 3, false, TagMethod::Lt);
+        assert!(result.is_err());
     }
 
     // ========================================================================

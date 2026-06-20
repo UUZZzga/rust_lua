@@ -1,10 +1,12 @@
-use crate::objects::{Instruction, LClosure, LuaType, NilKind, Proto, TValue, UpVal, UpvalDesc};
+use crate::debug::runerror;
+use crate::objects::{Instruction, LClosure, LuaType, NilKind, Proto, TValue, UpVal, UpvalDesc, UpValRef};
 use crate::strings::{LuaString, StringTable};
 use crate::table::Table;
 use crate::gc::{GCObjectHeader, GCState};
 use crate::execute::{VmExecutor, VmResult, VmError};
 use crate::tm::DefaultMetatables;
 use std::rc::Rc;
+use std::cell::RefCell;
 use std::io::Write;
 
 const EOFMARK: &str = "<eof>";
@@ -18,6 +20,34 @@ pub const BASIC_STACK_SIZE: usize = 2 * LUA_MINSTACK;
 pub const EXTRA_STACK: usize = 5;
 
 pub const MIN_STACK: usize = LUA_MINSTACK;
+pub const LUAI_MAXSTACK: usize = 1000000;
+pub const LUAI_MAXCCALLS: u32 = 200;
+pub const STACKERRSPACE: usize = 200;
+pub const MAXSTACK_BYSIZET: usize = (usize::max_value() / std::mem::size_of::<TValue>()) - STACKERRSPACE ;
+pub const MAXSTACK: usize = if LUAI_MAXSTACK < MAXSTACK_BYSIZET {LUAI_MAXSTACK} else {MAXSTACK_BYSIZET};
+pub const ERRORSTACKSIZE: usize = MAXSTACK + STACKERRSPACE;
+
+pub struct GlobalState {
+    pub gcstopem: bool,
+}
+
+pub struct LuaFunctionCallInfo {
+    pub savedpc: Instruction,
+    pub trap: bool,
+    pub nextraargs: i32,
+}
+
+pub enum CallInfoU {
+    LuaFunction(LuaFunctionCallInfo),
+    CFunction(),
+}
+
+pub struct CallInfo {
+    pub previous: Option<Box<CallInfo>>,
+    pub top: usize,
+    pub func: usize,
+    pub u: CallInfoU,
+}
 
 // ============================================================================
 // LuaState — 合并 VmState + LuaState 的所有字段
@@ -29,6 +59,7 @@ pub struct LuaState {
     pub code: Vec<Instruction>,
     pub upval_descs: Vec<UpvalDesc>,
     pub protos: Vec<Proto>,
+    pub top: usize,
     pub base: usize,
     pub pc: usize,
     pub trap: bool,
@@ -38,7 +69,7 @@ pub struct LuaState {
     pub proto_flag: u8,
     /// PF_VAHID 模式下隐藏变参的数量（对应 C 的 ci->u.l.nextraargs）
     pub nextraargs: i32,
-    pub closure_upvals: Vec<UpVal>,
+    pub closure_upvals: Vec<UpValRef>,
     pub open_upval: Option<usize>,
     pub tbc_list: Option<usize>,
     pub twups_linked: bool,
@@ -61,6 +92,12 @@ pub struct LuaState {
     pub n_ccalls: u32,
     pub dmt: DefaultMetatables,
     pub stdout: Box<dyn Write>,
+    pub global_state: Rc<GlobalState>,
+    pub ci: Option<Box<CallInfo>>,
+}
+
+fn G(l: &LuaState) -> &GlobalState {
+    &l.global_state
 }
 
 // ============================================================================
@@ -85,13 +122,15 @@ impl LuaState {
             TValue::Table(globals.clone()),
         );
 
-        let mut stack = Self::init_stack();
+        let stack = Self::init_stack();
+        let top = stack.len();
 
         LuaState {
             constants: Vec::new(),
             code: Vec::new(),
             upval_descs: Vec::new(),
             protos: Vec::new(),
+            top,
             base: 0,
             pc: 0,
             trap: false,
@@ -113,6 +152,8 @@ impl LuaState {
             n_ccalls: 0,
             dmt: DefaultMetatables::new(),
             stdout: Box::new(std::io::stdout()),
+            global_state: Rc::new(GlobalState { gcstopem: false }),
+            ci: None,
         }
     }
 
@@ -126,6 +167,85 @@ impl LuaState {
         stack
     }
 
+    fn condmovestack(&mut self, _pre: usize, _pos: usize) {
+        // Rust 版本: Vec 自行管理内存，无需在栈重分配时修正指针
+        // C 版本的 condmovestack 仅在 hardstacktests 配置下做额外检查
+    }
+
+    pub fn checkstackaux(&mut self, n: usize, pre: usize, pos: usize) {
+        if self.stack.len() - self.top <= n {
+            let _ = self.growstack(n, true);
+        } else {
+            self.condmovestack(pre, pos);
+        }
+    }
+
+    pub fn checkstack(&mut self, n: usize) {
+        self.checkstackaux(n, 0, 0);
+    }
+
+    /// 对应 C 的 luaD_growstack
+    /// 尝试将栈增长至少 n 个元素。raiseerror=true 时报告错误，否则返回错误。
+    pub fn growstack(&mut self, n: usize, raiseerror: bool) -> Result<(), VmError> {
+        let size = self.stack.len();
+        if size > MAXSTACK {
+            // 栈已超过最大值，线程正在使用为错误保留的额外空间
+            debug_assert_eq!(size, ERRORSTACKSIZE);
+            if raiseerror {
+                // 对应 C 的 luaD_errerr (栈错误发生在消息处理器内)
+                // 简化: 直接返回 StackError
+            }
+            return Err(VmError::StackError);
+        } else if n < MAXSTACK {
+            let mut newsize = size + (size >> 1);  /* tentative new size (size * 1.5) */
+            let needed = self.top + n;
+            if newsize > MAXSTACK {
+                newsize = MAXSTACK;
+            }
+            if newsize < needed {
+                newsize = needed;
+            }
+            if newsize <= MAXSTACK {
+                return self.reallocstack(newsize, raiseerror);
+            }
+        }
+        /* else stack overflow */
+        /* add extra size to be able to handle the error message */
+        self.reallocstack(ERRORSTACKSIZE, raiseerror)?;
+        if raiseerror {
+            runerror(self, "stack overflow", &[]);
+        }
+        Err(VmError::StackOverflow)
+    }
+
+    /// 对应 C 的 luaD_reallocstack
+    /// Rust 版本: Vec 自行管理内存，relstack/correctstack 为空操作
+    pub fn reallocstack(&mut self, newsize: usize, _raiseerror: bool) -> Result<(), VmError> {
+        let oldsize = self.stack.len();
+        debug_assert!(newsize <= MAXSTACK || newsize == ERRORSTACKSIZE);
+        // relstack: Rust 中无需将指针转为偏移量 (Vec 自行管理内存)
+        // G(self).gcstopem = true: 简化，不停止紧急 GC
+        // 扩展栈到 newsize + EXTRA_STACK，新位置填 nil
+        let target = newsize + EXTRA_STACK;
+        if target > oldsize {
+            self.stack.resize(target, TValue::Nil(NilKind::Strict));
+        }
+        // correctstack: Rust 中无需修正指针 (使用索引而非指针)
+        Ok(())
+    }
+
+    /// 对应 C 的 relstack: 将指针转为偏移量
+    /// Rust 版本: 无操作 (Vec 自行管理内存，使用索引)
+    fn relstack(&mut self) {
+        // no-op in Rust
+    }
+
+    /// 对应 C 的 correctstack: 将偏移量转回指针
+    /// Rust 版本: 无操作 (Vec 自行管理内存，使用索引)
+    fn correctstack(&mut self) {
+        // no-op in Rust
+    }
+
     /// 使用已有的 GCState 创建 LuaState
     pub fn with_gc(gc: Rc<GCState>) -> Self {
         let mut registry = Table::new();
@@ -135,11 +255,15 @@ impl LuaState {
             TValue::Table(globals.clone()),
         );
 
-        let mut state = LuaState {
+        let stack = Self::init_stack();
+        let top = stack.len();
+
+        let state = LuaState {
             constants: Vec::new(),
             code: Vec::new(),
             upval_descs: Vec::new(),
             protos: Vec::new(),
+            top,
             base: 0,
             pc: 0,
             trap: false,
@@ -152,7 +276,7 @@ impl LuaState {
             tbc_list: None,
             twups_linked: false,
             is_in_twups: false,
-            stack: Self::init_stack(),
+            stack,
             gc,
             globals,
             registry,
@@ -161,6 +285,8 @@ impl LuaState {
             n_ccalls: 0,
             dmt: DefaultMetatables::new(),
             stdout: Box::new(std::io::stdout()),
+            global_state: Rc::new(GlobalState { gcstopem: false }),
+            ci: None,
         };
         state
     }
@@ -206,11 +332,13 @@ impl LuaState {
         while stack.len() < needed {
             stack.push(TValue::Nil(NilKind::Strict));
         }
+        let top = stack.len();
         LuaState {
             constants: proto.constants.clone(),
             code: proto.code.clone(),
             upval_descs: proto.upvalues.clone(),
             protos: proto.protos.clone(),
+            top,
             base,
             pc: 0,
             trap: false,
@@ -232,6 +360,8 @@ impl LuaState {
             n_ccalls: 0,
             dmt: DefaultMetatables::new(),
             stdout: Box::new(std::io::stdout()),
+            global_state: Rc::new(GlobalState { gcstopem: false }),
+            ci: None,
         }
     }
 }
@@ -664,10 +794,24 @@ impl LuaState {
     pub fn load_buffer(&mut self, code: &str, chunk_name: &str) -> i32 {
         match crate::compiler::compile(code, chunk_name) {
             Ok(proto) => {
+                // 创建主闭包，设置 _ENV 上值为全局表
+                // 对应 C 的 luaU_undump + closureupvalue(L, proto, 0) = _ENV
+                let nup = proto.size_upvalues as usize;
+                let mut upvals: Vec<UpValRef> = Vec::with_capacity(nup.max(1));
+                // 第一个上值是 _ENV，指向全局表
+                upvals.push(Rc::new(RefCell::new(UpVal::Closed {
+                    value: Box::new(TValue::Table(self.globals.clone())),
+                })));
+                // 填充剩余上值（如果有）
+                for _ in 1..nup {
+                    upvals.push(Rc::new(RefCell::new(UpVal::Closed {
+                        value: Box::new(TValue::Nil(NilKind::Strict)),
+                    })));
+                }
                 let closure = LClosure {
                     gc_header: GCObjectHeader::new(),
                     proto,
-                    upvals: Vec::new(),
+                    upvals,
                 };
                 self.stack.push(TValue::LClosure(closure));
                 0
@@ -700,6 +844,38 @@ impl LuaState {
         }
     }
 
+    /// 对应 C 的 getCcalls: 获取 C 调用嵌套数 (低 16 位)
+    fn get_ccalls(&self) -> u32 {
+        self.n_ccalls & 0xffff
+    }
+
+    /// 对应 C 的 ccall: 调用函数 (无错误保护)
+    /// Rust 版本: 简化实现，委托给 pcall 并忽略错误
+    fn ccall(&mut self, nargs: usize, n_results: i32, inc: u32) {
+        self.n_ccalls = self.n_ccalls.saturating_add(inc);
+        if self.get_ccalls() >= LUAI_MAXCCALLS {
+            // 对应 C 的 checkstackp + luaE_checkcstack
+            // 简化: 仅检查栈空间
+            self.checkstack(0);
+            if self.get_ccalls() >= LUAI_MAXCCALLS {
+                runerror(self, "C stack overflow", &[]);
+            }
+        }
+        // 委托给 pcall 执行实际调用 (忽略错误)
+        let _ = self.pcall(nargs, n_results, 0);
+        self.n_ccalls = self.n_ccalls.saturating_sub(inc);
+    }
+
+    pub fn call(&mut self, nargs: usize, nresults: i32) {
+        self.ccall(nargs, nresults, 1)
+    }
+
+    pub fn call_no_yield(&mut self, nargs: usize, nresults: i32) {
+        // nyci = 0x10000 | 1 (C: lstate.h)
+        let nyci: u32 = 0x10000 | 1;
+        self.ccall(nargs, nresults, nyci)
+    }
+
     // ====== pcall ======
 
     pub fn pcall(&mut self, nargs: usize, nresults: i32, _errfunc: isize) -> i32 {
@@ -724,6 +900,7 @@ impl LuaState {
                 let saved_upval_descs = std::mem::take(&mut self.upval_descs);
                 let saved_protos = std::mem::take(&mut self.protos);
                 let saved_base = self.base;
+                let saved_pc = self.pc;
                 let saved_num_params = self.num_params;
                 let saved_is_vararg = self.is_vararg;
                 let saved_proto_flag = self.proto_flag;
@@ -742,10 +919,8 @@ impl LuaState {
                 self.is_vararg = closure.proto.is_vararg();
                 self.proto_flag = closure.proto.flag;
                 self.nextraargs = 0;
-                let upval_val = UpVal::Closed {
-                    value: Box::new(TValue::Table(self.globals.clone())),
-                };
-                self.closure_upvals = vec![upval_val];
+                // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
+                self.closure_upvals = closure.upvals;
                 self.tbc_list = None;
                 self.open_upval = None;
 
@@ -776,7 +951,7 @@ impl LuaState {
                 self.upval_descs = saved_upval_descs;
                 self.protos = saved_protos;
                 self.base = saved_base;
-                self.pc = 0;
+                self.pc = saved_pc;
                 self.num_params = saved_num_params;
                 self.is_vararg = saved_is_vararg;
                 self.proto_flag = saved_proto_flag;
@@ -834,6 +1009,7 @@ impl LuaState {
             TValue::LightUserData(tag) => {
                 let tag_val = tag as usize;
                 if tag_val == 1 {
+                    // print(...)
                     let args_start = func_idx + 1;
                     let args_end = self.stack.len();
                     let mut s = String::new();
@@ -846,6 +1022,62 @@ impl LuaState {
                     self.stack.truncate(func_idx);
                     let _ = writeln!(self.stdout, "{}", s);
                     let _ = self.stdout.flush();
+                    return 0;
+                }
+                if tag_val == 2 {
+                    // setmetatable(t, mt)
+                    let arg2 = if func_idx + 2 < self.stack.len() {
+                        self.stack[func_idx + 2].clone()
+                    } else {
+                        TValue::Nil(NilKind::Strict)
+                    };
+                    match &mut self.stack[func_idx + 1] {
+                        TValue::Table(t) => {
+                            match &arg2 {
+                                TValue::Table(mt) => {
+                                    t.metatable = Some(Box::new(mt.clone()));
+                                }
+                                TValue::Nil(_) => {
+                                    t.metatable = None;
+                                }
+                                _ => {
+                                    self.stack.truncate(func_idx);
+                                    self.push_string("bad argument #2 to 'setmetatable' (nil or table expected)");
+                                    return ERR_RUN;
+                                }
+                            }
+                            // 返回表本身
+                            let ret = self.stack[func_idx + 1].clone();
+                            self.stack.truncate(func_idx);
+                            self.stack.push(ret);
+                            return 0;
+                        }
+                        _ => {
+                            self.stack.truncate(func_idx);
+                            self.push_string("bad argument #1 to 'setmetatable' (table expected)");
+                            return ERR_RUN;
+                        }
+                    }
+                }
+                if tag_val == 3 {
+                    // getmetatable(t)
+                    let mt = match &self.stack[func_idx + 1] {
+                        TValue::Table(t) => t.metatable.as_ref().map(|b| b.as_ref().clone()),
+                        _ => None,
+                    };
+                    self.stack.truncate(func_idx);
+                    match mt {
+                        Some(mt_table) => self.stack.push(TValue::Table(mt_table)),
+                        None => self.stack.push(TValue::Nil(NilKind::Strict)),
+                    }
+                    return 0;
+                }
+                if tag_val == 4 {
+                    // type(v)
+                    let ty = self.stack[func_idx + 1].ty();
+                    let name = self.typename(ty);
+                    self.stack.truncate(func_idx);
+                    self.push_string(name);
                     return 0;
                 }
                 self.stack.truncate(func_idx);
@@ -933,11 +1165,39 @@ impl LuaState {
             TValue::Str(str_to_ls(&self.string_table, "arg")),
             TValue::Table(arg_table),
         );
-        
+
         self.globals.set(
             TValue::Str(str_to_ls(&self.string_table, "print")),
             TValue::LightUserData(1_usize as *mut std::ffi::c_void),
         );
+
+        self.globals.set(
+            TValue::Str(str_to_ls(&self.string_table, "setmetatable")),
+            TValue::LightUserData(2_usize as *mut std::ffi::c_void),
+        );
+
+        self.globals.set(
+            TValue::Str(str_to_ls(&self.string_table, "getmetatable")),
+            TValue::LightUserData(3_usize as *mut std::ffi::c_void),
+        );
+
+        self.globals.set(
+            TValue::Str(str_to_ls(&self.string_table, "type")),
+            TValue::LightUserData(4_usize as *mut std::ffi::c_void),
+        );
+
+        self.globals.set(
+            TValue::Str(str_to_ls(&self.string_table, "pcall")),
+            TValue::LightUserData(5_usize as *mut std::ffi::c_void),
+        );
+
+        self.globals.set(
+            TValue::Str(str_to_ls(&self.string_table, "error")),
+            TValue::LightUserData(6_usize as *mut std::ffi::c_void),
+        );
+
+        // 打开字符串库 (创建字符串元表)
+        crate::stdlib::string_lib::open_string_lib(self);
     }
 
     // ====== Hook ======
