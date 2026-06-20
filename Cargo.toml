@@ -28,6 +28,10 @@ path = "tests_rs/metamethod_tests.rs"
 name = "arithmetic_tests"
 path = "tests_rs/arithmetic_tests.rs"
 
+[[test]]
+name = "string_tests"
+path = "tests_rs/string_tests.rs"
+
 [features]
 ffi = []
 

@@ -12,7 +12,7 @@
 //! ## 规约驱动开发 (spec-driven-tdd)
 //! 每个公开函数都包含规约注释。
 
-use crate::objects::{Instruction, LClosure, NilKind, Proto, TValue, UpVal, UpValRef, PF_VAHID, PF_VATAB};
+use crate::objects::{Instruction, LClosure, NilKind, Proto, TValue, UpVal, UpValRef, LuaType, PF_VAHID, PF_VATAB};
 use crate::opcodes::{self, OpCode};
 use crate::table::Table;
 use crate::tm::{
@@ -616,7 +616,7 @@ impl VmExecutor {
         } else {
             TValue::Nil(NilKind::Strict)
         };
-        let result = Self::table_get(&upval_val, &key);
+        let result = Self::table_get(state, &upval_val, &key);
         Self::write_stack(state, a, result);
         state.pc += 1;
         Ok(())
@@ -628,7 +628,7 @@ impl VmExecutor {
         let c = Self::rc(state, inst);
         let table_val = Self::read_stack(state, b).clone();
         let key = Self::read_stack(state, c).clone();
-        let result = Self::table_get(&table_val, &key);
+        let result = Self::table_get(state, &table_val, &key);
         Self::write_stack(state, a, result);
         state.pc += 1;
         Ok(())
@@ -640,7 +640,7 @@ impl VmExecutor {
         let c = opcodes::getarg_c(inst) as i64;
         let table_val = Self::read_stack(state, b).clone();
         let key = TValue::Integer(c);
-        let result = Self::table_get(&table_val, &key);
+        let result = Self::table_get(state, &table_val, &key);
         Self::write_stack(state, a, result);
         state.pc += 1;
         Ok(())
@@ -652,7 +652,7 @@ impl VmExecutor {
         let c_key = opcodes::getarg_c(inst) as usize;
         let table_val = Self::read_stack(state, b).clone();
         let key = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
-        let result = Self::table_get(&table_val, &key);
+        let result = Self::table_get(state, &table_val, &key);
         Self::write_stack(state, a, result);
         state.pc += 1;
         Ok(())
@@ -754,7 +754,7 @@ impl VmExecutor {
             .cloned().unwrap_or(TValue::Nil(NilKind::Strict));
         let obj = Self::read_stack(state, b).clone();
         Self::write_stack(state, a + 1, obj.clone());
-        let result = Self::table_get(&obj, &key);
+        let result = Self::table_get(state, &obj, &key);
         Self::write_stack(state, a, result);
         state.pc += 1;
         Ok(())
@@ -1775,6 +1775,11 @@ impl VmExecutor {
                         _ => format!("{}", msg),
                     };
                     return Err(VmError::RuntimeError(err_msg));
+                } else if tag_val >= 100 {
+                    // 字符串库函数（标签 100+）
+                    crate::stdlib::string_lib::call_string_function(
+                        tag_val, state, a, nargs, nresults,
+                    )?;
                 }
                 state.pc += 1;
                 Ok(())
@@ -2586,9 +2591,27 @@ impl VmExecutor {
     // 辅助: 表操作
     // ========================================================================
 
-    fn table_get(table_val: &TValue, key: &TValue) -> TValue {
+    fn table_get(state: &LuaState, table_val: &TValue, key: &TValue) -> TValue {
         match table_val {
             TValue::Table(t) => t.get(key).cloned().unwrap_or(TValue::Nil(NilKind::Strict)),
+            TValue::Str(_) => {
+                // 字符串类型: 查找字符串元表的 __index
+                if let Some(mt) = state.dmt.get(LuaType::String) {
+                    let index_key = crate::tm::make_tm_tvalue(crate::tm::TagMethod::Index);
+                    if let Some(index_val) = mt.get(&index_key) {
+                        match index_val {
+                            TValue::Table(index_table) => {
+                                index_table.get(key).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
+                            }
+                            _ => TValue::Nil(NilKind::Strict),
+                        }
+                    } else {
+                        TValue::Nil(NilKind::Strict)
+                    }
+                } else {
+                    TValue::Nil(NilKind::Strict)
+                }
+            }
             _ => TValue::Nil(NilKind::Strict),
         }
     }
