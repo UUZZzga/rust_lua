@@ -618,6 +618,12 @@ pub fn equal_obj(
     t2: &TValue,
 ) -> Result<bool, VmError> {
     // C: if (ttype(t1) != ttype(t2)) return 0;
+    // ttype 检查基类型: Integer 和 Float 同属 LUA_TNUMBER
+    // 先处理数字混合比较 (integer == float), 与 C 的 ttypetag 分支一致
+    if t1.is_number() && t2.is_number() {
+        // 两个数字: 用 raw_equal 处理 (包括 integer/float 混合比较)
+        return Ok(crate::vm::raw_equal(t1, t2));
+    }
     if std::mem::discriminant(t1) != std::mem::discriminant(t2) {
         return Ok(false);
     }

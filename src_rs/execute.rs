@@ -1126,7 +1126,8 @@ impl VmExecutor {
     fn op_shli(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
-        let ic = opcodes::getarg_c(inst) as i64;
+        // C 使用 GETARG_sC (有符号常量), 与 C 版本一致
+        let ic = opcodes::getarg_sc(inst) as i64;
         let v = Self::read_stack(state, b).clone();
         if let Some(ib) = to_integer_ns(&v, F2IMode::Eq) {
             Self::write_stack(state, a, TValue::Integer(shiftl(ic, ib)));
@@ -1140,7 +1141,8 @@ impl VmExecutor {
     fn op_shri(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
-        let ic = opcodes::getarg_c(inst) as i64;
+        // C 使用 GETARG_sC (有符号常量), 与 C 版本一致
+        let ic = opcodes::getarg_sc(inst) as i64;
         let v = Self::read_stack(state, b).clone();
         if let Some(ib) = to_integer_ns(&v, F2IMode::Eq) {
             Self::write_stack(state, a, TValue::Integer(shiftl(ib, -ic)));

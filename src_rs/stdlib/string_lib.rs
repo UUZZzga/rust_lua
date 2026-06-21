@@ -34,6 +34,9 @@ pub const STR_FORMAT: usize = 109;
 pub const STR_MATCH: usize = 110;
 pub const STR_GMATCH: usize = 111;
 pub const STR_GSUB: usize = 112;
+pub const STR_PACK: usize = 113;
+pub const STR_PACKSIZE: usize = 114;
+pub const STR_UNPACK: usize = 115;
 
 // ============================================================================
 // 算术元方法 (对应 C 的 arith_add, arith_sub, ...)
@@ -203,8 +206,12 @@ pub fn str_sub(s: &str, start: i64, end: i64) -> String {
 
 /// string.reverse(s) — 反转字符串
 /// 对应 C 的 str_reverse
+///
+/// 与 C 版本一致:反转字节序列,不进行 UTF-8 解码。
+/// 使用 unsafe 创建 String 以保持原始字节 (与 str_char 一致)。
 pub fn str_reverse(s: &str) -> String {
-    s.bytes().rev().map(|b| b as char).collect()
+    let bytes: Vec<u8> = s.bytes().rev().collect();
+    unsafe { String::from_utf8_unchecked(bytes) }
 }
 
 /// string.byte(s, [i], [j]) — 返回字符的字节值
@@ -1362,6 +1369,651 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
 }
 
 // ============================================================================
+// pack/unpack/packsize 实现 (对应 C 的 str_pack/str_packsize/str_unpack)
+// ============================================================================
+
+/// pack/unpack 的填充字节 (对应 C 的 LUAL_PACKPADBYTE)
+const PACK_PAD_BYTE: u8 = 0x00;
+
+/// 整数二进制表示的最大尺寸 (对应 C 的 MAXINTSIZE)
+const MAX_INT_SIZE: usize = 16;
+
+/// lua_Integer 的字节数 (对应 C 的 SZINT = sizeof(lua_Integer))
+const SZ_INT: usize = std::mem::size_of::<i64>();
+
+/// 最大分配大小 (对应 C 的 MAX_SIZE)
+/// C: sizeof(size_t) < sizeof(lua_Integer) ? MAX_SIZET : cast_sizet(LUA_MAXINTEGER)
+/// 在 64 位平台上 sizeof(size_t) == sizeof(lua_Integer) == 8,所以 MAX_SIZE = LUA_MAXINTEGER
+const MAX_SIZE: usize = if std::mem::size_of::<usize>() < std::mem::size_of::<i64>() {
+    usize::MAX
+} else {
+    i64::MAX as usize
+};
+
+/// 原生字节序是否为小端 (对应 C 的 nativeendian.little)
+fn native_is_little() -> bool {
+    cfg!(target_endian = "little")
+}
+
+/// 最大对齐 (对应 C 的 offsetof(struct cD, u),即 LUAI_MAXALIGN 联合体的对齐)
+/// 在 64 位平台上通常为 8
+const fn max_align() -> usize {
+    let a = std::mem::align_of::<f64>();
+    let b = std::mem::align_of::<*const u8>();
+    let c = std::mem::align_of::<i64>();
+    let d = std::mem::align_of::<std::os::raw::c_long>();
+    let mut m = a;
+    if b > m { m = b; }
+    if c > m { m = c; }
+    if d > m { m = d; }
+    m
+}
+const MAX_ALIGN: usize = max_align();
+
+/// pack/unpack 头信息 (对应 C 的 Header)
+#[derive(Clone, Copy)]
+struct PackHeader {
+    islittle: bool,
+    maxalign: usize,
+}
+
+impl PackHeader {
+    fn new() -> Self {
+        PackHeader {
+            islittle: native_is_little(),
+            maxalign: 1,
+        }
+    }
+}
+
+/// pack/unpack 选项 (对应 C 的 KOption)
+#[derive(Debug, PartialEq, Eq)]
+enum KOption {
+    Kint,       // 有符号整数
+    Kuint,      // 无符号整数
+    Kfloat,     // 单精度浮点
+    Knumber,    // Lua 原生浮点 (lua_Number = double)
+    Kdouble,    // 双精度浮点
+    Kchar,      // 定长字符串
+    Kstring,    // 带长度前缀的字符串
+    Kzstr,      // 零终止字符串
+    Kpadding,   // 填充
+    Kpaddalign, // 对齐填充
+    Knop,       // 无操作
+}
+
+/// 从格式字符串中读取数字 (对应 C 的 getnum)
+/// 返回 (读取的数字, 剩余格式字符串)
+fn getnum(fmt: &[u8], pos: &mut usize, default: usize) -> usize {
+    if *pos >= fmt.len() || !fmt[*pos].is_ascii_digit() {
+        return default;
+    }
+    let mut a: usize = 0;
+    while *pos < fmt.len() && fmt[*pos].is_ascii_digit() && a <= (usize::MAX - 9) / 10 {
+        a = a * 10 + (fmt[*pos] - b'0') as usize;
+        *pos += 1;
+    }
+    a
+}
+
+/// 读取数字并检查是否在 [1, MAX_INT_SIZE] 范围内 (对应 C 的 getnumlimit)
+fn getnumlimit(fmt: &[u8], pos: &mut usize, default: usize) -> Result<usize, String> {
+    let sz = getnum(fmt, pos, default);
+    if sz.wrapping_sub(1) >= MAX_INT_SIZE {
+        return Err(format!(
+            "integral size ({}) out of limits [1,{}]",
+            sz, MAX_INT_SIZE
+        ));
+    }
+    Ok(sz)
+}
+
+/// 读取并分类下一个选项 (对应 C 的 getoption)
+/// 返回 (选项类型, 选项尺寸)
+fn getoption(h: &mut PackHeader, fmt: &[u8], pos: &mut usize) -> Result<(KOption, usize), String> {
+    if *pos >= fmt.len() {
+        return Err("invalid format (ends with empty)".to_string());
+    }
+    let opt = fmt[*pos];
+    *pos += 1;
+    let mut size: usize = 0;
+    let result = match opt {
+        b'b' => { size = std::mem::size_of::<i8>(); KOption::Kint }
+        b'B' => { size = std::mem::size_of::<i8>(); KOption::Kuint }
+        b'h' => { size = std::mem::size_of::<i16>(); KOption::Kint }
+        b'H' => { size = std::mem::size_of::<i16>(); KOption::Kuint }
+        b'l' => { size = std::mem::size_of::<std::os::raw::c_long>(); KOption::Kint }
+        b'L' => { size = std::mem::size_of::<std::os::raw::c_long>(); KOption::Kuint }
+        b'j' => { size = SZ_INT; KOption::Kint }
+        b'J' => { size = SZ_INT; KOption::Kuint }
+        b'T' => { size = std::mem::size_of::<usize>(); KOption::Kuint }
+        b'f' => { size = std::mem::size_of::<f32>(); KOption::Kfloat }
+        b'n' => { size = std::mem::size_of::<f64>(); KOption::Knumber }
+        b'd' => { size = std::mem::size_of::<f64>(); KOption::Kdouble }
+        b'i' => { size = getnumlimit(fmt, pos, std::mem::size_of::<std::os::raw::c_int>())?; KOption::Kint }
+        b'I' => { size = getnumlimit(fmt, pos, std::mem::size_of::<std::os::raw::c_int>())?; KOption::Kuint }
+        b's' => { size = getnumlimit(fmt, pos, std::mem::size_of::<usize>())?; KOption::Kstring }
+        b'c' => {
+            size = getnum(fmt, pos, usize::MAX);
+            if size == usize::MAX {
+                return Err("missing size for format option 'c'".to_string());
+            }
+            KOption::Kchar
+        }
+        b'z' => KOption::Kzstr,
+        b'x' => { size = 1; KOption::Kpadding }
+        b'X' => KOption::Kpaddalign,
+        b' ' => KOption::Knop,
+        b'<' => { h.islittle = true; KOption::Knop }
+        b'>' => { h.islittle = false; KOption::Knop }
+        b'=' => { h.islittle = native_is_little(); KOption::Knop }
+        b'!' => {
+            h.maxalign = getnumlimit(fmt, pos, MAX_ALIGN)?;
+            KOption::Knop
+        }
+        _ => return Err(format!("invalid format option '{}'", opt as char)),
+    };
+    Ok((result, size))
+}
+
+/// 检查是否为 2 的幂 (对应 C 的 ispow2)
+fn is_pow2(x: usize) -> bool {
+    x != 0 && (x & (x - 1)) == 0
+}
+
+/// 读取、分类并填充对齐细节 (对应 C 的 getdetails)
+/// 返回 (选项类型, 选项尺寸, 需要对齐的字节数)
+fn getdetails(
+    h: &mut PackHeader,
+    totalsize: usize,
+    fmt: &[u8],
+    pos: &mut usize,
+) -> Result<(KOption, usize, usize), String> {
+    let (opt, mut size) = getoption(h, fmt, pos)?;
+    let mut align = size; // 通常对齐等于尺寸
+    if opt == KOption::Kpaddalign {
+        // 'X' 从后续选项获取对齐
+        if *pos >= fmt.len() {
+            return Err("invalid next option for option 'X'".to_string());
+        }
+        let (next_opt, next_size) = getoption(h, fmt, pos)?;
+        if next_opt == KOption::Kchar || next_size == 0 {
+            return Err("invalid next option for option 'X'".to_string());
+        }
+        align = next_size;
+    }
+    let ntoalign = if align <= 1 || opt == KOption::Kchar {
+        0
+    } else {
+        if align > h.maxalign {
+            align = h.maxalign;
+        }
+        if !is_pow2(align) {
+            return Err("format asks for alignment not power of 2".to_string());
+        }
+        let szmoda = totalsize & (align - 1);
+        (align - szmoda) & (align - 1)
+    };
+    // 注意: getoption 对于 Kpaddalign 已消耗了后续选项,但 size 仍为 0
+    // 对于 Kpaddalign, size 应为 0 (对齐填充不占额外尺寸,只占 ntoalign)
+    if opt == KOption::Kpaddalign {
+        size = 0;
+    }
+    Ok((opt, size, ntoalign))
+}
+
+/// 打包整数 (对应 C 的 packint)
+fn packint(buf: &mut Vec<u8>, n: u64, islittle: bool, size: usize, neg: bool) {
+    let start = buf.len();
+    buf.resize(start + size, 0);
+    let mask = 0xFFu64;
+    // 写入第一个字节
+    let first_idx = if islittle { 0 } else { size - 1 };
+    buf[start + first_idx] = (n & mask) as u8;
+    let mut n = n;
+    for i in 1..size {
+        n >>= 8;
+        let idx = if islittle { i } else { size - 1 - i };
+        buf[start + idx] = (n & mask) as u8;
+    }
+    // 负数需要符号扩展
+    if neg && size > SZ_INT {
+        for i in SZ_INT..size {
+            let idx = if islittle { i } else { size - 1 - i };
+            buf[start + idx] = 0xFF;
+        }
+    }
+}
+
+/// 按指定字节序复制字节 (对应 C 的 copywithendian)
+fn copy_with_endian(dest: &mut [u8], src: &[u8], islittle: bool) {
+    let size = dest.len();
+    if islittle == native_is_little() {
+        dest.copy_from_slice(&src[..size]);
+    } else {
+        for i in 0..size {
+            dest[i] = src[size - 1 - i];
+        }
+    }
+}
+
+/// 解包整数 (对应 C 的 unpackint)
+fn unpackint(data: &[u8], islittle: bool, size: usize, issigned: bool) -> Result<i64, String> {
+    let mut res: u64 = 0;
+    let limit = if size <= SZ_INT { size } else { SZ_INT };
+    for i in (0..limit).rev() {
+        res <<= 8;
+        let idx = if islittle { i } else { size - 1 - i };
+        res |= data[idx] as u64;
+    }
+    if size < SZ_INT {
+        if issigned {
+            // 符号扩展
+            let mask = 1u64 << (size * 8 - 1);
+            res = (res ^ mask).wrapping_sub(mask);
+        }
+    } else if size > SZ_INT {
+        // 检查未读字节
+        let mask: u8 = if !issigned || (res as i64) >= 0 { 0 } else { 0xFF };
+        for i in limit..size {
+            let idx = if islittle { i } else { size - 1 - i };
+            if data[idx] != mask {
+                return Err(format!(
+                    "{}-byte integer does not fit into Lua Integer",
+                    size
+                ));
+            }
+        }
+    }
+    Ok(res as i64)
+}
+
+/// 从 TValue 获取整数值 (对应 C 的 luaL_checkinteger)
+fn check_integer(v: &TValue, arg: usize) -> Result<i64, String> {
+    match v.as_integer() {
+        Some(i) => Ok(i),
+        None => Err(format!(
+            "bad argument #{} (integer expected, got {})",
+            arg,
+            v.ty()
+        )),
+    }
+}
+
+/// 从 TValue 获取浮点值 (对应 C 的 luaL_checknumber)
+fn check_number(v: &TValue, arg: usize) -> Result<f64, String> {
+    match v.as_float() {
+        Some(f) => Ok(f),
+        None => Err(format!(
+            "bad argument #{} (number expected, got {})",
+            arg,
+            v.ty()
+        )),
+    }
+}
+
+/// 从 TValue 获取字符串字节 (对应 C 的 luaL_checklstring)
+fn check_lstring<'a>(v: &'a TValue, arg: usize) -> Result<&'a [u8], String> {
+    match v {
+        TValue::Str(s) => Ok(s.as_str().as_bytes()),
+        _ => Err(format!(
+            "bad argument #{} (string expected, got {})",
+            arg,
+            v.ty()
+        )),
+    }
+}
+
+/// string.pack(fmt, ...) — 打包值到二进制字符串
+/// 对应 C 的 str_pack
+pub fn str_pack(fmt: &str, args: &[TValue]) -> Result<Vec<u8>, String> {
+    let fmt_bytes = fmt.as_bytes();
+    let mut h = PackHeader::new();
+    let mut pos = 0; // 格式字符串的当前位置
+    let mut arg: usize = 0; // 当前参数索引 (0-based,对应 C 的 arg-1)
+    let mut totalsize: usize = 0;
+    let mut buf: Vec<u8> = Vec::new();
+
+    while pos < fmt_bytes.len() {
+        let (opt, size, ntoalign) = getdetails(&mut h, totalsize, fmt_bytes, &mut pos)?;
+        // 对应 C: if (size + ntoalign > MAX_SIZE - totalsize)
+        // 使用 checked_add 避免 size + ntoalign 溢出,使用 saturating_sub 避免 MAX_SIZE - totalsize 下溢
+        let total = match size.checked_add(ntoalign) {
+            Some(t) if totalsize <= MAX_SIZE.saturating_sub(t) => t,
+            _ => {
+                return Err(format!(
+                    "bad argument #{} to 'pack' (result too long)",
+                    arg + 1
+                ))
+            }
+        };
+        totalsize += total;
+        // 添加对齐填充
+        for _ in 0..ntoalign {
+            buf.push(PACK_PAD_BYTE);
+        }
+        // arg 在 C 中从 1 开始,这里从 0 开始
+        // C: arg++ 在 switch 之前,所以 arg 对应当前参数
+        // 但对于 Kpadding/Kpaddalign/Knop,arg 不增加
+        let need_arg = !matches!(opt, KOption::Kpadding | KOption::Kpaddalign | KOption::Knop);
+        if need_arg {
+            arg += 1;
+        }
+        match opt {
+            KOption::Kint => {
+                if arg > args.len() {
+                    return Err(format!(
+                        "bad argument #{} to 'pack' (value expected)",
+                        arg + 1
+                    ));
+                }
+                let n = check_integer(&args[arg - 1], arg + 1)?;
+                if size < SZ_INT {
+                    let lim = 1i64 << (size * 8 - 1);
+                    if n < -lim || n >= lim {
+                        return Err(format!(
+                            "bad argument #{} to 'pack' (integer overflow)",
+                            arg + 1
+                        ));
+                    }
+                }
+                packint(&mut buf, n as u64, h.islittle, size, n < 0);
+            }
+            KOption::Kuint => {
+                if arg > args.len() {
+                    return Err(format!(
+                        "bad argument #{} to 'pack' (value expected)",
+                        arg + 1
+                    ));
+                }
+                let n = check_integer(&args[arg - 1], arg + 1)?;
+                if size < SZ_INT {
+                    let max = 1u64 << (size * 8);
+                    if (n as u64) >= max {
+                        return Err(format!(
+                            "bad argument #{} to 'pack' (unsigned overflow)",
+                            arg + 1
+                        ));
+                    }
+                }
+                packint(&mut buf, n as u64, h.islittle, size, false);
+            }
+            KOption::Kfloat => {
+                if arg > args.len() {
+                    return Err(format!(
+                        "bad argument #{} to 'pack' (value expected)",
+                        arg + 1
+                    ));
+                }
+                let f = check_number(&args[arg - 1], arg + 1)? as f32;
+                let bytes = f.to_le_bytes();
+                let start = buf.len();
+                buf.resize(start + size, 0);
+                // 根据字节序复制
+                if h.islittle == native_is_little() {
+                    buf[start..start + size].copy_from_slice(&bytes);
+                } else {
+                    for i in 0..size {
+                        buf[start + i] = bytes[size - 1 - i];
+                    }
+                }
+            }
+            KOption::Knumber => {
+                if arg > args.len() {
+                    return Err(format!(
+                        "bad argument #{} to 'pack' (value expected)",
+                        arg + 1
+                    ));
+                }
+                let f = check_number(&args[arg - 1], arg + 1)?;
+                let bytes = f.to_le_bytes();
+                let start = buf.len();
+                buf.resize(start + size, 0);
+                if h.islittle == native_is_little() {
+                    buf[start..start + size].copy_from_slice(&bytes);
+                } else {
+                    for i in 0..size {
+                        buf[start + i] = bytes[size - 1 - i];
+                    }
+                }
+            }
+            KOption::Kdouble => {
+                if arg > args.len() {
+                    return Err(format!(
+                        "bad argument #{} to 'pack' (value expected)",
+                        arg + 1
+                    ));
+                }
+                let f = check_number(&args[arg - 1], arg + 1)?;
+                let bytes = f.to_le_bytes();
+                let start = buf.len();
+                buf.resize(start + size, 0);
+                if h.islittle == native_is_little() {
+                    buf[start..start + size].copy_from_slice(&bytes);
+                } else {
+                    for i in 0..size {
+                        buf[start + i] = bytes[size - 1 - i];
+                    }
+                }
+            }
+            KOption::Kchar => {
+                if arg > args.len() {
+                    return Err(format!(
+                        "bad argument #{} to 'pack' (value expected)",
+                        arg + 1
+                    ));
+                }
+                let s = check_lstring(&args[arg - 1], arg + 1)?;
+                let len = s.len();
+                if len > size {
+                    return Err(format!(
+                        "bad argument #{} to 'pack' (string longer than given size)",
+                        arg + 1
+                    ));
+                }
+                buf.extend_from_slice(s);
+                if len < size {
+                    let psize = size - len;
+                    buf.extend(std::iter::repeat(PACK_PAD_BYTE).take(psize));
+                }
+            }
+            KOption::Kstring => {
+                if arg > args.len() {
+                    return Err(format!(
+                        "bad argument #{} to 'pack' (value expected)",
+                        arg + 1
+                    ));
+                }
+                let s = check_lstring(&args[arg - 1], arg + 1)?;
+                let len = s.len();
+                // 检查长度是否适合给定尺寸
+                if size < SZ_INT {
+                    let max_len = 1usize << (size * 8);
+                    if len >= max_len {
+                        return Err(format!(
+                            "bad argument #{} to 'pack' (string length does not fit in given size)",
+                            arg + 1
+                        ));
+                    }
+                }
+                // 打包长度
+                packint(&mut buf, len as u64, h.islittle, size, false);
+                buf.extend_from_slice(s);
+                totalsize += len;
+            }
+            KOption::Kzstr => {
+                if arg > args.len() {
+                    return Err(format!(
+                        "bad argument #{} to 'pack' (value expected)",
+                        arg + 1
+                    ));
+                }
+                let s = check_lstring(&args[arg - 1], arg + 1)?;
+                let len = s.len();
+                // 检查字符串中是否包含零字节
+                if s.contains(&0) {
+                    return Err(format!(
+                        "bad argument #{} to 'pack' (string contains zeros)",
+                        arg + 1
+                    ));
+                }
+                buf.extend_from_slice(s);
+                buf.push(0); // 添加终止零
+                totalsize += len + 1;
+            }
+            KOption::Kpadding => {
+                buf.push(PACK_PAD_BYTE);
+                // Kpadding 不消耗参数,需要回退 arg
+                // 注意: 上面的 need_arg 已处理
+            }
+            KOption::Kpaddalign | KOption::Knop => {
+                // 不消耗参数
+            }
+        }
+    }
+    Ok(buf)
+}
+
+/// string.packsize(fmt) — 返回打包结果的固定大小
+/// 对应 C 的 str_packsize
+pub fn str_packsize(fmt: &str) -> Result<usize, String> {
+    let fmt_bytes = fmt.as_bytes();
+    let mut h = PackHeader::new();
+    let mut pos = 0;
+    let mut totalsize: usize = 0;
+
+    while pos < fmt_bytes.len() {
+        let (opt, size, ntoalign) = getdetails(&mut h, totalsize, fmt_bytes, &mut pos)?;
+        if opt == KOption::Kstring || opt == KOption::Kzstr {
+            return Err("bad argument #1 to 'packsize' (variable-length format)".to_string());
+        }
+        // 对应 C: if (size + ntoalign > MAX_SIZE - totalsize)
+        // 使用 checked_add 避免 size + ntoalign 溢出,使用 saturating_sub 避免 MAX_SIZE - total 下溢
+        let total = match size.checked_add(ntoalign) {
+            Some(t) if totalsize <= MAX_SIZE.saturating_sub(t) => t,
+            _ => return Err("bad argument #1 to 'packsize' (format result too large)".to_string()),
+        };
+        totalsize += total;
+    }
+    Ok(totalsize)
+}
+
+/// string.unpack(fmt, data, [pos]) — 从二进制字符串解包值
+/// 对应 C 的 str_unpack
+/// 返回 (解包的值列表, 下一个位置)
+pub fn str_unpack(fmt: &str, data: &[u8], init_pos: i64) -> Result<(Vec<TValue>, usize), String> {
+    let fmt_bytes = fmt.as_bytes();
+    let ld = data.len();
+    // posrelatI 将相对位置转为绝对位置 (1-based),然后 -1 转为 0-based
+    let mut pos = posrelat_i(init_pos, ld).saturating_sub(1);
+    if pos > ld {
+        return Err(format!(
+            "bad argument #3 to 'unpack' (initial position out of string)"
+        ));
+    }
+    let mut h = PackHeader::new();
+    let mut fmt_pos = 0;
+    let mut results: Vec<TValue> = Vec::new();
+
+    while fmt_pos < fmt_bytes.len() {
+        let (opt, size, ntoalign) = getdetails(&mut h, pos, fmt_bytes, &mut fmt_pos)?;
+        // 检查数据足够
+        let needed = ntoalign + size;
+        if needed > ld - pos {
+            return Err("bad argument #2 to 'unpack' (data string too short)".to_string());
+        }
+        pos += ntoalign; // 跳过对齐
+
+        match opt {
+            KOption::Kint => {
+                let res = unpackint(&data[pos..pos + size], h.islittle, size, true)?;
+                results.push(TValue::Integer(res));
+            }
+            KOption::Kuint => {
+                let res = unpackint(&data[pos..pos + size], h.islittle, size, false)?;
+                results.push(TValue::Integer(res));
+            }
+            KOption::Kfloat => {
+                let mut f_bytes = [0u8; 4];
+                copy_with_endian(&mut f_bytes, &data[pos..pos + 4], h.islittle);
+                let f = f32::from_le_bytes(f_bytes);
+                results.push(TValue::Float(f as f64));
+            }
+            KOption::Knumber => {
+                let mut f_bytes = [0u8; 8];
+                copy_with_endian(&mut f_bytes, &data[pos..pos + 8], h.islittle);
+                let f = f64::from_le_bytes(f_bytes);
+                results.push(TValue::Float(f));
+            }
+            KOption::Kdouble => {
+                let mut f_bytes = [0u8; 8];
+                copy_with_endian(&mut f_bytes, &data[pos..pos + 8], h.islittle);
+                let f = f64::from_le_bytes(f_bytes);
+                results.push(TValue::Float(f));
+            }
+            KOption::Kchar => {
+                let s_bytes = &data[pos..pos + size];
+                // 使用 unsafe 创建包含原始字节的 String (与 str_char 一致)
+                let s = unsafe { String::from_utf8_unchecked(s_bytes.to_vec()) };
+                results.push(TValue::Str(crate::strings::LuaString::Short(
+                    std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: s })
+                )));
+            }
+            KOption::Kstring => {
+                let len = unpackint(&data[pos..pos + size], h.islittle, size, false)? as usize;
+                if len > ld - pos - size {
+                    return Err("bad argument #2 to 'unpack' (data string too short)".to_string());
+                }
+                let s_bytes = &data[pos + size..pos + size + len];
+                let s = unsafe { String::from_utf8_unchecked(s_bytes.to_vec()) };
+                results.push(TValue::Str(crate::strings::LuaString::Short(
+                    std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: s })
+                )));
+                pos += len; // 跳过字符串
+            }
+            KOption::Kzstr => {
+                // 查找零字节
+                let rel_pos = pos;
+                let mut zero_idx = None;
+                for i in rel_pos..ld {
+                    if data[i] == 0 {
+                        zero_idx = Some(i);
+                        break;
+                    }
+                }
+                let zero_idx = match zero_idx {
+                    Some(idx) => idx,
+                    None => {
+                        return Err(
+                            "bad argument #2 to 'unpack' (unfinished string for format 'z')"
+                                .to_string(),
+                        );
+                    }
+                };
+                let len = zero_idx - rel_pos;
+                if pos + len >= ld {
+                    return Err(
+                        "bad argument #2 to 'unpack' (unfinished string for format 'z')"
+                            .to_string(),
+                    );
+                }
+                let s_bytes = &data[rel_pos..zero_idx];
+                let s = unsafe { String::from_utf8_unchecked(s_bytes.to_vec()) };
+                results.push(TValue::Str(crate::strings::LuaString::Short(
+                    std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: s })
+                )));
+                pos += len + 1; // 跳过字符串和终止零
+            }
+            KOption::Kpadding | KOption::Kpaddalign | KOption::Knop => {
+                // 不产生结果
+            }
+        }
+        pos += size;
+    }
+    Ok((results, pos + 1)) // 返回 1-based 的下一个位置
+}
+
+// ============================================================================
 // 派发函数 — 从 execute.rs 的 op_call 调用
 // ============================================================================
 
@@ -1589,6 +2241,69 @@ pub fn call_string_function(
             // 这里返回一个错误提示
             Err(VmError::RuntimeError("string.gmatch not fully supported in this build".to_string()))
         }
+        STR_PACK => {
+            // string.pack(fmt, ...)
+            let fmt = get_str_arg(state, a, 0)?;
+            // 收集参数 (从索引 1 开始,即第 2 个参数及之后)
+            let args: Vec<TValue> = (1..nargs).map(|i| {
+                let idx = a + 1 + i;
+                if idx < state.stack.len() {
+                    state.stack[idx].clone()
+                } else {
+                    TValue::Nil(NilKind::Strict)
+                }
+            }).collect();
+            match str_pack(&fmt, &args) {
+                Ok(bytes) => {
+                    // 将字节转换为 LuaString (可能包含非 UTF-8 字节)
+                    let s = unsafe { String::from_utf8_unchecked(bytes) };
+                    push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&s))]);
+                    Ok(())
+                }
+                Err(msg) => Err(VmError::RuntimeError(msg)),
+            }
+        }
+        STR_PACKSIZE => {
+            // string.packsize(fmt)
+            let fmt = get_str_arg(state, a, 0)?;
+            match str_packsize(&fmt) {
+                Ok(size) => {
+                    push_results(state, a, nresults, vec![TValue::Integer(size as i64)]);
+                    Ok(())
+                }
+                Err(msg) => Err(VmError::RuntimeError(msg)),
+            }
+        }
+        STR_UNPACK => {
+            // string.unpack(fmt, data, [pos])
+            let fmt = get_str_arg(state, a, 0)?;
+            // 获取数据字符串的字节
+            let data_bytes = {
+                let stack_idx = a + 1 + 1;
+                if stack_idx >= state.stack.len() {
+                    return Err(VmError::RuntimeError(format!(
+                        "bad argument #2 to 'unpack' (string expected, got no value)"
+                    )));
+                }
+                match &state.stack[stack_idx] {
+                    TValue::Str(s) => s.as_str().as_bytes().to_vec(),
+                    _ => return Err(VmError::RuntimeError(format!(
+                        "bad argument #2 to 'unpack' (string expected, got {})",
+                        state.stack[stack_idx].ty()
+                    ))),
+                }
+            };
+            let pos = get_opt_int_arg(state, a, 2, 1);
+            match str_unpack(&fmt, &data_bytes, pos) {
+                Ok((mut values, next_pos)) => {
+                    // 最后一个返回值是下一个位置
+                    values.push(TValue::Integer(next_pos as i64));
+                    push_results(state, a, nresults, values);
+                    Ok(())
+                }
+                Err(msg) => Err(VmError::RuntimeError(msg)),
+            }
+        }
         _ => Err(VmError::RuntimeError(format!("unknown string function tag: {}", tag))),
     }
 }
@@ -1664,6 +2379,9 @@ fn create_string_lib_table(state: &LuaState) -> Table {
     register(&mut lib, "match", STR_MATCH);
     register(&mut lib, "gmatch", STR_GMATCH);
     register(&mut lib, "gsub", STR_GSUB);
+    register(&mut lib, "pack", STR_PACK);
+    register(&mut lib, "packsize", STR_PACKSIZE);
+    register(&mut lib, "unpack", STR_UNPACK);
     lib
 }
 
@@ -2593,5 +3311,582 @@ mod tests {
         let mut state = LuaState::new();
         let result = call_string_function(999, &mut state, 0, 0, 0);
         assert!(result.is_err());
+    }
+
+    // ========================================================================
+    // pack / packsize / unpack 测试
+    // ========================================================================
+
+    /// 辅助: 将字节数组转为包含原始字节的 String (用于比较)
+    fn bytes_to_string(b: &[u8]) -> String {
+        unsafe { String::from_utf8_unchecked(b.to_vec()) }
+    }
+
+    /// 辅助: 比较打包结果与期望的字节序列
+    fn assert_pack_eq(fmt: &str, args: &[TValue], expected: &[u8]) {
+        let result = str_pack(fmt, args).expect("pack should succeed");
+        assert_eq!(result, expected, "pack({:?}) mismatch", fmt);
+    }
+
+    /// 辅助: 比较 unpack 结果
+    fn assert_unpack_eq(fmt: &str, data: &[u8], expected: &[TValue]) {
+        let (results, _) = str_unpack(fmt, data, 1).expect("unpack should succeed");
+        assert_eq!(results.len(), expected.len(), "unpack({:?}) result count mismatch", fmt);
+        for (i, (r, e)) in results.iter().zip(expected.iter()).enumerate() {
+            assert!(crate::vm::raw_equal(r, e),
+                "unpack({:?}) result[{}] mismatch: got {:?}, expected {:?}", fmt, i, r, e);
+        }
+    }
+
+    // --- 基本整数打包 ---
+
+    #[test]
+    fn test_pack_int_basic() {
+        // 小端 1 字节有符号整数
+        assert_pack_eq("<i1", &[TValue::Integer(1)], &[0x01]);
+        assert_pack_eq("<i1", &[TValue::Integer(127)], &[0x7F]);
+        assert_pack_eq("<i1", &[TValue::Integer(-1)], &[0xFF]);
+        assert_pack_eq("<i1", &[TValue::Integer(-128)], &[0x80]);
+
+        // 大端 1 字节有符号整数
+        assert_pack_eq(">i1", &[TValue::Integer(1)], &[0x01]);
+        assert_pack_eq(">i1", &[TValue::Integer(-1)], &[0xFF]);
+
+        // 小端 2 字节有符号整数
+        assert_pack_eq("<i2", &[TValue::Integer(1)], &[0x01, 0x00]);
+        assert_pack_eq("<i2", &[TValue::Integer(256)], &[0x00, 0x01]);
+        assert_pack_eq("<i2", &[TValue::Integer(-1)], &[0xFF, 0xFF]);
+
+        // 大端 2 字节有符号整数
+        assert_pack_eq(">i2", &[TValue::Integer(1)], &[0x00, 0x01]);
+        assert_pack_eq(">i2", &[TValue::Integer(256)], &[0x01, 0x00]);
+        assert_pack_eq(">i2", &[TValue::Integer(-1)], &[0xFF, 0xFF]);
+    }
+
+    #[test]
+    fn test_pack_uint_basic() {
+        // 无符号整数
+        assert_pack_eq("<I1", &[TValue::Integer(255)], &[0xFF]);
+        assert_pack_eq("<I2", &[TValue::Integer(65535)], &[0xFF, 0xFF]);
+        assert_pack_eq(">I2", &[TValue::Integer(65535)], &[0xFF, 0xFF]);
+        assert_pack_eq("<I4", &[TValue::Integer(0x12345678)], &[0x78, 0x56, 0x34, 0x12]);
+        assert_pack_eq(">I4", &[TValue::Integer(0x12345678)], &[0x12, 0x34, 0x56, 0x78]);
+    }
+
+    #[test]
+    fn test_pack_int_overflow() {
+        // i1 范围: -128 ~ 127
+        assert!(str_pack("<i1", &[TValue::Integer(128)]).is_err());
+        assert!(str_pack("<i1", &[TValue::Integer(-129)]).is_err());
+
+        // I1 范围: 0 ~ 255
+        assert!(str_pack("<I1", &[TValue::Integer(256)]).is_err());
+        assert!(str_pack("<I1", &[TValue::Integer(-1)]).is_err());
+    }
+
+    // --- Lua Integer (j/J) ---
+
+    #[test]
+    fn test_pack_lua_integer() {
+        // j = lua_Integer (8 字节有符号)
+        let val = 0x0807060504030201i64;
+        assert_pack_eq("<j", &[TValue::Integer(val)],
+            &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
+        assert_pack_eq(">j", &[TValue::Integer(val)],
+            &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+
+        // J = lua_Integer (8 字节无符号)
+        assert_pack_eq("<J", &[TValue::Integer(-1)],
+            &[0xFF; 8]);
+    }
+
+    #[test]
+    fn test_pack_max_min_integer() {
+        // 最大/最小整数
+        assert_pack_eq("<j", &[TValue::Integer(i64::MAX)],
+            &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F]);
+        assert_pack_eq("<j", &[TValue::Integer(i64::MIN)],
+            &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80]);
+    }
+
+    // --- 浮点数 ---
+
+    #[test]
+    fn test_pack_float() {
+        // f = float (4 字节)
+        let f = 1.0f32;
+        let bytes = f.to_le_bytes();
+        assert_pack_eq("<f", &[TValue::Float(1.0)], &bytes);
+
+        let bytes = f.to_be_bytes();
+        assert_pack_eq(">f", &[TValue::Float(1.0)], &bytes);
+    }
+
+    #[test]
+    fn test_pack_double() {
+        // d = double (8 字节)
+        let d = 3.14f64;
+        let bytes = d.to_le_bytes();
+        assert_pack_eq("<d", &[TValue::Float(3.14)], &bytes);
+
+        let bytes = d.to_be_bytes();
+        assert_pack_eq(">d", &[TValue::Float(3.14)], &bytes);
+    }
+
+    #[test]
+    fn test_pack_number() {
+        // n = lua_Number (8 字节, double)
+        let d = 2.718f64;
+        let bytes = d.to_le_bytes();
+        assert_pack_eq("<n", &[TValue::Float(2.718)], &bytes);
+    }
+
+    #[test]
+    fn test_pack_float_special() {
+        // 0.0
+        assert_pack_eq("<f", &[TValue::Float(0.0)], &[0u8; 4]);
+        assert_pack_eq("<d", &[TValue::Float(0.0)], &[0u8; 8]);
+
+        // 无穷大
+        let inf = f64::INFINITY;
+        let bytes = inf.to_le_bytes();
+        assert_pack_eq("<d", &[TValue::Float(inf)], &bytes);
+
+        // 负无穷
+        let neg_inf = f64::NEG_INFINITY;
+        let bytes = neg_inf.to_le_bytes();
+        assert_pack_eq("<d", &[TValue::Float(neg_inf)], &bytes);
+    }
+
+    #[test]
+    fn test_pack_unpack_float_roundtrip() {
+        for &n in &[0.0, -1.1, 1.9, f64::INFINITY, f64::NEG_INFINITY, 1e20, -1e20, 0.1, 2000.7] {
+            let packed = str_pack("<n", &[TValue::Float(n)]).unwrap();
+            assert_unpack_eq("<n", &packed, &[TValue::Float(n)]);
+        }
+    }
+
+    // --- 字符串 ---
+
+    #[test]
+    fn test_pack_string_fixed() {
+        // c = 固定长度字符串
+        assert_pack_eq("<c3", &[TValue::Str(crate::strings::LuaString::Short(
+            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: "abc".to_string() })
+        ))], &[b'a', b'b', b'c']);
+
+        // 短字符串补零
+        assert_pack_eq("<c5", &[TValue::Str(crate::strings::LuaString::Short(
+            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: "ab".to_string() })
+        ))], &[b'a', b'b', 0, 0, 0]);
+    }
+
+    #[test]
+    fn test_pack_string_zstr() {
+        // z = 零终止字符串
+        let s = TValue::Str(crate::strings::LuaString::Short(
+            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: "hello".to_string() })
+        ));
+        assert_pack_eq("<z", &[s], &[b'h', b'e', b'l', b'l', b'o', 0]);
+    }
+
+    #[test]
+    fn test_pack_string_s() {
+        // s = 带长度前缀的字符串 (默认 size_t = 8 字节)
+        let s = TValue::Str(crate::strings::LuaString::Short(
+            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: "hi".to_string() })
+        ));
+        let result = str_pack("<s", &[s]).unwrap();
+        // 8 字节长度前缀 (小端) + 字符串内容
+        assert_eq!(result.len(), 10);
+        assert_eq!(&result[0..8], &[2, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(&result[8..10], &[b'h', b'i']);
+    }
+
+    #[test]
+    fn test_pack_string_s1() {
+        // s1 = 1 字节长度前缀的字符串
+        let s = TValue::Str(crate::strings::LuaString::Short(
+            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: "hi".to_string() })
+        ));
+        assert_pack_eq("<s1", &[s], &[2, b'h', b'i']);
+    }
+
+    #[test]
+    fn test_pack_empty_string() {
+        let empty = TValue::Str(crate::strings::LuaString::Short(
+            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: "".to_string() })
+        ));
+
+        // 空字符串 c0
+        assert_pack_eq("<c0", &[empty.clone()], &[]);
+
+        // 空字符串 z
+        assert_pack_eq("<z", &[empty.clone()], &[0]);
+
+        // 空字符串 s1
+        assert_pack_eq("<s1", &[empty], &[0]);
+    }
+
+    #[test]
+    fn test_pack_string_with_special_chars() {
+        // 包含特殊字符的字符串
+        let bytes = vec![0u8, 1, 2, 255, 254, 128];
+        let s = unsafe { String::from_utf8_unchecked(bytes.clone()) };
+        let sval = TValue::Str(crate::strings::LuaString::Short(
+            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: s })
+        ));
+        assert_pack_eq("<c6", &[sval.clone()], &bytes);
+
+        // z 字符串中不能包含 0 (除了终止符)
+        let s2 = unsafe { String::from_utf8_unchecked(vec![1u8, 2, 3]) };
+        let sval2 = TValue::Str(crate::strings::LuaString::Short(
+            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: s2 })
+        ));
+        assert_pack_eq("<z", &[sval2], &[1, 2, 3, 0]);
+    }
+
+    // --- 字节序 ---
+
+    #[test]
+    fn test_pack_endian_consistency() {
+        // 大端和小端互为反转
+        let val = 0x12345678i64;
+        let le = str_pack("<i4", &[TValue::Integer(val)]).unwrap();
+        let be = str_pack(">i4", &[TValue::Integer(val)]).unwrap();
+        assert_eq!(le, be.iter().rev().copied().collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_pack_native_endian() {
+        // = 前缀表示原生字节序
+        let val = 1i64;
+        let native = str_pack("=i2", &[TValue::Integer(val)]).unwrap();
+        if cfg!(target_endian = "little") {
+            assert_eq!(native, vec![1, 0]);
+        } else {
+            assert_eq!(native, vec![0, 1]);
+        }
+    }
+
+    #[test]
+    fn test_pack_mixed_endian() {
+        // 混合字节序
+        let result = str_pack(">i2 <i2", &[TValue::Integer(10), TValue::Integer(20)]).unwrap();
+        assert_eq!(result, vec![0, 10, 20, 0]);
+    }
+
+    // --- 对齐和填充 ---
+
+    #[test]
+    fn test_pack_padding() {
+        // x = 填充一个零字节
+        assert_pack_eq("<x", &[], &[0]);
+
+        // X = 对齐填充 (消耗下一个格式选项来确定对齐,但不打包该选项的值)
+        // !4 xi1: x=1字节填充, i1=对齐1(无需填充), 总共2字节
+        assert_pack_eq("<!4 xi1", &[TValue::Integer(1)], &[0, 1]);
+    }
+
+    #[test]
+    fn test_pack_alignment() {
+        // !4 设置对齐为 4
+        // i1Xi4: i1=1字节, Xi4=对齐到4(填充3字节), i4被X消耗不打包
+        let result = str_pack("<!4 i1Xi4", &[TValue::Integer(1)]).unwrap();
+        assert_eq!(result, vec![1, 0, 0, 0]);
+
+        // !4 i1 X i4 i4: i1=1字节, Xi4=对齐到4(消耗i4), i4=打包4字节
+        // 只打包2个值: i1=1, i4=2
+        let result = str_pack("<!4 i1Xi4i4", &[
+            TValue::Integer(1),
+            TValue::Integer(2),
+        ]).unwrap();
+        assert_eq!(result, vec![1, 0, 0, 0, 2, 0, 0, 0]);
+    }
+
+    // --- packsize ---
+
+    #[test]
+    fn test_packsize_basic() {
+        assert_eq!(str_packsize("<i1").unwrap(), 1);
+        assert_eq!(str_packsize("<i2").unwrap(), 2);
+        assert_eq!(str_packsize("<i4").unwrap(), 4);
+        assert_eq!(str_packsize("<i8").unwrap(), 8);
+        assert_eq!(str_packsize("<j").unwrap(), 8);
+        assert_eq!(str_packsize("<f").unwrap(), 4);
+        assert_eq!(str_packsize("<d").unwrap(), 8);
+        assert_eq!(str_packsize("<n").unwrap(), 8);
+    }
+
+    #[test]
+    fn test_packsize_multiple() {
+        // 默认 maxalign=1, 所以无对齐填充
+        assert_eq!(str_packsize("<i1i2i4").unwrap(), 7);
+        // i1 + x(1字节) + i4(对齐1,无填充) = 1+1+4 = 6
+        assert_eq!(str_packsize("<i1xi4").unwrap(), 6);
+        // !4 i1xi4: i1(1) + x(1) + 对齐到4(填充2) + i4(4) = 8
+        assert_eq!(str_packsize("<!4 i1xi4").unwrap(), 8);
+    }
+
+    #[test]
+    fn test_packsize_matches_pack() {
+        // packsize 结果应与 pack 结果长度一致 (对于不需要额外参数的格式)
+        let fmts = ["<i1", "<i2", "<i4", "<j", "<f", "<d", "<n", "<x", "<i1i2i4"];
+        for fmt in &fmts {
+            let size = str_packsize(fmt).unwrap();
+            // 对于这些格式, pack 不需要额外参数 (除了整数/浮点数)
+            // 我们只验证格式部分的大小
+            println!("packsize({:?}) = {}", fmt, size);
+        }
+    }
+
+    #[test]
+    fn test_packsize_invalid() {
+        // i0 无效
+        assert!(str_packsize("i0").is_err());
+        // !0 无效 (对齐为 0)
+        assert!(str_packsize("!0").is_err());
+        // !3 单独不报错 (没有需要对齐的选项)
+        // !3 i4 报错 (3 不是 2 的幂)
+        assert!(str_packsize("!3 i4").is_err());
+    }
+
+    // --- unpack ---
+
+    #[test]
+    fn test_unpack_int_basic() {
+        assert_unpack_eq("<i1", &[0x01], &[TValue::Integer(1)]);
+        assert_unpack_eq("<i1", &[0xFF], &[TValue::Integer(-1)]);
+        assert_unpack_eq("<i2", &[0x01, 0x00], &[TValue::Integer(1)]);
+        assert_unpack_eq(">i2", &[0x00, 0x01], &[TValue::Integer(1)]);
+        assert_unpack_eq("<I1", &[0xFF], &[TValue::Integer(255)]);
+    }
+
+    #[test]
+    fn test_unpack_sign_extension() {
+        // 符号扩展: i1 的 0xF0 应为 -16
+        assert_unpack_eq("<i1", &[0xF0], &[TValue::Integer(-16)]);
+        // 无符号: I1 的 0xF0 应为 240
+        assert_unpack_eq("<I1", &[0xF0], &[TValue::Integer(240)]);
+
+        // 多字节符号扩展
+        assert_unpack_eq("<i2", &[0x00, 0x80], &[TValue::Integer(-32768)]);
+        assert_unpack_eq("<i3", &[0x00, 0x00, 0x80], &[TValue::Integer(-8388608)]);
+    }
+
+    #[test]
+    fn test_unpack_uint_does_not_fit() {
+        // 解包无符号整数时,如果值超出 lua_Integer 范围,应报错
+        // 仅当 size > SZ_INT 时才检查 (对应 tpack.lua 的溢出测试)
+        // 9 字节无符号,最高字节为 1,超出 i64 范围
+        let data = vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
+        assert!(str_unpack("<I9", &data, 1).is_err());
+
+        // 9 字节有符号,最高字节为 1,超出 i64 范围
+        let data = vec![0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        assert!(str_unpack(">i9", &data, 1).is_err());
+
+        // 8 字节无符号 0x8000000000000000 不报错 (转为 i64::MIN)
+        let data = vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80];
+        assert!(str_unpack("<I8", &data, 1).is_ok());
+    }
+
+    #[test]
+    fn test_unpack_multiple_values() {
+        // 多值解包
+        let data = vec![0x01, 0x02, 0x03];
+        let (results, _) = str_unpack("<i1i1i1", &data, 1).unwrap();
+        assert_eq!(results.len(), 3);
+        assert!(crate::vm::raw_equal(&results[0], &TValue::Integer(1)));
+        assert!(crate::vm::raw_equal(&results[1], &TValue::Integer(2)));
+        assert!(crate::vm::raw_equal(&results[2], &TValue::Integer(3)));
+    }
+
+    #[test]
+    fn test_unpack_with_position() {
+        // 从指定位置开始解包
+        let data = vec![0xFF, 0x01, 0x02];
+        let (results, next_pos) = str_unpack("<i2", &data, 2).unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(crate::vm::raw_equal(&results[0], &TValue::Integer(0x0201)));
+        assert_eq!(next_pos, 4); // 1-based, 2 + 2 = 4
+    }
+
+    #[test]
+    fn test_unpack_string() {
+        // 解包固定长度字符串
+        let data = vec![b'a', b'b', b'c'];
+        let (results, _) = str_unpack("<c3", &data, 1).unwrap();
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            TValue::Str(s) => assert_eq!(s.as_str(), "abc"),
+            _ => panic!("expected string"),
+        }
+
+        // 解包零终止字符串
+        let data = vec![b'h', b'i', 0];
+        let (results, _) = str_unpack("<z", &data, 1).unwrap();
+        match &results[0] {
+            TValue::Str(s) => assert_eq!(s.as_str(), "hi"),
+            _ => panic!("expected string"),
+        }
+
+        // 解包带长度前缀字符串
+        let data = vec![2, b'h', b'i'];
+        let (results, _) = str_unpack("<s1", &data, 1).unwrap();
+        match &results[0] {
+            TValue::Str(s) => assert_eq!(s.as_str(), "hi"),
+            _ => panic!("expected string"),
+        }
+    }
+
+    #[test]
+    fn test_pack_unpack_roundtrip() {
+        // 整数往返
+        for &val in &[0i64, 1, -1, 127, -128, 32767, -32768, 255, 65535] {
+            let packed = str_pack("<i4", &[TValue::Integer(val)]).unwrap();
+            assert_unpack_eq("<i4", &packed, &[TValue::Integer(val)]);
+        }
+
+        // 浮点数往返
+        for &val in &[0.0, 1.0, -1.0, 3.14, 2.718, 1e10, -1e10] {
+            let packed = str_pack("<d", &[TValue::Float(val)]).unwrap();
+            assert_unpack_eq("<d", &packed, &[TValue::Float(val)]);
+        }
+    }
+
+    #[test]
+    fn test_pack_unpack_roundtrip_endian() {
+        // 大端往返
+        let val = 0x12345678i64;
+        for fmt in &["<i4", ">i4", "<j", ">j"] {
+            let packed = str_pack(fmt, &[TValue::Integer(val)]).unwrap();
+            assert_unpack_eq(fmt, &packed, &[TValue::Integer(val)]);
+        }
+    }
+
+    // --- 错误处理 ---
+
+    #[test]
+    fn test_pack_invalid_format() {
+        assert!(str_pack("<i0", &[TValue::Integer(0)]).is_err());
+        assert!(str_pack("<i17", &[TValue::Integer(0)]).is_err()); // 超过 16
+        // !0 无效 (对齐为 0)
+        assert!(str_pack("!0", &[]).is_err());
+        // !3 单独不报错 (maxalign=3, 但没有需要对齐的选项)
+        // !3 i4 报错 (3 不是 2 的幂)
+        assert!(str_pack("!3 i4", &[TValue::Integer(0)]).is_err());
+    }
+
+    #[test]
+    fn test_pack_missing_argument() {
+        assert!(str_pack("<i1", &[]).is_err());
+        assert!(str_pack("<i1i1", &[TValue::Integer(1)]).is_err());
+    }
+
+    #[test]
+    fn test_unpack_data_too_short() {
+        assert!(str_unpack("<i4", &[0, 0, 0], 1).is_err());
+        assert!(str_unpack("<c5", &[1, 2, 3], 1).is_err());
+    }
+
+    #[test]
+    fn test_pack_string_too_long() {
+        let s = TValue::Str(crate::strings::LuaString::Short(
+            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: "hello".to_string() })
+        ));
+        // c3 容纳 3 字节, 但字符串有 5 字节
+        assert!(str_pack("<c3", &[s]).is_err());
+    }
+
+    // --- 无操作 (空格) ---
+
+    #[test]
+    fn test_pack_nop() {
+        // 空格是空操作
+        assert_pack_eq("<  i1", &[TValue::Integer(42)], &[42]);
+        assert_eq!(str_packsize("<  i1").unwrap(), 1);
+    }
+
+    // --- 复合格式 ---
+
+    #[test]
+    fn test_pack_complex_format() {
+        // 复合格式: i1 + c3 + i2
+        let s = TValue::Str(crate::strings::LuaString::Short(
+            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: "abc".to_string() })
+        ));
+        let result = str_pack("<i1c3i2", &[
+            TValue::Integer(1),
+            s,
+            TValue::Integer(2),
+        ]).unwrap();
+        assert_eq!(result, vec![1, b'a', b'b', b'c', 2, 0]);
+    }
+
+    #[test]
+    fn test_pack_unpack_complex_roundtrip() {
+        let s = TValue::Str(crate::strings::LuaString::Short(
+            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: "XY".to_string() })
+        ));
+        let fmt = "<i1c2i2d";
+        let args = vec![
+            TValue::Integer(42),
+            s.clone(),
+            TValue::Integer(1000),
+            TValue::Float(3.14),
+        ];
+        let packed = str_pack(fmt, &args).unwrap();
+        let (results, _) = str_unpack(fmt, &packed, 1).unwrap();
+        assert_eq!(results.len(), 4);
+        assert!(crate::vm::raw_equal(&results[0], &TValue::Integer(42)));
+        assert!(crate::vm::raw_equal(&results[1], &s));
+        assert!(crate::vm::raw_equal(&results[2], &TValue::Integer(1000)));
+        assert!(crate::vm::raw_equal(&results[3], &TValue::Float(3.14)));
+    }
+
+    // --- tpack.lua 关键测试场景 ---
+
+    #[test]
+    fn test_tpack_line99_scenario() {
+        // 模拟 tpack.lua:99 的场景
+        // lnum = 0x13121110090807060504030201 (溢出 i64, 使用 wrapping)
+        let lnum = 0x0807060504030201i64; // wrapping 后的低 64 位
+
+        for i in 1..=8usize {
+            let shift = (i * 8) as i64;
+            // n = lnum & (~(-1 << (i * 8)))
+            let mask = if shift >= 64 { -1i64 } else { !((-1i64) << shift) };
+            let n = lnum & mask;
+
+            let fmt = format!("<i{}", i);
+            let packed = str_pack(&fmt, &[TValue::Integer(n)]).unwrap();
+
+            // 验证打包结果长度
+            assert_eq!(packed.len(), i, "i={} pack length mismatch", i);
+
+            // 验证解包往返
+            let unpack_fmt = format!("<i{}", i);
+            let (results, _) = str_unpack(&unpack_fmt, &packed, 1).unwrap();
+            assert!(crate::vm::raw_equal(&results[0], &TValue::Integer(n)),
+                "i={} roundtrip mismatch: got {:?}, expected {}", i, results[0], n);
+        }
+    }
+
+    #[test]
+    fn test_tpack_reverse_endian() {
+        // 测试 tpack.lua 中的 s:reverse() 场景
+        let val = 0xAAi64;
+        for i in 1..=8usize {
+            let le_fmt = format!("<I{}", i);
+            let be_fmt = format!(">I{}", i);
+
+            let le_packed = str_pack(&le_fmt, &[TValue::Integer(val)]).unwrap();
+            let be_packed = str_pack(&be_fmt, &[TValue::Integer(val)]).unwrap();
+
+            // 大端结果应是小端结果的反转
+            let reversed: Vec<u8> = le_packed.iter().rev().copied().collect();
+            assert_eq!(be_packed, reversed, "i={} endian reverse mismatch", i);
+        }
     }
 }

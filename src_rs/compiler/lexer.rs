@@ -401,13 +401,17 @@ impl LexState {
                     // Hex integers that overflow i64 may fit in u64 (e.g., 0xFFFFFFFFFFFFFFFF = -1)
                     match u64::from_str_radix(s, 16) {
                         Ok(v) => self.token = Token::Int(v as i64),
-                        Err(_) => match s.parse::<f64>() {
-                            Ok(v) => self.token = Token::Float(v),
-                            Err(_) => {
-                                self.error(&format!("malformed number: {}", s));
-                                self.token = Token::Int(0);
+                        Err(_) => {
+                            // Hex integers that overflow u64: use wrapping arithmetic
+                            // (与 C 版本的 l_str2int 一致,对十六进制数不做溢出检查)
+                            let mut a: u64 = 0;
+                            for c in s.chars() {
+                                if let Some(d) = c.to_digit(16) {
+                                    a = a.wrapping_mul(16).wrapping_add(d as u64);
+                                }
                             }
-                        },
+                            self.token = Token::Int(a as i64);
+                        }
                     }
                 }
                 Err(_) => match s.parse::<f64>() {
