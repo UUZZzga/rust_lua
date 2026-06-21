@@ -1588,7 +1588,7 @@ mod tests {
 
     #[test]
     fn test_luastring_long() {
-        let long = LongString { hash: AtomicU64::new(0), extra: AtomicU8::new(0), contents: "a".repeat(100) };
+        let long = LongString { hash: AtomicU64::new(0), extra: AtomicU8::new(0), contents: "a".repeat(100), ptr_id: 0 };
         let ts = LuaString::Long(long);
         assert_eq!(ts.len(), 100);
         assert!(matches!(ts, LuaString::Long(_)));
@@ -1615,8 +1615,8 @@ mod tests {
         let ts3 = LuaString::Short(arc3);
         assert_ne!(ts1, ts3);
 
-        let long1 = LuaString::Long(LongString { hash: AtomicU64::new(0), extra: AtomicU8::new(0), contents: "test".into() });
-        let long2 = LuaString::Long(LongString { hash: AtomicU64::new(0), extra: AtomicU8::new(0), contents: "test".into() });
+        let long1 = LuaString::Long(LongString { hash: AtomicU64::new(0), extra: AtomicU8::new(0), contents: "test".into(), ptr_id: 0 });
+        let long2 = LuaString::Long(LongString { hash: AtomicU64::new(0), extra: AtomicU8::new(0), contents: "test".into(), ptr_id: 0 });
         assert_eq!(long1, long2);
     }
 

@@ -162,14 +162,29 @@ pub trait GCObject {
 // GCObjectHeader — 可嵌入的 GC 对象头部
 // ============================================================================
 
+/// 全局指针 ID 计数器 — 用于 %p 格式输出稳定的唯一标识符。
+/// 对应 C 实现中对象的堆地址。
+static PTR_ID_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+
+/// 分配一个新的唯一指针 ID（对应 C 中堆对象的地址）
+pub fn new_ptr_id() -> usize {
+    PTR_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
 #[derive(Debug, Clone)]
 pub struct GCObjectHeader {
     id: Cell<Option<GCObjectId>>,
+    /// 稳定的唯一标识符，用于 %p 格式输出。
+    /// 克隆时保留同一值（表示同一个对象）。
+    pub ptr_id: usize,
 }
 
 impl GCObjectHeader {
     pub fn new() -> Self {
-        GCObjectHeader { id: Cell::new(None) }
+        GCObjectHeader {
+            id: Cell::new(None),
+            ptr_id: new_ptr_id(),
+        }
     }
 
     pub fn id(&self) -> Option<GCObjectId> {

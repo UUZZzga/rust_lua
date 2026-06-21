@@ -1064,8 +1064,89 @@ fn apply_replacement(repl: &str, ms: &MatchState, s: usize, e: usize) -> Result<
 // string.format 实现 (对应 C 的 str_format)
 // ============================================================================
 
+/// 格式字符串最大长度 (对应 C 的 MAX_FORMAT)
+const MAX_FORMAT: usize = 32;
+
+/// 有效标志集合 (对应 C 的 L_FMTFLAGS*)
+const FMT_FLAGSF: &str = "-+#0 ";  // 浮点: a, A, e, E, f, g, G
+const FMT_FLAGSX: &str = "-#0";    // 十六进制: o, x, X
+const FMT_FLAGSI: &str = "-+0 ";   // 整数: d, i
+const FMT_FLAGSU: &str = "-0";     // 无符号: u
+const FMT_FLAGSC: &str = "-";      // 字符、指针、字符串: c, p, s
+
+/// 跳过最多 2 位数字 (对应 C 的 get2digits)
+fn get2digits(bytes: &[u8], mut idx: usize) -> usize {
+    if idx < bytes.len() && bytes[idx].is_ascii_digit() {
+        idx += 1;
+        if idx < bytes.len() && bytes[idx].is_ascii_digit() {
+            idx += 1;
+        }
+    }
+    idx
+}
+
+/// 检查格式说明是否有效 (对应 C 的 checkformat)
+/// form: 完整格式字符串 (从 '%' 开始到 specifier 结束)
+/// flags: 允许的标志集合
+/// allow_precision: 是否允许精度
+fn check_format(form: &str, flags: &str, allow_precision: bool) -> Result<(), String> {
+    let bytes = form.as_bytes();
+    let mut idx = 1; // skip '%'
+
+    // 跳过 flags
+    while idx < bytes.len() && flags.as_bytes().contains(&bytes[idx]) {
+        idx += 1;
+    }
+
+    // 如果下一个字符不是 '0'，跳过 width (最多2位数字)
+    // (C: a width cannot start with '0')
+    if idx < bytes.len() && bytes[idx] != b'0' {
+        idx = get2digits(bytes, idx);
+        // 如果遇到 '.' 且允许精度，跳过精度
+        if idx < bytes.len() && bytes[idx] == b'.' && allow_precision {
+            idx += 1;
+            idx = get2digits(bytes, idx);
+        }
+    }
+
+    // 检查是否到达说明符 (字母字符)
+    if idx >= bytes.len() || !bytes[idx].is_ascii_alphabetic() {
+        return Err(format!("invalid conversion specification: '{}'", form));
+    }
+    Ok(())
+}
+
+/// 将 Rust 的指数格式转换为 C 的指数格式
+/// Rust: "1e2" 或 "1E2" (指数不带前导零和符号)
+/// C:    "1e+02" 或 "1E+02" (指数至少 2 位，带符号)
+fn format_exponent_c(s: String) -> String {
+    // 找到 e/E 的位置
+    if let Some(e_pos) = s.find(|c: char| c == 'e' || c == 'E') {
+        let mantissa = &s[..e_pos];
+        let e_char = &s[e_pos..e_pos + 1];
+        let exp_str = &s[e_pos + 1..];
+        // 解析指数部分
+        let (sign, digits) = if exp_str.starts_with('-') {
+            ("-", &exp_str[1..])
+        } else if exp_str.starts_with('+') {
+            ("+", &exp_str[1..])
+        } else {
+            ("+", exp_str)
+        };
+        // 指数至少 2 位，前导零
+        let digits = if digits.len() < 2 {
+            format!("0{}", digits)
+        } else {
+            digits.to_string()
+        };
+        format!("{}{}{}{}", mantissa, e_char, sign, digits)
+    } else {
+        s
+    }
+}
+
 /// string.format(fmt, ...) — 格式化字符串
-/// 对应 C 的 str_format (简化版，支持常用格式)
+/// 对应 C 的 str_format
 pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
     let fmt_bytes = fmt.as_bytes();
     let mut result = String::new();
@@ -1088,19 +1169,42 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
             continue;
         }
 
+        // 保存格式字符串起始位置 (包括 '%')
+        let form_start = i - 1;
+
+        // 先检查格式长度 (对应 C 的 getformat 中的长度检查)
+        // 避免解析超大宽度/精度时溢出
+        {
+            let mut scan_idx = i;
+            // 跳过 flags (L_FMTFLAGSF = "-+#0 ")
+            while scan_idx < fmt_bytes.len() && b"-+ 0#".contains(&fmt_bytes[scan_idx]) {
+                scan_idx += 1;
+            }
+            // 跳过 width 和 precision (数字和 '.')
+            while scan_idx < fmt_bytes.len() && (fmt_bytes[scan_idx].is_ascii_digit() || fmt_bytes[scan_idx] == b'.') {
+                scan_idx += 1;
+            }
+            // scan_idx 现在指向 specifier
+            let form_len = scan_idx - form_start + 1; // 包括 '%' 和 specifier
+            if form_len >= MAX_FORMAT - 9 {
+                return Err("invalid format (too long)".to_string());
+            }
+        }
+
         // 解析格式说明符: flags, width, precision
-        let fmt_start = i;
-        // 解析 flags
+        // flags: 对应 C 的 L_FMTFLAGSF "-+#0 "
         let mut left_align = false;
         let mut plus_sign = false;
         let mut space_sign = false;
         let mut zero_pad = false;
-        while i < fmt_bytes.len() && b"-+ 0".contains(&fmt_bytes[i]) {
+        let mut alt_form = false;  // # 标志
+        while i < fmt_bytes.len() && b"-+ 0#".contains(&fmt_bytes[i]) {
             match fmt_bytes[i] {
                 b'-' => left_align = true,
                 b'+' => plus_sign = true,
                 b' ' => space_sign = true,
                 b'0' => zero_pad = true,
+                b'#' => alt_form = true,
                 _ => {}
             }
             i += 1;
@@ -1108,7 +1212,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
         // 解析 width
         let mut width: usize = 0;
         while i < fmt_bytes.len() && fmt_bytes[i].is_ascii_digit() {
-            width = width * 10 + (fmt_bytes[i] - b'0') as usize;
+            width = width.saturating_mul(10).saturating_add((fmt_bytes[i] - b'0') as usize);
             i += 1;
         }
         // 解析 precision
@@ -1117,7 +1221,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
             i += 1;
             let mut prec: usize = 0;
             while i < fmt_bytes.len() && fmt_bytes[i].is_ascii_digit() {
-                prec = prec * 10 + (fmt_bytes[i] - b'0') as usize;
+                prec = prec.saturating_mul(10).saturating_add((fmt_bytes[i] - b'0') as usize);
                 i += 1;
             }
             precision = Some(prec);
@@ -1127,8 +1231,16 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
         }
 
         let spec = fmt_bytes[i];
-        let _ = fmt_start; // 保留用于调试
         i += 1;
+
+        // 获取完整的格式字符串 (从 '%' 到 specifier)
+        let form = std::str::from_utf8(&fmt_bytes[form_start..i])
+            .unwrap_or("%");
+
+        // 检查格式长度 (对应 C 的 getformat 中的长度检查)
+        if form.len() >= MAX_FORMAT - 9 {
+            return Err("invalid format (too long)".to_string());
+        }
 
         if arg_idx >= args.len() {
             return Err(format!("bad argument #{} to 'format' (no value)", arg_idx + 2));
@@ -1152,88 +1264,359 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
 
         match spec {
             b'd' | b'i' => {
+                check_format(form, FMT_FLAGSI, true)?;
                 let n = arg.as_integer()
                     .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
-                let mut s = if n < 0 {
-                    n.to_string()
-                } else if plus_sign {
-                    format!("+{}", n)
-                } else if space_sign {
-                    format!(" {}", n)
+                // 处理符号
+                let neg = n < 0;
+                let abs_n: u64 = if neg {
+                    ((n as i128).unsigned_abs()) as u64
                 } else {
-                    n.to_string()
+                    n as u64
                 };
-                if zero_pad && width > s.len() {
-                    let pad = width - s.len();
-                    if n < 0 {
-                        s = format!("-{}{}", "0".repeat(pad), s[1..].to_string());
-                    } else if plus_sign {
-                        s = format!("+{}{}", "0".repeat(pad), s[1..].to_string());
-                    } else if space_sign {
-                        s = format!(" {}{}", "0".repeat(pad), s[1..].to_string());
+                let mut digits = abs_n.to_string();
+                // 处理精度: 精度表示至少输出的数字位数
+                if let Some(p) = precision {
+                    if p == 0 && n == 0 {
+                        digits.clear();
+                    } else if p > digits.len() {
+                        digits = format!("{}{}", "0".repeat(p - digits.len()), digits);
+                    }
+                }
+                // 符号字符串
+                let sign_str = if neg { "-" }
+                    else if plus_sign { "+" }
+                    else if space_sign { " " }
+                    else { "" };
+                // 处理宽度
+                let content_len = sign_str.len() + digits.len();
+                if width > content_len {
+                    let pad = width - content_len;
+                    if left_align {
+                        result.push_str(sign_str);
+                        result.push_str(&digits);
+                        result.push_str(&" ".repeat(pad));
+                    } else if zero_pad && precision.is_none() {
+                        // 零填充在符号之后 (精度会覆盖 0 标志)
+                        result.push_str(sign_str);
+                        result.push_str(&"0".repeat(pad));
+                        result.push_str(&digits);
                     } else {
-                        s = format!("{}{}", "0".repeat(pad), s);
+                        result.push_str(&" ".repeat(pad));
+                        result.push_str(sign_str);
+                        result.push_str(&digits);
                     }
                 } else {
-                    s = apply_width(s);
+                    result.push_str(sign_str);
+                    result.push_str(&digits);
                 }
-                result.push_str(&s);
             }
             b'u' => {
+                check_format(form, FMT_FLAGSU, true)?;
                 let n = arg.as_integer()
                     .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
-                let s = (n as u64).to_string();
-                result.push_str(&apply_width(s));
+                let mut digits = (n as u64).to_string();
+                // 处理精度
+                if let Some(p) = precision {
+                    if p == 0 && n == 0 {
+                        digits.clear();
+                    } else if p > digits.len() {
+                        digits = format!("{}{}", "0".repeat(p - digits.len()), digits);
+                    }
+                }
+                // 处理宽度
+                if width > digits.len() {
+                    let pad = width - digits.len();
+                    if left_align {
+                        result.push_str(&digits);
+                        result.push_str(&" ".repeat(pad));
+                    } else if zero_pad && precision.is_none() {
+                        result.push_str(&"0".repeat(pad));
+                        result.push_str(&digits);
+                    } else {
+                        result.push_str(&" ".repeat(pad));
+                        result.push_str(&digits);
+                    }
+                } else {
+                    result.push_str(&digits);
+                }
             }
             b'o' => {
+                check_format(form, FMT_FLAGSX, true)?;
                 let n = arg.as_integer()
                     .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
-                let s = format!("{:o}", n as u64);
-                result.push_str(&apply_width(s));
+                let mut digits = format!("{:o}", n as u64);
+                // 处理精度 (默认精度为 1)
+                let prec = precision.unwrap_or(1);
+                if prec == 0 && n == 0 {
+                    digits.clear();
+                } else if prec > digits.len() {
+                    digits = format!("{}{}", "0".repeat(prec - digits.len()), digits);
+                }
+                // # 标志: 确保以 0 开头
+                if alt_form && !digits.starts_with('0') {
+                    digits = format!("0{}", digits);
+                }
+                // 处理宽度
+                if width > digits.len() {
+                    let pad = width - digits.len();
+                    if left_align {
+                        result.push_str(&digits);
+                        result.push_str(&" ".repeat(pad));
+                    } else if zero_pad && precision.is_none() {
+                        result.push_str(&"0".repeat(pad));
+                        result.push_str(&digits);
+                    } else {
+                        result.push_str(&" ".repeat(pad));
+                        result.push_str(&digits);
+                    }
+                } else {
+                    result.push_str(&digits);
+                }
             }
             b'x' => {
+                check_format(form, FMT_FLAGSX, true)?;
                 let n = arg.as_integer()
                     .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
-                let s = format!("{:x}", n as u64);
-                result.push_str(&apply_width(s));
+                let mut digits = format!("{:x}", n as u64);
+                // 处理精度 (默认精度为 1)
+                let prec = precision.unwrap_or(1);
+                if prec == 0 && n == 0 {
+                    digits.clear();
+                } else if prec > digits.len() {
+                    digits = format!("{}{}", "0".repeat(prec - digits.len()), digits);
+                }
+                // # 标志: 添加 "0x" 前缀 (当值不为 0 时)
+                let prefix = if alt_form && n != 0 { "0x" } else { "" };
+                // 处理宽度
+                let content_len = prefix.len() + digits.len();
+                if width > content_len {
+                    let pad = width - content_len;
+                    if left_align {
+                        result.push_str(prefix);
+                        result.push_str(&digits);
+                        result.push_str(&" ".repeat(pad));
+                    } else if zero_pad && precision.is_none() {
+                        result.push_str(prefix);
+                        result.push_str(&"0".repeat(pad));
+                        result.push_str(&digits);
+                    } else {
+                        result.push_str(&" ".repeat(pad));
+                        result.push_str(prefix);
+                        result.push_str(&digits);
+                    }
+                } else {
+                    result.push_str(prefix);
+                    result.push_str(&digits);
+                }
             }
             b'X' => {
+                check_format(form, FMT_FLAGSX, true)?;
                 let n = arg.as_integer()
                     .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
-                let s = format!("{:X}", n as u64);
-                result.push_str(&apply_width(s));
+                let mut digits = format!("{:X}", n as u64);
+                // 处理精度 (默认精度为 1)
+                let prec = precision.unwrap_or(1);
+                if prec == 0 && n == 0 {
+                    digits.clear();
+                } else if prec > digits.len() {
+                    digits = format!("{}{}", "0".repeat(prec - digits.len()), digits);
+                }
+                // # 标志: 添加 "0X" 前缀 (当值不为 0 时)
+                let prefix = if alt_form && n != 0 { "0X" } else { "" };
+                // 处理宽度
+                let content_len = prefix.len() + digits.len();
+                if width > content_len {
+                    let pad = width - content_len;
+                    if left_align {
+                        result.push_str(prefix);
+                        result.push_str(&digits);
+                        result.push_str(&" ".repeat(pad));
+                    } else if zero_pad && precision.is_none() {
+                        result.push_str(prefix);
+                        result.push_str(&"0".repeat(pad));
+                        result.push_str(&digits);
+                    } else {
+                        result.push_str(&" ".repeat(pad));
+                        result.push_str(prefix);
+                        result.push_str(&digits);
+                    }
+                } else {
+                    result.push_str(prefix);
+                    result.push_str(&digits);
+                }
             }
             b'c' => {
+                check_format(form, FMT_FLAGSC, false)?;
                 let n = arg.as_integer()
                     .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
                 if n < 0 || n > 255 {
                     return Err("value out of range".to_string());
                 }
-                result.push(n as u8 as char);
+                // 对应 C 的 sprintf %c: 输出单字节（非 UTF-8 编码）
+                let c = n as u8;
+                // 处理宽度
+                if width > 1 {
+                    let pad = width - 1;
+                    if left_align {
+                        unsafe { result.as_mut_vec().push(c); }
+                        result.push_str(&" ".repeat(pad));
+                    } else {
+                        result.push_str(&" ".repeat(pad));
+                        unsafe { result.as_mut_vec().push(c); }
+                    }
+                } else {
+                    unsafe { result.as_mut_vec().push(c); }
+                }
             }
-            b'f' | b'F' => {
+            b'a' | b'A' => {
+                check_format(form, FMT_FLAGSF, true)?;
+                // %a %A 十六进制浮点格式未实现
+                return Err(format!("invalid conversion '%{}' to 'format'", spec as char));
+            }
+            b'f' => {
+                check_format(form, FMT_FLAGSF, true)?;
                 let n = arg.as_float()
                     .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
-                let s = match precision {
-                    Some(p) => format!("{:.*}", p, n),
-                    None => format!("{}", n),
+                let p = precision.unwrap_or(6);  // 默认精度为 6
+                let mut s = format!("{:.*}", p, n);
+                // # 标志: 总是显示小数点
+                if alt_form && !s.contains('.') {
+                    s.push('.');
+                }
+                // 添加正号或空格
+                if n >= 0.0 && !s.starts_with('-') {
+                    if plus_sign {
+                        s = format!("+{}", s);
+                    } else if space_sign {
+                        s = format!(" {}", s);
+                    }
+                }
+                // 处理宽度
+                if width > s.len() {
+                    let pad = width - s.len();
+                    if left_align {
+                        s = format!("{}{}", s, " ".repeat(pad));
+                    } else if zero_pad {
+                        // 零填充在符号之后
+                        if s.starts_with('-') {
+                            s = format!("-{}{}", "0".repeat(pad), &s[1..]);
+                        } else if s.starts_with('+') {
+                            s = format!("+{}{}", "0".repeat(pad), &s[1..]);
+                        } else if s.starts_with(' ') {
+                            s = format!(" {}{}", "0".repeat(pad), &s[1..]);
+                        } else {
+                            s = format!("{}{}", "0".repeat(pad), s);
+                        }
+                    } else {
+                        s = format!("{}{}", " ".repeat(pad), s);
+                    }
+                }
+                result.push_str(&s);
+            }
+            b'e' | b'E' | b'g' | b'G' => {
+                check_format(form, FMT_FLAGSF, true)?;
+                let n = arg.as_float()
+                    .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
+                let p = precision.unwrap_or(6);  // 默认精度为 6
+                let mut s = match spec {
+                    b'e' | b'E' => {
+                        // %e/%E: 科学计数法，指数至少 2 位，带符号
+                        let uppercase = spec == b'E';
+                        let raw = if uppercase {
+                            format!("{:.*E}", p, n)
+                        } else {
+                            format!("{:.*e}", p, n)
+                        };
+                        // 转换指数部分为 C 格式 (1e2 -> 1e+02)
+                        format_exponent_c(raw)
+                    }
+                    b'g' | b'G' => {
+                        // %g/%G: 根据值的大小决定使用 %e/%E 还是 %f 格式
+                        // 精度表示有效数字位数
+                        let p = if p == 0 { 1 } else { p };
+                        let uppercase = spec == b'G';
+                        if n == 0.0 || n.is_nan() || n.is_infinite() {
+                            // 特殊值
+                            if n == 0.0 {
+                                "0".to_string()
+                            } else if n.is_nan() {
+                                "nan".to_string()
+                            } else if n > 0.0 {
+                                "inf".to_string()
+                            } else {
+                                "-inf".to_string()
+                            }
+                        } else {
+                            let exp = n.abs().log10().floor() as i32;
+                            if exp < -4 || exp >= p as i32 {
+                                // 使用 %e/%E 格式
+                                let raw = if uppercase {
+                                    format!("{:.*E}", p - 1, n)
+                                } else {
+                                    format!("{:.*e}", p - 1, n)
+                                };
+                                let mut s = format_exponent_c(raw);
+                                // 去除尾随零 (除非有 # 标志)
+                                if !alt_form && s.contains('.') {
+                                    // 找到 e/E 的位置
+                                    let e_pos = s.find(|c: char| c == 'e' || c == 'E').unwrap();
+                                    let mantissa = &s[..e_pos];
+                                    let exp_part = &s[e_pos..];
+                                    let mantissa = mantissa.trim_end_matches('0');
+                                    let mantissa = mantissa.trim_end_matches('.');
+                                    s = format!("{}{}", mantissa, exp_part);
+                                }
+                                s
+                            } else {
+                                // 使用 %f 格式
+                                let decimal_places = ((p as i32 - 1 - exp).max(0)) as usize;
+                                let mut s = format!("{:.*}", decimal_places, n);
+                                // 去除尾随零 (除非有 # 标志)
+                                if !alt_form && s.contains('.') {
+                                    s = s.trim_end_matches('0').to_string();
+                                    s = s.trim_end_matches('.').to_string();
+                                }
+                                s
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
                 };
-                result.push_str(&apply_width(s));
-            }
-            b'e' | b'E' => {
-                let n = arg.as_float()
-                    .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
-                let s = match precision {
-                    Some(p) => format!("{:.*e}", p, n),
-                    None => format!("{:e}", n),
-                };
-                result.push_str(&apply_width(s));
-            }
-            b'g' | b'G' => {
-                let n = arg.as_float()
-                    .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
-                let s = format!("{}", n);
-                result.push_str(&apply_width(s));
+                // # 标志: 总是显示小数点 (对于 %e/%E)
+                if alt_form && (spec == b'e' || spec == b'E') && !s.contains('.') {
+                    if let Some(pos) = s.find('e').or_else(|| s.find('E')) {
+                        s.insert(pos, '.');
+                    }
+                }
+                // 添加正号或空格
+                if n >= 0.0 && !s.starts_with('-') {
+                    if plus_sign {
+                        s = format!("+{}", s);
+                    } else if space_sign {
+                        s = format!(" {}", s);
+                    }
+                }
+                // 处理宽度
+                if width > s.len() {
+                    let pad = width - s.len();
+                    if left_align {
+                        s = format!("{}{}", s, " ".repeat(pad));
+                    } else if zero_pad {
+                        if s.starts_with('-') {
+                            s = format!("-{}{}", "0".repeat(pad), &s[1..]);
+                        } else if s.starts_with('+') {
+                            s = format!("+{}{}", "0".repeat(pad), &s[1..]);
+                        } else if s.starts_with(' ') {
+                            s = format!(" {}{}", "0".repeat(pad), &s[1..]);
+                        } else {
+                            s = format!("{}{}", "0".repeat(pad), s);
+                        }
+                    } else {
+                        s = format!("{}{}", " ".repeat(pad), s);
+                    }
+                }
+                result.push_str(&s);
             }
             b's' => {
                 let s = match arg {
@@ -1248,14 +1631,37 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                     TValue::Boolean(b) => b.to_string(),
                     _ => return Err(format!("bad argument #{} to 'format' (no proper format)", arg_idx)),
                 };
-                // 应用精度 (截断)
-                let truncated = match precision {
-                    Some(p) if p < s.len() => s[..p].to_string(),
-                    _ => s,
-                };
-                result.push_str(&apply_width(truncated));
+                // 对应 C: 如果有修饰符 (width/precision/flags)，检查字符串是否包含零字节
+                let has_modifiers = width > 0 || precision.is_some() ||
+                    left_align || plus_sign || space_sign || zero_pad || alt_form;
+                if has_modifiers {
+                    // C: checkformat(L, form, L_FMTFLAGSC, 1)
+                    check_format(form, FMT_FLAGSC, true)?;
+                    // C: luaL_argcheck(L, l == strlen(s), arg, "string contains zeros")
+                    if s.as_bytes().contains(&0) {
+                        return Err(format!("bad argument #{} to 'format' (string contains zeros)", arg_idx));
+                    }
+                    // C: 如果没有精度且字符串长度 >= 100，保持原样不格式化
+                    if precision.is_none() && s.len() >= 100 {
+                        result.push_str(&s);
+                    } else {
+                        // 应用精度 (截断)
+                        let truncated = match precision {
+                            Some(p) if p < s.len() => s[..p].to_string(),
+                            _ => s,
+                        };
+                        result.push_str(&apply_width(truncated));
+                    }
+                } else {
+                    // 无修饰符: 保持整个字符串
+                    result.push_str(&s);
+                }
             }
             b'q' => {
+                // q 不能有修饰符 (对应 C: if (form[2] != '\0'))
+                if form.len() > 2 {  // "%q" 长度为 2
+                    return Err("specifier '%%q' cannot have modifiers".to_string());
+                }
                 // 引用字符串/字面量 — 对应 C 的 addliteral
                 // 字符串:加引号并转义
                 // 数字:直接输出(整数用十进制,浮点用十六进制 %a 格式)
@@ -1319,30 +1725,42 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                 }
             }
             b'p' => {
+                // C: checkformat(L, form, L_FMTFLAGSC, 0)
+                check_format(form, FMT_FLAGSC, false)?;
                 // 指针格式 — 对应 C 的 lua_topointer
                 // 对于 nil、boolean、number:返回 "(null)"
-                // 对于 table、function、userdata、thread、string:返回指针地址
+                // 对于 table、function、userdata、thread、string:返回唯一标识符
+                // 使用 GCObjectHeader::ptr_id 作为稳定标识符（对应 C 中堆对象的地址）
                 let p_str = match arg {
                     TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_) => {
                         "(null)".to_string()
                     }
                     TValue::Str(s) => {
-                        let ptr = s.as_str().as_ptr() as usize;
-                        format!("0x{:x}", ptr)
+                        match s {
+                            crate::strings::LuaString::Short(arc) => {
+                                // 短字符串：使用 Arc 的指针地址（内部化保证同一内容同一 Arc）
+                                let ptr = std::sync::Arc::as_ptr(arc) as usize;
+                                format!("0x{:x}", ptr)
+                            }
+                            crate::strings::LuaString::Long(ls) => {
+                                // 长字符串：使用 ptr_id（每个实例唯一，克隆保留同一值）
+                                format!("0x{:x}", ls.ptr_id)
+                            }
+                        }
                     }
                     TValue::Table(t) => {
-                        let ptr = t as *const crate::table::Table as usize;
-                        format!("0x{:x}", ptr)
+                        format!("0x{:x}", t.gc_header.ptr_id)
                     }
                     TValue::LClosure(l) => {
-                        let ptr = l as *const _ as usize;
-                        format!("0x{:x}", ptr)
+                        format!("0x{:x}", l.gc_header.ptr_id)
                     }
                     TValue::CClosure(c) => {
+                        // CClosure 没有 gc_header，使用结构体地址
                         let ptr = c as *const _ as usize;
                         format!("0x{:x}", ptr)
                     }
                     TValue::LCFn(f) => {
+                        // 轻量 C 函数：使用函数指针地址
                         let ptr = f as *const _ as usize;
                         format!("0x{:x}", ptr)
                     }
@@ -3888,5 +4306,278 @@ mod tests {
             let reversed: Vec<u8> = le_packed.iter().rev().copied().collect();
             assert_eq!(be_packed, reversed, "i={} endian reverse mismatch", i);
         }
+    }
+
+    // ========================================================================
+    // string.format 格式验证测试 (对应 C 的 checkformat)
+    // ========================================================================
+
+    #[test]
+    fn test_format_hash_flag_octal() {
+        // %#12o: # 标志，八进制，宽度 12
+        assert_eq!(
+            str_format("%#12o", &[TValue::Integer(10)]).unwrap(),
+            "         012"
+        );
+    }
+
+    #[test]
+    fn test_format_hash_flag_hex_lower() {
+        // %#10x: # 标志，十六进制小写，宽度 10
+        assert_eq!(
+            str_format("%#10x", &[TValue::Integer(100)]).unwrap(),
+            "      0x64"
+        );
+    }
+
+    #[test]
+    fn test_format_hash_flag_hex_upper() {
+        // %#-17X: # 标志，十六进制大写，左对齐，宽度 17
+        assert_eq!(
+            str_format("%#-17X", &[TValue::Integer(100)]).unwrap(),
+            "0X64             "
+        );
+    }
+
+    #[test]
+    fn test_format_zero_pad_integer() {
+        // %013i: 零填充，宽度 13
+        assert_eq!(
+            str_format("%013i", &[TValue::Integer(-100)]).unwrap(),
+            "-000000000100"
+        );
+    }
+
+    #[test]
+    fn test_format_precision_integer() {
+        // %2.5d: 宽度 2，精度 5
+        assert_eq!(
+            str_format("%2.5d", &[TValue::Integer(-100)]).unwrap(),
+            "-00100"
+        );
+    }
+
+    #[test]
+    fn test_format_precision_zero_unsigned() {
+        // %.u: 精度 0，值为 0
+        assert_eq!(
+            str_format("%.u", &[TValue::Integer(0)]).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_format_hash_flag_float() {
+        // %+#014.0f: + 和 # 和 0 标志，宽度 14，精度 0
+        assert_eq!(
+            str_format("%+#014.0f", &[TValue::Float(100.0)]).unwrap(),
+            "+000000000100."
+        );
+    }
+
+    #[test]
+    fn test_format_left_align_char() {
+        // %-16c: 左对齐，宽度 16
+        assert_eq!(
+            str_format("%-16c", &[TValue::Integer(97)]).unwrap(),
+            "a               "
+        );
+    }
+
+    #[test]
+    fn test_format_plus_g_uppercase() {
+        // %+.3G: + 标志，精度 3，%G 格式
+        assert_eq!(
+            str_format("%+.3G", &[TValue::Float(1.5)]).unwrap(),
+            "+1.5"
+        );
+    }
+
+    #[test]
+    fn test_format_precision_zero_string() {
+        // %.0s: 精度 0，字符串
+        assert_eq!(
+            str_format("%.0s", &[TValue::Integer(0)]).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_format_precision_empty_string() {
+        // %.s: 精度 0 (等同 .0s)
+        assert_eq!(
+            str_format("%.s", &[TValue::Integer(0)]).unwrap(),
+            ""
+        );
+    }
+
+    #[test]
+    fn test_format_exponent_uppercase() {
+        // % 1.0E: 空格标志，宽度 1，精度 0，%E 格式
+        let result = str_format("% 1.0E", &[TValue::Float(100.0)]).unwrap();
+        assert!(result.starts_with(" 1E+"));
+    }
+
+    #[test]
+    fn test_format_invalid_conversion_too_long_width() {
+        // %100.3d: 宽度 3 位数字 (get2digits 只允许 2 位)
+        assert!(str_format("%100.3d", &[TValue::Integer(10)]).is_err());
+    }
+
+    #[test]
+    fn test_format_invalid_conversion_too_long_precision() {
+        // %1.100d: 精度 3 位数字
+        assert!(str_format("%1.100d", &[TValue::Integer(10)]).is_err());
+    }
+
+    #[test]
+    fn test_format_invalid_conversion_unknown_specifier() {
+        // %t: 未知说明符
+        assert!(str_format("%t", &[TValue::Integer(10)]).is_err());
+    }
+
+    #[test]
+    fn test_format_invalid_conversion_zero_flag_char() {
+        // %010c: c 不允许 0 标志
+        assert!(str_format("%010c", &[TValue::Integer(10)]).is_err());
+    }
+
+    #[test]
+    fn test_format_invalid_conversion_precision_char() {
+        // %.10c: c 不允许精度
+        assert!(str_format("%.10c", &[TValue::Integer(10)]).is_err());
+    }
+
+    #[test]
+    fn test_format_invalid_conversion_zero_flag_string() {
+        // %0.34s: s 的 0 标志无效 (L_FMTFLAGSC = "-")
+        assert!(str_format("%0.34s", &[TValue::Integer(10)]).is_err());
+    }
+
+    #[test]
+    fn test_format_invalid_conversion_hash_flag_integer() {
+        // %#i: i 不允许 # 标志
+        assert!(str_format("%#i", &[TValue::Integer(10)]).is_err());
+    }
+
+    #[test]
+    fn test_format_invalid_conversion_precision_pointer() {
+        // %3.1p: p 不允许精度
+        assert!(str_format("%3.1p", &[TValue::Integer(10)]).is_err());
+    }
+
+    #[test]
+    fn test_format_invalid_conversion_zero_dot_string() {
+        // %0.s: s 的 0 标志无效
+        assert!(str_format("%0.s", &[TValue::Integer(10)]).is_err());
+    }
+
+    #[test]
+    fn test_format_q_cannot_have_modifiers() {
+        // %10q: q 不能有修饰符
+        assert!(str_format("%10q", &[TValue::Integer(10)]).is_err());
+    }
+
+    #[test]
+    fn test_format_invalid_conversion_uppercase_f() {
+        // %F: 无效说明符 (不在 C89 中)
+        assert!(str_format("%F", &[TValue::Integer(10)]).is_err());
+    }
+
+    #[test]
+    fn test_format_no_value() {
+        // %d %d: 参数不足
+        assert!(str_format("%d %d", &[TValue::Integer(10)]).is_err());
+    }
+
+    #[test]
+    fn test_format_too_long_format() {
+        // 格式字符串太长
+        let aux = "0".repeat(600);
+        let fmt = format!("%{}d", aux);
+        assert!(str_format(&fmt, &[TValue::Integer(10)]).is_err());
+    }
+
+    #[test]
+    fn test_format_hash_flag_octal_zero() {
+        // %#o: # 标志，八进制，值为 0
+        assert_eq!(
+            str_format("%#o", &[TValue::Integer(0)]).unwrap(),
+            "0"
+        );
+    }
+
+    #[test]
+    fn test_format_hash_flag_hex_zero() {
+        // %#x: # 标志，十六进制，值为 0 (不添加 0x 前缀)
+        assert_eq!(
+            str_format("%#x", &[TValue::Integer(0)]).unwrap(),
+            "0"
+        );
+    }
+
+    #[test]
+    fn test_format_simple_integer() {
+        assert_eq!(
+            str_format("%d", &[TValue::Integer(42)]).unwrap(),
+            "42"
+        );
+    }
+
+    #[test]
+    fn test_format_simple_string() {
+        assert_eq!(
+            str_format("%s", &[TValue::Integer(42)]).unwrap(),
+            "42"
+        );
+    }
+
+    #[test]
+    fn test_format_escape_percent() {
+        assert_eq!(
+            str_format("%%d", &[TValue::Integer(10)]).unwrap(),
+            "%d"
+        );
+    }
+
+    #[test]
+    fn test_format_plus_sign_integer() {
+        assert_eq!(
+            str_format("%+08d", &[TValue::Integer(31501)]).unwrap(),
+            "+0031501"
+        );
+    }
+
+    #[test]
+    fn test_format_plus_sign_negative_integer() {
+        assert_eq!(
+            str_format("%+08d", &[TValue::Integer(-30927)]).unwrap(),
+            "-0030927"
+        );
+    }
+
+    #[test]
+    fn test_format_hex_uppercase() {
+        assert_eq!(
+            str_format("%08X", &[TValue::Integer(0xFFFFFFFF)]).unwrap(),
+            "FFFFFFFF"
+        );
+    }
+
+    #[test]
+    fn test_format_hex_float() {
+        // 0.0 应该输出 "0"
+        assert_eq!(
+            str_format("%x", &[TValue::Float(0.0)]).unwrap(),
+            "0"
+        );
+    }
+
+    #[test]
+    fn test_format_octal_value() {
+        assert_eq!(
+            str_format("%o", &[TValue::Integer(0xABCD)]).unwrap(),
+            "125715"
+        );
     }
 }

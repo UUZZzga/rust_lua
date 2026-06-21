@@ -59,6 +59,9 @@ pub struct LongString {
     pub hash: AtomicU64,
     pub extra: AtomicU8,
     pub contents: String,
+    /// 稳定的唯一标识符，用于 %p 格式输出。
+    /// 克隆时保留同一值（表示同一个字符串实例）。
+    pub ptr_id: usize,
 }
 
 impl Clone for LongString {
@@ -67,6 +70,7 @@ impl Clone for LongString {
             hash: AtomicU64::new(self.hash.load(Ordering::Relaxed)),
             extra: AtomicU8::new(self.extra.load(Ordering::Relaxed)),
             contents: self.contents.clone(),
+            ptr_id: self.ptr_id,
         }
     }
 }
@@ -302,6 +306,7 @@ pub fn new_long_str(str: &str) -> LuaString {
         hash: AtomicU64::new(0),
         extra: AtomicU8::new(0),
         contents: str.to_string(),
+        ptr_id: crate::gc::new_ptr_id(),
     })
 }
 
@@ -572,6 +577,7 @@ mod tests {
             hash: AtomicU64::new(0),
             extra: AtomicU8::new(0),
             contents: "hello".to_string(),
+            ptr_id: 0,
         });
         assert!(!eq_str(&short, &long), "不同类型（短 vs 长）必须不等");
     }
@@ -624,6 +630,7 @@ mod tests {
             hash: AtomicU64::new(123),
             extra: AtomicU8::new(0),
             contents: "a".repeat(50),
+            ptr_id: 0,
         };
         let hash = ensure_long_hash(&mut ls);
         assert_eq!(ls.extra.load(Ordering::Relaxed), 1, "extra 应为 1（标记已计算哈希）");
@@ -636,6 +643,7 @@ mod tests {
             hash: AtomicU64::new(0),
             extra: AtomicU8::new(1),
             contents: "a".repeat(50),
+            ptr_id: 0,
         };
         let hash_before = ls.hash.load(Ordering::Relaxed);
         let hash = ensure_long_hash(&mut ls);
@@ -917,11 +925,13 @@ mod tests {
             hash: AtomicU64::new(0),
             extra: AtomicU8::new(0),
             contents: content.clone(),
+            ptr_id: 0,
         });
         let mut ls = LongString {
             hash: AtomicU64::new(0),
             extra: AtomicU8::new(0),
             contents: content.clone(),
+            ptr_id: 0,
         };
         ensure_long_hash(&mut ls);
         let hashed = LuaString::Long(ls);
@@ -945,11 +955,13 @@ mod tests {
             hash: AtomicU64::new(0),
             extra: AtomicU8::new(0),
             contents: "hello".to_string(),
+            ptr_id: 0,
         });
         let ls2 = LuaString::Long(LongString {
             hash: AtomicU64::new(h),
             extra: AtomicU8::new(1),
             contents: "hello".to_string(),
+            ptr_id: 0,
         });
 
         assert_eq!(hash_one(&ls1), hash_one(&ls2),
@@ -1003,11 +1015,13 @@ mod tests {
             hash: AtomicU64::new(0),
             extra: AtomicU8::new(0),
             contents: content.clone(),
+            ptr_id: 0,
         };
         let mut b = LongString {
             hash: AtomicU64::new(0),
             extra: AtomicU8::new(0),
             contents: content.clone(),
+            ptr_id: 0,
         };
 
         let h0 = ensure_long_hash(&mut a);
