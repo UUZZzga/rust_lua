@@ -324,6 +324,7 @@ mod tests {
             last_traceback: String::new(),
             last_error_msg: String::new(),
             last_c_function: None,
+            math_random_state: None,
         }
     }
 

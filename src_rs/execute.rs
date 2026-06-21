@@ -415,12 +415,16 @@ impl VmExecutor {
                                 state, ra + 3, nargs, nresults,
                             )
                         } else if crate::stdlib::base_lib::is_base_tag(tag_val) {
-                            crate::stdlib::base_lib::call_base_function(
-                                tag_val, state, ra + 3, nargs, nresults,
-                            )
-                        } else {
-                            Ok(())
-                        };
+                    crate::stdlib::base_lib::call_base_function(
+                        tag_val, state, ra + 3, nargs, nresults,
+                    )
+                } else if crate::stdlib::math_lib::is_math_tag(tag_val) {
+                    crate::stdlib::math_lib::call_math_function(
+                        tag_val, state, ra + 3, nargs, nresults,
+                    )
+                } else {
+                    Ok(())
+                };
                         match result {
                             Ok(()) => {
                                 state.pc += 1;
@@ -1809,6 +1813,11 @@ impl VmExecutor {
                     crate::stdlib::base_lib::call_base_function(
                         tag_val, state, a, nargs, nresults,
                     )?;
+                } else if crate::stdlib::math_lib::is_math_tag(tag_val) {
+                    // 数学库函数（标签 200-299）
+                    crate::stdlib::math_lib::call_math_function(
+                        tag_val, state, a, nargs, nresults,
+                    )?;
                 } else if tag_val >= 100 {
                     // 字符串库函数（标签 100+）
                     crate::stdlib::string_lib::call_string_function(
@@ -1987,6 +1996,11 @@ impl VmExecutor {
                 let nargs = if b == 0 { state.stack.len().saturating_sub(a + 1) } else { b.saturating_sub(1) };
                 if crate::stdlib::base_lib::is_base_tag(tag_val) {
                     crate::stdlib::base_lib::call_base_function(
+                        tag_val, state, a, nargs, -1,
+                    )?;
+                } else if crate::stdlib::math_lib::is_math_tag(tag_val) {
+                    // 数学库函数（标签 200-299）
+                    crate::stdlib::math_lib::call_math_function(
                         tag_val, state, a, nargs, -1,
                     )?;
                 } else if tag_val >= 100 {

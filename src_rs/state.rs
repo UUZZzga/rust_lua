@@ -107,6 +107,8 @@ pub struct LuaState {
     pub last_error_msg: String,
     /// 当前正在调用的 C 函数名（用于 traceback）— None 表示不在 C 函数中
     pub last_c_function: Option<String>,
+    /// 数学库随机数生成器状态 — 对应 C 的 RanState (math.random/randomseed)
+    pub math_random_state: Option<Box<crate::stdlib::math_lib::RandState>>,
 }
 
 /// 调用栈条目 — 用于堆栈回溯
@@ -180,6 +182,7 @@ impl LuaState {
             last_traceback: String::new(),
             last_error_msg: String::new(),
             last_c_function: None,
+            math_random_state: None,
         }
     }
 
@@ -317,6 +320,7 @@ impl LuaState {
             last_traceback: String::new(),
             last_error_msg: String::new(),
             last_c_function: None,
+            math_random_state: None,
         };
         state
     }
@@ -396,6 +400,7 @@ impl LuaState {
             last_traceback: String::new(),
             last_error_msg: String::new(),
             last_c_function: None,
+            math_random_state: None,
         }
     }
 }
@@ -1302,6 +1307,9 @@ impl LuaState {
 
         // 打开字符串库 (创建字符串元表)
         crate::stdlib::string_lib::open_string_lib(self);
+
+        // 打开数学库 (注册 math 全局表, 包含 abs/sin/cos/random 等)
+        crate::stdlib::math_lib::open_math_lib(self);
     }
 
     // ====== Hook ======
