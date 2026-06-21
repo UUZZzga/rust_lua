@@ -139,11 +139,13 @@ fn posrelat_i(pos: i64, len: usize) -> usize {
 /// 获取结束位置 (0-based, clip 到 [0, len])
 /// 对应 C 的 getendpos:
 /// - pos > len: 返回 len
-/// - pos >= 0: 返回 pos
+/// - pos >= 0: 返回 pos  (注意: 0 是合法的结束位置,表示空区间)
 /// - pos < -len: 返回 0
 /// - 否则: 返回 len + pos + 1
-fn get_end_pos(pos: i64, def: i64, len: usize) -> usize {
-    let pos = if pos == 0 { def } else { pos };
+///
+/// 与 C 版本一致,默认值(def)由调用方通过 get_opt_int_arg 处理,
+/// 此函数不再承担默认值替换职责。
+fn get_end_pos(pos: i64, len: usize) -> usize {
     if pos > len as i64 {
         len
     } else if pos >= 0 {
@@ -179,18 +181,21 @@ pub fn str_len(s: &str) -> i64 {
 
 /// string.sub(s, start, end) — 返回子串
 /// 对应 C 的 str_sub
+///
+/// 与 C 版本逻辑一致:
+/// - start 由 posrelat_i 转为 1-based 绝对位置 (>= 1)
+/// - end 由 get_end_pos 转为 0-based 包含结束位置 (in [0, len])
+/// - 当 start <= end 时,返回 s[start-1..end]
+/// - 否则返回空字符串
 pub fn str_sub(s: &str, start: i64, end: i64) -> String {
     let len = s.len();
     let start_pos = posrelat_i(start, len);
-    let end_pos = get_end_pos(end, -1, len);
-    if start_pos <= end_pos && start_pos <= len {
-        let start_idx = start_pos.saturating_sub(1).min(len);
-        let end_idx = end_pos.min(len);
-        if start_idx < end_idx {
-            s[start_idx..end_idx].to_string()
-        } else {
-            String::new()
-        }
+    let end_pos = get_end_pos(end, len);
+    if start_pos <= end_pos {
+        // start_pos >= 1 (由 posrelat_i 保证), 所以 start_pos - 1 不会下溢
+        // end_pos <= len (由 get_end_pos 保证), 所以切片不会越界
+        // 当 start_pos <= end_pos 时, start_pos <= len (因 end_pos <= len)
+        s[start_pos - 1..end_pos].to_string()
     } else {
         String::new()
     }
@@ -204,15 +209,22 @@ pub fn str_reverse(s: &str) -> String {
 
 /// string.byte(s, [i], [j]) — 返回字符的字节值
 /// 对应 C 的 str_byte
+///
+/// 与 C 版本逻辑一致:
+/// - posi = posrelat_i(i, len)  (1-based, >= 1)
+/// - pose = get_end_pos(j, len) (0-based, in [0, len])
+/// - 当 posi <= pose 时,返回 s[posi-1..pose] 中各字节
+/// - 否则返回空
 pub fn str_byte(s: &str, i: i64, j: i64) -> Vec<i64> {
     let len = s.len();
     let posi = posrelat_i(i, len);
-    let pose = get_end_pos(j, i, len);
+    let pose = get_end_pos(j, len);
     let mut result = Vec::new();
-    if posi <= pose && posi <= len {
-        let start = posi.saturating_sub(1).min(len);
-        let end = pose.min(len);
-        for &b in &s.as_bytes()[start..end] {
+    if posi <= pose {
+        // posi >= 1 (由 posrelat_i 保证)
+        // pose <= len (由 get_end_pos 保证)
+        // 当 posi <= pose 时, posi <= len, 切片合法
+        for &b in &s.as_bytes()[posi - 1..pose] {
             result.push(b as i64);
         }
     }
@@ -229,27 +241,43 @@ pub fn str_char(codes: &[i64]) -> Result<String, String> {
         }
         bytes.push(c as u8);
     }
-    String::from_utf8(bytes).map_err(|_| "invalid UTF-8 sequence".to_string())
+    // Lua 字符串是字节序列,不要求有效 UTF-8 (与 C 版本一致)。
+    // 解析器也用 unsafe 绕过 UTF-8 校验存储原始字节 (见 lexer.rs 的 read_escape),
+    // 这里采用相同方式以保持一致。
+    // bytes 中的值已在 [0,255] 范围内校验,from_utf8_unchecked 不会导致 UB,
+    // 只是 String 内部可能包含非法 UTF-8 (这是刻意设计)。
+    Ok(unsafe { String::from_utf8_unchecked(bytes) })
 }
 
 /// string.rep(s, n, [sep]) — 重复字符串
 /// 对应 C 的 str_rep
-pub fn str_rep(s: &str, n: i64, sep: &str) -> String {
+///
+/// 与 C 版本一致,在结果字符串过大时返回错误 "resulting string too large"。
+pub fn str_rep(s: &str, n: i64, sep: &str) -> Result<String, String> {
     if n <= 0 {
-        return String::new();
+        return Ok(String::new());
     }
+    let len = s.len();
+    let lsep = sep.len();
     let n = n as usize;
+    // 对应 C: len > MAX_SIZE - lsep || (len + lsep) > MAX_SIZE / n
+    // MAX_SIZE 使用 isize::MAX (Rust 分配器上限)
+    let max_size = isize::MAX as usize;
+    if len > max_size - lsep || (len + lsep) > max_size / n {
+        return Err("resulting string too large".to_string());
+    }
+    let totallen = n * (len + lsep) - lsep;
     if sep.is_empty() {
-        s.repeat(n)
+        Ok(s.repeat(n))
     } else {
-        let mut result = String::with_capacity(n * s.len() + (n - 1) * sep.len());
+        let mut result = String::with_capacity(totallen);
         for i in 0..n {
             if i > 0 {
                 result.push_str(sep);
             }
             result.push_str(s);
         }
-        result
+        Ok(result)
     }
 }
 
@@ -1221,30 +1249,109 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                 result.push_str(&apply_width(truncated));
             }
             b'q' => {
-                // 引用字符串
-                result.push('"');
+                // 引用字符串/字面量 — 对应 C 的 addliteral
+                // 字符串:加引号并转义
+                // 数字:直接输出(整数用十进制,浮点用十六进制 %a 格式)
+                // nil/boolean:直接输出 "nil"/"true"/"false"
+                // NaN → "(0/0)", inf → "1e9999", -inf → "-1e9999"
                 match arg {
                     TValue::Str(s) => {
-                        for c in s.as_str().bytes() {
+                        // 对应 C 的 addquoted: 保持原始字节,控制字符用 \ddd 格式
+                        result.push('"');
+                        let bytes = s.as_str().as_bytes();
+                        for (idx, &c) in bytes.iter().enumerate() {
                             match c {
                                 b'"' | b'\\' | b'\n' => {
                                     result.push('\\');
-                                    result.push(c as char);
+                                    // 使用 unsafe 保持原始字节 (非 ASCII 字节可能不是有效 UTF-8)
+                                    unsafe { result.as_mut_vec().push(c); }
                                 }
                                 _ if c.is_ascii_control() => {
-                                    result.push_str(&format!("\\{}", c));
+                                    // C: 如果下一个字符是数字,用 \03d (3位前导零);否则用 \d
+                                    let next_is_digit = idx + 1 < bytes.len() && bytes[idx + 1].is_ascii_digit();
+                                    if next_is_digit {
+                                        result.push_str(&format!("\\{:03}", c));
+                                    } else {
+                                        result.push_str(&format!("\\{}", c));
+                                    }
                                 }
-                                _ => result.push(c as char),
+                                _ => {
+                                    // 原样输出,保持原始字节 (与 C 的 luaL_addchar 一致)
+                                    unsafe { result.as_mut_vec().push(c); }
+                                }
                             }
                         }
+                        result.push('"');
                     }
-                    TValue::Integer(n) => result.push_str(&n.to_string()),
-                    TValue::Float(f) => result.push_str(&format!("{}", f)),
+                    TValue::Integer(n) => {
+                        // 对应 C: LUA_MININTEGER 用十六进制,否则用十进制
+                        if *n == i64::MIN {
+                            result.push_str(&format!("0x{:x}", *n as u64));
+                        } else {
+                            result.push_str(&n.to_string());
+                        }
+                    }
+                    TValue::Float(f) => {
+                        if f.is_nan() {
+                            result.push_str("(0/0)");
+                        } else if f.is_infinite() {
+                            if *f > 0.0 {
+                                result.push_str("1e9999");
+                            } else {
+                                result.push_str("-1e9999");
+                            }
+                        } else {
+                            // C 用十六进制浮点 (%a) 确保精度;
+                            // Rust 无原生 %a,用十进制格式 (Display trait 保证往返精度)
+                            result.push_str(&format!("{}", f));
+                        }
+                    }
                     TValue::Nil(_) => result.push_str("nil"),
                     TValue::Boolean(b) => result.push_str(&b.to_string()),
-                    _ => return Err("value has no literal form".to_string()),
+                    _ => return Err("bad argument to 'format' (value has no literal form)".to_string()),
                 }
-                result.push('"');
+            }
+            b'p' => {
+                // 指针格式 — 对应 C 的 lua_topointer
+                // 对于 nil、boolean、number:返回 "(null)"
+                // 对于 table、function、userdata、thread、string:返回指针地址
+                let p_str = match arg {
+                    TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_) => {
+                        "(null)".to_string()
+                    }
+                    TValue::Str(s) => {
+                        let ptr = s.as_str().as_ptr() as usize;
+                        format!("0x{:x}", ptr)
+                    }
+                    TValue::Table(t) => {
+                        let ptr = t as *const crate::table::Table as usize;
+                        format!("0x{:x}", ptr)
+                    }
+                    TValue::LClosure(l) => {
+                        let ptr = l as *const _ as usize;
+                        format!("0x{:x}", ptr)
+                    }
+                    TValue::CClosure(c) => {
+                        let ptr = c as *const _ as usize;
+                        format!("0x{:x}", ptr)
+                    }
+                    TValue::LCFn(f) => {
+                        let ptr = f as *const _ as usize;
+                        format!("0x{:x}", ptr)
+                    }
+                    TValue::UserData(u) => {
+                        let ptr = u as *const _ as usize;
+                        format!("0x{:x}", ptr)
+                    }
+                    TValue::Thread(t) => {
+                        let ptr = t as *const _ as usize;
+                        format!("0x{:x}", ptr)
+                    }
+                    TValue::LightUserData(p) => {
+                        format!("0x{:x}", *p as usize)
+                    }
+                };
+                result.push_str(&apply_width(p_str));
             }
             _ => {
                 return Err(format!("invalid conversion '%{}' to 'format'", spec as char));
@@ -1403,9 +1510,13 @@ pub fn call_string_function(
             } else {
                 String::new()
             };
-            let result = str_rep(&s, n, &sep);
-            push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&result))]);
-            Ok(())
+            match str_rep(&s, n, &sep) {
+                Ok(result) => {
+                    push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&result))]);
+                    Ok(())
+                }
+                Err(msg) => Err(VmError::RuntimeError(msg)),
+            }
         }
         STR_FIND => {
             let s = get_str_arg(state, a, 0)?;
@@ -1612,24 +1723,25 @@ mod tests {
 
     #[test]
     fn test_get_end_pos_positive() {
-        assert_eq!(get_end_pos(5, -1, 10), 5);
-        assert_eq!(get_end_pos(0, -1, 10), 10); // 0 使用默认值 -1
+        assert_eq!(get_end_pos(5, 10), 5);
+        // 0 是合法的结束位置 (表示空区间),不应被转为默认值
+        assert_eq!(get_end_pos(0, 10), 0);
     }
 
     #[test]
     fn test_get_end_pos_beyond_len() {
-        assert_eq!(get_end_pos(20, -1, 10), 10);
+        assert_eq!(get_end_pos(20, 10), 10);
     }
 
     #[test]
     fn test_get_end_pos_negative() {
-        assert_eq!(get_end_pos(-1, -1, 10), 10);
-        assert_eq!(get_end_pos(-3, -1, 10), 8);
+        assert_eq!(get_end_pos(-1, 10), 10);
+        assert_eq!(get_end_pos(-3, 10), 8);
     }
 
     #[test]
     fn test_get_end_pos_negative_out_of_range() {
-        assert_eq!(get_end_pos(-20, -1, 10), 0);
+        assert_eq!(get_end_pos(-20, 10), 0);
     }
 
     // ========================================================================
@@ -1674,7 +1786,9 @@ mod tests {
     #[test]
     fn test_str_sub_default_end() {
         assert_eq!(str_sub("hello", 2, -1), "ello");
-        assert_eq!(str_sub("hello", 2, 0), "ello"); // 0 means default -1
+        // end=0 是合法的结束位置 (表示位置 0 之前,即空区间)
+        // start=2 > end=0, 所以返回空字符串,与 C 版本一致
+        assert_eq!(str_sub("hello", 2, 0), "");
     }
 
     #[test]
@@ -1687,6 +1801,96 @@ mod tests {
     fn test_str_sub_empty() {
         assert_eq!(str_sub("", 1, 1), "");
         assert_eq!(str_sub("hello", 3, 2), "");
+    }
+
+    /// 对应 strings.lua 第 40-55 行的 string.sub 测试用例
+    /// 这些用例直接来自 Lua 5.5 官方测试套件,确保与 C 实现完全一致
+    #[test]
+    fn test_str_sub_lua_suite() {
+        let s = "123456789";
+        assert_eq!(str_sub(s, 2, 4), "234");
+        assert_eq!(str_sub(s, 7, -1), "789");
+        assert_eq!(str_sub(s, 7, 6), "");
+        assert_eq!(str_sub(s, 7, 7), "7");
+        // 关键边界用例: start=0 → 1, end=0 → 0, start > end → ""
+        assert_eq!(str_sub(s, 0, 0), "");
+        assert_eq!(str_sub(s, -10, 10), "123456789");
+        assert_eq!(str_sub(s, 1, 9), "123456789");
+        assert_eq!(str_sub(s, -10, -20), "");
+        assert_eq!(str_sub(s, -1, -1), "9");
+        assert_eq!(str_sub(s, -4, -1), "6789");
+        assert_eq!(str_sub(s, -6, -4), "456");
+    }
+
+    /// 对应 strings.lua 第 51-53 行的极值整数边界用例
+    #[test]
+    fn test_str_sub_extreme_integers() {
+        let s = "123456789";
+        let mini = i64::MIN;
+        let maxi = i64::MAX;
+        assert_eq!(str_sub(s, mini, -4), "123456");
+        assert_eq!(str_sub(s, mini, maxi), "123456789");
+        assert_eq!(str_sub(s, mini, mini), "");
+    }
+
+    /// 对应 strings.lua 第 54-55 行的包含 null 字节的字符串
+    #[test]
+    fn test_str_sub_with_null_byte() {
+        // "\000123456789" 长度为 10
+        let s = "\u{0}123456789";
+        assert_eq!(str_sub(s, 3, 5), "234");
+        assert_eq!(str_sub(s, 8, -1), "789");
+    }
+
+    /// str_byte 的边界用例: end=0 应产生空区间
+    #[test]
+    fn test_str_byte_end_zero() {
+        // string.byte("ABC", 1, 0) → end=0 < posi=1, 返回空
+        assert_eq!(str_byte("ABC", 1, 0), Vec::<i64>::new());
+        // string.byte("ABC", 0, 0) → posi=1, pose=0, 返回空
+        assert_eq!(str_byte("ABC", 0, 0), Vec::<i64>::new());
+    }
+
+    /// str_byte 的边界用例: 超出范围的索引
+    #[test]
+    fn test_str_byte_out_of_range() {
+        assert_eq!(str_byte("ABC", 10, 20), Vec::<i64>::new());
+        assert_eq!(str_byte("ABC", -10, -20), Vec::<i64>::new());
+    }
+
+    /// str_byte 的边界用例: 空字符串
+    #[test]
+    fn test_str_byte_empty_string() {
+        assert_eq!(str_byte("", 1, 1), Vec::<i64>::new());
+        assert_eq!(str_byte("", 0, 0), Vec::<i64>::new());
+    }
+
+    /// str_byte 的边界用例: 包含 null 字节
+    #[test]
+    fn test_str_byte_with_null_byte() {
+        let s = "\u{0}AB";
+        assert_eq!(str_byte(s, 1, 1), vec![0]);
+        assert_eq!(str_byte(s, 1, 3), vec![0, 65, 66]);
+        assert_eq!(str_byte(s, -1, -1), vec![66]);
+    }
+
+    /// str_sub 的边界用例: 空字符串的各种位置参数
+    #[test]
+    fn test_str_sub_empty_string_various() {
+        assert_eq!(str_sub("", 0, 0), "");
+        assert_eq!(str_sub("", -1, -1), "");
+        assert_eq!(str_sub("", 1, 100), "");
+        assert_eq!(str_sub("", -100, 100), "");
+    }
+
+    /// str_sub 的边界用例: 单字符字符串
+    #[test]
+    fn test_str_sub_single_char() {
+        assert_eq!(str_sub("a", 1, 1), "a");
+        assert_eq!(str_sub("a", 0, 0), "");
+        assert_eq!(str_sub("a", 1, 0), "");
+        assert_eq!(str_sub("a", -1, -1), "a");
+        assert_eq!(str_sub("a", -1, 0), "");
     }
 
     #[test]
@@ -1734,21 +1938,42 @@ mod tests {
     }
 
     #[test]
+    fn test_str_char_non_utf8_bytes() {
+        // string.char(255) 应返回包含字节 255 的字符串 (与 C 版本一致)
+        // Lua 字符串是字节序列,不要求有效 UTF-8
+        let s = str_char(&[255]).unwrap();
+        assert_eq!(s.as_bytes(), &[255]);
+        // string.char(0, 255, 0) 应返回 3 字节
+        let s = str_char(&[0, 255, 0]).unwrap();
+        assert_eq!(s.as_bytes(), &[0, 255, 0]);
+        // string.char(228) 应返回包含字节 0xe4 的字符串
+        let s = str_char(&[228]).unwrap();
+        assert_eq!(s.as_bytes(), &[0xe4]);
+    }
+
+    #[test]
     fn test_str_rep_basic() {
-        assert_eq!(str_rep("ab", 3, ""), "ababab");
-        assert_eq!(str_rep("ab", 1, ""), "ab");
-        assert_eq!(str_rep("ab", 0, ""), "");
+        assert_eq!(str_rep("ab", 3, "").unwrap(), "ababab");
+        assert_eq!(str_rep("ab", 1, "").unwrap(), "ab");
+        assert_eq!(str_rep("ab", 0, "").unwrap(), "");
     }
 
     #[test]
     fn test_str_rep_with_sep() {
-        assert_eq!(str_rep("ab", 3, ","), "ab,ab,ab");
-        assert_eq!(str_rep("x", 3, "-"), "x-x-x");
+        assert_eq!(str_rep("ab", 3, ",").unwrap(), "ab,ab,ab");
+        assert_eq!(str_rep("x", 3, "-").unwrap(), "x-x-x");
     }
 
     #[test]
     fn test_str_rep_negative() {
-        assert_eq!(str_rep("ab", -5, ""), "");
+        assert_eq!(str_rep("ab", -5, "").unwrap(), "");
+    }
+
+    #[test]
+    fn test_str_rep_too_large() {
+        // 对应 strings.lua line 114-115: 结果字符串过大时应返回错误
+        assert!(str_rep("aa", i64::MAX, "").is_err());
+        assert!(str_rep("a", i64::MAX, ",").is_err());
     }
 
     // ========================================================================
@@ -1996,6 +2221,59 @@ mod tests {
         let args = vec![TValue::Integer(42)];
         let result = str_format("[%-5d]", &args).unwrap();
         assert_eq!(result, "[42   ]");
+    }
+
+    #[test]
+    fn test_str_format_q_string() {
+        // %q 字符串:加引号并转义
+        let args = vec![TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+            crate::strings::ShortString { hash: 0, contents: "hello".to_string() }
+        )))];
+        let result = str_format("%q", &args).unwrap();
+        assert_eq!(result, "\"hello\"");
+    }
+
+    #[test]
+    fn test_str_format_q_integer() {
+        // %q 整数:直接输出,不加引号
+        let args = vec![TValue::Integer(42)];
+        let result = str_format("%q", &args).unwrap();
+        assert_eq!(result, "42");
+    }
+
+    #[test]
+    fn test_str_format_q_boolean_nil() {
+        // %q 布尔和 nil:直接输出,不加引号
+        let args = vec![TValue::Boolean(true)];
+        assert_eq!(str_format("%q", &args).unwrap(), "true");
+        let args = vec![TValue::Boolean(false)];
+        assert_eq!(str_format("%q", &args).unwrap(), "false");
+        let args = vec![TValue::Nil(NilKind::Strict)];
+        assert_eq!(str_format("%q", &args).unwrap(), "nil");
+    }
+
+    #[test]
+    fn test_str_format_q_nan_inf() {
+        // %q NaN → "(0/0)", inf → "1e9999", -inf → "-1e9999"
+        let args = vec![TValue::Float(f64::NAN)];
+        assert_eq!(str_format("%q", &args).unwrap(), "(0/0)");
+        let args = vec![TValue::Float(f64::INFINITY)];
+        assert_eq!(str_format("%q", &args).unwrap(), "1e9999");
+        let args = vec![TValue::Float(f64::NEG_INFINITY)];
+        assert_eq!(str_format("%q", &args).unwrap(), "-1e9999");
+    }
+
+    #[test]
+    fn test_str_format_p_null() {
+        // %p 对于 nil、boolean、number 返回 "(null)"
+        let args = vec![TValue::Nil(NilKind::Strict)];
+        assert_eq!(str_format("%p", &args).unwrap(), "(null)");
+        let args = vec![TValue::Boolean(true)];
+        assert_eq!(str_format("%p", &args).unwrap(), "(null)");
+        let args = vec![TValue::Integer(42)];
+        assert_eq!(str_format("%p", &args).unwrap(), "(null)");
+        let args = vec![TValue::Float(3.14)];
+        assert_eq!(str_format("%p", &args).unwrap(), "(null)");
     }
 
     // ========================================================================

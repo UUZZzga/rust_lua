@@ -1638,7 +1638,9 @@ impl VmExecutor {
 
     fn op_eqi(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
-        let im = opcodes::getarg_sbx(inst) as i64;
+        // EQI 是 IABC 模式,使用 sB 参数 (有符号 B, 8 位)
+        // 对应 C: int im = GETARG_sB(i);
+        let im = opcodes::getarg_sb(inst) as i64;
         let v = Self::read_stack(state, a);
         let cond = match v {
             TValue::Integer(i) => *i == im,
@@ -1664,7 +1666,9 @@ impl VmExecutor {
 
     fn op_lei(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
-        let im = opcodes::getarg_sbx(inst) as i64;
+        // LEI 是 IABC 模式,使用 sB 参数 (有符号 B, 8 位)
+        // 对应 C: int im = GETARG_sB(i);
+        let im = opcodes::getarg_sb(inst) as i64;
         let v = Self::read_stack(state, a);
         let cond = match v {
             TValue::Integer(i) => *i <= im,
@@ -1690,7 +1694,9 @@ impl VmExecutor {
 
     fn op_gei(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
-        let im = opcodes::getarg_sbx(inst) as i64;
+        // GEI 是 IABC 模式,使用 sB 参数 (有符号 B, 8 位)
+        // 对应 C: int im = GETARG_sB(i);
+        let im = opcodes::getarg_sb(inst) as i64;
         let v = Self::read_stack(state, a);
         let cond = match v {
             TValue::Integer(i) => *i >= im,

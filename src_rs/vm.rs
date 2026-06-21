@@ -846,8 +846,15 @@ pub fn concat_stack(
         let is_prev_empty = matches!(v_prev, TValue::Str(ref s) if s.len() == 0);
         if is_prev_empty {
             // C: setobjs2s(L, top-2, top-1); → 结果就是第二个操作数
+            //     cast_void(tostring(L, s2v(top-2))); → 将其转为字符串
             let val = stack.pop().unwrap();
             let idx = top - 2;
+            // 将数字转为字符串 (与 C 的 tostring 一致)
+            let val = match val {
+                TValue::Integer(i) => TValue::Str(string_from_int(i)),
+                TValue::Float(f) => TValue::Str(string_from_float(f)),
+                other => other,
+            };
             stack[idx] = val;
             remaining -= 1;
             continue;
