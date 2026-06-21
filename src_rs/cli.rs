@@ -77,14 +77,51 @@ impl Interpreter {
         status
     }
 
+    /// 消息处理器 — 对应 C 的 msghandler
+    ///
+    /// 当 pcall 发生错误时调用，负责：
+    /// 1. 将错误对象转换为字符串
+    /// 2. 追加堆栈回溯信息
+    fn msghandler(&mut self) {
+        // 尝试将错误对象转换为字符串
+        let msg = match self.l.to_string(-1) {
+            Some(s) => s,
+            None => {
+                // 错误对象不是字符串，尝试 __tostring 元方法
+                if self.l.call_meta(-1, "__tostring") {
+                    if let Some(s) = self.l.to_string(-1) {
+                        self.l.pop(1);
+                        s
+                    } else {
+                        self.l.pop(1);
+                        format!("(error object is a {} value)", self.l.typename_at(-1))
+                    }
+                } else {
+                    format!("(error object is a {} value)", self.l.typename_at(-1))
+                }
+            }
+        };
+        // 弹出原始错误对象
+        self.l.pop(1);
+        // 追加堆栈回溯（由 execute_loop 在错误发生时构建并存储）
+        let traceback = if self.l.last_traceback.is_empty() {
+            format!("{}\nstack traceback:\n\t[C]: in ?", msg)
+        } else {
+            format!("{}\n{}", msg, self.l.last_traceback)
+        };
+        self.l.push_string(&traceback);
+    }
+
     fn docall(&mut self, narg: usize, nres: i32) -> i32 {
         let base = self.l.gettop() - narg;
-        self.l.rotate(base as isize, 1);
         setup_signal_handler();
         let status = self.l.pcall(narg, nres, 0);
         reset_signal_handler();
-        self.l.rotate(base as isize, -1);
-        self.l.pop(1);
+        if status != 0 {
+            // 调用消息处理器追加堆栈回溯
+            self.msghandler();
+        }
+        let _ = base;
         status
     }
 

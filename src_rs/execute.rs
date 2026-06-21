@@ -90,6 +90,83 @@ struct CallFrame {
 }
 
 // ============================================================================
+// 辅助函数 — 用于堆栈回溯
+// ============================================================================
+
+/// 对应 C 的 luaO_chunkid：将源名转换为短源名
+fn short_source(source: &crate::strings::LuaString) -> String {
+    let bytes = source.as_str().as_bytes();
+    if bytes.is_empty() {
+        return "?".to_string();
+    }
+    match bytes[0] {
+        b'=' => String::from_utf8_lossy(&bytes[1..]).into_owned(),
+        b'@' => String::from_utf8_lossy(&bytes[1..]).into_owned(),
+        _ => {
+            let end = bytes
+                .iter()
+                .position(|&b| b == b'\n')
+                .unwrap_or(bytes.len())
+                .min(40);
+            let head = String::from_utf8_lossy(&bytes[..end]);
+            if bytes.len() > 40 || bytes.iter().any(|&b| b == b'\n') {
+                format!("[string \"{}...\"]", head)
+            } else {
+                format!("[string \"{}\"]", head)
+            }
+        }
+    }
+}
+
+/// 对应 C 的 luaG_getfuncline：从 Proto 的 line_info/abs_line_info 计算 pc 所在行号
+fn get_proto_line(proto: &Proto, pc: usize) -> i32 {
+    if proto.line_info.is_empty() || pc >= proto.line_info.len() {
+        return -1;
+    }
+    let mut base_pc = -1i32;
+    let mut base_line = proto.line_defined;
+    for abs in &proto.abs_line_info {
+        let abs_pc = abs.pc;
+        if abs_pc <= pc as i32 && abs_pc > base_pc {
+            base_pc = abs_pc;
+            base_line = abs.line;
+        }
+    }
+    let mut line = base_line;
+    let mut i = base_pc + 1;
+    while i <= pc as i32 {
+        let delta = proto.line_info[i as usize];
+        if delta != i8::MIN {
+            line += delta as i32;
+        }
+        i += 1;
+    }
+    line
+}
+
+/// 检查错误消息是否已包含 source:line 前缀
+/// 用于避免 error()/assert() 等已添加前缀的错误消息被重复添加
+/// 匹配模式: "source:line: " 其中 line 是数字
+fn has_source_line_prefix(msg: &str) -> bool {
+    let bytes = msg.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b':' && i + 1 < bytes.len() && bytes[i + 1].is_ascii_digit() {
+            // 找到 ":数字"，继续查找数字后的 ": "
+            let mut j = i + 1;
+            while j < bytes.len() && bytes[j].is_ascii_digit() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b':' && j + 1 < bytes.len() && bytes[j + 1] == b' ' {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+// ============================================================================
 // VmExecutor
 // ============================================================================
 
@@ -155,7 +232,7 @@ impl VmExecutor {
                 }
             }
 
-            match op {
+            let result = match op {
                 OpCode::MOVE => Self::op_move(state, inst),
                 OpCode::LOADI => Self::op_loadi(state, inst),
                 OpCode::LOADF => Self::op_loadf(state, inst),
@@ -226,17 +303,29 @@ impl VmExecutor {
                 OpCode::TESTSET => Self::op_testset(state, inst),
                 OpCode::CALL => Self::op_call(state, inst, &mut call_stack),
                 OpCode::TAILCALL => Self::op_tailcall(state, inst),
-                OpCode::RETURN => match Self::op_return(state, inst, &mut call_stack)? {
-                    Some(vr) => return Ok(vr),
-                    None => Ok(()),
+                OpCode::RETURN => match Self::op_return(state, inst, &mut call_stack) {
+                    Ok(Some(vr)) => return Ok(vr),
+                    Ok(None) => Ok(()),
+                    Err(e) => {
+                        Self::build_traceback(state, &call_stack, &e);
+                        return Err(e);
+                    }
                 },
-                OpCode::RETURN0 => match Self::op_return0(state, inst, &mut call_stack)? {
-                    Some(vr) => return Ok(vr),
-                    None => Ok(()),
+                OpCode::RETURN0 => match Self::op_return0(state, inst, &mut call_stack) {
+                    Ok(Some(vr)) => return Ok(vr),
+                    Ok(None) => Ok(()),
+                    Err(e) => {
+                        Self::build_traceback(state, &call_stack, &e);
+                        return Err(e);
+                    }
                 },
-                OpCode::RETURN1 => match Self::op_return1(state, inst, &mut call_stack)? {
-                    Some(vr) => return Ok(vr),
-                    None => Ok(()),
+                OpCode::RETURN1 => match Self::op_return1(state, inst, &mut call_stack) {
+                    Ok(Some(vr)) => return Ok(vr),
+                    Ok(None) => Ok(()),
+                    Err(e) => {
+                        Self::build_traceback(state, &call_stack, &e);
+                        return Err(e);
+                    }
                 },
                 OpCode::FORLOOP => Self::op_forloop(state, inst),
                 OpCode::FORPREP => Self::op_forprep(state, inst),
@@ -315,23 +404,30 @@ impl VmExecutor {
                         let tag_val = *tag as usize;
                         let nresults = (c + 1) as i32;
                         let nargs = 2; // state 和 control
-                        if tag_val == crate::stdlib::base_lib::BASE_IPAIRS_AUX {
+                        let result = if tag_val == crate::stdlib::base_lib::BASE_IPAIRS_AUX {
                             // ipairs 迭代器 (ipairsaux)
                             crate::stdlib::base_lib::call_ipairs_aux(
                                 state, ra + 3, nargs, nresults,
-                            )?;
+                            )
                         } else if tag_val == crate::stdlib::base_lib::BASE_NEXT_ITER {
                             // pairs 迭代器 (next)
                             crate::stdlib::base_lib::call_next_iter(
                                 state, ra + 3, nargs, nresults,
-                            )?;
+                            )
                         } else if crate::stdlib::base_lib::is_base_tag(tag_val) {
                             crate::stdlib::base_lib::call_base_function(
                                 tag_val, state, ra + 3, nargs, nresults,
-                            )?;
+                            )
+                        } else {
+                            Ok(())
+                        };
+                        match result {
+                            Ok(()) => {
+                                state.pc += 1;
+                                Ok(())
+                            }
+                            Err(e) => Err(e),
                         }
-                        state.pc += 1;
-                        Ok(())
                     } else {
                         state.pc += 1;
                         Ok(())
@@ -347,8 +443,73 @@ impl VmExecutor {
                 OpCode::EXTRAARG => {
                     return Err(VmError::IllegalOpcode(OpCode::EXTRAARG as u8));
                 }
-            }?;
+            };
+            match result {
+                Ok(()) => {}
+                Err(e) => {
+                    Self::build_traceback(state, &call_stack, &e);
+                    return Err(e);
+                }
+            }
         }
+    }
+
+    /// 构建堆栈回溯并存储到 state.last_traceback — 对应 C 的 luaL_traceback
+    ///
+    /// 在错误发生时调用，从当前状态和调用栈构建回溯信息。
+    /// 同时格式化错误消息（添加 source:line 前缀）并存储到 state.last_error_msg。
+    fn build_traceback(state: &mut LuaState, _call_stack: &[CallFrame], error: &VmError) {
+        let mut trace = String::from("stack traceback:");
+
+        // 获取当前源和行号
+        let (source, line) = if state.base > 0 && state.base <= state.stack.len() {
+            if let TValue::LClosure(closure) = &state.stack[state.base - 1].clone() {
+                let src = closure.proto.source.as_ref()
+                    .map(|s| short_source(s))
+                    .unwrap_or_else(|| "?".to_string());
+                let ln = get_proto_line(&closure.proto, state.pc);
+                (src, ln)
+            } else {
+                ("?".to_string(), -1)
+            }
+        } else {
+            ("?".to_string(), -1)
+        };
+
+        // 如果错误由 C 函数引发，先添加 C 函数帧 — 对应 C 的 [C]: in global 'name'
+        if let Some(c_func_name) = &state.last_c_function {
+            trace.push_str(&format!("\n\t[C]: in global '{}'", c_func_name));
+        }
+
+        // 添加当前 Lua 帧到 traceback
+        if state.base > 0 && state.base <= state.stack.len() {
+            if let TValue::LClosure(_) = &state.stack[state.base - 1].clone() {
+                let name = "main chunk";
+                if line > 0 {
+                    trace.push_str(&format!("\n\t{}:{}: in {}", source, line, name));
+                } else {
+                    trace.push_str(&format!("\n\t{}: in {}", source, name));
+                }
+            }
+        }
+
+        // 最后添加 [C]: in ?
+        trace.push_str("\n\t[C]: in ?");
+
+        // 格式化错误消息（添加 source:line 前缀）— 对应 C 的 luaG_addinfo
+        let error_msg = match error {
+            VmError::RuntimeError(msg) => msg.clone(),
+            other => format!("{}", other),
+        };
+        // 只在错误消息尚未包含 source:line 前缀时添加
+        // (error()/assert() 等 C 函数已经通过 luaL_where 添加了前缀)
+        let prefix = if line > 0 && !has_source_line_prefix(&error_msg) {
+            format!("{}:{}: ", source, line)
+        } else {
+            String::new()
+        };
+        state.last_error_msg = format!("{}{}", prefix, error_msg);
+        state.last_traceback = trace;
     }
 
     /// 格式化单条指令为 bytecode_dump 格式
@@ -637,7 +798,7 @@ impl VmExecutor {
         } else {
             TValue::Nil(NilKind::Strict)
         };
-        let result = Self::table_get(state, &upval_val, &key);
+        let result = Self::table_get(state, &upval_val, &key)?;
         Self::write_stack(state, a, result);
         state.pc += 1;
         Ok(())
@@ -649,7 +810,7 @@ impl VmExecutor {
         let c = Self::rc(state, inst);
         let table_val = Self::read_stack(state, b).clone();
         let key = Self::read_stack(state, c).clone();
-        let result = Self::table_get(state, &table_val, &key);
+        let result = Self::table_get(state, &table_val, &key)?;
         Self::write_stack(state, a, result);
         state.pc += 1;
         Ok(())
@@ -661,7 +822,7 @@ impl VmExecutor {
         let c = opcodes::getarg_c(inst) as i64;
         let table_val = Self::read_stack(state, b).clone();
         let key = TValue::Integer(c);
-        let result = Self::table_get(state, &table_val, &key);
+        let result = Self::table_get(state, &table_val, &key)?;
         Self::write_stack(state, a, result);
         state.pc += 1;
         Ok(())
@@ -673,7 +834,7 @@ impl VmExecutor {
         let c_key = opcodes::getarg_c(inst) as usize;
         let table_val = Self::read_stack(state, b).clone();
         let key = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
-        let result = Self::table_get(state, &table_val, &key);
+        let result = Self::table_get(state, &table_val, &key)?;
         Self::write_stack(state, a, result);
         state.pc += 1;
         Ok(())
@@ -775,7 +936,7 @@ impl VmExecutor {
             .cloned().unwrap_or(TValue::Nil(NilKind::Strict));
         let obj = Self::read_stack(state, b).clone();
         Self::write_stack(state, a + 1, obj.clone());
-        let result = Self::table_get(state, &obj, &key);
+        let result = Self::table_get(state, &obj, &key)?;
         Self::write_stack(state, a, result);
         state.pc += 1;
         Ok(())
@@ -1641,7 +1802,7 @@ impl VmExecutor {
                 let nargs = if b == 0 { state.stack.len().saturating_sub(a + 1) } else { b.saturating_sub(1) };
                 let nresults: i32 = if c == 0 { -1 } else { c - 1 };
 
-                // 基础库函数派发 (标签 1-19)
+                // 基础库函数派发
                 // 对应原 C 源码 lbaselib.cpp 的各个函数
                 // 注意: ipairsaux (迭代器) 只在 TFORCALL 中调用, 不在此处理
                 if crate::stdlib::base_lib::is_base_tag(tag_val) {
@@ -1665,9 +1826,11 @@ impl VmExecutor {
                 Self::call_c_function(state, a, b, c, cc.f)?;
                 Ok(())
             }
-            _ => {
-                state.pc += 1;
-                Ok(())
+            other => {
+                // 非可调用对象: 抛出 "attempt to call a {type} value" 错误
+                // 对应 C 的 luaG_callerror
+                let type_name = state.typename(other.ty());
+                Err(VmError::RuntimeError(format!("attempt to call a {} value", type_name)))
             }
         }
     }
@@ -2483,13 +2646,13 @@ impl VmExecutor {
     // 辅助: 表操作
     // ========================================================================
 
-    fn table_get(state: &mut LuaState, table_val: &TValue, key: &TValue) -> TValue {
+    fn table_get(state: &mut LuaState, table_val: &TValue, key: &TValue) -> Result<TValue, VmError> {
         match table_val {
             TValue::Table(t) => {
                 // 先直接查找表
                 if let Some(v) = t.get(key) {
                     if !matches!(v, TValue::Nil(_)) {
-                        return v.clone();
+                        return Ok(v.clone());
                     }
                 }
                 // 查找 __index 元方法
@@ -2503,13 +2666,13 @@ impl VmExecutor {
                             }
                             TValue::LClosure(_) | TValue::LCFn(_) | TValue::CClosure(_) | TValue::LightUserData(_) => {
                                 // __index 是函数: 调用 __index(table, key)
-                                return Self::call_index_metamethod(state, index_val.clone(), table_val.clone(), key.clone());
+                                return Ok(Self::call_index_metamethod(state, index_val.clone(), table_val.clone(), key.clone()));
                             }
                             _ => {}
                         }
                     }
                 }
-                TValue::Nil(NilKind::Strict)
+                Ok(TValue::Nil(NilKind::Strict))
             }
             TValue::Str(_) => {
                 // 字符串类型: 查找字符串元表的 __index
@@ -2518,18 +2681,22 @@ impl VmExecutor {
                     if let Some(index_val) = mt.get(&index_key) {
                         match index_val {
                             TValue::Table(index_table) => {
-                                index_table.get(key).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
+                                Ok(index_table.get(key).cloned().unwrap_or(TValue::Nil(NilKind::Strict)))
                             }
-                            _ => TValue::Nil(NilKind::Strict),
+                            _ => Ok(TValue::Nil(NilKind::Strict)),
                         }
                     } else {
-                        TValue::Nil(NilKind::Strict)
+                        Ok(TValue::Nil(NilKind::Strict))
                     }
                 } else {
-                    TValue::Nil(NilKind::Strict)
+                    Ok(TValue::Nil(NilKind::Strict))
                 }
             }
-            _ => TValue::Nil(NilKind::Strict),
+            other => {
+                // 非表/字符串值: 尝试 __index 元方法
+                let type_name = state.typename(other.ty());
+                Err(VmError::RuntimeError(format!("attempt to index a {} value", type_name)))
+            }
         }
     }
 

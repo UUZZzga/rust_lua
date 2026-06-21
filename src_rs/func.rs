@@ -320,6 +320,10 @@ mod tests {
             stdout: Box::new(std::io::stdout()),
             global_state: std::rc::Rc::new(crate::state::GlobalState { gcstopem: false }),
             ci: None,
+            call_info: Vec::new(),
+            last_traceback: String::new(),
+            last_error_msg: String::new(),
+            last_c_function: None,
         }
     }
 

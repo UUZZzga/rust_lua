@@ -12,9 +12,10 @@
 //! - 标签 1-6: 原有临时实现 (print, setmetatable, getmetatable, type, pcall, error)
 //! - 标签 7+: 新增基础库函数
 
-use crate::objects::{NilKind, TValue};
+use crate::objects::{NilKind, Proto, TValue};
 use crate::state::LuaState;
 use crate::execute::VmError;
+use crate::strings::LuaString;
 use std::io::Write;
 
 // ============================================================================
@@ -379,6 +380,32 @@ fn push_single_result(state: &mut LuaState, a: usize, nresults: i32, result: TVa
 /// - a: 函数在栈中的位置 (0-based)
 /// - nargs: 参数数量
 /// - nresults: 期望结果数 (-1 = MULTRET)
+/// 将 base 库函数 tag 映射到函数名（用于 traceback）
+pub fn base_function_name(tag: usize) -> Option<&'static str> {
+    match tag {
+        BASE_PRINT => Some("print"),
+        BASE_SETMETATABLE => Some("setmetatable"),
+        BASE_GETMETATABLE => Some("getmetatable"),
+        BASE_TYPE => Some("type"),
+        BASE_PCALL => Some("pcall"),
+        BASE_ERROR => Some("error"),
+        BASE_TONUMBER => Some("tonumber"),
+        BASE_TOSTRING => Some("tostring"),
+        BASE_ASSERT => Some("assert"),
+        BASE_SELECT => Some("select"),
+        BASE_RAWEQUAL => Some("rawequal"),
+        BASE_RAWLEN => Some("rawlen"),
+        BASE_RAWGET => Some("rawget"),
+        BASE_RAWSET => Some("rawset"),
+        BASE_NEXT => Some("next"),
+        BASE_IPAIRS => Some("ipairs"),
+        BASE_PAIRS => Some("pairs"),
+        BASE_XPCALL => Some("xpcall"),
+        BASE_WARN => Some("warn"),
+        _ => None,
+    }
+}
+
 pub fn call_base_function(
     tag: usize,
     state: &mut LuaState,
@@ -386,7 +413,11 @@ pub fn call_base_function(
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
-    match tag {
+    // 设置当前 C 函数名（用于 traceback）— 对应 C 的 CallInfo 记录
+    let prev_c_func = state.last_c_function.take();
+    state.last_c_function = base_function_name(tag).map(|s| s.to_string());
+
+    let result = match tag {
         BASE_PRINT => call_print(state, a, nargs, nresults),
         BASE_SETMETATABLE => call_setmetatable(state, a, nargs, nresults),
         BASE_GETMETATABLE => call_getmetatable(state, a, nargs, nresults),
@@ -407,7 +438,14 @@ pub fn call_base_function(
         BASE_XPCALL => call_xpcall(state, a, nargs, nresults),
         BASE_WARN => call_warn(state, a, nargs, nresults),
         _ => Err(VmError::RuntimeError(format!("unknown base function tag: {}", tag))),
+    };
+
+    // 函数正常返回时恢复之前的 C 函数名
+    // 错误时不恢复，以便 build_traceback 能获取当前 C 函数名
+    if result.is_ok() {
+        state.last_c_function = prev_c_func;
     }
+    result
 }
 
 // ============================================================================
@@ -572,13 +610,105 @@ fn call_pcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
     Ok(())
 }
 
+/// 对应 C 的 luaO_chunkid：将 source 格式化为短源标识
+fn short_src(source: &LuaString) -> String {
+    let bytes = source.as_str().as_bytes();
+    if bytes.is_empty() {
+        return "?".to_string();
+    }
+    match bytes[0] {
+        b'=' => String::from_utf8_lossy(&bytes[1..]).into_owned(),
+        b'@' => String::from_utf8_lossy(&bytes[1..]).into_owned(),
+        _ => {
+            let end = bytes
+                .iter()
+                .position(|&b| b == b'\n')
+                .unwrap_or(bytes.len())
+                .min(40);
+            let head = String::from_utf8_lossy(&bytes[..end]);
+            if bytes.len() > 40 || bytes.iter().any(|&b| b == b'\n') {
+                format!("[string \"{}...\"]", head)
+            } else {
+                format!("[string \"{}\"]", head)
+            }
+        }
+    }
+}
+
+/// 对应 C 的 luaG_getfuncline：从 Proto 的 line_info/abs_line_info 计算 pc 所在行号
+fn get_func_line(proto: &Proto, pc: usize) -> i32 {
+    if proto.line_info.is_empty() || pc >= proto.line_info.len() {
+        return -1;
+    }
+    let mut base_pc = -1i32;
+    let mut base_line = proto.line_defined;
+    for abs in &proto.abs_line_info {
+        let abs_pc = abs.pc;
+        if abs_pc <= pc as i32 && abs_pc > base_pc {
+            base_pc = abs_pc;
+            base_line = abs.line;
+        }
+    }
+    let mut line = base_line;
+    let mut i = base_pc + 1;
+    while i <= pc as i32 {
+        let delta = proto.line_info[i as usize];
+        if delta != i8::MIN {
+            line += delta as i32;
+        }
+        i += 1;
+    }
+    line
+}
+
+/// 对应 C 的 luaL_where：返回 "source:line: " 形式的位置前缀
+///
+/// level 1 表示调用 error/assert 的 Lua 函数（当前正在执行的帧）。
+/// 当前实现通过 LuaState 直接支持 level=1；更高层级返回空字符串，
+/// 与 C 中 lua_getstack 失败时的行为一致。
+fn lua_l_where(state: &LuaState, level: usize) -> String {
+    if level == 0 {
+        return String::new();
+    }
+    if level != 1 {
+        return String::new();
+    }
+    if state.base == 0 || state.base > state.stack.len() {
+        return String::new();
+    }
+    let closure = match &state.stack[state.base - 1] {
+        TValue::LClosure(c) => c,
+        _ => return String::new(),
+    };
+    let line = get_func_line(&closure.proto, state.pc);
+    if line <= 0 {
+        return String::new();
+    }
+    let source = closure
+        .proto
+        .source
+        .as_ref()
+        .map(short_src)
+        .unwrap_or_else(|| "?".to_string());
+    format!("{}:{}: ", source, line)
+}
+
 /// error(msg [, level]) — 对应 C 的 luaB_error
-fn call_error(state: &mut LuaState, a: usize, _nargs: usize, _nresults: i32) -> Result<(), VmError> {
+fn call_error(state: &mut LuaState, a: usize, nargs: usize, _nresults: i32) -> Result<(), VmError> {
     let msg = get_arg(state, a, 0);
-    let err_msg = match &msg {
+    let level = if nargs >= 2 {
+        get_arg(state, a, 1).as_integer().unwrap_or(1) as i32
+    } else {
+        1
+    };
+    let mut err_msg = match &msg {
         TValue::Str(s) => s.as_str().to_string(),
         _ => lua_value_to_string(&msg),
     };
+    if matches!(msg, TValue::Str(_)) && level > 0 {
+        let prefix = lua_l_where(state, level as usize);
+        err_msg = format!("{}{}", prefix, err_msg);
+    }
     Err(VmError::RuntimeError(err_msg))
 }
 
@@ -649,7 +779,11 @@ fn call_assert(
             push_results(state, a, nresults, results);
             Ok(())
         }
-        Err(msg) => Err(VmError::RuntimeError(msg)),
+        Err(msg) => {
+            // C 中 luaB_assert 最终调用 luaB_error(level=1)，error 会拼接 where 信息
+            let prefix = lua_l_where(state, 1);
+            Err(VmError::RuntimeError(format!("{}{}", prefix, msg)))
+        }
     }
 }
 

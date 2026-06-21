@@ -380,6 +380,15 @@ pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
     fs.proto.num_params = 0;
     fs.proto.flag = PF_VAHID;
 
+    // 设置源名 — 对应 C 的 lexstate.source = luaX_newstring(L, name, ...)
+    // 源名用于错误消息和堆栈回溯中的位置信息
+    fs.proto.source = Some(crate::strings::LuaString::Short(std::sync::Arc::new(
+        crate::strings::ShortString {
+            hash: 0,
+            contents: ls.chunk_name.clone(),
+        }
+    )));
+
     // Like C's mainfunc: register _ENV as upvalue #0 (instack=1, idx=0).
     // In C, _ENV is also a local variable at register 0, but we handle it
     // differently: _ENV is treated as an upvalue in the main function,

@@ -98,6 +98,24 @@ pub struct LuaState {
     pub stdout: Box<dyn Write>,
     pub global_state: Rc<GlobalState>,
     pub ci: Option<Box<CallInfo>>,
+    /// 调用栈信息，用于构建堆栈回溯 — 对应 C 的 CallInfo 链表
+    /// 每个元素是 (source, line, function_name)
+    pub call_info: Vec<CallInfoEntry>,
+    /// 最后一次错误的堆栈回溯字符串
+    pub last_traceback: String,
+    /// 最后一次错误的格式化消息（含 source:line 前缀）
+    pub last_error_msg: String,
+    /// 当前正在调用的 C 函数名（用于 traceback）— None 表示不在 C 函数中
+    pub last_c_function: Option<String>,
+}
+
+/// 调用栈条目 — 用于堆栈回溯
+#[derive(Clone)]
+pub struct CallInfoEntry {
+    pub source: String,
+    pub line: i32,
+    pub name: String,
+    pub is_c: bool,
 }
 
 fn G(l: &LuaState) -> &GlobalState {
@@ -158,6 +176,10 @@ impl LuaState {
             stdout: Box::new(std::io::stdout()),
             global_state: Rc::new(GlobalState { gcstopem: false }),
             ci: None,
+            call_info: Vec::new(),
+            last_traceback: String::new(),
+            last_error_msg: String::new(),
+            last_c_function: None,
         }
     }
 
@@ -291,6 +313,10 @@ impl LuaState {
             stdout: Box::new(std::io::stdout()),
             global_state: Rc::new(GlobalState { gcstopem: false }),
             ci: None,
+            call_info: Vec::new(),
+            last_traceback: String::new(),
+            last_error_msg: String::new(),
+            last_c_function: None,
         };
         state
     }
@@ -366,6 +392,10 @@ impl LuaState {
             stdout: Box::new(std::io::stdout()),
             global_state: Rc::new(GlobalState { gcstopem: false }),
             ci: None,
+            call_info: Vec::new(),
+            last_traceback: String::new(),
+            last_error_msg: String::new(),
+            last_c_function: None,
         }
     }
 }
@@ -567,6 +597,11 @@ impl LuaState {
             LuaType::UserData => "userdata",
             LuaType::Thread => "thread",
         }
+    }
+
+    /// 返回指定栈位置值的类型名 — 对应 C 的 luaL_typename
+    pub fn typename_at(&self, idx: isize) -> &'static str {
+        self.typename(self.get_type(idx))
     }
 
     pub fn to_integer(&self, idx: isize) -> Option<i64> {
@@ -790,6 +825,59 @@ impl LuaState {
     pub fn traceback(&mut self, msg: &str, _level: usize) {
         let trace = format!("stack traceback:\n\t...\n{}", msg);
         self.push_string(&trace);
+    }
+
+    /// 构建堆栈回溯字符串 — 对应 C 的 luaL_traceback
+    ///
+    /// 格式:
+    /// ```
+    /// msg
+    /// stack traceback:
+    ///         [C]: in global 'assert'
+    ///         (command line):1: in main chunk
+    ///         [C]: in ?
+    /// ```
+    pub fn traceback_string(&self, msg: &str, _level: usize) -> String {
+        let mut result = String::new();
+        if !msg.is_empty() {
+            result.push_str(msg);
+            result.push('\n');
+        }
+        result.push_str("stack traceback:");
+        // 从 call_info 构建回溯
+        if self.call_info.is_empty() {
+            // 没有调用信息，使用简化的回溯
+            result.push_str("\n\t[C]: in ?");
+        } else {
+            for entry in &self.call_info {
+                result.push('\n');
+                result.push('\t');
+                if entry.is_c {
+                    result.push_str("[C]: in ");
+                    result.push_str(&entry.name);
+                } else {
+                    if entry.line > 0 {
+                        result.push_str(&format!("{}:{}: in ", entry.source, entry.line));
+                    } else {
+                        result.push_str(&format!("{}: in ", entry.source));
+                    }
+                    result.push_str(&entry.name);
+                }
+            }
+            // 最后添加 [C]: in ?
+            result.push_str("\n\t[C]: in ?");
+        }
+        result
+    }
+
+    /// 推入调用栈条目 — 用于堆栈回溯
+    pub fn push_call_info(&mut self, entry: CallInfoEntry) {
+        self.call_info.push(entry);
+    }
+
+    /// 弹出调用栈条目
+    pub fn pop_call_info(&mut self) {
+        self.call_info.pop();
     }
 
     pub fn error(&mut self, msg: &str) -> String {
@@ -1058,7 +1146,17 @@ impl LuaState {
                     }
                     Err(e) => {
                         self.stack.truncate(func_idx);
-                        self.push_string(&format!("{}", e));
+                        // 优先使用 build_traceback 格式化的错误消息（含 source:line 前缀）
+                        if !self.last_error_msg.is_empty() {
+                            let msg = self.last_error_msg.clone();
+                            self.last_error_msg.clear();
+                            self.push_string(&msg);
+                        } else {
+                            match e {
+                                VmError::RuntimeError(str) => self.push_string(&str),
+                                _ => self.push_string(&format!("{}", e)),
+                            }
+                        }
                         ERR_RUN
                     }
                 }
