@@ -940,7 +940,7 @@ impl LuaState {
             .map(|f| format!("@{}", f))
             .unwrap_or_else(|| "=stdin".to_string());
 
-        let bytes = match filename {
+        let mut bytes = match filename {
             Some(name) => match std::fs::read(name) {
                 Ok(b) => b,
                 Err(err) => {
@@ -958,7 +958,7 @@ impl LuaState {
             }
         };
 
-        self.load_bytes(&bytes, &chunk_name, mode)
+        self.load_bytes(&mut bytes, &chunk_name, mode)
     }
 
     pub fn load_file(&mut self, fname: Option<&str>) -> i32 {
@@ -966,9 +966,9 @@ impl LuaState {
     }
 
     /// 从已读取的字节数组加载 Lua 代码。处理 BOM、shebang、编码与二进制签名。
-    fn load_bytes(&mut self, bytes: &[u8], chunk_name: &str, mode: Option<&str>) -> i32 {
-        let after_bom = skip_bom(bytes);
-        let (_, first, rest) = skip_comment(after_bom);
+    fn load_bytes(&mut self, bytes: &mut [u8], chunk_name: &str, mode: Option<&str>) -> i32 {
+        let after_bom = skip_bom_mut(bytes);
+        let (skipped_comment, first, rest, rest_start) = skip_comment(after_bom);
 
         let is_binary = first == Some(LUA_SIGNATURE[0]);
 
@@ -984,7 +984,17 @@ impl LuaState {
             self.push_string("attempt to load a binary chunk");
             return ERR_SYNTAX;
         }
-
+        let rest =
+        if skipped_comment {
+            if let Some(rest_start) = rest_start {
+                after_bom[rest_start - 1] = b'\n';
+                &after_bom[(rest_start - 1)..]
+            } else {
+                rest
+            }
+        } else {
+            rest
+        };
         let source = decode_source_bytes(&rest);
         self.load_buffer(&source, chunk_name)
     }
@@ -1381,20 +1391,40 @@ impl LuaState {
 // ============================================================================
 
 /// 跳过 UTF-8 BOM（EF BB BF）。若 BOM 不完整则保留原字节，与 C 的 `skipBOM` 行为一致。
-fn skip_bom(bytes: &[u8]) -> &[u8] {
-    if bytes.starts_with(UTF8_BOM) {
-        &bytes[UTF8_BOM.len()..]
-    } else {
-        bytes
-    }
+macro_rules! skip_bom_fn {
+    // 入口：$mut 可以是空或 `mut`
+    ($name:ident, $($mut:tt)?) => {
+        pub fn $name(bytes: & $($mut)? [u8]) -> & $($mut)? [u8] {
+            const BOM: &[u8] = &[0xEF, 0xBB, 0xBF];
+            if bytes.starts_with(BOM) {
+                let n = BOM.len();
+                // 用内部辅助宏根据 $mut 展开不同的切片方式
+                skip_bom_fn!(@subslice bytes, $($mut)?, n)
+            } else {
+                bytes
+            }
+        }
+    };
+    // 不可变：普通索引
+    (@subslice $bytes:ident, , $n:ident) => {
+        & $bytes[$n..]
+    };
+    // 可变：split_at_mut
+    (@subslice $bytes:ident, mut, $n:ident) => {
+        $bytes.split_at_mut($n).1
+    };
 }
+
+// 生成两个函数，无需重复写 starts_with 和 if 逻辑
+skip_bom_fn!(skip_bom,);
+skip_bom_fn!(skip_bom_mut, mut);
 
 /// 跳过可选的首行注释（以 '#' 开头的 shebang/Unix exec 行）。
 ///
 /// 返回三元组：`(是否跳过了首行, 首字符, 首字符之后的剩余字节)`。
 /// 与 C 的 `skipcomment` 一致：`first` 是从流中读取出来的字符，
 /// `rest` 包含 `first`，`load_bytes` 不需要再把 `first` 放回缓冲区。
-fn skip_comment(bytes: &[u8]) -> (bool, Option<u8>, &[u8]) {
+fn skip_comment(bytes: &[u8]) -> (bool, Option<u8>, &[u8], Option<usize>) {
     if bytes.first() == Some(&b'#') {
         let mut pos = 1;
         while pos < bytes.len() && bytes[pos] != b'\n' {
@@ -1407,12 +1437,12 @@ fn skip_comment(bytes: &[u8]) -> (bool, Option<u8>, &[u8]) {
         // first 是注释后的第一个字符；rest 是该字符之后的字节
         let first = bytes.get(pos).copied();
         let rest_start = (pos).min(bytes.len());
-        (true, first, &bytes[rest_start..])
+        (true, first, &bytes[rest_start..], Some(rest_start))
     } else {
         // first 是第一个字符；rest 是该字符之后的字节
         let first = bytes.first().copied();
         let rest = if bytes.is_empty() { &[] } else { &bytes[0..] };
-        (false, first, rest)
+        (false, first, rest, None)
     }
 }
 
@@ -1544,17 +1574,17 @@ mod tests {
 
     #[test]
     fn test_skip_comment() {
-        let (skipped, first, rest) = skip_comment(b"#!/bin/lua\nprint(1)");
+        let (skipped, first, rest, _) = skip_comment(b"#!/bin/lua\nprint(1)");
         assert!(skipped);
         assert_eq!(first, Some(b'p'));
         assert_eq!(rest, b"print(1)");
 
-        let (skipped, first, rest) = skip_comment(b"-- no shebang\nreturn");
+        let (skipped, first, rest, _) = skip_comment(b"-- no shebang\nreturn");
         assert!(!skipped);
         assert_eq!(first, Some(b'-'));
         assert_eq!(rest, b"-- no shebang\nreturn");
 
-        let (skipped, first, rest) = skip_comment(b"#only shebang");
+        let (skipped, first, rest, _) = skip_comment(b"#only shebang");
         assert!(skipped);
         assert_eq!(first, None);
         assert!(rest.is_empty());
