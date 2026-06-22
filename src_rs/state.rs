@@ -1403,6 +1403,8 @@ fn skip_bom(bytes: &[u8]) -> &[u8] {
 /// 跳过可选的首行注释（以 '#' 开头的 shebang/Unix exec 行）。
 ///
 /// 返回三元组：`(是否跳过了首行, 首字符, 首字符之后的剩余字节)`。
+/// 与 C 的 `skipcomment` 一致：`first` 是从流中读取出来的字符，
+/// `rest` 不包含 `first`，因为 `load_bytes` 会单独把 `first` 放回缓冲区。
 fn skip_comment(bytes: &[u8]) -> (bool, Option<u8>, &[u8]) {
     if bytes.first() == Some(&b'#') {
         let mut pos = 1;
@@ -1413,9 +1415,15 @@ fn skip_comment(bytes: &[u8]) -> (bool, Option<u8>, &[u8]) {
         if pos < bytes.len() && bytes[pos] == b'\n' {
             pos += 1;
         }
-        (true, bytes.get(pos).copied(), &bytes[pos..])
+        // first 是注释后的第一个字符；rest 是该字符之后的字节
+        let first = bytes.get(pos).copied();
+        let rest_start = (pos + 1).min(bytes.len());
+        (true, first, &bytes[rest_start..])
     } else {
-        (false, bytes.get(0).copied(), bytes)
+        // first 是第一个字符；rest 是该字符之后的字节
+        let first = bytes.first().copied();
+        let rest = if bytes.is_empty() { &[] } else { &bytes[1..] };
+        (false, first, rest)
     }
 }
 
