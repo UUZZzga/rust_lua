@@ -49,6 +49,7 @@ pub const BASE_WARN: usize = 19;
 // require 函数标签
 pub const BASE_REQUIRE: usize = 22;
 pub const BASE_LOAD: usize = 23;
+pub const BASE_COLLECTGARBAGE: usize = 24;
 
 // 迭代器辅助函数标签 (不在 is_base_tag 范围内, 只在 TFORCALL 中处理)
 // 对应 C 的 ipairsaux 和 next 迭代器函数
@@ -58,6 +59,7 @@ pub const BASE_NEXT_ITER: usize = 21;
 /// 标签是否属于基础库
 pub fn is_base_tag(tag: usize) -> bool {
     (tag >= BASE_PRINT && tag <= BASE_WARN) || tag == BASE_REQUIRE || tag == BASE_LOAD
+        || tag == BASE_COLLECTGARBAGE
 }
 
 /// 判断标签是否为已知的函数标签 (用于 type/tostring 显示)
@@ -409,6 +411,7 @@ pub fn base_function_name(tag: usize) -> Option<&'static str> {
         BASE_WARN => Some("warn"),
         BASE_REQUIRE => Some("require"),
         BASE_LOAD => Some("load"),
+        BASE_COLLECTGARBAGE => Some("collectgarbage"),
         _ => None,
     }
 }
@@ -446,6 +449,7 @@ pub fn call_base_function(
         BASE_WARN => call_warn(state, a, nargs, nresults),
         BASE_REQUIRE => call_require(state, a, nargs, nresults),
         BASE_LOAD => call_load(state, a, nargs, nresults),
+        BASE_COLLECTGARBAGE => call_collectgarbage(state, a, nargs, nresults),
         _ => Err(VmError::RuntimeError(format!("unknown base function tag: {}", tag))),
     };
 
@@ -1145,7 +1149,7 @@ fn call_require(
 /// load(chunk [, chunkname [, mode [, env]]]) — 对应 C 的 lua_load
 ///
 /// 加载并编译 Lua 代码块, 返回编译后的函数
-/// 目前仅支持字符串参数 (不支持 reader 函数)
+/// 支持文本和二进制格式 (检测 \x1bLua 签名)
 fn call_load(
     state: &mut LuaState,
     a: usize,
@@ -1170,18 +1174,31 @@ fn call_load(
     };
 
     // 获取可选的 chunkname 参数
+    // 对应 C 的 luaL_optstring(L, 2, c) — 未提供时默认为源代码字符串
     let chunkname = if nargs >= 2 {
         let name_val = get_arg(state, a, 1);
         match &name_val {
             TValue::Str(s) => s.as_str().to_string(),
-            _ => "=?".to_string(),
+            TValue::Nil(_) => source.clone(),
+            _ => source.clone(),
         }
     } else {
-        "=?".to_string()
+        source.clone()
     };
 
-    // 编译源代码
-    match crate::compiler::compile(state, &source, &chunkname) {
+    // 检测二进制格式 (以 \x1bLua 开头)
+    let is_binary = source.as_bytes().starts_with(b"\x1bLua");
+
+    let proto_result = if is_binary {
+        // 二进制格式: 使用 undump
+        crate::compiler::bytecode_dump::undump_to_proto(source.as_bytes())
+            .map_err(|e| format!("bad binary chunk: {}", e))
+    } else {
+        // 文本格式: 编译源代码
+        crate::compiler::compile(state, &source, &chunkname)
+    };
+
+    match proto_result {
         Ok(proto) => {
             // 创建闭包, 设置 _ENV 上值为全局表
             let nup = proto.size_upvalues as usize;
@@ -1353,6 +1370,85 @@ pub fn call_next_iter(
     call_next(state, a, nargs, nresults)
 }
 
+/// collectgarbage([opt [, arg]]) — 对应 C 的 luaB_collectgarbage
+///
+/// 简化实现: 由于当前 GC 是占位实现, 大部分选项返回合理默认值。
+/// 支持的选项:
+/// - "collect" (默认): 执行完整 GC, 返回 0
+/// - "stop": 停止 GC, 返回 0
+/// - "restart": 重启 GC, 返回 0
+/// - "count": 返回内存使用量 (KB, 简化为 0)
+/// - "step": 执行一步, 返回 boolean (是否完成)
+/// - "isrunning": 返回 GC 是否运行
+/// - "generational"/"incremental": 切换模式, 返回之前的模式字符串
+/// - "param": 查询/设置 GC 参数 (简化, 返回 0)
+fn call_collectgarbage(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    let opt = if nargs >= 1 {
+        match get_arg(state, a, 0) {
+            TValue::Str(s) => s.as_str().to_string(),
+            _ => "collect".to_string(),
+        }
+    } else {
+        "collect".to_string()
+    };
+
+    let result = match opt.as_str() {
+        "collect" => {
+            state.gc.full_gc();
+            TValue::Integer(0)
+        }
+        "stop" => {
+            state.gc_stop();
+            TValue::Integer(0)
+        }
+        "restart" => {
+            state.gc_restart();
+            TValue::Integer(0)
+        }
+        "count" => {
+            // 返回内存使用量 (KB) — 简化为 0
+            TValue::Float(0.0)
+        }
+        "countb" => {
+            // 返回内存使用量的小数部分 (字节) — 简化为 0
+            TValue::Integer(0)
+        }
+        "step" => {
+            state.gc.step();
+            TValue::Boolean(true)
+        }
+        "isrunning" => {
+            TValue::Boolean(state.gc.is_running())
+        }
+        "generational" => {
+            state.gc_gen();
+            TValue::Str(state.intern_str("incremental"))
+        }
+        "incremental" => {
+            // 简化: 返回之前的模式
+            TValue::Str(state.intern_str("incremental"))
+        }
+        "param" => {
+            // 简化: 返回 0
+            TValue::Integer(0)
+        }
+        _ => {
+            return Err(VmError::RuntimeError(format!(
+                "bad argument #1 to 'collectgarbage' (invalid option '{}')",
+                opt
+            )));
+        }
+    };
+
+    push_single_result(state, a, nresults, result);
+    Ok(())
+}
+
 // ============================================================================
 // 打开基础库 — 对应 C 的 luaopen_base
 // ============================================================================
@@ -1396,6 +1492,7 @@ pub fn open_base_lib(state: &mut LuaState) {
     register(state, "warn", BASE_WARN);
     register(state, "require", BASE_REQUIRE);
     register(state, "load", BASE_LOAD);
+    register(state, "collectgarbage", BASE_COLLECTGARBAGE);
 
     // 设置 _G 全局变量 (指向全局表自身)
     let globals_clone = state.globals.clone();

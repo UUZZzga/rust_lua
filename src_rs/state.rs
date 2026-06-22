@@ -109,15 +109,31 @@ pub struct LuaState {
     pub last_c_function: Option<String>,
     /// 数学库随机数生成器状态 — 对应 C 的 RanState (math.random/randomseed)
     pub math_random_state: Option<Box<crate::stdlib::math_lib::RandState>>,
+    /// debug hook 函数 — 对应 C 的 L->hook
+    pub hook_func: Option<TValue>,
+    /// debug hook 掩码 — 对应 C 的 L->hookmask
+    pub hook_mask: i32,
+    /// debug hook count — 对应 C 的 L->basehookcount
+    pub hook_count: i32,
+    /// 上次 line hook 检查的 pc — 对应 C 的 L->oldpc（指令索引，不是行号）
+    pub hook_old_pc: i32,
 }
 
-/// 调用栈条目 — 用于堆栈回溯
+/// 调用栈条目 — 用于堆栈回溯和 debug.getinfo
 #[derive(Clone)]
 pub struct CallInfoEntry {
     pub source: String,
     pub line: i32,
     pub name: String,
     pub is_c: bool,
+    /// Lua 函数引用（C 函数为 None）
+    pub closure: Option<crate::objects::LClosure>,
+    /// 栈帧基址（对应 C 的 ci->func + 1）
+    pub base: usize,
+    /// 调用时的 PC（用于计算 currentline）
+    pub saved_pc: usize,
+    /// 函数名类型: "local", "global", "method", "field", "hook", ""
+    pub namewhat: String,
 }
 
 fn G(l: &LuaState) -> &GlobalState {
@@ -183,6 +199,10 @@ impl LuaState {
             last_error_msg: String::new(),
             last_c_function: None,
             math_random_state: None,
+            hook_func: None,
+            hook_mask: 0,
+            hook_count: 0,
+            hook_old_pc: 0,
         }
     }
 
@@ -321,6 +341,10 @@ impl LuaState {
             last_error_msg: String::new(),
             last_c_function: None,
             math_random_state: None,
+            hook_func: None,
+            hook_mask: 0,
+            hook_count: 0,
+            hook_old_pc: 0,
         };
         state
     }
@@ -401,6 +425,10 @@ impl LuaState {
             last_error_msg: String::new(),
             last_c_function: None,
             math_random_state: None,
+            hook_func: None,
+            hook_mask: 0,
+            hook_count: 0,
+            hook_old_pc: 0,
         }
     }
 }
@@ -1249,6 +1277,25 @@ impl LuaState {
                         }
                     }
                 }
+                // Debug 库函数 (标签 500-519)
+                // 对应原 C 源码 ldblib.cpp 的各个函数
+                if crate::stdlib::debug_lib::is_debug_tag(tag_val) {
+                    match crate::stdlib::debug_lib::call_debug_function(
+                        tag_val, self, func_idx, nargs, nresults,
+                    ) {
+                        Ok(()) => return 0,
+                        Err(crate::execute::VmError::RuntimeError(msg)) => {
+                            self.stack.truncate(func_idx);
+                            self.push_string(&msg);
+                            return ERR_RUN;
+                        }
+                        Err(e) => {
+                            self.stack.truncate(func_idx);
+                            self.push_string(&format!("{}", e));
+                            return ERR_RUN;
+                        }
+                    }
+                }
                 // 字符串库函数 (标签 100+)
                 if tag_val >= 100 {
                     match crate::stdlib::string_lib::call_string_function(
@@ -1369,6 +1416,9 @@ impl LuaState {
 
         // 打开 Table 库 (注册 table 全局表, 包含 concat/unpack/pack/insert/remove 等)
         crate::stdlib::table_lib::open_table_lib(self);
+
+        // 打开 Debug 库 (注册 debug 全局表, 包含 getinfo/getlocal/setupvalue/traceback/sethook 等)
+        crate::stdlib::debug_lib::open_debug_lib(self);
     }
 
     // ====== Hook ======

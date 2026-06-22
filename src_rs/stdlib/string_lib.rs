@@ -39,6 +39,7 @@ pub const STR_PACKSIZE: usize = 114;
 pub const STR_UNPACK: usize = 115;
 /// string.gmatch 迭代器标签 (在 TFORCALL 中调用)
 pub const STR_GMATCH_ITER: usize = 116;
+pub const STR_DUMP: usize = 117;
 
 /// 检查标签是否为字符串库标签 (包括 gmatch 迭代器)
 pub fn is_string_tag(tag: usize) -> bool {
@@ -2928,6 +2929,50 @@ pub fn call_string_function(
             // 参数: state_table (表), ctrl (忽略)
             call_gmatch_iter(state, a, nargs, nresults)
         }
+        STR_DUMP => {
+            // string.dump(f [, strip]) — 对应 C 的 str_dump
+            // 将 Lua 函数序列化为二进制格式
+            if nargs == 0 {
+                return Err(VmError::RuntimeError(
+                    "bad argument #1 to 'dump' (function expected, got no value)".to_string(),
+                ));
+            }
+            let stack_idx = a + 1;
+            if stack_idx >= state.stack.len() {
+                return Err(VmError::RuntimeError(
+                    "bad argument #1 to 'dump' (function expected, got no value)".to_string(),
+                ));
+            }
+            let func_val = state.stack[stack_idx].clone();
+            let strip = if nargs >= 2 {
+                let strip_idx = a + 2;
+                if strip_idx < state.stack.len() {
+                    matches!(&state.stack[strip_idx], TValue::Boolean(true))
+                } else {
+                    false
+                }
+            } else {
+                false
+            };
+            match &func_val {
+                TValue::LClosure(cl) => {
+                    let data = crate::compiler::bytecode_dump::dump_proto(&cl.proto, strip);
+                    push_results(state, a, nresults, vec![TValue::Str(
+                        crate::strings::LuaString::Long(crate::strings::LongString {
+                            contents: unsafe { String::from_utf8_unchecked(data) },
+                            hash: std::sync::atomic::AtomicU64::new(0),
+                            extra: std::sync::atomic::AtomicU8::new(0),
+                            ptr_id: crate::gc::new_ptr_id(),
+                        })
+                    )]);
+                    Ok(())
+                }
+                _ => Err(VmError::RuntimeError(format!(
+                    "bad argument #1 to 'dump' (function expected, got {})",
+                    func_val.ty()
+                ))),
+            }
+        }
         _ => Err(VmError::RuntimeError(format!("unknown string function tag: {}", tag))),
     }
 }
@@ -3006,6 +3051,7 @@ fn create_string_lib_table(state: &LuaState) -> Table {
     register(&mut lib, "pack", STR_PACK);
     register(&mut lib, "packsize", STR_PACKSIZE);
     register(&mut lib, "unpack", STR_UNPACK);
+    register(&mut lib, "dump", STR_DUMP);
     lib
 }
 

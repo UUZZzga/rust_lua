@@ -7,3 +7,4 @@ pub mod string_lib;
 pub mod math_lib;
 pub mod utf8_lib;
 pub mod table_lib;
+pub mod debug_lib;

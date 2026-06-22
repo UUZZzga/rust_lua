@@ -93,9 +93,8 @@ struct CallFrame {
 // 辅助函数 — 用于堆栈回溯
 // ============================================================================
 
-/// 对应 C 的 luaO_chunkid：将源名转换为短源名
-fn short_source(source: &crate::strings::LuaString) -> String {
-    let bytes = source.as_str().as_bytes();
+/// 对应 C 的 luaO_chunkid：将源名转换为短源名（从字节切片）
+fn short_source_bytes(bytes: &[u8]) -> String {
     if bytes.is_empty() {
         return "?".to_string();
     }
@@ -115,6 +114,33 @@ fn short_source(source: &crate::strings::LuaString) -> String {
                 format!("[string \"{}\"]", head)
             }
         }
+    }
+}
+
+/// 对应 C 的 luaO_chunkid：将源名转换为短源名
+fn short_source(source: &crate::strings::LuaString) -> String {
+    short_source_bytes(source.as_str().as_bytes())
+}
+
+/// 格式化函数名 — 对应 C 的 pushfuncname
+///
+/// 逻辑:
+/// 1. 若 namewhat 非空: `"{namewhat} '{name}'"` (如 "global 'foo'", "method 'bar'")
+/// 2. 若是 main chunk: "main chunk"
+/// 3. 若有闭包信息 (Lua 函数): "function '<src>:<linedefined>'"
+/// 4. 否则: "?"
+fn format_func_name(namewhat: &str, name: &str, is_main: bool, closure: Option<&LClosure>) -> String {
+    if !namewhat.is_empty() {
+        format!("{} '{}'", namewhat, name)
+    } else if is_main {
+        "main chunk".to_string()
+    } else if let Some(c) = closure {
+        let src = c.proto.source.as_ref()
+            .map(|s| short_source(s))
+            .unwrap_or_else(|| "?".to_string());
+        format!("function <{}:{}>", src, c.proto.line_defined)
+    } else {
+        "?".to_string()
     }
 }
 
@@ -142,6 +168,207 @@ fn get_proto_line(proto: &Proto, pc: usize) -> i32 {
         i += 1;
     }
     line
+}
+
+/// 从调用指令的上下文获取函数名和 namewhat
+/// 对应 C 的 funcnamefromcode
+///
+/// 逻辑:
+/// 1. 获取 OP_CALL 指令的操作数 A（函数寄存器）
+/// 2. 调用 get_obj_name 查找寄存器 A 的值是如何被设置的
+fn get_func_name(state: &LuaState, call_pc: usize) -> (String, String) {
+    if call_pc >= state.code.len() {
+        return (String::new(), String::new());
+    }
+    // 获取调用者的 proto
+    if state.base == 0 || state.base > state.stack.len() {
+        return (String::new(), String::new());
+    }
+    let prev_closure = match &state.stack[state.base - 1] {
+        TValue::LClosure(c) => c.clone(),
+        _ => return (String::new(), String::new()),
+    };
+    let proto = &prev_closure.proto;
+
+    // 获取 OP_CALL 指令的操作数 A（函数寄存器）
+    let call_inst = state.code[call_pc];
+    let func_reg = opcodes::getarg_a(call_inst) as usize;
+
+    get_obj_name(proto, call_pc, func_reg)
+}
+
+/// 查找设置指定寄存器的指令
+/// 对应 C 的 findsetreg
+fn find_set_reg(proto: &Proto, lastpc: usize, reg: usize) -> i32 {
+    let mut setreg: i32 = -1;
+    if lastpc == 0 || lastpc > proto.code.len() {
+        return -1;
+    }
+    for pc in 0..lastpc {
+        let inst = proto.code[pc];
+        let op = opcodes::get_opcode(inst);
+        let a = opcodes::getarg_a(inst) as usize;
+        let change = match op {
+            OpCode::LOADNIL => {
+                let b = opcodes::getarg_b(inst) as usize;
+                a <= reg && reg <= a + b
+            }
+            OpCode::TFORCALL => reg >= a + 2,
+            OpCode::CALL | OpCode::TAILCALL => reg >= a,
+            _ => opcodes::test_a_mode(op) && reg == a,
+        };
+        if change {
+            setreg = pc as i32;
+        }
+    }
+    setreg
+}
+
+/// 查找寄存器对应的局部变量名
+/// 对应 C 的 luaF_getlocalname
+fn get_local_name_at(proto: &Proto, reg: usize, pc: usize) -> Option<String> {
+    // reg 是 0-based 寄存器编号，local_number 是 1-based
+    let local_number = reg + 1;
+    let mut count = local_number;
+    for loc_var in &proto.loc_vars {
+        if (loc_var.start_pc as usize) > pc {
+            break;
+        }
+        if (loc_var.start_pc as usize) <= pc && pc < (loc_var.end_pc as usize) {
+            count -= 1;
+            if count == 0 {
+                if let Some(ref name) = loc_var.varname {
+                    return Some(name.as_str().to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// 获取寄存器值的 name 和 namewhat
+/// 对应 C 的 getobjname + basicgetobjname
+fn get_obj_name(proto: &Proto, pc: usize, reg: usize) -> (String, String) {
+    // 先查找局部变量
+    if let Some(name) = get_local_name_at(proto, reg, pc) {
+        return (name, "local".to_string());
+    }
+
+    // 查找设置 reg 的指令
+    let set_pc = find_set_reg(proto, pc, reg);
+    if set_pc < 0 || set_pc as usize >= proto.code.len() {
+        return (String::new(), String::new());
+    }
+    let set_pc = set_pc as usize;
+    let set_inst = proto.code[set_pc];
+    let set_op = opcodes::get_opcode(set_inst);
+
+    match set_op {
+        OpCode::MOVE => {
+            // MOVE A B: R[A] := R[B]
+            let b = opcodes::getarg_b(set_inst) as usize;
+            if b < reg {
+                // 递归查找 B 的 name
+                return get_obj_name(proto, set_pc, b);
+            }
+            (String::new(), String::new())
+        }
+        OpCode::GETUPVAL => {
+            // GETUPVAL A B: R[A] := Upval[B]
+            let b = opcodes::getarg_b(set_inst) as usize;
+            if b < proto.upvalues.len() {
+                if let Some(ref name) = proto.upvalues[b].name {
+                    return (name.as_str().to_string(), "upvalue".to_string());
+                }
+            }
+            (String::new(), String::new())
+        }
+        OpCode::GETTABUP => {
+            // GETTABUP A B C: R[A] := Upval[B][K[C]]
+            let c = opcodes::getarg_c(set_inst) as usize;
+            let b = opcodes::getarg_b(set_inst) as usize;
+            let name = if c < proto.constants.len() {
+                match &proto.constants[c] {
+                    TValue::Str(s) => s.as_str().to_string(),
+                    _ => "?".to_string(),
+                }
+            } else {
+                "?".to_string()
+            };
+            // 检查上值是否是 _ENV
+            let is_env = b < proto.upvalues.len()
+                && proto.upvalues[b].name.as_ref().map(|s| s.as_str()) == Some("_ENV");
+            let namewhat = if is_env { "global" } else { "field" };
+            (name, namewhat.to_string())
+        }
+        OpCode::GETFIELD => {
+            // GETFIELD A B C: R[A] := R[B][K[C]]
+            let c = opcodes::getarg_c(set_inst) as usize;
+            let b = opcodes::getarg_b(set_inst) as usize;
+            let name = if c < proto.constants.len() {
+                match &proto.constants[c] {
+                    TValue::Str(s) => s.as_str().to_string(),
+                    _ => "?".to_string(),
+                }
+            } else {
+                "?".to_string()
+            };
+            // 检查表寄存器 B 是否是 _ENV
+            let is_env = is_env_register(proto, set_pc, b);
+            let namewhat = if is_env { "global" } else { "field" };
+            (name, namewhat.to_string())
+        }
+        OpCode::GETTABLE => {
+            // GETTABLE A B C: R[A] := R[B][R[C]]
+            let b = opcodes::getarg_b(set_inst) as usize;
+            // 检查表寄存器 B 是否是 _ENV
+            let is_env = is_env_register(proto, set_pc, b);
+            let namewhat = if is_env { "global" } else { "field" };
+            ("?".to_string(), namewhat.to_string())
+        }
+        OpCode::GETI => {
+            // GETI A B C: R[A] := R[B][R[C]]
+            ("integer index".to_string(), "field".to_string())
+        }
+        OpCode::SELF => {
+            // SELF A B C: A+1 := B; A := B[K[C]]
+            let c = opcodes::getarg_c(set_inst) as usize;
+            let name = if c < proto.constants.len() {
+                match &proto.constants[c] {
+                    TValue::Str(s) => s.as_str().to_string(),
+                    _ => "?".to_string(),
+                }
+            } else {
+                "?".to_string()
+            };
+            (name, "method".to_string())
+        }
+        _ => (String::new(), String::new()),
+    }
+}
+
+/// 检查寄存器 reg 是否是 _ENV（局部变量或上值）
+/// 对应 C 的 isEnv
+fn is_env_register(proto: &Proto, pc: usize, reg: usize) -> bool {
+    // 先查找局部变量
+    if let Some(name) = get_local_name_at(proto, reg, pc) {
+        return name == "_ENV";
+    }
+    // 查找设置 reg 的指令
+    let set_pc = find_set_reg(proto, pc, reg);
+    if set_pc < 0 || set_pc as usize >= proto.code.len() {
+        return false;
+    }
+    let set_inst = proto.code[set_pc as usize];
+    let set_op = opcodes::get_opcode(set_inst);
+    match set_op {
+        OpCode::GETUPVAL => {
+            let b = opcodes::getarg_b(set_inst) as usize;
+            b < proto.upvalues.len()
+                && proto.upvalues[b].name.as_ref().map(|s| s.as_str()) == Some("_ENV")
+        }
+        _ => false,
+    }
 }
 
 /// 检查错误消息是否已包含 source:line 前缀
@@ -195,6 +422,8 @@ impl VmExecutor {
         loop {
             if state.pc >= state.code.len() {
                 if let Some(frame) = call_stack.pop() {
+                    // 同时弹出调用栈信息
+                    state.call_info.pop();
                     state.code = frame.code;
                     state.constants = frame.constants;
                     state.upval_descs = frame.upval_descs;
@@ -208,6 +437,9 @@ impl VmExecutor {
                     state.closure_upvals = frame.closure_upvals;
                     state.tbc_list = frame.tbc_list;
                     state.open_upval = frame.open_upval;
+                    // 对应 C 的 rethook: L->oldpc = pcRel(ci->u.l.savedpc, ci_func(ci)->p)
+                    // 函数返回时，设置 oldpc 为调用者的 return_pc
+                    state.hook_old_pc = state.pc as i32;
                     continue;
                 }
                 return Ok(VmResult::Return { nresults: 0, result_base: state.base });
@@ -216,13 +448,36 @@ impl VmExecutor {
             let inst = state.code[state.pc];
             let op = opcodes::get_opcode(inst);
 
+            // 检查 line hook — 对应 C 的 luaG_traceexec
+            if state.hook_mask & 4 != 0 { // LUA_MASKLINE = 4
+                if state.hook_func.is_some() {
+                    let new_pc = state.pc as i32;
+                    // 对应 C: int oldpc = (L->oldpc < p->sizecode) ? L->oldpc : 0;
+                    let code_len = state.code.len() as i32;
+                    let old_pc = if state.hook_old_pc < code_len {
+                        state.hook_old_pc
+                    } else {
+                        0
+                    };
+                    // 对应 C: if (npci <= oldpc || changedline(p, oldpc, npci))
+                    if new_pc <= old_pc || Self::changed_line(state, old_pc, new_pc) {
+                        let current_line = Self::get_current_line(state);
+                        if current_line >= 0 {
+                            Self::call_line_hook(state, current_line)?;
+                        }
+                    }
+                    // 对应 C: L->oldpc = npci;
+                    state.hook_old_pc = new_pc;
+                }
+            }
+
             // 调试跟踪输出
             if trace_level >= 1 {
                 // 检测是否支持 ANSI 颜色
                 let use_color = std::env::var("TERM").ok()
                     .map(|t| t != "dumb")
                     .unwrap_or(false);
-                
+
                 // 打印完整代码列表，标记当前 PC
                 eprint!("{}", Self::dump_code_with_pc(state, state.pc, use_color));
                 
@@ -471,44 +726,103 @@ impl VmExecutor {
     /// 构建堆栈回溯并存储到 state.last_traceback — 对应 C 的 luaL_traceback
     ///
     /// 在错误发生时调用，从当前状态和调用栈构建回溯信息。
+    /// 遍历 call_info 中的所有调用帧，构建完整的堆栈回溯。
     /// 同时格式化错误消息（添加 source:line 前缀）并存储到 state.last_error_msg。
     fn build_traceback(state: &mut LuaState, _call_stack: &[CallFrame], error: &VmError) {
+        // LEVELS1/LEVELS2: 对应 C 的 traceback 层数限制
+        // 超过 LEVELS1+LEVELS2 帧时，只显示前 LEVELS1 帧和后 LEVELS2 帧，中间用 "..." 跳过
+        const LEVELS1: usize = 10;
+        const LEVELS2: usize = 11;
+
         let mut trace = String::from("stack traceback:");
 
-        // 获取当前源和行号
-        let (source, line) = if state.base > 0 && state.base <= state.stack.len() {
+        // 获取当前帧的源、行号和闭包
+        let (cur_source, cur_line, cur_closure) = if state.base > 0 && state.base <= state.stack.len() {
             if let TValue::LClosure(closure) = &state.stack[state.base - 1].clone() {
                 let src = closure.proto.source.as_ref()
                     .map(|s| short_source(s))
                     .unwrap_or_else(|| "?".to_string());
                 let ln = get_proto_line(&closure.proto, state.pc);
-                (src, ln)
+                (src, ln, Some(closure.clone()))
             } else {
-                ("?".to_string(), -1)
+                ("?".to_string(), -1, None)
             }
         } else {
-            ("?".to_string(), -1)
+            ("?".to_string(), -1, None)
         };
+
+        let ci = &state.call_info;
+        let ci_len = ci.len();
+        let has_lua_frame = cur_closure.is_some();
 
         // 如果错误由 C 函数引发，先添加 C 函数帧 — 对应 C 的 [C]: in global 'name'
         if let Some(c_func_name) = &state.last_c_function {
             trace.push_str(&format!("\n\t[C]: in global '{}'", c_func_name));
         }
 
-        // 添加当前 Lua 帧到 traceback
-        if state.base > 0 && state.base <= state.stack.len() {
-            if let TValue::LClosure(_) = &state.stack[state.base - 1].clone() {
-                let name = "main chunk";
-                if line > 0 {
-                    trace.push_str(&format!("\n\t{}:{}: in {}", source, line, name));
-                } else {
-                    trace.push_str(&format!("\n\t{}: in {}", source, name));
-                }
-            }
+        // 收集所有 Lua 帧信息 (source, line, name_str) — 从内到外
+        // 帧 0: 当前函数; 帧 1..=ci_len: 调用者
+        // call_info[i] 存储: source/line = 调用者(外层)的信息, name/closure = 被调用者(内层)的信息
+        // 因此:
+        // - 帧 L (1<=L<=ci_len) 的 source/line = call_info[ci_len - L].source/line
+        // - 帧 L (0<=L<ci_len) 的 name/namewhat/closure = call_info[ci_len - 1 - L]
+        // - 帧 ci_len (最外层) 的 name = "main chunk"
+        let mut frames: Vec<(String, i32, String)> = Vec::new();
+
+        // 帧 0: 当前函数
+        if has_lua_frame {
+            let name_str = if ci_len > 0 {
+                let last = &ci[ci_len - 1];
+                format_func_name(&last.namewhat, &last.name, false, last.closure.as_ref())
+            } else {
+                "main chunk".to_string()
+            };
+            frames.push((cur_source.clone(), cur_line, name_str));
         }
 
-        // 最后添加 [C]: in ?
-        trace.push_str("\n\t[C]: in ?");
+        // 帧 1..=ci_len: 调用者帧
+        for level in 1..=ci_len {
+            let entry = &ci[ci_len - level];
+            let src = short_source_bytes(entry.source.as_bytes());
+            let line = entry.line;
+            let name_str = if level < ci_len {
+                // name/namewhat/closure 来自更外层的 call_info 条目
+                let outer = &ci[ci_len - 1 - level];
+                format_func_name(&outer.namewhat, &outer.name, false, outer.closure.as_ref())
+            } else {
+                // 最外层是 main chunk
+                "main chunk".to_string()
+            };
+            frames.push((src, line, name_str));
+        }
+
+        // 应用 LEVELS1/LEVELS2 限制 — 对应 C 的 limit2show 逻辑
+        let total = frames.len();
+        let limit2show = if total > LEVELS1 + LEVELS2 {
+            Some(LEVELS1)
+        } else {
+            None
+        };
+
+        let mut idx = 0;
+        while idx < total {
+            if let Some(limit) = limit2show {
+                if idx == limit {
+                    // 跳过中间层
+                    let n = total - idx - LEVELS2;
+                    trace.push_str(&format!("\n\t...\t(skipping {} levels)", n));
+                    idx = total - LEVELS2;
+                    continue;
+                }
+            }
+            let (src, line, name) = &frames[idx];
+            if *line > 0 {
+                trace.push_str(&format!("\n\t{}:{}: in {}", src, line, name));
+            } else {
+                trace.push_str(&format!("\n\t{}: in {}", src, name));
+            }
+            idx += 1;
+        }
 
         // 格式化错误消息（添加 source:line 前缀）— 对应 C 的 luaG_addinfo
         let error_msg = match error {
@@ -517,8 +831,8 @@ impl VmExecutor {
         };
         // 只在错误消息尚未包含 source:line 前缀时添加
         // (error()/assert() 等 C 函数已经通过 luaL_where 添加了前缀)
-        let prefix = if line > 0 && !has_source_line_prefix(&error_msg) {
-            format!("{}:{}: ", source, line)
+        let prefix = if cur_line > 0 && !has_source_line_prefix(&error_msg) {
+            format!("{}:{}: ", cur_source, cur_line)
         } else {
             String::new()
         };
@@ -675,6 +989,150 @@ impl VmExecutor {
             // Skip the jump (对应 C 的 pc++)
             state.pc += 2;  // 跳过 TEST 和 JMP
         }
+    }
+
+    // ========================================================================
+    // Line hook 支持 — 对应 C 的 luaG_traceexec
+    // ========================================================================
+
+    /// 获取当前指令所在行号 — 对应 C 的 luaG_getfuncline
+    fn get_current_line(state: &LuaState) -> i32 {
+        if state.base == 0 || state.base > state.stack.len() {
+            return -1;
+        }
+        if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
+            let proto = &closure.proto;
+            if proto.line_info.is_empty() || state.pc >= proto.line_info.len() {
+                return -1;
+            }
+            // 计算行号: 基础行号 + delta 累加
+            let mut base_pc = -1i32;
+            let mut base_line = proto.line_defined;
+            for abs in &proto.abs_line_info {
+                let abs_pc = abs.pc;
+                if abs_pc <= state.pc as i32 && abs_pc > base_pc {
+                    base_pc = abs_pc;
+                    base_line = abs.line;
+                }
+            }
+            let mut line = base_line;
+            let mut i = base_pc + 1;
+            while i <= state.pc as i32 {
+                let delta = proto.line_info[i as usize];
+                if delta != i8::MIN {
+                    line += delta as i32;
+                }
+                i += 1;
+            }
+            line
+        } else {
+            -1
+        }
+    }
+
+    /// 检查从 old_pc 到 new_pc 是否发生了行号变化 — 对应 C 的 changedline
+    fn changed_line(state: &LuaState, old_pc: i32, new_pc: i32) -> bool {
+        if state.base == 0 || state.base > state.stack.len() {
+            return false;
+        }
+        if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
+            let proto = &closure.proto;
+            if proto.line_info.is_empty() {
+                return false;
+            }
+            // 简化实现: 直接比较两个 pc 对应的行号
+            let old_line = Self::get_proto_line_at(proto, old_pc as usize);
+            let new_line = Self::get_proto_line_at(proto, new_pc as usize);
+            old_line != new_line
+        } else {
+            false
+        }
+    }
+
+    /// 获取 proto 在指定 pc 处的行号
+    fn get_proto_line_at(proto: &Proto, pc: usize) -> i32 {
+        if proto.line_info.is_empty() || pc >= proto.line_info.len() {
+            return -1;
+        }
+        let mut base_pc = -1i32;
+        let mut base_line = proto.line_defined;
+        for abs in &proto.abs_line_info {
+            let abs_pc = abs.pc;
+            if abs_pc <= pc as i32 && abs_pc > base_pc {
+                base_pc = abs_pc;
+                base_line = abs.line;
+            }
+        }
+        let mut line = base_line;
+        let mut i = base_pc + 1;
+        while i <= pc as i32 {
+            let delta = proto.line_info[i as usize];
+            if delta != i8::MIN {
+                line += delta as i32;
+            }
+            i += 1;
+        }
+        line
+    }
+
+    /// 调用 line hook 函数 — 对应 C 的 luaD_callhook(L, "line", line)
+    ///
+    /// 在栈上压入 hook 函数和参数 ("line", line)，通过 pcall 调用，
+    /// 然后恢复栈。hook 调用期间临时禁用 hook 避免递归。
+    fn call_line_hook(state: &mut LuaState, line: i32) -> Result<(), VmError> {
+        let hook_fn = match &state.hook_func {
+            Some(f) => f.clone(),
+            None => return Ok(()),
+        };
+
+        // 保存当前栈顶
+        let saved_top = state.stack.len();
+
+        // 临时禁用 hook（避免递归）
+        let saved_mask = state.hook_mask;
+        state.hook_mask = 0;
+
+        // 压入 hook 函数和参数: f("line", line)
+        state.stack.push(hook_fn);
+        let event_str = state.intern_str("line");
+        state.stack.push(TValue::Str(event_str));
+        state.stack.push(TValue::Integer(line as i64));
+
+        // 调用 hook 函数 (2 个参数, 0 个返回值)
+        let status = state.pcall(2, 0, 0);
+
+        // 如果出错，从栈上获取错误消息（pcall 把错误消息推入 func_idx 位置）
+        let err_msg = if status != 0 {
+            // pcall 出错时，错误消息在 saved_top 位置（func_idx）
+            let msg = if saved_top < state.stack.len() {
+                match &state.stack[saved_top] {
+                    TValue::Str(s) => s.as_str().to_string(),
+                    _ => String::new(),
+                }
+            } else {
+                String::new()
+            };
+            Some(msg)
+        } else {
+            None
+        };
+
+        // 恢复栈顶
+        state.stack.truncate(saved_top);
+
+        // 恢复 hook
+        state.hook_mask = saved_mask;
+
+        if let Some(msg) = err_msg {
+            let msg = if msg.is_empty() {
+                "error in hook function".to_string()
+            } else {
+                msg
+            };
+            return Err(VmError::RuntimeError(msg));
+        }
+
+        Ok(())
     }
 
     // ========================================================================
@@ -1766,6 +2224,27 @@ impl VmExecutor {
                 let nfixparams = closure.proto.num_params as usize;
                 let proto_is_vararg = closure.proto.is_vararg();
 
+                // 获取调用前的源和行号（用于 traceback）
+                let (caller_source, caller_line) = if state.base > 0 && state.base <= state.stack.len() {
+                    if let TValue::LClosure(prev_closure) = &state.stack[state.base - 1] {
+                        let src = prev_closure
+                            .proto
+                            .source
+                            .as_ref()
+                            .map(|s| s.as_str().to_string())
+                            .unwrap_or_else(|| "=?".to_string());
+                        let line = get_proto_line(&prev_closure.proto, state.pc);
+                        (src, line)
+                    } else {
+                        ("=?".to_string(), -1)
+                    }
+                } else {
+                    ("=?".to_string(), -1)
+                };
+
+                // 获取函数名和 namewhat（对应 C 的 funcnamefromcode）
+                let (func_name, func_namewhat) = get_func_name(state, state.pc);
+
                 call_stack.push(CallFrame {
                     code: std::mem::take(&mut state.code),
                     constants: std::mem::take(&mut state.constants),
@@ -1784,6 +2263,18 @@ impl VmExecutor {
                     open_upval: state.open_upval.take(),
                 });
 
+                // 推入调用栈信息（用于 debug.getinfo 和 traceback）
+                state.call_info.push(crate::state::CallInfoEntry {
+                    source: caller_source,
+                    line: caller_line,
+                    name: func_name,
+                    is_c: false,
+                    closure: Some(closure.clone()),
+                    base: state.base,
+                    saved_pc: state.pc,
+                    namewhat: func_namewhat,
+                });
+
                 state.code = closure.proto.code.clone();
                 state.constants = closure.proto.constants.clone();
                 state.upval_descs = closure.proto.upvalues.clone();
@@ -1798,6 +2289,9 @@ impl VmExecutor {
                 state.closure_upvals = closure.upvals;
                 state.tbc_list = None;
                 state.open_upval = None;
+                // 对应 C 的 luaD_hookcall: L->oldpc = 0
+                // 新函数的 oldpc 设为 0，第一条指令会触发 hook（因为 0 不是有效 pc）
+                state.hook_old_pc = 0;
 
                 if proto_is_vararg {
                     // vararg 函数: 截断栈到实际参数末尾，VARARGPREP 会处理变参并扩展栈
@@ -1844,6 +2338,11 @@ impl VmExecutor {
                 } else if crate::stdlib::table_lib::is_table_tag(tag_val) {
                     // Table 库函数（标签 400-409）
                     crate::stdlib::table_lib::call_table_function(
+                        tag_val, state, a, nargs, nresults,
+                    )?;
+                } else if crate::stdlib::debug_lib::is_debug_tag(tag_val) {
+                    // Debug 库函数（标签 500-519）
+                    crate::stdlib::debug_lib::call_debug_function(
                         tag_val, state, a, nargs, nresults,
                     )?;
                 } else if tag_val >= 100 {
@@ -2041,6 +2540,11 @@ impl VmExecutor {
                     crate::stdlib::table_lib::call_table_function(
                         tag_val, state, a, nargs, -1,
                     )?;
+                } else if crate::stdlib::debug_lib::is_debug_tag(tag_val) {
+                    // Debug 库函数（标签 500-519）
+                    crate::stdlib::debug_lib::call_debug_function(
+                        tag_val, state, a, nargs, -1,
+                    )?;
                 } else if tag_val >= 100 {
                     crate::stdlib::string_lib::call_string_function(
                         tag_val, state, a, nargs, -1,
@@ -2062,6 +2566,8 @@ impl VmExecutor {
         let nresults = if n < 0 { state.stack.len().saturating_sub(a) } else { n as usize };
 
         if let Some(frame) = call_stack.pop() {
+            // 同时弹出调用栈信息
+            state.call_info.pop();
             let return_base = frame.return_base;
             let num_results = frame.num_results;
             let mut results = Vec::new();
@@ -2088,6 +2594,8 @@ impl VmExecutor {
             state.closure_upvals = frame.closure_upvals;
             state.tbc_list = frame.tbc_list;
             state.open_upval = frame.open_upval;
+            // 对应 C 的 rethook: L->oldpc = pcRel(ci->u.l.savedpc, ci_func(ci)->p)
+            state.hook_old_pc = state.pc as i32;
 
             if num_results >= 0 {
                 while state.stack.len() < return_base + num_results as usize {
@@ -2127,6 +2635,8 @@ impl VmExecutor {
 
     fn op_return0(state: &mut LuaState, _inst: Instruction, call_stack: &mut Vec<CallFrame>) -> Result<Option<VmResult>, VmError> {
         if let Some(frame) = call_stack.pop() {
+            // 同时弹出调用栈信息
+            state.call_info.pop();
             let return_base = frame.return_base;
             let num_results = frame.num_results;
             // 关闭当前栈帧的所有打开上值
@@ -2175,6 +2685,8 @@ impl VmExecutor {
             TValue::Nil(NilKind::Strict)
         };
         if let Some(frame) = call_stack.pop() {
+            // 同时弹出调用栈信息
+            state.call_info.pop();
             let return_base = frame.return_base;
             let num_results = frame.num_results;
             // 关闭当前栈帧的所有打开上值
