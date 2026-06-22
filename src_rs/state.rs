@@ -968,7 +968,7 @@ impl LuaState {
     /// 从已读取的字节数组加载 Lua 代码。处理 BOM、shebang、编码与二进制签名。
     fn load_bytes(&mut self, bytes: &[u8], chunk_name: &str, mode: Option<&str>) -> i32 {
         let after_bom = skip_bom(bytes);
-        let (skipped_comment, first, rest) = skip_comment(after_bom);
+        let (_, first, rest) = skip_comment(after_bom);
 
         let is_binary = first == Some(LUA_SIGNATURE[0]);
 
@@ -985,18 +985,7 @@ impl LuaState {
             return ERR_SYNTAX;
         }
 
-        // 组装待编译的源码缓冲区：跳过的 shebang 用换行符补齐行号，
-        // 随后追加剩余字节。
-        let mut content = Vec::with_capacity(rest.len() + 2);
-        if skipped_comment {
-            content.push(b'\n');
-        }
-        if let Some(c) = first {
-            content.push(c);
-        }
-        content.extend_from_slice(rest);
-
-        let source = decode_source_bytes(&content);
+        let source = decode_source_bytes(&rest);
         self.load_buffer(&source, chunk_name)
     }
 
@@ -1404,7 +1393,7 @@ fn skip_bom(bytes: &[u8]) -> &[u8] {
 ///
 /// 返回三元组：`(是否跳过了首行, 首字符, 首字符之后的剩余字节)`。
 /// 与 C 的 `skipcomment` 一致：`first` 是从流中读取出来的字符，
-/// `rest` 不包含 `first`，因为 `load_bytes` 会单独把 `first` 放回缓冲区。
+/// `rest` 包含 `first`，`load_bytes` 不需要再把 `first` 放回缓冲区。
 fn skip_comment(bytes: &[u8]) -> (bool, Option<u8>, &[u8]) {
     if bytes.first() == Some(&b'#') {
         let mut pos = 1;
@@ -1417,12 +1406,12 @@ fn skip_comment(bytes: &[u8]) -> (bool, Option<u8>, &[u8]) {
         }
         // first 是注释后的第一个字符；rest 是该字符之后的字节
         let first = bytes.get(pos).copied();
-        let rest_start = (pos + 1).min(bytes.len());
+        let rest_start = (pos).min(bytes.len());
         (true, first, &bytes[rest_start..])
     } else {
         // first 是第一个字符；rest 是该字符之后的字节
         let first = bytes.first().copied();
-        let rest = if bytes.is_empty() { &[] } else { &bytes[1..] };
+        let rest = if bytes.is_empty() { &[] } else { &bytes[0..] };
         (false, first, rest)
     }
 }
