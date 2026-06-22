@@ -10217,11 +10217,16 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
         }
     }
     expect(fs, &Token::RParen);
-    
     let mut new_fs = FuncState::new(fs.ls_mut());
     new_fs.prev = fs as *mut FuncState;  // like C's fs->prev = ls->fs
     new_fs.proto.num_params = n_params;
     new_fs.proto.line_defined = line_defined;
+    let ls = fs.ls_mut();
+
+    // 设置源名 — 对应 C 的 lexstate.source = luaX_newstring(L, name, ...)
+    // 源名用于错误消息和堆栈回溯中的位置信息
+    new_fs.proto.source = Some(crate::strings::new_lstr(&ls.state.string_table, &ls.chunk_name));
+
     if is_vararg {
         new_fs.proto.flag = PF_VAHID;
         new_fs.code_abc(OpCode::VARARGPREP, 0, 0, 0);
