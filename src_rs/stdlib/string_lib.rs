@@ -37,6 +37,37 @@ pub const STR_GSUB: usize = 112;
 pub const STR_PACK: usize = 113;
 pub const STR_PACKSIZE: usize = 114;
 pub const STR_UNPACK: usize = 115;
+/// string.gmatch 迭代器标签 (在 TFORCALL 中调用)
+pub const STR_GMATCH_ITER: usize = 116;
+
+/// 检查标签是否为字符串库标签 (包括 gmatch 迭代器)
+pub fn is_string_tag(tag: usize) -> bool {
+    (100..120).contains(&tag)
+}
+
+/// 字符串库函数名 (用于 traceback)
+pub fn string_function_name(tag: usize) -> Option<&'static str> {
+    match tag {
+        STR_UPPER => Some("upper"),
+        STR_LOWER => Some("lower"),
+        STR_LEN => Some("len"),
+        STR_SUB => Some("sub"),
+        STR_REVERSE => Some("reverse"),
+        STR_BYTE => Some("byte"),
+        STR_CHAR => Some("char"),
+        STR_REP => Some("rep"),
+        STR_FIND => Some("find"),
+        STR_FORMAT => Some("format"),
+        STR_MATCH => Some("match"),
+        STR_GMATCH => Some("gmatch"),
+        STR_GSUB => Some("gsub"),
+        STR_PACK => Some("pack"),
+        STR_PACKSIZE => Some("packsize"),
+        STR_UNPACK => Some("unpack"),
+        STR_GMATCH_ITER => Some("gmatch_iter"),
+        _ => None,
+    }
+}
 
 // ============================================================================
 // 算术元方法 (对应 C 的 arith_add, arith_sub, ...)
@@ -794,7 +825,8 @@ fn get_captures(ms: &MatchState, s: usize, e: usize) -> Result<Vec<TValue>, Stri
         match cap {
             CaptureResult::Str(start, len) => {
                 let bytes = &ms.src[start..start + len];
-                let s = String::from_utf8_lossy(bytes).into_owned();
+                // Lua 字符串是字节序列，使用 from_utf8_unchecked 保留原始字节
+                let s = unsafe { String::from_utf8_unchecked(bytes.to_vec()) };
                 result.push(TValue::Str(crate::strings::LuaString::Short(
                     Arc::new(crate::strings::ShortString { hash: 0, contents: s })
                 )));
@@ -893,7 +925,8 @@ pub fn str_match(s: &str, pattern: &str, init: i64) -> Result<Vec<TValue>, Strin
             if captures.is_empty() {
                 // 无捕获时返回整个匹配
                 let matched = &s.as_bytes()[start - 1..end];
-                let matched_str = String::from_utf8_lossy(matched).into_owned();
+                // Lua 字符串是字节序列，使用 from_utf8_unchecked 保留原始字节
+                let matched_str = unsafe { String::from_utf8_unchecked(matched.to_vec()) };
                 Ok(vec![TValue::Str(crate::strings::LuaString::Short(
                     Arc::new(crate::strings::ShortString { hash: 0, contents: matched_str })
                 ))])
@@ -943,7 +976,10 @@ impl GMatchIterator {
                 self.pos = if end > match_start { end } else { match_start + 1 };
                 if captures.is_empty() {
                     // 无捕获时返回整个匹配的子串
-                    let matched_str = String::from_utf8_lossy(&src_bytes[match_start..end]).into_owned();
+                    // Lua 字符串是字节序列，使用 from_utf8_unchecked 保留原始字节
+                    let matched_str = unsafe {
+                        String::from_utf8_unchecked(src_bytes[match_start..end].to_vec())
+                    };
                     return Ok(vec![TValue::Str(crate::strings::LuaString::Short(
                         Arc::new(crate::strings::ShortString { hash: 0, contents: matched_str })
                     ))]);
@@ -968,7 +1004,8 @@ pub fn str_gsub(s: &str, pattern: &str, repl: &str, max_s: i64) -> Result<(Strin
     let anchor = pattern.starts_with('^');
     let pat_start = if anchor { 1 } else { 0 };
 
-    let mut result = String::new();
+    // 使用 Vec<u8> 构建结果，避免 as char 转换导致字节值变化
+    let mut result: Vec<u8> = Vec::new();
     let mut src_pos = 0;
     let mut n = 0i64;
     let mut last_match_end: Option<usize> = None;
@@ -983,7 +1020,7 @@ pub fn str_gsub(s: &str, pattern: &str, repl: &str, max_s: i64) -> Result<(Strin
             if Some(end) == last_match_end {
                 // 避免空匹配的无限循环
                 if src_pos < len {
-                    result.push(src_bytes[src_pos] as char);
+                    result.push(src_bytes[src_pos]);
                 }
                 src_pos += 1;
                 if anchor {
@@ -995,14 +1032,12 @@ pub fn str_gsub(s: &str, pattern: &str, repl: &str, max_s: i64) -> Result<(Strin
             last_match_end = Some(end);
 
             // 处理替换字符串
-            let match_str = &src_bytes[src_pos..end];
-            let match_str = String::from_utf8_lossy(match_str);
             let replacement = apply_replacement(repl, &ms, src_pos, end)?;
-            result.push_str(&replacement);
+            result.extend_from_slice(replacement.as_bytes());
 
             src_pos = end;
         } else if src_pos < len {
-            result.push(src_bytes[src_pos] as char);
+            result.push(src_bytes[src_pos]);
             src_pos += 1;
         } else {
             break;
@@ -1014,15 +1049,18 @@ pub fn str_gsub(s: &str, pattern: &str, repl: &str, max_s: i64) -> Result<(Strin
 
     // 添加剩余部分
     if src_pos < len {
-        result.push_str(&String::from_utf8_lossy(&src_bytes[src_pos..]));
+        result.extend_from_slice(&src_bytes[src_pos..]);
     }
 
+    // Lua 字符串是字节序列，使用 from_utf8_unchecked 保留原始字节
+    let result = unsafe { String::from_utf8_unchecked(result) };
     Ok((result, n))
 }
 
 /// 处理替换字符串中的 %0, %1-%9
 fn apply_replacement(repl: &str, ms: &MatchState, s: usize, e: usize) -> Result<String, String> {
-    let mut result = String::new();
+    // 使用 Vec<u8> 构建结果，避免 as char 转换导致字节值变化
+    let mut result: Vec<u8> = Vec::new();
     let repl_bytes = repl.as_bytes();
     let mut i = 0;
     while i < repl_bytes.len() {
@@ -1033,19 +1071,19 @@ fn apply_replacement(repl: &str, ms: &MatchState, s: usize, e: usize) -> Result<
             }
             let c = repl_bytes[i];
             if c == b'%' {
-                result.push('%');
+                result.push(b'%');
             } else if c == b'0' {
                 let match_bytes = &ms.src[s..e];
-                result.push_str(&String::from_utf8_lossy(match_bytes));
+                result.extend_from_slice(match_bytes);
             } else if c.is_ascii_digit() {
                 let cap_idx = (c - b'1') as usize;
                 let cap = get_one_capture(ms, cap_idx, s, e)?;
                 match cap {
                     CaptureResult::Str(start, len) => {
-                        result.push_str(&String::from_utf8_lossy(&ms.src[start..start + len]));
+                        result.extend_from_slice(&ms.src[start..start + len]);
                     }
                     CaptureResult::Pos(pos) => {
-                        result.push_str(&pos.to_string());
+                        result.extend_from_slice(pos.to_string().as_bytes());
                     }
                 }
             } else {
@@ -1053,11 +1091,12 @@ fn apply_replacement(repl: &str, ms: &MatchState, s: usize, e: usize) -> Result<
             }
             i += 1;
         } else {
-            result.push(repl_bytes[i] as char);
+            result.push(repl_bytes[i]);
             i += 1;
         }
     }
-    Ok(result)
+    // Lua 字符串是字节序列
+    Ok(unsafe { String::from_utf8_unchecked(result) })
 }
 
 // ============================================================================
@@ -2508,6 +2547,132 @@ fn push_results(state: &mut LuaState, a: usize, nresults: i32, results: Vec<TVal
     }
 }
 
+/// gmatch 迭代器函数 — 对应 C 的 gmatch_aux
+///
+/// 在 TFORCALL 中调用，参数: state_table (表), ctrl (忽略)
+/// 从 state_table 中读取 s, p, pos, anchor, pat_start
+/// 运行一次匹配，更新 pos，返回捕获（或 nil 表示结束）
+fn call_gmatch_iter(
+    state: &mut LuaState,
+    a: usize,
+    _nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    // 从栈位置 a+1 读取状态表
+    let state_val = if a + 1 < state.stack.len() {
+        state.stack[a + 1].clone()
+    } else {
+        TValue::Nil(NilKind::Strict)
+    };
+
+    let mut state_table = match state_val {
+        TValue::Table(t) => t,
+        _ => return Err(VmError::RuntimeError(
+            "gmatch iterator: state table expected".to_string(),
+        )),
+    };
+
+    // 从表中读取字段
+    let s_key = TValue::Str(state.intern_str("s"));
+    let p_key = TValue::Str(state.intern_str("p"));
+    let pos_key = TValue::Str(state.intern_str("pos"));
+    let anchor_key = TValue::Str(state.intern_str("anchor"));
+    let pat_start_key = TValue::Str(state.intern_str("pat_start"));
+
+    let s_str = match state_table.get(&s_key) {
+        Some(TValue::Str(s)) => s.as_str().to_string(),
+        _ => return Err(VmError::RuntimeError(
+            "gmatch iterator: invalid state (missing 's')".to_string(),
+        )),
+    };
+    let p_str = match state_table.get(&p_key) {
+        Some(TValue::Str(s)) => s.as_str().to_string(),
+        _ => return Err(VmError::RuntimeError(
+            "gmatch iterator: invalid state (missing 'p')".to_string(),
+        )),
+    };
+    let pos: usize = match state_table.get(&pos_key) {
+        Some(TValue::Integer(n)) => *n as usize,
+        _ => return Err(VmError::RuntimeError(
+            "gmatch iterator: invalid state (missing 'pos')".to_string(),
+        )),
+    };
+    let anchor: bool = match state_table.get(&anchor_key) {
+        Some(TValue::Boolean(b)) => *b,
+        _ => false,
+    };
+    let pat_start: usize = match state_table.get(&pat_start_key) {
+        Some(TValue::Integer(n)) => *n as usize,
+        _ => 0,
+    };
+
+    // 运行匹配循环 — 对应 C 的 gmatch_aux
+    let src_bytes = s_str.as_bytes();
+    let len = src_bytes.len();
+    let mut cur_pos = pos;
+
+    let mut result_vals: Vec<TValue> = Vec::new();
+    let mut found = false;
+
+    while cur_pos <= len {
+        let mut ms = MatchState::new(&s_str, &p_str);
+        ms.level = 0;
+        ms.captures.clear();
+        ms.match_depth = MAX_CCALLS;
+
+        match match_pattern(&mut ms, cur_pos, pat_start) {
+            Ok(Some(end)) => {
+                // 找到匹配
+                let captures = match get_captures(&ms, cur_pos, end) {
+                    Ok(c) => c,
+                    Err(e) => return Err(VmError::RuntimeError(e)),
+                };
+                // 推进位置: 如果匹配为空则前进 1 以避免无限循环
+                let next_pos = if end > cur_pos { end } else { cur_pos + 1 };
+                // 更新状态表中的 pos
+                state_table.set(pos_key.clone(), TValue::Integer(next_pos as i64));
+
+                if captures.is_empty() {
+                    // 无捕获时返回整个匹配的子串
+                    // Lua 字符串是字节序列，使用 from_utf8_unchecked 保留原始字节
+                    let matched_str = unsafe {
+                        String::from_utf8_unchecked(src_bytes[cur_pos..end].to_vec())
+                    };
+                    result_vals.push(TValue::Str(state.intern_str(&matched_str)));
+                } else {
+                    result_vals = captures;
+                }
+                found = true;
+                break;
+            }
+            Ok(None) => {
+                // 未匹配，继续下一个位置
+            }
+            Err(e) => return Err(VmError::RuntimeError(e)),
+        }
+
+        if anchor {
+            break;
+        }
+        cur_pos += 1;
+    }
+
+    if !found {
+        // 没有更多匹配
+        push_results(state, a, nresults, vec![TValue::Nil(NilKind::Strict)]);
+    } else {
+        // 将更新后的状态表写回原始位置 (ra+1 = a-2)
+        // 注意: a = ra+3, a+1 = ra+4 是副本,会被 push_results 截断
+        // ra+1 是原始状态位置,在 a 之前,不会被截断
+        let state_idx = a - 2;
+        if state_idx < state.stack.len() {
+            state.stack[state_idx] = TValue::Table(state_table);
+        }
+        push_results(state, a, nresults, result_vals);
+    }
+    Ok(())
+}
+
 /// 字符串库函数派发
 /// 从 execute.rs 的 op_call 调用，当 LightUserData 标签 >= 100 时
 pub fn call_string_function(
@@ -2653,11 +2818,47 @@ pub fn call_string_function(
             }
         }
         STR_GMATCH => {
-            // gmatch 返回一个迭代器函数
-            // 简化实现: 使用 LightUserData 标签存储状态
-            // 由于架构限制，gmatch 的完整实现需要闭包支持
-            // 这里返回一个错误提示
-            Err(VmError::RuntimeError("string.gmatch not fully supported in this build".to_string()))
+            // string.gmatch(s, pattern) — 返回迭代器函数、状态表、初始控制值
+            // 使用表存储状态: {s=string, p=pattern, pos=0, anchor=bool, pat_start=int}
+            let s = get_str_arg(state, a, 0)?;
+            let p = get_str_arg(state, a, 1)?;
+            let init = get_opt_int_arg(state, a, 2, 1);
+            let len = s.len();
+            let init_pos = posrelat_i(init, len).saturating_sub(1);
+            let init_pos = if init_pos > len { len } else { init_pos };
+
+            let anchor = p.starts_with('^');
+            let pat_start = if anchor { 1 } else { 0 };
+
+            // 创建状态表
+            let mut state_table = crate::table::Table::new();
+            state_table.set(
+                TValue::Str(state.intern_str("s")),
+                TValue::Str(state.intern_str(&s)),
+            );
+            state_table.set(
+                TValue::Str(state.intern_str("p")),
+                TValue::Str(state.intern_str(&p)),
+            );
+            state_table.set(
+                TValue::Str(state.intern_str("pos")),
+                TValue::Integer(init_pos as i64),
+            );
+            state_table.set(
+                TValue::Str(state.intern_str("anchor")),
+                TValue::Boolean(anchor),
+            );
+            state_table.set(
+                TValue::Str(state.intern_str("pat_start")),
+                TValue::Integer(pat_start as i64),
+            );
+
+            let iter_val = TValue::LightUserData(STR_GMATCH_ITER as *mut std::ffi::c_void);
+            let state_val = TValue::Table(state_table);
+            let ctrl_val = TValue::Integer(0);
+
+            push_results(state, a, nresults, vec![iter_val, state_val, ctrl_val]);
+            Ok(())
         }
         STR_PACK => {
             // string.pack(fmt, ...)
@@ -2721,6 +2922,11 @@ pub fn call_string_function(
                 }
                 Err(msg) => Err(VmError::RuntimeError(msg)),
             }
+        }
+        STR_GMATCH_ITER => {
+            // gmatch 迭代器 — 在 TFORCALL 中调用
+            // 参数: state_table (表), ctrl (忽略)
+            call_gmatch_iter(state, a, nargs, nresults)
         }
         _ => Err(VmError::RuntimeError(format!("unknown string function tag: {}", tag))),
     }

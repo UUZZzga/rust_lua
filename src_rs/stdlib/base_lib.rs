@@ -12,10 +12,11 @@
 //! - 标签 1-6: 原有临时实现 (print, setmetatable, getmetatable, type, pcall, error)
 //! - 标签 7+: 新增基础库函数
 
-use crate::objects::{NilKind, Proto, TValue};
+use crate::objects::{NilKind, Proto, TValue, LClosure, UpVal, UpValRef};
 use crate::state::LuaState;
 use crate::execute::VmError;
 use crate::strings::LuaString;
+use crate::gc::GCObjectHeader;
 use std::io::Write;
 
 // ============================================================================
@@ -45,6 +46,10 @@ pub const BASE_PAIRS: usize = 17;
 pub const BASE_XPCALL: usize = 18;
 pub const BASE_WARN: usize = 19;
 
+// require 函数标签
+pub const BASE_REQUIRE: usize = 22;
+pub const BASE_LOAD: usize = 23;
+
 // 迭代器辅助函数标签 (不在 is_base_tag 范围内, 只在 TFORCALL 中处理)
 // 对应 C 的 ipairsaux 和 next 迭代器函数
 pub const BASE_IPAIRS_AUX: usize = 20;
@@ -52,7 +57,7 @@ pub const BASE_NEXT_ITER: usize = 21;
 
 /// 标签是否属于基础库
 pub fn is_base_tag(tag: usize) -> bool {
-    tag >= BASE_PRINT && tag <= BASE_WARN
+    (tag >= BASE_PRINT && tag <= BASE_WARN) || tag == BASE_REQUIRE || tag == BASE_LOAD
 }
 
 /// 判断标签是否为已知的函数标签 (用于 type/tostring 显示)
@@ -402,6 +407,8 @@ pub fn base_function_name(tag: usize) -> Option<&'static str> {
         BASE_PAIRS => Some("pairs"),
         BASE_XPCALL => Some("xpcall"),
         BASE_WARN => Some("warn"),
+        BASE_REQUIRE => Some("require"),
+        BASE_LOAD => Some("load"),
         _ => None,
     }
 }
@@ -437,6 +444,8 @@ pub fn call_base_function(
         BASE_PAIRS => call_pairs(state, a, nargs, nresults),
         BASE_XPCALL => call_xpcall(state, a, nargs, nresults),
         BASE_WARN => call_warn(state, a, nargs, nresults),
+        BASE_REQUIRE => call_require(state, a, nargs, nresults),
+        BASE_LOAD => call_load(state, a, nargs, nresults),
         _ => Err(VmError::RuntimeError(format!("unknown base function tag: {}", tag))),
     };
 
@@ -1050,6 +1059,160 @@ fn call_warn(state: &mut LuaState, a: usize, nargs: usize, _nresults: i32) -> Re
     Ok(())
 }
 
+/// require(modname) — 加载模块
+///
+/// 简化实现, 对应 C 的 requiref 语义:
+/// 1. 检查 package.loaded[modname], 如果已加载则直接返回
+/// 2. 对于内置模块 (utf8, math, string 等), 返回对应的全局表
+/// 3. 对于未知模块, 返回错误
+fn call_require(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    if nargs == 0 {
+        return Err(VmError::RuntimeError(
+            "bad argument #1 to 'require' (string expected, got no value)".to_string(),
+        ));
+    }
+    let modname_val = get_arg(state, a, 0);
+    let modname = match &modname_val {
+        TValue::Str(s) => s.as_str().to_string(),
+        _ => {
+            return Err(VmError::RuntimeError(format!(
+                "bad argument #1 to 'require' (string expected, got {})",
+                modname_val.ty()
+            )));
+        }
+    };
+
+    // 检查 package.loaded 表中是否已缓存
+    let package_key = TValue::Str(state.intern_str("package"));
+    if let Some(TValue::Table(package_table)) = state.globals.get(&package_key) {
+        let loaded_key = TValue::Str(state.intern_str("loaded"));
+        if let Some(TValue::Table(loaded_table)) = package_table.get(&loaded_key) {
+            let mod_key = TValue::Str(state.intern_str(&modname));
+            if let Some(val) = loaded_table.get(&mod_key) {
+                if !matches!(val, TValue::Nil(_)) {
+                    push_results(state, a, nresults, vec![val.clone()]);
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    // 对于内置模块, 返回对应的全局表
+    let global_key = TValue::Str(state.intern_str(&modname));
+    let result = state.globals.get(&global_key).cloned();
+
+    match result {
+        Some(val) if !matches!(val, TValue::Nil(_)) => {
+            // 缓存到 package.loaded
+            let package_key = TValue::Str(state.intern_str("package"));
+            let package_table = match state.globals.get(&package_key) {
+                Some(TValue::Table(t)) => t.clone(),
+                _ => {
+                    // 创建 package 表
+                    let mut pkg = crate::table::Table::new();
+                    let loaded = crate::table::Table::new();
+                    pkg.set(
+                        TValue::Str(state.intern_str("loaded")),
+                        TValue::Table(loaded),
+                    );
+                    state.globals.set(package_key.clone(), TValue::Table(pkg.clone()));
+                    pkg
+                }
+            };
+            let loaded_key = TValue::Str(state.intern_str("loaded"));
+            if let Some(TValue::Table(loaded_table)) = package_table.get(&loaded_key) {
+                let mut loaded_table = loaded_table.clone();
+                loaded_table.set(global_key.clone(), val.clone());
+                let mut package_table = package_table;
+                package_table.set(loaded_key, TValue::Table(loaded_table));
+                state.globals.set(package_key, TValue::Table(package_table));
+            }
+            push_results(state, a, nresults, vec![val]);
+            Ok(())
+        }
+        _ => Err(VmError::RuntimeError(format!(
+            "module '{}' not found",
+            modname
+        ))),
+    }
+}
+
+/// load(chunk [, chunkname [, mode [, env]]]) — 对应 C 的 lua_load
+///
+/// 加载并编译 Lua 代码块, 返回编译后的函数
+/// 目前仅支持字符串参数 (不支持 reader 函数)
+fn call_load(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    if nargs == 0 {
+        return Err(VmError::RuntimeError(
+            "bad argument #1 to 'load' (string expected, got no value)".to_string(),
+        ));
+    }
+
+    let chunk_val = get_arg(state, a, 0);
+    let source = match &chunk_val {
+        TValue::Str(s) => s.as_str().to_string(),
+        _ => {
+            return Err(VmError::RuntimeError(format!(
+                "bad argument #1 to 'load' (string expected, got {})",
+                chunk_val.ty()
+            )));
+        }
+    };
+
+    // 获取可选的 chunkname 参数
+    let chunkname = if nargs >= 2 {
+        let name_val = get_arg(state, a, 1);
+        match &name_val {
+            TValue::Str(s) => s.as_str().to_string(),
+            _ => "=?".to_string(),
+        }
+    } else {
+        "=?".to_string()
+    };
+
+    // 编译源代码
+    match crate::compiler::compile(state, &source, &chunkname) {
+        Ok(proto) => {
+            // 创建闭包, 设置 _ENV 上值为全局表
+            let nup = proto.size_upvalues as usize;
+            let mut upvals: Vec<UpValRef> = Vec::with_capacity(nup.max(1));
+            upvals.push(std::rc::Rc::new(std::cell::RefCell::new(UpVal::Closed {
+                value: Box::new(TValue::Table(state.globals.clone())),
+            })));
+            for _ in 1..nup {
+                upvals.push(std::rc::Rc::new(std::cell::RefCell::new(UpVal::Closed {
+                    value: Box::new(TValue::Nil(NilKind::Strict)),
+                })));
+            }
+            let closure = LClosure {
+                gc_header: GCObjectHeader::new(),
+                proto,
+                upvals,
+            };
+            push_results(state, a, nresults, vec![TValue::LClosure(closure)]);
+            Ok(())
+        }
+        Err(err_msg) => {
+            // 编译失败: 返回 nil + 错误消息
+            push_results(state, a, nresults, vec![
+                TValue::Nil(NilKind::Strict),
+                TValue::Str(state.intern_str(&err_msg)),
+            ]);
+            Ok(())
+        }
+    }
+}
+
 // ============================================================================
 // 表遍历辅助函数 (对应 C 的 lua_next)
 // ============================================================================
@@ -1231,6 +1394,8 @@ pub fn open_base_lib(state: &mut LuaState) {
     register(state, "pairs", BASE_PAIRS);
     register(state, "xpcall", BASE_XPCALL);
     register(state, "warn", BASE_WARN);
+    register(state, "require", BASE_REQUIRE);
+    register(state, "load", BASE_LOAD);
 
     // 设置 _G 全局变量 (指向全局表自身)
     let globals_clone = state.globals.clone();

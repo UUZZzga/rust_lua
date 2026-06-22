@@ -422,6 +422,16 @@ impl VmExecutor {
                     crate::stdlib::math_lib::call_math_function(
                         tag_val, state, ra + 3, nargs, nresults,
                     )
+                } else if crate::stdlib::utf8_lib::is_utf8_tag(tag_val) {
+                    // UTF-8 迭代器 (iter_auxstrict / iter_auxlax)
+                    crate::stdlib::utf8_lib::call_utf8_function(
+                        tag_val, state, ra + 3, nargs, nresults,
+                    )
+                } else if crate::stdlib::string_lib::is_string_tag(tag_val) {
+                    // 字符串库迭代器 (gmatch_iter)
+                    crate::stdlib::string_lib::call_string_function(
+                        tag_val, state, ra + 3, nargs, nresults,
+                    )
                 } else {
                     Ok(())
                 };
@@ -1826,6 +1836,16 @@ impl VmExecutor {
                     crate::stdlib::math_lib::call_math_function(
                         tag_val, state, a, nargs, nresults,
                     )?;
+                } else if crate::stdlib::utf8_lib::is_utf8_tag(tag_val) {
+                    // UTF-8 库函数（标签 300-309）
+                    crate::stdlib::utf8_lib::call_utf8_function(
+                        tag_val, state, a, nargs, nresults,
+                    )?;
+                } else if crate::stdlib::table_lib::is_table_tag(tag_val) {
+                    // Table 库函数（标签 400-409）
+                    crate::stdlib::table_lib::call_table_function(
+                        tag_val, state, a, nargs, nresults,
+                    )?;
                 } else if tag_val >= 100 {
                     // 字符串库函数（标签 100+）
                     crate::stdlib::string_lib::call_string_function(
@@ -2009,6 +2029,16 @@ impl VmExecutor {
                 } else if crate::stdlib::math_lib::is_math_tag(tag_val) {
                     // 数学库函数（标签 200-299）
                     crate::stdlib::math_lib::call_math_function(
+                        tag_val, state, a, nargs, -1,
+                    )?;
+                } else if crate::stdlib::utf8_lib::is_utf8_tag(tag_val) {
+                    // UTF-8 库函数（标签 300-309）
+                    crate::stdlib::utf8_lib::call_utf8_function(
+                        tag_val, state, a, nargs, -1,
+                    )?;
+                } else if crate::stdlib::table_lib::is_table_tag(tag_val) {
+                    // Table 库函数（标签 400-409）
+                    crate::stdlib::table_lib::call_table_function(
                         tag_val, state, a, nargs, -1,
                     )?;
                 } else if tag_val >= 100 {
@@ -2251,7 +2281,6 @@ impl VmExecutor {
 
     fn op_forprep(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let ra = Self::ra(state, inst);
-        // eprintln!("DEBUG FORPREP: ra={}, stack.len={}, base={}, pc={}", ra, state.stack.len(), state.base, state.pc);
 
         let init_val = Self::read_stack(state, ra).clone();
         let limit_val = Self::read_stack(state, ra + 1).clone();
@@ -2276,8 +2305,10 @@ impl VmExecutor {
 
                 let skip = if *step_i > 0 { *init_i > limit_i } else { *init_i < limit_i };
                 if skip {
+                    // C 代码中 vmfetch() 已递增 pc，所以 pc += GETARG_Bx(i) + 1 实际跳到 prep+bx+2。
+                    // Rust 中 state.pc 指向当前指令，需要 +2 来达到相同效果（跳过 FORLOOP）。
                     let bx = opcodes::getarg_bx(inst);
-                    state.pc = ((state.pc as i32) + bx + 1) as usize;
+                    state.pc = ((state.pc as i32) + bx + 2) as usize;
                     return Ok(());
                 }
                 let count: u64 = if *step_i > 0 {
@@ -2312,13 +2343,14 @@ impl VmExecutor {
                     _ => { state.pc += 1; return Ok(()); }
                 };
 
-                if step_f == 0.0 { 
+                if step_f == 0.0 {
                     return Err(VmError::RuntimeError("for step is zero".into()));
                 }
                 let skip = if step_f > 0.0 { limit_f < init_f } else { init_f < limit_f };
                 if skip {
+                    // 同上：+2 跳过 FORLOOP
                     let bx = opcodes::getarg_bx(inst);
-                    state.pc = ((state.pc as i32) + bx + 1) as usize;
+                    state.pc = ((state.pc as i32) + bx + 2) as usize;
                     return Ok(());
                 }
                 Self::write_stack(state, ra, TValue::Float(limit_f));
@@ -2387,7 +2419,7 @@ impl VmExecutor {
             let mut t = table.clone();
             for i in 0..n_actual {
                 let val = Self::read_stack(state, ra + 1 + i).clone();
-                let pos = last - i - 1;
+                let pos = last - n_actual + i;
                 t.set_int((pos + 1) as i64, val);
             }
             Self::write_stack(state, ra, TValue::Table(t));

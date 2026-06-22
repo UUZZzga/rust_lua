@@ -1176,11 +1176,65 @@ impl LuaState {
                 let tag_val = tag as usize;
                 let nargs = self.stack.len().saturating_sub(func_idx + 1);
 
-                // 基础库函数派发 (标签 1-19)
+                // 基础库函数派发 (标签 1-19, 22)
                 // 对应原 C 源码 lbaselib.cpp 的各个函数
                 // 注意: ipairsaux (迭代器) 只在 TFORCALL 中调用, 不在此处理
                 if crate::stdlib::base_lib::is_base_tag(tag_val) {
                     match crate::stdlib::base_lib::call_base_function(
+                        tag_val, self, func_idx, nargs, nresults,
+                    ) {
+                        Ok(()) => return 0,
+                        Err(crate::execute::VmError::RuntimeError(msg)) => {
+                            self.stack.truncate(func_idx);
+                            self.push_string(&msg);
+                            return ERR_RUN;
+                        }
+                        Err(e) => {
+                            self.stack.truncate(func_idx);
+                            self.push_string(&format!("{}", e));
+                            return ERR_RUN;
+                        }
+                    }
+                }
+                // 数学库函数 (标签 200-299)
+                if crate::stdlib::math_lib::is_math_tag(tag_val) {
+                    match crate::stdlib::math_lib::call_math_function(
+                        tag_val, self, func_idx, nargs, nresults,
+                    ) {
+                        Ok(()) => return 0,
+                        Err(crate::execute::VmError::RuntimeError(msg)) => {
+                            self.stack.truncate(func_idx);
+                            self.push_string(&msg);
+                            return ERR_RUN;
+                        }
+                        Err(e) => {
+                            self.stack.truncate(func_idx);
+                            self.push_string(&format!("{}", e));
+                            return ERR_RUN;
+                        }
+                    }
+                }
+                // UTF-8 库函数 (标签 300-309)
+                if crate::stdlib::utf8_lib::is_utf8_tag(tag_val) {
+                    match crate::stdlib::utf8_lib::call_utf8_function(
+                        tag_val, self, func_idx, nargs, nresults,
+                    ) {
+                        Ok(()) => return 0,
+                        Err(crate::execute::VmError::RuntimeError(msg)) => {
+                            self.stack.truncate(func_idx);
+                            self.push_string(&msg);
+                            return ERR_RUN;
+                        }
+                        Err(e) => {
+                            self.stack.truncate(func_idx);
+                            self.push_string(&format!("{}", e));
+                            return ERR_RUN;
+                        }
+                    }
+                }
+                // Table 库函数 (标签 400-409)
+                if crate::stdlib::table_lib::is_table_tag(tag_val) {
+                    match crate::stdlib::table_lib::call_table_function(
                         tag_val, self, func_idx, nargs, nresults,
                     ) {
                         Ok(()) => return 0,
@@ -1310,6 +1364,12 @@ impl LuaState {
 
         // 打开数学库 (注册 math 全局表, 包含 abs/sin/cos/random 等)
         crate::stdlib::math_lib::open_math_lib(self);
+
+        // 打开 UTF-8 库 (注册 utf8 全局表, 包含 offset/codepoint/char/len/codes 等)
+        crate::stdlib::utf8_lib::open_utf8_lib(self);
+
+        // 打开 Table 库 (注册 table 全局表, 包含 concat/unpack/pack/insert/remove 等)
+        crate::stdlib::table_lib::open_table_lib(self);
     }
 
     // ====== Hook ======

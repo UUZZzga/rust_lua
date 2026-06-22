@@ -4,7 +4,7 @@ mod compiler_compare_tests {
     use crate::opcodes;
 
     fn compile_rust(source: &str, name: Option<&str>) -> crate::objects::Proto {
-        crate::compiler::compile(source, name.unwrap_or("=test")).expect("Rust compile failed")
+        crate::compiler::compile(&mut crate::state::LuaState::new(), source, name.unwrap_or("=test")).expect("Rust compile failed")
     }
 
     unsafe fn compile_c(source: &str) -> bytecode_dump::DumpedFunction {
@@ -1504,7 +1504,7 @@ assert(a == 2)
     }
 
     fn assert_compile_ok(source: &str, name: Option<&str>) {
-        let result = crate::compiler::compile(source, name.unwrap_or("=test_assert"));
+        let result = crate::compiler::compile(&mut crate::state::LuaState::new(), source, name.unwrap_or("=test_assert"));
         assert!(result.is_ok(), "Compile failed: {:?}", result.err());
     }
 

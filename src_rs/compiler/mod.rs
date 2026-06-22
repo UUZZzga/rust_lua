@@ -8,6 +8,6 @@ mod cmp_tests;
 use crate::{objects::Proto, state::LuaState};
 
 pub fn compile(state: &mut LuaState, source: &str, name: &str) -> Result<Proto, String> {
-    let mut ls = lexer::LexState::new(state,source, name);
+    let mut ls = lexer::LexState::new(state, source, name);
     compile::compile_chunk(&mut ls)
 }
