@@ -898,7 +898,7 @@ impl LuaState {
     // ====== Load Code ======
 
     pub fn load_buffer(&mut self, code: &str, chunk_name: &str) -> i32 {
-        match crate::compiler::compile(code, chunk_name) {
+        match crate::compiler::compile(self, code, chunk_name) {
             Ok(proto) => {
                 // 创建主闭包，设置 _ENV 上值为全局表
                 // 对应 C 的 luaU_undump + closureupvalue(L, proto, 0) = _ENV

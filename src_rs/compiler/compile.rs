@@ -350,9 +350,9 @@ struct RegAllocEntry {
     idx: i32,
 }
 
-pub struct FuncState {
+pub struct FuncState<'a> {
     pub proto: Proto,
-    pub prev: *mut FuncState,  // raw pointer to parent FuncState (like C's fs->prev)
+    pub prev: *mut FuncState<'a>,  // raw pointer to parent FuncState (like C's fs->prev)
     pub pc: i32,
     pub freereg: i32,
     pub max_freereg: i32,
@@ -365,7 +365,7 @@ pub struct FuncState {
     pub gotos: Vec<GotoDesc>,
     lasttarget: i32,
     block_stack: Vec<BlockEntry>,  // 每个块的信息，栈顶是当前块
-    ls: *mut LexState,
+    ls: *mut LexState<'a>,
     // 每条指令对应的行号（与 code 数组平行），用于在 finalize 时计算 line_info
     inst_lines: Vec<i32>,
     #[cfg(debug_assertions)]
@@ -382,12 +382,7 @@ pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
 
     // 设置源名 — 对应 C 的 lexstate.source = luaX_newstring(L, name, ...)
     // 源名用于错误消息和堆栈回溯中的位置信息
-    fs.proto.source = Some(crate::strings::LuaString::Short(std::sync::Arc::new(
-        crate::strings::ShortString {
-            hash: 0,
-            contents: ls.chunk_name.clone(),
-        }
-    )));
+    fs.proto.source = Some(crate::strings::new_lstr(&ls.state.string_table, &ls.chunk_name));
 
     // Like C's mainfunc: register _ENV as upvalue #0 (instack=1, idx=0).
     // In C, _ENV is also a local variable at register 0, but we handle it
@@ -395,9 +390,7 @@ pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
     // and global variable access uses GETTABUP/SETTABUP instead of GETFIELD/SETFIELD.
     // This avoids the register offset issue that would occur if _ENV were a local.
     fs.proto.upvalues.push(crate::objects::UpvalDesc {
-        name: Some(crate::strings::LuaString::Short(std::sync::Arc::new(
-            crate::strings::ShortString { hash: 0, contents: "_ENV".to_string() }
-        ))),
+        name: Some(crate::strings::new_lstr(&ls.state.string_table, "_ENV")),
         in_stack: true,
         idx: 0,
         parent_local_idx: 0,
@@ -417,8 +410,8 @@ pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
     Ok(proto)
 }
 
-impl FuncState {
-    fn new(ls: &mut LexState) -> Self {
+impl<'a> FuncState<'a> {
+    fn new(ls: &mut LexState<'a>) -> Self {
         FuncState {
             proto: crate::func::new_proto(),
             prev: std::ptr::null_mut(),
@@ -434,7 +427,7 @@ impl FuncState {
             gotos: Vec::new(),
             lasttarget: 0,
             block_stack: Vec::new(),
-            ls: ls as *mut LexState,
+            ls: ls as *mut LexState<'a>,
             inst_lines: Vec::new(),
             #[cfg(debug_assertions)]
             reg_alloc_stack: Vec::new(),
@@ -443,8 +436,8 @@ impl FuncState {
         }
     }
 
-    fn ls(&self) -> &LexState { unsafe { &*self.ls } }
-    fn ls_mut(&mut self) -> &mut LexState { unsafe { &mut *self.ls } }
+    fn ls(&self) -> &LexState<'a> { unsafe { &*self.ls } }
+    fn ls_mut(&mut self) -> &mut LexState<'a> { unsafe { &mut *self.ls } }
 
     fn error(&mut self, msg: &str) {
         self.errors.push(format!("{}:{}: {}", self.ls().chunk_name, self.ls().lastline, msg));
@@ -483,7 +476,7 @@ const ABSLINEINFO: i8 = -0x80;
 /// 连续指令数上限，超过则插入绝对行号 (C: MAXIWTHABS = 128)
 const MAXIWTHABS: i32 = 128;
 
-impl FuncState {
+impl<'a> FuncState<'a> {
     /// 发射指令到原型代码数组，返回当前 pc 并自增
     fn emit(&mut self, ins: Instruction) -> i32 {
         self.proto.code.push(ins);
@@ -716,8 +709,7 @@ impl FuncState {
 
     /// 创建字符串常量并添加到常量表
     fn string_k(&mut self, s: &str) -> i32 {
-        let t = crate::strings::StringTable::new();
-        let ls = crate::strings::new_lstr(&t, s);
+        let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, s);
         self.const_k(TValue::Str(ls))
     }
 
@@ -922,10 +914,9 @@ impl FuncState {
         let nactvar = self.active_nactvar();
         // 注册到 proto.locvars (对应 C 的 registerlocalvar)
         let pidx = self.proto.loc_vars.len() as i32;
+        let varname = Some(crate::strings::new_lstr(&self.ls_mut().state.string_table, name));
         self.proto.loc_vars.push(LocVar {
-            varname: Some(crate::strings::LuaString::Short(std::sync::Arc::new(
-                crate::strings::ShortString { hash: 0, contents: name.to_string() }
-            ))),
+            varname,
             start_pc,
             end_pc: 0,
         });
@@ -959,10 +950,9 @@ impl FuncState {
         // 的变量注册到 locvars。global 变量 (kind >= GDKREG) 不注册。
         let pidx = if in_reg {
             let p = self.proto.loc_vars.len() as i32;
+            let varname = Some(crate::strings::new_lstr(&self.ls_mut().state.string_table, name));
             self.proto.loc_vars.push(LocVar {
-                varname: Some(crate::strings::LuaString::Short(std::sync::Arc::new(
-                    crate::strings::ShortString { hash: 0, contents: name.to_string() }
-                ))),
+                varname,
                 start_pc,
                 end_pc: 0,
             });
@@ -1003,10 +993,9 @@ impl FuncState {
         let in_reg = kind <= RDKTOCLOSE;
         let pidx = if in_reg {
             let p = self.proto.loc_vars.len() as i32;
+            let varname = Some(crate::strings::new_lstr(&self.ls_mut().state.string_table, name));
             self.proto.loc_vars.push(LocVar {
-                varname: Some(crate::strings::LuaString::Short(std::sync::Arc::new(
-                    crate::strings::ShortString { hash: 0, contents: name.to_string() }
-                ))),
+                varname,
                 start_pc,
                 end_pc: 0,
             });
@@ -1153,11 +1142,12 @@ impl FuncState {
             if !pvar.is_local && pvar.is_parent_upval && pvar.name == name {
                 // Found in parent's upvalues: create instack=false upvalue
                 let idx = self.proto.upvalues.len() as i32;
-                let ls = crate::strings::new_lstr(&crate::strings::StringTable::new(), name);
+                let upval_idx = pvar.upval_idx as u8;
+                let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name);
                 self.proto.upvalues.push(crate::objects::UpvalDesc {
                     name: Some(ls),
                     in_stack: false,
-                    idx: pvar.upval_idx as u8,
+                    idx: upval_idx,
                     parent_local_idx: 0,
                 });
                 self.proto.size_upvalues = self.proto.upvalues.len() as i32;
@@ -1190,7 +1180,7 @@ impl FuncState {
                     return None;
                 }
                 let idx = self.proto.upvalues.len() as i32;
-                let ls = crate::strings::new_lstr(&crate::strings::StringTable::new(), name);
+                let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name);
                 self.proto.upvalues.push(crate::objects::UpvalDesc {
                     name: Some(ls),
                     in_stack: false,
@@ -1208,7 +1198,7 @@ impl FuncState {
     /// Like C's newupvalue with VLOCAL: instack=true, idx=ridx.
     fn create_upvalue_from_parent_local(&mut self, pvar: &ParentVar) -> UpvalueOrCtc {
         let idx = self.proto.upvalues.len() as i32;
-        let ls = crate::strings::new_lstr(&crate::strings::StringTable::new(), &pvar.name);
+        let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, &pvar.name);
         self.proto.upvalues.push(crate::objects::UpvalDesc {
             name: Some(ls),
             in_stack: true,
@@ -1269,8 +1259,7 @@ impl FuncState {
             }
             if let Some(j) = found_local {
                 let pvar = &prev.parent_locals[j];
-                let t = crate::strings::StringTable::new();
-                let ls = crate::strings::new_lstr(&t, name);
+                let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name);
                 let idx = prev.proto.upvalues.len();
                 prev.proto.upvalues.push(crate::objects::UpvalDesc {
                     name: Some(ls),
@@ -1289,8 +1278,7 @@ impl FuncState {
         for (j, pvar) in prev.parent_locals.iter().enumerate().rev() {
             if pvar.is_local || !pvar.is_parent_upval { continue; }
             if pvar.name == name {
-                let t = crate::strings::StringTable::new();
-                let ls = crate::strings::new_lstr(&t, name);
+                let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name);
                 let idx = prev.proto.upvalues.len();
                 prev.proto.upvalues.push(crate::objects::UpvalDesc {
                     name: Some(ls),
@@ -1318,8 +1306,7 @@ impl FuncState {
                 if grandparent_upval_idx == usize::MAX {
                     return usize::MAX;
                 }
-                let t = crate::strings::StringTable::new();
-                let ls = crate::strings::new_lstr(&t, name);
+                let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name);
                 let idx = prev.proto.upvalues.len();
                 prev.proto.upvalues.push(crate::objects::UpvalDesc {
                     name: Some(ls),
@@ -9376,20 +9363,22 @@ fn parse_for(fs: &mut FuncState) {
         // Like C's adjustlocalvars(ls, nvars): activate user-declared variables INSIDE body block
         // Also assign registers to them (like C's luaK_reserveregs)
         // C's adjustlocalvars calls registerlocalvar for each var, registering them to locvars
-        for (i, lv) in fs.locals[body_nlocals..].iter_mut().enumerate() {
-            lv.active = true;
-            lv.reg = base + 3 + i as i32;
+        let len = fs.locals.len();
+        for i in 0..(len - body_nlocals) {
+            let idx = body_nlocals + i;
+            fs.locals[idx].active = true;
+            fs.locals[idx].reg = base + 3 + i as i32;
             // Register to proto.loc_vars (like C's registerlocalvar in adjustlocalvars)
-            if lv.pidx < 0 && lv.kind <= RDKTOCLOSE {
+            if fs.locals[idx].pidx < 0 && fs.locals[idx].kind <= RDKTOCLOSE {
+                let name = fs.locals[idx].name.clone();
                 let p = fs.proto.loc_vars.len() as i32;
+                let varname = Some(crate::strings::new_lstr(&fs.ls_mut().state.string_table, &name));
                 fs.proto.loc_vars.push(LocVar {
-                    varname: Some(crate::strings::LuaString::Short(std::sync::Arc::new(
-                        crate::strings::ShortString { hash: 0, contents: lv.name.clone() }
-                    ))),
+                    varname,
                     start_pc: fs.pc,
                     end_pc: 0,
                 });
-                lv.pidx = p;
+                fs.locals[idx].pidx = p;
             }
         }
 

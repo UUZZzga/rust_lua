@@ -1,3 +1,5 @@
+use crate::state::LuaState;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     // Keywords
@@ -50,7 +52,8 @@ impl Token {
     }
 }
 
-pub struct LexState {
+pub struct LexState<'a> {
+    pub state: &'a mut LuaState,
     pub source: String,
     pub chunk_name: String,
     pub pos: usize,
@@ -64,11 +67,12 @@ pub struct LexState {
     pub nesting_level: u32,  // recursion depth counter (like C's nCcalls)
 }
 
-impl LexState {
-    pub fn new(source: &str, chunk_name: &str) -> Self {
+impl<'a> LexState<'a> {
+    pub fn new(state: &'a mut LuaState, source: &str, chunk_name: &str) -> Self {
         let src = source.to_string();
         let first = src.chars().next().unwrap_or('\0');
         LexState {
+            state,
             source: src,
             chunk_name: chunk_name.to_string(),
             pos: 0,
