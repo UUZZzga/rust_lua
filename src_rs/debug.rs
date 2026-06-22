@@ -10,7 +10,7 @@
 use crate::execute::VmError;
 use crate::objects::TValue;
 use crate::tm::obj_type_name;
-use crate::vm::LuaState;
+use crate::state::LuaState;
 
 /// 通用运行时错误 — 对应 C 的 luaG_runerror
 ///

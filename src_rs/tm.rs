@@ -19,7 +19,7 @@ use crate::debug::{concaterror, ordererror, opinterror, tointerror};
 use crate::execute::VmError;
 use crate::objects::{Instruction, NilKind, TValue, Table, LuaType};
 use crate::strings::{LuaString, ShortString, rust_hash};
-use crate::vm::LuaState;
+use crate::state::LuaState;
 
 // ============================================================================
 // get_mmbin_tm — 从 MM 系列指令中提取元方法事件索引

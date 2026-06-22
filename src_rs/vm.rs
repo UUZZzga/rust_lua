@@ -34,8 +34,6 @@ use std::cell::RefCell;
 pub use crate::execute::VmExecutor;
 pub use crate::execute::VmResult;
 pub use crate::execute::VmError;
-// LuaState 已合并 LuaVM，统一在 state.rs 中管理
-pub use crate::state::LuaState;
 
 // ============================================================================
 // F2IMode: 浮点数到整数的转换模式
@@ -757,26 +755,6 @@ fn value_is_stringable(v: &TValue) -> bool {
     matches!(v, TValue::Str(_) | TValue::Integer(_) | TValue::Float(_))
 }
 
-fn value_to_string_len(v: &TValue) -> usize {
-    match v {
-        TValue::Str(s) => s.len(),
-        TValue::Integer(i) => {
-            if *i == 0 { 1 } else { ((i.unsigned_abs() as f64).log10().floor() as usize) + 1 + if *i < 0 { 1 } else { 0 } }
-        }
-        TValue::Float(f) => format_float_len(*f),
-        _ => 0,
-    }
-}
-
-fn append_value_to_string(buf: &mut String, v: &TValue) {
-    match v {
-        TValue::Str(s) => buf.push_str(s.as_str()),
-        TValue::Integer(i) => buf.push_str(&i.to_string()),
-        TValue::Float(f) => buf.push_str(&format_float(*f)),
-        _ => {}
-    }
-}
-
 fn format_float_len(f: f64) -> usize {
     if f.is_nan() { return 3; }
     if f.is_infinite() { return if f > 0.0 { 3 } else { 4 }; }
@@ -1222,7 +1200,8 @@ fn format_float(f: f64) -> String {
 mod tests {
     use super::*;
     use crate::objects::{NilKind, Proto, UpvalDesc};
-    use crate::strings::{LuaString, StringTable};
+    use crate::state::LuaState;
+use crate::strings::{LuaString, StringTable};
     use std::rc::Rc;
 
     fn make_gc() -> Rc<crate::gc::GCState> {
@@ -2429,16 +2408,5 @@ mod tests {
         assert_eq!(format!("{:?}", FastAccess::Ok), "Ok");
         assert_eq!(format!("{:?}", FastAccess::NotTable), "NotTable");
         assert_eq!(format!("{:?}", FastAccess::Empty), "Empty");
-    }
-
-    // ========================================================================
-    // value_to_string_len 测试
-    // ========================================================================
-
-    #[test]
-    fn test_value_to_string_len_int() {
-        assert_eq!(super::value_to_string_len(&TValue::Integer(0)), 1);
-        assert_eq!(super::value_to_string_len(&TValue::Integer(42)), 2);
-        assert_eq!(super::value_to_string_len(&TValue::Integer(-42)), 3);
     }
 }

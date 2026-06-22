@@ -3548,7 +3548,7 @@ mod tests {
             TValue::Float(3.0),
         ];
         let result = str_format("%d %s %f", &args).unwrap();
-        assert_eq!(result, "1 two 3");
+        assert_eq!(result, "1 two 3.000000");
     }
 
     #[test]

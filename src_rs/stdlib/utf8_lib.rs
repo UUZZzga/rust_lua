@@ -888,8 +888,8 @@ mod tests {
     #[test]
     fn test_utf8_encode_large() {
         // 原始 UTF-8 值 (非 Unicode)
-        assert_eq!(utf8_encode(0x4000000), vec![0xF8, 0x90, 0x80, 0x80, 0x80]);
-        assert_eq!(utf8_encode(0x7FFFFFFF), vec![0xFC, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF]);
+        assert_eq!(utf8_encode(0x4000000), vec![0xFC, 0x84, 0x80, 0x80, 0x80, 0x80]);
+        assert_eq!(utf8_encode(0x7FFFFFFF), vec![0xFD, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF]);
     }
 
     // ========================================================================
@@ -955,8 +955,10 @@ mod tests {
         assert_eq!(utf8_offset_impl(s, 2, 1).unwrap(), Some((2, 2)));
         // n=5, 第5个字符
         assert_eq!(utf8_offset_impl(s, 5, 1).unwrap(), Some((5, 5)));
-        // n=6, 超出范围
-        assert_eq!(utf8_offset_impl(s, 6, 1).unwrap(), None);
+        // n=6, 与 C 实现一致: n = len + 1 时返回 len + 1
+        assert_eq!(utf8_offset_impl(s, 6, 1).unwrap(), Some((6, 6)));
+        // n=7, 超出范围
+        assert_eq!(utf8_offset_impl(s, 7, 1).unwrap(), None);
     }
 
     #[test]
