@@ -407,8 +407,8 @@ pub fn raw_equal(t1: &TValue, t2: &TValue) -> bool {
         }
         (TValue::Str(a), TValue::Str(b)) => a.as_str() == b.as_str(),
         (TValue::LightUserData(a), TValue::LightUserData(b)) => std::ptr::eq(*a, *b),
-        (TValue::Table(a), TValue::Table(b)) => std::ptr::eq(a as *const Table, b as *const Table),
-        (TValue::LClosure(a), TValue::LClosure(b)) => std::ptr::eq(a as *const _, b as *const _),
+        (TValue::Table(a), TValue::Table(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
+        (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
         (TValue::CClosure(a), TValue::CClosure(b)) => std::ptr::eq(a as *const _, b as *const _),
         (TValue::UserData(a), TValue::UserData(b)) => std::ptr::eq(a as *const _, b as *const _),
         (TValue::Thread(a), TValue::Thread(b)) => std::ptr::eq(a as *const _, b as *const _),
@@ -652,12 +652,13 @@ pub fn finish_get(key: &TValue, t: &TValue, _metatable: Option<&Table>) -> Resul
     for _loop_count in 0..MAX_TAG_LOOP {
         match &current {
             TValue::Table(table) => {
-                if let Some(ref mt) = table.metatable {
-                    return Ok(table.get(&current_key).cloned().unwrap_or_else(|| {
-                        mt.get(&current_key).cloned().unwrap_or(TValue::Nil(crate::objects::NilKind::Strict))
+                // 通过 get_metatable() 获取元表（共享 Rc，开销极小）
+                if let Some(mt) = table.get_metatable() {
+                    return Ok(table.get(&current_key).unwrap_or_else(|| {
+                        mt.get(&current_key).unwrap_or(TValue::Nil(crate::objects::NilKind::Strict))
                     }));
                 } else {
-                    return Ok(table.get(&current_key).cloned().unwrap_or(TValue::Nil(crate::objects::NilKind::Strict)));
+                    return Ok(table.get(&current_key).unwrap_or(TValue::Nil(crate::objects::NilKind::Strict)));
                 }
             }
             _ => {
@@ -2064,7 +2065,7 @@ use crate::strings::{LuaString, StringTable};
         let result = finish_set(&mut tv, TValue::Str(make_ls("a")), TValue::Integer(100), FastAccess::Ok);
         assert!(result.is_ok());
         if let TValue::Table(ref t) = tv {
-            assert_eq!(t.get(&TValue::Str(make_ls("a"))), Some(&TValue::Integer(100)));
+            assert_eq!(t.get(&TValue::Str(make_ls("a"))), Some(TValue::Integer(100)));
         }
     }
 

@@ -115,8 +115,13 @@ pub struct LuaState {
     pub hook_mask: i32,
     /// debug hook count — 对应 C 的 L->basehookcount
     pub hook_count: i32,
+    /// 当前 hook count (每条指令递减) — 对应 C 的 L->hookcount
+    pub current_hook_count: i32,
     /// 上次 line hook 检查的 pc — 对应 C 的 L->oldpc（指令索引，不是行号）
     pub hook_old_pc: i32,
+    /// 是否允许调用 hook — 对应 C 的 L->allowhook
+    /// 在 hook 执行期间设为 false，防止递归调用
+    pub allowhook: bool,
 }
 
 /// 调用栈条目 — 用于堆栈回溯和 debug.getinfo
@@ -134,6 +139,10 @@ pub struct CallInfoEntry {
     pub saved_pc: usize,
     /// 函数名类型: "local", "global", "method", "field", "hook", ""
     pub namewhat: String,
+    /// 调用者的 proto_flag（PF_VAHID / PF_VATAB）— 用于 debug.getlocal level > 1
+    pub proto_flag: u8,
+    /// 调用者的 nextraargs — 用于 debug.getlocal level > 1 的 vararg 访问
+    pub nextraargs: i32,
 }
 
 fn G(l: &LuaState) -> &GlobalState {
@@ -202,7 +211,9 @@ impl LuaState {
             hook_func: None,
             hook_mask: 0,
             hook_count: 0,
+            current_hook_count: 0,
             hook_old_pc: 0,
+            allowhook: true,
         }
     }
 
@@ -344,7 +355,9 @@ impl LuaState {
             hook_func: None,
             hook_mask: 0,
             hook_count: 0,
+            current_hook_count: 0,
             hook_old_pc: 0,
+            allowhook: true,
         };
         state
     }
@@ -428,7 +441,9 @@ impl LuaState {
             hook_func: None,
             hook_mask: 0,
             hook_count: 0,
+            current_hook_count: 0,
             hook_old_pc: 0,
+            allowhook: true,
         }
     }
 }
@@ -727,7 +742,7 @@ impl LuaState {
         let key = TValue::Str(str_to_ls(&self.string_table, key_name));
         if abs > 0 && abs <= self.stack.len() {
             let val = if let TValue::Table(ref t) = &self.stack[abs - 1] {
-                t.get(&key).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
+                t.get(&key).unwrap_or(TValue::Nil(NilKind::Strict))
             } else {
                 TValue::Nil(NilKind::Strict)
             };
@@ -757,7 +772,7 @@ impl LuaState {
         if abs > 0 && abs <= self.stack.len() {
             let val = if let TValue::Table(ref t) = &self.stack[abs - 1] {
                 let tkey = TValue::Integer(i);
-                t.get(&tkey).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
+                t.get(&tkey).unwrap_or(TValue::Nil(NilKind::Strict))
             } else {
                 TValue::Nil(NilKind::Strict)
             };
@@ -785,7 +800,7 @@ impl LuaState {
         let abs = self.abs_index(idx);
         if abs > 0 && abs <= self.stack.len() {
             let val = if let TValue::Table(ref t) = &self.stack[abs - 1] {
-                t.get(&key).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
+                t.get(&key).unwrap_or(TValue::Nil(NilKind::Strict))
             } else {
                 TValue::Nil(NilKind::Strict)
             };
@@ -1203,120 +1218,83 @@ impl LuaState {
                 let tag_val = tag as usize;
                 let nargs = self.stack.len().saturating_sub(func_idx + 1);
 
-                // 基础库函数派发 (标签 1-19, 22)
-                // 对应原 C 源码 lbaselib.cpp 的各个函数
-                // 注意: ipairsaux (迭代器) 只在 TFORCALL 中调用, 不在此处理
-                if crate::stdlib::base_lib::is_base_tag(tag_val) {
-                    match crate::stdlib::base_lib::call_base_function(
+                // 推入 CallInfoEntry，让 debug.getinfo/traceback 能正确看到 C 函数帧
+                // 对应 C 的 luaD_precall -> inc_ci 创建新的 CallInfo
+                let c_func_name: Option<String> = if crate::stdlib::base_lib::is_base_tag(tag_val) {
+                    crate::stdlib::base_lib::base_function_name(tag_val).map(|s| s.to_string())
+                } else if crate::stdlib::debug_lib::is_debug_tag(tag_val) {
+                    crate::stdlib::debug_lib::debug_function_name(tag_val).map(|s| s.to_string())
+                } else if crate::stdlib::math_lib::is_math_tag(tag_val) {
+                    crate::stdlib::math_lib::math_function_name(tag_val).map(|s| s.to_string())
+                } else if crate::stdlib::utf8_lib::is_utf8_tag(tag_val) {
+                    crate::stdlib::utf8_lib::utf8_function_name(tag_val).map(|s| s.to_string())
+                } else if crate::stdlib::table_lib::is_table_tag(tag_val) {
+                    crate::stdlib::table_lib::table_function_name(tag_val).map(|s| s.to_string())
+                } else if tag_val >= 100 {
+                    crate::stdlib::string_lib::string_function_name(tag_val).map(|s| s.to_string())
+                } else {
+                    None
+                };
+                self.call_info.push(crate::state::CallInfoEntry {
+                    source: "=[C]".to_string(),
+                    line: -1,
+                    name: c_func_name.unwrap_or_default(),
+                    is_c: true,
+                    closure: None,
+                    base: func_idx + 1,
+                    saved_pc: self.pc,
+                    namewhat: "field".to_string(),
+                    proto_flag: self.proto_flag,
+                    nextraargs: self.nextraargs,
+                });
+
+                // 派发 C 函数并收集结果
+                let dispatch_result: Result<(), crate::execute::VmError> = if crate::stdlib::base_lib::is_base_tag(tag_val) {
+                    crate::stdlib::base_lib::call_base_function(
                         tag_val, self, func_idx, nargs, nresults,
-                    ) {
-                        Ok(()) => return 0,
-                        Err(crate::execute::VmError::RuntimeError(msg)) => {
-                            self.stack.truncate(func_idx);
-                            self.push_string(&msg);
-                            return ERR_RUN;
-                        }
-                        Err(e) => {
-                            self.stack.truncate(func_idx);
-                            self.push_string(&format!("{}", e));
-                            return ERR_RUN;
-                        }
+                    )
+                } else if crate::stdlib::math_lib::is_math_tag(tag_val) {
+                    crate::stdlib::math_lib::call_math_function(
+                        tag_val, self, func_idx, nargs, nresults,
+                    )
+                } else if crate::stdlib::utf8_lib::is_utf8_tag(tag_val) {
+                    crate::stdlib::utf8_lib::call_utf8_function(
+                        tag_val, self, func_idx, nargs, nresults,
+                    )
+                } else if crate::stdlib::table_lib::is_table_tag(tag_val) {
+                    crate::stdlib::table_lib::call_table_function(
+                        tag_val, self, func_idx, nargs, nresults,
+                    )
+                } else if crate::stdlib::debug_lib::is_debug_tag(tag_val) {
+                    crate::stdlib::debug_lib::call_debug_function(
+                        tag_val, self, func_idx, nargs, nresults,
+                    )
+                } else if tag_val >= 100 {
+                    crate::stdlib::string_lib::call_string_function(
+                        tag_val, self, func_idx, nargs, nresults,
+                    )
+                } else {
+                    Err(crate::execute::VmError::RuntimeError(format!(
+                        "attempt to call a non-function value (tag={})", tag_val
+                    )))
+                };
+
+                // 弹出 C 函数的 CallInfoEntry
+                self.call_info.pop();
+
+                match dispatch_result {
+                    Ok(()) => 0,
+                    Err(crate::execute::VmError::RuntimeError(msg)) => {
+                        self.stack.truncate(func_idx);
+                        self.push_string(&msg);
+                        ERR_RUN
+                    }
+                    Err(e) => {
+                        self.stack.truncate(func_idx);
+                        self.push_string(&format!("{}", e));
+                        ERR_RUN
                     }
                 }
-                // 数学库函数 (标签 200-299)
-                if crate::stdlib::math_lib::is_math_tag(tag_val) {
-                    match crate::stdlib::math_lib::call_math_function(
-                        tag_val, self, func_idx, nargs, nresults,
-                    ) {
-                        Ok(()) => return 0,
-                        Err(crate::execute::VmError::RuntimeError(msg)) => {
-                            self.stack.truncate(func_idx);
-                            self.push_string(&msg);
-                            return ERR_RUN;
-                        }
-                        Err(e) => {
-                            self.stack.truncate(func_idx);
-                            self.push_string(&format!("{}", e));
-                            return ERR_RUN;
-                        }
-                    }
-                }
-                // UTF-8 库函数 (标签 300-309)
-                if crate::stdlib::utf8_lib::is_utf8_tag(tag_val) {
-                    match crate::stdlib::utf8_lib::call_utf8_function(
-                        tag_val, self, func_idx, nargs, nresults,
-                    ) {
-                        Ok(()) => return 0,
-                        Err(crate::execute::VmError::RuntimeError(msg)) => {
-                            self.stack.truncate(func_idx);
-                            self.push_string(&msg);
-                            return ERR_RUN;
-                        }
-                        Err(e) => {
-                            self.stack.truncate(func_idx);
-                            self.push_string(&format!("{}", e));
-                            return ERR_RUN;
-                        }
-                    }
-                }
-                // Table 库函数 (标签 400-409)
-                if crate::stdlib::table_lib::is_table_tag(tag_val) {
-                    match crate::stdlib::table_lib::call_table_function(
-                        tag_val, self, func_idx, nargs, nresults,
-                    ) {
-                        Ok(()) => return 0,
-                        Err(crate::execute::VmError::RuntimeError(msg)) => {
-                            self.stack.truncate(func_idx);
-                            self.push_string(&msg);
-                            return ERR_RUN;
-                        }
-                        Err(e) => {
-                            self.stack.truncate(func_idx);
-                            self.push_string(&format!("{}", e));
-                            return ERR_RUN;
-                        }
-                    }
-                }
-                // Debug 库函数 (标签 500-519)
-                // 对应原 C 源码 ldblib.cpp 的各个函数
-                if crate::stdlib::debug_lib::is_debug_tag(tag_val) {
-                    match crate::stdlib::debug_lib::call_debug_function(
-                        tag_val, self, func_idx, nargs, nresults,
-                    ) {
-                        Ok(()) => return 0,
-                        Err(crate::execute::VmError::RuntimeError(msg)) => {
-                            self.stack.truncate(func_idx);
-                            self.push_string(&msg);
-                            return ERR_RUN;
-                        }
-                        Err(e) => {
-                            self.stack.truncate(func_idx);
-                            self.push_string(&format!("{}", e));
-                            return ERR_RUN;
-                        }
-                    }
-                }
-                // 字符串库函数 (标签 100+)
-                if tag_val >= 100 {
-                    match crate::stdlib::string_lib::call_string_function(
-                        tag_val, self, func_idx, nargs, nresults,
-                    ) {
-                        Ok(()) => return 0,
-                        Err(crate::execute::VmError::RuntimeError(msg)) => {
-                            self.stack.truncate(func_idx);
-                            self.push_string(&msg);
-                            return ERR_RUN;
-                        }
-                        Err(e) => {
-                            self.stack.truncate(func_idx);
-                            self.push_string(&format!("{}", e));
-                            return ERR_RUN;
-                        }
-                    }
-                }
-                self.stack.truncate(func_idx);
-                self.push_string(&format!("attempt to call a non-function value (tag={})", tag_val));
-                ERR_RUN
             }
             _ => {
                 self.stack.truncate(func_idx);

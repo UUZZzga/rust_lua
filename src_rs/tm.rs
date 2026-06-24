@@ -99,6 +99,11 @@ impl TagMethod {
         }
     }
 
+    /// 返回事件名（不含 "__" 前缀）— 对应 C 的 tmname[tm] + 2
+    pub fn event_name(self) -> &'static str {
+        &self.name()[2..]
+    }
+
     pub fn is_fast_access(self) -> bool {
         (self as u8) <= (TagMethod::Eq as u8)
     }
@@ -178,7 +183,7 @@ impl Metatable {
         Metatable { table: Table::new(), flags: MetatableFlags::empty() }
     }
 
-    pub fn get_tm(&mut self, tm: TagMethod) -> Option<&TValue> {
+    pub fn get_tm(&mut self, tm: TagMethod) -> Option<TValue> {
         if let Some(flag) = MetatableFlags::from_tag_method(tm) {
             if self.flags.contains(flag) { return None; }
         }
@@ -254,15 +259,16 @@ pub fn type_name(ty: LuaType) -> &'static str {
 }
 
 pub fn obj_type_name(obj: &TValue) -> String {
-    let meta: Option<&Table> = match obj {
-        TValue::Table(t) => t.metatable.as_ref().map(|b| b.as_ref()),
-        TValue::UserData(u) => u.metatable.as_ref().map(|b| b.as_ref()),
+    // 获取元表（Table 通过 get_metatable() 共享 Rc；UserData 直接克隆）
+    let meta: Option<Table> = match obj {
+        TValue::Table(t) => t.get_metatable(),
+        TValue::UserData(u) => u.metatable.as_ref().map(|b| (**b).clone()),
         _ => None,
     };
     if let Some(mt) = meta {
         let name_key = make_name_key();
         if let Some(name_val) = mt.get(&name_key) {
-            if let TValue::Str(s) = name_val {
+            if let TValue::Str(s) = &name_val {
                 return s.as_str().to_string();
             }
         }
@@ -270,15 +276,16 @@ pub fn obj_type_name(obj: &TValue) -> String {
     type_name(obj.ty()).to_string()
 }
 
-pub fn get_tm_by_obj<'a>(
-    obj: &'a TValue,
+pub fn get_tm_by_obj(
+    obj: &TValue,
     tm: TagMethod,
-    default_mts: &'a DefaultMetatables,
-) -> Option<&'a TValue> {
-    let mt: Option<&Table> = match obj {
-        TValue::Table(t) => t.metatable.as_ref().map(|b| b.as_ref()),
-        TValue::UserData(u) => u.metatable.as_ref().map(|b| b.as_ref()),
-        _ => default_mts.get(obj.ty()),
+    default_mts: &DefaultMetatables,
+) -> Option<TValue> {
+    // RefCell 无法返回引用，故返回 owned TValue
+    let mt: Option<Table> = match obj {
+        TValue::Table(t) => t.get_metatable(),
+        TValue::UserData(u) => u.metatable.as_ref().map(|b| (**b).clone()),
+        _ => default_mts.get(obj.ty()).cloned(),
     };
     let mt = mt?;
     let key = make_tm_tvalue(tm);
@@ -342,6 +349,7 @@ fn call_tm_res(
     p1: &TValue,
     p2: &TValue,
     res: usize,
+    tm: TagMethod,
 ) -> Result<(), VmError> {
     let func_idx = state.stack.len();
     // 压入函数和两个参数 (对应 C 的 setobj2s)
@@ -350,8 +358,37 @@ fn call_tm_res(
     state.stack.push(p2.clone());
     state.top = state.stack.len();
 
+    // 推入 CallInfoEntry — 对应 C 的 luaD_callnoyield 推入 CallInfo
+    // name = 事件名 (如 "index", "add"), namewhat = "metamethod"
+    let caller_base = state.base;
+    let caller_pc = state.pc;
+    let caller_source = if state.base > 0 && state.base <= state.stack.len() {
+        if let TValue::LClosure(c) = &state.stack[state.base - 1] {
+            c.proto.source.as_ref().map(|s| s.as_str().to_string()).unwrap_or_else(|| "=?".to_string())
+        } else {
+            "=[C]".to_string()
+        }
+    } else {
+        "=?".to_string()
+    };
+    state.call_info.push(crate::state::CallInfoEntry {
+        source: caller_source,
+        line: -1,
+        name: tm.event_name().to_string(),
+        is_c: false,
+        closure: None,
+        base: caller_base,
+        saved_pc: caller_pc,
+        namewhat: "metamethod".to_string(),
+        proto_flag: state.proto_flag,
+        nextraargs: state.nextraargs,
+    });
+
     // 调用: 2 个参数, 1 个返回值 (对应 C 的 luaD_callnoyield(L, func, 1))
     let status = state.pcall(2, 1, 0);
+
+    // 弹出 CallInfoEntry
+    state.call_info.pop();
 
     // pcall 后: 栈截断到 func_idx，1 个结果(或错误消息)在 func_idx
     let result = if func_idx < state.stack.len() {
@@ -405,12 +442,11 @@ fn callbin_tm(
 ) -> Result<bool, VmError> {
     // 先从 p1 查找元方法，再从 p2 查找
     let tm_val = get_tm_by_obj(p1, tm, &state.dmt)
-        .or_else(|| get_tm_by_obj(p2, tm, &state.dmt))
-        .cloned();
+        .or_else(|| get_tm_by_obj(p2, tm, &state.dmt));
 
     match tm_val {
         Some(f) => {
-            call_tm_res(state, &f, p1, p2, res)?;
+            call_tm_res(state, &f, p1, p2, res, tm)?;
             Ok(true)
         }
         None => Ok(false),
@@ -638,14 +674,13 @@ pub fn equal_obj(
     }
     // C: fasttm(L, hvalue(t1)->metatable, TM_EQ) ?? fasttm(L, hvalue(t2)->metatable, TM_EQ)
     let tm = get_tm_by_obj(t1, TagMethod::Eq, &state.dmt)
-        .or_else(|| get_tm_by_obj(t2, TagMethod::Eq, &state.dmt))
-        .cloned();
+        .or_else(|| get_tm_by_obj(t2, TagMethod::Eq, &state.dmt));
     match tm {
         Some(f) => {
             // C: luaT_callTMres(L, tm, t1, t2, L->top.p); return !tagisfalse(tag);
             let res = state.stack.len();
             state.stack.push(TValue::Nil(NilKind::Strict));
-            call_tm_res(state, &f, t1, t2, res)?;
+            call_tm_res(state, &f, t1, t2, res, TagMethod::Eq)?;
             let result = state.stack[res].clone();
             state.stack.truncate(res);
             state.top = state.stack.len();
@@ -694,9 +729,9 @@ pub fn obj_len(
     let tm: Option<TValue> = match rb {
         TValue::Table(t) => {
             // 先查表自身元表的 __len
-            let tm_val = t.metatable.as_ref().and_then(|mt| {
-                let mut meta = Metatable::new(mt.as_ref().clone());
-                meta.get_tm(TagMethod::Len).cloned()
+            let tm_val = t.get_metatable().and_then(|mt| {
+                let mut meta = Metatable::new(mt);
+                meta.get_tm(TagMethod::Len)
             });
             if tm_val.is_some() {
                 tm_val
@@ -723,14 +758,14 @@ pub fn obj_len(
         }
         _ => {
             // 其他类型: 查找 __len 元方法
-            get_tm_by_obj(rb, TagMethod::Len, &state.dmt).cloned()
+            get_tm_by_obj(rb, TagMethod::Len, &state.dmt)
         }
     };
 
     match tm {
         Some(f) => {
             // C: luaT_callTMres(L, tm, rb, rb, ra);
-            call_tm_res(state, &f, rb, rb, ra)
+            call_tm_res(state, &f, rb, rb, ra, TagMethod::Len)
         }
         None => {
             Err(VmError::RuntimeError(format!(
@@ -803,7 +838,7 @@ impl VarargTable {
         match self {
             VarargTable::Table { ref table, count } => {
                 if i >= *count { return None; }
-                table.get_int(i as i64 + 1).cloned()
+                table.get_int(i as i64 + 1)
             }
             VarargTable::Hidden { args } => args.get(i).cloned(),
         }

@@ -1108,7 +1108,7 @@ fn test_unit_call_setmetatable() {
     state.stack.push(TValue::Table(mt));
     base_lib::call_base_function(base_lib::BASE_SETMETATABLE, &mut state, 0, 2, 1).unwrap();
     match &state.stack[0] {
-        TValue::Table(t) => assert!(t.metatable.is_some()),
+        TValue::Table(t) => assert!(t.data.borrow().metatable.is_some()),
         _ => panic!("expected table result"),
     }
 }
@@ -1118,7 +1118,7 @@ fn test_unit_call_getmetatable() {
     let mut state = LuaState::new();
     state.stack.clear();
     let mut t = Table::new();
-    t.metatable = Some(Box::new(Table::new()));
+    t.data.borrow_mut().metatable = Some(Box::new(Table::new()));
     state.stack.push(TValue::LightUserData(base_lib::BASE_GETMETATABLE as *mut std::ffi::c_void));
     state.stack.push(TValue::Table(t));
     base_lib::call_base_function(base_lib::BASE_GETMETATABLE, &mut state, 0, 1, 1).unwrap();

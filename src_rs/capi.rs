@@ -722,7 +722,7 @@ pub extern "C" fn lua_gettable(L: *mut lua_State, idx: c_int) -> c_int {
     let L = unsafe { &mut *L };
     let key = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
     if is_registry(idx) {
-        let val = L.registry.get(&key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
+        let val = L.registry.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
         let ty = lua_type_code(val.ty());
         L.stack.push(val);
         return ty;
@@ -735,7 +735,7 @@ pub extern "C" fn lua_gettable(L: *mut lua_State, idx: c_int) -> c_int {
         }
     };
     let val = match &L.stack[off] {
-        TValue::Table(t) => t.get(&key).cloned().unwrap_or(TValue::Nil(NilKind::Strict)),
+        TValue::Table(t) => t.get(&key).unwrap_or(TValue::Nil(NilKind::Strict)),
         _ => TValue::Nil(NilKind::Strict),
     };
     let ty = lua_type_code(val.ty());
@@ -776,7 +776,7 @@ pub extern "C" fn lua_getfield(L: *mut lua_State, idx: c_int, k: *const c_char) 
     let key = crate::state::str_to_ls(&L.string_table, &key_str);
     let key_tv = TValue::Str(key);
     if is_registry(idx) {
-        let val = L.registry.get(&key_tv).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
+        let val = L.registry.get(&key_tv).unwrap_or(TValue::Nil(NilKind::Strict));
         let ty = lua_type_code(val.ty());
         L.stack.push(val);
         return ty;
@@ -789,7 +789,7 @@ pub extern "C" fn lua_getfield(L: *mut lua_State, idx: c_int, k: *const c_char) 
         }
     };
     let val = match &L.stack[off] {
-        TValue::Table(t) => t.get(&key_tv).cloned().unwrap_or(TValue::Nil(NilKind::Strict)),
+        TValue::Table(t) => t.get(&key_tv).unwrap_or(TValue::Nil(NilKind::Strict)),
         _ => TValue::Nil(NilKind::Strict),
     };
     let ty = lua_type_code(val.ty());
@@ -843,7 +843,7 @@ pub extern "C" fn lua_rawgeti(L: *mut lua_State, idx: c_int, n: lua_Integer) -> 
     let L = unsafe { &mut *L };
     let key = TValue::Integer(n);
     if is_registry(idx) {
-        let val = L.registry.get(&key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
+        let val = L.registry.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
         let ty = lua_type_code(val.ty());
         L.stack.push(val);
         return ty;
@@ -856,7 +856,7 @@ pub extern "C" fn lua_rawgeti(L: *mut lua_State, idx: c_int, n: lua_Integer) -> 
         }
     };
     let val = match &L.stack[off] {
-        TValue::Table(t) => t.get(&key).cloned().unwrap_or(TValue::Nil(NilKind::Strict)),
+        TValue::Table(t) => t.get(&key).unwrap_or(TValue::Nil(NilKind::Strict)),
         _ => TValue::Nil(NilKind::Strict),
     };
     let ty = lua_type_code(val.ty());
@@ -899,7 +899,7 @@ pub extern "C" fn lua_getglobal(L: *mut lua_State, name: *const c_char) -> c_int
     };
     let key = crate::state::str_to_ls(&L.string_table, &name_str);
     let key_tv = TValue::Str(key);
-    let val = L.globals.get(&key_tv).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
+    let val = L.globals.get(&key_tv).unwrap_or(TValue::Nil(NilKind::Strict));
     let ty = lua_type_code(val.ty());
     L.stack.push(val);
     ty

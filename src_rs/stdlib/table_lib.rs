@@ -74,7 +74,7 @@ fn table_len(table: &crate::table::Table) -> i64 {
 
 /// 获取表中指定整数键的值
 fn table_get_int(table: &crate::table::Table, key: i64) -> TValue {
-    table.get_int(key).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
+    table.get_int(key).unwrap_or(TValue::Nil(NilKind::Strict))
 }
 
 /// 将结果压入栈并调整栈顶
@@ -255,7 +255,7 @@ fn call_pack(
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
-    let mut t = crate::table::Table::new();
+    let t = crate::table::Table::new();
     for i in 0..nargs {
         let val = get_arg(state, a, i);
         t.set_int((i + 1) as i64, val);

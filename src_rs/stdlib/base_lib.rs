@@ -506,26 +506,26 @@ fn call_setmetatable(
         let arg1_ref = &mut state.stack[a + 1];
         match arg1_ref {
             TValue::Table(t) => {
-                // 检查是否有 __metatable 元方法 (受保护的元表)
-                if let Some(ref mt) = t.metatable {
-                    if mt.get(&metatable_key).is_some() {
-                        return Err(VmError::RuntimeError(
-                            "cannot change a protected metatable".to_string(),
-                        ));
-                    }
+            // 检查是否有 __metatable 元方法 (受保护的元表)
+            if let Some(mt) = t.get_metatable() {
+                if mt.get(&metatable_key).is_some() {
+                    return Err(VmError::RuntimeError(
+                        "cannot change a protected metatable".to_string(),
+                    ));
                 }
-                // 设置元表
-                match &arg2 {
-                    TValue::Table(mt) => {
-                        t.metatable = Some(Box::new(mt.clone()));
-                    }
-                    TValue::Nil(_) => {
-                        t.metatable = None;
-                    }
-                    _ => unreachable!(),
-                }
-                state.stack[a + 1].clone()
             }
+            // 设置元表
+            match &arg2 {
+                TValue::Table(mt) => {
+                    t.set_metatable(Some(mt.clone()));
+                }
+                TValue::Nil(_) => {
+                    t.set_metatable(None);
+                }
+                _ => unreachable!(),
+            }
+            state.stack[a + 1].clone()
+        }
             _ => {
                 return Err(VmError::RuntimeError(
                     "bad argument #1 to 'setmetatable' (table expected)".to_string(),
@@ -550,11 +550,11 @@ fn call_getmetatable(
     let metatable_key = TValue::Str(state.intern_str("__metatable"));
     let result = match &arg {
         TValue::Table(t) => {
-            if let Some(ref mt) = t.metatable {
+            if let Some(mt) = t.get_metatable() {
                 // 检查 __metatable 元方法
                 match mt.get(&metatable_key) {
-                    Some(val) => val.clone(),
-                    None => TValue::Table(mt.as_ref().clone()),
+                    Some(val) => val,
+                    None => TValue::Table(mt),
                 }
             } else {
                 TValue::Nil(NilKind::Strict)
@@ -886,7 +886,7 @@ fn call_rawget(
     let k = get_arg(state, a, 1);
     match &t {
         TValue::Table(table) => {
-            let result = table.get(&k).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
+            let result = table.get(&k).unwrap_or(TValue::Nil(NilKind::Strict));
             push_single_result(state, a, nresults, result);
             Ok(())
         }
@@ -1108,7 +1108,7 @@ fn call_require(
 
     // 对于内置模块, 返回对应的全局表
     let global_key = TValue::Str(state.intern_str(&modname));
-    let result = state.globals.get(&global_key).cloned();
+    let result = state.globals.get(&global_key);
 
     match result {
         Some(val) if !matches!(val, TValue::Nil(_)) => {
@@ -1199,9 +1199,14 @@ fn call_load(
     };
 
     match proto_result {
-        Ok(proto) => {
+        Ok(mut proto) => {
             // 创建闭包, 设置 _ENV 上值为全局表
             let nup = proto.size_upvalues as usize;
+            // 二进制加载的 proto 中字符串常量是 LongString, 需要驻留化为 ShortString
+            // 以便与全局表中的 ShortString 键匹配 (Short vs Long 的 Hash/PartialEq 不一致)
+            if is_binary {
+                intern_proto_strings(&mut proto, state);
+            }
             let mut upvals: Vec<UpValRef> = Vec::with_capacity(nup.max(1));
             upvals.push(std::rc::Rc::new(std::cell::RefCell::new(UpVal::Closed {
                 value: Box::new(TValue::Table(state.globals.clone())),
@@ -1231,6 +1236,49 @@ fn call_load(
 }
 
 // ============================================================================
+// 二进制 chunk 字符串驻留化 (修复 ShortString/LongString 不匹配问题)
+// ============================================================================
+
+/// 递归地将 proto 及其子 proto 中的字符串常量驻留化
+///
+/// 二进制 dump/undump 后, 所有字符串都是 LongString。但全局表的键是 ShortString
+/// (通过 StringTable::intern 创建)。由于 LuaString 的 PartialEq/Hash 实现中
+/// Short vs Long 返回 false, 导致 GETTABUP 无法在全局表中找到键。
+/// 此函数将短字符串 (<= 40 字节) 转换为驻留的 ShortString。
+fn intern_proto_strings(proto: &mut Proto, state: &LuaState) {
+    // 驻留化常量池中的字符串
+    for c in &mut proto.constants {
+        if let TValue::Str(s) = c {
+            let s_str = s.as_str().to_string();
+            *c = TValue::Str(state.intern_str(&s_str));
+        }
+    }
+    // 驻留化 upvalue 名称
+    for uv in &mut proto.upvalues {
+        if let Some(name) = uv.name.take() {
+            let name_str = name.as_str().to_string();
+            uv.name = Some(state.intern_str(&name_str));
+        }
+    }
+    // 驻留化局部变量名
+    for lv in &mut proto.loc_vars {
+        if let Some(name) = lv.varname.take() {
+            let name_str = name.as_str().to_string();
+            lv.varname = Some(state.intern_str(&name_str));
+        }
+    }
+    // 驻留化 source
+    if let Some(src) = proto.source.take() {
+        let src_str = src.as_str().to_string();
+        proto.source = Some(state.intern_str(&src_str));
+    }
+    // 递归处理子 proto
+    for p in &mut proto.protos {
+        intern_proto_strings(p, state);
+    }
+}
+
+// ============================================================================
 // 表遍历辅助函数 (对应 C 的 lua_next)
 // ============================================================================
 
@@ -1251,11 +1299,12 @@ fn table_next(table: &crate::table::Table, key: &TValue) -> (Option<TValue>, TVa
     if let TValue::Integer(k) = key {
         if *k > 0 {
             let idx = (*k - 1) as usize;
-            if idx < table.array.len() {
+            let data = table.data.borrow();
+            if idx < data.array.len() {
                 // 尝试下一个数组元素
                 let next_idx = idx + 1;
-                if next_idx < table.array.len() {
-                    let next_val = &table.array[next_idx];
+                if next_idx < data.array.len() {
+                    let next_val = &data.array[next_idx];
                     if !matches!(next_val, TValue::Nil(NilKind::Empty)) {
                         return (
                             Some(TValue::Integer(next_idx as i64 + 1)),
@@ -1264,6 +1313,7 @@ fn table_next(table: &crate::table::Table, key: &TValue) -> (Option<TValue>, TVa
                     }
                 }
                 // 数组部分结束, 转到哈希部分
+                drop(data); // 释放 borrow, 避免 find_first_hash 中重复 borrow
                 return find_first_hash(table);
             }
         }
@@ -1276,18 +1326,21 @@ fn table_next(table: &crate::table::Table, key: &TValue) -> (Option<TValue>, TVa
 /// 查找第一个非空元素 (数组部分)
 fn find_first(table: &crate::table::Table) -> (Option<TValue>, TValue) {
     // 先查找数组部分
-    for (i, v) in table.array.iter().enumerate() {
+    let data = table.data.borrow();
+    for (i, v) in data.array.iter().enumerate() {
         if !matches!(v, TValue::Nil(NilKind::Empty)) {
             return (Some(TValue::Integer(i as i64 + 1)), v.clone());
         }
     }
+    drop(data); // 释放 borrow
     // 数组部分为空, 查找哈希部分
     find_first_hash(table)
 }
 
 /// 查找哈希部分的第一个元素
 fn find_first_hash(table: &crate::table::Table) -> (Option<TValue>, TValue) {
-    if let Some((k, v)) = table.hash.iter().next() {
+    let data = table.data.borrow();
+    if let Some((k, v)) = data.hash.iter().next() {
         return (Some(k.clone()), v.clone());
     }
     (None, TValue::Nil(NilKind::Strict))
@@ -1298,8 +1351,9 @@ fn find_next_hash(
     table: &crate::table::Table,
     key: &TValue,
 ) -> (Option<TValue>, TValue) {
+    let data = table.data.borrow();
     let mut found = false;
-    for (k, v) in table.hash.iter() {
+    for (k, v) in data.hash.iter() {
         if found {
             return (Some(k.clone()), v.clone());
         }
@@ -1341,7 +1395,6 @@ pub fn call_ipairs_aux(
         TValue::Table(table) => {
             let val = table
                 .get_int(next_i)
-                .cloned()
                 .unwrap_or(TValue::Nil(NilKind::Strict));
             if matches!(val, TValue::Nil(_)) {
                 // 结束迭代
@@ -2055,7 +2108,7 @@ mod tests {
         state.stack.push(TValue::Table(mt));
         call_base_function(BASE_SETMETATABLE, &mut state, 0, 2, 1).unwrap();
         match &state.stack[0] {
-            TValue::Table(t) => assert!(t.metatable.is_some()),
+            TValue::Table(t) => assert!(t.has_metatable()),
             _ => panic!("expected table result"),
         }
     }
@@ -2064,8 +2117,8 @@ mod tests {
     fn test_call_base_function_getmetatable() {
         let mut state = LuaState::new();
         state.stack.clear();
-        let mut t = crate::table::Table::new();
-        t.metatable = Some(Box::new(crate::table::Table::new()));
+        let t = crate::table::Table::new();
+        t.set_metatable(Some(crate::table::Table::new()));
         state.stack.push(TValue::LightUserData(BASE_GETMETATABLE as *mut std::ffi::c_void));
         state.stack.push(TValue::Table(t));
         call_base_function(BASE_GETMETATABLE, &mut state, 0, 1, 1).unwrap();

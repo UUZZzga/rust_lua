@@ -1058,6 +1058,199 @@ pub fn str_gsub(s: &str, pattern: &str, repl: &str, max_s: i64) -> Result<(Strin
     Ok((result, n))
 }
 
+/// string.gsub 的 table/function 替换实现 — 对应 C 的 str_gsub + add_value
+///
+/// 当 repl 为 table 或 function 时调用此函数。
+/// - table: 以第一个捕获（或整个匹配）为键查表
+/// - function: 以所有捕获为参数调用函数
+/// 若结果为 nil/false，保留原匹配文本；若为 string/number，用作替换；否则报错。
+fn str_gsub_with_repl(
+    state: &mut LuaState,
+    s: &str,
+    pattern: &str,
+    repl: &TValue,
+    max_s: i64,
+) -> Result<(String, i64), String> {
+    let src_bytes = s.as_bytes();
+    let len = src_bytes.len();
+    let max_s = if max_s < 0 { len as i64 + 1 } else { max_s };
+    let anchor = pattern.starts_with('^');
+    let pat_start = if anchor { 1 } else { 0 };
+
+    let mut result: Vec<u8> = Vec::new();
+    let mut src_pos = 0;
+    let mut n = 0i64;
+    let mut last_match_end: Option<usize> = None;
+
+    while n < max_s && src_pos <= len {
+        let mut ms = MatchState::new(s, pattern);
+        ms.level = 0;
+        ms.captures.clear();
+        ms.match_depth = MAX_CCALLS;
+
+        if let Ok(Some(end)) = match_pattern(&mut ms, src_pos, pat_start) {
+            if Some(end) == last_match_end {
+                // 避免空匹配的无限循环
+                if src_pos < len {
+                    result.push(src_bytes[src_pos]);
+                }
+                src_pos += 1;
+                if anchor {
+                    break;
+                }
+                continue;
+            }
+            n += 1;
+            last_match_end = Some(end);
+
+            // 处理替换值 (table 或 function) — 对应 C 的 add_value
+            let replacement = add_value_from_repl(state, &ms, src_pos, end, repl)?;
+            result.extend_from_slice(replacement.as_bytes());
+
+            src_pos = end;
+        } else if src_pos < len {
+            result.push(src_bytes[src_pos]);
+            src_pos += 1;
+        } else {
+            break;
+        }
+        if anchor {
+            break;
+        }
+    }
+
+    // 添加剩余部分
+    if src_pos < len {
+        result.extend_from_slice(&src_bytes[src_pos..]);
+    }
+
+    let result = unsafe { String::from_utf8_unchecked(result) };
+    Ok((result, n))
+}
+
+/// 对应 C 的 add_value — 处理 table/function 替换值
+///
+/// 返回替换后的字符串。若结果为 nil/false，保留原匹配文本。
+fn add_value_from_repl(
+    state: &mut LuaState,
+    ms: &MatchState,
+    s: usize,
+    e: usize,
+    repl: &TValue,
+) -> Result<String, String> {
+    match repl {
+        // table 替换 — 对应 C 的 LUA_TTABLE 分支
+        TValue::Table(t) => {
+            // push_onecapture(ms, 0, s, e) — 第一个捕获（或整个匹配）作为索引
+            let key = get_capture_as_tvalue(state, ms, 0, s, e)?;
+            // lua_gettable(L, 3)
+            let val = t.get(&key);
+            match val {
+                None | Some(TValue::Nil(_)) | Some(TValue::Boolean(false)) => {
+                    // nil 或 false — 保留原匹配文本
+                    let bytes = &ms.src[s..e];
+                    Ok(unsafe { String::from_utf8_unchecked(bytes.to_vec()) })
+                }
+                Some(TValue::Str(st)) => Ok(st.as_str().to_string()),
+                Some(TValue::Integer(i)) => Ok(i.to_string()),
+                Some(TValue::Float(f)) => Ok(format_float_value(f)),
+                Some(other) => Err(format!(
+                    "invalid replacement value (a {})",
+                    other.ty()
+                )),
+            }
+        }
+        // function 替换 — 对应 C 的 LUA_TFUNCTION 分支
+        TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) => {
+            // push_captures(ms, s, e) — 所有捕获作为参数
+            let n = if ms.level == 0 { 1 } else { ms.level };
+            let mut captures = Vec::with_capacity(n);
+            for i in 0..n {
+                captures.push(get_capture_as_tvalue(state, ms, i, s, e)?);
+            }
+
+            // 保存当前栈顶，调用函数后恢复
+            let stack_top = state.stack.len();
+            // push function
+            state.stack.push(repl.clone());
+            // push captures as arguments
+            for cap in captures {
+                state.stack.push(cap);
+            }
+
+            let status = state.pcall(n, 1, 0);
+            if status != 0 {
+                let msg = state
+                    .to_string(-1)
+                    .unwrap_or_else(|| "error in gsub function".to_string());
+                state.settop(stack_top);
+                return Err(msg);
+            }
+
+            // 取出结果
+            let result_val = state.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+            state.settop(stack_top);
+
+            match result_val {
+                TValue::Nil(_) | TValue::Boolean(false) => {
+                    // nil 或 false — 保留原匹配文本
+                    let bytes = &ms.src[s..e];
+                    Ok(unsafe { String::from_utf8_unchecked(bytes.to_vec()) })
+                }
+                TValue::Str(st) => Ok(st.as_str().to_string()),
+                TValue::Integer(i) => Ok(i.to_string()),
+                TValue::Float(f) => Ok(format_float_value(f)),
+                other => Err(format!(
+                    "invalid replacement value (a {})",
+                    other.ty()
+                )),
+            }
+        }
+        _ => Err("invalid replacement value".to_string()),
+    }
+}
+
+/// 获取第 i 个捕获并转换为 TValue — 对应 C 的 push_onecapture
+///
+/// 使用 state.intern_str() 创建字符串，确保哈希值与表查找一致。
+fn get_capture_as_tvalue(
+    state: &mut LuaState,
+    ms: &MatchState,
+    i: usize,
+    s: usize,
+    e: usize,
+) -> Result<TValue, String> {
+    let cap = get_one_capture(ms, i, s, e)?;
+    match cap {
+        CaptureResult::Str(start, len) => {
+            let bytes = &ms.src[start..start + len];
+            let str_val = unsafe { String::from_utf8_unchecked(bytes.to_vec()) };
+            Ok(TValue::Str(state.intern_str(&str_val)))
+        }
+        CaptureResult::Pos(pos) => Ok(TValue::Integer(pos as i64)),
+    }
+}
+
+/// 格式化浮点数为字符串 — 与 Lua 的 tostring 行为一致
+fn format_float_value(f: f64) -> String {
+    if f.is_nan() {
+        return "nan".to_string();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { "inf".to_string() } else { "-inf".to_string() };
+    }
+    if f == 0.0 {
+        return "0.0".to_string();
+    }
+    let s = format!("{}", f);
+    // Rust 的 Display 对整数值浮点数不输出小数点，需补 ".0"
+    if s.contains('.') || s.contains('e') || s.contains('E') {
+        s
+    } else {
+        format!("{}.0", s)
+    }
+}
+
 /// 处理替换字符串中的 %0, %1-%9
 fn apply_replacement(repl: &str, ms: &MatchState, s: usize, e: usize) -> Result<String, String> {
     // 使用 Vec<u8> 构建结果，避免 as char 转换导致字节值变化
@@ -2593,17 +2786,17 @@ fn call_gmatch_iter(
         )),
     };
     let pos: usize = match state_table.get(&pos_key) {
-        Some(TValue::Integer(n)) => *n as usize,
+        Some(TValue::Integer(n)) => n as usize,
         _ => return Err(VmError::RuntimeError(
             "gmatch iterator: invalid state (missing 'pos')".to_string(),
         )),
     };
     let anchor: bool = match state_table.get(&anchor_key) {
-        Some(TValue::Boolean(b)) => *b,
+        Some(TValue::Boolean(b)) => b,
         _ => false,
     };
     let pat_start: usize = match state_table.get(&pat_start_key) {
-        Some(TValue::Integer(n)) => *n as usize,
+        Some(TValue::Integer(n)) => n as usize,
         _ => 0,
     };
 
@@ -2805,17 +2998,46 @@ pub fn call_string_function(
         STR_GSUB => {
             let s = get_str_arg(state, a, 0)?;
             let pattern = get_str_arg(state, a, 1)?;
-            let repl = get_str_arg(state, a, 2)?;
             let max_s = get_opt_int_arg(state, a, 3, -1);
-            match str_gsub(&s, &pattern, &repl, max_s) {
-                Ok((result, n)) => {
-                    push_results(state, a, nresults, vec![
-                        TValue::Str(state.intern_str(&result)),
-                        TValue::Integer(n),
-                    ]);
-                    Ok(())
+            // 检查 repl 参数类型 — 对应 C 的 tr = lua_type(L, 3)
+            let repl_idx = a + 3;
+            let repl_val = if repl_idx < state.stack.len() {
+                state.stack[repl_idx].clone()
+            } else {
+                TValue::Nil(NilKind::Strict)
+            };
+            match &repl_val {
+                // table 或 function 替换 — 对应 C 的 LUA_TTABLE / LUA_TFUNCTION 分支
+                TValue::Table(_) | TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) => {
+                    match str_gsub_with_repl(state, &s, &pattern, &repl_val, max_s) {
+                        Ok((result, n)) => {
+                            push_results(state, a, nresults, vec![
+                                TValue::Str(state.intern_str(&result)),
+                                TValue::Integer(n),
+                            ]);
+                            Ok(())
+                        }
+                        Err(msg) => Err(VmError::RuntimeError(msg)),
+                    }
                 }
-                Err(msg) => Err(VmError::RuntimeError(msg)),
+                // string/number 替换 — 对应 C 的 default 分支 (add_s)
+                TValue::Str(_) | TValue::Integer(_) | TValue::Float(_) => {
+                    let repl = get_str_arg(state, a, 2)?;
+                    match str_gsub(&s, &pattern, &repl, max_s) {
+                        Ok((result, n)) => {
+                            push_results(state, a, nresults, vec![
+                                TValue::Str(state.intern_str(&result)),
+                                TValue::Integer(n),
+                            ]);
+                            Ok(())
+                        }
+                        Err(msg) => Err(VmError::RuntimeError(msg)),
+                    }
+                }
+                _ => Err(VmError::RuntimeError(format!(
+                    "bad argument #3 (string/function/table expected, got {})",
+                    repl_val.ty()
+                ))),
             }
         }
         STR_GMATCH => {

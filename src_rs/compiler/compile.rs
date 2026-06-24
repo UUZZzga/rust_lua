@@ -338,6 +338,22 @@ struct BlockEntry {
     insidetbc: bool,        // true if inside the scope of a to-be-closed var (inherited)
 }
 
+/// Pending function body block info, saved by parse_chunk for close_func to use.
+/// In C, close_func calls luaK_ret BEFORE leaveblock. In Rust, parse_chunk
+/// (which does leaveblock) is called before close_func. To match C's order,
+/// parse_chunk saves the block info here, and close_func does the leaveblock
+/// work (deactivate locals, solve gotos) AFTER generating RETURN.
+#[derive(Clone, Copy)]
+struct PendingFuncBlock {
+    saved_nlocals: usize,
+    saved_nlabels: usize,
+    saved_ngotos: usize,
+    has_upval: bool,
+    has_tbc: bool,
+    nactvar: i32,
+    reglevel: i32,
+}
+
 // ============================================================================
 // FuncState
 // ============================================================================
@@ -365,6 +381,11 @@ pub struct FuncState<'a> {
     pub gotos: Vec<GotoDesc>,
     lasttarget: i32,
     block_stack: Vec<BlockEntry>,  // 每个块的信息，栈顶是当前块
+    /// Pending function body block info, saved by parse_chunk for close_func.
+    /// In C, close_func calls luaK_ret BEFORE leaveblock. To match that order,
+    /// parse_chunk saves the block info here (without deactivating locals),
+    /// and close_func does the leaveblock work AFTER generating RETURN.
+    pending_func_block: Option<PendingFuncBlock>,
     ls: *mut LexState<'a>,
     // 每条指令对应的行号（与 code 数组平行），用于在 finalize 时计算 line_info
     inst_lines: Vec<i32>,
@@ -400,6 +421,7 @@ pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
     ls.next();
     fs.code_abc(OpCode::VARARGPREP, 0, 0, 0);
     parse_chunk(&mut fs);
+    close_func(&mut fs);
 
     if !fs.errors.is_empty() {
         return Err(fs.errors.join("\n"));
@@ -427,6 +449,7 @@ impl<'a> FuncState<'a> {
             gotos: Vec::new(),
             lasttarget: 0,
             block_stack: Vec::new(),
+            pending_func_block: None,
             ls: ls as *mut LexState<'a>,
             inst_lines: Vec::new(),
             #[cfg(debug_assertions)]
@@ -492,6 +515,19 @@ impl<'a> FuncState<'a> {
     fn fixline(&mut self, line: i32) {
         if let Some(last) = self.inst_lines.last_mut() {
             *last = line;
+        }
+    }
+
+    /// Patch the line of the instruction at `pc` to `line`.
+    /// Used to fix line info for deferred GETI/GETTABLE/GETFIELD instructions
+    /// (generated during prefixexp parsing) to match C's behavior where
+    /// luaK_dischargevars generates them with the operator's line.
+    fn patch_inst_line(&mut self, pc: i32, line: i32) {
+        if pc >= 0 {
+            let idx = pc as usize;
+            if idx < self.inst_lines.len() {
+                self.inst_lines[idx] = line;
+            }
         }
     }
 
@@ -814,14 +850,16 @@ impl<'a> FuncState<'a> {
 
     /// Deactivate locals from index `start` onward (like C's removevars).
     /// 对 kind <= RDKTOCLOSE (varinreg) 的变量设置 proto.loc_vars[pidx].end_pc = pc。
+    /// 只更新仍然 active 的变量，避免覆盖之前已 deactivate 的 end_pc。
     fn deactivate_locals_range(&mut self, start: usize) {
         let pc = self.pc;
         let end = self.locals.len();
         for i in start..end {
+            let was_active = self.locals[i].active;
             self.locals[i].active = false;
             let pidx = self.locals[i].pidx;
             let kind = self.locals[i].kind;
-            if kind <= RDKTOCLOSE && pidx >= 0 {
+            if was_active && kind <= RDKTOCLOSE && pidx >= 0 {
                 self.proto.loc_vars[pidx as usize].end_pc = pc;
             }
         }
@@ -2445,23 +2483,52 @@ fn parse_chunk(fs: &mut FuncState) {
     if !is_last {
         parse_chunk_stmts(fs);
     }
-    let nvarstack = fs.nvarstack();
-    fs.return_stat_gen(nvarstack, 0);
 
-    // Leave function body block (like C's leaveblock for the function body block).
-    // Don't generate CLOSE because this is the function body block (previous=NULL in C).
+    // Pop the function body block but DON'T deactivate locals yet.
+    // In C, close_func calls luaK_ret BEFORE leaveblock. To match that order,
+    // we save the block info here, and close_func will do the leaveblock work
+    // (deactivate locals, solve gotos) AFTER generating RETURN.
     let has_upval = fs.current_block_has_upval();
     let has_tbc = fs.locals[saved_nlocals..].iter().any(|l| l.kind == RDKTOCLOSE && l.active);
     let block_entry = fs.block_stack.pop().unwrap();
-    // C's leaveblock order: removevars before solvegotos
-    fs.deactivate_locals_range(saved_nlocals);
-    // Solve gotos for the function body block (like C's solvegotos in leaveblock)
-    solve_gotos_for_block(fs, saved_nlabels, saved_nlocals, block_entry.saved_ngotos, has_tbc || has_upval, block_entry.nactvar, block_entry.reglevel);
-    // Check for unresolved gotos (like C's leaveblock: if bl->previous==NULL && pending gotos)
-    if !fs.gotos.is_empty() {
-        // There are unresolved gotos - this is an error
-        let gt = &fs.gotos[0];
-        fs.errors.push(format!("{}: no visible label '{}' for goto", gt.line, gt.name));
+    fs.pending_func_block = Some(PendingFuncBlock {
+        saved_nlocals,
+        saved_nlabels,
+        saved_ngotos,
+        has_upval,
+        has_tbc,
+        nactvar: block_entry.nactvar,
+        reglevel: block_entry.reglevel,
+    });
+}
+
+/// Like C's close_func: emit final RETURN and call parse_chunk_finish.
+/// This is called AFTER the function body has been parsed and 'end' has been
+/// consumed, so that the RETURN instruction gets the line of the 'end' keyword.
+fn close_func(fs: &mut FuncState) {
+    // Like C's close_func: luaK_ret(fs, luaY_nvarstack(fs), 0) first,
+    // then leaveblock (which calls removevars to set end_pc).
+    // Must get nvarstack BEFORE deactivation, otherwise it returns 0.
+    let nvarstack = fs.nvarstack();
+    fs.return_stat_gen(nvarstack, 0);
+
+    // Now do the leaveblock work that parse_chunk deferred.
+    // In C, close_func calls leaveblock(fs) which does:
+    //   removevars(fs, bl->nactvar)  -> deactivate locals, set end_pc
+    //   solvegotos(fs, bl)           -> solve pending gotos
+    //   check unresolved gotos        -> error if any
+    if let Some(pb) = fs.pending_func_block.take() {
+        // removevars: deactivate ALL locals (from 0, like C's bl->nactvar=0
+        // for function body block). This sets end_pc for all locals including
+        // parameters, so debug.getlocal(func, n) can find them.
+        fs.deactivate_locals_range(0);
+        // solvegotos: solve pending gotos for the function body block
+        solve_gotos_for_block(fs, pb.saved_nlabels, pb.saved_nlocals, pb.saved_ngotos, pb.has_tbc || pb.has_upval, pb.nactvar, pb.reglevel);
+        // Check for unresolved gotos (like C's leaveblock: if bl->previous==NULL && pending gotos)
+        if !fs.gotos.is_empty() {
+            let gt = &fs.gotos[0];
+            fs.errors.push(format!("{}: no visible label '{}' for goto", gt.line, gt.name));
+        }
     }
 
     parse_chunk_finish(fs);
@@ -5423,6 +5490,14 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         if limit <= PREC_BOR && check(fs, &Token::Pipe) {
             let mut ec = e.exp.clone();
             let mut flip = false;
+            // Like C's subexpr: consume operator first, then discharge e1
+            fs.ls_mut().next();
+            let bin_line = fs.ls().lastline;
+            // Patch the line of e1's deferred instruction (GETI/GETTABLE/GETFIELD
+            // from prefixexp) to the operator's line, matching C's luaK_dischargevars.
+            if ec.info2 >= 0 {
+                fs.patch_inst_line(ec.info2, bin_line);
+            }
             // Like C's luaK_infix for OPR_BOR: if e1 is not a numeral, compile to register
             if !matches!(ec.kind, ExpKind::Int | ExpKind::Float) || ec.has_jumps() {
                 let r = fs.exp_to_reg(&ec);
@@ -5431,8 +5506,8 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 ec.info = r as i64;
                 ec.kind = ExpKind::NonReloc;  // Mark as already in register
             }
-            fs.ls_mut().next();
             let mut e2 = parse_subexpr(fs, PREC_BOR + 1);
+            let pc_before = fs.pc;
             // Like C's codebitwise: if e1 is an integer constant, swap operands
             if matches!(ec.kind, ExpKind::Int) && !ec.has_jumps() {
                 std::mem::swap(&mut ec, &mut e2.exp);
@@ -5519,12 +5594,28 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     e = ExprItem { exp: ExpDesc::new_reloc_with_pc(0, pc) };
                 }
             }
+            // Like C's finishbinexpval: fix op and MMBIN lines to operator's line
+            if fs.pc > pc_before {
+                let n = fs.inst_lines.len();
+                if n >= 2 {
+                    fs.inst_lines[n - 1] = bin_line;
+                    fs.inst_lines[n - 2] = bin_line;
+                }
+            }
             matched = true;
         }
 
         if limit <= PREC_BXOR && check(fs, &Token::Tilde) {
             let mut ec = e.exp.clone();
             let mut flip = false;
+            // Like C's subexpr: consume operator first, then discharge e1
+            fs.ls_mut().next();
+            let bin_line = fs.ls().lastline;
+            // Patch the line of e1's deferred instruction (GETI/GETTABLE/GETFIELD
+            // from prefixexp) to the operator's line, matching C's luaK_dischargevars.
+            if ec.info2 >= 0 {
+                fs.patch_inst_line(ec.info2, bin_line);
+            }
             // Like C's luaK_infix for OPR_BXOR: if e1 is not a numeral, compile to register
             if !matches!(ec.kind, ExpKind::Int | ExpKind::Float) || ec.has_jumps() {
                 let r = fs.exp_to_reg(&ec);
@@ -5533,8 +5624,8 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 ec.info = r as i64;
                 ec.kind = ExpKind::NonReloc;  // Mark as already in register
             }
-            fs.ls_mut().next();
             let mut e2 = parse_subexpr(fs, PREC_BXOR + 1);
+            let pc_before = fs.pc;
             // Like C's codebitwise: if e1 is an integer constant, swap operands
             if matches!(ec.kind, ExpKind::Int) && !ec.has_jumps() {
                 std::mem::swap(&mut ec, &mut e2.exp);
@@ -5621,12 +5712,28 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     e = ExprItem { exp: ExpDesc::new_reloc_with_pc(0, pc) };
                 }
             }
+            // Like C's finishbinexpval: fix op and MMBIN lines to operator's line
+            if fs.pc > pc_before {
+                let n = fs.inst_lines.len();
+                if n >= 2 {
+                    fs.inst_lines[n - 1] = bin_line;  // MMBIN/MMBINK
+                    fs.inst_lines[n - 2] = bin_line;  // op (BXOR/BXORK)
+                }
+            }
             matched = true;
         }
-        
+
         if limit <= PREC_BAND && check(fs, &Token::Ampersand) {
             let mut ec = e.exp.clone();
             let mut flip = false;
+            // Like C's subexpr: consume operator first, then discharge e1
+            fs.ls_mut().next();
+            let bin_line = fs.ls().lastline;
+            // Patch the line of e1's deferred instruction (GETI/GETTABLE/GETFIELD
+            // from prefixexp) to the operator's line, matching C's luaK_dischargevars.
+            if ec.info2 >= 0 {
+                fs.patch_inst_line(ec.info2, bin_line);
+            }
             // Like C's luaK_infix for OPR_BAND: if e1 is not a numeral, compile to register
             if !matches!(ec.kind, ExpKind::Int | ExpKind::Float) || ec.has_jumps() {
                 let r = fs.exp_to_reg(&ec);
@@ -5635,8 +5742,8 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 ec.info = r as i64;
                 ec.kind = ExpKind::NonReloc;  // Mark as already in register
             }
-            fs.ls_mut().next();
             let mut e2 = parse_subexpr(fs, PREC_BAND + 1);
+            let pc_before = fs.pc;
             // Like C's codebitwise: if e1 is an integer constant, swap operands
             if matches!(ec.kind, ExpKind::Int) && !ec.has_jumps() {
                 std::mem::swap(&mut ec, &mut e2.exp);
@@ -5733,11 +5840,27 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     e = ExprItem { exp: ExpDesc::new_reloc_with_pc(0, pc) };
                 }
             }
+            // Like C's finishbinexpval: fix op and MMBIN lines to operator's line
+            if fs.pc > pc_before {
+                let n = fs.inst_lines.len();
+                if n >= 2 {
+                    fs.inst_lines[n - 1] = bin_line;  // MMBIN/MMBINK
+                    fs.inst_lines[n - 2] = bin_line;  // op (BAND/BANDK)
+                }
+            }
             matched = true;
         }
-        
+
         if limit <= PREC_SHL && check(fs, &Token::LtLt) {
             let mut ec = e.exp.clone();
+            // Like C's subexpr: consume operator first, then discharge e1
+            fs.ls_mut().next();
+            let bin_line = fs.ls().lastline;
+            // Patch the line of e1's deferred instruction (GETI/GETTABLE/GETFIELD
+            // from prefixexp) to the operator's line, matching C's luaK_dischargevars.
+            if ec.info2 >= 0 {
+                fs.patch_inst_line(ec.info2, bin_line);
+            }
             // Like C's luaK_infix for OPR_SHL: if e1 is not a numeral, compile to register
             if !matches!(ec.kind, ExpKind::Int | ExpKind::Float) || ec.has_jumps() {
                 let r = fs.exp_to_reg(&ec);
@@ -5746,8 +5869,8 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 ec.info = r as i64;
                 ec.kind = ExpKind::NonReloc;  // Mark as already in register
             }
-            fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_SHL + 1);
+            let pc_before = fs.pc;
             let v1_opt = to_int_const(&ec);
             let shift_opt = to_int_const(&e2.exp);
             if v1_opt.is_some() && shift_opt.is_some() {
@@ -5848,11 +5971,27 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         e = ExprItem { exp: ExpDesc::new_reloc_with_pc(0, pc) };
                     }
             }
+            // Like C's finishbinexpval: fix op and MMBIN lines to operator's line
+            if fs.pc > pc_before {
+                let n = fs.inst_lines.len();
+                if n >= 2 {
+                    fs.inst_lines[n - 1] = bin_line;  // MMBIN/MMBINI
+                    fs.inst_lines[n - 2] = bin_line;  // op (SHL/SHLI/SHRI)
+                }
+            }
             matched = true;
         }
 
         if limit <= PREC_SHL && check(fs, &Token::GtGt) {
             let mut ec = e.exp.clone();
+            // Like C's subexpr: consume operator first, then discharge e1
+            fs.ls_mut().next();
+            let bin_line = fs.ls().lastline;
+            // Patch the line of e1's deferred instruction (GETI/GETTABLE/GETFIELD
+            // from prefixexp) to the operator's line, matching C's luaK_dischargevars.
+            if ec.info2 >= 0 {
+                fs.patch_inst_line(ec.info2, bin_line);
+            }
             // Like C's luaK_infix for OPR_SHR: if e1 is not a numeral, compile to register
             if !matches!(ec.kind, ExpKind::Int | ExpKind::Float) || ec.has_jumps() {
                 let r = fs.exp_to_reg(&ec);
@@ -5861,8 +6000,8 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 ec.info = r as i64;
                 ec.kind = ExpKind::NonReloc;  // Mark as already in register
             }
-            fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_SHL + 1);
+            let pc_before = fs.pc;
             let v1_opt = to_int_const(&ec);
             let shift_opt = to_int_const(&e2.exp);
             if v1_opt.is_some() && shift_opt.is_some() {
@@ -5946,11 +6085,28 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     e = ExprItem { exp: ExpDesc::new_reloc_with_pc(0, pc) };
                 }
             }
+            // Like C's finishbinexpval: fix op and MMBIN lines to operator's line
+            if fs.pc > pc_before {
+                let n = fs.inst_lines.len();
+                if n >= 2 {
+                    fs.inst_lines[n - 1] = bin_line;  // MMBIN/MMBINI
+                    fs.inst_lines[n - 2] = bin_line;  // op (SHR/SHRI)
+                }
+            }
             matched = true;
         }
-        
+
         if limit <= PREC_CONCAT && check(fs, &Token::DotDot) {
             let mut ec = e.exp.clone();
+            // Like C's subexpr: consume operator first, then discharge e1
+            // (so GETTABLE/MOVE get operator's line, matching C's luaK_infix for OPR_CONCAT)
+            fs.ls_mut().next();
+            let cat_line = fs.ls().lastline;
+            // Patch the line of e1's deferred instruction (GETI/GETTABLE/GETFIELD
+            // from prefixexp) to the operator's line, matching C's luaK_dischargevars.
+            if ec.info2 >= 0 {
+                fs.patch_inst_line(ec.info2, cat_line);
+            }
             let mut r = if ec.has_jumps() {
                 let r = fs.exp_to_reg(&ec);
                 ec.t = NO_JUMP;
@@ -5976,7 +6132,6 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 fs.code_abc(OpCode::MOVE, new_r, r, 0);
                 r = new_r;
             }
-            fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_CONCAT);
             let freereg_before_r2 = fs.freereg;
             let r2 = if matches!(e2.exp.kind, ExpKind::NonReloc) && !e2.exp.has_jumps() {
@@ -6027,6 +6182,16 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         if limit <= PREC_ADD && check_addop(fs) {
             let mut ec = e.exp.clone();
             let is_add = check(fs, &Token::Plus);
+            // Like C's subexpr: capture operator's line, consume operator,
+            // THEN discharge e1 (so GETTABLE gets operator's line).
+            let _op_line = fs.ls().linenumber;
+            fs.ls_mut().next();
+            let bin_line = fs.ls().lastline;
+            // Patch the line of e1's deferred instruction (GETI/GETTABLE/GETFIELD
+            // from prefixexp) to the operator's line, matching C's luaK_dischargevars.
+            if ec.info2 >= 0 {
+                fs.patch_inst_line(ec.info2, bin_line);
+            }
             // Like C's luaK_infix: if e1 is not a numeral, put it in a register.
             // A numeral with jumps (e.g., from `a or 1`) must also be put in a register,
             // because C's luaK_exp2anyreg calls luaK_dischargevars (no-op for VKINT)
@@ -6035,8 +6200,8 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 let r = fs.exp_to_reg(&ec);
                 ec = ExpDesc::new(ExpKind::NonReloc, r as i64);
             }
-            fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_ADD + 1);
+            let pc_before = fs.pc;
             match (&ec.kind, &e2.exp.kind) {
                 (ExpKind::Int, ExpKind::Int) if !ec.has_jumps() && !e2.exp.has_jumps() => {
                     let val = if is_add { ec.info.wrapping_add(e2.exp.info) } else { ec.info.wrapping_sub(e2.exp.info) };
@@ -6760,21 +6925,37 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     }
                 }
             }
+            // Like C's finishbinexpval: fix op and MMBIN lines to operator's line
+            if fs.pc > pc_before {
+                let n = fs.inst_lines.len();
+                if n >= 2 {
+                    fs.inst_lines[n - 1] = bin_line;  // MMBIN
+                    fs.inst_lines[n - 2] = bin_line;  // op (ADD/SUB/ADDK/etc.)
+                }
+            }
             matched = true;
         }
-        
+
         if limit <= PREC_MUL && check_mulop(fs) {
             let mut ec = e.exp.clone();
             let is_mul = check(fs, &Token::Star);
             let is_div = check(fs, &Token::Slash);
             let is_idiv = check(fs, &Token::SlashSlash);
+            // Like C's subexpr: consume operator first, then discharge e1
+            fs.ls_mut().next();
+            let bin_line = fs.ls().lastline;
+            // Patch the line of e1's deferred instruction (GETI/GETTABLE/GETFIELD
+            // from prefixexp) to the operator's line, matching C's luaK_dischargevars.
+            if ec.info2 >= 0 {
+                fs.patch_inst_line(ec.info2, bin_line);
+            }
             // Like C's luaK_infix: if e1 is not a numeral, put it in a register
             if !matches!(ec.kind, ExpKind::Int | ExpKind::Float) {
                 let r = fs.exp_to_reg(&ec);
                 ec = ExpDesc::new(ExpKind::NonReloc, r as i64);
             }
-            fs.ls_mut().next();
             let mut e2 = parse_subexpr(fs, PREC_MUL + 1);
+            let pc_before = fs.pc;
             match (&ec.kind, &e2.exp.kind) {
                 (ExpKind::Int, ExpKind::Int) if !ec.has_jumps() && !e2.exp.has_jumps() => {
                     if is_idiv {
@@ -7666,18 +7847,34 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     }
                 }
             }
+            // Like C's finishbinexpval: fix op and MMBIN lines to operator's line
+            if fs.pc > pc_before {
+                let n = fs.inst_lines.len();
+                if n >= 2 {
+                    fs.inst_lines[n - 1] = bin_line;  // MMBIN
+                    fs.inst_lines[n - 2] = bin_line;  // op (MUL/DIV/IDIV/MOD/etc.)
+                }
+            }
             matched = true;
         }
-        
+
         if limit <= PREC_POW && check(fs, &Token::Caret) {
             let mut ec = e.exp.clone();
+            // Like C's subexpr: consume operator first, then discharge e1
+            fs.ls_mut().next();
+            let bin_line = fs.ls().lastline;
+            // Patch the line of e1's deferred instruction (GETI/GETTABLE/GETFIELD
+            // from prefixexp) to the operator's line, matching C's luaK_dischargevars.
+            if ec.info2 >= 0 {
+                fs.patch_inst_line(ec.info2, bin_line);
+            }
             // Like C's luaK_infix: if e1 is not a numeral, put it in a register
             if !matches!(ec.kind, ExpKind::Int | ExpKind::Float) {
                 let r = fs.exp_to_reg(&ec);
                 ec = ExpDesc::new(ExpKind::NonReloc, r as i64);
             }
-            fs.ls_mut().next();
             let e2 = parse_subexpr(fs, PREC_POW);
+            let pc_before = fs.pc;
             let mut pow_no_fold = false;
             match (&ec.kind, &e2.exp.kind) {
                 (ExpKind::Int, ExpKind::Int) if !ec.has_jumps() && !e2.exp.has_jumps() => {
@@ -7832,9 +8029,17 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     e = ExprItem { exp: ExpDesc::new_reloc_with_pc(0, pc) };
                 }
             }
+            // Like C's finishbinexpval: fix op and MMBIN lines to operator's line
+            if fs.pc > pc_before {
+                let n = fs.inst_lines.len();
+                if n >= 2 {
+                    fs.inst_lines[n - 1] = bin_line;  // MMBIN
+                    fs.inst_lines[n - 2] = bin_line;  // op (POW/POWK)
+                }
+            }
             matched = true;
         }
-        
+
         if !matched {
             break;
         }
@@ -9103,6 +9308,7 @@ fn parse_repeat(fs: &mut FuncState) {
 
 /// ANTLR4: `'for' NAME '=' expr ',' expr (',' expr)? 'do' block 'end' ;` (numeric for) 以及 `'for' namelist 'in' explist 'do' block 'end' ;` (generic for)
 fn parse_for(fs: &mut FuncState) {
+    let for_line = fs.ls().lastline;  // C: line = ls->linenumber in statement() (line of 'for' keyword)
     fs.ls_mut().next();
     let name = get_name(fs);
     
@@ -9197,6 +9403,12 @@ fn parse_for(fs: &mut FuncState) {
         fs.fix_jump(prep, fs.pc, false);
         let loop_pc = fs.code_abx(OpCode::FORLOOP, base, 0);
         fs.fix_jump(loop_pc, prep + 1, true);
+        // C: luaK_fixline(fs, line) — set FORLOOP's line to the 'for' line
+        fs.fixline(for_line);
+
+        // C: check_match(ls, TK_END, TK_FOR, line) — consume 'end' BEFORE leaveblock
+        // This ensures lastline is the line of 'end' when CLOSE is generated
+        expect(fs, &Token::End);
 
         // Handle forstat block exit (like C's leaveblock for forstat) [NUMERIC FOR]
         // C order: 1) CLOSE  2) removevars  3) freereg  4) createlabel(break)  5) solvegotos
@@ -9223,7 +9435,6 @@ fn parse_for(fs: &mut FuncState) {
 
         solve_gotos_for_block(fs, forstat_nlabels, forstat_nlocals, forstat_entry.saved_ngotos, forstat_has_tbc || has_forstat_upval, forstat_entry.nactvar, forstat_entry.reglevel);
         fs.break_list = saved_breaklist;
-        expect(fs, &Token::End);
     } else {
         let mut vars = vec![name];
         while check(fs, &Token::Comma) {
@@ -9412,6 +9623,10 @@ fn parse_for(fs: &mut FuncState) {
         // Like C's forbody: luaK_fixline(fs, line) after FORLOOP
         fs.fixline(for_line);
 
+        // C: check_match(ls, TK_END, TK_FOR, line) — consume 'end' BEFORE leaveblock
+        // This ensures lastline is the line of 'end' when CLOSE is generated
+        expect(fs, &Token::End);
+
         // Handle forstat block exit (like C's leaveblock for forstat) [GENERIC FOR]
         // C order: 1) CLOSE  2) removevars  3) freereg  4) createlabel(break)  5) solvegotos
         let has_forstat_upval = fs.current_block_has_upval();
@@ -9434,8 +9649,6 @@ fn parse_for(fs: &mut FuncState) {
             reglevel: forstat_entry.reglevel,
             line: 0,
         });
-
-        expect(fs, &Token::End);
 
         solve_gotos_for_block(fs, forstat_nlabels, forstat_nlocals, forstat_entry.saved_ngotos, forstat_has_tbc || has_forstat_upval, forstat_entry.nactvar, forstat_entry.reglevel);
         fs.break_list = saved_breaklist;
@@ -10227,17 +10440,35 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     // 源名用于错误消息和堆栈回溯中的位置信息
     new_fs.proto.source = Some(crate::strings::new_lstr(&ls.state.string_table, &ls.chunk_name));
 
+    // Like C's parlist: add regular parameters first (start_pc before VARARGPREP),
+    // then generate VARARGPREP, then add vararg parameter (start_pc after VARARGPREP).
+    // This order ensures regular parameters have start_pc=0, so that
+    // debug.getlocal(func, n) with pc=0 can find them.
+    // Both named (...name) and unnamed (...) vararg are added as RDKVAVAR after VARARGPREP.
+    let vararg_param_name = if is_vararg {
+        // Remove the last entry from param_names (it's the vararg entry,
+        // either the named vararg or "(vararg table)")
+        Some(param_names.pop().unwrap())
+    } else {
+        None
+    };
+
+    // Add regular parameters (start_pc = current pc, which is 0 before VARARGPREP)
+    for name in &param_names {
+        let cur_pc = new_fs.pc;
+        new_fs.add_local(name, cur_pc);
+    }
+
+    // Generate VARARGPREP (if vararg), like C's setvararg
     if is_vararg {
         new_fs.proto.flag = PF_VAHID;
         new_fs.code_abc(OpCode::VARARGPREP, 0, 0, 0);
     }
 
-    for (i, name) in param_names.iter().enumerate() {
-        if vararg_named && i == param_names.len() - 1 {
-            new_fs.add_local_kind(name, 2, RDKVAVAR);
-        } else {
-            new_fs.add_local(name, 2);
-        }
+    // Add vararg parameter (start_pc = current pc, which is 1 after VARARGPREP)
+    if let Some(name) = vararg_param_name {
+        let cur_pc = new_fs.pc;
+        new_fs.add_local_kind(&name, cur_pc, RDKVAVAR);
     }
 
     for (i, local) in fs.locals.iter().enumerate() {
@@ -10356,6 +10587,11 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
             fs.mark_ancestor_blocks_for_upval(uv.idx as usize);
         }
     }
+
+    // Like C's close_func: emit final RETURN and call parse_chunk_finish.
+    // This is called AFTER 'end' has been consumed, so the RETURN instruction
+    // gets the line of the 'end' keyword (which is last_line_defined).
+    close_func(&mut new_fs);
 
     let proto = new_fs.proto;
     let p_idx = fs.proto.protos.len() as i32;

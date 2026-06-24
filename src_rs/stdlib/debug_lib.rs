@@ -20,7 +20,7 @@
 //! - 标签 400+: 表库
 //! - 标签 500+: 调试库
 
-use crate::objects::{NilKind, TValue, LClosure, Proto, UpVal};
+use crate::objects::{NilKind, TValue, LClosure, Proto, UpVal, PF_VAHID};
 use crate::state::LuaState;
 use crate::table::Table;
 use crate::execute::VmError;
@@ -242,16 +242,104 @@ fn get_current_source_line(state: &LuaState) -> (String, i32) {
 ///
 /// 对应 C 的 lua_getlocalname
 fn get_local_name(proto: &Proto, local_number: usize, pc: usize) -> Option<String> {
+    let mut n = local_number;
     for loc_var in &proto.loc_vars {
         if (loc_var.start_pc as usize) <= pc && pc < (loc_var.end_pc as usize) {
-            if let Some(ref name) = loc_var.varname {
-                let name = name.as_str().to_string();
-                if local_number == 1 {
-                    return Some(name);
+            n -= 1;
+            if n == 0 {
+                if let Some(ref name) = loc_var.varname {
+                    return Some(name.as_str().to_string());
                 }
-                // 继续查找下一个
+                return None;
             }
         }
+    }
+    None
+}
+
+/// 栈帧信息 — 用于 debug.getlocal/setlocal 的 level > 1 支持
+struct FrameInfo {
+    base: usize,
+    pc: usize,
+    proto_flag: u8,
+    nextraargs: i32,
+    /// 指向栈上的 LClosure（已 clone）
+    closure: LClosure,
+    /// 栈上有效槽位的上限（对应 C 的 limit = ci->next->func.p 或 L->top）
+    /// 槽位 n 满足 limit - base >= n && n > 0 时为 "(temporary)"
+    limit: usize,
+}
+
+/// 获取指定 level 的栈帧信息
+///
+/// level 1 = 当前函数, level 2 = 调用者, ...
+/// 返回 None 表示 level 超出范围或不是 Lua 函数
+fn get_frame_info(state: &LuaState, level: i32) -> Option<FrameInfo> {
+    if level < 1 {
+        return None;
+    }
+    if level == 1 {
+        // 当前函数
+        if state.base == 0 || state.base > state.stack.len() {
+            return None;
+        }
+        if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
+            return Some(FrameInfo {
+                base: state.base,
+                pc: state.pc,
+                proto_flag: state.proto_flag,
+                nextraargs: state.nextraargs,
+                closure: closure.clone(),
+                // 对应 C: limit = L->top (当前栈顶)
+                // state.top 未实时维护, 使用 stack.len() 代替
+                limit: state.stack.len(),
+            });
+        }
+        return None;
+    }
+    // level >= 2: 从 call_info 获取调用者信息
+    // 当最后一个 call_info 条目是 C 函数时，它代表当前正在执行的 C 函数（level 0），
+    // 需要跳过它来计算 level >= 2 的索引。
+    let c_func_offset = if state
+        .call_info
+        .last()
+        .map(|e| e.is_c)
+        .unwrap_or(false)
+    {
+        1
+    } else {
+        0
+    };
+    let idx = state
+        .call_info
+        .len()
+        .checked_sub((level as usize).saturating_sub(1) + c_func_offset)?;
+    let entry = &state.call_info[idx];
+    // entry.base 是调用者的 base, entry.closure 是被调用者的 closure
+    // 调用者的 closure 在栈上 entry.base - 1 位置
+    if entry.base == 0 || entry.base > state.stack.len() {
+        return None;
+    }
+    // 计算 limit: 对应 C 的 ci->next->func.p
+    // ci->next 是被调用者的 call info, 其 func.p = 被调用者的 base - 1
+    let limit = if level == 2 {
+        // 被调用者是当前函数 (level 1), func.p = state.base - 1
+        state.base.saturating_sub(1)
+    } else {
+        // 被调用者是 level-1, 其 call_info 条目在 idx+1
+        // call_info[idx+1].base = 被调用者的 base, func.p = base - 1
+        let callee_entry = &state.call_info[idx + 1];
+        callee_entry.base.saturating_sub(1)
+    };
+    if let TValue::LClosure(closure) = &state.stack[entry.base - 1] {
+        return Some(FrameInfo {
+            base: entry.base,
+            pc: entry.saved_pc,
+            proto_flag: entry.proto_flag,
+            nextraargs: entry.nextraargs,
+            closure: closure.clone(),
+            limit,
+        });
     }
     None
 }
@@ -365,8 +453,8 @@ fn call_getmetatable(
     let arg = get_arg(state, a, 0);
     let result = match &arg {
         TValue::Table(t) => {
-            if let Some(ref mt) = t.metatable {
-                TValue::Table(*mt.clone())
+            if let Some(mt) = t.get_metatable() {
+                TValue::Table(mt)
             } else {
                 TValue::Nil(NilKind::Strict)
             }
@@ -408,7 +496,7 @@ fn call_setmetatable(
             // 修改栈上的表
             if a + 1 < state.stack.len() {
                 if let TValue::Table(ref mut t) = state.stack[a + 1] {
-                    t.metatable = Some(Box::new(mt.clone()));
+                    t.set_metatable(Some(mt.clone()));
                 }
             }
             arg1.clone()
@@ -416,7 +504,7 @@ fn call_setmetatable(
         (TValue::Table(_), TValue::Nil(_)) => {
             if a + 1 < state.stack.len() {
                 if let TValue::Table(ref mut t) = state.stack[a + 1] {
-                    t.metatable = None;
+                    t.set_metatable(None);
                 }
             }
             arg1.clone()
@@ -556,11 +644,20 @@ fn call_getinfo(
         info.short_src = "[C]".to_string();
         info.source = "=[C]".to_string();
         info.currentline = -1;
-        info.nups = 0;
         info.nparams = 0;
         info.isvararg = true;
         info.name = None;
         info.namewhat = String::new();
+        // string.gmatch 返回的迭代器在 C 中是带 3 个上值的 C 闭包
+        // (字符串、模式、userdata 状态)，这里报告 nups = 3 以匹配 C 行为
+        if let TValue::LightUserData(p) = &level_or_func {
+            let tag = *p as usize;
+            if tag == crate::stdlib::string_lib::STR_GMATCH_ITER {
+                info.nups = 3;
+            } else {
+                info.nups = 0;
+            }
+        }
     } else {
         // 栈级别模式
         let level = level_or_func.as_integer().unwrap_or(0) as i32;
@@ -681,25 +778,29 @@ fn call_getinfo(
         }
     }
     if what.contains('f') {
-        // 直接从栈上获取原始函数值 (避免克隆导致引用语义失效)
-        // 对应 C 的 lua_pushvalue(L, arg + 1)
-        let func_idx = a + 1 + arg_offset;
-        if func_idx < state.stack.len() {
-            // 使用 std::mem::replace 移动值, 避免克隆
-            // (栈上的值会被替换为 nil, 但随后 push_results 会 truncate 栈)
-            let func_val = std::mem::replace(
-                &mut state.stack[func_idx],
-                TValue::Nil(NilKind::Strict),
-            );
+        // level 模式下使用 info.func (由 fill_info_from_level 设置)
+        // 函数参数模式下从栈上获取原始函数值 (保持引用语义)
+        if let Some(func_val) = info.func.take() {
             result_table.set(
                 TValue::Str(state.intern_str("func")),
                 func_val,
             );
         } else {
-            result_table.set(
-                TValue::Str(state.intern_str("func")),
-                TValue::Nil(NilKind::Strict),
-            );
+            // 函数参数模式: 从栈上获取原始函数值
+            // 对应 C 的 lua_pushvalue(L, arg + 1)
+            let func_idx = a + 1 + arg_offset;
+            if func_idx < state.stack.len() {
+                let func_val = state.stack[func_idx].clone();
+                result_table.set(
+                    TValue::Str(state.intern_str("func")),
+                    func_val,
+                );
+            } else {
+                result_table.set(
+                    TValue::Str(state.intern_str("func")),
+                    TValue::Nil(NilKind::Strict),
+                );
+            }
         }
     }
 
@@ -811,11 +912,23 @@ fn fill_info_from_level(
             info.func = Some(TValue::LClosure(closure.clone()));
             info.closure = Some(closure.clone());
 
-            // 从 call_info 的最后一个元素获取 name 和 namewhat
+            // 从 call_info 获取 name 和 namewhat
             // call_info[last] 记录了当前函数是如何被调用的
-            let (name, namewhat) = state
+            // 当最后一个条目是 C 函数时，跳过它（C 函数条目记录的是 C 函数的调用信息）
+            let name_idx = if state
                 .call_info
                 .last()
+                .map(|e| e.is_c)
+                .unwrap_or(false)
+                && state.call_info.len() >= 2
+            {
+                state.call_info.len() - 2
+            } else {
+                state.call_info.len().saturating_sub(1)
+            };
+            let (name, namewhat) = state
+                .call_info
+                .get(name_idx)
                 .map(|entry| {
                     (
                         if entry.name.is_empty() {
@@ -879,72 +992,108 @@ fn fill_info_from_level(
     }
 
     // level >= 2: 从 call_info 中获取
-    // call_info 记录的是"被调用的函数"的信息
-    // call_info[0] = 第一个被调用的函数（最外层）
-    // call_info[last] = 最近被调用的函数（调用当前帧的函数）
     //
-    // level 1 = 当前 Lua 帧
-    // level 2 = 调用当前帧的函数 = call_info[last]
-    // level 3 = 调用 level 2 的函数 = call_info[last-1]
-    // level n = call_info[len - n + 1]
+    // CallInfoEntry 在 op_call 时推入，记录的是"调用转换"信息:
+    //   closure = 被调用者（callee）的闭包
+    //   base    = 调用者（caller）的 base
+    //   saved_pc = 调用者（caller）的 pc
+    //   name/namewhat = 被调用者（callee）的名字
     //
-    // 例: call_info = [f, g.x] (len=2)
-    // level 2 = f = call_info[0] = call_info[2 - 2] = call_info[len - level]
-    // level 3 = 主函数 = 不在 call_info 中 (越界)
-    let ci_idx = match state.call_info.len().checked_sub(level as usize) {
+    // 当最后一个 call_info 条目是 C 函数时，它代表当前正在执行的 C 函数（level 0），
+    // 需要跳过它来计算 level >= 2 的索引。
+    //
+    // level n 对应的函数 = 调用 level n-1 的函数
+    // call_info[last] 记录了"谁调用了当前函数"
+    //   → level 2 = call_info[last] = call_info[len - 1]
+    //   → level n = call_info[len - (n - 1)]
+    //
+    // 要获取 level n 的函数信息:
+    //   closure = state.stack[entry.base - 1]  (调用者的闭包)
+    //   pc      = entry.saved_pc               (调用者的 pc)
+    //   name    = call_info[ci_idx - 1].name   (调用者被调用时的名字，若存在)
+
+    // 检查最后一个 call_info 条目是否是 C 函数（当前正在执行的 C 函数）
+    let c_func_offset = if state
+        .call_info
+        .last()
+        .map(|e| e.is_c)
+        .unwrap_or(false)
+    {
+        1 // 跳过最后一个 C 函数条目
+    } else {
+        0
+    };
+
+    let ci_idx = match state
+        .call_info
+        .len()
+        .checked_sub((level as usize).saturating_sub(1) + c_func_offset)
+    {
         Some(idx) => idx,
         None => return false,
     };
 
     let entry = &state.call_info[ci_idx];
-    if let Some(ref closure) = entry.closure {
-        let proto = &closure.proto;
-        info.func = Some(TValue::LClosure(closure.clone()));
-        info.closure = Some(closure.clone());
 
-        if what.contains('S') {
-            info.source = proto
-                .source
-                .as_ref()
-                .map(|s| s.as_str().to_string())
-                .unwrap_or_else(|| "=?".to_string());
-            info.short_src = proto
-                .source
-                .as_ref()
-                .map(short_src)
-                .unwrap_or_else(|| "?".to_string());
-            info.linedefined = proto.line_defined;
-            info.lastlinedefined = proto.last_line_defined;
-            info.what = "Lua".to_string();
+    // 调用者的名字来自前一个 entry（调用者被调用时推入的记录）
+    // 若 ci_idx == 0，调用者是主函数，没有名字
+    let (caller_name, caller_namewhat) = if ci_idx > 0 {
+        let prev = &state.call_info[ci_idx - 1];
+        (
+            if prev.name.is_empty() { None } else { Some(prev.name.clone()) },
+            prev.namewhat.clone(),
+        )
+    } else {
+        (None, String::new())
+    };
+
+    // 从栈上获取调用者的闭包（entry.base 是调用者的 base）
+    if entry.base > 0 && entry.base <= state.stack.len() {
+        if let TValue::LClosure(closure) = &state.stack[entry.base - 1] {
+            let proto = &closure.proto;
+            info.func = Some(TValue::LClosure(closure.clone()));
+            info.closure = Some(closure.clone());
+
+            if what.contains('S') {
+                info.source = proto
+                    .source
+                    .as_ref()
+                    .map(|s| s.as_str().to_string())
+                    .unwrap_or_else(|| "=?".to_string());
+                info.short_src = proto
+                    .source
+                    .as_ref()
+                    .map(short_src)
+                    .unwrap_or_else(|| "?".to_string());
+                info.linedefined = proto.line_defined;
+                info.lastlinedefined = proto.last_line_defined;
+                info.what = "Lua".to_string();
+            }
+            if what.contains('l') {
+                info.currentline = get_proto_line(proto, entry.saved_pc);
+            }
+            if what.contains('u') {
+                info.nups = closure.upvals.len();
+                info.nparams = proto.num_params as usize;
+                info.isvararg = proto.is_vararg();
+            }
+            if what.contains('n') {
+                info.name = caller_name;
+                info.namewhat = caller_namewhat;
+            }
+            if what.contains('t') {
+                info.istailcall = false;
+                info.extraargs = 0;
+            }
+            if what.contains('r') {
+                info.ftransfer = 0;
+                info.ntransfer = 0;
+            }
+            return true;
         }
-        if what.contains('l') {
-            info.currentline = get_proto_line(proto, entry.saved_pc);
-        }
-        if what.contains('u') {
-            info.nups = closure.upvals.len();
-            info.nparams = proto.num_params as usize;
-            info.isvararg = proto.is_vararg();
-        }
-        if what.contains('n') {
-            info.name = if entry.name.is_empty() {
-                None
-            } else {
-                Some(entry.name.clone())
-            };
-            info.namewhat = entry.namewhat.clone();
-        }
-        if what.contains('t') {
-            info.istailcall = false;
-            info.extraargs = 0;
-        }
-        if what.contains('r') {
-            info.ftransfer = 0;
-            info.ntransfer = 0;
-        }
-        return true;
     }
 
-    // C 函数帧
+    // C 函数帧 — 对应 C 的 CIST_C
     info.what = "C".to_string();
     info.short_src = "[C]".to_string();
     info.source = "=[C]".to_string();
@@ -952,8 +1101,24 @@ fn fill_info_from_level(
     info.nups = 0;
     info.nparams = 0;
     info.isvararg = true;
-    info.name = None;
-    info.namewhat = String::new();
+    if what.contains('n') {
+        info.name = caller_name;
+        info.namewhat = caller_namewhat;
+    }
+    if what.contains('t') {
+        info.istailcall = false;
+        info.extraargs = 0;
+    }
+    if what.contains('r') {
+        info.ftransfer = 0;
+        info.ntransfer = 0;
+    }
+    // 'f' 选项: 从栈上读取 C 函数值 (entry.base - 1 = 函数位置)
+    if what.contains('f') {
+        if entry.base > 0 && entry.base <= state.stack.len() {
+            info.func = Some(state.stack[entry.base - 1].clone());
+        }
+    }
     true
 }
 
@@ -997,7 +1162,7 @@ fn fill_active_lines(table: &mut Table, proto: &Proto) {
         }
         let (mut base_pc, mut baseline) = get_baseline(proto, pc);
         base_pc += 1;
-        while base_pc < pc {
+        while base_pc <= pc {
             if proto.line_info[base_pc as usize] != ABSLINEINFO {
                 baseline += proto.line_info[base_pc as usize] as i32;
             }
@@ -1053,10 +1218,12 @@ fn call_getlocal(
         .as_integer()
         .unwrap_or(0) as i32;
 
-    // 函数参数模式
-    if matches!(arg1, TValue::LClosure(_)) {
+    // 函数参数模式: if arg1 is a function (Lua or C), get local name.
+    // In C, lua_isfunction returns true for both Lua and C functions.
+    // In Rust, C functions are stored as LightUserData with tags.
+    if matches!(arg1, TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) | TValue::LightUserData(_)) {
         if let TValue::LClosure(closure) = &arg1 {
-            // 获取函数的局部变量名
+            // Lua function: get the local variable name
             let name = get_local_name(&closure.proto, nvar as usize, 0);
             match name {
                 Some(n) => {
@@ -1071,6 +1238,10 @@ fn call_getlocal(
                     push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
                 }
             }
+            return Ok(());
+        } else {
+            // C function (not a Lua function): no local variables
+            push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
             return Ok(());
         }
     }
@@ -1096,30 +1267,44 @@ fn call_getlocal(
         return Ok(());
     }
 
-    if level == 1 {
-        // 当前 Lua 帧
-        if state.base == 0 || state.base > state.stack.len() {
-            return Err(VmError::RuntimeError(
-                "level out of range".to_string(),
-            ));
-        }
-        if let TValue::LClosure(closure) = &state.stack[state.base - 1].clone() {
-            let proto = &closure.proto;
-            let pc = state.pc;
+    // level >= 1: 使用 get_frame_info 获取栈帧信息
+    match get_frame_info(state, level) {
+        Some(frame) => {
+            let proto = &frame.closure.proto;
 
-            // 处理负数索引 (vararg)
+            // 处理负数索引 (vararg) — 对应 C 的 findvararg
             if nvar < 0 {
-                // vararg 访问 — 简化实现
-                push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
+                if (frame.proto_flag & PF_VAHID) != 0 {
+                    let nextra = frame.nextraargs;
+                    if nvar >= -nextra {
+                        // pos = ci->func.p - nextra - (n + 1)
+                        // ci->func.p = frame.base - 1
+                        let pos = (frame.base as i32) - 1 - nextra - (nvar + 1);
+                        let pos = pos as usize;
+                        let val = if pos < state.stack.len() {
+                            state.stack[pos].clone()
+                        } else {
+                            TValue::Nil(NilKind::Strict)
+                        };
+                        push_results(state, a, nresults, vec![
+                            TValue::Str(state.intern_str("(vararg)")),
+                            val,
+                        ]);
+                    } else {
+                        push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
+                    }
+                } else {
+                    push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
+                }
                 return Ok(());
             }
 
             // 正数索引: 局部变量
-            let name = get_local_name(proto, nvar as usize, pc);
+            let name = get_local_name(proto, nvar as usize, frame.pc);
             match name {
                 Some(n) => {
                     // 获取栈上的值
-                    let stack_idx = state.base + (nvar as usize) - 1;
+                    let stack_idx = frame.base + (nvar as usize) - 1;
                     let val = if stack_idx < state.stack.len() {
                         state.stack[stack_idx].clone()
                     } else {
@@ -1131,15 +1316,32 @@ fn call_getlocal(
                     ]);
                 }
                 None => {
-                    push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
+                    // 对应 C 的 luaG_findlocal: 没有命名局部变量时，检查是否是临时变量
+                    // limit - base >= n && n > 0 时为 "(temporary)"
+                    let cond = nvar > 0 && frame.limit >= frame.base && (frame.limit - frame.base) >= (nvar as usize);
+                    if cond {
+                        // 临时变量: 返回 ("(temporary)", value)
+                        let stack_idx = frame.base + (nvar as usize) - 1;
+                        let val = if stack_idx < state.stack.len() {
+                            state.stack[stack_idx].clone()
+                        } else {
+                            TValue::Nil(NilKind::Strict)
+                        };
+                        push_results(state, a, nresults, vec![
+                            TValue::Str(state.intern_str("(temporary)")),
+                            val,
+                        ]);
+                    } else {
+                        push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
+                    }
                 }
             }
             return Ok(());
         }
+        None => {
+            Err(VmError::RuntimeError("level out of range".to_string()))
+        }
     }
-
-    // 超出范围
-    Err(VmError::RuntimeError("level out of range".to_string()))
 }
 
 /// debug.setlocal([thread,] level, local, value) — 对应 C 的 db_setlocal
@@ -1165,41 +1367,70 @@ fn call_setlocal(
         .unwrap_or(0) as i32;
     let value = get_arg(state, a, arg_offset + 2);
 
-    if level == 1 {
-        if state.base == 0 || state.base > state.stack.len() {
-            return Err(VmError::RuntimeError(
-                "level out of range".to_string(),
-            ));
-        }
-        if let TValue::LClosure(closure) = &state.stack[state.base - 1].clone() {
-            let proto = &closure.proto;
-            let pc = state.pc;
+    if level < 1 {
+        return Err(VmError::RuntimeError("level out of range".to_string()));
+    }
 
+    // 使用 get_frame_info 获取栈帧信息
+    match get_frame_info(state, level) {
+        Some(frame) => {
+            let proto = &frame.closure.proto;
+
+            // 处理负数索引 (vararg) — 对应 C 的 findvararg
             if nvar < 0 {
-                // vararg — 简化实现
-                push_single_result(state, a, nresults, TValue::Str(state.intern_str("(vararg)")));
+                if (frame.proto_flag & PF_VAHID) != 0 {
+                    let nextra = frame.nextraargs;
+                    if nvar >= -nextra {
+                        // pos = ci->func.p - nextra - (n + 1)
+                        let pos = (frame.base as i32) - 1 - nextra - (nvar + 1);
+                        let pos = pos as usize;
+                        if pos < state.stack.len() {
+                            state.stack[pos] = value;
+                        }
+                        push_single_result(state, a, nresults, TValue::Str(state.intern_str("(vararg)")));
+                    } else {
+                        push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
+                    }
+                } else {
+                    push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
+                }
                 return Ok(());
             }
 
-            let name = get_local_name(proto, nvar as usize, pc);
+            let name = get_local_name(proto, nvar as usize, frame.pc);
             match name {
                 Some(n) => {
                     // 设置栈上的值
-                    let stack_idx = state.base + (nvar as usize) - 1;
+                    let stack_idx = frame.base + (nvar as usize) - 1;
                     if stack_idx < state.stack.len() {
                         state.stack[stack_idx] = value;
                     }
                     push_single_result(state, a, nresults, TValue::Str(state.intern_str(&n)));
                 }
                 None => {
-                    push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
+                    // 对应 C 的 luaG_findlocal: 临时变量
+                    let limit = if level == 1 {
+                        state.top
+                    } else {
+                        state.base.saturating_sub(1)
+                    };
+                    if nvar > 0 && (frame.base + (nvar as usize)) <= limit {
+                        let stack_idx = frame.base + (nvar as usize) - 1;
+                        if stack_idx < state.stack.len() {
+                            state.stack[stack_idx] = value;
+                        }
+                        push_single_result(state, a, nresults, TValue::Str(state.intern_str("(temporary)")));
+                    } else {
+                        push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
+                    }
                 }
             }
             return Ok(());
         }
+        None => {
+            Err(VmError::RuntimeError("level out of range".to_string()))
+        }
     }
-
-    Err(VmError::RuntimeError("level out of range".to_string()))
 }
 
 /// debug.getupvalue(f, n) — 对应 C 的 db_getupvalue
@@ -1235,14 +1466,14 @@ fn call_getupvalue(
                         }
                     }
                 };
-                // 获取上值名
+                // 获取上值名 — 对应 C 的 luaF_getupname: NULL name 返回 "(no name)"
                 let name = closure
                     .proto
                     .upvalues
                     .get(n - 1)
                     .and_then(|u| u.name.as_ref())
                     .map(|s| s.as_str().to_string())
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| "(no name)".to_string());
                 push_results(state, a, nresults, vec![
                     TValue::Str(state.intern_str(&name)),
                     val,
@@ -1298,14 +1529,14 @@ fn call_setupvalue(
     match &arg1 {
         TValue::LClosure(closure) => {
             if n > 0 && n <= closure.upvals.len() {
-                // 获取上值名
+                // 获取上值名 — 对应 C 的 luaF_getupname: NULL name 返回 "(no name)"
                 let name = closure
                     .proto
                     .upvalues
                     .get(n - 1)
                     .and_then(|u| u.name.as_ref())
                     .map(|s| s.as_str().to_string())
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| "(no name)".to_string());
 
                 // 设置上值
                 // 由于 upvals 是 Rc<RefCell>, 我们需要可变访问
@@ -1555,7 +1786,7 @@ fn set_hook_in_registry(state: &mut LuaState, hook: Option<TValue>, mask: i32, c
                 TValue::Str(state.intern_str("__mode")),
                 TValue::Str(state.intern_str("k")),
             );
-            t.metatable = Some(Box::new(mt));
+            t.set_metatable(Some(mt));
             t
         }
     };
@@ -1587,6 +1818,7 @@ fn set_hook_in_registry(state: &mut LuaState, hook: Option<TValue>, mask: i32, c
     state.hook_func = hook;
     state.hook_mask = mask;
     state.hook_count = count;
+    state.current_hook_count = count;
     // 不修改 hook_old_pc — 对应 C 的 sethook 不修改 oldpc
     // oldpc 只在 luaD_hookcall（函数调用）和 rethook（函数返回）中被修改
 }
@@ -1633,6 +1865,14 @@ fn call_traceback(
 }
 
 /// 构建堆栈回溯字符串 — 对应 C 的 luaL_traceback
+///
+/// Level 映射:
+/// - Level 0 = debug.traceback 自身 (C 函数, 不显示)
+/// - Level 1 = 调用 debug.traceback 的函数
+/// - Level 2 = 调用 level 1 的函数
+///
+/// 当 call_info 末尾有 C 函数链时（C 函数调用 C 函数），
+/// state.base 不随 C 函数调用改变，所以需要计算 C 函数链长度来正确映射 level。
 fn build_traceback(state: &LuaState, msg: &str, level: i32) -> String {
     let mut result = String::new();
     if !msg.is_empty() {
@@ -1641,38 +1881,175 @@ fn build_traceback(state: &LuaState, msg: &str, level: i32) -> String {
     }
     result.push_str("stack traceback:");
 
-    // 从 call_info 构建
-    if state.call_info.is_empty() {
-        // 使用当前帧
-        let (source, line) = get_current_source_line(state);
-        if line > 0 {
-            result.push_str(&format!("\n\t{}:{}: in main chunk", source, line));
-        } else {
-            result.push_str("\n\t[C]: in ?");
-        }
-    } else {
-        let start = level as usize;
-        for (i, entry) in state.call_info.iter().enumerate() {
-            if i < start {
+    // Level 0: debug.traceback 自身 (C/tagged 函数)
+    if level <= 0 {
+        result.push_str("\n\t[C]: in field 'traceback'");
+    }
+
+    // 计算 call_info 末尾的 C 函数链长度
+    // 这些 C 函数条目代表当前正在执行的 C 函数及其 C 函数调用者
+    // 最后一个条目是当前函数（level 0），倒数第二个是 level 1，等等
+    let c_chain_len = count_c_function_chain(state);
+    let n = state.call_info.len();
+
+    // Level 1 到 c_chain_len-1: C 函数调用者（call_info[last-1] 到 call_info[last-c_chain_len+1]）
+    // Level c_chain_len: state.base（Lua 函数）
+    // Level c_chain_len+1+: 剩余 call_info 条目
+
+    // 输出 C 函数调用者（level 1 到 c_chain_len-1）
+    if c_chain_len >= 2 {
+        for i in 1..c_chain_len {
+            let current_level = i as i32;
+            if current_level < level {
                 continue;
             }
-            result.push('\n');
-            result.push('\t');
-            if entry.is_c {
-                result.push_str("[C]: in ");
-                result.push_str(&entry.name);
-            } else {
-                if entry.line > 0 {
-                    result.push_str(&format!("{}:{}: in ", entry.source, entry.line));
-                } else {
-                    result.push_str(&format!("{}: in ", entry.source));
-                }
-                result.push_str(&entry.name);
+            let idx = n - 1 - i;
+            if idx < n {
+                let entry = &state.call_info[idx];
+                result.push_str(&format!("\n\t[C]: in {}", entry.name));
             }
         }
     }
+
+    // 输出 state.base（Lua 函数，level c_chain_len）
+    let lua_level = c_chain_len as i32;
+    if lua_level >= level {
+        if let Some((src, line, name, namewhat, is_main)) = get_current_frame_info(state) {
+            push_traceback_line(&mut result, &src, line, &name, &namewhat, is_main);
+        }
+    }
+
+    // 输出剩余 call_info 条目（level c_chain_len+1+）
+    // call_info[i] 记录的是: 调用者(在 source/line 中) 调用了 被调用者(在 closure 中)
+    // 跳过末尾的 c_chain_len 个 C 函数条目
+    let remaining = n.saturating_sub(c_chain_len);
+    for i in (0..remaining).rev() {
+        let current_level = (c_chain_len + 1 + (remaining - 1 - i)) as i32;
+        if current_level < level {
+            continue;
+        }
+        let entry = &state.call_info[i];
+        if entry.is_c {
+            result.push_str(&format!("\n\t[C]: in {}", entry.name));
+        } else {
+            let src = short_src_from_source(&entry.source);
+            let is_main = entry
+                .closure
+                .as_ref()
+                .map(|c| c.proto.line_defined == 0)
+                .unwrap_or(false);
+            push_traceback_line(&mut result, &src, entry.line, &entry.name, &entry.namewhat, is_main);
+        }
+    }
+
     result.push_str("\n\t[C]: in ?");
     result
+}
+
+/// 计算 call_info 末尾的 C 函数链长度
+/// 返回末尾连续 C 函数条目的数量（包括当前正在执行的 C 函数）
+fn count_c_function_chain(state: &LuaState) -> usize {
+    let mut count = 0;
+    for i in (0..state.call_info.len()).rev() {
+        if state.call_info[i].is_c {
+            count += 1;
+        } else {
+            break;
+        }
+    }
+    count
+}
+
+/// 获取当前 Lua 帧的信息 (用于 traceback 的 level 1)
+fn get_current_frame_info(state: &LuaState) -> Option<(String, i32, String, String, bool)> {
+    if state.base == 0 || state.base > state.stack.len() {
+        return None;
+    }
+    if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
+        let proto = &closure.proto;
+        let src = proto
+            .source
+            .as_ref()
+            .map(short_src)
+            .unwrap_or_else(|| "?".to_string());
+        let line = get_proto_line(proto, state.pc);
+        // 当最后一个 call_info 条目是 C 函数时，跳过它获取 name/namewhat
+        // 因为 C 函数条目记录的是 C 函数的调用信息，不是当前 Lua 帧的
+        let (name, namewhat) = if state
+            .call_info
+            .last()
+            .map(|e| e.is_c)
+            .unwrap_or(false)
+            && state.call_info.len() >= 2
+        {
+            let entry = &state.call_info[state.call_info.len() - 2];
+            (entry.name.clone(), entry.namewhat.clone())
+        } else {
+            state
+                .call_info
+                .last()
+                .map(|e| (e.name.clone(), e.namewhat.clone()))
+                .unwrap_or((String::new(), String::new()))
+        };
+        let is_main = proto.line_defined == 0;
+        return Some((src, line, name, namewhat, is_main));
+    }
+    None
+}
+
+/// 将 source 字符串转换为 short_src
+fn short_src_from_source(source: &str) -> String {
+    const LUA_IDSIZE: usize = 60;
+    const RETS: &str = "...";
+
+    let bytes = source.as_bytes();
+    match bytes.first() {
+        Some(&b'=') => {
+            let content = &bytes[1..];
+            if content.len() <= LUA_IDSIZE {
+                String::from_utf8_lossy(content).into_owned()
+            } else {
+                String::from_utf8_lossy(&content[..LUA_IDSIZE - 1]).into_owned()
+            }
+        }
+        Some(&b'@') => {
+            let content = &bytes[1..];
+            if content.len() <= LUA_IDSIZE {
+                String::from_utf8_lossy(content).into_owned()
+            } else {
+                let keep = LUA_IDSIZE - RETS.len();
+                let start = content.len() - keep;
+                format!("{}{}", RETS, String::from_utf8_lossy(&content[start..]))
+            }
+        }
+        _ => source.to_string(),
+    }
+}
+
+/// 格式化 traceback 的一行 — 对应 C 的 luaL_traceback + pushfuncname
+fn push_traceback_line(
+    result: &mut String,
+    src: &str,
+    line: i32,
+    name: &str,
+    namewhat: &str,
+    is_main: bool,
+) {
+    result.push('\n');
+    result.push('\t');
+    if line > 0 {
+        result.push_str(&format!("{}:{}: in ", src, line));
+    } else {
+        result.push_str(&format!("{}: in ", src));
+    }
+    // 对应 C 的 pushfuncname
+    if !namewhat.is_empty() {
+        result.push_str(&format!("{} '{}'", namewhat, name));
+    } else if is_main {
+        result.push_str("main chunk");
+    } else {
+        result.push_str("?");
+    }
 }
 
 /// debug.debug() — 对应 C 的 db_debug
@@ -1813,8 +2190,8 @@ mod tests {
     #[test]
     fn test_call_getmetatable_table() {
         let mut state = LuaState::new();
-        let mut t = Table::new();
-        t.metatable = Some(Box::new(Table::new()));
+        let t = Table::new();
+        t.set_metatable(Some(Table::new()));
         state.stack.clear();
         state.stack.push(TValue::LightUserData(DEBUG_GETMETATABLE as *mut std::ffi::c_void));
         state.stack.push(TValue::Table(t));
@@ -1844,7 +2221,7 @@ mod tests {
         state.stack.push(TValue::Table(mt));
         call_debug_function(DEBUG_SETMETATABLE, &mut state, 0, 2, 1).unwrap();
         match &state.stack[0] {
-            TValue::Table(t) => assert!(t.metatable.is_some()),
+            TValue::Table(t) => assert!(t.has_metatable()),
             _ => panic!("expected table result"),
         }
     }

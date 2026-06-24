@@ -1776,19 +1776,19 @@ mod tests {
 
         let huge_key = TValue::Str(state.intern_str("huge"));
         match math_table.get(&huge_key) {
-            Some(TValue::Float(f)) => assert!(f.is_infinite() && *f > 0.0),
+            Some(TValue::Float(f)) => assert!(f.is_infinite() && f > 0.0),
             _ => panic!("math.huge not found or wrong type"),
         }
 
         let maxint_key = TValue::Str(state.intern_str("maxinteger"));
         match math_table.get(&maxint_key) {
-            Some(TValue::Integer(n)) => assert_eq!(*n, i64::MAX),
+            Some(TValue::Integer(n)) => assert_eq!(n, i64::MAX),
             _ => panic!("math.maxinteger not found or wrong type"),
         }
 
         let minint_key = TValue::Str(state.intern_str("mininteger"));
         match math_table.get(&minint_key) {
-            Some(TValue::Integer(n)) => assert_eq!(*n, i64::MIN),
+            Some(TValue::Integer(n)) => assert_eq!(n, i64::MIN),
             _ => panic!("math.mininteger not found or wrong type"),
         }
     }

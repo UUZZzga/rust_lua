@@ -383,8 +383,8 @@ impl PartialEq for TValue {
                 if a.is_nan() { false } else { a.to_bits() == (*b as f64).to_bits() }
             }
             (TValue::Str(a), TValue::Str(b)) => a == b,
-            (TValue::Table(a), TValue::Table(b)) => std::ptr::eq(a, b),
-            (TValue::LClosure(a), TValue::LClosure(b)) => std::ptr::eq(a, b),
+            (TValue::Table(a), TValue::Table(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
+            (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
             (TValue::CClosure(a), TValue::CClosure(b)) => std::ptr::eq(a, b),
             (TValue::LCFn(a), TValue::LCFn(b)) => std::ptr::eq(a.func as *const (), b.func as *const ()),
             (TValue::UserData(a), TValue::UserData(b)) => std::ptr::eq(a, b),
@@ -436,11 +436,11 @@ impl Hash for TValue {
             }
             TValue::Table(t) => {
                 6u8.hash(state);
-                (t as *const Table as usize).hash(state);
+                t.gc_header.ptr_id.hash(state);
             }
             TValue::LClosure(c) => {
                 7u8.hash(state);
-                (c as *const LClosure as usize).hash(state);
+                c.gc_header.ptr_id.hash(state);
             }
             TValue::CClosure(c) => {
                 8u8.hash(state);
@@ -504,15 +504,12 @@ pub struct LCFunction {
 // 规约：表类型 (用 hashbrown::HashMap 重写)
 // ============================================================================
 
-/// Lua 表 —— 关联数组，包含数组部分和哈希部分。
+/// Lua 表的数据部分 —— 被 `Rc<RefCell<TableData>>` 包装以实现共享语义。
 ///
-/// 数组部分使用 `Vec<TValue>`（1-based 索引），空槽位存储 `Nil(Empty)`。
-/// 哈希部分使用 `hashbrown::HashMap<TValue, TValue>`，利用 Rust 的 Hash + Eq trait。
-///
-/// 方法实现见 [crate::table]。
-#[derive(Debug, Clone)]
-pub struct Table {
-    pub gc_header: GCObjectHeader,
+/// 将数据分离到 `TableData` 中，使得 `Table` 的克隆（仅克隆 `Rc`）共享同一份数据。
+/// 这解决了 `_ENV` upvalue 与 `state.globals` 不同步的问题：
+/// 克隆后的 Table 仍然指向同一份数据，修改对两者都可见。
+pub struct TableData {
     /// 数组部分（1-based，索引 0 对应键 1）
     pub array: Vec<TValue>,
     /// 哈希部分（非整数键以及超出数组范围的整数键）
@@ -520,17 +517,51 @@ pub struct Table {
     /// 元表
     pub metatable: Option<Box<Table>>,
     /// #t 的搜索提示（内部优化）
-    pub(crate) len_hint: usize,
+    pub len_hint: usize,
+}
+
+/// Lua 表 —— 关联数组，包含数组部分和哈希部分。
+///
+/// 数据字段包装在 `Rc<RefCell<TableData>>` 中，克隆 `Table` 时共享同一份数据，
+/// 而非深拷贝。这保证了 `_ENV` upvalue 与 `state.globals` 始终同步。
+///
+/// `gc_header` 保留在 `Table` 上（不在 `TableData` 中），因为 `ptr_id` 需要在克隆时保持一致。
+///
+/// 方法实现见 [crate::table]。
+pub struct Table {
+    pub gc_header: GCObjectHeader,
+    /// 共享数据 —— 克隆 Table 时仅增加 Rc 引用计数
+    pub data: Rc<RefCell<TableData>>,
+}
+
+impl Clone for Table {
+    /// 克隆 Table：仅克隆 `Rc`（共享数据），并克隆 `gc_header`（保持同一 `ptr_id`）。
+    fn clone(&self) -> Self {
+        Table {
+            gc_header: self.gc_header.clone(),
+            data: Rc::clone(&self.data),
+        }
+    }
+}
+
+impl fmt::Debug for Table {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Table")
+            .field("ptr_id", &self.gc_header.ptr_id)
+            .finish_non_exhaustive()
+    }
 }
 
 impl Default for Table {
     fn default() -> Self {
         Table {
             gc_header: GCObjectHeader::new(),
-            array: Vec::new(),
-            hash: hashbrown::HashMap::new(),
-            metatable: None,
-            len_hint: 0,
+            data: Rc::new(RefCell::new(TableData {
+                array: Vec::new(),
+                hash: hashbrown::HashMap::new(),
+                metatable: None,
+                len_hint: 0,
+            })),
         }
     }
 }

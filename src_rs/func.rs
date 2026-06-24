@@ -329,6 +329,8 @@ mod tests {
             hook_mask: 0,
             hook_count: 0,
             hook_old_pc: 0,
+            current_hook_count: 0,
+            allowhook: true,
         }
     }
 
