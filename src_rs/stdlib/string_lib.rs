@@ -1378,6 +1378,82 @@ fn format_exponent_c(s: String) -> String {
     }
 }
 
+/// 格式化十六进制浮点数 (对应 C printf 的 %a/%A)
+///
+/// 格式: [-]0x<int>.<frac>p<sign><exp>
+/// - 零: 0x0p+0
+/// - 正常: 1.<mantissa_hex>p<exp>
+/// - 无穷: inf/INF
+/// - NaN: nan/NAN
+fn format_hex_float(n: f64, precision: Option<usize>, upper: bool) -> String {
+    let hex_digits = if upper { "0123456789ABCDEF" } else { "0123456789abcdef" };
+    let prefix = if upper { "0X" } else { "0x" };
+    let p_char = if upper { 'P' } else { 'p' };
+
+    if n.is_nan() {
+        return if upper { "nan" } else { "nan" }.to_string();
+    }
+    if n.is_infinite() {
+        let inf = if upper { "INF" } else { "inf" };
+        return if n > 0.0 { inf.to_string() } else { format!("-{}", inf) };
+    }
+
+    let bits = n.to_bits();
+    let sign_bit = bits >> 63;
+    let exponent = ((bits >> 52) & 0x7FF) as i32;
+    let mantissa = bits & 0xFFFFFFFFFFFFF; // 52 bits
+
+    let sign_str = if sign_bit != 0 { "-" } else { "" };
+
+    if exponent == 0 && mantissa == 0 {
+        // 零
+        return format!("{}{}0{}+0", sign_str, prefix, p_char);
+    }
+
+    let (int_digit, frac_bits, exp_val) = if exponent == 0 {
+        // 非规格化数: 0.mantissa * 2^(-1022)
+        (0u64, mantissa, -1022i32)
+    } else {
+        // 正常数: 1.mantissa * 2^(exponent - 1023)
+        (1u64, mantissa, exponent - 1023)
+    };
+
+    // 默认精度: 13 个十六进制数字 (52 bits / 4 = 13)
+    let default_prec = 13usize;
+    let prec = precision.unwrap_or(default_prec);
+
+    // 将 52 位尾数格式化为十六进制字符串
+    // 尾数位 0-51, 最高 4 位 (48-51) 是第一个十六进制数字
+    let mut frac_str = String::new();
+    for i in 0..prec {
+        let shift = 52 - 4 * (i + 1);
+        let digit = if shift >= 0 {
+            ((frac_bits >> shift) & 0xF) as usize
+        } else {
+            // 超出尾数精度, 补 0
+            0
+        };
+        frac_str.push(hex_digits.as_bytes()[digit] as char);
+    }
+
+    // 无显式精度时, 去除尾随零
+    if precision.is_none() {
+        while frac_str.ends_with('0') {
+            frac_str.pop();
+        }
+    }
+
+    // 格式化指数
+    let exp_sign = if exp_val >= 0 { "+" } else { "-" };
+    let exp_abs = exp_val.abs();
+
+    if frac_str.is_empty() {
+        format!("{}{}{}{}{}{}", sign_str, prefix, int_digit, p_char, exp_sign, exp_abs)
+    } else {
+        format!("{}{}{}.{}{}{}{}", sign_str, prefix, int_digit, frac_str, p_char, exp_sign, exp_abs)
+    }
+}
+
 /// string.format(fmt, ...) — 格式化字符串
 /// 对应 C 的 str_format
 pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
@@ -1704,8 +1780,41 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
             }
             b'a' | b'A' => {
                 check_format(form, FMT_FLAGSF, true)?;
-                // %a %A 十六进制浮点格式未实现
-                return Err(format!("invalid conversion '%{}' to 'format'", spec as char));
+                let n = arg.as_float()
+                    .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
+                let upper = spec == b'A';
+                let hex_str = format_hex_float(n, precision, upper);
+                // # 标志: 总是显示小数点 (已在 format_hex_float 中处理)
+                // 添加正号或空格
+                let mut s = hex_str;
+                if n >= 0.0 && !s.starts_with('-') && !n.is_nan() {
+                    if plus_sign {
+                        s = format!("+{}", s);
+                    } else if space_sign {
+                        s = format!(" {}", s);
+                    }
+                }
+                // 处理宽度
+                if width > s.len() {
+                    if left_align {
+                        s = format!("{}{}", s, " ".repeat(width - s.len()));
+                    } else if zero_pad && !n.is_nan() && !n.is_infinite() {
+                        // 零填充在 0x 之后、数字之前
+                        // 简化: 对 %a 的零填充,在符号后、0x前填充
+                        if s.starts_with('-') {
+                            s = format!("-{}{}", "0".repeat(width - s.len()), &s[1..]);
+                        } else if s.starts_with('+') {
+                            s = format!("+{}{}", "0".repeat(width - s.len()), &s[1..]);
+                        } else if s.starts_with(' ') {
+                            s = format!(" {}{}", "0".repeat(width - s.len()), &s[1..]);
+                        } else {
+                            s = format!("{}{}", "0".repeat(width - s.len()), s);
+                        }
+                    } else {
+                        s = format!("{}{}", " ".repeat(width - s.len()), s);
+                    }
+                }
+                result.push_str(&s);
             }
             b'f' => {
                 check_format(form, FMT_FLAGSF, true)?;
@@ -1902,18 +2011,17 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                 // NaN → "(0/0)", inf → "1e9999", -inf → "-1e9999"
                 match arg {
                     TValue::Str(s) => {
-                        // 对应 C 的 addquoted: 保持原始字节,控制字符用 \ddd 格式
+                        // 对应 C 的 addquoted: 按字节处理,控制字符根据下一个字符决定格式
                         result.push('"');
                         let bytes = s.as_str().as_bytes();
                         for (idx, &c) in bytes.iter().enumerate() {
                             match c {
                                 b'"' | b'\\' | b'\n' => {
                                     result.push('\\');
-                                    // 使用 unsafe 保持原始字节 (非 ASCII 字节可能不是有效 UTF-8)
                                     unsafe { result.as_mut_vec().push(c); }
                                 }
                                 _ if c.is_ascii_control() => {
-                                    // C: 如果下一个字符是数字,用 \03d (3位前导零);否则用 \d
+                                    // ASCII 控制字符: 如果下一个字符是数字,用 \03d (3位);否则用 \d
                                     let next_is_digit = idx + 1 < bytes.len() && bytes[idx + 1].is_ascii_digit();
                                     if next_is_digit {
                                         result.push_str(&format!("\\{:03}", c));
@@ -1922,7 +2030,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                                     }
                                 }
                                 _ => {
-                                    // 原样输出,保持原始字节 (与 C 的 luaL_addchar 一致)
+                                    // 其他字符(包括非 ASCII 字节)保持原始字节
                                     unsafe { result.as_mut_vec().push(c); }
                                 }
                             }
@@ -2741,6 +2849,103 @@ fn push_results(state: &mut LuaState, a: usize, nresults: i32, results: Vec<TVal
     }
 }
 
+/// 对应 C 的 luaL_tolstring: 将值转为字符串用于 string.format 的 %s。
+/// - table: 调用 __tostring 元方法;若无则用 __name (或 "table") + 指针地址
+/// - 其他类型: 返回 None (由 str_format 自行处理)
+fn tostring_for_format(state: &mut LuaState, val: &TValue) -> Option<String> {
+    let table = match val {
+        TValue::Table(t) => t.clone(),
+        _ => return None,
+    };
+
+    // 查找 __tostring 元方法
+    let tostring_key = TValue::Str(state.intern_str("__tostring"));
+    let meta_fn = {
+        let data = table.data.borrow();
+        data.metatable.as_ref().and_then(|mt| mt.get(&tostring_key))
+    };
+
+    if let Some(f) = meta_fn {
+        // 调用 __tostring(value)
+        let base = state.stack.len();
+        state.stack.push(f);
+        state.stack.push(val.clone());
+        let status = state.pcall(1, 1, 0);
+        let result = if status == 0 && base < state.stack.len() {
+            match &state.stack[base] {
+                TValue::Str(s) => Some(s.as_str().to_string()),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        state.stack.truncate(base);
+        return result;
+    }
+
+    // 无 __tostring: 使用 __name (或默认 "table") + 指针地址
+    let name_key = TValue::Str(state.intern_str("__name"));
+    let type_name = {
+        let data = table.data.borrow();
+        data.metatable.as_ref()
+            .and_then(|mt| mt.get(&name_key))
+            .and_then(|v| match v {
+                TValue::Str(s) => Some(s.as_str().to_string()),
+                _ => None,
+            })
+            .unwrap_or_else(|| "table".to_string())
+    };
+    Some(format!("{}: 0x{:x}", type_name, table.gc_header.ptr_id))
+}
+
+/// 预扫描格式字符串,返回使用 %s (或 %.Ns 等) 的参数索引集合 (0-based)。
+/// 仅这些参数需要对 table 调用 __tostring 元方法 (对应 C 的 luaL_tolstring)。
+/// %q 等其他 specifier 不应转换 table,以便 str_format 能正确报 "value has no literal form"。
+fn find_s_arg_indices(fmt: &str) -> std::collections::HashSet<usize> {
+    let mut indices = std::collections::HashSet::new();
+    let bytes = fmt.as_bytes();
+    let mut i = 0;
+    let mut arg_idx = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        i += 1;
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b'%' {
+            i += 1;
+            continue;
+        }
+        // 跳过 flags
+        while i < bytes.len() && b"-+ 0#".contains(&bytes[i]) {
+            i += 1;
+        }
+        // 跳过 width
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        // 跳过 precision
+        if i < bytes.len() && bytes[i] == b'.' {
+            i += 1;
+            while i < bytes.len() && bytes[i].is_ascii_digit() {
+                i += 1;
+            }
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        if bytes[i] == b's' {
+            indices.insert(arg_idx);
+        }
+        arg_idx += 1;
+        i += 1;
+    }
+    indices
+}
+
 /// gmatch 迭代器函数 — 对应 C 的 gmatch_aux
 ///
 /// 在 TFORCALL 中调用，参数: state_table (表), ctrl (忽略)
@@ -2855,13 +3060,8 @@ fn call_gmatch_iter(
         // 没有更多匹配
         push_results(state, a, nresults, vec![TValue::Nil(NilKind::Strict)]);
     } else {
-        // 将更新后的状态表写回原始位置 (ra+1 = a-2)
-        // 注意: a = ra+3, a+1 = ra+4 是副本,会被 push_results 截断
-        // ra+1 是原始状态位置,在 a 之前,不会被截断
-        let state_idx = a - 2;
-        if state_idx < state.stack.len() {
-            state.stack[state_idx] = TValue::Table(state_table);
-        }
+        // Table 使用 Rc<RefCell<TableData>>,state_table.set() 已更新共享数据
+        // 无需写回栈位置 (无论通过 __call 还是 TFORCALL 调用,表引用共享同一数据)
         push_results(state, a, nresults, result_vals);
     }
     Ok(())
@@ -2967,7 +3167,7 @@ pub fn call_string_function(
         }
         STR_FORMAT => {
             let fmt = get_str_arg(state, a, 0)?;
-            let args: Vec<TValue> = (1..nargs).map(|i| {
+            let mut args: Vec<TValue> = (1..nargs).map(|i| {
                 let idx = a + 1 + i;
                 if idx < state.stack.len() {
                     state.stack[idx].clone()
@@ -2975,6 +3175,16 @@ pub fn call_string_function(
                     TValue::Nil(NilKind::Strict)
                 }
             }).collect();
+            // 对应 C 的 luaL_tolstring: 仅对 %s 参数中的 table 调用 __tostring 元方法。
+            // %q 等其他 specifier 不转换,以便 str_format 正确报 "value has no literal form"。
+            let s_indices = find_s_arg_indices(&fmt);
+            for (i, arg) in args.iter_mut().enumerate() {
+                if s_indices.contains(&i) {
+                    if let Some(s) = tostring_for_format(state, arg) {
+                        *arg = TValue::Str(state.intern_str(&s));
+                    }
+                }
+            }
             match str_format(&fmt, &args) {
                 Ok(result) => {
                     push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&result))]);
@@ -3041,8 +3251,10 @@ pub fn call_string_function(
             }
         }
         STR_GMATCH => {
-            // string.gmatch(s, pattern) — 返回迭代器函数、状态表、初始控制值
-            // 使用表存储状态: {s=string, p=pattern, pos=0, anchor=bool, pat_start=int}
+            // string.gmatch(s, pattern) — 返回一个可调用的状态表
+            // 对应 C 的 gmatch: 创建带 upvalue 的 C 闭包
+            // Rust 版本: 返回带 __call 元方法的表,表内存储状态
+            // 状态: {s=string, p=pattern, pos=0, anchor=bool, pat_start=int}
             let s = get_str_arg(state, a, 0)?;
             let p = get_str_arg(state, a, 1)?;
             let init = get_opt_int_arg(state, a, 2, 1);
@@ -3076,11 +3288,16 @@ pub fn call_string_function(
                 TValue::Integer(pat_start as i64),
             );
 
-            let iter_val = TValue::LightUserData(STR_GMATCH_ITER as *mut std::ffi::c_void);
-            let state_val = TValue::Table(state_table);
-            let ctrl_val = TValue::Integer(0);
+            // 创建元表,设置 __call = STR_GMATCH_ITER 标签
+            let mut mt = crate::table::Table::new();
+            mt.set(
+                TValue::Str(state.intern_str("__call")),
+                TValue::LightUserData(STR_GMATCH_ITER as *mut std::ffi::c_void),
+            );
+            state_table.set_metatable(Some(mt));
 
-            push_results(state, a, nresults, vec![iter_val, state_val, ctrl_val]);
+            // 返回单个表值 (可调用对象)
+            push_results(state, a, nresults, vec![TValue::Table(state_table)]);
             Ok(())
         }
         STR_PACK => {

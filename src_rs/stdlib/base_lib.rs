@@ -232,12 +232,27 @@ pub fn base_tonumber(v: &TValue, base: Option<i64>) -> Option<TValue> {
                         return Some(TValue::Float(f));
                     }
                     // 尝试十六进制 (0x 前缀)
-                    if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-                        if let Ok(i) = i64::from_str_radix(rest, 16) {
-                            return Some(TValue::Integer(i));
+                    // 先分离符号
+                    let (neg, hex_part) = if let Some(r) = s.strip_prefix('-') {
+                        (true, r)
+                    } else if let Some(r) = s.strip_prefix('+') {
+                        (false, r)
+                    } else {
+                        (false, s)
+                    };
+                    if let Some(rest) = hex_part.strip_prefix("0x").or_else(|| hex_part.strip_prefix("0X")) {
+                        // 检查是否包含浮点特征 (p/P 或 .)
+                        let is_float = rest.contains(|c: char| c == 'p' || c == 'P' || c == '.');
+                        if is_float {
+                            if let Some(f) = parse_hex_float(rest) {
+                                return Some(TValue::Float(if neg { -f } else { f }));
+                            }
+                        } else {
+                            if let Ok(i) = i64::from_str_radix(rest, 16) {
+                                return Some(TValue::Integer(if neg { -i } else { i }));
+                            }
                         }
                     }
-                    // 尝试十六进制浮点 (简化: 不支持)
                     None
                 }
                 _ => None,
@@ -256,6 +271,56 @@ pub fn base_tonumber(v: &TValue, base: Option<i64>) -> Option<TValue> {
             }
         }
     }
+}
+
+/// 解析十六进制浮点数 (对应 C strtod 对 0x 前缀的处理)
+///
+/// 输入格式: <int_part>[.<frac_part>][p<exp>]
+/// 例如: "1.999999999999ap-4" → 0.1
+fn parse_hex_float(s: &str) -> Option<f64> {
+    // 分离指数部分 (p/P)
+    let (mantissa_str, exp_str) = if let Some(idx) = s.find(|c: char| c == 'p' || c == 'P') {
+        (&s[..idx], Some(&s[idx + 1..]))
+    } else {
+        (s, None)
+    };
+
+    // 分离整数和小数部分
+    let (int_str, frac_str) = if let Some(idx) = mantissa_str.find('.') {
+        (&mantissa_str[..idx], &mantissa_str[idx + 1..])
+    } else {
+        (mantissa_str, "")
+    };
+
+    if int_str.is_empty() && frac_str.is_empty() {
+        return None;
+    }
+
+    // 解析整数部分
+    let mut int_val: f64 = 0.0;
+    for c in int_str.chars() {
+        let digit = c.to_digit(16)?;
+        int_val = int_val * 16.0 + digit as f64;
+    }
+
+    // 解析小数部分
+    let mut frac_val: f64 = 0.0;
+    let mut frac_scale: f64 = 1.0 / 16.0;
+    for c in frac_str.chars() {
+        let digit = c.to_digit(16)?;
+        frac_val += digit as f64 * frac_scale;
+        frac_scale /= 16.0;
+    }
+
+    let mut result = int_val + frac_val;
+
+    // 解析指数部分 (2 的幂)
+    if let Some(exp_str) = exp_str {
+        let exp: i32 = exp_str.parse().ok()?;
+        result *= 2f64.powi(exp);
+    }
+
+    Some(result)
 }
 
 /// tostring(v) — 转换为字符串 (对应 C 的 luaB_tostring)
@@ -774,6 +839,54 @@ fn call_tostring(
     nresults: i32,
 ) -> Result<(), VmError> {
     let arg = get_arg(state, a, 0);
+    // 对应 C 的 luaL_tolstring: 先尝试调用 __tostring 元方法
+    if let TValue::Table(t) = &arg {
+        let tostring_key = TValue::Str(state.intern_str("__tostring"));
+        let meta_fn = {
+            let data = t.data.borrow();
+            data.metatable.as_ref().and_then(|mt| mt.get(&tostring_key))
+        };
+        if let Some(f) = meta_fn {
+            // 调用 __tostring(value)
+            let base = state.stack.len();
+            state.stack.push(f);
+            state.stack.push(arg.clone());
+            let status = state.pcall(1, 1, 0);
+            if status != 0 {
+                // pcall 失败: 传播错误
+                let err = if base < state.stack.len() {
+                    match &state.stack[base] {
+                        TValue::Str(s) => s.as_str().to_string(),
+                        other => format!("{:?}", other),
+                    }
+                } else {
+                    String::new()
+                };
+                state.stack.truncate(base);
+                return Err(VmError::RuntimeError(err));
+            }
+            // 检查返回值是否为字符串
+            let result_str = if base < state.stack.len() {
+                match &state.stack[base] {
+                    TValue::Str(s) => Some(s.as_str().to_string()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            state.stack.truncate(base);
+            return match result_str {
+                Some(s) => {
+                    push_single_result(state, a, nresults, TValue::Str(state.intern_str(&s)));
+                    Ok(())
+                }
+                None => Err(VmError::RuntimeError(
+                    "'__tostring' must return a string".to_string(),
+                )),
+            };
+        }
+    }
+    // 无 __tostring 元方法: 使用默认转换
     let s = base_tostring(&arg);
     push_single_result(state, a, nresults, TValue::Str(state.intern_str(&s)));
     Ok(())

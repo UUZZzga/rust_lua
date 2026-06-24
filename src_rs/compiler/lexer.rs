@@ -52,6 +52,21 @@ impl Token {
     }
 }
 
+/// 从字节切片的指定位置安全地读取一个字符。
+/// 无效 UTF-8 字节按单字节处理 (作为 Latin-1 字符),对应 C 版本按字节读取源码的行为。
+fn read_char_at(bytes: &[u8], pos: usize) -> char {
+    if pos >= bytes.len() {
+        return '\0';
+    }
+    if bytes[pos] < 0x80 {
+        return bytes[pos] as char;
+    }
+    match std::str::from_utf8(&bytes[pos..]).ok().and_then(|s| s.chars().next()) {
+        Some(ch) => ch,
+        None => bytes[pos] as char,  // 无效 UTF-8: 按字节值作为 char
+    }
+}
+
 pub struct LexState<'a> {
     pub state: &'a mut LuaState,
     pub source: String,
@@ -70,7 +85,7 @@ pub struct LexState<'a> {
 impl<'a> LexState<'a> {
     pub fn new(state: &'a mut LuaState, source: &str, chunk_name: &str) -> Self {
         let src = source.to_string();
-        let first = src.chars().next().unwrap_or('\0');
+        let first = read_char_at(src.as_bytes(), 0);
         LexState {
             state,
             source: src,
@@ -91,27 +106,36 @@ impl<'a> LexState<'a> {
         if self.current == '\n' {
             self.linenumber += 1;
         }
-        if self.pos < self.source.len() {
-            let bytes = self.source.as_bytes();
+        let bytes = self.source.as_bytes();
+        if self.pos < bytes.len() {
             if bytes[self.pos] < 0x80 {
                 self.pos += 1;
             } else {
-                let ch = self.source[self.pos..].chars().next().unwrap_or('\0');
-                self.pos += ch.len_utf8();
+                // 尝试解析为 UTF-8;无效字节按单字节处理 (对应 C 按字节读取)
+                match std::str::from_utf8(&bytes[self.pos..]).ok().and_then(|s| s.chars().next()) {
+                    Some(ch) => self.pos += ch.len_utf8(),
+                    None => self.pos += 1,
+                }
             }
         }
-        self.current = if self.pos < self.source.len() {
-            self.source[self.pos..].chars().next().unwrap_or('\0')
-        } else {
-            '\0'
-        };
+        self.current = read_char_at(self.source.as_bytes(), self.pos);
     }
 
     fn peek(&self) -> char {
-        let src = &self.source[self.pos..];
-        let mut chars = src.chars();
-        chars.next();
-        chars.next().unwrap_or('\0')
+        let bytes = self.source.as_bytes();
+        let mut pos = self.pos;
+        // 跳过当前字符
+        if pos < bytes.len() {
+            if bytes[pos] < 0x80 {
+                pos += 1;
+            } else {
+                match std::str::from_utf8(&bytes[pos..]).ok().and_then(|s| s.chars().next()) {
+                    Some(ch) => pos += ch.len_utf8(),
+                    None => pos += 1,
+                }
+            }
+        }
+        read_char_at(bytes, pos)
     }
 
     fn skip_whitespace(&mut self) {
@@ -448,8 +472,12 @@ impl<'a> LexState<'a> {
                     break;
                 }
                 c => {
-                    s.push(c);
+                    // 直接拷贝源字节,以正确处理非 UTF-8 字节 (对应 C 的 save_and_next)
+                    let start = self.pos;
                     self.next_char();
+                    let bytes = &self.source.as_bytes()[start..self.pos];
+                    unsafe { s.as_mut_vec().extend_from_slice(bytes); }
+                    let _ = c;
                 }
             }
         }
@@ -538,12 +566,22 @@ impl<'a> LexState<'a> {
                 }
             }
             '\n' | '\r' => {
+                // 对应 C: inclinenumber(ls); c = '\n'; goto only_save;
+                // 跳过换行序列 (\n, \r, \n\r, \r\n) 并在字符串中存入换行符
+                let old = self.current;
                 self.next_char();
-                if self.current == '\n' {
+                if (self.current == '\n' || self.current == '\r') && self.current != old {
                     self.next_char();
                 }
+                s.push('\n');
             }
-            c => { s.push(c); self.next_char(); }
+            c => {
+                // 直接拷贝源字节,以正确处理非 UTF-8 字节
+                let start = self.pos;
+                self.next_char();
+                let bytes = &self.source.as_bytes()[start..self.pos];
+                unsafe { s.as_mut_vec().extend_from_slice(bytes); }
+            }
         }
     }
 
@@ -564,7 +602,10 @@ impl<'a> LexState<'a> {
                     let actual = self.count_equals();
                     if actual == eqs && self.current == ']' {
                         let end = self.pos - 1 - actual;
-                        let s = self.source[start..end].to_string();
+                        // 使用原始字节拷贝,以正确处理非 UTF-8 字节
+                        let s = unsafe {
+                            String::from_utf8_unchecked(self.source.as_bytes()[start..end].to_vec())
+                        };
                         self.next_char();
                         self.token = Token::String(s);
                         return;

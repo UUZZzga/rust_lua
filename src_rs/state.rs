@@ -1230,6 +1230,8 @@ impl LuaState {
                     crate::stdlib::utf8_lib::utf8_function_name(tag_val).map(|s| s.to_string())
                 } else if crate::stdlib::table_lib::is_table_tag(tag_val) {
                     crate::stdlib::table_lib::table_function_name(tag_val).map(|s| s.to_string())
+                } else if crate::stdlib::os_lib::is_os_tag(tag_val) {
+                    crate::stdlib::os_lib::os_function_name(tag_val).map(|s| s.to_string())
                 } else if tag_val >= 100 {
                     crate::stdlib::string_lib::string_function_name(tag_val).map(|s| s.to_string())
                 } else {
@@ -1267,6 +1269,10 @@ impl LuaState {
                     )
                 } else if crate::stdlib::debug_lib::is_debug_tag(tag_val) {
                     crate::stdlib::debug_lib::call_debug_function(
+                        tag_val, self, func_idx, nargs, nresults,
+                    )
+                } else if crate::stdlib::os_lib::is_os_tag(tag_val) {
+                    crate::stdlib::os_lib::call_os_function(
                         tag_val, self, func_idx, nargs, nresults,
                     )
                 } else if tag_val >= 100 {
@@ -1397,6 +1403,9 @@ impl LuaState {
 
         // 打开 Debug 库 (注册 debug 全局表, 包含 getinfo/getlocal/setupvalue/traceback/sethook 等)
         crate::stdlib::debug_lib::open_debug_lib(self);
+
+        // 打开 OS 库 (注册 os 全局表, 包含 setlocale 等)
+        crate::stdlib::os_lib::open_os_lib(self);
     }
 
     // ====== Hook ======

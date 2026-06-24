@@ -2340,9 +2340,35 @@ impl VmExecutor {
 
     fn op_call(state: &mut LuaState, inst: Instruction, call_stack: &mut Vec<CallFrame>) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
-        let b = opcodes::getarg_b(inst) as usize;
+        let mut b = opcodes::getarg_b(inst) as usize;
         let c = opcodes::getarg_c(inst) as i32;
-        let func_val = Self::read_stack(state, a).clone();
+        let mut func_val = Self::read_stack(state, a).clone();
+
+        // __call 元方法支持 — 对应 C 的 luaT_tryfuncTM
+        // 当非函数值被调用时,检查其元表的 __call 元方法
+        // 如果存在,将 __call 函数插入到栈位置 a,原值和参数右移 1 位
+        // 调用变为 __call(original_value, original_args...)
+        if let TValue::Table(ref t) = func_val {
+            if let Some(mt) = t.get_metatable() {
+                let call_key = TValue::Str(state.intern_str("__call"));
+                if let Some(call_fn) = mt.get(&call_key) {
+                    // 对应 C: for (st = L->top; st > func; st--) setobj(st, st-1);
+                    // 在位置 a 插入 __call 函数,原 table 和所有参数右移 1 位
+                    state.stack.insert(a, call_fn.clone());
+                    // b 增加 1 以反映额外的 self 参数 (MULTRET 时 b=0 不变,
+                    // nargs 从 stack.len() 计算,自动包含额外元素)
+                    if b > 0 { b += 1; }
+                    func_val = call_fn;
+                } else {
+                    let type_name = state.typename(func_val.ty());
+                    return Err(VmError::RuntimeError(format!("attempt to call a {} value", type_name)));
+                }
+            } else {
+                let type_name = state.typename(func_val.ty());
+                return Err(VmError::RuntimeError(format!("attempt to call a {} value", type_name)));
+            }
+        }
+
         match func_val {
             TValue::LClosure(closure) => {
                 let nargs = if b == 0 { state.stack.len().saturating_sub(a + 1) } else { b.saturating_sub(1) };
@@ -2510,6 +2536,11 @@ impl VmExecutor {
                 } else if crate::stdlib::debug_lib::is_debug_tag(tag_val) {
                     // Debug 库函数（标签 500-519）
                     crate::stdlib::debug_lib::call_debug_function(
+                        tag_val, state, a, nargs, nresults,
+                    )
+                } else if crate::stdlib::os_lib::is_os_tag(tag_val) {
+                    // OS 库函数（标签 600-609）
+                    crate::stdlib::os_lib::call_os_function(
                         tag_val, state, a, nargs, nresults,
                     )
                 } else if tag_val >= 100 {
@@ -2742,6 +2773,11 @@ impl VmExecutor {
                 } else if crate::stdlib::debug_lib::is_debug_tag(tag_val) {
                     // Debug 库函数（标签 500-519）
                     crate::stdlib::debug_lib::call_debug_function(
+                        tag_val, state, a, nargs, -1,
+                    )?;
+                } else if crate::stdlib::os_lib::is_os_tag(tag_val) {
+                    // OS 库函数（标签 600-609）
+                    crate::stdlib::os_lib::call_os_function(
                         tag_val, state, a, nargs, -1,
                     )?;
                 } else if tag_val >= 100 {
