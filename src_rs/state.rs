@@ -878,7 +878,7 @@ impl LuaState {
     /// 构建堆栈回溯字符串 — 对应 C 的 luaL_traceback
     ///
     /// 格式:
-    /// ```
+    /// ```text
     /// msg
     /// stack traceback:
     ///         [C]: in global 'assert'
