@@ -1406,6 +1406,9 @@ impl LuaState {
 
         // 打开 OS 库 (注册 os 全局表, 包含 setlocale 等)
         crate::stdlib::os_lib::open_os_lib(self);
+
+        // 打开 Coroutine 库 (注册 coroutine 全局表, 包含 create/resume/yield/status 等)
+        crate::stdlib::coroutine_lib::open_coroutine_lib(self);
     }
 
     // ====== Hook ======

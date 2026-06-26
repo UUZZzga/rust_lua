@@ -765,6 +765,11 @@ impl VmExecutor {
                     crate::stdlib::string_lib::call_string_function(
                         tag_val, state, ra + 3, nargs, nresults,
                     )
+                } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
+                    // Coroutine 库函数（标签 700-709）
+                    crate::stdlib::coroutine_lib::call_coro_function(
+                        tag_val, state, ra + 3, nargs, nresults,
+                    )
                 } else {
                     Ok(())
                 };
@@ -915,6 +920,9 @@ impl VmExecutor {
             String::new()
         };
         state.last_error_msg = format!("{}{}", prefix, error_msg);
+        // 末尾追加 C 层调用者帧 — 对应 C Lua 中调用主块的 C 函数
+        // (如 pcall/docall)，该帧无名称，显示为 [C]: in ?
+        trace.push_str("\n\t[C]: in ?");
         state.last_traceback = trace;
     }
 
@@ -2501,6 +2509,8 @@ impl VmExecutor {
                     crate::stdlib::base_lib::base_function_name(tag_val).map(|s| s.to_string())
                 } else if crate::stdlib::debug_lib::is_debug_tag(tag_val) {
                     crate::stdlib::debug_lib::debug_function_name(tag_val).map(|s| s.to_string())
+                } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
+                    crate::stdlib::coroutine_lib::coro_function_name(tag_val).map(|s| s.to_string())
                 } else {
                     None
                 };
@@ -2555,6 +2565,11 @@ impl VmExecutor {
                 } else if crate::stdlib::os_lib::is_os_tag(tag_val) {
                     // OS 库函数（标签 600-609）
                     crate::stdlib::os_lib::call_os_function(
+                        tag_val, state, a, nargs, nresults,
+                    )
+                } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
+                    // Coroutine 库函数（标签 700-709）
+                    crate::stdlib::coroutine_lib::call_coro_function(
                         tag_val, state, a, nargs, nresults,
                     )
                 } else if tag_val >= 100 {
@@ -2792,6 +2807,11 @@ impl VmExecutor {
                 } else if crate::stdlib::os_lib::is_os_tag(tag_val) {
                     // OS 库函数（标签 600-609）
                     crate::stdlib::os_lib::call_os_function(
+                        tag_val, state, a, nargs, -1,
+                    )?;
+                } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
+                    // Coroutine 库函数（标签 700-709）
+                    crate::stdlib::coroutine_lib::call_coro_function(
                         tag_val, state, a, nargs, -1,
                     )?;
                 } else if tag_val >= 100 {

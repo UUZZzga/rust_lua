@@ -9,3 +9,4 @@ pub mod utf8_lib;
 pub mod table_lib;
 pub mod debug_lib;
 pub mod os_lib;
+pub mod coroutine_lib;

@@ -806,13 +806,15 @@ pub struct Udata {
 /// Scenario: 线程的生命周期
 /// Given: 一个新创建的 Lua 线程
 /// When: 检查其状态
-/// Then: status = ThreadStatus::OK, stack 为空
+/// Then: status = ThreadStatus::Suspended, stack 为空
 #[derive(Debug, Clone)]
 pub struct LuaThread {
     /// 线程栈
     pub stack: Vec<TValue>,
     /// 线程状态
     pub status: ThreadStatus,
+    /// 协程体函数 (coroutine.create 的参数)
+    pub function: Option<Box<TValue>>,
 }
 
 /// 线程状态
@@ -820,6 +822,7 @@ pub struct LuaThread {
 pub enum ThreadStatus {
     OK,
     Suspended,
+    Normal,
     Error,
 }
 
