@@ -660,6 +660,13 @@ fn call_pcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
         }
     }
 
+    // 截断栈到 f + 其参数，确保 state.pcall 通过 stack.len() 计算的 func_idx 指向 f
+    // (调用方帧可能有额外寄存器残留在参数之上)
+    let new_top = a + pcall_nargs + 1;
+    if state.stack.len() > new_top {
+        state.stack.truncate(new_top);
+    }
+
     let status = state.pcall(pcall_nargs, -1, 0);
 
     // pcall 后: 栈截断到 a, 结果在 a..
@@ -1101,6 +1108,13 @@ fn call_xpcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         // 移除 f (a+1) 和 err_fn (a+2)
         state.stack.remove(a + 1);
         state.stack.remove(a + 1);
+    }
+
+    // 截断栈到 f + 其参数，确保 state.pcall 通过 stack.len() 计算的 func_idx 指向 f
+    // (调用方帧可能有额外寄存器残留在参数之上)
+    let new_top = a + xpcall_nargs + 1;
+    if state.stack.len() > new_top {
+        state.stack.truncate(new_top);
     }
 
     let status = state.pcall(xpcall_nargs, -1, 0);
