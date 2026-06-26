@@ -22,6 +22,7 @@ pub const TABLE_UNPACK: usize = 401;
 pub const TABLE_PACK: usize = 402;
 pub const TABLE_INSERT: usize = 403;
 pub const TABLE_REMOVE: usize = 404;
+pub const TABLE_SORT: usize = 405;
 
 /// Table 库标签范围: [400, 410)
 pub fn is_table_tag(tag: usize) -> bool {
@@ -36,6 +37,7 @@ pub fn table_function_name(tag: usize) -> Option<&'static str> {
         TABLE_PACK => Some("pack"),
         TABLE_INSERT => Some("insert"),
         TABLE_REMOVE => Some("remove"),
+        TABLE_SORT => Some("sort"),
         _ => None,
     }
 }
@@ -175,6 +177,7 @@ pub fn call_table_function(
         TABLE_PACK => call_pack(state, a, nargs, nresults),
         TABLE_INSERT => call_insert(state, a, nargs, nresults),
         TABLE_REMOVE => call_remove(state, a, nargs, nresults),
+        TABLE_SORT => call_sort(state, a, nargs, nresults),
         _ => Err(VmError::RuntimeError(format!(
             "unknown table function tag: {}", tag
         ))),
@@ -348,6 +351,113 @@ fn call_remove(
     Ok(())
 }
 
+/// table.sort(table [, comp]) — 对应 C 的 sort
+///
+/// 对 table 的数组部分进行原地排序。comp 是可选的比较函数，
+/// 接受两个参数，返回 true 如果第一个小于第二个。
+/// 无 comp 时使用 Lua 的 < 运算符。
+fn call_sort(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+    let table_val = get_arg(state, a, 0);
+    let comp_val = if nargs >= 2 {
+        get_arg(state, a, 1)
+    } else {
+        TValue::Nil(NilKind::Strict)
+    };
+
+    let table = match table_val {
+        TValue::Table(ref t) => t.clone(),
+        _ => return Err(VmError::RuntimeError(format!(
+            "bad argument #1 to 'sort' (table expected, got {})", table_val.ty()
+        ))),
+    };
+
+    let has_comp = !matches!(comp_val, TValue::Nil(_));
+    let n = table.len();
+
+    // 提取数组元素到 Vec
+    let mut elems: Vec<TValue> = Vec::with_capacity(n as usize);
+    for i in 1..=n {
+        elems.push(table_get_int(&table, i));
+    }
+
+    if has_comp {
+        // 有比较函数: 使用快速排序,每次比较通过 state.pcall 调用比较函数
+        let mut err: Option<VmError> = None;
+        // 使用简单的插入排序 (n 通常较小; 大数组可优化为快速排序)
+        for i in 1..elems.len() {
+            if err.is_some() { break; }
+            let mut j = i;
+            while j > 0 {
+                // 调用 comp(elems[j], elems[j-1]): 若返回 true 则交换
+                match call_comp_function(state, &comp_val, &elems[j], &elems[j-1]) {
+                    Ok(true) => {
+                        elems.swap(j, j - 1);
+                        j -= 1;
+                    }
+                    Ok(false) => break,
+                    Err(e) => { err = Some(e); break; }
+                }
+            }
+        }
+        if let Some(e) = err { return Err(e); }
+    } else {
+        // 无比较函数: 使用 Lua < 运算符 (对应 C 的 lua_compare LUA_OPLT)
+        elems.sort_by(|x, y| {
+            match crate::vm::less_than_raw(x, y) {
+                Some(true) => std::cmp::Ordering::Less,
+                Some(false) => std::cmp::Ordering::Greater,
+                None => std::cmp::Ordering::Equal,
+            }
+        });
+    }
+
+    // 写回 table
+    for (i, val) in elems.iter().enumerate() {
+        table.set_int(i as i64 + 1, val.clone());
+    }
+
+    push_results(state, a, nresults, vec![]);
+    Ok(())
+}
+
+/// 从 Rust 调用 Lua 比较函数 (对应 C 的 sort_comp 中的函数调用路径)
+///
+/// 推入 comp(a, b) 并通过 state.pcall 调用,返回布尔结果。
+fn call_comp_function(
+    state: &mut LuaState,
+    comp: &TValue,
+    a: &TValue,
+    b: &TValue,
+) -> Result<bool, VmError> {
+    let saved_len = state.stack.len();
+    // 推入: comp, a, b
+    state.stack.push(comp.clone());
+    state.stack.push(a.clone());
+    state.stack.push(b.clone());
+
+    let status = state.pcall(2, 1, 0);
+
+    if status != 0 {
+        // 恢复栈
+        state.stack.truncate(saved_len);
+        return Err(VmError::RuntimeError("error in comparison function".to_string()));
+    }
+
+    // pcall 后: 栈截断到 saved_len, 推入 1 个结果
+    let result = if saved_len < state.stack.len() {
+        match &state.stack[saved_len] {
+            TValue::Boolean(v) => *v,
+            _ => false,
+        }
+    } else {
+        false
+    };
+
+    // 恢复栈到调用前
+    state.stack.truncate(saved_len);
+    Ok(result)
+}
+
 // ============================================================================
 // 打开 Table 库 — 对应 C 的 luaopen_table
 // ============================================================================
@@ -366,6 +476,7 @@ pub fn open_table_lib(state: &mut LuaState) {
     register(&mut lib, "pack", TABLE_PACK);
     register(&mut lib, "insert", TABLE_INSERT);
     register(&mut lib, "remove", TABLE_REMOVE);
+    register(&mut lib, "sort", TABLE_SORT);
 
     let key = TValue::Str(state.intern_str("table"));
     state.globals.set(key, TValue::Table(lib));

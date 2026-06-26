@@ -27,6 +27,12 @@ pub const MIN_STACK: usize = LUA_MINSTACK;
 pub const LUAI_MAXSTACK: usize = 1000000;
 pub const LUAI_MAXCCALLS: u32 = 200;
 pub const STACKERRSPACE: usize = 200;
+
+/// __call 元方法链的最大深度 (对应 C 的 MAX_CCMT = 0xf << 8, 4 位计数器, 上限 15)
+///
+/// 对应 src/lstate.h 中的 MAX_CCMT 定义。当 __call 链超过 15 层时报
+/// "'__call' chain too long" 错误。
+pub const MAX_CALL_CHAIN: usize = 15;
 pub const MAXSTACK_BYSIZET: usize = (usize::max_value() / std::mem::size_of::<TValue>()) - STACKERRSPACE ;
 pub const MAXSTACK: usize = if LUAI_MAXSTACK < MAXSTACK_BYSIZET {LUAI_MAXSTACK} else {MAXSTACK_BYSIZET};
 pub const ERRORSTACKSIZE: usize = MAXSTACK + STACKERRSPACE;
@@ -960,7 +966,7 @@ impl LuaState {
                 let closure = LClosure {
                     gc_header: GCObjectHeader::new(),
                     proto,
-                    upvals,
+                    upvals: Rc::new(RefCell::new(upvals)),
                 };
                 self.stack.push(TValue::LClosure(closure));
                 0
@@ -1085,9 +1091,59 @@ impl LuaState {
             return ERR_RUN;
         }
 
+        // __call 元方法链解析 (对应 C 的 tryfuncTM + precall 的 goto retry)
+        // 当 func 是表且有 __call 元方法时,在 func_idx 位置插入元方法,
+        // 原表和所有参数右移 1 位,使调用变为 __call(original_table, args...)。
+        // 循环处理嵌套 __call 链,直到找到可调用对象或超过 MAX_CALL_CHAIN(15)。
+        // (op_call/op_tailcall 已在 execute.rs 中处理此逻辑,但 pcall 直接
+        //  调用 state.pcall,所以这里也需要相同的处理。)
+        let mut chain_len: usize = 0;
+        loop {
+            let cur_val = self.stack[func_idx].clone();
+            if let TValue::Table(ref t) = cur_val {
+                let mt_opt = t.get_metatable();
+                let call_fn = mt_opt.as_ref().and_then(|mt| {
+                    let call_key = TValue::Str(self.intern_str("__call"));
+                    mt.get(&call_key)
+                });
+                if let Some(call_fn) = call_fn {
+                    // 在 func_idx 位置插入元方法,原 func 和参数右移 1 位
+                    // 对应 C: for (p = L->top.p; p > func; p--) setobjs2s(L, p, p-1);
+                    self.stack.insert(func_idx, call_fn.clone());
+                    if chain_len >= MAX_CALL_CHAIN {
+                        self.stack.truncate(func_idx);
+                        self.push_string("'__call' chain too long");
+                        return ERR_RUN;
+                    }
+                    chain_len += 1;
+                    continue;  // 对应 goto retry
+                }
+                // 表无 __call 元方法,报 "attempt to call a table value"
+                self.stack.truncate(func_idx);
+                self.push_string(&format!(
+                    "attempt to call a {} value",
+                    self.typename(cur_val.ty())
+                ));
+                return ERR_RUN;
+            }
+            break;  // 非表类型,退出循环进入原有 match
+        }
+
         let func_val = self.stack[func_idx].clone();
         match func_val {
             TValue::LClosure(closure) => {
+                // 检查 C 调用深度 (对应 C 的 luaE_incCstack / luaE_checkcstack)
+                // 每次 Lua 闭包调用递增 n_ccalls,达到 LUAI_MAXCCALLS(200) 时
+                // 抛出可被 pcall 捕获的 "C stack overflow",防止 Rust 原生栈溢出。
+                // 注意: 必须在 execute_loop 之前检查,否则递归仍会无限进行。
+                self.n_ccalls = self.n_ccalls.saturating_add(1);
+                if self.get_ccalls() >= LUAI_MAXCCALLS {
+                    self.n_ccalls = self.n_ccalls.saturating_sub(1);
+                    self.stack.truncate(func_idx);
+                    self.push_string("C stack overflow");
+                    return ERR_RUN;
+                }
+
                 let nargs_actual = self.stack.len().saturating_sub(func_idx + 1);
                 let fsize = closure.proto.max_stack_size as usize;
                 let nfixparams = closure.proto.num_params as usize;
@@ -1118,7 +1174,8 @@ impl LuaState {
                 self.proto_flag = closure.proto.flag;
                 self.nextraargs = 0;
                 // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
-                self.closure_upvals = closure.upvals;
+                // upvals 是 Rc<RefCell<Vec>>，这里 clone 出 Vec 供执行期使用
+                self.closure_upvals = closure.upvals.borrow().clone();
                 self.tbc_list = None;
                 self.open_upval = None;
 
@@ -1143,6 +1200,9 @@ impl LuaState {
                 }
 
                 let result = VmExecutor::execute_loop(self);
+                // 恢复 n_ccalls (对应 C 的 decnny);无论成功或失败都递减,
+                // 保证 pcall 返回后深度计数平衡。
+                self.n_ccalls = self.n_ccalls.saturating_sub(1);
 
                 self.code = saved_code;
                 self.constants = saved_constants;

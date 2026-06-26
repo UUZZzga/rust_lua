@@ -20,7 +20,7 @@
 //! - 标签 400+: 表库
 //! - 标签 500+: 调试库
 
-use crate::objects::{NilKind, TValue, LClosure, Proto, UpVal, PF_VAHID};
+use crate::objects::{NilKind, TValue, LClosure, Proto, UpVal, UpValRef, PF_VAHID};
 use crate::state::LuaState;
 use crate::table::Table;
 use crate::execute::VmError;
@@ -884,7 +884,7 @@ fn fill_info_from_closure(info: &mut DebugInfo, closure: &LClosure, what: &str) 
         info.currentline = -1; // 函数参数模式没有当前行
     }
     if what.contains('u') {
-        info.nups = closure.upvals.len();
+        info.nups = closure.upvals.borrow().len();
         info.nparams = proto.num_params as usize;
         info.isvararg = proto.is_vararg();
     }
@@ -988,7 +988,7 @@ fn fill_info_from_level(
                 info.currentline = get_proto_line(proto, state.pc);
             }
             if what.contains('u') {
-                info.nups = closure.upvals.len();
+                info.nups = closure.upvals.borrow().len();
                 info.nparams = proto.num_params as usize;
                 info.isvararg = proto.is_vararg();
             }
@@ -1101,7 +1101,7 @@ fn fill_info_from_level(
                 info.currentline = get_proto_line(proto, entry.saved_pc);
             }
             if what.contains('u') {
-                info.nups = closure.upvals.len();
+                info.nups = closure.upvals.borrow().len();
                 info.nparams = proto.num_params as usize;
                 info.isvararg = proto.is_vararg();
             }
@@ -1482,8 +1482,9 @@ fn call_getupvalue(
 
     match &arg1 {
         TValue::LClosure(closure) => {
-            if n > 0 && n <= closure.upvals.len() {
-                let uv_ref = closure.upvals[n - 1].borrow();
+            if n > 0 && n <= closure.upvals.borrow().len() {
+                let upvals_ref = closure.upvals.borrow();
+                let uv_ref = upvals_ref[n - 1].borrow();
                 let val = match &*uv_ref {
                     UpVal::Closed { value } => (**value).clone(),
                     UpVal::Open { stack_index, .. } => {
@@ -1556,7 +1557,7 @@ fn call_setupvalue(
 
     match &arg1 {
         TValue::LClosure(closure) => {
-            if n > 0 && n <= closure.upvals.len() {
+            if n > 0 && n <= closure.upvals.borrow().len() {
                 // 获取上值名 — 对应 C 的 luaF_getupname: NULL name 返回 "(no name)"
                 let name = closure
                     .proto
@@ -1571,10 +1572,11 @@ fn call_setupvalue(
                 // 但 arg1 是 clone 的, 我们需要修改栈上的原始闭包
                 if a + 1 < state.stack.len() {
                     if let TValue::LClosure(ref mut cl) = state.stack[a + 1] {
-                        if n <= cl.upvals.len() {
+                        if n <= cl.upvals.borrow().len() {
                             // 先取出 stack_index (如果是 Open), 然后释放 borrow, 再修改 stack
                             let action = {
-                                let mut uv_ref = cl.upvals[n - 1].borrow_mut();
+                                let upvals_ref = cl.upvals.borrow();
+                                let mut uv_ref = upvals_ref[n - 1].borrow_mut();
                                 match &mut *uv_ref {
                                     UpVal::Closed { value: val } => {
                                         **val = value.clone();
@@ -1635,9 +1637,10 @@ fn call_upvalueid(
 
     match &arg1 {
         TValue::LClosure(closure) => {
-            if n > 0 && n <= closure.upvals.len() {
+            let upvals_ref = closure.upvals.borrow();
+            if n > 0 && n <= upvals_ref.len() {
                 // 使用 Rc 的指针作为唯一标识
-                let ptr = Rc::as_ptr(&closure.upvals[n - 1]) as *mut std::ffi::c_void;
+                let ptr = Rc::as_ptr(&upvals_ref[n - 1]) as *mut std::ffi::c_void;
                 push_single_result(state, a, nresults, TValue::LightUserData(ptr));
             } else {
                 push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
@@ -1670,30 +1673,36 @@ fn call_upvaluejoin(
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
-    let f1 = get_arg(state, a, 0);
-    let n1 = get_arg(state, a, 1).as_integer().unwrap_or(0) as usize;
+    // 对应 C 的 db_upvaluejoin -> lua_upvaluejoin:
+    //   *up1 = *up2;  (f1 的第 n1 个上值指向 f2 的第 n2 个上值对象)
+    //
+    // 关键: upvals 是 Rc<RefCell<Vec>>，所有 LClosure clone 共享同一个 Vec。
+    // 修改栈上 clone 的 upvals 会影响所有共享同一 Rc 的闭包（包括原始 LClosure）。
+    let f1_stack_idx = a + 1;  // f1 在栈上的位置
     let f2 = get_arg(state, a, 2);
+    let n1 = get_arg(state, a, 1).as_integer().unwrap_or(0) as usize;
     let n2 = get_arg(state, a, 3).as_integer().unwrap_or(0) as usize;
 
-    if let (TValue::LClosure(_), TValue::LClosure(_)) = (&f1, &f2) {
-        // 获取 f2 的上值引用
-        let f2_upval = if let TValue::LClosure(c2) = &f2 {
-            if n2 > 0 && n2 <= c2.upvals.len() {
-                Some(c2.upvals[n2 - 1].clone())
-            } else {
-                None
-            }
+    // 获取 f2 的第 n2 个上值引用 (Rc<RefCell<UpVal>>)
+    let f2_upval: Option<UpValRef> = if let TValue::LClosure(c2) = &f2 {
+        let c2_upvals = c2.upvals.borrow();
+        if n2 > 0 && n2 <= c2_upvals.len() {
+            Some(c2_upvals[n2 - 1].clone())
         } else {
             None
-        };
+        }
+    } else {
+        None
+    };
 
-        if let Some(upval) = f2_upval {
-            // 设置到 f1 的上值
-            if a + 1 < state.stack.len() {
-                if let TValue::LClosure(ref mut c1) = state.stack[a + 1] {
-                    if n1 > 0 && n1 <= c1.upvals.len() {
-                        c1.upvals[n1 - 1] = upval;
-                    }
+    // 将 f1 的第 n1 个上值指向 f2 的第 n2 个上值
+    // 通过 borrow_mut 修改共享的 Vec，影响所有共享同一 Rc 的闭包
+    if let Some(upval) = f2_upval {
+        if f1_stack_idx < state.stack.len() {
+            if let TValue::LClosure(ref mut c1) = state.stack[f1_stack_idx] {
+                let mut c1_upvals = c1.upvals.borrow_mut();
+                if n1 > 0 && n1 <= c1_upvals.len() {
+                    c1_upvals[n1 - 1] = upval;
                 }
             }
         }
@@ -2305,9 +2314,9 @@ mod tests {
         let closure = LClosure {
             gc_header: GCObjectHeader::new(),
             proto,
-            upvals: vec![Rc::new(RefCell::new(UpVal::Closed {
+            upvals: Rc::new(RefCell::new(vec![Rc::new(RefCell::new(UpVal::Closed {
                 value: Box::new(TValue::Integer(42)),
-            }))],
+            }))])),
         };
         state.stack.clear();
         state.stack.push(TValue::LightUserData(DEBUG_GETUPVALUE as *mut std::ffi::c_void));
@@ -2332,7 +2341,7 @@ mod tests {
         let closure = LClosure {
             gc_header: GCObjectHeader::new(),
             proto: crate::func::new_proto(),
-            upvals: vec![],
+            upvals: Rc::new(RefCell::new(vec![])),
         };
         state.stack.clear();
         state.stack.push(TValue::LightUserData(DEBUG_GETUPVALUE as *mut std::ffi::c_void));
@@ -2527,9 +2536,9 @@ mod tests {
         let closure = LClosure {
             gc_header: GCObjectHeader::new(),
             proto: crate::func::new_proto(),
-            upvals: vec![Rc::new(RefCell::new(UpVal::Closed {
+            upvals: Rc::new(RefCell::new(vec![Rc::new(RefCell::new(UpVal::Closed {
                 value: Box::new(TValue::Integer(42)),
-            }))],
+            }))])),
         };
         state.stack.clear();
         state.stack.push(TValue::LightUserData(DEBUG_UPVALUEID as *mut std::ffi::c_void));
@@ -2546,7 +2555,7 @@ mod tests {
         let closure = LClosure {
             gc_header: GCObjectHeader::new(),
             proto: crate::func::new_proto(),
-            upvals: vec![],
+            upvals: Rc::new(RefCell::new(vec![])),
         };
         state.stack.clear();
         state.stack.push(TValue::LightUserData(DEBUG_UPVALUEID as *mut std::ffi::c_void));

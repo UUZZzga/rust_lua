@@ -1,5 +1,14 @@
 use crate::state::LuaState;
 
+/// 词法分析器使用的 EOF 标记字符。
+///
+/// 对应 C 中的 EOZ (-1)。C 的 `ls->current` 是 int 类型,可以区分 \0 (0) 和 EOZ (-1)。
+/// Rust 中 `char` 不能为 -1,因此使用 Unicode 最大码点 U+10FFFF 作为 sentinel。
+/// 该字符不会出现在合法的 Lua 源码中 (它不属于任何 Lua 标识符、字符串字面量或
+/// 转义序列),因此可安全地用作 EOF 标记,让源码中真正的 \0 字节 (如 reader 函数
+/// 模式下读到的字节流) 能被词法分析器正确处理。
+pub const EOF_CHAR: char = '\u{10FFFF}';
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     // Keywords
@@ -50,13 +59,89 @@ impl Token {
             _ => None,
         }
     }
+
+    /// 将 token 转换为可读字符串，对应 C 的 `txtToken` + `luaX_token2str`。
+    ///
+    /// 用于错误消息中显示当前 token (如 `"unexpected symbol near '%s'"`)。
+    /// - Name/String/Int/Float: 返回 `"'<value>'"` (带引号)
+    /// - Eof: 返回 `"<eof>"`
+    /// - 关键字/符号: 返回 `"'<name>'"` (如 `"'and'"`, `"'//'"`)
+    pub fn to_display_str(&self) -> String {
+        match self {
+            Token::Name(s) => format!("'{}'", s),
+            Token::String(s) => format!("'{}'", s),
+            Token::Int(n) => format!("'{}'", n),
+            Token::Float(f) => format!("'{}'", f),
+            Token::Eof => "<eof>".to_string(),
+            // 关键字
+            Token::And => "'and'".to_string(),
+            Token::Break => "'break'".to_string(),
+            Token::Do => "'do'".to_string(),
+            Token::Else => "'else'".to_string(),
+            Token::Elseif => "'elseif'".to_string(),
+            Token::End => "'end'".to_string(),
+            Token::False => "'false'".to_string(),
+            Token::For => "'for'".to_string(),
+            Token::Function => "'function'".to_string(),
+            Token::Goto => "'goto'".to_string(),
+            Token::If => "'if'".to_string(),
+            Token::In => "'in'".to_string(),
+            Token::Local => "'local'".to_string(),
+            Token::Nil => "'nil'".to_string(),
+            Token::Not => "'not'".to_string(),
+            Token::Or => "'or'".to_string(),
+            Token::Repeat => "'repeat'".to_string(),
+            Token::Return => "'return'".to_string(),
+            Token::Then => "'then'".to_string(),
+            Token::True => "'true'".to_string(),
+            Token::Until => "'until'".to_string(),
+            Token::While => "'while'".to_string(),
+            // 符号
+            Token::Plus => "'+'".to_string(),
+            Token::Minus => "'-'".to_string(),
+            Token::Star => "'*'".to_string(),
+            Token::Slash => "'/'".to_string(),
+            Token::Percent => "'%'".to_string(),
+            Token::Caret => "'^'".to_string(),
+            Token::Hash => "'#'".to_string(),
+            Token::Ampersand => "'&'".to_string(),
+            Token::Tilde => "'~'".to_string(),
+            Token::Pipe => "'|'".to_string(),
+            Token::LtLt => "'<<'".to_string(),
+            Token::GtGt => "'>>'".to_string(),
+            Token::SlashSlash => "'//'".to_string(),
+            Token::EqEq => "'=='".to_string(),
+            Token::TildeEq => "'~='".to_string(),
+            Token::LtEq => "'<='".to_string(),
+            Token::GtEq => "'>='".to_string(),
+            Token::Lt => "'<'".to_string(),
+            Token::Gt => "'>'".to_string(),
+            Token::Eq => "'='".to_string(),
+            Token::LParen => "'('".to_string(),
+            Token::RParen => "')'".to_string(),
+            Token::LBrace => "'{'".to_string(),
+            Token::RBrace => "'}'".to_string(),
+            Token::LBracket => "'['".to_string(),
+            Token::RBracket => "']'".to_string(),
+            Token::ColonColon => "'::'".to_string(),
+            Token::Dot => "'.'".to_string(),
+            Token::DotDot => "'..'".to_string(),
+            Token::DotDotDot => "'...'".to_string(),
+            Token::Comma => "','".to_string(),
+            Token::Colon => "':'".to_string(),
+            Token::Semi => "';'".to_string(),
+        }
+    }
 }
 
 /// 从字节切片的指定位置安全地读取一个字符。
 /// 无效 UTF-8 字节按单字节处理 (作为 Latin-1 字符),对应 C 版本按字节读取源码的行为。
+///
+/// pos 越界时返回 `EOF_CHAR` (而非 '\0'),以便区分源码中的真实 \0 字节与 EOF。
+/// (C 版本用 int 的 -1 表示 EOZ; Rust 中用 U+10FFFF sentinel。)
 fn read_char_at(bytes: &[u8], pos: usize) -> char {
     if pos >= bytes.len() {
-        return '\0';
+        return EOF_CHAR;
     }
     if bytes[pos] < 0x80 {
         return bytes[pos] as char;
@@ -153,7 +238,7 @@ impl<'a> LexState<'a> {
                             continue;
                         }
                     }
-                    while self.current != '\n' && self.current != '\0' {
+                    while self.current != '\n' && self.current != EOF_CHAR {
                         self.next_char();
                     }
                 }
@@ -175,7 +260,7 @@ impl<'a> LexState<'a> {
         self.next_char();
         loop {
             match self.current {
-                '\0' => {
+                EOF_CHAR => {
                     self.error("unfinished long comment");
                     return;
                 }
@@ -221,7 +306,7 @@ impl<'a> LexState<'a> {
     fn read_token(&mut self) {
         self.skip_whitespace();
         match self.current {
-            '\0' => self.token = Token::Eof,
+            EOF_CHAR => self.token = Token::Eof,
             '+' => { self.token = Token::Plus; self.next_char(); }
             '*' => { self.token = Token::Star; self.next_char(); }
             '%' => { self.token = Token::Percent; self.next_char(); }
@@ -459,7 +544,7 @@ impl<'a> LexState<'a> {
         let mut s = String::new();
         loop {
             match self.current {
-                '\0' | '\n' => {
+                EOF_CHAR | '\n' => {
                     self.error("unfinished string");
                     break;
                 }
@@ -593,7 +678,7 @@ impl<'a> LexState<'a> {
         let start = self.pos;
         loop {
             match self.current {
-                '\0' => {
+                EOF_CHAR => {
                     self.error("unfinished long string");
                     break;
                 }

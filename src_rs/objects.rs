@@ -581,8 +581,12 @@ pub struct LClosure {
     pub gc_header: GCObjectHeader,
     /// 函数原型
     pub proto: Proto,
-    /// 上值列表（共享引用，多个闭包可共享同一个 UpVal）
-    pub upvals: Vec<UpValRef>,
+    /// 上值列表（共享引用，多个闭包可共享同一个 UpVal）。
+    ///
+    /// 使用 Rc<RefCell<Vec>> 包装，使 LClosure clone 时所有副本共享同一个 upvals Vec。
+    /// 这样 debug.upvaluejoin 修改栈上副本的 upvals 会影响所有共享同一 Rc 的闭包
+    /// （对应 C 中 Closure 是堆分配对象、栈上存 Closure* 指针的语义）。
+    pub upvals: Rc<RefCell<Vec<UpValRef>>>,
 }
 
 /// C 闭包 —— C 函数 + 捕获的上值

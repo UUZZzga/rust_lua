@@ -23,7 +23,7 @@ use crate::tm::{
 use crate::vm::{to_number_ns, to_integer_ns, F2IMode, shiftl, is_false,
     concat_stack, raw_equal, float_to_integer,
     modulus, modulus_float, idiv};
-use crate::state::{LuaState, LUA_MINSTACK};
+use crate::state::{LuaState, LUA_MINSTACK, MAX_CALL_CHAIN};
 use crate::gc::GCState;
 use std::rc::Rc;
 use std::cell::RefCell;
@@ -720,7 +720,7 @@ impl VmExecutor {
                         state.proto_flag = proto_flag;
                         state.nextraargs = 0;
                         // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
-                        state.closure_upvals = closure.upvals.clone();
+                        state.closure_upvals = closure.upvals.borrow().clone();
                         state.tbc_list = None;
                         state.open_upval = None;
 
@@ -2366,29 +2366,41 @@ impl VmExecutor {
         let c = opcodes::getarg_c(inst) as i32;
         let mut func_val = Self::read_stack(state, a).clone();
 
-        // __call 元方法支持 — 对应 C 的 luaT_tryfuncTM
-        // 当非函数值被调用时,检查其元表的 __call 元方法
-        // 如果存在,将 __call 函数插入到栈位置 a,原值和参数右移 1 位
-        // 调用变为 __call(original_value, original_args...)
-        if let TValue::Table(ref t) = func_val {
-            if let Some(mt) = t.get_metatable() {
-                let call_key = TValue::Str(state.intern_str("__call"));
-                if let Some(call_fn) = mt.get(&call_key) {
+        // __call 元方法支持 — 对应 C 的 luaT_tryfuncTM + precall 的 goto retry
+        // 循环处理 __call 链:当 __call 元方法本身也是表时,继续查找其 __call,
+        // 直到找到真正的可调用对象 (LClosure/LCFn/CClosure/LightUserData)。
+        // 对应 C precall 中的 default 分支: func = luaT_tryfuncTM(L, func); goto retry;
+        // MAX_CCMT = 0xf (15): 对应 C 的 4 位计数器,超过 15 层时报 "too long"
+        let mut chain_len: usize = 0;
+        loop {
+            if let TValue::Table(ref t) = func_val {
+                let mt_opt = t.get_metatable();
+                let call_fn = mt_opt.as_ref().and_then(|mt| {
+                    let call_key = TValue::Str(state.intern_str("__call"));
+                    mt.get(&call_key)
+                });
+                if let Some(call_fn) = call_fn {
                     // 对应 C: for (st = L->top; st > func; st--) setobj(st, st-1);
                     // 在位置 a 插入 __call 函数,原 table 和所有参数右移 1 位
+                    // 调用变为 __call(original_value, original_args...)
                     state.stack.insert(a, call_fn.clone());
                     // b 增加 1 以反映额外的 self 参数 (MULTRET 时 b=0 不变,
                     // nargs 从 stack.len() 计算,自动包含额外元素)
                     if b > 0 { b += 1; }
+                    // 对应 C: if ((status & MAX_CCMT) == MAX_CCMT) luaG_runerror(...)
+                    if chain_len >= MAX_CALL_CHAIN {
+                        return Err(VmError::RuntimeError(
+                            "'__call' chain too long".to_string(),
+                        ));
+                    }
+                    chain_len += 1;
                     func_val = call_fn;
-                } else {
-                    let type_name = state.typename(func_val.ty());
-                    return Err(VmError::RuntimeError(format!("attempt to call a {} value", type_name)));
+                    continue;  // 对应 C 的 goto retry
                 }
-            } else {
                 let type_name = state.typename(func_val.ty());
                 return Err(VmError::RuntimeError(format!("attempt to call a {} value", type_name)));
             }
+            break;
         }
 
         match func_val {
@@ -2463,7 +2475,7 @@ impl VmExecutor {
                 state.proto_flag = closure.proto.flag;
                 state.nextraargs = 0;
                 // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
-                state.closure_upvals = closure.upvals;
+                state.closure_upvals = closure.upvals.borrow().clone();
                 state.tbc_list = None;
                 state.open_upval = None;
                 // 对应 C 的 luaD_hookcall: L->oldpc = 0
@@ -2716,8 +2728,47 @@ impl VmExecutor {
 
     fn op_tailcall(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
-        let b = opcodes::getarg_b(inst) as usize;
-        let func_val = Self::read_stack(state, a).clone();
+        let mut b = opcodes::getarg_b(inst) as usize;
+        let mut func_val = Self::read_stack(state, a).clone();
+
+        // 对应 C 的 OP_TAILCALL: if (TESTARG_k(i)) luaF_closeupval(L, base);
+        // K 标志位表示可能有 open upvalues,必须在移动栈数据之前关闭,
+        // 否则 open upvalue 指向的栈位置会被覆盖,导致 upvalue 值错误
+        // (如 Z combinator 中 a 的 upvalue le 被尾调用的参数覆盖)
+        if opcodes::testarg_k(inst) {
+            crate::func::close(state, state.base, 0, 0);
+        }
+
+        // __call 元方法支持 — 对应 C 的 luaT_tryfuncTM + precall 的 goto retry
+        // (同 op_call 的处理,循环解析 __call 链,处理嵌套 __call 表)
+        // MAX_CCMT = 0xf (15): 对应 C 的 4 位计数器,超过 15 层时报 "too long"
+        let mut chain_len: usize = 0;
+        loop {
+            if let TValue::Table(ref t) = func_val {
+                let mt_opt = t.get_metatable();
+                let call_fn = mt_opt.as_ref().and_then(|mt| {
+                    let call_key = TValue::Str(state.intern_str("__call"));
+                    mt.get(&call_key)
+                });
+                if let Some(call_fn) = call_fn {
+                    state.stack.insert(a, call_fn.clone());
+                    if b > 0 { b += 1; }
+                    // 对应 C: if ((status & MAX_CCMT) == MAX_CCMT) luaG_runerror(...)
+                    if chain_len >= MAX_CALL_CHAIN {
+                        return Err(VmError::RuntimeError(
+                            "'__call' chain too long".to_string(),
+                        ));
+                    }
+                    chain_len += 1;
+                    func_val = call_fn;
+                    continue;
+                }
+                let type_name = state.typename(func_val.ty());
+                return Err(VmError::RuntimeError(format!("attempt to call a {} value", type_name)));
+            }
+            break;
+        }
+
         match func_val {
             TValue::LClosure(closure) => {
                 let nargs_total = state.stack.len().saturating_sub(a);
@@ -2745,7 +2796,7 @@ impl VmExecutor {
                 state.proto_flag = closure.proto.flag;
                 state.nextraargs = 0;
                 // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
-                state.closure_upvals = closure.upvals;
+                state.closure_upvals = closure.upvals.borrow().clone();
                 state.tbc_list = None;
                 state.open_upval = None;
 
@@ -2757,6 +2808,12 @@ impl VmExecutor {
                     }
                 } else {
                     let frame_end = func_slot + 1 + fsize;
+                    // 对应 C 的 ci->top = ci->func.p + 1 + p->maxstacksize
+                    // 截断栈到帧末尾,丢弃尾调用遗留的额外元素
+                    // (如 __call 链产生的中间表),防止栈无限增长导致 O(n^2) 卡死
+                    if state.stack.len() > frame_end {
+                        state.stack.truncate(frame_end);
+                    }
                     while state.stack.len() < frame_end {
                         state.stack.push(TValue::Nil(NilKind::Strict));
                     }
@@ -3280,7 +3337,7 @@ impl VmExecutor {
                     })));
                 }
             }
-            let closure = LClosure { gc_header: crate::gc::GCObjectHeader::new(), proto, upvals };
+            let closure = LClosure { gc_header: crate::gc::GCObjectHeader::new(), proto, upvals: Rc::new(RefCell::new(upvals)) };
             Self::write_stack(state, ra, TValue::LClosure(closure));
         }
         state.pc += 1;
@@ -4389,7 +4446,7 @@ mod tests {
     fn test_execute_call_lua_closure() {
         // Create an inner proto that just returns 0
         let inner_proto = make_proto(vec![make_bx(OpCode::RETURN0, 0, 0)], vec![]);
-        let closure = LClosure { gc_header: GCObjectHeader::new(), proto: inner_proto, upvals: vec![] };
+        let closure = LClosure { gc_header: GCObjectHeader::new(), proto: inner_proto, upvals: Rc::new(RefCell::new(vec![])) };
 
         let mut stack = default_stack(10);
         stack[0] = TValue::LClosure(closure);
@@ -4402,7 +4459,7 @@ mod tests {
     #[test]
     fn test_execute_tailcall_lua_closure() {
         let inner_proto = make_proto(vec![make_bx(OpCode::RETURN0, 0, 0)], vec![]);
-        let closure = LClosure { gc_header: GCObjectHeader::new(), proto: inner_proto, upvals: vec![] };
+        let closure = LClosure { gc_header: GCObjectHeader::new(), proto: inner_proto, upvals: Rc::new(RefCell::new(vec![])) };
 
         let mut stack = default_stack(10);
         stack[0] = TValue::LClosure(closure);

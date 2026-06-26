@@ -1138,13 +1138,13 @@ pub fn push_closure(
     let closure = crate::objects::LClosure {
         gc_header: crate::gc::GCObjectHeader::new(),
         proto: proto.clone(),
-        upvals,
+        upvals: Rc::new(RefCell::new(upvals)),
     };
     closure.gc_header.set_id(closure_id);
 
     // GC barrier (luaC_objbarrier): for each upvalue, if closure is black
     // and upvalue value is a white GC object, make it gray
-    for uv in &closure.upvals {
+    for uv in closure.upvals.borrow().iter() {
         let uv_ref = uv.borrow();
         match &*uv_ref {
             UpVal::Closed { value } => {
@@ -2355,7 +2355,7 @@ use crate::strings::{LuaString, StringTable};
         push_closure(&mut stack, &proto, &[], 0, 3, &make_gc());
         match &stack[3] {
             TValue::LClosure(c) => {
-                assert_eq!(c.upvals.len(), 1);
+                assert_eq!(c.upvals.borrow().len(), 1);
             }
             _ => panic!("Expected LClosure"),
         }

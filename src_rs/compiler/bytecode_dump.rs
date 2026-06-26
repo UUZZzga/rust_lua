@@ -57,6 +57,8 @@ struct BytecodeReader {
     data: Vec<u8>,
     pos: usize,
     strings: Vec<String>,
+    /// 截断错误标志 — 对应 C 的 error(S, "truncated chunk")
+    error: Option<String>,
 }
 
 impl BytecodeReader {
@@ -65,19 +67,42 @@ impl BytecodeReader {
             data,
             pos: 0,
             strings: Vec::new(),
+            error: None,
         }
     }
 
     fn read_byte(&mut self) -> u8 {
+        if self.error.is_some() {
+            return 0;
+        }
+        if self.pos >= self.data.len() {
+            self.error = Some("truncated chunk".to_string());
+            return 0;
+        }
         let b = self.data[self.pos];
         self.pos += 1;
         b
     }
 
     fn read_bytes(&mut self, n: usize) -> &[u8] {
+        if self.error.is_some() {
+            return &[];
+        }
+        if self.pos + n > self.data.len() {
+            self.error = Some("truncated chunk".to_string());
+            return &[];
+        }
         let slice = &self.data[self.pos..self.pos + n];
         self.pos += n;
         slice
+    }
+
+    /// 检查截断错误 — 在 header 校验前调用, 对应 C 的 loadBlock 失败时的 error(S, "truncated chunk")
+    fn check(&self) -> Result<(), String> {
+        if let Some(ref err) = self.error {
+            return Err(err.clone());
+        }
+        Ok(())
     }
 
     fn read_varint(&mut self) -> u64 {
@@ -111,6 +136,9 @@ impl BytecodeReader {
 
     fn read_float(&mut self) -> f64 {
         let bytes = self.read_bytes(8);
+        if bytes.len() < 8 {
+            return 0.0;
+        }
         let mut arr = [0u8; 8];
         arr.copy_from_slice(bytes);
         f64::from_le_bytes(arr)
@@ -128,9 +156,17 @@ impl BytecodeReader {
             if idx == 0 {
                 return String::new();
             }
-            return self.strings[(idx - 1) as usize].clone();
+            let idx = (idx - 1) as usize;
+            if idx >= self.strings.len() {
+                self.error = Some("truncated chunk".to_string());
+                return String::new();
+            }
+            return self.strings[idx].clone();
         }
-        let bytes = self.read_bytes(size);
+        let bytes = self.read_bytes(size).to_vec();
+        if bytes.is_empty() && self.error.is_some() {
+            return String::new();
+        }
         let len = if bytes.last() == Some(&0) { size - 1 } else { size };
         let s = String::from_utf8_lossy(&bytes[..len]).to_string();
         self.strings.push(s.clone());
@@ -157,7 +193,10 @@ impl BytecodeReader {
         self.align(4);
         let mut code = Vec::with_capacity(sizecode);
         for _i in 0..sizecode {
-            let bytes = self.read_bytes(4);
+            let bytes = self.read_bytes(4).to_vec();
+            if bytes.len() < 4 {
+                return code;
+            }
             let raw = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
             code.push(self.read_instruction(raw));
         }
@@ -300,25 +339,98 @@ pub fn parse_dump(data: Vec<u8>) -> Result<DumpedFunction, String> {
     let mut reader = BytecodeReader::new(data);
 
     if reader.data.len() < 12 {
-        return Err("dump too short".to_string());
+        return Err("truncated chunk".to_string());
     }
 
-    let sig = reader.read_bytes(4);
+    // 校验签名 \x1bLua — 对应 C 的 checkliteral(LUA_SIGNATURE)
+    let sig = reader.read_bytes(4).to_vec();
+    reader.check()?;
     if sig != b"\x1bLua" {
-        return Err("bad signature".to_string());
+        return Err("not a binary chunk".to_string());
     }
 
-    let _version = reader.read_byte();
-    let _format = reader.read_byte();
-    let _luac_data = reader.read_bytes(6);
+    // 校验版本号 — 对应 C 的 LUAC_VERSION (5.5 = 0x55)
+    let version = reader.read_byte();
+    reader.check()?;
+    if version != 0x55 {
+        return Err("version mismatch".to_string());
+    }
 
-    reader.read_num_info_int();
-    reader.read_num_info_inst();
-    reader.read_num_info_integer();
-    reader.read_num_info_number();
+    // 校验格式 — 对应 C 的 LUAC_FORMAT = 0
+    let format = reader.read_byte();
+    reader.check()?;
+    if format != 0 {
+        return Err("format mismatch".to_string());
+    }
+
+    // 校验 LUAC_DATA — 对应 C 的 checkliteral(LUAC_DATA, "corrupted chunk")
+    let luac_data = reader.read_bytes(6).to_vec();
+    reader.check()?;
+    if luac_data != b"\x19\x93\r\n\x1a\n" {
+        return Err("corrupted chunk".to_string());
+    }
+
+    // 校验 int: size=4, value=-0x5678 (i32) — 对应 C 的 checknum(int, LUAC_INT)
+    let int_size = reader.read_byte();
+    reader.check()?;
+    if int_size as usize != std::mem::size_of::<i32>() {
+        return Err("int size mismatch".to_string());
+    }
+    let int_val_bytes = reader.read_bytes(4).to_vec();
+    reader.check()?;
+    let int_val = i32::from_ne_bytes([int_val_bytes[0], int_val_bytes[1], int_val_bytes[2], int_val_bytes[3]]);
+    if int_val != -0x5678 {
+        return Err("int format mismatch".to_string());
+    }
+
+    // 校验 Instruction: size=4, value=0x12345678 (u32) — 对应 C 的 checknum(Instruction, LUAC_INST)
+    let inst_size = reader.read_byte();
+    reader.check()?;
+    if inst_size as usize != std::mem::size_of::<u32>() {
+        return Err("instruction size mismatch".to_string());
+    }
+    let inst_val_bytes = reader.read_bytes(4).to_vec();
+    reader.check()?;
+    let inst_val = u32::from_ne_bytes([inst_val_bytes[0], inst_val_bytes[1], inst_val_bytes[2], inst_val_bytes[3]]);
+    if inst_val != 0x12345678 {
+        return Err("instruction format mismatch".to_string());
+    }
+
+    // 校验 lua_Integer: size=8, value=-0x5678 (i64) — 对应 C 的 checknum(lua_Integer, LUAC_INT)
+    let integer_size = reader.read_byte();
+    reader.check()?;
+    if integer_size as usize != std::mem::size_of::<i64>() {
+        return Err("Lua integer size mismatch".to_string());
+    }
+    let integer_val_bytes = reader.read_bytes(8).to_vec();
+    reader.check()?;
+    let integer_val = i64::from_ne_bytes([
+        integer_val_bytes[0], integer_val_bytes[1], integer_val_bytes[2], integer_val_bytes[3],
+        integer_val_bytes[4], integer_val_bytes[5], integer_val_bytes[6], integer_val_bytes[7],
+    ]);
+    if integer_val != -0x5678 {
+        return Err("Lua integer format mismatch".to_string());
+    }
+
+    // 校验 lua_Number: size=8, value=-370.5 (f64) — 对应 C 的 checknum(lua_Number, LUAC_NUM)
+    // 注意: 浮点数的内部表示可能有 padding（long double 情况），所以只校验 size
+    // 对应 calls.lua:524: headlen = headlen - string.packsize("n")  -- remove float check
+    let number_size = reader.read_byte();
+    reader.check()?;
+    if number_size as usize != std::mem::size_of::<f64>() {
+        return Err("Lua number size mismatch".to_string());
+    }
+    // 读取但不严格校验 value（对应 C 中 long double padding 的容忍）
+    let _number_val_bytes = reader.read_bytes(number_size as usize).to_vec();
+    reader.check()?;
 
     let _num_upvalues = reader.read_byte();
     let func = reader.read_function();
+
+    // 检查截断错误 — 对应 C 中 loadBlock/loadByte 遇到 EOZ 时的 "truncated chunk"
+    if let Some(err) = reader.error {
+        return Err(err);
+    }
 
     Ok(func)
 }

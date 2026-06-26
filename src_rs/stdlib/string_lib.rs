@@ -230,7 +230,12 @@ pub fn str_sub(s: &str, start: i64, end: i64) -> String {
         // start_pos >= 1 (由 posrelat_i 保证), 所以 start_pos - 1 不会下溢
         // end_pos <= len (由 get_end_pos 保证), 所以切片不会越界
         // 当 start_pos <= end_pos 时, start_pos <= len (因 end_pos <= len)
-        s[start_pos - 1..end_pos].to_string()
+        //
+        // 按字节切片 (Lua 的 string.sub 是字节级操作, 不关心 UTF-8 字符边界)。
+        // 对应 C 中按字节截取的行为。使用 unsafe 构造 String 以保留原始字节,
+        // 与 str_reverse/str_char 等函数一致。
+        let bytes = s.as_bytes()[start_pos - 1..end_pos].to_vec();
+        unsafe { String::from_utf8_unchecked(bytes) }
     } else {
         String::new()
     }

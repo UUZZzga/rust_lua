@@ -632,13 +632,18 @@ fn call_getmetatable(
 }
 
 /// type(v) — 对应 C 的 luaB_type
-fn call_type(state: &mut LuaState, a: usize, _nargs: usize, nresults: i32) -> Result<(), VmError> {
-    let arg = get_arg(state, a, 0);
-    if matches!(arg, TValue::Nil(NilKind::Empty)) {
+///
+/// C 实现使用 luaL_argcheck(L, t != LUA_TNONE, 1, "value expected"):
+/// 当参数缺失时 lua_type 返回 LUA_TNONE,从而报错;
+/// 显式传入 nil 时返回 LUA_TNIL,正常返回 "nil"。
+/// 这里用 nargs == 0 区分“参数缺失”与“显式 nil”。
+fn call_type(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+    if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'type' (value expected)".to_string(),
         ));
     }
+    let arg = get_arg(state, a, 0);
     let name = base_type_name(&arg);
     let result = TValue::Str(state.intern_str(name));
     push_single_result(state, a, nresults, result);
@@ -1151,12 +1156,11 @@ fn call_xpcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
                 results.push(state.stack[a + i].clone());
             }
         } else {
-            // 错误处理函数本身出错
-            if handler_nret > 0 {
-                results.push(state.stack[a].clone());
-            } else {
-                results.push(TValue::Nil(NilKind::Strict));
-            }
+            // 错误处理函数本身出错 — 对应 C 的 luaD_errerr:
+            // 消息处理器失败时,不能再递归调用处理器,直接返回
+            // "error in error handling" 作为最终错误消息。
+            // 这保证 calls.lua:168 的 string.find(msg, "error") 能匹配。
+            results.push(TValue::Str(state.intern_str("error in error handling")));
         }
     }
 
@@ -1273,10 +1277,22 @@ fn call_require(
     }
 }
 
-/// load(chunk [, chunkname [, mode [, env]]]) — 对应 C 的 lua_load
+/// load(chunk [, chunkname [, mode [, env]]]) — 对应 C 的 luaB_load + lua_load
 ///
-/// 加载并编译 Lua 代码块, 返回编译后的函数
-/// 支持文本和二进制格式 (检测 \x1bLua 签名)
+/// 加载并编译 Lua 代码块, 返回编译后的函数。
+/// 支持两种 chunk 形式:
+/// 1. 字符串 chunk — 直接编译字符串内容
+/// 2. reader 函数 — 反复调用 reader() 直到返回 nil, 累积返回的字符串
+///
+/// mode 参数控制允许的格式:
+/// - "t": 仅文本
+/// - "b": 仅二进制
+/// - "bt" 或缺省: 两者皆可
+///
+/// env 参数 (第 4 个) 作为加载函数的 _ENV 上值; 缺省时使用当前全局表。
+///
+/// 错误处理: 编译失败或 reader 抛错时返回 (nil, error_msg), 不向上抛错
+/// (对应 C 的 load_aux 中 status != LUA_OK 的分支)。
 fn call_load(
     state: &mut LuaState,
     a: usize,
@@ -1290,31 +1306,168 @@ fn call_load(
     }
 
     let chunk_val = get_arg(state, a, 0);
-    let source = match &chunk_val {
-        TValue::Str(s) => s.as_str().to_string(),
-        _ => {
-            return Err(VmError::RuntimeError(format!(
-                "bad argument #1 to 'load' (string expected, got {})",
-                chunk_val.ty()
-            )));
-        }
-    };
 
-    // 获取可选的 chunkname 参数
-    // 对应 C 的 luaL_optstring(L, 2, c) — 未提供时默认为源代码字符串
+    // 获取可选的 chunkname 参数 (第 2 个)
+    // 字符串 chunk 缺省时用 chunk 内容作为 chunkname (对应 C 的 luaL_optstring(L, 2, s))
+    // reader 模式缺省时用 "=(load)" (对应 C 的 luaL_optstring(L, 2, "=(load)"))
+    let is_string_chunk = matches!(chunk_val, TValue::Str(_));
+    let default_chunkname = if is_string_chunk {
+        match &chunk_val {
+            TValue::Str(s) => s.as_str().to_string(),
+            _ => unreachable!(),
+        }
+    } else {
+        "=(load)".to_string()
+    };
     let chunkname = if nargs >= 2 {
         let name_val = get_arg(state, a, 1);
         match &name_val {
             TValue::Str(s) => s.as_str().to_string(),
-            TValue::Nil(_) => source.clone(),
-            _ => source.clone(),
+            TValue::Nil(_) => default_chunkname.clone(),
+            _ => default_chunkname.clone(),
         }
     } else {
-        source.clone()
+        default_chunkname.clone()
     };
 
-    // 检测二进制格式 (以 \x1bLua 开头)
-    let is_binary = source.as_bytes().starts_with(b"\x1bLua");
+    // 获取 mode 参数 (第 3 个) — "t" / "b" / "bt" / nil
+    let mode: Option<String> = if nargs >= 3 {
+        let mode_val = get_arg(state, a, 2);
+        match &mode_val {
+            TValue::Str(s) => Some(s.as_str().to_string()),
+            TValue::Nil(_) => None,
+            _ => None,
+        }
+    } else {
+        None
+    };
+
+    // 获取 env 参数 (第 4 个) — 用作加载函数的第 1 个上值
+    //
+    // 对应 C 的 luaB_load 中 `int env = (!lua_isnone(L, 4) ? 4 : 0);`
+    // 以及 load_aux 中 `if (envidx) lua_setupvalue(L, -2, 1);`:
+    //   - nargs < 4 (env 缺省): envidx = 0, 不调用 lua_setupvalue;
+    //     但 lua_load 内部仍会把第 1 个上值设为全局表 (_ENV 行为)。
+    //     → 用全局表
+    //   - nargs >= 4 且 env == nil: envidx = 4, lua_setupvalue 设第 1 个上值为 nil
+    //     → 用 nil (覆盖 lua_load 设置的全局表)
+    //   - nargs >= 4 且 env 非 nil: 用 env
+    let env_val = if nargs >= 4 {
+        get_arg(state, a, 3)  // 即使是 nil 也直接用 (不替换为全局表)
+    } else {
+        TValue::Table(state.globals.clone())
+    };
+
+    // 根据 chunk 类型获取源代码字符串
+    // 对应 C 的 luaB_load 中 s = lua_tolstring(L, 1, &l) 的判断
+    let source_result: Result<String, String> = match &chunk_val {
+        TValue::Str(s) => Ok(s.as_str().to_string()),
+        TValue::LClosure(_) => {
+            // reader 函数模式: 循环调用 reader() 累积字符串
+            // 对应 C 的 generic_reader + luaZ_fill 的循环
+            // EOF 条件: reader 返回 nil (对应 C 的 lua_isnil → NULL)
+            //         或返回空字符串 "" (对应 C 的 size==0 → EOZ)
+            let mut buffer = String::new();
+            loop {
+                // 推入 reader function 到栈顶
+                // 对应 C 的 lua_pushvalue(L, 1); lua_call(L, 0, 1);
+                let saved_len = state.stack.len();
+                state.stack.push(chunk_val.clone());
+                let status = state.pcall(0, 1, 0);
+                if status != 0 {
+                    // reader 抛错: 对应 C 的 luaD_protectedparser 捕获 generic_reader
+                    // 中的 luaL_error — load 返回 (nil, error_msg), 不向上抛
+                    // pcall 失败后栈顶是错误消息字符串
+                    let err_msg = if saved_len < state.stack.len() {
+                        match &state.stack[saved_len] {
+                            TValue::Str(s) => s.as_str().to_string(),
+                            _ => "reader function must return a string".to_string(),
+                        }
+                    } else {
+                        "reader function must return a string".to_string()
+                    };
+                    state.stack.truncate(saved_len);
+                    // load_aux 返回 (nil, error_msg)
+                    push_results(state, a, nresults, vec![
+                        TValue::Nil(NilKind::Strict),
+                        TValue::Str(state.intern_str(&err_msg)),
+                    ]);
+                    return Ok(());
+                }
+                // pcall 成功: 栈顶是 reader 返回值
+                let result = if saved_len < state.stack.len() {
+                    state.stack[saved_len].clone()
+                } else {
+                    TValue::Nil(NilKind::Strict)
+                };
+                state.stack.truncate(saved_len);
+                match &result {
+                    TValue::Nil(_) => break, // reader 返回 nil: 结束 (C: NULL)
+                    TValue::Str(s) => {
+                        // reader 返回字符串: 检查长度
+                        // 对应 C 的 luaZ_fill: if (size == 0) return EOZ;
+                        if s.as_str().is_empty() {
+                            break; // 空字符串视为 EOF
+                        }
+                        buffer.push_str(s.as_str());
+                    }
+                    _ => {
+                        // reader 返回非字符串非 nil: 对应 C 的 luaL_error
+                        // 但 lua_load 内部保护模式会捕获, 返回 (nil, error_msg)
+                        let err_msg = "reader function must return a string".to_string();
+                        push_results(state, a, nresults, vec![
+                            TValue::Nil(NilKind::Strict),
+                            TValue::Str(state.intern_str(&err_msg)),
+                        ]);
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(buffer)
+        }
+        _ => Err(format!(
+            "bad argument #1 to 'load' (string or function expected, got {})",
+            chunk_val.ty()
+        )),
+    };
+
+    let source = match source_result {
+        Ok(s) => s,
+        Err(err_msg) => {
+            return Err(VmError::RuntimeError(err_msg));
+        }
+    };
+
+    // 检测二进制格式 (仅检查首字节 \x1b, 对应 C 的 f_parser: c == LUA_SIGNATURE[0])
+    // 完整签名校验由 parse_dump 的 checkHeader 负责
+    let is_binary = source.as_bytes().first().copied() == Some(0x1b);
+
+    // mode 检查 (对应 C 的 getMode + lua_load 的 mode 参数)
+    let mode_str = mode.as_deref();
+    let allows_text = match mode_str {
+        None => true,
+        Some(m) => m.contains('t') || (!m.contains('b') && !m.contains('t')),
+    };
+    let allows_binary = match mode_str {
+        None => true,
+        Some(m) => m.contains('b'),
+    };
+    if is_binary && !allows_binary {
+        // 二进制但 mode 不允许 (mode = "t")
+        push_results(state, a, nresults, vec![
+            TValue::Nil(NilKind::Strict),
+            TValue::Str(state.intern_str("attempt to load a binary chunk (mode is 'text')")),
+        ]);
+        return Ok(());
+    }
+    if !is_binary && !allows_text {
+        // 文本但 mode 不允许 (mode = "b")
+        push_results(state, a, nresults, vec![
+            TValue::Nil(NilKind::Strict),
+            TValue::Str(state.intern_str("attempt to load a text chunk (mode is 'binary')")),
+        ]);
+        return Ok(());
+    }
 
     let proto_result = if is_binary {
         // 二进制格式: 使用 undump
@@ -1327,7 +1480,7 @@ fn call_load(
 
     match proto_result {
         Ok(mut proto) => {
-            // 创建闭包, 设置 _ENV 上值为全局表
+            // 创建闭包, 设置 _ENV 上值为 env 参数 (缺省为全局表)
             let nup = proto.size_upvalues as usize;
             // 二进制加载的 proto 中字符串常量是 LongString, 需要驻留化为 ShortString
             // 以便与全局表中的 ShortString 键匹配 (Short vs Long 的 Hash/PartialEq 不一致)
@@ -1336,7 +1489,7 @@ fn call_load(
             }
             let mut upvals: Vec<UpValRef> = Vec::with_capacity(nup.max(1));
             upvals.push(std::rc::Rc::new(std::cell::RefCell::new(UpVal::Closed {
-                value: Box::new(TValue::Table(state.globals.clone())),
+                value: Box::new(env_val),
             })));
             for _ in 1..nup {
                 upvals.push(std::rc::Rc::new(std::cell::RefCell::new(UpVal::Closed {
@@ -1346,13 +1499,13 @@ fn call_load(
             let closure = LClosure {
                 gc_header: GCObjectHeader::new(),
                 proto,
-                upvals,
+                upvals: std::rc::Rc::new(std::cell::RefCell::new(upvals)),
             };
             push_results(state, a, nresults, vec![TValue::LClosure(closure)]);
             Ok(())
         }
         Err(err_msg) => {
-            // 编译失败: 返回 nil + 错误消息
+            // 编译失败: 返回 nil + 错误消息 (对应 C 的 load_aux 失败分支)
             push_results(state, a, nresults, vec![
                 TValue::Nil(NilKind::Strict),
                 TValue::Str(state.intern_str(&err_msg)),

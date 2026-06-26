@@ -423,8 +423,12 @@ pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
     parse_chunk(&mut fs);
     close_func(&mut fs);
 
-    if !fs.errors.is_empty() {
-        return Err(fs.errors.join("\n"));
+    // 合并 FuncState 的错误和 LexState 的错误 (如 lexer 遇到非法字符)
+    // 对应 C 的 luaY_parser 中 check errors
+    let mut all_errors = std::mem::take(&mut fs.errors);
+    all_errors.extend(fs.ls_mut().errors.drain(..));
+    if !all_errors.is_empty() {
+        return Err(all_errors.join("\n"));
     }
 
     let mut proto = fs.proto;
@@ -1938,6 +1942,12 @@ impl<'a> FuncState<'a> {
     /// 生成 RETURN 指令: 像 C 的 luaK_ret 一样，仅根据 nret 选择 RETURN0/RETURN1/RETURN。
     /// needclose 和 PF_VAHID 的调整由 parse_chunk_finish() 统一处理。
     fn return_stat_gen(&mut self, first: i32, nret: i32) {
+        // 对应 C 的 luaY_checklimit(fs, nret + 1, MAXARG_B, "returns")
+        if nret + 1 > MAXARG_B as i32 {
+            let line = self.proto.line_defined;
+            let where_ = if line == 0 { "main function".to_string() } else { format!("function at line {}", line) };
+            self.error(&format!("too many returns (limit is {}) in {}", MAXARG_B, where_));
+        }
         match nret {
             0 => {
                 self.code_abc(OpCode::RETURN0, first, 1, 0);
@@ -2261,7 +2271,7 @@ fn test_next(fs: &mut FuncState, t: &Token) -> bool {
 /// ANTLR4: 终端匹配断言 — 期望当前 token 匹配，否则报错并跳过
 fn expect(fs: &mut FuncState, t: &Token) {
     if !check(fs, t) {
-        fs.error(&format!("expected {:?}, got {:?}", t, fs.ls().token));
+        fs.error(&format!("{} expected", t.to_display_str()));
     } else {
         fs.ls_mut().next();
     }
@@ -2285,7 +2295,7 @@ fn get_name(fs: &mut FuncState) -> String {
             name
         }
         _ => {
-            fs.error(&format!("expected identifier {:?}", fs.ls().token));
+            fs.error(&format!("'name' expected near {}", fs.ls().token.to_display_str()));
             String::new()
         }
     }
@@ -3088,7 +3098,7 @@ fn parse_statement(fs: &mut FuncState) {
             None
         }
         _ => {
-            fs.error(&format!("unexpected token: {:?}", fs.ls().token));
+            fs.error(&format!("unexpected symbol near {}", fs.ls().token.to_display_str()));
             fs.ls_mut().next();
             None
         }
@@ -8539,7 +8549,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
             ExpDesc::new(ExpKind::Relocable, r as i64)
         }
         _ => {
-            fs.error(&format!("unexpected token in expression: {:?}", fs.ls().token));
+            fs.error(&format!("unexpected symbol near {}", fs.ls().token.to_display_str()));
             fs.ls_mut().next();
             ExpDesc::new(ExpKind::Nil, 0)
         }
