@@ -648,14 +648,42 @@ fn call_getinfo(
         info.isvararg = true;
         info.name = None;
         info.namewhat = String::new();
+        info.nups = 0;
+    } else if let TValue::Table(t) = &level_or_func {
+        // 可调用表 (带 __call 元方法的表)
         // string.gmatch 返回的迭代器在 C 中是带 3 个上值的 C 闭包
-        // (字符串、模式、userdata 状态)，这里报告 nups = 3 以匹配 C 行为
-        if let TValue::LightUserData(p) = &level_or_func {
-            let tag = *p as usize;
-            if tag == crate::stdlib::string_lib::STR_GMATCH_ITER {
-                info.nups = 3;
-            } else {
-                info.nups = 0;
+        // (字符串、模式、userdata 状态)，Rust 版本用带 __call 的表模拟
+        let is_gmatch_iter = t
+            .get_metatable()
+            .and_then(|mt| mt.get(&TValue::Str(state.intern_str("__call"))))
+            .map(|v| {
+                if let TValue::LightUserData(p) = &v {
+                    *p as usize == crate::stdlib::string_lib::STR_GMATCH_ITER
+                } else {
+                    false
+                }
+            })
+            .unwrap_or(false);
+        if is_gmatch_iter {
+            info.what = "C".to_string();
+            info.short_src = "[C]".to_string();
+            info.source = "=[C]".to_string();
+            info.currentline = -1;
+            info.nparams = 0;
+            info.isvararg = true;
+            info.name = None;
+            info.namewhat = String::new();
+            info.nups = 3;
+        } else {
+            // 非可调用表,按栈级别处理
+            let level = level_or_func.as_integer().unwrap_or(0) as i32;
+            if level < 0 {
+                push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
+                return Ok(());
+            }
+            if !fill_info_from_level(state, &mut info, level, &what) {
+                push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
+                return Ok(());
             }
         }
     } else {

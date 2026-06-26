@@ -628,7 +628,21 @@ impl VmExecutor {
                     Self::write_stack(state, ra + 4, s);
                     Self::write_stack(state, ra + 5, ctrl);
 
-                    let func_val = Self::read_stack(state, ra + 3).clone();
+                    let mut func_val = Self::read_stack(state, ra + 3).clone();
+                    // 可调用表 (带 __call 元方法) 支持 — 对应 op_call 中的 luaT_tryfuncTM
+                    // string.gmatch 返回的迭代器是带 __call 的表,这里提取 __call 作为
+                    // 实际函数,原表作为 self 参数放到 ra+4,ra+5 保持 ctrl
+                    if let TValue::Table(t) = &func_val {
+                        if let Some(mt) = t.get_metatable() {
+                            let call_key = TValue::Str(state.intern_str("__call"));
+                            if let Some(call_fn) = mt.get(&call_key) {
+                                let table_clone = func_val.clone();
+                                Self::write_stack(state, ra + 4, table_clone);
+                                Self::write_stack(state, ra + 3, call_fn.clone());
+                                func_val = call_fn;
+                            }
+                        }
+                    }
 
                     if let TValue::LClosure(closure) = &func_val {
                         let proto_code = closure.proto.code.clone();
