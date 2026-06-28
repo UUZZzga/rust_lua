@@ -10,3 +10,4 @@ pub mod table_lib;
 pub mod debug_lib;
 pub mod os_lib;
 pub mod coroutine_lib;
+pub mod io_lib;

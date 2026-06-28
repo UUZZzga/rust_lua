@@ -225,6 +225,15 @@ impl DefaultMetatables {
         }
     }
 
+    /// 清除指定类型的元表 — 对应 C 的 `G(L)->mt[ttype] = NULL`
+    /// debug.setmetatable(v, nil) 对基本类型调用此方法。
+    pub fn clear(&mut self, ty: LuaType) {
+        let idx = ty as usize;
+        if idx < self.tables.len() {
+            self.tables[idx] = None;
+        }
+    }
+
     pub fn get_mut(&mut self, ty: LuaType) -> Option<&mut Metatable> {
         let idx = ty as usize;
         self.tables.get_mut(idx)?.as_mut()
@@ -343,7 +352,7 @@ impl std::error::Error for TagMethodError {}
 /// ```
 ///
 /// Rust 版本: 在栈顶压入函数和参数，调用 pcall，将结果写入 res 槽位。
-fn call_tm_res(
+pub(crate) fn call_tm_res(
     state: &mut LuaState,
     f: &TValue,
     p1: &TValue,
@@ -362,6 +371,17 @@ fn call_tm_res(
     // name = 事件名 (如 "index", "add"), namewhat = "metamethod"
     let caller_base = state.base;
     let caller_pc = state.pc;
+    let caller_code = state.code.clone();
+    let caller_constants = state.constants.clone();
+    let caller_upval_descs = state.upval_descs.clone();
+    let caller_protos = state.protos.clone();
+    let caller_num_params = state.num_params;
+    let caller_is_vararg = state.is_vararg;
+    let caller_proto_flag = state.proto_flag;
+    let caller_nextraargs = state.nextraargs;
+    let caller_closure_upvals = state.closure_upvals.clone();
+    let caller_tbc_list = state.tbc_list;
+    let caller_open_upval = state.open_upval;
     let caller_source = if state.base > 0 && state.base <= state.stack.len() {
         if let TValue::LClosure(c) = &state.stack[state.base - 1] {
             c.proto.source.as_ref().map(|s| s.as_str().to_string()).unwrap_or_else(|| "=?".to_string())
@@ -380,14 +400,63 @@ fn call_tm_res(
         base: caller_base,
         saved_pc: caller_pc,
         namewhat: "metamethod".to_string(),
-        proto_flag: state.proto_flag,
-        nextraargs: state.nextraargs,
+        proto_flag: caller_proto_flag,
+        nextraargs: caller_nextraargs,
     });
+
+    // Push PcallProtection — 元方法 continuation 机制
+    // yield 穿过元方法后，resume 时元方法返回，op_return 检测到 is_metamethod=true
+    // 并执行 continuation（对应 C Lua 的 luaV_finishOp + unroll 机制）。
+    // saved_pc 保留指向被中断的指令（OP_LE/OP_MMBIN 等），不 +1，
+    // 以便 continuation 时读取该指令并完成。
+    state.pcall_protection_stack.push(crate::state::PcallProtection {
+        saved_code: caller_code.clone(),
+        saved_constants: caller_constants.clone(),
+        saved_upval_descs: caller_upval_descs.clone(),
+        saved_protos: caller_protos.clone(),
+        saved_base: caller_base,
+        saved_pc: caller_pc,
+        saved_num_params: caller_num_params,
+        saved_is_vararg: caller_is_vararg,
+        saved_proto_flag: caller_proto_flag,
+        saved_nextraargs: caller_nextraargs,
+        saved_closure_upvals: caller_closure_upvals.clone(),
+        saved_tbc_list: caller_tbc_list,
+        saved_open_upval: caller_open_upval,
+        func_idx: func_idx,
+        nresults: 1,
+        pcall_kind: crate::state::PcallKind::Pcall,
+        saved_filled: false,
+        is_metamethod: true,
+        metamethod_res: res,
+        saved_call_stack_len: state.call_stack.len(),
+    });
+    let mm_protection_idx = state.pcall_protection_stack.len() - 1;
 
     // 调用: 2 个参数, 1 个返回值 (对应 C 的 luaD_callnoyield(L, func, 1))
     let status = state.pcall(2, 1, 0);
 
-    // 弹出 CallInfoEntry
+    // yield: 元方法 yield 时，state.pcall 返回 LUA_YIELD
+    // 不截断栈、不 pop CallInfoEntry、不 pop PcallProtection、不恢复 saved 状态，
+    // 保留元方法的执行状态供 call_wrap_call 保存到 ThreadContext。
+    // state.pcall 的 LClosure yield 分支已更新 PcallProtection（saved_filled=true）。
+    // 但 LightUserData (C 函数) 分支不更新，需在此手动更新。
+    // (对应 C Lua 中 yield 通过 longjmp 跳出 luaT_callTMres，
+    //  CallInfo 栈保留元方法帧，resume 后继续执行元方法。)
+    if status == crate::state::LUA_YIELD {
+        // C 函数元方法 yield 时，state.pcall 的 LightUserData 分支不更新 PcallProtection
+        let protection = &mut state.pcall_protection_stack[mm_protection_idx];
+        if !protection.saved_filled {
+            protection.saved_filled = true;
+            protection.func_idx = func_idx;
+            // saved_pc 已在 push 时设置为 caller_pc（被中断指令），不需 +1
+        }
+        let yield_values = state.pending_yield.take().unwrap_or_default();
+        return Err(VmError::Yield(yield_values));
+    }
+
+    // 非 yield: pop PcallProtection 和 CallInfoEntry
+    state.pcall_protection_stack.pop();
     state.call_info.pop();
 
     // pcall 后: 栈截断到 func_idx，1 个结果(或错误消息)在 func_idx
@@ -401,13 +470,12 @@ fn call_tm_res(
     state.stack.truncate(func_idx);
 
     if status != 0 {
-        // 元方法调用失败 — 提取错误消息
+        // 元方法调用失败 — 保留原始错误值类型（非字符串错误用 RuntimeErrorValue）
         state.top = state.stack.len();
-        let err_msg = match &result {
-            TValue::Str(s) => s.as_str().to_string(),
-            _ => format!("{}", result),
-        };
-        return Err(VmError::RuntimeError(err_msg));
+        return Err(match &result {
+            TValue::Str(s) => VmError::RuntimeError(s.as_str().to_string()),
+            _ => VmError::RuntimeErrorValue(result.clone()),
+        });
     }
 
     // 将结果写入 res 槽位 (对应 C 的 setobjs2s(L, res, ...))
@@ -417,6 +485,252 @@ fn call_tm_res(
     state.stack[res] = result;
     state.top = state.stack.len();
     Ok(())
+}
+
+/// 调用元方法 (3 个参数, 0 个返回值) — 对应 C 的 luaT_callTM
+///
+/// C 实现:
+/// ```c
+/// void luaT_callTM (lua_State *L, const TValue *f, const TValue *p1,
+///                   const TValue *p2, const TValue *p3) {
+///   StkId func = L->top.p;
+///   setobj2s(L, func, f);
+///   setobj2s(L, func + 1, p1);
+///   setobj2s(L, func + 2, p2);
+///   setobj2s(L, func + 3, p3);
+///   L->top.p = func + 4;
+///   if (isLuacode(L->ci))
+///     luaD_call(L, func, 0);
+///   else
+///     luaD_callnoyield(L, func, 0);
+/// }
+/// ```
+///
+/// Rust 版本: 在栈顶压入函数和 3 个参数，调用 pcall (0 个返回值)。
+/// 用于 `__newindex` 元方法 (table, key, value)。
+/// 支持 yield (使用 PcallProtection 机制)。
+pub(crate) fn call_tm(
+    state: &mut LuaState,
+    f: &TValue,
+    p1: &TValue,
+    p2: &TValue,
+    p3: &TValue,
+    tm: TagMethod,
+) -> Result<(), VmError> {
+    let func_idx = state.stack.len();
+    state.stack.push(f.clone());
+    state.stack.push(p1.clone());
+    state.stack.push(p2.clone());
+    state.stack.push(p3.clone());
+    state.top = state.stack.len();
+
+    let caller_base = state.base;
+    let caller_pc = state.pc;
+    let caller_code = state.code.clone();
+    let caller_constants = state.constants.clone();
+    let caller_upval_descs = state.upval_descs.clone();
+    let caller_protos = state.protos.clone();
+    let caller_num_params = state.num_params;
+    let caller_is_vararg = state.is_vararg;
+    let caller_proto_flag = state.proto_flag;
+    let caller_nextraargs = state.nextraargs;
+    let caller_closure_upvals = state.closure_upvals.clone();
+    let caller_tbc_list = state.tbc_list;
+    let caller_open_upval = state.open_upval;
+    let caller_source = if state.base > 0 && state.base <= state.stack.len() {
+        if let TValue::LClosure(c) = &state.stack[state.base - 1] {
+            c.proto.source.as_ref().map(|s| s.as_str().to_string()).unwrap_or_else(|| "=?".to_string())
+        } else {
+            "=[C]".to_string()
+        }
+    } else {
+        "=?".to_string()
+    };
+    state.call_info.push(crate::state::CallInfoEntry {
+        source: caller_source,
+        line: -1,
+        name: tm.event_name().to_string(),
+        is_c: false,
+        closure: None,
+        base: caller_base,
+        saved_pc: caller_pc,
+        namewhat: "metamethod".to_string(),
+        proto_flag: caller_proto_flag,
+        nextraargs: caller_nextraargs,
+    });
+
+    // Push PcallProtection — 元方法 continuation 机制
+    // saved_pc 保留指向被中断的指令 (SETTABLE/SETI/SETFIELD), 不 +1,
+    // 以便 continuation 时读取该指令并完成。
+    // metamethod_res 设为 func_idx (不使用, 因为 0 个返回值)。
+    state.pcall_protection_stack.push(crate::state::PcallProtection {
+        saved_code: caller_code.clone(),
+        saved_constants: caller_constants.clone(),
+        saved_upval_descs: caller_upval_descs.clone(),
+        saved_protos: caller_protos.clone(),
+        saved_base: caller_base,
+        saved_pc: caller_pc,
+        saved_num_params: caller_num_params,
+        saved_is_vararg: caller_is_vararg,
+        saved_proto_flag: caller_proto_flag,
+        saved_nextraargs: caller_nextraargs,
+        saved_closure_upvals: caller_closure_upvals.clone(),
+        saved_tbc_list: caller_tbc_list,
+        saved_open_upval: caller_open_upval,
+        func_idx: func_idx,
+        nresults: 0,
+        pcall_kind: crate::state::PcallKind::Pcall,
+        saved_filled: false,
+        is_metamethod: true,
+        metamethod_res: func_idx,  // 不使用 (0 个返回值)
+        saved_call_stack_len: state.call_stack.len(),
+    });
+    let mm_protection_idx = state.pcall_protection_stack.len() - 1;
+
+    // 调用: 3 个参数, 0 个返回值
+    let status = state.pcall(3, 0, 0);
+
+    // yield: 元方法 yield 时，state.pcall 返回 LUA_YIELD
+    if status == crate::state::LUA_YIELD {
+        let protection = &mut state.pcall_protection_stack[mm_protection_idx];
+        if !protection.saved_filled {
+            protection.saved_filled = true;
+            protection.func_idx = func_idx;
+        }
+        let yield_values = state.pending_yield.take().unwrap_or_default();
+        return Err(VmError::Yield(yield_values));
+    }
+
+    // 非 yield: pop PcallProtection 和 CallInfoEntry
+    state.pcall_protection_stack.pop();
+    state.call_info.pop();
+
+    // pcall 后: 栈截断到 func_idx
+    state.stack.truncate(func_idx);
+    state.top = state.stack.len();
+
+    if status != 0 {
+        // 元方法调用失败 — 返回错误
+        let result = if func_idx < state.stack.len() {
+            state.stack[func_idx].clone()
+        } else {
+            TValue::Nil(NilKind::Strict)
+        };
+        return Err(match &result {
+            TValue::Str(s) => VmError::RuntimeError(s.as_str().to_string()),
+            _ => VmError::RuntimeErrorValue(result.clone()),
+        });
+    }
+    Ok(())
+}
+
+/// 调用 __close 元方法 — 对应 C 的 callclosemethod
+///
+/// C 实现:
+/// ```c
+/// static void callclosemethod (lua_State *L, TValue *obj, TValue *err, int yy) {
+///   StkId top = L->top.p;
+///   const TValue *tm = luaT_gettmbyobj(L, obj, TM_CLOSE);
+///   setobj2s(L, top, tm);        /* will call metamethod... */
+///   setobj2s(L, top + 1, obj);   /* with 'self' as the 1st argument */
+///   setobj2s(L, top + 2, err);   /* and error msg. as 2nd argument */
+///   L->top.p = top + 3;
+///   luaD_call(L, top, 0);
+/// }
+/// ```
+///
+/// 找不到 __close 元方法时返回 Ok(false)，调用成功返回 Ok(true)，调用错误返回 Err。
+thread_local! {
+    static CLOSE_METHOD_DEPTH: std::cell::Cell<usize> = std::cell::Cell::new(0);
+}
+
+pub fn call_close_method(
+    state: &mut LuaState,
+    obj: &TValue,
+    err: &TValue,
+) -> Result<bool, VmError> {
+    let depth = CLOSE_METHOD_DEPTH.with(|d| { let v = d.get(); d.set(v + 1); v });
+    if depth > 10 {
+        panic!("call_close_method infinite recursion, depth={}", depth);
+    }
+    struct DepthGuard;
+    impl Drop for DepthGuard {
+        fn drop(&mut self) {
+            CLOSE_METHOD_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        }
+    }
+    let _guard = DepthGuard;
+    // 查找 __close 元方法
+    let tm_val = get_tm_by_obj(obj, TagMethod::Close, &state.dmt);
+    let f = match tm_val {
+        Some(f) if f.is_function() => f,
+        _ => return Ok(false),  // 无 __close 元方法
+    };
+
+    let func_idx = state.stack.len();
+    // 压入函数和两个参数 (对应 C 的 setobj2s)
+    state.stack.push(f);
+    state.stack.push(obj.clone());
+    state.stack.push(err.clone());
+    state.top = state.stack.len();
+
+    // 推入 CallInfoEntry — 对应 C 的 luaD_callnoyield 推入 CallInfo
+    let caller_base = state.base;
+    let caller_pc = state.pc;
+    let caller_source = if state.base > 0 && state.base <= state.stack.len() {
+        if let TValue::LClosure(c) = &state.stack[state.base - 1] {
+            c.proto.source.as_ref().map(|s| s.as_str().to_string()).unwrap_or_else(|| "=?".to_string())
+        } else {
+            "=[C]".to_string()
+        }
+    } else {
+        "=?".to_string()
+    };
+    state.call_info.push(crate::state::CallInfoEntry {
+        source: caller_source,
+        line: -1,
+        name: "__close".to_string(),
+        is_c: false,
+        closure: None,
+        base: caller_base,
+        saved_pc: caller_pc,
+        namewhat: "metamethod".to_string(),
+        proto_flag: state.proto_flag,
+        nextraargs: state.nextraargs,
+    });
+
+    // __close 元方法通过 luaD_callnoyield 调用（不可 yield），递增 n_ny_calls
+    let saved_ny = state.n_ny_calls;
+    state.n_ny_calls = state.n_ny_calls.saturating_add(1);
+    // 调用: 2 个参数, 0 个返回值 (对应 C 的 luaD_call(L, top, 0))
+    let status = state.pcall(2, 0, 0);
+    state.n_ny_calls = saved_ny;
+
+    // 弹出 CallInfoEntry
+    state.call_info.pop();
+
+    if status != 0 {
+        // 元方法调用失败 — pcall 将错误值推入栈中 func_idx 位置
+        // 在截断栈之前读取错误值，保留原始 TValue 类型
+        let err_val = state.stack.get(func_idx).cloned()
+            .unwrap_or(TValue::Nil(NilKind::Strict));
+        // 截断栈，移除临时压入的函数/参数/错误值
+        state.stack.truncate(func_idx);
+        state.top = state.stack.len();
+        // 非字符串错误用 RuntimeErrorValue 保留原始类型（如数字 200）
+        return Err(if matches!(err_val, TValue::Str(_)) {
+            VmError::RuntimeError(match &err_val {
+                TValue::Str(s) => s.as_str().to_string(),
+                _ => String::new(),
+            })
+        } else {
+            VmError::RuntimeErrorValue(err_val)
+        });
+    }
+    // 截断栈，移除临时压入的函数/参数
+    state.stack.truncate(func_idx);
+    state.top = state.stack.len();
+    Ok(true)
 }
 
 /// 查找并调用二元元方法 — 对应 C 的 callbinTM
@@ -440,17 +754,132 @@ fn callbin_tm(
     res: usize,
     tm: TagMethod,
 ) -> Result<bool, VmError> {
-    // 先从 p1 查找元方法，再从 p2 查找
+    // 先从 p1 查找元方法，再从 p2 查找 — 对应 C 的 callbinTM
     let tm_val = get_tm_by_obj(p1, tm, &state.dmt)
         .or_else(|| get_tm_by_obj(p2, tm, &state.dmt));
 
     match tm_val {
         Some(f) => {
+            // 字符串算术元方法占位符 (Integer(0)) — 对应 C 的 arith_add/arith_sub 等
+            // 这些元方法会先将字符串操作数转换为数字，再执行算术运算
+            if let TValue::Integer(0) = f {
+                // 先尝试字符串算术
+                if string_arith(state, p1, p2, res, tm)? {
+                    return Ok(true);
+                }
+                // 字符串算术失败 — 对应 C 的 trymt: 查找 p2 的元方法
+                if let Some(f2) = get_tm_by_obj(p2, tm, &state.dmt) {
+                    if !matches!(f2, TValue::Integer(0)) {
+                        // p2 有非字符串的元方法，调用它
+                        call_tm_res(state, &f2, p1, p2, res, tm)?;
+                        return Ok(true);
+                    }
+                    // p2 也是字符串，报错 (对应 trymt 中 p2 是 LUA_TSTRING)
+                }
+                // p2 没有元方法或也是字符串，报错
+                // 对应 C: luaL_error("attempt to %s a '%s' with a '%s'", ...)
+                let opname = tm.event_name();
+                let t1 = obj_type_name(p1);
+                let t2 = obj_type_name(p2);
+                return Err(VmError::RuntimeError(format!(
+                    "attempt to {} a '{}' with a '{}'", opname, t1, t2
+                )));
+            }
             call_tm_res(state, &f, p1, p2, res, tm)?;
             Ok(true)
         }
         None => Ok(false),
     }
+}
+
+/// 字符串算术元方法 — 对应 C Lua 的 arith_add/arith_sub 等函数
+///
+/// C 实现 (lstrlib.cpp):
+/// ```c
+/// static int arith (lua_State *L, int op, const char *mtname) {
+///   if (tonum(L, 1) && tonum(L, 2))
+///     lua_arith(L, op);  /* result will be on the top */
+///   else
+///     trymt(L, mtname, mtname + 2);
+///   return 1;
+/// }
+/// ```
+///
+/// 尝试将操作数转换为数字 (含字符串强制转换)，然后执行算术运算。
+/// 转换失败时返回 false (让调用者报错或尝试其他元方法)。
+fn string_arith(
+    state: &mut LuaState,
+    p1: &TValue,
+    p2: &TValue,
+    res: usize,
+    tm: TagMethod,
+) -> Result<bool, VmError> {
+    use crate::objects::NilKind;
+    use crate::vm::{to_integer, to_number, F2IMode};
+
+    // 尝试整数运算 (对应 C 的 ttisinteger 检查)
+    let i1 = to_integer(p1, F2IMode::Eq);
+    let i2 = to_integer(p2, F2IMode::Eq);
+
+    if let (Some(i1), Some(i2)) = (i1, i2) {
+        let result = match tm {
+            TagMethod::Add => Some(TValue::Integer(i1.wrapping_add(i2))),
+            TagMethod::Sub => Some(TValue::Integer(i1.wrapping_sub(i2))),
+            TagMethod::Mul => Some(TValue::Integer(i1.wrapping_mul(i2))),
+            TagMethod::Mod => {
+                if i2 == 0 {
+                    return Err(VmError::RuntimeError("attempt to perform 'n%0'".into()));
+                }
+                Some(TValue::Integer(crate::vm::modulus(i1, i2)
+                    .map_err(|_| VmError::ModuloByZero)?))
+            }
+            TagMethod::IDiv => {
+                if i2 == 0 {
+                    return Err(VmError::RuntimeError("attempt to perform 'n//0'".into()));
+                }
+                Some(TValue::Integer(i1 / i2))
+            }
+            TagMethod::Unm => Some(TValue::Integer(i1.wrapping_neg())),
+            // Div 和 Pow 总是浮点
+            TagMethod::Div | TagMethod::Pow => None,
+            _ => return Ok(false),
+        };
+
+        if let Some(r) = result {
+            while state.stack.len() <= res {
+                state.stack.push(TValue::Nil(NilKind::Strict));
+            }
+            state.stack[res] = r;
+            return Ok(true);
+        }
+    }
+
+    // 浮点运算 (对应 C 的 tonumberns 检查)
+    let n1 = to_number(p1);
+    let n2 = to_number(p2);
+
+    if let (Some(n1), Some(n2)) = (n1, n2) {
+        let result = match tm {
+            TagMethod::Add => n1 + n2,
+            TagMethod::Sub => n1 - n2,
+            TagMethod::Mul => n1 * n2,
+            TagMethod::Div => n1 / n2,
+            TagMethod::Mod => crate::vm::modulus_float(n1, n2),
+            TagMethod::Pow => n1.powf(n2),
+            TagMethod::IDiv => (n1 / n2).floor(),
+            TagMethod::Unm => -n1,
+            _ => return Ok(false),
+        };
+
+        while state.stack.len() <= res {
+            state.stack.push(TValue::Nil(NilKind::Strict));
+        }
+        state.stack[res] = TValue::Float(result);
+        return Ok(true);
+    }
+
+    // 转换失败
+    Ok(false)
 }
 
 /// 尝试二元元方法 — 对应 C 的 luaT_trybinTM
@@ -610,14 +1039,38 @@ pub fn call_order_tm(
 }
 
 /// 调用整数顺序比较元方法 — 对应 C 的 luaT_callorderiTM
+///
+/// C 实现:
+/// ```c
+/// int luaT_callorderiTM (lua_State *L, const TValue *p1, int v2,
+///                        int flip, int isfloat, TMS event) {
+///   TValue aux; const TValue *p2;
+///   if (isfloat) {
+///     setfltvalue(&aux, cast_num(v2));  // 浮点常量还原为 float
+///   }
+///   else
+///     setivalue(&aux, v2);
+///   if (flip) { p2 = p1; p1 = &aux; }
+///   else p2 = &aux;
+///   return luaT_callorderTM(L, p1, p2, event);
+/// }
+/// ```
+///
+/// `isfloat` 为 true 时，`v2` 原本是浮点常量（如 `5.0`），需还原为 Float 类型，
+/// 以确保元方法收到与源码类型一致的参数。
 pub fn call_orderi_tm(
     state: &mut LuaState,
     p1: &TValue,
     v2: i64,
     flip: bool,
+    isfloat: bool,
     tm: TagMethod,
 ) -> Result<bool, VmError> {
-    let aux = TValue::Integer(v2);
+    let aux = if isfloat {
+        TValue::Float(v2 as f64)
+    } else {
+        TValue::Integer(v2)
+    };
     let (a, b) = if flip { (&aux, p1) } else { (p1, &aux) };
     call_order_tm(state, a, b, tm)
 }
@@ -1071,7 +1524,7 @@ mod tests {
     fn test_call_orderi_tm_no_metamethod() {
         let mut state = LuaState::new();
         let p1 = TValue::Nil(NilKind::Strict);
-        let result = call_orderi_tm(&mut state, &p1, 3, false, TagMethod::Lt);
+        let result = call_orderi_tm(&mut state, &p1, 3, false, false, TagMethod::Lt);
         assert!(result.is_err());
     }
 

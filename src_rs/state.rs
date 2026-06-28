@@ -1,5 +1,5 @@
 use crate::debug::runerror;
-use crate::objects::{Instruction, LClosure, LuaType, NilKind, Proto, TValue, UpVal, UpvalDesc, UpValRef};
+use crate::objects::{CallFrame, Instruction, LClosure, LuaThread, LuaType, NilKind, Proto, TableData, ThreadContext, ThreadStatus, TValue, UpVal, UpValRef, UpvalDesc};
 use crate::strings::{LuaString, StringTable};
 use crate::table::Table;
 use crate::gc::{GCObjectHeader, GCState};
@@ -11,6 +11,7 @@ use std::io::{Read, Write};
 
 const EOFMARK: &str = "<eof>";
 
+pub const LUA_YIELD: i32 = 1;
 pub const ERR_RUN: i32 = 2;
 pub const ERR_SYNTAX: i32 = 3;
 pub const ERR_FILE: i32 = 6;  // LUA_ERRERR + 1, used by luaL_loadfilex
@@ -36,6 +37,58 @@ pub const MAX_CALL_CHAIN: usize = 15;
 pub const MAXSTACK_BYSIZET: usize = (usize::max_value() / std::mem::size_of::<TValue>()) - STACKERRSPACE ;
 pub const MAXSTACK: usize = if LUAI_MAXSTACK < MAXSTACK_BYSIZET {LUAI_MAXSTACK} else {MAXSTACK_BYSIZET};
 pub const ERRORSTACKSIZE: usize = MAXSTACK + STACKERRSPACE;
+
+/// pcall 类型 — 区分 pcall 和 xpcall 的 error 处理行为
+#[derive(Clone, Debug)]
+pub enum PcallKind {
+    /// pcall: error 时返回 (false, error)
+    Pcall,
+    /// xpcall: error 时调用 handler(error)，返回 (false, handler_result)
+    Xpcall { handler: TValue },
+}
+
+/// pcall 保护状态 — 对应 C Lua 的 CIST_YPCALL CallInfo
+///
+/// call_pcall/call_xpcall 在调用 state.pcall 前 push 此结构。
+/// yield 穿过 pcall 后，pcall 的 C 函数栈帧被销毁，但保护状态保留在栈中。
+/// 当 inner_func 后续执行 error 或正常返回时，由 execute_loop 检查并处理
+/// （对应 C Lua 的 precover + finishpcallk 机制）。
+#[derive(Clone, Debug)]
+pub struct PcallProtection {
+    /// pcall 调用者的执行上下文（saved_*）— 用于恢复 pcall 调用者的执行
+    pub saved_code: Vec<Instruction>,
+    pub saved_constants: Vec<TValue>,
+    pub saved_upval_descs: Vec<UpvalDesc>,
+    pub saved_protos: Vec<Proto>,
+    pub saved_base: usize,
+    pub saved_pc: usize,
+    pub saved_num_params: u8,
+    pub saved_is_vararg: bool,
+    pub saved_proto_flag: u8,
+    pub saved_nextraargs: i32,
+    pub saved_closure_upvals: Vec<UpValRef>,
+    pub saved_tbc_list: Option<usize>,
+    pub saved_open_upval: Option<usize>,
+    /// pcall 的 func 位置（栈索引）— 用于截断栈和放置返回值
+    pub func_idx: usize,
+    /// pcall 期望的返回值数量（-1 = MULTRET）
+    pub nresults: i32,
+    /// pcall 类型 — 区分 pcall 和 xpcall 的 error/return 处理
+    pub pcall_kind: PcallKind,
+    /// saved_* 是否已填充（即是否被 yield 穿过）
+    /// false: call_pcall/call_xpcall push 的空壳，由 state.pcall 处理 error
+    /// true: yield 穿过后由 state.pcall 更新，由 execute_loop 处理 error/return
+    pub saved_filled: bool,
+    /// 是否为元方法调用 (call_tm_res 推入)
+    /// yield 穿过元方法后，resume 时元方法返回，由 op_return 检查并执行
+    /// continuation（对应 C Lua 的 luaV_finishOp 机制）
+    pub is_metamethod: bool,
+    /// 元方法结果的栈索引 (res 参数) — continuation 时将结果放入此槽位
+    pub metamethod_res: usize,
+    /// 元方法调用前的 call_stack 长度 — 用于区分元方法自身返回 vs 元方法调用的函数返回
+    /// 当 call_stack.len() == saved_call_stack_len 时，是元方法自身返回
+    pub saved_call_stack_len: usize,
+}
 
 pub struct GlobalState {
     pub gcstopem: bool,
@@ -100,6 +153,10 @@ pub struct LuaState {
     pub api_func_base: usize,
     // C 函数调用嵌套计数（对应 C 的 L->nCcalls），用于检测 C 栈溢出
     pub n_ccalls: u32,
+    // 非可 yield 调用计数（对应 C 的 nCcalls 高 16 位 / incnny）
+    // 常规 C 函数调用递增此计数，pcall/xpcall 例外（CIST_YPCALL）
+    // coroutine.isyieldable() 检查此计数是否为 0
+    pub n_ny_calls: u32,
     pub dmt: DefaultMetatables,
     pub stdout: Box<dyn Write>,
     pub global_state: Rc<GlobalState>,
@@ -111,6 +168,11 @@ pub struct LuaState {
     pub last_traceback: String,
     /// 最后一次错误的格式化消息（含 source:line 前缀）
     pub last_error_msg: String,
+    /// 最后一次错误的原始值（保留原始 TValue 类型，如 error(100) 的数字 100）
+    /// coroutine.close 需要返回此原始值
+    pub last_error_value: Option<TValue>,
+    /// pcall 内部发生 yield 时暂存的 yield 值，供调用者传播
+    pub pending_yield: Option<Vec<TValue>>,
     /// 当前正在调用的 C 函数名（用于 traceback）— None 表示不在 C 函数中
     pub last_c_function: Option<String>,
     /// 数学库随机数生成器状态 — 对应 C 的 RanState (math.random/randomseed)
@@ -128,6 +190,23 @@ pub struct LuaState {
     /// 是否允许调用 hook — 对应 C 的 L->allowhook
     /// 在 hook 执行期间设为 false，防止递归调用
     pub allowhook: bool,
+    /// 主线程对象（用于 coroutine.running() 在主线程返回 thread）
+    pub main_thread: LuaThread,
+    /// 调用栈 — 保存 caller 的 VM 执行上下文（原 execute_loop 局部变量，提升为字段以支持协程挂起）
+    pub call_stack: Vec<CallFrame>,
+    /// 当前活动协程的上下文 — None 表示主线程执行中
+    pub current_thread: Option<Rc<RefCell<ThreadContext>>>,
+    /// coroutine.wrap 创建的协程列表 — 通过 tag (710+idx) 索引
+    /// None 表示协程已完成或出错
+    pub wrap_coros: Vec<Option<LuaThread>>,
+    /// pcall 保护栈 — 对应 C Lua 的 CIST_YPCALL CallInfo 链
+    /// 当 pcall 保护可 yield 的 Lua 函数时，push 保护状态。
+    /// yield 穿过 pcall 后，保护状态保留。
+    /// execute_loop 收到 error/return 时检查此栈，处理 pcall 的返回/error。
+    pub pcall_protection_stack: Vec<PcallProtection>,
+    /// 弱引用表列表 — setmetatable 设置 __mode 时注册，collectgarbage 时清理
+    /// 使用 Weak 引用避免阻止表本身的回收
+    pub weak_tables: Vec<std::rc::Weak<std::cell::RefCell<TableData>>>,
 }
 
 /// 调用栈条目 — 用于堆栈回溯和 debug.getinfo
@@ -205,6 +284,7 @@ impl LuaState {
             string_table: StringTable::new(),
             api_func_base: 0,
             n_ccalls: 0,
+            n_ny_calls: 0,
             dmt: DefaultMetatables::new(),
             stdout: Box::new(std::io::stdout()),
             global_state: Rc::new(GlobalState { gcstopem: false }),
@@ -212,6 +292,8 @@ impl LuaState {
             call_info: Vec::new(),
             last_traceback: String::new(),
             last_error_msg: String::new(),
+            last_error_value: None,
+            pending_yield: None,
             last_c_function: None,
             math_random_state: None,
             hook_func: None,
@@ -220,6 +302,18 @@ impl LuaState {
             current_hook_count: 0,
             hook_old_pc: 0,
             allowhook: true,
+            main_thread: LuaThread {
+                stack: Vec::new(),
+                status: ThreadStatus::OK,
+                function: None,
+                is_main: true,
+                context: Rc::new(RefCell::new(ThreadContext::default())),
+            },
+            call_stack: Vec::new(),
+            current_thread: None,
+            wrap_coros: Vec::new(),
+            pcall_protection_stack: Vec::new(),
+            weak_tables: Vec::new(),
         }
     }
 
@@ -349,6 +443,7 @@ impl LuaState {
             string_table: StringTable::new(),
             api_func_base: 0,
             n_ccalls: 0,
+            n_ny_calls: 0,
             dmt: DefaultMetatables::new(),
             stdout: Box::new(std::io::stdout()),
             global_state: Rc::new(GlobalState { gcstopem: false }),
@@ -356,6 +451,8 @@ impl LuaState {
             call_info: Vec::new(),
             last_traceback: String::new(),
             last_error_msg: String::new(),
+            last_error_value: None,
+            pending_yield: None,
             last_c_function: None,
             math_random_state: None,
             hook_func: None,
@@ -364,6 +461,18 @@ impl LuaState {
             current_hook_count: 0,
             hook_old_pc: 0,
             allowhook: true,
+            main_thread: LuaThread {
+                stack: Vec::new(),
+                status: ThreadStatus::OK,
+                function: None,
+                is_main: true,
+                context: Rc::new(RefCell::new(ThreadContext::default())),
+            },
+            call_stack: Vec::new(),
+            current_thread: None,
+            wrap_coros: Vec::new(),
+            pcall_protection_stack: Vec::new(),
+            weak_tables: Vec::new(),
         };
         state
     }
@@ -435,6 +544,7 @@ impl LuaState {
             string_table: StringTable::new(),
             api_func_base: 0,
             n_ccalls: 0,
+            n_ny_calls: 0,
             dmt: DefaultMetatables::new(),
             stdout: Box::new(std::io::stdout()),
             global_state: Rc::new(GlobalState { gcstopem: false }),
@@ -442,6 +552,8 @@ impl LuaState {
             call_info: Vec::new(),
             last_traceback: String::new(),
             last_error_msg: String::new(),
+            last_error_value: None,
+            pending_yield: None,
             last_c_function: None,
             math_random_state: None,
             hook_func: None,
@@ -450,6 +562,18 @@ impl LuaState {
             current_hook_count: 0,
             hook_old_pc: 0,
             allowhook: true,
+            main_thread: LuaThread {
+                stack: Vec::new(),
+                status: ThreadStatus::OK,
+                function: None,
+                is_main: true,
+                context: Rc::new(RefCell::new(ThreadContext::default())),
+            },
+            call_stack: Vec::new(),
+            current_thread: None,
+            wrap_coros: Vec::new(),
+            pcall_protection_stack: Vec::new(),
+            weak_tables: Vec::new(),
         }
     }
 }
@@ -1100,6 +1224,30 @@ impl LuaState {
         let mut chain_len: usize = 0;
         loop {
             let cur_val = self.stack[func_idx].clone();
+            // 检查是否是 coroutine.wrap 返回的 Table（GC 跟踪，可被回收）
+            if let Some(idx) = crate::stdlib::coroutine_lib::get_wrap_idx(&cur_val) {
+                let tag = crate::stdlib::coroutine_lib::CORO_WRAP_CALL_BASE + idx;
+                let nargs = self.stack.len().saturating_sub(func_idx + 1);
+                let result = crate::stdlib::coroutine_lib::call_wrap_call(
+                    tag, self, func_idx, nargs, nresults,
+                );
+                return match result {
+                    Ok(()) => 0,
+                    Err(e) => {
+                        self.stack.truncate(func_idx);
+                        let err_val = match e {
+                            crate::execute::VmError::RuntimeErrorValue(val) => val,
+                            crate::execute::VmError::RuntimeError(s) => {
+                                TValue::Str(self.intern_str(&s))
+                            }
+                            other => TValue::Str(self.intern_str(&format!("{}", other))),
+                        };
+                        self.last_error_value = Some(err_val.clone());
+                        self.stack.push(err_val);
+                        ERR_RUN
+                    }
+                };
+            }
             if let TValue::Table(ref t) = cur_val {
                 let mt_opt = t.get_metatable();
                 let call_fn = mt_opt.as_ref().and_then(|mt| {
@@ -1143,6 +1291,10 @@ impl LuaState {
                     self.push_string("C stack overflow");
                     return ERR_RUN;
                 }
+                // 保存 n_ccalls，用于 error 路径恢复（对应 C Lua 的 longjmp 恢复 ci->nCcalls）
+                // error() 抛出时，execute_loop 中 OP_CALL 递增的 n_ccalls 不会由 op_return 递减，
+                // 导致计数失衡。非 yield 路径需恢复到 pcall 调用前的值。
+                let saved_n_ccalls = self.n_ccalls.saturating_sub(1);
 
                 let nargs_actual = self.stack.len().saturating_sub(func_idx + 1);
                 let fsize = closure.proto.max_stack_size as usize;
@@ -1199,33 +1351,190 @@ impl LuaState {
                     }
                 }
 
-                let result = VmExecutor::execute_loop(self);
-                // 恢复 n_ccalls (对应 C 的 decnny);无论成功或失败都递减,
-                // 保证 pcall 返回后深度计数平衡。
-                self.n_ccalls = self.n_ccalls.saturating_sub(1);
+                // Shield 机制: 防止内层 pcall 的 error 被外层 PcallProtection 错误捕获
+                // 当顶部 PcallProtection 有 saved_filled=true（即 yield 穿过外层 pcall）时，
+                // push 一个 shield（saved_filled=false）。execute_loop 的 error 处理只处理
+                // saved_filled=true 的 PcallProtection，遇到 shield 时 break，
+                // 使 error 传播到本 state.pcall，而非被外层 PcallProtection 捕获。
+                // 典型场景: pcall(foo) yield 后，foo 的 __close error 应被
+                // call_close_method 的 state.pcall 捕获，而非 pcall(foo) 的 PcallProtection。
+                let need_shield = self.pcall_protection_stack.last().map_or(false, |t| t.saved_filled);
+                if need_shield {
+                    self.pcall_protection_stack.push(crate::state::PcallProtection {
+                        saved_code: Vec::new(),
+                        saved_constants: Vec::new(),
+                        saved_upval_descs: Vec::new(),
+                        saved_protos: Vec::new(),
+                        saved_base: 0,
+                        saved_pc: 0,
+                        saved_num_params: 0,
+                        saved_is_vararg: false,
+                        saved_proto_flag: 0,
+                        saved_nextraargs: 0,
+                        saved_closure_upvals: Vec::new(),
+                        saved_tbc_list: None,
+                        saved_open_upval: None,
+                        func_idx: 0,
+                        nresults: 0,
+                        pcall_kind: crate::state::PcallKind::Pcall,
+                        saved_filled: false,
+                        is_metamethod: false,
+                        metamethod_res: 0,
+                        saved_call_stack_len: 0,
+                    });
+                }
 
-                self.code = saved_code;
-                self.constants = saved_constants;
-                self.upval_descs = saved_upval_descs;
-                self.protos = saved_protos;
-                self.base = saved_base;
-                self.pc = saved_pc;
-                self.num_params = saved_num_params;
-                self.is_vararg = saved_is_vararg;
-                self.proto_flag = saved_proto_flag;
-                self.nextraargs = saved_nextraargs;
-                self.closure_upvals = saved_closure_upvals;
-                self.tbc_list = saved_tbc_list;
-                self.open_upval = saved_open_upval;
+                // 临时保存并清空 call_stack，避免 execute_loop 中的 op_return
+                // 错误地 pop 外层调用帧（如 checkerror 的帧）。
+                // state.pcall 的 LClosure 分支不 push call_stack（不像 op_call），
+                // 所以 call_stack 中的帧是外层调用的，不应被内层函数的 op_return 使用。
+                // 对应 C Lua 中 state.pcall 创建新的 CallInfo，与外层 CallInfo 链隔离。
+                // 注意: 不清空 call_info，因为 op_return 只在 call_stack.pop() 成功时
+                // 才 pop call_info（call_stack 为空时不会 pop），且调用者（如 call_hook）
+                // 可能已 push call_info 供 debug.getinfo 使用。
+                let saved_call_stack_frames = std::mem::take(&mut self.call_stack);
+
+                let result = VmExecutor::execute_loop(self);
+
+                // 恢复 call_stack（execute_loop 可能修改了它）
+                // 非 yield 路径: execute_loop 中的 op_return 应该走 else 分支（call_stack 为空），
+                //   不会 pop 帧也不会 push 帧，call_stack 仍为空。
+                // yield 路径: execute_loop 返回 Yield，call_stack 可能有残留（被中断的调用），
+                //   保留这些帧供协程恢复时使用。
+                if !matches!(&result, Ok(VmResult::Yield { .. })) {
+                    self.call_stack = saved_call_stack_frames;
+                } else {
+                    // yield: 合并残留帧（如果有）到 saved 帧之前
+                    // 通常 yield 时 call_stack 包含被中断的调用帧
+                    let mut remaining = std::mem::take(&mut self.call_stack);
+                    remaining.extend(saved_call_stack_frames);
+                    self.call_stack = remaining;
+                }
+                // 恢复 n_ccalls (对应 C 的 decnny / longjmp 恢复 ci->nCcalls)。
+                // 非 yield 路径下恢复到 pcall 调用前的值:
+                //   - 成功路径: op_return 已递减 op_call 的增量,恢复到 saved_n_ccalls 等价于递减 1
+                //   - error 路径: op_call 的增量未被 op_return 递减,需整体恢复
+                // yield 路径不恢复 (协程恢复时由 ThreadContext 处理)。
+                if !matches!(&result, Ok(VmResult::Yield { .. })) {
+                    self.n_ccalls = saved_n_ccalls;
+                }
+
+                // pop shield: shield 只在 execute_loop 执行期间需要
+                // (yield 路径下也需先 pop shield，再更新顶部 PcallProtection)
+                if need_shield {
+                    self.pcall_protection_stack.pop();
+                }
+
+                // yield 不是错误: 暂存 yield 值,不关闭 TBC 变量
+                // (yield 时 TBC 变量应保持 open,等协程恢复后正常关闭)
+                // 注意: execute_loop 将 VmError::Yield 转换为 Ok(VmResult::Yield)
+                let is_yield = matches!(&result, Ok(VmResult::Yield { .. }));
+                if is_yield {
+                    if let Ok(VmResult::Yield { values }) = &result {
+                        self.pending_yield = Some(values.clone());
+                    }
+                    // yield 时清理 last_error_value,避免残留错误影响
+                    self.last_error_value = None;
+                    self.last_error_msg.clear();
+                    // 更新顶部 PcallProtection 的 saved_* 字段和 saved_filled=true
+                    // 对应 C Lua 的 CIST_YPCALL CallInfo 保留:
+                    // yield 穿过 pcall 后,pcall 返回,但保护状态保留。
+                    // 当 inner_func 后续执行 error/return 时,由 execute_loop 检查并处理。
+                    // 跳过已 saved_filled=true 的（嵌套 yield 场景，内层 state.pcall 已更新），
+                    // 向下查找第一个未填充的 PcallProtection（对应 C Lua 的多层 CallInfo）
+                    let pp_len = self.pcall_protection_stack.len();
+                    let target_idx = (0..pp_len).rev()
+                        .find(|&i| !self.pcall_protection_stack[i].saved_filled)
+                        .or_else(|| {
+                            // 全部已填充: 无可更新目标（不应发生）
+                            None
+                        });
+                    if let Some(idx) = target_idx {
+                        let top = &mut self.pcall_protection_stack[idx];
+                        top.saved_code = saved_code.clone();
+                        top.saved_constants = saved_constants.clone();
+                        top.saved_upval_descs = saved_upval_descs.clone();
+                        top.saved_protos = saved_protos.clone();
+                        top.saved_base = saved_base;
+                        // is_metamethod: saved_pc 不 +1，保留指向被中断的指令（OP_LE/OP_MMBIN），
+                        // 以便 op_return continuation 时读取该指令并完成（对应 C 的 luaV_finishOp）。
+                        // 非 metamethod: saved_pc + 1，跳过调用 pcall 的 CALL 指令。
+                        top.saved_pc = if top.is_metamethod { saved_pc } else { saved_pc + 1 };
+                        top.saved_num_params = saved_num_params;
+                        top.saved_is_vararg = saved_is_vararg;
+                        top.saved_proto_flag = saved_proto_flag;
+                        top.saved_nextraargs = saved_nextraargs;
+                        top.saved_closure_upvals = saved_closure_upvals.clone();
+                        top.saved_tbc_list = saved_tbc_list;
+                        top.saved_open_upval = saved_open_upval;
+                        top.func_idx = func_idx;
+                        top.nresults = nresults;
+                        top.saved_filled = true;
+                    }
+                }
+
+                // 错误时关闭 to-be-closed 变量（对应 C 的 luaD_closeprotected -> luaF_close）
+                // 必须在恢复 saved 状态之前调用，此时 state.closure_upvals/open_upval 仍是 foo 的
+                let close_err = if is_yield {
+                    None
+                } else {
+                    match &result {
+                        Ok(_) => None,
+                        Err(e) => {
+                            // 从 e 构造错误值（始终更新，避免上次 pcall 残留的 last_error_value 污染）
+                            // 对应 C Lua 的 longjmp 恢复：错误值来自当前错误，而非全局状态
+                            let err_from_e = match e {
+                                VmError::RuntimeErrorValue(val) => val.clone(),
+                                VmError::RuntimeError(s) => TValue::Str(self.intern_str(s)),
+                                other => TValue::Str(self.intern_str(&format!("{}", other))),
+                            };
+                            self.last_error_value = Some(err_from_e);
+                            let close_level = self.base;  // foo 的 base
+                            // __close 的调用者应是 pcall（C 函数），对应 C 版本中 foo 的 ci
+                            // 在 error 时被弹出，调用栈上只剩 pcall 的 ci。
+                            // call_close_method 推入的 __close CallInfoEntry 的 base = state.base
+                            // = close_level。state.stack[close_level-1] 是 foo 闭包（LClosure），
+                            // 因为 call_pcall 把 foo 覆盖到 pcall 闭包位置。
+                            // 临时设为 nil（非 LClosure），让 debug.getinfo(2) 返回 "C"。
+                            // close 后会 truncate 栈到 func_idx，无需恢复。
+                            if close_level > 0 && close_level <= self.stack.len() {
+                                self.stack[close_level - 1] = TValue::Nil(NilKind::Strict);
+                            }
+                            crate::func::close(self, close_level, 1, 0).ok();
+                            // 用 clone() 而非 take()，保留 last_error_value 供上层 close 函数读取错误传播
+                            self.last_error_value.clone()
+                        }
+                    }
+                };
+
+                // yield 时: 保留 foo 的执行状态（不恢复 saved 状态，不截断栈）
+                // 对应 C Lua 中 yield 通过 longjmp 穿过 pcall，pcall 的状态被销毁，
+                // 第二次 resume 直接恢复 foo 的执行。
+                if !is_yield {
+                    self.code = saved_code;
+                    self.constants = saved_constants;
+                    self.upval_descs = saved_upval_descs;
+                    self.protos = saved_protos;
+                    self.base = saved_base;
+                    self.pc = saved_pc;
+                    self.num_params = saved_num_params;
+                    self.is_vararg = saved_is_vararg;
+                    self.proto_flag = saved_proto_flag;
+                    self.nextraargs = saved_nextraargs;
+                    self.closure_upvals = saved_closure_upvals;
+                    self.tbc_list = saved_tbc_list;
+                    self.open_upval = saved_open_upval;
+                }
 
                 match result {
                     Ok(VmResult::Return { nresults: nret, result_base }) => {
+                        // 对应 C 的 adjustresults: nresults >= 0 时补 nil 到 nresults
                         let expected = if nresults == MULT_RET {
                             nret
                         } else if nresults <= 0 {
                             0
                         } else {
-                            (nret).min(nresults as usize)
+                            nresults as usize
                         };
 
                         // 从 result_base 位置取结果（可能是 VARARGPREP 调整后的 base）
@@ -1247,23 +1556,35 @@ impl LuaState {
                         }
                         0
                     }
+                    Ok(VmResult::Yield { .. }) => {
+                        // yield: 保留 foo 的执行状态，不截断栈
+                        // yield 值已在 pending_yield 中,调用者检查并传播
+                        LUA_YIELD
+                    }
                     Ok(_) => {
                         self.stack.truncate(func_idx);
                         0
                     }
-                    Err(e) => {
+                    Err(_) => {
                         self.stack.truncate(func_idx);
-                        // 优先使用 build_traceback 格式化的错误消息（含 source:line 前缀）
-                        if !self.last_error_msg.is_empty() {
-                            let msg = self.last_error_msg.clone();
-                            self.last_error_msg.clear();
-                            self.push_string(&msg);
+                        // close 后 last_error_value 包含最终错误值（可能是原始错误或 __close 错误）
+                        // 保留原始 TValue 类型（如数字 43），pcall 返回 (false, err_value)
+                        let err_val = close_err.unwrap_or_else(|| TValue::Nil(NilKind::Strict));
+                        // 对字符串错误，使用 build_traceback 添加了 source:line 前缀的
+                        // last_error_msg（VM 错误如 "attempt to call" 需要前缀；
+                        // error()/assert() 的前缀已在 last_error_value 中，二者一致）
+                        let err_val = if matches!(err_val, TValue::Str(_))
+                            && !self.last_error_msg.is_empty()
+                        {
+                            TValue::Str(self.intern_str(&self.last_error_msg))
                         } else {
-                            match e {
-                                VmError::RuntimeError(str) => self.push_string(&str),
-                                _ => self.push_string(&format!("{}", e)),
-                            }
-                        }
+                            err_val
+                        };
+                        self.last_error_msg.clear();
+                        // 清除 last_error_value，防止残留值污染后续 pcall
+                        // (对应 C Lua 的 longjmp 后错误状态不跨 pcall 保留)
+                        self.last_error_value = None;
+                        self.stack.push(err_val);
                         ERR_RUN
                     }
                 }
@@ -1292,6 +1613,8 @@ impl LuaState {
                     crate::stdlib::table_lib::table_function_name(tag_val).map(|s| s.to_string())
                 } else if crate::stdlib::os_lib::is_os_tag(tag_val) {
                     crate::stdlib::os_lib::os_function_name(tag_val).map(|s| s.to_string())
+                } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
+                    crate::stdlib::coroutine_lib::coro_function_name(tag_val).map(|s| s.to_string())
                 } else if tag_val >= 100 {
                     crate::stdlib::string_lib::string_function_name(tag_val).map(|s| s.to_string())
                 } else {
@@ -1335,6 +1658,14 @@ impl LuaState {
                     crate::stdlib::os_lib::call_os_function(
                         tag_val, self, func_idx, nargs, nresults,
                     )
+                } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
+                    crate::stdlib::coroutine_lib::call_coro_function(
+                        tag_val, self, func_idx, nargs, nresults,
+                    )
+                } else if crate::stdlib::coroutine_lib::is_wrap_call_tag(tag_val) {
+                    crate::stdlib::coroutine_lib::call_wrap_call(
+                        tag_val, self, func_idx, nargs, nresults,
+                    )
                 } else if tag_val >= 100 {
                     crate::stdlib::string_lib::call_string_function(
                         tag_val, self, func_idx, nargs, nresults,
@@ -1350,9 +1681,27 @@ impl LuaState {
 
                 match dispatch_result {
                     Ok(()) => 0,
+                    // yield: C 函数 (如 call_pcall/call_xpcall) 传播的 yield
+                    // 对应 C 中 yield 通过 longjmp 穿过 pcall:
+                    // 不截断栈,保留被调用函数的执行状态供协程恢复时使用
+                    // (与 LClosure 分支的 yield 处理一致)
+                    Err(crate::execute::VmError::Yield(values)) => {
+                        self.pending_yield = Some(values);
+                        self.last_error_value = None;
+                        self.last_error_msg.clear();
+                        LUA_YIELD
+                    }
                     Err(crate::execute::VmError::RuntimeError(msg)) => {
                         self.stack.truncate(func_idx);
                         self.push_string(&msg);
+                        ERR_RUN
+                    }
+                    Err(crate::execute::VmError::RuntimeErrorValue(val)) => {
+                        // 非字符串错误值（如 error(foo)）：保留原始 TValue 放到栈上，
+                        // 供 pcall 返回 (false, original_value) 而非 (false, string)
+                        self.stack.truncate(func_idx);
+                        self.stack.push(val);
+                        self.top = self.stack.len();
                         ERR_RUN
                     }
                     Err(e) => {
@@ -1469,6 +1818,9 @@ impl LuaState {
 
         // 打开 Coroutine 库 (注册 coroutine 全局表, 包含 create/resume/yield/status 等)
         crate::stdlib::coroutine_lib::open_coroutine_lib(self);
+
+        // 打开 I/O 库 (注册 io 全局表, 包含 stdin/stdout/stderr)
+        crate::stdlib::io_lib::open_io_lib(self);
     }
 
     // ====== Hook ======
@@ -1483,6 +1835,101 @@ impl LuaState {
 
     pub fn intern(&self, s: &str) -> LuaString {
         str_to_ls(&self.string_table, s)
+    }
+
+    // ====== 弱引用表管理 ======
+
+    /// 注册弱引用表 — 当 setmetatable 设置包含 __mode 的元表时调用
+    /// 使用 Weak 引用避免阻止表本身的回收
+    pub fn register_weak_table(&mut self, t: &Table) {
+        self.weak_tables.push(std::rc::Rc::downgrade(&t.data));
+    }
+
+    /// 处理弱引用表 — 在 collectgarbage("collect") 中调用
+    /// 扫描所有弱引用表，清除值（或键）仅被弱引用表持有的条目
+    /// 使用 Rc::strong_count 判断：count == 1 表示仅弱引用表本身持有
+    pub fn process_weak_tables(&mut self) {
+        let mode_key = TValue::Str(self.intern_str("__mode"));
+        let mut i = 0;
+        while i < self.weak_tables.len() {
+            match self.weak_tables[i].upgrade() {
+                None => {
+                    // 表已被回收，从列表中移除
+                    self.weak_tables.swap_remove(i);
+                }
+                Some(data_rc) => {
+                    // 检查 __mode 标志
+                    let (weak_k, weak_v) = {
+                        let data = data_rc.borrow();
+                        if let Some(ref mt) = data.metatable {
+                            match mt.get(&mode_key) {
+                                Some(TValue::Str(s)) => {
+                                    let mode = s.as_str();
+                                    (mode.contains('k'), mode.contains('v'))
+                                }
+                                _ => (false, false),
+                            }
+                        } else {
+                            (false, false)
+                        }
+                    };
+                    if weak_k || weak_v {
+                        let mut to_clear_array: Vec<usize> = Vec::new();
+                        let mut to_clear_hash: Vec<TValue> = Vec::new();
+                        {
+                            let data = data_rc.borrow();
+                            // 检查数组部分
+                            for (idx, val) in data.array.iter().enumerate() {
+                                if matches!(val, TValue::Nil(NilKind::Empty)) {
+                                    continue;
+                                }
+                                if weak_v && Self::is_weakly_held_val(val) {
+                                    to_clear_array.push(idx);
+                                }
+                            }
+                            // 检查哈希部分
+                            for (k, v) in data.hash.iter() {
+                                let remove = if weak_v && weak_k {
+                                    // kv 模式：键或值任一弱持有则清除
+                                    Self::is_weakly_held_val(k) || Self::is_weakly_held_val(v)
+                                } else if weak_v {
+                                    Self::is_weakly_held_val(v)
+                                } else {
+                                    // weak_k only
+                                    Self::is_weakly_held_val(k)
+                                };
+                                if remove {
+                                    to_clear_hash.push(k.clone());
+                                }
+                            }
+                        }
+                        // 应用清除
+                        if !to_clear_array.is_empty() || !to_clear_hash.is_empty() {
+                            let mut data = data_rc.borrow_mut();
+                            for idx in to_clear_array {
+                                data.array[idx] = TValue::Nil(NilKind::Empty);
+                            }
+                            for k in to_clear_hash {
+                                data.hash.remove(&k);
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+            }
+        }
+    }
+
+    /// 判断值是否仅被弱引用表持有（Rc strong_count == 1）
+    /// 仅对 GC 对象类型（Table/LClosure/CClosure/Thread/UserData）有效
+    /// 字符串总是被字符串表持有，不视为弱持有
+    fn is_weakly_held_val(val: &TValue) -> bool {
+        match val {
+            TValue::Table(t) => std::rc::Rc::strong_count(&t.data) <= 1,
+            TValue::LClosure(c) => std::rc::Rc::strong_count(&c.upvals) <= 1,
+            TValue::Thread(t) => std::rc::Rc::strong_count(&t.context) <= 1,
+            _ => false,
+        }
     }
 }
 

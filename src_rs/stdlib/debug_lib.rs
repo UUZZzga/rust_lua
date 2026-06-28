@@ -25,6 +25,7 @@ use crate::state::LuaState;
 use crate::table::Table;
 use crate::execute::VmError;
 use crate::strings::LuaString;
+use crate::tm::Metatable;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -466,15 +467,20 @@ fn call_getmetatable(
                 TValue::Nil(NilKind::Strict)
             }
         }
-        _ => TValue::Nil(NilKind::Strict),
+        // 基本类型: 从全局 G(L)->mt[type] 读取
+        _ => match state.dmt.get(arg.ty()) {
+            Some(mt) => TValue::Table(mt.clone()),
+            None => TValue::Nil(NilKind::Strict),
+        },
     };
     push_single_result(state, a, nresults, result);
     Ok(())
 }
 
-/// debug.setmetatable(v, mt) — 对应 C 的 db_setmetatable
+/// debug.setmetatable(v, mt) — 对应 C 的 db_setmetatable → lua_setmetatable
 ///
-/// 设置值的元表, 返回原值
+/// 设置值的元表, 返回原值。对 Table/UserData 设置自身元表;
+/// 对基本类型(number/boolean/nil/string)设置全局 G(L)->mt[type]。
 fn call_setmetatable(
     state: &mut LuaState,
     a: usize,
@@ -491,7 +497,7 @@ fn call_setmetatable(
         ));
     }
 
-    let result = match (&arg1, &arg2) {
+    match (&arg1, &arg2) {
         (TValue::Table(_), TValue::Table(mt)) => {
             // 修改栈上的表
             if a + 1 < state.stack.len() {
@@ -499,7 +505,21 @@ fn call_setmetatable(
                     t.set_metatable(Some(mt.clone()));
                 }
             }
-            arg1.clone()
+            // 检查 __mode 弱引用表
+            if let TValue::Table(ref t) = arg1 {
+                let has_mode = {
+                    let data = t.data.borrow();
+                    if let Some(ref mt) = data.metatable {
+                        let mode_key = TValue::Str(state.intern_str("__mode"));
+                        mt.get(&mode_key).is_some()
+                    } else {
+                        false
+                    }
+                };
+                if has_mode {
+                    state.register_weak_table(t);
+                }
+            }
         }
         (TValue::Table(_), TValue::Nil(_)) => {
             if a + 1 < state.stack.len() {
@@ -507,15 +527,19 @@ fn call_setmetatable(
                     t.set_metatable(None);
                 }
             }
-            arg1.clone()
         }
-        _ => {
-            return Err(VmError::RuntimeError(
-                "bad argument #1 to 'setmetatable' (table expected)".to_string(),
-            ));
+        // 基本类型: 设置全局 mt[type] — 对应 C 的 G(L)->mt[ttype(obj)]
+        (_, TValue::Table(mt)) => {
+            let ty = arg1.ty();
+            state.dmt.set(ty, Metatable::new(mt.clone()));
         }
-    };
-    push_single_result(state, a, nresults, result);
+        (_, TValue::Nil(_)) => {
+            let ty = arg1.ty();
+            state.dmt.clear(ty);
+        }
+        _ => unreachable!(),
+    }
+    push_single_result(state, a, nresults, arg1);
     Ok(())
 }
 
@@ -1724,15 +1748,28 @@ fn call_sethook(
 ) -> Result<(), VmError> {
     let mut arg_offset = 0;
     let arg0 = get_arg(state, a, 0);
-    if matches!(arg0, TValue::Thread(_)) {
+    let target_thread = if let TValue::Thread(t) = &arg0 {
         arg_offset = 1;
-    }
+        Some(t.clone())
+    } else {
+        None
+    };
 
     let hook = get_arg(state, a, arg_offset);
 
     if matches!(hook, TValue::Nil(_)) || matches!(hook, TValue::Nil(NilKind::Empty)) {
         // 关闭钩子
-        set_hook_in_registry(state, None, 0, 0);
+        if let Some(thread) = target_thread {
+            // 设置到指定协程的 ThreadContext
+            let mut ctx = thread.context.borrow_mut();
+            ctx.saved_hook_func = None;
+            ctx.saved_hook_mask = 0;
+            ctx.saved_hook_count = 0;
+            ctx.saved_current_hook_count = 0;
+            ctx.saved_allowhook = true;
+        } else {
+            set_hook_in_registry(state, None, 0, 0);
+        }
     } else {
         let mask_str = match &get_arg(state, a, arg_offset + 1) {
             TValue::Str(s) => s.as_str().to_string(),
@@ -1744,7 +1781,20 @@ fn call_sethook(
             0
         };
         let mask = make_mask(&mask_str, count);
-        set_hook_in_registry(state, Some(hook), mask, count);
+        if let Some(thread) = target_thread {
+            // 设置到指定协程的 ThreadContext（resume 时恢复到 state）
+            // 同时把 hook 函数的 Open upvalue 转为 Closed，
+            // 避免协程执行期间 state.stack 被替换后 upvalue 失效
+            crate::stdlib::coroutine_lib::close_hook_upvals(&hook, state);
+            let mut ctx = thread.context.borrow_mut();
+            ctx.saved_hook_func = Some(hook);
+            ctx.saved_hook_mask = mask;
+            ctx.saved_hook_count = count;
+            ctx.saved_current_hook_count = count;
+            ctx.saved_allowhook = true;
+        } else {
+            set_hook_in_registry(state, Some(hook), mask, count);
+        }
     }
 
     push_results(state, a, nresults, vec![]);

@@ -141,21 +141,6 @@ fn table_concat_impl(
     Ok(result)
 }
 
-/// table.unpack(list [, i [, j]]) — 对应 C 的 tunpack
-fn table_unpack_impl(
-    table: &crate::table::Table,
-    i: i64,
-    j: i64,
-) -> Vec<TValue> {
-    let mut result = Vec::new();
-    let mut idx = i;
-    while idx <= j {
-        result.push(table_get_int(table, idx));
-        idx += 1;
-    }
-    result
-}
-
 // ============================================================================
 // 函数派发 — 从 execute.rs 调用
 // ============================================================================
@@ -228,6 +213,7 @@ fn call_concat(
 }
 
 /// table.unpack(list [, i [, j]])
+/// 对应 C Lua 的 tunpack: 直接 push 到栈,不创建中间 Vec
 fn call_unpack(
     state: &mut LuaState,
     a: usize,
@@ -246,8 +232,38 @@ fn call_unpack(
     let i = if nargs >= 2 { get_opt_int_arg(state, a, 1, 1) } else { 1 };
     let j = if nargs >= 3 { get_opt_int_arg(state, a, 2, default_len) } else { default_len };
 
-    let results = table_unpack_impl(&table, i, j);
-    push_results(state, a, nresults, results);
+    if i > j {
+        state.stack.truncate(a);
+        return Ok(());
+    }
+    // 对应 C Lua 的 lua_checkstack 检查: 元素数量超过 INT_MAX 或栈空间不足时报错
+    let n = (j as i64 - i as i64 + 1) as usize;
+    if n >= i32::MAX as usize || state.stack.len().saturating_add(n) > crate::state::MAXSTACK {
+        return Err(VmError::RuntimeError("too many results to unpack".to_string()));
+    }
+
+    // 直接 push 到栈,避免创建中间 Vec(对应 C Lua tunpack 的行为)
+    // 预分配容量，避免增量扩容导致内存碎片/OOM
+    state.stack.truncate(a);
+    state.stack.reserve(n);
+    let mut idx = i;
+    while idx < j {
+        state.stack.push(table_get_int(&table, idx));
+        idx += 1;
+    }
+    state.stack.push(table_get_int(&table, j));  // push 最后一个元素
+
+    // 根据 nresults 调整: 如果 nresults >= 0 且不等于 n,需要调整
+    if nresults >= 0 {
+        let current = state.stack.len() - a;
+        if (current as i32) > nresults {
+            state.stack.truncate(a + nresults as usize);
+        } else {
+            while (state.stack.len() - a) < nresults as usize {
+                state.stack.push(TValue::Nil(NilKind::Strict));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -423,6 +439,8 @@ fn call_sort(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 /// 从 Rust 调用 Lua 比较函数 (对应 C 的 sort_comp 中的函数调用路径)
 ///
 /// 推入 comp(a, b) 并通过 state.pcall 调用,返回布尔结果。
+/// 注意: C Lua 使用 lua_call(不可 yield),这里通过递增 n_ny_calls 模拟,
+/// 使比较函数内部不能 yield(对应 C Lua 的 nny 计数)。
 fn call_comp_function(
     state: &mut LuaState,
     comp: &TValue,
@@ -435,7 +453,10 @@ fn call_comp_function(
     state.stack.push(a.clone());
     state.stack.push(b.clone());
 
+    // 递增 n_ny_calls,使比较函数调用不可 yield(对应 C Lua 的 lua_call 行为)
+    state.n_ny_calls += 1;
     let status = state.pcall(2, 1, 0);
+    state.n_ny_calls = state.n_ny_calls.saturating_sub(1);
 
     if status != 0 {
         // 恢复栈

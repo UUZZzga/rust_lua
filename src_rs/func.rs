@@ -1,5 +1,6 @@
 use crate::objects::*;
 use crate::state::LuaState;
+use crate::execute::VmError;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -153,6 +154,7 @@ fn new_upval(state: &mut LuaState, level: usize, prev: Option<usize>) -> usize {
         stack_index: level,
         next,
         previous: prev,
+        tbc: false,
     })));
     uv_idx
 }
@@ -205,51 +207,137 @@ fn unlink_upval(state: &mut LuaState, uv_idx: usize) {
     }
 }
 
-pub fn close(state: &mut LuaState, level: usize, _status: i32, _nresults: i32) {
+pub fn close(state: &mut LuaState, level: usize, status: i32, _nresults: i32) -> Result<(), VmError> {
+    // 收集所有 should_close 的 upvalue（按 open_upval 链表顺序，stack_index 降序）
+    // open_upval 链表是按 stack_index 降序，对应 Lua 5.5 的关闭顺序
+    let mut to_close: Vec<usize> = Vec::new();
     let mut current = state.open_upval;
     while let Some(uv_idx) = current {
-        let (should_close, next) = {
-            let uv_ref = state.closure_upvals[uv_idx].borrow();
-            match &*uv_ref {
-                UpVal::Open { stack_index, next, .. } => (*stack_index >= level, *next),
-                UpVal::Closed { .. } => (false, None),
-            }
-        };
-        current = next;
-        if should_close {
-            close_upval(state, uv_idx);
-        }
-        if state.open_upval.is_none() {
+        if uv_idx >= state.closure_upvals.len() {
             break;
         }
+        let (should_close, next, stack_idx) = {
+            let uv_ref = state.closure_upvals[uv_idx].borrow();
+            match &*uv_ref {
+                UpVal::Open { stack_index, next, .. } => (*stack_index >= level, *next, *stack_index),
+                UpVal::Closed { .. } => (false, None, 0),
+            }
+        };
+        if should_close {
+            to_close.push(uv_idx);
+        }
+        current = next;
+    }
+
+    // 没有需要关闭的 upvalue: 直接返回，不修改错误状态
+    // (避免 status!=0 但无 TBC 变量时用 Nil 覆盖原有错误)
+    if to_close.is_empty() {
+        state.twups_linked = false;
+        return Ok(());
+    }
+
+    // 对每个 should_close 的 upvalue，按顺序处理
+    // 对 TBC upvalue，先调用 __close metamethod，再 close_upval
+    // 错误传播: __close 出错时，错误值传递给下一个 __close 的 err 参数
+    let mut current_status = status;
+    let mut current_err: TValue = if status != 0 {
+        state.last_error_value.clone().unwrap_or(TValue::Nil(NilKind::Strict))
+    } else {
+        TValue::Nil(NilKind::Strict)
+    };
+    let mut has_error = status != 0;
+
+    for uv_idx in to_close {
+        let is_tbc = {
+            let uv_ref = state.closure_upvals[uv_idx].borrow();
+            matches!(&*uv_ref, UpVal::Open { tbc: true, .. })
+        };
+        let (stack_idx, tbc_flag) = {
+            let uv_ref = state.closure_upvals[uv_idx].borrow();
+            if let UpVal::Open { stack_index, tbc, .. } = &*uv_ref {
+                (*stack_index, *tbc)
+            } else {
+                (0, false)
+            }
+        };
+        if is_tbc {
+            // TBC upvalue: 读取栈上的值，调用 __close metamethod
+            let val = {
+                let uv_ref = state.closure_upvals[uv_idx].borrow();
+                if let UpVal::Open { stack_index, .. } = &*uv_ref {
+                    state.stack.get(*stack_index).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
+                } else {
+                    TValue::Nil(NilKind::Strict)
+                }
+            };
+            // 只对非 nil 的值调用 __close
+            if !matches!(val, TValue::Nil(_)) {
+                // 清空 last_error_value 以便检测 __close 是否出错
+                state.last_error_value = None;
+                state.last_error_msg.clear();
+                // 调用 __close(val, current_err)
+                match crate::tm::call_close_method(state, &val, &current_err) {
+                    Ok(_) => {
+                        // __close 成功: 不改变错误状态
+                    }
+                    Err(e) => {
+                        // __close 出错: 从返回的 VmError 提取错误值，更新 current_err
+                        // (pcall 已清除 last_error_value，不能从 state 读取)
+                        current_err = match e {
+                            VmError::RuntimeErrorValue(val) => val,
+                            VmError::RuntimeError(s) => TValue::Str(state.intern_str(&s)),
+                            other => TValue::Str(state.intern_str(&format!("{}", other))),
+                        };
+                        has_error = true;
+                        current_status = 1;  // 错误状态
+                    }
+                }
+            }
+        }
+        close_upval(state, uv_idx);
+    }
+    // 如果 close 过程中有错误，设置 state.last_error_value 供调用者检查
+    if has_error {
+        state.last_error_value = Some(current_err.clone());
+        // 同时设置 last_error_msg（用于 close_suspended_coroutine 检测错误）
+        let msg = match &current_err {
+            TValue::Str(s) => s.as_str().to_string(),
+            _ => format!("{}", current_err),
+        };
+        state.last_error_msg = msg;
     }
     state.twups_linked = false;
+    if has_error {
+        // __close 出错: 返回错误以中断调用者的执行（对应 C 的 luaD_throw）
+        // state.last_error_value 已包含最终错误值，调用者可通过它获取原始 TValue
+        // 字符串错误用 RuntimeError，非字符串错误用 RuntimeErrorValue 保留原始 TValue
+        Err(match &current_err {
+            TValue::Str(s) => VmError::RuntimeError(s.as_str().to_string()),
+            _ => VmError::RuntimeErrorValue(current_err.clone()),
+        })
+    } else {
+        Ok(())
+    }
 }
 
 pub fn new_tbc_upval(state: &mut LuaState, level: usize) -> Option<usize> {
-    let uv_idx = state.closure_upvals.len();
-    state.closure_upvals.push(Rc::new(RefCell::new(UpVal::Open {
-        stack_index: level,
-        next: None,
-        previous: None,
-    })));
-    if let Some(head) = state.tbc_list {
-        let mut head_ref = state.closure_upvals[head].borrow_mut();
-        if let UpVal::Open { ref mut next, .. } = &mut *head_ref {
-            *next = Some(uv_idx);
-        }
-    }
+    // 对应 C 的 luaF_newtbcupval: 复用或创建 open upvalue，然后标记 tbc
+    // TBC upvalue 复用 open_upval 链表（通过 find_upval 加入），用 tbc 字段标记
+    // 不再使用单独的 tbc_list 链表（会导致循环引用）
+    let uv_idx = find_upval(state, level);
     {
         let mut uv_ref = state.closure_upvals[uv_idx].borrow_mut();
-        if let UpVal::Open { ref mut previous, .. } = &mut *uv_ref {
-            *previous = state.tbc_list;
+        if let UpVal::Open { ref mut tbc, .. } = &mut *uv_ref {
+            *tbc = true;
         }
     }
+    // 更新 tbc_list 指向最新的 TBC upvalue（用于 pop_tbc_list 等检查）
     state.tbc_list = Some(uv_idx);
     Some(uv_idx)
 }
 
 pub fn pop_tbc_list(state: &mut LuaState, level: usize) {
+    // 简化: tbc_list 不再是链表，只清除 head 的 tbc 标志（如果 stack_index >= level）
     let head = match state.tbc_list {
         Some(h) => h,
         None => return,
@@ -265,20 +353,14 @@ pub fn pop_tbc_list(state: &mut LuaState, level: usize) {
     if !should_pop {
         return;
     }
-    let new_head = {
-        let head_ref = state.closure_upvals[head].borrow();
-        match &*head_ref {
-            UpVal::Open { previous, .. } => *previous,
-            _ => None,
-        }
-    };
+    // 清除 tbc 标志
     {
         let mut head_ref = state.closure_upvals[head].borrow_mut();
-        if let UpVal::Open { ref mut next, .. } = &mut *head_ref {
-            *next = None;
+        if let UpVal::Open { ref mut tbc, .. } = &mut *head_ref {
+            *tbc = false;
         }
     }
-    state.tbc_list = new_head;
+    state.tbc_list = None;
 }
 
 pub fn get_local_name(_proto: &Proto, _local_number: usize, _pc: usize) -> Option<&str> {
@@ -331,6 +413,21 @@ mod tests {
             hook_old_pc: 0,
             current_hook_count: 0,
             allowhook: true,
+            n_ny_calls: 0,
+            last_error_value: None,
+            pending_yield: None,
+            main_thread: LuaThread {
+                stack: Vec::new(),
+                status: ThreadStatus::OK,
+                function: None,
+                is_main: true,
+                context: Rc::new(RefCell::new(ThreadContext::default())),
+            },
+            call_stack: Vec::new(),
+            current_thread: None,
+            wrap_coros: Vec::new(),
+            pcall_protection_stack: Vec::new(),
+            weak_tables: Vec::new(),
         }
     }
 

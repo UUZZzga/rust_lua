@@ -111,6 +111,7 @@ impl PartialEq for LongString {
 
 /// 短字符串：`Arc::ptr_eq` 快速路径，否则比较 `contents`。
 /// 长字符串：委派给 `LongString::eq`。
+/// 跨类型（Short vs Long）：比较内容 — 对应 C Lua 的 luaS_eqlngstr/luaS_hash 比较逻辑。
 impl PartialEq for LuaString {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
@@ -118,7 +119,7 @@ impl PartialEq for LuaString {
                 Arc::ptr_eq(a, b) || a.contents == b.contents
             }
             (LuaString::Long(a), LuaString::Long(b)) => a == b,
-            _ => false,
+            _ => self.as_str() == other.as_str(),
         }
     }
 }

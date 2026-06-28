@@ -340,10 +340,7 @@ pub fn base_rawequal(v1: &TValue, v2: &TValue) -> bool {
         }
         (TValue::Str(a), TValue::Str(b)) => a == b,
         (TValue::LightUserData(a), TValue::LightUserData(b)) => std::ptr::eq(*a, *b),
-        (TValue::Table(a), TValue::Table(b)) => std::ptr::eq(
-            a as *const _ as *const u8,
-            b as *const _ as *const u8,
-        ),
+        (TValue::Table(a), TValue::Table(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
         _ => false,
     }
 }
@@ -599,6 +596,22 @@ fn call_setmetatable(
         }
     };
 
+    // 检查是否设置了 __mode（弱引用表），注册到 weak_tables
+    if let TValue::Table(ref t) = result {
+        let has_mode = {
+            let data = t.data.borrow();
+            if let Some(ref mt) = data.metatable {
+                let mode_key = TValue::Str(state.intern_str("__mode"));
+                mt.get(&mode_key).is_some()
+            } else {
+                false
+            }
+        };
+        if has_mode {
+            state.register_weak_table(t);
+        }
+    }
+
     push_single_result(state, a, nresults, result);
     Ok(())
 }
@@ -625,7 +638,11 @@ fn call_getmetatable(
                 TValue::Nil(NilKind::Strict)
             }
         }
-        _ => TValue::Nil(NilKind::Strict),
+        // 基本类型: 从全局 G(L)->mt[type] 读取 (不检查 __metatable)
+        _ => match state.dmt.get(arg.ty()) {
+            Some(mt) => TValue::Table(mt.clone()),
+            None => TValue::Nil(NilKind::Strict),
+        },
     };
     push_single_result(state, a, nresults, result);
     Ok(())
@@ -672,7 +689,59 @@ fn call_pcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
         state.stack.truncate(new_top);
     }
 
+    // push pcall 保护状态 — 对应 C Lua 的 CIST_YPCALL
+    // yield 穿过 pcall 后，pcall 的 C 函数栈帧被销毁，但保护状态保留。
+    // 当 inner_func 后续执行 error/return 时，由 execute_loop 检查并处理。
+    state.pcall_protection_stack.push(crate::state::PcallProtection {
+        saved_code: state.code.clone(),
+        saved_constants: state.constants.clone(),
+        saved_upval_descs: state.upval_descs.clone(),
+        saved_protos: state.protos.clone(),
+        saved_base: state.base,
+        saved_pc: state.pc,
+        saved_num_params: state.num_params,
+        saved_is_vararg: state.is_vararg,
+        saved_proto_flag: state.proto_flag,
+        saved_nextraargs: state.nextraargs,
+        saved_closure_upvals: state.closure_upvals.clone(),
+        saved_tbc_list: state.tbc_list,
+        saved_open_upval: state.open_upval,
+        func_idx: a,
+        nresults: -1,
+        pcall_kind: crate::state::PcallKind::Pcall,
+        saved_filled: false,
+        is_metamethod: false,
+        metamethod_res: 0,
+        saved_call_stack_len: 0,
+    });
+    let pcall_protection_idx = state.pcall_protection_stack.len() - 1;
+
     let status = state.pcall(pcall_nargs, -1, 0);
+
+    // 非 yield 返回时 pop pcall 保护状态
+    if status != crate::state::LUA_YIELD {
+        state.pcall_protection_stack.pop();
+    } else {
+        // yield: 更新 pcall 的 PcallProtection 为 saved_filled=true
+        // 当 inner_func 是 LClosure 时，state.pcall 的 LClosure 分支已经更新了
+        // saved_filled=true 和 saved_pc+1，这里是冗余但无害的。
+        // 当 inner_func 是 C 函数时，state.pcall 的 LightUserData 分支不更新 PcallProtection，
+        // 所以这里需要手动更新。
+        // saved_pc + 1: 跳过调用 pcall 的 CALL 指令（与 LClosure 分支的 saved_pc + 1 一致）。
+        let protection = &mut state.pcall_protection_stack[pcall_protection_idx];
+        if !protection.saved_filled {
+            protection.saved_pc += 1;
+            protection.saved_filled = true;
+        }
+    }
+
+    // yield: 从 pending_yield 取出 yield 值并传播 (对应 C 中 yield 穿过 pcall)
+    if status == crate::state::LUA_YIELD {
+        let yield_values = state.pending_yield.take().unwrap_or_default();
+        // yield 时不截断栈，保留 foo 的执行状态供第二次 resume 恢复
+        // 对应 C Lua 中 yield 穿过 pcall，pcall 的状态被销毁
+        return Err(VmError::Yield(yield_values));
+    }
 
     // pcall 后: 栈截断到 a, 结果在 a..
     let nret = state.stack.len().saturating_sub(a);
@@ -791,15 +860,22 @@ fn call_error(state: &mut LuaState, a: usize, nargs: usize, _nresults: i32) -> R
     } else {
         1
     };
-    let mut err_msg = match &msg {
-        TValue::Str(s) => s.as_str().to_string(),
-        _ => lua_value_to_string(&msg),
-    };
-    if matches!(msg, TValue::Str(_)) && level > 0 {
-        let prefix = lua_l_where(state, level as usize);
-        err_msg = format!("{}{}", prefix, err_msg);
+    // 对应 C Lua 的 error(): 字符串添加位置前缀，非字符串原样返回
+    if let TValue::Str(s) = &msg {
+        let mut err_msg = s.as_str().to_string();
+        if level > 0 {
+            let prefix = lua_l_where(state, level as usize);
+            err_msg = format!("{}{}", prefix, err_msg);
+        }
+        // 保存包含前缀的错误值（与 C Lua 行为一致：error(s) 返回带位置前缀的字符串）
+        state.last_error_value = Some(TValue::Str(state.intern_str(&err_msg)));
+        Err(VmError::RuntimeError(err_msg))
+    } else {
+        // 非字符串错误值: 原样返回（对应 C Lua 中 errfunc 为非字符串时的行为）
+        // 保留原始 TValue 类型（coroutine.close 需要返回原始值）
+        state.last_error_value = Some(msg.clone());
+        Err(VmError::RuntimeErrorValue(msg))
     }
-    Err(VmError::RuntimeError(err_msg))
 }
 
 /// tonumber(v [, base]) — 对应 C 的 luaB_tonumber
@@ -919,8 +995,15 @@ fn call_assert(
         }
         Err(msg) => {
             // C 中 luaB_assert 最终调用 luaB_error(level=1)，error 会拼接 where 信息
-            let prefix = lua_l_where(state, 1);
-            Err(VmError::RuntimeError(format!("{}{}", prefix, msg)))
+            // 非字符串错误值（如 assert(false, t)）保留原始 TValue（对应 C Lua 中 error(non-string, 1)）
+            if args.len() >= 2 && !matches!(args[1], TValue::Str(_) | TValue::Nil(_)) {
+                let err_val = args[1].clone();
+                state.last_error_value = Some(err_val.clone());
+                Err(VmError::RuntimeErrorValue(err_val))
+            } else {
+                let prefix = lua_l_where(state, 1);
+                Err(VmError::RuntimeError(format!("{}{}", prefix, msg)))
+            }
         }
     }
 }
@@ -1122,7 +1205,56 @@ fn call_xpcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         state.stack.truncate(new_top);
     }
 
+    // push pcall 保护状态 — 对应 C Lua 的 CIST_YPCALL
+    // yield 穿过 xpcall 后，xpcall 的 C 函数栈帧被销毁，但保护状态保留。
+    // 当 inner_func 后续执行 error/return 时，由 execute_loop 检查并处理。
+    state.pcall_protection_stack.push(crate::state::PcallProtection {
+        saved_code: state.code.clone(),
+        saved_constants: state.constants.clone(),
+        saved_upval_descs: state.upval_descs.clone(),
+        saved_protos: state.protos.clone(),
+        saved_base: state.base,
+        saved_pc: state.pc,
+        saved_num_params: state.num_params,
+        saved_is_vararg: state.is_vararg,
+        saved_proto_flag: state.proto_flag,
+        saved_nextraargs: state.nextraargs,
+        saved_closure_upvals: state.closure_upvals.clone(),
+        saved_tbc_list: state.tbc_list,
+        saved_open_upval: state.open_upval,
+        func_idx: a,
+        nresults: -1,
+        pcall_kind: crate::state::PcallKind::Xpcall { handler: err_fn.clone() },
+        saved_filled: false,
+        is_metamethod: false,
+        metamethod_res: 0,
+        saved_call_stack_len: 0,
+    });
+    let xpcall_protection_idx = state.pcall_protection_stack.len() - 1;
+
     let status = state.pcall(xpcall_nargs, -1, 0);
+
+    // 非 yield 返回时 pop pcall 保护状态
+    if status != crate::state::LUA_YIELD {
+        state.pcall_protection_stack.pop();
+    } else {
+        // yield: 更新 xpcall 的 PcallProtection 为 saved_filled=true
+        // state.pcall 的 LightUserData 分支（C 函数路径）不更新 PcallProtection，
+        // 所以这里需要手动更新。
+        // saved_pc + 1: 跳过调用 xpcall 的 CALL 指令（与 LClosure 分支的 saved_pc + 1 一致）。
+        let protection = &mut state.pcall_protection_stack[xpcall_protection_idx];
+        if !protection.saved_filled {
+            protection.saved_pc += 1;
+            protection.saved_filled = true;
+        }
+    }
+
+    // yield: 从 pending_yield 取出 yield 值并传播 (对应 C 中 yield 穿过 xpcall)
+    // 对应 C 的 finishpcall: status == LUA_YIELD 时视为成功，不调用错误处理函数
+    if status == crate::state::LUA_YIELD {
+        let yield_values = state.pending_yield.take().unwrap_or_default();
+        return Err(VmError::Yield(yield_values));
+    }
 
     let nret = state.stack.len().saturating_sub(a);
     let mut results: Vec<TValue> = Vec::new();
@@ -1732,6 +1864,18 @@ fn call_collectgarbage(
 
     let result = match opt.as_str() {
         "collect" => {
+            // 清理 wrap_coros 中不再被外部引用的协程
+            // （ThreadContext 的 Rc 计数 == 1 表示只有 wrap_coros 持有）
+            for entry in state.wrap_coros.iter_mut() {
+                if let Some(thread) = entry {
+                    let rc_count = std::rc::Rc::strong_count(&thread.context);
+                    if rc_count <= 1 {
+                        *entry = None;
+                    }
+                }
+            }
+            // 清理弱引用表中仅被弱引用表持有的条目
+            state.process_weak_tables();
             state.gc.full_gc();
             TValue::Integer(0)
         }

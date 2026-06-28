@@ -1183,7 +1183,11 @@ fn add_value_from_repl(
                 state.stack.push(cap);
             }
 
+            // gsub 回调通过 lua_call (luaD_callnoyield) 调用，不可 yield
+            let saved_ny = state.n_ny_calls;
+            state.n_ny_calls = state.n_ny_calls.saturating_add(1);
             let status = state.pcall(n, 1, 0);
+            state.n_ny_calls = saved_ny;
             if status != 0 {
                 let msg = state
                     .to_string(-1)

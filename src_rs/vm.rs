@@ -411,7 +411,7 @@ pub fn raw_equal(t1: &TValue, t2: &TValue) -> bool {
         (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
         (TValue::CClosure(a), TValue::CClosure(b)) => std::ptr::eq(a as *const _, b as *const _),
         (TValue::UserData(a), TValue::UserData(b)) => std::ptr::eq(a as *const _, b as *const _),
-        (TValue::Thread(a), TValue::Thread(b)) => std::ptr::eq(a as *const _, b as *const _),
+        (TValue::Thread(a), TValue::Thread(b)) => Rc::ptr_eq(&a.context, &b.context),
         _ => false,
     }
 }
@@ -857,8 +857,9 @@ pub fn concat_stack(
             append_val_to_string(&mut result, &stack[idx]);
         }
         use crate::strings::ShortString;
+        let h = crate::strings::rust_hash(&result);
         let ls = LuaString::Short(std::sync::Arc::new(ShortString {
-            hash: 0,
+            hash: h,
             contents: result,
         }));
         let target_idx = top - n;
@@ -871,17 +872,21 @@ pub fn concat_stack(
 
 fn string_from_int(i: i64) -> LuaString {
     use crate::strings::ShortString;
+    let s = i.to_string();
+    let h = crate::strings::rust_hash(&s);
     LuaString::Short(std::sync::Arc::new(ShortString {
-        hash: 0,
-        contents: i.to_string(),
+        hash: h,
+        contents: s,
     }))
 }
 
 fn string_from_float(f: f64) -> LuaString {
     use crate::strings::ShortString;
+    let s = format_float(f);
+    let h = crate::strings::rust_hash(&s);
     LuaString::Short(std::sync::Arc::new(ShortString {
-        hash: 0,
-        contents: format_float(f),
+        hash: h,
+        contents: s,
     }))
 }
 
@@ -1119,6 +1124,7 @@ pub fn push_closure(
                     stack_index: idx,
                     next: None,
                     previous: None,
+                    tbc: false,
                 })));
             } else {
                 upvals.push(Rc::new(RefCell::new(UpVal::Closed {

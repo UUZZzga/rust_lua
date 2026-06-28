@@ -5172,7 +5172,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 is_sc_number(&e2.exp)
             };
 
-            if let Some(sc_val) = sc_imm {
+            if let Some((sc_val, isfloat)) = sc_imm {
                 let (reg, imm, reg_alloc) = if is_eq {
                     let alloc = !matches!(e2.exp.kind, ExpKind::NonReloc);
                     let reg = if alloc {
@@ -5228,7 +5228,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     Token::LtEq | Token::GtEq => OpCode::LEI,
                     _ => OpCode::EQI,
                 };
-                fs.code_abc_k(imm_op, reg, imm, 0, k != 0);
+                fs.code_abc_k(imm_op, reg, imm, isfloat as i32, k != 0);
                 let jmp_pc = fs.jump();
                 if reg_alloc
                     || (matches!(ec.kind, ExpKind::NonReloc | ExpKind::Call | ExpKind::Vararg) && reg >= fs.nvarstack())
@@ -5238,7 +5238,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 }
                 e = ExprItem { exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64) };
             } else if is_gt {
-                if let Some(sc_val) = is_sc_number(&e2.exp) {
+                if let Some((sc_val, isfloat)) = is_sc_number(&e2.exp) {
                     let r_alloc = !matches!(ec.kind, ExpKind::NonReloc);
                     let reg = if r_alloc {
                         fs.exp_to_reg(&ec)
@@ -5259,7 +5259,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         Token::GtEq => OpCode::GEI,
                         _ => OpCode::GTI,
                     };
-                    fs.code_abc_k(imm_op, reg, imm, 0, k != 0);
+                    fs.code_abc_k(imm_op, reg, imm, isfloat as i32, k != 0);
                     let jmp_pc = fs.jump();
                     if r_alloc
                         || (matches!(ec.kind, ExpKind::NonReloc | ExpKind::Call | ExpKind::Vararg) && reg >= fs.nvarstack())
@@ -5367,9 +5367,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         }
                         reg
                     };
-                    if let Some(sc_val) = is_sc_number(&e2.exp) {
+                    if let Some((sc_val, isfloat)) = is_sc_number(&e2.exp) {
                             let sc = int_to_sc(sc_val);
-                            fs.code_abc_k(OpCode::EQI, r, sc, 0, is_eq_op);
+                            fs.code_abc_k(OpCode::EQI, r, sc, isfloat as i32, is_eq_op);
                             let jmp_pc = fs.jump();
                             if r_alloc || (matches!(ec.kind, ExpKind::NonReloc | ExpKind::Call | ExpKind::Vararg) && r >= fs.nvarstack()) { fs.free_reg(); }
                             e = ExprItem { exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64) };
@@ -5416,7 +5416,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                 } else {
                     // LT/LE case: check if left operand is SC number
                     // (transform A < B to B > A, A <= B to B >= A)
-                    if let Some(sc_val) = is_sc_number(&ec) {
+                    if let Some((sc_val, isfloat)) = is_sc_number(&ec) {
                         let r_alloc = !matches!(e2.exp.kind, ExpKind::NonReloc | ExpKind::Call | ExpKind::Vararg);
                         let reg = if r_alloc {
                             fs.exp_to_reg(&e2.exp)
@@ -5440,7 +5440,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                             Token::LtEq => OpCode::GEI,
                             _ => OpCode::GTI,
                         };
-                        fs.code_abc_k(imm_op, reg, imm, 0, k != 0);
+                        fs.code_abc_k(imm_op, reg, imm, isfloat as i32, k != 0);
                         let jmp_pc = fs.jump();
                         if r_alloc || (matches!(e2.exp.kind, ExpKind::NonReloc | ExpKind::Call | ExpKind::Vararg) && reg >= fs.nvarstack()) {
                             fs.free_reg();
@@ -8104,10 +8104,10 @@ fn int_to_sc(v: i64) -> i32 {
 }
 
 /// 获取表达式的 SC 整数值 (C 的 isSCnumber 对应)
-/// 如果 Int 常量适合 SC，返回 Some(整数值)；
-/// 如果 Float 常量可精确转为 Int 且适合 SC，返回 Some(整数值)；
-/// 否则返回 None。
-fn is_sc_number(desc: &ExpDesc) -> Option<i64> {
+/// 返回 Some((整数值, isfloat))；isfloat=true 表示原常量是浮点数（如 5.0）。
+/// C Lua 在 LTI/LEI/GTI/GEI/EQI 指令的 C 字段中存储此标志，
+/// 元方法调用时需还原为 float 类型（见 luaT_callorderiTM）。
+fn is_sc_number(desc: &ExpDesc) -> Option<(i64, bool)> {
     if desc.has_jumps() {
         return None;
     }
@@ -8117,7 +8117,7 @@ fn is_sc_number(desc: &ExpDesc) -> Option<i64> {
             // C's fitsC: (unsigned)i + OFFSET_sC <= MAXARG_C, where OFFSET_sC=127, MAXARG_C=255
             // So range is -127 to 128
             if v >= -127 && v <= 128 {
-                Some(v)
+                Some((v, false))
             } else {
                 None
             }
@@ -8130,7 +8130,7 @@ fn is_sc_number(desc: &ExpDesc) -> Option<i64> {
                 let i = fl as i64;
                 // C's fitsC: range -127 to 128
                 if i >= -127 && i <= 128 {
-                    Some(i)
+                    Some((i, true))
                 } else {
                     None
                 }

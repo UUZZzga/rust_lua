@@ -312,7 +312,7 @@ impl TValue {
     /// When: 调用 .is_function()
     /// Then: 返回 true
     pub fn is_function(&self) -> bool {
-        matches!(self, TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_))
+        matches!(self, TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) | TValue::LightUserData(_))
     }
 
     /// 尝试获取整数值
@@ -388,7 +388,7 @@ impl PartialEq for TValue {
             (TValue::CClosure(a), TValue::CClosure(b)) => std::ptr::eq(a, b),
             (TValue::LCFn(a), TValue::LCFn(b)) => std::ptr::eq(a.func as *const (), b.func as *const ()),
             (TValue::UserData(a), TValue::UserData(b)) => std::ptr::eq(a, b),
-            (TValue::Thread(a), TValue::Thread(b)) => std::ptr::eq(a, b),
+            (TValue::Thread(a), TValue::Thread(b)) => Rc::ptr_eq(&a.context, &b.context),
             _ => false,
         }
     }
@@ -456,7 +456,7 @@ impl Hash for TValue {
             }
             TValue::Thread(t) => {
                 11u8.hash(state);
-                (t as *const LuaThread as usize).hash(state);
+                (Rc::as_ptr(&t.context) as usize).hash(state);
             }
         }
     }
@@ -630,6 +630,9 @@ pub enum UpVal {
         next: Option<usize>,
         /// 链表中的上一个上值索引
         previous: Option<usize>,
+        /// 是否为 to-be-closed 上值（对应 C 的 uv->tbc）
+        /// close 时若为 true，需调用 __close 元方法
+        tbc: bool,
     },
     /// 关闭的上值（持有值的副本）
     Closed {
@@ -805,6 +808,87 @@ pub struct Udata {
 // 规约：线程/协程
 // ============================================================================
 
+/// 调用帧 — 保存 caller 的 VM 执行上下文（对应 C 的 CallInfo 中 Lua 部分）
+///
+/// 当 op_call 调用一个 LClosure 时，把当前 code/base/pc 等保存到 CallFrame，
+/// 切换到被调用函数的原型；op_return 时从 CallFrame 恢复。
+#[derive(Debug, Clone)]
+pub struct CallFrame {
+    pub code: Vec<Instruction>,
+    pub constants: Vec<TValue>,
+    pub upval_descs: Vec<UpvalDesc>,
+    pub protos: Vec<Proto>,
+    pub base: usize,
+    pub return_pc: usize,
+    pub return_base: usize,
+    pub num_results: i32,
+    pub num_params: u8,
+    pub is_vararg: bool,
+    pub proto_flag: u8,
+    pub nextraargs: i32,
+    pub closure_upvals: Vec<UpValRef>,
+    pub tbc_list: Option<usize>,
+    pub open_upval: Option<usize>,
+}
+
+/// 协程挂起时保存的 VM 执行上下文
+///
+/// coroutine.yield 时把当前执行状态保存到 ThreadContext，
+/// coroutine.resume 时从 ThreadContext 恢复继续执行。
+#[derive(Debug, Clone, Default)]
+pub struct ThreadContext {
+    /// 是否已开始执行（首次 resume 后置 true）
+    pub started: bool,
+    /// 协程当前状态（共享可变，对应 LuaThread.status 的真实来源）
+    pub status: ThreadStatus,
+    /// 挂起时保存的 VM 执行上下文
+    pub saved_code: Vec<Instruction>,
+    pub saved_constants: Vec<TValue>,
+    pub saved_upval_descs: Vec<UpvalDesc>,
+    pub saved_protos: Vec<Proto>,
+    pub saved_base: usize,
+    pub saved_pc: usize,
+    pub saved_top: usize,
+    pub saved_num_params: u8,
+    pub saved_is_vararg: bool,
+    pub saved_proto_flag: u8,
+    pub saved_nextraargs: i32,
+    pub saved_closure_upvals: Vec<UpValRef>,
+    pub saved_open_upval: Option<usize>,
+    pub saved_tbc_list: Option<usize>,
+    pub saved_call_stack: Vec<CallFrame>,
+    pub saved_stack: Vec<TValue>,
+    pub saved_hook_old_pc: i32,
+    /// 协程自己的 hook 设置（由 debug.sethook(co, ...) 设置）
+    /// resume 时恢复到 state，yield 时从 state 保存回此处
+    pub saved_hook_func: Option<TValue>,
+    pub saved_hook_mask: i32,
+    pub saved_hook_count: i32,
+    pub saved_current_hook_count: i32,
+    pub saved_allowhook: bool,
+    /// yield 调用的 nresults（恢复时用于调整 resume 参数数量）
+    /// 仅在 started=true 且上次是 yield 挂起时有意义
+    pub saved_yield_nresults: i32,
+    /// 协程错误时保存的错误信息（status=Error 时有效）
+    /// coroutine.close 时若协程已 dead 且有错误，应返回该错误
+    pub error_msg: Option<TValue>,
+    /// 首次 resume 时收集的跨协程 upvalue 信息（uv_ref + original_stack_index）
+    /// 用于 close_suspended_coroutine 时把 Closed upvalue 值同步回父栈
+    pub upval_origins: Vec<(UpValRef, usize)>,
+    /// wrap 协程创建时的 current_thread 指针值（用于检测首次 resume 是否跨栈）
+    /// 0 表示在主线程创建；非 0 表示在某个协程内创建（Rc::as_ptr 的 usize 值）
+    pub wrap_creator_thread_ptr: usize,
+    /// wrap 协程创建时保存的开 upvalue 信息（uv_ref, original_stack_index, saved_value）
+    /// 首次 resume 时若同栈则从 state.stack 读最新值关闭；若跨栈则用 saved_value 关闭
+    pub pending_wrap_upvals: Vec<(UpValRef, usize, TValue)>,
+    /// yield 时关闭的 Open upvalue 信息（协程内部创建的闭包的 upvalue）
+    /// resume 时把 Closed 值同步回协程栈并恢复 Open
+    pub yield_upval_origins: Vec<(UpValRef, usize)>,
+    /// 协程 yield 时保存的 pcall_protection_stack 片段（协程内部 push 的部分）
+    /// resume 时恢复到 state.pcall_protection_stack，协程结束时不清除（由调用者清理）
+    pub saved_pcall_protection_stack: Vec<crate::state::PcallProtection>,
+}
+
 /// Lua 线程（协程）
 ///
 /// Scenario: 线程的生命周期
@@ -819,6 +903,10 @@ pub struct LuaThread {
     pub status: ThreadStatus,
     /// 协程体函数 (coroutine.create 的参数)
     pub function: Option<Box<TValue>>,
+    /// 是否为主线程
+    pub is_main: bool,
+    /// 持久化执行上下文（Rc 共享，clone 后仍指向同一份状态）
+    pub context: Rc<RefCell<ThreadContext>>,
 }
 
 /// 线程状态
@@ -828,6 +916,12 @@ pub enum ThreadStatus {
     Suspended,
     Normal,
     Error,
+}
+
+impl Default for ThreadStatus {
+    fn default() -> Self {
+        ThreadStatus::Suspended
+    }
 }
 
 // ============================================================================
@@ -2073,7 +2167,7 @@ mod tests {
 
     #[test]
     fn test_upval_open() {
-        let uv = UpVal::Open { stack_index: 3, next: None, previous: None };
+        let uv = UpVal::Open { stack_index: 3, next: None, previous: None, tbc: false };
         match uv {
             UpVal::Open { stack_index, .. } => assert_eq!(stack_index, 3),
             _ => panic!("expected Open"),
@@ -2082,7 +2176,7 @@ mod tests {
 
     #[test]
     fn test_upval_open_is_open() {
-        let uv = UpVal::Open { stack_index: 3, next: None, previous: None };
+        let uv = UpVal::Open { stack_index: 3, next: None, previous: None, tbc: false };
         assert!(uv.is_open());
         assert_eq!(uv.level(), Some(3));
     }
