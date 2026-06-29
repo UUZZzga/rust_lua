@@ -58,13 +58,16 @@ echo "Running project..."
 # 测试时限制内存为 512MB
 ulimit -v 524288
 
-for test_file in tests_lua/db.lua tests_lua/calls.lua tests_lua/coroutine.lua tests_lua/strings.lua tests_lua/utf8.lua; do
+for test_file in tests_lua/db.lua tests_lua/calls.lua tests_lua/coroutine.lua tests_lua/math.lua tests_lua/strings.lua tests_lua/utf8.lua; do
     test_name=$(basename "$test_file")
     log_name="logs/${test_name%.lua}_run.log"
     echo "Running $test_name ..."
-    ./target/debug/lua "$test_file" > "$log_name" 2>&1
+    timeout 10 ./target/debug/lua "$test_file" > "$log_name" 2>&1
     RUN_EXIT=$?
     if [ $RUN_EXIT -ne 0 ]; then
+        if [ $RUN_EXIT -eq 124 ]; then
+            echo "Timeout: $test_name use LUA_VM_TRACE=1 to debug"
+        fi
         echo "ERROR: $test_name failed (exit code $RUN_EXIT)!"
         echo "Check $log_name for details"
         exit 2

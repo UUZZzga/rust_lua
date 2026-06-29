@@ -89,17 +89,22 @@ impl Table {
                 data.hash.get(key).cloned()
             }
             TValue::Float(f) => {
-                let i = *f as i64;
-                if (i as f64).to_bits() == f.to_bits() && i > 0 && *f != -0.0 {
-                    let idx = (i - 1) as usize;
-                    if idx < data.array.len() {
-                        let v = &data.array[idx];
-                        if !matches!(v, TValue::Nil(NilKind::Empty)) {
-                            return Some(v.clone());
+                // 对应 C: lua_numbertointeger — 浮点能精确转换为整数时，用整数键
+                // 包括 -0.0 → 0；排除 NaN/Inf 和超出 i64 范围的值
+                if let Some(i) = float_key_to_int(*f) {
+                    if i > 0 {
+                        let idx = (i - 1) as usize;
+                        if idx < data.array.len() {
+                            let v = &data.array[idx];
+                            if !matches!(v, TValue::Nil(NilKind::Empty)) {
+                                return Some(v.clone());
+                            }
                         }
                     }
+                    data.hash.get(&TValue::Integer(i)).cloned()
+                } else {
+                    data.hash.get(key).cloned()
                 }
-                data.hash.get(key).cloned()
             }
             _ => data.hash.get(key).cloned(),
         }
@@ -139,17 +144,26 @@ impl Table {
                 }
             }
             TValue::Float(f) => {
-                let i = *f as i64;
-                if (i as f64).to_bits() == f.to_bits() && i > 0 && *f != -0.0 {
-                    let idx = (i - 1) as usize;
-                    if idx < data.array.len() {
-                        if is_nil {
-                            data.array[idx] = TValue::Nil(NilKind::Empty);
-                        } else {
-                            data.array[idx] = value;
+                // 对应 C: luaH_set — 浮点能精确转换为整数时，用整数键插入
+                if let Some(i) = float_key_to_int(*f) {
+                    if i > 0 {
+                        let idx = (i - 1) as usize;
+                        if idx < data.array.len() {
+                            if is_nil {
+                                data.array[idx] = TValue::Nil(NilKind::Empty);
+                            } else {
+                                data.array[idx] = value;
+                            }
+                            return;
                         }
-                        return;
                     }
+                    let int_key = TValue::Integer(i);
+                    if is_nil {
+                        data.hash.remove(&int_key);
+                    } else {
+                        data.hash.insert(int_key, value);
+                    }
+                    return;
                 }
             }
             _ => {}
@@ -468,6 +482,28 @@ pub fn new_table() -> Table {
 
 pub fn new_table_with_capacity(narray: usize, nhsize: usize) -> Table {
     Table::with_capacity(narray, nhsize)
+}
+
+/// 浮点数键转换为整数键 — 对应 C 的 `lua_numbertointeger`
+///
+/// 当浮点数能精确表示为 i64 范围内的整数时返回该整数。
+/// 包括 `-0.0 → 0`；排除 NaN、Inf 和超出 i64 范围的值。
+///
+/// 对应 C 实现:
+/// ```c
+/// #define lua_numbertointeger(n,p) \
+///   ((*(p) = (lua_Integer)(n)), (lua_Number)(*(p)) == (n))
+/// ```
+fn float_key_to_int(f: f64) -> Option<i64> {
+    // 范围检查：i64::MAX as f64 实际是 2^63（向上舍入），所以 < i64::MAX as f64
+    // 能正确排除 2^63 及以上的值；NaN 与任何数比较都是 false，会被排除
+    if f >= i64::MIN as f64 && f < i64::MAX as f64 {
+        let i = f as i64;
+        if (i as f64) == f {
+            return Some(i);
+        }
+    }
+    None
 }
 
 // ============================================================================

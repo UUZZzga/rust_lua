@@ -164,13 +164,13 @@ pub fn math_atan(y: f64, x: Option<f64>) -> f64 {
 pub fn math_tointeger(v: &TValue) -> Option<i64> {
     match v {
         TValue::Integer(n) => Some(*n),
-        TValue::Float(f) => {
-            // 对应 C 的 lua_numbertointeger
-            let i = *f as i64;
-            if (i as f64) == *f {
-                Some(i)
-            } else {
-                None
+        TValue::Float(f) => crate::vm::float_to_integer(*f, crate::vm::F2IMode::Eq),
+        TValue::Str(s) => {
+            // 对应 C 的 luaV_tointeger: l_strton 转成数字，再转整数
+            match crate::objects::str2num(s.as_str()) {
+                Some(TValue::Integer(n)) => Some(n),
+                Some(TValue::Float(f)) => crate::vm::float_to_integer(f, crate::vm::F2IMode::Eq),
+                _ => None,
             }
         }
         _ => None,
@@ -180,9 +180,12 @@ pub fn math_tointeger(v: &TValue) -> Option<i64> {
 /// 将浮点数转为整数 (如果可以无损转换), 否则保持浮点
 /// 对应 C 的 pushnumint
 fn push_num_int(d: f64) -> TValue {
-    let i = d as i64;
-    if (i as f64) == d {
-        TValue::Integer(i)
+    // C 的 lua_numbertointeger: d >= MININTEGER && d < -MININTEGER
+    // -MININTEGER = 2^63 (可精确表示为 f64)
+    let min_int_f = i64::MIN as f64;
+    let max_int_f = -min_int_f;
+    if d >= min_int_f && d < max_int_f {
+        TValue::Integer(d as i64)
     } else {
         TValue::Float(d)
     }
@@ -247,10 +250,8 @@ pub fn math_modf(v: &TValue) -> Result<(TValue, TValue), String> {
             Ok((v.clone(), TValue::Float(0.0)))
         }
         TValue::Float(f) => {
-            if f.is_nan() || f.is_infinite() {
-                return Ok((TValue::Float(*f), TValue::Float(0.0)));
-            }
             // 对应 C: ip = (n < 0) ? ceil(n) : floor(n)
+            // NaN/Inf 走正常路径: NaN 的 frac 为 NaN, Inf 的 frac 为 0.0
             let ip = if *f < 0.0 { f.ceil() } else { f.floor() };
             let frac = if *f == ip { 0.0 } else { *f - ip };
             Ok((push_num_int(ip), TValue::Float(frac)))
@@ -487,7 +488,7 @@ impl RandState {
         // 计算 >= n 的最小 Mersenne 数 (2^k - 1)
         let mut lim = n;
         let mut sh = 1u32;
-        while (lim & (lim + 1)) != 0 {
+        while (lim & (lim.wrapping_add(1))) != 0 {
             lim |= lim >> sh;
             sh *= 2;
         }
@@ -553,7 +554,7 @@ pub fn math_random(
                 }
                 // 投影到 [0, up - low] 然后加 low
                 let p = state.project(rv, (up as u64).wrapping_sub(low as u64));
-                Ok(TValue::Integer(p as i64 + low))
+                Ok(TValue::Integer(p.wrapping_add(low as u64) as i64))
             }
         }
         2 => {
@@ -563,7 +564,7 @@ pub fn math_random(
                 return Err("bad argument #1 to 'random' (interval is empty)".to_string());
             }
             let p = state.project(rv, (up as u64).wrapping_sub(low as u64));
-            Ok(TValue::Integer(p as i64 + low))
+            Ok(TValue::Integer(p.wrapping_add(low as u64) as i64))
         }
         _ => Err("wrong number of arguments to 'random'".to_string()),
     }
@@ -1410,7 +1411,7 @@ mod tests {
         assert_eq!(math_tointeger(&TValue::Float(42.0)), Some(42));
         assert_eq!(math_tointeger(&TValue::Float(42.5)), None);
         assert_eq!(math_tointeger(&TValue::Boolean(true)), None);
-        assert_eq!(math_tointeger(&make_str("42")), None);
+        assert_eq!(math_tointeger(&make_str("42")), Some(42));
     }
 
     #[test]

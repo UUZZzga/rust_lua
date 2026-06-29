@@ -8072,8 +8072,9 @@ fn to_int_const(e: &ExpDesc) -> Option<i64> {
         ExpKind::Int => Some(e.info),
         ExpKind::Float => {
             let f = f64::from_bits(e.info as u64);
-            let i = f as i64;
-            if i as f64 == f { Some(i) } else { None }
+            // Must match C's luaV_flttointeger (F2Ieq) + lua_numbertointeger range check.
+            // Rust's `f as i64` saturates, wrongly converting 2^63 to i64::MAX.
+            crate::vm::float_to_integer(f, crate::vm::F2IMode::Eq)
         }
         _ => None,
     }
@@ -8517,10 +8518,8 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                             }
                             ExpKind::Float => {
                                 // Like C's constfolding: convert float to int, then BNOT
-                                let f = f64::from_bits(ei.exp.info as u64);
-                                let fi = f as i64;
-                                if (fi as f64) == f {
-                                    ExpDesc::new(ExpKind::Int, !fi)
+                                if let Some(i) = to_int_const(&ei.exp) {
+                                    ExpDesc::new(ExpKind::Int, !i)
                                 } else {
                                     let r = fs.exp_to_reg(&ei.exp);
                                     let pc = fs.code_abc(OpCode::BNOT, 0, r, 0);

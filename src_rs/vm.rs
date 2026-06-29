@@ -115,14 +115,19 @@ pub fn float_to_integer(n: f64, mode: F2IMode) -> Option<i64> {
             F2IMode::Floor => {}
             F2IMode::Ceil => {
                 let ceil = n.ceil();
-                if ceil > i64::MAX as f64 {
+                // 注意: i64::MAX as f64 = 2^63 (向上舍入), 所以用 >= 排除 2^63 及以上
+                // (2^63 超出 i64 范围, 但 Rust 饱和转换会错误地返回 i64::MAX)
+                if ceil >= i64::MAX as f64 || ceil < i64::MIN as f64 {
                     return None;
                 }
                 return Some(ceil as i64);
             }
         }
     }
-    if floor > i64::MAX as f64 || floor < i64::MIN as f64 {
+    // 范围检查: floor 必须在 [i64::MIN, i64::MAX) 内
+    // i64::MIN as f64 = -2^63 (精确), i64::MAX as f64 = 2^63 (向上舍入)
+    // 用 >= 排除 2^63, 用 >= 包含 -2^63
+    if floor >= i64::MAX as f64 || floor < i64::MIN as f64 {
         return None;
     }
     Some(floor as i64)
@@ -154,6 +159,11 @@ pub fn to_number_ns(obj: &TValue) -> Option<f64> {
 /// When: 调用 to_number
 /// Then: 返回 Some(3.14)
 ///
+/// Scenario: 带空格的字符串 " 3e0 " 转浮点
+/// Given: TValue::Str(" 3e0 ")
+/// When: 调用 to_number
+/// Then: 返回 Some(3.0)
+///
 /// Scenario: 无效字符串
 /// Given: TValue::Str("abc")
 /// When: 调用 to_number
@@ -162,7 +172,11 @@ pub fn to_number(obj: &TValue) -> Option<f64> {
     match obj {
         TValue::Float(f) => Some(*f),
         TValue::Integer(i) => Some(*i as f64),
-        TValue::Str(s) => s.as_str().parse::<f64>().ok(),
+        TValue::Str(s) => match crate::objects::str2num(s.as_str())? {
+            TValue::Float(f) => Some(f),
+            TValue::Integer(i) => Some(i as f64),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -197,14 +211,20 @@ pub fn to_integer_ns(obj: &TValue, mode: F2IMode) -> Option<i64> {
 /// Given: TValue::Str("42")
 /// When: 调用 to_integer(obj, Eq)
 /// Then: 返回 Some(42)
+///
+/// Scenario: 带空格的字符串 " 10 " 转整数
+/// Given: TValue::Str(" 10 ")
+/// When: 调用 to_integer(obj, Eq)
+/// Then: 返回 Some(10)
 pub fn to_integer(obj: &TValue, mode: F2IMode) -> Option<i64> {
     match obj {
         TValue::Integer(i) => Some(*i),
         TValue::Float(f) => float_to_integer(*f, mode),
-        TValue::Str(s) => {
-            let parsed = s.as_str().parse::<f64>().ok()?;
-            float_to_integer(parsed, mode)
-        }
+        TValue::Str(s) => match crate::objects::str2num(s.as_str())? {
+            TValue::Integer(i) => Some(i),
+            TValue::Float(f) => float_to_integer(f, mode),
+            _ => None,
+        },
         _ => None,
     }
 }
@@ -281,8 +301,11 @@ fn strcoll_compare(a: &str, b: &str) -> Ordering {
 // ============================================================================
 
 fn int_fits_float(i: i64) -> bool {
-    let f = i as f64;
-    (f as i64) == i
+    // f64 有 53 位尾数精度，能精确表示 [-2^53, 2^53] 范围内的整数。
+    // 对应 C 的 l_intfitsf (NBM = DBL_MANT_DIG = 53)。
+    // 不能用 `i as f64` 再转回比较，因为饱和转换会让 i64::MAX 误判为可精确表示。
+    const MAX_INT_FITS_F: i64 = 1 << 53;
+    -MAX_INT_FITS_F <= i && i <= MAX_INT_FITS_F
 }
 
 fn lt_int_float(i: i64, f: f64) -> bool {
@@ -396,9 +419,7 @@ pub fn raw_equal(t1: &TValue, t2: &TValue) -> bool {
         (TValue::Nil(a), TValue::Nil(b)) => a == b,
         (TValue::Boolean(a), TValue::Boolean(b)) => a == b,
         (TValue::Integer(a), TValue::Integer(b)) => a == b,
-        (TValue::Float(a), TValue::Float(b)) => {
-            if a.is_nan() || b.is_nan() { false } else { a.to_bits() == b.to_bits() }
-        }
+        (TValue::Float(a), TValue::Float(b)) => a == b,
         (TValue::Integer(a), TValue::Float(b)) => {
             if b.is_nan() { false } else { float_to_integer(*b, F2IMode::Eq).map_or(false, |i| *a == i) }
         }
@@ -1300,9 +1321,14 @@ use crate::strings::{LuaString, StringTable};
 
     #[test]
     fn test_float_to_integer_i64_max_edge() {
+        // i64::MAX as f64 实际是 2^63 (向上舍入), 超出 i64 范围, 应返回 None
+        // 对应 C 的 lua_numbertointeger: (lua_Integer)(2^63) 是 UB/截断, 转回不等于 2^63
         let max_f = i64::MAX as f64;
-        assert_eq!(float_to_integer(max_f, F2IMode::Eq), Some(i64::MAX));
+        assert_eq!(float_to_integer(max_f, F2IMode::Eq), None);
         assert!(float_to_integer(f64::INFINITY, F2IMode::Eq).is_none());
+        // f64 能精确表示的最大 i64: 2^63 - 1024 = i64::MAX - 1023
+        let largest_fit = i64::MAX - 1023;
+        assert_eq!(float_to_integer(largest_fit as f64, F2IMode::Eq), Some(largest_fit));
     }
 
     #[test]
@@ -1954,7 +1980,7 @@ use crate::strings::{LuaString, StringTable};
     fn test_int_fits_float_large() {
         assert!(!int_fits_float(2i64.pow(53) + 1));
         assert!(int_fits_float(2i64.pow(53)));
-        assert!(int_fits_float(2i64.pow(54)));
+        assert!(!int_fits_float(2i64.pow(54)));
     }
 
     // ========================================================================

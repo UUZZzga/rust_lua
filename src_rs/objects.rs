@@ -369,18 +369,12 @@ impl PartialEq for TValue {
             (TValue::Boolean(a), TValue::Boolean(b)) => a == b,
             (TValue::LightUserData(a), TValue::LightUserData(b)) => a == b,
             (TValue::Integer(a), TValue::Integer(b)) => a == b,
-            (TValue::Float(a), TValue::Float(b)) => {
-                if a.is_nan() || b.is_nan() {
-                    false
-                } else {
-                    a.to_bits() == b.to_bits()
-                }
-            }
+            (TValue::Float(a), TValue::Float(b)) => a == b,
             (TValue::Integer(a), TValue::Float(b)) => {
-                if b.is_nan() { false } else { (*a as f64).to_bits() == b.to_bits() }
+                if b.is_nan() { false } else { (*a as f64) == *b }
             }
             (TValue::Float(a), TValue::Integer(b)) => {
-                if a.is_nan() { false } else { a.to_bits() == (*b as f64).to_bits() }
+                if a.is_nan() { false } else { *a == (*b as f64) }
             }
             (TValue::Str(a), TValue::Str(b)) => a == b,
             (TValue::Table(a), TValue::Table(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
@@ -1164,22 +1158,41 @@ pub fn hexavalue(c: u8) -> u8 {
 /// When: 调用 str2num("")
 /// Then: 返回 None
 pub fn str2num(s: &str) -> Option<TValue> {
-    // 规约: 待实现
     let s = s.trim();
     if s.is_empty() {
         return None;
     }
-    // 尝试十六进制
+    // 提取可选符号 — 对应 C 的 isneg(&s)
+    let (neg, s) = if let Some(rest) = s.strip_prefix('-') {
+        (true, rest)
+    } else if let Some(rest) = s.strip_prefix('+') {
+        (false, rest)
+    } else {
+        (false, s)
+    };
+    // 尝试十六进制 — 对应 C: if (s[0]=='0' && (s[1]=='x'||s[1]=='X'))
     if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        return parse_hex_int(rest).map(TValue::Integer);
+        // 检查是否是浮点数（包含 '.' 或 'p'/'P'）
+        let is_float = rest.contains('.') || rest.contains('p') || rest.contains('P');
+        if is_float {
+            return parse_hex_float(rest).map(|f| {
+                TValue::Float(if neg { -f } else { f })
+            });
+        }
+        return parse_hex_int(rest).map(|v| {
+            TValue::Integer(if neg { (v as u64).wrapping_neg() as i64 } else { v })
+        });
     }
-    // 尝试十进制整数
-    if let Some(i) = parse_dec_int(s) {
+    // 尝试十进制整数（含符号）
+    let signed_s = if neg { format!("-{}", s) } else { s.to_string() };
+    if let Some(i) = parse_dec_int(&signed_s) {
         return Some(TValue::Integer(i));
     }
-    // 尝试浮点数
-    if let Ok(f) = s.parse::<f64>() {
-        return Some(TValue::Float(f));
+    // 尝试浮点数（含符号）— 拒绝 "inf"/"nan"（对应 C 的 l_str2d 检查 .xXnN）
+    if !signed_s.contains('n') && !signed_s.contains('N') {
+        if let Ok(f) = signed_s.parse::<f64>() {
+            return Some(TValue::Float(f));
+        }
     }
     None
 }
@@ -1189,15 +1202,126 @@ fn parse_dec_int(s: &str) -> Option<i64> {
 }
 
 fn parse_hex_int(s: &str) -> Option<i64> {
-    let s = s.trim();
-    if s.is_empty() {
+    // C 的 l_str2int: 只读取十六进制数字，然后检查剩余是否全为空格
+    let mut result: u64 = 0;
+    let mut empty = true;
+    let bytes = s.as_bytes();
+    let mut pos = 0;
+    while pos < bytes.len() && bytes[pos].is_ascii_hexdigit() {
+        let digit = hexavalue(bytes[pos]) as u64;
+        result = result.wrapping_mul(16).wrapping_add(digit);
+        empty = false;
+        pos += 1;
+    }
+    if empty {
         return None;
     }
-    let mut result: i64 = 0;
-    for &b in s.as_bytes() {
-        let digit = hexavalue(b) as i64;
-        result = result.checked_mul(16)?.checked_add(digit)?;
+    // 剩余必须全为空格（对应 C 的 skip trailing spaces + *s == '\0' 检查）
+    let remaining = &s[pos..];
+    if !remaining.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' | b'\x0b')) {
+        return None;
     }
+    Some(result as i64)
+}
+
+/// 解析十六进制浮点数 (对应 C 的 lua_strx2number)
+///
+/// 输入格式: <int_part>[.<frac_part>][p<exp>]
+/// 例如: "1.999999999999ap-4" → 0.1
+///
+/// 按照 C 的实现，用 f64 直接累积所有数字（最多 MAXSIGDIG 位），
+/// 让 IEEE 754 自动处理舍入，最后用 ldexp(r, e) 调整指数。
+pub fn parse_hex_float(s: &str) -> Option<f64> {
+    const MAXSIGDIG: usize = 30;
+
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+    let mut r: f64 = 0.0;
+    let mut sigdig: usize = 0;
+    let mut nosigdig: usize = 0;
+    let mut e: i32 = 0;
+    let mut hasdot = false;
+
+    // 读取尾数部分（数字和小数点）
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '.' {
+            if hasdot {
+                break;
+            }
+            hasdot = true;
+        } else if c.is_ascii_hexdigit() {
+            let d = c.to_digit(16).unwrap();
+            if sigdig == 0 && d == 0 {
+                nosigdig += 1;
+            } else {
+                sigdig += 1;
+                if sigdig <= MAXSIGDIG {
+                    r = r * 16.0 + d as f64;
+                } else {
+                    e += 1;
+                }
+            }
+            if hasdot {
+                e -= 1;
+            }
+        } else {
+            break;
+        }
+        i += 1;
+    }
+
+    if nosigdig + sigdig == 0 {
+        return None;
+    }
+
+    e *= 4;
+
+    // 处理 p 指数部分
+    if i < chars.len() && (chars[i] == 'p' || chars[i] == 'P') {
+        i += 1;
+        let neg_exp = if i < chars.len() && chars[i] == '-' {
+            i += 1;
+            true
+        } else if i < chars.len() && chars[i] == '+' {
+            i += 1;
+            false
+        } else {
+            false
+        };
+        if i >= chars.len() || !chars[i].is_ascii_digit() {
+            return None;
+        }
+        let mut exp_val: i32 = 0;
+        while i < chars.len() && chars[i].is_ascii_digit() {
+            exp_val = exp_val * 10 + (chars[i] as u8 - b'0') as i32;
+            i += 1;
+        }
+        if neg_exp { e -= exp_val; } else { e += exp_val; }
+    }
+
+    // 必须处理完所有字符（对应 C 的 endptr 检查）
+    if i != chars.len() {
+        return None;
+    }
+
+    // ldexp(r, e) = r * 2^e
+    // 用位操作构造精确的 2^e，避免 powi 的精度问题
+    let result = if r == 0.0 || !r.is_finite() {
+        r
+    } else if e >= 1023 {
+        f64::INFINITY * r.signum()
+    } else if e <= -1075 {
+        0.0_f64.copysign(r)
+    } else {
+        let pow2 = if e >= -1022 {
+            f64::from_bits(((e + 1023) as u64) << 52)
+        } else {
+            f64::from_bits(1u64 << (e + 1074))
+        };
+        r * pow2
+    };
+
     Some(result)
 }
 

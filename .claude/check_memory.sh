@@ -2,14 +2,17 @@
 # Hook 脚本：校验命令是否符合内存限制规则
 # - 构建命令必须使用 systemd-run 绕过内存限制
 # - 测试命令必须使用 ulimit -v 524288 限制内存为 512MB
-# - shell 脚本（如 _run_test.sh）也会被扫描，防止绕过
+# - shell/Python 脚本也会被扫描内容，防止绕过
 
-# 提取实际命令
-if [ -p /dev/stdin ] || [ -f /dev/stdin ]; then
-    COMMAND=$(jq -r '.tool_input.command' < /dev/stdin)
+# 提取实际命令（支持 pipe 输入和交互式终端输入）
+if [ -t 0 ]; then
+    # 交互式终端：读一行
+    read -r STDIN_DATA
 else
-    COMMAND=$(jq -r '.tool_input.command')  2>/dev/null || COMMAND=""
+    # Pipe/重定向：读全部
+    STDIN_DATA=$(cat)
 fi
+COMMAND=$(echo "$STDIN_DATA" | jq -r '.tool_input.command' 2>/dev/null || echo "")
 
 if [ -z "$COMMAND" ]; then
     exit 0
@@ -34,24 +37,27 @@ if echo "$COMMAND" | grep -qE '(\./target/.*/lua .*tests_lua/|lua .*\.lua)'; the
 fi
 
 # ================================================================
-# 增强检测：扫描 shell 脚本内容，防止通过脚本绕过内存限制
+# 增强检测：扫描脚本内容，防止通过脚本绕过内存限制
+# 支持：shell 脚本 (.sh) 和 Python 脚本 (.py)
 # ================================================================
-# 从命令中提取脚本路径（支持 bash/sh <script> 或直接 ./<script>.sh）
+PROJECT_ROOT="/media/uuzz/6283521EEF804B69/GameProjects/lua-5.5.0"
+
+# 从命令中提取脚本路径
 SCRIPT_PATH=""
-if echo "$COMMAND" | grep -qE '(^| )((bash|sh|source) +|\./)([^ ]*\.sh)'; then
-    # 匹配 bash run.sh, sh run.sh, source run.sh, ./run.sh 等形式
-    SCRIPT_PATH=$(echo "$COMMAND" | sed -n 's/.*\(bash\|sh\|source\) \+\([^ ]*\.sh\).*/\2/p')
-    if [ -z "$SCRIPT_PATH" ]; then
-        SCRIPT_PATH=$(echo "$COMMAND" | sed -n 's/.*\.\/\([^ ]*\.sh\).*/\1/p')
-        if [ -n "$SCRIPT_PATH" ]; then
-            SCRIPT_PATH="./$SCRIPT_PATH"
-        fi
+# 匹配 bash/sh/source <script>
+if echo "$COMMAND" | grep -qE '(^| )((bash|sh|source) +)([^ ]+\.(sh|py))'; then
+    SCRIPT_PATH=$(echo "$COMMAND" | sed -n 's/.*\(bash\|sh\|source\) \+\([^ ]*\.\(sh\|py\)\).*/\2/p')
+fi
+# 匹配 python3/python <script>
+if [ -z "$SCRIPT_PATH" ]; then
+    if echo "$COMMAND" | grep -qE '(^| )(python|python3) +[^ ]+\.py'; then
+        SCRIPT_PATH=$(echo "$COMMAND" | sed -n 's/.*\(python\|python3\) \+\([^ ]*\.py\).*/\2/p')
     fi
 fi
-# 也匹配直接以 ./xxx.sh 开头的命令
+# 匹配直接以 ./xxx.sh 或 ./xxx.py 开头的命令
 if [ -z "$SCRIPT_PATH" ]; then
-    if echo "$COMMAND" | grep -qE '^\./[^ ]+\.sh'; then
-        SCRIPT_PATH=$(echo "$COMMAND" | sed -n 's/^\(\.\/[^ ]*\.sh\).*/\1/p')
+    if echo "$COMMAND" | grep -qE '^\./[^ ]+\.(sh|py)'; then
+        SCRIPT_PATH=$(echo "$COMMAND" | sed -n 's/^\(\.\/[^ ]*\.\(sh\|py\)\).*/\1/p')
     fi
 fi
 
@@ -59,38 +65,75 @@ fi
 if [ -n "$SCRIPT_PATH" ]; then
     # 如果是相对路径，转成绝对路径
     if [[ "$SCRIPT_PATH" != /* ]]; then
-        # 从命令中提取 cwd（如果有）
-        ABS_SCRIPT_PATH="/media/uuzz/6283521EEF804B69/GameProjects/lua-5.5.0/${SCRIPT_PATH#./}"
+        ABS_SCRIPT_PATH="${PROJECT_ROOT}/${SCRIPT_PATH#./}"
     else
         ABS_SCRIPT_PATH="$SCRIPT_PATH"
     fi
 
     if [ -f "$ABS_SCRIPT_PATH" ]; then
         SCRIPT_CONTENT=$(cat "$ABS_SCRIPT_PATH" 2>/dev/null)
+        SCRIPT_EXT="${SCRIPT_PATH##*.}"
 
-        # 检查脚本中是否包含 lua 测试执行命令
-        if echo "$SCRIPT_CONTENT" | grep -qE '(\./target/.*/lua|lua .*\.lua)'; then
-            # 脚本中包含测试执行命令，标记为测试运行
+        # --- 检测测试执行命令（适用于所有脚本类型） ---
+        HAS_TEST_CMD=0
+
+        # 检测 ./target/.../lua 或 lua xxx.lua 调用
+        if echo "$SCRIPT_CONTENT" | grep -qE '((\./)?target/[^ ]*/lua|lua .*\.lua)'; then
+            HAS_TEST_CMD=1
+        fi
+
+        if [ "$HAS_TEST_CMD" -eq 1 ]; then
             IS_TEST_RUN=1
 
-            # 检查脚本自身是否包含 ulimit
-            if ! echo "$SCRIPT_CONTENT" | grep -q 'ulimit -v 524288'; then
-                echo "ERROR: 脚本 $SCRIPT_PATH 包含 lua 测试执行命令但未设置内存限制"
-                echo "请在脚本内添加: ulimit -v 524288"
-                echo "或在运行脚本时使用: ulimit -v 524288 && $COMMAND"
-                exit 2
+            # shell 脚本检查 ulimit
+            if [ "$SCRIPT_EXT" = "sh" ]; then
+                if ! echo "$SCRIPT_CONTENT" | grep -q 'ulimit -v 524288'; then
+                    echo "ERROR: 脚本 $SCRIPT_PATH 包含 lua 测试执行命令但未设置内存限制"
+                    echo "请在脚本内添加: ulimit -v 524288"
+                    echo "或在运行脚本时使用: ulimit -v 524288 && $COMMAND"
+                    exit 2
+                fi
+                if ! echo "$SCRIPT_CONTENT" | grep -q 'timeout'; then
+                    echo "WARNING: 脚本 $SCRIPT_PATH 包含 lua 测试执行命令但未设置 timeout"
+                    echo "建议在脚本内使用 timeout 命令包装测试执行"
+                    exit 1
+                fi
             fi
 
-            # 检查脚本自身是否包含 timeout
-            if ! echo "$SCRIPT_CONTENT" | grep -q 'timeout'; then
-                echo "WARNING: 脚本 $SCRIPT_PATH 包含 lua 测试执行命令但未设置 timeout"
-                echo "建议在脚本内使用 timeout 命令包装测试执行"
-                exit 1
+            # Python 脚本：检查是否使用了 resource 模块限制内存，或者包装了 ulimit
+            if [ "$SCRIPT_EXT" = "py" ]; then
+                # 检查是否通过 subprocess 调用时使用了 ulimit/PR_SETMM
+                HAS_MEM_LIMIT=0
+
+                # 方法1：脚本自身通过 resource.setrlimit 限制
+                if echo "$SCRIPT_CONTENT" | grep -q 'resource\.setrlimit'; then
+                    HAS_MEM_LIMIT=1
+                fi
+                # 方法2：通过 prlimit 或 ulimit 包装命令
+                if echo "$SCRIPT_CONTENT" | grep -qE '(ulimit -v 524288|prlimit.*--as=524288|PR_SETMM)'; then
+                    HAS_MEM_LIMIT=1
+                fi
+                # 方法3：subprocess 调用时 shell=True 且命令中包含 ulimit
+                if echo "$SCRIPT_CONTENT" | grep -qE 'shell=True.*ulimit|ulimit.*shell=True'; then
+                    HAS_MEM_LIMIT=1
+                fi
+
+                if [ "$HAS_MEM_LIMIT" -eq 0 ]; then
+                    echo "ERROR: Python 脚本 $SCRIPT_PATH 包含 lua 测试执行但未设置内存限制"
+                    echo "请在 Python 脚本中使用 resource.setrlimit 限制内存"
+                    echo "或在 subprocess 调用中使用 'ulimit -v 524288 && <命令>'"
+                    exit 2
+                fi
             fi
         fi
 
-        # 检查脚本中是否包含构建命令
+        # --- 检测构建命令 ---
+        HAS_BUILD_CMD=0
         if echo "$SCRIPT_CONTENT" | grep -qE '(cargo build|cargo test|cargo check|cargo clippy|rustc)'; then
+            HAS_BUILD_CMD=1
+        fi
+
+        if [ "$HAS_BUILD_CMD" -eq 1 ]; then
             if ! echo "$COMMAND" | grep -q 'systemd-run.*--property=LimitAS=infinity'; then
                 if ! echo "$SCRIPT_CONTENT" | grep -q 'systemd-run.*--property=LimitAS=infinity'; then
                     echo "ERROR: 脚本 $SCRIPT_PATH 包含构建命令但未使用 systemd-run 绕过内存限制"

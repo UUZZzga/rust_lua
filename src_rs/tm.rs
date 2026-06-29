@@ -914,6 +914,8 @@ pub fn try_bin_tm(
     p2: &TValue,
     res: usize,
     tm: TagMethod,
+    p1_info: String,
+    p2_info: String,
 ) -> Result<(), VmError> {
     if !callbin_tm(state, p1, p2, res, tm)? {
         // 未找到元方法 — 根据事件类型报错
@@ -921,7 +923,7 @@ pub fn try_bin_tm(
             TagMethod::BAnd | TagMethod::BOr | TagMethod::BXor
             | TagMethod::Shl | TagMethod::Shr | TagMethod::BNot => {
                 if p1.is_number() && p2.is_number() {
-                    tointerror(p1, p2)
+                    tointerror(p1, p2, &p1_info, &p2_info)
                 } else {
                     opinterror(p1, p2, "perform bitwise operation on")
                 }
@@ -949,11 +951,14 @@ pub fn try_bin_assoc_tm(
     flip: bool,
     res: usize,
     tm: TagMethod,
+    p1_info: String,
+    p2_info: String,
 ) -> Result<(), VmError> {
     if flip {
-        try_bin_tm(state, p2, p1, res, tm)
+        // flip 时传给 try_bin_tm 的是 (p2, p1)，info 也要对应交换
+        try_bin_tm(state, p2, p1, res, tm, p2_info, p1_info)
     } else {
-        try_bin_tm(state, p1, p2, res, tm)
+        try_bin_tm(state, p1, p2, res, tm, p1_info, p2_info)
     }
 }
 
@@ -975,9 +980,11 @@ pub fn try_bini_tm(
     flip: bool,
     res: usize,
     tm: TagMethod,
+    p1_info: String,
 ) -> Result<(), VmError> {
     let aux = TValue::Integer(i2);
-    try_bin_assoc_tm(state, p1, &aux, flip, res, tm)
+    // i2 是立即数，没有寄存器位置，info 为空
+    try_bin_assoc_tm(state, p1, &aux, flip, res, tm, p1_info, String::new())
 }
 
 /// 尝试字符串拼接元方法 — 对应 C 的 luaT_tryconcatTM
@@ -1485,7 +1492,7 @@ mod tests {
         let p1 = TValue::Integer(1);
         let p2 = TValue::Integer(2);
         // 整数没有 __add 元方法，应返回 RuntimeError
-        let result = try_bin_tm(&mut state, &p1, &p2, 0, TagMethod::Add);
+        let result = try_bin_tm(&mut state, &p1, &p2, 0, TagMethod::Add, String::new(), String::new());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, VmError::RuntimeError(_)));
@@ -1497,7 +1504,7 @@ mod tests {
         let mut state = LuaState::new();
         let p1 = TValue::Nil(NilKind::Strict);
         let p2 = TValue::Integer(1);
-        let result = try_bin_tm(&mut state, &p1, &p2, 0, TagMethod::Add);
+        let result = try_bin_tm(&mut state, &p1, &p2, 0, TagMethod::Add, String::new(), String::new());
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, VmError::RuntimeError(_)));

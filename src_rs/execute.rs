@@ -176,11 +176,10 @@ fn get_func_name(state: &LuaState, call_pc: usize) -> (String, String) {
     if state.base == 0 || state.base > state.stack.len() {
         return (String::new(), String::new());
     }
-    let prev_closure = match &state.stack[state.base - 1] {
-        TValue::LClosure(c) => c.clone(),
+    let proto = match &state.stack[state.base - 1] {
+        TValue::LClosure(c) => &c.proto,
         _ => return (String::new(), String::new()),
     };
-    let proto = &prev_closure.proto;
 
     // 获取 OP_CALL 指令的操作数 A（函数寄存器）
     let call_inst = state.code[call_pc];
@@ -196,6 +195,15 @@ fn find_set_reg(proto: &Proto, lastpc: usize, reg: usize) -> i32 {
     if lastpc == 0 || lastpc > proto.code.len() {
         return -1;
     }
+    // C: if (testMMMode(GET_OPCODE(p->code[lastpc]))) lastpc--;
+    // MMBIN/MMBINI/MMBINK 前面的算术指令在 to_integer 失败时未实际执行，
+    // 需要跳过它以找到真正设置该寄存器的指令。
+    let mut lastpc = lastpc;
+    if opcodes::test_mm_mode(opcodes::get_opcode(proto.code[lastpc])) {
+        if lastpc == 0 { return -1; }
+        lastpc -= 1;
+    }
+    let mut jmptarget: i32 = 0;  // 0 之前的代码是无条件的
     for pc in 0..lastpc {
         let inst = proto.code[pc];
         let op = opcodes::get_opcode(inst);
@@ -207,13 +215,26 @@ fn find_set_reg(proto: &Proto, lastpc: usize, reg: usize) -> i32 {
             }
             OpCode::TFORCALL => reg >= a + 2,
             OpCode::CALL | OpCode::TAILCALL => reg >= a,
+            OpCode::JMP => {
+                let b = opcodes::getarg_sj(inst);
+                let dest = (pc as i32) + 1 + b;
+                if dest <= lastpc as i32 && dest > jmptarget {
+                    jmptarget = dest;
+                }
+                false
+            }
             _ => opcodes::test_a_mode(op) && reg == a,
         };
         if change {
-            setreg = pc as i32;
+            setreg = filter_pc(pc as i32, jmptarget);
         }
     }
     setreg
+}
+
+/// 对应 C 的 filterpc：如果 pc 在 jmptarget 之前（条件代码内），返回 -1
+fn filter_pc(pc: i32, jmptarget: i32) -> i32 {
+    if pc < jmptarget { -1 } else { pc }
 }
 
 /// 查找寄存器对应的局部变量名
@@ -360,6 +381,44 @@ fn is_env_register(proto: &Proto, pc: usize, reg: usize) -> bool {
                 && proto.upvalues[b].name.as_ref().map(|s| s.as_str()) == Some("_ENV")
         }
         _ => false,
+    }
+}
+
+/// 构造寄存器值的变量信息字符串 — 对应 C 的 varinfo
+///
+/// C 实现:
+/// ```c
+/// static const char *varinfo (lua_State *L, const TValue *o) {
+///   CallInfo *ci = L->ci;
+///   const char *name = NULL;
+///   const char *kind = NULL;
+///   if (isLua(ci)) {
+///     kind = getupvalname(ci, o, &name);
+///     if (!kind) {
+///       int reg = instack(ci, o);
+///       if (reg >= 0)
+///         kind = getobjname(ci_func(ci)->p, currentpc(ci), reg, &name);
+///     }
+///   }
+///   return formatvarinfo(L, kind, name);
+/// }
+/// ```
+///
+/// Rust 版本直接接收寄存器编号（调用方已知），通过 get_obj_name 获取
+/// kind 和 name，返回 " (kind 'name')" 或空字符串。
+fn varinfo_str(state: &LuaState, reg: usize) -> String {
+    if state.base == 0 || state.base > state.stack.len() {
+        return String::new();
+    }
+    let proto = match &state.stack[state.base - 1] {
+        TValue::LClosure(c) => &c.proto,
+        _ => return String::new(),
+    };
+    let (name, kind) = get_obj_name(proto, state.pc, reg);
+    if kind.is_empty() {
+        String::new()
+    } else {
+        format!(" ({} '{}')", kind, name)
     }
 }
 
@@ -2338,7 +2397,10 @@ impl VmExecutor {
             // result = RA(pi), pi = 前一条指令 (原始算术指令)
             let pi = state.code[state.pc - 1];
             let result = Self::ra(state, pi);
-            try_bin_tm(state, &p1, &p2, result, tm)?;
+            // varinfo_str 需要相对于 base 的寄存器编号，而非绝对栈位置
+            let p1_info = varinfo_str(state, opcodes::getarg_a(inst) as usize);
+            let p2_info = varinfo_str(state, opcodes::getarg_b(inst) as usize);
+            try_bin_tm(state, &p1, &p2, result, tm, p1_info, p2_info)?;
         }
         state.pc += 1;
         Ok(())
@@ -2356,7 +2418,8 @@ impl VmExecutor {
         if let Some(tm) = TagMethod::from_u8(tm_idx) {
             let pi = state.code[state.pc - 1];
             let result = Self::ra(state, pi);
-            try_bini_tm(state, &p1, imm as i64, flip, result, tm)?;
+            let p1_info = varinfo_str(state, opcodes::getarg_a(inst) as usize);
+            try_bini_tm(state, &p1, imm as i64, flip, result, tm, p1_info)?;
         }
         state.pc += 1;
         Ok(())
@@ -2377,7 +2440,8 @@ impl VmExecutor {
         if let Some(tm) = TagMethod::from_u8(tm_idx) {
             let pi = state.code[state.pc - 1];
             let result = Self::ra(state, pi);
-            try_bin_assoc_tm(state, &p1, &p2, flip, result, tm)?;
+            let p1_info = varinfo_str(state, opcodes::getarg_a(inst) as usize);
+            try_bin_assoc_tm(state, &p1, &p2, flip, result, tm, p1_info, String::new())?;
         }
         state.pc += 1;
         Ok(())
@@ -2396,7 +2460,8 @@ impl VmExecutor {
             TValue::Float(f) => Self::write_stack(state, a, TValue::Float(-f)),
             _ => {
                 // result = ra (与 C 一致)
-                try_bin_tm(state, &v, &v, a, TagMethod::Unm)?;
+                // UNM 不是位运算，走 opinterror，不需要变量信息
+                try_bin_tm(state, &v, &v, a, TagMethod::Unm, String::new(), String::new())?;
             }
         }
         state.pc += 1;
@@ -2414,7 +2479,8 @@ impl VmExecutor {
             Self::write_stack(state, a, TValue::Integer(!i));
         } else {
             // result = ra (与 C 一致)
-            try_bin_tm(state, &v, &v, a, TagMethod::BNot)?;
+            let info = varinfo_str(state, opcodes::getarg_b(inst) as usize);
+            try_bin_tm(state, &v, &v, a, TagMethod::BNot, info.clone(), info)?;
         }
         state.pc += 1;
         Ok(())
@@ -2915,21 +2981,31 @@ impl VmExecutor {
                 // 对应 C 的 precallC: 推入 CallInfoEntry 并在整个 C 函数执行期间保留
                 // 这样 debug.getinfo/traceback 能正确看到 C 函数帧
                 // 对应 C 的 luaD_precall -> inc_ci 创建新的 CallInfo
-                let (func_name, func_namewhat) = get_func_name(state, state.pc);
-                let c_is_base = crate::stdlib::base_lib::is_base_tag(tag_val);
-                let c_func_name: Option<String> = if c_is_base {
+                //
+                // 性能优化: 不在每次 C 函数调用时调用 get_func_name (对应 C 的
+                // funcnamefromcode), 因为它内部调用 find_set_reg 遍历 0..call_pc
+                // 的所有指令 (O(n))。C 实现只在 traceback 时才计算函数名。
+                // 这里用 tag 映射获取函数名, namewhat 设为 "function"。
+                let c_name: String = if crate::stdlib::base_lib::is_base_tag(tag_val) {
                     crate::stdlib::base_lib::base_function_name(tag_val).map(|s| s.to_string())
+                } else if crate::stdlib::math_lib::is_math_tag(tag_val) {
+                    crate::stdlib::math_lib::math_function_name(tag_val).map(|s| s.to_string())
+                } else if crate::stdlib::utf8_lib::is_utf8_tag(tag_val) {
+                    crate::stdlib::utf8_lib::utf8_function_name(tag_val).map(|s| s.to_string())
+                } else if crate::stdlib::table_lib::is_table_tag(tag_val) {
+                    crate::stdlib::table_lib::table_function_name(tag_val).map(|s| s.to_string())
                 } else if crate::stdlib::debug_lib::is_debug_tag(tag_val) {
                     crate::stdlib::debug_lib::debug_function_name(tag_val).map(|s| s.to_string())
+                } else if crate::stdlib::os_lib::is_os_tag(tag_val) {
+                    crate::stdlib::os_lib::os_function_name(tag_val).map(|s| s.to_string())
                 } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
                     crate::stdlib::coroutine_lib::coro_function_name(tag_val).map(|s| s.to_string())
+                } else if crate::stdlib::string_lib::is_string_tag(tag_val) {
+                    crate::stdlib::string_lib::string_function_name(tag_val).map(|s| s.to_string())
                 } else {
                     None
-                };
-                // namewhat: 使用 get_func_name 返回的实际值（global/field/method/hook）
-                // 对应 C 的 getfuncname 根据调用指令确定 namewhat
-                let c_namewhat = func_namewhat;
-                let c_name = c_func_name.unwrap_or(func_name);
+                }.unwrap_or_default();
+                let c_namewhat = if c_name.is_empty() { String::new() } else { "function".to_string() };
                 state.call_info.push(crate::state::CallInfoEntry {
                     source: "=[C]".to_string(),
                     line: -1,
@@ -4355,6 +4431,18 @@ impl VmExecutor {
                         }
                     }
 
+                    // 没有 __newindex 元方法, 即将插入新键: 对应 C 的 luaH_finishset
+                    // 检查 NaN/nil 键 (NaN 永远不等于自身, 故每次都是新键)
+                    match &key {
+                        TValue::Nil(_) => {
+                            return Err(VmError::RuntimeError("table index is nil".to_string()));
+                        }
+                        TValue::Float(f) if f.is_nan() => {
+                            return Err(VmError::RuntimeError("table index is NaN".to_string()));
+                        }
+                        _ => {}
+                    }
+
                     // 没有 __newindex 元方法: 直接设置
                     t.set(key, val);
                     let tid = t.gc_header.id();
@@ -5043,6 +5131,7 @@ mod tests {
     fn test_execute_settable() {
         let code = vec![
             make_abc(OpCode::NEWTABLE, 0, 0, 3),
+            make_asbx(OpCode::LOADI, 0, 0),
             make_asbx(OpCode::LOADI, 1, 1),
             make_asbx(OpCode::LOADI, 2, 42),
             make_abck(OpCode::SETTABLE, 0, 1, 2, 0),

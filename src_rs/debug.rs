@@ -11,6 +11,7 @@ use crate::execute::VmError;
 use crate::objects::TValue;
 use crate::tm::obj_type_name;
 use crate::state::LuaState;
+use crate::vm::{to_integer_ns, F2IMode};
 
 /// 通用运行时错误 — 对应 C 的 luaG_runerror
 ///
@@ -75,11 +76,26 @@ pub fn opinterror(p1: &TValue, p2: &TValue, op: &str) -> VmError {
 }
 
 /// 整数转换错误 — 对应 C 的 luaG_tointerror
-pub fn tointerror(p1: &TValue, p2: &TValue) -> VmError {
-    let t1 = obj_type_name(p1);
-    let t2 = obj_type_name(p2);
-    VmError::RuntimeError(format!("number{} has no integer representation", 
-        if t1 == t2 { format!("s ({})", t1) } else { format!(" or {}", t2) }))
+///
+/// C 实现:
+/// ```c
+/// l_noret luaG_tointerror (lua_State *L, const TValue *p1, const TValue *p2) {
+///   lua_Integer temp;
+///   if (!luaV_tointegerns(p1, &temp, LUA_FLOORN2I))
+///     p2 = p1;
+///   luaG_runerror(L, "number%s has no integer representation", varinfo(L, p2));
+/// }
+/// ```
+///
+/// p1_info / p2_info 是调用方通过 varinfo_str 预先构造的变量信息字符串
+/// （如 " (field 'huge')"），对应 C 的 varinfo(L, p1) / varinfo(L, p2)。
+pub fn tointerror(p1: &TValue, p2: &TValue, p1_info: &str, p2_info: &str) -> VmError {
+    let info = if to_integer_ns(p1, F2IMode::Floor).is_none() {
+        p1_info
+    } else {
+        p2_info
+    };
+    VmError::RuntimeError(format!("number{} has no integer representation", info))
 }
 
 /// 判断值是否为数字 — 对应 C 的 ttisnumber
