@@ -428,6 +428,10 @@ mod tests {
             wrap_coros: Vec::new(),
             pcall_protection_stack: Vec::new(),
             weak_tables: Vec::new(),
+            finobj_list: Vec::new(),
+            transferinfo_ftransfer: 0,
+            transferinfo_ntransfer: 0,
+            pending_return_adjust: None,
         }
     }
 

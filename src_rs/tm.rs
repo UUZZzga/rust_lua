@@ -402,6 +402,7 @@ pub(crate) fn call_tm_res(
         namewhat: "metamethod".to_string(),
         proto_flag: caller_proto_flag,
         nextraargs: caller_nextraargs,
+        is_tailcall: false,
     });
 
     // Push PcallProtection — 元方法 continuation 机制
@@ -557,6 +558,7 @@ pub(crate) fn call_tm(
         namewhat: "metamethod".to_string(),
         proto_flag: caller_proto_flag,
         nextraargs: caller_nextraargs,
+        is_tailcall: false,
     });
 
     // Push PcallProtection — 元方法 continuation 机制
@@ -697,6 +699,7 @@ pub fn call_close_method(
         namewhat: "metamethod".to_string(),
         proto_flag: state.proto_flag,
         nextraargs: state.nextraargs,
+        is_tailcall: false,
     });
 
     // __close 元方法通过 luaD_callnoyield 调用（不可 yield），递增 n_ny_calls

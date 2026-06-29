@@ -462,7 +462,7 @@ impl VmExecutor {
                                 last_entry.saved_pc = state.pc;
                             }
                         }
-                        Self::call_hook(state, "count", -1, None)?;
+                        Self::call_hook(state, "count", -1, None, 0, 0)?;
                     }
                     // line hook — 对应 C: if (mask & LUA_MASKLINE)
                     if state.hook_mask & 4 != 0 { // LUA_MASKLINE = 4
@@ -490,7 +490,7 @@ impl VmExecutor {
                                     last_entry.saved_pc = state.pc;
                                 }
                             }
-                            Self::call_hook(state, "line", current_line, None)?;
+                            Self::call_hook(state, "line", current_line, None, 0, 0)?;
                         }
                         // 对应 C: L->oldpc = npci;
                         state.hook_old_pc = new_pc;
@@ -722,6 +722,7 @@ impl VmExecutor {
                             namewhat: "for iterator".to_string(),
                             proto_flag: state.proto_flag,
                             nextraargs: state.nextraargs,
+                            is_tailcall: false,
                         });
 
                         state.code = proto_code;
@@ -795,6 +796,11 @@ impl VmExecutor {
                 };
                         match result {
                             Ok(()) => {
+                                // TFORCALL 调用 C 函数迭代器时，adjust_results 可能
+                                // 推迟了结果放置（return hook 启用时）。TFORCALL 不经
+                                // op_call 路径，需在此完成 adjust，否则 TFORLOOP 读到
+                                // 错误的值。
+                                state.finish_pending_adjust();
                                 state.pc += 1;
                                 Ok(())
                             }
@@ -969,6 +975,10 @@ impl VmExecutor {
 
         let ci = &state.call_info;
         let ci_len = ci.len();
+        // 跳过 call_info 末尾的 C 函数帧 — 它们由 last_c_function 处理
+        // （error 时 C 函数帧保留在 call_info 中，供 build_traceback_from_thread 使用）
+        let c_chain_len = ci.iter().rev().take_while(|e| e.is_c).count();
+        let effective_ci_len = ci_len - c_chain_len;
         let has_lua_frame = cur_closure.is_some();
 
         // 如果错误由 C 函数引发，先添加 C 函数帧 — 对应 C 的 [C]: in global 'name'
@@ -977,18 +987,14 @@ impl VmExecutor {
         }
 
         // 收集所有 Lua 帧信息 (source, line, name_str) — 从内到外
-        // 帧 0: 当前函数; 帧 1..=ci_len: 调用者
+        // 帧 0: 当前函数; 帧 1..=effective_ci_len: 调用者
         // call_info[i] 存储: source/line = 调用者(外层)的信息, name/closure = 被调用者(内层)的信息
-        // 因此:
-        // - 帧 L (1<=L<=ci_len) 的 source/line = call_info[ci_len - L].source/line
-        // - 帧 L (0<=L<ci_len) 的 name/namewhat/closure = call_info[ci_len - 1 - L]
-        // - 帧 ci_len (最外层) 的 name = "main chunk"
         let mut frames: Vec<(String, i32, String)> = Vec::new();
 
         // 帧 0: 当前函数
         if has_lua_frame {
-            let name_str = if ci_len > 0 {
-                let last = &ci[ci_len - 1];
+            let name_str = if effective_ci_len > 0 {
+                let last = &ci[effective_ci_len - 1];
                 format_func_name(&last.namewhat, &last.name, false, last.closure.as_ref())
             } else {
                 "main chunk".to_string()
@@ -996,14 +1002,14 @@ impl VmExecutor {
             frames.push((cur_source.clone(), cur_line, name_str));
         }
 
-        // 帧 1..=ci_len: 调用者帧
-        for level in 1..=ci_len {
-            let entry = &ci[ci_len - level];
+        // 帧 1..=effective_ci_len: 调用者帧
+        for level in 1..=effective_ci_len {
+            let entry = &ci[effective_ci_len - level];
             let src = short_source_bytes(entry.source.as_bytes());
             let line = entry.line;
-            let name_str = if level < ci_len {
+            let name_str = if level < effective_ci_len {
                 // name/namewhat/closure 来自更外层的 call_info 条目
-                let outer = &ci[ci_len - 1 - level];
+                let outer = &ci[effective_ci_len - 1 - level];
                 format_func_name(&outer.namewhat, &outer.name, false, outer.closure.as_ref())
             } else {
                 // 最外层是 main chunk
@@ -1521,7 +1527,8 @@ impl VmExecutor {
     /// `frame_base`: 指定 hook_entry 的 base（触发 hook 的帧的 base）。
     ///   - None: 使用 state.base（适用于 line hook、Lua 函数 call hook、return hook）
     ///   - Some(base): 使用指定 base（适用于 C 函数 call hook，此时 state.base 尚未更新）
-    pub fn call_hook(state: &mut LuaState, event: &str, line: i32, frame_base: Option<usize>) -> Result<(), VmError> {
+    pub fn call_hook(state: &mut LuaState, event: &str, line: i32, frame_base: Option<usize>,
+                     ftransfer: i32, ntransfer: i32) -> Result<(), VmError> {
         let hook_fn = match &state.hook_func {
             Some(f) => f.clone(),
             None => return Ok(()),
@@ -1531,6 +1538,10 @@ impl VmExecutor {
         if !state.allowhook {
             return Ok(());
         }
+
+        // 设置 transferinfo — 对应 C 的 L->transferinfo
+        state.transferinfo_ftransfer = ftransfer;
+        state.transferinfo_ntransfer = ntransfer;
 
         // 保存当前栈顶
         let saved_top = state.stack.len();
@@ -1589,6 +1600,7 @@ impl VmExecutor {
             namewhat: "hook".to_string(),
             proto_flag: state.proto_flag,
             nextraargs: state.nextraargs,
+            is_tailcall: false,
         });
 
         // 调用 hook 函数 (2 个参数, 0 个返回值)
@@ -1883,6 +1895,7 @@ impl VmExecutor {
         state.pc += 1;  // skip extra argument
         let hash_size = if b > 0 { 1u32 << (b - 1) } else { 0 };
         let array_size = c as usize;
+        state.maybe_collect_gc();
         let table = Table::with_capacity(array_size, hash_size as usize);
         let table_id = state.gc.register_object(array_size + hash_size as usize);
         table.gc_header.set_id(table_id);
@@ -2847,6 +2860,7 @@ impl VmExecutor {
                     namewhat: func_namewhat,
                     proto_flag: state.proto_flag,
                     nextraargs: state.nextraargs,
+                    is_tailcall: false,
                 });
 
                 state.code = closure.proto.code.clone();
@@ -2887,7 +2901,8 @@ impl VmExecutor {
                     }
                     // 对应 C 的 luaG_tracecall -> luaD_hookcall: 触发 call hook
                     if state.hook_mask & 1 != 0 {  // LUA_MASKCALL
-                        Self::call_hook(state, "call", -1, None)?;
+                        // ftransfer=1 (参数从 func+1 开始), ntransfer=numparams
+                        Self::call_hook(state, "call", -1, None, 1, nfixparams as i32)?;
                     }
                 }
                 Ok(())
@@ -2911,8 +2926,9 @@ impl VmExecutor {
                 } else {
                     None
                 };
-                // namewhat: C 库函数为 "field"，hook 回调为 "hook"
-                let c_namewhat = if func_namewhat == "hook" { "hook".to_string() } else { "field".to_string() };
+                // namewhat: 使用 get_func_name 返回的实际值（global/field/method/hook）
+                // 对应 C 的 getfuncname 根据调用指令确定 namewhat
+                let c_namewhat = func_namewhat;
                 let c_name = c_func_name.unwrap_or(func_name);
                 state.call_info.push(crate::state::CallInfoEntry {
                     source: "=[C]".to_string(),
@@ -2925,11 +2941,13 @@ impl VmExecutor {
                     namewhat: c_namewhat.clone(),
                     proto_flag: state.proto_flag,
                     nextraargs: state.nextraargs,
+                    is_tailcall: false,
                 });
 
                 // 对应 C 的 luaG_tracecall -> luaD_hookcall: 触发 call hook
                 if state.hook_mask & 1 != 0 {  // LUA_MASKCALL
-                    Self::call_hook(state, "call", -1, Some(a + 1))?;
+                    // ftransfer=1 (参数从 func+1 开始), ntransfer=narg
+                    Self::call_hook(state, "call", -1, Some(a + 1), 1, nargs as i32)?;
                 }
 
                 // 基础库函数派发
@@ -2989,11 +3007,29 @@ impl VmExecutor {
 
                 // （n_ny_calls 在 luaD_call 路径中不递增，无需递减）
 
-                // 弹出 C 函数的 CallInfoEntry
-                state.call_info.pop();
+                // yield/error 时不弹出 CallInfoEntry —
+                // yield: call_resume 的 yield 分支会保存完整的 call_info
+                // error: build_traceback_from_thread 依赖 call_info 中的 C 函数帧显示 error 位置
+                //        execute.rs 的 build_traceback 会跳过末尾的 C 函数帧（用 last_c_function 处理）
+                let is_yield = matches!(&dispatch_result, Err(VmError::Yield(_)));
+                let is_error = dispatch_result.is_err();
+                if !is_yield && !is_error {
+                    state.call_info.pop();
+                }
 
                 // 对应 C 的 luaD_poscall -> rethook: 触发 return hook
+                // yield 时也触发 return hook（对应 C Lua 中 yield 的 return 事件）
                 if state.hook_mask & 2 != 0 {  // LUA_MASKRET
+                    // ftransfer = firstres - func; 从 pending_return_adjust 读取结果位置
+                    // (C 函数通过 adjust_results 把结果放到栈顶之上并设置了 pending_return_adjust)
+                    let (ftransfer, nres) = match state.pending_return_adjust {
+                        Some((_, _, n_actual, first_result_pos)) => {
+                            ((first_result_pos as i32) - (a as i32), n_actual as i32)
+                        }
+                        None => (1, 0),
+                    };
+                    // 保存 pending_return_adjust，防止 hook 函数内部的 C 函数调用覆盖它
+                    let saved_pending = state.pending_return_adjust.take();
                     state.call_info.push(crate::state::CallInfoEntry {
                         source: "=[C]".to_string(),
                         line: -1,
@@ -3005,9 +3041,17 @@ impl VmExecutor {
                         namewhat: c_namewhat,
                         proto_flag: state.proto_flag,
                         nextraargs: state.nextraargs,
+                        is_tailcall: false,
                     });
-                    Self::call_hook(state, "return", -1, Some(a + 1))?;
+                    Self::call_hook(state, "return", -1, Some(a + 1), ftransfer, nres)?;
                     state.call_info.pop();
+                    // 恢复 pending_return_adjust，供 finish_pending_adjust 使用
+                    state.pending_return_adjust = saved_pending;
+                }
+
+                // 执行待定的返回值调整（return hook 启用时 push_results 延迟了 adjust）
+                if !is_yield {
+                    state.finish_pending_adjust();
                 }
 
                 dispatch_result?;
@@ -3207,12 +3251,23 @@ impl VmExecutor {
                 state.tbc_list = None;
                 state.open_upval = None;
 
+                // 对应 C 的 ci->callstatus |= CIST_TAIL
+                // 标记当前 CallInfoEntry 为尾调用，供 debug.getinfo(1).istailcall 读取
+                if let Some(entry) = state.call_info.last_mut() {
+                    entry.is_tailcall = true;
+                    entry.closure = Some(closure.clone());
+                }
+                // 对应 C 的 luaD_hookcall: L->oldpc = 0
+                // 新函数的 oldpc 设为 0，第一条指令会触发 line hook
+                state.hook_old_pc = 0;
+
                 if proto_is_vararg {
                     // vararg 函数: 截断栈到实际参数末尾，VARARGPREP 会处理
                     state.stack.truncate(func_slot + 1 + nargs);
                     for i in nargs..nfixparams {
                         Self::write_stack(state, func_slot + 1 + i, TValue::Nil(NilKind::Strict));
                     }
+                    // call hook 对 vararg 函数在 VARARGPREP 中触发 (tail call 事件)
                 } else {
                     let frame_end = func_slot + 1 + fsize;
                     // 对应 C 的 ci->top = ci->func.p + 1 + p->maxstacksize
@@ -3226,6 +3281,11 @@ impl VmExecutor {
                     }
                     for i in nargs..nfixparams {
                         state.stack[func_slot + 1 + i] = TValue::Nil(NilKind::Strict);
+                    }
+                    // 对应 C 的 startfunc -> luaG_tracecall -> luaD_hookcall:
+                    // 非 vararg 尾调用触发 "tail call" hook (CIST_TAIL 已设置)
+                    if state.hook_mask & 1 != 0 {  // LUA_MASKCALL
+                        Self::call_hook(state, "tail call", -1, None, 1, nfixparams as i32)?;
                     }
                 }
                 Ok(())
@@ -3307,7 +3367,12 @@ impl VmExecutor {
 
         // 对应 C 的 rethook: 触发 return hook (在弹出 call_info 之前)
         if state.hook_mask & 2 != 0 {  // LUA_MASKRET
-            Self::call_hook(state, "return", -1, None)?;
+            // C 的 OP_RETURN 中 ci->func.p -= delta 恢复到 old func,
+            // rethook 中 ci->func.p += delta 变回 new func (虚拟 func).
+            // Rust 的 state.base 已经是 new func + 1 (op_varargprep 调整后),
+            // 所以 ftransfer = a - (state.base - 1) = a - state.base + 1, 不需要 delta 修正.
+            let ftransfer = (a as i32) - (state.base as i32) + 1;
+            Self::call_hook(state, "return", -1, None, ftransfer, nresults as i32)?;
         }
 
         // 元方法 continuation 检查 (在 call_stack.pop() 之前)
@@ -3426,7 +3491,8 @@ impl VmExecutor {
     fn op_return0(state: &mut LuaState, _inst: Instruction) -> Result<Option<VmResult>, VmError> {
         // 对应 C 的 rethook: 触发 return hook (在弹出 call_info 之前)
         if state.hook_mask & 2 != 0 {  // LUA_MASKRET
-            Self::call_hook(state, "return", -1, None)?;
+            // op_return0: 0 个返回值，ftransfer 不重要（ntransfer=0）
+            Self::call_hook(state, "return", -1, None, 0, 0)?;
         }
         // 元方法 continuation 检查 (在 call_stack.pop() 之前)
         // resume 后 call_stack 不为空 (包含调用者帧)，所以必须在 pop 之前检查
@@ -3511,7 +3577,10 @@ impl VmExecutor {
         };
         // 对应 C 的 rethook: 触发 return hook (在弹出 call_info 之前)
         if state.hook_mask & 2 != 0 {  // LUA_MASKRET
-            Self::call_hook(state, "return", -1, None)?;
+            // op_return1: 1 个返回值在 a 位置
+            // state.base 已是 new func + 1 (vararg 调整后), 不需要 delta 修正
+            let ftransfer = (a as i32) - (state.base as i32) + 1;
+            Self::call_hook(state, "return", -1, None, ftransfer, 1)?;
         }
         // 元方法 continuation 检查 (在 call_stack.pop() 之前)
         // resume 后 call_stack 不为空 (包含调用者帧)，所以必须在 pop 之前检查
@@ -4081,9 +4150,17 @@ impl VmExecutor {
             }
         }
 
-        // 对应 C 的 luaG_tracecall -> luaD_hookcall: vararg 函数在 VARARGPREP 后触发 call hook
+        // 对应 C 的 OP_VARARGPREP -> luaD_hookcall: vararg 函数在 VARARGPREP 后触发 call hook
+        // luaD_hookcall 检查 CIST_TAIL 决定事件类型: 尾调用触发 "tail call", 否则 "call"
         if state.hook_mask & 1 != 0 {  // LUA_MASKCALL
-            Self::call_hook(state, "call", -1, None)?;
+            // ftransfer=1 (参数从 func+1 开始), ntransfer=numparams
+            let nfixparams = state.num_params as i32;
+            let event = if state.call_info.last().map(|e| e.is_tailcall).unwrap_or(false) {
+                "tail call"
+            } else {
+                "call"
+            };
+            Self::call_hook(state, event, -1, None, 1, nfixparams)?;
         }
 
         // 对应 C 的 VARARGPREP: L->oldpc = 1; next opcode will be seen as a "new" line

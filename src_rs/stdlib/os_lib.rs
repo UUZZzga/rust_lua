@@ -47,17 +47,7 @@ fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
 }
 
 fn push_single_result(state: &mut LuaState, a: usize, nresults: i32, result: TValue) {
-    state.stack.truncate(a);
-    if nresults != 0 {
-        state.stack.push(result);
-    }
-    // 填充 nil 到 nresults
-    let current = state.stack.len() - a;
-    if nresults > 0 && (current as i32) < nresults {
-        for _ in current..nresults as usize {
-            state.stack.push(TValue::Nil(NilKind::Strict));
-        }
-    }
+    state.adjust_results(a, nresults, vec![result]);
 }
 
 // ============================================================================

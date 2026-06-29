@@ -2847,15 +2847,7 @@ fn get_bool_arg(state: &LuaState, a: usize, idx: usize, default: bool) -> bool {
 
 /// 将结果压入栈并调整栈顶
 fn push_results(state: &mut LuaState, a: usize, nresults: i32, results: Vec<TValue>) {
-    state.stack.truncate(a);
-    let nresults = if nresults < 0 { results.len() as i32 } else { nresults };
-    for i in 0..nresults as usize {
-        if i < results.len() {
-            state.stack.push(results[i].clone());
-        } else {
-            state.stack.push(TValue::Nil(NilKind::Strict));
-        }
-    }
+    state.adjust_results(a, nresults, results);
 }
 
 /// 对应 C 的 luaL_tolstring: 将值转为字符串用于 string.format 的 %s。

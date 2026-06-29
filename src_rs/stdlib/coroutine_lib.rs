@@ -90,16 +90,7 @@ fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
 }
 
 fn push_single_result(state: &mut LuaState, a: usize, nresults: i32, result: TValue) {
-    state.stack.truncate(a);
-    if nresults != 0 {
-        state.stack.push(result);
-    }
-    let current = state.stack.len() - a;
-    if nresults > 0 && (current as i32) < nresults {
-        for _ in current..nresults as usize {
-            state.stack.push(TValue::Nil(NilKind::Strict));
-        }
-    }
+    state.adjust_results(a, nresults, vec![result]);
 }
 
 /// 推送 resume 的结果: success flag + values，并根据 nresults 调整
@@ -721,7 +712,7 @@ fn call_create(
         ));
     }
     let func = get_arg(state, a, 0);
-    if !func.is_function() {
+    if !func.is_function() && !matches!(func, TValue::Table(_)) {
         return Err(VmError::RuntimeError(format!(
             "bad argument #1 to 'create' (function expected, got {})",
             func.ty()
@@ -1157,7 +1148,7 @@ fn call_resume(
 
     // 首次 resume 时触发 call hook（对应 C Lua 的 luaD_hook(L, LUA_HOOKCALL, -1, 0, 0)）
     if is_first_resume && state.hook_mask & 1 != 0 && state.hook_func.is_some() {
-        VmExecutor::call_hook(state, "call", -1, None)?;
+        VmExecutor::call_hook(state, "call", -1, None, 0, 0)?;
     }
 
     // 调用 execute_loop
@@ -1190,6 +1181,7 @@ fn call_resume(
                 ctx.saved_tbc_list = state.tbc_list;
                 ctx.saved_call_stack = std::mem::take(&mut state.call_stack);
                 ctx.saved_stack = std::mem::take(&mut state.stack);
+                ctx.saved_call_info = std::mem::take(&mut state.call_info);
                 ctx.yield_upval_origins = yield_origins;
                 ctx.saved_hook_old_pc = state.hook_old_pc;
                 ctx.saved_hook_func = state.hook_func.take();
@@ -1213,14 +1205,32 @@ fn call_resume(
                 let mut ctx = co_context.borrow_mut();
                 ctx.status = ThreadStatus::OK;
                 ctx.started = true;
+                // 协程结束，清空 saved_call_info（对应 C 中协程 dead 后 ci 链为空）
+                ctx.saved_call_info.clear();
             }
             (true, Vec::new(), Some((co_stack, result_base, ret_n)))
         }
         Ok(_) => {
-            co_context.borrow_mut().status = ThreadStatus::OK;
+            let mut ctx = co_context.borrow_mut();
+            ctx.status = ThreadStatus::OK;
+            ctx.saved_call_info.clear();
             (true, Vec::new(), None)
         }
         Err(e) => {
+            // 保存 error 状态到 ctx — 对应 C 中 lua_resume 不可恢复错误时
+            // CallInfo 链不展开（luaD_throw longjmp 跳过正常清理），
+            // 保留 error 时的状态供 debug.traceback 使用。
+            // 必须在 TBC 关闭之前保存（TBC 关闭会修改 stack[base-1]）。
+            // 只克隆到 base 的部分栈（build_traceback_from_thread 只需要
+            // saved_stack[saved_base-1] 处的 LClosure），避免克隆整个栈导致 OOM。
+            {
+                let mut ctx = co_context.borrow_mut();
+                ctx.saved_call_info = std::mem::take(&mut state.call_info);
+                let save_end = state.base.min(state.stack.len());
+                ctx.saved_stack = state.stack[..save_end].to_vec();
+                ctx.saved_base = state.base;
+                ctx.saved_pc = state.pc.wrapping_add(1);
+            }
             // 第二次 resume 时 pcall 的保护已丢失（state.pcall 的 saved 状态是局部变量，
             // yield 后被销毁）。需要在此手动关闭协程（foo）的 TBC 变量，
             // 对应 C Lua 中 pcall 错误时 luaD_closeprotected -> luaF_close 的行为。
@@ -1345,7 +1355,6 @@ fn setup_first_resume(
         state.open_upval = None;
         state.tbc_list = None;
         state.call_stack = Vec::new();
-        state.call_info = Vec::new();
         state.hook_old_pc = 0;
 
         // 设置栈: stack[0] = closure, stack[1..1+nargs] = resume_args
@@ -1378,8 +1387,31 @@ fn setup_first_resume(
                 state.stack[1 + i] = TValue::Nil(NilKind::Strict);
             }
         }
-    } else if func.is_function() {
-        // C 函数 (LightUserData/CClosure/LCFn): 创建 CALL + RETURN 序列
+
+        // 推入初始 CallInfoEntry — 对应 C 中协程的 base CallInfo
+        // 记录协程主函数的信息，使 traceback/getinfo 能正确显示最外层帧
+        let init_source = closure
+            .proto
+            .source
+            .as_ref()
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_else(|| "=?".to_string());
+        state.call_info = vec![crate::state::CallInfoEntry {
+            source: init_source,
+            line: -1,
+            name: String::new(),
+            is_c: false,
+            closure: Some(closure.clone()),
+            base: 1,
+            saved_pc: 0,
+            namewhat: String::new(),
+            proto_flag: closure.proto.flag,
+            nextraargs: 0,
+            is_tailcall: false,
+        }];
+    } else if func.is_function() || matches!(func, TValue::Table(_)) {
+        // C 函数 (LightUserData/CClosure/LCFn) 或带 __call 元方法的 Table:
+        // 创建 CALL + RETURN 序列
         // 栈布局: stack[0] = func, stack[1] = func (寄存器 0), stack[2..] = 参数
         // CALL 0 nargs+1 0 — 调用寄存器 0 的函数, MULTRET
         // RETURN 0 0 — 返回所有结果 (MULTRET)
@@ -1450,9 +1482,14 @@ fn setup_subsequent_resume(
     state.hook_old_pc = ctx.saved_hook_old_pc;
     // 恢复协程的 pcall_protection_stack（yield 时保存到 ThreadContext）
     state.pcall_protection_stack.extend(ctx.saved_pcall_protection_stack.iter().cloned());
-    // call_info 未保存在 ThreadContext 中，重置为空
-    // (对嵌套调用场景可能不完美，但基本测试中 yield 在顶层调用)
-    state.call_info = Vec::new();
+    // 恢复协程的 call_info（yield 时保存到 ThreadContext）
+    state.call_info = ctx.saved_call_info.clone();
+    // pop 掉 yield 时保留的 C 函数 CallInfoEntry
+    // 对应 C 中 yield 的 C 函数返回后 ci 被正常 pop
+    // （Rust 中 yield 通过 Err(Yield) 返回，op_call 跳过了 pop，这里补偿）
+    if state.call_info.last().map(|e| e.is_c).unwrap_or(false) {
+        state.call_info.pop();
+    }
 
     let yield_nresults = ctx.saved_yield_nresults;
     let yield_origins = ctx.yield_upval_origins.clone();
@@ -1549,7 +1586,7 @@ fn call_wrap(
         ));
     }
     let func = get_arg(state, a, 0);
-    if !func.is_function() {
+    if !func.is_function() && !matches!(func, TValue::Table(_)) {
         return Err(VmError::RuntimeError(format!(
             "bad argument #1 to 'wrap' (function expected, got {})",
             func.ty()
@@ -1724,7 +1761,7 @@ pub fn call_wrap_call(
 
     // 首次 resume 时触发 call hook（对应 C Lua 的 luaD_hook(L, LUA_HOOKCALL, -1, 0, 0)）
     if is_first_resume && state.hook_mask & 1 != 0 && state.hook_func.is_some() {
-        VmExecutor::call_hook(state, "call", -1, None)?;
+        VmExecutor::call_hook(state, "call", -1, None, 0, 0)?;
     }
 
     // 执行

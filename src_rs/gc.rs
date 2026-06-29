@@ -217,6 +217,7 @@ pub struct GCState {
     pub current_white: Cell<u8>,
     next_id: Cell<usize>,
     metas: RefCell<Vec<Option<GCObjectMeta>>>,
+    free_ids: RefCell<Vec<usize>>,
     gray: RefCell<VecDeque<GCObjectId>>,
     gray_again: RefCell<VecDeque<GCObjectId>>,
     weak: RefCell<VecDeque<GCObjectId>>,
@@ -227,6 +228,7 @@ pub struct GCState {
     pub gc_stop: Cell<u8>,
     pub gc_params: [u8; 6],
     pub in_minor: Cell<bool>,
+    next_collect_threshold: Cell<usize>,
 }
 
 impl GCState {
@@ -237,6 +239,7 @@ impl GCState {
             current_white: Cell::new(1 << 0),
             next_id: Cell::new(1),
             metas: RefCell::new(Vec::new()),
+            free_ids: RefCell::new(Vec::new()),
             gray: RefCell::new(VecDeque::new()),
             gray_again: RefCell::new(VecDeque::new()),
             weak: RefCell::new(VecDeque::new()),
@@ -247,6 +250,7 @@ impl GCState {
             gc_stop: Cell::new(0),
             gc_params: [0; 6],
             in_minor: Cell::new(false),
+            next_collect_threshold: Cell::new(200000),
         }
     }
 
@@ -283,22 +287,28 @@ impl GCState {
     // ========================================================================
 
     pub fn register_object(&self, size: usize) -> GCObjectId {
-        let id_val = self.next_id.get();
-        let id = GCObjectId(id_val);
-        self.next_id.set(id_val + 1);
-
-        let mut metas = self.metas.borrow_mut();
-        while metas.len() <= id.0 {
-            metas.push(None);
-        }
-
         let cw = self.current_white.get();
         let color = if cw & 1 != 0 { GCColor::White0 } else { GCColor::White1 };
 
         let mut meta = GCObjectMeta::new(size);
         meta.color = color;
         meta.age = if self.mode == GCMode::Generational { GCAge::New } else { GCAge::New };
-        metas[id.0] = Some(meta);
+
+        let mut metas = self.metas.borrow_mut();
+        let mut free_ids = self.free_ids.borrow_mut();
+        let id = if let Some(reused_id) = free_ids.pop() {
+            metas[reused_id] = Some(meta);
+            GCObjectId(reused_id)
+        } else {
+            let id_val = self.next_id.get();
+            let id = GCObjectId(id_val);
+            self.next_id.set(id_val + 1);
+            while metas.len() <= id.0 {
+                metas.push(None);
+            }
+            metas[id.0] = Some(meta);
+            id
+        };
 
         let current = self.gc_debt.get();
         self.gc_debt.set(current - size as isize);
@@ -316,6 +326,7 @@ impl GCState {
                 self.gc_estimate.set(estimate.saturating_sub(meta.size));
             }
             metas[id.0] = None;
+            self.free_ids.borrow_mut().push(id.0);
         }
     }
 
@@ -340,6 +351,40 @@ impl GCState {
     pub fn is_registered(&self, id: GCObjectId) -> bool {
         let metas = self.metas.borrow();
         id.0 < metas.len() && metas[id.0].is_some()
+    }
+
+    /// 返回已注册对象数量（含已释放但未复用的 ID 槽位）
+    pub fn metas_len(&self) -> usize {
+        self.metas.borrow().len()
+    }
+
+    /// 返回当前 GC 触发阈值
+    pub fn collect_threshold(&self) -> usize {
+        self.next_collect_threshold.get()
+    }
+
+    /// 设置 GC 触发阈值
+    pub fn set_collect_threshold(&self, threshold: usize) {
+        self.next_collect_threshold.set(threshold);
+    }
+
+    /// 清扫不可达对象：遍历 metas，释放所有不在 `reachable` 集合中的对象。
+    /// 对应 C 的 sweep 阶段。
+    pub fn sweep_unreachable(&self, reachable: &std::collections::HashSet<usize>) {
+        let mut metas = self.metas.borrow_mut();
+        let mut free_ids = self.free_ids.borrow_mut();
+        let mut total_freed_size = 0usize;
+        for (i, meta_opt) in metas.iter_mut().enumerate() {
+            if meta_opt.is_some() && !reachable.contains(&i) {
+                if let Some(ref meta) = meta_opt {
+                    total_freed_size = total_freed_size.saturating_add(meta.size);
+                }
+                *meta_opt = None;
+                free_ids.push(i);
+            }
+        }
+        let estimate = self.gc_estimate.get();
+        self.gc_estimate.set(estimate.saturating_sub(total_freed_size));
     }
 
     // ========================================================================

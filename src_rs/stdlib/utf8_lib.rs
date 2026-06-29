@@ -293,19 +293,7 @@ fn get_required_int_arg(state: &LuaState, a: usize, idx: usize, fname: &str) -> 
 
 /// 将结果压入栈并调整栈顶
 fn push_results(state: &mut LuaState, a: usize, nresults: i32, results: Vec<TValue>) {
-    state.stack.truncate(a);
-    let n = if nresults < 0 {
-        results.len()
-    } else {
-        nresults as usize
-    };
-    for i in 0..n {
-        if i < results.len() {
-            state.stack.push(results[i].clone());
-        } else {
-            state.stack.push(TValue::Nil(NilKind::Strict));
-        }
-    }
+    state.adjust_results(a, nresults, results);
 }
 
 /// 将字节序列创建为 Lua 字符串（使用 unsafe 绕过 UTF-8 校验，与 string 库一致）

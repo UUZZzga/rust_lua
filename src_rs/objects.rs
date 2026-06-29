@@ -887,6 +887,9 @@ pub struct ThreadContext {
     /// 协程 yield 时保存的 pcall_protection_stack 片段（协程内部 push 的部分）
     /// resume 时恢复到 state.pcall_protection_stack，协程结束时不清除（由调用者清理）
     pub saved_pcall_protection_stack: Vec<crate::state::PcallProtection>,
+    /// 协程 yield 时保存的 call_info（调用栈信息）
+    /// 用于 debug.traceback(co) 和 debug.getinfo(co, level) 在协程挂起时查看调用栈
+    pub saved_call_info: Vec<crate::state::CallInfoEntry>,
 }
 
 /// Lua 线程（协程）

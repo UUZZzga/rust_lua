@@ -414,19 +414,7 @@ fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
 
 /// 将结果压入栈并调整栈顶
 fn push_results(state: &mut LuaState, a: usize, nresults: i32, results: Vec<TValue>) {
-    state.stack.truncate(a);
-    let n = if nresults < 0 {
-        results.len()
-    } else {
-        nresults as usize
-    };
-    for i in 0..n {
-        if i < results.len() {
-            state.stack.push(results[i].clone());
-        } else {
-            state.stack.push(TValue::Nil(NilKind::Strict));
-        }
-    }
+    state.adjust_results(a, nresults, results);
 }
 
 /// 将单个结果压入栈
@@ -596,19 +584,23 @@ fn call_setmetatable(
         }
     };
 
-    // 检查是否设置了 __mode（弱引用表），注册到 weak_tables
+    // 检查是否设置了 __mode（弱引用表）或 __gc（finalizer），注册到相应列表
     if let TValue::Table(ref t) = result {
-        let has_mode = {
+        let (has_mode, has_gc) = {
             let data = t.data.borrow();
             if let Some(ref mt) = data.metatable {
                 let mode_key = TValue::Str(state.intern_str("__mode"));
-                mt.get(&mode_key).is_some()
+                let gc_key = TValue::Str(state.intern_str("__gc"));
+                (mt.get(&mode_key).is_some(), mt.get(&gc_key).is_some())
             } else {
-                false
+                (false, false)
             }
         };
         if has_mode {
             state.register_weak_table(t);
+        }
+        if has_gc {
+            state.register_finobj(t);
         }
     }
 
@@ -1876,7 +1868,7 @@ fn call_collectgarbage(
             }
             // 清理弱引用表中仅被弱引用表持有的条目
             state.process_weak_tables();
-            state.gc.full_gc();
+            state.collect_gc();
             TValue::Integer(0)
         }
         "stop" => {

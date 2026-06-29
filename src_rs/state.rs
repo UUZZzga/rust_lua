@@ -7,6 +7,7 @@ use crate::execute::{VmExecutor, VmResult, VmError};
 use crate::tm::DefaultMetatables;
 use std::rc::Rc;
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::io::{Read, Write};
 
 const EOFMARK: &str = "<eof>";
@@ -207,10 +208,23 @@ pub struct LuaState {
     /// 弱引用表列表 — setmetatable 设置 __mode 时注册，collectgarbage 时清理
     /// 使用 Weak 引用避免阻止表本身的回收
     pub weak_tables: Vec<std::rc::Weak<std::cell::RefCell<TableData>>>,
+    /// 有 __gc 元方法的对象列表 — setmetatable 设置 __gc 时注册
+    /// GC 时检查不可达的对象，调用其 finalizer 后再释放
+    pub finobj_list: Vec<Table>,
+    /// hook 传输信息 — 对应 C 的 L->transferinfo
+    /// 记录最近一次 call/return hook 传输的值的位置和数量
+    /// debug.getinfo 的 'r' 选项从此字段读取 ftransfer/ntransfer
+    pub transferinfo_ftransfer: i32,
+    pub transferinfo_ntransfer: i32,
+    /// 待执行的返回值调整 — 当 return hook 启用时，push_results 不立即 adjust 栈，
+    /// 而是把结果放到栈上并设置此字段。op_call 在 return hook 执行完后执行 adjust。
+    /// (a, nresults, n_actual, first_result_pos) — a=func 位置, nresults=期望返回值数,
+    /// n_actual=实际返回值数, first_result_pos=结果在栈上的起始位置
+    pub pending_return_adjust: Option<(usize, i32, usize, usize)>,
 }
 
 /// 调用栈条目 — 用于堆栈回溯和 debug.getinfo
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct CallInfoEntry {
     pub source: String,
     pub line: i32,
@@ -228,6 +242,8 @@ pub struct CallInfoEntry {
     pub proto_flag: u8,
     /// 调用者的 nextraargs — 用于 debug.getlocal level > 1 的 vararg 访问
     pub nextraargs: i32,
+    /// 是否为尾调用（对应 C 的 CIST_TAIL）— debug.getinfo(1).istailcall
+    pub is_tailcall: bool,
 }
 
 fn G(l: &LuaState) -> &GlobalState {
@@ -314,6 +330,10 @@ impl LuaState {
             wrap_coros: Vec::new(),
             pcall_protection_stack: Vec::new(),
             weak_tables: Vec::new(),
+            finobj_list: Vec::new(),
+            transferinfo_ftransfer: 0,
+            transferinfo_ntransfer: 0,
+            pending_return_adjust: None,
         }
     }
 
@@ -473,6 +493,10 @@ impl LuaState {
             wrap_coros: Vec::new(),
             pcall_protection_stack: Vec::new(),
             weak_tables: Vec::new(),
+            finobj_list: Vec::new(),
+            transferinfo_ftransfer: 0,
+            transferinfo_ntransfer: 0,
+            pending_return_adjust: None,
         };
         state
     }
@@ -574,6 +598,10 @@ impl LuaState {
             wrap_coros: Vec::new(),
             pcall_protection_stack: Vec::new(),
             weak_tables: Vec::new(),
+            finobj_list: Vec::new(),
+            transferinfo_ftransfer: 0,
+            transferinfo_ntransfer: 0,
+            pending_return_adjust: None,
         }
     }
 }
@@ -581,6 +609,73 @@ impl LuaState {
 impl Default for LuaState {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl LuaState {
+    /// 调整 C 函数返回值到栈上 — 对应 C 的 luaD_poscall 中的栈调整
+    ///
+    /// 当 return hook 启用时，不立即 adjust，而是把结果放到栈顶之上，
+    /// 设置 pending_return_adjust，由 op_call 在 return hook 后执行 adjust。
+    /// 这样 return hook 中的 debug.getlocal 能从栈上读到返回值。
+    pub fn adjust_results(&mut self, a: usize, nresults: i32, results: Vec<TValue>) {
+        // 如果 return hook 启用且允许调用 hook，先把 results 放到栈顶之上（不 truncate），
+        // 设置 pending_return_adjust，由 op_call 在 return hook 后执行 adjust。
+        // hook 执行期间 allowhook=false，return hook 不会被调用，不应推迟。
+        // 只有在 op_call 路径中（call_info 栈顶有 is_c=true 的 entry）才推迟，
+        // 因为只有 op_call 会调用 finish_pending_adjust。单元测试直接调用 C 函数时
+        // call_info 为空，不应推迟。
+        if self.hook_mask & 2 != 0 && self.allowhook {  // LUA_MASKRET
+            let in_op_call = self.call_info.last().map(|e| e.is_c).unwrap_or(false);
+            if in_op_call {
+                let first_result_pos = self.stack.len();
+                for v in &results {
+                    self.stack.push(v.clone());
+                }
+                self.pending_return_adjust = Some((a, nresults, results.len(), first_result_pos));
+                return;
+            }
+        }
+
+        self.stack.truncate(a);
+        let n = if nresults < 0 {
+            results.len()
+        } else {
+            nresults as usize
+        };
+        for i in 0..n {
+            if i < results.len() {
+                self.stack.push(results[i].clone());
+            } else {
+                self.stack.push(TValue::Nil(NilKind::Strict));
+            }
+        }
+    }
+
+    /// 执行待定的返回值调整 — 由 op_call 在 return hook 后调用
+    pub fn finish_pending_adjust(&mut self) {
+        if let Some((a, nresults, n_actual, first_result_pos)) = self.pending_return_adjust.take() {
+            // 保存栈上的返回值（在 first_result_pos.. 位置）
+            let results: Vec<TValue> = if first_result_pos + n_actual <= self.stack.len() {
+                self.stack[first_result_pos..first_result_pos + n_actual].to_vec()
+            } else {
+                Vec::new()
+            };
+            // 执行 adjust: truncate 到 a 并重新放置结果
+            self.stack.truncate(a);
+            let n = if nresults < 0 {
+                results.len()
+            } else {
+                nresults as usize
+            };
+            for i in 0..n {
+                if i < results.len() {
+                    self.stack.push(results[i].clone());
+                } else {
+                    self.stack.push(TValue::Nil(NilKind::Strict));
+                }
+            }
+        }
     }
 }
 
@@ -1631,6 +1726,7 @@ impl LuaState {
                     namewhat: "field".to_string(),
                     proto_flag: self.proto_flag,
                     nextraargs: self.nextraargs,
+                    is_tailcall: false,
                 });
 
                 // 派发 C 函数并收集结果
@@ -1845,6 +1941,14 @@ impl LuaState {
         self.weak_tables.push(std::rc::Rc::downgrade(&t.data));
     }
 
+    /// 注册有 __gc 元方法的对象 — 当 setmetatable 设置包含 __gc 的元表时调用
+    pub fn register_finobj(&mut self, t: &Table) {
+        let ptr_id = t.gc_header.ptr_id;
+        if !self.finobj_list.iter().any(|x| x.gc_header.ptr_id == ptr_id) {
+            self.finobj_list.push(t.clone());
+        }
+    }
+
     /// 处理弱引用表 — 在 collectgarbage("collect") 中调用
     /// 扫描所有弱引用表，清除值（或键）仅被弱引用表持有的条目
     /// 使用 Rc::strong_count 判断：count == 1 表示仅弱引用表本身持有
@@ -1929,6 +2033,276 @@ impl LuaState {
             TValue::LClosure(c) => std::rc::Rc::strong_count(&c.upvals) <= 1,
             TValue::Thread(t) => std::rc::Rc::strong_count(&t.context) <= 1,
             _ => false,
+        }
+    }
+
+    // ========================================================================
+    // Mark-Sweep GC — 从根集合标记所有可达对象，然后清扫不可达对象
+    // ========================================================================
+
+    /// 完整的 mark-sweep GC：从根集合开始标记所有可达对象，然后清扫不可达对象。
+    /// 对应 C 的 luaC_fullgc。
+    pub fn collect_gc(&mut self) {
+        let mut reachable: HashSet<usize> = HashSet::new();
+        let mut visited: HashSet<usize> = HashSet::new();
+        let mut worklist: Vec<TValue> = Vec::new();
+
+        // 收集根：栈
+        for val in &self.stack {
+            worklist.push(val.clone());
+        }
+
+        // 收集根：全局表、registry
+        worklist.push(TValue::Table(self.globals.clone()));
+        worklist.push(TValue::Table(self.registry.clone()));
+
+        // 收集根：closure_upvals
+        for uv_ref in &self.closure_upvals {
+            let uv = uv_ref.borrow();
+            match &*uv {
+                UpVal::Closed { value } => {
+                    worklist.push((**value).clone());
+                }
+                UpVal::Open { stack_index, .. } => {
+                    if *stack_index < self.stack.len() {
+                        worklist.push(self.stack[*stack_index].clone());
+                    }
+                }
+            }
+        }
+
+        // 收集根：call_stack 中的 constants 和 closure_upvals
+        for frame in &self.call_stack {
+            for val in &frame.constants {
+                worklist.push(val.clone());
+            }
+            for uv_ref in &frame.closure_upvals {
+                let uv = uv_ref.borrow();
+                if let UpVal::Closed { value } = &*uv {
+                    worklist.push((**value).clone());
+                }
+            }
+        }
+
+        // 收集根：call_info 中的 closures
+        for ci in &self.call_info {
+            if let Some(ref closure) = ci.closure {
+                worklist.push(TValue::LClosure(closure.clone()));
+            }
+        }
+
+        // 收集根：hook_func
+        if let Some(ref hook) = self.hook_func {
+            worklist.push(hook.clone());
+        }
+
+        // 收集根：协程
+        for thread_opt in &self.wrap_coros {
+            if let Some(ref thread) = thread_opt {
+                self.collect_thread_roots(thread, &mut worklist);
+            }
+        }
+        self.collect_thread_roots(&self.main_thread, &mut worklist);
+
+        // 处理工作列表
+        while let Some(val) = worklist.pop() {
+            self.mark_tvalue(&val, &mut reachable, &mut visited, &mut worklist);
+        }
+
+        // 调用 finalizer — 在 sweep 前找到不可达的有 __gc 的对象，调用其 finalizer
+        self.call_finalizers(&reachable);
+
+        // 清扫
+        self.gc.sweep_unreachable(&reachable);
+
+        // 重置 debt 和动态阈值
+        self.gc.set_debt(100);
+        let new_threshold = self.gc.metas_len() + 200000;
+        self.gc.set_collect_threshold(new_threshold);
+    }
+
+    /// 调用 finalizer — 找到 finobj_list 中不可达的对象，调用其 __gc 元方法
+    /// 对应 C Lua 的 callfinalizers
+    fn call_finalizers(&mut self, reachable: &HashSet<usize>) {
+        // 收集需要 finalize 的对象（不可达且有 __gc）
+        let gc_key = TValue::Str(self.intern_str("__gc"));
+        let mut to_finalize: Vec<(Table, TValue)> = Vec::new();
+        let mut keep: Vec<Table> = Vec::new();
+
+        for t in self.finobj_list.drain(..) {
+            let is_reachable = t.gc_header.id().map_or(false, |id| reachable.contains(&id.0));
+            if is_reachable {
+                keep.push(t);
+                continue;
+            }
+            // 获取 __gc 元方法
+            let gc_func = {
+                let data = t.data.borrow();
+                if let Some(ref mt) = data.metatable {
+                    mt.get(&gc_key)
+                } else {
+                    None
+                }
+            };
+            if let Some(gc_func) = gc_func {
+                to_finalize.push((t, gc_func));
+            }
+            // 没有 __gc 的不可达对象直接丢弃（将被 sweep）
+        }
+        self.finobj_list = keep;
+
+        // 调用每个 finalizer
+        for (t, gc_func) in to_finalize {
+            let stack_base = self.stack.len();
+            // 压入 __gc 函数和对象参数（对应 C 的 luaT_callTMres）
+            self.stack.push(gc_func);
+            self.stack.push(TValue::Table(t.clone()));
+            self.top = self.stack.len();
+
+            // 推入 CallInfoEntry — name="__gc", namewhat="metamethod"
+            // 使 debug.getinfo(1) 返回正确的 namewhat 和 name
+            let caller_source = if self.base > 0 && self.base <= self.stack.len() {
+                if let TValue::LClosure(c) = &self.stack[self.base - 1] {
+                    c.proto.source.as_ref().map(|s| s.as_str().to_string()).unwrap_or_else(|| "=?".to_string())
+                } else {
+                    "=[C]".to_string()
+                }
+            } else {
+                "=?".to_string()
+            };
+            self.call_info.push(CallInfoEntry {
+                source: caller_source,
+                line: -1,
+                name: "__gc".to_string(),
+                is_c: false,
+                closure: None,
+                base: self.base,
+                saved_pc: self.pc,
+                namewhat: "metamethod".to_string(),
+                proto_flag: self.proto_flag,
+                nextraargs: self.nextraargs,
+                is_tailcall: false,
+            });
+
+            // 调用 finalizer: 1 个参数, 0 个返回值
+            let _ = self.pcall(1, 0, 0);
+
+            // 恢复栈和 call_info
+            self.stack.truncate(stack_base);
+            self.call_info.pop();
+        }
+    }
+
+    /// 收集协程的根对象
+    fn collect_thread_roots(&self, thread: &LuaThread, worklist: &mut Vec<TValue>) {
+        for val in &thread.stack {
+            worklist.push(val.clone());
+        }
+        if let Some(ref func) = thread.function {
+            worklist.push((**func).clone());
+        }
+        let ctx = thread.context.borrow();
+        for val in &ctx.saved_stack {
+            worklist.push(val.clone());
+        }
+        for val in &ctx.saved_constants {
+            worklist.push(val.clone());
+        }
+        for uv_ref in &ctx.saved_closure_upvals {
+            let uv = uv_ref.borrow();
+            match &*uv {
+                UpVal::Closed { value } => {
+                    worklist.push((**value).clone());
+                }
+                UpVal::Open { stack_index, .. } => {
+                    if *stack_index < ctx.saved_stack.len() {
+                        worklist.push(ctx.saved_stack[*stack_index].clone());
+                    }
+                }
+            }
+        }
+        for frame in &ctx.saved_call_stack {
+            for val in &frame.constants {
+                worklist.push(val.clone());
+            }
+            for uv_ref in &frame.closure_upvals {
+                let uv = uv_ref.borrow();
+                if let UpVal::Closed { value } = &*uv {
+                    worklist.push((**value).clone());
+                }
+            }
+        }
+        if let Some(ref hook) = ctx.saved_hook_func {
+            worklist.push(hook.clone());
+        }
+        if let Some(ref err) = ctx.error_msg {
+            worklist.push(err.clone());
+        }
+        for ci in &ctx.saved_call_info {
+            if let Some(ref closure) = ci.closure {
+                worklist.push(TValue::LClosure(closure.clone()));
+            }
+        }
+    }
+
+    /// 标记 TValue 可达，并将子对象加入工作列表
+    fn mark_tvalue(
+        &self,
+        val: &TValue,
+        reachable: &mut HashSet<usize>,
+        visited: &mut HashSet<usize>,
+        worklist: &mut Vec<TValue>,
+    ) {
+        match val {
+            TValue::Table(t) => {
+                if let Some(id) = t.gc_header.id() {
+                    reachable.insert(id.0);
+                }
+                let ptr_id = t.gc_header.ptr_id;
+                if visited.insert(ptr_id) {
+                    let data = t.data.borrow();
+                    for v in data.array.iter() {
+                        worklist.push(v.clone());
+                    }
+                    for (k, v) in data.hash.iter() {
+                        worklist.push(k.clone());
+                        worklist.push(v.clone());
+                    }
+                    if let Some(ref mt) = data.metatable {
+                        worklist.push(TValue::Table((**mt).clone()));
+                    }
+                }
+            }
+            TValue::LClosure(c) => {
+                if let Some(id) = c.gc_header.id() {
+                    reachable.insert(id.0);
+                }
+                let ptr_id = c.gc_header.ptr_id;
+                if visited.insert(ptr_id) {
+                    let upvals = c.upvals.borrow();
+                    for uv_ref in upvals.iter() {
+                        let uv = uv_ref.borrow();
+                        match &*uv {
+                            UpVal::Closed { value } => {
+                                worklist.push((**value).clone());
+                            }
+                            UpVal::Open { stack_index, .. } => {
+                                if *stack_index < self.stack.len() {
+                                    worklist.push(self.stack[*stack_index].clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// 当 metas 大小超过动态阈值时自动触发 GC
+    pub fn maybe_collect_gc(&mut self) {
+        if self.gc.metas_len() > self.gc.collect_threshold() {
+            self.collect_gc();
         }
     }
 }
