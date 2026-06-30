@@ -271,6 +271,7 @@ struct ParentVar {
     is_global: bool,      // true = GDKREG/GDKCONST variable (global declaration)
     is_ctc: bool,         // true = RDKCTC variable (compile-time constant, not an upvalue)
     is_vararg: bool,      // true = RDKVAVAR variable (named vararg parameter, needs PF_VATAB)
+    kind: i32,            // variable kind (VDKREG/RDKCONST/RDKCTC/GDKREG/GDKCONST etc.)
     ctc_kind: Option<ExpKind>,  // constant kind (for is_ctc)
     ctc_info: Option<i64>,      // constant info (for is_ctc)
     ctc_str: Option<String>,    // constant string value (for is_ctc Str)
@@ -415,6 +416,7 @@ pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
         in_stack: true,
         idx: 0,
         parent_local_idx: 0,
+        kind: VDKREG as u8,
     });
     fs.proto.size_upvalues = 1;
 
@@ -1183,14 +1185,16 @@ impl<'a> FuncState<'a> {
         for pvar in self.parent_locals.iter().rev() {
             if !pvar.is_local && pvar.is_parent_upval && pvar.name == name {
                 // Found in parent's upvalues: create instack=false upvalue
-                let idx = self.proto.upvalues.len() as i32;
                 let upval_idx = pvar.upval_idx as u8;
+                let pvar_kind = pvar.kind as u8;
+                let idx = self.proto.upvalues.len() as i32;
                 let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name);
                 self.proto.upvalues.push(crate::objects::UpvalDesc {
                     name: Some(ls),
                     in_stack: false,
                     idx: upval_idx,
                     parent_local_idx: 0,
+                    kind: pvar_kind,
                 });
                 self.proto.size_upvalues = self.proto.upvalues.len() as i32;
                 return Some(UpvalueOrCtc::Upvalue(idx));
@@ -1216,6 +1220,7 @@ impl<'a> FuncState<'a> {
                 }
                 // Variable is inherited from a grandparent function.
                 // Need to create an upvalue in the parent first, then reference it.
+                let pvar_kind = pvar.kind as u8;
                 let parent_upval_idx = self.find_or_create_parent_upvalue(name);
                 if parent_upval_idx == usize::MAX {
                     // Variable is a global declaration in an ancestor: not an upvalue
@@ -1228,6 +1233,7 @@ impl<'a> FuncState<'a> {
                     in_stack: false,
                     idx: parent_upval_idx as u8,
                     parent_local_idx: 0,
+                    kind: pvar_kind,
                 });
                 self.proto.size_upvalues = self.proto.upvalues.len() as i32;
                 return Some(UpvalueOrCtc::Upvalue(idx));
@@ -1246,6 +1252,7 @@ impl<'a> FuncState<'a> {
             in_stack: true,
             idx: pvar.reg as u8,
             parent_local_idx: pvar.local_idx,
+            kind: pvar.kind as u8,
         });
         self.proto.size_upvalues = self.proto.upvalues.len() as i32;
         UpvalueOrCtc::Upvalue(idx)
@@ -1301,6 +1308,7 @@ impl<'a> FuncState<'a> {
             }
             if let Some(j) = found_local {
                 let pvar = &prev.parent_locals[j];
+                let pvar_kind = pvar.kind;
                 let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name);
                 let idx = prev.proto.upvalues.len();
                 prev.proto.upvalues.push(crate::objects::UpvalDesc {
@@ -1308,6 +1316,7 @@ impl<'a> FuncState<'a> {
                     in_stack: true,
                     idx: pvar.reg as u8,
                     parent_local_idx: pvar.local_idx,
+                    kind: pvar_kind as u8,
                 });
                 prev.proto.size_upvalues = prev.proto.upvalues.len() as i32;
                 return idx;
@@ -1320,13 +1329,16 @@ impl<'a> FuncState<'a> {
         for (j, pvar) in prev.parent_locals.iter().enumerate().rev() {
             if pvar.is_local || !pvar.is_parent_upval { continue; }
             if pvar.name == name {
+                let pvar_kind = pvar.kind;
+                let upval_idx = pvar.upval_idx as u8;
                 let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name);
                 let idx = prev.proto.upvalues.len();
                 prev.proto.upvalues.push(crate::objects::UpvalDesc {
                     name: Some(ls),
                     in_stack: false,
-                    idx: pvar.upval_idx as u8,
+                    idx: upval_idx,
                     parent_local_idx: 0,
+                    kind: pvar_kind as u8,
                 });
                 prev.proto.size_upvalues = prev.proto.upvalues.len() as i32;
                 return idx;
@@ -1344,6 +1356,7 @@ impl<'a> FuncState<'a> {
                 }
                 // Variable is inherited from a grandparent function.
                 // Recurse to create upvalue in parent first.
+                let pvar_kind = pvar.kind as u8;
                 let grandparent_upval_idx = prev.find_or_create_parent_upvalue(name);
                 if grandparent_upval_idx == usize::MAX {
                     return usize::MAX;
@@ -1355,6 +1368,7 @@ impl<'a> FuncState<'a> {
                     in_stack: false,
                     idx: grandparent_upval_idx as u8,
                     parent_local_idx: 0,
+                    kind: pvar_kind,
                 });
                 prev.proto.size_upvalues = prev.proto.upvalues.len() as i32;
                 return idx;
@@ -1448,6 +1462,42 @@ impl<'a> FuncState<'a> {
                     return None;
                 }
             }
+        }
+        None
+    }
+
+    /// 搜索当前函数及父函数链中的 global 声明，返回其 kind。
+    /// 对应 C 的 singlevaraux 递归搜索：先在当前函数 searchvar，
+    /// 未找到则递归到父函数。用于检测子函数中的 global const 赋值。
+    fn find_global_kind_in_chain(&self, name: &str) -> Option<i32> {
+        // First, check current function's locals
+        if let Some(kind) = self.find_global_decl(name) {
+            return Some(kind);
+        }
+        // Then, check parent_locals (global declarations in ancestor functions).
+        // Search all entries (is_local=true for parent's locals, is_local=false
+        // for grandparent variables) to handle multi-level closures.
+        // Like C's singlevaraux: a non-global variable with matching name shadows
+        // any outer global declaration (returns None).
+        let mut global_star_active = false;
+        for pvar in self.parent_locals.iter().rev() {
+            if pvar.is_global {
+                if pvar.name == "(global *)" {
+                    if !global_star_active { global_star_active = true; }
+                } else if pvar.name == name {
+                    return Some(pvar.kind);
+                } else {
+                    global_star_active = false;
+                }
+            } else {
+                // non-global variable: if name matches, it shadows any global
+                if pvar.name == name {
+                    return None;
+                }
+            }
+        }
+        if global_star_active {
+            return Some(GDKREG);
         }
         None
     }
@@ -3518,6 +3568,26 @@ fn parse_assign_or_call(fs: &mut FuncState) {
         }
         expect(fs, &Token::Eq);
 
+        // check_readonly: 对 const 变量赋值报错 (对应 C 的 check_readonly)
+        // C 中 luaK_semerror 会立即终止编译;Rust 中 fs.error 只记录错误,
+        // 由 parse_chunk_stmts 检测 has_errors 后停止后续语句。
+        let mut reported = false;
+        for v in vars.iter_mut() {
+            if v.is_readonly {
+                if !reported {
+                    let name = v.var_name.as_deref().unwrap_or("?").to_string();
+                    fs.error(&format!("attempt to assign to const variable '{}'", name));
+                    reported = true;
+                }
+                v.local_idx = None;
+                v.var_name = None;
+                v.upval_idx = None;
+                v.table_reg = None;
+                v.table_key = None;
+                v.key = None;
+            }
+        }
+
         // C compiler evaluates the left side before the right side.
         // For var_name with key > MAXINDEXRK, SETTABUP can't be used, so we must
         // emit GETUPVAL+LOADK now (before evaluating the right side), matching C's
@@ -4307,7 +4377,8 @@ fn code_global_via_env_prefix(fs: &mut FuncState, name: &str) -> PrefixResult {
     let is_env = name == "_ENV";
     let k = if is_env { 0 } else { fs.string_k(name) };
     // 检查是否有 global <const> 声明（read-only）
-    let is_readonly = !is_env && fs.find_global_decl(name) == Some(GDKCONST);
+    // 搜索父函数链以检测子函数中的 global const 赋值（对应 C 的 singlevaraux 递归）
+    let is_readonly = !is_env && fs.find_global_kind_in_chain(name) == Some(GDKCONST);
     // Like C buildglobal: singlevaraux(fs, "_ENV", ...) finds _ENV.
     // _ENV can be a local (VLOCAL), a local const (VCONST), or an upvalue (VUPVAL).
     // For VCONST, luaK_exp2anyregup discharges it to a register first.
@@ -4444,10 +4515,11 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         fs.code_abx(OpCode::LOADK, r, k);
                     }
                 };
-                PrefixResult { var_name: None, local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
+                PrefixResult { var_name: Some(name.clone()), local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: true }
             } else if let Some((reg, kind)) = fs.find_local_ex(&name) {
                 let is_vvargvar = kind == RDKVAVAR;
-                PrefixResult { var_name: None, local_idx: Some(reg), key: None, reg: Some(reg), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar, is_readonly: false }
+                let is_readonly = kind == RDKCONST;
+                PrefixResult { var_name: if is_readonly { Some(name.clone()) } else { None }, local_idx: Some(reg), key: None, reg: Some(reg), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar, is_readonly }
             } else if fs.find_named_global_decl(&name).is_some() {
                 // 具名 global 声明（如 `global a`）：优先于 upvalue，通过 _ENV[name] 访问。
                 // 匹配 C 的 searchvar：具名 global 匹配时立即返回 VGLOBAL，优先于 upvalue 查找。
@@ -4459,7 +4531,11 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         // Like C's singlevar which returns VUPVAL, we delay the GETUPVAL
                         // until load_func or the Dot/LBracket suffix handlers need it.
                         // This avoids duplicate GETUPVAL instructions and matches C's behavior.
-                        PrefixResult { var_name: None, local_idx: None, key: None, reg: None, table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: true, upval_idx: Some(upval_idx), env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
+                        // check_readonly: propagate const-ness from upvalue kind
+                        // (corresponds to C's check_readonly for VUPVAL with kind!=VDKREG)
+                        let uv_kind = fs.proto.upvalues[upval_idx as usize].kind as i32;
+                        let is_readonly = uv_kind == RDKCONST;
+                        PrefixResult { var_name: if is_readonly { Some(name.clone()) } else { None }, local_idx: None, key: None, reg: None, table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: true, upval_idx: Some(upval_idx), env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
                     }
                     UpvalueOrCtc::CtcConst(mut ctc) => {
                         // Like find_local_ctc handling: load constant into a register
@@ -4498,7 +4574,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                                 fs.code_abx(OpCode::LOADK, r, k);
                             }
                         };
-                        PrefixResult { var_name: None, local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: false }
+                        PrefixResult { var_name: Some(name.clone()), local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: true }
                     }
                 }
             } else {
@@ -9475,15 +9551,17 @@ fn parse_for(fs: &mut FuncState) {
         fs.add_local_kind("(for state)", fs.pc, RDKTOCLOSE);
         let ncontrol = vars.len() as i32;
         // Add user-declared variables as INACTIVE (they'll be activated inside body block)
-        for var_name in &vars {
+        // Like C's forlist: first variable (control) is RDKCONST, others are VDKREG
+        for (i, var_name) in vars.iter().enumerate() {
             let vidx = fs.locals.len() as i32;
             let nactvar = fs.active_nactvar();
+            let kind = if i == 0 { RDKCONST } else { VDKREG };
             fs.locals.push(LocalVar {
                 name: var_name.clone(),
                 start_pc: fs.pc,
                 active: false,
                 reg: 0,
-                kind: RDKCONST,
+                kind,
                 ctc_kind: None,
                 ctc_info: None,
                 ctc_str: None,
@@ -9685,10 +9763,18 @@ fn parse_func_stat(fs: &mut FuncState) {
         // can shadow global declarations (e.g., `local f` shadows `global <const> *`).
         let local_result = fs.find_local_ex(name);
         let global_kind = if local_result.is_none() {
-            fs.find_global_decl(name)
+            fs.find_global_kind_in_chain(name)
         } else {
             None
         };
+
+        // check_readonly: 对 const 变量函数声明赋值报错 (对应 C 的 check_readonly in funcstat)
+        if local_result.map(|(_, k)| k == RDKCONST).unwrap_or(false)
+            || global_kind == Some(GDKCONST)
+            || (local_result.is_none() && global_kind.is_none() && fs.find_local_ctc(name).is_some())
+        {
+            fs.error(&format!("attempt to assign to const variable '{}'", name));
+        }
 
         if let Some((reg, _kind)) = local_result {
             // Variable is a local (including locals that shadow global declarations):
@@ -10491,6 +10577,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
                 is_global,
                 is_ctc,
                 is_vararg,
+                kind: local.kind,
                 ctc_kind: local.ctc_kind.clone(),
                 ctc_info: local.ctc_info,
                 ctc_str: local.ctc_str.clone(),
@@ -10517,6 +10604,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
                     is_global: false,
                     is_ctc: false,
                     is_vararg: false,
+                    kind: uv.kind as i32,
                     ctc_kind: None,
                     ctc_info: None,
                     ctc_str: None,
@@ -10539,6 +10627,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
             is_global: gp_var.is_global,
             is_ctc: gp_var.is_ctc,
             is_vararg: gp_var.is_vararg,
+            kind: gp_var.kind,
             ctc_kind: gp_var.ctc_kind.clone(),
             ctc_info: gp_var.ctc_info,
             ctc_str: gp_var.ctc_str.clone(),
@@ -10601,6 +10690,11 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     // This is called AFTER 'end' has been consumed, so the RETURN instruction
     // gets the line of the 'end' keyword (which is last_line_defined).
     close_func(&mut new_fs);
+
+    // Propagate child function's compile errors to the parent FuncState.
+    // (Rust uses deferred error collection instead of C's immediate longjmp;
+    //  without this, errors in nested functions would be lost when new_fs drops.)
+    fs.errors.extend(new_fs.errors.drain(..));
 
     let proto = new_fs.proto;
     let p_idx = fs.proto.protos.len() as i32;

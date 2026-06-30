@@ -3288,6 +3288,7 @@ mod tests {
                 in_stack: false,
                 idx: 0,
                 parent_local_idx: 0,
+                kind: 0,
             }],
             line_info: vec![],
             abs_line_info: vec![],

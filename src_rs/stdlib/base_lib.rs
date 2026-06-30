@@ -616,12 +616,15 @@ fn call_pcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
         saved_tbc_list: state.tbc_list,
         saved_open_upval: state.open_upval,
         func_idx: a,
-        nresults: -1,
+        // 保存 pcall 调用者期望的返回值数 (非 state.pcall 的 -1)，
+        // 供 finish_pcall_return continuation 调整栈使用。
+        nresults,
         pcall_kind: crate::state::PcallKind::Pcall,
         saved_filled: false,
         is_metamethod: false,
         metamethod_res: 0,
         saved_call_stack_len: 0,
+        is_close_continuation: false,
     });
     let pcall_protection_idx = state.pcall_protection_stack.len() - 1;
 
@@ -1144,12 +1147,15 @@ fn call_xpcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         saved_tbc_list: state.tbc_list,
         saved_open_upval: state.open_upval,
         func_idx: a,
-        nresults: -1,
+        // 保存 xpcall 调用者期望的返回值数 (非 state.pcall 的 -1)，
+        // 供 finish_pcall_return continuation 调整栈使用。
+        nresults,
         pcall_kind: crate::state::PcallKind::Xpcall { handler: err_fn.clone() },
         saved_filled: false,
         is_metamethod: false,
         metamethod_res: 0,
         saved_call_stack_len: 0,
+        is_close_continuation: false,
     });
     let xpcall_protection_idx = state.pcall_protection_stack.len() - 1;
 
@@ -1198,9 +1204,27 @@ fn call_xpcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         state.stack.push(err_fn);
         state.stack.push(err_msg);
 
+        // 恢复错误发生时的 call_info 快照 — 对应 C Lua 中 errfunc 在 luaG_errormsg
+        // 中被调用，此时 CallInfo 链表仍完整（longjmp 跳过了 callclosemethod 的弹出代码）。
+        // 这样 debug.traceback 能看到 __close 帧。
+        let saved_call_info = std::mem::take(&mut state.last_error_call_info);
+        let original_call_info = if let Some(ref err_ci) = saved_call_info {
+            let orig = std::mem::take(&mut state.call_info);
+            state.call_info = err_ci.clone();
+            Some(orig)
+        } else {
+            None
+        };
+
         // 调用错误处理函数 (1 个参数, MULTRET)
         let handler_status = state.pcall(1, -1, 0);
         let handler_nret = state.stack.len().saturating_sub(a);
+
+        // 恢复 call_info 到清理后的状态
+        if let Some(orig) = original_call_info {
+            state.call_info = orig;
+        }
+        state.last_error_call_info = None;
 
         results.push(TValue::Boolean(false));
         if handler_status == 0 {
@@ -1323,11 +1347,116 @@ fn call_require(
             push_results(state, a, nresults, vec![val]);
             Ok(())
         }
-        _ => Err(VmError::RuntimeError(format!(
-            "module '{}' not found",
-            modname
-        ))),
+        _ => {
+            // 全局表未找到,尝试从 package.path 搜索并加载文件模块
+            if let Some(filepath) = search_module_file(state, &modname) {
+                load_and_run_module(state, a, nresults, &modname, &filepath)
+            } else {
+                Err(VmError::RuntimeError(format!(
+                    "module '{}' not found",
+                    modname
+                )))
+            }
+        }
     }
+}
+
+/// 读取 package.path 并搜索模块文件 (对应 C 的 searchpath 逻辑,简化版)
+///
+/// package.path 是用 `;` 分隔的模板列表,`?` 替换为 modname。
+/// 返回第一个存在的文件路径。
+fn search_module_file(state: &LuaState, modname: &str) -> Option<String> {
+    let package_key = TValue::Str(state.intern_str("package"));
+    let path_key = TValue::Str(state.intern_str("path"));
+    let path = match state.globals.get(&package_key) {
+        Some(TValue::Table(t)) => match t.get(&path_key) {
+            Some(TValue::Str(s)) => s.as_str().to_string(),
+            _ => "./?.lua;./?/init.lua".to_string(),
+        },
+        _ => "./?.lua;./?/init.lua".to_string(),
+    };
+    for template in path.split(';') {
+        if template.is_empty() {
+            continue;
+        }
+        let filepath = template.replace('?', modname);
+        if std::path::Path::new(&filepath).is_file() {
+            return Some(filepath);
+        }
+    }
+    None
+}
+
+/// 加载并执行模块文件,缓存结果到 package.loaded (对应 C 的 requiref 语义)
+fn load_and_run_module(
+    state: &mut LuaState,
+    a: usize,
+    nresults: i32,
+    modname: &str,
+    filepath: &str,
+) -> Result<(), VmError> {
+    let saved_len = state.stack.len();
+    let load_status = state.load_file(Some(filepath));
+    if load_status != 0 {
+        let err = state.to_string(-1).unwrap_or_default();
+        state.settop(saved_len);
+        return Err(VmError::RuntimeError(format!(
+            "error loading module '{}' from '{}': {}",
+            modname, filepath, err
+        )));
+    }
+    let call_status = state.pcall(0, 1, 0);
+    if call_status != 0 {
+        let err = state.to_string(-1).unwrap_or_default();
+        state.settop(saved_len);
+        return Err(VmError::RuntimeError(format!(
+            "error loading module '{}' from '{}': {}",
+            modname, filepath, err
+        )));
+    }
+    let result = state
+        .stack
+        .get(saved_len)
+        .cloned()
+        .unwrap_or_else(|| TValue::Nil(NilKind::Strict));
+    state.settop(saved_len);
+    cache_module_loaded(state, modname, result.clone());
+    push_results(state, a, nresults, vec![result]);
+    Ok(())
+}
+
+/// 缓存模块到 package.loaded[modname]
+fn cache_module_loaded(state: &mut LuaState, modname: &str, val: TValue) {
+    let package_key = TValue::Str(state.intern_str("package"));
+    let loaded_key = TValue::Str(state.intern_str("loaded"));
+    let mod_key = TValue::Str(state.intern_str(modname));
+    if let Some(TValue::Table(package_table)) = state.globals.get(&package_key) {
+        if let Some(TValue::Table(loaded_table)) = package_table.get(&loaded_key) {
+            // Table 共享数据 (Rc<RefCell>),直接 set 即可同步到 package.loaded
+            loaded_table.set(mod_key, val);
+        }
+    }
+}
+
+/// 初始化 package 表:设置 path (从 LUA_PATH 环境变量或默认) 和 loaded
+/// 对应 C loadlib.cpp 的 luaopen_package (简化版,不实现 searchers/cpath)
+fn init_package_table(state: &mut LuaState) {
+    let package_key = TValue::Str(state.intern_str("package"));
+    let pkg = crate::table::Table::new();
+    let loaded = crate::table::Table::new();
+    pkg.set(
+        TValue::Str(state.intern_str("loaded")),
+        TValue::Table(loaded),
+    );
+    // path:优先读取 LUA_PATH_5_5 / LUA_PATH 环境变量,无则用默认值
+    let path = std::env::var("LUA_PATH_5_5")
+        .or_else(|_| std::env::var("LUA_PATH"))
+        .unwrap_or_else(|_| "./?.lua;./?/init.lua".to_string());
+    pkg.set(
+        TValue::Str(state.intern_str("path")),
+        TValue::Str(state.intern_str(&path)),
+    );
+    state.globals.set(package_key, TValue::Table(pkg));
 }
 
 /// load(chunk [, chunkname [, mode [, env]]]) — 对应 C 的 luaB_load + lua_load
@@ -1903,6 +2032,9 @@ pub fn open_base_lib(state: &mut LuaState) {
         version_key,
         TValue::Str(state.intern_str("Lua 5.5")),
     );
+
+    // 初始化 package 表 (path + loaded),支持 require 从文件加载模块
+    init_package_table(state);
 }
 
 // ============================================================================

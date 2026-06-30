@@ -11,6 +11,8 @@ build/ 目录下为 Lua C 实现的构建目录，如果需要重新构建，也
 
 测试时 `ulimit -v 524288`（512MB），构建时用 `systemd-run --user --wait --collect --pipe --property=LimitAS=infinity` 绕过限制。
 
+不遵守规则会被hook拦截，导致测试失败。
+
 ## 编译器改动校验
 
 修改 `src_rs/` 下的核心数据文件或 `src_rs/compiler/` 目录时，需执行编译器比对测试（已固化到 hook），确保 Rust 输出与 C 实现一致。测试输出重定向到 `test.log` 查看。

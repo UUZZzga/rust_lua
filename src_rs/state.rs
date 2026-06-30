@@ -89,6 +89,10 @@ pub struct PcallProtection {
     /// 元方法调用前的 call_stack 长度 — 用于区分元方法自身返回 vs 元方法调用的函数返回
     /// 当 call_stack.len() == saved_call_stack_len 时，是元方法自身返回
     pub saved_call_stack_len: usize,
+    /// 是否为 __close continuation (call_close_method 推入)
+    /// yield 穿过 __close 后，resume 时 __close 返回，由 op_return 检查并执行
+    /// continuation（对应 C Lua 的 luaV_finishOp 对 OP_RETURN/OP_CLOSE 的 savedpc-- 机制）
+    pub is_close_continuation: bool,
 }
 
 pub struct GlobalState {
@@ -216,11 +220,33 @@ pub struct LuaState {
     /// debug.getinfo 的 'r' 选项从此字段读取 ftransfer/ntransfer
     pub transferinfo_ftransfer: i32,
     pub transferinfo_ntransfer: i32,
-    /// 待执行的返回值调整 — 当 return hook 启用时，push_results 不立即 adjust 栈，
+    /// 待执行的返回值调整 — 当 return hook 启用时，push_results 不立即 adjust 栈,
     /// 而是把结果放到栈上并设置此字段。op_call 在 return hook 执行完后执行 adjust。
     /// (a, nresults, n_actual, first_result_pos) — a=func 位置, nresults=期望返回值数,
     /// n_actual=实际返回值数, first_result_pos=结果在栈上的起始位置
     pub pending_return_adjust: Option<(usize, i32, usize, usize)>,
+    /// 错误发生时的 call_info 快照 — 对应 C Lua 中 longjmp 后 CallInfo 链表保持完整的行为
+    /// state.pcall 错误时在 truncate call_info 之前保存快照。
+    /// call_xpcall 调用错误处理函数之前恢复此快照，让 debug.traceback 能看到错误发生时的帧
+    /// (如 __close 帧)。调用错误处理函数后清除。
+    pub last_error_call_info: Option<Vec<CallInfoEntry>>,
+    /// 最后一个出错的 __close 的 CallInfoEntry — 对应 C Lua 中 longjmp 跳过 callclosemethod
+    /// 的弹出代码，CallInfo 节点保留在链表中。call_close_method 出错时 pop __close 帧并保存
+    /// 到此字段。state.pcall 保存 call_info 快照时将此帧追加到快照末尾，让 xpcall 的错误
+    /// 处理函数（如 debug.traceback）能看到 __close 帧。
+    pub last_close_frame: Option<CallInfoEntry>,
+    /// close continuation 的 pending error — 对应 C Lua 的 CIST_RECST 保存的错误状态。
+    /// 当 __close 出错时，execute_loop 错误处理分支将 error 保存到此字段，然后调用
+    /// func::close 继续关闭剩余 TBC 变量。func::close 处理完毕后检查此字段，
+    /// 若有 pending error 则传播给上层 pcall。
+    pub close_error_status: Option<TValue>,
+    /// coroutine.close() 关闭自身时设置 — 对应 C Lua 的 lua_closethread(co, L) 中
+    /// co == L 的场景。C Lua 中 coroutine.close() 会立即调用 luaF_close 关闭所有 TBC 变量，
+    /// 并通过 luaD_throwbaselevel 抛到协程 base level。我们的实现未完整支持此语义，
+    /// 改为设置此标志，让后续 OP_RETURN 的 func::close 使用不可 yield 模式 (yy=0)，
+    /// 使 __close 中的 yield 失败（对应 nny > 0 场景）。
+    /// call_resume 开始时清除。
+    pub force_noyield_close: bool,
 }
 
 /// 调用栈条目 — 用于堆栈回溯和 debug.getinfo
@@ -334,6 +360,10 @@ impl LuaState {
             transferinfo_ftransfer: 0,
             transferinfo_ntransfer: 0,
             pending_return_adjust: None,
+            last_error_call_info: None,
+            last_close_frame: None,
+            close_error_status: None,
+            force_noyield_close: false,
         }
     }
 
@@ -497,6 +527,10 @@ impl LuaState {
             transferinfo_ftransfer: 0,
             transferinfo_ntransfer: 0,
             pending_return_adjust: None,
+            last_error_call_info: None,
+            last_close_frame: None,
+            close_error_status: None,
+            force_noyield_close: false,
         };
         state
     }
@@ -602,6 +636,10 @@ impl LuaState {
             transferinfo_ftransfer: 0,
             transferinfo_ntransfer: 0,
             pending_return_adjust: None,
+            last_error_call_info: None,
+            last_close_frame: None,
+            close_error_status: None,
+            force_noyield_close: false,
         }
     }
 }
@@ -1476,6 +1514,7 @@ impl LuaState {
                         is_metamethod: false,
                         metamethod_res: 0,
                         saved_call_stack_len: 0,
+                        is_close_continuation: false,
                     });
                 }
 
@@ -1488,6 +1527,8 @@ impl LuaState {
                 // 才 pop call_info（call_stack 为空时不会 pop），且调用者（如 call_hook）
                 // 可能已 push call_info 供 debug.getinfo 使用。
                 let saved_call_stack_frames = std::mem::take(&mut self.call_stack);
+                // 保存 call_info 长度，用于错误时清理残留条目（对应 C 的 L->ci = old_ci）
+                let saved_call_info_len = self.call_info.len();
 
                 let result = VmExecutor::execute_loop(self);
 
@@ -1553,8 +1594,10 @@ impl LuaState {
                         top.saved_base = saved_base;
                         // is_metamethod: saved_pc 不 +1，保留指向被中断的指令（OP_LE/OP_MMBIN），
                         // 以便 op_return continuation 时读取该指令并完成（对应 C 的 luaV_finishOp）。
-                        // 非 metamethod: saved_pc + 1，跳过调用 pcall 的 CALL 指令。
-                        top.saved_pc = if top.is_metamethod { saved_pc } else { saved_pc + 1 };
+                        // is_close_continuation: saved_pc 不 +1，保留指向 OP_RETURN/OP_CLOSE，
+                        // 以便 op_return continuation 时重新执行该指令（对应 C 的 savedpc--）。
+                        // 其他: saved_pc + 1，跳过调用 pcall 的 CALL 指令。
+                        top.saved_pc = if top.is_metamethod || top.is_close_continuation { saved_pc } else { saved_pc + 1 };
                         top.saved_num_params = saved_num_params;
                         top.saved_is_vararg = saved_is_vararg;
                         top.saved_proto_flag = saved_proto_flag;
@@ -1563,13 +1606,23 @@ impl LuaState {
                         top.saved_tbc_list = saved_tbc_list;
                         top.saved_open_upval = saved_open_upval;
                         top.func_idx = func_idx;
-                        top.nresults = nresults;
+                        // 不覆盖 nresults: PcallProtection.nresults 保存的是
+                        // call_pcall/call_xpcall 的 nresults (pcall 调用者期望的返回值数),
+                        // 供 finish_pcall_return continuation 使用。
                         top.saved_filled = true;
                     }
                 }
 
                 // 错误时关闭 to-be-closed 变量（对应 C 的 luaD_closeprotected -> luaF_close）
                 // 必须在恢复 saved 状态之前调用，此时 state.closure_upvals/open_upval 仍是 foo 的
+                //
+                // 在协程中 pcall 走 CIST_YPCALL 路径（对应 C Lua 的 lua_pcallk + continuation），
+                // error 时由 finishpcallk 用 yy=1（可 yield）处理 close。这里模拟该机制：
+                // 如果可 yield（n_ny_calls==0 且在协程中），用 yy=1 让 __close 可 yield。
+                // close_yield 时设置 close_error_status 保存 error 状态，更新 PcallProtection
+                // saved_filled=true，返回 LUA_YIELD。resume 时由 finish_close_continuation
+                // 继续关闭剩余 TBC 变量（对应 C Lua 的 finishpcallk -> luaF_close 循环）。
+                let mut close_yield: Option<Vec<TValue>> = None;
                 let close_err = if is_yield {
                     None
                 } else {
@@ -1584,6 +1637,20 @@ impl LuaState {
                                 other => TValue::Str(self.intern_str(&format!("{}", other))),
                             };
                             self.last_error_value = Some(err_from_e);
+                            // 保存错误发生时的 call_info 快照 — 对应 C Lua 中 longjmp 后
+                            // CallInfo 链表保持完整的行为。call_xpcall 调用错误处理函数之前
+                            // 恢复此快照，让 debug.traceback 能看到错误发生时的帧（如 __close 帧）。
+                            // 如果有 __close 帧（call_close_method 出错时保存到 last_close_frame），
+                            // 追加到快照末尾，模拟 C Lua 中 CallInfo 节点保留在链表中的行为。
+                            let mut snapshot = self.call_info.clone();
+                            if let Some(ref close_frame) = self.last_close_frame {
+                                snapshot.push(close_frame.clone());
+                            }
+                            self.last_error_call_info = Some(snapshot);
+                            self.last_close_frame = None;
+                            // 清理 call_info 中 foo 执行期间的残留条目（对应 C 的 L->ci = old_ci）
+                            // 必须在 func::close 之前执行，否则 debug.getinfo(2) 会读到残留条目
+                            self.call_info.truncate(saved_call_info_len);
                             let close_level = self.base;  // foo 的 base
                             // __close 的调用者应是 pcall（C 函数），对应 C 版本中 foo 的 ci
                             // 在 error 时被弹出，调用栈上只剩 pcall 的 ci。
@@ -1595,17 +1662,63 @@ impl LuaState {
                             if close_level > 0 && close_level <= self.stack.len() {
                                 self.stack[close_level - 1] = TValue::Nil(NilKind::Strict);
                             }
-                            crate::func::close(self, close_level, 1, 0).ok();
+                            // 在协程中用 yy=1（可 yield），对应 C Lua 的 finishpcallk 用 yy=1
+                            let close_yy = if self.n_ny_calls == 0 && self.current_thread.is_some() { 1 } else { 0 };
+                            match crate::func::close(self, close_level, 1, close_yy) {
+                                Ok(()) => {}
+                                Err(VmError::Yield(values)) => {
+                                    close_yield = Some(values);
+                                }
+                                Err(_) => {}
+                            }
                             // 用 clone() 而非 take()，保留 last_error_value 供上层 close 函数读取错误传播
                             self.last_error_value.clone()
                         }
                     }
                 };
 
-                // yield 时: 保留 foo 的执行状态（不恢复 saved 状态，不截断栈）
+                // close_yield: __close yield（pcall error 路径的 close）
+                // 类似 is_yield: 不恢复 saved_*（保留 __close 的执行状态），
+                // 更新 PcallProtection saved_filled=true（保存 call_pcall 调用者状态），
+                // 设置 close_error_status 保存 error 状态，返回 LUA_YIELD。
+                // resume 时由 finish_close_continuation 继续关闭剩余 TBC 变量。
+                let is_close_yield = close_yield.is_some();
+                if is_close_yield {
+                    // 设置 close_error_status — 保存 error 状态供 resume 时 finish_close_continuation 使用
+                    // 对应 C Lua 的 CIST_RECST 保存的错误状态
+                    self.close_error_status = self.last_error_value.clone();
+                    // 设置 pending_yield 供 call_pcall 传播
+                    self.pending_yield = close_yield;
+                    // 更新 PcallProtection saved_filled=true（类似 is_yield 路径）
+                    let pp_len = self.pcall_protection_stack.len();
+                    let target_idx = (0..pp_len).rev()
+                        .find(|&i| !self.pcall_protection_stack[i].saved_filled);
+                    if let Some(idx) = target_idx {
+                        let top = &mut self.pcall_protection_stack[idx];
+                        top.saved_code = saved_code.clone();
+                        top.saved_constants = saved_constants.clone();
+                        top.saved_upval_descs = saved_upval_descs.clone();
+                        top.saved_protos = saved_protos.clone();
+                        top.saved_base = saved_base;
+                        top.saved_pc = saved_pc + 1;
+                        top.saved_num_params = saved_num_params;
+                        top.saved_is_vararg = saved_is_vararg;
+                        top.saved_proto_flag = saved_proto_flag;
+                        top.saved_nextraargs = saved_nextraargs;
+                        top.saved_closure_upvals = saved_closure_upvals.clone();
+                        top.saved_tbc_list = saved_tbc_list;
+                        top.saved_open_upval = saved_open_upval;
+                        top.func_idx = func_idx;
+                        top.saved_filled = true;
+                    }
+                }
+
+                // yield 时: 保留 __close/foo 的执行状态（不恢复 saved 状态，不截断栈）
                 // 对应 C Lua 中 yield 通过 longjmp 穿过 pcall，pcall 的状态被销毁，
-                // 第二次 resume 直接恢复 foo 的执行。
-                if !is_yield {
+                // 第二次 resume 直接恢复 __close/foo 的执行。
+                // is_close_yield: __close 正在执行，state 是 __close 的状态
+                // is_yield: foo 直接 yield，state 是 foo 的状态
+                if !is_yield && !is_close_yield {
                     self.code = saved_code;
                     self.constants = saved_constants;
                     self.upval_descs = saved_upval_descs;
@@ -1661,26 +1774,32 @@ impl LuaState {
                         0
                     }
                     Err(_) => {
-                        self.stack.truncate(func_idx);
-                        // close 后 last_error_value 包含最终错误值（可能是原始错误或 __close 错误）
-                        // 保留原始 TValue 类型（如数字 43），pcall 返回 (false, err_value)
-                        let err_val = close_err.unwrap_or_else(|| TValue::Nil(NilKind::Strict));
-                        // 对字符串错误，使用 build_traceback 添加了 source:line 前缀的
-                        // last_error_msg（VM 错误如 "attempt to call" 需要前缀；
-                        // error()/assert() 的前缀已在 last_error_value 中，二者一致）
-                        let err_val = if matches!(err_val, TValue::Str(_))
-                            && !self.last_error_msg.is_empty()
-                        {
-                            TValue::Str(self.intern_str(&self.last_error_msg))
+                        if is_close_yield {
+                            // __close yield: 不截断栈（保留 __close 的执行状态）
+                            // pending_yield 已设置，调用者检查并传播
+                            LUA_YIELD
                         } else {
-                            err_val
-                        };
-                        self.last_error_msg.clear();
-                        // 清除 last_error_value，防止残留值污染后续 pcall
-                        // (对应 C Lua 的 longjmp 后错误状态不跨 pcall 保留)
-                        self.last_error_value = None;
-                        self.stack.push(err_val);
-                        ERR_RUN
+                            self.stack.truncate(func_idx);
+                            // close 后 last_error_value 包含最终错误值（可能是原始错误或 __close 错误）
+                            // 保留原始 TValue 类型（如数字 43），pcall 返回 (false, err_value)
+                            let err_val = close_err.unwrap_or_else(|| TValue::Nil(NilKind::Strict));
+                            // 对字符串错误，使用 build_traceback 添加了 source:line 前缀的
+                            // last_error_msg（VM 错误如 "attempt to call" 需要前缀；
+                            // error()/assert() 的前缀已在 last_error_value 中，二者一致）
+                            let err_val = if matches!(err_val, TValue::Str(_))
+                                && !self.last_error_msg.is_empty()
+                            {
+                                TValue::Str(self.intern_str(&self.last_error_msg))
+                            } else {
+                                err_val
+                            };
+                            self.last_error_msg.clear();
+                            // 清除 last_error_value，防止残留值污染后续 pcall
+                            // (对应 C Lua 的 longjmp 后错误状态不跨 pcall 保留)
+                            self.last_error_value = None;
+                            self.stack.push(err_val);
+                            ERR_RUN
+                        }
                     }
                 }
             }
@@ -1785,6 +1904,34 @@ impl LuaState {
                         self.pending_yield = Some(values);
                         self.last_error_value = None;
                         self.last_error_msg.clear();
+                        // C 函数 __close (如 coroutine.yield 作为 __close) yield 时，
+                        // state.code/state.pc 未被修改（仍为 close 调用者的上下文）。
+                        // 需要更新 close continuation 的 PcallProtection，
+                        // 以便 resume 时 finish_close_continuation 能正确恢复并重新执行 OP_RETURN/OP_CLOSE。
+                        // (与 LClosure 分支的 yield 处理一致)
+                        let pp_len = self.pcall_protection_stack.len();
+                        let target_idx = (0..pp_len).rev()
+                            .find(|&i| !self.pcall_protection_stack[i].saved_filled
+                                && self.pcall_protection_stack[i].is_close_continuation);
+                        if let Some(idx) = target_idx {
+                            let top = &mut self.pcall_protection_stack[idx];
+                            top.saved_code = self.code.clone();
+                            top.saved_constants = self.constants.clone();
+                            top.saved_upval_descs = self.upval_descs.clone();
+                            top.saved_protos = self.protos.clone();
+                            top.saved_base = self.base;
+                            // is_close_continuation: saved_pc 不 +1，保留指向 OP_RETURN/OP_CLOSE
+                            top.saved_pc = self.pc;
+                            top.saved_num_params = self.num_params;
+                            top.saved_is_vararg = self.is_vararg;
+                            top.saved_proto_flag = self.proto_flag;
+                            top.saved_nextraargs = self.nextraargs;
+                            top.saved_closure_upvals = self.closure_upvals.clone();
+                            top.saved_tbc_list = self.tbc_list;
+                            top.saved_open_upval = self.open_upval;
+                            top.func_idx = func_idx;
+                            top.saved_filled = true;
+                        }
                         LUA_YIELD
                     }
                     Err(crate::execute::VmError::RuntimeError(msg)) => {

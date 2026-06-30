@@ -2378,7 +2378,7 @@ use crate::strings::{LuaString, StringTable};
             constants: vec![],
             code: vec![],
             protos: vec![],
-            upvalues: vec![UpvalDesc { in_stack: true, idx: 0, name: None, parent_local_idx: 0 }],
+            upvalues: vec![UpvalDesc { in_stack: true, idx: 0, name: None, parent_local_idx: 0, kind: 0 }],
             line_info: vec![],
             abs_line_info: vec![],
             loc_vars: vec![],

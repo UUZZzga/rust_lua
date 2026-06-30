@@ -672,6 +672,8 @@ pub struct UpvalDesc {
     /// For in_stack upvalues: index in parent's locals array (used by mark_block_upval)
     /// For non-in_stack upvalues: unused (0)
     pub parent_local_idx: usize,
+    /// 变量 kind (VDKREG/RDKCONST/RDKCTC 等，对应 C 的 Upvaldesc.kind)
+    pub kind: u8,
 }
 
 /// 局部变量描述符（调试信息）
@@ -884,6 +886,10 @@ pub struct ThreadContext {
     /// 协程 yield 时保存的 call_info（调用栈信息）
     /// 用于 debug.traceback(co) 和 debug.getinfo(co, level) 在协程挂起时查看调用栈
     pub saved_call_info: Vec<crate::state::CallInfoEntry>,
+    /// 协程 yield 时保存的 close_error_status（close continuation 的 pending error）
+    /// 对应 C Lua 的 CIST_RECST 保存的错误状态。
+    /// pcall error 路径的 close_yield 时设置，resume 后由 finish_close_continuation 读取。
+    pub saved_close_error_status: Option<TValue>,
 }
 
 /// Lua 线程（协程）

@@ -1197,8 +1197,7 @@ impl BytecodeWriter {
         for uv in &f.upvalues {
             self.dump_byte(if uv.in_stack { 1 } else { 0 });
             self.dump_byte(uv.idx);
-            // kind: 对于普通变量是 0 (VDKREG)
-            self.dump_byte(0);
+            self.dump_byte(uv.kind);
         }
     }
 
@@ -1326,12 +1325,13 @@ pub fn dumped_to_proto(df: &DumpedFunction) -> Proto {
     }).collect();
 
     // upvalues: (bool, u8, u8) → UpvalDesc
-    proto.upvalues = df.upvalues.iter().enumerate().map(|(i, (instack, idx, _kind))| {
+    proto.upvalues = df.upvalues.iter().enumerate().map(|(i, (instack, idx, kind))| {
         UpvalDesc {
             name: df.upvalue_names.get(i).and_then(|n| n.as_ref().map(|s| make_long_string(s))),
             in_stack: *instack,
             idx: *idx,
             parent_local_idx: 0,
+            kind: *kind,
         }
     }).collect();
 

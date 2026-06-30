@@ -55,10 +55,13 @@ echo "Project build passed."
 
 echo "Running project..."
 
+# 设置 LUA_PATH,让 require 能找到 tests_lua 目录下的模块 (如 tracegc.lua)
+export LUA_PATH="tests_lua/?.lua;./?.lua;./?/init.lua"
+
 # 测试时限制内存为 512MB
 ulimit -v 524288
 
-for test_file in tests_lua/db.lua tests_lua/calls.lua tests_lua/coroutine.lua tests_lua/math.lua tests_lua/strings.lua tests_lua/utf8.lua; do
+for test_file in tests_lua/db.lua tests_lua/calls.lua tests_lua/coroutine.lua tests_lua/locals.lua tests_lua/math.lua tests_lua/strings.lua tests_lua/utf8.lua; do
     test_name=$(basename "$test_file")
     log_name="logs/${test_name%.lua}_run.log"
     echo "Running $test_name ..."

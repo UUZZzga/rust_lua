@@ -794,6 +794,12 @@ fn call_close(
     nresults: i32,
 ) -> Result<(), VmError> {
     if nargs < 1 {
+        // 对应 C Lua 的 getoptco: 无参数时关闭当前协程自身
+        // C Lua 中 coroutine.close() 会调用 lua_closethread(co, L) 立即关闭所有 TBC 变量，
+        // 并通过 luaD_throwbaselevel 抛到 base level。我们的实现未完整支持此语义，
+        // 改为设置 force_noyield_close 标志，让后续 OP_RETURN 的 func::close 使用
+        // 不可 yield 模式 (yy=0)，使 __close 中的 yield 失败。
+        state.force_noyield_close = true;
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'close' (thread expected)".to_string(),
         ));
@@ -1108,6 +1114,11 @@ fn call_resume(
     // 保存 n_ny_calls 并重置为 0（协程初始状态是可 yield 的）
     let saved_n_ny_calls = state.n_ny_calls;
     state.n_ny_calls = 0;
+    // 保存 force_noyield_close 并重置为 false
+    // 协程内 coroutine.close() 关闭自身时设置，只在协程内有效；
+    // 调用者的 force_noyield_close 不应泄漏到协程，反之亦然。
+    let saved_force_noyield_close = state.force_noyield_close;
+    state.force_noyield_close = false;
     // 保存 pcall_protection_stack 长度（协程内部 push 的 PcallProtection 不应泄漏到外部）
     let saved_pcall_protection_len = state.pcall_protection_stack.len();
 
@@ -1128,6 +1139,7 @@ fn call_resume(
     // 恢复 n_ccalls (协程 yield/error 可能导致 n_ccalls 不准确)
     state.n_ccalls = saved_n_ccalls;
     state.n_ny_calls = saved_n_ny_calls;
+    state.force_noyield_close = saved_force_noyield_close;
         return Err(e);
     }
 
@@ -1169,8 +1181,15 @@ fn call_resume(
                 ctx.saved_upval_descs = std::mem::take(&mut state.upval_descs);
                 ctx.saved_protos = std::mem::take(&mut state.protos);
                 ctx.saved_base = state.base;
-                // pc + 1 以跳过 yield CALL 指令
-                ctx.saved_pc = state.pc + 1;
+                // C 函数 __close (如 coroutine.yield 作为 __close) yield 时，
+                // state.pc 指向 OP_RETURN/OP_CLOSE（非 CALL 指令），不应 +1。
+                // 此时 PcallProtection.saved_pc == state.pc（都指向 OP_RETURN/OP_CLOSE）。
+                // Lua __close yield 时，state.pc 指向 __close 中的 CALL 指令，
+                // saved_pc 指向 OP_RETURN/OP_CLOSE，二者不同，需要 +1 跳过 CALL。
+                let is_c_close_yield = state.pcall_protection_stack.last()
+                    .map_or(false, |t| t.is_close_continuation && t.saved_filled
+                        && t.saved_pc == state.pc);
+                ctx.saved_pc = if is_c_close_yield { state.pc } else { state.pc + 1 };
                 ctx.saved_top = state.top;
                 ctx.saved_num_params = state.num_params;
                 ctx.saved_is_vararg = state.is_vararg;
@@ -1190,6 +1209,9 @@ fn call_resume(
                 ctx.saved_current_hook_count = state.current_hook_count;
                 ctx.saved_allowhook = state.allowhook;
                 ctx.saved_pcall_protection_stack = state.pcall_protection_stack[saved_pcall_protection_len..].to_vec();
+                // 保存 close_error_status（close continuation 的 pending error）
+                // 对应 C Lua 的 CIST_RECST 保存的错误状态，跨 yield/resume 保留
+                ctx.saved_close_error_status = state.close_error_status.take();
                 ctx.status = ThreadStatus::Suspended;
                 // saved_yield_nresults 已由 call_yield 设置
             }
@@ -1302,14 +1324,24 @@ fn call_resume(
     // 恢复 n_ccalls (协程 yield/error 可能导致 n_ccalls 不准确)
     state.n_ccalls = saved_n_ccalls;
     state.n_ny_calls = saved_n_ny_calls;
+    // 恢复调用者的 force_noyield_close（协程内的设置不泄漏到调用者）
+    state.force_noyield_close = saved_force_noyield_close;
     // 协程结束时清理 pcall_protection_stack（移除协程内部 push 的 PcallProtection）
     if co_finished {
         state.pcall_protection_stack.truncate(saved_pcall_protection_len);
     }
 
-    // 首次 resume 时: 把 Closed upvalue 值同步回父栈，协程结束则恢复 Open
+    // 把 Closed upvalue 值同步回父栈，协程结束则恢复 Open
     if is_first_resume {
         sync_upvals_back(state, &open_upvals, co_finished, true);
+    } else {
+        // 后续 resume：从 upval_origins 恢复 open_upvals 信息，
+        // yield 时同步 Closed 值回父栈（保持 Closed）；结束时恢复 Open。
+        let origins = co_context.borrow().upval_origins.clone();
+        let dead_upvals: Vec<OpenUpvalInfo> = origins.into_iter()
+            .map(|(uv_ref, idx)| OpenUpvalInfo { uv_ref, original_stack_index: idx })
+            .collect();
+        sync_upvals_back(state, &dead_upvals, co_finished, true);
     }
 
     // 推送结果
@@ -1482,6 +1514,8 @@ fn setup_subsequent_resume(
     state.hook_old_pc = ctx.saved_hook_old_pc;
     // 恢复协程的 pcall_protection_stack（yield 时保存到 ThreadContext）
     state.pcall_protection_stack.extend(ctx.saved_pcall_protection_stack.iter().cloned());
+    // 恢复 close_error_status（yield 时保存到 ThreadContext）
+    state.close_error_status = ctx.saved_close_error_status.clone();
     // 恢复协程的 call_info（yield 时保存到 ThreadContext）
     state.call_info = ctx.saved_call_info.clone();
     // pop 掉 yield 时保留的 C 函数 CallInfoEntry
@@ -1779,7 +1813,15 @@ pub fn call_wrap_call(
                 ctx.saved_upval_descs = std::mem::take(&mut state.upval_descs);
                 ctx.saved_protos = std::mem::take(&mut state.protos);
                 ctx.saved_base = state.base;
-                ctx.saved_pc = state.pc + 1;
+                // C 函数 __close (如 coroutine.yield 作为 __close) yield 时，
+                // state.pc 指向 OP_RETURN/OP_CLOSE（非 CALL 指令），不应 +1。
+                // 此时 PcallProtection.saved_pc == state.pc（都指向 OP_RETURN/OP_CLOSE）。
+                // Lua __close yield 时，state.pc 指向 __close 中的 CALL 指令，
+                // saved_pc 指向 OP_RETURN/OP_CLOSE，二者不同，需要 +1 跳过 CALL。
+                let is_c_close_yield = state.pcall_protection_stack.last()
+                    .map_or(false, |t| t.is_close_continuation && t.saved_filled
+                        && t.saved_pc == state.pc);
+                ctx.saved_pc = if is_c_close_yield { state.pc } else { state.pc + 1 };
                 ctx.saved_top = state.top;
                 ctx.saved_num_params = state.num_params;
                 ctx.saved_is_vararg = state.is_vararg;
@@ -1798,6 +1840,8 @@ pub fn call_wrap_call(
                 ctx.saved_current_hook_count = state.current_hook_count;
                 ctx.saved_allowhook = state.allowhook;
                 ctx.saved_pcall_protection_stack = state.pcall_protection_stack[saved_pcall_protection_len..].to_vec();
+                // 保存 close_error_status（close continuation 的 pending error）
+                ctx.saved_close_error_status = state.close_error_status.take();
                 ctx.status = ThreadStatus::Suspended;
             }
             // yield 时从 state 中移除协程的 PcallProtection（避免污染调用者 state）
@@ -1826,7 +1870,22 @@ pub fn call_wrap_call(
             (Vec::new(), true, None)
         }
         Err(e) => {
-            co_context.borrow_mut().status = ThreadStatus::Error;
+            // 保存 error 状态到 ctx（必须在 TBC 关闭之前保存）
+            {
+                let mut ctx = co_context.borrow_mut();
+                ctx.status = ThreadStatus::Error;
+                ctx.saved_call_info = state.call_info.clone();
+                let save_end = state.base.min(state.stack.len());
+                ctx.saved_stack = state.stack[..save_end].to_vec();
+                ctx.saved_base = state.base;
+                ctx.saved_pc = state.pc.wrapping_add(1);
+            }
+            // 关闭协程的 TBC 变量，对应 C Lua 中 luaD_closeprotected -> luaF_close
+            let close_level = state.base;
+            if close_level > 0 && close_level <= state.stack.len() {
+                state.stack[close_level - 1] = TValue::Nil(NilKind::Strict);
+            }
+            let _ = crate::func::close(state, close_level, 1, 0);
             // 保留原始错误值（非字符串错误如 error(foo) 应原样传播），
             // 而非格式化为字符串丢失 TValue 类型
             let err_val = state.last_error_value.take().unwrap_or_else(|| {
@@ -1856,10 +1915,18 @@ pub fn call_wrap_call(
         state.pcall_protection_stack.truncate(saved_pcall_protection_len);
     }
 
-    // 首次 resume 时: 把 Closed upvalue 值同步回父栈，协程结束则恢复 Open
+    // 把 Closed upvalue 值同步回父栈，协程结束则恢复 Open
     // 同栈时写回 state.stack（原始父栈）；跨栈时跳过写回（父栈不可访问），仅恢复 Open
     if is_first_resume {
         sync_upvals_back(state, &open_upvals, is_dead, same_stack);
+    } else {
+        // 后续 resume：从 upval_origins 恢复 open_upvals 信息，
+        // yield 时同步 Closed 值回父栈（保持 Closed）；结束时恢复 Open。
+        let origins = co_context.borrow().upval_origins.clone();
+        let dead_upvals: Vec<OpenUpvalInfo> = origins.into_iter()
+            .map(|(uv_ref, idx)| OpenUpvalInfo { uv_ref, original_stack_index: idx })
+            .collect();
+        sync_upvals_back(state, &dead_upvals, is_dead, same_stack);
     }
 
     // 出错时抛出错误（wrap 语义：不返回 false+err，而是直接抛错）

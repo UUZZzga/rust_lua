@@ -207,7 +207,14 @@ fn unlink_upval(state: &mut LuaState, uv_idx: usize) {
     }
 }
 
-pub fn close(state: &mut LuaState, level: usize, status: i32, _nresults: i32) -> Result<(), VmError> {
+pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result<(), VmError> {
+    // force_noyield_close: coroutine.close() 关闭自身时设置（对应 C Lua 的 lua_closethread(co, L)
+    // 中 co == L 场景）。C Lua 会立即调用 luaF_close(L, L->stack, LUA_OK, 1) 关闭所有 TBC 变量，
+    // 并通过 luaD_throwbaselevel 抛到 base level。我们的实现未完整支持此语义，改为设置标志，
+    // 让 OP_RETURN 的 func::close 使用不可 yield 模式 (yy=0)，使 __close 中的 yield 失败
+    // （对应 C Lua 中 nny > 0 时 yield 报错的场景）。
+    let yy = if state.force_noyield_close { 0 } else { yy };
+
     // 收集所有 should_close 的 upvalue（按 open_upval 链表顺序，stack_index 降序）
     // open_upval 链表是按 stack_index 降序，对应 Lua 5.5 的关闭顺序
     let mut to_close: Vec<usize> = Vec::new();
@@ -261,7 +268,7 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, _nresults: i32) ->
             }
         };
         if is_tbc {
-            // TBC upvalue: 读取栈上的值，调用 __close metamethod
+            // TBC upvalue: 读取栈上的值（在 close_upval 之前，因为 close_upval 会改为 Closed）
             let val = {
                 let uv_ref = state.closure_upvals[uv_idx].borrow();
                 if let UpVal::Open { stack_index, .. } = &*uv_ref {
@@ -270,15 +277,30 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, _nresults: i32) ->
                     TValue::Nil(NilKind::Strict)
                 }
             };
+            // 先 close_upval（从 open 链表移除），再调用 __close
+            // 对应 C Lua 的 luaF_close: unlinkupval 先于 callclosemethod
+            // 这样 yield 后重新执行 close 时，不会再次处理已关闭的 upvalue（幂等）
+            close_upval(state, uv_idx);
             // 只对非 nil 的值调用 __close
             if !matches!(val, TValue::Nil(_)) {
                 // 清空 last_error_value 以便检测 __close 是否出错
                 state.last_error_value = None;
                 state.last_error_msg.clear();
-                // 调用 __close(val, current_err)
-                match crate::tm::call_close_method(state, &val, &current_err) {
+                // 调用 __close(val, err?) — 无错误时只传 1 个参数 (对应 C 的 errobj=NULL)
+                let err_ref = if has_error { Some(&current_err) } else { None };
+                match crate::tm::call_close_method(state, &val, err_ref, yy != 0) {
                     Ok(_) => {
                         // __close 成功: 不改变错误状态
+                    }
+                    Err(VmError::Yield(values)) => {
+                        // __close yield: 传播 yield，不继续处理剩余 upvalue
+                        // close_upval 已执行，upvalue 已从 open 链表移除
+                        // 恢复 last_error_value（被 line 280 清除），供 close_yield 处理使用
+                        // 对应 C Lua 的 CIST_RECST 保存的错误状态跨 yield 保留
+                        if has_error {
+                            state.last_error_value = Some(current_err.clone());
+                        }
+                        return Err(VmError::Yield(values));
                     }
                     Err(e) => {
                         // __close 出错: 从返回的 VmError 提取错误值，更新 current_err
@@ -293,8 +315,9 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, _nresults: i32) ->
                     }
                 }
             }
+        } else {
+            close_upval(state, uv_idx);
         }
-        close_upval(state, uv_idx);
     }
     // 如果 close 过程中有错误，设置 state.last_error_value 供调用者检查
     if has_error {
@@ -320,10 +343,23 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, _nresults: i32) ->
     }
 }
 
-pub fn new_tbc_upval(state: &mut LuaState, level: usize) -> Option<usize> {
-    // 对应 C 的 luaF_newtbcupval: 复用或创建 open upvalue，然后标记 tbc
+pub fn new_tbc_upval(state: &mut LuaState, level: usize) -> Result<Option<usize>, VmError> {
+    // 对应 C 的 luaF_newtbcupval: 检查 __close 元方法，复用或创建 open upvalue，然后标记 tbc
+    let val = state.stack.get(level).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
+    // C 的 luaF_newtbcupval: l_isfalse 检查，跳过 nil/false
+    if val.is_false() {
+        return Ok(None);  // false/nil 不需要关闭
+    }
+    // 对应 C 的 checkclosemth: 检查 __close 元方法是否存在
+    let has_close = crate::tm::get_tm_by_obj(&val, crate::tm::TagMethod::Close, &state.dmt).is_some();
+    if !has_close {
+        // 获取变量名 — 对应 C 的 luaG_findlocal(L, L->ci, idx, NULL)
+        let varname = get_var_name_at(state, level).unwrap_or_else(|| "?".to_string());
+        return Err(VmError::RuntimeError(format!(
+            "variable '{}' got a non-closable value", varname
+        )));
+    }
     // TBC upvalue 复用 open_upval 链表（通过 find_upval 加入），用 tbc 字段标记
-    // 不再使用单独的 tbc_list 链表（会导致循环引用）
     let uv_idx = find_upval(state, level);
     {
         let mut uv_ref = state.closure_upvals[uv_idx].borrow_mut();
@@ -333,7 +369,38 @@ pub fn new_tbc_upval(state: &mut LuaState, level: usize) -> Option<usize> {
     }
     // 更新 tbc_list 指向最新的 TBC upvalue（用于 pop_tbc_list 等检查）
     state.tbc_list = Some(uv_idx);
-    Some(uv_idx)
+    Ok(Some(uv_idx))
+}
+
+/// 获取指定栈位置对应的局部变量名 — 对应 C 的 luaG_findlocal + luaG_getlocalname
+/// `reg` 是绝对栈位置 (对应 C 的 StkId level)，需要转换为相对于函数的局部变量编号
+fn get_var_name_at(state: &LuaState, reg: usize) -> Option<String> {
+    if state.base == 0 || state.base > state.stack.len() {
+        return None;
+    }
+    if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
+        let proto = &closure.proto;
+        let pc = state.pc;
+        // C: idx = level - ci->func.p; Rust: func 在 state.base - 1
+        // 所以 local_number = reg - (state.base - 1) = reg - state.base + 1
+        let local_number = reg.wrapping_sub(state.base - 1);
+        if local_number == 0 {
+            return None;
+        }
+        let mut n = local_number as i32;
+        for loc_var in &proto.loc_vars {
+            if (loc_var.start_pc as usize) <= pc && pc < (loc_var.end_pc as usize) {
+                n -= 1;
+                if n == 0 {
+                    if let Some(ref name) = loc_var.varname {
+                        return Some(name.as_str().to_string());
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+    None
 }
 
 pub fn pop_tbc_list(state: &mut LuaState, level: usize) {
@@ -432,6 +499,10 @@ mod tests {
             transferinfo_ftransfer: 0,
             transferinfo_ntransfer: 0,
             pending_return_adjust: None,
+            last_error_call_info: None,
+            last_close_frame: None,
+            close_error_status: None,
+            force_noyield_close: false,
         }
     }
 
@@ -545,17 +616,46 @@ mod tests {
     #[test]
     fn test_new_tbc_upval_creates_tbc_entry() {
         let mut state = make_vm_state();
-        state.stack = vec![TValue::Integer(100)];
-        let uv = new_tbc_upval(&mut state, 0);
+        // 创建带 __close 元方法的 Table
+        let close_key = TValue::Str(state.intern_str("__close"));
+        let mt = crate::table::Table::new();
+        mt.set(close_key, TValue::Integer(0));
+        let obj = crate::table::Table::new();
+        obj.set_metatable(Some(mt));
+        state.stack = vec![TValue::Table(obj)];
+        let uv = new_tbc_upval(&mut state, 0).expect("closable value should succeed");
         assert!(uv.is_some());
         assert_eq!(state.tbc_list, uv);
     }
 
     #[test]
-    fn test_pop_tbc_list_removes_entry() {
+    fn test_new_tbc_upval_rejects_non_closable() {
         let mut state = make_vm_state();
         state.stack = vec![TValue::Integer(100)];
-        let _uv = new_tbc_upval(&mut state, 0);
+        // Integer 没有 __close 元方法，应返回 Err
+        assert!(new_tbc_upval(&mut state, 0).is_err());
+    }
+
+    #[test]
+    fn test_new_tbc_upval_skips_false() {
+        let mut state = make_vm_state();
+        state.stack = vec![TValue::Boolean(false)];
+        // false/nil 不需要关闭，应返回 Ok(None)
+        let uv = new_tbc_upval(&mut state, 0).expect("false should succeed");
+        assert!(uv.is_none());
+    }
+
+    #[test]
+    fn test_pop_tbc_list_removes_entry() {
+        let mut state = make_vm_state();
+        // 创建带 __close 元方法的 Table
+        let close_key = TValue::Str(state.intern_str("__close"));
+        let mt = crate::table::Table::new();
+        mt.set(close_key, TValue::Integer(0));
+        let obj = crate::table::Table::new();
+        obj.set_metatable(Some(mt));
+        state.stack = vec![TValue::Table(obj)];
+        let _uv = new_tbc_upval(&mut state, 0).expect("closable value should succeed");
         pop_tbc_list(&mut state, 0);
         assert_eq!(state.tbc_list, None);
     }

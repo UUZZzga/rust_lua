@@ -431,6 +431,7 @@ pub(crate) fn call_tm_res(
         is_metamethod: true,
         metamethod_res: res,
         saved_call_stack_len: state.call_stack.len(),
+        is_close_continuation: false,
     });
     let mm_protection_idx = state.pcall_protection_stack.len() - 1;
 
@@ -586,6 +587,7 @@ pub(crate) fn call_tm(
         is_metamethod: true,
         metamethod_res: func_idx,  // 不使用 (0 个返回值)
         saved_call_stack_len: state.call_stack.len(),
+        is_close_continuation: false,
     });
     let mm_protection_idx = state.pcall_protection_stack.len() - 1;
 
@@ -649,7 +651,8 @@ thread_local! {
 pub fn call_close_method(
     state: &mut LuaState,
     obj: &TValue,
-    err: &TValue,
+    err: Option<&TValue>,
+    yy: bool,
 ) -> Result<bool, VmError> {
     let depth = CLOSE_METHOD_DEPTH.with(|d| { let v = d.get(); d.set(v + 1); v });
     if depth > 10 {
@@ -663,17 +666,36 @@ pub fn call_close_method(
     }
     let _guard = DepthGuard;
     // 查找 __close 元方法
+    // 对应 C 的 callclosemethod: 不检查 __close 是否存在，直接把 tm 放到栈上调用。
+    // 如果 tm 是 nil（__close 被移除），luaD_callnoyield 尝试调用 nil，
+    // luaG_callerror → funcnamefromcall → funcnamefromcode(OP_RETURN) → "metamethod 'close'"
+    // 生成 "attempt to call a nil value (metamethod 'close')" 错误。
     let tm_val = get_tm_by_obj(obj, TagMethod::Close, &state.dmt);
     let f = match tm_val {
         Some(f) if f.is_function() => f,
-        _ => return Ok(false),  // 无 __close 元方法
+        other => {
+            // __close 不存在或不是函数 — 对应 C 调用 nil/table 值时的 call error
+            let tn = match &other {
+                Some(v) => type_name(v.ty()),
+                None => "nil",
+            };
+            return Err(VmError::RuntimeError(format!(
+                "attempt to call a {} value (metamethod 'close')", tn
+            )));
+        }
     };
 
     let func_idx = state.stack.len();
-    // 压入函数和两个参数 (对应 C 的 setobj2s)
+    // 压入函数和参数 (对应 C 的 callclosemethod)
+    // C 中 err == NULL 时不传递第二个参数（无错误时只传 1 个参数）
     state.stack.push(f);
     state.stack.push(obj.clone());
-    state.stack.push(err.clone());
+    let nargs = if let Some(err_val) = err {
+        state.stack.push(err_val.clone());
+        2
+    } else {
+        1
+    };
     state.top = state.stack.len();
 
     // 推入 CallInfoEntry — 对应 C 的 luaD_callnoyield 推入 CallInfo
@@ -691,7 +713,7 @@ pub fn call_close_method(
     state.call_info.push(crate::state::CallInfoEntry {
         source: caller_source,
         line: -1,
-        name: "__close".to_string(),
+        name: "close".to_string(),
         is_c: false,
         closure: None,
         base: caller_base,
@@ -702,15 +724,55 @@ pub fn call_close_method(
         is_tailcall: false,
     });
 
-    // __close 元方法通过 luaD_callnoyield 调用（不可 yield），递增 n_ny_calls
+    // Push PcallProtection — close continuation 机制
+    // yield 穿过 __close 后，resume 时 __close 返回，op_return 检测到 is_close_continuation=true
+    // 并执行 continuation（对应 C Lua 的 luaV_finishOp 对 OP_RETURN/OP_CLOSE 的 savedpc-- 机制）
+    state.pcall_protection_stack.push(crate::state::PcallProtection {
+        saved_code: Vec::new(),
+        saved_constants: Vec::new(),
+        saved_upval_descs: Vec::new(),
+        saved_protos: Vec::new(),
+        saved_base: 0,
+        saved_pc: 0,
+        saved_num_params: 0,
+        saved_is_vararg: false,
+        saved_proto_flag: 0,
+        saved_nextraargs: 0,
+        saved_closure_upvals: Vec::new(),
+        saved_tbc_list: None,
+        saved_open_upval: None,
+        func_idx: 0,
+        nresults: 0,
+        pcall_kind: crate::state::PcallKind::Pcall,
+        saved_filled: false,
+        is_metamethod: false,
+        metamethod_res: 0,
+        saved_call_stack_len: state.call_stack.len(),
+        is_close_continuation: true,
+    });
+
+    // 对应 C 的 callclosemethod: yy=1 用 luaD_call (可 yield), yy=0 用 luaD_callnoyield
+    // n_ny_calls > 0 时不可 yield (对应 C 的 nny > 0)
     let saved_ny = state.n_ny_calls;
-    state.n_ny_calls = state.n_ny_calls.saturating_add(1);
-    // 调用: 2 个参数, 0 个返回值 (对应 C 的 luaD_call(L, top, 0))
-    let status = state.pcall(2, 0, 0);
+    if !yy {
+        state.n_ny_calls = state.n_ny_calls.saturating_add(1);
+    }
+    // 调用: nargs 个参数, 0 个返回值 (对应 C 的 luaD_call(L, top, 0))
+    let status = state.pcall(nargs, 0, 0);
     state.n_ny_calls = saved_ny;
 
     // 弹出 CallInfoEntry
-    state.call_info.pop();
+    let close_frame = state.call_info.pop();
+
+    if status == crate::state::LUA_YIELD {
+        // __close 函数 yield: 不 pop PcallProtection (保留供 resume 时使用)
+        // 对应 C Lua 的 luaV_finishOp: savedpc-- 重新执行 OP_RETURN/OP_CLOSE
+        let values = state.pending_yield.take().unwrap_or_default();
+        return Err(VmError::Yield(values));
+    }
+
+    // 成功或错误: pop PcallProtection
+    state.pcall_protection_stack.pop();
 
     if status != 0 {
         // 元方法调用失败 — pcall 将错误值推入栈中 func_idx 位置
@@ -720,6 +782,11 @@ pub fn call_close_method(
         // 截断栈，移除临时压入的函数/参数/错误值
         state.stack.truncate(func_idx);
         state.top = state.stack.len();
+        // 保存 __close 的 CallInfoEntry — 对应 C Lua 中 longjmp 跳过 callclosemethod
+        // 的弹出代码，CallInfo 节点保留在链表中。state.pcall 保存 call_info 快照时
+        // 将此帧追加到快照末尾，让 xpcall 的错误处理函数（如 debug.traceback）能看到
+        // __close 帧。
+        state.last_close_frame = close_frame;
         // 非字符串错误用 RuntimeErrorValue 保留原始类型（如数字 200）
         return Err(if matches!(err_val, TValue::Str(_)) {
             VmError::RuntimeError(match &err_val {

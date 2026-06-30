@@ -647,37 +647,20 @@ impl VmExecutor {
                 OpCode::RETURN => match Self::op_return(state, inst) {
                     Ok(Some(vr)) => return Ok(vr),
                     Ok(None) => Ok(()),
-                    Err(e) => {
-                        // yield 从元方法 continuation 传出时不构建 traceback
-                        // (对应 C Lua 中 yield 走 resume/unroll 路径, 不进入 error 处理)
-                        if let VmError::Yield(values) = e {
-                            return Ok(VmResult::Yield { values });
-                        }
-                        Self::build_traceback(state, &e);
-                        return Err(e);
-                    }
+                    Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
+                    Err(e) => Err(e),
                 },
                 OpCode::RETURN0 => match Self::op_return0(state, inst) {
                     Ok(Some(vr)) => return Ok(vr),
                     Ok(None) => Ok(()),
-                    Err(e) => {
-                        if let VmError::Yield(values) = e {
-                            return Ok(VmResult::Yield { values });
-                        }
-                        Self::build_traceback(state, &e);
-                        return Err(e);
-                    }
+                    Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
+                    Err(e) => Err(e),
                 },
                 OpCode::RETURN1 => match Self::op_return1(state, inst) {
                     Ok(Some(vr)) => return Ok(vr),
                     Ok(None) => Ok(()),
-                    Err(e) => {
-                        if let VmError::Yield(values) = e {
-                            return Ok(VmResult::Yield { values });
-                        }
-                        Self::build_traceback(state, &e);
-                        return Err(e);
-                    }
+                    Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
+                    Err(e) => Err(e),
                 },
                 OpCode::FORLOOP => Self::op_forloop(state, inst),
                 OpCode::FORPREP => Self::op_forprep(state, inst),
@@ -887,118 +870,237 @@ impl VmExecutor {
                     if let VmError::Yield(values) = e {
                         return Ok(VmResult::Yield { values });
                     }
-                    // 检查 pcall_protection_stack — 对应 C Lua 的 precover + finishpcallk
-                    // yield 穿过 pcall/xpcall 后，C 函数栈帧被销毁，但保护状态保留。
-                    // 当 inner_func 后续执行 error 时，由 execute_loop 处理 pcall/xpcall 的返回。
-                    // 只处理 saved_filled=true 的 PcallProtection（即被 yield 穿过的），
-                    // 避免误处理 state.pcall 的 LClosure 分支调用的 execute_loop 中的 error。
-                    if state.pcall_protection_stack.last().map_or(false, |t| t.saved_filled) {
-                        // 获取 error 值（保留原始 TValue 类型，如 error({s}) 的表）
-                        let error_val = state.last_error_value.clone()
-                            .unwrap_or_else(|| {
-                                match &e {
+                    let mut current_error = e;
+                    loop {
+                        // close continuation error 处理 — 对应 C Lua 的 precover + finishpcallk +
+                        // luaF_close 机制（CIST_RECST 保存错误状态后继续关闭剩余 TBC 变量）
+                        //
+                        // 当 __close 元方法 error 时，error 传播到 execute_loop。
+                        // 若栈顶 PP 是 is_close_continuation + saved_filled（即 __close 是被
+                        // yield 穿过的 close continuation），则：
+                        //   1. pop PP，恢复 close 调用者（如 foo）的执行上下文
+                        //   2. 保存 error 值到 close_error_status（模拟 CIST_RECST）
+                        //   3. 调用 func::close 继续关闭剩余 TBC 变量
+                        //      - 成功：检查 close_error_status，若有 pending error 则 fall through
+                        //        到 pcall 处理；否则继续 execute_loop
+                        //      - yield：返回 Yield
+                        //      - 出错：更新 current_error，fall through 到 pcall 处理
+                        if state.pcall_protection_stack.last().map_or(false, |t| t.saved_filled && t.is_close_continuation) {
+                            let pp = state.pcall_protection_stack.pop().unwrap();
+                            // 恢复 close 调用者的执行上下文 (对应 C 的 L->ci = ci->previous)
+                            state.code = pp.saved_code;
+                            state.constants = pp.saved_constants;
+                            state.upval_descs = pp.saved_upval_descs;
+                            state.protos = pp.saved_protos;
+                            state.base = pp.saved_base;
+                            state.pc = pp.saved_pc;
+                            state.num_params = pp.saved_num_params;
+                            state.is_vararg = pp.saved_is_vararg;
+                            state.proto_flag = pp.saved_proto_flag;
+                            state.nextraargs = pp.saved_nextraargs;
+                            state.closure_upvals = pp.saved_closure_upvals;
+                            state.tbc_list = pp.saved_tbc_list;
+                            state.open_upval = pp.saved_open_upval;
+                            // 截断栈，移除 __close 函数的帧
+                            state.stack.truncate(pp.func_idx);
+                            state.top = state.stack.len();
+                            // 保存 error 值到 close_error_status（供 func::close 和后续传播使用）
+                            // 保留 last_error_value，让 func::close 读取它作为 current_err
+                            // （对应 C Lua 的 CIST_RECST 保存错误状态，luaF_close 用 status 读取）
+                            if state.last_error_value.is_none() {
+                                state.last_error_value = Some(match &current_error {
                                     VmError::RuntimeErrorValue(val) => val.clone(),
                                     VmError::RuntimeError(s) => TValue::Str(state.intern_str(s)),
-                                    _ => TValue::Str(state.intern_str(&format!("{}", e))),
-                                }
-                            });
-                        state.last_error_value = None;
-                        state.last_error_msg.clear();
-
-                        // current_results 是当前要传递给 pcall/xpcall 的返回值
-                        // 初始为 [error_val]，因为 inner_func 执行了 error
-                        let mut current_results: Vec<TValue> = vec![error_val];
-                        // is_error 表示当前是否在处理 error（而非成功返回值）
-                        let mut is_error = true;
-
-                        // 循环处理所有 PcallProtection（从内到外）
-                        // 只处理 saved_filled=true 的 PcallProtection，
-                        // 遇到 shield（saved_filled=false，由 state.pcall push）时 break，
-                        // 使 error 传播到 state.pcall，而非被外层 PcallProtection 捕获。
-                        while let Some(protection) = state.pcall_protection_stack.last() {
-                            if !protection.saved_filled { break; }
-                            let protection = state.pcall_protection_stack.pop().unwrap();
-                            // 恢复 pcall 调用者的执行上下文
-                            state.code = protection.saved_code;
-                            state.constants = protection.saved_constants;
-                            state.upval_descs = protection.saved_upval_descs;
-                            state.protos = protection.saved_protos;
-                            state.base = protection.saved_base;
-                            state.pc = protection.saved_pc;
-                            state.num_params = protection.saved_num_params;
-                            state.is_vararg = protection.saved_is_vararg;
-                            state.proto_flag = protection.saved_proto_flag;
-                            state.nextraargs = protection.saved_nextraargs;
-                            state.closure_upvals = protection.saved_closure_upvals;
-                            state.tbc_list = protection.saved_tbc_list;
-                            state.open_upval = protection.saved_open_upval;
-
-                            if is_error {
-                                // 处理 error：pcall/xpcall 捕获 error
-                                match protection.pcall_kind {
-                                    crate::state::PcallKind::Pcall => {
-                                        // pcall: 返回 (false, error_val)
-                                        state.stack.truncate(protection.func_idx);
-                                        state.stack.push(TValue::Boolean(false));
-                                        state.stack.push(current_results[0].clone());
-                                        state.top = protection.func_idx + 2;
-                                        current_results = vec![TValue::Boolean(false), current_results[0].clone()];
-                                        // pcall 已捕获 error，后续 PcallProtection 处理成功返回值
-                                        is_error = false;
-                                    }
-                                    crate::state::PcallKind::Xpcall { handler } => {
-                                        // xpcall: 调用 handler(error_val)，返回 (false, handler_result)
-                                        state.stack.truncate(protection.func_idx);
-                                        state.stack.push(handler);
-                                        state.stack.push(current_results[0].clone());
-                                        state.top = protection.func_idx + 2;
-                                        let handler_status = state.pcall(1, -1, 0);
-                                        let handler_nret = state.stack.len().saturating_sub(protection.func_idx);
-                                        let handler_result: Vec<TValue> = if handler_status == 0 {
-                                            // handler 成功: 返回 handler 的结果
-                                            (0..handler_nret).map(|i| state.stack[protection.func_idx + i].clone()).collect()
-                                        } else {
-                                            // handler 失败: 返回 "error in error handling"
-                                            vec![TValue::Str(state.intern_str("error in error handling"))]
+                                    _ => TValue::Str(state.intern_str(&format!("{}", current_error))),
+                                });
+                            }
+                            let error_val = state.last_error_value.clone().unwrap();
+                            state.last_error_msg.clear();
+                            state.close_error_status = Some(error_val);
+                            // 调用 func::close 继续关闭剩余 TBC 变量
+                            // level = state.base（close 调用者的 base），status = 1（error），ynresults = 1
+                            match crate::func::close(state, state.base, 1, 1) {
+                                Ok(()) => {
+                                    if let Some(err) = state.close_error_status.take() {
+                                        // 有 pending error，转换回 current_error，fall through 到 pcall 处理
+                                        state.last_error_value = Some(err.clone());
+                                        current_error = match err {
+                                            TValue::Str(s) => VmError::RuntimeError(s.to_string()),
+                                            v => VmError::RuntimeErrorValue(v),
                                         };
-                                        // xpcall 返回 (false, handler_result...)
-                                        state.stack.truncate(protection.func_idx);
-                                        state.stack.push(TValue::Boolean(false));
-                                        for r in &handler_result {
-                                            state.stack.push(r.clone());
-                                        }
-                                        state.top = protection.func_idx + 1 + handler_result.len();
-                                        current_results = {
-                                            let mut v = vec![TValue::Boolean(false)];
-                                            v.extend(handler_result);
-                                            v
-                                        };
-                                        is_error = false;
+                                        continue;  // 下一轮迭代处理 pcall
                                     }
+                                    // 无 pending error，继续 execute_loop
+                                    break;
                                 }
-                            } else {
-                                // 处理成功返回值：pcall/xpcall 返回 (true, results...)
-                                // 先获取当前栈上的 current_results（在恢复 saved_* 状态后，
-                                // current_results 可能已在栈上，但这里用 Vec 传递）
-                                state.stack.truncate(protection.func_idx);
-                                state.stack.push(TValue::Boolean(true));
-                                for r in &current_results {
-                                    state.stack.push(r.clone());
+                                Err(VmError::Yield(values)) => {
+                                    return Ok(VmResult::Yield { values });
                                 }
-                                state.top = protection.func_idx + 1 + current_results.len();
-                                // current_results 更新为 (true, results...)
-                                current_results = {
-                                    let mut v = vec![TValue::Boolean(true)];
-                                    v.extend(current_results.iter().cloned());
-                                    v
-                                };
+                                Err(e2) => {
+                                    // close 出错（非 yield），更新 current_error，fall through 到 pcall
+                                    state.close_error_status = None;
+                                    current_error = e2;
+                                    continue;
+                                }
                             }
                         }
-                        // 所有 PcallProtection 处理完毕，继续执行 saved_code/saved_pc
-                        continue;
+                        // 检查 pcall_protection_stack — 对应 C Lua 的 precover + finishpcallk
+                        // yield 穿过 pcall/xpcall 后，C 函数栈帧被销毁，但保护状态保留。
+                        // 当 inner_func 后续执行 error 时，由 execute_loop 处理 pcall/xpcall 的返回。
+                        // 只处理 saved_filled=true 的 PcallProtection（即被 yield 穿过的），
+                        // 避免误处理 state.pcall 的 LClosure 分支调用的 execute_loop 中的 error。
+                        // 跳过 is_close_continuation 的 PcallProtection：close continuation 的 error
+                        // 已在上面的 close continuation 分支处理。
+                        if state.pcall_protection_stack.last().map_or(false, |t| t.saved_filled && !t.is_close_continuation) {
+                            // 获取 error 值（保留原始 TValue 类型，如 error({s}) 的表）
+                            let mut error_val = state.last_error_value.clone()
+                                .unwrap_or_else(|| {
+                                    match &current_error {
+                                        VmError::RuntimeErrorValue(val) => val.clone(),
+                                        VmError::RuntimeError(s) => TValue::Str(state.intern_str(s)),
+                                        _ => TValue::Str(state.intern_str(&format!("{}", current_error))),
+                                    }
+                                });
+                            state.last_error_value = None;
+                            state.last_error_msg.clear();
+
+                            // 关闭 TBC 变量 — 对应 C Lua 的 finishpcallk:
+                            // luaF_close(L, func, status, 1)
+                            // 当 error 穿过被 yield 的 pcall 时，需要关闭 pcall 保护范围内的
+                            // TBC 变量。使用 pcall 调用者（如 foo）的 closure_upvals/tbc_list/open_upval
+                            // (从 call_stack 栈顶 CallFrame 获取，保存的是 pcall 调用者的值)。
+                            // 若 call_stack 为空（inner_func 直接 error），使用当前 state 的上下文。
+                            let pp_func_idx = state.pcall_protection_stack.last().unwrap().func_idx;
+                            let saved_ctx = if let Some(frame) = state.call_stack.last().cloned() {
+                                let saved_cu = std::mem::replace(&mut state.closure_upvals, frame.closure_upvals.clone());
+                                let saved_tl = std::mem::replace(&mut state.tbc_list, frame.tbc_list);
+                                let saved_ou = std::mem::replace(&mut state.open_upval, frame.open_upval);
+                                Some((saved_cu, saved_tl, saved_ou))
+                            } else {
+                                None
+                            };
+                            state.last_error_value = Some(error_val.clone());
+                            match crate::func::close(state, pp_func_idx, 1, 1) {
+                                Ok(()) => {}
+                                Err(VmError::Yield(values)) => {
+                                    if let Some((cu, tl, ou)) = saved_ctx {
+                                        state.closure_upvals = cu;
+                                        state.tbc_list = tl;
+                                        state.open_upval = ou;
+                                    }
+                                    return Ok(VmResult::Yield { values });
+                                }
+                                Err(_) => {}
+                            }
+                            // 获取最终 error 值（可能被 __close 更新）
+                            if let Some(final_err) = state.last_error_value.take() {
+                                error_val = final_err;
+                            }
+                            state.last_error_msg.clear();
+
+                            // current_results 是当前要传递给 pcall/xpcall 的返回值
+                            // 初始为 [error_val]，因为 inner_func 执行了 error
+                            let mut current_results: Vec<TValue> = vec![error_val];
+                            // is_error 表示当前是否在处理 error（而非成功返回值）
+                            let mut is_error = true;
+
+                            // 循环处理所有 PcallProtection（从内到外）
+                            // 只处理 saved_filled=true 的 PcallProtection，
+                            // 遇到 shield（saved_filled=false，由 state.pcall push）时 break，
+                            // 使 error 传播到 state.pcall，而非被外层 PcallProtection 捕获。
+                            // 遇到 is_close_continuation 时也 break：close continuation 的 error
+                            // 已在上面的分支处理。
+                            while let Some(protection) = state.pcall_protection_stack.last() {
+                                if !protection.saved_filled { break; }
+                                if protection.is_close_continuation { break; }
+                                let protection = state.pcall_protection_stack.pop().unwrap();
+                                // 恢复 pcall 调用者的执行上下文
+                                state.code = protection.saved_code;
+                                state.constants = protection.saved_constants;
+                                state.upval_descs = protection.saved_upval_descs;
+                                state.protos = protection.saved_protos;
+                                state.base = protection.saved_base;
+                                state.pc = protection.saved_pc;
+                                state.num_params = protection.saved_num_params;
+                                state.is_vararg = protection.saved_is_vararg;
+                                state.proto_flag = protection.saved_proto_flag;
+                                state.nextraargs = protection.saved_nextraargs;
+                                state.closure_upvals = protection.saved_closure_upvals;
+                                state.tbc_list = protection.saved_tbc_list;
+                                state.open_upval = protection.saved_open_upval;
+
+                                if is_error {
+                                    // 处理 error：pcall/xpcall 捕获 error
+                                    match protection.pcall_kind {
+                                        crate::state::PcallKind::Pcall => {
+                                            // pcall: 返回 (false, error_val)
+                                            state.stack.truncate(protection.func_idx);
+                                            state.stack.push(TValue::Boolean(false));
+                                            state.stack.push(current_results[0].clone());
+                                            state.top = protection.func_idx + 2;
+                                            current_results = vec![TValue::Boolean(false), current_results[0].clone()];
+                                            // pcall 已捕获 error，后续 PcallProtection 处理成功返回值
+                                            is_error = false;
+                                        }
+                                        crate::state::PcallKind::Xpcall { handler } => {
+                                            // xpcall: 调用 handler(error_val)，返回 (false, handler_result)
+                                            state.stack.truncate(protection.func_idx);
+                                            state.stack.push(handler);
+                                            state.stack.push(current_results[0].clone());
+                                            state.top = protection.func_idx + 2;
+                                            let handler_status = state.pcall(1, -1, 0);
+                                            let handler_nret = state.stack.len().saturating_sub(protection.func_idx);
+                                            let handler_result: Vec<TValue> = if handler_status == 0 {
+                                                // handler 成功: 返回 handler 的结果
+                                                (0..handler_nret).map(|i| state.stack[protection.func_idx + i].clone()).collect()
+                                            } else {
+                                                // handler 失败: 返回 "error in error handling"
+                                                vec![TValue::Str(state.intern_str("error in error handling"))]
+                                            };
+                                            // xpcall 返回 (false, handler_result...)
+                                            state.stack.truncate(protection.func_idx);
+                                            state.stack.push(TValue::Boolean(false));
+                                            for r in &handler_result {
+                                                state.stack.push(r.clone());
+                                            }
+                                            state.top = protection.func_idx + 1 + handler_result.len();
+                                            current_results = {
+                                                let mut v = vec![TValue::Boolean(false)];
+                                                v.extend(handler_result);
+                                                v
+                                            };
+                                            is_error = false;
+                                        }
+                                    }
+                                } else {
+                                    // 处理成功返回值：pcall/xpcall 返回 (true, results...)
+                                    // 先获取当前栈上的 current_results（在恢复 saved_* 状态后，
+                                    // current_results 可能已在栈上，但这里用 Vec 传递）
+                                    state.stack.truncate(protection.func_idx);
+                                    state.stack.push(TValue::Boolean(true));
+                                    for r in &current_results {
+                                        state.stack.push(r.clone());
+                                    }
+                                    state.top = protection.func_idx + 1 + current_results.len();
+                                    // current_results 更新为 (true, results...)
+                                    current_results = {
+                                        let mut v = vec![TValue::Boolean(true)];
+                                        v.extend(current_results.iter().cloned());
+                                        v
+                                    };
+                                }
+                            }
+                            // 所有 PcallProtection 处理完毕，清空 call_stack
+                            // 对应 C Lua 的 longjmp 跳过所有 CallInfo，回到 pcall 调用前的状态
+                            // pcall 处理路径只在协程场景下被触发（PP1.saved_filled=true，即 yield 穿过 pcall），
+                            // call_stack 中的帧是被中断的调用帧，pcall 捕获 error 后不再需要
+                            state.call_stack.clear();
+                            break;
+                        }
+                        Self::build_traceback(state, &current_error);
+                        return Err(current_error);
                     }
-                    Self::build_traceback(state, &e);
-                    return Err(e);
+                    continue;
                 }
             }
         }
@@ -1439,6 +1541,170 @@ impl VmExecutor {
                 }
             }
         }
+
+        Ok(true)
+    }
+
+    /// 完成 __close continuation — 对应 C Lua 的 luaV_finishOp 对 OP_RETURN/OP_CLOSE 的处理
+    ///
+    /// 当 __close 元方法 yield 后，resume 时 __close 函数返回，op_return 检测到
+    /// is_close_continuation=true 的 PcallProtection，恢复 close 调用者状态，
+    /// 重新执行 OP_RETURN/OP_CLOSE（对应 C 的 savedpc--）。
+    ///
+    /// 返回 true 表示已处理 continuation，op_return 应返回 Ok(None) 让 execute_loop
+    /// 重新执行 OP_RETURN/OP_CLOSE。返回 false 表示不是 close continuation。
+    fn finish_close_continuation(state: &mut LuaState) -> Result<bool, VmError> {
+        let cur_call_stack_len = state.call_stack.len();
+        let is_close_cont = state.pcall_protection_stack.last()
+            .map_or(false, |t| t.is_close_continuation && t.saved_filled
+                && t.saved_call_stack_len == cur_call_stack_len);
+        if !is_close_cont {
+            return Ok(false);
+        }
+
+        // 关闭 __close 函数栈帧的 TBC 变量和开 upvalue
+        // 此时 state.base 是 __close 函数的 base
+        // 如果 close 再次 yield，PcallProtection 保留供下次 resume 使用
+        // 对应 C Lua 的 luaV_finishOp: savedpc-- 重新执行 OP_RETURN/OP_CLOSE
+        match crate::func::close(state, state.base, 0, 1) {
+            Ok(()) => {}
+            Err(e) => {
+                // close yield 或出错: 不 pop PcallProtection, 不恢复状态
+                return Err(e);
+            }
+        }
+
+        // close 成功: pop PcallProtection
+        let protection = state.pcall_protection_stack.pop().unwrap();
+
+        // 恢复 close 调用者的执行上下文 (对应 C 的 L->ci = ci->previous)
+        state.code = protection.saved_code;
+        state.constants = protection.saved_constants;
+        state.upval_descs = protection.saved_upval_descs;
+        state.protos = protection.saved_protos;
+        state.base = protection.saved_base;
+        state.pc = protection.saved_pc;  // 指向 OP_RETURN/OP_CLOSE (不 +1, 重新执行)
+        state.num_params = protection.saved_num_params;
+        state.is_vararg = protection.saved_is_vararg;
+        state.proto_flag = protection.saved_proto_flag;
+        state.nextraargs = protection.saved_nextraargs;
+        state.closure_upvals = protection.saved_closure_upvals;
+        state.tbc_list = protection.saved_tbc_list;
+        state.open_upval = protection.saved_open_upval;
+
+        // 截断栈，移除 __close 函数的帧
+        state.stack.truncate(protection.func_idx);
+        state.top = state.stack.len();
+
+        // 检查 close_error_status — 对应 C Lua 的 CIST_RECST 保存的错误状态
+        // 当 __close continuation 是被 execute_loop 的 close continuation error 分支
+        // 触发的（前一个 __close 出错后 func::close 继续关闭剩余 TBC），close_error_status
+        // 保存了 pending error。此时已恢复 close 调用者的状态（state.base = 调用者 base），
+        // 需继续 close 调用者的剩余 TBC 变量（对应 C Lua 的 luaF_close 循环）。
+        // 如果剩余 __close 再次 yield，重新设置 close_error_status 并返回 Err(Yield)。
+        if let Some(err) = state.close_error_status.take() {
+            state.last_error_value = Some(err.clone());
+            // 继续 close 调用者的剩余 TBC 变量（status=1, yy=1 可 yield）
+            // 对应 C Lua 的 finishpcallk: luaF_close(L, func, status, 1)
+            match crate::func::close(state, state.base, 1, 1) {
+                Ok(()) => {
+                    // close 完成: 返回 pending error 给上层 pcall
+                    return match err {
+                        TValue::Str(s) => Err(VmError::RuntimeError(s.to_string())),
+                        v => Err(VmError::RuntimeErrorValue(v)),
+                    };
+                }
+                Err(VmError::Yield(values)) => {
+                    // __close 再次 yield: 重新设置 close_error_status，返回 Yield
+                    // 对应 C Lua 的 luaF_close 被 yield interrupt，finishpcallk 再次被调用
+                    state.close_error_status = Some(err);
+                    return Err(VmError::Yield(values));
+                }
+                Err(e2) => {
+                    // __close 出错: 用新 error 替代 pending error
+                    state.close_error_status = None;
+                    return Err(e2);
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
+    /// pcall/xpcall 正常返回 continuation — 对应 C Lua 的 finishpcallk (成功路径)
+    ///
+    /// yield 穿过 pcall/xpcall 后，C 函数栈帧被销毁，但保护状态保留在
+    /// pcall_protection_stack 中 (saved_filled=true)。当被保护的 Lua 函数
+    /// 执行 OP_RETURN 返回时，execute_loop 收到 Ok(Some(VmResult::Return { ... }))，
+    /// 由此函数检查并处理 pcall/xpcall 的正常返回:
+    ///   1. pop PcallProtection
+    ///   2. 从 VmResult 取返回值，截断栈到 func_idx
+    ///   3. 恢复 pcall 调用者的执行上下文
+    ///   4. push true + 返回值，按 nresults 调整栈 (模拟 call_pcall/call_xpcall 成功返回)
+    ///   5. 返回 true，execute_loop 继续循环 (pcall 调用者从 CALL 指令之后继续执行)
+    ///
+    /// 注意: 只处理非 close continuation、非 metamethod 的 PcallProtection。
+    /// close continuation 由 finish_close_continuation 处理，
+    /// metamethod 由 try_finish_metamethod 处理。
+    fn finish_pcall_return(state: &mut LuaState, nret: usize, result_base: usize) -> Result<bool, VmError> {
+        let need_finish = state.pcall_protection_stack.last().map_or(false, |t| {
+            t.saved_filled && !t.is_close_continuation && !t.is_metamethod
+        });
+        if !need_finish {
+            return Ok(false);
+        }
+
+        let protection = state.pcall_protection_stack.pop().unwrap();
+
+        // 从 result_base 取 nret 个返回值
+        let mut tmp_results: Vec<TValue> = Vec::with_capacity(nret);
+        for i in 0..nret {
+            if result_base + i < state.stack.len() {
+                tmp_results.push(std::mem::take(&mut state.stack[result_base + i]));
+            } else {
+                tmp_results.push(TValue::Nil(NilKind::Strict));
+            }
+        }
+
+        // 截断栈到 func_idx (移除被保护函数的栈帧)
+        state.stack.truncate(protection.func_idx);
+
+        // 恢复 pcall 调用者的执行上下文
+        state.code = protection.saved_code;
+        state.constants = protection.saved_constants;
+        state.upval_descs = protection.saved_upval_descs;
+        state.protos = protection.saved_protos;
+        state.base = protection.saved_base;
+        state.pc = protection.saved_pc;  // 指向 CALL pcall 指令之后
+        state.num_params = protection.saved_num_params;
+        state.is_vararg = protection.saved_is_vararg;
+        state.proto_flag = protection.saved_proto_flag;
+        state.nextraargs = protection.saved_nextraargs;
+        state.closure_upvals = protection.saved_closure_upvals;
+        state.tbc_list = protection.saved_tbc_list;
+        state.open_upval = protection.saved_open_upval;
+
+        // push true + 返回值，按 nresults 调整栈
+        // (模拟 call_pcall/call_xpcall 的成功返回: results = [true] + tmp_results)
+        // 直接调整栈 (不使用 push_results/adjust_results，避免 pending_return_adjust 问题)
+        let mut results: Vec<TValue> = {
+            let mut v = vec![TValue::Boolean(true)];
+            v.extend(tmp_results);
+            v
+        };
+        let n = if protection.nresults < 0 {
+            results.len()
+        } else {
+            protection.nresults as usize
+        };
+        for i in 0..n {
+            if i < results.len() {
+                state.stack.push(std::mem::take(&mut results[i]));
+            } else {
+                state.stack.push(TValue::Nil(NilKind::Strict));
+            }
+        }
+        state.top = state.stack.len();
 
         Ok(true)
     }
@@ -2619,7 +2885,7 @@ impl VmExecutor {
 
     fn op_tbc(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
-        crate::func::new_tbc_upval(state, a);
+        crate::func::new_tbc_upval(state, a)?;
         state.pc += 1;
         Ok(())
     }
@@ -3441,16 +3707,6 @@ impl VmExecutor {
         let n = opcodes::getarg_b(inst) as i32 - 1;
         let nresults = if n < 0 { state.stack.len().saturating_sub(a) } else { n as usize };
 
-        // 对应 C 的 rethook: 触发 return hook (在弹出 call_info 之前)
-        if state.hook_mask & 2 != 0 {  // LUA_MASKRET
-            // C 的 OP_RETURN 中 ci->func.p -= delta 恢复到 old func,
-            // rethook 中 ci->func.p += delta 变回 new func (虚拟 func).
-            // Rust 的 state.base 已经是 new func + 1 (op_varargprep 调整后),
-            // 所以 ftransfer = a - (state.base - 1) = a - state.base + 1, 不需要 delta 修正.
-            let ftransfer = (a as i32) - (state.base as i32) + 1;
-            Self::call_hook(state, "return", -1, None, ftransfer, nresults as i32)?;
-        }
-
         // 元方法 continuation 检查 (在 call_stack.pop() 之前)
         // resume 后 call_stack 不为空 (包含调用者帧)，所以必须在 pop 之前检查
         // 对应 C Lua 的 luaV_finishOp + unroll 机制
@@ -3465,44 +3721,45 @@ impl VmExecutor {
             }
         }
 
+        // close continuation 检查 (在 close 之前)
+        // __close 函数返回时检测 is_close_continuation 的 PcallProtection
+        // 恢复 close 调用者的执行上下文，重新执行 OP_RETURN/OP_CLOSE
+        // 对应 C Lua 的 luaV_finishOp 对 OP_RETURN/OP_CLOSE 的 savedpc-- 机制
+        if Self::finish_close_continuation(state)? {
+            return Ok(None);
+        }
+
+        // 先关闭 TBC 变量和 upvalues（在 call_stack.pop() 之前）
+        // 对应 C 的 OP_RETURN: luaF_close (line 1774) 在 luaD_poscall (line 1781) 之前执行
+        // close yield 时不 pop call_stack，resume 后重新执行 OP_RETURN（对应 C 的 savedpc--）
+        let close_result = crate::func::close(state, state.base, 0, 1);
+        match close_result {
+            Ok(()) => {}
+            Err(e) => {
+                // close yield 或出错: 不 pop call_stack，传播错误
+                return Err(e);
+            }
+        }
         if let Some(frame) = state.call_stack.pop() {
-            // 同时弹出调用栈信息
-            state.call_info.pop();
             // 递减 C 调用深度 (对应 op_call 中递增的 n_ccalls)
             state.n_ccalls = state.n_ccalls.saturating_sub(1);
             let return_base = frame.return_base;
             let num_results = frame.num_results;
+            // 对应 C 的 rethook: 触发 return hook (在 close 之后, 弹出 call_info 之前)
+            // C 的 OP_RETURN: luaF_close 先执行 (可能设置 hook), 然后 luaD_poscall 触发 rethook
+            if state.hook_mask & 2 != 0 {  // LUA_MASKRET
+                let ftransfer = (a as i32) - (state.base as i32) + 1;
+                Self::call_hook(state, "return", -1, None, ftransfer, nresults as i32)?;
+            }
+            // close 成功: 弹出 call_info (对应 C 的 luaD_poscall: L->ci = L->ci->previous)
+            state.call_info.pop();
+            // 收集返回值（在 close 之后，对应 C 的 moveresults）
             let mut results = Vec::new();
             for i in 0..nresults {
                 if a + i < state.stack.len() {
                     results.push(std::mem::take(&mut state.stack[a + i]));
                 } else {
                     results.push(TValue::Nil(NilKind::Strict));
-                }
-            }
-            // 关闭当前栈帧的所有打开上值 (对应 C 的 luaF_close(L, base, ...))
-            // 必须在恢复 frame 之前执行，因为关闭上值需要读取当前栈帧的数据
-            // __close 出错时传播错误（对应 C 的 luaD_throw + luaD_rawrunprotected）
-            // 对应 C: luaD_rawrunprotected 的 longjmp 恢复路径会执行 L->ci = L->ci->previous
-            // 因此 close 出错时仍需恢复调用者栈帧，以便上层 pcall 的 close_err 能正确关闭 TBC 变量
-            match crate::func::close(state, state.base, 0, 1) {
-                Ok(()) => {}
-                Err(e) => {
-                    // close 出错: 先恢复调用者栈帧 (对应 C 的 L->ci = L->ci->previous)
-                    state.code = frame.code;
-                    state.constants = frame.constants;
-                    state.upval_descs = frame.upval_descs;
-                    state.protos = frame.protos;
-                    state.base = frame.base;
-                    state.pc = frame.return_pc;
-                    state.num_params = frame.num_params;
-                    state.is_vararg = frame.is_vararg;
-                    state.proto_flag = frame.proto_flag;
-                    state.nextraargs = frame.nextraargs;
-                    state.closure_upvals = frame.closure_upvals;
-                    state.tbc_list = frame.tbc_list;
-                    state.open_upval = frame.open_upval;
-                    return Err(e);
                 }
             }
             state.code = frame.code;
@@ -3557,52 +3814,59 @@ impl VmExecutor {
             state.top = state.stack.len();
             Ok(None)
         } else {
-            // 正常协程底部函数返回：关闭当前栈帧的 TBC 变量和开 upvalue
-            // 对应 C 的 OP_RETURN 中 luaF_close(L, base, CLOSEKTOP, 1)
-            crate::func::close(state, state.base, 0, 1)?;
+            // 正常协程底部函数返回 / pcall 调用的函数返回
+            // close 已在 if 分支前执行（幂等，upvalue 已关闭）
+            // 对应 C 的 rethook: 触发 return hook (在 close 之后)
+            // pcall 调用的 Lua 函数返回时也走此分支，需触发 return hook
+            if state.hook_mask & 2 != 0 {  // LUA_MASKRET
+                let ftransfer = (a as i32) - (state.base as i32) + 1;
+                Self::call_hook(state, "return", -1, None, ftransfer, nresults as i32)?;
+            }
+            // pcall 正常返回 continuation 检查
+            // yield 穿过 pcall 后，pcall 的 C 函数栈帧被销毁，但保护状态保留。
+            // 当被保护的 Lua 函数返回时，由此检查处理 pcall 的正常返回。
+            if Self::finish_pcall_return(state, nresults, a)? {
+                return Ok(None);  // pcall continuation 已处理，继续循环
+            }
             Ok(Some(VmResult::Return { nresults, result_base: a }))
         }
     }
 
     fn op_return0(state: &mut LuaState, _inst: Instruction) -> Result<Option<VmResult>, VmError> {
-        // 对应 C 的 rethook: 触发 return hook (在弹出 call_info 之前)
-        if state.hook_mask & 2 != 0 {  // LUA_MASKRET
-            // op_return0: 0 个返回值，ftransfer 不重要（ntransfer=0）
-            Self::call_hook(state, "return", -1, None, 0, 0)?;
-        }
         // 元方法 continuation 检查 (在 call_stack.pop() 之前)
         // resume 后 call_stack 不为空 (包含调用者帧)，所以必须在 pop 之前检查
         // 对应 C Lua 的 luaV_finishOp + unroll 机制
         if Self::try_finish_metamethod(state, None)? {
             return Ok(None);  // 元方法 continuation 已处理，继续循环
         }
+        // close continuation 检查 (在 close 之前)
+        // __close 函数返回时检测 is_close_continuation 的 PcallProtection
+        // 恢复 close 调用者的执行上下文，重新执行 OP_RETURN/OP_CLOSE
+        // 对应 C Lua 的 luaV_finishOp 对 OP_RETURN/OP_CLOSE 的 savedpc-- 机制
+        if Self::finish_close_continuation(state)? {
+            return Ok(None);  // 重新执行 OP_RETURN/OP_CLOSE
+        }
+        // 先关闭 TBC 变量和 upvalues（在 call_stack.pop() 之前）
+        // 对应 C 的 OP_RETURN: luaF_close (line 1774) 在 luaD_poscall (line 1781) 之前执行
+        // close yield 时不 pop call_stack，resume 后重新执行 OP_RETURN（对应 C 的 savedpc--）
+        match crate::func::close(state, state.base, 0, 1) {
+            Ok(()) => {}
+            Err(e) => {
+                // close yield 或出错: 不 pop call_stack，传播错误
+                return Err(e);
+            }
+        }
         if let Some(frame) = state.call_stack.pop() {
-            // 同时弹出调用栈信息
-            state.call_info.pop();
             // 递减 C 调用深度 (对应 op_call 中递增的 n_ccalls)
             state.n_ccalls = state.n_ccalls.saturating_sub(1);
             let return_base = frame.return_base;
             let num_results = frame.num_results;
-            // 关闭当前栈帧的所有打开上值 (close 出错时恢复调用者栈帧再传播错误)
-            match crate::func::close(state, state.base, 0, 1) {
-                Ok(()) => {}
-                Err(e) => {
-                    state.code = frame.code;
-                    state.constants = frame.constants;
-                    state.upval_descs = frame.upval_descs;
-                    state.protos = frame.protos;
-                    state.base = frame.base;
-                    state.pc = frame.return_pc;
-                    state.num_params = frame.num_params;
-                    state.is_vararg = frame.is_vararg;
-                    state.proto_flag = frame.proto_flag;
-                    state.nextraargs = frame.nextraargs;
-                    state.closure_upvals = frame.closure_upvals;
-                    state.tbc_list = frame.tbc_list;
-                    state.open_upval = frame.open_upval;
-                    return Err(e);
-                }
+            // 对应 C 的 rethook: 触发 return hook (在 close 之后, 弹出 call_info 之前)
+            if state.hook_mask & 2 != 0 {  // LUA_MASKRET
+                Self::call_hook(state, "return", -1, None, 0, 0)?;
             }
+            // close 成功: 弹出 call_info (对应 C 的 luaD_poscall: L->ci = L->ci->previous)
+            state.call_info.pop();
             state.code = frame.code;
             state.constants = frame.constants;
             state.upval_descs = frame.upval_descs;
@@ -3638,8 +3902,16 @@ impl VmExecutor {
             state.top = state.stack.len();
             Ok(None)
         } else {
-            // 正常协程底部函数返回
-            crate::func::close(state, state.base, 0, 1)?;
+            // 正常协程底部函数返回 / pcall 调用的函数返回
+            // close 已在 if 分支前执行（幂等，upvalue 已关闭）
+            // 对应 C 的 rethook: 触发 return hook (在 close 之后)
+            if state.hook_mask & 2 != 0 {  // LUA_MASKRET
+                Self::call_hook(state, "return", -1, None, 0, 0)?;
+            }
+            // pcall 正常返回 continuation 检查 (nret=0)
+            if Self::finish_pcall_return(state, 0, state.base)? {
+                return Ok(None);  // pcall continuation 已处理，继续循环
+            }
             Ok(Some(VmResult::Return { nresults: 0, result_base: state.base }))
         }
     }
@@ -3651,46 +3923,41 @@ impl VmExecutor {
         } else {
             TValue::Nil(NilKind::Strict)
         };
-        // 对应 C 的 rethook: 触发 return hook (在弹出 call_info 之前)
-        if state.hook_mask & 2 != 0 {  // LUA_MASKRET
-            // op_return1: 1 个返回值在 a 位置
-            // state.base 已是 new func + 1 (vararg 调整后), 不需要 delta 修正
-            let ftransfer = (a as i32) - (state.base as i32) + 1;
-            Self::call_hook(state, "return", -1, None, ftransfer, 1)?;
-        }
         // 元方法 continuation 检查 (在 call_stack.pop() 之前)
         // resume 后 call_stack 不为空 (包含调用者帧)，所以必须在 pop 之前检查
         // 对应 C Lua 的 luaV_finishOp + unroll 机制
         if Self::try_finish_metamethod(state, Some(val.clone()))? {
             return Ok(None);  // 元方法 continuation 已处理，继续循环
         }
+        // close continuation 检查 (在 close 之前)
+        // __close 函数返回时检测 is_close_continuation 的 PcallProtection
+        // 恢复 close 调用者的执行上下文，重新执行 OP_RETURN/OP_CLOSE
+        // 对应 C Lua 的 luaV_finishOp 对 OP_RETURN/OP_CLOSE 的 savedpc-- 机制
+        if Self::finish_close_continuation(state)? {
+            return Ok(None);  // 重新执行 OP_RETURN/OP_CLOSE
+        }
+        // 先关闭 TBC 变量和 upvalues（在 call_stack.pop() 之前）
+        // 对应 C 的 OP_RETURN: luaF_close (line 1774) 在 luaD_poscall (line 1781) 之前执行
+        // close yield 时不 pop call_stack，resume 后重新执行 OP_RETURN（对应 C 的 savedpc--）
+        match crate::func::close(state, state.base, 0, 1) {
+            Ok(()) => {}
+            Err(e) => {
+                // close yield 或出错: 不 pop call_stack，传播错误
+                return Err(e);
+            }
+        }
         if let Some(frame) = state.call_stack.pop() {
-            // 同时弹出调用栈信息
-            state.call_info.pop();
             // 递减 C 调用深度 (对应 op_call 中递增的 n_ccalls)
             state.n_ccalls = state.n_ccalls.saturating_sub(1);
             let return_base = frame.return_base;
             let num_results = frame.num_results;
-            // 关闭当前栈帧的所有打开上值 (close 出错时恢复调用者栈帧再传播错误)
-            match crate::func::close(state, state.base, 0, 1) {
-                Ok(()) => {}
-                Err(e) => {
-                    state.code = frame.code;
-                    state.constants = frame.constants;
-                    state.upval_descs = frame.upval_descs;
-                    state.protos = frame.protos;
-                    state.base = frame.base;
-                    state.pc = frame.return_pc;
-                    state.num_params = frame.num_params;
-                    state.is_vararg = frame.is_vararg;
-                    state.proto_flag = frame.proto_flag;
-                    state.nextraargs = frame.nextraargs;
-                    state.closure_upvals = frame.closure_upvals;
-                    state.tbc_list = frame.tbc_list;
-                    state.open_upval = frame.open_upval;
-                    return Err(e);
-                }
+            // 对应 C 的 rethook: 触发 return hook (在 close 之后, 弹出 call_info 之前)
+            if state.hook_mask & 2 != 0 {  // LUA_MASKRET
+                let ftransfer = (a as i32) - (state.base as i32) + 1;
+                Self::call_hook(state, "return", -1, None, ftransfer, 1)?;
             }
+            // close 成功: 弹出 call_info (对应 C 的 luaD_poscall: L->ci = L->ci->previous)
+            state.call_info.pop();
             state.code = frame.code;
             state.constants = frame.constants;
             state.upval_descs = frame.upval_descs;
@@ -3734,12 +4001,21 @@ impl VmExecutor {
             state.top = state.stack.len();
             Ok(None)
         } else {
-            // 正常协程底部函数返回：关闭当前栈帧的 TBC 变量和开 upvalue
-            crate::func::close(state, state.base, 0, 1)?;
+            // 正常协程底部函数返回 / pcall 调用的函数返回
+            // close 已在 if 分支前执行（幂等，upvalue 已关闭）
+            // 对应 C 的 rethook: 触发 return hook (在 close 之后)
+            if state.hook_mask & 2 != 0 {  // LUA_MASKRET
+                let ftransfer = (a as i32) - (state.base as i32) + 1;
+                Self::call_hook(state, "return", -1, None, ftransfer, 1)?;
+            }
             // 把返回值放到 base-1（func 位置）
             let result_base = state.base.saturating_sub(1);
             if state.base > 0 && result_base < state.stack.len() {
                 state.stack[result_base] = val;
+            }
+            // pcall 正常返回 continuation 检查 (nret=1)
+            if Self::finish_pcall_return(state, 1, result_base)? {
+                return Ok(None);  // pcall continuation 已处理，继续循环
             }
             Ok(Some(VmResult::Return { nresults: 1, result_base }))
         }
@@ -3890,9 +4166,12 @@ impl VmExecutor {
         let ra = Self::ra(state, inst);
         let tmp = Self::read_stack(state, ra + 2).clone();
         let closing = Self::read_stack(state, ra + 3).clone();
+        let need_tbc = !closing.is_false();
         Self::write_stack(state, ra + 3, tmp);
         Self::write_stack(state, ra + 2, closing);
-        // 对应 C: pc += GETARG_Bx(i) (使用无符号 Bx, 不是有符号 sBx)
+        if need_tbc {
+            crate::func::new_tbc_upval(state, ra + 2)?;
+        }
         let bx = opcodes::getarg_bx(inst);
         state.pc = ((state.pc as i32) + bx + 1) as usize;
         Ok(())
@@ -4183,6 +4462,10 @@ impl VmExecutor {
             let key_n = state.string_table.intern("n");
             table.set(TValue::Str(key_n), TValue::Integer(nextra as i64));
             // 把表放到 vatab_pos 位置，截断后续
+            // nextra=0 时 vatab_pos 可能等于 stack_len，需要先扩展栈
+            while state.stack.len() <= vatab_pos {
+                state.stack.push(TValue::Nil(NilKind::Strict));
+            }
             state.stack[vatab_pos] = TValue::Table(table);
             state.stack.truncate(vatab_pos + 1);
         } else {
