@@ -625,6 +625,7 @@ fn call_pcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
         metamethod_res: 0,
         saved_call_stack_len: 0,
         is_close_continuation: false,
+        is_pairs_continuation: false,
     });
     let pcall_protection_idx = state.pcall_protection_stack.len() - 1;
 
@@ -1069,7 +1070,8 @@ fn call_next(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 
     match &t {
         TValue::Table(table) => {
-            let (next_key, next_val) = table_next(table, &key);
+            let (next_key, next_val) = table_next(table, &key)
+                .map_err(|e| VmError::RuntimeError(e.to_string()))?;
             match next_key {
                 Some(k) => {
                     push_results(state, a, nresults, vec![k, next_val]);
@@ -1087,7 +1089,12 @@ fn call_next(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 }
 
 /// ipairs(t) — 对应 C 的 luaB_ipairs
-fn call_ipairs(state: &mut LuaState, a: usize, _nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_ipairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+    if nargs < 1 {
+        return Err(VmError::RuntimeError(
+            "bad argument #1 to 'ipairs' (value expected)".to_string(),
+        ));
+    }
     let t = get_arg(state, a, 0);
     // 返回迭代器函数 (ipairsaux), 状态 t, 初始值 0
     // 使用 BASE_IPAIRS_AUX 标签表示 ipairsaux (与 BASE_IPAIRS 区分, 避免被 op_call 误派发)
@@ -1097,12 +1104,95 @@ fn call_ipairs(state: &mut LuaState, a: usize, _nargs: usize, nresults: i32) -> 
 }
 
 /// pairs(t) — 对应 C 的 luaB_pairs
-fn call_pairs(state: &mut LuaState, a: usize, _nargs: usize, nresults: i32) -> Result<(), VmError> {
+///
+/// 无 __pairs 元方法时: 返回 next, t, nil, nil (第 4 个 nil 是 TBC 占位)
+/// 有 __pairs 元方法时: 调用 __pairs(t) 获取迭代器/state/control/closing
+///   __pairs 内部可能 yield (对应 C 的 lua_callk + pairscont continuation)
+fn call_pairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+    if nargs < 1 {
+        return Err(VmError::RuntimeError(
+            "bad argument #1 to 'pairs' (value expected)".to_string(),
+        ));
+    }
     let t = get_arg(state, a, 0);
-    // 简化实现: 不检查 __pairs 元方法, 直接返回 next, t, nil
-    // 使用 BASE_NEXT_ITER 标签表示 next 迭代器 (与 BASE_NEXT 区分, 避免被 op_call 误派发)
-    let next_fn = TValue::LightUserData(BASE_NEXT_ITER as *mut std::ffi::c_void);
-    push_results(state, a, nresults, vec![next_fn, t, TValue::Nil(NilKind::Strict)]);
+    // 对应 C luaB_pairs: 检查 __pairs 元方法
+    let pairs_key = TValue::Str(state.intern_str("__pairs"));
+    let meta_pairs = match &t {
+        TValue::Table(tbl) => {
+            tbl.get_metatable().and_then(|mt| mt.get(&pairs_key))
+        }
+        _ => None,
+    };
+
+    if let Some(pairs_fn) = meta_pairs {
+        // 有 __pairs: 调用 __pairs(t), 期望 4 个返回值
+        // 栈布局: [pairs(LightUserData) | t] → [pairs_fn | t]
+        state.stack[a] = pairs_fn;
+        // 确保栈上有参数 t (a+1)
+        while state.stack.len() <= a + 1 {
+            state.stack.push(TValue::Nil(NilKind::Strict));
+        }
+        state.stack[a + 1] = t.clone();
+        // 截断栈到 a+2 (移除多余参数)
+        state.stack.truncate(a + 2);
+        state.top = state.stack.len();
+
+        // push pairs continuation 保护状态 — 对应 C 的 lua_callk + pairscont
+        // __pairs 内部 yield 时，call_pairs 返回 Yield，保护状态保留。
+        // resume 时 __pairs 返回，op_return 检查 pcall_protection_stack，
+        // 调用 finish_pcall_return 执行 continuation（不 push true 前缀）。
+        state.pcall_protection_stack.push(crate::state::PcallProtection {
+            saved_code: state.code.clone(),
+            saved_constants: state.constants.clone(),
+            saved_upval_descs: state.upval_descs.clone(),
+            saved_protos: state.protos.clone(),
+            saved_base: state.base,
+            saved_pc: state.pc + 1,  // 跳过调用 pairs 的 CALL 指令
+            saved_num_params: state.num_params,
+            saved_is_vararg: state.is_vararg,
+            saved_proto_flag: state.proto_flag,
+            saved_nextraargs: state.nextraargs,
+            saved_closure_upvals: state.closure_upvals.clone(),
+            saved_tbc_list: state.tbc_list,
+            saved_open_upval: state.open_upval,
+            func_idx: a,
+            nresults,
+            pcall_kind: crate::state::PcallKind::Pcall,
+            saved_filled: false,
+            is_metamethod: false,
+            metamethod_res: 0,
+            saved_call_stack_len: 0,
+            is_close_continuation: false,
+            is_pairs_continuation: true,
+        });
+
+        // state.pcall(1, 4): 1 arg (t), 4 results
+        let status = state.pcall(1, 4, 0);
+
+        if status == crate::state::LUA_YIELD {
+            // __pairs 内部 yield: 传播 yield (保护状态保留，saved_filled 由 state.pcall 设为 true)
+            let yield_values = state.pending_yield.take().unwrap_or_default();
+            return Err(VmError::Yield(yield_values));
+        }
+
+        // 非 yield: pop 保护状态，取 4 个返回值
+        state.pcall_protection_stack.pop();
+
+        // 取 __pairs 的 4 个返回值 (state.pcall 已调整栈到 a..a+4)
+        let results: Vec<TValue> = (0..4).map(|i| {
+            state.stack.get(a + i).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
+        }).collect();
+        push_results(state, a, nresults, results);
+    } else {
+        // 无 __pairs: 返回 next, t, nil, nil (第 4 个 nil 是 TBC 占位)
+        let next_fn = TValue::LightUserData(BASE_NEXT_ITER as *mut std::ffi::c_void);
+        push_results(state, a, nresults, vec![
+            next_fn,
+            t,
+            TValue::Nil(NilKind::Strict),
+            TValue::Nil(NilKind::Strict),
+        ]);
+    }
     Ok(())
 }
 
@@ -1156,6 +1246,7 @@ fn call_xpcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         metamethod_res: 0,
         saved_call_stack_len: 0,
         is_close_continuation: false,
+        is_pairs_continuation: false,
     });
     let xpcall_protection_idx = state.pcall_protection_stack.len() - 1;
 
@@ -1680,7 +1771,7 @@ fn call_load(
             }
             let closure = LClosure {
                 gc_header: GCObjectHeader::new(),
-                proto,
+                proto: std::rc::Rc::new(proto),
                 upvals: std::rc::Rc::new(std::cell::RefCell::new(upvals)),
             };
             push_results(state, a, nresults, vec![TValue::LClosure(closure)]);
@@ -1751,14 +1842,55 @@ fn intern_proto_strings(proto: &mut Proto, state: &LuaState) {
 /// - key 为最后一个 key 时返回 None
 ///
 /// 遍历顺序: 先数组部分 (1, 2, ...), 再哈希部分
-fn table_next(table: &crate::table::Table, key: &TValue) -> (Option<TValue>, TValue) {
+pub fn table_next(
+    table: &crate::table::Table,
+    key: &TValue,
+) -> Result<(Option<TValue>, TValue), &'static str> {
     // 如果 key 是 nil, 从数组部分开始
     if matches!(key, TValue::Nil(_)) {
-        return find_first(table);
+        return Ok(find_first(table));
     }
 
+    // 规范化 Float key 到 Integer（对应 C 的 lua_numbertointeger）
+    let key = if let TValue::Float(f) = key {
+        if let Some(i) = crate::table::float_key_to_int(*f) {
+            TValue::Integer(i)
+        } else {
+            key.clone()
+        }
+    } else {
+        key.clone()
+    };
+
+    // 对应 C 的 findindex: 检查 key 是否在表中（array 或 hash）
+    // 若 key 不存在则抛 "invalid key to 'next'" 错误
+    //
+    // 注意: hash 中的 tombstone (Nil(Empty)) 也算"在表中" — 对应 C 的 dead key 语义,
+    // 让 `for k,v in pairs(t) do t[k] = nil end` 能继续遍历。
+    // `table.get()` 对 tombstone 返回 None, 因此不能用 get().is_none() 判断。
+    let key_exists = {
+        let data = table.data.borrow();
+        let mut exists = false;
+        if let TValue::Integer(i) = &key {
+            if *i > 0 {
+                let idx = (*i - 1) as usize;
+                if idx < data.array.len() && !matches!(data.array[idx], TValue::Nil(NilKind::Empty)) {
+                    exists = true;
+                }
+            }
+        }
+        if !exists {
+            exists = data.hash.contains_key(&key);
+        }
+        exists
+    };
+    if !key_exists {
+        return Err("invalid key to 'next'");
+    }
+
+    // key 存在，查找下一个
     // 如果 key 是整数且在数组范围内
-    if let TValue::Integer(k) = key {
+    if let TValue::Integer(k) = &key {
         if *k > 0 {
             let idx = (*k - 1) as usize;
             let data = table.data.borrow();
@@ -1768,21 +1900,21 @@ fn table_next(table: &crate::table::Table, key: &TValue) -> (Option<TValue>, TVa
                 if next_idx < data.array.len() {
                     let next_val = &data.array[next_idx];
                     if !matches!(next_val, TValue::Nil(NilKind::Empty)) {
-                        return (
+                        return Ok((
                             Some(TValue::Integer(next_idx as i64 + 1)),
                             next_val.clone(),
-                        );
+                        ));
                     }
                 }
                 // 数组部分结束, 转到哈希部分
                 drop(data); // 释放 borrow, 避免 find_first_hash 中重复 borrow
-                return find_first_hash(table);
+                return Ok(find_first_hash(table));
             }
         }
     }
 
     // key 在哈希部分, 找下一个哈希键
-    find_next_hash(table, key)
+    Ok(find_next_hash(table, &key))
 }
 
 /// 查找第一个非空元素 (数组部分)
@@ -1799,28 +1931,42 @@ fn find_first(table: &crate::table::Table) -> (Option<TValue>, TValue) {
     find_first_hash(table)
 }
 
-/// 查找哈希部分的第一个元素
+/// 查找哈希部分的第一个元素 (跳过 tombstone)
+///
+/// 用 `hash_buckets` 顺序遍历 + `hash.get(k)` 检查 live — 对应 C `luaH_next` 的
+/// hash 部分扫描，但 Rust 用插入顺序而非 hash bucket 顺序。
 fn find_first_hash(table: &crate::table::Table) -> (Option<TValue>, TValue) {
     let data = table.data.borrow();
-    if let Some((k, v)) = data.hash.iter().next() {
-        return (Some(k.clone()), v.clone());
+    for k in &data.hash_buckets {
+        if let Some(v) = data.hash.get(k) {
+            if !matches!(v, TValue::Nil(NilKind::Empty)) {
+                return (Some(k.clone()), v.clone());
+            }
+        }
     }
     (None, TValue::Nil(NilKind::Strict))
 }
 
-/// 在哈希部分中查找给定 key 之后的下一个 key
+/// 在哈希部分中查找给定 key 之后的下一个 key (跳过 tombstone)
+///
+/// 用 `key_to_bucket.get(key)` O(1) 定位 prev 的位置，然后线性扫描
+/// `hash_buckets[idx+1..]` 找下一个 live entry — 对应 C 的 findindex O(1)
+/// (C 用 hash→mainposition→chain 定位 node index)。
 fn find_next_hash(
     table: &crate::table::Table,
     key: &TValue,
 ) -> (Option<TValue>, TValue) {
     let data = table.data.borrow();
-    let mut found = false;
-    for (k, v) in data.hash.iter() {
-        if found {
-            return (Some(k.clone()), v.clone());
-        }
-        if k == key {
-            found = true;
+    let start_idx = match data.key_to_bucket.get(key) {
+        Some(&i) => i + 1,
+        None => return (None, TValue::Nil(NilKind::Strict)),
+    };
+    for i in start_idx..data.hash_buckets.len() {
+        let k = &data.hash_buckets[i];
+        if let Some(v) = data.hash.get(k) {
+            if !matches!(v, TValue::Nil(NilKind::Empty)) {
+                return (Some(k.clone()), v.clone());
+            }
         }
     }
     (None, TValue::Nil(NilKind::Strict))
@@ -1851,25 +1997,19 @@ pub fn call_ipairs_aux(
             ));
         }
     };
-    let next_i = i + 1;
+    // 对应 C 的 luaL_intop(+, i, 1): unsigned 算术 wrap-around
+    // 在 i == math.maxinteger 时，next_i 会环绕到 math.mininteger
+    let next_i = (i as u64).wrapping_add(1) as i64;
 
-    match &t {
-        TValue::Table(table) => {
-            let val = table
-                .get_int(next_i)
-                .unwrap_or(TValue::Nil(NilKind::Strict));
-            if matches!(val, TValue::Nil(_)) {
-                // 结束迭代
-                push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
-            } else {
-                push_results(state, a, nresults, vec![TValue::Integer(next_i), val]);
-            }
-            Ok(())
-        }
-        _ => Err(VmError::RuntimeError(
-            "bad argument #1 to 'ipairs' iterator (table expected)".to_string(),
-        )),
+    // 对应 C 的 lua_geti → luaV_finishget: 支持 __index 元方法 (包括非 table 类型的元表)
+    // ipairs 可用于非 table 值 (如带 __index 元方法的 userdata), 所以不限定 Table 类型
+    let val = crate::execute::VmExecutor::table_get(state, &t, &TValue::Integer(next_i))?;
+    if matches!(val, TValue::Nil(_)) {
+        push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
+    } else {
+        push_results(state, a, nresults, vec![TValue::Integer(next_i), val]);
     }
+    Ok(())
 }
 
 /// pairs 迭代器函数 (对应 C 的 next, 在 TFORCALL 中调用)
@@ -1938,8 +2078,8 @@ fn call_collectgarbage(
             TValue::Integer(0)
         }
         "count" => {
-            // 返回内存使用量 (KB) — 简化为 0
-            TValue::Float(0.0)
+            // 返回内存使用量 (KB) — 基于 GC 估算
+            TValue::Float(state.gc.gc_estimate.get() as f64 / 1024.0)
         }
         "countb" => {
             // 返回内存使用量的小数部分 (字节) — 简化为 0
@@ -2721,17 +2861,17 @@ mod tests {
         t.set(TValue::Integer(2), TValue::Integer(20));
 
         // 从 nil 开始
-        let (key, val) = table_next(&t, &TValue::Nil(NilKind::Strict));
+        let (key, val) = table_next(&t, &TValue::Nil(NilKind::Strict)).unwrap();
         assert!(matches!(key, Some(TValue::Integer(1))));
         assert_eq!(val, TValue::Integer(10));
 
         // 下一个
-        let (key, val) = table_next(&t, &TValue::Integer(1));
+        let (key, val) = table_next(&t, &TValue::Integer(1)).unwrap();
         assert!(matches!(key, Some(TValue::Integer(2))));
         assert_eq!(val, TValue::Integer(20));
 
         // 结束
-        let (key, _) = table_next(&t, &TValue::Integer(2));
+        let (key, _) = table_next(&t, &TValue::Integer(2)).unwrap();
         assert!(key.is_none());
     }
 }

@@ -432,6 +432,7 @@ pub(crate) fn call_tm_res(
         metamethod_res: res,
         saved_call_stack_len: state.call_stack.len(),
         is_close_continuation: false,
+        is_pairs_continuation: false,
     });
     let mm_protection_idx = state.pcall_protection_stack.len() - 1;
 
@@ -588,6 +589,7 @@ pub(crate) fn call_tm(
         metamethod_res: func_idx,  // 不使用 (0 个返回值)
         saved_call_stack_len: state.call_stack.len(),
         is_close_continuation: false,
+        is_pairs_continuation: false,
     });
     let mm_protection_idx = state.pcall_protection_stack.len() - 1;
 
@@ -749,6 +751,7 @@ pub fn call_close_method(
         metamethod_res: 0,
         saved_call_stack_len: state.call_stack.len(),
         is_close_continuation: true,
+        is_pairs_continuation: false,
     });
 
     // 对应 C 的 callclosemethod: yy=1 用 luaD_call (可 yield), yy=0 用 luaD_callnoyield

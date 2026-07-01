@@ -508,10 +508,20 @@ pub struct TableData {
     pub array: Vec<TValue>,
     /// 哈希部分（非整数键以及超出数组范围的整数键）
     pub hash: hashbrown::HashMap<TValue, TValue>,
+    /// 哈希 key 的插入顺序列表（含 tombstone key）— 用于 `next()` 的 O(1) findindex。
+    ///
+    /// 对应 C 的 Node 数组语义: `next(prev)` 用 prev 在数组中的位置定位, 然后向后扫描
+    /// 找下一个非空 entry。Rust 的 `hashbrown::HashMap::iter()` 无法 O(1) 定位 key 的
+    /// bucket 位置, 因此维护此顺序列表 + `key_to_bucket` 索引。
+    pub hash_buckets: Vec<TValue>,
+    /// `key → hash_buckets index` 映射 — 让 `next(prev)` 能 O(1) 定位 prev 的位置
+    pub key_to_bucket: hashbrown::HashMap<TValue, usize>,
     /// 元表
     pub metatable: Option<Box<Table>>,
     /// #t 的搜索提示（内部优化）
     pub len_hint: usize,
+    /// 哈希边界搜索的随机种子（对应 C 的 G(L)->seed，用于 hash_search 的 2j/2j+1 选择）
+    pub seed: u32,
 }
 
 /// Lua 表 —— 关联数组，包含数组部分和哈希部分。
@@ -553,8 +563,11 @@ impl Default for Table {
             data: Rc::new(RefCell::new(TableData {
                 array: Vec::new(),
                 hash: hashbrown::HashMap::new(),
+                hash_buckets: Vec::new(),
+                key_to_bucket: hashbrown::HashMap::new(),
                 metatable: None,
                 len_hint: 0,
+                seed: 1,
             })),
         }
     }
@@ -573,8 +586,8 @@ impl Default for Table {
 #[derive(Debug, Clone)]
 pub struct LClosure {
     pub gc_header: GCObjectHeader,
-    /// 函数原型
-    pub proto: Proto,
+    /// 函数原型（Rc 共享，clone 为 O(1)，避免每次 OP_CALL 深拷贝整个 Proto）
+    pub proto: Rc<Proto>,
     /// 上值列表（共享引用，多个闭包可共享同一个 UpVal）。
     ///
     /// 使用 Rc<RefCell<Vec>> 包装，使 LClosure clone 时所有副本共享同一个 upvals Vec。

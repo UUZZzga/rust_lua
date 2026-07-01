@@ -3297,7 +3297,7 @@ mod tests {
         };
         let closure = LClosure {
             gc_header: GCObjectHeader::new(),
-            proto,
+            proto: Rc::new(proto),
             upvals: Rc::new(RefCell::new(vec![Rc::new(RefCell::new(UpVal::Closed {
                 value: Box::new(TValue::Integer(42)),
             }))])),
@@ -3324,7 +3324,7 @@ mod tests {
         let mut state = LuaState::new();
         let closure = LClosure {
             gc_header: GCObjectHeader::new(),
-            proto: crate::func::new_proto(),
+            proto: Rc::new(crate::func::new_proto()),
             upvals: Rc::new(RefCell::new(vec![])),
         };
         state.stack.clear();
@@ -3519,7 +3519,7 @@ mod tests {
         let mut state = LuaState::new();
         let closure = LClosure {
             gc_header: GCObjectHeader::new(),
-            proto: crate::func::new_proto(),
+            proto: Rc::new(crate::func::new_proto()),
             upvals: Rc::new(RefCell::new(vec![Rc::new(RefCell::new(UpVal::Closed {
                 value: Box::new(TValue::Integer(42)),
             }))])),
@@ -3538,7 +3538,7 @@ mod tests {
         let mut state = LuaState::new();
         let closure = LClosure {
             gc_header: GCObjectHeader::new(),
-            proto: crate::func::new_proto(),
+            proto: Rc::new(crate::func::new_proto()),
             upvals: Rc::new(RefCell::new(vec![])),
         };
         state.stack.clear();

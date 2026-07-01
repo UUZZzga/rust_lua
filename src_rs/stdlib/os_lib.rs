@@ -20,6 +20,7 @@ use std::ffi::{CStr, CString};
 // ============================================================================
 
 pub const OS_SETLOCALE: usize = 600;
+pub const OS_CLOCK: usize = 601;
 
 /// OS 库标签范围: [600, 610)
 pub fn is_os_tag(tag: usize) -> bool {
@@ -30,6 +31,7 @@ pub fn is_os_tag(tag: usize) -> bool {
 pub fn os_function_name(tag: usize) -> Option<&'static str> {
     match tag {
         OS_SETLOCALE => Some("setlocale"),
+        OS_CLOCK => Some("clock"),
         _ => None,
     }
 }
@@ -154,8 +156,23 @@ pub fn call_os_function(
 ) -> Result<(), VmError> {
     match tag {
         OS_SETLOCALE => call_setlocale(state, a, nargs, nresults),
+        OS_CLOCK => call_clock(state, a, nresults),
         _ => Ok(()),
     }
+}
+
+/// os.clock() — 返回程序使用的 CPU 时间（秒）
+/// 对应 C: lua_pushnumber(L, ((lua_Number)clock())/(lua_Number)CLOCKS_PER_SEC);
+extern "C" {
+    fn clock() -> isize;
+}
+const CLOCKS_PER_SEC: f64 = 1_000_000.0;
+
+fn call_clock(state: &mut LuaState, a: usize, nresults: i32) -> Result<(), VmError> {
+    let ticks = unsafe { clock() };
+    let seconds = ticks as f64 / CLOCKS_PER_SEC;
+    push_single_result(state, a, nresults, TValue::Float(seconds));
+    Ok(())
 }
 
 // ============================================================================
@@ -172,6 +189,7 @@ pub fn open_os_lib(state: &mut LuaState) {
     };
 
     register(&mut lib, "setlocale", OS_SETLOCALE);
+    register(&mut lib, "clock", OS_CLOCK);
 
     let key = TValue::Str(state.intern_str("os"));
     state.globals.set(key, TValue::Table(lib));

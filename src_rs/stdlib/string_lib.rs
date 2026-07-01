@@ -2859,11 +2859,13 @@ fn tostring_for_format(state: &mut LuaState, val: &TValue) -> Option<String> {
         _ => return None,
     };
 
-    // 查找 __tostring 元方法
+    // 查找 __tostring 元方法 (过滤 nil: __tostring = nil 表示无元方法)
     let tostring_key = TValue::Str(state.intern_str("__tostring"));
     let meta_fn = {
         let data = table.data.borrow();
-        data.metatable.as_ref().and_then(|mt| mt.get(&tostring_key))
+        data.metatable.as_ref()
+            .and_then(|mt| mt.get(&tostring_key))
+            .filter(|v| !matches!(v, TValue::Nil(_)))
     };
 
     if let Some(f) = meta_fn {

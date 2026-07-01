@@ -47,6 +47,11 @@ pub fn is_wrap_call_tag(tag: usize) -> bool {
 /// 元表中标记 wrap Table 的键（用 LightUserData 固定指针值避免字符串 interning）
 pub const WRAP_MARKER: *mut std::ffi::c_void = 0x77726170 as *mut std::ffi::c_void;
 
+/// 元表中持有 wrap 协程引用的键 — 让 collectgarbage 能根据 ThreadContext 的 Rc 计数
+/// 判断 wrap table 是否还被引用（wrap table 可达 → metatable 可达 → thread 可达 →
+/// context Rc >= 2）。否则 yield 中的 Suspended 协程会被误清理。
+pub const WRAP_THREAD_MARKER: *mut std::ffi::c_void = 0x77726174 as *mut std::ffi::c_void;
+
 /// 检查值是否是 coroutine.wrap 返回的 Table，返回 wrap_coros 中的索引
 /// wrap 返回 GC 跟踪的 Table（可被 GC 回收），元表包含 WRAP_MARKER 标记
 pub fn get_wrap_idx(val: &TValue) -> Option<usize> {
@@ -1651,15 +1656,20 @@ fn call_wrap(
     }
     // 存入 wrap_coros side table
     let idx = state.wrap_coros.len();
-    state.wrap_coros.push(Some(thread));
-    // 返回 GC 跟踪的 Table（可被 GC 回收），元表包含 WRAP_MARKER 标记
-    // op_call/op_tailcall/TFORCALL 检测到此标记时调用 call_wrap_call
+    // metatable 持有 thread.clone() — 创建时 stack 为空, clone 开销小;
+    // 主要是让 context 的 Rc 计数反映 wrap table 的可达性,
+    // 避免 collectgarbage 误清理 yield 中的 Suspended 协程
     let wrap_table = crate::table::Table::new();
     let mt = crate::table::Table::new();
     mt.set(
         TValue::LightUserData(WRAP_MARKER),
         TValue::Integer(idx as i64),
     );
+    mt.set(
+        TValue::LightUserData(WRAP_THREAD_MARKER),
+        TValue::Thread(thread.clone()),
+    );
+    state.wrap_coros.push(Some(thread));
     wrap_table.set_metatable(Some(mt));
     push_single_result(state, a, nresults, TValue::Table(wrap_table));
     Ok(())

@@ -1164,7 +1164,7 @@ pub fn push_closure(
     let closure_id = gc.register_object(std::mem::size_of::<crate::objects::LClosure>());
     let closure = crate::objects::LClosure {
         gc_header: crate::gc::GCObjectHeader::new(),
-        proto: proto.clone(),
+        proto: Rc::new(proto.clone()),
         upvals: Rc::new(RefCell::new(upvals)),
     };
     closure.gc_header.set_id(closure_id);

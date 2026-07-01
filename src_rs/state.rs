@@ -93,6 +93,11 @@ pub struct PcallProtection {
     /// yield 穿过 __close 后，resume 时 __close 返回，由 op_return 检查并执行
     /// continuation（对应 C Lua 的 luaV_finishOp 对 OP_RETURN/OP_CLOSE 的 savedpc-- 机制）
     pub is_close_continuation: bool,
+    /// 是否为 pairs continuation (call_pairs 调用 __pairs 时推入)
+    /// yield 穿过 __pairs 后，resume 时 __pairs 返回，由 op_return 检查并执行
+    /// continuation（对应 C Lua 的 lua_callk + pairscont 机制）
+    /// 与普通 pcall continuation 区别: 不 push true 前缀，直接返回 __pairs 的结果
+    pub is_pairs_continuation: bool,
 }
 
 pub struct GlobalState {
@@ -1222,7 +1227,7 @@ impl LuaState {
                 }
                 let closure = LClosure {
                     gc_header: GCObjectHeader::new(),
-                    proto,
+                    proto: Rc::new(proto),
                     upvals: Rc::new(RefCell::new(upvals)),
                 };
                 self.stack.push(TValue::LClosure(closure));
@@ -1515,6 +1520,7 @@ impl LuaState {
                         metamethod_res: 0,
                         saved_call_stack_len: 0,
                         is_close_continuation: false,
+                        is_pairs_continuation: false,
                     });
                 }
 
@@ -2064,6 +2070,21 @@ impl LuaState {
 
         // 打开 I/O 库 (注册 io 全局表, 包含 stdin/stdout/stderr)
         crate::stdlib::io_lib::open_io_lib(self);
+
+        // 把标准库注册到 package.loaded（对应 C 的 luaL_requiref），
+        // 防止 nextvar.lua 清理全局表时把标准库当作未加载模块删除
+        for name in ["string", "math", "utf8", "table", "debug", "os", "coroutine", "io", "package"] {
+            let name_val = TValue::Str(self.intern_str(name));
+            if let Some(lib) = self.globals.get(&name_val) {
+                let package_key = TValue::Str(self.intern_str("package"));
+                if let Some(TValue::Table(pkg)) = self.globals.get(&package_key) {
+                    let loaded_key = TValue::Str(self.intern_str("loaded"));
+                    if let Some(TValue::Table(loaded)) = pkg.get(&loaded_key) {
+                        loaded.set(name_val, lib);
+                    }
+                }
+            }
+        }
     }
 
     // ====== Hook ======

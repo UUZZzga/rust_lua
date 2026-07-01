@@ -20,7 +20,7 @@ use crate::tm::{
     try_bin_tm, try_bin_assoc_tm, try_bini_tm, try_concat_tm,
     call_order_tm, equal_obj, obj_len,
 };
-use crate::vm::{to_number_ns, to_integer_ns, F2IMode, shiftl, is_false,
+use crate::vm::{to_number_ns, to_number, to_integer_ns, F2IMode, shiftl, is_false,
     concat_stack, raw_equal, float_to_integer,
     modulus, modulus_float, idiv};
 use crate::state::{LuaState, LUA_MINSTACK, MAX_CALL_CHAIN, LUAI_MAXCCALLS};
@@ -782,12 +782,20 @@ impl VmExecutor {
                         state.tbc_list = None;
                         state.open_upval = None;
 
-                        let frame_end = ra + 4 + fsize;
-                        while state.stack.len() < frame_end {
-                            state.stack.push(TValue::Nil(NilKind::Strict));
-                        }
-                        for i in nargs..nfixparams {
-                            state.stack[ra + 4 + i] = TValue::Nil(NilKind::Strict);
+                        if proto_is_vararg {
+                            // vararg 函数: truncate 到实际参数末尾 (对应 op_call 的 vararg 分支)
+                            state.stack.truncate(ra + 4 + nargs);
+                            for i in nargs..nfixparams {
+                                Self::write_stack(state, ra + 4 + i, TValue::Nil(NilKind::Strict));
+                            }
+                        } else {
+                            let frame_end = ra + 4 + fsize;
+                            while state.stack.len() < frame_end {
+                                state.stack.push(TValue::Nil(NilKind::Strict));
+                            }
+                            for i in nargs..nfixparams {
+                                state.stack[ra + 4 + i] = TValue::Nil(NilKind::Strict);
+                            }
                         }
                         Ok(())
                     } else if let TValue::LightUserData(tag) = &func_val {
@@ -801,10 +809,38 @@ impl VmExecutor {
                                 state, ra + 3, nargs, nresults,
                             )
                         } else if tag_val == crate::stdlib::base_lib::BASE_NEXT_ITER {
-                            // pairs 迭代器 (next)
-                            crate::stdlib::base_lib::call_next_iter(
-                                state, ra + 3, nargs, nresults,
-                            )
+                            // pairs 迭代器 (next) — 直接内联以避免多层调用开销
+                            // TFORCALL 已把参数移到: ra+3=f, ra+4=状态(表), ra+5=控制变量(key)
+                            let table_val = state.stack.get(ra + 4).cloned()
+                                .unwrap_or(crate::objects::TValue::Nil(crate::objects::NilKind::Strict));
+                            let key_val = state.stack.get(ra + 5).cloned()
+                                .unwrap_or(crate::objects::TValue::Nil(crate::objects::NilKind::Strict));
+                            match &table_val {
+                                crate::objects::TValue::Table(table) => {
+                                    let (next_key, next_val) =
+                                        crate::stdlib::base_lib::table_next(table, &key_val)
+                                            .map_err(|e| VmError::RuntimeError(e.to_string()))?;
+                                    if state.stack.len() > ra + 3 {
+                                        state.stack.truncate(ra + 3);
+                                    }
+                                    while state.stack.len() < ra + 3 {
+                                        state.stack.push(crate::objects::TValue::Nil(crate::objects::NilKind::Strict));
+                                    }
+                                    match next_key {
+                                        Some(k) => {
+                                            state.stack.push(k);
+                                            state.stack.push(next_val);
+                                        }
+                                        None => {
+                                            state.stack.push(crate::objects::TValue::Nil(crate::objects::NilKind::Strict));
+                                        }
+                                    }
+                                    Ok(())
+                                }
+                                _ => Err(VmError::RuntimeError(
+                                    "bad argument #1 to 'next' (table expected)".to_string(),
+                                )),
+                            }
                         } else if crate::stdlib::base_lib::is_base_tag(tag_val) {
                     crate::stdlib::base_lib::call_base_function(
                         tag_val, state, ra + 3, nargs, nresults,
@@ -1687,7 +1723,10 @@ impl VmExecutor {
         // push true + 返回值，按 nresults 调整栈
         // (模拟 call_pcall/call_xpcall 的成功返回: results = [true] + tmp_results)
         // 直接调整栈 (不使用 push_results/adjust_results，避免 pending_return_adjust 问题)
-        let mut results: Vec<TValue> = {
+        // pairs continuation: 不 push true 前缀，直接返回 __pairs 的结果
+        let mut results: Vec<TValue> = if protection.is_pairs_continuation {
+            tmp_results
+        } else {
             let mut v = vec![TValue::Boolean(true)];
             v.extend(tmp_results);
             v
@@ -3244,6 +3283,19 @@ impl VmExecutor {
                 let nargs = if b == 0 { state.stack.len().saturating_sub(a + 1) } else { b.saturating_sub(1) };
                 let nresults: i32 = if c == 0 { -1 } else { c - 1 };
 
+                // ipairsaux / next 迭代器函数: 除 TFORCALL 外, 普通调用也支持
+                // (对应 C 中 ipairsaux 也是普通 C 函数, 可被直接调用)
+                if tag_val == crate::stdlib::base_lib::BASE_IPAIRS_AUX {
+                    crate::stdlib::base_lib::call_ipairs_aux(state, a, nargs, nresults)?;
+                    state.pc += 1;
+                    return Ok(());
+                }
+                if tag_val == crate::stdlib::base_lib::BASE_NEXT_ITER {
+                    crate::stdlib::base_lib::call_next_iter(state, a, nargs, nresults)?;
+                    state.pc += 1;
+                    return Ok(());
+                }
+
                 // 对应 C 的 precallC: 推入 CallInfoEntry 并在整个 C 函数执行期间保留
                 // 这样 debug.getinfo/traceback 能正确看到 C 函数帧
                 // 对应 C 的 luaD_precall -> inc_ci 创建新的 CallInfo
@@ -4082,30 +4134,30 @@ impl VmExecutor {
         match (&init_val, &step_val) {
             (TValue::Integer(init_i), TValue::Integer(step_i)) => {
                 if *step_i == 0 {
-                    return Err(VmError::RuntimeError("for step is zero".into()));
+                    return Err(VmError::RuntimeError("'for' step is zero".into()));
                 }
-                let limit_i = match &limit_val {
-                    TValue::Integer(i) => *i,
-                    TValue::Float(f) => {
-                        // 对应 C 的 forlimit: float_to_integer 失败时, 根据 float 值的范围处理
-                        // 正无穷或过大: 设为 MAXINTEGER; 负无穷或过小: 设为 MININTEGER
-                        if *step_i < 0 {
-                            float_to_integer(*f, F2IMode::Ceil).unwrap_or_else(|| {
-                                if *f > 0.0 { i64::MAX } else { i64::MIN }
-                            })
-                        } else {
-                            float_to_integer(*f, F2IMode::Floor).unwrap_or_else(|| {
-                                if *f > 0.0 { i64::MAX } else { i64::MIN }
-                            })
-                        }
+                // 对应 C 的 forlimit: 将 limit 转为整数
+                // 返回 Ok(Some(i)) = 成功, Ok(None) = 跳过循环 (超范围), Err(()) = 转换失败
+                let limit_i = match Self::forlimit(&limit_val, *step_i) {
+                    Ok(Some(i)) => i,
+                    Ok(None) => {
+                        let bx = opcodes::getarg_bx(inst);
+                        state.pc = ((state.pc as i32) + bx + 2) as usize;
+                        return Ok(());
                     }
-                    _ => { state.pc += 1; return Ok(()); }
+                    Err(()) => {
+                        let what = match &limit_val {
+                            TValue::Str(_) => "string",
+                            _ => "value",
+                        };
+                        return Err(VmError::RuntimeError(format!(
+                            "bad 'for' limit (number expected, got {})", what
+                        )));
+                    }
                 };
 
                 let skip = if *step_i > 0 { *init_i > limit_i } else { *init_i < limit_i };
                 if skip {
-                    // C 代码中 vmfetch() 已递增 pc，所以 pc += GETARG_Bx(i) + 1 实际跳到 prep+bx+2。
-                    // Rust 中 state.pc 指向当前指令，需要 +2 来达到相同效果（跳过 FORLOOP）。
                     let bx = opcodes::getarg_bx(inst);
                     state.pc = ((state.pc as i32) + bx + 2) as usize;
                     return Ok(());
@@ -4126,28 +4178,31 @@ impl VmExecutor {
                 Self::write_stack(state, ra + 2, TValue::Integer(saved_init));
             }
             _ => {
-                let init_f = match &init_val {
-                    TValue::Integer(i) => *i as f64,
-                    TValue::Float(f) => *f,
-                    _ => { state.pc += 1; return Ok(()); }
+                // 浮点分支: 对应 C 的 tonumber 转换 (含字符串)
+                let limit_f = match to_number(&limit_val) {
+                    Some(f) => f,
+                    None => return Err(VmError::RuntimeError(
+                        format!("bad 'for' limit (number expected, got {})", limit_val.ty())
+                    )),
                 };
-                let limit_f = match &limit_val {
-                    TValue::Integer(i) => *i as f64,
-                    TValue::Float(f) => *f,
-                    _ => { state.pc += 1; return Ok(()); }
+                let step_f = match to_number(&step_val) {
+                    Some(f) => f,
+                    None => return Err(VmError::RuntimeError(
+                        format!("bad 'for' step (number expected, got {})", step_val.ty())
+                    )),
                 };
-                let step_f = match &step_val {
-                    TValue::Integer(i) => *i as f64,
-                    TValue::Float(f) => *f,
-                    _ => { state.pc += 1; return Ok(()); }
+                let init_f = match to_number(&init_val) {
+                    Some(f) => f,
+                    None => return Err(VmError::RuntimeError(
+                        format!("bad 'for' initial value (number expected, got {})", init_val.ty())
+                    )),
                 };
 
                 if step_f == 0.0 {
-                    return Err(VmError::RuntimeError("for step is zero".into()));
+                    return Err(VmError::RuntimeError("'for' step is zero".into()));
                 }
                 let skip = if step_f > 0.0 { limit_f < init_f } else { init_f < limit_f };
                 if skip {
-                    // 同上：+2 跳过 FORLOOP
                     let bx = opcodes::getarg_bx(inst);
                     state.pc = ((state.pc as i32) + bx + 2) as usize;
                     return Ok(());
@@ -4160,6 +4215,28 @@ impl VmExecutor {
 
         state.pc += 1;
         Ok(())
+    }
+
+    /// 对应 C 的 forlimit: 将 limit 转为整数 (整数循环分支用)
+    /// 返回 Ok(Some(i)) = 转换成功, Ok(None) = 超范围需跳过循环, Err(()) = tonumber 失败
+    fn forlimit(lim: &TValue, step: i64) -> Result<Option<i64>, ()> {
+        let mode = if step < 0 { F2IMode::Ceil } else { F2IMode::Floor };
+        // 1. luaV_tointeger: integer/float (不转字符串)
+        if let Some(i) = to_integer_ns(lim, mode) {
+            return Ok(Some(i));
+        }
+        // 2. tonumber (转字符串/其他)
+        let f = to_number(lim).ok_or(())?;
+        // 3. float_to_integer
+        if let Some(i) = float_to_integer(f, mode) {
+            return Ok(Some(i));
+        }
+        // 4. 超范围: f 超出整数范围
+        if f > 0.0 {
+            if step < 0 { Ok(None) } else { Ok(Some(i64::MAX)) }
+        } else {
+            if step > 0 { Ok(None) } else { Ok(Some(i64::MIN)) }
+        }
     }
 
     fn op_tforprep(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
@@ -4178,10 +4255,12 @@ impl VmExecutor {
     }
 
     fn op_tforcall(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+        // 对应 C OP_TFORCALL: ra=iterator, ra+1=state, ra+2=closing(TBC), ra+3=control
+        // 调用 ra+3 = function(ra+4=state, ra+5=control), 2 个参数
         let ra = Self::ra(state, inst);
         let f = Self::read_stack(state, ra).clone();
         let s = Self::read_stack(state, ra + 1).clone();
-        let ctrl = Self::read_stack(state, ra + 2).clone();
+        let ctrl = Self::read_stack(state, ra + 3).clone();
         Self::write_stack(state, ra + 3, f);
         Self::write_stack(state, ra + 4, s);
         Self::write_stack(state, ra + 5, ctrl);
@@ -4273,7 +4352,7 @@ impl VmExecutor {
                     })));
                 }
             }
-            let closure = LClosure { gc_header: crate::gc::GCObjectHeader::new(), proto, upvals: Rc::new(RefCell::new(upvals)) };
+            let closure = LClosure { gc_header: crate::gc::GCObjectHeader::new(), proto: Rc::new(proto), upvals: Rc::new(RefCell::new(upvals)) };
             Self::write_stack(state, ra, TValue::LClosure(closure));
         }
         state.pc += 1;
@@ -4537,7 +4616,7 @@ impl VmExecutor {
     // 辅助: 表操作
     // ========================================================================
 
-    fn table_get(state: &mut LuaState, table_val: &TValue, key: &TValue) -> Result<TValue, VmError> {
+    pub fn table_get(state: &mut LuaState, table_val: &TValue, key: &TValue) -> Result<TValue, VmError> {
         // 对应 C Lua 的 luaV_finishget — 用循环代替递归，加 MAXTAGLOOP 限制
         // 防止 __index 链无限循环（如 a.__index = a 导致栈溢出）
         const MAXTAGLOOP: usize = 2000;
@@ -4655,7 +4734,7 @@ impl VmExecutor {
     /// 设置表字段，支持 `__newindex` 元方法和 yield
     /// 对应 C Lua 的 luaV_finishset
     /// 成功时表已被修改 (通过 Rc<RefCell<Table>> 的内部可变性)
-    fn table_set(
+    pub fn table_set(
         state: &mut LuaState,
         table_val: &TValue,
         key: TValue,
@@ -5507,7 +5586,7 @@ mod tests {
     fn test_execute_call_lua_closure() {
         // Create an inner proto that just returns 0
         let inner_proto = make_proto(vec![make_bx(OpCode::RETURN0, 0, 0)], vec![]);
-        let closure = LClosure { gc_header: GCObjectHeader::new(), proto: inner_proto, upvals: Rc::new(RefCell::new(vec![])) };
+        let closure = LClosure { gc_header: GCObjectHeader::new(), proto: Rc::new(inner_proto), upvals: Rc::new(RefCell::new(vec![])) };
 
         let mut stack = default_stack(10);
         stack[0] = TValue::LClosure(closure);
@@ -5520,7 +5599,7 @@ mod tests {
     #[test]
     fn test_execute_tailcall_lua_closure() {
         let inner_proto = make_proto(vec![make_bx(OpCode::RETURN0, 0, 0)], vec![]);
-        let closure = LClosure { gc_header: GCObjectHeader::new(), proto: inner_proto, upvals: Rc::new(RefCell::new(vec![])) };
+        let closure = LClosure { gc_header: GCObjectHeader::new(), proto: Rc::new(inner_proto), upvals: Rc::new(RefCell::new(vec![])) };
 
         let mut stack = default_stack(10);
         stack[0] = TValue::LClosure(closure);
