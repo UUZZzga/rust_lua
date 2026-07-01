@@ -1405,40 +1405,32 @@ impl<'a> FuncState<'a> {
     ///   None - 没有找到匹配的 global 声明
     ///   如果遇到 global * 但名字不匹配，会设置 global_star_active
     fn find_global_decl(&self, name: &str) -> Option<i32> {
-        let mut global_star_active = false;
+        // C's searchvar: info starts at -1 (preambular active).
+        // - collective (global *): if info < 0, record info & remember kind
+        // - named global matches: return its kind
+        // - named global non-match: if info == -1, set info = -2 (invalidate preambular only)
+        let mut info: i32 = -1;
+        let mut collective_kind: i32 = GDKREG;
         for lv in self.locals.iter().rev() {
             if !lv.active { continue; }
             if lv.kind >= GDKREG {
-                // global declaration
                 if lv.name == "(global *)" {
-                    // collective declaration (global *)
-                    if !global_star_active {
-                        global_star_active = true;
+                    if info < 0 {
+                        info = 0;
+                        collective_kind = lv.kind;
                     }
                 } else if lv.name == name {
-                    // named global declaration matches
                     return Some(lv.kind);
                 } else {
-                    // named global declaration doesn't match:
-                    // invalidate any previous global * declaration
-                    // (C: var->u.info = -2)
-                    global_star_active = false;
+                    if info == -1 {
+                        info = -2;
+                    }
                 }
-            } else {
-                // non-global variable: like C's searchvar, check if name matches.
-                // If it matches, this is a local, not a global (return None).
-                // If it doesn't match, continue searching for global declarations.
-                if lv.name == name {
-                    return None;
-                }
+            } else if lv.name == name {
+                return None;
             }
         }
-        if global_star_active {
-            // global * covers this name
-            Some(GDKREG)
-        } else {
-            None
-        }
+        if info >= 0 { Some(collective_kind) } else { None }
     }
 
     /// 只查找具名 global 声明（如 `global a`），不包含 collective `global *`。
@@ -1466,6 +1458,60 @@ impl<'a> FuncState<'a> {
         None
     }
 
+    /// Check whether `name` is an undeclared global variable, matching C's
+    /// searchvar returning `var->u.info == -2`: there is an active named global
+    /// declaration that doesn't match `name`, and no active collective (`global *`)
+    /// declaration covers it. In that case C raises "variable 'X' not declared".
+    /// Also searches parent function chains (like singlevaraux recursion), because
+    /// a global declaration in an enclosing function also restricts inner scopes.
+    fn is_undeclared_global(&self, name: &str) -> bool {
+        // Current function scope (C's searchvar). info starts at -1 (preambular);
+        // named global non-match sets it to -2; collective sets it to >= 0 if < 0.
+        let mut info: i32 = -1;
+        for lv in self.locals.iter().rev() {
+            if !lv.active { continue; }
+            if lv.kind >= GDKREG {
+                if lv.name == "(global *)" {
+                    if info < 0 {
+                        info = 0;  // any non-negative value
+                    }
+                } else if lv.name == name {
+                    return false;  // named global matches: declared
+                } else if info == -1 {
+                    info = -2;  // named global non-match invalidates preambular
+                }
+            } else if lv.name == name {
+                return false;  // local variable matches: not a global
+            }
+        }
+        if info == -2 {
+            return true;
+        }
+        // Parent function scopes (singlevaraux recursion). A named global
+        // declaration in an ancestor that isn't covered by a collective also
+        // makes the variable undeclared.
+        let mut parent_info: i32 = -1;
+        let mut global_star_active = false;
+        for pvar in self.parent_locals.iter().rev() {
+            if !pvar.is_local { continue; }
+            if pvar.is_global {
+                if pvar.name == "(global *)" {
+                    if !global_star_active {
+                        global_star_active = true;
+                        parent_info = 0;  // collective covers
+                    }
+                } else if pvar.name == name {
+                    return false;  // named global matches
+                } else if !global_star_active {
+                    parent_info = -2;
+                }
+            } else if pvar.name == name {
+                return false;  // local in parent: would be an upvalue, not undeclared
+            }
+        }
+        parent_info == -2
+    }
+
     /// 搜索当前函数及父函数链中的 global 声明，返回其 kind。
     /// 对应 C 的 singlevaraux 递归搜索：先在当前函数 searchvar，
     /// 未找到则递归到父函数。用于检测子函数中的 global const 赋值。
@@ -1479,27 +1525,29 @@ impl<'a> FuncState<'a> {
         // for grandparent variables) to handle multi-level closures.
         // Like C's singlevaraux: a non-global variable with matching name shadows
         // any outer global declaration (returns None).
-        let mut global_star_active = false;
+        let mut info: i32 = -1;
+        let mut collective_kind: i32 = GDKREG;
         for pvar in self.parent_locals.iter().rev() {
             if pvar.is_global {
                 if pvar.name == "(global *)" {
-                    if !global_star_active { global_star_active = true; }
+                    if info < 0 {
+                        info = 0;
+                        collective_kind = pvar.kind;
+                    }
                 } else if pvar.name == name {
                     return Some(pvar.kind);
                 } else {
-                    global_star_active = false;
+                    if info == -1 {
+                        info = -2;
+                    }
                 }
             } else {
-                // non-global variable: if name matches, it shadows any global
                 if pvar.name == name {
                     return None;
                 }
             }
         }
-        if global_star_active {
-            return Some(GDKREG);
-        }
-        None
+        if info >= 0 { Some(collective_kind) } else { None }
     }
 
     /// 获取当前标签位置（即下一个指令的 pc）
@@ -2380,6 +2428,16 @@ fn find_label_from(fs: &FuncState, name: &str, start_idx: usize) -> Option<usize
 /// When true, locals are assumed to already be out of scope, so nactvar
 /// is set to the block's entry level (bl->nactvar), not the current level.
 fn create_label(fs: &mut FuncState, name: &str, line: i32, last: bool) {
+    // C's labelstat calls checkrepeated before createlabel: scan the current
+    // function's labels (fs->firstlabel..end) for a duplicate name and raise
+    // "label 'X' already defined on line Y". In Rust each FuncState owns its
+    // labels, so the whole vector is the function's label scope.
+    for lb in &fs.labels {
+        if lb.name == name {
+            fs.error(&format!("label '{}' already defined on line {}", name, lb.line));
+            return;
+        }
+    }
     let pc = fs.get_label();
     fs.lasttarget = fs.pc;  // mark label position as jump target (like luaK_getlabel)
     // C's newlabelentry uses ls->fs->nactvar (current count of active variables
@@ -2488,6 +2546,29 @@ fn solve_gotos_for_block(fs: &mut FuncState, saved_nlabels: usize, saved_nlocals
             // Only gt->close determines whether to apply closegoto
             let gt = fs.gotos.remove(i);
             let mut gt_pc = gt.pc;
+
+            // C's closegoto: if (gt->nactvar < label->nactvar) jumpscopeerror(ls, gt);
+            // goto jumps into the scope of some variable declared between goto and label.
+            // The offending variable is the one at active index gt.nactvar (0-based) at
+            // goto creation time. Each LocalVar records the active count at its declaration
+            // (nactvar field == its 0-based active index). C's actvar array is compact:
+            // when a block exits, removevars shrinks nactvar but keeps array contents,
+            // and later new_varkind entries overwrite the freed slots. So multiple Rust
+            // locals can share the same nactvar field; the last one wins (it overwrote
+            // earlier entries in C's compact array).
+            let lb_nactvar = fs.labels[lb_idx].nactvar;
+            if gt.nactvar < lb_nactvar {
+                let varname = fs.locals.iter().rev()
+                    .find(|lv| lv.nactvar == gt.nactvar)
+                    .map(|lv| if lv.name == "(global *)" { "*".to_string() } else { lv.name.clone() })
+                    .unwrap_or_else(|| "*".to_string());
+                fs.error(&format!(
+                    "<goto {}> at line {} jumps into the scope of '{}'",
+                    gt.name, gt.line, varname
+                ));
+                // Skip patching; the error aborts compilation anyway.
+                continue;
+            }
 
             if gt.close || (fs.labels[lb_idx].nactvar < gt.nactvar && needclose) {
                 // Like C's closegoto: move jump to CLOSE+1, put CLOSE at original position
@@ -2851,33 +2932,42 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
         // When key is a Kstr (index <= MAXINDEXRK), no pre-evaluation is needed
         // because SETTABUP can encode it directly. When key > MAXINDEXRK,
         // we must emit GETUPVAL + LOADK before expressions are parsed.
-        // Structure: PreEvalInfo { table_reg, key_reg } for non-Kstr keys.
+        // Structure: PreEvalInfo { table_reg, key_reg, table_allocated } for non-Kstr keys.
         struct PreEvalInfo {
             table_reg: i32,  // register holding _ENV (or -1 if not pre-evaluated)
             key_reg: i32,    // register holding key constant (or -1)
+            table_allocated: bool,  // true if table_reg was alloc'd (needs free)
         }
         let mut pre_evals: Vec<PreEvalInfo> = Vec::new();
-        // 检查 _ENV 是否是 VVARGVAR（命名 vararg 参数）
+        // 检查 _ENV 是否是 local（包括 VVARGVAR）还是 upvalue
         let env_local_ex = fs.find_local_ex("_ENV");
         let env_is_vvargvar = env_local_ex.map(|(_, kind)| kind == RDKVAVAR).unwrap_or(false);
+        let env_is_local = env_local_ex.is_some();
         let env_reg = env_local_ex.map(|(reg, _)| reg).unwrap_or(-1);
         for i in 0..nvars {
             if !is_kstr(fs, var_k_names[i]) {
                 // Key is not a short string constant (index > MAXINDEXRK)
-                // Pre-emit GETUPVAL + LOADK, matching C's luaK_indexed behavior
-                let table_reg = fs.alloc_reg();
-                fs.code_abc(OpCode::GETUPVAL, table_reg, 0, 0);
+                // Pre-emit table + LOADK, matching C's luaK_indexed behavior.
+                // _ENV local: no table alloc needed (use env_reg directly);
+                // _ENV upvalue: GETUPVAL into allocated register.
+                let (table_reg, table_allocated) = if env_is_local {
+                    (env_reg, false)
+                } else {
+                    let r = fs.alloc_reg();
+                    fs.code_abc(OpCode::GETUPVAL, r, 0, 0);
+                    (r, true)
+                };
                 let key_reg = fs.alloc_reg();
                 fs.code_abx(OpCode::LOADK, key_reg, var_k_names[i]);
-                pre_evals.push(PreEvalInfo { table_reg, key_reg });
+                pre_evals.push(PreEvalInfo { table_reg, key_reg, table_allocated });
             } else if env_is_vvargvar {
                 // _ENV 是 VVARGVAR：预评估 key（LOADK），匹配 C 的 buildglobal
                 // （C 的 luaK_indexed 对 VVARGVAR 总是将 key 加载到寄存器）
                 let key_reg = fs.alloc_reg();
                 fs.code_abx(OpCode::LOADK, key_reg, var_k_names[i]);
-                pre_evals.push(PreEvalInfo { table_reg: env_reg, key_reg });
+                pre_evals.push(PreEvalInfo { table_reg: env_reg, key_reg, table_allocated: false });
             } else {
-                pre_evals.push(PreEvalInfo { table_reg: -1, key_reg: -1 });
+                pre_evals.push(PreEvalInfo { table_reg: -1, key_reg: -1, table_allocated: false });
             }
         }
 
@@ -2934,33 +3024,44 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
         }
 
         // Like C's initglobal unwind: for each variable from last to first,
-        // checkglobal then storevartop
+        // checkglobal then storevartop. Key/table registers are NOT freed here
+        // (matching C's behavior where VINDEXED key regs persist until block end).
         for i in (0..nvars).rev() {
             let pe = &pre_evals[i];
             if pe.table_reg >= 0 && !env_is_vvargvar {
-                // Key was pre-evaluated (not VVARGVAR): checkglobal re-loads _ENV + key (like C's
-                // checkglobal which calls buildglobal again), then storevartop uses
-                // the pre-evaluated registers for SETTABLE.
-                // checkglobal: GETUPVAL + LOADK + GETTABLE + ERRNNIL
-                let cr = fs.alloc_reg();
-                fs.code_abc(OpCode::GETUPVAL, cr, 0, 0);
-                let ckr = fs.alloc_reg();
-                fs.code_abx(OpCode::LOADK, ckr, var_k_names[i]);
-                fs.code_abc(OpCode::GETTABLE, cr, cr, ckr);
-                // Like C's luaK_codecheckglobal: luaK_fixline(fs, line) after exp2anyreg
-                fs.fixline(init_line);
-                let k_bx = if var_k_names[i] >= crate::opcodes::MAXARG_BX as i32 { 0 } else { var_k_names[i] + 1 };
-                fs.code_abx(OpCode::ERRNNIL, cr, k_bx);
-                // Like C's luaK_codecheckglobal: luaK_fixline(fs, line) after ERRNNIL
-                fs.fixline(init_line);
-                fs.free_reg(); // ckr
-                fs.free_reg(); // cr
+                // checkglobal: re-create the global variable expression (like C's
+                // checkglobal which calls buildglobal again), then check non-nil.
+                // storevartop uses the pre-evaluated registers for SETTABLE.
+                if env_is_local {
+                    // _ENV is local: LOADK + GETTABLE + ERRNNIL (no GETUPVAL needed)
+                    let cr = fs.alloc_reg();
+                    fs.code_abx(OpCode::LOADK, cr, var_k_names[i]);
+                    fs.code_abc(OpCode::GETTABLE, cr, env_reg, cr);
+                    fs.fixline(init_line);
+                    let k_bx = if var_k_names[i] >= crate::opcodes::MAXARG_BX as i32 { 0 } else { var_k_names[i] + 1 };
+                    fs.code_abx(OpCode::ERRNNIL, cr, k_bx);
+                    fs.fixline(init_line);
+                    fs.free_reg(); // cr
+                } else {
+                    // _ENV is upvalue: re-GETUPVAL + LOADK + GETTABLE + ERRNNIL
+                    // (C's checkglobal calls buildglobal again, which does a fresh
+                    // GETUPVAL rather than reusing the pre-evaluated table_reg)
+                    let cr = fs.alloc_reg();
+                    fs.code_abc(OpCode::GETUPVAL, cr, 0, 0);
+                    let ckr = fs.alloc_reg();
+                    fs.code_abx(OpCode::LOADK, ckr, var_k_names[i]);
+                    fs.code_abc(OpCode::GETTABLE, cr, cr, ckr);
+                    fs.fixline(init_line);
+                    let k_bx = if var_k_names[i] >= crate::opcodes::MAXARG_BX as i32 { 0 } else { var_k_names[i] + 1 };
+                    fs.code_abx(OpCode::ERRNNIL, cr, k_bx);
+                    fs.fixline(init_line);
+                    fs.free_reg(); // ckr
+                    fs.free_reg(); // cr
+                }
                 // storevartop: SETTABLE table_reg key_reg val_reg
                 let val_reg = fs.freereg - 1;
                 fs.code_abc_k(OpCode::SETTABLE, pe.table_reg, pe.key_reg, val_reg, false);
                 fs.free_reg(); // val_reg
-                fs.free_reg(); // key_reg
-                fs.free_reg(); // table_reg
             } else if env_is_vvargvar {
                 // _ENV 是 VVARGVAR：checkglobal 使用 LOADK + GETVARG + ERRNNIL
                 // （GETVARG 会被 luaK_finish 转为 GETTABLE，因为有 PF_VATAB）
@@ -2988,15 +3089,32 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
                 let val_reg = fs.freereg - 1;
                 fs.code_abc_k(OpCode::SETTABLE, env_reg, pe.key_reg, val_reg, false);
                 fs.free_reg(); // val_reg
-                fs.free_reg(); // key_reg
+            } else if env_is_local {
+                // Key is a Kstr and _ENV is a local: use GETFIELD/SETFIELD
+                // checkglobal: GETFIELD + ERRNNIL
+                let cr = fs.alloc_reg();
+                code_getfield(fs, cr, env_reg, var_k_names[i]);
+                fs.fixline(init_line);
+                let k_bx = if var_k_names[i] >= crate::opcodes::MAXARG_BX as i32 { 0 } else { var_k_names[i] + 1 };
+                fs.code_abx(OpCode::ERRNNIL, cr, k_bx);
+                fs.fixline(init_line);
+                fs.free_reg();
+                // storevartop: SETFIELD env_reg k val_reg
+                let val_reg = fs.freereg - 1;
+                fs.code_abc(OpCode::SETFIELD, env_reg, var_k_names[i], val_reg);
+                fs.free_reg();
             } else {
-                // Key is a Kstr: use the simpler checkglobal + code_settabup path
+                // Key is a Kstr and _ENV is an upvalue: use GETTABUP/SETTABUP
                 checkglobal(fs, &names[i], init_line);
                 let val_reg = fs.freereg - 1;
                 code_settabup(fs, 0, var_k_names[i], val_reg);
                 fs.free_reg();
             }
         }
+        // Like C's statement-end freereg reset: VINDEXED key/table registers
+        // are not freed by storevartop (they persist until block end in C).
+        // C resets freereg = nvarstack at statement exit; do the same here.
+        fs.set_freereg(fs.nvarstack());
     }
 
     // Like C's globalnames: now activate the declaration
@@ -4374,6 +4492,11 @@ struct PrefixResult {
 /// 匹配 C 的 buildglobal：_ENV 可以是 local、local const (CTC) 或 upvalue。
 /// 用于具名 global 声明（如 `global a`）、collective `global *` 和隐式全局。
 fn code_global_via_env_prefix(fs: &mut FuncState, name: &str) -> PrefixResult {
+    // C's buildglobal raises "_ENV is global when accessing variable 'X'" when
+    // _ENV itself is a named global declaration.
+    if fs.find_named_global_decl("_ENV").is_some() {
+        fs.error(&format!("_ENV is global when accessing variable '{}'", name));
+    }
     let is_env = name == "_ENV";
     let k = if is_env { 0 } else { fs.string_k(name) };
     // 检查是否有 global <const> 声明（read-only）
@@ -4581,6 +4704,11 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                 // 全局变量（collective `global *` 或隐式全局）通过 _ENV[name] 访问。
                 // 匹配 C 的 buildvar：先 singlevaraux 查找 local/upvalue（已在上面处理），
                 // 未找到则 buildglobal 通过 _ENV[name] 访问。
+                // C's buildvar: if singlevaraux returns VGLOBAL with info==-2,
+                // raise "variable 'X' not declared".
+                if fs.is_undeclared_global(&name) {
+                    fs.error(&format!("variable '{}' not declared", name));
+                }
                 code_global_via_env_prefix(fs, &name)
             };
 
@@ -8296,6 +8424,12 @@ fn check_mulop(fs: &FuncState) -> bool {
 /// Code access to a global variable via _ENV: _ENV[name].
 /// Used by parse_simple_exp for both explicit global declarations and implicit globals.
 fn code_global_via_env(fs: &mut FuncState, name: &str) -> ExpDesc {
+    // C's buildglobal calls singlevaraux(fs, "_ENV", ...) which returns VGLOBAL
+    // when _ENV itself is a named global declaration, then raises
+    // "_ENV is global when accessing variable 'X'".
+    if fs.find_named_global_decl("_ENV").is_some() {
+        fs.error(&format!("_ENV is global when accessing variable '{}'", name));
+    }
     let k = fs.string_k(name);
     // Like C's singlevar + luaK_indexed: resolve _ENV as local, upvalue, or implicit
     let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
@@ -8461,6 +8595,12 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 }
             } else {
                 // 全局变量（`global *` 或隐式全局）通过 _ENV[name] 访问
+                // C's buildvar: if singlevaraux returns VGLOBAL with info==-2,
+                // raise "variable 'X' not declared" (named global declaration
+                // without a covering collective).
+                if fs.is_undeclared_global(&name) {
+                    fs.error(&format!("variable '{}' not declared", name));
+                }
                 code_global_via_env(fs, &name)
             }
         }
@@ -9798,6 +9938,13 @@ fn parse_func_stat(fs: &mut FuncState) {
                 fs.fixline(line);
                 return;
             }
+        }
+
+        // C's funcname calls singlevar -> buildvar, which raises
+        // "variable 'X' not declared" when info==-2 (named global declaration
+        // without a covering collective). Check before falling back to _ENV.
+        if fs.is_undeclared_global(name) {
+            fs.error(&format!("variable '{}' not declared", name));
         }
 
         let k = fs.string_k(name);
