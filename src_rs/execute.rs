@@ -4378,10 +4378,20 @@ impl VmExecutor {
             let table_pos = state.base + vatab;
             let table_val = Self::read_stack(state, table_pos).clone();
             let nargs = if let TValue::Table(ref t) = table_val {
-                if let Some(TValue::Integer(n)) = t.get(&TValue::Str(state.string_table.intern("n"))) {
-                    n as usize
-                } else {
-                    0
+                match t.get(&TValue::Str(state.string_table.intern("n"))) {
+                    Some(TValue::Integer(n)) => {
+                        if n < 0 || (n as u64) > (i32::MAX as u64) / 2 {
+                            return Err(VmError::RuntimeError(
+                                "vararg table has no proper 'n'".to_string(),
+                            ));
+                        }
+                        n as usize
+                    }
+                    _ => {
+                        return Err(VmError::RuntimeError(
+                            "vararg table has no proper 'n'".to_string(),
+                        ));
+                    }
                 }
             } else {
                 0
@@ -4441,30 +4451,32 @@ impl VmExecutor {
         let key = Self::read_stack(state, c).clone();
         let nextra = state.nextraargs;
 
-        let result = match &key {
-            TValue::Integer(n) => {
-                let n = *n;
-                if n >= 1 && (n as usize) <= nextra as usize {
-                    // 变参在 state.base - 1 - nextra .. state.base - 2
-                    // 第 n 个变参在 state.base - 1 - nextra + (n - 1) = state.base - nextra + n - 2
-                    let idx = state.base.saturating_sub(nextra as usize + 1).saturating_add(n as usize - 1);
-                    if idx < state.stack.len() {
-                        state.stack[idx].clone()
-                    } else {
-                        TValue::Nil(NilKind::Strict)
-                    }
+        // 对应 C 的 tointegerns: 整数直接用，浮点数尝试精确转换（如 1.0 → 1）
+        let as_int = match &key {
+            TValue::Integer(n) => Some(*n),
+            TValue::Float(f) => crate::table::float_key_to_int(*f),
+            _ => None,
+        };
+
+        let result = if let Some(n) = as_int {
+            if n >= 1 && (n as usize) <= nextra as usize {
+                let idx = state.base.saturating_sub(nextra as usize + 1).saturating_add(n as usize - 1);
+                if idx < state.stack.len() {
+                    state.stack[idx].clone()
                 } else {
                     TValue::Nil(NilKind::Strict)
                 }
+            } else {
+                TValue::Nil(NilKind::Strict)
             }
-            TValue::Str(s) => {
-                if s.as_str() == "n" {
-                    TValue::Integer(nextra as i64)
-                } else {
-                    TValue::Nil(NilKind::Strict)
-                }
+        } else if let TValue::Str(s) = &key {
+            if s.as_str() == "n" {
+                TValue::Integer(nextra as i64)
+            } else {
+                TValue::Nil(NilKind::Strict)
             }
-            _ => TValue::Nil(NilKind::Strict),
+        } else {
+            TValue::Nil(NilKind::Strict)
         };
         Self::write_stack(state, ra, result);
         state.pc += 1;

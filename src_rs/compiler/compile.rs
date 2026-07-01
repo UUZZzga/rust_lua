@@ -4660,7 +4660,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                 PrefixResult { var_name: Some(name.clone()), local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: true }
             } else if let Some((reg, kind)) = fs.find_local_ex(&name) {
                 let is_vvargvar = kind == RDKVAVAR;
-                let is_readonly = kind == RDKCONST;
+                let is_readonly = kind != VDKREG;
                 PrefixResult { var_name: if is_readonly { Some(name.clone()) } else { None }, local_idx: Some(reg), key: None, reg: Some(reg), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar, is_readonly }
             } else if fs.find_named_global_decl(&name).is_some() {
                 // 具名 global 声明（如 `global a`）：优先于 upvalue，通过 _ENV[name] 访问。
@@ -4676,7 +4676,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         // check_readonly: propagate const-ness from upvalue kind
                         // (corresponds to C's check_readonly for VUPVAL with kind!=VDKREG)
                         let uv_kind = fs.proto.upvalues[upval_idx as usize].kind as i32;
-                        let is_readonly = uv_kind == RDKCONST;
+                        let is_readonly = uv_kind != VDKREG;
                         PrefixResult { var_name: if is_readonly { Some(name.clone()) } else { None }, local_idx: None, key: None, reg: None, table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: true, upval_idx: Some(upval_idx), env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
                     }
                     UpvalueOrCtc::CtcConst(mut ctc) => {
@@ -9928,7 +9928,7 @@ fn parse_func_stat(fs: &mut FuncState) {
         };
 
         // check_readonly: 对 const 变量函数声明赋值报错 (对应 C 的 check_readonly in funcstat)
-        if local_result.map(|(_, k)| k == RDKCONST).unwrap_or(false)
+        if local_result.map(|(_, k)| k != VDKREG).unwrap_or(false)
             || global_kind == Some(GDKCONST)
             || (local_result.is_none() && global_kind.is_none() && fs.find_local_ctc(name).is_some())
         {
