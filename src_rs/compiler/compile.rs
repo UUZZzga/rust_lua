@@ -751,7 +751,7 @@ impl<'a> FuncState<'a> {
 
     /// 创建字符串常量并添加到常量表
     fn string_k(&mut self, s: &str) -> i32 {
-        let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, s);
+        let ls = self.ls_mut().anchor_string(s);
         self.const_k(TValue::Str(ls))
     }
 
@@ -3338,6 +3338,17 @@ fn check_conflict_for_var(fs: &mut FuncState, prev_vars: &mut Vec<PrefixResult>,
     }
 }
 
+/// 检查 PrefixResult 是否为合法的赋值目标 (对应 C 的 vkisvar)。
+/// 局部变量、upvalue、索引变量 (表字段/全局) 和 vararg 参数可以作为赋值目标;
+/// 字面量 (数字/字符串/nil/true/false) 和函数调用则不能。
+fn is_valid_assign_target(v: &PrefixResult) -> bool {
+    !v.has_call
+        && (v.local_idx.is_some()
+            || v.upval_idx.is_some()
+            || v.table_reg.is_some()
+            || v.is_vvargvar)
+}
+
 fn parse_assign_or_call(fs: &mut FuncState) {
     let mut first = parse_prefix_exp(fs);
     
@@ -3673,9 +3684,17 @@ fn parse_assign_or_call(fs: &mut FuncState) {
     
     if check(fs, &Token::Eq) || check(fs, &Token::Comma) {
         let mut vars = vec![first];
+        // check_condition(ls, vkisvar(lh->v.k), "syntax error") — 对应 C 的 restassign
+        // 赋值目标必须是变量 (local/upval/indexed/vargvar),不能是字面量或调用。
+        if !is_valid_assign_target(&vars[0]) {
+            fs.error("syntax error");
+        }
         while check(fs, &Token::Comma) {
             fs.ls_mut().next();
             let new_var = parse_prefix_exp(fs);
+            if !is_valid_assign_target(&new_var) {
+                fs.error("syntax error");
+            }
             // check_conflict: if a non-indexed variable conflicts with previous
             // indexed variables (same table/key register), save the original
             // value to a temp register (matching C's check_conflict in lparser.cpp).
