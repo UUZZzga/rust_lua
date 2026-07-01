@@ -21,6 +21,8 @@ use std::ffi::{CStr, CString};
 
 pub const OS_SETLOCALE: usize = 600;
 pub const OS_CLOCK: usize = 601;
+pub const OS_TMPNAME: usize = 602;
+pub const OS_REMOVE: usize = 603;
 
 /// OS 库标签范围: [600, 610)
 pub fn is_os_tag(tag: usize) -> bool {
@@ -32,6 +34,8 @@ pub fn os_function_name(tag: usize) -> Option<&'static str> {
     match tag {
         OS_SETLOCALE => Some("setlocale"),
         OS_CLOCK => Some("clock"),
+        OS_TMPNAME => Some("tmpname"),
+        OS_REMOVE => Some("remove"),
         _ => None,
     }
 }
@@ -157,6 +161,8 @@ pub fn call_os_function(
     match tag {
         OS_SETLOCALE => call_setlocale(state, a, nargs, nresults),
         OS_CLOCK => call_clock(state, a, nresults),
+        OS_TMPNAME => call_tmpname(state, a, nresults),
+        OS_REMOVE => call_remove(state, a, nargs, nresults),
         _ => Ok(()),
     }
 }
@@ -176,6 +182,79 @@ fn call_clock(state: &mut LuaState, a: usize, nresults: i32) -> Result<(), VmErr
 }
 
 // ============================================================================
+// os.tmpname 实现 (对应 C 的 os_tmpname)
+// ============================================================================
+
+/// os.tmpname() — 返回一个临时文件名
+///
+/// 对应 C 的 os_tmpname (POSIX 路径)：使用 mkstemp 创建临时文件，
+/// 关闭后返回文件名。模板为 "/tmp/lua_XXXXXX"。
+fn call_tmpname(state: &mut LuaState, a: usize, nresults: i32) -> Result<(), VmError> {
+    let mut buf: [u8; 32] = *b"/tmp/lua_XXXXXX\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+    let ptr = buf.as_mut_ptr() as *mut libc::c_char;
+    let fd = unsafe { libc::mkstemp(ptr) };
+    if fd == -1 {
+        return Err(VmError::RuntimeError(
+            "unable to generate a unique filename".to_string(),
+        ));
+    }
+    unsafe { libc::close(fd); }
+    let cstr = unsafe { CStr::from_ptr(ptr) };
+    let s = cstr.to_str().unwrap_or("").to_string();
+    push_single_result(state, a, nresults, TValue::Str(state.intern_str(&s)));
+    Ok(())
+}
+
+// ============================================================================
+// os.remove 实现 (对应 C 的 os_remove)
+// ============================================================================
+
+/// os.remove(filename) — 删除文件
+///
+/// 对应 C 的 os_remove + luaL_fileresult：
+/// 成功返回 true；失败返回 nil, error message, errno。
+fn call_remove(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    let filename_val = if nargs > 0 { get_arg(state, a, 0) } else { TValue::Nil(NilKind::Strict) };
+    let filename_cstr = match &filename_val {
+        TValue::Str(s) => {
+            let bytes = s.as_str().as_bytes();
+            if bytes.contains(&0) {
+                return Err(VmError::RuntimeError(
+                    "bad argument #1 to 'remove' (string contains embedded zeros)".to_string(),
+                ));
+            }
+            CString::new(bytes).unwrap_or_else(|_| CString::new("").unwrap())
+        }
+        _ => {
+            return Err(VmError::RuntimeError(
+                "bad argument #1 to 'remove' (string expected)".to_string(),
+            ));
+        }
+    };
+
+    let result = unsafe { libc::remove(filename_cstr.as_ptr()) };
+    if result == 0 {
+        push_single_result(state, a, nresults, TValue::Boolean(true));
+    } else {
+        let err = std::io::Error::last_os_error();
+        let fname = filename_cstr.to_str().unwrap_or("");
+        let msg = format!("{}: {}", fname, err);
+        let errno = err.raw_os_error().unwrap_or(0);
+        state.adjust_results(a, nresults, vec![
+            TValue::Nil(NilKind::Strict),
+            TValue::Str(state.intern_str(&msg)),
+            TValue::Integer(errno as i64),
+        ]);
+    }
+    Ok(())
+}
+
+// ============================================================================
 // 打开 OS 库 — 对应 C 的 luaopen_os
 // ============================================================================
 
@@ -190,6 +269,8 @@ pub fn open_os_lib(state: &mut LuaState) {
 
     register(&mut lib, "setlocale", OS_SETLOCALE);
     register(&mut lib, "clock", OS_CLOCK);
+    register(&mut lib, "tmpname", OS_TMPNAME);
+    register(&mut lib, "remove", OS_REMOVE);
 
     let key = TValue::Str(state.intern_str("os"));
     state.globals.set(key, TValue::Table(lib));

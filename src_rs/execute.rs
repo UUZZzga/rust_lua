@@ -864,6 +864,11 @@ impl VmExecutor {
                     crate::stdlib::coroutine_lib::call_coro_function(
                         tag_val, state, ra + 3, nargs, nresults,
                     )
+                } else if crate::stdlib::io_lib::is_io_function_tag(tag_val) {
+                    // I/O 库函数（标签 800-809）
+                    crate::stdlib::io_lib::call_io_function(
+                        tag_val, state, ra + 3, nargs, nresults,
+                    )
                 } else if crate::stdlib::coroutine_lib::is_wrap_call_tag(tag_val) {
                     // coroutine.wrap 返回的函数（标签 710+）
                     crate::stdlib::coroutine_lib::call_wrap_call(
@@ -3318,6 +3323,8 @@ impl VmExecutor {
                     crate::stdlib::os_lib::os_function_name(tag_val).map(|s| s.to_string())
                 } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
                     crate::stdlib::coroutine_lib::coro_function_name(tag_val).map(|s| s.to_string())
+                } else if crate::stdlib::io_lib::is_io_function_tag(tag_val) {
+                    crate::stdlib::io_lib::io_function_name(tag_val).map(|s| s.to_string())
                 } else if crate::stdlib::string_lib::is_string_tag(tag_val) {
                     crate::stdlib::string_lib::string_function_name(tag_val).map(|s| s.to_string())
                 } else {
@@ -3383,6 +3390,12 @@ impl VmExecutor {
                 } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
                     // Coroutine 库函数（标签 700-709）
                     crate::stdlib::coroutine_lib::call_coro_function(
+                        tag_val, state, a, nargs, nresults,
+                    )
+                } else if crate::stdlib::io_lib::is_io_function_tag(tag_val) {
+                    // I/O 库函数（标签 800-809）— 必须在 wrap_call 之前检查
+                    // (is_wrap_call_tag 用 tag >= 710，会误匹配 800+)
+                    crate::stdlib::io_lib::call_io_function(
                         tag_val, state, a, nargs, nresults,
                     )
                 } else if crate::stdlib::coroutine_lib::is_wrap_call_tag(tag_val) {
@@ -3730,6 +3743,11 @@ impl VmExecutor {
                 } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
                     // Coroutine 库函数（标签 700-709）
                     crate::stdlib::coroutine_lib::call_coro_function(
+                        tag_val, state, a, nargs, -1,
+                    )?;
+                } else if crate::stdlib::io_lib::is_io_function_tag(tag_val) {
+                    // I/O 库函数（标签 800-809）
+                    crate::stdlib::io_lib::call_io_function(
                         tag_val, state, a, nargs, -1,
                     )?;
                 } else if crate::stdlib::coroutine_lib::is_wrap_call_tag(tag_val) {

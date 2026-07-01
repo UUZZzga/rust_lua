@@ -50,6 +50,7 @@ pub const BASE_WARN: usize = 19;
 pub const BASE_REQUIRE: usize = 22;
 pub const BASE_LOAD: usize = 23;
 pub const BASE_COLLECTGARBAGE: usize = 24;
+pub const BASE_DOFILE: usize = 25;
 
 // 迭代器辅助函数标签 (不在 is_base_tag 范围内, 只在 TFORCALL 中处理)
 // 对应 C 的 ipairsaux 和 next 迭代器函数
@@ -59,7 +60,7 @@ pub const BASE_NEXT_ITER: usize = 21;
 /// 标签是否属于基础库
 pub fn is_base_tag(tag: usize) -> bool {
     (tag >= BASE_PRINT && tag <= BASE_WARN) || tag == BASE_REQUIRE || tag == BASE_LOAD
-        || tag == BASE_COLLECTGARBAGE
+        || tag == BASE_COLLECTGARBAGE || tag == BASE_DOFILE
 }
 
 /// 判断标签是否为已知的函数标签 (用于 type/tostring 显示)
@@ -379,6 +380,7 @@ pub fn base_function_name(tag: usize) -> Option<&'static str> {
         BASE_REQUIRE => Some("require"),
         BASE_LOAD => Some("load"),
         BASE_COLLECTGARBAGE => Some("collectgarbage"),
+        BASE_DOFILE => Some("dofile"),
         _ => None,
     }
 }
@@ -417,6 +419,7 @@ pub fn call_base_function(
         BASE_REQUIRE => call_require(state, a, nargs, nresults),
         BASE_LOAD => call_load(state, a, nargs, nresults),
         BASE_COLLECTGARBAGE => call_collectgarbage(state, a, nargs, nresults),
+        BASE_DOFILE => call_dofile(state, a, nargs, nresults),
         _ => Err(VmError::RuntimeError(format!("unknown base function tag: {}", tag))),
     };
 
@@ -1788,6 +1791,75 @@ fn call_load(
     }
 }
 
+/// dofile([filename]) — 加载并执行文件
+///
+/// 对应 C 的 luaB_dofile:
+/// ```c
+/// static int luaB_dofile (lua_State *L) {
+///   const char *fname = luaL_optstring(L, 1, NULL);
+///   int status = luaL_loadfile(L, fname);
+///   if (status != LUA_OK)
+///     return luaL_error(L, "%s", lua_tostring(L, -1));
+///   lua_call(L, 0, LUA_MULTRET);
+///   return lua_gettop(L);
+/// }
+/// ```
+fn call_dofile(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    let filename: Option<String> = if nargs > 0 {
+        let arg = get_arg(state, a, 0);
+        match &arg {
+            TValue::Str(s) => Some(s.as_str().to_string()),
+            TValue::Nil(_) => None,
+            _ => {
+                return Err(VmError::RuntimeError(format!(
+                    "bad argument #1 to 'dofile' (string expected, got {})",
+                    arg.ty()
+                )));
+            }
+        }
+    } else {
+        None
+    };
+
+    state.stack.truncate(a);
+    // 截断后栈顶即为 a；load_file 将 chunk 压在 a，pcall 后结果/错误也在 a。
+    // 因此 saved_len 必须在 truncate 之后捕获（== a），否则旧位置无法读到结果。
+    let saved_len = state.stack.len();
+
+    let load_status = state.load_file(filename.as_deref());
+    if load_status != 0 {
+        let err = state.to_string(-1).unwrap_or_default();
+        state.settop(saved_len);
+        return Err(VmError::RuntimeError(format!("{}", err)));
+    }
+
+    let call_status = state.pcall(0, -1, 0);
+    if call_status != 0 {
+        let err_val = state.stack.get(saved_len).cloned()
+            .unwrap_or_else(|| TValue::Str(state.intern_str("dofile error")));
+        state.settop(saved_len);
+        match err_val {
+            TValue::Str(s) => return Err(VmError::RuntimeError(s.as_str().to_string())),
+            other => return Err(VmError::RuntimeErrorValue(other)),
+        }
+    }
+
+    let n_results = state.stack.len().saturating_sub(saved_len);
+    let results: Vec<TValue> = if n_results > 0 {
+        state.stack[saved_len..].to_vec()
+    } else {
+        Vec::new()
+    };
+    state.settop(saved_len);
+    push_results(state, a, nresults, results);
+    Ok(())
+}
+
 // ============================================================================
 // 二进制 chunk 字符串驻留化 (修复 ShortString/LongString 不匹配问题)
 // ============================================================================
@@ -2160,6 +2232,7 @@ pub fn open_base_lib(state: &mut LuaState) {
     register(state, "require", BASE_REQUIRE);
     register(state, "load", BASE_LOAD);
     register(state, "collectgarbage", BASE_COLLECTGARBAGE);
+    register(state, "dofile", BASE_DOFILE);
 
     // 设置 _G 全局变量 (指向全局表自身)
     let globals_clone = state.globals.clone();

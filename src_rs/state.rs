@@ -169,6 +169,9 @@ pub struct LuaState {
     pub n_ny_calls: u32,
     pub dmt: DefaultMetatables,
     pub stdout: Box<dyn Write>,
+    /// io.output 设置的当前输出流 — None 表示使用 stdout
+    /// 对应 C liolib 中存储在 registry[IO_OUTPUT] 的默认输出文件句柄
+    pub io_output: Option<Box<dyn Write>>,
     pub global_state: Rc<GlobalState>,
     pub ci: Option<Box<CallInfo>>,
     /// 调用栈信息，用于构建堆栈回溯 — 对应 C 的 CallInfo 链表
@@ -334,6 +337,7 @@ impl LuaState {
             n_ny_calls: 0,
             dmt: DefaultMetatables::new(),
             stdout: Box::new(std::io::stdout()),
+            io_output: None,
             global_state: Rc::new(GlobalState { gcstopem: false }),
             ci: None,
             call_info: Vec::new(),
@@ -501,6 +505,7 @@ impl LuaState {
             n_ny_calls: 0,
             dmt: DefaultMetatables::new(),
             stdout: Box::new(std::io::stdout()),
+            io_output: None,
             global_state: Rc::new(GlobalState { gcstopem: false }),
             ci: None,
             call_info: Vec::new(),
@@ -610,6 +615,7 @@ impl LuaState {
             n_ny_calls: 0,
             dmt: DefaultMetatables::new(),
             stdout: Box::new(std::io::stdout()),
+            io_output: None,
             global_state: Rc::new(GlobalState { gcstopem: false }),
             ci: None,
             call_info: Vec::new(),
@@ -1835,6 +1841,8 @@ impl LuaState {
                     crate::stdlib::os_lib::os_function_name(tag_val).map(|s| s.to_string())
                 } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
                     crate::stdlib::coroutine_lib::coro_function_name(tag_val).map(|s| s.to_string())
+                } else if crate::stdlib::io_lib::is_io_function_tag(tag_val) {
+                    crate::stdlib::io_lib::io_function_name(tag_val).map(|s| s.to_string())
                 } else if tag_val >= 100 {
                     crate::stdlib::string_lib::string_function_name(tag_val).map(|s| s.to_string())
                 } else {
@@ -1881,6 +1889,10 @@ impl LuaState {
                     )
                 } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
                     crate::stdlib::coroutine_lib::call_coro_function(
+                        tag_val, self, func_idx, nargs, nresults,
+                    )
+                } else if crate::stdlib::io_lib::is_io_function_tag(tag_val) {
+                    crate::stdlib::io_lib::call_io_function(
                         tag_val, self, func_idx, nargs, nresults,
                     )
                 } else if crate::stdlib::coroutine_lib::is_wrap_call_tag(tag_val) {

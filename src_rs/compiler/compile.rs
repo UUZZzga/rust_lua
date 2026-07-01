@@ -2,6 +2,9 @@ use crate::objects::*;
 use crate::objects::PF_VAHID;
 use crate::opcodes::*;
 use super::lexer::{LexState, Token};
+use crate::strings::LuaString;
+use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 
 use crate::objects::Instruction;
 
@@ -206,7 +209,7 @@ const GDKCONST: i32 = 6;
 //   exp_to_k(fs, e)                → 表达式转常量索引(≤255)
 //   check_addop(fs)                → 检查加减运算符(+/-)
 //   check_mulop(fs)                → 检查乘除运算符(*/- // %)
-//   tvalue_eq(a, b)                → TValue比较(常量去重)
+//   ConstKey (PartialEq/Hash)       → TValue比较(常量去重)
 // ---------------------------------------------------------------------------
 
 // ============================================================================
@@ -367,6 +370,58 @@ struct RegAllocEntry {
     idx: i32,
 }
 
+// ============================================================================
+// 常量索引键 — 用于 const_k 的 O(1) 查找
+// 语义与 tvalue_eq 一致：不做跨类型比较（Integer != Float）
+// ============================================================================
+
+#[derive(Clone)]
+enum ConstKey {
+    Nil,
+    Boolean(bool),
+    Integer(i64),
+    Float(u64),  // f64::to_bits
+    Str(LuaString),
+}
+
+impl PartialEq for ConstKey {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (ConstKey::Nil, ConstKey::Nil) => true,
+            (ConstKey::Boolean(a), ConstKey::Boolean(b)) => a == b,
+            (ConstKey::Integer(a), ConstKey::Integer(b)) => a == b,
+            (ConstKey::Float(a), ConstKey::Float(b)) => a == b,
+            (ConstKey::Str(a), ConstKey::Str(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ConstKey {}
+
+impl Hash for ConstKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        match self {
+            ConstKey::Nil => 0u8.hash(state),
+            ConstKey::Boolean(b) => { 1u8.hash(state); b.hash(state); }
+            ConstKey::Integer(i) => { 2u8.hash(state); i.hash(state); }
+            ConstKey::Float(f) => { 3u8.hash(state); f.hash(state); }
+            ConstKey::Str(s) => { 4u8.hash(state); Hash::hash(s, state); }
+        }
+    }
+}
+
+fn to_const_key(v: &TValue) -> ConstKey {
+    match v {
+        TValue::Nil(_) => ConstKey::Nil,
+        TValue::Boolean(b) => ConstKey::Boolean(*b),
+        TValue::Integer(i) => ConstKey::Integer(*i),
+        TValue::Float(f) => ConstKey::Float(f.to_bits()),
+        TValue::Str(s) => ConstKey::Str(s.clone()),
+        _ => ConstKey::Nil,
+    }
+}
+
 pub struct FuncState<'a> {
     pub proto: Proto,
     pub prev: *mut FuncState<'a>,  // raw pointer to parent FuncState (like C's fs->prev)
@@ -390,6 +445,8 @@ pub struct FuncState<'a> {
     ls: *mut LexState<'a>,
     // 每条指令对应的行号（与 code 数组平行），用于在 finalize 时计算 line_info
     inst_lines: Vec<i32>,
+    /// 常量索引 — 用于 const_k 的 O(1) 查找，避免线性扫描
+    const_index: HashMap<ConstKey, i32>,
     #[cfg(debug_assertions)]
     reg_alloc_stack: Vec<RegAllocEntry>,
     #[cfg(debug_assertions)]
@@ -458,6 +515,7 @@ impl<'a> FuncState<'a> {
             pending_func_block: None,
             ls: ls as *mut LexState<'a>,
             inst_lines: Vec::new(),
+            const_index: HashMap::new(),
             #[cfg(debug_assertions)]
             reg_alloc_stack: Vec::new(),
             #[cfg(debug_assertions)]
@@ -552,6 +610,23 @@ impl<'a> FuncState<'a> {
             self.emit(create_vabck(op, a, b, c, if k { 1 } else { 0 }))
         } else {
             self.emit(create_abck(op, a, b, c, if k { 1 } else { 0 }))
+        }
+    }
+
+    /// 生成 SETLIST 指令 — 对应 C 的 luaK_setlist
+    ///
+    /// 当 nelems (起始索引) 超过 MAXARG_vC (1023) 时，使用 K=1 + EXTRAARG 存储高位。
+    /// 对应 C lvm.cpp OP_SETLIST 中 `if (TESTARG_k(i)) { last += GETARG_Ax(*pc) * (MAXARG_vC+1); }`。
+    fn code_setlist(&mut self, base: i32, tostore: i32, nelems: i32) {
+        let tostore = if tostore < 0 { 0 } else { tostore };
+        let maxarg_vc = (1i32 << SIZE_VC) - 1;
+        if nelems <= maxarg_vc {
+            self.code_abc_k(OpCode::SETLIST, base, tostore, nelems, false);
+        } else {
+            let extra = nelems / (maxarg_vc + 1);
+            let nelems_low = nelems % (maxarg_vc + 1);
+            self.code_abc_k(OpCode::SETLIST, base, tostore, nelems_low, true);
+            self.code_ax(OpCode::EXTRAARG, extra);
         }
     }
 
@@ -739,13 +814,13 @@ impl<'a> FuncState<'a> {
 
     /// 查找或添加常量到常量表: 去重后返回常量索引
     fn const_k(&mut self, value: TValue) -> i32 {
-        for (i, c) in self.proto.constants.iter().enumerate() {
-            if tvalue_eq(c, &value) {
-                return i as i32;
-            }
+        let key = to_const_key(&value);
+        if let Some(&idx) = self.const_index.get(&key) {
+            return idx;
         }
         let idx = self.proto.constants.len() as i32;
         self.proto.constants.push(value);
+        self.const_index.insert(key, idx);
         idx
     }
 
@@ -4324,8 +4399,9 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
         let method = get_name(fs);
         let k = fs.string_k(&method);
         let src = src_reg.unwrap_or(freg);
-        // C++ compiler: luaK_self checks strisshr — long method names can't use SELF opcode
-        if method.len() <= crate::strings::LUAI_MAXSHORTLEN {
+        // C++ compiler: luaK_self checks strisshr && luaK_exp2K (constant index <= MAXINDEXRK)
+        // 长方法名或常量索引超过 MAXINDEXRK 时不能用 SELF，必须回退到 MOVE+GETTABLE
+        if method.len() <= crate::strings::LUAI_MAXSHORTLEN && (k as u32) <= crate::opcodes::MAXINDEXRK {
             fs.code_abc(OpCode::SELF, freg, src, k);
         } else {
             // Long method name: use MOVE + GETTABLE instead of SELF
@@ -10255,12 +10331,16 @@ fn parse_local(fs: &mut FuncState) {
                 let popped = fs.proto.code.pop();
                 fs.inst_lines.pop();
                 fs.pc -= 1;
-                // If the popped instruction is LOADK, the constant it references
-                // was added for this CTC variable and should also be removed.
-                // (LOADI/LOADF don't add constants, so no pop needed for those.)
+                // LOADK 引用的常量是 CTC 变量声明时添加的，C 编译器不添加此常量
+                // (luaK_exp2const 直接提取值不 discharge)。需要从 proto.constants
+                // 和 const_index HashMap 中同时删除，保持两者一致。
+                // (LOADI/LOADF 不添加常量，无需处理。)
                 if let Some(inst) = popped {
                     if crate::opcodes::get_opcode(inst) == OpCode::LOADK {
-                        fs.proto.constants.pop();
+                        if let Some(val) = fs.proto.constants.pop() {
+                            let key = to_const_key(&val);
+                            fs.const_index.remove(&key);
+                        }
                     }
                 }
             }
@@ -10481,7 +10561,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                 }
                 // Only flush SETLIST if tostore >= maxtostore
                 if tostore > 0 && tostore >= maxtostore {
-                    fs.code_abc(OpCode::SETLIST, table_r, tostore, need_array);
+                    fs.code_setlist(table_r, tostore, need_array);
                     need_array += tostore;
                     tostore = 0;
                     fs.set_freereg(table_r + 1);
@@ -10539,7 +10619,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                     }
                     // Only flush SETLIST if tostore >= maxtostore
                     if tostore > 0 && tostore >= maxtostore {
-                        fs.code_abc(OpCode::SETLIST, table_r, tostore, need_array);
+                        fs.code_setlist(table_r, tostore, need_array);
                         need_array += tostore;
                         tostore = 0;
                         fs.set_freereg(table_r + 1);
@@ -10575,7 +10655,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                         tostore += 1;
                         // Flush SETLIST if tostore >= maxtostore (like C's closelistfield)
                         if tostore >= maxtostore {
-                            fs.code_abc(OpCode::SETLIST, table_r, tostore, need_array);
+                            fs.code_setlist(table_r, tostore, need_array);
                             need_array += tostore;
                             tostore = 0;
                             fs.set_freereg(table_r + 1);
@@ -10589,7 +10669,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                     tostore += 1;
                     // Flush SETLIST if tostore >= maxtostore (like C's closelistfield)
                     if tostore >= maxtostore {
-                        fs.code_abc(OpCode::SETLIST, table_r, tostore, need_array);
+                        fs.code_setlist(table_r, tostore, need_array);
                         need_array += tostore;
                         tostore = 0;
                         fs.set_freereg(table_r + 1);
@@ -10608,7 +10688,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
     if let Some(last) = last_list_exp {
         if last.kind == ExpKind::Call {
             fs.set_c(last.info2, 0);
-            fs.code_abc(OpCode::SETLIST, table_r, 0, need_array);
+            fs.code_setlist(table_r, 0, need_array);
             need_array += tostore;
             fs.set_freereg(table_r + 1);
         } else if last.kind == ExpKind::Vararg {
@@ -10617,20 +10697,20 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
             fs.set_c(pc, 0);  // LUA_MULTRET + 1 = 0
             let r = fs.alloc_reg();
             fs.set_a(pc, r);
-            fs.code_abc(OpCode::SETLIST, table_r, 0, need_array);
+            fs.code_setlist(table_r, 0, need_array);
             need_array += tostore;
             fs.set_freereg(table_r + 1);
         } else {
             fs.exp_to_next_reg(&last);
             tostore += 1;
             if tostore > 0 {
-                fs.code_abc(OpCode::SETLIST, table_r, tostore, need_array);
+                fs.code_setlist(table_r, tostore, need_array);
                 need_array += tostore;
                 fs.set_freereg(table_r + 1);
             }
         }
     } else if tostore > 0 {
-        fs.code_abc(OpCode::SETLIST, table_r, tostore, need_array);
+        fs.code_setlist(table_r, tostore, need_array);
         need_array += tostore;
         fs.set_freereg(table_r + 1);
     }
@@ -10873,18 +10953,6 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
 // ============================================================================
 // Value comparison for constant dedup
 // ============================================================================
-
-/// TValue 比较: 用于常量去重，支持 nil/bool/int/float/string 类型
-fn tvalue_eq(a: &TValue, b: &TValue) -> bool {
-    match (a, b) {
-        (TValue::Nil(_), TValue::Nil(_)) => true,
-        (TValue::Boolean(a), TValue::Boolean(b)) => a == b,
-        (TValue::Integer(a), TValue::Integer(b)) => a == b,
-        (TValue::Float(a), TValue::Float(b)) => a.to_bits() == b.to_bits(),
-        (TValue::Str(a), TValue::Str(b)) => a.as_str() == b.as_str(),
-        _ => false,
-    }
-}
 
 /// 检查 float 值是否为整数值且在 i64 范围内。
 ///

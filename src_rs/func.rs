@@ -467,6 +467,7 @@ mod tests {
             n_ccalls: 0,
             dmt: crate::tm::DefaultMetatables::new(),
             stdout: Box::new(std::io::stdout()),
+            io_output: None,
             global_state: std::rc::Rc::new(crate::state::GlobalState { gcstopem: false }),
             ci: None,
             call_info: Vec::new(),
