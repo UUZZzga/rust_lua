@@ -523,7 +523,9 @@ impl<'a> FuncState<'a> {
         }
     }
 
+    #[inline(always)]
     fn ls(&self) -> &LexState<'a> { unsafe { &*self.ls } }
+    #[inline(always)]
     fn ls_mut(&mut self) -> &mut LexState<'a> { unsafe { &mut *self.ls } }
 
     fn error(&mut self, msg: &str) {
@@ -532,6 +534,7 @@ impl<'a> FuncState<'a> {
 
     /// Increment nesting level; error if too deep (like C's enterlevel/luaE_incCstack).
     /// Returns false if nesting level exceeded (caller should bail out).
+    #[inline(always)]
     fn enterlevel(&mut self) -> bool {
         self.ls_mut().nesting_level += 1;
         if self.ls().nesting_level >= LUAI_MAXCCALLS {
@@ -542,11 +545,13 @@ impl<'a> FuncState<'a> {
     }
 
     /// Decrement nesting level (like C's leavelevel)
+    #[inline(always)]
     fn leavelevel(&mut self) {
         self.ls_mut().nesting_level -= 1;
     }
 
     /// Check if there are pending errors (for bailing out of recursion)
+    #[inline(always)]
     fn has_errors(&self) -> bool {
         !self.errors.is_empty()
     }
@@ -2426,11 +2431,13 @@ fn final_target(code: &[u32], mut i: i32) -> i32 {
 // ============================================================================
 
 /// ANTLR4: 终端匹配 — 检查当前 token 是否与给定 token 类型相同
+#[inline(always)]
 fn check(fs: &FuncState, t: &Token) -> bool {
     std::mem::discriminant(&fs.ls().token) == std::mem::discriminant(t)
 }
 
 /// ANTLR4: 终端匹配+消费 — 检查并消费当前 token
+#[inline(always)]
 fn test_next(fs: &mut FuncState, t: &Token) -> bool {
     let l = fs.ls_mut();
     if std::mem::discriminant(&l.token) == std::mem::discriminant(t) {
@@ -2442,6 +2449,7 @@ fn test_next(fs: &mut FuncState, t: &Token) -> bool {
 }
 
 /// ANTLR4: 终端匹配断言 — 期望当前 token 匹配，否则报错并跳过
+#[inline(always)]
 fn expect(fs: &mut FuncState, t: &Token) {
     if !check(fs, t) {
         fs.error(&format!("{} expected", t.to_display_str()));
@@ -3308,7 +3316,7 @@ fn parse_statement(fs: &mut FuncState) {
             let line = fs.ls().lastline;
             let is_global = name == "global" && {
                 let l = fs.ls_mut();
-                let lk = &l.lookahead_next().0;
+                let lk = l.lookahead_next();
                 matches!(lk, Token::Lt | Token::Name(_) | Token::Star | Token::Function)
             };
             if is_global {
@@ -4460,6 +4468,8 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
             fs.set_freereg(freg + 1);
             return pc;
         }
+        // Like C's funcargs default: missing args after method name
+        fs.error(&format!("function arguments expected near {}", fs.ls().token.to_display_str()));
         return -1;
     }
 
@@ -5865,29 +5875,36 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     fs.code_abc_k(OpCode::MMBINK, v1, k, 14, flip);
                     e = ExprItem { exp: ExpDesc::new_reloc_with_pc(0, pc) };
                 } else {
-                    // BOR variant: like C's codebinexpval
-                    // C's infix already compiled e1 to register (if not numeral)
-                    // codebinexpval compiles e2 first, then finishbinexpval gets e1's register
-                    let v2 = if matches!(e2.exp.kind, ExpKind::NonReloc) && !e2.exp.has_jumps() {
-                        e2.exp.info as i32
-                    } else if matches!(e2.exp.kind, ExpKind::Relocable) && !e2.exp.has_jumps() && e2.exp.info2 < 0 {
-                        e2.exp.info as i32
+                    // BOR variant: like C's codebinNoK + codebinexpval
+                    // Like C's codebinNoK: if flip, swap back to original order,
+                    // then codebinexpval processes original e2 first, then e1.
+                    let (first_ec, first_e2) = if flip {
+                        (&ec.clone(), &e2.exp.clone())
                     } else {
-                        fs.exp_to_reg(&e2.exp)
+                        (&e2.exp.clone(), &ec.clone())
                     };
-                    // Now get e1's register (already compiled in infix if not numeral)
-                    let v1 = if ec.has_jumps() {
-                        let r = fs.exp_to_reg(&ec);
-                        ec.t = NO_JUMP;
-                        ec.f = NO_JUMP;
-                        ec.info = r as i64;
-                        r
-                    } else if matches!(ec.kind, ExpKind::NonReloc) {
-                        ec.info as i32
-                    } else if matches!(ec.kind, ExpKind::Relocable) {
-                        fs.exp_to_reg(&ec)
+                    // Process the first operand (original e2 in C's codebinexpval)
+                    let v2 = if matches!(first_ec.kind, ExpKind::NonReloc) && !first_ec.has_jumps() {
+                        first_ec.info as i32
+                    } else if matches!(first_ec.kind, ExpKind::Relocable) && !first_ec.has_jumps() && first_ec.info2 < 0 {
+                        first_ec.info as i32
                     } else {
-                        fs.exp_to_reg(&ec)
+                        fs.exp_to_reg(first_ec)
+                    };
+                    // Process the second operand (original e1 in C's finishbinexpval)
+                    let v1 = if first_e2.has_jumps() {
+                        let r = fs.exp_to_reg(first_e2);
+                        r
+                    } else if matches!(first_e2.kind, ExpKind::NonReloc) {
+                        first_e2.info as i32
+                    } else if matches!(first_e2.kind, ExpKind::Relocable) {
+                        if first_e2.info2 >= 0 {
+                            fs.exp_to_reg(first_e2)
+                        } else {
+                            first_e2.info as i32
+                        }
+                    } else {
+                        fs.exp_to_reg(first_e2)
                     };
                     let pc = fs.code_abc(OpCode::BOR, 0, v1, v2);
                     // Free registers in descending order - like C's freeregs
@@ -5983,29 +6000,36 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     fs.code_abc_k(OpCode::MMBINK, v1, k, 15, flip);
                     e = ExprItem { exp: ExpDesc::new_reloc_with_pc(0, pc) };
                 } else {
-                    // BXOR variant: like C's codebinexpval
-                    // C's infix already compiled e1 to register (if not numeral)
-                    // codebinexpval compiles e2 first, then finishbinexpval gets e1's register
-                    let v2 = if matches!(e2.exp.kind, ExpKind::NonReloc) && !e2.exp.has_jumps() {
-                        e2.exp.info as i32
-                    } else if matches!(e2.exp.kind, ExpKind::Relocable) && !e2.exp.has_jumps() && e2.exp.info2 < 0 {
-                        e2.exp.info as i32
+                    // BXOR variant: like C's codebinNoK + codebinexpval
+                    // Like C's codebinNoK: if flip, swap back to original order,
+                    // then codebinexpval processes original e2 first, then e1.
+                    let (first_ec, first_e2) = if flip {
+                        (&ec.clone(), &e2.exp.clone())
                     } else {
-                        fs.exp_to_reg(&e2.exp)
+                        (&e2.exp.clone(), &ec.clone())
                     };
-                    // Now get e1's register (already compiled in infix if not numeral)
-                    let v1 = if ec.has_jumps() {
-                        let r = fs.exp_to_reg(&ec);
-                        ec.t = NO_JUMP;
-                        ec.f = NO_JUMP;
-                        ec.info = r as i64;
-                        r
-                    } else if matches!(ec.kind, ExpKind::NonReloc) {
-                        ec.info as i32
-                    } else if matches!(ec.kind, ExpKind::Relocable) {
-                        fs.exp_to_reg(&ec)
+                    // Process the first operand (original e2 in C's codebinexpval)
+                    let v2 = if matches!(first_ec.kind, ExpKind::NonReloc) && !first_ec.has_jumps() {
+                        first_ec.info as i32
+                    } else if matches!(first_ec.kind, ExpKind::Relocable) && !first_ec.has_jumps() && first_ec.info2 < 0 {
+                        first_ec.info as i32
                     } else {
-                        fs.exp_to_reg(&ec)
+                        fs.exp_to_reg(first_ec)
+                    };
+                    // Process the second operand (original e1 in C's finishbinexpval)
+                    let v1 = if first_e2.has_jumps() {
+                        let r = fs.exp_to_reg(first_e2);
+                        r
+                    } else if matches!(first_e2.kind, ExpKind::NonReloc) {
+                        first_e2.info as i32
+                    } else if matches!(first_e2.kind, ExpKind::Relocable) {
+                        if first_e2.info2 >= 0 {
+                            fs.exp_to_reg(first_e2)
+                        } else {
+                            first_e2.info as i32
+                        }
+                    } else {
+                        fs.exp_to_reg(first_e2)
                     };
                     let pc = fs.code_abc(OpCode::BXOR, 0, v1, v2);
                     // Free registers in descending order - like C's freeregs
@@ -8185,54 +8209,31 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             let e2 = parse_subexpr(fs, PREC_POW);
             let pc_before = fs.pc;
             let mut pow_no_fold = false;
-            match (&ec.kind, &e2.exp.kind) {
-                (ExpKind::Int, ExpKind::Int) if !ec.has_jumps() && !e2.exp.has_jumps() => {
-                    let base = ec.info as f64;
-                    let exp = e2.exp.info;
-                    let result = base.powi(exp as i32);
-                    // Like C's constfolding: don't fold if result is NaN or 0.0
-                    if !result.is_nan() && result != 0.0 {
-                        e = ExprItem { exp: ExpDesc::new(ExpKind::Float, result.to_bits() as i64) };
-                    } else {
-                        pow_no_fold = true;
-                    }
-                }
-                (ExpKind::Float, ExpKind::Int) if !ec.has_jumps() && !e2.exp.has_jumps() => {
-                    let base = f64::from_bits(ec.info as u64);
-                    let exp = e2.exp.info;
-                    let result = base.powi(exp as i32);
-                    // Like C's constfolding: don't fold if result is NaN or 0.0
-                    if !result.is_nan() && result != 0.0 {
-                        e = ExprItem { exp: ExpDesc::new(ExpKind::Float, result.to_bits() as i64) };
-                    } else {
-                        pow_no_fold = true;
-                    }
-                }
-                (ExpKind::Int, ExpKind::Float) if !ec.has_jumps() && !e2.exp.has_jumps() => {
-                    let base = ec.info as f64;
-                    let exp = f64::from_bits(e2.exp.info as u64);
-                    let result = base.powf(exp);
-                    // Like C's constfolding: don't fold if result is NaN or 0.0
-                    if !result.is_nan() && result != 0.0 {
-                        e = ExprItem { exp: ExpDesc::new(ExpKind::Float, result.to_bits() as i64) };
-                    } else {
-                        pow_no_fold = true;
-                    }
-                }
-                (ExpKind::Float, ExpKind::Float) if !ec.has_jumps() && !e2.exp.has_jumps() => {
-                    let base = f64::from_bits(ec.info as u64);
-                    let exp = f64::from_bits(e2.exp.info as u64);
-                    let result = base.powf(exp);
-                    // Like C's constfolding: don't fold if result is NaN or 0.0
-                    if !result.is_nan() && result != 0.0 {
-                        e = ExprItem { exp: ExpDesc::new(ExpKind::Float, result.to_bits() as i64) };
-                    } else {
-                        pow_no_fold = true;
-                    }
-                }
-                _ => {
+            // Like C's LUA_OPPOW: pow always operates on floats (integers converted);
+            // use float_pow to match luai_numpow (b==2 → a*a, else pow(a,b))
+            let foldable = matches!((&ec.kind, &e2.exp.kind),
+                (ExpKind::Int | ExpKind::Float, ExpKind::Int | ExpKind::Float))
+                && !ec.has_jumps() && !e2.exp.has_jumps();
+            if foldable {
+                let base = match ec.kind {
+                    ExpKind::Int => ec.info as f64,
+                    ExpKind::Float => f64::from_bits(ec.info as u64),
+                    _ => unreachable!(),
+                };
+                let exp = match e2.exp.kind {
+                    ExpKind::Int => e2.exp.info as f64,
+                    ExpKind::Float => f64::from_bits(e2.exp.info as u64),
+                    _ => unreachable!(),
+                };
+                let result = crate::config::float_pow(base, exp);
+                // Like C's constfolding: don't fold if result is NaN or 0.0
+                if !result.is_nan() && result != 0.0 {
+                    e = ExprItem { exp: ExpDesc::new(ExpKind::Float, result.to_bits() as i64) };
+                } else {
                     pow_no_fold = true;
                 }
+            } else {
+                pow_no_fold = true;
             }
             if pow_no_fold {
                 // Like C's isSHint/isSCint: only use K variant if e2 has no jumps
@@ -10610,7 +10611,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                 need_hash += 1;
             } else if let Token::Name(s) = &fs.ls().token {
                 let name = s.clone();
-                let next_is_eq = fs.ls_mut().lookahead_next().0 == Token::Eq;
+                let next_is_eq = fs.ls_mut().lookahead_next() == &Token::Eq;
                 if next_is_eq {
                     // closelistfield: discharge previous list item
                     if let Some(prev) = last_list_exp.take() {

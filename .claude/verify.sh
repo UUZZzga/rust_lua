@@ -42,7 +42,7 @@ fi
 
 # 3. 构建项目
 echo "Building project..."
-cargo build > logs/build.log 2>&1
+cargo build --release > logs/build.log 2>&1
 BUILD_EXIT=$?
 
 if [ $BUILD_EXIT -ne 0 ]; then
@@ -61,11 +61,11 @@ export LUA_PATH="tests_lua/?.lua;./?.lua;./?/init.lua"
 # 测试时限制内存为 512MB
 ulimit -v 524288
 
-for test_file in tests_lua/db.lua tests_lua/calls.lua tests_lua/coroutine.lua tests_lua/goto.lua tests_lua/literals.lua tests_lua/locals.lua tests_lua/math.lua tests_lua/nextvar.lua tests_lua/sort.lua tests_lua/strings.lua tests_lua/utf8.lua tests_lua/vararg.lua tests_lua/verybig.lua; do
+for test_file in tests_lua/db.lua tests_lua/calls.lua tests_lua/constructs.lua tests_lua/coroutine.lua tests_lua/goto.lua tests_lua/literals.lua tests_lua/locals.lua tests_lua/math.lua tests_lua/nextvar.lua tests_lua/sort.lua tests_lua/strings.lua tests_lua/utf8.lua tests_lua/vararg.lua tests_lua/verybig.lua; do
     test_name=$(basename "$test_file")
     log_name="logs/${test_name%.lua}_run.log"
     echo "Running $test_name ..."
-    timeout 10 ./target/debug/lua "$test_file" > "$log_name" 2>&1
+    timeout 10 ./target/release/lua "$test_file" > "$log_name" 2>&1
     RUN_EXIT=$?
     if [ $RUN_EXIT -ne 0 ]; then
         if [ $RUN_EXIT -eq 124 ]; then

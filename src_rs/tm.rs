@@ -938,7 +938,7 @@ fn string_arith(
             TagMethod::Mul => n1 * n2,
             TagMethod::Div => n1 / n2,
             TagMethod::Mod => crate::vm::modulus_float(n1, n2),
-            TagMethod::Pow => n1.powf(n2),
+            TagMethod::Pow => crate::config::float_pow(n1, n2),
             TagMethod::IDiv => (n1 / n2).floor(),
             TagMethod::Unm => -n1,
             _ => return Ok(false),

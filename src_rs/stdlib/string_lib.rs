@@ -145,7 +145,7 @@ fn idiv_f(a: f64, b: f64) -> f64 { (a / b).floor() }
 fn mod_f(a: f64, b: f64) -> f64 {
     if b == 0.0 { f64::NAN } else { a - (a / b).floor() * b }
 }
-fn pow_f(a: f64, b: f64) -> f64 { a.powf(b) }
+fn pow_f(a: f64, b: f64) -> f64 { crate::config::float_pow(a, b) }
 fn unm_f(a: f64, _b: f64) -> f64 { -a }
 fn unm_int(a: i64, _b: i64) -> Option<i64> { Some(a.wrapping_neg()) }
 

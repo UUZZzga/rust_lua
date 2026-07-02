@@ -164,8 +164,7 @@ pub struct LexState<'a> {
     pub linenumber: i32,
     pub lastline: i32,
     pub token: Token,
-    pub token_info: String,
-    pub lookahead: Option<(Token, String)>,
+    pub lookahead: Option<Token>,
     pub errors: Vec<String>,
     pub nesting_level: u32,  // recursion depth counter (like C's nCcalls)
     /// Scanner string table — 对应 C 的 `ls->h`。
@@ -187,7 +186,6 @@ impl<'a> LexState<'a> {
             linenumber: 1,
             lastline: 1,
             token: Token::Eof,
-            token_info: String::new(),
             lookahead: None,
             errors: Vec::new(),
             nesting_level: 0,
@@ -354,22 +352,19 @@ impl<'a> LexState<'a> {
 
     pub fn next(&mut self) {
         self.lastline = self.linenumber;
-        if let Some((tok, info)) = self.lookahead.take() {
+        if let Some(tok) = self.lookahead.take() {
             self.token = tok;
-            self.token_info = info;
             return;
         }
         self.read_token();
     }
 
-    pub fn lookahead_next(&mut self) -> &(Token, String) {
+    pub fn lookahead_next(&mut self) -> &Token {
         if self.lookahead.is_none() {
             let saved_token = self.token.clone();
-            let saved_info = self.token_info.clone();
             self.read_token();
-            self.lookahead = Some((self.token.clone(), self.token_info.clone()));
+            self.lookahead = Some(self.token.clone());
             self.token = saved_token;
-            self.token_info = saved_info;
         }
         self.lookahead.as_ref().unwrap()
     }
@@ -484,11 +479,6 @@ impl<'a> LexState<'a> {
                 self.token = Token::Eof;
             }
         }
-        self.token_info = match &self.token {
-            Token::Name(s) => s.clone(),
-            Token::String(s) => s.clone(),
-            _ => String::new(),
-        };
     }
 
     fn read_name(&mut self) {
@@ -809,7 +799,7 @@ impl<'a> LexState<'a> {
     }
 
     pub fn check_next(&mut self, tok: &Token) -> bool {
-        let (next_tok, _) = self.lookahead_next().clone();
+        let next_tok = self.lookahead_next().clone();
         std::mem::discriminant(&next_tok) == std::mem::discriminant(tok)
     }
 

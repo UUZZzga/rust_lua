@@ -2379,7 +2379,7 @@ impl VmExecutor {
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
         let v1 = Self::read_stack(state, b).clone();
         if let (Some(n1), Some(n2)) = (to_number_ns(&v1), to_number_ns(&v2)) {
-            Self::write_stack(state, a, TValue::Float(n1.powf(n2)));
+            Self::write_stack(state, a, TValue::Float(crate::config::float_pow(n1, n2)));
             state.pc += 2;  // skip MMBINK
         } else {
             state.pc += 1;  // fall through to MMBINK
@@ -2565,7 +2565,7 @@ impl VmExecutor {
         let v1 = Self::read_stack(state, b).clone();
         let v2 = Self::read_stack(state, c).clone();
         if let (Some(n1), Some(n2)) = (to_number_ns(&v1), to_number_ns(&v2)) {
-            Self::write_stack(state, a, TValue::Float(n1.powf(n2)));
+            Self::write_stack(state, a, TValue::Float(crate::config::float_pow(n1, n2)));
             state.pc += 2;  // skip MMBIN
         } else {
             state.pc += 1;  // fall through to MMBIN

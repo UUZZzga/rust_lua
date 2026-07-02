@@ -1607,7 +1607,7 @@ pub fn rawarith(op: ArithOp, p1: &TValue, p2: &TValue, res: &mut TValue) -> bool
                 (Some(a), Some(b)) => {
                     *res = TValue::Float(match op {
                         ArithOp::Div => a / b,
-                        ArithOp::Pow => a.powf(b),
+                        ArithOp::Pow => crate::config::float_pow(a, b),
                         _ => unreachable!(),
                     });
                     true
