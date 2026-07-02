@@ -2916,6 +2916,10 @@ impl VmExecutor {
                 return Err(VmError::RuntimeError("concat error".into()));
             }
         }
+        // 对应 C 的 luaC_checkGC(L)（在 luaV_concat 结束时调用）
+        // 字符串不注册到 GC metas，metas_len 无法反映拼接产生的分配压力，
+        // 因此用计数器限制：每 N 次 op_concat 触发一次 GC，清理弱引用表等。
+        state.concat_gc_check();
         state.pc += 1;
         Ok(())
     }

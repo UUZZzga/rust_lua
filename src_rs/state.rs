@@ -220,6 +220,10 @@ pub struct LuaState {
     /// 弱引用表列表 — setmetatable 设置 __mode 时注册，collectgarbage 时清理
     /// 使用 Weak 引用避免阻止表本身的回收
     pub weak_tables: Vec<std::rc::Weak<std::cell::RefCell<TableData>>>,
+    /// op_concat 的 GC 计数器 — 字符串不注册到 GC metas，用计数器限制
+    /// 每 concat_gc_interval 次 op_concat 触发一次 GC（清理弱引用表等）
+    pub concat_gc_counter: std::cell::Cell<usize>,
+    pub concat_gc_interval: std::cell::Cell<usize>,
     /// 有 __gc 元方法的对象列表 — setmetatable 设置 __gc 时注册
     /// GC 时检查不可达的对象，调用其 finalizer 后再释放
     pub finobj_list: Vec<Table>,
@@ -365,6 +369,8 @@ impl LuaState {
             wrap_coros: Vec::new(),
             pcall_protection_stack: Vec::new(),
             weak_tables: Vec::new(),
+            concat_gc_counter: std::cell::Cell::new(0),
+            concat_gc_interval: std::cell::Cell::new(4096),
             finobj_list: Vec::new(),
             transferinfo_ftransfer: 0,
             transferinfo_ntransfer: 0,
@@ -533,6 +539,8 @@ impl LuaState {
             wrap_coros: Vec::new(),
             pcall_protection_stack: Vec::new(),
             weak_tables: Vec::new(),
+            concat_gc_counter: std::cell::Cell::new(0),
+            concat_gc_interval: std::cell::Cell::new(4096),
             finobj_list: Vec::new(),
             transferinfo_ftransfer: 0,
             transferinfo_ntransfer: 0,
@@ -643,6 +651,8 @@ impl LuaState {
             wrap_coros: Vec::new(),
             pcall_protection_stack: Vec::new(),
             weak_tables: Vec::new(),
+            concat_gc_counter: std::cell::Cell::new(0),
+            concat_gc_interval: std::cell::Cell::new(4096),
             finobj_list: Vec::new(),
             transferinfo_ftransfer: 0,
             transferinfo_ntransfer: 0,
@@ -2482,7 +2492,22 @@ impl LuaState {
     /// 当 metas 大小超过动态阈值时自动触发 GC
     pub fn maybe_collect_gc(&mut self) {
         if self.gc.metas_len() > self.gc.collect_threshold() {
+            self.process_weak_tables();
             self.collect_gc();
+        }
+    }
+
+    /// 字符串拼接的 GC 检查：字符串不注册到 GC metas，metas_len 无法反映
+    /// 拼接产生的分配压力，因此用计数器限制：每 concat_gc_interval 次 op_concat
+    /// 触发一次 process_weak_tables + collect_gc，清理弱引用表中的死条目。
+    pub fn concat_gc_check(&mut self) {
+        let cnt = self.concat_gc_counter.get() + 1;
+        if cnt >= self.concat_gc_interval.get() {
+            self.process_weak_tables();
+            self.collect_gc();
+            self.concat_gc_counter.set(0);
+        } else {
+            self.concat_gc_counter.set(cnt);
         }
     }
 }

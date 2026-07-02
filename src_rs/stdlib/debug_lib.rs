@@ -2420,6 +2420,30 @@ fn call_upvalueid(
             }
             Ok(())
         }
+        TValue::Table(t) => {
+            // string.gmatch 返回的迭代器在 C 中是带 3 个上值的 C 闭包
+            // (字符串、模式、userdata 状态)，Rust 版本用带 __call 的表模拟
+            let is_gmatch_iter = t
+                .get_metatable()
+                .and_then(|mt| mt.get(&TValue::Str(state.intern_str("__call"))))
+                .map(|v| {
+                    if let TValue::LightUserData(p) = &v {
+                        *p as usize == crate::stdlib::string_lib::STR_GMATCH_ITER
+                    } else {
+                        false
+                    }
+                })
+                .unwrap_or(false);
+            if is_gmatch_iter && n > 0 && n <= 3 {
+                // gmatch 迭代器有 3 个 upvalue，用表指针 + n 作为唯一标识
+                let ptr = std::rc::Rc::as_ptr(&t.data) as *mut std::ffi::c_void;
+                let id_ptr = (ptr as usize + n) as *mut std::ffi::c_void;
+                push_single_result(state, a, nresults, TValue::LightUserData(id_ptr));
+            } else {
+                push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
+            }
+            Ok(())
+        }
         _ => {
             push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
             Ok(())
@@ -2436,39 +2460,60 @@ fn call_upvaluejoin(
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
-    // 对应 C 的 db_upvaluejoin -> lua_upvaluejoin:
-    //   *up1 = *up2;  (f1 的第 n1 个上值指向 f2 的第 n2 个上值对象)
-    //
-    // 关键: upvals 是 Rc<RefCell<Vec>>，所有 LClosure clone 共享同一个 Vec。
-    // 修改栈上 clone 的 upvals 会影响所有共享同一 Rc 的闭包（包括原始 LClosure）。
+    // 对应 C 的 db_upvaluejoin -> lua_upvaluejoin -> getupvalref:
+    //   f1/f2 必须是 Lua 函数 (LClosure)，n1/n2 必须在 [1, nupvalues] 范围内
     let f1_stack_idx = a + 1;  // f1 在栈上的位置
     let f2 = get_arg(state, a, 2);
     let n1 = get_arg(state, a, 1).as_integer().unwrap_or(0) as usize;
     let n2 = get_arg(state, a, 3).as_integer().unwrap_or(0) as usize;
 
-    // 获取 f2 的第 n2 个上值引用 (Rc<RefCell<UpVal>>)
-    let f2_upval: Option<UpValRef> = if let TValue::LClosure(c2) = &f2 {
-        let c2_upvals = c2.upvals.borrow();
-        if n2 > 0 && n2 <= c2_upvals.len() {
-            Some(c2_upvals[n2 - 1].clone())
-        } else {
-            None
+    // 检查 f1 是 LClosure，且 n1 在有效范围内
+    if f1_stack_idx >= state.stack.len() {
+        return Err(VmError::RuntimeError(
+            "bad argument #1 to 'upvaluejoin' (Lua function expected)".to_string(),
+        ));
+    }
+    let f1_upvals_len = match &state.stack[f1_stack_idx] {
+        TValue::LClosure(c1) => c1.upvals.borrow().len(),
+        _ => {
+            return Err(VmError::RuntimeError(
+                "bad argument #1 to 'upvaluejoin' (Lua function expected)".to_string(),
+            ));
         }
-    } else {
-        None
+    };
+    if n1 == 0 || n1 > f1_upvals_len {
+        return Err(VmError::RuntimeError(format!(
+            "bad argument #2 to 'upvaluejoin' (invalid upvalue index {})", n1
+        )));
+    }
+
+    // 检查 f2 是 LClosure，且 n2 在有效范围内
+    let f2_upvals_len = match &f2 {
+        TValue::LClosure(c2) => c2.upvals.borrow().len(),
+        _ => {
+            return Err(VmError::RuntimeError(
+                "bad argument #3 to 'upvaluejoin' (Lua function expected)".to_string(),
+            ));
+        }
+    };
+    if n2 == 0 || n2 > f2_upvals_len {
+        return Err(VmError::RuntimeError(format!(
+            "bad argument #4 to 'upvaluejoin' (invalid upvalue index {})", n2
+        )));
+    }
+
+    // 获取 f2 的第 n2 个上值引用 (Rc<RefCell<UpVal>>)
+    let f2_upval: UpValRef = {
+        let c2 = if let TValue::LClosure(c2) = &f2 { c2 } else { unreachable!() };
+        let c2_upvals = c2.upvals.borrow();
+        c2_upvals[n2 - 1].clone()
     };
 
     // 将 f1 的第 n1 个上值指向 f2 的第 n2 个上值
     // 通过 borrow_mut 修改共享的 Vec，影响所有共享同一 Rc 的闭包
-    if let Some(upval) = f2_upval {
-        if f1_stack_idx < state.stack.len() {
-            if let TValue::LClosure(ref mut c1) = state.stack[f1_stack_idx] {
-                let mut c1_upvals = c1.upvals.borrow_mut();
-                if n1 > 0 && n1 <= c1_upvals.len() {
-                    c1_upvals[n1 - 1] = upval;
-                }
-            }
-        }
+    if let TValue::LClosure(ref mut c1) = state.stack[f1_stack_idx] {
+        let mut c1_upvals = c1.upvals.borrow_mut();
+        c1_upvals[n1 - 1] = f2_upval;
     }
 
     // 不返回结果

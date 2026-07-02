@@ -496,6 +496,8 @@ mod tests {
             wrap_coros: Vec::new(),
             pcall_protection_stack: Vec::new(),
             weak_tables: Vec::new(),
+            concat_gc_counter: std::cell::Cell::new(0),
+            concat_gc_interval: std::cell::Cell::new(4096),
             finobj_list: Vec::new(),
             transferinfo_ftransfer: 0,
             transferinfo_ntransfer: 0,
