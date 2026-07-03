@@ -1602,7 +1602,7 @@ assert(a == 2)
 
     #[test]
     fn test_reg_no_leak_unary_ops() {
-        assert_compile_ok("return -1; return not true; return #'abc'; return ~0", None);
+        assert_compile_ok("local a = -1; local b = not true; local c = #'abc'; local d = ~0", None);
     }
 
     #[test]

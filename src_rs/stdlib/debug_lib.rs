@@ -580,7 +580,8 @@ fn call_getuservalue(
 
 /// debug.setuservalue(u, v, [n]) — 对应 C 的 db_setuservalue
 ///
-/// 设置用户数据的第 n 个用户值
+/// 设置用户数据的第 n 个用户值。若 n 超出 userdata 的 uservalue 容量，
+/// 返回 false（对应 C 的 lua_setiuservalue 返回 0 + luaL_pushfail）。
 fn call_setuservalue(
     state: &mut LuaState,
     a: usize,
@@ -597,21 +598,35 @@ fn call_setuservalue(
 
     let result = match &arg1 {
         TValue::UserData(_) => {
-            // 修改栈上的 userdata
-            if a + 1 < state.stack.len() {
-                if let TValue::UserData(ref mut u) = state.stack[a + 1] {
-                    while u.user_values.len() < n {
-                        u.user_values.push(TValue::Nil(NilKind::Strict));
+            // 检查 n 是否在 userdata 的 uservalue 容量范围内
+            // 对应 C 的 lua_setiuservalue 返回 0 当 n > nuvalue
+            let nuvalue = if let TValue::UserData(u) = &arg1 { u.nuvalue } else { 0 };
+            if n < 1 || n > nuvalue as usize {
+                TValue::Boolean(false)
+            } else {
+                // 修改栈上的 userdata
+                if a + 1 < state.stack.len() {
+                    if let TValue::UserData(ref mut u) = state.stack[a + 1] {
+                        while u.user_values.len() < n {
+                            u.user_values.push(TValue::Nil(NilKind::Strict));
+                        }
+                        u.user_values[n - 1] = arg2.clone();
                     }
-                    u.user_values[n - 1] = arg2.clone();
                 }
+                arg1.clone()
             }
-            arg1.clone()
         }
         _ => {
-            // 对于非 userdata, 返回 nil (对应 C 的 luaL_pushfail)
-            push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
-            return Ok(());
+            // 对非 userdata 报错 (对应 C 的 luaL_checktype + luaL_typeerror)
+            // LightUserData 有特殊消息 "light userdata"
+            let typearg = match &arg1 {
+                TValue::LightUserData(_) => "light userdata".to_string(),
+                _ => crate::tm::obj_type_name(&arg1),
+            };
+            return Err(VmError::RuntimeError(format!(
+                "bad argument #1 to 'setuservalue' (userdata expected, got {})",
+                typearg
+            )));
         }
     };
     push_single_result(state, a, nresults, result);
@@ -2810,10 +2825,43 @@ fn build_traceback(state: &LuaState, msg: &str, level: i32) -> String {
         }
     }
 
-    // 输出 state.base（Lua 函数，level c_chain_len）
+    // 输出当前 Lua 帧（level c_chain_len）
+    // 正常场景: state.base/state.pc 指向当前 Lua 函数
+    // error handler 场景: state.base/state.pc 指向 pcall 调用前状态（main chunk），
+    //   需从 call_info 的最后一个非 C 条目获取错误发生时的帧信息
     let lua_level = c_chain_len as i32;
     if lua_level >= level {
-        if let Some((src, line, name, namewhat, is_main)) = get_current_frame_info(state) {
+        let last_lua_idx = (0..n).rev().find(|&i| !state.call_info[i].is_c);
+        let is_error_handler = last_lua_idx.is_some() && {
+            let idx = last_lua_idx.unwrap();
+            let ci_closure = state.call_info[idx].closure.as_ref();
+            let stack_closure = if state.base > 0 && state.base <= state.stack.len() {
+                if let TValue::LClosure(c) = &state.stack[state.base - 1] { Some(c) } else { None }
+            } else { None };
+            match (ci_closure, stack_closure) {
+                (Some(ci), Some(st)) => !Rc::ptr_eq(&ci.proto, &st.proto),
+                _ => false,
+            }
+        };
+
+        if is_error_handler {
+            // error handler 场景: 从 call_info 的最后一个非 C 条目获取帧信息
+            let idx = last_lua_idx.unwrap();
+            let entry = &state.call_info[idx];
+            if let Some(ref closure) = entry.closure {
+                let proto = &closure.proto;
+                let src = proto.source.as_ref().map(short_src).unwrap_or_else(|| "?".to_string());
+                let line = get_proto_line(proto, entry.saved_pc);
+                let is_main = proto.line_defined == 0;
+                let (name, namewhat) = if state.call_info.last().map(|e| e.is_c).unwrap_or(false) && n >= 2 {
+                    let e = &state.call_info[n - 2];
+                    (e.name.clone(), e.namewhat.clone())
+                } else {
+                    (entry.name.clone(), entry.namewhat.clone())
+                };
+                lines.push(make_traceback_line(&src, line, &name, &namewhat, is_main, false, proto.line_defined));
+            }
+        } else if let Some((src, line, name, namewhat, is_main)) = get_current_frame_info(state) {
             let (is_c, linedefined) = if state.base > 0 && state.base <= state.stack.len() {
                 if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
                     (false, closure.proto.line_defined)

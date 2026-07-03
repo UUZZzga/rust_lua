@@ -381,7 +381,7 @@ impl PartialEq for TValue {
             (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
             (TValue::CClosure(a), TValue::CClosure(b)) => std::ptr::eq(a, b),
             (TValue::LCFn(a), TValue::LCFn(b)) => std::ptr::eq(a.func as *const (), b.func as *const ()),
-            (TValue::UserData(a), TValue::UserData(b)) => std::ptr::eq(a, b),
+            (TValue::UserData(a), TValue::UserData(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
             (TValue::Thread(a), TValue::Thread(b)) => Rc::ptr_eq(&a.context, &b.context),
             _ => false,
         }
@@ -446,7 +446,7 @@ impl Hash for TValue {
             }
             TValue::UserData(u) => {
                 10u8.hash(state);
-                (u as *const Udata as usize).hash(state);
+                u.gc_header.ptr_id.hash(state);
             }
             TValue::Thread(t) => {
                 11u8.hash(state);
@@ -801,6 +801,8 @@ pub const PF_FIXED: u8 = 4;
 /// Then: len = 64, nuvalue = 0, data 指向 64 字节内存
 #[derive(Debug, Clone)]
 pub struct Udata {
+    /// GC 对象头 — ptr_id 在克隆时保持一致，用于哈希和相等性比较
+    pub gc_header: GCObjectHeader,
     /// 用户值数量
     pub nuvalue: u16,
     /// 数据长度

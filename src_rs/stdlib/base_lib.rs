@@ -736,18 +736,11 @@ fn get_func_line(proto: &Proto, pc: usize) -> i32 {
     line
 }
 
-/// 对应 C 的 luaL_where：返回 "source:line: " 形式的位置前缀
+/// 返回当前 Lua 函数的位置前缀 "source:line: "（对应 C 的 luaL_where 核心）
 ///
-/// level 1 表示调用 error/assert 的 Lua 函数（当前正在执行的帧）。
-/// 当前实现通过 LuaState 直接支持 level=1；更高层级返回空字符串，
-/// 与 C 中 lua_getstack 失败时的行为一致。
-fn lua_l_where(state: &LuaState, level: usize) -> String {
-    if level == 0 {
-        return String::new();
-    }
-    if level != 1 {
-        return String::new();
-    }
+/// 当前 Lua 函数由 state.base/pc 代表。C 函数不改变 state.base,
+/// 所以在 C 函数中调用时, state.base/pc 仍然是调用该 C 函数的 Lua 函数。
+fn get_current_lua_func_position(state: &LuaState) -> String {
     if state.base == 0 || state.base > state.stack.len() {
         return String::new();
     }
@@ -768,6 +761,77 @@ fn lua_l_where(state: &LuaState, level: usize) -> String {
     format!("{}:{}: ", source, line)
 }
 
+/// 对应 C 的 luaL_where：返回 "source:line: " 形式的位置前缀
+///
+/// level 语义对应 C 的 lua_getstack: level=0 是当前帧, level=1 是调用者帧。
+/// C 版本中 C 函数（error/assert/pcall）创建 CallInfo, level=1 跳过当前 C 函数帧。
+/// Rust 版本中 C 函数推入 call_info 但不改变 state.base, 需要检查 call_info
+/// 来正确模拟 C 的 level 语义。
+fn lua_l_where(state: &LuaState, level: usize) -> String {
+    if level == 0 {
+        return String::new();
+    }
+    // level=1: 调用当前函数的帧
+    // level=k (k>=2): 回溯 call_stack 到更上层帧
+    //   call_stack[last] = 直接调用者, call_stack[last-1] = 调用者的调用者, ...
+    //   level=2 -> call_stack[cs_len-1], level=k -> call_stack[cs_len-(k-1)]
+    if level == 1 {
+        // 检查 call_info 最后一个元素是否是 C 函数帧
+        // 对应 C 的 lua_getstack(L, 1): 跳过当前帧 (L->ci), 返回 L->ci->previous
+        // Rust 版本中, call_info 最后一个元素是当前 C 函数帧 (如果在 C 函数中)
+        if let Some(last_frame) = state.call_info.last() {
+            if last_frame.is_c {
+                // 当前在 C 函数中 (如 error/assert)
+                // 调用该 C 函数的帧可能是:
+                // 1. call_info[len-2] (如果是 C 函数帧) — 如 pcall -> assert
+                //    C 函数帧 currentline=-1, 返回空字符串
+                // 2. state.base/pc 代表的 Lua 函数 — 如直接调用 assert/error
+                let ci_len = state.call_info.len();
+                if ci_len >= 2 {
+                    let prev_frame = &state.call_info[ci_len - 2];
+                    if prev_frame.is_c {
+                        // 调用者也是 C 函数 (如 pcall -> assert), 返回空字符串
+                        return String::new();
+                    }
+                }
+                // 调用者是 Lua 函数, 返回 state.base/pc 代表的 Lua 函数位置
+                return get_current_lua_func_position(state);
+            }
+        }
+        // 当前不在 C 函数中, 返回 state.base/pc 代表的 Lua 函数位置
+        get_current_lua_func_position(state)
+    } else {
+        let cs_len = state.call_stack.len();
+        // level=k 对应 call_stack[cs_len - (k-1)]
+        let frame_idx = if cs_len >= level - 1 {
+            cs_len - (level - 1)
+        } else {
+            return String::new();
+        };
+        let frame = &state.call_stack[frame_idx];
+        if frame.base == 0 || frame.base > state.stack.len() {
+            return String::new();
+        }
+        let closure = match &state.stack[frame.base - 1] {
+            TValue::LClosure(c) => c,
+            _ => return String::new(),
+        };
+        // return_pc - 1 是调用当前函数的 OP_CALL 指令的 PC
+        let call_pc = if frame.return_pc > 0 { frame.return_pc - 1 } else { 0 };
+        let line = get_func_line(&closure.proto, call_pc);
+        if line <= 0 {
+            return String::new();
+        }
+        let source = closure
+            .proto
+            .source
+            .as_ref()
+            .map(short_src)
+            .unwrap_or_else(|| "?".to_string());
+        format!("{}:{}: ", source, line)
+    }
+}
+
 /// error(msg [, level]) — 对应 C 的 luaB_error
 fn call_error(state: &mut LuaState, a: usize, nargs: usize, _nresults: i32) -> Result<(), VmError> {
     let msg = get_arg(state, a, 0);
@@ -776,18 +840,26 @@ fn call_error(state: &mut LuaState, a: usize, nargs: usize, _nresults: i32) -> R
     } else {
         1
     };
-    // 对应 C Lua 的 error(): 字符串添加位置前缀，非字符串原样返回
+    // 对应 C Lua 的 error(): 字符串且 level > 0 时添加位置前缀；其他情况原样返回
+    // 对于非字符串或 level==0，错误消息不应被 build_traceback 再加前缀
+    state.error_no_prefix = true;  // 默认不要前缀（非字符串/level=0 路径）
     if let TValue::Str(s) = &msg {
         let mut err_msg = s.as_str().to_string();
         if level > 0 {
             let prefix = lua_l_where(state, level as usize);
             err_msg = format!("{}{}", prefix, err_msg);
+            state.error_no_prefix = false;  // 字符串 + level>0：已加前缀，build_traceback 不再处理
         }
-        // 保存包含前缀的错误值（与 C Lua 行为一致：error(s) 返回带位置前缀的字符串）
         state.last_error_value = Some(TValue::Str(state.intern_str(&err_msg)));
         Err(VmError::RuntimeError(err_msg))
     } else {
         // 非字符串错误值: 原样返回（对应 C Lua 中 errfunc 为非字符串时的行为）
+        // 特殊处理：error() 即 error(nil) 应返回 "<no error object>"（对应 C luaG_errormsg）
+        if matches!(msg, TValue::Nil(_)) {
+            let err_msg = "<no error object>".to_string();
+            state.last_error_value = Some(TValue::Str(state.intern_str(&err_msg)));
+            return Err(VmError::RuntimeError(err_msg));
+        }
         // 保留原始 TValue 类型（coroutine.close 需要返回原始值）
         state.last_error_value = Some(msg.clone());
         Err(VmError::RuntimeErrorValue(msg))
@@ -801,6 +873,12 @@ fn call_tonumber(
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
+    // 对应 C 的 luaL_checkany(L, 1)：必须有一个参数
+    if nargs == 0 {
+        return Err(VmError::RuntimeError(
+            "bad argument #1 to 'tonumber' (value expected)".to_string(),
+        ));
+    }
     let arg = get_arg(state, a, 0);
     let base_arg = if nargs >= 2 {
         get_arg(state, a, 1)
@@ -839,9 +917,15 @@ fn call_tonumber(
 fn call_tostring(
     state: &mut LuaState,
     a: usize,
-    _nargs: usize,
+    nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
+    // 对应 C 的 luaL_checkany(L, 1)：必须有一个参数
+    if nargs == 0 {
+        return Err(VmError::RuntimeError(
+            "bad argument #1 to 'tostring' (value expected)".to_string(),
+        ));
+    }
     let arg = get_arg(state, a, 0);
     // 对应 C 的 luaL_tolstring: 先尝试调用 __tostring 元方法
     if let TValue::Table(t) = &arg {
@@ -891,7 +975,14 @@ fn call_tostring(
         }
     }
     // 无 __tostring 元方法: 使用默认转换
-    let s = base_tostring(&arg);
+    // 对应 C 的 luaL_tolstring default 分支: "%s: %p" 用 obj_type_name
+    let s = match &arg {
+        TValue::Integer(_) | TValue::Float(_) | TValue::Str(_) |
+        TValue::Boolean(_) | TValue::Nil(_) | TValue::LightUserData(_) => {
+            lua_value_to_string(&arg)
+        }
+        _ => format!("{}: 0x0", crate::tm::obj_type_name(&arg)),
+    };
     push_single_result(state, a, nresults, TValue::Str(state.intern_str(&s)));
     Ok(())
 }
@@ -903,6 +994,15 @@ fn call_assert(
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
+    // C 中 luaB_assert 先检查 lua_toboolean(L, 1)，无参数时返回 false 进入 else 分支，
+    // 然后 luaL_checkany(L, 1) 触发 "bad argument #1 (value expected)" 错误
+    if nargs == 0 {
+        let prefix = lua_l_where(state, 1);
+        return Err(VmError::RuntimeError(format!(
+            "{}bad argument #1 to 'assert' (value expected)",
+            prefix
+        )));
+    }
     let args: Vec<TValue> = (0..nargs).map(|i| get_arg(state, a, i)).collect();
     match base_assert(&args) {
         Ok(results) => {
@@ -1293,10 +1393,7 @@ fn call_xpcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
             TValue::Nil(NilKind::Strict)
         };
 
-        // 设置栈: [err_fn | err_msg]
-        state.stack.truncate(a);
-        state.stack.push(err_fn);
-        state.stack.push(err_msg);
+        // (栈设置移到下面的 handler 调用循环中)
 
         // 恢复错误发生时的 call_info 快照 — 对应 C Lua 中 errfunc 在 luaG_errormsg
         // 中被调用，此时 CallInfo 链表仍完整（longjmp 跳过了 callclosemethod 的弹出代码）。
@@ -1311,8 +1408,63 @@ fn call_xpcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         };
 
         // 调用错误处理函数 (1 个参数, MULTRET)
-        let handler_status = state.pcall(1, -1, 0);
-        let handler_nret = state.stack.len().saturating_sub(a);
+        // 对应 C Lua 的 luaG_errormsg 递归调用 errfunc:
+        // C 版本中 errfunc 通过 luaD_callnoyield 调用，nCcalls 递增 1。
+        // errfunc 中的 error() 通过 OP_CALL 调用，nCcalls 不递增（C 的 OP_CALL
+        // 不递增 nCcalls）。所以每次递归 nCcalls 递增 1。
+        // Rust 版本中 OP_CALL 递增 n_ccalls，与 C 版本不同。为了模拟 C 的递归
+        // 行为，用 recursion_count 控制递归次数，设置 n_ccalls = LUAI_MAXCCALLS
+        // 避免 state.pcall 触发栈溢出（对应 C 的 201-219 不触发错误）。
+        // 当 recursion_count >= LUAI_MAXCCALLS 时，手动设置错误值为 "C stack overflow"，
+        // 模拟 C 的 nCcalls = 200 时触发 "C stack overflow"。
+        // 当 recursion_count >= LUAI_MAXCCALLS * 11 / 10 时，返回 "error in error handling"，
+        // 模拟 C 的 nCcalls >= 220 时触发 "error in error handling"。
+        let saved_handler_n_ccalls = state.n_ccalls;
+        let mut current_err = err_msg;
+        let mut handler_status = crate::state::ERR_RUN;
+        let mut recursion_count: u32 = 0;
+        let mut handler_nret = 0;
+
+        loop {
+            // 检查递归次数，模拟 C 的 nCcalls 检查
+            if recursion_count >= crate::state::LUAI_MAXCCALLS * 11 / 10 {
+                // 达到上限 — "error in error handling"
+                break;
+            }
+            if recursion_count >= crate::state::LUAI_MAXCCALLS {
+                // 递归次数达到 200，触发 "C stack overflow"
+                current_err = TValue::Str(state.intern_str("C stack overflow"));
+            }
+
+            // 设置栈: [err_fn | current_err]
+            state.stack.truncate(a);
+            state.stack.push(err_fn.clone());
+            state.stack.push(current_err.clone());
+
+            // 设置 n_ccalls = LUAI_MAXCCALLS，避免 state.pcall 触发栈溢出
+            // 对应 C 中 errfunc 在 luaG_errormsg 中被调用，nCcalls 在 201-219 之间不触发错误
+            state.n_ccalls = crate::state::LUAI_MAXCCALLS;
+
+            handler_status = state.pcall(1, -1, 0);
+            handler_nret = state.stack.len().saturating_sub(a);
+
+            if handler_status == 0 {
+                // handler 成功返回
+                break;
+            }
+
+            // handler 失败 — 获取错误值
+            current_err = if state.stack.len() > a {
+                state.stack[a].clone()
+            } else {
+                TValue::Nil(NilKind::Strict)
+            };
+
+            // 递增 recursion_count，模拟 C 的递归调用 errfunc
+            recursion_count = recursion_count.saturating_add(1);
+        }
+
+        state.n_ccalls = saved_handler_n_ccalls;
 
         // 恢复 call_info 到清理后的状态
         if let Some(orig) = original_call_info {
@@ -1328,9 +1480,7 @@ fn call_xpcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
             }
         } else {
             // 错误处理函数本身出错 — 对应 C 的 luaD_errerr:
-            // 消息处理器失败时,不能再递归调用处理器,直接返回
-            // "error in error handling" 作为最终错误消息。
-            // 这保证 calls.lua:168 的 string.find(msg, "error") 能匹配。
+            // 返回 "error in error handling" 作为最终错误消息。
             results.push(TValue::Str(state.intern_str("error in error handling")));
         }
     }
@@ -2075,7 +2225,7 @@ pub fn call_ipairs_aux(
 
     // 对应 C 的 lua_geti → luaV_finishget: 支持 __index 元方法 (包括非 table 类型的元表)
     // ipairs 可用于非 table 值 (如带 __index 元方法的 userdata), 所以不限定 Table 类型
-    let val = crate::execute::VmExecutor::table_get(state, &t, &TValue::Integer(next_i))?;
+    let val = crate::execute::VmExecutor::table_get(state, &t, &TValue::Integer(next_i), crate::execute::VarSource::None)?;
     if matches!(val, TValue::Nil(_)) {
         push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
     } else {
@@ -2118,7 +2268,11 @@ fn call_collectgarbage(
     let opt = if nargs >= 1 {
         match get_arg(state, a, 0) {
             TValue::Str(s) => s.as_str().to_string(),
-            _ => "collect".to_string(),
+            TValue::Nil(_) => "collect".to_string(),
+            ref other => return Err(VmError::RuntimeError(format!(
+                "bad argument #1 to 'collectgarbage' (string expected, got {})",
+                crate::tm::obj_type_name(other)
+            ))),
         }
     } else {
         "collect".to_string()

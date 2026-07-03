@@ -1159,6 +1159,17 @@ fn call_resume(
         state.allowhook = ctx.saved_allowhook;
     }
 
+    // 递增 n_ccalls 防止协程嵌套过深导致 Rust 栈溢出
+    // (对应 C Lua 的 luaD_resume: L->ci->nCcalls = L->nCcalls + 1)
+    state.n_ccalls = state.n_ccalls.saturating_add(1);
+    if state.n_ccalls >= crate::state::LUAI_MAXCCALLS {
+        state.n_ccalls = saved_n_ccalls;
+        state.n_ny_calls = saved_n_ny_calls;
+        state.force_noyield_close = saved_force_noyield_close;
+        restore_caller_context(state, caller_ctx);
+        return push_resume_error(state, a, nresults, "C stack overflow");
+    }
+
     // 设置 current_thread 和状态
     state.current_thread = Some(co_context.clone());
     co_context.borrow_mut().status = ThreadStatus::Normal;
@@ -1582,7 +1593,7 @@ fn call_yield(
     // 检查是否可 yield（无非可 yield 的 C 函数调用在栈上）
     if state.n_ny_calls > 0 {
         return Err(VmError::RuntimeError(
-            "attempt to yield from a non-yieldable call".to_string(),
+            "attempt to yield across a C-call boundary".to_string(),
         ));
     }
 

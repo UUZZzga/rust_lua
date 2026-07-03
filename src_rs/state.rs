@@ -184,6 +184,9 @@ pub struct LuaState {
     /// 最后一次错误的原始值（保留原始 TValue 类型，如 error(100) 的数字 100）
     /// coroutine.close 需要返回此原始值
     pub last_error_value: Option<TValue>,
+    /// 标记错误消息是否应跳过 source:line 前缀
+    /// error() level=0 或非字符串错误值时为 true，build_traceback 不再添加前缀
+    pub error_no_prefix: bool,
     /// pcall 内部发生 yield 时暂存的 yield 值，供调用者传播
     pub pending_yield: Option<Vec<TValue>>,
     /// 当前正在调用的 C 函数名（用于 traceback）— None 表示不在 C 函数中
@@ -348,6 +351,7 @@ impl LuaState {
             last_traceback: String::new(),
             last_error_msg: String::new(),
             last_error_value: None,
+            error_no_prefix: false,
             pending_yield: None,
             last_c_function: None,
             math_random_state: None,
@@ -518,6 +522,7 @@ impl LuaState {
             last_traceback: String::new(),
             last_error_msg: String::new(),
             last_error_value: None,
+            error_no_prefix: false,
             pending_yield: None,
             last_c_function: None,
             math_random_state: None,
@@ -630,6 +635,7 @@ impl LuaState {
             last_traceback: String::new(),
             last_error_msg: String::new(),
             last_error_value: None,
+            error_no_prefix: false,
             pending_yield: None,
             last_c_function: None,
             math_random_state: None,
@@ -1327,7 +1333,7 @@ impl LuaState {
     }
 
     /// 对应 C 的 getCcalls: 获取 C 调用嵌套数 (低 16 位)
-    fn get_ccalls(&self) -> u32 {
+    pub fn get_ccalls(&self) -> u32 {
         self.n_ccalls & 0xffff
     }
 
@@ -1439,10 +1445,19 @@ impl LuaState {
                 // 抛出可被 pcall 捕获的 "C stack overflow",防止 Rust 原生栈溢出。
                 // 注意: 必须在 execute_loop 之前检查,否则递归仍会无限进行。
                 self.n_ccalls = self.n_ccalls.saturating_add(1);
-                if self.get_ccalls() >= LUAI_MAXCCALLS {
+                let cc = self.get_ccalls();
+                // 对应 C 的 luaE_checkcstack:
+                // cc == LUAI_MAXCCALLS → "C stack overflow"
+                // cc >= LUAI_MAXCCALLS * 11 / 10 → "error in error handling"
+                // cc 在 (MAXCCALLS, MAXCCALLS*1.1) 之间 → 不触发错误（error handler 中的调用）
+                if cc == LUAI_MAXCCALLS || cc >= LUAI_MAXCCALLS * 11 / 10 {
                     self.n_ccalls = self.n_ccalls.saturating_sub(1);
                     self.stack.truncate(func_idx);
-                    self.push_string("C stack overflow");
+                    if cc >= LUAI_MAXCCALLS * 11 / 10 {
+                        self.push_string("error in error handling");
+                    } else {
+                        self.push_string("C stack overflow");
+                    }
                     return ERR_RUN;
                 }
                 // 保存 n_ccalls，用于 error 路径恢复（对应 C Lua 的 longjmp 恢复 ci->nCcalls）
@@ -1468,6 +1483,52 @@ impl LuaState {
                 let saved_closure_upvals = std::mem::take(&mut self.closure_upvals);
                 let saved_tbc_list = self.tbc_list.take();
                 let saved_open_upval = self.open_upval.take();
+
+                // 推入 call_info — 对应 C 的 luaD_precall 创建新 CallInfo
+                // state.pcall 不是通过 OP_CALL 调用的（从 C 函数内部调用），
+                // 不能用 get_func_name 获取函数名（state.pc 指向调用 pcall/xpcall
+                // 的指令而非调用 g 的指令），name/namewhat 设为空。
+                // caller_source/caller_line 从当前 state（调用者的执行上下文）获取。
+                //
+                // 只在调用者是 Lua 函数时推入。当调用者是 C 函数（如 docall 从
+                // 主线程 base 调用时，state.base == 0），不推入——此时 C 调用者帧
+                // 由 build_traceback 末尾追加的 "[C]: in ?" 处理，推入会造成多余帧。
+                // 若调用者已推入相同闭包的条目（如 call_hook 已推入 namewhat="hook"
+                // 的条目），或已推入 namewhat 非空的条目（如 call_tm_res 已推入
+                // namewhat="metamethod" 的条目），跳过以避免覆盖 namewhat。
+                let saved_call_info_len = self.call_info.len();
+                let caller_is_lua = self.base > 0 && self.base <= self.stack.len()
+                    && matches!(&self.stack[self.base - 1], TValue::LClosure(_));
+                let already_has_entry = self.call_info.last().map_or(false, |e| {
+                    e.closure.as_ref().map_or(false, |c| Rc::ptr_eq(&c.proto, &closure.proto))
+                        || (!e.namewhat.is_empty() && !e.is_c)
+                });
+                let pushed_call_info = caller_is_lua && !already_has_entry;
+                if pushed_call_info {
+                    let (caller_source, caller_line) =
+                        if let TValue::LClosure(prev_closure) = &self.stack[self.base - 1] {
+                            let src = prev_closure.proto.source.as_ref()
+                                .map(|s| s.as_str().to_string())
+                                .unwrap_or_else(|| "=?".to_string());
+                            let line = crate::execute::get_proto_line(&prev_closure.proto, self.pc);
+                            (src, line)
+                        } else {
+                            unreachable!()
+                        };
+                    self.call_info.push(crate::state::CallInfoEntry {
+                        source: caller_source,
+                        line: caller_line,
+                        name: String::new(),
+                        is_c: false,
+                        closure: Some(closure.clone()),
+                        base: self.base,
+                        saved_pc: self.pc,
+                        namewhat: String::new(),
+                        proto_flag: self.proto_flag,
+                        nextraargs: self.nextraargs,
+                        is_tailcall: false,
+                    });
+                }
 
                 self.code = closure.proto.code.clone();
                 self.constants = closure.proto.constants.clone();
@@ -1549,8 +1610,6 @@ impl LuaState {
                 // 才 pop call_info（call_stack 为空时不会 pop），且调用者（如 call_hook）
                 // 可能已 push call_info 供 debug.getinfo 使用。
                 let saved_call_stack_frames = std::mem::take(&mut self.call_stack);
-                // 保存 call_info 长度，用于错误时清理残留条目（对应 C 的 L->ci = old_ci）
-                let saved_call_info_len = self.call_info.len();
 
                 let result = VmExecutor::execute_loop(self);
 
@@ -1784,6 +1843,9 @@ impl LuaState {
                                 self.stack.push(TValue::Nil(NilKind::Strict));
                             }
                         }
+                        if pushed_call_info {
+                            self.call_info.pop();
+                        }
                         0
                     }
                     Ok(VmResult::Yield { .. }) => {
@@ -1793,6 +1855,9 @@ impl LuaState {
                     }
                     Ok(_) => {
                         self.stack.truncate(func_idx);
+                        if pushed_call_info {
+                            self.call_info.pop();
+                        }
                         0
                     }
                     Err(_) => {

@@ -506,6 +506,7 @@ mod tests {
             last_close_frame: None,
             close_error_status: None,
             force_noyield_close: false,
+            error_no_prefix: false,
         }
     }
 

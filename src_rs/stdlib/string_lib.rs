@@ -12,7 +12,7 @@ use crate::objects::{LuaType, NilKind, TValue};
 use crate::state::LuaState;
 use crate::table::Table;
 use crate::tm::{Metatable, TagMethod, make_tm_tvalue};
-use crate::execute::VmError;
+use crate::execute::{arg_error, VmError};
 use std::sync::Arc;
 
 // ============================================================================
@@ -1166,7 +1166,8 @@ fn add_value_from_repl(
             }
         }
         // function 替换 — 对应 C 的 LUA_TFUNCTION 分支
-        TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) => {
+        // LightUserData (C 函数标签) 也算 function
+        TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) | TValue::LightUserData(_) => {
             // push_captures(ms, s, e) — 所有捕获作为参数
             let n = if ms.level == 0 { 1 } else { ms.level };
             let mut captures = Vec::with_capacity(n);
@@ -2115,8 +2116,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                         format!("0x{:x}", ptr)
                     }
                     TValue::UserData(u) => {
-                        let ptr = u as *const _ as usize;
-                        format!("0x{:x}", ptr)
+                        format!("0x{:x}", u.gc_header.ptr_id)
                     }
                     TValue::Thread(t) => {
                         let ptr = t as *const _ as usize;
@@ -2789,50 +2789,73 @@ pub fn str_unpack(fmt: &str, data: &[u8], init_pos: i64) -> Result<(Vec<TValue>,
 fn get_str_arg(state: &LuaState, a: usize, idx: usize) -> Result<String, VmError> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.stack.len() {
-        return Err(VmError::RuntimeError(format!(
-            "bad argument #{} (string expected, got no value)",
-            idx + 1
-        )));
+        return Err(arg_error(state, idx + 1, "string expected, got no value"));
     }
     let val = &state.stack[stack_idx];
     match val {
         TValue::Str(s) => Ok(s.as_str().to_string()),
         TValue::Integer(n) => Ok(n.to_string()),
         TValue::Float(f) => Ok(format!("{}", f)),
-        _ => Err(VmError::RuntimeError(format!(
-            "bad argument #{} (string expected, got {})",
+        _ => Err(arg_error(
+            state,
             idx + 1,
-            val.ty()
-        ))),
+            &format!("string expected, got {}", crate::tm::obj_type_name(val)),
+        )),
     }
 }
 
-/// 从栈中读取整数参数
-fn get_int_arg(state: &LuaState, a: usize, idx: usize, default: i64) -> i64 {
+/// 从栈中读取整数参数 (对应 C 的 luaL_checkinteger)
+/// 浮点数必须能精确转为整数，否则报 "number has no integer representation"
+fn get_int_arg(state: &LuaState, a: usize, idx: usize, default: i64, _funcname: &str) -> Result<i64, VmError> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.stack.len() {
-        return default;
+        return Ok(default);
     }
     match &state.stack[stack_idx] {
-        TValue::Integer(n) => *n,
-        TValue::Float(f) => *f as i64,
-        TValue::Str(s) => s.as_str().parse::<i64>().unwrap_or(default),
-        _ => default,
+        TValue::Integer(n) => Ok(*n),
+        TValue::Float(f) => {
+            match crate::vm::float_to_integer(*f, crate::vm::F2IMode::Eq) {
+                Some(i) => Ok(i),
+                None => Err(arg_error(state, idx + 1, "number has no integer representation")),
+            }
+        }
+        TValue::Str(s) => match s.as_str().parse::<i64>() {
+            Ok(i) => Ok(i),
+            Err(_) => Ok(default),
+        },
+        TValue::Nil(_) => Ok(default),
+        _ => Err(arg_error(
+            state,
+            idx + 1,
+            &format!("number expected, got {}", crate::tm::obj_type_name(&state.stack[stack_idx])),
+        )),
     }
 }
 
-/// 从栈中读取可选整数参数
-fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: i64) -> i64 {
+/// 从栈中读取可选整数参数 (对应 C 的 luaL_optinteger)
+fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: i64, _funcname: &str) -> Result<i64, VmError> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.stack.len() {
-        return default;
+        return Ok(default);
     }
     match &state.stack[stack_idx] {
-        TValue::Nil(_) => default,
-        TValue::Integer(n) => *n,
-        TValue::Float(f) => *f as i64,
-        TValue::Str(s) => s.as_str().parse::<i64>().unwrap_or(default),
-        _ => default,
+        TValue::Nil(_) => Ok(default),
+        TValue::Integer(n) => Ok(*n),
+        TValue::Float(f) => {
+            match crate::vm::float_to_integer(*f, crate::vm::F2IMode::Eq) {
+                Some(i) => Ok(i),
+                None => Err(arg_error(state, idx + 1, "number has no integer representation")),
+            }
+        }
+        TValue::Str(s) => match s.as_str().parse::<i64>() {
+            Ok(i) => Ok(i),
+            Err(_) => Ok(default),
+        },
+        _ => Err(arg_error(
+            state,
+            idx + 1,
+            &format!("number expected, got {}", crate::tm::obj_type_name(&state.stack[stack_idx])),
+        )),
     }
 }
 
@@ -3100,8 +3123,8 @@ pub fn call_string_function(
         }
         STR_SUB => {
             let s = get_str_arg(state, a, 0)?;
-            let start = get_int_arg(state, a, 1, 1);
-            let end = get_opt_int_arg(state, a, 2, -1);
+            let start = get_int_arg(state, a, 1, 1, "sub")?;
+            let end = get_opt_int_arg(state, a, 2, -1, "sub")?;
             let result = str_sub(&s, start, end);
             push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&result))]);
             Ok(())
@@ -3114,8 +3137,8 @@ pub fn call_string_function(
         }
         STR_BYTE => {
             let s = get_str_arg(state, a, 0)?;
-            let i = get_opt_int_arg(state, a, 1, 1);
-            let j = get_opt_int_arg(state, a, 2, i);
+            let i = get_opt_int_arg(state, a, 1, 1, "byte")?;
+            let j = get_opt_int_arg(state, a, 2, i, "byte")?;
             let bytes = str_byte(&s, i, j);
             let results: Vec<TValue> = bytes.into_iter().map(TValue::Integer).collect();
             push_results(state, a, nresults, results);
@@ -3124,7 +3147,7 @@ pub fn call_string_function(
         STR_CHAR => {
             let mut codes = Vec::new();
             for idx in 0..nargs {
-                codes.push(get_int_arg(state, a, idx, 0));
+                codes.push(get_int_arg(state, a, idx, 0, "char")?);
             }
             match str_char(&codes) {
                 Ok(result) => {
@@ -3136,7 +3159,7 @@ pub fn call_string_function(
         }
         STR_REP => {
             let s = get_str_arg(state, a, 0)?;
-            let n = get_int_arg(state, a, 1, 0);
+            let n = get_int_arg(state, a, 1, 0, "rep")?;
             let sep = if nargs >= 3 {
                 get_str_arg(state, a, 2).unwrap_or_default()
             } else {
@@ -3153,7 +3176,7 @@ pub fn call_string_function(
         STR_FIND => {
             let s = get_str_arg(state, a, 0)?;
             let pattern = get_str_arg(state, a, 1)?;
-            let init = get_opt_int_arg(state, a, 2, 1);
+            let init = get_opt_int_arg(state, a, 2, 1, "find")?;
             let plain = get_bool_arg(state, a, 3, false);
             match str_find(&s, &pattern, init, plain) {
                 Ok(FindResult::Found { start, end, captures }) => {
@@ -3199,7 +3222,7 @@ pub fn call_string_function(
         STR_MATCH => {
             let s = get_str_arg(state, a, 0)?;
             let pattern = get_str_arg(state, a, 1)?;
-            let init = get_opt_int_arg(state, a, 2, 1);
+            let init = get_opt_int_arg(state, a, 2, 1, "match")?;
             match str_match(&s, &pattern, init) {
                 Ok(results) => {
                     push_results(state, a, nresults, results);
@@ -3211,7 +3234,7 @@ pub fn call_string_function(
         STR_GSUB => {
             let s = get_str_arg(state, a, 0)?;
             let pattern = get_str_arg(state, a, 1)?;
-            let max_s = get_opt_int_arg(state, a, 3, -1);
+            let max_s = get_opt_int_arg(state, a, 3, -1, "gsub")?;
             // 检查 repl 参数类型 — 对应 C 的 tr = lua_type(L, 3)
             let repl_idx = a + 3;
             let repl_val = if repl_idx < state.stack.len() {
@@ -3221,7 +3244,8 @@ pub fn call_string_function(
             };
             match &repl_val {
                 // table 或 function 替换 — 对应 C 的 LUA_TTABLE / LUA_TFUNCTION 分支
-                TValue::Table(_) | TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) => {
+                // LightUserData (C 函数标签) 也算 function (is_function 包含它)
+                TValue::Table(_) | TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) | TValue::LightUserData(_) => {
                     match str_gsub_with_repl(state, &s, &pattern, &repl_val, max_s) {
                         Ok((result, n)) => {
                             push_results(state, a, nresults, vec![
@@ -3260,7 +3284,7 @@ pub fn call_string_function(
             // 状态: {s=string, p=pattern, pos=0, anchor=bool, pat_start=int}
             let s = get_str_arg(state, a, 0)?;
             let p = get_str_arg(state, a, 1)?;
-            let init = get_opt_int_arg(state, a, 2, 1);
+            let init = get_opt_int_arg(state, a, 2, 1, "gmatch")?;
             let len = s.len();
             let init_pos = posrelat_i(init, len).saturating_sub(1);
             let init_pos = if init_pos > len { len } else { init_pos };
@@ -3355,7 +3379,7 @@ pub fn call_string_function(
                     ))),
                 }
             };
-            let pos = get_opt_int_arg(state, a, 2, 1);
+            let pos = get_opt_int_arg(state, a, 2, 1, "unpack")?;
             match str_unpack(&fmt, &data_bytes, pos) {
                 Ok((mut values, next_pos)) => {
                     // 最后一个返回值是下一个位置

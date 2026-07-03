@@ -11,8 +11,8 @@
 
 use crate::objects::{NilKind, TValue};
 use crate::state::LuaState;
-use crate::execute::VmError;
-use crate::tm::{TagMethod, call_order_tm};
+use crate::execute::{arg_error, VmError};
+use crate::tm::{TagMethod, call_order_tm, obj_type_name};
 use crate::vm::VmExecutor;
 
 // ============================================================================
@@ -86,7 +86,7 @@ fn table_len(table: &crate::table::Table) -> i64 {
 /// 如果结果不是整数，报 "object length is not an integer"。
 fn get_obj_len(state: &mut LuaState, obj: &TValue) -> Result<i64, VmError> {
     let tmp_ra = state.stack.len();
-    crate::tm::obj_len(state, tmp_ra, obj)?;
+    crate::tm::obj_len(state, tmp_ra, obj, "")?;
     let result = state.stack.get(tmp_ra).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
     state.stack.truncate(tmp_ra);
     match result {
@@ -107,12 +107,12 @@ fn table_get_int(table: &crate::table::Table, key: i64) -> TValue {
 /// 获取 t[i]，支持 __index 元方法 (对应 C lua_geti → luaV_finishget)
 /// 用于 table 库函数对表元素访问时透明地调用元方法（如 proxy 表）
 fn geti_meta(state: &mut LuaState, table_val: &TValue, i: i64) -> Result<TValue, VmError> {
-    VmExecutor::table_get(state, table_val, &TValue::Integer(i))
+    VmExecutor::table_get(state, table_val, &TValue::Integer(i), crate::execute::VarSource::None)
 }
 
 /// 设置 t[i] = v，支持 __newindex 元方法 (对应 C lua_seti → luaV_finishset)
 fn seti_meta(state: &mut LuaState, table_val: &TValue, i: i64, val: TValue) -> Result<(), VmError> {
-    VmExecutor::table_set(state, table_val, TValue::Integer(i), val)
+    VmExecutor::table_set(state, table_val, TValue::Integer(i), val, crate::execute::VarSource::None)
 }
 
 /// 将结果压入栈并调整栈顶
@@ -535,9 +535,8 @@ fn call_sort(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 
     match &table_val {
         TValue::Table(_) => {},
-        _ => return Err(VmError::RuntimeError(format!(
-            "bad argument #1 to 'sort' (table expected, got {})", table_val.ty()
-        ))),
+        _ => return Err(arg_error(state, 1,
+            &format!("table expected, got {}", obj_type_name(&table_val)))),
     }
 
     let n = get_obj_len(state, &table_val)?;
@@ -736,8 +735,8 @@ fn call_move(
             while i < n {
                 let src_key = TValue::Integer(f.wrapping_add(i));
                 let dst_key = TValue::Integer(t.wrapping_add(i));
-                let val = crate::execute::VmExecutor::table_get(state, &src_val, &src_key)?;
-                crate::execute::VmExecutor::table_set(state, &dst_val, dst_key, val)?;
+                let val = crate::execute::VmExecutor::table_get(state, &src_val, &src_key, crate::execute::VarSource::None)?;
+                crate::execute::VmExecutor::table_set(state, &dst_val, dst_key, val, crate::execute::VarSource::None)?;
                 i += 1;
             }
         } else {
@@ -745,8 +744,8 @@ fn call_move(
             loop {
                 let src_key = TValue::Integer(f.wrapping_add(i));
                 let dst_key = TValue::Integer(t.wrapping_add(i));
-                let val = crate::execute::VmExecutor::table_get(state, &src_val, &src_key)?;
-                crate::execute::VmExecutor::table_set(state, &dst_val, dst_key, val)?;
+                let val = crate::execute::VmExecutor::table_get(state, &src_val, &src_key, crate::execute::VarSource::None)?;
+                crate::execute::VmExecutor::table_set(state, &dst_val, dst_key, val, crate::execute::VarSource::None)?;
                 if i == 0 { break; }
                 i -= 1;
             }
@@ -811,9 +810,11 @@ fn call_comp_function(
     state.n_ny_calls = state.n_ny_calls.saturating_sub(1);
 
     if status != 0 {
-        // 恢复栈
+        // 获取原始错误值并传播 (对应 C 的 lua_call 直接传播错误)
+        let err_val = state.stack.last().cloned()
+            .unwrap_or_else(|| TValue::Nil(NilKind::Strict));
         state.stack.truncate(saved_len);
-        return Err(VmError::RuntimeError("error in comparison function".to_string()));
+        return Err(VmError::RuntimeErrorValue(err_val));
     }
 
     // pcall 后: 栈截断到 saved_len, 推入 1 个结果

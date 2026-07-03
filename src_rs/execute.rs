@@ -18,7 +18,7 @@ use crate::table::Table;
 use crate::tm::{
     TagMethod,
     try_bin_tm, try_bin_assoc_tm, try_bini_tm, try_concat_tm,
-    call_order_tm, equal_obj, obj_len,
+    call_order_tm, equal_obj, obj_len, obj_type_name,
 };
 use crate::vm::{to_number_ns, to_number, to_integer_ns, F2IMode, shiftl, is_false,
     concat_stack, raw_equal, float_to_integer,
@@ -86,24 +86,57 @@ impl std::error::Error for VmError {}
 // ============================================================================
 
 /// 对应 C 的 luaO_chunkid：将源名转换为短源名（从字节切片）
+/// LUA_IDSIZE = 60, 输出最多 59 字符（留 1 个给 '\0'）
 fn short_source_bytes(bytes: &[u8]) -> String {
+    const LUA_IDSIZE: usize = 60;
     if bytes.is_empty() {
         return "?".to_string();
     }
     match bytes[0] {
-        b'=' => String::from_utf8_lossy(&bytes[1..]).into_owned(),
-        b'@' => String::from_utf8_lossy(&bytes[1..]).into_owned(),
-        _ => {
-            let end = bytes
-                .iter()
-                .position(|&b| b == b'\n')
-                .unwrap_or(bytes.len())
-                .min(40);
-            let head = String::from_utf8_lossy(&bytes[..end]);
-            if bytes.len() > 40 || bytes.iter().any(|&b| b == b'\n') {
-                format!("[string \"{}...\"]", head)
+        b'=' => {
+            // literal source: 去掉 '=' 前缀，超过 LUA_IDSIZE-1 则截断
+            let content = &bytes[1..];
+            if content.len() <= LUA_IDSIZE - 1 {
+                String::from_utf8_lossy(content).into_owned()
             } else {
-                format!("[string \"{}\"]", head)
+                String::from_utf8_lossy(&content[..LUA_IDSIZE - 1]).into_owned()
+            }
+        }
+        b'@' => {
+            // file name: 去掉 '@' 前缀
+            // C: srclen 是整个 source 长度（含 '@'），bufflen = LUA_IDSIZE = 60
+            //    if srclen <= bufflen: 显示 content (srclen-1 字符)
+            //    else: "..." + 末尾 (bufflen - LL(RETS) - 1) 字符 = 3 + 56 = 59 字符
+            let content = &bytes[1..];
+            // content.len() = srclen - 1; 条件 srclen <= 60 即 content.len() <= 59
+            if content.len() <= LUA_IDSIZE - 1 {
+                String::from_utf8_lossy(content).into_owned()
+            } else {
+                // "..." + 末尾 56 字符
+                let tail_len = LUA_IDSIZE - 3 - 1; // 56
+                let start = content.len() - tail_len;
+                format!("...{}", String::from_utf8_lossy(&content[start..]))
+            }
+        }
+        _ => {
+            // string: [string "..."] 格式
+            // C: PRE = "[string \"" (9), POS = "\"]" (2), RETS = "..." (3)
+            //    bufflen = LUA_IDSIZE - (9+3+2) - 1 = 45
+            const PRE_LEN: usize = 9;
+            const POS_LEN: usize = 2;
+            const RETS_LEN: usize = 3;
+            let bufflen = LUA_IDSIZE - PRE_LEN - POS_LEN - RETS_LEN - 1; // 45
+
+            let nl_pos = bytes.iter().position(|&b| b == b'\n');
+            let effective_len = nl_pos.unwrap_or(bytes.len());
+
+            if effective_len < bufflen && nl_pos.is_none() {
+                // small one-line source
+                format!("[string \"{}\"]", String::from_utf8_lossy(&bytes[..effective_len]))
+            } else {
+                // truncate: source 前 n 字符 + "..."
+                let n = effective_len.min(bufflen);
+                format!("[string \"{}...\"]", String::from_utf8_lossy(&bytes[..n]))
             }
         }
     }
@@ -118,7 +151,7 @@ fn short_source(source: &crate::strings::LuaString) -> String {
 ///
 /// 逻辑:
 /// 1. 若 namewhat 非空: `"{namewhat} '{name}'"` (如 "global 'foo'", "method 'bar'")
-/// 2. 若是 main chunk: "main chunk"
+/// 2. 若是 main chunk (is_main 或 line_defined == 0): "main chunk"
 /// 3. 若有闭包信息 (Lua 函数): "function '<src>:<linedefined>'"
 /// 4. 否则: "?"
 fn format_func_name(namewhat: &str, name: &str, is_main: bool, closure: Option<&LClosure>) -> String {
@@ -127,17 +160,21 @@ fn format_func_name(namewhat: &str, name: &str, is_main: bool, closure: Option<&
     } else if is_main {
         "main chunk".to_string()
     } else if let Some(c) = closure {
-        let src = c.proto.source.as_ref()
-            .map(|s| short_source(s))
-            .unwrap_or_else(|| "?".to_string());
-        format!("function <{}:{}>", src, c.proto.line_defined)
+        if c.proto.line_defined == 0 {
+            "main chunk".to_string()
+        } else {
+            let src = c.proto.source.as_ref()
+                .map(|s| short_source(s))
+                .unwrap_or_else(|| "?".to_string());
+            format!("function <{}:{}>", src, c.proto.line_defined)
+        }
     } else {
         "?".to_string()
     }
 }
 
 /// 对应 C 的 luaG_getfuncline：从 Proto 的 line_info/abs_line_info 计算 pc 所在行号
-fn get_proto_line(proto: &Proto, pc: usize) -> i32 {
+pub fn get_proto_line(proto: &Proto, pc: usize) -> i32 {
     if proto.line_info.is_empty() || pc >= proto.line_info.len() {
         return -1;
     }
@@ -168,7 +205,7 @@ fn get_proto_line(proto: &Proto, pc: usize) -> i32 {
 /// 逻辑:
 /// 1. 获取 OP_CALL 指令的操作数 A（函数寄存器）
 /// 2. 调用 get_obj_name 查找寄存器 A 的值是如何被设置的
-fn get_func_name(state: &LuaState, call_pc: usize) -> (String, String) {
+pub fn get_func_name(state: &LuaState, call_pc: usize) -> (String, String) {
     if call_pc >= state.code.len() {
         return (String::new(), String::new());
     }
@@ -181,11 +218,177 @@ fn get_func_name(state: &LuaState, call_pc: usize) -> (String, String) {
         _ => return (String::new(), String::new()),
     };
 
-    // 获取 OP_CALL 指令的操作数 A（函数寄存器）
     let call_inst = state.code[call_pc];
+    let opcode = opcodes::get_opcode(call_inst);
+
+    // 对应 C 的 funcnamefromcode: OP_TFORCALL 返回 "for iterator"
+    if opcode == OpCode::TFORCALL {
+        return ("for iterator".to_string(), "for iterator".to_string());
+    }
+
+    // 获取 OP_CALL 指令的操作数 A（函数寄存器）
     let func_reg = opcodes::getarg_a(call_inst) as usize;
 
     get_obj_name(proto, call_pc, func_reg)
+}
+
+/// 在 loaded 表中递归查找函数的全限定名 (对应 C 的 pushglobalfuncname + findfield)
+///
+/// 核心逻辑:
+/// 1. 获取当前函数 (从 call_info.last().base - 1)
+/// 2. 获取 loaded 表 (package.loaded)
+/// 3. 在 loaded 表中递归查找函数 (2 层深度)
+/// 4. 去掉 "_G." 前缀
+pub fn push_global_func_name(state: &LuaState) -> Option<String> {
+    // 获取当前函数
+    let func_val = state.call_info.last().and_then(|ci| {
+        if ci.base > 0 {
+            state.stack.get(ci.base - 1).cloned()
+        } else {
+            None
+        }
+    })?;
+
+    // 获取 loaded 表
+    let package_key = TValue::Str(state.intern_str("package"));
+    let loaded_key = TValue::Str(state.intern_str("loaded"));
+    let loaded_table = state.globals.get(&package_key)
+        .and_then(|pkg| if let TValue::Table(t) = pkg { Some(t) } else { None })
+        .and_then(|t| t.get(&loaded_key))
+        .and_then(|v| if let TValue::Table(t) = v { Some(t) } else { None })?;
+
+    // 在 loaded 表中递归查找 func_val
+    let name = find_field(&loaded_table, &func_val, 2)?;
+
+    // 去掉 "_G." 前缀 (对应 C 的 strncmp(name, LUA_GNAME ".", 3))
+    if let Some(stripped) = name.strip_prefix("_G.") {
+        Some(stripped.to_string())
+    } else {
+        Some(name)
+    }
+}
+
+/// 在表中递归查找对象 (对应 C 的 findfield)
+/// level = 递归深度 (2 表示查找 2 层)
+fn find_field(table: &Table, obj: &TValue, level: usize) -> Option<String> {
+    if level == 0 {
+        return None;
+    }
+    let mut prev_key: Option<TValue> = None;
+    loop {
+        match table.next(prev_key.as_ref()) {
+            Some((key, val)) => {
+                if let TValue::Str(k) = &key {
+                    if val == *obj {
+                        return Some(k.as_str().to_string());
+                    }
+                    if let TValue::Table(t) = &val {
+                        if let Some(name) = find_field(t, obj, level - 1) {
+                            return Some(format!("{}.{}", k, name));
+                        }
+                    }
+                }
+                prev_key = Some(key);
+            }
+            None => break,
+        }
+    }
+    None
+}
+
+/// 生成参数错误消息 (对应 C 的 luaL_argerror)
+///
+/// 核心逻辑:
+/// 1. 通过 call_info 获取调用者帧,分析调用方式 (name, namewhat)
+/// 2. 若调用者是 C 函数 (无法分析代码),调用 push_global_func_name 查找全局函数名
+/// 3. 若 namewhat == "method" (SELF 语法):
+///    - arg == 1: self 参数错误, 返回 "calling 'X' on bad self (msg)"
+///    - arg > 1: 普通参数错误, arg 减去 self, 返回 "bad argument #{arg-1} to 'X' (msg)"
+/// 4. 否则返回 "bad argument #{arg} to 'X' (msg)"
+pub fn arg_error(state: &LuaState, arg: usize, msg: &str) -> VmError {
+    let (name, namewhat) = get_current_func_name(state);
+    let func_name = if !name.is_empty() {
+        name
+    } else {
+        push_global_func_name(state).unwrap_or_else(|| "?".to_string())
+    };
+    if namewhat == "method" {
+        if arg == 1 {
+            return VmError::RuntimeError(format!(
+                "calling '{}' on bad self ({})", func_name, msg
+            ));
+        }
+        let real_arg = arg - 1;
+        return VmError::RuntimeError(format!(
+            "bad argument #{} to '{}' ({})", real_arg, func_name, msg
+        ));
+    }
+    VmError::RuntimeError(format!(
+        "bad argument #{} to '{}' ({})", arg, func_name, msg
+    ))
+}
+
+/// 通过 call_info 获取当前函数的调用方式 (对应 C 的 getfuncname -> funcnamefromcall)
+///
+/// 核心逻辑:
+/// 1. 当前帧 = call_info[last] (C 函数帧), 其 saved_pc 是调用者帧中 OP_CALL 指令的 PC
+/// 2. 调用者帧 = call_info[last-1]
+/// 3. 若调用者是 Lua 函数,用当前帧的 saved_pc 分析调用指令获取 (name, namewhat)
+/// 4. 若调用者是 C 函数,返回空 (无法分析代码)
+fn get_current_func_name(state: &LuaState) -> (String, String) {
+    let ci_len = state.call_info.len();
+    if ci_len < 2 {
+        // call_info 不足 2 层,回退到 get_func_name
+        return get_func_name(state, state.pc);
+    }
+    let current_ci = &state.call_info[ci_len - 1];
+    let caller_ci = &state.call_info[ci_len - 2];
+    if !caller_ci.is_c {
+        if let Some(closure) = &caller_ci.closure {
+            let proto = &closure.proto;
+            // 用当前帧的 saved_pc (调用者帧中调用当前 C 函数的 OP_CALL 指令的 PC)
+            let call_pc = current_ci.saved_pc;
+            if call_pc < proto.code.len() {
+                let call_inst = proto.code[call_pc];
+                let func_reg = opcodes::getarg_a(call_inst) as usize;
+                return get_obj_name(proto, call_pc, func_reg);
+            }
+        }
+    } else {
+        // 调用者是 C 函数。state.pcall 的 LClosure 分支不 push call_info,
+        // 导致 call_info 缺少中间 Lua 帧（如 pcall 内部调用的 chunk）。
+        // 此时 state.code/state.pc 对应该 Lua 帧的代码。
+        // 检查 state.pc 处的 OP_CALL 调用的函数寄存器是否等于当前 C 函数位置,
+        // 若是则说明 state.code 对应当前 C 函数的调用者,可用 get_obj_name 分析。
+        if state.pc < state.code.len() && state.base > 0 && state.base <= state.stack.len() {
+            let call_inst = state.code[state.pc];
+            let op = opcodes::get_opcode(call_inst);
+            if op == OpCode::CALL || op == OpCode::TAILCALL {
+                let func_reg = opcodes::getarg_a(call_inst) as usize;
+                // func_reg 是寄存器编号,对应的栈索引是 state.base + func_reg
+                // current_ci.base - 1 是当前 C 函数的栈索引
+                if state.base + func_reg == current_ci.base - 1 {
+                    if let TValue::LClosure(c) = &state.stack[state.base - 1] {
+                        let proto = &c.proto;
+                        return get_obj_name(proto, state.pc, func_reg);
+                    }
+                }
+            }
+        }
+    }
+    (String::new(), String::new())
+}
+
+/// 生成 "attempt to call a {type} value" 错误消息，附加变量名信息
+/// 对应 C 的 luaG_callerror: typeerror(L, o, "call", extra)
+/// extra = funcnamefromcall 找到名字时为 " (kind 'name')"，否则为 varinfo 结果
+fn call_error_message(state: &LuaState, type_name: &str) -> String {
+    let (name, namewhat) = get_func_name(state, state.pc);
+    if !namewhat.is_empty() && !name.is_empty() {
+        format!("attempt to call a {} value ({} '{}')", type_name, namewhat, name)
+    } else {
+        format!("attempt to call a {} value", type_name)
+    }
 }
 
 /// 查找设置指定寄存器的指令
@@ -259,9 +462,64 @@ fn get_local_name_at(proto: &Proto, reg: usize, pc: usize) -> Option<String> {
     None
 }
 
-/// 获取寄存器值的 name 和 namewhat
-/// 对应 C 的 getobjname + basicgetobjname
-fn get_obj_name(proto: &Proto, pc: usize, reg: usize) -> (String, String) {
+/// 获取常量的名字 — 对应 C 的 kname
+///
+/// C 实现:
+/// ```c
+/// static const char *kname (const Proto *p, int index, const char **name) {
+///   TValue *kvalue = &p->k[index];
+///   if (ttisstring(kvalue)) {
+///     *name = getstr(tsvalue(kvalue));
+///     return "constant";
+///   }
+///   else {
+///     *name = "?";
+///     return NULL;
+///   }
+/// }
+/// ```
+///
+/// 返回 (name, kind):
+/// - 字符串常量: (字符串, "constant")
+/// - 非字符串常量或越界: ("?", "")
+fn kname(proto: &Proto, index: usize) -> (String, String) {
+    if index < proto.constants.len() {
+        match &proto.constants[index] {
+            TValue::Str(s) => (s.as_str().to_string(), "constant".to_string()),
+            _ => ("?".to_string(), String::new()),
+        }
+    } else {
+        ("?".to_string(), String::new())
+    }
+}
+
+/// 查找寄存器对应的常量名 — 对应 C 的 rname
+///
+/// C 实现:
+/// ```c
+/// static void rname (const Proto *p, int pc, int c, const char **name) {
+///   const char *what = basicgetobjname(p, &pc, c, name);
+///   if (!(what && *what == 'c'))  /* did not find a constant name? */
+///     *name = "?";
+/// }
+/// ```
+///
+/// 用于 GETTABLE 指令: key 在寄存器 C 中，需查找该寄存器的来源。
+/// 如果来源是 LOADK (常量)，返回常量名；否则返回 "?"。
+fn rname(proto: &Proto, pc: usize, reg: usize) -> String {
+    let (name, kind) = basic_get_obj_name(proto, pc, reg);
+    if kind == "constant" {
+        name
+    } else {
+        "?".to_string()
+    }
+}
+
+/// 基本名称查找 — 对应 C 的 basicgetobjname
+///
+/// 只处理局部变量、MOVE、GETUPVAL、LOADK、LOADKX。
+/// 不处理表访问指令 (GETTABUP/GETTABLE/GETFIELD 等)，那些由 get_obj_name 扩展处理。
+fn basic_get_obj_name(proto: &Proto, pc: usize, reg: usize) -> (String, String) {
     // 先查找局部变量
     if let Some(name) = get_local_name_at(proto, reg, pc) {
         return (name, "local".to_string());
@@ -282,7 +540,7 @@ fn get_obj_name(proto: &Proto, pc: usize, reg: usize) -> (String, String) {
             let b = opcodes::getarg_b(set_inst) as usize;
             if b < reg {
                 // 递归查找 B 的 name
-                return get_obj_name(proto, set_pc, b);
+                return basic_get_obj_name(proto, set_pc, b);
             }
             (String::new(), String::new())
         }
@@ -296,18 +554,50 @@ fn get_obj_name(proto: &Proto, pc: usize, reg: usize) -> (String, String) {
             }
             (String::new(), String::new())
         }
+        OpCode::LOADK => {
+            // LOADK A Bx: R[A] := K[Bx]
+            let bx = opcodes::getarg_bx(set_inst) as usize;
+            kname(proto, bx)
+        }
+        OpCode::LOADKX => {
+            // LOADKX A: R[A] := K[EXTRAARG]
+            // 下一条指令是 EXTRAARG，存储 Ax 格式的常量索引
+            if set_pc + 1 < proto.code.len() {
+                let extra = proto.code[set_pc + 1];
+                let ax = opcodes::getarg_a(extra) as usize;
+                kname(proto, ax)
+            } else {
+                ("?".to_string(), String::new())
+            }
+        }
+        _ => (String::new(), String::new()),
+    }
+}
+
+/// 获取寄存器值的 name 和 namewhat
+/// 对应 C 的 getobjname (扩展 basicgetobjname 处理表访问)
+fn get_obj_name(proto: &Proto, pc: usize, reg: usize) -> (String, String) {
+    // 先调用 basic_get_obj_name 处理局部变量/MOVE/GETUPVAL/LOADK/LOADKX
+    let (name, kind) = basic_get_obj_name(proto, pc, reg);
+    if !kind.is_empty() {
+        return (name, kind);
+    }
+
+    // basic_get_obj_name 未找到，重新查找 set_pc 处理表访问指令
+    let set_pc = find_set_reg(proto, pc, reg);
+    if set_pc < 0 || set_pc as usize >= proto.code.len() {
+        return (String::new(), String::new());
+    }
+    let set_pc = set_pc as usize;
+    let set_inst = proto.code[set_pc];
+    let set_op = opcodes::get_opcode(set_inst);
+
+    match set_op {
         OpCode::GETTABUP => {
             // GETTABUP A B C: R[A] := Upval[B][K[C]]
             let c = opcodes::getarg_c(set_inst) as usize;
             let b = opcodes::getarg_b(set_inst) as usize;
-            let name = if c < proto.constants.len() {
-                match &proto.constants[c] {
-                    TValue::Str(s) => s.as_str().to_string(),
-                    _ => "?".to_string(),
-                }
-            } else {
-                "?".to_string()
-            };
+            let name = kname(proto, c).0;
             // 检查上值是否是 _ENV
             let is_env = b < proto.upvalues.len()
                 && proto.upvalues[b].name.as_ref().map(|s| s.as_str()) == Some("_ENV");
@@ -318,14 +608,7 @@ fn get_obj_name(proto: &Proto, pc: usize, reg: usize) -> (String, String) {
             // GETFIELD A B C: R[A] := R[B][K[C]]
             let c = opcodes::getarg_c(set_inst) as usize;
             let b = opcodes::getarg_b(set_inst) as usize;
-            let name = if c < proto.constants.len() {
-                match &proto.constants[c] {
-                    TValue::Str(s) => s.as_str().to_string(),
-                    _ => "?".to_string(),
-                }
-            } else {
-                "?".to_string()
-            };
+            let name = kname(proto, c).0;
             // 检查表寄存器 B 是否是 _ENV
             let is_env = is_env_register(proto, set_pc, b);
             let namewhat = if is_env { "global" } else { "field" };
@@ -334,10 +617,13 @@ fn get_obj_name(proto: &Proto, pc: usize, reg: usize) -> (String, String) {
         OpCode::GETTABLE => {
             // GETTABLE A B C: R[A] := R[B][R[C]]
             let b = opcodes::getarg_b(set_inst) as usize;
+            let c = opcodes::getarg_c(set_inst) as usize;
             // 检查表寄存器 B 是否是 _ENV
             let is_env = is_env_register(proto, set_pc, b);
             let namewhat = if is_env { "global" } else { "field" };
-            ("?".to_string(), namewhat.to_string())
+            // key 在寄存器 C 中，调用 rname 查找 key 的来源
+            let name = rname(proto, set_pc, c);
+            (name, namewhat.to_string())
         }
         OpCode::GETI => {
             // GETI A B C: R[A] := R[B][R[C]]
@@ -346,14 +632,7 @@ fn get_obj_name(proto: &Proto, pc: usize, reg: usize) -> (String, String) {
         OpCode::SELF => {
             // SELF A B C: A+1 := B; A := B[K[C]]
             let c = opcodes::getarg_c(set_inst) as usize;
-            let name = if c < proto.constants.len() {
-                match &proto.constants[c] {
-                    TValue::Str(s) => s.as_str().to_string(),
-                    _ => "?".to_string(),
-                }
-            } else {
-                "?".to_string()
-            };
+            let name = kname(proto, c).0;
             (name, "method".to_string())
         }
         _ => (String::new(), String::new()),
@@ -361,26 +640,33 @@ fn get_obj_name(proto: &Proto, pc: usize, reg: usize) -> (String, String) {
 }
 
 /// 检查寄存器 reg 是否是 _ENV（局部变量或上值）
-/// 对应 C 的 isEnv
+/// 对应 C 的 isEnv (isup == 0 的寄存器情况)
+///
+/// C 实现:
+/// ```c
+/// static const char *isEnv (const Proto *p, int pc, Instruction i, int isup) {
+///   int t = GETARG_B(i);
+///   const char *name;
+///   if (isup)
+///     name = upvalname(p, t);
+///   else {
+///     const char *what = basicgetobjname(p, &pc, t, &name);
+///     if (what != strlocal && what != strupval)
+///       name = NULL;
+///   }
+///   return (name && strcmp(name, LUA_ENV) == 0) ? "global" : "field";
+/// }
+/// ```
+///
+/// 使用 basic_get_obj_name 查找表寄存器的来源，
+/// 只有 local 或 upvalue 来源才可能是 _ENV。
 fn is_env_register(proto: &Proto, pc: usize, reg: usize) -> bool {
-    // 先查找局部变量
-    if let Some(name) = get_local_name_at(proto, reg, pc) {
-        return name == "_ENV";
-    }
-    // 查找设置 reg 的指令
-    let set_pc = find_set_reg(proto, pc, reg);
-    if set_pc < 0 || set_pc as usize >= proto.code.len() {
-        return false;
-    }
-    let set_inst = proto.code[set_pc as usize];
-    let set_op = opcodes::get_opcode(set_inst);
-    match set_op {
-        OpCode::GETUPVAL => {
-            let b = opcodes::getarg_b(set_inst) as usize;
-            b < proto.upvalues.len()
-                && proto.upvalues[b].name.as_ref().map(|s| s.as_str()) == Some("_ENV")
-        }
-        _ => false,
+    let (name, kind) = basic_get_obj_name(proto, pc, reg);
+    // C: if (what != strlocal && what != strupval) name = NULL;
+    if kind == "local" || kind == "upvalue" {
+        name == "_ENV"
+    } else {
+        false
     }
 }
 
@@ -419,6 +705,40 @@ fn varinfo_str(state: &LuaState, reg: usize) -> String {
         String::new()
     } else {
         format!(" ({} '{}')", kind, name)
+    }
+}
+
+/// 变量来源：用于索引错误时附加变量名信息
+pub enum VarSource {
+    /// 寄存器号（相对于 base，0-based）
+    Reg(usize),
+    /// 上值索引
+    Upval(usize),
+    /// 无来源信息
+    None,
+}
+
+/// 生成索引错误的变量信息字符串
+/// 对应 C 的 varinfo(L, o): 通过寄存器号或上值索引获取变量信息
+fn index_varinfo(state: &LuaState, source: VarSource) -> String {
+    match source {
+        VarSource::Reg(reg) => varinfo_str(state, reg),
+        VarSource::Upval(idx) => {
+            if state.base == 0 || state.base > state.stack.len() {
+                return String::new();
+            }
+            let proto = match &state.stack[state.base - 1] {
+                TValue::LClosure(c) => &c.proto,
+                _ => return String::new(),
+            };
+            if idx < proto.upvalues.len() {
+                if let Some(ref name) = proto.upvalues[idx].name {
+                    return format!(" (upvalue '{}')", name.as_str());
+                }
+            }
+            String::new()
+        }
+        VarSource::None => String::new(),
     }
 }
 
@@ -889,9 +1209,59 @@ impl VmExecutor {
                             }
                             Err(e) => Err(e),
                         }
-                    } else {
+                    } else if let TValue::CClosure(cc) = &func_val {
+                        let nresults = (c + 1) as i32;
+                        state.call_stack.push(CallFrame {
+                            code: std::mem::take(&mut state.code),
+                            constants: std::mem::take(&mut state.constants),
+                            upval_descs: std::mem::take(&mut state.upval_descs),
+                            protos: std::mem::take(&mut state.protos),
+                            base: state.base,
+                            return_pc: state.pc + 1,
+                            return_base: ra + 3,
+                            num_results: nresults,
+                            num_params: state.num_params,
+                            is_vararg: state.is_vararg,
+                            proto_flag: state.proto_flag,
+                            nextraargs: state.nextraargs,
+                            closure_upvals: std::mem::take(&mut state.closure_upvals),
+                            tbc_list: state.tbc_list.take(),
+                            open_upval: state.open_upval.take(),
+                        });
+                        state.base = ra + 4;
+                        Self::call_c_function(state, ra + 3, 2, nresults, cc.f)?;
+                        state.finish_pending_adjust();
                         state.pc += 1;
                         Ok(())
+                    } else if let TValue::LCFn(lcf) = &func_val {
+                        let nresults = (c + 1) as i32;
+                        state.call_stack.push(CallFrame {
+                            code: std::mem::take(&mut state.code),
+                            constants: std::mem::take(&mut state.constants),
+                            upval_descs: std::mem::take(&mut state.upval_descs),
+                            protos: std::mem::take(&mut state.protos),
+                            base: state.base,
+                            return_pc: state.pc + 1,
+                            return_base: ra + 3,
+                            num_results: nresults,
+                            num_params: state.num_params,
+                            is_vararg: state.is_vararg,
+                            proto_flag: state.proto_flag,
+                            nextraargs: state.nextraargs,
+                            closure_upvals: std::mem::take(&mut state.closure_upvals),
+                            tbc_list: state.tbc_list.take(),
+                            open_upval: state.open_upval.take(),
+                        });
+                        state.base = ra + 4;
+                        Self::call_c_function(state, ra + 3, 2, nresults, lcf.func)?;
+                        state.finish_pending_adjust();
+                        state.pc += 1;
+                        Ok(())
+                    } else {
+                        // 非可调用对象: 抛出 "attempt to call a {type} value" 错误
+                        // 对应 C 的 luaG_callerror
+                        let type_name = state.typename(func_val.ty());
+                        Err(VmError::RuntimeError(call_error_message(state, &type_name)))
                     }
                 }
                 OpCode::TFORLOOP => Self::op_tforloop(state, inst),
@@ -1161,18 +1531,21 @@ impl VmExecutor {
         let mut trace = String::from("stack traceback:");
 
         // 获取当前帧的源、行号和闭包
-        let (cur_source, cur_line, cur_closure) = if state.base > 0 && state.base <= state.stack.len() {
+        // has_no_debug_info: 对应 C 的 luaG_addinfo 中 src == NULL 的情况
+        //   (string.dump(f, true) 去除调试信息后 source 为 None)
+        let (cur_source, cur_line, cur_closure, has_no_debug_info) = if state.base > 0 && state.base <= state.stack.len() {
             if let TValue::LClosure(closure) = &state.stack[state.base - 1].clone() {
+                let no_debug = closure.proto.source.is_none();
                 let src = closure.proto.source.as_ref()
                     .map(|s| short_source(s))
                     .unwrap_or_else(|| "?".to_string());
                 let ln = get_proto_line(&closure.proto, state.pc);
-                (src, ln, Some(closure.clone()))
+                (src, ln, Some(closure.clone()), no_debug)
             } else {
-                ("?".to_string(), -1, None)
+                ("?".to_string(), -1, None, false)
             }
         } else {
-            ("?".to_string(), -1, None)
+            ("?".to_string(), -1, None, false)
         };
 
         let ci = &state.call_info;
@@ -1256,12 +1629,25 @@ impl VmExecutor {
         };
         // 只在错误消息尚未包含 source:line 前缀时添加
         // (error()/assert() 等 C 函数已经通过 luaL_where 添加了前缀)
-        let prefix = if cur_line > 0 && !has_source_line_prefix(&error_msg) {
-            format!("{}:{}: ", cur_source, cur_line)
+        // error_no_prefix: error() level=0 或非字符串错误值时，显式不加前缀
+        // 对应 C 的 luaG_addinfo:
+        //   - src == NULL (无调试信息): 添加 "?:?: " 前缀
+        //   - src != NULL: 添加 "source:line: " 前缀 (line > 0 时)
+        let prefix = if !state.error_no_prefix
+            && !has_source_line_prefix(&error_msg)
+            && (has_no_debug_info || cur_line > 0)
+        {
+            if has_no_debug_info {
+                "?:?: ".to_string()
+            } else {
+                format!("{}:{}: ", cur_source, cur_line)
+            }
         } else {
             String::new()
         };
         state.last_error_msg = format!("{}{}", prefix, error_msg);
+        // 重置标志，避免影响后续错误
+        state.error_no_prefix = false;
         // 末尾追加 C 层调用者帧 — 对应 C Lua 中调用主块的 C 函数
         // (如 pcall/docall)，该帧无名称，显示为 [C]: in ?
         trace.push_str("\n\t[C]: in ?");
@@ -2153,7 +2539,7 @@ impl VmExecutor {
         } else {
             TValue::Nil(NilKind::Strict)
         };
-        let result = Self::table_get(state, &upval_val, &key)?;
+        let result = Self::table_get(state, &upval_val, &key, VarSource::Upval(b))?;
         Self::write_stack(state, a, result);
         state.pc += 1;
         Ok(())
@@ -2165,7 +2551,7 @@ impl VmExecutor {
         let c = Self::rc(state, inst);
         let table_val = Self::read_stack(state, b).clone();
         let key = Self::read_stack(state, c).clone();
-        let result = Self::table_get(state, &table_val, &key)?;
+        let result = Self::table_get(state, &table_val, &key, VarSource::Reg(opcodes::getarg_b(inst) as usize))?;
         Self::write_stack(state, a, result);
         state.pc += 1;
         Ok(())
@@ -2177,7 +2563,7 @@ impl VmExecutor {
         let c = opcodes::getarg_c(inst) as i64;
         let table_val = Self::read_stack(state, b).clone();
         let key = TValue::Integer(c);
-        let result = Self::table_get(state, &table_val, &key)?;
+        let result = Self::table_get(state, &table_val, &key, VarSource::Reg(opcodes::getarg_b(inst) as usize))?;
         Self::write_stack(state, a, result);
         state.pc += 1;
         Ok(())
@@ -2189,7 +2575,7 @@ impl VmExecutor {
         let c_key = opcodes::getarg_c(inst) as usize;
         let table_val = Self::read_stack(state, b).clone();
         let key = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
-        let result = Self::table_get(state, &table_val, &key)?;
+        let result = Self::table_get(state, &table_val, &key, VarSource::Reg(opcodes::getarg_b(inst) as usize))?;
         Self::write_stack(state, a, result);
         state.pc += 1;
         Ok(())
@@ -2212,7 +2598,7 @@ impl VmExecutor {
         };
         // table_set 通过 Rc<RefCell<TableData>> 的内部可变性修改表，
         // 不需要写回 upval_val
-        Self::table_set(state, &upval_val, key, val)?;
+        Self::table_set(state, &upval_val, key, val, VarSource::Upval(a))?;
         state.pc += 1;
         Ok(())
     }
@@ -2224,7 +2610,7 @@ impl VmExecutor {
         let table_val = Self::read_stack(state, a).clone();
         let key = Self::read_stack(state, b).clone();
         let val = Self::resolve_val(state, inst, c);
-        Self::table_set(state, &table_val, key, val)?;
+        Self::table_set(state, &table_val, key, val, VarSource::Reg(opcodes::getarg_a(inst) as usize))?;
         state.pc += 1;
         Ok(())
     }
@@ -2235,7 +2621,7 @@ impl VmExecutor {
         let c = opcodes::getarg_c(inst);
         let table_val = Self::read_stack(state, a).clone();
         let val = Self::resolve_val(state, inst, c);
-        Self::table_set(state, &table_val, TValue::Integer(b), val)?;
+        Self::table_set(state, &table_val, TValue::Integer(b), val, VarSource::Reg(opcodes::getarg_a(inst) as usize))?;
         state.pc += 1;
         Ok(())
     }
@@ -2247,7 +2633,7 @@ impl VmExecutor {
         let table_val = Self::read_stack(state, a).clone();
         let key = state.constants.get(b_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
         let val = Self::resolve_val(state, inst, c);
-        Self::table_set(state, &table_val, key, val)?;
+        Self::table_set(state, &table_val, key, val, VarSource::Reg(opcodes::getarg_a(inst) as usize))?;
         state.pc += 1;
         Ok(())
     }
@@ -2280,7 +2666,7 @@ impl VmExecutor {
             .cloned().unwrap_or(TValue::Nil(NilKind::Strict));
         let obj = Self::read_stack(state, b).clone();
         Self::write_stack(state, a + 1, obj.clone());
-        let result = Self::table_get(state, &obj, &key)?;
+        let result = Self::table_get(state, &obj, &key, VarSource::Reg(opcodes::getarg_b(inst) as usize))?;
         Self::write_stack(state, a, result);
         state.pc += 1;
         Ok(())
@@ -2769,9 +3155,8 @@ impl VmExecutor {
             TValue::Integer(i) => Self::write_stack(state, a, TValue::Integer(i.wrapping_neg())),
             TValue::Float(f) => Self::write_stack(state, a, TValue::Float(-f)),
             _ => {
-                // result = ra (与 C 一致)
-                // UNM 不是位运算，走 opinterror，不需要变量信息
-                try_bin_tm(state, &v, &v, a, TagMethod::Unm, String::new(), String::new())?;
+                let info = varinfo_str(state, opcodes::getarg_b(inst) as usize);
+                try_bin_tm(state, &v, &v, a, TagMethod::Unm, info.clone(), info)?;
             }
         }
         state.pc += 1;
@@ -2811,7 +3196,8 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v = Self::read_stack(state, b).clone();
-        obj_len(state, a, &v)?;
+        let info = varinfo_str(state, opcodes::getarg_b(inst) as usize);
+        obj_len(state, a, &v, &info)?;
         state.pc += 1;
         Ok(())
     }
@@ -3167,7 +3553,7 @@ impl VmExecutor {
                     continue;  // 对应 C 的 goto retry
                 }
                 let type_name = state.typename(func_val.ty());
-                return Err(VmError::RuntimeError(format!("attempt to call a {} value", type_name)));
+                return Err(VmError::RuntimeError(call_error_message(state, &type_name)));
             }
             break;
         }
@@ -3205,9 +3591,19 @@ impl VmExecutor {
                 // 每次 Lua 闭包调用递增 n_ccalls,达到 LUAI_MAXCCALLS(200) 时
                 // 抛出 "C stack overflow",防止无限递归导致内存耗尽。
                 state.n_ccalls = state.n_ccalls.saturating_add(1);
-                if state.n_ccalls >= LUAI_MAXCCALLS {
+                let cc = state.get_ccalls();
+                // 对应 C 的 luaE_checkcstack:
+                // cc == LUAI_MAXCCALLS → "C stack overflow"
+                // cc >= LUAI_MAXCCALLS * 11 / 10 → "error in error handling"
+                // cc 在 (MAXCCALLS, MAXCCALLS*1.1) 之间 → 不触发错误（error handler 中的调用）
+                if cc == LUAI_MAXCCALLS || cc >= LUAI_MAXCCALLS * 11 / 10 {
                     state.n_ccalls = state.n_ccalls.saturating_sub(1);
-                    return Err(VmError::RuntimeError("C stack overflow".to_string()));
+                    let msg = if cc >= LUAI_MAXCCALLS * 11 / 10 {
+                        "error in error handling"
+                    } else {
+                        "C stack overflow"
+                    };
+                    return Err(VmError::RuntimeError(msg.to_string()));
                 }
 
                 state.call_stack.push(CallFrame {
@@ -3484,7 +3880,7 @@ impl VmExecutor {
                 // 非可调用对象: 抛出 "attempt to call a {type} value" 错误
                 // 对应 C 的 luaG_callerror
                 let type_name = state.typename(other.ty());
-                Err(VmError::RuntimeError(format!("attempt to call a {} value", type_name)))
+                Err(VmError::RuntimeError(call_error_message(state, &type_name)))
             }
         }
     }
@@ -3626,7 +4022,7 @@ impl VmExecutor {
                     continue;
                 }
                 let type_name = state.typename(func_val.ty());
-                return Err(VmError::RuntimeError(format!("attempt to call a {} value", type_name)));
+                return Err(VmError::RuntimeError(call_error_message(state, &type_name)));
             }
             break;
         }
@@ -3769,9 +4165,11 @@ impl VmExecutor {
                 state.pc += 1;
                 Ok(())
             }
-            _ => {
-                state.pc += 1;
-                Ok(())
+            other => {
+                // 非可调用对象: 抛出 "attempt to call a {type} value" 错误
+                // 对应 C 的 luaG_callerror (同 op_call)
+                let type_name = state.typename(other.ty());
+                Err(VmError::RuntimeError(call_error_message(state, &type_name)))
             }
         }
     }
@@ -4204,19 +4602,19 @@ impl VmExecutor {
                 let limit_f = match to_number(&limit_val) {
                     Some(f) => f,
                     None => return Err(VmError::RuntimeError(
-                        format!("bad 'for' limit (number expected, got {})", limit_val.ty())
+                        format!("bad 'for' limit (number expected, got {})", obj_type_name(&limit_val))
                     )),
                 };
                 let step_f = match to_number(&step_val) {
                     Some(f) => f,
                     None => return Err(VmError::RuntimeError(
-                        format!("bad 'for' step (number expected, got {})", step_val.ty())
+                        format!("bad 'for' step (number expected, got {})", obj_type_name(&step_val))
                     )),
                 };
                 let init_f = match to_number(&init_val) {
                     Some(f) => f,
                     None => return Err(VmError::RuntimeError(
-                        format!("bad 'for' initial value (number expected, got {})", init_val.ty())
+                        format!("bad 'for' initial value (number expected, got {})", obj_type_name(&init_val))
                     )),
                 };
 
@@ -4650,7 +5048,7 @@ impl VmExecutor {
     // 辅助: 表操作
     // ========================================================================
 
-    pub fn table_get(state: &mut LuaState, table_val: &TValue, key: &TValue) -> Result<TValue, VmError> {
+    pub fn table_get(state: &mut LuaState, table_val: &TValue, key: &TValue, table_source: VarSource) -> Result<TValue, VmError> {
         // 对应 C Lua 的 luaV_finishget — 用循环代替递归，加 MAXTAGLOOP 限制
         // 防止 __index 链无限循环（如 a.__index = a 导致栈溢出）
         const MAXTAGLOOP: usize = 2000;
@@ -4680,7 +5078,11 @@ impl VmExecutor {
                                 // __index 是函数: 调用 __index(table, key) (可能 yield)
                                 return Self::call_index_metamethod(state, index_val.clone(), current.clone(), key.clone());
                             }
-                            _ => {}
+                            _ => {
+                                // __index 是其他类型: 继续循环，由 other 分支报错
+                                current = index_val.clone();
+                                continue;
+                            }
                         }
                     }
                     return Ok(TValue::Nil(NilKind::Strict));
@@ -4717,12 +5119,14 @@ impl VmExecutor {
                             }
                             _ => {
                                 let type_name = state.typename(other.ty());
-                                return Err(VmError::RuntimeError(format!("attempt to index a {} value", type_name)));
+                                let info = index_varinfo(state, table_source);
+                                return Err(VmError::RuntimeError(format!("attempt to index a {} value{}", type_name, info)));
                             }
                         },
                         None => {
                             let type_name = state.typename(other.ty());
-                            return Err(VmError::RuntimeError(format!("attempt to index a {} value", type_name)));
+                            let info = index_varinfo(state, table_source);
+                            return Err(VmError::RuntimeError(format!("attempt to index a {} value{}", type_name, info)));
                         }
                     }
                 }
@@ -4773,6 +5177,7 @@ impl VmExecutor {
         table_val: &TValue,
         key: TValue,
         val: TValue,
+        table_source: VarSource,
     ) -> Result<(), VmError> {
         // 对应 C Lua 的 luaV_finishset — 用循环代替递归，加 MAXTAGLOOP 限制
         // 防止 __newindex 链无限循环（如 a.__newindex = a 导致栈溢出）
@@ -4877,13 +5282,15 @@ impl VmExecutor {
                                 }
                                 _ => {
                                     let type_name = state.typename(current.ty());
-                                    return Err(VmError::RuntimeError(format!("attempt to index a {} value", type_name)));
+                                    let info = index_varinfo(state, table_source);
+                                    return Err(VmError::RuntimeError(format!("attempt to index a {} value{}", type_name, info)));
                                 }
                             }
                         }
                         None => {
                             let type_name = state.typename(current.ty());
-                            return Err(VmError::RuntimeError(format!("attempt to index a {} value", type_name)));
+                            let info = index_varinfo(state, table_source);
+                            return Err(VmError::RuntimeError(format!("attempt to index a {} value{}", type_name, info)));
                         }
                     }
                 }
@@ -5723,7 +6130,9 @@ mod tests {
             make_abc(OpCode::TFORCALL, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
-        assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
+        let result = execute_test(&proto, 0, default_stack(20));
+        // TFORCALL with a non-callable value (integer) should return a call error
+        assert!(result.is_err(), "TFORCALL with non-callable should error");
     }
 
     #[test]

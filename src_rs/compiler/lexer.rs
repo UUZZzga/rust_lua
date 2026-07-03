@@ -155,6 +155,58 @@ fn read_char_at(bytes: &[u8], pos: usize) -> char {
     }
 }
 
+/// 对应 C 的 luaO_chunkid：将 chunk_name 格式化为短源标识
+/// 用于错误消息中的 source 前缀（`[string "..."]:line:`）
+/// LUA_IDSIZE = 60, 输出最多 59 字符（留 1 个给 '\0'）
+pub fn format_chunk_id(chunk_name: &str) -> String {
+    const LUA_IDSIZE: usize = 60;
+    let bytes = chunk_name.as_bytes();
+    if bytes.is_empty() {
+        return "?".to_string();
+    }
+    match bytes[0] {
+        b'=' => {
+            let content = &bytes[1..];
+            if content.len() <= LUA_IDSIZE - 1 {
+                String::from_utf8_lossy(content).into_owned()
+            } else {
+                String::from_utf8_lossy(&content[..LUA_IDSIZE - 1]).into_owned()
+            }
+        }
+        b'@' => {
+            // C: srclen 含 '@'，bufflen = 60
+            //    if srclen <= 60: 显示 content (srclen-1 字符)
+            //    else: "..." + 末尾 56 字符 = 59 字符
+            let content = &bytes[1..];
+            if content.len() <= LUA_IDSIZE - 1 {
+                String::from_utf8_lossy(content).into_owned()
+            } else {
+                let tail_len = LUA_IDSIZE - 3 - 1; // 56
+                let start = content.len() - tail_len;
+                format!("...{}", String::from_utf8_lossy(&content[start..]))
+            }
+        }
+        _ => {
+            // C: PRE = "[string \"" (9), POS = "\"]" (2), RETS = "..." (3)
+            //    bufflen = 60 - (9+3+2) - 1 = 45
+            const PRE_LEN: usize = 9;
+            const POS_LEN: usize = 2;
+            const RETS_LEN: usize = 3;
+            let bufflen = LUA_IDSIZE - PRE_LEN - POS_LEN - RETS_LEN - 1; // 45
+
+            let nl_pos = bytes.iter().position(|&b| b == b'\n');
+            let effective_len = nl_pos.unwrap_or(bytes.len());
+
+            if effective_len < bufflen && nl_pos.is_none() {
+                format!("[string \"{}\"]", String::from_utf8_lossy(&bytes[..effective_len]))
+            } else {
+                let n = effective_len.min(bufflen);
+                format!("[string \"{}...\"]", String::from_utf8_lossy(&bytes[..n]))
+            }
+        }
+    }
+}
+
 pub struct LexState<'a> {
     pub state: &'a mut LuaState,
     pub source: String,
@@ -171,6 +223,9 @@ pub struct LexState<'a> {
     /// 锚定长字符串字面量,确保同一源码中的长字符串返回同一 `LuaString` (相同 ptr_id)。
     /// 短字符串已通过全局 `StringTable` 内部化去重,无需在此重复。
     scanner_strings: HashMap<String, LuaString>,
+    /// 当前 token 的原始文本 — 对应 C 的 `luaZ_buffer(ls->buff)`。
+    /// 用于错误消息中显示数字/字符串的原始文本 (如 "1.000" 而不是 "1")。
+    pub token_text: String,
 }
 
 impl<'a> LexState<'a> {
@@ -190,6 +245,7 @@ impl<'a> LexState<'a> {
             errors: Vec::new(),
             nesting_level: 0,
             scanner_strings: HashMap::new(),
+            token_text: String::new(),
         }
     }
 
@@ -331,7 +387,7 @@ impl<'a> LexState<'a> {
     }
 
     pub fn error(&mut self, msg: &str) {
-        self.errors.push(format!("{}:{}: {}", self.chunk_name, self.linenumber, msg));
+        self.errors.push(format!("{}:{}: {}", format_chunk_id(&self.chunk_name), self.linenumber, msg));
     }
 
     /// 转义序列错误，对应 C 的 `esccheck` + `lexerror(msg, TK_STRING)`。
@@ -347,7 +403,7 @@ impl<'a> LexState<'a> {
             token.push(self.current);
         }
         self.errors.push(format!("{}:{}: {} near '{}'",
-            self.chunk_name, self.linenumber, msg, token));
+            format_chunk_id(&self.chunk_name), self.linenumber, msg, token));
     }
 
     pub fn next(&mut self) {
@@ -369,8 +425,31 @@ impl<'a> LexState<'a> {
         self.lookahead.as_ref().unwrap()
     }
 
+    /// 返回当前 token 的显示字符串, 对应 C 的 `txtToken`。
+    ///
+    /// 对 Name/String/Int/Float: 优先使用 `token_text` (原始文本, 如 "1.000"),
+    ///   回退到 `to_display_str()` (格式化后的值, 如 "1")。
+    ///   这对应 C 中 `luaZ_buffer(ls->buff)` 保存的原始扫描文本。
+    /// 对其他 token (关键字/符号/Eof): 直接使用 `to_display_str()`。
+    pub fn token_display(&self) -> String {
+        match &self.token {
+            Token::Name(_) | Token::String(_) | Token::Int(_) | Token::Float(_) => {
+                if !self.token_text.is_empty() {
+                    format!("'{}'", self.token_text)
+                } else {
+                    self.token.to_display_str()
+                }
+            }
+            _ => self.token.to_display_str(),
+        }
+    }
+
     fn read_token(&mut self) {
         self.skip_whitespace();
+        // 对应 C: luaZ_resetbuffer(ls->buff) — 每个新 token 开始前清空原始文本缓冲。
+        // 只有 read_name/read_number/read_short_string/read_long_string 会填充它,
+        // 其他 token (符号/关键字) 保持为空, token_display() 会回退到 to_display_str()。
+        self.token_text.clear();
         match self.current {
             EOF_CHAR => self.token = Token::Eof,
             '+' => { self.token = Token::Plus; self.next_char(); }
@@ -457,10 +536,18 @@ impl<'a> LexState<'a> {
                 }
             }
             '[' => {
+                let start_pos = self.pos;  // '[' 的位置, 用于长字符串 token_text
                 self.next_char();
                 let eqs = self.count_equals();
                 if self.current == '[' {
                     self.read_long_string(eqs);
+                    // 设置 token_text 包含完整的长字符串字面量 (含 [=...[ ... ]=...])
+                    // 对应 C: luaZ_buffer(ls->buff) 在 read_long_string 期间累积的所有字符
+                    if self.pos > start_pos {
+                        self.token_text = std::str::from_utf8(
+                            &self.source.as_bytes()[start_pos..self.pos])
+                            .unwrap_or("").to_string();
+                    }
                 } else {
                     self.token = Token::LBracket;
                 }
@@ -474,7 +561,17 @@ impl<'a> LexState<'a> {
             c if c.is_ascii_digit() => self.read_number(),
             c if c.is_ascii_alphabetic() || c == '_' => self.read_name(),
             _ => {
-                self.error(&format!("unexpected character: '{}'", self.current));
+                // 对应 C: llex default 分支返回单字符 token, parser primaryexp default
+                // 报 "unexpected symbol". luaX_token2str 对控制字符显示 '<\N>', 对可打印字符显示 'c'.
+                let c = self.current;
+                let token_str = if c == EOF_CHAR {
+                    "<eof>".to_string()
+                } else if c.is_ascii_graphic() {
+                    format!("'{}'", c)
+                } else {
+                    format!("'<\\{}>'", c as u32)
+                };
+                self.error(&format!("unexpected symbol near {}", token_str));
                 self.next_char();
                 self.token = Token::Eof;
             }
@@ -490,6 +587,7 @@ impl<'a> LexState<'a> {
         // continuation byte 处 panic。此处用字节切片绕过边界检查。
         // read_name 只消费 ASCII 字母数字/下划线,内容必为合法 UTF-8。
         let s = std::str::from_utf8(&self.source.as_bytes()[start..self.pos]).unwrap();
+        self.token_text = s.to_string();
         self.token = Token::is_keyword(s).unwrap_or_else(|| Token::Name(s.to_string()));
     }
 
@@ -559,6 +657,7 @@ impl<'a> LexState<'a> {
         }
 
         let s = std::str::from_utf8(&self.source.as_bytes()[start..self.pos]).unwrap();
+        self.token_text = s.to_string();
         if is_float {
             if is_hex {
                 match parse_hex_float(s) {
@@ -610,6 +709,7 @@ impl<'a> LexState<'a> {
 
     fn read_short_string(&mut self) {
         let delim = self.current;
+        let text_start = self.pos;  // 引号的起始位置
         self.next_char();
         let mut s = String::new();
         loop {
@@ -643,6 +743,9 @@ impl<'a> LexState<'a> {
                 }
             }
         }
+        // 设置 token_text 包含原始字面量 (含引号), 对应 C 的 luaZ_buffer(ls->buff)
+        self.token_text = std::str::from_utf8(&self.source.as_bytes()[text_start..self.pos])
+            .unwrap_or("").to_string();
         self.token = Token::String(s);
     }
 

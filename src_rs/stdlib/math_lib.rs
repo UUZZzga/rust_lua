@@ -656,7 +656,7 @@ fn get_number_arg(state: &LuaState, a: usize, idx: usize, fname: &str) -> Result
         ))),
         _ => Err(VmError::RuntimeError(format!(
             "bad argument #{} to '{}' (number expected, got {})",
-            idx + 1, fname, v.ty()
+            idx + 1, fname, crate::tm::obj_type_name(&v)
         ))),
     }
 }

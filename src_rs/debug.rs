@@ -68,11 +68,15 @@ pub fn ordererror(p1: &TValue, p2: &TValue) -> VmError {
 ///   luaG_typeerror(L, p2, msg);
 /// }
 /// ```
-pub fn opinterror(p1: &TValue, p2: &TValue, op: &str) -> VmError {
+pub fn opinterror(p1: &TValue, p2: &TValue, op: &str, p1_info: &str, p2_info: &str) -> VmError {
     // C: 如果 p1 不是数字，则错误对象是 p1；否则错误对象是 p2
-    let err_obj = if !is_number(p1) { p1 } else { p2 };
+    let (err_obj, info) = if !is_number(p1) {
+        (p1, p1_info)
+    } else {
+        (p2, p2_info)
+    };
     let tname = obj_type_name(err_obj);
-    VmError::RuntimeError(format!("attempt to {} a {} value", op, tname))
+    VmError::RuntimeError(format!("attempt to {} a {} value{}", op, tname, info))
 }
 
 /// 整数转换错误 — 对应 C 的 luaG_tointerror

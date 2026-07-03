@@ -282,7 +282,8 @@ pub fn obj_type_name(obj: &TValue) -> String {
             }
         }
     }
-    type_name(obj.ty()).to_string()
+    // LightUserData 可能是内置函数标签（print, type 等），需用 base_type_name 识别
+    crate::stdlib::base_lib::base_type_name(obj).to_string()
 }
 
 pub fn get_tm_by_obj(
@@ -474,9 +475,19 @@ pub(crate) fn call_tm_res(
 
     if status != 0 {
         // 元方法调用失败 — 保留原始错误值类型（非字符串错误用 RuntimeErrorValue）
+        // 对应 C 的 funcnamefromcode: 当元方法不可调用时，附加 " (metamethod 'name')"
         state.top = state.stack.len();
+        let mm_name = tm.event_name();
         return Err(match &result {
-            TValue::Str(s) => VmError::RuntimeError(s.as_str().to_string()),
+            TValue::Str(s) => {
+                let msg = s.as_str().to_string();
+                // 仅对 "attempt to call" 错误附加元方法名（对应 C 的 luaG_callerror）
+                if msg.starts_with("attempt to call") && !msg.contains("metamethod") {
+                    VmError::RuntimeError(format!("{} (metamethod '{}')", msg, mm_name))
+                } else {
+                    VmError::RuntimeError(msg)
+                }
+            }
             _ => VmError::RuntimeErrorValue(result.clone()),
         });
     }
@@ -995,10 +1006,10 @@ pub fn try_bin_tm(
                 if p1.is_number() && p2.is_number() {
                     tointerror(p1, p2, &p1_info, &p2_info)
                 } else {
-                    opinterror(p1, p2, "perform bitwise operation on")
+                    opinterror(p1, p2, "perform bitwise operation on", &p1_info, &p2_info)
                 }
             }
-            _ => opinterror(p1, p2, "perform arithmetic on"),
+            _ => opinterror(p1, p2, "perform arithmetic on", &p1_info, &p2_info),
         });
     }
     Ok(())
@@ -1258,6 +1269,7 @@ pub fn obj_len(
     state: &mut LuaState,
     ra: usize,
     rb: &TValue,
+    varinfo: &str,
 ) -> Result<(), VmError> {
     let tm: Option<TValue> = match rb {
         TValue::Table(t) => {
@@ -1302,8 +1314,9 @@ pub fn obj_len(
         }
         None => {
             Err(VmError::RuntimeError(format!(
-                "attempt to get length of a {} value",
-                obj_type_name(rb)
+                "attempt to get length of a {} value{}",
+                obj_type_name(rb),
+                varinfo
             )))
         }
     }

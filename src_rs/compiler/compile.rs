@@ -480,6 +480,10 @@ pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
     ls.next();
     fs.code_abc(OpCode::VARARGPREP, 0, 0, 0);
     parse_chunk(&mut fs);
+    // 对应 C 的 mainfunc 中 check(ls, TK_EOS)：所有语句解析完后必须到达 EOF
+    if !matches!(fs.ls().token, Token::Eof) {
+        fs.error(&format!("<eof> expected near {}", fs.ls().token_display()));
+    }
     close_func(&mut fs);
 
     // 合并 FuncState 的错误和 LexState 的错误 (如 lexer 遇到非法字符)
@@ -529,7 +533,28 @@ impl<'a> FuncState<'a> {
     fn ls_mut(&mut self) -> &mut LexState<'a> { unsafe { &mut *self.ls } }
 
     fn error(&mut self, msg: &str) {
-        self.errors.push(format!("{}:{}: {}", self.ls().chunk_name, self.ls().lastline, msg));
+        self.errors.push(format!("{}:{}: {}", crate::compiler::lexer::format_chunk_id(&self.ls().chunk_name), self.ls().lastline, msg));
+    }
+
+    /// 对应 C 的 errorlimit: 生成 "too many %s (limit is %d) in %s" 错误
+    fn error_limit(&mut self, limit: i32, what: &str) {
+        let line = self.proto.line_defined;
+        let where_ = if line == 0 {
+            "main function".to_string()
+        } else {
+            format!("function at line {}", line)
+        };
+        self.error(&format!("too many {} (limit is {}) in {}", what, limit, where_));
+    }
+
+    /// 同 error_limit 但使用指定的 line_defined（用于在 parent 函数中创建 upvalue 时报错）
+    fn error_limit_at(&mut self, line_defined: i32, limit: i32, what: &str) {
+        let where_ = if line_defined == 0 {
+            "main function".to_string()
+        } else {
+            format!("function at line {}", line_defined)
+        };
+        self.error(&format!("too many {} (limit is {}) in {}", what, limit, where_));
     }
 
     /// Increment nesting level; error if too deep (like C's enterlevel/luaE_incCstack).
@@ -893,11 +918,15 @@ impl<'a> FuncState<'a> {
     }
 
     /// 分配新寄存器: freereg++ 并追踪 max_freereg
+    /// 对应 C 的 luaK_reserveregs(fs, 1) → luaK_checkstack(fs, 1)
     #[cfg_attr(debug_assertions, track_caller)]
     fn alloc_reg(&mut self) -> i32 {
         let r = self.freereg;
         self.freereg += 1;
         if self.freereg > self.max_freereg {
+            if self.freereg > MAX_FSTACK as i32 {
+                self.error_limit(MAX_FSTACK as i32, "registers");
+            }
             self.max_freereg = self.freereg;
         }
         #[cfg(debug_assertions)]
@@ -916,9 +945,13 @@ impl<'a> FuncState<'a> {
 
     /// C 的 luaK_checkstack: 检查寄存器栈水平，更新 max_freereg
     /// newstack = freereg + n; max_freereg = max(max_freereg, newstack)
+    /// 对应 C: if (newstack > fs->f->maxstacksize) { luaY_checklimit(...); ... }
     fn checkstack(&mut self, n: i32) {
         let newstack = self.freereg + n;
         if newstack > self.max_freereg {
+            if newstack > MAX_FSTACK as i32 {
+                self.error_limit(MAX_FSTACK as i32, "registers");
+            }
             self.max_freereg = newstack;
         }
     }
@@ -1033,6 +1066,11 @@ impl<'a> FuncState<'a> {
 
     /// 添加局部变量 (VDKREG)，分配寄存器并返回
     fn add_local(&mut self, name: &str, start_pc: i32) -> i32 {
+        const MAXVARS: i32 = 200;
+        let reglevel = self.reglevel_for_nactvar(self.active_nactvar());
+        if reglevel + 1 > MAXVARS {
+            self.error_limit(MAXVARS, "local variables");
+        }
         let reg = self.alloc_reg();
         let vidx = self.locals.len() as i32;
         let nactvar = self.active_nactvar();
@@ -1062,7 +1100,14 @@ impl<'a> FuncState<'a> {
 
     /// 添加带类型局部变量 (RDKCONST/RDKTOCLOSE 等)，自动分配寄存器
     fn add_local_kind(&mut self, name: &str, start_pc: i32, kind: i32) -> i32 {
+        const MAXVARS: i32 = 200;
         let in_reg = kind <= RDKTOCLOSE;
+        if in_reg {
+            let reglevel = self.reglevel_for_nactvar(self.active_nactvar());
+            if reglevel + 1 > MAXVARS {
+                self.error_limit(MAXVARS, "local variables");
+            }
+        }
         let reg = if in_reg && kind != RDKCTC {
             self.alloc_reg()
         } else {
@@ -1110,11 +1155,18 @@ impl<'a> FuncState<'a> {
 
     /// 添加指定寄存器的局部变量
     fn add_local_kind_reg(&mut self, name: &str, start_pc: i32, kind: i32, reg: i32) {
+        const MAXVARS: i32 = 200;
+        let in_reg = kind <= RDKTOCLOSE;
+        if in_reg {
+            let reglevel = self.reglevel_for_nactvar(self.active_nactvar());
+            if reglevel + 1 > MAXVARS {
+                self.error_limit(MAXVARS, "local variables");
+            }
+        }
         let vidx = self.locals.len() as i32;
         let nactvar = self.active_nactvar();
         // C: registerlocalvar 只在 adjustlocalvars 中调用，只对 varinreg (kind <= RDKTOCLOSE)
         // 的变量注册到 locvars。global 变量 (kind >= GDKREG) 不注册。
-        let in_reg = kind <= RDKTOCLOSE;
         let pidx = if in_reg {
             let p = self.proto.loc_vars.len() as i32;
             let varname = Some(crate::strings::new_lstr(&self.ls_mut().state.string_table, name));
@@ -1262,23 +1314,35 @@ impl<'a> FuncState<'a> {
         }
         // Step 2: search parent's upvalues (is_local=false, is_parent_upval=true)
         //         (like C's searchupvalue)
-        for pvar in self.parent_locals.iter().rev() {
+        let n_parent = self.parent_locals.len();
+        let mut found_idx: Option<usize> = None;
+        for i in (0..n_parent).rev() {
+            let pvar = &self.parent_locals[i];
             if !pvar.is_local && pvar.is_parent_upval && pvar.name == name {
-                // Found in parent's upvalues: create instack=false upvalue
-                let upval_idx = pvar.upval_idx as u8;
-                let pvar_kind = pvar.kind as u8;
-                let idx = self.proto.upvalues.len() as i32;
-                let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name);
-                self.proto.upvalues.push(crate::objects::UpvalDesc {
-                    name: Some(ls),
-                    in_stack: false,
-                    idx: upval_idx,
-                    parent_local_idx: 0,
-                    kind: pvar_kind,
-                });
-                self.proto.size_upvalues = self.proto.upvalues.len() as i32;
-                return Some(UpvalueOrCtc::Upvalue(idx));
+                found_idx = Some(i);
+                break;
             }
+        }
+        if let Some(i) = found_idx {
+            let (upval_idx, pvar_kind) = {
+                let pvar = &self.parent_locals[i];
+                (pvar.upval_idx as u8, pvar.kind as u8)
+            };
+            const MAXUPVAL: usize = 255;
+            if self.proto.upvalues.len() + 1 > MAXUPVAL {
+                self.error_limit(MAXUPVAL as i32, "upvalues");
+            }
+            let idx = self.proto.upvalues.len() as i32;
+            let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name);
+            self.proto.upvalues.push(crate::objects::UpvalDesc {
+                name: Some(ls),
+                in_stack: false,
+                idx: upval_idx,
+                parent_local_idx: 0,
+                kind: pvar_kind,
+            });
+            self.proto.size_upvalues = self.proto.upvalues.len() as i32;
+            return Some(UpvalueOrCtc::Upvalue(idx));
         }
         // Step 3: search grandparent variables (is_local=false, is_parent_upval=false)
         //         (like C's singlevaraux recursing to grandparent)
@@ -1306,6 +1370,10 @@ impl<'a> FuncState<'a> {
                     // Variable is a global declaration in an ancestor: not an upvalue
                     return None;
                 }
+                const MAXUPVAL: usize = 255;
+                if self.proto.upvalues.len() + 1 > MAXUPVAL {
+                    self.error_limit(MAXUPVAL as i32, "upvalues");
+                }
                 let idx = self.proto.upvalues.len() as i32;
                 let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name);
                 self.proto.upvalues.push(crate::objects::UpvalDesc {
@@ -1325,6 +1393,10 @@ impl<'a> FuncState<'a> {
     /// Helper: create an upvalue from a parent local variable (is_local=true).
     /// Like C's newupvalue with VLOCAL: instack=true, idx=ridx.
     fn create_upvalue_from_parent_local(&mut self, pvar: &ParentVar) -> UpvalueOrCtc {
+        const MAXUPVAL: usize = 255;
+        if self.proto.upvalues.len() + 1 > MAXUPVAL {
+            self.error_limit(MAXUPVAL as i32, "upvalues");
+        }
         let idx = self.proto.upvalues.len() as i32;
         let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, &pvar.name);
         self.proto.upvalues.push(crate::objects::UpvalDesc {
@@ -1389,6 +1461,11 @@ impl<'a> FuncState<'a> {
             if let Some(j) = found_local {
                 let pvar = &prev.parent_locals[j];
                 let pvar_kind = pvar.kind;
+                const MAXUPVAL: usize = 255;
+                if prev.proto.upvalues.len() + 1 > MAXUPVAL {
+                    let line_defined = prev.proto.line_defined;
+                    self.error_limit_at(line_defined, MAXUPVAL as i32, "upvalues");
+                }
                 let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name);
                 let idx = prev.proto.upvalues.len();
                 prev.proto.upvalues.push(crate::objects::UpvalDesc {
@@ -1411,6 +1488,11 @@ impl<'a> FuncState<'a> {
             if pvar.name == name {
                 let pvar_kind = pvar.kind;
                 let upval_idx = pvar.upval_idx as u8;
+                const MAXUPVAL: usize = 255;
+                if prev.proto.upvalues.len() + 1 > MAXUPVAL {
+                    let line_defined = prev.proto.line_defined;
+                    self.error_limit_at(line_defined, MAXUPVAL as i32, "upvalues");
+                }
                 let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name);
                 let idx = prev.proto.upvalues.len();
                 prev.proto.upvalues.push(crate::objects::UpvalDesc {
@@ -1440,6 +1522,11 @@ impl<'a> FuncState<'a> {
                 let grandparent_upval_idx = prev.find_or_create_parent_upvalue(name);
                 if grandparent_upval_idx == usize::MAX {
                     return usize::MAX;
+                }
+                const MAXUPVAL: usize = 255;
+                if prev.proto.upvalues.len() + 1 > MAXUPVAL {
+                    let line_defined = prev.proto.line_defined;
+                    self.error_limit_at(line_defined, MAXUPVAL as i32, "upvalues");
                 }
                 let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name);
                 let idx = prev.proto.upvalues.len();
@@ -2377,7 +2464,12 @@ fn parse_chunk_finish(fs: &mut FuncState) {
     // Check for unresolved gotos
     if !fs.gotos.is_empty() {
         let gt = &fs.gotos[0];
-        fs.error(&format!("no visible label '{}' for goto", gt.name));
+        // 对应 C 的 luaK_semerror: "no visible label '%s' for <goto> at line %d"
+        // luaK_semerror 设置 ls->linenumber = ls->lastline（回到 goto 的行号）
+        // 并设置 ls->t.token = 0（不添加 "near TOKEN"）
+        let msg = format!("no visible label '{}' for <goto> at line {}", gt.name, gt.line);
+        let chunk_id = crate::compiler::lexer::format_chunk_id(&fs.ls().chunk_name);
+        fs.errors.push(format!("{}:{}: {}", chunk_id, gt.line, msg));
     }
 
     // 从 inst_lines 计算 line_info 和 abs_line_info
@@ -2458,6 +2550,32 @@ fn expect(fs: &mut FuncState, t: &Token) {
     }
 }
 
+/// 对应 C 的 check_match：期望 token t，若不匹配且跨行，则报 "X expected (to close Y at line Z) near TOKEN"
+/// `who` 是开始符号（如 '{'），`where` 是开始行号
+fn check_match(fs: &mut FuncState, t: &Token, who: &Token, where_line: i32) {
+    if !check(fs, t) {
+        if where_line == fs.ls().linenumber {
+            // 同一行：简单错误消息（对应 C 的 error_expected）
+            fs.error(&format!("{} expected", t.to_display_str()));
+        } else {
+            // 跨行：复杂错误消息（对应 C 的 luaX_syntaxerror + luaO_pushfstring）
+            // luaX_syntaxerror 会通过 lexerror 加上 " near TOKEN" 后缀
+            let msg = format!("{} expected (to close {} at line {})",
+                t.to_display_str(), who.to_display_str(), where_line);
+            syntax_error_with_token(fs, &msg);
+        }
+    } else {
+        fs.ls_mut().next();
+    }
+}
+
+/// 对应 C 的 luaX_syntaxerror：生成 "msg near TOKEN" 格式的错误消息
+fn syntax_error_with_token(fs: &mut FuncState, msg: &str) {
+    let token_str = fs.ls().token_display();
+    let chunk_id = crate::compiler::lexer::format_chunk_id(&fs.ls().chunk_name);
+    fs.errors.push(format!("{}:{}: {} near {}", chunk_id, fs.ls().linenumber, msg, token_str));
+}
+
 /// ANTLR4: 判断是否代码块结束标记 — 'end' | 'else' | 'elseif' | 'until' | EOF
 fn block_follow(fs: &FuncState, with_until: bool) -> bool {
     match &fs.ls().token {
@@ -2476,7 +2594,7 @@ fn get_name(fs: &mut FuncState) -> String {
             name
         }
         _ => {
-            fs.error(&format!("'name' expected near {}", fs.ls().token.to_display_str()));
+            fs.error(&format!("'name' expected near {}", fs.ls().token_display()));
             String::new()
         }
     }
@@ -2751,7 +2869,9 @@ fn close_func(fs: &mut FuncState) {
         // Check for unresolved gotos (like C's leaveblock: if bl->previous==NULL && pending gotos)
         if !fs.gotos.is_empty() {
             let gt = &fs.gotos[0];
-            fs.errors.push(format!("{}: no visible label '{}' for goto", gt.line, gt.name));
+            let msg = format!("no visible label '{}' for <goto> at line {}", gt.name, gt.line);
+            let chunk_id = crate::compiler::lexer::format_chunk_id(&fs.ls().chunk_name);
+            fs.errors.push(format!("{}:{}: {}", chunk_id, gt.line, msg));
         }
     }
 
@@ -3313,7 +3433,7 @@ fn parse_statement(fs: &mut FuncState) {
             None
         },
         Token::Name(name) => {
-            let line = fs.ls().lastline;
+            let line = fs.ls().linenumber;
             let is_global = name == "global" && {
                 let l = fs.ls_mut();
                 let lk = l.lookahead_next();
@@ -3327,8 +3447,24 @@ fn parse_statement(fs: &mut FuncState) {
             }
             None
         }
-        Token::LParen
-        | Token::Nil
+        Token::LParen => {
+            // 对应 C 的 exprstat: 只允许函数调用语句或赋值
+            // LParen 开头的表达式可能是 (f)() 函数调用
+            let ei = parse_expr(fs);
+            if ei.exp.kind == ExpKind::Call {
+                fs.set_c(ei.exp.info2, 1);
+            } else {
+                // 对应 C 的 check_condition(ls, v.v.k == VCALL, "syntax error")
+                fs.error("syntax error");
+            }
+            let _r = fs.exp_to_reg(&ei.exp);
+            fs.free_reg();
+            if check(fs, &Token::Semi) { fs.ls_mut().next(); }
+            None
+        }
+        // C 的 primaryexp 只接受 '(' 或 NAME，其他字面量/运算符开头的语句
+        // 在 primaryexp 阶段报 "unexpected symbol near 'token'"
+        Token::Nil
         | Token::False
         | Token::True
         | Token::Int(_)
@@ -3339,17 +3475,12 @@ fn parse_statement(fs: &mut FuncState) {
         | Token::Not
         | Token::Hash
         | Token::Tilde => {
-            let ei = parse_expr(fs);
-            if ei.exp.kind == ExpKind::Call {
-                fs.set_c(ei.exp.info2, 1);
-            }
-            let _r = fs.exp_to_reg(&ei.exp);
-            fs.free_reg();
-            if check(fs, &Token::Semi) { fs.ls_mut().next(); }
+            fs.error(&format!("unexpected symbol near {}", fs.ls().token_display()));
+            fs.ls_mut().next();
             None
         }
         _ => {
-            fs.error(&format!("unexpected symbol near {}", fs.ls().token.to_display_str()));
+            fs.error(&format!("unexpected symbol near {}", fs.ls().token_display()));
             fs.ls_mut().next();
             None
         }
@@ -3764,7 +3895,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
         fs.set_freereg(fs.nvarstack());
         return;
     }
-    
+
     if check(fs, &Token::Eq) || check(fs, &Token::Comma) {
         let mut vars = vec![first];
         // check_condition(ls, vkisvar(lh->v.k), "syntax error") — 对应 C 的 restassign
@@ -3772,7 +3903,16 @@ fn parse_assign_or_call(fs: &mut FuncState) {
         if !is_valid_assign_target(&vars[0]) {
             fs.error("syntax error");
         }
+        // 对应 C 的 restassign 递归: 每个 ',' 后 enterlevel 控制递归深度。
+        // C 中 restassign 是递归的, enterlevel 在递归前调用, leavelevel 在递归后调用,
+        // 所以 nCcalls 随赋值目标数量累积。Rust 用迭代模拟, 累积 nesting_level,
+        // 循环结束后统一 leavelevel。
+        let mut assign_depth = 0;
         while check(fs, &Token::Comma) {
+            if !fs.enterlevel() {
+                break;
+            }
+            assign_depth += 1;
             fs.ls_mut().next();
             let new_var = parse_prefix_exp(fs);
             if !is_valid_assign_target(&new_var) {
@@ -3785,6 +3925,9 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 check_conflict_for_var(fs, &mut vars, &new_var);
             }
             vars.push(new_var);
+        }
+        for _ in 0..assign_depth {
+            fs.leavelevel();
         }
         expect(fs, &Token::Eq);
 
@@ -4103,8 +4246,9 @@ fn parse_assign_or_call(fs: &mut FuncState) {
     }
     
     if !has_call {
-        let (_r, _, _, _) = load_func(fs, &first, false);
-        fs.free_reg();
+        // 对应 C 的 check_condition(ls, v.v.k == VCALL, "syntax error")
+        // 语句以 Name 开头但既不是赋值也不是函数调用 → 语法错误
+        fs.error("syntax error");
     }
 }
 
@@ -4370,7 +4514,7 @@ fn load_func(fs: &mut FuncState, p: &PrefixResult, is_method: bool) -> (i32, boo
 /// ANTLR4: `args: '(' explist? ')' | tableconstructor | STRING ;` 及 `':' NAME args ;` — 解析函数参数并生成 CALL 指令
 fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
     // Like C's funcargs: save line at start for luaK_fixline after CALL
-    let line = fs.ls().lastline;
+    let line = fs.ls().linenumber;
     if matches!(&fs.ls().token, Token::String(..)) {
         let str_s = match &fs.ls().token {
             Token::String(s) => s.clone(),
@@ -4469,7 +4613,7 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
             return pc;
         }
         // Like C's funcargs default: missing args after method name
-        fs.error(&format!("function arguments expected near {}", fs.ls().token.to_display_str()));
+        fs.error(&format!("function arguments expected near {}", fs.ls().token_display()));
         return -1;
     }
 
@@ -8729,6 +8873,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
         }
         Token::Not | Token::Minus | Token::Hash | Token::Tilde => {
             let op_tok = fs.ls().token.clone();
+            let op_line = fs.ls().linenumber;
             fs.ls_mut().next();
             let ei = parse_subexpr(fs, PREC_UNARY);
             match op_tok {
@@ -8782,6 +8927,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     if ei.exp.has_jumps() {
                         let r = fs.exp_to_reg(&ei.exp);
                         let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
+                        fs.fixline(op_line);
                         fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
                         ExpDesc::new_reloc_with_pc(r as i64, pc)
                     } else {
@@ -8795,6 +8941,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                                 if result.is_nan() || result == 0.0 {
                                     let r = fs.exp_to_reg(&ei.exp);
                                     let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
+                                    fs.fixline(op_line);
                                     fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
                                     ExpDesc::new_reloc_with_pc(r as i64, pc)
                                 } else {
@@ -8804,6 +8951,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                             _ => {
                                 let r = fs.exp_to_reg(&ei.exp);
                                 let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
+                                fs.fixline(op_line);
                                 fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
                                 ExpDesc::new_reloc_with_pc(r as i64, pc)
                             }
@@ -8815,12 +8963,14 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     let r = fs.exp_to_reg(&ei.exp);
                     fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
                     let pc = fs.code_abc(OpCode::LEN, 0, r, 0);
+                    fs.fixline(op_line);
                     ExpDesc::new_reloc_with_pc(r as i64, pc)
                 }
                 Token::Tilde => {
                     if ei.exp.has_jumps() {
                         let r = fs.exp_to_reg(&ei.exp);
                         let pc = fs.code_abc(OpCode::BNOT, 0, r, 0);
+                        fs.fixline(op_line);
                         fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
                         ExpDesc::new_reloc_with_pc(r as i64, pc)
                     } else {
@@ -8835,6 +8985,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                                 } else {
                                     let r = fs.exp_to_reg(&ei.exp);
                                     let pc = fs.code_abc(OpCode::BNOT, 0, r, 0);
+                                    fs.fixline(op_line);
                                     fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
                                     ExpDesc::new_reloc_with_pc(r as i64, pc)
                                 }
@@ -8842,6 +8993,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                             _ => {
                                 let r = fs.exp_to_reg(&ei.exp);
                                 let pc = fs.code_abc(OpCode::BNOT, 0, r, 0);
+                                fs.fixline(op_line);
                                 fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
                                 ExpDesc::new_reloc_with_pc(r as i64, pc)
                             }
@@ -8860,7 +9012,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
             ExpDesc::new(ExpKind::Relocable, r as i64)
         }
         _ => {
-            fs.error(&format!("unexpected symbol near {}", fs.ls().token.to_display_str()));
+            fs.error(&format!("unexpected symbol near {}", fs.ls().token_display()));
             fs.ls_mut().next();
             ExpDesc::new(ExpKind::Nil, 0)
         }
@@ -9765,8 +9917,8 @@ fn parse_for(fs: &mut FuncState) {
         }
         expect(fs, &Token::In);
 
-        // C: line = ls->linenumber (line of 'in' keyword, used for luaK_fixline in forbody)
-        let for_line = fs.ls().lastline;
+        // C: line = ls->linenumber (after checknext(TK_IN), line of first expr token)
+        let for_line = fs.ls().linenumber;
         let saved_freereg = fs.freereg;
         let base = fs.freereg;
 
@@ -10542,6 +10694,7 @@ fn maxtostore(fs: &FuncState) -> i32 {
 
 /// ANTLR4: `tableconstructor: '{' fieldlist? '}' ;`
 fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
+    let open_line = fs.ls().lastline;  // '{' 所在行（对应 C 的 line = ls->linenumber）
     fs.ls_mut().next();
     let table_r = fs.alloc_reg();
     let pc = fs.code_abc_k(OpCode::NEWTABLE, 0, 0, 0, false);
@@ -10716,7 +10869,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
         fs.set_freereg(table_r + 1);
     }
 
-    expect(fs, &Token::RBrace);
+    check_match(fs, &Token::RBrace, &Token::LBrace, open_line);
 
     fs.set_tablesize(pc, table_r, need_array, need_hash);
 
@@ -10766,6 +10919,10 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
                 fs.ls_mut().next();
                 n_params += 1;
                 param_names.push(name);
+            } else {
+                // 对应 C 的 default: luaX_syntaxerror(ls, "<name> or '...' expected")
+                fs.error("<name> or '...' expected");
+                break;
             }
             if !check(fs, &Token::Comma) { break; }
             fs.ls_mut().next();
