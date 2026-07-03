@@ -188,7 +188,8 @@ impl Metatable {
             if self.flags.contains(flag) { return None; }
         }
         let key = make_tm_tvalue(tm);
-        let result = self.table.get(&key);
+        // C: luaT_gettm — ttisnil 检查，nil 值（含 Empty tombstone）视为无元方法
+        let result = self.table.get(&key).filter(|v| !v.is_nil());
         if result.is_none() {
             if let Some(flag) = MetatableFlags::from_tag_method(tm) {
                 self.flags.insert(flag);
@@ -299,7 +300,8 @@ pub fn get_tm_by_obj(
     };
     let mt = mt?;
     let key = make_tm_tvalue(tm);
-    mt.get(&key)
+    // C: notm(tm) — ttisnil 检查，nil 值（含 Empty tombstone）视为无元方法
+    mt.get(&key).filter(|v| !v.is_nil())
 }
 
 // ============================================================================
