@@ -311,6 +311,17 @@ pub fn new_long_str(str: &str) -> LuaString {
     })
 }
 
+/// 从字节创建长字符串 — 用于二进制数据 (io.read 返回的二进制内容等)
+/// 对应 C Lua 中字符串可以包含任意字节 (包括 \0 和非 UTF-8 字节)
+pub fn new_long_bytes(bytes: Vec<u8>) -> LuaString {
+    LuaString::Long(LongString {
+        hash: AtomicU64::new(0),
+        extra: AtomicU8::new(0),
+        contents: unsafe { String::from_utf8_unchecked(bytes) },
+        ptr_id: crate::gc::new_ptr_id(),
+    })
+}
+
 /// 确保长字符串有哈希值（惰性计算）。
 pub fn ensure_long_hash(ls: &mut LongString) -> u64 {
     if ls.extra.load(Ordering::Relaxed) == 0 {

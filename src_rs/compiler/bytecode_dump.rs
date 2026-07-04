@@ -168,7 +168,9 @@ impl BytecodeReader {
             return String::new();
         }
         let len = if bytes.last() == Some(&0) { size - 1 } else { size };
-        let s = String::from_utf8_lossy(&bytes[..len]).to_string();
+        // Lua 字符串可包含任意字节 (包括非 UTF-8)，用 from_utf8_unchecked 保留原始字节
+        // 对应 C Lua 中 TString 可以存储任意字节序列
+        let s = unsafe { String::from_utf8_unchecked(bytes[..len].to_vec()) };
         self.strings.push(s.clone());
         s
     }

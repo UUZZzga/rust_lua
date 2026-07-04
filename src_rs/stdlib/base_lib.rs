@@ -51,6 +51,7 @@ pub const BASE_REQUIRE: usize = 22;
 pub const BASE_LOAD: usize = 23;
 pub const BASE_COLLECTGARBAGE: usize = 24;
 pub const BASE_DOFILE: usize = 25;
+pub const BASE_LOADFILE: usize = 26;
 
 // 迭代器辅助函数标签 (不在 is_base_tag 范围内, 只在 TFORCALL 中处理)
 // 对应 C 的 ipairsaux 和 next 迭代器函数
@@ -60,7 +61,7 @@ pub const BASE_NEXT_ITER: usize = 21;
 /// 标签是否属于基础库
 pub fn is_base_tag(tag: usize) -> bool {
     (tag >= BASE_PRINT && tag <= BASE_WARN) || tag == BASE_REQUIRE || tag == BASE_LOAD
-        || tag == BASE_COLLECTGARBAGE || tag == BASE_DOFILE
+        || tag == BASE_COLLECTGARBAGE || tag == BASE_DOFILE || tag == BASE_LOADFILE
 }
 
 /// 判断标签是否为已知的函数标签 (用于 type/tostring 显示)
@@ -205,7 +206,14 @@ pub fn base_type_name(v: &TValue) -> &'static str {
         }
         TValue::Integer(_) | TValue::Float(_) => "number",
         TValue::Str(_) => "string",
-        TValue::Table(_) => "table",
+        TValue::Table(_) => {
+            // coroutine.wrap 返回的 Table 在 type() 中应表现为 "function"
+            if crate::stdlib::coroutine_lib::get_wrap_idx(v).is_some() {
+                "function"
+            } else {
+                "table"
+            }
+        }
         TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) => "function",
         TValue::UserData(_) => "userdata",
         TValue::Thread(_) => "thread",
@@ -259,6 +267,7 @@ pub fn base_rawequal(v1: &TValue, v2: &TValue) -> bool {
         (TValue::Str(a), TValue::Str(b)) => a == b,
         (TValue::LightUserData(a), TValue::LightUserData(b)) => std::ptr::eq(*a, *b),
         (TValue::Table(a), TValue::Table(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
+        (TValue::UserData(a), TValue::UserData(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
         _ => false,
     }
 }
@@ -420,6 +429,7 @@ pub fn call_base_function(
         BASE_LOAD => call_load(state, a, nargs, nresults),
         BASE_COLLECTGARBAGE => call_collectgarbage(state, a, nargs, nresults),
         BASE_DOFILE => call_dofile(state, a, nargs, nresults),
+        BASE_LOADFILE => call_loadfile(state, a, nargs, nresults),
         _ => Err(VmError::RuntimeError(format!("unknown base function tag: {}", tag))),
     };
 
@@ -954,6 +964,47 @@ fn call_tostring(
                 return Err(VmError::RuntimeError(err));
             }
             // 检查返回值是否为字符串
+            let result_str = if base < state.stack.len() {
+                match &state.stack[base] {
+                    TValue::Str(s) => Some(s.as_str().to_string()),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            state.stack.truncate(base);
+            return match result_str {
+                Some(s) => {
+                    push_single_result(state, a, nresults, TValue::Str(state.intern_str(&s)));
+                    Ok(())
+                }
+                None => Err(VmError::RuntimeError(
+                    "'__tostring' must return a string".to_string(),
+                )),
+            };
+        }
+    }
+    // UserData: 查找元表的 __tostring 元方法 (对应 C 的 luaL_tolstring)
+    if let TValue::UserData(u) = &arg {
+        let tostring_key = TValue::Str(state.intern_str("__tostring"));
+        let meta_fn = u.metatable.as_ref().and_then(|mt| mt.get(&tostring_key));
+        if let Some(f) = meta_fn {
+            let base = state.stack.len();
+            state.stack.push(f);
+            state.stack.push(arg.clone());
+            let status = state.pcall(1, 1, 0);
+            if status != 0 {
+                let err = if base < state.stack.len() {
+                    match &state.stack[base] {
+                        TValue::Str(s) => s.as_str().to_string(),
+                        other => format!("{:?}", other),
+                    }
+                } else {
+                    String::new()
+                };
+                state.stack.truncate(base);
+                return Err(VmError::RuntimeError(err));
+            }
             let result_str = if base < state.stack.len() {
                 match &state.stack[base] {
                     TValue::Str(s) => Some(s.as_str().to_string()),
@@ -1757,10 +1808,20 @@ fn call_load(
     };
 
     // 获取 mode 参数 (第 3 个) — "t" / "b" / "bt" / nil
+    // 对应 C 的 getMode: 默认 "bt"，'B' (固定缓冲区) 对 Lua 代码非法
     let mode: Option<String> = if nargs >= 3 {
         let mode_val = get_arg(state, a, 2);
         match &mode_val {
-            TValue::Str(s) => Some(s.as_str().to_string()),
+            TValue::Str(s) => {
+                let m = s.as_str().to_string();
+                // C 的 getMode: if (strchr(mode, 'B') != NULL) luaL_argerror(...)
+                if m.contains('B') {
+                    return Err(VmError::RuntimeError(
+                        "bad argument #3 to 'load' (invalid mode)".to_string(),
+                    ));
+                }
+                Some(m)
+            }
             TValue::Nil(_) => None,
             _ => None,
         }
@@ -1788,8 +1849,24 @@ fn call_load(
     // 对应 C 的 luaB_load 中 s = lua_tolstring(L, 1, &l) 的判断
     let source_result: Result<String, String> = match &chunk_val {
         TValue::Str(s) => Ok(s.as_str().to_string()),
-        TValue::LClosure(_) => {
+        TValue::LClosure(_) | TValue::LightUserData(_) => {
             // reader 函数模式: 循环调用 reader() 累积字符串
+            // LightUserData 必须是可调用的 function tag (io.lines 迭代器等)，
+            // 对应 C 的 luaL_checktype(L, 1, LUA_TFUNCTION) — C 中 io.lines
+            // 返回 C 闭包 (LUA_TFUNCTION)，Rust 用 LightUserData tag 代替
+            if let TValue::LightUserData(tag) = &chunk_val {
+                let tag_val = *tag as usize;
+                let is_callable = is_function_tag(tag_val)
+                    || crate::stdlib::io_lib::is_io_function_tag(tag_val)
+                    || crate::stdlib::io_lib::is_lines_iterator_tag(tag_val)
+                    || crate::stdlib::coroutine_lib::is_wrap_call_tag(tag_val);
+                if !is_callable {
+                    return Err(VmError::RuntimeError(format!(
+                        "bad argument #1 to 'load' (function expected, got {})",
+                        chunk_val.ty()
+                    )));
+                }
+            }
             // 对应 C 的 generic_reader + luaZ_fill 的循环
             // EOF 条件: reader 返回 nil (对应 C 的 lua_isnil → NULL)
             //         或返回空字符串 "" (对应 C 的 size==0 → EOZ)
@@ -1989,6 +2066,12 @@ fn call_dofile(
     }
 
     let call_status = state.pcall(0, -1, 0);
+    // yield 穿过 dofile: 传播 yield (对应 C Lua 中 yield 穿过 C 函数 dofile)
+    if call_status == crate::state::LUA_YIELD {
+        let yield_values = state.pending_yield.take().unwrap_or_default();
+        // yield 时不截断栈，保留 chunk 的执行状态供第二次 resume 恢复
+        return Err(VmError::Yield(yield_values));
+    }
     if call_status != 0 {
         let err_val = state.stack.get(saved_len).cloned()
             .unwrap_or_else(|| TValue::Str(state.intern_str("dofile error")));
@@ -2010,6 +2093,118 @@ fn call_dofile(
     Ok(())
 }
 
+/// loadfile([filename [, mode]]) — 加载文件为 chunk，但不执行
+///
+/// 对应 C 的 luaB_loadfile:
+/// ```c
+/// static int luaB_loadfile (lua_State *L) {
+///   const char *fname = luaL_optstring(L, 1, NULL);
+///   const char *mode = luaL_optstring(L, 2, NULL);
+///   int status = luaL_loadfilex(L, fname, mode);
+///   if (status == LUA_OK)
+///     return 1;  /* File loaded successfully */
+///   else {  /* error (error message is on top of the stack) */
+///     lua_pushnil(L);
+///     lua_insert(L, -2);  /* put nil before error message */
+///     return 2;  /* return nil plus error message */
+///   }
+/// }
+/// ```
+fn call_loadfile(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    // 获取可选的 filename 参数 (默认 nil → 从 stdin 读取)
+    let filename: Option<String> = if nargs >= 1 {
+        let arg = get_arg(state, a, 0);
+        match &arg {
+            TValue::Str(s) => Some(s.as_str().to_string()),
+            TValue::Nil(_) => None,
+            _ => {
+                return Err(VmError::RuntimeError(format!(
+                    "bad argument #1 to 'loadfile' (string expected, got {})",
+                    arg.ty()
+                )));
+            }
+        }
+    } else {
+        None
+    };
+
+    // 获取可选的 mode 参数 (默认 nil)
+    // 对应 C 的 getMode: 'B' (固定缓冲区) 对 Lua 代码非法
+    let mode: Option<String> = if nargs >= 2 {
+        let m = get_arg(state, a, 1);
+        match &m {
+            TValue::Str(s) => {
+                let mode_str = s.as_str().to_string();
+                if mode_str.contains('B') {
+                    return Err(VmError::RuntimeError(
+                        "bad argument #2 to 'loadfile' (invalid mode)".to_string(),
+                    ));
+                }
+                Some(mode_str)
+            }
+            TValue::Nil(_) => None,
+            _ => {
+                return Err(VmError::RuntimeError(format!(
+                    "bad argument #2 to 'loadfile' (string expected, got {})",
+                    m.ty()
+                )));
+            }
+        }
+    } else {
+        None
+    };
+
+    // 获取可选的 env 参数 (第 3 个参数)
+    // 对应 C 的 luaB_loadfile: int env = (!lua_isnone(L, 3) ? 3 : 0)
+    // load_aux 中: lua_pushvalue(L, envidx); lua_setupvalue(L, -2, 1) 设置为第 1 个上值 (_ENV)
+    let env: Option<TValue> = if nargs >= 3 {
+        Some(get_arg(state, a, 2))
+    } else {
+        None
+    };
+
+    // 保存栈位置，调用 load_filex
+    state.stack.truncate(a);
+    let saved_len = state.stack.len();
+
+    let status = state.load_filex(filename.as_deref(), mode.as_deref());
+    if status == 0 {
+        // 成功: 栈顶是加载的 chunk 函数
+        let chunk = state.stack.get(saved_len).cloned()
+            .unwrap_or_else(|| TValue::Nil(NilKind::Strict));
+        state.settop(saved_len);
+        // 如果提供了 env 参数, 设置为闭包的第 1 个上值 (_ENV)
+        // 对应 C 的 load_aux: lua_setupvalue(L, -2, 1)
+        if let Some(env_val) = env {
+            if let TValue::LClosure(closure) = &chunk {
+                let upvals = closure.upvals.borrow();
+                if !upvals.is_empty() {
+                    *upvals[0].borrow_mut() = UpVal::Closed {
+                        value: Box::new(env_val),
+                    };
+                }
+            }
+        }
+        push_results(state, a, nresults, vec![chunk]);
+    } else {
+        // 失败: 栈顶是错误消息
+        let err_msg = state.stack.get(saved_len).cloned()
+            .unwrap_or_else(|| TValue::Str(state.intern_str("loadfile error")));
+        state.settop(saved_len);
+        // 返回 nil + 错误消息
+        push_results(state, a, nresults, vec![
+            TValue::Nil(NilKind::Strict),
+            err_msg,
+        ]);
+    }
+    Ok(())
+}
+
 // ============================================================================
 // 二进制 chunk 字符串驻留化 (修复 ShortString/LongString 不匹配问题)
 // ============================================================================
@@ -2020,7 +2215,7 @@ fn call_dofile(
 /// (通过 StringTable::intern 创建)。由于 LuaString 的 PartialEq/Hash 实现中
 /// Short vs Long 返回 false, 导致 GETTABUP 无法在全局表中找到键。
 /// 此函数将短字符串 (<= 40 字节) 转换为驻留的 ShortString。
-fn intern_proto_strings(proto: &mut Proto, state: &LuaState) {
+pub fn intern_proto_strings(proto: &mut Proto, state: &LuaState) {
     // 驻留化常量池中的字符串
     for c in &mut proto.constants {
         if let TValue::Str(s) = c {
@@ -2387,6 +2582,7 @@ pub fn open_base_lib(state: &mut LuaState) {
     register(state, "load", BASE_LOAD);
     register(state, "collectgarbage", BASE_COLLECTGARBAGE);
     register(state, "dofile", BASE_DOFILE);
+    register(state, "loadfile", BASE_LOADFILE);
 
     // 设置 _G 全局变量 (指向全局表自身)
     let globals_clone = state.globals.clone();

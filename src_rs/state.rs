@@ -172,6 +172,18 @@ pub struct LuaState {
     /// io.output 设置的当前输出流 — None 表示使用 stdout
     /// 对应 C liolib 中存储在 registry[IO_OUTPUT] 的默认输出文件句柄
     pub io_output: Option<Box<dyn Write>>,
+    /// 文件句柄注册表 — key 是 UserData 的 gc_header.ptr_id，value 是 FILE* 指针
+    /// 对应 C 的 luaL_Stream 中存储的 FILE*。UserData 本身不存数据，通过此 map 关联。
+    pub file_handles: std::collections::HashMap<usize, *mut libc::FILE>,
+    /// 标记哪些文件句柄是 io.popen 创建的（关闭时用 pclose 而非 fclose）
+    /// 对应 C 的 LStream.closef = &io_pclose
+    pub popen_handles: std::collections::HashSet<usize>,
+    /// 当前默认输入流的 UserData ptr_id — None 表示使用 io.stdin
+    /// 对应 C 的 registry[IO_INPUT]
+    pub io_input_handle: Option<usize>,
+    /// 当前默认输出流的 UserData ptr_id — None 表示使用 io.stdout
+    /// 对应 C 的 registry[IO_OUTPUT]
+    pub io_output_handle: Option<usize>,
     pub global_state: Rc<GlobalState>,
     pub ci: Option<Box<CallInfo>>,
     /// 调用栈信息，用于构建堆栈回溯 — 对应 C 的 CallInfo 链表
@@ -230,6 +242,9 @@ pub struct LuaState {
     /// 有 __gc 元方法的对象列表 — setmetatable 设置 __gc 时注册
     /// GC 时检查不可达的对象，调用其 finalizer 后再释放
     pub finobj_list: Vec<Table>,
+    /// 有 __gc 元方法的 UserData 列表 — FILE* 等通过默认元表设置的 userdata
+    /// GC 时检查不可达的 UserData，调用其 finalizer（fclose）后释放
+    pub ud_finobj_list: Vec<crate::objects::Udata>,
     /// hook 传输信息 — 对应 C 的 L->transferinfo
     /// 记录最近一次 call/return hook 传输的值的位置和数量
     /// debug.getinfo 的 'r' 选项从此字段读取 ftransfer/ntransfer
@@ -345,6 +360,10 @@ impl LuaState {
             dmt: DefaultMetatables::new(),
             stdout: Box::new(std::io::stdout()),
             io_output: None,
+            file_handles: std::collections::HashMap::new(),
+            popen_handles: std::collections::HashSet::new(),
+            io_input_handle: None,
+            io_output_handle: None,
             global_state: Rc::new(GlobalState { gcstopem: false }),
             ci: None,
             call_info: Vec::new(),
@@ -376,6 +395,7 @@ impl LuaState {
             concat_gc_counter: std::cell::Cell::new(0),
             concat_gc_interval: std::cell::Cell::new(4096),
             finobj_list: Vec::new(),
+            ud_finobj_list: Vec::new(),
             transferinfo_ftransfer: 0,
             transferinfo_ntransfer: 0,
             pending_return_adjust: None,
@@ -516,6 +536,10 @@ impl LuaState {
             dmt: DefaultMetatables::new(),
             stdout: Box::new(std::io::stdout()),
             io_output: None,
+            file_handles: std::collections::HashMap::new(),
+            popen_handles: std::collections::HashSet::new(),
+            io_input_handle: None,
+            io_output_handle: None,
             global_state: Rc::new(GlobalState { gcstopem: false }),
             ci: None,
             call_info: Vec::new(),
@@ -547,6 +571,7 @@ impl LuaState {
             concat_gc_counter: std::cell::Cell::new(0),
             concat_gc_interval: std::cell::Cell::new(4096),
             finobj_list: Vec::new(),
+            ud_finobj_list: Vec::new(),
             transferinfo_ftransfer: 0,
             transferinfo_ntransfer: 0,
             pending_return_adjust: None,
@@ -629,6 +654,10 @@ impl LuaState {
             dmt: DefaultMetatables::new(),
             stdout: Box::new(std::io::stdout()),
             io_output: None,
+            file_handles: std::collections::HashMap::new(),
+            popen_handles: std::collections::HashSet::new(),
+            io_input_handle: None,
+            io_output_handle: None,
             global_state: Rc::new(GlobalState { gcstopem: false }),
             ci: None,
             call_info: Vec::new(),
@@ -660,6 +689,7 @@ impl LuaState {
             concat_gc_counter: std::cell::Cell::new(0),
             concat_gc_interval: std::cell::Cell::new(4096),
             finobj_list: Vec::new(),
+            ud_finobj_list: Vec::new(),
             transferinfo_ftransfer: 0,
             transferinfo_ntransfer: 0,
             pending_return_adjust: None,
@@ -1314,8 +1344,35 @@ impl LuaState {
             return ERR_SYNTAX;
         }
         if is_binary {
-            self.push_string("attempt to load a binary chunk");
-            return ERR_SYNTAX;
+            // 二进制 chunk: 使用 undump_to_proto 解析 (对应 C 的 luaU_undump)
+            // 传入 rest (跳过 BOM 和注释后的部分，从 LUA_SIGNATURE 开始)
+            return match crate::compiler::bytecode_dump::undump_to_proto(rest) {
+                Ok(mut proto) => {
+                    // 驻留化字符串 (LongString → ShortString)
+                    crate::stdlib::base_lib::intern_proto_strings(&mut proto, self);
+                    let nup = proto.size_upvalues as usize;
+                    let mut upvals: Vec<UpValRef> = Vec::with_capacity(nup.max(1));
+                    upvals.push(Rc::new(RefCell::new(UpVal::Closed {
+                        value: Box::new(TValue::Table(self.globals.clone())),
+                    })));
+                    for _ in 1..nup {
+                        upvals.push(Rc::new(RefCell::new(UpVal::Closed {
+                            value: Box::new(TValue::Nil(NilKind::Strict)),
+                        })));
+                    }
+                    let closure = LClosure {
+                        gc_header: GCObjectHeader::new(),
+                        proto: Rc::new(proto),
+                        upvals: Rc::new(RefCell::new(upvals)),
+                    };
+                    self.stack.push(TValue::LClosure(closure));
+                    0
+                }
+                Err(e) => {
+                    self.push_string(&format!("bad binary chunk: {}", e));
+                    ERR_SYNTAX
+                }
+            };
         }
         let rest =
         if skipped_comment {
@@ -1970,6 +2027,11 @@ impl LuaState {
                     crate::stdlib::io_lib::call_io_function(
                         tag_val, self, func_idx, nargs, nresults,
                     )
+                } else if crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
+                    // io.lines/file:lines 返回的迭代器
+                    crate::stdlib::io_lib::call_lines_iterator(
+                        tag_val, self, func_idx, nargs, nresults,
+                    )
                 } else if crate::stdlib::coroutine_lib::is_wrap_call_tag(tag_val) {
                     crate::stdlib::coroutine_lib::call_wrap_call(
                         tag_val, self, func_idx, nargs, nresults,
@@ -2204,6 +2266,14 @@ impl LuaState {
         }
     }
 
+    /// 注册有 __gc 元方法的 UserData — FILE* 等通过默认元表设置的 userdata
+    pub fn register_ud_finobj(&mut self, u: &crate::objects::Udata) {
+        let ptr_id = u.gc_header.ptr_id;
+        if !self.ud_finobj_list.iter().any(|x| x.gc_header.ptr_id == ptr_id) {
+            self.ud_finobj_list.push(u.clone());
+        }
+    }
+
     /// 处理弱引用表 — 在 collectgarbage("collect") 中调用
     /// 扫描所有弱引用表，清除值（或键）仅被弱引用表持有的条目
     /// 使用 Rc::strong_count 判断：count == 1 表示仅弱引用表本身持有
@@ -2381,7 +2451,8 @@ impl LuaState {
     fn call_finalizers(&mut self, reachable: &HashSet<usize>) {
         // 收集需要 finalize 的对象（不可达且有 __gc）
         let gc_key = TValue::Str(self.intern_str("__gc"));
-        let mut to_finalize: Vec<(Table, TValue)> = Vec::new();
+        // (gc_func, object_value) — object_value 是要 finalize 的对象
+        let mut to_finalize: Vec<(TValue, TValue)> = Vec::new();
         let mut keep: Vec<Table> = Vec::new();
 
         for t in self.finobj_list.drain(..) {
@@ -2400,18 +2471,40 @@ impl LuaState {
                 }
             };
             if let Some(gc_func) = gc_func {
-                to_finalize.push((t, gc_func));
+                to_finalize.push((gc_func, TValue::Table(t.clone())));
             }
             // 没有 __gc 的不可达对象直接丢弃（将被 sweep）
         }
         self.finobj_list = keep;
 
+        // 收集需要 finalize 的 UserData（不可达且有 __gc）
+        let mut ud_keep: Vec<crate::objects::Udata> = Vec::new();
+        for u in self.ud_finobj_list.drain(..) {
+            let is_reachable = u.gc_header.id().map_or(false, |id| reachable.contains(&id.0));
+            if is_reachable {
+                ud_keep.push(u);
+                continue;
+            }
+            // 获取 __gc 元方法
+            let gc_func = {
+                if let Some(ref mt) = u.metatable {
+                    mt.get(&gc_key)
+                } else {
+                    None
+                }
+            };
+            if let Some(gc_func) = gc_func {
+                to_finalize.push((gc_func, TValue::UserData(u.clone())));
+            }
+        }
+        self.ud_finobj_list = ud_keep;
+
         // 调用每个 finalizer
-        for (t, gc_func) in to_finalize {
+        for (gc_func, obj_val) in to_finalize {
             let stack_base = self.stack.len();
             // 压入 __gc 函数和对象参数（对应 C 的 luaT_callTMres）
             self.stack.push(gc_func);
-            self.stack.push(TValue::Table(t.clone()));
+            self.stack.push(obj_val);
             self.top = self.stack.len();
 
             // 推入 CallInfoEntry — name="__gc", namewhat="metamethod"
@@ -2547,6 +2640,20 @@ impl LuaState {
                                 }
                             }
                         }
+                    }
+                }
+            }
+            TValue::UserData(u) => {
+                if let Some(id) = u.gc_header.id() {
+                    reachable.insert(id.0);
+                }
+                let ptr_id = u.gc_header.ptr_id;
+                if visited.insert(ptr_id) {
+                    if let Some(ref mt) = u.metatable {
+                        worklist.push(TValue::Table((**mt).clone()));
+                    }
+                    for uv in &u.user_values {
+                        worklist.push(uv.clone());
                     }
                 }
             }

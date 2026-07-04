@@ -1189,6 +1189,11 @@ impl VmExecutor {
                     crate::stdlib::io_lib::call_io_function(
                         tag_val, state, ra + 3, nargs, nresults,
                     )
+                } else if crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
+                    // io.lines/file:lines 返回的迭代器（必须在 wrap_call 之前检查）
+                    crate::stdlib::io_lib::call_lines_iterator(
+                        tag_val, state, ra + 3, nargs, nresults,
+                    )
                 } else if crate::stdlib::coroutine_lib::is_wrap_call_tag(tag_val) {
                     // coroutine.wrap 返回的函数（标签 710+）
                     crate::stdlib::coroutine_lib::call_wrap_call(
@@ -3798,6 +3803,11 @@ impl VmExecutor {
                     crate::stdlib::io_lib::call_io_function(
                         tag_val, state, a, nargs, nresults,
                     )
+                } else if crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
+                    // io.lines/file:lines 返回的迭代器
+                    crate::stdlib::io_lib::call_lines_iterator(
+                        tag_val, state, a, nargs, nresults,
+                    )
                 } else if crate::stdlib::coroutine_lib::is_wrap_call_tag(tag_val) {
                     // coroutine.wrap 返回的函数（标签 710+）
                     crate::stdlib::coroutine_lib::call_wrap_call(
@@ -4148,6 +4158,11 @@ impl VmExecutor {
                 } else if crate::stdlib::io_lib::is_io_function_tag(tag_val) {
                     // I/O 库函数（标签 800-809）
                     crate::stdlib::io_lib::call_io_function(
+                        tag_val, state, a, nargs, -1,
+                    )?;
+                } else if crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
+                    // io.lines/file:lines 返回的迭代器
+                    crate::stdlib::io_lib::call_lines_iterator(
                         tag_val, state, a, nargs, -1,
                     )?;
                 } else if crate::stdlib::coroutine_lib::is_wrap_call_tag(tag_val) {
