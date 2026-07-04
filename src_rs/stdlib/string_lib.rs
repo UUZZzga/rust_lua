@@ -443,6 +443,8 @@ fn class_end(ms: &MatchState, p: usize) -> Result<usize, String> {
             if idx < ms.p_end && ms.pat_byte(idx) == b'^' {
                 idx += 1;
             }
+            // do-while 风格：字符集中的第一个 ']' 被当作内容，第二个 ']' 才是结束符
+            // （与 C 实现一致，使 `[^]]` 能匹配任何非 ']' 字符，`[]]` 能匹配 ']'）
             loop {
                 if idx >= ms.p_end {
                     return Err("malformed pattern (missing ']')".to_string());
@@ -451,11 +453,11 @@ fn class_end(ms: &MatchState, p: usize) -> Result<usize, String> {
                 idx += 1;
                 if c == b'%' && idx < ms.p_end {
                     idx += 1;
-                } else if c == b']' {
-                    break;
+                }
+                if idx < ms.p_end && ms.pat_byte(idx) == b']' {
+                    return Ok(idx + 1);
                 }
             }
-            Ok(idx)
         }
         _ => Ok(p + 1),
     }
@@ -482,12 +484,13 @@ fn single_match(ms: &MatchState, s: usize, p: usize, ep: usize) -> bool {
 }
 
 /// 对应 C 的 matchbalance: 平衡匹配 %bxy
-fn match_balance(ms: &MatchState, s: usize, p: usize) -> Option<usize> {
+/// 参数不足时报错（对应 C 的 luaL_error）
+fn match_balance(ms: &MatchState, s: usize, p: usize) -> Result<Option<usize>, String> {
     if p + 1 >= ms.p_end {
-        return None;
+        return Err("malformed pattern (missing arguments to '%b')".to_string());
     }
     if s >= ms.src_end || ms.src_byte(s) != ms.pat_byte(p) {
-        return None;
+        return Ok(None);
     }
     let b = ms.pat_byte(p);
     let e = ms.pat_byte(p + 1);
@@ -498,23 +501,25 @@ fn match_balance(ms: &MatchState, s: usize, p: usize) -> Option<usize> {
         if c == e {
             cont -= 1;
             if cont == 0 {
-                return Some(idx + 1);
+                return Ok(Some(idx + 1));
             }
         } else if c == b {
             cont += 1;
         }
         idx += 1;
     }
-    None
+    Ok(None)
 }
 
 /// 对应 C 的 check_capture
 fn check_capture(ms: &MatchState, l: u8) -> Result<usize, String> {
-    let l = (l - b'1') as usize;
-    if l >= ms.level || ms.captures[l].len == CAP_UNFINISHED {
+    // C: l -= '1'; if (l < 0 || l >= ms->level || ...)
+    // 用 i32 避免负数下溢（%0 会得到 -1）
+    let l = (l as i32) - (b'1' as i32);
+    if l < 0 || l as usize >= ms.level || ms.captures[l as usize].len == CAP_UNFINISHED {
         return Err(format!("invalid capture index %{}", l + 1));
     }
-    Ok(l)
+    Ok(l as usize)
 }
 
 /// 对应 C 的 capture_to_close
@@ -557,13 +562,14 @@ fn end_capture(ms: &mut MatchState, s: usize, p: usize) -> Result<Option<usize>,
 }
 
 /// 对应 C 的 match_capture
-fn match_capture(ms: &MatchState, s: usize, l: u8) -> Option<usize> {
-    let l = check_capture(ms, l).ok()?;
+fn match_capture(ms: &MatchState, s: usize, l: u8) -> Result<Option<usize>, String> {
+    // C: l = check_capture(ms, l);  会抛出错误
+    let l = check_capture(ms, l)?;
     let len = ms.captures[l].len as usize;
     if s + len <= ms.src_end && ms.src[ms.captures[l].init..ms.captures[l].init + len] == ms.src[s..s + len] {
-        Some(s + len)
+        Ok(Some(s + len))
     } else {
-        None
+        Ok(None)
     }
 }
 
@@ -674,7 +680,7 @@ fn match_pattern_inner(ms: &mut MatchState, mut s: usize, mut p: usize) -> Resul
                 if p + 1 < ms.p_end {
                     match ms.pat_byte(p + 1) {
                         b'b' => {
-                            let res = match_balance(ms, s, p + 2);
+                            let res = match_balance(ms, s, p + 2)?;
                             match res {
                                 Some(new_s) => {
                                     s = new_s;
@@ -702,7 +708,7 @@ fn match_pattern_inner(ms: &mut MatchState, mut s: usize, mut p: usize) -> Resul
                             }
                         }
                         c if c.is_ascii_digit() => {
-                            let res = match_capture(ms, s, c);
+                            let res = match_capture(ms, s, c)?;
                             match res {
                                 Some(new_s) => {
                                     s = new_s;
@@ -898,13 +904,16 @@ pub fn str_find(s: &str, pattern: &str, init: i64, plain: bool) -> Result<FindRe
         ms.level = 0;
         ms.captures.clear();
         ms.match_depth = MAX_CCALLS;
-        if let Ok(Some(end)) = match_pattern(&mut ms, search_pos, pat_start) {
-            let captures = get_captures(&ms, search_pos, end)?;
-            return Ok(FindResult::Found {
-                start: search_pos + 1,
-                end,
-                captures,
-            });
+        match match_pattern(&mut ms, search_pos, pat_start)? {
+            Some(end) => {
+                let captures = get_captures(&ms, search_pos, end)?;
+                return Ok(FindResult::Found {
+                    start: search_pos + 1,
+                    end,
+                    captures,
+                });
+            }
+            None => {}
         }
         if anchor || search_pos >= ms.src_end {
             break;
@@ -976,21 +985,24 @@ impl GMatchIterator {
             ms.captures.clear();
             ms.match_depth = MAX_CCALLS;
             let match_start = self.pos;
-            if let Ok(Some(end)) = match_pattern(&mut ms, match_start, self.pat_start) {
-                let captures = get_captures(&ms, match_start, end)?;
-                // 推进位置: 如果匹配为空则前进 1 以避免无限循环
-                self.pos = if end > match_start { end } else { match_start + 1 };
-                if captures.is_empty() {
-                    // 无捕获时返回整个匹配的子串
-                    // Lua 字符串是字节序列，使用 from_utf8_unchecked 保留原始字节
-                    let matched_str = unsafe {
-                        String::from_utf8_unchecked(src_bytes[match_start..end].to_vec())
-                    };
-                    return Ok(vec![TValue::Str(crate::strings::LuaString::Short(
-                        Arc::new(crate::strings::ShortString { hash: 0, contents: matched_str })
-                    ))]);
+            match match_pattern(&mut ms, match_start, self.pat_start)? {
+                Some(end) => {
+                    let captures = get_captures(&ms, match_start, end)?;
+                    // 推进位置: 如果匹配为空则前进 1 以避免无限循环
+                    self.pos = if end > match_start { end } else { match_start + 1 };
+                    if captures.is_empty() {
+                        // 无捕获时返回整个匹配的子串
+                        // Lua 字符串是字节序列，使用 from_utf8_unchecked 保留原始字节
+                        let matched_str = unsafe {
+                            String::from_utf8_unchecked(src_bytes[match_start..end].to_vec())
+                        };
+                        return Ok(vec![TValue::Str(crate::strings::LuaString::Short(
+                            Arc::new(crate::strings::ShortString { hash: 0, contents: matched_str })
+                        ))]);
+                    }
+                    return Ok(captures);
                 }
-                return Ok(captures);
+                None => {}
             }
             if self.anchor {
                 break;
@@ -1022,7 +1034,8 @@ pub fn str_gsub(s: &str, pattern: &str, repl: &str, max_s: i64) -> Result<(Strin
         ms.captures.clear();
         ms.match_depth = MAX_CCALLS;
 
-        if let Ok(Some(end)) = match_pattern(&mut ms, src_pos, pat_start) {
+        let matched = match_pattern(&mut ms, src_pos, pat_start)?;
+        if let Some(end) = matched {
             if Some(end) == last_match_end {
                 // 避免空匹配的无限循环
                 if src_pos < len {
@@ -1075,7 +1088,7 @@ fn str_gsub_with_repl(
     pattern: &str,
     repl: &TValue,
     max_s: i64,
-) -> Result<(String, i64), String> {
+) -> Result<(String, i64, bool), String> {
     let src_bytes = s.as_bytes();
     let len = src_bytes.len();
     let max_s = if max_s < 0 { len as i64 + 1 } else { max_s };
@@ -1085,6 +1098,7 @@ fn str_gsub_with_repl(
     let mut result: Vec<u8> = Vec::new();
     let mut src_pos = 0;
     let mut n = 0i64;
+    let mut changed = false;
     let mut last_match_end: Option<usize> = None;
 
     while n < max_s && src_pos <= len {
@@ -1093,7 +1107,8 @@ fn str_gsub_with_repl(
         ms.captures.clear();
         ms.match_depth = MAX_CCALLS;
 
-        if let Ok(Some(end)) = match_pattern(&mut ms, src_pos, pat_start) {
+        let matched = match_pattern(&mut ms, src_pos, pat_start)?;
+        if let Some(end) = matched {
             if Some(end) == last_match_end {
                 // 避免空匹配的无限循环
                 if src_pos < len {
@@ -1109,7 +1124,8 @@ fn str_gsub_with_repl(
             last_match_end = Some(end);
 
             // 处理替换值 (table 或 function) — 对应 C 的 add_value
-            let replacement = add_value_from_repl(state, &ms, src_pos, end, repl)?;
+            let (replacement, repl_changed) = add_value_from_repl(state, &ms, src_pos, end, repl)?;
+            changed = changed || repl_changed;
             result.extend_from_slice(replacement.as_bytes());
 
             src_pos = end;
@@ -1130,36 +1146,45 @@ fn str_gsub_with_repl(
     }
 
     let result = unsafe { String::from_utf8_unchecked(result) };
-    Ok((result, n))
+    Ok((result, n, changed))
 }
 
 /// 对应 C 的 add_value — 处理 table/function 替换值
 ///
-/// 返回替换后的字符串。若结果为 nil/false，保留原匹配文本。
+/// 返回 (替换后的字符串, changed 标志)。
+/// 若结果为 nil/false，保留原匹配文本，changed = false（对应 C 的 return 0）。
 fn add_value_from_repl(
     state: &mut LuaState,
     ms: &MatchState,
     s: usize,
     e: usize,
     repl: &TValue,
-) -> Result<String, String> {
+) -> Result<(String, bool), String> {
     match repl {
         // table 替换 — 对应 C 的 LUA_TTABLE 分支
         TValue::Table(t) => {
             // push_onecapture(ms, 0, s, e) — 第一个捕获（或整个匹配）作为索引
             let key = get_capture_as_tvalue(state, ms, 0, s, e)?;
-            // lua_gettable(L, 3)
-            let val = t.get(&key);
+            // lua_gettable(L, 3) — 需要处理 __index 元方法
+            let val = crate::execute::VmExecutor::table_get(
+                state,
+                &TValue::Table(t.clone()),
+                &key,
+                crate::execute::VarSource::None,
+            ).map_err(|e| match e {
+                VmError::RuntimeError(s) => s,
+                _ => "error in table indexing".to_string(),
+            })?;
             match val {
-                None | Some(TValue::Nil(_)) | Some(TValue::Boolean(false)) => {
-                    // nil 或 false — 保留原匹配文本
+                TValue::Nil(_) | TValue::Boolean(false) => {
+                    // nil 或 false — 保留原匹配文本，changed = false
                     let bytes = &ms.src[s..e];
-                    Ok(unsafe { String::from_utf8_unchecked(bytes.to_vec()) })
+                    Ok((unsafe { String::from_utf8_unchecked(bytes.to_vec()) }, false))
                 }
-                Some(TValue::Str(st)) => Ok(st.as_str().to_string()),
-                Some(TValue::Integer(i)) => Ok(i.to_string()),
-                Some(TValue::Float(f)) => Ok(format_float_value(f)),
-                Some(other) => Err(format!(
+                TValue::Str(st) => Ok((st.as_str().to_string(), true)),
+                TValue::Integer(i) => Ok((i.to_string(), true)),
+                TValue::Float(f) => Ok((format_float_value(f), true)),
+                other => Err(format!(
                     "invalid replacement value (a {})",
                     other.ty()
                 )),
@@ -1203,13 +1228,13 @@ fn add_value_from_repl(
 
             match result_val {
                 TValue::Nil(_) | TValue::Boolean(false) => {
-                    // nil 或 false — 保留原匹配文本
+                    // nil 或 false — 保留原匹配文本，changed = false
                     let bytes = &ms.src[s..e];
-                    Ok(unsafe { String::from_utf8_unchecked(bytes.to_vec()) })
+                    Ok((unsafe { String::from_utf8_unchecked(bytes.to_vec()) }, false))
                 }
-                TValue::Str(st) => Ok(st.as_str().to_string()),
-                TValue::Integer(i) => Ok(i.to_string()),
-                TValue::Float(f) => Ok(format_float_value(f)),
+                TValue::Str(st) => Ok((st.as_str().to_string(), true)),
+                TValue::Integer(i) => Ok((i.to_string(), true)),
+                TValue::Float(f) => Ok((format_float_value(f), true)),
                 other => Err(format!(
                     "invalid replacement value (a {})",
                     other.ty()
@@ -1291,7 +1316,9 @@ fn apply_replacement(repl: &str, ms: &MatchState, s: usize, e: usize) -> Result<
                     }
                 }
             } else {
-                return Err(format!("invalid use of '%{}' in replacement string", c as char));
+                // C: luaL_error(L, "invalid use of '%c' in replacement string", L_ESC);
+                // L_ESC 是 '%', 所以消息是 "invalid use of '%' in replacement string"
+                return Err("invalid use of '%' in replacement string".to_string());
             }
             i += 1;
         } else {
@@ -2833,7 +2860,11 @@ fn get_int_arg(state: &LuaState, a: usize, idx: usize, default: i64, _funcname: 
 }
 
 /// 从栈中读取可选整数参数 (对应 C 的 luaL_optinteger)
-fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: i64, _funcname: &str) -> Result<i64, VmError> {
+/// nargs 是实际参数个数，用 nargs 判断参数是否存在（对应 C 的 lua_gettop）
+fn get_opt_int_arg(state: &LuaState, a: usize, nargs: usize, idx: usize, default: i64, _funcname: &str) -> Result<i64, VmError> {
+    if idx >= nargs {
+        return Ok(default);
+    }
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.stack.len() {
         return Ok(default);
@@ -2860,7 +2891,10 @@ fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: i64, _funcna
 }
 
 /// 从栈中读取布尔参数
-fn get_bool_arg(state: &LuaState, a: usize, idx: usize, default: bool) -> bool {
+fn get_bool_arg(state: &LuaState, a: usize, nargs: usize, idx: usize, default: bool) -> bool {
+    if idx >= nargs {
+        return default;
+    }
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.stack.len() {
         return default;
@@ -3003,6 +3037,7 @@ fn call_gmatch_iter(
     let pos_key = TValue::Str(state.intern_str("pos"));
     let anchor_key = TValue::Str(state.intern_str("anchor"));
     let pat_start_key = TValue::Str(state.intern_str("pat_start"));
+    let lastmatch_key = TValue::Str(state.intern_str("lastmatch"));
 
     let s_str = match state_table.get(&s_key) {
         Some(TValue::Str(s)) => s.as_str().to_string(),
@@ -3030,6 +3065,11 @@ fn call_gmatch_iter(
         Some(TValue::Integer(n)) => n as usize,
         _ => 0,
     };
+    // lastmatch: 上次匹配的结束位置（-1 表示无上次匹配）
+    let lastmatch: i64 = match state_table.get(&lastmatch_key) {
+        Some(TValue::Integer(n)) => n,
+        _ => -1,
+    };
 
     // 运行匹配循环 — 对应 C 的 gmatch_aux
     let src_bytes = s_str.as_bytes();
@@ -3047,28 +3087,32 @@ fn call_gmatch_iter(
 
         match match_pattern(&mut ms, cur_pos, pat_start) {
             Ok(Some(end)) => {
-                // 找到匹配
-                let captures = match get_captures(&ms, cur_pos, end) {
-                    Ok(c) => c,
-                    Err(e) => return Err(VmError::RuntimeError(e)),
-                };
-                // 推进位置: 如果匹配为空则前进 1 以避免无限循环
-                let next_pos = if end > cur_pos { end } else { cur_pos + 1 };
-                // 更新状态表中的 pos
-                state_table.set(pos_key.clone(), TValue::Integer(next_pos as i64));
-
-                if captures.is_empty() {
-                    // 无捕获时返回整个匹配的子串
-                    // Lua 字符串是字节序列，使用 from_utf8_unchecked 保留原始字节
-                    let matched_str = unsafe {
-                        String::from_utf8_unchecked(src_bytes[cur_pos..end].to_vec())
+                // 对应 C: e != gm->lastmatch
+                // 跳过结束位置与上次匹配相同的匹配（处理空匹配的重复）
+                if end as i64 != lastmatch {
+                    // 找到匹配
+                    let captures = match get_captures(&ms, cur_pos, end) {
+                        Ok(c) => c,
+                        Err(e) => return Err(VmError::RuntimeError(e)),
                     };
-                    result_vals.push(TValue::Str(state.intern_str(&matched_str)));
-                } else {
-                    result_vals = captures;
+                    // 更新 pos 和 lastmatch（对应 C: gm->src = gm->lastmatch = e）
+                    state_table.set(pos_key.clone(), TValue::Integer(end as i64));
+                    state_table.set(lastmatch_key.clone(), TValue::Integer(end as i64));
+
+                    if captures.is_empty() {
+                        // 无捕获时返回整个匹配的子串
+                        // Lua 字符串是字节序列，使用 from_utf8_unchecked 保留原始字节
+                        let matched_str = unsafe {
+                            String::from_utf8_unchecked(src_bytes[cur_pos..end].to_vec())
+                        };
+                        result_vals.push(TValue::Str(state.intern_str(&matched_str)));
+                    } else {
+                        result_vals = captures;
+                    }
+                    found = true;
+                    break;
                 }
-                found = true;
-                break;
+                // end == lastmatch，跳过此匹配，继续下一个位置
             }
             Ok(None) => {
                 // 未匹配，继续下一个位置
@@ -3124,7 +3168,7 @@ pub fn call_string_function(
         STR_SUB => {
             let s = get_str_arg(state, a, 0)?;
             let start = get_int_arg(state, a, 1, 1, "sub")?;
-            let end = get_opt_int_arg(state, a, 2, -1, "sub")?;
+            let end = get_opt_int_arg(state, a, nargs, 2, -1, "sub")?;
             let result = str_sub(&s, start, end);
             push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&result))]);
             Ok(())
@@ -3137,8 +3181,8 @@ pub fn call_string_function(
         }
         STR_BYTE => {
             let s = get_str_arg(state, a, 0)?;
-            let i = get_opt_int_arg(state, a, 1, 1, "byte")?;
-            let j = get_opt_int_arg(state, a, 2, i, "byte")?;
+            let i = get_opt_int_arg(state, a, nargs, 1, 1, "byte")?;
+            let j = get_opt_int_arg(state, a, nargs, 2, i, "byte")?;
             let bytes = str_byte(&s, i, j);
             let results: Vec<TValue> = bytes.into_iter().map(TValue::Integer).collect();
             push_results(state, a, nresults, results);
@@ -3176,8 +3220,8 @@ pub fn call_string_function(
         STR_FIND => {
             let s = get_str_arg(state, a, 0)?;
             let pattern = get_str_arg(state, a, 1)?;
-            let init = get_opt_int_arg(state, a, 2, 1, "find")?;
-            let plain = get_bool_arg(state, a, 3, false);
+            let init = get_opt_int_arg(state, a, nargs, 2, 1, "find")?;
+            let plain = get_bool_arg(state, a, nargs, 3, false);
             match str_find(&s, &pattern, init, plain) {
                 Ok(FindResult::Found { start, end, captures }) => {
                     let mut results = vec![TValue::Integer(start as i64), TValue::Integer(end as i64)];
@@ -3222,7 +3266,7 @@ pub fn call_string_function(
         STR_MATCH => {
             let s = get_str_arg(state, a, 0)?;
             let pattern = get_str_arg(state, a, 1)?;
-            let init = get_opt_int_arg(state, a, 2, 1, "match")?;
+            let init = get_opt_int_arg(state, a, nargs, 2, 1, "match")?;
             match str_match(&s, &pattern, init) {
                 Ok(results) => {
                     push_results(state, a, nresults, results);
@@ -3234,7 +3278,10 @@ pub fn call_string_function(
         STR_GSUB => {
             let s = get_str_arg(state, a, 0)?;
             let pattern = get_str_arg(state, a, 1)?;
-            let max_s = get_opt_int_arg(state, a, 3, -1, "gsub")?;
+            let max_s = get_opt_int_arg(state, a, nargs, 3, -1, "gsub")?;
+            // 原始字符串的 TValue — 对应 C 的 lua_pushvalue(L, 1)
+            // 当没有替换发生时，返回原始字符串（保持指针一致性，使 %p 相等）
+            let orig_str = state.stack.get(a + 1).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
             // 检查 repl 参数类型 — 对应 C 的 tr = lua_type(L, 3)
             let repl_idx = a + 3;
             let repl_val = if repl_idx < state.stack.len() {
@@ -3247,9 +3294,11 @@ pub fn call_string_function(
                 // LightUserData (C 函数标签) 也算 function (is_function 包含它)
                 TValue::Table(_) | TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) | TValue::LightUserData(_) => {
                     match str_gsub_with_repl(state, &s, &pattern, &repl_val, max_s) {
-                        Ok((result, n)) => {
+                        Ok((result, n, changed)) => {
+                            // 对应 C: if (!changed) lua_pushvalue(L, 1);
+                            let result_val = if !changed { orig_str } else { TValue::Str(state.intern_str(&result)) };
                             push_results(state, a, nresults, vec![
-                                TValue::Str(state.intern_str(&result)),
+                                result_val,
                                 TValue::Integer(n),
                             ]);
                             Ok(())
@@ -3262,8 +3311,10 @@ pub fn call_string_function(
                     let repl = get_str_arg(state, a, 2)?;
                     match str_gsub(&s, &pattern, &repl, max_s) {
                         Ok((result, n)) => {
+                            // 对应 C: if (!changed) lua_pushvalue(L, 1);
+                            let result_val = if n == 0 { orig_str } else { TValue::Str(state.intern_str(&result)) };
                             push_results(state, a, nresults, vec![
-                                TValue::Str(state.intern_str(&result)),
+                                result_val,
                                 TValue::Integer(n),
                             ]);
                             Ok(())
@@ -3284,10 +3335,12 @@ pub fn call_string_function(
             // 状态: {s=string, p=pattern, pos=0, anchor=bool, pat_start=int}
             let s = get_str_arg(state, a, 0)?;
             let p = get_str_arg(state, a, 1)?;
-            let init = get_opt_int_arg(state, a, 2, 1, "gmatch")?;
+            let init = get_opt_int_arg(state, a, nargs, 2, 1, "gmatch")?;
             let len = s.len();
             let init_pos = posrelat_i(init, len).saturating_sub(1);
-            let init_pos = if init_pos > len { len } else { init_pos };
+            // 对应 C: if (init > ls) init = ls + 1;
+            // 让 src = s + (ls+1) 超过 src_end = s + ls，循环不执行
+            let init_pos = if init_pos > len { len + 1 } else { init_pos };
 
             let anchor = p.starts_with('^');
             let pat_start = if anchor { 1 } else { 0 };
@@ -3313,6 +3366,12 @@ pub fn call_string_function(
             state_table.set(
                 TValue::Str(state.intern_str("pat_start")),
                 TValue::Integer(pat_start as i64),
+            );
+            // lastmatch: 上次匹配的结束位置（-1 表示无上次匹配）
+            // 对应 C 的 gm->lastmatch，用于跳过空匹配造成的重复
+            state_table.set(
+                TValue::Str(state.intern_str("lastmatch")),
+                TValue::Integer(-1),
             );
 
             // 创建元表,设置 __call = STR_GMATCH_ITER 标签
@@ -3379,7 +3438,7 @@ pub fn call_string_function(
                     ))),
                 }
             };
-            let pos = get_opt_int_arg(state, a, 2, 1, "unpack")?;
+            let pos = get_opt_int_arg(state, a, nargs, 2, 1, "unpack")?;
             match str_unpack(&fmt, &data_bytes, pos) {
                 Ok((mut values, next_pos)) => {
                     // 最后一个返回值是下一个位置
