@@ -685,6 +685,18 @@ impl<'a> FuncState<'a> {
         self.emit(ins)
     }
 
+    /// 生成加载常量指令: k <= MAXARG_BX 时用 LOADK，否则用 LOADKX + EXTRAARG
+    /// 对应 C 的 luaK_codek
+    fn code_loadk(&mut self, reg: i32, k: i32) -> i32 {
+        if k <= crate::opcodes::MAXARG_BX as i32 {
+            self.code_abx(OpCode::LOADK, reg, k)
+        } else {
+            let pc = self.code_abx(OpCode::LOADKX, reg, 0);
+            self.code_ax(OpCode::EXTRAARG, k);
+            pc
+        }
+    }
+
     /// 生成 IAsBx 模式指令: `op a sbx` (有符号偏移, 加 OFFSET_SBX)
     fn code_asbx(&mut self, op: OpCode, a: i32, sbx: i32) -> i32 {
         let ins = ((op as u32) << POS_OP)
@@ -1767,7 +1779,7 @@ impl<'a> FuncState<'a> {
                     self.code_asbx(OpCode::LOADI, r, val as i32);
                 } else {
                     let k = self.int_k(val);
-                    self.code_abx(OpCode::LOADK, r, k);
+                    self.code_loadk(r, k);
                 }
                 r
             }
@@ -1779,14 +1791,14 @@ impl<'a> FuncState<'a> {
                     self.code_asbx(OpCode::LOADF, r, fi as i32);
                 } else {
                     let k = self.float_k(f);
-                    self.code_abx(OpCode::LOADK, r, k);
+                    self.code_loadk(r, k);
                 }
                 r
             }
             ExpKind::Str => {
                 let r = self.alloc_reg();
                 let k = self.get_str_k(e);
-                self.code_abx(OpCode::LOADK, r, k);
+                self.code_loadk(r, k);
                 r
             }
             ExpKind::NonReloc => {
@@ -1928,7 +1940,7 @@ impl<'a> FuncState<'a> {
                     self.code_asbx(OpCode::LOADI, reg, val as i32);
                 } else {
                     let k = self.int_k(val);
-                    self.code_abx(OpCode::LOADK, reg, k);
+                    self.code_loadk(reg, k);
                 }
             }
             ExpKind::Float => {
@@ -1938,12 +1950,12 @@ impl<'a> FuncState<'a> {
                     self.code_asbx(OpCode::LOADF, reg, fi as i32);
                 } else {
                     let k = self.float_k(f);
-                    self.code_abx(OpCode::LOADK, reg, k);
+                    self.code_loadk(reg, k);
                 }
             }
             ExpKind::Str => {
                 let k = self.get_str_k(e);
-                self.code_abx(OpCode::LOADK, reg, k);
+                self.code_loadk(reg, k);
             }
             ExpKind::Vararg => {
                 // Like C's setoneret for VVARARG: SETARG_C(pc, 2), then VRELOC
@@ -2975,7 +2987,7 @@ fn code_gettabup(fs: &mut FuncState, r: i32, upval: i32, k: i32) -> i32 {
     } else {
         fs.code_abc(OpCode::GETUPVAL, r, upval, 0);
         let kr = fs.alloc_reg();
-        fs.code_abx(OpCode::LOADK, kr, k);
+        fs.code_loadk(kr, k);
         let pc = fs.code_abc(OpCode::GETTABLE, r, r, kr);
         fs.free_reg();
         pc
@@ -2990,7 +3002,7 @@ fn code_settabup(fs: &mut FuncState, upval: i32, k: i32, val: i32) {
         let r = fs.alloc_reg();
         fs.code_abc(OpCode::GETUPVAL, r, upval, 0);
         let kr = fs.alloc_reg();
-        fs.code_abx(OpCode::LOADK, kr, k);
+        fs.code_loadk(kr, k);
         fs.code_abc_k(OpCode::SETTABLE, r, kr, val, false);
         fs.free_reg(); // kr
         fs.free_reg(); // r
@@ -3005,7 +3017,7 @@ fn code_settabup_k(fs: &mut FuncState, upval: i32, k: i32, val: i32, is_k: bool)
         let r = fs.alloc_reg();
         fs.code_abc(OpCode::GETUPVAL, r, upval, 0);
         let kr = fs.alloc_reg();
-        fs.code_abx(OpCode::LOADK, kr, k);
+        fs.code_loadk(kr, k);
         fs.code_abc_k(OpCode::SETTABLE, r, kr, val, is_k);
         fs.free_reg(); // kr
         fs.free_reg(); // r
@@ -3034,12 +3046,12 @@ fn code_getfield(fs: &mut FuncState, r: i32, table: i32, k: i32) -> i32 {
         fs.code_abc(OpCode::GETFIELD, r, table, k)
     } else if r != table {
         // Optimization: use result register for LOADK (same as C++ compiler's codegetfield)
-        fs.code_abx(OpCode::LOADK, r, k);
+        fs.code_loadk(r, k);
         fs.code_abc(OpCode::GETTABLE, r, table, r)
     } else {
         // r == table: can't use r for LOADK as it would overwrite the table value
         let kr = fs.alloc_reg();
-        fs.code_abx(OpCode::LOADK, kr, k);
+        fs.code_loadk(kr, k);
         let pc = fs.code_abc(OpCode::GETTABLE, r, table, kr);
         fs.free_reg(); // kr
         pc
@@ -3052,7 +3064,7 @@ fn code_setfield(fs: &mut FuncState, table: i32, k: i32, val: i32) {
         fs.code_abc_k(OpCode::SETFIELD, table, k, val, false);
     } else {
         let kr = fs.alloc_reg();
-        fs.code_abx(OpCode::LOADK, kr, k);
+        fs.code_loadk(kr, k);
         fs.code_abc_k(OpCode::SETTABLE, table, kr, val, false);
         fs.free_reg(); // kr
     }
@@ -3064,7 +3076,7 @@ fn code_setfield_k(fs: &mut FuncState, table: i32, k: i32, val: i32, is_k: bool)
         fs.code_abc_k(OpCode::SETFIELD, table, k, val, is_k);
     } else {
         let kr = fs.alloc_reg();
-        fs.code_abx(OpCode::LOADK, kr, k);
+        fs.code_loadk(kr, k);
         fs.code_abc_k(OpCode::SETTABLE, table, kr, val, is_k);
         fs.free_reg(); // kr
     }
@@ -3161,13 +3173,13 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
                     (r, true)
                 };
                 let key_reg = fs.alloc_reg();
-                fs.code_abx(OpCode::LOADK, key_reg, var_k_names[i]);
+                fs.code_loadk(key_reg, var_k_names[i]);
                 pre_evals.push(PreEvalInfo { table_reg, key_reg, table_allocated });
             } else if env_is_vvargvar {
                 // _ENV 是 VVARGVAR：预评估 key（LOADK），匹配 C 的 buildglobal
                 // （C 的 luaK_indexed 对 VVARGVAR 总是将 key 加载到寄存器）
                 let key_reg = fs.alloc_reg();
-                fs.code_abx(OpCode::LOADK, key_reg, var_k_names[i]);
+                fs.code_loadk(key_reg, var_k_names[i]);
                 pre_evals.push(PreEvalInfo { table_reg: env_reg, key_reg, table_allocated: false });
             } else {
                 pre_evals.push(PreEvalInfo { table_reg: -1, key_reg: -1, table_allocated: false });
@@ -3238,7 +3250,7 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
                 if env_is_local {
                     // _ENV is local: LOADK + GETTABLE + ERRNNIL (no GETUPVAL needed)
                     let cr = fs.alloc_reg();
-                    fs.code_abx(OpCode::LOADK, cr, var_k_names[i]);
+                    fs.code_loadk(cr, var_k_names[i]);
                     fs.code_abc(OpCode::GETTABLE, cr, env_reg, cr);
                     fs.fixline(init_line);
                     let k_bx = if var_k_names[i] >= crate::opcodes::MAXARG_BX as i32 { 0 } else { var_k_names[i] + 1 };
@@ -3252,7 +3264,7 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
                     let cr = fs.alloc_reg();
                     fs.code_abc(OpCode::GETUPVAL, cr, 0, 0);
                     let ckr = fs.alloc_reg();
-                    fs.code_abx(OpCode::LOADK, ckr, var_k_names[i]);
+                    fs.code_loadk(ckr, var_k_names[i]);
                     fs.code_abc(OpCode::GETTABLE, cr, cr, ckr);
                     fs.fixline(init_line);
                     let k_bx = if var_k_names[i] >= crate::opcodes::MAXARG_BX as i32 { 0 } else { var_k_names[i] + 1 };
@@ -3270,7 +3282,7 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
                 // （GETVARG 会被 luaK_finish 转为 GETTABLE，因为有 PF_VATAB）
                 // storevartop 使用 SETTABLE + PF_VATAB
                 let kr = fs.alloc_reg();
-                fs.code_abx(OpCode::LOADK, kr, var_k_names[i]);
+                fs.code_loadk(kr, var_k_names[i]);
                 // Free key register (like C's freeregs in VVARGIND discharge)
                 if kr >= fs.nvarstack() && kr == fs.freereg - 1 {
                     fs.free_reg();
@@ -3350,7 +3362,7 @@ fn globalfunc(fs: &mut FuncState, line: i32) {
         let table_reg = fs.alloc_reg();
         fs.code_abc(OpCode::GETUPVAL, table_reg, 0, 0);
         let key_reg = fs.alloc_reg();
-        fs.code_abx(OpCode::LOADK, key_reg, k);
+        fs.code_loadk(key_reg, k);
         pre_eval = Some((table_reg, key_reg));
     }
 
@@ -3362,7 +3374,7 @@ fn globalfunc(fs: &mut FuncState, line: i32) {
         let cr = fs.alloc_reg();
         fs.code_abc(OpCode::GETUPVAL, cr, 0, 0);
         let ckr = fs.alloc_reg();
-        fs.code_abx(OpCode::LOADK, ckr, k);
+        fs.code_loadk(ckr, k);
         fs.code_abc(OpCode::GETTABLE, cr, cr, ckr);
         let k_bx = if k >= crate::opcodes::MAXARG_BX as i32 { 0 } else { k + 1 };
         fs.code_abx(OpCode::ERRNNIL, cr, k_bx);
@@ -3601,7 +3613,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 if first.is_vvargvar {
                     let base_reg = first.reg.unwrap();
                     let kr = fs.alloc_reg();
-                    fs.code_abx(OpCode::LOADK, kr, k);
+                    fs.code_loadk(kr, k);
                     first = PrefixResult {
                         var_name: None, local_idx: None, key: None, reg: Some(base_reg),
                         table_reg: Some(base_reg), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false,
@@ -3663,7 +3675,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     (k, true, false)
                 } else {
                     let kr = fs.alloc_reg();
-                    fs.code_abx(OpCode::LOADK, kr, k);
+                    fs.code_loadk(kr, k);
                     (kr, false, true)
                 };
                 let new_is_upvalue = (first.is_upvalue || can_revert_getupval) && is_short_str;
@@ -3787,7 +3799,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                                 (-1, false, false)
                             } else {
                                 let kr = fs.alloc_reg();
-                                fs.code_abx(OpCode::LOADK, kr, k);
+                                fs.code_loadk(kr, k);
                                 (kr, false, false)
                             }
                         }
@@ -3798,7 +3810,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                             (-1, false, false)
                         } else {
                             let kr = fs.alloc_reg();
-                            fs.code_abx(OpCode::LOADK, kr, k);
+                            fs.code_loadk(kr, k);
                             (kr, false, false)
                         }
                     }
@@ -3863,7 +3875,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         // Long string key: emit LOADK now (after table's GETUPVAL)
                         let k = fs.get_str_k(&ei.exp);
                         let key_r = fs.alloc_reg();
-                        fs.code_abx(OpCode::LOADK, key_r, k);
+                        fs.code_loadk(key_r, k);
                         (key_r, true)
                     } else {
                         // Relocable key (e.g., i+j): patch the VRELOC instruction's A
@@ -3964,7 +3976,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         let r = fs.alloc_reg();
                         fs.code_abc(OpCode::GETUPVAL, r, v.upval_idx.unwrap_or(0), 0);
                         let kr = fs.alloc_reg();
-                        fs.code_abx(OpCode::LOADK, kr, k_name);
+                        fs.code_loadk(kr, k_name);
                         v.var_name = None;
                         v.key = None;
                         v.reg = Some(r);
@@ -4307,7 +4319,7 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
                     fs.code_asbx(OpCode::LOADI, dest, v as i32);
                 } else {
                     let k = fs.int_k(v);
-                    fs.code_abx(OpCode::LOADK, dest, k);
+                    fs.code_loadk(dest, k);
                 }
                 fs.resolve_jumps(e, dest);
                 return;
@@ -4317,7 +4329,7 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
                 fs.code_asbx(OpCode::LOADI, dest, v as i32);
             } else {
                 let k = fs.int_k(v);
-                fs.code_abx(OpCode::LOADK, dest, k);
+                fs.code_loadk(dest, k);
             }
         }
         ExpKind::Float => {
@@ -4328,7 +4340,7 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
                     fs.code_asbx(OpCode::LOADF, dest, fi as i32);
                 } else {
                     let k = fs.float_k(f);
-                    fs.code_abx(OpCode::LOADK, dest, k);
+                    fs.code_loadk(dest, k);
                 }
                 fs.resolve_jumps(e, dest);
                 return;
@@ -4339,17 +4351,17 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
                 fs.code_asbx(OpCode::LOADF, dest, fi as i32);
             } else {
                 let k = fs.float_k(f);
-                fs.code_abx(OpCode::LOADK, dest, k);
+                fs.code_loadk(dest, k);
             }
         }
         ExpKind::Str => {
             let k = fs.get_str_k(e);
             if e.t != NO_JUMP || e.f != NO_JUMP {
-                fs.code_abx(OpCode::LOADK, dest, k);
+                fs.code_loadk(dest, k);
                 fs.resolve_jumps(e, dest);
                 return;
             }
-            fs.code_abx(OpCode::LOADK, dest, k);
+            fs.code_loadk(dest, k);
         }
         ExpKind::VJMP => {
             let jmp_pc = e.info as i32;
@@ -4523,7 +4535,7 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
         fs.ls_mut().next();
         let k = fs.string_k(&str_s);
         let kr = fs.alloc_reg();
-        fs.code_abx(OpCode::LOADK, kr, k);
+        fs.code_loadk(kr, k);
         let pc = fs.code_abc(OpCode::CALL, freg, 2, 2);
         // C++ funcargs: luaK_fixline(fs, line) after CALL
         fs.fixline(line);
@@ -4563,7 +4575,7 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
                 fs.alloc_reg();
             }
             let kr = fs.alloc_reg();   // key reg at freg+2 or higher
-            fs.code_abx(OpCode::LOADK, kr, k);
+            fs.code_loadk(kr, k);
             fs.code_abc(OpCode::MOVE, freg + 1, src, 0);
             fs.code_abc(OpCode::GETTABLE, freg, src, kr);
             fs.free_reg();  // free key register
@@ -4582,7 +4594,7 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
             fs.ls_mut().next();
             let k = fs.string_k(&str_s);
             let kr = fs.alloc_reg();
-            fs.code_abx(OpCode::LOADK, kr, k);
+            fs.code_loadk(kr, k);
             let pc = fs.code_abc(OpCode::CALL, freg, 3, 2);
             fs.fixline(line);
             fs.set_freereg(freg + 1);
@@ -4766,7 +4778,7 @@ fn code_global_via_env_prefix(fs: &mut FuncState, name: &str) -> PrefixResult {
                     fs.code_asbx(OpCode::LOADI, env_r, val as i32);
                 } else {
                     let kk = fs.int_k(val);
-                    fs.code_abx(OpCode::LOADK, env_r, kk);
+                    fs.code_loadk(env_r, kk);
                 }
             }
             ExpKind::Float => {
@@ -4776,12 +4788,12 @@ fn code_global_via_env_prefix(fs: &mut FuncState, name: &str) -> PrefixResult {
                     fs.code_asbx(OpCode::LOADF, env_r, fi as i32);
                 } else {
                     let kk = fs.float_k(f);
-                    fs.code_abx(OpCode::LOADK, env_r, kk);
+                    fs.code_loadk(env_r, kk);
                 }
             }
             ExpKind::Str => {
                 let kk = fs.get_str_k(&env_ctc);
-                fs.code_abx(OpCode::LOADK, env_r, kk);
+                fs.code_loadk(env_r, kk);
             }
             ExpKind::Boolean => {
                 if env_ctc.info != 0 {
@@ -4795,7 +4807,7 @@ fn code_global_via_env_prefix(fs: &mut FuncState, name: &str) -> PrefixResult {
             }
             _ => {
                 let kk = fs.discharge_str(&mut env_ctc.clone());
-                fs.code_abx(OpCode::LOADK, env_r, kk);
+                fs.code_loadk(env_r, kk);
             }
         }
         let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
@@ -4804,7 +4816,7 @@ fn code_global_via_env_prefix(fs: &mut FuncState, name: &str) -> PrefixResult {
             PrefixResult { var_name: Some(name.to_string()), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(k), table_key_is_const: true, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
         } else {
             let kr = fs.alloc_reg();
-            fs.code_abx(OpCode::LOADK, kr, k);
+            fs.code_loadk(kr, k);
             PrefixResult { var_name: Some(name.to_string()), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
         }
     } else if let Some((env_reg, kind)) = fs.find_local_ex("_ENV") {
@@ -4817,7 +4829,7 @@ fn code_global_via_env_prefix(fs: &mut FuncState, name: &str) -> PrefixResult {
             // 1. GETVARG 会被 luaK_finish 转为 GETTABLE
             // 2. RETURN1 不会被转为 RETURN（PF_VAHID 被清除）
             let kr = fs.alloc_reg();
-            fs.code_abx(OpCode::LOADK, kr, k);
+            fs.code_loadk(kr, k);
             PrefixResult { var_name: Some(name.to_string()), local_idx: None, key: None, reg: None, table_reg: Some(env_reg), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: false, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: true, is_readonly }
         } else {
             let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
@@ -4829,7 +4841,7 @@ fn code_global_via_env_prefix(fs: &mut FuncState, name: &str) -> PrefixResult {
                 let env_r = fs.alloc_reg();
                 fs.code_abc(OpCode::MOVE, env_r, env_reg, 0);
                 let kr = fs.alloc_reg();
-                fs.code_abx(OpCode::LOADK, kr, k);
+                fs.code_loadk(kr, k);
                 PrefixResult { var_name: Some(name.to_string()), local_idx: None, key: None, reg: None, table_reg: Some(env_r), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false, key_allocated_reg: true, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
             }
         }
@@ -4860,17 +4872,17 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                             fs.code_asbx(OpCode::LOADI, r, val as i32);
                         } else {
                             let k = fs.int_k(val);
-                            fs.code_abx(OpCode::LOADK, r, k);
+                            fs.code_loadk(r, k);
                         }
                     }
                     ExpKind::Float => {
                         let f = f64::from_bits(ctc.info as u64);
                         let k = fs.float_k(f);
-                        fs.code_abx(OpCode::LOADK, r, k);
+                        fs.code_loadk(r, k);
                     }
                     ExpKind::Str => {
                         let k = fs.discharge_str(&mut ctc);
-                        fs.code_abx(OpCode::LOADK, r, k);
+                        fs.code_loadk(r, k);
                     }
                     ExpKind::Boolean => {
                         if ctc.info != 0 {
@@ -4884,7 +4896,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     }
                     _ => {
                         let k = fs.discharge_str(&mut ctc);
-                        fs.code_abx(OpCode::LOADK, r, k);
+                        fs.code_loadk(r, k);
                     }
                 };
                 PrefixResult { var_name: Some(name.clone()), local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: true }
@@ -4919,17 +4931,17 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                                     fs.code_asbx(OpCode::LOADI, r, val as i32);
                                 } else {
                                     let k = fs.int_k(val);
-                                    fs.code_abx(OpCode::LOADK, r, k);
+                                    fs.code_loadk(r, k);
                                 }
                             }
                             ExpKind::Float => {
                                 let f = f64::from_bits(ctc.info as u64);
                                 let k = fs.float_k(f);
-                                fs.code_abx(OpCode::LOADK, r, k);
+                                fs.code_loadk(r, k);
                             }
                             ExpKind::Str => {
                                 let k = fs.discharge_str(&mut ctc);
-                                fs.code_abx(OpCode::LOADK, r, k);
+                                fs.code_loadk(r, k);
                             }
                             ExpKind::Boolean => {
                                 if ctc.info != 0 {
@@ -4943,7 +4955,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                             }
                             _ => {
                                 let k = fs.discharge_str(&mut ctc);
-                                fs.code_abx(OpCode::LOADK, r, k);
+                                fs.code_loadk(r, k);
                             }
                         };
                         PrefixResult { var_name: Some(name.clone()), local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: true }
@@ -4974,7 +4986,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         if result.is_vvargvar {
                             let base_reg = result.reg.unwrap();
                             let kr = fs.alloc_reg();
-                            fs.code_abx(OpCode::LOADK, kr, k);
+                            fs.code_loadk(kr, k);
                             result = PrefixResult {
                                 var_name: None, local_idx: None, key: None, reg: Some(base_reg),
                                 table_reg: Some(base_reg), table_key: Some(kr), table_key_is_const: false, table_key_is_int: false,
@@ -5070,7 +5082,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                             (k, true, false)
                         } else {
                             let kr = fs.alloc_reg();
-                            fs.code_abx(OpCode::LOADK, kr, k);
+                            fs.code_loadk(kr, k);
                             (kr, false, true)
                         };
                         let new_is_upvalue = (result.is_upvalue || can_revert_getupval) && is_short_str;
@@ -5212,7 +5224,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                                     (-1, false, false)
                                 } else {
                                     let kr = fs.alloc_reg();
-                                    fs.code_abx(OpCode::LOADK, kr, k);
+                                    fs.code_loadk(kr, k);
                                     (kr, false, false)
                                 }
                             }
@@ -5223,7 +5235,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                                 (-1, false, false)
                             } else {
                                 let kr = fs.alloc_reg();
-                                fs.code_abx(OpCode::LOADK, kr, k);
+                                fs.code_loadk(kr, k);
                                 (kr, false, false)
                             }
                         }
@@ -5282,7 +5294,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                             // Long string key: emit LOADK now (after table's GETUPVAL)
                             let k = fs.get_str_k(&ei.exp);
                             let key_r = fs.alloc_reg();
-                            fs.code_abx(OpCode::LOADK, key_r, k);
+                            fs.code_loadk(key_r, k);
                             (key_r, true)
                         } else {
                             let key_r = fs.exp_to_reg(&ei.exp);
@@ -8691,7 +8703,7 @@ fn code_global_via_env(fs: &mut FuncState, name: &str) -> ExpDesc {
             // 3. 生成 GETVARG A=0（VRELOC），后续 exp_to_reg 会复用 kr 并 patch A
             // 4. luaK_finish 将 GETVARG 转为 GETTABLE（因为有 PF_VATAB）
             let kr = fs.alloc_reg();
-            fs.code_abx(OpCode::LOADK, kr, k);
+            fs.code_loadk(kr, k);
             // Free key register (like C's freeregs in VVARGIND discharge)
             if kr >= fs.nvarstack() && kr == fs.freereg - 1 {
                 fs.free_reg();
@@ -8722,7 +8734,7 @@ fn code_global_via_env(fs: &mut FuncState, name: &str) -> ExpDesc {
             let env_r = fs.alloc_reg();
             fs.code_abc(OpCode::GETUPVAL, env_r, uv_idx, 0);
             let kr = fs.alloc_reg();
-            fs.code_abx(OpCode::LOADK, kr, k);
+            fs.code_loadk(kr, k);
             let pc = fs.code_abc(OpCode::GETTABLE, env_r, env_r, kr);
             fs.free_reg(); // free kr
             (env_r, pc)
@@ -8737,7 +8749,7 @@ fn code_global_via_env(fs: &mut FuncState, name: &str) -> ExpDesc {
             let env_r = fs.alloc_reg();
             fs.code_abc(OpCode::GETUPVAL, env_r, 0, 0);
             let kr = fs.alloc_reg();
-            fs.code_abx(OpCode::LOADK, kr, k);
+            fs.code_loadk(kr, k);
             let pc = fs.code_abc(OpCode::GETTABLE, env_r, env_r, kr);
             fs.free_reg(); // free kr
             (env_r, pc)
@@ -9056,7 +9068,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 if e.kind == ExpKind::VVARGVAR {
                     let base_reg = e.info as i32;
                     let kr = fs.alloc_reg();
-                    fs.code_abx(OpCode::LOADK, kr, k);  // load key into register
+                    fs.code_loadk(kr, k);  // load key into register
                     // Free key register (like C's freeregs in VVARGIND discharge)
                     if kr >= fs.nvarstack() && kr == fs.freereg - 1 {
                         fs.free_reg();
@@ -9092,7 +9104,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 } && !is_short_str {
                     // _ENV upval with non-short key: keep GETUPVAL, use GETTABLE
                     let kr = fs.alloc_reg();
-                    fs.code_abx(OpCode::LOADK, kr, k);
+                    fs.code_loadk(kr, k);
                     let inst_pc = fs.code_abc(OpCode::GETTABLE, base_reg, base_reg, kr);
                     fs.free_reg(); // kr
                     e = ExpDesc { kind: ExpKind::NonReloc, info: base_reg as i64, info2: inst_pc, t: NO_JUMP, f: NO_JUMP, str_val: None };
@@ -9107,7 +9119,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                         code_getfield(fs, result_reg, base_reg, k)
                     } else {
                         // Long string: load key into register, use GETTABLE
-                        fs.code_abx(OpCode::LOADK, result_reg, k);
+                        fs.code_loadk(result_reg, k);
                         fs.code_abc(OpCode::GETTABLE, result_reg, base_reg, result_reg)
                     };
                     e = ExpDesc { kind: ExpKind::NonReloc, info: result_reg as i64, info2: inst_pc, t: NO_JUMP, f: NO_JUMP, str_val: None };
@@ -9248,7 +9260,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                         // Long string key: LOADK → GETTABLE (relocatable) → freeregs
                         let k = fs.get_str_k(&ei.exp);
                         let kr = fs.alloc_reg();
-                        fs.code_abx(OpCode::LOADK, kr, k);
+                        fs.code_loadk(kr, k);
                         let inst_pc = fs.code_abc(OpCode::GETTABLE, 0, base_reg, kr);
                         // Free both table and key registers (high first)
                         let (high_reg, low_reg) = if base_reg > kr {
@@ -9335,11 +9347,11 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                                 base_reg
                             };
                             if result_reg != base_reg {
-                                fs.code_abx(OpCode::LOADK, result_reg, k);
+                                fs.code_loadk(result_reg, k);
                                 inst_pc = fs.code_abc(OpCode::GETTABLE, result_reg, base_reg, result_reg);
                             } else {
                                 let kr = fs.alloc_reg();
-                                fs.code_abx(OpCode::LOADK, kr, k);
+                                fs.code_loadk(kr, k);
                                 inst_pc = fs.code_abc(OpCode::GETTABLE, result_reg, base_reg, kr);
                                 fs.free_reg(); // kr
                             }
@@ -10209,13 +10221,13 @@ fn parse_func_stat(fs: &mut FuncState) {
                     let env_r = fs.alloc_reg();
                     fs.code_abc(OpCode::MOVE, env_r, env_reg, 0);
                     let kr = fs.alloc_reg();
-                    fs.code_abx(OpCode::LOADK, kr, k);
+                    fs.code_loadk(kr, k);
                     pre_eval = Some((env_r, kr));
                 } else {
                     let env_r = fs.alloc_reg();
                     fs.code_abc(OpCode::GETUPVAL, env_r, 0, 0);
                     let kr = fs.alloc_reg();
-                    fs.code_abx(OpCode::LOADK, kr, k);
+                    fs.code_loadk(kr, k);
                     pre_eval = Some((env_r, kr));
                 }
             } else {
@@ -10224,13 +10236,13 @@ fn parse_func_stat(fs: &mut FuncState) {
                     let env_r = fs.alloc_reg();
                     fs.code_abc(OpCode::MOVE, env_r, env_reg, 0);
                     let kr = fs.alloc_reg();
-                    fs.code_abx(OpCode::LOADK, kr, k);
+                    fs.code_loadk(kr, k);
                     pre_eval = Some((env_r, kr));
                 } else {
                     let env_r = fs.alloc_reg();
                     fs.code_abc(OpCode::GETUPVAL, env_r, 0, 0);
                     let kr = fs.alloc_reg();
-                    fs.code_abx(OpCode::LOADK, kr, k);
+                    fs.code_loadk(kr, k);
                     pre_eval = Some((env_r, kr));
                 }
             }
@@ -10351,7 +10363,7 @@ fn parse_func_stat(fs: &mut FuncState) {
         -1i32  // sentinel: will use SETFIELD with inline constant
     } else {
         let kr = fs.alloc_reg();
-        fs.code_abx(OpCode::LOADK, kr, fk);
+        fs.code_loadk(kr, fk);
         kr
     };
     let freg = parse_body_ex(fs, *is_colon, None);
@@ -10751,7 +10763,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                     } else {
                         // Long string: load key into register, use SETTABLE
                         let kr = fs.alloc_reg();
-                        fs.code_abx(OpCode::LOADK, kr, k);
+                        fs.code_loadk(kr, k);
                         fs.code_abc_k(OpCode::SETTABLE, table_r, kr, v_rk, is_k);
                     }
                 } else if is_seti {
@@ -10789,7 +10801,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                     let key_needs_reg = name.len() > crate::strings::LUAI_MAXSHORTLEN || (k as u32) > crate::opcodes::MAXINDEXRK;
                     let kr = if key_needs_reg {
                         let kr = fs.alloc_reg();
-                        fs.code_abx(OpCode::LOADK, kr, k);
+                        fs.code_loadk(kr, k);
                         kr
                     } else {
                         -1

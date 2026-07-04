@@ -564,7 +564,7 @@ fn basic_get_obj_name(proto: &Proto, pc: usize, reg: usize) -> (String, String) 
             // 下一条指令是 EXTRAARG，存储 Ax 格式的常量索引
             if set_pc + 1 < proto.code.len() {
                 let extra = proto.code[set_pc + 1];
-                let ax = opcodes::getarg_a(extra) as usize;
+                let ax = opcodes::getarg_ax(extra) as usize;
                 kname(proto, ax)
             } else {
                 ("?".to_string(), String::new())
@@ -2451,7 +2451,7 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         state.pc += 1;
         let extra = state.code[state.pc];
-        let extra_idx = opcodes::getarg_a(extra) as usize;
+        let extra_idx = opcodes::getarg_ax(extra) as usize;
         let val = state.constants[extra_idx].clone();
         Self::write_stack(state, a, val);
         state.pc += 1;
@@ -2648,7 +2648,7 @@ impl VmExecutor {
         let b = opcodes::getarg_vb(inst) as u32;
         let mut c = opcodes::getarg_vc(inst) as u32;
         if opcodes::testarg_k(inst) {
-            let extra = opcodes::getarg_a(state.code[state.pc + 1]);
+            let extra = opcodes::getarg_ax(state.code[state.pc + 1]);
             c += (extra as u32) * ((1u32 << opcodes::SIZE_VC));
         }
         // C 总是 pc++ 跳过 extra argument（无论 k 是否为真）
@@ -4721,7 +4721,7 @@ impl VmExecutor {
         let n = opcodes::getarg_vb(inst) as usize;
         let mut last = opcodes::getarg_vc(inst) as usize;
         if opcodes::testarg_k(inst) {
-            let extra = opcodes::getarg_a(state.code[state.pc + 1]);
+            let extra = opcodes::getarg_ax(state.code[state.pc + 1]);
             last += (extra as usize) * ((1usize << opcodes::SIZE_VC));
             state.pc += 1;
         }

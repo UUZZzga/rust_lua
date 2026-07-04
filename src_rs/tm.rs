@@ -461,9 +461,8 @@ pub(crate) fn call_tm_res(
         return Err(VmError::Yield(yield_values));
     }
 
-    // 非 yield: pop PcallProtection 和 CallInfoEntry
+    // 非 yield: pop PcallProtection
     state.pcall_protection_stack.pop();
-    state.call_info.pop();
 
     // pcall 后: 栈截断到 func_idx，1 个结果(或错误消息)在 func_idx
     let result = if func_idx < state.stack.len() {
@@ -476,8 +475,8 @@ pub(crate) fn call_tm_res(
     state.stack.truncate(func_idx);
 
     if status != 0 {
-        // 元方法调用失败 — 保留原始错误值类型（非字符串错误用 RuntimeErrorValue）
-        // 对应 C 的 funcnamefromcode: 当元方法不可调用时，附加 " (metamethod 'name')"
+        // 元方法调用失败 — 保留 CallInfoEntry 供 traceback 使用
+        // 上层 state.pcall 会保存 call_info 快照（包含此帧），然后截断到正确长度
         state.top = state.stack.len();
         let mm_name = tm.event_name();
         return Err(match &result {
@@ -493,6 +492,9 @@ pub(crate) fn call_tm_res(
             _ => VmError::RuntimeErrorValue(result.clone()),
         });
     }
+
+    // 成功: pop CallInfoEntry
+    state.call_info.pop();
 
     // 将结果写入 res 槽位 (对应 C 的 setobjs2s(L, res, ...))
     while state.stack.len() <= res {
@@ -620,26 +622,31 @@ pub(crate) fn call_tm(
         return Err(VmError::Yield(yield_values));
     }
 
-    // 非 yield: pop PcallProtection 和 CallInfoEntry
+    // 非 yield: pop PcallProtection
     state.pcall_protection_stack.pop();
-    state.call_info.pop();
 
-    // pcall 后: 栈截断到 func_idx
-    state.stack.truncate(func_idx);
-    state.top = state.stack.len();
-
+    // pcall 后: 错误值在 func_idx 位置 (state.pcall 已 truncate 并 push 错误值)
+    // 成功: 无返回值 (nresults=0), 栈上无额外值
     if status != 0 {
-        // 元方法调用失败 — 返回错误
+        // 元方法调用失败 — 保留 CallInfoEntry 供 traceback 使用
+        // 上层 state.pcall 会保存 call_info 快照（包含此帧），然后截断到正确长度
         let result = if func_idx < state.stack.len() {
             state.stack[func_idx].clone()
         } else {
             TValue::Nil(NilKind::Strict)
         };
+        // 截断栈, 移除错误值和临时压入的函数/参数
+        state.stack.truncate(func_idx);
+        state.top = state.stack.len();
         return Err(match &result {
             TValue::Str(s) => VmError::RuntimeError(s.as_str().to_string()),
             _ => VmError::RuntimeErrorValue(result.clone()),
         });
     }
+    // 成功: pop CallInfoEntry, 截断栈
+    state.stack.truncate(func_idx);
+    state.top = state.stack.len();
+    state.call_info.pop();
     Ok(())
 }
 

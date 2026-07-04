@@ -59,6 +59,7 @@ pub const SIZE_C: u32 = 8;   pub const SIZE_B: u32 = 8;
 pub const SIZE_VB: u32 = 6;
 pub const SIZE_VC: u32 = 10;
 pub const SIZE_BX: u32 = SIZE_C + SIZE_B + 1;
+pub const SIZE_Ax: u32 = SIZE_BX + SIZE_A;
 pub const SIZE_A: u32 = 8;   pub const SIZE_OP: u32 = 7;
 pub const POS_OP: u32 = 0;   pub const POS_A: u32 = POS_OP + SIZE_OP;
 pub const POS_K: u32 = POS_A + SIZE_A;
@@ -79,6 +80,7 @@ pub const MAX_FSTACK: u8 = NO_REG;
 pub const MAXARG_B: u32 = (1u32 << SIZE_B) - 1;
 pub const MAXINDEXRK: u32 = MAXARG_B;
 pub const MAXARG_BX: u32 = (1u32 << SIZE_BX) - 1;
+pub const MAXARG_Ax: u32 = (1u32 << SIZE_Ax) - 1;
 
 // ============================================================================
 // 位操作
@@ -101,6 +103,7 @@ pub const MAXARG_BX: u32 = (1u32 << SIZE_BX) - 1;
     OpCode::from_u8(((i >> POS_OP) & mask1(SIZE_OP, 0)) as u8).unwrap_or(OpCode::MOVE)
 }
 #[inline] pub fn getarg_a(i: Instruction) -> i32 { getarg(i, POS_A, SIZE_A) }
+#[inline] pub fn getarg_ax(i: Instruction) -> i32 { getarg(i, POS_A, SIZE_Ax) }
 #[inline] pub fn getarg_b(i: Instruction) -> i32 { getarg(i, POS_B, SIZE_B) }
 #[inline] pub fn getarg_vb(i: Instruction) -> i32 { getarg(i, POS_VB, SIZE_VB) }
 #[inline] pub fn getarg_vc(i: Instruction) -> i32 { getarg(i, POS_VC, SIZE_VC) }

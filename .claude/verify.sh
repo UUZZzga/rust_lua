@@ -61,7 +61,21 @@ export LUA_PATH="tests_lua/?.lua;./?.lua;./?/init.lua"
 # 测试时限制内存为 512MB
 ulimit -v 524288
 
-for test_file in tests_lua/calls.lua tests_lua/closure.lua tests_lua/code.lua tests_lua/constructs.lua tests_lua/coroutine.lua tests_lua/db.lua tests_lua/errors.lua tests_lua/events.lua tests_lua/files.lua tests_lua/goto.lua tests_lua/literals.lua tests_lua/locals.lua tests_lua/math.lua tests_lua/memerr.lua tests_lua/nextvar.lua tests_lua/pm.lua tests_lua/sort.lua tests_lua/strings.lua tests_lua/utf8.lua tests_lua/vararg.lua tests_lua/verybig.lua; do
+# big.lua 含主 chunk 中的 coroutine.yield, 必须用 coroutine.wrap 包装运行
+# (与 tests_lua/all.lua 中的调用方式一致)
+echo "Running big.lua ..."
+timeout 30 ./target/release/lua -e "local f = coroutine.wrap(assert(loadfile('tests_lua/big.lua'))); assert(f() == 'b'); assert(f() == 'a')" > logs/big_run.log 2>&1
+RUN_EXIT=$?
+if [ $RUN_EXIT -ne 0 ]; then
+    if [ $RUN_EXIT -eq 124 ]; then
+        echo "Timeout: big.lua use LUA_VM_TRACE=1 to debug"
+    fi
+    echo "ERROR: big.lua failed (exit code $RUN_EXIT)!"
+    echo "Check logs/big_run.log for details"
+    exit 2
+fi
+
+for test_file in tests_lua/calls.lua tests_lua/closure.lua tests_lua/code.lua tests_lua/constructs.lua tests_lua/coroutine.lua tests_lua/db.lua tests_lua/errors.lua tests_lua/events.lua tests_lua/files.lua tests_lua/goto.lua tests_lua/literals.lua tests_lua/locals.lua tests_lua/math.lua tests_lua/memerr.lua tests_lua/nextvar.lua tests_lua/pm.lua tests_lua/sort.lua tests_lua/strings.lua tests_lua/tpack.lua tests_lua/utf8.lua tests_lua/vararg.lua tests_lua/verybig.lua; do
     test_name=$(basename "$test_file")
     log_name="logs/${test_name%.lua}_run.log"
     echo "Running $test_name ..."
