@@ -671,6 +671,39 @@ fn close_yield_upvals(yield_values: &[TValue], state: &LuaState) -> Vec<(UpValRe
             _ => {}
         }
     }
+    // 遍历 state.open_upval 链表，关闭所有剩余的 open upvalue。
+    // 这些 upvalue 指向协程栈，yield 后 state.stack 切回主线程栈，
+    // 若不关闭，外部持有的闭包（前一次 yield 传出但不在本次 yield 值中）
+    // 会通过 Open upvalue 访问主线程栈的错误位置。
+    // 跳过 TBC upvalue：它们只在协程内部通过 func::close 访问，
+    // yield 后协程栈被保存到 ThreadContext，resume 时恢复，TBC upvalue 仍指向正确位置。
+    // 若关闭 TBC upvalue，sync_yield_upvals_back 恢复 Open 时会丢失 tbc 标记，
+    // 导致后续 close 不调用 __close。
+    let mut current = state.open_upval;
+    while let Some(uv_idx) = current {
+        let uv_ref = state.closure_upvals[uv_idx].clone();
+        let (stack_index, next, is_open, is_tbc) = {
+            let uv = uv_ref.borrow();
+            match &*uv {
+                UpVal::Open { stack_index, next, tbc, .. } => (*stack_index, *next, true, *tbc),
+                UpVal::Closed { .. } => (0, None, false, false),
+            }
+        };
+        if is_open && !is_tbc {
+            let ptr = Rc::as_ptr(&uv_ref) as usize;
+            if visited.insert(ptr) {
+                let val = state.stack.get(stack_index)
+                    .cloned()
+                    .unwrap_or(TValue::Nil(NilKind::Strict));
+                *uv_ref.borrow_mut() = UpVal::Closed { value: Box::new(val) };
+                result_info.push(OpenUpvalInfo {
+                    uv_ref,
+                    original_stack_index: stack_index,
+                });
+            }
+        }
+        current = next;
+    }
     result_info.into_iter()
         .map(|info| (info.uv_ref, info.original_stack_index))
         .collect()

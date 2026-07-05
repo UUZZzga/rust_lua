@@ -2624,6 +2624,12 @@ impl LuaState {
 
     /// 增量 GC 步进：累加 siz 工作量，达到当前对象数时触发完整 GC 并返回 true
     pub fn step_gc(&mut self, siz: usize) -> bool {
+        // generational 模式下未实现 minor collection，直接做 full collection
+        // 以保证 weak table 清除等语义正确（对应 C Lua genstep 中的 youngcollection + cleartable）
+        if self.gc.current_mode() == crate::gc::GCMode::Generational {
+            self.collect_gc();
+            return true;
+        }
         let n = siz.max(1);
         let acc = self.gc.step_accum.get() + n;
         let threshold = self.gc.metas_len().max(1);

@@ -75,7 +75,7 @@ if [ $RUN_EXIT -ne 0 ]; then
     exit 2
 fi
 
-for test_file in tests_lua/calls.lua tests_lua/closure.lua tests_lua/code.lua tests_lua/constructs.lua tests_lua/coroutine.lua tests_lua/db.lua tests_lua/errors.lua tests_lua/events.lua tests_lua/files.lua tests_lua/gc.lua tests_lua/goto.lua tests_lua/literals.lua tests_lua/locals.lua tests_lua/math.lua tests_lua/memerr.lua tests_lua/nextvar.lua tests_lua/pm.lua tests_lua/sort.lua tests_lua/strings.lua tests_lua/tpack.lua tests_lua/utf8.lua tests_lua/vararg.lua tests_lua/verybig.lua; do
+for test_file in tests_lua/calls.lua tests_lua/closure.lua tests_lua/code.lua tests_lua/constructs.lua tests_lua/coroutine.lua tests_lua/db.lua tests_lua/errors.lua tests_lua/events.lua tests_lua/files.lua tests_lua/gc.lua tests_lua/gengc.lua tests_lua/goto.lua tests_lua/literals.lua tests_lua/locals.lua tests_lua/math.lua tests_lua/memerr.lua tests_lua/nextvar.lua tests_lua/pm.lua tests_lua/sort.lua tests_lua/strings.lua tests_lua/tpack.lua tests_lua/utf8.lua tests_lua/vararg.lua tests_lua/verybig.lua; do
     test_name=$(basename "$test_file")
     log_name="logs/${test_name%.lua}_run.log"
     echo "Running $test_name ..."
