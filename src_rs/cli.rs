@@ -2,7 +2,7 @@
 //!
 //! 提供 Lua REPL 和脚本执行功能。
 
-use crate::objects::LuaType;
+use crate::objects::{LuaType, TValue};
 use crate::state::{LuaState, ERR_RUN, ERR_SYNTAX, MIN_STACK, MULT_RET};
 
 use std::io::{self, BufRead, IsTerminal, Write};
@@ -542,8 +542,8 @@ impl Interpreter {
         }
 
         if args & HAS_EE != 0 {
-            self.l.push_boolean(true);
-            self.l.set_field(0, "LUA_NOENV");
+            let key = TValue::Str(self.l.intern_str("LUA_NOENV"));
+            self.l.registry.set(key, TValue::Boolean(true));
         }
 
         self.l.open_selected_libs(-1, 0);

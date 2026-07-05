@@ -1733,8 +1733,46 @@ fn cache_module_loaded(state: &mut LuaState, modname: &str, val: TValue) {
     }
 }
 
-/// 初始化 package 表:设置 path (从 LUA_PATH 环境变量或默认) 和 loaded
-/// 对应 C loadlib.cpp 的 luaopen_package (简化版,不实现 searchers/cpath)
+/// 读取路径环境变量 — 对应 C loadlib.cpp 的 setpath
+///
+/// 顺序:版本化变量 (envname + "_5_5") → 未版本化变量 → 默认值。
+/// 若 registry 中 LUA_NOENV 为真 (命令行 -E),忽略环境变量直接用默认值。
+/// 路径中的 ";;" 会被替换为默认路径。
+fn setpath(state: &LuaState, envname: &str, dft: &str) -> String {
+    let noenv_key = TValue::Str(state.intern_str("LUA_NOENV"));
+    let noenv = matches!(state.registry.get(&noenv_key), Some(TValue::Boolean(true)));
+
+    let nver = format!("{}_5_5", envname);
+    let path = if noenv {
+        None
+    } else {
+        std::env::var(&nver).ok().or_else(|| std::env::var(envname).ok())
+    };
+
+    let path = match path {
+        Some(p) => p,
+        None => return dft.to_string(),
+    };
+
+    if let Some(pos) = path.find(";;") {
+        let mut result = String::new();
+        if pos > 0 {
+            result.push_str(&path[..pos]);
+            result.push(';');
+        }
+        result.push_str(dft);
+        if pos + 2 < path.len() {
+            result.push(';');
+            result.push_str(&path[pos + 2..]);
+        }
+        result
+    } else {
+        path
+    }
+}
+
+/// 初始化 package 表:设置 path/cpath (从环境变量或默认) 和 loaded
+/// 对应 C loadlib.cpp 的 luaopen_package (简化版,不实现 searchers)
 fn init_package_table(state: &mut LuaState) {
     let package_key = TValue::Str(state.intern_str("package"));
     let pkg = crate::table::Table::new();
@@ -1743,13 +1781,15 @@ fn init_package_table(state: &mut LuaState) {
         TValue::Str(state.intern_str("loaded")),
         TValue::Table(loaded),
     );
-    // path:优先读取 LUA_PATH_5_5 / LUA_PATH 环境变量,无则用默认值
-    let path = std::env::var("LUA_PATH_5_5")
-        .or_else(|_| std::env::var("LUA_PATH"))
-        .unwrap_or_else(|_| "./?.lua;./?/init.lua".to_string());
+    let path = setpath(state, "LUA_PATH", "./?.lua;./?/init.lua");
     pkg.set(
         TValue::Str(state.intern_str("path")),
         TValue::Str(state.intern_str(&path)),
+    );
+    let cpath = setpath(state, "LUA_CPATH", crate::config::CPATH_DEFAULT);
+    pkg.set(
+        TValue::Str(state.intern_str("cpath")),
+        TValue::Str(state.intern_str(&cpath)),
     );
     state.globals.set(package_key, TValue::Table(pkg));
 }
