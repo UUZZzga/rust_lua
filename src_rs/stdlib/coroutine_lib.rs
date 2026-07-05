@@ -1671,7 +1671,11 @@ fn call_wrap(
     // 主要是让 context 的 Rc 计数反映 wrap table 的可达性,
     // 避免 collectgarbage 误清理 yield 中的 Suspended 协程
     let wrap_table = crate::table::Table::new();
+    let wrap_id = state.gc.register_object(std::mem::size_of::<crate::objects::Table>());
+    wrap_table.gc_header.set_id(wrap_id);
     let mt = crate::table::Table::new();
+    let mt_id = state.gc.register_object(std::mem::size_of::<crate::objects::Table>());
+    mt.gc_header.set_id(mt_id);
     mt.set(
         TValue::LightUserData(WRAP_MARKER),
         TValue::Integer(idx as i64),
@@ -1768,7 +1772,10 @@ pub fn call_wrap_call(
     };
 
     // 保存调用者上下文
-    let caller_ctx = save_caller_context(state);
+    let mut caller_ctx = save_caller_context(state);
+    // 暂存调用者栈到 state.caller_gc_stacks — 协程执行期间 GC 需要看到调用者栈
+    // 中的 wrap table 引用，否则内层协程会被误判为不可达（big.lua 嵌套 wrap 场景）
+    state.caller_gc_stacks.push(std::mem::take(&mut caller_ctx.stack));
     // 保存 n_ccalls (协程执行期间可能修改,退出时恢复)
     let saved_n_ccalls = state.n_ccalls;
     // 递增 n_ccalls 防止协程嵌套过深导致 Rust 栈溢出
@@ -1776,6 +1783,8 @@ pub fn call_wrap_call(
     state.n_ccalls = state.n_ccalls.saturating_add(1);
     if state.n_ccalls >= crate::state::LUAI_MAXCCALLS {
         state.n_ccalls = saved_n_ccalls;
+        caller_ctx.stack = state.caller_gc_stacks.pop().unwrap_or_default();
+        restore_caller_context(state, caller_ctx);
         return Err(VmError::RuntimeError("C stack overflow".to_string()));
     }
     // 保存 n_ny_calls 并重置为 0（协程初始状态是可 yield 的）
@@ -1794,6 +1803,7 @@ pub fn call_wrap_call(
     };
 
     if let Err(e) = setup_result {
+        caller_ctx.stack = state.caller_gc_stacks.pop().unwrap_or_default();
         restore_caller_context(state, caller_ctx);
         state.n_ccalls = saved_n_ccalls;
     state.n_ny_calls = saved_n_ny_calls;
@@ -1927,6 +1937,7 @@ pub fn call_wrap_call(
     }
 
     // 恢复调用者上下文
+    caller_ctx.stack = state.caller_gc_stacks.pop().unwrap_or_default();
     restore_caller_context(state, caller_ctx);
     // 恢复 n_ccalls (协程 yield/error 可能导致 n_ccalls 不准确)
     state.n_ccalls = saved_n_ccalls;

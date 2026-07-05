@@ -247,6 +247,34 @@ impl StringTable {
             }
         }
     }
+
+    /// 清理字符串表中的死字符串（只有字符串表持有的字符串）。
+    /// 对应 C Lua 的 sweep 阶段清理 string table 的逻辑。
+    /// 返回被清理的字符串数量。
+    pub fn sweep(&self) -> usize {
+        let mut ht = self.ht.write().unwrap();
+        let mut freed = 0;
+        let mut empty_keys = Vec::new();
+
+        for (key, bucket) in ht.iter_mut() {
+            let before = bucket.len();
+            // strong_count == 1 表示只有字符串表持有，无其他引用 → 可回收
+            bucket.retain(|item| Arc::strong_count(item) > 1);
+            freed += before - bucket.len();
+            if bucket.is_empty() {
+                empty_keys.push(*key);
+            }
+        }
+
+        for key in empty_keys {
+            ht.remove(&key);
+        }
+
+        let mut nuse = self.nuse.write().unwrap();
+        *nuse = nuse.saturating_sub(freed);
+
+        freed
+    }
 }
 
 // ============================================================================

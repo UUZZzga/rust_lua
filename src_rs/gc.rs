@@ -213,7 +213,7 @@ impl Default for GCObjectHeader {
 /// 所有方法都使用 `&self` (interior mutability) 以支持在共享引用下操作。
 pub struct GCState {
     pub phase: Cell<GCPhase>,
-    pub mode: GCMode,
+    pub mode: Cell<GCMode>,
     pub current_white: Cell<u8>,
     next_id: Cell<usize>,
     metas: RefCell<Vec<Option<GCObjectMeta>>>,
@@ -226,16 +226,19 @@ pub struct GCState {
     pub gc_debt: Cell<isize>,
     pub gc_estimate: Cell<usize>,
     pub gc_stop: Cell<u8>,
-    pub gc_params: [u8; 6],
+    pub gc_params: [Cell<i32>; 6],
     pub in_minor: Cell<bool>,
     next_collect_threshold: Cell<usize>,
+    pub step_accum: Cell<usize>,
+    /// GC 是否正在运行（collect_gc 进行中）— 用于阻止 finalizer 中重入
+    pub gc_running: Cell<bool>,
 }
 
 impl GCState {
     pub fn new(mode: GCMode) -> Self {
         GCState {
             phase: Cell::new(GCPhase::Pause),
-            mode,
+            mode: Cell::new(mode),
             current_white: Cell::new(1 << 0),
             next_id: Cell::new(1),
             metas: RefCell::new(Vec::new()),
@@ -248,37 +251,74 @@ impl GCState {
             gc_debt: Cell::new(0),
             gc_estimate: Cell::new(0),
             gc_stop: Cell::new(0),
-            gc_params: [0; 6],
+            gc_params: [Cell::new(0), Cell::new(0), Cell::new(0),
+                        Cell::new(0), Cell::new(0), Cell::new(0)],
             in_minor: Cell::new(false),
             next_collect_threshold: Cell::new(200000),
+            step_accum: Cell::new(0),
+            gc_running: Cell::new(false),
         }
     }
 
     pub fn default_incremental() -> Self {
         let gc = GCState::new(GCMode::Incremental);
-        gc.set_gc_param(0, 200);
-        gc.set_gc_param(1, 200);
-        gc.set_gc_param(2, 100);
+        gc.set_gc_param(Self::PARAM_PAUSE, 200);
+        gc.set_gc_param(Self::PARAM_STEPMUL, 200);
+        gc.set_gc_param(Self::PARAM_STEPSIZE, 100);
         gc
     }
 
     pub fn default_generational() -> Self {
         let gc = GCState::new(GCMode::Generational);
-        gc.set_gc_param(0, 20);
-        gc.set_gc_param(1, 50);
-        gc.set_gc_param(2, 70);
+        gc.set_gc_param(Self::PARAM_MINORMUL, 20);
+        gc.set_gc_param(Self::PARAM_MAJORMINOR, 50);
+        gc.set_gc_param(Self::PARAM_MINORMAJOR, 70);
         gc
     }
 
-    fn set_gc_param(&self, idx: usize, val: u8) {
-        // gc_params is [u8; 6]; we need interior mutability for it too.
-        // For now, accept that gc_params is immutable after construction.
-        // The array values are small and set only once at init.
-        unsafe {
-            let ptr = &self.gc_params as *const [u8; 6] as *mut [u8; 6];
-            if idx < (*ptr).len() {
-                (*ptr)[idx] = val;
-            }
+    /// GC 参数索引（与 C 的 LUA_GCP* 一致）
+    pub const PARAM_MINORMUL: usize = 0;
+    pub const PARAM_MAJORMINOR: usize = 1;
+    pub const PARAM_MINORMAJOR: usize = 2;
+    pub const PARAM_PAUSE: usize = 3;
+    pub const PARAM_STEPMUL: usize = 4;
+    pub const PARAM_STEPSIZE: usize = 5;
+
+    /// 返回当前 GC 模式
+    pub fn current_mode(&self) -> GCMode {
+        self.mode.get()
+    }
+
+    /// 切换 GC 模式，返回之前的模式
+    pub fn set_mode(&self, mode: GCMode) -> GCMode {
+        let old = self.mode.get();
+        self.mode.set(mode);
+        old
+    }
+
+    fn set_gc_param(&self, idx: usize, val: i32) {
+        if idx < self.gc_params.len() {
+            self.gc_params[idx].set(val);
+        }
+    }
+
+    /// 查询 GC 参数，返回当前值
+    pub fn get_gc_param(&self, idx: usize) -> i32 {
+        if idx < self.gc_params.len() {
+            self.gc_params[idx].get()
+        } else {
+            0
+        }
+    }
+
+    /// 设置 GC 参数，返回之前的值
+    pub fn swap_gc_param(&self, idx: usize, val: i32) -> i32 {
+        if idx < self.gc_params.len() {
+            let old = self.gc_params[idx].get();
+            self.gc_params[idx].set(val);
+            old
+        } else {
+            0
         }
     }
 
@@ -292,28 +332,22 @@ impl GCState {
 
         let mut meta = GCObjectMeta::new(size);
         meta.color = color;
-        meta.age = if self.mode == GCMode::Generational { GCAge::New } else { GCAge::New };
+        meta.age = if self.mode.get() == GCMode::Generational { GCAge::New } else { GCAge::New };
 
         let mut metas = self.metas.borrow_mut();
-        let mut free_ids = self.free_ids.borrow_mut();
-        let id = if let Some(reused_id) = free_ids.pop() {
-            metas[reused_id] = Some(meta);
-            GCObjectId(reused_id)
-        } else {
-            let id_val = self.next_id.get();
-            let id = GCObjectId(id_val);
-            self.next_id.set(id_val + 1);
-            while metas.len() <= id.0 {
-                metas.push(None);
-            }
-            metas[id.0] = Some(meta);
-            id
-        };
+        let id_val = self.next_id.get();
+        let id = GCObjectId(id_val);
+        self.next_id.set(id_val + 1);
+        while metas.len() <= id.0 {
+            metas.push(None);
+        }
+        metas[id.0] = Some(meta);
 
         let current = self.gc_debt.get();
-        self.gc_debt.set(current - size as isize);
+        let charged = size.max(64) as isize;
+        self.gc_debt.set(current - charged);
         let estimate = self.gc_estimate.get();
-        self.gc_estimate.set(estimate + size);
+        self.gc_estimate.set(estimate + charged as usize);
 
         id
     }
@@ -322,11 +356,11 @@ impl GCState {
         let mut metas = self.metas.borrow_mut();
         if id.0 < metas.len() {
             if let Some(ref meta) = metas[id.0] {
+                let charged = meta.size.max(64);
                 let estimate = self.gc_estimate.get();
-                self.gc_estimate.set(estimate.saturating_sub(meta.size));
+                self.gc_estimate.set(estimate.saturating_sub(charged));
             }
             metas[id.0] = None;
-            self.free_ids.borrow_mut().push(id.0);
         }
     }
 
@@ -358,6 +392,16 @@ impl GCState {
         self.metas.borrow().len()
     }
 
+    /// 返回实际存活（非 None）的对象数
+    pub fn active_count(&self) -> usize {
+        self.metas.borrow().iter().filter(|m| m.is_some()).count()
+    }
+
+    /// 返回 free_ids 长度
+    pub fn free_ids_count(&self) -> usize {
+        self.free_ids.borrow().len()
+    }
+
     /// 返回当前 GC 触发阈值
     pub fn collect_threshold(&self) -> usize {
         self.next_collect_threshold.get()
@@ -372,15 +416,13 @@ impl GCState {
     /// 对应 C 的 sweep 阶段。
     pub fn sweep_unreachable(&self, reachable: &std::collections::HashSet<usize>) {
         let mut metas = self.metas.borrow_mut();
-        let mut free_ids = self.free_ids.borrow_mut();
         let mut total_freed_size = 0usize;
         for (i, meta_opt) in metas.iter_mut().enumerate() {
             if meta_opt.is_some() && !reachable.contains(&i) {
                 if let Some(ref meta) = meta_opt {
-                    total_freed_size = total_freed_size.saturating_add(meta.size);
+                    total_freed_size = total_freed_size.saturating_add(meta.size.max(64));
                 }
                 *meta_opt = None;
-                free_ids.push(i);
             }
         }
         let estimate = self.gc_estimate.get();
@@ -548,7 +590,7 @@ impl GCState {
     /// 当黑色对象 p 被写入时，将其加入 grayagain 队列
     pub fn barrier_back(&self, p: GCObjectId) {
         if self.is_black(p) {
-            if self.mode == GCMode::Generational {
+            if self.mode.get() == GCMode::Generational {
                 if let Some(mut meta) = self.meta_mut(p) {
                     if meta.age == GCAge::Old || meta.age == GCAge::Touched2 {
                         meta.age = GCAge::Touched1;
@@ -576,6 +618,11 @@ impl GCState {
 
     pub fn is_running(&self) -> bool {
         self.gc_stop.get() == 0
+    }
+
+    /// GC 是否正在执行 collect_gc（用于阻止 finalizer 中重入）
+    pub fn is_gc_running(&self) -> bool {
+        self.gc_running.get()
     }
 
     pub fn is_sweep_phase(&self) -> bool {
@@ -617,6 +664,26 @@ impl GCState {
             GCPhase::SweepEnd => self.end_cycle(),
             GCPhase::CallFin => self.phase.set(GCPhase::Pause),
         }
+    }
+
+    /// 执行最多 n 步 GC 工作，返回是否完成一个完整周期（phase 回到 Pause）
+    pub fn step_n(&self, n: usize) -> bool {
+        if !self.is_running() {
+            return self.phase.get() == GCPhase::Pause;
+        }
+        let iters = n.max(1);
+        for _ in 0..iters {
+            self.step();
+            if self.phase.get() == GCPhase::Pause {
+                return true;
+            }
+        }
+        false
+    }
+
+    /// 当前是否处于 Pause 阶段（即一个周期已完成）
+    pub fn is_paused(&self) -> bool {
+        self.phase.get() == GCPhase::Pause
     }
 
     // ========================================================================
@@ -676,7 +743,7 @@ impl GCState {
         let cw = self.current_white.get();
         self.current_white.set(cw ^ 0x3);
 
-        if self.mode == GCMode::Generational {
+        if self.mode.get() == GCMode::Generational {
             self.bump_ages();
         }
 
@@ -706,7 +773,7 @@ impl GCState {
     // ========================================================================
 
     fn update_debt(&self, _debt: isize) {
-        let step_size = self.gc_params.get(2).copied().unwrap_or(100) as isize;
+        let step_size = self.gc_params.get(Self::PARAM_STEPSIZE).map(|c| c.get()).unwrap_or(100) as isize;
         self.gc_debt.set(step_size);
     }
 
@@ -909,7 +976,7 @@ mod tests {
     #[test]
     fn test_gc_state_generational() {
         let gc = GCState::default_generational();
-        assert_eq!(gc.mode, GCMode::Generational);
+        assert_eq!(gc.mode.get(), GCMode::Generational);
     }
 
     #[test]

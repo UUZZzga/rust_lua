@@ -3216,7 +3216,16 @@ impl VmExecutor {
         while state.stack.len() < a + n {
             state.stack.push(TValue::Nil(NilKind::Strict));
         }
-        // 设置 top = a + n (标记拼接操作数的结束)
+
+        // 保存 a+n 之后的栈元素（局部变量等），避免被 truncate 移除。
+        // C Lua 中 L->top = ra + n 只是设置 top 指针，不移除栈元素；
+        // Rust 实现中需手动保存/恢复。
+        let saved_tail: Vec<TValue> = if state.stack.len() > a + n {
+            state.stack[a + n..].to_vec()
+        } else {
+            Vec::new()
+        };
+        // 截断到 a+n（仅保留拼接操作数）
         state.stack.truncate(a + n);
 
         // 尝试直接拼接 (对应 C 的 luaV_concat)
@@ -3239,13 +3248,11 @@ impl VmExecutor {
                         std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: String::new() })
                     ))
                 });
-                Self::write_stack(state, a, result);
-                // 清除剩余槽位
-                for i in 1..n {
-                    if a + i < state.stack.len() {
-                        state.stack[a + i] = TValue::Nil(NilKind::Strict);
-                    }
-                }
+                // 截断到 a，写入结果，恢复 saved_tail
+                state.stack.truncate(a);
+                state.stack.push(result);
+                state.stack.extend_from_slice(&saved_tail);
+                state.top = state.stack.len();
             }
             Err((_, vals)) => {
                 // 拼接失败: 尝试 __concat 元方法
@@ -3298,10 +3305,12 @@ impl VmExecutor {
                     }
                 }
                 // 结果在 stack[a]
-                // 清除剩余槽位
+                // 清除剩余槽位，恢复 saved_tail
                 while state.stack.len() > a + 1 {
                     state.stack.pop();
                 }
+                state.stack.extend_from_slice(&saved_tail);
+                state.top = state.stack.len();
             }
             Err(_) => {
                 return Err(VmError::RuntimeError("concat error".into()));
@@ -3513,6 +3522,11 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let mut b = opcodes::getarg_b(inst) as usize;
         let c = opcodes::getarg_c(inst) as i32;
+        // 对应 C 的 OP_CALL: if (b != 0) L->top.p = ra + b
+        // 设置栈顶为函数+参数末尾，用于 GC 栈遍历和栈空间检查
+        if b != 0 {
+            state.top = a + b;
+        }
         let mut func_val = Self::read_stack(state, a).clone();
 
         // __call 元方法支持 — 对应 C 的 luaT_tryfuncTM + precall 的 goto retry
@@ -3670,6 +3684,7 @@ impl VmExecutor {
                     for i in nargs..nfixparams {
                         Self::write_stack(state, a + 1 + i, TValue::Nil(NilKind::Strict));
                     }
+                    // VARARGPREP 会扩展栈到 fsize 并更新 self.top
                     // call hook 对 vararg 函数在 VARARGPREP 中触发
                 } else {
                     // 非 vararg 函数: 直接扩展到 fsize
@@ -3680,6 +3695,9 @@ impl VmExecutor {
                     for i in nargs..nfixparams {
                         state.stack[a + 1 + i] = TValue::Nil(NilKind::Strict);
                     }
+                    // 对应 C 的 ci->top = func + 1 + fsize
+                    // GC 遍历栈时需要覆盖整个函数帧，包含所有局部变量和临时寄存器
+                    state.top = frame_end;
                     // 对应 C 的 luaG_tracecall -> luaD_hookcall: 触发 call hook
                     if state.hook_mask & 1 != 0 {  // LUA_MASKCALL
                         // ftransfer=1 (参数从 func+1 开始), ntransfer=numparams
@@ -4787,7 +4805,13 @@ impl VmExecutor {
                     })));
                 }
             }
+            // GC: 在创建新闭包前检查 GC 阈值，回收不可达的旧闭包。
+            // 对应 C Lua 的 luaC_checkGC（OP_CLOSURE 中调用 luaC_checkGC(L)）。
+            state.maybe_collect_gc();
             let closure = LClosure { gc_header: crate::gc::GCObjectHeader::new(), proto: Rc::new(proto), upvals: Rc::new(RefCell::new(upvals)) };
+            // 注册到 GC metas，使 gc_estimate 增长，让 maybe_collect_gc 的阈值检查能正常工作
+            let closure_id = state.gc.register_object(std::mem::size_of::<LClosure>());
+            closure.gc_header.set_id(closure_id);
             Self::write_stack(state, ra, TValue::LClosure(closure));
         }
         state.pc += 1;
@@ -5032,6 +5056,9 @@ impl VmExecutor {
                 while state.stack.len() < frame_end {
                     state.stack.push(TValue::Nil(NilKind::Strict));
                 }
+                // 对应 C 的 ci->top = func + 1 + fsize
+                // GC 遍历栈时需要覆盖整个函数帧，包含所有局部变量和临时寄存器
+                state.top = frame_end;
             }
         }
 

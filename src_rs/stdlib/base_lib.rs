@@ -2475,20 +2475,24 @@ fn call_collectgarbage(
 
     let result = match opt.as_str() {
         "collect" => {
-            // 清理 wrap_coros 中不再被外部引用的协程
-            // （ThreadContext 的 Rc 计数 == 1 表示只有 wrap_coros 持有）
-            for entry in state.wrap_coros.iter_mut() {
-                if let Some(thread) = entry {
-                    let rc_count = std::rc::Rc::strong_count(&thread.context);
-                    if rc_count <= 1 {
-                        *entry = None;
+            // GC 正在进行中（finalizer 内重入）— 不重入，返回 falsy
+            if state.gc.is_gc_running() {
+                TValue::Boolean(false)
+            } else {
+                // 清理 wrap_coros 中不再被外部引用的协程
+                // （ThreadContext 的 Rc 计数 == 1 表示只有 wrap_coros 持有）
+                for entry in state.wrap_coros.iter_mut() {
+                    if let Some(thread) = entry {
+                        let rc_count = std::rc::Rc::strong_count(&thread.context);
+                        if rc_count <= 1 {
+                            *entry = None;
+                        }
                     }
                 }
+                // collect_gc 内部会清理弱引用表中的死条目
+                state.collect_gc();
+                TValue::Integer(0)
             }
-            // 清理弱引用表中仅被弱引用表持有的条目
-            state.process_weak_tables();
-            state.collect_gc();
-            TValue::Integer(0)
         }
         "stop" => {
             state.gc_stop();
@@ -2507,23 +2511,75 @@ fn call_collectgarbage(
             TValue::Integer(0)
         }
         "step" => {
-            state.gc.step();
-            TValue::Boolean(true)
+            let siz: usize = if nargs >= 2 {
+                match get_arg(state, a, 1) {
+                    TValue::Integer(i) => (i as i64).max(0) as usize,
+                    TValue::Float(f) => (f as i64).max(0) as usize,
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+            let done = state.step_gc(siz);
+            TValue::Boolean(done)
         }
         "isrunning" => {
             TValue::Boolean(state.gc.is_running())
         }
         "generational" => {
-            state.gc_gen();
-            TValue::Str(state.intern_str("incremental"))
+            let old = state.gc.set_mode(crate::gc::GCMode::Generational);
+            let prev = if old == crate::gc::GCMode::Generational {
+                "generational"
+            } else {
+                "incremental"
+            };
+            TValue::Str(state.intern_str(prev))
         }
         "incremental" => {
-            // 简化: 返回之前的模式
-            TValue::Str(state.intern_str("incremental"))
+            let old = state.gc.set_mode(crate::gc::GCMode::Incremental);
+            let prev = if old == crate::gc::GCMode::Generational {
+                "generational"
+            } else {
+                "incremental"
+            };
+            TValue::Str(state.intern_str(prev))
         }
         "param" => {
-            // 简化: 返回 0
-            TValue::Integer(0)
+            use crate::gc::GCState;
+            let pname = match get_arg(state, a, 1) {
+                TValue::Str(s) => s.as_str().to_string(),
+                ref other => return Err(VmError::RuntimeError(format!(
+                    "bad argument #2 to 'collectgarbage' (string expected, got {})",
+                    crate::tm::obj_type_name(other)
+                ))),
+            };
+            let pidx = match pname.as_str() {
+                "minormul" => GCState::PARAM_MINORMUL,
+                "majorminor" => GCState::PARAM_MAJORMINOR,
+                "minormajor" => GCState::PARAM_MINORMAJOR,
+                "pause" => GCState::PARAM_PAUSE,
+                "stepmul" => GCState::PARAM_STEPMUL,
+                "stepsize" => GCState::PARAM_STEPSIZE,
+                _ => return Err(VmError::RuntimeError(format!(
+                    "bad argument #2 to 'collectgarbage' (invalid parameter name '{}')",
+                    pname
+                ))),
+            };
+            if nargs >= 3 {
+                let val: i32 = match get_arg(state, a, 2) {
+                    TValue::Integer(i) => i as i32,
+                    TValue::Float(f) => f as i32,
+                    ref other => return Err(VmError::RuntimeError(format!(
+                        "bad argument #3 to 'collectgarbage' (number expected, got {})",
+                        crate::tm::obj_type_name(other)
+                    ))),
+                };
+                let old = state.gc.swap_gc_param(pidx, val);
+                TValue::Integer(old as i64)
+            } else {
+                let cur = state.gc.get_gc_param(pidx);
+                TValue::Integer(cur as i64)
+            }
         }
         _ => {
             return Err(VmError::RuntimeError(format!(
