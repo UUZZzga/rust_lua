@@ -4385,6 +4385,14 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
                 fs.patch_list_aux(my_false_list, final_pc, dest, p_f);
             }
         }
+        ExpKind::Upval => {
+            if e.t != NO_JUMP || e.f != NO_JUMP {
+                fs.code_abc(OpCode::GETUPVAL, dest, e.info as i32, 0);
+                fs.resolve_jumps(e, dest);
+                return;
+            }
+            fs.code_abc(OpCode::GETUPVAL, dest, e.info as i32, 0);
+        }
         _ => {
             // Like C's exp2reg: discharge2reg + patchlistaux (resolve jumps)
             if e.has_jumps() {
