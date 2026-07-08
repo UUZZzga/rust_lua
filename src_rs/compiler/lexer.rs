@@ -31,6 +31,10 @@ pub enum Token {
     LParen, RParen, LBrace, RBrace, LBracket, RBracket,
     ColonColon, Dot, DotDot, DotDotDot, Comma, Colon, Semi,
 
+    /// 单字符 token (对应 C llex default 分支返回的非保留字符)
+    /// 用于未知字符 (如控制字符 \1), 让解析器报 "syntax error" 或 "unexpected symbol"
+    Char(char),
+
     Eof,
 }
 
@@ -133,6 +137,14 @@ impl Token {
             Token::Comma => "','".to_string(),
             Token::Colon => "':'".to_string(),
             Token::Semi => "';'".to_string(),
+            // 对应 C luaX_token2str: 可打印字符 "'c'", 控制字符 "'<\N>'"
+            Token::Char(c) => {
+                if c.is_ascii_graphic() || *c == ' ' {
+                    format!("'{}'", c)
+                } else {
+                    format!("'<\\{}>'", *c as u32)
+                }
+            }
         }
     }
 }
@@ -560,20 +572,13 @@ impl<'a> LexState<'a> {
             '\'' | '"' => self.read_short_string(),
             c if c.is_ascii_digit() => self.read_number(),
             c if c.is_ascii_alphabetic() || c == '_' => self.read_name(),
-            _ => {
-                // 对应 C: llex default 分支返回单字符 token, parser primaryexp default
-                // 报 "unexpected symbol". luaX_token2str 对控制字符显示 '<\N>', 对可打印字符显示 'c'.
-                let c = self.current;
-                let token_str = if c == EOF_CHAR {
-                    "<eof>".to_string()
-                } else if c.is_ascii_graphic() {
-                    format!("'{}'", c)
-                } else {
-                    format!("'<\\{}>'", c as u32)
-                };
-                self.error(&format!("unexpected symbol near {}", token_str));
+            EOF_CHAR => self.token = Token::Eof,
+            c => {
+                // 对应 C llex default 分支: 非字母数字的单字符直接返回为 token
+                // (如控制字符 \1), 解析器在 primaryexp/exprstat 中报 "syntax error"
+                // 或 "unexpected symbol". luaX_token2str 对控制字符显示 '<\N>'.
                 self.next_char();
-                self.token = Token::Eof;
+                self.token = Token::Char(c);
             }
         }
     }
@@ -663,16 +668,18 @@ impl<'a> LexState<'a> {
                 match parse_hex_float(s) {
                     Some(v) => self.token = Token::Float(v),
                     None => {
-                        self.error(&format!("malformed number: 0x{}", s));
-                        self.token = Token::Float(0.0);
+                        // 对应 C: lexerror(ls, "malformed number", TK_FLT)
+                        // txtToken(TK_FLT) 返回 buffer 内容 (含 0x 前缀), 带引号
+                        self.error(&format!("malformed number near '0x{}'", s));
+                        self.token = Token::Eof;
                     }
                 }
             } else {
                 match s.parse::<f64>() {
                     Ok(v) => self.token = Token::Float(v),
                     Err(_) => {
-                        self.error(&format!("malformed number: {}", s));
-                        self.token = Token::Float(0.0);
+                        self.error(&format!("malformed number near '{}'", s));
+                        self.token = Token::Eof;
                     }
                 }
             }
@@ -699,8 +706,8 @@ impl<'a> LexState<'a> {
                 Err(_) => match s.parse::<f64>() {
                     Ok(v) => self.token = Token::Float(v),
                     Err(_) => {
-                        self.error(&format!("malformed number: {}", s));
-                        self.token = Token::Int(0);
+                        self.error(&format!("malformed number near '{}'", s));
+                        self.token = Token::Eof;
                     }
                 },
             }

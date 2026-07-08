@@ -384,7 +384,6 @@ pub(crate) fn call_tm_res(
     let caller_nextraargs = state.nextraargs;
     let caller_closure_upvals = state.closure_upvals.clone();
     let caller_tbc_list = state.tbc_list;
-    let caller_open_upval = state.open_upval;
     let caller_source = if state.base > 0 && state.base <= state.stack.len() {
         if let TValue::LClosure(c) = &state.stack[state.base - 1] {
             c.proto.source.as_ref().map(|s| s.as_str().to_string()).unwrap_or_else(|| "=?".to_string())
@@ -426,7 +425,6 @@ pub(crate) fn call_tm_res(
         saved_nextraargs: caller_nextraargs,
         saved_closure_upvals: caller_closure_upvals.clone(),
         saved_tbc_list: caller_tbc_list,
-        saved_open_upval: caller_open_upval,
         func_idx: func_idx,
         nresults: 1,
         pcall_kind: crate::state::PcallKind::Pcall,
@@ -554,7 +552,6 @@ pub(crate) fn call_tm(
     let caller_nextraargs = state.nextraargs;
     let caller_closure_upvals = state.closure_upvals.clone();
     let caller_tbc_list = state.tbc_list;
-    let caller_open_upval = state.open_upval;
     let caller_source = if state.base > 0 && state.base <= state.stack.len() {
         if let TValue::LClosure(c) = &state.stack[state.base - 1] {
             c.proto.source.as_ref().map(|s| s.as_str().to_string()).unwrap_or_else(|| "=?".to_string())
@@ -595,7 +592,6 @@ pub(crate) fn call_tm(
         saved_nextraargs: caller_nextraargs,
         saved_closure_upvals: caller_closure_upvals.clone(),
         saved_tbc_list: caller_tbc_list,
-        saved_open_upval: caller_open_upval,
         func_idx: func_idx,
         nresults: 0,
         pcall_kind: crate::state::PcallKind::Pcall,
@@ -677,8 +673,12 @@ pub fn call_close_method(
     yy: bool,
 ) -> Result<bool, VmError> {
     let depth = CLOSE_METHOD_DEPTH.with(|d| { let v = d.get(); d.set(v + 1); v });
-    if depth > 10 {
-        panic!("call_close_method infinite recursion, depth={}", depth);
+    // 对应 C 的 luaE_checkcstack: __close 链式调用达到 LUAI_MAXCCALLS 时
+    // 抛出可被 pcall 捕获的 "C stack overflow" 错误（cstack.lua:108 期望此消息）。
+    // 不能 panic，否则 coroutine.close 无法返回 (false, msg)。
+    if depth >= crate::state::LUAI_MAXCCALLS as usize {
+        CLOSE_METHOD_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        return Err(VmError::RuntimeError("C stack overflow".to_string()));
     }
     struct DepthGuard;
     impl Drop for DepthGuard {
@@ -762,7 +762,6 @@ pub fn call_close_method(
         saved_nextraargs: 0,
         saved_closure_upvals: Vec::new(),
         saved_tbc_list: None,
-        saved_open_upval: None,
         func_idx: 0,
         nresults: 0,
         pcall_kind: crate::state::PcallKind::Pcall,

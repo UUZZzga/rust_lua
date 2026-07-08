@@ -52,6 +52,16 @@ pub const BASE_LOAD: usize = 23;
 pub const BASE_COLLECTGARBAGE: usize = 24;
 pub const BASE_DOFILE: usize = 25;
 pub const BASE_LOADFILE: usize = 26;
+pub const BASE_LOADLIB: usize = 27;
+pub const BASE_SEARCHPATH: usize = 28;
+
+// package.searchers 表中的 searcher 函数标签 (对应 C 的 searcher_preload/Lua/C/Croot)
+// 当前 call_require 硬编码搜索逻辑,不遍历 package.searchers 表;
+// 这些标签仅用于让 searchers 表元素显示为 "function" 类型。
+pub const BASE_SEARCHER_PRELOAD: usize = 29;
+pub const BASE_SEARCHER_LUA: usize = 30;
+pub const BASE_SEARCHER_C: usize = 31;
+pub const BASE_SEARCHER_CROOT: usize = 32;
 
 // 迭代器辅助函数标签 (不在 is_base_tag 范围内, 只在 TFORCALL 中处理)
 // 对应 C 的 ipairsaux 和 next 迭代器函数
@@ -62,6 +72,7 @@ pub const BASE_NEXT_ITER: usize = 21;
 pub fn is_base_tag(tag: usize) -> bool {
     (tag >= BASE_PRINT && tag <= BASE_WARN) || tag == BASE_REQUIRE || tag == BASE_LOAD
         || tag == BASE_COLLECTGARBAGE || tag == BASE_DOFILE || tag == BASE_LOADFILE
+        || tag == BASE_LOADLIB || tag == BASE_SEARCHPATH
 }
 
 /// 判断标签是否为已知的函数标签 (用于 type/tostring 显示)
@@ -69,6 +80,7 @@ pub fn is_base_tag(tag: usize) -> bool {
 /// 包括基础库函数标签 (1-19)、迭代器辅助函数标签 (20-21) 和字符串库标签 (100+)
 pub fn is_function_tag(tag: usize) -> bool {
     is_base_tag(tag) || tag == BASE_IPAIRS_AUX || tag == BASE_NEXT_ITER || tag >= 100
+        || (tag >= BASE_SEARCHER_PRELOAD && tag <= BASE_SEARCHER_CROOT)
 }
 
 // ============================================================================
@@ -390,6 +402,9 @@ pub fn base_function_name(tag: usize) -> Option<&'static str> {
         BASE_LOAD => Some("load"),
         BASE_COLLECTGARBAGE => Some("collectgarbage"),
         BASE_DOFILE => Some("dofile"),
+        BASE_LOADFILE => Some("loadfile"),
+        BASE_LOADLIB => Some("loadlib"),
+        BASE_SEARCHPATH => Some("searchpath"),
         _ => None,
     }
 }
@@ -430,6 +445,13 @@ pub fn call_base_function(
         BASE_COLLECTGARBAGE => call_collectgarbage(state, a, nargs, nresults),
         BASE_DOFILE => call_dofile(state, a, nargs, nresults),
         BASE_LOADFILE => call_loadfile(state, a, nargs, nresults),
+        BASE_LOADLIB => call_loadlib(state, a, nargs, nresults),
+        BASE_SEARCHPATH => call_searchpath(state, a, nargs, nresults),
+        BASE_SEARCHER_PRELOAD | BASE_SEARCHER_LUA | BASE_SEARCHER_C | BASE_SEARCHER_CROOT => {
+            Err(VmError::RuntimeError(
+                "package.searchers functions are not directly callable".to_string(),
+            ))
+        }
         _ => Err(VmError::RuntimeError(format!("unknown base function tag: {}", tag))),
     };
 
@@ -627,7 +649,6 @@ fn call_pcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
         saved_nextraargs: state.nextraargs,
         saved_closure_upvals: state.closure_upvals.clone(),
         saved_tbc_list: state.tbc_list,
-        saved_open_upval: state.open_upval,
         func_idx: a,
         // 保存 pcall 调用者期望的返回值数 (非 state.pcall 的 -1)，
         // 供 finish_pcall_return continuation 调整栈使用。
@@ -1308,7 +1329,6 @@ fn call_pairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
             saved_nextraargs: state.nextraargs,
             saved_closure_upvals: state.closure_upvals.clone(),
             saved_tbc_list: state.tbc_list,
-            saved_open_upval: state.open_upval,
             func_idx: a,
             nresults,
             pcall_kind: crate::state::PcallKind::Pcall,
@@ -1389,7 +1409,6 @@ fn call_xpcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         saved_nextraargs: state.nextraargs,
         saved_closure_upvals: state.closure_upvals.clone(),
         saved_tbc_list: state.tbc_list,
-        saved_open_upval: state.open_upval,
         func_idx: a,
         // 保存 xpcall 调用者期望的返回值数 (非 state.pcall 的 -1)，
         // 供 finish_pcall_return continuation 调整栈使用。
@@ -1547,11 +1566,15 @@ fn call_warn(state: &mut LuaState, a: usize, nargs: usize, _nresults: i32) -> Re
             "bad argument #1 to 'warn' (string expected)".to_string(),
         ));
     }
-    let mut msg = String::new();
+    // 对应 C: for (i = 1; i < n; i++) lua_warning(L, msg_i, 1);
+    //         lua_warning(L, msg_n, 0);
     for i in 0..nargs {
         let arg = get_arg(state, a, i);
         match &arg {
-            TValue::Str(s) => msg.push_str(s.as_str()),
+            TValue::Str(s) => {
+                let tocont = i + 1 < nargs;
+                state.warning(s.as_str(), tocont);
+            }
             _ => {
                 return Err(VmError::RuntimeError(format!(
                     "bad argument #{} to 'warn' (string expected)",
@@ -1560,18 +1583,19 @@ fn call_warn(state: &mut LuaState, a: usize, nargs: usize, _nresults: i32) -> Re
             }
         }
     }
-    // 输出到 stderr (简化实现)
-    eprintln!("Lua warning: {}", msg);
     state.stack.truncate(a);
     Ok(())
 }
 
 /// require(modname) — 加载模块
 ///
-/// 简化实现, 对应 C 的 requiref 语义:
-/// 1. 检查 package.loaded[modname], 如果已加载则直接返回
-/// 2. 对于内置模块 (utf8, math, string 等), 返回对应的全局表
-/// 3. 对于未知模块, 返回错误
+/// 对应 C loadlib.cpp 的 ll_require，按顺序尝试 4 个 searcher：
+/// 1. package.preload[modname] — 预加载函数
+/// 2. package.path — Lua 文件搜索（modname 中 `.` 替换为 `/`）
+/// 3. package.cpath — C 模块搜索（modname 中 `.` 替换为 `_` 构造 luaopen_xxx）
+/// 4. 全局表 _G[modname] — 内置库兼容（Rust 扩展，非 C 标准行为）
+///
+/// 返回 (module_value, loader_data)，loader_data 通常是文件路径。
 fn call_require(
     state: &mut LuaState,
     a: usize,
@@ -1594,14 +1618,17 @@ fn call_require(
         }
     };
 
-    // 检查 package.loaded 表中是否已缓存
-    let package_key = TValue::Str(state.intern_str("package"));
-    if let Some(TValue::Table(package_table)) = state.globals.get(&package_key) {
+    // 1. 检查 package.loaded 表中是否已缓存
+    // 使用 registry 中的 package 表（对应 C 版 require 的 upvalue），不受
+    // Lua 代码 `package = {}` 重置全局变量影响。
+    if let Some(package_table) = get_package_table(state) {
         let loaded_key = TValue::Str(state.intern_str("loaded"));
         if let Some(TValue::Table(loaded_table)) = package_table.get(&loaded_key) {
             let mod_key = TValue::Str(state.intern_str(&modname));
             if let Some(val) = loaded_table.get(&mod_key) {
-                if !matches!(val, TValue::Nil(_)) {
+                // 对应 C 版 lua_toboolean：仅 truthy（非 nil 非 false）才视为已加载
+                // false 被视为未加载，需要重新执行 loader
+                if !matches!(val, TValue::Nil(_)) && !matches!(val, TValue::Boolean(false)) {
                     push_results(state, a, nresults, vec![val.clone()]);
                     return Ok(());
                 }
@@ -1609,77 +1636,549 @@ fn call_require(
         }
     }
 
-    // 对于内置模块, 返回对应的全局表
-    let global_key = TValue::Str(state.intern_str(&modname));
-    let result = state.globals.get(&global_key);
+    // 检查 package.searchers 是否为 table — 对应 C findloader (loadlib.cpp:624)
+    if let Some(package_table) = get_package_table(state) {
+        let searchers_key = TValue::Str(state.intern_str("searchers"));
+        match package_table.get(&searchers_key) {
+            Some(TValue::Table(_)) => {}
+            _ => {
+                return Err(VmError::RuntimeError(
+                    "'package.searchers' must be a table".to_string(),
+                ));
+            }
+        }
+    }
 
-    match result {
-        Some(val) if !matches!(val, TValue::Nil(_)) => {
-            // 缓存到 package.loaded
-            let package_key = TValue::Str(state.intern_str("package"));
-            let package_table = match state.globals.get(&package_key) {
-                Some(TValue::Table(t)) => t.clone(),
-                _ => {
-                    // 创建 package 表
-                    let mut pkg = crate::table::Table::new();
-                    let loaded = crate::table::Table::new();
-                    pkg.set(
-                        TValue::Str(state.intern_str("loaded")),
-                        TValue::Table(loaded),
-                    );
-                    state.globals.set(package_key.clone(), TValue::Table(pkg.clone()));
-                    pkg
+    // 收集错误消息
+    let mut err_msgs: Vec<String> = Vec::new();
+
+    // 2. 检查 package.preload[modname]
+    if let Some(preload_func) = get_preload(state, &modname) {
+        if !matches!(preload_func, TValue::Nil(_)) {
+            // 调用 preload 函数: preload(modname)
+            return run_loader(state, a, nresults, &modname, preload_func, ":preload:");
+        }
+    }
+    err_msgs.push(format!("no field package.preload['{}']", modname));
+
+    // 3. Lua 文件搜索 (package.path) — 对应 C searcher_Lua
+    match findfile(state, &modname, "path", "/", ".") {
+        Ok((Some(filepath), _)) => {
+            return load_lua_module(state, a, nresults, &modname, &filepath);
+        }
+        Ok((None, errmsg)) => {
+            err_msgs.push(errmsg);
+        }
+        Err(e) => {
+            return Err(VmError::RuntimeError(e));
+        }
+    }
+
+    // 4. C 模块搜索 (package.cpath) — 对应 C searcher_C
+    match search_c_module(state, &modname) {
+        Ok((loader_func, filepath)) => {
+            return run_loader(state, a, nresults, &modname, loader_func, &filepath);
+        }
+        Err(msg) => {
+            err_msgs.push(msg);
+        }
+    }
+
+    // 5. C root 搜索 — 对应 C searcher_Croot
+    // 如果 modname 含 '.'，提取 root 部分搜索 cpath
+    if let Some(dot_pos) = modname.find('.') {
+        let root = &modname[..dot_pos];
+        match findfile(state, root, "cpath", "/", ".") {
+            Ok((Some(filepath), _)) => {
+                // root 文件找到，尝试加载 modname 对应的 openfunc
+                match load_c_root(state, &filepath, &modname) {
+                    Ok(loader_func) => {
+                        return run_loader(state, a, nresults, &modname, loader_func, &filepath);
+                    }
+                    Err(msg) => {
+                        err_msgs.push(msg);
+                    }
                 }
-            };
+            }
+            Ok((None, errmsg)) => {
+                err_msgs.push(errmsg);
+            }
+            Err(e) => {
+                return Err(VmError::RuntimeError(e));
+            }
+        }
+    }
+
+    // 6. 内置库兼容：检查全局表 _G[modname]
+    let global_key = TValue::Str(state.intern_str(&modname));
+    if let Some(val) = state.globals.get(&global_key) {
+        if !matches!(val, TValue::Nil(_)) {
+            cache_module_loaded(state, &modname, val.clone());
+            push_results(state, a, nresults, vec![val]);
+            return Ok(());
+        }
+    }
+
+    Err(VmError::RuntimeError(format!(
+        "module '{}' not found:\n\t{}",
+        modname,
+        err_msgs.join("\n\t")
+    )))
+}
+
+/// 获取 package.preload[modname]
+fn get_preload(state: &LuaState, modname: &str) -> Option<TValue> {
+    if let Some(package_table) = get_package_table(state) {
+        let preload_key = TValue::Str(state.intern_str("preload"));
+        if let Some(TValue::Table(preload_table)) = package_table.get(&preload_key) {
+            let mod_key = TValue::Str(state.intern_str(modname));
+            return Some(preload_table.get(&mod_key).unwrap_or(TValue::Nil(NilKind::Strict)));
+        }
+    }
+    None
+}
+
+/// 调用 loader 函数（preload 或 Lua 文件返回的函数）
+fn run_loader(
+    state: &mut LuaState,
+    a: usize,
+    nresults: i32,
+    modname: &str,
+    loader: TValue,
+    loader_data: &str,
+) -> Result<(), VmError> {
+    let saved_len = state.stack.len();
+    state.stack.push(loader);
+    state.stack.push(TValue::Str(state.intern_str(modname)));
+    state.stack.push(TValue::Str(state.intern_str(loader_data)));
+    let status = state.pcall(2, 1, 0);
+    if status != 0 {
+        let err = state.to_string(-1).unwrap_or_default();
+        state.settop(saved_len);
+        return Err(VmError::RuntimeError(err));
+    }
+    let result = state
+        .stack
+        .get(saved_len)
+        .cloned()
+        .unwrap_or_else(|| TValue::Nil(NilKind::Strict));
+    state.settop(saved_len);
+    let result = if matches!(result, TValue::Nil(_)) {
+        TValue::Boolean(true)
+    } else {
+        result
+    };
+    cache_module_loaded(state, modname, result.clone());
+    push_results(state, a, nresults, vec![result, TValue::Str(state.intern_str(loader_data))]);
+    Ok(())
+}
+
+/// 加载并执行 .lua 模块文件
+fn load_lua_module(
+    state: &mut LuaState,
+    a: usize,
+    nresults: i32,
+    modname: &str,
+    filepath: &str,
+) -> Result<(), VmError> {
+    let saved_len = state.stack.len();
+    let load_status = state.load_file(Some(filepath));
+    if load_status != 0 {
+        let err = state.to_string(-1).unwrap_or_default();
+        state.settop(saved_len);
+        return Err(VmError::RuntimeError(format!(
+            "error loading module '{}' from '{}': {}",
+            modname, filepath, err
+        )));
+    }
+    // 调用加载的函数：(modname, filepath)
+    state.stack.push(TValue::Str(state.intern_str(modname)));
+    state.stack.push(TValue::Str(state.intern_str(filepath)));
+    let call_status = state.pcall(2, 1, 0);
+    if call_status != 0 {
+        let err = state.to_string(-1).unwrap_or_default();
+        state.settop(saved_len);
+        return Err(VmError::RuntimeError(format!(
+            "error loading module '{}' from '{}': {}",
+            modname, filepath, err
+        )));
+    }
+    let result = state
+        .stack
+        .get(saved_len)
+        .cloned()
+        .unwrap_or_else(|| TValue::Nil(NilKind::Strict));
+    state.settop(saved_len);
+    // 对应 C ll_require: 如果 loader 返回非 nil，设 package.loaded[modname] = result；
+    // 如果返回 nil，检查模块代码是否已设置 package.loaded[modname]；若仍为 nil，设为 true。
+    let result = if matches!(result, TValue::Nil(_)) {
+        // loader 返回 nil — 检查模块是否已设置 package.loaded[modname]
+        if let Some(package_table) = get_package_table(state) {
             let loaded_key = TValue::Str(state.intern_str("loaded"));
             if let Some(TValue::Table(loaded_table)) = package_table.get(&loaded_key) {
-                let mut loaded_table = loaded_table.clone();
-                loaded_table.set(global_key.clone(), val.clone());
-                let mut package_table = package_table;
-                package_table.set(loaded_key, TValue::Table(loaded_table));
-                state.globals.set(package_key, TValue::Table(package_table));
-            }
-            push_results(state, a, nresults, vec![val]);
-            Ok(())
-        }
-        _ => {
-            // 全局表未找到,尝试从 package.path 搜索并加载文件模块
-            if let Some(filepath) = search_module_file(state, &modname) {
-                load_and_run_module(state, a, nresults, &modname, &filepath)
+                let mod_key = TValue::Str(state.intern_str(modname));
+                if let Some(val) = loaded_table.get(&mod_key) {
+                    if !matches!(val, TValue::Nil(_)) {
+                        val
+                    } else {
+                        TValue::Boolean(true)
+                    }
+                } else {
+                    TValue::Boolean(true)
+                }
             } else {
-                Err(VmError::RuntimeError(format!(
-                    "module '{}' not found",
-                    modname
-                )))
+                TValue::Boolean(true)
             }
+        } else {
+            TValue::Boolean(true)
+        }
+    } else {
+        // loader 返回非 nil — 缓存到 package.loaded
+        cache_module_loaded(state, modname, result.clone());
+        result
+    };
+    // 确保最终结果也缓存
+    cache_module_loaded(state, modname, result.clone());
+    push_results(state, a, nresults, vec![result, TValue::Str(state.intern_str(filepath))]);
+    Ok(())
+}
+
+/// 通用路径搜索 — 对应 C loadlib.cpp 的 searchpath
+///
+/// 在 package[fieldname] 中搜索 name，name 中的 sep 替换为 dirsep，
+/// 模板中 ? 替换为 name。返回第一个存在的文件路径。
+/// 通用路径搜索 — 对应 C loadlib.cpp 的 findfile + searchpath
+///
+/// 在 package[fieldname] 中搜索 name，name 中的 sep 替换为 dirsep，
+/// 模板中 ? 替换为 name。返回 (找到的路径, 错误消息)。
+/// 找到时错误消息为空；未找到时路径为 None，错误消息列出所有尝试的文件。
+/// path 不是字符串时返回 Err（对应 C 的 luaL_error）。
+fn findfile(state: &LuaState, name: &str, fieldname: &str, dirsep: &str, sep: &str) -> Result<(Option<String>, String), String> {
+    let path = match get_package_table(state) {
+        Some(t) => {
+            let path_key = TValue::Str(state.intern_str(fieldname));
+            match t.get(&path_key) {
+                Some(TValue::Str(s)) => s.as_str().to_string(),
+                _ => return Err(format!("'package.{}' must be a string", fieldname)),
+            }
+        }
+        None => return Err(format!("'package.{}' must be a string", fieldname)),
+    };
+    let name_replaced = if !sep.is_empty() && name.contains(sep) {
+        name.replace(sep, dirsep)
+    } else {
+        name.to_string()
+    };
+    let mut err_paths: Vec<String> = Vec::new();
+    for template in path.split(';') {
+        let filepath = template.replace('?', &name_replaced);
+        if std::path::Path::new(&filepath).is_file() {
+            return Ok((Some(filepath), String::new()));
+        }
+        err_paths.push(filepath);
+    }
+    let errmsg = format!("no file '{}'", err_paths.join("'\n\tno file '"));
+    Ok((None, errmsg))
+}
+
+/// 旧版兼容：仅返回找到的路径，不返回错误消息
+fn search_path(state: &LuaState, name: &str, fieldname: &str, dirsep: &str, sep: &str) -> Result<Option<String>, String> {
+    findfile(state, name, fieldname, dirsep, sep).map(|(opt, _)| opt)
+}
+
+/// loadfunc — 对应 C loadlib.cpp 的 loadfunc
+///
+/// 在 filename 中查找 luaopen_<modname> 函数。
+/// modname 中 `.` → `_`，处理 `-` ignore mark（先试前缀，再试后缀）。
+fn loadfunc(state: &mut LuaState, filename: &str, modname: &str) -> Result<TValue, LoadlibError> {
+    let modname_normalized = modname.replace('.', "_");
+    let openfunc = if let Some(dash_pos) = modname_normalized.find('-') {
+        let prefix = &modname_normalized[..dash_pos];
+        let func_name = format!("luaopen_{}", prefix);
+        match lookforfunc(state, filename, &func_name) {
+            Ok(val) => return Ok(val),
+            Err(LoadlibError::FuncNotFound) => {
+                let suffix = &modname_normalized[dash_pos + 1..];
+                format!("luaopen_{}", suffix)
+            }
+            Err(e) => return Err(e),
+        }
+    } else {
+        format!("luaopen_{}", modname_normalized)
+    };
+    lookforfunc(state, filename, &openfunc)
+}
+
+/// 搜索并加载 C 模块 — 对应 C loadlib.cpp 的 searcher_C
+///
+/// 在 package.cpath 中搜索 .so 文件，调用 luaopen_xxx 函数。
+/// 返回 Ok((loader_func, filepath)) 或 Err(error_message)。
+fn search_c_module(state: &mut LuaState, modname: &str) -> Result<(TValue, String), String> {
+    let (filename_opt, errmsg) = findfile(state, modname, "cpath", "/", ".")?;
+    let filename = match filename_opt {
+        Some(f) => f,
+        None => return Err(errmsg),
+    };
+    let loader = loadfunc(state, &filename, modname).map_err(|e| e.to_error_msg(&filename))?;
+    Ok((loader, filename))
+}
+
+/// C root 加载 — 对应 C loadlib.cpp 的 searcher_Croot
+///
+/// 在已找到的 root 文件中查找 modname 对应的 openfunc。
+fn load_c_root(state: &mut LuaState, filepath: &str, modname: &str) -> Result<TValue, String> {
+    match loadfunc(state, filepath, modname) {
+        Ok(val) => Ok(val),
+        Err(LoadlibError::FuncNotFound) => {
+            Err(format!("no module '{}' in file '{}'", modname, filepath))
+        }
+        Err(e) => Err(e.to_error_msg(filepath)),
+    }
+}
+
+/// loadlib 错误类型
+enum LoadlibError {
+    LibNotFound(String),  // dlopen 失败，错误消息
+    FuncNotFound,         // dlsym 失败
+}
+
+impl LoadlibError {
+    fn to_error_msg(&self, filename: &str) -> String {
+        match self {
+            LoadlibError::LibNotFound(msg) => format!("error loading module at file '{}': {}", filename, msg),
+            LoadlibError::FuncNotFound => format!("no symbol 'luaopen_' in file '{}'", filename),
         }
     }
 }
 
-/// 读取 package.path 并搜索模块文件 (对应 C 的 searchpath 逻辑,简化版)
+// ============================================================================
+// 动态库加载辅助函数 — 对应 C loadlib.cpp 的 lsys_load / lsys_sym / lsys_unload
+// 直接调用 libc dlopen/dlsym/dlclose，不依赖 capi 模块（避免 ffi feature 冲突）
+// ============================================================================
+
+/// dlopen 加载动态库，返回库句柄。seeglb=true 时用 RTLD_GLOBAL。
+unsafe fn sys_load(path: &str, seeglb: bool) -> *mut std::ffi::c_void {
+    let cpath = match std::ffi::CString::new(path) {
+        Ok(c) => c,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    let flags = if seeglb {
+        libc::RTLD_NOW | libc::RTLD_GLOBAL
+    } else {
+        libc::RTLD_NOW | libc::RTLD_LOCAL
+    };
+    unsafe { libc::dlopen(cpath.as_ptr(), flags) }
+}
+
+/// dlsym 查找符号，返回函数指针
+unsafe fn sys_sym(lib: *mut std::ffi::c_void, sym: &str) -> Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> i32> {
+    let csym = std::ffi::CString::new(sym).ok()?;
+    let ptr = unsafe { libc::dlsym(lib, csym.as_ptr()) };
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute::<*mut std::ffi::c_void, unsafe extern "C" fn(*mut std::ffi::c_void) -> i32>(ptr) })
+    }
+}
+
+/// dlerror 获取错误消息
+unsafe fn sys_dlerror() -> String {
+    let ptr = unsafe { libc::dlerror() };
+    if ptr.is_null() {
+        String::new()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+    }
+}
+
+/// lookforfunc — 对应 C loadlib.cpp 的 lookforfunc
+///
+/// 1. 检查 registry.CLIBS[path]，已加载则复用
+/// 2. 未加载则 dlopen
+/// 3. sym == "*" 返回 true（仅加载库）
+/// 4. 否则 dlsym 找函数，返回 C 函数
+fn lookforfunc(state: &mut LuaState, path: &str, sym: &str) -> Result<TValue, LoadlibError> {
+    // 检查 CLIBS 缓存
+    let clibs_key = TValue::Str(state.intern_str("CLIBS"));
+    let clibs_table = match state.registry.get(&clibs_key) {
+        Some(TValue::Table(t)) => Some(t),
+        _ => None,
+    };
+    let path_key = TValue::Str(state.intern_str(path));
+    let mut lib_handle: *mut std::ffi::c_void = std::ptr::null_mut();
+    if let Some(ref clibs) = clibs_table {
+        if let Some(TValue::LightUserData(p)) = clibs.get(&path_key) {
+            lib_handle = p;
+        }
+    }
+
+    // 未加载则 dlopen
+    if lib_handle.is_null() {
+        let seeglb = sym == "*";
+        lib_handle = unsafe { sys_load(path, seeglb) };
+        if lib_handle.is_null() {
+            let msg = unsafe { sys_dlerror() };
+            return Err(LoadlibError::LibNotFound(msg));
+        }
+        // 缓存到 registry.CLIBS[path]
+        let clibs = match state.registry.get(&clibs_key) {
+            Some(TValue::Table(t)) => t,
+            _ => {
+                let new_clibs = crate::table::Table::new();
+                state.registry.set(clibs_key.clone(), TValue::Table(new_clibs.clone()));
+                new_clibs
+            }
+        };
+        clibs.set(path_key, TValue::LightUserData(lib_handle));
+    }
+
+    // sym == "*" 仅加载库
+    if sym == "*" {
+        return Ok(TValue::Boolean(true));
+    }
+
+    // dlsym 查找函数
+    let func = unsafe { sys_sym(lib_handle, sym) };
+    match func {
+        Some(f) => {
+            // 创建轻量 C 函数并返回
+            use crate::objects::LCFunction;
+            Ok(TValue::LCFn(LCFunction { func: f }))
+        }
+        None => Err(LoadlibError::FuncNotFound),
+    }
+}
+
+/// package.loadlib(path, init) — 对应 C loadlib.cpp 的 ll_loadlib
+///
+/// init == "*": 仅加载库，返回 true
+/// 否则: dlopen + dlsym，返回 C 函数
+/// 错误: 返回 (nil, errmsg, when) — when 是 "open"（dlopen 失败）或 "init"（dlsym 失败）
+fn call_loadlib(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    if nargs < 2 {
+        return Err(VmError::RuntimeError(
+            "bad argument to 'loadlib' (needs 2 arguments)".to_string(),
+        ));
+    }
+    let path_val = get_arg(state, a, 0);
+    let init_val = get_arg(state, a, 1);
+    let path = match &path_val {
+        TValue::Str(s) => s.as_str().to_string(),
+        _ => return Err(VmError::RuntimeError(
+            "bad argument #1 to 'loadlib' (string expected)".to_string(),
+        )),
+    };
+    let init = match &init_val {
+        TValue::Str(s) => s.as_str().to_string(),
+        _ => return Err(VmError::RuntimeError(
+            "bad argument #2 to 'loadlib' (string expected)".to_string(),
+        )),
+    };
+
+    match lookforfunc(state, &path, &init) {
+        Ok(val) => {
+            push_results(state, a, nresults, vec![val]);
+            Ok(())
+        }
+        Err(LoadlibError::LibNotFound(msg)) => {
+            // 返回 (nil, errmsg, "open")
+            push_results(state, a, nresults, vec![
+                TValue::Nil(NilKind::Strict),
+                TValue::Str(state.intern_str(&msg)),
+                TValue::Str(state.intern_str("open")),
+            ]);
+            Ok(())
+        }
+        Err(LoadlibError::FuncNotFound) => {
+            let msg = unsafe { sys_dlerror() };
+            push_results(state, a, nresults, vec![
+                TValue::Nil(NilKind::Strict),
+                TValue::Str(state.intern_str(&msg)),
+                TValue::Str(state.intern_str("init")),
+            ]);
+            Ok(())
+        }
+    }
+}
+
+/// package.searchpath(name, path [, sep [, dirsep]]) — 对应 C ll_searchpath
+///
+/// 在 path 中搜索 name，返回找到的文件路径。
+/// 失败返回 (nil, errmsg)。
+fn call_searchpath(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    if nargs < 2 {
+        return Err(VmError::RuntimeError(
+            "bad argument to 'searchpath' (needs at least 2 arguments)".to_string(),
+        ));
+    }
+    let name_val = get_arg(state, a, 0);
+    let path_val = get_arg(state, a, 1);
+    let name = match &name_val {
+        TValue::Str(s) => s.as_str().to_string(),
+        _ => return Err(VmError::RuntimeError(
+            "bad argument #1 to 'searchpath' (string expected)".to_string(),
+        )),
+    };
+    let path = match &path_val {
+        TValue::Str(s) => s.as_str().to_string(),
+        _ => return Err(VmError::RuntimeError(
+            "bad argument #2 to 'searchpath' (string expected)".to_string(),
+        )),
+    };
+    let sep = match nargs >= 3 {
+        true => match &get_arg(state, a, 2) {
+            TValue::Str(s) => s.as_str().to_string(),
+            _ => ".".to_string(),
+        },
+        false => ".".to_string(),
+    };
+    let dirsep = match nargs >= 4 {
+        true => match &get_arg(state, a, 3) {
+            TValue::Str(s) => s.as_str().to_string(),
+            _ => "/".to_string(),
+        },
+        false => "/".to_string(),
+    };
+
+    // name 中 sep 替换为 dirsep
+    let name_replaced = if !sep.is_empty() && name.contains(&sep) {
+        name.replace(&sep, &dirsep)
+    } else {
+        name.clone()
+    };
+    let mut err_paths: Vec<String> = Vec::new();
+    for template in path.split(';') {
+        let filepath = template.replace('?', &name_replaced);
+        if std::path::Path::new(&filepath).is_file() {
+            push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&filepath))]);
+            return Ok(());
+        }
+        err_paths.push(filepath);
+    }
+    let errmsg = format!("no file '{}'", err_paths.join("'\n\tno file '"));
+    push_results(state, a, nresults, vec![
+        TValue::Nil(NilKind::Strict),
+        TValue::Str(state.intern_str(&errmsg)),
+    ]);
+    Ok(())
+}
+
+/// 读取 package.path 并搜索模块文件 (旧版兼容,保留供 loadfile 等使用)
 ///
 /// package.path 是用 `;` 分隔的模板列表,`?` 替换为 modname。
 /// 返回第一个存在的文件路径。
 fn search_module_file(state: &LuaState, modname: &str) -> Option<String> {
-    let package_key = TValue::Str(state.intern_str("package"));
-    let path_key = TValue::Str(state.intern_str("path"));
-    let path = match state.globals.get(&package_key) {
-        Some(TValue::Table(t)) => match t.get(&path_key) {
-            Some(TValue::Str(s)) => s.as_str().to_string(),
-            _ => "./?.lua;./?/init.lua".to_string(),
-        },
-        _ => "./?.lua;./?/init.lua".to_string(),
-    };
-    for template in path.split(';') {
-        if template.is_empty() {
-            continue;
-        }
-        let filepath = template.replace('?', modname);
-        if std::path::Path::new(&filepath).is_file() {
-            return Some(filepath);
-        }
-    }
-    None
+    search_path(state, modname, "path", "/", ".").ok().flatten()
 }
 
 /// 加载并执行模块文件,缓存结果到 package.loaded (对应 C 的 requiref 语义)
@@ -1722,10 +2221,9 @@ fn load_and_run_module(
 
 /// 缓存模块到 package.loaded[modname]
 fn cache_module_loaded(state: &mut LuaState, modname: &str, val: TValue) {
-    let package_key = TValue::Str(state.intern_str("package"));
     let loaded_key = TValue::Str(state.intern_str("loaded"));
     let mod_key = TValue::Str(state.intern_str(modname));
-    if let Some(TValue::Table(package_table)) = state.globals.get(&package_key) {
+    if let Some(package_table) = get_package_table(state) {
         if let Some(TValue::Table(loaded_table)) = package_table.get(&loaded_key) {
             // Table 共享数据 (Rc<RefCell>),直接 set 即可同步到 package.loaded
             loaded_table.set(mod_key, val);
@@ -1771,8 +2269,8 @@ fn setpath(state: &LuaState, envname: &str, dft: &str) -> String {
     }
 }
 
-/// 初始化 package 表:设置 path/cpath (从环境变量或默认) 和 loaded
-/// 对应 C loadlib.cpp 的 luaopen_package (简化版,不实现 searchers)
+/// 初始化 package 表:设置 path/cpath/loaded/preload/loadlib/searchpath/searchers/config
+/// 对应 C loadlib.cpp 的 luaopen_package
 fn init_package_table(state: &mut LuaState) {
     let package_key = TValue::Str(state.intern_str("package"));
     let pkg = crate::table::Table::new();
@@ -1780,6 +2278,12 @@ fn init_package_table(state: &mut LuaState) {
     pkg.set(
         TValue::Str(state.intern_str("loaded")),
         TValue::Table(loaded),
+    );
+    // preload 表 — 对应 registry[LUA_PRELOAD_TABLE]
+    let preload = crate::table::Table::new();
+    pkg.set(
+        TValue::Str(state.intern_str("preload")),
+        TValue::Table(preload),
     );
     let path = setpath(state, "LUA_PATH", "./?.lua;./?/init.lua");
     pkg.set(
@@ -1791,7 +2295,63 @@ fn init_package_table(state: &mut LuaState) {
         TValue::Str(state.intern_str("cpath")),
         TValue::Str(state.intern_str(&cpath)),
     );
-    state.globals.set(package_key, TValue::Table(pkg));
+    // config 字段 — 对应 C 的 package.config: DIRSEP \n PATH_SEP \n PATH_MARK \n EXEC_DIR \n IGMARK \n
+    let config = "/\n;\n?\n!\n-\n";
+    pkg.set(
+        TValue::Str(state.intern_str("config")),
+        TValue::Str(state.intern_str(config)),
+    );
+    // loadlib 函数
+    pkg.set(
+        TValue::Str(state.intern_str("loadlib")),
+        TValue::LightUserData(BASE_LOADLIB as *mut std::ffi::c_void),
+    );
+    // searchpath 函数
+    pkg.set(
+        TValue::Str(state.intern_str("searchpath")),
+        TValue::LightUserData(BASE_SEARCHPATH as *mut std::ffi::c_void),
+    );
+    // searchers 表 — 对应 C createsearcherstable (loadlib.cpp:703)
+    // 包含 4 个 searcher 函数标签 (preload/Lua/C/Croot)
+    let searchers = crate::table::Table::new();
+    searchers.set(
+        TValue::Integer(1),
+        TValue::LightUserData(BASE_SEARCHER_PRELOAD as *mut std::ffi::c_void),
+    );
+    searchers.set(
+        TValue::Integer(2),
+        TValue::LightUserData(BASE_SEARCHER_LUA as *mut std::ffi::c_void),
+    );
+    searchers.set(
+        TValue::Integer(3),
+        TValue::LightUserData(BASE_SEARCHER_C as *mut std::ffi::c_void),
+    );
+    searchers.set(
+        TValue::Integer(4),
+        TValue::LightUserData(BASE_SEARCHER_CROOT as *mut std::ffi::c_void),
+    );
+    pkg.set(
+        TValue::Str(state.intern_str("searchers")),
+        TValue::Table(searchers),
+    );
+    state.globals.set(package_key.clone(), TValue::Table(pkg.clone()));
+    // 同时在 registry 中保存 package 表引用 — 对应 C 版 ll_require 通过
+    // upvalue 访问 package 表。这样 Lua 代码 `package = {}` 重置全局变量后，
+    // require 仍能访问注册时的 package 表（含 loaded/preload/searchers）。
+    let registry_pkg_key = TValue::Str(state.intern_str("_PACKAGE"));
+    state.registry.set(registry_pkg_key, TValue::Table(pkg));
+}
+
+/// 从 registry 读取注册时的 package 表 — 对应 C 版 require 函数的 upvalue(1)
+///
+/// Lua 代码可能重置全局 `package = {}`，但 require 内部必须使用注册时的
+/// package 表（含 loaded/preload/searchers/path/cpath），否则会破坏模块加载。
+fn get_package_table(state: &LuaState) -> Option<crate::table::Table> {
+    let registry_pkg_key = TValue::Str(state.intern_str("_PACKAGE"));
+    match state.registry.get(&registry_pkg_key) {
+        Some(TValue::Table(t)) => Some(t),
+        _ => None,
+    }
 }
 
 /// load(chunk [, chunkname [, mode [, env]]]) — 对应 C 的 luaB_load + lua_load
@@ -2012,6 +2572,17 @@ fn call_load(
         return Ok(());
     }
 
+    // 编译前触发 GC：回收之前测试残留的可达垃圾，避免内存累积。
+    // all.lua 的 dofile 不在每个测试后调用 collectgarbage，临时对象（如
+    // constructs.lua 的 83MB）仍占用 gc_estimate，但 collect_threshold 可能
+    // 高于 gc_estimate，maybe_collect_gc 不会触发。
+    // 对大源代码（>= 64KB，如 big.lua 的 load(prog)）强制完整 GC；
+    // 小源代码用 maybe_collect_gc 避免频繁 GC 导致性能下降。
+    if source.len() >= 65536 {
+        state.collect_gc();
+    } else {
+        state.maybe_collect_gc();
+    }
     let proto_result = if is_binary {
         // 二进制格式: 使用 undump
         crate::compiler::bytecode_dump::undump_to_proto(source.as_bytes())
@@ -2515,9 +3086,12 @@ fn call_collectgarbage(
 
     let result = match opt.as_str() {
         "collect" => {
-            // GC 正在进行中（finalizer 内重入）— 不重入，返回 falsy
-            if state.gc.is_gc_running() {
-                TValue::Boolean(false)
+            // GC 正在进行中（finalizer 内重入）或状态关闭中（close_state 内）—
+            // 不重入，对应 C 的 lua_gc 返回 -1，collectgarbage 不 push 返回值（返回 nil）
+            if state.gc.is_gc_running() || state.gc_closing {
+                state.stack.truncate(a);
+                push_results(state, a, nresults, vec![]);
+                return Ok(());
             } else {
                 // 清理 wrap_coros 中不再被外部引用的协程
                 // （ThreadContext 的 Rc 计数 == 1 表示只有 wrap_coros 持有）

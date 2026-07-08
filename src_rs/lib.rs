@@ -3,7 +3,8 @@
 //! 通过 CMake 将 Rust 源码编译为静态库，再用 C++ 调用。
 //! 逐步替代 Lua 的 C 实现。
 
-// 原始 FFI 声明（extern "C"）
+// 原始 FFI 声明（extern "C"）— 仅 ffi feature 时编译（引用 C 符号）
+#[cfg(feature = "ffi")]
 pub mod bindings;
 
 // 核心配置（luaconf.h）— 类型定义、常量、路径、数值运算
@@ -15,7 +16,8 @@ pub mod opcodes;
 // 安全包装层 —— 操作码名称（lopnames.h）
 pub mod opnames;
 
-// 安全包装层 —— 解析器（lparser.h / lparser.cpp）
+// 安全包装层 —— 解析器（lparser.h / lparser.cpp）— 仅 ffi feature 时编译
+#[cfg(feature = "ffi")]
 pub mod parser;
 
 // Lua 对象和值的表示

@@ -151,7 +151,7 @@ pub enum TValue {
     /// 轻量 C 函数
     LCFn(LCFunction),
     /// 用户数据
-    UserData(Udata),
+    UserData(Box<Udata>),
     /// 线程/协程
     Thread(LuaThread),
 }
@@ -839,7 +839,6 @@ pub struct CallFrame {
     pub nextraargs: i32,
     pub closure_upvals: Vec<UpValRef>,
     pub tbc_list: Option<usize>,
-    pub open_upval: Option<usize>,
 }
 
 /// 协程挂起时保存的 VM 执行上下文
@@ -865,6 +864,7 @@ pub struct ThreadContext {
     pub saved_proto_flag: u8,
     pub saved_nextraargs: i32,
     pub saved_closure_upvals: Vec<UpValRef>,
+    pub saved_open_upvals: Vec<UpValRef>,
     pub saved_open_upval: Option<usize>,
     pub saved_tbc_list: Option<usize>,
     pub saved_call_stack: Vec<CallFrame>,

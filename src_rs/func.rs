@@ -85,7 +85,7 @@ pub fn find_upval(state: &mut LuaState, level: usize) -> usize {
     let mut current = state.open_upval;
     while let Some(uv_idx) = current {
         let uv_level = {
-            let uv_ref = state.closure_upvals[uv_idx].borrow();
+            let uv_ref = state.open_upvals[uv_idx].borrow();
             match &*uv_ref {
                 UpVal::Open { stack_index, .. } => Some(*stack_index),
                 UpVal::Closed { .. } => None,
@@ -94,7 +94,7 @@ pub fn find_upval(state: &mut LuaState, level: usize) -> usize {
         if uv_level.is_none() {
             // Closed upvalue: skip (shouldn't be in open list, but be safe)
             current = {
-                let uv_ref = state.closure_upvals[uv_idx].borrow();
+                let uv_ref = state.open_upvals[uv_idx].borrow();
                 match &*uv_ref {
                     UpVal::Open { next, .. } => *next,
                     _ => None,
@@ -111,7 +111,7 @@ pub fn find_upval(state: &mut LuaState, level: usize) -> usize {
         }
         prev = Some(uv_idx);
         current = {
-            let uv_ref = state.closure_upvals[uv_idx].borrow();
+            let uv_ref = state.open_upvals[uv_idx].borrow();
             match &*uv_ref {
                 UpVal::Open { next, .. } => *next,
                 _ => None,
@@ -122,18 +122,18 @@ pub fn find_upval(state: &mut LuaState, level: usize) -> usize {
 }
 
 fn new_upval(state: &mut LuaState, level: usize, prev: Option<usize>) -> usize {
-    let uv_idx = state.closure_upvals.len();
+    let uv_idx = state.open_upvals.len();
     let mut next: Option<usize> = None;
     match prev {
         Some(p_idx) => {
             {
-                let p_ref = state.closure_upvals[p_idx].borrow();
+                let p_ref = state.open_upvals[p_idx].borrow();
                 if let UpVal::Open { next: p_next, .. } = &*p_ref {
                     next = *p_next;
                 }
             }
             {
-                let mut p_ref = state.closure_upvals[p_idx].borrow_mut();
+                let mut p_ref = state.open_upvals[p_idx].borrow_mut();
                 if let UpVal::Open { ref mut next, .. } = &mut *p_ref {
                     *next = Some(uv_idx);
                 }
@@ -145,12 +145,12 @@ fn new_upval(state: &mut LuaState, level: usize, prev: Option<usize>) -> usize {
         }
     }
     if let Some(n_idx) = next {
-        let mut n_ref = state.closure_upvals[n_idx].borrow_mut();
+        let mut n_ref = state.open_upvals[n_idx].borrow_mut();
         if let UpVal::Open { ref mut previous, .. } = &mut *n_ref {
             *previous = Some(uv_idx);
         }
     }
-    state.closure_upvals.push(Rc::new(RefCell::new(UpVal::Open {
+    state.open_upvals.push(Rc::new(RefCell::new(UpVal::Open {
         stack_index: level,
         next,
         previous: prev,
@@ -162,7 +162,7 @@ fn new_upval(state: &mut LuaState, level: usize, prev: Option<usize>) -> usize {
 pub fn close_upval(state: &mut LuaState, uv_idx: usize) {
     state.gc.cond_gc();
     let val = {
-        let uv_ref = state.closure_upvals[uv_idx].borrow();
+        let uv_ref = state.open_upvals[uv_idx].borrow();
         match &*uv_ref {
             UpVal::Open { stack_index, .. } => {
                 state.stack.get(*stack_index).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
@@ -175,14 +175,14 @@ pub fn close_upval(state: &mut LuaState, uv_idx: usize) {
         state.gc.mark_object(gc_id);
     }
     unlink_upval(state, uv_idx);
-    *state.closure_upvals[uv_idx].borrow_mut() = UpVal::Closed {
+    *state.open_upvals[uv_idx].borrow_mut() = UpVal::Closed {
         value: Box::new(val),
     };
 }
 
-fn unlink_upval(state: &mut LuaState, uv_idx: usize) {
+pub fn unlink_upval(state: &mut LuaState, uv_idx: usize) {
     let (prev, nxt) = {
-        let uv_ref = state.closure_upvals[uv_idx].borrow();
+        let uv_ref = state.open_upvals[uv_idx].borrow();
         match &*uv_ref {
             UpVal::Open { previous, next, .. } => (*previous, *next),
             _ => return,
@@ -190,7 +190,7 @@ fn unlink_upval(state: &mut LuaState, uv_idx: usize) {
     };
     match prev {
         Some(p_idx) => {
-            let mut p_ref = state.closure_upvals[p_idx].borrow_mut();
+            let mut p_ref = state.open_upvals[p_idx].borrow_mut();
             if let UpVal::Open { ref mut next, .. } = &mut *p_ref {
                 *next = nxt;
             }
@@ -200,7 +200,7 @@ fn unlink_upval(state: &mut LuaState, uv_idx: usize) {
         }
     }
     if let Some(n_idx) = nxt {
-        let mut n_ref = state.closure_upvals[n_idx].borrow_mut();
+        let mut n_ref = state.open_upvals[n_idx].borrow_mut();
         if let UpVal::Open { ref mut previous, .. } = &mut *n_ref {
             *previous = prev;
         }
@@ -220,11 +220,11 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
     let mut to_close: Vec<usize> = Vec::new();
     let mut current = state.open_upval;
     while let Some(uv_idx) = current {
-        if uv_idx >= state.closure_upvals.len() {
+        if uv_idx >= state.open_upvals.len() {
             break;
         }
         let (should_close, next, stack_idx) = {
-            let uv_ref = state.closure_upvals[uv_idx].borrow();
+            let uv_ref = state.open_upvals[uv_idx].borrow();
             match &*uv_ref {
                 UpVal::Open { stack_index, next, .. } => (*stack_index >= level, *next, *stack_index),
                 UpVal::Closed { .. } => (false, None, 0),
@@ -256,11 +256,11 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
 
     for uv_idx in to_close {
         let is_tbc = {
-            let uv_ref = state.closure_upvals[uv_idx].borrow();
+            let uv_ref = state.open_upvals[uv_idx].borrow();
             matches!(&*uv_ref, UpVal::Open { tbc: true, .. })
         };
         let (stack_idx, tbc_flag) = {
-            let uv_ref = state.closure_upvals[uv_idx].borrow();
+            let uv_ref = state.open_upvals[uv_idx].borrow();
             if let UpVal::Open { stack_index, tbc, .. } = &*uv_ref {
                 (*stack_index, *tbc)
             } else {
@@ -270,7 +270,7 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
         if is_tbc {
             // TBC upvalue: 读取栈上的值（在 close_upval 之前，因为 close_upval 会改为 Closed）
             let val = {
-                let uv_ref = state.closure_upvals[uv_idx].borrow();
+                let uv_ref = state.open_upvals[uv_idx].borrow();
                 if let UpVal::Open { stack_index, .. } = &*uv_ref {
                     state.stack.get(*stack_index).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
                 } else {
@@ -362,7 +362,7 @@ pub fn new_tbc_upval(state: &mut LuaState, level: usize) -> Result<Option<usize>
     // TBC upvalue 复用 open_upval 链表（通过 find_upval 加入），用 tbc 字段标记
     let uv_idx = find_upval(state, level);
     {
-        let mut uv_ref = state.closure_upvals[uv_idx].borrow_mut();
+        let mut uv_ref = state.open_upvals[uv_idx].borrow_mut();
         if let UpVal::Open { ref mut tbc, .. } = &mut *uv_ref {
             *tbc = true;
         }
@@ -410,7 +410,7 @@ pub fn pop_tbc_list(state: &mut LuaState, level: usize) {
         None => return,
     };
     let should_pop = {
-        let head_ref = state.closure_upvals[head].borrow();
+        let head_ref = state.open_upvals[head].borrow();
         if let UpVal::Open { stack_index, .. } = &*head_ref {
             *stack_index >= level
         } else {
@@ -422,7 +422,7 @@ pub fn pop_tbc_list(state: &mut LuaState, level: usize) {
     }
     // 清除 tbc 标志
     {
-        let mut head_ref = state.closure_upvals[head].borrow_mut();
+        let mut head_ref = state.open_upvals[head].borrow_mut();
         if let UpVal::Open { ref mut tbc, .. } = &mut *head_ref {
             *tbc = false;
         }
@@ -446,6 +446,7 @@ mod tests {
             top: 0,
             base: 0,
             closure_upvals: Vec::new(),
+            open_upvals: Vec::new(),
             open_upval: None,
             tbc_list: None,
             twups_linked: false,
@@ -513,6 +514,11 @@ mod tests {
             close_error_status: None,
             force_noyield_close: false,
             error_no_prefix: false,
+            pending_error: None,
+            warn_on: false,
+            warn_pending: false,
+            gc_closing: false,
+            exit_requested: None,
         }
     }
 
@@ -591,9 +597,9 @@ mod tests {
         let mut state = make_vm_state();
         state.stack = vec![TValue::Integer(42)];
         let uv = find_upval(&mut state, 0);
-        assert!(state.closure_upvals[uv].borrow().is_open());
+        assert!(state.open_upvals[uv].borrow().is_open());
         close_upval(&mut state, uv);
-        let uv_ref = state.closure_upvals[uv].borrow();
+        let uv_ref = state.open_upvals[uv].borrow();
         match &*uv_ref {
             UpVal::Closed { value } => assert_eq!(**value, TValue::Integer(42)),
             _ => panic!("expected Closed"),

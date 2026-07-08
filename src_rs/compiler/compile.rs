@@ -488,10 +488,13 @@ pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
 
     // 合并 FuncState 的错误和 LexState 的错误 (如 lexer 遇到非法字符)
     // 对应 C 的 luaY_parser 中 check errors
+    // C 版在第一个语法错误时通过 luaD_throw 立即停止；Rust 版收集所有错误，
+    // 但只返回第一个，保持与 C 一致的行为（特别是 incomplete 检查依赖错误消息
+    // 以 "<eof>" 结尾，多行错误消息会破坏这个检查）。
     let mut all_errors = std::mem::take(&mut fs.errors);
     all_errors.extend(fs.ls_mut().errors.drain(..));
     if !all_errors.is_empty() {
-        return Err(all_errors.join("\n"));
+        return Err(all_errors.into_iter().next().unwrap());
     }
 
     let mut proto = fs.proto;
@@ -2553,10 +2556,11 @@ fn test_next(fs: &mut FuncState, t: &Token) -> bool {
 }
 
 /// ANTLR4: 终端匹配断言 — 期望当前 token 匹配，否则报错并跳过
+/// 对应 C 的 error_expected: 调用 luaX_syntaxerror 生成 "TOKEN expected near CURTOKEN"
 #[inline(always)]
 fn expect(fs: &mut FuncState, t: &Token) {
     if !check(fs, t) {
-        fs.error(&format!("{} expected", t.to_display_str()));
+        syntax_error_with_token(fs, &format!("{} expected", t.to_display_str()));
     } else {
         fs.ls_mut().next();
     }
@@ -2567,8 +2571,8 @@ fn expect(fs: &mut FuncState, t: &Token) {
 fn check_match(fs: &mut FuncState, t: &Token, who: &Token, where_line: i32) {
     if !check(fs, t) {
         if where_line == fs.ls().linenumber {
-            // 同一行：简单错误消息（对应 C 的 error_expected）
-            fs.error(&format!("{} expected", t.to_display_str()));
+            // 同一行：简单错误消息（对应 C 的 error_expected → luaX_syntaxerror）
+            syntax_error_with_token(fs, &format!("{} expected", t.to_display_str()));
         } else {
             // 跨行：复杂错误消息（对应 C 的 luaX_syntaxerror + luaO_pushfstring）
             // luaX_syntaxerror 会通过 lexerror 加上 " near TOKEN" 后缀
@@ -3467,7 +3471,7 @@ fn parse_statement(fs: &mut FuncState) {
                 fs.set_c(ei.exp.info2, 1);
             } else {
                 // 对应 C 的 check_condition(ls, v.v.k == VCALL, "syntax error")
-                fs.error("syntax error");
+                syntax_error_with_token(fs, "syntax error");
             }
             let _r = fs.exp_to_reg(&ei.exp);
             fs.free_reg();
@@ -3913,7 +3917,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
         // check_condition(ls, vkisvar(lh->v.k), "syntax error") — 对应 C 的 restassign
         // 赋值目标必须是变量 (local/upval/indexed/vargvar),不能是字面量或调用。
         if !is_valid_assign_target(&vars[0]) {
-            fs.error("syntax error");
+            syntax_error_with_token(fs, "syntax error");
         }
         // 对应 C 的 restassign 递归: 每个 ',' 后 enterlevel 控制递归深度。
         // C 中 restassign 是递归的, enterlevel 在递归前调用, leavelevel 在递归后调用,
@@ -3928,7 +3932,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
             fs.ls_mut().next();
             let new_var = parse_prefix_exp(fs);
             if !is_valid_assign_target(&new_var) {
-                fs.error("syntax error");
+                syntax_error_with_token(fs, "syntax error");
             }
             // check_conflict: if a non-indexed variable conflicts with previous
             // indexed variables (same table/key register), save the original
@@ -4260,7 +4264,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
     if !has_call {
         // 对应 C 的 check_condition(ls, v.v.k == VCALL, "syntax error")
         // 语句以 Name 开头但既不是赋值也不是函数调用 → 语法错误
-        fs.error("syntax error");
+        syntax_error_with_token(fs, "syntax error");
     }
 }
 
@@ -4986,6 +4990,9 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     Token::Dot => {
                         fs.ls_mut().next();
                         let field = get_name(fs);
+                        if fs.has_errors() {
+                            break;
+                        }
                         let k = fs.string_k(&field);
 
                         // Handle VVARGVAR: like C's luaK_indexed, create VVARGIND-like PrefixResult
@@ -10451,6 +10458,7 @@ fn parse_local(fs: &mut FuncState) {
                         if ei.exp.t != NO_JUMP || ei.exp.f != NO_JUMP {
                             fs.resolve_jumps(&ei.exp, target);
                         }
+                        fs.set_freereg(target + 1);
                         last_exp = Some(ExpDesc::new(ExpKind::NonReloc, target as i64));
                     }
                     ExpKind::Relocable => {
@@ -10459,6 +10467,7 @@ fn parse_local(fs: &mut FuncState) {
                             if ei.exp.t != NO_JUMP || ei.exp.f != NO_JUMP {
                                 fs.resolve_jumps(&ei.exp, target);
                             }
+                            fs.set_freereg(target + 1);
                             last_exp = Some(ExpDesc::new(ExpKind::NonReloc, target as i64));
                         } else {
                             let r = ei.exp.info as i32;
@@ -10468,6 +10477,7 @@ fn parse_local(fs: &mut FuncState) {
                             if ei.exp.t != NO_JUMP || ei.exp.f != NO_JUMP {
                                 fs.resolve_jumps(&ei.exp, target);
                             }
+                            fs.set_freereg(target + 1);
                             last_exp = Some(ExpDesc::new(ExpKind::Relocable, target as i64));
                         }
                     }
@@ -10941,7 +10951,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
                 param_names.push(name);
             } else {
                 // 对应 C 的 default: luaX_syntaxerror(ls, "<name> or '...' expected")
-                fs.error("<name> or '...' expected");
+                syntax_error_with_token(fs, "<name> or '...' expected");
                 break;
             }
             if !check(fs, &Token::Comma) { break; }

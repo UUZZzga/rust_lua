@@ -20,13 +20,19 @@ use crate::tm::{
     try_bin_tm, try_bin_assoc_tm, try_bini_tm, try_concat_tm,
     call_order_tm, equal_obj, obj_len, obj_type_name,
 };
-use crate::vm::{to_number_ns, to_number, to_integer_ns, F2IMode, shiftl, is_false,
+use crate::vm::{to_number_ns, to_number, to_integer_ns, F2IMode, shiftl, shiftr, is_false,
     concat_stack, raw_equal, float_to_integer,
     modulus, modulus_float, idiv};
 use crate::state::{LuaState, LUA_MINSTACK, MAX_CALL_CHAIN, LUAI_MAXCCALLS};
 use crate::gc::GCState;
 use std::rc::Rc;
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// 信号中断标志 — 对应 C 的 globalL + laction + lstop 机制。
+/// 信号处理器 (cli.rs::laction) 设置此标志，VM 循环在每条指令前检查，
+/// 若设置则抛出 "interrupted!" 错误（可被 pcall 捕获）。
+pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 use std::ffi::c_void;
 
 // ============================================================================
@@ -791,6 +797,11 @@ impl VmExecutor {
             .unwrap_or(0);
 
         loop {
+            // 检查信号中断 — 对应 C 的 lstop hook 抛出 "interrupted!" 错误
+            if INTERRUPTED.load(Ordering::SeqCst) {
+                INTERRUPTED.store(false, Ordering::SeqCst);
+                return Err(VmError::RuntimeError("interrupted!".to_string()));
+            }
             if state.pc >= state.code.len() {
                 if let Some(frame) = state.call_stack.pop() {
                     // 同时弹出调用栈信息
@@ -809,7 +820,6 @@ impl VmExecutor {
                     state.nextraargs = frame.nextraargs;
                     state.closure_upvals = frame.closure_upvals;
                     state.tbc_list = frame.tbc_list;
-                    state.open_upval = frame.open_upval;
                     // 对应 C 的 rethook: L->oldpc = pcRel(ci->u.l.savedpc, ci_func(ci)->p)
                     // 函数返回时，设置 oldpc 为调用者的 return_pc
                     state.hook_old_pc = state.pc as i32;
@@ -1069,7 +1079,6 @@ impl VmExecutor {
                             nextraargs: state.nextraargs,
                             closure_upvals: std::mem::take(&mut state.closure_upvals),
                             tbc_list: state.tbc_list.take(),
-                            open_upval: state.open_upval.take(),
                         });
 
                         // 推入调用栈信息 — 对应 C 的 funcnamefromcode 返回 "for iterator"
@@ -1100,7 +1109,6 @@ impl VmExecutor {
                         // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
                         state.closure_upvals = closure.upvals.borrow().clone();
                         state.tbc_list = None;
-                        state.open_upval = None;
 
                         if proto_is_vararg {
                             // vararg 函数: truncate 到实际参数末尾 (对应 op_call 的 vararg 分支)
@@ -1231,7 +1239,6 @@ impl VmExecutor {
                             nextraargs: state.nextraargs,
                             closure_upvals: std::mem::take(&mut state.closure_upvals),
                             tbc_list: state.tbc_list.take(),
-                            open_upval: state.open_upval.take(),
                         });
                         state.base = ra + 4;
                         Self::call_c_function(state, ra + 3, 2, nresults, cc.f)?;
@@ -1255,7 +1262,6 @@ impl VmExecutor {
                             nextraargs: state.nextraargs,
                             closure_upvals: std::mem::take(&mut state.closure_upvals),
                             tbc_list: state.tbc_list.take(),
-                            open_upval: state.open_upval.take(),
                         });
                         state.base = ra + 4;
                         Self::call_c_function(state, ra + 3, 2, nresults, lcf.func)?;
@@ -1316,7 +1322,6 @@ impl VmExecutor {
                             state.nextraargs = pp.saved_nextraargs;
                             state.closure_upvals = pp.saved_closure_upvals;
                             state.tbc_list = pp.saved_tbc_list;
-                            state.open_upval = pp.saved_open_upval;
                             // 截断栈，移除 __close 函数的帧
                             state.stack.truncate(pp.func_idx);
                             state.top = state.stack.len();
@@ -1390,8 +1395,7 @@ impl VmExecutor {
                             let saved_ctx = if let Some(frame) = state.call_stack.last().cloned() {
                                 let saved_cu = std::mem::replace(&mut state.closure_upvals, frame.closure_upvals.clone());
                                 let saved_tl = std::mem::replace(&mut state.tbc_list, frame.tbc_list);
-                                let saved_ou = std::mem::replace(&mut state.open_upval, frame.open_upval);
-                                Some((saved_cu, saved_tl, saved_ou))
+                                Some((saved_cu, saved_tl))
                             } else {
                                 None
                             };
@@ -1399,10 +1403,9 @@ impl VmExecutor {
                             match crate::func::close(state, pp_func_idx, 1, 1) {
                                 Ok(()) => {}
                                 Err(VmError::Yield(values)) => {
-                                    if let Some((cu, tl, ou)) = saved_ctx {
+                                    if let Some((cu, tl)) = saved_ctx {
                                         state.closure_upvals = cu;
                                         state.tbc_list = tl;
-                                        state.open_upval = ou;
                                     }
                                     return Ok(VmResult::Yield { values });
                                 }
@@ -1443,7 +1446,7 @@ impl VmExecutor {
                                 state.nextraargs = protection.saved_nextraargs;
                                 state.closure_upvals = protection.saved_closure_upvals;
                                 state.tbc_list = protection.saved_tbc_list;
-                                state.open_upval = protection.saved_open_upval;
+                                // open_upval is now global, not saved/restored per-function
 
                                 if is_error {
                                     // 处理 error：pcall/xpcall 捕获 error
@@ -1853,7 +1856,7 @@ impl VmExecutor {
         state.nextraargs = protection.saved_nextraargs;
         state.closure_upvals = protection.saved_closure_upvals;
         state.tbc_list = protection.saved_tbc_list;
-        state.open_upval = protection.saved_open_upval;
+        // open_upval is now global, not saved/restored per-function
 
         // 截断栈，移除元方法的帧
         state.stack.truncate(protection.func_idx);
@@ -2022,7 +2025,7 @@ impl VmExecutor {
         state.nextraargs = protection.saved_nextraargs;
         state.closure_upvals = protection.saved_closure_upvals;
         state.tbc_list = protection.saved_tbc_list;
-        state.open_upval = protection.saved_open_upval;
+        // open_upval is now global, not saved/restored per-function
 
         // 截断栈，移除 __close 函数的帧
         state.stack.truncate(protection.func_idx);
@@ -2114,7 +2117,7 @@ impl VmExecutor {
         state.nextraargs = protection.saved_nextraargs;
         state.closure_upvals = protection.saved_closure_upvals;
         state.tbc_list = protection.saved_tbc_list;
-        state.open_upval = protection.saved_open_upval;
+        // open_upval is now global, not saved/restored per-function
 
         // push true + 返回值，按 nresults 调整栈
         // (模拟 call_pcall/call_xpcall 的成功返回: results = [true] + tmp_results)
@@ -2657,7 +2660,9 @@ impl VmExecutor {
         let array_size = c as usize;
         state.maybe_collect_gc();
         let table = Table::with_capacity(array_size, hash_size as usize);
-        let table_id = state.gc.register_object(array_size + hash_size as usize);
+        // 使用 mem_size() 计算实际内存占用（含 Table 结构 + array + hash），
+        // 避免 GC 低估内存导致不及时回收（big.lua/verybig.lua 内存分配失败）
+        let table_id = state.gc.register_object(table.mem_size());
         table.gc_header.set_id(table_id);
         Self::write_stack(state, a, TValue::Table(table));
         state.pc += 1;
@@ -2876,7 +2881,7 @@ impl VmExecutor {
         let ic = opcodes::getarg_sc(inst) as i64;
         let v = Self::read_stack(state, b).clone();
         if let Some(ib) = to_integer_ns(&v, F2IMode::Eq) {
-            Self::write_stack(state, a, TValue::Integer(shiftl(ib, -ic)));
+            Self::write_stack(state, a, TValue::Integer(shiftr(ib, ic)));
             state.pc += 2;  // skip MMBINI
         } else {
             state.pc += 1;  // fall through to MMBINI
@@ -3077,7 +3082,7 @@ impl VmExecutor {
             to_integer_ns(&v1, F2IMode::Eq),
             to_integer_ns(&v2, F2IMode::Eq),
         ) {
-            Self::write_stack(state, a, TValue::Integer(shiftl(i1, -i2)));
+            Self::write_stack(state, a, TValue::Integer(shiftr(i1, i2)));
             state.pc += 2;  // skip MMBIN
         } else {
             state.pc += 1;  // fall through to MMBIN
@@ -3640,7 +3645,6 @@ impl VmExecutor {
                     nextraargs: state.nextraargs,
                     closure_upvals: std::mem::take(&mut state.closure_upvals),
                     tbc_list: state.tbc_list.take(),
-                    open_upval: state.open_upval.take(),
                 });
 
                 // 推入调用栈信息（用于 debug.getinfo 和 traceback）
@@ -3671,7 +3675,6 @@ impl VmExecutor {
                 // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
                 state.closure_upvals = closure.upvals.borrow().clone();
                 state.tbc_list = None;
-                state.open_upval = None;
                 // 对应 C 的 luaD_hookcall: L->oldpc = 0
                 // 新函数的 oldpc 设为 0，第一条指令会触发 hook（因为 0 不是有效 pc）
                 state.hook_old_pc = 0;
@@ -3934,15 +3937,16 @@ impl VmExecutor {
         // nresults: -1 = MULTRET, >=0 = 固定结果数
         let nresults: i32 = if c == 0 { -1 } else { c - 1 };
 
-        // precallC: 设置 api_func_base，确保栈空间
+        // precallC: 设置 api_func_base，确保栈 capacity（不改变 len，避免干扰 lua_gettop）
         let saved_api_base = state.api_func_base;
         state.api_func_base = a;
         state.n_ccalls = state.n_ccalls.saturating_add(1);
 
-        // 确保栈空间 (LUA_MINSTACK)
-        let needed_top = state.stack.len() + LUA_MINSTACK;
-        while state.stack.len() < needed_top {
-            state.stack.push(TValue::Nil(NilKind::Strict));
+        // 预留 capacity，但不 push nil（push 会改变 stack.len()，导致 C 函数中
+        // lua_gettop 返回值偏移）。C 函数需要空间时通过 lua_checkstack 或
+        // lua_pushxxx 自动扩展栈。
+        if state.stack.capacity() < state.stack.len() + LUA_MINSTACK {
+            state.stack.reserve(LUA_MINSTACK);
         }
 
         // 调用 C 函数: n = f(L)
@@ -4084,7 +4088,6 @@ impl VmExecutor {
                 // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
                 state.closure_upvals = closure.upvals.borrow().clone();
                 state.tbc_list = None;
-                state.open_upval = None;
 
                 // 对应 C 的 ci->callstatus |= CIST_TAIL
                 // 标记当前 CallInfoEntry 为尾调用，供 debug.getinfo(1).istailcall 读取
@@ -4279,7 +4282,6 @@ impl VmExecutor {
             state.nextraargs = frame.nextraargs;
             state.closure_upvals = frame.closure_upvals;
             state.tbc_list = frame.tbc_list;
-            state.open_upval = frame.open_upval;
             // 对应 C 的 rethook: L->oldpc = pcRel(ci->u.l.savedpc, ci_func(ci)->p)
             // C 的 pcRel 宏为 (cast_int((pc) - (p)->code) - 1)，有 -1 偏移
             // state.pc = frame.return_pc = CALL 指令的下一条 (pc+1)
@@ -4384,7 +4386,6 @@ impl VmExecutor {
             state.nextraargs = frame.nextraargs;
             state.closure_upvals = frame.closure_upvals;
             state.tbc_list = frame.tbc_list;
-            state.open_upval = frame.open_upval;
             // 对应 C 的 rethook: L->oldpc = pcRel(ci->u.l.savedpc, ci_func(ci)->p)
             state.hook_old_pc = state.pc as i32 - 1;
             // op_return0 返回 0 个值
@@ -4475,7 +4476,6 @@ impl VmExecutor {
             state.nextraargs = frame.nextraargs;
             state.closure_upvals = frame.closure_upvals;
             state.tbc_list = frame.tbc_list;
-            state.open_upval = frame.open_upval;
             // 对应 C 的 rethook: L->oldpc = pcRel(ci->u.l.savedpc, ci_func(ci)->p)
             state.hook_old_pc = state.pc as i32 - 1;
             // op_return1 返回 1 个值
@@ -4755,6 +4755,12 @@ impl VmExecutor {
                 let pos = last - n_actual + i;
                 t.set_int((pos + 1) as i64, val);
             }
+            // 表可能已增长（array.push / hash.insert），更新 GC 估算大小
+            if let Some(id) = t.gc_header.id() {
+                state.gc.set_obj_size(id, t.mem_size());
+            }
+            // 表增长后检查是否需要 GC
+            state.maybe_collect_gc();
             Self::write_stack(state, ra, TValue::Table(t));
         }
         state.pc += 1;
@@ -4786,7 +4792,7 @@ impl VmExecutor {
                         // 对应 C: upv[i] = luaF_findupval(L, base + p->upvalues[i].idx);
                         let stack_idx = state.base + desc.idx as usize;
                         let uv_idx = crate::func::find_upval(state, stack_idx);
-                        upvals.push(state.closure_upvals[uv_idx].clone());
+                        upvals.push(state.open_upvals[uv_idx].clone());
                     } else {
                         // 上值来自外层闭包: 共享同一个 Rc<RefCell<UpVal>>
                         // 对应 C: upv[i] = cl->upvals[p->upvalues[i].idx];
@@ -5292,7 +5298,11 @@ impl VmExecutor {
                     if let Some(tid) = tid {
                         state.gc.obj_barrier_back(tid, tid);
                         state.gc.barrier_back(tid);
+                        // 新键插入可能增长表，更新 GC 估算大小
+                        state.gc.set_obj_size(tid, t.mem_size());
                     }
+                    // 表可能已增长，检查是否需要 GC（对应 C 的 luaC_condGC）
+                    state.maybe_collect_gc();
                     return Ok(());
                 }
                 _ => {

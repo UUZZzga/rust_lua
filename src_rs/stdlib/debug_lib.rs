@@ -1163,64 +1163,95 @@ fn fill_info_from_level(
     };
 
     // 从栈上获取调用者的闭包（entry.base 是调用者的 base）
-    if entry.base > 0 && entry.base <= state.stack.len() {
-        if let TValue::LClosure(closure) = &state.stack[entry.base - 1] {
-            let proto = &closure.proto;
-            info.func = Some(TValue::LClosure(closure.clone()));
-            info.closure = Some(closure.clone());
-
-            if what.contains('S') {
-                info.source = proto
-                    .source
-                    .as_ref()
-                    .map(|s| s.as_str().to_string())
-                    .unwrap_or_else(|| "=?".to_string());
-                info.short_src = proto
-                    .source
-                    .as_ref()
-                    .map(short_src)
-                    .unwrap_or_else(|| "?".to_string());
-                info.linedefined = proto.line_defined;
-                info.lastlinedefined = proto.last_line_defined;
-                info.what = if proto.line_defined == 0 { "main" } else { "Lua" }.to_string();
-            }
-            if what.contains('l') {
-                info.currentline = get_proto_line(proto, entry.saved_pc);
-            }
-            if what.contains('u') {
-                info.nups = closure.upvals.borrow().len();
-                info.nparams = proto.num_params as usize;
-                info.isvararg = proto.is_vararg();
-            }
-            if what.contains('n') {
-                info.name = caller_name;
-                info.namewhat = caller_namewhat;
-            }
-            if what.contains('t') {
-                // level N 的 istailcall = level N 是否是尾调用
-                // entry (call_info[ci_idx]) 记录 "level N-1 被调用时" 的信息:
-                //   is_tailcall = level N-1 是否是尾调用
-                // level N 的 istailcall 记录在 "level N 被调用时" 的 entry 中 = call_info[ci_idx - 1]
-                // (tail call 重用 entry, 修改 closure 和 is_tailcall, 所以 call_info[ci_idx-1]
-                //  在 tail call 后记录的是重用后的函数的 istailcall)
-                info.istailcall = if ci_idx > 0 {
-                    state.call_info[ci_idx - 1].is_tailcall
-                } else {
-                    false
-                };
-                info.extraargs = 0;
-            }
-            if what.contains('r') {
-                if !state.allowhook {
-                    info.ftransfer = state.transferinfo_ftransfer;
-                    info.ntransfer = state.transferinfo_ntransfer;
-                } else {
-                    info.ftransfer = 0;
-                    info.ntransfer = 0;
-                }
-            }
-            return true;
+    // 后备: 如果栈上不是 LClosure（如 C 调用者场景，pcall 后栈已截断），
+    // 从 entry.closure 获取被调用者的闭包信息。这对应 C 版中 CallInfo 链表
+    // 总是保留被调用者的闭包信息，debug.getinfo 能从中获取 source/currentline。
+    //
+    // 特殊情况: hook 场景中，hook 函数的 entry.base 指向被 hook 的 C 函数
+    // （如 assert），此时栈上是 C 函数（LightUserData），应该走 C 函数路径
+    // 返回该 C 函数的信息，而不是 fallback 到 entry.closure（hook 函数自身）。
+    let stack_val = if entry.base > 0 && entry.base <= state.stack.len() {
+        Some(state.stack[entry.base - 1].clone())
+    } else {
+        None
+    };
+    let stack_closure = stack_val.as_ref().and_then(|v| {
+        if let TValue::LClosure(c) = v {
+            Some(c.clone())
+        } else {
+            None
         }
+    });
+    let is_stack_c_func = stack_val
+        .as_ref()
+        .map(|v| {
+            matches!(
+                v,
+                TValue::LightUserData(_) | TValue::CClosure(_) | TValue::LCFn(_)
+            )
+        })
+        .unwrap_or(false);
+    let closure_opt = if is_stack_c_func {
+        None
+    } else {
+        stack_closure.or_else(|| entry.closure.clone())
+    };
+    if let Some(closure) = closure_opt {
+        let proto = &closure.proto;
+        info.func = Some(TValue::LClosure(closure.clone()));
+        info.closure = Some(closure.clone());
+
+        if what.contains('S') {
+            info.source = proto
+                .source
+                .as_ref()
+                .map(|s| s.as_str().to_string())
+                .unwrap_or_else(|| "=?".to_string());
+            info.short_src = proto
+                .source
+                .as_ref()
+                .map(short_src)
+                .unwrap_or_else(|| "?".to_string());
+            info.linedefined = proto.line_defined;
+            info.lastlinedefined = proto.last_line_defined;
+            info.what = if proto.line_defined == 0 { "main" } else { "Lua" }.to_string();
+        }
+        if what.contains('l') {
+            info.currentline = get_proto_line(proto, entry.saved_pc);
+        }
+        if what.contains('u') {
+            info.nups = closure.upvals.borrow().len();
+            info.nparams = proto.num_params as usize;
+            info.isvararg = proto.is_vararg();
+        }
+        if what.contains('n') {
+            info.name = caller_name;
+            info.namewhat = caller_namewhat;
+        }
+        if what.contains('t') {
+            // level N 的 istailcall = level N 是否是尾调用
+            // entry (call_info[ci_idx]) 记录 "level N-1 被调用时" 的信息:
+            //   is_tailcall = level N-1 是否是尾调用
+            // level N 的 istailcall 记录在 "level N 被调用时" 的 entry 中 = call_info[ci_idx - 1]
+            // (tail call 重用 entry, 修改 closure 和 is_tailcall, 所以 call_info[ci_idx-1]
+            //  在 tail call 后记录的是重用后的函数的 istailcall)
+            info.istailcall = if ci_idx > 0 {
+                state.call_info[ci_idx - 1].is_tailcall
+            } else {
+                false
+            };
+            info.extraargs = 0;
+        }
+        if what.contains('r') {
+            if !state.allowhook {
+                info.ftransfer = state.transferinfo_ftransfer;
+                info.ntransfer = state.transferinfo_ntransfer;
+            } else {
+                info.ftransfer = 0;
+                info.ntransfer = 0;
+            }
+        }
+        return true;
     }
 
     // C 函数帧 — 对应 C 的 CIST_C
@@ -3167,14 +3198,44 @@ fn push_traceback_line(
 
 /// debug.debug() — 对应 C 的 db_debug
 ///
-/// 交互式调试器 (简化实现)
+/// 交互式调试器: 循环读取 stdin, 输出 prompt 到 stderr, 执行用户输入的 Lua 代码。
+/// 读到 "cont" 或 EOF 时退出。
 fn call_debug(
     state: &mut LuaState,
     a: usize,
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
-    // 简化实现: 不进入交互模式, 直接返回
+    use std::io::{self, BufRead, Write};
+    let _ = nargs;
+    loop {
+        let _ = io::stderr().write_all(b"lua_debug> ");
+        let _ = io::stderr().flush();
+        let mut buffer = String::new();
+        match io::stdin().lock().read_line(&mut buffer) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        if buffer == "cont\n" || buffer == "cont\r\n" {
+            break;
+        }
+        state.settop(a);
+        let status = state.load_buffer(&buffer, "=(debug command)");
+        if status == 0 {
+            let pcall_status = state.pcall(0, 0, 0);
+            if pcall_status != 0 {
+                let msg = state.to_string(-1).unwrap_or_default();
+                let _ = io::stderr().write_all(msg.as_bytes());
+                let _ = io::stderr().write_all(b"\n");
+            }
+        } else {
+            let msg = state.to_string(-1).unwrap_or_default();
+            let _ = io::stderr().write_all(msg.as_bytes());
+            let _ = io::stderr().write_all(b"\n");
+        }
+        state.settop(a);
+    }
     push_results(state, a, nresults, vec![]);
     Ok(())
 }

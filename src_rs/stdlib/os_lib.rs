@@ -443,7 +443,7 @@ fn call_os_execute(
 /// 对应 C 的 os_exit:
 /// - code 是 boolean: true → 0 (SUCCESS), false → 1 (FAILURE)
 /// - code 是 number: 用作退出码 (默认 0)
-/// - close 为 true: 调用 lua_close (Rust 中省略, 直接 exit)
+/// - close 为 true: 调用 close_state 触发 finalizer，然后 exit
 fn call_os_exit(
     state: &mut LuaState,
     a: usize,
@@ -466,8 +466,25 @@ fn call_os_exit(
     } else {
         0
     };
-    // close 参数 (第 2 个) — 若为 true 应调用 lua_close; Rust 实现直接 exit, 省略清理
-    std::process::exit(status);
+    let close = nargs >= 2 && {
+        let v = get_arg(state, a, 1);
+        matches!(&v, TValue::Boolean(true))
+    };
+    if close {
+        if state.gc_closing {
+            // 已在 close_state 中（finalizer 调用 os.exit）：设置退出请求，
+            // close_state 处理完剩余 finalizer 后据此退出
+            state.exit_requested = Some(status);
+            // 用 VmError 中断当前 finalizer 的 pcall，让 close_state 继续处理后续对象
+            return Err(VmError::RuntimeError("__exit_requested__".to_string()));
+        } else {
+            // 普通脚本中调用 os.exit(code, true)：触发 close_state，内部会 exit
+            state.close_state();
+            std::process::exit(status);
+        }
+    } else {
+        std::process::exit(status);
+    }
 }
 
 // ============================================================================

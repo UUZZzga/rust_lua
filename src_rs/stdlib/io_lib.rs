@@ -207,19 +207,19 @@ fn new_file_userdata(state: &mut LuaState, file: *mut libc::FILE, file_mt: &Tabl
     if file_mt.get(&gc_key).is_some() {
         state.register_ud_finobj(&udata);
     }
-    TValue::UserData(udata)
+    TValue::UserData(Box::new(udata))
 }
 
 /// 创建已关闭的 FILE* userdata — 用于 io.type 检查已关闭文件
 fn new_closed_userdata(file_mt: &Table) -> TValue {
-    TValue::UserData(crate::objects::Udata {
+    TValue::UserData(Box::new(crate::objects::Udata {
         gc_header: crate::gc::GCObjectHeader::new(),
         nuvalue: 0,
         len: 0,
         metatable: Some(Box::new(file_mt.clone())),
         user_values: vec![],
         data: vec![],
-    })
+    }))
 }
 
 /// 检查文件模式是否合法 — 对应 C 的 l_checkmode
@@ -2237,7 +2237,7 @@ pub fn open_io_lib(state: &mut LuaState) {
         };
         let ptr_id = udata.gc_header.ptr_id;
         state.file_handles.insert(ptr_id, file);
-        TValue::UserData(udata)
+        TValue::UserData(Box::new(udata))
     };
 
     let stdin_val = make_stream(state, c_stdin());

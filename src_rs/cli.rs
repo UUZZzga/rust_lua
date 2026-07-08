@@ -6,7 +6,7 @@ use crate::objects::{LuaType, TValue};
 use crate::state::{LuaState, ERR_RUN, ERR_SYNTAX, MIN_STACK, MULT_RET};
 
 use std::io::{self, BufRead, IsTerminal, Write};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::Ordering;
 
 const LUA_PROGNAME: &str = "lua";
 const LUA_INIT_VAR: &str = "LUA_INIT";
@@ -21,8 +21,6 @@ const HAS_I: i32 = 2;
 const HAS_V: i32 = 4;
 const HAS_E: i32 = 8;
 const HAS_EE: i32 = 16;
-
-static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 
 pub struct Interpreter {
     l: LuaState,
@@ -83,21 +81,111 @@ impl Interpreter {
     /// 1. 将错误对象转换为字符串
     /// 2. 追加堆栈回溯信息
     fn msghandler(&mut self) {
-        // 尝试将错误对象转换为字符串
+        // 对应 C 的 msghandler: lua_tostring 不调用 __tostring，需单独调用 luaL_callmeta
         let msg = match self.l.to_string(-1) {
             Some(s) => s,
             None => {
-                // 错误对象不是字符串，尝试 __tostring 元方法
-                if self.l.call_meta(-1, "__tostring") {
-                    if let Some(s) = self.l.to_string(-1) {
-                        self.l.pop(1);
-                        s
-                    } else {
-                        self.l.pop(1);
-                        format!("(error object is a {} value)", self.l.typename_at(-1))
+                // 错误对象不是字符串/数字，尝试 __tostring 元方法
+                let errobj = self.l.obj_at(-1).cloned();
+                let ts_result = match &errobj {
+                    Some(TValue::Table(t)) => {
+                        let tostring_key = TValue::Str(self.l.intern_str("__tostring"));
+                        let meta_fn = {
+                            let data = t.data.borrow();
+                            data.metatable.as_ref().and_then(|mt| mt.get(&tostring_key))
+                        };
+                        meta_fn.map(|f| {
+                            let base = self.l.stack.len();
+                            self.l.stack.push(f);
+                            self.l.stack.push(errobj.clone().unwrap());
+                            // 构造 call_info，让 __tostring 中的 debug.getinfo 能看到
+                            // 错误发生时的调用栈（对应 C 版中 msghandler 作为 pcall 的
+                            // msgh 在错误上下文中被调用）。
+                            //
+                            // C 版调用栈: main chunk → error(C) → msghandler(C) → __tostring
+                            // debug.getinfo(4) 返回 main chunk 的 currentline。
+                            //
+                            // Rust 版 call_info[i] 记录"调用者 → 被调用者":
+                            //   call_info[0] = "C 调用者 → main chunk"（从 last_error_call_info 获取）
+                            //   call_info[1] = "main chunk → error"（从 last_error_call_info 获取）
+                            //   call_info[2] = "error → msghandler"（手动推入）
+                            //   pcall 推入 "msghandler → __tostring"
+                            //
+                            // debug.getinfo(4) 查找 call_info[len-3] = call_info[1] = "main chunk → error"
+                            // 返回 call_info[1] 的调用者信息 = main chunk
+                            // currentline = get_proto_line(proto, call_info[1].saved_pc)
+                            //
+                            // 注意: call_info[1].saved_pc 是 error C 函数帧的 saved_pc，
+                            // 即 main chunk 中 error(m) 的 pc。但 call_info[1] 是 error C 函数帧，
+                            // 它的 closure 是 None（C 函数），需要从 call_info[0].closure 获取
+                            // main chunk 闭包（debug.getinfo 的 closure 后备机制）。
+                            let saved_ci = std::mem::take(&mut self.l.call_info);
+                            let mut constructed_ci: Vec<crate::state::CallInfoEntry> = Vec::new();
+                            if let Some(ref err_ci) = self.l.last_error_call_info {
+                                // 找到 main chunk 帧（closure 非空的条目）和 error C 函数帧
+                                let mut main_closure: Option<crate::objects::LClosure> = None;
+                                let mut error_pc: usize = 0;
+                                for entry in err_ci.iter() {
+                                    if let Some(c) = &entry.closure {
+                                        main_closure = Some(c.clone());
+                                    }
+                                    if entry.is_c && entry.saved_pc > 0 {
+                                        error_pc = entry.saved_pc;
+                                    }
+                                }
+                                // 构造 main chunk 帧: "C 调用者 → main chunk"
+                                // saved_pc = error_pc（error(m) 的 pc），让 debug.getinfo(4)
+                                // 返回 main chunk 的 currentline = error(m) 的行号
+                                if let Some(mc) = &main_closure {
+                                    constructed_ci.push(crate::state::CallInfoEntry {
+                                        source: mc.proto.source.as_ref()
+                                            .map(|s| s.as_str().to_string())
+                                            .unwrap_or_else(|| "=?".to_string()),
+                                        line: -1,
+                                        name: String::new(),
+                                        is_c: true,  // C 调用者
+                                        closure: Some(mc.clone()),
+                                        base: 0,
+                                        saved_pc: error_pc,  // error(m) 的 pc
+                                        namewhat: String::new(),
+                                        proto_flag: mc.proto.flag,
+                                        nextraargs: 0,
+                                        is_tailcall: false,
+                                    });
+                                }
+                                // 推入 msghandler C 函数帧
+                                constructed_ci.push(crate::state::CallInfoEntry {
+                                    source: "=[C]".to_string(),
+                                    line: -1,
+                                    name: "msghandler".to_string(),
+                                    is_c: true,
+                                    closure: None,
+                                    base: 0,
+                                    saved_pc: 0,
+                                    namewhat: String::new(),
+                                    proto_flag: 0,
+                                    nextraargs: 0,
+                                    is_tailcall: false,
+                                });
+                            }
+                            self.l.call_info = constructed_ci;
+                            let status = self.l.pcall(1, 1, 0);
+                            let result = if status == 0 {
+                                self.l.to_string(-1)
+                            } else {
+                                None
+                            };
+                            // 恢复 call_info
+                            self.l.call_info = saved_ci;
+                            self.l.settop(base);
+                            result
+                        })
                     }
-                } else {
-                    format!("(error object is a {} value)", self.l.typename_at(-1))
+                    _ => None,
+                };
+                match ts_result {
+                    Some(Some(s)) => s,
+                    _ => format!("(error object is a {} value)", self.l.typename_at(-1)),
                 }
             }
         };
@@ -270,6 +358,11 @@ impl Interpreter {
         match stdin.lock().read_line(&mut line) {
             Ok(0) => None,
             Ok(_) => {
+                // 非终端时回显输入行（模拟 readline 库在管道/重定向时的行为）
+                if !stdin.is_terminal() {
+                    let _ = self.l.stdout.write_all(line.as_bytes());
+                    let _ = self.l.stdout.flush();
+                }
                 if line.ends_with('\n') {
                     line.pop();
                     if line.ends_with('\r') {
@@ -305,14 +398,38 @@ impl Interpreter {
     fn get_prompt(&mut self, firstline: bool) -> String {
         let global_name = if firstline { "_PROMPT" } else { "_PROMPT2" };
         if self.l.get_global(global_name) == LuaType::Nil {
-            (if firstline { LUA_PROMPT } else { LUA_PROMPT2 }).to_string()
-        } else {
-            let result = self.l.to_string(-1).unwrap_or_else(|| {
-                (if firstline { LUA_PROMPT } else { LUA_PROMPT2 }).to_string()
-            });
-            self.l.pop(1);
-            result
+            return (if firstline { LUA_PROMPT } else { LUA_PROMPT2 }).to_string();
         }
+        // 对应 C 的 luaL_tolstring: 字符串直接用，表调用 __tostring
+        let result = match self.l.obj_at(-1).cloned() {
+            Some(TValue::Str(s)) => Some(s.as_str().to_string()),
+            Some(TValue::Table(t)) => {
+                let tostring_key = TValue::Str(self.l.intern_str("__tostring"));
+                let meta_fn = {
+                    let data = t.data.borrow();
+                    data.metatable.as_ref().and_then(|mt| mt.get(&tostring_key))
+                };
+                meta_fn.and_then(|f| {
+                    let base = self.l.stack.len();
+                    self.l.stack.push(f);
+                    self.l.stack.push(TValue::Table(t));
+                    let status = self.l.pcall(1, 1, 0);
+                    if status == 0 {
+                        let s = self.l.to_string(-1);
+                        self.l.settop(base);
+                        s
+                    } else {
+                        self.l.settop(base);
+                        None
+                    }
+                })
+            }
+            _ => self.l.to_string(-1),
+        };
+        self.l.pop(1);
+        result.unwrap_or_else(|| {
+            (if firstline { LUA_PROMPT } else { LUA_PROMPT2 }).to_string()
+        })
     }
 
     fn pushline(&mut self, firstline: bool) -> bool {
@@ -345,20 +462,20 @@ impl Interpreter {
     fn multiline(&mut self) -> i32 {
         let first_line = self.l.to_string(1).unwrap_or_default();
         self.check_local(&first_line);
-
+        let mut current = first_line;
         loop {
-            let line = self.l.to_string(1).unwrap_or_default();
-            let status = self.l.load_buffer(&line, "=stdin");
+            let status = self.l.load_buffer(&current, "=stdin");
             if !self.incomplete(status) || !self.pushline(false) {
                 return status;
             }
-            self.l.rotate(-2, -1);
-            self.l.pop(1);
-            self.l.push_lstring(b"\n");
-            self.l.rotate(-2, 1);
-            self.l.pop(1);
-            self.l.pop(1);
-            self.l.push_string(&format!("{}{}", first_line, "\n"));
+            // 栈：[current(位置1), 错误消息, 新行]
+            let new_line = self.l.to_string(-1).unwrap_or_default();
+            self.l.pop(2);  // 移除新行和错误消息
+            // 栈：[current]
+            current = format!("{}\n{}", current, new_line);
+            self.l.pop(1);  // 移除旧 current
+            self.l.push_string(&current);
+            // 栈：[current]
         }
     }
 
@@ -592,8 +709,11 @@ impl Interpreter {
     }
 }
 
-unsafe extern "C" fn laction(_sig: i32) {
-    INTERRUPTED.store(true, Ordering::SeqCst);
+unsafe extern "C" fn laction(sig: i32) {
+    // 对应 C 的 laction: setsignal(i, SIG_DFL) — 恢复默认信号处理
+    // 如果另一个 SIGINT 发生，终止进程
+    libc::signal(sig, libc::SIG_DFL);
+    crate::execute::INTERRUPTED.store(true, Ordering::SeqCst);
 }
 
 fn setup_signal_handler() {
@@ -616,6 +736,15 @@ fn reset_signal_handler() {
 
 /// CLI 入口点
 pub fn main() {
+    // 调试: 输出关键类型大小（用 LUA_DEBUG_SIZES 环境变量控制）
+    if std::env::var("LUA_DEBUG_SIZES").is_ok() {
+        eprintln!("TValue: {}", std::mem::size_of::<crate::objects::TValue>());
+        eprintln!("Table: {}", std::mem::size_of::<crate::objects::Table>());
+        eprintln!("LClosure: {}", std::mem::size_of::<crate::objects::LClosure>());
+        eprintln!("LuaString: {}", std::mem::size_of::<crate::strings::LuaString>());
+        eprintln!("Proto: {}", std::mem::size_of::<crate::objects::Proto>());
+        eprintln!("LuaThread: {}", std::mem::size_of::<crate::objects::LuaThread>());
+    }
     let args: Vec<String> = std::env::args().collect();
 
     let mut interpreter = match Interpreter::new() {
@@ -625,7 +754,9 @@ pub fn main() {
         }
     };
 
-    if !interpreter.pmain(&args) {
+    let result = interpreter.pmain(&args);
+    interpreter.l.close_state();
+    if !result {
         std::process::exit(1);
     }
 }

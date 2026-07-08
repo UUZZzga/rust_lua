@@ -197,6 +197,7 @@ struct CallerContext {
     proto_flag: u8,
     nextraargs: i32,
     closure_upvals: Vec<crate::objects::UpValRef>,
+    open_upvals: Vec<crate::objects::UpValRef>,
     open_upval: Option<usize>,
     tbc_list: Option<usize>,
     call_stack: Vec<crate::objects::CallFrame>,
@@ -226,6 +227,7 @@ fn save_caller_context(state: &mut LuaState) -> CallerContext {
         proto_flag: state.proto_flag,
         nextraargs: state.nextraargs,
         closure_upvals: std::mem::take(&mut state.closure_upvals),
+        open_upvals: std::mem::take(&mut state.open_upvals),
         open_upval: state.open_upval,
         tbc_list: state.tbc_list,
         call_stack: std::mem::take(&mut state.call_stack),
@@ -255,6 +257,7 @@ fn restore_caller_context(state: &mut LuaState, ctx: CallerContext) {
     state.proto_flag = ctx.proto_flag;
     state.nextraargs = ctx.nextraargs;
     state.closure_upvals = ctx.closure_upvals;
+    state.open_upvals = ctx.open_upvals;
     state.open_upval = ctx.open_upval;
     state.tbc_list = ctx.tbc_list;
     state.call_stack = ctx.call_stack;
@@ -292,7 +295,7 @@ struct OpenUpvalInfo {
 /// 第一步: 在 save_caller_context 之前，把开 upvalue 转为 Closed
 /// 返回 (uv_ref, original_stack_index) 列表，供退出时同步
 /// 首次 resume 时同时把信息保存到 ThreadContext，供 close_suspended_coroutine 使用
-fn close_open_upvals(thread: &LuaThread, state: &LuaState) -> Vec<OpenUpvalInfo> {
+fn close_open_upvals(thread: &LuaThread, state: &mut LuaState) -> Vec<OpenUpvalInfo> {
     let mut result = Vec::new();
     if !thread.context.borrow().started {
         if let Some(boxed_func) = &thread.function {
@@ -327,23 +330,47 @@ fn close_open_upvals(thread: &LuaThread, state: &LuaState) -> Vec<OpenUpvalInfo>
 /// 扫描栈上的 LClosure 参数，收集其 Open upvalue
 /// 用于 C 函数体协程（如 coroutine.create(pcall)）首次 resume 时
 fn scan_stack_for_closures(
-    state: &LuaState,
+    state: &mut LuaState,
     result: &mut Vec<OpenUpvalInfo>,
     visited: &mut std::collections::HashSet<usize>,
 ) {
     let mut visited_tables = std::collections::HashSet::new();
-    // 扫描整个栈，找到 LClosure 和 Table 类型的值
-    for v in state.stack.iter() {
-        match v {
-            TValue::LClosure(closure) => {
-                collect_and_close_upvals_impl(&closure.upvals.borrow(), state, result, visited, &mut visited_tables);
+    // 先 clone 栈上的 LClosure/Table 引用（避免遍历时借用 state.stack）
+    let closures: Vec<Rc<RefCell<Vec<UpValRef>>>> = state.stack.iter()
+        .filter_map(|v| {
+            if let TValue::LClosure(closure) = v {
+                Some(closure.upvals.clone())
+            } else {
+                None
             }
-            TValue::Table(t) => {
-                scan_table_and_close_upvals(t, state, result, visited, &mut visited_tables);
+        })
+        .collect();
+    let tables: Vec<Table> = state.stack.iter()
+        .filter_map(|v| {
+            if let TValue::Table(t) = v {
+                Some(t.clone())
+            } else {
+                None
             }
-            _ => {}
-        }
+        })
+        .collect();
+    for upvals in &closures {
+        collect_and_close_upvals_impl(&upvals.borrow(), state, result, visited, &mut visited_tables);
     }
+    for t in &tables {
+        scan_table_and_close_upvals(t, state, result, visited, &mut visited_tables);
+    }
+}
+
+/// 通过 Rc 指针关闭 upvalue（unlink + 设置为 Closed）
+/// 协程场景下必须先从 open_upval 链表移除再设为 Closed，
+/// 否则链表中残留的 Closed upvalue 会让 func::close 遍历中断（Closed 无 next 字段）
+fn close_upval_by_ref(state: &mut LuaState, uv_ref: &Rc<RefCell<UpVal>>, val: TValue) {
+    let ptr = Rc::as_ptr(uv_ref) as usize;
+    if let Some(uv_idx) = state.open_upvals.iter().position(|r| Rc::as_ptr(r) as usize == ptr) {
+        crate::func::unlink_upval(state, uv_idx);
+    }
+    *uv_ref.borrow_mut() = UpVal::Closed { value: Box::new(val) };
 }
 
 /// 递归收集并关闭所有可达的 Open upvalue
@@ -351,7 +378,7 @@ fn scan_stack_for_closures(
 /// 当 upvalue 的值是 Table 时，递归扫描 Table（包括元表）中的 LClosure
 fn collect_and_close_upvals(
     upvals: &[Rc<RefCell<UpVal>>],
-    state: &LuaState,
+    state: &mut LuaState,
     result: &mut Vec<OpenUpvalInfo>,
     visited: &mut std::collections::HashSet<usize>,
 ) {
@@ -361,7 +388,7 @@ fn collect_and_close_upvals(
 
 fn collect_and_close_upvals_impl(
     upvals: &[Rc<RefCell<UpVal>>],
-    state: &LuaState,
+    state: &mut LuaState,
     result: &mut Vec<OpenUpvalInfo>,
     visited: &mut std::collections::HashSet<usize>,
     visited_tables: &mut std::collections::HashSet<usize>,
@@ -385,9 +412,9 @@ fn collect_and_close_upvals_impl(
                 UpVal::Closed { value } => (false, 0, (**value).clone()),
             }
         };
-        // 如果是 Open，转为 Closed
+        // 如果是 Open，转为 Closed（先从链表移除，再设为 Closed）
         if is_open {
-            *uv_ref.borrow_mut() = UpVal::Closed { value: Box::new(val.clone()) };
+            close_upval_by_ref(state, uv_ref, val.clone());
             result.push(OpenUpvalInfo {
                 uv_ref: uv_ref.clone(),
                 original_stack_index: original_idx,
@@ -408,7 +435,7 @@ fn collect_and_close_upvals_impl(
 /// 同时递归扫描嵌套 Table 和元表
 fn scan_table_and_close_upvals(
     table: &Table,
-    state: &LuaState,
+    state: &mut LuaState,
     result: &mut Vec<OpenUpvalInfo>,
     visited: &mut std::collections::HashSet<usize>,
     visited_tables: &mut std::collections::HashSet<usize>,
@@ -460,7 +487,7 @@ fn scan_table_and_close_upvals(
 /// 关闭 hook 函数的 Open upvalue（供 debug.sethook 使用）
 /// 把 hook 函数及其嵌套 LClosure 的 Open upvalue 转为 Closed，
 /// 避免协程执行期间 state.stack 被替换后 upvalue 失效
-pub fn close_hook_upvals(hook: &TValue, state: &LuaState) {
+pub fn close_hook_upvals(hook: &TValue, state: &mut LuaState) {
     if let TValue::LClosure(closure) = hook {
         let mut result = Vec::new();
         let mut visited = std::collections::HashSet::new();
@@ -632,16 +659,27 @@ fn sync_upvals_back(
         if write_back && info.original_stack_index < state.stack.len() {
             state.stack[info.original_stack_index] = latest_val.clone();
         }
-        // 协程已结束: 恢复为 Open（指向父栈原位置）
+        // 协程已结束: 恢复为 Open（指向父栈原位置）并重新加入链表
         if co_finished {
-            let mut uv = info.uv_ref.borrow_mut();
-            if let UpVal::Closed { .. } = &*uv {
-                *uv = UpVal::Open {
-                    stack_index: info.original_stack_index,
-                    next: None,
-                    previous: None,
-                    tbc: false,
-                };
+            let need_relink = {
+                let mut uv = info.uv_ref.borrow_mut();
+                if let UpVal::Closed { .. } = &*uv {
+                    *uv = UpVal::Open {
+                        stack_index: info.original_stack_index,
+                        next: None,
+                        previous: None,
+                        tbc: false,
+                    };
+                    true
+                } else {
+                    false
+                }
+            };
+            if need_relink {
+                let ptr = Rc::as_ptr(&info.uv_ref) as usize;
+                if let Some(uv_idx) = state.open_upvals.iter().position(|r| Rc::as_ptr(r) as usize == ptr) {
+                    relink_upval(state, uv_idx);
+                }
             }
         }
     }
@@ -650,7 +688,7 @@ fn sync_upvals_back(
 /// yield 时关闭 yield 出来的闭包的 Open upvalue（指向协程栈）
 /// 在 saved_stack = take(state.stack) 之前调用（state.stack 仍是协程栈）
 /// 返回 (uv_ref, original_stack_index) 列表，供 resume 时同步回协程栈
-fn close_yield_upvals(yield_values: &[TValue], state: &LuaState) -> Vec<(UpValRef, usize)> {
+fn close_yield_upvals(yield_values: &[TValue], state: &mut LuaState) -> Vec<(UpValRef, usize)> {
     let mut result_info: Vec<OpenUpvalInfo> = Vec::new();
     let mut visited = std::collections::HashSet::new();
     let mut visited_tables = std::collections::HashSet::new();
@@ -679,9 +717,14 @@ fn close_yield_upvals(yield_values: &[TValue], state: &LuaState) -> Vec<(UpValRe
     // yield 后协程栈被保存到 ThreadContext，resume 时恢复，TBC upvalue 仍指向正确位置。
     // 若关闭 TBC upvalue，sync_yield_upvals_back 恢复 Open 时会丢失 tbc 标记，
     // 导致后续 close 不调用 __close。
+    // 先收集要关闭的 uv_idx（遍历链表时不能修改链表），再逐个 unlink + close
+    let mut to_close: Vec<(usize, usize)> = Vec::new(); // (uv_idx, stack_index)
     let mut current = state.open_upval;
     while let Some(uv_idx) = current {
-        let uv_ref = state.closure_upvals[uv_idx].clone();
+        if uv_idx >= state.open_upvals.len() {
+            break;
+        }
+        let uv_ref = state.open_upvals[uv_idx].clone();
         let (stack_index, next, is_open, is_tbc) = {
             let uv = uv_ref.borrow();
             match &*uv {
@@ -692,21 +735,83 @@ fn close_yield_upvals(yield_values: &[TValue], state: &LuaState) -> Vec<(UpValRe
         if is_open && !is_tbc {
             let ptr = Rc::as_ptr(&uv_ref) as usize;
             if visited.insert(ptr) {
-                let val = state.stack.get(stack_index)
-                    .cloned()
-                    .unwrap_or(TValue::Nil(NilKind::Strict));
-                *uv_ref.borrow_mut() = UpVal::Closed { value: Box::new(val) };
-                result_info.push(OpenUpvalInfo {
-                    uv_ref,
-                    original_stack_index: stack_index,
-                });
+                to_close.push((uv_idx, stack_index));
             }
         }
         current = next;
     }
+    for (uv_idx, stack_index) in to_close {
+        let val = state.stack.get(stack_index)
+            .cloned()
+            .unwrap_or(TValue::Nil(NilKind::Strict));
+        let uv_ref = state.open_upvals[uv_idx].clone();
+        crate::func::unlink_upval(state, uv_idx);
+        *uv_ref.borrow_mut() = UpVal::Closed { value: Box::new(val) };
+        result_info.push(OpenUpvalInfo {
+            uv_ref,
+            original_stack_index: stack_index,
+        });
+    }
     result_info.into_iter()
         .map(|info| (info.uv_ref, info.original_stack_index))
         .collect()
+}
+
+/// 把已有的 Open upvalue 重新插入 open_upval 链表（按 stack_index 降序）
+/// 用于 sync_yield_upvals_back 恢复 Open 后重新加入链表，
+/// 否则后续 close_yield_upvals 遍历链表时找不到该 upvalue
+fn relink_upval(state: &mut LuaState, uv_idx: usize) {
+    let stack_index = {
+        let uv = state.open_upvals[uv_idx].borrow();
+        match &*uv {
+            UpVal::Open { stack_index, .. } => *stack_index,
+            _ => return,
+        }
+    };
+    let mut prev: Option<usize> = None;
+    let mut current = state.open_upval;
+    while let Some(idx) = current {
+        if idx == uv_idx {
+            return; // 已在链表中
+        }
+        let (cur_level, next) = {
+            let uv = state.open_upvals[idx].borrow();
+            match &*uv {
+                UpVal::Open { stack_index, next, .. } => (*stack_index, *next),
+                _ => break,
+            }
+        };
+        if cur_level < stack_index {
+            break;
+        }
+        prev = Some(idx);
+        current = next;
+    }
+    let next_node = current;
+    {
+        let mut uv = state.open_upvals[uv_idx].borrow_mut();
+        if let UpVal::Open { ref mut previous, ref mut next, .. } = &mut *uv {
+            *previous = prev;
+            *next = next_node;
+        }
+    }
+    match prev {
+        Some(p_idx) => {
+            let mut p = state.open_upvals[p_idx].borrow_mut();
+            if let UpVal::Open { ref mut next, .. } = &mut *p {
+                *next = Some(uv_idx);
+            }
+        }
+        None => {
+            state.open_upval = Some(uv_idx);
+        }
+    }
+    if let Some(n_idx) = next_node {
+        let mut n = state.open_upvals[n_idx].borrow_mut();
+        if let UpVal::Open { ref mut previous, .. } = &mut *n {
+            *previous = Some(uv_idx);
+        }
+    }
 }
 
 /// resume 时把 yield 时关闭的 upvalue 的 Closed 值同步回协程栈，并恢复 Open
@@ -731,6 +836,11 @@ fn sync_yield_upvals_back(state: &mut LuaState, origins: &[(UpValRef, usize)]) {
             previous: None,
             tbc: false,
         };
+        // 重新加入 open_upval 链表
+        let ptr = Rc::as_ptr(uv_ref) as usize;
+        if let Some(uv_idx) = state.open_upvals.iter().position(|r| Rc::as_ptr(r) as usize == ptr) {
+            relink_upval(state, uv_idx);
+        }
     }
 }
 
@@ -940,6 +1050,7 @@ fn close_suspended_coroutine(
         state.proto_flag = ctx.saved_proto_flag;
         state.nextraargs = ctx.saved_nextraargs;
         state.closure_upvals = ctx.saved_closure_upvals.clone();
+        state.open_upvals = ctx.saved_open_upvals.clone();
         state.open_upval = ctx.saved_open_upval;
         state.tbc_list = ctx.saved_tbc_list;
         state.call_stack = ctx.saved_call_stack.clone();
@@ -1245,6 +1356,7 @@ fn call_resume(
                 ctx.saved_proto_flag = state.proto_flag;
                 ctx.saved_nextraargs = state.nextraargs;
                 ctx.saved_closure_upvals = std::mem::take(&mut state.closure_upvals);
+                ctx.saved_open_upvals = std::mem::take(&mut state.open_upvals);
                 ctx.saved_open_upval = state.open_upval;
                 ctx.saved_tbc_list = state.tbc_list;
                 ctx.saved_call_stack = std::mem::take(&mut state.call_stack);
@@ -1555,6 +1667,7 @@ fn setup_subsequent_resume(
     state.proto_flag = ctx.saved_proto_flag;
     state.nextraargs = ctx.saved_nextraargs;
     state.closure_upvals = ctx.saved_closure_upvals.clone();
+    state.open_upvals = ctx.saved_open_upvals.clone();
     state.open_upval = ctx.saved_open_upval;
     state.tbc_list = ctx.saved_tbc_list;
     state.call_stack = ctx.saved_call_stack.clone();
@@ -1793,7 +1906,7 @@ pub fn call_wrap_call(
             } else {
                 saved_val.clone()
             };
-            *uv_ref.borrow_mut() = UpVal::Closed { value: Box::new(val) };
+            close_upval_by_ref(state, &uv_ref, val);
             open_upvals.push(OpenUpvalInfo { uv_ref: uv_ref.clone(), original_stack_index: orig_idx });
             origins.push((uv_ref, orig_idx));
         }
@@ -1892,6 +2005,7 @@ pub fn call_wrap_call(
                 ctx.saved_proto_flag = state.proto_flag;
                 ctx.saved_nextraargs = state.nextraargs;
                 ctx.saved_closure_upvals = std::mem::take(&mut state.closure_upvals);
+                ctx.saved_open_upvals = std::mem::take(&mut state.open_upvals);
                 ctx.saved_open_upval = state.open_upval;
                 ctx.saved_tbc_list = state.tbc_list;
                 ctx.saved_call_stack = std::mem::take(&mut state.call_stack);

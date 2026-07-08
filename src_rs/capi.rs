@@ -20,7 +20,7 @@
 
 #![allow(non_snake_case, non_camel_case_types, unused_imports)]
 
-use std::ffi::{c_char, c_int, c_void, CStr, CString};
+use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::ptr;
 
 use crate::objects::{LuaType, NilKind, Proto, TValue, LClosure, CClosure, LCFunction, Table};
@@ -351,6 +351,28 @@ pub extern "C" fn lua_pop(L: *mut lua_State, n: c_int) {
     lua_settop(L, -(n) - 1);
 }
 
+/// lua_insert: 把栈顶元素插入到 idx 位置，元素上移。
+/// 等同于 lua_rotate(L, idx, 1)。
+#[no_mangle]
+pub extern "C" fn lua_insert(L: *mut lua_State, idx: c_int) {
+    lua_rotate(L, idx, 1);
+}
+
+/// lua_remove: 移除 idx 处的元素，元素下移。
+/// 等同于 lua_rotate(L, idx, -1) 后 pop。
+#[no_mangle]
+pub extern "C" fn lua_remove(L: *mut lua_State, idx: c_int) {
+    lua_rotate(L, idx, -1);
+    lua_pop(L, 1);
+}
+
+/// lua_replace: 宏，等价于 lua_copy(L, -1, idx) + pop
+#[no_mangle]
+pub extern "C" fn lua_replace(L: *mut lua_State, idx: c_int) {
+    lua_copy(L, -1, idx);
+    lua_pop(L, 1);
+}
+
 // ============================================================================
 // Push 系列
 // ============================================================================
@@ -656,11 +678,19 @@ pub extern "C" fn lua_tolstring(
 
     // 返回内部字符串指针
     if let TValue::Str(ref s) = L.stack[off] {
-        let ptr = s.as_str().as_ptr() as *const c_char;
+        let slice = s.as_str();
         if !len.is_null() {
-            unsafe { *len = s.len() };
+            unsafe { *len = slice.len() };
         }
-        ptr
+        // 空字符串的 as_ptr() 返回 dangling pointer（非空但不可读）。
+        // C 代码（如 luaL_checklstring 后接 memcpy(dst, str, len+1)）会读取
+        // null 终止符导致段错误。返回指向静态 null 字节的有效指针。
+        if slice.is_empty() {
+            static EMPTY_NUL: u8 = 0;
+            &EMPTY_NUL as *const u8 as *const c_char
+        } else {
+            slice.as_ptr() as *const c_char
+        }
     } else {
         ptr::null()
     }
@@ -747,16 +777,23 @@ pub extern "C" fn lua_gettable(L: *mut lua_State, idx: c_int) -> c_int {
 #[no_mangle]
 pub extern "C" fn lua_settable(L: *mut lua_State, idx: c_int) {
     let L = unsafe { &mut *L };
-    let val = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
-    let key = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+    // 先基于当前 top（包含 key 和 val）定位 table，再 pop
     if is_registry(idx) {
+        let val = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        let key = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
         L.registry.set(key, val);
         return;
     }
     let off = match index2offset(L, idx) {
         Some(o) => o,
-        None => return,
+        None => {
+            L.stack.pop();
+            L.stack.pop();
+            return;
+        }
     };
+    let val = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+    let key = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
     if let TValue::Table(ref mut t) = L.stack[off] {
         t.set(key, val);
     }
@@ -801,7 +838,7 @@ pub extern "C" fn lua_getfield(L: *mut lua_State, idx: c_int, k: *const c_char) 
 #[no_mangle]
 pub extern "C" fn lua_setfield(L: *mut lua_State, idx: c_int, k: *const c_char) {
     let L = unsafe { &mut *L };
-    let val = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+    // 先基于当前 top（包含 val）定位 table，再 pop val
     let key_str = if k.is_null() {
         String::new()
     } else {
@@ -812,13 +849,18 @@ pub extern "C" fn lua_setfield(L: *mut lua_State, idx: c_int, k: *const c_char) 
     let key = crate::state::str_to_ls(&L.string_table, &key_str);
     let key_tv = TValue::Str(key);
     if is_registry(idx) {
+        let val = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
         L.registry.set(key_tv, val);
         return;
     }
     let off = match index2offset(L, idx) {
         Some(o) => o,
-        None => return,
+        None => {
+            L.stack.pop();
+            return;
+        }
     };
+    let val = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
     if let TValue::Table(ref mut t) = L.stack[off] {
         t.set(key_tv, val);
     }
@@ -868,15 +910,20 @@ pub extern "C" fn lua_rawgeti(L: *mut lua_State, idx: c_int, n: lua_Integer) -> 
 #[no_mangle]
 pub extern "C" fn lua_rawseti(L: *mut lua_State, idx: c_int, n: lua_Integer) {
     let L = unsafe { &mut *L };
-    let val = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+    // 先基于当前 top（包含 val）定位 table，再 pop
     if is_registry(idx) {
+        let val = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
         L.registry.set(TValue::Integer(n), val);
         return;
     }
     let off = match index2offset(L, idx) {
         Some(o) => o,
-        None => return,
+        None => {
+            L.stack.pop();
+            return;
+        }
     };
+    let val = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
     if let TValue::Table(ref mut t) = L.stack[off] {
         t.set_int(n, val);
     }
@@ -944,6 +991,284 @@ fn format_float(f: f64) -> String {
         s.to_string()
     }
 }
+
+// ============================================================================
+// luaL 辅助库函数 — 对应 C lauxlib.cpp
+// ============================================================================
+
+/// luaL_Reg 结构 — 对应 C 的 luaL_Reg
+#[repr(C)]
+pub struct luaL_Reg {
+    pub name: *const c_char,
+    pub func: Option<lua_CFunction>,
+}
+
+/// luaL_checkversion_: 版本兼容性检查（简化为空实现）
+///
+/// C 版本检查 LUA_VERSION_NUM 和 LUAL_NUMSIZES，不匹配则 luaL_error。
+/// Rust 实现暂不检查，因为 .so 都是与同版本编译的。
+#[no_mangle]
+pub extern "C" fn luaL_checkversion_(_L: *mut lua_State, _ver: lua_Number, _sz: usize) {
+    // 简化：不做任何检查
+}
+
+/// luaL_setfuncs: 把 luaL_Reg 数组中的函数注册到栈顶表
+///
+/// 栈布局（调用前）: [... | table | upvalue1 | ... | upvalueN]
+/// nup = N，table 在 -(nup+1) 位置
+/// 调用后: [... | table]（弹出所有 upvalue）
+#[no_mangle]
+pub extern "C" fn luaL_setfuncs(L: *mut lua_State, l: *const luaL_Reg, nup: c_int) {
+    if l.is_null() {
+        return;
+    }
+    let nup = nup as i32;
+    let mut i = 0;
+    loop {
+        let reg = unsafe { &*l.add(i) };
+        if reg.name.is_null() {
+            break;
+        }
+        i += 1;
+        match reg.func {
+            None => {
+                // 占位符：压入 false
+                lua_pushboolean(L, 0);
+            }
+            Some(f) => {
+                // 复制 nup 个 upvalue 到栈顶（每次复制 -nup 位置）
+                for _ in 0..nup {
+                    lua_pushvalue(L, -nup);
+                }
+                lua_pushcclosure(L, f, nup);
+            }
+        }
+        // 栈: [... | table | upv1..N | closure]，table 在 -(nup+2)
+        lua_setfield(L, -(nup + 2), reg.name);
+    }
+    // 弹出 nup 个 upvalue
+    lua_pop(L, nup);
+}
+
+/// luaL_checklstring: 检查参数 arg 是否为字符串，返回字符串指针和长度
+///
+/// 对应 C 的 luaL_checklstring，参数不匹配时调用 luaL_typeerror 抛错。
+#[no_mangle]
+pub extern "C" fn luaL_checklstring(
+    L: *mut lua_State,
+    arg: c_int,
+    l: *mut usize,
+) -> *const c_char {
+    // 用 lua_tolstring 获取字符串指针
+    let ptr = lua_tolstring(L, arg, l);
+    if ptr.is_null() {
+        // 类型错误：简化处理，调用 lua_error 抛错
+        let msg = CString::new(format!("bad argument #{} (string expected)", arg)).unwrap();
+        lua_pushstring(L, msg.as_ptr());
+        lua_error(L);
+    }
+    ptr
+}
+
+/// luaL_ref: 在表 t（栈顶）中创建对栈顶值的引用
+///
+/// 返回引用编号（整数）。栈顶值被弹出。
+/// 对应 C 的 luaL_ref：
+/// - 栈顶值是 nil → 弹出，返回 LUA_REFNIL
+/// - 否则 → t[n] = value，n++，弹出 value，返回 n-1
+#[no_mangle]
+pub extern "C" fn luaL_ref(L: *mut lua_State, t: c_int) -> c_int {
+    const LUA_REFNIL: c_int = -1;
+    const LUA_NOREF: c_int = -2;
+
+    let L = unsafe { &mut *L };
+    if L.stack.is_empty() {
+        return LUA_NOREF;
+    }
+    let val = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+    if matches!(val, TValue::Nil(_)) {
+        return LUA_REFNIL;
+    }
+    // 获取表 t（通常是 LUA_REGISTRYINDEX）
+    // 简化：假设 t 是 registry（LUA_REGISTRYINDEX），用 registry 的 array 部分
+    // C 实现：t[ref] = value，ref 从 t[0] 取空闲链表
+    // 这里用 registry 的 hash 部分，key 是整数 ref
+    let registry = L.registry.clone();
+    // 简化：维护一个递增计数器存在 registry[0]
+    let next_ref_key = TValue::Integer(0);
+    let next_ref = match registry.get(&next_ref_key) {
+        Some(TValue::Integer(n)) => n + 1,
+        _ => 1,
+    };
+    registry.set(next_ref_key, TValue::Integer(next_ref));
+    registry.set(TValue::Integer(next_ref), val);
+    next_ref as c_int
+}
+
+/// luaL_unref: 释放引用（简化实现，不回收）
+#[no_mangle]
+pub extern "C" fn luaL_unref(L: *mut lua_State, _t: c_int, ref_: c_int) {
+    let L = unsafe { &mut *L };
+    if ref_ == -1 || ref_ == -2 {
+        return;  // LUA_REFNIL 或 LUA_NOREF
+    }
+    let registry = L.registry.clone();
+    registry.set(TValue::Integer(ref_ as i64), TValue::Nil(NilKind::Strict));
+}
+
+// ============================================================================
+// 调用与错误 — 对应 C lapi.cpp
+// ============================================================================
+
+/// lua_callk: 调用栈顶函数（无保护，错误会传播）
+///
+/// 简化实现：用 pcall 调用，错误时 panic（模拟无保护语义）
+/// k 是延续函数（C continuation），Rust 实现不支持，忽略。
+#[no_mangle]
+pub extern "C" fn lua_callk(
+    L: *mut lua_State,
+    nargs: usize,
+    nresults: i32,
+    _ctx: isize,
+    _k: Option<unsafe extern "C" fn(*mut lua_State, c_int, isize) -> c_int>,
+) {
+    let L = unsafe { &mut *L };
+    let status = L.pcall(nargs, nresults, 0);
+    if status != 0 {
+        // pcall 失败：取栈顶错误值，设置 pending_error，panic 让上层捕获
+        let err = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        L.pending_error = Some(err);
+        panic!("lua_callk error");
+    }
+}
+
+/// lua_error: 抛出栈顶错误值
+///
+/// 对应 C 的 lua_error（用 longjmp）。Rust 实现用 panic + pending_error。
+/// 调用方（C 函数）应假设此函数不返回。
+#[no_mangle]
+pub extern "C" fn lua_error(L: *mut lua_State) -> c_int {
+    let L = unsafe { &mut *L };
+    let err = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+    L.pending_error = Some(err);
+    panic!("lua_error");
+}
+
+/// lua_getallocf: 获取内存分配器函数
+///
+/// 返回一个基于 libc realloc/free 的默认分配器，供 C 模块（如 lib22.c）使用。
+/// ud 设为 NULL（Rust VM 用自己的分配器，C 模块分配的内存由其自行管理）。
+pub type lua_Alloc = Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize) -> *mut c_void>;
+
+/// 默认 C 内存分配器：realloc/free 包装
+unsafe extern "C" fn default_allocf(
+    _ud: *mut c_void,
+    ptr: *mut c_void,
+    _osize: usize,
+    nsize: usize,
+) -> *mut c_void {
+    if nsize == 0 {
+        if !ptr.is_null() {
+            libc::free(ptr);
+        }
+        ptr::null_mut()
+    } else {
+        libc::realloc(ptr, nsize)
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn lua_getallocf(_L: *mut lua_State, ud: *mut *mut c_void) -> lua_Alloc {
+    if !ud.is_null() {
+        unsafe { *ud = ptr::null_mut(); }
+    }
+    Some(default_allocf)
+}
+
+/// lua_pushfstring / lua_pushvfstring 由 C 文件 src_rs/capi_variadic.c 提供
+/// （stable Rust 不支持 c_variadic，需用 C 实现可变参数格式化）。
+
+
+// ============================================================================
+// External String — Lua 5.5 新增 API
+// ============================================================================
+
+/// lua_pushexternalstring: 创建外部字符串并压栈
+///
+/// 对应 C 5.5 的 lua_pushexternalstring。
+/// s 是外部缓冲区，len 是长度，dealloc 是释放回调，ud 是回调参数。
+///
+/// 简化实现：拷贝 s 内容到普通 LuaString，不实际调用 dealloc
+/// （.so 的 dlclose 由进程退出时 OS 回收，对测试运行无影响）。
+/// 这避免了修改 GC 机制以支持外部字符串的复杂度。
+#[no_mangle]
+pub extern "C" fn lua_pushexternalstring(
+    L: *mut lua_State,
+    s: *const c_char,
+    len: usize,
+    _dealloc: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize) -> *mut c_void>,
+    _ud: *mut c_void,
+) -> *const c_char {
+    let L = unsafe { &mut *L };
+    if s.is_null() || len == 0 {
+        L.push_string("");
+    } else {
+        let bytes = unsafe { std::slice::from_raw_parts(s as *const u8, len) };
+        L.push_lstring(bytes);
+    }
+    s
+}
+
+// ============================================================================
+// package.loadlib 支持函数 — 供 base_lib.rs 调用
+// ============================================================================
+
+/// 内部函数：dlopen 加载动态库，返回库句柄
+///
+/// 对应 C loadlib.cpp 的 lsys_load。seeglb=true 时用 RTLD_GLOBAL。
+pub unsafe fn sys_load(path: &str, seeglb: bool) -> *mut c_void {
+    let cpath = match CString::new(path) {
+        Ok(c) => c,
+        Err(_) => return ptr::null_mut(),
+    };
+    let flags = if seeglb {
+        libc::RTLD_NOW | libc::RTLD_GLOBAL
+    } else {
+        libc::RTLD_NOW | libc::RTLD_LOCAL
+    };
+    unsafe { libc::dlopen(cpath.as_ptr(), flags) }
+}
+
+/// 内部函数：dlsym 查找符号，返回函数指针
+///
+/// 对应 C loadlib.cpp 的 lsys_sym。
+pub unsafe fn sys_sym(lib: *mut c_void, sym: &str) -> Option<lua_CFunction> {
+    let csym = CString::new(sym).ok()?;
+    let ptr = unsafe { libc::dlsym(lib, csym.as_ptr()) };
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute::<*mut c_void, lua_CFunction>(ptr) })
+    }
+}
+
+/// 内部函数：dlclose 关闭动态库
+pub unsafe fn sys_unload(lib: *mut c_void) {
+    if !lib.is_null() {
+        unsafe { libc::dlclose(lib); }
+    }
+}
+
+/// 内部函数：dlerror 获取错误消息
+pub unsafe fn sys_dlerror() -> String {
+    let ptr = unsafe { libc::dlerror() };
+    if ptr.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+    }
+}
+
 
 // ============================================================================
 // 测试

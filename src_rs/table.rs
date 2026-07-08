@@ -504,9 +504,12 @@ impl Table {
 
     pub fn mem_size(&self) -> usize {
         let data = self.data.borrow();
+        // array.capacity() 反映 Vec 实际分配的内存（含 over-allocation），
+        // 避免 big.lua 的 prog 表（263144 条目）因 Vec 倍增容量导致 gc_estimate 低估。
+        // hash.len() 避免 hashbrown 最小容量（8）导致小表 gc_estimate 高估（gc.lua:477）。
         std::mem::size_of::<Table>()
-            + data.array.len() * std::mem::size_of::<TValue>()
-            + data.hash.capacity()
+            + data.array.capacity() * std::mem::size_of::<TValue>()
+            + data.hash.len()
                 * (std::mem::size_of::<TValue>() * 2 + std::mem::size_of::<u8>())
     }
 }

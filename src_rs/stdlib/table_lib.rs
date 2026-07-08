@@ -269,17 +269,27 @@ fn call_unpack(
         return Err(VmError::RuntimeError("too many results to unpack".to_string()));
     }
 
-    // 收集结果到 Vec (push_results 会处理 truncate 和 nresults 调整)
-    // 通过 __index 元方法访问元素 (对应 C lua_geti)
-    let mut results: Vec<TValue> = Vec::with_capacity(n);
+    // 预留栈空间。Rust TValue（96 字节）比 C 的 16 字节大 6 倍，大 n 时分配可能 OOM。
+    // 用 try_reserve_exact 避免 panic，将 OOM 转为可被 pcall/resume 捕获的运行时错误。
+    // 沿用 "too many results to unpack" 消息（与 MAXSTACK 检查一致），让 errors.lua:615 的
+    // checkerr("too many results", f) 能匹配。
+    state.stack.try_reserve_exact(n).map_err(|_| {
+        VmError::RuntimeError("too many results to unpack".to_string())
+    })?;
+
+    // 直接 push 到 state.stack，不创建中间 Vec
+    // 对应 C 版 tunpack: while (i < e) { lua_geti(L, 1, i); i++; } lua_geti(L, 1, e);
+    let first_result_pos = state.stack.len();
     let mut idx = i;
     while idx < j {
-        results.push(geti_meta(state, &list_val, idx)?);
+        let val = geti_meta(state, &list_val, idx)?;
+        state.stack.push(val);
         idx += 1;
     }
-    results.push(geti_meta(state, &list_val, j)?);
+    let val = geti_meta(state, &list_val, j)?;
+    state.stack.push(val);
 
-    push_results(state, a, nresults, results);
+    state.adjust_results_on_stack(a, nresults, n, first_result_pos);
     Ok(())
 }
 
