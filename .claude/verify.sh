@@ -106,6 +106,21 @@ for test_file in tests_lua/calls.lua tests_lua/closure.lua tests_lua/code.lua te
     fi
 done
 
+log_name="../logs/all_run.log"
+echo "Running all.lua ..."
+cd tests_lua
+timeout 300 ../target/release/lua all.lua > "$log_name" 2>&1 < /dev/null
+cd ..
+RUN_EXIT=$?
+if [ $RUN_EXIT -ne 0 ]; then
+    if [ $RUN_EXIT -eq 124 ]; then
+        echo "Timeout: all.lua use LUA_VM_TRACE=1 to debug"
+    fi
+    echo "ERROR: all.lua failed (exit code $RUN_EXIT)!"
+    echo "Check $log_name for details"
+    exit 2
+fi
+
 echo "Project run passed."
 
 echo "All tests passed!"
