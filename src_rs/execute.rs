@@ -2691,22 +2691,28 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let imm = opcodes::getarg_sc(inst) as i64;
-        let val = Self::read_stack(state, b).clone();
-        match val {
-            TValue::Integer(iv) => {
-                Self::write_stack(state, a, TValue::Integer(iv.wrapping_add(imm)));
-                state.pc += 1;
+        let (has_imm_result, result) = {
+            let val = Self::read_stack(state, b);
+            match val {
+                TValue::Integer(iv) => {
+                    (true, TValue::Integer(iv.wrapping_add(imm)))
+                }
+                TValue::Float(fv) => {
+                    (true, TValue::Float(fv + imm as f64))
+                }
+                _ => {
+                    (false, TValue::Nil(NilKind::Strict))
+                }
             }
-            TValue::Float(fv) => {
-                Self::write_stack(state, a, TValue::Float(fv + imm as f64));
-                state.pc += 1;
-            }
-            _ => {}
+        };
+        if has_imm_result {
+            Self::write_stack(state, a, result);
+            state.pc += 2;  // skip MMBINK
+        } else {
+            state.pc += 1;  // fall through to MMBINK
         }
-        state.pc += 1;
         Ok(())
     }
-
     fn op_addk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);

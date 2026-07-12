@@ -22,8 +22,8 @@ const LUA_SIGNATURE: &[u8] = b"\x1bLua";
 const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
 pub const LUA_MINSTACK: usize = 20;
-pub const BASIC_STACK_SIZE: usize = 2 * LUA_MINSTACK;
-pub const EXTRA_STACK: usize = 5;
+pub const BASIC_STACK_SIZE: usize = 256;
+pub const EXTRA_STACK: usize = 64;
 
 pub const MIN_STACK: usize = LUA_MINSTACK;
 pub const LUAI_MAXSTACK: usize = 1000000;
