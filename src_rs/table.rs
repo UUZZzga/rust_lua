@@ -4,7 +4,8 @@
 //!
 //! ## 设计原则
 //! - 数组部分：`Vec<TValue>`，1-based，空槽存储 `Nil(Empty)`
-//! - 哈希部分：`hashbrown::HashMap<TValue, TValue>`
+//! - 哈希部分：`Vec<(TValue, TValue)>` (hash_buckets) 按插入顺序存储，(key, value) 对
+//! - 用 `key_to_bucket: HashMap<TValue, usize>` 做 O(1) 查找
 //! - 数据通过 `Rc<RefCell<TableData>>` 共享，克隆 Table 共享同一份数据
 //! - `LuaTable` 封装为未来元方法支持预留接口
 
@@ -24,20 +25,15 @@ fn ceillog2(x: u64) -> u32 {
     }
     (x - 1).ilog2() + 1
 }
-
-/// 哈希查询辅助函数 — 跳过 tombstone (Nil(Empty))
-///
-/// 对应 C 的 `getgeneric` 语义: 返回的 slot 若 val 为 nil (dead key/tombstone)
-/// 视为不存在。Rust 用 `hashbrown::HashMap` 配合 tombstone 模拟 C 的 dead key:
-/// `set(key, nil)` 不 `remove`, 而是插入 `Nil(Empty)` 作为 tombstone,
-/// 让 `next()` 能定位已删除 key 继续遍历。
-fn hash_get(hash: &hashbrown::HashMap<TValue, TValue>, key: &TValue) -> Option<TValue> {
-    match hash.get(key) {
-        Some(v) if !matches!(v, TValue::Nil(NilKind::Empty)) => Some(v.clone()),
-        _ => None,
+fn hash_get(td: &TableData, key: &TValue) -> Option<TValue> {
+    if let Some(idx) = td.key_to_bucket.as_ref().and_then(|m| m.get(key)) {
+        let v = &td.hash_buckets[*idx].1;
+        if !matches!(v, TValue::Nil(NilKind::Empty)) {
+            return Some(v.clone());
+        }
     }
+    None
 }
-
 // ============================================================================
 // Table 方法实现
 // ============================================================================
@@ -48,12 +44,9 @@ impl Table {
             gc_header: GCObjectHeader::new(),
             data: Rc::new(RefCell::new(TableData {
                 array: Vec::new(),
-                hash: hashbrown::HashMap::new(),
                 hash_buckets: Vec::new(),
-                key_to_bucket: hashbrown::HashMap::new(),
+                key_to_bucket: None,
                 metatable: None,
-                len_hint: 0,
-                seed: 1,
             })),
         }
     }
@@ -63,12 +56,9 @@ impl Table {
             gc_header: GCObjectHeader::new(),
             data: Rc::new(RefCell::new(TableData {
                 array: (0..narray).map(|_| TValue::Nil(NilKind::Empty)).collect(),
-                hash: hashbrown::HashMap::with_capacity(nhash),
                 hash_buckets: Vec::with_capacity(nhash),
-                key_to_bucket: hashbrown::HashMap::with_capacity(nhash),
+                key_to_bucket: if nhash > 0 { Some(Box::new(hashbrown::HashMap::with_capacity(nhash))) } else { None },
                 metatable: None,
-                len_hint: narray / 2,
-                seed: 1,
             })),
         }
     }
@@ -76,10 +66,9 @@ impl Table {
     pub fn array_size(&self) -> usize {
         self.data.borrow().array.len()
     }
-
     pub fn hash_size(&self) -> usize {
-        self.data.borrow().hash.values()
-            .filter(|v| !matches!(v, TValue::Nil(NilKind::Empty)))
+        self.data.borrow().hash_buckets.iter()
+            .filter(|(_, v)| !matches!(v, TValue::Nil(NilKind::Empty)))
             .count()
     }
 
@@ -117,11 +106,9 @@ impl Table {
                         return Some(v.clone());
                     }
                 }
-                hash_get(&data.hash, key)
+                hash_get(&data, key)
             }
             TValue::Float(f) => {
-                // 对应 C: lua_numbertointeger — 浮点能精确转换为整数时，用整数键
-                // 包括 -0.0 → 0；排除 NaN/Inf 和超出 i64 范围的值
                 if let Some(i) = float_key_to_int(*f) {
                     if i > 0 {
                         let idx = (i - 1) as usize;
@@ -132,15 +119,14 @@ impl Table {
                             }
                         }
                     }
-                    hash_get(&data.hash, &TValue::Integer(i))
+                    hash_get(&data, &TValue::Integer(i))
                 } else {
-                    hash_get(&data.hash, key)
+                    hash_get(&data, key)
                 }
             }
-            _ => data.hash.get(key).cloned(),
+            _ => hash_get(&data, key),
         }
     }
-
     pub fn get_int(&self, key: i64) -> Option<TValue> {
         let data = self.data.borrow();
         if key > 0 {
@@ -152,7 +138,7 @@ impl Table {
                 }
             }
         }
-        hash_get(&data.hash, &TValue::Integer(key))
+        hash_get(&data, &TValue::Integer(key))
     }
 
     // ========================================================================
@@ -234,27 +220,26 @@ impl Table {
     /// 对应 C 的 `luaH_psetshortstr`/`newcheckedkey` 的核心行为:
     /// - 若 key 不存在且写入 nil (Strict)，则不创建 node (C 直接返回 HOK)
     ///   避免无意义 tombstone 累积
-    /// - 若 key 不存在且写入非 nil，插入 hash + 追加到 hash_buckets + 记录 key_to_bucket
+    /// - 若 key 不存在且写入非 nil，追加到 hash_buckets + 记录 key_to_bucket
     /// - 若 key 存在 (含 tombstone)，覆盖值 (nil 写为 Nil(Empty) tombstone)
-    ///
-    /// `hash_buckets`/`key_to_bucket` 让 `next(prev)` 能 O(1) 定位 prev 的位置，
-    /// 然后线性扫描 `hash_buckets[idx+1..]` 找下一个 live entry — 对应 C 的 findindex O(1)。
     fn hash_set(data: &mut TableData, key: &TValue, value: TValue, is_nil: bool) {
-        let exists = data.hash.contains_key(key);
-        if !exists && is_nil {
-            return; // C 语义: 对不存在的 key 设 nil 不创建 node
-        }
-        if !exists {
-            let idx = data.hash_buckets.len();
-            data.hash_buckets.push(key.clone());
-            data.key_to_bucket.insert(key.clone(), idx);
-        }
         let val = if is_nil { TValue::Nil(NilKind::Empty) } else { value };
-        data.hash.insert(key.clone(), val);
+        use hashbrown::hash_map::Entry;
+        let ktb = data.key_to_bucket.get_or_insert_with(|| Box::new(hashbrown::HashMap::new()));
+        match ktb.entry(key.clone()) {
+            Entry::Occupied(e) => {
+                data.hash_buckets[*e.get()].1 = val;
+            }
+            Entry::Vacant(e) => {
+                if is_nil {
+                    return; // C 语义: 对不存在的 key 设 nil 不创建 node
+                }
+                let idx = data.hash_buckets.len();
+                data.hash_buckets.push((e.key().clone(), val));
+                e.insert(idx);
+            }
+        }
     }
-
-    // ========================================================================
-    // len: # 操作符
     // ========================================================================
 
     pub fn len(&self) -> i64 {
@@ -265,14 +250,13 @@ impl Table {
         let data = self.data.borrow();
         let asize = data.array.len();
         if asize == 0 {
-            return Self::hash_boundary_impl(&data.hash, asize as i64, data.seed);
+            return match &data.key_to_bucket {
+                Some(ktb) => Self::hash_boundary_impl_key_to_bucket(ktb, asize as i64, 1u32),
+                None => asize as i64,
+            };
         }
 
-        let hint = if data.len_hint > 0 && data.len_hint <= asize {
-            data.len_hint
-        } else {
-            1
-        };
+        let hint = 1;
 
         let present_at = |i: usize| -> bool {
             i > 0 && i <= asize && !matches!(&data.array[i - 1], TValue::Nil(NilKind::Empty))
@@ -306,10 +290,10 @@ impl Table {
             return Self::bin_search_array(&data.array, 0, limit) as i64;
         }
 
-        if data.hash.is_empty() {
-            return asize as i64;
+        match &data.key_to_bucket {
+            Some(ktb) => Self::hash_boundary_impl_key_to_bucket(ktb, asize as i64, 1u32),
+            None => asize as i64,
         }
-        Self::hash_boundary_impl(&data.hash, asize as i64, data.seed)
     }
 
     fn bin_search_array(array: &[TValue], lo: usize, hi: usize) -> usize {
@@ -332,16 +316,14 @@ impl Table {
     /// 或 asize==0。此处检查 t[asize+1] 是否存在：
     /// - 不存在：asize 即边界
     /// - 存在：进入指数增长 + 二分查找
-    ///
-    /// 关键：指数增长用 `j = j*2 + (rnd & 1)`（2j 或 2j+1 随机选择），
-    /// 避免 t[2^k] 这类稀疏键让 j 永远命中 2 的幂导致增长到巨大值
-    /// （对应 nextvar.lua "testing attack on table length" 场景）。
-    fn hash_boundary_impl(
-        hash: &hashbrown::HashMap<TValue, TValue>,
+    /// 使用 key_to_bucket 代替原 hash HashMap 做 O(1) 存在性检查。
+    fn hash_boundary_impl_key_to_bucket(
+        key_to_bucket: &hashbrown::HashMap<TValue, usize>,
         asize: i64,
         seed: u32,
     ) -> i64 {
-        if !hash.contains_key(&TValue::Integer(asize + 1)) {
+        use TValue::Integer;
+        if !key_to_bucket.contains_key(&Integer(asize + 1)) {
             return asize;
         }
         let max_int = i64::MAX as u64;
@@ -352,14 +334,14 @@ impl Table {
         let incr: u64 = (rnd & mask) as u64 + 1;
         let mut j: u64 = if incr <= max_int - i { i + incr } else { i + 1 };
         rnd >>= n;
-        while hash.contains_key(&TValue::Integer(j as i64)) {
+        while key_to_bucket.contains_key(&Integer(j as i64)) {
             i = j;
             if j <= max_int / 2 - 1 {
                 j = j * 2 + (rnd & 1) as u64;
                 rnd >>= 1;
             } else {
                 j = max_int;
-                if !hash.contains_key(&TValue::Integer(j as i64)) {
+                if !key_to_bucket.contains_key(&Integer(j as i64)) {
                     break;
                 } else {
                     return j as i64;
@@ -368,7 +350,7 @@ impl Table {
         }
         while j - i > 1 {
             let m = (i + j) / 2;
-            if hash.contains_key(&TValue::Integer(m as i64)) {
+            if key_to_bucket.contains_key(&Integer(m as i64)) {
                 i = m;
             } else {
                 j = m;
@@ -390,12 +372,9 @@ impl Table {
                         return Some((TValue::Integer(i as i64 + 1), v.clone()));
                     }
                 }
-                // 用 hash_buckets 顺序找第一个 live entry
-                for k in &data.hash_buckets {
-                    if let Some(v) = data.hash.get(k) {
-                        if !matches!(v, TValue::Nil(NilKind::Empty)) {
-                            return Some((k.clone(), v.clone()));
-                        }
+                for (k, v) in &data.hash_buckets {
+                    if !matches!(v, TValue::Nil(NilKind::Empty)) {
+                        return Some((k.clone(), v.clone()));
                     }
                 }
                 None
@@ -409,28 +388,21 @@ impl Table {
                             return Some((TValue::Integer(j as i64 + 1), v.clone()));
                         }
                     }
-                    // array 部分结束, 转到哈希部分第一个 live entry
-                    for k in &data.hash_buckets {
-                        if let Some(v) = data.hash.get(k) {
-                            if !matches!(v, TValue::Nil(NilKind::Empty)) {
-                                return Some((k.clone(), v.clone()));
-                            }
+                    for (k, v) in &data.hash_buckets {
+                        if !matches!(v, TValue::Nil(NilKind::Empty)) {
+                            return Some((k.clone(), v.clone()));
                         }
                     }
                     None
                 }
                 _ => {
-                    // O(1) 定位 prev 在 hash_buckets 中的位置, 然后线性扫描找下一个 live
-                    let start = match data.key_to_bucket.get(prev) {
+                    let start = match data.key_to_bucket.as_ref().and_then(|m| m.get(prev)) {
                         Some(&i) => i + 1,
                         None => return None,
                     };
-                    for i in start..data.hash_buckets.len() {
-                        let k = &data.hash_buckets[i];
-                        if let Some(v) = data.hash.get(k) {
-                            if !matches!(v, TValue::Nil(NilKind::Empty)) {
-                                return Some((k.clone(), v.clone()));
-                            }
+                    for (k, v) in data.hash_buckets[start..].iter() {
+                        if !matches!(v, TValue::Nil(NilKind::Empty)) {
+                            return Some((k.clone(), v.clone()));
                         }
                     }
                     None
@@ -452,7 +424,7 @@ impl Table {
                 all_entries.push((TValue::Integer(i as i64 + 1), v.clone()));
             }
         }
-        for (k, v) in data.hash.drain() {
+        for (k, v) in data.hash_buckets.drain(..) {
             if matches!(v, TValue::Nil(NilKind::Empty)) {
                 continue;
             }
@@ -465,15 +437,10 @@ impl Table {
         } else {
             data.array.truncate(nasize);
         }
-        data.hash.clear();
-        data.hash.reserve(nhsize);
-        // 重建 hash_buckets / key_to_bucket — rehash 丢弃所有 tombstone
         data.hash_buckets.clear();
         data.hash_buckets.reserve(nhsize);
-        data.key_to_bucket.clear();
-        data.key_to_bucket.reserve(nhsize);
-        data.len_hint = nasize / 2;
-
+        // 不再预设 key_to_bucket: 让下面的插入循环按需创建
+        data.key_to_bucket = None;
         for (k, v) in all_entries {
             match &k {
                 TValue::Integer(i) if *i > 0 => {
@@ -482,41 +449,32 @@ impl Table {
                         data.array[idx] = v;
                     } else {
                         let bidx = data.hash_buckets.len();
-                        data.hash_buckets.push(k.clone());
-                        data.key_to_bucket.insert(k.clone(), bidx);
-                        data.hash.insert(k, v);
+                        data.hash_buckets.push((k.clone(), v));
+                        data.key_to_bucket.get_or_insert_with(|| Box::new(hashbrown::HashMap::new())).insert(k, bidx);
                     }
                 }
                 _ => {
                     let bidx = data.hash_buckets.len();
-                    data.hash_buckets.push(k.clone());
-                    data.key_to_bucket.insert(k.clone(), bidx);
-                    data.hash.insert(k, v);
+                    data.hash_buckets.push((k.clone(), v));
+                    data.key_to_bucket.get_or_insert_with(|| Box::new(hashbrown::HashMap::new())).insert(k, bidx);
                 }
             }
         }
     }
 
     pub fn resize_array(&self, nasize: usize) {
-        let nhsize = self.data.borrow().hash.len();
+        let nhsize = self.data.borrow().hash_buckets.len();
         self.rehash(nasize, nhsize);
     }
 
     pub fn mem_size(&self) -> usize {
         let data = self.data.borrow();
-        // array.capacity() 反映 Vec 实际分配的内存（含 over-allocation），
-        // 避免 big.lua 的 prog 表（263144 条目）因 Vec 倍增容量导致 gc_estimate 低估。
-        // hash.len() 避免 hashbrown 最小容量（8）导致小表 gc_estimate 高估（gc.lua:477）。
         std::mem::size_of::<Table>()
             + data.array.capacity() * std::mem::size_of::<TValue>()
-            + data.hash.len()
+            + data.hash_buckets.len()
                 * (std::mem::size_of::<TValue>() * 2 + std::mem::size_of::<u8>())
     }
 }
-
-// ============================================================================
-// LuaTable: 元方法感知封装
-// ============================================================================
 
 pub struct LuaTable {
     table: Table,
@@ -638,8 +596,7 @@ mod tests {
     #[test]
     fn test_table_with_capacity() {
         let t = Table::with_capacity(10, 8);
-        assert_eq!(t.array_size(), 10);
-        assert!(t.data.borrow().hash.capacity() >= 8);
+        assert!(t.data.borrow().hash_buckets.capacity() >= 8);
         let data = t.data.borrow();
         for v in &data.array {
             assert!(matches!(v, TValue::Nil(NilKind::Empty)));
@@ -753,7 +710,7 @@ mod tests {
     fn test_set_int_hash() {
         let t = Table::new();
         t.set_int(100, TValue::Integer(42));
-        assert!(t.data.borrow().hash.contains_key(&TValue::Integer(100)));
+        assert!(t.data.borrow().key_to_bucket.as_ref().unwrap().contains_key(&TValue::Integer(100)));
         assert_eq!(t.get_int(100), Some(TValue::Integer(42)));
     }
 

@@ -464,10 +464,10 @@ pub extern "C" fn lua_pushcclosure(L: *mut lua_State, f: lua_CFunction, n: c_int
                     .unwrap_or(TValue::Nil(NilKind::Strict)),
             );
         }
-        L.stack.push(TValue::CClosure(CClosure {
+        L.stack.push(TValue::CClosure(Box::new(CClosure {
             f,
             upvalue: upvalues,
-        }));
+        })));
     }
 }
 

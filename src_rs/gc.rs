@@ -18,12 +18,14 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
+use std::num::NonZeroUsize;
 
 // ============================================================================
 // GCObjectId — GC 对象的唯一标识
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(transparent)]
 pub struct GCObjectId(pub(crate) usize);
 
 // ============================================================================
@@ -173,7 +175,7 @@ pub fn new_ptr_id() -> usize {
 
 #[derive(Debug, Clone)]
 pub struct GCObjectHeader {
-    id: Cell<Option<GCObjectId>>,
+    id: Cell<Option<NonZeroUsize>>,
     /// 稳定的唯一标识符，用于 %p 格式输出。
     /// 克隆时保留同一值（表示同一个对象）。
     pub ptr_id: usize,
@@ -188,11 +190,11 @@ impl GCObjectHeader {
     }
 
     pub fn id(&self) -> Option<GCObjectId> {
-        self.id.get()
+        self.id.get().map(|n| GCObjectId(n.get()))
     }
 
     pub fn set_id(&self, id: GCObjectId) {
-        self.id.set(Some(id));
+        self.id.set(Some(NonZeroUsize::new(id.0).unwrap()));
     }
 
     pub fn clear_id(&self) {

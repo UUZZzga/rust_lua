@@ -123,7 +123,7 @@ impl Interpreter {
                             let mut constructed_ci: Vec<crate::state::CallInfoEntry> = Vec::new();
                             if let Some(ref err_ci) = self.l.last_error_call_info {
                                 // 找到 main chunk 帧（closure 非空的条目）和 error C 函数帧
-                                let mut main_closure: Option<crate::objects::LClosure> = None;
+                                let mut main_closure: Option<Box<crate::objects::LClosure>> = None;
                                 let mut error_pc: usize = 0;
                                 for entry in err_ci.iter() {
                                     if let Some(c) = &entry.closure {

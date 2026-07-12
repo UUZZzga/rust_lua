@@ -145,15 +145,15 @@ pub enum TValue {
     /// 表
     Table(Table),
     /// Lua 闭包
-    LClosure(LClosure),
+    LClosure(Box<LClosure>),
     /// C 闭包
-    CClosure(CClosure),
+    CClosure(Box<CClosure>),
     /// 轻量 C 函数
     LCFn(LCFunction),
     /// 用户数据
     UserData(Box<Udata>),
     /// 线程/协程
-    Thread(LuaThread),
+    Thread(Box<LuaThread>),
 }
 
 /// nil 的子变体 —— 用 enum 替代 C 的 variant bit
@@ -438,7 +438,7 @@ impl Hash for TValue {
             }
             TValue::CClosure(c) => {
                 8u8.hash(state);
-                (c as *const CClosure as usize).hash(state);
+                (&**c as *const CClosure as usize).hash(state);
             }
             TValue::LCFn(c) => {
                 9u8.hash(state);
@@ -506,22 +506,14 @@ pub struct LCFunction {
 pub struct TableData {
     /// 数组部分（1-based，索引 0 对应键 1）
     pub array: Vec<TValue>,
-    /// 哈希部分（非整数键以及超出数组范围的整数键）
-    pub hash: hashbrown::HashMap<TValue, TValue>,
-    /// 哈希 key 的插入顺序列表（含 tombstone key）— 用于 `next()` 的 O(1) findindex。
-    ///
-    /// 对应 C 的 Node 数组语义: `next(prev)` 用 prev 在数组中的位置定位, 然后向后扫描
-    /// 找下一个非空 entry。Rust 的 `hashbrown::HashMap::iter()` 无法 O(1) 定位 key 的
-    /// bucket 位置, 因此维护此顺序列表 + `key_to_bucket` 索引。
-    pub hash_buckets: Vec<TValue>,
-    /// `key → hash_buckets index` 映射 — 让 `next(prev)` 能 O(1) 定位 prev 的位置
-    pub key_to_bucket: hashbrown::HashMap<TValue, usize>,
+    /// 哈希部分：(key, value) 对 — 替代原来的 hash + hash_buckets 双结构
+    /// 通过 key_to_bucket 进行 O(1) 查找，此 Vec 保持插入顺序用于 next() 遍历
+    pub hash_buckets: Vec<(TValue, TValue)>,
+    /// `key → hash_buckets index` 映射 — 让 get / set / next 能 O(1) 定位
+    /// Option<Box<…>> 使空表不浪费 HashMap 结构体内存（~56 bytes）
+    pub key_to_bucket: Option<Box<hashbrown::HashMap<TValue, usize>>>,
     /// 元表
     pub metatable: Option<Box<Table>>,
-    /// #t 的搜索提示（内部优化）
-    pub len_hint: usize,
-    /// 哈希边界搜索的随机种子（对应 C 的 G(L)->seed，用于 hash_search 的 2j/2j+1 选择）
-    pub seed: u32,
 }
 
 /// Lua 表 —— 关联数组，包含数组部分和哈希部分。
@@ -562,12 +554,9 @@ impl Default for Table {
             gc_header: GCObjectHeader::new(),
             data: Rc::new(RefCell::new(TableData {
                 array: Vec::new(),
-                hash: hashbrown::HashMap::new(),
                 hash_buckets: Vec::new(),
-                key_to_bucket: hashbrown::HashMap::new(),
+                key_to_bucket: None,
                 metatable: None,
-                len_hint: 0,
-                seed: 1,
             })),
         }
     }
@@ -1869,7 +1858,7 @@ mod tests {
     #[test]
     fn test_luastring_long() {
         let long = LongString { hash: AtomicU64::new(0), extra: AtomicU8::new(0), contents: "a".repeat(100), ptr_id: 0 };
-        let ts = LuaString::Long(long);
+        let ts = LuaString::Long(Box::new(long));
         assert_eq!(ts.len(), 100);
         assert!(matches!(ts, LuaString::Long(_)));
     }
@@ -1895,8 +1884,8 @@ mod tests {
         let ts3 = LuaString::Short(arc3);
         assert_ne!(ts1, ts3);
 
-        let long1 = LuaString::Long(LongString { hash: AtomicU64::new(0), extra: AtomicU8::new(0), contents: "test".into(), ptr_id: 0 });
-        let long2 = LuaString::Long(LongString { hash: AtomicU64::new(0), extra: AtomicU8::new(0), contents: "test".into(), ptr_id: 0 });
+        let long1 = LuaString::Long(Box::new(LongString { hash: AtomicU64::new(0), extra: AtomicU8::new(0), contents: "test".into(), ptr_id: 0 }));
+        let long2 = LuaString::Long(Box::new(LongString { hash: AtomicU64::new(0), extra: AtomicU8::new(0), contents: "test".into(), ptr_id: 0 }));
         assert_eq!(long1, long2);
     }
 
@@ -2379,5 +2368,26 @@ mod tests {
         assert_eq!(NilKind::Strict, NilKind::Strict);
         assert_ne!(NilKind::Strict, NilKind::Empty);
         assert_eq!(NilKind::AbsentKey, NilKind::AbsentKey);
+    }
+
+    #[test]
+    fn test_type_sizes() {
+        use std::mem::size_of;
+        use std::cell::Cell;
+        use crate::gc::GCObjectId;
+        println!("TValue: {}", size_of::<TValue>());
+        println!("Table: {}", size_of::<Table>());
+        println!("  GCObjectHeader: {}", size_of::<crate::gc::GCObjectHeader>());
+        println!("  GCObjectId: {}", size_of::<GCObjectId>());
+        println!("  Option<GCObjectId>: {}", size_of::<Option<GCObjectId>>());
+        println!("  Cell<Option<GCObjectId>>: {}", size_of::<Cell<Option<GCObjectId>>>());
+        println!("  ptr_id: usize = 8");
+        println!("TableData: {}", size_of::<TableData>());
+        println!("LClosure: {}", size_of::<LClosure>());
+        println!("CClosure: {}", size_of::<CClosure>());
+        println!("LuaThread: {}", size_of::<LuaThread>());
+        println!("UserData: {}", size_of::<Udata>());
+        println!("LCFunction: {}", size_of::<LCFunction>());
+        println!("LuaString: {}", size_of::<crate::strings::LuaString>());
     }
 }

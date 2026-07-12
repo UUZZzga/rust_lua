@@ -1,7 +1,7 @@
 #!/bin/bash
 # Hook 脚本：校验命令是否符合内存限制规则
 # - 构建命令必须使用 systemd-run 绕过内存限制
-# - 测试命令必须使用 ulimit -v 524288 限制内存为 512MB
+# - 测试命令必须使用 systemd-run --user --property=LimitAS=204800 限制内存为 200MB
 # - shell/Python 脚本也会被扫描内容，防止绕过
 
 # 提取实际命令（支持 pipe 输入和交互式终端输入）
@@ -85,12 +85,12 @@ if [ -n "$SCRIPT_PATH" ]; then
         if [ "$HAS_TEST_CMD" -eq 1 ]; then
             IS_TEST_RUN=1
 
-            # shell 脚本检查 ulimit
+            # shell 脚本检查 systemd-run 内存限制
             if [ "$SCRIPT_EXT" = "sh" ]; then
-                if ! echo "$SCRIPT_CONTENT" | grep -q 'ulimit -v 524288'; then
+                if ! echo "$SCRIPT_CONTENT" | grep -q 'systemd-run.*--property=LimitAS=204800'; then
                     echo "ERROR: 脚本 $SCRIPT_PATH 包含 lua 测试执行命令但未设置内存限制"
-                    echo "请在脚本内添加: ulimit -v 524288"
-                    echo "或在运行脚本时使用: ulimit -v 524288 && $COMMAND"
+                    echo "请在脚本内使用: systemd-run --user --wait --collect --pipe --property=LimitAS=204800"
+                    echo "或在运行脚本时使用: systemd-run --user --wait --collect --pipe --property=LimitAS=204800 && <命令>"
                     exit 2
                 fi
                 if ! echo "$SCRIPT_CONTENT" | grep -q 'timeout'; then
@@ -100,28 +100,28 @@ if [ -n "$SCRIPT_PATH" ]; then
                 fi
             fi
 
-            # Python 脚本：检查是否使用了 resource 模块限制内存，或者包装了 ulimit
+            # Python 脚本：检查是否使用了 systemd-run 限制内存
             if [ "$SCRIPT_EXT" = "py" ]; then
-                # 检查是否通过 subprocess 调用时使用了 ulimit/PR_SETMM
+                # 检查是否通过 subprocess 调用时使用了 systemd-run
                 HAS_MEM_LIMIT=0
 
                 # 方法1：脚本自身通过 resource.setrlimit 限制
                 if echo "$SCRIPT_CONTENT" | grep -q 'resource\.setrlimit'; then
                     HAS_MEM_LIMIT=1
                 fi
-                # 方法2：通过 prlimit 或 ulimit 包装命令
-                if echo "$SCRIPT_CONTENT" | grep -qE '(ulimit -v 524288|prlimit.*--as=524288|PR_SETMM)'; then
+                # 方法2：通过 systemd-run 包装命令
+                if echo "$SCRIPT_CONTENT" | grep -qE 'systemd-run.*--property=LimitAS=204800'; then
                     HAS_MEM_LIMIT=1
                 fi
-                # 方法3：subprocess 调用时 shell=True 且命令中包含 ulimit
-                if echo "$SCRIPT_CONTENT" | grep -qE 'shell=True.*ulimit|ulimit.*shell=True'; then
+                # 方法3：subprocess 调用时 shell=True 且命令中包含 systemd-run
+                if echo "$SCRIPT_CONTENT" | grep -qE 'shell=True.*systemd-run|systemd-run.*shell=True'; then
                     HAS_MEM_LIMIT=1
                 fi
 
                 if [ "$HAS_MEM_LIMIT" -eq 0 ]; then
                     echo "ERROR: Python 脚本 $SCRIPT_PATH 包含 lua 测试执行但未设置内存限制"
                     echo "请在 Python 脚本中使用 resource.setrlimit 限制内存"
-                    echo "或在 subprocess 调用中使用 'ulimit -v 524288 && <命令>'"
+                    echo "或在 subprocess 调用中使用 'systemd-run --user --wait --collect --pipe --property=LimitAS=204800 && <命令>'"
                     exit 2
                 fi
             fi
@@ -155,18 +155,18 @@ if [ "$IS_BUILD" -eq 1 ]; then
     fi
 fi
 
-# 如果是测试执行命令，检查是否设置了 ulimit
+# 如果是测试执行命令，检查是否设置了 systemd-run 内存限制
 if [ "$IS_TEST_RUN" -eq 1 ]; then
     if echo "$COMMAND" | grep -q 'systemd-run.*--property=LimitAS=infinity'; then
         echo "ERROR: 测试命令禁止使用 systemd-run 绕过内存限制"
-        echo "请在命令前添加: ulimit -v 524288 && <测试命令>"
-        echo "例如: ulimit -v 524288 && ./target/debug/lua tests_lua/test.lua"
+        echo "请使用: systemd-run --user --wait --collect --pipe --property=LimitAS=204800 <测试命令>"
+        echo "例如: systemd-run --user --wait --collect --pipe --property=LimitAS=204800 ./target/debug/lua tests_lua/test.lua"
         exit 2
     fi
-    if ! echo "$COMMAND" | grep -q 'ulimit -v 524288'; then
-        echo "ERROR: 测试命令必须使用 ulimit -v 524288 限制内存为 512MB"
-        echo "请在命令前添加: ulimit -v 524288 && <测试命令>"
-        echo "例如: ulimit -v 524288 && ./target/debug/lua tests_lua/test.lua"
+    if ! echo "$COMMAND" | grep -q 'systemd-run.*--property=LimitAS=204800'; then
+        echo "ERROR: 测试命令必须使用 systemd-run --user --property=LimitAS=204800 限制内存为 200MB"
+        echo "请在命令前添加: systemd-run --user --wait --collect --pipe --property=LimitAS=204800 && <测试命令>"
+        echo "例如: systemd-run --user --wait --collect --pipe --property=LimitAS=204800 ./target/debug/lua tests_lua/test.lua"
         exit 2
     fi
     if [ "$USE_TIMEOUT" -eq 0 ]; then

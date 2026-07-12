@@ -306,7 +306,7 @@ pub struct CallInfoEntry {
     pub name: String,
     pub is_c: bool,
     /// Lua 函数引用（C 函数为 None）
-    pub closure: Option<crate::objects::LClosure>,
+    pub closure: Option<Box<crate::objects::LClosure>>,
     /// 栈帧基址（对应 C 的 ci->func + 1）
     pub base: usize,
     /// 调用时的 PC（用于计算 currentline）
@@ -1485,11 +1485,11 @@ impl LuaState {
                         value: Box::new(TValue::Nil(NilKind::Strict)),
                     })));
                 }
-                let closure = LClosure {
+                let closure = Box::new(LClosure {
                     gc_header: GCObjectHeader::new(),
                     proto: Rc::new(proto),
                     upvals: Rc::new(RefCell::new(upvals)),
-                };
+                });
                 self.stack.push(TValue::LClosure(closure));
                 0
             }
@@ -1568,11 +1568,11 @@ impl LuaState {
                             value: Box::new(TValue::Nil(NilKind::Strict)),
                         })));
                     }
-                    let closure = LClosure {
+                    let closure = Box::new(LClosure {
                         gc_header: GCObjectHeader::new(),
                         proto: Rc::new(proto),
                         upvals: Rc::new(RefCell::new(upvals)),
-                    };
+                    });
                     self.stack.push(TValue::LClosure(closure));
                     0
                 }
@@ -2551,10 +2551,9 @@ impl LuaState {
                     continue;
                 }
                 let data = data_rc.borrow();
-                for (k, v) in data.hash.iter() {
+                for (k, v) in data.hash_buckets.iter() {
                     let k_reachable = Self::is_marked(k, reachable);
                     let v_reachable = Self::is_marked(v, reachable);
-                    // 值是 GC 对象且可达，键不可达 → 标记键（ephemeron 传递性）
                     if v_reachable && !k_reachable {
                         let v_is_gc = matches!(v, TValue::Table(_) | TValue::LClosure(_) | TValue::UserData(_));
                         if v_is_gc {
@@ -2571,7 +2570,6 @@ impl LuaState {
                             changed = true;
                         }
                     }
-                    // 键可达，值不可达 → 标记值（ephemeron 传递性：键可达则值通过表被引用）
                     if k_reachable && !v_reachable {
                         worklist.push(v.clone());
                         changed = true;
@@ -2624,7 +2622,7 @@ impl LuaState {
                                     }
                                 }
                             }
-                            for (k, v) in data.hash.iter() {
+                            for (k, v) in data.hash_buckets.iter() {
                                 let k_dead = weak_k && !Self::is_marked(k, reachable);
                                 let v_dead = weak_v && !Self::is_marked(v, reachable);
                                 let remove = if weak_k && weak_v {
@@ -2645,7 +2643,17 @@ impl LuaState {
                                 data.array[idx] = TValue::Nil(NilKind::Empty);
                             }
                             for k in to_clear_hash {
-                                data.hash.remove(&k);
+                                if let Some(i) = data.key_to_bucket.as_mut().and_then(|m| m.remove(&k)) {
+                                    let last_idx = data.hash_buckets.len() - 1;
+                                    if i != last_idx {
+                                        // 把最后一个条目移到空隙，保持连续性
+                                        let key = data.hash_buckets.last().unwrap().0.clone();
+                                        data.hash_buckets.swap_remove(i);
+                                        data.key_to_bucket.as_mut().unwrap().insert(key, i);
+                                    } else {
+                                        data.hash_buckets.pop();
+                                    }
+                                }
                             }
                         }
                     }
@@ -2687,7 +2695,7 @@ impl LuaState {
         // 清除标志
         self.gc.gc_running.set(false);
         // GC 回收对象后，Rust 分配器（glibc malloc）可能仍持有释放的内存不归还操作系统。
-        // malloc_trim(0) 强制分配器将所有未使用的堆内存归还操作系统，避免在 512MB
+        // malloc_trim(0) 强制分配器将所有未使用的堆内存归还操作系统，避免在 200MB
         // 限制下因碎片化导致大分配失败（big.lua 的 48MB Vec 倍增分配）。
         unsafe { libc::malloc_trim(0); }
         result
@@ -2814,8 +2822,8 @@ impl LuaState {
         self.gc.set_collect_threshold(new_threshold);
         self.gc.set_debt(100);
         self.gc.step_accum.set(0);
-    }
 
+    }
     /// 增量 GC 步进：累加 siz 工作量，达到当前对象数时触发完整 GC 并返回 true
     pub fn step_gc(&mut self, siz: usize) -> bool {
         // generational 模式下未实现 minor collection，直接做 full collection
@@ -3132,12 +3140,10 @@ impl LuaState {
                             worklist.push(v.clone());
                         }
                     }
-                    for (k, v) in data.hash.iter() {
+                    for (k, v) in data.hash_buckets.iter() {
                         if !weak_k {
                             worklist.push(k.clone());
                         }
-                        // 弱键表（ephemeron）：值不参与标记传播，由 ephemeron 处理阶段单独处理
-                        // 弱值表：值不遍历；普通表：值遍历
                         if !weak_k && !weak_v {
                             worklist.push(v.clone());
                         }

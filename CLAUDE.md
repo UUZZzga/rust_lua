@@ -9,7 +9,7 @@ build/ 目录下为 Lua C 实现的构建目录，如果需要重新构建，也
 
 ## 内存限制规则
 
-测试时 `ulimit -v 524288`（512MB），构建时用 `systemd-run --user --wait --collect --pipe --property=LimitAS=infinity` 绕过限制。
+测试时 `systemd-run --user --wait --collect --pipe --property=LimitAS=204800`（200MB），构建时用 `systemd-run --user --wait --collect --pipe --property=LimitAS=infinity` 绕过限制。
 
 不遵守规则会被hook拦截，导致测试失败。
 

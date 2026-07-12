@@ -3,6 +3,33 @@ use std::collections::HashMap;
 use crate::state::LuaState;
 use crate::strings::LuaString;
 
+/// 编译器内部缓冲区的缓存,用于避免每次编译时重复分配 Vec/String/HashMap 的堆内存。
+/// 通过 `COMPILER_CACHE` 线程局部变量跨编译调用复用,减少 glibc 堆碎片和 RSS。
+struct CompilerCache {
+    errors: Vec<String>,
+    scanner_strings: HashMap<String, LuaString>,
+    token_text: String,
+}
+
+impl CompilerCache {
+    fn new() -> Self {
+        CompilerCache {
+            errors: Vec::new(),
+            scanner_strings: HashMap::new(),
+            token_text: String::new(),
+        }
+    }
+    fn clear(&mut self) {
+        self.errors.clear();
+        self.scanner_strings.clear();
+        self.token_text.clear();
+    }
+}
+
+thread_local! {
+    static COMPILER_CACHE: std::cell::RefCell<Option<Box<CompilerCache>>> = const { std::cell::RefCell::new(None) };
+}
+
 /// 词法分析器使用的 EOF 标记字符。
 ///
 /// 对应 C 中的 EOZ (-1)。C 的 `ls->current` 是 int 类型,可以区分 \0 (0) 和 EOZ (-1)。
@@ -221,8 +248,8 @@ pub fn format_chunk_id(chunk_name: &str) -> String {
 
 pub struct LexState<'a> {
     pub state: &'a mut LuaState,
-    pub source: String,
-    pub chunk_name: String,
+    pub source: &'a str,
+    pub chunk_name: &'a str,
     pub pos: usize,
     pub current: char,
     pub linenumber: i32,
@@ -238,26 +265,39 @@ pub struct LexState<'a> {
     /// 当前 token 的原始文本 — 对应 C 的 `luaZ_buffer(ls->buff)`。
     /// 用于错误消息中显示数字/字符串的原始文本 (如 "1.000" 而不是 "1")。
     pub token_text: String,
+    /// 编译器执行缓存句柄。持有 `CompilerCache` 的 Box,确保其堆内存不被释放。
+    /// Drop 时将内部缓冲 (`errors`、`scanner_strings`、`token_text`)回收到线程局部缓存,
+    /// 供下一次编译复用,避免每次编译时重新分配堆内存。
+    _cache: Option<Box<CompilerCache>>,
 }
-
 impl<'a> LexState<'a> {
-    pub fn new(state: &'a mut LuaState, source: &str, chunk_name: &str) -> Self {
-        let src = source.to_string();
-        let first = read_char_at(src.as_bytes(), 0);
+    pub fn new(state: &'a mut LuaState, source: &'a str, chunk_name: &'a str) -> Self {
+        // 从线程局部缓存中获取可重用的内部缓冲,避免每次编译时重新分配堆内存。
+        let (errors, scanner_strings, token_text, cache_holder) = COMPILER_CACHE.with(|c| {
+            let mut cell = c.borrow_mut();
+            let mut boxed = cell.take().unwrap_or_else(|| Box::new(CompilerCache::new()));
+            boxed.clear();
+            let errors = std::mem::take(&mut boxed.errors);
+            let scanner_strings = std::mem::take(&mut boxed.scanner_strings);
+            let token_text = std::mem::take(&mut boxed.token_text);
+            (errors, scanner_strings, token_text, boxed)
+        });
+        let first = read_char_at(source.as_bytes(), 0);
         LexState {
             state,
-            source: src,
-            chunk_name: chunk_name.to_string(),
+            source,
+            chunk_name,
             pos: 0,
             current: first,
             linenumber: 1,
             lastline: 1,
             token: Token::Eof,
             lookahead: None,
-            errors: Vec::new(),
+            errors,
             nesting_level: 0,
-            scanner_strings: HashMap::new(),
-            token_text: String::new(),
+            scanner_strings,
+            token_text,
+            _cache: Some(cache_holder),
         }
     }
 
@@ -919,6 +959,19 @@ impl<'a> LexState<'a> {
             true
         } else {
             false
+        }
+    }
+}
+
+impl<'a> Drop for LexState<'a> {
+    /// 将内部缓冲 (`errors`、`scanner_strings`、`token_text`) 回收到线程局部缓存,
+    /// 供下一次编译复用。避免 glibc 因频繁分配／释放小对象产生的堆碎片和页缓存膨胀。
+    fn drop(&mut self) {
+        if let Some(mut boxed) = self._cache.take() {
+            boxed.errors = std::mem::take(&mut self.errors);
+            boxed.scanner_strings = std::mem::take(&mut self.scanner_strings);
+            boxed.token_text = std::mem::take(&mut self.token_text);
+            COMPILER_CACHE.with(|c| *c.borrow_mut() = Some(boxed));
         }
     }
 }

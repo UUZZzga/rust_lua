@@ -1578,7 +1578,7 @@ impl VmExecutor {
         if has_lua_frame {
             let name_str = if effective_ci_len > 0 {
                 let last = &ci[effective_ci_len - 1];
-                format_func_name(&last.namewhat, &last.name, false, last.closure.as_ref())
+                format_func_name(&last.namewhat, &last.name, false, last.closure.as_deref())
             } else {
                 "main chunk".to_string()
             };
@@ -1593,7 +1593,7 @@ impl VmExecutor {
             let name_str = if level < effective_ci_len {
                 // name/namewhat/closure 来自更外层的 call_info 条目
                 let outer = &ci[effective_ci_len - 1 - level];
-                format_func_name(&outer.namewhat, &outer.name, false, outer.closure.as_ref())
+                format_func_name(&outer.namewhat, &outer.name, false, outer.closure.as_deref())
             } else {
                 // 最外层是 main chunk
                 "main chunk".to_string()
@@ -1785,6 +1785,9 @@ impl VmExecutor {
     fn write_stack(state: &mut LuaState, idx: usize, val: TValue) {
         Self::ensure_stack(state, idx);
         state.stack[idx] = val;
+        if idx >= state.top {
+            state.top = idx + 1;
+        }
     }
 
     #[allow(dead_code)]
@@ -4814,7 +4817,7 @@ impl VmExecutor {
             // GC: 在创建新闭包前检查 GC 阈值，回收不可达的旧闭包。
             // 对应 C Lua 的 luaC_checkGC（OP_CLOSURE 中调用 luaC_checkGC(L)）。
             state.maybe_collect_gc();
-            let closure = LClosure { gc_header: crate::gc::GCObjectHeader::new(), proto: Rc::new(proto), upvals: Rc::new(RefCell::new(upvals)) };
+            let closure = Box::new(LClosure { gc_header: crate::gc::GCObjectHeader::new(), proto: Rc::new(proto), upvals: Rc::new(RefCell::new(upvals)) });
             // 注册到 GC metas，使 gc_estimate 增长，让 maybe_collect_gc 的阈值检查能正常工作
             let closure_id = state.gc.register_object(std::mem::size_of::<LClosure>());
             closure.gc_header.set_id(closure_id);
@@ -6079,7 +6082,7 @@ mod tests {
     fn test_execute_call_lua_closure() {
         // Create an inner proto that just returns 0
         let inner_proto = make_proto(vec![make_bx(OpCode::RETURN0, 0, 0)], vec![]);
-        let closure = LClosure { gc_header: GCObjectHeader::new(), proto: Rc::new(inner_proto), upvals: Rc::new(RefCell::new(vec![])) };
+        let closure = Box::new(LClosure { gc_header: GCObjectHeader::new(), proto: Rc::new(inner_proto), upvals: Rc::new(RefCell::new(vec![])) });
 
         let mut stack = default_stack(10);
         stack[0] = TValue::LClosure(closure);
@@ -6092,7 +6095,7 @@ mod tests {
     #[test]
     fn test_execute_tailcall_lua_closure() {
         let inner_proto = make_proto(vec![make_bx(OpCode::RETURN0, 0, 0)], vec![]);
-        let closure = LClosure { gc_header: GCObjectHeader::new(), proto: Rc::new(inner_proto), upvals: Rc::new(RefCell::new(vec![])) };
+        let closure = Box::new(LClosure { gc_header: GCObjectHeader::new(), proto: Rc::new(inner_proto), upvals: Rc::new(RefCell::new(vec![])) });
 
         let mut stack = default_stack(10);
         stack[0] = TValue::LClosure(closure);

@@ -2610,11 +2610,11 @@ fn call_load(
                     value: Box::new(TValue::Nil(NilKind::Strict)),
                 })));
             }
-            let closure = LClosure {
+            let closure = Box::new(LClosure {
                 gc_header: GCObjectHeader::new(),
                 proto: std::rc::Rc::new(proto),
                 upvals: std::rc::Rc::new(std::cell::RefCell::new(upvals)),
-            };
+            });
             push_results(state, a, nresults, vec![TValue::LClosure(closure)]);
             Ok(())
         }
@@ -2908,7 +2908,7 @@ pub fn table_next(
             }
         }
         if !exists {
-            exists = data.hash.contains_key(&key);
+            exists = data.key_to_bucket.as_ref().map_or(false, |m| m.contains_key(&key));
         }
         exists
     };
@@ -2965,11 +2965,9 @@ fn find_first(table: &crate::table::Table) -> (Option<TValue>, TValue) {
 /// hash 部分扫描，但 Rust 用插入顺序而非 hash bucket 顺序。
 fn find_first_hash(table: &crate::table::Table) -> (Option<TValue>, TValue) {
     let data = table.data.borrow();
-    for k in &data.hash_buckets {
-        if let Some(v) = data.hash.get(k) {
-            if !matches!(v, TValue::Nil(NilKind::Empty)) {
-                return (Some(k.clone()), v.clone());
-            }
+    for (k, v) in &data.hash_buckets {
+        if !matches!(v, TValue::Nil(NilKind::Empty)) {
+            return (Some(k.clone()), v.clone());
         }
     }
     (None, TValue::Nil(NilKind::Strict))
@@ -2985,22 +2983,17 @@ fn find_next_hash(
     key: &TValue,
 ) -> (Option<TValue>, TValue) {
     let data = table.data.borrow();
-    let start_idx = match data.key_to_bucket.get(key) {
+    let start_idx = match data.key_to_bucket.as_ref().and_then(|m| m.get(key)) {
         Some(&i) => i + 1,
         None => return (None, TValue::Nil(NilKind::Strict)),
     };
-    for i in start_idx..data.hash_buckets.len() {
-        let k = &data.hash_buckets[i];
-        if let Some(v) = data.hash.get(k) {
-            if !matches!(v, TValue::Nil(NilKind::Empty)) {
-                return (Some(k.clone()), v.clone());
-            }
+    for (k, v) in data.hash_buckets[start_idx..].iter() {
+        if !matches!(v, TValue::Nil(NilKind::Empty)) {
+            return (Some(k.clone()), v.clone());
         }
     }
     (None, TValue::Nil(NilKind::Strict))
 }
-
-// ============================================================================
 // ipairs 辅助函数 — 对应 C 的 ipairsaux
 // ============================================================================
 

@@ -66,13 +66,18 @@ echo "Running project..."
 # 设置 LUA_PATH,让 require 能找到 tests_lua 目录下的模块 (如 tracegc.lua)
 export LUA_PATH="tests_lua/?.lua;./?.lua;./?/init.lua"
 
-# 测试时限制内存为 512MB
-ulimit -v 524288
+# 测试命令包装：用 systemd-run 限制内存为 200MB（CLAUDE.md 规则）
+run_test() {
+    systemd-run --user --wait --collect --pipe \
+        --property=LimitAS=204800 \
+        --working-directory="$(pwd)" \
+        "$@"
+}
 
 # big.lua 含主 chunk 中的 coroutine.yield, 必须用 coroutine.wrap 包装运行
 # (与 tests_lua/all.lua 中的调用方式一致)
 echo "Running big.lua ..."
-timeout 30 ./target/release/lua -e "local f = coroutine.wrap(assert(loadfile('tests_lua/big.lua'))); assert(f() == 'b'); assert(f() == 'a')" > logs/big_run.log 2>&1 < /dev/null
+timeout 30 run_test ./target/release/lua -e "local f = coroutine.wrap(assert(loadfile('tests_lua/big.lua'))); assert(f() == 'b'); assert(f() == 'a')" > logs/big_run.log 2>&1 < /dev/null
 RUN_EXIT=$?
 if [ $RUN_EXIT -ne 0 ]; then
     if [ $RUN_EXIT -eq 124 ]; then
@@ -91,9 +96,9 @@ for test_file in tests_lua/calls.lua tests_lua/closure.lua tests_lua/code.lua te
         # files.lua:88 的 io.stdin:seek 要求 stdin 不可 seek；/dev/null 可 seek 会导致断言失败
         # （C 版本同行为，属环境依赖）。files.lua 在 line 300 用 io.input(file) 重定向输入，
         # 不从 stdin 读取，因此空管道（立即 EOF）安全。
-        printf '' | timeout 10 ./target/release/lua "$test_file" > "$log_name" 2>&1
+        printf '' | timeout 10 run_test ./target/release/lua "$test_file" > "$log_name" 2>&1
     else
-        timeout 10 ./target/release/lua "$test_file" > "$log_name" 2>&1 < /dev/null
+        timeout 10 run_test ./target/release/lua "$test_file" > "$log_name" 2>&1 < /dev/null
     fi
     RUN_EXIT=$?
     if [ $RUN_EXIT -ne 0 ]; then
@@ -109,7 +114,7 @@ done
 log_name="../logs/all_run.log"
 echo "Running all.lua ..."
 cd tests_lua
-timeout 300 ../target/release/lua all.lua > "$log_name" 2>&1 < /dev/null
+timeout 300 run_test ../target/release/lua all.lua > "$log_name" 2>&1 < /dev/null
 cd ..
 RUN_EXIT=$?
 if [ $RUN_EXIT -ne 0 ]; then

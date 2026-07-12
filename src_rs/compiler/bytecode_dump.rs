@@ -1294,12 +1294,12 @@ use std::sync::atomic::{AtomicU64, AtomicU8};
 
 /// 创建长字符串的辅助函数
 fn make_long_string(s: &str) -> LuaString {
-    LuaString::Long(LongString {
+    LuaString::Long(Box::new(LongString {
         contents: s.to_string(),
         hash: AtomicU64::new(0),
         extra: AtomicU8::new(0),
         ptr_id: crate::gc::new_ptr_id(),
-    })
+    }))
 }
 
 /// 将 DumpedFunction 转换为 Proto

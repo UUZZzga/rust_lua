@@ -3483,12 +3483,12 @@ pub fn call_string_function(
                 TValue::LClosure(cl) => {
                     let data = crate::compiler::bytecode_dump::dump_proto(&cl.proto, strip);
                     push_results(state, a, nresults, vec![TValue::Str(
-                        crate::strings::LuaString::Long(crate::strings::LongString {
+                        crate::strings::LuaString::Long(Box::new(crate::strings::LongString {
                             contents: unsafe { String::from_utf8_unchecked(data) },
                             hash: std::sync::atomic::AtomicU64::new(0),
                             extra: std::sync::atomic::AtomicU8::new(0),
                             ptr_id: crate::gc::new_ptr_id(),
-                        })
+                        }))
                     )]);
                     Ok(())
                 }

@@ -5,7 +5,7 @@
 //! ## 核心类型
 //! - `LuaString` — 枚举类型，统一表示短/长字符串
 //!   - `LuaString::Short(Arc<ShortString>)` — 内部化（interned）的短字符串
-//!   - `LuaString::Long(LongString)` — 非内部化的长字符串
+//!   - `LuaString::Long(Box<LongString>)` — 非内部化的长字符串
 //!
 //! ## 设计原则
 //! - 短字符串通过指针相等性比较（内部化保证同一内容只有一个 Arc 实例）
@@ -90,7 +90,7 @@ impl Debug for LongString {
 #[derive(Clone, Debug)]
 pub enum LuaString {
     Short(Arc<ShortString>),
-    Long(LongString),
+    Long(Box<LongString>),
 }
 
 // ============================================================================
@@ -331,23 +331,23 @@ impl std::fmt::Display for LuaString {
 /// 创建一个长字符串对象，不预先计算哈希（惰性）。
 pub fn new_long_str(str: &str) -> LuaString {
     debug_assert!(str.len() > LUAI_MAXSHORTLEN, "长字符串长度必须大于 LUAI_MAXSHORTLEN");
-    LuaString::Long(LongString {
+    LuaString::Long(Box::new(LongString {
         hash: AtomicU64::new(0),
         extra: AtomicU8::new(0),
         contents: str.to_string(),
         ptr_id: crate::gc::new_ptr_id(),
-    })
+    }))
 }
 
 /// 从字节创建长字符串 — 用于二进制数据 (io.read 返回的二进制内容等)
 /// 对应 C Lua 中字符串可以包含任意字节 (包括 \0 和非 UTF-8 字节)
 pub fn new_long_bytes(bytes: Vec<u8>) -> LuaString {
-    LuaString::Long(LongString {
+    LuaString::Long(Box::new(LongString {
         hash: AtomicU64::new(0),
         extra: AtomicU8::new(0),
         contents: unsafe { String::from_utf8_unchecked(bytes) },
         ptr_id: crate::gc::new_ptr_id(),
-    })
+    }))
 }
 
 /// 确保长字符串有哈希值（惰性计算）。
@@ -613,12 +613,12 @@ mod tests {
     fn test_eq_str_short_vs_long() {
         let tb = StringTable::new();
         let short = tb.intern("hello");
-        let long = LuaString::Long(LongString {
+        let long = LuaString::Long(Box::new(LongString {
             hash: AtomicU64::new(0),
             extra: AtomicU8::new(0),
             contents: "hello".to_string(),
             ptr_id: 0,
-        });
+        }));
         assert!(!eq_str(&short, &long), "不同类型（短 vs 长）必须不等");
     }
 
@@ -961,12 +961,12 @@ mod tests {
     #[test]
     fn test_hash_mixed_extra_same_content() {
         let content = "a".repeat(LUAI_MAXSHORTLEN + 1);
-        let unhashed = LuaString::Long(LongString {
+        let unhashed = LuaString::Long(Box::new(LongString {
             hash: AtomicU64::new(0),
             extra: AtomicU8::new(0),
             contents: content.clone(),
             ptr_id: 0,
-        });
+        }));
         let mut ls = LongString {
             hash: AtomicU64::new(0),
             extra: AtomicU8::new(0),
@@ -974,7 +974,7 @@ mod tests {
             ptr_id: 0,
         };
         ensure_long_hash(&mut ls);
-        let hashed = LuaString::Long(ls);
+        let hashed = LuaString::Long(Box::new(ls));
 
         assert_eq!(unhashed, hashed, "同内容的不同 extra 状态应相等");
 
@@ -991,18 +991,18 @@ mod tests {
     #[test]
     fn test_hash_same_content_different_hash_field() {
         let h = rust_hash("hello");
-        let ls1 = LuaString::Long(LongString {
+        let ls1 = LuaString::Long(Box::new(LongString {
             hash: AtomicU64::new(0),
             extra: AtomicU8::new(0),
             contents: "hello".to_string(),
             ptr_id: 0,
-        });
-        let ls2 = LuaString::Long(LongString {
+        }));
+        let ls2 = LuaString::Long(Box::new(LongString {
             hash: AtomicU64::new(h),
             extra: AtomicU8::new(1),
             contents: "hello".to_string(),
             ptr_id: 0,
-        });
+        }));
 
         assert_eq!(hash_one(&ls1), hash_one(&ls2),
             "相同内容 → Hash 应相同（extra=0 实时计算 vs extra=1 缓存命中）");
