@@ -1731,55 +1731,62 @@ impl VmExecutor {
         }
     }
 
-    fn read_stack(state: &LuaState, idx: usize) -> &TValue {
+    #[inline(always)]
+    fn read_stack<'a>(state: &'a LuaState, idx: usize) -> &'a TValue {
         if idx < state.stack.len() {
             &state.stack[idx]
         } else {
-            // 打印完整的调试信息
-            eprintln!("\n=== STACK UNDERFLOW PANIC ===");
-            eprintln!("尝试访问栈索引: {}, 栈大小: {}", idx, state.stack.len());
-            eprintln!("当前 PC: {}, Base: {}", state.pc, state.base);
+            Self::read_stack_panic(state, idx)
+        }
+    }
 
-            // 打印完整指令列表，标记当前执行的指令
-            let use_color = std::env::var("TERM").ok()
-                .map(|t| t != "dumb")
-                .unwrap_or(false);
-            eprint!("{}", Self::dump_code_with_pc(state, state.pc, use_color));
+    #[cold]
+    #[inline(never)]
+    fn read_stack_panic(state: &LuaState, idx: usize) -> &TValue {
+        // 打印完整的调试信息
+        eprintln!("\n=== STACK UNDERFLOW PANIC ===");
+        eprintln!("尝试访问栈索引: {}, 栈大小: {}", idx, state.stack.len());
+        eprintln!("当前 PC: {}, Base: {}", state.pc, state.base);
 
-            // 打印完整栈内容
-            eprint!("{}", Self::dump_stack(state));
+        // 打印完整指令列表，标记当前执行的指令
+        let use_color = std::env::var("TERM").ok()
+            .map(|t| t != "dumb")
+            .unwrap_or(false);
+        eprint!("{}", Self::dump_code_with_pc(state, state.pc, use_color));
 
-            // 打印栈帧信息
-            eprintln!("\n--- 栈帧信息 ---");
-            eprintln!("  Base 寄存器起始: {}", state.base);
-            eprintln!("  参数数量: {}", state.num_params);
-            eprintln!("  是否可变参数: {}", state.is_vararg);
-            eprintln!("  代码长度: {} 条指令", state.code.len());
-            
-            // 打印 upval 信息
-            if !state.closure_upvals.is_empty() {
-                eprintln!("\n--- Upval 信息 (共 {} 个) ---", state.closure_upvals.len());
-                for (i, upval) in state.closure_upvals.iter().enumerate() {
-                    let uv_ref = upval.borrow();
-                    match &*uv_ref {
-                        UpVal::Closed { value } => {
-                            eprintln!("  upval[{}] = Closed({})", i, value);
-                        }
-                        UpVal::Open { stack_index, .. } => {
-                            let val = if *stack_index < state.stack.len() {
-                                format!("{}", state.stack[*stack_index])
-                            } else {
-                                "<invalid>".to_string()
-                            };
-                            eprintln!("  upval[{}] = Open(stack_index={}, value={})", i, stack_index, val);
-                        }
+        // 打印完整栈内容
+        eprint!("{}", Self::dump_stack(state));
+
+        // 打印栈帧信息
+        eprintln!("\n--- 栈帧信息 ---");
+        eprintln!("  Base 寄存器起始: {}", state.base);
+        eprintln!("  参数数量: {}", state.num_params);
+        eprintln!("  是否可变参数: {}", state.is_vararg);
+        eprintln!("  代码长度: {} 条指令", state.code.len());
+
+        // 打印 upval 信息
+        if !state.closure_upvals.is_empty() {
+            eprintln!("\n--- Upval 信息 (共 {} 个) ---", state.closure_upvals.len());
+            for (i, upval) in state.closure_upvals.iter().enumerate() {
+                let uv_ref = upval.borrow();
+                match &*uv_ref {
+                    UpVal::Closed { value } => {
+                        eprintln!("  upval[{}] = Closed({})", i, value);
+                    }
+                    UpVal::Open { stack_index, .. } => {
+                        let val = if *stack_index < state.stack.len() {
+                            format!("{}", state.stack[*stack_index])
+                        } else {
+                            "<invalid>".to_string()
+                        };
+                        eprintln!("  upval[{}] = Open(stack_index={}, value={})", i, stack_index, val);
                     }
                 }
             }
-
-            panic!("stack underflow: idx={}, stack.len={}, pc={}, base={}",
-                   idx, state.stack.len(), state.pc, state.base);
         }
+
+        panic!("stack underflow: idx={}, stack.len={}, pc={}, base={}",
+               idx, state.stack.len(), state.pc, state.base);
     }
 
     fn write_stack(state: &mut LuaState, idx: usize, val: TValue) {
