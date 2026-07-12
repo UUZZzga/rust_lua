@@ -995,286 +995,7 @@ impl VmExecutor {
                 OpCode::FORLOOP => Self::op_forloop(state, inst),
                 OpCode::FORPREP => Self::op_forprep(state, inst),
                 OpCode::TFORPREP => Self::op_tforprep(state, inst),
-                OpCode::TFORCALL => {
-                    let ra = Self::ra(state, inst);
-                    let c = opcodes::getarg_c(inst) as usize;
-                    let f = Self::read_stack(state, ra).clone();
-                    let s = Self::read_stack(state, ra + 1).clone();
-                    let ctrl = Self::read_stack(state, ra + 3).clone();
-                    Self::write_stack(state, ra + 3, f);
-                    Self::write_stack(state, ra + 4, s);
-                    Self::write_stack(state, ra + 5, ctrl);
-
-                    let mut func_val = Self::read_stack(state, ra + 3).clone();
-                    // 可调用表 (带 __call 元方法) 支持 — 对应 op_call 中的 luaT_tryfuncTM
-                    // string.gmatch 返回的迭代器是带 __call 的表,这里提取 __call 作为
-                    // 实际函数,原表作为 self 参数放到 ra+4,ra+5 保持 ctrl
-                    if let TValue::Table(t) = &func_val {
-                        if let Some(mt) = t.get_metatable() {
-                            let call_key = TValue::Str(state.intern_str("__call"));
-                            if let Some(call_fn) = mt.get(&call_key) {
-                                let table_clone = func_val.clone();
-                                Self::write_stack(state, ra + 4, table_clone);
-                                Self::write_stack(state, ra + 3, call_fn.clone());
-                                func_val = call_fn;
-                            }
-                        }
-                    }
-
-                    // 检查是否是 coroutine.wrap 返回的 Table（GC 跟踪，可被回收）
-                    // wrap Table 的元表只有 WRAP_MARKER，没有 __call，所以上面的 __call 检测不会匹配
-                    if let Some(idx) = crate::stdlib::coroutine_lib::get_wrap_idx(&func_val) {
-                        let tag = crate::stdlib::coroutine_lib::CORO_WRAP_CALL_BASE + idx;
-                        let nresults = (c + 1) as i32;
-                        crate::stdlib::coroutine_lib::call_wrap_call(
-                            tag, state, ra + 3, 2, nresults,
-                        )?;
-                        state.pc += 1;
-                        Ok(())
-                    } else if let TValue::LClosure(closure) = &func_val {
-                        let proto_code = closure.proto.code.clone();
-                        let proto_constants = closure.proto.constants.clone();
-                        let proto_upvals = closure.proto.upvalues.clone();
-                        let proto_protos = closure.proto.protos.clone();
-                        let proto_num_params = closure.proto.num_params;
-                        let proto_is_vararg = closure.proto.is_vararg();
-                        let proto_flag = closure.proto.flag;
-                        let proto_max_stack = closure.proto.max_stack_size;
-
-                        // 获取调用前的源和行号（用于 traceback）
-                        let (caller_source, caller_line) = if state.base > 0 && state.base <= state.stack.len() {
-                            if let TValue::LClosure(prev_closure) = &state.stack[state.base - 1] {
-                                let src = prev_closure
-                                    .proto
-                                    .source
-                                    .as_ref()
-                                    .map(|s| s.as_str().to_string())
-                                    .unwrap_or_else(|| "=?".to_string());
-                                let line = get_proto_line(&prev_closure.proto, state.pc);
-                                (src, line)
-                            } else {
-                                ("=?".to_string(), -1)
-                            }
-                        } else {
-                            ("=?".to_string(), -1)
-                        };
-
-                        let nresults = (c + 1) as i32;
-                        let fsize = proto_max_stack as usize;
-                        let nfixparams = proto_num_params as usize;
-                        let nargs = 2;
-
-                        state.call_stack.push(CallFrame {
-                            code: std::mem::take(&mut state.code),
-                            constants: std::mem::take(&mut state.constants),
-                            upval_descs: std::mem::take(&mut state.upval_descs),
-                            protos: std::mem::take(&mut state.protos),
-                            base: state.base,
-                            return_pc: state.pc + 1,
-                            return_base: ra + 3,
-                            num_results: nresults,
-                            num_params: state.num_params,
-                            is_vararg: state.is_vararg,
-                            proto_flag: state.proto_flag,
-                            nextraargs: state.nextraargs,
-                            closure_upvals: std::mem::take(&mut state.closure_upvals),
-                            tbc_list: state.tbc_list.take(),
-                        });
-
-                        // 推入调用栈信息 — 对应 C 的 funcnamefromcode 返回 "for iterator"
-                        state.call_info.push(crate::state::CallInfoEntry {
-                            source: caller_source,
-                            line: caller_line,
-                            name: "for iterator".to_string(),
-                            is_c: false,
-                            closure: Some(closure.clone()),
-                            base: state.base,
-                            saved_pc: state.pc,
-                            namewhat: "for iterator".to_string(),
-                            proto_flag: state.proto_flag,
-                            nextraargs: state.nextraargs,
-                            is_tailcall: false,
-                        });
-
-                        state.code = proto_code;
-                        state.constants = proto_constants;
-                        state.upval_descs = proto_upvals;
-                        state.protos = proto_protos;
-                        state.base = ra + 4;
-                        state.pc = 0;
-                        state.num_params = proto_num_params;
-                        state.is_vararg = proto_is_vararg;
-                        state.proto_flag = proto_flag;
-                        state.nextraargs = 0;
-                        // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
-                        state.closure_upvals = closure.upvals.borrow().clone();
-                        state.tbc_list = None;
-
-                        if proto_is_vararg {
-                            // vararg 函数: truncate 到实际参数末尾 (对应 op_call 的 vararg 分支)
-                            state.stack.truncate(ra + 4 + nargs);
-                            for i in nargs..nfixparams {
-                                Self::write_stack(state, ra + 4 + i, TValue::Nil(NilKind::Strict));
-                            }
-                        } else {
-                            let frame_end = ra + 4 + fsize;
-                            while state.stack.len() < frame_end {
-                                state.stack.push(TValue::Nil(NilKind::Strict));
-                            }
-                            for i in nargs..nfixparams {
-                                state.stack[ra + 4 + i] = TValue::Nil(NilKind::Strict);
-                            }
-                        }
-                        Ok(())
-                    } else if let TValue::LightUserData(tag) = &func_val {
-                        // 处理 LightUserData 迭代器 (ipairs/pairs 返回的迭代器)
-                        let tag_val = *tag as usize;
-                        let nresults = (c + 1) as i32;
-                        let nargs = 2; // state 和 control
-                        let result = if tag_val == crate::stdlib::base_lib::BASE_IPAIRS_AUX {
-                            // ipairs 迭代器 (ipairsaux)
-                            crate::stdlib::base_lib::call_ipairs_aux(
-                                state, ra + 3, nargs, nresults,
-                            )
-                        } else if tag_val == crate::stdlib::base_lib::BASE_NEXT_ITER {
-                            // pairs 迭代器 (next) — 直接内联以避免多层调用开销
-                            // TFORCALL 已把参数移到: ra+3=f, ra+4=状态(表), ra+5=控制变量(key)
-                            let table_val = state.stack.get(ra + 4).cloned()
-                                .unwrap_or(crate::objects::TValue::Nil(crate::objects::NilKind::Strict));
-                            let key_val = state.stack.get(ra + 5).cloned()
-                                .unwrap_or(crate::objects::TValue::Nil(crate::objects::NilKind::Strict));
-                            match &table_val {
-                                crate::objects::TValue::Table(table) => {
-                                    let (next_key, next_val) =
-                                        crate::stdlib::base_lib::table_next(table, &key_val)
-                                            .map_err(|e| VmError::RuntimeError(e.to_string()))?;
-                                    if state.stack.len() > ra + 3 {
-                                        state.stack.truncate(ra + 3);
-                                    }
-                                    while state.stack.len() < ra + 3 {
-                                        state.stack.push(crate::objects::TValue::Nil(crate::objects::NilKind::Strict));
-                                    }
-                                    match next_key {
-                                        Some(k) => {
-                                            state.stack.push(k);
-                                            state.stack.push(next_val);
-                                        }
-                                        None => {
-                                            state.stack.push(crate::objects::TValue::Nil(crate::objects::NilKind::Strict));
-                                        }
-                                    }
-                                    Ok(())
-                                }
-                                _ => Err(VmError::RuntimeError(
-                                    "bad argument #1 to 'next' (table expected)".to_string(),
-                                )),
-                            }
-                        } else if crate::stdlib::base_lib::is_base_tag(tag_val) {
-                    crate::stdlib::base_lib::call_base_function(
-                        tag_val, state, ra + 3, nargs, nresults,
-                    )
-                } else if crate::stdlib::math_lib::is_math_tag(tag_val) {
-                    crate::stdlib::math_lib::call_math_function(
-                        tag_val, state, ra + 3, nargs, nresults,
-                    )
-                } else if crate::stdlib::utf8_lib::is_utf8_tag(tag_val) {
-                    // UTF-8 迭代器 (iter_auxstrict / iter_auxlax)
-                    crate::stdlib::utf8_lib::call_utf8_function(
-                        tag_val, state, ra + 3, nargs, nresults,
-                    )
-                } else if crate::stdlib::string_lib::is_string_tag(tag_val) {
-                    // 字符串库迭代器 (gmatch_iter)
-                    crate::stdlib::string_lib::call_string_function(
-                        tag_val, state, ra + 3, nargs, nresults,
-                    )
-                } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
-                    // Coroutine 库函数（标签 700-709）
-                    crate::stdlib::coroutine_lib::call_coro_function(
-                        tag_val, state, ra + 3, nargs, nresults,
-                    )
-                } else if crate::stdlib::io_lib::is_io_function_tag(tag_val) {
-                    // I/O 库函数（标签 800-809）
-                    crate::stdlib::io_lib::call_io_function(
-                        tag_val, state, ra + 3, nargs, nresults,
-                    )
-                } else if crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
-                    // io.lines/file:lines 返回的迭代器（必须在 wrap_call 之前检查）
-                    crate::stdlib::io_lib::call_lines_iterator(
-                        tag_val, state, ra + 3, nargs, nresults,
-                    )
-                } else if crate::stdlib::coroutine_lib::is_wrap_call_tag(tag_val) {
-                    // coroutine.wrap 返回的函数（标签 710+）
-                    crate::stdlib::coroutine_lib::call_wrap_call(
-                        tag_val, state, ra + 3, nargs, nresults,
-                    )
-                } else {
-                    Ok(())
-                };
-                        match result {
-                            Ok(()) => {
-                                // TFORCALL 调用 C 函数迭代器时，adjust_results 可能
-                                // 推迟了结果放置（return hook 启用时）。TFORCALL 不经
-                                // op_call 路径，需在此完成 adjust，否则 TFORLOOP 读到
-                                // 错误的值。
-                                state.finish_pending_adjust();
-                                state.pc += 1;
-                                Ok(())
-                            }
-                            Err(e) => Err(e),
-                        }
-                    } else if let TValue::CClosure(cc) = &func_val {
-                        let nresults = (c + 1) as i32;
-                        state.call_stack.push(CallFrame {
-                            code: std::mem::take(&mut state.code),
-                            constants: std::mem::take(&mut state.constants),
-                            upval_descs: std::mem::take(&mut state.upval_descs),
-                            protos: std::mem::take(&mut state.protos),
-                            base: state.base,
-                            return_pc: state.pc + 1,
-                            return_base: ra + 3,
-                            num_results: nresults,
-                            num_params: state.num_params,
-                            is_vararg: state.is_vararg,
-                            proto_flag: state.proto_flag,
-                            nextraargs: state.nextraargs,
-                            closure_upvals: std::mem::take(&mut state.closure_upvals),
-                            tbc_list: state.tbc_list.take(),
-                        });
-                        state.base = ra + 4;
-                        Self::call_c_function(state, ra + 3, 2, nresults, cc.f)?;
-                        state.finish_pending_adjust();
-                        state.pc += 1;
-                        Ok(())
-                    } else if let TValue::LCFn(lcf) = &func_val {
-                        let nresults = (c + 1) as i32;
-                        state.call_stack.push(CallFrame {
-                            code: std::mem::take(&mut state.code),
-                            constants: std::mem::take(&mut state.constants),
-                            upval_descs: std::mem::take(&mut state.upval_descs),
-                            protos: std::mem::take(&mut state.protos),
-                            base: state.base,
-                            return_pc: state.pc + 1,
-                            return_base: ra + 3,
-                            num_results: nresults,
-                            num_params: state.num_params,
-                            is_vararg: state.is_vararg,
-                            proto_flag: state.proto_flag,
-                            nextraargs: state.nextraargs,
-                            closure_upvals: std::mem::take(&mut state.closure_upvals),
-                            tbc_list: state.tbc_list.take(),
-                        });
-                        state.base = ra + 4;
-                        Self::call_c_function(state, ra + 3, 2, nresults, lcf.func)?;
-                        state.finish_pending_adjust();
-                        state.pc += 1;
-                        Ok(())
-                    } else {
-                        // 非可调用对象: 抛出 "attempt to call a {type} value" 错误
-                        // 对应 C 的 luaG_callerror
-                        let type_name = state.typename(func_val.ty());
-                        Err(VmError::RuntimeError(call_error_message(state, &type_name)))
-                    }
-                }
+                OpCode::TFORCALL => Self::op_tforcall(state, inst),
                 OpCode::TFORLOOP => Self::op_tforloop(state, inst),
                 OpCode::SETLIST => Self::op_setlist(state, inst),
                 OpCode::CLOSURE => Self::op_closure(state, inst),
@@ -1713,21 +1434,41 @@ impl VmExecutor {
     // 辅助方法
     // ========================================================================
 
+    #[inline]
     fn ra(state: &LuaState, inst: Instruction) -> usize {
         state.base + opcodes::getarg_a(inst) as usize
     }
-
+    #[inline]
     fn rb(state: &LuaState, inst: Instruction) -> usize {
         state.base + opcodes::getarg_b(inst) as usize
     }
-
+    #[inline]
     fn rc(state: &LuaState, inst: Instruction) -> usize {
         state.base + opcodes::getarg_c(inst) as usize
     }
 
+
+    #[inline]
     fn ensure_stack(state: &mut LuaState, idx: usize) {
         if idx >= state.stack.len() {
-            state.stack.resize(idx + 1, TValue::Nil(NilKind::Strict));
+            Self::write_stack_grow(state, idx);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn write_stack_grow(state: &mut LuaState, idx: usize) {
+        state.stack.resize(idx + 1, TValue::Nil(NilKind::Strict));
+    }
+
+    #[inline]
+    fn write_stack(state: &mut LuaState, idx: usize, val: TValue) {
+        if idx >= state.stack.len() {
+            Self::write_stack_grow(state, idx);
+        }
+        state.stack[idx] = val;
+        if idx >= state.top {
+            state.top = idx + 1;
         }
     }
 
@@ -1789,13 +1530,6 @@ impl VmExecutor {
                idx, state.stack.len(), state.pc, state.base);
     }
 
-    fn write_stack(state: &mut LuaState, idx: usize, val: TValue) {
-        Self::ensure_stack(state, idx);
-        state.stack[idx] = val;
-        if idx >= state.top {
-            state.top = idx + 1;
-        }
-    }
 
     #[allow(dead_code)]
     fn push_stack(state: &mut LuaState, val: TValue) -> usize {
@@ -2426,6 +2160,7 @@ impl VmExecutor {
     // 操作码实现
     // ========================================================================
 
+#[inline]
     fn op_move(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2435,6 +2170,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_loadi(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let val = opcodes::getarg_sbx(inst) as i64;
@@ -2443,6 +2179,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_loadf(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let val = opcodes::getarg_sbx(inst) as f64;
@@ -2451,6 +2188,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_loadk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let idx = opcodes::getarg_bx(inst) as usize;
@@ -2471,6 +2209,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_loadfalse(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         Self::write_stack(state, a, TValue::Boolean(false));
@@ -2492,6 +2231,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_loadnil(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst);
@@ -2543,6 +2283,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_gettabup(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as usize;
@@ -2563,6 +2304,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_gettable(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2575,6 +2317,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_geti(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2587,6 +2330,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_getfield(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2621,6 +2365,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_settable(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2633,6 +2378,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_seti(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as i64;
@@ -2644,6 +2390,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_setfield(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b_key = opcodes::getarg_b(inst) as usize;
@@ -2679,6 +2426,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_self(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2694,6 +2442,7 @@ impl VmExecutor {
 
     // ---- 算术运算 ----
 
+#[inline]
     fn op_addi(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2720,6 +2469,7 @@ impl VmExecutor {
         }
         Ok(())
     }
+#[inline]
     fn op_addk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2736,6 +2486,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_subk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2752,6 +2503,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_mulk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2905,6 +2657,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_add(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         // C: op_arith — if both numbers, compute and pc++ (skip MMBIN); else fall through
         let a = Self::ra(state, inst);
@@ -2922,6 +2675,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_sub(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2938,6 +2692,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_mul(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2985,6 +2740,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_div(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -3169,6 +2925,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_unm(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         // C: ra = RA(i), rb = vRB(i)
         // C: if integer: setivalue(s2v(ra), -ib)
@@ -3207,6 +2964,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_not(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -3217,6 +2975,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_len(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         // C: StkId ra = RA(i); Protect(luaV_objlen(L, ra, vRB(i)));
         let a = Self::ra(state, inst);
@@ -3359,6 +3118,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_jmp(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let sj = opcodes::getarg_sj(inst);
         state.pc = ((state.pc as i32) + sj + 1) as usize;
@@ -3367,6 +3127,7 @@ impl VmExecutor {
 
     // ---- 比较运算 ----
 
+#[inline]
     fn op_eq(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         // C: StkId ra = RA(i); TValue *rb = vRB(i);
         //     Protect(cond = luaV_equalobj(L, s2v(ra), rb));
@@ -3379,6 +3140,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_lt(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         // C: op_order(L, l_lti, LTnum, lessthanothers)
         // lessthanothers: if (string) strcmp; else luaT_callorderTM(L, l, r, TM_LT)
@@ -3397,6 +3159,7 @@ impl VmExecutor {
         Ok(())
     }
 
+#[inline]
     fn op_le(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         // C: op_order(L, l_lei, LEnum, lessequalothers)
         // lessequalothers: if (string) strcmp; else luaT_callorderTM(L, l, r, TM_LE)
@@ -4724,17 +4487,261 @@ impl VmExecutor {
     }
 
     fn op_tforcall(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
-        // 对应 C OP_TFORCALL: ra=iterator, ra+1=state, ra+2=closing(TBC), ra+3=control
-        // 调用 ra+3 = function(ra+4=state, ra+5=control), 2 个参数
         let ra = Self::ra(state, inst);
+        let c = opcodes::getarg_c(inst) as usize;
         let f = Self::read_stack(state, ra).clone();
         let s = Self::read_stack(state, ra + 1).clone();
         let ctrl = Self::read_stack(state, ra + 3).clone();
         Self::write_stack(state, ra + 3, f);
         Self::write_stack(state, ra + 4, s);
         Self::write_stack(state, ra + 5, ctrl);
-        state.pc += 1;
-        Ok(())
+
+        let mut func_val = Self::read_stack(state, ra + 3).clone();
+        // 可调用表 (带 __call 元方法) 支持 — 对应 op_call 中的 luaT_tryfuncTM
+        // string.gmatch 返回的迭代器是带 __call 的表,这里提取 __call 作为
+        // 实际函数,原表作为 self 参数放到 ra+4,ra+5 保持 ctrl
+        if let TValue::Table(t) = &func_val {
+            if let Some(mt) = t.get_metatable() {
+                let call_key = TValue::Str(state.intern_str("__call"));
+                if let Some(call_fn) = mt.get(&call_key) {
+                    let table_clone = func_val.clone();
+                    Self::write_stack(state, ra + 4, table_clone);
+                    Self::write_stack(state, ra + 3, call_fn.clone());
+                    func_val = call_fn;
+                }
+            }
+        }
+
+        // 检查是否是 coroutine.wrap 返回的 Table（GC 跟踪，可被回收）
+        // wrap Table 的元表只有 WRAP_MARKER，没有 __call，所以上面的 __call 检测不会匹配
+        if let Some(idx) = crate::stdlib::coroutine_lib::get_wrap_idx(&func_val) {
+            let tag = crate::stdlib::coroutine_lib::CORO_WRAP_CALL_BASE + idx;
+            let nresults = (c + 1) as i32;
+            crate::stdlib::coroutine_lib::call_wrap_call(
+                tag, state, ra + 3, 2, nresults,
+            )?;
+            state.pc += 1;
+            return Ok(());
+        }
+
+        match &func_val {
+            TValue::LClosure(closure) => {
+                let proto_code = closure.proto.code.clone();
+                let proto_constants = closure.proto.constants.clone();
+                let proto_upvals = closure.proto.upvalues.clone();
+                let proto_protos = closure.proto.protos.clone();
+                let proto_num_params = closure.proto.num_params;
+                let proto_is_vararg = closure.proto.is_vararg();
+                let proto_flag = closure.proto.flag;
+                let proto_max_stack = closure.proto.max_stack_size;
+
+                // 获取调用前的源和行号（用于 traceback）
+                let (caller_source, caller_line) = if state.base > 0 && state.base <= state.stack.len() {
+                    if let TValue::LClosure(prev_closure) = &state.stack[state.base - 1] {
+                        let src = prev_closure
+                            .proto
+                            .source
+                            .as_ref()
+                            .map(|s| s.as_str().to_string())
+                            .unwrap_or_else(|| "=?".to_string());
+                        let line = get_proto_line(&prev_closure.proto, state.pc);
+                        (src, line)
+                    } else {
+                        ("=?".to_string(), -1)
+                    }
+                } else {
+                    ("=?".to_string(), -1)
+                };
+
+                let nresults = (c + 1) as i32;
+                let fsize = proto_max_stack as usize;
+                let nfixparams = proto_num_params as usize;
+                let nargs = 2;
+
+                state.call_stack.push(CallFrame {
+                    code: std::mem::take(&mut state.code),
+                    constants: std::mem::take(&mut state.constants),
+                    upval_descs: std::mem::take(&mut state.upval_descs),
+                    protos: std::mem::take(&mut state.protos),
+                    base: state.base,
+                    return_pc: state.pc + 1,
+                    return_base: ra + 3,
+                    num_results: nresults,
+                    num_params: state.num_params,
+                    is_vararg: state.is_vararg,
+                    proto_flag: state.proto_flag,
+                    nextraargs: state.nextraargs,
+                    closure_upvals: std::mem::take(&mut state.closure_upvals),
+                    tbc_list: state.tbc_list.take(),
+                });
+
+                // 推入调用栈信息 — 对应 C 的 funcnamefromcode 返回 "for iterator"
+                state.call_info.push(crate::state::CallInfoEntry {
+                    source: caller_source,
+                    line: caller_line,
+                    name: "for iterator".to_string(),
+                    is_c: false,
+                    closure: Some(closure.clone()),
+                    base: state.base,
+                    saved_pc: state.pc,
+                    namewhat: "for iterator".to_string(),
+                    proto_flag: state.proto_flag,
+                    nextraargs: state.nextraargs,
+                    is_tailcall: false,
+                });
+
+                state.code = proto_code;
+                state.constants = proto_constants;
+                state.upval_descs = proto_upvals;
+                state.protos = proto_protos;
+                state.base = ra + 4;
+                state.pc = 0;
+                state.num_params = proto_num_params;
+                state.is_vararg = proto_is_vararg;
+                state.proto_flag = proto_flag;
+                state.nextraargs = 0;
+                // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
+                state.closure_upvals = closure.upvals.borrow().clone();
+                state.tbc_list = None;
+
+                if proto_is_vararg {
+                    // vararg 函数: truncate 到实际参数末尾 (对应 op_call 的 vararg 分支)
+                    state.stack.truncate(ra + 4 + nargs);
+                    for i in nargs..nfixparams {
+                        Self::write_stack(state, ra + 4 + i, TValue::Nil(NilKind::Strict));
+                    }
+                } else {
+                    let frame_end = ra + 4 + fsize;
+                    while state.stack.len() < frame_end {
+                        state.stack.push(TValue::Nil(NilKind::Strict));
+                    }
+                    for i in nargs..nfixparams {
+                        state.stack[ra + 4 + i] = TValue::Nil(NilKind::Strict);
+                    }
+                }
+                Ok(())
+            }
+            TValue::LightUserData(tag) => {
+                // 处理 LightUserData 迭代器 (ipairs/pairs 返回的迭代器)
+                let tag_val = *tag as usize;
+                let nresults = (c + 1) as i32;
+                let nargs = 2;
+                let result = if tag_val == crate::stdlib::base_lib::BASE_IPAIRS_AUX {
+                    crate::stdlib::base_lib::call_ipairs_aux(state, ra + 3, nargs, nresults)
+                } else if tag_val == crate::stdlib::base_lib::BASE_NEXT_ITER {
+                    // pairs 迭代器 (next) — 直接内联以避免多层调用开销
+                    let table_val = state.stack.get(ra + 4).cloned()
+                        .unwrap_or(TValue::Nil(NilKind::Strict));
+                    let key_val = state.stack.get(ra + 5).cloned()
+                        .unwrap_or(TValue::Nil(NilKind::Strict));
+                    match &table_val {
+                        TValue::Table(table) => {
+                            let (next_key, next_val) =
+                                crate::stdlib::base_lib::table_next(table, &key_val)
+                                    .map_err(|e| VmError::RuntimeError(e.to_string()))?;
+                            if state.stack.len() > ra + 3 {
+                                state.stack.truncate(ra + 3);
+                            }
+                            while state.stack.len() < ra + 3 {
+                                state.stack.push(TValue::Nil(NilKind::Strict));
+                            }
+                            match next_key {
+                                Some(k) => {
+                                    state.stack.push(k);
+                                    state.stack.push(next_val);
+                                }
+                                None => {
+                                    state.stack.push(TValue::Nil(NilKind::Strict));
+                                }
+                            }
+                            Ok(())
+                        }
+                        _ => Err(VmError::RuntimeError(
+                            "bad argument #1 to 'next' (table expected)".to_string(),
+                        )),
+                    }
+                } else if crate::stdlib::base_lib::is_base_tag(tag_val) {
+                    crate::stdlib::base_lib::call_base_function(tag_val, state, ra + 3, nargs, nresults)
+                } else if crate::stdlib::math_lib::is_math_tag(tag_val) {
+                    crate::stdlib::math_lib::call_math_function(tag_val, state, ra + 3, nargs, nresults)
+                } else if crate::stdlib::utf8_lib::is_utf8_tag(tag_val) {
+                    crate::stdlib::utf8_lib::call_utf8_function(tag_val, state, ra + 3, nargs, nresults)
+                } else if crate::stdlib::string_lib::is_string_tag(tag_val) {
+                    crate::stdlib::string_lib::call_string_function(tag_val, state, ra + 3, nargs, nresults)
+                } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
+                    crate::stdlib::coroutine_lib::call_coro_function(tag_val, state, ra + 3, nargs, nresults)
+                } else if crate::stdlib::io_lib::is_io_function_tag(tag_val) {
+                    crate::stdlib::io_lib::call_io_function(tag_val, state, ra + 3, nargs, nresults)
+                } else if crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
+                    crate::stdlib::io_lib::call_lines_iterator(tag_val, state, ra + 3, nargs, nresults)
+                } else if crate::stdlib::coroutine_lib::is_wrap_call_tag(tag_val) {
+                    crate::stdlib::coroutine_lib::call_wrap_call(tag_val, state, ra + 3, nargs, nresults)
+                } else {
+                    Ok(())
+                };
+                match result {
+                    Ok(()) => {
+                        state.finish_pending_adjust();
+                        state.pc += 1;
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            TValue::CClosure(cc) => {
+                let nresults = (c + 1) as i32;
+                state.call_stack.push(CallFrame {
+                    code: std::mem::take(&mut state.code),
+                    constants: std::mem::take(&mut state.constants),
+                    upval_descs: std::mem::take(&mut state.upval_descs),
+                    protos: std::mem::take(&mut state.protos),
+                    base: state.base,
+                    return_pc: state.pc + 1,
+                    return_base: ra + 3,
+                    num_results: nresults,
+                    num_params: state.num_params,
+                    is_vararg: state.is_vararg,
+                    proto_flag: state.proto_flag,
+                    nextraargs: state.nextraargs,
+                    closure_upvals: std::mem::take(&mut state.closure_upvals),
+                    tbc_list: state.tbc_list.take(),
+                });
+                state.base = ra + 4;
+                Self::call_c_function(state, ra + 3, 2, nresults, cc.f)?;
+                state.finish_pending_adjust();
+                state.pc += 1;
+                Ok(())
+            }
+            TValue::LCFn(lcf) => {
+                let nresults = (c + 1) as i32;
+                state.call_stack.push(CallFrame {
+                    code: std::mem::take(&mut state.code),
+                    constants: std::mem::take(&mut state.constants),
+                    upval_descs: std::mem::take(&mut state.upval_descs),
+                    protos: std::mem::take(&mut state.protos),
+                    base: state.base,
+                    return_pc: state.pc + 1,
+                    return_base: ra + 3,
+                    num_results: nresults,
+                    num_params: state.num_params,
+                    is_vararg: state.is_vararg,
+                    proto_flag: state.proto_flag,
+                    nextraargs: state.nextraargs,
+                    closure_upvals: std::mem::take(&mut state.closure_upvals),
+                    tbc_list: state.tbc_list.take(),
+                });
+                state.base = ra + 4;
+                Self::call_c_function(state, ra + 3, 2, nresults, lcf.func)?;
+                state.finish_pending_adjust();
+                state.pc += 1;
+                Ok(())
+            }
+            _ => {
+                // 非可调用对象: 抛出 "attempt to call a {type} value" 错误
+                let type_name = state.typename(func_val.ty());
+                Err(VmError::RuntimeError(call_error_message(state, &type_name)))
+            }
+        }
     }
 
     fn op_tforloop(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
