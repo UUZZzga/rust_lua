@@ -18,7 +18,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
-use std::num::NonZeroUsize;
+use std::num::NonZeroU32;
 
 // ============================================================================
 // GCObjectId — GC 对象的唯一标识
@@ -26,7 +26,7 @@ use std::num::NonZeroUsize;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[repr(transparent)]
-pub struct GCObjectId(pub(crate) usize);
+pub struct GCObjectId(pub(crate) u32);
 
 // ============================================================================
 // GCColor — 对象颜色 (三色标记)
@@ -166,19 +166,19 @@ pub trait GCObject {
 
 /// 全局指针 ID 计数器 — 用于 %p 格式输出稳定的唯一标识符。
 /// 对应 C 实现中对象的堆地址。
-static PTR_ID_COUNTER: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+static PTR_ID_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 /// 分配一个新的唯一指针 ID（对应 C 中堆对象的地址）
-pub fn new_ptr_id() -> usize {
+pub fn new_ptr_id() -> u32 {
     PTR_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 #[derive(Debug, Clone)]
 pub struct GCObjectHeader {
-    id: Cell<Option<NonZeroUsize>>,
+    id: Cell<Option<NonZeroU32>>,
     /// 稳定的唯一标识符，用于 %p 格式输出。
     /// 克隆时保留同一值（表示同一个对象）。
-    pub ptr_id: usize,
+    pub ptr_id: u32,
 }
 
 impl GCObjectHeader {
@@ -194,7 +194,7 @@ impl GCObjectHeader {
     }
 
     pub fn set_id(&self, id: GCObjectId) {
-        self.id.set(Some(NonZeroUsize::new(id.0).unwrap()));
+        self.id.set(Some(NonZeroU32::new(id.0).unwrap()));
     }
 
     pub fn clear_id(&self) {
@@ -217,9 +217,9 @@ pub struct GCState {
     pub phase: Cell<GCPhase>,
     pub mode: Cell<GCMode>,
     pub current_white: Cell<u8>,
-    next_id: Cell<usize>,
+    next_id: Cell<u32>,
     metas: RefCell<Vec<Option<GCObjectMeta>>>,
-    free_ids: RefCell<Vec<usize>>,
+    free_ids: RefCell<Vec<u32>>,
     gray: RefCell<VecDeque<GCObjectId>>,
     gray_again: RefCell<VecDeque<GCObjectId>>,
     weak: RefCell<VecDeque<GCObjectId>>,
@@ -340,10 +340,10 @@ impl GCState {
         let id_val = self.next_id.get();
         let id = GCObjectId(id_val);
         self.next_id.set(id_val + 1);
-        while metas.len() <= id.0 {
+        while metas.len() <= id.0 as usize {
             metas.push(None);
         }
-        metas[id.0] = Some(meta);
+        metas[id.0 as usize] = Some(meta);
 
         let current = self.gc_debt.get();
         let charged = size.max(64) as isize;
@@ -356,20 +356,20 @@ impl GCState {
 
     pub fn unregister_object(&self, id: GCObjectId) {
         let mut metas = self.metas.borrow_mut();
-        if id.0 < metas.len() {
-            if let Some(ref meta) = metas[id.0] {
+        if (id.0 as usize) < metas.len() {
+            if let Some(meta) = &metas[id.0 as usize] {
                 let charged = meta.size.max(64);
                 let estimate = self.gc_estimate.get();
                 self.gc_estimate.set(estimate.saturating_sub(charged));
             }
-            metas[id.0] = None;
+            metas[id.0 as usize] = None;
         }
     }
 
     pub(crate) fn meta(&self, id: GCObjectId) -> Option<std::cell::Ref<'_, GCObjectMeta>> {
         let metas = self.metas.borrow();
-        if id.0 < metas.len() && metas[id.0].is_some() {
-            Some(std::cell::Ref::map(metas, |m| m[id.0].as_ref().unwrap()))
+        if (id.0 as usize) < metas.len() && metas[id.0 as usize].is_some() {
+            Some(std::cell::Ref::map(metas, |m| m[id.0 as usize].as_ref().unwrap()))
         } else {
             None
         }
@@ -377,8 +377,8 @@ impl GCState {
 
     pub(crate) fn meta_mut(&self, id: GCObjectId) -> Option<std::cell::RefMut<'_, GCObjectMeta>> {
         let metas = self.metas.borrow_mut();
-        if id.0 < metas.len() && metas[id.0].is_some() {
-            Some(std::cell::RefMut::map(metas, |m| m[id.0].as_mut().unwrap()))
+        if (id.0 as usize) < metas.len() && metas[id.0 as usize].is_some() {
+            Some(std::cell::RefMut::map(metas, |m| m[id.0 as usize].as_mut().unwrap()))
         } else {
             None
         }
@@ -386,7 +386,7 @@ impl GCState {
 
     pub fn is_registered(&self, id: GCObjectId) -> bool {
         let metas = self.metas.borrow();
-        id.0 < metas.len() && metas[id.0].is_some()
+        (id.0 as usize) < metas.len() && metas[id.0 as usize].is_some()
     }
 
     /// 返回已注册对象数量（含已释放但未复用的 ID 槽位）

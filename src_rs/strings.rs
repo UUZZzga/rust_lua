@@ -61,7 +61,7 @@ pub struct LongString {
     pub contents: String,
     /// 稳定的唯一标识符，用于 %p 格式输出。
     /// 克隆时保留同一值（表示同一个字符串实例）。
-    pub ptr_id: usize,
+    pub ptr_id: u32,
 }
 
 impl Clone for LongString {

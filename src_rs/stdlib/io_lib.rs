@@ -141,7 +141,7 @@ fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
 
 /// 检查参数是否是 FILE* userdata 并返回其 ptr_id
 /// 对应 C 的 tolstream -> luaL_checkudata
-fn check_file_arg(state: &LuaState, a: usize, nargs: usize, fname: &str) -> Result<usize, VmError> {
+fn check_file_arg(state: &LuaState, a: usize, nargs: usize, fname: &str) -> Result<u32, VmError> {
     if nargs < 1 {
         return Err(VmError::RuntimeError(format!(
             "bad argument #1 to '{}' (FILE* expected, got no value)",
@@ -175,12 +175,12 @@ fn check_file_arg(state: &LuaState, a: usize, nargs: usize, fname: &str) -> Resu
 }
 
 /// 从 UserData ptr_id 获取 FILE* — 不检查是否已关闭
-fn get_file_ptr(state: &LuaState, ptr_id: usize) -> Option<*mut libc::FILE> {
+fn get_file_ptr(state: &LuaState, ptr_id: u32) -> Option<*mut libc::FILE> {
     state.file_handles.get(&ptr_id).copied()
 }
 
 /// 判断文件是否已关闭 (file_handles 中无对应 ptr_id)
-fn is_closed(state: &LuaState, ptr_id: usize) -> bool {
+fn is_closed(state: &LuaState, ptr_id: u32) -> bool {
     !state.file_handles.contains_key(&ptr_id)
 }
 
@@ -1632,7 +1632,7 @@ fn call_file_setvbuf(
 /// 每次调用迭代器时, 从 state 中的迭代器表取出状态
 #[derive(Clone, Debug)]
 pub struct LinesState {
-    pub file_ptr_id: usize,        // 文件的 UserData ptr_id
+    pub file_ptr_id: u32,
     pub formats: Vec<TValue>,      // 读取格式
     pub to_close: bool,            // 完成后是否关闭文件
     pub finished: bool,            // 是否已完成
@@ -2044,7 +2044,7 @@ fn get_current_input_userdata(state: &mut LuaState) -> TValue {
 }
 
 /// 获取 io.stdin 的 ptr_id
-fn get_stdin_ptr_id(state: &LuaState) -> usize {
+fn get_stdin_ptr_id(state: &LuaState) -> u32 {
     let io_key = TValue::Str(state.intern_str("io"));
     if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
         let stdin_key = TValue::Str(state.intern_str("stdin"));
