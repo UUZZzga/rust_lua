@@ -11132,7 +11132,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
 
     let proto = new_fs.proto;
     let p_idx = fs.proto.protos.len() as i32;
-    fs.proto.protos.push(proto);
+    fs.proto.protos.push(std::rc::Rc::new(proto));
     let r = target.unwrap_or_else(|| fs.alloc_reg());
     fs.code_abx(OpCode::CLOSURE, r, p_idx);
     r

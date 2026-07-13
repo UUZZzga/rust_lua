@@ -1338,7 +1338,7 @@ pub fn dumped_to_proto(df: &DumpedFunction) -> Proto {
     }).collect();
 
     // protos: 递归转换
-    proto.protos = df.protos.iter().map(|p| dumped_to_proto(p)).collect();
+    proto.protos = df.protos.iter().map(|p| std::rc::Rc::new(dumped_to_proto(p))).collect();
 
     // source
     proto.source = df.source.as_ref().map(|s| make_long_string(s));

@@ -2855,7 +2855,7 @@ pub fn intern_proto_strings(proto: &mut Proto, state: &LuaState) {
     }
     // 递归处理子 proto
     for p in &mut proto.protos {
-        intern_proto_strings(p, state);
+        intern_proto_strings(std::rc::Rc::make_mut(p), state);
     }
 }
 

@@ -60,7 +60,7 @@ pub struct PcallProtection {
     pub saved_code: Vec<Instruction>,
     pub saved_constants: Vec<TValue>,
     pub saved_upval_descs: Vec<UpvalDesc>,
-    pub saved_protos: Vec<Proto>,
+    pub saved_protos: Vec<Rc<Proto>>,
     pub saved_base: usize,
     pub saved_pc: usize,
     pub saved_num_params: u8,
@@ -130,7 +130,7 @@ pub struct LuaState {
     pub constants: Vec<TValue>,
     pub code: Vec<Instruction>,
     pub upval_descs: Vec<UpvalDesc>,
-    pub protos: Vec<Proto>,
+    pub protos: Vec<Rc<Proto>>,
     pub top: usize,
     pub base: usize,
     pub pc: usize,
@@ -176,16 +176,16 @@ pub struct LuaState {
     pub io_output: Option<Box<dyn Write>>,
     /// 文件句柄注册表 — key 是 UserData 的 gc_header.ptr_id，value 是 FILE* 指针
     /// 对应 C 的 luaL_Stream 中存储的 FILE*。UserData 本身不存数据，通过此 map 关联。
-    pub file_handles: std::collections::HashMap<usize, *mut libc::FILE>,
+    pub file_handles: std::collections::HashMap<u32, *mut libc::FILE>,
     /// 标记哪些文件句柄是 io.popen 创建的（关闭时用 pclose 而非 fclose）
     /// 对应 C 的 LStream.closef = &io_pclose
-    pub popen_handles: std::collections::HashSet<usize>,
+    pub popen_handles: std::collections::HashSet<u32>,
     /// 当前默认输入流的 UserData ptr_id — None 表示使用 io.stdin
     /// 对应 C 的 registry[IO_INPUT]
-    pub io_input_handle: Option<usize>,
+    pub io_input_handle: Option<u32>,
     /// 当前默认输出流的 UserData ptr_id — None 表示使用 io.stdout
     /// 对应 C 的 registry[IO_OUTPUT]
-    pub io_output_handle: Option<usize>,
+    pub io_output_handle: Option<u32>,
     pub global_state: Rc<GlobalState>,
     pub ci: Option<Box<CallInfo>>,
     /// 调用栈信息，用于构建堆栈回溯 — 对应 C 的 CallInfo 链表
@@ -2564,7 +2564,7 @@ impl LuaState {
                                 _ => None,
                             };
                             if let Some(id) = k_id {
-                                reachable.insert(id.0);
+                                reachable.insert(id.0 as usize);
                             }
                             worklist.push(k.clone());
                             changed = true;
@@ -2667,9 +2667,9 @@ impl LuaState {
     /// 非 GC 对象（字符串、数字、布尔、nil）总是视为存活
     fn is_marked(val: &TValue, reachable: &HashSet<usize>) -> bool {
         match val {
-            TValue::Table(t) => t.gc_header.id().map_or(true, |id| reachable.contains(&id.0)),
-            TValue::LClosure(c) => c.gc_header.id().map_or(true, |id| reachable.contains(&id.0)),
-            TValue::UserData(u) => u.gc_header.id().map_or(true, |id| reachable.contains(&id.0)),
+            TValue::Table(t) => t.gc_header.id().map_or(true, |id| reachable.contains(&(id.0 as usize))),
+            TValue::LClosure(c) => c.gc_header.id().map_or(true, |id| reachable.contains(&(id.0 as usize))),
+            TValue::UserData(u) => u.gc_header.id().map_or(true, |id| reachable.contains(&(id.0 as usize))),
             _ => true,
         }
     }
@@ -2861,7 +2861,7 @@ impl LuaState {
         let mut keep: Vec<Table> = Vec::new();
 
         for t in self.finobj_list.drain(..) {
-            let is_reachable = t.gc_header.id().map_or(false, |id| reachable.contains(&id.0));
+            let is_reachable = t.gc_header.id().map_or(false, |id| reachable.contains(&(id.0 as usize)));
             if is_reachable {
                 keep.push(t);
                 continue;
@@ -2883,7 +2883,7 @@ impl LuaState {
 
         let mut ud_keep: Vec<crate::objects::Udata> = Vec::new();
         for u in self.ud_finobj_list.drain(..) {
-            let is_reachable = u.gc_header.id().map_or(false, |id| reachable.contains(&id.0));
+            let is_reachable = u.gc_header.id().map_or(false, |id| reachable.contains(&(id.0 as usize)));
             if is_reachable {
                 ud_keep.push(u);
                 continue;
@@ -3117,10 +3117,10 @@ impl LuaState {
         match val {
             TValue::Table(t) => {
                 if let Some(id) = t.gc_header.id() {
-                    reachable.insert(id.0);
+                    reachable.insert(id.0 as usize);
                 }
                 let ptr_id = t.gc_header.ptr_id;
-                if visited.insert(ptr_id) {
+                if visited.insert(ptr_id as usize) {
                     let data = t.data.borrow();
                     let (weak_k, weak_v) = match &data.metatable {
                         Some(mt) => {
@@ -3155,10 +3155,10 @@ impl LuaState {
             }
             TValue::LClosure(c) => {
                 if let Some(id) = c.gc_header.id() {
-                    reachable.insert(id.0);
+                    reachable.insert(id.0 as usize);
                 }
                 let ptr_id = c.gc_header.ptr_id;
-                if visited.insert(ptr_id) {
+                if visited.insert(ptr_id as usize) {
                     let upvals = c.upvals.borrow();
                     for uv_ref in upvals.iter() {
                         let uv = uv_ref.borrow();
@@ -3177,10 +3177,10 @@ impl LuaState {
             }
             TValue::UserData(u) => {
                 if let Some(id) = u.gc_header.id() {
-                    reachable.insert(id.0);
+                    reachable.insert(id.0 as usize);
                 }
                 let ptr_id = u.gc_header.ptr_id;
-                if visited.insert(ptr_id) {
+                if visited.insert(ptr_id as usize) {
                     if let Some(ref mt) = u.metatable {
                         worklist.push(TValue::Table((**mt).clone()));
                     }

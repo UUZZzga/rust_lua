@@ -188,7 +188,7 @@ struct CallerContext {
     code: Vec<crate::objects::Instruction>,
     constants: Vec<TValue>,
     upval_descs: Vec<crate::objects::UpvalDesc>,
-    protos: Vec<crate::objects::Proto>,
+    protos: Vec<Rc<crate::objects::Proto>>,
     base: usize,
     pc: usize,
     top: usize,

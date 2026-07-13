@@ -738,7 +738,7 @@ pub struct Proto {
     /// 指令序列
     pub code: Vec<Instruction>,
     /// 子原型
-    pub protos: Vec<Proto>,
+    pub protos: Vec<Rc<Proto>>,
     /// 上值描述
     pub upvalues: Vec<UpvalDesc>,
     /// 行号差值数组
@@ -817,7 +817,7 @@ pub struct CallFrame {
     pub code: Vec<Instruction>,
     pub constants: Vec<TValue>,
     pub upval_descs: Vec<UpvalDesc>,
-    pub protos: Vec<Proto>,
+    pub protos: Vec<Rc<Proto>>,
     pub base: usize,
     pub return_pc: usize,
     pub return_base: usize,
@@ -844,7 +844,7 @@ pub struct ThreadContext {
     pub saved_code: Vec<Instruction>,
     pub saved_constants: Vec<TValue>,
     pub saved_upval_descs: Vec<UpvalDesc>,
-    pub saved_protos: Vec<Proto>,
+    pub saved_protos: Vec<Rc<Proto>>,
     pub saved_base: usize,
     pub saved_pc: usize,
     pub saved_top: usize,
@@ -2375,19 +2375,28 @@ mod tests {
         use std::mem::size_of;
         use std::cell::Cell;
         use crate::gc::GCObjectId;
-        println!("TValue: {}", size_of::<TValue>());
+        println!("TValue: {} (align {})", size_of::<TValue>(), std::mem::align_of::<TValue>());
         println!("Table: {}", size_of::<Table>());
         println!("  GCObjectHeader: {}", size_of::<crate::gc::GCObjectHeader>());
         println!("  GCObjectId: {}", size_of::<GCObjectId>());
         println!("  Option<GCObjectId>: {}", size_of::<Option<GCObjectId>>());
         println!("  Cell<Option<GCObjectId>>: {}", size_of::<Cell<Option<GCObjectId>>>());
-        println!("  ptr_id: usize = 8");
         println!("TableData: {}", size_of::<TableData>());
         println!("LClosure: {}", size_of::<LClosure>());
         println!("CClosure: {}", size_of::<CClosure>());
         println!("LuaThread: {}", size_of::<LuaThread>());
-        println!("UserData: {}", size_of::<Udata>());
+        println!("Udata: {}", size_of::<Udata>());
         println!("LCFunction: {}", size_of::<LCFunction>());
         println!("LuaString: {}", size_of::<crate::strings::LuaString>());
+        println!("ShortString: {}", size_of::<crate::strings::ShortString>());
+        println!("LongString: {}", size_of::<crate::strings::LongString>());
+        println!("NilKind: {}", size_of::<NilKind>());
+        println!("Instruction: {}", size_of::<Instruction>());
+        println!("Proto: {}", size_of::<Proto>());
+        println!("CallFrame: {}", size_of::<CallFrame>());
+        println!("UpvalDesc: {}", size_of::<UpvalDesc>());
+        println!("LocVar: {}", size_of::<LocVar>());
+        println!("AbsLineInfo: {}", size_of::<AbsLineInfo>());
+        println!("UpVal: {}", size_of::<UpVal>());
     }
 }

@@ -4837,7 +4837,7 @@ impl VmExecutor {
             // GC: 在创建新闭包前检查 GC 阈值，回收不可达的旧闭包。
             // 对应 C Lua 的 luaC_checkGC（OP_CLOSURE 中调用 luaC_checkGC(L)）。
             state.maybe_collect_gc();
-            let closure = Box::new(LClosure { gc_header: crate::gc::GCObjectHeader::new(), proto: Rc::new(proto), upvals: Rc::new(RefCell::new(upvals)) });
+            let closure = Box::new(LClosure { gc_header: crate::gc::GCObjectHeader::new(), proto, upvals: Rc::new(RefCell::new(upvals)) });
             // 注册到 GC metas，使 gc_estimate 增长，让 maybe_collect_gc 的阈值检查能正常工作
             let closure_id = state.gc.register_object(std::mem::size_of::<LClosure>());
             closure.gc_header.set_id(closure_id);
@@ -6134,7 +6134,7 @@ mod tests {
         let inner_proto = make_proto(vec![make_bx(OpCode::RETURN0, 0, 0)], vec![]);
         let code = vec![make_bx(OpCode::CLOSURE, 0, 0)];
         let mut proto = make_proto(code, vec![]);
-        proto.protos = vec![inner_proto];
+        proto.protos = vec![Rc::new(inner_proto)];
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
