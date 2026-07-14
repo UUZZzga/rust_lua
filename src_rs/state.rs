@@ -1463,23 +1463,18 @@ impl LuaState {
     // ====== Load Code ======
 
     pub fn load_buffer(&mut self, code: &str, chunk_name: &str) -> i32 {
-        // 编译前强制触发完整 GC：all.lua 的 dofile 在每个测试文件执行后不调用
-        // collectgarbage，上一个测试创建的临时对象（如 constructs.lua 的 83MB）
-        // 仍占用 gc_estimate，但 collect_threshold 可能高于 gc_estimate，
-        // maybe_collect_gc 的阈值检查不会触发。强制 collect_gc 确保回收这些垃圾，
-        // 避免 big.lua 等内存密集测试因累积垃圾而分配失败。
-        self.collect_gc();
+        // 使用阈值触发 GC 而非强制完整 GC — 避免每个 load() 调用都做 O(objects) 标记。
+        // 当 gc_estimate 超过 collect_threshold 时自动收集，否则跳过。
+        // 这对 construct.lua（206,780 次 load() 调用）是关键的优化：
+        // 非强制 GC 路径节省了完整标记遍历的 all-objects 扫描开销。
+        self.maybe_collect_gc();
         match crate::compiler::compile(self, code, chunk_name) {
             Ok(proto) => {
-                // 创建主闭包，设置 _ENV 上值为全局表
-                // 对应 C 的 luaU_undump + closureupvalue(L, proto, 0) = _ENV
                 let nup = proto.size_upvalues as usize;
                 let mut upvals: Vec<UpValRef> = Vec::with_capacity(nup.max(1));
-                // 第一个上值是 _ENV，指向全局表
                 upvals.push(Rc::new(RefCell::new(UpVal::Closed {
                     value: Box::new(TValue::Table(self.globals.clone())),
                 })));
-                // 填充剩余上值（如果有）
                 for _ in 1..nup {
                     upvals.push(Rc::new(RefCell::new(UpVal::Closed {
                         value: Box::new(TValue::Nil(NilKind::Strict)),

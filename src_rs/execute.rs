@@ -2475,7 +2475,7 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
-        let v1 = Self::read_stack(state, b).clone();
+        let v1 = Self::read_stack(state, b);
         if v1.is_number() && v2.is_number() {
             let result = Self::arith_binary(&v1, &v2, |a, b| a + b, |a, b| a.wrapping_add(b));
             Self::write_stack(state, a, result);
@@ -2492,7 +2492,7 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
-        let v1 = Self::read_stack(state, b).clone();
+        let v1 = Self::read_stack(state, b);
         if v1.is_number() && v2.is_number() {
             let result = Self::arith_binary(&v1, &v2, |a, b| a - b, |a, b| a.wrapping_sub(b));
             Self::write_stack(state, a, result);
@@ -2509,7 +2509,7 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
-        let v1 = Self::read_stack(state, b).clone();
+        let v1 = Self::read_stack(state, b);
         if v1.is_number() && v2.is_number() {
             let result = Self::arith_binary(&v1, &v2, |a, b| a * b, |a, b| a.wrapping_mul(b));
             Self::write_stack(state, a, result);
@@ -2525,7 +2525,7 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
-        let v1 = Self::read_stack(state, b).clone();
+        let v1 = Self::read_stack(state, b);
         if v1.is_number() && v2.is_number() {
             let result = Self::arith_mod(&v1, &v2)?;
             Self::write_stack(state, a, result);
@@ -2541,7 +2541,7 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
-        let v1 = Self::read_stack(state, b).clone();
+        let v1 = Self::read_stack(state, b);
         if let (Some(n1), Some(n2)) = (to_number_ns(&v1), to_number_ns(&v2)) {
             Self::write_stack(state, a, TValue::Float(crate::config::float_pow(n1, n2)));
             state.pc += 2;  // skip MMBINK
@@ -2556,7 +2556,7 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
-        let v1 = Self::read_stack(state, b).clone();
+        let v1 = Self::read_stack(state, b);
         if let (Some(n1), Some(n2)) = (to_number_ns(&v1), to_number_ns(&v2)) {
             Self::write_stack(state, a, TValue::Float(n1 / n2));
             state.pc += 2;  // skip MMBINK
@@ -2571,7 +2571,7 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
-        let v1 = Self::read_stack(state, b).clone();
+        let v1 = Self::read_stack(state, b);
         if v1.is_number() && v2.is_number() {
             let result = Self::arith_idiv(&v1, &v2)?;
             Self::write_stack(state, a, result);
@@ -2587,7 +2587,7 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
-        let v1 = Self::read_stack(state, b).clone();
+        let v1 = Self::read_stack(state, b);
         if let (Some(i1), TValue::Integer(i2)) = (to_integer_ns(&v1, F2IMode::Eq), &v2) {
             Self::write_stack(state, a, TValue::Integer(i1 & i2));
             state.pc += 2;  // skip MMBINK
@@ -2602,7 +2602,7 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
-        let v1 = Self::read_stack(state, b).clone();
+        let v1 = Self::read_stack(state, b);
         if let (Some(i1), TValue::Integer(i2)) = (to_integer_ns(&v1, F2IMode::Eq), &v2) {
             Self::write_stack(state, a, TValue::Integer(i1 | i2));
             state.pc += 2;  // skip MMBINK
@@ -2617,7 +2617,7 @@ impl VmExecutor {
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
         let v2 = state.constants.get(c_key).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
-        let v1 = Self::read_stack(state, b).clone();
+        let v1 = Self::read_stack(state, b);
         if let (Some(i1), TValue::Integer(i2)) = (to_integer_ns(&v1, F2IMode::Eq), &v2) {
             Self::write_stack(state, a, TValue::Integer(i1 ^ i2));
             state.pc += 2;  // skip MMBINK
@@ -2663,10 +2663,10 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
-        let v1 = Self::read_stack(state, b).clone();
-        let v2 = Self::read_stack(state, c).clone();
+        let v1 = Self::read_stack(state, b);
+        let v2 = Self::read_stack(state, c);
         if v1.is_number() && v2.is_number() {
-            let result = Self::arith_binary(&v1, &v2, |a, b| a + b, |a, b| a.wrapping_add(b));
+            let result = Self::arith_binary(v1, v2, |a, b| a + b, |a, b| a.wrapping_add(b));
             Self::write_stack(state, a, result);
             state.pc += 2;  // skip MMBIN
         } else {
@@ -2680,8 +2680,8 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
-        let v1 = Self::read_stack(state, b).clone();
-        let v2 = Self::read_stack(state, c).clone();
+        let v1 = Self::read_stack(state, b);
+        let v2 = Self::read_stack(state, c);
         if v1.is_number() && v2.is_number() {
             let result = Self::arith_binary(&v1, &v2, |a, b| a - b, |a, b| a.wrapping_sub(b));
             Self::write_stack(state, a, result);
@@ -2697,8 +2697,8 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
-        let v1 = Self::read_stack(state, b).clone();
-        let v2 = Self::read_stack(state, c).clone();
+        let v1 = Self::read_stack(state, b);
+        let v2 = Self::read_stack(state, c);
         if v1.is_number() && v2.is_number() {
             let result = Self::arith_binary(&v1, &v2, |a, b| a * b, |a, b| a.wrapping_mul(b));
             Self::write_stack(state, a, result);
@@ -2713,8 +2713,8 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
-        let v1 = Self::read_stack(state, b).clone();
-        let v2 = Self::read_stack(state, c).clone();
+        let v1 = Self::read_stack(state, b);
+        let v2 = Self::read_stack(state, c);
         if v1.is_number() && v2.is_number() {
             let result = Self::arith_mod(&v1, &v2)?;
             Self::write_stack(state, a, result);
@@ -2729,8 +2729,8 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
-        let v1 = Self::read_stack(state, b).clone();
-        let v2 = Self::read_stack(state, c).clone();
+        let v1 = Self::read_stack(state, b);
+        let v2 = Self::read_stack(state, c);
         if let (Some(n1), Some(n2)) = (to_number_ns(&v1), to_number_ns(&v2)) {
             Self::write_stack(state, a, TValue::Float(crate::config::float_pow(n1, n2)));
             state.pc += 2;  // skip MMBIN
@@ -2745,8 +2745,8 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
-        let v1 = Self::read_stack(state, b).clone();
-        let v2 = Self::read_stack(state, c).clone();
+        let v1 = Self::read_stack(state, b);
+        let v2 = Self::read_stack(state, c);
         if let (Some(n1), Some(n2)) = (to_number_ns(&v1), to_number_ns(&v2)) {
             Self::write_stack(state, a, TValue::Float(n1 / n2));
             state.pc += 2;  // skip MMBIN
@@ -2760,8 +2760,8 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
-        let v1 = Self::read_stack(state, b).clone();
-        let v2 = Self::read_stack(state, c).clone();
+        let v1 = Self::read_stack(state, b);
+        let v2 = Self::read_stack(state, c);
         if v1.is_number() && v2.is_number() {
             let result = Self::arith_idiv(&v1, &v2)?;
             Self::write_stack(state, a, result);
@@ -2776,8 +2776,8 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
-        let v1 = Self::read_stack(state, b).clone();
-        let v2 = Self::read_stack(state, c).clone();
+        let v1 = Self::read_stack(state, b);
+        let v2 = Self::read_stack(state, c);
         if let (Some(i1), Some(i2)) = (
             to_integer_ns(&v1, F2IMode::Eq),
             to_integer_ns(&v2, F2IMode::Eq),
@@ -2794,8 +2794,8 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
-        let v1 = Self::read_stack(state, b).clone();
-        let v2 = Self::read_stack(state, c).clone();
+        let v1 = Self::read_stack(state, b);
+        let v2 = Self::read_stack(state, c);
         if let (Some(i1), Some(i2)) = (
             to_integer_ns(&v1, F2IMode::Eq),
             to_integer_ns(&v2, F2IMode::Eq),
@@ -2812,8 +2812,8 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
-        let v1 = Self::read_stack(state, b).clone();
-        let v2 = Self::read_stack(state, c).clone();
+        let v1 = Self::read_stack(state, b);
+        let v2 = Self::read_stack(state, c);
         if let (Some(i1), Some(i2)) = (
             to_integer_ns(&v1, F2IMode::Eq),
             to_integer_ns(&v2, F2IMode::Eq),
@@ -2830,8 +2830,8 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
-        let v1 = Self::read_stack(state, b).clone();
-        let v2 = Self::read_stack(state, c).clone();
+        let v1 = Self::read_stack(state, b);
+        let v2 = Self::read_stack(state, c);
         if let (Some(i1), Some(i2)) = (
             to_integer_ns(&v1, F2IMode::Eq),
             to_integer_ns(&v2, F2IMode::Eq),
@@ -2848,8 +2848,8 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
-        let v1 = Self::read_stack(state, b).clone();
-        let v2 = Self::read_stack(state, c).clone();
+        let v1 = Self::read_stack(state, b);
+        let v2 = Self::read_stack(state, c);
         if let (Some(i1), Some(i2)) = (
             to_integer_ns(&v1, F2IMode::Eq),
             to_integer_ns(&v2, F2IMode::Eq),
@@ -5127,30 +5127,32 @@ impl VmExecutor {
         for _ in 0..MAXTAGLOOP {
             match &current {
                 TValue::Table(t) => {
-                    // 先直接查找表
-                    if let Some(v) = t.get(key) {
+                    // 一次 borrow 内查找值 + 检查元表 — 减少 RefCell 开销
+                    let (val, has_mt) = t.get_and_has_mt(key);
+                    if let Some(v) = val {
                         if !matches!(v, TValue::Nil(_)) {
                             return Ok(v);
                         }
                     }
-                    // 查找 __index 元方法
-                    let index_val = t.get_metatable().and_then(|mt| {
-                        let index_key = crate::tm::make_tm_tvalue(crate::tm::TagMethod::Index);
-                        mt.get(&index_key)
-                    });
+                    // 仅在存在元表时才再次 borrow 获取 __index
+                    let index_val = if has_mt {
+                        t.get_metatable().and_then(|mt| {
+                            let index_key = crate::tm::make_tm_tvalue(crate::tm::TagMethod::Index);
+                            mt.get(&index_key)
+                        })
+                    } else {
+                        None
+                    };
                     if let Some(index_val) = index_val {
                         match &index_val {
                             TValue::Table(_) => {
-                                // __index 是表: 循环
                                 current = index_val.clone();
                                 continue;
                             }
                             TValue::LClosure(_) | TValue::LCFn(_) | TValue::CClosure(_) | TValue::LightUserData(_) => {
-                                // __index 是函数: 调用 __index(table, key) (可能 yield)
                                 return Self::call_index_metamethod(state, index_val.clone(), current.clone(), key.clone());
                             }
                             _ => {
-                                // __index 是其他类型: 继续循环，由 other 分支报错
                                 current = index_val.clone();
                                 continue;
                             }

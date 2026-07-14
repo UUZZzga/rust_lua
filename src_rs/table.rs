@@ -95,6 +95,45 @@ impl Table {
     // get / get_int —— 返回 owned TValue（RefCell 无法返回引用）
     // ========================================================================
 
+    /// 一次 borrow 内同时查找值和检查元表 — 减少 RefCell 借出次数。
+    pub fn get_and_has_mt(&self, key: &TValue) -> (Option<TValue>, bool) {
+        let data = self.data.borrow();
+        let has_mt = data.metatable.is_some();
+        let val = match key {
+            TValue::Integer(i) if *i > 0 => {
+                let idx = (*i - 1) as usize;
+                if idx < data.array.len() {
+                    let v = &data.array[idx];
+                    if !matches!(v, TValue::Nil(NilKind::Empty)) {
+                        Some(v.clone())
+                    } else {
+                        hash_get(&data, key)
+                    }
+                } else {
+                    hash_get(&data, key)
+                }
+            }
+            TValue::Float(f) => {
+                if let Some(i) = float_key_to_int(*f) {
+                    if i > 0 {
+                        let idx = (i - 1) as usize;
+                        if idx < data.array.len() {
+                            let v = &data.array[idx];
+                            if !matches!(v, TValue::Nil(NilKind::Empty)) {
+                                return (Some(v.clone()), has_mt);
+                            }
+                        }
+                    }
+                    hash_get(&data, &TValue::Integer(i))
+                } else {
+                    hash_get(&data, key)
+                }
+            }
+            _ => hash_get(&data, key),
+        };
+        (val, has_mt)
+    }
+
     pub fn get(&self, key: &TValue) -> Option<TValue> {
         let data = self.data.borrow();
         match key {
@@ -224,21 +263,18 @@ impl Table {
     /// - 若 key 存在 (含 tombstone)，覆盖值 (nil 写为 Nil(Empty) tombstone)
     fn hash_set(data: &mut TableData, key: &TValue, value: TValue, is_nil: bool) {
         let val = if is_nil { TValue::Nil(NilKind::Empty) } else { value };
-        use hashbrown::hash_map::Entry;
         let ktb = data.key_to_bucket.get_or_insert_with(|| Box::new(hashbrown::HashMap::new()));
-        match ktb.entry(key.clone()) {
-            Entry::Occupied(e) => {
-                data.hash_buckets[*e.get()].1 = val;
-            }
-            Entry::Vacant(e) => {
-                if is_nil {
-                    return; // C 语义: 对不存在的 key 设 nil 不创建 node
-                }
-                let idx = data.hash_buckets.len();
-                data.hash_buckets.push((e.key().clone(), val));
-                e.insert(idx);
-            }
+        // 先检查 key 是否已存在，避免克隆 key
+        if let Some(idx) = ktb.get(key) {
+            data.hash_buckets[*idx].1 = val;
+            return;
         }
+        if is_nil {
+            return; // C 语义: 对不存在的 key 设 nil 不创建 node
+        }
+        let idx = data.hash_buckets.len();
+        data.hash_buckets.push((key.clone(), val));
+        ktb.insert(key.clone(), idx);
     }
     // ========================================================================
 

@@ -596,9 +596,12 @@ impl<'a> LexState<'a> {
                     // 设置 token_text 包含完整的长字符串字面量 (含 [=...[ ... ]=...])
                     // 对应 C: luaZ_buffer(ls->buff) 在 read_long_string 期间累积的所有字符
                     if self.pos > start_pos {
-                        self.token_text = std::str::from_utf8(
-                            &self.source.as_bytes()[start_pos..self.pos])
-                            .unwrap_or("").to_string();
+                        self.token_text.clear();
+                        if let Ok(s) = std::str::from_utf8(&self.source.as_bytes()[start_pos..self.pos]) {
+                            self.token_text.push_str(s);
+                        }
+                    } else {
+                        self.token_text.clear();
                     }
                 } else {
                     self.token = Token::LBracket;
@@ -632,7 +635,8 @@ impl<'a> LexState<'a> {
         // continuation byte 处 panic。此处用字节切片绕过边界检查。
         // read_name 只消费 ASCII 字母数字/下划线,内容必为合法 UTF-8。
         let s = std::str::from_utf8(&self.source.as_bytes()[start..self.pos]).unwrap();
-        self.token_text = s.to_string();
+        self.token_text.clear();
+        self.token_text.push_str(s);
         self.token = Token::is_keyword(s).unwrap_or_else(|| Token::Name(s.to_string()));
     }
 
@@ -702,7 +706,8 @@ impl<'a> LexState<'a> {
         }
 
         let s = std::str::from_utf8(&self.source.as_bytes()[start..self.pos]).unwrap();
-        self.token_text = s.to_string();
+        self.token_text.clear();
+        self.token_text.push_str(s);
         if is_float {
             if is_hex {
                 match parse_hex_float(s) {
@@ -791,8 +796,10 @@ impl<'a> LexState<'a> {
             }
         }
         // 设置 token_text 包含原始字面量 (含引号), 对应 C 的 luaZ_buffer(ls->buff)
-        self.token_text = std::str::from_utf8(&self.source.as_bytes()[text_start..self.pos])
-            .unwrap_or("").to_string();
+        self.token_text.clear();
+        if let Ok(s) = std::str::from_utf8(&self.source.as_bytes()[text_start..self.pos]) {
+            self.token_text.push_str(s);
+        }
         self.token = Token::String(s);
     }
 

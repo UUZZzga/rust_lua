@@ -18,13 +18,13 @@ pub fn new_proto() -> Proto {
         size_abs_line_info: 0,
         line_defined: 0,
         last_line_defined: 0,
-        constants: Vec::new(),
-        code: Vec::new(),
+        constants: Vec::with_capacity(8),
+        code: Vec::with_capacity(8),
         protos: Vec::new(),
-        upvalues: Vec::new(),
-        line_info: Vec::new(),
+        upvalues: Vec::with_capacity(2),
+        line_info: Vec::with_capacity(8),
         abs_line_info: Vec::new(),
-        loc_vars: Vec::new(),
+        loc_vars: Vec::with_capacity(4),
         source: None,
     }
 }

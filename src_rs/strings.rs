@@ -23,7 +23,25 @@ use std::collections::hash_map::DefaultHasher;
 use std::fmt::{self, Debug, Formatter};
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
+use parking_lot::RwLock;
+use std::hash::BuildHasherDefault;
+
+// Identity hasher for u64-keyed HashMaps — the key IS already a hash value,
+// so using SipHash on it is wasted cycles.
+#[derive(Default)]
+struct IdHasher(u64);
+impl Hasher for IdHasher {
+    fn finish(&self) -> u64 { self.0 }
+    fn write(&mut self, bytes: &[u8]) {
+        // Only used for non-u64 keys; read as little-endian u64.
+        let mut buf = [0u8; 8];
+        let len = bytes.len().min(8);
+        buf[..len].copy_from_slice(&bytes[..len]);
+        self.0 = u64::from_le_bytes(buf);
+    }
+    fn write_u64(&mut self, i: u64) { self.0 = i; }
+}
 
 // ============================================================================
 // 规约：常量
@@ -175,30 +193,28 @@ impl Hash for LuaString {
 /// 字符串表 — 管理短字符串的内部化。
 #[derive(Debug)]
 pub struct StringTable {
-    ht: RwLock<HashMap<u64, Vec<Arc<ShortString>>>>,
+    ht: RwLock<HashMap<u64, Vec<Arc<ShortString>>, BuildHasherDefault<IdHasher>>>,
     nuse: RwLock<usize>,
 }
 
 impl StringTable {
     pub fn new() -> Self {
         StringTable {
-            ht: RwLock::new(HashMap::with_capacity(128)),
+            ht: RwLock::new(HashMap::with_capacity_and_hasher(128, BuildHasherDefault::<IdHasher>::default())),
             nuse: RwLock::new(0),
         }
     }
-
-    /// 内部化一个短字符串。写锁内二次检查防止 TOCTOU 竞态。
+    /// 内部化一个短字符串。
+    #[inline]
     pub fn intern(&self, str: &str) -> LuaString {
         let h = rust_hash(str);
         debug_assert!(str.len() <= LUAI_MAXSHORTLEN, "intern 只用于短字符串");
 
-        {
-            let ht = self.ht.read().unwrap();
-            if let Some(bucket) = ht.get(&h) {
-                for ts in bucket {
-                    if *ts.contents == *str {
-                        return LuaString::Short(Arc::clone(ts));
-                    }
+        let mut ht = self.ht.write();
+        if let Some(bucket) = ht.get(&h) {
+            for ts in bucket {
+                if *ts.contents == *str {
+                    return LuaString::Short(Arc::clone(ts));
                 }
             }
         }
@@ -207,40 +223,30 @@ impl StringTable {
             hash: h,
             contents: str.to_string(),
         });
-
-        let mut ht = self.ht.write().unwrap();
-        if let Some(bucket) = ht.get(&h) {
-            if let Some(existing) = bucket.iter().find(|item| *item.contents == *str) {
-                return LuaString::Short(Arc::clone(existing));
-            }
-        }
-        ht.entry(h).or_insert_with(Vec::new).push(Arc::clone(&ts));
-        drop(ht);
-
-        let mut nuse = self.nuse.write().unwrap();
-        *nuse += 1;
-
+        let bucket = ht.entry(h).or_insert_with(Vec::new);
+        bucket.push(Arc::clone(&ts));
+        *self.nuse.write() += 1;
         LuaString::Short(ts)
     }
 
     pub fn count(&self) -> usize {
-        *self.nuse.read().unwrap()
+        *self.nuse.read()
     }
 
     pub fn remove(&self, ts: &ShortString) {
         let h = ts.hash;
-        let mut ht = self.ht.write().unwrap();
+        let mut ht = self.ht.write();
         let bucket = ht.get_mut(&h).unwrap();
         bucket.retain(|item| !std::ptr::eq(item.as_ref(), ts));
         if bucket.is_empty() {
             ht.remove(&h);
         }
-        let mut nuse = self.nuse.write().unwrap();
+        let mut nuse = self.nuse.write();
         *nuse = nuse.saturating_sub(1);
     }
 
     pub fn for_each<F: FnMut(&ShortString)>(&self, mut f: F) {
-        let ht = self.ht.read().unwrap();
+        let ht = self.ht.read();
         for bucket in ht.values() {
             for ts in bucket {
                 f(ts);
@@ -252,7 +258,7 @@ impl StringTable {
     /// 对应 C Lua 的 sweep 阶段清理 string table 的逻辑。
     /// 返回被清理的字符串数量。
     pub fn sweep(&self) -> usize {
-        let mut ht = self.ht.write().unwrap();
+        let mut ht = self.ht.write();
         let mut freed = 0;
         let mut empty_keys = Vec::new();
 
@@ -270,7 +276,7 @@ impl StringTable {
             ht.remove(&key);
         }
 
-        let mut nuse = self.nuse.write().unwrap();
+        let mut nuse = self.nuse.write();
         *nuse = nuse.saturating_sub(freed);
 
         freed
@@ -281,7 +287,7 @@ impl StringTable {
 // 规约：哈希计算
 // ============================================================================
 
-/// 使用 Rust 标准 `DefaultHasher` 计算字符串的 u64 哈希值。
+#[inline]
 pub fn rust_hash(str: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     str.hash(&mut hasher);
@@ -291,8 +297,8 @@ pub fn rust_hash(str: &str) -> u64 {
 // ============================================================================
 // 规约：字符串方法
 // ============================================================================
-
 impl LuaString {
+    #[inline]
     pub fn as_str(&self) -> &str {
         match self {
             LuaString::Short(s) => &s.contents,
@@ -323,6 +329,7 @@ impl std::fmt::Display for LuaString {
         write!(f, "{}", self.as_str())
     }
 }
+
 
 // ============================================================================
 // 规约：创建字符串
@@ -359,7 +366,7 @@ pub fn ensure_long_hash(ls: &mut LongString) -> u64 {
     }
     ls.hash.load(Ordering::Relaxed)
 }
-
+#[inline]
 pub fn new_lstr(table: &StringTable, str: &str) -> LuaString {
     if str.len() <= LUAI_MAXSHORTLEN {
         table.intern(str)
@@ -394,7 +401,7 @@ impl StringCache {
         len: usize,
         table: &StringTable,
     ) -> LuaString {
-        let cached = self.cached.read().unwrap();
+        let cached = self.cached.read();
         let cached_ptr = cached.as_str().as_ptr();
         let cached_len = cached.len();
 
@@ -406,13 +413,13 @@ impl StringCache {
         let slice = unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(str_ptr, len)) };
         let new_s = new_lstr(table, slice);
 
-        let mut cached = self.cached.write().unwrap();
+        let mut cached = self.cached.write();
         *cached = new_s.clone();
         new_s
     }
 
     pub fn clear(&self, new_base: LuaString) {
-        let mut cached = self.cached.write().unwrap();
+        let mut cached = self.cached.write();
         *cached = new_base;
     }
 }

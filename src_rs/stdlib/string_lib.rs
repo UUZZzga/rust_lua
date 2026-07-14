@@ -1998,23 +1998,22 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                 result.push_str(&s);
             }
             b's' => {
-                let s = match arg {
-                    TValue::Str(s) => s.as_str().to_string(),
-                    TValue::Integer(n) => n.to_string(),
-                    TValue::Float(f) => {
-                        if f.is_nan() { "nan".to_string() }
-                        else if f.is_infinite() { if *f > 0.0 { "inf".to_string() } else { "-inf".to_string() } }
-                        else { format!("{}", f) }
-                    }
-                    TValue::Nil(_) => "nil".to_string(),
-                    TValue::Boolean(b) => b.to_string(),
-                    _ => return Err(format!("bad argument #{} to 'format' (no proper format)", arg_idx)),
-                };
-                // 对应 C: 如果有修饰符 (width/precision/flags)，检查字符串是否包含零字节
                 let has_modifiers = width > 0 || precision.is_some() ||
                     left_align || plus_sign || space_sign || zero_pad || alt_form;
                 if has_modifiers {
-                    // C: checkformat(L, form, L_FMTFLAGSC, 1)
+                    let s = match arg {
+                        TValue::Str(s) => s.as_str().to_string(),
+                        TValue::Integer(n) => n.to_string(),
+                        TValue::Float(f) => {
+                            if f.is_nan() { "nan".to_string() }
+                            else if f.is_infinite() { if *f > 0.0 { "inf".to_string() } else { "-inf".to_string() } }
+                            else { format!("{}", f) }
+                        }
+                        TValue::Nil(_) => "nil".to_string(),
+                        TValue::Boolean(b) => b.to_string(),
+                        _ => return Err(format!("bad argument #{} to 'format' (no proper format)", arg_idx)),
+                    };
+                    // 对应 C: 如果有修饰符 (width/precision/flags)，检查字符串是否包含零字节
                     check_format(form, FMT_FLAGSC, true)?;
                     // C: luaL_argcheck(L, l == strlen(s), arg, "string contains zeros")
                     if s.as_bytes().contains(&0) {
@@ -2032,8 +2031,19 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                         result.push_str(&apply_width(truncated));
                     }
                 } else {
-                    // 无修饰符: 保持整个字符串
-                    result.push_str(&s);
+                    // 无修饰符: 直接输出，避免 String 分配
+                    match arg {
+                        TValue::Str(s) => result.push_str(s.as_str()),
+                        TValue::Integer(n) => result.push_str(&n.to_string()),
+                        TValue::Float(f) => {
+                            if f.is_nan() { result.push_str("nan"); }
+                            else if f.is_infinite() { if *f > 0.0 { result.push_str("inf"); } else { result.push_str("-inf"); } }
+                            else { result.push_str(&format!("{}", f)); }
+                        }
+                        TValue::Nil(_) => result.push_str("nil"),
+                        TValue::Boolean(b) => result.push_str(&b.to_string()),
+                        _ => return Err(format!("bad argument #{} to 'format' (no proper format)", arg_idx)),
+                    }
                 }
             }
             b'q' => {

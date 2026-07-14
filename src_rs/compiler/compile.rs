@@ -2607,7 +2607,7 @@ fn get_name(fs: &mut FuncState) -> String {
         Token::Name(s) => {
             let name = s.clone();
             fs.ls_mut().next();
-            name
+            name.to_string()
         }
         _ => {
             fs.error(&format!("'name' expected near {}", fs.ls().token_display()));
@@ -4911,11 +4911,11 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         fs.code_loadk(r, k);
                     }
                 };
-                PrefixResult { var_name: Some(name.clone()), local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: true }
+                PrefixResult { var_name: Some(name.to_string()), local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: true }
             } else if let Some((reg, kind)) = fs.find_local_ex(&name) {
                 let is_vvargvar = kind == RDKVAVAR;
                 let is_readonly = kind != VDKREG;
-                PrefixResult { var_name: if is_readonly { Some(name.clone()) } else { None }, local_idx: Some(reg), key: None, reg: Some(reg), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar, is_readonly }
+                PrefixResult { var_name: if is_readonly { Some(name.to_string()) } else { None }, local_idx: Some(reg), key: None, reg: Some(reg), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar, is_readonly }
             } else if fs.find_named_global_decl(&name).is_some() {
                 // 具名 global 声明（如 `global a`）：优先于 upvalue，通过 _ENV[name] 访问。
                 // 匹配 C 的 searchvar：具名 global 匹配时立即返回 VGLOBAL，优先于 upvalue 查找。
@@ -4931,7 +4931,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         // (corresponds to C's check_readonly for VUPVAL with kind!=VDKREG)
                         let uv_kind = fs.proto.upvalues[upval_idx as usize].kind as i32;
                         let is_readonly = uv_kind != VDKREG;
-                        PrefixResult { var_name: if is_readonly { Some(name.clone()) } else { None }, local_idx: None, key: None, reg: None, table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: true, upval_idx: Some(upval_idx), env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
+                PrefixResult { var_name: if is_readonly { Some(name.to_string()) } else { None }, local_idx: None, key: None, reg: None, table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: false, is_upvalue: true, upval_idx: Some(upval_idx), env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly }
                     }
                     UpvalueOrCtc::CtcConst(mut ctc) => {
                         // Like find_local_ctc handling: load constant into a register
@@ -4970,7 +4970,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                                 fs.code_loadk(r, k);
                             }
                         };
-                        PrefixResult { var_name: Some(name.clone()), local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: true }
+                        PrefixResult { var_name: Some(name.to_string()), local_idx: Some(r), key: None, reg: Some(r), table_reg: None, table_key: None, table_key_is_const: false, table_key_is_int: false, key_allocated_reg: false, allocated_reg: true, is_upvalue: false, upval_idx: None, env_gettabup_pc: -1, has_call: false, call_pc: -1, is_vvargvar: false, is_readonly: true }
                     }
                 }
             } else {
@@ -10936,7 +10936,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
                     let name = name.clone();
                     fs.ls_mut().next();
                     // Add as RDKVAVAR kind local variable (not counted in n_params, like C)
-                    param_names.push(name);
+                    param_names.push(name.to_string());
                     vararg_named = true;
                 } else {
                     // Traditional ... without name (not counted in n_params, like C)
@@ -10948,7 +10948,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
                 let name = name.clone();
                 fs.ls_mut().next();
                 n_params += 1;
-                param_names.push(name);
+                param_names.push(name.to_string());
             } else {
                 // 对应 C 的 default: luaX_syntaxerror(ls, "<name> or '...' expected")
                 syntax_error_with_token(fs, "<name> or '...' expected");
@@ -10968,8 +10968,6 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     // 设置源名 — 对应 C 的 lexstate.source = luaX_newstring(L, name, ...)
     // 源名用于错误消息和堆栈回溯中的位置信息
     new_fs.proto.source = Some(crate::strings::new_lstr(&ls.state.string_table, &ls.chunk_name));
-
-    // Like C's parlist: add regular parameters first (start_pc before VARARGPREP),
     // then generate VARARGPREP, then add vararg parameter (start_pc after VARARGPREP).
     // This order ensures regular parameters have start_pc=0, so that
     // debug.getlocal(func, n) with pc=0 can find them.

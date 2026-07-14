@@ -2383,28 +2383,44 @@ fn call_load(
     }
 
     let chunk_val = get_arg(state, a, 0);
-
-    // 获取可选的 chunkname 参数 (第 2 个)
-    // 字符串 chunk 缺省时用 chunk 内容作为 chunkname (对应 C 的 luaL_optstring(L, 2, s))
-    // reader 模式缺省时用 "=(load)" (对应 C 的 luaL_optstring(L, 2, "=(load)"))
     let is_string_chunk = matches!(chunk_val, TValue::Str(_));
-    let default_chunkname = if is_string_chunk {
-        match &chunk_val {
-            TValue::Str(s) => s.as_str().to_string(),
-            _ => unreachable!(),
-        }
-    } else {
-        "=(load)".to_string()
-    };
+    // Lazy default_chunkname — only computed when needed (nargs < 2 or name is nil).
+    // For constructs.lua (206K load() calls with explicit "" name), this avoids
+    // copying the 106-char source string into a chunkname that is never used.
     let chunkname = if nargs >= 2 {
         let name_val = get_arg(state, a, 1);
         match &name_val {
             TValue::Str(s) => s.as_str().to_string(),
-            TValue::Nil(_) => default_chunkname.clone(),
-            _ => default_chunkname.clone(),
+            TValue::Nil(_) => {
+                if is_string_chunk {
+                    match &chunk_val {
+                        TValue::Str(s) => s.as_str().to_string(),
+                        _ => unreachable!(),
+                    }
+                } else {
+                    "=(load)".to_string()
+                }
+            }
+            _ => {
+                if is_string_chunk {
+                    match &chunk_val {
+                        TValue::Str(s) => s.as_str().to_string(),
+                        _ => unreachable!(),
+                    }
+                } else {
+                    "=(load)".to_string()
+                }
+            }
         }
     } else {
-        default_chunkname.clone()
+        if is_string_chunk {
+            match &chunk_val {
+                TValue::Str(s) => s.as_str().to_string(),
+                _ => unreachable!(),
+            }
+        } else {
+            "=(load)".to_string()
+        }
     };
 
     // 获取 mode 参数 (第 3 个) — "t" / "b" / "bt" / nil
@@ -2447,8 +2463,15 @@ fn call_load(
 
     // 根据 chunk 类型获取源代码字符串
     // 对应 C 的 luaB_load 中 s = lua_tolstring(L, 1, &l) 的判断
-    let source_result: Result<String, String> = match &chunk_val {
-        TValue::Str(s) => Ok(s.as_str().to_string()),
+    // 字符串 chunk: 直接借用 &str 避免克隆 (关键优化: constructs.lua 调用 206,780 次 load())
+    // reader 函数: 循环调用 reader() 累积字符串
+    let source: &str;
+    let _source_owned: String;
+    match &chunk_val {
+        TValue::Str(s) => {
+            source = s.as_str();
+            _source_owned = String::new();
+        }
         TValue::LClosure(_) | TValue::LightUserData(_) => {
             // reader 函数模式: 循环调用 reader() 累积字符串
             // LightUserData 必须是可调用的 function tag (io.lines 迭代器等)，
@@ -2478,9 +2501,6 @@ fn call_load(
                 state.stack.push(chunk_val.clone());
                 let status = state.pcall(0, 1, 0);
                 if status != 0 {
-                    // reader 抛错: 对应 C 的 luaD_protectedparser 捕获 generic_reader
-                    // 中的 luaL_error — load 返回 (nil, error_msg), 不向上抛
-                    // pcall 失败后栈顶是错误消息字符串
                     let err_msg = if saved_len < state.stack.len() {
                         match &state.stack[saved_len] {
                             TValue::Str(s) => s.as_str().to_string(),
@@ -2490,14 +2510,12 @@ fn call_load(
                         "reader function must return a string".to_string()
                     };
                     state.stack.truncate(saved_len);
-                    // load_aux 返回 (nil, error_msg)
                     push_results(state, a, nresults, vec![
                         TValue::Nil(NilKind::Strict),
                         TValue::Str(state.intern_str(&err_msg)),
                     ]);
                     return Ok(());
                 }
-                // pcall 成功: 栈顶是 reader 返回值
                 let result = if saved_len < state.stack.len() {
                     state.stack[saved_len].clone()
                 } else {
@@ -2505,41 +2523,32 @@ fn call_load(
                 };
                 state.stack.truncate(saved_len);
                 match &result {
-                    TValue::Nil(_) => break, // reader 返回 nil: 结束 (C: NULL)
+                    TValue::Nil(_) => break,
                     TValue::Str(s) => {
-                        // reader 返回字符串: 检查长度
-                        // 对应 C 的 luaZ_fill: if (size == 0) return EOZ;
                         if s.as_str().is_empty() {
-                            break; // 空字符串视为 EOF
+                            break;
                         }
                         buffer.push_str(s.as_str());
                     }
                     _ => {
-                        // reader 返回非字符串非 nil: 对应 C 的 luaL_error
-                        // 但 lua_load 内部保护模式会捕获, 返回 (nil, error_msg)
-                        let err_msg = "reader function must return a string".to_string();
                         push_results(state, a, nresults, vec![
                             TValue::Nil(NilKind::Strict),
-                            TValue::Str(state.intern_str(&err_msg)),
+                            TValue::Str(state.intern_str("reader function must return a string")),
                         ]);
                         return Ok(());
                     }
                 }
             }
-            Ok(buffer)
+            _source_owned = buffer;
+            source = &_source_owned;
         }
-        _ => Err(format!(
-            "bad argument #1 to 'load' (string or function expected, got {})",
-            chunk_val.ty()
-        )),
-    };
-
-    let source = match source_result {
-        Ok(s) => s,
-        Err(err_msg) => {
-            return Err(VmError::RuntimeError(err_msg));
+        _ => {
+            return Err(VmError::RuntimeError(format!(
+                "bad argument #1 to 'load' (string or function expected, got {})",
+                chunk_val.ty()
+            )));
         }
-    };
+    }
 
     // 检测二进制格式 (仅检查首字节 \x1b, 对应 C 的 f_parser: c == LUA_SIGNATURE[0])
     // 完整签名校验由 parse_dump 的 checkHeader 负责
@@ -2572,16 +2581,14 @@ fn call_load(
         return Ok(());
     }
 
-    // 编译前触发 GC：回收之前测试残留的可达垃圾，避免内存累积。
-    // all.lua 的 dofile 不在每个测试后调用 collectgarbage，临时对象（如
-    // constructs.lua 的 83MB）仍占用 gc_estimate，但 collect_threshold 可能
-    // 高于 gc_estimate，maybe_collect_gc 不会触发。
-    // 对大源代码（>= 64KB，如 big.lua 的 load(prog)）强制完整 GC；
-    // 小源代码用 maybe_collect_gc 避免频繁 GC 导致性能下降。
+    // Defer GC for small source code (<64KB): during compiler-heavy workloads
+    // (constructs.lua: 206K+ load() calls), threshold-based GC fires ~100 times
+    // for short-lived closures that are freed by Box::drop anyway. Letting metas
+    // accumulate until a deferred collection is more efficient.
+    // For large source (>=64KB), force full GC before compilation to avoid
+    // OOM during the allocation-heavy compilation process.
     if source.len() >= 65536 {
         state.collect_gc();
-    } else {
-        state.maybe_collect_gc();
     }
     let proto_result = if is_binary {
         // 二进制格式: 使用 undump
