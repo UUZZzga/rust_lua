@@ -10,8 +10,13 @@ use crate::table::Table;
 use crate::tm::DefaultMetatables;
 use std::cell::RefCell;
 use std::collections::HashSet;
+use crate::objects::FxBuildHasher;
 use std::io::{Read, Write};
 use std::rc::Rc;
+
+/// GC 标记阶段使用的集合类型 — 用 FxHash 替代默认 SipHash，
+/// 因为 key 是 usize（对象 ID/指针），用 SipHash 是浪费（perf 显示占 ~4%）。
+type GcHashSet = HashSet<usize, FxBuildHasher>;
 
 const EOFMARK: &str = "<eof>";
 
@@ -848,11 +853,16 @@ impl LuaState {
                 return;
             }
         }
-        // 将结果从 first_result_pos 移动到 a（TValue 非 Copy，用 clone 循环）
+        // 将结果从 first_result_pos 移动到 a
+        // 用 mem::replace 避免 clone：源位置的值被移出（填 Nil(Empty)），
+        // 后续 truncate 会删除源位置，不会留下垃圾。
         // 正向循环安全：a < first_result_pos，写 a+k 不会覆盖尚未读取的源 first_result_pos+k
         if n_actual > 0 && first_result_pos + n_actual <= self.stack.len() {
             for k in 0..n_actual {
-                let val = self.stack[first_result_pos + k].clone();
+                let val = std::mem::replace(
+                    &mut self.stack[first_result_pos + k],
+                    TValue::Nil(NilKind::Empty),
+                );
                 self.stack[a + k] = val;
             }
         }
@@ -880,7 +890,10 @@ impl LuaState {
             // 错误执行，把栈截断到错误的 a 值）
             if n_actual > 0 && first_result_pos + n_actual <= self.stack.len() {
                 for k in 0..n_actual {
-                    let val = self.stack[first_result_pos + k].clone();
+                    let val = std::mem::replace(
+                        &mut self.stack[first_result_pos + k],
+                        TValue::Nil(NilKind::Empty),
+                    );
                     self.stack[a + k] = val;
                 }
             }
@@ -2571,8 +2584,8 @@ impl LuaState {
     /// 注意：弱键值表（__mode = "kv"）不参与 ephemeron 传递性，其键和值都按弱引用独立判断。
     fn process_ephemerons(
         &self,
-        reachable: &mut HashSet<usize>,
-        visited: &mut HashSet<usize>,
+        reachable: &mut GcHashSet,
+        visited: &mut GcHashSet,
         worklist: &mut Vec<TValue>,
     ) {
         let mode_key = TValue::Str(self.intern_str("__mode"));
@@ -2639,7 +2652,7 @@ impl LuaState {
 
     /// 清理弱引用表 — 在 collect_gc 标记完成后、sweep 之前调用
     /// 基于 GC reachable 集合判断键/值是否死亡，清除死亡的弱引用条目
-    fn clear_weak_tables(&mut self, reachable: &HashSet<usize>) {
+    fn clear_weak_tables(&mut self, reachable: &GcHashSet) {
         let mode_key = TValue::Str(self.intern_str("__mode"));
         let mut i = 0;
         while i < self.weak_tables.len() {
@@ -2722,7 +2735,7 @@ impl LuaState {
 
     /// 判断值是否被 GC 标记为存活（在 reachable 集合中）
     /// 非 GC 对象（字符串、数字、布尔、nil）总是视为存活
-    fn is_marked(val: &TValue, reachable: &HashSet<usize>) -> bool {
+    fn is_marked(val: &TValue, reachable: &GcHashSet) -> bool {
         match val {
             TValue::Table(t) => t
                 .gc_header
@@ -2770,8 +2783,8 @@ impl LuaState {
     }
 
     fn collect_gc_inner(&mut self) {
-        let mut reachable: HashSet<usize> = HashSet::new();
-        let mut visited: HashSet<usize> = HashSet::new();
+        let mut reachable: GcHashSet = GcHashSet::default();
+        let mut visited: GcHashSet = GcHashSet::default();
         let mut worklist: Vec<TValue> = Vec::new();
 
         // 收集根：栈 — 遍历到 self.top（对应 C Lua 的 traversethread: o < th->top）
@@ -2779,7 +2792,9 @@ impl LuaState {
         // 在 OP_RETURN 中被设为返回值末尾。超出 self.top 的栈槽是"死亡"的。
         let stack_top = self.top.min(self.stack.len());
         for val in &self.stack[..stack_top] {
-            worklist.push(val.clone());
+            if Self::needs_gc_mark(val) {
+                worklist.push(val.clone());
+            }
         }
 
         // 收集根：全局表、registry
@@ -2791,11 +2806,16 @@ impl LuaState {
             let uv = uv_ref.borrow();
             match &*uv {
                 UpVal::Closed { value } => {
-                    worklist.push((**value).clone());
+                    if Self::needs_gc_mark(value) {
+                        worklist.push((**value).clone());
+                    }
                 }
                 UpVal::Open { stack_index, .. } => {
                     if *stack_index < self.stack.len() {
-                        worklist.push(self.stack[*stack_index].clone());
+                        let val = &self.stack[*stack_index];
+                        if Self::needs_gc_mark(val) {
+                            worklist.push(val.clone());
+                        }
                     }
                 }
             }
@@ -2804,12 +2824,16 @@ impl LuaState {
         // 收集根：call_stack 中的 constants 和 closure_upvals
         for frame in &self.call_stack {
             for val in &frame.constants[..] {
-                worklist.push(val.clone());
+                if Self::needs_gc_mark(val) {
+                    worklist.push(val.clone());
+                }
             }
             for uv_ref in &frame.closure_upvals {
                 let uv = uv_ref.borrow();
                 if let UpVal::Closed { value } = &*uv {
-                    worklist.push((**value).clone());
+                    if Self::needs_gc_mark(value) {
+                        worklist.push((**value).clone());
+                    }
                 }
             }
         }
@@ -2823,7 +2847,9 @@ impl LuaState {
 
         // 收集根：hook_func
         if let Some(ref hook) = self.hook_func {
-            worklist.push(hook.clone());
+            if Self::needs_gc_mark(hook) {
+                worklist.push(hook.clone());
+            }
         }
 
         // 收集根：call_wrap_call 期间的调用者栈
@@ -2831,7 +2857,9 @@ impl LuaState {
         // 否则 GC 看不到内层协程引用，会误判为不可达。
         for stack in &self.caller_gc_stacks {
             for val in stack {
-                worklist.push(val.clone());
+                if Self::needs_gc_mark(val) {
+                    worklist.push(val.clone());
+                }
             }
         }
 
@@ -2901,7 +2929,7 @@ impl LuaState {
         }
         let n = siz.max(1);
         let acc = self.gc.step_accum.get() + n;
-        let threshold = self.gc.metas_len().max(1);
+        let threshold = self.gc.active_count().max(1);
         if acc >= threshold {
             self.collect_gc();
             true
@@ -2919,8 +2947,8 @@ impl LuaState {
     /// __gc 函数（当函数本身不可达时）。call_finalizers 会重新检查 __gc 是否存在。
     fn collect_finalizers(
         &mut self,
-        reachable: &mut HashSet<usize>,
-        visited: &mut HashSet<usize>,
+        reachable: &mut GcHashSet,
+        visited: &mut GcHashSet,
         worklist: &mut Vec<TValue>,
     ) -> Vec<TValue> {
         let gc_key = TValue::Str(self.intern_str("__gc"));
@@ -3132,47 +3160,68 @@ impl LuaState {
     /// 收集协程的根对象
     fn collect_thread_roots(&self, thread: &LuaThread, worklist: &mut Vec<TValue>) {
         for val in &thread.stack {
-            worklist.push(val.clone());
+            if Self::needs_gc_mark(val) {
+                worklist.push(val.clone());
+            }
         }
         if let Some(ref func) = thread.function {
-            worklist.push((**func).clone());
+            if Self::needs_gc_mark(func) {
+                worklist.push((**func).clone());
+            }
         }
         let ctx = thread.context.borrow();
         for val in &ctx.saved_stack {
-            worklist.push(val.clone());
+            if Self::needs_gc_mark(val) {
+                worklist.push(val.clone());
+            }
         }
         for val in &ctx.saved_constants[..] {
-            worklist.push(val.clone());
+            if Self::needs_gc_mark(val) {
+                worklist.push(val.clone());
+            }
         }
         for uv_ref in &ctx.saved_closure_upvals {
             let uv = uv_ref.borrow();
             match &*uv {
                 UpVal::Closed { value } => {
-                    worklist.push((**value).clone());
+                    if Self::needs_gc_mark(value) {
+                        worklist.push((**value).clone());
+                    }
                 }
                 UpVal::Open { stack_index, .. } => {
                     if *stack_index < ctx.saved_stack.len() {
-                        worklist.push(ctx.saved_stack[*stack_index].clone());
+                        let val = &ctx.saved_stack[*stack_index];
+                        if Self::needs_gc_mark(val) {
+                            worklist.push(val.clone());
+                        }
                     }
                 }
             }
         }
         for frame in &ctx.saved_call_stack {
             for val in &frame.constants[..] {
-                worklist.push(val.clone());
+                if Self::needs_gc_mark(val) {
+                    worklist.push(val.clone());
+                }
             }
             for uv_ref in &frame.closure_upvals {
                 let uv = uv_ref.borrow();
                 if let UpVal::Closed { value } = &*uv {
-                    worklist.push((**value).clone());
+                    if Self::needs_gc_mark(value) {
+                        worklist.push((**value).clone());
+                    }
                 }
             }
         }
         if let Some(ref hook) = ctx.saved_hook_func {
-            worklist.push(hook.clone());
+            if Self::needs_gc_mark(hook) {
+                worklist.push(hook.clone());
+            }
         }
         if let Some(ref err) = ctx.error_msg {
-            worklist.push(err.clone());
+            if Self::needs_gc_mark(err) {
+                worklist.push(err.clone());
+            }
         }
         for ci in &ctx.saved_call_info {
             if let Some(ref closure) = ci.closure {
@@ -3182,11 +3231,23 @@ impl LuaState {
     }
 
     /// 标记 TValue 可达，并将子对象加入工作列表
+    ///
+    /// 只处理 Table/LClosure/UserData/Thread（mark_tvalue 的 match 分支）。
+    /// 其他类型（Nil/Boolean/Integer/Float/Str 等）不需要 GC 标记，
+    /// 过滤掉可避免大量无意义的 clone（perf 显示 TValue::clone 占 7.75%）。
+    #[inline]
+    fn needs_gc_mark(val: &TValue) -> bool {
+        matches!(
+            val,
+            TValue::Table(_) | TValue::LClosure(_) | TValue::UserData(_) | TValue::Thread(_)
+        )
+    }
+
     fn mark_tvalue(
         &self,
         val: &TValue,
-        reachable: &mut HashSet<usize>,
-        visited: &mut HashSet<usize>,
+        reachable: &mut GcHashSet,
+        visited: &mut GcHashSet,
         worklist: &mut Vec<TValue>,
     ) {
         match val {
@@ -3211,15 +3272,15 @@ impl LuaState {
                         None => (false, false),
                     };
                     for v in data.array.iter() {
-                        if !weak_v {
+                        if !weak_v && Self::needs_gc_mark(v) {
                             worklist.push(v.clone());
                         }
                     }
                     for (k, v) in data.hash_buckets.iter() {
-                        if !weak_k {
+                        if !weak_k && Self::needs_gc_mark(k) {
                             worklist.push(k.clone());
                         }
-                        if !weak_k && !weak_v {
+                        if !weak_k && !weak_v && Self::needs_gc_mark(v) {
                             worklist.push(v.clone());
                         }
                     }
@@ -3235,19 +3296,24 @@ impl LuaState {
                 let ptr_id = c.gc_header.ptr_id;
                 if visited.insert(ptr_id as usize) {
                     let upvals = c.upvals.borrow();
-                    for uv_ref in upvals.iter() {
-                        let uv = uv_ref.borrow();
-                        match &*uv {
-                            UpVal::Closed { value } => {
+                for uv_ref in upvals.iter() {
+                    let uv = uv_ref.borrow();
+                    match &*uv {
+                        UpVal::Closed { value } => {
+                            if Self::needs_gc_mark(value) {
                                 worklist.push((**value).clone());
                             }
-                            UpVal::Open { stack_index, .. } => {
-                                if *stack_index < self.stack.len() {
-                                    worklist.push(self.stack[*stack_index].clone());
+                        }
+                        UpVal::Open { stack_index, .. } => {
+                            if *stack_index < self.stack.len() {
+                                let val = &self.stack[*stack_index];
+                                if Self::needs_gc_mark(val) {
+                                    worklist.push(val.clone());
                                 }
                             }
                         }
                     }
+                }
                 }
             }
             TValue::UserData(u) => {
@@ -3260,7 +3326,9 @@ impl LuaState {
                         worklist.push(TValue::Table((**mt).clone()));
                     }
                     for uv in &u.user_values {
-                        worklist.push(uv.clone());
+                        if Self::needs_gc_mark(uv) {
+                            worklist.push(uv.clone());
+                        }
                     }
                 }
             }

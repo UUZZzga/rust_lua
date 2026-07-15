@@ -401,12 +401,18 @@ impl MatchState {
         }
     }
 
+    /// 获取源字符串字节 — 所有调用点已确保 idx < src_end <= src.len()
+    #[inline(always)]
     fn src_byte(&self, idx: usize) -> u8 {
-        self.src[idx]
+        // 安全性：调用点已在访问前检查 idx < src_end
+        unsafe { *self.src.get_unchecked(idx) }
     }
 
+    /// 获取模式字符串字节 — 所有调用点已确保 idx < p_end <= pattern.len()
+    #[inline(always)]
     fn pat_byte(&self, idx: usize) -> u8 {
-        self.pattern[idx]
+        // 安全性：调用点已在访问前检查 idx < p_end
+        unsafe { *self.pattern.get_unchecked(idx) }
     }
 }
 
@@ -438,26 +444,30 @@ fn match_class(c: u8, cl: u8) -> bool {
 fn match_bracket_class(c: u8, p: &[u8], ec: usize) -> bool {
     let mut sig = true;
     let mut idx = 0;
-    if p.len() > 1 && p[1] == b'^' {
-        sig = false;
-        idx = 1; // skip the '^'
-    }
-    idx += 1;
-    while idx < ec {
-        if p[idx] == b'%' {
-            idx += 1;
-            if idx < ec && match_class(c, p[idx]) {
-                return sig;
-            }
-        } else if idx + 2 < ec && p[idx + 1] == b'-' {
-            if p[idx] <= c && c <= p[idx + 2] {
-                return sig;
-            }
-            idx += 2;
-        } else if p[idx] == c {
-            return sig;
+    // 安全性：p 来自 ms.pattern[p_start..ep]，长度 >= ec
+    // 所有索引访问都在 idx < ec 的条件下进行
+    unsafe {
+        if p.len() > 1 && *p.get_unchecked(1) == b'^' {
+            sig = false;
+            idx = 1; // skip the '^'
         }
         idx += 1;
+        while idx < ec {
+            if *p.get_unchecked(idx) == b'%' {
+                idx += 1;
+                if idx < ec && match_class(c, *p.get_unchecked(idx)) {
+                    return sig;
+                }
+            } else if idx + 2 < ec && *p.get_unchecked(idx + 1) == b'-' {
+                if *p.get_unchecked(idx) <= c && c <= *p.get_unchecked(idx + 2) {
+                    return sig;
+                }
+                idx += 2;
+            } else if *p.get_unchecked(idx) == c {
+                return sig;
+            }
+            idx += 1;
+        }
     }
     !sig
 }
@@ -514,7 +524,11 @@ fn single_match(ms: &MatchState, s: usize, p: usize, ep: usize) -> bool {
                 false
             }
         }
-        b'[' => match_bracket_class(c, &ms.pattern[p..ep], ep - p - 1),
+        // 安全性：p < ep <= p_end <= pattern.len()（class_end 保证）
+        b'[' => unsafe {
+            let slice = ms.pattern.get_unchecked(p..ep);
+            match_bracket_class(c, slice, ep - p - 1)
+        },
         _ => ms.pat_byte(p) == c,
     }
 }

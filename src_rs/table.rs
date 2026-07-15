@@ -58,7 +58,10 @@ impl Table {
                 array: (0..narray).map(|_| TValue::Nil(NilKind::Empty)).collect(),
                 hash_buckets: Vec::with_capacity(nhash),
                 key_to_bucket: if nhash > 0 {
-                    Some(Box::new(hashbrown::HashMap::with_capacity(nhash)))
+                    Some(Box::new(hashbrown::HashMap::with_capacity_and_hasher(
+                        nhash,
+                        crate::objects::FxBuildHasher::default(),
+                    )))
                 } else {
                     None
                 },
@@ -276,7 +279,11 @@ impl Table {
         };
         let ktb = data
             .key_to_bucket
-            .get_or_insert_with(|| Box::new(hashbrown::HashMap::new()));
+            .get_or_insert_with(|| {
+                Box::new(hashbrown::HashMap::with_hasher(
+                    crate::objects::FxBuildHasher::default(),
+                ))
+            });
         // 先检查 key 是否已存在，避免克隆 key
         if let Some(idx) = ktb.get(key) {
             data.hash_buckets[*idx].1 = val;
@@ -367,7 +374,7 @@ impl Table {
     /// - 存在：进入指数增长 + 二分查找
     /// 使用 key_to_bucket 代替原 hash HashMap 做 O(1) 存在性检查。
     fn hash_boundary_impl_key_to_bucket(
-        key_to_bucket: &hashbrown::HashMap<TValue, usize>,
+        key_to_bucket: &hashbrown::HashMap<TValue, usize, crate::objects::FxBuildHasher>,
         asize: i64,
         seed: u32,
     ) -> i64 {
@@ -500,7 +507,11 @@ impl Table {
                         let bidx = data.hash_buckets.len();
                         data.hash_buckets.push((k.clone(), v));
                         data.key_to_bucket
-                            .get_or_insert_with(|| Box::new(hashbrown::HashMap::new()))
+                            .get_or_insert_with(|| {
+                                Box::new(hashbrown::HashMap::with_hasher(
+                                    crate::objects::FxBuildHasher::default(),
+                                ))
+                            })
                             .insert(k, bidx);
                     }
                 }
@@ -508,7 +519,11 @@ impl Table {
                     let bidx = data.hash_buckets.len();
                     data.hash_buckets.push((k.clone(), v));
                     data.key_to_bucket
-                        .get_or_insert_with(|| Box::new(hashbrown::HashMap::new()))
+                        .get_or_insert_with(|| {
+                            Box::new(hashbrown::HashMap::with_hasher(
+                                crate::objects::FxBuildHasher::default(),
+                            ))
+                        })
                         .insert(k, bidx);
                 }
             }

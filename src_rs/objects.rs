@@ -22,13 +22,83 @@
 //! ```
 
 use std::fmt;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
 
 use crate::strings::LuaString;
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::gc::GCObjectHeader;
+
+// ============================================================================
+// FxHash — 用于 Table 哈希部分的快速非加密哈希
+// ============================================================================
+//
+// Rust 默认 HashMap 使用 SipHash（抗碰撞攻击），但 Lua 表的 key 已包含足够熵
+// （Integer/Float 直接哈希，String 有预计算哈希，Table 用 ptr_id），
+// 不需要 SipHash 的加密强度。FxHash 速度快 5-10 倍，显著降低哈希开销。
+// 对应 C Lua 的 luaH_hashstr 等使用简单哈希的策略。
+
+/// FxHash 常量种子（来自 rustc-hash crate）
+const FX_HASH_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+
+/// FxHasher — 快速非加密哈希器，用于 Table 的 key_to_bucket HashMap。
+/// 替代默认 SipHash，减少哈希计算开销（perf 显示 SipHash 占 ~4.36%）。
+#[derive(Default)]
+pub struct FxHasher {
+    hash: u64,
+}
+
+impl FxHasher {
+    #[inline]
+    fn add_to_hash(&mut self, i: u64) {
+        self.hash = (self.hash.rotate_left(5) ^ i).wrapping_mul(FX_HASH_SEED);
+    }
+}
+
+impl Hasher for FxHasher {
+    fn finish(&self) -> u64 {
+        self.hash
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for chunk in bytes.chunks_exact(8) {
+            let mut buf = [0u8; 8];
+            buf.copy_from_slice(chunk);
+            self.add_to_hash(u64::from_le_bytes(buf));
+        }
+        let rem = bytes.len() % 8;
+        if rem > 0 {
+            let mut buf = [0u8; 8];
+            buf[..rem].copy_from_slice(&bytes[bytes.len() - rem..]);
+            self.add_to_hash(u64::from_le_bytes(buf));
+        }
+    }
+
+    #[inline]
+    fn write_u8(&mut self, i: u8) { self.add_to_hash(i as u64); }
+    #[inline]
+    fn write_u16(&mut self, i: u16) { self.add_to_hash(i as u64); }
+    #[inline]
+    fn write_u32(&mut self, i: u32) { self.add_to_hash(i as u64); }
+    #[inline]
+    fn write_u64(&mut self, i: u64) { self.add_to_hash(i); }
+    #[inline]
+    fn write_i8(&mut self, i: i8) { self.add_to_hash(i as u64); }
+    #[inline]
+    fn write_i16(&mut self, i: i16) { self.add_to_hash(i as u64); }
+    #[inline]
+    fn write_i32(&mut self, i: i32) { self.add_to_hash(i as u64); }
+    #[inline]
+    fn write_i64(&mut self, i: i64) { self.add_to_hash(i as u64); }
+    #[inline]
+    fn write_usize(&mut self, i: usize) { self.add_to_hash(i as u64); }
+    #[inline]
+    fn write_isize(&mut self, i: isize) { self.add_to_hash(i as u64); }
+}
+
+/// FxBuildHasher — BuildHasher 实现，构造 FxHasher
+pub type FxBuildHasher = BuildHasherDefault<FxHasher>;
 
 // ============================================================================
 // 规约：Lua 基础类型标签
@@ -528,7 +598,8 @@ pub struct TableData {
     pub hash_buckets: Vec<(TValue, TValue)>,
     /// `key → hash_buckets index` 映射 — 让 get / set / next 能 O(1) 定位
     /// Option<Box<…>> 使空表不浪费 HashMap 结构体内存（~56 bytes）
-    pub key_to_bucket: Option<Box<hashbrown::HashMap<TValue, usize>>>,
+    /// 使用 FxBuildHasher 替代默认 SipHash，减少哈希计算开销
+    pub key_to_bucket: Option<Box<hashbrown::HashMap<TValue, usize, FxBuildHasher>>>,
     /// 元表
     pub metatable: Option<Box<Table>>,
 }

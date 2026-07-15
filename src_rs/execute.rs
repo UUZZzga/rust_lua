@@ -4226,20 +4226,22 @@ impl VmExecutor {
         state.n_ccalls = state.n_ccalls.saturating_sub(1);
 
         // 移动结果到 a 位置（对应 C 的 moveresults）
+        // 用 mem::replace 从源位置移出值（填 Nil(Empty)），避免 clone。
+        // 源位置在后续 truncate 中被删除，不会留下垃圾。
         if nresults >= 0 {
             // 固定结果数
             let nresults = nresults as usize;
             let copy_count = n.min(nresults);
-            // 先把结果复制到临时 Vec，避免覆盖问题
-            let results: Vec<TValue> = (0..copy_count)
-                .map(|i| state.stack[first_result + i].clone())
-                .collect();
             // 确保 a + nresults 在栈范围内
             while state.stack.len() <= a + nresults {
                 state.stack.push(TValue::Nil(NilKind::Strict));
             }
             for i in 0..copy_count {
-                state.stack[a + i] = results[i].clone();
+                let val = std::mem::replace(
+                    &mut state.stack[first_result + i],
+                    TValue::Nil(NilKind::Empty),
+                );
+                state.stack[a + i] = val;
             }
             for i in copy_count..nresults {
                 state.stack[a + i] = TValue::Nil(NilKind::Strict);
@@ -4247,14 +4249,15 @@ impl VmExecutor {
             state.stack.truncate(a + nresults);
         } else {
             // MULTRET: 保留所有 n 个结果
-            let results: Vec<TValue> = (0..n)
-                .map(|i| state.stack[first_result + i].clone())
-                .collect();
             while state.stack.len() < a + n {
                 state.stack.push(TValue::Nil(NilKind::Strict));
             }
             for i in 0..n {
-                state.stack[a + i] = results[i].clone();
+                let val = std::mem::replace(
+                    &mut state.stack[first_result + i],
+                    TValue::Nil(NilKind::Empty),
+                );
+                state.stack[a + i] = val;
             }
             state.stack.truncate(a + n);
         }

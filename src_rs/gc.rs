@@ -224,6 +224,10 @@ pub struct GCState {
     next_id: Cell<u32>,
     metas: RefCell<Vec<Option<GCObjectMeta>>>,
     free_ids: RefCell<Vec<u32>>,
+    /// 活跃对象 ID 列表 — sweep 时只遍历此列表而非整个 metas 数组。
+    /// register_object 时 push，sweep_unreachable 时重建（只保留可达对象）。
+    /// 这避免了 metas 数组无限增长导致 sweep 遍历空槽的开销。
+    all_objects: RefCell<Vec<u32>>,
     gray: RefCell<VecDeque<GCObjectId>>,
     gray_again: RefCell<VecDeque<GCObjectId>>,
     weak: RefCell<VecDeque<GCObjectId>>,
@@ -249,6 +253,7 @@ impl GCState {
             next_id: Cell::new(1),
             metas: RefCell::new(Vec::new()),
             free_ids: RefCell::new(Vec::new()),
+            all_objects: RefCell::new(Vec::new()),
             gray: RefCell::new(VecDeque::new()),
             gray_again: RefCell::new(VecDeque::new()),
             weak: RefCell::new(VecDeque::new()),
@@ -355,13 +360,21 @@ impl GCState {
         };
 
         let mut metas = self.metas.borrow_mut();
-        let id_val = self.next_id.get();
-        let id = GCObjectId(id_val);
-        self.next_id.set(id_val + 1);
-        while metas.len() <= id.0 as usize {
-            metas.push(None);
-        }
+        let mut free_ids = self.free_ids.borrow_mut();
+        let mut all_objects = self.all_objects.borrow_mut();
+        // 优先重用已释放的 ID 槽位，避免 metas 数组无限增长
+        let id = if let Some(free_id) = free_ids.pop() {
+            GCObjectId(free_id)
+        } else {
+            let id_val = self.next_id.get();
+            self.next_id.set(id_val + 1);
+            while metas.len() <= id_val as usize {
+                metas.push(None);
+            }
+            GCObjectId(id_val)
+        };
         metas[id.0 as usize] = Some(meta);
+        all_objects.push(id.0);
 
         let current = self.gc_debt.get();
         let charged = size.max(64) as isize;
@@ -381,6 +394,13 @@ impl GCState {
                 self.gc_estimate.set(estimate.saturating_sub(charged));
             }
             metas[id.0 as usize] = None;
+            // 收集释放的 ID 供 register_object 重用
+            self.free_ids.borrow_mut().push(id.0);
+            // 从 all_objects 移除（swap_remove O(1)，顺序不影响正确性）
+            let mut all_objects = self.all_objects.borrow_mut();
+            if let Some(pos) = all_objects.iter().position(|&x| x == id.0) {
+                all_objects.swap_remove(pos);
+            }
         }
     }
 
@@ -416,9 +436,9 @@ impl GCState {
         self.metas.borrow().len()
     }
 
-    /// 返回实际存活（非 None）的对象数
+    /// 返回实际存活（非 None）的对象数 — O(1) 直接读 all_objects 长度
     pub fn active_count(&self) -> usize {
-        self.metas.borrow().iter().filter(|m| m.is_some()).count()
+        self.all_objects.borrow().len()
     }
 
     /// 返回 free_ids 长度
@@ -436,19 +456,30 @@ impl GCState {
         self.next_collect_threshold.set(threshold);
     }
 
-    /// 清扫不可达对象：遍历 metas，释放所有不在 `reachable` 集合中的对象。
-    /// 对应 C 的 sweep 阶段。
-    pub fn sweep_unreachable(&self, reachable: &std::collections::HashSet<usize>) {
+    /// 清扫不可达对象：只遍历 all_objects 活跃列表，释放所有不在 `reachable` 集合中的对象。
+    /// 对应 C 的 sweep 阶段（C 遍历 allgc 链表，此处遍历 all_objects 列表）。
+    pub fn sweep_unreachable(&self, reachable: &std::collections::HashSet<usize, crate::objects::FxBuildHasher>) {
         let mut metas = self.metas.borrow_mut();
+        let mut all_objects = self.all_objects.borrow_mut();
+        let mut free_ids = self.free_ids.borrow_mut();
         let mut total_freed_size = 0usize;
-        for (i, meta_opt) in metas.iter_mut().enumerate() {
-            if meta_opt.is_some() && !reachable.contains(&i) {
-                if let Some(ref meta) = meta_opt {
+        // 原地重建 all_objects：只保留可达对象
+        let mut write = 0usize;
+        for read in 0..all_objects.len() {
+            let id = all_objects[read];
+            let i = id as usize;
+            if !reachable.contains(&i) {
+                if let Some(ref meta) = metas[i] {
                     total_freed_size = total_freed_size.saturating_add(meta.size.max(64));
                 }
-                *meta_opt = None;
+                metas[i] = None;
+                free_ids.push(id);
+            } else {
+                all_objects[write] = id;
+                write += 1;
             }
         }
+        all_objects.truncate(write);
         let estimate = self.gc_estimate.get();
         self.gc_estimate
             .set(estimate.saturating_sub(total_freed_size));
