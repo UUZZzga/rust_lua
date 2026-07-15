@@ -200,7 +200,10 @@ pub struct StringTable {
 impl StringTable {
     pub fn new() -> Self {
         StringTable {
-            ht: RwLock::new(HashMap::with_capacity_and_hasher(128, BuildHasherDefault::<IdHasher>::default())),
+            ht: RwLock::new(HashMap::with_capacity_and_hasher(
+                128,
+                BuildHasherDefault::<IdHasher>::default(),
+            )),
             nuse: RwLock::new(0),
         }
     }
@@ -210,15 +213,20 @@ impl StringTable {
         let h = rust_hash(str);
         debug_assert!(str.len() <= LUAI_MAXSHORTLEN, "intern 只用于短字符串");
 
-        let mut ht = self.ht.write();
-        if let Some(bucket) = ht.get(&h) {
+        // 读优先路径: 绝大多数 intern 调用是查找已有字符串
+        let ht_reader = self.ht.read();
+        if let Some(bucket) = ht_reader.get(&h) {
             for ts in bucket {
                 if *ts.contents == *str {
                     return LuaString::Short(Arc::clone(ts));
                 }
             }
         }
+        drop(ht_reader);
 
+        // 写路径: 需要插入新字符串
+        // TOCTOU 在单线程执行中安全; 多线程下最多导致重复桶条目(无害)
+        let mut ht = self.ht.write();
         let ts = Arc::new(ShortString {
             hash: h,
             contents: str.to_string(),

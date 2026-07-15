@@ -590,7 +590,7 @@ fn max_expand(ms: &mut MatchState, s: usize, p: usize, ep: usize) -> Result<Opti
 }
 
 /// 对应 C 的 min_expand
-fn min_expand(ms: &mut MatchState, s: usize, p: usize, ep: usize) -> Result<Option<usize>, String> {
+fn min_expand(ms: &mut MatchState, mut s: usize, p: usize, ep: usize) -> Result<Option<usize>, String> {
     loop {
         let res = match_pattern(ms, s, ep + 1)?;
         if res.is_some() {
@@ -600,7 +600,7 @@ fn min_expand(ms: &mut MatchState, s: usize, p: usize, ep: usize) -> Result<Opti
             if s + 1 > ms.src_end {
                 return Ok(None);
             }
-            return min_expand(ms, s + 1, p, ep);
+            s += 1;
         } else {
             return Ok(None);
         }
@@ -1500,11 +1500,15 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
     let mut i = 0;
 
     while i < fmt_bytes.len() {
-        if fmt_bytes[i] != b'%' {
-            result.push(fmt_bytes[i] as char);
+        // Push consecutive literal (non-%) text as a single slice to avoid O(N) char pushes
+        let lit_start = i;
+        while i < fmt_bytes.len() && fmt_bytes[i] != b'%' {
             i += 1;
-            continue;
         }
+        if i > lit_start {
+            result.push_str(unsafe { std::str::from_utf8_unchecked(&fmt_bytes[lit_start..i]) });
+        }
+        if i >= fmt_bytes.len() { break; }
         i += 1; // skip '%'
         if i >= fmt_bytes.len() {
             return Err("invalid conversion '%' to 'format'".to_string());
@@ -3255,13 +3259,15 @@ pub fn call_string_function(
                     TValue::Nil(NilKind::Strict)
                 }
             }).collect();
-            // 对应 C 的 luaL_tolstring: 仅对 %s 参数中的 table 调用 __tostring 元方法。
-            // %q 等其他 specifier 不转换,以便 str_format 正确报 "value has no literal form"。
-            let s_indices = find_s_arg_indices(&fmt);
-            for (i, arg) in args.iter_mut().enumerate() {
-                if s_indices.contains(&i) {
-                    if let Some(s) = tostring_for_format(state, arg) {
-                        *arg = TValue::Str(state.intern_str(&s));
+            // Fast path: only need __tostring conversion when a %s arg is a table.
+            // Avoid HashSet allocation + format scan for the common case (all string args).
+            if args.iter().any(|arg| matches!(arg, TValue::Table(_))) {
+                let s_indices = find_s_arg_indices(&fmt);
+                for (i, arg) in args.iter_mut().enumerate() {
+                    if s_indices.contains(&i) {
+                        if let Some(s) = tostring_for_format(state, arg) {
+                            *arg = TValue::Str(state.intern_str(&s));
+                        }
                     }
                 }
             }

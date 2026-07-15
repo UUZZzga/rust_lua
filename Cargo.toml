@@ -50,7 +50,6 @@ hashbrown = "0.15"
 bitflags = "2"
 imara-diff = "0.2"
 parking_lot = "0.12"
-tikv-jemallocator = "0.6"
 
 [build-dependencies]
 cc = "1.0"

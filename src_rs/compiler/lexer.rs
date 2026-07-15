@@ -317,6 +317,7 @@ impl<'a> LexState<'a> {
         }
     }
 
+    #[inline(always)]
     fn next_char(&mut self) {
         let old = self.current;
         if old == '\n' || old == '\r' {
@@ -333,6 +334,7 @@ impl<'a> LexState<'a> {
     }
 
     /// 仅推进位置指针并更新 current,不处理行号。
+    #[inline(always)]
     fn advance_pos(&mut self) {
         let bytes = self.source.as_bytes();
         if self.pos < bytes.len() {
@@ -349,6 +351,7 @@ impl<'a> LexState<'a> {
         self.current = read_char_at(self.source.as_bytes(), self.pos);
     }
 
+    #[inline(always)]
     fn peek(&self) -> char {
         let bytes = self.source.as_bytes();
         let mut pos = self.pos;
@@ -366,6 +369,7 @@ impl<'a> LexState<'a> {
         read_char_at(bytes, pos)
     }
 
+    #[inline(always)]
     fn skip_whitespace(&mut self) {
         loop {
             match self.current {

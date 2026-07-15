@@ -798,8 +798,8 @@ impl VmExecutor {
 
         loop {
             // 检查信号中断 — 对应 C 的 lstop hook 抛出 "interrupted!" 错误
-            if INTERRUPTED.load(Ordering::SeqCst) {
-                INTERRUPTED.store(false, Ordering::SeqCst);
+            if INTERRUPTED.load(Ordering::Relaxed) {
+                INTERRUPTED.store(false, Ordering::Release);
                 return Err(VmError::RuntimeError("interrupted!".to_string()));
             }
             if state.pc >= state.code.len() {
@@ -828,7 +828,7 @@ impl VmExecutor {
                 return Ok(VmResult::Return { nresults: 0, result_base: state.base });
             }
 
-            let inst = state.code[state.pc];
+            let inst = unsafe { *state.code.get_unchecked(state.pc) };
             let op = opcodes::get_opcode(inst);
 
             // 检查 count hook 和 line hook — 对应 C 的 luaG_traceexec

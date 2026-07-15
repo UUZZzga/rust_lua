@@ -491,9 +491,9 @@ pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
     // C 版在第一个语法错误时通过 luaD_throw 立即停止；Rust 版收集所有错误，
     // 但只返回第一个，保持与 C 一致的行为（特别是 incomplete 检查依赖错误消息
     // 以 "<eof>" 结尾，多行错误消息会破坏这个检查）。
-    let mut all_errors = std::mem::take(&mut fs.errors);
-    all_errors.extend(fs.ls_mut().errors.drain(..));
-    if !all_errors.is_empty() {
+    if !fs.errors.is_empty() || !fs.ls().errors.is_empty() {
+        let mut all_errors = std::mem::take(&mut fs.errors);
+        all_errors.extend(fs.ls_mut().errors.drain(..));
         return Err(all_errors.into_iter().next().unwrap());
     }
 

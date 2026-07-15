@@ -24,7 +24,7 @@ pub fn new_proto() -> Proto {
         upvalues: Vec::with_capacity(2),
         line_info: Vec::with_capacity(8),
         abs_line_info: Vec::new(),
-        loc_vars: Vec::with_capacity(4),
+        loc_vars: Vec::new(),
         source: None,
     }
 }
