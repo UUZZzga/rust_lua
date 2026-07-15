@@ -39,6 +39,35 @@ pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
 use std::ffi::c_void;
 
 // ============================================================================
+// 算术二元运算宏
+// ----------------------------------------------------------------------------
+// 替代原 arith_binary(v1, v2, float_op: fn, int_op: fn) —— 函数指针参数会
+// 阻碍 LLVM 内联特化，生成间接 call（perf annotate 中可见 `call rbp`/`call r15`
+// 等间接调用）。宏用 token 拼接（$op / $int_method）直接展开为 `add`/`sub`/
+// `imul` 等原生指令，消除函数指针间接调用。
+//
+// 用法: arith_bin!(v1, v2, +, wrapping_add)  →  Integer: i1.wrapping_add(i2)
+//                                                Float:    n1 + n2
+// 整数运算用方法形式（wrapping_add 等），浮点用运算符（+/ -/ *）。
+// ============================================================================
+macro_rules! arith_bin {
+    ($v1:expr, $v2:expr, $op:tt, $int_method:ident) => {{
+        match ($v1, $v2) {
+            (TValue::Integer(i1), TValue::Integer(i2)) => {
+                TValue::Integer((*i1).$int_method(*i2))
+            }
+            _ => {
+                if let (Some(n1), Some(n2)) = (to_number_ns($v1), to_number_ns($v2)) {
+                    TValue::Float(n1 $op n2)
+                } else {
+                    TValue::Nil(NilKind::Strict)
+                }
+            }
+        }
+    }};
+}
+
+// ============================================================================
 // VmResult / VmError
 // ============================================================================
 
@@ -1631,15 +1660,15 @@ impl VmExecutor {
     // 辅助方法
     // ========================================================================
 
-    #[inline]
+    #[inline(always)]
     fn ra(state: &LuaState, inst: Instruction) -> usize {
         state.base + opcodes::getarg_a(inst) as usize
     }
-    #[inline]
+    #[inline(always)]
     fn rb(state: &LuaState, inst: Instruction) -> usize {
         state.base + opcodes::getarg_b(inst) as usize
     }
-    #[inline]
+    #[inline(always)]
     fn rc(state: &LuaState, inst: Instruction) -> usize {
         state.base + opcodes::getarg_c(inst) as usize
     }
@@ -1657,7 +1686,7 @@ impl VmExecutor {
         state.stack.resize(idx + 1, TValue::Nil(NilKind::Strict));
     }
 
-    #[inline]
+    #[inline(always)]
     fn write_stack(state: &mut LuaState, idx: usize, val: TValue) {
         if idx >= state.stack.len() {
             Self::write_stack_grow(state, idx);
@@ -1745,6 +1774,7 @@ impl VmExecutor {
         idx
     }
 
+    #[inline(always)]
     fn do_conditional_jump(state: &mut LuaState, inst: Instruction, cond: bool) {
         let expected = opcodes::testarg_k(inst);
         if cond == expected {
@@ -2420,6 +2450,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_loadkx(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         state.pc += 1;
@@ -2439,6 +2470,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_lfalseskip(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         Self::write_stack(state, a, TValue::Boolean(false));
@@ -2446,6 +2478,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_loadtrue(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         Self::write_stack(state, a, TValue::Boolean(true));
@@ -2464,6 +2497,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_getupval(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as usize;
@@ -2485,6 +2519,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_setupval(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as usize;
@@ -2764,7 +2799,7 @@ impl VmExecutor {
             .unwrap_or(TValue::Nil(NilKind::Strict));
         let v1 = Self::read_stack(state, b);
         if v1.is_number() && v2.is_number() {
-            let result = Self::arith_binary(&v1, &v2, |a, b| a + b, |a, b| a.wrapping_add(b));
+            let result = arith_bin!(v1, &v2, +, wrapping_add);
             Self::write_stack(state, a, result);
             state.pc += 2; // skip MMBINK
         } else {
@@ -2785,7 +2820,7 @@ impl VmExecutor {
             .unwrap_or(TValue::Nil(NilKind::Strict));
         let v1 = Self::read_stack(state, b);
         if v1.is_number() && v2.is_number() {
-            let result = Self::arith_binary(&v1, &v2, |a, b| a - b, |a, b| a.wrapping_sub(b));
+            let result = arith_bin!(v1, &v2, -, wrapping_sub);
             Self::write_stack(state, a, result);
             state.pc += 2; // skip MMBINK
         } else {
@@ -2806,7 +2841,7 @@ impl VmExecutor {
             .unwrap_or(TValue::Nil(NilKind::Strict));
         let v1 = Self::read_stack(state, b);
         if v1.is_number() && v2.is_number() {
-            let result = Self::arith_binary(&v1, &v2, |a, b| a * b, |a, b| a.wrapping_mul(b));
+            let result = arith_bin!(v1, &v2, *, wrapping_mul);
             Self::write_stack(state, a, result);
             state.pc += 2; // skip MMBINK
         } else {
@@ -2815,6 +2850,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_modk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2835,6 +2871,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_powk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2854,6 +2891,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_divk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2873,6 +2911,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_idivk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2893,6 +2932,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_bandk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2912,6 +2952,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_bork(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2931,6 +2972,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_bxork(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2950,6 +2992,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_shli(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2965,6 +3008,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_shri(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -2989,7 +3033,8 @@ impl VmExecutor {
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if v1.is_number() && v2.is_number() {
-            let result = Self::arith_binary(v1, v2, |a, b| a + b, |a, b| a.wrapping_add(b));
+            // 用宏替代 arith_binary —— 消除 fn 指针间接 call，运算直接内联为 add/imul
+            let result = arith_bin!(v1, v2, +, wrapping_add);
             Self::write_stack(state, a, result);
             state.pc += 2; // skip MMBIN
         } else {
@@ -3006,7 +3051,7 @@ impl VmExecutor {
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if v1.is_number() && v2.is_number() {
-            let result = Self::arith_binary(&v1, &v2, |a, b| a - b, |a, b| a.wrapping_sub(b));
+            let result = arith_bin!(v1, v2, -, wrapping_sub);
             Self::write_stack(state, a, result);
             state.pc += 2; // skip MMBIN
         } else {
@@ -3023,7 +3068,7 @@ impl VmExecutor {
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if v1.is_number() && v2.is_number() {
-            let result = Self::arith_binary(&v1, &v2, |a, b| a * b, |a, b| a.wrapping_mul(b));
+            let result = arith_bin!(v1, v2, *, wrapping_mul);
             Self::write_stack(state, a, result);
             state.pc += 2; // skip MMBIN
         } else {
@@ -3032,6 +3077,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_mod(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -3048,6 +3094,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_pow(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -3079,6 +3126,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_idiv(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -3095,6 +3143,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_band(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -3113,6 +3162,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_bor(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -3131,6 +3181,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_bxor(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -3149,6 +3200,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_shl(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -3167,6 +3219,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_shr(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -3271,6 +3324,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_bnot(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         // C: ra = RA(i), rb = vRB(i)
         // C: if tointegerns(rb, &ib): setivalue(s2v(ra), ~ib)
@@ -3465,9 +3519,31 @@ impl VmExecutor {
         //     Protect(cond = luaV_equalobj(L, s2v(ra), rb));
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
-        let v1 = Self::read_stack(state, a).clone();
-        let v2 = Self::read_stack(state, b).clone();
-        let cond = equal_obj(state, &v1, &v2)?;
+        // 快速路径：number/string/同对象比较不 clone，仅 table/userdata metamethod 路径 clone。
+        // 原 op_eq 对 read_stack 结果直接 .clone()，每次比较产生 2 次 TValue clone+drop
+        // （perf 中 TValue clone 7.79% + drop glue 13.48% 的重要来源）。
+        let fast: Option<bool> = {
+            let v1 = Self::read_stack(state, a);
+            let v2 = Self::read_stack(state, b);
+            if v1.is_number() && v2.is_number() {
+                Some(raw_equal(v1, v2))
+            } else if std::mem::discriminant(v1) != std::mem::discriminant(v2) {
+                Some(false)
+            } else if raw_equal(v1, v2) {
+                Some(true)
+            } else {
+                None // 需元方法（仅 table/userdata）
+            }
+        };
+        let cond = match fast {
+            Some(c) => c,
+            None => {
+                // cold path：clone 后调用 __eq 元方法
+                let v1 = Self::read_stack(state, a).clone();
+                let v2 = Self::read_stack(state, b).clone();
+                equal_obj(state, &v1, &v2)?
+            }
+        };
         Self::do_conditional_jump(state, inst, cond);
         Ok(())
     }
@@ -3478,14 +3554,25 @@ impl VmExecutor {
         // lessthanothers: if (string) strcmp; else luaT_callorderTM(L, l, r, TM_LT)
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
-        let v1 = Self::read_stack(state, a).clone();
-        let v2 = Self::read_stack(state, b).clone();
-        let cond = if v1.is_number() && v2.is_number() {
-            crate::vm::lt_num(&v1, &v2)
-        } else if let (TValue::Str(s1), TValue::Str(s2)) = (&v1, &v2) {
-            crate::vm::strcmp(s1, s2) == std::cmp::Ordering::Less
-        } else {
-            call_order_tm(state, &v1, &v2, TagMethod::Lt)?
+        // 快速路径不 clone；仅非 number/string 路径 clone 调用 __lt
+        let fast: Option<bool> = {
+            let v1 = Self::read_stack(state, a);
+            let v2 = Self::read_stack(state, b);
+            if v1.is_number() && v2.is_number() {
+                Some(crate::vm::lt_num(v1, v2))
+            } else if let (TValue::Str(s1), TValue::Str(s2)) = (v1, v2) {
+                Some(crate::vm::strcmp(s1, s2) == std::cmp::Ordering::Less)
+            } else {
+                None
+            }
+        };
+        let cond = match fast {
+            Some(c) => c,
+            None => {
+                let v1 = Self::read_stack(state, a).clone();
+                let v2 = Self::read_stack(state, b).clone();
+                call_order_tm(state, &v1, &v2, TagMethod::Lt)?
+            }
         };
         Self::do_conditional_jump(state, inst, cond);
         Ok(())
@@ -3497,19 +3584,31 @@ impl VmExecutor {
         // lessequalothers: if (string) strcmp; else luaT_callorderTM(L, l, r, TM_LE)
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
-        let v1 = Self::read_stack(state, a).clone();
-        let v2 = Self::read_stack(state, b).clone();
-        let cond = if v1.is_number() && v2.is_number() {
-            crate::vm::le_num(&v1, &v2)
-        } else if let (TValue::Str(s1), TValue::Str(s2)) = (&v1, &v2) {
-            crate::vm::strcmp(s1, s2) != std::cmp::Ordering::Greater
-        } else {
-            call_order_tm(state, &v1, &v2, TagMethod::Le)?
+        // 快速路径不 clone；仅非 number/string 路径 clone 调用 __le
+        let fast: Option<bool> = {
+            let v1 = Self::read_stack(state, a);
+            let v2 = Self::read_stack(state, b);
+            if v1.is_number() && v2.is_number() {
+                Some(crate::vm::le_num(v1, v2))
+            } else if let (TValue::Str(s1), TValue::Str(s2)) = (v1, v2) {
+                Some(crate::vm::strcmp(s1, s2) != std::cmp::Ordering::Greater)
+            } else {
+                None
+            }
+        };
+        let cond = match fast {
+            Some(c) => c,
+            None => {
+                let v1 = Self::read_stack(state, a).clone();
+                let v2 = Self::read_stack(state, b).clone();
+                call_order_tm(state, &v1, &v2, TagMethod::Le)?
+            }
         };
         Self::do_conditional_jump(state, inst, cond);
         Ok(())
     }
 
+    #[inline]
     fn op_eqk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b_key = opcodes::getarg_b(inst) as usize;
@@ -3520,6 +3619,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_eqi(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         // EQI 是 IABC 模式,使用 sB 参数 (有符号 B, 8 位)
@@ -3535,6 +3635,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_lti(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         // C: op_orderI(L, l_lti, luai_numlt, 0, TM_LT)
         // flip = 0, event = LT → __lt(a, im)
@@ -3552,6 +3653,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_lei(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         // C: op_orderI(L, l_lei, luai_numle, 0, TM_LE)
         // flip = 0, event = LE → __le(a, im)
@@ -3568,6 +3670,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_gti(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         // C: op_orderI(L, l_gti, luai_numgt, 1, TM_LT)
         // flip = 1, event = LT → __lt(im, a)  (a > im 等价于 im < a)
@@ -3584,6 +3687,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_gei(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         // C: op_orderI(L, l_gei, luai_numge, 1, TM_LE)
         // flip = 1, event = LE → __le(im, a)  (a >= im 等价于 im <= a)
@@ -3600,6 +3704,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_test(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let v = Self::read_stack(state, a);
@@ -3608,6 +3713,7 @@ impl VmExecutor {
         Ok(())
     }
 
+    #[inline]
     fn op_testset(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -5928,24 +6034,7 @@ impl VmExecutor {
         }
     }
 
-    fn arith_binary(
-        v1: &TValue,
-        v2: &TValue,
-        float_op: fn(f64, f64) -> f64,
-        int_op: fn(i64, i64) -> i64,
-    ) -> TValue {
-        match (v1, v2) {
-            (TValue::Integer(i1), TValue::Integer(i2)) => TValue::Integer(int_op(*i1, *i2)),
-            _ => {
-                if let (Some(n1), Some(n2)) = (to_number_ns(v1), to_number_ns(v2)) {
-                    TValue::Float(float_op(n1, n2))
-                } else {
-                    TValue::Nil(NilKind::Strict)
-                }
-            }
-        }
-    }
-
+    #[inline(always)]
     fn arith_mod(v1: &TValue, v2: &TValue) -> Result<TValue, VmError> {
         match (v1, v2) {
             (TValue::Integer(i1), TValue::Integer(i2)) => {
@@ -5962,6 +6051,7 @@ impl VmExecutor {
         }
     }
 
+    #[inline(always)]
     fn arith_idiv(v1: &TValue, v2: &TValue) -> Result<TValue, VmError> {
         match (v1, v2) {
             (TValue::Integer(i1), TValue::Integer(i2)) => {
