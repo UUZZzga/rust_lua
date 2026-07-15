@@ -428,27 +428,22 @@ pub(crate) fn call_tm_res(
     let caller_nextraargs = state.nextraargs;
     let caller_closure_upvals = state.closure_upvals.clone();
     let caller_tbc_list = state.tbc_list;
-    let caller_source = if state.base > 0 && state.base <= state.stack.len() {
+    let caller_proto = if state.base > 0 && state.base <= state.stack.len() {
         if let TValue::LClosure(c) = &state.stack[state.base - 1] {
-            c.proto
-                .source
-                .as_ref()
-                .map(|s| s.as_str().to_string())
-                .unwrap_or_else(|| "=?".to_string())
+            Some(Rc::clone(&c.proto))
         } else {
-            "=[C]".to_string()
+            None
         }
     } else {
-        "=?".to_string()
+        None
     };
     state.call_info.push(crate::state::CallInfoEntry {
-        source: caller_source,
-        line: -1,
-        name: tm.event_name().to_string(),
+        caller_proto,
         is_c: false,
         closure: None,
         base: caller_base,
         saved_pc: caller_pc,
+        name: tm.event_name().to_string(),
         namewhat: "metamethod".to_string(),
         proto_flag: caller_proto_flag,
         nextraargs: caller_nextraargs,
@@ -602,27 +597,22 @@ pub(crate) fn call_tm(
     let caller_nextraargs = state.nextraargs;
     let caller_closure_upvals = state.closure_upvals.clone();
     let caller_tbc_list = state.tbc_list;
-    let caller_source = if state.base > 0 && state.base <= state.stack.len() {
+    let caller_proto = if state.base > 0 && state.base <= state.stack.len() {
         if let TValue::LClosure(c) = &state.stack[state.base - 1] {
-            c.proto
-                .source
-                .as_ref()
-                .map(|s| s.as_str().to_string())
-                .unwrap_or_else(|| "=?".to_string())
+            Some(Rc::clone(&c.proto))
         } else {
-            "=[C]".to_string()
+            None
         }
     } else {
-        "=?".to_string()
+        None
     };
     state.call_info.push(crate::state::CallInfoEntry {
-        source: caller_source,
-        line: -1,
-        name: tm.event_name().to_string(),
+        caller_proto,
         is_c: false,
         closure: None,
         base: caller_base,
         saved_pc: caller_pc,
+        name: tm.event_name().to_string(),
         namewhat: "metamethod".to_string(),
         proto_flag: caller_proto_flag,
         nextraargs: caller_nextraargs,
@@ -784,27 +774,22 @@ pub fn call_close_method(
     // 推入 CallInfoEntry — 对应 C 的 luaD_callnoyield 推入 CallInfo
     let caller_base = state.base;
     let caller_pc = state.pc;
-    let caller_source = if state.base > 0 && state.base <= state.stack.len() {
+    let caller_proto = if state.base > 0 && state.base <= state.stack.len() {
         if let TValue::LClosure(c) = &state.stack[state.base - 1] {
-            c.proto
-                .source
-                .as_ref()
-                .map(|s| s.as_str().to_string())
-                .unwrap_or_else(|| "=?".to_string())
+            Some(Rc::clone(&c.proto))
         } else {
-            "=[C]".to_string()
+            None
         }
     } else {
-        "=?".to_string()
+        None
     };
     state.call_info.push(crate::state::CallInfoEntry {
-        source: caller_source,
-        line: -1,
-        name: "close".to_string(),
+        caller_proto,
         is_c: false,
         closure: None,
         base: caller_base,
         saved_pc: caller_pc,
+        name: "close".to_string(),
         namewhat: "metamethod".to_string(),
         proto_flag: state.proto_flag,
         nextraargs: state.nextraargs,

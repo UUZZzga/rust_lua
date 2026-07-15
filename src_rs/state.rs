@@ -310,9 +310,9 @@ pub struct LuaState {
 /// 调用栈条目 — 用于堆栈回溯和 debug.getinfo
 #[derive(Debug, Clone)]
 pub struct CallInfoEntry {
-    pub source: String,
-    pub line: i32,
-    pub name: String,
+    /// 调用者的 Proto（用于 traceback 时实时计算 source/line/name）
+    /// C 函数帧和 hook 帧可能为 None
+    pub caller_proto: Option<Rc<Proto>>,
     pub is_c: bool,
     /// Lua 函数引用（C 函数为 None）
     pub closure: Option<Box<crate::objects::LClosure>>,
@@ -320,7 +320,10 @@ pub struct CallInfoEntry {
     pub base: usize,
     /// 调用时的 PC（用于计算 currentline）
     pub saved_pc: usize,
-    /// 函数名类型: "local", "global", "method", "field", "hook", ""
+    /// 函数名（C 函数帧/hook/metamethod 预设置；Lua 函数帧默认空，traceback 时实时计算）
+    pub name: String,
+    /// 函数名类型: "local", "global", "method", "field", "hook", "metamethod", ""
+    /// （C 函数帧/hook/metamethod 预设置；Lua 函数帧默认空，traceback 时实时计算）
     pub namewhat: String,
     /// 调用者的 proto_flag（PF_VAHID / PF_VATAB）— 用于 debug.getlocal level > 1
     pub proto_flag: u8,
@@ -1431,18 +1434,19 @@ impl LuaState {
             result.push_str("\n\t[C]: in ?");
         } else {
             for entry in &self.call_info {
+                let (src, line, name, _) = crate::execute::compute_caller_info(entry);
                 result.push('\n');
                 result.push('\t');
                 if entry.is_c {
                     result.push_str("[C]: in ");
-                    result.push_str(&entry.name);
+                    result.push_str(&name);
                 } else {
-                    if entry.line > 0 {
-                        result.push_str(&format!("{}:{}: in ", entry.source, entry.line));
+                    if line > 0 {
+                        result.push_str(&format!("{}:{}: in ", src, line));
                     } else {
-                        result.push_str(&format!("{}: in ", entry.source));
+                        result.push_str(&format!("{}: in ", src));
                     }
-                    result.push_str(&entry.name);
+                    result.push_str(&name);
                 }
             }
             // 最后添加 [C]: in ?
@@ -1740,6 +1744,11 @@ impl LuaState {
                 let nfixparams = closure.proto.num_params as usize;
                 let proto_is_vararg = closure.proto.is_vararg();
 
+                // 提前提取 proto 和 upvals 的 Rc 引用，使后续可以 move closure（而非 clone）
+                // perf: 消除 CallInfoEntry.closure 的 Box 堆分配
+                let proto = Rc::clone(&closure.proto);
+                let upvals = Rc::clone(&closure.upvals);
+
                 let saved_code = std::mem::take(&mut self.code);
                 let saved_constants = std::mem::take(&mut self.constants);
                 let saved_upval_descs = std::mem::take(&mut self.upval_descs);
@@ -1775,56 +1784,52 @@ impl LuaState {
                 let already_has_entry = self.call_info.last().map_or(false, |e| {
                     e.closure
                         .as_ref()
-                        .map_or(false, |c| Rc::ptr_eq(&c.proto, &closure.proto))
+                        .map_or(false, |c| Rc::ptr_eq(&c.proto, &proto))
                         || (!e.namewhat.is_empty() && !e.is_c)
                 });
                 let pushed_call_info = !already_has_entry;
                 if pushed_call_info {
-                    let (caller_source, caller_line, caller_base, caller_pc) = if caller_is_lua {
+                    let (caller_proto, caller_base, caller_pc) = if caller_is_lua {
                         if let TValue::LClosure(prev_closure) = &self.stack[self.base - 1] {
-                            let src = prev_closure
-                                .proto
-                                .source
-                                .as_ref()
-                                .map(|s| s.as_str().to_string())
-                                .unwrap_or_else(|| "=?".to_string());
-                            let line = crate::execute::get_proto_line(&prev_closure.proto, self.pc);
-                            (src, line, self.base, self.pc)
+                            (Some(Rc::clone(&prev_closure.proto)), self.base, self.pc)
                         } else {
                             unreachable!()
                         }
                     } else {
-                        // C 调用者: source="=[C]", line=-1, base=0, saved_pc=0
-                        ("=[C]".to_string(), -1, 0usize, 0usize)
+                        // C 调用者: caller_proto=None, base=0, saved_pc=0
+                        (None, 0usize, 0usize)
                     };
                     self.call_info.push(crate::state::CallInfoEntry {
-                        source: caller_source,
-                        line: caller_line,
-                        name: String::new(),
+                        caller_proto,
                         is_c: !caller_is_lua,
-                        closure: Some(closure.clone()),
+                        // move closure 避免 clone + Box 堆分配
+                        closure: Some(closure),
                         base: caller_base,
                         saved_pc: caller_pc,
+                        name: String::new(),
                         namewhat: String::new(),
                         proto_flag: self.proto_flag,
                         nextraargs: self.nextraargs,
                         is_tailcall: false,
                     });
+                } else {
+                    // 不需要 closure，drop 它
+                    drop(closure);
                 }
 
-                self.code = closure.proto.code.clone();
-                self.constants = closure.proto.constants.clone();
-                self.upval_descs = closure.proto.upvalues.clone();
-                self.protos = closure.proto.protos.clone();
+                self.code = Rc::clone(&proto.code);
+                self.constants = Rc::clone(&proto.constants);
+                self.upval_descs = Rc::clone(&proto.upvalues);
+                self.protos = proto.protos.clone();
                 self.base = func_idx + 1;
                 self.pc = 0;
-                self.num_params = closure.proto.num_params;
-                self.is_vararg = closure.proto.is_vararg();
-                self.proto_flag = closure.proto.flag;
+                self.num_params = proto.num_params;
+                self.is_vararg = proto.is_vararg();
+                self.proto_flag = proto.flag;
                 self.nextraargs = 0;
                 // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
                 // upvals 是 Rc<RefCell<Vec>>，这里 clone 出 Vec 供执行期使用
-                self.closure_upvals = closure.upvals.borrow().clone();
+                self.closure_upvals = upvals.borrow().clone();
                 self.tbc_list = None;
                 // 不清空 state.open_upval: 全局链表机制下，open_upval 不随函数调用/返回保存/恢复
                 // (对应 C 的 L->openupval 全局链表，luaD_precall 不修改它)
@@ -2217,13 +2222,12 @@ impl LuaState {
                     None
                 };
                 self.call_info.push(crate::state::CallInfoEntry {
-                    source: "=[C]".to_string(),
-                    line: -1,
-                    name: c_func_name.unwrap_or_default(),
+                    caller_proto: None,
                     is_c: true,
                     closure: None,
                     base: func_idx + 1,
                     saved_pc: self.pc,
+                    name: c_func_name.unwrap_or_default(),
                     namewhat: "field".to_string(),
                     proto_flag: self.proto_flag,
                     nextraargs: self.nextraargs,
@@ -3043,27 +3047,22 @@ impl LuaState {
             self.stack.push(obj_val);
             self.top = self.stack.len();
 
-            let caller_source = if self.base > 0 && self.base <= self.stack.len() {
+            let caller_proto = if self.base > 0 && self.base <= self.stack.len() {
                 if let TValue::LClosure(c) = &self.stack[self.base - 1] {
-                    c.proto
-                        .source
-                        .as_ref()
-                        .map(|s| s.as_str().to_string())
-                        .unwrap_or_else(|| "=?".to_string())
+                    Some(Rc::clone(&c.proto))
                 } else {
-                    "=[C]".to_string()
+                    None
                 }
             } else {
-                "=?".to_string()
+                None
             };
             self.call_info.push(CallInfoEntry {
-                source: caller_source,
-                line: -1,
-                name: "__gc".to_string(),
+                caller_proto,
                 is_c: false,
                 closure: None,
                 base: self.base,
                 saved_pc: self.pc,
+                name: "__gc".to_string(),
                 namewhat: "metamethod".to_string(),
                 proto_flag: self.proto_flag,
                 nextraargs: self.nextraargs,

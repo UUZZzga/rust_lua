@@ -1724,20 +1724,14 @@ fn setup_first_resume(
 
         // 推入初始 CallInfoEntry — 对应 C 中协程的 base CallInfo
         // 记录协程主函数的信息，使 traceback/getinfo 能正确显示最外层帧
-        let init_source = closure
-            .proto
-            .source
-            .as_ref()
-            .map(|s| s.as_str().to_string())
-            .unwrap_or_else(|| "=?".to_string());
+        // caller_proto 设为协程主函数的 proto，让 compute_caller_info 能提取 source
         state.call_info = vec![crate::state::CallInfoEntry {
-            source: init_source,
-            line: -1,
-            name: String::new(),
+            caller_proto: Some(Rc::clone(&closure.proto)),
             is_c: false,
             closure: Some(closure.clone()),
             base: 1,
             saved_pc: 0,
+            name: String::new(),
             namewhat: String::new(),
             proto_flag: closure.proto.flag,
             nextraargs: 0,

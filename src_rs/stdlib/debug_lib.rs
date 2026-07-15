@@ -1018,13 +1018,14 @@ fn fill_info_from_level(state: &LuaState, info: &mut DebugInfo, level: i32, what
                 .call_info
                 .get(name_idx)
                 .map(|entry| {
+                    let (_, _, n, nw) = crate::execute::compute_caller_info(entry);
                     (
-                        if entry.name.is_empty() {
+                        if n.is_empty() {
                             None
                         } else {
-                            Some(entry.name.clone())
+                            Some(n)
                         },
-                        entry.namewhat.clone(),
+                        nw,
                     )
                 })
                 .unwrap_or((None, String::new()));
@@ -1147,15 +1148,17 @@ fn fill_info_from_level(state: &LuaState, info: &mut DebugInfo, level: i32, what
 
     // 调用者的名字来自前一个 entry（调用者被调用时推入的记录）
     // 若 ci_idx == 0，调用者是主函数，没有名字
+    // name/namewhat 延迟计算: 通过 compute_caller_info 从 prev.caller_proto + prev.saved_pc 实时获取
     let (caller_name, caller_namewhat) = if ci_idx > 0 {
         let prev = &state.call_info[ci_idx - 1];
+        let (_, _, n, nw) = crate::execute::compute_caller_info(prev);
         (
-            if prev.name.is_empty() {
+            if n.is_empty() {
                 None
             } else {
-                Some(prev.name.clone())
+                Some(n)
             },
-            prev.namewhat.clone(),
+            nw,
         )
     } else {
         (None, String::new())
@@ -1365,13 +1368,14 @@ fn fill_info_from_thread(
             // 名字来自调用当前帧的 call_info 条目
             let (name, namewhat) = if n > c_chain_len {
                 let name_entry = &call_info[n - 1 - c_chain_len];
+                let (_, _, nm, nw) = crate::execute::compute_caller_info(name_entry);
                 (
-                    if name_entry.name.is_empty() {
+                    if nm.is_empty() {
                         None
                     } else {
-                        Some(name_entry.name.clone())
+                        Some(nm)
                     },
-                    name_entry.namewhat.clone(),
+                    nw,
                 )
             } else {
                 (None, String::new())
@@ -1508,7 +1512,8 @@ fn fill_info_from_thread(
             .to_string();
         }
         if what.contains('l') {
-            info.currentline = next_entry.line;
+            let (_, line, _, _) = crate::execute::compute_caller_info(next_entry);
+            info.currentline = line;
         }
         if what.contains('u') {
             info.nups = closure.upvals.borrow().len();
@@ -1516,12 +1521,13 @@ fn fill_info_from_thread(
             info.isvararg = proto.is_vararg();
         }
         if what.contains('n') {
-            info.name = if entry.name.is_empty() {
+            let (_, _, name, namewhat) = crate::execute::compute_caller_info(entry);
+            info.name = if name.is_empty() {
                 None
             } else {
-                Some(entry.name.clone())
+                Some(name)
             };
-            info.namewhat = entry.namewhat.clone();
+            info.namewhat = namewhat;
         }
         if what.contains('t') {
             info.istailcall = entry.is_tailcall;
@@ -2964,9 +2970,11 @@ fn build_traceback(state: &LuaState, msg: &str, level: i32) -> String {
                 let (name, namewhat) =
                     if state.call_info.last().map(|e| e.is_c).unwrap_or(false) && n >= 2 {
                         let e = &state.call_info[n - 2];
-                        (e.name.clone(), e.namewhat.clone())
+                        let (_, _, nm, nw) = crate::execute::compute_caller_info(e);
+                        (nm, nw)
                     } else {
-                        (entry.name.clone(), entry.namewhat.clone())
+                        let (_, _, nm, nw) = crate::execute::compute_caller_info(entry);
+                        (nm, nw)
                     };
                 lines.push(make_traceback_line(
                     &src,
@@ -3023,7 +3031,8 @@ fn build_traceback(state: &LuaState, msg: &str, level: i32) -> String {
                     0,
                 ));
             } else {
-                let src = short_src_from_source(&next_entry.source);
+                let (src_full, line, _, _) = crate::execute::compute_caller_info(next_entry);
+                let src = short_src_from_source(&src_full);
                 let is_main = entry
                     .closure
                     .as_ref()
@@ -3034,11 +3043,12 @@ fn build_traceback(state: &LuaState, msg: &str, level: i32) -> String {
                     .as_ref()
                     .map(|c| c.proto.line_defined)
                     .unwrap_or(0);
+                let (_, _, name, namewhat) = crate::execute::compute_caller_info(entry);
                 lines.push(make_traceback_line(
                     &src,
-                    next_entry.line,
-                    &entry.name,
-                    &entry.namewhat,
+                    line,
+                    &name,
+                    &namewhat,
                     is_main,
                     entry.is_c,
                     linedefined,
@@ -3152,7 +3162,8 @@ fn build_traceback_from_thread(
                 // 名字来自调用当前帧的 call_info 条目
                 let (name, namewhat) = if n > c_chain_len {
                     let name_entry = &call_info[n - 1 - c_chain_len];
-                    (name_entry.name.clone(), name_entry.namewhat.clone())
+                    let (_, _, nm, nw) = crate::execute::compute_caller_info(name_entry);
+                    (nm, nw)
                 } else {
                     (String::new(), String::new())
                 };
@@ -3195,7 +3206,8 @@ fn build_traceback_from_thread(
                     0,
                 );
             } else {
-                let src = short_src_from_source(&next_entry.source);
+                let (src_full, line, _, _) = crate::execute::compute_caller_info(next_entry);
+                let src = short_src_from_source(&src_full);
                 let is_main = entry
                     .closure
                     .as_ref()
@@ -3206,12 +3218,13 @@ fn build_traceback_from_thread(
                     .as_ref()
                     .map(|c| c.proto.line_defined)
                     .unwrap_or(0);
+                let (_, _, name, namewhat) = crate::execute::compute_caller_info(entry);
                 push_traceback_line(
                     &mut result,
                     &src,
-                    next_entry.line,
-                    &entry.name,
-                    &entry.namewhat,
+                    line,
+                    &name,
+                    &namewhat,
                     is_main,
                     entry.is_c,
                     linedefined,
@@ -3257,12 +3270,16 @@ fn get_current_frame_info(state: &LuaState) -> Option<(String, i32, String, Stri
             && state.call_info.len() >= 2
         {
             let entry = &state.call_info[state.call_info.len() - 2];
-            (entry.name.clone(), entry.namewhat.clone())
+            let (_, _, nm, nw) = crate::execute::compute_caller_info(entry);
+            (nm, nw)
         } else {
             state
                 .call_info
                 .last()
-                .map(|e| (e.name.clone(), e.namewhat.clone()))
+                .map(|e| {
+                    let (_, _, nm, nw) = crate::execute::compute_caller_info(e);
+                    (nm, nw)
+                })
                 .unwrap_or((String::new(), String::new()))
         };
         let is_main = proto.line_defined == 0;

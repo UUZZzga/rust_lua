@@ -266,6 +266,79 @@ pub fn get_func_name(state: &LuaState, call_pc: usize) -> (String, String) {
     get_obj_name(proto, call_pc, func_reg)
 }
 
+/// 从 CallInfoEntry 的 caller_proto + saved_pc 实时计算 traceback 信息
+/// 对应 C 的 funcnamefromcode + getline
+///
+/// 返回 (source, line, name, namewhat):
+/// - source: 调用者源文件名
+/// - line: 调用发生处的行号
+/// - name: 被调用函数的名字
+/// - namewhat: 名字类型 ("local"/"global"/"method"/"field"/"for iterator"/"hook"/"metamethod"/...)
+///
+/// 对于 C 函数帧 (is_c=true): source="[C]", line=-1, name/namewhat 使用预设置值
+/// 对于 hook/metamethod 帧 (namewhat 非空): source/line 从 caller_proto 计算, name/namewhat 使用预设置值
+/// 对于普通 Lua 函数帧: 全部从 caller_proto + saved_pc 实时计算
+pub fn compute_caller_info(entry: &crate::state::CallInfoEntry) -> (String, i32, String, String) {
+    if entry.is_c {
+        return (
+            "=[C]".to_string(),
+            -1,
+            entry.name.clone(),
+            entry.namewhat.clone(),
+        );
+    }
+
+    // Lua 函数帧
+    if let Some(ref caller_proto) = entry.caller_proto {
+        let source = caller_proto
+            .source
+            .as_ref()
+            .map(|s| s.as_str().to_string())
+            .unwrap_or_else(|| "=?".to_string());
+        // Rust 版 saved_pc 直接指向 CALL 指令（pc 在读取时未递增）
+        let line = get_proto_line(caller_proto, entry.saved_pc);
+
+        // name/namewhat: 如果已预设置 (hook/metamethod)，直接使用
+        if !entry.namewhat.is_empty() {
+            return (source, line, entry.name.clone(), entry.namewhat.clone());
+        }
+
+        // 普通 Lua 函数帧: 从 caller_proto.code[saved_pc] 实时计算 name/namewhat
+        let (name, namewhat) = compute_name_from_proto(caller_proto, entry.saved_pc);
+        (source, line, name, namewhat)
+    } else {
+        // 无 caller_proto (C 调用者或无 base)
+        (
+            "=?".to_string(),
+            -1,
+            entry.name.clone(),
+            entry.namewhat.clone(),
+        )
+    }
+}
+
+/// 从 caller_proto 的 CALL 指令计算函数名和 namewhat
+/// 对应 C 的 funcnamefromcode
+///
+/// Rust 版本中 state.pc 在读取指令时未递增（与 C 的 savedpc++ 不同），
+/// 所以 saved_pc 直接指向 CALL 指令本身的偏移。
+fn compute_name_from_proto(caller_proto: &Proto, saved_pc: usize) -> (String, String) {
+    if saved_pc >= caller_proto.code.len() {
+        return (String::new(), String::new());
+    }
+    let call_inst = caller_proto.code[saved_pc];
+    let opcode = opcodes::get_opcode(call_inst);
+
+    // 对应 C 的 funcnamefromcode: OP_TFORCALL 返回 "for iterator"
+    if opcode == OpCode::TFORCALL {
+        return ("for iterator".to_string(), "for iterator".to_string());
+    }
+
+    // 获取 OP_CALL 指令的操作数 A（函数寄存器）
+    let func_reg = opcodes::getarg_a(call_inst) as usize;
+    get_obj_name(caller_proto, saved_pc, func_reg)
+}
+
 /// 在 loaded 表中递归查找函数的全限定名 (对应 C 的 pushglobalfuncname + findfield)
 ///
 /// 核心逻辑:
@@ -907,11 +980,6 @@ impl VmExecutor {
                     }
                     // count hook 先触发 — 对应 C: if (counthook) luaD_hook(L, LUA_HOOKCOUNT, -1, 0, 0)
                     if counthook {
-                        if state.allowhook {
-                            if let Some(last_entry) = state.call_info.last_mut() {
-                                last_entry.saved_pc = state.pc;
-                            }
-                        }
                         Self::call_hook(state, "count", -1, None, 0, 0)?;
                     }
                     // line hook — 对应 C: if (mask & LUA_MASKLINE)
@@ -930,17 +998,11 @@ impl VmExecutor {
                         // C 实现中 luaG_getfuncline 返回 -1, luaD_hook 会被调用
                         if new_pc <= old_pc || Self::changed_line(state, old_pc, new_pc) {
                             let current_line = Self::get_current_line(state);
-                            // 对应 C: ci->u.l.savedpc = pc; (在 luaG_traceexec 中更新)
-                            // 在调用 line hook 前更新 call_info 最后一个条目的 saved_pc,
-                            // 让 hook 回调中的 debug.getinfo(2, "l").currentline 返回正确的行号
-                            // 注意: 只在 allowhook 为 true 时更新。当 hook 函数执行时,
-                            // allowhook 为 false, last_entry 是 hook_entry (代表触发 hook
-                            // 的函数), 不应被更新为 hook 函数的 pc。
-                            if state.allowhook {
-                                if let Some(last_entry) = state.call_info.last_mut() {
-                                    last_entry.saved_pc = state.pc;
-                                }
-                            }
+                            // 注意: 不更新 call_info.last().saved_pc。
+                            // Rust 版 call_info[i].saved_pc 存储的是调用者的 CALL 偏移（不是
+                            // 当前函数的 pc），与 C 的 ci->u.l.savedpc 语义不同。
+                            // call_hook 中已正确设置 hook entry 的 saved_pc = state.pc，
+                            // debug.getinfo(2) 的行号从 hook entry 获取，无需额外更新。
                             Self::call_hook(state, "line", current_line, None, 0, 0)?;
                         }
                         // 对应 C: L->oldpc = npci;
@@ -1383,14 +1445,16 @@ impl VmExecutor {
 
         // 收集所有 Lua 帧信息 (source, line, name_str) — 从内到外
         // 帧 0: 当前函数; 帧 1..=effective_ci_len: 调用者
-        // call_info[i] 存储: source/line = 调用者(外层)的信息, name/closure = 被调用者(内层)的信息
+        // call_info[i] 存储: caller_proto/saved_pc = 调用者(外层)的信息, name/closure = 被调用者(内层)的信息
+        // source/line/name/namewhat 延迟计算: 通过 compute_caller_info 从 caller_proto + saved_pc 实时获取
         let mut frames: Vec<(String, i32, String)> = Vec::new();
 
         // 帧 0: 当前函数
         if has_lua_frame {
             let name_str = if effective_ci_len > 0 {
                 let last = &ci[effective_ci_len - 1];
-                format_func_name(&last.namewhat, &last.name, false, last.closure.as_deref())
+                let (_, _, name, namewhat) = compute_caller_info(last);
+                format_func_name(&namewhat, &name, false, last.closure.as_deref())
             } else {
                 "main chunk".to_string()
             };
@@ -1400,17 +1464,13 @@ impl VmExecutor {
         // 帧 1..=effective_ci_len: 调用者帧
         for level in 1..=effective_ci_len {
             let entry = &ci[effective_ci_len - level];
-            let src = short_source_bytes(entry.source.as_bytes());
-            let line = entry.line;
+            let (src_full, line, _, _) = compute_caller_info(entry);
+            let src = short_source_bytes(src_full.as_bytes());
             let name_str = if level < effective_ci_len {
                 // name/namewhat/closure 来自更外层的 call_info 条目
                 let outer = &ci[effective_ci_len - 1 - level];
-                format_func_name(
-                    &outer.namewhat,
-                    &outer.name,
-                    false,
-                    outer.closure.as_deref(),
-                )
+                let (_, _, name, namewhat) = compute_caller_info(outer);
+                format_func_name(&namewhat, &name, false, outer.closure.as_deref())
             } else {
                 // 最外层是 main chunk
                 "main chunk".to_string()
@@ -2247,32 +2307,25 @@ impl VmExecutor {
         // 这样 debug.getinfo(2) 能通过 state.stack[entry.base - 1] 获取触发帧的闭包
         let hook_base = frame_base.unwrap_or(state.base);
 
-        // 获取触发 hook 的函数的 source 和 pc
-        let (caller_source, caller_pc) = if hook_base > 0 && hook_base <= state.stack.len() {
+        // 提取调用者的 proto 和 pc（用于 traceback 时实时计算 source/line）
+        let (caller_proto, caller_pc) = if hook_base > 0 && hook_base <= state.stack.len() {
             if let TValue::LClosure(prev_closure) = &state.stack[hook_base - 1] {
-                let src = prev_closure
-                    .proto
-                    .source
-                    .as_ref()
-                    .map(|s| s.as_str().to_string())
-                    .unwrap_or_else(|| "=?".to_string());
-                (src, state.pc)
+                (Some(Rc::clone(&prev_closure.proto)), state.pc)
             } else {
                 // C 函数或其它类型
-                ("=[C]".to_string(), 0)
+                (None, 0)
             }
         } else {
-            ("=?".to_string(), 0)
+            (None, 0)
         };
 
         state.call_info.push(crate::state::CallInfoEntry {
-            source: caller_source,
-            line: line,
-            name: "?".to_string(),
+            caller_proto,
             is_c: false,
             closure: hook_closure,
             base: hook_base,
             saved_pc: caller_pc,
+            name: "?".to_string(),
             namewhat: "hook".to_string(),
             proto_flag: state.proto_flag,
             nextraargs: state.nextraargs,
@@ -3654,27 +3707,22 @@ impl VmExecutor {
                 let nfixparams = closure.proto.num_params as usize;
                 let proto_is_vararg = closure.proto.is_vararg();
 
-                // 获取调用前的源和行号（用于 traceback）
-                let (caller_source, caller_line) =
-                    if state.base > 0 && state.base <= state.stack.len() {
-                        if let TValue::LClosure(prev_closure) = &state.stack[state.base - 1] {
-                            let src = prev_closure
-                                .proto
-                                .source
-                                .as_ref()
-                                .map(|s| s.as_str().to_string())
-                                .unwrap_or_else(|| "=?".to_string());
-                            let line = get_proto_line(&prev_closure.proto, state.pc);
-                            (src, line)
-                        } else {
-                            ("=?".to_string(), -1)
-                        }
-                    } else {
-                        ("=?".to_string(), -1)
-                    };
+                // 提前提取 proto 和 upvals 的 Rc 引用，使后续可以 move closure（而非 clone）
+                // perf: 消除 CallInfoEntry.closure 的 Box 堆分配
+                let proto = Rc::clone(&closure.proto);
+                let upvals = Rc::clone(&closure.upvals);
 
-                // 获取函数名和 namewhat（对应 C 的 funcnamefromcode）
-                let (func_name, func_namewhat) = get_func_name(state, state.pc);
+                // 提取调用者的 proto（用于 traceback 时实时计算 source/line/name）
+                // perf: 延迟计算，消除 op_call 中的 find_set_reg + get_proto_line + get_func_name 开销
+                let caller_proto = if state.base > 0 && state.base <= state.stack.len() {
+                    if let TValue::LClosure(prev_closure) = &state.stack[state.base - 1] {
+                        Some(Rc::clone(&prev_closure.proto))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
 
                 // 检查 C 调用深度 (对应 C 的 luaE_incCstack / luaE_checkcstack)
                 // 每次 Lua 闭包调用递增 n_ccalls,达到 LUAI_MAXCCALLS(200) 时
@@ -3713,15 +3761,16 @@ impl VmExecutor {
                 });
 
                 // 推入调用栈信息（用于 debug.getinfo 和 traceback）
+                // move closure 避免 clone + Box 堆分配（perf: 消除 ~1% malloc）
+                // source/line/name/namewhat 延迟到 traceback 时从 caller_proto + saved_pc 实时计算
                 state.call_info.push(crate::state::CallInfoEntry {
-                    source: caller_source,
-                    line: caller_line,
-                    name: func_name,
+                    caller_proto,
                     is_c: false,
-                    closure: Some(closure.clone()),
+                    closure: Some(closure),
                     base: state.base,
                     saved_pc: state.pc,
-                    namewhat: func_namewhat,
+                    name: String::new(),
+                    namewhat: String::new(),
                     proto_flag: state.proto_flag,
                     nextraargs: state.nextraargs,
                     is_tailcall: false,
@@ -3729,18 +3778,18 @@ impl VmExecutor {
 
                 // Rc::clone 是 O(1) 引用计数，替代原来的 Vec 深拷贝
                 // perf: 消除 op_call/op_tailcall 中 4 次 malloc+memmove（~5.3% 热点）
-                state.code = Rc::clone(&closure.proto.code);
-                state.constants = Rc::clone(&closure.proto.constants);
-                state.upval_descs = Rc::clone(&closure.proto.upvalues);
-                state.protos = closure.proto.protos.clone();
+                state.code = Rc::clone(&proto.code);
+                state.constants = Rc::clone(&proto.constants);
+                state.upval_descs = Rc::clone(&proto.upvalues);
+                state.protos = proto.protos.clone();
                 state.base = a + 1;
                 state.pc = 0;
-                state.num_params = closure.proto.num_params;
-                state.is_vararg = closure.proto.is_vararg();
-                state.proto_flag = closure.proto.flag;
+                state.num_params = proto.num_params;
+                state.is_vararg = proto.is_vararg();
+                state.proto_flag = proto.flag;
                 state.nextraargs = 0;
                 // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
-                state.closure_upvals = closure.upvals.borrow().clone();
+                state.closure_upvals = upvals.borrow().clone();
                 state.tbc_list = None;
                 // 对应 C 的 luaD_hookcall: L->oldpc = 0
                 // 新函数的 oldpc 设为 0，第一条指令会触发 hook（因为 0 不是有效 pc）
@@ -3835,13 +3884,12 @@ impl VmExecutor {
                     "function".to_string()
                 };
                 state.call_info.push(crate::state::CallInfoEntry {
-                    source: "=[C]".to_string(),
-                    line: -1,
-                    name: c_name.clone(),
+                    caller_proto: None,
                     is_c: true,
                     closure: None,
                     base: a + 1,
                     saved_pc: state.pc,
+                    name: c_name.clone(),
                     namewhat: c_namewhat.clone(),
                     proto_flag: state.proto_flag,
                     nextraargs: state.nextraargs,
@@ -3934,13 +3982,12 @@ impl VmExecutor {
                     // 保存 pending_return_adjust，防止 hook 函数内部的 C 函数调用覆盖它
                     let saved_pending = state.pending_return_adjust.take();
                     state.call_info.push(crate::state::CallInfoEntry {
-                        source: "=[C]".to_string(),
-                        line: -1,
-                        name: c_name,
+                        caller_proto: None,
                         is_c: true,
                         closure: None,
                         base: a + 1,
                         saved_pc: state.pc,
+                        name: c_name,
                         namewhat: c_namewhat,
                         proto_flag: state.proto_flag,
                         nextraargs: state.nextraargs,
@@ -4135,6 +4182,11 @@ impl VmExecutor {
                 let func_slot = state.base.saturating_sub(1);
                 let proto_is_vararg = closure.proto.is_vararg();
 
+                // 提前提取 proto 和 upvals 的 Rc 引用，使后续可以 move closure（而非 clone）
+                // perf: 消除 CallInfoEntry.closure 的 Box 堆分配
+                let proto = Rc::clone(&closure.proto);
+                let upvals = Rc::clone(&closure.upvals);
+
                 for i in 0..nargs_total {
                     let src = a + i;
                     let dst = func_slot + i;
@@ -4145,24 +4197,25 @@ impl VmExecutor {
 
                 // Rc::clone 是 O(1) 引用计数，替代原来的 Vec 深拷贝
                 // perf: 消除 op_call/op_tailcall 中 4 次 malloc+memmove（~5.3% 热点）
-                state.code = Rc::clone(&closure.proto.code);
-                state.constants = Rc::clone(&closure.proto.constants);
-                state.upval_descs = Rc::clone(&closure.proto.upvalues);
-                state.protos = closure.proto.protos.clone();
+                state.code = Rc::clone(&proto.code);
+                state.constants = Rc::clone(&proto.constants);
+                state.upval_descs = Rc::clone(&proto.upvalues);
+                state.protos = proto.protos.clone();
                 state.pc = 0;
-                state.num_params = closure.proto.num_params;
-                state.is_vararg = closure.proto.is_vararg();
-                state.proto_flag = closure.proto.flag;
+                state.num_params = proto.num_params;
+                state.is_vararg = proto.is_vararg();
+                state.proto_flag = proto.flag;
                 state.nextraargs = 0;
                 // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
-                state.closure_upvals = closure.upvals.borrow().clone();
+                state.closure_upvals = upvals.borrow().clone();
                 state.tbc_list = None;
 
                 // 对应 C 的 ci->callstatus |= CIST_TAIL
                 // 标记当前 CallInfoEntry 为尾调用，供 debug.getinfo(1).istailcall 读取
+                // move closure 避免 clone + Box 堆分配
                 if let Some(entry) = state.call_info.last_mut() {
                     entry.is_tailcall = true;
-                    entry.closure = Some(closure.clone());
+                    entry.closure = Some(closure);
                 }
                 // 对应 C 的 luaD_hookcall: L->oldpc = 0
                 // 新函数的 oldpc 设为 0，第一条指令会触发 line hook
@@ -4875,24 +4928,18 @@ impl VmExecutor {
                 let proto_flag = closure.proto.flag;
                 let proto_max_stack = closure.proto.max_stack_size;
 
-                // 获取调用前的源和行号（用于 traceback）
-                let (caller_source, caller_line) =
-                    if state.base > 0 && state.base <= state.stack.len() {
-                        if let TValue::LClosure(prev_closure) = &state.stack[state.base - 1] {
-                            let src = prev_closure
-                                .proto
-                                .source
-                                .as_ref()
-                                .map(|s| s.as_str().to_string())
-                                .unwrap_or_else(|| "=?".to_string());
-                            let line = get_proto_line(&prev_closure.proto, state.pc);
-                            (src, line)
-                        } else {
-                            ("=?".to_string(), -1)
-                        }
+                // 提取调用者的 proto（用于 traceback 时实时计算 source/line/name）
+                // perf: 延迟计算，消除 op_tforcall 中的 get_proto_line 开销
+                // "for iterator" name 由 compute_caller_info 从 TFORCALL opcode 检测
+                let caller_proto = if state.base > 0 && state.base <= state.stack.len() {
+                    if let TValue::LClosure(prev_closure) = &state.stack[state.base - 1] {
+                        Some(Rc::clone(&prev_closure.proto))
                     } else {
-                        ("=?".to_string(), -1)
-                    };
+                        None
+                    }
+                } else {
+                    None
+                };
 
                 let nresults = (c + 1) as i32;
                 let fsize = proto_max_stack as usize;
@@ -4916,16 +4963,16 @@ impl VmExecutor {
                     tbc_list: state.tbc_list.take(),
                 });
 
-                // 推入调用栈信息 — 对应 C 的 funcnamefromcode 返回 "for iterator"
+                // 推入调用栈信息
+                // "for iterator" name 由 compute_caller_info 从 caller_proto 的 TFORCALL opcode 实时检测
                 state.call_info.push(crate::state::CallInfoEntry {
-                    source: caller_source,
-                    line: caller_line,
-                    name: "for iterator".to_string(),
+                    caller_proto,
                     is_c: false,
                     closure: Some(closure.clone()),
                     base: state.base,
                     saved_pc: state.pc,
-                    namewhat: "for iterator".to_string(),
+                    name: String::new(),
+                    namewhat: String::new(),
                     proto_flag: state.proto_flag,
                     nextraargs: state.nextraargs,
                     is_tailcall: false,

@@ -6,6 +6,7 @@ use crate::objects::{LuaType, TValue};
 use crate::state::{LuaState, ERR_RUN, ERR_SYNTAX, MIN_STACK, MULT_RET};
 
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
 const LUA_PROGNAME: &str = "lua";
@@ -141,18 +142,12 @@ impl Interpreter {
                                 // 返回 main chunk 的 currentline = error(m) 的行号
                                 if let Some(mc) = &main_closure {
                                     constructed_ci.push(crate::state::CallInfoEntry {
-                                        source: mc
-                                            .proto
-                                            .source
-                                            .as_ref()
-                                            .map(|s| s.as_str().to_string())
-                                            .unwrap_or_else(|| "=?".to_string()),
-                                        line: -1,
-                                        name: String::new(),
+                                        caller_proto: Some(Rc::clone(&mc.proto)),
                                         is_c: true, // C 调用者
                                         closure: Some(mc.clone()),
                                         base: 0,
                                         saved_pc: error_pc, // error(m) 的 pc
+                                        name: String::new(),
                                         namewhat: String::new(),
                                         proto_flag: mc.proto.flag,
                                         nextraargs: 0,
@@ -161,13 +156,12 @@ impl Interpreter {
                                 }
                                 // 推入 msghandler C 函数帧
                                 constructed_ci.push(crate::state::CallInfoEntry {
-                                    source: "=[C]".to_string(),
-                                    line: -1,
-                                    name: "msghandler".to_string(),
+                                    caller_proto: None,
                                     is_c: true,
                                     closure: None,
                                     base: 0,
                                     saved_pc: 0,
+                                    name: "msghandler".to_string(),
                                     namewhat: String::new(),
                                     proto_flag: 0,
                                     nextraargs: 0,
