@@ -18,6 +18,7 @@ use crate::objects::{LuaType, NilKind, TValue};
 use crate::state::LuaState;
 use crate::table::Table;
 use std::io::Write;
+use std::rc::Rc;
 use std::os::raw::c_int;
 
 // C 标准库的 stdin/stdout/stderr — libc crate 不直接导出，用 extern 声明
@@ -209,12 +210,12 @@ fn new_file_userdata(state: &mut LuaState, file: *mut libc::FILE, file_mt: &Tabl
     if file_mt.get(&gc_key).is_some() {
         state.register_ud_finobj(&udata);
     }
-    TValue::UserData(Box::new(udata))
+    TValue::UserData(Rc::new(udata))
 }
 
 /// 创建已关闭的 FILE* userdata — 用于 io.type 检查已关闭文件
 fn new_closed_userdata(file_mt: &Table) -> TValue {
-    TValue::UserData(Box::new(crate::objects::Udata {
+    TValue::UserData(Rc::new(crate::objects::Udata {
         gc_header: crate::gc::GCObjectHeader::new(),
         nuvalue: 0,
         len: 0,
@@ -2341,7 +2342,7 @@ pub fn open_io_lib(state: &mut LuaState) {
         };
         let ptr_id = udata.gc_header.ptr_id;
         state.file_handles.insert(ptr_id, file);
-        TValue::UserData(Box::new(udata))
+        TValue::UserData(Rc::new(udata))
     };
 
     let stdin_val = make_stream(state, c_stdin());

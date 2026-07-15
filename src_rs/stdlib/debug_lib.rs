@@ -263,7 +263,7 @@ struct FrameInfo {
     proto_flag: u8,
     nextraargs: i32,
     /// 指向栈上的 LClosure（已 clone）；C 函数帧为 None
-    closure: Option<Box<LClosure>>,
+    closure: Option<Rc<LClosure>>,
     /// 栈上有效槽位的上限（对应 C 的 limit = ci->next->func.p 或 L->top）
     /// 槽位 n 满足 limit - base >= n && n > 0 时为 "(temporary)" / "(C temporary)"
     limit: usize,
@@ -615,7 +615,8 @@ fn call_setuservalue(
             } else {
                 // 修改栈上的 userdata
                 if a + 1 < state.stack.len() {
-                    if let TValue::UserData(ref mut u) = state.stack[a + 1] {
+                    if let TValue::UserData(ref mut u) = &mut state.stack[a + 1] {
+                        let u = Rc::make_mut(u);
                         while u.user_values.len() < n {
                             u.user_values.push(TValue::Nil(NilKind::Strict));
                         }
@@ -917,7 +918,7 @@ struct DebugInfo {
     istailcall: bool,
     extraargs: i32,
     func: Option<TValue>,
-    closure: Option<Box<LClosure>>,
+    closure: Option<Rc<LClosure>>,
 }
 
 /// 从闭包填充调试信息
@@ -925,7 +926,7 @@ fn fill_info_from_closure(info: &mut DebugInfo, closure: &LClosure, what: &str) 
     let proto = &closure.proto;
     // 注意: 不在此设置 info.func, 由 call_getinfo 直接从栈上获取原始值
     // 以确保 b.func == 原始函数 (引用语义)
-    info.closure = Some(Box::new(closure.clone()));
+    info.closure = Some(Rc::new(closure.clone()));
 
     if what.contains('S') {
         info.source = proto
@@ -2444,7 +2445,8 @@ fn call_setupvalue(
         TValue::CClosure(_) => {
             // C 闭包
             if a + 1 < state.stack.len() {
-                if let TValue::CClosure(ref mut cc) = state.stack[a + 1] {
+                if let TValue::CClosure(ref mut cc) = &mut state.stack[a + 1] {
+                    let cc = Rc::make_mut(cc);
                     if n > 0 && n <= cc.upvalue.len() {
                         cc.upvalue[n - 1] = value;
                         push_single_result(state, a, nresults, TValue::Str(state.intern_str("")));
@@ -3647,7 +3649,7 @@ mod tests {
             loc_vars: vec![],
             source: None,
         };
-        let closure = Box::new(LClosure {
+        let closure = Rc::new(LClosure {
             gc_header: GCObjectHeader::new(),
             proto: Rc::new(proto),
             upvals: Rc::new(RefCell::new(vec![Rc::new(RefCell::new(UpVal::Closed {
@@ -3676,7 +3678,7 @@ mod tests {
     fn test_call_getupvalue_out_of_range() {
         use crate::gc::GCObjectHeader;
         let mut state = LuaState::new();
-        let closure = Box::new(LClosure {
+        let closure = Rc::new(LClosure {
             gc_header: GCObjectHeader::new(),
             proto: Rc::new(crate::func::new_proto()),
             upvals: Rc::new(RefCell::new(vec![])),
@@ -3899,7 +3901,7 @@ mod tests {
     fn test_call_upvalueid_closure() {
         use crate::gc::GCObjectHeader;
         let mut state = LuaState::new();
-        let closure = Box::new(LClosure {
+        let closure = Rc::new(LClosure {
             gc_header: GCObjectHeader::new(),
             proto: Rc::new(crate::func::new_proto()),
             upvals: Rc::new(RefCell::new(vec![Rc::new(RefCell::new(UpVal::Closed {
@@ -3920,7 +3922,7 @@ mod tests {
     fn test_call_upvalueid_out_of_range() {
         use crate::gc::GCObjectHeader;
         let mut state = LuaState::new();
-        let closure = Box::new(LClosure {
+        let closure = Rc::new(LClosure {
             gc_header: GCObjectHeader::new(),
             proto: Rc::new(crate::func::new_proto()),
             upvals: Rc::new(RefCell::new(vec![])),

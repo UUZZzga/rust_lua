@@ -5432,7 +5432,7 @@ impl VmExecutor {
             // GC: 在创建新闭包前检查 GC 阈值，回收不可达的旧闭包。
             // 对应 C Lua 的 luaC_checkGC（OP_CLOSURE 中调用 luaC_checkGC(L)）。
             state.maybe_collect_gc();
-            let closure = Box::new(LClosure {
+            let closure = Rc::new(LClosure {
                 gc_header: crate::gc::GCObjectHeader::new(),
                 proto,
                 upvals: Rc::new(RefCell::new(upvals)),
@@ -5760,30 +5760,32 @@ impl VmExecutor {
         // 对应 C Lua 的 luaV_finishget — 用循环代替递归，加 MAXTAGLOOP 限制
         // 防止 __index 链无限循环（如 a.__index = a 导致栈溢出）
         const MAXTAGLOOP: usize = 2000;
-        let mut current = table_val.clone();
+        // 优化：首次迭代直接借用 table_val，避免不必要的 clone。
+        // 调用方已 clone 了 table_val，此处再 clone 是冗余的。
+        // take() 将值移出 current（变为 None），使 curr 借用 owned 而非 current，
+        // 从而可以在循环体内安全地设置 current = Some(...)。
+        let mut current: Option<TValue> = None;
         for _ in 0..MAXTAGLOOP {
-            match &current {
+            let owned = current.take();
+            let curr: &TValue = owned.as_ref().unwrap_or(table_val);
+            match curr {
                 TValue::Table(t) => {
-                    // 一次 borrow 内查找值 + 检查元表 — 减少 RefCell 开销
-                    let (val, has_mt) = t.get_and_has_mt(key);
+                    // 一次 borrow 内查找值 + 获取元表 — 消除 metamethod 路径的第二次 borrow
+                    let (val, mt) = t.get_and_metatable(key);
                     if let Some(v) = val {
                         if !matches!(v, TValue::Nil(_)) {
                             return Ok(v);
                         }
                     }
-                    // 仅在存在元表时才再次 borrow 获取 __index
-                    let index_val = if has_mt {
-                        t.get_metatable().and_then(|mt| {
-                            let index_key = crate::tm::make_tm_tvalue(crate::tm::TagMethod::Index);
-                            mt.get(&index_key)
-                        })
-                    } else {
-                        None
-                    };
+                    // 直接使用已获取的元表，无需再次 borrow
+                    let index_val = mt.and_then(|mt| {
+                        let index_key = crate::tm::make_tm_tvalue(crate::tm::TagMethod::Index);
+                        mt.get(&index_key)
+                    });
                     if let Some(index_val) = index_val {
                         match &index_val {
                             TValue::Table(_) => {
-                                current = index_val.clone();
+                                current = Some(index_val);
                                 continue;
                             }
                             TValue::LClosure(_)
@@ -5792,13 +5794,13 @@ impl VmExecutor {
                             | TValue::LightUserData(_) => {
                                 return Self::call_index_metamethod(
                                     state,
-                                    index_val.clone(),
-                                    current.clone(),
+                                    index_val,
+                                    curr.clone(),
                                     key.clone(),
                                 );
                             }
                             _ => {
-                                current = index_val.clone();
+                                current = Some(index_val);
                                 continue;
                             }
                         }
@@ -5837,13 +5839,13 @@ impl VmExecutor {
                                 return Self::call_index_metamethod(
                                     state,
                                     f,
-                                    current.clone(),
+                                    curr.clone(),
                                     key.clone(),
                                 );
                             }
                             TValue::Table(_) => {
                                 // __index 是表: 循环
-                                current = f;
+                                current = Some(f);
                                 continue;
                             }
                             _ => {
@@ -6800,7 +6802,7 @@ mod tests {
     fn test_execute_call_lua_closure() {
         // Create an inner proto that just returns 0
         let inner_proto = make_proto(vec![make_bx(OpCode::RETURN0, 0, 0)], vec![]);
-        let closure = Box::new(LClosure {
+        let closure = Rc::new(LClosure {
             gc_header: GCObjectHeader::new(),
             proto: Rc::new(inner_proto),
             upvals: Rc::new(RefCell::new(vec![])),
@@ -6817,7 +6819,7 @@ mod tests {
     #[test]
     fn test_execute_tailcall_lua_closure() {
         let inner_proto = make_proto(vec![make_bx(OpCode::RETURN0, 0, 0)], vec![]);
-        let closure = Box::new(LClosure {
+        let closure = Rc::new(LClosure {
             gc_header: GCObjectHeader::new(),
             proto: Rc::new(inner_proto),
             upvals: Rc::new(RefCell::new(vec![])),

@@ -105,10 +105,11 @@ impl Table {
     // get / get_int —— 返回 owned TValue（RefCell 无法返回引用）
     // ========================================================================
 
-    /// 一次 borrow 内同时查找值和检查元表 — 减少 RefCell 借出次数。
-    pub fn get_and_has_mt(&self, key: &TValue) -> (Option<TValue>, bool) {
+    /// 一次 borrow 内同时查找值并返回元表 — 消除 metamethod 路径的第二次 borrow。
+    /// 返回 (查找结果, 元表)。元表为 Some 时调用方无需再次 borrow 获取 __index。
+    pub fn get_and_metatable(&self, key: &TValue) -> (Option<TValue>, Option<Table>) {
         let data = self.data.borrow();
-        let has_mt = data.metatable.is_some();
+        let mt = data.metatable.as_ref().map(|b| (**b).clone());
         let val = match key {
             TValue::Integer(i) if *i > 0 => {
                 let idx = (*i - 1) as usize;
@@ -130,7 +131,7 @@ impl Table {
                         if idx < data.array.len() {
                             let v = &data.array[idx];
                             if !matches!(v, TValue::Nil(NilKind::Empty)) {
-                                return (Some(v.clone()), has_mt);
+                                return (Some(v.clone()), mt);
                             }
                         }
                     }
@@ -141,7 +142,7 @@ impl Table {
             }
             _ => hash_get(&data, key),
         };
-        (val, has_mt)
+        (val, mt)
     }
 
     pub fn get(&self, key: &TValue) -> Option<TValue> {

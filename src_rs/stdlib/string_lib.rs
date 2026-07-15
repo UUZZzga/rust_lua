@@ -374,27 +374,27 @@ struct Capture {
 }
 
 /// 匹配状态 — 对应 C 的 MatchState
-struct MatchState {
-    src: Vec<u8>,
+/// 优化：使用 &[u8] 切片引用而非 Vec<u8>，避免每次匹配时复制源字符串和模式字符串。
+/// C 版本用指针直接引用原字符串，此处用借用切片达到同等效果。
+struct MatchState<'a> {
+    src: &'a [u8],
     src_init: usize,
     src_end: usize,
-    pattern: Vec<u8>,
+    pattern: &'a [u8],
     p_end: usize,
     match_depth: i32,
     level: usize,
     captures: Vec<Capture>,
 }
 
-impl MatchState {
-    fn new(src: &str, pattern: &str) -> Self {
-        let src_bytes = src.as_bytes().to_vec();
-        let pat_bytes = pattern.as_bytes().to_vec();
+impl<'a> MatchState<'a> {
+    fn new(src: &'a [u8], pattern: &'a [u8]) -> Self {
         MatchState {
             src_init: 0,
-            src_end: src_bytes.len(),
-            p_end: pat_bytes.len(),
-            src: src_bytes,
-            pattern: pat_bytes,
+            src_end: src.len(),
+            p_end: pattern.len(),
+            src,
+            pattern,
             match_depth: MAX_CCALLS,
             level: 0,
             captures: Vec::with_capacity(MAX_CAPTURES),
@@ -473,7 +473,8 @@ fn match_bracket_class(c: u8, p: &[u8], ec: usize) -> bool {
 }
 
 /// 对应 C 的 classend: 找到模式类的结束位置
-fn class_end(ms: &MatchState, p: usize) -> Result<usize, String> {
+#[inline]
+fn class_end(ms: &MatchState<'_>, p: usize) -> Result<usize, String> {
     if p >= ms.p_end {
         return Err("malformed pattern (ends with '%')".to_string());
     }
@@ -510,7 +511,8 @@ fn class_end(ms: &MatchState, p: usize) -> Result<usize, String> {
 }
 
 /// 对应 C 的 singlematch: 检查单个字符是否匹配
-fn single_match(ms: &MatchState, s: usize, p: usize, ep: usize) -> bool {
+#[inline]
+fn single_match(ms: &MatchState<'_>, s: usize, p: usize, ep: usize) -> bool {
     if s >= ms.src_end {
         return false;
     }
@@ -535,7 +537,7 @@ fn single_match(ms: &MatchState, s: usize, p: usize, ep: usize) -> bool {
 
 /// 对应 C 的 matchbalance: 平衡匹配 %bxy
 /// 参数不足时报错（对应 C 的 luaL_error）
-fn match_balance(ms: &MatchState, s: usize, p: usize) -> Result<Option<usize>, String> {
+fn match_balance(ms: &MatchState<'_>, s: usize, p: usize) -> Result<Option<usize>, String> {
     if p + 1 >= ms.p_end {
         return Err("malformed pattern (missing arguments to '%b')".to_string());
     }
@@ -562,7 +564,7 @@ fn match_balance(ms: &MatchState, s: usize, p: usize) -> Result<Option<usize>, S
 }
 
 /// 对应 C 的 check_capture
-fn check_capture(ms: &MatchState, l: u8) -> Result<usize, String> {
+fn check_capture(ms: &MatchState<'_>, l: u8) -> Result<usize, String> {
     // C: l -= '1'; if (l < 0 || l >= ms->level || ...)
     // 用 i32 避免负数下溢（%0 会得到 -1）
     let l = (l as i32) - (b'1' as i32);
@@ -573,7 +575,7 @@ fn check_capture(ms: &MatchState, l: u8) -> Result<usize, String> {
 }
 
 /// 对应 C 的 capture_to_close
-fn capture_to_close(ms: &MatchState) -> Result<usize, String> {
+fn capture_to_close(ms: &MatchState<'_>) -> Result<usize, String> {
     let mut level = ms.level;
     while level > 0 {
         level -= 1;
@@ -586,7 +588,7 @@ fn capture_to_close(ms: &MatchState) -> Result<usize, String> {
 
 /// 对应 C 的 start_capture
 fn start_capture(
-    ms: &mut MatchState,
+    ms: &mut MatchState<'_>,
     s: usize,
     p: usize,
     what: i32,
@@ -606,7 +608,7 @@ fn start_capture(
 }
 
 /// 对应 C 的 end_capture
-fn end_capture(ms: &mut MatchState, s: usize, p: usize) -> Result<Option<usize>, String> {
+fn end_capture(ms: &mut MatchState<'_>, s: usize, p: usize) -> Result<Option<usize>, String> {
     let l = capture_to_close(ms)?;
     ms.captures[l].len = (s - ms.captures[l].init) as i32;
     let res = match_pattern(ms, s, p)?;
@@ -617,7 +619,7 @@ fn end_capture(ms: &mut MatchState, s: usize, p: usize) -> Result<Option<usize>,
 }
 
 /// 对应 C 的 match_capture
-fn match_capture(ms: &MatchState, s: usize, l: u8) -> Result<Option<usize>, String> {
+fn match_capture(ms: &MatchState<'_>, s: usize, l: u8) -> Result<Option<usize>, String> {
     // C: l = check_capture(ms, l);  会抛出错误
     let l = check_capture(ms, l)?;
     let len = ms.captures[l].len as usize;
@@ -631,7 +633,7 @@ fn match_capture(ms: &MatchState, s: usize, l: u8) -> Result<Option<usize>, Stri
 }
 
 /// 对应 C 的 max_expand
-fn max_expand(ms: &mut MatchState, s: usize, p: usize, ep: usize) -> Result<Option<usize>, String> {
+fn max_expand(ms: &mut MatchState<'_>, s: usize, p: usize, ep: usize) -> Result<Option<usize>, String> {
     let mut i = 0i32;
     while single_match(ms, s + i as usize, p, ep) {
         i += 1;
@@ -648,7 +650,7 @@ fn max_expand(ms: &mut MatchState, s: usize, p: usize, ep: usize) -> Result<Opti
 
 /// 对应 C 的 min_expand
 fn min_expand(
-    ms: &mut MatchState,
+    ms: &mut MatchState<'_>,
     mut s: usize,
     p: usize,
     ep: usize,
@@ -670,7 +672,7 @@ fn min_expand(
 }
 
 /// 对应 C 的 match — 核心模式匹配函数
-fn match_pattern(ms: &mut MatchState, s: usize, p: usize) -> Result<Option<usize>, String> {
+fn match_pattern(ms: &mut MatchState<'_>, s: usize, p: usize) -> Result<Option<usize>, String> {
     if ms.match_depth == 0 {
         return Err("pattern too complex".to_string());
     }
@@ -681,7 +683,7 @@ fn match_pattern(ms: &mut MatchState, s: usize, p: usize) -> Result<Option<usize
 }
 
 fn match_pattern_inner(
-    ms: &mut MatchState,
+    ms: &mut MatchState<'_>,
     mut s: usize,
     mut p: usize,
 ) -> Result<Option<usize>, String> {
@@ -875,7 +877,7 @@ fn match_pattern_inner(
 
 /// 获取第 i 个捕获的内容
 /// 返回 (start, length) 或位置捕获
-fn get_one_capture(ms: &MatchState, i: usize, s: usize, e: usize) -> Result<CaptureResult, String> {
+fn get_one_capture(ms: &MatchState<'_>, i: usize, s: usize, e: usize) -> Result<CaptureResult, String> {
     if i >= ms.level {
         if i != 0 {
             return Err(format!("invalid capture index %{}", i + 1));
@@ -899,7 +901,7 @@ enum CaptureResult {
 }
 
 /// 获取所有捕获的字符串
-fn get_captures(ms: &MatchState, s: usize, e: usize) -> Result<Vec<TValue>, String> {
+fn get_captures(ms: &MatchState<'_>, s: usize, e: usize) -> Result<Vec<TValue>, String> {
     let nlevels = if ms.level == 0 { 1 } else { ms.level };
     let mut result = Vec::with_capacity(nlevels);
     for i in 0..nlevels {
@@ -970,7 +972,7 @@ pub fn str_find(s: &str, pattern: &str, init: i64, plain: bool) -> Result<FindRe
     }
 
     // 模式匹配
-    let mut ms = MatchState::new(s, pattern);
+    let mut ms = MatchState::new(s.as_bytes(), pattern.as_bytes());
     let mut pat_start = 0;
     let anchor = ms.pat_byte(0) == b'^';
     if anchor {
@@ -1065,7 +1067,7 @@ impl GMatchIterator {
         let src_bytes = self.src.as_bytes();
         let len = src_bytes.len();
         while self.pos <= len {
-            let mut ms = MatchState::new(&self.src, &self.pattern);
+            let mut ms = MatchState::new(self.src.as_bytes(), self.pattern.as_bytes());
             ms.level = 0;
             ms.captures.clear();
             ms.match_depth = MAX_CCALLS;
@@ -1121,7 +1123,7 @@ pub fn str_gsub(s: &str, pattern: &str, repl: &str, max_s: i64) -> Result<(Strin
     let mut last_match_end: Option<usize> = None;
 
     while n < max_s && src_pos <= len {
-        let mut ms = MatchState::new(s, pattern);
+        let mut ms = MatchState::new(s.as_bytes(), pattern.as_bytes());
         ms.level = 0;
         ms.captures.clear();
         ms.match_depth = MAX_CCALLS;
@@ -1194,7 +1196,7 @@ fn str_gsub_with_repl(
     let mut last_match_end: Option<usize> = None;
 
     while n < max_s && src_pos <= len {
-        let mut ms = MatchState::new(s, pattern);
+        let mut ms = MatchState::new(s.as_bytes(), pattern.as_bytes());
         ms.level = 0;
         ms.captures.clear();
         ms.match_depth = MAX_CCALLS;
@@ -1247,7 +1249,7 @@ fn str_gsub_with_repl(
 /// 若结果为 nil/false，保留原匹配文本，changed = false（对应 C 的 return 0）。
 fn add_value_from_repl(
     state: &mut LuaState,
-    ms: &MatchState,
+    ms: &MatchState<'_>,
     s: usize,
     e: usize,
     repl: &TValue,
@@ -1343,7 +1345,7 @@ fn add_value_from_repl(
 /// 使用 state.intern_str() 创建字符串，确保哈希值与表查找一致。
 fn get_capture_as_tvalue(
     state: &mut LuaState,
-    ms: &MatchState,
+    ms: &MatchState<'_>,
     i: usize,
     s: usize,
     e: usize,
@@ -1384,7 +1386,7 @@ fn format_float_value(f: f64) -> String {
 }
 
 /// 处理替换字符串中的 %0, %1-%9
-fn apply_replacement(repl: &str, ms: &MatchState, s: usize, e: usize) -> Result<String, String> {
+fn apply_replacement(repl: &str, ms: &MatchState<'_>, s: usize, e: usize) -> Result<String, String> {
     // 使用 Vec<u8> 构建结果，避免 as char 转换导致字节值变化
     let mut result: Vec<u8> = Vec::new();
     let repl_bytes = repl.as_bytes();
@@ -3427,7 +3429,7 @@ fn call_gmatch_iter(
     let mut found = false;
 
     while cur_pos <= len {
-        let mut ms = MatchState::new(&s_str, &p_str);
+        let mut ms = MatchState::new(s_str.as_bytes(), p_str.as_bytes());
         ms.level = 0;
         ms.captures.clear();
         ms.match_depth = MAX_CCALLS;

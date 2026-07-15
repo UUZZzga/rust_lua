@@ -323,7 +323,7 @@ pub struct CallInfoEntry {
     pub caller_proto: Option<Rc<Proto>>,
     pub is_c: bool,
     /// Lua 函数引用（C 函数为 None）
-    pub closure: Option<Box<crate::objects::LClosure>>,
+    pub closure: Option<Rc<crate::objects::LClosure>>,
     /// 栈帧基址（对应 C 的 ci->func + 1）
     pub base: usize,
     /// 调用时的 PC（用于计算 currentline）
@@ -1354,7 +1354,7 @@ impl LuaState {
             to_finalize.push(TValue::Table(t));
         }
         for u in self.ud_finobj_list.drain(..).rev() {
-            to_finalize.push(TValue::UserData(Box::new(u)));
+            to_finalize.push(TValue::UserData(Rc::new(u)));
         }
         self.call_finalizers(to_finalize);
         // finalizer 中可能调用 os.exit(code, true) 设置 exit_requested
@@ -1511,7 +1511,7 @@ impl LuaState {
                         value: Box::new(TValue::Nil(NilKind::Strict)),
                     })));
                 }
-                let closure = Box::new(LClosure {
+                let closure = Rc::new(LClosure {
                     gc_header: GCObjectHeader::new(),
                     proto: Rc::new(proto),
                     upvals: Rc::new(RefCell::new(upvals)),
@@ -1594,7 +1594,7 @@ impl LuaState {
                             value: Box::new(TValue::Nil(NilKind::Strict)),
                         })));
                     }
-                    let closure = Box::new(LClosure {
+                    let closure = Rc::new(LClosure {
                         gc_header: GCObjectHeader::new(),
                         proto: Rc::new(proto),
                         upvals: Rc::new(RefCell::new(upvals)),
@@ -2997,8 +2997,8 @@ impl LuaState {
                 }
             };
             if has_gc {
-                worklist.push(TValue::UserData(Box::new(u.clone())));
-                to_finalize.push(TValue::UserData(Box::new(u)));
+                worklist.push(TValue::UserData(Rc::new(u.clone())));
+                to_finalize.push(TValue::UserData(Rc::new(u)));
             }
         }
         self.ud_finobj_list = ud_keep;

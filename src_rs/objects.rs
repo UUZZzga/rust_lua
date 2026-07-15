@@ -215,15 +215,19 @@ pub enum TValue {
     /// 表
     Table(Table),
     /// Lua 闭包
-    LClosure(Box<LClosure>),
-    /// C 闭包
-    CClosure(Box<CClosure>),
+    /// 使用 Rc 而非 Box：clone 时仅增加引用计数（O(1)），不触发 malloc/free。
+    /// Box<LClosure> 的 clone 需要 Box::new(LClosure::clone()) 即 malloc+memcpy，
+    /// 在高频栈操作（OP_MOVE/OP_CALL 等）中是性能瓶颈。
+    /// Rc 与 Box 一样支持 niche 优化（NonNull），TValue 大小保持 16 字节不变。
+    LClosure(Rc<LClosure>),
+    /// C 闭包（同理用 Rc）
+    CClosure(Rc<CClosure>),
     /// 轻量 C 函数
     LCFn(LCFunction),
-    /// 用户数据
-    UserData(Box<Udata>),
-    /// 线程/协程
-    Thread(Box<LuaThread>),
+    /// 用户数据（同理用 Rc）
+    UserData(Rc<Udata>),
+    /// 线程/协程（同理用 Rc）
+    Thread(Rc<LuaThread>),
 }
 
 /// nil 的子变体 —— 用 enum 替代 C 的 variant bit
@@ -464,7 +468,7 @@ impl PartialEq for TValue {
             (TValue::Str(a), TValue::Str(b)) => a == b,
             (TValue::Table(a), TValue::Table(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
             (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
-            (TValue::CClosure(a), TValue::CClosure(b)) => std::ptr::eq(a, b),
+            (TValue::CClosure(a), TValue::CClosure(b)) => Rc::ptr_eq(a, b),
             (TValue::LCFn(a), TValue::LCFn(b)) => {
                 std::ptr::eq(a.func as *const (), b.func as *const ())
             }

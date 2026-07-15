@@ -2736,7 +2736,7 @@ fn call_load(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
                     value: Box::new(TValue::Nil(NilKind::Strict)),
                 })));
             }
-            let closure = Box::new(LClosure {
+            let closure = Rc::new(LClosure {
                 gc_header: GCObjectHeader::new(),
                 proto: std::rc::Rc::new(proto),
                 upvals: std::rc::Rc::new(std::cell::RefCell::new(upvals)),

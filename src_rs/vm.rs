@@ -455,7 +455,7 @@ pub fn raw_equal(t1: &TValue, t2: &TValue) -> bool {
         (TValue::LightUserData(a), TValue::LightUserData(b)) => std::ptr::eq(*a, *b),
         (TValue::Table(a), TValue::Table(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
         (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
-        (TValue::CClosure(a), TValue::CClosure(b)) => std::ptr::eq(a as *const _, b as *const _),
+        (TValue::CClosure(a), TValue::CClosure(b)) => Rc::ptr_eq(a, b),
         (TValue::UserData(a), TValue::UserData(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
         (TValue::Thread(a), TValue::Thread(b)) => Rc::ptr_eq(&a.context, &b.context),
         _ => false,
@@ -1233,7 +1233,7 @@ pub fn push_closure(
     }
 
     let closure_id = gc.register_object(std::mem::size_of::<crate::objects::LClosure>());
-    let closure = Box::new(crate::objects::LClosure {
+    let closure = Rc::new(crate::objects::LClosure {
         gc_header: crate::gc::GCObjectHeader::new(),
         proto: Rc::new(proto.clone()),
         upvals: Rc::new(RefCell::new(upvals)),

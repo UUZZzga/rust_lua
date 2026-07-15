@@ -992,7 +992,7 @@ fn call_create(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         is_main: false,
         context,
     };
-    push_single_result(state, a, nresults, TValue::Thread(Box::new(thread)));
+    push_single_result(state, a, nresults, TValue::Thread(Rc::new(thread)));
     Ok(())
 }
 
@@ -1294,11 +1294,11 @@ fn call_running(
                 is_main: false,
                 context: ctx.clone(),
             };
-            (TValue::Thread(Box::new(thread)), false)
+            (TValue::Thread(Rc::new(thread)), false)
         }
         None => {
             // 主线程 — 返回 main_thread + true
-            (TValue::Thread(Box::new(state.main_thread.clone())), true)
+            (TValue::Thread(Rc::new(state.main_thread.clone())), true)
         }
     };
 
@@ -1962,7 +1962,7 @@ fn call_wrap(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
     );
     mt.set(
         TValue::LightUserData(WRAP_THREAD_MARKER),
-        TValue::Thread(Box::new(thread.clone())),
+        TValue::Thread(Rc::new(thread.clone())),
     );
     state.wrap_coros.push(Some(thread));
     wrap_table.set_metatable(Some(mt));

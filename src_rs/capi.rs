@@ -22,6 +22,7 @@
 
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::ptr;
+use std::rc::Rc;
 
 use crate::objects::{CClosure, LCFunction, LClosure, LuaType, NilKind, Proto, TValue, Table};
 use crate::state::LuaState;
@@ -460,7 +461,7 @@ pub extern "C" fn lua_pushcclosure(L: *mut lua_State, f: lua_CFunction, n: c_int
         for _ in 0..n {
             upvalues.push(L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict)));
         }
-        L.stack.push(TValue::CClosure(Box::new(CClosure {
+        L.stack.push(TValue::CClosure(Rc::new(CClosure {
             f,
             upvalue: upvalues,
         })));
