@@ -65,9 +65,9 @@ pub enum PcallKind {
 #[derive(Clone, Debug)]
 pub struct PcallProtection {
     /// pcall 调用者的执行上下文（saved_*）— 用于恢复 pcall 调用者的执行
-    pub saved_code: Vec<Instruction>,
-    pub saved_constants: Vec<TValue>,
-    pub saved_upval_descs: Vec<UpvalDesc>,
+    pub saved_code: Rc<Vec<Instruction>>,
+    pub saved_constants: Rc<Vec<TValue>>,
+    pub saved_upval_descs: Rc<Vec<UpvalDesc>>,
     pub saved_protos: Vec<Rc<Proto>>,
     pub saved_base: usize,
     pub saved_pc: usize,
@@ -135,9 +135,10 @@ pub struct CallInfo {
 
 pub struct LuaState {
     // 执行上下文（原 VmState）
-    pub constants: Vec<TValue>,
-    pub code: Vec<Instruction>,
-    pub upval_descs: Vec<UpvalDesc>,
+    // Rc<Vec> 避免 op_call 中深拷贝 proto 字段（perf: 省 ~5.3% malloc+memmove）
+    pub constants: Rc<Vec<TValue>>,
+    pub code: Rc<Vec<Instruction>>,
+    pub upval_descs: Rc<Vec<UpvalDesc>>,
     pub protos: Vec<Rc<Proto>>,
     pub top: usize,
     pub base: usize,
@@ -366,9 +367,9 @@ impl LuaState {
         let top = stack.len();
 
         LuaState {
-            constants: Vec::new(),
-            code: Vec::new(),
-            upval_descs: Vec::new(),
+            constants: Rc::new(Vec::new()),
+            code: Rc::new(Vec::new()),
+            upval_descs: Rc::new(Vec::new()),
             protos: Vec::new(),
             top,
             base: 0,
@@ -556,9 +557,9 @@ impl LuaState {
         let top = stack.len();
 
         let state = LuaState {
-            constants: Vec::new(),
-            code: Vec::new(),
-            upval_descs: Vec::new(),
+            constants: Rc::new(Vec::new()),
+            code: Rc::new(Vec::new()),
+            upval_descs: Rc::new(Vec::new()),
             protos: Vec::new(),
             top,
             base: 0,
@@ -1862,9 +1863,9 @@ impl LuaState {
                 if need_shield {
                     self.pcall_protection_stack
                         .push(crate::state::PcallProtection {
-                            saved_code: Vec::new(),
-                            saved_constants: Vec::new(),
-                            saved_upval_descs: Vec::new(),
+                            saved_code: Rc::new(Vec::new()),
+                            saved_constants: Rc::new(Vec::new()),
+                            saved_upval_descs: Rc::new(Vec::new()),
                             saved_protos: Vec::new(),
                             saved_base: 0,
                             saved_pc: 0,
@@ -2795,7 +2796,7 @@ impl LuaState {
 
         // 收集根：call_stack 中的 constants 和 closure_upvals
         for frame in &self.call_stack {
-            for val in &frame.constants {
+            for val in &frame.constants[..] {
                 worklist.push(val.clone());
             }
             for uv_ref in &frame.closure_upvals {
@@ -3138,7 +3139,7 @@ impl LuaState {
         for val in &ctx.saved_stack {
             worklist.push(val.clone());
         }
-        for val in &ctx.saved_constants {
+        for val in &ctx.saved_constants[..] {
             worklist.push(val.clone());
         }
         for uv_ref in &ctx.saved_closure_upvals {
@@ -3155,7 +3156,7 @@ impl LuaState {
             }
         }
         for frame in &ctx.saved_call_stack {
-            for val in &frame.constants {
+            for val in &frame.constants[..] {
                 worklist.push(val.clone());
             }
             for uv_ref in &frame.closure_upvals {
@@ -3420,10 +3421,10 @@ mod tests {
             size_abs_line_info: 0,
             line_defined: 0,
             last_line_defined: 0,
-            constants: vec![],
-            code: vec![],
+            constants: Rc::new(vec![]),
+            code: Rc::new(vec![]),
             protos: vec![],
-            upvalues: vec![],
+            upvalues: Rc::new(vec![]),
             line_info: vec![],
             abs_line_info: vec![],
             loc_vars: vec![],

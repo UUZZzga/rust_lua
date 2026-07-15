@@ -18,10 +18,10 @@ pub fn new_proto() -> Proto {
         size_abs_line_info: 0,
         line_defined: 0,
         last_line_defined: 0,
-        constants: Vec::with_capacity(8),
-        code: Vec::with_capacity(8),
+        constants: Rc::new(Vec::with_capacity(8)),
+        code: Rc::new(Vec::with_capacity(8)),
         protos: Vec::new(),
-        upvalues: Vec::with_capacity(2),
+        upvalues: Rc::new(Vec::with_capacity(2)),
         line_info: Vec::with_capacity(8),
         abs_line_info: Vec::new(),
         loc_vars: Vec::new(),
@@ -32,7 +32,7 @@ pub fn new_proto() -> Proto {
 pub fn proto_size(p: &Proto) -> usize {
     let mut size = std::mem::size_of::<Proto>();
     size += p.code.len() * std::mem::size_of::<Instruction>();
-    for c in &p.constants {
+    for c in &p.constants[..] {
         size += tvalue_size(c);
     }
     for sub in &p.protos {
@@ -476,9 +476,9 @@ mod tests {
             tbc_list: None,
             twups_linked: false,
             is_in_twups: false,
-            constants: Vec::new(),
-            code: Vec::new(),
-            upval_descs: Vec::new(),
+            constants: Rc::new(Vec::new()),
+            code: Rc::new(Vec::new()),
+            upval_descs: Rc::new(Vec::new()),
             protos: Vec::new(),
             trap: false,
             num_params: 0,
@@ -575,8 +575,8 @@ mod tests {
     #[test]
     fn test_proto_size_includes_code_and_constants() {
         let mut p = new_proto();
-        p.code = vec![1, 2, 3];
-        p.constants = vec![TValue::Integer(42)];
+        p.code = Rc::new(vec![1, 2, 3]);
+        p.constants = Rc::new(vec![TValue::Integer(42)]);
         let empty_size = proto_size(&new_proto());
         let filled_size = proto_size(&p);
         assert!(filled_size > empty_size);

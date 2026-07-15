@@ -12,6 +12,7 @@
 //! - 错误处理使用 `Result<(), VmError>` 替代 C 的 longjmp
 
 use std::fmt;
+use std::rc::Rc;
 
 use bitflags::bitflags;
 
@@ -816,9 +817,9 @@ pub fn call_close_method(
     state
         .pcall_protection_stack
         .push(crate::state::PcallProtection {
-            saved_code: Vec::new(),
-            saved_constants: Vec::new(),
-            saved_upval_descs: Vec::new(),
+            saved_code: Rc::new(Vec::new()),
+            saved_constants: Rc::new(Vec::new()),
+            saved_upval_descs: Rc::new(Vec::new()),
             saved_protos: Vec::new(),
             saved_base: 0,
             saved_pc: 0,

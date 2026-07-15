@@ -198,9 +198,9 @@ fn push_resume_error(
 
 /// 保存调用者的 VM 执行上下文到局部变量（使用 mem::take 避免克隆）
 struct CallerContext {
-    code: Vec<crate::objects::Instruction>,
-    constants: Vec<TValue>,
-    upval_descs: Vec<crate::objects::UpvalDesc>,
+    code: Rc<Vec<crate::objects::Instruction>>,
+    constants: Rc<Vec<TValue>>,
+    upval_descs: Rc<Vec<crate::objects::UpvalDesc>>,
     protos: Vec<Rc<crate::objects::Proto>>,
     base: usize,
     pc: usize,
@@ -1206,9 +1206,9 @@ fn close_suspended_coroutine(
     // 清空协程的 ThreadContext（协程已结束）
     {
         let mut ctx = co_context.borrow_mut();
-        ctx.saved_code = Vec::new();
-        ctx.saved_constants = Vec::new();
-        ctx.saved_upval_descs = Vec::new();
+        ctx.saved_code = Rc::new(Vec::new());
+        ctx.saved_constants = Rc::new(Vec::new());
+        ctx.saved_upval_descs = Rc::new(Vec::new());
         ctx.saved_protos = Vec::new();
         ctx.saved_closure_upvals = Vec::new();
         ctx.saved_call_stack = Vec::new();
@@ -1674,10 +1674,10 @@ fn setup_first_resume(
     let nargs = resume_args.len();
 
     if let TValue::LClosure(closure) = &func {
-        // Lua 函数: 从 proto 加载执行上下文
-        state.code = closure.proto.code.clone();
-        state.constants = closure.proto.constants.clone();
-        state.upval_descs = closure.proto.upvalues.clone();
+        // Lua 函数: 从 proto 加载执行上下文 — Rc::clone O(1) 替代 Vec 深拷贝
+        state.code = Rc::clone(&closure.proto.code);
+        state.constants = Rc::clone(&closure.proto.constants);
+        state.upval_descs = Rc::clone(&closure.proto.upvalues);
         state.protos = closure.proto.protos.clone();
         state.base = 1; // closure 在 stack[0]，寄存器从 stack[1] 开始
         state.pc = 0;
@@ -1752,9 +1752,9 @@ fn setup_first_resume(
         use crate::opcodes::{create_abck, OpCode};
         let call_inst = create_abck(OpCode::CALL, 0, (nargs + 1) as i32, 0, 0);
         let return_inst = create_abck(OpCode::RETURN, 0, 0, 0, 0);
-        state.code = vec![call_inst, return_inst];
-        state.constants = Vec::new();
-        state.upval_descs = Vec::new();
+        state.code = Rc::new(vec![call_inst, return_inst]);
+        state.constants = Rc::new(Vec::new());
+        state.upval_descs = Rc::new(Vec::new());
         state.protos = Vec::new();
         state.base = 1;
         state.pc = 0;

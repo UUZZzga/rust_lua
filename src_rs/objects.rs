@@ -750,14 +750,14 @@ pub struct Proto {
     pub line_defined: i32,
     /// 定义结束行
     pub last_line_defined: i32,
-    /// 常量表
-    pub constants: Vec<TValue>,
-    /// 指令序列
-    pub code: Vec<Instruction>,
+    /// 常量表 — Rc<Vec> 避免 op_call 中深拷贝（perf: 省 ~5.3% malloc+memmove）
+    pub constants: Rc<Vec<TValue>>,
+    /// 指令序列 — Rc<Vec> 避免 op_call 中深拷贝
+    pub code: Rc<Vec<Instruction>>,
     /// 子原型
     pub protos: Vec<Rc<Proto>>,
-    /// 上值描述
-    pub upvalues: Vec<UpvalDesc>,
+    /// 上值描述 — Rc<Vec> 避免 op_call 中深拷贝
+    pub upvalues: Rc<Vec<UpvalDesc>>,
     /// 行号差值数组
     pub line_info: Vec<i8>,
     /// 绝对行号信息
@@ -831,9 +831,9 @@ pub struct Udata {
 /// 切换到被调用函数的原型；op_return 时从 CallFrame 恢复。
 #[derive(Debug, Clone)]
 pub struct CallFrame {
-    pub code: Vec<Instruction>,
-    pub constants: Vec<TValue>,
-    pub upval_descs: Vec<UpvalDesc>,
+    pub code: Rc<Vec<Instruction>>,
+    pub constants: Rc<Vec<TValue>>,
+    pub upval_descs: Rc<Vec<UpvalDesc>>,
     pub protos: Vec<Rc<Proto>>,
     pub base: usize,
     pub return_pc: usize,
@@ -858,9 +858,9 @@ pub struct ThreadContext {
     /// 协程当前状态（共享可变，对应 LuaThread.status 的真实来源）
     pub status: ThreadStatus,
     /// 挂起时保存的 VM 执行上下文
-    pub saved_code: Vec<Instruction>,
-    pub saved_constants: Vec<TValue>,
-    pub saved_upval_descs: Vec<UpvalDesc>,
+    pub saved_code: Rc<Vec<Instruction>>,
+    pub saved_constants: Rc<Vec<TValue>>,
+    pub saved_upval_descs: Rc<Vec<UpvalDesc>>,
     pub saved_protos: Vec<Rc<Proto>>,
     pub saved_base: usize,
     pub saved_pc: usize,
@@ -1985,10 +1985,10 @@ mod tests {
             size_abs_line_info: 0,
             line_defined: 0,
             last_line_defined: 0,
-            constants: vec![],
-            code: vec![],
+            constants: Rc::new(vec![]),
+            code: Rc::new(vec![]),
             protos: vec![],
-            upvalues: vec![],
+            upvalues: Rc::new(vec![]),
             line_info: vec![],
             abs_line_info: vec![],
             loc_vars: vec![],

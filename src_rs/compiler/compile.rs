@@ -5,6 +5,7 @@ use crate::opcodes::*;
 use crate::strings::LuaString;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
+use std::rc::Rc;
 
 use crate::objects::Instruction;
 
@@ -521,7 +522,7 @@ pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
     // differently: _ENV is treated as an upvalue in the main function,
     // and global variable access uses GETTABUP/SETTABUP instead of GETFIELD/SETFIELD.
     // This avoids the register offset issue that would occur if _ENV were a local.
-    fs.proto.upvalues.push(crate::objects::UpvalDesc {
+    Rc::make_mut(&mut fs.proto.upvalues).push(crate::objects::UpvalDesc {
         name: Some(crate::strings::new_lstr(&ls.state.string_table, "_ENV")),
         in_stack: true,
         idx: 0,
@@ -667,7 +668,7 @@ const MAXIWTHABS: i32 = 128;
 impl<'a> FuncState<'a> {
     /// 发射指令到原型代码数组，返回当前 pc 并自增
     fn emit(&mut self, ins: Instruction) -> i32 {
-        self.proto.code.push(ins);
+        Rc::make_mut(&mut self.proto.code).push(ins);
         self.inst_lines.push(self.ls().lastline);
         let cur = self.pc;
         self.pc += 1;
@@ -792,7 +793,7 @@ impl<'a> FuncState<'a> {
 
     /// 修复跳转指令偏移量: 根据 OpMode 计算 dest 与 pc 之差写入指令
     fn fix_jump(&mut self, pc: i32, dest: i32, back: bool) {
-        let i = &mut self.proto.code[pc as usize];
+        let i = &mut Rc::make_mut(&mut self.proto.code)[pc as usize];
         let op = get_opcode(*i);
         match get_opmode(op) {
             OpMode::IABC => {
@@ -829,19 +830,19 @@ impl<'a> FuncState<'a> {
 
     /// 设置指定指令的 C 参数
     fn set_c(&mut self, pc: i32, c: i32) {
-        let i = &mut self.proto.code[pc as usize];
+        let i = &mut Rc::make_mut(&mut self.proto.code)[pc as usize];
         setarg(i, c, POS_C, SIZE_C);
     }
 
     /// 设置指定指令的 A 参数 (用于延迟寄存器分配)
     fn set_a(&mut self, pc: i32, a: i32) {
-        let i = &mut self.proto.code[pc as usize];
+        let i = &mut Rc::make_mut(&mut self.proto.code)[pc as usize];
         setarg(i, a, POS_A, SIZE_A);
     }
 
     /// 设置指定指令的 B 参数
     fn set_b(&mut self, pc: i32, b: i32) {
-        let i = &mut self.proto.code[pc as usize];
+        let i = &mut Rc::make_mut(&mut self.proto.code)[pc as usize];
         setarg(i, b, POS_B, SIZE_B);
     }
 
@@ -856,8 +857,9 @@ impl<'a> FuncState<'a> {
             0
         };
         let inst = create_vabck(OpCode::NEWTABLE, ra, hsize, rc, if k { 1 } else { 0 });
-        self.proto.code[pc as usize] = inst;
-        self.proto.code[(pc + 1) as usize] =
+        let code = Rc::make_mut(&mut self.proto.code);
+        code[pc as usize] = inst;
+        code[(pc + 1) as usize] =
             ((OpCode::EXTRAARG as u32) << POS_OP) | ((extra as u32) << POS_A);
     }
 
@@ -870,7 +872,7 @@ impl<'a> FuncState<'a> {
     fn negate_condition(&mut self, jmp_pc: i32) {
         let ctrl_pc = jmp_pc - 1;
         if ctrl_pc >= 0 && ctrl_pc < self.proto.code.len() as i32 {
-            let ctrl_inst = &mut self.proto.code[ctrl_pc as usize];
+            let ctrl_inst = &mut Rc::make_mut(&mut self.proto.code)[ctrl_pc as usize];
             let cur_k = testarg_k(*ctrl_inst);
             setarg(ctrl_inst, if cur_k { 0 } else { 1 }, POS_K, 1);
         }
@@ -908,7 +910,7 @@ impl<'a> FuncState<'a> {
         }
         let offset = list2 - list - 1;
         setarg(
-            &mut self.proto.code[list as usize],
+            &mut Rc::make_mut(&mut self.proto.code)[list as usize],
             offset + OFFSET_sJ,
             POS_SJ,
             SIZE_sJ,
@@ -938,7 +940,7 @@ impl<'a> FuncState<'a> {
             return idx;
         }
         let idx = self.proto.constants.len() as i32;
-        self.proto.constants.push(value);
+        Rc::make_mut(&mut self.proto.constants).push(value);
         self.const_index.insert(key, idx);
         idx
     }
@@ -997,7 +999,7 @@ impl<'a> FuncState<'a> {
             if float_is_integer(k) {
                 // k 是整数值，不去重，直接添加新常量
                 let idx = self.proto.constants.len() as i32;
-                self.proto.constants.push(TValue::Float(f));
+                Rc::make_mut(&mut self.proto.constants).push(TValue::Float(f));
                 idx
             } else {
                 // k 不是整数值，正常去重
@@ -1456,7 +1458,7 @@ impl<'a> FuncState<'a> {
             }
             let idx = self.proto.upvalues.len() as i32;
             let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name);
-            self.proto.upvalues.push(crate::objects::UpvalDesc {
+            Rc::make_mut(&mut self.proto.upvalues).push(crate::objects::UpvalDesc {
                 name: Some(ls),
                 in_stack: false,
                 idx: upval_idx,
@@ -1498,7 +1500,7 @@ impl<'a> FuncState<'a> {
                 }
                 let idx = self.proto.upvalues.len() as i32;
                 let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name);
-                self.proto.upvalues.push(crate::objects::UpvalDesc {
+                Rc::make_mut(&mut self.proto.upvalues).push(crate::objects::UpvalDesc {
                     name: Some(ls),
                     in_stack: false,
                     idx: parent_upval_idx as u8,
@@ -1521,7 +1523,7 @@ impl<'a> FuncState<'a> {
         }
         let idx = self.proto.upvalues.len() as i32;
         let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, &pvar.name);
-        self.proto.upvalues.push(crate::objects::UpvalDesc {
+        Rc::make_mut(&mut self.proto.upvalues).push(crate::objects::UpvalDesc {
             name: Some(ls),
             in_stack: true,
             idx: pvar.reg as u8,
@@ -1594,7 +1596,7 @@ impl<'a> FuncState<'a> {
                 }
                 let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name);
                 let idx = prev.proto.upvalues.len();
-                prev.proto.upvalues.push(crate::objects::UpvalDesc {
+                Rc::make_mut(&mut prev.proto.upvalues).push(crate::objects::UpvalDesc {
                     name: Some(ls),
                     in_stack: true,
                     idx: pvar.reg as u8,
@@ -1623,7 +1625,7 @@ impl<'a> FuncState<'a> {
                 }
                 let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name);
                 let idx = prev.proto.upvalues.len();
-                prev.proto.upvalues.push(crate::objects::UpvalDesc {
+                Rc::make_mut(&mut prev.proto.upvalues).push(crate::objects::UpvalDesc {
                     name: Some(ls),
                     in_stack: false,
                     idx: upval_idx,
@@ -1660,7 +1662,7 @@ impl<'a> FuncState<'a> {
                 }
                 let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name);
                 let idx = prev.proto.upvalues.len();
-                prev.proto.upvalues.push(crate::objects::UpvalDesc {
+                Rc::make_mut(&mut prev.proto.upvalues).push(crate::objects::UpvalDesc {
                     name: Some(ls),
                     in_stack: false,
                     idx: grandparent_upval_idx as u8,
@@ -2317,14 +2319,14 @@ impl<'a> FuncState<'a> {
         let old_a = getarg_a(i);
         if reg != NO_REG as i32 && reg != b {
             setarg(
-                &mut self.proto.code[(node - 1) as usize],
+                &mut Rc::make_mut(&mut self.proto.code)[(node - 1) as usize],
                 reg,
                 POS_A,
                 SIZE_A,
             );
         } else {
             let k = testarg_k(i);
-            self.proto.code[(node - 1) as usize] = ((OpCode::TEST as u32) << POS_OP)
+            Rc::make_mut(&mut self.proto.code)[(node - 1) as usize] = ((OpCode::TEST as u32) << POS_OP)
                 | ((b as u32) << POS_A)
                 | (if k { 1u32 << POS_K } else { 0 });
         }
@@ -2598,8 +2600,9 @@ fn parse_chunk_finish(fs: &mut FuncState) {
     if proto.flag & PF_VATAB != 0 {
         proto.flag &= !PF_VAHID;
     }
-    for i in 0..proto.code.len() {
-        let inst = &mut proto.code[i];
+    let code = Rc::make_mut(&mut proto.code);
+    for i in 0..code.len() {
+        let inst = &mut code[i];
         let op = get_opcode(*inst);
         match op {
             OpCode::RETURN0 | OpCode::RETURN1 => {
@@ -2620,14 +2623,14 @@ fn parse_chunk_finish(fs: &mut FuncState) {
             }
             _ => {}
         }
-        let op = get_opcode(proto.code[i]); // re-read after possible SET_OPCODE
+        let op = get_opcode(code[i]); // re-read after possible SET_OPCODE
         match op {
             OpCode::RETURN0 | OpCode::RETURN1 | OpCode::RETURN | OpCode::TAILCALL => {
                 if fs.needclose {
-                    SETARG_k(&mut proto.code[i], 1);
+                    SETARG_k(&mut code[i], 1);
                 }
                 if (proto.flag & PF_VAHID) != 0 {
-                    SETARG_C(&mut proto.code[i], proto.num_params as i32 + 1);
+                    SETARG_C(&mut code[i], proto.num_params as i32 + 1);
                 }
             }
             _ => {}
@@ -2885,8 +2888,9 @@ fn solve_goto(fs: &mut FuncState, name: &str) {
                     // it after deactivation (locals array is sparse). Use the saved reglevel
                     // from label creation time, which is equivalent.
                     let stklevel = lb.reglevel;
-                    fs.proto.code[(gt_pc + 1) as usize] = fs.proto.code[gt_pc as usize];
-                    fs.proto.code[gt_pc as usize] = create_abck(OpCode::CLOSE, stklevel, 0, 0, 0);
+                    let code = Rc::make_mut(&mut fs.proto.code);
+                    code[(gt_pc + 1) as usize] = code[gt_pc as usize];
+                    code[gt_pc as usize] = create_abck(OpCode::CLOSE, stklevel, 0, 0, 0);
                     gt_pc += 1; // Now JMP is at gt_pc
                 }
                 // Patch the JMP to jump to the label
@@ -2985,8 +2989,9 @@ fn solve_gotos_for_block(
                 // it after deactivation (locals array is sparse). Use the saved reglevel
                 // from label creation time, which is equivalent.
                 let stklevel = fs.labels[lb_idx].reglevel;
-                fs.proto.code[(gt_pc + 1) as usize] = fs.proto.code[gt_pc as usize];
-                fs.proto.code[gt_pc as usize] = create_abck(OpCode::CLOSE, stklevel, 0, 0, 0);
+                let code = Rc::make_mut(&mut fs.proto.code);
+                code[(gt_pc + 1) as usize] = code[gt_pc as usize];
+                code[gt_pc as usize] = create_abck(OpCode::CLOSE, stklevel, 0, 0, 0);
                 gt_pc += 1;
             }
             let lb = &fs.labels[lb_idx];
@@ -3983,7 +3988,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 let (base_reg, gettabup_pc) = if can_revert_getupval {
                     // Revert: remove the GETUPVAL instruction, free the register
                     let getupval_pc = fs.pc - 1;
-                    fs.proto.code.remove(getupval_pc as usize);
+                    Rc::make_mut(&mut fs.proto.code).remove(getupval_pc as usize);
                     fs.inst_lines.remove(getupval_pc as usize);
                     fs.pc -= 1;
                     fs.free_reg();
@@ -4228,7 +4233,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         // Short string key: use GETTABUP/SETTABUP directly (C's VINDEXUP)
                         // If we emitted GETUPVAL before key load, revert it
                         if getupval_emitted_before_key {
-                            fs.proto.code.remove(fs.pc as usize - 1);
+                            Rc::make_mut(&mut fs.proto.code).remove(fs.pc as usize - 1);
                             fs.inst_lines.remove(fs.pc as usize - 1);
                             fs.pc -= 1;
                             fs.free_reg();
@@ -4479,11 +4484,11 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         let gettabup_pc = v.env_gettabup_pc;
                         let (env_k, adjusted_key) =
                             if gettabup_pc >= 0 && (gettabup_pc as usize) < fs.proto.code.len() {
-                                let gettabup_inst = fs.proto.code.remove(gettabup_pc as usize);
+                                let gettabup_inst = Rc::make_mut(&mut fs.proto.code).remove(gettabup_pc as usize);
                                 fs.inst_lines.remove(gettabup_pc as usize);
                                 fs.pc -= 1;
                                 let env_k = getarg_c(gettabup_inst);
-                                fs.proto.constants.remove(env_k as usize);
+                                Rc::make_mut(&mut fs.proto.constants).remove(env_k as usize);
                                 let adjusted_key = if (env_k as i32) < table_key {
                                     table_key - 1
                                 } else {
@@ -5745,7 +5750,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         let (base_reg, gettabup_pc) = if can_revert_getupval {
                             // Revert: remove the GETUPVAL instruction, free the register
                             let getupval_pc = fs.pc - 1;
-                            fs.proto.code.remove(getupval_pc as usize);
+                            Rc::make_mut(&mut fs.proto.code).remove(getupval_pc as usize);
                             fs.inst_lines.remove(getupval_pc as usize);
                             fs.pc -= 1;
                             fs.free_reg();
@@ -6011,7 +6016,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                                 && (kr as u32) <= crate::opcodes::MAXINDEXRK;
                             if can_use_settabup {
                                 if getupval_emitted_before_key {
-                                    fs.proto.code.remove(fs.pc as usize - 1);
+                                    Rc::make_mut(&mut fs.proto.code).remove(fs.pc as usize - 1);
                                     fs.inst_lines.remove(fs.pc as usize - 1);
                                     fs.pc -= 1;
                                     fs.free_reg();
@@ -6261,7 +6266,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         // and: goiftrue → jumponcond(cond=0) → TEST b k=!cond=true
                         let not_inst = fs.proto.code[e_left.info2 as usize];
                         let b = getarg_b(not_inst);
-                        fs.proto.code.remove(e_left.info2 as usize);
+                        Rc::make_mut(&mut fs.proto.code).remove(e_left.info2 as usize);
                         fs.inst_lines.remove(e_left.info2 as usize);
                         fs.pc -= 1;
                         fs.code_abc_k(OpCode::TEST, b, 0, 0, true);
@@ -6331,7 +6336,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                         // or: goiffalse → jumponcond(cond=1) → TEST b k=!cond=false
                         let not_inst = fs.proto.code[e_left.info2 as usize];
                         let b = getarg_b(not_inst);
-                        fs.proto.code.remove(e_left.info2 as usize);
+                        Rc::make_mut(&mut fs.proto.code).remove(e_left.info2 as usize);
                         fs.inst_lines.remove(e_left.info2 as usize);
                         fs.pc -= 1;
                         fs.code_abc_k(OpCode::TEST, b, 0, 0, false);
@@ -7665,7 +7670,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             };
             if merged {
                 let n = getarg_b(fs.proto.code[fs.proto.code.len() - 1]);
-                fs.proto.code.pop();
+                Rc::make_mut(&mut fs.proto.code).pop();
                 fs.inst_lines.pop();
                 fs.pc -= 1;
                 fs.code_abc(OpCode::CONCAT, r, n + 1, 0);
@@ -10351,7 +10356,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 ExpKind::Call => {
                     let call_pc = ei.exp.info2;
                     if call_pc >= 0 {
-                        setarg(&mut fs.proto.code[call_pc as usize], 2, POS_C, SIZE_C);
+                        setarg(&mut Rc::make_mut(&mut fs.proto.code)[call_pc as usize], 2, POS_C, SIZE_C);
                     }
                     ExpDesc {
                         kind: ExpKind::NonReloc,
@@ -10592,7 +10597,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     let last_idx = fs.pc as usize - 1;
                     let last_ins = fs.proto.code[last_idx];
                     let uv_idx = getarg_b(last_ins);
-                    fs.proto.code.remove(last_idx);
+                    Rc::make_mut(&mut fs.proto.code).remove(last_idx);
                     fs.inst_lines.remove(last_idx);
                     fs.pc -= 1;
                     if base_reg >= fs.nvarstack() && base_reg == fs.freereg - 1 {
@@ -11036,7 +11041,7 @@ fn parse_if_cond(fs: &mut FuncState, entry_freereg: i32) -> i32 {
             let not_inst = fs.proto.code[ei.exp.info2 as usize];
             let b = getarg_b(not_inst);
             fs.pc -= 1;
-            fs.proto.code.pop();
+            Rc::make_mut(&mut fs.proto.code).pop();
             fs.inst_lines.pop();
             // goiftrue: cond=0, !cond=1 → k=true
             fs.code_abc_k(OpCode::TEST, b, 0, 0, true);
@@ -11110,7 +11115,7 @@ fn parse_while(fs: &mut FuncState) {
             let not_inst = fs.proto.code[ei.exp.info2 as usize];
             let b = getarg_b(not_inst);
             fs.pc -= 1;
-            fs.proto.code.pop();
+            Rc::make_mut(&mut fs.proto.code).pop();
             fs.inst_lines.pop();
             fs.code_abc_k(OpCode::TEST, b, 0, 0, true);
             let jmp = fs.jump();
@@ -11294,7 +11299,7 @@ fn parse_repeat(fs: &mut FuncState) {
                 let not_inst = fs.proto.code[ei.exp.info2 as usize];
                 let b = getarg_b(not_inst);
                 fs.pc -= 1;
-                fs.proto.code.pop();
+                Rc::make_mut(&mut fs.proto.code).pop();
                 fs.inst_lines.pop();
                 fs.code_abc_k(OpCode::TEST, b, 0, 0, true);
                 let jmp_pc3 = fs.jump();
@@ -11646,7 +11651,7 @@ fn parse_for(fs: &mut FuncState) {
             if fs.pc > pc_before {
                 for i in (pc_before..fs.pc).rev() {
                     if get_opcode(fs.proto.code[i as usize]) == OpCode::CALL {
-                        setarg(&mut fs.proto.code[i as usize], needed, POS_C, SIZE_C);
+                        setarg(&mut Rc::make_mut(&mut fs.proto.code)[i as usize], needed, POS_C, SIZE_C);
                         break;
                     }
                 }
@@ -12188,7 +12193,7 @@ fn parse_local(fs: &mut FuncState) {
             let n_reg = if last_is_ctc { nvars - 1 } else { nvars };
 
             if last_is_ctc {
-                let popped = fs.proto.code.pop();
+                let popped = Rc::make_mut(&mut fs.proto.code).pop();
                 fs.inst_lines.pop();
                 fs.pc -= 1;
                 // LOADK 引用的常量是 CTC 变量声明时添加的，C 编译器不添加此常量
@@ -12197,7 +12202,7 @@ fn parse_local(fs: &mut FuncState) {
                 // (LOADI/LOADF 不添加常量，无需处理。)
                 if let Some(inst) = popped {
                     if crate::opcodes::get_opcode(inst) == OpCode::LOADK {
-                        if let Some(val) = fs.proto.constants.pop() {
+                        if let Some(val) = Rc::make_mut(&mut fs.proto.constants).pop() {
                             let key = to_const_key(&val);
                             fs.const_index.remove(&key);
                         }
@@ -12214,7 +12219,7 @@ fn parse_local(fs: &mut FuncState) {
                     let call_pc = last_e.info2;
                     if call_pc >= 0 {
                         let needed = ((n_reg - n_vals + 2) as i32).min(255);
-                        setarg(&mut fs.proto.code[call_pc as usize], needed, POS_C, SIZE_C);
+                        setarg(&mut Rc::make_mut(&mut fs.proto.code)[call_pc as usize], needed, POS_C, SIZE_C);
                     }
                 }
             } else if last_is_vararg {
@@ -12329,11 +12334,12 @@ fn parse_return(fs: &mut FuncState) {
         // Like C's retstat: if hasmultret, setmultret; else exp2nextreg
         if matches!(last_ei.exp.kind, ExpKind::Call) {
             let call_pc = last_ei.exp.info2 as usize;
-            setarg(&mut fs.proto.code[call_pc], 0, POS_C, SIZE_C);
+            let code = Rc::make_mut(&mut fs.proto.code);
+            setarg(&mut code[call_pc], 0, POS_C, SIZE_C);
             // Check for tail call
             let has_tbc = fs.block_stack.last().map(|b| b.insidetbc).unwrap_or(false);
             if !has_tbc && nret == 1 {
-                SET_OPCODE(&mut fs.proto.code[call_pc], OpCode::TAILCALL);
+                SET_OPCODE(&mut code[call_pc], OpCode::TAILCALL);
             }
             fs.return_stat_gen(first, -1);
         } else if matches!(last_ei.exp.kind, ExpKind::Vararg) {
@@ -12350,12 +12356,13 @@ fn parse_return(fs: &mut FuncState) {
         // Like C's hasmultret(VCALL): set multret, then check for tail call
         let call_pc = ei.exp.info2 as usize;
         // Like C's luaK_setmultret: set CALL's C to 0 (LUA_MULTRET + 1)
-        setarg(&mut fs.proto.code[call_pc], 0, POS_C, SIZE_C);
+        let code = Rc::make_mut(&mut fs.proto.code);
+        setarg(&mut code[call_pc], 0, POS_C, SIZE_C);
         // Check for tail call: must not be inside a TBC block (like C's !fs->bl->insidetbc)
         let has_tbc = fs.block_stack.last().map(|b| b.insidetbc).unwrap_or(false);
         if !has_tbc {
             // Convert CALL to TAILCALL (like C's SET_OPCODE)
-            SET_OPCODE(&mut fs.proto.code[call_pc], OpCode::TAILCALL);
+            SET_OPCODE(&mut code[call_pc], OpCode::TAILCALL);
         }
         // Generate RETURN with LUA_MULTRET (nret = -1, so B = nret+1 = 0)
         fs.return_stat_gen(first, -1);
@@ -12783,7 +12790,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     // For in_stack upvalues: mark the parent's block containing the local variable.
     // For !in_stack upvalues: mark the parent's block (since the parent also has
     // an upvalue that needs closing), and recursively mark ancestor blocks.
-    for uv in &new_fs.proto.upvalues {
+    for uv in &new_fs.proto.upvalues[..] {
         if uv.in_stack {
             let local_idx = uv.parent_local_idx;
             let is_active = local_idx < fs.locals.len() && fs.locals[local_idx].active;

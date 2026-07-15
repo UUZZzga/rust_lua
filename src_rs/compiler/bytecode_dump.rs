@@ -8,6 +8,7 @@ use crate::opcodes::{
 use imara_diff::{Algorithm, Diff, InternedInput};
 use std::ffi::{c_int, c_void};
 use std::ptr;
+use std::rc::Rc;
 
 #[derive(Debug, Clone)]
 pub struct DumpInstruction {
@@ -1344,14 +1345,14 @@ impl BytecodeWriter {
     fn dump_code(&mut self, f: &Proto) {
         self.dump_int(f.code.len() as i32);
         self.dump_align(std::mem::size_of::<u32>());
-        for &inst in &f.code {
+        for &inst in &f.code[..] {
             self.dump_block(&inst.to_le_bytes());
         }
     }
 
     fn dump_constants(&mut self, f: &Proto) {
         self.dump_int(f.constants.len() as i32);
-        for c in &f.constants {
+        for c in &f.constants[..] {
             match c {
                 TValue::Nil(_) => {
                     self.dump_byte(LUA_VNIL);
@@ -1390,7 +1391,7 @@ impl BytecodeWriter {
 
     fn dump_upvalues(&mut self, f: &Proto) {
         self.dump_int(f.upvalues.len() as i32);
-        for uv in &f.upvalues {
+        for uv in &f.upvalues[..] {
             self.dump_byte(if uv.in_stack { 1 } else { 0 });
             self.dump_byte(uv.idx);
             self.dump_byte(uv.kind);
@@ -1440,7 +1441,7 @@ impl BytecodeWriter {
         let n = if self.strip { 0 } else { f.upvalues.len() };
         self.dump_int(n as i32);
         if !self.strip {
-            for uv in &f.upvalues {
+            for uv in &f.upvalues[..] {
                 self.dump_string(uv.name.as_ref().map(|s| s.as_str()));
             }
         }
@@ -1507,10 +1508,10 @@ pub fn dumped_to_proto(df: &DumpedFunction) -> Proto {
     proto.max_stack_size = df.maxstacksize;
 
     // code: DumpInstruction → u32
-    proto.code = df.code.iter().map(|inst| dump_inst_to_raw(inst)).collect();
+    proto.code = Rc::new(df.code.iter().map(|inst| dump_inst_to_raw(inst)).collect());
 
     // constants: DumpConstant → TValue
-    proto.constants = df
+    proto.constants = Rc::new(df
         .constants
         .iter()
         .map(|c| match c {
@@ -1520,10 +1521,10 @@ pub fn dumped_to_proto(df: &DumpedFunction) -> Proto {
             DumpConstant::Float(f) => TValue::Float(*f),
             DumpConstant::String(s) => TValue::Str(make_long_string(s)),
         })
-        .collect();
+        .collect());
 
     // upvalues: (bool, u8, u8) → UpvalDesc
-    proto.upvalues = df
+    proto.upvalues = Rc::new(df
         .upvalues
         .iter()
         .enumerate()
@@ -1537,7 +1538,7 @@ pub fn dumped_to_proto(df: &DumpedFunction) -> Proto {
             parent_local_idx: 0,
             kind: *kind,
         })
-        .collect();
+        .collect());
 
     // protos: 递归转换
     proto.protos = df
@@ -1596,10 +1597,10 @@ fn new_proto_internal() -> Proto {
         size_abs_line_info: 0,
         line_defined: 0,
         last_line_defined: 0,
-        constants: Vec::new(),
-        code: Vec::new(),
+        constants: Rc::new(Vec::new()),
+        code: Rc::new(Vec::new()),
         protos: Vec::new(),
-        upvalues: Vec::new(),
+        upvalues: Rc::new(Vec::new()),
         line_info: Vec::new(),
         abs_line_info: Vec::new(),
         loc_vars: Vec::new(),

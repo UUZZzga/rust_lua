@@ -18,6 +18,7 @@ use crate::objects::{LClosure, NilKind, Proto, TValue, UpVal, UpValRef};
 use crate::state::LuaState;
 use crate::strings::LuaString;
 use std::io::Write;
+use std::rc::Rc;
 
 // ============================================================================
 // 函数标签 (LightUserData 占位符值)
@@ -2964,14 +2965,14 @@ fn call_loadfile(
 /// 此函数将短字符串 (<= 40 字节) 转换为驻留的 ShortString。
 pub fn intern_proto_strings(proto: &mut Proto, state: &LuaState) {
     // 驻留化常量池中的字符串
-    for c in &mut proto.constants {
+    for c in Rc::make_mut(&mut proto.constants).iter_mut() {
         if let TValue::Str(s) = c {
             let s_str = s.as_str().to_string();
             *c = TValue::Str(state.intern_str(&s_str));
         }
     }
     // 驻留化 upvalue 名称
-    for uv in &mut proto.upvalues {
+    for uv in Rc::make_mut(&mut proto.upvalues).iter_mut() {
         if let Some(name) = uv.name.take() {
             let name_str = name.as_str().to_string();
             uv.name = Some(state.intern_str(&name_str));

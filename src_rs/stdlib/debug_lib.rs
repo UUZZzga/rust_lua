@@ -3612,10 +3612,10 @@ mod tests {
             size_abs_line_info: 0,
             line_defined: 0,
             last_line_defined: 0,
-            constants: vec![],
-            code: vec![],
+            constants: Rc::new(vec![]),
+            code: Rc::new(vec![]),
             protos: vec![],
-            upvalues: vec![UpvalDesc {
+            upvalues: Rc::new(vec![UpvalDesc {
                 name: Some(LuaString::Short(Arc::new(crate::strings::ShortString {
                     hash: 0,
                     contents: "x".to_string(),
@@ -3624,7 +3624,7 @@ mod tests {
                 idx: 0,
                 parent_local_idx: 0,
                 kind: 0,
-            }],
+            }]),
             line_info: vec![],
             abs_line_info: vec![],
             loc_vars: vec![],
