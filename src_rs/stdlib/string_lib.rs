@@ -8,11 +8,11 @@
 //! - __index 指向字符串库函数表 (string.len, string.sub 等)
 //! - 注册 string 全局表，包含所有字符串库函数
 
+use crate::execute::{arg_error, VmError};
 use crate::objects::{LuaType, NilKind, TValue};
 use crate::state::LuaState;
 use crate::table::Table;
-use crate::tm::{Metatable, TagMethod, make_tm_tvalue};
-use crate::execute::{arg_error, VmError};
+use crate::tm::{make_tm_tvalue, Metatable, TagMethod};
 use std::sync::Arc;
 
 // ============================================================================
@@ -107,9 +107,7 @@ fn arith_op(
     let n1 = to_num(v1)?;
     let n2 = to_num(v2)?;
     match (&n1, &n2) {
-        (TValue::Integer(i1), TValue::Integer(i2)) => {
-            int_op(*i1, *i2).map(TValue::Integer)
-        }
+        (TValue::Integer(i1), TValue::Integer(i2)) => int_op(*i1, *i2).map(TValue::Integer),
         _ => {
             let f1 = match &n1 {
                 TValue::Integer(i) => *i as f64,
@@ -127,27 +125,61 @@ fn arith_op(
 }
 
 // 算术运算辅助函数
-fn add_int(a: i64, b: i64) -> Option<i64> { Some(a.wrapping_add(b)) }
-fn sub_int(a: i64, b: i64) -> Option<i64> { Some(a.wrapping_sub(b)) }
-fn mul_int(a: i64, b: i64) -> Option<i64> { Some(a.wrapping_mul(b)) }
+fn add_int(a: i64, b: i64) -> Option<i64> {
+    Some(a.wrapping_add(b))
+}
+fn sub_int(a: i64, b: i64) -> Option<i64> {
+    Some(a.wrapping_sub(b))
+}
+fn mul_int(a: i64, b: i64) -> Option<i64> {
+    Some(a.wrapping_mul(b))
+}
 fn idiv_int(a: i64, b: i64) -> Option<i64> {
-    if b == 0 { None } else { Some(a.div_euclid(b)) }
+    if b == 0 {
+        None
+    } else {
+        Some(a.div_euclid(b))
+    }
 }
 fn mod_int(a: i64, b: i64) -> Option<i64> {
-    if b == 0 { None } else { Some(a.rem_euclid(b)) }
+    if b == 0 {
+        None
+    } else {
+        Some(a.rem_euclid(b))
+    }
 }
 
-fn add_f(a: f64, b: f64) -> f64 { a + b }
-fn sub_f(a: f64, b: f64) -> f64 { a - b }
-fn mul_f(a: f64, b: f64) -> f64 { a * b }
-fn div_f(a: f64, b: f64) -> f64 { a / b }
-fn idiv_f(a: f64, b: f64) -> f64 { (a / b).floor() }
-fn mod_f(a: f64, b: f64) -> f64 {
-    if b == 0.0 { f64::NAN } else { a - (a / b).floor() * b }
+fn add_f(a: f64, b: f64) -> f64 {
+    a + b
 }
-fn pow_f(a: f64, b: f64) -> f64 { crate::config::float_pow(a, b) }
-fn unm_f(a: f64, _b: f64) -> f64 { -a }
-fn unm_int(a: i64, _b: i64) -> Option<i64> { Some(a.wrapping_neg()) }
+fn sub_f(a: f64, b: f64) -> f64 {
+    a - b
+}
+fn mul_f(a: f64, b: f64) -> f64 {
+    a * b
+}
+fn div_f(a: f64, b: f64) -> f64 {
+    a / b
+}
+fn idiv_f(a: f64, b: f64) -> f64 {
+    (a / b).floor()
+}
+fn mod_f(a: f64, b: f64) -> f64 {
+    if b == 0.0 {
+        f64::NAN
+    } else {
+        a - (a / b).floor() * b
+    }
+}
+fn pow_f(a: f64, b: f64) -> f64 {
+    crate::config::float_pow(a, b)
+}
+fn unm_f(a: f64, _b: f64) -> f64 {
+    -a
+}
+fn unm_int(a: i64, _b: i64) -> Option<i64> {
+    Some(a.wrapping_neg())
+}
 
 // ============================================================================
 // 位置辅助函数 (对应 C 的 posrelatI, getendpos)
@@ -395,7 +427,11 @@ fn match_class(c: u8, cl: u8) -> bool {
         b'z' => c == 0, // deprecated
         _ => return cl == c,
     };
-    if cl.is_ascii_lowercase() { res } else { !res }
+    if cl.is_ascii_lowercase() {
+        res
+    } else {
+        !res
+    }
 }
 
 /// 对应 C 的 matchbracketclass: 匹配方括号字符类
@@ -535,7 +571,12 @@ fn capture_to_close(ms: &MatchState) -> Result<usize, String> {
 }
 
 /// 对应 C 的 start_capture
-fn start_capture(ms: &mut MatchState, s: usize, p: usize, what: i32) -> Result<Option<usize>, String> {
+fn start_capture(
+    ms: &mut MatchState,
+    s: usize,
+    p: usize,
+    what: i32,
+) -> Result<Option<usize>, String> {
     if ms.level >= MAX_CAPTURES {
         return Err("too many captures".to_string());
     }
@@ -566,7 +607,9 @@ fn match_capture(ms: &MatchState, s: usize, l: u8) -> Result<Option<usize>, Stri
     // C: l = check_capture(ms, l);  会抛出错误
     let l = check_capture(ms, l)?;
     let len = ms.captures[l].len as usize;
-    if s + len <= ms.src_end && ms.src[ms.captures[l].init..ms.captures[l].init + len] == ms.src[s..s + len] {
+    if s + len <= ms.src_end
+        && ms.src[ms.captures[l].init..ms.captures[l].init + len] == ms.src[s..s + len]
+    {
         Ok(Some(s + len))
     } else {
         Ok(None)
@@ -590,7 +633,12 @@ fn max_expand(ms: &mut MatchState, s: usize, p: usize, ep: usize) -> Result<Opti
 }
 
 /// 对应 C 的 min_expand
-fn min_expand(ms: &mut MatchState, mut s: usize, p: usize, ep: usize) -> Result<Option<usize>, String> {
+fn min_expand(
+    ms: &mut MatchState,
+    mut s: usize,
+    p: usize,
+    ep: usize,
+) -> Result<Option<usize>, String> {
     loop {
         let res = match_pattern(ms, s, ep + 1)?;
         if res.is_some() {
@@ -618,7 +666,11 @@ fn match_pattern(ms: &mut MatchState, s: usize, p: usize) -> Result<Option<usize
     result
 }
 
-fn match_pattern_inner(ms: &mut MatchState, mut s: usize, mut p: usize) -> Result<Option<usize>, String> {
+fn match_pattern_inner(
+    ms: &mut MatchState,
+    mut s: usize,
+    mut p: usize,
+) -> Result<Option<usize>, String> {
     loop {
         if p >= ms.p_end {
             return Ok(Some(s));
@@ -696,7 +748,11 @@ fn match_pattern_inner(ms: &mut MatchState, mut s: usize, mut p: usize) -> Resul
                                 return Err("missing '[' after '%f' in pattern".to_string());
                             }
                             let ep = class_end(ms, p2)?;
-                            let previous = if s == ms.src_init { 0u8 } else { ms.src_byte(s - 1) };
+                            let previous = if s == ms.src_init {
+                                0u8
+                            } else {
+                                ms.src_byte(s - 1)
+                            };
                             let current = if s < ms.src_end { ms.src_byte(s) } else { 0u8 };
                             if !match_bracket_class(previous, &ms.pattern[p2..ep], ep - p2 - 1)
                                 && match_bracket_class(current, &ms.pattern[p2..ep], ep - p2 - 1)
@@ -839,9 +895,12 @@ fn get_captures(ms: &MatchState, s: usize, e: usize) -> Result<Vec<TValue>, Stri
                 let bytes = &ms.src[start..start + len];
                 // Lua 字符串是字节序列，使用 from_utf8_unchecked 保留原始字节
                 let s = unsafe { String::from_utf8_unchecked(bytes.to_vec()) };
-                result.push(TValue::Str(crate::strings::LuaString::Short(
-                    Arc::new(crate::strings::ShortString { hash: 0, contents: s })
-                )));
+                result.push(TValue::Str(crate::strings::LuaString::Short(Arc::new(
+                    crate::strings::ShortString {
+                        hash: 0,
+                        contents: s,
+                    },
+                ))));
             }
             CaptureResult::Pos(pos) => {
                 result.push(TValue::Integer(pos as i64));
@@ -862,7 +921,12 @@ pub fn str_find(s: &str, pattern: &str, init: i64, plain: bool) -> Result<FindRe
 
     // 检查模式是否有特殊字符
     let has_specials = |p: &str| {
-        p.bytes().any(|c| matches!(c, b'^' | b'$' | b'*' | b'+' | b'?' | b'.' | b'(' | b'[' | b'%' | b'-'))
+        p.bytes().any(|c| {
+            matches!(
+                c,
+                b'^' | b'$' | b'*' | b'+' | b'?' | b'.' | b'(' | b'[' | b'%' | b'-'
+            )
+        })
     };
 
     if plain || !has_specials(pattern) {
@@ -936,14 +1000,21 @@ pub enum FindResult {
 /// 对应 C 的 str_match
 pub fn str_match(s: &str, pattern: &str, init: i64) -> Result<Vec<TValue>, String> {
     match str_find(s, pattern, init, false)? {
-        FindResult::Found { start, end, captures } => {
+        FindResult::Found {
+            start,
+            end,
+            captures,
+        } => {
             if captures.is_empty() {
                 // 无捕获时返回整个匹配
                 let matched = &s.as_bytes()[start - 1..end];
                 // Lua 字符串是字节序列，使用 from_utf8_unchecked 保留原始字节
                 let matched_str = unsafe { String::from_utf8_unchecked(matched.to_vec()) };
                 Ok(vec![TValue::Str(crate::strings::LuaString::Short(
-                    Arc::new(crate::strings::ShortString { hash: 0, contents: matched_str })
+                    Arc::new(crate::strings::ShortString {
+                        hash: 0,
+                        contents: matched_str,
+                    }),
                 ))])
             } else {
                 Ok(captures)
@@ -989,7 +1060,11 @@ impl GMatchIterator {
                 Some(end) => {
                     let captures = get_captures(&ms, match_start, end)?;
                     // 推进位置: 如果匹配为空则前进 1 以避免无限循环
-                    self.pos = if end > match_start { end } else { match_start + 1 };
+                    self.pos = if end > match_start {
+                        end
+                    } else {
+                        match_start + 1
+                    };
                     if captures.is_empty() {
                         // 无捕获时返回整个匹配的子串
                         // Lua 字符串是字节序列，使用 from_utf8_unchecked 保留原始字节
@@ -997,7 +1072,10 @@ impl GMatchIterator {
                             String::from_utf8_unchecked(src_bytes[match_start..end].to_vec())
                         };
                         return Ok(vec![TValue::Str(crate::strings::LuaString::Short(
-                            Arc::new(crate::strings::ShortString { hash: 0, contents: matched_str })
+                            Arc::new(crate::strings::ShortString {
+                                hash: 0,
+                                contents: matched_str,
+                            }),
                         ))]);
                     }
                     return Ok(captures);
@@ -1171,7 +1249,8 @@ fn add_value_from_repl(
                 &TValue::Table(t.clone()),
                 &key,
                 crate::execute::VarSource::None,
-            ).map_err(|e| match e {
+            )
+            .map_err(|e| match e {
                 VmError::RuntimeError(s) => s,
                 _ => "error in table indexing".to_string(),
             })?;
@@ -1179,15 +1258,15 @@ fn add_value_from_repl(
                 TValue::Nil(_) | TValue::Boolean(false) => {
                     // nil 或 false — 保留原匹配文本，changed = false
                     let bytes = &ms.src[s..e];
-                    Ok((unsafe { String::from_utf8_unchecked(bytes.to_vec()) }, false))
+                    Ok((
+                        unsafe { String::from_utf8_unchecked(bytes.to_vec()) },
+                        false,
+                    ))
                 }
                 TValue::Str(st) => Ok((st.as_str().to_string(), true)),
                 TValue::Integer(i) => Ok((i.to_string(), true)),
                 TValue::Float(f) => Ok((format_float_value(f), true)),
-                other => Err(format!(
-                    "invalid replacement value (a {})",
-                    other.ty()
-                )),
+                other => Err(format!("invalid replacement value (a {})", other.ty())),
             }
         }
         // function 替换 — 对应 C 的 LUA_TFUNCTION 分支
@@ -1230,15 +1309,15 @@ fn add_value_from_repl(
                 TValue::Nil(_) | TValue::Boolean(false) => {
                     // nil 或 false — 保留原匹配文本，changed = false
                     let bytes = &ms.src[s..e];
-                    Ok((unsafe { String::from_utf8_unchecked(bytes.to_vec()) }, false))
+                    Ok((
+                        unsafe { String::from_utf8_unchecked(bytes.to_vec()) },
+                        false,
+                    ))
                 }
                 TValue::Str(st) => Ok((st.as_str().to_string(), true)),
                 TValue::Integer(i) => Ok((i.to_string(), true)),
                 TValue::Float(f) => Ok((format_float_value(f), true)),
-                other => Err(format!(
-                    "invalid replacement value (a {})",
-                    other.ty()
-                )),
+                other => Err(format!("invalid replacement value (a {})", other.ty())),
             }
         }
         _ => Err("invalid replacement value".to_string()),
@@ -1272,7 +1351,11 @@ fn format_float_value(f: f64) -> String {
         return "nan".to_string();
     }
     if f.is_infinite() {
-        return if f > 0.0 { "inf".to_string() } else { "-inf".to_string() };
+        return if f > 0.0 {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        };
     }
     if f == 0.0 {
         return "0.0".to_string();
@@ -1338,11 +1421,11 @@ fn apply_replacement(repl: &str, ms: &MatchState, s: usize, e: usize) -> Result<
 const MAX_FORMAT: usize = 32;
 
 /// 有效标志集合 (对应 C 的 L_FMTFLAGS*)
-const FMT_FLAGSF: &str = "-+#0 ";  // 浮点: a, A, e, E, f, g, G
-const FMT_FLAGSX: &str = "-#0";    // 十六进制: o, x, X
-const FMT_FLAGSI: &str = "-+0 ";   // 整数: d, i
-const FMT_FLAGSU: &str = "-0";     // 无符号: u
-const FMT_FLAGSC: &str = "-";      // 字符、指针、字符串: c, p, s
+const FMT_FLAGSF: &str = "-+#0 "; // 浮点: a, A, e, E, f, g, G
+const FMT_FLAGSX: &str = "-#0"; // 十六进制: o, x, X
+const FMT_FLAGSI: &str = "-+0 "; // 整数: d, i
+const FMT_FLAGSU: &str = "-0"; // 无符号: u
+const FMT_FLAGSC: &str = "-"; // 字符、指针、字符串: c, p, s
 
 /// 跳过最多 2 位数字 (对应 C 的 get2digits)
 fn get2digits(bytes: &[u8], mut idx: usize) -> usize {
@@ -1423,7 +1506,11 @@ fn format_exponent_c(s: String) -> String {
 /// - 无穷: inf/INF
 /// - NaN: nan/NAN
 fn format_hex_float(n: f64, precision: Option<usize>, upper: bool) -> String {
-    let hex_digits = if upper { "0123456789ABCDEF" } else { "0123456789abcdef" };
+    let hex_digits = if upper {
+        "0123456789ABCDEF"
+    } else {
+        "0123456789abcdef"
+    };
     let prefix = if upper { "0X" } else { "0x" };
     let p_char = if upper { 'P' } else { 'p' };
 
@@ -1432,7 +1519,11 @@ fn format_hex_float(n: f64, precision: Option<usize>, upper: bool) -> String {
     }
     if n.is_infinite() {
         let inf = if upper { "INF" } else { "inf" };
-        return if n > 0.0 { inf.to_string() } else { format!("-{}", inf) };
+        return if n > 0.0 {
+            inf.to_string()
+        } else {
+            format!("-{}", inf)
+        };
     }
 
     let bits = n.to_bits();
@@ -1485,9 +1576,15 @@ fn format_hex_float(n: f64, precision: Option<usize>, upper: bool) -> String {
     let exp_abs = exp_val.abs();
 
     if frac_str.is_empty() {
-        format!("{}{}{}{}{}{}", sign_str, prefix, int_digit, p_char, exp_sign, exp_abs)
+        format!(
+            "{}{}{}{}{}{}",
+            sign_str, prefix, int_digit, p_char, exp_sign, exp_abs
+        )
     } else {
-        format!("{}{}{}.{}{}{}{}", sign_str, prefix, int_digit, frac_str, p_char, exp_sign, exp_abs)
+        format!(
+            "{}{}{}.{}{}{}{}",
+            sign_str, prefix, int_digit, frac_str, p_char, exp_sign, exp_abs
+        )
     }
 }
 
@@ -1508,7 +1605,9 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
         if i > lit_start {
             result.push_str(unsafe { std::str::from_utf8_unchecked(&fmt_bytes[lit_start..i]) });
         }
-        if i >= fmt_bytes.len() { break; }
+        if i >= fmt_bytes.len() {
+            break;
+        }
         i += 1; // skip '%'
         if i >= fmt_bytes.len() {
             return Err("invalid conversion '%' to 'format'".to_string());
@@ -1531,7 +1630,9 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                 scan_idx += 1;
             }
             // 跳过 width 和 precision (数字和 '.')
-            while scan_idx < fmt_bytes.len() && (fmt_bytes[scan_idx].is_ascii_digit() || fmt_bytes[scan_idx] == b'.') {
+            while scan_idx < fmt_bytes.len()
+                && (fmt_bytes[scan_idx].is_ascii_digit() || fmt_bytes[scan_idx] == b'.')
+            {
                 scan_idx += 1;
             }
             // scan_idx 现在指向 specifier
@@ -1547,7 +1648,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
         let mut plus_sign = false;
         let mut space_sign = false;
         let mut zero_pad = false;
-        let mut alt_form = false;  // # 标志
+        let mut alt_form = false; // # 标志
         while i < fmt_bytes.len() && b"-+ 0#".contains(&fmt_bytes[i]) {
             match fmt_bytes[i] {
                 b'-' => left_align = true,
@@ -1562,7 +1663,9 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
         // 解析 width
         let mut width: usize = 0;
         while i < fmt_bytes.len() && fmt_bytes[i].is_ascii_digit() {
-            width = width.saturating_mul(10).saturating_add((fmt_bytes[i] - b'0') as usize);
+            width = width
+                .saturating_mul(10)
+                .saturating_add((fmt_bytes[i] - b'0') as usize);
             i += 1;
         }
         // 解析 precision
@@ -1571,7 +1674,9 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
             i += 1;
             let mut prec: usize = 0;
             while i < fmt_bytes.len() && fmt_bytes[i].is_ascii_digit() {
-                prec = prec.saturating_mul(10).saturating_add((fmt_bytes[i] - b'0') as usize);
+                prec = prec
+                    .saturating_mul(10)
+                    .saturating_add((fmt_bytes[i] - b'0') as usize);
                 i += 1;
             }
             precision = Some(prec);
@@ -1584,8 +1689,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
         i += 1;
 
         // 获取完整的格式字符串 (从 '%' 到 specifier)
-        let form = std::str::from_utf8(&fmt_bytes[form_start..i])
-            .unwrap_or("%");
+        let form = std::str::from_utf8(&fmt_bytes[form_start..i]).unwrap_or("%");
 
         // 检查格式长度 (对应 C 的 getformat 中的长度检查)
         if form.len() >= MAX_FORMAT - 9 {
@@ -1593,7 +1697,10 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
         }
 
         if arg_idx >= args.len() {
-            return Err(format!("bad argument #{} to 'format' (no value)", arg_idx + 2));
+            return Err(format!(
+                "bad argument #{} to 'format' (no value)",
+                arg_idx + 2
+            ));
         }
         let arg = &args[arg_idx];
         arg_idx += 1;
@@ -1615,8 +1722,13 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
         match spec {
             b'd' | b'i' => {
                 check_format(form, FMT_FLAGSI, true)?;
-                let n = arg.as_integer()
-                    .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
+                let n = arg.as_integer().ok_or_else(|| {
+                    format!(
+                        "bad argument #{} to 'format' (number expected, got {})",
+                        arg_idx,
+                        arg.ty()
+                    )
+                })?;
                 // 处理符号
                 let neg = n < 0;
                 let abs_n: u64 = if neg {
@@ -1634,10 +1746,15 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                     }
                 }
                 // 符号字符串
-                let sign_str = if neg { "-" }
-                    else if plus_sign { "+" }
-                    else if space_sign { " " }
-                    else { "" };
+                let sign_str = if neg {
+                    "-"
+                } else if plus_sign {
+                    "+"
+                } else if space_sign {
+                    " "
+                } else {
+                    ""
+                };
                 // 处理宽度
                 let content_len = sign_str.len() + digits.len();
                 if width > content_len {
@@ -1663,8 +1780,13 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
             }
             b'u' => {
                 check_format(form, FMT_FLAGSU, true)?;
-                let n = arg.as_integer()
-                    .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
+                let n = arg.as_integer().ok_or_else(|| {
+                    format!(
+                        "bad argument #{} to 'format' (number expected, got {})",
+                        arg_idx,
+                        arg.ty()
+                    )
+                })?;
                 let mut digits = (n as u64).to_string();
                 // 处理精度
                 if let Some(p) = precision {
@@ -1693,8 +1815,13 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
             }
             b'o' => {
                 check_format(form, FMT_FLAGSX, true)?;
-                let n = arg.as_integer()
-                    .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
+                let n = arg.as_integer().ok_or_else(|| {
+                    format!(
+                        "bad argument #{} to 'format' (number expected, got {})",
+                        arg_idx,
+                        arg.ty()
+                    )
+                })?;
                 let mut digits = format!("{:o}", n as u64);
                 // 处理精度 (默认精度为 1)
                 let prec = precision.unwrap_or(1);
@@ -1726,8 +1853,13 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
             }
             b'x' => {
                 check_format(form, FMT_FLAGSX, true)?;
-                let n = arg.as_integer()
-                    .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
+                let n = arg.as_integer().ok_or_else(|| {
+                    format!(
+                        "bad argument #{} to 'format' (number expected, got {})",
+                        arg_idx,
+                        arg.ty()
+                    )
+                })?;
                 let mut digits = format!("{:x}", n as u64);
                 // 处理精度 (默认精度为 1)
                 let prec = precision.unwrap_or(1);
@@ -1762,8 +1894,13 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
             }
             b'X' => {
                 check_format(form, FMT_FLAGSX, true)?;
-                let n = arg.as_integer()
-                    .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
+                let n = arg.as_integer().ok_or_else(|| {
+                    format!(
+                        "bad argument #{} to 'format' (number expected, got {})",
+                        arg_idx,
+                        arg.ty()
+                    )
+                })?;
                 let mut digits = format!("{:X}", n as u64);
                 // 处理精度 (默认精度为 1)
                 let prec = precision.unwrap_or(1);
@@ -1798,8 +1935,13 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
             }
             b'c' => {
                 check_format(form, FMT_FLAGSC, false)?;
-                let n = arg.as_integer()
-                    .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
+                let n = arg.as_integer().ok_or_else(|| {
+                    format!(
+                        "bad argument #{} to 'format' (number expected, got {})",
+                        arg_idx,
+                        arg.ty()
+                    )
+                })?;
                 if n < 0 || n > 255 {
                     return Err("value out of range".to_string());
                 }
@@ -1809,20 +1951,31 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                 if width > 1 {
                     let pad = width - 1;
                     if left_align {
-                        unsafe { result.as_mut_vec().push(c); }
+                        unsafe {
+                            result.as_mut_vec().push(c);
+                        }
                         result.push_str(&" ".repeat(pad));
                     } else {
                         result.push_str(&" ".repeat(pad));
-                        unsafe { result.as_mut_vec().push(c); }
+                        unsafe {
+                            result.as_mut_vec().push(c);
+                        }
                     }
                 } else {
-                    unsafe { result.as_mut_vec().push(c); }
+                    unsafe {
+                        result.as_mut_vec().push(c);
+                    }
                 }
             }
             b'a' | b'A' => {
                 check_format(form, FMT_FLAGSF, true)?;
-                let n = arg.as_float()
-                    .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
+                let n = arg.as_float().ok_or_else(|| {
+                    format!(
+                        "bad argument #{} to 'format' (number expected, got {})",
+                        arg_idx,
+                        arg.ty()
+                    )
+                })?;
                 let upper = spec == b'A';
                 let hex_str = format_hex_float(n, precision, upper);
                 // # 标志: 总是显示小数点 (已在 format_hex_float 中处理)
@@ -1859,9 +2012,14 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
             }
             b'f' => {
                 check_format(form, FMT_FLAGSF, true)?;
-                let n = arg.as_float()
-                    .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
-                let p = precision.unwrap_or(6);  // 默认精度为 6
+                let n = arg.as_float().ok_or_else(|| {
+                    format!(
+                        "bad argument #{} to 'format' (number expected, got {})",
+                        arg_idx,
+                        arg.ty()
+                    )
+                })?;
+                let p = precision.unwrap_or(6); // 默认精度为 6
                 let mut s = format!("{:.*}", p, n);
                 // # 标志: 总是显示小数点
                 if alt_form && !s.contains('.') {
@@ -1899,9 +2057,14 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
             }
             b'e' | b'E' | b'g' | b'G' => {
                 check_format(form, FMT_FLAGSF, true)?;
-                let n = arg.as_float()
-                    .ok_or_else(|| format!("bad argument #{} to 'format' (number expected, got {})", arg_idx, arg.ty()))?;
-                let p = precision.unwrap_or(6);  // 默认精度为 6
+                let n = arg.as_float().ok_or_else(|| {
+                    format!(
+                        "bad argument #{} to 'format' (number expected, got {})",
+                        arg_idx,
+                        arg.ty()
+                    )
+                })?;
+                let p = precision.unwrap_or(6); // 默认精度为 6
                 let mut s = match spec {
                     b'e' | b'E' => {
                         // %e/%E: 科学计数法，指数至少 2 位，带符号
@@ -2002,26 +2165,47 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                 result.push_str(&s);
             }
             b's' => {
-                let has_modifiers = width > 0 || precision.is_some() ||
-                    left_align || plus_sign || space_sign || zero_pad || alt_form;
+                let has_modifiers = width > 0
+                    || precision.is_some()
+                    || left_align
+                    || plus_sign
+                    || space_sign
+                    || zero_pad
+                    || alt_form;
                 if has_modifiers {
                     let s = match arg {
                         TValue::Str(s) => s.as_str().to_string(),
                         TValue::Integer(n) => n.to_string(),
                         TValue::Float(f) => {
-                            if f.is_nan() { "nan".to_string() }
-                            else if f.is_infinite() { if *f > 0.0 { "inf".to_string() } else { "-inf".to_string() } }
-                            else { format!("{}", f) }
+                            if f.is_nan() {
+                                "nan".to_string()
+                            } else if f.is_infinite() {
+                                if *f > 0.0 {
+                                    "inf".to_string()
+                                } else {
+                                    "-inf".to_string()
+                                }
+                            } else {
+                                format!("{}", f)
+                            }
                         }
                         TValue::Nil(_) => "nil".to_string(),
                         TValue::Boolean(b) => b.to_string(),
-                        _ => return Err(format!("bad argument #{} to 'format' (no proper format)", arg_idx)),
+                        _ => {
+                            return Err(format!(
+                                "bad argument #{} to 'format' (no proper format)",
+                                arg_idx
+                            ))
+                        }
                     };
                     // 对应 C: 如果有修饰符 (width/precision/flags)，检查字符串是否包含零字节
                     check_format(form, FMT_FLAGSC, true)?;
                     // C: luaL_argcheck(L, l == strlen(s), arg, "string contains zeros")
                     if s.as_bytes().contains(&0) {
-                        return Err(format!("bad argument #{} to 'format' (string contains zeros)", arg_idx));
+                        return Err(format!(
+                            "bad argument #{} to 'format' (string contains zeros)",
+                            arg_idx
+                        ));
                     }
                     // C: 如果没有精度且字符串长度 >= 100，保持原样不格式化
                     if precision.is_none() && s.len() >= 100 {
@@ -2040,19 +2224,33 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                         TValue::Str(s) => result.push_str(s.as_str()),
                         TValue::Integer(n) => result.push_str(&n.to_string()),
                         TValue::Float(f) => {
-                            if f.is_nan() { result.push_str("nan"); }
-                            else if f.is_infinite() { if *f > 0.0 { result.push_str("inf"); } else { result.push_str("-inf"); } }
-                            else { result.push_str(&format!("{}", f)); }
+                            if f.is_nan() {
+                                result.push_str("nan");
+                            } else if f.is_infinite() {
+                                if *f > 0.0 {
+                                    result.push_str("inf");
+                                } else {
+                                    result.push_str("-inf");
+                                }
+                            } else {
+                                result.push_str(&format!("{}", f));
+                            }
                         }
                         TValue::Nil(_) => result.push_str("nil"),
                         TValue::Boolean(b) => result.push_str(&b.to_string()),
-                        _ => return Err(format!("bad argument #{} to 'format' (no proper format)", arg_idx)),
+                        _ => {
+                            return Err(format!(
+                                "bad argument #{} to 'format' (no proper format)",
+                                arg_idx
+                            ))
+                        }
                     }
                 }
             }
             b'q' => {
                 // q 不能有修饰符 (对应 C: if (form[2] != '\0'))
-                if form.len() > 2 {  // "%q" 长度为 2
+                if form.len() > 2 {
+                    // "%q" 长度为 2
                     return Err("specifier '%%q' cannot have modifiers".to_string());
                 }
                 // 引用字符串/字面量 — 对应 C 的 addliteral
@@ -2069,11 +2267,14 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                             match c {
                                 b'"' | b'\\' | b'\n' => {
                                     result.push('\\');
-                                    unsafe { result.as_mut_vec().push(c); }
+                                    unsafe {
+                                        result.as_mut_vec().push(c);
+                                    }
                                 }
                                 _ if c.is_ascii_control() => {
                                     // ASCII 控制字符: 如果下一个字符是数字,用 \03d (3位);否则用 \d
-                                    let next_is_digit = idx + 1 < bytes.len() && bytes[idx + 1].is_ascii_digit();
+                                    let next_is_digit =
+                                        idx + 1 < bytes.len() && bytes[idx + 1].is_ascii_digit();
                                     if next_is_digit {
                                         result.push_str(&format!("\\{:03}", c));
                                     } else {
@@ -2082,7 +2283,9 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                                 }
                                 _ => {
                                     // 其他字符(包括非 ASCII 字节)保持原始字节
-                                    unsafe { result.as_mut_vec().push(c); }
+                                    unsafe {
+                                        result.as_mut_vec().push(c);
+                                    }
                                 }
                             }
                         }
@@ -2113,7 +2316,11 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                     }
                     TValue::Nil(_) => result.push_str("nil"),
                     TValue::Boolean(b) => result.push_str(&b.to_string()),
-                    _ => return Err("bad argument to 'format' (value has no literal form)".to_string()),
+                    _ => {
+                        return Err(
+                            "bad argument to 'format' (value has no literal form)".to_string()
+                        )
+                    }
                 }
             }
             b'p' => {
@@ -2170,7 +2377,10 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                 result.push_str(&apply_width(p_str));
             }
             _ => {
-                return Err(format!("invalid conversion '%{}' to 'format'", spec as char));
+                return Err(format!(
+                    "invalid conversion '%{}' to 'format'",
+                    spec as char
+                ));
             }
         }
     }
@@ -2212,9 +2422,15 @@ const fn max_align() -> usize {
     let c = std::mem::align_of::<i64>();
     let d = std::mem::align_of::<std::os::raw::c_long>();
     let mut m = a;
-    if b > m { m = b; }
-    if c > m { m = c; }
-    if d > m { m = d; }
+    if b > m {
+        m = b;
+    }
+    if c > m {
+        m = c;
+    }
+    if d > m {
+        m = d;
+    }
     m
 }
 const MAX_ALIGN: usize = max_align();
@@ -2287,21 +2503,66 @@ fn getoption(h: &mut PackHeader, fmt: &[u8], pos: &mut usize) -> Result<(KOption
     *pos += 1;
     let mut size: usize = 0;
     let result = match opt {
-        b'b' => { size = std::mem::size_of::<i8>(); KOption::Kint }
-        b'B' => { size = std::mem::size_of::<i8>(); KOption::Kuint }
-        b'h' => { size = std::mem::size_of::<i16>(); KOption::Kint }
-        b'H' => { size = std::mem::size_of::<i16>(); KOption::Kuint }
-        b'l' => { size = std::mem::size_of::<std::os::raw::c_long>(); KOption::Kint }
-        b'L' => { size = std::mem::size_of::<std::os::raw::c_long>(); KOption::Kuint }
-        b'j' => { size = SZ_INT; KOption::Kint }
-        b'J' => { size = SZ_INT; KOption::Kuint }
-        b'T' => { size = std::mem::size_of::<usize>(); KOption::Kuint }
-        b'f' => { size = std::mem::size_of::<f32>(); KOption::Kfloat }
-        b'n' => { size = std::mem::size_of::<f64>(); KOption::Knumber }
-        b'd' => { size = std::mem::size_of::<f64>(); KOption::Kdouble }
-        b'i' => { size = getnumlimit(fmt, pos, std::mem::size_of::<std::os::raw::c_int>())?; KOption::Kint }
-        b'I' => { size = getnumlimit(fmt, pos, std::mem::size_of::<std::os::raw::c_int>())?; KOption::Kuint }
-        b's' => { size = getnumlimit(fmt, pos, std::mem::size_of::<usize>())?; KOption::Kstring }
+        b'b' => {
+            size = std::mem::size_of::<i8>();
+            KOption::Kint
+        }
+        b'B' => {
+            size = std::mem::size_of::<i8>();
+            KOption::Kuint
+        }
+        b'h' => {
+            size = std::mem::size_of::<i16>();
+            KOption::Kint
+        }
+        b'H' => {
+            size = std::mem::size_of::<i16>();
+            KOption::Kuint
+        }
+        b'l' => {
+            size = std::mem::size_of::<std::os::raw::c_long>();
+            KOption::Kint
+        }
+        b'L' => {
+            size = std::mem::size_of::<std::os::raw::c_long>();
+            KOption::Kuint
+        }
+        b'j' => {
+            size = SZ_INT;
+            KOption::Kint
+        }
+        b'J' => {
+            size = SZ_INT;
+            KOption::Kuint
+        }
+        b'T' => {
+            size = std::mem::size_of::<usize>();
+            KOption::Kuint
+        }
+        b'f' => {
+            size = std::mem::size_of::<f32>();
+            KOption::Kfloat
+        }
+        b'n' => {
+            size = std::mem::size_of::<f64>();
+            KOption::Knumber
+        }
+        b'd' => {
+            size = std::mem::size_of::<f64>();
+            KOption::Kdouble
+        }
+        b'i' => {
+            size = getnumlimit(fmt, pos, std::mem::size_of::<std::os::raw::c_int>())?;
+            KOption::Kint
+        }
+        b'I' => {
+            size = getnumlimit(fmt, pos, std::mem::size_of::<std::os::raw::c_int>())?;
+            KOption::Kuint
+        }
+        b's' => {
+            size = getnumlimit(fmt, pos, std::mem::size_of::<usize>())?;
+            KOption::Kstring
+        }
         b'c' => {
             size = getnum(fmt, pos, usize::MAX);
             if size == usize::MAX {
@@ -2310,12 +2571,24 @@ fn getoption(h: &mut PackHeader, fmt: &[u8], pos: &mut usize) -> Result<(KOption
             KOption::Kchar
         }
         b'z' => KOption::Kzstr,
-        b'x' => { size = 1; KOption::Kpadding }
+        b'x' => {
+            size = 1;
+            KOption::Kpadding
+        }
         b'X' => KOption::Kpaddalign,
         b' ' => KOption::Knop,
-        b'<' => { h.islittle = true; KOption::Knop }
-        b'>' => { h.islittle = false; KOption::Knop }
-        b'=' => { h.islittle = native_is_little(); KOption::Knop }
+        b'<' => {
+            h.islittle = true;
+            KOption::Knop
+        }
+        b'>' => {
+            h.islittle = false;
+            KOption::Knop
+        }
+        b'=' => {
+            h.islittle = native_is_little();
+            KOption::Knop
+        }
         b'!' => {
             h.maxalign = getnumlimit(fmt, pos, MAX_ALIGN)?;
             KOption::Knop
@@ -2423,7 +2696,11 @@ fn unpackint(data: &[u8], islittle: bool, size: usize, issigned: bool) -> Result
         }
     } else if size > SZ_INT {
         // 检查未读字节
-        let mask: u8 = if !issigned || (res as i64) >= 0 { 0 } else { 0xFF };
+        let mask: u8 = if !issigned || (res as i64) >= 0 {
+            0
+        } else {
+            0xFF
+        };
         for i in limit..size {
             let idx = if islittle { i } else { size - 1 - i };
             if data[idx] != mask {
@@ -2765,7 +3042,10 @@ pub fn str_unpack(fmt: &str, data: &[u8], init_pos: i64) -> Result<(Vec<TValue>,
                 // 使用 unsafe 创建包含原始字节的 String (与 str_char 一致)
                 let s = unsafe { String::from_utf8_unchecked(s_bytes.to_vec()) };
                 results.push(TValue::Str(crate::strings::LuaString::Short(
-                    std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: s })
+                    std::sync::Arc::new(crate::strings::ShortString {
+                        hash: 0,
+                        contents: s,
+                    }),
                 )));
             }
             KOption::Kstring => {
@@ -2776,7 +3056,10 @@ pub fn str_unpack(fmt: &str, data: &[u8], init_pos: i64) -> Result<(Vec<TValue>,
                 let s_bytes = &data[pos + size..pos + size + len];
                 let s = unsafe { String::from_utf8_unchecked(s_bytes.to_vec()) };
                 results.push(TValue::Str(crate::strings::LuaString::Short(
-                    std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: s })
+                    std::sync::Arc::new(crate::strings::ShortString {
+                        hash: 0,
+                        contents: s,
+                    }),
                 )));
                 pos += len; // 跳过字符串
             }
@@ -2809,7 +3092,10 @@ pub fn str_unpack(fmt: &str, data: &[u8], init_pos: i64) -> Result<(Vec<TValue>,
                 let s_bytes = &data[rel_pos..zero_idx];
                 let s = unsafe { String::from_utf8_unchecked(s_bytes.to_vec()) };
                 results.push(TValue::Str(crate::strings::LuaString::Short(
-                    std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: s })
+                    std::sync::Arc::new(crate::strings::ShortString {
+                        hash: 0,
+                        contents: s,
+                    }),
                 )));
                 pos += len + 1; // 跳过字符串和终止零
             }
@@ -2847,19 +3133,27 @@ fn get_str_arg(state: &LuaState, a: usize, idx: usize) -> Result<String, VmError
 
 /// 从栈中读取整数参数 (对应 C 的 luaL_checkinteger)
 /// 浮点数必须能精确转为整数，否则报 "number has no integer representation"
-fn get_int_arg(state: &LuaState, a: usize, idx: usize, default: i64, _funcname: &str) -> Result<i64, VmError> {
+fn get_int_arg(
+    state: &LuaState,
+    a: usize,
+    idx: usize,
+    default: i64,
+    _funcname: &str,
+) -> Result<i64, VmError> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.stack.len() {
         return Ok(default);
     }
     match &state.stack[stack_idx] {
         TValue::Integer(n) => Ok(*n),
-        TValue::Float(f) => {
-            match crate::vm::float_to_integer(*f, crate::vm::F2IMode::Eq) {
-                Some(i) => Ok(i),
-                None => Err(arg_error(state, idx + 1, "number has no integer representation")),
-            }
-        }
+        TValue::Float(f) => match crate::vm::float_to_integer(*f, crate::vm::F2IMode::Eq) {
+            Some(i) => Ok(i),
+            None => Err(arg_error(
+                state,
+                idx + 1,
+                "number has no integer representation",
+            )),
+        },
         TValue::Str(s) => match s.as_str().parse::<i64>() {
             Ok(i) => Ok(i),
             Err(_) => Ok(default),
@@ -2868,14 +3162,24 @@ fn get_int_arg(state: &LuaState, a: usize, idx: usize, default: i64, _funcname: 
         _ => Err(arg_error(
             state,
             idx + 1,
-            &format!("number expected, got {}", crate::tm::obj_type_name(&state.stack[stack_idx])),
+            &format!(
+                "number expected, got {}",
+                crate::tm::obj_type_name(&state.stack[stack_idx])
+            ),
         )),
     }
 }
 
 /// 从栈中读取可选整数参数 (对应 C 的 luaL_optinteger)
 /// nargs 是实际参数个数，用 nargs 判断参数是否存在（对应 C 的 lua_gettop）
-fn get_opt_int_arg(state: &LuaState, a: usize, nargs: usize, idx: usize, default: i64, _funcname: &str) -> Result<i64, VmError> {
+fn get_opt_int_arg(
+    state: &LuaState,
+    a: usize,
+    nargs: usize,
+    idx: usize,
+    default: i64,
+    _funcname: &str,
+) -> Result<i64, VmError> {
     if idx >= nargs {
         return Ok(default);
     }
@@ -2886,12 +3190,14 @@ fn get_opt_int_arg(state: &LuaState, a: usize, nargs: usize, idx: usize, default
     match &state.stack[stack_idx] {
         TValue::Nil(_) => Ok(default),
         TValue::Integer(n) => Ok(*n),
-        TValue::Float(f) => {
-            match crate::vm::float_to_integer(*f, crate::vm::F2IMode::Eq) {
-                Some(i) => Ok(i),
-                None => Err(arg_error(state, idx + 1, "number has no integer representation")),
-            }
-        }
+        TValue::Float(f) => match crate::vm::float_to_integer(*f, crate::vm::F2IMode::Eq) {
+            Some(i) => Ok(i),
+            None => Err(arg_error(
+                state,
+                idx + 1,
+                "number has no integer representation",
+            )),
+        },
         TValue::Str(s) => match s.as_str().parse::<i64>() {
             Ok(i) => Ok(i),
             Err(_) => Ok(default),
@@ -2899,7 +3205,10 @@ fn get_opt_int_arg(state: &LuaState, a: usize, nargs: usize, idx: usize, default
         _ => Err(arg_error(
             state,
             idx + 1,
-            &format!("number expected, got {}", crate::tm::obj_type_name(&state.stack[stack_idx])),
+            &format!(
+                "number expected, got {}",
+                crate::tm::obj_type_name(&state.stack[stack_idx])
+            ),
         )),
     }
 }
@@ -2934,7 +3243,8 @@ fn tostring_for_format(state: &mut LuaState, val: &TValue) -> Option<String> {
     let tostring_key = TValue::Str(state.intern_str("__tostring"));
     let meta_fn = {
         let data = table.data.borrow();
-        data.metatable.as_ref()
+        data.metatable
+            .as_ref()
             .and_then(|mt| mt.get(&tostring_key))
             .filter(|v| !matches!(v, TValue::Nil(_)))
     };
@@ -2961,7 +3271,8 @@ fn tostring_for_format(state: &mut LuaState, val: &TValue) -> Option<String> {
     let name_key = TValue::Str(state.intern_str("__name"));
     let type_name = {
         let data = table.data.borrow();
-        data.metatable.as_ref()
+        data.metatable
+            .as_ref()
             .and_then(|mt| mt.get(&name_key))
             .and_then(|v| match v {
                 TValue::Str(s) => Some(s.as_str().to_string()),
@@ -3040,9 +3351,11 @@ fn call_gmatch_iter(
 
     let mut state_table = match state_val {
         TValue::Table(t) => t,
-        _ => return Err(VmError::RuntimeError(
-            "gmatch iterator: state table expected".to_string(),
-        )),
+        _ => {
+            return Err(VmError::RuntimeError(
+                "gmatch iterator: state table expected".to_string(),
+            ))
+        }
     };
 
     // 从表中读取字段
@@ -3055,21 +3368,27 @@ fn call_gmatch_iter(
 
     let s_str = match state_table.get(&s_key) {
         Some(TValue::Str(s)) => s.as_str().to_string(),
-        _ => return Err(VmError::RuntimeError(
-            "gmatch iterator: invalid state (missing 's')".to_string(),
-        )),
+        _ => {
+            return Err(VmError::RuntimeError(
+                "gmatch iterator: invalid state (missing 's')".to_string(),
+            ))
+        }
     };
     let p_str = match state_table.get(&p_key) {
         Some(TValue::Str(s)) => s.as_str().to_string(),
-        _ => return Err(VmError::RuntimeError(
-            "gmatch iterator: invalid state (missing 'p')".to_string(),
-        )),
+        _ => {
+            return Err(VmError::RuntimeError(
+                "gmatch iterator: invalid state (missing 'p')".to_string(),
+            ))
+        }
     };
     let pos: usize = match state_table.get(&pos_key) {
         Some(TValue::Integer(n)) => n as usize,
-        _ => return Err(VmError::RuntimeError(
-            "gmatch iterator: invalid state (missing 'pos')".to_string(),
-        )),
+        _ => {
+            return Err(VmError::RuntimeError(
+                "gmatch iterator: invalid state (missing 'pos')".to_string(),
+            ))
+        }
     };
     let anchor: bool = match state_table.get(&anchor_key) {
         Some(TValue::Boolean(b)) => b,
@@ -3164,13 +3483,23 @@ pub fn call_string_function(
         STR_UPPER => {
             let s = get_str_arg(state, a, 0)?;
             let result = str_upper(&s);
-            push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&result))]);
+            push_results(
+                state,
+                a,
+                nresults,
+                vec![TValue::Str(state.intern_str(&result))],
+            );
             Ok(())
         }
         STR_LOWER => {
             let s = get_str_arg(state, a, 0)?;
             let result = str_lower(&s);
-            push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&result))]);
+            push_results(
+                state,
+                a,
+                nresults,
+                vec![TValue::Str(state.intern_str(&result))],
+            );
             Ok(())
         }
         STR_LEN => {
@@ -3184,13 +3513,23 @@ pub fn call_string_function(
             let start = get_int_arg(state, a, 1, 1, "sub")?;
             let end = get_opt_int_arg(state, a, nargs, 2, -1, "sub")?;
             let result = str_sub(&s, start, end);
-            push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&result))]);
+            push_results(
+                state,
+                a,
+                nresults,
+                vec![TValue::Str(state.intern_str(&result))],
+            );
             Ok(())
         }
         STR_REVERSE => {
             let s = get_str_arg(state, a, 0)?;
             let result = str_reverse(&s);
-            push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&result))]);
+            push_results(
+                state,
+                a,
+                nresults,
+                vec![TValue::Str(state.intern_str(&result))],
+            );
             Ok(())
         }
         STR_BYTE => {
@@ -3209,7 +3548,12 @@ pub fn call_string_function(
             }
             match str_char(&codes) {
                 Ok(result) => {
-                    push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&result))]);
+                    push_results(
+                        state,
+                        a,
+                        nresults,
+                        vec![TValue::Str(state.intern_str(&result))],
+                    );
                     Ok(())
                 }
                 Err(msg) => Err(VmError::RuntimeError(msg)),
@@ -3225,7 +3569,12 @@ pub fn call_string_function(
             };
             match str_rep(&s, n, &sep) {
                 Ok(result) => {
-                    push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&result))]);
+                    push_results(
+                        state,
+                        a,
+                        nresults,
+                        vec![TValue::Str(state.intern_str(&result))],
+                    );
                     Ok(())
                 }
                 Err(msg) => Err(VmError::RuntimeError(msg)),
@@ -3237,8 +3586,13 @@ pub fn call_string_function(
             let init = get_opt_int_arg(state, a, nargs, 2, 1, "find")?;
             let plain = get_bool_arg(state, a, nargs, 3, false);
             match str_find(&s, &pattern, init, plain) {
-                Ok(FindResult::Found { start, end, captures }) => {
-                    let mut results = vec![TValue::Integer(start as i64), TValue::Integer(end as i64)];
+                Ok(FindResult::Found {
+                    start,
+                    end,
+                    captures,
+                }) => {
+                    let mut results =
+                        vec![TValue::Integer(start as i64), TValue::Integer(end as i64)];
                     results.extend(captures);
                     push_results(state, a, nresults, results);
                 }
@@ -3251,14 +3605,16 @@ pub fn call_string_function(
         }
         STR_FORMAT => {
             let fmt = get_str_arg(state, a, 0)?;
-            let mut args: Vec<TValue> = (1..nargs).map(|i| {
-                let idx = a + 1 + i;
-                if idx < state.stack.len() {
-                    state.stack[idx].clone()
-                } else {
-                    TValue::Nil(NilKind::Strict)
-                }
-            }).collect();
+            let mut args: Vec<TValue> = (1..nargs)
+                .map(|i| {
+                    let idx = a + 1 + i;
+                    if idx < state.stack.len() {
+                        state.stack[idx].clone()
+                    } else {
+                        TValue::Nil(NilKind::Strict)
+                    }
+                })
+                .collect();
             // Fast path: only need __tostring conversion when a %s arg is a table.
             // Avoid HashSet allocation + format scan for the common case (all string args).
             if args.iter().any(|arg| matches!(arg, TValue::Table(_))) {
@@ -3273,7 +3629,12 @@ pub fn call_string_function(
             }
             match str_format(&fmt, &args) {
                 Ok(result) => {
-                    push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&result))]);
+                    push_results(
+                        state,
+                        a,
+                        nresults,
+                        vec![TValue::Str(state.intern_str(&result))],
+                    );
                     Ok(())
                 }
                 Err(msg) => Err(VmError::RuntimeError(msg)),
@@ -3297,7 +3658,11 @@ pub fn call_string_function(
             let max_s = get_opt_int_arg(state, a, nargs, 3, -1, "gsub")?;
             // 原始字符串的 TValue — 对应 C 的 lua_pushvalue(L, 1)
             // 当没有替换发生时，返回原始字符串（保持指针一致性，使 %p 相等）
-            let orig_str = state.stack.get(a + 1).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
+            let orig_str = state
+                .stack
+                .get(a + 1)
+                .cloned()
+                .unwrap_or(TValue::Nil(NilKind::Strict));
             // 检查 repl 参数类型 — 对应 C 的 tr = lua_type(L, 3)
             let repl_idx = a + 3;
             let repl_val = if repl_idx < state.stack.len() {
@@ -3308,15 +3673,20 @@ pub fn call_string_function(
             match &repl_val {
                 // table 或 function 替换 — 对应 C 的 LUA_TTABLE / LUA_TFUNCTION 分支
                 // LightUserData (C 函数标签) 也算 function (is_function 包含它)
-                TValue::Table(_) | TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) | TValue::LightUserData(_) => {
+                TValue::Table(_)
+                | TValue::LClosure(_)
+                | TValue::CClosure(_)
+                | TValue::LCFn(_)
+                | TValue::LightUserData(_) => {
                     match str_gsub_with_repl(state, &s, &pattern, &repl_val, max_s) {
                         Ok((result, n, changed)) => {
                             // 对应 C: if (!changed) lua_pushvalue(L, 1);
-                            let result_val = if !changed { orig_str } else { TValue::Str(state.intern_str(&result)) };
-                            push_results(state, a, nresults, vec![
-                                result_val,
-                                TValue::Integer(n),
-                            ]);
+                            let result_val = if !changed {
+                                orig_str
+                            } else {
+                                TValue::Str(state.intern_str(&result))
+                            };
+                            push_results(state, a, nresults, vec![result_val, TValue::Integer(n)]);
                             Ok(())
                         }
                         Err(msg) => Err(VmError::RuntimeError(msg)),
@@ -3328,11 +3698,12 @@ pub fn call_string_function(
                     match str_gsub(&s, &pattern, &repl, max_s) {
                         Ok((result, n)) => {
                             // 对应 C: if (!changed) lua_pushvalue(L, 1);
-                            let result_val = if n == 0 { orig_str } else { TValue::Str(state.intern_str(&result)) };
-                            push_results(state, a, nresults, vec![
-                                result_val,
-                                TValue::Integer(n),
-                            ]);
+                            let result_val = if n == 0 {
+                                orig_str
+                            } else {
+                                TValue::Str(state.intern_str(&result))
+                            };
+                            push_results(state, a, nresults, vec![result_val, TValue::Integer(n)]);
                             Ok(())
                         }
                         Err(msg) => Err(VmError::RuntimeError(msg)),
@@ -3406,14 +3777,16 @@ pub fn call_string_function(
             // string.pack(fmt, ...)
             let fmt = get_str_arg(state, a, 0)?;
             // 收集参数 (从索引 1 开始,即第 2 个参数及之后)
-            let args: Vec<TValue> = (1..nargs).map(|i| {
-                let idx = a + 1 + i;
-                if idx < state.stack.len() {
-                    state.stack[idx].clone()
-                } else {
-                    TValue::Nil(NilKind::Strict)
-                }
-            }).collect();
+            let args: Vec<TValue> = (1..nargs)
+                .map(|i| {
+                    let idx = a + 1 + i;
+                    if idx < state.stack.len() {
+                        state.stack[idx].clone()
+                    } else {
+                        TValue::Nil(NilKind::Strict)
+                    }
+                })
+                .collect();
             match str_pack(&fmt, &args) {
                 Ok(bytes) => {
                     // 将字节转换为 LuaString (可能包含非 UTF-8 字节)
@@ -3448,10 +3821,12 @@ pub fn call_string_function(
                 }
                 match &state.stack[stack_idx] {
                     TValue::Str(s) => s.as_str().as_bytes().to_vec(),
-                    _ => return Err(VmError::RuntimeError(format!(
-                        "bad argument #2 to 'unpack' (string expected, got {})",
-                        state.stack[stack_idx].ty()
-                    ))),
+                    _ => {
+                        return Err(VmError::RuntimeError(format!(
+                            "bad argument #2 to 'unpack' (string expected, got {})",
+                            state.stack[stack_idx].ty()
+                        )))
+                    }
                 }
             };
             let pos = get_opt_int_arg(state, a, nargs, 2, 1, "unpack")?;
@@ -3498,14 +3873,19 @@ pub fn call_string_function(
             match &func_val {
                 TValue::LClosure(cl) => {
                     let data = crate::compiler::bytecode_dump::dump_proto(&cl.proto, strip);
-                    push_results(state, a, nresults, vec![TValue::Str(
-                        crate::strings::LuaString::Long(Box::new(crate::strings::LongString {
-                            contents: unsafe { String::from_utf8_unchecked(data) },
-                            hash: std::sync::atomic::AtomicU64::new(0),
-                            extra: std::sync::atomic::AtomicU8::new(0),
-                            ptr_id: crate::gc::new_ptr_id(),
-                        }))
-                    )]);
+                    push_results(
+                        state,
+                        a,
+                        nresults,
+                        vec![TValue::Str(crate::strings::LuaString::Long(Box::new(
+                            crate::strings::LongString {
+                                contents: unsafe { String::from_utf8_unchecked(data) },
+                                hash: std::sync::atomic::AtomicU64::new(0),
+                                extra: std::sync::atomic::AtomicU8::new(0),
+                                ptr_id: crate::gc::new_ptr_id(),
+                            },
+                        )))],
+                    );
                     Ok(())
                 }
                 _ => Err(VmError::RuntimeError(format!(
@@ -3514,7 +3894,10 @@ pub fn call_string_function(
                 ))),
             }
         }
-        _ => Err(VmError::RuntimeError(format!("unknown string function tag: {}", tag))),
+        _ => Err(VmError::RuntimeError(format!(
+            "unknown string function tag: {}",
+            tag
+        ))),
     }
 }
 
@@ -3913,7 +4296,11 @@ mod tests {
     fn test_str_find_plain() {
         let result = str_find("hello world", "world", 1, true).unwrap();
         match result {
-            FindResult::Found { start, end, captures } => {
+            FindResult::Found {
+                start,
+                end,
+                captures,
+            } => {
                 assert_eq!(start, 7);
                 assert_eq!(end, 11);
                 assert!(captures.is_empty());
@@ -3977,7 +4364,11 @@ mod tests {
     fn test_str_find_pattern_capture() {
         let result = str_find("hello", "(h(e)llo)", 1, false).unwrap();
         match result {
-            FindResult::Found { start, end, captures } => {
+            FindResult::Found {
+                start,
+                end,
+                captures,
+            } => {
                 assert_eq!(start, 1);
                 assert_eq!(end, 5);
                 assert_eq!(captures.len(), 2);
@@ -4084,9 +4475,12 @@ mod tests {
 
     #[test]
     fn test_str_format_string() {
-        let args = vec![TValue::Str(crate::strings::LuaString::Short(
-            Arc::new(crate::strings::ShortString { hash: 0, contents: "world".to_string() })
-        ))];
+        let args = vec![TValue::Str(crate::strings::LuaString::Short(Arc::new(
+            crate::strings::ShortString {
+                hash: 0,
+                contents: "world".to_string(),
+            },
+        )))];
         let result = str_format("hello %s", &args).unwrap();
         assert_eq!(result, "hello world");
     }
@@ -4129,9 +4523,12 @@ mod tests {
     fn test_str_format_multiple() {
         let args = vec![
             TValue::Integer(1),
-            TValue::Str(crate::strings::LuaString::Short(
-                Arc::new(crate::strings::ShortString { hash: 0, contents: "two".to_string() })
-            )),
+            TValue::Str(crate::strings::LuaString::Short(Arc::new(
+                crate::strings::ShortString {
+                    hash: 0,
+                    contents: "two".to_string(),
+                },
+            ))),
             TValue::Float(3.0),
         ];
         let result = str_format("%d %s %f", &args).unwrap();
@@ -4155,9 +4552,12 @@ mod tests {
     #[test]
     fn test_str_format_q_string() {
         // %q 字符串:加引号并转义
-        let args = vec![TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
-            crate::strings::ShortString { hash: 0, contents: "hello".to_string() }
-        )))];
+        let args = vec![TValue::Str(crate::strings::LuaString::Short(
+            std::sync::Arc::new(crate::strings::ShortString {
+                hash: 0,
+                contents: "hello".to_string(),
+            }),
+        ))];
         let result = str_format("%q", &args).unwrap();
         assert_eq!(result, "\"hello\"");
     }
@@ -4221,10 +4621,19 @@ mod tests {
     fn test_string_metatable_has_arith_methods() {
         let mut state = LuaState::new();
         create_string_metatable(&mut state);
-        let mt = state.dmt.get(LuaType::String).expect("string metatable must exist");
+        let mt = state
+            .dmt
+            .get(LuaType::String)
+            .expect("string metatable must exist");
         for tm in &[
-            TagMethod::Add, TagMethod::Sub, TagMethod::Mul, TagMethod::Mod,
-            TagMethod::Pow, TagMethod::Div, TagMethod::IDiv, TagMethod::Unm,
+            TagMethod::Add,
+            TagMethod::Sub,
+            TagMethod::Mul,
+            TagMethod::Mod,
+            TagMethod::Pow,
+            TagMethod::Div,
+            TagMethod::IDiv,
+            TagMethod::Unm,
         ] {
             let key = make_tm_tvalue(*tm);
             assert!(mt.get(&key).is_some(), "metamethod {:?} must exist", tm);
@@ -4235,7 +4644,10 @@ mod tests {
     fn test_string_metatable_has_index() {
         let mut state = LuaState::new();
         create_string_metatable(&mut state);
-        let mt = state.dmt.get(LuaType::String).expect("string metatable must exist");
+        let mt = state
+            .dmt
+            .get(LuaType::String)
+            .expect("string metatable must exist");
         let key = make_tm_tvalue(TagMethod::Index);
         assert!(mt.get(&key).is_some(), "__index must exist");
     }
@@ -4268,7 +4680,10 @@ mod tests {
         let key = TValue::Str(state.intern_str("string"));
         let string_table = state.globals.get(&key).expect("string global must exist");
         if let TValue::Table(t) = string_table {
-            for name in &["upper", "lower", "len", "sub", "reverse", "byte", "char", "rep", "find", "format", "match", "gsub"] {
+            for name in &[
+                "upper", "lower", "len", "sub", "reverse", "byte", "char", "rep", "find", "format",
+                "match", "gsub",
+            ] {
                 let fn_key = TValue::Str(state.intern_str(name));
                 assert!(t.get(&fn_key).is_some(), "string.{} must exist", name);
             }
@@ -4281,27 +4696,36 @@ mod tests {
 
     #[test]
     fn test_to_num_string_integer() {
-        let v = TValue::Str(crate::strings::LuaString::Short(
-            Arc::new(crate::strings::ShortString { hash: 0, contents: "42".to_string() })
-        ));
+        let v = TValue::Str(crate::strings::LuaString::Short(Arc::new(
+            crate::strings::ShortString {
+                hash: 0,
+                contents: "42".to_string(),
+            },
+        )));
         let result = to_num(&v);
         assert_eq!(result, Some(TValue::Integer(42)));
     }
 
     #[test]
     fn test_to_num_string_float() {
-        let v = TValue::Str(crate::strings::LuaString::Short(
-            Arc::new(crate::strings::ShortString { hash: 0, contents: "3.14".to_string() })
-        ));
+        let v = TValue::Str(crate::strings::LuaString::Short(Arc::new(
+            crate::strings::ShortString {
+                hash: 0,
+                contents: "3.14".to_string(),
+            },
+        )));
         let result = to_num(&v);
         assert!(matches!(result, Some(TValue::Float(f)) if (f - 3.14).abs() < 1e-10));
     }
 
     #[test]
     fn test_to_num_invalid_string() {
-        let v = TValue::Str(crate::strings::LuaString::Short(
-            Arc::new(crate::strings::ShortString { hash: 0, contents: "abc".to_string() })
-        ));
+        let v = TValue::Str(crate::strings::LuaString::Short(Arc::new(
+            crate::strings::ShortString {
+                hash: 0,
+                contents: "abc".to_string(),
+            },
+        )));
         let result = to_num(&v);
         assert_eq!(result, None);
     }
@@ -4316,9 +4740,14 @@ mod tests {
 
     #[test]
     fn test_arith_op_add_strings() {
-        let make_str = |s: &str| TValue::Str(crate::strings::LuaString::Short(
-            Arc::new(crate::strings::ShortString { hash: 0, contents: s.to_string() })
-        ));
+        let make_str = |s: &str| {
+            TValue::Str(crate::strings::LuaString::Short(Arc::new(
+                crate::strings::ShortString {
+                    hash: 0,
+                    contents: s.to_string(),
+                },
+            )))
+        };
         let v1 = make_str("10");
         let v2 = make_str("20");
         let result = arith_op(&v1, &v2, add_int, add_f);
@@ -4362,7 +4791,7 @@ mod tests {
         // 大写字母类表示否定: %A 表示非字母字符
         assert!(!match_class(b'a', b'A')); // 'a' 是字母，%A 应该不匹配
         assert!(!match_class(b'Z', b'A')); // 'Z' 是字母，%A 应该不匹配
-        assert!(match_class(b'1', b'A'));  // '1' 不是字母，%A 应该匹配
+        assert!(match_class(b'1', b'A')); // '1' 不是字母，%A 应该匹配
     }
 
     #[test]
@@ -4382,7 +4811,9 @@ mod tests {
         // 清空栈 (LuaState::new() 会预置一个 Nil)
         state.stack.clear();
         // 模拟栈: [func, "hello"]
-        state.stack.push(TValue::LightUserData(STR_UPPER as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(STR_UPPER as *mut std::ffi::c_void));
         state.stack.push(TValue::Str(state.intern_str("hello")));
         let a = 0;
         let nargs = 1;
@@ -4399,7 +4830,9 @@ mod tests {
     fn test_call_string_function_len() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(STR_LEN as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(STR_LEN as *mut std::ffi::c_void));
         state.stack.push(TValue::Str(state.intern_str("hello")));
         call_string_function(STR_LEN, &mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
@@ -4412,7 +4845,9 @@ mod tests {
     fn test_call_string_function_sub() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(STR_SUB as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(STR_SUB as *mut std::ffi::c_void));
         state.stack.push(TValue::Str(state.intern_str("hello")));
         state.stack.push(TValue::Integer(2));
         state.stack.push(TValue::Integer(4));
@@ -4427,7 +4862,9 @@ mod tests {
     fn test_call_string_function_reverse() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(STR_REVERSE as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(STR_REVERSE as *mut std::ffi::c_void));
         state.stack.push(TValue::Str(state.intern_str("abc")));
         call_string_function(STR_REVERSE, &mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
@@ -4440,7 +4877,9 @@ mod tests {
     fn test_call_string_function_byte() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(STR_BYTE as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(STR_BYTE as *mut std::ffi::c_void));
         state.stack.push(TValue::Str(state.intern_str("AB")));
         state.stack.push(TValue::Integer(1));
         state.stack.push(TValue::Integer(2));
@@ -4460,7 +4899,9 @@ mod tests {
     fn test_call_string_function_char() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(STR_CHAR as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(STR_CHAR as *mut std::ffi::c_void));
         state.stack.push(TValue::Integer(65));
         state.stack.push(TValue::Integer(66));
         call_string_function(STR_CHAR, &mut state, 0, 2, 1).unwrap();
@@ -4474,7 +4915,9 @@ mod tests {
     fn test_call_string_function_rep() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(STR_REP as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(STR_REP as *mut std::ffi::c_void));
         state.stack.push(TValue::Str(state.intern_str("ab")));
         state.stack.push(TValue::Integer(3));
         call_string_function(STR_REP, &mut state, 0, 2, 1).unwrap();
@@ -4488,8 +4931,12 @@ mod tests {
     fn test_call_string_function_find() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(STR_FIND as *mut std::ffi::c_void));
-        state.stack.push(TValue::Str(state.intern_str("hello world")));
+        state
+            .stack
+            .push(TValue::LightUserData(STR_FIND as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::Str(state.intern_str("hello world")));
         state.stack.push(TValue::Str(state.intern_str("world")));
         call_string_function(STR_FIND, &mut state, 0, 2, -1).unwrap();
         assert!(state.stack.len() >= 2);
@@ -4507,7 +4954,9 @@ mod tests {
     fn test_call_string_function_format() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(STR_FORMAT as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(STR_FORMAT as *mut std::ffi::c_void));
         state.stack.push(TValue::Str(state.intern_str("hello %s")));
         state.stack.push(TValue::Str(state.intern_str("world")));
         call_string_function(STR_FORMAT, &mut state, 0, 2, 1).unwrap();
@@ -4542,10 +4991,21 @@ mod tests {
     /// 辅助: 比较 unpack 结果
     fn assert_unpack_eq(fmt: &str, data: &[u8], expected: &[TValue]) {
         let (results, _) = str_unpack(fmt, data, 1).expect("unpack should succeed");
-        assert_eq!(results.len(), expected.len(), "unpack({:?}) result count mismatch", fmt);
+        assert_eq!(
+            results.len(),
+            expected.len(),
+            "unpack({:?}) result count mismatch",
+            fmt
+        );
         for (i, (r, e)) in results.iter().zip(expected.iter()).enumerate() {
-            assert!(crate::vm::raw_equal(r, e),
-                "unpack({:?}) result[{}] mismatch: got {:?}, expected {:?}", fmt, i, r, e);
+            assert!(
+                crate::vm::raw_equal(r, e),
+                "unpack({:?}) result[{}] mismatch: got {:?}, expected {:?}",
+                fmt,
+                i,
+                r,
+                e
+            );
         }
     }
 
@@ -4580,8 +5040,16 @@ mod tests {
         assert_pack_eq("<I1", &[TValue::Integer(255)], &[0xFF]);
         assert_pack_eq("<I2", &[TValue::Integer(65535)], &[0xFF, 0xFF]);
         assert_pack_eq(">I2", &[TValue::Integer(65535)], &[0xFF, 0xFF]);
-        assert_pack_eq("<I4", &[TValue::Integer(0x12345678)], &[0x78, 0x56, 0x34, 0x12]);
-        assert_pack_eq(">I4", &[TValue::Integer(0x12345678)], &[0x12, 0x34, 0x56, 0x78]);
+        assert_pack_eq(
+            "<I4",
+            &[TValue::Integer(0x12345678)],
+            &[0x78, 0x56, 0x34, 0x12],
+        );
+        assert_pack_eq(
+            ">I4",
+            &[TValue::Integer(0x12345678)],
+            &[0x12, 0x34, 0x56, 0x78],
+        );
     }
 
     #[test]
@@ -4601,23 +5069,34 @@ mod tests {
     fn test_pack_lua_integer() {
         // j = lua_Integer (8 字节有符号)
         let val = 0x0807060504030201i64;
-        assert_pack_eq("<j", &[TValue::Integer(val)],
-            &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08]);
-        assert_pack_eq(">j", &[TValue::Integer(val)],
-            &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]);
+        assert_pack_eq(
+            "<j",
+            &[TValue::Integer(val)],
+            &[0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08],
+        );
+        assert_pack_eq(
+            ">j",
+            &[TValue::Integer(val)],
+            &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01],
+        );
 
         // J = lua_Integer (8 字节无符号)
-        assert_pack_eq("<J", &[TValue::Integer(-1)],
-            &[0xFF; 8]);
+        assert_pack_eq("<J", &[TValue::Integer(-1)], &[0xFF; 8]);
     }
 
     #[test]
     fn test_pack_max_min_integer() {
         // 最大/最小整数
-        assert_pack_eq("<j", &[TValue::Integer(i64::MAX)],
-            &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F]);
-        assert_pack_eq("<j", &[TValue::Integer(i64::MIN)],
-            &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80]);
+        assert_pack_eq(
+            "<j",
+            &[TValue::Integer(i64::MAX)],
+            &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F],
+        );
+        assert_pack_eq(
+            "<j",
+            &[TValue::Integer(i64::MIN)],
+            &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80],
+        );
     }
 
     // --- 浮点数 ---
@@ -4671,7 +5150,17 @@ mod tests {
 
     #[test]
     fn test_pack_unpack_float_roundtrip() {
-        for &n in &[0.0, -1.1, 1.9, f64::INFINITY, f64::NEG_INFINITY, 1e20, -1e20, 0.1, 2000.7] {
+        for &n in &[
+            0.0,
+            -1.1,
+            1.9,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            1e20,
+            -1e20,
+            0.1,
+            2000.7,
+        ] {
             let packed = str_pack("<n", &[TValue::Float(n)]).unwrap();
             assert_unpack_eq("<n", &packed, &[TValue::Float(n)]);
         }
@@ -4682,31 +5171,51 @@ mod tests {
     #[test]
     fn test_pack_string_fixed() {
         // c = 固定长度字符串
-        assert_pack_eq("<c3", &[TValue::Str(crate::strings::LuaString::Short(
-            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: "abc".to_string() })
-        ))], &[b'a', b'b', b'c']);
+        assert_pack_eq(
+            "<c3",
+            &[TValue::Str(crate::strings::LuaString::Short(
+                std::sync::Arc::new(crate::strings::ShortString {
+                    hash: 0,
+                    contents: "abc".to_string(),
+                }),
+            ))],
+            &[b'a', b'b', b'c'],
+        );
 
         // 短字符串补零
-        assert_pack_eq("<c5", &[TValue::Str(crate::strings::LuaString::Short(
-            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: "ab".to_string() })
-        ))], &[b'a', b'b', 0, 0, 0]);
+        assert_pack_eq(
+            "<c5",
+            &[TValue::Str(crate::strings::LuaString::Short(
+                std::sync::Arc::new(crate::strings::ShortString {
+                    hash: 0,
+                    contents: "ab".to_string(),
+                }),
+            ))],
+            &[b'a', b'b', 0, 0, 0],
+        );
     }
 
     #[test]
     fn test_pack_string_zstr() {
         // z = 零终止字符串
-        let s = TValue::Str(crate::strings::LuaString::Short(
-            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: "hello".to_string() })
-        ));
+        let s = TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+            crate::strings::ShortString {
+                hash: 0,
+                contents: "hello".to_string(),
+            },
+        )));
         assert_pack_eq("<z", &[s], &[b'h', b'e', b'l', b'l', b'o', 0]);
     }
 
     #[test]
     fn test_pack_string_s() {
         // s = 带长度前缀的字符串 (默认 size_t = 8 字节)
-        let s = TValue::Str(crate::strings::LuaString::Short(
-            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: "hi".to_string() })
-        ));
+        let s = TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+            crate::strings::ShortString {
+                hash: 0,
+                contents: "hi".to_string(),
+            },
+        )));
         let result = str_pack("<s", &[s]).unwrap();
         // 8 字节长度前缀 (小端) + 字符串内容
         assert_eq!(result.len(), 10);
@@ -4717,17 +5226,23 @@ mod tests {
     #[test]
     fn test_pack_string_s1() {
         // s1 = 1 字节长度前缀的字符串
-        let s = TValue::Str(crate::strings::LuaString::Short(
-            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: "hi".to_string() })
-        ));
+        let s = TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+            crate::strings::ShortString {
+                hash: 0,
+                contents: "hi".to_string(),
+            },
+        )));
         assert_pack_eq("<s1", &[s], &[2, b'h', b'i']);
     }
 
     #[test]
     fn test_pack_empty_string() {
-        let empty = TValue::Str(crate::strings::LuaString::Short(
-            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: "".to_string() })
-        ));
+        let empty = TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+            crate::strings::ShortString {
+                hash: 0,
+                contents: "".to_string(),
+            },
+        )));
 
         // 空字符串 c0
         assert_pack_eq("<c0", &[empty.clone()], &[]);
@@ -4744,16 +5259,22 @@ mod tests {
         // 包含特殊字符的字符串
         let bytes = vec![0u8, 1, 2, 255, 254, 128];
         let s = unsafe { String::from_utf8_unchecked(bytes.clone()) };
-        let sval = TValue::Str(crate::strings::LuaString::Short(
-            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: s })
-        ));
+        let sval = TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+            crate::strings::ShortString {
+                hash: 0,
+                contents: s,
+            },
+        )));
         assert_pack_eq("<c6", &[sval.clone()], &bytes);
 
         // z 字符串中不能包含 0 (除了终止符)
         let s2 = unsafe { String::from_utf8_unchecked(vec![1u8, 2, 3]) };
-        let sval2 = TValue::Str(crate::strings::LuaString::Short(
-            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: s2 })
-        ));
+        let sval2 = TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+            crate::strings::ShortString {
+                hash: 0,
+                contents: s2,
+            },
+        )));
         assert_pack_eq("<z", &[sval2], &[1, 2, 3, 0]);
     }
 
@@ -4808,10 +5329,7 @@ mod tests {
 
         // !4 i1 X i4 i4: i1=1字节, Xi4=对齐到4(消耗i4), i4=打包4字节
         // 只打包2个值: i1=1, i4=2
-        let result = str_pack("<!4 i1Xi4i4", &[
-            TValue::Integer(1),
-            TValue::Integer(2),
-        ]).unwrap();
+        let result = str_pack("<!4 i1Xi4i4", &[TValue::Integer(1), TValue::Integer(2)]).unwrap();
         assert_eq!(result, vec![1, 0, 0, 0, 2, 0, 0, 0]);
     }
 
@@ -4982,7 +5500,7 @@ mod tests {
     fn test_pack_invalid_format() {
         assert!(str_pack("<i0", &[TValue::Integer(0)]).is_err());
         assert!(str_pack("<i17", &[TValue::Integer(0)]).is_err()); // 超过 16
-        // !0 无效 (对齐为 0)
+                                                                   // !0 无效 (对齐为 0)
         assert!(str_pack("!0", &[]).is_err());
         // !3 单独不报错 (maxalign=3, 但没有需要对齐的选项)
         // !3 i4 报错 (3 不是 2 的幂)
@@ -5003,9 +5521,12 @@ mod tests {
 
     #[test]
     fn test_pack_string_too_long() {
-        let s = TValue::Str(crate::strings::LuaString::Short(
-            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: "hello".to_string() })
-        ));
+        let s = TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+            crate::strings::ShortString {
+                hash: 0,
+                contents: "hello".to_string(),
+            },
+        )));
         // c3 容纳 3 字节, 但字符串有 5 字节
         assert!(str_pack("<c3", &[s]).is_err());
     }
@@ -5024,22 +5545,24 @@ mod tests {
     #[test]
     fn test_pack_complex_format() {
         // 复合格式: i1 + c3 + i2
-        let s = TValue::Str(crate::strings::LuaString::Short(
-            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: "abc".to_string() })
-        ));
-        let result = str_pack("<i1c3i2", &[
-            TValue::Integer(1),
-            s,
-            TValue::Integer(2),
-        ]).unwrap();
+        let s = TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+            crate::strings::ShortString {
+                hash: 0,
+                contents: "abc".to_string(),
+            },
+        )));
+        let result = str_pack("<i1c3i2", &[TValue::Integer(1), s, TValue::Integer(2)]).unwrap();
         assert_eq!(result, vec![1, b'a', b'b', b'c', 2, 0]);
     }
 
     #[test]
     fn test_pack_unpack_complex_roundtrip() {
-        let s = TValue::Str(crate::strings::LuaString::Short(
-            std::sync::Arc::new(crate::strings::ShortString { hash: 0, contents: "XY".to_string() })
-        ));
+        let s = TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+            crate::strings::ShortString {
+                hash: 0,
+                contents: "XY".to_string(),
+            },
+        )));
         let fmt = "<i1c2i2d";
         let args = vec![
             TValue::Integer(42),
@@ -5067,7 +5590,11 @@ mod tests {
         for i in 1..=8usize {
             let shift = (i * 8) as i64;
             // n = lnum & (~(-1 << (i * 8)))
-            let mask = if shift >= 64 { -1i64 } else { !((-1i64) << shift) };
+            let mask = if shift >= 64 {
+                -1i64
+            } else {
+                !((-1i64) << shift)
+            };
             let n = lnum & mask;
 
             let fmt = format!("<i{}", i);
@@ -5079,8 +5606,13 @@ mod tests {
             // 验证解包往返
             let unpack_fmt = format!("<i{}", i);
             let (results, _) = str_unpack(&unpack_fmt, &packed, 1).unwrap();
-            assert!(crate::vm::raw_equal(&results[0], &TValue::Integer(n)),
-                "i={} roundtrip mismatch: got {:?}, expected {}", i, results[0], n);
+            assert!(
+                crate::vm::raw_equal(&results[0], &TValue::Integer(n)),
+                "i={} roundtrip mismatch: got {:?}, expected {}",
+                i,
+                results[0],
+                n
+            );
         }
     }
 
@@ -5153,10 +5685,7 @@ mod tests {
     #[test]
     fn test_format_precision_zero_unsigned() {
         // %.u: 精度 0，值为 0
-        assert_eq!(
-            str_format("%.u", &[TValue::Integer(0)]).unwrap(),
-            ""
-        );
+        assert_eq!(str_format("%.u", &[TValue::Integer(0)]).unwrap(), "");
     }
 
     #[test]
@@ -5180,28 +5709,19 @@ mod tests {
     #[test]
     fn test_format_plus_g_uppercase() {
         // %+.3G: + 标志，精度 3，%G 格式
-        assert_eq!(
-            str_format("%+.3G", &[TValue::Float(1.5)]).unwrap(),
-            "+1.5"
-        );
+        assert_eq!(str_format("%+.3G", &[TValue::Float(1.5)]).unwrap(), "+1.5");
     }
 
     #[test]
     fn test_format_precision_zero_string() {
         // %.0s: 精度 0，字符串
-        assert_eq!(
-            str_format("%.0s", &[TValue::Integer(0)]).unwrap(),
-            ""
-        );
+        assert_eq!(str_format("%.0s", &[TValue::Integer(0)]).unwrap(), "");
     }
 
     #[test]
     fn test_format_precision_empty_string() {
         // %.s: 精度 0 (等同 .0s)
-        assert_eq!(
-            str_format("%.s", &[TValue::Integer(0)]).unwrap(),
-            ""
-        );
+        assert_eq!(str_format("%.s", &[TValue::Integer(0)]).unwrap(), "");
     }
 
     #[test]
@@ -5294,43 +5814,28 @@ mod tests {
     #[test]
     fn test_format_hash_flag_octal_zero() {
         // %#o: # 标志，八进制，值为 0
-        assert_eq!(
-            str_format("%#o", &[TValue::Integer(0)]).unwrap(),
-            "0"
-        );
+        assert_eq!(str_format("%#o", &[TValue::Integer(0)]).unwrap(), "0");
     }
 
     #[test]
     fn test_format_hash_flag_hex_zero() {
         // %#x: # 标志，十六进制，值为 0 (不添加 0x 前缀)
-        assert_eq!(
-            str_format("%#x", &[TValue::Integer(0)]).unwrap(),
-            "0"
-        );
+        assert_eq!(str_format("%#x", &[TValue::Integer(0)]).unwrap(), "0");
     }
 
     #[test]
     fn test_format_simple_integer() {
-        assert_eq!(
-            str_format("%d", &[TValue::Integer(42)]).unwrap(),
-            "42"
-        );
+        assert_eq!(str_format("%d", &[TValue::Integer(42)]).unwrap(), "42");
     }
 
     #[test]
     fn test_format_simple_string() {
-        assert_eq!(
-            str_format("%s", &[TValue::Integer(42)]).unwrap(),
-            "42"
-        );
+        assert_eq!(str_format("%s", &[TValue::Integer(42)]).unwrap(), "42");
     }
 
     #[test]
     fn test_format_escape_percent() {
-        assert_eq!(
-            str_format("%%d", &[TValue::Integer(10)]).unwrap(),
-            "%d"
-        );
+        assert_eq!(str_format("%%d", &[TValue::Integer(10)]).unwrap(), "%d");
     }
 
     #[test]
@@ -5360,10 +5865,7 @@ mod tests {
     #[test]
     fn test_format_hex_float() {
         // 0.0 应该输出 "0"
-        assert_eq!(
-            str_format("%x", &[TValue::Float(0.0)]).unwrap(),
-            "0"
-        );
+        assert_eq!(str_format("%x", &[TValue::Float(0.0)]).unwrap(), "0");
     }
 
     #[test]

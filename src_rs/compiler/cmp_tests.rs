@@ -4,7 +4,12 @@ mod compiler_compare_tests {
     use crate::opcodes;
 
     fn compile_rust(source: &str, name: Option<&str>) -> crate::objects::Proto {
-        crate::compiler::compile(&mut crate::state::LuaState::new(), source, name.unwrap_or("=test")).expect("Rust compile failed")
+        crate::compiler::compile(
+            &mut crate::state::LuaState::new(),
+            source,
+            name.unwrap_or("=test"),
+        )
+        .expect("Rust compile failed")
     }
 
     unsafe fn compile_c(source: &str) -> bytecode_dump::DumpedFunction {
@@ -23,41 +28,78 @@ mod compiler_compare_tests {
         let mut meta_diffs = Vec::new();
 
         if rust_proto.num_params != c_func.numparams {
-            meta_diffs.push(format!("num_params: Rust={}, C={}", rust_proto.num_params, c_func.numparams));
+            meta_diffs.push(format!(
+                "num_params: Rust={}, C={}",
+                rust_proto.num_params, c_func.numparams
+            ));
         }
         if rust_proto.flag != c_func.flag {
             meta_diffs.push(format!("flag: Rust={}, C={}", rust_proto.flag, c_func.flag));
         }
         if rust_proto.max_stack_size != c_func.maxstacksize {
-            meta_diffs.push(format!("max_stack_size: Rust={}, C={}", rust_proto.max_stack_size, c_func.maxstacksize));
+            meta_diffs.push(format!(
+                "max_stack_size: Rust={}, C={}",
+                rust_proto.max_stack_size, c_func.maxstacksize
+            ));
         }
         if rust_proto.line_defined != c_func.linedefined {
-            meta_diffs.push(format!("line_defined: Rust={}, C={}", rust_proto.line_defined, c_func.linedefined));
+            meta_diffs.push(format!(
+                "line_defined: Rust={}, C={}",
+                rust_proto.line_defined, c_func.linedefined
+            ));
         }
         if rust_proto.last_line_defined != c_func.lastlinedefined {
-            meta_diffs.push(format!("last_line_defined: Rust={}, C={}", rust_proto.last_line_defined, c_func.lastlinedefined));
+            meta_diffs.push(format!(
+                "last_line_defined: Rust={}, C={}",
+                rust_proto.last_line_defined, c_func.lastlinedefined
+            ));
         }
         if rust_proto.size_upvalues as usize != c_func.upvalues.len() {
-            meta_diffs.push(format!("size_upvalues: Rust={}, C={}", rust_proto.size_upvalues, c_func.upvalues.len()));
+            meta_diffs.push(format!(
+                "size_upvalues: Rust={}, C={}",
+                rust_proto.size_upvalues,
+                c_func.upvalues.len()
+            ));
         }
         if rust_proto.size_k as usize != c_func.constants.len() {
-            meta_diffs.push(format!("size_k: Rust={}, C={}", rust_proto.size_k, c_func.constants.len()));
+            meta_diffs.push(format!(
+                "size_k: Rust={}, C={}",
+                rust_proto.size_k,
+                c_func.constants.len()
+            ));
         }
         if rust_proto.size_code as usize != c_func.code.len() {
-            meta_diffs.push(format!("size_code: Rust={}, C={}", rust_proto.size_code, c_func.code.len()));
+            meta_diffs.push(format!(
+                "size_code: Rust={}, C={}",
+                rust_proto.size_code,
+                c_func.code.len()
+            ));
         }
         if rust_proto.size_line_info != c_func.size_line_info {
-            meta_diffs.push(format!("size_line_info: Rust={}, C={}", rust_proto.size_line_info, c_func.size_line_info));
+            meta_diffs.push(format!(
+                "size_line_info: Rust={}, C={}",
+                rust_proto.size_line_info, c_func.size_line_info
+            ));
         }
         if rust_proto.size_abs_line_info != c_func.size_abs_line_info {
-            meta_diffs.push(format!("size_abs_line_info: Rust={}, C={}", rust_proto.size_abs_line_info, c_func.size_abs_line_info));
+            meta_diffs.push(format!(
+                "size_abs_line_info: Rust={}, C={}",
+                rust_proto.size_abs_line_info, c_func.size_abs_line_info
+            ));
         }
         if rust_proto.size_loc_vars != c_func.size_loc_vars {
-            meta_diffs.push(format!("size_loc_vars: Rust={}, C={}", rust_proto.size_loc_vars, c_func.size_loc_vars));
+            meta_diffs.push(format!(
+                "size_loc_vars: Rust={}, C={}",
+                rust_proto.size_loc_vars, c_func.size_loc_vars
+            ));
         }
         // size_p 通过 protos.len() 对比
         if rust_proto.size_p as usize != c_func.protos.len() {
-            meta_diffs.push(format!("size_p: Rust={}, C={}", rust_proto.size_p, c_func.protos.len()));
+            meta_diffs.push(format!(
+                "size_p: Rust={}, C={}",
+                rust_proto.size_p,
+                c_func.protos.len()
+            ));
         }
 
         if !meta_diffs.is_empty() {
@@ -76,13 +118,23 @@ mod compiler_compare_tests {
             let rust_dump = bytecode_dump::dump_instructions(&rust_proto.code);
             let c_dump = bytecode_dump::dump_c_instructions(&c_func.code, &c_func.constants);
             // Print upvalue info for debugging
-            let rust_uv: Vec<String> = rust_proto.upvalues.iter().map(|uv| {
-                let name_str = uv.name.as_ref().map(|s| s.to_string()).unwrap_or_else(|| "?".to_string());
-                format!("{}(instack={},idx={})", name_str, uv.in_stack, uv.idx)
-            }).collect();
-            let c_uv: Vec<String> = c_func.upvalues.iter().map(|(instack, idx, _kind)| {
-                format!("(instack={},idx={})", instack, idx)
-            }).collect();
+            let rust_uv: Vec<String> = rust_proto
+                .upvalues
+                .iter()
+                .map(|uv| {
+                    let name_str = uv
+                        .name
+                        .as_ref()
+                        .map(|s| s.to_string())
+                        .unwrap_or_else(|| "?".to_string());
+                    format!("{}(instack={},idx={})", name_str, uv.in_stack, uv.idx)
+                })
+                .collect();
+            let c_uv: Vec<String> = c_func
+                .upvalues
+                .iter()
+                .map(|(instack, idx, _kind)| format!("(instack={},idx={})", instack, idx))
+                .collect();
             panic!(
                 "Instruction mismatch for source: {}\n\
                  Function: {}\n\
@@ -347,22 +399,43 @@ mod compiler_compare_tests {
         assert_inst_match("return 0xFD & 0xAA ~ 0xCC | 0xF0 == 0xF4", None);
         assert_inst_match("return 0xF0 & 0x0F + 1 == 0x10", None);
         assert_inst_match("return 3^4//2^3//5 == 2", None);
-        assert_inst_match("return -3+4*5//2^3^2//9+4%10/3 == (-3)+(((4*5)//(2^(3^2)))//9)+((4%10)/3)", None);
+        assert_inst_match(
+            "return -3+4*5//2^3^2//9+4%10/3 == (-3)+(((4*5)//(2^(3^2)))//9)+((4%10)/3)",
+            None,
+        );
         assert_inst_match("return not ((true or false) and nil)", None);
         assert_inst_match("return true or false  and nil", None);
         assert_inst_match("return (((1 or false) and true) or false) == true", None);
         assert_inst_match("return (((nil and true) or false) and true) == false", None);
-        assert_inst_match("return -(1 or 2) == -1 and (1 and 2)+(-1.25 or -4) == 0.75", None);
+        assert_inst_match(
+            "return -(1 or 2) == -1 and (1 and 2)+(-1.25 or -4) == 0.75",
+            None,
+        );
         assert_inst_match("local x, y = 1, 2; return (x>y) and x or y == 2", None);
-        assert_inst_match("local x, y = 1, 2; x,y=2,1; return (x>y) and x or y == 2", None);
-        assert_inst_match("return 1234567890 == tonumber('1234567890') and 1234567890+1 == 1234567891", None);
-        assert_inst_match("local x = ((b or a)+1 == 2 and (10 or a)+1 == 11); return x", None);
-        assert_inst_match("local a,b = 1,nil; local x = ((b or a)+1 == 2 and (10 or a)+1 == 11); return x", None);
+        assert_inst_match(
+            "local x, y = 1, 2; x,y=2,1; return (x>y) and x or y == 2",
+            None,
+        );
+        assert_inst_match(
+            "return 1234567890 == tonumber('1234567890') and 1234567890+1 == 1234567891",
+            None,
+        );
+        assert_inst_match(
+            "local x = ((b or a)+1 == 2 and (10 or a)+1 == 11); return x",
+            None,
+        );
+        assert_inst_match(
+            "local a,b = 1,nil; local x = ((b or a)+1 == 2 and (10 or a)+1 == 11); return x",
+            None,
+        );
         assert_inst_match("return #a", None);
         assert_inst_match("return {123456789}", None);
         assert_inst_match("return {'123456789'}", None);
         assert_inst_match("return {3, 100, 5.0, -10}", None);
-        assert_inst_match("if a then return 'a' end; local b = {}; for _ in pairs(b) do end", None);
+        assert_inst_match(
+            "if a then return 'a' end; local b = {}; for _ in pairs(b) do end",
+            None,
+        );
     }
 
     #[test]
@@ -370,19 +443,25 @@ mod compiler_compare_tests {
         assert_inst_match("if true then return 1 end", None);
         assert_inst_match("if false then return 1 end", None);
         assert_inst_match("if true then return 1 else return 2 end", None);
-        assert_inst_match("if true then return 1 elseif true then return 2 else return 3 end",None);
-        assert_inst_match("local a; if false then a = 3 // 0; a = 0 % 0 end",None);
-        assert_inst_match("if a.b == 0 then end",None);
-        assert_inst_match("if a.b ~= 0 then end",None);
-        assert_inst_match("if _ENV.b == 0 then end",None);
-        assert_inst_match("if _ENV.b ~= 0 then end",None);
-        assert_inst_match("local i = 0; if i % 60000 == 0 then end",None);
-        assert_inst_match("if a then return 'a' end",None);
-        assert_inst_match("if a then else return 'a' end",None);
-        assert_inst_match("if not a then --[\n local b = {} end --",None);
-        assert_inst_match("if not a then --[\n local b = {}\n local c = [[]]\n end --",None);
-        assert_inst_match("if not a then local d = b.c() local e = '' .. d end",None);
-        assert_inst_match("local a, b, c; if not a then end",None);
+        assert_inst_match(
+            "if true then return 1 elseif true then return 2 else return 3 end",
+            None,
+        );
+        assert_inst_match("local a; if false then a = 3 // 0; a = 0 % 0 end", None);
+        assert_inst_match("if a.b == 0 then end", None);
+        assert_inst_match("if a.b ~= 0 then end", None);
+        assert_inst_match("if _ENV.b == 0 then end", None);
+        assert_inst_match("if _ENV.b ~= 0 then end", None);
+        assert_inst_match("local i = 0; if i % 60000 == 0 then end", None);
+        assert_inst_match("if a then return 'a' end", None);
+        assert_inst_match("if a then else return 'a' end", None);
+        assert_inst_match("if not a then --[\n local b = {} end --", None);
+        assert_inst_match(
+            "if not a then --[\n local b = {}\n local c = [[]]\n end --",
+            None,
+        );
+        assert_inst_match("if not a then local d = b.c() local e = '' .. d end", None);
+        assert_inst_match("local a, b, c; if not a then end", None);
     }
 
     #[test]
@@ -390,7 +469,10 @@ mod compiler_compare_tests {
         assert_inst_match("while false do end", None);
         assert_inst_match("while nil do end;", None);
         assert_inst_match("local a=nil; while not a do end", None);
-        assert_inst_match("local a; while a ~= (a + 0.0) or (a - 1) ~= (a - 1.0) do a = a // 2 end", None);
+        assert_inst_match(
+            "local a; while a ~= (a + 0.0) or (a - 1) ~= (a - 1.0) do a = a // 2 end",
+            None,
+        );
         assert_inst_match("local i = 1, a; while a[i] ~= 0 do i = a[i] end", None);
     }
 
@@ -400,8 +482,14 @@ mod compiler_compare_tests {
         assert_inst_match("for i = 1, 1000 do break; end", None);
         assert_inst_match("local a = nil; for i = i, 1, -1 do a = a + 1 end", None);
         assert_inst_match("for i = 1, n do for i = i, 1, -1 do end end", None);
-        assert_inst_match("if not a then b = 0 end; local c = {}; for i=3000,-3000,-1 do c[i + 0.0] = i; end", None);
-        assert_inst_match("local a, lim; for i = 1,lim do a[#a + 1] = '' .. -(2*(lim - i + 1) + 1) end", None);
+        assert_inst_match(
+            "if not a then b = 0 end; local c = {}; for i=3000,-3000,-1 do c[i + 0.0] = i; end",
+            None,
+        );
+        assert_inst_match(
+            "local a, lim; for i = 1,lim do a[#a + 1] = '' .. -(2*(lim - i + 1) + 1) end",
+            None,
+        );
         assert_inst_match("local T; local b = T.a(0, 10); for i = 1, 10 do local v, p = b.c(b, i) assert(v == nil and p) end", None);
     }
 
@@ -415,60 +503,114 @@ mod compiler_compare_tests {
         assert_inst_match("for k,v,w in a do end", None);
         assert_inst_match("for _ in a.b('1'..';'..'2', '2') do end", None);
         assert_inst_match("for _ in a:b('1'..';'..'2', '2') do end", None);
-        assert_inst_match("for _, _ in ipairs({}) do for _, _ in ipairs({}) do end end", None);
+        assert_inst_match(
+            "for _, _ in ipairs({}) do for _, _ in ipairs({}) do end end",
+            None,
+        );
     }
 
     #[test]
     fn test_for_generic() {
         assert_inst_match("local a = {} for _, __ in ipairs(a) do end", None);
         assert_inst_match("local a = {} for _, __ in ipairs(a) do local b end", None);
-        assert_inst_match("do local a = {} for _, __ in ipairs(a) do local b end end", None);
+        assert_inst_match(
+            "do local a = {} for _, __ in ipairs(a) do local b end end",
+            None,
+        );
         assert_inst_match("for _, _ in _ do local a, b assert(a == b) end", None);
     }
 
     #[test]
     fn test_function_upvalue() {
-        assert_inst_match("local a; local function f(x) x={a=1}; x={x=1}; x={G=1} end", None);
+        assert_inst_match(
+            "local a; local function f(x) x={a=1}; x={x=1}; x={G=1} end",
+            None,
+        );
         assert_inst_match("local a; local function f(x) local b=a .. '' end", None);
     }
 
     #[test]
     fn test_function_2() {
-        assert_inst_match("function checkload (s, msg) assert(string.find(select(2, load(s)), msg)) end", None);
+        assert_inst_match(
+            "function checkload (s, msg) assert(string.find(select(2, load(s)), msg)) end",
+            None,
+        );
         assert_inst_match("function f(i) if i < 10 then end end", None);
         assert_inst_match("function f(i) if i < 10 then local i = 0 end end", None);
         assert_inst_match("function f () return 1,2,3; end; local a, b, c = f()", None);
-        assert_inst_match("function f () return 1,2,3; end; local a, b, c = (f())", None);
-        assert_inst_match("function f () return 1,2,3; end; local a, b, c; a, b, c = f()", None);
-        assert_inst_match("function f () return 1,2,3; end; local a, b, c; a, b, c = (f())", None);
+        assert_inst_match(
+            "function f () return 1,2,3; end; local a, b, c = (f())",
+            None,
+        );
+        assert_inst_match(
+            "function f () return 1,2,3; end; local a, b, c; a, b, c = f()",
+            None,
+        );
+        assert_inst_match(
+            "function f () return 1,2,3; end; local a, b, c; a, b, c = (f())",
+            None,
+        );
         assert_inst_match("local a, b = 3 and f()", None);
         assert_inst_match("local function h(a,b,c,d,e) while (a>=b or c or (d and e) or nil) do return 1; end; return 0; end", None);
         assert_inst_match("assert(not a(b, 'c'))", None);
         assert_inst_match("local a; a.b.c = function (...) end", None);
         assert_inst_match("local a,i,j,b; local function foo() i, a[i], a, j, a[j], a[i+j] = j, i, i, b, j, i end", None);
-        assert_inst_match("local t = {}; (function (a) t[a], a = 10, 20  end)(1)", None);
+        assert_inst_match(
+            "local t = {}; (function (a) t[a], a = 10, 20  end)(1)",
+            None,
+        );
         assert_inst_match("local t = {} (function (a) t[a], a = 10, 20  end)(1)", None);
-        assert_inst_match("local T local a = {T.f[[]]} assert(T.f('', 2, 0) == 10.0/0) a = T.f('')", None);
-        assert_inst_match("local t = setmetatable({x = 20}, {__len = function (t) return t.x end})", None);
+        assert_inst_match(
+            "local T local a = {T.f[[]]} assert(T.f('', 2, 0) == 10.0/0) a = T.f('')",
+            None,
+        );
+        assert_inst_match(
+            "local t = setmetatable({x = 20}, {__len = function (t) return t.x end})",
+            None,
+        );
         assert_inst_match("local a, t; f(t, {n=1,a})", None);
     }
 
     #[test]
     fn test_function_close() {
-        assert_inst_match("do local a = {} local function f () local b = a end f() end", None);
-        assert_inst_match("do local a, b = {}, {} local function f () local c = a end f() end", None);
-        assert_inst_match("do local a, b = {}, {} local function f () local c = b end f() end", None);
-        assert_inst_match("if not a then local b local function f(x) local x = t.f(x) return b .. x end end", None);
-        assert_inst_match("for _, _ in _ do local b local function f(x) local x = t.f(x) return b .. x end end", None);
+        assert_inst_match(
+            "do local a = {} local function f () local b = a end f() end",
+            None,
+        );
+        assert_inst_match(
+            "do local a, b = {}, {} local function f () local c = a end f() end",
+            None,
+        );
+        assert_inst_match(
+            "do local a, b = {}, {} local function f () local c = b end f() end",
+            None,
+        );
+        assert_inst_match(
+            "if not a then local b local function f(x) local x = t.f(x) return b .. x end end",
+            None,
+        );
+        assert_inst_match(
+            "for _, _ in _ do local b local function f(x) local x = t.f(x) return b .. x end end",
+            None,
+        );
     }
 
     #[test]
     fn test_assert_expr1() {
-        assert_inst_match("assert(-3+4*5//2^3^2//9+4%10/3 == (-3)+(((4*5)//(2^(3^2)))//9)+((4%10)/3))", None);
+        assert_inst_match(
+            "assert(-3+4*5//2^3^2//9+4%10/3 == (-3)+(((4*5)//(2^(3^2)))//9)+((4%10)/3))",
+            None,
+        );
         assert_inst_match("assert(a == n*(n+1)/2 and i==3)", None);
         assert_inst_match("assert(t[1] and t[n] and not t[0] and not t[n+1])", None);
-        assert_inst_match("local t = {}; assert(t[1] and t[n] and not t[0] and not t[n+1])", None);
-        assert_inst_match("local t, n = {}, 100; assert(t[1] and t[n] and not t[0] and not t[n+1])", None);
+        assert_inst_match(
+            "local t = {}; assert(t[1] and t[n] and not t[0] and not t[n+1])",
+            None,
+        );
+        assert_inst_match(
+            "local t, n = {}, 100; assert(t[1] and t[n] and not t[0] and not t[n+1])",
+            None,
+        );
         assert_inst_match("local n = 100; assert(a == n*(n+1)/2 and i==3)", None);
         assert_inst_match("local f, g, h; assert(f(1,2,nil,nil,'x') == nil and g(1,2,nil,nil,'x') == 0 and h(1,2,nil,nil,'x') == 0)", None);
         assert_inst_match("x = 2<3 and not 3; assert(x == false)", None);
@@ -491,34 +633,64 @@ mod compiler_compare_tests {
         assert_inst_match("assert(not not a == true)", None);
         assert_inst_match("local a; assert(not not a == true)", None);
         assert_inst_match("assert(not 'x' == false)", None);
-        assert_inst_match("local a, b; assert(a[b] == 10 and a[b - 1] == 11 and a[-b] == 12 and a[-b + 1] == 13)", None);
-        assert_inst_match("local a; assert(a == 3.0 and math.type(a) == 'float')", None);
+        assert_inst_match(
+            "local a, b; assert(a[b] == 10 and a[b - 1] == 11 and a[-b] == 12 and a[-b + 1] == 13)",
+            None,
+        );
+        assert_inst_match(
+            "local a; assert(a == 3.0 and math.type(a) == 'float')",
+            None,
+        );
         assert_inst_match("local a, x, y; assert(x == a..a and y == 5)", None);
-        assert_inst_match("local lim = 12000; local a = {}; a[#a + 1] = '' .. -(2*lim + 2)", None);
+        assert_inst_match(
+            "local lim = 12000; local a = {}; a[#a + 1] = '' .. -(2*lim + 2)",
+            None,
+        );
         assert_inst_match("local T; local f = T.a[[]] T.b(f, 2, '')", None);
         assert_inst_match("local T, i; assert(T.ref{} == i)", None);
     }
 
     #[test]
     fn test_assert_var() {
-        assert_inst_match("local x = ((b or a)+1 == 2 and (10 or a)+1 == 11); assert(x);", None);
-        assert_inst_match("local x\nx = (((2<3) or 1) == true and (2<3 and 4) == 4); assert(x);", None);
-        assert_inst_match("assert(x[1] == 3 and x[2] == 5 and x[3] == 10 and x[4] == 9 and x[12] == 1)", None);
-        assert_inst_match("local a,i,j,b; i, a[i], a, j, a[j], a[i+j] = j, i, i, b, j, i", None);
+        assert_inst_match(
+            "local x = ((b or a)+1 == 2 and (10 or a)+1 == 11); assert(x);",
+            None,
+        );
+        assert_inst_match(
+            "local x\nx = (((2<3) or 1) == true and (2<3 and 4) == 4); assert(x);",
+            None,
+        );
+        assert_inst_match(
+            "assert(x[1] == 3 and x[2] == 5 and x[3] == 10 and x[4] == 9 and x[12] == 1)",
+            None,
+        );
+        assert_inst_match(
+            "local a,i,j,b; i, a[i], a, j, a[j], a[i+j] = j, i, i, b, j, i",
+            None,
+        );
     }
 
     #[test]
     fn test_table_field_assign() {
         assert_inst_match("local A = {};A.a = nil;A.b = false;A.c = 123", None);
-        assert_inst_match("local A = {};A['a'] = nil;A['b'] = false;A['c'] = 123", None);
+        assert_inst_match(
+            "local A = {};A['a'] = nil;A['b'] = false;A['c'] = 123",
+            None,
+        );
         assert_inst_match("local a = {1}; a[#a + 1] = 2", None);
         assert_inst_match("local a = {1}; a[#a + 1] = 2 .. ''", None);
         assert_inst_match("local a = {1}; a[#a + 1] = {1}", None);
-        assert_inst_match("local a = {1}; a[#a + 1] = function (b) return {b + 1 + ''} end", None);
+        assert_inst_match(
+            "local a = {1}; a[#a + 1] = function (b) return {b + 1 + ''} end",
+            None,
+        );
         assert_inst_match("a[#a + 1] = 2 .. ''", None);
         assert_inst_match("local a, b = nil, 23; local x = {a or b+2}", None);
         assert_inst_match("local a = nil; local x = {f(100)*2+3 or a}", None);
-        assert_inst_match("local a, b = nil, 23; local x = {f=2+3 or a, a = b+2}", None);
+        assert_inst_match(
+            "local a, b = nil, 23; local x = {f=2+3 or a, a = b+2}",
+            None,
+        );
         assert_inst_match("local a; a={y=1}", None);
         assert_inst_match("local abc = {{'(0==_ENV.a)', 0 == _ENV.a}}", None);
         assert_inst_match("local a = {{'a', 1}}; a[1][2] = 2", None);
@@ -528,7 +700,10 @@ mod compiler_compare_tests {
         assert_inst_match("local aa = 1; _ENV.aa = aa", None);
         assert_inst_match("local aa = 1; _ENV.aa = aa; _ENV.aa = nil", None);
         assert_inst_match("_ENV.a = b.c(0, 1)", None);
-        assert_inst_match("local a = {}; getmetatable(a).__index = function () end", None);
+        assert_inst_match(
+            "local a = {}; getmetatable(a).__index = function () end",
+            None,
+        );
         assert_inst_match("local e, m; assert(not e and m:find(\"'newindex'\"))", None);
         assert_inst_match("local a = {['a'] = '', ['b'] = '', ['c'] = '', ['d'] = '', ['e'] = '', ['f'] = '', ['g'] = ''}", None);
         assert_inst_match("a.b.c = nil; a.b.c.d = nil; a.b.c.d.e = nil; a.b.c.d.e.f = nil; a.b.c.d.e.f.g = nil; a.b.c.d.e.f.g.h = nil; a.b.c.d.e.f.g.h.i = nil; a.b.c.d.e.f.g.h.i.g = nil; a.b.c.d.e.f.g.h.i.g.k = nil", None);
@@ -541,7 +716,10 @@ mod compiler_compare_tests {
         assert_inst_match("a,b = f(), 1, 2, 3, f()", None);
         assert_inst_match("local a, b, f; a,b = f(), 1, 2, 3, f()", None);
         assert_inst_match("local a = {}; a[print](a[a[f]] == a[print])", None);
-        assert_inst_match("local a, b, c; a = {10,9,8,7,6,5,4,3,2; [-3]='a', [f]=print, a='a', b='ab'}", None);
+        assert_inst_match(
+            "local a, b, c; a = {10,9,8,7,6,5,4,3,2; [-3]='a', [f]=print, a='a', b='ab'}",
+            None,
+        );
         assert_inst_match("local a, b, c; a[1], f(a)[2], b, c = {['alo']=assert}, 10, a[1], a[f], 6, 10, 23, f(a), 2", None);
         assert_inst_match("local a; a.aVeryLongName012345678901234567890123456789012345678901234567890123456789 = 10", None);
         assert_inst_match("local a; local function foo () end; assert(foo() == 10 and a.aVeryLongName012345678901234567890123456789012345678901234567890123456789 == 10)", None);
@@ -585,7 +763,10 @@ mod compiler_compare_tests {
     #[test]
     fn test_do_nested_func() {
         // Test: do with nested function that captures local var - C should generate CLOSE
-        assert_inst_match("do local a = {}; local function f() a.x = true end end", None);
+        assert_inst_match(
+            "do local a = {}; local function f() a.x = true end end",
+            None,
+        );
     }
 
     #[test]
@@ -624,7 +805,8 @@ mod compiler_compare_tests {
     /// fix it correctly goes through CLOSE (JMP 4 → CLOSE).
     #[test]
     fn test_repeat_until_or_with_upvalue() {
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local a = {}
 do
   local x = 1
@@ -635,7 +817,9 @@ repeat
   local x
   i = i + 1
 until i > 3 or a[1]() ~= 1
-"#, None);
+"#,
+            None,
+        );
     }
 
     // #[test]
@@ -651,24 +835,31 @@ until i > 3 or a[1]() ~= 1
     #[test]
     fn test_for_break_closure() {
         // Numeric for loop with break and closure capturing loop variable
-        assert_inst_match("for i = 1, 3 do local f = function() return i end break end", None);
+        assert_inst_match(
+            "for i = 1, 3 do local f = function() return i end break end",
+            None,
+        );
     }
 
     #[test]
     fn test_env_closure_close() {
         // do local _ENV with closure capturing _ENV - should generate CLOSE on block exit
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 do
   local _ENV = {}
   function foo() return A end
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
     fn test_env_nested_closure_close() {
         // Nested _ENV blocks with closures - tests multiple CLOSE instructions
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 do
   local mt = {}
   do
@@ -680,20 +871,26 @@ do
     end
   end
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
     fn debug_goto_simple() {
         // Minimal test: goto jumping out of a block with a local variable
         // This matches the pattern in goto.lua that causes PC 54 difference
-        assert_inst_match(r#"local x; do local y = 12; goto l1; ::l2:: x = x + 1; goto l3; ::l1:: x = y; goto l2; end; ::l3:: return x"#, None);
+        assert_inst_match(
+            r#"local x; do local y = 12; goto l1; ::l2:: x = x + 1; goto l3; ::l1:: x = y; goto l2; end; ::l3:: return x"#,
+            None,
+        );
     }
 
     #[test]
     fn debug_goto_with_y() {
         // Same but with local y inside the block (like goto.lua)
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local x
 do
   local y = 12
@@ -702,13 +899,16 @@ do
   ::l1:: x = y; goto l2
 end
 ::l3:: return x
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
     fn debug_goto_while() {
         // goto.lua lines 89-96: goto out of while loop with local variable
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local x = 13
 while true do
   goto l4
@@ -718,13 +918,16 @@ while true do
   ::l1:: ;;;
 end
 ::l4:: assert(x == 13)
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
     fn debug_goto_if() {
         // goto.lua lines 98-104: goto inside if block with local variable
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 if print then
   goto l1
   error("should not be here")
@@ -732,13 +935,16 @@ if print then
   local x
   ::l1:: ; ::l2:: ;;
 else end
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
     fn debug_goto_with_globals() {
         // Like goto.lua: global declarations + goto jumping out of block with upvalue
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 global<const> print, assert
 local x
 do
@@ -748,13 +954,16 @@ do
   ::l1:: x = y; goto l2
 end
 ::l3:: assert(x == 13)
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
     fn debug_global_func() {
         // global function foo - foo should be resolved as global variable
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 global<const> print, assert
 local foo = 20
 do
@@ -763,19 +972,24 @@ do
   end
   assert(foo == _ENV.foo and foo(4) == 16)
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
     fn debug_global_init() {
         // global X; X = 20 - test that SETTABUP uses constant for value
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 global<const> print
 do
   local X = 10
   do global X; X = 20 end
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     /// Regression test: <const> variables referenced by child functions should NOT
@@ -789,7 +1003,8 @@ end
         // local k0 <const> is referenced inside f1, but since it's a <const>,
         // it should be inlined as a constant, not captured as an upvalue.
         // The do...end block should NOT generate a CLOSE instruction.
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 do
   local k0 <const> = "hello"
   local function f1 ()
@@ -801,14 +1016,17 @@ do
   local f2 = f1()
   local f3 = f2()
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     /// Test that <const> integer variables in parent scope are also
     /// correctly inlined as constants in child functions, not captured as upvalues.
     #[test]
     fn test_ctc_int_no_extra_close() {
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 do
   local k0 <const> = 42
   local function f1 ()
@@ -816,12 +1034,15 @@ do
   end
   local f2 = f1()
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
     fn test_local_func_in_func() {
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local Z = function (le)
       local function a (f)
         return le(function (x) return f(f)(x) end)
@@ -837,12 +1058,15 @@ local F = function (f)
     end
 
 assert(5*Z(F)(4)==5 and Z(F)(5)==5*Z(F)(4))
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
     fn test_local_shadow_assign() {
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local a = {i = 10}
 do
   local a = {}
@@ -851,7 +1075,9 @@ end
 a = nil
 (function (x) a=x end)(23)
 assert(a == 23)
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
@@ -859,12 +1085,15 @@ assert(a == 23)
         // Constants (nil, true, false, numbers, strings) should NOT be treated
         // as function calls. Before the fix, `nil(...)` was incorrectly parsed
         // as a function call chain, producing extra CALL+MOVE instructions.
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local a = 1
 a = nil
 (function(x) a = x end)(23)
 assert(a == 23)
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
@@ -880,13 +1109,16 @@ assert(a == 23)
         // Long method names (> LUAI_MAXSHORTLEN) in function definitions
         // must use LOADK+SETTABLE instead of SETFIELD.
         // Before the fix, SETFIELD was incorrectly used for long string keys.
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local t = {x = 1}
 function t:_012345678901234567890123456789012345678901234567890123456789 ()
   return self.x
 end
 assert(t:_012345678901234567890123456789012345678901234567890123456789() == 1)
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
@@ -895,48 +1127,60 @@ assert(t:_012345678901234567890123456789012345678901234567890123456789() == 1)
         // as the register, not VRELOC's info (which is 0).
         // Before fix: TEST 0 k (wrong register 0)
         // After fix: TEST 1 k (correct register from NOT's B operand)
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local x = true
 if not x then
   x = false
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
     fn test_not_in_while_condition() {
         // NOT operator in while condition should produce TEST with NOT's B operand.
         // Before fix: TEST 0 k (wrong register)
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local x = true
 while not x do
   x = false
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
     fn test_not_in_elseif_condition() {
         // NOT operator in elseif condition should produce TEST with NOT's B operand.
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local x = true
 if x then
   x = false
 elseif not x then
   x = true
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
     fn test_not_in_repeat_until() {
         // NOT operator in repeat-until condition should produce EQ with correct register.
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local x = false
 repeat
   x = true
 until not x
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
@@ -944,43 +1188,55 @@ until not x
         // 'and' with comparison operators produces VJMP for each condition.
         // The false list must contain all JMPs and be patched correctly.
         // Before fix: second JMP was not patched (JMP -1 / infinite loop).
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 if 1 < 2 and 3 < 4 then
   local x = 1
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
     fn test_or_with_not() {
         // 'or' with NOT should remove NOT and use TEST with NOT's B operand.
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local x = false
 if x or not x then
   x = true
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
     fn test_and_or_combined() {
         // Combined and/or with comparisons tests jump list patching.
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local a = 1
 if a < 2 and a > 0 or a == 3 then
   a = 2
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
     fn test_not_preserves_jumps() {
         // NOT should preserve and swap t/f jump lists from the operand.
         // Before fix: NOT discarded jump lists, causing missing JMP+LFALSESKIP+LOADTRUE.
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local x = (not true)
 assert(x == false)
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
@@ -988,10 +1244,13 @@ assert(x == false)
         // BANDK should reuse the left operand's register when it's a temporary.
         // Before the fix, the left operand's register was not freed, causing
         // a register offset of 1 in subsequent instructions.
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local a = (1 + 1) & 255
 assert(a == 2)
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
@@ -1011,7 +1270,7 @@ assert(a == 2)
     fn test_api_lua() {
         assert_inst_match_file("api.lua");
     }
-  
+
     #[test]
     fn test_attrib_lua() {
         assert_inst_match_file("attrib.lua");
@@ -1103,17 +1362,17 @@ assert(a == 2)
             .expect("thread spawn failed");
         child.join().expect("test thread panicked");
     }
- 
+
     #[test]
     fn test_literals_lua() {
         assert_inst_match_file("literals.lua");
     }
- 
+
     #[test]
     fn test_locals_lua() {
         assert_inst_match_file("locals.lua");
     }
- 
+
     #[test]
     fn test_math_lua() {
         assert_inst_match_file("math.lua");
@@ -1262,7 +1521,9 @@ assert(a == 2)
         let mut source = String::new();
         // Generate 256 short string constants to push subsequent constants past MAXINDEXRK
         for i in 0..256 {
-            if i % 5 == 0 { source.push('\n'); }
+            if i % 5 == 0 {
+                source.push('\n');
+            }
             source.push_str(&format!("_ = \"s{:03}\"; ", i));
         }
         // Now "getmetatable" and "__index" will have constant indices > 255
@@ -1278,7 +1539,9 @@ assert(a == 2)
         let mut source = String::new();
         // Generate 256 short string constants to push subsequent constants past MAXINDEXRK
         for i in 0..256 {
-            if i % 5 == 0 { source.push('\n'); }
+            if i % 5 == 0 {
+                source.push('\n');
+            }
             source.push_str(&format!("_ = \"s{:03}\"; ", i));
         }
         // Now "testKey" will have a constant index > 255, so GETFIELD must fall back
@@ -1291,7 +1554,9 @@ assert(a == 2)
         // Test GETFIELD overflow in chained field access (a.b.c where b's index > MAXINDEXRK)
         let mut source = String::new();
         for i in 0..256 {
-            if i % 5 == 0 { source.push('\n'); }
+            if i % 5 == 0 {
+                source.push('\n');
+            }
             source.push_str(&format!("_ = \"s{:03}\"; ", i));
         }
         // "fieldA" and "fieldB" will have constant indices > 255
@@ -1304,7 +1569,9 @@ assert(a == 2)
         // Test GETFIELD overflow in function call context (a.method() where method's index > MAXINDEXRK)
         let mut source = String::new();
         for i in 0..256 {
-            if i % 5 == 0 { source.push('\n'); }
+            if i % 5 == 0 {
+                source.push('\n');
+            }
             source.push_str(&format!("_ = \"s{:03}\"; ", i));
         }
         // "myMethod" will have a constant index > 255
@@ -1320,7 +1587,9 @@ assert(a == 2)
         // e.g., "L1 = T.newstate()" where "L1" has constant index > 255
         let mut source = String::new();
         for i in 0..256 {
-            if i % 5 == 0 { source.push('\n'); }
+            if i % 5 == 0 {
+                source.push('\n');
+            }
             source.push_str(&format!("_ = \"s{:03}\"; ", i));
         }
         // "T" and "newstate" will have constant indices > 255
@@ -1336,7 +1605,9 @@ assert(a == 2)
         // matching C compiler's evaluation order.
         let mut source = String::new();
         for i in 0..256 {
-            if i % 5 == 0 { source.push('\n'); }
+            if i % 5 == 0 {
+                source.push('\n');
+            }
             source.push_str(&format!("_ = \"s{:03}\"; ", i));
         }
         // "longFieldName" will have a constant index > 255
@@ -1351,7 +1622,9 @@ assert(a == 2)
         // matching C compiler's evaluation order.
         let mut source = String::new();
         for i in 0..256 {
-            if i % 5 == 0 { source.push('\n'); }
+            if i % 5 == 0 {
+                source.push('\n');
+            }
             source.push_str(&format!("_ = \"s{:03}\"; ", i));
         }
         // "longKeyName" will have a constant index > 255
@@ -1366,7 +1639,9 @@ assert(a == 2)
         // (not register 0) and emit LOADK+GETTABLE, matching C compiler output.
         let mut source = String::new();
         for i in 0..256 {
-            if i % 5 == 0 { source.push('\n'); }
+            if i % 5 == 0 {
+                source.push('\n');
+            }
             source.push_str(&format!("_ = \"s{:03}\"; ", i));
         }
         // "readKey" will have a constant index > 255
@@ -1381,7 +1656,9 @@ assert(a == 2)
         // and emit LOADK+GETTABLE, matching C compiler output.
         let mut source = String::new();
         for i in 0..256 {
-            if i % 5 == 0 { source.push('\n'); }
+            if i % 5 == 0 {
+                source.push('\n');
+            }
             source.push_str(&format!("_ = \"s{:03}\"; ", i));
         }
         // "readField" will have a constant index > 255
@@ -1420,7 +1697,9 @@ assert(a == 2)
         // Previously, CLOSURE was emitted before GETUPVAL+LOADK.
         let mut source = String::new();
         for i in 0..256 {
-            if i % 5 == 0 { source.push('\n'); }
+            if i % 5 == 0 {
+                source.push('\n');
+            }
             source.push_str(&format!("_ = \"s{:03}\"; ", i));
         }
         // "longFuncName" will have a constant index > 255
@@ -1499,12 +1778,17 @@ assert(a == 2)
         let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         path.push("tests_lua/");
         path.push(name);
-        let bytes = std::fs::read(path.as_path()).expect(&format!("Failed to read file: {:?}", path));
+        let bytes =
+            std::fs::read(path.as_path()).expect(&format!("Failed to read file: {:?}", path));
         String::from_utf8_lossy(&bytes).into_owned()
     }
 
     fn assert_compile_ok(source: &str, name: Option<&str>) {
-        let result = crate::compiler::compile(&mut crate::state::LuaState::new(), source, name.unwrap_or("=test_assert"));
+        let result = crate::compiler::compile(
+            &mut crate::state::LuaState::new(),
+            source,
+            name.unwrap_or("=test_assert"),
+        );
         assert!(result.is_ok(), "Compile failed: {:?}", result.err());
     }
 
@@ -1530,10 +1814,7 @@ assert(a == 2)
             "if true then return 1 elseif true then return 2 else return 3 end",
             None,
         );
-        assert_compile_ok(
-            "if false then a=1 elseif true then a=2 else a=3 end",
-            None,
-        );
+        assert_compile_ok("if false then a=1 elseif true then a=2 else a=3 end", None);
     }
 
     #[test]
@@ -1550,12 +1831,18 @@ assert(a == 2)
 
     #[test]
     fn test_reg_no_leak_function_call() {
-        assert_compile_ok("local function f(x, y) return x + y end; local a = f(1, 2)", None);
+        assert_compile_ok(
+            "local function f(x, y) return x + y end; local a = f(1, 2)",
+            None,
+        );
     }
 
     #[test]
     fn test_reg_no_leak_method_call() {
-        assert_compile_ok("local t = {}; local function m(t, x) return x end; local a = m(t, 1)", None);
+        assert_compile_ok(
+            "local t = {}; local function m(t, x) return x end; local a = m(t, 1)",
+            None,
+        );
     }
 
     #[test]
@@ -1602,7 +1889,10 @@ assert(a == 2)
 
     #[test]
     fn test_reg_no_leak_unary_ops() {
-        assert_compile_ok("local a = -1; local b = not true; local c = #'abc'; local d = ~0", None);
+        assert_compile_ok(
+            "local a = -1; local b = not true; local c = #'abc'; local d = ~0",
+            None,
+        );
     }
 
     #[test]
@@ -1615,24 +1905,33 @@ assert(a == 2)
     fn test_and_reg_leak() {
         // This tests the register leak in 'and' expressions with comparisons
         // Before fix: Rust generates ADDI 8 0 -1 (freereg=8), C generates ADDI 6 0 -1 (freereg=6)
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local a = 0
 assert(a == 0 and a == 0)
 assert(a == 0)
-"#, None);
+"#,
+            None,
+        );
         // More complex: with bitwise operations and comparisons in 'and'
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local a, b, c, d
 a = 0xFF
 assert(a >> 4 == 0xF and a == 0xFF)
 assert(a == 0xFF)
-"#, None);
+"#,
+            None,
+        );
         // Even more complex: matching the actual bitwise.lua pattern
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local a = 0
 assert(-1 >> 1 == (1 << 63) - 1 and 1 << 31 == 0x80000000)
 assert(a == 0)
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
@@ -1642,15 +1941,27 @@ assert(a == 0)
         // With comparison (VJMP) as first operand
         assert_inst_match("local a,b,c,d; local x = a <= b and c and d", None);
         // Return with and chain
-        assert_inst_match("local a,b,c,d; local function f() return a and b and c and d end", None);
+        assert_inst_match(
+            "local a,b,c,d; local function f() return a and b and c and d end",
+            None,
+        );
         // Return with and chain and comparison
-        assert_inst_match("local a,b,c,d,e; local function f() return a <= b and c and d and e end", None);
+        assert_inst_match(
+            "local a,b,c,d,e; local function f() return a <= b and c and d and e end",
+            None,
+        );
         // Return with and/or chain
-        assert_inst_match("local a,b,c,d,e; local function f() return a <= b and c and d and e or 1 end", None);
+        assert_inst_match(
+            "local a,b,c,d,e; local function f() return a <= b and c and d and e or 1 end",
+            None,
+        );
         // More complex: and chain ending with false, then or true
         assert_inst_match("local a,b,c,d,e; local function f() return a <= b and c and d and e and false or true end", None);
         // With parameters (matching proto[12] pattern: LE + TEST + TEST + TEST)
-        assert_inst_match("local function f(a,b,c,d,e) return a <= b and c and d and e and false or true end", None);
+        assert_inst_match(
+            "local function f(a,b,c,d,e) return a <= b and c and d and e and false or true end",
+            None,
+        );
         // Matching constructs.lua proto[12]: not (a>=b or c or d and e or nil) with return 0/1
         assert_inst_match("function g(a,b,c,d,e) if not (a>=b or c or d and e or nil) then return 0; else return 1; end end", None);
     }
@@ -1658,10 +1969,19 @@ assert(a == 0)
     #[test]
     fn test_or_band_debug() {
         // Simple or + band: y or -1, then & 0xFFFFFFFF
-        assert_inst_match("local function f(x,y) return (x or -1) & 0xFFFFFFFF end", None);
-        assert_inst_match("local function f(x,y) return (y or -1) & 0xFFFFFFFF end", None);
+        assert_inst_match(
+            "local function f(x,y) return (x or -1) & 0xFFFFFFFF end",
+            None,
+        );
+        assert_inst_match(
+            "local function f(x,y) return (y or -1) & 0xFFFFFFFF end",
+            None,
+        );
         // Both x or -1 and y or -1
-        assert_inst_match("local function f(x,y) return ((x or -1) & (y or -1)) & 0xFFFFFFFF end", None);
+        assert_inst_match(
+            "local function f(x,y) return ((x or -1) & (y or -1)) & 0xFFFFFFFF end",
+            None,
+        );
     }
 
     #[test]
@@ -1672,10 +1992,13 @@ assert(a == 0)
         // but C's codebinexpval compiles right operand first (e2), then left (e1).
         // This causes different register allocation when both operands need temp registers.
         // Minimal reproduction: -1 >> (numbits - 1) where both sides need a register.
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local numbits = 64
 assert(-1 >> (numbits - 1) == 1)
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
@@ -1754,7 +2077,10 @@ end"#,
 
     #[test]
     fn test_goto_in_for_loop() {
-        assert_inst_match("for i = 1, 5 do if i > 3 then goto endloop end end; ::endloop::", None);
+        assert_inst_match(
+            "for i = 1, 5 do if i > 3 then goto endloop end end; ::endloop::",
+            None,
+        );
     }
 
     #[test]
@@ -1835,7 +2161,10 @@ end"#,
     #[test]
     fn test_named_vararg_len_in_if() {
         // VVARGVAR LEN in if condition: if #t > 0
-        assert_inst_match("local function f(...t) if #t > 0 then return 1 end end", None);
+        assert_inst_match(
+            "local function f(...t) if #t > 0 then return 1 end end",
+            None,
+        );
     }
 
     #[test]
@@ -1929,7 +2258,8 @@ end"#,
         // Test: when a local function inside an if block captures a local variable,
         // and there's a for loop inside the if block, the if block should still
         // generate CLOSE instruction
-        let source = "if true then local a = {}; local function f() a.x = true end; for i=1,1 do end end";
+        let source =
+            "if true then local a = {}; local function f() a.x = true end; for i=1,1 do end end";
         assert_inst_match(source, None);
     }
 
@@ -1986,14 +2316,16 @@ end"#,
     #[test]
     fn debug_forstat_close_with_body_upvalue_global_const() {
         // Same but with global <const> *
-        let source = "global <const> *; for i=1,10 do local a = {}; local function f() a.x = true end end";
+        let source =
+            "global <const> *; for i=1,10 do local a = {}; local function f() a.x = true end end";
         assert_inst_match(source, None);
     }
 
     #[test]
     fn test_numeric_for_close() {
         // Numeric for loop with closure capturing outer variable - forstat block needs CLOSE
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local a = {}
 local function additems()
   a.x = true
@@ -2006,14 +2338,17 @@ for i = 1, 10 do
   end
   if st then break end
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
     fn test_numeric_for_inner_generic_for_close() {
         // Numeric for loop containing generic for loop with to-be-closed state
         // The generic for's forstat block has marktobeclosed, which should propagate CLOSE
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local a = {}
 local function additems()
   a.x = true
@@ -2026,12 +2361,15 @@ for i = 1, math.huge do
   end
   if count == 5 then break end
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
     fn test_numeric_for_inner_generic_for_close2() {
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 do
   local a = {}
   local function additems ()
@@ -2049,7 +2387,9 @@ do
     if count == 5 then break end
   end
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
@@ -2155,12 +2495,21 @@ end"#;
         for (i, inst) in rust_proto.code.iter().enumerate() {
             let opcode = opcodes::get_opcode(*inst);
             if opcode == opcodes::OpCode::JMP {
-                let sj_raw = opcodes::getarg(*inst, opcodes::POS_SJ, opcodes::SIZE_BX + opcodes::SIZE_A);
+                let sj_raw =
+                    opcodes::getarg(*inst, opcodes::POS_SJ, opcodes::SIZE_BX + opcodes::SIZE_A);
                 let sj = sj_raw - opcodes::OFFSET_sJ;
                 let target = i as i32 + sj + 1;
-                eprintln!("  PC {:3}: raw={:#010x} JMP sj_raw={} sj={} target={}", i, inst, sj_raw, sj, target);
+                eprintln!(
+                    "  PC {:3}: raw={:#010x} JMP sj_raw={} sj={} target={}",
+                    i, inst, sj_raw, sj, target
+                );
             } else {
-                eprintln!("  PC {:3}: raw={:#010x} {}", i, inst, bytecode_dump::format_instruction(*inst));
+                eprintln!(
+                    "  PC {:3}: raw={:#010x} {}",
+                    i,
+                    inst,
+                    bytecode_dump::format_instruction(*inst)
+                );
             }
         }
 
@@ -2169,12 +2518,21 @@ end"#;
             let raw = bytecode_dump::dump_inst_to_raw(inst);
             let opcode = opcodes::get_opcode(raw);
             if opcode == opcodes::OpCode::JMP {
-                let sj_raw = opcodes::getarg(raw, opcodes::POS_SJ, opcodes::SIZE_BX + opcodes::SIZE_A);
+                let sj_raw =
+                    opcodes::getarg(raw, opcodes::POS_SJ, opcodes::SIZE_BX + opcodes::SIZE_A);
                 let sj = sj_raw - opcodes::OFFSET_sJ;
                 let target = i as i32 + sj + 1;
-                eprintln!("  PC {:3}: raw={:#010x} JMP sj_raw={} sj={} target={}", i, raw, sj_raw, sj, target);
+                eprintln!(
+                    "  PC {:3}: raw={:#010x} JMP sj_raw={} sj={} target={}",
+                    i, raw, sj_raw, sj, target
+                );
             } else {
-                eprintln!("  PC {:3}: raw={:#010x} {}", i, raw, bytecode_dump::format_c_instruction(inst, &c_func.constants));
+                eprintln!(
+                    "  PC {:3}: raw={:#010x} {}",
+                    i,
+                    raw,
+                    bytecode_dump::format_c_instruction(inst, &c_func.constants)
+                );
             }
         }
 
@@ -2480,7 +2838,7 @@ local mz <const> = -1/inf
 local z <const> = 1/inf
 assert(mz == z)
 "#,
-            Some("test_const_div_compare")
+            Some("test_const_div_compare"),
         );
     }
 
@@ -2503,7 +2861,7 @@ local mz <const> = -1/inf
 local z <const> = 1/inf
 assert(mz == z)
 "#,
-            Some("test_ctc_shadowing")
+            Some("test_ctc_shadowing"),
         );
     }
 
@@ -2521,7 +2879,7 @@ local x = -1
 local mz = 0/x
 assert(mz == 0)
 "#,
-            Some("test_int_div_zero_result")
+            Some("test_int_div_zero_result"),
         );
     }
 
@@ -2542,7 +2900,7 @@ x = ~x
 x = x & 8822622750169614806
 return x
 "#,
-            Some("test_band_flip_operand_order")
+            Some("test_band_flip_operand_order"),
         );
     }
 
@@ -2559,24 +2917,30 @@ return x
         // Before fix: Rust generates GETUPVAL twice (one from parse_prefix_exp, one from load_func),
         // causing an extra register to be consumed and CONCAT operands shifted.
         // After fix: Rust generates GETUPVAL once, matching C compiler output.
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local f = error
 local function g(x)
   f("attempt to '" .. x .. "' a value", 4)
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     /// Variant: upvalue call with string concatenation in arguments,
     /// matching the pattern from bwcoercion.lua's trymt function.
     #[test]
     fn test_upvalue_call_concat_args() {
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local err, tp = error, type
 local function trymt(x, y, name)
   err("attempt to '" .. name .. "' a " .. tp(x) .. " with a " .. tp(y), 4)
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     /// Regression test: upvalue indexed by another upvalue must emit
@@ -2593,40 +2957,49 @@ end
         // C order: GETUPVAL key (relocatable) → GETUPVAL table (relocatable)
         //          → GETTABLE (relocatable)
         // Before fix: GETUPVAL table → GETUPVAL key → GETTABLE (wrong order)
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local A = 1
 local a = {}
 local function f()
   return a[A]
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     /// Variant: upvalue indexed by upvalue with the key declared first.
     #[test]
     fn test_upvalue_indexed_by_upvalue_key_first() {
         // Key upvalue declared before table upvalue
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local a = {}
 local A = 1
 local function f()
   return a[A]
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     /// Variant: upvalue indexed by upvalue used in a more complex expression.
     #[test]
     fn test_upvalue_indexed_by_upvalue_in_expr() {
         // From closure.lua line 265: local dummy = function () return a[A] end
-        assert_inst_match(r#"
+        assert_inst_match(
+            r#"
 local A, B = 0, {}
 local function f(x)
   local a = {}
   local dummy = function () return a[A] end
   return dummy()
 end
-"#, None);
+"#,
+            None,
+        );
     }
 
     #[test]
@@ -2634,8 +3007,14 @@ end
         let source = std::fs::read_to_string("tests_lua/events.lua").unwrap();
         let rust_proto = compile_rust(&source, None);
         let c_func = unsafe { compile_c(&source) };
-        fn find_proto<'a>(p: &'a crate::objects::Proto, path: &str, target: &str) -> Option<&'a crate::objects::Proto> {
-            if path == target { return Some(p); }
+        fn find_proto<'a>(
+            p: &'a crate::objects::Proto,
+            path: &str,
+            target: &str,
+        ) -> Option<&'a crate::objects::Proto> {
+            if path == target {
+                return Some(p);
+            }
             for (i, sp) in p.protos.iter().enumerate() {
                 let sub_path = format!("{}/proto[{}]", path, i);
                 if let Some(found) = find_proto(sp, &sub_path, target) {
@@ -2644,16 +3023,29 @@ end
             }
             None
         }
-        let rust_p37 = find_proto(&rust_proto, "main", "main/proto[37]").expect("proto[37] not found");
+        let rust_p37 =
+            find_proto(&rust_proto, "main", "main/proto[37]").expect("proto[37] not found");
         let c_p37 = &c_func.protos[37];
         let mut out = String::new();
         out.push_str("=== proto[37] ===\n");
         out.push_str(&format!("Rust upvalues: {:?}\n", rust_p37.upvalues));
         out.push_str(&format!("C upvalues: {:?}\n", c_p37.upvalues));
-        out.push_str(&format!("Rust num_params: {}, line: {}\n", rust_p37.num_params, rust_p37.line_defined));
-        out.push_str(&format!("C numparams: {}, flag: {}, line: {}\n", c_p37.numparams, c_p37.flag, c_p37.linedefined));
-        out.push_str(&format!("Rust instructions:\n{}\n", bytecode_dump::dump_instructions(&rust_p37.code)));
-        out.push_str(&format!("C instructions:\n{}\n", bytecode_dump::dump_c_instructions(&c_p37.code, &c_p37.constants)));
+        out.push_str(&format!(
+            "Rust num_params: {}, line: {}\n",
+            rust_p37.num_params, rust_p37.line_defined
+        ));
+        out.push_str(&format!(
+            "C numparams: {}, flag: {}, line: {}\n",
+            c_p37.numparams, c_p37.flag, c_p37.linedefined
+        ));
+        out.push_str(&format!(
+            "Rust instructions:\n{}\n",
+            bytecode_dump::dump_instructions(&rust_p37.code)
+        ));
+        out.push_str(&format!(
+            "C instructions:\n{}\n",
+            bytecode_dump::dump_c_instructions(&c_p37.code, &c_p37.constants)
+        ));
         std::fs::write("/tmp/proto37_debug.txt", out).unwrap();
     }
 
@@ -2669,14 +3061,31 @@ end
         let c_func = unsafe { compile_c(source) };
         let mut out = String::new();
         out.push_str("=== sort proto[10] simplified ===\n");
-        out.push_str(&format!("Rust has {} sub-protos\n", rust_proto.protos.len()));
-        out.push_str(&format!("Rust main instructions:\n{}\n", bytecode_dump::dump_instructions(&rust_proto.code)));
+        out.push_str(&format!(
+            "Rust has {} sub-protos\n",
+            rust_proto.protos.len()
+        ));
+        out.push_str(&format!(
+            "Rust main instructions:\n{}\n",
+            bytecode_dump::dump_instructions(&rust_proto.code)
+        ));
         for (i, p) in rust_proto.protos.iter().enumerate() {
-            out.push_str(&format!("Rust proto[{}] instructions:\n{}\n", i, bytecode_dump::dump_instructions(&p.code)));
+            out.push_str(&format!(
+                "Rust proto[{}] instructions:\n{}\n",
+                i,
+                bytecode_dump::dump_instructions(&p.code)
+            ));
         }
-        out.push_str(&format!("C main instructions:\n{}\n", bytecode_dump::dump_c_instructions(&c_func.code, &c_func.constants)));
+        out.push_str(&format!(
+            "C main instructions:\n{}\n",
+            bytecode_dump::dump_c_instructions(&c_func.code, &c_func.constants)
+        ));
         for (i, p) in c_func.protos.iter().enumerate() {
-            out.push_str(&format!("C proto[{}] instructions:\n{}\n", i, bytecode_dump::dump_c_instructions(&p.code, &p.constants)));
+            out.push_str(&format!(
+                "C proto[{}] instructions:\n{}\n",
+                i,
+                bytecode_dump::dump_c_instructions(&p.code, &p.constants)
+            ));
         }
         std::fs::write("/tmp/sort_debug.txt", out).unwrap();
     }
@@ -2699,5 +3108,4 @@ end
         let source = "local debug = 1\nfunction f() global collectgarbage; collectgarbage(); return debug end\n";
         assert_inst_match(source, None);
     }
-
 }

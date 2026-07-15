@@ -12,7 +12,8 @@ pub type lua_Unsigned = u64;
 pub type lua_KContext = isize;
 pub type lua_KFunction =
     unsafe extern "C" fn(L: *mut lua_State, status: c_int, ctx: lua_KContext) -> c_int;
-pub type lua_Writer = unsafe extern "C" fn(L: *mut lua_State, p: *const c_void, sz: usize, ud: *mut c_void) -> c_int;
+pub type lua_Writer =
+    unsafe extern "C" fn(L: *mut lua_State, p: *const c_void, sz: usize, ud: *mut c_void) -> c_int;
 
 pub const LUA_OK: c_int = 0;
 pub const LUA_ERRRUN: c_int = 2;
@@ -49,20 +50,12 @@ extern "C" {
 
     pub fn lua_toboolean(L: *mut lua_State, idx: c_int) -> c_int;
     pub fn lua_tointegerx(L: *mut lua_State, idx: c_int, isnum: *mut c_int) -> lua_Integer;
-    pub fn lua_tolstring(
-        L: *mut lua_State,
-        idx: c_int,
-        len: *mut usize,
-    ) -> *const c_char;
+    pub fn lua_tolstring(L: *mut lua_State, idx: c_int, len: *mut usize) -> *const c_char;
     pub fn lua_touserdata(L: *mut lua_State, idx: c_int) -> *mut c_void;
 
     pub fn lua_pushnil(L: *mut lua_State);
     pub fn lua_pushinteger(L: *mut lua_State, n: lua_Integer);
-    pub fn lua_pushlstring(
-        L: *mut lua_State,
-        s: *const c_char,
-        len: usize,
-    ) -> *const c_char;
+    pub fn lua_pushlstring(L: *mut lua_State, s: *const c_char, len: usize) -> *const c_char;
     pub fn lua_pushstring(L: *mut lua_State, s: *const c_char) -> *const c_char;
     pub fn lua_pushfstring(L: *mut lua_State, fmt: *const c_char, ...) -> *const c_char;
     pub fn lua_pushcclosure(L: *mut lua_State, f: lua_CFunction, n: c_int);
@@ -89,7 +82,12 @@ extern "C" {
 
     pub fn lua_gc(L: *mut lua_State, what: c_int, ...) -> c_int;
 
-    pub fn lua_sethook(L: *mut lua_State, func: Option<lua_Hook>, mask: c_int, count: c_int) -> c_int;
+    pub fn lua_sethook(
+        L: *mut lua_State,
+        func: Option<lua_Hook>,
+        mask: c_int,
+        count: c_int,
+    ) -> c_int;
 
     pub fn lua_warning(L: *mut lua_State, msg: *const c_char, tocont: c_int);
 
@@ -100,11 +98,7 @@ extern "C" {
         strip: c_int,
     ) -> c_int;
 
-    pub fn luaL_loadfilex(
-        L: *mut lua_State,
-        fname: *const c_char,
-        mode: *const c_char,
-    ) -> c_int;
+    pub fn luaL_loadfilex(L: *mut lua_State, fname: *const c_char, mode: *const c_char) -> c_int;
     pub fn luaL_loadbufferx(
         L: *mut lua_State,
         buff: *const c_char,
@@ -114,17 +108,8 @@ extern "C" {
     ) -> c_int;
     pub fn luaL_openselectedlibs(L: *mut lua_State, load: c_int, preload: c_int);
     pub fn luaL_callmeta(L: *mut lua_State, obj: c_int, e: *const c_char) -> c_int;
-    pub fn luaL_tolstring(
-        L: *mut lua_State,
-        idx: c_int,
-        len: *mut usize,
-    ) -> *const c_char;
-    pub fn luaL_traceback(
-        L: *mut lua_State,
-        L1: *mut lua_State,
-        msg: *const c_char,
-        level: c_int,
-    );
+    pub fn luaL_tolstring(L: *mut lua_State, idx: c_int, len: *mut usize) -> *const c_char;
+    pub fn luaL_traceback(L: *mut lua_State, L1: *mut lua_State, msg: *const c_char, level: c_int);
     pub fn luaL_len(L: *mut lua_State, idx: c_int) -> lua_Integer;
     pub fn luaL_checkstack(L: *mut lua_State, sz: c_int, msg: *const c_char);
     pub fn luaL_error(L: *mut lua_State, fmt: *const c_char, ...) -> !;
@@ -164,15 +149,14 @@ pub unsafe fn luaL_loadbuffer(
     luaL_loadbufferx(L, buff, sz, name, ptr::null())
 }
 
-pub unsafe fn lua_pcall(
-    L: *mut lua_State,
-    nargs: c_int,
-    nresults: c_int,
-    errfunc: c_int,
-) -> c_int {
+pub unsafe fn lua_pcall(L: *mut lua_State, nargs: c_int, nresults: c_int, errfunc: c_int) -> c_int {
     lua_pcallk(L, nargs, nresults, errfunc, 0, ptr::null())
 }
 
 pub unsafe fn luaL_checkversion(L: *mut lua_State) {
-    luaL_checkversion_(L, 505.0, std::mem::size_of::<lua_Integer>() * 16 + std::mem::size_of::<lua_Number>());
+    luaL_checkversion_(
+        L,
+        505.0,
+        std::mem::size_of::<lua_Integer>() * 16 + std::mem::size_of::<lua_Number>(),
+    );
 }

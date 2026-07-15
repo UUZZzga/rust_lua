@@ -29,7 +29,12 @@ struct SharedWriter {
 impl SharedWriter {
     fn new() -> (Self, Arc<Mutex<Vec<u8>>>) {
         let buffer = Arc::new(Mutex::new(Vec::new()));
-        (Self { buffer: buffer.clone() }, buffer)
+        (
+            Self {
+                buffer: buffer.clone(),
+            },
+            buffer,
+        )
     }
 }
 
@@ -434,9 +439,8 @@ fn test_error_string() {
 
 #[test]
 fn test_error_with_pcall() {
-    let output = run_lua_expr(
-        "local ok, err = pcall(function() error('test') end); print(ok, err)"
-    );
+    let output =
+        run_lua_expr("local ok, err = pcall(function() error('test') end); print(ok, err)");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("false"));
@@ -659,7 +663,7 @@ fn test_rawset_returns_table() {
 #[test]
 fn test_rawget_does_not_use_metamethod() {
     let output = run_lua_expr(
-        "local t = setmetatable({}, {__index = function() return 99 end}); print(rawget(t, 1))"
+        "local t = setmetatable({}, {__index = function() return 99 end}); print(rawget(t, 1))",
     );
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -684,7 +688,7 @@ fn test_ipairs_basic() {
 #[test]
 fn test_ipairs_empty_table() {
     let output = run_lua_expr(
-        "local count = 0; for i, v in ipairs({}) do count = count + 1 end; print(count)"
+        "local count = 0; for i, v in ipairs({}) do count = count + 1 end; print(count)",
     );
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -734,9 +738,7 @@ fn test_pairs_array() {
 
 #[test]
 fn test_xpcall_success() {
-    let output = run_lua_expr(
-        "print(xpcall(function() return 42 end, function(e) return e end))"
-    );
+    let output = run_lua_expr("print(xpcall(function() return 42 end, function(e) return e end))");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("true"));
@@ -809,12 +811,18 @@ fn test_unit_b_str2int() {
 
 #[test]
 fn test_unit_base_type_name() {
-    assert_eq!(base_lib::base_type_name(&TValue::Nil(NilKind::Strict)), "nil");
+    assert_eq!(
+        base_lib::base_type_name(&TValue::Nil(NilKind::Strict)),
+        "nil"
+    );
     assert_eq!(base_lib::base_type_name(&TValue::Boolean(true)), "boolean");
     assert_eq!(base_lib::base_type_name(&TValue::Integer(42)), "number");
     assert_eq!(base_lib::base_type_name(&TValue::Float(3.14)), "number");
     assert_eq!(base_lib::base_type_name(&make_str("hello")), "string");
-    assert_eq!(base_lib::base_type_name(&TValue::Table(Table::new())), "table");
+    assert_eq!(
+        base_lib::base_type_name(&TValue::Table(Table::new())),
+        "table"
+    );
 }
 
 #[test]
@@ -840,7 +848,10 @@ fn test_unit_base_tonumber() {
 
 #[test]
 fn test_unit_base_tostring() {
-    assert_eq!(base_lib::base_tostring(&TValue::Nil(NilKind::Strict)), "nil");
+    assert_eq!(
+        base_lib::base_tostring(&TValue::Nil(NilKind::Strict)),
+        "nil"
+    );
     assert_eq!(base_lib::base_tostring(&TValue::Boolean(true)), "true");
     assert_eq!(base_lib::base_tostring(&TValue::Integer(42)), "42");
     assert_eq!(base_lib::base_tostring(&make_str("hello")), "hello");
@@ -850,10 +861,22 @@ fn test_unit_base_tostring() {
 
 #[test]
 fn test_unit_base_rawequal() {
-    assert!(base_lib::base_rawequal(&TValue::Nil(NilKind::Strict), &TValue::Nil(NilKind::Empty)));
-    assert!(base_lib::base_rawequal(&TValue::Integer(42), &TValue::Integer(42)));
-    assert!(!base_lib::base_rawequal(&TValue::Integer(42), &TValue::Integer(43)));
-    assert!(base_lib::base_rawequal(&TValue::Integer(42), &TValue::Float(42.0)));
+    assert!(base_lib::base_rawequal(
+        &TValue::Nil(NilKind::Strict),
+        &TValue::Nil(NilKind::Empty)
+    ));
+    assert!(base_lib::base_rawequal(
+        &TValue::Integer(42),
+        &TValue::Integer(42)
+    ));
+    assert!(!base_lib::base_rawequal(
+        &TValue::Integer(42),
+        &TValue::Integer(43)
+    ));
+    assert!(base_lib::base_rawequal(
+        &TValue::Integer(42),
+        &TValue::Float(42.0)
+    ));
     assert!(base_lib::base_rawequal(&make_str("a"), &make_str("a")));
     assert!(!base_lib::base_rawequal(&make_str("a"), &make_str("b")));
 }
@@ -917,18 +940,33 @@ fn test_unit_open_base_lib() {
     base_lib::open_base_lib(&mut state);
 
     // 验证原有函数
-    for name in &["print", "setmetatable", "getmetatable", "type", "pcall", "error"] {
+    for name in &[
+        "print",
+        "setmetatable",
+        "getmetatable",
+        "type",
+        "pcall",
+        "error",
+    ] {
         let key = TValue::Str(state.intern_str(name));
-        assert!(state.globals.get(&key).is_some(), "{} must be registered", name);
+        assert!(
+            state.globals.get(&key).is_some(),
+            "{} must be registered",
+            name
+        );
     }
 
     // 验证新增函数
     for name in &[
-        "tonumber", "tostring", "assert", "select", "rawequal", "rawlen",
-        "rawget", "rawset", "next", "ipairs", "pairs", "xpcall", "warn",
+        "tonumber", "tostring", "assert", "select", "rawequal", "rawlen", "rawget", "rawset",
+        "next", "ipairs", "pairs", "xpcall", "warn",
     ] {
         let key = TValue::Str(state.intern_str(name));
-        assert!(state.globals.get(&key).is_some(), "{} must be registered", name);
+        assert!(
+            state.globals.get(&key).is_some(),
+            "{} must be registered",
+            name
+        );
     }
 
     // 验证 _G 和 _VERSION
@@ -947,7 +985,9 @@ fn test_unit_open_base_lib() {
 fn test_unit_call_type() {
     let mut state = LuaState::new();
     state.stack.clear();
-    state.stack.push(TValue::LightUserData(base_lib::BASE_TYPE as *mut std::ffi::c_void));
+    state.stack.push(TValue::LightUserData(
+        base_lib::BASE_TYPE as *mut std::ffi::c_void,
+    ));
     state.stack.push(TValue::Integer(42));
     base_lib::call_base_function(base_lib::BASE_TYPE, &mut state, 0, 1, 1).unwrap();
     match &state.stack[0] {
@@ -960,7 +1000,9 @@ fn test_unit_call_type() {
 fn test_unit_call_tonumber() {
     let mut state = LuaState::new();
     state.stack.clear();
-    state.stack.push(TValue::LightUserData(base_lib::BASE_TONUMBER as *mut std::ffi::c_void));
+    state.stack.push(TValue::LightUserData(
+        base_lib::BASE_TONUMBER as *mut std::ffi::c_void,
+    ));
     state.stack.push(TValue::Str(state.intern_str("42")));
     base_lib::call_base_function(base_lib::BASE_TONUMBER, &mut state, 0, 1, 1).unwrap();
     match &state.stack[0] {
@@ -973,7 +1015,9 @@ fn test_unit_call_tonumber() {
 fn test_unit_call_tostring() {
     let mut state = LuaState::new();
     state.stack.clear();
-    state.stack.push(TValue::LightUserData(base_lib::BASE_TOSTRING as *mut std::ffi::c_void));
+    state.stack.push(TValue::LightUserData(
+        base_lib::BASE_TOSTRING as *mut std::ffi::c_void,
+    ));
     state.stack.push(TValue::Integer(42));
     base_lib::call_base_function(base_lib::BASE_TOSTRING, &mut state, 0, 1, 1).unwrap();
     match &state.stack[0] {
@@ -986,7 +1030,9 @@ fn test_unit_call_tostring() {
 fn test_unit_call_rawequal() {
     let mut state = LuaState::new();
     state.stack.clear();
-    state.stack.push(TValue::LightUserData(base_lib::BASE_RAWEQUAL as *mut std::ffi::c_void));
+    state.stack.push(TValue::LightUserData(
+        base_lib::BASE_RAWEQUAL as *mut std::ffi::c_void,
+    ));
     state.stack.push(TValue::Integer(42));
     state.stack.push(TValue::Integer(42));
     base_lib::call_base_function(base_lib::BASE_RAWEQUAL, &mut state, 0, 2, 1).unwrap();
@@ -1000,7 +1046,9 @@ fn test_unit_call_rawequal() {
 fn test_unit_call_rawlen() {
     let mut state = LuaState::new();
     state.stack.clear();
-    state.stack.push(TValue::LightUserData(base_lib::BASE_RAWLEN as *mut std::ffi::c_void));
+    state.stack.push(TValue::LightUserData(
+        base_lib::BASE_RAWLEN as *mut std::ffi::c_void,
+    ));
     state.stack.push(TValue::Str(state.intern_str("hello")));
     base_lib::call_base_function(base_lib::BASE_RAWLEN, &mut state, 0, 1, 1).unwrap();
     match &state.stack[0] {
@@ -1015,7 +1063,9 @@ fn test_unit_call_rawget() {
     state.stack.clear();
     let mut t = Table::new();
     t.set(TValue::Integer(1), TValue::Integer(100));
-    state.stack.push(TValue::LightUserData(base_lib::BASE_RAWGET as *mut std::ffi::c_void));
+    state.stack.push(TValue::LightUserData(
+        base_lib::BASE_RAWGET as *mut std::ffi::c_void,
+    ));
     state.stack.push(TValue::Table(t));
     state.stack.push(TValue::Integer(1));
     base_lib::call_base_function(base_lib::BASE_RAWGET, &mut state, 0, 2, 1).unwrap();
@@ -1030,7 +1080,9 @@ fn test_unit_call_rawset() {
     let mut state = LuaState::new();
     state.stack.clear();
     let t = Table::new();
-    state.stack.push(TValue::LightUserData(base_lib::BASE_RAWSET as *mut std::ffi::c_void));
+    state.stack.push(TValue::LightUserData(
+        base_lib::BASE_RAWSET as *mut std::ffi::c_void,
+    ));
     state.stack.push(TValue::Table(t));
     state.stack.push(TValue::Integer(1));
     state.stack.push(TValue::Integer(999));
@@ -1048,7 +1100,9 @@ fn test_unit_call_rawset() {
 fn test_unit_call_select_hash() {
     let mut state = LuaState::new();
     state.stack.clear();
-    state.stack.push(TValue::LightUserData(base_lib::BASE_SELECT as *mut std::ffi::c_void));
+    state.stack.push(TValue::LightUserData(
+        base_lib::BASE_SELECT as *mut std::ffi::c_void,
+    ));
     state.stack.push(TValue::Str(state.intern_str("#")));
     state.stack.push(TValue::Integer(1));
     state.stack.push(TValue::Integer(2));
@@ -1064,7 +1118,9 @@ fn test_unit_call_select_hash() {
 fn test_unit_call_assert_true() {
     let mut state = LuaState::new();
     state.stack.clear();
-    state.stack.push(TValue::LightUserData(base_lib::BASE_ASSERT as *mut std::ffi::c_void));
+    state.stack.push(TValue::LightUserData(
+        base_lib::BASE_ASSERT as *mut std::ffi::c_void,
+    ));
     state.stack.push(TValue::Boolean(true));
     base_lib::call_base_function(base_lib::BASE_ASSERT, &mut state, 0, 1, -1).unwrap();
     match &state.stack[0] {
@@ -1077,7 +1133,9 @@ fn test_unit_call_assert_true() {
 fn test_unit_call_assert_false() {
     let mut state = LuaState::new();
     state.stack.clear();
-    state.stack.push(TValue::LightUserData(base_lib::BASE_ASSERT as *mut std::ffi::c_void));
+    state.stack.push(TValue::LightUserData(
+        base_lib::BASE_ASSERT as *mut std::ffi::c_void,
+    ));
     state.stack.push(TValue::Boolean(false));
     let result = base_lib::call_base_function(base_lib::BASE_ASSERT, &mut state, 0, 1, -1);
     assert!(result.is_err());
@@ -1087,8 +1145,12 @@ fn test_unit_call_assert_false() {
 fn test_unit_call_error() {
     let mut state = LuaState::new();
     state.stack.clear();
-    state.stack.push(TValue::LightUserData(base_lib::BASE_ERROR as *mut std::ffi::c_void));
-    state.stack.push(TValue::Str(state.intern_str("test error")));
+    state.stack.push(TValue::LightUserData(
+        base_lib::BASE_ERROR as *mut std::ffi::c_void,
+    ));
+    state
+        .stack
+        .push(TValue::Str(state.intern_str("test error")));
     let result = base_lib::call_base_function(base_lib::BASE_ERROR, &mut state, 0, 1, 0);
     assert!(result.is_err());
     match result {
@@ -1103,7 +1165,9 @@ fn test_unit_call_setmetatable() {
     state.stack.clear();
     let t = Table::new();
     let mt = Table::new();
-    state.stack.push(TValue::LightUserData(base_lib::BASE_SETMETATABLE as *mut std::ffi::c_void));
+    state.stack.push(TValue::LightUserData(
+        base_lib::BASE_SETMETATABLE as *mut std::ffi::c_void,
+    ));
     state.stack.push(TValue::Table(t));
     state.stack.push(TValue::Table(mt));
     base_lib::call_base_function(base_lib::BASE_SETMETATABLE, &mut state, 0, 2, 1).unwrap();
@@ -1119,7 +1183,9 @@ fn test_unit_call_getmetatable() {
     state.stack.clear();
     let mut t = Table::new();
     t.data.borrow_mut().metatable = Some(Box::new(Table::new()));
-    state.stack.push(TValue::LightUserData(base_lib::BASE_GETMETATABLE as *mut std::ffi::c_void));
+    state.stack.push(TValue::LightUserData(
+        base_lib::BASE_GETMETATABLE as *mut std::ffi::c_void,
+    ));
     state.stack.push(TValue::Table(t));
     base_lib::call_base_function(base_lib::BASE_GETMETATABLE, &mut state, 0, 1, 1).unwrap();
     match &state.stack[0] {
@@ -1133,7 +1199,9 @@ fn test_unit_call_getmetatable_no_mt() {
     let mut state = LuaState::new();
     state.stack.clear();
     let t = Table::new();
-    state.stack.push(TValue::LightUserData(base_lib::BASE_GETMETATABLE as *mut std::ffi::c_void));
+    state.stack.push(TValue::LightUserData(
+        base_lib::BASE_GETMETATABLE as *mut std::ffi::c_void,
+    ));
     state.stack.push(TValue::Table(t));
     base_lib::call_base_function(base_lib::BASE_GETMETATABLE, &mut state, 0, 1, 1).unwrap();
     match &state.stack[0] {
@@ -1149,7 +1217,9 @@ fn test_unit_call_ipairs() {
     let mut t = Table::new();
     t.set(TValue::Integer(1), TValue::Integer(10));
     t.set(TValue::Integer(2), TValue::Integer(20));
-    state.stack.push(TValue::LightUserData(base_lib::BASE_IPAIRS as *mut std::ffi::c_void));
+    state.stack.push(TValue::LightUserData(
+        base_lib::BASE_IPAIRS as *mut std::ffi::c_void,
+    ));
     state.stack.push(TValue::Table(t));
     base_lib::call_base_function(base_lib::BASE_IPAIRS, &mut state, 0, 1, 3).unwrap();
     assert_eq!(state.stack.len(), 3);
@@ -1171,7 +1241,9 @@ fn test_unit_call_pairs() {
     let mut state = LuaState::new();
     state.stack.clear();
     let t = Table::new();
-    state.stack.push(TValue::LightUserData(base_lib::BASE_PAIRS as *mut std::ffi::c_void));
+    state.stack.push(TValue::LightUserData(
+        base_lib::BASE_PAIRS as *mut std::ffi::c_void,
+    ));
     state.stack.push(TValue::Table(t));
     base_lib::call_base_function(base_lib::BASE_PAIRS, &mut state, 0, 1, 3).unwrap();
     assert_eq!(state.stack.len(), 3);
@@ -1192,7 +1264,9 @@ fn test_unit_call_ipairs_aux() {
     let mut t = Table::new();
     t.set(TValue::Integer(1), TValue::Integer(10));
     t.set(TValue::Integer(2), TValue::Integer(20));
-    state.stack.push(TValue::LightUserData(base_lib::BASE_IPAIRS as *mut std::ffi::c_void));
+    state.stack.push(TValue::LightUserData(
+        base_lib::BASE_IPAIRS as *mut std::ffi::c_void,
+    ));
     state.stack.push(TValue::Table(t));
     state.stack.push(TValue::Integer(0));
     base_lib::call_ipairs_aux(&mut state, 0, 2, -1).unwrap();
@@ -1221,7 +1295,7 @@ fn test_unit_call_unknown_tag() {
 #[test]
 fn test_metatable_index() {
     let output = run_lua_expr(
-        "local t = setmetatable({}, {__index = function() return 42 end}); print(t.missing)"
+        "local t = setmetatable({}, {__index = function() return 42 end}); print(t.missing)",
     );
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1241,9 +1315,8 @@ fn test_nested_pcall() {
 
 #[test]
 fn test_type_in_pcall() {
-    let output = run_lua_expr(
-        "local ok, result = pcall(function() return type({}) end); print(ok, result)"
-    );
+    let output =
+        run_lua_expr("local ok, result = pcall(function() return type({}) end); print(ok, result)");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("true"));
@@ -1263,9 +1336,8 @@ fn test_chained_operations() {
 
 #[test]
 fn test_select_with_vararg() {
-    let output = run_lua_expr(
-        "local function f(...) return select('#', ...) end; print(f(1, 2, 3, 4, 5))"
-    );
+    let output =
+        run_lua_expr("local function f(...) return select('#', ...) end; print(f(1, 2, 3, 4, 5))");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("5"));
@@ -1273,9 +1345,7 @@ fn test_select_with_vararg() {
 
 #[test]
 fn test_assert_returns_value() {
-    let output = run_lua_expr(
-        "local v = assert(42); print(v)"
-    );
+    let output = run_lua_expr("local v = assert(42); print(v)");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("42"));
@@ -1283,9 +1353,7 @@ fn test_assert_returns_value() {
 
 #[test]
 fn test_tostring_table() {
-    let output = run_lua_expr(
-        "print(type(tostring({})))"
-    );
+    let output = run_lua_expr("print(type(tostring({})))");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("string"));

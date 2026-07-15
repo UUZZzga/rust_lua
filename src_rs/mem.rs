@@ -276,11 +276,7 @@ impl<'a, A: Allocator> MemState<'a, A> {
     // Vector 缩容 — 对应 luaM_shrinkvector_
     // ========================================================================
 
-    pub fn shrink_vec<T>(
-        &mut self,
-        v: Vec<T>,
-        final_n: usize,
-    ) -> Result<Vec<T>, MemError> {
+    pub fn shrink_vec<T>(&mut self, v: Vec<T>, final_n: usize) -> Result<Vec<T>, MemError> {
         let old_cap = v.capacity();
         let old_size_bytes = old_cap * mem::size_of::<T>();
         let new_size_bytes = final_n * mem::size_of::<T>();

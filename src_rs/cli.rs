@@ -68,7 +68,10 @@ impl Interpreter {
 
     fn report(&mut self, status: i32) -> i32 {
         if status != 0 {
-            let msg = self.l.to_string(-1).unwrap_or_else(|| "(error message not a string)".to_string());
+            let msg = self
+                .l
+                .to_string(-1)
+                .unwrap_or_else(|| "(error message not a string)".to_string());
             let _ = write!(self.stderr, "{}: {}\n", self.progname, msg);
             self.l.pop(1);
         }
@@ -138,15 +141,18 @@ impl Interpreter {
                                 // 返回 main chunk 的 currentline = error(m) 的行号
                                 if let Some(mc) = &main_closure {
                                     constructed_ci.push(crate::state::CallInfoEntry {
-                                        source: mc.proto.source.as_ref()
+                                        source: mc
+                                            .proto
+                                            .source
+                                            .as_ref()
                                             .map(|s| s.as_str().to_string())
                                             .unwrap_or_else(|| "=?".to_string()),
                                         line: -1,
                                         name: String::new(),
-                                        is_c: true,  // C 调用者
+                                        is_c: true, // C 调用者
                                         closure: Some(mc.clone()),
                                         base: 0,
-                                        saved_pc: error_pc,  // error(m) 的 pc
+                                        saved_pc: error_pc, // error(m) 的 pc
                                         namewhat: String::new(),
                                         proto_flag: mc.proto.flag,
                                         nextraargs: 0,
@@ -378,16 +384,16 @@ impl Interpreter {
     fn check_local(&mut self, line: &str) {
         let trimmed = line.trim_start_matches(&[' ', '\t']);
         if trimmed.starts_with("local ") {
-            self.writestring_error("warning: locals do not survive across lines in interactive mode\n");
+            self.writestring_error(
+                "warning: locals do not survive across lines in interactive mode\n",
+            );
         }
     }
 
     fn incomplete(&self, status: i32) -> bool {
         if status == ERR_SYNTAX {
             if let Some(msg) = self.l.to_string(-1) {
-                if msg.len() >= EOFMARK.len()
-                    && &msg[msg.len() - EOFMARK.len()..] == EOFMARK
-                {
+                if msg.len() >= EOFMARK.len() && &msg[msg.len() - EOFMARK.len()..] == EOFMARK {
                     return true;
                 }
             }
@@ -427,9 +433,7 @@ impl Interpreter {
             _ => self.l.to_string(-1),
         };
         self.l.pop(1);
-        result.unwrap_or_else(|| {
-            (if firstline { LUA_PROMPT } else { LUA_PROMPT2 }).to_string()
-        })
+        result.unwrap_or_else(|| (if firstline { LUA_PROMPT } else { LUA_PROMPT2 }).to_string())
     }
 
     fn pushline(&mut self, firstline: bool) -> bool {
@@ -470,10 +474,10 @@ impl Interpreter {
             }
             // 栈：[current(位置1), 错误消息, 新行]
             let new_line = self.l.to_string(-1).unwrap_or_default();
-            self.l.pop(2);  // 移除新行和错误消息
-            // 栈：[current]
+            self.l.pop(2); // 移除新行和错误消息
+                           // 栈：[current]
             current = format!("{}\n{}", current, new_line);
-            self.l.pop(1);  // 移除旧 current
+            self.l.pop(1); // 移除旧 current
             self.l.push_string(&current);
             // 栈：[current]
         }
@@ -502,7 +506,10 @@ impl Interpreter {
             self.l.get_global("print");
             self.l.rotate(1, 1);
             if self.l.pcall(n, 0, 0) != 0 {
-                let err_msg = self.l.to_string(-1).unwrap_or_else(|| "(error)".to_string());
+                let err_msg = self
+                    .l
+                    .to_string(-1)
+                    .unwrap_or_else(|| "(error)".to_string());
                 let _ = write!(
                     self.stderr,
                     "{}: error calling 'print' ({})\n",
@@ -578,9 +585,7 @@ impl Interpreter {
                     args |= HAS_E;
                     if bytes.get(2).is_none() || bytes.get(2) == Some(&b'\0') {
                         i += 1;
-                        if i >= argv.len()
-                            || argv[i].as_bytes().first() == Some(&b'-')
-                        {
+                        if i >= argv.len() || argv[i].as_bytes().first() == Some(&b'-') {
                             return HAS_ERROR;
                         }
                     }
@@ -588,9 +593,7 @@ impl Interpreter {
                 Some(b'l') => {
                     if bytes.get(2).is_none() || bytes.get(2) == Some(&b'\0') {
                         i += 1;
-                        if i >= argv.len()
-                            || argv[i].as_bytes().first() == Some(&b'-')
-                        {
+                        if i >= argv.len() || argv[i].as_bytes().first() == Some(&b'-') {
                             return HAS_ERROR;
                         }
                     }
@@ -639,11 +642,7 @@ impl Interpreter {
 
         let mut script: isize = 0;
         let args = Self::collect_args(argv, &mut script);
-        let optlim = if script > 0 {
-            script as usize
-        } else {
-            argc
-        };
+        let optlim = if script > 0 { script as usize } else { argc };
 
         if args & HAS_ERROR != 0 {
             let bad_idx = script as usize;
@@ -687,8 +686,7 @@ impl Interpreter {
         }
 
         if script > 0 {
-            let after_dash =
-                script > 1 && argv[script as usize - 1] == "--";
+            let after_dash = script > 1 && argv[script as usize - 1] == "--";
             if self.handle_script(argv, script, after_dash) != 0 {
                 return false;
             }
@@ -740,10 +738,19 @@ pub fn main() {
     if std::env::var("LUA_DEBUG_SIZES").is_ok() {
         eprintln!("TValue: {}", std::mem::size_of::<crate::objects::TValue>());
         eprintln!("Table: {}", std::mem::size_of::<crate::objects::Table>());
-        eprintln!("LClosure: {}", std::mem::size_of::<crate::objects::LClosure>());
-        eprintln!("LuaString: {}", std::mem::size_of::<crate::strings::LuaString>());
+        eprintln!(
+            "LClosure: {}",
+            std::mem::size_of::<crate::objects::LClosure>()
+        );
+        eprintln!(
+            "LuaString: {}",
+            std::mem::size_of::<crate::strings::LuaString>()
+        );
         eprintln!("Proto: {}", std::mem::size_of::<crate::objects::Proto>());
-        eprintln!("LuaThread: {}", std::mem::size_of::<crate::objects::LuaThread>());
+        eprintln!(
+            "LuaThread: {}",
+            std::mem::size_of::<crate::objects::LuaThread>()
+        );
     }
     let args: Vec<String> = std::env::args().collect();
 

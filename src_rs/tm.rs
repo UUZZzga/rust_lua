@@ -15,11 +15,11 @@ use std::fmt;
 
 use bitflags::bitflags;
 
-use crate::debug::{concaterror, ordererror, opinterror, tointerror};
+use crate::debug::{concaterror, opinterror, ordererror, tointerror};
 use crate::execute::VmError;
-use crate::objects::{Instruction, NilKind, TValue, Table, LuaType};
-use crate::strings::{LuaString, ShortString, rust_hash};
+use crate::objects::{Instruction, LuaType, NilKind, TValue, Table};
 use crate::state::LuaState;
+use crate::strings::{rust_hash, LuaString, ShortString};
 
 // ============================================================================
 // get_mmbin_tm — 从 MM 系列指令中提取元方法事件索引
@@ -110,18 +110,30 @@ impl TagMethod {
 
     pub fn from_u8(n: u8) -> Option<Self> {
         match n {
-            0 => Some(TagMethod::Index), 1 => Some(TagMethod::NewIndex),
-            2 => Some(TagMethod::Gc), 3 => Some(TagMethod::Mode),
-            4 => Some(TagMethod::Len), 5 => Some(TagMethod::Eq),
-            6 => Some(TagMethod::Add), 7 => Some(TagMethod::Sub),
-            8 => Some(TagMethod::Mul), 9 => Some(TagMethod::Mod),
-            10 => Some(TagMethod::Pow), 11 => Some(TagMethod::Div),
-            12 => Some(TagMethod::IDiv), 13 => Some(TagMethod::BAnd),
-            14 => Some(TagMethod::BOr), 15 => Some(TagMethod::BXor),
-            16 => Some(TagMethod::Shl), 17 => Some(TagMethod::Shr),
-            18 => Some(TagMethod::Unm), 19 => Some(TagMethod::BNot),
-            20 => Some(TagMethod::Lt), 21 => Some(TagMethod::Le),
-            22 => Some(TagMethod::Concat), 23 => Some(TagMethod::Call),
+            0 => Some(TagMethod::Index),
+            1 => Some(TagMethod::NewIndex),
+            2 => Some(TagMethod::Gc),
+            3 => Some(TagMethod::Mode),
+            4 => Some(TagMethod::Len),
+            5 => Some(TagMethod::Eq),
+            6 => Some(TagMethod::Add),
+            7 => Some(TagMethod::Sub),
+            8 => Some(TagMethod::Mul),
+            9 => Some(TagMethod::Mod),
+            10 => Some(TagMethod::Pow),
+            11 => Some(TagMethod::Div),
+            12 => Some(TagMethod::IDiv),
+            13 => Some(TagMethod::BAnd),
+            14 => Some(TagMethod::BOr),
+            15 => Some(TagMethod::BXor),
+            16 => Some(TagMethod::Shl),
+            17 => Some(TagMethod::Shr),
+            18 => Some(TagMethod::Unm),
+            19 => Some(TagMethod::BNot),
+            20 => Some(TagMethod::Lt),
+            21 => Some(TagMethod::Le),
+            22 => Some(TagMethod::Concat),
+            23 => Some(TagMethod::Call),
             24 => Some(TagMethod::Close),
             _ => None,
         }
@@ -176,16 +188,24 @@ pub struct Metatable {
 
 impl Metatable {
     pub fn new(table: Table) -> Self {
-        Metatable { table, flags: MetatableFlags::empty() }
+        Metatable {
+            table,
+            flags: MetatableFlags::empty(),
+        }
     }
 
     pub fn empty() -> Self {
-        Metatable { table: Table::new(), flags: MetatableFlags::empty() }
+        Metatable {
+            table: Table::new(),
+            flags: MetatableFlags::empty(),
+        }
     }
 
     pub fn get_tm(&mut self, tm: TagMethod) -> Option<TValue> {
         if let Some(flag) = MetatableFlags::from_tag_method(tm) {
-            if self.flags.contains(flag) { return None; }
+            if self.flags.contains(flag) {
+                return None;
+            }
         }
         let key = make_tm_tvalue(tm);
         // C: luaT_gettm — ttisnil 检查，nil 值（含 Empty tombstone）视为无元方法
@@ -242,7 +262,9 @@ impl DefaultMetatables {
 }
 
 impl Default for DefaultMetatables {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ============================================================================
@@ -250,8 +272,8 @@ impl Default for DefaultMetatables {
 // ============================================================================
 
 const TYPE_NAMES: [&str; 11] = [
-    "no value", "nil", "boolean", "userdata", "number",
-    "string", "table", "function", "userdata", "thread", "upvalue",
+    "no value", "nil", "boolean", "userdata", "number", "string", "table", "function", "userdata",
+    "thread", "upvalue",
 ];
 
 pub fn type_name(ty: LuaType) -> &'static str {
@@ -311,20 +333,41 @@ pub fn get_tm_by_obj(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TagMethodError {
     NoMetamethod(TagMethod),
-    TypeError { expected: String, got: String },
-    OrderError { left: String, right: String },
-    ConcatError { left: String, right: String },
-    OpError { op: String, left: String, right: String },
+    TypeError {
+        expected: String,
+        got: String,
+    },
+    OrderError {
+        left: String,
+        right: String,
+    },
+    ConcatError {
+        left: String,
+        right: String,
+    },
+    OpError {
+        op: String,
+        left: String,
+        right: String,
+    },
 }
 
 impl fmt::Display for TagMethodError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TagMethodError::NoMetamethod(tm) => write!(f, "no metamethod '{}' found", tm.name()),
-            TagMethodError::TypeError { expected, got } => write!(f, "type error: expected {}, got {}", expected, got),
-            TagMethodError::OrderError { left, right } => write!(f, "attempt to compare {} with {}", left, right),
-            TagMethodError::ConcatError { left, right } => write!(f, "attempt to concatenate {} with {}", left, right),
-            TagMethodError::OpError { op, left, right } => write!(f, "attempt to {} {} and {}", op, left, right),
+            TagMethodError::TypeError { expected, got } => {
+                write!(f, "type error: expected {}, got {}", expected, got)
+            }
+            TagMethodError::OrderError { left, right } => {
+                write!(f, "attempt to compare {} with {}", left, right)
+            }
+            TagMethodError::ConcatError { left, right } => {
+                write!(f, "attempt to concatenate {} with {}", left, right)
+            }
+            TagMethodError::OpError { op, left, right } => {
+                write!(f, "attempt to {} {} and {}", op, left, right)
+            }
         }
     }
 }
@@ -386,7 +429,11 @@ pub(crate) fn call_tm_res(
     let caller_tbc_list = state.tbc_list;
     let caller_source = if state.base > 0 && state.base <= state.stack.len() {
         if let TValue::LClosure(c) = &state.stack[state.base - 1] {
-            c.proto.source.as_ref().map(|s| s.as_str().to_string()).unwrap_or_else(|| "=?".to_string())
+            c.proto
+                .source
+                .as_ref()
+                .map(|s| s.as_str().to_string())
+                .unwrap_or_else(|| "=?".to_string())
         } else {
             "=[C]".to_string()
         }
@@ -412,29 +459,31 @@ pub(crate) fn call_tm_res(
     // 并执行 continuation（对应 C Lua 的 luaV_finishOp + unroll 机制）。
     // saved_pc 保留指向被中断的指令（OP_LE/OP_MMBIN 等），不 +1，
     // 以便 continuation 时读取该指令并完成。
-    state.pcall_protection_stack.push(crate::state::PcallProtection {
-        saved_code: caller_code.clone(),
-        saved_constants: caller_constants.clone(),
-        saved_upval_descs: caller_upval_descs.clone(),
-        saved_protos: caller_protos.clone(),
-        saved_base: caller_base,
-        saved_pc: caller_pc,
-        saved_num_params: caller_num_params,
-        saved_is_vararg: caller_is_vararg,
-        saved_proto_flag: caller_proto_flag,
-        saved_nextraargs: caller_nextraargs,
-        saved_closure_upvals: caller_closure_upvals.clone(),
-        saved_tbc_list: caller_tbc_list,
-        func_idx: func_idx,
-        nresults: 1,
-        pcall_kind: crate::state::PcallKind::Pcall,
-        saved_filled: false,
-        is_metamethod: true,
-        metamethod_res: res,
-        saved_call_stack_len: state.call_stack.len(),
-        is_close_continuation: false,
-        is_pairs_continuation: false,
-    });
+    state
+        .pcall_protection_stack
+        .push(crate::state::PcallProtection {
+            saved_code: caller_code.clone(),
+            saved_constants: caller_constants.clone(),
+            saved_upval_descs: caller_upval_descs.clone(),
+            saved_protos: caller_protos.clone(),
+            saved_base: caller_base,
+            saved_pc: caller_pc,
+            saved_num_params: caller_num_params,
+            saved_is_vararg: caller_is_vararg,
+            saved_proto_flag: caller_proto_flag,
+            saved_nextraargs: caller_nextraargs,
+            saved_closure_upvals: caller_closure_upvals.clone(),
+            saved_tbc_list: caller_tbc_list,
+            func_idx: func_idx,
+            nresults: 1,
+            pcall_kind: crate::state::PcallKind::Pcall,
+            saved_filled: false,
+            is_metamethod: true,
+            metamethod_res: res,
+            saved_call_stack_len: state.call_stack.len(),
+            is_close_continuation: false,
+            is_pairs_continuation: false,
+        });
     let mm_protection_idx = state.pcall_protection_stack.len() - 1;
 
     // 调用: 2 个参数, 1 个返回值 (对应 C 的 luaD_callnoyield(L, func, 1))
@@ -554,7 +603,11 @@ pub(crate) fn call_tm(
     let caller_tbc_list = state.tbc_list;
     let caller_source = if state.base > 0 && state.base <= state.stack.len() {
         if let TValue::LClosure(c) = &state.stack[state.base - 1] {
-            c.proto.source.as_ref().map(|s| s.as_str().to_string()).unwrap_or_else(|| "=?".to_string())
+            c.proto
+                .source
+                .as_ref()
+                .map(|s| s.as_str().to_string())
+                .unwrap_or_else(|| "=?".to_string())
         } else {
             "=[C]".to_string()
         }
@@ -579,29 +632,31 @@ pub(crate) fn call_tm(
     // saved_pc 保留指向被中断的指令 (SETTABLE/SETI/SETFIELD), 不 +1,
     // 以便 continuation 时读取该指令并完成。
     // metamethod_res 设为 func_idx (不使用, 因为 0 个返回值)。
-    state.pcall_protection_stack.push(crate::state::PcallProtection {
-        saved_code: caller_code.clone(),
-        saved_constants: caller_constants.clone(),
-        saved_upval_descs: caller_upval_descs.clone(),
-        saved_protos: caller_protos.clone(),
-        saved_base: caller_base,
-        saved_pc: caller_pc,
-        saved_num_params: caller_num_params,
-        saved_is_vararg: caller_is_vararg,
-        saved_proto_flag: caller_proto_flag,
-        saved_nextraargs: caller_nextraargs,
-        saved_closure_upvals: caller_closure_upvals.clone(),
-        saved_tbc_list: caller_tbc_list,
-        func_idx: func_idx,
-        nresults: 0,
-        pcall_kind: crate::state::PcallKind::Pcall,
-        saved_filled: false,
-        is_metamethod: true,
-        metamethod_res: func_idx,  // 不使用 (0 个返回值)
-        saved_call_stack_len: state.call_stack.len(),
-        is_close_continuation: false,
-        is_pairs_continuation: false,
-    });
+    state
+        .pcall_protection_stack
+        .push(crate::state::PcallProtection {
+            saved_code: caller_code.clone(),
+            saved_constants: caller_constants.clone(),
+            saved_upval_descs: caller_upval_descs.clone(),
+            saved_protos: caller_protos.clone(),
+            saved_base: caller_base,
+            saved_pc: caller_pc,
+            saved_num_params: caller_num_params,
+            saved_is_vararg: caller_is_vararg,
+            saved_proto_flag: caller_proto_flag,
+            saved_nextraargs: caller_nextraargs,
+            saved_closure_upvals: caller_closure_upvals.clone(),
+            saved_tbc_list: caller_tbc_list,
+            func_idx: func_idx,
+            nresults: 0,
+            pcall_kind: crate::state::PcallKind::Pcall,
+            saved_filled: false,
+            is_metamethod: true,
+            metamethod_res: func_idx, // 不使用 (0 个返回值)
+            saved_call_stack_len: state.call_stack.len(),
+            is_close_continuation: false,
+            is_pairs_continuation: false,
+        });
     let mm_protection_idx = state.pcall_protection_stack.len() - 1;
 
     // 调用: 3 个参数, 0 个返回值
@@ -672,7 +727,11 @@ pub fn call_close_method(
     err: Option<&TValue>,
     yy: bool,
 ) -> Result<bool, VmError> {
-    let depth = CLOSE_METHOD_DEPTH.with(|d| { let v = d.get(); d.set(v + 1); v });
+    let depth = CLOSE_METHOD_DEPTH.with(|d| {
+        let v = d.get();
+        d.set(v + 1);
+        v
+    });
     // 对应 C 的 luaE_checkcstack: __close 链式调用达到 LUAI_MAXCCALLS 时
     // 抛出可被 pcall 捕获的 "C stack overflow" 错误（cstack.lua:108 期望此消息）。
     // 不能 panic，否则 coroutine.close 无法返回 (false, msg)。
@@ -702,7 +761,8 @@ pub fn call_close_method(
                 None => "nil",
             };
             return Err(VmError::RuntimeError(format!(
-                "attempt to call a {} value (metamethod 'close')", tn
+                "attempt to call a {} value (metamethod 'close')",
+                tn
             )));
         }
     };
@@ -725,7 +785,11 @@ pub fn call_close_method(
     let caller_pc = state.pc;
     let caller_source = if state.base > 0 && state.base <= state.stack.len() {
         if let TValue::LClosure(c) = &state.stack[state.base - 1] {
-            c.proto.source.as_ref().map(|s| s.as_str().to_string()).unwrap_or_else(|| "=?".to_string())
+            c.proto
+                .source
+                .as_ref()
+                .map(|s| s.as_str().to_string())
+                .unwrap_or_else(|| "=?".to_string())
         } else {
             "=[C]".to_string()
         }
@@ -749,29 +813,31 @@ pub fn call_close_method(
     // Push PcallProtection — close continuation 机制
     // yield 穿过 __close 后，resume 时 __close 返回，op_return 检测到 is_close_continuation=true
     // 并执行 continuation（对应 C Lua 的 luaV_finishOp 对 OP_RETURN/OP_CLOSE 的 savedpc-- 机制）
-    state.pcall_protection_stack.push(crate::state::PcallProtection {
-        saved_code: Vec::new(),
-        saved_constants: Vec::new(),
-        saved_upval_descs: Vec::new(),
-        saved_protos: Vec::new(),
-        saved_base: 0,
-        saved_pc: 0,
-        saved_num_params: 0,
-        saved_is_vararg: false,
-        saved_proto_flag: 0,
-        saved_nextraargs: 0,
-        saved_closure_upvals: Vec::new(),
-        saved_tbc_list: None,
-        func_idx: 0,
-        nresults: 0,
-        pcall_kind: crate::state::PcallKind::Pcall,
-        saved_filled: false,
-        is_metamethod: false,
-        metamethod_res: 0,
-        saved_call_stack_len: state.call_stack.len(),
-        is_close_continuation: true,
-        is_pairs_continuation: false,
-    });
+    state
+        .pcall_protection_stack
+        .push(crate::state::PcallProtection {
+            saved_code: Vec::new(),
+            saved_constants: Vec::new(),
+            saved_upval_descs: Vec::new(),
+            saved_protos: Vec::new(),
+            saved_base: 0,
+            saved_pc: 0,
+            saved_num_params: 0,
+            saved_is_vararg: false,
+            saved_proto_flag: 0,
+            saved_nextraargs: 0,
+            saved_closure_upvals: Vec::new(),
+            saved_tbc_list: None,
+            func_idx: 0,
+            nresults: 0,
+            pcall_kind: crate::state::PcallKind::Pcall,
+            saved_filled: false,
+            is_metamethod: false,
+            metamethod_res: 0,
+            saved_call_stack_len: state.call_stack.len(),
+            is_close_continuation: true,
+            is_pairs_continuation: false,
+        });
 
     // 对应 C 的 callclosemethod: yy=1 用 luaD_call (可 yield), yy=0 用 luaD_callnoyield
     // n_ny_calls > 0 时不可 yield (对应 C 的 nny > 0)
@@ -799,7 +865,10 @@ pub fn call_close_method(
     if status != 0 {
         // 元方法调用失败 — pcall 将错误值推入栈中 func_idx 位置
         // 在截断栈之前读取错误值，保留原始 TValue 类型
-        let err_val = state.stack.get(func_idx).cloned()
+        let err_val = state
+            .stack
+            .get(func_idx)
+            .cloned()
             .unwrap_or(TValue::Nil(NilKind::Strict));
         // 截断栈，移除临时压入的函数/参数/错误值
         state.stack.truncate(func_idx);
@@ -847,8 +916,7 @@ fn callbin_tm(
     tm: TagMethod,
 ) -> Result<bool, VmError> {
     // 先从 p1 查找元方法，再从 p2 查找 — 对应 C 的 callbinTM
-    let tm_val = get_tm_by_obj(p1, tm, &state.dmt)
-        .or_else(|| get_tm_by_obj(p2, tm, &state.dmt));
+    let tm_val = get_tm_by_obj(p1, tm, &state.dmt).or_else(|| get_tm_by_obj(p2, tm, &state.dmt));
 
     match tm_val {
         Some(f) => {
@@ -874,7 +942,8 @@ fn callbin_tm(
                 let t1 = obj_type_name(p1);
                 let t2 = obj_type_name(p2);
                 return Err(VmError::RuntimeError(format!(
-                    "attempt to {} a '{}' with a '{}'", opname, t1, t2
+                    "attempt to {} a '{}' with a '{}'",
+                    opname, t1, t2
                 )));
             }
             call_tm_res(state, &f, p1, p2, res, tm)?;
@@ -922,8 +991,9 @@ fn string_arith(
                 if i2 == 0 {
                     return Err(VmError::RuntimeError("attempt to perform 'n%0'".into()));
                 }
-                Some(TValue::Integer(crate::vm::modulus(i1, i2)
-                    .map_err(|_| VmError::ModuloByZero)?))
+                Some(TValue::Integer(
+                    crate::vm::modulus(i1, i2).map_err(|_| VmError::ModuloByZero)?,
+                ))
             }
             TagMethod::IDiv => {
                 if i2 == 0 {
@@ -1009,8 +1079,12 @@ pub fn try_bin_tm(
     if !callbin_tm(state, p1, p2, res, tm)? {
         // 未找到元方法 — 根据事件类型报错
         return Err(match tm {
-            TagMethod::BAnd | TagMethod::BOr | TagMethod::BXor
-            | TagMethod::Shl | TagMethod::Shr | TagMethod::BNot => {
+            TagMethod::BAnd
+            | TagMethod::BOr
+            | TagMethod::BXor
+            | TagMethod::Shl
+            | TagMethod::Shr
+            | TagMethod::BNot => {
                 if p1.is_number() && p2.is_number() {
                     tointerror(p1, p2, &p1_info, &p2_info)
                 } else {
@@ -1200,11 +1274,7 @@ pub fn call_orderi_tm(
 ///   }
 /// }
 /// ```
-pub fn equal_obj(
-    state: &mut LuaState,
-    t1: &TValue,
-    t2: &TValue,
-) -> Result<bool, VmError> {
+pub fn equal_obj(state: &mut LuaState, t1: &TValue, t2: &TValue) -> Result<bool, VmError> {
     // C: if (ttype(t1) != ttype(t2)) return 0;
     // ttype 检查基类型: Integer 和 Float 同属 LUA_TNUMBER
     // 先处理数字混合比较 (integer == float), 与 C 的 ttypetag 分支一致
@@ -1273,12 +1343,7 @@ pub fn equal_obj(
 ///   luaT_callTMres(L, tm, rb, rb, ra);
 /// }
 /// ```
-pub fn obj_len(
-    state: &mut LuaState,
-    ra: usize,
-    rb: &TValue,
-    varinfo: &str,
-) -> Result<(), VmError> {
+pub fn obj_len(state: &mut LuaState, ra: usize, rb: &TValue, varinfo: &str) -> Result<(), VmError> {
     let tm: Option<TValue> = match rb {
         TValue::Table(t) => {
             // 先查表自身元表的 __len
@@ -1320,13 +1385,11 @@ pub fn obj_len(
             // C: luaT_callTMres(L, tm, rb, rb, ra);
             call_tm_res(state, &f, rb, rb, ra, TagMethod::Len)
         }
-        None => {
-            Err(VmError::RuntimeError(format!(
-                "attempt to get length of a {} value{}",
-                obj_type_name(rb),
-                varinfo
-            )))
-        }
+        None => Err(VmError::RuntimeError(format!(
+            "attempt to get length of a {} value{}",
+            obj_type_name(rb),
+            varinfo
+        ))),
     }
 }
 
@@ -1349,7 +1412,11 @@ impl VarargInfo {
 
     pub fn num_extra(&self) -> usize {
         let extra = self.total_args.saturating_sub(self.num_fixed_params);
-        if self.is_vararg() { extra } else { 0 }
+        if self.is_vararg() {
+            extra
+        } else {
+            0
+        }
     }
 }
 
@@ -1372,7 +1439,8 @@ impl VarargTable {
         }
         t.set(
             TValue::Str(LuaString::Short(std::sync::Arc::new(ShortString {
-                hash: rust_hash("n"), contents: "n".to_string(),
+                hash: rust_hash("n"),
+                contents: "n".to_string(),
             }))),
             TValue::Integer(count as i64),
         );
@@ -1387,11 +1455,15 @@ impl VarargTable {
     }
 
     pub fn get(&self, idx: usize) -> Option<TValue> {
-        if idx < 1 { return None; }
+        if idx < 1 {
+            return None;
+        }
         let i = idx - 1;
         match self {
             VarargTable::Table { ref table, count } => {
-                if i >= *count { return None; }
+                if i >= *count {
+                    return None;
+                }
                 table.get_int(i as i64 + 1)
             }
             VarargTable::Hidden { args } => args.get(i).cloned(),
@@ -1408,11 +1480,23 @@ impl VarargTable {
 
     pub fn get_varargs(&self, wanted: isize) -> Vec<TValue> {
         let n = self.count();
-        let take = if wanted < 0 { n } else { let w = wanted as usize; if w > n { n } else { w } };
+        let take = if wanted < 0 {
+            n
+        } else {
+            let w = wanted as usize;
+            if w > n {
+                n
+            } else {
+                w
+            }
+        };
         let total = if wanted < 0 { n } else { wanted as usize };
         let mut result = Vec::with_capacity(total);
         for i in 0..take {
-            result.push(self.get(i + 1).unwrap_or_else(|| TValue::Nil(NilKind::Strict)));
+            result.push(
+                self.get(i + 1)
+                    .unwrap_or_else(|| TValue::Nil(NilKind::Strict)),
+            );
         }
         for _ in take..total {
             result.push(TValue::Nil(NilKind::Strict));
@@ -1499,15 +1583,22 @@ mod tests {
 
     #[test]
     fn test_metatable_flags_from_tag_method() {
-        assert_eq!(MetatableFlags::from_tag_method(TagMethod::Index), Some(MetatableFlags::NO_INDEX));
-        assert_eq!(MetatableFlags::from_tag_method(TagMethod::Eq), Some(MetatableFlags::NO_EQ));
+        assert_eq!(
+            MetatableFlags::from_tag_method(TagMethod::Index),
+            Some(MetatableFlags::NO_INDEX)
+        );
+        assert_eq!(
+            MetatableFlags::from_tag_method(TagMethod::Eq),
+            Some(MetatableFlags::NO_EQ)
+        );
         assert_eq!(MetatableFlags::from_tag_method(TagMethod::Add), None);
     }
 
     #[test]
     fn test_metatable_get_tm_and_cache() {
         let mut mt = Metatable::empty();
-        mt.table.set(make_tm_tvalue(TagMethod::Index), TValue::Integer(42));
+        mt.table
+            .set(make_tm_tvalue(TagMethod::Index), TValue::Integer(42));
         assert!(mt.get_tm(TagMethod::Index).is_some());
         assert!(mt.get_tm(TagMethod::Len).is_none());
         assert!(mt.flags.contains(MetatableFlags::NO_LEN));
@@ -1517,7 +1608,8 @@ mod tests {
     fn test_metatable_cache_hit() {
         let mut mt = Metatable::empty();
         mt.flags.insert(MetatableFlags::NO_INDEX);
-        mt.table.set(make_tm_tvalue(TagMethod::Index), TValue::Integer(99));
+        mt.table
+            .set(make_tm_tvalue(TagMethod::Index), TValue::Integer(99));
         assert!(mt.get_tm(TagMethod::Index).is_none());
     }
 
@@ -1583,7 +1675,15 @@ mod tests {
         let p1 = TValue::Integer(1);
         let p2 = TValue::Integer(2);
         // 整数没有 __add 元方法，应返回 RuntimeError
-        let result = try_bin_tm(&mut state, &p1, &p2, 0, TagMethod::Add, String::new(), String::new());
+        let result = try_bin_tm(
+            &mut state,
+            &p1,
+            &p2,
+            0,
+            TagMethod::Add,
+            String::new(),
+            String::new(),
+        );
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, VmError::RuntimeError(_)));
@@ -1595,7 +1695,15 @@ mod tests {
         let mut state = LuaState::new();
         let p1 = TValue::Nil(NilKind::Strict);
         let p2 = TValue::Integer(1);
-        let result = try_bin_tm(&mut state, &p1, &p2, 0, TagMethod::Add, String::new(), String::new());
+        let result = try_bin_tm(
+            &mut state,
+            &p1,
+            &p2,
+            0,
+            TagMethod::Add,
+            String::new(),
+            String::new(),
+        );
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, VmError::RuntimeError(_)));
@@ -1607,7 +1715,12 @@ mod tests {
     fn test_try_concat_tm_no_metamethod() {
         let mut state = LuaState::new();
         // nil 不能拼接
-        let result = try_concat_tm(&mut state, &TValue::Nil(NilKind::Strict), &TValue::Integer(2), 0);
+        let result = try_concat_tm(
+            &mut state,
+            &TValue::Nil(NilKind::Strict),
+            &TValue::Integer(2),
+            0,
+        );
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), VmError::RuntimeError(_)));
     }
@@ -1616,7 +1729,12 @@ mod tests {
     fn test_call_order_tm_no_metamethod() {
         let mut state = LuaState::new();
         // nil 和 integer 无法比较
-        let result = call_order_tm(&mut state, &TValue::Nil(NilKind::Strict), &TValue::Integer(2), TagMethod::Lt);
+        let result = call_order_tm(
+            &mut state,
+            &TValue::Nil(NilKind::Strict),
+            &TValue::Integer(2),
+            TagMethod::Lt,
+        );
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), VmError::RuntimeError(_)));
     }
@@ -1635,21 +1753,35 @@ mod tests {
 
     #[test]
     fn test_vararg_info_fixed() {
-        let info = VarargInfo { total_args: 3, num_fixed_params: 3, has_vararg_table: false, has_hidden_varargs: false };
+        let info = VarargInfo {
+            total_args: 3,
+            num_fixed_params: 3,
+            has_vararg_table: false,
+            has_hidden_varargs: false,
+        };
         assert!(!info.is_vararg());
         assert_eq!(info.num_extra(), 0);
     }
 
     #[test]
     fn test_vararg_info_vararg() {
-        let info = VarargInfo { total_args: 5, num_fixed_params: 2, has_vararg_table: false, has_hidden_varargs: true };
+        let info = VarargInfo {
+            total_args: 5,
+            num_fixed_params: 2,
+            has_vararg_table: false,
+            has_hidden_varargs: true,
+        };
         assert!(info.is_vararg());
         assert_eq!(info.num_extra(), 3);
     }
 
     #[test]
     fn test_vararg_table_from_args() {
-        let args = vec![TValue::Integer(10), TValue::Integer(20), TValue::Integer(30)];
+        let args = vec![
+            TValue::Integer(10),
+            TValue::Integer(20),
+            TValue::Integer(30),
+        ];
         let vt = VarargTable::from_args(&args);
         assert_eq!(vt.count(), 3);
         assert_eq!(vt.get(1), Some(TValue::Integer(10)));
@@ -1687,7 +1819,11 @@ mod tests {
 
     #[test]
     fn test_vararg_table_get_varargs_all() {
-        let args = vec![TValue::Integer(10), TValue::Integer(20), TValue::Integer(30)];
+        let args = vec![
+            TValue::Integer(10),
+            TValue::Integer(20),
+            TValue::Integer(30),
+        ];
         let vt = VarargTable::from_hidden(args);
         let result = vt.get_varargs(-1);
         assert_eq!(result.len(), 3);

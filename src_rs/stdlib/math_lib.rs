@@ -12,10 +12,10 @@
 //! - 提供伪随机数生成器 (xoshiro256** 算法): random, randomseed
 //! - 提供常量: pi, huge, maxinteger, mininteger
 
+use crate::execute::VmError;
 use crate::objects::{NilKind, TValue};
 use crate::state::LuaState;
 use crate::table::Table;
-use crate::execute::VmError;
 
 // ============================================================================
 // 常量
@@ -118,7 +118,10 @@ pub fn math_abs(v: &TValue) -> Result<TValue, String> {
             Ok(TValue::Integer(n.wrapping_abs()))
         }
         TValue::Float(f) => Ok(TValue::Float(f.abs())),
-        _ => Err(format!("bad argument #1 to 'abs' (number expected, got {})", v.ty())),
+        _ => Err(format!(
+            "bad argument #1 to 'abs' (number expected, got {})",
+            v.ty()
+        )),
     }
 }
 
@@ -198,7 +201,10 @@ pub fn math_floor(v: &TValue) -> Result<TValue, String> {
     match v {
         TValue::Integer(_) => Ok(v.clone()),
         TValue::Float(f) => Ok(push_num_int(f.floor())),
-        _ => Err(format!("bad argument #1 to 'floor' (number expected, got {})", v.ty())),
+        _ => Err(format!(
+            "bad argument #1 to 'floor' (number expected, got {})",
+            v.ty()
+        )),
     }
 }
 
@@ -209,7 +215,10 @@ pub fn math_ceil(v: &TValue) -> Result<TValue, String> {
     match v {
         TValue::Integer(_) => Ok(v.clone()),
         TValue::Float(f) => Ok(push_num_int(f.ceil())),
-        _ => Err(format!("bad argument #1 to 'ceil' (number expected, got {})", v.ty())),
+        _ => Err(format!(
+            "bad argument #1 to 'ceil' (number expected, got {})",
+            v.ty()
+        )),
     }
 }
 
@@ -232,7 +241,10 @@ pub fn math_fmod(v1: &TValue, v2: &TValue) -> Result<TValue, String> {
         _ => {
             let a = to_float(v1)?;
             let b = to_float(v2).map_err(|_| {
-                format!("bad argument #2 to 'fmod' (number expected, got {})", v2.ty())
+                format!(
+                    "bad argument #2 to 'fmod' (number expected, got {})",
+                    v2.ty()
+                )
             })?;
             Ok(TValue::Float(a % b))
         }
@@ -246,9 +258,7 @@ pub fn math_fmod(v1: &TValue, v2: &TValue) -> Result<TValue, String> {
 /// 浮点输入: (向零取整的整数部分, 小数部分)
 pub fn math_modf(v: &TValue) -> Result<(TValue, TValue), String> {
     match v {
-        TValue::Integer(_) => {
-            Ok((v.clone(), TValue::Float(0.0)))
-        }
+        TValue::Integer(_) => Ok((v.clone(), TValue::Float(0.0))),
         TValue::Float(f) => {
             // 对应 C: ip = (n < 0) ? ceil(n) : floor(n)
             // NaN/Inf 走正常路径: NaN 的 frac 为 NaN, Inf 的 frac 为 0.0
@@ -256,7 +266,10 @@ pub fn math_modf(v: &TValue) -> Result<(TValue, TValue), String> {
             let frac = if *f == ip { 0.0 } else { *f - ip };
             Ok((push_num_int(ip), TValue::Float(frac)))
         }
-        _ => Err(format!("bad argument #1 to 'modf' (number expected, got {})", v.ty())),
+        _ => Err(format!(
+            "bad argument #1 to 'modf' (number expected, got {})",
+            v.ty()
+        )),
     }
 }
 
@@ -380,9 +393,8 @@ fn to_float(v: &TValue) -> Result<f64, String> {
         TValue::Float(f) => Ok(*f),
         TValue::Str(s) => {
             let s = s.as_str();
-            s.parse::<f64>().map_err(|_| {
-                format!("bad argument (number expected, got string '{}')", s)
-            })
+            s.parse::<f64>()
+                .map_err(|_| format!("bad argument (number expected, got string '{}')", s))
         }
         _ => Err(format!("bad argument (number expected, got {})", v.ty())),
     }
@@ -415,10 +427,7 @@ fn lua_lt(a: &TValue, b: &TValue) -> Result<bool, String> {
         (TValue::Integer(x), TValue::Float(y)) => Ok((*x as f64) < *y),
         (TValue::Float(x), TValue::Integer(y)) => Ok(*x < (*y as f64)),
         (TValue::Str(x), TValue::Str(y)) => Ok(x.as_str() < y.as_str()),
-        _ => Err(format!(
-            "attempt to compare {} with {}",
-            a.ty(), b.ty()
-        )),
+        _ => Err(format!("attempt to compare {} with {}", a.ty(), b.ty())),
     }
 }
 
@@ -532,10 +541,7 @@ impl Default for RandState {
 /// 单参数 0: 返回全范围随机整数
 /// 单参数 n: 返回 [1, n] 范围的整数
 /// 双参数 low, up: 返回 [low, up] 范围的整数
-pub fn math_random(
-    state: &mut RandState,
-    args: &[TValue],
-) -> Result<TValue, String> {
+pub fn math_random(state: &mut RandState, args: &[TValue]) -> Result<TValue, String> {
     let rv = state.nextrand();
     match args.len() {
         0 => {
@@ -577,10 +583,7 @@ pub fn math_random(
 /// 双参数 x, y: 使用 x, y 作为种子
 ///
 /// 返回 (主种子, 次种子)
-pub fn math_randomseed(
-    state: &mut RandState,
-    args: &[TValue],
-) -> Result<(i64, i64), String> {
+pub fn math_randomseed(state: &mut RandState, args: &[TValue]) -> Result<(i64, i64), String> {
     let (n1, n2) = match args.len() {
         0 => {
             // 使用当前时间作为种子 (对应 C 的 luaL_makeseed)
@@ -646,17 +649,22 @@ fn get_number_arg(state: &LuaState, a: usize, idx: usize, fname: &str) -> Result
             } else {
                 Err(VmError::RuntimeError(format!(
                     "bad argument #{} to '{}' (number expected, got string '{}')",
-                    idx + 1, fname, s
+                    idx + 1,
+                    fname,
+                    s
                 )))
             }
         }
         TValue::Nil(_) => Err(VmError::RuntimeError(format!(
             "bad argument #{} to '{}' (number expected, got nil)",
-            idx + 1, fname
+            idx + 1,
+            fname
         ))),
         _ => Err(VmError::RuntimeError(format!(
             "bad argument #{} to '{}' (number expected, got {})",
-            idx + 1, fname, crate::tm::obj_type_name(&v)
+            idx + 1,
+            fname,
+            crate::tm::obj_type_name(&v)
         ))),
     }
 }
@@ -684,13 +692,17 @@ fn get_int_arg(state: &LuaState, a: usize, idx: usize, fname: &str) -> Result<i6
             } else {
                 Err(VmError::RuntimeError(format!(
                     "bad argument #{} to '{}' (integer expected, got float {})",
-                    idx + 1, fname, f
+                    idx + 1,
+                    fname,
+                    f
                 )))
             }
         }
         _ => Err(VmError::RuntimeError(format!(
             "bad argument #{} to '{}' (integer expected, got {})",
-            idx + 1, fname, v.ty()
+            idx + 1,
+            fname,
+            v.ty()
         ))),
     }
 }
@@ -740,7 +752,10 @@ pub fn call_math_function(
         MATH_TYPE => call_type(state, a, nargs, nresults),
         MATH_RANDOM => call_random(state, a, nargs, nresults),
         MATH_RANDOMSEED => call_randomseed(state, a, nargs, nresults),
-        _ => Err(VmError::RuntimeError(format!("unknown math function tag: {}", tag))),
+        _ => Err(VmError::RuntimeError(format!(
+            "unknown math function tag: {}",
+            tag
+        ))),
     };
 
     if result.is_ok() {
@@ -903,7 +918,12 @@ fn call_modf(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 }
 
 /// math.tointeger(v) — 对应 C 的 math_toint
-fn call_tointeger(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_tointeger(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'tointeger' (value expected)".to_string(),
@@ -948,7 +968,12 @@ fn call_frexp(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
     let v = get_number_arg(state, a, 0, "frexp")?;
     let x = to_float(&v).map_err(|msg| VmError::RuntimeError(msg))?;
     let (m, e) = math_frexp(x);
-    push_results(state, a, nresults, vec![TValue::Float(m), TValue::Integer(e)]);
+    push_results(
+        state,
+        a,
+        nresults,
+        vec![TValue::Float(m), TValue::Integer(e)],
+    );
     Ok(())
 }
 
@@ -981,7 +1006,8 @@ fn call_min(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Resu
         if !matches!(arg, TValue::Integer(_) | TValue::Float(_)) {
             return Err(VmError::RuntimeError(format!(
                 "bad argument #{} to 'min' (number expected, got {})",
-                i + 1, arg.ty()
+                i + 1,
+                arg.ty()
             )));
         }
     }
@@ -1007,7 +1033,8 @@ fn call_max(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Resu
         if !matches!(arg, TValue::Integer(_) | TValue::Float(_)) {
             return Err(VmError::RuntimeError(format!(
                 "bad argument #{} to 'max' (number expected, got {})",
-                i + 1, arg.ty()
+                i + 1,
+                arg.ty()
             )));
         }
     }
@@ -1055,12 +1082,22 @@ fn call_random(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
 }
 
 /// math.randomseed([x [, y]]) — 对应 C 的 math_randomseed
-fn call_randomseed(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_randomseed(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
     let args: Vec<TValue> = (0..nargs).map(|i| get_arg(state, a, i)).collect();
     let rand_state = state.math_random_state.as_mut().unwrap();
     match math_randomseed(rand_state, &args) {
         Ok((n1, n2)) => {
-            push_results(state, a, nresults, vec![TValue::Integer(n1), TValue::Integer(n2)]);
+            push_results(
+                state,
+                a,
+                nresults,
+                vec![TValue::Integer(n1), TValue::Integer(n2)],
+            );
             Ok(())
         }
         Err(msg) => Err(VmError::RuntimeError(msg)),
@@ -1178,14 +1215,20 @@ mod tests {
     #[test]
     fn test_math_abs_integer() {
         assert_eq!(math_abs(&TValue::Integer(42)).unwrap(), TValue::Integer(42));
-        assert_eq!(math_abs(&TValue::Integer(-42)).unwrap(), TValue::Integer(42));
+        assert_eq!(
+            math_abs(&TValue::Integer(-42)).unwrap(),
+            TValue::Integer(42)
+        );
         assert_eq!(math_abs(&TValue::Integer(0)).unwrap(), TValue::Integer(0));
     }
 
     #[test]
     fn test_math_abs_float() {
         assert_eq!(math_abs(&TValue::Float(3.14)).unwrap(), TValue::Float(3.14));
-        assert_eq!(math_abs(&TValue::Float(-3.14)).unwrap(), TValue::Float(3.14));
+        assert_eq!(
+            math_abs(&TValue::Float(-3.14)).unwrap(),
+            TValue::Float(3.14)
+        );
         assert_eq!(math_abs(&TValue::Float(0.0)).unwrap(), TValue::Float(0.0));
     }
 
@@ -1248,30 +1291,51 @@ mod tests {
 
     #[test]
     fn test_math_floor_integer() {
-        assert_eq!(math_floor(&TValue::Integer(42)).unwrap(), TValue::Integer(42));
-        assert_eq!(math_floor(&TValue::Integer(-42)).unwrap(), TValue::Integer(-42));
+        assert_eq!(
+            math_floor(&TValue::Integer(42)).unwrap(),
+            TValue::Integer(42)
+        );
+        assert_eq!(
+            math_floor(&TValue::Integer(-42)).unwrap(),
+            TValue::Integer(-42)
+        );
     }
 
     #[test]
     fn test_math_floor_float() {
         assert_eq!(math_floor(&TValue::Float(3.7)).unwrap(), TValue::Integer(3));
-        assert_eq!(math_floor(&TValue::Float(-3.7)).unwrap(), TValue::Integer(-4));
+        assert_eq!(
+            math_floor(&TValue::Float(-3.7)).unwrap(),
+            TValue::Integer(-4)
+        );
         assert_eq!(math_floor(&TValue::Float(3.0)).unwrap(), TValue::Integer(3));
         // 大浮点数无法无损转为整数
         let big = 1e20;
-        assert_eq!(math_floor(&TValue::Float(big)).unwrap(), TValue::Float(big.floor()));
+        assert_eq!(
+            math_floor(&TValue::Float(big)).unwrap(),
+            TValue::Float(big.floor())
+        );
     }
 
     #[test]
     fn test_math_ceil_integer() {
-        assert_eq!(math_ceil(&TValue::Integer(42)).unwrap(), TValue::Integer(42));
-        assert_eq!(math_ceil(&TValue::Integer(-42)).unwrap(), TValue::Integer(-42));
+        assert_eq!(
+            math_ceil(&TValue::Integer(42)).unwrap(),
+            TValue::Integer(42)
+        );
+        assert_eq!(
+            math_ceil(&TValue::Integer(-42)).unwrap(),
+            TValue::Integer(-42)
+        );
     }
 
     #[test]
     fn test_math_ceil_float() {
         assert_eq!(math_ceil(&TValue::Float(3.2)).unwrap(), TValue::Integer(4));
-        assert_eq!(math_ceil(&TValue::Float(-3.2)).unwrap(), TValue::Integer(-3));
+        assert_eq!(
+            math_ceil(&TValue::Float(-3.2)).unwrap(),
+            TValue::Integer(-3)
+        );
         assert_eq!(math_ceil(&TValue::Float(3.0)).unwrap(), TValue::Integer(3));
     }
 
@@ -1471,7 +1535,11 @@ mod tests {
 
     #[test]
     fn test_math_min_float() {
-        let args = vec![TValue::Float(3.14), TValue::Float(1.41), TValue::Float(2.71)];
+        let args = vec![
+            TValue::Float(3.14),
+            TValue::Float(1.41),
+            TValue::Float(2.71),
+        ];
         assert_eq!(math_min(&args).unwrap(), TValue::Float(1.41));
     }
 
@@ -1566,7 +1634,11 @@ mod tests {
         for _ in 0..100 {
             let r = state.nextrand();
             let f = RandState::i2d(r);
-            assert!(f >= 0.0 && f < 1.0, "i2d returned {} which is out of [0, 1)", f);
+            assert!(
+                f >= 0.0 && f < 1.0,
+                "i2d returned {} which is out of [0, 1)",
+                f
+            );
         }
     }
 
@@ -1614,7 +1686,8 @@ mod tests {
         let mut state = RandState::new();
         state.setseed(42, 0);
         for _ in 0..100 {
-            let result = math_random(&mut state, &[TValue::Integer(10), TValue::Integer(20)]).unwrap();
+            let result =
+                math_random(&mut state, &[TValue::Integer(10), TValue::Integer(20)]).unwrap();
             match result {
                 TValue::Integer(n) => {
                     assert!(n >= 10 && n <= 20, "random(10, 20) returned {}", n);
@@ -1651,10 +1724,8 @@ mod tests {
     #[test]
     fn test_math_randomseed_two_args() {
         let mut state = RandState::new();
-        let (n1, n2) = math_randomseed(
-            &mut state,
-            &[TValue::Integer(42), TValue::Integer(99)],
-        ).unwrap();
+        let (n1, n2) =
+            math_randomseed(&mut state, &[TValue::Integer(42), TValue::Integer(99)]).unwrap();
         assert_eq!(n1, 42);
         assert_eq!(n2, 99);
     }
@@ -1731,10 +1802,31 @@ mod tests {
 
         // 验证所有函数
         for name in &[
-            "abs", "acos", "asin", "atan", "ceil", "cos", "deg", "exp",
-            "tointeger", "floor", "fmod", "frexp", "ult", "ldexp", "log",
-            "max", "min", "modf", "rad", "sin", "sqrt", "tan", "type",
-            "random", "randomseed",
+            "abs",
+            "acos",
+            "asin",
+            "atan",
+            "ceil",
+            "cos",
+            "deg",
+            "exp",
+            "tointeger",
+            "floor",
+            "fmod",
+            "frexp",
+            "ult",
+            "ldexp",
+            "log",
+            "max",
+            "min",
+            "modf",
+            "rad",
+            "sin",
+            "sqrt",
+            "tan",
+            "type",
+            "random",
+            "randomseed",
         ] {
             let key = TValue::Str(state.intern_str(name));
             assert!(
@@ -1790,7 +1882,9 @@ mod tests {
     fn test_call_math_function_abs() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(MATH_ABS as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(MATH_ABS as *mut std::ffi::c_void));
         state.stack.push(TValue::Integer(-42));
         call_math_function(MATH_ABS, &mut state, 0, 1, 1).unwrap();
         assert_eq!(state.stack.len(), 1);
@@ -1804,7 +1898,9 @@ mod tests {
     fn test_call_math_function_floor() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(MATH_FLOOR as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(MATH_FLOOR as *mut std::ffi::c_void));
         state.stack.push(TValue::Float(3.7));
         call_math_function(MATH_FLOOR, &mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
@@ -1817,7 +1913,9 @@ mod tests {
     fn test_call_math_function_max() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(MATH_MAX as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(MATH_MAX as *mut std::ffi::c_void));
         state.stack.push(TValue::Integer(1));
         state.stack.push(TValue::Integer(5));
         state.stack.push(TValue::Integer(3));
@@ -1832,7 +1930,9 @@ mod tests {
     fn test_call_math_function_min() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(MATH_MIN as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(MATH_MIN as *mut std::ffi::c_void));
         state.stack.push(TValue::Integer(1));
         state.stack.push(TValue::Integer(5));
         state.stack.push(TValue::Integer(3));
@@ -1847,7 +1947,9 @@ mod tests {
     fn test_call_math_function_type() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(MATH_TYPE as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(MATH_TYPE as *mut std::ffi::c_void));
         state.stack.push(TValue::Integer(42));
         call_math_function(MATH_TYPE, &mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
@@ -1860,7 +1962,9 @@ mod tests {
     fn test_call_math_function_type_float() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(MATH_TYPE as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(MATH_TYPE as *mut std::ffi::c_void));
         state.stack.push(TValue::Float(3.14));
         call_math_function(MATH_TYPE, &mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
@@ -1873,7 +1977,9 @@ mod tests {
     fn test_call_math_function_tointeger() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(MATH_TOINTEGER as *mut std::ffi::c_void));
+        state.stack.push(TValue::LightUserData(
+            MATH_TOINTEGER as *mut std::ffi::c_void,
+        ));
         state.stack.push(TValue::Float(42.0));
         call_math_function(MATH_TOINTEGER, &mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
@@ -1886,7 +1992,9 @@ mod tests {
     fn test_call_math_function_tointeger_fail() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(MATH_TOINTEGER as *mut std::ffi::c_void));
+        state.stack.push(TValue::LightUserData(
+            MATH_TOINTEGER as *mut std::ffi::c_void,
+        ));
         state.stack.push(TValue::Float(42.5));
         call_math_function(MATH_TOINTEGER, &mut state, 0, 1, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
@@ -1896,7 +2004,9 @@ mod tests {
     fn test_call_math_function_ult() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(MATH_ULT as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(MATH_ULT as *mut std::ffi::c_void));
         state.stack.push(TValue::Integer(1));
         state.stack.push(TValue::Integer(2));
         call_math_function(MATH_ULT, &mut state, 0, 2, 1).unwrap();
@@ -1910,7 +2020,9 @@ mod tests {
     fn test_call_math_function_modf() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(MATH_MODF as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(MATH_MODF as *mut std::ffi::c_void));
         state.stack.push(TValue::Float(3.14));
         call_math_function(MATH_MODF, &mut state, 0, 1, -1).unwrap();
         assert_eq!(state.stack.len(), 2);
@@ -1928,7 +2040,9 @@ mod tests {
     fn test_call_math_function_frexp() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(MATH_FREXP as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(MATH_FREXP as *mut std::ffi::c_void));
         state.stack.push(TValue::Float(4.0));
         call_math_function(MATH_FREXP, &mut state, 0, 1, -1).unwrap();
         assert_eq!(state.stack.len(), 2);
@@ -1947,7 +2061,9 @@ mod tests {
         let mut state = LuaState::new();
         open_math_lib(&mut state);
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(MATH_RANDOMSEED as *mut std::ffi::c_void));
+        state.stack.push(TValue::LightUserData(
+            MATH_RANDOMSEED as *mut std::ffi::c_void,
+        ));
         state.stack.push(TValue::Integer(42));
         call_math_function(MATH_RANDOMSEED, &mut state, 0, 1, -1).unwrap();
         assert_eq!(state.stack.len(), 2);
@@ -1966,7 +2082,9 @@ mod tests {
         let mut state = LuaState::new();
         open_math_lib(&mut state);
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(MATH_RANDOM as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(MATH_RANDOM as *mut std::ffi::c_void));
         state.stack.push(TValue::Integer(1));
         state.stack.push(TValue::Integer(100));
         call_math_function(MATH_RANDOM, &mut state, 0, 2, 1).unwrap();

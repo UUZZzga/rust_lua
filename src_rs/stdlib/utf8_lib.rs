@@ -13,9 +13,9 @@
 //! - 标签 200+: 数学库
 //! - 标签 300+: UTF-8 库
 
+use crate::execute::VmError;
 use crate::objects::{NilKind, TValue};
 use crate::state::LuaState;
-use crate::execute::VmError;
 
 // ============================================================================
 // 常量 (对应 C 源码的宏定义)
@@ -35,8 +35,7 @@ const MSG_INVALID: &str = "invalid UTF-8 code";
 /// 原始模式为 "[\0-\x7F\xC2-\xFD][\x80-\xBF]*"，包含非 ASCII 字节，
 /// 因此存储为字节切片。使用时通过 unsafe 转换为 Lua 字符串。
 const UTF8PATT_BYTES: &[u8] = &[
-    b'[', 0, b'-', 0x7F, 0xC2, b'-', 0xFD, b']',
-    b'[', 0x80, b'-', 0xBF, b']', b'*',
+    b'[', 0, b'-', 0x7F, 0xC2, b'-', 0xFD, b']', b'[', 0x80, b'-', 0xBF, b']', b'*',
 ];
 
 // ============================================================================
@@ -180,10 +179,7 @@ fn utf8_encode(code: u32) -> Vec<u8> {
     if code < 0x80 {
         vec![code as u8]
     } else if code < 0x800 {
-        vec![
-            0xC0 | ((code >> 6) as u8),
-            0x80 | ((code & 0x3F) as u8),
-        ]
+        vec![0xC0 | ((code >> 6) as u8), 0x80 | ((code & 0x3F) as u8)]
     } else if code < 0x10000 {
         vec![
             0xE0 | ((code >> 12) as u8),
@@ -267,12 +263,18 @@ fn get_bool_arg(state: &LuaState, a: usize, idx: usize, default: bool) -> bool {
 }
 
 /// 从栈中读取必需的整数参数（带错误消息）
-fn get_required_int_arg(state: &LuaState, a: usize, idx: usize, fname: &str) -> Result<i64, VmError> {
+fn get_required_int_arg(
+    state: &LuaState,
+    a: usize,
+    idx: usize,
+    fname: &str,
+) -> Result<i64, VmError> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.stack.len() {
         return Err(VmError::RuntimeError(format!(
             "bad argument #{} to '{}' (number expected, got no value)",
-            idx + 1, fname
+            idx + 1,
+            fname
         )));
     }
     match &state.stack[stack_idx] {
@@ -281,12 +283,15 @@ fn get_required_int_arg(state: &LuaState, a: usize, idx: usize, fname: &str) -> 
         TValue::Str(s) => s.as_str().parse::<i64>().map_err(|_| {
             VmError::RuntimeError(format!(
                 "bad argument #{} to '{}' (number expected, got string)",
-                idx + 1, fname
+                idx + 1,
+                fname
             ))
         }),
         _ => Err(VmError::RuntimeError(format!(
             "bad argument #{} to '{}' (number expected, got {})",
-            idx + 1, fname, state.stack[stack_idx].ty()
+            idx + 1,
+            fname,
+            state.stack[stack_idx].ty()
         ))),
     }
 }
@@ -512,12 +517,7 @@ pub fn call_utf8_function(
 }
 
 /// utf8.offset(s, n, [i]) — 对应 C 的 byteoffset
-fn call_offset(
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
+fn call_offset(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     let s = get_str_bytes(state, a, 0)?;
     let n = get_required_int_arg(state, a, 1, "offset")?;
     let default_posi = if n >= 0 { 1 } else { s.len() as i64 + 1 };
@@ -529,10 +529,12 @@ fn call_offset(
 
     match utf8_offset_impl(&s, n, posi) {
         Ok(Some((init_pos, final_pos))) => {
-            push_results(state, a, nresults, vec![
-                TValue::Integer(init_pos),
-                TValue::Integer(final_pos),
-            ]);
+            push_results(
+                state,
+                a,
+                nresults,
+                vec![TValue::Integer(init_pos), TValue::Integer(final_pos)],
+            );
             Ok(())
         }
         Ok(None) => {
@@ -552,8 +554,16 @@ fn call_codepoint(
     nresults: i32,
 ) -> Result<(), VmError> {
     let s = get_str_bytes(state, a, 0)?;
-    let posi = if nargs >= 2 { get_opt_int_arg(state, a, 1, 1) } else { 1 };
-    let pose = if nargs >= 3 { get_opt_int_arg(state, a, 2, posi) } else { posi };
+    let posi = if nargs >= 2 {
+        get_opt_int_arg(state, a, 1, 1)
+    } else {
+        1
+    };
+    let pose = if nargs >= 3 {
+        get_opt_int_arg(state, a, 2, posi)
+    } else {
+        posi
+    };
     let lax = nargs >= 4 && get_bool_arg(state, a, 3, false);
 
     match utf8_codepoint_impl(&s, posi, pose, lax) {
@@ -570,12 +580,7 @@ fn call_codepoint(
 }
 
 /// utf8.char(n1, n2, ...) — 对应 C 的 utfchar
-fn call_char(
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
+fn call_char(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     let mut codes = Vec::with_capacity(nargs);
     for i in 0..nargs {
         let c = get_required_int_arg(state, a, i, "char")?;
@@ -593,16 +598,19 @@ fn call_char(
 }
 
 /// utf8.len(s [, i [, j [, lax]]]) — 对应 C 的 utflen
-fn call_len(
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
+fn call_len(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     let s = get_str_bytes(state, a, 0)?;
     let len = s.len();
-    let posi = if nargs >= 2 { get_opt_int_arg(state, a, 1, 1) } else { 1 };
-    let posj = if nargs >= 3 { get_opt_int_arg(state, a, 2, -1) } else { -1 };
+    let posi = if nargs >= 2 {
+        get_opt_int_arg(state, a, 1, 1)
+    } else {
+        1
+    };
+    let posj = if nargs >= 3 {
+        get_opt_int_arg(state, a, 2, -1)
+    } else {
+        -1
+    };
     let lax = nargs >= 4 && get_bool_arg(state, a, 3, false);
 
     // 边界检查 (对应 C 的 argcheck)
@@ -610,11 +618,15 @@ fn call_len(
     // C: --posj < len  (posj 先转 0-based)
     let posi_rel = u_posrelat(posi, len);
     if !(1 <= posi_rel && posi_rel - 1 <= len as i64) {
-        return Err(VmError::RuntimeError("initial position out of bounds".to_string()));
+        return Err(VmError::RuntimeError(
+            "initial position out of bounds".to_string(),
+        ));
     }
     let posj_rel = u_posrelat(posj, len);
     if !(posj_rel - 1 < len as i64) {
-        return Err(VmError::RuntimeError("final position out of bounds".to_string()));
+        return Err(VmError::RuntimeError(
+            "final position out of bounds".to_string(),
+        ));
     }
 
     // 转为 0-based (对应 C 的 --posi, --posj)
@@ -634,10 +646,12 @@ fn call_len(
             }
             None => {
                 // 返回 nil + 当前位置 (1-based)
-                push_results(state, a, nresults, vec![
-                    TValue::Nil(NilKind::Strict),
-                    TValue::Integer(i + 1),
-                ]);
+                push_results(
+                    state,
+                    a,
+                    nresults,
+                    vec![TValue::Nil(NilKind::Strict), TValue::Integer(i + 1)],
+                );
                 return Ok(());
             }
         }
@@ -650,12 +664,7 @@ fn call_len(
 /// utf8.codes(s, [lax]) — 对应 C 的 iter_codes
 ///
 /// 返回 3 个值: 迭代器函数, 字符串 s, 初始位置 0
-fn call_codes(
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
+fn call_codes(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     let s = get_str_bytes(state, a, 0)?;
     let lax = nargs >= 2 && get_bool_arg(state, a, 1, false);
 
@@ -696,16 +705,20 @@ fn call_iter(
 
     let s_bytes: Vec<u8> = match &s_val {
         TValue::Str(s) => s.as_str().as_bytes().to_vec(),
-        _ => return Err(VmError::RuntimeError(
-            "bad argument #1 to 'iter' (string expected)".to_string(),
-        )),
+        _ => {
+            return Err(VmError::RuntimeError(
+                "bad argument #1 to 'iter' (string expected)".to_string(),
+            ))
+        }
     };
     let n: i64 = match &n_val {
         TValue::Integer(n) => *n,
         TValue::Float(f) => *f as i64,
-        _ => return Err(VmError::RuntimeError(
-            "bad argument #2 to 'iter' (number expected)".to_string(),
-        )),
+        _ => {
+            return Err(VmError::RuntimeError(
+                "bad argument #2 to 'iter' (number expected)".to_string(),
+            ))
+        }
     };
 
     let len = s_bytes.len();
@@ -737,10 +750,15 @@ fn call_iter(
             if next_pos < len && iscont(s_bytes[next_pos]) {
                 return Err(VmError::RuntimeError(MSG_INVALID.to_string()));
             }
-            push_results(state, a, nresults, vec![
-                TValue::Integer((pos + 1) as i64), // 1-based 位置
-                TValue::Integer(code as i64),
-            ]);
+            push_results(
+                state,
+                a,
+                nresults,
+                vec![
+                    TValue::Integer((pos + 1) as i64), // 1-based 位置
+                    TValue::Integer(code as i64),
+                ],
+            );
             Ok(())
         }
         None => Err(VmError::RuntimeError(MSG_INVALID.to_string())),
@@ -818,9 +836,15 @@ mod tests {
         // 3-byte: U+FFFF
         assert_eq!(utf8_decode(&[0xEF, 0xBF, 0xBF], false), Some((3, 0xFFFF)));
         // 4-byte: U+10000
-        assert_eq!(utf8_decode(&[0xF0, 0x90, 0x80, 0x80], false), Some((4, 0x10000)));
+        assert_eq!(
+            utf8_decode(&[0xF0, 0x90, 0x80, 0x80], false),
+            Some((4, 0x10000))
+        );
         // 4-byte: U+10FFFF
-        assert_eq!(utf8_decode(&[0xF4, 0x8F, 0xBF, 0xBF], false), Some((4, 0x10FFFF)));
+        assert_eq!(
+            utf8_decode(&[0xF4, 0x8F, 0xBF, 0xBF], false),
+            Some((4, 0x10FFFF))
+        );
     }
 
     #[test]
@@ -828,7 +852,7 @@ mod tests {
         // 代理区码点在 strict 模式下应失败
         assert_eq!(utf8_decode(&[0xED, 0xA0, 0x80], true), None); // U+D800
         assert_eq!(utf8_decode(&[0xED, 0xBF, 0xBF], true), None); // U+DFFF
-        // 在 lax 模式下应成功
+                                                                  // 在 lax 模式下应成功
         assert_eq!(utf8_decode(&[0xED, 0xA0, 0x80], false), Some((3, 0xD800)));
         assert_eq!(utf8_decode(&[0xED, 0xBF, 0xBF], false), Some((3, 0xDFFF)));
     }
@@ -876,8 +900,14 @@ mod tests {
     #[test]
     fn test_utf8_encode_large() {
         // 原始 UTF-8 值 (非 Unicode)
-        assert_eq!(utf8_encode(0x4000000), vec![0xFC, 0x84, 0x80, 0x80, 0x80, 0x80]);
-        assert_eq!(utf8_encode(0x7FFFFFFF), vec![0xFD, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF]);
+        assert_eq!(
+            utf8_encode(0x4000000),
+            vec![0xFC, 0x84, 0x80, 0x80, 0x80, 0x80]
+        );
+        assert_eq!(
+            utf8_encode(0x7FFFFFFF),
+            vec![0xFD, 0xBF, 0xBF, 0xBF, 0xBF, 0xBF]
+        );
     }
 
     // ========================================================================
@@ -920,7 +950,10 @@ mod tests {
 
     #[test]
     fn test_utf8_char_multibyte() {
-        assert_eq!(utf8_char_impl(&[0x10FFFF]).unwrap(), vec![0xF4, 0x8F, 0xBF, 0xBF]);
+        assert_eq!(
+            utf8_char_impl(&[0x10FFFF]).unwrap(),
+            vec![0xF4, 0x8F, 0xBF, 0xBF]
+        );
     }
 
     #[test]

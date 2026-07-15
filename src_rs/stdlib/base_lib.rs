@@ -12,11 +12,11 @@
 //! - 标签 1-6: 原有临时实现 (print, setmetatable, getmetatable, type, pcall, error)
 //! - 标签 7+: 新增基础库函数
 
-use crate::objects::{NilKind, Proto, TValue, LClosure, UpVal, UpValRef};
-use crate::state::LuaState;
 use crate::execute::VmError;
-use crate::strings::LuaString;
 use crate::gc::GCObjectHeader;
+use crate::objects::{LClosure, NilKind, Proto, TValue, UpVal, UpValRef};
+use crate::state::LuaState;
+use crate::strings::LuaString;
 use std::io::Write;
 
 // ============================================================================
@@ -70,16 +70,24 @@ pub const BASE_NEXT_ITER: usize = 21;
 
 /// 标签是否属于基础库
 pub fn is_base_tag(tag: usize) -> bool {
-    (tag >= BASE_PRINT && tag <= BASE_WARN) || tag == BASE_REQUIRE || tag == BASE_LOAD
-        || tag == BASE_COLLECTGARBAGE || tag == BASE_DOFILE || tag == BASE_LOADFILE
-        || tag == BASE_LOADLIB || tag == BASE_SEARCHPATH
+    (tag >= BASE_PRINT && tag <= BASE_WARN)
+        || tag == BASE_REQUIRE
+        || tag == BASE_LOAD
+        || tag == BASE_COLLECTGARBAGE
+        || tag == BASE_DOFILE
+        || tag == BASE_LOADFILE
+        || tag == BASE_LOADLIB
+        || tag == BASE_SEARCHPATH
 }
 
 /// 判断标签是否为已知的函数标签 (用于 type/tostring 显示)
 ///
 /// 包括基础库函数标签 (1-19)、迭代器辅助函数标签 (20-21) 和字符串库标签 (100+)
 pub fn is_function_tag(tag: usize) -> bool {
-    is_base_tag(tag) || tag == BASE_IPAIRS_AUX || tag == BASE_NEXT_ITER || tag >= 100
+    is_base_tag(tag)
+        || tag == BASE_IPAIRS_AUX
+        || tag == BASE_NEXT_ITER
+        || tag >= 100
         || (tag >= BASE_SEARCHER_PRELOAD && tag <= BASE_SEARCHER_CROOT)
 }
 
@@ -122,7 +130,11 @@ fn format_float(f: f64) -> String {
         return "nan".to_string();
     }
     if f.is_infinite() {
-        return if f > 0.0 { "inf".to_string() } else { "-inf".to_string() };
+        return if f > 0.0 {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        };
     }
     let s = format!("{}", f);
     // 如果结果看起来像整数 (只有数字和负号), 添加 ".0"
@@ -252,9 +264,7 @@ pub fn base_tonumber(v: &TValue, base: Option<i64>) -> Option<TValue> {
                 return None;
             }
             match v {
-                TValue::Str(s) => {
-                    b_str2int(s.as_str(), b as u32).map(TValue::Integer)
-                }
+                TValue::Str(s) => b_str2int(s.as_str(), b as u32).map(TValue::Integer),
                 _ => None,
             }
         }
@@ -289,7 +299,10 @@ pub fn base_rawlen(v: &TValue) -> Result<i64, String> {
     match v {
         TValue::Table(t) => Ok(t.len()),
         TValue::Str(s) => Ok(s.len() as i64),
-        _ => Err(format!("table or string expected, got {}", base_type_name(v))),
+        _ => Err(format!(
+            "table or string expected, got {}",
+            base_type_name(v)
+        )),
     }
 }
 
@@ -452,7 +465,10 @@ pub fn call_base_function(
                 "package.searchers functions are not directly callable".to_string(),
             ))
         }
-        _ => Err(VmError::RuntimeError(format!("unknown base function tag: {}", tag))),
+        _ => Err(VmError::RuntimeError(format!(
+            "unknown base function tag: {}",
+            tag
+        ))),
     };
 
     // 函数正常返回时恢复之前的 C 函数名
@@ -508,26 +524,26 @@ fn call_setmetatable(
         let arg1_ref = &mut state.stack[a + 1];
         match arg1_ref {
             TValue::Table(t) => {
-            // 检查是否有 __metatable 元方法 (受保护的元表)
-            if let Some(mt) = t.get_metatable() {
-                if mt.get(&metatable_key).is_some() {
-                    return Err(VmError::RuntimeError(
-                        "cannot change a protected metatable".to_string(),
-                    ));
+                // 检查是否有 __metatable 元方法 (受保护的元表)
+                if let Some(mt) = t.get_metatable() {
+                    if mt.get(&metatable_key).is_some() {
+                        return Err(VmError::RuntimeError(
+                            "cannot change a protected metatable".to_string(),
+                        ));
+                    }
                 }
+                // 设置元表
+                match &arg2 {
+                    TValue::Table(mt) => {
+                        t.set_metatable(Some(mt.clone()));
+                    }
+                    TValue::Nil(_) => {
+                        t.set_metatable(None);
+                    }
+                    _ => unreachable!(),
+                }
+                state.stack[a + 1].clone()
             }
-            // 设置元表
-            match &arg2 {
-                TValue::Table(mt) => {
-                    t.set_metatable(Some(mt.clone()));
-                }
-                TValue::Nil(_) => {
-                    t.set_metatable(None);
-                }
-                _ => unreachable!(),
-            }
-            state.stack[a + 1].clone()
-        }
             _ => {
                 return Err(VmError::RuntimeError(
                     "bad argument #1 to 'setmetatable' (table expected)".to_string(),
@@ -636,31 +652,33 @@ fn call_pcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
     // push pcall 保护状态 — 对应 C Lua 的 CIST_YPCALL
     // yield 穿过 pcall 后，pcall 的 C 函数栈帧被销毁，但保护状态保留。
     // 当 inner_func 后续执行 error/return 时，由 execute_loop 检查并处理。
-    state.pcall_protection_stack.push(crate::state::PcallProtection {
-        saved_code: state.code.clone(),
-        saved_constants: state.constants.clone(),
-        saved_upval_descs: state.upval_descs.clone(),
-        saved_protos: state.protos.clone(),
-        saved_base: state.base,
-        saved_pc: state.pc,
-        saved_num_params: state.num_params,
-        saved_is_vararg: state.is_vararg,
-        saved_proto_flag: state.proto_flag,
-        saved_nextraargs: state.nextraargs,
-        saved_closure_upvals: state.closure_upvals.clone(),
-        saved_tbc_list: state.tbc_list,
-        func_idx: a,
-        // 保存 pcall 调用者期望的返回值数 (非 state.pcall 的 -1)，
-        // 供 finish_pcall_return continuation 调整栈使用。
-        nresults,
-        pcall_kind: crate::state::PcallKind::Pcall,
-        saved_filled: false,
-        is_metamethod: false,
-        metamethod_res: 0,
-        saved_call_stack_len: 0,
-        is_close_continuation: false,
-        is_pairs_continuation: false,
-    });
+    state
+        .pcall_protection_stack
+        .push(crate::state::PcallProtection {
+            saved_code: state.code.clone(),
+            saved_constants: state.constants.clone(),
+            saved_upval_descs: state.upval_descs.clone(),
+            saved_protos: state.protos.clone(),
+            saved_base: state.base,
+            saved_pc: state.pc,
+            saved_num_params: state.num_params,
+            saved_is_vararg: state.is_vararg,
+            saved_proto_flag: state.proto_flag,
+            saved_nextraargs: state.nextraargs,
+            saved_closure_upvals: state.closure_upvals.clone(),
+            saved_tbc_list: state.tbc_list,
+            func_idx: a,
+            // 保存 pcall 调用者期望的返回值数 (非 state.pcall 的 -1)，
+            // 供 finish_pcall_return continuation 调整栈使用。
+            nresults,
+            pcall_kind: crate::state::PcallKind::Pcall,
+            saved_filled: false,
+            is_metamethod: false,
+            metamethod_res: 0,
+            saved_call_stack_len: 0,
+            is_close_continuation: false,
+            is_pairs_continuation: false,
+        });
     let pcall_protection_idx = state.pcall_protection_stack.len() - 1;
 
     let status = state.pcall(pcall_nargs, -1, 0);
@@ -848,7 +866,11 @@ fn lua_l_where(state: &LuaState, level: usize) -> String {
             _ => return String::new(),
         };
         // return_pc - 1 是调用当前函数的 OP_CALL 指令的 PC
-        let call_pc = if frame.return_pc > 0 { frame.return_pc - 1 } else { 0 };
+        let call_pc = if frame.return_pc > 0 {
+            frame.return_pc - 1
+        } else {
+            0
+        };
         let line = get_func_line(&closure.proto, call_pc);
         if line <= 0 {
             return String::new();
@@ -873,13 +895,13 @@ fn call_error(state: &mut LuaState, a: usize, nargs: usize, _nresults: i32) -> R
     };
     // 对应 C Lua 的 error(): 字符串且 level > 0 时添加位置前缀；其他情况原样返回
     // 对于非字符串或 level==0，错误消息不应被 build_traceback 再加前缀
-    state.error_no_prefix = true;  // 默认不要前缀（非字符串/level=0 路径）
+    state.error_no_prefix = true; // 默认不要前缀（非字符串/level=0 路径）
     if let TValue::Str(s) = &msg {
         let mut err_msg = s.as_str().to_string();
         if level > 0 {
             let prefix = lua_l_where(state, level as usize);
             err_msg = format!("{}{}", prefix, err_msg);
-            state.error_no_prefix = false;  // 字符串 + level>0：已加前缀，build_traceback 不再处理
+            state.error_no_prefix = false; // 字符串 + level>0：已加前缀，build_traceback 不再处理
         }
         state.last_error_value = Some(TValue::Str(state.intern_str(&err_msg)));
         Err(VmError::RuntimeError(err_msg))
@@ -1049,10 +1071,12 @@ fn call_tostring(
     // 无 __tostring 元方法: 使用默认转换
     // 对应 C 的 luaL_tolstring default 分支: "%s: %p" 用 obj_type_name
     let s = match &arg {
-        TValue::Integer(_) | TValue::Float(_) | TValue::Str(_) |
-        TValue::Boolean(_) | TValue::Nil(_) | TValue::LightUserData(_) => {
-            lua_value_to_string(&arg)
-        }
+        TValue::Integer(_)
+        | TValue::Float(_)
+        | TValue::Str(_)
+        | TValue::Boolean(_)
+        | TValue::Nil(_)
+        | TValue::LightUserData(_) => lua_value_to_string(&arg),
         _ => format!("{}: 0x0", crate::tm::obj_type_name(&arg)),
     };
     push_single_result(state, a, nresults, TValue::Str(state.intern_str(&s)));
@@ -1060,12 +1084,7 @@ fn call_tostring(
 }
 
 /// assert(v [, message]) — 对应 C 的 luaB_assert
-fn call_assert(
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
+fn call_assert(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     // C 中 luaB_assert 先检查 lua_toboolean(L, 1)，无参数时返回 false 进入 else 分支，
     // 然后 luaL_checkany(L, 1) 触发 "bad argument #1 (value expected)" 错误
     if nargs == 0 {
@@ -1097,12 +1116,7 @@ fn call_assert(
 }
 
 /// select(n, ...) — 对应 C 的 luaB_select
-fn call_select(
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
+fn call_select(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'select' (value expected)".to_string(),
@@ -1245,8 +1259,8 @@ fn call_next(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 
     match &t {
         TValue::Table(table) => {
-            let (next_key, next_val) = table_next(table, &key)
-                .map_err(|e| VmError::RuntimeError(e.to_string()))?;
+            let (next_key, next_val) =
+                table_next(table, &key).map_err(|e| VmError::RuntimeError(e.to_string()))?;
             match next_key {
                 Some(k) => {
                     push_results(state, a, nresults, vec![k, next_val]);
@@ -1293,9 +1307,7 @@ fn call_pairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
     // 对应 C luaB_pairs: 检查 __pairs 元方法
     let pairs_key = TValue::Str(state.intern_str("__pairs"));
     let meta_pairs = match &t {
-        TValue::Table(tbl) => {
-            tbl.get_metatable().and_then(|mt| mt.get(&pairs_key))
-        }
+        TValue::Table(tbl) => tbl.get_metatable().and_then(|mt| mt.get(&pairs_key)),
         _ => None,
     };
 
@@ -1316,29 +1328,31 @@ fn call_pairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
         // __pairs 内部 yield 时，call_pairs 返回 Yield，保护状态保留。
         // resume 时 __pairs 返回，op_return 检查 pcall_protection_stack，
         // 调用 finish_pcall_return 执行 continuation（不 push true 前缀）。
-        state.pcall_protection_stack.push(crate::state::PcallProtection {
-            saved_code: state.code.clone(),
-            saved_constants: state.constants.clone(),
-            saved_upval_descs: state.upval_descs.clone(),
-            saved_protos: state.protos.clone(),
-            saved_base: state.base,
-            saved_pc: state.pc + 1,  // 跳过调用 pairs 的 CALL 指令
-            saved_num_params: state.num_params,
-            saved_is_vararg: state.is_vararg,
-            saved_proto_flag: state.proto_flag,
-            saved_nextraargs: state.nextraargs,
-            saved_closure_upvals: state.closure_upvals.clone(),
-            saved_tbc_list: state.tbc_list,
-            func_idx: a,
-            nresults,
-            pcall_kind: crate::state::PcallKind::Pcall,
-            saved_filled: false,
-            is_metamethod: false,
-            metamethod_res: 0,
-            saved_call_stack_len: 0,
-            is_close_continuation: false,
-            is_pairs_continuation: true,
-        });
+        state
+            .pcall_protection_stack
+            .push(crate::state::PcallProtection {
+                saved_code: state.code.clone(),
+                saved_constants: state.constants.clone(),
+                saved_upval_descs: state.upval_descs.clone(),
+                saved_protos: state.protos.clone(),
+                saved_base: state.base,
+                saved_pc: state.pc + 1, // 跳过调用 pairs 的 CALL 指令
+                saved_num_params: state.num_params,
+                saved_is_vararg: state.is_vararg,
+                saved_proto_flag: state.proto_flag,
+                saved_nextraargs: state.nextraargs,
+                saved_closure_upvals: state.closure_upvals.clone(),
+                saved_tbc_list: state.tbc_list,
+                func_idx: a,
+                nresults,
+                pcall_kind: crate::state::PcallKind::Pcall,
+                saved_filled: false,
+                is_metamethod: false,
+                metamethod_res: 0,
+                saved_call_stack_len: 0,
+                is_close_continuation: false,
+                is_pairs_continuation: true,
+            });
 
         // state.pcall(1, 4): 1 arg (t), 4 results
         let status = state.pcall(1, 4, 0);
@@ -1353,19 +1367,30 @@ fn call_pairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
         state.pcall_protection_stack.pop();
 
         // 取 __pairs 的 4 个返回值 (state.pcall 已调整栈到 a..a+4)
-        let results: Vec<TValue> = (0..4).map(|i| {
-            state.stack.get(a + i).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
-        }).collect();
+        let results: Vec<TValue> = (0..4)
+            .map(|i| {
+                state
+                    .stack
+                    .get(a + i)
+                    .cloned()
+                    .unwrap_or(TValue::Nil(NilKind::Strict))
+            })
+            .collect();
         push_results(state, a, nresults, results);
     } else {
         // 无 __pairs: 返回 next, t, nil, nil (第 4 个 nil 是 TBC 占位)
         let next_fn = TValue::LightUserData(BASE_NEXT_ITER as *mut std::ffi::c_void);
-        push_results(state, a, nresults, vec![
-            next_fn,
-            t,
-            TValue::Nil(NilKind::Strict),
-            TValue::Nil(NilKind::Strict),
-        ]);
+        push_results(
+            state,
+            a,
+            nresults,
+            vec![
+                next_fn,
+                t,
+                TValue::Nil(NilKind::Strict),
+                TValue::Nil(NilKind::Strict),
+            ],
+        );
     }
     Ok(())
 }
@@ -1396,31 +1421,35 @@ fn call_xpcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     // push pcall 保护状态 — 对应 C Lua 的 CIST_YPCALL
     // yield 穿过 xpcall 后，xpcall 的 C 函数栈帧被销毁，但保护状态保留。
     // 当 inner_func 后续执行 error/return 时，由 execute_loop 检查并处理。
-    state.pcall_protection_stack.push(crate::state::PcallProtection {
-        saved_code: state.code.clone(),
-        saved_constants: state.constants.clone(),
-        saved_upval_descs: state.upval_descs.clone(),
-        saved_protos: state.protos.clone(),
-        saved_base: state.base,
-        saved_pc: state.pc,
-        saved_num_params: state.num_params,
-        saved_is_vararg: state.is_vararg,
-        saved_proto_flag: state.proto_flag,
-        saved_nextraargs: state.nextraargs,
-        saved_closure_upvals: state.closure_upvals.clone(),
-        saved_tbc_list: state.tbc_list,
-        func_idx: a,
-        // 保存 xpcall 调用者期望的返回值数 (非 state.pcall 的 -1)，
-        // 供 finish_pcall_return continuation 调整栈使用。
-        nresults,
-        pcall_kind: crate::state::PcallKind::Xpcall { handler: err_fn.clone() },
-        saved_filled: false,
-        is_metamethod: false,
-        metamethod_res: 0,
-        saved_call_stack_len: 0,
-        is_close_continuation: false,
-        is_pairs_continuation: false,
-    });
+    state
+        .pcall_protection_stack
+        .push(crate::state::PcallProtection {
+            saved_code: state.code.clone(),
+            saved_constants: state.constants.clone(),
+            saved_upval_descs: state.upval_descs.clone(),
+            saved_protos: state.protos.clone(),
+            saved_base: state.base,
+            saved_pc: state.pc,
+            saved_num_params: state.num_params,
+            saved_is_vararg: state.is_vararg,
+            saved_proto_flag: state.proto_flag,
+            saved_nextraargs: state.nextraargs,
+            saved_closure_upvals: state.closure_upvals.clone(),
+            saved_tbc_list: state.tbc_list,
+            func_idx: a,
+            // 保存 xpcall 调用者期望的返回值数 (非 state.pcall 的 -1)，
+            // 供 finish_pcall_return continuation 调整栈使用。
+            nresults,
+            pcall_kind: crate::state::PcallKind::Xpcall {
+                handler: err_fn.clone(),
+            },
+            saved_filled: false,
+            is_metamethod: false,
+            metamethod_res: 0,
+            saved_call_stack_len: 0,
+            is_close_continuation: false,
+            is_pairs_continuation: false,
+        });
     let xpcall_protection_idx = state.pcall_protection_stack.len() - 1;
 
     let status = state.pcall(xpcall_nargs, -1, 0);
@@ -1732,7 +1761,11 @@ fn get_preload(state: &LuaState, modname: &str) -> Option<TValue> {
         let preload_key = TValue::Str(state.intern_str("preload"));
         if let Some(TValue::Table(preload_table)) = package_table.get(&preload_key) {
             let mod_key = TValue::Str(state.intern_str(modname));
-            return Some(preload_table.get(&mod_key).unwrap_or(TValue::Nil(NilKind::Strict)));
+            return Some(
+                preload_table
+                    .get(&mod_key)
+                    .unwrap_or(TValue::Nil(NilKind::Strict)),
+            );
         }
     }
     None
@@ -1769,7 +1802,12 @@ fn run_loader(
         result
     };
     cache_module_loaded(state, modname, result.clone());
-    push_results(state, a, nresults, vec![result, TValue::Str(state.intern_str(loader_data))]);
+    push_results(
+        state,
+        a,
+        nresults,
+        vec![result, TValue::Str(state.intern_str(loader_data))],
+    );
     Ok(())
 }
 
@@ -1839,7 +1877,12 @@ fn load_lua_module(
     };
     // 确保最终结果也缓存
     cache_module_loaded(state, modname, result.clone());
-    push_results(state, a, nresults, vec![result, TValue::Str(state.intern_str(filepath))]);
+    push_results(
+        state,
+        a,
+        nresults,
+        vec![result, TValue::Str(state.intern_str(filepath))],
+    );
     Ok(())
 }
 
@@ -1853,7 +1896,13 @@ fn load_lua_module(
 /// 模板中 ? 替换为 name。返回 (找到的路径, 错误消息)。
 /// 找到时错误消息为空；未找到时路径为 None，错误消息列出所有尝试的文件。
 /// path 不是字符串时返回 Err（对应 C 的 luaL_error）。
-fn findfile(state: &LuaState, name: &str, fieldname: &str, dirsep: &str, sep: &str) -> Result<(Option<String>, String), String> {
+fn findfile(
+    state: &LuaState,
+    name: &str,
+    fieldname: &str,
+    dirsep: &str,
+    sep: &str,
+) -> Result<(Option<String>, String), String> {
     let path = match get_package_table(state) {
         Some(t) => {
             let path_key = TValue::Str(state.intern_str(fieldname));
@@ -1882,7 +1931,13 @@ fn findfile(state: &LuaState, name: &str, fieldname: &str, dirsep: &str, sep: &s
 }
 
 /// 旧版兼容：仅返回找到的路径，不返回错误消息
-fn search_path(state: &LuaState, name: &str, fieldname: &str, dirsep: &str, sep: &str) -> Result<Option<String>, String> {
+fn search_path(
+    state: &LuaState,
+    name: &str,
+    fieldname: &str,
+    dirsep: &str,
+    sep: &str,
+) -> Result<Option<String>, String> {
     findfile(state, name, fieldname, dirsep, sep).map(|(opt, _)| opt)
 }
 
@@ -1938,14 +1993,16 @@ fn load_c_root(state: &mut LuaState, filepath: &str, modname: &str) -> Result<TV
 
 /// loadlib 错误类型
 enum LoadlibError {
-    LibNotFound(String),  // dlopen 失败，错误消息
-    FuncNotFound,         // dlsym 失败
+    LibNotFound(String), // dlopen 失败，错误消息
+    FuncNotFound,        // dlsym 失败
 }
 
 impl LoadlibError {
     fn to_error_msg(&self, filename: &str) -> String {
         match self {
-            LoadlibError::LibNotFound(msg) => format!("error loading module at file '{}': {}", filename, msg),
+            LoadlibError::LibNotFound(msg) => {
+                format!("error loading module at file '{}': {}", filename, msg)
+            }
             LoadlibError::FuncNotFound => format!("no symbol 'luaopen_' in file '{}'", filename),
         }
     }
@@ -1971,13 +2028,21 @@ unsafe fn sys_load(path: &str, seeglb: bool) -> *mut std::ffi::c_void {
 }
 
 /// dlsym 查找符号，返回函数指针
-unsafe fn sys_sym(lib: *mut std::ffi::c_void, sym: &str) -> Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> i32> {
+unsafe fn sys_sym(
+    lib: *mut std::ffi::c_void,
+    sym: &str,
+) -> Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> i32> {
     let csym = std::ffi::CString::new(sym).ok()?;
     let ptr = unsafe { libc::dlsym(lib, csym.as_ptr()) };
     if ptr.is_null() {
         None
     } else {
-        Some(unsafe { std::mem::transmute::<*mut std::ffi::c_void, unsafe extern "C" fn(*mut std::ffi::c_void) -> i32>(ptr) })
+        Some(unsafe {
+            std::mem::transmute::<
+                *mut std::ffi::c_void,
+                unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
+            >(ptr)
+        })
     }
 }
 
@@ -1987,7 +2052,9 @@ unsafe fn sys_dlerror() -> String {
     if ptr.is_null() {
         String::new()
     } else {
-        unsafe { std::ffi::CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+        unsafe { std::ffi::CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -2025,7 +2092,9 @@ fn lookforfunc(state: &mut LuaState, path: &str, sym: &str) -> Result<TValue, Lo
             Some(TValue::Table(t)) => t,
             _ => {
                 let new_clibs = crate::table::Table::new();
-                state.registry.set(clibs_key.clone(), TValue::Table(new_clibs.clone()));
+                state
+                    .registry
+                    .set(clibs_key.clone(), TValue::Table(new_clibs.clone()));
                 new_clibs
             }
         };
@@ -2069,15 +2138,19 @@ fn call_loadlib(
     let init_val = get_arg(state, a, 1);
     let path = match &path_val {
         TValue::Str(s) => s.as_str().to_string(),
-        _ => return Err(VmError::RuntimeError(
-            "bad argument #1 to 'loadlib' (string expected)".to_string(),
-        )),
+        _ => {
+            return Err(VmError::RuntimeError(
+                "bad argument #1 to 'loadlib' (string expected)".to_string(),
+            ))
+        }
     };
     let init = match &init_val {
         TValue::Str(s) => s.as_str().to_string(),
-        _ => return Err(VmError::RuntimeError(
-            "bad argument #2 to 'loadlib' (string expected)".to_string(),
-        )),
+        _ => {
+            return Err(VmError::RuntimeError(
+                "bad argument #2 to 'loadlib' (string expected)".to_string(),
+            ))
+        }
     };
 
     match lookforfunc(state, &path, &init) {
@@ -2087,20 +2160,30 @@ fn call_loadlib(
         }
         Err(LoadlibError::LibNotFound(msg)) => {
             // 返回 (nil, errmsg, "open")
-            push_results(state, a, nresults, vec![
-                TValue::Nil(NilKind::Strict),
-                TValue::Str(state.intern_str(&msg)),
-                TValue::Str(state.intern_str("open")),
-            ]);
+            push_results(
+                state,
+                a,
+                nresults,
+                vec![
+                    TValue::Nil(NilKind::Strict),
+                    TValue::Str(state.intern_str(&msg)),
+                    TValue::Str(state.intern_str("open")),
+                ],
+            );
             Ok(())
         }
         Err(LoadlibError::FuncNotFound) => {
             let msg = unsafe { sys_dlerror() };
-            push_results(state, a, nresults, vec![
-                TValue::Nil(NilKind::Strict),
-                TValue::Str(state.intern_str(&msg)),
-                TValue::Str(state.intern_str("init")),
-            ]);
+            push_results(
+                state,
+                a,
+                nresults,
+                vec![
+                    TValue::Nil(NilKind::Strict),
+                    TValue::Str(state.intern_str(&msg)),
+                    TValue::Str(state.intern_str("init")),
+                ],
+            );
             Ok(())
         }
     }
@@ -2125,15 +2208,19 @@ fn call_searchpath(
     let path_val = get_arg(state, a, 1);
     let name = match &name_val {
         TValue::Str(s) => s.as_str().to_string(),
-        _ => return Err(VmError::RuntimeError(
-            "bad argument #1 to 'searchpath' (string expected)".to_string(),
-        )),
+        _ => {
+            return Err(VmError::RuntimeError(
+                "bad argument #1 to 'searchpath' (string expected)".to_string(),
+            ))
+        }
     };
     let path = match &path_val {
         TValue::Str(s) => s.as_str().to_string(),
-        _ => return Err(VmError::RuntimeError(
-            "bad argument #2 to 'searchpath' (string expected)".to_string(),
-        )),
+        _ => {
+            return Err(VmError::RuntimeError(
+                "bad argument #2 to 'searchpath' (string expected)".to_string(),
+            ))
+        }
     };
     let sep = match nargs >= 3 {
         true => match &get_arg(state, a, 2) {
@@ -2160,16 +2247,26 @@ fn call_searchpath(
     for template in path.split(';') {
         let filepath = template.replace('?', &name_replaced);
         if std::path::Path::new(&filepath).is_file() {
-            push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&filepath))]);
+            push_results(
+                state,
+                a,
+                nresults,
+                vec![TValue::Str(state.intern_str(&filepath))],
+            );
             return Ok(());
         }
         err_paths.push(filepath);
     }
     let errmsg = format!("no file '{}'", err_paths.join("'\n\tno file '"));
-    push_results(state, a, nresults, vec![
-        TValue::Nil(NilKind::Strict),
-        TValue::Str(state.intern_str(&errmsg)),
-    ]);
+    push_results(
+        state,
+        a,
+        nresults,
+        vec![
+            TValue::Nil(NilKind::Strict),
+            TValue::Str(state.intern_str(&errmsg)),
+        ],
+    );
     Ok(())
 }
 
@@ -2244,7 +2341,9 @@ fn setpath(state: &LuaState, envname: &str, dft: &str) -> String {
     let path = if noenv {
         None
     } else {
-        std::env::var(&nver).ok().or_else(|| std::env::var(envname).ok())
+        std::env::var(&nver)
+            .ok()
+            .or_else(|| std::env::var(envname).ok())
     };
 
     let path = match path {
@@ -2334,7 +2433,9 @@ fn init_package_table(state: &mut LuaState) {
         TValue::Str(state.intern_str("searchers")),
         TValue::Table(searchers),
     );
-    state.globals.set(package_key.clone(), TValue::Table(pkg.clone()));
+    state
+        .globals
+        .set(package_key.clone(), TValue::Table(pkg.clone()));
     // 同时在 registry 中保存 package 表引用 — 对应 C 版 ll_require 通过
     // upvalue 访问 package 表。这样 Lua 代码 `package = {}` 重置全局变量后，
     // require 仍能访问注册时的 package 表（含 loaded/preload/searchers）。
@@ -2370,12 +2471,7 @@ fn get_package_table(state: &LuaState) -> Option<crate::table::Table> {
 ///
 /// 错误处理: 编译失败或 reader 抛错时返回 (nil, error_msg), 不向上抛错
 /// (对应 C 的 load_aux 中 status != LUA_OK 的分支)。
-fn call_load(
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
+fn call_load(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'load' (string expected, got no value)".to_string(),
@@ -2456,7 +2552,7 @@ fn call_load(
     //     → 用 nil (覆盖 lua_load 设置的全局表)
     //   - nargs >= 4 且 env 非 nil: 用 env
     let env_val = if nargs >= 4 {
-        get_arg(state, a, 3)  // 即使是 nil 也直接用 (不替换为全局表)
+        get_arg(state, a, 3) // 即使是 nil 也直接用 (不替换为全局表)
     } else {
         TValue::Table(state.globals.clone())
     };
@@ -2510,10 +2606,15 @@ fn call_load(
                         "reader function must return a string".to_string()
                     };
                     state.stack.truncate(saved_len);
-                    push_results(state, a, nresults, vec![
-                        TValue::Nil(NilKind::Strict),
-                        TValue::Str(state.intern_str(&err_msg)),
-                    ]);
+                    push_results(
+                        state,
+                        a,
+                        nresults,
+                        vec![
+                            TValue::Nil(NilKind::Strict),
+                            TValue::Str(state.intern_str(&err_msg)),
+                        ],
+                    );
                     return Ok(());
                 }
                 let result = if saved_len < state.stack.len() {
@@ -2531,10 +2632,17 @@ fn call_load(
                         buffer.push_str(s.as_str());
                     }
                     _ => {
-                        push_results(state, a, nresults, vec![
-                            TValue::Nil(NilKind::Strict),
-                            TValue::Str(state.intern_str("reader function must return a string")),
-                        ]);
+                        push_results(
+                            state,
+                            a,
+                            nresults,
+                            vec![
+                                TValue::Nil(NilKind::Strict),
+                                TValue::Str(
+                                    state.intern_str("reader function must return a string"),
+                                ),
+                            ],
+                        );
                         return Ok(());
                     }
                 }
@@ -2566,18 +2674,28 @@ fn call_load(
     };
     if is_binary && !allows_binary {
         // 二进制但 mode 不允许 (mode = "t")
-        push_results(state, a, nresults, vec![
-            TValue::Nil(NilKind::Strict),
-            TValue::Str(state.intern_str("attempt to load a binary chunk (mode is 'text')")),
-        ]);
+        push_results(
+            state,
+            a,
+            nresults,
+            vec![
+                TValue::Nil(NilKind::Strict),
+                TValue::Str(state.intern_str("attempt to load a binary chunk (mode is 'text')")),
+            ],
+        );
         return Ok(());
     }
     if !is_binary && !allows_text {
         // 文本但 mode 不允许 (mode = "b")
-        push_results(state, a, nresults, vec![
-            TValue::Nil(NilKind::Strict),
-            TValue::Str(state.intern_str("attempt to load a text chunk (mode is 'binary')")),
-        ]);
+        push_results(
+            state,
+            a,
+            nresults,
+            vec![
+                TValue::Nil(NilKind::Strict),
+                TValue::Str(state.intern_str("attempt to load a text chunk (mode is 'binary')")),
+            ],
+        );
         return Ok(());
     }
 
@@ -2627,10 +2745,15 @@ fn call_load(
         }
         Err(err_msg) => {
             // 编译失败: 返回 nil + 错误消息 (对应 C 的 load_aux 失败分支)
-            push_results(state, a, nresults, vec![
-                TValue::Nil(NilKind::Strict),
-                TValue::Str(state.intern_str(&err_msg)),
-            ]);
+            push_results(
+                state,
+                a,
+                nresults,
+                vec![
+                    TValue::Nil(NilKind::Strict),
+                    TValue::Str(state.intern_str(&err_msg)),
+                ],
+            );
             Ok(())
         }
     }
@@ -2649,12 +2772,7 @@ fn call_load(
 ///   return lua_gettop(L);
 /// }
 /// ```
-fn call_dofile(
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
+fn call_dofile(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     let filename: Option<String> = if nargs > 0 {
         let arg = get_arg(state, a, 0);
         match &arg {
@@ -2691,7 +2809,10 @@ fn call_dofile(
         return Err(VmError::Yield(yield_values));
     }
     if call_status != 0 {
-        let err_val = state.stack.get(saved_len).cloned()
+        let err_val = state
+            .stack
+            .get(saved_len)
+            .cloned()
             .unwrap_or_else(|| TValue::Str(state.intern_str("dofile error")));
         state.settop(saved_len);
         match err_val {
@@ -2793,7 +2914,10 @@ fn call_loadfile(
     let status = state.load_filex(filename.as_deref(), mode.as_deref());
     if status == 0 {
         // 成功: 栈顶是加载的 chunk 函数
-        let chunk = state.stack.get(saved_len).cloned()
+        let chunk = state
+            .stack
+            .get(saved_len)
+            .cloned()
             .unwrap_or_else(|| TValue::Nil(NilKind::Strict));
         state.settop(saved_len);
         // 如果提供了 env 参数, 设置为闭包的第 1 个上值 (_ENV)
@@ -2811,14 +2935,19 @@ fn call_loadfile(
         push_results(state, a, nresults, vec![chunk]);
     } else {
         // 失败: 栈顶是错误消息
-        let err_msg = state.stack.get(saved_len).cloned()
+        let err_msg = state
+            .stack
+            .get(saved_len)
+            .cloned()
             .unwrap_or_else(|| TValue::Str(state.intern_str("loadfile error")));
         state.settop(saved_len);
         // 返回 nil + 错误消息
-        push_results(state, a, nresults, vec![
-            TValue::Nil(NilKind::Strict),
-            err_msg,
-        ]);
+        push_results(
+            state,
+            a,
+            nresults,
+            vec![TValue::Nil(NilKind::Strict), err_msg],
+        );
     }
     Ok(())
 }
@@ -2909,13 +3038,17 @@ pub fn table_next(
         if let TValue::Integer(i) = &key {
             if *i > 0 {
                 let idx = (*i - 1) as usize;
-                if idx < data.array.len() && !matches!(data.array[idx], TValue::Nil(NilKind::Empty)) {
+                if idx < data.array.len() && !matches!(data.array[idx], TValue::Nil(NilKind::Empty))
+                {
                     exists = true;
                 }
             }
         }
         if !exists {
-            exists = data.key_to_bucket.as_ref().map_or(false, |m| m.contains_key(&key));
+            exists = data
+                .key_to_bucket
+                .as_ref()
+                .map_or(false, |m| m.contains_key(&key));
         }
         exists
     };
@@ -2935,10 +3068,7 @@ pub fn table_next(
                 if next_idx < data.array.len() {
                     let next_val = &data.array[next_idx];
                     if !matches!(next_val, TValue::Nil(NilKind::Empty)) {
-                        return Ok((
-                            Some(TValue::Integer(next_idx as i64 + 1)),
-                            next_val.clone(),
-                        ));
+                        return Ok((Some(TValue::Integer(next_idx as i64 + 1)), next_val.clone()));
                     }
                 }
                 // 数组部分结束, 转到哈希部分
@@ -2962,7 +3092,7 @@ fn find_first(table: &crate::table::Table) -> (Option<TValue>, TValue) {
         }
     }
     drop(data); // 释放 borrow
-    // 数组部分为空, 查找哈希部分
+                // 数组部分为空, 查找哈希部分
     find_first_hash(table)
 }
 
@@ -2985,10 +3115,7 @@ fn find_first_hash(table: &crate::table::Table) -> (Option<TValue>, TValue) {
 /// 用 `key_to_bucket.get(key)` O(1) 定位 prev 的位置，然后线性扫描
 /// `hash_buckets[idx+1..]` 找下一个 live entry — 对应 C 的 findindex O(1)
 /// (C 用 hash→mainposition→chain 定位 node index)。
-fn find_next_hash(
-    table: &crate::table::Table,
-    key: &TValue,
-) -> (Option<TValue>, TValue) {
+fn find_next_hash(table: &crate::table::Table, key: &TValue) -> (Option<TValue>, TValue) {
     let data = table.data.borrow();
     let start_idx = match data.key_to_bucket.as_ref().and_then(|m| m.get(key)) {
         Some(&i) => i + 1,
@@ -3031,7 +3158,12 @@ pub fn call_ipairs_aux(
 
     // 对应 C 的 lua_geti → luaV_finishget: 支持 __index 元方法 (包括非 table 类型的元表)
     // ipairs 可用于非 table 值 (如带 __index 元方法的 userdata), 所以不限定 Table 类型
-    let val = crate::execute::VmExecutor::table_get(state, &t, &TValue::Integer(next_i), crate::execute::VarSource::None)?;
+    let val = crate::execute::VmExecutor::table_get(
+        state,
+        &t,
+        &TValue::Integer(next_i),
+        crate::execute::VarSource::None,
+    )?;
     if matches!(val, TValue::Nil(_)) {
         push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
     } else {
@@ -3075,10 +3207,12 @@ fn call_collectgarbage(
         match get_arg(state, a, 0) {
             TValue::Str(s) => s.as_str().to_string(),
             TValue::Nil(_) => "collect".to_string(),
-            ref other => return Err(VmError::RuntimeError(format!(
-                "bad argument #1 to 'collectgarbage' (string expected, got {})",
-                crate::tm::obj_type_name(other)
-            ))),
+            ref other => {
+                return Err(VmError::RuntimeError(format!(
+                    "bad argument #1 to 'collectgarbage' (string expected, got {})",
+                    crate::tm::obj_type_name(other)
+                )))
+            }
         }
     } else {
         "collect".to_string()
@@ -3137,9 +3271,7 @@ fn call_collectgarbage(
             let done = state.step_gc(siz);
             TValue::Boolean(done)
         }
-        "isrunning" => {
-            TValue::Boolean(state.gc.is_running())
-        }
+        "isrunning" => TValue::Boolean(state.gc.is_running()),
         "generational" => {
             let old = state.gc.set_mode(crate::gc::GCMode::Generational);
             let prev = if old == crate::gc::GCMode::Generational {
@@ -3162,10 +3294,12 @@ fn call_collectgarbage(
             use crate::gc::GCState;
             let pname = match get_arg(state, a, 1) {
                 TValue::Str(s) => s.as_str().to_string(),
-                ref other => return Err(VmError::RuntimeError(format!(
-                    "bad argument #2 to 'collectgarbage' (string expected, got {})",
-                    crate::tm::obj_type_name(other)
-                ))),
+                ref other => {
+                    return Err(VmError::RuntimeError(format!(
+                        "bad argument #2 to 'collectgarbage' (string expected, got {})",
+                        crate::tm::obj_type_name(other)
+                    )))
+                }
             };
             let pidx = match pname.as_str() {
                 "minormul" => GCState::PARAM_MINORMUL,
@@ -3174,19 +3308,23 @@ fn call_collectgarbage(
                 "pause" => GCState::PARAM_PAUSE,
                 "stepmul" => GCState::PARAM_STEPMUL,
                 "stepsize" => GCState::PARAM_STEPSIZE,
-                _ => return Err(VmError::RuntimeError(format!(
-                    "bad argument #2 to 'collectgarbage' (invalid parameter name '{}')",
-                    pname
-                ))),
+                _ => {
+                    return Err(VmError::RuntimeError(format!(
+                        "bad argument #2 to 'collectgarbage' (invalid parameter name '{}')",
+                        pname
+                    )))
+                }
             };
             if nargs >= 3 {
                 let val: i32 = match get_arg(state, a, 2) {
                     TValue::Integer(i) => i as i32,
                     TValue::Float(f) => f as i32,
-                    ref other => return Err(VmError::RuntimeError(format!(
-                        "bad argument #3 to 'collectgarbage' (number expected, got {})",
-                        crate::tm::obj_type_name(other)
-                    ))),
+                    ref other => {
+                        return Err(VmError::RuntimeError(format!(
+                            "bad argument #3 to 'collectgarbage' (number expected, got {})",
+                            crate::tm::obj_type_name(other)
+                        )))
+                    }
                 };
                 let old = state.gc.swap_gc_param(pidx, val);
                 TValue::Integer(old as i64)
@@ -3220,10 +3358,9 @@ pub fn open_base_lib(state: &mut LuaState) {
     // 注册所有基础库函数 (使用 LightUserData 标签)
     let register = |state: &mut LuaState, name: &str, tag: usize| {
         let key = TValue::Str(state.intern_str(name));
-        state.globals.set(
-            key,
-            TValue::LightUserData(tag as *mut std::ffi::c_void),
-        );
+        state
+            .globals
+            .set(key, TValue::LightUserData(tag as *mut std::ffi::c_void));
     };
 
     // 原有函数 (保持兼容性)
@@ -3261,10 +3398,9 @@ pub fn open_base_lib(state: &mut LuaState) {
 
     // 设置 _VERSION 全局变量
     let version_key = TValue::Str(state.intern_str("_VERSION"));
-    state.globals.set(
-        version_key,
-        TValue::Str(state.intern_str("Lua 5.5")),
-    );
+    state
+        .globals
+        .set(version_key, TValue::Str(state.intern_str("Lua 5.5")));
 
     // 初始化 package 表 (path + loaded),支持 require 从文件加载模块
     init_package_table(state);
@@ -3338,7 +3474,10 @@ mod tests {
         assert_eq!(base_type_name(&TValue::Integer(42)), "number");
         assert_eq!(base_type_name(&TValue::Float(3.14)), "number");
         assert_eq!(base_type_name(&make_str("hello")), "string");
-        assert_eq!(base_type_name(&TValue::Table(crate::table::Table::new())), "table");
+        assert_eq!(
+            base_type_name(&TValue::Table(crate::table::Table::new())),
+            "table"
+        );
     }
 
     // ========================================================================
@@ -3423,9 +3562,18 @@ mod tests {
 
     #[test]
     fn test_base_rawequal() {
-        assert!(base_rawequal(&TValue::Nil(NilKind::Strict), &TValue::Nil(NilKind::Empty)));
-        assert!(base_rawequal(&TValue::Boolean(true), &TValue::Boolean(true)));
-        assert!(!base_rawequal(&TValue::Boolean(true), &TValue::Boolean(false)));
+        assert!(base_rawequal(
+            &TValue::Nil(NilKind::Strict),
+            &TValue::Nil(NilKind::Empty)
+        ));
+        assert!(base_rawequal(
+            &TValue::Boolean(true),
+            &TValue::Boolean(true)
+        ));
+        assert!(!base_rawequal(
+            &TValue::Boolean(true),
+            &TValue::Boolean(false)
+        ));
         assert!(base_rawequal(&TValue::Integer(42), &TValue::Integer(42)));
         assert!(base_rawequal(&TValue::Integer(42), &TValue::Float(42.0)));
         assert!(base_rawequal(&make_str("a"), &make_str("a")));
@@ -3462,11 +3610,7 @@ mod tests {
 
     #[test]
     fn test_base_select_positive() {
-        let args = vec![
-            TValue::Integer(1),
-            TValue::Integer(2),
-            TValue::Integer(3),
-        ];
+        let args = vec![TValue::Integer(1), TValue::Integer(2), TValue::Integer(3)];
         let result = base_select(2, &args).unwrap();
         assert_eq!(result.len(), 2);
         assert_eq!(result[0], TValue::Integer(2));
@@ -3475,11 +3619,7 @@ mod tests {
 
     #[test]
     fn test_base_select_negative() {
-        let args = vec![
-            TValue::Integer(1),
-            TValue::Integer(2),
-            TValue::Integer(3),
-        ];
+        let args = vec![TValue::Integer(1), TValue::Integer(2), TValue::Integer(3)];
         let result = base_select(-1, &args).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], TValue::Integer(3));
@@ -3589,18 +3729,33 @@ mod tests {
         open_base_lib(&mut state);
 
         // 验证原有函数
-        for name in &["print", "setmetatable", "getmetatable", "type", "pcall", "error"] {
+        for name in &[
+            "print",
+            "setmetatable",
+            "getmetatable",
+            "type",
+            "pcall",
+            "error",
+        ] {
             let key = TValue::Str(state.intern_str(name));
-            assert!(state.globals.get(&key).is_some(), "{} must be registered", name);
+            assert!(
+                state.globals.get(&key).is_some(),
+                "{} must be registered",
+                name
+            );
         }
 
         // 验证新增函数
         for name in &[
-            "tonumber", "tostring", "assert", "select", "rawequal", "rawlen",
-            "rawget", "rawset", "next", "ipairs", "pairs", "xpcall", "warn",
+            "tonumber", "tostring", "assert", "select", "rawequal", "rawlen", "rawget", "rawset",
+            "next", "ipairs", "pairs", "xpcall", "warn",
         ] {
             let key = TValue::Str(state.intern_str(name));
-            assert!(state.globals.get(&key).is_some(), "{} must be registered", name);
+            assert!(
+                state.globals.get(&key).is_some(),
+                "{} must be registered",
+                name
+            );
         }
     }
 
@@ -3634,7 +3789,9 @@ mod tests {
     fn test_call_base_function_type() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(BASE_TYPE as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(BASE_TYPE as *mut std::ffi::c_void));
         state.stack.push(TValue::Integer(42));
         call_base_function(BASE_TYPE, &mut state, 0, 1, 1).unwrap();
         assert_eq!(state.stack.len(), 1);
@@ -3648,7 +3805,9 @@ mod tests {
     fn test_call_base_function_tonumber() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(BASE_TONUMBER as *mut std::ffi::c_void));
+        state.stack.push(TValue::LightUserData(
+            BASE_TONUMBER as *mut std::ffi::c_void,
+        ));
         state.stack.push(TValue::Str(state.intern_str("42")));
         call_base_function(BASE_TONUMBER, &mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
@@ -3661,7 +3820,9 @@ mod tests {
     fn test_call_base_function_tostring() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(BASE_TOSTRING as *mut std::ffi::c_void));
+        state.stack.push(TValue::LightUserData(
+            BASE_TOSTRING as *mut std::ffi::c_void,
+        ));
         state.stack.push(TValue::Integer(42));
         call_base_function(BASE_TOSTRING, &mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
@@ -3674,7 +3835,9 @@ mod tests {
     fn test_call_base_function_rawequal() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(BASE_RAWEQUAL as *mut std::ffi::c_void));
+        state.stack.push(TValue::LightUserData(
+            BASE_RAWEQUAL as *mut std::ffi::c_void,
+        ));
         state.stack.push(TValue::Integer(42));
         state.stack.push(TValue::Integer(42));
         call_base_function(BASE_RAWEQUAL, &mut state, 0, 2, 1).unwrap();
@@ -3688,7 +3851,9 @@ mod tests {
     fn test_call_base_function_rawlen() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(BASE_RAWLEN as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(BASE_RAWLEN as *mut std::ffi::c_void));
         state.stack.push(TValue::Str(state.intern_str("hello")));
         call_base_function(BASE_RAWLEN, &mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
@@ -3703,7 +3868,9 @@ mod tests {
         state.stack.clear();
         let mut t = crate::table::Table::new();
         t.set(TValue::Integer(1), TValue::Integer(100));
-        state.stack.push(TValue::LightUserData(BASE_RAWGET as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(BASE_RAWGET as *mut std::ffi::c_void));
         state.stack.push(TValue::Table(t));
         state.stack.push(TValue::Integer(1));
         call_base_function(BASE_RAWGET, &mut state, 0, 2, 1).unwrap();
@@ -3718,7 +3885,9 @@ mod tests {
         let mut state = LuaState::new();
         state.stack.clear();
         let t = crate::table::Table::new();
-        state.stack.push(TValue::LightUserData(BASE_RAWSET as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(BASE_RAWSET as *mut std::ffi::c_void));
         state.stack.push(TValue::Table(t));
         state.stack.push(TValue::Integer(1));
         state.stack.push(TValue::Integer(999));
@@ -3736,7 +3905,9 @@ mod tests {
     fn test_call_base_function_select_hash() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(BASE_SELECT as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(BASE_SELECT as *mut std::ffi::c_void));
         state.stack.push(TValue::Str(state.intern_str("#")));
         state.stack.push(TValue::Integer(1));
         state.stack.push(TValue::Integer(2));
@@ -3752,7 +3923,9 @@ mod tests {
     fn test_call_base_function_select_index() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(BASE_SELECT as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(BASE_SELECT as *mut std::ffi::c_void));
         state.stack.push(TValue::Integer(2));
         state.stack.push(TValue::Integer(10));
         state.stack.push(TValue::Integer(20));
@@ -3773,7 +3946,9 @@ mod tests {
     fn test_call_base_function_assert_true() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(BASE_ASSERT as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(BASE_ASSERT as *mut std::ffi::c_void));
         state.stack.push(TValue::Boolean(true));
         call_base_function(BASE_ASSERT, &mut state, 0, 1, -1).unwrap();
         assert_eq!(state.stack.len(), 1);
@@ -3787,7 +3962,9 @@ mod tests {
     fn test_call_base_function_assert_false() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(BASE_ASSERT as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(BASE_ASSERT as *mut std::ffi::c_void));
         state.stack.push(TValue::Boolean(false));
         let result = call_base_function(BASE_ASSERT, &mut state, 0, 1, -1);
         assert!(result.is_err());
@@ -3797,8 +3974,12 @@ mod tests {
     fn test_call_base_function_error() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(BASE_ERROR as *mut std::ffi::c_void));
-        state.stack.push(TValue::Str(state.intern_str("test error")));
+        state
+            .stack
+            .push(TValue::LightUserData(BASE_ERROR as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::Str(state.intern_str("test error")));
         let result = call_base_function(BASE_ERROR, &mut state, 0, 1, 0);
         assert!(result.is_err());
         match result {
@@ -3813,7 +3994,9 @@ mod tests {
         state.stack.clear();
         let t = crate::table::Table::new();
         let mt = crate::table::Table::new();
-        state.stack.push(TValue::LightUserData(BASE_SETMETATABLE as *mut std::ffi::c_void));
+        state.stack.push(TValue::LightUserData(
+            BASE_SETMETATABLE as *mut std::ffi::c_void,
+        ));
         state.stack.push(TValue::Table(t));
         state.stack.push(TValue::Table(mt));
         call_base_function(BASE_SETMETATABLE, &mut state, 0, 2, 1).unwrap();
@@ -3829,7 +4012,9 @@ mod tests {
         state.stack.clear();
         let t = crate::table::Table::new();
         t.set_metatable(Some(crate::table::Table::new()));
-        state.stack.push(TValue::LightUserData(BASE_GETMETATABLE as *mut std::ffi::c_void));
+        state.stack.push(TValue::LightUserData(
+            BASE_GETMETATABLE as *mut std::ffi::c_void,
+        ));
         state.stack.push(TValue::Table(t));
         call_base_function(BASE_GETMETATABLE, &mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
@@ -3843,7 +4028,9 @@ mod tests {
         let mut state = LuaState::new();
         state.stack.clear();
         let t = crate::table::Table::new();
-        state.stack.push(TValue::LightUserData(BASE_GETMETATABLE as *mut std::ffi::c_void));
+        state.stack.push(TValue::LightUserData(
+            BASE_GETMETATABLE as *mut std::ffi::c_void,
+        ));
         state.stack.push(TValue::Table(t));
         call_base_function(BASE_GETMETATABLE, &mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
@@ -3859,7 +4046,9 @@ mod tests {
         let mut t = crate::table::Table::new();
         t.set(TValue::Integer(1), TValue::Integer(10));
         t.set(TValue::Integer(2), TValue::Integer(20));
-        state.stack.push(TValue::LightUserData(BASE_IPAIRS as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(BASE_IPAIRS as *mut std::ffi::c_void));
         state.stack.push(TValue::Table(t));
         call_base_function(BASE_IPAIRS, &mut state, 0, 1, 3).unwrap();
         assert_eq!(state.stack.len(), 3);
@@ -3885,7 +4074,9 @@ mod tests {
         let mut state = LuaState::new();
         state.stack.clear();
         let t = crate::table::Table::new();
-        state.stack.push(TValue::LightUserData(BASE_PAIRS as *mut std::ffi::c_void));
+        state
+            .stack
+            .push(TValue::LightUserData(BASE_PAIRS as *mut std::ffi::c_void));
         state.stack.push(TValue::Table(t));
         call_base_function(BASE_PAIRS, &mut state, 0, 1, 3).unwrap();
         assert_eq!(state.stack.len(), 3);
@@ -3907,7 +4098,9 @@ mod tests {
         let mut t = crate::table::Table::new();
         t.set(TValue::Integer(1), TValue::Integer(10));
         t.set(TValue::Integer(2), TValue::Integer(20));
-        state.stack.push(TValue::LightUserData(BASE_IPAIRS_AUX as *mut std::ffi::c_void));
+        state.stack.push(TValue::LightUserData(
+            BASE_IPAIRS_AUX as *mut std::ffi::c_void,
+        ));
         state.stack.push(TValue::Table(t));
         state.stack.push(TValue::Integer(0));
         call_ipairs_aux(&mut state, 0, 2, -1).unwrap();
@@ -3927,7 +4120,9 @@ mod tests {
         let mut state = LuaState::new();
         state.stack.clear();
         let t = crate::table::Table::new();
-        state.stack.push(TValue::LightUserData(BASE_IPAIRS_AUX as *mut std::ffi::c_void));
+        state.stack.push(TValue::LightUserData(
+            BASE_IPAIRS_AUX as *mut std::ffi::c_void,
+        ));
         state.stack.push(TValue::Table(t));
         state.stack.push(TValue::Integer(0));
         call_ipairs_aux(&mut state, 0, 2, 1).unwrap();

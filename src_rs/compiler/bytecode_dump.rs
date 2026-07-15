@@ -1,15 +1,13 @@
 #[cfg(feature = "ffi")]
 use crate::lua_ffi;
 use crate::opcodes::{
-    self, OPNAMES, TM_EVENT_NAMES, get_opcode, getarg_a, getarg_b, getarg_c, getarg_vc,
-    getarg_bx, getarg_sbx, getarg_sj,
-    getarg_vb, testarg_k, getarg, POS_A, SIZE_BX, SIZE_A, POS_K, POS_B, POS_C, POS_VB, POS_VC, OFFSET_sJ,
-    POS_BX, POS_SJ,
-    OpCode, OpMode, get_opmode,
+    self, get_opcode, get_opmode, getarg, getarg_a, getarg_b, getarg_bx, getarg_c, getarg_sbx,
+    getarg_sj, getarg_vb, getarg_vc, testarg_k, OFFSET_sJ, OpCode, OpMode, OPNAMES, POS_A, POS_B,
+    POS_BX, POS_C, POS_K, POS_SJ, POS_VB, POS_VC, SIZE_A, SIZE_BX, TM_EVENT_NAMES,
 };
+use imara_diff::{Algorithm, Diff, InternedInput};
 use std::ffi::{c_int, c_void};
 use std::ptr;
-use imara_diff::{Algorithm, Diff, InternedInput};
 
 #[derive(Debug, Clone)]
 pub struct DumpInstruction {
@@ -39,13 +37,13 @@ pub struct DumpedFunction {
     pub maxstacksize: u8,
     pub code: Vec<DumpInstruction>,
     pub constants: Vec<DumpConstant>,
-    pub upvalues: Vec<(bool, u8, u8)>,  // (instack, idx, kind)
+    pub upvalues: Vec<(bool, u8, u8)>, // (instack, idx, kind)
     pub protos: Vec<DumpedFunction>,
     // 调试信息
     pub source: Option<String>,
     pub line_info: Vec<i8>,
-    pub abs_line_info: Vec<(i32, i32)>,  // (pc, line)
-    pub loc_vars: Vec<(Option<String>, i32, i32)>,  // (varname, startpc, endpc)
+    pub abs_line_info: Vec<(i32, i32)>,            // (pc, line)
+    pub loc_vars: Vec<(Option<String>, i32, i32)>, // (varname, startpc, endpc)
     pub upvalue_names: Vec<Option<String>>,
     // 调试信息大小（用于对比）
     pub size_line_info: i32,
@@ -167,7 +165,11 @@ impl BytecodeReader {
         if bytes.is_empty() && self.error.is_some() {
             return String::new();
         }
-        let len = if bytes.last() == Some(&0) { size - 1 } else { size };
+        let len = if bytes.last() == Some(&0) {
+            size - 1
+        } else {
+            size
+        };
         // Lua 字符串可包含任意字节 (包括非 UTF-8)，用 from_utf8_unchecked 保留原始字节
         // 对应 C Lua 中 TString 可以存储任意字节序列
         let s = unsafe { String::from_utf8_unchecked(bytes[..len].to_vec()) };
@@ -183,8 +185,16 @@ impl BytecodeReader {
         DumpInstruction {
             opcode: opcode_val,
             a: opcodes::getarg_a(raw) as u32,
-            b: if is_vabc { opcodes::getarg_vb(raw) as u32 } else { opcodes::getarg_b(raw) as u32 },
-            c: if is_vabc { opcodes::getarg_vc(raw) as u32 } else { opcodes::getarg_c(raw) as u32 },
+            b: if is_vabc {
+                opcodes::getarg_vb(raw) as u32
+            } else {
+                opcodes::getarg_b(raw) as u32
+            },
+            c: if is_vabc {
+                opcodes::getarg_vc(raw) as u32
+            } else {
+                opcodes::getarg_c(raw) as u32
+            },
             k: (raw >> opcodes::POS_K) & 1,
             bx: opcodes::getarg(raw, opcodes::POS_BX, opcodes::SIZE_BX) as u32,
         }
@@ -213,9 +223,9 @@ impl BytecodeReader {
             let c = match tt {
                 0 => DumpConstant::Nil,
                 1 => DumpConstant::Boolean(false),
-                17 => DumpConstant::Boolean(true),            // LUA_VTRUE = 0x11
-                3 => DumpConstant::Integer(self.read_integer()),  // LUA_VNUMINT = 3
-                19 => DumpConstant::Float(self.read_float()),     // LUA_VNUMFLT = 0x13
+                17 => DumpConstant::Boolean(true), // LUA_VTRUE = 0x11
+                3 => DumpConstant::Integer(self.read_integer()), // LUA_VNUMINT = 3
+                19 => DumpConstant::Float(self.read_float()), // LUA_VNUMFLT = 0x13
                 4 | 20 => DumpConstant::String(self.read_string()), // 4=VSHRSTR, 20=VLNGSTR
                 _ => DumpConstant::Nil,
             };
@@ -251,7 +261,16 @@ impl BytecodeReader {
             protos.push(self.read_function());
         }
         let source_str = self.read_string();
-        let (source, line_info, abs_line_info, loc_vars, upvalue_names, size_line_info, size_abs_line_info, size_loc_vars) = self.read_debug();
+        let (
+            source,
+            line_info,
+            abs_line_info,
+            loc_vars,
+            upvalue_names,
+            size_line_info,
+            size_abs_line_info,
+            size_loc_vars,
+        ) = self.read_debug();
         DumpedFunction {
             linedefined,
             lastlinedefined,
@@ -262,7 +281,11 @@ impl BytecodeReader {
             constants,
             upvalues,
             protos,
-            source: if source_str.is_empty() { None } else { Some(source_str) },
+            source: if source_str.is_empty() {
+                None
+            } else {
+                Some(source_str)
+            },
             line_info,
             abs_line_info,
             loc_vars,
@@ -293,7 +316,18 @@ impl BytecodeReader {
         let _value = self.read_bytes(8);
     }
 
-    fn read_debug(&mut self) -> (Option<String>, Vec<i8>, Vec<(i32, i32)>, Vec<(Option<String>, i32, i32)>, Vec<Option<String>>, i32, i32, i32) {
+    fn read_debug(
+        &mut self,
+    ) -> (
+        Option<String>,
+        Vec<i8>,
+        Vec<(i32, i32)>,
+        Vec<(Option<String>, i32, i32)>,
+        Vec<Option<String>>,
+        i32,
+        i32,
+        i32,
+    ) {
         // line_info
         let size_line_info = self.read_int() as i32;
         let mut line_info = Vec::new();
@@ -309,8 +343,18 @@ impl BytecodeReader {
         if size_abs_line_info > 0 {
             self.align(4);
             for _ in 0..size_abs_line_info {
-                let pc = i32::from_le_bytes([self.read_byte(), self.read_byte(), self.read_byte(), self.read_byte()]);
-                let line = i32::from_le_bytes([self.read_byte(), self.read_byte(), self.read_byte(), self.read_byte()]);
+                let pc = i32::from_le_bytes([
+                    self.read_byte(),
+                    self.read_byte(),
+                    self.read_byte(),
+                    self.read_byte(),
+                ]);
+                let line = i32::from_le_bytes([
+                    self.read_byte(),
+                    self.read_byte(),
+                    self.read_byte(),
+                    self.read_byte(),
+                ]);
                 abs_line_info.push((pc, line));
             }
         }
@@ -322,7 +366,15 @@ impl BytecodeReader {
             let varname = self.read_string();
             let startpc = self.read_int();
             let endpc = self.read_int();
-            loc_vars.push((if varname.is_empty() { None } else { Some(varname) }, startpc, endpc));
+            loc_vars.push((
+                if varname.is_empty() {
+                    None
+                } else {
+                    Some(varname)
+                },
+                startpc,
+                endpc,
+            ));
         }
 
         // upvalue names
@@ -333,7 +385,16 @@ impl BytecodeReader {
             upvalue_names.push(if name.is_empty() { None } else { Some(name) });
         }
 
-        (None, line_info, abs_line_info, loc_vars, upvalue_names, size_line_info, size_abs_line_info, size_loc_vars)
+        (
+            None,
+            line_info,
+            abs_line_info,
+            loc_vars,
+            upvalue_names,
+            size_line_info,
+            size_abs_line_info,
+            size_loc_vars,
+        )
     }
 }
 
@@ -380,7 +441,12 @@ pub fn parse_dump(data: Vec<u8>) -> Result<DumpedFunction, String> {
     }
     let int_val_bytes = reader.read_bytes(4).to_vec();
     reader.check()?;
-    let int_val = i32::from_ne_bytes([int_val_bytes[0], int_val_bytes[1], int_val_bytes[2], int_val_bytes[3]]);
+    let int_val = i32::from_ne_bytes([
+        int_val_bytes[0],
+        int_val_bytes[1],
+        int_val_bytes[2],
+        int_val_bytes[3],
+    ]);
     if int_val != -0x5678 {
         return Err("int format mismatch".to_string());
     }
@@ -393,7 +459,12 @@ pub fn parse_dump(data: Vec<u8>) -> Result<DumpedFunction, String> {
     }
     let inst_val_bytes = reader.read_bytes(4).to_vec();
     reader.check()?;
-    let inst_val = u32::from_ne_bytes([inst_val_bytes[0], inst_val_bytes[1], inst_val_bytes[2], inst_val_bytes[3]]);
+    let inst_val = u32::from_ne_bytes([
+        inst_val_bytes[0],
+        inst_val_bytes[1],
+        inst_val_bytes[2],
+        inst_val_bytes[3],
+    ]);
     if inst_val != 0x12345678 {
         return Err("instruction format mismatch".to_string());
     }
@@ -407,8 +478,14 @@ pub fn parse_dump(data: Vec<u8>) -> Result<DumpedFunction, String> {
     let integer_val_bytes = reader.read_bytes(8).to_vec();
     reader.check()?;
     let integer_val = i64::from_ne_bytes([
-        integer_val_bytes[0], integer_val_bytes[1], integer_val_bytes[2], integer_val_bytes[3],
-        integer_val_bytes[4], integer_val_bytes[5], integer_val_bytes[6], integer_val_bytes[7],
+        integer_val_bytes[0],
+        integer_val_bytes[1],
+        integer_val_bytes[2],
+        integer_val_bytes[3],
+        integer_val_bytes[4],
+        integer_val_bytes[5],
+        integer_val_bytes[6],
+        integer_val_bytes[7],
     ]);
     if integer_val != -0x5678 {
         return Err("Lua integer format mismatch".to_string());
@@ -464,8 +541,15 @@ pub unsafe fn compile_with_c_lua(source: &[u8]) -> Result<Vec<u8>, String> {
 
         let dump_data = Box::into_raw(Box::new(Vec::<u8>::new()));
 
-        extern "C" fn writer(_L: *mut lua_ffi::lua_State, p: *const c_void, sz: usize, ud: *mut c_void) -> c_int {
-            if sz == 0 { return 0; }
+        extern "C" fn writer(
+            _L: *mut lua_ffi::lua_State,
+            p: *const c_void,
+            sz: usize,
+            ud: *mut c_void,
+        ) -> c_int {
+            if sz == 0 {
+                return 0;
+            }
             let data: &mut Vec<u8> = unsafe { &mut *(ud as *mut Vec<u8>) };
             let slice = unsafe { std::slice::from_raw_parts(p as *const u8, sz) };
             data.extend_from_slice(slice);
@@ -523,12 +607,16 @@ fn format_operands(op: u32, a: i32, b: i32, c: i32, bx: i32, sbx: i32, sj: i32, 
         opcodes::OpCode::LOADI | opcodes::OpCode::LOADF => format!("{} {}", a, sbx),
         opcodes::OpCode::LOADK => format!("{} {}", a, bx),
         opcodes::OpCode::LOADKX => format!("{}", a),
-        opcodes::OpCode::LOADFALSE | opcodes::OpCode::LFALSESKIP | opcodes::OpCode::LOADTRUE => format!("{}", a),
+        opcodes::OpCode::LOADFALSE | opcodes::OpCode::LFALSESKIP | opcodes::OpCode::LOADTRUE => {
+            format!("{}", a)
+        }
         opcodes::OpCode::LOADNIL => format!("{} {}", a, b),
         opcodes::OpCode::GETUPVAL | opcodes::OpCode::SETUPVAL => format!("{} {}", a, b),
         opcodes::OpCode::GETTABUP | opcodes::OpCode::GETTABLE => format!("{} {} {}", a, b, c),
         opcodes::OpCode::GETI | opcodes::OpCode::GETFIELD => format!("{} {} {}", a, b, c),
-        opcodes::OpCode::SETTABUP | opcodes::OpCode::SETTABLE | opcodes::OpCode::SETI
+        opcodes::OpCode::SETTABUP
+        | opcodes::OpCode::SETTABLE
+        | opcodes::OpCode::SETI
         | opcodes::OpCode::SETFIELD => format!("{} {} {}{}", a, b, c, isk),
         opcodes::OpCode::NEWTABLE => {
             let vb = getarg_vb(op);
@@ -536,29 +624,50 @@ fn format_operands(op: u32, a: i32, b: i32, c: i32, bx: i32, sbx: i32, sj: i32, 
             format!("{} {} {}{}", a, vb, vc, isk)
         }
         opcodes::OpCode::SELF => format!("{} {} {}{}", a, b, c, isk),
-        opcodes::OpCode::ADDI | opcodes::OpCode::SHLI | opcodes::OpCode::SHRI => format!("{} {} {}", a, b, sc),
-        opcodes::OpCode::ADDK | opcodes::OpCode::SUBK | opcodes::OpCode::MULK
-        | opcodes::OpCode::MODK | opcodes::OpCode::POWK | opcodes::OpCode::DIVK
-        | opcodes::OpCode::IDIVK | opcodes::OpCode::BANDK | opcodes::OpCode::BORK
+        opcodes::OpCode::ADDI | opcodes::OpCode::SHLI | opcodes::OpCode::SHRI => {
+            format!("{} {} {}", a, b, sc)
+        }
+        opcodes::OpCode::ADDK
+        | opcodes::OpCode::SUBK
+        | opcodes::OpCode::MULK
+        | opcodes::OpCode::MODK
+        | opcodes::OpCode::POWK
+        | opcodes::OpCode::DIVK
+        | opcodes::OpCode::IDIVK
+        | opcodes::OpCode::BANDK
+        | opcodes::OpCode::BORK
         | opcodes::OpCode::BXORK => format!("{} {} {}", a, b, c),
-        opcodes::OpCode::ADD | opcodes::OpCode::SUB | opcodes::OpCode::MUL
-        | opcodes::OpCode::MOD | opcodes::OpCode::POW | opcodes::OpCode::DIV
-        | opcodes::OpCode::IDIV | opcodes::OpCode::BAND | opcodes::OpCode::BOR
-        | opcodes::OpCode::BXOR | opcodes::OpCode::SHL | opcodes::OpCode::SHR
-        => format!("{} {} {}", a, b, c),
+        opcodes::OpCode::ADD
+        | opcodes::OpCode::SUB
+        | opcodes::OpCode::MUL
+        | opcodes::OpCode::MOD
+        | opcodes::OpCode::POW
+        | opcodes::OpCode::DIV
+        | opcodes::OpCode::IDIV
+        | opcodes::OpCode::BAND
+        | opcodes::OpCode::BOR
+        | opcodes::OpCode::BXOR
+        | opcodes::OpCode::SHL
+        | opcodes::OpCode::SHR => format!("{} {} {}", a, b, c),
         opcodes::OpCode::MMBIN => format!("{} {} {}", a, b, c),
         opcodes::OpCode::MMBINI => format!("{} {} {} {}", a, sb, c, isk),
         opcodes::OpCode::MMBINK => format!("{} {} {} {}", a, b, c, isk),
-        opcodes::OpCode::UNM | opcodes::OpCode::BNOT | opcodes::OpCode::NOT
+        opcodes::OpCode::UNM
+        | opcodes::OpCode::BNOT
+        | opcodes::OpCode::NOT
         | opcodes::OpCode::LEN => format!("{} {}", a, b),
         opcodes::OpCode::CONCAT => format!("{} {}", a, b),
         opcodes::OpCode::CLOSE | opcodes::OpCode::TBC => format!("{}", a),
         opcodes::OpCode::JMP => format!("{}", sj),
-        opcodes::OpCode::EQ | opcodes::OpCode::LT | opcodes::OpCode::LE
-        => format!("{} {} {}", a, b, isk),
+        opcodes::OpCode::EQ | opcodes::OpCode::LT | opcodes::OpCode::LE => {
+            format!("{} {} {}", a, b, isk)
+        }
         opcodes::OpCode::EQK => format!("{} {} {}", a, b, isk),
-        opcodes::OpCode::EQI | opcodes::OpCode::LTI | opcodes::OpCode::LEI
-        | opcodes::OpCode::GTI | opcodes::OpCode::GEI => format!("{} {} {}", a, sb, isk),
+        opcodes::OpCode::EQI
+        | opcodes::OpCode::LTI
+        | opcodes::OpCode::LEI
+        | opcodes::OpCode::GTI
+        | opcodes::OpCode::GEI => format!("{} {} {}", a, sb, isk),
         opcodes::OpCode::TEST => format!("{} {}", a, isk),
         opcodes::OpCode::TESTSET => format!("{} {} {}", a, b, isk),
         opcodes::OpCode::CALL => format!("{} {} {}", a, b, c),
@@ -566,8 +675,10 @@ fn format_operands(op: u32, a: i32, b: i32, c: i32, bx: i32, sbx: i32, sj: i32, 
         opcodes::OpCode::RETURN => format!("{} {} {}{}", a, b, c, isk),
         opcodes::OpCode::RETURN0 => String::new(),
         opcodes::OpCode::RETURN1 => format!("{}", a),
-        opcodes::OpCode::FORLOOP | opcodes::OpCode::FORPREP
-        | opcodes::OpCode::TFORPREP | opcodes::OpCode::TFORLOOP => format!("{} {}", a, bx),
+        opcodes::OpCode::FORLOOP
+        | opcodes::OpCode::FORPREP
+        | opcodes::OpCode::TFORPREP
+        | opcodes::OpCode::TFORLOOP => format!("{} {}", a, bx),
         opcodes::OpCode::TFORCALL => format!("{} {}", a, c),
         opcodes::OpCode::SETLIST => {
             let vb = getarg_vb(op);
@@ -594,10 +705,16 @@ fn format_c_comment(inst: &DumpInstruction, constants: &[DumpConstant]) -> Strin
 
     match op {
         opcodes::OpCode::LOADK | opcodes::OpCode::LOADKX => {
-            let idx = if op == opcodes::OpCode::LOADKX { inst.c as usize } else { inst.bx as usize };
+            let idx = if op == opcodes::OpCode::LOADKX {
+                inst.c as usize
+            } else {
+                inst.bx as usize
+            };
             if idx < constants.len() {
                 format!("\t; {}", format_constant(constants, idx))
-            } else { String::new() }
+            } else {
+                String::new()
+            }
         }
         opcodes::OpCode::GETTABUP | opcodes::OpCode::GETFIELD => {
             format!("\t; {}", format_constant(constants, c as usize))
@@ -605,21 +722,37 @@ fn format_c_comment(inst: &DumpInstruction, constants: &[DumpConstant]) -> Strin
         opcodes::OpCode::SETTABUP | opcodes::OpCode::SETFIELD => {
             let b_const = format_constant(constants, inst.b as usize);
             let mut s = format!("\t; {}", b_const);
-            if isk { s.push_str(&format!(" {}", format_constant(constants, c as usize))); }
+            if isk {
+                s.push_str(&format!(" {}", format_constant(constants, c as usize)));
+            }
             s
         }
         opcodes::OpCode::SETTABLE | opcodes::OpCode::SETI => {
-            if isk { format!("\t; {}", format_constant(constants, c as usize)) } else { String::new() }
+            if isk {
+                format!("\t; {}", format_constant(constants, c as usize))
+            } else {
+                String::new()
+            }
         }
         opcodes::OpCode::NEWTABLE => {
             format!("\t; {}", c)
         }
         opcodes::OpCode::SELF => {
-            if isk { format!("\t; {}", format_constant(constants, c as usize)) } else { String::new() }
+            if isk {
+                format!("\t; {}", format_constant(constants, c as usize))
+            } else {
+                String::new()
+            }
         }
-        opcodes::OpCode::ADDK | opcodes::OpCode::SUBK | opcodes::OpCode::MULK
-        | opcodes::OpCode::MODK | opcodes::OpCode::POWK | opcodes::OpCode::DIVK
-        | opcodes::OpCode::IDIVK | opcodes::OpCode::BANDK | opcodes::OpCode::BORK
+        opcodes::OpCode::ADDK
+        | opcodes::OpCode::SUBK
+        | opcodes::OpCode::MULK
+        | opcodes::OpCode::MODK
+        | opcodes::OpCode::POWK
+        | opcodes::OpCode::DIVK
+        | opcodes::OpCode::IDIVK
+        | opcodes::OpCode::BANDK
+        | opcodes::OpCode::BORK
         | opcodes::OpCode::BXORK => {
             format!("\t; {}", format_constant(constants, c as usize))
         }
@@ -627,23 +760,33 @@ fn format_c_comment(inst: &DumpInstruction, constants: &[DumpConstant]) -> Strin
             let event_idx = c as usize;
             if event_idx < TM_EVENT_NAMES.len() {
                 format!("\t; {}", TM_EVENT_NAMES[event_idx])
-            } else { String::new() }
+            } else {
+                String::new()
+            }
         }
         opcodes::OpCode::MMBINI => {
             let event_idx = c as usize;
             let mut s = if event_idx < TM_EVENT_NAMES.len() {
                 format!("\t; {}", TM_EVENT_NAMES[event_idx])
-            } else { String::new() };
-            if isk { s.push_str(" flip"); }
+            } else {
+                String::new()
+            };
+            if isk {
+                s.push_str(" flip");
+            }
             s
         }
         opcodes::OpCode::MMBINK => {
             let event_idx = c as usize;
             let mut s = if event_idx < TM_EVENT_NAMES.len() {
                 format!("\t; {} ", TM_EVENT_NAMES[event_idx])
-            } else { String::new() };
+            } else {
+                String::new()
+            };
             s.push_str(&format_constant(constants, inst.b as usize));
-            if isk { s.push_str(" flip"); }
+            if isk {
+                s.push_str(" flip");
+            }
             s
         }
         opcodes::OpCode::JMP => {
@@ -655,15 +798,27 @@ fn format_c_comment(inst: &DumpInstruction, constants: &[DumpConstant]) -> Strin
             format!("\t; {}", format_constant(constants, inst.b as usize))
         }
         opcodes::OpCode::CALL => {
-            let in_args = if inst.b == 0 { "all in".to_string() } else { format!("{} in", inst.b as i32 - 1) };
-            let out_args = if inst.c == 0 { "all out".to_string() } else { format!("{} out", inst.c as i32 - 1) };
+            let in_args = if inst.b == 0 {
+                "all in".to_string()
+            } else {
+                format!("{} in", inst.b as i32 - 1)
+            };
+            let out_args = if inst.c == 0 {
+                "all out".to_string()
+            } else {
+                format!("{} out", inst.c as i32 - 1)
+            };
             format!("\t; {} {}", in_args, out_args)
         }
         opcodes::OpCode::TAILCALL => {
             format!("\t; {} in", inst.b as i32 - 1)
         }
         opcodes::OpCode::RETURN => {
-            if inst.b == 0 { "\t; all out".to_string() } else { format!("\t; {} out", inst.b as i32 - 1) }
+            if inst.b == 0 {
+                "\t; all out".to_string()
+            } else {
+                format!("\t; {} out", inst.b as i32 - 1)
+            }
         }
         opcodes::OpCode::FORLOOP => {
             format!("\t; to {}", pc as i32 - inst.bx as i32 + 2)
@@ -678,17 +833,28 @@ fn format_c_comment(inst: &DumpInstruction, constants: &[DumpConstant]) -> Strin
             format!("\t; to {}", pc as i32 - inst.bx as i32 + 2)
         }
         opcodes::OpCode::SETLIST => {
-            if isk { format!("\t; {}", c as usize + opcodes::SIZE_C as usize + 1) } else { String::new() }
+            if isk {
+                format!("\t; {}", c as usize + opcodes::SIZE_C as usize + 1)
+            } else {
+                String::new()
+            }
         }
         opcodes::OpCode::LOADNIL => {
             format!("\t; {} out", inst.b as i32 + 1)
         }
         opcodes::OpCode::VARARG => {
-            if inst.c == 0 { "\t; all out".to_string() } else { format!("\t; {} out", inst.c as i32 - 1) }
+            if inst.c == 0 {
+                "\t; all out".to_string()
+            } else {
+                format!("\t; {} out", inst.c as i32 - 1)
+            }
         }
         opcodes::OpCode::ERRNNIL => {
-            if inst.bx == 0 { "\t; ?".to_string() }
-            else { format!("\t; {}", format_constant(constants, (inst.bx as usize) - 1)) }
+            if inst.bx == 0 {
+                "\t; ?".to_string()
+            } else {
+                format!("\t; {}", format_constant(constants, (inst.bx as usize) - 1))
+            }
         }
         _ => String::new(),
     }
@@ -698,17 +864,17 @@ pub fn dump_inst_to_raw(inst: &DumpInstruction) -> u32 {
     let op = OpCode::from_u8(inst.opcode).unwrap_or(OpCode::MOVE);
     let is_vabc = get_opmode(op) == OpMode::IvABC;
     if is_vabc {
-            (inst.opcode as u32)
-                | ((inst.a as u32) << POS_A)
-                | ((inst.k as u32) << POS_K)
-                | ((inst.b as u32) << POS_VB)
-                | ((inst.c as u32) << POS_VC)
+        (inst.opcode as u32)
+            | ((inst.a as u32) << POS_A)
+            | ((inst.k as u32) << POS_K)
+            | ((inst.b as u32) << POS_VB)
+            | ((inst.c as u32) << POS_VC)
     } else {
-            (inst.opcode as u32)
-                | ((inst.a as u32) << POS_A)
-                | ((inst.k as u32) << POS_K)
-                | ((inst.b as u32) << POS_B)
-                | ((inst.c as u32) << POS_C)
+        (inst.opcode as u32)
+            | ((inst.a as u32) << POS_A)
+            | ((inst.k as u32) << POS_K)
+            | ((inst.b as u32) << POS_B)
+            | ((inst.c as u32) << POS_C)
     }
 }
 
@@ -732,9 +898,13 @@ fn normalize_instruction(raw: u32) -> String {
     // Determine which operands are constant references based on opcode
     match opcode {
         // IABx instructions: Bx is always a constant index
-        opcodes::OpCode::LOADK | opcodes::OpCode::CLOSURE | opcodes::OpCode::ERRNNIL
-        | opcodes::OpCode::FORLOOP | opcodes::OpCode::FORPREP
-        | opcodes::OpCode::TFORPREP | opcodes::OpCode::TFORLOOP => {
+        opcodes::OpCode::LOADK
+        | opcodes::OpCode::CLOSURE
+        | opcodes::OpCode::ERRNNIL
+        | opcodes::OpCode::FORLOOP
+        | opcodes::OpCode::FORPREP
+        | opcodes::OpCode::TFORPREP
+        | opcodes::OpCode::TFORLOOP => {
             // operands is "A Bx" - replace the Bx part
             let parts: Vec<&str> = operands.splitn(2, ' ').collect();
             if parts.len() == 2 {
@@ -771,7 +941,11 @@ fn normalize_instruction(raw: u32) -> String {
             // When k bit is set, C is a constant index; otherwise it's a register
             let parts: Vec<&str> = operands.split(' ').collect();
             if parts.len() >= 3 {
-                let c_norm = if k || c >= 256 { "K" } else { parts[2].trim_end_matches('k') };
+                let c_norm = if k || c >= 256 {
+                    "K"
+                } else {
+                    parts[2].trim_end_matches('k')
+                };
                 let k_str = if k { "k" } else { "" };
                 format!("{}\t{} K {}{}", op_name, parts[0], c_norm, k_str)
             } else {
@@ -783,7 +957,11 @@ fn normalize_instruction(raw: u32) -> String {
             // When k bit is set, C is a constant index; otherwise it's a register
             let parts: Vec<&str> = operands.split(' ').collect();
             if parts.len() >= 3 {
-                let c_norm = if k || c >= 256 { "K" } else { parts[2].trim_end_matches('k') };
+                let c_norm = if k || c >= 256 {
+                    "K"
+                } else {
+                    parts[2].trim_end_matches('k')
+                };
                 let k_str = if k { "k" } else { "" };
                 format!("{}\t{} {} {}{}", op_name, parts[0], parts[1], c_norm, k_str)
             } else {
@@ -795,7 +973,11 @@ fn normalize_instruction(raw: u32) -> String {
             // When k bit is set, C is a constant index; otherwise it's a register
             let parts: Vec<&str> = operands.split(' ').collect();
             if parts.len() >= 3 {
-                let c_norm = if k || c >= 256 { "K" } else { parts[2].trim_end_matches('k') };
+                let c_norm = if k || c >= 256 {
+                    "K"
+                } else {
+                    parts[2].trim_end_matches('k')
+                };
                 let k_str = if k { "k" } else { "" };
                 format!("{}\t{} K {}{}", op_name, parts[0], c_norm, k_str)
             } else {
@@ -812,9 +994,15 @@ fn normalize_instruction(raw: u32) -> String {
                 format!("{}\t{}", op_name, operands)
             }
         }
-        opcodes::OpCode::ADDK | opcodes::OpCode::SUBK | opcodes::OpCode::MULK
-        | opcodes::OpCode::MODK | opcodes::OpCode::POWK | opcodes::OpCode::DIVK
-        | opcodes::OpCode::IDIVK | opcodes::OpCode::BANDK | opcodes::OpCode::BORK
+        opcodes::OpCode::ADDK
+        | opcodes::OpCode::SUBK
+        | opcodes::OpCode::MULK
+        | opcodes::OpCode::MODK
+        | opcodes::OpCode::POWK
+        | opcodes::OpCode::DIVK
+        | opcodes::OpCode::IDIVK
+        | opcodes::OpCode::BANDK
+        | opcodes::OpCode::BORK
         | opcodes::OpCode::BXORK => {
             // operands is "A B C" - C is always a constant index
             let parts: Vec<&str> = operands.split(' ').collect();
@@ -839,7 +1027,13 @@ fn normalize_instruction(raw: u32) -> String {
             let parts: Vec<&str> = operands.split(' ').collect();
             if parts.len() >= 3 {
                 let k_str = if k { "k" } else { "" };
-                format!("{}\t{} K {} {}", op_name, parts[0], parts[2].trim_end_matches('k'), k_str)
+                format!(
+                    "{}\t{} K {} {}",
+                    op_name,
+                    parts[0],
+                    parts[2].trim_end_matches('k'),
+                    k_str
+                )
             } else {
                 format!("{}\t{}", op_name, operands)
             }
@@ -987,7 +1181,7 @@ pub fn dump_c_instructions(code: &[DumpInstruction], constants: &[DumpConstant])
 // Proto 序列化 (对应 C 的 ldump.cpp)
 // ============================================================================
 
-use crate::objects::{Proto, TValue, NilKind, AbsLineInfo};
+use crate::objects::{AbsLineInfo, NilKind, Proto, TValue};
 use std::collections::HashMap;
 
 /// Lua 二进制格式常量
@@ -1287,10 +1481,10 @@ pub fn dump_proto(f: &Proto, strip: bool) -> Vec<u8> {
 // DumpedFunction → Proto 转换 (用于 load 加载二进制格式)
 // ============================================================================
 
-use crate::objects::{UpvalDesc, LocVar};
-use crate::strings::{LuaString, LongString};
-use std::sync::Arc;
+use crate::objects::{LocVar, UpvalDesc};
+use crate::strings::{LongString, LuaString};
 use std::sync::atomic::{AtomicU64, AtomicU8};
+use std::sync::Arc;
 
 /// 创建长字符串的辅助函数
 fn make_long_string(s: &str) -> LuaString {
@@ -1316,45 +1510,64 @@ pub fn dumped_to_proto(df: &DumpedFunction) -> Proto {
     proto.code = df.code.iter().map(|inst| dump_inst_to_raw(inst)).collect();
 
     // constants: DumpConstant → TValue
-    proto.constants = df.constants.iter().map(|c| {
-        match c {
+    proto.constants = df
+        .constants
+        .iter()
+        .map(|c| match c {
             DumpConstant::Nil => TValue::Nil(NilKind::Strict),
             DumpConstant::Boolean(b) => TValue::Boolean(*b),
             DumpConstant::Integer(i) => TValue::Integer(*i),
             DumpConstant::Float(f) => TValue::Float(*f),
             DumpConstant::String(s) => TValue::Str(make_long_string(s)),
-        }
-    }).collect();
+        })
+        .collect();
 
     // upvalues: (bool, u8, u8) → UpvalDesc
-    proto.upvalues = df.upvalues.iter().enumerate().map(|(i, (instack, idx, kind))| {
-        UpvalDesc {
-            name: df.upvalue_names.get(i).and_then(|n| n.as_ref().map(|s| make_long_string(s))),
+    proto.upvalues = df
+        .upvalues
+        .iter()
+        .enumerate()
+        .map(|(i, (instack, idx, kind))| UpvalDesc {
+            name: df
+                .upvalue_names
+                .get(i)
+                .and_then(|n| n.as_ref().map(|s| make_long_string(s))),
             in_stack: *instack,
             idx: *idx,
             parent_local_idx: 0,
             kind: *kind,
-        }
-    }).collect();
+        })
+        .collect();
 
     // protos: 递归转换
-    proto.protos = df.protos.iter().map(|p| std::rc::Rc::new(dumped_to_proto(p))).collect();
+    proto.protos = df
+        .protos
+        .iter()
+        .map(|p| std::rc::Rc::new(dumped_to_proto(p)))
+        .collect();
 
     // source
     proto.source = df.source.as_ref().map(|s| make_long_string(s));
 
     // 调试信息
     proto.line_info = df.line_info.clone();
-    proto.abs_line_info = df.abs_line_info.iter().map(|(pc, line)| {
-        AbsLineInfo { pc: *pc, line: *line }
-    }).collect();
-    proto.loc_vars = df.loc_vars.iter().map(|(varname, startpc, endpc)| {
-        LocVar {
+    proto.abs_line_info = df
+        .abs_line_info
+        .iter()
+        .map(|(pc, line)| AbsLineInfo {
+            pc: *pc,
+            line: *line,
+        })
+        .collect();
+    proto.loc_vars = df
+        .loc_vars
+        .iter()
+        .map(|(varname, startpc, endpc)| LocVar {
             varname: varname.as_ref().map(|s| make_long_string(s)),
             start_pc: *startpc,
             end_pc: *endpc,
-        }
-    }).collect();
+        })
+        .collect();
 
     // 设置 size 字段
     proto.size_upvalues = proto.upvalues.len() as i32;

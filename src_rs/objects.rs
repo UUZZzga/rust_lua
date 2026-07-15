@@ -312,7 +312,10 @@ impl TValue {
     /// When: 调用 .is_function()
     /// Then: 返回 true
     pub fn is_function(&self) -> bool {
-        matches!(self, TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) | TValue::LightUserData(_))
+        matches!(
+            self,
+            TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) | TValue::LightUserData(_)
+        )
     }
 
     /// 尝试获取整数值
@@ -332,7 +335,11 @@ impl TValue {
             TValue::Integer(i) => Some(*i),
             TValue::Float(f) => {
                 let i = *f as i64;
-                if (i as f64) == *f { Some(i) } else { None }
+                if (i as f64) == *f {
+                    Some(i)
+                } else {
+                    None
+                }
             }
             _ => None,
         }
@@ -371,16 +378,26 @@ impl PartialEq for TValue {
             (TValue::Integer(a), TValue::Integer(b)) => a == b,
             (TValue::Float(a), TValue::Float(b)) => a == b,
             (TValue::Integer(a), TValue::Float(b)) => {
-                if b.is_nan() { false } else { (*a as f64) == *b }
+                if b.is_nan() {
+                    false
+                } else {
+                    (*a as f64) == *b
+                }
             }
             (TValue::Float(a), TValue::Integer(b)) => {
-                if a.is_nan() { false } else { *a == (*b as f64) }
+                if a.is_nan() {
+                    false
+                } else {
+                    *a == (*b as f64)
+                }
             }
             (TValue::Str(a), TValue::Str(b)) => a == b,
             (TValue::Table(a), TValue::Table(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
             (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
             (TValue::CClosure(a), TValue::CClosure(b)) => std::ptr::eq(a, b),
-            (TValue::LCFn(a), TValue::LCFn(b)) => std::ptr::eq(a.func as *const (), b.func as *const ()),
+            (TValue::LCFn(a), TValue::LCFn(b)) => {
+                std::ptr::eq(a.func as *const (), b.func as *const ())
+            }
             (TValue::UserData(a), TValue::UserData(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
             (TValue::Thread(a), TValue::Thread(b)) => Rc::ptr_eq(&a.context, &b.context),
             _ => false,
@@ -992,21 +1009,14 @@ pub fn ceil_log2(x: u32) -> u8 {
         v >>= 8;
     }
     let log_2: [u8; 256] = [
-        0, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4,
-        5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
-        6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-        6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
-        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+        0, 1, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5, 5,
+        5, 5, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6, 6,
+        6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
+        7, 7, 7, 7, 7, 7, 7, 7, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
+        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
         8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
     ];
     l + log_2[v as usize]
@@ -1185,16 +1195,22 @@ pub fn str2num(s: &str) -> Option<TValue> {
         // 检查是否是浮点数（包含 '.' 或 'p'/'P'）
         let is_float = rest.contains('.') || rest.contains('p') || rest.contains('P');
         if is_float {
-            return parse_hex_float(rest).map(|f| {
-                TValue::Float(if neg { -f } else { f })
-            });
+            return parse_hex_float(rest).map(|f| TValue::Float(if neg { -f } else { f }));
         }
         return parse_hex_int(rest).map(|v| {
-            TValue::Integer(if neg { (v as u64).wrapping_neg() as i64 } else { v })
+            TValue::Integer(if neg {
+                (v as u64).wrapping_neg() as i64
+            } else {
+                v
+            })
         });
     }
     // 尝试十进制整数（含符号）
-    let signed_s = if neg { format!("-{}", s) } else { s.to_string() };
+    let signed_s = if neg {
+        format!("-{}", s)
+    } else {
+        s.to_string()
+    };
     if let Some(i) = parse_dec_int(&signed_s) {
         return Some(TValue::Integer(i));
     }
@@ -1228,7 +1244,10 @@ fn parse_hex_int(s: &str) -> Option<i64> {
     }
     // 剩余必须全为空格（对应 C 的 skip trailing spaces + *s == '\0' 检查）
     let remaining = &s[pos..];
-    if !remaining.bytes().all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' | b'\x0b')) {
+    if !remaining
+        .bytes()
+        .all(|b| matches!(b, b' ' | b'\t' | b'\n' | b'\r' | b'\x0c' | b'\x0b'))
+    {
         return None;
     }
     Some(result as i64)
@@ -1307,7 +1326,11 @@ pub fn parse_hex_float(s: &str) -> Option<f64> {
             exp_val = exp_val * 10 + (chars[i] as u8 - b'0') as i32;
             i += 1;
         }
-        if neg_exp { e -= exp_val; } else { e += exp_val; }
+        if neg_exp {
+            e -= exp_val;
+        } else {
+            e += exp_val;
+        }
     }
 
     // 必须处理完所有字符（对应 C 的 endptr 检查）
@@ -1508,13 +1531,18 @@ pub fn chunkid(out: &mut [u8], source: &[u8], srclen: usize) {
         out[..pre_len].copy_from_slice(pre);
         let usable = bufflen - total_overhead;
         let nl = src.iter().position(|&b| b == b'\n');
-        let src_len = nl.map(|p| p.min(usable)).unwrap_or(if src.len() < usable { src.len() } else { usable });
+        let src_len = nl.map(|p| p.min(usable)).unwrap_or(if src.len() < usable {
+            src.len()
+        } else {
+            usable
+        });
         out[pre_len..pre_len + src_len].copy_from_slice(&src[..src_len]);
         if nl.is_some() || src.len() > usable {
             let rets = b"...";
             let rets_len = rets.len();
             out[pre_len + src_len..pre_len + src_len + rets_len].copy_from_slice(rets);
-            out[pre_len + src_len + rets_len..pre_len + src_len + rets_len + pos_len].copy_from_slice(pos);
+            out[pre_len + src_len + rets_len..pre_len + src_len + rets_len + pos_len]
+                .copy_from_slice(pos);
         } else {
             out[pre_len + src_len..pre_len + src_len + pos_len].copy_from_slice(pos);
         }
@@ -1569,7 +1597,12 @@ pub enum ArithOp {
 pub fn rawarith(op: ArithOp, p1: &TValue, p2: &TValue, res: &mut TValue) -> bool {
     // 规约: 待实现
     match op {
-        ArithOp::BAnd | ArithOp::BOr | ArithOp::BXor | ArithOp::Shl | ArithOp::Shr | ArithOp::BNot => {
+        ArithOp::BAnd
+        | ArithOp::BOr
+        | ArithOp::BXor
+        | ArithOp::Shl
+        | ArithOp::Shr
+        | ArithOp::BNot => {
             if !p1.is_integer() || !p2.is_integer() {
                 return false;
             }
@@ -1613,7 +1646,11 @@ pub fn rawarith(op: ArithOp, p1: &TValue, p2: &TValue, res: &mut TValue) -> bool
                         ArithOp::Add => TValue::Integer(a.wrapping_add(b)),
                         ArithOp::Sub => TValue::Integer(a.wrapping_sub(b)),
                         ArithOp::Mul => TValue::Integer(a.wrapping_mul(b)),
-                        ArithOp::IDiv => TValue::Integer(if b == 0 { 0 } else { float_idiv(a as f64, b as f64) as i64 }),
+                        ArithOp::IDiv => TValue::Integer(if b == 0 {
+                            0
+                        } else {
+                            float_idiv(a as f64, b as f64) as i64
+                        }),
                         ArithOp::Mod => TValue::Integer(if b == 0 { 0 } else { a % b }),
                         ArithOp::Unm => TValue::Integer(a.wrapping_neg()),
                         _ => unreachable!(),
@@ -1648,7 +1685,11 @@ fn float_idiv(a: f64, b: f64) -> f64 {
 
 fn float_mod(a: f64, b: f64) -> f64 {
     let m = a % b;
-    if (m > 0.0) == (b < 0.0) && m != 0.0 { m + b } else { m }
+    if (m > 0.0) == (b < 0.0) && m != 0.0 {
+        m + b
+    } else {
+        m
+    }
 }
 
 // ============================================================================
@@ -1710,7 +1751,7 @@ pub fn twoto(n: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::strings::{ShortString, LongString};
+    use crate::strings::{LongString, ShortString};
     use std::sync::atomic::{AtomicU64, AtomicU8};
 
     // ========================================================================
@@ -1847,7 +1888,10 @@ mod tests {
 
     #[test]
     fn test_luastring_short() {
-        let short = ShortString { hash: 0, contents: "hello".into() };
+        let short = ShortString {
+            hash: 0,
+            contents: "hello".into(),
+        };
         let ts = LuaString::Short(std::sync::Arc::new(short));
         assert_eq!(ts.as_str(), "hello");
         assert_eq!(ts.len(), 5);
@@ -1857,7 +1901,12 @@ mod tests {
 
     #[test]
     fn test_luastring_long() {
-        let long = LongString { hash: AtomicU64::new(0), extra: AtomicU8::new(0), contents: "a".repeat(100), ptr_id: 0 };
+        let long = LongString {
+            hash: AtomicU64::new(0),
+            extra: AtomicU8::new(0),
+            contents: "a".repeat(100),
+            ptr_id: 0,
+        };
         let ts = LuaString::Long(Box::new(long));
         assert_eq!(ts.len(), 100);
         assert!(matches!(ts, LuaString::Long(_)));
@@ -1865,7 +1914,10 @@ mod tests {
 
     #[test]
     fn test_luastring_empty() {
-        let short = ShortString { hash: 0, contents: String::new() };
+        let short = ShortString {
+            hash: 0,
+            contents: String::new(),
+        };
         let ts = LuaString::Short(std::sync::Arc::new(short));
         assert!(ts.is_empty());
         assert_eq!(ts.len(), 0);
@@ -1874,25 +1926,42 @@ mod tests {
 
     #[test]
     fn test_luastring_eq() {
-        let arc1 = std::sync::Arc::new(ShortString { hash: 0, contents: "foo".into() });
+        let arc1 = std::sync::Arc::new(ShortString {
+            hash: 0,
+            contents: "foo".into(),
+        });
         let arc2 = std::sync::Arc::clone(&arc1);
         let ts1 = LuaString::Short(arc1);
         let ts2 = LuaString::Short(arc2);
         assert_eq!(ts1, ts2);
 
-        let arc3 = std::sync::Arc::new(ShortString { hash: 1, contents: "bar".into() });
+        let arc3 = std::sync::Arc::new(ShortString {
+            hash: 1,
+            contents: "bar".into(),
+        });
         let ts3 = LuaString::Short(arc3);
         assert_ne!(ts1, ts3);
 
-        let long1 = LuaString::Long(Box::new(LongString { hash: AtomicU64::new(0), extra: AtomicU8::new(0), contents: "test".into(), ptr_id: 0 }));
-        let long2 = LuaString::Long(Box::new(LongString { hash: AtomicU64::new(0), extra: AtomicU8::new(0), contents: "test".into(), ptr_id: 0 }));
+        let long1 = LuaString::Long(Box::new(LongString {
+            hash: AtomicU64::new(0),
+            extra: AtomicU8::new(0),
+            contents: "test".into(),
+            ptr_id: 0,
+        }));
+        let long2 = LuaString::Long(Box::new(LongString {
+            hash: AtomicU64::new(0),
+            extra: AtomicU8::new(0),
+            contents: "test".into(),
+            ptr_id: 0,
+        }));
         assert_eq!(long1, long2);
     }
 
     #[test]
     fn test_luastring_as_str() {
         let short = LuaString::Short(std::sync::Arc::new(ShortString {
-            hash: 0, contents: "abc".into(),
+            hash: 0,
+            contents: "abc".into(),
         }));
         assert_eq!(short.as_str(), "abc");
     }
@@ -2267,8 +2336,11 @@ mod tests {
         let code = codeparam(50);
         let result = applyparam(code, 1000);
         // 期望约 500，允许 ±10% 误差
-        assert!(result > 400 && result < 600,
-            "50% of 1000 should be ~500, got {}", result);
+        assert!(
+            result > 400 && result < 600,
+            "50% of 1000 should be ~500, got {}",
+            result
+        );
     }
 
     // ========================================================================
@@ -2304,7 +2376,12 @@ mod tests {
 
     #[test]
     fn test_upval_open() {
-        let uv = UpVal::Open { stack_index: 3, next: None, previous: None, tbc: false };
+        let uv = UpVal::Open {
+            stack_index: 3,
+            next: None,
+            previous: None,
+            tbc: false,
+        };
         match uv {
             UpVal::Open { stack_index, .. } => assert_eq!(stack_index, 3),
             _ => panic!("expected Open"),
@@ -2313,14 +2390,21 @@ mod tests {
 
     #[test]
     fn test_upval_open_is_open() {
-        let uv = UpVal::Open { stack_index: 3, next: None, previous: None, tbc: false };
+        let uv = UpVal::Open {
+            stack_index: 3,
+            next: None,
+            previous: None,
+            tbc: false,
+        };
         assert!(uv.is_open());
         assert_eq!(uv.level(), Some(3));
     }
 
     #[test]
     fn test_upval_closed() {
-        let uv = UpVal::Closed { value: Box::new(TValue::Integer(42)) };
+        let uv = UpVal::Closed {
+            value: Box::new(TValue::Integer(42)),
+        };
         match uv {
             UpVal::Closed { value } => assert_eq!(*value, TValue::Integer(42)),
             _ => panic!("expected Closed"),
@@ -2329,7 +2413,9 @@ mod tests {
 
     #[test]
     fn test_upval_closed_not_open() {
-        let uv = UpVal::Closed { value: Box::new(TValue::Integer(42)) };
+        let uv = UpVal::Closed {
+            value: Box::new(TValue::Integer(42)),
+        };
         assert!(!uv.is_open());
         assert_eq!(uv.level(), None);
     }
@@ -2372,15 +2458,25 @@ mod tests {
 
     #[test]
     fn test_type_sizes() {
-        use std::mem::size_of;
-        use std::cell::Cell;
         use crate::gc::GCObjectId;
-        println!("TValue: {} (align {})", size_of::<TValue>(), std::mem::align_of::<TValue>());
+        use std::cell::Cell;
+        use std::mem::size_of;
+        println!(
+            "TValue: {} (align {})",
+            size_of::<TValue>(),
+            std::mem::align_of::<TValue>()
+        );
         println!("Table: {}", size_of::<Table>());
-        println!("  GCObjectHeader: {}", size_of::<crate::gc::GCObjectHeader>());
+        println!(
+            "  GCObjectHeader: {}",
+            size_of::<crate::gc::GCObjectHeader>()
+        );
         println!("  GCObjectId: {}", size_of::<GCObjectId>());
         println!("  Option<GCObjectId>: {}", size_of::<Option<GCObjectId>>());
-        println!("  Cell<Option<GCObjectId>>: {}", size_of::<Cell<Option<GCObjectId>>>());
+        println!(
+            "  Cell<Option<GCObjectId>>: {}",
+            size_of::<Cell<Option<GCObjectId>>>()
+        );
         println!("TableData: {}", size_of::<TableData>());
         println!("LClosure: {}", size_of::<LClosure>());
         println!("CClosure: {}", size_of::<CClosure>());

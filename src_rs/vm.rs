@@ -16,24 +16,21 @@
 use std::cmp::Ordering;
 use std::ffi::CString;
 
-use crate::objects::{TValue, UpVal, UpValRef, NilKind};
+use crate::gc::GCState;
+use crate::objects::{NilKind, TValue, UpVal, UpValRef};
 use crate::strings::LuaString;
 use crate::table::Table;
-use crate::tm::{
-    TagMethod, TagMethodError, DefaultMetatables,
-    get_tm_by_obj, obj_type_name,
-};
-use crate::gc::GCState;
-use std::rc::Rc;
+use crate::tm::{get_tm_by_obj, obj_type_name, DefaultMetatables, TagMethod, TagMethodError};
 use std::cell::RefCell;
+use std::rc::Rc;
 
 // ============================================================================
 // 虚拟机主解释器循环 (原 lvm.cpp 中的 luaV_execute)
 // ============================================================================
 
+pub use crate::execute::VmError;
 pub use crate::execute::VmExecutor;
 pub use crate::execute::VmResult;
-pub use crate::execute::VmError;
 
 // ============================================================================
 // F2IMode: 浮点数到整数的转换模式
@@ -263,8 +260,16 @@ pub fn strcmp(ts1: &LuaString, ts2: &LuaString) -> Ordering {
     let bytes2 = s2.as_bytes();
 
     loop {
-        let seg1_end = bytes1[pos1..].iter().position(|&b| b == 0).map(|p| pos1 + p).unwrap_or(s1.len());
-        let seg2_end = bytes2[pos2..].iter().position(|&b| b == 0).map(|p| pos2 + p).unwrap_or(s2.len());
+        let seg1_end = bytes1[pos1..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|p| pos1 + p)
+            .unwrap_or(s1.len());
+        let seg2_end = bytes2[pos2..]
+            .iter()
+            .position(|&b| b == 0)
+            .map(|p| pos2 + p)
+            .unwrap_or(s2.len());
 
         let seg1 = &s1[pos1..seg1_end];
         let seg2 = &s2[pos2..seg2_end];
@@ -278,7 +283,11 @@ pub fn strcmp(ts1: &LuaString, ts2: &LuaString) -> Ordering {
         let finished2 = seg2_end == s2.len();
 
         if finished2 {
-            return if finished1 { Ordering::Equal } else { Ordering::Greater };
+            return if finished1 {
+                Ordering::Equal
+            } else {
+                Ordering::Greater
+            };
         }
         if finished1 {
             return Ordering::Less;
@@ -371,7 +380,11 @@ pub fn lt_num(l: &TValue, r: &TValue) -> bool {
         (TValue::Integer(li), TValue::Float(rf)) => lt_int_float(*li, *rf),
         (TValue::Float(lf), TValue::Integer(ri)) => lt_float_int(*lf, *ri),
         (TValue::Float(lf), TValue::Float(rf)) => {
-            if lf.is_nan() || rf.is_nan() { false } else { lf < rf }
+            if lf.is_nan() || rf.is_nan() {
+                false
+            } else {
+                lf < rf
+            }
         }
         _ => panic!("lt_num: operands must be numbers"),
     }
@@ -384,7 +397,11 @@ pub fn le_num(l: &TValue, r: &TValue) -> bool {
         (TValue::Integer(li), TValue::Float(rf)) => le_int_float(*li, *rf),
         (TValue::Float(lf), TValue::Integer(ri)) => le_float_int(*lf, *ri),
         (TValue::Float(lf), TValue::Float(rf)) => {
-            if lf.is_nan() || rf.is_nan() { false } else { lf <= rf }
+            if lf.is_nan() || rf.is_nan() {
+                false
+            } else {
+                lf <= rf
+            }
         }
         _ => panic!("le_num: operands must be numbers"),
     }
@@ -421,10 +438,18 @@ pub fn raw_equal(t1: &TValue, t2: &TValue) -> bool {
         (TValue::Integer(a), TValue::Integer(b)) => a == b,
         (TValue::Float(a), TValue::Float(b)) => a == b,
         (TValue::Integer(a), TValue::Float(b)) => {
-            if b.is_nan() { false } else { float_to_integer(*b, F2IMode::Eq).map_or(false, |i| *a == i) }
+            if b.is_nan() {
+                false
+            } else {
+                float_to_integer(*b, F2IMode::Eq).map_or(false, |i| *a == i)
+            }
         }
         (TValue::Float(a), TValue::Integer(b)) => {
-            if a.is_nan() { false } else { float_to_integer(*a, F2IMode::Eq).map_or(false, |i| i == *b) }
+            if a.is_nan() {
+                false
+            } else {
+                float_to_integer(*a, F2IMode::Eq).map_or(false, |i| i == *b)
+            }
         }
         (TValue::Str(a), TValue::Str(b)) => a.as_str() == b.as_str(),
         (TValue::LightUserData(a), TValue::LightUserData(b)) => std::ptr::eq(*a, *b),
@@ -567,10 +592,14 @@ pub fn modulus_float(m: f64, n: f64) -> f64 {
 pub fn shiftl(x: i64, y: i64) -> i64 {
     const NBITS: i64 = 64;
     if y < 0 {
-        if y <= -NBITS { return 0; }
+        if y <= -NBITS {
+            return 0;
+        }
         ((x as u64) >> (-y as u32)) as i64
     } else {
-        if y >= NBITS { return 0; }
+        if y >= NBITS {
+            return 0;
+        }
         ((x as u64) << (y as u32)) as i64
     }
 }
@@ -676,10 +705,13 @@ pub fn finish_get(key: &TValue, t: &TValue, _metatable: Option<&Table>) -> Resul
                 // 通过 get_metatable() 获取元表（共享 Rc，开销极小）
                 if let Some(mt) = table.get_metatable() {
                     return Ok(table.get(&current_key).unwrap_or_else(|| {
-                        mt.get(&current_key).unwrap_or(TValue::Nil(crate::objects::NilKind::Strict))
+                        mt.get(&current_key)
+                            .unwrap_or(TValue::Nil(crate::objects::NilKind::Strict))
                     }));
                 } else {
-                    return Ok(table.get(&current_key).unwrap_or(TValue::Nil(crate::objects::NilKind::Strict)));
+                    return Ok(table
+                        .get(&current_key)
+                        .unwrap_or(TValue::Nil(crate::objects::NilKind::Strict)));
                 }
             }
             _ => {
@@ -687,7 +719,9 @@ pub fn finish_get(key: &TValue, t: &TValue, _metatable: Option<&Table>) -> Resul
             }
         }
     }
-    Err(VmError::RuntimeError("'__index' chain too long; possible loop".into()))
+    Err(VmError::RuntimeError(
+        "'__index' chain too long; possible loop".into(),
+    ))
 }
 
 // ============================================================================
@@ -717,7 +751,12 @@ pub fn finish_get(key: &TValue, t: &TValue, _metatable: Option<&Table>) -> Resul
 /// Given: __newindex 链形成循环
 /// When: 遍历超过 MAXTAGLOOP 次
 /// Then: 返回 RuntimeError
-pub fn finish_set(t: &mut TValue, key: TValue, val: TValue, _hres: FastAccess) -> Result<(), VmError> {
+pub fn finish_set(
+    t: &mut TValue,
+    key: TValue,
+    val: TValue,
+    _hres: FastAccess,
+) -> Result<(), VmError> {
     for _loop_count in 0..MAX_TAG_LOOP {
         match t {
             TValue::Table(table) => {
@@ -725,11 +764,15 @@ pub fn finish_set(t: &mut TValue, key: TValue, val: TValue, _hres: FastAccess) -
                 return Ok(());
             }
             _ => {
-                return Err(VmError::TypeError("attempt to index a non-table value".into()));
+                return Err(VmError::TypeError(
+                    "attempt to index a non-table value".into(),
+                ));
             }
         }
     }
-    Err(VmError::RuntimeError("'__newindex' chain too long; possible loop".into()))
+    Err(VmError::RuntimeError(
+        "'__newindex' chain too long; possible loop".into(),
+    ))
 }
 
 // ============================================================================
@@ -778,8 +821,12 @@ fn value_is_stringable(v: &TValue) -> bool {
 }
 
 fn format_float_len(f: f64) -> usize {
-    if f.is_nan() { return 3; }
-    if f.is_infinite() { return if f > 0.0 { 3 } else { 4 }; }
+    if f.is_nan() {
+        return 3;
+    }
+    if f.is_infinite() {
+        return if f > 0.0 { 3 } else { 4 };
+    }
     format_float(f).len()
 }
 
@@ -799,11 +846,10 @@ fn format_float_len(f: f64) -> usize {
 /// Given: 栈上有 Table 和 Str("hello")
 /// When: 调用 concat_stack(stack, 2, &dmt)
 /// Then: 返回 Err(ConcatError { ... })
-pub fn concat_stack(
-    stack: &mut Vec<TValue>,
-    total: usize,
-) -> Result<(), TagMethodError> {
-    if total <= 1 { return Ok(()); }
+pub fn concat_stack(stack: &mut Vec<TValue>, total: usize) -> Result<(), TagMethodError> {
+    if total <= 1 {
+        return Ok(());
+    }
     let mut remaining = total;
     while remaining > 1 {
         let top = stack.len();
@@ -915,7 +961,9 @@ fn value_str_len(v: &TValue) -> usize {
     match v {
         TValue::Str(s) => s.len(),
         TValue::Integer(i) => {
-            if *i == 0 { 1 } else if *i < 0 {
+            if *i == 0 {
+                1
+            } else if *i < 0 {
                 (*i as i128).unsigned_abs().to_string().len() + 1
             } else {
                 (*i as u64).to_string().len()
@@ -968,7 +1016,11 @@ fn append_val_to_string(buf: &mut String, v: &TValue) {
 /// When: 调用 for_limit
 /// Then: 返回 true（跳过循环）
 pub fn for_limit(init: i64, limit_val: &TValue, step: i64) -> Result<(i64, bool), VmError> {
-    let mode = if step < 0 { F2IMode::Ceil } else { F2IMode::Floor };
+    let mode = if step < 0 {
+        F2IMode::Ceil
+    } else {
+        F2IMode::Floor
+    };
 
     if let Some(limit) = to_integer(limit_val, mode) {
         let skip = if step > 0 { init > limit } else { init < limit };
@@ -977,7 +1029,11 @@ pub fn for_limit(init: i64, limit_val: &TValue, step: i64) -> Result<(i64, bool)
 
     let flim = match to_number_ns(limit_val) {
         Some(n) => n,
-        None => return Err(VmError::RuntimeError("bad 'for' limit (number expected, got value)".into())),
+        None => {
+            return Err(VmError::RuntimeError(
+                "bad 'for' limit (number expected, got value)".into(),
+            ))
+        }
     };
 
     if flim > 0.0 {
@@ -1035,7 +1091,11 @@ pub fn for_prep(stack: &mut Vec<TValue>, ra: usize) -> Result<bool, VmError> {
             let count: u64 = if *step_i > 0 {
                 let diff = (limit_i as u64).wrapping_sub(*init_i as u64);
                 let s = *step_i as u64;
-                if s == 1 { diff } else { diff / s }
+                if s == 1 {
+                    diff
+                } else {
+                    diff / s
+                }
             } else {
                 let diff = (*init_i as u64).wrapping_sub(limit_i as u64);
                 let s = ((-(*step_i + 1)) as u64).wrapping_add(1);
@@ -1047,13 +1107,20 @@ pub fn for_prep(stack: &mut Vec<TValue>, ra: usize) -> Result<bool, VmError> {
             Ok(false)
         }
         _ => {
-            let init_f = to_number(&init).ok_or_else(|| VmError::RuntimeError("bad 'for' initial value".into()))?;
-            let limit_f = to_number(&limit).ok_or_else(|| VmError::RuntimeError("bad 'for' limit".into()))?;
-            let step_f = to_number(&step).ok_or_else(|| VmError::RuntimeError("bad 'for' step".into()))?;
+            let init_f = to_number(&init)
+                .ok_or_else(|| VmError::RuntimeError("bad 'for' initial value".into()))?;
+            let limit_f =
+                to_number(&limit).ok_or_else(|| VmError::RuntimeError("bad 'for' limit".into()))?;
+            let step_f =
+                to_number(&step).ok_or_else(|| VmError::RuntimeError("bad 'for' step".into()))?;
             if step_f == 0.0 {
                 return Err(VmError::RuntimeError("'for' step is zero".into()));
             }
-            let skip = if step_f > 0.0 { limit_f < init_f } else { init_f < limit_f };
+            let skip = if step_f > 0.0 {
+                limit_f < init_f
+            } else {
+                init_f < limit_f
+            };
             if skip {
                 return Ok(true);
             }
@@ -1102,7 +1169,11 @@ pub fn float_for_loop(stack: &mut Vec<TValue>, ra: usize) -> bool {
         _ => return false,
     };
     let new_idx = idx + step;
-    let should_continue = if step > 0.0 { new_idx <= limit } else { new_idx >= limit };
+    let should_continue = if step > 0.0 {
+        new_idx <= limit
+    } else {
+        new_idx >= limit
+    };
     if should_continue {
         stack[ra + 2] = TValue::Float(new_idx);
         true
@@ -1212,12 +1283,26 @@ pub fn gc_id_of_tvalue(val: &TValue) -> Option<crate::gc::GCObjectId> {
 // ============================================================================
 
 fn format_float(f: f64) -> String {
-    if f.is_nan() { return "nan".to_string(); }
-    if f.is_infinite() { return if f > 0.0 { "inf".to_string() } else { "-inf".to_string() }; }
-    if f == 0.0 { return "0.0".to_string(); }
+    if f.is_nan() {
+        return "nan".to_string();
+    }
+    if f.is_infinite() {
+        return if f > 0.0 {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        };
+    }
+    if f == 0.0 {
+        return "0.0".to_string();
+    }
     let s = format!("{:.15}", f);
     let s = s.trim_end_matches('0');
-    if s.ends_with('.') { format!("{}0", s) } else { s.to_string() }
+    if s.ends_with('.') {
+        format!("{}0", s)
+    } else {
+        s.to_string()
+    }
 }
 
 // ============================================================================
@@ -1229,7 +1314,7 @@ mod tests {
     use super::*;
     use crate::objects::{NilKind, Proto, UpvalDesc};
     use crate::state::LuaState;
-use crate::strings::{LuaString, StringTable};
+    use crate::strings::{LuaString, StringTable};
     use std::rc::Rc;
 
     fn make_gc() -> Rc<crate::gc::GCState> {
@@ -1245,7 +1330,10 @@ use crate::strings::{LuaString, StringTable};
         let l = LuaState::new();
         // 对应 C 的 stack_init: top = stack + 1, stacksize = BASIC_STACK_SIZE + EXTRA_STACK
         assert_eq!(l.gettop(), 1, "stack must have function entry slot");
-        assert_eq!(l.stack.capacity(), crate::state::BASIC_STACK_SIZE + crate::state::EXTRA_STACK);
+        assert_eq!(
+            l.stack.capacity(),
+            crate::state::BASIC_STACK_SIZE + crate::state::EXTRA_STACK
+        );
     }
 
     #[test]
@@ -1256,7 +1344,10 @@ use crate::strings::{LuaString, StringTable};
 
     #[test]
     fn test_vm_executor_reachable() {
-        let result: Result<VmResult, VmError> = Ok(VmResult::Return { nresults: 0, result_base: 0 });
+        let result: Result<VmResult, VmError> = Ok(VmResult::Return {
+            nresults: 0,
+            result_base: 0,
+        });
         assert!(result.is_ok());
     }
 
@@ -1328,17 +1419,26 @@ use crate::strings::{LuaString, StringTable};
         assert!(float_to_integer(f64::INFINITY, F2IMode::Eq).is_none());
         // f64 能精确表示的最大 i64: 2^63 - 1024 = i64::MAX - 1023
         let largest_fit = i64::MAX - 1023;
-        assert_eq!(float_to_integer(largest_fit as f64, F2IMode::Eq), Some(largest_fit));
+        assert_eq!(
+            float_to_integer(largest_fit as f64, F2IMode::Eq),
+            Some(largest_fit)
+        );
     }
 
     #[test]
     fn test_float_to_integer_overflow() {
-        assert_eq!(float_to_integer(i64::MAX as f64 + 10000.0, F2IMode::Eq), None);
+        assert_eq!(
+            float_to_integer(i64::MAX as f64 + 10000.0, F2IMode::Eq),
+            None
+        );
     }
 
     #[test]
     fn test_float_to_integer_i64_min_edge() {
-        assert_eq!(float_to_integer(i64::MIN as f64, F2IMode::Eq), Some(i64::MIN));
+        assert_eq!(
+            float_to_integer(i64::MIN as f64, F2IMode::Eq),
+            Some(i64::MIN)
+        );
     }
 
     #[test]
@@ -1564,9 +1664,18 @@ use crate::strings::{LuaString, StringTable};
     #[test]
     fn test_lt_num_large_int_vs_float() {
         let large = 2i64.pow(54);
-        assert!(!lt_num(&TValue::Integer(large), &TValue::Float(large as f64)));
-        assert!(lt_num(&TValue::Integer(large), &TValue::Float(large as f64 + 8.0)));
-        assert!(lt_num(&TValue::Integer(large - 1), &TValue::Float(large as f64 + 8.0)));
+        assert!(!lt_num(
+            &TValue::Integer(large),
+            &TValue::Float(large as f64)
+        ));
+        assert!(lt_num(
+            &TValue::Integer(large),
+            &TValue::Float(large as f64 + 8.0)
+        ));
+        assert!(lt_num(
+            &TValue::Integer(large - 1),
+            &TValue::Float(large as f64 + 8.0)
+        ));
     }
 
     #[test]
@@ -1595,7 +1704,10 @@ use crate::strings::{LuaString, StringTable};
     fn test_raw_equal_same_type_same_value() {
         assert!(raw_equal(&TValue::Integer(42), &TValue::Integer(42)));
         assert!(raw_equal(&TValue::Boolean(true), &TValue::Boolean(true)));
-        assert!(raw_equal(&TValue::Nil(NilKind::Strict), &TValue::Nil(NilKind::Strict)));
+        assert!(raw_equal(
+            &TValue::Nil(NilKind::Strict),
+            &TValue::Nil(NilKind::Strict)
+        ));
     }
 
     #[test]
@@ -1606,7 +1718,10 @@ use crate::strings::{LuaString, StringTable};
 
     #[test]
     fn test_raw_equal_diff_nil_variant() {
-        assert!(!raw_equal(&TValue::Nil(NilKind::Strict), &TValue::Nil(NilKind::Empty)));
+        assert!(!raw_equal(
+            &TValue::Nil(NilKind::Strict),
+            &TValue::Nil(NilKind::Empty)
+        ));
     }
 
     #[test]
@@ -1623,12 +1738,18 @@ use crate::strings::{LuaString, StringTable};
     #[test]
     fn test_raw_equal_diff_type() {
         assert!(!raw_equal(&TValue::Integer(1), &TValue::Boolean(true)));
-        assert!(!raw_equal(&TValue::Nil(NilKind::Strict), &TValue::Integer(0)));
+        assert!(!raw_equal(
+            &TValue::Nil(NilKind::Strict),
+            &TValue::Integer(0)
+        ));
     }
 
     #[test]
     fn test_raw_equal_nan() {
-        assert!(!raw_equal(&TValue::Float(f64::NAN), &TValue::Float(f64::NAN)));
+        assert!(!raw_equal(
+            &TValue::Float(f64::NAN),
+            &TValue::Float(f64::NAN)
+        ));
     }
 
     #[test]
@@ -2094,17 +2215,30 @@ use crate::strings::{LuaString, StringTable};
     fn test_finish_set_table() {
         let t = Table::new();
         let mut tv = TValue::Table(t);
-        let result = finish_set(&mut tv, TValue::Str(make_ls("a")), TValue::Integer(100), FastAccess::Ok);
+        let result = finish_set(
+            &mut tv,
+            TValue::Str(make_ls("a")),
+            TValue::Integer(100),
+            FastAccess::Ok,
+        );
         assert!(result.is_ok());
         if let TValue::Table(ref t) = tv {
-            assert_eq!(t.get(&TValue::Str(make_ls("a"))), Some(TValue::Integer(100)));
+            assert_eq!(
+                t.get(&TValue::Str(make_ls("a"))),
+                Some(TValue::Integer(100))
+            );
         }
     }
 
     #[test]
     fn test_finish_set_non_table_error() {
         let mut tv = TValue::Integer(42);
-        let result = finish_set(&mut tv, TValue::Integer(1), TValue::Integer(100), FastAccess::Ok);
+        let result = finish_set(
+            &mut tv,
+            TValue::Integer(1),
+            TValue::Integer(100),
+            FastAccess::Ok,
+        );
         assert!(result.is_err());
     }
 
@@ -2168,10 +2302,7 @@ use crate::strings::{LuaString, StringTable};
     #[test]
     fn test_concat_stack_with_numbers() {
         let tb = StringTable::new();
-        let mut stack = vec![
-            TValue::Str(tb.intern("x=")),
-            TValue::Integer(42),
-        ];
+        let mut stack = vec![TValue::Str(tb.intern("x=")), TValue::Integer(42)];
         concat_stack(&mut stack, 2).unwrap();
         if let TValue::Str(ref s) = stack[0] {
             assert_eq!(s.as_str(), "x=42");
@@ -2183,10 +2314,7 @@ use crate::strings::{LuaString, StringTable};
     #[test]
     fn test_concat_stack_empty_first() {
         let tb = StringTable::new();
-        let mut stack = vec![
-            TValue::Str(tb.intern("")),
-            TValue::Str(tb.intern("world")),
-        ];
+        let mut stack = vec![TValue::Str(tb.intern("")), TValue::Str(tb.intern("world"))];
         concat_stack(&mut stack, 2).unwrap();
         assert_eq!(stack.len(), 1);
         if let TValue::Str(ref s) = stack[0] {
@@ -2244,55 +2372,35 @@ use crate::strings::{LuaString, StringTable};
 
     #[test]
     fn test_for_prep_integer_ascending() {
-        let mut stack = vec![
-            TValue::Integer(1),
-            TValue::Integer(5),
-            TValue::Integer(1),
-        ];
+        let mut stack = vec![TValue::Integer(1), TValue::Integer(5), TValue::Integer(1)];
         let skip = for_prep(&mut stack, 0).unwrap();
         assert!(!skip);
     }
 
     #[test]
     fn test_for_prep_integer_descending() {
-        let mut stack = vec![
-            TValue::Integer(5),
-            TValue::Integer(1),
-            TValue::Integer(-1),
-        ];
+        let mut stack = vec![TValue::Integer(5), TValue::Integer(1), TValue::Integer(-1)];
         let skip = for_prep(&mut stack, 0).unwrap();
         assert!(!skip);
     }
 
     #[test]
     fn test_for_prep_skip_when_init_exceeds_limit() {
-        let mut stack = vec![
-            TValue::Integer(10),
-            TValue::Integer(5),
-            TValue::Integer(1),
-        ];
+        let mut stack = vec![TValue::Integer(10), TValue::Integer(5), TValue::Integer(1)];
         let skip = for_prep(&mut stack, 0).unwrap();
         assert!(skip);
     }
 
     #[test]
     fn test_for_prep_step_zero_error() {
-        let mut stack = vec![
-            TValue::Integer(1),
-            TValue::Integer(5),
-            TValue::Integer(0),
-        ];
+        let mut stack = vec![TValue::Integer(1), TValue::Integer(5), TValue::Integer(0)];
         let result = for_prep(&mut stack, 0);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_for_prep_float() {
-        let mut stack = vec![
-            TValue::Float(1.0),
-            TValue::Float(5.0),
-            TValue::Float(1.0),
-        ];
+        let mut stack = vec![TValue::Float(1.0), TValue::Float(5.0), TValue::Float(1.0)];
         let skip = for_prep(&mut stack, 0).unwrap();
         assert!(!skip);
     }
@@ -2303,32 +2411,20 @@ use crate::strings::{LuaString, StringTable};
 
     #[test]
     fn test_float_for_loop_continue() {
-        let mut stack = vec![
-            TValue::Float(5.0),
-            TValue::Float(1.0),
-            TValue::Float(3.0),
-        ];
+        let mut stack = vec![TValue::Float(5.0), TValue::Float(1.0), TValue::Float(3.0)];
         assert!(float_for_loop(&mut stack, 0));
         assert_eq!(stack[2], TValue::Float(4.0));
     }
 
     #[test]
     fn test_float_for_loop_end() {
-        let mut stack = vec![
-            TValue::Float(5.0),
-            TValue::Float(1.0),
-            TValue::Float(5.0),
-        ];
+        let mut stack = vec![TValue::Float(5.0), TValue::Float(1.0), TValue::Float(5.0)];
         assert!(!float_for_loop(&mut stack, 0));
     }
 
     #[test]
     fn test_float_for_loop_descending_continue() {
-        let mut stack = vec![
-            TValue::Float(1.0),
-            TValue::Float(-1.0),
-            TValue::Float(3.0),
-        ];
+        let mut stack = vec![TValue::Float(1.0), TValue::Float(-1.0), TValue::Float(3.0)];
         assert!(float_for_loop(&mut stack, 0));
         assert_eq!(stack[2], TValue::Float(2.0));
     }
@@ -2340,10 +2436,18 @@ use crate::strings::{LuaString, StringTable};
     #[test]
     fn test_push_closure_no_upvals() {
         let proto = Proto {
-            num_params: 0, flag: 0, max_stack_size: 10,
-            size_upvalues: 0, size_k: 0, size_code: 0, size_line_info: 0,
-            size_p: 0, size_loc_vars: 0, size_abs_line_info: 0,
-            line_defined: 0, last_line_defined: 0,
+            num_params: 0,
+            flag: 0,
+            max_stack_size: 10,
+            size_upvalues: 0,
+            size_k: 0,
+            size_code: 0,
+            size_line_info: 0,
+            size_p: 0,
+            size_loc_vars: 0,
+            size_abs_line_info: 0,
+            line_defined: 0,
+            last_line_defined: 0,
             constants: vec![],
             code: vec![],
             protos: vec![],
@@ -2371,14 +2475,28 @@ use crate::strings::{LuaString, StringTable};
             TValue::Nil(NilKind::Strict),
         ];
         let proto = Proto {
-            num_params: 0, flag: 0, max_stack_size: 10,
-            size_upvalues: 1, size_k: 0, size_code: 0, size_line_info: 0,
-            size_p: 0, size_loc_vars: 0, size_abs_line_info: 0,
-            line_defined: 0, last_line_defined: 0,
+            num_params: 0,
+            flag: 0,
+            max_stack_size: 10,
+            size_upvalues: 1,
+            size_k: 0,
+            size_code: 0,
+            size_line_info: 0,
+            size_p: 0,
+            size_loc_vars: 0,
+            size_abs_line_info: 0,
+            line_defined: 0,
+            last_line_defined: 0,
             constants: vec![],
             code: vec![],
             protos: vec![],
-            upvalues: vec![UpvalDesc { in_stack: true, idx: 0, name: None, parent_local_idx: 0, kind: 0 }],
+            upvalues: vec![UpvalDesc {
+                in_stack: true,
+                idx: 0,
+                name: None,
+                parent_local_idx: 0,
+                kind: 0,
+            }],
             line_info: vec![],
             abs_line_info: vec![],
             loc_vars: vec![],

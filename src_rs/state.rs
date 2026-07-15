@@ -1,21 +1,24 @@
 use crate::debug::runerror;
-use crate::objects::{CallFrame, Instruction, LClosure, LuaThread, LuaType, NilKind, Proto, TableData, ThreadContext, ThreadStatus, TValue, UpVal, UpValRef, UpvalDesc};
+use crate::execute::{VmError, VmExecutor, VmResult};
+use crate::gc::{GCObjectHeader, GCState};
+use crate::objects::{
+    CallFrame, Instruction, LClosure, LuaThread, LuaType, NilKind, Proto, TValue, TableData,
+    ThreadContext, ThreadStatus, UpVal, UpValRef, UpvalDesc,
+};
 use crate::strings::{LuaString, StringTable};
 use crate::table::Table;
-use crate::gc::{GCObjectHeader, GCState};
-use crate::execute::{VmExecutor, VmResult, VmError};
 use crate::tm::DefaultMetatables;
-use std::rc::Rc;
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::io::{Read, Write};
+use std::rc::Rc;
 
 const EOFMARK: &str = "<eof>";
 
 pub const LUA_YIELD: i32 = 1;
 pub const ERR_RUN: i32 = 2;
 pub const ERR_SYNTAX: i32 = 3;
-pub const ERR_FILE: i32 = 6;  // LUA_ERRERR + 1, used by luaL_loadfilex
+pub const ERR_FILE: i32 = 6; // LUA_ERRERR + 1, used by luaL_loadfilex
 pub const MULT_RET: i32 = -1;
 
 const LUA_SIGNATURE: &[u8] = b"\x1bLua";
@@ -35,8 +38,13 @@ pub const STACKERRSPACE: usize = 200;
 /// 对应 src/lstate.h 中的 MAX_CCMT 定义。当 __call 链超过 15 层时报
 /// "'__call' chain too long" 错误。
 pub const MAX_CALL_CHAIN: usize = 15;
-pub const MAXSTACK_BYSIZET: usize = (usize::max_value() / std::mem::size_of::<TValue>()) - STACKERRSPACE ;
-pub const MAXSTACK: usize = if LUAI_MAXSTACK < MAXSTACK_BYSIZET {LUAI_MAXSTACK} else {MAXSTACK_BYSIZET};
+pub const MAXSTACK_BYSIZET: usize =
+    (usize::max_value() / std::mem::size_of::<TValue>()) - STACKERRSPACE;
+pub const MAXSTACK: usize = if LUAI_MAXSTACK < MAXSTACK_BYSIZET {
+    LUAI_MAXSTACK
+} else {
+    MAXSTACK_BYSIZET
+};
 pub const ERRORSTACKSIZE: usize = MAXSTACK + STACKERRSPACE;
 
 /// pcall 类型 — 区分 pcall 和 xpcall 的 error 处理行为
@@ -352,10 +360,7 @@ impl LuaState {
             t.gc_header.set_id(id);
             t
         };
-        registry.set(
-            TValue::Integer(2),
-            TValue::Table(globals.clone()),
-        );
+        registry.set(TValue::Integer(2), TValue::Table(globals.clone()));
 
         let stack = Self::init_stack();
         let top = stack.len();
@@ -482,7 +487,7 @@ impl LuaState {
             }
             return Err(VmError::StackError);
         } else if n < MAXSTACK {
-            let mut newsize = size + (size >> 1);  /* tentative new size (size * 1.5) */
+            let mut newsize = size + (size >> 1); /* tentative new size (size * 1.5) */
             let needed = self.top + n;
             if newsize > MAXSTACK {
                 newsize = MAXSTACK;
@@ -545,10 +550,7 @@ impl LuaState {
             t.gc_header.set_id(id);
             t
         };
-        registry.set(
-            TValue::Integer(2),
-            TValue::Table(globals.clone()),
-        );
+        registry.set(TValue::Integer(2), TValue::Table(globals.clone()));
 
         let stack = Self::init_stack();
         let top = stack.len();
@@ -795,7 +797,8 @@ impl LuaState {
         // 只有在 op_call 路径中（call_info 栈顶有 is_c=true 的 entry）才推迟，
         // 因为只有 op_call 会调用 finish_pending_adjust。单元测试直接调用 C 函数时
         // call_info 为空，不应推迟。
-        if self.hook_mask & 2 != 0 && self.allowhook {  // LUA_MASKRET
+        if self.hook_mask & 2 != 0 && self.allowhook {
+            // LUA_MASKRET
             let in_op_call = self.call_info.last().map(|e| e.is_c).unwrap_or(false);
             if in_op_call {
                 let first_result_pos = self.stack.len();
@@ -904,7 +907,11 @@ fn format_float(f: f64) -> String {
         return "nan".to_string();
     }
     if f.is_infinite() {
-        return if f > 0.0 { "inf".to_string() } else { "-inf".to_string() };
+        return if f > 0.0 {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        };
     }
     if f == 0.0 {
         return "0.0".to_string();
@@ -1108,7 +1115,10 @@ impl LuaState {
     }
 
     pub fn to_boolean(&self, idx: isize) -> bool {
-        !matches!(self.obj_at(idx), Some(TValue::Nil(_)) | Some(TValue::Boolean(false)))
+        !matches!(
+            self.obj_at(idx),
+            Some(TValue::Nil(_)) | Some(TValue::Boolean(false))
+        )
     }
 
     pub fn to_string(&self, idx: isize) -> Option<String> {
@@ -1577,8 +1587,7 @@ impl LuaState {
                 }
             };
         }
-        let rest =
-        if skipped_comment {
+        let rest = if skipped_comment {
             if let Some(rest_start) = rest_start {
                 after_bom[rest_start - 1] = b'\n';
                 &after_bom[(rest_start - 1)..]
@@ -1684,7 +1693,7 @@ impl LuaState {
                         return ERR_RUN;
                     }
                     chain_len += 1;
-                    continue;  // 对应 goto retry
+                    continue; // 对应 goto retry
                 }
                 // 表无 __call 元方法,报 "attempt to call a table value"
                 self.stack.truncate(func_idx);
@@ -1694,7 +1703,7 @@ impl LuaState {
                 ));
                 return ERR_RUN;
             }
-            break;  // 非表类型,退出循环进入原有 match
+            break; // 非表类型,退出循环进入原有 match
         }
 
         let func_val = self.stack[func_idx].clone();
@@ -1759,29 +1768,34 @@ impl LuaState {
                 // 的条目），或已推入 namewhat 非空的条目（如 call_tm_res 已推入
                 // namewhat="metamethod" 的条目），跳过以避免覆盖 namewhat。
                 let saved_call_info_len = self.call_info.len();
-                let caller_is_lua = self.base > 0 && self.base <= self.stack.len()
+                let caller_is_lua = self.base > 0
+                    && self.base <= self.stack.len()
                     && matches!(&self.stack[self.base - 1], TValue::LClosure(_));
                 let already_has_entry = self.call_info.last().map_or(false, |e| {
-                    e.closure.as_ref().map_or(false, |c| Rc::ptr_eq(&c.proto, &closure.proto))
+                    e.closure
+                        .as_ref()
+                        .map_or(false, |c| Rc::ptr_eq(&c.proto, &closure.proto))
                         || (!e.namewhat.is_empty() && !e.is_c)
                 });
                 let pushed_call_info = !already_has_entry;
                 if pushed_call_info {
-                    let (caller_source, caller_line, caller_base, caller_pc) =
-                        if caller_is_lua {
-                            if let TValue::LClosure(prev_closure) = &self.stack[self.base - 1] {
-                                let src = prev_closure.proto.source.as_ref()
-                                    .map(|s| s.as_str().to_string())
-                                    .unwrap_or_else(|| "=?".to_string());
-                                let line = crate::execute::get_proto_line(&prev_closure.proto, self.pc);
-                                (src, line, self.base, self.pc)
-                            } else {
-                                unreachable!()
-                            }
+                    let (caller_source, caller_line, caller_base, caller_pc) = if caller_is_lua {
+                        if let TValue::LClosure(prev_closure) = &self.stack[self.base - 1] {
+                            let src = prev_closure
+                                .proto
+                                .source
+                                .as_ref()
+                                .map(|s| s.as_str().to_string())
+                                .unwrap_or_else(|| "=?".to_string());
+                            let line = crate::execute::get_proto_line(&prev_closure.proto, self.pc);
+                            (src, line, self.base, self.pc)
                         } else {
-                            // C 调用者: source="=[C]", line=-1, base=0, saved_pc=0
-                            ("=[C]".to_string(), -1, 0usize, 0usize)
-                        };
+                            unreachable!()
+                        }
+                    } else {
+                        // C 调用者: source="=[C]", line=-1, base=0, saved_pc=0
+                        ("=[C]".to_string(), -1, 0usize, 0usize)
+                    };
                     self.call_info.push(crate::state::CallInfoEntry {
                         source: caller_source,
                         line: caller_line,
@@ -1841,31 +1855,35 @@ impl LuaState {
                 // 使 error 传播到本 state.pcall，而非被外层 PcallProtection 捕获。
                 // 典型场景: pcall(foo) yield 后，foo 的 __close error 应被
                 // call_close_method 的 state.pcall 捕获，而非 pcall(foo) 的 PcallProtection。
-                let need_shield = self.pcall_protection_stack.last().map_or(false, |t| t.saved_filled);
+                let need_shield = self
+                    .pcall_protection_stack
+                    .last()
+                    .map_or(false, |t| t.saved_filled);
                 if need_shield {
-                    self.pcall_protection_stack.push(crate::state::PcallProtection {
-                        saved_code: Vec::new(),
-                        saved_constants: Vec::new(),
-                        saved_upval_descs: Vec::new(),
-                        saved_protos: Vec::new(),
-                        saved_base: 0,
-                        saved_pc: 0,
-                        saved_num_params: 0,
-                        saved_is_vararg: false,
-                        saved_proto_flag: 0,
-                        saved_nextraargs: 0,
-                        saved_closure_upvals: Vec::new(),
-                        saved_tbc_list: None,
-                        func_idx: 0,
-                        nresults: 0,
-                        pcall_kind: crate::state::PcallKind::Pcall,
-                        saved_filled: false,
-                        is_metamethod: false,
-                        metamethod_res: 0,
-                        saved_call_stack_len: 0,
-                        is_close_continuation: false,
-                        is_pairs_continuation: false,
-                    });
+                    self.pcall_protection_stack
+                        .push(crate::state::PcallProtection {
+                            saved_code: Vec::new(),
+                            saved_constants: Vec::new(),
+                            saved_upval_descs: Vec::new(),
+                            saved_protos: Vec::new(),
+                            saved_base: 0,
+                            saved_pc: 0,
+                            saved_num_params: 0,
+                            saved_is_vararg: false,
+                            saved_proto_flag: 0,
+                            saved_nextraargs: 0,
+                            saved_closure_upvals: Vec::new(),
+                            saved_tbc_list: None,
+                            func_idx: 0,
+                            nresults: 0,
+                            pcall_kind: crate::state::PcallKind::Pcall,
+                            saved_filled: false,
+                            is_metamethod: false,
+                            metamethod_res: 0,
+                            saved_call_stack_len: 0,
+                            is_close_continuation: false,
+                            is_pairs_continuation: false,
+                        });
                 }
 
                 // 临时保存并清空 call_stack，避免 execute_loop 中的 op_return
@@ -1927,7 +1945,8 @@ impl LuaState {
                     // 跳过已 saved_filled=true 的（嵌套 yield 场景，内层 state.pcall 已更新），
                     // 向下查找第一个未填充的 PcallProtection（对应 C Lua 的多层 CallInfo）
                     let pp_len = self.pcall_protection_stack.len();
-                    let target_idx = (0..pp_len).rev()
+                    let target_idx = (0..pp_len)
+                        .rev()
                         .find(|&i| !self.pcall_protection_stack[i].saved_filled)
                         .or_else(|| {
                             // 全部已填充: 无可更新目标（不应发生）
@@ -1945,7 +1964,11 @@ impl LuaState {
                         // is_close_continuation: saved_pc 不 +1，保留指向 OP_RETURN/OP_CLOSE，
                         // 以便 op_return continuation 时重新执行该指令（对应 C 的 savedpc--）。
                         // 其他: saved_pc + 1，跳过调用 pcall 的 CALL 指令。
-                        top.saved_pc = if top.is_metamethod || top.is_close_continuation { saved_pc } else { saved_pc + 1 };
+                        top.saved_pc = if top.is_metamethod || top.is_close_continuation {
+                            saved_pc
+                        } else {
+                            saved_pc + 1
+                        };
                         top.saved_num_params = saved_num_params;
                         top.saved_is_vararg = saved_is_vararg;
                         top.saved_proto_flag = saved_proto_flag;
@@ -1998,19 +2021,24 @@ impl LuaState {
                             // 清理 call_info 中 foo 执行期间的残留条目（对应 C 的 L->ci = old_ci）
                             // 必须在 func::close 之前执行，否则 debug.getinfo(2) 会读到残留条目
                             self.call_info.truncate(saved_call_info_len);
-                            let close_level = self.base;  // foo 的 base
-                            // __close 的调用者应是 pcall（C 函数），对应 C 版本中 foo 的 ci
-                            // 在 error 时被弹出，调用栈上只剩 pcall 的 ci。
-                            // call_close_method 推入的 __close CallInfoEntry 的 base = state.base
-                            // = close_level。state.stack[close_level-1] 是 foo 闭包（LClosure），
-                            // 因为 call_pcall 把 foo 覆盖到 pcall 闭包位置。
-                            // 临时设为 nil（非 LClosure），让 debug.getinfo(2) 返回 "C"。
-                            // close 后会 truncate 栈到 func_idx，无需恢复。
+                            let close_level = self.base; // foo 的 base
+                                                         // __close 的调用者应是 pcall（C 函数），对应 C 版本中 foo 的 ci
+                                                         // 在 error 时被弹出，调用栈上只剩 pcall 的 ci。
+                                                         // call_close_method 推入的 __close CallInfoEntry 的 base = state.base
+                                                         // = close_level。state.stack[close_level-1] 是 foo 闭包（LClosure），
+                                                         // 因为 call_pcall 把 foo 覆盖到 pcall 闭包位置。
+                                                         // 临时设为 nil（非 LClosure），让 debug.getinfo(2) 返回 "C"。
+                                                         // close 后会 truncate 栈到 func_idx，无需恢复。
                             if close_level > 0 && close_level <= self.stack.len() {
                                 self.stack[close_level - 1] = TValue::Nil(NilKind::Strict);
                             }
                             // 在协程中用 yy=1（可 yield），对应 C Lua 的 finishpcallk 用 yy=1
-                            let close_yy = if self.n_ny_calls == 0 && self.current_thread.is_some() { 1 } else { 0 };
+                            let close_yy = if self.n_ny_calls == 0 && self.current_thread.is_some()
+                            {
+                                1
+                            } else {
+                                0
+                            };
                             match crate::func::close(self, close_level, 1, close_yy) {
                                 Ok(()) => {}
                                 Err(VmError::Yield(values)) => {
@@ -2038,7 +2066,8 @@ impl LuaState {
                     self.pending_yield = close_yield;
                     // 更新 PcallProtection saved_filled=true（类似 is_yield 路径）
                     let pp_len = self.pcall_protection_stack.len();
-                    let target_idx = (0..pp_len).rev()
+                    let target_idx = (0..pp_len)
+                        .rev()
                         .find(|&i| !self.pcall_protection_stack[i].saved_filled);
                     if let Some(idx) = target_idx {
                         let top = &mut self.pcall_protection_stack[idx];
@@ -2080,7 +2109,10 @@ impl LuaState {
                 }
 
                 match result {
-                    Ok(VmResult::Return { nresults: nret, result_base }) => {
+                    Ok(VmResult::Return {
+                        nresults: nret,
+                        result_base,
+                    }) => {
                         // 对应 C 的 adjustresults: nresults >= 0 时补 nil 到 nresults
                         let expected = if nresults == MULT_RET {
                             nret
@@ -2154,12 +2186,8 @@ impl LuaState {
                     }
                 }
             }
-            TValue::LCFn(lcf) => {
-                Self::pcall_c_function(self, func_idx, nresults, lcf.func)
-            }
-            TValue::CClosure(cc) => {
-                Self::pcall_c_function(self, func_idx, nresults, cc.f)
-            }
+            TValue::LCFn(lcf) => Self::pcall_c_function(self, func_idx, nresults, lcf.func),
+            TValue::CClosure(cc) => Self::pcall_c_function(self, func_idx, nresults, cc.f),
             TValue::LightUserData(tag) => {
                 let tag_val = tag as usize;
                 let nargs = self.stack.len().saturating_sub(func_idx + 1);
@@ -2202,56 +2230,58 @@ impl LuaState {
                 });
 
                 // 派发 C 函数并收集结果
-                let dispatch_result: Result<(), crate::execute::VmError> = if crate::stdlib::base_lib::is_base_tag(tag_val) {
-                    crate::stdlib::base_lib::call_base_function(
-                        tag_val, self, func_idx, nargs, nresults,
-                    )
-                } else if crate::stdlib::math_lib::is_math_tag(tag_val) {
-                    crate::stdlib::math_lib::call_math_function(
-                        tag_val, self, func_idx, nargs, nresults,
-                    )
-                } else if crate::stdlib::utf8_lib::is_utf8_tag(tag_val) {
-                    crate::stdlib::utf8_lib::call_utf8_function(
-                        tag_val, self, func_idx, nargs, nresults,
-                    )
-                } else if crate::stdlib::table_lib::is_table_tag(tag_val) {
-                    crate::stdlib::table_lib::call_table_function(
-                        tag_val, self, func_idx, nargs, nresults,
-                    )
-                } else if crate::stdlib::debug_lib::is_debug_tag(tag_val) {
-                    crate::stdlib::debug_lib::call_debug_function(
-                        tag_val, self, func_idx, nargs, nresults,
-                    )
-                } else if crate::stdlib::os_lib::is_os_tag(tag_val) {
-                    crate::stdlib::os_lib::call_os_function(
-                        tag_val, self, func_idx, nargs, nresults,
-                    )
-                } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
-                    crate::stdlib::coroutine_lib::call_coro_function(
-                        tag_val, self, func_idx, nargs, nresults,
-                    )
-                } else if crate::stdlib::io_lib::is_io_function_tag(tag_val) {
-                    crate::stdlib::io_lib::call_io_function(
-                        tag_val, self, func_idx, nargs, nresults,
-                    )
-                } else if crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
-                    // io.lines/file:lines 返回的迭代器
-                    crate::stdlib::io_lib::call_lines_iterator(
-                        tag_val, self, func_idx, nargs, nresults,
-                    )
-                } else if crate::stdlib::coroutine_lib::is_wrap_call_tag(tag_val) {
-                    crate::stdlib::coroutine_lib::call_wrap_call(
-                        tag_val, self, func_idx, nargs, nresults,
-                    )
-                } else if tag_val >= 100 {
-                    crate::stdlib::string_lib::call_string_function(
-                        tag_val, self, func_idx, nargs, nresults,
-                    )
-                } else {
-                    Err(crate::execute::VmError::RuntimeError(format!(
-                        "attempt to call a non-function value (tag={})", tag_val
-                    )))
-                };
+                let dispatch_result: Result<(), crate::execute::VmError> =
+                    if crate::stdlib::base_lib::is_base_tag(tag_val) {
+                        crate::stdlib::base_lib::call_base_function(
+                            tag_val, self, func_idx, nargs, nresults,
+                        )
+                    } else if crate::stdlib::math_lib::is_math_tag(tag_val) {
+                        crate::stdlib::math_lib::call_math_function(
+                            tag_val, self, func_idx, nargs, nresults,
+                        )
+                    } else if crate::stdlib::utf8_lib::is_utf8_tag(tag_val) {
+                        crate::stdlib::utf8_lib::call_utf8_function(
+                            tag_val, self, func_idx, nargs, nresults,
+                        )
+                    } else if crate::stdlib::table_lib::is_table_tag(tag_val) {
+                        crate::stdlib::table_lib::call_table_function(
+                            tag_val, self, func_idx, nargs, nresults,
+                        )
+                    } else if crate::stdlib::debug_lib::is_debug_tag(tag_val) {
+                        crate::stdlib::debug_lib::call_debug_function(
+                            tag_val, self, func_idx, nargs, nresults,
+                        )
+                    } else if crate::stdlib::os_lib::is_os_tag(tag_val) {
+                        crate::stdlib::os_lib::call_os_function(
+                            tag_val, self, func_idx, nargs, nresults,
+                        )
+                    } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
+                        crate::stdlib::coroutine_lib::call_coro_function(
+                            tag_val, self, func_idx, nargs, nresults,
+                        )
+                    } else if crate::stdlib::io_lib::is_io_function_tag(tag_val) {
+                        crate::stdlib::io_lib::call_io_function(
+                            tag_val, self, func_idx, nargs, nresults,
+                        )
+                    } else if crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
+                        // io.lines/file:lines 返回的迭代器
+                        crate::stdlib::io_lib::call_lines_iterator(
+                            tag_val, self, func_idx, nargs, nresults,
+                        )
+                    } else if crate::stdlib::coroutine_lib::is_wrap_call_tag(tag_val) {
+                        crate::stdlib::coroutine_lib::call_wrap_call(
+                            tag_val, self, func_idx, nargs, nresults,
+                        )
+                    } else if tag_val >= 100 {
+                        crate::stdlib::string_lib::call_string_function(
+                            tag_val, self, func_idx, nargs, nresults,
+                        )
+                    } else {
+                        Err(crate::execute::VmError::RuntimeError(format!(
+                            "attempt to call a non-function value (tag={})",
+                            tag_val
+                        )))
+                    };
 
                 // 弹出 C 函数的 CallInfoEntry
                 self.call_info.pop();
@@ -2272,9 +2302,10 @@ impl LuaState {
                         // 以便 resume 时 finish_close_continuation 能正确恢复并重新执行 OP_RETURN/OP_CLOSE。
                         // (与 LClosure 分支的 yield 处理一致)
                         let pp_len = self.pcall_protection_stack.len();
-                        let target_idx = (0..pp_len).rev()
-                            .find(|&i| !self.pcall_protection_stack[i].saved_filled
-                                && self.pcall_protection_stack[i].is_close_continuation);
+                        let target_idx = (0..pp_len).rev().find(|&i| {
+                            !self.pcall_protection_stack[i].saved_filled
+                                && self.pcall_protection_stack[i].is_close_continuation
+                        });
                         if let Some(idx) = target_idx {
                             let top = &mut self.pcall_protection_stack[idx];
                             top.saved_code = self.code.clone();
@@ -2356,8 +2387,8 @@ impl LuaState {
         // 对应 C 的 longjmp 跨 C 函数抛错到 pcall 的 setjmp
         self.pending_error = None;
         let ptr: *mut LuaState = self;
-        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            unsafe { f(ptr as *mut c_void) }
+        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+            f(ptr as *mut c_void)
         }));
 
         // 恢复 api_func_base 和 n_ccalls（无论成功失败）
@@ -2447,7 +2478,17 @@ impl LuaState {
 
         // 把标准库注册到 package.loaded（对应 C 的 luaL_requiref），
         // 防止 nextvar.lua 清理全局表时把标准库当作未加载模块删除
-        for name in ["string", "math", "utf8", "table", "debug", "os", "coroutine", "io", "package"] {
+        for name in [
+            "string",
+            "math",
+            "utf8",
+            "table",
+            "debug",
+            "os",
+            "coroutine",
+            "io",
+            "package",
+        ] {
             let name_val = TValue::Str(self.intern_str(name));
             if let Some(lib) = self.globals.get(&name_val) {
                 let package_key = TValue::Str(self.intern_str("package"));
@@ -2489,7 +2530,11 @@ impl LuaState {
             return;
         }
         let ptr_id = t.gc_header.ptr_id;
-        if !self.finobj_list.iter().any(|x| x.gc_header.ptr_id == ptr_id) {
+        if !self
+            .finobj_list
+            .iter()
+            .any(|x| x.gc_header.ptr_id == ptr_id)
+        {
             self.finobj_list.push(t.clone());
         }
     }
@@ -2500,7 +2545,11 @@ impl LuaState {
             return;
         }
         let ptr_id = u.gc_header.ptr_id;
-        if !self.ud_finobj_list.iter().any(|x| x.gc_header.ptr_id == ptr_id) {
+        if !self
+            .ud_finobj_list
+            .iter()
+            .any(|x| x.gc_header.ptr_id == ptr_id)
+        {
             self.ud_finobj_list.push(u.clone());
         }
     }
@@ -2550,7 +2599,10 @@ impl LuaState {
                     let k_reachable = Self::is_marked(k, reachable);
                     let v_reachable = Self::is_marked(v, reachable);
                     if v_reachable && !k_reachable {
-                        let v_is_gc = matches!(v, TValue::Table(_) | TValue::LClosure(_) | TValue::UserData(_));
+                        let v_is_gc = matches!(
+                            v,
+                            TValue::Table(_) | TValue::LClosure(_) | TValue::UserData(_)
+                        );
                         if v_is_gc {
                             let k_id = match k {
                                 TValue::Table(t) => t.gc_header.id(),
@@ -2638,7 +2690,9 @@ impl LuaState {
                                 data.array[idx] = TValue::Nil(NilKind::Empty);
                             }
                             for k in to_clear_hash {
-                                if let Some(i) = data.key_to_bucket.as_mut().and_then(|m| m.remove(&k)) {
+                                if let Some(i) =
+                                    data.key_to_bucket.as_mut().and_then(|m| m.remove(&k))
+                                {
                                     let last_idx = data.hash_buckets.len() - 1;
                                     if i != last_idx {
                                         // 把最后一个条目移到空隙，保持连续性
@@ -2662,9 +2716,18 @@ impl LuaState {
     /// 非 GC 对象（字符串、数字、布尔、nil）总是视为存活
     fn is_marked(val: &TValue, reachable: &HashSet<usize>) -> bool {
         match val {
-            TValue::Table(t) => t.gc_header.id().map_or(true, |id| reachable.contains(&(id.0 as usize))),
-            TValue::LClosure(c) => c.gc_header.id().map_or(true, |id| reachable.contains(&(id.0 as usize))),
-            TValue::UserData(u) => u.gc_header.id().map_or(true, |id| reachable.contains(&(id.0 as usize))),
+            TValue::Table(t) => t
+                .gc_header
+                .id()
+                .map_or(true, |id| reachable.contains(&(id.0 as usize))),
+            TValue::LClosure(c) => c
+                .gc_header
+                .id()
+                .map_or(true, |id| reachable.contains(&(id.0 as usize))),
+            TValue::UserData(u) => u
+                .gc_header
+                .id()
+                .map_or(true, |id| reachable.contains(&(id.0 as usize))),
             _ => true,
         }
     }
@@ -2692,7 +2755,9 @@ impl LuaState {
         // GC 回收对象后，Rust 分配器（glibc malloc）可能仍持有释放的内存不归还操作系统。
         // malloc_trim(0) 强制分配器将所有未使用的堆内存归还操作系统，避免在 200MB
         // 限制下因碎片化导致大分配失败（big.lua 的 48MB Vec 倍增分配）。
-        unsafe { libc::malloc_trim(0); }
+        unsafe {
+            libc::malloc_trim(0);
+        }
         result
     }
 
@@ -2817,7 +2882,6 @@ impl LuaState {
         self.gc.set_collect_threshold(new_threshold);
         self.gc.set_debt(100);
         self.gc.step_accum.set(0);
-
     }
     /// 增量 GC 步进：累加 siz 工作量，达到当前对象数时触发完整 GC 并返回 true
     pub fn step_gc(&mut self, siz: usize) -> bool {
@@ -2856,7 +2920,10 @@ impl LuaState {
         let mut keep: Vec<Table> = Vec::new();
 
         for t in self.finobj_list.drain(..) {
-            let is_reachable = t.gc_header.id().map_or(false, |id| reachable.contains(&(id.0 as usize)));
+            let is_reachable = t
+                .gc_header
+                .id()
+                .map_or(false, |id| reachable.contains(&(id.0 as usize)));
             if is_reachable {
                 keep.push(t);
                 continue;
@@ -2878,7 +2945,10 @@ impl LuaState {
 
         let mut ud_keep: Vec<crate::objects::Udata> = Vec::new();
         for u in self.ud_finobj_list.drain(..) {
-            let is_reachable = u.gc_header.id().map_or(false, |id| reachable.contains(&(id.0 as usize)));
+            let is_reachable = u
+                .gc_header
+                .id()
+                .map_or(false, |id| reachable.contains(&(id.0 as usize)));
             if is_reachable {
                 ud_keep.push(u);
                 continue;
@@ -2915,7 +2985,8 @@ impl LuaState {
 
         // 构建 upval_origins 映射：UpVal Rc 指针 -> original_stack_index
         // 遍历主线程栈上的所有协程，收集它们的 upval_origins（首次 resume 时记录）
-        let mut upval_origins_map: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+        let mut upval_origins_map: std::collections::HashMap<usize, usize> =
+            std::collections::HashMap::new();
         for val in self.stack.iter() {
             if let TValue::Thread(t) = val {
                 let origins = t.context.borrow().upval_origins.clone();
@@ -2952,7 +3023,9 @@ impl LuaState {
 
             // 收集 finalizer 函数的 upvalue 的 Rc 指针，用于后续同步
             let finalizer_uv_ptrs: Vec<usize> = if let TValue::LClosure(c) = &gc_func {
-                c.upvals.borrow().iter()
+                c.upvals
+                    .borrow()
+                    .iter()
                     .map(|uv_ref| Rc::as_ptr(uv_ref) as usize)
                     .collect()
             } else {
@@ -2971,7 +3044,11 @@ impl LuaState {
 
             let caller_source = if self.base > 0 && self.base <= self.stack.len() {
                 if let TValue::LClosure(c) = &self.stack[self.base - 1] {
-                    c.proto.source.as_ref().map(|s| s.as_str().to_string()).unwrap_or_else(|| "=?".to_string())
+                    c.proto
+                        .source
+                        .as_ref()
+                        .map(|s| s.as_str().to_string())
+                        .unwrap_or_else(|| "=?".to_string())
                 } else {
                     "=[C]".to_string()
                 }
@@ -3316,7 +3393,11 @@ mod tests {
         // 验证 stack_init: 参考 lstate.cpp L158-169
         let state = LuaState::new();
         // L->top = stack + 1 → gettop() 必须返回 1
-        assert_eq!(state.gettop(), 1, "stack length must be 1 (function entry slot)");
+        assert_eq!(
+            state.gettop(),
+            1,
+            "stack length must be 1 (function entry slot)"
+        );
         // stack[0] 必须是函数入口 nil
         assert!(matches!(state.stack[0], TValue::Nil(NilKind::Strict)));
         // 容量 = BASIC_STACK_SIZE + EXTRA_STACK
@@ -3327,10 +3408,18 @@ mod tests {
     fn test_stack_init_from_proto() {
         // 验证 from_proto 的栈初始化: base > 0 时必须保证函数入口槽
         let proto = Proto {
-            num_params: 0, flag: 0, max_stack_size: 10,
-            size_upvalues: 0, size_k: 0, size_code: 0, size_line_info: 0,
-            size_p: 0, size_loc_vars: 0, size_abs_line_info: 0,
-            line_defined: 0, last_line_defined: 0,
+            num_params: 0,
+            flag: 0,
+            max_stack_size: 10,
+            size_upvalues: 0,
+            size_k: 0,
+            size_code: 0,
+            size_line_info: 0,
+            size_p: 0,
+            size_loc_vars: 0,
+            size_abs_line_info: 0,
+            line_defined: 0,
+            last_line_defined: 0,
             constants: vec![],
             code: vec![],
             protos: vec![],
@@ -3345,21 +3434,35 @@ mod tests {
         // case 1: base=0, empty stack → main function scenario
         let state = LuaState::from_proto(&proto, 0, vec![], gc.clone());
         assert_eq!(state.base, 0);
-        assert_eq!(state.stack.len(), 10, "base=0 with max_stack_size=10 must allocate 10 register slots");
+        assert_eq!(
+            state.stack.len(),
+            10,
+            "base=0 with max_stack_size=10 must allocate 10 register slots"
+        );
 
         // case 2: base=1, empty stack → called function scenario
         let state = LuaState::from_proto(&proto, 1, vec![], gc.clone());
         assert_eq!(state.base, 1);
-        assert_eq!(state.stack.len(), 11, "base=1 with max_stack_size=10 must allocate 1+10=11 slots");
+        assert_eq!(
+            state.stack.len(),
+            11,
+            "base=1 with max_stack_size=10 must allocate 1+10=11 slots"
+        );
         assert!(matches!(state.stack[0], TValue::Nil(NilKind::Strict)));
 
         // case 3: base=1, stack with args → called function
-        let state = LuaState::from_proto(&proto, 1, vec![
-            TValue::Nil(NilKind::Strict),
-            TValue::Integer(42),
-        ], gc.clone());
+        let state = LuaState::from_proto(
+            &proto,
+            1,
+            vec![TValue::Nil(NilKind::Strict), TValue::Integer(42)],
+            gc.clone(),
+        );
         assert_eq!(state.base, 1);
-        assert_eq!(state.stack.len(), 11, "base=1 with max_stack_size=10 must allocate 1+10=11 slots");
+        assert_eq!(
+            state.stack.len(),
+            11,
+            "base=1 with max_stack_size=10 must allocate 1+10=11 slots"
+        );
         assert!(matches!(state.stack[0], TValue::Nil(NilKind::Strict)));
         assert_eq!(state.stack[1], TValue::Integer(42));
     }
@@ -3384,7 +3487,11 @@ mod tests {
 
     fn tmp_path(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
-        p.push(format!("lua_rs_load_file_test_{}_{}", name, std::process::id()));
+        p.push(format!(
+            "lua_rs_load_file_test_{}_{}",
+            name,
+            std::process::id()
+        ));
         p
     }
 
@@ -3444,7 +3551,12 @@ mod tests {
         let mut state = LuaState::new();
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests_lua/strings.lua");
         let status = state.load_file(Some(path));
-        assert_eq!(status, 0, "load_file should succeed: {:?}", state.to_string(-1));
+        assert_eq!(
+            status,
+            0,
+            "load_file should succeed: {:?}",
+            state.to_string(-1)
+        );
         assert!(
             matches!(state.stack.last(), Some(TValue::LClosure(_))),
             "stack top should be a closure"
@@ -3456,7 +3568,12 @@ mod tests {
         let mut state = LuaState::new();
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests_lua/all.lua");
         let status = state.load_file(Some(path));
-        assert_eq!(status, 0, "load_file should succeed: {:?}", state.to_string(-1));
+        assert_eq!(
+            status,
+            0,
+            "load_file should succeed: {:?}",
+            state.to_string(-1)
+        );
         assert!(matches!(state.stack.last(), Some(TValue::LClosure(_))));
     }
 
@@ -3502,7 +3619,11 @@ mod tests {
         let status = state.load_filex(Some(path.to_str().unwrap()), Some("b"));
         assert_eq!(status, ERR_SYNTAX);
         let msg = state.to_string(-1).unwrap_or_default();
-        assert!(msg.contains("mode is 'binary'"), "unexpected error: {}", msg);
+        assert!(
+            msg.contains("mode is 'binary'"),
+            "unexpected error: {}",
+            msg
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -3511,7 +3632,12 @@ mod tests {
         let path = write_tmp("bom", b"\xef\xbb\xbfreturn 42\n");
         let mut state = LuaState::new();
         let status = state.load_file(Some(path.to_str().unwrap()));
-        assert_eq!(status, 0, "load_file should succeed: {:?}", state.to_string(-1));
+        assert_eq!(
+            status,
+            0,
+            "load_file should succeed: {:?}",
+            state.to_string(-1)
+        );
         assert!(matches!(state.stack.last(), Some(TValue::LClosure(_))));
         let _ = std::fs::remove_file(&path);
     }
@@ -3521,7 +3647,12 @@ mod tests {
         let path = write_tmp("shebang_only", b"#!/usr/bin/env lua\n");
         let mut state = LuaState::new();
         let status = state.load_file(Some(path.to_str().unwrap()));
-        assert_eq!(status, 0, "empty shebang file should load: {:?}", state.to_string(-1));
+        assert_eq!(
+            status,
+            0,
+            "empty shebang file should load: {:?}",
+            state.to_string(-1)
+        );
         assert!(matches!(state.stack.last(), Some(TValue::LClosure(_))));
         let _ = std::fs::remove_file(&path);
     }
@@ -3535,7 +3666,12 @@ mod tests {
         let path = write_tmp("latin1_str", &bytes);
         let mut state = LuaState::new();
         let status = state.load_file(Some(path.to_str().unwrap()));
-        assert_eq!(status, 0, "latin1 string literal should load: {:?}", state.to_string(-1));
+        assert_eq!(
+            status,
+            0,
+            "latin1 string literal should load: {:?}",
+            state.to_string(-1)
+        );
         assert!(matches!(state.stack.last(), Some(TValue::LClosure(_))));
         let _ = std::fs::remove_file(&path);
     }
@@ -3549,7 +3685,12 @@ mod tests {
         let path = write_tmp("shebang_latin1", &bytes);
         let mut state = LuaState::new();
         let status = state.load_file(Some(path.to_str().unwrap()));
-        assert_eq!(status, 0, "shebang + latin1 should load: {:?}", state.to_string(-1));
+        assert_eq!(
+            status,
+            0,
+            "shebang + latin1 should load: {:?}",
+            state.to_string(-1)
+        );
         assert!(matches!(state.stack.last(), Some(TValue::LClosure(_))));
         let _ = std::fs::remove_file(&path);
     }

@@ -1,6 +1,6 @@
+use crate::execute::VmError;
 use crate::objects::*;
 use crate::state::LuaState;
-use crate::execute::VmError;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -54,28 +54,27 @@ fn tvalue_size(v: &TValue) -> usize {
 
 pub fn new_c_closure(state: &mut LuaState, _nupvals: usize) -> usize {
     let idx = state.closure_upvals.len();
-    state.closure_upvals.push(Rc::new(RefCell::new(UpVal::Closed {
-        value: Box::new(TValue::Nil(NilKind::Strict)),
-    })));
+    state
+        .closure_upvals
+        .push(Rc::new(RefCell::new(UpVal::Closed {
+            value: Box::new(TValue::Nil(NilKind::Strict)),
+        })));
     idx
 }
 
 pub fn new_l_closure(state: &mut LuaState, nupvals: usize) -> usize {
     let idx = state.closure_upvals.len();
     for _ in 0..nupvals {
-        state.closure_upvals.push(Rc::new(RefCell::new(UpVal::Closed {
-            value: Box::new(TValue::Nil(NilKind::Strict)),
-        })));
+        state
+            .closure_upvals
+            .push(Rc::new(RefCell::new(UpVal::Closed {
+                value: Box::new(TValue::Nil(NilKind::Strict)),
+            })));
     }
     idx
 }
 
-pub fn init_upvals(
-    _state: &mut LuaState,
-    _closure_start: usize,
-    _proto: &Proto,
-) {
-}
+pub fn init_upvals(_state: &mut LuaState, _closure_start: usize, _proto: &Proto) {}
 
 pub fn find_upval(state: &mut LuaState, level: usize) -> usize {
     if !state.is_in_twups {
@@ -146,7 +145,10 @@ fn new_upval(state: &mut LuaState, level: usize, prev: Option<usize>) -> usize {
     }
     if let Some(n_idx) = next {
         let mut n_ref = state.open_upvals[n_idx].borrow_mut();
-        if let UpVal::Open { ref mut previous, .. } = &mut *n_ref {
+        if let UpVal::Open {
+            ref mut previous, ..
+        } = &mut *n_ref
+        {
             *previous = Some(uv_idx);
         }
     }
@@ -164,9 +166,11 @@ pub fn close_upval(state: &mut LuaState, uv_idx: usize) {
     let val = {
         let uv_ref = state.open_upvals[uv_idx].borrow();
         match &*uv_ref {
-            UpVal::Open { stack_index, .. } => {
-                state.stack.get(*stack_index).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
-            }
+            UpVal::Open { stack_index, .. } => state
+                .stack
+                .get(*stack_index)
+                .cloned()
+                .unwrap_or(TValue::Nil(NilKind::Strict)),
             UpVal::Closed { value } => (**value).clone(),
         }
     };
@@ -201,7 +205,10 @@ pub fn unlink_upval(state: &mut LuaState, uv_idx: usize) {
     }
     if let Some(n_idx) = nxt {
         let mut n_ref = state.open_upvals[n_idx].borrow_mut();
-        if let UpVal::Open { ref mut previous, .. } = &mut *n_ref {
+        if let UpVal::Open {
+            ref mut previous, ..
+        } = &mut *n_ref
+        {
             *previous = prev;
         }
     }
@@ -226,7 +233,9 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
         let (should_close, next, stack_idx) = {
             let uv_ref = state.open_upvals[uv_idx].borrow();
             match &*uv_ref {
-                UpVal::Open { stack_index, next, .. } => (*stack_index >= level, *next, *stack_index),
+                UpVal::Open {
+                    stack_index, next, ..
+                } => (*stack_index >= level, *next, *stack_index),
                 UpVal::Closed { .. } => (false, None, 0),
             }
         };
@@ -248,7 +257,10 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
     // 错误传播: __close 出错时，错误值传递给下一个 __close 的 err 参数
     let mut current_status = status;
     let mut current_err: TValue = if status != 0 {
-        state.last_error_value.clone().unwrap_or(TValue::Nil(NilKind::Strict))
+        state
+            .last_error_value
+            .clone()
+            .unwrap_or(TValue::Nil(NilKind::Strict))
     } else {
         TValue::Nil(NilKind::Strict)
     };
@@ -261,7 +273,10 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
         };
         let (stack_idx, tbc_flag) = {
             let uv_ref = state.open_upvals[uv_idx].borrow();
-            if let UpVal::Open { stack_index, tbc, .. } = &*uv_ref {
+            if let UpVal::Open {
+                stack_index, tbc, ..
+            } = &*uv_ref
+            {
                 (*stack_index, *tbc)
             } else {
                 (0, false)
@@ -272,7 +287,11 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
             let val = {
                 let uv_ref = state.open_upvals[uv_idx].borrow();
                 if let UpVal::Open { stack_index, .. } = &*uv_ref {
-                    state.stack.get(*stack_index).cloned().unwrap_or(TValue::Nil(NilKind::Strict))
+                    state
+                        .stack
+                        .get(*stack_index)
+                        .cloned()
+                        .unwrap_or(TValue::Nil(NilKind::Strict))
                 } else {
                     TValue::Nil(NilKind::Strict)
                 }
@@ -311,7 +330,7 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
                             other => TValue::Str(state.intern_str(&format!("{}", other))),
                         };
                         has_error = true;
-                        current_status = 1;  // 错误状态
+                        current_status = 1; // 错误状态
                     }
                 }
             }
@@ -345,18 +364,24 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
 
 pub fn new_tbc_upval(state: &mut LuaState, level: usize) -> Result<Option<usize>, VmError> {
     // 对应 C 的 luaF_newtbcupval: 检查 __close 元方法，复用或创建 open upvalue，然后标记 tbc
-    let val = state.stack.get(level).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
+    let val = state
+        .stack
+        .get(level)
+        .cloned()
+        .unwrap_or(TValue::Nil(NilKind::Strict));
     // C 的 luaF_newtbcupval: l_isfalse 检查，跳过 nil/false
     if val.is_false() {
-        return Ok(None);  // false/nil 不需要关闭
+        return Ok(None); // false/nil 不需要关闭
     }
     // 对应 C 的 checkclosemth: 检查 __close 元方法是否存在
-    let has_close = crate::tm::get_tm_by_obj(&val, crate::tm::TagMethod::Close, &state.dmt).is_some();
+    let has_close =
+        crate::tm::get_tm_by_obj(&val, crate::tm::TagMethod::Close, &state.dmt).is_some();
     if !has_close {
         // 获取变量名 — 对应 C 的 luaG_findlocal(L, L->ci, idx, NULL)
         let varname = get_var_name_at(state, level).unwrap_or_else(|| "?".to_string());
         return Err(VmError::RuntimeError(format!(
-            "variable '{}' got a non-closable value", varname
+            "variable '{}' got a non-closable value",
+            varname
         )));
     }
     // TBC upvalue 复用 open_upval 链表（通过 find_upval 加入），用 tbc 字段标记
@@ -621,7 +646,11 @@ mod tests {
     #[test]
     fn test_close_closes_all_upvals_down_to_level() {
         let mut state = make_vm_state();
-        state.stack = vec![TValue::Integer(10), TValue::Integer(20), TValue::Integer(30)];
+        state.stack = vec![
+            TValue::Integer(10),
+            TValue::Integer(20),
+            TValue::Integer(30),
+        ];
         let _uv0 = find_upval(&mut state, 0);
         let _uv1 = find_upval(&mut state, 1);
         let _uv2 = find_upval(&mut state, 2);

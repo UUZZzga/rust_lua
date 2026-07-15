@@ -198,7 +198,9 @@ fn new_file_userdata(state: &mut LuaState, file: *mut libc::FILE, file_mt: &Tabl
         data: vec![],
     };
     // 注册到 GC 并设置 id（使 mark_tvalue 能正确标记 reachable）
-    let ud_id = state.gc.register_object(std::mem::size_of::<crate::objects::Udata>());
+    let ud_id = state
+        .gc
+        .register_object(std::mem::size_of::<crate::objects::Udata>());
     udata.gc_header.set_id(ud_id);
     let ptr_id = udata.gc_header.ptr_id;
     state.file_handles.insert(ptr_id, file);
@@ -253,7 +255,12 @@ fn check_mode(mode: &str) -> bool {
 ///
 /// 成功: 推入 true，返回 1
 /// 失败: 推入 nil, "filename: error" 或 "error", errno，返回 3
-fn file_result(state: &mut LuaState, results: &mut Vec<TValue>, stat: bool, fname: Option<&str>) -> usize {
+fn file_result(
+    state: &mut LuaState,
+    results: &mut Vec<TValue>,
+    stat: bool,
+    fname: Option<&str>,
+) -> usize {
     if stat {
         results.push(TValue::Boolean(true));
         1
@@ -379,7 +386,9 @@ fn call_io_open(
     }
 
     // 设置 errno = 0
-    unsafe { *libc::__errno_location() = 0; }
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
     let c_filename = std::ffi::CString::new(filename.clone()).unwrap();
     let c_mode = std::ffi::CString::new(mode.clone()).unwrap();
     let f = unsafe { libc::fopen(c_filename.as_ptr(), c_mode.as_ptr()) };
@@ -389,7 +398,9 @@ fn call_io_open(
         file_result(state, &mut results, false, Some(filename.as_str()));
     } else {
         // 获取 FILE* 元表 (从 dmt[UserData])
-        let file_mt = state.dmt.get(LuaType::UserData)
+        let file_mt = state
+            .dmt
+            .get(LuaType::UserData)
             .cloned()
             .unwrap_or_else(|| {
                 let mut t = crate::table::Table::new();
@@ -415,13 +426,17 @@ fn call_io_tmpfile(
     _nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
-    unsafe { *libc::__errno_location() = 0; }
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
     let f = unsafe { libc::tmpfile() };
     let mut results = Vec::new();
     if f.is_null() {
         file_result(state, &mut results, false, None);
     } else {
-        let file_mt = state.dmt.get(LuaType::UserData)
+        let file_mt = state
+            .dmt
+            .get(LuaType::UserData)
             .cloned()
             .unwrap_or_else(|| {
                 let mut t = crate::table::Table::new();
@@ -494,15 +509,21 @@ fn call_io_popen(
     let c_prog = std::ffi::CString::new(prog.clone()).unwrap();
     let c_mode = std::ffi::CString::new(mode).unwrap();
     // 对应 C 的 l_popen: fflush(NULL) 后 popen
-    unsafe { libc::fflush(std::ptr::null_mut()); }
-    unsafe { *libc::__errno_location() = 0; }
+    unsafe {
+        libc::fflush(std::ptr::null_mut());
+    }
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
     let f = unsafe { libc::popen(c_prog.as_ptr(), c_mode.as_ptr()) };
 
     let mut results = Vec::new();
     if f.is_null() {
         file_result(state, &mut results, false, Some(prog.as_str()));
     } else {
-        let file_mt = state.dmt.get(LuaType::UserData)
+        let file_mt = state
+            .dmt
+            .get(LuaType::UserData)
             .cloned()
             .unwrap_or_else(|| {
                 let mut t = crate::table::Table::new();
@@ -530,9 +551,17 @@ fn call_io_popen(
 /// 通用 write 实现 — 对应 C 的 g_write
 ///
 /// 将多个参数写入 FILE*，返回 (true) 或 (nil, err, errno, count)
-fn g_write(state: &mut LuaState, a: usize, nargs: usize, f: *mut libc::FILE, first_arg: usize) -> Result<Vec<TValue>, VmError> {
+fn g_write(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    f: *mut libc::FILE,
+    first_arg: usize,
+) -> Result<Vec<TValue>, VmError> {
     let mut total_bytes: u64 = 0;
-    unsafe { *libc::__errno_location() = 0; }
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
     for i in 0..nargs {
         let arg_idx = first_arg + i;
         let val = if arg_idx < state.stack.len() {
@@ -543,9 +572,7 @@ fn g_write(state: &mut LuaState, a: usize, nargs: usize, f: *mut libc::FILE, fir
         let bytes: Vec<u8> = match &val {
             TValue::Str(s) => s.as_str().as_bytes().to_vec(),
             TValue::Integer(n) => n.to_string().into_bytes(),
-            TValue::Float(fl) => {
-                crate::stdlib::base_lib::lua_value_to_string(&val).into_bytes()
-            }
+            TValue::Float(fl) => crate::stdlib::base_lib::lua_value_to_string(&val).into_bytes(),
             _ => {
                 // 对应 C 的 luaL_checklstring 抛出错误
                 return Err(VmError::RuntimeError(format!(
@@ -555,9 +582,8 @@ fn g_write(state: &mut LuaState, a: usize, nargs: usize, f: *mut libc::FILE, fir
                 )));
             }
         };
-        let written = unsafe {
-            libc::fwrite(bytes.as_ptr() as *const std::ffi::c_void, 1, bytes.len(), f)
-        };
+        let written =
+            unsafe { libc::fwrite(bytes.as_ptr() as *const std::ffi::c_void, 1, bytes.len(), f) };
         total_bytes += written as u64;
         if written < bytes.len() {
             // 写入错误
@@ -632,16 +658,21 @@ fn call_io_output(
                     }
                     state.io_output_handle = Some(u.gc_header.ptr_id);
                     state.io_output = None; // 清除 Box<dyn Write>
-                    // 保存到 io 表的 _current_output 字段
+                                            // 保存到 io 表的 _current_output 字段
                     let io_key = TValue::Str(state.intern_str("io"));
                     if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
-                        io_table.set(TValue::Str(state.intern_str("_current_output")), arg.clone());
+                        io_table.set(
+                            TValue::Str(state.intern_str("_current_output")),
+                            arg.clone(),
+                        );
                     }
                 }
                 TValue::Str(s) => {
                     let filename = s.as_str().to_string();
                     // 用 fopen 打开文件，模式 "w"
-                    unsafe { *libc::__errno_location() = 0; }
+                    unsafe {
+                        *libc::__errno_location() = 0;
+                    }
                     let c_filename = std::ffi::CString::new(filename.clone()).unwrap();
                     let c_mode = std::ffi::CString::new("w").unwrap();
                     let f = unsafe { libc::fopen(c_filename.as_ptr(), c_mode.as_ptr()) };
@@ -650,12 +681,11 @@ fn call_io_output(
                         let msg = unsafe { std::ffi::CStr::from_ptr(libc::strerror(en)) }
                             .to_string_lossy()
                             .into_owned();
-                        return Err(VmError::RuntimeError(format!(
-                            "{}: {}",
-                            filename, msg
-                        )));
+                        return Err(VmError::RuntimeError(format!("{}: {}", filename, msg)));
                     }
-                    let file_mt = state.dmt.get(LuaType::UserData)
+                    let file_mt = state
+                        .dmt
+                        .get(LuaType::UserData)
                         .cloned()
                         .unwrap_or_else(|| {
                             let mut t = crate::table::Table::new();
@@ -673,7 +703,10 @@ fn call_io_output(
                     // 保存到 io 表的 _current_output 字段
                     let io_key = TValue::Str(state.intern_str("io"));
                     if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
-                        io_table.set(TValue::Str(state.intern_str("_current_output")), udata.clone());
+                        io_table.set(
+                            TValue::Str(state.intern_str("_current_output")),
+                            udata.clone(),
+                        );
                     }
                 }
                 _ => {
@@ -725,7 +758,9 @@ fn call_io_input(
                 }
                 TValue::Str(s) => {
                     let filename = s.as_str().to_string();
-                    unsafe { *libc::__errno_location() = 0; }
+                    unsafe {
+                        *libc::__errno_location() = 0;
+                    }
                     let c_filename = std::ffi::CString::new(filename.clone()).unwrap();
                     let c_mode = std::ffi::CString::new("r").unwrap();
                     let f = unsafe { libc::fopen(c_filename.as_ptr(), c_mode.as_ptr()) };
@@ -734,12 +769,11 @@ fn call_io_input(
                         let msg = unsafe { std::ffi::CStr::from_ptr(libc::strerror(en)) }
                             .to_string_lossy()
                             .into_owned();
-                        return Err(VmError::RuntimeError(format!(
-                            "{}: {}",
-                            filename, msg
-                        )));
+                        return Err(VmError::RuntimeError(format!("{}: {}", filename, msg)));
                     }
-                    let file_mt = state.dmt.get(LuaType::UserData)
+                    let file_mt = state
+                        .dmt
+                        .get(LuaType::UserData)
                         .cloned()
                         .unwrap_or_else(|| {
                             let mut t = crate::table::Table::new();
@@ -756,7 +790,10 @@ fn call_io_input(
                     // 保存到 io 表的 _current_input 字段
                     let io_key = TValue::Str(state.intern_str("io"));
                     if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
-                        io_table.set(TValue::Str(state.intern_str("_current_input")), udata.clone());
+                        io_table.set(
+                            TValue::Str(state.intern_str("_current_input")),
+                            udata.clone(),
+                        );
                     }
                 }
                 _ => {
@@ -805,15 +842,21 @@ fn call_io_close(
             };
             if is_standard {
                 // 不能关闭标准文件 (对应 C 的 io_noclose: 返回 nil, "cannot close standard file")
-                state.adjust_results(a, nresults, vec![
-                    TValue::Nil(NilKind::Strict),
-                    TValue::Str(state.intern_str("cannot close standard file")),
-                ]);
+                state.adjust_results(
+                    a,
+                    nresults,
+                    vec![
+                        TValue::Nil(NilKind::Strict),
+                        TValue::Str(state.intern_str("cannot close standard file")),
+                    ],
+                );
                 return Ok(());
             }
             if let Some(f) = state.file_handles.get(&pid).copied() {
                 let is_popen = state.popen_handles.remove(&pid);
-                unsafe { *libc::__errno_location() = 0; }
+                unsafe {
+                    *libc::__errno_location() = 0;
+                }
                 let mut results = Vec::new();
                 if is_popen {
                     let stat = unsafe { libc::pclose(f) };
@@ -873,10 +916,14 @@ fn close_file_handle(
     };
 
     if is_standard {
-        state.adjust_results(a, nresults, vec![
-            TValue::Nil(NilKind::Strict),
-            TValue::Str(state.intern_str("cannot close standard file")),
-        ]);
+        state.adjust_results(
+            a,
+            nresults,
+            vec![
+                TValue::Nil(NilKind::Strict),
+                TValue::Str(state.intern_str("cannot close standard file")),
+            ],
+        );
         return Ok(());
     }
 
@@ -890,7 +937,9 @@ fn close_file_handle(
     // 关闭文件
     let f = state.file_handles.remove(&ptr_id).unwrap();
     let is_popen = state.popen_handles.remove(&ptr_id);
-    unsafe { *libc::__errno_location() = 0; }
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
     let mut results = Vec::new();
     if is_popen {
         // popen 文件: 用 pclose 关闭, 返回 exec_result (true/nil, "exit"/"signal", code)
@@ -952,7 +1001,7 @@ fn read_number(f: *mut libc::FILE) -> Option<TValue> {
     // 对应 C 的 L_MAXLENNUM: 缓冲区最大长度，超过则解析失败
     const L_MAXLENNUM: usize = 200;
     let mut buf: Vec<u8> = Vec::with_capacity(L_MAXLENNUM + 1);
-    let mut overflow = false;  // 缓冲区溢出标志（对应 C 的 buff[0]='\0'）
+    let mut overflow = false; // 缓冲区溢出标志（对应 C 的 buff[0]='\0'）
     let mut c = unsafe { libc::fgetc(f) };
     // nextc: 保存当前字符到 buf 并读取下一个，溢出时返回 false（对应 C 的 nextc）
     macro_rules! nextc {
@@ -978,9 +1027,11 @@ fn read_number(f: *mut libc::FILE) -> Option<TValue> {
     let mut hex = false;
     let mut count = 0;
     if c == b'0' as c_int {
-        if nextc!() {  // 保存 '0'
+        if nextc!() {
+            // 保存 '0'
             if c == b'x' as c_int || c == b'X' as c_int {
-                if nextc!() {  // 保存 'x'/'X'
+                if nextc!() {
+                    // 保存 'x'/'X'
                     hex = true;
                 }
             } else {
@@ -992,7 +1043,9 @@ fn read_number(f: *mut libc::FILE) -> Option<TValue> {
     while c >= 0 {
         let ch = c as u8 as char;
         if (hex && ch.is_ascii_hexdigit()) || (!hex && ch.is_ascii_digit()) {
-            if !nextc!() { break; }
+            if !nextc!() {
+                break;
+            }
             count += 1;
         } else {
             break;
@@ -1000,11 +1053,14 @@ fn read_number(f: *mut libc::FILE) -> Option<TValue> {
     }
     // 小数点
     if c == b'.' as c_int {
-        if nextc!() {  // 保存 '.'
+        if nextc!() {
+            // 保存 '.'
             while c >= 0 {
                 let ch = c as u8 as char;
                 if (hex && ch.is_ascii_hexdigit()) || (!hex && ch.is_ascii_digit()) {
-                    if !nextc!() { break; }
+                    if !nextc!() {
+                        break;
+                    }
                     count += 1;
                 } else {
                     break;
@@ -1017,19 +1073,24 @@ fn read_number(f: *mut libc::FILE) -> Option<TValue> {
         if (hex && (c == b'p' as c_int || c == b'P' as c_int))
             || (!hex && (c == b'e' as c_int || c == b'E' as c_int))
         {
-            if nextc!() {  // 保存 'p'/'e'
+            if nextc!() {
+                // 保存 'p'/'e'
                 if c == b'-' as c_int || c == b'+' as c_int {
-                    nextc!();  // 保存符号
+                    nextc!(); // 保存符号
                 }
                 while c >= 0 && (c as u8 as char).is_ascii_digit() {
-                    if !nextc!() { break; }
+                    if !nextc!() {
+                        break;
+                    }
                 }
             }
         }
     }
     // 回退一个字符（对应 C 的 ungetc(rn.c, rn.f)）
     if c >= 0 {
-        unsafe { libc::ungetc(c, f); }
+        unsafe {
+            libc::ungetc(c, f);
+        }
     }
     if count == 0 || overflow {
         return None;
@@ -1088,7 +1149,11 @@ fn read_number(f: *mut libc::FILE) -> Option<TValue> {
                 // 纯十六进制整数: 直接 u64 as i64 (对应 C 的 l_str2int + l_castU2S)
                 if let Ok(int_val) = u64::from_str_radix(hex_part, 16) {
                     // C: *result = l_castU2S(neg ? 0u - a : a)
-                    let i = if neg { (0u64).wrapping_sub(int_val) as i64 } else { int_val as i64 };
+                    let i = if neg {
+                        (0u64).wrapping_sub(int_val) as i64
+                    } else {
+                        int_val as i64
+                    };
                     return Some(TValue::Integer(i));
                 }
             }
@@ -1130,7 +1195,12 @@ fn read_all(f: *mut libc::FILE) -> Vec<u8> {
     let mut chunk = [0u8; 8192];
     loop {
         let n = unsafe {
-            libc::fread(chunk.as_mut_ptr() as *mut std::ffi::c_void, 1, chunk.len(), f)
+            libc::fread(
+                chunk.as_mut_ptr() as *mut std::ffi::c_void,
+                1,
+                chunk.len(),
+                f,
+            )
         };
         if n == 0 {
             break;
@@ -1149,15 +1219,15 @@ fn read_chars(f: *mut libc::FILE, n: usize) -> Option<Vec<u8>> {
         // 测试 EOF: 读一个字符再放回
         let c = unsafe { libc::fgetc(f) };
         if c >= 0 {
-            unsafe { libc::ungetc(c, f); }
+            unsafe {
+                libc::ungetc(c, f);
+            }
             return Some(Vec::new());
         }
         return None;
     }
     let mut buf = vec![0u8; n];
-    let nr = unsafe {
-        libc::fread(buf.as_mut_ptr() as *mut std::ffi::c_void, 1, n, f)
-    };
+    let nr = unsafe { libc::fread(buf.as_mut_ptr() as *mut std::ffi::c_void, 1, n, f) };
     if nr == 0 {
         return None;
     }
@@ -1175,8 +1245,12 @@ fn g_read(
     f: *mut libc::FILE,
     first_arg: usize,
 ) -> Result<Vec<TValue>, VmError> {
-    unsafe { libc::clearerr(f); }
-    unsafe { *libc::__errno_location() = 0; }
+    unsafe {
+        libc::clearerr(f);
+    }
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
 
     let mut results: Vec<TValue> = Vec::new();
     let mut success = true;
@@ -1209,7 +1283,9 @@ fn g_read(
                         // 测试 EOF
                         let c = unsafe { libc::fgetc(f) };
                         if c >= 0 {
-                            unsafe { libc::ungetc(c, f); }
+                            unsafe {
+                                libc::ungetc(c, f);
+                            }
                             results.push(TValue::Str(state.intern_str("")));
                         } else {
                             success = false;
@@ -1236,7 +1312,9 @@ fn g_read(
                     } else if n == 0.0 {
                         let c = unsafe { libc::fgetc(f) };
                         if c >= 0 {
-                            unsafe { libc::ungetc(c, f); }
+                            unsafe {
+                                libc::ungetc(c, f);
+                            }
                             results.push(TValue::Str(state.intern_str("")));
                         } else {
                             success = false;
@@ -1265,33 +1343,31 @@ fn g_read(
                         )));
                     }
                     match p.as_bytes()[0] {
-                        b'n' => {
-                            match read_number(f) {
-                                Some(v) => results.push(v),
-                                None => {
-                                    success = false;
-                                    results.push(TValue::Nil(NilKind::Strict));
-                                }
+                        b'n' => match read_number(f) {
+                            Some(v) => results.push(v),
+                            None => {
+                                success = false;
+                                results.push(TValue::Nil(NilKind::Strict));
                             }
-                        }
-                        b'l' => {
-                            match read_line(f, true) {
-                                Some(buf) => results.push(TValue::Str(crate::strings::new_long_bytes(buf))),
-                                None => {
-                                    success = false;
-                                    results.push(TValue::Nil(NilKind::Strict));
-                                }
+                        },
+                        b'l' => match read_line(f, true) {
+                            Some(buf) => {
+                                results.push(TValue::Str(crate::strings::new_long_bytes(buf)))
                             }
-                        }
-                        b'L' => {
-                            match read_line(f, false) {
-                                Some(buf) => results.push(TValue::Str(crate::strings::new_long_bytes(buf))),
-                                None => {
-                                    success = false;
-                                    results.push(TValue::Nil(NilKind::Strict));
-                                }
+                            None => {
+                                success = false;
+                                results.push(TValue::Nil(NilKind::Strict));
                             }
-                        }
+                        },
+                        b'L' => match read_line(f, false) {
+                            Some(buf) => {
+                                results.push(TValue::Str(crate::strings::new_long_bytes(buf)))
+                            }
+                            None => {
+                                success = false;
+                                results.push(TValue::Nil(NilKind::Strict));
+                            }
+                        },
                         b'a' => {
                             let buf = read_all(f);
                             results.push(TValue::Str(crate::strings::new_long_bytes(buf)));
@@ -1482,7 +1558,9 @@ fn call_file_seek(
         0
     };
 
-    unsafe { *libc::__errno_location() = 0; }
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
     let res = unsafe { libc::fseek(f, offset as libc::c_long, mode) };
     if res != 0 {
         let en = unsafe { *libc::__errno_location() };
@@ -1493,11 +1571,15 @@ fn call_file_seek(
         } else {
             "(no extra info)".to_string()
         };
-        state.adjust_results(a, nresults, vec![
-            TValue::Nil(NilKind::Strict),
-            TValue::Str(state.intern_str(&msg)),
-            TValue::Integer(en as i64),
-        ]);
+        state.adjust_results(
+            a,
+            nresults,
+            vec![
+                TValue::Nil(NilKind::Strict),
+                TValue::Str(state.intern_str(&msg)),
+                TValue::Integer(en as i64),
+            ],
+        );
         return Ok(());
     }
     let pos = unsafe { libc::ftell(f) };
@@ -1524,7 +1606,9 @@ fn call_file_flush(
             ));
         }
     };
-    unsafe { *libc::__errno_location() = 0; }
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
     let res = unsafe { libc::fflush(f) };
     let mut results = Vec::new();
     file_result(state, &mut results, res == 0, None);
@@ -1540,7 +1624,9 @@ fn call_io_flush(
     nresults: i32,
 ) -> Result<(), VmError> {
     let f = get_default_output(state)?;
-    unsafe { *libc::__errno_location() = 0; }
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
     let res = unsafe { libc::fflush(f) };
     let mut results = Vec::new();
     file_result(state, &mut results, res == 0, None);
@@ -1615,7 +1701,9 @@ fn call_file_setvbuf(
         8192
     };
 
-    unsafe { *libc::__errno_location() = 0; }
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
     let res = unsafe { libc::setvbuf(f, std::ptr::null_mut(), mode, size) };
     let mut results = Vec::new();
     file_result(state, &mut results, res == 0, None);
@@ -1633,9 +1721,9 @@ fn call_file_setvbuf(
 #[derive(Clone, Debug)]
 pub struct LinesState {
     pub file_ptr_id: u32,
-    pub formats: Vec<TValue>,      // 读取格式
-    pub to_close: bool,            // 完成后是否关闭文件
-    pub finished: bool,            // 是否已完成
+    pub formats: Vec<TValue>, // 读取格式
+    pub to_close: bool,       // 完成后是否关闭文件
+    pub finished: bool,       // 是否已完成
 }
 
 /// 全局 lines 状态存储 — 使用 thread_local 避免修改 state.rs
@@ -1693,7 +1781,9 @@ fn call_io_lines(
     let first = get_arg(state, a, 0);
     if first.is_nil() {
         // nil 参数: 使用默认输入流，读取后续格式参数
-        let ptr_id = state.io_input_handle.unwrap_or_else(|| get_stdin_ptr_id(state));
+        let ptr_id = state
+            .io_input_handle
+            .unwrap_or_else(|| get_stdin_ptr_id(state));
         let mut formats = Vec::new();
         if nargs >= 2 {
             for i in 1..nargs {
@@ -1718,7 +1808,9 @@ fn call_io_lines(
     match &first {
         TValue::Str(s) => {
             let filename = s.as_str().to_string();
-            unsafe { *libc::__errno_location() = 0; }
+            unsafe {
+                *libc::__errno_location() = 0;
+            }
             let c_filename = std::ffi::CString::new(filename.clone()).unwrap();
             let c_mode = std::ffi::CString::new("r").unwrap();
             let f = unsafe { libc::fopen(c_filename.as_ptr(), c_mode.as_ptr()) };
@@ -1727,12 +1819,11 @@ fn call_io_lines(
                 let msg = unsafe { std::ffi::CStr::from_ptr(libc::strerror(en)) }
                     .to_string_lossy()
                     .into_owned();
-                return Err(VmError::RuntimeError(format!(
-                    "{}: {}",
-                    filename, msg
-                )));
+                return Err(VmError::RuntimeError(format!("{}: {}", filename, msg)));
             }
-            let file_mt = state.dmt.get(LuaType::UserData)
+            let file_mt = state
+                .dmt
+                .get(LuaType::UserData)
                 .cloned()
                 .unwrap_or_else(|| {
                     let mut t = crate::table::Table::new();
@@ -1769,18 +1860,16 @@ fn call_io_lines(
             // lua_pushvalue(file); return 4;
             // generic for 的第 4 个值是 to-be-closed 变量，循环结束时自动关闭
             results.push(TValue::LightUserData(tag as *mut std::ffi::c_void));
-            results.push(TValue::Nil(crate::objects::NilKind::Strict));  // state
-            results.push(TValue::Nil(crate::objects::NilKind::Strict));  // control
-            results.push(udata);  // file (to-be-closed)
+            results.push(TValue::Nil(crate::objects::NilKind::Strict)); // state
+            results.push(TValue::Nil(crate::objects::NilKind::Strict)); // control
+            results.push(udata); // file (to-be-closed)
             state.adjust_results(a, nresults, results);
             Ok(())
         }
-        _ => {
-            Err(VmError::RuntimeError(format!(
-                "bad argument #1 to 'lines' (string expected, got {})",
-                crate::tm::obj_type_name(&first)
-            )))
-        }
+        _ => Err(VmError::RuntimeError(format!(
+            "bad argument #1 to 'lines' (string expected, got {})",
+            crate::tm::obj_type_name(&first)
+        ))),
     }
 }
 
@@ -1845,7 +1934,7 @@ pub fn call_lines_iterator(
     nresults: i32,
 ) -> Result<(), VmError> {
     let _ = nargs; // lines 迭代器无参数
-    // 从 LINES_STATES 取出状态
+                   // 从 LINES_STATES 取出状态
     let (file_ptr_id, formats, to_close, finished) = LINES_STATES.with(|s| {
         let mut map = s.borrow_mut();
         if let Some(ls) = map.get_mut(&tag) {
@@ -1856,7 +1945,9 @@ pub fn call_lines_iterator(
     });
 
     if file_ptr_id == 0 {
-        return Err(VmError::RuntimeError("lines iterator state not found".to_string()));
+        return Err(VmError::RuntimeError(
+            "lines iterator state not found".to_string(),
+        ));
     }
 
     if finished {
@@ -1900,7 +1991,9 @@ pub fn call_lines_iterator(
             // 关闭文件（如果需要）
             if to_close {
                 if let Some(f) = state.file_handles.remove(&file_ptr_id) {
-                    unsafe { libc::fclose(f); }
+                    unsafe {
+                        libc::fclose(f);
+                    }
                 }
             }
             LINES_STATES.with(|s| {
@@ -1914,7 +2007,9 @@ pub fn call_lines_iterator(
         // EOF: 关闭文件
         if to_close {
             if let Some(f) = state.file_handles.remove(&file_ptr_id) {
-                unsafe { libc::fclose(f); }
+                unsafe {
+                    libc::fclose(f);
+                }
             }
         }
         LINES_STATES.with(|s| {
@@ -1949,7 +2044,9 @@ fn get_default_output(state: &mut LuaState) -> Result<*mut libc::FILE, VmError> 
         if let Some(f) = state.file_handles.get(&pid).copied() {
             return Ok(f);
         }
-        return Err(VmError::RuntimeError("default output file is closed".to_string()));
+        return Err(VmError::RuntimeError(
+            "default output file is closed".to_string(),
+        ));
     }
     // 检查 io_output: Box<dyn Write> (向后兼容)
     if state.io_output.is_some() {
@@ -2084,9 +2181,13 @@ fn call_file_gc(
         if !is_standard {
             let is_popen = state.popen_handles.remove(&ptr_id);
             if is_popen {
-                unsafe { libc::pclose(f); }
+                unsafe {
+                    libc::pclose(f);
+                }
             } else {
-                unsafe { libc::fclose(f); }
+                unsafe {
+                    libc::fclose(f);
+                }
             }
             state.file_handles.remove(&ptr_id);
         }
@@ -2219,7 +2320,10 @@ pub fn open_io_lib(state: &mut LuaState) {
         TValue::Str(state.intern_str("setvbuf")),
         TValue::LightUserData(IO_FILE_SETVBUF as *mut std::ffi::c_void),
     );
-    file_mt.set(TValue::Str(state.intern_str("__index")), TValue::Table(file_methods));
+    file_mt.set(
+        TValue::Str(state.intern_str("__index")),
+        TValue::Table(file_methods),
+    );
 
     // 注册为 UserData 的默认元表
     let mt = crate::tm::Metatable::new(file_mt.clone());

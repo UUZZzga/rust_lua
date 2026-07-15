@@ -85,7 +85,9 @@ impl GCAge {
 }
 
 impl Default for GCAge {
-    fn default() -> Self { GCAge::New }
+    fn default() -> Self {
+        GCAge::New
+    }
 }
 
 // ============================================================================
@@ -203,7 +205,9 @@ impl GCObjectHeader {
 }
 
 impl Default for GCObjectHeader {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 // ============================================================================
@@ -253,8 +257,14 @@ impl GCState {
             gc_debt: Cell::new(0),
             gc_estimate: Cell::new(0),
             gc_stop: Cell::new(0),
-            gc_params: [Cell::new(0), Cell::new(0), Cell::new(0),
-                        Cell::new(0), Cell::new(0), Cell::new(0)],
+            gc_params: [
+                Cell::new(0),
+                Cell::new(0),
+                Cell::new(0),
+                Cell::new(0),
+                Cell::new(0),
+                Cell::new(0),
+            ],
             in_minor: Cell::new(false),
             next_collect_threshold: Cell::new(200000),
             step_accum: Cell::new(0),
@@ -330,11 +340,19 @@ impl GCState {
 
     pub fn register_object(&self, size: usize) -> GCObjectId {
         let cw = self.current_white.get();
-        let color = if cw & 1 != 0 { GCColor::White0 } else { GCColor::White1 };
+        let color = if cw & 1 != 0 {
+            GCColor::White0
+        } else {
+            GCColor::White1
+        };
 
         let mut meta = GCObjectMeta::new(size);
         meta.color = color;
-        meta.age = if self.mode.get() == GCMode::Generational { GCAge::New } else { GCAge::New };
+        meta.age = if self.mode.get() == GCMode::Generational {
+            GCAge::New
+        } else {
+            GCAge::New
+        };
 
         let mut metas = self.metas.borrow_mut();
         let id_val = self.next_id.get();
@@ -369,7 +387,9 @@ impl GCState {
     pub(crate) fn meta(&self, id: GCObjectId) -> Option<std::cell::Ref<'_, GCObjectMeta>> {
         let metas = self.metas.borrow();
         if (id.0 as usize) < metas.len() && metas[id.0 as usize].is_some() {
-            Some(std::cell::Ref::map(metas, |m| m[id.0 as usize].as_ref().unwrap()))
+            Some(std::cell::Ref::map(metas, |m| {
+                m[id.0 as usize].as_ref().unwrap()
+            }))
         } else {
             None
         }
@@ -378,7 +398,9 @@ impl GCState {
     pub(crate) fn meta_mut(&self, id: GCObjectId) -> Option<std::cell::RefMut<'_, GCObjectMeta>> {
         let metas = self.metas.borrow_mut();
         if (id.0 as usize) < metas.len() && metas[id.0 as usize].is_some() {
-            Some(std::cell::RefMut::map(metas, |m| m[id.0 as usize].as_mut().unwrap()))
+            Some(std::cell::RefMut::map(metas, |m| {
+                m[id.0 as usize].as_mut().unwrap()
+            }))
         } else {
             None
         }
@@ -428,7 +450,8 @@ impl GCState {
             }
         }
         let estimate = self.gc_estimate.get();
-        self.gc_estimate.set(estimate.saturating_sub(total_freed_size));
+        self.gc_estimate
+            .set(estimate.saturating_sub(total_freed_size));
     }
 
     // ========================================================================
@@ -775,7 +798,11 @@ impl GCState {
     // ========================================================================
 
     fn update_debt(&self, _debt: isize) {
-        let step_size = self.gc_params.get(Self::PARAM_STEPSIZE).map(|c| c.get()).unwrap_or(100) as isize;
+        let step_size = self
+            .gc_params
+            .get(Self::PARAM_STEPSIZE)
+            .map(|c| c.get())
+            .unwrap_or(100) as isize;
         self.gc_debt.set(step_size);
     }
 

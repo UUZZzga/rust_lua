@@ -9,9 +9,9 @@
 //! ## 标签分配
 //! - 标签 600+: OS 库
 
+use crate::execute::VmError;
 use crate::objects::{NilKind, TValue};
 use crate::state::LuaState;
-use crate::execute::VmError;
 use crate::strings::LuaString;
 use std::ffi::{CStr, CString};
 
@@ -96,7 +96,11 @@ fn call_setlocale(
     nresults: i32,
 ) -> Result<(), VmError> {
     // 获取 locale 参数 (可选, 默认 NULL = 查询)
-    let locale_val = if nargs > 0 { get_arg(state, a, 0) } else { TValue::Nil(NilKind::Strict) };
+    let locale_val = if nargs > 0 {
+        get_arg(state, a, 0)
+    } else {
+        TValue::Nil(NilKind::Strict)
+    };
     let locale_cstr = match &locale_val {
         TValue::Str(s) => {
             let bytes = s.as_str().as_bytes();
@@ -117,23 +121,26 @@ fn call_setlocale(
     };
 
     // 获取 category 参数 (可选, 默认 "all")
-    let category_val = if nargs > 1 { get_arg(state, a, 1) } else { TValue::Nil(NilKind::Strict) };
+    let category_val = if nargs > 1 {
+        get_arg(state, a, 1)
+    } else {
+        TValue::Nil(NilKind::Strict)
+    };
     let cat = match &category_val {
-        TValue::Str(s) => {
-            match s.as_str() {
-                "all" => libc::LC_ALL,
-                "collate" => libc::LC_COLLATE,
-                "ctype" => libc::LC_CTYPE,
-                "monetary" => libc::LC_MONETARY,
-                "numeric" => libc::LC_NUMERIC,
-                "time" => libc::LC_TIME,
-                other => {
-                    return Err(VmError::RuntimeError(format!(
-                        "bad argument #2 to 'setlocale' (invalid option '{}')", other
-                    )));
-                }
+        TValue::Str(s) => match s.as_str() {
+            "all" => libc::LC_ALL,
+            "collate" => libc::LC_COLLATE,
+            "ctype" => libc::LC_CTYPE,
+            "monetary" => libc::LC_MONETARY,
+            "numeric" => libc::LC_NUMERIC,
+            "time" => libc::LC_TIME,
+            other => {
+                return Err(VmError::RuntimeError(format!(
+                    "bad argument #2 to 'setlocale' (invalid option '{}')",
+                    other
+                )));
             }
-        }
+        },
         TValue::Nil(_) => libc::LC_ALL, // 默认 "all"
         _ => {
             return Err(VmError::RuntimeError(
@@ -143,7 +150,10 @@ fn call_setlocale(
     };
 
     // 调用 C 的 setlocale
-    let locale_ptr = locale_cstr.as_ref().map(|s| s.as_ptr()).unwrap_or(std::ptr::null());
+    let locale_ptr = locale_cstr
+        .as_ref()
+        .map(|s| s.as_ptr())
+        .unwrap_or(std::ptr::null());
     let result = unsafe { libc::setlocale(cat, locale_ptr) };
 
     if result.is_null() {
@@ -155,7 +165,12 @@ fn call_setlocale(
             .to_str()
             .unwrap_or("")
             .to_string();
-        push_single_result(state, a, nresults, TValue::Str(state.intern_str(&result_str)));
+        push_single_result(
+            state,
+            a,
+            nresults,
+            TValue::Str(state.intern_str(&result_str)),
+        );
     }
     Ok(())
 }
@@ -219,7 +234,9 @@ fn call_tmpname(state: &mut LuaState, a: usize, nresults: i32) -> Result<(), VmE
             "unable to generate a unique filename".to_string(),
         ));
     }
-    unsafe { libc::close(fd); }
+    unsafe {
+        libc::close(fd);
+    }
     let cstr = unsafe { CStr::from_ptr(ptr) };
     let s = cstr.to_str().unwrap_or("").to_string();
     push_single_result(state, a, nresults, TValue::Str(state.intern_str(&s)));
@@ -234,13 +251,12 @@ fn call_tmpname(state: &mut LuaState, a: usize, nresults: i32) -> Result<(), VmE
 ///
 /// 对应 C 的 os_remove + luaL_fileresult：
 /// 成功返回 true；失败返回 nil, error message, errno。
-fn call_remove(
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
-    let filename_val = if nargs > 0 { get_arg(state, a, 0) } else { TValue::Nil(NilKind::Strict) };
+fn call_remove(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+    let filename_val = if nargs > 0 {
+        get_arg(state, a, 0)
+    } else {
+        TValue::Nil(NilKind::Strict)
+    };
     let filename_cstr = match &filename_val {
         TValue::Str(s) => {
             let bytes = s.as_str().as_bytes();
@@ -266,11 +282,15 @@ fn call_remove(
         let fname = filename_cstr.to_str().unwrap_or("");
         let msg = format!("{}: {}", fname, err);
         let errno = err.raw_os_error().unwrap_or(0);
-        state.adjust_results(a, nresults, vec![
-            TValue::Nil(NilKind::Strict),
-            TValue::Str(state.intern_str(&msg)),
-            TValue::Integer(errno as i64),
-        ]);
+        state.adjust_results(
+            a,
+            nresults,
+            vec![
+                TValue::Nil(NilKind::Strict),
+                TValue::Str(state.intern_str(&msg)),
+                TValue::Integer(errno as i64),
+            ],
+        );
     }
     Ok(())
 }
@@ -289,13 +309,12 @@ fn call_remove(
 /// }
 /// ```
 /// 环境变量不存在时返回 nil。
-fn call_getenv(
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
-    let name_val = if nargs > 0 { get_arg(state, a, 0) } else { TValue::Nil(NilKind::Strict) };
+fn call_getenv(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+    let name_val = if nargs > 0 {
+        get_arg(state, a, 0)
+    } else {
+        TValue::Nil(NilKind::Strict)
+    };
     let name_cstr = match &name_val {
         TValue::Str(s) => {
             let bytes = s.as_str().as_bytes();
@@ -321,7 +340,12 @@ fn call_getenv(
             .to_str()
             .unwrap_or("")
             .to_string();
-        push_single_result(state, a, nresults, TValue::Str(state.intern_str(&result_str)));
+        push_single_result(
+            state,
+            a,
+            nresults,
+            TValue::Str(state.intern_str(&result_str)),
+        );
     }
     Ok(())
 }
@@ -334,13 +358,12 @@ fn call_getenv(
 ///
 /// 对应 C 的 os_rename + luaL_fileresult：
 /// 成功返回 true；失败返回 nil, error message, errno。
-fn call_rename(
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
-    let oldname_val = if nargs > 0 { get_arg(state, a, 0) } else { TValue::Nil(NilKind::Strict) };
+fn call_rename(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+    let oldname_val = if nargs > 0 {
+        get_arg(state, a, 0)
+    } else {
+        TValue::Nil(NilKind::Strict)
+    };
     let oldname_cstr = match &oldname_val {
         TValue::Str(s) => {
             let bytes = s.as_str().as_bytes();
@@ -358,7 +381,11 @@ fn call_rename(
         }
     };
 
-    let newname_val = if nargs > 1 { get_arg(state, a, 1) } else { TValue::Nil(NilKind::Strict) };
+    let newname_val = if nargs > 1 {
+        get_arg(state, a, 1)
+    } else {
+        TValue::Nil(NilKind::Strict)
+    };
     let newname_cstr = match &newname_val {
         TValue::Str(s) => {
             let bytes = s.as_str().as_bytes();
@@ -383,11 +410,15 @@ fn call_rename(
         let err = std::io::Error::last_os_error();
         let msg = err.to_string();
         let errno = err.raw_os_error().unwrap_or(0);
-        state.adjust_results(a, nresults, vec![
-            TValue::Nil(NilKind::Strict),
-            TValue::Str(state.intern_str(&msg)),
-            TValue::Integer(errno as i64),
-        ]);
+        state.adjust_results(
+            a,
+            nresults,
+            vec![
+                TValue::Nil(NilKind::Strict),
+                TValue::Str(state.intern_str(&msg)),
+                TValue::Integer(errno as i64),
+            ],
+        );
     }
     Ok(())
 }
@@ -407,7 +438,11 @@ fn call_os_execute(
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
-    let cmd_val = if nargs > 0 { get_arg(state, a, 0) } else { TValue::Nil(NilKind::Strict) };
+    let cmd_val = if nargs > 0 {
+        get_arg(state, a, 0)
+    } else {
+        TValue::Nil(NilKind::Strict)
+    };
     let cmd = match &cmd_val {
         TValue::Str(s) => Some(s.as_str().to_string()),
         TValue::Nil(_) => None,
@@ -419,7 +454,9 @@ fn call_os_execute(
         }
     };
 
-    unsafe { *libc::__errno_location() = 0; }
+    unsafe {
+        *libc::__errno_location() = 0;
+    }
     let c_cmd = cmd.as_ref().and_then(|s| CString::new(s.clone()).ok());
     let stat = unsafe { libc::system(c_cmd.as_ref().map_or(std::ptr::null(), |c| c.as_ptr())) };
 
@@ -453,7 +490,13 @@ fn call_os_exit(
     let status = if nargs >= 1 {
         let v = get_arg(state, a, 0);
         match &v {
-            TValue::Boolean(b) => if *b { 0 } else { 1 },
+            TValue::Boolean(b) => {
+                if *b {
+                    0
+                } else {
+                    1
+                }
+            }
             TValue::Integer(n) => *n as i32,
             TValue::Nil(_) => 0,
             _ => {
@@ -495,14 +538,21 @@ fn call_os_exit(
 ///
 /// key: 字段名, d: 默认值 (< 0 表示必须存在), delta: 偏移量
 /// 接受 Integer 或可无损转换的 Float (对应 C 的 lua_tointegerx)
-fn get_field(table: &crate::table::Table, state: &LuaState, key: &str, d: i32, delta: i32) -> Result<i32, VmError> {
+fn get_field(
+    table: &crate::table::Table,
+    state: &LuaState,
+    key: &str,
+    d: i32,
+    delta: i32,
+) -> Result<i32, VmError> {
     let k = TValue::Str(state.intern_str(key));
     match table.get(&k) {
         Some(TValue::Nil(_)) | None => {
             // 字段不存在或为 nil: 用默认值
             if d < 0 {
                 Err(VmError::RuntimeError(format!(
-                    "field '{}' missing in date table", key
+                    "field '{}' missing in date table",
+                    key
                 )))
             } else {
                 Ok(d)
@@ -520,7 +570,8 @@ fn get_field(table: &crate::table::Table, state: &LuaState, key: &str, d: i32, d
                     };
                     if !in_bounds {
                         return Err(VmError::RuntimeError(format!(
-                            "field '{}' is out-of-bound", key
+                            "field '{}' is out-of-bound",
+                            key
                         )));
                     }
                     Ok((res - delta as i64) as i32)
@@ -528,7 +579,8 @@ fn get_field(table: &crate::table::Table, state: &LuaState, key: &str, d: i32, d
                 None => {
                     // 非数字或不可转换的 Float
                     Err(VmError::RuntimeError(format!(
-                        "field '{}' is not an integer", key
+                        "field '{}' is not an integer",
+                        key
                     )))
                 }
             }
@@ -544,7 +596,9 @@ fn set_field(table: &crate::table::Table, state: &LuaState, key: &str, value: i3
 
 /// 设置表布尔字段 — 对应 C 的 setboolfield (value < 0 时不设置)
 fn set_boolfield(table: &crate::table::Table, state: &LuaState, key: &str, value: i32) {
-    if value < 0 { return; }
+    if value < 0 {
+        return;
+    }
     let k = TValue::Str(state.intern_str(key));
     table.set(k, TValue::Boolean(value != 0));
 }
@@ -637,8 +691,8 @@ fn call_os_date(
     // 格式化: 按字节遍历, 遇到 % 用 strftime 处理
     // 合法的 strftime 转换说明符 — 对应 C 的 LUA_STRFTIMEOPTIONS (POSIX)
     const SINGLE_OPTS: &[u8] = b"aAbBcCdDeFgGhHIjmMnprRStTuUVwWxXyYzZ%";
-    const E_OPTS: &[u8] = b"cExXyY";  // %E 后可跟的字符
-    const O_OPTS: &[u8] = b"dDeFgGmMVwWy";  // %O 后可跟的字符
+    const E_OPTS: &[u8] = b"cExXyY"; // %E 后可跟的字符
+    const O_OPTS: &[u8] = b"dDeFgGmMVwWy"; // %O 后可跟的字符
 
     let mut result: Vec<u8> = Vec::new();
     let mut i = fmt_start;
@@ -665,7 +719,8 @@ fn call_os_date(
                     // 修饰符在末尾: 非法
                     let spec_str = String::from_utf8_lossy(&spec);
                     return Err(VmError::RuntimeError(format!(
-                        "invalid conversion specifier '{}'", spec_str
+                        "invalid conversion specifier '{}'",
+                        spec_str
                     )));
                 }
             }
@@ -684,16 +739,16 @@ fn call_os_date(
             if !valid {
                 let spec_str = String::from_utf8_lossy(&spec);
                 return Err(VmError::RuntimeError(format!(
-                    "invalid conversion specifier '{}'", spec_str
+                    "invalid conversion specifier '{}'",
+                    spec_str
                 )));
             }
             // 用 strftime 格式化 (spec 是合法的 C 格式字符串, 不含 \0)
             let cc = std::ffi::CString::new(spec.clone())
                 .map_err(|_| VmError::RuntimeError("invalid conversion specifier".to_string()))?;
             let mut buf = [0u8; 250];
-            let reslen = unsafe {
-                libc::strftime(buf.as_mut_ptr() as *mut i8, 250, cc.as_ptr(), &tmr)
-            };
+            let reslen =
+                unsafe { libc::strftime(buf.as_mut_ptr() as *mut i8, 250, cc.as_ptr(), &tmr) };
             result.extend_from_slice(&buf[..reslen]);
         }
     }
@@ -746,7 +801,13 @@ fn call_os_time(
         // isdst: -1 表示未知 (让 mktime 自动判断)
         let isdst_key = TValue::Str(state.intern_str("isdst"));
         ts.tm_isdst = match table.get(&isdst_key) {
-            Some(TValue::Boolean(b)) => if b { 1 } else { 0 },
+            Some(TValue::Boolean(b)) => {
+                if b {
+                    1
+                } else {
+                    0
+                }
+            }
             _ => -1,
         };
         let t = unsafe { libc::mktime(&mut ts) };
@@ -788,18 +849,22 @@ fn call_os_difftime(
     let v1 = get_arg(state, a, 0);
     let t1 = match crate::vm::to_integer_ns(&v1, crate::vm::F2IMode::Eq) {
         Some(n) => n as libc::time_t,
-        None => return Err(VmError::RuntimeError(format!(
-            "bad argument #1 to 'difftime' (number has no integer representation, got {})",
-            crate::tm::obj_type_name(&v1)
-        ))),
+        None => {
+            return Err(VmError::RuntimeError(format!(
+                "bad argument #1 to 'difftime' (number has no integer representation, got {})",
+                crate::tm::obj_type_name(&v1)
+            )))
+        }
     };
     let v2 = get_arg(state, a, 1);
     let t2 = match crate::vm::to_integer_ns(&v2, crate::vm::F2IMode::Eq) {
         Some(n) => n as libc::time_t,
-        None => return Err(VmError::RuntimeError(format!(
-            "bad argument #2 to 'difftime' (number has no integer representation, got {})",
-            crate::tm::obj_type_name(&v2)
-        ))),
+        None => {
+            return Err(VmError::RuntimeError(format!(
+                "bad argument #2 to 'difftime' (number has no integer representation, got {})",
+                crate::tm::obj_type_name(&v2)
+            )))
+        }
     };
     let diff = unsafe { libc::difftime(t1, t2) };
     state.adjust_results(a, nresults, vec![TValue::Float(diff)]);

@@ -23,7 +23,7 @@
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::ptr;
 
-use crate::objects::{LuaType, NilKind, Proto, TValue, LClosure, CClosure, LCFunction, Table};
+use crate::objects::{CClosure, LCFunction, LClosure, LuaType, NilKind, Proto, TValue, Table};
 use crate::state::LuaState;
 use crate::strings::LuaString;
 use crate::vm::F2IMode;
@@ -117,7 +117,7 @@ fn index2val<'a>(L: &'a LuaState, idx: c_int) -> Option<&'a TValue> {
     // lua_upvalueindex(i) = LUA_REGISTRYINDEX - i
     // 上值存储在 stack[api_func_base] 处的 CClosure 中
     if idx < LUA_REGISTRYINDEX {
-        let up_idx = (LUA_REGISTRYINDEX - idx) as usize;  // 1-based
+        let up_idx = (LUA_REGISTRYINDEX - idx) as usize; // 1-based
         if L.api_func_base < L.stack.len() {
             if let TValue::CClosure(cc) = &L.stack[L.api_func_base] {
                 if up_idx >= 1 && up_idx <= cc.upvalue.len() {
@@ -458,11 +458,7 @@ pub extern "C" fn lua_pushcclosure(L: *mut lua_State, f: lua_CFunction, n: c_int
         // C 闭包：从栈顶弹 n 个上值
         let mut upvalues = Vec::with_capacity(n);
         for _ in 0..n {
-            upvalues.push(
-                L.stack
-                    .pop()
-                    .unwrap_or(TValue::Nil(NilKind::Strict)),
-            );
+            upvalues.push(L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict)));
         }
         L.stack.push(TValue::CClosure(Box::new(CClosure {
             f,
@@ -574,25 +570,17 @@ pub extern "C" fn lua_toboolean(L: *mut lua_State, idx: c_int) -> c_int {
 
 /// lua_tointegerx: 转为整数，isnum 输出是否转换成功。
 #[no_mangle]
-pub extern "C" fn lua_tointegerx(
-    L: *mut lua_State,
-    idx: c_int,
-    isnum: *mut c_int,
-) -> lua_Integer {
+pub extern "C" fn lua_tointegerx(L: *mut lua_State, idx: c_int, isnum: *mut c_int) -> lua_Integer {
     let L = unsafe { &*L };
     let result = match index2val(L, idx) {
         Some(TValue::Integer(i)) => Some(*i),
         Some(TValue::Float(f)) => crate::vm::float_to_integer(*f, F2IMode::Eq),
-        Some(TValue::Str(s)) => s
-            .as_str()
-            .parse::<i64>()
-            .ok()
-            .or_else(|| {
-                s.as_str()
-                    .parse::<f64>()
-                    .ok()
-                    .and_then(|f| crate::vm::float_to_integer(f, F2IMode::Eq))
-            }),
+        Some(TValue::Str(s)) => s.as_str().parse::<i64>().ok().or_else(|| {
+            s.as_str()
+                .parse::<f64>()
+                .ok()
+                .and_then(|f| crate::vm::float_to_integer(f, F2IMode::Eq))
+        }),
         _ => None,
     };
     match result {
@@ -613,11 +601,7 @@ pub extern "C" fn lua_tointegerx(
 
 /// lua_tonumberx: 转为浮点数。
 #[no_mangle]
-pub extern "C" fn lua_tonumberx(
-    L: *mut lua_State,
-    idx: c_int,
-    isnum: *mut c_int,
-) -> lua_Number {
+pub extern "C" fn lua_tonumberx(L: *mut lua_State, idx: c_int, isnum: *mut c_int) -> lua_Number {
     let L = unsafe { &*L };
     let result = match index2val(L, idx) {
         Some(TValue::Integer(i)) => Some(*i as f64),
@@ -646,11 +630,7 @@ pub extern "C" fn lua_tonumberx(
 /// 注意：返回的指针指向内部缓冲区，在下次 Lua 调用后可能失效。
 /// 当前实现：对于字符串值直接返回内部指针；对于数字先转换为字符串再压栈。
 #[no_mangle]
-pub extern "C" fn lua_tolstring(
-    L: *mut lua_State,
-    idx: c_int,
-    len: *mut usize,
-) -> *const c_char {
+pub extern "C" fn lua_tolstring(L: *mut lua_State, idx: c_int, len: *mut usize) -> *const c_char {
     let L = unsafe { &mut *L };
     let off = if is_registry(idx) {
         return ptr::null(); // registry 不是字符串
@@ -806,14 +786,15 @@ pub extern "C" fn lua_getfield(L: *mut lua_State, idx: c_int, k: *const c_char) 
     let key_str = if k.is_null() {
         String::new()
     } else {
-        unsafe { CStr::from_ptr(k) }
-            .to_string_lossy()
-            .into_owned()
+        unsafe { CStr::from_ptr(k) }.to_string_lossy().into_owned()
     };
     let key = crate::state::str_to_ls(&L.string_table, &key_str);
     let key_tv = TValue::Str(key);
     if is_registry(idx) {
-        let val = L.registry.get(&key_tv).unwrap_or(TValue::Nil(NilKind::Strict));
+        let val = L
+            .registry
+            .get(&key_tv)
+            .unwrap_or(TValue::Nil(NilKind::Strict));
         let ty = lua_type_code(val.ty());
         L.stack.push(val);
         return ty;
@@ -842,9 +823,7 @@ pub extern "C" fn lua_setfield(L: *mut lua_State, idx: c_int, k: *const c_char) 
     let key_str = if k.is_null() {
         String::new()
     } else {
-        unsafe { CStr::from_ptr(k) }
-            .to_string_lossy()
-            .into_owned()
+        unsafe { CStr::from_ptr(k) }.to_string_lossy().into_owned()
     };
     let key = crate::state::str_to_ls(&L.string_table, &key_str);
     let key_tv = TValue::Str(key);
@@ -946,7 +925,10 @@ pub extern "C" fn lua_getglobal(L: *mut lua_State, name: *const c_char) -> c_int
     };
     let key = crate::state::str_to_ls(&L.string_table, &name_str);
     let key_tv = TValue::Str(key);
-    let val = L.globals.get(&key_tv).unwrap_or(TValue::Nil(NilKind::Strict));
+    let val = L
+        .globals
+        .get(&key_tv)
+        .unwrap_or(TValue::Nil(NilKind::Strict));
     let ty = lua_type_code(val.ty());
     L.stack.push(val);
     ty
@@ -978,7 +960,11 @@ fn format_float(f: f64) -> String {
         return "nan".to_string();
     }
     if f.is_infinite() {
-        return if f > 0.0 { "inf".to_string() } else { "-inf".to_string() };
+        return if f > 0.0 {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        };
     }
     if f == 0.0 {
         return "0.0".to_string();
@@ -1054,11 +1040,7 @@ pub extern "C" fn luaL_setfuncs(L: *mut lua_State, l: *const luaL_Reg, nup: c_in
 ///
 /// 对应 C 的 luaL_checklstring，参数不匹配时调用 luaL_typeerror 抛错。
 #[no_mangle]
-pub extern "C" fn luaL_checklstring(
-    L: *mut lua_State,
-    arg: c_int,
-    l: *mut usize,
-) -> *const c_char {
+pub extern "C" fn luaL_checklstring(L: *mut lua_State, arg: c_int, l: *mut usize) -> *const c_char {
     // 用 lua_tolstring 获取字符串指针
     let ptr = lua_tolstring(L, arg, l);
     if ptr.is_null() {
@@ -1110,7 +1092,7 @@ pub extern "C" fn luaL_ref(L: *mut lua_State, t: c_int) -> c_int {
 pub extern "C" fn luaL_unref(L: *mut lua_State, _t: c_int, ref_: c_int) {
     let L = unsafe { &mut *L };
     if ref_ == -1 || ref_ == -2 {
-        return;  // LUA_REFNIL 或 LUA_NOREF
+        return; // LUA_REFNIL 或 LUA_NOREF
     }
     let registry = L.registry.clone();
     registry.set(TValue::Integer(ref_ as i64), TValue::Nil(NilKind::Strict));
@@ -1158,7 +1140,8 @@ pub extern "C" fn lua_error(L: *mut lua_State) -> c_int {
 ///
 /// 返回一个基于 libc realloc/free 的默认分配器，供 C 模块（如 lib22.c）使用。
 /// ud 设为 NULL（Rust VM 用自己的分配器，C 模块分配的内存由其自行管理）。
-pub type lua_Alloc = Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize) -> *mut c_void>;
+pub type lua_Alloc =
+    Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize) -> *mut c_void>;
 
 /// 默认 C 内存分配器：realloc/free 包装
 unsafe extern "C" fn default_allocf(
@@ -1180,14 +1163,15 @@ unsafe extern "C" fn default_allocf(
 #[no_mangle]
 pub extern "C" fn lua_getallocf(_L: *mut lua_State, ud: *mut *mut c_void) -> lua_Alloc {
     if !ud.is_null() {
-        unsafe { *ud = ptr::null_mut(); }
+        unsafe {
+            *ud = ptr::null_mut();
+        }
     }
     Some(default_allocf)
 }
 
 /// lua_pushfstring / lua_pushvfstring 由 C 文件 src_rs/capi_variadic.c 提供
 /// （stable Rust 不支持 c_variadic，需用 C 实现可变参数格式化）。
-
 
 // ============================================================================
 // External String — Lua 5.5 新增 API
@@ -1255,7 +1239,9 @@ pub unsafe fn sys_sym(lib: *mut c_void, sym: &str) -> Option<lua_CFunction> {
 /// 内部函数：dlclose 关闭动态库
 pub unsafe fn sys_unload(lib: *mut c_void) {
     if !lib.is_null() {
-        unsafe { libc::dlclose(lib); }
+        unsafe {
+            libc::dlclose(lib);
+        }
     }
 }
 
@@ -1265,10 +1251,11 @@ pub unsafe fn sys_dlerror() -> String {
     if ptr.is_null() {
         String::new()
     } else {
-        unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned()
+        unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned()
     }
 }
-
 
 // ============================================================================
 // 测试
@@ -1388,7 +1375,11 @@ mod tests {
             unsafe extern "C" fn adder(L: *mut c_void) -> c_int {
                 // 读取上值（idx 用 lua_upvalueindex）
                 // upvalueindex(1) = LUA_REGISTRYINDEX - 1
-                let upv = lua_tointegerx(L as *mut lua_State, LUA_REGISTRYINDEX - 1, std::ptr::null_mut());
+                let upv = lua_tointegerx(
+                    L as *mut lua_State,
+                    LUA_REGISTRYINDEX - 1,
+                    std::ptr::null_mut(),
+                );
                 let arg = lua_tointegerx(L as *mut lua_State, 1, std::ptr::null_mut());
                 lua_pushinteger(L as *mut lua_State, upv + arg);
                 1

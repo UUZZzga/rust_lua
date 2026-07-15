@@ -1,7 +1,7 @@
-use std::process::Command;
 use lua_rs::cli::Interpreter;
 use std::io::Write;
 use std::os::unix::process::ExitStatusExt;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 fn lua_path() -> String {
@@ -18,7 +18,12 @@ struct SharedWriter {
 impl SharedWriter {
     fn new() -> (Self, Arc<Mutex<Vec<u8>>>) {
         let buffer = Arc::new(Mutex::new(Vec::new()));
-        (Self { buffer: buffer.clone() }, buffer)
+        (
+            Self {
+                buffer: buffer.clone(),
+            },
+            buffer,
+        )
     }
 }
 
@@ -203,10 +208,7 @@ fn test_concat() {
 
 #[test]
 fn test_collect_args_e_option() {
-    let output = run_lua(&[
-        "-e", "print('x')",
-        "-e", "print('y')",
-    ]);
+    let output = run_lua(&["-e", "print('x')", "-e", "print('y')"]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("x"));
@@ -290,17 +292,48 @@ fn test_error_message_format() {
     assert!(!success, "error() should fail");
 
     // 验证基本格式
-    assert!(stderr.contains("lua: "), "应该有 'lua: ' 前缀, got: {}", stderr);
-    assert!(stderr.contains("(command line):1: "), "应该有 source:line 前缀, got: {}", stderr);
-    assert!(stderr.contains("test error"), "应该包含错误消息, got: {}", stderr);
-    assert!(stderr.contains("stack traceback:"), "应该有 stack traceback, got: {}", stderr);
-    assert!(stderr.contains("[C]: in global 'error'"), "应该有 [C]: in global 'error', got: {}", stderr);
-    assert!(stderr.contains("(command line):1: in main chunk"), "应该有 main chunk, got: {}", stderr);
-    assert!(stderr.contains("[C]: in ?"), "应该有 [C]: in ?, got: {}", stderr);
+    assert!(
+        stderr.contains("lua: "),
+        "应该有 'lua: ' 前缀, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("(command line):1: "),
+        "应该有 source:line 前缀, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("test error"),
+        "应该包含错误消息, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("stack traceback:"),
+        "应该有 stack traceback, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("[C]: in global 'error'"),
+        "应该有 [C]: in global 'error', got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("(command line):1: in main chunk"),
+        "应该有 main chunk, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("[C]: in ?"),
+        "应该有 [C]: in ?, got: {}",
+        stderr
+    );
 
     // 验证没有双重前缀
-    assert!(!stderr.contains("(command line):1: (command line):"),
-            "不应该有双重 source:line 前缀, got: {}", stderr);
+    assert!(
+        !stderr.contains("(command line):1: (command line):"),
+        "不应该有双重 source:line 前缀, got: {}",
+        stderr
+    );
 }
 
 /// 测试 assert(false) 的打印格式
@@ -315,17 +348,48 @@ fn test_assert_error_format() {
     let (success, _stdout, stderr) = run_lua_code("assert(false)");
     assert!(!success, "assert(false) should fail");
 
-    assert!(stderr.contains("lua: "), "应该有 'lua: ' 前缀, got: {}", stderr);
-    assert!(stderr.contains("(command line):1: "), "应该有 source:line 前缀, got: {}", stderr);
-    assert!(stderr.contains("assertion failed!"), "应该有 'assertion failed!' 消息, got: {}", stderr);
-    assert!(stderr.contains("stack traceback:"), "应该有 stack traceback, got: {}", stderr);
-    assert!(stderr.contains("[C]: in global 'assert'"), "应该有 [C]: in global 'assert', got: {}", stderr);
-    assert!(stderr.contains("(command line):1: in main chunk"), "应该有 main chunk, got: {}", stderr);
-    assert!(stderr.contains("[C]: in ?"), "应该有 [C]: in ?, got: {}", stderr);
+    assert!(
+        stderr.contains("lua: "),
+        "应该有 'lua: ' 前缀, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("(command line):1: "),
+        "应该有 source:line 前缀, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("assertion failed!"),
+        "应该有 'assertion failed!' 消息, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("stack traceback:"),
+        "应该有 stack traceback, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("[C]: in global 'assert'"),
+        "应该有 [C]: in global 'assert', got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("(command line):1: in main chunk"),
+        "应该有 main chunk, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("[C]: in ?"),
+        "应该有 [C]: in ?, got: {}",
+        stderr
+    );
 
     // 验证没有双重前缀
-    assert!(!stderr.contains("(command line):1: (command line):"),
-            "不应该有双重 source:line 前缀, got: {}", stderr);
+    assert!(
+        !stderr.contains("(command line):1: (command line):"),
+        "不应该有双重 source:line 前缀, got: {}",
+        stderr
+    );
 }
 
 /// 测试 assert(false, msg) 的自定义消息格式
@@ -334,9 +398,21 @@ fn test_assert_error_with_message() {
     let (success, _stdout, stderr) = run_lua_code("assert(false, 'custom assert message')");
     assert!(!success, "assert(false, msg) should fail");
 
-    assert!(stderr.contains("(command line):1: "), "应该有 source:line 前缀, got: {}", stderr);
-    assert!(stderr.contains("custom assert message"), "应该有自定义消息, got: {}", stderr);
-    assert!(stderr.contains("stack traceback:"), "应该有 stack traceback, got: {}", stderr);
+    assert!(
+        stderr.contains("(command line):1: "),
+        "应该有 source:line 前缀, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("custom assert message"),
+        "应该有自定义消息, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("stack traceback:"),
+        "应该有 stack traceback, got: {}",
+        stderr
+    );
 }
 
 /// 测试索引 nil 值的错误格式
@@ -346,13 +422,36 @@ fn test_index_nil_error_format() {
     let (success, _stdout, stderr) = run_lua_code("local x=nil; x.func()");
     assert!(!success, "indexing nil should fail");
 
-    assert!(stderr.contains("lua: "), "应该有 'lua: ' 前缀, got: {}", stderr);
-    assert!(stderr.contains("(command line):1: "), "应该有 source:line 前缀, got: {}", stderr);
-    assert!(stderr.contains("attempt to index a nil value"),
-            "应该有 'attempt to index a nil value' 消息, got: {}", stderr);
-    assert!(stderr.contains("stack traceback:"), "应该有 stack traceback, got: {}", stderr);
-    assert!(stderr.contains("(command line):1: in main chunk"), "应该有 main chunk, got: {}", stderr);
-    assert!(stderr.contains("[C]: in ?"), "应该有 [C]: in ?, got: {}", stderr);
+    assert!(
+        stderr.contains("lua: "),
+        "应该有 'lua: ' 前缀, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("(command line):1: "),
+        "应该有 source:line 前缀, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("attempt to index a nil value"),
+        "应该有 'attempt to index a nil value' 消息, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("stack traceback:"),
+        "应该有 stack traceback, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("(command line):1: in main chunk"),
+        "应该有 main chunk, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("[C]: in ?"),
+        "应该有 [C]: in ?, got: {}",
+        stderr
+    );
 }
 
 /// 测试调用 nil 值的错误格式
@@ -362,12 +461,31 @@ fn test_call_nil_error_format() {
     let (success, _stdout, stderr) = run_lua_code("local x=nil; x()");
     assert!(!success, "calling nil should fail");
 
-    assert!(stderr.contains("lua: "), "应该有 'lua: ' 前缀, got: {}", stderr);
-    assert!(stderr.contains("(command line):1: "), "应该有 source:line 前缀, got: {}", stderr);
-    assert!(stderr.contains("attempt to call a nil value"),
-            "应该有 'attempt to call a nil value' 消息, got: {}", stderr);
-    assert!(stderr.contains("stack traceback:"), "应该有 stack traceback, got: {}", stderr);
-    assert!(stderr.contains("[C]: in ?"), "应该有 [C]: in ?, got: {}", stderr);
+    assert!(
+        stderr.contains("lua: "),
+        "应该有 'lua: ' 前缀, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("(command line):1: "),
+        "应该有 source:line 前缀, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("attempt to call a nil value"),
+        "应该有 'attempt to call a nil value' 消息, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("stack traceback:"),
+        "应该有 stack traceback, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("[C]: in ?"),
+        "应该有 [C]: in ?, got: {}",
+        stderr
+    );
 }
 
 /// 测试调用非函数值的错误格式
@@ -376,9 +494,16 @@ fn test_call_non_function_error_format() {
     let (success, _stdout, stderr) = run_lua_code("local x=42; x()");
     assert!(!success, "calling number should fail");
 
-    assert!(stderr.contains("attempt to call a number value"),
-            "应该有 'attempt to call a number value' 消息, got: {}", stderr);
-    assert!(stderr.contains("stack traceback:"), "应该有 stack traceback, got: {}", stderr);
+    assert!(
+        stderr.contains("attempt to call a number value"),
+        "应该有 'attempt to call a number value' 消息, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("stack traceback:"),
+        "应该有 stack traceback, got: {}",
+        stderr
+    );
 }
 
 /// 测试多行代码中的错误行号
@@ -389,9 +514,16 @@ fn test_error_line_number_multiline() {
     assert!(!success, "should fail on line 3");
 
     // 错误应该发生在第 3 行
-    assert!(stderr.contains("(command line):3: "),
-            "应该显示行号 3, got: {}", stderr);
-    assert!(stderr.contains("line 3 error"), "应该包含错误消息, got: {}", stderr);
+    assert!(
+        stderr.contains("(command line):3: "),
+        "应该显示行号 3, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("line 3 error"),
+        "应该包含错误消息, got: {}",
+        stderr
+    );
 }
 
 /// 测试错误消息中不包含 debug 打印
@@ -401,9 +533,21 @@ fn test_no_debug_print_in_error() {
     assert!(!success);
 
     // 不应该包含 debug 打印
-    assert!(!stderr.contains("op_call"), "不应该有 op_call debug 打印, got: {}", stderr);
-    assert!(!stderr.contains("LightUserData"), "不应该有 LightUserData debug 打印, got: {}", stderr);
-    assert!(!stderr.contains("op_"), "不应该有 op_ debug 打印, got: {}", stderr);
+    assert!(
+        !stderr.contains("op_call"),
+        "不应该有 op_call debug 打印, got: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("LightUserData"),
+        "不应该有 LightUserData debug 打印, got: {}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("op_"),
+        "不应该有 op_ debug 打印, got: {}",
+        stderr
+    );
 }
 
 /// 测试 error() 不带字符串参数的情况
@@ -414,7 +558,11 @@ fn test_error_with_non_string() {
 
     // 应该有错误输出
     assert!(!stderr.is_empty(), "应该有错误输出");
-    assert!(stderr.contains("stack traceback:"), "应该有 stack traceback, got: {}", stderr);
+    assert!(
+        stderr.contains("stack traceback:"),
+        "应该有 stack traceback, got: {}",
+        stderr
+    );
 }
 
 /// 测试嵌套函数调用的错误
@@ -424,39 +572,74 @@ fn test_nested_function_error() {
     let (success, _stdout, stderr) = run_lua_code(code);
     assert!(!success, "nested error should fail");
 
-    assert!(stderr.contains("from foo"), "应该包含错误消息, got: {}", stderr);
-    assert!(stderr.contains("stack traceback:"), "应该有 stack traceback, got: {}", stderr);
-    assert!(stderr.contains("in main chunk"), "应该有 main chunk, got: {}", stderr);
-    assert!(stderr.contains("[C]: in ?"), "应该有 [C]: in ?, got: {}", stderr);
+    assert!(
+        stderr.contains("from foo"),
+        "应该包含错误消息, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("stack traceback:"),
+        "应该有 stack traceback, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("in main chunk"),
+        "应该有 main chunk, got: {}",
+        stderr
+    );
+    assert!(
+        stderr.contains("[C]: in ?"),
+        "应该有 [C]: in ?, got: {}",
+        stderr
+    );
 }
 
 /// 测试 pcall 捕获错误
 #[test]
 fn test_pcall_catches_error() {
-    let (success, stdout, _stderr) = run_lua_code("local ok, err = pcall(error, 'caught'); print(ok, err)");
+    let (success, stdout, _stderr) =
+        run_lua_code("local ok, err = pcall(error, 'caught'); print(ok, err)");
     assert!(success, "pcall should catch the error");
 
     let stdout = stdout.trim();
-    assert!(stdout.contains("false"), "pcall should return false on error, got: {}", stdout);
-    assert!(stdout.contains("caught"), "应该包含错误消息, got: {}", stdout);
+    assert!(
+        stdout.contains("false"),
+        "pcall should return false on error, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("caught"),
+        "应该包含错误消息, got: {}",
+        stdout
+    );
 }
 
 /// 测试 pcall 捕获 assert 错误
 #[test]
 fn test_pcall_catches_assert() {
-    let (success, stdout, _stderr) = run_lua_code("local ok, err = pcall(assert, false); print(ok)");
+    let (success, stdout, _stderr) =
+        run_lua_code("local ok, err = pcall(assert, false); print(ok)");
     assert!(success, "pcall should catch the error");
 
-    assert!(stdout.contains("false"), "pcall should return false, got: {}", stdout);
+    assert!(
+        stdout.contains("false"),
+        "pcall should return false, got: {}",
+        stdout
+    );
 }
 
 /// 测试 pcall 捕获类型错误
 #[test]
 fn test_pcall_catches_type_error() {
-    let (success, stdout, _stderr) = run_lua_code("local ok, err = pcall(function() local x=nil; x() end); print(ok)");
+    let (success, stdout, _stderr) =
+        run_lua_code("local ok, err = pcall(function() local x=nil; x() end); print(ok)");
     assert!(success, "pcall should catch the error");
 
-    assert!(stdout.contains("false"), "pcall should return false, got: {}", stdout);
+    assert!(
+        stdout.contains("false"),
+        "pcall should return false, got: {}",
+        stdout
+    );
 }
 
 /// 测试完整的错误输出格式与 C 实现一致
@@ -476,7 +659,12 @@ fn test_error_format_matches_c() {
     ];
 
     for line in &expected_lines {
-        assert!(stderr.contains(line), "应该包含 '{}', got: {}", line, stderr);
+        assert!(
+            stderr.contains(line),
+            "应该包含 '{}', got: {}",
+            line,
+            stderr
+        );
     }
 }
 
@@ -495,7 +683,12 @@ fn test_assert_format_matches_c() {
     ];
 
     for line in &expected_lines {
-        assert!(stderr.contains(line), "应该包含 '{}', got: {}", line, stderr);
+        assert!(
+            stderr.contains(line),
+            "应该包含 '{}', got: {}",
+            line,
+            stderr
+        );
     }
 }
 
@@ -514,7 +707,12 @@ fn test_index_nil_format_matches_c() {
     ];
 
     for line in &expected_lines {
-        assert!(stderr.contains(line), "应该包含 '{}', got: {}", line, stderr);
+        assert!(
+            stderr.contains(line),
+            "应该包含 '{}', got: {}",
+            line,
+            stderr
+        );
     }
 }
 
@@ -532,7 +730,12 @@ fn test_call_nil_format_matches_c() {
     ];
 
     for line in &expected_lines {
-        assert!(stderr.contains(line), "应该包含 '{}', got: {}", line, stderr);
+        assert!(
+            stderr.contains(line),
+            "应该包含 '{}', got: {}",
+            line,
+            stderr
+        );
     }
 }
 
@@ -620,7 +823,8 @@ fn test_multiline_execution() {
 /// 测试函数返回值
 #[test]
 fn test_function_return() {
-    let (success, stdout, _stderr) = run_lua_code("function add(a, b) return a + b end; print(add(5, 7))");
+    let (success, stdout, _stderr) =
+        run_lua_code("function add(a, b) return a + b end; print(add(5, 7))");
     assert!(success);
     assert_eq!(stdout.trim(), "12");
 }
@@ -628,7 +832,9 @@ fn test_function_return() {
 /// 测试多返回值
 #[test]
 fn test_multiple_returns() {
-    let (success, stdout, _stderr) = run_lua_code("function multi() return 1, 2, 3 end; local a, b, c = multi(); print(a, b, c)");
+    let (success, stdout, _stderr) = run_lua_code(
+        "function multi() return 1, 2, 3 end; local a, b, c = multi(); print(a, b, c)",
+    );
     assert!(success);
     assert_eq!(stdout.trim(), "1\t2\t3");
 }
@@ -654,7 +860,8 @@ fn test_table_access() {
 /// 测试表字段
 #[test]
 fn test_table_fields() {
-    let (success, stdout, _stderr) = run_lua_code("t = {name='Lua', version=5.5}; print(t.name, t.version)");
+    let (success, stdout, _stderr) =
+        run_lua_code("t = {name='Lua', version=5.5}; print(t.name, t.version)");
     assert!(success);
     assert!(stdout.contains("Lua"), "应该包含 Lua, got: {}", stdout);
     assert!(stdout.contains("5.5"), "应该包含 5.5, got: {}", stdout);
@@ -663,7 +870,8 @@ fn test_table_fields() {
 /// 测试 for 循环
 #[test]
 fn test_numeric_for() {
-    let (success, stdout, _stderr) = run_lua_code("local sum = 0; for i = 1, 10 do sum = sum + i end; print(sum)");
+    let (success, stdout, _stderr) =
+        run_lua_code("local sum = 0; for i = 1, 10 do sum = sum + i end; print(sum)");
     assert!(success);
     assert_eq!(stdout.trim(), "55");
 }
@@ -671,7 +879,8 @@ fn test_numeric_for() {
 /// 测试 while 循环
 #[test]
 fn test_while_loop() {
-    let code = "local i = 1; local sum = 0; while i <= 5 do sum = sum + i; i = i + 1 end; print(sum)";
+    let code =
+        "local i = 1; local sum = 0; while i <= 5 do sum = sum + i; i = i + 1 end; print(sum)";
     let (success, stdout, _stderr) = run_lua_code(code);
     assert!(success);
     // 注意: Rust 实现中 while 循环可能有 bug，这里只验证能执行
@@ -728,6 +937,10 @@ fn test_comments() {
     let (success, stdout, _stderr) = run_lua_code(code);
     // 注意: 注释处理可能有 bug，这里验证基本行为
     if success {
-        assert!(stdout.contains("after comment"), "应该包含 'after comment', got: {}", stdout);
+        assert!(
+            stdout.contains("after comment"),
+            "应该包含 'after comment', got: {}",
+            stdout
+        );
     }
 }

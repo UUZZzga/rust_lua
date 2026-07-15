@@ -28,7 +28,12 @@ struct SharedWriter {
 impl SharedWriter {
     fn new() -> (Self, Arc<Mutex<Vec<u8>>>) {
         let buffer = Arc::new(Mutex::new(Vec::new()));
-        (Self { buffer: buffer.clone() }, buffer)
+        (
+            Self {
+                buffer: buffer.clone(),
+            },
+            buffer,
+        )
     }
 }
 
@@ -103,7 +108,11 @@ fn test_int_div() {
     assert!(output.status.success());
     // 整数/整数在 Lua 5.5 中如果整除则返回整数，否则返回浮点
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("5.0") || stdout.contains("5"), "10/2 应为 5, got: {}", stdout);
+    assert!(
+        stdout.contains("5.0") || stdout.contains("5"),
+        "10/2 应为 5, got: {}",
+        stdout
+    );
 }
 
 #[test]
@@ -232,7 +241,11 @@ fn test_pow_float() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     // sqrt(2) ≈ 1.414...
-    assert!(stdout.contains("1.414"), "2^0.5 应约为 1.414, got: {}", stdout);
+    assert!(
+        stdout.contains("1.414"),
+        "2^0.5 应约为 1.414, got: {}",
+        stdout
+    );
 }
 
 #[test]
@@ -326,7 +339,11 @@ fn test_int_div_zero_error() {
     ]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("false"), "整数整除零应报错, got: {}", stdout);
+    assert!(
+        stdout.contains("false"),
+        "整数整除零应报错, got: {}",
+        stdout
+    );
 }
 
 #[test]
@@ -338,7 +355,11 @@ fn test_int_mod_zero_error() {
     ]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("false"), "整数取模零应报错, got: {}", stdout);
+    assert!(
+        stdout.contains("false"),
+        "整数取模零应报错, got: {}",
+        stdout
+    );
 }
 
 #[test]

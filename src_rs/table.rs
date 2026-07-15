@@ -9,8 +9,8 @@
 //! - 数据通过 `Rc<RefCell<TableData>>` 共享，克隆 Table 共享同一份数据
 //! - `LuaTable` 封装为未来元方法支持预留接口
 
-use crate::objects::{NilKind, TableData, TValue};
 use crate::gc::GCObjectHeader;
+use crate::objects::{NilKind, TValue, TableData};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -57,7 +57,11 @@ impl Table {
             data: Rc::new(RefCell::new(TableData {
                 array: (0..narray).map(|_| TValue::Nil(NilKind::Empty)).collect(),
                 hash_buckets: Vec::with_capacity(nhash),
-                key_to_bucket: if nhash > 0 { Some(Box::new(hashbrown::HashMap::with_capacity(nhash))) } else { None },
+                key_to_bucket: if nhash > 0 {
+                    Some(Box::new(hashbrown::HashMap::with_capacity(nhash)))
+                } else {
+                    None
+                },
                 metatable: None,
             })),
         }
@@ -67,7 +71,10 @@ impl Table {
         self.data.borrow().array.len()
     }
     pub fn hash_size(&self) -> usize {
-        self.data.borrow().hash_buckets.iter()
+        self.data
+            .borrow()
+            .hash_buckets
+            .iter()
             .filter(|(_, v)| !matches!(v, TValue::Nil(NilKind::Empty)))
             .count()
     }
@@ -262,8 +269,14 @@ impl Table {
     /// - 若 key 不存在且写入非 nil，追加到 hash_buckets + 记录 key_to_bucket
     /// - 若 key 存在 (含 tombstone)，覆盖值 (nil 写为 Nil(Empty) tombstone)
     fn hash_set(data: &mut TableData, key: &TValue, value: TValue, is_nil: bool) {
-        let val = if is_nil { TValue::Nil(NilKind::Empty) } else { value };
-        let ktb = data.key_to_bucket.get_or_insert_with(|| Box::new(hashbrown::HashMap::new()));
+        let val = if is_nil {
+            TValue::Nil(NilKind::Empty)
+        } else {
+            value
+        };
+        let ktb = data
+            .key_to_bucket
+            .get_or_insert_with(|| Box::new(hashbrown::HashMap::new()));
         // 先检查 key 是否已存在，避免克隆 key
         if let Some(idx) = ktb.get(key) {
             data.hash_buckets[*idx].1 = val;
@@ -486,13 +499,17 @@ impl Table {
                     } else {
                         let bidx = data.hash_buckets.len();
                         data.hash_buckets.push((k.clone(), v));
-                        data.key_to_bucket.get_or_insert_with(|| Box::new(hashbrown::HashMap::new())).insert(k, bidx);
+                        data.key_to_bucket
+                            .get_or_insert_with(|| Box::new(hashbrown::HashMap::new()))
+                            .insert(k, bidx);
                     }
                 }
                 _ => {
                     let bidx = data.hash_buckets.len();
                     data.hash_buckets.push((k.clone(), v));
-                    data.key_to_bucket.get_or_insert_with(|| Box::new(hashbrown::HashMap::new())).insert(k, bidx);
+                    data.key_to_bucket
+                        .get_or_insert_with(|| Box::new(hashbrown::HashMap::new()))
+                        .insert(k, bidx);
                 }
             }
         }
@@ -746,7 +763,13 @@ mod tests {
     fn test_set_int_hash() {
         let t = Table::new();
         t.set_int(100, TValue::Integer(42));
-        assert!(t.data.borrow().key_to_bucket.as_ref().unwrap().contains_key(&TValue::Integer(100)));
+        assert!(t
+            .data
+            .borrow()
+            .key_to_bucket
+            .as_ref()
+            .unwrap()
+            .contains_key(&TValue::Integer(100)));
         assert_eq!(t.get_int(100), Some(TValue::Integer(42)));
     }
 
@@ -765,7 +788,10 @@ mod tests {
         assert!(t.get_int(1).is_some());
         t.set_int(1, TValue::Nil(NilKind::Strict));
         assert_eq!(t.get_int(1), None);
-        assert!(matches!(&t.data.borrow().array[0], TValue::Nil(NilKind::Empty)));
+        assert!(matches!(
+            &t.data.borrow().array[0],
+            TValue::Nil(NilKind::Empty)
+        ));
     }
 
     #[test]
@@ -1007,7 +1033,10 @@ mod tests {
         assert_eq!(t.array_size(), 3);
         assert_eq!(t.get_int(1), Some(TValue::Integer(10)));
         assert_eq!(t.get_int(3), Some(TValue::Integer(30)));
-        assert!(matches!(&t.data.borrow().array[1], TValue::Nil(NilKind::Empty)));
+        assert!(matches!(
+            &t.data.borrow().array[1],
+            TValue::Nil(NilKind::Empty)
+        ));
     }
 
     #[test]

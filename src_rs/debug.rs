@@ -9,8 +9,8 @@
 
 use crate::execute::VmError;
 use crate::objects::TValue;
-use crate::tm::obj_type_name;
 use crate::state::LuaState;
+use crate::tm::obj_type_name;
 use crate::vm::{to_integer_ns, F2IMode};
 
 /// 通用运行时错误 — 对应 C 的 luaG_runerror

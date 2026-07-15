@@ -9,10 +9,10 @@
 //! ## 标签分配
 //! - 标签 400+: Table 库
 
+use crate::execute::{arg_error, VmError};
 use crate::objects::{NilKind, TValue};
 use crate::state::LuaState;
-use crate::execute::{arg_error, VmError};
-use crate::tm::{TagMethod, call_order_tm, obj_type_name};
+use crate::tm::{call_order_tm, obj_type_name, TagMethod};
 use crate::vm::VmExecutor;
 
 // ============================================================================
@@ -87,15 +87,19 @@ fn table_len(table: &crate::table::Table) -> i64 {
 fn get_obj_len(state: &mut LuaState, obj: &TValue) -> Result<i64, VmError> {
     let tmp_ra = state.stack.len();
     crate::tm::obj_len(state, tmp_ra, obj, "")?;
-    let result = state.stack.get(tmp_ra).cloned().unwrap_or(TValue::Nil(NilKind::Strict));
+    let result = state
+        .stack
+        .get(tmp_ra)
+        .cloned()
+        .unwrap_or(TValue::Nil(NilKind::Strict));
     state.stack.truncate(tmp_ra);
     match result {
         TValue::Integer(n) => Ok(n),
-        TValue::Float(f) => {
-            crate::vm::float_to_integer(f, crate::vm::F2IMode::Eq)
-                .ok_or_else(|| VmError::RuntimeError("object length is not an integer".to_string()))
-        }
-        _ => Err(VmError::RuntimeError("object length is not an integer".to_string())),
+        TValue::Float(f) => crate::vm::float_to_integer(f, crate::vm::F2IMode::Eq)
+            .ok_or_else(|| VmError::RuntimeError("object length is not an integer".to_string())),
+        _ => Err(VmError::RuntimeError(
+            "object length is not an integer".to_string(),
+        )),
     }
 }
 
@@ -107,12 +111,23 @@ fn table_get_int(table: &crate::table::Table, key: i64) -> TValue {
 /// 获取 t[i]，支持 __index 元方法 (对应 C lua_geti → luaV_finishget)
 /// 用于 table 库函数对表元素访问时透明地调用元方法（如 proxy 表）
 fn geti_meta(state: &mut LuaState, table_val: &TValue, i: i64) -> Result<TValue, VmError> {
-    VmExecutor::table_get(state, table_val, &TValue::Integer(i), crate::execute::VarSource::None)
+    VmExecutor::table_get(
+        state,
+        table_val,
+        &TValue::Integer(i),
+        crate::execute::VarSource::None,
+    )
 }
 
 /// 设置 t[i] = v，支持 __newindex 元方法 (对应 C lua_seti → luaV_finishset)
 fn seti_meta(state: &mut LuaState, table_val: &TValue, i: i64, val: TValue) -> Result<(), VmError> {
-    VmExecutor::table_set(state, table_val, TValue::Integer(i), val, crate::execute::VarSource::None)
+    VmExecutor::table_set(
+        state,
+        table_val,
+        TValue::Integer(i),
+        val,
+        crate::execute::VarSource::None,
+    )
 }
 
 /// 将结果压入栈并调整栈顶
@@ -142,9 +157,12 @@ fn table_concat_impl(
             TValue::Str(s) => result.push_str(s.as_str()),
             TValue::Integer(n) => result.push_str(&n.to_string()),
             TValue::Float(f) => result.push_str(&format!("{}", f)),
-            _ => return Err(VmError::RuntimeError(format!(
-                "invalid value (at index {}) in table for 'concat'", idx
-            ))),
+            _ => {
+                return Err(VmError::RuntimeError(format!(
+                    "invalid value (at index {}) in table for 'concat'",
+                    idx
+                )))
+            }
         }
         Ok(())
     };
@@ -189,7 +207,8 @@ pub fn call_table_function(
         TABLE_MOVE => call_move(state, a, nargs, nresults),
         TABLE_CREATE => call_create(state, a, nargs, nresults),
         _ => Err(VmError::RuntimeError(format!(
-            "unknown table function tag: {}", tag
+            "unknown table function tag: {}",
+            tag
         ))),
     };
 
@@ -200,18 +219,16 @@ pub fn call_table_function(
 }
 
 /// table.concat(list [, sep [, i [, j]]])
-fn call_concat(
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
+fn call_concat(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     let list_val = get_arg(state, a, 0);
     match &list_val {
-        TValue::Table(_) => {},
-        _ => return Err(VmError::RuntimeError(format!(
-            "bad argument #1 to 'concat' (table expected, got {})", list_val.ty()
-        ))),
+        TValue::Table(_) => {}
+        _ => {
+            return Err(VmError::RuntimeError(format!(
+                "bad argument #1 to 'concat' (table expected, got {})",
+                list_val.ty()
+            )))
+        }
     }
 
     let sep = if nargs >= 2 {
@@ -225,33 +242,52 @@ fn call_concat(
     };
 
     let default_len = get_obj_len(state, &list_val)?;
-    let i = if nargs >= 3 { get_opt_int_arg(state, a, 2, 1) } else { 1 };
-    let j = if nargs >= 4 { get_opt_int_arg(state, a, 3, default_len) } else { default_len };
+    let i = if nargs >= 3 {
+        get_opt_int_arg(state, a, 2, 1)
+    } else {
+        1
+    };
+    let j = if nargs >= 4 {
+        get_opt_int_arg(state, a, 3, default_len)
+    } else {
+        default_len
+    };
 
     let result = table_concat_impl(state, &list_val, &sep, i, j)?;
-    push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&result))]);
+    push_results(
+        state,
+        a,
+        nresults,
+        vec![TValue::Str(state.intern_str(&result))],
+    );
     Ok(())
 }
 
 /// table.unpack(list [, i [, j]])
 /// 对应 C Lua 的 tunpack: 直接 push 到栈,不创建中间 Vec
-fn call_unpack(
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
+fn call_unpack(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     let list_val = get_arg(state, a, 0);
     match &list_val {
-        TValue::Table(_) => {},
-        _ => return Err(VmError::RuntimeError(format!(
-            "bad argument #1 to 'unpack' (table expected, got {})", list_val.ty()
-        ))),
+        TValue::Table(_) => {}
+        _ => {
+            return Err(VmError::RuntimeError(format!(
+                "bad argument #1 to 'unpack' (table expected, got {})",
+                list_val.ty()
+            )))
+        }
     }
 
     let default_len = get_obj_len(state, &list_val)?;
-    let i = if nargs >= 2 { get_opt_int_arg(state, a, 1, 1) } else { 1 };
-    let j = if nargs >= 3 { get_opt_int_arg(state, a, 2, default_len) } else { default_len };
+    let i = if nargs >= 2 {
+        get_opt_int_arg(state, a, 1, 1)
+    } else {
+        1
+    };
+    let j = if nargs >= 3 {
+        get_opt_int_arg(state, a, 2, default_len)
+    } else {
+        default_len
+    };
 
     if i > j {
         // 空范围: 返回 0 个值 (对应 C 的 return 0)
@@ -262,20 +298,25 @@ fn call_unpack(
     // C: n = l_castS2U(e) - l_castS2U(i); ++n; (用 unsigned 算术避免溢出)
     let n_minus_1 = (j as u64).wrapping_sub(i as u64);
     if n_minus_1 >= i32::MAX as u64 {
-        return Err(VmError::RuntimeError("too many results to unpack".to_string()));
+        return Err(VmError::RuntimeError(
+            "too many results to unpack".to_string(),
+        ));
     }
     let n = n_minus_1 as usize + 1;
     if n >= i32::MAX as usize || state.stack.len().saturating_add(n) > crate::state::MAXSTACK {
-        return Err(VmError::RuntimeError("too many results to unpack".to_string()));
+        return Err(VmError::RuntimeError(
+            "too many results to unpack".to_string(),
+        ));
     }
 
     // 预留栈空间。Rust TValue（96 字节）比 C 的 16 字节大 6 倍，大 n 时分配可能 OOM。
     // 用 try_reserve_exact 避免 panic，将 OOM 转为可被 pcall/resume 捕获的运行时错误。
     // 沿用 "too many results to unpack" 消息（与 MAXSTACK 检查一致），让 errors.lua:615 的
     // checkerr("too many results", f) 能匹配。
-    state.stack.try_reserve_exact(n).map_err(|_| {
-        VmError::RuntimeError("too many results to unpack".to_string())
-    })?;
+    state
+        .stack
+        .try_reserve_exact(n)
+        .map_err(|_| VmError::RuntimeError("too many results to unpack".to_string()))?;
 
     // 直接 push 到 state.stack，不创建中间 Vec
     // 对应 C 版 tunpack: while (i < e) { lua_geti(L, 1, i); i++; } lua_geti(L, 1, e);
@@ -294,12 +335,7 @@ fn call_unpack(
 }
 
 /// table.pack(...)
-fn call_pack(
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
+fn call_pack(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     let t = crate::table::Table::new();
     for i in 0..nargs {
         let val = get_arg(state, a, i);
@@ -314,18 +350,16 @@ fn call_pack(
 }
 
 /// table.insert(list, [pos,] value)
-fn call_insert(
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
+fn call_insert(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     let list_val = get_arg(state, a, 0);
     match &list_val {
-        TValue::Table(_) => {},
-        _ => return Err(VmError::RuntimeError(format!(
-            "bad argument #1 to 'insert' (table expected, got {})", list_val.ty()
-        ))),
+        TValue::Table(_) => {}
+        _ => {
+            return Err(VmError::RuntimeError(format!(
+                "bad argument #1 to 'insert' (table expected, got {})",
+                list_val.ty()
+            )))
+        }
     }
 
     let len = get_obj_len(state, &list_val)?;
@@ -340,7 +374,9 @@ fn call_insert(
         let pos = get_opt_int_arg(state, a, 1, 0);
         // C: luaL_argcheck(L, (lua_Unsigned)pos - 1u < (lua_Unsigned)e, ...) → pos ∈ [1, e]
         if (pos as u64).wrapping_sub(1) >= (e as u64) {
-            return Err(VmError::RuntimeError("bad argument #2 to 'insert' (position out of bounds)".to_string()));
+            return Err(VmError::RuntimeError(
+                "bad argument #2 to 'insert' (position out of bounds)".to_string(),
+            ));
         }
         let val = get_arg(state, a, 2);
         // shift elements up — 对应 C: for (i=e; i>pos; i--) { t[i] = t[i-1] }
@@ -362,18 +398,16 @@ fn call_insert(
 }
 
 /// table.remove(list [, pos])
-fn call_remove(
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
+fn call_remove(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     let list_val = get_arg(state, a, 0);
     match &list_val {
-        TValue::Table(_) => {},
-        _ => return Err(VmError::RuntimeError(format!(
-            "bad argument #1 to 'remove' (table expected, got {})", list_val.ty()
-        ))),
+        TValue::Table(_) => {}
+        _ => {
+            return Err(VmError::RuntimeError(format!(
+                "bad argument #1 to 'remove' (table expected, got {})",
+                list_val.ty()
+            )))
+        }
     }
 
     let len = get_obj_len(state, &list_val)?;
@@ -382,7 +416,11 @@ fn call_remove(
     //   pos 默认 = size; 仅当 pos != size 时才校验 pos ∈ [1, size+1]
     //   (无符号下溢让 pos<=0 变巨大值 > size, 自然失败)
     // 这允许 size=0, pos=0 时取 t[0] (如 a={[0]="ban"}, table.remove(a) 返回 "ban")
-    let pos = if nargs >= 2 { get_opt_int_arg(state, a, 1, len) } else { len };
+    let pos = if nargs >= 2 {
+        get_opt_int_arg(state, a, 1, len)
+    } else {
+        len
+    };
     if pos != len {
         let pos_u = pos as u64;
         if pos_u.wrapping_sub(1) > (len as u64) {
@@ -415,12 +453,7 @@ fn call_remove(
 
 const RANLIMIT: u32 = 100;
 
-fn sort_comp(
-    state: &mut LuaState,
-    comp: &TValue,
-    a: &TValue,
-    b: &TValue,
-) -> Result<bool, VmError> {
+fn sort_comp(state: &mut LuaState, comp: &TValue, a: &TValue, b: &TValue) -> Result<bool, VmError> {
     if matches!(comp, TValue::Nil(_)) {
         if a.is_number() && b.is_number() {
             Ok(crate::vm::lt_num(a, b))
@@ -458,7 +491,9 @@ fn partition(
         }
         loop {
             j -= 1;
-            let ej = elems.get(j as usize).cloned()
+            let ej = elems
+                .get(j as usize)
+                .cloned()
                 .unwrap_or(TValue::Nil(NilKind::Strict));
             if !sort_comp(state, comp, &pivot, &ej)? {
                 break;
@@ -544,9 +579,14 @@ fn call_sort(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
     };
 
     match &table_val {
-        TValue::Table(_) => {},
-        _ => return Err(arg_error(state, 1,
-            &format!("table expected, got {}", obj_type_name(&table_val)))),
+        TValue::Table(_) => {}
+        _ => {
+            return Err(arg_error(
+                state,
+                1,
+                &format!("table expected, got {}", obj_type_name(&table_val)),
+            ))
+        }
     }
 
     let n = get_obj_len(state, &table_val)?;
@@ -586,12 +626,7 @@ fn call_sort(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 /// sizeseq > INT_MAX → "out of range" (arg #1)
 /// sizerest > INT_MAX → "out of range" (arg #2)
 /// sizerest > MAXHSIZE (2^30) → "table overflow"
-fn call_create(
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
+fn call_create(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     // 参数 1: sizeseq (必需)
     let sizeseq = if nargs >= 1 {
         match &state.stack[a + 1] {
@@ -601,13 +636,17 @@ fn call_create(
                     i
                 } else {
                     return Err(VmError::RuntimeError(
-                        "bad argument #1 to 'create' (number has no integer representation)".to_string(),
+                        "bad argument #1 to 'create' (number has no integer representation)"
+                            .to_string(),
                     ));
                 }
-            },
-            other => return Err(VmError::RuntimeError(format!(
-                "bad argument #1 to 'create' (integer expected, got {})", other.ty()
-            ))),
+            }
+            other => {
+                return Err(VmError::RuntimeError(format!(
+                    "bad argument #1 to 'create' (integer expected, got {})",
+                    other.ty()
+                )))
+            }
         }
     } else {
         return Err(VmError::RuntimeError(
@@ -624,14 +663,18 @@ fn call_create(
                     i
                 } else {
                     return Err(VmError::RuntimeError(
-                        "bad argument #2 to 'create' (number has no integer representation)".to_string(),
+                        "bad argument #2 to 'create' (number has no integer representation)"
+                            .to_string(),
                     ));
                 }
-            },
+            }
             TValue::Nil(_) => 0,
-            other => return Err(VmError::RuntimeError(format!(
-                "bad argument #2 to 'create' (integer expected, got {})", other.ty()
-            ))),
+            other => {
+                return Err(VmError::RuntimeError(format!(
+                    "bad argument #2 to 'create' (integer expected, got {})",
+                    other.ty()
+                )))
+            }
         }
     } else {
         0
@@ -672,17 +715,13 @@ fn call_create(
 ///
 /// 将 a1[f..e] 移动到 a2[t..t+e-f]，默认 a2 = a1。返回 a2。
 /// 通过 VmExecutor::table_get/table_set 调用元方法 (__index/__newindex)。
-fn call_move(
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
+fn call_move(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     // 参数 1: 源表 (必需)
     let src_val = get_arg(state, a, 0);
     if !matches!(src_val, TValue::Table(_)) {
         return Err(VmError::RuntimeError(format!(
-            "bad argument #1 to 'move' (table expected, got {})", src_val.ty()
+            "bad argument #1 to 'move' (table expected, got {})",
+            src_val.ty()
         )));
     }
 
@@ -700,7 +739,8 @@ fn call_move(
             src_val.clone()
         } else if !matches!(v, TValue::Table(_)) {
             return Err(VmError::RuntimeError(format!(
-                "bad argument #5 to 'move' (table expected, got {})", v.ty()
+                "bad argument #5 to 'move' (table expected, got {})",
+                v.ty()
             )));
         } else {
             v
@@ -714,9 +754,11 @@ fn call_move(
         // C: luaL_argcheck(L, f > 0 || e < LUA_MAXINTEGER + f, 3, "too many elements to move")
         let n = match e.checked_sub(f).and_then(|d| d.checked_add(1)) {
             Some(n) if n >= 0 => n,
-            _ => return Err(VmError::RuntimeError(
-                "bad argument #3 to 'move' (too many elements to move)".to_string(),
-            )),
+            _ => {
+                return Err(VmError::RuntimeError(
+                    "bad argument #3 to 'move' (too many elements to move)".to_string(),
+                ))
+            }
         };
 
         // "destination wrap around": t + n - 1 不能超过 MAXINT
@@ -730,9 +772,7 @@ fn call_move(
         // 决定复制方向: 当源和目标重叠时反向复制避免覆盖未读取元素
         // C: t > e || t <= f || (tt != 1 && !lua_compare(L, 1, tt, LUA_OPEQ))
         let src_eq_dst = match (&src_val, &dst_val) {
-            (TValue::Table(s), TValue::Table(d)) => {
-                std::rc::Rc::ptr_eq(&s.data, &d.data)
-            }
+            (TValue::Table(s), TValue::Table(d)) => std::rc::Rc::ptr_eq(&s.data, &d.data),
             _ => false,
         };
         let ascending = t > e || t <= f || !src_eq_dst;
@@ -745,8 +785,19 @@ fn call_move(
             while i < n {
                 let src_key = TValue::Integer(f.wrapping_add(i));
                 let dst_key = TValue::Integer(t.wrapping_add(i));
-                let val = crate::execute::VmExecutor::table_get(state, &src_val, &src_key, crate::execute::VarSource::None)?;
-                crate::execute::VmExecutor::table_set(state, &dst_val, dst_key, val, crate::execute::VarSource::None)?;
+                let val = crate::execute::VmExecutor::table_get(
+                    state,
+                    &src_val,
+                    &src_key,
+                    crate::execute::VarSource::None,
+                )?;
+                crate::execute::VmExecutor::table_set(
+                    state,
+                    &dst_val,
+                    dst_key,
+                    val,
+                    crate::execute::VarSource::None,
+                )?;
                 i += 1;
             }
         } else {
@@ -754,9 +805,22 @@ fn call_move(
             loop {
                 let src_key = TValue::Integer(f.wrapping_add(i));
                 let dst_key = TValue::Integer(t.wrapping_add(i));
-                let val = crate::execute::VmExecutor::table_get(state, &src_val, &src_key, crate::execute::VarSource::None)?;
-                crate::execute::VmExecutor::table_set(state, &dst_val, dst_key, val, crate::execute::VarSource::None)?;
-                if i == 0 { break; }
+                let val = crate::execute::VmExecutor::table_get(
+                    state,
+                    &src_val,
+                    &src_key,
+                    crate::execute::VarSource::None,
+                )?;
+                crate::execute::VmExecutor::table_set(
+                    state,
+                    &dst_val,
+                    dst_key,
+                    val,
+                    crate::execute::VarSource::None,
+                )?;
+                if i == 0 {
+                    break;
+                }
                 i -= 1;
             }
         }
@@ -777,7 +841,8 @@ fn get_int_arg(
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.stack.len() {
         return Err(VmError::RuntimeError(format!(
-            "bad argument #{} to '{}' (integer expected, got no value)", arg_num, fname
+            "bad argument #{} to '{}' (integer expected, got no value)",
+            arg_num, fname
         )));
     }
     match &state.stack[stack_idx] {
@@ -787,12 +852,16 @@ fn get_int_arg(
                 Ok(i)
             } else {
                 Err(VmError::RuntimeError(format!(
-                    "bad argument #{} to '{}' (number has no integer representation)", arg_num, fname
+                    "bad argument #{} to '{}' (number has no integer representation)",
+                    arg_num, fname
                 )))
             }
         }
         other => Err(VmError::RuntimeError(format!(
-            "bad argument #{} to '{}' (integer expected, got {})", arg_num, fname, other.ty()
+            "bad argument #{} to '{}' (integer expected, got {})",
+            arg_num,
+            fname,
+            other.ty()
         ))),
     }
 }
@@ -821,7 +890,10 @@ fn call_comp_function(
 
     if status != 0 {
         // 获取原始错误值并传播 (对应 C 的 lua_call 直接传播错误)
-        let err_val = state.stack.last().cloned()
+        let err_val = state
+            .stack
+            .last()
+            .cloned()
             .unwrap_or_else(|| TValue::Nil(NilKind::Strict));
         state.stack.truncate(saved_len);
         return Err(VmError::RuntimeErrorValue(err_val));

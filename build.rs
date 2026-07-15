@@ -8,7 +8,10 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", lua_src_dir.display());
-    println!("cargo:rerun-if-changed={}", rs_src_dir.join("capi_variadic.c").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        rs_src_dir.join("capi_variadic.c").display()
+    );
     println!("cargo:rerun-if-changed=Cargo.toml");
 
     // 默认构建（非 ffi）也需导出 C API 符号到动态符号表，

@@ -239,8 +239,13 @@ impl OpName {
     pub fn is_arithmetic(self) -> bool {
         matches!(
             self,
-            OpName::Add | OpName::Sub | OpName::Mul | OpName::Mod
-                | OpName::Pow | OpName::Div | OpName::IDiv
+            OpName::Add
+                | OpName::Sub
+                | OpName::Mul
+                | OpName::Mod
+                | OpName::Pow
+                | OpName::Div
+                | OpName::IDiv
         )
     }
 
@@ -256,8 +261,10 @@ impl OpName {
     }
 
     pub fn is_jump(self) -> bool {
-        matches!(self, OpName::Jmp | OpName::ForLoop | OpName::ForPrep
-            | OpName::TForLoop | OpName::TForPrep)
+        matches!(
+            self,
+            OpName::Jmp | OpName::ForLoop | OpName::ForPrep | OpName::TForLoop | OpName::TForPrep
+        )
     }
 
     pub fn is_call(self) -> bool {
@@ -269,7 +276,10 @@ impl OpName {
     }
 
     pub fn is_load_constant(self) -> bool {
-        matches!(self, OpName::LoadK | OpName::LoadKx | OpName::LoadI | OpName::LoadF)
+        matches!(
+            self,
+            OpName::LoadK | OpName::LoadKx | OpName::LoadI | OpName::LoadF
+        )
     }
 }
 

@@ -19,7 +19,12 @@ struct SharedWriter {
 impl SharedWriter {
     fn new() -> (Self, Arc<Mutex<Vec<u8>>>) {
         let buffer = Arc::new(Mutex::new(Vec::new()));
-        (Self { buffer: buffer.clone() }, buffer)
+        (
+            Self {
+                buffer: buffer.clone(),
+            },
+            buffer,
+        )
     }
 }
 
@@ -97,7 +102,11 @@ fn test_counter_independent() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     // a: 1, 2, 3; b: 1, 2
-    assert!(stdout.contains("1\t2\t1\t3\t2"), "期望 1 2 1 3 2, got: {}", stdout);
+    assert!(
+        stdout.contains("1\t2\t1\t3\t2"),
+        "期望 1 2 1 3 2, got: {}",
+        stdout
+    );
 }
 
 // ============================================================================
@@ -126,11 +135,31 @@ fn test_shared_upvalue() {
     // get()=0, inc()=10, get()=10, inc()=20, get()=20
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(lines.len() >= 5, "期望至少 5 行输出, got: {}", stdout);
-    assert!(lines[0].contains("0"), "第一次 get 应为 0, got: {}", lines[0]);
-    assert!(lines[1].contains("10"), "第一次 inc 应为 10, got: {}", lines[1]);
-    assert!(lines[2].contains("10"), "第二次 get 应为 10, got: {}", lines[2]);
-    assert!(lines[3].contains("20"), "第二次 inc 应为 20, got: {}", lines[3]);
-    assert!(lines[4].contains("20"), "第三次 get 应为 20, got: {}", lines[4]);
+    assert!(
+        lines[0].contains("0"),
+        "第一次 get 应为 0, got: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("10"),
+        "第一次 inc 应为 10, got: {}",
+        lines[1]
+    );
+    assert!(
+        lines[2].contains("10"),
+        "第二次 get 应为 10, got: {}",
+        lines[2]
+    );
+    assert!(
+        lines[3].contains("20"),
+        "第二次 inc 应为 20, got: {}",
+        lines[3]
+    );
+    assert!(
+        lines[4].contains("20"),
+        "第三次 get 应为 20, got: {}",
+        lines[4]
+    );
 }
 
 // ============================================================================
@@ -190,9 +219,21 @@ fn test_triple_nested_closure() {
     // 第三次: a=4,b=5,c=6 → 456
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(lines.len() >= 3, "期望至少 3 行输出, got: {}", stdout);
-    assert!(lines[0].trim() == "234", "第一次应为 234, got: {}", lines[0]);
-    assert!(lines[1].trim() == "345", "第二次应为 345, got: {}", lines[1]);
-    assert!(lines[2].trim() == "456", "第三次应为 456, got: {}", lines[2]);
+    assert!(
+        lines[0].trim() == "234",
+        "第一次应为 234, got: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].trim() == "345",
+        "第二次应为 345, got: {}",
+        lines[1]
+    );
+    assert!(
+        lines[2].trim() == "456",
+        "第三次应为 456, got: {}",
+        lines[2]
+    );
 }
 
 // ============================================================================
@@ -218,8 +259,16 @@ fn test_upvalue_closed_after_return() {
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(lines.len() >= 3, "期望至少 3 行输出, got: {}", stdout);
     assert!(lines[0].trim() == "8", "add5(3) 应为 8, got: {}", lines[0]);
-    assert!(lines[1].trim() == "13", "add10(3) 应为 13, got: {}", lines[1]);
-    assert!(lines[2].trim() == "12", "add5(7) 应为 12, got: {}", lines[2]);
+    assert!(
+        lines[1].trim() == "13",
+        "add10(3) 应为 13, got: {}",
+        lines[1]
+    );
+    assert!(
+        lines[2].trim() == "12",
+        "add5(7) 应为 12, got: {}",
+        lines[2]
+    );
 }
 
 /// 上值为表时，闭包修改表内容，其他闭包可见
@@ -243,9 +292,21 @@ fn test_upvalue_table_shared() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(lines.len() >= 3, "期望至少 3 行输出, got: {}", stdout);
-    assert!(lines[0].trim() == "100", "get('x') 应为 100, got: {}", lines[0]);
-    assert!(lines[1].trim() == "200", "get('y') 应为 200, got: {}", lines[1]);
-    assert!(lines[2].trim() == "nil", "get('z') 应为 nil, got: {}", lines[2]);
+    assert!(
+        lines[0].trim() == "100",
+        "get('x') 应为 100, got: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].trim() == "200",
+        "get('y') 应为 200, got: {}",
+        lines[1]
+    );
+    assert!(
+        lines[2].trim() == "nil",
+        "get('z') 应为 nil, got: {}",
+        lines[2]
+    );
 }
 
 // ============================================================================
@@ -275,8 +336,16 @@ fn test_setupval_persists() {
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(lines.len() >= 3, "期望至少 3 行输出, got: {}", stdout);
     assert!(lines[0].trim() == "0", "初始值应为 0, got: {}", lines[0]);
-    assert!(lines[1].trim() == "42", "set(42) 后应为 42, got: {}", lines[1]);
-    assert!(lines[2].trim() == "99", "set(99) 后应为 99, got: {}", lines[2]);
+    assert!(
+        lines[1].trim() == "42",
+        "set(42) 后应为 42, got: {}",
+        lines[1]
+    );
+    assert!(
+        lines[2].trim() == "99",
+        "set(99) 后应为 99, got: {}",
+        lines[2]
+    );
 }
 
 /// 上值为字符串，修改后正确反映
@@ -298,6 +367,14 @@ fn test_upvalue_string() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(lines.len() >= 2, "期望至少 2 行输出, got: {}", stdout);
-    assert!(lines[0].contains("hello, world"), "期望 'hello, world', got: {}", lines[0]);
-    assert!(lines[1].contains("hello, lua"), "期望 'hello, lua', got: {}", lines[1]);
+    assert!(
+        lines[0].contains("hello, world"),
+        "期望 'hello, world', got: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("hello, lua"),
+        "期望 'hello, lua', got: {}",
+        lines[1]
+    );
 }

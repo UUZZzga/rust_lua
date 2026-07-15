@@ -179,7 +179,8 @@ pub const PATH_DEFAULT: &str = "/usr/local/share/lua/5.5/?.lua;/usr/local/share/
 #[cfg(target_os = "windows")]
 pub const CPATH_DEFAULT: &str = "!.\\?.dll;!.\\..\\lib\\lua\\5.5\\?.dll;!.\\loadall.dll;.\\?.dll";
 #[cfg(not(target_os = "windows"))]
-pub const CPATH_DEFAULT: &str = "/usr/local/lib/lua/5.5/?.so;/usr/local/lib/lua/5.5/loadall.so;./?.so";
+pub const CPATH_DEFAULT: &str =
+    "/usr/local/lib/lua/5.5/?.so;/usr/local/lib/lua/5.5/loadall.so;./?.so";
 
 // ============================================================================
 // 其他常量

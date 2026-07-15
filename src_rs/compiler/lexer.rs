@@ -42,8 +42,28 @@ pub const EOF_CHAR: char = '\u{10FFFF}';
 #[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     // Keywords
-    And, Break, Do, Else, Elseif, End, False, For, Function, Goto,
-    If, In, Local, Nil, Not, Or, Repeat, Return, Then, True, Until, While,
+    And,
+    Break,
+    Do,
+    Else,
+    Elseif,
+    End,
+    False,
+    For,
+    Function,
+    Goto,
+    If,
+    In,
+    Local,
+    Nil,
+    Not,
+    Or,
+    Repeat,
+    Return,
+    Then,
+    True,
+    Until,
+    While,
 
     // Literals
     Name(String),
@@ -52,11 +72,39 @@ pub enum Token {
     String(String),
 
     // Symbols
-    Plus, Minus, Star, Slash, Percent, Caret, Hash,
-    Ampersand, Tilde, Pipe, LtLt, GtGt, SlashSlash,
-    EqEq, TildeEq, LtEq, GtEq, Lt, Gt, Eq,
-    LParen, RParen, LBrace, RBrace, LBracket, RBracket,
-    ColonColon, Dot, DotDot, DotDotDot, Comma, Colon, Semi,
+    Plus,
+    Minus,
+    Star,
+    Slash,
+    Percent,
+    Caret,
+    Hash,
+    Ampersand,
+    Tilde,
+    Pipe,
+    LtLt,
+    GtGt,
+    SlashSlash,
+    EqEq,
+    TildeEq,
+    LtEq,
+    GtEq,
+    Lt,
+    Gt,
+    Eq,
+    LParen,
+    RParen,
+    LBrace,
+    RBrace,
+    LBracket,
+    RBracket,
+    ColonColon,
+    Dot,
+    DotDot,
+    DotDotDot,
+    Comma,
+    Colon,
+    Semi,
 
     /// 单字符 token (对应 C llex default 分支返回的非保留字符)
     /// 用于未知字符 (如控制字符 \1), 让解析器报 "syntax error" 或 "unexpected symbol"
@@ -188,9 +236,12 @@ fn read_char_at(bytes: &[u8], pos: usize) -> char {
     if bytes[pos] < 0x80 {
         return bytes[pos] as char;
     }
-    match std::str::from_utf8(&bytes[pos..]).ok().and_then(|s| s.chars().next()) {
+    match std::str::from_utf8(&bytes[pos..])
+        .ok()
+        .and_then(|s| s.chars().next())
+    {
         Some(ch) => ch,
-        None => bytes[pos] as char,  // 无效 UTF-8: 按字节值作为 char
+        None => bytes[pos] as char, // 无效 UTF-8: 按字节值作为 char
     }
 }
 
@@ -237,7 +288,10 @@ pub fn format_chunk_id(chunk_name: &str) -> String {
             let effective_len = nl_pos.unwrap_or(bytes.len());
 
             if effective_len < bufflen && nl_pos.is_none() {
-                format!("[string \"{}\"]", String::from_utf8_lossy(&bytes[..effective_len]))
+                format!(
+                    "[string \"{}\"]",
+                    String::from_utf8_lossy(&bytes[..effective_len])
+                )
             } else {
                 let n = effective_len.min(bufflen);
                 format!("[string \"{}...\"]", String::from_utf8_lossy(&bytes[..n]))
@@ -257,7 +311,7 @@ pub struct LexState<'a> {
     pub token: Token,
     pub lookahead: Option<Token>,
     pub errors: Vec<String>,
-    pub nesting_level: u32,  // recursion depth counter (like C's nCcalls)
+    pub nesting_level: u32, // recursion depth counter (like C's nCcalls)
     /// Scanner string table — 对应 C 的 `ls->h`。
     /// 锚定长字符串字面量,确保同一源码中的长字符串返回同一 `LuaString` (相同 ptr_id)。
     /// 短字符串已通过全局 `StringTable` 内部化去重,无需在此重复。
@@ -275,7 +329,9 @@ impl<'a> LexState<'a> {
         // 从线程局部缓存中获取可重用的内部缓冲,避免每次编译时重新分配堆内存。
         let (errors, scanner_strings, token_text, cache_holder) = COMPILER_CACHE.with(|c| {
             let mut cell = c.borrow_mut();
-            let mut boxed = cell.take().unwrap_or_else(|| Box::new(CompilerCache::new()));
+            let mut boxed = cell
+                .take()
+                .unwrap_or_else(|| Box::new(CompilerCache::new()));
             boxed.clear();
             let errors = std::mem::take(&mut boxed.errors);
             let scanner_strings = std::mem::take(&mut boxed.scanner_strings);
@@ -342,7 +398,10 @@ impl<'a> LexState<'a> {
                 self.pos += 1;
             } else {
                 // 尝试解析为 UTF-8;无效字节按单字节处理 (对应 C 按字节读取)
-                match std::str::from_utf8(&bytes[self.pos..]).ok().and_then(|s| s.chars().next()) {
+                match std::str::from_utf8(&bytes[self.pos..])
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                {
                     Some(ch) => self.pos += ch.len_utf8(),
                     None => self.pos += 1,
                 }
@@ -360,7 +419,10 @@ impl<'a> LexState<'a> {
             if bytes[pos] < 0x80 {
                 pos += 1;
             } else {
-                match std::str::from_utf8(&bytes[pos..]).ok().and_then(|s| s.chars().next()) {
+                match std::str::from_utf8(&bytes[pos..])
+                    .ok()
+                    .and_then(|s| s.chars().next())
+                {
                     Some(ch) => pos += ch.len_utf8(),
                     None => pos += 1,
                 }
@@ -443,7 +505,12 @@ impl<'a> LexState<'a> {
     }
 
     pub fn error(&mut self, msg: &str) {
-        self.errors.push(format!("{}:{}: {}", format_chunk_id(&self.chunk_name), self.linenumber, msg));
+        self.errors.push(format!(
+            "{}:{}: {}",
+            format_chunk_id(&self.chunk_name),
+            self.linenumber,
+            msg
+        ));
     }
 
     /// 转义序列错误，对应 C 的 `esccheck` + `lexerror(msg, TK_STRING)`。
@@ -454,12 +521,19 @@ impl<'a> LexState<'a> {
         let mut token = String::new();
         token.push_str(s);
         let bytes = &self.source.as_bytes()[backslash_pos..self.pos];
-        unsafe { token.as_mut_vec().extend_from_slice(bytes); }
+        unsafe {
+            token.as_mut_vec().extend_from_slice(bytes);
+        }
         if self.current != EOF_CHAR {
             token.push(self.current);
         }
-        self.errors.push(format!("{}:{}: {} near '{}'",
-            format_chunk_id(&self.chunk_name), self.linenumber, msg, token));
+        self.errors.push(format!(
+            "{}:{}: {} near '{}'",
+            format_chunk_id(&self.chunk_name),
+            self.linenumber,
+            msg,
+            token
+        ));
     }
 
     pub fn next(&mut self) {
@@ -508,19 +582,58 @@ impl<'a> LexState<'a> {
         self.token_text.clear();
         match self.current {
             EOF_CHAR => self.token = Token::Eof,
-            '+' => { self.token = Token::Plus; self.next_char(); }
-            '*' => { self.token = Token::Star; self.next_char(); }
-            '%' => { self.token = Token::Percent; self.next_char(); }
-            '^' => { self.token = Token::Caret; self.next_char(); }
-            '#' => { self.token = Token::Hash; self.next_char(); }
-            '&' => { self.token = Token::Ampersand; self.next_char(); }
-            '|' => { self.token = Token::Pipe; self.next_char(); }
-            '(' => { self.token = Token::LParen; self.next_char(); }
-            ')' => { self.token = Token::RParen; self.next_char(); }
-            '{' => { self.token = Token::LBrace; self.next_char(); }
-            '}' => { self.token = Token::RBrace; self.next_char(); }
-            ',' => { self.token = Token::Comma; self.next_char(); }
-            ';' => { self.token = Token::Semi; self.next_char(); }
+            '+' => {
+                self.token = Token::Plus;
+                self.next_char();
+            }
+            '*' => {
+                self.token = Token::Star;
+                self.next_char();
+            }
+            '%' => {
+                self.token = Token::Percent;
+                self.next_char();
+            }
+            '^' => {
+                self.token = Token::Caret;
+                self.next_char();
+            }
+            '#' => {
+                self.token = Token::Hash;
+                self.next_char();
+            }
+            '&' => {
+                self.token = Token::Ampersand;
+                self.next_char();
+            }
+            '|' => {
+                self.token = Token::Pipe;
+                self.next_char();
+            }
+            '(' => {
+                self.token = Token::LParen;
+                self.next_char();
+            }
+            ')' => {
+                self.token = Token::RParen;
+                self.next_char();
+            }
+            '{' => {
+                self.token = Token::LBrace;
+                self.next_char();
+            }
+            '}' => {
+                self.token = Token::RBrace;
+                self.next_char();
+            }
+            ',' => {
+                self.token = Token::Comma;
+                self.next_char();
+            }
+            ';' => {
+                self.token = Token::Semi;
+                self.next_char();
+            }
             '~' => {
                 self.next_char();
                 if self.current == '=' {
@@ -542,16 +655,28 @@ impl<'a> LexState<'a> {
             '<' => {
                 self.next_char();
                 match self.current {
-                    '=' => { self.token = Token::LtEq; self.next_char(); }
-                    '<' => { self.token = Token::LtLt; self.next_char(); }
+                    '=' => {
+                        self.token = Token::LtEq;
+                        self.next_char();
+                    }
+                    '<' => {
+                        self.token = Token::LtLt;
+                        self.next_char();
+                    }
                     _ => self.token = Token::Lt,
                 }
             }
             '>' => {
                 self.next_char();
                 match self.current {
-                    '=' => { self.token = Token::GtEq; self.next_char(); }
-                    '>' => { self.token = Token::GtGt; self.next_char(); }
+                    '=' => {
+                        self.token = Token::GtEq;
+                        self.next_char();
+                    }
+                    '>' => {
+                        self.token = Token::GtGt;
+                        self.next_char();
+                    }
                     _ => self.token = Token::Gt,
                 }
             }
@@ -592,7 +717,7 @@ impl<'a> LexState<'a> {
                 }
             }
             '[' => {
-                let start_pos = self.pos;  // '[' 的位置, 用于长字符串 token_text
+                let start_pos = self.pos; // '[' 的位置, 用于长字符串 token_text
                 self.next_char();
                 let eqs = self.count_equals();
                 if self.current == '[' {
@@ -601,7 +726,9 @@ impl<'a> LexState<'a> {
                     // 对应 C: luaZ_buffer(ls->buff) 在 read_long_string 期间累积的所有字符
                     if self.pos > start_pos {
                         self.token_text.clear();
-                        if let Ok(s) = std::str::from_utf8(&self.source.as_bytes()[start_pos..self.pos]) {
+                        if let Ok(s) =
+                            std::str::from_utf8(&self.source.as_bytes()[start_pos..self.pos])
+                        {
                             self.token_text.push_str(s);
                         }
                     } else {
@@ -611,7 +738,10 @@ impl<'a> LexState<'a> {
                     self.token = Token::LBracket;
                 }
             }
-            ']' => { self.token = Token::RBracket; self.next_char(); }
+            ']' => {
+                self.token = Token::RBracket;
+                self.next_char();
+            }
             '-' => {
                 self.next_char();
                 self.token = Token::Minus;
@@ -765,7 +895,7 @@ impl<'a> LexState<'a> {
 
     fn read_short_string(&mut self) {
         let delim = self.current;
-        let text_start = self.pos;  // 引号的起始位置
+        let text_start = self.pos; // 引号的起始位置
         self.next_char();
         let mut s = String::new();
         loop {
@@ -794,7 +924,9 @@ impl<'a> LexState<'a> {
                     let start = self.pos;
                     self.next_char();
                     let bytes = &self.source.as_bytes()[start..self.pos];
-                    unsafe { s.as_mut_vec().extend_from_slice(bytes); }
+                    unsafe {
+                        s.as_mut_vec().extend_from_slice(bytes);
+                    }
                     let _ = c;
                 }
             }
@@ -809,16 +941,46 @@ impl<'a> LexState<'a> {
 
     fn read_escape(&mut self, s: &mut String, backslash_pos: usize) {
         match self.current {
-            'a' => { s.push('\x07'); self.next_char(); }
-            'b' => { s.push('\x08'); self.next_char(); }
-            'f' => { s.push('\x0c'); self.next_char(); }
-            'n' => { s.push('\n'); self.next_char(); }
-            'r' => { s.push('\r'); self.next_char(); }
-            't' => { s.push('\t'); self.next_char(); }
-            'v' => { s.push('\x0b'); self.next_char(); }
-            '\\' => { s.push('\\'); self.next_char(); }
-            '"' => { s.push('"'); self.next_char(); }
-            '\'' => { s.push('\''); self.next_char(); }
+            'a' => {
+                s.push('\x07');
+                self.next_char();
+            }
+            'b' => {
+                s.push('\x08');
+                self.next_char();
+            }
+            'f' => {
+                s.push('\x0c');
+                self.next_char();
+            }
+            'n' => {
+                s.push('\n');
+                self.next_char();
+            }
+            'r' => {
+                s.push('\r');
+                self.next_char();
+            }
+            't' => {
+                s.push('\t');
+                self.next_char();
+            }
+            'v' => {
+                s.push('\x0b');
+                self.next_char();
+            }
+            '\\' => {
+                s.push('\\');
+                self.next_char();
+            }
+            '"' => {
+                s.push('"');
+                self.next_char();
+            }
+            '\'' => {
+                s.push('\'');
+                self.next_char();
+            }
             'z' => {
                 self.next_char();
                 // 对应 C read_string 中 '\z' 分支: 跳过后续所有空白 (lisspace)
@@ -829,7 +991,7 @@ impl<'a> LexState<'a> {
             }
             'x' => {
                 // 对应 C readhexaesc: 要求恰好 2 个十六进制数字
-                self.next_char();  // skip 'x'
+                self.next_char(); // skip 'x'
                 let mut val: u32 = 0;
                 for _ in 0..2 {
                     if let Some(d) = self.current.to_digit(16) {
@@ -840,15 +1002,17 @@ impl<'a> LexState<'a> {
                         return;
                     }
                 }
-                unsafe { s.as_mut_vec().push(val as u8); }
+                unsafe {
+                    s.as_mut_vec().push(val as u8);
+                }
             }
             'u' => {
-                self.next_char();  // skip 'u'
+                self.next_char(); // skip 'u'
                 if self.current != '{' {
                     self.escape_error(s, backslash_pos, "missing '{'");
                     return;
                 }
-                self.next_char();  // skip '{'
+                self.next_char(); // skip '{'
                 let mut r: u32 = 0;
                 let mut has_digit = false;
                 while self.current.is_ascii_hexdigit() {
@@ -868,10 +1032,12 @@ impl<'a> LexState<'a> {
                     self.escape_error(s, backslash_pos, "missing '}'");
                     return;
                 }
-                self.next_char();  // skip '}'
-                // 使用 UTF-8 编码（支持 1-6 字节，等价于 C 版本 luaO_utf8esc）
+                self.next_char(); // skip '}'
+                                  // 使用 UTF-8 编码（支持 1-6 字节，等价于 C 版本 luaO_utf8esc）
                 for b in utf8_encode(r) {
-                    unsafe { s.as_mut_vec().push(b); }
+                    unsafe {
+                        s.as_mut_vec().push(b);
+                    }
                 }
             }
             '0'..='9' => {
@@ -889,7 +1055,9 @@ impl<'a> LexState<'a> {
                     self.escape_error(s, backslash_pos, "decimal escape too large");
                     return;
                 }
-                unsafe { s.as_mut_vec().push(val as u8); }
+                unsafe {
+                    s.as_mut_vec().push(val as u8);
+                }
             }
             '\n' | '\r' => {
                 // 对应 C: inclinenumber(ls); c = '\n'; goto only_save;
@@ -908,8 +1076,8 @@ impl<'a> LexState<'a> {
     }
 
     fn read_long_string(&mut self, eqs: usize) {
-        self.next_char();  // skip 2nd '['
-        // 对应 C: if (currIsNewline(ls)) inclinenumber(ls);  /* skip it */
+        self.next_char(); // skip 2nd '['
+                          // 对应 C: if (currIsNewline(ls)) inclinenumber(ls);  /* skip it */
         if self.current == '\n' || self.current == '\r' {
             self.inclinenumber();
         }
@@ -923,10 +1091,10 @@ impl<'a> LexState<'a> {
                 }
                 ']' => {
                     // 对应 C skip_sep: 检查是否为结束分隔符 ]=...]
-                    self.next_char();  // skip ']'
-                    let actual = self.count_equals();  // count (并跳过) '='
+                    self.next_char(); // skip ']'
+                    let actual = self.count_equals(); // count (并跳过) '='
                     if actual == eqs && self.current == ']' {
-                        self.next_char();  // skip 2nd ']'
+                        self.next_char(); // skip 2nd ']'
                         self.token = Token::String(s);
                         return;
                     }
@@ -947,7 +1115,9 @@ impl<'a> LexState<'a> {
                     let start = self.pos;
                     self.next_char();
                     let bytes = &self.source.as_bytes()[start..self.pos];
-                    unsafe { s.as_mut_vec().extend_from_slice(bytes); }
+                    unsafe {
+                        s.as_mut_vec().extend_from_slice(bytes);
+                    }
                     let _ = c;
                 }
             }
@@ -1048,7 +1218,7 @@ fn utf8_encode(x: u32) -> Vec<u8> {
     } else {
         // 多字节序列：从后向前填充续字节，最后写首字节
         let mut x = x;
-        let mut mfb: u32 = 0x3f;  // 首字节可用的最大有效位
+        let mut mfb: u32 = 0x3f; // 首字节可用的最大有效位
         loop {
             buff[UTF8BUFFSZ - n] = (0x80 | (x & 0x3f)) as u8;
             n += 1;

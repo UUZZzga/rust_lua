@@ -32,7 +32,12 @@ struct SharedWriter {
 impl SharedWriter {
     fn new() -> (Self, Arc<Mutex<Vec<u8>>>) {
         let buffer = Arc::new(Mutex::new(Vec::new()));
-        (Self { buffer: buffer.clone() }, buffer)
+        (
+            Self {
+                buffer: buffer.clone(),
+            },
+            buffer,
+        )
     }
 }
 
@@ -105,11 +110,7 @@ fn test_math_huge() {
     let output = run_lua_expr("print(math.huge)");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(
-        stdout.trim() == "inf",
-        "expected 'inf', got: {}",
-        stdout
-    );
+    assert!(stdout.trim() == "inf", "expected 'inf', got: {}", stdout);
 }
 
 #[test]
@@ -775,8 +776,14 @@ fn test_math_random_no_args() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     // 应该输出一个 [0, 1) 范围的浮点数
     let trimmed = stdout.trim();
-    let val: f64 = trimmed.parse().expect(&format!("expected float, got: {}", trimmed));
-    assert!(val >= 0.0 && val < 1.0, "random() returned {} which is out of [0, 1)", val);
+    let val: f64 = trimmed
+        .parse()
+        .expect(&format!("expected float, got: {}", trimmed));
+    assert!(
+        val >= 0.0 && val < 1.0,
+        "random() returned {} which is out of [0, 1)",
+        val
+    );
 }
 
 #[test]
@@ -797,13 +804,31 @@ fn test_math_random_single_arg() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     // 解析输出验证范围
-    assert!(stdout.contains("MIN="), "expected MIN= in output: {}", stdout);
-    assert!(stdout.contains("MAX="), "expected MAX= in output: {}", stdout);
+    assert!(
+        stdout.contains("MIN="),
+        "expected MIN= in output: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("MAX="),
+        "expected MAX= in output: {}",
+        stdout
+    );
     // 提取最小值和最大值
-    let min_str = stdout.split("MIN=").nth(1).unwrap().split(" ").next().unwrap();
+    let min_str = stdout
+        .split("MIN=")
+        .nth(1)
+        .unwrap()
+        .split(" ")
+        .next()
+        .unwrap();
     let max_str = stdout.split("MAX=").nth(1).unwrap().trim();
-    let min_val: i64 = min_str.parse().expect(&format!("expected integer, got: {}", min_str));
-    let max_val: i64 = max_str.parse().expect(&format!("expected integer, got: {}", max_str));
+    let min_val: i64 = min_str
+        .parse()
+        .expect(&format!("expected integer, got: {}", min_str));
+    let max_val: i64 = max_str
+        .parse()
+        .expect(&format!("expected integer, got: {}", max_str));
     assert!(min_val >= 1, "min value {} should be >= 1", min_val);
     assert!(max_val <= 6, "max value {} should be <= 6", max_val);
 }
@@ -825,12 +850,30 @@ fn test_math_random_two_args() {
     let output = run_lua_expr(code);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("MIN="), "expected MIN= in output: {}", stdout);
-    assert!(stdout.contains("MAX="), "expected MAX= in output: {}", stdout);
-    let min_str = stdout.split("MIN=").nth(1).unwrap().split(" ").next().unwrap();
+    assert!(
+        stdout.contains("MIN="),
+        "expected MIN= in output: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("MAX="),
+        "expected MAX= in output: {}",
+        stdout
+    );
+    let min_str = stdout
+        .split("MIN=")
+        .nth(1)
+        .unwrap()
+        .split(" ")
+        .next()
+        .unwrap();
     let max_str = stdout.split("MAX=").nth(1).unwrap().trim();
-    let min_val: i64 = min_str.parse().expect(&format!("expected integer, got: {}", min_str));
-    let max_val: i64 = max_str.parse().expect(&format!("expected integer, got: {}", max_str));
+    let min_val: i64 = min_str
+        .parse()
+        .expect(&format!("expected integer, got: {}", min_str));
+    let max_val: i64 = max_str
+        .parse()
+        .expect(&format!("expected integer, got: {}", max_str));
     assert!(min_val >= 10, "min value {} should be >= 10", min_val);
     assert!(max_val <= 20, "max value {} should be <= 20", max_val);
 }
@@ -1117,11 +1160,7 @@ fn test_rust_api_math_log() {
 
 #[test]
 fn test_rust_api_math_min_max() {
-    let args = vec![
-        TValue::Integer(3),
-        TValue::Integer(1),
-        TValue::Integer(2),
-    ];
+    let args = vec![TValue::Integer(3), TValue::Integer(1), TValue::Integer(2)];
     assert_eq!(math_lib::math_min(&args).unwrap(), TValue::Integer(1));
     assert_eq!(math_lib::math_max(&args).unwrap(), TValue::Integer(3));
 }
@@ -1201,10 +1240,8 @@ fn test_rust_api_math_random() {
 
     // 双参数: 返回 [low, up] 整数
     for _ in 0..100 {
-        let result = math_lib::math_random(
-            &mut state,
-            &[TValue::Integer(10), TValue::Integer(20)],
-        ).unwrap();
+        let result =
+            math_lib::math_random(&mut state, &[TValue::Integer(10), TValue::Integer(20)]).unwrap();
         match result {
             TValue::Integer(n) => assert!(n >= 10 && n <= 20),
             _ => panic!("expected integer"),
@@ -1277,8 +1314,14 @@ fn test_rust_api_is_math_tag() {
 
 #[test]
 fn test_rust_api_math_function_name() {
-    assert_eq!(math_lib::math_function_name(math_lib::MATH_ABS), Some("abs"));
-    assert_eq!(math_lib::math_function_name(math_lib::MATH_SIN), Some("sin"));
+    assert_eq!(
+        math_lib::math_function_name(math_lib::MATH_ABS),
+        Some("abs")
+    );
+    assert_eq!(
+        math_lib::math_function_name(math_lib::MATH_SIN),
+        Some("sin")
+    );
     assert_eq!(
         math_lib::math_function_name(math_lib::MATH_RANDOM),
         Some("random")

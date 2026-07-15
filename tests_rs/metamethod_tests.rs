@@ -27,7 +27,12 @@ struct SharedWriter {
 impl SharedWriter {
     fn new() -> (Self, Arc<Mutex<Vec<u8>>>) {
         let buffer = Arc::new(Mutex::new(Vec::new()));
-        (Self { buffer: buffer.clone() }, buffer)
+        (
+            Self {
+                buffer: buffer.clone(),
+            },
+            buffer,
+        )
     }
 }
 
@@ -197,7 +202,11 @@ fn test_unm_metamethod() {
     ]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("-999"), "__unm 应返回 -999, got: {}", stdout);
+    assert!(
+        stdout.contains("-999"),
+        "__unm 应返回 -999, got: {}",
+        stdout
+    );
 }
 
 /// 一元负号: 整数直接取反 (不调用元方法)
@@ -215,7 +224,11 @@ fn test_unm_float() {
     let output = run_lua(&["-e", "print(-3.14)"]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("-3.14"), "-3.14 应为 -3.14, got: {}", stdout);
+    assert!(
+        stdout.contains("-3.14"),
+        "-3.14 应为 -3.14, got: {}",
+        stdout
+    );
 }
 
 // ============================================================================
@@ -332,7 +345,11 @@ fn test_concat_metamethod() {
     ]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("concat_result"), "__concat 应返回 concat_result, got: {}", stdout);
+    assert!(
+        stdout.contains("concat_result"),
+        "__concat 应返回 concat_result, got: {}",
+        stdout
+    );
 }
 
 /// __concat 元方法: 字符串 .. 表
@@ -345,7 +362,11 @@ fn test_concat_metamethod_flipped() {
     ]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("flipped"), "__concat 翻转应返回 flipped, got: {}", stdout);
+    assert!(
+        stdout.contains("flipped"),
+        "__concat 翻转应返回 flipped, got: {}",
+        stdout
+    );
 }
 
 /// 字符串拼接: 不调用元方法
@@ -354,7 +375,11 @@ fn test_concat_strings() {
     let output = run_lua(&["-e", "print('hello' .. ' ' .. 'world')"]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("hello world"), "拼接应为 'hello world', got: {}", stdout);
+    assert!(
+        stdout.contains("hello world"),
+        "拼接应为 'hello world', got: {}",
+        stdout
+    );
 }
 
 // ============================================================================
@@ -378,8 +403,16 @@ fn test_eq_metamethod() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(lines.len() >= 2, "期望至少 2 行输出, got: {}", stdout);
-    assert!(lines[0].contains("true"), "t1 == t2 应为 true, got: {}", lines[0]);
-    assert!(lines[1].contains("true"), "t1 == t1 应为 true, got: {}", lines[1]);
+    assert!(
+        lines[0].contains("true"),
+        "t1 == t2 应为 true, got: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].contains("true"),
+        "t1 == t1 应为 true, got: {}",
+        lines[1]
+    );
 }
 
 /// __lt 元方法: 表 < 表
@@ -409,7 +442,11 @@ fn test_le_metamethod() {
     ]);
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("false"), "__le 应返回 false, got: {}", stdout);
+    assert!(
+        stdout.contains("false"),
+        "__le 应返回 false, got: {}",
+        stdout
+    );
 }
 
 // ============================================================================
@@ -468,9 +505,16 @@ fn test_mmbin_no_metamethod_error() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(lines.len() >= 2, "期望至少 2 行输出, got: {}", stdout);
-    assert!(lines[0].contains("false"), "pcall 应返回 false, got: {}", lines[0]);
-    assert!(lines[1].to_lowercase().contains("arithmetic") || lines[1].contains("perform"),
-           "错误消息应包含 arithmetic/perform, got: {}", lines[1]);
+    assert!(
+        lines[0].contains("false"),
+        "pcall 应返回 false, got: {}",
+        lines[0]
+    );
+    assert!(
+        lines[1].to_lowercase().contains("arithmetic") || lines[1].contains("perform"),
+        "错误消息应包含 arithmetic/perform, got: {}",
+        lines[1]
+    );
 }
 
 /// 无元方法时: -表 应报错
@@ -486,7 +530,11 @@ fn test_unm_no_metamethod_error() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(lines.len() >= 1, "期望至少 1 行输出, got: {}", stdout);
-    assert!(lines[0].contains("false"), "pcall 应返回 false, got: {}", lines[0]);
+    assert!(
+        lines[0].contains("false"),
+        "pcall 应返回 false, got: {}",
+        lines[0]
+    );
 }
 
 /// 无元方法时: ~表 应报错
@@ -502,7 +550,11 @@ fn test_bnot_no_metamethod_error() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(lines.len() >= 1, "期望至少 1 行输出, got: {}", stdout);
-    assert!(lines[0].contains("false"), "pcall 应返回 false, got: {}", lines[0]);
+    assert!(
+        lines[0].contains("false"),
+        "pcall 应返回 false, got: {}",
+        lines[0]
+    );
 }
 
 /// 无元方法时: 表 .. 表 应报错
@@ -518,5 +570,9 @@ fn test_concat_no_metamethod_error() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     assert!(lines.len() >= 1, "期望至少 1 行输出, got: {}", stdout);
-    assert!(lines[0].contains("false"), "pcall 应返回 false, got: {}", lines[0]);
+    assert!(
+        lines[0].contains("false"),
+        "pcall 应返回 false, got: {}",
+        lines[0]
+    );
 }
