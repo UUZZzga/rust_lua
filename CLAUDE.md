@@ -6,6 +6,8 @@ src_rs/ 目录下为 Lua Rust 实现的目录。
 tests_lua/ 目录下为 Lua C 官方的测试用例目录，内部还有几个新增的用于测试 Rust 实现的测试用例。
 tests_rs/ 目录下为 Lua Rust 实现的测试目录。
 build/ 目录下为 Lua C 实现的构建目录，如果需要重新构建，也只能使用该目录。
+target/ 目录下为 Lua Rust 实现的构建目录，如果需要重新构建，也只能使用该目录。
+target_perf/ 目录下为 Lua Rust 实现的性能测试目录，如果需要重新构建，也只能使用该目录。
 
 ## 内存限制规则
 

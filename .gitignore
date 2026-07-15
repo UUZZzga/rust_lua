@@ -3,6 +3,7 @@ build
 build_c
 cbuild
 target
+target_perf
 logs
 
 # Rust/Cargo
