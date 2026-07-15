@@ -77,15 +77,6 @@ pub enum VmResult {
         nresults: usize,
         result_base: usize,
     },
-    TailCall {
-        proto: Proto,
-        base: usize,
-    },
-    Call {
-        proto: Proto,
-        base: usize,
-        num_results: i32,
-    },
     /// 协程 yield — 携带 yield 的值
     Yield {
         values: Vec<TValue>,
@@ -3311,14 +3302,23 @@ impl VmExecutor {
         // C: else: luaT_trybinTM(L, rb, rb, ra, TM_UNM)
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
-        let v = Self::read_stack(state, b).clone();
-        match v {
-            TValue::Integer(i) => Self::write_stack(state, a, TValue::Integer(i.wrapping_neg())),
-            TValue::Float(f) => Self::write_stack(state, a, TValue::Float(-f)),
-            _ => {
-                let info = varinfo_str(state, opcodes::getarg_b(inst) as usize);
-                try_bin_tm(state, &v, &v, a, TagMethod::Unm, info.clone(), info)?;
+        // 快速路径：number 直接取负，借用 state.stack 避免 TValue clone
+        // （原实现对 read_stack 结果直接 .clone()，每次取负产生 1 次 TValue clone+drop）
+        let result = {
+            let v = Self::read_stack(state, b);
+            match v {
+                TValue::Integer(i) => Some(TValue::Integer(i.wrapping_neg())),
+                TValue::Float(f) => Some(TValue::Float(-f)),
+                _ => None,
             }
+        };
+        if let Some(r) = result {
+            Self::write_stack(state, a, r);
+        } else {
+            // cold path：非 number，需调用 __unm 元方法（需 &mut state，必须 clone）
+            let v = Self::read_stack(state, b).clone();
+            let info = varinfo_str(state, opcodes::getarg_b(inst) as usize);
+            try_bin_tm(state, &v, &v, a, TagMethod::Unm, info.clone(), info)?;
         }
         state.pc += 1;
         Ok(())
@@ -3331,10 +3331,16 @@ impl VmExecutor {
         // C: else: luaT_trybinTM(L, rb, rb, ra, TM_BNOT)
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
-        let v = Self::read_stack(state, b).clone();
-        if let Some(i) = to_integer_ns(&v, F2IMode::Eq) {
-            Self::write_stack(state, a, TValue::Integer(!i));
+        // 快速路径：可转整数时直接取反，借用 state.stack 避免 TValue clone
+        let result = {
+            let v = Self::read_stack(state, b);
+            to_integer_ns(v, F2IMode::Eq).map(|i| TValue::Integer(!i))
+        };
+        if let Some(r) = result {
+            Self::write_stack(state, a, r);
         } else {
+            // cold path：非整数，需调用 __bnot 元方法（需 &mut state，必须 clone）
+            let v = Self::read_stack(state, b).clone();
             // result = ra (与 C 一致)
             let info = varinfo_str(state, opcodes::getarg_b(inst) as usize);
             try_bin_tm(state, &v, &v, a, TagMethod::BNot, info.clone(), info)?;
@@ -3643,11 +3649,22 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let im = opcodes::getarg_sb(inst) as i64;
         let isfloat = opcodes::getarg_c(inst) != 0;
-        let v = Self::read_stack(state, a).clone();
-        let cond = match &v {
-            TValue::Integer(i) => *i < im,
-            TValue::Float(f) => *f < (im as f64),
-            _ => crate::tm::call_orderi_tm(state, &v, im, false, isfloat, TagMethod::Lt)?,
+        // 快速路径：number 直接比较，借用 state.stack 避免 TValue clone
+        let cond = {
+            let v = Self::read_stack(state, a);
+            match v {
+                TValue::Integer(i) => Some(*i < im),
+                TValue::Float(f) => Some(*f < (im as f64)),
+                _ => None,
+            }
+        };
+        let cond = match cond {
+            Some(c) => c,
+            None => {
+                // cold path：非 number，需调用 __lt 元方法（需 &mut state，必须 clone）
+                let v = Self::read_stack(state, a).clone();
+                crate::tm::call_orderi_tm(state, &v, im, false, isfloat, TagMethod::Lt)?
+            }
         };
         Self::do_conditional_jump(state, inst, cond);
         Ok(())
@@ -3660,11 +3677,20 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let im = opcodes::getarg_sb(inst) as i64;
         let isfloat = opcodes::getarg_c(inst) != 0;
-        let v = Self::read_stack(state, a).clone();
-        let cond = match &v {
-            TValue::Integer(i) => *i <= im,
-            TValue::Float(f) => *f <= (im as f64),
-            _ => crate::tm::call_orderi_tm(state, &v, im, false, isfloat, TagMethod::Le)?,
+        let cond = {
+            let v = Self::read_stack(state, a);
+            match v {
+                TValue::Integer(i) => Some(*i <= im),
+                TValue::Float(f) => Some(*f <= (im as f64)),
+                _ => None,
+            }
+        };
+        let cond = match cond {
+            Some(c) => c,
+            None => {
+                let v = Self::read_stack(state, a).clone();
+                crate::tm::call_orderi_tm(state, &v, im, false, isfloat, TagMethod::Le)?
+            }
         };
         Self::do_conditional_jump(state, inst, cond);
         Ok(())
@@ -3677,11 +3703,20 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let im = opcodes::getarg_sb(inst) as i64;
         let isfloat = opcodes::getarg_c(inst) != 0;
-        let v = Self::read_stack(state, a).clone();
-        let cond = match &v {
-            TValue::Integer(i) => *i > im,
-            TValue::Float(f) => *f > (im as f64),
-            _ => crate::tm::call_orderi_tm(state, &v, im, true, isfloat, TagMethod::Lt)?,
+        let cond = {
+            let v = Self::read_stack(state, a);
+            match v {
+                TValue::Integer(i) => Some(*i > im),
+                TValue::Float(f) => Some(*f > (im as f64)),
+                _ => None,
+            }
+        };
+        let cond = match cond {
+            Some(c) => c,
+            None => {
+                let v = Self::read_stack(state, a).clone();
+                crate::tm::call_orderi_tm(state, &v, im, true, isfloat, TagMethod::Lt)?
+            }
         };
         Self::do_conditional_jump(state, inst, cond);
         Ok(())
@@ -3694,11 +3729,20 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let im = opcodes::getarg_sb(inst) as i64;
         let isfloat = opcodes::getarg_c(inst) != 0;
-        let v = Self::read_stack(state, a).clone();
-        let cond = match &v {
-            TValue::Integer(i) => *i >= im,
-            TValue::Float(f) => *f >= (im as f64),
-            _ => crate::tm::call_orderi_tm(state, &v, im, true, isfloat, TagMethod::Le)?,
+        let cond = {
+            let v = Self::read_stack(state, a);
+            match v {
+                TValue::Integer(i) => Some(*i >= im),
+                TValue::Float(f) => Some(*f >= (im as f64)),
+                _ => None,
+            }
+        };
+        let cond = match cond {
+            Some(c) => c,
+            None => {
+                let v = Self::read_stack(state, a).clone();
+                crate::tm::call_orderi_tm(state, &v, im, true, isfloat, TagMethod::Le)?
+            }
         };
         Self::do_conditional_jump(state, inst, cond);
         Ok(())
