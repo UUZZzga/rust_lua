@@ -2990,8 +2990,9 @@ pub fn intern_proto_strings(proto: &mut Proto, state: &LuaState) {
         let src_str = src.as_str().to_string();
         proto.source = Some(state.intern_str(&src_str));
     }
-    // 递归处理子 proto
-    for p in &mut proto.protos {
+    // 递归处理子 proto — Rc::make_mut 在 protos 独占时（refcount=1）直接返回 &mut Vec，
+    // 否则 clone-on-write；此处 intern_proto_strings 在加载后调用，protos 通常独占
+    for p in std::rc::Rc::make_mut(&mut proto.protos).iter_mut() {
         intern_proto_strings(std::rc::Rc::make_mut(p), state);
     }
 }

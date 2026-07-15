@@ -805,7 +805,7 @@ pub fn call_close_method(
             saved_code: Rc::new(Vec::new()),
             saved_constants: Rc::new(Vec::new()),
             saved_upval_descs: Rc::new(Vec::new()),
-            saved_protos: Vec::new(),
+            saved_protos: Rc::new(Vec::new()),
             saved_base: 0,
             saved_pc: 0,
             saved_num_params: 0,

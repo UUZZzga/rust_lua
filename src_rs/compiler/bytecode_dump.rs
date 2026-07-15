@@ -1400,7 +1400,7 @@ impl BytecodeWriter {
 
     fn dump_protos(&mut self, f: &Proto) {
         self.dump_int(f.protos.len() as i32);
-        for p in &f.protos {
+        for p in f.protos.iter() {
             self.dump_function(p);
         }
     }
@@ -1540,12 +1540,13 @@ pub fn dumped_to_proto(df: &DumpedFunction) -> Proto {
         })
         .collect());
 
-    // protos: 递归转换
-    proto.protos = df
-        .protos
-        .iter()
-        .map(|p| std::rc::Rc::new(dumped_to_proto(p)))
-        .collect();
+    // protos: 递归转换 — 包装为 Rc<Vec> 让 op_call 共享，避免每次调用 clone O(n) Vec 分配
+    proto.protos = Rc::new(
+        df.protos
+            .iter()
+            .map(|p| std::rc::Rc::new(dumped_to_proto(p)))
+            .collect(),
+    );
 
     // source
     proto.source = df.source.as_ref().map(|s| make_long_string(s));
@@ -1599,7 +1600,7 @@ fn new_proto_internal() -> Proto {
         last_line_defined: 0,
         constants: Rc::new(Vec::new()),
         code: Rc::new(Vec::new()),
-        protos: Vec::new(),
+        protos: Rc::new(Vec::new()),
         upvalues: Rc::new(Vec::new()),
         line_info: Vec::new(),
         abs_line_info: Vec::new(),

@@ -3631,7 +3631,7 @@ mod tests {
             last_line_defined: 0,
             constants: Rc::new(vec![]),
             code: Rc::new(vec![]),
-            protos: vec![],
+            protos: Rc::new(vec![]),
             upvalues: Rc::new(vec![UpvalDesc {
                 name: Some(LuaString::Short(Arc::new(crate::strings::ShortString {
                     hash: 0,

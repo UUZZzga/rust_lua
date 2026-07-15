@@ -12840,7 +12840,10 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
 
     let proto = new_fs.proto;
     let p_idx = fs.proto.protos.len() as i32;
-    fs.proto.protos.push(std::rc::Rc::new(proto));
+    // Rc::make_mut 在编译期独占 protos（refcount=1）时直接返回 &mut Vec，无开销；
+    // 此处 fs.proto 是新建 Proto，protos 一定独占，所以 push 不触发 clone-on-write。
+    // 包装为 Rc<Vec> 后 op_call 共享该 Vec 时 refcount>1，运行期不再 mutate。
+    std::rc::Rc::make_mut(&mut fs.proto.protos).push(std::rc::Rc::new(proto));
     let r = target.unwrap_or_else(|| fs.alloc_reg());
     fs.code_abx(OpCode::CLOSURE, r, p_idx);
     r

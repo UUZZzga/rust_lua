@@ -2450,7 +2450,7 @@ mod tests {
             last_line_defined: 0,
             constants: Rc::new(vec![]),
             code: Rc::new(vec![]),
-            protos: vec![],
+            protos: Rc::new(vec![]),
             upvalues: Rc::new(vec![]),
             line_info: vec![],
             abs_line_info: vec![],
@@ -2489,7 +2489,7 @@ mod tests {
             last_line_defined: 0,
             constants: Rc::new(vec![]),
             code: Rc::new(vec![]),
-            protos: vec![],
+            protos: Rc::new(vec![]),
             upvalues: Rc::new(vec![UpvalDesc {
                 in_stack: true,
                 idx: 0,

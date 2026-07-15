@@ -6176,7 +6176,7 @@ mod tests {
             last_line_defined: 0,
             constants: Rc::new(constants),
             code: Rc::new(code),
-            protos: vec![],
+            protos: Rc::new(vec![]),
             upvalues: Rc::new(vec![]),
             line_info: vec![],
             abs_line_info: vec![],
@@ -6837,7 +6837,7 @@ mod tests {
         let inner_proto = make_proto(vec![make_bx(OpCode::RETURN0, 0, 0)], vec![]);
         let code = vec![make_bx(OpCode::CLOSURE, 0, 0)];
         let mut proto = make_proto(code, vec![]);
-        proto.protos = vec![Rc::new(inner_proto)];
+        proto.protos = Rc::new(vec![Rc::new(inner_proto)]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 

@@ -20,7 +20,7 @@ pub fn new_proto() -> Proto {
         last_line_defined: 0,
         constants: Rc::new(Vec::with_capacity(8)),
         code: Rc::new(Vec::with_capacity(8)),
-        protos: Vec::new(),
+        protos: Rc::new(Vec::new()),
         upvalues: Rc::new(Vec::with_capacity(2)),
         line_info: Vec::with_capacity(8),
         abs_line_info: Vec::new(),
@@ -35,7 +35,7 @@ pub fn proto_size(p: &Proto) -> usize {
     for c in &p.constants[..] {
         size += tvalue_size(c);
     }
-    for sub in &p.protos {
+    for sub in p.protos.iter() {
         size += proto_size(sub);
     }
     size += p.upvalues.len() * std::mem::size_of::<UpvalDesc>();
@@ -479,7 +479,7 @@ mod tests {
             constants: Rc::new(Vec::new()),
             code: Rc::new(Vec::new()),
             upval_descs: Rc::new(Vec::new()),
-            protos: Vec::new(),
+            protos: Rc::new(Vec::new()),
             trap: false,
             num_params: 0,
             is_vararg: false,

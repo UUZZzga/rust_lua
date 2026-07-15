@@ -201,7 +201,8 @@ struct CallerContext {
     code: Rc<Vec<crate::objects::Instruction>>,
     constants: Rc<Vec<TValue>>,
     upval_descs: Rc<Vec<crate::objects::UpvalDesc>>,
-    protos: Vec<Rc<crate::objects::Proto>>,
+    /// 调用者子原型列表 — Rc 共享，save/restore 时 O(1) 引用计数
+    protos: Rc<Vec<Rc<crate::objects::Proto>>>,
     base: usize,
     pc: usize,
     top: usize,
@@ -1209,7 +1210,7 @@ fn close_suspended_coroutine(
         ctx.saved_code = Rc::new(Vec::new());
         ctx.saved_constants = Rc::new(Vec::new());
         ctx.saved_upval_descs = Rc::new(Vec::new());
-        ctx.saved_protos = Vec::new();
+        ctx.saved_protos = Rc::new(Vec::new());
         ctx.saved_closure_upvals = Vec::new();
         ctx.saved_call_stack = Vec::new();
         ctx.saved_stack = Vec::new();
@@ -1749,7 +1750,7 @@ fn setup_first_resume(
         state.code = Rc::new(vec![call_inst, return_inst]);
         state.constants = Rc::new(Vec::new());
         state.upval_descs = Rc::new(Vec::new());
-        state.protos = Vec::new();
+        state.protos = Rc::new(Vec::new());
         state.base = 1;
         state.pc = 0;
         state.num_params = nargs as u8;

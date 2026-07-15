@@ -754,8 +754,10 @@ pub struct Proto {
     pub constants: Rc<Vec<TValue>>,
     /// 指令序列 — Rc<Vec> 避免 op_call 中深拷贝
     pub code: Rc<Vec<Instruction>>,
-    /// 子原型
-    pub protos: Vec<Rc<Proto>>,
+    /// 子原型 — Rc<Vec> 避免 op_call 中 O(n) Vec 分配与 Rc 指针数组深拷贝
+    /// （op_call 调用频度高，原 `proto.protos.clone()` 每次都 malloc 新 Vec；
+    ///  改为 Rc 共享后变为 O(1) 引用计数；编译期通过 Rc::make_mut 独占修改）
+    pub protos: Rc<Vec<Rc<Proto>>>,
     /// 上值描述 — Rc<Vec> 避免 op_call 中深拷贝
     pub upvalues: Rc<Vec<UpvalDesc>>,
     /// 行号差值数组
@@ -834,7 +836,8 @@ pub struct CallFrame {
     pub code: Rc<Vec<Instruction>>,
     pub constants: Rc<Vec<TValue>>,
     pub upval_descs: Rc<Vec<UpvalDesc>>,
-    pub protos: Vec<Rc<Proto>>,
+    /// 子原型列表 — Rc 共享，op_call 保存调用现场时 O(1) 引用计数（perf: 消除 Vec 分配）
+    pub protos: Rc<Vec<Rc<Proto>>>,
     pub base: usize,
     pub return_pc: usize,
     pub return_base: usize,
@@ -861,7 +864,8 @@ pub struct ThreadContext {
     pub saved_code: Rc<Vec<Instruction>>,
     pub saved_constants: Rc<Vec<TValue>>,
     pub saved_upval_descs: Rc<Vec<UpvalDesc>>,
-    pub saved_protos: Vec<Rc<Proto>>,
+    /// 协程挂起时保存的子原型列表 — Rc 共享，yield/resume 时 O(1) 引用计数
+    pub saved_protos: Rc<Vec<Rc<Proto>>>,
     pub saved_base: usize,
     pub saved_pc: usize,
     pub saved_top: usize,
@@ -1987,7 +1991,7 @@ mod tests {
             last_line_defined: 0,
             constants: Rc::new(vec![]),
             code: Rc::new(vec![]),
-            protos: vec![],
+            protos: Rc::new(vec![]),
             upvalues: Rc::new(vec![]),
             line_info: vec![],
             abs_line_info: vec![],
