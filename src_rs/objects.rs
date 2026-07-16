@@ -608,6 +608,66 @@ pub struct TableData {
     pub metatable: Option<Box<Table>>,
 }
 
+impl Drop for TableData {
+    /// 迭代式释放，避免长链表等递归结构导致栈溢出。
+    ///
+    /// 编译器自动生成的 Drop 会递归释放 array/hash_buckets 中的 TValue::Table，
+    /// 当 Table 通过 `next` 等字段形成长链表时（如 400K+ 节点），递归深度超过
+    /// 主线程 8MB 栈限制导致栈溢出。
+    ///
+    /// 此实现将所有子 Table 引用收集到 pending 列表，然后迭代处理：
+    /// - 独占引用（Rc::strong_count == 1）：取出 TableData 并继续收集子 Table
+    /// - 共享引用：减少 Rc 引用计数，由其他持有者负责释放
+    fn drop(&mut self) {
+        fn extract(v: TValue, pending: &mut Vec<Table>) {
+            if let TValue::Table(t) = v {
+                pending.push(t);
+            }
+        }
+
+        // 取走所有字段，避免编译器自动生成的 Drop 递归处理
+        let mut pending: Vec<Table> = Vec::new();
+
+        for v in self.array.drain(..) {
+            extract(v, &mut pending);
+        }
+        for (k, v) in self.hash_buckets.drain(..) {
+            extract(k, &mut pending);
+            extract(v, &mut pending);
+        }
+        if let Some(ktb) = self.key_to_bucket.take() {
+            for (k, _) in *ktb {
+                extract(k, &mut pending);
+            }
+        }
+        if let Some(mt) = self.metatable.take() {
+            pending.push(*mt);
+        }
+
+        // 迭代释放独占引用的 Table，避免递归 Drop
+        while let Some(t) = pending.pop() {
+            if let Ok(ref_cell) = Rc::try_unwrap(t.data) {
+                let mut td = ref_cell.into_inner();
+                for v in td.array.drain(..) {
+                    extract(v, &mut pending);
+                }
+                for (k, v) in td.hash_buckets.drain(..) {
+                    extract(k, &mut pending);
+                    extract(v, &mut pending);
+                }
+                if let Some(ktb) = td.key_to_bucket.take() {
+                    for (k, _) in *ktb {
+                        extract(k, &mut pending);
+                    }
+                }
+                if let Some(mt) = td.metatable.take() {
+                    pending.push(*mt);
+                }
+            }
+        }
+    }
+}
+
 /// Lua 表 —— 关联数组，包含数组部分和哈希部分。
 ///
 /// 数据字段包装在 `Rc<RefCell<TableData>>` 中，克隆 `Table` 时共享同一份数据，

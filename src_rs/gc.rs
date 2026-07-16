@@ -879,10 +879,13 @@ impl GCState {
 
     pub fn set_obj_size(&self, id: GCObjectId, size: usize) {
         if let Some(mut meta) = self.meta_mut(id) {
-            let old = meta.size;
+            // 用 .max(64) 保持与 register_object/sweep_unreachable 一致的 charge 口径
+            // 否则当 old < 64 时，register 收取 64 但此处只按 old 调整，导致 gc_estimate 虚高
+            let old_charged = meta.size.max(64);
+            let new_charged = size.max(64);
             meta.size = size;
             let estimate = self.gc_estimate.get();
-            self.gc_estimate.set(estimate + size - old);
+            self.gc_estimate.set(estimate + new_charged - old_charged);
         }
     }
 

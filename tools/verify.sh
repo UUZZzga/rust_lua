@@ -67,6 +67,25 @@ echo "Running project..."
 export LUA_PATH="tests_lua/?.lua;./?.lua;./?/init.lua"
 export LUA_EXEC="./target/release/lua"
 
+# 测试时限制内存为 512MB
+ulimit -v 512000
+
+for test_file in tests_lua/gc_linkedlist_diag.lua tests_lua/gc_linkedlist_test.lua; do
+    test_name=$(basename "$test_file")
+    log_name="logs/${test_name%.lua}_run.log"
+    echo "Running $test_name ..."
+    timeout 30 $LUA_EXEC "$test_file" > "$log_name" 2>&1 < /dev/null
+    RUN_EXIT=$?
+    if [ $RUN_EXIT -ne 0 ]; then
+        if [ $RUN_EXIT -eq 124 ]; then
+            echo "Timeout: $test_name use LUA_VM_TRACE=1 to debug"
+        fi
+        echo "ERROR: $test_name failed (exit code $RUN_EXIT)!"
+        echo "Check $log_name for details"
+        exit 2
+    fi
+done
+
 # 测试时限制内存为 200MB
 ulimit -v 204800
 
