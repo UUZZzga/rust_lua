@@ -544,6 +544,9 @@ mod tests {
             warn_pending: false,
             gc_closing: false,
             exit_requested: None,
+            cached_mode_key: std::cell::RefCell::new(None),
+            cached_gc_key: std::cell::RefCell::new(None),
+            last_gc_estimate: 0,
         }
     }
 

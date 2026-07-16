@@ -313,6 +313,14 @@ pub struct LuaState {
     /// 使 __close 中的 yield 失败（对应 nny > 0 场景）。
     /// call_resume 开始时清除。
     pub force_noyield_close: bool,
+    /// GC 标记阶段缓存的 "__mode" 字符串键 — 避免每次 mark_tvalue 都 intern_str
+    /// （perf: mark_tvalue 中 __mode 查找占 ~2%）
+    pub cached_mode_key: std::cell::RefCell<Option<LuaString>>,
+    /// GC finalizer 阶段缓存的 "__gc" 字符串键 — 避免每次 collect_finalizers/call_finalizers 都 intern_str
+    pub cached_gc_key: std::cell::RefCell<Option<LuaString>>,
+    /// 上次 GC 后的 gc_estimate 快照 — 用于判断 malloc_trim 是否值得调用
+    /// （仅当释放了大量内存时才 trim，避免每次 GC 都做系统调用）
+    pub last_gc_estimate: usize,
 }
 
 /// 调用栈条目 — 用于堆栈回溯和 debug.getinfo
@@ -456,6 +464,9 @@ impl LuaState {
             last_close_frame: None,
             close_error_status: None,
             force_noyield_close: false,
+            cached_mode_key: std::cell::RefCell::new(None),
+            cached_gc_key: std::cell::RefCell::new(None),
+            last_gc_estimate: 0,
         }
     }
 
@@ -646,6 +657,9 @@ impl LuaState {
             last_close_frame: None,
             close_error_status: None,
             force_noyield_close: false,
+            cached_mode_key: std::cell::RefCell::new(None),
+            cached_gc_key: std::cell::RefCell::new(None),
+            last_gc_estimate: 0,
         };
         state
     }
@@ -786,6 +800,9 @@ impl LuaState {
             last_close_frame: None,
             close_error_status: None,
             force_noyield_close: false,
+            cached_mode_key: std::cell::RefCell::new(None),
+            cached_gc_key: std::cell::RefCell::new(None),
+            last_gc_estimate: 0,
         }
     }
 }
@@ -2537,6 +2554,28 @@ impl LuaState {
         str_to_ls(&self.string_table, s)
     }
 
+    /// 获取缓存的 "__mode" 字符串键（用于 GC mark_tvalue/process_ephemerons）
+    /// 第一次调用时 intern 并缓存，后续直接返回缓存值。
+    /// 避免每次 mark_tvalue 都做 hash+查找（perf: 节省 ~2%）
+    fn mode_key_cached(&self) -> LuaString {
+        if let Some(ref k) = *self.cached_mode_key.borrow() {
+            return k.clone();
+        }
+        let k = self.intern_str("__mode");
+        *self.cached_mode_key.borrow_mut() = Some(k.clone());
+        k
+    }
+
+    /// 获取缓存的 "__gc" 字符串键（用于 GC collect_finalizers/call_finalizers）
+    fn gc_key_cached(&self) -> LuaString {
+        if let Some(ref k) = *self.cached_gc_key.borrow() {
+            return k.clone();
+        }
+        let k = self.intern_str("__gc");
+        *self.cached_gc_key.borrow_mut() = Some(k.clone());
+        k
+    }
+
     // ====== 弱引用表管理 ======
 
     /// 注册弱引用表 — 当 setmetatable 设置包含 __mode 的元表时调用
@@ -2588,7 +2627,7 @@ impl LuaState {
         visited: &mut GcHashSet,
         worklist: &mut Vec<TValue>,
     ) {
-        let mode_key = TValue::Str(self.intern_str("__mode"));
+        let mode_key = TValue::Str(self.mode_key_cached());
         let mut changed = true;
         while changed {
             changed = false;
@@ -2653,7 +2692,7 @@ impl LuaState {
     /// 清理弱引用表 — 在 collect_gc 标记完成后、sweep 之前调用
     /// 基于 GC reachable 集合判断键/值是否死亡，清除死亡的弱引用条目
     fn clear_weak_tables(&mut self, reachable: &GcHashSet) {
-        let mode_key = TValue::Str(self.intern_str("__mode"));
+        let mode_key = TValue::Str(self.mode_key_cached());
         let mut i = 0;
         while i < self.weak_tables.len() {
             match self.weak_tables[i].upgrade() {
@@ -2767,6 +2806,7 @@ impl LuaState {
         let saved_allowhook = self.allowhook;
         self.allowhook = false;
 
+        let prev_estimate = self.gc.gc_estimate.get();
         let result = self.collect_gc_inner();
 
         // 恢复 hook 状态
@@ -2774,18 +2814,33 @@ impl LuaState {
         // 清除标志
         self.gc.gc_running.set(false);
         // GC 回收对象后，Rust 分配器（glibc malloc）可能仍持有释放的内存不归还操作系统。
-        // malloc_trim(0) 强制分配器将所有未使用的堆内存归还操作系统，避免在 200MB
-        // 限制下因碎片化导致大分配失败（big.lua 的 48MB Vec 倍增分配）。
-        unsafe {
-            libc::malloc_trim(0);
+        // malloc_trim(0) 是系统调用，开销较大（perf 显示 ~1.5%）。
+        // 仅当释放了大量内存（>1MB）时才调用，避免在小 GC 中浪费。
+        let cur_estimate = self.gc.gc_estimate.get();
+        if prev_estimate > cur_estimate + 1024 * 1024 {
+            unsafe {
+                libc::malloc_trim(0);
+            }
         }
+        self.last_gc_estimate = cur_estimate;
         result
     }
 
     fn collect_gc_inner(&mut self) {
-        let mut reachable: GcHashSet = GcHashSet::default();
-        let mut visited: GcHashSet = GcHashSet::default();
-        let mut worklist: Vec<TValue> = Vec::new();
+        let active = self.gc.active_count();
+        // 预分配可达集容量 — 估计可达对象约为活跃对象的 60%（其余是垃圾）
+        // 过大预分配会增加内存压力（500K 对象 * 8B = 4MB/集），反而变慢
+        let est_reachable = (active * 3 / 5).max(64);
+        let mut reachable: GcHashSet = GcHashSet::with_capacity_and_hasher(
+            est_reachable,
+            FxBuildHasher::default(),
+        );
+        let mut visited: GcHashSet = GcHashSet::with_capacity_and_hasher(
+            est_reachable,
+            FxBuildHasher::default(),
+        );
+        // worklist 预分配为估计可达对象的 2 倍（根 + 一层引用）
+        let mut worklist: Vec<TValue> = Vec::with_capacity(est_reachable * 2);
 
         // 收集根：栈 — 遍历到 self.top（对应 C Lua 的 traversethread: o < th->top）
         // self.top 在 OP_CALL 中被设为 ra + b（函数+参数末尾），
@@ -2919,23 +2974,29 @@ impl LuaState {
         self.gc.set_debt(100);
         self.gc.step_accum.set(0);
     }
-    /// 增量 GC 步进：累加 siz 工作量，达到当前对象数时触发完整 GC 并返回 true
+    /// 增量 GC 步进
+    /// - siz=0: 无参数 collectgarbage("step")，C Lua 强制执行一步基本 GC。
+    ///   generational 模式下一步 = minor collection（清除弱表等）。
+    ///   本实现未实现 minor collection，故做 full collection 保证语义正确
+    ///   （gengc.lua:122 依赖 step 清除弱表）。
+    /// - siz>0: 带参数 collectgarbage("step", N)，增量累积 N 字节工作量，
+    ///   达到 active_count 阈值才触发完整 GC。大多数 step 只累积不触发，P95 接近 0。
     pub fn step_gc(&mut self, siz: usize) -> bool {
-        // generational 模式下未实现 minor collection，直接做 full collection
-        // 以保证 weak table 清除等语义正确（对应 C Lua genstep 中的 youngcollection + cleartable）
-        if self.gc.current_mode() == crate::gc::GCMode::Generational {
+        if siz == 0 {
             self.collect_gc();
-            return true;
-        }
-        let n = siz.max(1);
-        let acc = self.gc.step_accum.get() + n;
-        let threshold = self.gc.active_count().max(1);
-        if acc >= threshold {
-            self.collect_gc();
+            self.gc.step_accum.set(0);
             true
         } else {
-            self.gc.step_accum.set(acc);
-            false
+            let acc = self.gc.step_accum.get() + siz;
+            let threshold = self.gc.active_count().max(1);
+            if acc >= threshold {
+                self.collect_gc();
+                self.gc.step_accum.set(0);
+                true
+            } else {
+                self.gc.step_accum.set(acc);
+                false
+            }
         }
     }
 
@@ -2951,7 +3012,7 @@ impl LuaState {
         visited: &mut GcHashSet,
         worklist: &mut Vec<TValue>,
     ) -> Vec<TValue> {
-        let gc_key = TValue::Str(self.intern_str("__gc"));
+        let gc_key = TValue::Str(self.gc_key_cached());
         let mut to_finalize: Vec<TValue> = Vec::new();
         let mut keep: Vec<Table> = Vec::new();
 
@@ -3017,7 +3078,7 @@ impl LuaState {
     /// open upvalue 被关闭，finalizer 修改 closed upvalue 的值不会自动同步回
     /// 主线程栈上的原始位置，需要在此手动同步（通过协程的 upval_origins 记录）。
     fn call_finalizers(&mut self, to_finalize: Vec<TValue>) {
-        let gc_key = TValue::Str(self.intern_str("__gc"));
+        let gc_key = TValue::Str(self.gc_key_cached());
 
         // 构建 upval_origins 映射：UpVal Rc 指针 -> original_stack_index
         // 遍历主线程栈上的所有协程，收集它们的 upval_origins（首次 resume 时记录）
@@ -3260,7 +3321,7 @@ impl LuaState {
                     let data = t.data.borrow();
                     let (weak_k, weak_v) = match &data.metatable {
                         Some(mt) => {
-                            let mode_key = TValue::Str(self.intern_str("__mode"));
+                            let mode_key = TValue::Str(self.mode_key_cached());
                             match mt.get(&mode_key) {
                                 Some(TValue::Str(s)) => {
                                     let mode = s.as_str();
@@ -3285,7 +3346,12 @@ impl LuaState {
                         }
                     }
                     if let Some(ref mt) = data.metatable {
-                        worklist.push(TValue::Table((**mt).clone()));
+                        // 提前检查 visited，避免已访问的 metatable 被 push/pop
+                        // （多表共享同一 metatable 时显著减少 worklist 操作）
+                        let mt_ptr = mt.gc_header.ptr_id as usize;
+                        if !visited.contains(&mt_ptr) {
+                            worklist.push(TValue::Table((**mt).clone()));
+                        }
                     }
                 }
             }
@@ -3323,7 +3389,10 @@ impl LuaState {
                 let ptr_id = u.gc_header.ptr_id;
                 if visited.insert(ptr_id as usize) {
                     if let Some(ref mt) = u.metatable {
-                        worklist.push(TValue::Table((**mt).clone()));
+                        let mt_ptr = mt.gc_header.ptr_id as usize;
+                        if !visited.contains(&mt_ptr) {
+                            worklist.push(TValue::Table((**mt).clone()));
+                        }
                     }
                     for uv in &u.user_values {
                         if Self::needs_gc_mark(uv) {
