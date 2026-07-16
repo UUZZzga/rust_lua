@@ -60,5 +60,5 @@ lto = true
 codegen-units = 1
 debug = false
 strip = "symbols"
-panic = "abort"
+panic = "unwind"
 overflow-checks = false

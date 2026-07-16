@@ -34,11 +34,13 @@ fn main() {
         variadic_build
             .file(rs_src_dir.join("capi_variadic.c"))
             .flag("-Wall")
-            .flag("-Wextra");
+            .flag("-Wextra")
+            .flag("-fexceptions");
         variadic_build.compile("lua_rs_variadic");
 
         println!("cargo:rustc-link-arg=-Wl,--undefined=lua_pushfstring");
         println!("cargo:rustc-link-arg=-Wl,--undefined=lua_pushvfstring");
+        println!("cargo:rustc-link-arg=-Wl,--undefined=luaL_error");
         return;
     }
 

@@ -16,3 +16,21 @@ Cargo.lock
 /*.swp
 /*.swo
 /tests_lua/libs/*.so
+
+# 构建产物和临时文件
+librust_out.rlib
+luac.out
+perf.data
+perf.data.*
+tests_lua/time.txt
+
+# deps/ 第三方依赖（源码、缓存、构建产物均不入库，由 deps/fetch.sh + deps/Makefile 重建）
+/deps/src/
+/deps/build/
+/deps/lib/
+/deps/cache/
+/deps/luarocks-root/
+/deps/luarocks-config.lua
+/deps/*.tar.gz
+/deps/*.zip
+/deps/.test_*.log
