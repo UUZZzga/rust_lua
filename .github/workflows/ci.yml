@@ -1,0 +1,135 @@
+name: CI
+
+# 构建 + 测试：Rust lua、C lua、依赖库，然后运行 deps/test.sh、tools/verify.sh、tools/gc_bench_run.sh
+#
+# 测试脚本:
+#   - deps/test.sh          依赖库测试 (lua-cjson/luasocket/lsqlite3/luarocks/sol2)
+#   - tools/verify.sh        编译器比对 + cargo test + tests_lua 全套
+#   - tools/gc_bench_run.sh  GC 性能对比 (C vs Rust)
+#
+# 缓存:
+#   - Cargo:        Swatinem/rust-cache (target/ + ~/.cargo)
+#   - CMake build/: actions/cache (C 实现增量构建)
+#   - deps sources: actions/cache (deps/cache 下载档 + deps/src 解压源码，避免重复下载)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+# 同一分支新推送时取消旧的运行
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake build-essential curl unzip perl ca-certificates
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # ----------------------------------------------------------------------
+      # 缓存
+      # ----------------------------------------------------------------------
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Cache CMake build
+        uses: actions/cache@v4
+        with:
+          path: build
+          key: cmake-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'src/*.cpp', 'src/*.h', 'src/*.hpp') }}
+          restore-keys: |
+            cmake-${{ runner.os }}-
+
+      # 缓存依赖库下载档 + 解压源码（fetch.sh 与 setup.sh 已对已存在内容跳过）
+      # 不缓存 deps/build 与 deps/lib：它们依赖当前 lua 头文件与 liblua_rs.a，
+      # 每次重新编译很快，且能保证与当前 Rust lua ABI 一致。
+      - name: Cache deps sources
+        uses: actions/cache@v4
+        with:
+          path: |
+            deps/cache
+            deps/src
+          key: deps-${{ runner.os }}-${{ hashFiles('deps/fetch.sh', 'deps/Makefile', 'deps/setup.sh') }}
+          restore-keys: |
+            deps-${{ runner.os }}-
+
+      # ----------------------------------------------------------------------
+      # 1. 构建 Rust lua (target/release/lua + liblua_rs.a)
+      # ----------------------------------------------------------------------
+      - name: Build Rust lua
+        run: cargo build --release
+
+      - name: Verify Rust lua artifacts
+        run: |
+          test -x target/release/lua
+          test -f target/release/liblua_rs.a
+
+      # ----------------------------------------------------------------------
+      # 2. 构建 C lua (build/lua) — verify.sh 与 gc_bench_run.sh 需要
+      # ----------------------------------------------------------------------
+      - name: Build C lua
+        run: |
+          cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel "$(nproc)"
+
+      - name: Verify C lua artifacts
+        run: test -x build/lua
+
+      # ----------------------------------------------------------------------
+      # 3. 构建依赖库 (deps/setup.sh: 下载 + sol2 补丁 + 编译 C 模块)
+      # ----------------------------------------------------------------------
+      - name: Setup deps
+        run: bash deps/setup.sh
+
+      # ----------------------------------------------------------------------
+      # 4. 测试一: deps/test.sh (依赖库测试)
+      # ----------------------------------------------------------------------
+      - name: Run deps tests
+        run: bash deps/test.sh
+
+      # ----------------------------------------------------------------------
+      # 5. 测试二: tools/verify.sh (编译器比对 + cargo test + tests_lua)
+      #    注: verify.sh 内部使用 systemd-run --user; 在 CI 中自动降级为直接运行
+      # ----------------------------------------------------------------------
+      - name: Run verify tests
+        run: bash tools/verify.sh
+
+      # ----------------------------------------------------------------------
+      # 6. 测试三: tools/gc_bench_run.sh (GC 性能对比)
+      # ----------------------------------------------------------------------
+      - name: Run GC bench
+        run: bash tools/gc_bench_run.sh --diff
+
+      # ----------------------------------------------------------------------
+      # 失败时上传日志（verify.sh 写 logs/, deps/test.sh 写 logs/）
+      # ----------------------------------------------------------------------
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-logs-${{ github.run_id }}
+          path: |
+            logs/
+            /tmp/gc_bench_c.txt
+            /tmp/gc_bench_rs.txt
+          if-no-files-found: ignore
+          retention-days: 7

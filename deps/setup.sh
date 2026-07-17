@@ -43,8 +43,9 @@ need unzip
 need make
 
 # systemd-run 包装（绕过内存限制，遵守 CLAUDE.md 规则）
+# 在无 user systemd 会话的环境（如 GitHub Actions CI）中自动降级为直接运行
 run_unlimited() {
-    if command -v systemd-run >/dev/null 2>&1; then
+    if command -v systemd-run >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
         systemd-run --user --wait --collect --pipe \
             --property=LimitAS=infinity \
             --working-directory="$PROJECT_ROOT" \

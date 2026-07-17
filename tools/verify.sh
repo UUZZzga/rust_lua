@@ -5,11 +5,16 @@ echo "Running verification tests..."
 mkdir -p logs
 
 # 构建命令包装：用 systemd-run 绕过内存限制（CLAUDE.md 规则）
+# 在无 user systemd 会话的环境（如 GitHub Actions CI）中自动降级为直接运行
 run_build() {
-    systemd-run --user --wait --collect --pipe \
-        --property=LimitAS=infinity \
-        --working-directory="$(pwd)" \
+    if command -v systemd-run >/dev/null 2>&1 && systemctl --user status >/dev/null 2>&1; then
+        systemd-run --user --wait --collect --pipe \
+            --property=LimitAS=infinity \
+            --working-directory="$(pwd)" \
+            "$@"
+    else
         "$@"
+    fi
 }
 
 # 1. 执行编译器比对测试
