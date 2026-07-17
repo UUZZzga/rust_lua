@@ -166,7 +166,8 @@ sol2: $(SOL2_SMOKETEST)
 # --- Phony targets --------------------------------------------------------
 .PHONY: all clean cjson luasocket lsqlite3 sol2
 
-all: $(ALL_TARGETS) sol2
+# 依赖 phony targets 而非 .so 文件目标，确保 luasocket 的 cp（安装 Lua 文件）被执行
+all: cjson luasocket lsqlite3 sol2
 	@echo "=== Build complete ==="
 	@ls -la $(DEPS_LIB)/
 

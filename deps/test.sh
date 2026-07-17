@@ -160,11 +160,20 @@ fi
 # ============================================================================
 # 3. lsqlite3
 # ============================================================================
+# tests-sqlite3.lua 位置因来源不同：
+#   - fossil zip (lsqlite3_v097.zip): 解压后在 test/ 子目录
+#   - git clone: 在根目录
 LSQLITE3_TESTS="$SCRIPT_DIR/src/lsqlite3"
+LSQLITE3_TEST_DIR=""
 if [[ -f "$LSQLITE3_TESTS/tests-sqlite3.lua" ]]; then
-    run_lua_test "lsqlite3/tests-sqlite3.lua" "$LSQLITE3_TESTS" tests-sqlite3.lua
+    LSQLITE3_TEST_DIR="$LSQLITE3_TESTS"
+elif [[ -f "$LSQLITE3_TESTS/test/tests-sqlite3.lua" ]]; then
+    LSQLITE3_TEST_DIR="$LSQLITE3_TESTS/test"
 else
     fail "lsqlite3 (源码缺失: $LSQLITE3_TESTS)"
+fi
+if [[ -n "$LSQLITE3_TEST_DIR" ]]; then
+    run_lua_test "lsqlite3/tests-sqlite3.lua" "$LSQLITE3_TEST_DIR" tests-sqlite3.lua
 fi
 
 # ============================================================================
