@@ -130,7 +130,61 @@ apply_sol2_patch() {
 apply_sol2_patch
 
 # ============================================================================
-# 4. 编译 C 模块 (cjson, luasocket, lsqlite3, sol2 smoke test)
+# 4. 生成 lsqlite3 Lua 5.5 兼容头文件
+# ============================================================================
+# lsqlite3 v0.9.7 使用了 luaL_reg/luaL_typerror/luaL_openlib/luaL_register 等
+# Lua 5.1/5.2 旧 API，在 Lua 5.5 中已移除。lua_compat.h 提供这些宏的兼容实现，
+# 由 Makefile 的 -include 强制注入。该文件不在 lsqlite3_v097.zip 中，需手动生成。
+LSQLITE3_SRC_DIR="$SCRIPT_DIR/src/lsqlite3"
+ensure_lsqlite3_compat() {
+    local compat_h="$LSQLITE3_SRC_DIR/lua_compat.h"
+    if [[ -f "$compat_h" ]]; then
+        ok "lsqlite3 lua_compat.h 已存在（跳过）"
+        return 0
+    fi
+    log "生成 lsqlite3 lua_compat.h ..."
+    cat > "$compat_h" <<'EOF'
+/* Lua 5.1/5.2 compatibility defines for lsqlite3 when built against Lua 5.5 */
+#ifndef LUA_COMPAT_H
+#define LUA_COMPAT_H
+
+/* luaL_reg was renamed to luaL_Reg in Lua 5.2 */
+#ifndef luaL_reg
+#define luaL_reg luaL_Reg
+#endif
+
+/* luaL_typerror was removed in Lua 5.3; use luaL_typeerror (same signature) */
+#define luaL_typerror(L, n, t) luaL_typeerror(L, n, t)
+
+/* luaL_openlib with NULL name: just sets functions on the table at stack top */
+#define luaL_openlib(L, name, reg, nup) \
+    do { \
+        if (name) { \
+            luaL_newlib(L, reg); \
+        } else { \
+            luaL_setfuncs(L, reg, nup); \
+        } \
+    } while (0)
+
+/* luaL_register was removed in Lua 5.2.
+ * Original behavior: create/open module table, set functions, push it,
+ * set package.loaded[name] = table, set _G[name] = table.
+ * Our compat: create new table, set functions, leave on stack,
+ * set global name to it so require() can find it. */
+#define luaL_register(L, name, reg) \
+    do { \
+        luaL_newlib(L, reg); \
+        lua_pushvalue(L, -1); \
+        lua_setglobal(L, name); \
+    } while (0)
+#endif /* LUA_COMPAT_H */
+EOF
+    ok "lsqlite3 lua_compat.h 已生成: $compat_h"
+}
+ensure_lsqlite3_compat
+
+# ============================================================================
+# 5. 编译 C 模块 (cjson, luasocket, lsqlite3, sol2 smoke test)
 # ============================================================================
 log "编译 C/C++ 模块 (make all)..."
 # make 不需要绕过内存限制（编译单个 .so 内存占用小）
@@ -138,7 +192,7 @@ make -C "$SCRIPT_DIR" all
 ok "C/C++ 模块编译完成"
 
 # ============================================================================
-# 5. 配置 luarocks（生成配置文件，便于 test.sh 使用）
+# 6. 配置 luarocks（生成配置文件，便于 test.sh 使用）
 # ============================================================================
 LUAROCKS_SRC="$SCRIPT_DIR/src/luarocks-3.13.0"
 LUAROCKS_CONFIG="$SCRIPT_DIR/luarocks-config.lua"
