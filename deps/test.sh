@@ -18,6 +18,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
+# 失败测试日志目录
+LOGS_DIR="$PROJECT_ROOT/logs"
+mkdir -p "$LOGS_DIR"
+
 # 颜色输出
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -32,6 +36,21 @@ FAILED_TESTS=()
 log()  { echo -e "${BLUE}[test]${NC} $*"; }
 ok()   { echo -e "${GREEN}[PASS]${NC} $*"; PASS=$((PASS+1)); }
 fail() { echo -e "${RED}[FAIL]${NC} $*"; FAIL=$((FAIL+1)); FAILED_TESTS+=("$1"); }
+
+# 将测试名转换为合法文件名（替换 / 为 _）
+sanitize_name() { echo "$1" | tr '/' '_'; }
+
+# 保存失败测试的完整日志到 logs/ 目录
+# 用法: save_fail_log <test_name> <tmp_log_file>
+save_fail_log() {
+    local test_name="$1"
+    local tmp_log="$2"
+    local saved="$LOGS_DIR/deps_$(sanitize_name "$test_name").log"
+    if [[ -f "$tmp_log" ]]; then
+        cp "$tmp_log" "$saved"
+        echo -e "    ${YELLOW}完整日志已保存: $saved${NC}"
+    fi
+}
 
 # ============================================================================
 # 前置检查
@@ -74,9 +93,11 @@ run_lua_test() {
     elif [[ $rc -eq 124 ]]; then
         fail "$name (超时)"
         tail -10 "$SCRIPT_DIR/.test_$$.log" 2>/dev/null | sed 's/^/    /'
+        save_fail_log "$name" "$SCRIPT_DIR/.test_$$.log"
     else
         fail "$name (退出码 $rc)"
         tail -20 "$SCRIPT_DIR/.test_$$.log" 2>/dev/null | sed 's/^/    /'
+        save_fail_log "$name" "$SCRIPT_DIR/.test_$$.log"
     fi
     rm -f "$SCRIPT_DIR/.test_$$.log"
 }
@@ -93,9 +114,11 @@ run_bin_test() {
         cat "$SCRIPT_DIR/.test_$$.log" 2>/dev/null | sed 's/^/    /'
     elif [[ $rc -eq 124 ]]; then
         fail "$name (超时)"
+        save_fail_log "$name" "$SCRIPT_DIR/.test_$$.log"
     else
         fail "$name (退出码 $rc)"
         tail -20 "$SCRIPT_DIR/.test_$$.log" 2>/dev/null | sed 's/^/    /'
+        save_fail_log "$name" "$SCRIPT_DIR/.test_$$.log"
     fi
     rm -f "$SCRIPT_DIR/.test_$$.log"
 }
@@ -156,6 +179,7 @@ if [[ -d "$LUAROCKS_SRC" ]]; then
     else
         fail "luarocks/--version"
         cat "$SCRIPT_DIR/.test_$$.log" 2>/dev/null | sed 's/^/    /'
+        save_fail_log "luarocks_version" "$SCRIPT_DIR/.test_$$.log"
     fi
     rm -f "$SCRIPT_DIR/.test_$$.log"
 
@@ -167,6 +191,7 @@ if [[ -d "$LUAROCKS_SRC" ]]; then
     else
         # luarocks list 在未配置 rocks_trees 时可能报错，降级为警告
         echo -e "${YELLOW}[warn]${NC} luarocks/list (非致命，可能缺少配置)"
+        save_fail_log "luarocks_list" "$SCRIPT_DIR/.test_$$.log"
         PASS=$((PASS+1))
     fi
     rm -f "$SCRIPT_DIR/.test_$$.log"
@@ -198,6 +223,9 @@ if [[ $FAIL -gt 0 ]]; then
     for t in "${FAILED_TESTS[@]}"; do
         echo "  - $t"
     done
+    echo
+    echo -e "${YELLOW}失败日志已保存到: $LOGS_DIR/${NC}"
+    echo -e "${YELLOW}  (文件名格式: deps_<测试名>.log)${NC}"
     exit 1
 fi
 echo

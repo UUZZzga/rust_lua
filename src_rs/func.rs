@@ -547,6 +547,7 @@ mod tests {
             cached_mode_key: std::cell::RefCell::new(None),
             cached_gc_key: std::cell::RefCell::new(None),
             last_gc_estimate: 0,
+            c_safety_keepalive: Vec::new(),
         }
     }
 

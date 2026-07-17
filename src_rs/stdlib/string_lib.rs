@@ -909,14 +909,9 @@ fn get_captures(ms: &MatchState<'_>, s: usize, e: usize) -> Result<Vec<TValue>, 
         match cap {
             CaptureResult::Str(start, len) => {
                 let bytes = &ms.src[start..start + len];
-                // Lua 字符串是字节序列，使用 from_utf8_unchecked 保留原始字节
-                let s = unsafe { String::from_utf8_unchecked(bytes.to_vec()) };
-                result.push(TValue::Str(crate::strings::LuaString::Short(Arc::new(
-                    crate::strings::ShortString {
-                        hash: 0,
-                        contents: s,
-                    },
-                ))));
+                result.push(TValue::Str(crate::strings::new_short_bytes(
+                    bytes.to_vec(),
+                )));
             }
             CaptureResult::Pos(pos) => {
                 result.push(TValue::Integer(pos as i64));
@@ -1024,13 +1019,8 @@ pub fn str_match(s: &str, pattern: &str, init: i64) -> Result<Vec<TValue>, Strin
             if captures.is_empty() {
                 // 无捕获时返回整个匹配
                 let matched = &s.as_bytes()[start - 1..end];
-                // Lua 字符串是字节序列，使用 from_utf8_unchecked 保留原始字节
-                let matched_str = unsafe { String::from_utf8_unchecked(matched.to_vec()) };
-                Ok(vec![TValue::Str(crate::strings::LuaString::Short(
-                    Arc::new(crate::strings::ShortString {
-                        hash: 0,
-                        contents: matched_str,
-                    }),
+                Ok(vec![TValue::Str(crate::strings::new_short_bytes(
+                    matched.to_vec(),
                 ))])
             } else {
                 Ok(captures)
@@ -1083,15 +1073,8 @@ impl GMatchIterator {
                     };
                     if captures.is_empty() {
                         // 无捕获时返回整个匹配的子串
-                        // Lua 字符串是字节序列，使用 from_utf8_unchecked 保留原始字节
-                        let matched_str = unsafe {
-                            String::from_utf8_unchecked(src_bytes[match_start..end].to_vec())
-                        };
-                        return Ok(vec![TValue::Str(crate::strings::LuaString::Short(
-                            Arc::new(crate::strings::ShortString {
-                                hash: 0,
-                                contents: matched_str,
-                            }),
+                        return Ok(vec![TValue::Str(crate::strings::new_short_bytes(
+                            src_bytes[match_start..end].to_vec(),
                         ))]);
                     }
                     return Ok(captures);
@@ -3055,13 +3038,8 @@ pub fn str_unpack(fmt: &str, data: &[u8], init_pos: i64) -> Result<(Vec<TValue>,
             }
             KOption::Kchar => {
                 let s_bytes = &data[pos..pos + size];
-                // 使用 unsafe 创建包含原始字节的 String (与 str_char 一致)
-                let s = unsafe { String::from_utf8_unchecked(s_bytes.to_vec()) };
-                results.push(TValue::Str(crate::strings::LuaString::Short(
-                    std::sync::Arc::new(crate::strings::ShortString {
-                        hash: 0,
-                        contents: s,
-                    }),
+                results.push(TValue::Str(crate::strings::new_short_bytes(
+                    s_bytes.to_vec(),
                 )));
             }
             KOption::Kstring => {
@@ -3070,12 +3048,8 @@ pub fn str_unpack(fmt: &str, data: &[u8], init_pos: i64) -> Result<(Vec<TValue>,
                     return Err("bad argument #2 to 'unpack' (data string too short)".to_string());
                 }
                 let s_bytes = &data[pos + size..pos + size + len];
-                let s = unsafe { String::from_utf8_unchecked(s_bytes.to_vec()) };
-                results.push(TValue::Str(crate::strings::LuaString::Short(
-                    std::sync::Arc::new(crate::strings::ShortString {
-                        hash: 0,
-                        contents: s,
-                    }),
+                results.push(TValue::Str(crate::strings::new_short_bytes(
+                    s_bytes.to_vec(),
                 )));
                 pos += len; // 跳过字符串
             }
@@ -3106,12 +3080,8 @@ pub fn str_unpack(fmt: &str, data: &[u8], init_pos: i64) -> Result<(Vec<TValue>,
                     );
                 }
                 let s_bytes = &data[rel_pos..zero_idx];
-                let s = unsafe { String::from_utf8_unchecked(s_bytes.to_vec()) };
-                results.push(TValue::Str(crate::strings::LuaString::Short(
-                    std::sync::Arc::new(crate::strings::ShortString {
-                        hash: 0,
-                        contents: s,
-                    }),
+                results.push(TValue::Str(crate::strings::new_short_bytes(
+                    s_bytes.to_vec(),
                 )));
                 pos += len + 1; // 跳过字符串和终止零
             }
@@ -3893,14 +3863,7 @@ pub fn call_string_function(
                         state,
                         a,
                         nresults,
-                        vec![TValue::Str(crate::strings::LuaString::Long(Box::new(
-                            crate::strings::LongString {
-                                contents: unsafe { String::from_utf8_unchecked(data) },
-                                hash: std::sync::atomic::AtomicU64::new(0),
-                                extra: std::sync::atomic::AtomicU8::new(0),
-                                ptr_id: crate::gc::new_ptr_id(),
-                            },
-                        )))],
+                        vec![TValue::Str(crate::strings::new_long_bytes(data))],
                     );
                     Ok(())
                 }

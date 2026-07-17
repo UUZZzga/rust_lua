@@ -2029,7 +2029,7 @@ mod tests {
     fn test_luastring_short() {
         let short = ShortString {
             hash: 0,
-            contents: "hello".into(),
+            contents: LuaString::with_nul("hello"),
         };
         let ts = LuaString::Short(std::sync::Arc::new(short));
         assert_eq!(ts.as_str(), "hello");
@@ -2043,7 +2043,7 @@ mod tests {
         let long = LongString {
             hash: AtomicU64::new(0),
             extra: AtomicU8::new(0),
-            contents: "a".repeat(100),
+            contents: LuaString::with_nul(&"a".repeat(100)),
             ptr_id: 0,
         };
         let ts = LuaString::Long(Box::new(long));
@@ -2055,7 +2055,7 @@ mod tests {
     fn test_luastring_empty() {
         let short = ShortString {
             hash: 0,
-            contents: String::new(),
+            contents: LuaString::with_nul(""),
         };
         let ts = LuaString::Short(std::sync::Arc::new(short));
         assert!(ts.is_empty());
@@ -2067,7 +2067,7 @@ mod tests {
     fn test_luastring_eq() {
         let arc1 = std::sync::Arc::new(ShortString {
             hash: 0,
-            contents: "foo".into(),
+            contents: LuaString::with_nul("foo"),
         });
         let arc2 = std::sync::Arc::clone(&arc1);
         let ts1 = LuaString::Short(arc1);
@@ -2076,7 +2076,7 @@ mod tests {
 
         let arc3 = std::sync::Arc::new(ShortString {
             hash: 1,
-            contents: "bar".into(),
+            contents: LuaString::with_nul("bar"),
         });
         let ts3 = LuaString::Short(arc3);
         assert_ne!(ts1, ts3);
@@ -2084,13 +2084,13 @@ mod tests {
         let long1 = LuaString::Long(Box::new(LongString {
             hash: AtomicU64::new(0),
             extra: AtomicU8::new(0),
-            contents: "test".into(),
+            contents: LuaString::with_nul("test"),
             ptr_id: 0,
         }));
         let long2 = LuaString::Long(Box::new(LongString {
             hash: AtomicU64::new(0),
             extra: AtomicU8::new(0),
-            contents: "test".into(),
+            contents: LuaString::with_nul("test"),
             ptr_id: 0,
         }));
         assert_eq!(long1, long2);
@@ -2100,10 +2100,11 @@ mod tests {
     fn test_luastring_as_str() {
         let short = LuaString::Short(std::sync::Arc::new(ShortString {
             hash: 0,
-            contents: "abc".into(),
+            contents: LuaString::with_nul("abc"),
         }));
         assert_eq!(short.as_str(), "abc");
     }
+
 
     // ========================================================================
     // Proto 测试

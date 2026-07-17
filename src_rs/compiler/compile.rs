@@ -3776,17 +3776,8 @@ fn parse_statement(fs: &mut FuncState) {
             None
         }
         Token::LParen => {
-            // 对应 C 的 exprstat: 只允许函数调用语句或赋值
-            // LParen 开头的表达式可能是 (f)() 函数调用
-            let ei = parse_expr(fs);
-            if ei.exp.kind == ExpKind::Call {
-                fs.set_c(ei.exp.info2, 1);
-            } else {
-                // 对应 C 的 check_condition(ls, v.v.k == VCALL, "syntax error")
-                syntax_error_with_token(fs, "syntax error");
-            }
-            let _r = fs.exp_to_reg(&ei.exp);
-            fs.free_reg();
+            // 对应 C 的 exprstat: (f)() 调用 或 (t).field = 1 赋值
+            parse_assign_or_call(fs);
             if check(fs, &Token::Semi) {
                 fs.ls_mut().next();
             }
@@ -5461,11 +5452,11 @@ fn code_global_via_env_prefix(fs: &mut FuncState, name: &str) -> PrefixResult {
 
 /// ANTLR4: `prefixexp: varOrExp | functioncall | '(' expr ')' ;` 以及 `var: NAME | prefixexp '[' expr ']' | prefixexp '.' NAME ;`
 fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
-    match &fs.ls().token {
+    let mut result = match &fs.ls().token {
         Token::Name(name) => {
             let name = name.clone();
             fs.ls_mut().next();
-            let mut result = if let Some(mut ctc) = fs.find_local_ctc(&name) {
+            if let Some(mut ctc) = fs.find_local_ctc(&name) {
                 let r = fs.alloc_reg();
                 match ctc.kind {
                     ExpKind::Int => {
@@ -5653,495 +5644,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     fs.error(&format!("variable '{}' not declared", name));
                 }
                 code_global_via_env_prefix(fs, &name)
-            };
-
-            loop {
-                match &fs.ls().token {
-                    Token::Dot => {
-                        fs.ls_mut().next();
-                        let field = get_name(fs);
-                        if fs.has_errors() {
-                            break;
-                        }
-                        let k = fs.string_k(&field);
-
-                        // Handle VVARGVAR: like C's luaK_indexed, create VVARGIND-like PrefixResult
-                        // C's luaK_indexed always puts key in a register for VVARGVAR (luaK_exp2anyreg),
-                        // so we always LOADK, never use SETFIELD/GETFIELD with constant index.
-                        if result.is_vvargvar {
-                            let base_reg = result.reg.unwrap();
-                            let kr = fs.alloc_reg();
-                            fs.code_loadk(kr, k);
-                            result = PrefixResult {
-                                var_name: None,
-                                local_idx: None,
-                                key: None,
-                                reg: Some(base_reg),
-                                table_reg: Some(base_reg),
-                                table_key: Some(kr),
-                                table_key_is_const: false,
-                                table_key_is_int: false,
-                                key_allocated_reg: true,
-                                allocated_reg: false,
-                                is_upvalue: false,
-                                upval_idx: None,
-                                env_gettabup_pc: -1,
-                                has_call: false,
-                                call_pc: -1,
-                                is_vvargvar: true,
-                                is_readonly: false,
-                            };
-                            continue;
-                        }
-
-                        if result.table_reg.is_some() {
-                            let prev_table = result.table_reg.unwrap();
-                            let prev_key = result.table_key.unwrap();
-                            if result.table_key_is_int {
-                                if result.allocated_reg {
-                                    fs.free_reg();
-                                }
-                                let r = fs.alloc_reg();
-                                fs.code_abc(OpCode::GETI, r, prev_table, prev_key);
-                                result.reg = Some(r);
-                                result.allocated_reg = true;
-                            } else if result.table_key_is_const {
-                                if result.allocated_reg {
-                                    fs.free_reg();
-                                }
-                                let r = fs.alloc_reg();
-                                code_getfield(fs, r, prev_table, prev_key);
-                                result.reg = Some(r);
-                                result.allocated_reg = true;
-                            } else {
-                                if result.key_allocated_reg {
-                                    fs.free_reg();
-                                }
-                                if result.allocated_reg {
-                                    fs.free_reg();
-                                }
-                                let r = fs.alloc_reg();
-                                fs.code_abc(OpCode::GETTABLE, r, prev_table, prev_key);
-                                result.reg = Some(r);
-                                result.allocated_reg = true;
-                            }
-                            result.table_reg = None;
-                            result.table_key = None;
-                            result.table_key_is_const = false;
-                            result.table_key_is_int = false;
-                            result.key_allocated_reg = false;
-                        }
-                        let is_short_str = field.len() <= crate::strings::LUAI_MAXSHORTLEN
-                            && (k as u32) <= crate::opcodes::MAXINDEXRK;
-                        // Check if we can revert a GETUPVAL and use SETTABUP/GETTABUP instead.
-                        // Only attempt revert if the last instruction is actually a GETUPVAL
-                        // generated for this result (i.e., result was just loaded from an upvalue
-                        // and not yet indexed). This matches C's VINDEXUP optimization where
-                        // _ENV (as upvalue) indexed by a short string stays as VINDEXUP.
-                        let can_revert_getupval = result.reg.is_some() && result.upval_idx.is_some() && is_short_str
-                            && !result.is_upvalue && result.table_reg.is_none()
-                            && result.allocated_reg  // must be a register we allocated
-                            && (fs.pc > 0)  // safety check
-                            && {
-                                let last_inst = fs.proto.code[(fs.pc - 1) as usize];
-                                get_opcode(last_inst) == OpCode::GETUPVAL
-                                    && getarg_a(last_inst) == result.reg.unwrap()
-                            };
-                        let (base_reg, gettabup_pc) = if can_revert_getupval {
-                            // Revert: remove the GETUPVAL instruction, free the register
-                            let getupval_pc = fs.pc - 1;
-                            Rc::make_mut(&mut fs.proto.code).remove(getupval_pc as usize);
-                            fs.inst_lines.remove(getupval_pc as usize);
-                            fs.pc -= 1;
-                            fs.free_reg();
-                            let uv_idx = result.upval_idx.unwrap();
-                            (uv_idx, -1) // Use upvalue index as base_reg (for SETTABUP/GETTABUP)
-                        } else if let Some(r) = result.reg {
-                            (r, -1)
-                        } else if result.is_upvalue {
-                            if !is_short_str {
-                                // Key exceeds MAXINDEXRK: must load upvalue into a register
-                                let r = fs.alloc_reg();
-                                fs.code_abc(OpCode::GETUPVAL, r, result.upval_idx.unwrap_or(0), 0);
-                                (r, -1)
-                            } else {
-                                // Defer: SETTABUP/GETTABUP can be used directly
-                                (result.upval_idx.unwrap_or(0), -1)
-                            }
-                        } else {
-                            let r = fs.alloc_reg();
-                            let gk = result.key.unwrap_or(0);
-                            let env_uv_idx = result.upval_idx.unwrap_or(0);
-                            code_gettabup(fs, r, env_uv_idx, gk);
-                            (r, fs.pc - 1)
-                        };
-                        let (table_key, table_key_is_const, key_allocated_reg) = if is_short_str {
-                            (k, true, false)
-                        } else {
-                            let kr = fs.alloc_reg();
-                            fs.code_loadk(kr, k);
-                            (kr, false, true)
-                        };
-                        let new_is_upvalue =
-                            (result.is_upvalue || can_revert_getupval) && is_short_str;
-                        result = PrefixResult {
-                            var_name: None,
-                            local_idx: None,
-                            key: None,
-                            reg: Some(base_reg),
-                            table_reg: Some(base_reg),
-                            table_key: Some(table_key),
-                            table_key_is_const: table_key_is_const,
-                            table_key_is_int: false,
-                            key_allocated_reg: key_allocated_reg,
-                            allocated_reg: if new_is_upvalue {
-                                false
-                            } else {
-                                result.allocated_reg
-                                    || result.reg.is_none()
-                                    || (result.is_upvalue && !is_short_str)
-                            },
-                            is_upvalue: new_is_upvalue,
-                            upval_idx: result.upval_idx,
-                            env_gettabup_pc: if new_is_upvalue {
-                                -1
-                            } else {
-                                if gettabup_pc >= 0 {
-                                    gettabup_pc
-                                } else {
-                                    result.env_gettabup_pc
-                                }
-                            },
-                            has_call: false,
-                            call_pc: -1,
-                            is_vvargvar: false,
-                            is_readonly: false,
-                        };
-                    }
-                    Token::LBracket => {
-                        fs.ls_mut().next();
-
-                        // Handle VVARGVAR: like C's luaK_indexed, create VVARGIND-like PrefixResult
-                        if result.is_vvargvar {
-                            let base_reg = result.reg.unwrap();
-                            let ei = parse_expr(fs);
-                            expect(fs, &Token::RBracket);
-                            // Like C's luaK_exp2anyreg: if key is already in a local register, use it directly
-                            let key_reg = if ei.exp.kind == ExpKind::NonReloc
-                                && (ei.exp.info as i32) < fs.nvarstack()
-                            {
-                                ei.exp.info as i32
-                            } else {
-                                fs.exp_to_next_reg(&ei.exp)
-                            };
-                            result = PrefixResult {
-                                var_name: None,
-                                local_idx: None,
-                                key: None,
-                                reg: Some(base_reg),
-                                table_reg: Some(base_reg),
-                                table_key: Some(key_reg),
-                                table_key_is_const: false,
-                                table_key_is_int: false,
-                                key_allocated_reg: false,
-                                allocated_reg: false,
-                                is_upvalue: false,
-                                upval_idx: None,
-                                env_gettabup_pc: -1,
-                                has_call: false,
-                                call_pc: -1,
-                                is_vvargvar: true,
-                                is_readonly: false,
-                            };
-                            continue;
-                        }
-
-                        if result.table_reg.is_some() {
-                            let prev_table = result.table_reg.unwrap();
-                            let prev_key = result.table_key.unwrap();
-                            if result.table_key_is_int {
-                                if result.allocated_reg {
-                                    fs.free_reg();
-                                }
-                                let r = fs.alloc_reg();
-                                fs.code_abc(OpCode::GETI, r, prev_table, prev_key);
-                                result.reg = Some(r);
-                                result.allocated_reg = true;
-                            } else if result.table_key_is_const {
-                                if result.allocated_reg {
-                                    fs.free_reg();
-                                }
-                                let r = fs.alloc_reg();
-                                code_getfield(fs, r, prev_table, prev_key);
-                                result.reg = Some(r);
-                                result.allocated_reg = true;
-                            } else {
-                                if result.key_allocated_reg {
-                                    fs.free_reg();
-                                }
-                                if result.allocated_reg {
-                                    fs.free_reg();
-                                }
-                                let r = fs.alloc_reg();
-                                fs.code_abc(OpCode::GETTABLE, r, prev_table, prev_key);
-                                result.reg = Some(r);
-                                result.allocated_reg = true;
-                            }
-                            result.table_reg = None;
-                            result.table_key = None;
-                            result.table_key_is_const = false;
-                            result.table_key_is_int = false;
-                            result.key_allocated_reg = false;
-                        }
-                        // For upvalue tables: match C's suffixedexp '[' + luaK_indexed behavior.
-                        // C compiler flow: yindex(expr + luaK_exp2val) → luaK_indexed
-                        // luaK_exp2val emits code for comparisons but NOT for simple exprs (VTRUE).
-                        // So the order depends on key type:
-                        // - Comparison key: key load code → GETUPVAL
-                        // - Simple key (true, nil, etc.): GETUPVAL → key load code
-                        // - Short string key: GETTABUP/SETTABUP (no GETUPVAL needed)
-                        let is_upvalue_table = result.is_upvalue && result.reg.is_none();
-                        let saved_upval_idx = result.upval_idx.unwrap_or(0);
-                        let (base_reg, gettabup_pc) = if let Some(r) = result.reg {
-                            (r, -1)
-                        } else if is_upvalue_table {
-                            (-1, -1) // placeholder
-                        } else {
-                            let r = fs.alloc_reg();
-                            let gk = result.key.unwrap_or(0);
-                            code_gettabup(fs, r, result.upval_idx.unwrap_or(0), gk);
-                            (r, fs.pc - 1)
-                        };
-                        let saved_freereg_before = fs.freereg;
-                        let ei = parse_expr(fs);
-                        expect(fs, &Token::RBracket);
-                        let key_has_jumps = ei.exp.has_jumps();
-                        // For upvalue tables with non-constant, non-simple keys that have jumps:
-                        // emit key load code first (like C's luaK_exp2val), then GETUPVAL
-                        // Note: Upval key is handled separately (upval_key_placeholder_pc),
-                        // because C's luaK_exp2val discharges VUPVAL to VRELOC (GETUPVAL key)
-                        // before luaK_indexed emits GETUPVAL table.
-                        let getupval_emitted_before_key = is_upvalue_table
-                            && !key_has_jumps
-                            && !matches!(ei.exp.kind, ExpKind::Str | ExpKind::Int)
-                            && !matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc)
-                            && ei.exp.kind != ExpKind::Upval;
-                        // Save table register when GETUPVAL is emitted so we can use it later
-                        // (key may have been allocated BEFORE the table, e.g. Call expressions)
-                        let getupval_table_reg = if getupval_emitted_before_key {
-                            // Simple expression (VTRUE, etc.): emit GETUPVAL first (like C's luaK_indexed)
-                            let r = fs.alloc_reg();
-                            fs.code_abc(OpCode::GETUPVAL, r, saved_upval_idx, 0);
-                            Some(r)
-                        } else {
-                            None
-                        };
-                        // For upvalue table + Upval key (like a[i]): C generates GETUPVAL key first
-                        // (VRELOC, A=0 placeholder in yindex's luaK_exp2val), then GETUPVAL table
-                        // (in luaK_indexed's luaK_exp2anyreg), then patches key's A.
-                        let upval_key_placeholder_pc = if is_upvalue_table
-                            && !getupval_emitted_before_key
-                            && ei.exp.kind == ExpKind::Upval
-                            && !key_has_jumps
-                        {
-                            let pc = fs.code_abc(OpCode::GETUPVAL, 0, ei.exp.info as i32, 0);
-                            Some(pc)
-                        } else {
-                            None
-                        };
-                        let (kr, key_is_const, key_is_int) = if ei.exp.kind == ExpKind::Str {
-                            let k = fs.get_str_k(&ei.exp);
-                            if let TValue::Str(crate::strings::LuaString::Short(_)) =
-                                fs.proto.constants[k as usize]
-                            {
-                                if (k as u32) <= crate::opcodes::MAXINDEXRK {
-                                    (k, true, false)
-                                } else {
-                                    // Long string key (index > MAXINDEXRK): for upvalue tables,
-                                    // defer LOADK until after table's GETUPVAL (matching C's luaK_indexed:
-                                    // luaK_exp2anyreg(t) first, then luaK_exp2anyreg(k)).
-                                    if is_upvalue_table
-                                        && !getupval_emitted_before_key
-                                        && !key_has_jumps
-                                    {
-                                        (-1, false, false)
-                                    } else {
-                                        let kr = fs.alloc_reg();
-                                        fs.code_loadk(kr, k);
-                                        (kr, false, false)
-                                    }
-                                }
-                            } else {
-                                // Long string (not Short): for upvalue tables, defer LOADK until after
-                                // table's GETUPVAL (matching C's luaK_indexed order).
-                                if is_upvalue_table
-                                    && !getupval_emitted_before_key
-                                    && !key_has_jumps
-                                {
-                                    (-1, false, false)
-                                } else {
-                                    let kr = fs.alloc_reg();
-                                    fs.code_loadk(kr, k);
-                                    (kr, false, false)
-                                }
-                            }
-                        } else if ei.exp.kind == ExpKind::Int
-                            && ei.exp.info >= 0
-                            && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
-                        {
-                            (ei.exp.info as i32, true, true)
-                        } else if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc)
-                            && !ei.exp.has_jumps()
-                            && ei.exp.info2 < 0
-                        {
-                            (ei.exp.info as i32, false, false)
-                        } else if is_upvalue_table
-                            && !getupval_emitted_before_key
-                            && matches!(ei.exp.kind, ExpKind::Upval | ExpKind::Relocable)
-                            && !key_has_jumps
-                        {
-                            // For upvalue table + Upval/Relocable key: defer key register allocation
-                            // until after table's GETUPVAL is emitted (matching C's luaK_indexed order).
-                            // Upval key: placeholder GETUPVAL already emitted, A will be patched later.
-                            // Relocable key: instruction already emitted, A will be patched later.
-                            (-1, false, false)
-                        } else {
-                            (fs.exp_to_reg(&ei.exp), false, false)
-                        };
-                        let key_allocated =
-                            !key_is_const && kr != -1 && fs.freereg > saved_freereg_before;
-                        let (base_reg, new_is_upvalue, allocated_reg) = if is_upvalue_table {
-                            let can_use_settabup = key_is_const
-                                && !key_is_int
-                                && (kr as u32) <= crate::opcodes::MAXINDEXRK;
-                            if can_use_settabup {
-                                if getupval_emitted_before_key {
-                                    Rc::make_mut(&mut fs.proto.code).remove(fs.pc as usize - 1);
-                                    fs.inst_lines.remove(fs.pc as usize - 1);
-                                    fs.pc -= 1;
-                                    fs.free_reg();
-                                }
-                                (saved_upval_idx, true, false)
-                            } else if getupval_emitted_before_key {
-                                // GETUPVAL already emitted before key load code.
-                                // Use the saved table register (key may have been allocated
-                                // BEFORE the table, e.g. Call expressions like t[a()])
-                                (getupval_table_reg.unwrap(), false, true)
-                            } else {
-                                let r = fs.alloc_reg();
-                                fs.code_abc(OpCode::GETUPVAL, r, saved_upval_idx, 0);
-                                (r, false, true)
-                            }
-                        } else {
-                            (
-                                base_reg,
-                                result.is_upvalue,
-                                result.allocated_reg || result.reg.is_none(),
-                            )
-                        };
-                        // Now resolve deferred key register allocation (Upval/Relocable/Str key for upvalue table)
-                        let (kr, key_allocated) = if kr == -1 && is_upvalue_table {
-                            if let Some(pc) = upval_key_placeholder_pc {
-                                let key_r = fs.alloc_reg();
-                                fs.set_a(pc, key_r);
-                                (key_r, true)
-                            } else if ei.exp.kind == ExpKind::Str {
-                                // Long string key: emit LOADK now (after table's GETUPVAL)
-                                let k = fs.get_str_k(&ei.exp);
-                                let key_r = fs.alloc_reg();
-                                fs.code_loadk(key_r, k);
-                                (key_r, true)
-                            } else {
-                                let key_r = fs.exp_to_reg(&ei.exp);
-                                (key_r, true)
-                            }
-                        } else {
-                            (kr, key_allocated)
-                        };
-                        result = PrefixResult {
-                            var_name: None,
-                            local_idx: None,
-                            key: None,
-                            reg: Some(base_reg),
-                            table_reg: Some(base_reg),
-                            table_key: Some(kr),
-                            table_key_is_const: key_is_const,
-                            table_key_is_int: key_is_int,
-                            key_allocated_reg: key_allocated,
-                            allocated_reg: allocated_reg,
-                            is_upvalue: new_is_upvalue,
-                            upval_idx: result.upval_idx,
-                            env_gettabup_pc: if new_is_upvalue {
-                                -1
-                            } else {
-                                if gettabup_pc >= 0 {
-                                    gettabup_pc
-                                } else {
-                                    result.env_gettabup_pc
-                                }
-                            },
-                            has_call: false,
-                            call_pc: -1,
-                            is_vvargvar: false,
-                            is_readonly: false,
-                        };
-                    }
-                    Token::LParen | Token::LBrace | Token::String(..) | Token::Colon => {
-                        let is_method = matches!(&fs.ls().token, Token::Colon);
-                        // If result is already a call result in the right position, reuse freg
-                        let (freg, _ef, func_allocated, src_reg) = if is_method {
-                            load_func(fs, &result, true)
-                        } else if result.has_call {
-                            if let Some(reg) = result.reg {
-                                if reg == fs.freereg - 1 {
-                                    // Already in the right position, no need to load
-                                    (reg, false, result.allocated_reg, None)
-                                } else {
-                                    load_func(fs, &result, false)
-                                }
-                            } else {
-                                load_func(fs, &result, false)
-                            }
-                        } else {
-                            load_func(fs, &result, false)
-                        };
-                        let mut last_call_pc = parse_func_args(fs, freg, src_reg);
-                        // Match C original: funcargs sets fs->freereg = base + 1
-                        fs.set_freereg(freg + 1);
-                        loop {
-                            match &fs.ls().token {
-                                Token::LParen | Token::LBrace | Token::String(_) | Token::Colon => {
-                                    last_call_pc = parse_func_args(fs, freg, None);
-                                    fs.set_freereg(freg + 1);
-                                }
-                                _ => break,
-                            }
-                        }
-                        result = PrefixResult {
-                            var_name: None,
-                            local_idx: None,
-                            key: None,
-                            reg: Some(freg),
-                            table_reg: None,
-                            table_key: None,
-                            table_key_is_const: false,
-                            table_key_is_int: false,
-                            key_allocated_reg: false,
-                            allocated_reg: func_allocated,
-                            is_upvalue: false,
-                            upval_idx: None,
-                            env_gettabup_pc: -1,
-                            has_call: true,
-                            call_pc: last_call_pc,
-                            is_vvargvar: false,
-                            is_readonly: false,
-                        };
-                    }
-                    _ => break,
-                }
             }
-
-            result
         }
         Token::LParen => {
             fs.ls_mut().next();
@@ -6191,7 +5694,556 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                 is_readonly: false,
             }
         }
+    };
+    loop {
+        match &fs.ls().token {
+            Token::Dot => {
+                fs.ls_mut().next();
+                let field = get_name(fs);
+                if fs.has_errors() {
+                    break;
+                }
+                let k = fs.string_k(&field);
+
+                // Handle VVARGVAR: like C's luaK_indexed, create VVARGIND-like PrefixResult
+                // C's luaK_indexed always puts key in a register for VVARGVAR (luaK_exp2anyreg),
+                // so we always LOADK, never use SETFIELD/GETFIELD with constant index.
+                if result.is_vvargvar {
+                    let base_reg = result.reg.unwrap();
+                    let kr = fs.alloc_reg();
+                    fs.code_loadk(kr, k);
+                    result = PrefixResult {
+                        var_name: None,
+                        local_idx: None,
+                        key: None,
+                        reg: Some(base_reg),
+                        table_reg: Some(base_reg),
+                        table_key: Some(kr),
+                        table_key_is_const: false,
+                        table_key_is_int: false,
+                        key_allocated_reg: true,
+                        allocated_reg: false,
+                        is_upvalue: false,
+                        upval_idx: None,
+                        env_gettabup_pc: -1,
+                        has_call: false,
+                        call_pc: -1,
+                        is_vvargvar: true,
+                        is_readonly: false,
+                    };
+                    continue;
+                }
+
+                if result.table_reg.is_some() {
+                    let prev_table = result.table_reg.unwrap();
+                    let prev_key = result.table_key.unwrap();
+                    if result.is_upvalue {
+                        // upvalue 索引表达式 (VINDEXUP)：discharge 到寄存器
+                        // 生成 GETTABUP（短字符串 key）或 GETUPVAL+GETI/GETTABLE（其他 key）
+                        if result.allocated_reg {
+                            fs.free_reg();
+                        }
+                        if result.key_allocated_reg {
+                            fs.free_reg();
+                        }
+                        let r = fs.alloc_reg();
+                        if result.table_key_is_const && !result.table_key_is_int {
+                            code_gettabup(fs, r, prev_table, prev_key);
+                        } else if result.table_key_is_int {
+                            fs.code_abc(OpCode::GETUPVAL, r, prev_table, 0);
+                            fs.code_abc(OpCode::GETI, r, r, prev_key);
+                        } else {
+                            // prev_key 是寄存器（长字符串或其他表达式）
+                            fs.code_abc(OpCode::GETUPVAL, r, prev_table, 0);
+                            fs.code_abc(OpCode::GETTABLE, r, r, prev_key);
+                        }
+                        result.reg = Some(r);
+                        result.allocated_reg = true;
+                        result.is_upvalue = false;
+                    } else if result.table_key_is_int {
+                        if result.allocated_reg {
+                            fs.free_reg();
+                        }
+                        let r = fs.alloc_reg();
+                        fs.code_abc(OpCode::GETI, r, prev_table, prev_key);
+                        result.reg = Some(r);
+                        result.allocated_reg = true;
+                    } else if result.table_key_is_const {
+                        if result.allocated_reg {
+                            fs.free_reg();
+                        }
+                        let r = fs.alloc_reg();
+                        code_getfield(fs, r, prev_table, prev_key);
+                        result.reg = Some(r);
+                        result.allocated_reg = true;
+                    } else {
+                        if result.key_allocated_reg {
+                            fs.free_reg();
+                        }
+                        if result.allocated_reg {
+                            fs.free_reg();
+                        }
+                        let r = fs.alloc_reg();
+                        fs.code_abc(OpCode::GETTABLE, r, prev_table, prev_key);
+                        result.reg = Some(r);
+                        result.allocated_reg = true;
+                    }
+                    result.table_reg = None;
+                    result.table_key = None;
+                    result.table_key_is_const = false;
+                    result.table_key_is_int = false;
+                    result.key_allocated_reg = false;
+                }
+                let is_short_str = field.len() <= crate::strings::LUAI_MAXSHORTLEN
+                    && (k as u32) <= crate::opcodes::MAXINDEXRK;
+                // Check if we can revert a GETUPVAL and use SETTABUP/GETTABUP instead.
+                // Only attempt revert if the last instruction is actually a GETUPVAL
+                // generated for this result (i.e., result was just loaded from an upvalue
+                // and not yet indexed). This matches C's VINDEXUP optimization where
+                // _ENV (as upvalue) indexed by a short string stays as VINDEXUP.
+                let can_revert_getupval = result.reg.is_some() && result.upval_idx.is_some() && is_short_str
+                    && !result.is_upvalue && result.table_reg.is_none()
+                    && result.allocated_reg  // must be a register we allocated
+                    && (fs.pc > 0)  // safety check
+                    && {
+                        let last_inst = fs.proto.code[(fs.pc - 1) as usize];
+                        get_opcode(last_inst) == OpCode::GETUPVAL
+                            && getarg_a(last_inst) == result.reg.unwrap()
+                    };
+                let (base_reg, gettabup_pc) = if can_revert_getupval {
+                    // Revert: remove the GETUPVAL instruction, free the register
+                    let getupval_pc = fs.pc - 1;
+                    Rc::make_mut(&mut fs.proto.code).remove(getupval_pc as usize);
+                    fs.inst_lines.remove(getupval_pc as usize);
+                    fs.pc -= 1;
+                    fs.free_reg();
+                    let uv_idx = result.upval_idx.unwrap();
+                    (uv_idx, -1) // Use upvalue index as base_reg (for SETTABUP/GETTABUP)
+                } else if let Some(r) = result.reg {
+                    (r, -1)
+                } else if result.is_upvalue {
+                    if !is_short_str {
+                        // Key exceeds MAXINDEXRK: must load upvalue into a register
+                        let r = fs.alloc_reg();
+                        fs.code_abc(OpCode::GETUPVAL, r, result.upval_idx.unwrap_or(0), 0);
+                        (r, -1)
+                    } else {
+                        // Defer: SETTABUP/GETTABUP can be used directly
+                        (result.upval_idx.unwrap_or(0), -1)
+                    }
+                } else {
+                    let r = fs.alloc_reg();
+                    let gk = result.key.unwrap_or(0);
+                    let env_uv_idx = result.upval_idx.unwrap_or(0);
+                    code_gettabup(fs, r, env_uv_idx, gk);
+                    (r, fs.pc - 1)
+                };
+                let (table_key, table_key_is_const, key_allocated_reg) = if is_short_str {
+                    (k, true, false)
+                } else {
+                    let kr = fs.alloc_reg();
+                    fs.code_loadk(kr, k);
+                    (kr, false, true)
+                };
+                let new_is_upvalue =
+                    (result.is_upvalue || can_revert_getupval) && is_short_str;
+                result = PrefixResult {
+                    var_name: None,
+                    local_idx: None,
+                    key: None,
+                    reg: Some(base_reg),
+                    table_reg: Some(base_reg),
+                    table_key: Some(table_key),
+                    table_key_is_const: table_key_is_const,
+                    table_key_is_int: false,
+                    key_allocated_reg: key_allocated_reg,
+                    allocated_reg: if new_is_upvalue {
+                        false
+                    } else {
+                        result.allocated_reg
+                            || result.reg.is_none()
+                            || (result.is_upvalue && !is_short_str)
+                    },
+                    is_upvalue: new_is_upvalue,
+                    upval_idx: result.upval_idx,
+                    env_gettabup_pc: if new_is_upvalue {
+                        -1
+                    } else {
+                        if gettabup_pc >= 0 {
+                            gettabup_pc
+                        } else {
+                            result.env_gettabup_pc
+                        }
+                    },
+                    has_call: false,
+                    call_pc: -1,
+                    is_vvargvar: false,
+                    is_readonly: false,
+                };
+            }
+            Token::LBracket => {
+                fs.ls_mut().next();
+
+                // Handle VVARGVAR: like C's luaK_indexed, create VVARGIND-like PrefixResult
+                if result.is_vvargvar {
+                    let base_reg = result.reg.unwrap();
+                    let ei = parse_expr(fs);
+                    expect(fs, &Token::RBracket);
+                    // Like C's luaK_exp2anyreg: if key is already in a local register, use it directly
+                    let key_reg = if ei.exp.kind == ExpKind::NonReloc
+                        && (ei.exp.info as i32) < fs.nvarstack()
+                    {
+                        ei.exp.info as i32
+                    } else {
+                        fs.exp_to_next_reg(&ei.exp)
+                    };
+                    result = PrefixResult {
+                        var_name: None,
+                        local_idx: None,
+                        key: None,
+                        reg: Some(base_reg),
+                        table_reg: Some(base_reg),
+                        table_key: Some(key_reg),
+                        table_key_is_const: false,
+                        table_key_is_int: false,
+                        key_allocated_reg: false,
+                        allocated_reg: false,
+                        is_upvalue: false,
+                        upval_idx: None,
+                        env_gettabup_pc: -1,
+                        has_call: false,
+                        call_pc: -1,
+                        is_vvargvar: true,
+                        is_readonly: false,
+                    };
+                    continue;
+                }
+
+                if result.table_reg.is_some() {
+                    let prev_table = result.table_reg.unwrap();
+                    let prev_key = result.table_key.unwrap();
+                    if result.is_upvalue {
+                        // upvalue 索引表达式 (VINDEXUP)：discharge 到寄存器
+                        // 生成 GETTABUP（短字符串 key）或 GETUPVAL+GETI/GETTABLE（其他 key）
+                        if result.allocated_reg {
+                            fs.free_reg();
+                        }
+                        if result.key_allocated_reg {
+                            fs.free_reg();
+                        }
+                        let r = fs.alloc_reg();
+                        if result.table_key_is_const && !result.table_key_is_int {
+                            code_gettabup(fs, r, prev_table, prev_key);
+                        } else if result.table_key_is_int {
+                            fs.code_abc(OpCode::GETUPVAL, r, prev_table, 0);
+                            fs.code_abc(OpCode::GETI, r, r, prev_key);
+                        } else {
+                            // prev_key 是寄存器（长字符串或其他表达式）
+                            fs.code_abc(OpCode::GETUPVAL, r, prev_table, 0);
+                            fs.code_abc(OpCode::GETTABLE, r, r, prev_key);
+                        }
+                        result.reg = Some(r);
+                        result.allocated_reg = true;
+                        result.is_upvalue = false;
+                    } else if result.table_key_is_int {
+                        if result.allocated_reg {
+                            fs.free_reg();
+                        }
+                        let r = fs.alloc_reg();
+                        fs.code_abc(OpCode::GETI, r, prev_table, prev_key);
+                        result.reg = Some(r);
+                        result.allocated_reg = true;
+                    } else if result.table_key_is_const {
+                        if result.allocated_reg {
+                            fs.free_reg();
+                        }
+                        let r = fs.alloc_reg();
+                        code_getfield(fs, r, prev_table, prev_key);
+                        result.reg = Some(r);
+                        result.allocated_reg = true;
+                    } else {
+                        if result.key_allocated_reg {
+                            fs.free_reg();
+                        }
+                        if result.allocated_reg {
+                            fs.free_reg();
+                        }
+                        let r = fs.alloc_reg();
+                        fs.code_abc(OpCode::GETTABLE, r, prev_table, prev_key);
+                        result.reg = Some(r);
+                        result.allocated_reg = true;
+                    }
+                    result.table_reg = None;
+                    result.table_key = None;
+                    result.table_key_is_const = false;
+                    result.table_key_is_int = false;
+                    result.key_allocated_reg = false;
+                }
+                // For upvalue tables: match C's suffixedexp '[' + luaK_indexed behavior.
+                // C compiler flow: yindex(expr + luaK_exp2val) → luaK_indexed
+                // luaK_exp2val emits code for comparisons but NOT for simple exprs (VTRUE).
+                // So the order depends on key type:
+                // - Comparison key: key load code → GETUPVAL
+                // - Simple key (true, nil, etc.): GETUPVAL → key load code
+                // - Short string key: GETTABUP/SETTABUP (no GETUPVAL needed)
+                let is_upvalue_table = result.is_upvalue && result.reg.is_none();
+                let saved_upval_idx = result.upval_idx.unwrap_or(0);
+                let (base_reg, gettabup_pc) = if let Some(r) = result.reg {
+                    (r, -1)
+                } else if is_upvalue_table {
+                    (-1, -1) // placeholder
+                } else {
+                    let r = fs.alloc_reg();
+                    let gk = result.key.unwrap_or(0);
+                    code_gettabup(fs, r, result.upval_idx.unwrap_or(0), gk);
+                    (r, fs.pc - 1)
+                };
+                let saved_freereg_before = fs.freereg;
+                let ei = parse_expr(fs);
+                expect(fs, &Token::RBracket);
+                let key_has_jumps = ei.exp.has_jumps();
+                // For upvalue tables with non-constant, non-simple keys that have jumps:
+                // emit key load code first (like C's luaK_exp2val), then GETUPVAL
+                // Note: Upval key is handled separately (upval_key_placeholder_pc),
+                // because C's luaK_exp2val discharges VUPVAL to VRELOC (GETUPVAL key)
+                // before luaK_indexed emits GETUPVAL table.
+                let getupval_emitted_before_key = is_upvalue_table
+                    && !key_has_jumps
+                    && !matches!(ei.exp.kind, ExpKind::Str | ExpKind::Int)
+                    && !matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc)
+                    && ei.exp.kind != ExpKind::Upval;
+                // Save table register when GETUPVAL is emitted so we can use it later
+                // (key may have been allocated BEFORE the table, e.g. Call expressions)
+                let getupval_table_reg = if getupval_emitted_before_key {
+                    // Simple expression (VTRUE, etc.): emit GETUPVAL first (like C's luaK_indexed)
+                    let r = fs.alloc_reg();
+                    fs.code_abc(OpCode::GETUPVAL, r, saved_upval_idx, 0);
+                    Some(r)
+                } else {
+                    None
+                };
+                // For upvalue table + Upval key (like a[i]): C generates GETUPVAL key first
+                // (VRELOC, A=0 placeholder in yindex's luaK_exp2val), then GETUPVAL table
+                // (in luaK_indexed's luaK_exp2anyreg), then patches key's A.
+                let upval_key_placeholder_pc = if is_upvalue_table
+                    && !getupval_emitted_before_key
+                    && ei.exp.kind == ExpKind::Upval
+                    && !key_has_jumps
+                {
+                    let pc = fs.code_abc(OpCode::GETUPVAL, 0, ei.exp.info as i32, 0);
+                    Some(pc)
+                } else {
+                    None
+                };
+                let (kr, key_is_const, key_is_int) = if ei.exp.kind == ExpKind::Str {
+                    let k = fs.get_str_k(&ei.exp);
+                    if let TValue::Str(crate::strings::LuaString::Short(_)) =
+                        fs.proto.constants[k as usize]
+                    {
+                        if (k as u32) <= crate::opcodes::MAXINDEXRK {
+                            (k, true, false)
+                        } else {
+                            // Long string key (index > MAXINDEXRK): for upvalue tables,
+                            // defer LOADK until after table's GETUPVAL (matching C's luaK_indexed:
+                            // luaK_exp2anyreg(t) first, then luaK_exp2anyreg(k)).
+                            if is_upvalue_table
+                                && !getupval_emitted_before_key
+                                && !key_has_jumps
+                            {
+                                (-1, false, false)
+                            } else {
+                                let kr = fs.alloc_reg();
+                                fs.code_loadk(kr, k);
+                                (kr, false, false)
+                            }
+                        }
+                    } else {
+                        // Long string (not Short): for upvalue tables, defer LOADK until after
+                        // table's GETUPVAL (matching C's luaK_indexed order).
+                        if is_upvalue_table
+                            && !getupval_emitted_before_key
+                            && !key_has_jumps
+                        {
+                            (-1, false, false)
+                        } else {
+                            let kr = fs.alloc_reg();
+                            fs.code_loadk(kr, k);
+                            (kr, false, false)
+                        }
+                    }
+                } else if ei.exp.kind == ExpKind::Int
+                    && ei.exp.info >= 0
+                    && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
+                {
+                    (ei.exp.info as i32, true, true)
+                } else if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc)
+                    && !ei.exp.has_jumps()
+                    && ei.exp.info2 < 0
+                {
+                    (ei.exp.info as i32, false, false)
+                } else if is_upvalue_table
+                    && !getupval_emitted_before_key
+                    && matches!(ei.exp.kind, ExpKind::Upval | ExpKind::Relocable)
+                    && !key_has_jumps
+                {
+                    // For upvalue table + Upval/Relocable key: defer key register allocation
+                    // until after table's GETUPVAL is emitted (matching C's luaK_indexed order).
+                    // Upval key: placeholder GETUPVAL already emitted, A will be patched later.
+                    // Relocable key: instruction already emitted, A will be patched later.
+                    (-1, false, false)
+                } else {
+                    (fs.exp_to_reg(&ei.exp), false, false)
+                };
+                let key_allocated =
+                    !key_is_const && kr != -1 && fs.freereg > saved_freereg_before;
+                let (base_reg, new_is_upvalue, allocated_reg) = if is_upvalue_table {
+                    let can_use_settabup = key_is_const
+                        && !key_is_int
+                        && (kr as u32) <= crate::opcodes::MAXINDEXRK;
+                    if can_use_settabup {
+                        if getupval_emitted_before_key {
+                            Rc::make_mut(&mut fs.proto.code).remove(fs.pc as usize - 1);
+                            fs.inst_lines.remove(fs.pc as usize - 1);
+                            fs.pc -= 1;
+                            fs.free_reg();
+                        }
+                        (saved_upval_idx, true, false)
+                    } else if getupval_emitted_before_key {
+                        // GETUPVAL already emitted before key load code.
+                        // Use the saved table register (key may have been allocated
+                        // BEFORE the table, e.g. Call expressions like t[a()])
+                        (getupval_table_reg.unwrap(), false, true)
+                    } else {
+                        let r = fs.alloc_reg();
+                        fs.code_abc(OpCode::GETUPVAL, r, saved_upval_idx, 0);
+                        (r, false, true)
+                    }
+                } else {
+                    (
+                        base_reg,
+                        result.is_upvalue,
+                        result.allocated_reg || result.reg.is_none(),
+                    )
+                };
+                // Now resolve deferred key register allocation (Upval/Relocable/Str key for upvalue table)
+                let (kr, key_allocated) = if kr == -1 && is_upvalue_table {
+                    if let Some(pc) = upval_key_placeholder_pc {
+                        let key_r = fs.alloc_reg();
+                        fs.set_a(pc, key_r);
+                        (key_r, true)
+                    } else if ei.exp.kind == ExpKind::Str {
+                        // Long string key: emit LOADK now (after table's GETUPVAL)
+                        let k = fs.get_str_k(&ei.exp);
+                        let key_r = fs.alloc_reg();
+                        fs.code_loadk(key_r, k);
+                        (key_r, true)
+                    } else {
+                        let key_r = fs.exp_to_reg(&ei.exp);
+                        (key_r, true)
+                    }
+                } else {
+                    (kr, key_allocated)
+                };
+                result = PrefixResult {
+                    var_name: None,
+                    local_idx: None,
+                    key: None,
+                    reg: Some(base_reg),
+                    table_reg: Some(base_reg),
+                    table_key: Some(kr),
+                    table_key_is_const: key_is_const,
+                    table_key_is_int: key_is_int,
+                    key_allocated_reg: key_allocated,
+                    allocated_reg: allocated_reg,
+                    is_upvalue: new_is_upvalue,
+                    upval_idx: result.upval_idx,
+                    env_gettabup_pc: if new_is_upvalue {
+                        -1
+                    } else {
+                        if gettabup_pc >= 0 {
+                            gettabup_pc
+                        } else {
+                            result.env_gettabup_pc
+                        }
+                    },
+                    has_call: false,
+                    call_pc: -1,
+                    is_vvargvar: false,
+                    is_readonly: false,
+                };
+            }
+            Token::LParen | Token::LBrace | Token::String(..) | Token::Colon => {
+                let is_method = matches!(&fs.ls().token, Token::Colon);
+                // If result is already a call result in the right position, reuse freg
+                let (freg, _ef, func_allocated, src_reg) = if is_method {
+                    load_func(fs, &result, true)
+                } else if result.has_call {
+                    if let Some(reg) = result.reg {
+                        if reg == fs.freereg - 1 {
+                            // Already in the right position, no need to load
+                            (reg, false, result.allocated_reg, None)
+                        } else {
+                            load_func(fs, &result, false)
+                        }
+                    } else {
+                        load_func(fs, &result, false)
+                    }
+                } else if let Some(reg) = result.reg {
+                    // For non-call results (e.g., parenthesized expressions like
+                    // (f)()), if the expression is already in a temp register at
+                    // freereg-1, reuse it directly without a MOVE — matching C's
+                    // luaK_exp2nextreg for VRELOC (patches instruction in place).
+                    // Skip locals (reg < nvarstack): C always MOVEs locals to a
+                    // temp register before calling.
+                    // Skip indexed access (table_reg set): load_func must discharge
+                    // the pending GETFIELD/GETTABLE.
+                    if reg == fs.freereg - 1
+                        && reg >= fs.nvarstack()
+                        && result.table_reg.is_none()
+                    {
+                        (reg, false, result.allocated_reg, None)
+                    } else {
+                        load_func(fs, &result, false)
+                    }
+                } else {
+                    load_func(fs, &result, false)
+                };
+                let mut last_call_pc = parse_func_args(fs, freg, src_reg);
+                // Match C original: funcargs sets fs->freereg = base + 1
+                fs.set_freereg(freg + 1);
+                loop {
+                    match &fs.ls().token {
+                        Token::LParen | Token::LBrace | Token::String(_) | Token::Colon => {
+                            last_call_pc = parse_func_args(fs, freg, None);
+                            fs.set_freereg(freg + 1);
+                        }
+                        _ => break,
+                    }
+                }
+                result = PrefixResult {
+                    var_name: None,
+                    local_idx: None,
+                    key: None,
+                    reg: Some(freg),
+                    table_reg: None,
+                    table_key: None,
+                    table_key_is_const: false,
+                    table_key_is_int: false,
+                    key_allocated_reg: false,
+                    allocated_reg: func_allocated,
+                    is_upvalue: false,
+                    upval_idx: None,
+                    env_gettabup_pc: -1,
+                    has_call: true,
+                    call_pc: last_call_pc,
+                    is_vvargvar: false,
+                    is_readonly: false,
+                };
+            }
+            _ => break,
+        }
     }
+    result
 }
 
 // ============================================================================
@@ -10708,7 +10760,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 // → luaK_indexed (emit GETUPVAL for non-isKstr keys, or use VINDEXUP for isKstr)
                 // → later dischargevars: freeregs(t, idx) → emit GETTABLE as VRELOC(A=0)
                 if table_is_upvalue {
-                    if ei.exp.kind == ExpKind::Str {
+                    if ei.exp.kind == ExpKind::Str && !ei.exp.has_jumps() {
                         let k = fs.get_str_k(&ei.exp);
                         if is_kstr(fs, k) {
                             // Short string key: use GETTABUP directly (C's VINDEXUP)
@@ -10856,6 +10908,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     let result_reg;
                     let inst_pc;
                     if ei.exp.kind == ExpKind::Int
+                        && !ei.exp.has_jumps()
                         && ei.exp.info >= 0
                         && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
                     {
@@ -10866,7 +10919,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                         };
                         inst_pc =
                             fs.code_abc(OpCode::GETI, result_reg, base_reg, ei.exp.info as i32);
-                    } else if ei.exp.kind == ExpKind::Str {
+                    } else if ei.exp.kind == ExpKind::Str && !ei.exp.has_jumps() {
                         let k = fs.get_str_k(&ei.exp);
                         if is_kstr(fs, k) {
                             result_reg = if base_is_nonreloc_local {
@@ -11989,6 +12042,11 @@ fn parse_func_stat(fs: &mut FuncState) {
             let k = fs.string_k(first_name);
             code_getfield(fs, r, env_reg, k);
             r
+        } else if let Some(UpvalueOrCtc::Upvalue(env_idx)) = fs.find_upvalue("_ENV") {
+            let r = fs.alloc_reg();
+            let k = fs.string_k(first_name);
+            code_gettabup(fs, r, env_idx, k);
+            r
         } else {
             let r = fs.alloc_reg();
             let k = fs.string_k(first_name);
@@ -12001,13 +12059,25 @@ fn parse_func_stat(fs: &mut FuncState) {
         // The register will be freed when the first GETFIELD is generated
         // (matching C's freereg in dischargevars for VINDEXSTR).
         reg
+    } else if let Some(UpvalueOrCtc::Upvalue(uv_idx)) = fs.find_upvalue(first_name) {
+        // Like C's singlevar for VUPVAL: load upvalue into a register
+        let r = fs.alloc_reg();
+        fs.code_abc(OpCode::GETUPVAL, r, uv_idx, 0);
+        r
     } else if let Some(env_reg) = fs.find_local("_ENV") {
         // _ENV is a local variable: use GETFIELD
         let r = fs.alloc_reg();
         let k = fs.string_k(first_name);
         code_getfield(fs, r, env_reg, k);
         r
+    } else if let Some(UpvalueOrCtc::Upvalue(env_idx)) = fs.find_upvalue("_ENV") {
+        // _ENV is an upvalue: use GETTABUP with correct upvalue index
+        let r = fs.alloc_reg();
+        let k = fs.string_k(first_name);
+        code_gettabup(fs, r, env_idx, k);
+        r
     } else {
+        // Fallback: _ENV is upvalue 0 (main chunk default)
         let r = fs.alloc_reg();
         let k = fs.string_k(first_name);
         code_gettabup(fs, r, 0, k);

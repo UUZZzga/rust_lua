@@ -925,6 +925,9 @@ pub fn concat_stack(stack: &mut Vec<TValue>, total: usize) -> Result<(), TagMeth
         }
         use crate::strings::ShortString;
         let h = crate::strings::rust_hash(&result);
+        // 追加 NUL 终止符，与 as_str_inner 的 NUL 剥离机制配合
+        // （拼接结果可能以 NUL 结尾，不加额外 NUL 会导致 as_str 错误剥离数据字节）
+        result.push('\0');
         let ls = LuaString::Short(std::sync::Arc::new(ShortString {
             hash: h,
             contents: result,

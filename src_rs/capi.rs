@@ -24,7 +24,7 @@ use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::ptr;
 use std::rc::Rc;
 
-use crate::objects::{CClosure, LCFunction, LClosure, LuaType, NilKind, Proto, TValue, Table};
+use crate::objects::{CClosure, LCFunction, LClosure, LuaType, NilKind, Proto, TValue, Table, Udata};
 use crate::state::LuaState;
 use crate::strings::LuaString;
 use crate::vm::F2IMode;
@@ -247,6 +247,22 @@ pub extern "C" fn lua_pushvalue(L: *mut lua_State, idx: c_int) {
         L.stack.push(TValue::Table(L.registry.clone()));
         return;
     }
+    // 上值伪索引: idx < LUA_REGISTRYINDEX
+    // lua_upvalueindex(i) = LUA_REGISTRYINDEX - i
+    // 上值存储在 stack[api_func_base] 的 CClosure 中
+    if idx < LUA_REGISTRYINDEX {
+        let up_idx = (LUA_REGISTRYINDEX - idx) as usize; // 1-based
+        if L.api_func_base < L.stack.len() {
+            if let TValue::CClosure(cc) = &L.stack[L.api_func_base] {
+                if up_idx >= 1 && up_idx <= cc.upvalue.len() {
+                    L.stack.push(cc.upvalue[up_idx - 1].clone());
+                    return;
+                }
+            }
+        }
+        L.stack.push(TValue::Nil(NilKind::Strict));
+        return;
+    }
     if let Some(off) = index2offset(L, idx) {
         let val = L.stack[off].clone();
         L.stack.push(val);
@@ -412,10 +428,13 @@ pub extern "C" fn lua_pushlstring(
         let bytes = unsafe { std::slice::from_raw_parts(s as *const u8, len) };
         L.push_lstring(bytes);
     }
-    // 返回内部字符串指针 —— 由于 Rust 字符串存储在 LuaString 内部，
-    // 我们需要返回一个稳定的指针。这里简化处理：返回静态空串。
-    // 实际使用中，C 代码应在调用后立即使用，或通过 lua_tolstring 重新获取。
-    c"".as_ptr()
+    // 返回栈顶字符串的内部指针（对应 C 的 lua_pushlstring 返回内部 TString 缓冲区）
+    // 短字符串由于 interned，指针在进程生命周期内稳定
+    // 长字符串指针在字符串不被从栈中移除前有效
+    match L.stack.last() {
+        Some(TValue::Str(ls)) => ls.as_c_str_ptr(),
+        _ => c"".as_ptr(),
+    }
 }
 
 /// lua_pushstring: 压入以 \0 结尾的字符串。
@@ -456,11 +475,14 @@ pub extern "C" fn lua_pushcclosure(L: *mut lua_State, f: lua_CFunction, n: c_int
         // 轻量 C 函数
         L.stack.push(TValue::LCFn(LCFunction { func: f }));
     } else {
-        // C 闭包：从栈顶弹 n 个上值
+        // C 闭包：从栈顶弹 n 个上值。pop 顺序是栈顶（最后压栈）→栈底（最先压栈），
+        // 与 C Lua 的 upvalue[0] = 最先压栈（栈底）相反，因此需要 reverse。
         let mut upvalues = Vec::with_capacity(n);
         for _ in 0..n {
-            upvalues.push(L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict)));
+            let val = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+            upvalues.push(val);
         }
+        upvalues.reverse();
         L.stack.push(TValue::CClosure(Rc::new(CClosure {
             f,
             upvalue: upvalues,
@@ -657,21 +679,12 @@ pub extern "C" fn lua_tolstring(L: *mut lua_State, idx: c_int, len: *mut usize) 
         }
     }
 
-    // 返回内部字符串指针
+    // 返回 NUL 结尾的 C 字符串指针（LuaString 内部已保证末尾有 NUL）
     if let TValue::Str(ref s) = L.stack[off] {
-        let slice = s.as_str();
         if !len.is_null() {
-            unsafe { *len = slice.len() };
+            unsafe { *len = s.len() };
         }
-        // 空字符串的 as_ptr() 返回 dangling pointer（非空但不可读）。
-        // C 代码（如 luaL_checklstring 后接 memcpy(dst, str, len+1)）会读取
-        // null 终止符导致段错误。返回指向静态 null 字节的有效指针。
-        if slice.is_empty() {
-            static EMPTY_NUL: u8 = 0;
-            &EMPTY_NUL as *const u8 as *const c_char
-        } else {
-            slice.as_ptr() as *const c_char
-        }
+        s.as_c_str_ptr()
     } else {
         ptr::null()
     }
@@ -682,10 +695,7 @@ pub extern "C" fn lua_touserdata(L: *mut lua_State, idx: c_int) -> *mut c_void {
     let L = unsafe { &*L };
     match index2val(L, idx) {
         Some(TValue::LightUserData(p)) => *p,
-        Some(TValue::UserData(_)) => {
-            // full userdata 暂未完整实现，返回 null
-            ptr::null_mut()
-        }
+        Some(TValue::UserData(ud)) => ud.data.as_ptr() as *mut c_void,
         _ => ptr::null_mut(),
     }
 }
@@ -731,8 +741,11 @@ pub extern "C" fn lua_createtable(L: *mut lua_State, narr: c_int, nrec: c_int) {
 #[no_mangle]
 pub extern "C" fn lua_gettable(L: *mut lua_State, idx: c_int) -> c_int {
     let L = unsafe { &mut *L };
-    let key = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+    // IMPORTANT: resolve offset BEFORE popping, because idx might be negative
+    // and popping changes relative positions
     if is_registry(idx) {
+        // For registry, pop key, look up directly
+        let key = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
         let val = L.registry.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
         let ty = lua_type_code(val.ty());
         L.stack.push(val);
@@ -741,10 +754,14 @@ pub extern "C" fn lua_gettable(L: *mut lua_State, idx: c_int) -> c_int {
     let off = match index2offset(L, idx) {
         Some(o) => o,
         None => {
+            // offset invalid: just pop key and push nil
+            L.stack.pop();
             L.stack.push(TValue::Nil(NilKind::Strict));
             return LUA_TNIL;
         }
     };
+    // Now pop key
+    let key = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
     let val = match &L.stack[off] {
         TValue::Table(t) => t.get(&key).unwrap_or(TValue::Nil(NilKind::Strict)),
         _ => TValue::Nil(NilKind::Strict),
@@ -845,20 +862,16 @@ pub extern "C" fn lua_setfield(L: *mut lua_State, idx: c_int, k: *const c_char) 
         t.set(key_tv, val);
     }
 }
-
 /// lua_rawget: t[k]，k 从栈顶弹出（不走元方法）。
 #[no_mangle]
 pub extern "C" fn lua_rawget(L: *mut lua_State, idx: c_int) -> c_int {
-    // 当前实现与 lua_gettable 一致（元方法尚未打通）
     lua_gettable(L, idx)
 }
-
 /// lua_rawset: t[k] = v，k 和 v 从栈顶弹出（不走元方法）。
 #[no_mangle]
 pub extern "C" fn lua_rawset(L: *mut lua_State, idx: c_int) {
     lua_settable(L, idx);
 }
-
 /// lua_rawgeti: t[n]，结果压栈。
 #[no_mangle]
 pub extern "C" fn lua_rawgeti(L: *mut lua_State, idx: c_int, n: lua_Integer) -> c_int {
@@ -1041,7 +1054,7 @@ pub extern "C" fn luaL_setfuncs(L: *mut lua_State, l: *const luaL_Reg, nup: c_in
 ///
 /// 对应 C 的 luaL_checklstring，参数不匹配时调用 luaL_typeerror 抛错。
 #[no_mangle]
-pub extern "C" fn luaL_checklstring(L: *mut lua_State, arg: c_int, l: *mut usize) -> *const c_char {
+pub extern "C-unwind" fn luaL_checklstring(L: *mut lua_State, arg: c_int, l: *mut usize) -> *const c_char {
     // 用 lua_tolstring 获取字符串指针
     let ptr = lua_tolstring(L, arg, l);
     if ptr.is_null() {
@@ -1107,39 +1120,53 @@ pub extern "C" fn luaL_unref(L: *mut lua_State, _t: c_int, ref_: c_int) {
 ///
 /// 简化实现：用 pcall 调用，错误时 panic（模拟无保护语义）
 /// k 是延续函数（C continuation），Rust 实现不支持，忽略。
+/// panic 委托给辅助函数，避免 extern "C" 函数中直接 panic 被编译器转为 abort。
+#[inline(never)]
+#[cold]
+unsafe fn do_lua_callk(L: *mut lua_State, nargs: usize, nresults: i32) {
+    let L = &mut *L;
+    let status = L.pcall(nargs, nresults, 0);
+    if status != 0 {
+        let err = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        L.pending_error = Some(err);
+        panic!("lua_callk error");
+    }
+}
 #[no_mangle]
-pub extern "C" fn lua_callk(
+pub extern "C-unwind" fn lua_callk(
     L: *mut lua_State,
     nargs: usize,
     nresults: i32,
     _ctx: isize,
     _k: Option<unsafe extern "C" fn(*mut lua_State, c_int, isize) -> c_int>,
 ) {
-    let L = unsafe { &mut *L };
-    let status = L.pcall(nargs, nresults, 0);
-    if status != 0 {
-        // pcall 失败：取栈顶错误值，设置 pending_error，panic 让上层捕获
-        let err = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
-        L.pending_error = Some(err);
-        panic!("lua_callk error");
-    }
+    unsafe { do_lua_callk(L, nargs, nresults) }
 }
+// C 函数错误处理
+// ============================================================================
+//
+// lua_error 被 C 代码调用（通常通过 lauxlib.cpp::luaL_error）。
+// Rust 的 extern "C" 函数中 panic 会触发 abort（panic_cannot_unwind），
+// 因为编译器会对 extern "C" 函数隐式应用 unwind(abort)。
+// 因此我们使用非 extern 函数来做实际的 panic，这样 unwind 可以正常进行。
+// C 模块的 .o 文件需编译时加 -fexceptions 标志，使 GCC 生成必要的
+// 栈展开表，让 Rust 的 catch_unwind 能安全通过 C 帧展开。
+// 已在 deps/Makefile 中添加此标志。
 
-/// lua_error: 抛出栈顶错误值
-///
-/// 对应 C 的 lua_error（用 longjmp）。Rust 实现用 panic + pending_error。
-/// 调用方（C 函数）应假设此函数不返回。
-#[no_mangle]
-pub extern "C" fn lua_error(L: *mut lua_State) -> c_int {
-    let L = unsafe { &mut *L };
+/// # Safety: L must be a valid pointer to a LuaState
+#[inline(never)]
+#[cold]
+unsafe fn do_lua_error(L: *mut lua_State) -> ! {
+    let L = &mut *L;
     let err = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
     L.pending_error = Some(err);
     panic!("lua_error");
 }
 
-/// lua_getallocf: 获取内存分配器函数
-///
-/// 返回一个基于 libc realloc/free 的默认分配器，供 C 模块（如 lib22.c）使用。
+#[no_mangle]
+pub extern "C-unwind" fn lua_error(L: *mut lua_State) -> c_int {
+    unsafe { do_lua_error(L) }
+}
 /// ud 设为 NULL（Rust VM 用自己的分配器，C 模块分配的内存由其自行管理）。
 pub type lua_Alloc =
     Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize) -> *mut c_void>;
@@ -1171,8 +1198,1005 @@ pub extern "C" fn lua_getallocf(_L: *mut lua_State, ud: *mut *mut c_void) -> lua
     Some(default_allocf)
 }
 
-/// lua_pushfstring / lua_pushvfstring 由 C 文件 src_rs/capi_variadic.c 提供
-/// （stable Rust 不支持 c_variadic，需用 C 实现可变参数格式化）。
+
+// ============================================================================
+// Userdata — Lua 5.5 (lua_newuserdatauv)
+// ============================================================================
+
+/// lua_newuserdatauv: 创建 full userdata。
+///
+/// 对应 C 的 lua_newuserdatauv。创建大小为 sz 字节、nuvalue 个用户值的 UserData，
+/// 压栈并返回数据区指针。
+///
+/// 注册到 GC 并设置 id，使 mark_tvalue 能正确标记 reachable。
+/// 这对 GC finalizer 机制至关重要：没有 id 的 userdata 会被 collect_finalizers
+/// 误判为不可达（id() 返回 None → map_or(false, ...)），即使它还在栈上。
+#[no_mangle]
+pub extern "C-unwind" fn lua_newuserdatauv(L: *mut lua_State, sz: usize, nuvalue: c_int) -> *mut c_void {
+    let L = unsafe { &mut *L };
+    let nuv = if nuvalue >= 0 { nuvalue as usize } else { 0 };
+    let mut udata = crate::objects::Udata {
+        gc_header: crate::gc::GCObjectHeader::new(),
+        nuvalue: nuv as u16,
+        len: sz,
+        metatable: None,
+        user_values: (0..nuv).map(|_| TValue::Nil(NilKind::Strict)).collect(),
+        data: vec![0u8; sz],
+    };
+    // 注册到 GC 并设置 id（使 mark_tvalue 能正确标记 reachable）
+    let ud_id = L.gc.register_object(std::mem::size_of::<crate::objects::Udata>());
+    udata.gc_header.set_id(ud_id);
+    let ptr = udata.data.as_mut_ptr() as *mut c_void;
+    L.stack.push(TValue::UserData(Rc::new(udata)));
+    ptr
+}
+
+/// lua_getmetatable: 获取对象元表。
+///
+/// 将 idx 处对象的元表（若有）压栈，返回 1；否则压 nil 返回 0。
+#[no_mangle]
+pub extern "C" fn lua_getmetatable(L: *mut lua_State, objindex: c_int) -> c_int {
+    if is_registry(objindex) {
+        // registry 没有元表，不 push 任何东西（对应 C Lua 语义）
+        return 0;
+    }
+    let L = unsafe { &mut *L };
+    let off = match index2offset(L, objindex) {
+        Some(o) => o,
+        None => return 0,
+    };
+    let mt = match &L.stack[off] {
+        TValue::UserData(u) => {
+            u.metatable.as_ref().map(|b| (**b).clone())
+        }
+        TValue::Table(t) => t.get_metatable(),
+        _ => None,
+    };
+    match mt {
+        Some(mt_val) => {
+            L.stack.push(TValue::Table(mt_val));
+            1
+        }
+        // 对应 C Lua: 没有元表时不 push 任何东西，只返回 0
+        None => 0,
+    }
+}
+/// lua_setmetatable: 设置对象元表。
+///
+/// 从栈顶弹出元表，设置为 idx 处对象的元表。返回 1 成功，0 失败（对象非 table/userdata）。
+///
+/// 对 userdata 设置含 `__gc` 元方法的元表时，注册到 `ud_finobj_list`，
+/// 确保 userdata 不可达时 GC 调用 finalizer（对应 C Lua 的 luaC_checkfinalizer）。
+/// 这对 C 模块（如 lsqlite3）至关重要：__gc 会在 Rc drop 前被调用，
+/// 让模块有机会清理 registry 中的 light userdata 引用，避免悬空指针。
+#[no_mangle]
+pub extern "C" fn lua_setmetatable(L: *mut lua_State, objindex: c_int) -> c_int {
+    let L = unsafe { &mut *L };
+    // IMPORTANT: resolve object offset BEFORE popping metatable,
+    // because the metatable is at stack top and objindex is relative
+    // to the original stack layout BEFORE the pop.
+    let off = match index2offset(L, objindex) {
+        Some(o) => o,
+        None => return 0,
+    };
+    // Now pop metatable from stack
+    let mt_val = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+    let mt = match mt_val {
+        TValue::Table(t) => Some(t),
+        TValue::Nil(_) => None,
+        _ => {
+            return 0;
+        }
+    };
+    // 预先 intern __gc 字符串（在持有 stack 借用前完成）
+    let gc_key = TValue::Str(L.intern_str("__gc"));
+    // 收集需要注册 __gc 的 userdata（避免在持有 stack 借用时调用 register_ud_finobj）
+    let mut ud_to_register: Option<Rc<Udata>> = None;
+    let result = match &mut L.stack[off] {
+        TValue::Table(t) => {
+            t.set_metatable(mt.clone());
+            1
+        }
+        TValue::UserData(u) => {
+            // Use in-place mutation through raw pointer instead of Rc::make_mut.
+            // Rc::make_mut clones the Udata when refcount > 1, creating a copy
+            // that doesn't propagate back to other references (like the Lua variable).
+            // This breaks the C API semantics where lua_setmetatable modifies
+            // the userdata in-place regardless of how many references there are.
+            let ptr = Rc::as_ptr(u) as *mut Udata;
+            unsafe { (*ptr).metatable = mt.as_ref().map(|t| Box::new(t.clone())); }
+            // 检查元表是否含 __gc，若有则收集待注册的 userdata
+            if let Some(ref mt_table) = mt {
+                if mt_table.get(&gc_key).is_some() {
+                    ud_to_register = Some(Rc::clone(u));
+                }
+            }
+            1
+        }
+        TValue::LightUserData(p) => {
+            let _ = *p;
+            if let Some(mt_val) = mt {
+                L.dmt.set(crate::objects::LuaType::LightUserData, crate::tm::Metatable::new(mt_val));
+            } else {
+                L.dmt.clear(crate::objects::LuaType::LightUserData);
+            }
+            1
+        }
+        _ => {
+            let ty = L.stack[off].ty();
+            if let Some(mt_val) = mt {
+                L.dmt.set(ty, crate::tm::Metatable::new(mt_val));
+            } else {
+                L.dmt.clear(ty);
+            }
+            1
+        }
+    };
+    // 在 match 外注册 __gc finalizer（避免借用冲突）
+    if let Some(ud) = ud_to_register {
+        L.register_ud_finobj(&ud);
+    }
+    result
+}
+
+/// lua_pcallk: 保护调用。
+///
+/// 对应 C 的 lua_pcallk。以保护模式调用函数。
+/// 简化实现：不支持 continuation（k 参数被忽略）。
+#[no_mangle]
+pub extern "C" fn lua_pcallk(
+    L: *mut lua_State,
+    nargs: c_int,
+    nresults: c_int,
+    _errfunc: c_int,
+    _ctx: isize,
+    _k: *const c_void,
+) -> c_int {
+    let L = unsafe { &mut *L };
+    // 清空 c_safety_keepalive: 上次 pcall 错误路径暂存的值现在可以安全释放。
+    // C 代码在两次 pcall 之间不应持有 userdata 指针（C Lua 中 GC 可能已回收）。
+    L.c_safety_keepalive.clear();
+    L.pcall(nargs as usize, nresults, _errfunc as isize)
+}
+
+/// lua_pushthread: 将当前线程压栈。
+#[no_mangle]
+pub extern "C" fn lua_pushthread(L: *mut lua_State) -> c_int {
+    let L = unsafe { &mut *L };
+    // 主线程：还未实现协程线程对象的推送
+    // 简单做法：压入一个布尔值表示主线程
+    L.stack.push(TValue::Boolean(true));
+    1 // 主线程返回 1
+}
+
+// ============================================================================
+// Table iteration (next)
+// ============================================================================
+
+/// lua_next: 表迭代。
+///
+/// 从栈顶弹出一个 key，在 idx 处的表中查找下一对 (key, value)，
+/// 将 key 和 value 压栈。无下一项时返回 0。
+///
+/// 对应 C Lua 5.5 lapi.c lua_next:
+///   k = s2v(L->top.p - 1);   // 保存 key（不立即 pop）
+///   t = gettable(L, idx);    // 用 idx 定位 table（key 还在栈上！）
+///   ... next ...
+///   L->top.p -= 1;           // pop key
+///
+/// 关键：idx 必须在 key 还在栈上时解释，否则负索引会偏移。
+/// 例如栈 [..., table, key]，idx=-2 指向 table；如果先 pop key，
+/// idx=-2 会指向 table 下面的元素。
+#[no_mangle]
+pub extern "C" fn lua_next(L: *mut lua_State, idx: c_int) -> c_int {
+    let L = unsafe { &mut *L };
+    // 先用 idx 定位 table（key 还在栈上），再 pop key
+    let off = match index2offset(L, idx) {
+        Some(o) => o,
+        None => {
+            // table 不存在，但仍需 pop key 保持栈平衡
+            L.stack.pop();
+            return 0;
+        }
+    };
+    // 读取 table 引用后再 pop key，避免借用冲突
+    let table_val = L.stack[off].clone();
+    let key = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+    match &table_val {
+        TValue::Table(t) => match crate::stdlib::base_lib::table_next(t, &key) {
+            Ok((Some(next_key), next_val)) => {
+                L.stack.push(next_key);
+                L.stack.push(next_val);
+                1
+            }
+            Ok((None, _)) => 0,
+            Err(_) => 0,
+        },
+        _ => 0,
+    }
+}
+
+// ============================================================================
+// Length, concat, comparison, arithmetic
+// ============================================================================
+
+/// lua_len: 长度操作符。
+///
+/// 计算 idx 处值的长度，结果压栈。
+#[no_mangle]
+pub extern "C" fn lua_len(L: *mut lua_State, idx: c_int) {
+    let L = unsafe { &mut *L };
+    let len = L.len(idx as isize);
+    L.stack.push(TValue::Integer(len as i64));
+}
+
+/// lua_concat: 字符串连接。
+///
+/// 连接栈顶 n 个值，结果压栈。
+#[no_mangle]
+pub extern "C" fn lua_concat(L: *mut lua_State, n: c_int) {
+    let L = unsafe { &mut *L };
+    if n <= 0 {
+        L.stack.push(TValue::Str(L.intern_str("")));
+        return;
+    }
+    let n = n as usize;
+    // 收集栈顶 n 个值，转为字符串
+    let mut parts: Vec<String> = Vec::with_capacity(n);
+    for _ in 0..n {
+        if L.stack.len() > 0 {
+            let val = L.stack.pop().unwrap();
+            let s = crate::stdlib::base_lib::lua_value_to_string(&val);
+            parts.push(s);
+        }
+    }
+    parts.reverse(); // 恢复原始顺序
+    let result = parts.concat();
+    L.stack.push(TValue::Str(L.intern_str(&result)));
+}
+
+// ============================================================================
+// 格式化字符串 — lua_pushfstring / lua_pushvfstring 由 C wrapper 实现
+// （Rust stable 不支持 c_variadic，用 deps/capi_compat.c 中的 C 代码处理可变参数）
+// ============================================================================
+
+/// lua_rawequal: 原始相等比较（不走元方法）。
+///
+/// 比较 idx1 和 idx2 处的值，相等返回 1，否则 0。
+#[no_mangle]
+pub extern "C" fn lua_rawequal(L: *mut lua_State, idx1: c_int, idx2: c_int) -> c_int {
+    let L = unsafe { &*L };
+    match (index2val(L, idx1), index2val(L, idx2)) {
+        (Some(v1), Some(v2)) => {
+            if v1.ty() != v2.ty() {
+                return 0;
+            }
+            match (v1, v2) {
+                (TValue::Nil(_), TValue::Nil(_)) => 1,
+                (TValue::Boolean(a), TValue::Boolean(b)) => (*a == *b) as c_int,
+                (TValue::Integer(a), TValue::Integer(b)) => (*a == *b) as c_int,
+                (TValue::Float(a), TValue::Float(b)) => (*a == *b) as c_int,
+                (TValue::Str(a), TValue::Str(b)) => (a == b) as c_int,
+                (TValue::Table(a), TValue::Table(b)) => (a.gc_header.ptr_id == b.gc_header.ptr_id) as c_int,
+                (TValue::UserData(a), TValue::UserData(b)) => (a.gc_header.ptr_id == b.gc_header.ptr_id) as c_int,
+                (TValue::LightUserData(a), TValue::LightUserData(b)) => (*a == *b) as c_int,
+                (TValue::LClosure(a), TValue::LClosure(b)) => (a.gc_header.ptr_id == b.gc_header.ptr_id) as c_int,
+                (TValue::CClosure(a), TValue::CClosure(b)) => Rc::ptr_eq(a, b) as c_int,
+                (TValue::Thread(a), TValue::Thread(b)) => Rc::ptr_eq(&a.context, &b.context) as c_int,
+                _ => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// lua_compare: 比较操作（支持元方法）。
+///
+/// op: 0=EQ, 1=LT, 2=LE
+#[no_mangle]
+pub extern "C" fn lua_compare(L: *mut lua_State, idx1: c_int, idx2: c_int, op: c_int) -> c_int {
+    let L = unsafe { &*L };
+    let v1 = match index2val(L, idx1) {
+        Some(v) => v,
+        None => return 0,
+    };
+    let v2 = match index2val(L, idx2) {
+        Some(v) => v,
+        None => return 0,
+    };
+    // 简化实现：仅支持原始类型的比较
+    // 对于 table/userdata 类型尝试使用元方法
+    match op {
+        0 => { // LUA_OPEQ: equal
+            // 先检查 rawequal
+            if v1.ty() == v2.ty() {
+                let eq = match (v1, v2) {
+                    (TValue::Nil(_), TValue::Nil(_)) => true,
+                    (TValue::Boolean(a), TValue::Boolean(b)) => a == b,
+                    (TValue::Integer(a), TValue::Integer(b)) => a == b,
+                    (TValue::Float(a), TValue::Float(b)) => a == b,
+                    (TValue::Integer(a), TValue::Float(b)) => *a as f64 == *b,
+                    (TValue::Float(a), TValue::Integer(b)) => *a == *b as f64,
+                    (TValue::Str(a), TValue::Str(b)) => a == b,
+                    (TValue::Table(a), TValue::Table(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
+                    (TValue::UserData(a), TValue::UserData(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
+                    (TValue::LightUserData(a), TValue::LightUserData(b)) => a == b,
+                    (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
+                    (TValue::CClosure(a), TValue::CClosure(b)) => Rc::ptr_eq(a, b),
+                    (TValue::Thread(a), TValue::Thread(b)) => Rc::ptr_eq(&a.context, &b.context),
+                    _ => false,
+                };
+                return eq as c_int;
+            }
+            // 不同类型：尝试 rawequal
+            0
+        }
+        1 => { // LUA_OPLT: less than
+            match (v1, v2) {
+                (TValue::Integer(a), TValue::Integer(b)) => (*a < *b) as c_int,
+                (TValue::Float(a), TValue::Float(b)) => (*a < *b) as c_int,
+                (TValue::Integer(a), TValue::Float(b)) => ((*a as f64) < (*b)) as c_int,
+                (TValue::Float(a), TValue::Integer(b)) => ((*a) < (*b as f64)) as c_int,
+                (TValue::Str(a), TValue::Str(b)) => (a.as_str() < b.as_str()) as c_int,
+                _ => 0,
+            }
+        }
+        2 => { // LUA_OPLE: less or equal
+            match (v1, v2) {
+                (TValue::Integer(a), TValue::Integer(b)) => (*a <= *b) as c_int,
+                (TValue::Float(a), TValue::Float(b)) => (*a <= *b) as c_int,
+                (TValue::Integer(a), TValue::Float(b)) => ((*a as f64) <= (*b)) as c_int,
+                (TValue::Float(a), TValue::Integer(b)) => ((*a) <= (*b as f64)) as c_int,
+                (TValue::Str(a), TValue::Str(b)) => (a.as_str() <= b.as_str()) as c_int,
+                _ => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// lua_arith: 算术运算。
+///
+/// op: LUA_OPADD=0, OPSUB=1, OPMUL=2, OPMOD=3, OPPOW=4, OPDIV=5,
+///     OPIDIV=6, OPBAND=7, OPBOR=8, OPBXOR=9, OPSHL=10, OPSHR=11,
+///     OPUNM=12, OPBNOT=13
+/// 从栈顶操作，结果压栈（弹出操作数，压入结果）。
+#[no_mangle]
+pub extern "C" fn lua_arith(L: *mut lua_State, op: c_int) {
+    let L = unsafe { &mut *L };
+    let rb = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+    let ra = if op != 12 && op != 13 {
+        L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict))
+    } else {
+        TValue::Integer(0)
+    };
+    
+    use crate::vm::to_number_ns;
+    
+    let result = match op {
+        0 => { // LUA_OPADD: a + b
+            match (&ra, &rb) {
+                (TValue::Integer(i1), TValue::Integer(i2)) => TValue::Integer(i1.wrapping_add(*i2)),
+                _ => {
+                    match (to_number_ns(&ra), to_number_ns(&rb)) {
+                        (Some(n1), Some(n2)) => TValue::Float(n1 + n2),
+                        _ => TValue::Nil(NilKind::Strict),
+                    }
+                }
+            }
+        }
+        1 => { // LUA_OPSUB: a - b
+            match (&ra, &rb) {
+                (TValue::Integer(i1), TValue::Integer(i2)) => TValue::Integer(i1.wrapping_sub(*i2)),
+                _ => {
+                    match (to_number_ns(&ra), to_number_ns(&rb)) {
+                        (Some(n1), Some(n2)) => TValue::Float(n1 - n2),
+                        _ => TValue::Nil(NilKind::Strict),
+                    }
+                }
+            }
+        }
+        2 => { // LUA_OPMUL: a * b
+            match (&ra, &rb) {
+                (TValue::Integer(i1), TValue::Integer(i2)) => TValue::Integer(i1.wrapping_mul(*i2)),
+                _ => {
+                    match (to_number_ns(&ra), to_number_ns(&rb)) {
+                        (Some(n1), Some(n2)) => TValue::Float(n1 * n2),
+                        _ => TValue::Nil(NilKind::Strict),
+                    }
+                }
+            }
+        }
+        3 => { // LUA_OPMOD: a % b
+            match (&ra, &rb) {
+                (TValue::Integer(i1), TValue::Integer(i2)) => {
+                    match crate::vm::modulus(*i1, *i2) {
+                        Ok(r) => TValue::Integer(r),
+                        Err(_) => TValue::Nil(NilKind::Strict),
+                    }
+                }
+                _ => {
+                    match (to_number_ns(&ra), to_number_ns(&rb)) {
+                        (Some(n1), Some(n2)) => TValue::Float(crate::vm::modulus_float(n1, n2)),
+                        _ => TValue::Nil(NilKind::Strict),
+                    }
+                }
+            }
+        }
+        4 => { // LUA_OPPOW: a ^ b
+            match (to_number_ns(&ra), to_number_ns(&rb)) {
+                (Some(n1), Some(n2)) => TValue::Float(n1.powf(n2)),
+                _ => TValue::Nil(NilKind::Strict),
+            }
+        }
+        5 => { // LUA_OPDIV: a / b
+            match (to_number_ns(&ra), to_number_ns(&rb)) {
+                (Some(n1), Some(n2)) => TValue::Float(n1 / n2),
+                _ => TValue::Nil(NilKind::Strict),
+            }
+        }
+        6 => { // LUA_OPIDIV: a // b (floor division)
+            match (&ra, &rb) {
+                (TValue::Integer(i1), TValue::Integer(i2)) => {
+                    match crate::vm::idiv(*i1, *i2) {
+                        Ok(r) => TValue::Integer(r),
+                        Err(_) => TValue::Nil(NilKind::Strict),
+                    }
+                }
+                _ => {
+                    match (to_number_ns(&ra), to_number_ns(&rb)) {
+                        (Some(n1), Some(n2)) => TValue::Float((n1 / n2).floor()),
+                        _ => TValue::Nil(NilKind::Strict),
+                    }
+                }
+            }
+        }
+        7 => { // LUA_OPBAND: a & b
+            match (&ra, &rb) {
+                (TValue::Integer(i1), TValue::Integer(i2)) => TValue::Integer(*i1 & *i2),
+                _ => TValue::Nil(NilKind::Strict),
+            }
+        }
+        8 => { // LUA_OPBOR: a | b
+            match (&ra, &rb) {
+                (TValue::Integer(i1), TValue::Integer(i2)) => TValue::Integer(*i1 | *i2),
+                _ => TValue::Nil(NilKind::Strict),
+            }
+        }
+        9 => { // LUA_OPBXOR: a ^ b (bitwise xor)
+            match (&ra, &rb) {
+                (TValue::Integer(i1), TValue::Integer(i2)) => TValue::Integer(*i1 ^ *i2),
+                _ => TValue::Nil(NilKind::Strict),
+            }
+        }
+        10 => { // LUA_OPSHL: a << b
+            match (&ra, &rb) {
+                (TValue::Integer(i1), TValue::Integer(i2)) => TValue::Integer(crate::vm::shiftl(*i1, *i2)),
+                _ => TValue::Nil(NilKind::Strict),
+            }
+        }
+        11 => { // LUA_OPSHR: a >> b
+            match (&ra, &rb) {
+                (TValue::Integer(i1), TValue::Integer(i2)) => TValue::Integer(crate::vm::shiftr(*i1, *i2)),
+                _ => TValue::Nil(NilKind::Strict),
+            }
+        }
+        12 => { // LUA_OPUNM: unary minus (-a)
+            match &rb {
+                TValue::Integer(i) => TValue::Integer(-i),
+                TValue::Float(f) => TValue::Float(-f),
+                _ => TValue::Nil(NilKind::Strict),
+            }
+        }
+        13 => { // LUA_OPBNOT: bitwise not (~a)
+            match &rb {
+                TValue::Integer(i) => TValue::Integer(!i),
+                _ => TValue::Nil(NilKind::Strict),
+            }
+        }
+        _ => TValue::Nil(NilKind::Strict),
+    };
+    L.stack.push(result);
+}
+
+// ============================================================================
+// Version and panic
+// ============================================================================
+
+/// lua_version: 返回 Lua 版本号。
+#[no_mangle]
+pub extern "C" fn lua_version(_L: *mut lua_State) -> lua_Number {
+    505.0 // LUA_VERSION_NUM = 5*100 + 5
+}
+
+// ============================================================================
+// GC control
+// ============================================================================
+
+/// lua_gc: 垃圾回收控制。
+///
+/// what: LUA_GCSTOP=0, LUA_GCRESTART=1, LUA_GCCOLLECT=2,
+///       LUA_GCCOUNT=3, LUA_GCSTEP=5, LUA_GCSETPAUSE=6,
+#[no_mangle]
+pub unsafe extern "C" fn lua_gc(L: *mut lua_State, what: c_int, _arg: c_int) -> c_int {
+    let L = unsafe { &mut *L };
+    match what {
+        0 => { // LUA_GCSTOP
+            L.gc_stop();
+            0
+        }
+        1 => { // LUA_GCRESTART
+            L.gc_restart();
+            0
+        }
+        2 => { // LUA_GCCOLLECT
+            L.collect_gc();
+            0
+        }
+        3 => { // LUA_GCCOUNT
+            // 返回 GC 内存使用量（以 KB 为单位）
+            L.gc.gc_estimate.get() as c_int
+        }
+        5 => { // LUA_GCSTEP
+            L.step_gc(1024 * 100); // 步进 100KB
+            0
+        }
+        9 => { // LUA_GCISRUNNING
+            if L.gc.gc_stop.get() == 0 { 1 } else { 0 }
+        }
+        10 => { // LUA_GCGEN
+            L.gc_gen();
+            0
+        }
+        11 => { // LUA_GCINC
+            L.gc_inc();
+            0
+        }
+        _ => 0,
+    }
+}
+
+// ============================================================================
+// Integer key access (geti/seti)
+// ============================================================================
+
+/// lua_geti: t[n]，结果压栈。
+#[no_mangle]
+pub extern "C" fn lua_geti(L: *mut lua_State, idx: c_int, n: lua_Integer) -> c_int {
+    let L = unsafe { &mut *L };
+    let key = TValue::Integer(n);
+    if is_registry(idx) {
+        let val = L.registry.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
+        let ty = lua_type_code(val.ty());
+        L.stack.push(val);
+        return ty;
+    }
+    let off = match index2offset(L, idx) {
+        Some(o) => o,
+        None => {
+            L.stack.push(TValue::Nil(NilKind::Strict));
+            return LUA_TNIL;
+        }
+    };
+    let val = match &L.stack[off] {
+        TValue::Table(t) => t.get(&key).unwrap_or(TValue::Nil(NilKind::Strict)),
+        _ => TValue::Nil(NilKind::Strict),
+    };
+    let ty = lua_type_code(val.ty());
+    L.stack.push(val);
+    ty
+}
+
+/// lua_seti: t[n] = v，v 从栈顶弹出。
+#[no_mangle]
+pub extern "C" fn lua_seti(L: *mut lua_State, idx: c_int, n: lua_Integer) {
+    let L = unsafe { &mut *L };
+    if is_registry(idx) {
+        let val = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        L.registry.set(TValue::Integer(n), val);
+        return;
+    }
+    let off = match index2offset(L, idx) {
+        Some(o) => o,
+        None => {
+            L.stack.pop();
+            return;
+        }
+    };
+    let val = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+    if let TValue::Table(ref mut t) = L.stack[off] {
+        t.set(TValue::Integer(n), val);
+    }
+}
+
+// ============================================================================
+// lua_atpanic — 设置 panic 处理器
+// ============================================================================
+
+/// lua_atpanic: 设置 panic 回调。
+///
+/// 保存传入的 panic 处理函数，返回旧的（当前简化：总是返回一个 no-op 函数）。
+#[allow(non_upper_case_globals)]
+static default_panic_handler: lua_CFunction = panic_noop;
+
+unsafe extern "C" fn panic_noop(_L: *mut c_void) -> c_int {
+    0
+}
+
+#[no_mangle]
+pub extern "C" fn lua_atpanic(_L: *mut lua_State, _panicf: lua_CFunction) -> lua_CFunction {
+    // 简化实现：不存储 panic 处理器，总是返回静态的 no-op 函数
+    // 这确保 C 模块尝试调用/比较返回的 panic 处理器时不会遇到 null 指针
+    default_panic_handler
+}
+// ============================================================================
+// Debug & Load API — 供 lauxlib.cpp (静态链接到 C 模块 .so) 使用
+// ============================================================================
+
+/// lua_Debug 结构体 — 对应 C lua.h 的 struct lua_Debug
+#[repr(C)]
+#[allow(non_camel_case_types)]
+pub struct lua_Debug {
+    event: c_int,
+    name: *const c_char,
+    namewhat: *const c_char,
+    what: *const c_char,
+    source: *const c_char,
+    srclen: usize,
+    currentline: c_int,
+    linedefined: c_int,
+    lastlinedefined: c_int,
+    nups: u8,
+    nparams: u8,
+    isvararg: i8,
+    extraargs: u8,
+    istailcall: i8,
+    ftransfer: c_int,
+    ntransfer: c_int,
+    short_src: [i8; 60], // LUA_IDSIZE
+    i_ci: *mut c_void,   // struct CallInfo*
+}
+
+/// lua_Reader — 对应 C lua.h 的 lua_Reader
+pub type lua_Reader = unsafe extern "C" fn(
+    L: *mut lua_State,
+    data: *mut c_void,
+    size: *mut usize,
+) -> *const c_char;
+
+/// lua_WarnFunction — 对应 C lua.h 的 lua_WarnFunction
+pub type lua_WarnFunction = extern "C" fn(ud: *mut c_void, msg: *const c_char, tocont: c_int);
+
+/// lua_getstack: 返回指定级别的堆栈信息
+///
+/// 对应 C Lua lapi.cpp lua_getstack:
+///   level 0 = 当前函数 (call_info 最后一个条目)
+///   level 1 = 调用者 (倒数第二个条目)
+///   ...
+/// 将 call_info 索引存储在 ar.i_ci 中供 lua_getinfo 使用。
+#[no_mangle]
+pub extern "C" fn lua_getstack(L: *mut lua_State, level: c_int, ar: *mut lua_Debug) -> c_int {
+    if level < 0 || ar.is_null() {
+        return 0;
+    }
+    let L = unsafe { &*L };
+    let ci_len = L.call_info.len();
+    if ci_len == 0 {
+        return 0;
+    }
+    let idx = match ci_len.checked_sub(level as usize + 1) {
+        Some(i) => i,
+        None => return 0,
+    };
+    // 将索引存储在 i_ci 中（编码为指针大小的值）
+    unsafe {
+        (*ar).i_ci = idx as *mut c_void;
+    }
+    1
+}
+
+/// lua_getinfo: 获取调试信息
+///
+/// 对应 C Lua lapi.cpp lua_getinfo。支持 what 字符串中的以下选项:
+///   'n' - name, namewhat (从调用点代码分析)
+///   't' - istailcall, extraargs
+///   'f' - 将函数压入栈顶
+///   'S' - what, source, srclen, linedefined, lastlinedefined, short_src
+///   'l' - currentline
+///   'u' - nups, nparams, isvararg
+#[no_mangle]
+pub extern "C" fn lua_getinfo(
+    L: *mut lua_State,
+    what: *const c_char,
+    ar: *mut lua_Debug,
+) -> c_int {
+    if ar.is_null() || what.is_null() {
+        return 0;
+    }
+    let L = unsafe { &mut *L };
+    let what_str = unsafe { CStr::from_ptr(what) }
+        .to_str()
+        .unwrap_or("");
+    let ci_idx = unsafe { (*ar).i_ci as usize };
+    if ci_idx >= L.call_info.len() {
+        return 0;
+    }
+    let ci = &L.call_info[ci_idx];
+
+    // 静态 C 字符串常量
+    static WHAT_C: &[u8] = b"C\0";
+    static WHAT_LUA: &[u8] = b"Lua\0";
+    static SOURCE_C: &[u8] = b"=[C]\0";
+    static SHORT_SRC_C: &[u8] = b"[C]\0";
+    static EMPTY_STR: &[u8] = b"\0";
+
+    if what_str.contains('n') {
+        // name/namewhat: 从调用者代码分析
+        // 对应 C getfuncname: 仅当调用者是 Lua 函数时分析
+        if ci.is_c {
+            // C 函数帧: name=NULL, namewhat=""（无调用点代码可分析）
+            unsafe {
+                (*ar).name = ptr::null();
+                (*ar).namewhat = EMPTY_STR.as_ptr() as *const c_char;
+            }
+        } else if let Some(ref caller_proto) = ci.caller_proto {
+            // Lua 函数帧: 从 caller_proto 的 saved_pc 处分析调用指令
+            let (name, namewhat) = crate::execute::compute_name_from_proto(caller_proto, ci.saved_pc);
+            if name.is_empty() {
+                unsafe {
+                    (*ar).name = ptr::null();
+                    (*ar).namewhat = EMPTY_STR.as_ptr() as *const c_char;
+                }
+            } else {
+                // name 需要是持久化的 C 字符串
+                // 使用 LuaString 的内部缓冲区（通过 intern）
+                let name_ls = crate::state::str_to_ls(&L.string_table, &name);
+                let namewhat_ls = crate::state::str_to_ls(&L.string_table, &namewhat);
+                unsafe {
+                    (*ar).name = name_ls.as_c_str_ptr();
+                    (*ar).namewhat = namewhat_ls.as_c_str_ptr();
+                }
+            }
+        } else {
+            unsafe {
+                (*ar).name = ptr::null();
+                (*ar).namewhat = EMPTY_STR.as_ptr() as *const c_char;
+            }
+        }
+    }
+
+    if what_str.contains('t') {
+        unsafe {
+            (*ar).istailcall = if ci.is_tailcall { 1 } else { 0 };
+            (*ar).extraargs = ci.nextraargs as u8;
+        }
+    }
+
+    if what_str.contains('f') {
+        // 将函数压入栈顶: 函数在 stack[ci.base - 1]
+        if ci.base > 0 && ci.base <= L.stack.len() {
+            let func_val = L.stack[ci.base - 1].clone();
+            L.stack.push(func_val);
+        } else {
+            L.stack.push(TValue::Nil(NilKind::Strict));
+        }
+    }
+
+    if what_str.contains('S') || what_str.contains('l') {
+        if ci.is_c {
+            // C 函数
+            if what_str.contains('S') {
+                unsafe {
+                    (*ar).what = WHAT_C.as_ptr() as *const c_char;
+                    (*ar).source = SOURCE_C.as_ptr() as *const c_char;
+                    (*ar).srclen = 4; // "=[C]" 长度
+                    (*ar).linedefined = -1;
+                    (*ar).lastlinedefined = -1;
+                    // short_src: 复制 "[C]"
+                    let src = b"[C]";
+                    let buf = &mut (*ar).short_src;
+                    for (i, &b) in src.iter().enumerate() {
+                        if i < buf.len() {
+                            buf[i] = b as i8;
+                        }
+                    }
+                    if src.len() < buf.len() {
+                        buf[src.len()] = 0;
+                    }
+                }
+            }
+            if what_str.contains('l') {
+                unsafe { (*ar).currentline = -1; }
+            }
+        } else if let Some(ref closure) = ci.closure {
+            // Lua 函数
+            let proto = &closure.proto;
+            if what_str.contains('S') {
+                let (source_ptr, srclen) = if let Some(ref src) = proto.source {
+                    (src.as_c_str_ptr(), src.len())
+                } else {
+                    (EMPTY_STR.as_ptr() as *const c_char, 0)
+                };
+                unsafe {
+                    (*ar).what = WHAT_LUA.as_ptr() as *const c_char;
+                    (*ar).source = source_ptr;
+                    (*ar).srclen = srclen;
+                    (*ar).linedefined = proto.line_defined;
+                    (*ar).lastlinedefined = proto.last_line_defined;
+                    // short_src: 从 source 生成（简化版）
+                    let src_str = if let Some(ref src) = proto.source {
+                        src.as_str()
+                    } else {
+                        ""
+                    };
+                    let short = if src_str.starts_with('@') {
+                        &src_str[1..]
+                    } else if src_str.starts_with('=') {
+                        &src_str[1..]
+                    } else {
+                        src_str
+                    };
+                    let buf = &mut (*ar).short_src;
+                    let short_bytes = short.as_bytes();
+                    let copy_len = short_bytes.len().min(buf.len() - 1);
+                    for i in 0..copy_len {
+                        buf[i] = short_bytes[i] as i8;
+                    }
+                    buf[copy_len] = 0;
+                }
+            }
+            if what_str.contains('l') {
+                // currentline: 从 caller_proto 的 saved_pc 计算
+                // 注意: saved_pc 是调用点 PC，不是当前执行 PC
+                // 对于 luaL_where(level=1)，level 1 = 调用者，需要调用者当前行号
+                // = 调用点行号 = get_proto_line(caller_proto, saved_pc)
+                let line = if let Some(ref caller_proto) = ci.caller_proto {
+                    crate::execute::get_proto_line(caller_proto, ci.saved_pc)
+                } else {
+                    -1
+                };
+                unsafe { (*ar).currentline = line; }
+            }
+        } else {
+            // 无 closure 信息（不应发生）
+            if what_str.contains('S') {
+                unsafe {
+                    (*ar).what = WHAT_C.as_ptr() as *const c_char;
+                    (*ar).source = EMPTY_STR.as_ptr() as *const c_char;
+                    (*ar).srclen = 0;
+                    (*ar).linedefined = -1;
+                    (*ar).lastlinedefined = -1;
+                    (*ar).short_src[0] = 0;
+                }
+            }
+            if what_str.contains('l') {
+                unsafe { (*ar).currentline = -1; }
+            }
+        }
+    }
+
+    if what_str.contains('u') {
+        if let Some(ref closure) = ci.closure {
+            unsafe {
+                (*ar).nups = closure.proto.size_upvalues as u8;
+                (*ar).nparams = closure.proto.num_params as u8;
+                (*ar).isvararg = if closure.proto.is_vararg() { 1 } else { 0 };
+            }
+        } else {
+            unsafe {
+                (*ar).nups = 0;
+                (*ar).nparams = 0;
+                (*ar).isvararg = 0;
+            }
+        }
+    }
+
+    1
+}
+
+/// lua_load: 加载 Lua 代码块
+///
+/// reader 是读取回调，data 是回调参数，chunkname 是代码块名称，mode 是编译模式。
+/// 加载成功返回 0，失败返回错误码。
+#[no_mangle]
+pub extern "C" fn lua_load(
+    L: *mut lua_State,
+    reader: lua_Reader,
+    data: *mut c_void,
+    chunkname: *const c_char,
+    _mode: *const c_char,
+) -> c_int {
+    let state = unsafe { &mut *L };
+    // 通过 reader 回调读取完整源码
+    let mut source = Vec::new();
+    loop {
+        let mut sz: usize = 0;
+        let chunk = unsafe { reader(L, data, &mut sz) };
+        if chunk.is_null() || sz == 0 {
+            break;
+        }
+        let slice = unsafe { std::slice::from_raw_parts(chunk as *const u8, sz) };
+        source.extend_from_slice(slice);
+    }
+    let name = if chunkname.is_null() {
+        "=(C load)"
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(chunkname) }
+            .to_str()
+            .unwrap_or("=(C load)")
+    };
+    let source_str = String::from_utf8_lossy(&source);
+    let status = state.load_buffer(&source_str, name);
+    status as c_int
+}
+/// lua_setwarnf: 设置警告回调（简化实现：忽略）
+#[no_mangle]
+pub extern "C" fn lua_setwarnf(
+    _L: *mut lua_State,
+    _f: lua_WarnFunction,
+    _ud: *mut c_void,
+) {
+    // 简化实现：不存储警告回调
+}
+
+/// lua_numbertocstring: 将数字转换为字符串并写入缓冲
+///
+/// 返回写入的字节数（不含终止 null）。
+#[no_mangle]
+pub extern "C" fn lua_numbertocstring(
+    L: *mut lua_State,
+    idx: c_int,
+    buff: *mut c_char,
+) -> u32 {
+    let state = unsafe { &mut *L };
+    let off = match index2offset(state, idx) {
+        Some(o) => o,
+        None => return 0,
+    };
+    let val = &state.stack[off];
+    let s = crate::stdlib::base_lib::lua_value_to_string(val);
+    let bytes = s.as_bytes();
+    let len = bytes.len().min(255); // 安全上限
+    if !buff.is_null() {
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buff as *mut u8, len);
+            *buff.add(len) = 0; // null-terminate
+        }
+    }
+    len as u32
+}
+
+/// lua_toclose: 标记栈上值在离开作用域时关闭（简化实现：忽略）
+#[no_mangle]
+pub extern "C" fn lua_toclose(_L: *mut lua_State, _idx: c_int) {
+    // 简化实现：不支持 to-close 变量
+}
+
+/// lua_closeslot: 关闭 to-close 槽（简化实现：忽略）
+#[no_mangle]
+pub extern "C" fn lua_closeslot(_L: *mut lua_State, _idx: c_int) {
+    // 简化实现
+}
+
+/// lua_topointer: 返回值的内部指针
+#[no_mangle]
+pub extern "C" fn lua_topointer(L: *mut lua_State, idx: c_int) -> *const c_void {
+    let state = unsafe { &mut *L };
+    let off = match index2offset(state, idx) {
+        Some(o) => o,
+        None => return std::ptr::null(),
+    };
+    match &state.stack[off] {
+        TValue::Str(s) => s.as_str().as_ptr() as *const c_void,
+        TValue::Table(t) => std::ptr::from_ref(t) as *const c_void,
+        TValue::LClosure(c) => std::ptr::from_ref(c) as *const c_void,
+        TValue::CClosure(c) => std::ptr::from_ref(c) as *const c_void,
+        TValue::UserData(u) => std::ptr::from_ref(u) as *const c_void,
+        TValue::LightUserData(p) => *p as *const c_void,
+        TValue::Thread(th) => std::ptr::from_ref(th) as *const c_void,
+        _ => std::ptr::from_ref(&state.stack[off]) as *const c_void,
+    }
+}
 
 // ============================================================================
 // External String — Lua 5.5 新增 API
@@ -1237,7 +2261,6 @@ pub unsafe fn sys_sym(lib: *mut c_void, sym: &str) -> Option<lua_CFunction> {
     }
 }
 
-/// 内部函数：dlclose 关闭动态库
 pub unsafe fn sys_unload(lib: *mut c_void) {
     if !lib.is_null() {
         unsafe {
@@ -1256,6 +2279,477 @@ pub unsafe fn sys_dlerror() -> String {
             .to_string_lossy()
             .into_owned()
     }
+}
+
+// ============================================================================
+// luaL_* 扩展函数 — 供 sol2 等 C++ binding 库使用
+// ============================================================================
+// 这些函数对应 C 实现的 lauxlib.cpp 中的 LUALIB_API 函数。
+// 之前只导出了 C 模块（cjson/luasocket/lsqlite3）需要的少数 luaL_* 函数，
+// sol2 等更高级的 binding 库需要完整的 luaL_* API。
+
+/// luaL_loadbufferx: 加载缓冲区为 Lua 代码块
+///
+/// 对应 C lauxlib.cpp 的 luaL_loadbufferx。
+/// 用 lua_load + reader 回调实现。
+#[no_mangle]
+pub extern "C" fn luaL_loadbufferx(
+    L: *mut lua_State,
+    buff: *const c_char,
+    size: usize,
+    name: *const c_char,
+    mode: *const c_char,
+) -> c_int {
+    if buff.is_null() || size == 0 {
+        // 空缓冲区：push 空函数
+        let state = unsafe { &mut *L };
+        let name_str = if name.is_null() {
+            "=(load)".to_string()
+        } else {
+            unsafe { CStr::from_ptr(name) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        return state.load_buffer("", &name_str) as c_int;
+    }
+
+    // 用 lua_load 的 reader 机制
+    struct LoadS {
+        s: *const c_char,
+        size: usize,
+    }
+    unsafe extern "C" fn reader(
+        _L: *mut lua_State,
+        data: *mut c_void,
+        sz: *mut usize,
+    ) -> *const c_char {
+        let ls = &mut *(data as *mut LoadS);
+        if ls.size == 0 {
+            *sz = 0;
+            return ptr::null();
+        }
+        *sz = ls.size;
+        let ptr = ls.s;
+        ls.size = 0; // 一次性返回全部
+        ptr
+    }
+    let ls = LoadS { s: buff, size };
+    lua_load(
+        L,
+        reader,
+        &ls as *const LoadS as *mut c_void,
+        name,
+        mode,
+    )
+}
+
+/// luaL_loadbuffer: 兼容宏（luaL_loadbufferx with mode=NULL）
+#[no_mangle]
+pub extern "C" fn luaL_loadbuffer(
+    L: *mut lua_State,
+    buff: *const c_char,
+    size: usize,
+    name: *const c_char,
+) -> c_int {
+    luaL_loadbufferx(L, buff, size, name, ptr::null())
+}
+
+/// luaL_loadstring: 加载字符串
+#[no_mangle]
+pub extern "C" fn luaL_loadstring(L: *mut lua_State, s: *const c_char) -> c_int {
+    if s.is_null() {
+        return 3; // LUA_ERRSYNTAX
+    }
+    let cstr = unsafe { CStr::from_ptr(s) };
+    let bytes = cstr.to_bytes();
+    luaL_loadbufferx(L, s, bytes.len(), s, ptr::null())
+}
+
+/// luaL_getmetatable: 从注册表获取指定名称的元表
+///
+/// 返回值的类型（LUA_TNIL 如果不存在）。
+#[no_mangle]
+pub extern "C" fn luaL_getmetatable(L: *mut lua_State, name: *const c_char) -> c_int {
+    let L = unsafe { &mut *L };
+    let name_str = if name.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let key = crate::state::str_to_ls(&L.string_table, &name_str);
+    let val = L
+        .registry
+        .get(&TValue::Str(key))
+        .unwrap_or(TValue::Nil(NilKind::Strict));
+    let ty = lua_type_code(val.ty());
+    L.stack.push(val);
+    ty
+}
+
+/// luaL_newmetatable: 创建并注册元表到注册表
+///
+/// 如果已存在返回 0（不创建），否则创建并返回 1。
+#[no_mangle]
+pub extern "C" fn luaL_newmetatable(L: *mut lua_State, tname: *const c_char) -> c_int {
+    // 先检查是否已存在
+    let existing_type = luaL_getmetatable(L, tname);
+    if existing_type != 0 { // 非 nil（LUA_TNIL=0）
+        return 0; // 已存在，不创建
+    }
+    // 弹出 nil
+    let L = unsafe { &mut *L };
+    L.stack.pop();
+    // 创建新表
+    lua_createtable(L, 0, 2);
+    // 设置 __name 字段
+    let tname_str = if tname.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(tname) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    lua_pushstring(L, tname);
+    lua_setfield(L, -2, c"__name".as_ptr());
+    // 注册到 registry[tname] = metatable
+    // 对应 C: lua_pushvalue(L, -1); lua_setfield(L, LUA_REGISTRYINDEX, tname);
+    // lua_setfield 会弹出复制的值，这里需手动 pop
+    lua_pushvalue(L, -1);
+    let key = crate::state::str_to_ls(&L.string_table, &tname_str);
+    let val = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+    L.registry.set(TValue::Str(key), val);
+    1
+}
+
+/// luaL_getsubtable: 获取 t[idx] 中的子表 [name]
+///
+/// 如果不存在则创建。成功返回 1，失败返回 0。
+#[no_mangle]
+pub extern "C" fn luaL_getsubtable(L: *mut lua_State, idx: c_int, fname: *const c_char) -> c_int {
+    // 获取 t[idx]
+    lua_getfield(L, idx, fname);
+    let L = unsafe { &mut *L };
+    let is_table = matches!(
+        L.stack.last().unwrap_or(&TValue::Nil(NilKind::Strict)),
+        TValue::Table(_)
+    );
+    if is_table {
+        return 1; // 已存在
+    }
+    // 不存在，弹出 nil，创建新表
+    L.stack.pop();
+    lua_createtable(L, 0, 0);
+    // t[fname] = newtable
+    // 需要：push t[idx]，push newtable，setfield
+    // 但 setfield 会 pop newtable，所以先复制一份
+    lua_pushvalue(L, -1); // 复制 newtable
+    lua_setfield(L, idx, fname); // t[fname] = newtable（pop 副本）
+    // 栈顶保留 newtable
+    1
+}
+
+/// luaL_checkstack: 确保栈有 space 个额外空间，否则抛出 "stack overflow" 错误。
+///
+/// 对应 C 的 lauxlib.cpp::luaL_checkstack。
+#[no_mangle]
+pub extern "C-unwind" fn luaL_checkstack(L: *mut lua_State, space: c_int, msg: *const c_char) {
+    if unsafe { lua_checkstack(L, space) } == 0 {
+        // 栈溢出：构造错误消息并抛出
+        let errmsg = if !msg.is_null() {
+            let cstr = unsafe { CStr::from_ptr(msg) };
+            format!("stack overflow ({})", cstr.to_string_lossy())
+        } else {
+            "stack overflow".to_string()
+        };
+        let L = unsafe { &mut *L };
+        L.push_string(&errmsg);
+        unsafe { lua_error(L) };
+    }
+}
+
+/// luaL_where: 标记当前调用位置（level 1）的错误信息前缀
+///
+/// push "chunkname:line: " 到栈顶。
+#[no_mangle]
+pub extern "C" fn luaL_where(L: *mut lua_State, _level: c_int) {
+    // 简化实现：push 空字符串（Rust 实现的调试信息结构与 C 不同）
+    let L = unsafe { &mut *L };
+    L.push_string("");
+}
+
+/// luaL_error: 抛出格式化错误
+///
+/// 注意：Rust stable 不支持 c_variadic，真正的 luaL_error 由
+/// deps/capi_compat.c 中的 C 代码实现（用 vsnprintf 格式化可变参数）。
+/// 此 Rust 版本仅作为 fallback，不导出（无 #[no_mangle]）。
+#[allow(dead_code)]
+extern "C-unwind" fn luaL_error_rust(L: *mut lua_State, fmt: *const c_char) -> c_int {
+    if !fmt.is_null() {
+        unsafe { lua_pushstring(L, fmt) };
+    } else {
+        let L = unsafe { &mut *L };
+        L.push_string("error");
+    }
+    unsafe { lua_error(L) }
+}
+
+/// luaL_requiref: 简化版 require
+///
+/// 调用 openf 打开模块，注册到 package.loaded，可选注册到全局表。
+#[no_mangle]
+pub extern "C" fn luaL_requiref(
+    L: *mut lua_State,
+    modname: *const c_char,
+    openf: lua_CFunction,
+    glb: c_int,
+) {
+    // 获取 registry[LUA_LOADED_TABLE]
+    // LUA_LOADED_TABLE = LUA_REGISTRYINDEX 下 "LOADED" 子表
+    // 简化：直接用 registry 的 hash 部分，key 是模块名
+    let L = unsafe { &mut *L };
+    let modname_str = if modname.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(modname) }
+            .to_string_lossy()
+            .into_owned()
+    };
+
+    // 检查是否已加载：registry[modname]
+    let mod_key = crate::state::str_to_ls(&L.string_table, &modname_str);
+    let loaded_val = L
+        .registry
+        .get(&TValue::Str(mod_key.clone()))
+        .unwrap_or(TValue::Nil(NilKind::Strict));
+
+    if !matches!(loaded_val, TValue::Nil(_)) && !matches!(loaded_val, TValue::Boolean(false)) {
+        // 已加载，push 到栈顶
+        L.stack.push(loaded_val);
+    } else {
+        // 未加载，调用 openf
+        // push openf 作为 C 函数到栈顶，push modname 作为参数，pcall 调用
+        // pcall 内部会保存/恢复 api_func_base，无需手动设置
+        L.stack.push(TValue::LCFn(LCFunction { func: openf }));
+        L.push_string(&modname_str);
+        let status = L.pcall(1, 1, 0);
+        if status != 0 {
+            // 调用失败，弹出错误，push 模块名作为 fallback
+            L.stack.pop();
+            L.push_string(&modname_str);
+        }
+
+        // 注册到 registry[modname] = result
+        if let Some(val) = L.stack.last() {
+            let val = val.clone();
+            L.registry.set(TValue::Str(mod_key.clone()), val);
+        }
+
+        // 如果 glb，设置全局变量
+        if glb != 0 {
+            let val = L.stack.last().cloned().unwrap_or(TValue::Nil(NilKind::Strict));
+            L.globals.set(TValue::Str(mod_key), val);
+        }
+    }
+}
+
+/// lua_xmove: 在线程间移动 n 个值
+///
+/// 对应 C lapi.cpp 的 lua_xmove。
+/// 从 from 栈顶弹出 n 个值，push 到 to 栈顶。
+#[no_mangle]
+pub extern "C" fn lua_xmove(from: *mut lua_State, to: *mut lua_State, n: c_int) {
+    if from == to || n <= 0 {
+        return;
+    }
+    let from = unsafe { &mut *from };
+    let to = unsafe { &mut *to };
+    let n = n as usize;
+    let start = if from.stack.len() >= n {
+        from.stack.len() - n
+    } else {
+        0
+    };
+    let vals: Vec<_> = from.stack.drain(start..).collect();
+    for v in vals {
+        to.stack.push(v);
+    }
+}
+
+/// lua_pushglobaltable: push 全局表到栈顶
+#[no_mangle]
+pub extern "C" fn lua_pushglobaltable(L: *mut lua_State) {
+    let L = unsafe { &mut *L };
+    L.stack.push(TValue::Table(L.globals.clone()));
+}
+
+/// luaL_traceback: 生成调用栈回溯字符串
+///
+/// 简化实现：只 push msg（如果非空），不生成完整栈回溯。
+/// Rust lua 的调试信息结构与 C 不同，完整实现需要 lua_getstack/lua_getinfo。
+#[no_mangle]
+pub extern "C" fn luaL_traceback(
+    L: *mut lua_State,
+    _L1: *mut lua_State,
+    msg: *const c_char,
+    _level: c_int,
+) {
+    let L = unsafe { &mut *L };
+    if msg.is_null() {
+        L.push_string("stack traceback:");
+    } else {
+        let msg_str = unsafe { CStr::from_ptr(msg) }
+            .to_string_lossy()
+            .into_owned();
+        L.push_string(&format!("{}\nstack traceback:", msg_str));
+    }
+}
+
+// ============================================================================
+// luaopen_* 标准库开库函数 — 供 luaL_requiref 调用
+// ============================================================================
+// 每个函数调用对应的 Rust open_*_lib，然后 push 库表（或全局表）到栈顶，
+// 返回 1。签名与 C 实现一致：int luaopen_xxx(lua_State *L)。
+
+/// luaopen_base: 打开基础库
+#[no_mangle]
+pub extern "C" fn luaopen_base(L: *mut lua_State) -> c_int {
+    let L = unsafe { &mut *L };
+    crate::stdlib::base_lib::open_base_lib(L);
+    // push 全局表作为返回值
+    L.stack.push(TValue::Table(L.globals.clone()));
+    1
+}
+
+/// luaopen_math: 打开数学库
+#[no_mangle]
+pub extern "C" fn luaopen_math(L: *mut lua_State) -> c_int {
+    let L = unsafe { &mut *L };
+    crate::stdlib::math_lib::open_math_lib(L);
+    // push math 表
+    let math_key = crate::state::str_to_ls(&L.string_table, "math");
+    let math_val = L
+        .globals
+        .get(&TValue::Str(math_key))
+        .unwrap_or(TValue::Nil(NilKind::Strict));
+    L.stack.push(math_val);
+    1
+}
+
+/// luaopen_string: 打开字符串库
+#[no_mangle]
+pub extern "C" fn luaopen_string(L: *mut lua_State) -> c_int {
+    let L = unsafe { &mut *L };
+    crate::stdlib::string_lib::open_string_lib(L);
+    let key = crate::state::str_to_ls(&L.string_table, "string");
+    let val = L
+        .globals
+        .get(&TValue::Str(key))
+        .unwrap_or(TValue::Nil(NilKind::Strict));
+    L.stack.push(val);
+    1
+}
+
+/// luaopen_os: 打开 OS 库
+#[no_mangle]
+pub extern "C" fn luaopen_os(L: *mut lua_State) -> c_int {
+    let L = unsafe { &mut *L };
+    crate::stdlib::os_lib::open_os_lib(L);
+    let key = crate::state::str_to_ls(&L.string_table, "os");
+    let val = L
+        .globals
+        .get(&TValue::Str(key))
+        .unwrap_or(TValue::Nil(NilKind::Strict));
+    L.stack.push(val);
+    1
+}
+
+/// luaopen_coroutine: 打开协程库
+#[no_mangle]
+pub extern "C" fn luaopen_coroutine(L: *mut lua_State) -> c_int {
+    let L = unsafe { &mut *L };
+    crate::stdlib::coroutine_lib::open_coroutine_lib(L);
+    let key = crate::state::str_to_ls(&L.string_table, "coroutine");
+    let val = L
+        .globals
+        .get(&TValue::Str(key))
+        .unwrap_or(TValue::Nil(NilKind::Strict));
+    L.stack.push(val);
+    1
+}
+
+/// luaopen_table: 打开 table 库
+#[no_mangle]
+pub extern "C" fn luaopen_table(L: *mut lua_State) -> c_int {
+    let L = unsafe { &mut *L };
+    crate::stdlib::table_lib::open_table_lib(L);
+    let key = crate::state::str_to_ls(&L.string_table, "table");
+    let val = L
+        .globals
+        .get(&TValue::Str(key))
+        .unwrap_or(TValue::Nil(NilKind::Strict));
+    L.stack.push(val);
+    1
+}
+
+/// luaopen_io: 打开 IO 库
+#[no_mangle]
+pub extern "C" fn luaopen_io(L: *mut lua_State) -> c_int {
+    let L = unsafe { &mut *L };
+    crate::stdlib::io_lib::open_io_lib(L);
+    let key = crate::state::str_to_ls(&L.string_table, "io");
+    let val = L
+        .globals
+        .get(&TValue::Str(key))
+        .unwrap_or(TValue::Nil(NilKind::Strict));
+    L.stack.push(val);
+    1
+}
+
+/// luaopen_debug: 打开 debug 库
+#[no_mangle]
+pub extern "C" fn luaopen_debug(L: *mut lua_State) -> c_int {
+    let L = unsafe { &mut *L };
+    crate::stdlib::debug_lib::open_debug_lib(L);
+    let key = crate::state::str_to_ls(&L.string_table, "debug");
+    let val = L
+        .globals
+        .get(&TValue::Str(key))
+        .unwrap_or(TValue::Nil(NilKind::Strict));
+    L.stack.push(val);
+    1
+}
+
+/// luaopen_utf8: 打开 utf8 库
+#[no_mangle]
+pub extern "C" fn luaopen_utf8(L: *mut lua_State) -> c_int {
+    let L = unsafe { &mut *L };
+    crate::stdlib::utf8_lib::open_utf8_lib(L);
+    let key = crate::state::str_to_ls(&L.string_table, "utf8");
+    let val = L
+        .globals
+        .get(&TValue::Str(key))
+        .unwrap_or(TValue::Nil(NilKind::Strict));
+    L.stack.push(val);
+    1
+}
+
+/// luaopen_package: 打开 package 库
+///
+/// Rust 实现中 package 表由 open_base_lib 初始化，
+/// 这里直接返回 package 表。
+#[no_mangle]
+pub extern "C" fn luaopen_package(L: *mut lua_State) -> c_int {
+    let L = unsafe { &mut *L };
+    // package 表已在 open_base_lib 中初始化
+    let key = crate::state::str_to_ls(&L.string_table, "package");
+    let val = L
+        .globals
+        .get(&TValue::Str(key))
+        .unwrap_or(TValue::Nil(NilKind::Strict));
+    L.stack.push(val);
+    1
 }
 
 // ============================================================================

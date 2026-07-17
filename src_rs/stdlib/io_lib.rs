@@ -207,10 +207,11 @@ fn new_file_userdata(state: &mut LuaState, file: *mut libc::FILE, file_mt: &Tabl
     state.file_handles.insert(ptr_id, file);
     // 如果元表有 __gc，注册到 ud_finobj_list
     let gc_key = TValue::Str(state.intern_str("__gc"));
+    let ud_rc = Rc::new(udata);
     if file_mt.get(&gc_key).is_some() {
-        state.register_ud_finobj(&udata);
+        state.register_ud_finobj(&ud_rc);
     }
-    TValue::UserData(Rc::new(udata))
+    TValue::UserData(ud_rc)
 }
 
 /// 创建已关闭的 FILE* userdata — 用于 io.type 检查已关闭文件

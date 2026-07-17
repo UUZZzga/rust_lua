@@ -274,7 +274,9 @@ pub struct LuaState {
     pub finobj_list: Vec<Table>,
     /// 有 __gc 元方法的 UserData 列表 — FILE* 等通过默认元表设置的 userdata
     /// GC 时检查不可达的 UserData，调用其 finalizer（fclose）后释放
-    pub ud_finobj_list: Vec<crate::objects::Udata>,
+    /// 存储 Rc<Udata> 而非 Udata 深拷贝：确保 __gc 在原始 userdata 上调用，
+    /// 这样 C 模块（如 lsqlite3）能通过 light userdata 指针正确清理 registry 引用
+    pub ud_finobj_list: Vec<Rc<crate::objects::Udata>>,
     /// 状态正在关闭 — 对应 C 的 g->gcstp & GCSTPCLS
     /// true 时不再注册新的 finalizer 对象（close 中创建的对象不会被 finalize）
     pub gc_closing: bool,
@@ -321,6 +323,16 @@ pub struct LuaState {
     /// 上次 GC 后的 gc_estimate 快照 — 用于判断 malloc_trim 是否值得调用
     /// （仅当释放了大量内存时才 trim，避免每次 GC 都做系统调用）
     pub last_gc_estimate: usize,
+    /// C 安全 keepalive 区 — pcall 错误路径中被截断的 TValue 暂存于此，
+    /// 延迟到下次 lua_pcallk 调用时释放。
+    ///
+    /// 原因：C 代码（如 lsqlite3 的 db_sql_normal_function）在 lua_pcall 失败后
+    /// 可能仍持有 userdata 指针（通过 lua_newuserdatauv 获取），并访问其数据区
+    /// （如 `ctx->ctx = NULL`）。C Lua 的栈是数组，truncate 只移动 top 指针，
+    /// userdata 在 GC 前保持有效。Rust 用 Vec<TValue>，truncate 立即 drop，
+    /// Rc 引用计数为 0 时 userdata 内存被释放，导致悬空指针。
+    /// 此字段模拟 C Lua 的 GC 延迟释放行为。
+    pub c_safety_keepalive: Vec<TValue>,
 }
 
 /// 调用栈条目 — 用于堆栈回溯和 debug.getinfo
@@ -467,6 +479,7 @@ impl LuaState {
             cached_mode_key: std::cell::RefCell::new(None),
             cached_gc_key: std::cell::RefCell::new(None),
             last_gc_estimate: 0,
+            c_safety_keepalive: Vec::new(),
         }
     }
 
@@ -660,6 +673,7 @@ impl LuaState {
             cached_mode_key: std::cell::RefCell::new(None),
             cached_gc_key: std::cell::RefCell::new(None),
             last_gc_estimate: 0,
+            c_safety_keepalive: Vec::new(),
         };
         state
     }
@@ -803,6 +817,7 @@ impl LuaState {
             cached_mode_key: std::cell::RefCell::new(None),
             cached_gc_key: std::cell::RefCell::new(None),
             last_gc_estimate: 0,
+            c_safety_keepalive: Vec::new(),
         }
     }
 }
@@ -1069,8 +1084,7 @@ impl LuaState {
     }
 
     pub fn push_lstring(&mut self, s: &[u8]) {
-        let text = String::from_utf8_lossy(s).into_owned();
-        let ls = str_to_ls(&self.string_table, &text);
+        let ls = crate::strings::new_lstr_bytes(&self.string_table, s);
         self.stack.push(TValue::Str(ls));
     }
 
@@ -1371,7 +1385,7 @@ impl LuaState {
             to_finalize.push(TValue::Table(t));
         }
         for u in self.ud_finobj_list.drain(..).rev() {
-            to_finalize.push(TValue::UserData(Rc::new(u)));
+            to_finalize.push(TValue::UserData(u));
         }
         self.call_finalizers(to_finalize);
         // finalizer 中可能调用 os.exit(code, true) 设置 exit_requested
@@ -2201,7 +2215,16 @@ impl LuaState {
                             // pending_yield 已设置，调用者检查并传播
                             LUA_YIELD
                         } else {
-                            self.stack.truncate(func_idx);
+                            // 将截断的值移到 c_safety_keepalive，延迟到下次 lua_pcallk 时释放。
+                            // C 代码（如 lsqlite3 的 db_sql_normal_function）在 lua_pcall 失败后
+                            // 可能仍持有 userdata 指针并访问其数据区。C Lua 的栈是数组，
+                            // truncate 只移动 top 指针，userdata 在 GC 前保持有效。
+                            // Rust 用 Vec<TValue>，truncate 立即 drop，Rc 引用计数为 0 时
+                            // userdata 内存被释放，导致悬空指针。此 keepalive 模拟 C Lua 行为。
+                            if self.stack.len() > func_idx {
+                                let drained = self.stack.split_off(func_idx);
+                                self.c_safety_keepalive.extend(drained);
+                            }
                             // close 后 last_error_value 包含最终错误值（可能是原始错误或 __close 错误）
                             // 保留原始 TValue 类型（如数字 43），pcall 返回 (false, err_value)
                             let err_val = close_err.unwrap_or_else(|| TValue::Nil(NilKind::Strict));
@@ -2413,6 +2436,23 @@ impl LuaState {
         self.api_func_base = func_idx;
         self.n_ccalls = self.n_ccalls.saturating_add(1);
 
+        // 推入 CallInfoEntry — 对应 C 的 luaD_precall 创建新 CallInfo
+        // pcall 路径下，调用者是 pcall（内部 C 函数），不是 Lua 函数，
+        // caller_proto=None 表示无法从代码分析函数名，lua_getinfo("n") 返回 NULL，
+        // 触发 luaL_argerror 调用 pushglobalfuncname 查找全局名。
+        self.call_info.push(crate::state::CallInfoEntry {
+            caller_proto: None,
+            is_c: true,
+            closure: None,
+            base: func_idx + 1,
+            saved_pc: 0,
+            name: String::new(),
+            namewhat: String::new(),
+            proto_flag: self.proto_flag,
+            nextraargs: self.nextraargs,
+            is_tailcall: false,
+        });
+
         // 预留 capacity，但不 push nil（push 会改变 stack.len()，导致 C 函数中
         // lua_gettop 返回值偏移）。C 函数需要空间时通过 lua_checkstack 或
         // lua_pushxxx 自动扩展栈。
@@ -2423,15 +2463,21 @@ impl LuaState {
 
         // 清空 pending_error，捕获 C 函数中 lua_error 触发的 panic
         // 对应 C 的 longjmp 跨 C 函数抛错到 pcall 的 setjmp
+        // 将 f 转换为 extern "C-unwind" 以允许 panic 跨 C 帧展开回 catch_unwind
+        // （C 模块编译时加 -fexceptions，GCC 生成 unwind 表使 Rust panic 能通过）
         self.pending_error = None;
         let ptr: *mut LuaState = self;
+        let f_unwind: unsafe extern "C-unwind" fn(*mut c_void) -> i32 = unsafe {
+            std::mem::transmute(f)
+        };
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            f(ptr as *mut c_void)
+            f_unwind(ptr as *mut c_void)
         }));
 
         // 恢复 api_func_base 和 n_ccalls（无论成功失败）
         self.api_func_base = saved_api_base;
         self.n_ccalls = self.n_ccalls.saturating_sub(1);
+        self.call_info.pop();
 
         // 错误路径：lua_error 触发 panic + pending_error
         if let Err(payload) = panic_result {
@@ -2600,7 +2646,8 @@ impl LuaState {
     }
 
     /// 注册有 __gc 元方法的 UserData — FILE* 等通过默认元表设置的 userdata
-    pub fn register_ud_finobj(&mut self, u: &crate::objects::Udata) {
+    /// 存储 Rc<Udata> 引用（而非深拷贝），确保 __gc 在原始 userdata 上调用
+    pub fn register_ud_finobj(&mut self, u: &Rc<crate::objects::Udata>) {
         if self.gc_closing {
             return;
         }
@@ -2610,7 +2657,7 @@ impl LuaState {
             .iter()
             .any(|x| x.gc_header.ptr_id == ptr_id)
         {
-            self.ud_finobj_list.push(u.clone());
+            self.ud_finobj_list.push(Rc::clone(u));
         }
     }
 
@@ -3040,7 +3087,7 @@ impl LuaState {
         }
         self.finobj_list = keep;
 
-        let mut ud_keep: Vec<crate::objects::Udata> = Vec::new();
+        let mut ud_keep: Vec<Rc<crate::objects::Udata>> = Vec::new();
         for u in self.ud_finobj_list.drain(..) {
             let is_reachable = u
                 .gc_header
@@ -3058,8 +3105,8 @@ impl LuaState {
                 }
             };
             if has_gc {
-                worklist.push(TValue::UserData(Rc::new(u.clone())));
-                to_finalize.push(TValue::UserData(Rc::new(u)));
+                worklist.push(TValue::UserData(Rc::clone(&u)));
+                to_finalize.push(TValue::UserData(u));
             }
         }
         self.ud_finobj_list = ud_keep;
@@ -3300,7 +3347,11 @@ impl LuaState {
     fn needs_gc_mark(val: &TValue) -> bool {
         matches!(
             val,
-            TValue::Table(_) | TValue::LClosure(_) | TValue::UserData(_) | TValue::Thread(_)
+            TValue::Table(_)
+                | TValue::LClosure(_)
+                | TValue::CClosure(_)
+                | TValue::UserData(_)
+                | TValue::Thread(_)
         )
     }
 
@@ -3380,6 +3431,21 @@ impl LuaState {
                         }
                     }
                 }
+                }
+            }
+            TValue::CClosure(cc) => {
+                // CClosure 没有 gc_header，用 Rc 指针地址做 visited 去重。
+                // 遍历 upvalue 列表，标记其中需要 GC 的对象（如 UserData）。
+                // 这对 C 模块（如 lua-cjson）至关重要：config UserData 作为 CClosure
+                // 的 upvalue 存储，若不遍历 CClosure，config 会被误判为不可达，
+                // __gc 释放其内部 buffer 后，后续访问导致 use-after-free。
+                let ptr = Rc::as_ptr(cc) as usize;
+                if visited.insert(ptr) {
+                    for uv in &cc.upvalue {
+                        if Self::needs_gc_mark(uv) {
+                            worklist.push(uv.clone());
+                        }
+                    }
                 }
             }
             TValue::UserData(u) => {

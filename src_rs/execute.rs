@@ -342,7 +342,7 @@ pub fn compute_caller_info(entry: &crate::state::CallInfoEntry) -> (String, i32,
 ///
 /// Rust 版本中 state.pc 在读取指令时未递增（与 C 的 savedpc++ 不同），
 /// 所以 saved_pc 直接指向 CALL 指令本身的偏移。
-fn compute_name_from_proto(caller_proto: &Proto, saved_pc: usize) -> (String, String) {
+pub fn compute_name_from_proto(caller_proto: &Proto, saved_pc: usize) -> (String, String) {
     if saved_pc >= caller_proto.code.len() {
         return (String::new(), String::new());
     }
@@ -4192,17 +4192,58 @@ impl VmExecutor {
     fn call_c_function(
         state: &mut LuaState,
         a: usize,
-        _b: usize,
+        b: usize,
         c: i32,
         f: unsafe extern "C" fn(*mut c_void) -> i32,
     ) -> Result<(), VmError> {
         // nresults: -1 = MULTRET, >=0 = 固定结果数
         let nresults: i32 = if c == 0 { -1 } else { c - 1 };
 
-        // precallC: 设置 api_func_base，确保栈 capacity（不改变 len，避免干扰 lua_gettop）
+        // precallC: 设置 api_func_base，确保栈 capacity
         let saved_api_base = state.api_func_base;
         state.api_func_base = a;
         state.n_ccalls = state.n_ccalls.saturating_add(1);
+
+        // 推入 CallInfoEntry — 对应 C 的 luaD_precall 创建新 CallInfo
+        // 外部 C 函数（通过 dlopen 加载的 .so）也需要 call_info 条目，
+        // 否则 lua_getstack/lua_getinfo 返回 0，导致 luaL_argerror 无法获取
+        // 函数名（如 cjson.encode_max_depth 错误消息缺少 "to 'xxx'" 部分）。
+        // caller_proto 从当前执行上下文获取（调用者的 LClosure）。
+        let caller_proto = if state.base > 0 && state.base <= state.stack.len() {
+            if let TValue::LClosure(c) = &state.stack[state.base - 1] {
+                Some(Rc::clone(&c.proto))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        state.call_info.push(crate::state::CallInfoEntry {
+            caller_proto,
+            is_c: true,
+            closure: None,
+            base: a + 1,
+            saved_pc: state.pc,
+            name: String::new(),
+            namewhat: String::new(),
+            proto_flag: state.proto_flag,
+            nextraargs: state.nextraargs,
+            is_tailcall: false,
+        });
+
+        // 关键修复：truncate 栈到 a + b（参数末尾），使 stack.len() == state.top。
+        // OP_CALL 设置了 state.top = a + b，但 stack.len() 可能更大（包含外层
+        // 函数 a+b 之后的"死亡"寄存器）。lua_gettop 基于 stack.len() 计算，
+        // 如果不 truncate，C 函数会看到错误的参数数量（如 cjson.encode 报
+        // "expected 1 argument"）。
+        // a+b 之后的寄存器在 CALL 后是"死亡"的（Lua 编译器保证），可安全丢弃。
+        // 对应 C Lua 的 L->top.p = ra + b（只设指针，不删内存；Vec 需 truncate）。
+        if b != 0 {
+            let new_top = a + b;
+            if state.stack.len() > new_top {
+                state.stack.truncate(new_top);
+            }
+        }
 
         // 预留 capacity，但不 push nil（push 会改变 stack.len()，导致 C 函数中
         // lua_gettop 返回值偏移）。C 函数需要空间时通过 lua_checkstack 或
@@ -4210,11 +4251,34 @@ impl VmExecutor {
         if state.stack.capacity() < state.stack.len() + LUA_MINSTACK {
             state.stack.reserve(LUA_MINSTACK);
         }
-
         // 调用 C 函数: n = f(L)
-        // C 函数通过 capi.rs 导出的 API 操作栈，返回结果数 n
+        // 用 catch_unwind 捕获 lua_error 抛出的 panic!
+        // C 模块 .so 需用 -fexceptions 编译，使 GCC 生成栈展开表。
+        // 将 f 转换为 extern "C-unwind" 以允许 panic 跨 C 帧展开回 catch_unwind
+        // （与 state.rs::pcall_c_function 保持一致，否则 panic 跨 extern "C" 边界会 abort）
         let ptr: *mut LuaState = state;
-        let n = unsafe { f(ptr as *mut c_void) };
+        let f_unwind: unsafe extern "C-unwind" fn(*mut c_void) -> i32 =
+            unsafe { std::mem::transmute(f) };
+        let c_call_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            unsafe { f_unwind(ptr as *mut c_void) }
+        }));
+        let n = match c_call_result {
+            Ok(n) => n,
+            Err(_panic) => {
+                // lua_error 被调用：恢复状态并返回错误
+                state.api_func_base = saved_api_base;
+                state.n_ccalls = state.n_ccalls.saturating_sub(1);
+                state.call_info.pop();
+                let err_msg = match state.pending_error.take() {
+                    Some(TValue::Str(s)) => s.as_str().to_string(),
+                    Some(TValue::Integer(i)) => format!("{}", i),
+                    Some(TValue::Float(f)) => format!("{}", f),
+                    Some(other) => format!("{:?}", other.ty()),
+                    None => "error in C function".to_string(),
+                };
+                return Err(VmError::RuntimeError(err_msg));
+            }
+        };
 
         // poscall: 把栈顶 n 个结果移动到 a 位置
         let top = state.stack.len();
@@ -4224,6 +4288,7 @@ impl VmExecutor {
         // 恢复 api_func_base 和 n_ccalls
         state.api_func_base = saved_api_base;
         state.n_ccalls = state.n_ccalls.saturating_sub(1);
+        state.call_info.pop();
 
         // 移动结果到 a 位置（对应 C 的 moveresults）
         // 用 mem::replace 从源位置移出值（填 Nil(Empty)），避免 clone。
@@ -4261,6 +4326,10 @@ impl VmExecutor {
             }
             state.stack.truncate(a + n);
         }
+
+        // 同步 state.top：poscall 后栈顶 = 结果末尾
+        // 对应 C Lua poscall 中 L->top.p = ci->func.p + 1 + nresults
+        state.top = state.stack.len();
 
         // 对应 C 的 rethook: L->oldpc = pcRel(ci->u.l.savedpc, ci_func(ci)->p)
         // C 函数返回时，设置 oldpc 为 CALL 指令的 pc，这样下一条指令的

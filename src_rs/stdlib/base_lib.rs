@@ -2375,6 +2375,8 @@ fn init_package_table(state: &mut LuaState) {
     let package_key = TValue::Str(state.intern_str("package"));
     let pkg = crate::table::Table::new();
     let loaded = crate::table::Table::new();
+    // registry._LOADED 和 package.loaded 共享同一个 Rc 引用（对应 C luaopen_package）
+    let loaded_shared = loaded.clone();
     pkg.set(
         TValue::Str(state.intern_str("loaded")),
         TValue::Table(loaded),
@@ -2442,6 +2444,11 @@ fn init_package_table(state: &mut LuaState) {
     // require 仍能访问注册时的 package 表（含 loaded/preload/searchers）。
     let registry_pkg_key = TValue::Str(state.intern_str("_PACKAGE"));
     state.registry.set(registry_pkg_key, TValue::Table(pkg));
+    // registry._LOADED = package.loaded (同一个 Rc 引用，对应 C luaopen_package)
+    // C 代码 (如 lauxlib.cpp pushglobalfuncname) 通过 lua_getfield(LUA_REGISTRYINDEX, "_LOADED")
+    // 访问 loaded 表，必须在 registry 中建立 _LOADED -> loaded 的映射。
+    let loaded_key = TValue::Str(state.intern_str("_LOADED"));
+    state.registry.set(loaded_key, TValue::Table(loaded_shared));
 }
 
 /// 从 registry 读取注册时的 package 表 — 对应 C 版 require 函数的 upvalue(1)

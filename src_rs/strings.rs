@@ -26,6 +26,7 @@ use std::hash::BuildHasherDefault;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
+use std::os::raw::c_char;
 
 // Identity hasher for u64-keyed HashMaps — the key IS already a hash value,
 // so using SipHash on it is wasted cycles.
@@ -116,8 +117,15 @@ pub enum LuaString {
 }
 
 // ============================================================================
-// 规约：相等性比较
+// 规约：内容比较辅助函数（兼容 NUL 和非 NUL 末尾的字符串）
 // ============================================================================
+
+/// 比较两个字符串的内容是否相同，忽略任一侧末尾可能的 NUL 字节。
+fn content_eq(a: &str, b: &str) -> bool {
+    let a = a.strip_suffix('\0').unwrap_or(a);
+    let b = b.strip_suffix('\0').unwrap_or(b);
+    a == b
+}
 
 /// 长字符串相等性：若双方均已哈希 → 先比 hash（快速淘汰），否则直接比内容。
 impl PartialEq for LongString {
@@ -127,7 +135,7 @@ impl PartialEq for LongString {
                 return false;
             }
         }
-        self.contents == other.contents
+        content_eq(&self.contents, &other.contents)
     }
 }
 
@@ -138,7 +146,7 @@ impl PartialEq for LuaString {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (LuaString::Short(a), LuaString::Short(b)) => {
-                Arc::ptr_eq(a, b) || a.contents == b.contents
+                Arc::ptr_eq(a, b) || content_eq(&a.contents, &b.contents)
             }
             (LuaString::Long(a), LuaString::Long(b)) => a == b,
             _ => self.as_str() == other.as_str(),
@@ -155,8 +163,8 @@ impl Eq for LuaString {}
 /// 比较两个 `LuaString` 的内容是否相同。
 pub fn eq_str(a: &LuaString, b: &LuaString) -> bool {
     match (a, b) {
-        (LuaString::Short(a), LuaString::Short(b)) => Arc::ptr_eq(a, b) || a.contents == b.contents,
-        (LuaString::Long(a), LuaString::Long(b)) => a.contents == b.contents,
+        (LuaString::Short(a), LuaString::Short(b)) => Arc::ptr_eq(a, b) || content_eq(&a.contents, &b.contents),
+        (LuaString::Long(a), LuaString::Long(b)) => content_eq(&a.contents, &b.contents),
         _ => false,
     }
 }
@@ -178,7 +186,12 @@ impl Hash for LuaString {
                 if s.extra.load(Ordering::Relaxed) == 1 {
                     state.write_u64(s.hash.load(Ordering::Relaxed));
                 } else {
-                    let h = rust_hash(&s.contents);
+                    let content = if s.contents.as_bytes().last() == Some(&0) {
+                        &s.contents[..s.contents.len() - 1]
+                    } else {
+                        &s.contents
+                    };
+                    let h = rust_hash(content);
                     s.hash.store(h, Ordering::Relaxed);
                     s.extra.store(1, Ordering::Relaxed);
                     state.write_u64(h);
@@ -219,7 +232,7 @@ impl StringTable {
         let ht_reader = self.ht.read();
         if let Some(bucket) = ht_reader.get(&h) {
             for ts in bucket {
-                if *ts.contents == *str {
+                if ts.contents.strip_suffix('\0').unwrap_or(&ts.contents) == str {
                     return LuaString::Short(Arc::clone(ts));
                 }
             }
@@ -231,7 +244,54 @@ impl StringTable {
         let mut ht = self.ht.write();
         let ts = Arc::new(ShortString {
             hash: h,
-            contents: str.to_string(),
+            contents: LuaString::with_nul(str),
+        });
+        let bucket = ht.entry(h).or_insert_with(Vec::new);
+        bucket.push(Arc::clone(&ts));
+        *self.nuse.write() += 1;
+        LuaString::Short(ts)
+    }
+
+    /// 内部化一个短字符串（从任意字节，8-bit clean，绕过 UTF-8 验证）。
+    /// 用于 C API 的 lua_pushlstring/lua_pushstring 等需要保留原始字节的场景。
+    #[inline]
+    pub fn intern_bytes(&self, bytes: &[u8]) -> LuaString {
+        debug_assert!(bytes.len() <= LUAI_MAXSHORTLEN, "intern_bytes 只用于短字符串");
+        // 必须使用与 intern() 相同的哈希算法。
+        // Rust 的 str::hash 实现为 hasher.write(bytes) + hasher.write_u8(0xff)，
+        // 其中 0xff 是终止符防止前缀冲突。intern_bytes 必须匹配此行为。
+        let h = {
+            let mut hasher = DefaultHasher::new();
+            hasher.write(bytes);
+            hasher.write_u8(0xff);
+            hasher.finish()
+        };
+
+        // 读优先路径
+        let ht_reader = self.ht.read();
+        if let Some(bucket) = ht_reader.get(&h) {
+            for ts in bucket {
+                // 逐字节比较（contents 末尾有 NUL，需剥离）
+                let contents_bytes = ts.contents.as_bytes();
+                let actual = if contents_bytes.last() == Some(&0) {
+                    &contents_bytes[..contents_bytes.len() - 1]
+                } else {
+                    contents_bytes
+                };
+                if actual == bytes {
+                    return LuaString::Short(Arc::clone(ts));
+                }
+            }
+        }
+        drop(ht_reader);
+
+        // 写路径
+        let mut buf = bytes.to_vec();
+        buf.push(0); // NUL 终止符
+        let mut ht = self.ht.write();
+        let ts = Arc::new(ShortString {
+            hash: h,
+            contents: unsafe { String::from_utf8_unchecked(buf) },
         });
         let bucket = ht.entry(h).or_insert_with(Vec::new);
         bucket.push(Arc::clone(&ts));
@@ -308,15 +368,48 @@ pub fn rust_hash(str: &str) -> u64 {
 // 规约：字符串方法
 // ============================================================================
 impl LuaString {
+    /// 新建时自动追加 NUL 字节，确保作为 *const c_char 返回时安全。
+    pub(crate) fn with_nul(str: &str) -> String {
+        let mut s = str.to_string();
+        s.push('\0');
+        s
+    }
+
     #[inline]
     pub fn as_str(&self) -> &str {
+        self.as_str_inner().0
+    }
+
+    /// 内部实现：返回 (str, has_nul)
+    fn as_str_inner(&self) -> (&str, bool) {
         match self {
-            LuaString::Short(s) => &s.contents,
-            LuaString::Long(s) => &s.contents,
+            LuaString::Short(s) => {
+                if s.contents.as_bytes().last() == Some(&0) {
+                    (&s.contents[..s.contents.len() - 1], true)
+                } else {
+                    (&s.contents, false)
+                }
+            }
+            LuaString::Long(s) => {
+                if s.contents.as_bytes().last() == Some(&0) {
+                    (&s.contents[..s.contents.len() - 1], true)
+                } else {
+                    (&s.contents, false)
+                }
+            }
         }
     }
 
-    /// 返回字符串长度（O(1)，直接从 `String` 获取）。
+    /// 返回一个 NUL 结尾的 C 字符串指针（供 C API 使用）。
+    /// 指针在 LuaString 自身存活期间有效。
+    pub fn as_c_str_ptr(&self) -> *const c_char {
+        match self {
+            LuaString::Short(s) => s.contents.as_ptr() as *const c_char,
+            LuaString::Long(s) => s.contents.as_ptr() as *const c_char,
+        }
+    }
+
+    /// 返回字符串长度（O(1)，不含末尾 NUL）。
     pub fn len(&self) -> usize {
         self.as_str().len()
     }
@@ -333,7 +426,6 @@ impl LuaString {
         }
     }
 }
-
 impl std::fmt::Display for LuaString {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.as_str())
@@ -353,26 +445,58 @@ pub fn new_long_str(str: &str) -> LuaString {
     LuaString::Long(Box::new(LongString {
         hash: AtomicU64::new(0),
         extra: AtomicU8::new(0),
-        contents: str.to_string(),
+        contents: LuaString::with_nul(str),
         ptr_id: crate::gc::new_ptr_id(),
     }))
 }
 
-/// 从字节创建长字符串 — 用于二进制数据 (io.read 返回的二进制内容等)
-/// 对应 C Lua 中字符串可以包含任意字节 (包括 \0 和非 UTF-8 字节)
 pub fn new_long_bytes(bytes: Vec<u8>) -> LuaString {
+    let mut buf = bytes;
+    buf.push(0);
     LuaString::Long(Box::new(LongString {
         hash: AtomicU64::new(0),
         extra: AtomicU8::new(0),
-        contents: unsafe { String::from_utf8_unchecked(bytes) },
+        contents: unsafe { String::from_utf8_unchecked(buf) },
         ptr_id: crate::gc::new_ptr_id(),
     }))
+}
+
+/// 从字节创建短字符串（自动追加 NUL 终止符，与 as_str_inner 的 NUL 剥离机制配合）
+/// 用于模式匹配、pack/unpack 等需要直接构造 ShortString 的场景
+///
+/// hash 必须与 `StringTable::intern_bytes` 保持一致，否则违反 Hash/Eq 契约：
+/// 两个内容相同的 ShortString（一个由 intern 创建，一个由此函数创建）
+/// PartialEq 为 true 但 hash 不同，会导致 HashMap 查找失败。
+pub fn new_short_bytes(bytes: Vec<u8>) -> LuaString {
+    // 与 intern_bytes 相同的哈希算法：DefaultHasher + write(bytes) + write_u8(0xff)
+    let h = {
+        let mut hasher = DefaultHasher::new();
+        hasher.write(&bytes);
+        hasher.write_u8(0xff);
+        hasher.finish()
+    };
+    let mut buf = bytes;
+    buf.push(0);
+    LuaString::Short(Arc::new(ShortString {
+        hash: h,
+        contents: unsafe { String::from_utf8_unchecked(buf) },
+    }))
+}
+
+/// 从 &str 创建短字符串（自动追加 NUL 终止符）
+pub fn new_short_str(s: &str) -> LuaString {
+    new_short_bytes(s.as_bytes().to_vec())
 }
 
 /// 确保长字符串有哈希值（惰性计算）。
 pub fn ensure_long_hash(ls: &mut LongString) -> u64 {
     if ls.extra.load(Ordering::Relaxed) == 0 {
-        let h = rust_hash(&ls.contents);
+        let content = if ls.contents.as_bytes().last() == Some(&0) {
+            &ls.contents[..ls.contents.len() - 1]
+        } else {
+            &ls.contents
+        };
+        let h = rust_hash(content);
         ls.hash.store(h, Ordering::Relaxed);
         ls.extra.store(1, Ordering::Relaxed);
     }
@@ -384,6 +508,17 @@ pub fn new_lstr(table: &StringTable, str: &str) -> LuaString {
         table.intern(str)
     } else {
         new_long_str(str)
+    }
+}
+
+/// 从任意字节创建 LuaString（8-bit clean，绕过 UTF-8 验证）。
+/// 用于 C API 的 lua_pushlstring/lua_pushstring 等需要保留原始字节的场景。
+#[inline]
+pub fn new_lstr_bytes(table: &StringTable, bytes: &[u8]) -> LuaString {
+    if bytes.len() <= LUAI_MAXSHORTLEN {
+        table.intern_bytes(bytes)
+    } else {
+        new_long_bytes(bytes.to_vec())
     }
 }
 
