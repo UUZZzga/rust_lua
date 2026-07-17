@@ -184,6 +184,62 @@ EOF
 ensure_lsqlite3_compat
 
 # ============================================================================
+# 4b. 给 lunit.lua 打 Lua 5.2+ 兼容补丁
+# ============================================================================
+# LuaDist/lsqlite3 自带的 lunit.lua 是 Lua 5.1 版本，直接用 setfenv/getfenv。
+# Lua 5.2+ 移除了这两个函数，需在 lunit.lua 开头插入兼容 shim。
+patch_lunit_compat() {
+    local lunit_lua="$LSQLITE3_SRC_DIR/lunit.lua"
+    if [[ ! -f "$lunit_lua" ]]; then
+        return 0
+    fi
+    if grep -q "Lua 5.2+ compatibility for setfenv" "$lunit_lua" 2>/dev/null; then
+        ok "lunit.lua 兼容补丁已存在（跳过）"
+        return 0
+    fi
+    log "应用 lunit.lua Lua 5.2+ 兼容补丁..."
+    local tmp_shim
+    tmp_shim=$(mktemp)
+    cat > "$tmp_shim" <<'LUAEOF'
+-- Lua 5.2+ compatibility for setfenv/getfenv (removed in Lua 5.2)
+if not setfenv then
+    local _debug = debug
+    local _type = type
+    function setfenv(f, t)
+        if _type(f) == 'number' then
+            f = _debug.getinfo(f + 1, 'f').func
+        end
+        _debug.setupvalue(f, 1, t)
+        return f
+    end
+end
+if not getfenv then
+    local _debug = debug
+    local _type = type
+    function getfenv(f)
+        if _type(f) == 'number' then
+            f = _debug.getinfo(f + 1, 'f').func
+        end
+        local name, value = _debug.getupvalue(f, 1)
+        if name == '_ENV' then return value end
+        return _G
+    end
+end
+-- Lua 5.2+ compatibility for table.getn (removed in Lua 5.2, use # operator)
+if not table.getn then
+    table.getn = function(t) return #t end
+end
+LUAEOF
+    # 在 license 头部 --]] 之后插入 shim（sed 'r' 读取临时文件内容追加到匹配行后）
+    sed -i '/^--\]\]/r '"$tmp_shim" "$lunit_lua"
+    rm -f "$tmp_shim"
+    grep -q "Lua 5.2+ compatibility for setfenv" "$lunit_lua" \
+        || die "lunit.lua 补丁未生效"
+    ok "lunit.lua 兼容补丁已应用"
+}
+patch_lunit_compat
+
+# ============================================================================
 # 5. 编译 C 模块 (cjson, luasocket, lsqlite3, sol2 smoke test)
 # ============================================================================
 log "编译 C/C++ 模块 (make all)..."
