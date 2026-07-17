@@ -74,7 +74,7 @@ fi
 
 # 设置 Lua 模块搜索路径
 export LUA_CPATH="$DEPS_LIB/?.so;$DEPS_LIB/?/core.so;;"
-export LUA_PATH="$DEPS_LIB/?.lua;$SCRIPT_DIR/src/lua-cjson/lua/?.lua;$SCRIPT_DIR/src/luarocks-3.13.0/src/?.lua;;"
+export LUA_PATH="$DEPS_LIB/?.lua;$SCRIPT_DIR/src/lua-cjson/lua/?.lua;$SCRIPT_DIR/src/luarocks-3.13.0/src/?.lua;$SCRIPT_DIR/src/lsqlite3/?.lua;;"
 export LD_LIBRARY_PATH="$DEPS_LIB:${LD_LIBRARY_PATH:-}"
 
 # 测试运行函数：超时 60s，限制内存 512MB（C 模块测试可能需要更多内存）
@@ -161,8 +161,8 @@ fi
 # 3. lsqlite3
 # ============================================================================
 # tests-sqlite3.lua 位置因来源不同：
-#   - fossil zip (lsqlite3_v097.zip): 解压后在 test/ 子目录
-#   - git clone: 在根目录
+#   - git clone (LuaDist/lsqlite3): 在根目录，自带 lunit.lua
+#   - fossil zip (lsqlite3_v097.zip): 解压后在 test/ 子目录，不含 lunit.lua
 LSQLITE3_TESTS="$SCRIPT_DIR/src/lsqlite3"
 LSQLITE3_TEST_DIR=""
 if [[ -f "$LSQLITE3_TESTS/tests-sqlite3.lua" ]]; then

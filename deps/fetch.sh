@@ -4,7 +4,7 @@
 # 下载内容：
 #   - lua-cjson   (openresty fork, master)
 #   - luasocket   (lunarmodules, master)
-#   - lsqlite3    (v0.9.7)
+#   - lsqlite3    (LuaDist fork, 含 lunit.lua 测试框架)
 #   - luarocks    (3.13.0)
 #   - sol2        (v3.3.0)
 #   - sqlite3     (amalgamation 3450100, 供 lsqlite3 静态链接)
@@ -103,12 +103,20 @@ download "$LUASOCKET_URL" "$LUASOCKET_ARCHIVE"
 extract_tarball "$CACHE_DIR/$LUASOCKET_ARCHIVE" "luasocket-master" "luasocket"
 
 # ============================================================================
-# 3. lsqlite3 v0.9.7
+# 3. lsqlite3 (LuaDist fork, 含 lunit.lua 和 tests-sqlite3.lua)
 # ============================================================================
-LSQLITE3_URL="http://lua.sqlite.org/home/zip/lsqlite3_v097.zip?uuid=v0.9.7"
-LSQLITE3_ARCHIVE="lsqlite3_v097.zip"
-download "$LSQLITE3_URL" "$LSQLITE3_ARCHIVE"
-extract_tarball "$CACHE_DIR/$LSQLITE3_ARCHIVE" "lsqlite3_v097" "lsqlite3"
+# 使用 git clone 而非 fossil zip：zip 版 v0.9.7 的 tests-sqlite3.lua 用
+# require(arg[1]) 且依赖 lunit.lua（zip 不含），git clone 版自带 lunit.lua
+# 且 tests-sqlite3.lua 直接 require "lsqlite3"，测试可自包含运行。
+LSQLITE3_REPO="https://github.com/LuaDist/lsqlite3.git"
+if [[ -d "$SRC_DIR/lsqlite3" && -f "$SRC_DIR/lsqlite3/lsqlite3.c" ]]; then
+    log "已存在: src/lsqlite3 (跳过 clone)"
+else
+    log "git clone: $LSQLITE3_REPO"
+    rm -rf "$SRC_DIR/lsqlite3"
+    git clone --depth=1 "$LSQLITE3_REPO" "$SRC_DIR/lsqlite3"
+    log "完成: src/lsqlite3"
+fi
 
 # ============================================================================
 # 4. luarocks 3.13.0
