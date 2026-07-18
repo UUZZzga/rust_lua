@@ -9,66 +9,11 @@
 //! - 注册 string 全局表，包含所有字符串库函数
 
 use crate::execute::{arg_error, VmError};
-use crate::objects::{LuaType, NilKind, TValue};
+use crate::objects::{BuiltinFn, BuiltinFnPtr, LuaType, NilKind, TValue};
 use crate::state::LuaState;
 use crate::table::Table;
 use crate::tm::{make_tm_tvalue, Metatable, TagMethod};
 use std::sync::Arc;
-
-// ============================================================================
-// 字符串函数标签 (LightUserData 占位符值)
-// ============================================================================
-// 标签 1-6 已被内置函数 (print, setmetatable, getmetatable, type, pcall, error) 占用
-// 字符串库函数使用标签 100+
-
-pub const STR_UPPER: usize = 100;
-pub const STR_LOWER: usize = 101;
-pub const STR_LEN: usize = 102;
-pub const STR_SUB: usize = 103;
-pub const STR_REVERSE: usize = 104;
-pub const STR_BYTE: usize = 105;
-pub const STR_CHAR: usize = 106;
-pub const STR_REP: usize = 107;
-pub const STR_FIND: usize = 108;
-pub const STR_FORMAT: usize = 109;
-pub const STR_MATCH: usize = 110;
-pub const STR_GMATCH: usize = 111;
-pub const STR_GSUB: usize = 112;
-pub const STR_PACK: usize = 113;
-pub const STR_PACKSIZE: usize = 114;
-pub const STR_UNPACK: usize = 115;
-/// string.gmatch 迭代器标签 (在 TFORCALL 中调用)
-pub const STR_GMATCH_ITER: usize = 116;
-pub const STR_DUMP: usize = 117;
-
-/// 检查标签是否为字符串库标签 (包括 gmatch 迭代器)
-pub fn is_string_tag(tag: usize) -> bool {
-    (100..120).contains(&tag)
-}
-
-/// 字符串库函数名 (用于 traceback)
-pub fn string_function_name(tag: usize) -> Option<&'static str> {
-    match tag {
-        STR_UPPER => Some("upper"),
-        STR_LOWER => Some("lower"),
-        STR_LEN => Some("len"),
-        STR_SUB => Some("sub"),
-        STR_REVERSE => Some("reverse"),
-        STR_BYTE => Some("byte"),
-        STR_CHAR => Some("char"),
-        STR_REP => Some("rep"),
-        STR_FIND => Some("find"),
-        STR_FORMAT => Some("format"),
-        STR_MATCH => Some("match"),
-        STR_GMATCH => Some("gmatch"),
-        STR_GSUB => Some("gsub"),
-        STR_PACK => Some("pack"),
-        STR_PACKSIZE => Some("packsize"),
-        STR_UNPACK => Some("unpack"),
-        STR_GMATCH_ITER => Some("gmatch_iter"),
-        _ => None,
-    }
-}
 
 // ============================================================================
 // 算术元方法 (对应 C 的 arith_add, arith_sub, ...)
@@ -1269,8 +1214,8 @@ fn add_value_from_repl(
             }
         }
         // function 替换 — 对应 C 的 LUA_TFUNCTION 分支
-        // LightUserData (C 函数标签) 也算 function
-        TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) | TValue::LightUserData(_) => {
+        // LightUserData (base 库 tag 函数) 和 BuiltinFn (已迁移库) 都算 function
+        TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) | TValue::LightUserData(_) | TValue::BuiltinFn(_) => {
             // push_captures(ms, s, e) — 所有捕获作为参数
             let n = if ms.level == 0 { 1 } else { ms.level };
             let mut captures = Vec::with_capacity(n);
@@ -2362,6 +2307,11 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                         let ptr = f as *const _ as usize;
                         format!("0x{:x}", ptr)
                     }
+                    TValue::BuiltinFn(b) => {
+                        // Rust 原生内置函数：使用函数指针地址
+                        let ptr = b.func as usize;
+                        format!("0x{:x}", ptr)
+                    }
                     TValue::UserData(u) => {
                         format!("0x{:x}", u.gc_header.ptr_id)
                     }
@@ -3322,7 +3272,7 @@ fn find_s_arg_indices(fmt: &str) -> std::collections::HashSet<usize> {
 /// 在 TFORCALL 中调用，参数: state_table (表), ctrl (忽略)
 /// 从 state_table 中读取 s, p, pos, anchor, pat_start
 /// 运行一次匹配，更新 pos，返回捕获（或 nil 表示结束）
-fn call_gmatch_iter(
+pub fn call_gmatch_iter(
     state: &mut LuaState,
     a: usize,
     _nargs: usize,
@@ -3456,19 +3406,126 @@ fn call_gmatch_iter(
     Ok(())
 }
 
-/// 字符串库函数派发
-/// 从 execute.rs 的 op_call 调用，当 LightUserData 标签 >= 100 时
-pub fn call_string_function(
-    tag: usize,
+// ============================================================================
+// 各函数的派发实现（作为 BuiltinFnPtr 注册到 string 表）
+// ============================================================================
+
+/// string.upper(s) — 对应 C 的 str_upper
+fn call_str_upper(
+    state: &mut LuaState,
+    a: usize,
+    _nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    let s = get_str_arg(state, a, 0)?;
+    let result = str_upper(&s);
+    push_results(
+        state,
+        a,
+        nresults,
+        vec![TValue::Str(state.intern_str(&result))],
+    );
+    Ok(())
+}
+
+/// string.lower(s) — 对应 C 的 str_lower
+fn call_str_lower(
+    state: &mut LuaState,
+    a: usize,
+    _nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    let s = get_str_arg(state, a, 0)?;
+    let result = str_lower(&s);
+    push_results(
+        state,
+        a,
+        nresults,
+        vec![TValue::Str(state.intern_str(&result))],
+    );
+    Ok(())
+}
+
+/// string.len(s) — 对应 C 的 str_len
+fn call_str_len(
+    state: &mut LuaState,
+    a: usize,
+    _nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    let s = get_str_arg(state, a, 0)?;
+    let result = str_len(&s);
+    push_results(state, a, nresults, vec![TValue::Integer(result)]);
+    Ok(())
+}
+
+/// string.sub(s, i [, j]) — 对应 C 的 str_sub
+fn call_str_sub(
     state: &mut LuaState,
     a: usize,
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
-    match tag {
-        STR_UPPER => {
-            let s = get_str_arg(state, a, 0)?;
-            let result = str_upper(&s);
+    let s = get_str_arg(state, a, 0)?;
+    let start = get_int_arg(state, a, 1, 1, "sub")?;
+    let end = get_opt_int_arg(state, a, nargs, 2, -1, "sub")?;
+    let result = str_sub(&s, start, end);
+    push_results(
+        state,
+        a,
+        nresults,
+        vec![TValue::Str(state.intern_str(&result))],
+    );
+    Ok(())
+}
+
+/// string.reverse(s) — 对应 C 的 str_reverse
+fn call_str_reverse(
+    state: &mut LuaState,
+    a: usize,
+    _nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    let s = get_str_arg(state, a, 0)?;
+    let result = str_reverse(&s);
+    push_results(
+        state,
+        a,
+        nresults,
+        vec![TValue::Str(state.intern_str(&result))],
+    );
+    Ok(())
+}
+
+/// string.byte(s [, i [, j]]) — 对应 C 的 str_byte
+fn call_str_byte(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    let s = get_str_arg(state, a, 0)?;
+    let i = get_opt_int_arg(state, a, nargs, 1, 1, "byte")?;
+    let j = get_opt_int_arg(state, a, nargs, 2, i, "byte")?;
+    let bytes = str_byte(&s, i, j);
+    let results: Vec<TValue> = bytes.into_iter().map(TValue::Integer).collect();
+    push_results(state, a, nresults, results);
+    Ok(())
+}
+
+/// string.char(...) — 对应 C 的 str_char
+fn call_str_char(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    let mut codes = Vec::new();
+    for idx in 0..nargs {
+        codes.push(get_int_arg(state, a, idx, 0, "char")?);
+    }
+    match str_char(&codes) {
+        Ok(result) => {
             push_results(
                 state,
                 a,
@@ -3477,9 +3534,26 @@ pub fn call_string_function(
             );
             Ok(())
         }
-        STR_LOWER => {
-            let s = get_str_arg(state, a, 0)?;
-            let result = str_lower(&s);
+        Err(msg) => Err(VmError::RuntimeError(msg)),
+    }
+}
+
+/// string.rep(s, n [, sep]) — 对应 C 的 str_rep
+fn call_str_rep(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    let s = get_str_arg(state, a, 0)?;
+    let n = get_int_arg(state, a, 1, 0, "rep")?;
+    let sep = if nargs >= 3 {
+        get_str_arg(state, a, 2).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    match str_rep(&s, n, &sep) {
+        Ok(result) => {
             push_results(
                 state,
                 a,
@@ -3488,17 +3562,71 @@ pub fn call_string_function(
             );
             Ok(())
         }
-        STR_LEN => {
-            let s = get_str_arg(state, a, 0)?;
-            let result = str_len(&s);
-            push_results(state, a, nresults, vec![TValue::Integer(result)]);
-            Ok(())
+        Err(msg) => Err(VmError::RuntimeError(msg)),
+    }
+}
+
+/// string.find(s, pattern [, init [, plain]]) — 对应 C 的 str_find
+fn call_str_find(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    let s = get_str_arg(state, a, 0)?;
+    let pattern = get_str_arg(state, a, 1)?;
+    let init = get_opt_int_arg(state, a, nargs, 2, 1, "find")?;
+    let plain = get_bool_arg(state, a, nargs, 3, false);
+    match str_find(&s, &pattern, init, plain) {
+        Ok(FindResult::Found {
+            start,
+            end,
+            captures,
+        }) => {
+            let mut results = vec![TValue::Integer(start as i64), TValue::Integer(end as i64)];
+            results.extend(captures);
+            push_results(state, a, nresults, results);
         }
-        STR_SUB => {
-            let s = get_str_arg(state, a, 0)?;
-            let start = get_int_arg(state, a, 1, 1, "sub")?;
-            let end = get_opt_int_arg(state, a, nargs, 2, -1, "sub")?;
-            let result = str_sub(&s, start, end);
+        Ok(FindResult::NotFound) => {
+            push_results(state, a, nresults, vec![TValue::Nil(NilKind::Strict)]);
+        }
+        Err(msg) => return Err(VmError::RuntimeError(msg)),
+    }
+    Ok(())
+}
+
+/// string.format(fmt, ...) — 对应 C 的 str_format
+fn call_str_format(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    let fmt = get_str_arg(state, a, 0)?;
+    let mut args: Vec<TValue> = (1..nargs)
+        .map(|i| {
+            let idx = a + 1 + i;
+            if idx < state.stack.len() {
+                state.stack[idx].clone()
+            } else {
+                TValue::Nil(NilKind::Strict)
+            }
+        })
+        .collect();
+    // Fast path: only need __tostring conversion when a %s arg is a table.
+    // Avoid HashSet allocation + format scan for the common case (all string args).
+    if args.iter().any(|arg| matches!(arg, TValue::Table(_))) {
+        let s_indices = find_s_arg_indices(&fmt);
+        for (i, arg) in args.iter_mut().enumerate() {
+            if s_indices.contains(&i) {
+                if let Some(s) = tostring_for_format(state, arg) {
+                    *arg = TValue::Str(state.intern_str(&s));
+                }
+            }
+        }
+    }
+    match str_format(&fmt, &args) {
+        Ok(result) => {
             push_results(
                 state,
                 a,
@@ -3507,375 +3635,295 @@ pub fn call_string_function(
             );
             Ok(())
         }
-        STR_REVERSE => {
-            let s = get_str_arg(state, a, 0)?;
-            let result = str_reverse(&s);
-            push_results(
-                state,
-                a,
-                nresults,
-                vec![TValue::Str(state.intern_str(&result))],
-            );
-            Ok(())
-        }
-        STR_BYTE => {
-            let s = get_str_arg(state, a, 0)?;
-            let i = get_opt_int_arg(state, a, nargs, 1, 1, "byte")?;
-            let j = get_opt_int_arg(state, a, nargs, 2, i, "byte")?;
-            let bytes = str_byte(&s, i, j);
-            let results: Vec<TValue> = bytes.into_iter().map(TValue::Integer).collect();
+        Err(msg) => Err(VmError::RuntimeError(msg)),
+    }
+}
+
+/// string.match(s, pattern [, init]) — 对应 C 的 str_match
+fn call_str_match(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    let s = get_str_arg(state, a, 0)?;
+    let pattern = get_str_arg(state, a, 1)?;
+    let init = get_opt_int_arg(state, a, nargs, 2, 1, "match")?;
+    match str_match(&s, &pattern, init) {
+        Ok(results) => {
             push_results(state, a, nresults, results);
             Ok(())
         }
-        STR_CHAR => {
-            let mut codes = Vec::new();
-            for idx in 0..nargs {
-                codes.push(get_int_arg(state, a, idx, 0, "char")?);
-            }
-            match str_char(&codes) {
-                Ok(result) => {
-                    push_results(
-                        state,
-                        a,
-                        nresults,
-                        vec![TValue::Str(state.intern_str(&result))],
-                    );
-                    Ok(())
-                }
-                Err(msg) => Err(VmError::RuntimeError(msg)),
-            }
-        }
-        STR_REP => {
-            let s = get_str_arg(state, a, 0)?;
-            let n = get_int_arg(state, a, 1, 0, "rep")?;
-            let sep = if nargs >= 3 {
-                get_str_arg(state, a, 2).unwrap_or_default()
-            } else {
-                String::new()
-            };
-            match str_rep(&s, n, &sep) {
-                Ok(result) => {
-                    push_results(
-                        state,
-                        a,
-                        nresults,
-                        vec![TValue::Str(state.intern_str(&result))],
-                    );
-                    Ok(())
-                }
-                Err(msg) => Err(VmError::RuntimeError(msg)),
-            }
-        }
-        STR_FIND => {
-            let s = get_str_arg(state, a, 0)?;
-            let pattern = get_str_arg(state, a, 1)?;
-            let init = get_opt_int_arg(state, a, nargs, 2, 1, "find")?;
-            let plain = get_bool_arg(state, a, nargs, 3, false);
-            match str_find(&s, &pattern, init, plain) {
-                Ok(FindResult::Found {
-                    start,
-                    end,
-                    captures,
-                }) => {
-                    let mut results =
-                        vec![TValue::Integer(start as i64), TValue::Integer(end as i64)];
-                    results.extend(captures);
-                    push_results(state, a, nresults, results);
-                }
-                Ok(FindResult::NotFound) => {
-                    push_results(state, a, nresults, vec![TValue::Nil(NilKind::Strict)]);
-                }
-                Err(msg) => return Err(VmError::RuntimeError(msg)),
-            }
-            Ok(())
-        }
-        STR_FORMAT => {
-            let fmt = get_str_arg(state, a, 0)?;
-            let mut args: Vec<TValue> = (1..nargs)
-                .map(|i| {
-                    let idx = a + 1 + i;
-                    if idx < state.stack.len() {
-                        state.stack[idx].clone()
+        Err(msg) => Err(VmError::RuntimeError(msg)),
+    }
+}
+
+/// string.gsub(s, pattern, repl [, max_s]) — 对应 C 的 str_gsub
+fn call_str_gsub(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    let s = get_str_arg(state, a, 0)?;
+    let pattern = get_str_arg(state, a, 1)?;
+    let max_s = get_opt_int_arg(state, a, nargs, 3, -1, "gsub")?;
+    // 原始字符串的 TValue — 对应 C 的 lua_pushvalue(L, 1)
+    // 当没有替换发生时，返回原始字符串（保持指针一致性，使 %p 相等）
+    let orig_str = state
+        .stack
+        .get(a + 1)
+        .cloned()
+        .unwrap_or(TValue::Nil(NilKind::Strict));
+    // 检查 repl 参数类型 — 对应 C 的 tr = lua_type(L, 3)
+    let repl_idx = a + 3;
+    let repl_val = if repl_idx < state.stack.len() {
+        state.stack[repl_idx].clone()
+    } else {
+        TValue::Nil(NilKind::Strict)
+    };
+    match &repl_val {
+        // table 或 function 替换 — 对应 C 的 LUA_TTABLE / LUA_TFUNCTION 分支
+        // table 始终接受（用作查找替换，无需 __call）；函数类用 is_callable() 兼容
+        // LightUserData(base tag) 形式的基础库函数（setmetatable 等仍是 LightUserData;
+        // BuiltinFn 已在 is_function 中）
+        v if matches!(v, TValue::Table(_)) || v.is_callable() => {
+            match str_gsub_with_repl(state, &s, &pattern, &repl_val, max_s) {
+                Ok((result, n, changed)) => {
+                    // 对应 C: if (!changed) lua_pushvalue(L, 1);
+                    let result_val = if !changed {
+                        orig_str
                     } else {
-                        TValue::Nil(NilKind::Strict)
-                    }
-                })
-                .collect();
-            // Fast path: only need __tostring conversion when a %s arg is a table.
-            // Avoid HashSet allocation + format scan for the common case (all string args).
-            if args.iter().any(|arg| matches!(arg, TValue::Table(_))) {
-                let s_indices = find_s_arg_indices(&fmt);
-                for (i, arg) in args.iter_mut().enumerate() {
-                    if s_indices.contains(&i) {
-                        if let Some(s) = tostring_for_format(state, arg) {
-                            *arg = TValue::Str(state.intern_str(&s));
-                        }
-                    }
-                }
-            }
-            match str_format(&fmt, &args) {
-                Ok(result) => {
-                    push_results(
-                        state,
-                        a,
-                        nresults,
-                        vec![TValue::Str(state.intern_str(&result))],
-                    );
+                        TValue::Str(state.intern_str(&result))
+                    };
+                    push_results(state, a, nresults, vec![result_val, TValue::Integer(n)]);
                     Ok(())
                 }
                 Err(msg) => Err(VmError::RuntimeError(msg)),
             }
         }
-        STR_MATCH => {
-            let s = get_str_arg(state, a, 0)?;
-            let pattern = get_str_arg(state, a, 1)?;
-            let init = get_opt_int_arg(state, a, nargs, 2, 1, "match")?;
-            match str_match(&s, &pattern, init) {
-                Ok(results) => {
-                    push_results(state, a, nresults, results);
-                    Ok(())
-                }
-                Err(msg) => Err(VmError::RuntimeError(msg)),
-            }
-        }
-        STR_GSUB => {
-            let s = get_str_arg(state, a, 0)?;
-            let pattern = get_str_arg(state, a, 1)?;
-            let max_s = get_opt_int_arg(state, a, nargs, 3, -1, "gsub")?;
-            // 原始字符串的 TValue — 对应 C 的 lua_pushvalue(L, 1)
-            // 当没有替换发生时，返回原始字符串（保持指针一致性，使 %p 相等）
-            let orig_str = state
-                .stack
-                .get(a + 1)
-                .cloned()
-                .unwrap_or(TValue::Nil(NilKind::Strict));
-            // 检查 repl 参数类型 — 对应 C 的 tr = lua_type(L, 3)
-            let repl_idx = a + 3;
-            let repl_val = if repl_idx < state.stack.len() {
-                state.stack[repl_idx].clone()
-            } else {
-                TValue::Nil(NilKind::Strict)
-            };
-            match &repl_val {
-                // table 或 function 替换 — 对应 C 的 LUA_TTABLE / LUA_TFUNCTION 分支
-                // LightUserData (C 函数标签) 也算 function (is_function 包含它)
-                TValue::Table(_)
-                | TValue::LClosure(_)
-                | TValue::CClosure(_)
-                | TValue::LCFn(_)
-                | TValue::LightUserData(_) => {
-                    match str_gsub_with_repl(state, &s, &pattern, &repl_val, max_s) {
-                        Ok((result, n, changed)) => {
-                            // 对应 C: if (!changed) lua_pushvalue(L, 1);
-                            let result_val = if !changed {
-                                orig_str
-                            } else {
-                                TValue::Str(state.intern_str(&result))
-                            };
-                            push_results(state, a, nresults, vec![result_val, TValue::Integer(n)]);
-                            Ok(())
-                        }
-                        Err(msg) => Err(VmError::RuntimeError(msg)),
-                    }
-                }
-                // string/number 替换 — 对应 C 的 default 分支 (add_s)
-                TValue::Str(_) | TValue::Integer(_) | TValue::Float(_) => {
-                    let repl = get_str_arg(state, a, 2)?;
-                    match str_gsub(&s, &pattern, &repl, max_s) {
-                        Ok((result, n)) => {
-                            // 对应 C: if (!changed) lua_pushvalue(L, 1);
-                            let result_val = if n == 0 {
-                                orig_str
-                            } else {
-                                TValue::Str(state.intern_str(&result))
-                            };
-                            push_results(state, a, nresults, vec![result_val, TValue::Integer(n)]);
-                            Ok(())
-                        }
-                        Err(msg) => Err(VmError::RuntimeError(msg)),
-                    }
-                }
-                _ => Err(VmError::RuntimeError(format!(
-                    "bad argument #3 (string/function/table expected, got {})",
-                    repl_val.ty()
-                ))),
-            }
-        }
-        STR_GMATCH => {
-            // string.gmatch(s, pattern) — 返回一个可调用的状态表
-            // 对应 C 的 gmatch: 创建带 upvalue 的 C 闭包
-            // Rust 版本: 返回带 __call 元方法的表,表内存储状态
-            // 状态: {s=string, p=pattern, pos=0, anchor=bool, pat_start=int}
-            let s = get_str_arg(state, a, 0)?;
-            let p = get_str_arg(state, a, 1)?;
-            let init = get_opt_int_arg(state, a, nargs, 2, 1, "gmatch")?;
-            let len = s.len();
-            let init_pos = posrelat_i(init, len).saturating_sub(1);
-            // 对应 C: if (init > ls) init = ls + 1;
-            // 让 src = s + (ls+1) 超过 src_end = s + ls，循环不执行
-            let init_pos = if init_pos > len { len + 1 } else { init_pos };
-
-            let anchor = p.starts_with('^');
-            let pat_start = if anchor { 1 } else { 0 };
-
-            // 创建状态表
-            let mut state_table = crate::table::Table::new();
-            state_table.set(
-                TValue::Str(state.intern_str("s")),
-                TValue::Str(state.intern_str(&s)),
-            );
-            state_table.set(
-                TValue::Str(state.intern_str("p")),
-                TValue::Str(state.intern_str(&p)),
-            );
-            state_table.set(
-                TValue::Str(state.intern_str("pos")),
-                TValue::Integer(init_pos as i64),
-            );
-            state_table.set(
-                TValue::Str(state.intern_str("anchor")),
-                TValue::Boolean(anchor),
-            );
-            state_table.set(
-                TValue::Str(state.intern_str("pat_start")),
-                TValue::Integer(pat_start as i64),
-            );
-            // lastmatch: 上次匹配的结束位置（-1 表示无上次匹配）
-            // 对应 C 的 gm->lastmatch，用于跳过空匹配造成的重复
-            state_table.set(
-                TValue::Str(state.intern_str("lastmatch")),
-                TValue::Integer(-1),
-            );
-
-            // 创建元表,设置 __call = STR_GMATCH_ITER 标签
-            let mut mt = crate::table::Table::new();
-            mt.set(
-                TValue::Str(state.intern_str("__call")),
-                TValue::LightUserData(STR_GMATCH_ITER as *mut std::ffi::c_void),
-            );
-            state_table.set_metatable(Some(mt));
-
-            // 返回单个表值 (可调用对象)
-            push_results(state, a, nresults, vec![TValue::Table(state_table)]);
-            Ok(())
-        }
-        STR_PACK => {
-            // string.pack(fmt, ...)
-            let fmt = get_str_arg(state, a, 0)?;
-            // 收集参数 (从索引 1 开始,即第 2 个参数及之后)
-            let args: Vec<TValue> = (1..nargs)
-                .map(|i| {
-                    let idx = a + 1 + i;
-                    if idx < state.stack.len() {
-                        state.stack[idx].clone()
+        // string/number 替换 — 对应 C 的 default 分支 (add_s)
+        TValue::Str(_) | TValue::Integer(_) | TValue::Float(_) => {
+            let repl = get_str_arg(state, a, 2)?;
+            match str_gsub(&s, &pattern, &repl, max_s) {
+                Ok((result, n)) => {
+                    // 对应 C: if (!changed) lua_pushvalue(L, 1);
+                    let result_val = if n == 0 {
+                        orig_str
                     } else {
-                        TValue::Nil(NilKind::Strict)
-                    }
-                })
-                .collect();
-            match str_pack(&fmt, &args) {
-                Ok(bytes) => {
-                    // 将字节转换为 LuaString (可能包含非 UTF-8 字节)
-                    let s = unsafe { String::from_utf8_unchecked(bytes) };
-                    push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&s))]);
+                        TValue::Str(state.intern_str(&result))
+                    };
+                    push_results(state, a, nresults, vec![result_val, TValue::Integer(n)]);
                     Ok(())
                 }
                 Err(msg) => Err(VmError::RuntimeError(msg)),
-            }
-        }
-        STR_PACKSIZE => {
-            // string.packsize(fmt)
-            let fmt = get_str_arg(state, a, 0)?;
-            match str_packsize(&fmt) {
-                Ok(size) => {
-                    push_results(state, a, nresults, vec![TValue::Integer(size as i64)]);
-                    Ok(())
-                }
-                Err(msg) => Err(VmError::RuntimeError(msg)),
-            }
-        }
-        STR_UNPACK => {
-            // string.unpack(fmt, data, [pos])
-            let fmt = get_str_arg(state, a, 0)?;
-            // 获取数据字符串的字节
-            let data_bytes = {
-                let stack_idx = a + 1 + 1;
-                if stack_idx >= state.stack.len() {
-                    return Err(VmError::RuntimeError(format!(
-                        "bad argument #2 to 'unpack' (string expected, got no value)"
-                    )));
-                }
-                match &state.stack[stack_idx] {
-                    TValue::Str(s) => s.as_str().as_bytes().to_vec(),
-                    _ => {
-                        return Err(VmError::RuntimeError(format!(
-                            "bad argument #2 to 'unpack' (string expected, got {})",
-                            state.stack[stack_idx].ty()
-                        )))
-                    }
-                }
-            };
-            let pos = get_opt_int_arg(state, a, nargs, 2, 1, "unpack")?;
-            match str_unpack(&fmt, &data_bytes, pos) {
-                Ok((mut values, next_pos)) => {
-                    // 最后一个返回值是下一个位置
-                    values.push(TValue::Integer(next_pos as i64));
-                    push_results(state, a, nresults, values);
-                    Ok(())
-                }
-                Err(msg) => Err(VmError::RuntimeError(msg)),
-            }
-        }
-        STR_GMATCH_ITER => {
-            // gmatch 迭代器 — 在 TFORCALL 中调用
-            // 参数: state_table (表), ctrl (忽略)
-            call_gmatch_iter(state, a, nargs, nresults)
-        }
-        STR_DUMP => {
-            // string.dump(f [, strip]) — 对应 C 的 str_dump
-            // 将 Lua 函数序列化为二进制格式
-            if nargs == 0 {
-                return Err(VmError::RuntimeError(
-                    "bad argument #1 to 'dump' (function expected, got no value)".to_string(),
-                ));
-            }
-            let stack_idx = a + 1;
-            if stack_idx >= state.stack.len() {
-                return Err(VmError::RuntimeError(
-                    "bad argument #1 to 'dump' (function expected, got no value)".to_string(),
-                ));
-            }
-            let func_val = state.stack[stack_idx].clone();
-            let strip = if nargs >= 2 {
-                let strip_idx = a + 2;
-                if strip_idx < state.stack.len() {
-                    matches!(&state.stack[strip_idx], TValue::Boolean(true))
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            match &func_val {
-                TValue::LClosure(cl) => {
-                    let data = crate::compiler::bytecode_dump::dump_proto(&cl.proto, strip);
-                    push_results(
-                        state,
-                        a,
-                        nresults,
-                        vec![TValue::Str(crate::strings::new_long_bytes(data))],
-                    );
-                    Ok(())
-                }
-                _ => Err(VmError::RuntimeError(format!(
-                    "bad argument #1 to 'dump' (function expected, got {})",
-                    func_val.ty()
-                ))),
             }
         }
         _ => Err(VmError::RuntimeError(format!(
-            "unknown string function tag: {}",
-            tag
+            "bad argument #3 (string/function/table expected, got {})",
+            repl_val.ty()
+        ))),
+    }
+}
+
+/// string.gmatch(s, pattern) — 对应 C 的 gmatch
+///
+/// 返回一个可调用的状态表。Rust 版本: 返回带 __call 元方法的表,表内存储状态
+/// 状态: {s=string, p=pattern, pos=0, anchor=bool, pat_start=int}
+fn call_str_gmatch(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    let s = get_str_arg(state, a, 0)?;
+    let p = get_str_arg(state, a, 1)?;
+    let init = get_opt_int_arg(state, a, nargs, 2, 1, "gmatch")?;
+    let len = s.len();
+    let init_pos = posrelat_i(init, len).saturating_sub(1);
+    // 对应 C: if (init > ls) init = ls + 1;
+    // 让 src = s + (ls+1) 超过 src_end = s + ls，循环不执行
+    let init_pos = if init_pos > len { len + 1 } else { init_pos };
+
+    let anchor = p.starts_with('^');
+    let pat_start = if anchor { 1 } else { 0 };
+
+    // 创建状态表
+    let mut state_table = crate::table::Table::new();
+    state_table.set(
+        TValue::Str(state.intern_str("s")),
+        TValue::Str(state.intern_str(&s)),
+    );
+    state_table.set(
+        TValue::Str(state.intern_str("p")),
+        TValue::Str(state.intern_str(&p)),
+    );
+    state_table.set(
+        TValue::Str(state.intern_str("pos")),
+        TValue::Integer(init_pos as i64),
+    );
+    state_table.set(
+        TValue::Str(state.intern_str("anchor")),
+        TValue::Boolean(anchor),
+    );
+    state_table.set(
+        TValue::Str(state.intern_str("pat_start")),
+        TValue::Integer(pat_start as i64),
+    );
+    // lastmatch: 上次匹配的结束位置（-1 表示无上次匹配）
+    // 对应 C 的 gm->lastmatch，用于跳过空匹配造成的重复
+    state_table.set(
+        TValue::Str(state.intern_str("lastmatch")),
+        TValue::Integer(-1),
+    );
+
+    // 创建元表,设置 __call = BuiltinFn(call_gmatch_iter)
+    // 迭代器作为 BuiltinFn 注册,无需 tag 派发
+    let mut mt = crate::table::Table::new();
+    mt.set(
+        TValue::Str(state.intern_str("__call")),
+        TValue::BuiltinFn(BuiltinFn {
+            func: call_gmatch_iter,
+            name: c"gmatch_iter".as_ptr() as *const u8,
+        }),
+    );
+    state_table.set_metatable(Some(mt));
+
+    // 返回单个表值 (可调用对象)
+    push_results(state, a, nresults, vec![TValue::Table(state_table)]);
+    Ok(())
+}
+
+/// string.pack(fmt, ...) — 对应 C 的 str_pack
+fn call_str_pack(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    let fmt = get_str_arg(state, a, 0)?;
+    // 收集参数 (从索引 1 开始,即第 2 个参数及之后)
+    let args: Vec<TValue> = (1..nargs)
+        .map(|i| {
+            let idx = a + 1 + i;
+            if idx < state.stack.len() {
+                state.stack[idx].clone()
+            } else {
+                TValue::Nil(NilKind::Strict)
+            }
+        })
+        .collect();
+    match str_pack(&fmt, &args) {
+        Ok(bytes) => {
+            // 将字节转换为 LuaString (可能包含非 UTF-8 字节)
+            let s = unsafe { String::from_utf8_unchecked(bytes) };
+            push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&s))]);
+            Ok(())
+        }
+        Err(msg) => Err(VmError::RuntimeError(msg)),
+    }
+}
+
+/// string.packsize(fmt) — 对应 C 的 str_packsize
+fn call_str_packsize(
+    state: &mut LuaState,
+    a: usize,
+    _nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    let fmt = get_str_arg(state, a, 0)?;
+    match str_packsize(&fmt) {
+        Ok(size) => {
+            push_results(state, a, nresults, vec![TValue::Integer(size as i64)]);
+            Ok(())
+        }
+        Err(msg) => Err(VmError::RuntimeError(msg)),
+    }
+}
+
+/// string.unpack(fmt, data [, pos]) — 对应 C 的 str_unpack
+fn call_str_unpack(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    let fmt = get_str_arg(state, a, 0)?;
+    // 获取数据字符串的字节
+    let data_bytes = {
+        let stack_idx = a + 1 + 1;
+        if stack_idx >= state.stack.len() {
+            return Err(VmError::RuntimeError(format!(
+                "bad argument #2 to 'unpack' (string expected, got no value)"
+            )));
+        }
+        match &state.stack[stack_idx] {
+            TValue::Str(s) => s.as_str().as_bytes().to_vec(),
+            _ => {
+                return Err(VmError::RuntimeError(format!(
+                    "bad argument #2 to 'unpack' (string expected, got {})",
+                    state.stack[stack_idx].ty()
+                )))
+            }
+        }
+    };
+    let pos = get_opt_int_arg(state, a, nargs, 2, 1, "unpack")?;
+    match str_unpack(&fmt, &data_bytes, pos) {
+        Ok((mut values, next_pos)) => {
+            // 最后一个返回值是下一个位置
+            values.push(TValue::Integer(next_pos as i64));
+            push_results(state, a, nresults, values);
+            Ok(())
+        }
+        Err(msg) => Err(VmError::RuntimeError(msg)),
+    }
+}
+
+/// string.dump(f [, strip]) — 对应 C 的 str_dump
+///
+/// 将 Lua 函数序列化为二进制格式
+fn call_str_dump(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    if nargs == 0 {
+        return Err(VmError::RuntimeError(
+            "bad argument #1 to 'dump' (function expected, got no value)".to_string(),
+        ));
+    }
+    let stack_idx = a + 1;
+    if stack_idx >= state.stack.len() {
+        return Err(VmError::RuntimeError(
+            "bad argument #1 to 'dump' (function expected, got no value)".to_string(),
+        ));
+    }
+    let func_val = state.stack[stack_idx].clone();
+    let strip = if nargs >= 2 {
+        let strip_idx = a + 2;
+        if strip_idx < state.stack.len() {
+            matches!(&state.stack[strip_idx], TValue::Boolean(true))
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    match &func_val {
+        TValue::LClosure(cl) => {
+            let data = crate::compiler::bytecode_dump::dump_proto(&cl.proto, strip);
+            push_results(
+                state,
+                a,
+                nresults,
+                vec![TValue::Str(crate::strings::new_long_bytes(data))],
+            );
+            Ok(())
+        }
+        _ => Err(VmError::RuntimeError(format!(
+            "bad argument #1 to 'dump' (function expected, got {})",
+            func_val.ty()
         ))),
     }
 }
@@ -3931,30 +3979,31 @@ fn set_arith_method(
 
 /// 创建字符串库函数表
 fn create_string_lib_table(state: &LuaState) -> Table {
-    let mut lib = Table::new();
-    // 注册所有字符串库函数，使用 LightUserData 标签
+    let lib = Table::new();
+    // 注册所有字符串库函数 (使用 BuiltinFn 函数指针)
     // 重要: 必须使用 state.intern_str() 创建键，确保哈希值与后续查找时一致
-    let register = |lib: &mut Table, name: &str, tag: usize| {
-        let key = TValue::Str(state.intern_str(name));
-        lib.set(key, TValue::LightUserData(tag as *mut std::ffi::c_void));
+    let register = |lib: &Table, name: &'static std::ffi::CStr, func: BuiltinFnPtr| {
+        let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
+        let name_ptr = name.as_ptr() as *const u8;
+        lib.set(key, TValue::BuiltinFn(BuiltinFn { func, name: name_ptr }));
     };
-    register(&mut lib, "upper", STR_UPPER);
-    register(&mut lib, "lower", STR_LOWER);
-    register(&mut lib, "len", STR_LEN);
-    register(&mut lib, "sub", STR_SUB);
-    register(&mut lib, "reverse", STR_REVERSE);
-    register(&mut lib, "byte", STR_BYTE);
-    register(&mut lib, "char", STR_CHAR);
-    register(&mut lib, "rep", STR_REP);
-    register(&mut lib, "find", STR_FIND);
-    register(&mut lib, "format", STR_FORMAT);
-    register(&mut lib, "match", STR_MATCH);
-    register(&mut lib, "gmatch", STR_GMATCH);
-    register(&mut lib, "gsub", STR_GSUB);
-    register(&mut lib, "pack", STR_PACK);
-    register(&mut lib, "packsize", STR_PACKSIZE);
-    register(&mut lib, "unpack", STR_UNPACK);
-    register(&mut lib, "dump", STR_DUMP);
+    register(&lib, c"upper", call_str_upper);
+    register(&lib, c"lower", call_str_lower);
+    register(&lib, c"len", call_str_len);
+    register(&lib, c"sub", call_str_sub);
+    register(&lib, c"reverse", call_str_reverse);
+    register(&lib, c"byte", call_str_byte);
+    register(&lib, c"char", call_str_char);
+    register(&lib, c"rep", call_str_rep);
+    register(&lib, c"find", call_str_find);
+    register(&lib, c"format", call_str_format);
+    register(&lib, c"match", call_str_match);
+    register(&lib, c"gmatch", call_str_gmatch);
+    register(&lib, c"gsub", call_str_gsub);
+    register(&lib, c"pack", call_str_pack);
+    register(&lib, c"packsize", call_str_packsize);
+    register(&lib, c"unpack", call_str_unpack);
+    register(&lib, c"dump", call_str_dump);
     lib
 }
 
@@ -4781,23 +4830,18 @@ mod tests {
     }
 
     // ========================================================================
-    // call_string_function 测试
+    // BuiltinFn 派发函数测试
     // ========================================================================
 
     #[test]
-    fn test_call_string_function_upper() {
+    fn test_call_str_upper() {
         let mut state = LuaState::new();
         // 清空栈 (LuaState::new() 会预置一个 Nil)
         state.stack.clear();
-        // 模拟栈: [func, "hello"]
-        state
-            .stack
-            .push(TValue::LightUserData(STR_UPPER as *mut std::ffi::c_void));
+        // 模拟栈: [func, "hello"] (位置 a=0 是函数占位,参数从 a+1 开始)
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::Str(state.intern_str("hello")));
-        let a = 0;
-        let nargs = 1;
-        let nresults = 1;
-        call_string_function(STR_UPPER, &mut state, a, nargs, nresults).unwrap();
+        call_str_upper(&mut state, 0, 1, 1).unwrap();
         assert_eq!(state.stack.len(), 1);
         match &state.stack[0] {
             TValue::Str(s) => assert_eq!(s.as_str(), "HELLO"),
@@ -4806,14 +4850,12 @@ mod tests {
     }
 
     #[test]
-    fn test_call_string_function_len() {
+    fn test_call_str_len() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(STR_LEN as *mut std::ffi::c_void));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::Str(state.intern_str("hello")));
-        call_string_function(STR_LEN, &mut state, 0, 1, 1).unwrap();
+        call_str_len(&mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 5),
             _ => panic!("expected integer result"),
@@ -4821,16 +4863,14 @@ mod tests {
     }
 
     #[test]
-    fn test_call_string_function_sub() {
+    fn test_call_str_sub() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(STR_SUB as *mut std::ffi::c_void));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::Str(state.intern_str("hello")));
         state.stack.push(TValue::Integer(2));
         state.stack.push(TValue::Integer(4));
-        call_string_function(STR_SUB, &mut state, 0, 3, 1).unwrap();
+        call_str_sub(&mut state, 0, 3, 1).unwrap();
         match &state.stack[0] {
             TValue::Str(s) => assert_eq!(s.as_str(), "ell"),
             _ => panic!("expected string result"),
@@ -4838,14 +4878,12 @@ mod tests {
     }
 
     #[test]
-    fn test_call_string_function_reverse() {
+    fn test_call_str_reverse() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(STR_REVERSE as *mut std::ffi::c_void));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::Str(state.intern_str("abc")));
-        call_string_function(STR_REVERSE, &mut state, 0, 1, 1).unwrap();
+        call_str_reverse(&mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
             TValue::Str(s) => assert_eq!(s.as_str(), "cba"),
             _ => panic!("expected string result"),
@@ -4853,16 +4891,14 @@ mod tests {
     }
 
     #[test]
-    fn test_call_string_function_byte() {
+    fn test_call_str_byte() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(STR_BYTE as *mut std::ffi::c_void));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::Str(state.intern_str("AB")));
         state.stack.push(TValue::Integer(1));
         state.stack.push(TValue::Integer(2));
-        call_string_function(STR_BYTE, &mut state, 0, 3, -1).unwrap();
+        call_str_byte(&mut state, 0, 3, -1).unwrap();
         assert_eq!(state.stack.len(), 2);
         match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 65),
@@ -4875,15 +4911,13 @@ mod tests {
     }
 
     #[test]
-    fn test_call_string_function_char() {
+    fn test_call_str_char() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(STR_CHAR as *mut std::ffi::c_void));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::Integer(65));
         state.stack.push(TValue::Integer(66));
-        call_string_function(STR_CHAR, &mut state, 0, 2, 1).unwrap();
+        call_str_char(&mut state, 0, 2, 1).unwrap();
         match &state.stack[0] {
             TValue::Str(s) => assert_eq!(s.as_str(), "AB"),
             _ => panic!("expected string result"),
@@ -4891,15 +4925,13 @@ mod tests {
     }
 
     #[test]
-    fn test_call_string_function_rep() {
+    fn test_call_str_rep() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(STR_REP as *mut std::ffi::c_void));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::Str(state.intern_str("ab")));
         state.stack.push(TValue::Integer(3));
-        call_string_function(STR_REP, &mut state, 0, 2, 1).unwrap();
+        call_str_rep(&mut state, 0, 2, 1).unwrap();
         match &state.stack[0] {
             TValue::Str(s) => assert_eq!(s.as_str(), "ababab"),
             _ => panic!("expected string result"),
@@ -4907,17 +4939,15 @@ mod tests {
     }
 
     #[test]
-    fn test_call_string_function_find() {
+    fn test_call_str_find() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(STR_FIND as *mut std::ffi::c_void));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state
             .stack
             .push(TValue::Str(state.intern_str("hello world")));
         state.stack.push(TValue::Str(state.intern_str("world")));
-        call_string_function(STR_FIND, &mut state, 0, 2, -1).unwrap();
+        call_str_find(&mut state, 0, 2, -1).unwrap();
         assert!(state.stack.len() >= 2);
         match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 7),
@@ -4930,26 +4960,17 @@ mod tests {
     }
 
     #[test]
-    fn test_call_string_function_format() {
+    fn test_call_str_format() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(STR_FORMAT as *mut std::ffi::c_void));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::Str(state.intern_str("hello %s")));
         state.stack.push(TValue::Str(state.intern_str("world")));
-        call_string_function(STR_FORMAT, &mut state, 0, 2, 1).unwrap();
+        call_str_format(&mut state, 0, 2, 1).unwrap();
         match &state.stack[0] {
             TValue::Str(s) => assert_eq!(s.as_str(), "hello world"),
             _ => panic!("expected string result"),
         }
-    }
-
-    #[test]
-    fn test_call_string_function_unknown_tag() {
-        let mut state = LuaState::new();
-        let result = call_string_function(999, &mut state, 0, 0, 0);
-        assert!(result.is_err());
     }
 
     // ========================================================================

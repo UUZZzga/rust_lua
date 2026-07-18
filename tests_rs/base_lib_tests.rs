@@ -926,15 +926,6 @@ fn test_unit_base_assert() {
 }
 
 #[test]
-fn test_unit_is_base_tag() {
-    assert!(base_lib::is_base_tag(base_lib::BASE_PRINT));
-    assert!(base_lib::is_base_tag(base_lib::BASE_ERROR));
-    assert!(base_lib::is_base_tag(base_lib::BASE_WARN));
-    assert!(!base_lib::is_base_tag(0));
-    assert!(!base_lib::is_base_tag(100));
-}
-
-#[test]
 fn test_unit_open_base_lib() {
     let mut state = LuaState::new();
     base_lib::open_base_lib(&mut state);
@@ -978,284 +969,11 @@ fn test_unit_open_base_lib() {
 }
 
 // ============================================================================
-// 单元测试: 通过 call_base_function 测试
+// 单元测试: 直接调用 BuiltinFn 函数
 // ============================================================================
-
-#[test]
-fn test_unit_call_type() {
-    let mut state = LuaState::new();
-    state.stack.clear();
-    state.stack.push(TValue::LightUserData(
-        base_lib::BASE_TYPE as *mut std::ffi::c_void,
-    ));
-    state.stack.push(TValue::Integer(42));
-    base_lib::call_base_function(base_lib::BASE_TYPE, &mut state, 0, 1, 1).unwrap();
-    match &state.stack[0] {
-        TValue::Str(s) => assert_eq!(s.as_str(), "number"),
-        _ => panic!("expected string result"),
-    }
-}
-
-#[test]
-fn test_unit_call_tonumber() {
-    let mut state = LuaState::new();
-    state.stack.clear();
-    state.stack.push(TValue::LightUserData(
-        base_lib::BASE_TONUMBER as *mut std::ffi::c_void,
-    ));
-    state.stack.push(TValue::Str(state.intern_str("42")));
-    base_lib::call_base_function(base_lib::BASE_TONUMBER, &mut state, 0, 1, 1).unwrap();
-    match &state.stack[0] {
-        TValue::Integer(n) => assert_eq!(*n, 42),
-        _ => panic!("expected integer result"),
-    }
-}
-
-#[test]
-fn test_unit_call_tostring() {
-    let mut state = LuaState::new();
-    state.stack.clear();
-    state.stack.push(TValue::LightUserData(
-        base_lib::BASE_TOSTRING as *mut std::ffi::c_void,
-    ));
-    state.stack.push(TValue::Integer(42));
-    base_lib::call_base_function(base_lib::BASE_TOSTRING, &mut state, 0, 1, 1).unwrap();
-    match &state.stack[0] {
-        TValue::Str(s) => assert_eq!(s.as_str(), "42"),
-        _ => panic!("expected string result"),
-    }
-}
-
-#[test]
-fn test_unit_call_rawequal() {
-    let mut state = LuaState::new();
-    state.stack.clear();
-    state.stack.push(TValue::LightUserData(
-        base_lib::BASE_RAWEQUAL as *mut std::ffi::c_void,
-    ));
-    state.stack.push(TValue::Integer(42));
-    state.stack.push(TValue::Integer(42));
-    base_lib::call_base_function(base_lib::BASE_RAWEQUAL, &mut state, 0, 2, 1).unwrap();
-    match &state.stack[0] {
-        TValue::Boolean(b) => assert!(*b),
-        _ => panic!("expected boolean result"),
-    }
-}
-
-#[test]
-fn test_unit_call_rawlen() {
-    let mut state = LuaState::new();
-    state.stack.clear();
-    state.stack.push(TValue::LightUserData(
-        base_lib::BASE_RAWLEN as *mut std::ffi::c_void,
-    ));
-    state.stack.push(TValue::Str(state.intern_str("hello")));
-    base_lib::call_base_function(base_lib::BASE_RAWLEN, &mut state, 0, 1, 1).unwrap();
-    match &state.stack[0] {
-        TValue::Integer(n) => assert_eq!(*n, 5),
-        _ => panic!("expected integer result"),
-    }
-}
-
-#[test]
-fn test_unit_call_rawget() {
-    let mut state = LuaState::new();
-    state.stack.clear();
-    let mut t = Table::new();
-    t.set(TValue::Integer(1), TValue::Integer(100));
-    state.stack.push(TValue::LightUserData(
-        base_lib::BASE_RAWGET as *mut std::ffi::c_void,
-    ));
-    state.stack.push(TValue::Table(t));
-    state.stack.push(TValue::Integer(1));
-    base_lib::call_base_function(base_lib::BASE_RAWGET, &mut state, 0, 2, 1).unwrap();
-    match &state.stack[0] {
-        TValue::Integer(n) => assert_eq!(*n, 100),
-        _ => panic!("expected integer result"),
-    }
-}
-
-#[test]
-fn test_unit_call_rawset() {
-    let mut state = LuaState::new();
-    state.stack.clear();
-    let t = Table::new();
-    state.stack.push(TValue::LightUserData(
-        base_lib::BASE_RAWSET as *mut std::ffi::c_void,
-    ));
-    state.stack.push(TValue::Table(t));
-    state.stack.push(TValue::Integer(1));
-    state.stack.push(TValue::Integer(999));
-    base_lib::call_base_function(base_lib::BASE_RAWSET, &mut state, 0, 3, 1).unwrap();
-    match &state.stack[0] {
-        TValue::Table(t) => {
-            let val = t.get(&TValue::Integer(1));
-            assert!(matches!(val, Some(TValue::Integer(999))));
-        }
-        _ => panic!("expected table result"),
-    }
-}
-
-#[test]
-fn test_unit_call_select_hash() {
-    let mut state = LuaState::new();
-    state.stack.clear();
-    state.stack.push(TValue::LightUserData(
-        base_lib::BASE_SELECT as *mut std::ffi::c_void,
-    ));
-    state.stack.push(TValue::Str(state.intern_str("#")));
-    state.stack.push(TValue::Integer(1));
-    state.stack.push(TValue::Integer(2));
-    state.stack.push(TValue::Integer(3));
-    base_lib::call_base_function(base_lib::BASE_SELECT, &mut state, 0, 4, 1).unwrap();
-    match &state.stack[0] {
-        TValue::Integer(n) => assert_eq!(*n, 3),
-        _ => panic!("expected integer result"),
-    }
-}
-
-#[test]
-fn test_unit_call_assert_true() {
-    let mut state = LuaState::new();
-    state.stack.clear();
-    state.stack.push(TValue::LightUserData(
-        base_lib::BASE_ASSERT as *mut std::ffi::c_void,
-    ));
-    state.stack.push(TValue::Boolean(true));
-    base_lib::call_base_function(base_lib::BASE_ASSERT, &mut state, 0, 1, -1).unwrap();
-    match &state.stack[0] {
-        TValue::Boolean(b) => assert!(*b),
-        _ => panic!("expected boolean true"),
-    }
-}
-
-#[test]
-fn test_unit_call_assert_false() {
-    let mut state = LuaState::new();
-    state.stack.clear();
-    state.stack.push(TValue::LightUserData(
-        base_lib::BASE_ASSERT as *mut std::ffi::c_void,
-    ));
-    state.stack.push(TValue::Boolean(false));
-    let result = base_lib::call_base_function(base_lib::BASE_ASSERT, &mut state, 0, 1, -1);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_unit_call_error() {
-    let mut state = LuaState::new();
-    state.stack.clear();
-    state.stack.push(TValue::LightUserData(
-        base_lib::BASE_ERROR as *mut std::ffi::c_void,
-    ));
-    state
-        .stack
-        .push(TValue::Str(state.intern_str("test error")));
-    let result = base_lib::call_base_function(base_lib::BASE_ERROR, &mut state, 0, 1, 0);
-    assert!(result.is_err());
-    match result {
-        Err(lua_rs::execute::VmError::RuntimeError(msg)) => assert_eq!(msg, "test error"),
-        _ => panic!("expected RuntimeError"),
-    }
-}
-
-#[test]
-fn test_unit_call_setmetatable() {
-    let mut state = LuaState::new();
-    state.stack.clear();
-    let t = Table::new();
-    let mt = Table::new();
-    state.stack.push(TValue::LightUserData(
-        base_lib::BASE_SETMETATABLE as *mut std::ffi::c_void,
-    ));
-    state.stack.push(TValue::Table(t));
-    state.stack.push(TValue::Table(mt));
-    base_lib::call_base_function(base_lib::BASE_SETMETATABLE, &mut state, 0, 2, 1).unwrap();
-    match &state.stack[0] {
-        TValue::Table(t) => assert!(t.data.borrow().metatable.is_some()),
-        _ => panic!("expected table result"),
-    }
-}
-
-#[test]
-fn test_unit_call_getmetatable() {
-    let mut state = LuaState::new();
-    state.stack.clear();
-    let mut t = Table::new();
-    t.data.borrow_mut().metatable = Some(Box::new(Table::new()));
-    state.stack.push(TValue::LightUserData(
-        base_lib::BASE_GETMETATABLE as *mut std::ffi::c_void,
-    ));
-    state.stack.push(TValue::Table(t));
-    base_lib::call_base_function(base_lib::BASE_GETMETATABLE, &mut state, 0, 1, 1).unwrap();
-    match &state.stack[0] {
-        TValue::Table(_) => {}
-        _ => panic!("expected table result"),
-    }
-}
-
-#[test]
-fn test_unit_call_getmetatable_no_mt() {
-    let mut state = LuaState::new();
-    state.stack.clear();
-    let t = Table::new();
-    state.stack.push(TValue::LightUserData(
-        base_lib::BASE_GETMETATABLE as *mut std::ffi::c_void,
-    ));
-    state.stack.push(TValue::Table(t));
-    base_lib::call_base_function(base_lib::BASE_GETMETATABLE, &mut state, 0, 1, 1).unwrap();
-    match &state.stack[0] {
-        TValue::Nil(_) => {}
-        _ => panic!("expected nil result"),
-    }
-}
-
-#[test]
-fn test_unit_call_ipairs() {
-    let mut state = LuaState::new();
-    state.stack.clear();
-    let mut t = Table::new();
-    t.set(TValue::Integer(1), TValue::Integer(10));
-    t.set(TValue::Integer(2), TValue::Integer(20));
-    state.stack.push(TValue::LightUserData(
-        base_lib::BASE_IPAIRS as *mut std::ffi::c_void,
-    ));
-    state.stack.push(TValue::Table(t));
-    base_lib::call_base_function(base_lib::BASE_IPAIRS, &mut state, 0, 1, 3).unwrap();
-    assert_eq!(state.stack.len(), 3);
-    match &state.stack[0] {
-        TValue::LightUserData(p) => {
-            assert_eq!(*p as usize, base_lib::BASE_IPAIRS_AUX);
-        }
-        _ => panic!("expected LightUserData"),
-    }
-    assert!(matches!(state.stack[1], TValue::Table(_)));
-    match &state.stack[2] {
-        TValue::Integer(n) => assert_eq!(*n, 0),
-        _ => panic!("expected integer 0"),
-    }
-}
-
-#[test]
-fn test_unit_call_pairs() {
-    let mut state = LuaState::new();
-    state.stack.clear();
-    let t = Table::new();
-    state.stack.push(TValue::LightUserData(
-        base_lib::BASE_PAIRS as *mut std::ffi::c_void,
-    ));
-    state.stack.push(TValue::Table(t));
-    base_lib::call_base_function(base_lib::BASE_PAIRS, &mut state, 0, 1, 3).unwrap();
-    assert_eq!(state.stack.len(), 3);
-    match &state.stack[0] {
-        TValue::LightUserData(p) => {
-            assert_eq!(*p as usize, base_lib::BASE_NEXT_ITER);
-        }
-        _ => panic!("expected LightUserData"),
-    }
-    assert!(matches!(state.stack[1], TValue::Table(_)));
-    assert!(matches!(state.stack[2], TValue::Nil(_)));
-}
+// base 库已迁移到 BuiltinFn，call_base_function/BASE_* tag 已删除。
+// 函数级单元测试在 base_lib.rs 的 mod tests 中进行（可访问私有函数）。
+// 此处仅保留对 pub 函数的直接测试。
 
 #[test]
 fn test_unit_call_ipairs_aux() {
@@ -1264,9 +982,12 @@ fn test_unit_call_ipairs_aux() {
     let mut t = Table::new();
     t.set(TValue::Integer(1), TValue::Integer(10));
     t.set(TValue::Integer(2), TValue::Integer(20));
-    state.stack.push(TValue::LightUserData(
-        base_lib::BASE_IPAIRS as *mut std::ffi::c_void,
-    ));
+    // base 库已迁移到 BuiltinFn，ipairs 返回的迭代器是 BuiltinFn(call_ipairs_aux)。
+    // call_ipairs_aux 不读取函数槽 (position a)，此处用 BuiltinFn 占位以模拟真实场景。
+    state.stack.push(TValue::BuiltinFn(lua_rs::objects::BuiltinFn {
+        func: base_lib::call_ipairs_aux,
+        name: b"for iterator\0".as_ptr() as *const u8,
+    }));
     state.stack.push(TValue::Table(t));
     state.stack.push(TValue::Integer(0));
     base_lib::call_ipairs_aux(&mut state, 0, 2, -1).unwrap();
@@ -1279,13 +1000,6 @@ fn test_unit_call_ipairs_aux() {
         TValue::Integer(n) => assert_eq!(*n, 10),
         _ => panic!("expected integer 10"),
     }
-}
-
-#[test]
-fn test_unit_call_unknown_tag() {
-    let mut state = LuaState::new();
-    let result = base_lib::call_base_function(999, &mut state, 0, 0, 0);
-    assert!(result.is_err());
 }
 
 // ============================================================================

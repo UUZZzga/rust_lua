@@ -744,7 +744,7 @@ pub fn call_close_method(
     // 生成 "attempt to call a nil value (metamethod 'close')" 错误。
     let tm_val = get_tm_by_obj(obj, TagMethod::Close, &state.dmt);
     let f = match tm_val {
-        Some(f) if f.is_function() => f,
+        Some(f) if f.is_callable() => f,
         other => {
             // __close 不存在或不是函数 — 对应 C 调用 nil/table 值时的 call error
             let tn = match &other {

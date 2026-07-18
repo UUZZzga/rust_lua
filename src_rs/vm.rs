@@ -456,6 +456,8 @@ pub fn raw_equal(t1: &TValue, t2: &TValue) -> bool {
         (TValue::Table(a), TValue::Table(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
         (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
         (TValue::CClosure(a), TValue::CClosure(b)) => Rc::ptr_eq(a, b),
+        (TValue::LCFn(a), TValue::LCFn(b)) => std::ptr::eq(a.func as *const (), b.func as *const ()),
+        (TValue::BuiltinFn(a), TValue::BuiltinFn(b)) => std::ptr::eq(a.func as *const (), b.func as *const ()),
         (TValue::UserData(a), TValue::UserData(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
         (TValue::Thread(a), TValue::Thread(b)) => Rc::ptr_eq(&a.context, &b.context),
         _ => false,

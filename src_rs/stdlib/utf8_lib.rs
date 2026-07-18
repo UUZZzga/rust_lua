@@ -7,14 +7,11 @@
 //! - 提供 utf8.offset, utf8.codepoint, utf8.char, utf8.len, utf8.codes 函数
 //! - 提供 utf8.charpattern 模式字符串
 //!
-//! ## 标签分配
-//! - 标签 1-19: 基础库
-//! - 标签 100+: 字符串库
-//! - 标签 200+: 数学库
-//! - 标签 300+: UTF-8 库
+//! ## 迁移说明
+//! - 已从 LightUserData(tag) 迁移到 BuiltinFn 函数指针方案
 
 use crate::execute::VmError;
-use crate::objects::{NilKind, TValue};
+use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
 
 // ============================================================================
@@ -39,34 +36,12 @@ const UTF8PATT_BYTES: &[u8] = &[
 ];
 
 // ============================================================================
-// 函数标签 (LightUserData 占位符值)
+// 函数标签 (已迁移到 BuiltinFn，不再使用 LightUserData tag)
 // ============================================================================
-
-pub const UTF8_OFFSET: usize = 300;
-pub const UTF8_CODEPOINT: usize = 301;
-pub const UTF8_CHAR: usize = 302;
-pub const UTF8_LEN: usize = 303;
-pub const UTF8_CODES: usize = 304;
-pub const UTF8_ITER_STRICT: usize = 305;
-pub const UTF8_ITER_LAX: usize = 306;
-
-/// UTF-8 库标签范围: [300, 310)
-pub fn is_utf8_tag(tag: usize) -> bool {
-    (300..310).contains(&tag)
-}
-
-/// 将 utf8 库函数 tag 映射到函数名（用于 traceback）
-pub fn utf8_function_name(tag: usize) -> Option<&'static str> {
-    match tag {
-        UTF8_OFFSET => Some("offset"),
-        UTF8_CODEPOINT => Some("codepoint"),
-        UTF8_CHAR => Some("char"),
-        UTF8_LEN => Some("len"),
-        UTF8_CODES => Some("codes"),
-        UTF8_ITER_STRICT | UTF8_ITER_LAX => Some("iter"),
-        _ => None,
-    }
-}
+// 标签 1-19: 基础库
+// 标签 100+: 字符串库
+// 标签 200+: 数学库（已迁移到 BuiltinFn）
+// 标签 300+: UTF-8 库（已迁移到 BuiltinFn，不再使用 tag）
 
 // ============================================================================
 // 辅助函数 (对应 C 源码的内联函数和宏)
@@ -482,40 +457,6 @@ fn utf8_iter_aux_impl(s: &[u8], n_arg: i64, strict: bool) -> Vec<TValue> {
 // 函数派发 — 从 execute.rs 调用
 // ============================================================================
 
-/// UTF-8 库函数派发
-///
-/// 从 execute.rs 的 op_call 或 state.rs 的 pcall 调用,
-/// 当 LightUserData 标签在 [300, 310) 范围内时。
-pub fn call_utf8_function(
-    tag: usize,
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
-    let prev_c_func = state.last_c_function.take();
-    state.last_c_function = utf8_function_name(tag).map(|s| s.to_string());
-
-    let result = match tag {
-        UTF8_OFFSET => call_offset(state, a, nargs, nresults),
-        UTF8_CODEPOINT => call_codepoint(state, a, nargs, nresults),
-        UTF8_CHAR => call_char(state, a, nargs, nresults),
-        UTF8_LEN => call_len(state, a, nargs, nresults),
-        UTF8_CODES => call_codes(state, a, nargs, nresults),
-        UTF8_ITER_STRICT => call_iter(state, a, nargs, nresults, true),
-        UTF8_ITER_LAX => call_iter(state, a, nargs, nresults, false),
-        _ => Err(VmError::RuntimeError(format!(
-            "unknown utf8 function tag: {}",
-            tag
-        ))),
-    };
-
-    if result.is_ok() {
-        state.last_c_function = prev_c_func;
-    }
-    result
-}
-
 /// utf8.offset(s, n, [i]) — 对应 C 的 byteoffset
 fn call_offset(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     let s = get_str_bytes(state, a, 0)?;
@@ -673,8 +614,12 @@ fn call_codes(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
         return Err(VmError::RuntimeError(MSG_INVALID.to_string()));
     }
 
-    let iter_tag = if lax { UTF8_ITER_LAX } else { UTF8_ITER_STRICT };
-    let iter_val = TValue::LightUserData(iter_tag as *mut std::ffi::c_void);
+    // 返回 BuiltinFn 迭代器（strict 或 lax）
+    let iter_fn = if lax { call_iter_lax } else { call_iter_strict };
+    let iter_val = TValue::BuiltinFn(BuiltinFn {
+        func: iter_fn,
+        name: c"iter".as_ptr() as *const u8,
+    });
     let s_val = state.stack[a + 1].clone();
     let init_pos = TValue::Integer(0);
 
@@ -682,7 +627,29 @@ fn call_codes(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
     Ok(())
 }
 
-/// utf8 迭代器函数 — 对应 C 的 iter_auxstrict / iter_auxlax
+/// utf8 迭代器函数（strict 模式）— 对应 C 的 iter_auxstrict
+///
+/// 在 TFORCALL 中调用，参数: s (字符串), n (当前位置)
+fn call_iter_strict(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    call_iter(state, a, nargs, nresults, true)
+}
+
+/// utf8 迭代器函数（lax 模式）— 对应 C 的 iter_auxlax
+fn call_iter_lax(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
+    call_iter(state, a, nargs, nresults, false)
+}
+
+/// utf8 迭代器函数实现 — 对应 C 的 iter_auxstrict / iter_auxlax
 ///
 /// 在 TFORCALL 中调用，参数: s (字符串), n (当前位置)
 fn call_iter(
@@ -778,16 +745,20 @@ fn call_iter(
 pub fn create_utf8_lib_table(state: &LuaState) -> crate::table::Table {
     let mut lib = crate::table::Table::new();
 
-    let register = |lib: &mut crate::table::Table, name: &str, tag: usize| {
-        let key = TValue::Str(state.intern_str(name));
-        lib.set(key, TValue::LightUserData(tag as *mut std::ffi::c_void));
+    // 注册所有 UTF-8 函数 (使用 BuiltinFn 函数指针)
+    let register = |lib: &mut crate::table::Table,
+                    name: &'static std::ffi::CStr,
+                    func: crate::objects::BuiltinFnPtr| {
+        let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
+        let name_ptr = name.as_ptr() as *const u8;
+        lib.set(key, TValue::BuiltinFn(BuiltinFn { func, name: name_ptr }));
     };
 
-    register(&mut lib, "offset", UTF8_OFFSET);
-    register(&mut lib, "codepoint", UTF8_CODEPOINT);
-    register(&mut lib, "char", UTF8_CHAR);
-    register(&mut lib, "len", UTF8_LEN);
-    register(&mut lib, "codes", UTF8_CODES);
+    register(&mut lib, c"offset", call_offset);
+    register(&mut lib, c"codepoint", call_codepoint);
+    register(&mut lib, c"char", call_char);
+    register(&mut lib, c"len", call_len);
+    register(&mut lib, c"codes", call_codes);
 
     // 设置 charpattern 字段
     let pattern_str = unsafe { String::from_utf8_unchecked(UTF8PATT_BYTES.to_vec()) };

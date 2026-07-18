@@ -21,7 +21,7 @@
 //! - 标签 500+: 调试库
 
 use crate::execute::VmError;
-use crate::objects::{LClosure, NilKind, Proto, TValue, UpVal, UpValRef, PF_VAHID};
+use crate::objects::{BuiltinFn, LClosure, NilKind, Proto, TValue, UpVal, UpValRef, PF_VAHID};
 use crate::state::LuaState;
 use crate::strings::LuaString;
 use crate::table::Table;
@@ -30,53 +30,9 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 // ============================================================================
-// 函数标签 (LightUserData 占位符值)
+// 函数标签 (已迁移到 BuiltinFn，不再使用 LightUserData tag)
 // ============================================================================
-
-pub const DEBUG_DEBUG: usize = 500;
-pub const DEBUG_GETUSERVALUE: usize = 501;
-pub const DEBUG_GETHOOK: usize = 502;
-pub const DEBUG_GETINFO: usize = 503;
-pub const DEBUG_GETLOCAL: usize = 504;
-pub const DEBUG_GETREGISTRY: usize = 505;
-pub const DEBUG_GETMETATABLE: usize = 506;
-pub const DEBUG_GETUPVALUE: usize = 507;
-pub const DEBUG_UPVALUEJOIN: usize = 508;
-pub const DEBUG_UPVALUEID: usize = 509;
-pub const DEBUG_SETUSERVALUE: usize = 510;
-pub const DEBUG_SETHOOK: usize = 511;
-pub const DEBUG_SETLOCAL: usize = 512;
-pub const DEBUG_SETMETATABLE: usize = 513;
-pub const DEBUG_SETUPVALUE: usize = 514;
-pub const DEBUG_TRACEBACK: usize = 515;
-
-/// 调试库标签范围: [500, 520)
-pub fn is_debug_tag(tag: usize) -> bool {
-    (500..520).contains(&tag)
-}
-
-/// 将 debug 库函数 tag 映射到函数名（用于 traceback）
-pub fn debug_function_name(tag: usize) -> Option<&'static str> {
-    match tag {
-        DEBUG_DEBUG => Some("debug"),
-        DEBUG_GETUSERVALUE => Some("getuservalue"),
-        DEBUG_GETHOOK => Some("gethook"),
-        DEBUG_GETINFO => Some("getinfo"),
-        DEBUG_GETLOCAL => Some("getlocal"),
-        DEBUG_GETREGISTRY => Some("getregistry"),
-        DEBUG_GETMETATABLE => Some("getmetatable"),
-        DEBUG_GETUPVALUE => Some("getupvalue"),
-        DEBUG_UPVALUEJOIN => Some("upvaluejoin"),
-        DEBUG_UPVALUEID => Some("upvalueid"),
-        DEBUG_SETUSERVALUE => Some("setuservalue"),
-        DEBUG_SETHOOK => Some("sethook"),
-        DEBUG_SETLOCAL => Some("setlocal"),
-        DEBUG_SETMETATABLE => Some("setmetatable"),
-        DEBUG_SETUPVALUE => Some("setupvalue"),
-        DEBUG_TRACEBACK => Some("traceback"),
-        _ => None,
-    }
-}
+// 标签 500+: 调试库（已迁移到 BuiltinFn，不再使用 tag）
 
 // ============================================================================
 // Hook 掩码常量 — 对应 C 的 LUA_MASK*
@@ -389,51 +345,8 @@ fn unmake_mask(mask: i32) -> String {
 }
 
 // ============================================================================
-// 函数派发 — 从 execute.rs / state.rs 调用
+// 函数派发 — 已迁移到 BuiltinFn，直接通过函数指针调用
 // ============================================================================
-
-/// 调试库函数派发
-///
-/// 从 execute.rs 的 op_call 或 state.rs 的 pcall 调用,
-/// 当 LightUserData 标签在 [500, 520) 范围内时。
-pub fn call_debug_function(
-    tag: usize,
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
-    let prev_c_func = state.last_c_function.take();
-    state.last_c_function = debug_function_name(tag).map(|s| s.to_string());
-
-    let result = match tag {
-        DEBUG_DEBUG => call_debug(state, a, nargs, nresults),
-        DEBUG_GETUSERVALUE => call_getuservalue(state, a, nargs, nresults),
-        DEBUG_GETHOOK => call_gethook(state, a, nargs, nresults),
-        DEBUG_GETINFO => call_getinfo(state, a, nargs, nresults),
-        DEBUG_GETLOCAL => call_getlocal(state, a, nargs, nresults),
-        DEBUG_GETREGISTRY => call_getregistry(state, a, nargs, nresults),
-        DEBUG_GETMETATABLE => call_getmetatable(state, a, nargs, nresults),
-        DEBUG_GETUPVALUE => call_getupvalue(state, a, nargs, nresults),
-        DEBUG_UPVALUEJOIN => call_upvaluejoin(state, a, nargs, nresults),
-        DEBUG_UPVALUEID => call_upvalueid(state, a, nargs, nresults),
-        DEBUG_SETUSERVALUE => call_setuservalue(state, a, nargs, nresults),
-        DEBUG_SETHOOK => call_sethook(state, a, nargs, nresults),
-        DEBUG_SETLOCAL => call_setlocal(state, a, nargs, nresults),
-        DEBUG_SETMETATABLE => call_setmetatable(state, a, nargs, nresults),
-        DEBUG_SETUPVALUE => call_setupvalue(state, a, nargs, nresults),
-        DEBUG_TRACEBACK => call_traceback(state, a, nargs, nresults),
-        _ => Err(VmError::RuntimeError(format!(
-            "unknown debug function tag: {}",
-            tag
-        ))),
-    };
-
-    if result.is_ok() {
-        state.last_c_function = prev_c_func;
-    }
-    result
-}
 
 // ============================================================================
 // 各函数实现
@@ -695,8 +608,15 @@ fn call_getinfo(
         if let TValue::LClosure(closure) = &level_or_func {
             fill_info_from_closure(&mut info, closure, &what);
         }
-    } else if matches!(level_or_func, TValue::LightUserData(_)) {
-        // C 函数
+    } else if matches!(
+        level_or_func,
+        TValue::LightUserData(_)
+            | TValue::BuiltinFn(_)
+            | TValue::CClosure(_)
+            | TValue::LCFn(_)
+    ) {
+        // C 函数 (BuiltinFn = Rust 原生内置函数, LCFn = lua_CFunction,
+        // CClosure = C 闭包, LightUserData = io.lines/coroutine.wrap 等遗留 tag)
         info.what = "C".to_string();
         info.short_src = "[C]".to_string();
         info.source = "=[C]".to_string();
@@ -714,8 +634,11 @@ fn call_getinfo(
             .get_metatable()
             .and_then(|mt| mt.get(&TValue::Str(state.intern_str("__call"))))
             .map(|v| {
-                if let TValue::LightUserData(p) = &v {
-                    *p as usize == crate::stdlib::string_lib::STR_GMATCH_ITER
+                if let TValue::BuiltinFn(bf) = &v {
+                    std::ptr::eq(
+                        bf.func as *const (),
+                        crate::stdlib::string_lib::call_gmatch_iter as *const (),
+                    )
                 } else {
                     false
                 }
@@ -1190,7 +1113,10 @@ fn fill_info_from_level(state: &LuaState, info: &mut DebugInfo, level: i32, what
         .map(|v| {
             matches!(
                 v,
-                TValue::LightUserData(_) | TValue::CClosure(_) | TValue::LCFn(_)
+                TValue::LightUserData(_)
+                    | TValue::CClosure(_)
+                    | TValue::LCFn(_)
+                    | TValue::BuiltinFn(_)
             )
         })
         .unwrap_or(false);
@@ -1961,10 +1887,15 @@ fn call_getlocal(
 
     // 函数参数模式: if arg1 is a function (Lua or C), get local name.
     // In C, lua_isfunction returns true for both Lua and C functions.
-    // In Rust, C functions are stored as LightUserData with tags.
+    // In Rust, C functions 可以是 BuiltinFn（Rust 原生内置函数）、LCFn（lua_CFunction）
+    // 或 LightUserData（io.lines 迭代器/coroutine.wrap 等遗留 tag 派发）。
     if matches!(
         arg1,
-        TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) | TValue::LightUserData(_)
+        TValue::LClosure(_)
+            | TValue::CClosure(_)
+            | TValue::LCFn(_)
+            | TValue::BuiltinFn(_)
+            | TValue::LightUserData(_)
     ) {
         if let TValue::LClosure(closure) = &arg1 {
             // Lua function: get the local variable name
@@ -2519,8 +2450,11 @@ fn call_upvalueid(
                 .get_metatable()
                 .and_then(|mt| mt.get(&TValue::Str(state.intern_str("__call"))))
                 .map(|v| {
-                    if let TValue::LightUserData(p) = &v {
-                        *p as usize == crate::stdlib::string_lib::STR_GMATCH_ITER
+                    if let TValue::BuiltinFn(bf) = &v {
+                        std::ptr::eq(
+                            bf.func as *const (),
+                            crate::stdlib::string_lib::call_gmatch_iter as *const (),
+                        )
                     } else {
                         false
                     }
@@ -3422,27 +3356,31 @@ fn call_debug(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
 pub fn create_debug_lib_table(state: &LuaState) -> Table {
     let mut lib = Table::new();
 
-    let register = |lib: &mut Table, name: &str, tag: usize| {
-        let key = TValue::Str(state.intern_str(name));
-        lib.set(key, TValue::LightUserData(tag as *mut std::ffi::c_void));
+    // 注册所有 debug 函数 (使用 BuiltinFn 函数指针)
+    let register = |lib: &mut Table,
+                    name: &'static std::ffi::CStr,
+                    func: crate::objects::BuiltinFnPtr| {
+        let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
+        let name_ptr = name.as_ptr() as *const u8;
+        lib.set(key, TValue::BuiltinFn(BuiltinFn { func, name: name_ptr }));
     };
 
-    register(&mut lib, "debug", DEBUG_DEBUG);
-    register(&mut lib, "getuservalue", DEBUG_GETUSERVALUE);
-    register(&mut lib, "gethook", DEBUG_GETHOOK);
-    register(&mut lib, "getinfo", DEBUG_GETINFO);
-    register(&mut lib, "getlocal", DEBUG_GETLOCAL);
-    register(&mut lib, "getregistry", DEBUG_GETREGISTRY);
-    register(&mut lib, "getmetatable", DEBUG_GETMETATABLE);
-    register(&mut lib, "getupvalue", DEBUG_GETUPVALUE);
-    register(&mut lib, "upvaluejoin", DEBUG_UPVALUEJOIN);
-    register(&mut lib, "upvalueid", DEBUG_UPVALUEID);
-    register(&mut lib, "setuservalue", DEBUG_SETUSERVALUE);
-    register(&mut lib, "sethook", DEBUG_SETHOOK);
-    register(&mut lib, "setlocal", DEBUG_SETLOCAL);
-    register(&mut lib, "setmetatable", DEBUG_SETMETATABLE);
-    register(&mut lib, "setupvalue", DEBUG_SETUPVALUE);
-    register(&mut lib, "traceback", DEBUG_TRACEBACK);
+    register(&mut lib, c"debug", call_debug);
+    register(&mut lib, c"getuservalue", call_getuservalue);
+    register(&mut lib, c"gethook", call_gethook);
+    register(&mut lib, c"getinfo", call_getinfo);
+    register(&mut lib, c"getlocal", call_getlocal);
+    register(&mut lib, c"getregistry", call_getregistry);
+    register(&mut lib, c"getmetatable", call_getmetatable);
+    register(&mut lib, c"getupvalue", call_getupvalue);
+    register(&mut lib, c"upvaluejoin", call_upvaluejoin);
+    register(&mut lib, c"upvalueid", call_upvalueid);
+    register(&mut lib, c"setuservalue", call_setuservalue);
+    register(&mut lib, c"sethook", call_sethook);
+    register(&mut lib, c"setlocal", call_setlocal);
+    register(&mut lib, c"setmetatable", call_setmetatable);
+    register(&mut lib, c"setupvalue", call_setupvalue);
+    register(&mut lib, c"traceback", call_traceback);
 
     lib
 }
@@ -3461,23 +3399,6 @@ pub fn open_debug_lib(state: &mut LuaState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_is_debug_tag() {
-        assert!(is_debug_tag(500));
-        assert!(is_debug_tag(519));
-        assert!(!is_debug_tag(499));
-        assert!(!is_debug_tag(520));
-        assert!(!is_debug_tag(100));
-    }
-
-    #[test]
-    fn test_debug_function_name() {
-        assert_eq!(debug_function_name(DEBUG_DEBUG), Some("debug"));
-        assert_eq!(debug_function_name(DEBUG_GETINFO), Some("getinfo"));
-        assert_eq!(debug_function_name(DEBUG_TRACEBACK), Some("traceback"));
-        assert_eq!(debug_function_name(999), None);
-    }
 
     #[test]
     fn test_make_mask() {
@@ -3545,10 +3466,7 @@ mod tests {
     fn test_call_getregistry() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_GETREGISTRY as *mut std::ffi::c_void,
-        ));
-        call_debug_function(DEBUG_GETREGISTRY, &mut state, 0, 0, 1).unwrap();
+        call_getregistry(&mut state, 0, 0, 1).unwrap();
         assert_eq!(state.stack.len(), 1);
         assert!(matches!(state.stack[0], TValue::Table(_)));
     }
@@ -3559,11 +3477,9 @@ mod tests {
         let t = Table::new();
         t.set_metatable(Some(Table::new()));
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_GETMETATABLE as *mut std::ffi::c_void,
-        ));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::Table(t));
-        call_debug_function(DEBUG_GETMETATABLE, &mut state, 0, 1, 1).unwrap();
+        call_getmetatable(&mut state, 0, 1, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Table(_)));
     }
 
@@ -3572,11 +3488,9 @@ mod tests {
         let mut state = LuaState::new();
         let t = Table::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_GETMETATABLE as *mut std::ffi::c_void,
-        ));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::Table(t));
-        call_debug_function(DEBUG_GETMETATABLE, &mut state, 0, 1, 1).unwrap();
+        call_getmetatable(&mut state, 0, 1, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
 
@@ -3586,12 +3500,10 @@ mod tests {
         let t = Table::new();
         let mt = Table::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_SETMETATABLE as *mut std::ffi::c_void,
-        ));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::Table(t));
         state.stack.push(TValue::Table(mt));
-        call_debug_function(DEBUG_SETMETATABLE, &mut state, 0, 2, 1).unwrap();
+        call_setmetatable(&mut state, 0, 2, 1).unwrap();
         match &state.stack[0] {
             TValue::Table(t) => assert!(t.has_metatable()),
             _ => panic!("expected table result"),
@@ -3602,11 +3514,9 @@ mod tests {
     fn test_call_getuservalue_non_userdata() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_GETUSERVALUE as *mut std::ffi::c_void,
-        ));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::Integer(42));
-        call_debug_function(DEBUG_GETUSERVALUE, &mut state, 0, 1, 1).unwrap();
+        call_getuservalue(&mut state, 0, 1, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
 
@@ -3657,12 +3567,10 @@ mod tests {
             }))])),
         });
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_GETUPVALUE as *mut std::ffi::c_void,
-        ));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::LClosure(closure));
         state.stack.push(TValue::Integer(1));
-        call_debug_function(DEBUG_GETUPVALUE, &mut state, 0, 2, 2).unwrap();
+        call_getupvalue(&mut state, 0, 2, 2).unwrap();
         assert_eq!(state.stack.len(), 2);
         match &state.stack[0] {
             TValue::Str(s) => assert_eq!(s.as_str(), "x"),
@@ -3684,12 +3592,10 @@ mod tests {
             upvals: Rc::new(RefCell::new(vec![])),
         });
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_GETUPVALUE as *mut std::ffi::c_void,
-        ));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::LClosure(closure));
         state.stack.push(TValue::Integer(1));
-        call_debug_function(DEBUG_GETUPVALUE, &mut state, 0, 2, 1).unwrap();
+        call_getupvalue(&mut state, 0, 2, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
 
@@ -3697,10 +3603,7 @@ mod tests {
     fn test_call_gethook_no_hook() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_GETHOOK as *mut std::ffi::c_void,
-        ));
-        call_debug_function(DEBUG_GETHOOK, &mut state, 0, 0, 1).unwrap();
+        call_gethook(&mut state, 0, 0, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
 
@@ -3710,20 +3613,15 @@ mod tests {
         // 设置钩子
         let hook_fn = TValue::LightUserData(999 as *mut std::ffi::c_void);
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_SETHOOK as *mut std::ffi::c_void,
-        ));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(hook_fn.clone());
         state.stack.push(TValue::Str(state.intern_str("crl")));
         state.stack.push(TValue::Integer(0));
-        call_debug_function(DEBUG_SETHOOK, &mut state, 0, 3, 0).unwrap();
+        call_sethook(&mut state, 0, 3, 0).unwrap();
 
         // 获取钩子
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_GETHOOK as *mut std::ffi::c_void,
-        ));
-        call_debug_function(DEBUG_GETHOOK, &mut state, 0, 0, 3).unwrap();
+        call_gethook(&mut state, 0, 0, 3).unwrap();
         assert_eq!(state.stack.len(), 3);
         assert_eq!(state.stack[0], hook_fn);
         match &state.stack[1] {
@@ -3742,27 +3640,20 @@ mod tests {
         // 先设置钩子
         let hook_fn = TValue::LightUserData(999 as *mut std::ffi::c_void);
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_SETHOOK as *mut std::ffi::c_void,
-        ));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(hook_fn);
         state.stack.push(TValue::Str(state.intern_str("l")));
-        call_debug_function(DEBUG_SETHOOK, &mut state, 0, 2, 0).unwrap();
+        call_sethook(&mut state, 0, 2, 0).unwrap();
 
         // 用 nil 清除
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_SETHOOK as *mut std::ffi::c_void,
-        ));
         state.stack.push(TValue::Nil(NilKind::Strict));
-        call_debug_function(DEBUG_SETHOOK, &mut state, 0, 1, 0).unwrap();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        call_sethook(&mut state, 0, 1, 0).unwrap();
 
         // 验证已清除
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_GETHOOK as *mut std::ffi::c_void,
-        ));
-        call_debug_function(DEBUG_GETHOOK, &mut state, 0, 0, 1).unwrap();
+        call_gethook(&mut state, 0, 0, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
 
@@ -3770,10 +3661,7 @@ mod tests {
     fn test_call_traceback_empty() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_TRACEBACK as *mut std::ffi::c_void,
-        ));
-        call_debug_function(DEBUG_TRACEBACK, &mut state, 0, 0, 1).unwrap();
+        call_traceback(&mut state, 0, 0, 1).unwrap();
         match &state.stack[0] {
             TValue::Str(s) => assert!(s.as_str().starts_with("stack traceback:")),
             _ => panic!("expected string result"),
@@ -3784,13 +3672,11 @@ mod tests {
     fn test_call_traceback_with_message() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_TRACEBACK as *mut std::ffi::c_void,
-        ));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state
             .stack
             .push(TValue::Str(state.intern_str("error message")));
-        call_debug_function(DEBUG_TRACEBACK, &mut state, 0, 1, 1).unwrap();
+        call_traceback(&mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
             TValue::Str(s) => {
                 let s = s.as_str();
@@ -3805,11 +3691,9 @@ mod tests {
     fn test_call_traceback_non_string_msg() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_TRACEBACK as *mut std::ffi::c_void,
-        ));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::Integer(42));
-        call_debug_function(DEBUG_TRACEBACK, &mut state, 0, 1, 1).unwrap();
+        call_traceback(&mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 42),
             _ => panic!("expected integer 42 (returned untouched)"),
@@ -3820,11 +3704,9 @@ mod tests {
     fn test_call_getinfo_out_of_range() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_GETINFO as *mut std::ffi::c_void,
-        ));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::Integer(1000));
-        call_debug_function(DEBUG_GETINFO, &mut state, 0, 1, 1).unwrap();
+        call_getinfo(&mut state, 0, 1, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
 
@@ -3832,11 +3714,9 @@ mod tests {
     fn test_call_getinfo_negative_level() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_GETINFO as *mut std::ffi::c_void,
-        ));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::Integer(-1));
-        call_debug_function(DEBUG_GETINFO, &mut state, 0, 1, 1).unwrap();
+        call_getinfo(&mut state, 0, 1, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
 
@@ -3844,12 +3724,10 @@ mod tests {
     fn test_call_getlocal_out_of_range() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_GETLOCAL as *mut std::ffi::c_void,
-        ));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::Integer(20));
         state.stack.push(TValue::Integer(1));
-        let result = call_debug_function(DEBUG_GETLOCAL, &mut state, 0, 2, 1);
+        let result = call_getlocal(&mut state, 0, 2, 1);
         assert!(result.is_err());
     }
 
@@ -3909,12 +3787,10 @@ mod tests {
             }))])),
         });
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_UPVALUEID as *mut std::ffi::c_void,
-        ));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::LClosure(closure));
         state.stack.push(TValue::Integer(1));
-        call_debug_function(DEBUG_UPVALUEID, &mut state, 0, 2, 1).unwrap();
+        call_upvalueid(&mut state, 0, 2, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::LightUserData(_)));
     }
 
@@ -3928,12 +3804,10 @@ mod tests {
             upvals: Rc::new(RefCell::new(vec![])),
         });
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            DEBUG_UPVALUEID as *mut std::ffi::c_void,
-        ));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::LClosure(closure));
         state.stack.push(TValue::Integer(1));
-        call_debug_function(DEBUG_UPVALUEID, &mut state, 0, 2, 1).unwrap();
+        call_upvalueid(&mut state, 0, 2, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
 
@@ -3941,17 +3815,7 @@ mod tests {
     fn test_call_debug_returns_nothing() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(DEBUG_DEBUG as *mut std::ffi::c_void));
-        call_debug_function(DEBUG_DEBUG, &mut state, 0, 0, 0).unwrap();
+        call_debug(&mut state, 0, 0, 0).unwrap();
         assert_eq!(state.stack.len(), 0);
-    }
-
-    #[test]
-    fn test_call_unknown_tag() {
-        let mut state = LuaState::new();
-        let result = call_debug_function(999, &mut state, 0, 0, 0);
-        assert!(result.is_err());
     }
 }

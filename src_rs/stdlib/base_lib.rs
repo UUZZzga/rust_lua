@@ -21,76 +21,17 @@ use std::io::Write;
 use std::rc::Rc;
 
 // ============================================================================
-// 函数标签 (LightUserData 占位符值)
+// 函数注册 (BuiltinFn 函数指针)
 // ============================================================================
-
-// 原有标签 (保持兼容性)
-pub const BASE_PRINT: usize = 1;
-pub const BASE_SETMETATABLE: usize = 2;
-pub const BASE_GETMETATABLE: usize = 3;
-pub const BASE_TYPE: usize = 4;
-pub const BASE_PCALL: usize = 5;
-pub const BASE_ERROR: usize = 6;
-
-// 新增标签
-pub const BASE_TONUMBER: usize = 7;
-pub const BASE_TOSTRING: usize = 8;
-pub const BASE_ASSERT: usize = 9;
-pub const BASE_SELECT: usize = 10;
-pub const BASE_RAWEQUAL: usize = 11;
-pub const BASE_RAWLEN: usize = 12;
-pub const BASE_RAWGET: usize = 13;
-pub const BASE_RAWSET: usize = 14;
-pub const BASE_NEXT: usize = 15;
-pub const BASE_IPAIRS: usize = 16;
-pub const BASE_PAIRS: usize = 17;
-pub const BASE_XPCALL: usize = 18;
-pub const BASE_WARN: usize = 19;
-
-// require 函数标签
-pub const BASE_REQUIRE: usize = 22;
-pub const BASE_LOAD: usize = 23;
-pub const BASE_COLLECTGARBAGE: usize = 24;
-pub const BASE_DOFILE: usize = 25;
-pub const BASE_LOADFILE: usize = 26;
-pub const BASE_LOADLIB: usize = 27;
-pub const BASE_SEARCHPATH: usize = 28;
-
-// package.searchers 表中的 searcher 函数标签 (对应 C 的 searcher_preload/Lua/C/Croot)
-// 当前 call_require 硬编码搜索逻辑,不遍历 package.searchers 表;
-// 这些标签仅用于让 searchers 表元素显示为 "function" 类型。
-pub const BASE_SEARCHER_PRELOAD: usize = 29;
-pub const BASE_SEARCHER_LUA: usize = 30;
-pub const BASE_SEARCHER_C: usize = 31;
-pub const BASE_SEARCHER_CROOT: usize = 32;
-
-// 迭代器辅助函数标签 (不在 is_base_tag 范围内, 只在 TFORCALL 中处理)
-// 对应 C 的 ipairsaux 和 next 迭代器函数
-pub const BASE_IPAIRS_AUX: usize = 20;
-pub const BASE_NEXT_ITER: usize = 21;
-
-/// 标签是否属于基础库
-pub fn is_base_tag(tag: usize) -> bool {
-    (tag >= BASE_PRINT && tag <= BASE_WARN)
-        || tag == BASE_REQUIRE
-        || tag == BASE_LOAD
-        || tag == BASE_COLLECTGARBAGE
-        || tag == BASE_DOFILE
-        || tag == BASE_LOADFILE
-        || tag == BASE_LOADLIB
-        || tag == BASE_SEARCHPATH
-}
-
-/// 判断标签是否为已知的函数标签 (用于 type/tostring 显示)
-///
-/// 包括基础库函数标签 (1-19)、迭代器辅助函数标签 (20-21) 和字符串库标签 (100+)
-pub fn is_function_tag(tag: usize) -> bool {
-    is_base_tag(tag)
-        || tag == BASE_IPAIRS_AUX
-        || tag == BASE_NEXT_ITER
-        || tag >= 100
-        || (tag >= BASE_SEARCHER_PRELOAD && tag <= BASE_SEARCHER_CROOT)
-}
+//
+// 基础库所有函数（含迭代器 ipairsaux/next、searcher 占位函数、loadlib/searchpath）
+// 已从 LightUserData(tag) 派发机制迁移到 BuiltinFn 函数指针方案。
+// 迭代器函数 (call_ipairs_aux, call_next_iter) 作为 BuiltinFn 返回给 Lua，
+// 由 op_call/op_tailcall/TFORCALL 的 BuiltinFn 分支统一派发。
+//
+// 注意：coroutine.wrap 返回 Table（带 WRAP_MARKER 元表），由 get_wrap_idx 检测，
+// 不存在 LightUserData 形式的 wrap 函数。LightUserData 仅剩 io.lines 迭代器
+// (tag >= 0x1000_0000_0000_0000)，由 io_lib::is_lines_iterator_tag 判定。
 
 // ============================================================================
 // 辅助函数: TValue 转字符串 (对应 C 的 luaL_tolstring)
@@ -108,11 +49,14 @@ pub fn lua_value_to_string(v: &TValue) -> String {
         TValue::Float(n) => format_float(*n),
         TValue::Str(s) => s.as_str().to_string(),
         TValue::Table(_) => "table: 0x0".to_string(),
-        TValue::LClosure(_) | TValue::LCFn(_) | TValue::CClosure(_) => "function: 0x0".to_string(),
+        TValue::LClosure(_)
+        | TValue::LCFn(_)
+        | TValue::CClosure(_)
+        | TValue::BuiltinFn(_) => "function: 0x0".to_string(),
+        // LightUserData 仅 io.lines 迭代器 (tag >= 0x1000_0000_0000_0000) 表现为 function
         TValue::LightUserData(p) => {
-            // 内置函数标签显示为 function, 其他显示为 userdata
             let tag = *p as usize;
-            if is_function_tag(tag) {
+            if crate::stdlib::io_lib::is_lines_iterator_tag(tag) {
                 "function: 0x0".to_string()
             } else {
                 format!("userdata: {:?}", p)
@@ -219,11 +163,10 @@ pub fn base_type_name(v: &TValue) -> &'static str {
     match v {
         TValue::Nil(_) => "nil",
         TValue::Boolean(_) => "boolean",
+        // LightUserData 仅 io.lines 迭代器 (tag >= 0x1000_0000_0000_0000) 表现为 function
         TValue::LightUserData(p) => {
-            // LightUserData 既用于实际 userdata, 也用于内置函数标签
-            // 标签值在已知范围内 (1-19 基础库, 20-21 迭代器, 100+ 字符串库) 的是函数
             let tag = *p as usize;
-            if is_function_tag(tag) {
+            if crate::stdlib::io_lib::is_lines_iterator_tag(tag) {
                 "function"
             } else {
                 "userdata"
@@ -239,7 +182,9 @@ pub fn base_type_name(v: &TValue) -> &'static str {
                 "table"
             }
         }
-        TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) => "function",
+        TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) | TValue::BuiltinFn(_) => {
+            "function"
+        }
         TValue::UserData(_) => "userdata",
         TValue::Thread(_) => "thread",
     }
@@ -376,112 +321,7 @@ fn push_single_result(state: &mut LuaState, a: usize, nresults: i32, result: TVa
 }
 
 // ============================================================================
-// 派发函数 — 从 execute.rs 的 op_call 和 state.rs 的 pcall 调用
-// ============================================================================
-
-/// 基础库函数派发
-///
-/// 从 execute.rs 的 op_call 或 state.rs 的 pcall 调用,
-/// 当 LightUserData 标签在 [BASE_PRINT, BASE_WARN] 范围内时。
-///
-/// 参数:
-/// - tag: 函数标签
-/// - state: Lua 状态
-/// - a: 函数在栈中的位置 (0-based)
-/// - nargs: 参数数量
-/// - nresults: 期望结果数 (-1 = MULTRET)
-/// 将 base 库函数 tag 映射到函数名（用于 traceback）
-pub fn base_function_name(tag: usize) -> Option<&'static str> {
-    match tag {
-        BASE_PRINT => Some("print"),
-        BASE_SETMETATABLE => Some("setmetatable"),
-        BASE_GETMETATABLE => Some("getmetatable"),
-        BASE_TYPE => Some("type"),
-        BASE_PCALL => Some("pcall"),
-        BASE_ERROR => Some("error"),
-        BASE_TONUMBER => Some("tonumber"),
-        BASE_TOSTRING => Some("tostring"),
-        BASE_ASSERT => Some("assert"),
-        BASE_SELECT => Some("select"),
-        BASE_RAWEQUAL => Some("rawequal"),
-        BASE_RAWLEN => Some("rawlen"),
-        BASE_RAWGET => Some("rawget"),
-        BASE_RAWSET => Some("rawset"),
-        BASE_NEXT => Some("next"),
-        BASE_IPAIRS => Some("ipairs"),
-        BASE_PAIRS => Some("pairs"),
-        BASE_XPCALL => Some("xpcall"),
-        BASE_WARN => Some("warn"),
-        BASE_REQUIRE => Some("require"),
-        BASE_LOAD => Some("load"),
-        BASE_COLLECTGARBAGE => Some("collectgarbage"),
-        BASE_DOFILE => Some("dofile"),
-        BASE_LOADFILE => Some("loadfile"),
-        BASE_LOADLIB => Some("loadlib"),
-        BASE_SEARCHPATH => Some("searchpath"),
-        _ => None,
-    }
-}
-
-pub fn call_base_function(
-    tag: usize,
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
-    // 设置当前 C 函数名（用于 traceback）— 对应 C 的 CallInfo 记录
-    let prev_c_func = state.last_c_function.take();
-    state.last_c_function = base_function_name(tag).map(|s| s.to_string());
-
-    let result = match tag {
-        BASE_PRINT => call_print(state, a, nargs, nresults),
-        BASE_SETMETATABLE => call_setmetatable(state, a, nargs, nresults),
-        BASE_GETMETATABLE => call_getmetatable(state, a, nargs, nresults),
-        BASE_TYPE => call_type(state, a, nargs, nresults),
-        BASE_PCALL => call_pcall(state, a, nargs, nresults),
-        BASE_ERROR => call_error(state, a, nargs, nresults),
-        BASE_TONUMBER => call_tonumber(state, a, nargs, nresults),
-        BASE_TOSTRING => call_tostring(state, a, nargs, nresults),
-        BASE_ASSERT => call_assert(state, a, nargs, nresults),
-        BASE_SELECT => call_select(state, a, nargs, nresults),
-        BASE_RAWEQUAL => call_rawequal(state, a, nargs, nresults),
-        BASE_RAWLEN => call_rawlen(state, a, nargs, nresults),
-        BASE_RAWGET => call_rawget(state, a, nargs, nresults),
-        BASE_RAWSET => call_rawset(state, a, nargs, nresults),
-        BASE_NEXT => call_next(state, a, nargs, nresults),
-        BASE_IPAIRS => call_ipairs(state, a, nargs, nresults),
-        BASE_PAIRS => call_pairs(state, a, nargs, nresults),
-        BASE_XPCALL => call_xpcall(state, a, nargs, nresults),
-        BASE_WARN => call_warn(state, a, nargs, nresults),
-        BASE_REQUIRE => call_require(state, a, nargs, nresults),
-        BASE_LOAD => call_load(state, a, nargs, nresults),
-        BASE_COLLECTGARBAGE => call_collectgarbage(state, a, nargs, nresults),
-        BASE_DOFILE => call_dofile(state, a, nargs, nresults),
-        BASE_LOADFILE => call_loadfile(state, a, nargs, nresults),
-        BASE_LOADLIB => call_loadlib(state, a, nargs, nresults),
-        BASE_SEARCHPATH => call_searchpath(state, a, nargs, nresults),
-        BASE_SEARCHER_PRELOAD | BASE_SEARCHER_LUA | BASE_SEARCHER_C | BASE_SEARCHER_CROOT => {
-            Err(VmError::RuntimeError(
-                "package.searchers functions are not directly callable".to_string(),
-            ))
-        }
-        _ => Err(VmError::RuntimeError(format!(
-            "unknown base function tag: {}",
-            tag
-        ))),
-    };
-
-    // 函数正常返回时恢复之前的 C 函数名
-    // 错误时不恢复，以便 build_traceback 能获取当前 C 函数名
-    if result.is_ok() {
-        state.last_c_function = prev_c_func;
-    }
-    result
-}
-
-// ============================================================================
-// 各函数的派发实现
+// 各函数的实现（作为 BuiltinFnPtr 注册到全局表）
 // ============================================================================
 
 /// print(...) — 对应 C 的 luaB_print
@@ -629,7 +469,7 @@ fn call_type(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 }
 
 /// pcall(f, args...) — 对应 C 的 luaB_pcall
-fn call_pcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+pub(crate) fn call_pcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     let func = get_arg(state, a, 0);
     let pcall_nargs = nargs.saturating_sub(1);
 
@@ -1287,8 +1127,11 @@ fn call_ipairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     }
     let t = get_arg(state, a, 0);
     // 返回迭代器函数 (ipairsaux), 状态 t, 初始值 0
-    // 使用 BASE_IPAIRS_AUX 标签表示 ipairsaux (与 BASE_IPAIRS 区分, 避免被 op_call 误派发)
-    let iter = TValue::LightUserData(BASE_IPAIRS_AUX as *mut std::ffi::c_void);
+    // ipairsaux 作为 BuiltinFn 注册（名称 "for iterator" 对应 C 的 luaB_auxlib_getn 语义）
+    let iter = TValue::BuiltinFn(crate::objects::BuiltinFn {
+        func: call_ipairs_aux,
+        name: c"for iterator".as_ptr() as *const u8,
+    });
     push_results(state, a, nresults, vec![iter, t, TValue::Integer(0)]);
     Ok(())
 }
@@ -1380,7 +1223,11 @@ fn call_pairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
         push_results(state, a, nresults, results);
     } else {
         // 无 __pairs: 返回 next, t, nil, nil (第 4 个 nil 是 TBC 占位)
-        let next_fn = TValue::LightUserData(BASE_NEXT_ITER as *mut std::ffi::c_void);
+        // next 作为 BuiltinFn 注册（名称 "next" 对应 C 的 luaB_next）
+        let next_fn = TValue::BuiltinFn(crate::objects::BuiltinFn {
+            func: call_next_iter,
+            name: c"next".as_ptr() as *const u8,
+        });
         push_results(
             state,
             a,
@@ -1397,7 +1244,7 @@ fn call_pairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
 }
 
 /// xpcall(f, err, args...) — 对应 C 的 luaB_xpcall
-fn call_xpcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+pub(crate) fn call_xpcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     let func = get_arg(state, a, 0);
     let err_fn = get_arg(state, a, 1);
     let xpcall_nargs = nargs.saturating_sub(2);
@@ -2271,6 +2118,22 @@ fn call_searchpath(
     Ok(())
 }
 
+/// package.searchers 表中的占位函数 — 对应 C 的 searcher_preload/Lua/C/Croot
+///
+/// 当前 call_require 硬编码搜索逻辑,不遍历 package.searchers 表;
+/// 这些 BuiltinFn 仅用于让 searchers 表元素显示为 "function" 类型。
+/// 直接调用会报错（与原 tag 行为一致）。
+fn call_searcher_placeholder(
+    _state: &mut LuaState,
+    _a: usize,
+    _nargs: usize,
+    _nresults: i32,
+) -> Result<(), VmError> {
+    Err(VmError::RuntimeError(
+        "package.searchers functions are not directly callable".to_string(),
+    ))
+}
+
 /// 读取 package.path 并搜索模块文件 (旧版兼容,保留供 loadfile 等使用)
 ///
 /// package.path 是用 `;` 分隔的模板列表,`?` 替换为 modname。
@@ -2403,35 +2266,38 @@ fn init_package_table(state: &mut LuaState) {
         TValue::Str(state.intern_str("config")),
         TValue::Str(state.intern_str(config)),
     );
-    // loadlib 函数
+    // loadlib 函数 — BuiltinFn 注册
     pkg.set(
         TValue::Str(state.intern_str("loadlib")),
-        TValue::LightUserData(BASE_LOADLIB as *mut std::ffi::c_void),
+        TValue::BuiltinFn(crate::objects::BuiltinFn {
+            func: call_loadlib,
+            name: c"loadlib".as_ptr() as *const u8,
+        }),
     );
-    // searchpath 函数
+    // searchpath 函数 — BuiltinFn 注册
     pkg.set(
         TValue::Str(state.intern_str("searchpath")),
-        TValue::LightUserData(BASE_SEARCHPATH as *mut std::ffi::c_void),
+        TValue::BuiltinFn(crate::objects::BuiltinFn {
+            func: call_searchpath,
+            name: c"searchpath".as_ptr() as *const u8,
+        }),
     );
     // searchers 表 — 对应 C createsearcherstable (loadlib.cpp:703)
-    // 包含 4 个 searcher 函数标签 (preload/Lua/C/Croot)
+    // 包含 4 个 searcher 占位函数 (preload/Lua/C/Croot)
+    // 当前 call_require 硬编码搜索逻辑,不遍历 package.searchers 表;
+    // 这些 BuiltinFn 仅用于让 searchers 表元素显示为 "function" 类型，
+    // 直接调用会报错（与原 tag 行为一致）。
+    let make_searcher = |name: &'static std::ffi::CStr| -> TValue {
+        TValue::BuiltinFn(crate::objects::BuiltinFn {
+            func: call_searcher_placeholder,
+            name: name.as_ptr() as *const u8,
+        })
+    };
     let searchers = crate::table::Table::new();
-    searchers.set(
-        TValue::Integer(1),
-        TValue::LightUserData(BASE_SEARCHER_PRELOAD as *mut std::ffi::c_void),
-    );
-    searchers.set(
-        TValue::Integer(2),
-        TValue::LightUserData(BASE_SEARCHER_LUA as *mut std::ffi::c_void),
-    );
-    searchers.set(
-        TValue::Integer(3),
-        TValue::LightUserData(BASE_SEARCHER_C as *mut std::ffi::c_void),
-    );
-    searchers.set(
-        TValue::Integer(4),
-        TValue::LightUserData(BASE_SEARCHER_CROOT as *mut std::ffi::c_void),
-    );
+    searchers.set(TValue::Integer(1), make_searcher(c"searcher_preload"));
+    searchers.set(TValue::Integer(2), make_searcher(c"searcher_Lua"));
+    searchers.set(TValue::Integer(3), make_searcher(c"searcher_C"));
+    searchers.set(TValue::Integer(4), make_searcher(c"searcher_Croot"));
     pkg.set(
         TValue::Str(state.intern_str("searchers")),
         TValue::Table(searchers),
@@ -2576,18 +2442,18 @@ fn call_load(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
             source = s.as_str();
             _source_owned = String::new();
         }
-        TValue::LClosure(_) | TValue::LightUserData(_) => {
+        TValue::LClosure(_)
+        | TValue::BuiltinFn(_)
+        | TValue::LCFn(_)
+        | TValue::CClosure(_)
+        | TValue::LightUserData(_) => {
             // reader 函数模式: 循环调用 reader() 累积字符串
-            // LightUserData 必须是可调用的 function tag (io.lines 迭代器等)，
+            // LightUserData 必须是可调用的 function tag (io.lines 迭代器)，
             // 对应 C 的 luaL_checktype(L, 1, LUA_TFUNCTION) — C 中 io.lines
             // 返回 C 闭包 (LUA_TFUNCTION)，Rust 用 LightUserData tag 代替
             if let TValue::LightUserData(tag) = &chunk_val {
                 let tag_val = *tag as usize;
-                let is_callable = is_function_tag(tag_val)
-                    || crate::stdlib::io_lib::is_io_function_tag(tag_val)
-                    || crate::stdlib::io_lib::is_lines_iterator_tag(tag_val)
-                    || crate::stdlib::coroutine_lib::is_wrap_call_tag(tag_val);
-                if !is_callable {
+                if !crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
                     return Err(VmError::RuntimeError(format!(
                         "bad argument #1 to 'load' (function expected, got {})",
                         chunk_val.ty()
@@ -3361,44 +3227,43 @@ fn call_collectgarbage(
 /// 打开基础库, 注册所有全局函数
 ///
 /// 对应 C 源码 lbaselib.cpp 的 luaopen_base 函数:
-/// 1. 注册所有基础函数到全局表
+/// 1. 注册所有基础函数到全局表 (使用 BuiltinFn 函数指针)
 /// 2. 设置 _G 和 _VERSION
 pub fn open_base_lib(state: &mut LuaState) {
-    // 注册所有基础库函数 (使用 LightUserData 标签)
-    let register = |state: &mut LuaState, name: &str, tag: usize| {
-        let key = TValue::Str(state.intern_str(name));
+    // 注册所有基础库函数 (使用 BuiltinFn 函数指针)
+    let register = |state: &mut LuaState, name: &'static std::ffi::CStr, func: crate::objects::BuiltinFnPtr| {
+        let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
+        let name_ptr = name.as_ptr() as *const u8;
         state
             .globals
-            .set(key, TValue::LightUserData(tag as *mut std::ffi::c_void));
+            .set(key, TValue::BuiltinFn(crate::objects::BuiltinFn { func, name: name_ptr }));
     };
 
-    // 原有函数 (保持兼容性)
-    register(state, "print", BASE_PRINT);
-    register(state, "setmetatable", BASE_SETMETATABLE);
-    register(state, "getmetatable", BASE_GETMETATABLE);
-    register(state, "type", BASE_TYPE);
-    register(state, "pcall", BASE_PCALL);
-    register(state, "error", BASE_ERROR);
-
-    // 新增函数
-    register(state, "tonumber", BASE_TONUMBER);
-    register(state, "tostring", BASE_TOSTRING);
-    register(state, "assert", BASE_ASSERT);
-    register(state, "select", BASE_SELECT);
-    register(state, "rawequal", BASE_RAWEQUAL);
-    register(state, "rawlen", BASE_RAWLEN);
-    register(state, "rawget", BASE_RAWGET);
-    register(state, "rawset", BASE_RAWSET);
-    register(state, "next", BASE_NEXT);
-    register(state, "ipairs", BASE_IPAIRS);
-    register(state, "pairs", BASE_PAIRS);
-    register(state, "xpcall", BASE_XPCALL);
-    register(state, "warn", BASE_WARN);
-    register(state, "require", BASE_REQUIRE);
-    register(state, "load", BASE_LOAD);
-    register(state, "collectgarbage", BASE_COLLECTGARBAGE);
-    register(state, "dofile", BASE_DOFILE);
-    register(state, "loadfile", BASE_LOADFILE);
+    // 基础库函数
+    register(state, c"print", call_print);
+    register(state, c"setmetatable", call_setmetatable);
+    register(state, c"getmetatable", call_getmetatable);
+    register(state, c"type", call_type);
+    register(state, c"pcall", call_pcall);
+    register(state, c"error", call_error);
+    register(state, c"tonumber", call_tonumber);
+    register(state, c"tostring", call_tostring);
+    register(state, c"assert", call_assert);
+    register(state, c"select", call_select);
+    register(state, c"rawequal", call_rawequal);
+    register(state, c"rawlen", call_rawlen);
+    register(state, c"rawget", call_rawget);
+    register(state, c"rawset", call_rawset);
+    register(state, c"next", call_next);
+    register(state, c"ipairs", call_ipairs);
+    register(state, c"pairs", call_pairs);
+    register(state, c"xpcall", call_xpcall);
+    register(state, c"warn", call_warn);
+    register(state, c"require", call_require);
+    register(state, c"load", call_load);
+    register(state, c"collectgarbage", call_collectgarbage);
+    register(state, c"dofile", call_dofile);
+    register(state, c"loadfile", call_loadfile);
 
     // 设置 _G 全局变量 (指向全局表自身)
     let globals_clone = state.globals.clone();
@@ -3487,6 +3352,61 @@ mod tests {
             base_type_name(&TValue::Table(crate::table::Table::new())),
             "table"
         );
+    }
+
+    /// 验证 LightUserData 在用户指针范围（超出内置 tag 范围）不被误判为 function
+    ///
+    /// 所有内置库已迁移到 BuiltinFn，coroutine.wrap 返回 Table，
+    /// LightUserData 仅剩 io.lines iterator (极大值) 表现为 function。
+    /// 其余所有 LightUserData 都应返回 "userdata"。
+    #[test]
+    fn test_lightuserdata_not_misjudged_as_function() {
+        // 真实用户指针值（超出内置 tag 范围）不应被误判为 function
+        let user_ptrs: [usize; 6] = [
+            0,                    // NULL 指针
+            1,                    // 原 BASE_PRINT 范围，基础库迁移后不再是内置 tag
+            100,                  // 原字符串库范围，已迁移
+            200,                  // 原数学库范围，已迁移
+            1000,                 // 原 wrap_call 上限附近，coroutine.wrap 已改用 Table
+            0x7fff_0000_0000,     // 真实用户指针高位 (Linux stack)
+        ];
+        for tag_val in user_ptrs {
+            let v = TValue::LightUserData(tag_val as *mut std::ffi::c_void);
+            assert_eq!(
+                base_type_name(&v),
+                "userdata",
+                "LightUserData(0x{:x}) 应为 userdata, 不应被误判为 function",
+                tag_val
+            );
+            assert!(
+                !v.is_function(),
+                "LightUserData(0x{:x}).is_function() 应为 false",
+                tag_val
+            );
+        }
+    }
+
+    /// 验证 BuiltinFn 被正确识别为 function
+    #[test]
+    fn test_builtin_fn_type_recognition() {
+        fn dummy_fn(
+            _state: &mut crate::state::LuaState,
+            _a: usize,
+            _nargs: usize,
+            _nresults: i32,
+        ) -> Result<(), crate::execute::VmError> {
+            Ok(())
+        }
+
+        let v = TValue::BuiltinFn(crate::objects::BuiltinFn {
+            func: dummy_fn,
+            name: c"dummy".as_ptr() as *const u8,
+        });
+        assert_eq!(base_type_name(&v), "function");
+        assert!(v.is_function());
+        assert_eq!(v.ty(), crate::objects::LuaType::Function);
+        // Display 应包含函数名
+        assert!(format!("{}", v).contains("dummy"));
     }
 
     // ========================================================================
@@ -3716,17 +3636,8 @@ mod tests {
     }
 
     // ========================================================================
-    // is_base_tag 测试
+    // is_base_tag 测试已删除（base 库已迁移到 BuiltinFn，不再使用 tag）
     // ========================================================================
-
-    #[test]
-    fn test_is_base_tag() {
-        assert!(is_base_tag(BASE_PRINT));
-        assert!(is_base_tag(BASE_ERROR));
-        assert!(is_base_tag(BASE_WARN));
-        assert!(!is_base_tag(0));
-        assert!(!is_base_tag(100)); // 字符串库标签
-    }
 
     // ========================================================================
     // open_base_lib 测试
@@ -3737,7 +3648,7 @@ mod tests {
         let mut state = LuaState::new();
         open_base_lib(&mut state);
 
-        // 验证原有函数
+        // 验证所有基础库函数注册为 BuiltinFn
         for name in &[
             "print",
             "setmetatable",
@@ -3745,24 +3656,31 @@ mod tests {
             "type",
             "pcall",
             "error",
+            "tonumber",
+            "tostring",
+            "assert",
+            "select",
+            "rawequal",
+            "rawlen",
+            "rawget",
+            "rawset",
+            "next",
+            "ipairs",
+            "pairs",
+            "xpcall",
+            "warn",
+            "require",
+            "load",
+            "collectgarbage",
+            "dofile",
+            "loadfile",
         ] {
             let key = TValue::Str(state.intern_str(name));
+            let val = state.globals.get(&key);
+            assert!(val.is_some(), "{} must be registered", name);
             assert!(
-                state.globals.get(&key).is_some(),
-                "{} must be registered",
-                name
-            );
-        }
-
-        // 验证新增函数
-        for name in &[
-            "tonumber", "tostring", "assert", "select", "rawequal", "rawlen", "rawget", "rawset",
-            "next", "ipairs", "pairs", "xpcall", "warn",
-        ] {
-            let key = TValue::Str(state.intern_str(name));
-            assert!(
-                state.globals.get(&key).is_some(),
-                "{} must be registered",
+                matches!(val, Some(TValue::BuiltinFn(_))),
+                "{} must be registered as BuiltinFn",
                 name
             );
         }
@@ -3791,18 +3709,24 @@ mod tests {
     }
 
     // ========================================================================
-    // call_base_function 测试
+    // 直接调用各 BuiltinFn 函数的测试（替代原 call_base_function 测试）
     // ========================================================================
 
+    /// 辅助：构造一个占位 BuiltinFn 作为栈上的 "函数" 位置
+    fn placeholder_builtin() -> TValue {
+        TValue::BuiltinFn(crate::objects::BuiltinFn {
+            func: call_searcher_placeholder,
+            name: c"placeholder".as_ptr() as *const u8,
+        })
+    }
+
     #[test]
-    fn test_call_base_function_type() {
+    fn test_call_type() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(BASE_TYPE as *mut std::ffi::c_void));
+        state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Integer(42));
-        call_base_function(BASE_TYPE, &mut state, 0, 1, 1).unwrap();
+        call_type(&mut state, 0, 1, 1).unwrap();
         assert_eq!(state.stack.len(), 1);
         match &state.stack[0] {
             TValue::Str(s) => assert_eq!(s.as_str(), "number"),
@@ -3811,14 +3735,12 @@ mod tests {
     }
 
     #[test]
-    fn test_call_base_function_tonumber() {
+    fn test_call_tonumber() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            BASE_TONUMBER as *mut std::ffi::c_void,
-        ));
+        state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Str(state.intern_str("42")));
-        call_base_function(BASE_TONUMBER, &mut state, 0, 1, 1).unwrap();
+        call_tonumber(&mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 42),
             _ => panic!("expected integer result"),
@@ -3826,14 +3748,12 @@ mod tests {
     }
 
     #[test]
-    fn test_call_base_function_tostring() {
+    fn test_call_tostring() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            BASE_TOSTRING as *mut std::ffi::c_void,
-        ));
+        state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Integer(42));
-        call_base_function(BASE_TOSTRING, &mut state, 0, 1, 1).unwrap();
+        call_tostring(&mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
             TValue::Str(s) => assert_eq!(s.as_str(), "42"),
             _ => panic!("expected string result"),
@@ -3841,15 +3761,13 @@ mod tests {
     }
 
     #[test]
-    fn test_call_base_function_rawequal() {
+    fn test_call_rawequal() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            BASE_RAWEQUAL as *mut std::ffi::c_void,
-        ));
+        state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Integer(42));
         state.stack.push(TValue::Integer(42));
-        call_base_function(BASE_RAWEQUAL, &mut state, 0, 2, 1).unwrap();
+        call_rawequal(&mut state, 0, 2, 1).unwrap();
         match &state.stack[0] {
             TValue::Boolean(b) => assert!(*b),
             _ => panic!("expected boolean result"),
@@ -3857,14 +3775,12 @@ mod tests {
     }
 
     #[test]
-    fn test_call_base_function_rawlen() {
+    fn test_call_rawlen() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(BASE_RAWLEN as *mut std::ffi::c_void));
+        state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Str(state.intern_str("hello")));
-        call_base_function(BASE_RAWLEN, &mut state, 0, 1, 1).unwrap();
+        call_rawlen(&mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 5),
             _ => panic!("expected integer result"),
@@ -3872,17 +3788,15 @@ mod tests {
     }
 
     #[test]
-    fn test_call_base_function_rawget() {
+    fn test_call_rawget() {
         let mut state = LuaState::new();
         state.stack.clear();
         let mut t = crate::table::Table::new();
         t.set(TValue::Integer(1), TValue::Integer(100));
-        state
-            .stack
-            .push(TValue::LightUserData(BASE_RAWGET as *mut std::ffi::c_void));
+        state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
         state.stack.push(TValue::Integer(1));
-        call_base_function(BASE_RAWGET, &mut state, 0, 2, 1).unwrap();
+        call_rawget(&mut state, 0, 2, 1).unwrap();
         match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 100),
             _ => panic!("expected integer result"),
@@ -3890,17 +3804,15 @@ mod tests {
     }
 
     #[test]
-    fn test_call_base_function_rawset() {
+    fn test_call_rawset() {
         let mut state = LuaState::new();
         state.stack.clear();
         let t = crate::table::Table::new();
-        state
-            .stack
-            .push(TValue::LightUserData(BASE_RAWSET as *mut std::ffi::c_void));
+        state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
         state.stack.push(TValue::Integer(1));
         state.stack.push(TValue::Integer(999));
-        call_base_function(BASE_RAWSET, &mut state, 0, 3, 1).unwrap();
+        call_rawset(&mut state, 0, 3, 1).unwrap();
         match &state.stack[0] {
             TValue::Table(t) => {
                 let val = t.get(&TValue::Integer(1));
@@ -3911,17 +3823,15 @@ mod tests {
     }
 
     #[test]
-    fn test_call_base_function_select_hash() {
+    fn test_call_select_hash() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(BASE_SELECT as *mut std::ffi::c_void));
+        state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Str(state.intern_str("#")));
         state.stack.push(TValue::Integer(1));
         state.stack.push(TValue::Integer(2));
         state.stack.push(TValue::Integer(3));
-        call_base_function(BASE_SELECT, &mut state, 0, 4, 1).unwrap();
+        call_select(&mut state, 0, 4, 1).unwrap();
         match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 3),
             _ => panic!("expected integer result"),
@@ -3929,17 +3839,15 @@ mod tests {
     }
 
     #[test]
-    fn test_call_base_function_select_index() {
+    fn test_call_select_index() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(BASE_SELECT as *mut std::ffi::c_void));
+        state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Integer(2));
         state.stack.push(TValue::Integer(10));
         state.stack.push(TValue::Integer(20));
         state.stack.push(TValue::Integer(30));
-        call_base_function(BASE_SELECT, &mut state, 0, 4, -1).unwrap();
+        call_select(&mut state, 0, 4, -1).unwrap();
         assert_eq!(state.stack.len(), 2);
         match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 20),
@@ -3952,14 +3860,12 @@ mod tests {
     }
 
     #[test]
-    fn test_call_base_function_assert_true() {
+    fn test_call_assert_true() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(BASE_ASSERT as *mut std::ffi::c_void));
+        state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Boolean(true));
-        call_base_function(BASE_ASSERT, &mut state, 0, 1, -1).unwrap();
+        call_assert(&mut state, 0, 1, -1).unwrap();
         assert_eq!(state.stack.len(), 1);
         match &state.stack[0] {
             TValue::Boolean(b) => assert!(*b),
@@ -3968,28 +3874,24 @@ mod tests {
     }
 
     #[test]
-    fn test_call_base_function_assert_false() {
+    fn test_call_assert_false() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(BASE_ASSERT as *mut std::ffi::c_void));
+        state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Boolean(false));
-        let result = call_base_function(BASE_ASSERT, &mut state, 0, 1, -1);
+        let result = call_assert(&mut state, 0, 1, -1);
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_call_base_function_error() {
+    fn test_call_error() {
         let mut state = LuaState::new();
         state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(BASE_ERROR as *mut std::ffi::c_void));
+        state.stack.push(placeholder_builtin());
         state
             .stack
             .push(TValue::Str(state.intern_str("test error")));
-        let result = call_base_function(BASE_ERROR, &mut state, 0, 1, 0);
+        let result = call_error(&mut state, 0, 1, 0);
         assert!(result.is_err());
         match result {
             Err(VmError::RuntimeError(msg)) => assert_eq!(msg, "test error"),
@@ -3998,17 +3900,15 @@ mod tests {
     }
 
     #[test]
-    fn test_call_base_function_setmetatable() {
+    fn test_call_setmetatable() {
         let mut state = LuaState::new();
         state.stack.clear();
         let t = crate::table::Table::new();
         let mt = crate::table::Table::new();
-        state.stack.push(TValue::LightUserData(
-            BASE_SETMETATABLE as *mut std::ffi::c_void,
-        ));
+        state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
         state.stack.push(TValue::Table(mt));
-        call_base_function(BASE_SETMETATABLE, &mut state, 0, 2, 1).unwrap();
+        call_setmetatable(&mut state, 0, 2, 1).unwrap();
         match &state.stack[0] {
             TValue::Table(t) => assert!(t.has_metatable()),
             _ => panic!("expected table result"),
@@ -4016,16 +3916,14 @@ mod tests {
     }
 
     #[test]
-    fn test_call_base_function_getmetatable() {
+    fn test_call_getmetatable() {
         let mut state = LuaState::new();
         state.stack.clear();
         let t = crate::table::Table::new();
         t.set_metatable(Some(crate::table::Table::new()));
-        state.stack.push(TValue::LightUserData(
-            BASE_GETMETATABLE as *mut std::ffi::c_void,
-        ));
+        state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
-        call_base_function(BASE_GETMETATABLE, &mut state, 0, 1, 1).unwrap();
+        call_getmetatable(&mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
             TValue::Table(_) => {}
             _ => panic!("expected table result"),
@@ -4033,15 +3931,13 @@ mod tests {
     }
 
     #[test]
-    fn test_call_base_function_getmetatable_no_mt() {
+    fn test_call_getmetatable_no_mt() {
         let mut state = LuaState::new();
         state.stack.clear();
         let t = crate::table::Table::new();
-        state.stack.push(TValue::LightUserData(
-            BASE_GETMETATABLE as *mut std::ffi::c_void,
-        ));
+        state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
-        call_base_function(BASE_GETMETATABLE, &mut state, 0, 1, 1).unwrap();
+        call_getmetatable(&mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
             TValue::Nil(_) => {}
             _ => panic!("expected nil result"),
@@ -4049,25 +3945,22 @@ mod tests {
     }
 
     #[test]
-    fn test_call_base_function_ipairs() {
+    fn test_call_ipairs() {
         let mut state = LuaState::new();
         state.stack.clear();
         let mut t = crate::table::Table::new();
         t.set(TValue::Integer(1), TValue::Integer(10));
         t.set(TValue::Integer(2), TValue::Integer(20));
-        state
-            .stack
-            .push(TValue::LightUserData(BASE_IPAIRS as *mut std::ffi::c_void));
+        state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
-        call_base_function(BASE_IPAIRS, &mut state, 0, 1, 3).unwrap();
+        call_ipairs(&mut state, 0, 1, 3).unwrap();
         assert_eq!(state.stack.len(), 3);
-        // 第一个返回值是迭代器函数 (使用 BASE_IPAIRS_AUX 标签)
+        // 第一个返回值是迭代器函数 (BuiltinFn, func 指向 call_ipairs_aux)
         match &state.stack[0] {
-            TValue::LightUserData(p) => {
-                let tag = *p as usize;
-                assert_eq!(tag, BASE_IPAIRS_AUX);
+            TValue::BuiltinFn(bf) => {
+                assert_eq!(bf.func as usize, call_ipairs_aux as usize);
             }
-            _ => panic!("expected LightUserData"),
+            _ => panic!("expected BuiltinFn"),
         }
         // 第二个返回值是表
         assert!(matches!(state.stack[1], TValue::Table(_)));
@@ -4079,22 +3972,20 @@ mod tests {
     }
 
     #[test]
-    fn test_call_base_function_pairs() {
+    fn test_call_pairs() {
         let mut state = LuaState::new();
         state.stack.clear();
         let t = crate::table::Table::new();
-        state
-            .stack
-            .push(TValue::LightUserData(BASE_PAIRS as *mut std::ffi::c_void));
+        state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
-        call_base_function(BASE_PAIRS, &mut state, 0, 1, 3).unwrap();
+        call_pairs(&mut state, 0, 1, 3).unwrap();
         assert_eq!(state.stack.len(), 3);
+        // 第一个返回值是 next 迭代器 (BuiltinFn, func 指向 call_next_iter)
         match &state.stack[0] {
-            TValue::LightUserData(p) => {
-                let tag = *p as usize;
-                assert_eq!(tag, BASE_NEXT_ITER);
+            TValue::BuiltinFn(bf) => {
+                assert_eq!(bf.func as usize, call_next_iter as usize);
             }
-            _ => panic!("expected LightUserData"),
+            _ => panic!("expected BuiltinFn"),
         }
         assert!(matches!(state.stack[1], TValue::Table(_)));
         assert!(matches!(state.stack[2], TValue::Nil(_)));
@@ -4107,9 +3998,7 @@ mod tests {
         let mut t = crate::table::Table::new();
         t.set(TValue::Integer(1), TValue::Integer(10));
         t.set(TValue::Integer(2), TValue::Integer(20));
-        state.stack.push(TValue::LightUserData(
-            BASE_IPAIRS_AUX as *mut std::ffi::c_void,
-        ));
+        state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
         state.stack.push(TValue::Integer(0));
         call_ipairs_aux(&mut state, 0, 2, -1).unwrap();
@@ -4129,9 +4018,7 @@ mod tests {
         let mut state = LuaState::new();
         state.stack.clear();
         let t = crate::table::Table::new();
-        state.stack.push(TValue::LightUserData(
-            BASE_IPAIRS_AUX as *mut std::ffi::c_void,
-        ));
+        state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
         state.stack.push(TValue::Integer(0));
         call_ipairs_aux(&mut state, 0, 2, 1).unwrap();
@@ -4139,12 +4026,9 @@ mod tests {
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
 
-    #[test]
-    fn test_call_base_function_unknown_tag() {
-        let mut state = LuaState::new();
-        let result = call_base_function(999, &mut state, 0, 0, 0);
-        assert!(result.is_err());
-    }
+    // ========================================================================
+    // call_base_function_unknown_tag 测试已删除（base 库已迁移到 BuiltinFn）
+    // ========================================================================
 
     // ========================================================================
     // table_next 测试

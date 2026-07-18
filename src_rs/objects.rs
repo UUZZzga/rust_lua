@@ -29,6 +29,8 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use crate::gc::GCObjectHeader;
+use crate::execute::VmError;
+use crate::state::LuaState;
 
 // ============================================================================
 // FxHash — 用于 Table 哈希部分的快速非加密哈希
@@ -184,6 +186,102 @@ impl fmt::Display for LuaType {
 }
 
 // ============================================================================
+// 规约：Rust 原生内置函数 (BuiltinFn)
+// ============================================================================
+
+/// Rust 原生内置函数指针类型
+///
+/// 与 C API 的 `lua_CFunction` (`unsafe extern "C" fn(*mut lua_State) -> c_int`) 不同，
+/// 使用 Rust ABI 和 `Result` 错误处理，类型安全且无 `unsafe`：
+///
+/// - `state`: VM 状态（可变引用，非裸指针）
+/// - `a`: 函数在栈中的位置（0-based，`state.stack[a]` 是函数本身，参数从 `a+1` 开始）
+/// - `nargs`: 参数数量
+/// - `nresults`: 期望结果数（-1 = MULTRET，>=0 = 固定数量）
+///
+/// 返回 `Result<(), VmError>`：
+/// - `Ok(())`: 成功，结果已压入栈并由 VM 调整
+/// - `Err(VmError::Yield(_))`: 协程 yield（非真实错误）
+/// - `Err(other)`: 运行时错误
+///
+/// 对应 C 的 `lua_CFunction`，但更适合 Rust 用户使用。
+pub type BuiltinFnPtr = fn(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError>;
+
+/// Rust 原生内置函数
+///
+/// 包含函数指针和静态函数名（用于 traceback）。
+///
+/// ## 与 `TValue::LightUserData(tag)` 的区别
+///
+/// 历史上内置库函数通过 `TValue::LightUserData(tag as *mut c_void)` 注册，
+/// 用 tag 值范围（1-32, 100-119, 200-299 等）派发。这有两个问题：
+/// 1. 用户通过 `lua_pushlightuserdata(L, p)` 保存的指针若落入 tag 范围，
+///    会被 `type()` 误判为 "function"
+/// 2. 派发需经过 `if-else` 链匹配 tag 范围 + 内部 `match tag`，开销 ~15-30 cycles
+///
+/// `BuiltinFn` 直接存储函数指针，调用时一次间接跳转即可（~5-10 cycles），
+/// 与 C Lua 持平。同时 `LightUserData` 不再承担派发职责，类型判断正确。
+///
+/// ## 内存布局
+///
+/// 为保持 `TValue` 24 字节大小不变，`name` 使用 `*const u8`（8 字节 thin pointer）
+/// 而非 `&'static str`（16 字节 fat pointer）。函数名均为 ASCII，NUL 终止。
+/// 用 `c"name".as_ptr()` 构造（Rust 1.77+ 的 `c"..."` 字面量产生 `&'static CStr`，
+/// `.as_ptr()` 得到指向 NUL 终止字节数组的 thin pointer）。
+///
+/// Scenario: 注册并调用 Rust 原生内置函数
+/// Given: 一个签名为 `fn(&mut LuaState, usize, usize, i32) -> Result<(), VmError>` 的函数
+/// When: 用 `TValue::BuiltinFn(BuiltinFn { func, name })` 注册到表中
+/// Then: Lua 代码调用该函数时，VM 直接通过函数指针调用，无需 tag 派发
+#[derive(Clone, Copy)]
+pub struct BuiltinFn {
+    /// 函数指针
+    pub func: BuiltinFnPtr,
+    /// 函数名（NUL 终止的 C 字符串指针，用于 traceback）
+    pub name: *const u8,
+}
+
+impl std::fmt::Debug for BuiltinFn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = unsafe {
+            if self.name.is_null() {
+                "<null>".to_string()
+            } else {
+                std::ffi::CStr::from_ptr(self.name as *const std::ffi::c_char)
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        f.debug_struct("BuiltinFn")
+            .field("name", &name)
+            .field("func", &(self.func as usize))
+            .finish()
+    }
+}
+
+impl BuiltinFn {
+    /// 获取函数名的 &str（unsafe，因为从裸指针构造）
+    ///
+    /// 安全性：name 必须是有效的 NUL 终止 C 字符串指针
+    pub fn name_str(&self) -> &str {
+        if self.name.is_null() {
+            ""
+        } else {
+            unsafe {
+                std::ffi::CStr::from_ptr(self.name as *const std::ffi::c_char)
+                    .to_str()
+                    .unwrap_or("")
+            }
+        }
+    }
+}
+
+// ============================================================================
 // 规约：TValue — Lua 核心值类型
 // ============================================================================
 
@@ -205,6 +303,10 @@ pub enum TValue {
     /// 布尔值
     Boolean(bool),
     /// 轻量用户数据（裸指针）
+    ///
+    /// 注意：此变体仅用于真正的 light userdata（用户通过 `lua_pushlightuserdata`
+    /// 保存的指针）。内置库函数标签已迁移到 `BuiltinFn` 变体，不再使用此变体
+    /// 进行派发，避免用户指针被误判为内置函数。
     LightUserData(*mut std::ffi::c_void),
     /// 数值 —— 整数子变体
     Integer(i64),
@@ -224,6 +326,11 @@ pub enum TValue {
     CClosure(Rc<CClosure>),
     /// 轻量 C 函数
     LCFn(LCFunction),
+    /// Rust 原生内置函数（函数指针 + 静态名）
+    ///
+    /// 用于注册 Rust 实现的内置函数。调用时直接通过函数指针派发，
+    /// 无需 tag 范围匹配。详见 `BuiltinFn` 类型文档。
+    BuiltinFn(BuiltinFn),
     /// 用户数据（同理用 Rc）
     UserData(Rc<Udata>),
     /// 线程/协程（同理用 Rc）
@@ -263,7 +370,10 @@ impl TValue {
             TValue::Integer(_) | TValue::Float(_) => LuaType::Number,
             TValue::Str(_) => LuaType::String,
             TValue::Table(_) => LuaType::Table,
-            TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) => LuaType::Function,
+            TValue::LClosure(_)
+            | TValue::CClosure(_)
+            | TValue::LCFn(_)
+            | TValue::BuiltinFn(_) => LuaType::Function,
             TValue::UserData(_) => LuaType::UserData,
             TValue::Thread(_) => LuaType::Thread,
         }
@@ -314,9 +424,6 @@ impl TValue {
         matches!(self, TValue::Boolean(false)) || self.is_nil()
     }
 
-    /// 是否为整数
-    ///
-    /// Scenario: 判断整数类型
     /// Given: TValue::Integer(42)
     /// When: 调用 .is_integer()
     /// Then: 返回 true
@@ -385,11 +492,39 @@ impl TValue {
     /// Given: TValue::LCFn(_)
     /// When: 调用 .is_function()
     /// Then: 返回 true
+    /// Given: TValue::BuiltinFn(_)
+    /// When: 调用 .is_function()
+    /// Then: 返回 true
+    /// Given: TValue::LightUserData(_)  // 真正的 light userdata，非内置函数
+    /// When: 调用 .is_function()
+    /// Then: 返回 false
     pub fn is_function(&self) -> bool {
         matches!(
             self,
-            TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) | TValue::LightUserData(_)
+            TValue::LClosure(_)
+                | TValue::CClosure(_)
+                | TValue::LCFn(_)
+                | TValue::BuiltinFn(_)
         )
+    }
+
+    /// 判断值是否可调用（兼容 io.lines 迭代器的 LightUserData 形式）
+    ///
+    /// 所有内置库（base/math/utf8/table/os/debug/io/coroutine/string）已迁移到 BuiltinFn，
+    /// coroutine.wrap 返回 Table（由 get_wrap_idx 检测）。
+    /// LightUserData 仅剩 io.lines 迭代器 (tag >= 0x1000_0000_0000_0000) 作为内置 tag。
+    pub fn is_callable(&self) -> bool {
+        if self.is_function() {
+            return true;
+        }
+        if let TValue::LightUserData(p) = self {
+            let tag = *p as usize;
+            // io lines iterator: 极大值范围
+            if tag >= 0x1000_0000_0000_0000 {
+                return true;
+            }
+        }
+        false
     }
 
     /// 尝试获取整数值
@@ -472,6 +607,9 @@ impl PartialEq for TValue {
             (TValue::LCFn(a), TValue::LCFn(b)) => {
                 std::ptr::eq(a.func as *const (), b.func as *const ())
             }
+            (TValue::BuiltinFn(a), TValue::BuiltinFn(b)) => {
+                std::ptr::eq(a.func as *const (), b.func as *const ())
+            }
             (TValue::UserData(a), TValue::UserData(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
             (TValue::Thread(a), TValue::Thread(b)) => Rc::ptr_eq(&a.context, &b.context),
             _ => false,
@@ -535,6 +673,10 @@ impl Hash for TValue {
                 9u8.hash(state);
                 (c.func as usize).hash(state);
             }
+            TValue::BuiltinFn(b) => {
+                12u8.hash(state);
+                (b.func as usize).hash(state);
+            }
             TValue::UserData(u) => {
                 10u8.hash(state);
                 u.gc_header.ptr_id.hash(state);
@@ -564,6 +706,7 @@ impl fmt::Display for TValue {
             TValue::LClosure(_) => write!(f, "function"),
             TValue::CClosure(_) => write!(f, "function"),
             TValue::LCFn(_) => write!(f, "function"),
+            TValue::BuiltinFn(b) => write!(f, "function: {}", b.name_str()),
             TValue::UserData(_) => write!(f, "userdata"),
             TValue::Thread(_) => write!(f, "thread"),
         }
@@ -1892,6 +2035,21 @@ mod tests {
     use super::*;
     use crate::strings::{LongString, ShortString};
     use std::sync::atomic::{AtomicU64, AtomicU8};
+
+    // ========================================================================
+    // TValue 大小检查
+    // ========================================================================
+
+    #[test]
+    fn test_tvalue_size() {
+        println!("TValue size: {}", std::mem::size_of::<TValue>());
+        println!("TValue align: {}", std::mem::align_of::<TValue>());
+        println!("BuiltinFn size: {}", std::mem::size_of::<BuiltinFn>());
+        println!("BuiltinFnPtr size: {}", std::mem::size_of::<BuiltinFnPtr>());
+        // 添加 BuiltinFn 变体后 TValue 应保持 24 字节
+        assert_eq!(std::mem::size_of::<TValue>(), 24);
+        assert_eq!(std::mem::size_of::<BuiltinFn>(), 16);
+    }
 
     // ========================================================================
     // LuaType 测试

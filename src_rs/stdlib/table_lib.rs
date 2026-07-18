@@ -6,47 +6,19 @@
 //! - 注册 table 全局表，包含表操作函数
 //! - 提供 table.concat, table.unpack, table.pack, table.insert, table.remove 函数
 //!
-//! ## 标签分配
-//! - 标签 400+: Table 库
+//! ## 迁移说明
+//! - 已从 LightUserData(tag) 迁移到 BuiltinFn 函数指针方案
 
 use crate::execute::{arg_error, VmError};
-use crate::objects::{NilKind, TValue};
+use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
 use crate::tm::{call_order_tm, obj_type_name, TagMethod};
 use crate::vm::VmExecutor;
 
 // ============================================================================
-// 函数标签 (LightUserData 占位符值)
+// 函数标签 (已迁移到 BuiltinFn，不再使用 LightUserData tag)
 // ============================================================================
-
-pub const TABLE_CONCAT: usize = 400;
-pub const TABLE_UNPACK: usize = 401;
-pub const TABLE_PACK: usize = 402;
-pub const TABLE_INSERT: usize = 403;
-pub const TABLE_REMOVE: usize = 404;
-pub const TABLE_SORT: usize = 405;
-pub const TABLE_MOVE: usize = 406;
-pub const TABLE_CREATE: usize = 407;
-
-/// Table 库标签范围: [400, 410)
-pub fn is_table_tag(tag: usize) -> bool {
-    (400..410).contains(&tag)
-}
-
-/// 将 table 库函数 tag 映射到函数名（用于 traceback）
-pub fn table_function_name(tag: usize) -> Option<&'static str> {
-    match tag {
-        TABLE_CONCAT => Some("concat"),
-        TABLE_UNPACK => Some("unpack"),
-        TABLE_PACK => Some("pack"),
-        TABLE_INSERT => Some("insert"),
-        TABLE_REMOVE => Some("remove"),
-        TABLE_SORT => Some("sort"),
-        TABLE_MOVE => Some("move"),
-        TABLE_CREATE => Some("create"),
-        _ => None,
-    }
-}
+// 标签 400+: Table 库（已迁移到 BuiltinFn，不再使用 tag）
 
 // ============================================================================
 // 栈操作辅助函数
@@ -183,40 +155,8 @@ fn table_concat_impl(
 }
 
 // ============================================================================
-// 函数派发 — 从 execute.rs 调用
+// 函数派发 — 已迁移到 BuiltinFn，直接通过函数指针调用
 // ============================================================================
-
-/// Table 库函数派发
-pub fn call_table_function(
-    tag: usize,
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
-    let prev_c_func = state.last_c_function.take();
-    state.last_c_function = table_function_name(tag).map(|s| s.to_string());
-
-    let result = match tag {
-        TABLE_CONCAT => call_concat(state, a, nargs, nresults),
-        TABLE_UNPACK => call_unpack(state, a, nargs, nresults),
-        TABLE_PACK => call_pack(state, a, nargs, nresults),
-        TABLE_INSERT => call_insert(state, a, nargs, nresults),
-        TABLE_REMOVE => call_remove(state, a, nargs, nresults),
-        TABLE_SORT => call_sort(state, a, nargs, nresults),
-        TABLE_MOVE => call_move(state, a, nargs, nresults),
-        TABLE_CREATE => call_create(state, a, nargs, nresults),
-        _ => Err(VmError::RuntimeError(format!(
-            "unknown table function tag: {}",
-            tag
-        ))),
-    };
-
-    if result.is_ok() {
-        state.last_c_function = prev_c_func;
-    }
-    result
-}
 
 /// table.concat(list [, sep [, i [, j]]])
 fn call_concat(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
@@ -922,19 +862,23 @@ fn call_comp_function(
 pub fn open_table_lib(state: &mut LuaState) {
     let mut lib = crate::table::Table::new();
 
-    let register = |lib: &mut crate::table::Table, name: &str, tag: usize| {
-        let key = TValue::Str(state.intern_str(name));
-        lib.set(key, TValue::LightUserData(tag as *mut std::ffi::c_void));
+    // 注册所有 Table 函数 (使用 BuiltinFn 函数指针)
+    let register = |lib: &mut crate::table::Table,
+                    name: &'static std::ffi::CStr,
+                    func: crate::objects::BuiltinFnPtr| {
+        let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
+        let name_ptr = name.as_ptr() as *const u8;
+        lib.set(key, TValue::BuiltinFn(BuiltinFn { func, name: name_ptr }));
     };
 
-    register(&mut lib, "concat", TABLE_CONCAT);
-    register(&mut lib, "unpack", TABLE_UNPACK);
-    register(&mut lib, "pack", TABLE_PACK);
-    register(&mut lib, "insert", TABLE_INSERT);
-    register(&mut lib, "remove", TABLE_REMOVE);
-    register(&mut lib, "sort", TABLE_SORT);
-    register(&mut lib, "move", TABLE_MOVE);
-    register(&mut lib, "create", TABLE_CREATE);
+    register(&mut lib, c"concat", call_concat);
+    register(&mut lib, c"unpack", call_unpack);
+    register(&mut lib, c"pack", call_pack);
+    register(&mut lib, c"insert", call_insert);
+    register(&mut lib, c"remove", call_remove);
+    register(&mut lib, c"sort", call_sort);
+    register(&mut lib, c"move", call_move);
+    register(&mut lib, c"create", call_create);
 
     let key = TValue::Str(state.intern_str("table"));
     state.globals.set(key, TValue::Table(lib));

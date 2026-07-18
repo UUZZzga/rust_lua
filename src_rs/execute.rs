@@ -1452,15 +1452,24 @@ impl VmExecutor {
 
         let ci = &state.call_info;
         let ci_len = ci.len();
-        // 跳过 call_info 末尾的 C 函数帧 — 它们由 last_c_function 处理
+        // 跳过 call_info 末尾的 C 函数帧 — 它们由 last_c_function 或 CallInfoEntry.name 处理
         // （error 时 C 函数帧保留在 call_info 中，供 build_traceback_from_thread 使用）
         let c_chain_len = ci.iter().rev().take_while(|e| e.is_c).count();
         let effective_ci_len = ci_len - c_chain_len;
         let has_lua_frame = cur_closure.is_some();
 
         // 如果错误由 C 函数引发，先添加 C 函数帧 — 对应 C 的 [C]: in global 'name'
+        // base 库已迁移到 BuiltinFn：last_c_function 不再设置，
+        // 改从 call_info 末尾的 C 帧读取 name（BuiltinFn 分支已设置）。
         if let Some(c_func_name) = &state.last_c_function {
             trace.push_str(&format!("\n\t[C]: in global '{}'", c_func_name));
+        } else if c_chain_len > 0 {
+            // BuiltinFn/LCFn/CClosure 分支：C 帧的 name 在 CallInfoEntry 中
+            // 取最内层的 C 帧（call_info 末尾最后一个 C 帧）
+            let c_frame = &ci[ci_len - 1];
+            if !c_frame.name.is_empty() {
+                trace.push_str(&format!("\n\t[C]: in global '{}'", c_frame.name));
+            }
         }
 
         // 收集所有 Lua 帧信息 (source, line, name_str) — 从内到外
@@ -3976,6 +3985,87 @@ impl VmExecutor {
                 }
                 Ok(())
             }
+            TValue::BuiltinFn(bf) => {
+                // Rust 原生内置函数派发 — 直接调用函数指针，无需 tag 范围匹配
+                // 性能：~5-10 cycles（与 C Lua 持平），比 LightUserData tag 派发快 2-3 倍
+                let nargs = if b == 0 {
+                    state.stack.len().saturating_sub(a + 1)
+                } else {
+                    b.saturating_sub(1)
+                };
+                let nresults: i32 = if c == 0 { -1 } else { c - 1 };
+
+                // 推入 CallInfoEntry（对应 C 的 luaD_precall -> inc_ci）
+                // name 直接从 BuiltinFn.name 取，无需调用 get_func_name
+                let c_name = bf.name_str().to_string();
+                let c_namewhat = "function".to_string();
+                state.call_info.push(crate::state::CallInfoEntry {
+                    caller_proto: None,
+                    is_c: true,
+                    closure: None,
+                    base: a + 1,
+                    saved_pc: state.pc,
+                    name: c_name.clone(),
+                    namewhat: c_namewhat.clone(),
+                    proto_flag: state.proto_flag,
+                    nextraargs: state.nextraargs,
+                    is_tailcall: false,
+                });
+
+                // 对应 C 的 luaG_tracecall -> luaD_hookcall: 触发 call hook
+                if state.hook_mask & 1 != 0 {
+                    // LUA_MASKCALL
+                    Self::call_hook(state, "call", -1, Some(a + 1), 1, nargs as i32)?;
+                }
+
+                // 直接调用函数指针 — 无 tag 派发层
+                let dispatch_result = (bf.func)(state, a, nargs, nresults);
+
+                let is_yield = matches!(&dispatch_result, Err(VmError::Yield(_)));
+                let is_error = dispatch_result.is_err();
+                if !is_yield && !is_error {
+                    state.call_info.pop();
+                }
+
+                // 对应 C 的 luaD_poscall -> rethook: 触发 return hook
+                if state.hook_mask & 2 != 0 {
+                    // LUA_MASKRET
+                    let (ftransfer, nres) = match state.pending_return_adjust {
+                        Some((_, _, n_actual, first_result_pos)) => {
+                            ((first_result_pos as i32) - (a as i32), n_actual as i32)
+                        }
+                        None => (1, 0),
+                    };
+                    let saved_pending = state.pending_return_adjust.take();
+                    state.call_info.push(crate::state::CallInfoEntry {
+                        caller_proto: None,
+                        is_c: true,
+                        closure: None,
+                        base: a + 1,
+                        saved_pc: state.pc,
+                        name: c_name,
+                        namewhat: c_namewhat,
+                        proto_flag: state.proto_flag,
+                        nextraargs: state.nextraargs,
+                        is_tailcall: false,
+                    });
+                    Self::call_hook(state, "return", -1, Some(a + 1), ftransfer, nres)?;
+                    state.call_info.pop();
+                    state.pending_return_adjust = saved_pending;
+                }
+
+                // 执行待定的返回值调整
+                if !is_yield {
+                    state.finish_pending_adjust();
+                }
+
+                dispatch_result?;
+
+                // 对应 C 的 rethook: C 函数返回时设置 oldpc
+                state.hook_old_pc = state.pc as i32;
+                state.pc += 1;
+                Ok(())
+            }
             TValue::LightUserData(tag) => {
                 let tag_val = tag as usize;
                 let nargs = if b == 0 {
@@ -3985,19 +4075,6 @@ impl VmExecutor {
                 };
                 let nresults: i32 = if c == 0 { -1 } else { c - 1 };
 
-                // ipairsaux / next 迭代器函数: 除 TFORCALL 外, 普通调用也支持
-                // (对应 C 中 ipairsaux 也是普通 C 函数, 可被直接调用)
-                if tag_val == crate::stdlib::base_lib::BASE_IPAIRS_AUX {
-                    crate::stdlib::base_lib::call_ipairs_aux(state, a, nargs, nresults)?;
-                    state.pc += 1;
-                    return Ok(());
-                }
-                if tag_val == crate::stdlib::base_lib::BASE_NEXT_ITER {
-                    crate::stdlib::base_lib::call_next_iter(state, a, nargs, nresults)?;
-                    state.pc += 1;
-                    return Ok(());
-                }
-
                 // 对应 C 的 precallC: 推入 CallInfoEntry 并在整个 C 函数执行期间保留
                 // 这样 debug.getinfo/traceback 能正确看到 C 函数帧
                 // 对应 C 的 luaD_precall -> inc_ci 创建新的 CallInfo
@@ -4005,34 +4082,10 @@ impl VmExecutor {
                 // 性能优化: 不在每次 C 函数调用时调用 get_func_name (对应 C 的
                 // funcnamefromcode), 因为它内部调用 find_set_reg 遍历 0..call_pc
                 // 的所有指令 (O(n))。C 实现只在 traceback 时才计算函数名。
-                // 这里用 tag 映射获取函数名, namewhat 设为 "function"。
-                let c_name: String = if crate::stdlib::base_lib::is_base_tag(tag_val) {
-                    crate::stdlib::base_lib::base_function_name(tag_val).map(|s| s.to_string())
-                } else if crate::stdlib::math_lib::is_math_tag(tag_val) {
-                    crate::stdlib::math_lib::math_function_name(tag_val).map(|s| s.to_string())
-                } else if crate::stdlib::utf8_lib::is_utf8_tag(tag_val) {
-                    crate::stdlib::utf8_lib::utf8_function_name(tag_val).map(|s| s.to_string())
-                } else if crate::stdlib::table_lib::is_table_tag(tag_val) {
-                    crate::stdlib::table_lib::table_function_name(tag_val).map(|s| s.to_string())
-                } else if crate::stdlib::debug_lib::is_debug_tag(tag_val) {
-                    crate::stdlib::debug_lib::debug_function_name(tag_val).map(|s| s.to_string())
-                } else if crate::stdlib::os_lib::is_os_tag(tag_val) {
-                    crate::stdlib::os_lib::os_function_name(tag_val).map(|s| s.to_string())
-                } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
-                    crate::stdlib::coroutine_lib::coro_function_name(tag_val).map(|s| s.to_string())
-                } else if crate::stdlib::io_lib::is_io_function_tag(tag_val) {
-                    crate::stdlib::io_lib::io_function_name(tag_val).map(|s| s.to_string())
-                } else if crate::stdlib::string_lib::is_string_tag(tag_val) {
-                    crate::stdlib::string_lib::string_function_name(tag_val).map(|s| s.to_string())
-                } else {
-                    None
-                }
-                .unwrap_or_default();
-                let c_namewhat = if c_name.is_empty() {
-                    String::new()
-                } else {
-                    "function".to_string()
-                };
+                // base 库已迁移到 BuiltinFn，LightUserData 仅剩 io.lines 迭代器和
+                // coroutine.wrap 函数，它们的函数名由 traceback 时计算，此处留空。
+                let c_name: String = String::new();
+                let c_namewhat = String::new();
                 state.call_info.push(crate::state::CallInfoEntry {
                     caller_proto: None,
                     is_c: true,
@@ -4054,55 +4107,20 @@ impl VmExecutor {
                 }
 
                 // 基础库函数派发
-                // 对应原 C 源码 lbaselib.cpp 的各个函数
-                // 注意: ipairsaux (迭代器) 只在 TFORCALL 中调用, 不在此处理
+                // base 库已迁移到 BuiltinFn，LightUserData 仅剩 io.lines 迭代器。
+                // coroutine.wrap 返回 Table（由 get_wrap_idx 检测，在 match 前已处理）。
                 // 普通库函数调用（对应 C 的 luaD_call）不递增 n_ny_calls。
                 // 只有 luaD_callnoyield 场景（__close/__gc 元方法、lua_call C API、
                 // 错误处理等）才递增。pcall/xpcall 是 CIST_YPCALL（yieldable protected）。
 
-                let dispatch_result = if crate::stdlib::base_lib::is_base_tag(tag_val) {
-                    crate::stdlib::base_lib::call_base_function(tag_val, state, a, nargs, nresults)
-                } else if crate::stdlib::math_lib::is_math_tag(tag_val) {
-                    // 数学库函数（标签 200-299）
-                    crate::stdlib::math_lib::call_math_function(tag_val, state, a, nargs, nresults)
-                } else if crate::stdlib::utf8_lib::is_utf8_tag(tag_val) {
-                    // UTF-8 库函数（标签 300-309）
-                    crate::stdlib::utf8_lib::call_utf8_function(tag_val, state, a, nargs, nresults)
-                } else if crate::stdlib::table_lib::is_table_tag(tag_val) {
-                    // Table 库函数（标签 400-409）
-                    crate::stdlib::table_lib::call_table_function(
-                        tag_val, state, a, nargs, nresults,
-                    )
-                } else if crate::stdlib::debug_lib::is_debug_tag(tag_val) {
-                    // Debug 库函数（标签 500-519）
-                    crate::stdlib::debug_lib::call_debug_function(
-                        tag_val, state, a, nargs, nresults,
-                    )
-                } else if crate::stdlib::os_lib::is_os_tag(tag_val) {
-                    // OS 库函数（标签 600-609）
-                    crate::stdlib::os_lib::call_os_function(tag_val, state, a, nargs, nresults)
-                } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
-                    // Coroutine 库函数（标签 700-709）
-                    crate::stdlib::coroutine_lib::call_coro_function(
-                        tag_val, state, a, nargs, nresults,
-                    )
-                } else if crate::stdlib::io_lib::is_io_function_tag(tag_val) {
-                    // I/O 库函数（标签 800-809）— 必须在 wrap_call 之前检查
-                    // (is_wrap_call_tag 用 tag >= 710，会误匹配 800+)
-                    crate::stdlib::io_lib::call_io_function(tag_val, state, a, nargs, nresults)
-                } else if crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
+                let dispatch_result = if crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
                     // io.lines/file:lines 返回的迭代器
                     crate::stdlib::io_lib::call_lines_iterator(tag_val, state, a, nargs, nresults)
-                } else if crate::stdlib::coroutine_lib::is_wrap_call_tag(tag_val) {
-                    // coroutine.wrap 返回的函数（标签 710+）
-                    crate::stdlib::coroutine_lib::call_wrap_call(tag_val, state, a, nargs, nresults)
-                } else if tag_val >= 100 {
-                    // 字符串库函数（标签 100+）
-                    crate::stdlib::string_lib::call_string_function(
-                        tag_val, state, a, nargs, nresults,
-                    )
                 } else {
-                    Ok(())
+                    Err(VmError::RuntimeError(format!(
+                        "attempt to call a non-function value (tag={})",
+                        tag_val
+                    )))
                 };
 
                 // （n_ny_calls 在 luaD_call 路径中不递增，无需递减）
@@ -4482,46 +4500,57 @@ impl VmExecutor {
                 Self::call_c_function(state, a, b, 0, cc.f)?;
                 Ok(())
             }
+            TValue::BuiltinFn(bf) => {
+                // TAILCALL Rust 原生内置函数: 调用后结果放在 a 位置，后续 RETURN 处理返回
+                // 对应 C 的 luaD_callnoyield + precallC + poscall（nresults=-1 由 RETURN 调整）
+                let nargs = if b == 0 {
+                    state.stack.len().saturating_sub(a + 1)
+                } else {
+                    b.saturating_sub(1)
+                };
+                // 推入 CallInfoEntry（与 op_call 一致，但 nresults=-1 表示 MULTRET，
+                // 由后续 RETURN 指令根据返回值数量调整）
+                state.call_info.push(crate::state::CallInfoEntry {
+                    caller_proto: None,
+                    is_c: true,
+                    closure: None,
+                    base: a + 1,
+                    saved_pc: state.pc,
+                    name: bf.name_str().to_string(),
+                    namewhat: "function".to_string(),
+                    proto_flag: state.proto_flag,
+                    nextraargs: state.nextraargs,
+                    is_tailcall: false,
+                });
+                let dispatch_result = (bf.func)(state, a, nargs, -1);
+                // 仅在非 yield/error 时弹出 CallInfoEntry
+                if !matches!(&dispatch_result, Err(VmError::Yield(_))) && dispatch_result.is_ok() {
+                    state.call_info.pop();
+                }
+                dispatch_result?;
+                // 对应 C 的 rethook: C 函数返回时设置 oldpc
+                state.hook_old_pc = state.pc as i32;
+                state.pc += 1;
+                Ok(())
+            }
             TValue::LightUserData(tag) => {
-                // TAILCALL LightUserData 函数 (基础库/字符串库函数)
-                // 注意: ipairsaux (迭代器) 只在 TFORCALL 中调用, 不在此处理
+                // TAILCALL LightUserData 函数
+                // base 库已迁移到 BuiltinFn，LightUserData 仅剩 io.lines 迭代器。
+                // coroutine.wrap 返回 Table（由 get_wrap_idx 检测，在 match 前已处理）。
                 let tag_val = tag as usize;
                 let nargs = if b == 0 {
                     state.stack.len().saturating_sub(a + 1)
                 } else {
                     b.saturating_sub(1)
                 };
-                if crate::stdlib::base_lib::is_base_tag(tag_val) {
-                    crate::stdlib::base_lib::call_base_function(tag_val, state, a, nargs, -1)?;
-                } else if crate::stdlib::math_lib::is_math_tag(tag_val) {
-                    // 数学库函数（标签 200-299）
-                    crate::stdlib::math_lib::call_math_function(tag_val, state, a, nargs, -1)?;
-                } else if crate::stdlib::utf8_lib::is_utf8_tag(tag_val) {
-                    // UTF-8 库函数（标签 300-309）
-                    crate::stdlib::utf8_lib::call_utf8_function(tag_val, state, a, nargs, -1)?;
-                } else if crate::stdlib::table_lib::is_table_tag(tag_val) {
-                    // Table 库函数（标签 400-409）
-                    crate::stdlib::table_lib::call_table_function(tag_val, state, a, nargs, -1)?;
-                } else if crate::stdlib::debug_lib::is_debug_tag(tag_val) {
-                    // Debug 库函数（标签 500-519）
-                    crate::stdlib::debug_lib::call_debug_function(tag_val, state, a, nargs, -1)?;
-                } else if crate::stdlib::os_lib::is_os_tag(tag_val) {
-                    // OS 库函数（标签 600-609）
-                    crate::stdlib::os_lib::call_os_function(tag_val, state, a, nargs, -1)?;
-                } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
-                    // Coroutine 库函数（标签 700-709）
-                    crate::stdlib::coroutine_lib::call_coro_function(tag_val, state, a, nargs, -1)?;
-                } else if crate::stdlib::io_lib::is_io_function_tag(tag_val) {
-                    // I/O 库函数（标签 800-809）
-                    crate::stdlib::io_lib::call_io_function(tag_val, state, a, nargs, -1)?;
-                } else if crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
+                if crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
                     // io.lines/file:lines 返回的迭代器
                     crate::stdlib::io_lib::call_lines_iterator(tag_val, state, a, nargs, -1)?;
-                } else if crate::stdlib::coroutine_lib::is_wrap_call_tag(tag_val) {
-                    // coroutine.wrap 返回的函数（标签 710+）
-                    crate::stdlib::coroutine_lib::call_wrap_call(tag_val, state, a, nargs, -1)?;
-                } else if tag_val >= 100 {
-                    crate::stdlib::string_lib::call_string_function(tag_val, state, a, nargs, -1)?;
+                } else {
+                    return Err(VmError::RuntimeError(format!(
+                        "attempt to call a non-function value (tag={})",
+                        tag_val
+                    )));
                 }
                 // 对应 C 的 rethook: C 函数返回时设置 oldpc
                 state.hook_old_pc = state.pc as i32;
@@ -5231,94 +5260,45 @@ impl VmExecutor {
                 }
                 Ok(())
             }
+            TValue::BuiltinFn(bf) => {
+                // Rust 原生内置函数作为 TFORCALL 迭代器（如 ipairs/pairs 的迭代器）
+                // 处理方式与 op_call 的 BuiltinFn 分支一致：不推 CallFrame，只推
+                // CallInfoEntry（用于 traceback）。迭代器函数（call_ipairs_aux /
+                // call_next_iter）只通过 `a` 参数访问栈，不依赖 state.base，
+                // 因此无需修改 state.base。
+                let nresults = (c + 1) as i32;
+                let nargs = 2;
+                state.call_info.push(crate::state::CallInfoEntry {
+                    caller_proto: None,
+                    is_c: true,
+                    closure: None,
+                    base: ra + 4,
+                    saved_pc: state.pc,
+                    name: "for iterator".to_string(),
+                    namewhat: "for iterator".to_string(),
+                    proto_flag: state.proto_flag,
+                    nextraargs: state.nextraargs,
+                    is_tailcall: false,
+                });
+                let dispatch_result = (bf.func)(state, ra + 3, nargs, nresults);
+                let is_yield = matches!(&dispatch_result, Err(VmError::Yield(_)));
+                if !is_yield {
+                    state.call_info.pop();
+                }
+                dispatch_result?;
+                state.finish_pending_adjust();
+                state.pc += 1;
+                Ok(())
+            }
             TValue::LightUserData(tag) => {
-                // 处理 LightUserData 迭代器 (ipairs/pairs 返回的迭代器)
+                // 处理 LightUserData 迭代器
+                // base 库已迁移到 BuiltinFn，ipairs/pairs 迭代器现在走 BuiltinFn 分支。
+                // LightUserData 仅剩 io.lines 迭代器。
+                // coroutine.wrap 返回 Table（由 get_wrap_idx 检测，在 match 前已处理）。
                 let tag_val = *tag as usize;
                 let nresults = (c + 1) as i32;
                 let nargs = 2;
-                let result = if tag_val == crate::stdlib::base_lib::BASE_IPAIRS_AUX {
-                    crate::stdlib::base_lib::call_ipairs_aux(state, ra + 3, nargs, nresults)
-                } else if tag_val == crate::stdlib::base_lib::BASE_NEXT_ITER {
-                    // pairs 迭代器 (next) — 直接内联以避免多层调用开销
-                    let table_val = state
-                        .stack
-                        .get(ra + 4)
-                        .cloned()
-                        .unwrap_or(TValue::Nil(NilKind::Strict));
-                    let key_val = state
-                        .stack
-                        .get(ra + 5)
-                        .cloned()
-                        .unwrap_or(TValue::Nil(NilKind::Strict));
-                    match &table_val {
-                        TValue::Table(table) => {
-                            let (next_key, next_val) =
-                                crate::stdlib::base_lib::table_next(table, &key_val)
-                                    .map_err(|e| VmError::RuntimeError(e.to_string()))?;
-                            if state.stack.len() > ra + 3 {
-                                state.stack.truncate(ra + 3);
-                            }
-                            while state.stack.len() < ra + 3 {
-                                state.stack.push(TValue::Nil(NilKind::Strict));
-                            }
-                            match next_key {
-                                Some(k) => {
-                                    state.stack.push(k);
-                                    state.stack.push(next_val);
-                                }
-                                None => {
-                                    state.stack.push(TValue::Nil(NilKind::Strict));
-                                }
-                            }
-                            Ok(())
-                        }
-                        _ => Err(VmError::RuntimeError(
-                            "bad argument #1 to 'next' (table expected)".to_string(),
-                        )),
-                    }
-                } else if crate::stdlib::base_lib::is_base_tag(tag_val) {
-                    crate::stdlib::base_lib::call_base_function(
-                        tag_val,
-                        state,
-                        ra + 3,
-                        nargs,
-                        nresults,
-                    )
-                } else if crate::stdlib::math_lib::is_math_tag(tag_val) {
-                    crate::stdlib::math_lib::call_math_function(
-                        tag_val,
-                        state,
-                        ra + 3,
-                        nargs,
-                        nresults,
-                    )
-                } else if crate::stdlib::utf8_lib::is_utf8_tag(tag_val) {
-                    crate::stdlib::utf8_lib::call_utf8_function(
-                        tag_val,
-                        state,
-                        ra + 3,
-                        nargs,
-                        nresults,
-                    )
-                } else if crate::stdlib::string_lib::is_string_tag(tag_val) {
-                    crate::stdlib::string_lib::call_string_function(
-                        tag_val,
-                        state,
-                        ra + 3,
-                        nargs,
-                        nresults,
-                    )
-                } else if crate::stdlib::coroutine_lib::is_coro_tag(tag_val) {
-                    crate::stdlib::coroutine_lib::call_coro_function(
-                        tag_val,
-                        state,
-                        ra + 3,
-                        nargs,
-                        nresults,
-                    )
-                } else if crate::stdlib::io_lib::is_io_function_tag(tag_val) {
-                    crate::stdlib::io_lib::call_io_function(tag_val, state, ra + 3, nargs, nresults)
-                } else if crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
+                let result = if crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
                     crate::stdlib::io_lib::call_lines_iterator(
                         tag_val,
                         state,
@@ -5326,16 +5306,11 @@ impl VmExecutor {
                         nargs,
                         nresults,
                     )
-                } else if crate::stdlib::coroutine_lib::is_wrap_call_tag(tag_val) {
-                    crate::stdlib::coroutine_lib::call_wrap_call(
-                        tag_val,
-                        state,
-                        ra + 3,
-                        nargs,
-                        nresults,
-                    )
                 } else {
-                    Ok(())
+                    Err(VmError::RuntimeError(format!(
+                        "attempt to call a non-function value (tag={})",
+                        tag_val
+                    )))
                 };
                 match result {
                     Ok(()) => {
@@ -5860,6 +5835,7 @@ impl VmExecutor {
                             TValue::LClosure(_)
                             | TValue::LCFn(_)
                             | TValue::CClosure(_)
+                            | TValue::BuiltinFn(_)
                             | TValue::LightUserData(_) => {
                                 return Self::call_index_metamethod(
                                     state,
@@ -5903,6 +5879,7 @@ impl VmExecutor {
                             TValue::LClosure(_)
                             | TValue::LCFn(_)
                             | TValue::CClosure(_)
+                            | TValue::BuiltinFn(_)
                             | TValue::LightUserData(_) => {
                                 // __index 是函数: 调用 __index(obj, key)
                                 return Self::call_index_metamethod(
@@ -6035,6 +6012,7 @@ impl VmExecutor {
                             TValue::LClosure(_)
                             | TValue::LCFn(_)
                             | TValue::CClosure(_)
+                            | TValue::BuiltinFn(_)
                             | TValue::LightUserData(_) => {
                                 // __newindex 是函数: 调用 __newindex(table, key, val) (可能 yield)
                                 crate::tm::call_tm(
@@ -6096,6 +6074,7 @@ impl VmExecutor {
                                 TValue::LClosure(_)
                                 | TValue::LCFn(_)
                                 | TValue::CClosure(_)
+                                | TValue::BuiltinFn(_)
                                 | TValue::LightUserData(_) => {
                                     // __newindex 是函数: 调用 (可能 yield)
                                     crate::tm::call_tm(

@@ -13,7 +13,7 @@
 //! - 提供常量: pi, huge, maxinteger, mininteger
 
 use crate::execute::VmError;
-use crate::objects::{NilKind, TValue};
+use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
 use crate::table::Table;
 
@@ -38,70 +38,7 @@ pub const MIN_INTEGER: i64 = i64::MIN;
 // ============================================================================
 // 标签 1-19: 基础库
 // 标签 100+: 字符串库
-// 标签 200+: 数学库
-
-pub const MATH_ABS: usize = 200;
-pub const MATH_ACOS: usize = 201;
-pub const MATH_ASIN: usize = 202;
-pub const MATH_ATAN: usize = 203;
-pub const MATH_CEIL: usize = 204;
-pub const MATH_COS: usize = 205;
-pub const MATH_DEG: usize = 206;
-pub const MATH_EXP: usize = 207;
-pub const MATH_TOINTEGER: usize = 208;
-pub const MATH_FLOOR: usize = 209;
-pub const MATH_FMOD: usize = 210;
-pub const MATH_FREXP: usize = 211;
-pub const MATH_ULT: usize = 212;
-pub const MATH_LDEXP: usize = 213;
-pub const MATH_LOG: usize = 214;
-pub const MATH_MAX: usize = 215;
-pub const MATH_MIN: usize = 216;
-pub const MATH_MODF: usize = 217;
-pub const MATH_RAD: usize = 218;
-pub const MATH_SIN: usize = 219;
-pub const MATH_SQRT: usize = 220;
-pub const MATH_TAN: usize = 221;
-pub const MATH_TYPE: usize = 222;
-pub const MATH_RANDOM: usize = 223;
-pub const MATH_RANDOMSEED: usize = 224;
-
-/// 数学库标签范围: [200, 300)
-pub fn is_math_tag(tag: usize) -> bool {
-    (200..300).contains(&tag)
-}
-
-/// 将 math 库函数 tag 映射到函数名（用于 traceback）
-pub fn math_function_name(tag: usize) -> Option<&'static str> {
-    match tag {
-        MATH_ABS => Some("abs"),
-        MATH_ACOS => Some("acos"),
-        MATH_ASIN => Some("asin"),
-        MATH_ATAN => Some("atan"),
-        MATH_CEIL => Some("ceil"),
-        MATH_COS => Some("cos"),
-        MATH_DEG => Some("deg"),
-        MATH_EXP => Some("exp"),
-        MATH_TOINTEGER => Some("tointeger"),
-        MATH_FLOOR => Some("floor"),
-        MATH_FMOD => Some("fmod"),
-        MATH_FREXP => Some("frexp"),
-        MATH_ULT => Some("ult"),
-        MATH_LDEXP => Some("ldexp"),
-        MATH_LOG => Some("log"),
-        MATH_MAX => Some("max"),
-        MATH_MIN => Some("min"),
-        MATH_MODF => Some("modf"),
-        MATH_RAD => Some("rad"),
-        MATH_SIN => Some("sin"),
-        MATH_SQRT => Some("sqrt"),
-        MATH_TAN => Some("tan"),
-        MATH_TYPE => Some("type"),
-        MATH_RANDOM => Some("random"),
-        MATH_RANDOMSEED => Some("randomseed"),
-        _ => None,
-    }
-}
+// 标签 200+: 数学库（已迁移到 BuiltinFn，不再使用 tag）
 
 // ============================================================================
 // 纯函数实现 (无状态, 可独立测试)
@@ -708,64 +645,7 @@ fn get_int_arg(state: &LuaState, a: usize, idx: usize, fname: &str) -> Result<i6
 }
 
 // ============================================================================
-// 派发函数 — 从 execute.rs 的 op_call 调用
-// ============================================================================
-
-/// 数学库函数派发
-///
-/// 从 execute.rs 的 op_call 或 op_tailcall 调用,
-/// 当 LightUserData 标签在 [200, 300) 范围内时。
-pub fn call_math_function(
-    tag: usize,
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
-    // 设置当前 C 函数名（用于 traceback）
-    let prev_c_func = state.last_c_function.take();
-    state.last_c_function = math_function_name(tag).map(|s| s.to_string());
-
-    let result = match tag {
-        MATH_ABS => call_abs(state, a, nargs, nresults),
-        MATH_SIN => call_simple_unary(state, a, nargs, nresults, math_sin, "sin"),
-        MATH_COS => call_simple_unary(state, a, nargs, nresults, math_cos, "cos"),
-        MATH_TAN => call_simple_unary(state, a, nargs, nresults, math_tan, "tan"),
-        MATH_ASIN => call_simple_unary(state, a, nargs, nresults, math_asin, "asin"),
-        MATH_ACOS => call_simple_unary(state, a, nargs, nresults, math_acos, "acos"),
-        MATH_ATAN => call_atan(state, a, nargs, nresults),
-        MATH_DEG => call_simple_unary(state, a, nargs, nresults, math_deg, "deg"),
-        MATH_RAD => call_simple_unary(state, a, nargs, nresults, math_rad, "rad"),
-        MATH_EXP => call_simple_unary(state, a, nargs, nresults, math_exp, "exp"),
-        MATH_SQRT => call_simple_unary(state, a, nargs, nresults, math_sqrt, "sqrt"),
-        MATH_LOG => call_log(state, a, nargs, nresults),
-        MATH_FLOOR => call_floor(state, a, nargs, nresults),
-        MATH_CEIL => call_ceil(state, a, nargs, nresults),
-        MATH_FMOD => call_fmod(state, a, nargs, nresults),
-        MATH_MODF => call_modf(state, a, nargs, nresults),
-        MATH_TOINTEGER => call_tointeger(state, a, nargs, nresults),
-        MATH_ULT => call_ult(state, a, nargs, nresults),
-        MATH_FREXP => call_frexp(state, a, nargs, nresults),
-        MATH_LDEXP => call_ldexp(state, a, nargs, nresults),
-        MATH_MIN => call_min(state, a, nargs, nresults),
-        MATH_MAX => call_max(state, a, nargs, nresults),
-        MATH_TYPE => call_type(state, a, nargs, nresults),
-        MATH_RANDOM => call_random(state, a, nargs, nresults),
-        MATH_RANDOMSEED => call_randomseed(state, a, nargs, nresults),
-        _ => Err(VmError::RuntimeError(format!(
-            "unknown math function tag: {}",
-            tag
-        ))),
-    };
-
-    if result.is_ok() {
-        state.last_c_function = prev_c_func;
-    }
-    result
-}
-
-// ============================================================================
-// 各函数的派发实现
+// 各函数的派发实现（作为 BuiltinFnPtr 注册到 math 表）
 // ============================================================================
 
 /// math.abs(v) — 对应 C 的 math_abs
@@ -805,6 +685,35 @@ fn call_simple_unary(
     let result = f(x);
     push_single_result(state, a, nresults, TValue::Float(result));
     Ok(())
+}
+
+// 简单一元函数的独立包装（作为 BuiltinFnPtr 注册）
+fn call_sin(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+    call_simple_unary(state, a, nargs, nresults, math_sin, "sin")
+}
+fn call_cos(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+    call_simple_unary(state, a, nargs, nresults, math_cos, "cos")
+}
+fn call_tan(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+    call_simple_unary(state, a, nargs, nresults, math_tan, "tan")
+}
+fn call_asin(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+    call_simple_unary(state, a, nargs, nresults, math_asin, "asin")
+}
+fn call_acos(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+    call_simple_unary(state, a, nargs, nresults, math_acos, "acos")
+}
+fn call_deg(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+    call_simple_unary(state, a, nargs, nresults, math_deg, "deg")
+}
+fn call_rad(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+    call_simple_unary(state, a, nargs, nresults, math_rad, "rad")
+}
+fn call_exp(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+    call_simple_unary(state, a, nargs, nresults, math_exp, "exp")
+}
+fn call_sqrt(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+    call_simple_unary(state, a, nargs, nresults, math_sqrt, "sqrt")
 }
 
 /// math.atan(y [, x]) — 对应 C 的 math_atan
@@ -1115,39 +1024,40 @@ fn call_randomseed(
 /// 2. 设置常量: pi, huge, maxinteger, mininteger
 /// 3. 初始化随机数生成器状态
 pub fn open_math_lib(state: &mut LuaState) {
-    let mut lib = Table::new();
+    let lib = Table::new();
 
-    // 注册所有数学库函数 (使用 LightUserData 标签)
-    let register = |lib: &mut Table, name: &str, tag: usize| {
-        let key = TValue::Str(state.intern_str(name));
-        lib.set(key, TValue::LightUserData(tag as *mut std::ffi::c_void));
+    // 注册所有数学库函数 (使用 BuiltinFn 函数指针)
+    let register = |lib: &Table, name: &'static std::ffi::CStr, func: crate::objects::BuiltinFnPtr| {
+        let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
+        let name_ptr = name.as_ptr() as *const u8;
+        lib.set(key, TValue::BuiltinFn(BuiltinFn { func, name: name_ptr }));
     };
 
-    register(&mut lib, "abs", MATH_ABS);
-    register(&mut lib, "acos", MATH_ACOS);
-    register(&mut lib, "asin", MATH_ASIN);
-    register(&mut lib, "atan", MATH_ATAN);
-    register(&mut lib, "ceil", MATH_CEIL);
-    register(&mut lib, "cos", MATH_COS);
-    register(&mut lib, "deg", MATH_DEG);
-    register(&mut lib, "exp", MATH_EXP);
-    register(&mut lib, "tointeger", MATH_TOINTEGER);
-    register(&mut lib, "floor", MATH_FLOOR);
-    register(&mut lib, "fmod", MATH_FMOD);
-    register(&mut lib, "frexp", MATH_FREXP);
-    register(&mut lib, "ult", MATH_ULT);
-    register(&mut lib, "ldexp", MATH_LDEXP);
-    register(&mut lib, "log", MATH_LOG);
-    register(&mut lib, "max", MATH_MAX);
-    register(&mut lib, "min", MATH_MIN);
-    register(&mut lib, "modf", MATH_MODF);
-    register(&mut lib, "rad", MATH_RAD);
-    register(&mut lib, "sin", MATH_SIN);
-    register(&mut lib, "sqrt", MATH_SQRT);
-    register(&mut lib, "tan", MATH_TAN);
-    register(&mut lib, "type", MATH_TYPE);
-    register(&mut lib, "random", MATH_RANDOM);
-    register(&mut lib, "randomseed", MATH_RANDOMSEED);
+    register(&lib, c"abs", call_abs);
+    register(&lib, c"acos", call_acos);
+    register(&lib, c"asin", call_asin);
+    register(&lib, c"atan", call_atan);
+    register(&lib, c"ceil", call_ceil);
+    register(&lib, c"cos", call_cos);
+    register(&lib, c"deg", call_deg);
+    register(&lib, c"exp", call_exp);
+    register(&lib, c"tointeger", call_tointeger);
+    register(&lib, c"floor", call_floor);
+    register(&lib, c"fmod", call_fmod);
+    register(&lib, c"frexp", call_frexp);
+    register(&lib, c"ult", call_ult);
+    register(&lib, c"ldexp", call_ldexp);
+    register(&lib, c"log", call_log);
+    register(&lib, c"max", call_max);
+    register(&lib, c"min", call_min);
+    register(&lib, c"modf", call_modf);
+    register(&lib, c"rad", call_rad);
+    register(&lib, c"sin", call_sin);
+    register(&lib, c"sqrt", call_sqrt);
+    register(&lib, c"tan", call_tan);
+    register(&lib, c"type", call_type);
+    register(&lib, c"random", call_random);
+    register(&lib, c"randomseed", call_randomseed);
 
     // 设置常量 (对应 C 的 lua_pushnumber/lua_pushinteger + lua_setfield)
     lib.set(TValue::Str(state.intern_str("pi")), TValue::Float(PI));
@@ -1746,33 +1656,8 @@ mod tests {
     }
 
     // ========================================================================
-    // is_math_tag 测试
+    // is_math_tag/math_function_name 测试已删除（math 库已迁移到 BuiltinFn）
     // ========================================================================
-
-    #[test]
-    fn test_is_math_tag() {
-        assert!(is_math_tag(MATH_ABS));
-        assert!(is_math_tag(MATH_RANDOM));
-        assert!(is_math_tag(MATH_RANDOMSEED));
-        assert!(is_math_tag(299));
-        assert!(!is_math_tag(199));
-        assert!(!is_math_tag(300));
-        assert!(!is_math_tag(0));
-        assert!(!is_math_tag(100));
-    }
-
-    // ========================================================================
-    // math_function_name 测试
-    // ========================================================================
-
-    #[test]
-    fn test_math_function_name() {
-        assert_eq!(math_function_name(MATH_ABS), Some("abs"));
-        assert_eq!(math_function_name(MATH_SIN), Some("sin"));
-        assert_eq!(math_function_name(MATH_RANDOM), Some("random"));
-        assert_eq!(math_function_name(MATH_RANDOMSEED), Some("randomseed"));
-        assert_eq!(math_function_name(999), None);
-    }
 
     // ========================================================================
     // open_math_lib 测试
@@ -1875,231 +1760,6 @@ mod tests {
     }
 
     // ========================================================================
-    // call_math_function 测试
+    // call_math_function 测试已删除（math 库已迁移到 BuiltinFn）
     // ========================================================================
-
-    #[test]
-    fn test_call_math_function_abs() {
-        let mut state = LuaState::new();
-        state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(MATH_ABS as *mut std::ffi::c_void));
-        state.stack.push(TValue::Integer(-42));
-        call_math_function(MATH_ABS, &mut state, 0, 1, 1).unwrap();
-        assert_eq!(state.stack.len(), 1);
-        match &state.stack[0] {
-            TValue::Integer(n) => assert_eq!(*n, 42),
-            _ => panic!("expected integer 42"),
-        }
-    }
-
-    #[test]
-    fn test_call_math_function_floor() {
-        let mut state = LuaState::new();
-        state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(MATH_FLOOR as *mut std::ffi::c_void));
-        state.stack.push(TValue::Float(3.7));
-        call_math_function(MATH_FLOOR, &mut state, 0, 1, 1).unwrap();
-        match &state.stack[0] {
-            TValue::Integer(n) => assert_eq!(*n, 3),
-            _ => panic!("expected integer 3"),
-        }
-    }
-
-    #[test]
-    fn test_call_math_function_max() {
-        let mut state = LuaState::new();
-        state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(MATH_MAX as *mut std::ffi::c_void));
-        state.stack.push(TValue::Integer(1));
-        state.stack.push(TValue::Integer(5));
-        state.stack.push(TValue::Integer(3));
-        call_math_function(MATH_MAX, &mut state, 0, 3, 1).unwrap();
-        match &state.stack[0] {
-            TValue::Integer(n) => assert_eq!(*n, 5),
-            _ => panic!("expected integer 5"),
-        }
-    }
-
-    #[test]
-    fn test_call_math_function_min() {
-        let mut state = LuaState::new();
-        state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(MATH_MIN as *mut std::ffi::c_void));
-        state.stack.push(TValue::Integer(1));
-        state.stack.push(TValue::Integer(5));
-        state.stack.push(TValue::Integer(3));
-        call_math_function(MATH_MIN, &mut state, 0, 3, 1).unwrap();
-        match &state.stack[0] {
-            TValue::Integer(n) => assert_eq!(*n, 1),
-            _ => panic!("expected integer 1"),
-        }
-    }
-
-    #[test]
-    fn test_call_math_function_type() {
-        let mut state = LuaState::new();
-        state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(MATH_TYPE as *mut std::ffi::c_void));
-        state.stack.push(TValue::Integer(42));
-        call_math_function(MATH_TYPE, &mut state, 0, 1, 1).unwrap();
-        match &state.stack[0] {
-            TValue::Str(s) => assert_eq!(s.as_str(), "integer"),
-            _ => panic!("expected string 'integer'"),
-        }
-    }
-
-    #[test]
-    fn test_call_math_function_type_float() {
-        let mut state = LuaState::new();
-        state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(MATH_TYPE as *mut std::ffi::c_void));
-        state.stack.push(TValue::Float(3.14));
-        call_math_function(MATH_TYPE, &mut state, 0, 1, 1).unwrap();
-        match &state.stack[0] {
-            TValue::Str(s) => assert_eq!(s.as_str(), "float"),
-            _ => panic!("expected string 'float'"),
-        }
-    }
-
-    #[test]
-    fn test_call_math_function_tointeger() {
-        let mut state = LuaState::new();
-        state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            MATH_TOINTEGER as *mut std::ffi::c_void,
-        ));
-        state.stack.push(TValue::Float(42.0));
-        call_math_function(MATH_TOINTEGER, &mut state, 0, 1, 1).unwrap();
-        match &state.stack[0] {
-            TValue::Integer(n) => assert_eq!(*n, 42),
-            _ => panic!("expected integer 42"),
-        }
-    }
-
-    #[test]
-    fn test_call_math_function_tointeger_fail() {
-        let mut state = LuaState::new();
-        state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            MATH_TOINTEGER as *mut std::ffi::c_void,
-        ));
-        state.stack.push(TValue::Float(42.5));
-        call_math_function(MATH_TOINTEGER, &mut state, 0, 1, 1).unwrap();
-        assert!(matches!(state.stack[0], TValue::Nil(_)));
-    }
-
-    #[test]
-    fn test_call_math_function_ult() {
-        let mut state = LuaState::new();
-        state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(MATH_ULT as *mut std::ffi::c_void));
-        state.stack.push(TValue::Integer(1));
-        state.stack.push(TValue::Integer(2));
-        call_math_function(MATH_ULT, &mut state, 0, 2, 1).unwrap();
-        match &state.stack[0] {
-            TValue::Boolean(b) => assert!(*b),
-            _ => panic!("expected boolean true"),
-        }
-    }
-
-    #[test]
-    fn test_call_math_function_modf() {
-        let mut state = LuaState::new();
-        state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(MATH_MODF as *mut std::ffi::c_void));
-        state.stack.push(TValue::Float(3.14));
-        call_math_function(MATH_MODF, &mut state, 0, 1, -1).unwrap();
-        assert_eq!(state.stack.len(), 2);
-        match &state.stack[0] {
-            TValue::Integer(n) => assert_eq!(*n, 3),
-            _ => panic!("expected integer 3"),
-        }
-        match &state.stack[1] {
-            TValue::Float(f) => assert!((f - 0.14).abs() < 1e-15),
-            _ => panic!("expected float 0.14"),
-        }
-    }
-
-    #[test]
-    fn test_call_math_function_frexp() {
-        let mut state = LuaState::new();
-        state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(MATH_FREXP as *mut std::ffi::c_void));
-        state.stack.push(TValue::Float(4.0));
-        call_math_function(MATH_FREXP, &mut state, 0, 1, -1).unwrap();
-        assert_eq!(state.stack.len(), 2);
-        match &state.stack[0] {
-            TValue::Float(f) => assert!((f - 0.5).abs() < 1e-15),
-            _ => panic!("expected float 0.5"),
-        }
-        match &state.stack[1] {
-            TValue::Integer(n) => assert_eq!(*n, 3),
-            _ => panic!("expected integer 3"),
-        }
-    }
-
-    #[test]
-    fn test_call_math_function_randomseed() {
-        let mut state = LuaState::new();
-        open_math_lib(&mut state);
-        state.stack.clear();
-        state.stack.push(TValue::LightUserData(
-            MATH_RANDOMSEED as *mut std::ffi::c_void,
-        ));
-        state.stack.push(TValue::Integer(42));
-        call_math_function(MATH_RANDOMSEED, &mut state, 0, 1, -1).unwrap();
-        assert_eq!(state.stack.len(), 2);
-        match &state.stack[0] {
-            TValue::Integer(n) => assert_eq!(*n, 42),
-            _ => panic!("expected integer 42"),
-        }
-        match &state.stack[1] {
-            TValue::Integer(n) => assert_eq!(*n, 0),
-            _ => panic!("expected integer 0"),
-        }
-    }
-
-    #[test]
-    fn test_call_math_function_random() {
-        let mut state = LuaState::new();
-        open_math_lib(&mut state);
-        state.stack.clear();
-        state
-            .stack
-            .push(TValue::LightUserData(MATH_RANDOM as *mut std::ffi::c_void));
-        state.stack.push(TValue::Integer(1));
-        state.stack.push(TValue::Integer(100));
-        call_math_function(MATH_RANDOM, &mut state, 0, 2, 1).unwrap();
-        match &state.stack[0] {
-            TValue::Integer(n) => {
-                assert!(*n >= 1 && *n <= 100, "random(1, 100) returned {}", n);
-            }
-            _ => panic!("expected integer result"),
-        }
-    }
-
-    #[test]
-    fn test_call_math_function_unknown_tag() {
-        let mut state = LuaState::new();
-        let result = call_math_function(999, &mut state, 0, 0, 0);
-        assert!(result.is_err());
-    }
 }

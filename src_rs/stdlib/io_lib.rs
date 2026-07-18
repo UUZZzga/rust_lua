@@ -9,12 +9,13 @@
 //! - 实现 file:read / file:write / file:seek / file:lines / file:flush /
 //!   file:setvbuf / file:close
 //!
-//! ## 标签分配
-//! - 标签 700-702: stdin/stdout/stderr 占位符值（非函数）
-//! - 标签 800-819: io 库函数和文件方法
+//! ## 迁移说明
+//! - 已从 LightUserData(tag) 迁移到 BuiltinFn 函数指针方案
+//! - io.lines / file:lines 返回的迭代器仍使用极大值 tag (>= 0x1000_0000_0000_0000)
+//!   因为 BuiltinFn 是 16 字节，无法存储迭代器状态
 
 use crate::execute::VmError;
-use crate::objects::{LuaType, NilKind, TValue};
+use crate::objects::{BuiltinFn, LuaType, NilKind, TValue};
 use crate::state::LuaState;
 use crate::table::Table;
 use std::io::Write;
@@ -61,68 +62,12 @@ pub fn is_io_tag(tag: usize) -> bool {
 }
 
 // ============================================================================
-// 函数标签
+// 函数标签 (已迁移到 BuiltinFn，不再使用 LightUserData tag)
 // ============================================================================
-
-pub const IO_WRITE: usize = 800;
-pub const IO_OUTPUT: usize = 801;
-pub const IO_CLOSE: usize = 802;
-pub const IO_INPUT: usize = 803;
-// FILE* 元方法标签
-pub const IO_FILE_GC: usize = 804;
-pub const IO_FILE_CLOSE: usize = 805;
-pub const IO_FILE_TOSTRING: usize = 806;
-// FILE* 方法表标签 (对应 C 的 meth: file:close 等)
-pub const IO_FILE_CLOSE_METHOD: usize = 807;
-pub const IO_TYPE: usize = 808;
-pub const IO_OPEN: usize = 809;
-pub const IO_FILE_READ: usize = 810;
-pub const IO_FILE_WRITE: usize = 811;
-pub const IO_FILE_SEEK: usize = 812;
-pub const IO_FILE_LINES: usize = 813;
-pub const IO_FILE_FLUSH: usize = 814;
-pub const IO_FILE_SETVBUF: usize = 815;
-pub const IO_READ: usize = 816;
-pub const IO_LINES: usize = 817;
-pub const IO_FLUSH: usize = 818;
-pub const IO_TMPFILE: usize = 819;
-pub const IO_POPEN: usize = 820;
+// 标签 800+: I/O 库函数和文件方法（已迁移到 BuiltinFn，不再使用 tag）
 
 /// io.lines / file:lines 的最大参数数量（对应 C 的 MAXARGLINE）
 const MAXARGLINE: usize = 250;
-
-/// I/O 库函数标签范围: [800, 821)
-pub fn is_io_function_tag(tag: usize) -> bool {
-    (800..821).contains(&tag)
-}
-
-/// 将 io 库函数 tag 映射到函数名（用于 traceback）
-pub fn io_function_name(tag: usize) -> Option<&'static str> {
-    match tag {
-        IO_WRITE => Some("write"),
-        IO_OUTPUT => Some("output"),
-        IO_CLOSE => Some("close"),
-        IO_INPUT => Some("input"),
-        IO_FILE_GC => Some("__gc"),
-        IO_FILE_CLOSE => Some("__close"),
-        IO_FILE_TOSTRING => Some("__tostring"),
-        IO_FILE_CLOSE_METHOD => Some("close"),
-        IO_TYPE => Some("type"),
-        IO_OPEN => Some("open"),
-        IO_FILE_READ => Some("read"),
-        IO_FILE_WRITE => Some("write"),
-        IO_FILE_SEEK => Some("seek"),
-        IO_FILE_LINES => Some("lines"),
-        IO_FILE_FLUSH => Some("flush"),
-        IO_FILE_SETVBUF => Some("setvbuf"),
-        IO_READ => Some("read"),
-        IO_LINES => Some("lines"),
-        IO_FLUSH => Some("flush"),
-        IO_TMPFILE => Some("tmpfile"),
-        IO_POPEN => Some("popen"),
-        _ => None,
-    }
-}
 
 // ============================================================================
 // 栈操作辅助函数
@@ -2226,102 +2171,41 @@ fn call_file_tostring(
 }
 
 // ============================================================================
-// 派发函数
-// ============================================================================
-
-pub fn call_io_function(
-    tag: usize,
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
-    let prev_c_func = state.last_c_function.take();
-    state.last_c_function = io_function_name(tag).map(|s| s.to_string());
-
-    let result = match tag {
-        IO_WRITE => call_io_write(state, a, nargs, nresults),
-        IO_OUTPUT => call_io_output(state, a, nargs, nresults),
-        IO_CLOSE => call_io_close(state, a, nargs, nresults),
-        IO_INPUT => call_io_input(state, a, nargs, nresults),
-        IO_FILE_GC => call_file_gc(state, a, nargs, nresults),
-        IO_FILE_CLOSE => call_file_close(state, a, nargs, nresults),
-        IO_FILE_TOSTRING => call_file_tostring(state, a, nargs, nresults),
-        IO_FILE_CLOSE_METHOD => call_file_close_method(state, a, nargs, nresults),
-        IO_TYPE => call_io_type(state, a, nargs, nresults),
-        IO_OPEN => call_io_open(state, a, nargs, nresults),
-        IO_FILE_READ => call_file_read(state, a, nargs, nresults),
-        IO_FILE_WRITE => call_file_write(state, a, nargs, nresults),
-        IO_FILE_SEEK => call_file_seek(state, a, nargs, nresults),
-        IO_FILE_LINES => call_file_lines(state, a, nargs, nresults),
-        IO_FILE_FLUSH => call_file_flush(state, a, nargs, nresults),
-        IO_FILE_SETVBUF => call_file_setvbuf(state, a, nargs, nresults),
-        IO_READ => call_io_read(state, a, nargs, nresults),
-        IO_LINES => call_io_lines(state, a, nargs, nresults),
-        IO_FLUSH => call_io_flush(state, a, nargs, nresults),
-        IO_TMPFILE => call_io_tmpfile(state, a, nargs, nresults),
-        IO_POPEN => call_io_popen(state, a, nargs, nresults),
-        _ => Ok(()),
-    };
-
-    state.last_c_function = prev_c_func;
-    result
-}
-
-// ============================================================================
 // 打开 I/O 库 — 对应 C 的 luaopen_io
 // ============================================================================
 
 pub fn open_io_lib(state: &mut LuaState) {
     let mut lib = crate::table::Table::new();
 
+    // 注册 BuiltinFn 的辅助闭包：用函数指针 + 名字注册到表
+    // (state 作为参数传入，避免闭包捕获 state 导致借用冲突)
+    let register = |table: &mut crate::table::Table,
+                    state: &LuaState,
+                    name: &'static std::ffi::CStr,
+                    func: crate::objects::BuiltinFnPtr| {
+        let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
+        let name_ptr = name.as_ptr() as *const u8;
+        table.set(key, TValue::BuiltinFn(BuiltinFn { func, name: name_ptr }));
+    };
+
     // 创建 FILE* 元表 (对应 C 的 LUA_FILEHANDLE)
     let mut file_mt = crate::table::Table::new();
     let name_key = TValue::Str(state.intern_str("__name"));
     file_mt.set(name_key, TValue::Str(state.intern_str("FILE*")));
-    file_mt.set(
-        TValue::Str(state.intern_str("__gc")),
-        TValue::LightUserData(IO_FILE_GC as *mut std::ffi::c_void),
-    );
-    file_mt.set(
-        TValue::Str(state.intern_str("__close")),
-        TValue::LightUserData(IO_FILE_CLOSE as *mut std::ffi::c_void),
-    );
-    file_mt.set(
-        TValue::Str(state.intern_str("__tostring")),
-        TValue::LightUserData(IO_FILE_TOSTRING as *mut std::ffi::c_void),
-    );
+    // FILE* 元方法 (用 BuiltinFn 注册)
+    register(&mut file_mt, state, c"__gc", call_file_gc);
+    register(&mut file_mt, state, c"__close", call_file_close);
+    register(&mut file_mt, state, c"__tostring", call_file_tostring);
 
-    // 创建 FILE* 方法表
+    // 创建 FILE* 方法表 (用 BuiltinFn 注册)
     let mut file_methods = crate::table::Table::new();
-    file_methods.set(
-        TValue::Str(state.intern_str("close")),
-        TValue::LightUserData(IO_FILE_CLOSE_METHOD as *mut std::ffi::c_void),
-    );
-    file_methods.set(
-        TValue::Str(state.intern_str("read")),
-        TValue::LightUserData(IO_FILE_READ as *mut std::ffi::c_void),
-    );
-    file_methods.set(
-        TValue::Str(state.intern_str("write")),
-        TValue::LightUserData(IO_FILE_WRITE as *mut std::ffi::c_void),
-    );
-    file_methods.set(
-        TValue::Str(state.intern_str("seek")),
-        TValue::LightUserData(IO_FILE_SEEK as *mut std::ffi::c_void),
-    );
-    file_methods.set(
-        TValue::Str(state.intern_str("lines")),
-        TValue::LightUserData(IO_FILE_LINES as *mut std::ffi::c_void),
-    );
-    file_methods.set(
-        TValue::Str(state.intern_str("flush")),
-        TValue::LightUserData(IO_FILE_FLUSH as *mut std::ffi::c_void),
-    );
-    file_methods.set(
-        TValue::Str(state.intern_str("setvbuf")),
-        TValue::LightUserData(IO_FILE_SETVBUF as *mut std::ffi::c_void),
-    );
+    register(&mut file_methods, state, c"close", call_file_close_method);
+    register(&mut file_methods, state, c"read", call_file_read);
+    register(&mut file_methods, state, c"write", call_file_write);
+    register(&mut file_methods, state, c"seek", call_file_seek);
+    register(&mut file_methods, state, c"lines", call_file_lines);
+    register(&mut file_methods, state, c"flush", call_file_flush);
+    register(&mut file_methods, state, c"setvbuf", call_file_setvbuf);
     file_mt.set(
         TValue::Str(state.intern_str("__index")),
         TValue::Table(file_methods),
@@ -2359,22 +2243,18 @@ pub fn open_io_lib(state: &mut LuaState) {
     let stderr_key = TValue::Str(state.intern_str("stderr"));
     lib.set(stderr_key, stderr_val);
 
-    // 注册 io 库函数
-    let register = |lib: &mut crate::table::Table, state: &mut LuaState, name: &str, tag: usize| {
-        let key = TValue::Str(state.intern_str(name));
-        lib.set(key, TValue::LightUserData(tag as *mut std::ffi::c_void));
-    };
-    register(&mut lib, state, "write", IO_WRITE);
-    register(&mut lib, state, "output", IO_OUTPUT);
-    register(&mut lib, state, "close", IO_CLOSE);
-    register(&mut lib, state, "input", IO_INPUT);
-    register(&mut lib, state, "type", IO_TYPE);
-    register(&mut lib, state, "open", IO_OPEN);
-    register(&mut lib, state, "read", IO_READ);
-    register(&mut lib, state, "lines", IO_LINES);
-    register(&mut lib, state, "flush", IO_FLUSH);
-    register(&mut lib, state, "tmpfile", IO_TMPFILE);
-    register(&mut lib, state, "popen", IO_POPEN);
+    // 注册 io 库函数 (用 BuiltinFn 注册)
+    register(&mut lib, state, c"write", call_io_write);
+    register(&mut lib, state, c"output", call_io_output);
+    register(&mut lib, state, c"close", call_io_close);
+    register(&mut lib, state, c"input", call_io_input);
+    register(&mut lib, state, c"type", call_io_type);
+    register(&mut lib, state, c"open", call_io_open);
+    register(&mut lib, state, c"read", call_io_read);
+    register(&mut lib, state, c"lines", call_io_lines);
+    register(&mut lib, state, c"flush", call_io_flush);
+    register(&mut lib, state, c"tmpfile", call_io_tmpfile);
+    register(&mut lib, state, c"popen", call_io_popen);
 
     let key = TValue::Str(state.intern_str("io"));
     state.globals.set(key, TValue::Table(lib));

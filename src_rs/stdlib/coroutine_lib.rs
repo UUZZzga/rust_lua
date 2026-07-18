@@ -8,12 +8,11 @@
 //!   coroutine.status, coroutine.wrap, coroutine.running, coroutine.isyieldable
 //!
 //! ## 标签分配
-//! - 标签 700+: Coroutine 库
+//! - 标签 700+: Coroutine 库（已迁移到 BuiltinFn，不再使用 tag）
+//! - 标签 710+: coroutine.wrap 返回的函数（仍用 tag，因 wrap 机制需要 side table）
 
 use crate::execute::{VmError, VmExecutor, VmResult};
-use crate::objects::{
-    LuaThread, NilKind, TValue, Table, ThreadContext, ThreadStatus, UpVal, UpValRef,
-};
+use crate::objects::{BuiltinFn, LuaThread, NilKind, TValue, Table, ThreadContext, ThreadStatus, UpVal, UpValRef};
 use crate::state::LuaState;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -21,30 +20,16 @@ use std::rc::Rc;
 // ============================================================================
 // 函数标签 (LightUserData 占位符值)
 // ============================================================================
-
-pub const CORO_CREATE: usize = 700;
-pub const CORO_ISYIELDABLE: usize = 701;
-pub const CORO_RESUME: usize = 702;
-pub const CORO_RUNNING: usize = 703;
-pub const CORO_STATUS: usize = 704;
-pub const CORO_WRAP: usize = 705;
-pub const CORO_YIELD: usize = 706;
-pub const CORO_CLOSE: usize = 707;
+// Coroutine 库函数（create/resume/yield 等）已迁移到 BuiltinFn，不再使用 tag。
+// 仅 coroutine.wrap 返回的函数仍用 tag（因 wrap 机制需要 side table 存储 ThreadContext）。
 
 /// coroutine.wrap 返回的函数的标签基准
 /// 标签 710+idx 对应 state.wrap_coros[idx]
+///
+/// 注意：coroutine.wrap 返回的是 Table（带 WRAP_MARKER 元表），
+/// 由 `get_wrap_idx()` 检测后计算 tag = CORO_WRAP_CALL_BASE + idx。
+/// 不存在 LightUserData(710+idx) 形式的 wrap 函数，因此无需 is_wrap_call_tag。
 pub const CORO_WRAP_CALL_BASE: usize = 710;
-
-/// Coroutine 库标签范围: [700, 710)
-pub fn is_coro_tag(tag: usize) -> bool {
-    (700..710).contains(&tag)
-}
-// 注: CORO_CLOSE=707 仍在 [700,710) 范围内
-
-/// 检查是否为 coroutine.wrap 返回的函数调用标签
-pub fn is_wrap_call_tag(tag: usize) -> bool {
-    tag >= CORO_WRAP_CALL_BASE
-}
 
 /// 元表中标记 wrap Table 的键（用 LightUserData 固定指针值避免字符串 interning）
 pub const WRAP_MARKER: *mut std::ffi::c_void = 0x77726170 as *mut std::ffi::c_void;
@@ -66,21 +51,6 @@ pub fn get_wrap_idx(val: &TValue) -> Option<usize> {
         }
     } else {
         None
-    }
-}
-
-/// 将 coroutine 库函数 tag 映射到函数名（用于 traceback）
-pub fn coro_function_name(tag: usize) -> Option<&'static str> {
-    match tag {
-        CORO_CREATE => Some("create"),
-        CORO_ISYIELDABLE => Some("isyieldable"),
-        CORO_RESUME => Some("resume"),
-        CORO_RUNNING => Some("running"),
-        CORO_STATUS => Some("status"),
-        CORO_WRAP => Some("wrap"),
-        CORO_YIELD => Some("yield"),
-        CORO_CLOSE => Some("close"),
-        _ => None,
     }
 }
 
@@ -969,6 +939,14 @@ fn sync_yield_upvals_back(state: &mut LuaState, origins: &[(UpValRef, usize)]) {
 // coroutine.create(f) — 对应 C 的 lua_cocreate
 // ============================================================================
 
+/// 判断值是否可作为协程主体调用：
+/// - 真正的函数（LClosure/CClosure/LCFn/BuiltinFn）
+/// - LightUserData 形式的内置函数（tag 落入内置范围）
+/// - 带 __call 元方法的 Table
+fn is_callable(v: &TValue) -> bool {
+    v.is_callable() || matches!(v, TValue::Table(_))
+}
+
 fn call_create(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     if nargs < 1 {
         return Err(VmError::RuntimeError(
@@ -976,7 +954,7 @@ fn call_create(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         ));
     }
     let func = get_arg(state, a, 0);
-    if !func.is_function() && !matches!(func, TValue::Table(_)) {
+    if !is_callable(&func) {
         return Err(VmError::RuntimeError(format!(
             "bad argument #1 to 'create' (function expected, got {})",
             func.ty()
@@ -1570,14 +1548,15 @@ fn call_resume(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
             // 检查协程体是否为 pcall/xpcall（C 函数提供错误保护）
             // 第二次 resume 时这些 C 函数的保护丢失，但语义上错误应被它们捕获，
             // 协程正常返回 (false, err) 而非报错。
+            // base 库已迁移到 BuiltinFn，通过比较函数指针判定 pcall/xpcall。
             let body_is_protective = thread
                 .function
                 .as_ref()
                 .map(|f| {
-                    if let TValue::LightUserData(ptr) = f.as_ref() {
-                        let tag = *ptr as usize;
-                        tag == crate::stdlib::base_lib::BASE_PCALL
-                            || tag == crate::stdlib::base_lib::BASE_XPCALL
+                    if let TValue::BuiltinFn(bf) = f.as_ref() {
+                        let func_ptr = bf.func as *const () as usize;
+                        func_ptr == crate::stdlib::base_lib::call_pcall as *const () as usize
+                            || func_ptr == crate::stdlib::base_lib::call_xpcall as *const () as usize
                     } else {
                         false
                     }
@@ -1738,8 +1717,8 @@ fn setup_first_resume(
             nextraargs: 0,
             is_tailcall: false,
         }];
-    } else if func.is_function() || matches!(func, TValue::Table(_)) {
-        // C 函数 (LightUserData/CClosure/LCFn) 或带 __call 元方法的 Table:
+    } else if is_callable(&func) {
+        // C 函数 (LightUserData/CClosure/LCFn/BuiltinFn) 或带 __call 元方法的 Table:
         // 创建 CALL + RETURN 序列
         // 栈布局: stack[0] = func, stack[1] = func (寄存器 0), stack[2..] = 参数
         // CALL 0 nargs+1 0 — 调用寄存器 0 的函数, MULTRET
@@ -1910,7 +1889,7 @@ fn call_wrap(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
         ));
     }
     let func = get_arg(state, a, 0);
-    if !func.is_function() && !matches!(func, TValue::Table(_)) {
+    if !is_callable(&func) {
         return Err(VmError::RuntimeError(format!(
             "bad argument #1 to 'wrap' (function expected, got {})",
             func.ty()
@@ -2299,49 +2278,31 @@ pub fn call_wrap_call(
 }
 
 // ============================================================================
-// 派发函数
-// ============================================================================
-
-pub fn call_coro_function(
-    tag: usize,
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
-    match tag {
-        CORO_CREATE => call_create(state, a, nargs, nresults),
-        CORO_ISYIELDABLE => call_isyieldable(state, a, nargs, nresults),
-        CORO_RESUME => call_resume(state, a, nargs, nresults),
-        CORO_RUNNING => call_running(state, a, nargs, nresults),
-        CORO_STATUS => call_status(state, a, nargs, nresults),
-        CORO_WRAP => call_wrap(state, a, nargs, nresults),
-        CORO_YIELD => call_yield(state, a, nargs, nresults),
-        CORO_CLOSE => call_close(state, a, nargs, nresults),
-        _ => Ok(()),
-    }
-}
-
-// ============================================================================
 // 打开 Coroutine 库 — 对应 C 的 luaopen_coroutine
 // ============================================================================
 
 pub fn open_coroutine_lib(state: &mut LuaState) {
     let mut lib = crate::table::Table::new();
 
-    let register = |lib: &mut crate::table::Table, name: &str, tag: usize| {
-        let key = TValue::Str(state.intern_str(name));
-        lib.set(key, TValue::LightUserData(tag as *mut std::ffi::c_void));
+    // 注册 BuiltinFn 的辅助闭包：用函数指针 + 名字注册到表
+    // (state 作为参数传入，避免闭包捕获 state 导致借用冲突)
+    let register = |lib: &mut crate::table::Table,
+                    state: &LuaState,
+                    name: &'static std::ffi::CStr,
+                    func: crate::objects::BuiltinFnPtr| {
+        let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
+        let name_ptr = name.as_ptr() as *const u8;
+        lib.set(key, TValue::BuiltinFn(BuiltinFn { func, name: name_ptr }));
     };
 
-    register(&mut lib, "create", CORO_CREATE);
-    register(&mut lib, "isyieldable", CORO_ISYIELDABLE);
-    register(&mut lib, "resume", CORO_RESUME);
-    register(&mut lib, "running", CORO_RUNNING);
-    register(&mut lib, "status", CORO_STATUS);
-    register(&mut lib, "wrap", CORO_WRAP);
-    register(&mut lib, "yield", CORO_YIELD);
-    register(&mut lib, "close", CORO_CLOSE);
+    register(&mut lib, state, c"create", call_create);
+    register(&mut lib, state, c"isyieldable", call_isyieldable);
+    register(&mut lib, state, c"resume", call_resume);
+    register(&mut lib, state, c"running", call_running);
+    register(&mut lib, state, c"status", call_status);
+    register(&mut lib, state, c"wrap", call_wrap);
+    register(&mut lib, state, c"yield", call_yield);
+    register(&mut lib, state, c"close", call_close);
 
     let key = TValue::Str(state.intern_str("coroutine"));
     state.globals.set(key, TValue::Table(lib));

@@ -1277,54 +1277,9 @@ fn test_rust_api_open_math_lib() {
 }
 
 #[test]
-fn test_rust_api_call_math_function() {
-    let mut state = LuaState::new();
-    math_lib::open_math_lib(&mut state);
-
-    // 测试 call_math_function 派发
-    state.stack.clear();
-    state.stack.push(TValue::LightUserData(
-        math_lib::MATH_ABS as *mut std::ffi::c_void,
-    ));
-    state.stack.push(TValue::Integer(-42));
-    math_lib::call_math_function(math_lib::MATH_ABS, &mut state, 0, 1, 1).unwrap();
-
-    match &state.stack[0] {
-        TValue::Integer(n) => assert_eq!(*n, 42),
-        _ => panic!("expected integer 42"),
-    }
-}
-
-#[test]
 fn test_rust_api_constants() {
     assert!((math_lib::PI - std::f64::consts::PI).abs() < 1e-15);
     assert!(math_lib::HUGE.is_infinite() && math_lib::HUGE > 0.0);
     assert_eq!(math_lib::MAX_INTEGER, i64::MAX);
     assert_eq!(math_lib::MIN_INTEGER, i64::MIN);
-}
-
-#[test]
-fn test_rust_api_is_math_tag() {
-    assert!(math_lib::is_math_tag(math_lib::MATH_ABS));
-    assert!(math_lib::is_math_tag(math_lib::MATH_RANDOM));
-    assert!(math_lib::is_math_tag(math_lib::MATH_RANDOMSEED));
-    assert!(!math_lib::is_math_tag(199));
-    assert!(!math_lib::is_math_tag(300));
-}
-
-#[test]
-fn test_rust_api_math_function_name() {
-    assert_eq!(
-        math_lib::math_function_name(math_lib::MATH_ABS),
-        Some("abs")
-    );
-    assert_eq!(
-        math_lib::math_function_name(math_lib::MATH_SIN),
-        Some("sin")
-    );
-    assert_eq!(
-        math_lib::math_function_name(math_lib::MATH_RANDOM),
-        Some("random")
-    );
-    assert_eq!(math_lib::math_function_name(999), None);
 }

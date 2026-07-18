@@ -6,53 +6,19 @@
 //! - 注册 os 全局表，包含操作系统相关函数
 //! - 当前实现: os.setlocale
 //!
-//! ## 标签分配
-//! - 标签 600+: OS 库
+//! ## 迁移说明
+//! - 已从 LightUserData(tag) 迁移到 BuiltinFn 函数指针方案
 
 use crate::execute::VmError;
-use crate::objects::{NilKind, TValue};
+use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
 use crate::strings::LuaString;
 use std::ffi::{CStr, CString};
 
 // ============================================================================
-// 函数标签 (LightUserData 占位符值)
+// 函数标签 (已迁移到 BuiltinFn，不再使用 LightUserData tag)
 // ============================================================================
-
-pub const OS_SETLOCALE: usize = 600;
-pub const OS_CLOCK: usize = 601;
-pub const OS_TMPNAME: usize = 602;
-pub const OS_REMOVE: usize = 603;
-pub const OS_GETENV: usize = 604;
-pub const OS_RENAME: usize = 605;
-pub const OS_EXECUTE: usize = 606;
-pub const OS_EXIT: usize = 607;
-pub const OS_DATE: usize = 608;
-pub const OS_TIME: usize = 609;
-pub const OS_DIFFTIME: usize = 610;
-
-/// OS 库标签范围: [600, 611)
-pub fn is_os_tag(tag: usize) -> bool {
-    (600..611).contains(&tag)
-}
-
-/// 将 os 库函数 tag 映射到函数名（用于 traceback）
-pub fn os_function_name(tag: usize) -> Option<&'static str> {
-    match tag {
-        OS_SETLOCALE => Some("setlocale"),
-        OS_CLOCK => Some("clock"),
-        OS_TMPNAME => Some("tmpname"),
-        OS_REMOVE => Some("remove"),
-        OS_GETENV => Some("getenv"),
-        OS_RENAME => Some("rename"),
-        OS_EXECUTE => Some("execute"),
-        OS_EXIT => Some("exit"),
-        OS_DATE => Some("date"),
-        OS_TIME => Some("time"),
-        OS_DIFFTIME => Some("difftime"),
-        _ => None,
-    }
-}
+// 标签 600+: OS 库（已迁移到 BuiltinFn，不再使用 tag）
 
 // ============================================================================
 // 栈操作辅助函数
@@ -176,32 +142,8 @@ fn call_setlocale(
 }
 
 // ============================================================================
-// 派发函数
+// 派发函数 — 已迁移到 BuiltinFn，直接通过函数指针调用
 // ============================================================================
-
-/// 派发 OS 库函数调用
-pub fn call_os_function(
-    tag: usize,
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError> {
-    match tag {
-        OS_SETLOCALE => call_setlocale(state, a, nargs, nresults),
-        OS_CLOCK => call_clock(state, a, nresults),
-        OS_TMPNAME => call_tmpname(state, a, nresults),
-        OS_REMOVE => call_remove(state, a, nargs, nresults),
-        OS_GETENV => call_getenv(state, a, nargs, nresults),
-        OS_RENAME => call_rename(state, a, nargs, nresults),
-        OS_EXECUTE => call_os_execute(state, a, nargs, nresults),
-        OS_EXIT => call_os_exit(state, a, nargs, nresults),
-        OS_DATE => call_os_date(state, a, nargs, nresults),
-        OS_TIME => call_os_time(state, a, nargs, nresults),
-        OS_DIFFTIME => call_os_difftime(state, a, nargs, nresults),
-        _ => Ok(()),
-    }
-}
 
 /// os.clock() — 返回程序使用的 CPU 时间（秒）
 /// 对应 C: lua_pushnumber(L, ((lua_Number)clock())/(lua_Number)CLOCKS_PER_SEC);
@@ -210,7 +152,7 @@ extern "C" {
 }
 const CLOCKS_PER_SEC: f64 = 1_000_000.0;
 
-fn call_clock(state: &mut LuaState, a: usize, nresults: i32) -> Result<(), VmError> {
+fn call_clock(state: &mut LuaState, a: usize, _nargs: usize, nresults: i32) -> Result<(), VmError> {
     let ticks = unsafe { clock() };
     let seconds = ticks as f64 / CLOCKS_PER_SEC;
     push_single_result(state, a, nresults, TValue::Float(seconds));
@@ -225,7 +167,7 @@ fn call_clock(state: &mut LuaState, a: usize, nresults: i32) -> Result<(), VmErr
 ///
 /// 对应 C 的 os_tmpname (POSIX 路径)：使用 mkstemp 创建临时文件，
 /// 关闭后返回文件名。模板为 "/tmp/lua_XXXXXX"。
-fn call_tmpname(state: &mut LuaState, a: usize, nresults: i32) -> Result<(), VmError> {
+fn call_tmpname(state: &mut LuaState, a: usize, _nargs: usize, nresults: i32) -> Result<(), VmError> {
     let mut buf: [u8; 32] = *b"/tmp/lua_XXXXXX\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
     let ptr = buf.as_mut_ptr() as *mut libc::c_char;
     let fd = unsafe { libc::mkstemp(ptr) };
@@ -879,22 +821,26 @@ fn call_os_difftime(
 pub fn open_os_lib(state: &mut LuaState) {
     let mut lib = crate::table::Table::new();
 
-    let register = |lib: &mut crate::table::Table, name: &str, tag: usize| {
-        let key = TValue::Str(state.intern_str(name));
-        lib.set(key, TValue::LightUserData(tag as *mut std::ffi::c_void));
+    // 注册所有 OS 函数 (使用 BuiltinFn 函数指针)
+    let register = |lib: &mut crate::table::Table,
+                    name: &'static std::ffi::CStr,
+                    func: crate::objects::BuiltinFnPtr| {
+        let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
+        let name_ptr = name.as_ptr() as *const u8;
+        lib.set(key, TValue::BuiltinFn(BuiltinFn { func, name: name_ptr }));
     };
 
-    register(&mut lib, "setlocale", OS_SETLOCALE);
-    register(&mut lib, "clock", OS_CLOCK);
-    register(&mut lib, "tmpname", OS_TMPNAME);
-    register(&mut lib, "remove", OS_REMOVE);
-    register(&mut lib, "getenv", OS_GETENV);
-    register(&mut lib, "rename", OS_RENAME);
-    register(&mut lib, "execute", OS_EXECUTE);
-    register(&mut lib, "exit", OS_EXIT);
-    register(&mut lib, "date", OS_DATE);
-    register(&mut lib, "time", OS_TIME);
-    register(&mut lib, "difftime", OS_DIFFTIME);
+    register(&mut lib, c"setlocale", call_setlocale);
+    register(&mut lib, c"clock", call_clock);
+    register(&mut lib, c"tmpname", call_tmpname);
+    register(&mut lib, c"remove", call_remove);
+    register(&mut lib, c"getenv", call_getenv);
+    register(&mut lib, c"rename", call_rename);
+    register(&mut lib, c"execute", call_os_execute);
+    register(&mut lib, c"exit", call_os_exit);
+    register(&mut lib, c"date", call_os_date);
+    register(&mut lib, c"time", call_os_time);
+    register(&mut lib, c"difftime", call_os_difftime);
 
     let key = TValue::Str(state.intern_str("os"));
     state.globals.set(key, TValue::Table(lib));
