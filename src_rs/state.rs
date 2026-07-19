@@ -250,10 +250,7 @@ pub struct LuaState {
     pub call_stack: Vec<CallFrame>,
     /// 当前活动协程的上下文 — None 表示主线程执行中
     pub current_thread: Option<Rc<RefCell<ThreadContext>>>,
-    /// coroutine.wrap 创建的协程列表 — 通过 tag (710+idx) 索引
-    /// None 表示协程已完成或出错
-    pub wrap_coros: Vec<Option<LuaThread>>,
-    /// call_wrap_call 执行期间，调用者栈（含活跃的 wrap table 引用）暂存于此，
+    /// call_wrap_fn 执行期间，调用者栈（含活跃的 wrap RustClosure 引用）暂存于此，
     /// 让 GC 能看到内层协程引用，避免误判为不可达。
     /// 嵌套 wrap 调用时按栈顺序 push/pop。
     pub caller_gc_stacks: Vec<Vec<TValue>>,
@@ -459,7 +456,6 @@ impl LuaState {
             },
             call_stack: Vec::with_capacity(32),
             current_thread: None,
-            wrap_coros: Vec::new(),
             caller_gc_stacks: Vec::new(),
             pcall_protection_stack: Vec::new(),
             weak_tables: Vec::new(),
@@ -653,7 +649,6 @@ impl LuaState {
             },
             call_stack: Vec::with_capacity(32),
             current_thread: None,
-            wrap_coros: Vec::new(),
             caller_gc_stacks: Vec::new(),
             pcall_protection_stack: Vec::new(),
             weak_tables: Vec::new(),
@@ -797,7 +792,6 @@ impl LuaState {
             },
             call_stack: Vec::with_capacity(32),
             current_thread: None,
-            wrap_coros: Vec::new(),
             caller_gc_stacks: Vec::new(),
             pcall_protection_stack: Vec::new(),
             weak_tables: Vec::new(),
@@ -1766,30 +1760,6 @@ impl LuaState {
         let mut chain_len: usize = 0;
         loop {
             let cur_val = self.stack[func_idx].clone();
-            // 检查是否是 coroutine.wrap 返回的 Table（GC 跟踪，可被回收）
-            if let Some(idx) = crate::stdlib::coroutine_lib::get_wrap_idx(&cur_val) {
-                let tag = crate::stdlib::coroutine_lib::CORO_WRAP_CALL_BASE + idx;
-                let nargs = self.stack.len().saturating_sub(func_idx + 1);
-                let result = crate::stdlib::coroutine_lib::call_wrap_call(
-                    tag, self, func_idx, nargs, nresults,
-                );
-                return match result {
-                    Ok(()) => 0,
-                    Err(e) => {
-                        self.stack.truncate(func_idx);
-                        let err_val = match e {
-                            crate::execute::VmError::RuntimeErrorValue(val) => val,
-                            crate::execute::VmError::RuntimeError(s) => {
-                                TValue::Str(self.intern_str(&s))
-                            }
-                            other => TValue::Str(self.intern_str(&format!("{}", other))),
-                        };
-                        self.last_error_value = Some(err_val.clone());
-                        self.stack.push(err_val);
-                        ERR_RUN
-                    }
-                };
-            }
             if let TValue::Table(ref t) = cur_val {
                 let mt_opt = t.get_metatable();
                 let call_fn = mt_opt.as_ref().and_then(|mt| {
@@ -2312,190 +2282,10 @@ impl LuaState {
             TValue::LCFn(lcf) => Self::pcall_c_function(self, func_idx, nresults, lcf.func),
             TValue::CClosure(cc) => Self::pcall_c_function(self, func_idx, nresults, cc.f),
             TValue::BuiltinFn(bf) => {
-                // Rust 原生内置函数（如 math/coroutine 库已迁移的函数）— 直接调用函数指针
-                // 对应 LightUserData 分支的简化版：无需 tag 派发，直接通过 bf.func 调用
-                let nargs = self.stack.len().saturating_sub(func_idx + 1);
-
-                // 推入 CallInfoEntry，让 debug.getinfo/traceback 能正确看到 C 函数帧
-                self.call_info.push(crate::state::CallInfoEntry {
-                    caller_proto: None,
-                    is_c: true,
-                    closure: None,
-                    base: func_idx + 1,
-                    saved_pc: self.pc,
-                    name: bf.name_str().to_string(),
-                    namewhat: "function".to_string(),
-                    proto_flag: self.proto_flag,
-                    nextraargs: self.nextraargs,
-                    is_tailcall: false,
-                });
-
-                // 直接调用函数指针 — 无 tag 派发层
-                let dispatch_result: Result<(), crate::execute::VmError> =
-                    (bf.func)(self, func_idx, nargs, nresults);
-
-                // 弹出 C 函数的 CallInfoEntry
-                self.call_info.pop();
-
-                match dispatch_result {
-                    Ok(()) => 0,
-                    // yield: C 函数 (如 coroutine.yield 作为 __close) 传播的 yield
-                    // 对应 C 中 yield 通过 longjmp 穿过 pcall:
-                    // 不截断栈,保留被调用函数的执行状态供协程恢复时使用
-                    // (与 LClosure/LightUserData 分支的 yield 处理一致)
-                    Err(crate::execute::VmError::Yield(values)) => {
-                        self.pending_yield = Some(values);
-                        self.last_error_value = None;
-                        self.last_error_msg.clear();
-                        // C 函数 __close (如 coroutine.yield 作为 __close) yield 时，
-                        // state.code/state.pc 未被修改（仍为 close 调用者的上下文）。
-                        // 需要更新 close continuation 的 PcallProtection，
-                        // 以便 resume 时 finish_close_continuation 能正确恢复并重新执行 OP_RETURN/OP_CLOSE。
-                        // (与 LClosure/LightUserData 分支的 yield 处理一致)
-                        let pp_len = self.pcall_protection_stack.len();
-                        let target_idx = (0..pp_len).rev().find(|&i| {
-                            !self.pcall_protection_stack[i].saved_filled
-                                && self.pcall_protection_stack[i].is_close_continuation
-                        });
-                        if let Some(idx) = target_idx {
-                            let top = &mut self.pcall_protection_stack[idx];
-                            top.saved_code = self.code.clone();
-                            top.saved_constants = self.constants.clone();
-                            top.saved_upval_descs = self.upval_descs.clone();
-                            top.saved_protos = self.protos.clone();
-                            top.saved_base = self.base;
-                            // is_close_continuation: saved_pc 不 +1，保留指向 OP_RETURN/OP_CLOSE
-                            top.saved_pc = self.pc;
-                            top.saved_num_params = self.num_params;
-                            top.saved_is_vararg = self.is_vararg;
-                            top.saved_proto_flag = self.proto_flag;
-                            top.saved_nextraargs = self.nextraargs;
-                            top.saved_closure_upvals = self.closure_upvals.clone();
-                            top.saved_tbc_list = self.tbc_list;
-                            top.func_idx = func_idx;
-                            top.saved_filled = true;
-                        }
-                        LUA_YIELD
-                    }
-                    Err(crate::execute::VmError::RuntimeError(msg)) => {
-                        self.stack.truncate(func_idx);
-                        self.push_string(&msg);
-                        ERR_RUN
-                    }
-                    Err(crate::execute::VmError::RuntimeErrorValue(val)) => {
-                        // 非字符串错误值（如 error(foo)）：保留原始 TValue 放到栈上，
-                        // 供 pcall 返回 (false, original_value) 而非 (false, string)
-                        self.stack.truncate(func_idx);
-                        self.stack.push(val);
-                        self.top = self.stack.len();
-                        ERR_RUN
-                    }
-                    Err(e) => {
-                        self.stack.truncate(func_idx);
-                        self.push_string(&format!("{}", e));
-                        ERR_RUN
-                    }
-                }
+                Self::pcall_rust_fn(self, func_idx, nresults, bf.func, bf.name_str())
             }
-            TValue::LightUserData(tag) => {
-                let tag_val = tag as usize;
-                let nargs = self.stack.len().saturating_sub(func_idx + 1);
-
-                // 推入 CallInfoEntry，让 debug.getinfo/traceback 能正确看到 C 函数帧
-                // 对应 C 的 luaD_precall -> inc_ci 创建新的 CallInfo
-                // base 库已迁移到 BuiltinFn，LightUserData 仅剩 io.lines 迭代器，
-                // 其函数名由 traceback 时计算，此处留空。
-                self.call_info.push(crate::state::CallInfoEntry {
-                    caller_proto: None,
-                    is_c: true,
-                    closure: None,
-                    base: func_idx + 1,
-                    saved_pc: self.pc,
-                    name: String::new(),
-                    namewhat: String::new(),
-                    proto_flag: self.proto_flag,
-                    nextraargs: self.nextraargs,
-                    is_tailcall: false,
-                });
-
-                // 派发 C 函数并收集结果
-                // base 库已迁移到 BuiltinFn，LightUserData 仅剩 io.lines 迭代器。
-                // coroutine.wrap 返回 Table（由 get_wrap_idx 检测，在 match 前已处理）。
-                let dispatch_result: Result<(), crate::execute::VmError> =
-                    if crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
-                        // io.lines/file:lines 返回的迭代器
-                        crate::stdlib::io_lib::call_lines_iterator(
-                            tag_val, self, func_idx, nargs, nresults,
-                        )
-                    } else {
-                        Err(crate::execute::VmError::RuntimeError(format!(
-                            "attempt to call a non-function value (tag={})",
-                            tag_val
-                        )))
-                    };
-
-                // 弹出 C 函数的 CallInfoEntry
-                self.call_info.pop();
-
-                match dispatch_result {
-                    Ok(()) => 0,
-                    // yield: C 函数 (如 call_pcall/call_xpcall) 传播的 yield
-                    // 对应 C 中 yield 通过 longjmp 穿过 pcall:
-                    // 不截断栈,保留被调用函数的执行状态供协程恢复时使用
-                    // (与 LClosure 分支的 yield 处理一致)
-                    Err(crate::execute::VmError::Yield(values)) => {
-                        self.pending_yield = Some(values);
-                        self.last_error_value = None;
-                        self.last_error_msg.clear();
-                        // C 函数 __close (如 coroutine.yield 作为 __close) yield 时，
-                        // state.code/state.pc 未被修改（仍为 close 调用者的上下文）。
-                        // 需要更新 close continuation 的 PcallProtection，
-                        // 以便 resume 时 finish_close_continuation 能正确恢复并重新执行 OP_RETURN/OP_CLOSE。
-                        // (与 LClosure 分支的 yield 处理一致)
-                        let pp_len = self.pcall_protection_stack.len();
-                        let target_idx = (0..pp_len).rev().find(|&i| {
-                            !self.pcall_protection_stack[i].saved_filled
-                                && self.pcall_protection_stack[i].is_close_continuation
-                        });
-                        if let Some(idx) = target_idx {
-                            let top = &mut self.pcall_protection_stack[idx];
-                            top.saved_code = self.code.clone();
-                            top.saved_constants = self.constants.clone();
-                            top.saved_upval_descs = self.upval_descs.clone();
-                            top.saved_protos = self.protos.clone();
-                            top.saved_base = self.base;
-                            // is_close_continuation: saved_pc 不 +1，保留指向 OP_RETURN/OP_CLOSE
-                            top.saved_pc = self.pc;
-                            top.saved_num_params = self.num_params;
-                            top.saved_is_vararg = self.is_vararg;
-                            top.saved_proto_flag = self.proto_flag;
-                            top.saved_nextraargs = self.nextraargs;
-                            top.saved_closure_upvals = self.closure_upvals.clone();
-                            top.saved_tbc_list = self.tbc_list;
-                            top.func_idx = func_idx;
-                            top.saved_filled = true;
-                        }
-                        LUA_YIELD
-                    }
-                    Err(crate::execute::VmError::RuntimeError(msg)) => {
-                        self.stack.truncate(func_idx);
-                        self.push_string(&msg);
-                        ERR_RUN
-                    }
-                    Err(crate::execute::VmError::RuntimeErrorValue(val)) => {
-                        // 非字符串错误值（如 error(foo)）：保留原始 TValue 放到栈上，
-                        // 供 pcall 返回 (false, original_value) 而非 (false, string)
-                        self.stack.truncate(func_idx);
-                        self.stack.push(val);
-                        self.top = self.stack.len();
-                        ERR_RUN
-                    }
-                    Err(e) => {
-                        self.stack.truncate(func_idx);
-                        self.push_string(&format!("{}", e));
-                        ERR_RUN
-                    }
-                }
+            TValue::RustClosure(rc) => {
+                Self::pcall_rust_fn(self, func_idx, nresults, rc.func, rc.name_str())
             }
             _ => {
                 self.stack.truncate(func_idx);
@@ -2610,6 +2400,99 @@ impl LuaState {
             }
         }
         0
+    }
+
+    /// 从 pcall 调用 Rust 原生函数（BuiltinFn 或 RustClosure 的 func）
+    ///
+    /// 公共逻辑：推入 CallInfoEntry → 调用函数指针 → 弹出 CallInfoEntry → 处理结果
+    /// BuiltinFn 和 RustClosure 的调用路径完全相同，区别仅在获取 func/name 的方式。
+    fn pcall_rust_fn(
+        &mut self,
+        func_idx: usize,
+        nresults: i32,
+        func: crate::objects::BuiltinFnPtr,
+        name: &str,
+    ) -> i32 {
+        let nargs = self.stack.len().saturating_sub(func_idx + 1);
+
+        // 推入 CallInfoEntry，让 debug.getinfo/traceback 能正确看到 C 函数帧
+        self.call_info.push(crate::state::CallInfoEntry {
+            caller_proto: None,
+            is_c: true,
+            closure: None,
+            base: func_idx + 1,
+            saved_pc: self.pc,
+            name: name.to_string(),
+            namewhat: "function".to_string(),
+            proto_flag: self.proto_flag,
+            nextraargs: self.nextraargs,
+            is_tailcall: false,
+        });
+
+        // 直接调用函数指针 — 无 tag 派发层
+        let dispatch_result: Result<(), crate::execute::VmError> =
+            func(self, func_idx, nargs, nresults);
+
+        // 弹出 C 函数的 CallInfoEntry
+        self.call_info.pop();
+
+        match dispatch_result {
+            Ok(()) => 0,
+            // yield: C 函数 (如 coroutine.yield 作为 __close) 传播的 yield
+            // 对应 C 中 yield 通过 longjmp 穿过 pcall:
+            // 不截断栈,保留被调用函数的执行状态供协程恢复时使用
+            Err(crate::execute::VmError::Yield(values)) => {
+                self.pending_yield = Some(values);
+                self.last_error_value = None;
+                self.last_error_msg.clear();
+                // C 函数 __close (如 coroutine.yield 作为 __close) yield 时，
+                // state.code/state.pc 未被修改（仍为 close 调用者的上下文）。
+                // 需要更新 close continuation 的 PcallProtection，
+                // 以便 resume 时 finish_close_continuation 能正确恢复并重新执行 OP_RETURN/OP_CLOSE。
+                let pp_len = self.pcall_protection_stack.len();
+                let target_idx = (0..pp_len).rev().find(|&i| {
+                    !self.pcall_protection_stack[i].saved_filled
+                        && self.pcall_protection_stack[i].is_close_continuation
+                });
+                if let Some(idx) = target_idx {
+                    let top = &mut self.pcall_protection_stack[idx];
+                    top.saved_code = self.code.clone();
+                    top.saved_constants = self.constants.clone();
+                    top.saved_upval_descs = self.upval_descs.clone();
+                    top.saved_protos = self.protos.clone();
+                    top.saved_base = self.base;
+                    // is_close_continuation: saved_pc 不 +1，保留指向 OP_RETURN/OP_CLOSE
+                    top.saved_pc = self.pc;
+                    top.saved_num_params = self.num_params;
+                    top.saved_is_vararg = self.is_vararg;
+                    top.saved_proto_flag = self.proto_flag;
+                    top.saved_nextraargs = self.nextraargs;
+                    top.saved_closure_upvals = self.closure_upvals.clone();
+                    top.saved_tbc_list = self.tbc_list;
+                    top.func_idx = func_idx;
+                    top.saved_filled = true;
+                }
+                LUA_YIELD
+            }
+            Err(crate::execute::VmError::RuntimeError(msg)) => {
+                self.stack.truncate(func_idx);
+                self.push_string(&msg);
+                ERR_RUN
+            }
+            Err(crate::execute::VmError::RuntimeErrorValue(val)) => {
+                // 非字符串错误值（如 error(foo)）：保留原始 TValue 放到栈上，
+                // 供 pcall 返回 (false, original_value) 而非 (false, string)
+                self.stack.truncate(func_idx);
+                self.stack.push(val);
+                self.top = self.stack.len();
+                ERR_RUN
+            }
+            Err(e) => {
+                self.stack.truncate(func_idx);
+                self.push_string(&format!("{}", e));
+                ERR_RUN
+            }
+        }
     }
 
     // ====== Open Libs ======
@@ -2911,6 +2794,8 @@ impl LuaState {
 
     /// 判断值是否被 GC 标记为存活（在 reachable 集合中）
     /// 非 GC 对象（字符串、数字、布尔、nil）总是视为存活
+    /// RustClosure/Thread/CClosure 无 gc_header，用 Rc 指针地址判断可达性
+    /// （指针地址 > 2^32，与 gc_header.id() 的 u32 空间不冲突）
     fn is_marked(val: &TValue, reachable: &GcHashSet) -> bool {
         match val {
             TValue::Table(t) => t
@@ -2925,6 +2810,18 @@ impl LuaState {
                 .gc_header
                 .id()
                 .map_or(true, |id| reachable.contains(&(id.0 as usize))),
+            TValue::RustClosure(rc) => {
+                let ptr = Rc::as_ptr(rc) as usize;
+                reachable.contains(&ptr)
+            }
+            TValue::Thread(t) => {
+                let ptr = Rc::as_ptr(&t.context) as usize;
+                reachable.contains(&ptr)
+            }
+            TValue::CClosure(cc) => {
+                let ptr = Rc::as_ptr(cc) as usize;
+                reachable.contains(&ptr)
+            }
             _ => true,
         }
     }
@@ -3044,8 +2941,8 @@ impl LuaState {
             }
         }
 
-        // 收集根：call_wrap_call 期间的调用者栈
-        // 嵌套 wrap 调用时，外层协程的栈（含活跃的 wrap table 引用）暂存于此，
+        // 收集根：call_wrap_fn 期间的调用者栈
+        // 嵌套 wrap 调用时，外层协程的栈（含活跃的 wrap RustClosure 引用）暂存于此，
         // 否则 GC 看不到内层协程引用，会误判为不可达。
         for stack in &self.caller_gc_stacks {
             for val in stack {
@@ -3056,7 +2953,7 @@ impl LuaState {
         }
 
         // 收集根：协程
-        // 不再把所有 wrap_coros 作为根，只通过 TValue::Thread 引用跟踪协程可达性
+        // 协程可达性通过 RustClosure 的 upvalues[0] (Thread) 跟踪
         // 主线程的 context（saved_stack 等）需要被收集
         self.collect_thread_roots(&self.main_thread, &mut worklist);
 
@@ -3088,17 +2985,9 @@ impl LuaState {
         // 清扫（sweep_unreachable 会自动减少 gc_estimate）
         self.gc.sweep_unreachable(&reachable);
 
-        // 回收不可达的协程：未被 mark_tvalue 遍历的协程（context 指针不在 visited 中）置为 None。
-        // 注意：不能用 retain()，因为会压缩数组改变索引，而 wrap table 元表中的 WRAP_MARKER
-        // 记录的是原始 idx，call_wrap_call 通过 idx 索引访问，索引必须稳定。
-        for entry in self.wrap_coros.iter_mut() {
-            if let Some(ref thread) = entry {
-                let ptr = Rc::as_ptr(&thread.context) as usize;
-                if !visited.contains(&ptr) {
-                    *entry = None;
-                }
-            }
-        }
+        // 协程回收：RustClosure 的 upvalues[0] 持有 Thread，由 mark_tvalue 遍历。
+        // 协程可达性完全由 RustClosure 引用决定，无需额外清理（与原 wrap_coros 机制不同）。
+        // 当 RustClosure 不可达时，upvalues[0] 的 Thread 自动被回收。
 
         // 清理字符串表：移除只有字符串表持有的死字符串
         // 对应 C Lua 的 sweepstrings；字符串不注册到 GC metas，需单独清理
@@ -3442,6 +3331,7 @@ impl LuaState {
                 | TValue::CClosure(_)
                 | TValue::UserData(_)
                 | TValue::Thread(_)
+                | TValue::RustClosure(_)
         )
     }
 
@@ -3524,14 +3414,33 @@ impl LuaState {
                 }
             }
             TValue::CClosure(cc) => {
-                // CClosure 没有 gc_header，用 Rc 指针地址做 visited 去重。
+                // CClosure 没有 gc_header，用 Rc 指针地址做 visited 去重 + reachable 标记。
                 // 遍历 upvalue 列表，标记其中需要 GC 的对象（如 UserData）。
                 // 这对 C 模块（如 lua-cjson）至关重要：config UserData 作为 CClosure
                 // 的 upvalue 存储，若不遍历 CClosure，config 会被误判为不可达，
                 // __gc 释放其内部 buffer 后，后续访问导致 use-after-free。
                 let ptr = Rc::as_ptr(cc) as usize;
                 if visited.insert(ptr) {
+                    reachable.insert(ptr);
                     for uv in &cc.upvalue {
+                        if Self::needs_gc_mark(uv) {
+                            worklist.push(uv.clone());
+                        }
+                    }
+                }
+            }
+            TValue::RustClosure(rc) => {
+                // RustClosure 没有 gc_header，用 Rc 指针地址做 visited 去重 + reachable 标记。
+                // 遍历 upvalues，标记其中需要 GC 的对象（如 Thread、Table）。
+                // 对 coroutine.wrap 至关重要：upvalues[0] 是 Thread，若不遍历，
+                // 协程会被误判为不可达，导致运行中协程被 GC 回收。
+                // reachable 标记让弱表中的 RustClosure 能被正确判断可达性
+                // （coroutine.lua:478 测试 wrap 协程在无外部引用时被 GC 回收）。
+                let ptr = Rc::as_ptr(rc) as usize;
+                if visited.insert(ptr) {
+                    reachable.insert(ptr);
+                    let upvals = rc.upvalues.borrow();
+                    for uv in upvals.iter() {
                         if Self::needs_gc_mark(uv) {
                             worklist.push(uv.clone());
                         }
@@ -3560,6 +3469,7 @@ impl LuaState {
             TValue::Thread(t) => {
                 let ptr = Rc::as_ptr(&t.context) as usize;
                 if visited.insert(ptr) {
+                    reachable.insert(ptr);
                     self.collect_thread_roots(t, worklist);
                 }
             }

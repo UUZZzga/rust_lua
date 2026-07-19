@@ -487,7 +487,7 @@ pub(crate) fn call_tm_res(
 
     // yield: 元方法 yield 时，state.pcall 返回 LUA_YIELD
     // 不截断栈、不 pop CallInfoEntry、不 pop PcallProtection、不恢复 saved 状态，
-    // 保留元方法的执行状态供 call_wrap_call 保存到 ThreadContext。
+    // 保留元方法的执行状态供 call_wrap_fn 保存到 ThreadContext。
     // state.pcall 的 LClosure yield 分支已更新 PcallProtection（saved_filled=true）。
     // 但 LightUserData (C 函数) 分支不更新，需在此手动更新。
     // (对应 C Lua 中 yield 通过 longjmp 跳出 luaT_callTMres，

@@ -7,52 +7,16 @@
 //! - 提供 coroutine.create, coroutine.resume, coroutine.yield,
 //!   coroutine.status, coroutine.wrap, coroutine.running, coroutine.isyieldable
 //!
-//! ## 标签分配
-//! - 标签 700+: Coroutine 库（已迁移到 BuiltinFn，不再使用 tag）
-//! - 标签 710+: coroutine.wrap 返回的函数（仍用 tag，因 wrap 机制需要 side table）
+//! ## 实现
+//! - 所有 coroutine 库函数（create/resume/yield 等）用 BuiltinFn 注册
+//! - coroutine.wrap 返回 RustClosure（携带 upvalues[0] = Thread），
+//!   由 op_call 的 RustClosure 分支派发到 call_wrap_fn
 
 use crate::execute::{VmError, VmExecutor, VmResult};
 use crate::objects::{BuiltinFn, LuaThread, NilKind, TValue, Table, ThreadContext, ThreadStatus, UpVal, UpValRef};
 use crate::state::LuaState;
 use std::cell::RefCell;
 use std::rc::Rc;
-
-// ============================================================================
-// 函数标签 (LightUserData 占位符值)
-// ============================================================================
-// Coroutine 库函数（create/resume/yield 等）已迁移到 BuiltinFn，不再使用 tag。
-// 仅 coroutine.wrap 返回的函数仍用 tag（因 wrap 机制需要 side table 存储 ThreadContext）。
-
-/// coroutine.wrap 返回的函数的标签基准
-/// 标签 710+idx 对应 state.wrap_coros[idx]
-///
-/// 注意：coroutine.wrap 返回的是 Table（带 WRAP_MARKER 元表），
-/// 由 `get_wrap_idx()` 检测后计算 tag = CORO_WRAP_CALL_BASE + idx。
-/// 不存在 LightUserData(710+idx) 形式的 wrap 函数，因此无需 is_wrap_call_tag。
-pub const CORO_WRAP_CALL_BASE: usize = 710;
-
-/// 元表中标记 wrap Table 的键（用 LightUserData 固定指针值避免字符串 interning）
-pub const WRAP_MARKER: *mut std::ffi::c_void = 0x77726170 as *mut std::ffi::c_void;
-
-/// 元表中持有 wrap 协程引用的键 — 让 collectgarbage 能根据 ThreadContext 的 Rc 计数
-/// 判断 wrap table 是否还被引用（wrap table 可达 → metatable 可达 → thread 可达 →
-/// context Rc >= 2）。否则 yield 中的 Suspended 协程会被误清理。
-pub const WRAP_THREAD_MARKER: *mut std::ffi::c_void = 0x77726174 as *mut std::ffi::c_void;
-
-/// 检查值是否是 coroutine.wrap 返回的 Table，返回 wrap_coros 中的索引
-/// wrap 返回 GC 跟踪的 Table（可被 GC 回收），元表包含 WRAP_MARKER 标记
-pub fn get_wrap_idx(val: &TValue) -> Option<usize> {
-    if let TValue::Table(t) = val {
-        let mt = t.get_metatable()?;
-        let key = TValue::LightUserData(WRAP_MARKER);
-        match mt.get(&key) {
-            Some(TValue::Integer(idx)) if idx >= 0 => Some(idx as usize),
-            _ => None,
-        }
-    } else {
-        None
-    }
-}
 
 // ============================================================================
 // 栈操作辅助函数
@@ -1908,7 +1872,7 @@ fn call_wrap(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
     // 收集开 upvalue 信息并保存到 ThreadContext（不关闭！）
     // 首次 resume 时根据同栈/跨栈决定用最新值还是 saved_value 关闭
     // 这样支持 `A = coroutine.wrap(function() ... A() ... end)` 的自引用模式
-    // （A 在 call_wrap 时还是旧值，在 call_wrap_call 首次调用时才被赋值为 wrap Table）
+    // （A 在 call_wrap 时还是旧值，在 call_wrap_fn 首次调用时才被赋值为 wrap RustClosure）
     let pending = collect_wrap_upvals_info(&thread, state);
     let creator_ptr = state
         .current_thread
@@ -1920,32 +1884,15 @@ fn call_wrap(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
         ctx.wrap_creator_thread_ptr = creator_ptr;
         ctx.pending_wrap_upvals = pending;
     }
-    // 存入 wrap_coros side table
-    let idx = state.wrap_coros.len();
-    // metatable 持有 thread.clone() — 创建时 stack 为空, clone 开销小;
-    // 主要是让 context 的 Rc 计数反映 wrap table 的可达性,
-    // 避免 collectgarbage 误清理 yield 中的 Suspended 协程
-    let wrap_table = crate::table::Table::new();
-    let wrap_id = state
-        .gc
-        .register_object(std::mem::size_of::<crate::objects::Table>());
-    wrap_table.gc_header.set_id(wrap_id);
-    let mt = crate::table::Table::new();
-    let mt_id = state
-        .gc
-        .register_object(std::mem::size_of::<crate::objects::Table>());
-    mt.gc_header.set_id(mt_id);
-    mt.set(
-        TValue::LightUserData(WRAP_MARKER),
-        TValue::Integer(idx as i64),
-    );
-    mt.set(
-        TValue::LightUserData(WRAP_THREAD_MARKER),
-        TValue::Thread(Rc::new(thread.clone())),
-    );
-    state.wrap_coros.push(Some(thread));
-    wrap_table.set_metatable(Some(mt));
-    push_single_result(state, a, nresults, TValue::Table(wrap_table));
+    // 创建 RustClosure，upvalues[0] 持有协程 Thread
+    // RustClosure 可被 GC 跟踪（state.rs::mark_tvalue 遍历 upvalues），
+    // 协程死亡时将 upvalues[0] 置为 nil，替代原 state.wrap_coros[idx] = None
+    let wrap_closure = crate::objects::RustClosure {
+        func: call_wrap_fn,
+        name: c"wrap".as_ptr() as *const u8,
+        upvalues: Rc::new(RefCell::new(vec![TValue::Thread(Rc::new(thread))])),
+    };
+    push_single_result(state, a, nresults, TValue::RustClosure(Rc::new(wrap_closure)));
     Ok(())
 }
 
@@ -1953,22 +1900,34 @@ fn call_wrap(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 /// 与 call_resume 的区别:
 /// - 无 success flag（直接返回值或抛错）
 /// - 出错时抛出错误而非返回 false + msg
-pub fn call_wrap_call(
-    tag: usize,
+///
+/// 由 op_call 的 `TValue::RustClosure(_)` 分支派发到此函数。
+/// RustClosure 的 upvalues[0] 持有协程 Thread；协程死亡时设置为 nil，
+/// 后续调用检测到 nil 报 "cannot resume dead coroutine" 错误。
+fn call_wrap_fn(
     state: &mut LuaState,
     a: usize,
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
-    let idx = tag - CORO_WRAP_CALL_BASE;
-
-    // 从 side table 获取协程
-    let thread = match state.wrap_coros.get(idx).and_then(|t| t.as_ref()) {
-        Some(t) => t.clone(),
-        None => {
+    // 从 state.stack[a] 取 RustClosure → upvalues[0] 取 Thread
+    let rc = match state.stack.get(a) {
+        Some(TValue::RustClosure(rc)) => rc.clone(),
+        _ => {
             return Err(VmError::RuntimeError(
-                "cannot resume dead coroutine".to_string(),
+                "coroutine.wrap: invalid closure".to_string(),
             ));
+        }
+    };
+    let thread = {
+        let upvals = rc.upvalues.borrow();
+        match upvals.get(0) {
+            Some(TValue::Thread(t)) => t.clone(),
+            _ => {
+                return Err(VmError::RuntimeError(
+                    "cannot resume dead coroutine".to_string(),
+                ));
+            }
         }
     };
 
@@ -2210,9 +2169,13 @@ pub fn call_wrap_call(
         }
     };
 
-    // 协程结束则从 side table 移除
+    // 协程结束则将 RustClosure 的 upvalues[0] 置为 nil
+    // （替代原 state.wrap_coros[idx] = None；后续调用会检测 nil 报 "dead coroutine"）
     if is_dead {
-        state.wrap_coros[idx] = None;
+        let mut upvals = rc.upvalues.borrow_mut();
+        if upvals.len() > 0 {
+            upvals[0] = TValue::Nil(NilKind::Strict);
+        }
     }
 
     // 恢复调用者上下文

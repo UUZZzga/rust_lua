@@ -11,13 +11,14 @@
 //!
 //! ## 迁移说明
 //! - 已从 LightUserData(tag) 迁移到 BuiltinFn 函数指针方案
-//! - io.lines / file:lines 返回的迭代器仍使用极大值 tag (>= 0x1000_0000_0000_0000)
-//!   因为 BuiltinFn 是 16 字节，无法存储迭代器状态
+//! - io.lines / file:lines 返回的迭代器使用 RustClosure 携带 upvalues
+//!   (file_ptr_id, to_close, finished, formats...)
 
 use crate::execute::VmError;
-use crate::objects::{BuiltinFn, LuaType, NilKind, TValue};
+use crate::objects::{BuiltinFn, LuaType, NilKind, RustClosure, TValue};
 use crate::state::LuaState;
 use crate::table::Table;
+use std::cell::RefCell;
 use std::io::Write;
 use std::rc::Rc;
 use std::os::raw::c_int;
@@ -1662,27 +1663,36 @@ fn call_file_setvbuf(
 // io.lines / file:lines 实现
 // ============================================================================
 
-/// lines 的迭代器状态 — 存储在 LightUserData tag 中
-/// 我们用一个简单的方案: io.lines/file:lines 返回一个 LightUserData (tag)
-/// 每次调用迭代器时, 从 state 中的迭代器表取出状态
-#[derive(Clone, Debug)]
-pub struct LinesState {
-    pub file_ptr_id: u32,
-    pub formats: Vec<TValue>, // 读取格式
-    pub to_close: bool,       // 完成后是否关闭文件
-    pub finished: bool,       // 是否已完成
-}
+/// lines 迭代器的 RustClosure upvalues 布局
+///   upvalues[0]: Integer(file_ptr_id)
+///   upvalues[1]: Boolean(to_close)     — 完成后是否关闭文件
+///   upvalues[2]: Boolean(finished)     — 是否已完成（可变，EOF/错误时设为 true）
+///   upvalues[3..]: formats             — 读取格式（TValue::Str）
+const LINES_UP_FILE: usize = 0;
+const LINES_UP_TO_CLOSE: usize = 1;
+const LINES_UP_FINISHED: usize = 2;
+const LINES_UP_FORMATS_BASE: usize = 3;
 
-/// 全局 lines 状态存储 — 使用 thread_local 避免修改 state.rs
-/// key 是 LightUserData 的 tag 值 (递增计数器)
-thread_local! {
-    static LINES_STATES: std::cell::RefCell<std::collections::HashMap<usize, Box<LinesState>>> =
-        std::cell::RefCell::new(std::collections::HashMap::new());
-    static LINES_COUNTER: std::cell::Cell<usize> = const { std::cell::Cell::new(0x1000_0000_0000_0000) };
+/// 构造 lines 迭代器的 RustClosure
+fn new_lines_iterator(
+    state: &LuaState,
+    file_ptr_id: u32,
+    to_close: bool,
+    formats: Vec<TValue>,
+) -> TValue {
+    let mut upvalues = Vec::with_capacity(LINES_UP_FORMATS_BASE + formats.len());
+    upvalues.push(TValue::Integer(file_ptr_id as i64));
+    upvalues.push(TValue::Boolean(to_close));
+    upvalues.push(TValue::Boolean(false)); // finished = false
+    for fmt in formats {
+        upvalues.push(fmt);
+    }
+    TValue::RustClosure(Rc::new(RustClosure {
+        func: call_lines_iterator_fn,
+        name: c"lines iterator".as_ptr() as *const u8,
+        upvalues: Rc::new(RefCell::new(upvalues)),
+    }))
 }
-
-/// lines 迭代器 tag 的起始范围 (高位, 避免与普通 tag 冲突)
-pub const LINES_TAG_BASE: usize = 0x1000_0000_0000_0000;
 
 /// io.lines([filename, [fmt1, ...]]) — 创建行迭代器
 fn call_io_lines(
@@ -1710,17 +1720,9 @@ fn call_io_lines(
             // 默认是 stdin 的 ptr_id
             get_stdin_ptr_id(state)
         });
-        let mut formats = Vec::new();
         // io.lines() 默认格式 "l"
-        formats.push(TValue::Str(state.intern_str("l")));
-        let ls = LinesState {
-            file_ptr_id: ptr_id,
-            formats,
-            to_close: false,
-            finished: false,
-        };
-        let tag = alloc_lines_tag(state, ls);
-        results.push(TValue::LightUserData(tag as *mut std::ffi::c_void));
+        let formats = vec![TValue::Str(state.intern_str("l"))];
+        results.push(new_lines_iterator(state, ptr_id, false, formats));
         state.adjust_results(a, nresults, results);
         return Ok(());
     }
@@ -1731,22 +1733,12 @@ fn call_io_lines(
         let ptr_id = state
             .io_input_handle
             .unwrap_or_else(|| get_stdin_ptr_id(state));
-        let mut formats = Vec::new();
-        if nargs >= 2 {
-            for i in 1..nargs {
-                formats.push(get_arg(state, a, i));
-            }
+        let formats = if nargs >= 2 {
+            (1..nargs).map(|i| get_arg(state, a, i)).collect::<Vec<_>>()
         } else {
-            formats.push(TValue::Str(state.intern_str("l")));
-        }
-        let ls = LinesState {
-            file_ptr_id: ptr_id,
-            formats,
-            to_close: false,
-            finished: false,
+            vec![TValue::Str(state.intern_str("l"))]
         };
-        let tag = alloc_lines_tag(state, ls);
-        results.push(TValue::LightUserData(tag as *mut std::ffi::c_void));
+        results.push(new_lines_iterator(state, ptr_id, false, formats));
         state.adjust_results(a, nresults, results);
         return Ok(());
     }
@@ -1787,26 +1779,17 @@ fn call_io_lines(
                 unreachable!()
             };
             // 默认格式 "l"
-            let mut formats = Vec::new();
-            if nargs >= 2 {
-                for i in 1..nargs {
-                    formats.push(get_arg(state, a, i));
-                }
+            let formats = if nargs >= 2 {
+                (1..nargs).map(|i| get_arg(state, a, i)).collect::<Vec<_>>()
             } else {
-                formats.push(TValue::Str(state.intern_str("l")));
-            }
-            let ls = LinesState {
-                file_ptr_id: ptr_id,
-                formats,
-                to_close: true,
-                finished: false,
+                vec![TValue::Str(state.intern_str("l"))]
             };
-            let tag = alloc_lines_tag(state, ls);
+            let iter = new_lines_iterator(state, ptr_id, true, formats);
             // toclose=1: 返回 4 个值 (迭代器, nil state, nil control, file to-be-closed)
             // 对应 C 的 io_lines: lua_pushnil(state); lua_pushnil(control);
             // lua_pushvalue(file); return 4;
             // generic for 的第 4 个值是 to-be-closed 变量，循环结束时自动关闭
-            results.push(TValue::LightUserData(tag as *mut std::ffi::c_void));
+            results.push(iter);
             results.push(TValue::Nil(crate::objects::NilKind::Strict)); // state
             results.push(TValue::Nil(crate::objects::NilKind::Strict)); // control
             results.push(udata); // file (to-be-closed)
@@ -1837,65 +1820,61 @@ fn call_file_lines(
         )));
     }
     let ptr_id = check_file_arg(state, a, nargs, "lines")?;
-    let mut formats = Vec::new();
-    if nargs >= 2 {
-        for i in 1..nargs {
-            formats.push(get_arg(state, a, i));
-        }
+    let formats = if nargs >= 2 {
+        (1..nargs).map(|i| get_arg(state, a, i)).collect::<Vec<_>>()
     } else {
-        formats.push(TValue::Str(state.intern_str("l")));
-    }
-    let ls = LinesState {
-        file_ptr_id: ptr_id,
-        formats,
-        to_close: false,
-        finished: false,
+        vec![TValue::Str(state.intern_str("l"))]
     };
-    let tag = alloc_lines_tag(state, ls);
-    let result = TValue::LightUserData(tag as *mut std::ffi::c_void);
+    let result = new_lines_iterator(state, ptr_id, false, formats);
     state.adjust_results(a, nresults, vec![result]);
     Ok(())
 }
 
-/// 分配 lines 迭代器 tag 并存储状态
-fn alloc_lines_tag(_state: &mut LuaState, ls: LinesState) -> usize {
-    let tag = LINES_COUNTER.with(|c| {
-        let v = c.get();
-        c.set(v + 1);
-        v
-    });
-    LINES_STATES.with(|s| {
-        s.borrow_mut().insert(tag, Box::new(ls));
-    });
-    tag
-}
-
-/// 调用 lines 迭代器 — 对应 C 的 io_readline
+/// lines 迭代器函数 — 对应 C 的 io_readline
 ///
-/// tag 是 LightUserData 的 tag 值, 用于从 LINES_STATES 中查找状态
-pub fn call_lines_iterator(
-    tag: usize,
+/// 从 state.stack[a] 取回 RustClosure，再从 upvalues 取状态。
+/// upvalues 布局见 [`new_lines_iterator`]。
+fn call_lines_iterator_fn(
     state: &mut LuaState,
     a: usize,
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
     let _ = nargs; // lines 迭代器无参数
-                   // 从 LINES_STATES 取出状态
-    let (file_ptr_id, formats, to_close, finished) = LINES_STATES.with(|s| {
-        let mut map = s.borrow_mut();
-        if let Some(ls) = map.get_mut(&tag) {
-            (ls.file_ptr_id, ls.formats.clone(), ls.to_close, ls.finished)
-        } else {
-            (0, Vec::new(), false, true)
-        }
-    });
 
-    if file_ptr_id == 0 {
-        return Err(VmError::RuntimeError(
-            "lines iterator state not found".to_string(),
-        ));
-    }
+    // 从 state.stack[a] 取出 RustClosure，提取状态
+    let (file_ptr_id, to_close, finished, formats) = {
+        let func_val = state
+            .stack
+            .get(a)
+            .cloned()
+            .ok_or_else(|| VmError::RuntimeError("lines iterator missing".to_string()))?;
+        let rc = match func_val {
+            TValue::RustClosure(rc) => rc,
+            _ => {
+                return Err(VmError::RuntimeError(
+                    "lines iterator: expected RustClosure".to_string(),
+                ));
+            }
+        };
+        let upvals = rc.upvalues.borrow();
+        let file_ptr_id = match upvals.get(LINES_UP_FILE) {
+            Some(TValue::Integer(i)) => *i as u32,
+            _ => {
+                return Err(VmError::RuntimeError(
+                    "lines iterator: bad file_ptr_id upvalue".to_string(),
+                ));
+            }
+        };
+        let to_close = matches!(upvals.get(LINES_UP_TO_CLOSE), Some(TValue::Boolean(true)));
+        let finished = matches!(upvals.get(LINES_UP_FINISHED), Some(TValue::Boolean(true)));
+        let formats = upvals
+            .iter()
+            .skip(LINES_UP_FORMATS_BASE)
+            .cloned()
+            .collect::<Vec<_>>();
+        (file_ptr_id, to_close, finished, formats)
+    };
 
     if finished {
         return Err(VmError::RuntimeError("file is already closed".to_string()));
@@ -1905,13 +1884,8 @@ pub fn call_lines_iterator(
     let f = match state.file_handles.get(&file_ptr_id).copied() {
         Some(f) => f,
         None => {
-            // 文件已被关闭
-            LINES_STATES.with(|s| {
-                let mut map = s.borrow_mut();
-                if let Some(ls) = map.get_mut(&tag) {
-                    ls.finished = true;
-                }
-            });
+            // 文件已被关闭 — 标记 finished
+            mark_lines_finished(state, a);
             return Err(VmError::RuntimeError("file is already closed".to_string()));
         }
     };
@@ -1943,12 +1917,7 @@ pub fn call_lines_iterator(
                     }
                 }
             }
-            LINES_STATES.with(|s| {
-                let mut map = s.borrow_mut();
-                if let Some(ls) = map.get_mut(&tag) {
-                    ls.finished = true;
-                }
-            });
+            mark_lines_finished(state, a);
             return Err(VmError::RuntimeError(err_msg));
         }
         // EOF: 关闭文件
@@ -1959,12 +1928,7 @@ pub fn call_lines_iterator(
                 }
             }
         }
-        LINES_STATES.with(|s| {
-            let mut map = s.borrow_mut();
-            if let Some(ls) = map.get_mut(&tag) {
-                ls.finished = true;
-            }
-        });
+        mark_lines_finished(state, a);
         // 返回无结果
         state.adjust_results(a, nresults, vec![]);
         Ok(())
@@ -1975,9 +1939,14 @@ pub fn call_lines_iterator(
     }
 }
 
-/// 判断 tag 是否是 lines 迭代器 tag
-pub fn is_lines_iterator_tag(tag: usize) -> bool {
-    tag >= LINES_TAG_BASE
+/// 标记 lines 迭代器为已完成 — 更新 upvalues[LINES_UP_FINISHED] = true
+fn mark_lines_finished(state: &mut LuaState, a: usize) {
+    if let Some(TValue::RustClosure(rc)) = state.stack.get(a).cloned() {
+        let mut upvals = rc.upvalues.borrow_mut();
+        if upvals.len() > LINES_UP_FINISHED {
+            upvals[LINES_UP_FINISHED] = TValue::Boolean(true);
+        }
+    }
 }
 
 // ============================================================================

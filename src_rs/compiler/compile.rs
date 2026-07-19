@@ -3813,7 +3813,13 @@ fn parse_statement(fs: &mut FuncState) {
         }
     };
     if result.is_none() {
-        fs.assert_regs_clean("parse_statement exit");
+        // C Lua 在语法错误后 longjmp 跳出，不会执行到 assert 检查。
+        // Rust 用 fs.error 记录错误后继续执行，错误恢复路径可能遗留未释放的寄存器
+        // （如 parse_expr 内部 code_global_via_env 分配的 GETTABUP 寄存器）。
+        // has_errors 时跳过 register leak 检查，因为编译会失败，字节码不会执行。
+        if !fs.has_errors() {
+            fs.assert_regs_clean("parse_statement exit");
+        }
     }
     fs.leavelevel();
 }

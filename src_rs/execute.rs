@@ -3811,19 +3811,6 @@ impl VmExecutor {
         // MAX_CCMT = 0xf (15): 对应 C 的 4 位计数器,超过 15 层时报 "too long"
         let mut chain_len: usize = 0;
         loop {
-            // 检查是否是 coroutine.wrap 返回的 Table（GC 跟踪，可被回收）
-            if let Some(idx) = crate::stdlib::coroutine_lib::get_wrap_idx(&func_val) {
-                let tag = crate::stdlib::coroutine_lib::CORO_WRAP_CALL_BASE + idx;
-                let nargs = if b == 0 {
-                    state.stack.len().saturating_sub(a + 1)
-                } else {
-                    b.saturating_sub(1)
-                };
-                let nresults = c - 1;
-                crate::stdlib::coroutine_lib::call_wrap_call(tag, state, a, nargs, nresults)?;
-                state.pc += 1;
-                return Ok(());
-            }
             if let TValue::Table(ref t) = func_val {
                 let mt_opt = t.get_metatable();
                 let call_fn = mt_opt.as_ref().and_then(|mt| {
@@ -3985,9 +3972,15 @@ impl VmExecutor {
                 }
                 Ok(())
             }
-            TValue::BuiltinFn(bf) => {
-                // Rust 原生内置函数派发 — 直接调用函数指针，无需 tag 范围匹配
+            TValue::BuiltinFn(_) | TValue::RustClosure(_) => {
+                // Rust 原生函数派发（BuiltinFn 无状态，RustClosure 携带 upvalues）
+                // 直接调用函数指针，无需 tag 范围匹配
                 // 性能：~5-10 cycles（与 C Lua 持平），比 LightUserData tag 派发快 2-3 倍
+                let (func, name) = match &func_val {
+                    TValue::BuiltinFn(bf) => (bf.func, bf.name_str().to_string()),
+                    TValue::RustClosure(rc) => (rc.func, rc.name_str().to_string()),
+                    _ => unreachable!(),
+                };
                 let nargs = if b == 0 {
                     state.stack.len().saturating_sub(a + 1)
                 } else {
@@ -3996,8 +3989,8 @@ impl VmExecutor {
                 let nresults: i32 = if c == 0 { -1 } else { c - 1 };
 
                 // 推入 CallInfoEntry（对应 C 的 luaD_precall -> inc_ci）
-                // name 直接从 BuiltinFn.name 取，无需调用 get_func_name
-                let c_name = bf.name_str().to_string();
+                // name 直接从函数取，无需调用 get_func_name
+                let c_name = name;
                 let c_namewhat = "function".to_string();
                 state.call_info.push(crate::state::CallInfoEntry {
                     caller_proto: None,
@@ -4019,7 +4012,7 @@ impl VmExecutor {
                 }
 
                 // 直接调用函数指针 — 无 tag 派发层
-                let dispatch_result = (bf.func)(state, a, nargs, nresults);
+                let dispatch_result = func(state, a, nargs, nresults);
 
                 let is_yield = matches!(&dispatch_result, Err(VmError::Yield(_)));
                 let is_error = dispatch_result.is_err();
@@ -4066,118 +4059,14 @@ impl VmExecutor {
                 state.pc += 1;
                 Ok(())
             }
-            TValue::LightUserData(tag) => {
-                let tag_val = tag as usize;
-                let nargs = if b == 0 {
-                    state.stack.len().saturating_sub(a + 1)
-                } else {
-                    b.saturating_sub(1)
-                };
-                let nresults: i32 = if c == 0 { -1 } else { c - 1 };
-
-                // 对应 C 的 precallC: 推入 CallInfoEntry 并在整个 C 函数执行期间保留
-                // 这样 debug.getinfo/traceback 能正确看到 C 函数帧
-                // 对应 C 的 luaD_precall -> inc_ci 创建新的 CallInfo
-                //
-                // 性能优化: 不在每次 C 函数调用时调用 get_func_name (对应 C 的
-                // funcnamefromcode), 因为它内部调用 find_set_reg 遍历 0..call_pc
-                // 的所有指令 (O(n))。C 实现只在 traceback 时才计算函数名。
-                // base 库已迁移到 BuiltinFn，LightUserData 仅剩 io.lines 迭代器和
-                // coroutine.wrap 函数，它们的函数名由 traceback 时计算，此处留空。
-                let c_name: String = String::new();
-                let c_namewhat = String::new();
-                state.call_info.push(crate::state::CallInfoEntry {
-                    caller_proto: None,
-                    is_c: true,
-                    closure: None,
-                    base: a + 1,
-                    saved_pc: state.pc,
-                    name: c_name.clone(),
-                    namewhat: c_namewhat.clone(),
-                    proto_flag: state.proto_flag,
-                    nextraargs: state.nextraargs,
-                    is_tailcall: false,
-                });
-
-                // 对应 C 的 luaG_tracecall -> luaD_hookcall: 触发 call hook
-                if state.hook_mask & 1 != 0 {
-                    // LUA_MASKCALL
-                    // ftransfer=1 (参数从 func+1 开始), ntransfer=narg
-                    Self::call_hook(state, "call", -1, Some(a + 1), 1, nargs as i32)?;
-                }
-
-                // 基础库函数派发
-                // base 库已迁移到 BuiltinFn，LightUserData 仅剩 io.lines 迭代器。
-                // coroutine.wrap 返回 Table（由 get_wrap_idx 检测，在 match 前已处理）。
-                // 普通库函数调用（对应 C 的 luaD_call）不递增 n_ny_calls。
-                // 只有 luaD_callnoyield 场景（__close/__gc 元方法、lua_call C API、
-                // 错误处理等）才递增。pcall/xpcall 是 CIST_YPCALL（yieldable protected）。
-
-                let dispatch_result = if crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
-                    // io.lines/file:lines 返回的迭代器
-                    crate::stdlib::io_lib::call_lines_iterator(tag_val, state, a, nargs, nresults)
-                } else {
-                    Err(VmError::RuntimeError(format!(
-                        "attempt to call a non-function value (tag={})",
-                        tag_val
-                    )))
-                };
-
-                // （n_ny_calls 在 luaD_call 路径中不递增，无需递减）
-
-                // yield/error 时不弹出 CallInfoEntry —
-                // yield: call_resume 的 yield 分支会保存完整的 call_info
-                // error: build_traceback_from_thread 依赖 call_info 中的 C 函数帧显示 error 位置
-                //        execute.rs 的 build_traceback 会跳过末尾的 C 函数帧（用 last_c_function 处理）
-                let is_yield = matches!(&dispatch_result, Err(VmError::Yield(_)));
-                let is_error = dispatch_result.is_err();
-                if !is_yield && !is_error {
-                    state.call_info.pop();
-                }
-
-                // 对应 C 的 luaD_poscall -> rethook: 触发 return hook
-                // yield 时也触发 return hook（对应 C Lua 中 yield 的 return 事件）
-                if state.hook_mask & 2 != 0 {
-                    // LUA_MASKRET
-                    // ftransfer = firstres - func; 从 pending_return_adjust 读取结果位置
-                    // (C 函数通过 adjust_results 把结果放到栈顶之上并设置了 pending_return_adjust)
-                    let (ftransfer, nres) = match state.pending_return_adjust {
-                        Some((_, _, n_actual, first_result_pos)) => {
-                            ((first_result_pos as i32) - (a as i32), n_actual as i32)
-                        }
-                        None => (1, 0),
-                    };
-                    // 保存 pending_return_adjust，防止 hook 函数内部的 C 函数调用覆盖它
-                    let saved_pending = state.pending_return_adjust.take();
-                    state.call_info.push(crate::state::CallInfoEntry {
-                        caller_proto: None,
-                        is_c: true,
-                        closure: None,
-                        base: a + 1,
-                        saved_pc: state.pc,
-                        name: c_name,
-                        namewhat: c_namewhat,
-                        proto_flag: state.proto_flag,
-                        nextraargs: state.nextraargs,
-                        is_tailcall: false,
-                    });
-                    Self::call_hook(state, "return", -1, Some(a + 1), ftransfer, nres)?;
-                    state.call_info.pop();
-                    // 恢复 pending_return_adjust，供 finish_pending_adjust 使用
-                    state.pending_return_adjust = saved_pending;
-                }
-
-                // 执行待定的返回值调整（return hook 启用时 push_results 延迟了 adjust）
-                if !is_yield {
-                    state.finish_pending_adjust();
-                }
-
-                dispatch_result?;
-
-                // 对应 C 的 rethook: C 函数返回时设置 oldpc
-                state.hook_old_pc = state.pc as i32;
-                state.pc += 1;
-                Ok(())
+            TValue::LightUserData(_) => {
+                // LightUserData 不再承担函数派发职责：
+                // - base 库已迁移到 BuiltinFn
+                // - io.lines 迭代器已迁移到 RustClosure
+                // - coroutine.wrap 返回 RustClosure（由 RustClosure 分支自动派发）
+                // 普通用户传入的 LightUserData 永远不是可调用对象。
+                let type_name = state.typename(func_val.ty());
+                Err(VmError::RuntimeError(call_error_message(state, &type_name)))
             }
             TValue::LCFn(lcf) => {
                 Self::call_c_function(state, a, b, c, lcf.func)?;
@@ -4375,19 +4264,6 @@ impl VmExecutor {
         // MAX_CCMT = 0xf (15): 对应 C 的 4 位计数器,超过 15 层时报 "too long"
         let mut chain_len: usize = 0;
         loop {
-            // 检查是否是 coroutine.wrap 返回的 Table（GC 跟踪，可被回收）
-            if let Some(idx) = crate::stdlib::coroutine_lib::get_wrap_idx(&func_val) {
-                let tag = crate::stdlib::coroutine_lib::CORO_WRAP_CALL_BASE + idx;
-                let nargs = if b == 0 {
-                    state.stack.len().saturating_sub(a + 1)
-                } else {
-                    b.saturating_sub(1)
-                };
-                // tailcall 沿用调用者的 nresults，用 MULTRET (-1) 让 call_wrap_call 处理
-                crate::stdlib::coroutine_lib::call_wrap_call(tag, state, a, nargs, -1)?;
-                state.pc += 1;
-                return Ok(());
-            }
             if let TValue::Table(ref t) = func_val {
                 let mt_opt = t.get_metatable();
                 let call_fn = mt_opt.as_ref().and_then(|mt| {
@@ -4500,9 +4376,14 @@ impl VmExecutor {
                 Self::call_c_function(state, a, b, 0, cc.f)?;
                 Ok(())
             }
-            TValue::BuiltinFn(bf) => {
-                // TAILCALL Rust 原生内置函数: 调用后结果放在 a 位置，后续 RETURN 处理返回
+            TValue::BuiltinFn(_) | TValue::RustClosure(_) => {
+                // TAILCALL Rust 原生函数: 调用后结果放在 a 位置，后续 RETURN 处理返回
                 // 对应 C 的 luaD_callnoyield + precallC + poscall（nresults=-1 由 RETURN 调整）
+                let (func, name) = match &func_val {
+                    TValue::BuiltinFn(bf) => (bf.func, bf.name_str().to_string()),
+                    TValue::RustClosure(rc) => (rc.func, rc.name_str().to_string()),
+                    _ => unreachable!(),
+                };
                 let nargs = if b == 0 {
                     state.stack.len().saturating_sub(a + 1)
                 } else {
@@ -4510,48 +4391,68 @@ impl VmExecutor {
                 };
                 // 推入 CallInfoEntry（与 op_call 一致，但 nresults=-1 表示 MULTRET，
                 // 由后续 RETURN 指令根据返回值数量调整）
+                let c_name = name;
+                let c_namewhat = "function".to_string();
                 state.call_info.push(crate::state::CallInfoEntry {
                     caller_proto: None,
                     is_c: true,
                     closure: None,
                     base: a + 1,
                     saved_pc: state.pc,
-                    name: bf.name_str().to_string(),
-                    namewhat: "function".to_string(),
+                    name: c_name.clone(),
+                    namewhat: c_namewhat.clone(),
                     proto_flag: state.proto_flag,
                     nextraargs: state.nextraargs,
                     is_tailcall: false,
                 });
-                let dispatch_result = (bf.func)(state, a, nargs, -1);
-                // 仅在非 yield/error 时弹出 CallInfoEntry
-                if !matches!(&dispatch_result, Err(VmError::Yield(_))) && dispatch_result.is_ok() {
+                // 对应 C 的 luaG_tracecall -> luaD_hookcall: 触发 call hook
+                if state.hook_mask & 1 != 0 {
+                    // LUA_MASKCALL
+                    Self::call_hook(state, "tail call", -1, Some(a + 1), 1, nargs as i32)?;
+                }
+                let dispatch_result = func(state, a, nargs, -1);
+
+                let is_yield = matches!(&dispatch_result, Err(VmError::Yield(_)));
+                let is_error = dispatch_result.is_err();
+                if !is_yield && !is_error {
                     state.call_info.pop();
                 }
-                dispatch_result?;
-                // 对应 C 的 rethook: C 函数返回时设置 oldpc
-                state.hook_old_pc = state.pc as i32;
-                state.pc += 1;
-                Ok(())
-            }
-            TValue::LightUserData(tag) => {
-                // TAILCALL LightUserData 函数
-                // base 库已迁移到 BuiltinFn，LightUserData 仅剩 io.lines 迭代器。
-                // coroutine.wrap 返回 Table（由 get_wrap_idx 检测，在 match 前已处理）。
-                let tag_val = tag as usize;
-                let nargs = if b == 0 {
-                    state.stack.len().saturating_sub(a + 1)
-                } else {
-                    b.saturating_sub(1)
-                };
-                if crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
-                    // io.lines/file:lines 返回的迭代器
-                    crate::stdlib::io_lib::call_lines_iterator(tag_val, state, a, nargs, -1)?;
-                } else {
-                    return Err(VmError::RuntimeError(format!(
-                        "attempt to call a non-function value (tag={})",
-                        tag_val
-                    )));
+
+                // 对应 C 的 luaD_poscall -> rethook: 触发 return hook
+                // 必须处理 pending_return_adjust，否则推迟的调整会被后续 op_call 错误执行
+                if state.hook_mask & 2 != 0 {
+                    // LUA_MASKRET
+                    let (ftransfer, nres) = match state.pending_return_adjust {
+                        Some((_, _, n_actual, first_result_pos)) => {
+                            ((first_result_pos as i32) - (a as i32), n_actual as i32)
+                        }
+                        None => (1, 0),
+                    };
+                    let saved_pending = state.pending_return_adjust.take();
+                    state.call_info.push(crate::state::CallInfoEntry {
+                        caller_proto: None,
+                        is_c: true,
+                        closure: None,
+                        base: a + 1,
+                        saved_pc: state.pc,
+                        name: c_name,
+                        namewhat: c_namewhat,
+                        proto_flag: state.proto_flag,
+                        nextraargs: state.nextraargs,
+                        is_tailcall: false,
+                    });
+                    Self::call_hook(state, "return", -1, Some(a + 1), ftransfer, nres)?;
+                    state.call_info.pop();
+                    state.pending_return_adjust = saved_pending;
                 }
+
+                // 执行待定的返回值调整
+                if !is_yield {
+                    state.finish_pending_adjust();
+                }
+
+                dispatch_result?;
+
                 // 对应 C 的 rethook: C 函数返回时设置 oldpc
                 state.hook_old_pc = state.pc as i32;
                 state.pc += 1;
@@ -5158,15 +5059,8 @@ impl VmExecutor {
             }
         }
 
-        // 检查是否是 coroutine.wrap 返回的 Table（GC 跟踪，可被回收）
-        // wrap Table 的元表只有 WRAP_MARKER，没有 __call，所以上面的 __call 检测不会匹配
-        if let Some(idx) = crate::stdlib::coroutine_lib::get_wrap_idx(&func_val) {
-            let tag = crate::stdlib::coroutine_lib::CORO_WRAP_CALL_BASE + idx;
-            let nresults = (c + 1) as i32;
-            crate::stdlib::coroutine_lib::call_wrap_call(tag, state, ra + 3, 2, nresults)?;
-            state.pc += 1;
-            return Ok(());
-        }
+        // 检查是否是 coroutine.wrap 返回的 RustClosure（由 RustClosure 分支自动派发）
+        // wrap RustClosure 不需要特殊处理，op_tforcall 的 BuiltinFn/RustClosure 分支会处理
 
         match &func_val {
             TValue::LClosure(closure) => {
@@ -5260,12 +5154,17 @@ impl VmExecutor {
                 }
                 Ok(())
             }
-            TValue::BuiltinFn(bf) => {
-                // Rust 原生内置函数作为 TFORCALL 迭代器（如 ipairs/pairs 的迭代器）
+            TValue::BuiltinFn(_) | TValue::RustClosure(_) => {
+                // Rust 原生函数作为 TFORCALL 迭代器（如 ipairs/pairs 的迭代器、io.lines）
                 // 处理方式与 op_call 的 BuiltinFn 分支一致：不推 CallFrame，只推
                 // CallInfoEntry（用于 traceback）。迭代器函数（call_ipairs_aux /
                 // call_next_iter）只通过 `a` 参数访问栈，不依赖 state.base，
                 // 因此无需修改 state.base。
+                let func = match func_val {
+                    TValue::BuiltinFn(bf) => bf.func,
+                    TValue::RustClosure(rc) => rc.func,
+                    _ => unreachable!(),
+                };
                 let nresults = (c + 1) as i32;
                 let nargs = 2;
                 state.call_info.push(crate::state::CallInfoEntry {
@@ -5280,7 +5179,7 @@ impl VmExecutor {
                     nextraargs: state.nextraargs,
                     is_tailcall: false,
                 });
-                let dispatch_result = (bf.func)(state, ra + 3, nargs, nresults);
+                let dispatch_result = func(state, ra + 3, nargs, nresults);
                 let is_yield = matches!(&dispatch_result, Err(VmError::Yield(_)));
                 if !is_yield {
                     state.call_info.pop();
@@ -5289,37 +5188,6 @@ impl VmExecutor {
                 state.finish_pending_adjust();
                 state.pc += 1;
                 Ok(())
-            }
-            TValue::LightUserData(tag) => {
-                // 处理 LightUserData 迭代器
-                // base 库已迁移到 BuiltinFn，ipairs/pairs 迭代器现在走 BuiltinFn 分支。
-                // LightUserData 仅剩 io.lines 迭代器。
-                // coroutine.wrap 返回 Table（由 get_wrap_idx 检测，在 match 前已处理）。
-                let tag_val = *tag as usize;
-                let nresults = (c + 1) as i32;
-                let nargs = 2;
-                let result = if crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
-                    crate::stdlib::io_lib::call_lines_iterator(
-                        tag_val,
-                        state,
-                        ra + 3,
-                        nargs,
-                        nresults,
-                    )
-                } else {
-                    Err(VmError::RuntimeError(format!(
-                        "attempt to call a non-function value (tag={})",
-                        tag_val
-                    )))
-                };
-                match result {
-                    Ok(()) => {
-                        state.finish_pending_adjust();
-                        state.pc += 1;
-                        Ok(())
-                    }
-                    Err(e) => Err(e),
-                }
             }
             TValue::CClosure(cc) => {
                 let nresults = (c + 1) as i32;
@@ -5836,6 +5704,7 @@ impl VmExecutor {
                             | TValue::LCFn(_)
                             | TValue::CClosure(_)
                             | TValue::BuiltinFn(_)
+                            | TValue::RustClosure(_)
                             | TValue::LightUserData(_) => {
                                 return Self::call_index_metamethod(
                                     state,
@@ -5880,6 +5749,7 @@ impl VmExecutor {
                             | TValue::LCFn(_)
                             | TValue::CClosure(_)
                             | TValue::BuiltinFn(_)
+                            | TValue::RustClosure(_)
                             | TValue::LightUserData(_) => {
                                 // __index 是函数: 调用 __index(obj, key)
                                 return Self::call_index_metamethod(
@@ -6013,6 +5883,7 @@ impl VmExecutor {
                             | TValue::LCFn(_)
                             | TValue::CClosure(_)
                             | TValue::BuiltinFn(_)
+                            | TValue::RustClosure(_)
                             | TValue::LightUserData(_) => {
                                 // __newindex 是函数: 调用 __newindex(table, key, val) (可能 yield)
                                 crate::tm::call_tm(
@@ -6071,20 +5942,21 @@ impl VmExecutor {
                     match newindex_val {
                         Some(f) => {
                             match &f {
-                                TValue::LClosure(_)
-                                | TValue::LCFn(_)
-                                | TValue::CClosure(_)
-                                | TValue::BuiltinFn(_)
-                                | TValue::LightUserData(_) => {
-                                    // __newindex 是函数: 调用 (可能 yield)
-                                    crate::tm::call_tm(
-                                        state,
-                                        &f,
-                                        &current,
-                                        &key,
-                                        &val,
-                                        crate::tm::TagMethod::NewIndex,
-                                    )?;
+                                    TValue::LClosure(_)
+                                    | TValue::LCFn(_)
+                                    | TValue::CClosure(_)
+                                    | TValue::BuiltinFn(_)
+                                    | TValue::RustClosure(_)
+                                    | TValue::LightUserData(_) => {
+                                        // __newindex 是函数: 调用 (可能 yield)
+                                        crate::tm::call_tm(
+                                            state,
+                                            &f,
+                                            &current,
+                                            &key,
+                                            &val,
+                                            crate::tm::TagMethod::NewIndex,
+                                        )?;
                                     return Ok(());
                                 }
                                 TValue::Table(_) => {

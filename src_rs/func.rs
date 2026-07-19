@@ -523,7 +523,6 @@ mod tests {
             },
             call_stack: Vec::new(),
             current_thread: None,
-            wrap_coros: Vec::new(),
             caller_gc_stacks: Vec::new(),
             pcall_protection_stack: Vec::new(),
             weak_tables: Vec::new(),

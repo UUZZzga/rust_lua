@@ -13,6 +13,7 @@ use crate::objects::{BuiltinFn, BuiltinFnPtr, LuaType, NilKind, TValue};
 use crate::state::LuaState;
 use crate::table::Table;
 use crate::tm::{make_tm_tvalue, Metatable, TagMethod};
+use std::rc::Rc;
 use std::sync::Arc;
 
 // ============================================================================
@@ -2310,6 +2311,11 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                     TValue::BuiltinFn(b) => {
                         // Rust 原生内置函数：使用函数指针地址
                         let ptr = b.func as usize;
+                        format!("0x{:x}", ptr)
+                    }
+                    TValue::RustClosure(rc) => {
+                        // Rust 闭包：使用 Rc 指针地址
+                        let ptr = Rc::as_ptr(rc) as usize;
                         format!("0x{:x}", ptr)
                     }
                     TValue::UserData(u) => {

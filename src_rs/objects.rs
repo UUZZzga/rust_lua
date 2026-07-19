@@ -282,6 +282,86 @@ impl BuiltinFn {
 }
 
 // ============================================================================
+// 规约：Rust 闭包 (RustClosure) — 携带 upvalues 的 Rust 原生函数
+// ============================================================================
+
+/// Rust 闭包 — 携带 upvalues 的 Rust 原生函数
+///
+/// 用于 coroutine.wrap 和 io.lines 等需要携带状态的内置函数。
+/// 对应 C Lua 的 CClosure（lua_CFunction + upvalue），但使用 Rust ABI。
+///
+/// ## 与 `BuiltinFn` 的区别
+///
+/// `BuiltinFn` 是无状态的（仅函数指针 + 名字），适用于 `math.sin`、`string.len` 等
+/// 纯函数。`RustClosure` 携带 `upvalues`，适用于需要绑定状态的场景：
+/// - `coroutine.wrap(f)` 返回 `RustClosure { upvalues: [Thread] }`
+/// - `io.lines(file)` 返回 `RustClosure { upvalues: [file_ptr_id, formats, ...] }`
+///
+/// ## upvalues 可变性
+///
+/// upvalues 使用 `Rc<RefCell<Vec<TValue>>>`，允许 io.lines 更新 `finished` 标志。
+/// clone 时共享同一份 upvalues（对应 C Lua 中闭包共享 upvalue 的语义）。
+///
+/// ## 调用路径
+///
+/// 与 `BuiltinFn` 相同：op_call/op_tailcall/TFORCALL/pcall 直接通过函数指针派发，
+/// 无需 tag 匹配或 metatable 查找。被调用函数从 `state.stack[a]` 取回 RustClosure，
+/// 再从 upvalues 取状态。
+///
+/// ## GC
+///
+/// RustClosure 需注册到 GC 遍历：GC 标记时遍历 upvalues 中的可达对象
+/// （如 Thread、Table）。用 `Rc::as_ptr` 做 visited 去重。
+///
+/// Scenario: 创建并调用 Rust 闭包
+/// Given: 一个 BuiltinFnPtr 函数指针和若干 upvalues
+/// When: 用 `TValue::RustClosure(Rc::new(RustClosure { func, name, upvalues }))` 注册
+/// Then: Lua 代码调用时，VM 直接通过函数指针调用，从 upvalues 取状态
+#[derive(Clone)]
+pub struct RustClosure {
+    /// 函数指针 — 签名与 BuiltinFnPtr 相同
+    pub func: BuiltinFnPtr,
+    /// 函数名（NUL 终止 C 字符串，用于 traceback）
+    pub name: *const u8,
+    /// 上值列表 — 可变，存储 coroutine.wrap 的 Thread 或 io.lines 的文件/格式
+    pub upvalues: Rc<RefCell<Vec<TValue>>>,
+}
+
+impl std::fmt::Debug for RustClosure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let name = unsafe {
+            if self.name.is_null() {
+                "<null>".to_string()
+            } else {
+                std::ffi::CStr::from_ptr(self.name as *const std::ffi::c_char)
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        f.debug_struct("RustClosure")
+            .field("name", &name)
+            .field("func", &(self.func as usize))
+            .field("nupvalues", &self.upvalues.borrow().len())
+            .finish()
+    }
+}
+
+impl RustClosure {
+    /// 获取函数名的 &str
+    pub fn name_str(&self) -> &str {
+        if self.name.is_null() {
+            ""
+        } else {
+            unsafe {
+                std::ffi::CStr::from_ptr(self.name as *const std::ffi::c_char)
+                    .to_str()
+                    .unwrap_or("")
+            }
+        }
+    }
+}
+
+// ============================================================================
 // 规约：TValue — Lua 核心值类型
 // ============================================================================
 
@@ -331,6 +411,11 @@ pub enum TValue {
     /// 用于注册 Rust 实现的内置函数。调用时直接通过函数指针派发，
     /// 无需 tag 范围匹配。详见 `BuiltinFn` 类型文档。
     BuiltinFn(BuiltinFn),
+    /// Rust 闭包（函数指针 + 可变 upvalues）
+    ///
+    /// 用于 coroutine.wrap 和 io.lines 等需要携带状态的内置函数。
+    /// 详见 `RustClosure` 类型文档。
+    RustClosure(Rc<RustClosure>),
     /// 用户数据（同理用 Rc）
     UserData(Rc<Udata>),
     /// 线程/协程（同理用 Rc）
@@ -373,7 +458,8 @@ impl TValue {
             TValue::LClosure(_)
             | TValue::CClosure(_)
             | TValue::LCFn(_)
-            | TValue::BuiltinFn(_) => LuaType::Function,
+            | TValue::BuiltinFn(_)
+            | TValue::RustClosure(_) => LuaType::Function,
             TValue::UserData(_) => LuaType::UserData,
             TValue::Thread(_) => LuaType::Thread,
         }
@@ -495,6 +581,9 @@ impl TValue {
     /// Given: TValue::BuiltinFn(_)
     /// When: 调用 .is_function()
     /// Then: 返回 true
+    /// Given: TValue::RustClosure(_)
+    /// When: 调用 .is_function()
+    /// Then: 返回 true
     /// Given: TValue::LightUserData(_)  // 真正的 light userdata，非内置函数
     /// When: 调用 .is_function()
     /// Then: 返回 false
@@ -505,26 +594,16 @@ impl TValue {
                 | TValue::CClosure(_)
                 | TValue::LCFn(_)
                 | TValue::BuiltinFn(_)
+                | TValue::RustClosure(_)
         )
     }
 
-    /// 判断值是否可调用（兼容 io.lines 迭代器的 LightUserData 形式）
+    /// 判断值是否可调用
     ///
-    /// 所有内置库（base/math/utf8/table/os/debug/io/coroutine/string）已迁移到 BuiltinFn，
-    /// coroutine.wrap 返回 Table（由 get_wrap_idx 检测）。
-    /// LightUserData 仅剩 io.lines 迭代器 (tag >= 0x1000_0000_0000_0000) 作为内置 tag。
+    /// 所有内置库已迁移到 BuiltinFn/RustClosure，coroutine.wrap 和 io.lines
+    /// 返回 RustClosure。LightUserData 不再承担派发职责，回归本职。
     pub fn is_callable(&self) -> bool {
-        if self.is_function() {
-            return true;
-        }
-        if let TValue::LightUserData(p) = self {
-            let tag = *p as usize;
-            // io lines iterator: 极大值范围
-            if tag >= 0x1000_0000_0000_0000 {
-                return true;
-            }
-        }
-        false
+        self.is_function()
     }
 
     /// 尝试获取整数值
@@ -610,6 +689,7 @@ impl PartialEq for TValue {
             (TValue::BuiltinFn(a), TValue::BuiltinFn(b)) => {
                 std::ptr::eq(a.func as *const (), b.func as *const ())
             }
+            (TValue::RustClosure(a), TValue::RustClosure(b)) => Rc::ptr_eq(a, b),
             (TValue::UserData(a), TValue::UserData(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
             (TValue::Thread(a), TValue::Thread(b)) => Rc::ptr_eq(&a.context, &b.context),
             _ => false,
@@ -677,6 +757,10 @@ impl Hash for TValue {
                 12u8.hash(state);
                 (b.func as usize).hash(state);
             }
+            TValue::RustClosure(rc) => {
+                13u8.hash(state);
+                (Rc::as_ptr(rc) as usize).hash(state);
+            }
             TValue::UserData(u) => {
                 10u8.hash(state);
                 u.gc_header.ptr_id.hash(state);
@@ -707,6 +791,7 @@ impl fmt::Display for TValue {
             TValue::CClosure(_) => write!(f, "function"),
             TValue::LCFn(_) => write!(f, "function"),
             TValue::BuiltinFn(b) => write!(f, "function: {}", b.name_str()),
+            TValue::RustClosure(rc) => write!(f, "function: {}", rc.name_str()),
             TValue::UserData(_) => write!(f, "userdata"),
             TValue::Thread(_) => write!(f, "thread"),
         }

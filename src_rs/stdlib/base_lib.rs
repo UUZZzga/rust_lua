@@ -29,9 +29,10 @@ use std::rc::Rc;
 // 迭代器函数 (call_ipairs_aux, call_next_iter) 作为 BuiltinFn 返回给 Lua，
 // 由 op_call/op_tailcall/TFORCALL 的 BuiltinFn 分支统一派发。
 //
-// 注意：coroutine.wrap 返回 Table（带 WRAP_MARKER 元表），由 get_wrap_idx 检测，
-// 不存在 LightUserData 形式的 wrap 函数。LightUserData 仅剩 io.lines 迭代器
-// (tag >= 0x1000_0000_0000_0000)，由 io_lib::is_lines_iterator_tag 判定。
+// 注意：
+// - coroutine.wrap 返回 RustClosure（携带 upvalues[0] = Thread），由 RustClosure 分支派发。
+// - io.lines/file:lines 返回 RustClosure（携带 upvalues 状态）。
+// - LightUserData 不再承担函数派发职责，type() 一律返回 "userdata"。
 
 // ============================================================================
 // 辅助函数: TValue 转字符串 (对应 C 的 luaL_tolstring)
@@ -52,16 +53,9 @@ pub fn lua_value_to_string(v: &TValue) -> String {
         TValue::LClosure(_)
         | TValue::LCFn(_)
         | TValue::CClosure(_)
-        | TValue::BuiltinFn(_) => "function: 0x0".to_string(),
-        // LightUserData 仅 io.lines 迭代器 (tag >= 0x1000_0000_0000_0000) 表现为 function
-        TValue::LightUserData(p) => {
-            let tag = *p as usize;
-            if crate::stdlib::io_lib::is_lines_iterator_tag(tag) {
-                "function: 0x0".to_string()
-            } else {
-                format!("userdata: {:?}", p)
-            }
-        }
+        | TValue::BuiltinFn(_)
+        | TValue::RustClosure(_) => "function: 0x0".to_string(),
+        TValue::LightUserData(p) => format!("userdata: {:?}", p),
         TValue::UserData(_) => "userdata: 0x0".to_string(),
         TValue::Thread(_) => "thread: 0x0".to_string(),
     }
@@ -163,28 +157,15 @@ pub fn base_type_name(v: &TValue) -> &'static str {
     match v {
         TValue::Nil(_) => "nil",
         TValue::Boolean(_) => "boolean",
-        // LightUserData 仅 io.lines 迭代器 (tag >= 0x1000_0000_0000_0000) 表现为 function
-        TValue::LightUserData(p) => {
-            let tag = *p as usize;
-            if crate::stdlib::io_lib::is_lines_iterator_tag(tag) {
-                "function"
-            } else {
-                "userdata"
-            }
-        }
+        TValue::LightUserData(_) => "userdata",
         TValue::Integer(_) | TValue::Float(_) => "number",
         TValue::Str(_) => "string",
-        TValue::Table(_) => {
-            // coroutine.wrap 返回的 Table 在 type() 中应表现为 "function"
-            if crate::stdlib::coroutine_lib::get_wrap_idx(v).is_some() {
-                "function"
-            } else {
-                "table"
-            }
-        }
-        TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) | TValue::BuiltinFn(_) => {
-            "function"
-        }
+        TValue::Table(_) => "table",
+        TValue::LClosure(_)
+        | TValue::CClosure(_)
+        | TValue::LCFn(_)
+        | TValue::BuiltinFn(_)
+        | TValue::RustClosure(_) => "function",
         TValue::UserData(_) => "userdata",
         TValue::Thread(_) => "thread",
     }
@@ -2446,20 +2427,11 @@ fn call_load(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
         | TValue::BuiltinFn(_)
         | TValue::LCFn(_)
         | TValue::CClosure(_)
-        | TValue::LightUserData(_) => {
+        | TValue::RustClosure(_) => {
             // reader 函数模式: 循环调用 reader() 累积字符串
-            // LightUserData 必须是可调用的 function tag (io.lines 迭代器)，
-            // 对应 C 的 luaL_checktype(L, 1, LUA_TFUNCTION) — C 中 io.lines
-            // 返回 C 闭包 (LUA_TFUNCTION)，Rust 用 LightUserData tag 代替
-            if let TValue::LightUserData(tag) = &chunk_val {
-                let tag_val = *tag as usize;
-                if !crate::stdlib::io_lib::is_lines_iterator_tag(tag_val) {
-                    return Err(VmError::RuntimeError(format!(
-                        "bad argument #1 to 'load' (function expected, got {})",
-                        chunk_val.ty()
-                    )));
-                }
-            }
+            // 对应 C 的 luaL_checktype(L, 1, LUA_TFUNCTION) — 函数变体均可
+            // (LClosure/CClosure/LCFn/BuiltinFn/RustClosure)。
+            // io.lines 返回的 RustClosure 也可作为 reader 使用。
             // 对应 C 的 generic_reader + luaZ_fill 的循环
             // EOF 条件: reader 返回 nil (对应 C 的 lua_isnil → NULL)
             //         或返回空字符串 "" (对应 C 的 size==0 → EOZ)
@@ -3102,16 +3074,8 @@ fn call_collectgarbage(
                 push_results(state, a, nresults, vec![]);
                 return Ok(());
             } else {
-                // 清理 wrap_coros 中不再被外部引用的协程
-                // （ThreadContext 的 Rc 计数 == 1 表示只有 wrap_coros 持有）
-                for entry in state.wrap_coros.iter_mut() {
-                    if let Some(thread) = entry {
-                        let rc_count = std::rc::Rc::strong_count(&thread.context);
-                        if rc_count <= 1 {
-                            *entry = None;
-                        }
-                    }
-                }
+                // 协程可达性由 RustClosure 的 upvalues[0] (Thread) 跟踪，
+                // collect_gc 会通过 mark_tvalue 遍历 RustClosure，自动回收不可达的协程。
                 // collect_gc 内部会清理弱引用表中的死条目
                 state.collect_gc();
                 TValue::Integer(0)
