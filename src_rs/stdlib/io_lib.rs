@@ -145,9 +145,8 @@ fn new_file_userdata(state: &mut LuaState, file: *mut libc::FILE, file_mt: &Tabl
         data: vec![],
     };
     // 注册到 GC 并设置 id（使 mark_tvalue 能正确标记 reachable）
-    let ud_id = state
-        .gc
-        .register_object(std::mem::size_of::<crate::objects::Udata>());
+    // 用 gc_mem_size() 计费含 data/user_values 容量，比 size_of::<Udata>() 更接近真实占用
+    let ud_id = state.gc.register_object(udata.gc_mem_size());
     udata.gc_header.set_id(ud_id);
     let ptr_id = udata.gc_header.ptr_id;
     state.file_handles.insert(ptr_id, file);

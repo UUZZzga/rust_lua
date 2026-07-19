@@ -379,13 +379,13 @@ impl LuaState {
         let gc = Rc::new(GCState::default_incremental());
         let globals = {
             let t = Table::new();
-            let id = gc.register_object(64);
+            let id = gc.register_object(t.mem_size());
             t.gc_header.set_id(id);
             t
         };
         let registry = {
             let t = Table::new();
-            let id = gc.register_object(64);
+            let id = gc.register_object(t.mem_size());
             t.gc_header.set_id(id);
             t
         };
@@ -572,13 +572,13 @@ impl LuaState {
     pub fn with_gc(gc: Rc<GCState>) -> Self {
         let globals = {
             let t = Table::new();
-            let id = gc.register_object(64);
+            let id = gc.register_object(t.mem_size());
             t.gc_header.set_id(id);
             t
         };
         let registry = {
             let t = Table::new();
-            let id = gc.register_object(64);
+            let id = gc.register_object(t.mem_size());
             t.gc_header.set_id(id);
             t
         };
@@ -718,14 +718,14 @@ impl LuaState {
 
         let globals = {
             let t = Table::new();
-            let id = gc.register_object(64);
+            let id = gc.register_object(t.mem_size());
             t.gc_header.set_id(id);
             t
         };
 
         let registry = {
             let t = Table::new();
-            let id = gc.register_object(64);
+            let id = gc.register_object(t.mem_size());
             t.gc_header.set_id(id);
             t
         };
@@ -2646,6 +2646,7 @@ impl LuaState {
         reachable: &mut GcHashSet,
         visited: &mut GcHashSet,
         worklist: &mut Vec<TValue>,
+        extra_size: &mut usize,
     ) {
         let mode_key = TValue::Str(self.mode_key_cached());
         let mut changed = true;
@@ -2704,7 +2705,7 @@ impl LuaState {
                 }
             }
             while let Some(val) = worklist.pop() {
-                self.mark_tvalue(&val, reachable, visited, worklist);
+                self.mark_tvalue(&val, reachable, visited, worklist, extra_size);
             }
         }
     }
@@ -2840,7 +2841,7 @@ impl LuaState {
         let saved_allowhook = self.allowhook;
         self.allowhook = false;
 
-        let prev_estimate = self.gc.gc_estimate.get();
+        let prev_estimate = self.gc.total_estimate();
         let result = self.collect_gc_inner();
 
         // 恢复 hook 状态
@@ -2850,7 +2851,7 @@ impl LuaState {
         // GC 回收对象后，Rust 分配器（glibc malloc）可能仍持有释放的内存不归还操作系统。
         // malloc_trim(0) 是系统调用，开销较大（perf 显示 ~1.5%）。
         // 仅当释放了大量内存（>1MB）时才调用，避免在小 GC 中浪费。
-        let cur_estimate = self.gc.gc_estimate.get();
+        let cur_estimate = self.gc.total_estimate();
         if prev_estimate > cur_estimate + 1024 * 1024 {
             unsafe {
                 libc::malloc_trim(0);
@@ -2957,23 +2958,28 @@ impl LuaState {
         // 主线程的 context（saved_stack 等）需要被收集
         self.collect_thread_roots(&self.main_thread, &mut worklist);
 
+        // extra_size: 累加无 gc_header 的可达对象（Proto/CClosure/RustClosure/Thread）的
+        // gc_mem_size()，用于 collect_gc 后重算 gc_extra_estimate。
+        // 长串不在此累加（用 ptr_id 去重困难），短串在 sweep 后遍历 string_table 累加。
+        let mut extra_size: usize = 0;
+
         // 处理工作列表
         while let Some(val) = worklist.pop() {
-            self.mark_tvalue(&val, &mut reachable, &mut visited, &mut worklist);
+            self.mark_tvalue(&val, &mut reachable, &mut visited, &mut worklist, &mut extra_size);
         }
 
         // ephemeron 表传递性处理：对于弱键表，如果值可达，则保留键。
         // 对应 C Lua 的 traverseephemeron + convergeephemerons。
         // 迭代直到收敛：值可达 → 标记键 → 键引用的对象可达 → 可能导致其他值可达...
-        self.process_ephemerons(&mut reachable, &mut visited, &mut worklist);
+        self.process_ephemerons(&mut reachable, &mut visited, &mut worklist, &mut extra_size);
 
         // 收集需要 finalize 的对象并"复活"它们 — 在 clear_weak_tables 之前调用。
         // 对应 C Lua 的 finalizer 对象"复活"语义：finalizer 执行时对象仍可达，
         // 其引用的对象也应被标记，然后才能清除弱表（避免误清除 finalizer 引用的弱表条目）。
-        let to_finalize = self.collect_finalizers(&mut reachable, &mut visited, &mut worklist);
+        let to_finalize = self.collect_finalizers(&mut reachable, &mut visited, &mut worklist, &mut extra_size);
 
         // 复活后可能引入新的 ephemeron 关系，再次处理 ephemeron 直到收敛
-        self.process_ephemerons(&mut reachable, &mut visited, &mut worklist);
+        self.process_ephemerons(&mut reachable, &mut visited, &mut worklist, &mut extra_size);
 
         // 清理弱引用表：基于标记结果清除死亡的弱引用键/值
         self.clear_weak_tables(&reachable);
@@ -2993,9 +2999,23 @@ impl LuaState {
         // 对应 C Lua 的 sweepstrings；字符串不注册到 GC metas，需单独清理
         self.string_table.sweep();
 
-        // 动态阈值 = estimate * pause / 100（与 C 实现一致，基于字节而非对象数）
+        // 累加 string_table 中存活短串的 gc_mem_size() 到 extra_size。
+        // 短串由 string_table 管理（无 gc_header），需在此遍历计费。
+        // 长串由 Arc 引用计数管理（Box<LongString> 每次 clone 独立内存），
+        //   不在此累加（ptr_id 去重困难且长串通常数量少），偏差可容忍。
+        self.string_table.for_each(|ss| {
+            extra_size += std::mem::size_of::<crate::strings::ShortString>()
+                + ss.contents.capacity()
+                + 16; // Arc 内部控制结构
+        });
+
+        // 重算 extra_estimate：反映当前可达的无 gc_header 对象的内存占用
+        self.gc.set_extra_estimate(extra_size);
+
+        // 动态阈值 = total_estimate * pause / 100（含 extra_estimate，使 GC 触发
+        // 更准确地反映真实内存占用，避免无 gc_header 对象不计费导致 GC 不及时）
         let pause = self.gc.get_gc_param(GCState::PARAM_PAUSE).max(1) as usize;
-        let new_threshold = self.gc.gc_estimate.get() * pause / 100;
+        let new_threshold = self.gc.total_estimate() * pause / 100;
         self.gc.set_collect_threshold(new_threshold);
         self.gc.set_debt(100);
         self.gc.step_accum.set(0);
@@ -3037,6 +3057,7 @@ impl LuaState {
         reachable: &mut GcHashSet,
         visited: &mut GcHashSet,
         worklist: &mut Vec<TValue>,
+        extra_size: &mut usize,
     ) -> Vec<TValue> {
         let gc_key = TValue::Str(self.gc_key_cached());
         let mut to_finalize: Vec<TValue> = Vec::new();
@@ -3091,7 +3112,7 @@ impl LuaState {
         self.ud_finobj_list = ud_keep;
 
         while let Some(val) = worklist.pop() {
-            self.mark_tvalue(&val, reachable, visited, worklist);
+            self.mark_tvalue(&val, reachable, visited, worklist, extra_size);
         }
 
         to_finalize
@@ -3341,6 +3362,7 @@ impl LuaState {
         reachable: &mut GcHashSet,
         visited: &mut GcHashSet,
         worklist: &mut Vec<TValue>,
+        extra_size: &mut usize,
     ) {
         match val {
             TValue::Table(t) => {
@@ -3392,6 +3414,9 @@ impl LuaState {
                 }
                 let ptr_id = c.gc_header.ptr_id;
                 if visited.insert(ptr_id as usize) {
+                    // Proto 无 gc_header，通过 LClosure.proto 的 Rc 引用管理生命周期。
+                    // 累加 proto.gc_mem_size() 到 extra_size，使 GC estimate 含 Proto 内存。
+                    *extra_size += c.proto.gc_mem_size();
                     let upvals = c.upvals.borrow();
                 for uv_ref in upvals.iter() {
                     let uv = uv_ref.borrow();
@@ -3422,6 +3447,7 @@ impl LuaState {
                 let ptr = Rc::as_ptr(cc) as usize;
                 if visited.insert(ptr) {
                     reachable.insert(ptr);
+                    *extra_size += cc.gc_mem_size();
                     for uv in &cc.upvalue {
                         if Self::needs_gc_mark(uv) {
                             worklist.push(uv.clone());
@@ -3439,6 +3465,7 @@ impl LuaState {
                 let ptr = Rc::as_ptr(rc) as usize;
                 if visited.insert(ptr) {
                     reachable.insert(ptr);
+                    *extra_size += rc.gc_mem_size();
                     let upvals = rc.upvalues.borrow();
                     for uv in upvals.iter() {
                         if Self::needs_gc_mark(uv) {
@@ -3470,6 +3497,7 @@ impl LuaState {
                 let ptr = Rc::as_ptr(&t.context) as usize;
                 if visited.insert(ptr) {
                     reachable.insert(ptr);
+                    *extra_size += t.gc_mem_size();
                     self.collect_thread_roots(t, worklist);
                 }
             }
@@ -3478,8 +3506,10 @@ impl LuaState {
     }
 
     /// 当 metas 大小超过动态阈值时自动触发 GC
+    /// 使用 total_estimate（含无 gc_header 对象的 extra_estimate）判断阈值，
+    /// 使 GC 触发更准确反映真实内存占用
     pub fn maybe_collect_gc(&mut self) {
-        if self.gc.is_running() && self.gc.gc_estimate.get() > self.gc.collect_threshold() {
+        if self.gc.is_running() && self.gc.total_estimate() > self.gc.collect_threshold() {
             self.collect_gc();
         }
     }

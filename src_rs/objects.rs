@@ -359,6 +359,18 @@ impl RustClosure {
             }
         }
     }
+
+    /// 估算 RustClosure 真实堆占用（用于 GC 内存计费）。
+    /// RustClosure 不调用 register_object（无 gc_header），由 gc_extra_estimate 跟踪。
+    pub fn gc_mem_size(&self) -> usize {
+        // Rc<RustClosure> 堆分配 = RustClosure 自身（Rc 无额外头，引用计数在 RcBox 内）
+        // RustClosure = { func: fn ptr, name: *const u8, upvalues: Rc<RefCell<Vec<TValue>>> }
+        // upvalues Vec 堆分配 = capacity * size_of::<TValue>()
+        let upvals_cap = self.upvalues.borrow().capacity();
+        std::mem::size_of::<RustClosure>()
+            + upvals_cap * std::mem::size_of::<TValue>()
+            + 16 // Rc<RefCell<Vec>> 分配头估算
+    }
 }
 
 // ============================================================================
@@ -979,6 +991,31 @@ pub struct CClosure {
     pub upvalue: Vec<TValue>,
 }
 
+impl LClosure {
+    /// 估算 LClosure 真实堆占用（用于 GC 内存计费）。
+    /// LClosure 通过 register_object 注册，但 size_of::<LClosure>() 不含 upvals 容量。
+    /// Proto 由 gc_extra_estimate 单独跟踪（共享，避免重复计费）。
+    pub fn gc_mem_size(&self) -> usize {
+        // Rc<LClosure> 堆分配 = LClosure 自身
+        // upvals: Rc<RefCell<Vec<UpValRef>>>，Vec 堆分配 = capacity * size_of::<UpValRef>()
+        let upvals_cap = self.upvals.borrow().capacity();
+        std::mem::size_of::<LClosure>()
+            + upvals_cap * std::mem::size_of::<UpValRef>()
+            + 16 // Rc<RefCell<Vec>> 分配头估算
+    }
+}
+
+impl CClosure {
+    /// 估算 CClosure 真实堆占用（用于 GC 内存计费）。
+    /// CClosure 不调用 register_object（无 gc_header），由 gc_extra_estimate 跟踪。
+    pub fn gc_mem_size(&self) -> usize {
+        // Rc<CClosure> 堆分配 = CClosure 自身
+        // upvalue: Vec<TValue>，Vec 堆分配 = capacity * size_of::<TValue>()
+        std::mem::size_of::<CClosure>()
+            + self.upvalue.capacity() * std::mem::size_of::<TValue>()
+    }
+}
+
 // ============================================================================
 // 规约：上值 (UpValue)
 // ============================================================================
@@ -1153,6 +1190,24 @@ impl Proto {
     pub fn need_vararg_table(&mut self) {
         self.flag |= PF_VATAB;
     }
+
+    /// 估算 Proto 真实堆占用（用于 GC 内存计费）。
+    /// Proto 不调用 register_object（无 gc_header），由 gc_extra_estimate 跟踪。
+    /// Proto 创建后字段不再扩容，故用 capacity 精确计费。
+    pub fn gc_mem_size(&self) -> usize {
+        // Rc<Proto> 堆分配 = Proto 自身（Rc 引用计数在 RcBox 内）
+        // Proto 内部多个 Rc<Vec> 共享，此处按 capacity 计费（共享时由首个持有者承担）
+        std::mem::size_of::<Proto>()
+            + self.constants.capacity() * std::mem::size_of::<TValue>()
+            + self.code.capacity() * std::mem::size_of::<Instruction>()
+            + self.protos.capacity() * std::mem::size_of::<Rc<Proto>>()
+            + self.upvalues.capacity() * std::mem::size_of::<UpvalDesc>()
+            + self.line_info.capacity() * std::mem::size_of::<i8>()
+            + self.abs_line_info.capacity() * std::mem::size_of::<AbsLineInfo>()
+            + self.loc_vars.capacity() * std::mem::size_of::<LocVar>()
+            // Rc<Vec> 分配头估算（每个 Rc<Vec> 约 16 字节分配头）
+            + 16 * 5
+    }
 }
 
 /// 原型标志位
@@ -1184,6 +1239,19 @@ pub struct Udata {
     pub user_values: Vec<TValue>,
     /// 原始数据
     pub data: Vec<u8>,
+}
+
+impl Udata {
+    /// 估算 Udata 真实堆占用（用于 GC 内存计费）。
+    /// Udata 通过 register_object 注册，但 size_of::<Udata>() 不含 data/user_values 容量。
+    pub fn gc_mem_size(&self) -> usize {
+        // Rc<Udata> 堆分配 = Udata 自身
+        // data: Vec<u8>，堆分配 = capacity
+        // user_values: Vec<TValue>，堆分配 = capacity * size_of::<TValue>()
+        std::mem::size_of::<Udata>()
+            + self.data.capacity()
+            + self.user_values.capacity() * std::mem::size_of::<TValue>()
+    }
 }
 
 // ============================================================================
@@ -1298,6 +1366,20 @@ pub struct LuaThread {
     pub is_main: bool,
     /// 持久化执行上下文（Rc 共享，clone 后仍指向同一份状态）
     pub context: Rc<RefCell<ThreadContext>>,
+}
+
+impl LuaThread {
+    /// 估算 LuaThread 真实堆占用（用于 GC 内存计费）。
+    /// LuaThread 不调用 register_object（无 gc_header），由 gc_extra_estimate 跟踪。
+    /// stack 在运行期会扩容，collect_gc 后重算以反映当前容量。
+    pub fn gc_mem_size(&self) -> usize {
+        // Rc<LuaThread> 堆分配 = LuaThread 自身
+        // stack: Vec<TValue>，堆分配 = capacity * size_of::<TValue>()
+        // context: Rc<RefCell<ThreadContext>>，含 saved_stack 等 Vec（粗略估算 64）
+        std::mem::size_of::<LuaThread>()
+            + self.stack.capacity() * std::mem::size_of::<TValue>()
+            + 64 // ThreadContext + RefCell 分配头估算
+    }
 }
 
 /// 线程状态

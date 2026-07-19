@@ -3090,8 +3090,8 @@ fn call_collectgarbage(
             TValue::Integer(0)
         }
         "count" => {
-            // 返回内存使用量 (KB) — 基于 GC 估算
-            TValue::Float(state.gc.gc_estimate.get() as f64 / 1024.0)
+            // 返回内存使用量 (KB) — 基于 GC 估算（含无 gc_header 对象的 extra_estimate）
+            TValue::Float(state.gc.total_estimate() as f64 / 1024.0)
         }
         "countb" => {
             // 返回内存使用量的小数部分 (字节) — 简化为 0

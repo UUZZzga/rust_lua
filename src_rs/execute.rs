@@ -5350,7 +5350,8 @@ impl VmExecutor {
                 upvals: Rc::new(RefCell::new(upvals)),
             });
             // 注册到 GC metas，使 gc_estimate 增长，让 maybe_collect_gc 的阈值检查能正常工作
-            let closure_id = state.gc.register_object(std::mem::size_of::<LClosure>());
+            // 用 gc_mem_size() 计费含 upvals 容量，比 size_of::<LClosure>() 更接近真实占用
+            let closure_id = state.gc.register_object(closure.gc_mem_size());
             closure.gc_header.set_id(closure_id);
             Self::write_stack(state, ra, TValue::LClosure(closure));
         }

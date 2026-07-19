@@ -538,10 +538,17 @@ impl Table {
 
     pub fn mem_size(&self) -> usize {
         let data = self.data.borrow();
-        std::mem::size_of::<Table>()
+        let mut size = std::mem::size_of::<Table>()
             + data.array.capacity() * std::mem::size_of::<TValue>()
-            + data.hash_buckets.len()
-                * (std::mem::size_of::<TValue>() * 2 + std::mem::size_of::<u8>())
+            + data.hash_buckets.capacity()
+                * (std::mem::size_of::<TValue>() * 2);
+        // key_to_bucket HashMap 堆占用：capacity * (size_of::<TValue>() + size_of::<usize>())
+        // + HashMap 内部控制结构（约 56 字节）
+        if let Some(ref ktb) = data.key_to_bucket {
+            size += ktb.capacity() * (std::mem::size_of::<TValue>() + std::mem::size_of::<usize>())
+                + 56;
+        }
+        size
     }
 }
 

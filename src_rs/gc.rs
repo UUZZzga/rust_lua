@@ -235,6 +235,10 @@ pub struct GCState {
     ephemeron: RefCell<VecDeque<GCObjectId>>,
     pub gc_debt: Cell<isize>,
     pub gc_estimate: Cell<usize>,
+    /// 无 gc_header 对象（String/Proto/CClosure/RustClosure/LuaThread）的估算占用。
+    /// 这些对象不调用 register_object，无法通过 gc_estimate 跟踪。
+    /// 创建时通过 charge_extra 增加（触发 GC），collect_gc 后通过 set_extra_estimate 重算（精确）。
+    pub gc_extra_estimate: Cell<usize>,
     pub gc_stop: Cell<u8>,
     pub gc_params: [Cell<i32>; 6],
     pub in_minor: Cell<bool>,
@@ -261,6 +265,7 @@ impl GCState {
             ephemeron: RefCell::new(VecDeque::new()),
             gc_debt: Cell::new(0),
             gc_estimate: Cell::new(0),
+            gc_extra_estimate: Cell::new(0),
             gc_stop: Cell::new(0),
             gc_params: [
                 Cell::new(0),
@@ -377,7 +382,7 @@ impl GCState {
         all_objects.push(id.0);
 
         let current = self.gc_debt.get();
-        let charged = size.max(64) as isize;
+        let charged = size.max(32) as isize;
         self.gc_debt.set(current - charged);
         let estimate = self.gc_estimate.get();
         self.gc_estimate.set(estimate + charged as usize);
@@ -389,7 +394,7 @@ impl GCState {
         let mut metas = self.metas.borrow_mut();
         if (id.0 as usize) < metas.len() {
             if let Some(meta) = &metas[id.0 as usize] {
-                let charged = meta.size.max(64);
+                let charged = meta.size.max(32);
                 let estimate = self.gc_estimate.get();
                 self.gc_estimate.set(estimate.saturating_sub(charged));
             }
@@ -456,6 +461,34 @@ impl GCState {
         self.next_collect_threshold.set(threshold);
     }
 
+    // ========================================================================
+    // 无 gc_header 对象的计费（String/Proto/CClosure/RustClosure/LuaThread）
+    // 这些对象不调用 register_object，通过 gc_extra_estimate 跟踪占用。
+    // ========================================================================
+
+    /// 创建无 gc_header 对象时增加 extra estimate（触发 GC）。
+    /// collect_gc 后通过 set_extra_estimate 重算为精确值。
+    pub fn charge_extra(&self, size: usize) {
+        let cur = self.gc_extra_estimate.get();
+        self.gc_extra_estimate.set(cur + size);
+    }
+
+    /// 设置 extra estimate（collect_gc 后重算使用）。
+    pub fn set_extra_estimate(&self, size: usize) {
+        self.gc_extra_estimate.set(size);
+    }
+
+    /// 返回 extra estimate（无 gc_header 对象的估算占用）。
+    pub fn extra_estimate(&self) -> usize {
+        self.gc_extra_estimate.get()
+    }
+
+    /// 返回总估算占用 = gc_estimate（已注册对象）+ gc_extra_estimate（无 gc_header 对象）。
+    /// collectgarbage("count") 和 GC 触发阈值应基于此值。
+    pub fn total_estimate(&self) -> usize {
+        self.gc_estimate.get().saturating_add(self.gc_extra_estimate.get())
+    }
+
     /// 清扫不可达对象：只遍历 all_objects 活跃列表，释放所有不在 `reachable` 集合中的对象。
     /// 对应 C 的 sweep 阶段（C 遍历 allgc 链表，此处遍历 all_objects 列表）。
     pub fn sweep_unreachable(&self, reachable: &std::collections::HashSet<usize, crate::objects::FxBuildHasher>) {
@@ -470,7 +503,7 @@ impl GCState {
             let i = id as usize;
             if !reachable.contains(&i) {
                 if let Some(ref meta) = metas[i] {
-                    total_freed_size = total_freed_size.saturating_add(meta.size.max(64));
+                    total_freed_size = total_freed_size.saturating_add(meta.size.max(32));
                 }
                 metas[i] = None;
                 free_ids.push(id);
@@ -879,10 +912,10 @@ impl GCState {
 
     pub fn set_obj_size(&self, id: GCObjectId, size: usize) {
         if let Some(mut meta) = self.meta_mut(id) {
-            // 用 .max(64) 保持与 register_object/sweep_unreachable 一致的 charge 口径
-            // 否则当 old < 64 时，register 收取 64 但此处只按 old 调整，导致 gc_estimate 虚高
-            let old_charged = meta.size.max(64);
-            let new_charged = size.max(64);
+            // 用 .max(32) 保持与 register_object/sweep_unreachable 一致的 charge 口径
+            // 否则当 old < 32 时，register 收取 32 但此处只按 old 调整，导致 gc_estimate 虚高
+            let old_charged = meta.size.max(32);
+            let new_charged = size.max(32);
             meta.size = size;
             let estimate = self.gc_estimate.get();
             self.gc_estimate.set(estimate + new_charged - old_charged);

@@ -1224,7 +1224,8 @@ pub extern "C-unwind" fn lua_newuserdatauv(L: *mut lua_State, sz: usize, nuvalue
         data: vec![0u8; sz],
     };
     // 注册到 GC 并设置 id（使 mark_tvalue 能正确标记 reachable）
-    let ud_id = L.gc.register_object(std::mem::size_of::<crate::objects::Udata>());
+    // 用 gc_mem_size() 计费含 data/user_values 容量，比 size_of::<Udata>() 更接近真实占用
+    let ud_id = L.gc.register_object(udata.gc_mem_size());
     udata.gc_header.set_id(ud_id);
     let ptr = udata.data.as_mut_ptr() as *mut c_void;
     L.stack.push(TValue::UserData(Rc::new(udata)));

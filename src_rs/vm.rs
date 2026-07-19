@@ -1237,12 +1237,13 @@ pub fn push_closure(
         }
     }
 
-    let closure_id = gc.register_object(std::mem::size_of::<crate::objects::LClosure>());
     let closure = Rc::new(crate::objects::LClosure {
         gc_header: crate::gc::GCObjectHeader::new(),
         proto: Rc::new(proto.clone()),
         upvals: Rc::new(RefCell::new(upvals)),
     });
+    // 用 gc_mem_size() 计费含 upvals 容量，比 size_of::<LClosure>() 更接近真实占用
+    let closure_id = gc.register_object(closure.gc_mem_size());
     closure.gc_header.set_id(closure_id);
 
     // GC barrier (luaC_objbarrier): for each upvalue, if closure is black

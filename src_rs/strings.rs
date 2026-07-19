@@ -375,6 +375,25 @@ impl LuaString {
         s
     }
 
+    /// 估算字符串真实堆占用（用于 GC 内存计费）。
+    /// 短串: Arc 分配头 + ShortString 结构 + contents 堆分配
+    /// 长串: Box 指针 + LongString 结构 + contents 堆分配
+    /// 字符串不调用 register_object（无 gc_header），由 gc_extra_estimate 跟踪。
+    pub fn gc_mem_size(&self) -> usize {
+        match self {
+            // Arc 分配 = ArcInner<ShortString>（含引用计数 usize）+ ShortString 自身
+            // ShortString = { hash: u64, contents: String }，String 堆分配 = capacity
+            LuaString::Short(s) => {
+                std::mem::size_of::<ShortString>() + s.contents.capacity() + 16
+            }
+            // Box<LongString> 堆分配 = LongString 自身（Box 无额外头）
+            // LongString = { hash: AtomicU64, extra: AtomicU8, contents: String, ptr_id: u32 }
+            LuaString::Long(s) => {
+                std::mem::size_of::<LongString>() + s.contents.capacity() + 8
+            }
+        }
+    }
+
     #[inline]
     pub fn as_str(&self) -> &str {
         self.as_str_inner().0
