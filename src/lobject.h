@@ -8,11 +8,6 @@
 #ifndef lobject_h
 #define lobject_h
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-
 
 #include <stdarg.h>
 
@@ -303,7 +298,6 @@ typedef union {
 ** Common Header for all collectable objects (in macro form, to be
 ** included in other objects)
 */
-struct GCObject;
 #define CommonHeader	struct GCObject *next; lu_byte tt; lu_byte marked
 
 
@@ -865,11 +859,6 @@ LUAI_FUNC const char *luaO_pushvfstring (lua_State *L, const char *fmt,
 LUAI_FUNC const char *luaO_pushfstring (lua_State *L, const char *fmt, ...);
 LUAI_FUNC void luaO_chunkid (char *out, const char *source, size_t srclen);
 
-
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif
 

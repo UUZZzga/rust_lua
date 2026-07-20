@@ -7,11 +7,6 @@
 #ifndef ldebug_h
 #define ldebug_h
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-
 
 #include "lstate.h"
 
@@ -66,10 +61,5 @@ LUAI_FUNC l_noret luaG_errormsg (lua_State *L);
 LUAI_FUNC int luaG_traceexec (lua_State *L, const Instruction *pc);
 LUAI_FUNC int luaG_tracecall (lua_State *L);
 
-
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif

@@ -7,11 +7,6 @@
 #ifndef ldo_h
 #define ldo_h
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-
 
 #include "llimits.h"
 #include "lobject.h"
@@ -99,11 +94,6 @@ LUAI_FUNC int luaD_checkminstack (lua_State *L);
 LUAI_FUNC l_noret luaD_throw (lua_State *L, TStatus errcode);
 LUAI_FUNC l_noret luaD_throwbaselevel (lua_State *L, TStatus errcode);
 LUAI_FUNC TStatus luaD_rawrunprotected (lua_State *L, Pfunc f, void *ud);
-
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif
 

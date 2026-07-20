@@ -47,8 +47,8 @@ fn main() {
     let mut build = cc::Build::new();
 
     build
-        .cpp(true)
-        .std("c++11")
+        .cpp(false)
+        .std("gnu99")  // 匹配原版 Lua 5.5.0 Makefile 的 -std=gnu99
         .include(&lua_src_dir)
         .flag("-Wall")
         .flag("-Wextra")
@@ -62,42 +62,42 @@ fn main() {
         build.define("LUA_USE_APICHECK", None);
     }
 
-    let cpp_files: Vec<&str> = vec![
-        "lapi.cpp",
-        "lauxlib.cpp",
-        "lbaselib.cpp",
-        "lcode.cpp",
-        "lcorolib.cpp",
-        "lctype.cpp",
-        "ldblib.cpp",
-        "ldebug.cpp",
-        "ldo.cpp",
-        "ldump.cpp",
-        "lfunc.cpp",
-        "lgc.cpp",
-        "linit.cpp",
-        "liolib.cpp",
-        "llex.cpp",
-        "lmathlib.cpp",
-        "lmem.cpp",
-        "loadlib.cpp",
-        "lobject.cpp",
-        "lopcodes.cpp",
-        "loslib.cpp",
-        "lparser.cpp",
-        "lstate.cpp",
-        "lstring.cpp",
-        "lstrlib.cpp",
-        "ltable.cpp",
-        "ltablib.cpp",
-        "ltm.cpp",
-        "lundump.cpp",
-        "lutf8lib.cpp",
-        "lvm.cpp",
-        "lzio.cpp",
+    let c_files: Vec<&str> = vec![
+        "lapi.c",
+        "lauxlib.c",
+        "lbaselib.c",
+        "lcode.c",
+        "lcorolib.c",
+        "lctype.c",
+        "ldblib.c",
+        "ldebug.c",
+        "ldo.c",
+        "ldump.c",
+        "lfunc.c",
+        "lgc.c",
+        "linit.c",
+        "liolib.c",
+        "llex.c",
+        "lmathlib.c",
+        "lmem.c",
+        "loadlib.c",
+        "lobject.c",
+        "lopcodes.c",
+        "loslib.c",
+        "lparser.c",
+        "lstate.c",
+        "lstring.c",
+        "lstrlib.c",
+        "ltable.c",
+        "ltablib.c",
+        "ltm.c",
+        "lundump.c",
+        "lutf8lib.c",
+        "lvm.c",
+        "lzio.c",
     ];
 
-    for f in &cpp_files {
+    for f in &c_files {
         let path = lua_src_dir.join(f);
         if path.exists() {
             build.file(&path);

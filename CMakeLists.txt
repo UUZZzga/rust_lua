@@ -1,9 +1,9 @@
 cmake_minimum_required(VERSION 3.16)
-project(lua VERSION 5.5.0 LANGUAGES CXX)
+project(lua VERSION 5.5.0 LANGUAGES C)
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_C_EXTENSIONS ON)  # 启用 GNU 扩展，匹配原版 gnu99
 
 # Build options
 option(LUA_USE_READLINE "Enable readline support" OFF)
@@ -11,12 +11,11 @@ option(LUA_COMPAT_MATHLIB "Enable deprecated math functions" OFF)
 
 # Compile options
 include(CheckCCompilerFlag)
-include(CheckCXXCompilerFlag)
 
-# 检查 C++ 编译器是否支持 -g3
-check_cxx_compiler_flag("-g3" CXX_COMPILER_SUPPORTS_G3)
-if(CXX_COMPILER_SUPPORTS_G3)
-    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g3")
+# 检查 C 编译器是否支持 -g3
+check_c_compiler_flag("-g3" C_COMPILER_SUPPORTS_G3)
+if(C_COMPILER_SUPPORTS_G3)
+    set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -g3")
 endif()
 
 set(LUA_COMPILE_OPTIONS -Wall -Wextra)
@@ -27,47 +26,47 @@ else()
     list(APPEND LUA_COMPILE_OPTIONS -O2)
 endif()
 
-# C++ Core sources
+# C Core sources
 set(CORE_SOURCES
-    src/lapi.cpp
-    src/lcode.cpp
-    src/lctype.cpp
-    src/ldebug.cpp
-    src/ldo.cpp
-    src/ldump.cpp
-    src/lfunc.cpp
-    src/lgc.cpp
-    src/llex.cpp
-    src/lmem.cpp
-    src/lobject.cpp
-    src/lopcodes.cpp
-    src/lparser.cpp
-    src/lstate.cpp
-    src/lstring.cpp
-    src/ltable.cpp
-    src/ltm.cpp
-    src/lundump.cpp
-    src/lvm.cpp
-    src/lzio.cpp
+    src/lapi.c
+    src/lcode.c
+    src/lctype.c
+    src/ldebug.c
+    src/ldo.c
+    src/ldump.c
+    src/lfunc.c
+    src/lgc.c
+    src/llex.c
+    src/lmem.c
+    src/lobject.c
+    src/lopcodes.c
+    src/lparser.c
+    src/lstate.c
+    src/lstring.c
+    src/ltable.c
+    src/ltm.c
+    src/lundump.c
+    src/lvm.c
+    src/lzio.c
 )
 
-# C++ Library sources
+# C Library sources
 set(LIB_SOURCES
-    src/lauxlib.cpp
-    src/lbaselib.cpp
-    src/lcorolib.cpp
-    src/ldblib.cpp
-    src/liolib.cpp
-    src/lmathlib.cpp
-    src/loadlib.cpp
-    src/loslib.cpp
-    src/lstrlib.cpp
-    src/ltablib.cpp
-    src/lutf8lib.cpp
-    src/linit.cpp
+    src/lauxlib.c
+    src/lbaselib.c
+    src/lcorolib.c
+    src/ldblib.c
+    src/liolib.c
+    src/lmathlib.c
+    src/loadlib.c
+    src/loslib.c
+    src/lstrlib.c
+    src/ltablib.c
+    src/lutf8lib.c
+    src/linit.c
 )
 
-# Build C++ library
+# Build C library
 add_library(lualib STATIC ${CORE_SOURCES} ${LIB_SOURCES})
 target_compile_options(lualib PRIVATE ${LUA_COMPILE_OPTIONS})
 target_link_libraries(lualib PUBLIC m)
@@ -82,7 +81,7 @@ if(APPLE)
 endif()
 
 set_source_files_properties(
-    src/llex.cpp src/lparser.cpp src/lcode.cpp
+    src/llex.c src/lparser.c src/lcode.c
     PROPERTIES COMPILE_FLAGS "-Os"
 )
 
@@ -91,13 +90,13 @@ if(LUA_COMPAT_MATHLIB)
 endif()
 
 # Lua interpreter
-add_executable(lua src/lua.cpp)
+add_executable(lua src/lua.c)
 target_link_libraries(lua lualib)
 target_compile_options(lua PRIVATE ${LUA_COMPILE_OPTIONS})
 set_target_properties(lua PROPERTIES ENABLE_EXPORTS TRUE)
 
 # Lua compiler
-add_executable(luac src/luac.cpp)
+add_executable(luac src/luac.c)
 target_link_libraries(luac lualib)
 target_compile_options(luac PRIVATE ${LUA_COMPILE_OPTIONS})
 
@@ -130,7 +129,7 @@ install(DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/
 message(STATUS "")
 message(STATUS "=== Lua ${PROJECT_VERSION} Build Configuration ===")
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
-message(STATUS "C++ standard: ${CMAKE_CXX_STANDARD}")
+message(STATUS "C standard: ${CMAKE_C_STANDARD}")
 message(STATUS "Readline: ${LUA_USE_READLINE}")
 message(STATUS "Compat mathlib: ${LUA_COMPAT_MATHLIB}")
 message(STATUS "===========================================")

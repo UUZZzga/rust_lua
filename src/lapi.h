@@ -7,11 +7,6 @@
 #ifndef lapi_h
 #define lapi_h
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-
 
 #include "llimits.h"
 #include "lstate.h"
@@ -66,10 +61,5 @@ extern "C" {
 	api_check(L, (n) < L->top.p - L->ci->func.p &&  \
                      L->tbclist.p < L->top.p - (n), \
 			  "not enough free elements in the stack")
-
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif

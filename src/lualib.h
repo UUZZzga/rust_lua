@@ -8,11 +8,6 @@
 #ifndef lualib_h
 #define lualib_h
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-
 #include "lua.h"
 
 
@@ -66,10 +61,5 @@ LUALIB_API void (luaL_openselectedlibs) (lua_State *L, int load, int preload);
 /* open all libraries */
 #define luaL_openlibs(L)	luaL_openselectedlibs(L, ~0, 0)
 
-
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif

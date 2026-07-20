@@ -55,7 +55,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: build
-          key: cmake-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'src/*.cpp', 'src/*.h', 'src/*.hpp') }}
+          key: cmake-${{ runner.os }}-${{ hashFiles('CMakeLists.txt', 'src/*.c', 'src/*.h', 'src/*.hpp') }}
           restore-keys: |
             cmake-${{ runner.os }}-
 

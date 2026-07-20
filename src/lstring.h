@@ -7,11 +7,6 @@
 #ifndef lstring_h
 #define lstring_h
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-
 #include "lgc.h"
 #include "lobject.h"
 #include "lstate.h"
@@ -74,10 +69,5 @@ LUAI_FUNC TString *luaS_newextlstr (lua_State *L,
 		const char *s, size_t len, lua_Alloc falloc, void *ud);
 LUAI_FUNC size_t luaS_sizelngstr (size_t len, int kind);
 LUAI_FUNC TString *luaS_normstr (lua_State *L, TString *ts);
-
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif

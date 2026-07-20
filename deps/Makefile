@@ -1,6 +1,6 @@
 # Makefile for building Lua C modules against the Rust Lua 5.5 implementation
 #
-# Each module is compiled as a shared library (.so) with lauxlib.cpp statically
+# Each module is compiled as a shared library (.so) with lauxlib.c statically
 # linked, so luaL_* functions (luaL_error, luaL_checklstring, etc.) are
 # available even though they aren't exported by the Rust binary.
 #
@@ -36,7 +36,7 @@ ALL_TARGETS := $(CJSON_TARGET) $(SOCKET_CORE_TARGET) $(MIME_TARGET)
 # --- lauxlib object (statically linked into each .so) ---------------------
 LAUXLIB_O := $(DEPS_BUILD)/lauxlib.o
 
-$(LAUXLIB_O): $(LUA_INCLUDE)/lauxlib.cpp $(LUA_INCLUDE)/lauxlib.h $(LUA_INCLUDE)/lua.h
+$(LAUXLIB_O): $(LUA_INCLUDE)/lauxlib.c $(LUA_INCLUDE)/lauxlib.h $(LUA_INCLUDE)/lua.h
 	@mkdir -p $(@D)
 	$(CC) $(CFLAGS) -c $< -o $@
 

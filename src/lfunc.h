@@ -7,11 +7,6 @@
 #ifndef lfunc_h
 #define lfunc_h
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
-
 
 #include "lobject.h"
 
@@ -66,10 +61,5 @@ LUAI_FUNC void luaF_freeproto (lua_State *L, Proto *f);
 LUAI_FUNC const char *luaF_getlocalname (const Proto *func, int local_number,
                                          int pc);
 
-
-
-#ifdef __cplusplus
-}
-#endif
 
 #endif
