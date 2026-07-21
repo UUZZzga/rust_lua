@@ -3525,7 +3525,6 @@ mod tests {
         use crate::gc::GCObjectHeader;
         use crate::objects::UpvalDesc;
         use crate::strings::LuaString;
-        use std::sync::Arc;
 
         let mut state = LuaState::new();
         let proto = Proto {
@@ -3545,7 +3544,7 @@ mod tests {
             code: Rc::new(vec![]),
             protos: Rc::new(vec![]),
             upvalues: Rc::new(vec![UpvalDesc {
-                name: Some(LuaString::Short(Arc::new(crate::strings::ShortString {
+                name: Some(LuaString::Short(crate::strings::ArcRc::new(crate::strings::ShortString {
                     hash: 0,
                     contents: "x".to_string(),
                 }))),
@@ -3734,10 +3733,9 @@ mod tests {
     #[test]
     fn test_short_src() {
         use crate::strings::LuaString;
-        use std::sync::Arc;
 
         let make_str = |s: &str| -> LuaString {
-            LuaString::Short(Arc::new(crate::strings::ShortString {
+            LuaString::Short(crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
                 contents: s.to_string(),
             }))

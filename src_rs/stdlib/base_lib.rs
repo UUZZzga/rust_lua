@@ -3251,10 +3251,9 @@ pub fn open_base_lib(state: &mut LuaState) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
 
     fn make_str(s: &str) -> TValue {
-        TValue::Str(crate::strings::LuaString::Short(Arc::new(
+        TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
                 contents: s.to_string(),

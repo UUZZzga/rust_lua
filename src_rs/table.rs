@@ -733,7 +733,7 @@ mod tests {
     #[test]
     fn test_get_string_key() {
         let t = Table::new();
-        let key = LuaString::Short(std::sync::Arc::new(ShortString {
+        let key = LuaString::Short(crate::strings::ArcRc::new(ShortString {
             hash: 0,
             contents: "name".into(),
         }));
@@ -829,7 +829,7 @@ mod tests {
     #[test]
     fn test_set_string_key() {
         let t = Table::new();
-        let key = LuaString::Short(std::sync::Arc::new(ShortString {
+        let key = LuaString::Short(crate::strings::ArcRc::new(ShortString {
             hash: 0,
             contents: "key".into(),
         }));
@@ -1093,7 +1093,7 @@ mod tests {
     #[test]
     fn test_rehash_preserves_string_keys() {
         let t = Table::new();
-        let key = LuaString::Short(std::sync::Arc::new(ShortString {
+        let key = LuaString::Short(crate::strings::ArcRc::new(ShortString {
             hash: 0,
             contents: "mykey".into(),
         }));

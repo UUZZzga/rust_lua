@@ -14,7 +14,6 @@ use crate::state::LuaState;
 use crate::table::Table;
 use crate::tm::{make_tm_tvalue, Metatable, TagMethod};
 use std::rc::Rc;
-use std::sync::Arc;
 
 // ============================================================================
 // 算术元方法 (对应 C 的 arith_add, arith_sub, ...)
@@ -2283,7 +2282,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                         match s {
                             crate::strings::LuaString::Short(arc) => {
                                 // 短字符串：使用 Arc 的指针地址（内部化保证同一内容同一 Arc）
-                                let ptr = std::sync::Arc::as_ptr(arc) as usize;
+                                let ptr = crate::strings::ArcRc::as_ptr(arc) as usize;
                                 format!("0x{:x}", ptr)
                             }
                             crate::strings::LuaString::Long(ls) => {
@@ -4509,7 +4508,7 @@ mod tests {
 
     #[test]
     fn test_str_format_string() {
-        let args = vec![TValue::Str(crate::strings::LuaString::Short(Arc::new(
+        let args = vec![TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
                 contents: "world".to_string(),
@@ -4557,7 +4556,7 @@ mod tests {
     fn test_str_format_multiple() {
         let args = vec![
             TValue::Integer(1),
-            TValue::Str(crate::strings::LuaString::Short(Arc::new(
+            TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
                 crate::strings::ShortString {
                     hash: 0,
                     contents: "two".to_string(),
@@ -4587,7 +4586,7 @@ mod tests {
     fn test_str_format_q_string() {
         // %q 字符串:加引号并转义
         let args = vec![TValue::Str(crate::strings::LuaString::Short(
-            std::sync::Arc::new(crate::strings::ShortString {
+            crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
                 contents: "hello".to_string(),
             }),
@@ -4730,7 +4729,7 @@ mod tests {
 
     #[test]
     fn test_to_num_string_integer() {
-        let v = TValue::Str(crate::strings::LuaString::Short(Arc::new(
+        let v = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
                 contents: "42".to_string(),
@@ -4742,7 +4741,7 @@ mod tests {
 
     #[test]
     fn test_to_num_string_float() {
-        let v = TValue::Str(crate::strings::LuaString::Short(Arc::new(
+        let v = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
                 contents: "3.14".to_string(),
@@ -4754,7 +4753,7 @@ mod tests {
 
     #[test]
     fn test_to_num_invalid_string() {
-        let v = TValue::Str(crate::strings::LuaString::Short(Arc::new(
+        let v = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
                 contents: "abc".to_string(),
@@ -4775,7 +4774,7 @@ mod tests {
     #[test]
     fn test_arith_op_add_strings() {
         let make_str = |s: &str| {
-            TValue::Str(crate::strings::LuaString::Short(Arc::new(
+            TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
                 crate::strings::ShortString {
                     hash: 0,
                     contents: s.to_string(),
@@ -5180,7 +5179,7 @@ mod tests {
         assert_pack_eq(
             "<c3",
             &[TValue::Str(crate::strings::LuaString::Short(
-                std::sync::Arc::new(crate::strings::ShortString {
+                crate::strings::ArcRc::new(crate::strings::ShortString {
                     hash: 0,
                     contents: "abc".to_string(),
                 }),
@@ -5192,7 +5191,7 @@ mod tests {
         assert_pack_eq(
             "<c5",
             &[TValue::Str(crate::strings::LuaString::Short(
-                std::sync::Arc::new(crate::strings::ShortString {
+                crate::strings::ArcRc::new(crate::strings::ShortString {
                     hash: 0,
                     contents: "ab".to_string(),
                 }),
@@ -5204,7 +5203,7 @@ mod tests {
     #[test]
     fn test_pack_string_zstr() {
         // z = 零终止字符串
-        let s = TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+        let s = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
                 contents: "hello".to_string(),
@@ -5216,7 +5215,7 @@ mod tests {
     #[test]
     fn test_pack_string_s() {
         // s = 带长度前缀的字符串 (默认 size_t = 8 字节)
-        let s = TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+        let s = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
                 contents: "hi".to_string(),
@@ -5232,7 +5231,7 @@ mod tests {
     #[test]
     fn test_pack_string_s1() {
         // s1 = 1 字节长度前缀的字符串
-        let s = TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+        let s = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
                 contents: "hi".to_string(),
@@ -5243,7 +5242,7 @@ mod tests {
 
     #[test]
     fn test_pack_empty_string() {
-        let empty = TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+        let empty = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
                 contents: "".to_string(),
@@ -5265,7 +5264,7 @@ mod tests {
         // 包含特殊字符的字符串
         let bytes = vec![0u8, 1, 2, 255, 254, 128];
         let s = unsafe { String::from_utf8_unchecked(bytes.clone()) };
-        let sval = TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+        let sval = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
                 contents: s,
@@ -5275,7 +5274,7 @@ mod tests {
 
         // z 字符串中不能包含 0 (除了终止符)
         let s2 = unsafe { String::from_utf8_unchecked(vec![1u8, 2, 3]) };
-        let sval2 = TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+        let sval2 = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
                 contents: s2,
@@ -5527,7 +5526,7 @@ mod tests {
 
     #[test]
     fn test_pack_string_too_long() {
-        let s = TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+        let s = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
                 contents: "hello".to_string(),
@@ -5551,7 +5550,7 @@ mod tests {
     #[test]
     fn test_pack_complex_format() {
         // 复合格式: i1 + c3 + i2
-        let s = TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+        let s = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
                 contents: "abc".to_string(),
@@ -5563,7 +5562,7 @@ mod tests {
 
     #[test]
     fn test_pack_unpack_complex_roundtrip() {
-        let s = TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+        let s = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
                 contents: "XY".to_string(),

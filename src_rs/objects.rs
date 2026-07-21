@@ -2356,7 +2356,7 @@ mod tests {
             hash: 0,
             contents: LuaString::with_nul("hello"),
         };
-        let ts = LuaString::Short(std::sync::Arc::new(short));
+        let ts = LuaString::Short(crate::strings::ArcRc::new(short));
         assert_eq!(ts.as_str(), "hello");
         assert_eq!(ts.len(), 5);
         assert!(matches!(ts, LuaString::Short(_)));
@@ -2382,7 +2382,7 @@ mod tests {
             hash: 0,
             contents: LuaString::with_nul(""),
         };
-        let ts = LuaString::Short(std::sync::Arc::new(short));
+        let ts = LuaString::Short(crate::strings::ArcRc::new(short));
         assert!(ts.is_empty());
         assert_eq!(ts.len(), 0);
         assert_eq!(ts.as_str(), "");
@@ -2390,16 +2390,16 @@ mod tests {
 
     #[test]
     fn test_luastring_eq() {
-        let arc1 = std::sync::Arc::new(ShortString {
+        let arc1 = crate::strings::ArcRc::new(ShortString {
             hash: 0,
             contents: LuaString::with_nul("foo"),
         });
-        let arc2 = std::sync::Arc::clone(&arc1);
+        let arc2 = crate::strings::ArcRc::clone(&arc1);
         let ts1 = LuaString::Short(arc1);
         let ts2 = LuaString::Short(arc2);
         assert_eq!(ts1, ts2);
 
-        let arc3 = std::sync::Arc::new(ShortString {
+        let arc3 = crate::strings::ArcRc::new(ShortString {
             hash: 1,
             contents: LuaString::with_nul("bar"),
         });
@@ -2423,7 +2423,7 @@ mod tests {
 
     #[test]
     fn test_luastring_as_str() {
-        let short = LuaString::Short(std::sync::Arc::new(ShortString {
+        let short = LuaString::Short(crate::strings::ArcRc::new(ShortString {
             hash: 0,
             contents: LuaString::with_nul("abc"),
         }));

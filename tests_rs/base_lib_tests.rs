@@ -790,7 +790,7 @@ fn test_version_contains_lua() {
 // ============================================================================
 
 fn make_str(s: &str) -> TValue {
-    TValue::Str(lua_rs::strings::LuaString::Short(Arc::new(
+    TValue::Str(lua_rs::strings::LuaString::Short(lua_rs::strings::ArcRc::new(
         lua_rs::strings::ShortString {
             hash: 0,
             contents: s.to_string(),

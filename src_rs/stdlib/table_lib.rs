@@ -47,11 +47,6 @@ fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: i64) -> i64 
     }
 }
 
-/// 获取表的长度 (使用 Table 自身的 len 实现，正确处理 array+hash 边界)
-fn table_len(table: &crate::table::Table) -> i64 {
-    table.len()
-}
-
 /// 获取对象长度，支持 __len 元方法 (对应 C 的 luaL_len)
 ///
 /// 调用 obj_len (会触发 __len 元方法)，然后转为整数。
@@ -75,13 +70,9 @@ fn get_obj_len(state: &mut LuaState, obj: &TValue) -> Result<i64, VmError> {
     }
 }
 
-/// 获取表中指定整数键的值
-fn table_get_int(table: &crate::table::Table, key: i64) -> TValue {
-    table.get_int(key).unwrap_or(TValue::Nil(NilKind::Strict))
-}
-
 /// 获取 t[i]，支持 __index 元方法 (对应 C lua_geti → luaV_finishget)
 /// 用于 table 库函数对表元素访问时透明地调用元方法（如 proxy 表）
+#[inline]
 fn geti_meta(state: &mut LuaState, table_val: &TValue, i: i64) -> Result<TValue, VmError> {
     VmExecutor::table_get(
         state,
@@ -92,7 +83,19 @@ fn geti_meta(state: &mut LuaState, table_val: &TValue, i: i64) -> Result<TValue,
 }
 
 /// 设置 t[i] = v，支持 __newindex 元方法 (对应 C lua_seti → luaV_finishset)
+#[inline]
 fn seti_meta(state: &mut LuaState, table_val: &TValue, i: i64, val: TValue) -> Result<(), VmError> {
+    VmExecutor::table_set(
+        state,
+        table_val.clone(),
+        TValue::Integer(i),
+        val,
+        crate::execute::VarSource::None,
+    )
+}
+
+#[inline]
+fn seti_meta_(state: &mut LuaState, table_val: TValue, i: i64, val: TValue) -> Result<(), VmError> {
     VmExecutor::table_set(
         state,
         table_val,
@@ -103,6 +106,7 @@ fn seti_meta(state: &mut LuaState, table_val: &TValue, i: i64, val: TValue) -> R
 }
 
 /// 将结果压入栈并调整栈顶
+#[inline]
 fn push_results(state: &mut LuaState, a: usize, nresults: i32, results: Vec<TValue>) {
     state.adjust_results(a, nresults, results);
 }
@@ -308,7 +312,7 @@ fn call_insert(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     if nargs == 2 {
         // insert at end — 对应 C: pos = e; lua_seti(L, 1, pos)
         let val = get_arg(state, a, 1);
-        seti_meta(state, &list_val, e, val)?;
+        seti_meta_(state, list_val, e, val)?;
     } else if nargs == 3 {
         // insert at position
         let pos = get_opt_int_arg(state, a, 1, 0);
@@ -326,14 +330,14 @@ fn call_insert(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
             seti_meta(state, &list_val, i, v)?;
             i -= 1;
         }
-        seti_meta(state, &list_val, pos, val)?;
+        seti_meta_(state, list_val, pos, val)?;
     } else {
         // 对应 C: default → "wrong number of arguments to 'insert'"
         return Err(VmError::RuntimeError(
             "wrong number of arguments to 'insert'".to_string(),
         ));
     }
-    push_results(state, a, nresults, vec![list_val.clone()]);
+    push_results(state, a, nresults, vec![]);
     Ok(())
 }
 
@@ -381,7 +385,7 @@ fn call_remove(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     // 清除 shift 后的最终位置 (i == min(pos, len)) — 对应 C 的 lua_seti(L, 1, pos)
     // 当 pos <= len: i == len, 清除 t[len] (原最后一个元素被 shift 覆盖后的位置)
     // 当 pos == len+1: shift 不执行, i == pos == len+1, 清除 t[len+1] (不影响 t[len])
-    seti_meta(state, &list_val, i, TValue::Nil(NilKind::Strict))?;
+    seti_meta_(state, list_val, i, TValue::Nil(NilKind::Strict))?;
 
     push_results(state, a, nresults, vec![removed]);
     Ok(())
@@ -733,7 +737,7 @@ fn call_move(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
                 )?;
                 crate::execute::VmExecutor::table_set(
                     state,
-                    &dst_val,
+                    dst_val.clone(),
                     dst_key,
                     val,
                     crate::execute::VarSource::None,
@@ -753,7 +757,7 @@ fn call_move(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
                 )?;
                 crate::execute::VmExecutor::table_set(
                     state,
-                    &dst_val,
+                    dst_val.clone(),
                     dst_key,
                     val,
                     crate::execute::VarSource::None,

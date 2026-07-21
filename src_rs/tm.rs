@@ -1424,7 +1424,7 @@ impl VarargTable {
             t.set_int(i as i64 + 1, v.clone());
         }
         t.set(
-            TValue::Str(LuaString::Short(std::sync::Arc::new(ShortString {
+            TValue::Str(LuaString::Short(crate::strings::ArcRc::new(ShortString {
                 hash: rust_hash("n"),
                 contents: "n".to_string(),
             }))),
@@ -1497,14 +1497,14 @@ impl VarargTable {
 
 pub fn make_tm_tvalue(tm: TagMethod) -> TValue {
     let name = tm.name();
-    TValue::Str(LuaString::Short(std::sync::Arc::new(ShortString {
+    TValue::Str(LuaString::Short(crate::strings::ArcRc::new(ShortString {
         hash: rust_hash(name),
         contents: name.to_string(),
     })))
 }
 
 fn make_ls(s: &str) -> TValue {
-    TValue::Str(LuaString::Short(std::sync::Arc::new(ShortString {
+    TValue::Str(LuaString::Short(crate::strings::ArcRc::new(ShortString {
         hash: rust_hash(s),
         contents: s.to_string(),
     })))

@@ -2,12 +2,15 @@ use std::collections::HashMap;
 
 use crate::state::LuaState;
 use crate::strings::LuaString;
+use crate::objects::FxBuildHasher;
 
 /// 编译器内部缓冲区的缓存,用于避免每次编译时重复分配 Vec/String/HashMap 的堆内存。
 /// 通过 `COMPILER_CACHE` 线程局部变量跨编译调用复用,减少 glibc 堆碎片和 RSS。
 struct CompilerCache {
     errors: Vec<String>,
-    scanner_strings: HashMap<String, LuaString>,
+    /// 用 FxBuildHasher 替代默认 SipHash,减少长字符串去重时的哈希开销
+    /// (String 内容有足够熵,FxHash 分布足够均匀)
+    scanner_strings: HashMap<String, LuaString, FxBuildHasher>,
     token_text: String,
 }
 
@@ -15,8 +18,12 @@ impl CompilerCache {
     fn new() -> Self {
         CompilerCache {
             errors: Vec::new(),
-            scanner_strings: HashMap::new(),
-            token_text: String::new(),
+            scanner_strings: HashMap::default(),
+            // 预分配 64 字节: perf 显示 read_token 是 finish_grow 的主要 caller (10 次),
+            // token_text 用于存储数字/字符串字面量的原始文本,常见长度 1-64 字节。
+            // 预分配后避免首次 push_str 触发 0→1→2→4→...→64 的多次扩容。
+            // CompilerCache 通过 thread_local 复用,容量在后续编译中保持。
+            token_text: String::with_capacity(64),
         }
     }
     fn clear(&mut self) {
@@ -66,10 +73,12 @@ pub enum Token {
     While,
 
     // Literals
-    Name(String),
+    // Name/String 直接保存已 intern 的 LuaString (Rc 引用),
+    // 避免每次 lex 都 malloc 新 String。clone 时只增加 refcount, 零分配。
+    Name(LuaString),
     Int(i64),
     Float(f64),
-    String(String),
+    String(LuaString),
 
     // Symbols
     Plus,
@@ -150,8 +159,8 @@ impl Token {
     /// - 关键字/符号: 返回 `"'<name>'"` (如 `"'and'"`, `"'//'"`)
     pub fn to_display_str(&self) -> String {
         match self {
-            Token::Name(s) => format!("'{}'", s),
-            Token::String(s) => format!("'{}'", s),
+            Token::Name(s) => format!("'{}'", s.as_str()),
+            Token::String(s) => format!("'{}'", s.as_str()),
             Token::Int(n) => format!("'{}'", n),
             Token::Float(f) => format!("'{}'", f),
             Token::Eof => "<eof>".to_string(),
@@ -229,6 +238,7 @@ impl Token {
 ///
 /// pos 越界时返回 `EOF_CHAR` (而非 '\0'),以便区分源码中的真实 \0 字节与 EOF。
 /// (C 版本用 int 的 -1 表示 EOZ; Rust 中用 U+10FFFF sentinel。)
+#[inline]
 fn read_char_at(bytes: &[u8], pos: usize) -> char {
     if pos >= bytes.len() {
         return EOF_CHAR;
@@ -315,7 +325,11 @@ pub struct LexState<'a> {
     /// Scanner string table — 对应 C 的 `ls->h`。
     /// 锚定长字符串字面量,确保同一源码中的长字符串返回同一 `LuaString` (相同 ptr_id)。
     /// 短字符串已通过全局 `StringTable` 内部化去重,无需在此重复。
-    scanner_strings: HashMap<String, LuaString>,
+    /// 用 FxBuildHasher 替代默认 SipHash,减少哈希开销
+    scanner_strings: HashMap<String, LuaString, FxBuildHasher>,
+    /// 缓存的 "_ENV" LuaString — 避免每次 code_global_via_env* 都重新 hash+查找
+    /// 全局 StringTable。第一次 env_str_cached() 调用时填充，后续直接 clone（refcount++）。
+    cached_env: Option<LuaString>,
     /// 当前 token 的原始文本 — 对应 C 的 `luaZ_buffer(ls->buff)`。
     /// 用于错误消息中显示数字/字符串的原始文本 (如 "1.000" 而不是 "1")。
     pub token_text: String,
@@ -352,9 +366,22 @@ impl<'a> LexState<'a> {
             errors,
             nesting_level: 0,
             scanner_strings,
+            cached_env: None,
             token_text,
             _cache: Some(cache_holder),
         }
+    }
+
+    /// 获取缓存的 "_ENV" LuaString。第一次调用时 intern 并缓存，
+    /// 后续直接 clone（refcount++），避免每次 code_global_via_env* 都做 hash+查找。
+    #[inline]
+    pub fn env_str_cached(&mut self) -> LuaString {
+        if let Some(ref k) = self.cached_env {
+            return k.clone();
+        }
+        let k = self.state.intern("_ENV");
+        self.cached_env = Some(k.clone());
+        k
     }
 
     /// 锚定字符串字面量,对应 C 的 `anchorstr` (llex.cpp)。
@@ -376,16 +403,15 @@ impl<'a> LexState<'a> {
     #[inline(always)]
     fn next_char(&mut self) {
         let old = self.current;
+        self.advance_pos();
+        // 换行处理: 绝大多数字符非换行,把换行分支挪到 advance_pos 之后,
+        // 让非换行路径只有一次 `old == '\n' || '\r'` 检查 (原代码有两次)。
         if old == '\n' || old == '\r' {
             self.linenumber += 1;
-        }
-        self.advance_pos();
-        // 处理 \n\r 或 \r\n 配对: 两者合为一个换行 (对应 C inclinenumber 的配对逻辑)
-        if (old == '\n' || old == '\r')
-            && (self.current == '\n' || self.current == '\r')
-            && self.current != old
-        {
-            self.advance_pos();
+            // 处理 \n\r 或 \r\n 配对: 两者合为一个换行 (对应 C inclinenumber 的配对逻辑)
+            if (self.current == '\n' || self.current == '\r') && self.current != old {
+                self.advance_pos();
+            }
         }
     }
 
@@ -393,21 +419,38 @@ impl<'a> LexState<'a> {
     #[inline(always)]
     fn advance_pos(&mut self) {
         let bytes = self.source.as_bytes();
-        if self.pos < bytes.len() {
-            if bytes[self.pos] < 0x80 {
-                self.pos += 1;
+        let len = bytes.len();
+        if self.pos < len {
+            // 推进 pos: ASCII 快速路径只做一次 bytes[pos] < 0x80 检查
+            self.pos += if bytes[self.pos] < 0x80 {
+                1
             } else {
                 // 尝试解析为 UTF-8;无效字节按单字节处理 (对应 C 按字节读取)
                 match std::str::from_utf8(&bytes[self.pos..])
                     .ok()
                     .and_then(|s| s.chars().next())
                 {
-                    Some(ch) => self.pos += ch.len_utf8(),
-                    None => self.pos += 1,
+                    Some(ch) => ch.len_utf8(),
+                    None => 1,
                 }
-            }
+            };
         }
-        self.current = read_char_at(self.source.as_bytes(), self.pos);
+        // 内联 read_char_at 逻辑,复用 bytes/len 缓存,避免重复 as_bytes() + 边界检查
+        // (perf: advance_pos 是 read_token 内最频繁调用的函数,减少冗余开销)
+        let p = self.pos;
+        self.current = if p >= len {
+            EOF_CHAR
+        } else if bytes[p] < 0x80 {
+            bytes[p] as char
+        } else {
+            match std::str::from_utf8(&bytes[p..])
+                .ok()
+                .and_then(|s| s.chars().next())
+            {
+                Some(ch) => ch,
+                None => bytes[p] as char,
+            }
+        };
     }
 
     #[inline(always)]
@@ -547,10 +590,11 @@ impl<'a> LexState<'a> {
 
     pub fn lookahead_next(&mut self) -> &Token {
         if self.lookahead.is_none() {
-            let saved_token = self.token.clone();
+            // 用 mem::replace 替代 clone,避免两次 Token::clone 开销
+            // (perf 显示 Token drop_glue 0.62%,此处是主要 clone 源之一)
+            let saved_token = std::mem::replace(&mut self.token, Token::Eof);
             self.read_token();
-            self.lookahead = Some(self.token.clone());
-            self.token = saved_token;
+            self.lookahead = Some(std::mem::replace(&mut self.token, saved_token));
         }
         self.lookahead.as_ref().unwrap()
     }
@@ -765,13 +809,15 @@ impl<'a> LexState<'a> {
         while self.current.is_ascii_alphanumeric() || self.current == '_' {
             self.next_char();
         }
-        // 源码可能包含非法 UTF-8 字节 (如 string.char(0x80)),str 切片会在
-        // continuation byte 处 panic。此处用字节切片绕过边界检查。
-        // read_name 只消费 ASCII 字母数字/下划线,内容必为合法 UTF-8。
-        let s = std::str::from_utf8(&self.source.as_bytes()[start..self.pos]).unwrap();
-        self.token_text.clear();
-        self.token_text.push_str(s);
-        self.token = Token::is_keyword(s).unwrap_or_else(|| Token::Name(s.to_string()));
+        // read_name 只消费 ASCII 字母数字/下划线,字节切片必为合法 ASCII (UTF-8 子集)。
+        // 用 from_utf8_unchecked 跳过验证,省去 perf 中 2.50% 的 from_utf8 开销。
+        let bytes = &self.source.as_bytes()[start..self.pos];
+        let s = unsafe { std::str::from_utf8_unchecked(bytes) };
+        // 直接 intern 到 StringTable, 避免每次都 s.to_string() 分配新 String。
+        // intern 命中时只增加 Rc refcount, 不分配新堆内存 (perf 显示 read_name malloc 1.66%)。
+        // 对应 C 的 luaX_newstring: 直接返回 intern 后的 TString*。
+        let ls = self.anchor_string(s);
+        self.token = Token::is_keyword(s).unwrap_or(Token::Name(ls));
     }
 
     fn read_number(&mut self) {
@@ -839,7 +885,10 @@ impl<'a> LexState<'a> {
             self.next_char();
         }
 
-        let s = std::str::from_utf8(&self.source.as_bytes()[start..self.pos]).unwrap();
+        // read_number 只消费数字、'.'、'e/E'、'+/-'、'x/X'、'p/P'、'a-f/A-F' 等 ASCII 字符,
+        // 字节切片必为合法 ASCII (UTF-8 子集)。用 from_utf8_unchecked 跳过验证。
+        let bytes = &self.source.as_bytes()[start..self.pos];
+        let s = unsafe { std::str::from_utf8_unchecked(bytes) };
         self.token_text.clear();
         self.token_text.push_str(s);
         if is_float {
@@ -936,7 +985,10 @@ impl<'a> LexState<'a> {
         if let Ok(s) = std::str::from_utf8(&self.source.as_bytes()[text_start..self.pos]) {
             self.token_text.push_str(s);
         }
-        self.token = Token::String(s);
+        // intern 字符串字面量 (对应 C anchorstr), 避免保留临时 String 导致 GC 压力。
+        // 短字符串走全局 StringTable 内部化去重; 长字符串走 scanner_strings 去重。
+        let ls = self.anchor_string(&s);
+        self.token = Token::String(ls);
     }
 
     fn read_escape(&mut self, s: &mut String, backslash_pos: usize) {
@@ -1095,7 +1147,9 @@ impl<'a> LexState<'a> {
                     let actual = self.count_equals(); // count (并跳过) '='
                     if actual == eqs && self.current == ']' {
                         self.next_char(); // skip 2nd ']'
-                        self.token = Token::String(s);
+                        // intern 长字符串字面量 (anchor_string 内部走 scanner_strings 去重)
+                        let ls = self.anchor_string(&s);
+                        self.token = Token::String(ls);
                         return;
                     }
                     // 不匹配: ']' 与 '=' 需作为内容保留 (对应 C skip_sep 的 save 行为)
@@ -1122,7 +1176,9 @@ impl<'a> LexState<'a> {
                 }
             }
         }
-        self.token = Token::String(s);
+        // EOF 中断的 fallback 路径 (错误恢复)
+        let ls = self.anchor_string(&s);
+        self.token = Token::String(ls);
     }
 
     pub fn check(&self, tok: &Token) -> bool {

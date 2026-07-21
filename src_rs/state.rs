@@ -448,7 +448,10 @@ impl LuaState {
             warn_on: true,
             warn_pending: false,
             main_thread: LuaThread {
-                stack: Vec::new(),
+                // 预分配 64 个槽位: 对应 C Lua 的 BASIC_STACK_SIZE = 60,
+                // 避免 main 函数加载时栈从 0 开始频繁扩容 (Vec::new() → 1 → 2 → 4 → ... → 64)
+                // Rust TValue 96 字节, 64 * 96 = 6KB, 内存开销可忽略
+                stack: Vec::with_capacity(64),
                 status: ThreadStatus::OK,
                 function: None,
                 is_main: true,
@@ -460,7 +463,7 @@ impl LuaState {
             pcall_protection_stack: Vec::new(),
             weak_tables: Vec::new(),
             concat_gc_counter: std::cell::Cell::new(0),
-            concat_gc_interval: std::cell::Cell::new(4096),
+            concat_gc_interval: std::cell::Cell::new(32768),
             finobj_list: Vec::new(),
             ud_finobj_list: Vec::new(),
             gc_closing: false,
@@ -641,7 +644,10 @@ impl LuaState {
             warn_on: true,
             warn_pending: false,
             main_thread: LuaThread {
-                stack: Vec::new(),
+                // 预分配 64 个槽位: 对应 C Lua 的 BASIC_STACK_SIZE = 60,
+                // 避免 main 函数加载时栈从 0 开始频繁扩容 (Vec::new() → 1 → 2 → 4 → ... → 64)
+                // Rust TValue 96 字节, 64 * 96 = 6KB, 内存开销可忽略
+                stack: Vec::with_capacity(64),
                 status: ThreadStatus::OK,
                 function: None,
                 is_main: true,
@@ -653,7 +659,7 @@ impl LuaState {
             pcall_protection_stack: Vec::new(),
             weak_tables: Vec::new(),
             concat_gc_counter: std::cell::Cell::new(0),
-            concat_gc_interval: std::cell::Cell::new(4096),
+            concat_gc_interval: std::cell::Cell::new(32768),
             finobj_list: Vec::new(),
             ud_finobj_list: Vec::new(),
             gc_closing: false,
@@ -784,7 +790,10 @@ impl LuaState {
             warn_on: true,
             warn_pending: false,
             main_thread: LuaThread {
-                stack: Vec::new(),
+                // 预分配 64 个槽位: 对应 C Lua 的 BASIC_STACK_SIZE = 60,
+                // 避免 main 函数加载时栈从 0 开始频繁扩容 (Vec::new() → 1 → 2 → 4 → ... → 64)
+                // Rust TValue 96 字节, 64 * 96 = 6KB, 内存开销可忽略
+                stack: Vec::with_capacity(64),
                 status: ThreadStatus::OK,
                 function: None,
                 is_main: true,
@@ -796,7 +805,7 @@ impl LuaState {
             pcall_protection_stack: Vec::new(),
             weak_tables: Vec::new(),
             concat_gc_counter: std::cell::Cell::new(0),
-            concat_gc_interval: std::cell::Cell::new(4096),
+            concat_gc_interval: std::cell::Cell::new(32768),
             finobj_list: Vec::new(),
             ud_finobj_list: Vec::new(),
             gc_closing: false,

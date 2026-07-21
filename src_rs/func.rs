@@ -527,7 +527,7 @@ mod tests {
             pcall_protection_stack: Vec::new(),
             weak_tables: Vec::new(),
             concat_gc_counter: std::cell::Cell::new(0),
-            concat_gc_interval: std::cell::Cell::new(4096),
+            concat_gc_interval: std::cell::Cell::new(32768),
             finobj_list: Vec::new(),
             ud_finobj_list: Vec::new(),
             transferinfo_ftransfer: 0,

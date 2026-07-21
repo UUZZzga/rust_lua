@@ -1485,7 +1485,6 @@ pub fn dump_proto(f: &Proto, strip: bool) -> Vec<u8> {
 use crate::objects::{LocVar, UpvalDesc};
 use crate::strings::{LongString, LuaString};
 use std::sync::atomic::{AtomicU64, AtomicU8};
-use std::sync::Arc;
 
 /// 创建长字符串的辅助函数
 /// 使用 with_nul 添加额外 NUL 终止符，与 as_str_inner 的 NUL 剥离机制配合

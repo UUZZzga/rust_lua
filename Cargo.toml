@@ -42,6 +42,9 @@ path = "tests_rs/math_lib_tests.rs"
 
 [features]
 ffi = []
+# 默认关闭: StringTable/StringCache 使用 std::cell::RefCell (零开销,单线程)
+# 启用时改用 parking_lot::RwLock (多线程安全,有原子操作开销)
+threaded = ["parking_lot"]
 
 [dependencies]
 libc = "0.2"
@@ -49,7 +52,7 @@ arc-swap = "1"
 hashbrown = "0.15"
 bitflags = "2"
 imara-diff = "0.2"
-parking_lot = "0.12"
+parking_lot = { version = "0.12", optional = true }
 
 [build-dependencies]
 cc = "1.0"

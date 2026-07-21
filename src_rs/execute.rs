@@ -985,50 +985,10 @@ impl VmExecutor {
 
             // 检查 count hook 和 line hook — 对应 C 的 luaG_traceexec
             // VARARGPREP 不触发 hook（对应 C 的 luaG_tracecall 对 vararg 函数返回 0）
+            // hook 未启用时 (hook_mask == 0) 此分支从不执行, 提取到 #[cold] 函数
+            // 减少 execute_loop 主循环代码体积 (约 45 行 → 3 行), 改善 icache 密度
             if state.hook_mask & (4 | 8) != 0 && op != OpCode::VARARGPREP {
-                // LUA_MASKLINE=4 | LUA_MASKCOUNT=8
-                if state.hook_func.is_some() {
-                    // count hook — 对应 C: counthook = (mask & LUA_MASKCOUNT) && (--L->hookcount == 0)
-                    let mut counthook = false;
-                    if state.hook_mask & 8 != 0 {
-                        // LUA_MASKCOUNT
-                        state.current_hook_count -= 1;
-                        if state.current_hook_count == 0 {
-                            counthook = true;
-                            state.current_hook_count = state.hook_count; // resethookcount
-                        }
-                    }
-                    // count hook 先触发 — 对应 C: if (counthook) luaD_hook(L, LUA_HOOKCOUNT, -1, 0, 0)
-                    if counthook {
-                        Self::call_hook(state, "count", -1, None, 0, 0)?;
-                    }
-                    // line hook — 对应 C: if (mask & LUA_MASKLINE)
-                    if state.hook_mask & 4 != 0 {
-                        // LUA_MASKLINE = 4
-                        let new_pc = state.pc as i32;
-                        // 对应 C: int oldpc = (L->oldpc < p->sizecode) ? L->oldpc : 0;
-                        let code_len = state.code.len() as i32;
-                        let old_pc = if state.hook_old_pc < code_len {
-                            state.hook_old_pc
-                        } else {
-                            0
-                        };
-                        // 对应 C: if (npci <= oldpc || changedline(p, oldpc, npci))
-                        // 注意: 即使 current_line < 0 (stripped 代码), 也要调用 hook
-                        // C 实现中 luaG_getfuncline 返回 -1, luaD_hook 会被调用
-                        if new_pc <= old_pc || Self::changed_line(state, old_pc, new_pc) {
-                            let current_line = Self::get_current_line(state);
-                            // 注意: 不更新 call_info.last().saved_pc。
-                            // Rust 版 call_info[i].saved_pc 存储的是调用者的 CALL 偏移（不是
-                            // 当前函数的 pc），与 C 的 ci->u.l.savedpc 语义不同。
-                            // call_hook 中已正确设置 hook entry 的 saved_pc = state.pc，
-                            // debug.getinfo(2) 的行号从 hook entry 获取，无需额外更新。
-                            Self::call_hook(state, "line", current_line, None, 0, 0)?;
-                        }
-                        // 对应 C: L->oldpc = npci;
-                        state.hook_old_pc = new_pc;
-                    }
-                }
+                Self::traceexec_hooks(state)?;
             }
 
             // 调试跟踪输出 — 提取到 cold 函数避免污染主循环 icache
@@ -1577,6 +1537,59 @@ impl VmExecutor {
             pc + 1,
             crate::compiler::bytecode_dump::format_instruction(inst)
         )
+    }
+
+    /// 执行 count hook 和 line hook — 从 execute_loop 主循环提取的 cold 路径。
+    ///
+    /// 调用前提: `state.hook_mask & (4 | 8) != 0` 且当前 op != VARARGPREP。
+    /// 提取为独立 #[cold] 函数, 减少 execute_loop 主循环代码体积 (约 45 行 → 3 行),
+    /// 改善 icache 密度。hook 未启用时此函数从不被调用。
+    #[cold]
+    #[inline(never)]
+    fn traceexec_hooks(state: &mut LuaState) -> Result<(), VmError> {
+        if state.hook_func.is_some() {
+            // count hook — 对应 C: counthook = (mask & LUA_MASKCOUNT) && (--L->hookcount == 0)
+            let mut counthook = false;
+            if state.hook_mask & 8 != 0 {
+                // LUA_MASKCOUNT
+                state.current_hook_count -= 1;
+                if state.current_hook_count == 0 {
+                    counthook = true;
+                    state.current_hook_count = state.hook_count; // resethookcount
+                }
+            }
+            // count hook 先触发 — 对应 C: if (counthook) luaD_hook(L, LUA_HOOKCOUNT, -1, 0, 0)
+            if counthook {
+                Self::call_hook(state, "count", -1, None, 0, 0)?;
+            }
+            // line hook — 对应 C: if (mask & LUA_MASKLINE)
+            if state.hook_mask & 4 != 0 {
+                // LUA_MASKLINE = 4
+                let new_pc = state.pc as i32;
+                // 对应 C: int oldpc = (L->oldpc < p->sizecode) ? L->oldpc : 0;
+                let code_len = state.code.len() as i32;
+                let old_pc = if state.hook_old_pc < code_len {
+                    state.hook_old_pc
+                } else {
+                    0
+                };
+                // 对应 C: if (npci <= oldpc || changedline(p, oldpc, npci))
+                // 注意: 即使 current_line < 0 (stripped 代码), 也要调用 hook
+                // C 实现中 luaG_getfuncline 返回 -1, luaD_hook 会被调用
+                if new_pc <= old_pc || Self::changed_line(state, old_pc, new_pc) {
+                    let current_line = Self::get_current_line(state);
+                    // 注意: 不更新 call_info.last().saved_pc。
+                    // Rust 版 call_info[i].saved_pc 存储的是调用者的 CALL 偏移（不是
+                    // 当前函数的 pc），与 C 的 ci->u.l.savedpc 语义不同。
+                    // call_hook 中已正确设置 hook entry 的 saved_pc = state.pc，
+                    // debug.getinfo(2) 的行号从 hook entry 获取，无需额外更新。
+                    Self::call_hook(state, "line", current_line, None, 0, 0)?;
+                }
+                // 对应 C: L->oldpc = npci;
+                state.hook_old_pc = new_pc;
+            }
+        }
+        Ok(())
     }
 
     /// 调试跟踪输出 — 标记为 cold 避免污染主循环的指令缓存 (icache)
@@ -2654,7 +2667,7 @@ impl VmExecutor {
         };
         // table_set 通过 Rc<RefCell<TableData>> 的内部可变性修改表，
         // 不需要写回 upval_val
-        Self::table_set(state, &upval_val, key, val, VarSource::Upval(a))?;
+        Self::table_set(state, upval_val, key, val, VarSource::Upval(a))?;
         state.pc += 1;
         Ok(())
     }
@@ -2669,7 +2682,7 @@ impl VmExecutor {
         let val = Self::resolve_val(state, inst, c);
         Self::table_set(
             state,
-            &table_val,
+            table_val,
             key,
             val,
             VarSource::Reg(opcodes::getarg_a(inst) as usize),
@@ -2687,7 +2700,7 @@ impl VmExecutor {
         let val = Self::resolve_val(state, inst, c);
         Self::table_set(
             state,
-            &table_val,
+            table_val,
             TValue::Integer(b),
             val,
             VarSource::Reg(opcodes::getarg_a(inst) as usize),
@@ -2710,7 +2723,7 @@ impl VmExecutor {
         let val = Self::resolve_val(state, inst, c);
         Self::table_set(
             state,
-            &table_val,
+            table_val,
             key,
             val,
             VarSource::Reg(opcodes::getarg_a(inst) as usize),
@@ -3395,23 +3408,17 @@ impl VmExecutor {
             state.stack.push(TValue::Nil(NilKind::Strict));
         }
 
-        // 保存 a+n 之后的栈元素（局部变量等），避免被 truncate 移除。
-        // C Lua 中 L->top = ra + n 只是设置 top 指针，不移除栈元素；
-        // Rust 实现中需手动保存/恢复。
-        let saved_tail: Vec<TValue> = if state.stack.len() > a + n {
-            state.stack[a + n..].to_vec()
-        } else {
-            Vec::new()
-        };
-        // 截断到 a+n（仅保留拼接操作数）
-        state.stack.truncate(a + n);
+        // 用 split_off 替代 to_vec+truncate:移动尾部到独立 Vec,避免每个 TValue 的 Rc::clone (atomic inc)
+        // (perf: op_concat 是热路径,to_vec 的 clone 占显著开销;split_off 是 O(剩余长度) 的 memcpy,零 clone)
+        let mut saved_tail: Vec<TValue> = state.stack.split_off(a + n);
 
         // 尝试直接拼接 (对应 C 的 luaV_concat)
         // concat_stack 在栈上操作，失败时返回 ConcatError
         // 注意: 即使返回 Err, vals 也可能已被部分拼接 (栈顶的 string 序列),
         // 必须保留 vals 以便写回 state.stack
         let concat_result = {
-            let mut vals: Vec<TValue> = state.stack[a..a + n].to_vec();
+            // split_off 移动操作数到独立 Vec,避免 to_vec 的 clone
+            let mut vals: Vec<TValue> = state.stack.split_off(a);
             match concat_stack(&mut vals, n) {
                 Ok(()) => Ok(vals),
                 Err(e) => Err((e, vals)),
@@ -3419,28 +3426,27 @@ impl VmExecutor {
         };
 
         match concat_result {
-            Ok(vals) => {
-                // 拼接成功: 结果在 vals[0]
-                let result = vals.into_iter().next().unwrap_or_else(|| {
-                    TValue::Str(crate::strings::LuaString::Short(std::sync::Arc::new(
+            Ok(mut vals) => {
+                // 拼接成功: concat_stack 保证 vals 长度为 1
+                let result = vals.pop().unwrap_or_else(|| {
+                    TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
                         crate::strings::ShortString {
                             hash: 0,
                             contents: String::new(),
                         },
                     )))
                 });
-                // 截断到 a，写入结果，恢复 saved_tail
-                state.stack.truncate(a);
+                // state.stack 已被 split_off(a) 截断到 a,无需再 truncate
                 state.stack.push(result);
-                state.stack.extend_from_slice(&saved_tail);
+                state.stack.append(&mut saved_tail);
                 state.top = state.stack.len();
             }
-            Err((_, vals)) => {
+            Err((_, mut vals)) => {
                 // 拼接失败: 尝试 __concat 元方法
                 // 先把 concat_stack 部分拼接的结果写回 state.stack
                 // (否则会对已被拼接的 string 重复调用 __concat，报 "attempt to concatenate a string value")
-                state.stack.truncate(a);
-                state.stack.extend_from_slice(&vals);
+                // state.stack 已被 split_off(a) 截断到 a,直接 append 即可
+                state.stack.append(&mut vals);
                 state.top = state.stack.len();
                 // C: luaT_tryconcatTM(L) — p1 = top-2, p2 = top-1, res = p1
                 // 循环处理，每次处理 2 个值
@@ -3461,22 +3467,19 @@ impl VmExecutor {
                     if remaining <= 1 {
                         break;
                     }
-                    let mut vals: Vec<TValue> = state.stack[a..a + remaining].to_vec();
+                    // split_off 移动 [a..] 到独立 Vec,避免 to_vec 的 clone
+                    let mut vals: Vec<TValue> = state.stack.split_off(a);
                     match concat_stack(&mut vals, remaining) {
                         Ok(()) => {
-                            // 拼接成功，替换栈上的值
-                            for (i, v) in vals.into_iter().enumerate() {
-                                state.stack[a + i] = v;
-                            }
-                            state.stack.truncate(a + 1);
+                            // concat_stack 后 vals 长度为 1,append 即可
+                            state.stack.append(&mut vals);
                             break;
                         }
                         Err(crate::tm::TagMethodError::ConcatError { .. }) => {
                             // concat_stack 可能已拼接栈顶的 string 序列(在 vals 中),
                             // 必须写回 state.stack 以反映已拼接的结果,
                             // 否则下次循环会错误地对两个 string 调用 __concat
-                            state.stack.truncate(a);
-                            state.stack.extend_from_slice(&vals);
+                            state.stack.append(&mut vals);
                             state.top = state.stack.len();
                             continue;
                         }
@@ -3490,7 +3493,7 @@ impl VmExecutor {
                 while state.stack.len() > a + 1 {
                     state.stack.pop();
                 }
-                state.stack.extend_from_slice(&saved_tail);
+                state.stack.append(&mut saved_tail);
                 state.top = state.stack.len();
             }
             Err(_) => {
@@ -5842,7 +5845,7 @@ impl VmExecutor {
     /// 成功时表已被修改 (通过 Rc<RefCell<Table>> 的内部可变性)
     pub fn table_set(
         state: &mut LuaState,
-        table_val: &TValue,
+        table_val: TValue,
         key: TValue,
         val: TValue,
         table_source: VarSource,
@@ -5850,7 +5853,10 @@ impl VmExecutor {
         // 对应 C Lua 的 luaV_finishset — 用循环代替递归，加 MAXTAGLOOP 限制
         // 防止 __newindex 链无限循环（如 a.__newindex = a 导致栈溢出）
         const MAXTAGLOOP: usize = 2000;
-        let mut current = table_val.clone();
+        // 接收 owned TValue 而非 &TValue:调用方 op_seti/op_setfield 等已 clone 到局部变量,
+        // 这里移动而非再 clone 一次,省去热路径上的冗余 Rc::clone (atomic inc)
+        // (perf: table_set 内部的 table_val.clone() 与调用方的 clone 重复,TValue::clone 占 4.48%)
+        let mut current = table_val;
         for _ in 0..MAXTAGLOOP {
             match &current {
                 TValue::Table(t) => {
