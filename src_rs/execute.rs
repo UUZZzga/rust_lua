@@ -1945,7 +1945,7 @@ impl VmExecutor {
                     if total > 1 {
                         // 尝试直接拼接 (对应 luaV_concat 的第一步)
                         let mut vals: Vec<TValue> = state.stack[a..a + total].to_vec();
-                        match concat_stack(&mut vals, total) {
+                        match concat_stack(&state.string_table, &mut vals, total) {
                             Ok(()) => {
                                 for (i, v) in vals.into_iter().enumerate() {
                                     state.stack[a + i] = v;
@@ -2168,7 +2168,7 @@ impl VmExecutor {
                 break;
             }
             let mut vals: Vec<TValue> = state.stack[a..a + remaining].to_vec();
-            match concat_stack(&mut vals, remaining) {
+            match concat_stack(&state.string_table, &mut vals, remaining) {
                 Ok(()) => {
                     for (i, v) in vals.into_iter().enumerate() {
                         state.stack[a + i] = v;
@@ -3419,7 +3419,7 @@ impl VmExecutor {
         let concat_result = {
             // split_off 移动操作数到独立 Vec,避免 to_vec 的 clone
             let mut vals: Vec<TValue> = state.stack.split_off(a);
-            match concat_stack(&mut vals, n) {
+            match concat_stack(&state.string_table, &mut vals, n) {
                 Ok(()) => Ok(vals),
                 Err(e) => Err((e, vals)),
             }
@@ -3429,12 +3429,7 @@ impl VmExecutor {
             Ok(mut vals) => {
                 // 拼接成功: concat_stack 保证 vals 长度为 1
                 let result = vals.pop().unwrap_or_else(|| {
-                    TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
-                        crate::strings::ShortString {
-                            hash: 0,
-                            contents: crate::strings::LuaString::with_nul(""),
-                        },
-                    )))
+                    TValue::Str(state.string_table.intern(""))
                 });
                 // state.stack 已被 split_off(a) 截断到 a,无需再 truncate
                 state.stack.push(result);
@@ -3469,7 +3464,7 @@ impl VmExecutor {
                     }
                     // split_off 移动 [a..] 到独立 Vec,避免 to_vec 的 clone
                     let mut vals: Vec<TValue> = state.stack.split_off(a);
-                    match concat_stack(&mut vals, remaining) {
+                    match concat_stack(&state.string_table, &mut vals, remaining) {
                         Ok(()) => {
                             // concat_stack 后 vals 长度为 1,append 即可
                             state.stack.append(&mut vals);
@@ -5694,8 +5689,9 @@ impl VmExecutor {
                         }
                     }
                     // 直接使用已获取的元表，无需再次 borrow
+                    let tmnames = &state.tmnames;
                     let index_val = mt.and_then(|mt| {
-                        let index_key = crate::tm::make_tm_tvalue(crate::tm::TagMethod::Index);
+                        let index_key = crate::tm::make_tm_tvalue(tmnames, crate::tm::TagMethod::Index);
                         mt.get(&index_key)
                     });
                     if let Some(index_val) = index_val {
@@ -5728,7 +5724,7 @@ impl VmExecutor {
                 TValue::Str(_) => {
                     // 字符串类型: 查找字符串元表的 __index
                     if let Some(mt) = state.dmt.get(LuaType::String) {
-                        let index_key = crate::tm::make_tm_tvalue(crate::tm::TagMethod::Index);
+                        let index_key = crate::tm::make_tm_tvalue(&state.tmnames, crate::tm::TagMethod::Index);
                         if let Some(index_val) = mt.get(&index_key) {
                             match index_val {
                                 TValue::Table(index_table) => {
@@ -5746,7 +5742,7 @@ impl VmExecutor {
                     // 非表/字符串值: 查找 __index 元方法 (基本类型如 number/boolean/nil)
                     // 对应 C Lua 的 luaV_finishget: 对非表值调用 getTMbyobj
                     let index_val =
-                        crate::tm::get_tm_by_obj(other, crate::tm::TagMethod::Index, &state.dmt);
+                        crate::tm::get_tm_by_obj(other, crate::tm::TagMethod::Index, &state.dmt, &state.tmnames);
                     match index_val {
                         Some(f) => match &f {
                             TValue::LClosure(_)
@@ -5879,9 +5875,10 @@ impl VmExecutor {
                     }
 
                     // key 不存在: 查找 __newindex 元方法
+                    let tmnames = &state.tmnames;
                     let newindex_val = t.get_metatable().and_then(|mt| {
                         let newindex_key =
-                            crate::tm::make_tm_tvalue(crate::tm::TagMethod::NewIndex);
+                            crate::tm::make_tm_tvalue(tmnames, crate::tm::TagMethod::NewIndex);
                         mt.get(&newindex_key)
                     });
                     if let Some(newindex_val) = newindex_val {
@@ -5945,6 +5942,7 @@ impl VmExecutor {
                         &current,
                         crate::tm::TagMethod::NewIndex,
                         &state.dmt,
+                        &state.tmnames,
                     );
                     match newindex_val {
                         Some(f) => {

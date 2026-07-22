@@ -20,7 +20,7 @@ use crate::debug::{concaterror, opinterror, ordererror, tointerror};
 use crate::execute::VmError;
 use crate::objects::{Instruction, LuaType, NilKind, TValue, Table};
 use crate::state::LuaState;
-use crate::strings::{rust_hash, LuaString, ShortString};
+use crate::strings::{LuaString, StringTable};
 
 // ============================================================================
 // get_mmbin_tm — 从 MM 系列指令中提取元方法事件索引
@@ -202,13 +202,13 @@ impl Metatable {
         }
     }
 
-    pub fn get_tm(&mut self, tm: TagMethod) -> Option<TValue> {
+    pub fn get_tm(&mut self, tmnames: &[LuaString; TM_N], tm: TagMethod) -> Option<TValue> {
         if let Some(flag) = MetatableFlags::from_tag_method(tm) {
             if self.flags.contains(flag) {
                 return None;
             }
         }
-        let key = make_tm_tvalue(tm);
+        let key = make_tm_tvalue(tmnames, tm);
         // C: luaT_gettm — ttisnil 检查，nil 值（含 Empty tombstone）视为无元方法
         let result = self.table.get(&key).filter(|v| !v.is_nil());
         if result.is_none() {
@@ -299,7 +299,8 @@ pub fn obj_type_name(obj: &TValue) -> String {
         _ => None,
     };
     if let Some(mt) = meta {
-        let name_key = make_name_key();
+        // __name 查找: 错误消息路径, 非热路径, 用一次性 key 即可 (不走 intern)
+        let name_key = TValue::Str(crate::strings::new_short_str("__name"));
         if let Some(name_val) = mt.get(&name_key) {
             if let TValue::Str(s) = &name_val {
                 return s.as_str().to_string();
@@ -314,6 +315,7 @@ pub fn get_tm_by_obj(
     obj: &TValue,
     tm: TagMethod,
     default_mts: &DefaultMetatables,
+    tmnames: &[LuaString; TM_N],
 ) -> Option<TValue> {
     // RefCell 无法返回引用，故返回 owned TValue
     let mt: Option<Table> = match obj {
@@ -322,7 +324,7 @@ pub fn get_tm_by_obj(
         _ => default_mts.get(obj.ty()).cloned(),
     };
     let mt = mt?;
-    let key = make_tm_tvalue(tm);
+    let key = make_tm_tvalue(tmnames, tm);
     // C: notm(tm) — ttisnil 检查，nil 值（含 Empty tombstone）视为无元方法
     mt.get(&key).filter(|v| !v.is_nil())
 }
@@ -742,7 +744,7 @@ pub fn call_close_method(
     // 如果 tm 是 nil（__close 被移除），luaD_callnoyield 尝试调用 nil，
     // luaG_callerror → funcnamefromcall → funcnamefromcode(OP_RETURN) → "metamethod 'close'"
     // 生成 "attempt to call a nil value (metamethod 'close')" 错误。
-    let tm_val = get_tm_by_obj(obj, TagMethod::Close, &state.dmt);
+    let tm_val = get_tm_by_obj(obj, TagMethod::Close, &state.dmt, &state.tmnames);
     let f = match tm_val {
         Some(f) if f.is_callable() => f,
         other => {
@@ -902,7 +904,8 @@ fn callbin_tm(
     tm: TagMethod,
 ) -> Result<bool, VmError> {
     // 先从 p1 查找元方法，再从 p2 查找 — 对应 C 的 callbinTM
-    let tm_val = get_tm_by_obj(p1, tm, &state.dmt).or_else(|| get_tm_by_obj(p2, tm, &state.dmt));
+    let tm_val = get_tm_by_obj(p1, tm, &state.dmt, &state.tmnames)
+        .or_else(|| get_tm_by_obj(p2, tm, &state.dmt, &state.tmnames));
 
     match tm_val {
         Some(f) => {
@@ -914,7 +917,7 @@ fn callbin_tm(
                     return Ok(true);
                 }
                 // 字符串算术失败 — 对应 C 的 trymt: 查找 p2 的元方法
-                if let Some(f2) = get_tm_by_obj(p2, tm, &state.dmt) {
+                if let Some(f2) = get_tm_by_obj(p2, tm, &state.dmt, &state.tmnames) {
                     if !matches!(f2, TValue::Integer(0)) {
                         // p2 有非字符串的元方法，调用它
                         call_tm_res(state, &f2, p1, p2, res, tm)?;
@@ -1281,8 +1284,8 @@ pub fn equal_obj(state: &mut LuaState, t1: &TValue, t2: &TValue) -> Result<bool,
         _ => return Ok(false),
     }
     // C: fasttm(L, hvalue(t1)->metatable, TM_EQ) ?? fasttm(L, hvalue(t2)->metatable, TM_EQ)
-    let tm = get_tm_by_obj(t1, TagMethod::Eq, &state.dmt)
-        .or_else(|| get_tm_by_obj(t2, TagMethod::Eq, &state.dmt));
+    let tm = get_tm_by_obj(t1, TagMethod::Eq, &state.dmt, &state.tmnames)
+        .or_else(|| get_tm_by_obj(t2, TagMethod::Eq, &state.dmt, &state.tmnames));
     match tm {
         Some(f) => {
             // C: luaT_callTMres(L, tm, t1, t2, L->top.p); return !tagisfalse(tag);
@@ -1335,7 +1338,7 @@ pub fn obj_len(state: &mut LuaState, ra: usize, rb: &TValue, varinfo: &str) -> R
             // 先查表自身元表的 __len
             let tm_val = t.get_metatable().and_then(|mt| {
                 let mut meta = Metatable::new(mt);
-                meta.get_tm(TagMethod::Len)
+                meta.get_tm(&state.tmnames, TagMethod::Len)
             });
             if tm_val.is_some() {
                 tm_val
@@ -1362,7 +1365,7 @@ pub fn obj_len(state: &mut LuaState, ra: usize, rb: &TValue, varinfo: &str) -> R
         }
         _ => {
             // 其他类型: 查找 __len 元方法
-            get_tm_by_obj(rb, TagMethod::Len, &state.dmt)
+            get_tm_by_obj(rb, TagMethod::Len, &state.dmt, &state.tmnames)
         }
     };
 
@@ -1417,17 +1420,14 @@ impl VarargTable {
         VarargTable::Hidden { args }
     }
 
-    pub fn from_args(args: &[TValue]) -> Self {
+    pub fn from_args(table: &StringTable, args: &[TValue]) -> Self {
         let mut t = Table::new();
         let count = args.len();
         for (i, v) in args.iter().enumerate() {
             t.set_int(i as i64 + 1, v.clone());
         }
         t.set(
-            TValue::Str(LuaString::Short(crate::strings::ArcRc::new(ShortString {
-                hash: rust_hash("n"),
-                contents: crate::strings::LuaString::with_nul("n"),
-            }))),
+            TValue::Str(table.intern("n")),
             TValue::Integer(count as i64),
         );
         VarargTable::Table { table: t, count }
@@ -1495,23 +1495,28 @@ impl VarargTable {
 // 辅助构造 TValue / LuaString
 // ============================================================================
 
-pub fn make_tm_tvalue(tm: TagMethod) -> TValue {
-    let name = tm.name();
-    TValue::Str(LuaString::Short(crate::strings::ArcRc::new(ShortString {
-        hash: rust_hash(name),
-        contents: crate::strings::LuaString::with_nul(name),
-    })))
+/// 初始化元方法名数组 — 对应 C 的 `luaT_init` 中 `G(L)->tmname[i] = luaS_new(L, eventname[i])`。
+/// 在 `LuaState::new` 时调用一次，后续 `make_tm_tvalue` 直接 `clone()` 复用，
+/// 保证同一元方法名始终返回同一 `ArcRc<ShortString>`（ptr_eq 快速路径）。
+pub fn init_tmnames(table: &StringTable) -> Box<[LuaString; TM_N]> {
+    let arr: [LuaString; TM_N] = std::array::from_fn(|i| {
+        let tm = TagMethod::from_u8(i as u8).expect("TM_N 与 TagMethod 变体数一致");
+        table.intern(tm.name())
+    });
+    Box::new(arr)
 }
 
-fn make_ls(s: &str) -> TValue {
-    TValue::Str(LuaString::Short(crate::strings::ArcRc::new(ShortString {
-        hash: rust_hash(s),
-        contents: crate::strings::LuaString::with_nul(s),
-    })))
+/// 从预 intern 的元方法名数组创建 TValue — O(1) clone，对应 C 的 `G(L)->tmname[event]`。
+pub fn make_tm_tvalue(tmnames: &[LuaString; TM_N], tm: TagMethod) -> TValue {
+    TValue::Str(tmnames[tm as usize].clone())
 }
 
-fn make_name_key() -> TValue {
-    make_ls("__name")
+fn make_ls(table: &StringTable, s: &str) -> TValue {
+    TValue::Str(table.intern(s))
+}
+
+fn make_name_key(table: &StringTable) -> TValue {
+    make_ls(table, "__name")
 }
 
 // ============================================================================
@@ -1522,6 +1527,13 @@ fn make_name_key() -> TValue {
 mod tests {
     use super::*;
     use crate::strings::StringTable;
+
+    /// 测试辅助: 创建 StringTable + tmnames
+    fn make_table_and_tmnames() -> (StringTable, Box<[LuaString; TM_N]>) {
+        let table = StringTable::new();
+        let tmnames = init_tmnames(&table);
+        (table, tmnames)
+    }
 
     // ========================================================================
     // TagMethod 测试
@@ -1582,21 +1594,23 @@ mod tests {
 
     #[test]
     fn test_metatable_get_tm_and_cache() {
+        let (_table, tmnames) = make_table_and_tmnames();
         let mut mt = Metatable::empty();
         mt.table
-            .set(make_tm_tvalue(TagMethod::Index), TValue::Integer(42));
-        assert!(mt.get_tm(TagMethod::Index).is_some());
-        assert!(mt.get_tm(TagMethod::Len).is_none());
+            .set(make_tm_tvalue(&tmnames, TagMethod::Index), TValue::Integer(42));
+        assert!(mt.get_tm(&tmnames, TagMethod::Index).is_some());
+        assert!(mt.get_tm(&tmnames, TagMethod::Len).is_none());
         assert!(mt.flags.contains(MetatableFlags::NO_LEN));
     }
 
     #[test]
     fn test_metatable_cache_hit() {
+        let (_table, tmnames) = make_table_and_tmnames();
         let mut mt = Metatable::empty();
         mt.flags.insert(MetatableFlags::NO_INDEX);
         mt.table
-            .set(make_tm_tvalue(TagMethod::Index), TValue::Integer(99));
-        assert!(mt.get_tm(TagMethod::Index).is_none());
+            .set(make_tm_tvalue(&tmnames, TagMethod::Index), TValue::Integer(99));
+        assert!(mt.get_tm(&tmnames, TagMethod::Index).is_none());
     }
 
     // ========================================================================
@@ -1627,9 +1641,10 @@ mod tests {
 
     #[test]
     fn test_default_metatables_set_and_get() {
+        let (_table, tmnames) = make_table_and_tmnames();
         let mut dmt = DefaultMetatables::new();
         let mut mt_data = Table::new();
-        mt_data.set(make_tm_tvalue(TagMethod::Add), TValue::Integer(99));
+        mt_data.set(make_tm_tvalue(&tmnames, TagMethod::Add), TValue::Integer(99));
         let mt = Metatable::new(mt_data);
         dmt.set(LuaType::Number, mt);
         assert!(dmt.get(LuaType::Number).is_some());
@@ -1768,7 +1783,10 @@ mod tests {
             TValue::Integer(20),
             TValue::Integer(30),
         ];
-        let vt = VarargTable::from_args(&args);
+        let vt = {
+            let table = StringTable::new();
+            VarargTable::from_args(&table, &args)
+        };
         assert_eq!(vt.count(), 3);
         assert_eq!(vt.get(1), Some(TValue::Integer(10)));
         assert_eq!(vt.get(3), Some(TValue::Integer(30)));
@@ -1816,7 +1834,9 @@ mod tests {
     }
 
     fn _make_tm_tvalue_local(tm: TagMethod) -> TValue {
-        super::make_tm_tvalue(tm)
+        let table = StringTable::new();
+        let tmnames = init_tmnames(&table);
+        super::make_tm_tvalue(&tmnames, tm)
     }
 
     fn _make_ls(s: &str) -> LuaString {

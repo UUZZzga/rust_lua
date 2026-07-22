@@ -848,7 +848,11 @@ fn format_float_len(f: f64) -> usize {
 /// Given: 栈上有 Table 和 Str("hello")
 /// When: 调用 concat_stack(stack, 2, &dmt)
 /// Then: 返回 Err(ConcatError { ... })
-pub fn concat_stack(stack: &mut Vec<TValue>, total: usize) -> Result<(), TagMethodError> {
+pub fn concat_stack(
+    table: &crate::strings::StringTable,
+    stack: &mut Vec<TValue>,
+    total: usize,
+) -> Result<(), TagMethodError> {
     if total <= 1 {
         return Ok(());
     }
@@ -878,11 +882,11 @@ pub fn concat_stack(stack: &mut Vec<TValue>, total: usize) -> Result<(), TagMeth
             match &stack[idx] {
                 TValue::Integer(i) => {
                     let i = *i;
-                    stack[idx] = TValue::Str(string_from_int(i));
+                    stack[idx] = TValue::Str(string_from_int(table, i));
                 }
                 TValue::Float(f) => {
                     let f = *f;
-                    stack[idx] = TValue::Str(string_from_float(f));
+                    stack[idx] = TValue::Str(string_from_float(table, f));
                 }
                 _ => {}
             }
@@ -899,8 +903,8 @@ pub fn concat_stack(stack: &mut Vec<TValue>, total: usize) -> Result<(), TagMeth
             let idx = top - 2;
             // 将数字转为字符串 (与 C 的 tostring 一致)
             let val = match val {
-                TValue::Integer(i) => TValue::Str(string_from_int(i)),
-                TValue::Float(f) => TValue::Str(string_from_float(f)),
+                TValue::Integer(i) => TValue::Str(string_from_int(table, i)),
+                TValue::Float(f) => TValue::Str(string_from_float(table, f)),
                 other => other,
             };
             stack[idx] = val;
@@ -919,22 +923,21 @@ pub fn concat_stack(stack: &mut Vec<TValue>, total: usize) -> Result<(), TagMeth
             total_len += l;
             n += 1;
         }
-        // 拼接 n 个值
-        // 预分配 total_len + 1 容量 (含 NUL 终止符), 避免 push('\0') 扩容
+        // 拼接 n 个值 — 对应 C 的 lvm.c:711-714:
+        // if (tl <= LUAI_MAXSHORTLEN) ts = luaS_newlstr(L, buff, tl);
+        // 短字符串走 intern (查表去重), 长字符串直接构造
         let mut result = String::with_capacity(total_len + 1);
         for i in 0..n {
             let idx = top - n + i;
             append_val_to_string(&mut result, &stack[idx]);
         }
-        use crate::strings::ShortString;
-        let h = crate::strings::rust_hash(&result);
-        // 追加 NUL 终止符，与 as_str_inner 的 NUL 剥离机制配合
-        // （拼接结果可能以 NUL 结尾，不加额外 NUL 会导致 as_str 错误剥离数据字节）
-        result.push('\0');
-        let ls = LuaString::Short(crate::strings::ArcRc::new(ShortString {
-            hash: h,
-            contents: result,
-        }));
+        let ls = if result.len() <= crate::strings::LUAI_MAXSHORTLEN {
+            // 短字符串: 走 intern 复用
+            table.intern(&result)
+        } else {
+            // 长字符串: new_long_str_from_string 内部会追加 NUL 终止符
+            crate::strings::new_long_str_from_string(result)
+        };
         let target_idx = top - n;
         stack[target_idx] = TValue::Str(ls);
         stack.truncate(target_idx + 1);
@@ -943,28 +946,16 @@ pub fn concat_stack(stack: &mut Vec<TValue>, total: usize) -> Result<(), TagMeth
     Ok(())
 }
 
-fn string_from_int(i: i64) -> LuaString {
-    use crate::strings::ShortString;
-    let mut s = i.to_string();
-    let h = crate::strings::rust_hash(&s);
-    s.reserve(1); // 避免 push('\0') 扩容
-    s.push('\0'); // NUL 终止符, 与 intern/new_short_bytes 保持一致
-    LuaString::Short(crate::strings::ArcRc::new(ShortString {
-        hash: h,
-        contents: s,
-    }))
+fn string_from_int(table: &crate::strings::StringTable, i: i64) -> LuaString {
+    let s = i.to_string();
+    // 对应 C 的 tostringbuff: 短字符串走 intern (luaS_newlstr → internshrstr)
+    table.intern(&s)
 }
 
-fn string_from_float(f: f64) -> LuaString {
-    use crate::strings::ShortString;
-    let mut s = format_float(f);
-    let h = crate::strings::rust_hash(&s);
-    s.reserve(1); // 避免 push('\0') 扩容
-    s.push('\0'); // NUL 终止符, 与 intern/new_short_bytes 保持一致
-    LuaString::Short(crate::strings::ArcRc::new(ShortString {
-        hash: h,
-        contents: s,
-    }))
+fn string_from_float(table: &crate::strings::StringTable, f: f64) -> LuaString {
+    let s = format_float(f);
+    // 对应 C 的 tostringbuff: 短字符串走 intern (luaS_newlstr → internshrstr)
+    table.intern(&s)
 }
 
 fn value_str_len(v: &TValue) -> usize {
@@ -2276,7 +2267,7 @@ mod tests {
             TValue::Str(tb.intern("world")),
         ];
         let len_before = stack.len();
-        concat_stack(&mut stack, 2).unwrap();
+        concat_stack(&tb, &mut stack, 2).unwrap();
         assert_eq!(stack.len(), len_before - 1);
         if let TValue::Str(ref s) = stack[0] {
             assert_eq!(s.as_str(), "helloworld");
@@ -2289,7 +2280,7 @@ mod tests {
     fn test_concat_stack_single_value() {
         let tb = StringTable::new();
         let mut stack = vec![TValue::Str(tb.intern("hello"))];
-        concat_stack(&mut stack, 1).unwrap();
+        concat_stack(&tb, &mut stack, 1).unwrap();
         assert_eq!(stack.len(), 1);
     }
 
@@ -2301,7 +2292,7 @@ mod tests {
             TValue::Str(tb.intern("b")),
             TValue::Str(tb.intern("c")),
         ];
-        concat_stack(&mut stack, 3).unwrap();
+        concat_stack(&tb, &mut stack, 3).unwrap();
         assert_eq!(stack.len(), 1);
         if let TValue::Str(ref s) = stack[0] {
             assert_eq!(s.as_str(), "abc");
@@ -2314,7 +2305,7 @@ mod tests {
     fn test_concat_stack_with_numbers() {
         let tb = StringTable::new();
         let mut stack = vec![TValue::Str(tb.intern("x=")), TValue::Integer(42)];
-        concat_stack(&mut stack, 2).unwrap();
+        concat_stack(&tb, &mut stack, 2).unwrap();
         if let TValue::Str(ref s) = stack[0] {
             assert_eq!(s.as_str(), "x=42");
         } else {
@@ -2326,7 +2317,7 @@ mod tests {
     fn test_concat_stack_empty_first() {
         let tb = StringTable::new();
         let mut stack = vec![TValue::Str(tb.intern("")), TValue::Str(tb.intern("world"))];
-        concat_stack(&mut stack, 2).unwrap();
+        concat_stack(&tb, &mut stack, 2).unwrap();
         assert_eq!(stack.len(), 1);
         if let TValue::Str(ref s) = stack[0] {
             assert_eq!(s.as_str(), "world");

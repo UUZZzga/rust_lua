@@ -6,6 +6,7 @@ use crate::objects::{
     TValue, TableData, ThreadContext, ThreadStatus, UpVal, UpValRef, UpvalDesc,
 };
 use crate::strings::{LuaString, StringTable};
+use crate::tm::{init_tmnames, TM_N};
 use crate::table::Table;
 use crate::tm::DefaultMetatables;
 use std::cell::RefCell;
@@ -175,6 +176,10 @@ pub struct LuaState {
     pub globals: Table,
     pub registry: Table,
     pub string_table: StringTable,
+    /// 预 intern 的元方法名数组 — 对应 C 的 `G(L)->tmname[TM_N]`。
+    /// 在 `LuaState::new` 时用 `string_table.intern` 初始化一次，
+    /// 后续 `make_tm_tvalue` 直接 `clone()` 复用，保证 ptr_eq 快速路径。
+    pub tmnames: Box<[LuaString; TM_N]>,
 
     // C API 导出层使用：当前 C 函数帧的 func 位置（0-based 栈索引）。
     // C API 的正索引相对于此位置；Lua 代码路径不使用此字段。
@@ -394,6 +399,9 @@ impl LuaState {
         let stack = Self::init_stack();
         let top = stack.len();
 
+        let string_table = StringTable::new();
+        let tmnames = init_tmnames(&string_table);
+
         LuaState {
             constants: Rc::new(Vec::new()),
             code: Rc::new(Vec::new()),
@@ -417,7 +425,8 @@ impl LuaState {
             gc,
             globals,
             registry,
-            string_table: StringTable::new(),
+            string_table,
+            tmnames,
             api_func_base: 0,
             n_ccalls: 0,
             n_ny_calls: 0,
@@ -590,6 +599,9 @@ impl LuaState {
         let stack = Self::init_stack();
         let top = stack.len();
 
+        let string_table = StringTable::new();
+        let tmnames = init_tmnames(&string_table);
+
         let state = LuaState {
             constants: Rc::new(Vec::new()),
             code: Rc::new(Vec::new()),
@@ -613,7 +625,8 @@ impl LuaState {
             gc,
             globals,
             registry,
-            string_table: StringTable::new(),
+            string_table,
+            tmnames,
             api_func_base: 0,
             n_ccalls: 0,
             n_ny_calls: 0,
@@ -736,6 +749,9 @@ impl LuaState {
             t
         };
 
+        let string_table = StringTable::new();
+        let tmnames = init_tmnames(&string_table);
+
         LuaState {
             constants: proto.constants.clone(),
             code: proto.code.clone(),
@@ -759,7 +775,8 @@ impl LuaState {
             gc,
             globals,
             registry,
-            string_table: StringTable::new(),
+            string_table,
+            tmnames,
             api_func_base: 0,
             n_ccalls: 0,
             n_ny_calls: 0,

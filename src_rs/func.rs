@@ -375,7 +375,7 @@ pub fn new_tbc_upval(state: &mut LuaState, level: usize) -> Result<Option<usize>
     }
     // 对应 C 的 checkclosemth: 检查 __close 元方法是否存在
     let has_close =
-        crate::tm::get_tm_by_obj(&val, crate::tm::TagMethod::Close, &state.dmt).is_some();
+        crate::tm::get_tm_by_obj(&val, crate::tm::TagMethod::Close, &state.dmt, &state.tmnames).is_some();
     if !has_close {
         // 获取变量名 — 对应 C 的 luaG_findlocal(L, L->ci, idx, NULL)
         let varname = get_var_name_at(state, level).unwrap_or_else(|| "?".to_string());
@@ -489,6 +489,7 @@ mod tests {
             globals: crate::table::Table::new(),
             registry: crate::table::Table::new(),
             string_table: crate::strings::StringTable::new(),
+            tmnames: crate::tm::init_tmnames(&crate::strings::StringTable::new()),
             api_func_base: 0,
             n_ccalls: 0,
             dmt: crate::tm::DefaultMetatables::new(),
