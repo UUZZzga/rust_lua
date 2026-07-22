@@ -675,6 +675,17 @@ impl<'a> FuncState<'a> {
         cur
     }
 
+    /// 移除最后一条指令 (对应 C 的 removelastinstruction)。
+    /// O(1) pop, 替代 O(n) 的 Vec::remove(index)。
+    /// 调用方必须确保要移除的指令就是当前最后一条 (pc - 1)。
+    #[inline(always)]
+    fn remove_last_instruction(&mut self) {
+        debug_assert!(self.pc > 0);
+        Rc::make_mut(&mut self.proto.code).pop();
+        self.inst_lines.pop();
+        self.pc -= 1;
+    }
+
     /// Like C's luaK_fixline: change line information for the last instruction.
     /// In Rust, we just update inst_lines; the final line_info/abs_line_info
     /// computation in parse_chunk_finish will use the corrected value.
@@ -3925,10 +3936,8 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     };
                 let (base_reg, gettabup_pc) = if can_revert_getupval {
                     // Revert: remove the GETUPVAL instruction, free the register
-                    let getupval_pc = fs.pc - 1;
-                    Rc::make_mut(&mut fs.proto.code).remove(getupval_pc as usize);
-                    fs.inst_lines.remove(getupval_pc as usize);
-                    fs.pc -= 1;
+                    // (GETUPVAL 是最后一条指令, 用 O(1) pop 替代 O(n) remove)
+                    fs.remove_last_instruction();
                     fs.free_reg();
                     let uv_idx = first.upval_idx.unwrap();
                     (uv_idx, -1) // Use upvalue index as base_reg (for SETTABUP/GETTABUP)
@@ -4171,9 +4180,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         // Short string key: use GETTABUP/SETTABUP directly (C's VINDEXUP)
                         // If we emitted GETUPVAL before key load, revert it
                         if getupval_emitted_before_key {
-                            Rc::make_mut(&mut fs.proto.code).remove(fs.pc as usize - 1);
-                            fs.inst_lines.remove(fs.pc as usize - 1);
-                            fs.pc -= 1;
+                            fs.remove_last_instruction();
                             fs.free_reg();
                         }
                         (saved_upval_idx, true, false)
@@ -5767,10 +5774,8 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     };
                 let (base_reg, gettabup_pc) = if can_revert_getupval {
                     // Revert: remove the GETUPVAL instruction, free the register
-                    let getupval_pc = fs.pc - 1;
-                    Rc::make_mut(&mut fs.proto.code).remove(getupval_pc as usize);
-                    fs.inst_lines.remove(getupval_pc as usize);
-                    fs.pc -= 1;
+                    // (GETUPVAL 是最后一条指令, 用 O(1) pop 替代 O(n) remove)
+                    fs.remove_last_instruction();
                     fs.free_reg();
                     let uv_idx = result.upval_idx.unwrap();
                     (uv_idx, -1) // Use upvalue index as base_reg (for SETTABUP/GETTABUP)
@@ -6057,9 +6062,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                         && (kr as u32) <= crate::opcodes::MAXINDEXRK;
                     if can_use_settabup {
                         if getupval_emitted_before_key {
-                            Rc::make_mut(&mut fs.proto.code).remove(fs.pc as usize - 1);
-                            fs.inst_lines.remove(fs.pc as usize - 1);
-                            fs.pc -= 1;
+                            fs.remove_last_instruction();
                             fs.free_reg();
                         }
                         (saved_upval_idx, true, false)
@@ -6271,11 +6274,11 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     if is_vreloc_not {
                         // Like C: remove NOT, use NOT's B operand as TEST's A
                         // and: goiftrue → jumponcond(cond=0) → TEST b k=!cond=true
+                        // NOT 是 parse_simple_exp 生成的最后一条指令, 用 O(1) pop 替代 O(n) remove
                         let not_inst = fs.proto.code[e_left.info2 as usize];
                         let b = getarg_b(not_inst);
-                        Rc::make_mut(&mut fs.proto.code).remove(e_left.info2 as usize);
-                        fs.inst_lines.remove(e_left.info2 as usize);
-                        fs.pc -= 1;
+                        debug_assert_eq!(e_left.info2, fs.pc - 1);
+                        fs.remove_last_instruction();
                         fs.code_abc_k(OpCode::TEST, b, 0, 0, true);
                         let jmp_pc = fs.jump();
                         fs.concat_jump(&mut e_left.f, jmp_pc);
@@ -6341,11 +6344,11 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     if is_vreloc_not {
                         // Like C: remove NOT, use NOT's B operand as TEST's A
                         // or: goiffalse → jumponcond(cond=1) → TEST b k=!cond=false
+                        // NOT 是 parse_simple_exp 生成的最后一条指令, 用 O(1) pop 替代 O(n) remove
                         let not_inst = fs.proto.code[e_left.info2 as usize];
                         let b = getarg_b(not_inst);
-                        Rc::make_mut(&mut fs.proto.code).remove(e_left.info2 as usize);
-                        fs.inst_lines.remove(e_left.info2 as usize);
-                        fs.pc -= 1;
+                        debug_assert_eq!(e_left.info2, fs.pc - 1);
+                        fs.remove_last_instruction();
                         fs.code_abc_k(OpCode::TEST, b, 0, 0, false);
                         let jmp_pc = fs.jump();
                         fs.concat_jump(&mut e_left.t, jmp_pc);
@@ -10640,12 +10643,9 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 };
                 if can_revert_getupval {
                     // Revert: remove the GETUPVAL instruction, free the register, use GETTABUP
-                    let last_idx = fs.pc as usize - 1;
-                    let last_ins = fs.proto.code[last_idx];
+                    let last_ins = fs.proto.code[fs.pc as usize - 1];
                     let uv_idx = getarg_b(last_ins);
-                    Rc::make_mut(&mut fs.proto.code).remove(last_idx);
-                    fs.inst_lines.remove(last_idx);
-                    fs.pc -= 1;
+                    fs.remove_last_instruction();
                     if base_reg >= fs.nvarstack() && base_reg == fs.freereg - 1 {
                         fs.free_reg();
                     }
