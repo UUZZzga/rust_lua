@@ -476,11 +476,30 @@ impl<'a> LexState<'a> {
 
     #[inline(always)]
     fn skip_whitespace(&mut self) {
+        let bytes = self.source.as_bytes();
+        let len = bytes.len();
         loop {
+            // ASCII 快速路径: 批量跳过 ' ' 和 '\t' (最常见的空白, 如缩进),
+            // 避免每字符调用 next_char → advance_pos + 换行检查的开销。
+            // (perf: skip_whitespace 占 read_token 9.14% 中的 2.58%,
+            //  其中绝大部分是 ' '/'\t' 的逐字符 next_char 调用)
+            while self.pos < len && (bytes[self.pos] == b' ' || bytes[self.pos] == b'\t') {
+                self.pos += 1;
+            }
+            // 更新 current 到新位置 (与 advance_pos 的 current 更新逻辑一致)
+            self.current = if self.pos >= len {
+                EOF_CHAR
+            } else if bytes[self.pos] < 0x80 {
+                bytes[self.pos] as char
+            } else {
+                read_char_at(bytes, self.pos)
+            };
             match self.current {
                 // 对应 C llex 中的空白: ' ', '\f', '\t', '\v' (以及 '\n','\r' 通过 inclinenumber)
                 // lispace 表 (lctype.c) 将这 6 个字符均标记为 SPACEBIT
-                ' ' | '\t' | '\r' | '\n' | '\u{0B}' | '\u{0C}' => self.next_char(),
+                // ' ' 和 '\t' 已在快速路径处理, 这里只处理需要行号更新的换行符
+                // 和 \u{0B}/\u{0C} (较少见, 不值得在快速路径中处理)
+                '\r' | '\n' | '\u{0B}' | '\u{0C}' => self.next_char(),
                 '-' if self.peek() == '-' => {
                     self.next_char();
                     self.next_char();
@@ -504,7 +523,7 @@ impl<'a> LexState<'a> {
     fn count_equals(&mut self) -> usize {
         let mut n = 0;
         while self.current == '=' {
-            self.next_char();
+            self.advance_pos();
             n += 1;
         }
         n
@@ -624,131 +643,134 @@ impl<'a> LexState<'a> {
         // 只有 read_name/read_number/read_short_string/read_long_string 会填充它,
         // 其他 token (符号/关键字) 保持为空, token_display() 会回退到 to_display_str()。
         self.token_text.clear();
+        // 性能: skip_whitespace 已跳过所有空白字符(含换行符), 此时 current 必非换行符。
+        // 用 advance_pos 代替 next_char 可省去换行检查 (old == '\n' || '\r' 分支),
+        // read_token 是 9.14% 热点, 其中 advance_pos/next_char 占 2.10%。
         match self.current {
             EOF_CHAR => self.token = Token::Eof,
             '+' => {
                 self.token = Token::Plus;
-                self.next_char();
+                self.advance_pos();
             }
             '*' => {
                 self.token = Token::Star;
-                self.next_char();
+                self.advance_pos();
             }
             '%' => {
                 self.token = Token::Percent;
-                self.next_char();
+                self.advance_pos();
             }
             '^' => {
                 self.token = Token::Caret;
-                self.next_char();
+                self.advance_pos();
             }
             '#' => {
                 self.token = Token::Hash;
-                self.next_char();
+                self.advance_pos();
             }
             '&' => {
                 self.token = Token::Ampersand;
-                self.next_char();
+                self.advance_pos();
             }
             '|' => {
                 self.token = Token::Pipe;
-                self.next_char();
+                self.advance_pos();
             }
             '(' => {
                 self.token = Token::LParen;
-                self.next_char();
+                self.advance_pos();
             }
             ')' => {
                 self.token = Token::RParen;
-                self.next_char();
+                self.advance_pos();
             }
             '{' => {
                 self.token = Token::LBrace;
-                self.next_char();
+                self.advance_pos();
             }
             '}' => {
                 self.token = Token::RBrace;
-                self.next_char();
+                self.advance_pos();
             }
             ',' => {
                 self.token = Token::Comma;
-                self.next_char();
+                self.advance_pos();
             }
             ';' => {
                 self.token = Token::Semi;
-                self.next_char();
+                self.advance_pos();
             }
             '~' => {
-                self.next_char();
+                self.advance_pos();
                 if self.current == '=' {
                     self.token = Token::TildeEq;
-                    self.next_char();
+                    self.advance_pos();
                 } else {
                     self.token = Token::Tilde;
                 }
             }
             '=' => {
-                self.next_char();
+                self.advance_pos();
                 if self.current == '=' {
                     self.token = Token::EqEq;
-                    self.next_char();
+                    self.advance_pos();
                 } else {
                     self.token = Token::Eq;
                 }
             }
             '<' => {
-                self.next_char();
+                self.advance_pos();
                 match self.current {
                     '=' => {
                         self.token = Token::LtEq;
-                        self.next_char();
+                        self.advance_pos();
                     }
                     '<' => {
                         self.token = Token::LtLt;
-                        self.next_char();
+                        self.advance_pos();
                     }
                     _ => self.token = Token::Lt,
                 }
             }
             '>' => {
-                self.next_char();
+                self.advance_pos();
                 match self.current {
                     '=' => {
                         self.token = Token::GtEq;
-                        self.next_char();
+                        self.advance_pos();
                     }
                     '>' => {
                         self.token = Token::GtGt;
-                        self.next_char();
+                        self.advance_pos();
                     }
                     _ => self.token = Token::Gt,
                 }
             }
             '/' => {
-                self.next_char();
+                self.advance_pos();
                 if self.current == '/' {
                     self.token = Token::SlashSlash;
-                    self.next_char();
+                    self.advance_pos();
                 } else {
                     self.token = Token::Slash;
                 }
             }
             ':' => {
-                self.next_char();
+                self.advance_pos();
                 if self.current == ':' {
                     self.token = Token::ColonColon;
-                    self.next_char();
+                    self.advance_pos();
                 } else {
                     self.token = Token::Colon;
                 }
             }
             '.' => {
-                self.next_char();
+                self.advance_pos();
                 if self.current == '.' {
-                    self.next_char();
+                    self.advance_pos();
                     if self.current == '.' {
                         self.token = Token::DotDotDot;
-                        self.next_char();
+                        self.advance_pos();
                     } else {
                         self.token = Token::DotDot;
                     }
@@ -762,7 +784,7 @@ impl<'a> LexState<'a> {
             }
             '[' => {
                 let start_pos = self.pos; // '[' 的位置, 用于长字符串 token_text
-                self.next_char();
+                self.advance_pos();
                 let eqs = self.count_equals();
                 if self.current == '[' {
                     self.read_long_string(eqs);
@@ -784,10 +806,10 @@ impl<'a> LexState<'a> {
             }
             ']' => {
                 self.token = Token::RBracket;
-                self.next_char();
+                self.advance_pos();
             }
             '-' => {
-                self.next_char();
+                self.advance_pos();
                 self.token = Token::Minus;
             }
             '\'' | '"' => self.read_short_string(),
@@ -798,21 +820,42 @@ impl<'a> LexState<'a> {
                 // 对应 C llex default 分支: 非字母数字的单字符直接返回为 token
                 // (如控制字符 \1), 解析器在 primaryexp/exprstat 中报 "syntax error"
                 // 或 "unexpected symbol". luaX_token2str 对控制字符显示 '<\N>'.
-                self.next_char();
+                self.advance_pos();
                 self.token = Token::Char(c);
             }
         }
     }
 
     fn read_name(&mut self) {
+        // ASCII 快速路径: 直接用字节切片扫描标识符,避免每个字符都调用 next_char/advance_pos
+        // (perf: read_name 是 4.37% 热点, 内层循环的 next_char → advance_pos 有冗余的
+        //  UTF-8 检查、边界检查、self.current 更新、换行检查等开销)
+        // Lua 标识符只含 ASCII 字母数字/下划线, 非 ASCII 字节直接终止循环
+        let bytes = self.source.as_bytes();
         let start = self.pos;
-        while self.current.is_ascii_alphanumeric() || self.current == '_' {
-            self.next_char();
+        let mut i = start;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z') || b == b'_'
+                || (b >= b'0' && b <= b'9')
+            {
+                i += 1;
+            } else {
+                break;
+            }
         }
+        // 只更新一次 pos 和 current, 而非每字符更新
+        self.pos = i;
+        self.current = if i >= bytes.len() {
+            EOF_CHAR
+        } else if bytes[i] < 0x80 {
+            bytes[i] as char
+        } else {
+            read_char_at(bytes, i)
+        };
         // read_name 只消费 ASCII 字母数字/下划线,字节切片必为合法 ASCII (UTF-8 子集)。
         // 用 from_utf8_unchecked 跳过验证,省去 perf 中 2.50% 的 from_utf8 开销。
-        let bytes = &self.source.as_bytes()[start..self.pos];
-        let s = unsafe { std::str::from_utf8_unchecked(bytes) };
+        let s = unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) };
         // 先检查关键字: 关键字 token 不含 LuaString, 无需 intern。
         // perf: constructs.lua 大量 load() 产生关键字(local/function/return/if/then/end 等),
         // 跳过关键字的 intern 可省去 hash 计算 + HashTable 查找 + Rc 引用计数操作。
@@ -836,52 +879,52 @@ impl<'a> LexState<'a> {
             let next = self.peek();
             if next == 'x' || next == 'X' {
                 is_hex = true;
-                self.next_char();
-                self.next_char();
+                self.advance_pos();
+                self.advance_pos();
                 start = self.pos;
             }
         }
 
         if is_hex {
             while self.current.is_ascii_hexdigit() {
-                self.next_char();
+                self.advance_pos();
             }
             if self.current == '.' {
                 is_float = true;
-                self.next_char();
+                self.advance_pos();
                 while self.current.is_ascii_hexdigit() {
-                    self.next_char();
+                    self.advance_pos();
                 }
             }
             if self.current == 'p' || self.current == 'P' {
                 is_float = true;
-                self.next_char();
+                self.advance_pos();
                 if self.current == '+' || self.current == '-' {
-                    self.next_char();
+                    self.advance_pos();
                 }
                 while self.current.is_ascii_digit() {
-                    self.next_char();
+                    self.advance_pos();
                 }
             }
         } else {
             while self.current.is_ascii_digit() {
-                self.next_char();
+                self.advance_pos();
             }
             if self.current == '.' {
                 is_float = true;
-                self.next_char();
+                self.advance_pos();
                 while self.current.is_ascii_digit() {
-                    self.next_char();
+                    self.advance_pos();
                 }
             }
             if self.current == 'e' || self.current == 'E' {
                 is_float = true;
-                self.next_char();
+                self.advance_pos();
                 if self.current == '+' || self.current == '-' {
-                    self.next_char();
+                    self.advance_pos();
                 }
                 while self.current.is_ascii_digit() {
-                    self.next_char();
+                    self.advance_pos();
                 }
             }
         }
@@ -889,7 +932,7 @@ impl<'a> LexState<'a> {
         // 对应 C: if (lislalpha(ls->current)) save_and_next(ls);  /* force an error */
         // 数字后紧跟字母/下划线时,将其包含进 token 以触发 "malformed number" 错误
         if self.current.is_ascii_alphabetic() || self.current == '_' {
-            self.next_char();
+            self.advance_pos();
         }
 
         // read_number 只消费数字、'.'、'e/E'、'+/-'、'x/X'、'p/P'、'a-f/A-F' 等 ASCII 字符,

@@ -584,6 +584,12 @@ fn max_expand(ms: &mut MatchState<'_>, s: usize, p: usize, ep: usize) -> Result<
     while single_match(ms, s + i as usize, p, ep) {
         i += 1;
     }
+    // 快速路径: ep+1 是模式末尾时, 最长匹配即为最终结果,
+    // 省去回溯阶段的 match_pattern 递归调用 (每次调用含 depth 检查 + 循环入口)。
+    // all.lua 大量模式以 * / + 结尾 (如 "%a*", ".*", "%w+"), max_expand 占 2.41%。
+    if ep + 1 >= ms.p_end {
+        return Ok(Some(s + i as usize));
+    }
     while i >= 0 {
         let res = match_pattern(ms, s + i as usize, ep + 1)?;
         if res.is_some() {
@@ -618,6 +624,10 @@ fn min_expand(
 }
 
 /// 对应 C 的 match — 核心模式匹配函数
+/// perf: match_pattern 是 all.lua 最大热点 (11.88%)。它是一个小包装层, 仅做 depth
+/// 检查 + 递减/递增, 实际逻辑在 match_pattern_inner。内联后递归调用直接进入
+/// match_pattern_inner, 省去每次递归的 call/ret 开销 (约 5-10 cycles/次)。
+#[inline]
 fn match_pattern(ms: &mut MatchState<'_>, s: usize, p: usize) -> Result<Option<usize>, String> {
     if ms.match_depth == 0 {
         return Err("pattern too complex".to_string());
@@ -648,137 +658,62 @@ fn match_pattern_inner(
             b')' => {
                 return end_capture(ms, s, p + 1);
             }
-            b'$' => {
-                if p + 1 == ms.p_end {
-                    return Ok(if s == ms.src_end { Some(s) } else { None });
-                }
-                // fall through to default
-                let ep = class_end(ms, p)?;
-                let suffix = if ep < ms.p_end { ms.pat_byte(ep) } else { 0 };
-                if !single_match(ms, s, p, ep) {
-                    if suffix == b'*' || suffix == b'?' || suffix == b'-' {
-                        p = ep + 1;
-                        continue;
-                    } else {
-                        return Ok(None);
-                    }
-                } else {
-                    match suffix {
-                        b'?' => {
-                            let res = match_pattern(ms, s + 1, ep + 1)?;
-                            if res.is_some() {
-                                return Ok(res);
-                            }
-                            p = ep + 1;
-                            continue;
-                        }
-                        b'+' => {
-                            s += 1;
-                            return max_expand(ms, s, p, ep);
-                        }
-                        b'*' => {
-                            return max_expand(ms, s, p, ep);
-                        }
-                        b'-' => {
-                            return min_expand(ms, s, p, ep);
-                        }
-                        _ => {
-                            s += 1;
-                            p = ep;
-                            continue;
-                        }
-                    }
-                }
+            b'$' if p + 1 == ms.p_end => {
+                return Ok(if s == ms.src_end { Some(s) } else { None });
             }
-            b'%' => {
-                if p + 1 < ms.p_end {
-                    match ms.pat_byte(p + 1) {
-                        b'b' => {
-                            let res = match_balance(ms, s, p + 2)?;
-                            match res {
-                                Some(new_s) => {
-                                    s = new_s;
-                                    p += 4;
-                                    continue;
-                                }
-                                None => return Ok(None),
-                            }
-                        }
-                        b'f' => {
-                            let mut p2 = p + 2;
-                            if p2 >= ms.p_end || ms.pat_byte(p2) != b'[' {
-                                return Err("missing '[' after '%f' in pattern".to_string());
-                            }
-                            let ep = class_end(ms, p2)?;
-                            let previous = if s == ms.src_init {
-                                0u8
-                            } else {
-                                ms.src_byte(s - 1)
-                            };
-                            let current = if s < ms.src_end { ms.src_byte(s) } else { 0u8 };
-                            if !match_bracket_class(previous, &ms.pattern[p2..ep], ep - p2 - 1)
-                                && match_bracket_class(current, &ms.pattern[p2..ep], ep - p2 - 1)
-                            {
-                                p = ep;
+            // perf: $ 非末尾时 fall through 到默认分支 (代码与 _ 完全相同, 合并以改善 icache 密度)
+            b'%' if p + 1 < ms.p_end && {
+                let c = ms.pat_byte(p + 1);
+                c == b'b' || c == b'f' || c.is_ascii_digit()
+            } => {
+                match ms.pat_byte(p + 1) {
+                    b'b' => {
+                        let res = match_balance(ms, s, p + 2)?;
+                        match res {
+                            Some(new_s) => {
+                                s = new_s;
+                                p += 4;
                                 continue;
-                            } else {
-                                return Ok(None);
                             }
-                        }
-                        c if c.is_ascii_digit() => {
-                            let res = match_capture(ms, s, c)?;
-                            match res {
-                                Some(new_s) => {
-                                    s = new_s;
-                                    p += 2;
-                                    continue;
-                                }
-                                None => return Ok(None),
-                            }
-                        }
-                        _ => {
-                            // fall through to default
+                            None => return Ok(None),
                         }
                     }
-                }
-                // fall through to default
-                let ep = class_end(ms, p)?;
-                let suffix = if ep < ms.p_end { ms.pat_byte(ep) } else { 0 };
-                if !single_match(ms, s, p, ep) {
-                    if suffix == b'*' || suffix == b'?' || suffix == b'-' {
-                        p = ep + 1;
-                        continue;
-                    } else {
-                        return Ok(None);
-                    }
-                } else {
-                    match suffix {
-                        b'?' => {
-                            let res = match_pattern(ms, s + 1, ep + 1)?;
-                            if res.is_some() {
-                                return Ok(res);
-                            }
-                            p = ep + 1;
-                            continue;
+                    b'f' => {
+                        let mut p2 = p + 2;
+                        if p2 >= ms.p_end || ms.pat_byte(p2) != b'[' {
+                            return Err("missing '[' after '%f' in pattern".to_string());
                         }
-                        b'+' => {
-                            s += 1;
-                            return max_expand(ms, s, p, ep);
-                        }
-                        b'*' => {
-                            return max_expand(ms, s, p, ep);
-                        }
-                        b'-' => {
-                            return min_expand(ms, s, p, ep);
-                        }
-                        _ => {
-                            s += 1;
+                        let ep = class_end(ms, p2)?;
+                        let previous = if s == ms.src_init {
+                            0u8
+                        } else {
+                            ms.src_byte(s - 1)
+                        };
+                        let current = if s < ms.src_end { ms.src_byte(s) } else { 0u8 };
+                        if !match_bracket_class(previous, &ms.pattern[p2..ep], ep - p2 - 1)
+                            && match_bracket_class(current, &ms.pattern[p2..ep], ep - p2 - 1)
+                        {
                             p = ep;
                             continue;
+                        } else {
+                            return Ok(None);
                         }
                     }
+                    c if c.is_ascii_digit() => {
+                        let res = match_capture(ms, s, c)?;
+                        match res {
+                            Some(new_s) => {
+                                s = new_s;
+                                p += 2;
+                                continue;
+                            }
+                            None => return Ok(None),
+                        }
+                    }
+                    _ => unreachable!(),
                 }
             }
+            // perf: 其他 % (如 %a, %d, %s) fall through 到默认分支, 与 _ 合并以改善 icache 密度
             _ => {
                 let ep = class_end(ms, p)?;
                 let suffix = if ep < ms.p_end { ms.pat_byte(ep) } else { 0 };

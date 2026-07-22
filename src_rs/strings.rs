@@ -200,6 +200,7 @@ impl PartialEq for LongString {
 /// 加 hash 预比较后：hash 不同 → 立即返回 false（O(1)，仅 1 条 `cmp` 指令），
 /// 避免进入 content_eq。hash 相同时（hash 冲突，极少见）才走 content_eq 检查实际内容。
 impl PartialEq for LuaString {
+    #[inline]
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (LuaString::Short(a), LuaString::Short(b)) => {

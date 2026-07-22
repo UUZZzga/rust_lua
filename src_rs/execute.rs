@@ -5682,40 +5682,44 @@ impl VmExecutor {
             match curr {
                 TValue::Table(t) => {
                     // 一次 borrow 内查找值 + 获取元表 — 消除 metamethod 路径的第二次 borrow
-                    let (val, mt) = t.get_and_metatable(key);
+                    let (val, has_mt) = t.get_and_metatable(key);
                     if let Some(v) = val {
                         if !matches!(v, TValue::Nil(_)) {
                             return Ok(v);
                         }
                     }
-                    // 直接使用已获取的元表，无需再次 borrow
-                    let tmnames = &state.tmnames;
-                    let index_val = mt.and_then(|mt| {
-                        let index_key = crate::tm::make_tm_tvalue(tmnames, crate::tm::TagMethod::Index);
-                        mt.get(&index_key)
-                    });
-                    if let Some(index_val) = index_val {
-                        match &index_val {
-                            TValue::Table(_) => {
-                                current = Some(index_val);
-                                continue;
-                            }
-                            TValue::LClosure(_)
-                            | TValue::LCFn(_)
-                            | TValue::CClosure(_)
-                            | TValue::BuiltinFn(_)
-                            | TValue::RustClosure(_)
-                            | TValue::LightUserData(_) => {
-                                return Self::call_index_metamethod(
-                                    state,
-                                    index_val,
-                                    curr.clone(),
-                                    key.clone(),
-                                );
-                            }
-                            _ => {
-                                current = Some(index_val);
-                                continue;
+                    // key 未命中: 仅在有元表时才 clone 元表查 __index (延迟 clone,
+                    // 避免命中路径的冗余 Rc incq; all.lua table_get 占 10.65%)
+                    if has_mt {
+                        let mt = t.get_metatable();
+                        let tmnames = &state.tmnames;
+                        let index_val = mt.and_then(|mt| {
+                            let index_key = crate::tm::make_tm_tvalue(tmnames, crate::tm::TagMethod::Index);
+                            mt.get(&index_key)
+                        });
+                        if let Some(index_val) = index_val {
+                            match &index_val {
+                                TValue::Table(_) => {
+                                    current = Some(index_val);
+                                    continue;
+                                }
+                                TValue::LClosure(_)
+                                | TValue::LCFn(_)
+                                | TValue::CClosure(_)
+                                | TValue::BuiltinFn(_)
+                                | TValue::RustClosure(_)
+                                | TValue::LightUserData(_) => {
+                                    return Self::call_index_metamethod(
+                                        state,
+                                        index_val,
+                                        curr.clone(),
+                                        key.clone(),
+                                    );
+                                }
+                                _ => {
+                                    current = Some(index_val);
+                                    continue;
+                                }
                             }
                         }
                     }

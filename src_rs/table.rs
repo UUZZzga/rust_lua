@@ -107,9 +107,12 @@ impl Table {
 
     /// 一次 borrow 内同时查找值并返回元表 — 消除 metamethod 路径的第二次 borrow。
     /// 返回 (查找结果, 元表)。元表为 Some 时调用方无需再次 borrow 获取 __index。
-    pub fn get_and_metatable(&self, key: &TValue) -> (Option<TValue>, Option<Table>) {
+    pub fn get_and_metatable(&self, key: &TValue) -> (Option<TValue>, bool) {
         let data = self.data.borrow();
-        let mt = data.metatable.as_ref().map(|b| (**b).clone());
+        // perf: 只返回是否有元表的标志, 不 clone 元表 (Table 是 Rc, clone 需 incq)。
+        // table_get 在 key 命中时直接返回, 无需元表; 仅 key 未命中时才调用 get_metatable()
+        // 获取元表查 __index。命中路径省去一次冗余的 Rc incq/drop (all.lua table_get 占 10.65%)。
+        let has_mt = data.metatable.is_some();
         let val = match key {
             TValue::Integer(i) if *i > 0 => {
                 let idx = (*i - 1) as usize;
@@ -131,7 +134,7 @@ impl Table {
                         if idx < data.array.len() {
                             let v = &data.array[idx];
                             if !matches!(v, TValue::Nil(NilKind::Empty)) {
-                                return (Some(v.clone()), mt);
+                                return (Some(v.clone()), has_mt);
                             }
                         }
                     }
@@ -142,7 +145,7 @@ impl Table {
             }
             _ => hash_get(&data, key),
         };
-        (val, mt)
+        (val, has_mt)
     }
 
     pub fn get(&self, key: &TValue) -> Option<TValue> {

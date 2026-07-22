@@ -575,8 +575,17 @@ impl<'a> FuncState<'a> {
             block_stack: Vec::new(),
             pending_func_block: None,
             ls: ls as *mut LexState<'a>,
-            inst_lines: Vec::new(),
-            const_index: HashMap::new(),
+            // perf: inst_lines 与 proto.code 在 emit 中 1:1 同步 push,
+            // proto.code 初始容量 8 (new_proto), inst_lines 初始容量 0 导致
+            // 前 8 条指令期间 inst_lines 扩容 2 次 (0→4→8)。
+            // 预分配 8 与 code 对齐, 消除前 8 条指令的 inst_lines 扩容。
+            // inst_lines 不进入 GC (FuncState 丢弃后释放), 无 GC 压力。
+            inst_lines: Vec::with_capacity(8),
+            // perf: const_index 的 reserve_rehash 占 1.32%, 初始容量 0 导致频繁扩容
+            // (0→8→16→32...)。给 16 初始容量可容纳约 11 个常量不扩容 (16*0.7),
+            // 覆盖大多数小函数的常量数量, 减少 rehash 开销。
+            // 内存开销: 16 桶 * 24 字节 ≈ 384 字节, 可忽略。
+            const_index: HashMap::with_capacity(16),
             #[cfg(debug_assertions)]
             reg_alloc_stack: Vec::new(),
             #[cfg(debug_assertions)]
