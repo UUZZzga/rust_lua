@@ -427,7 +427,8 @@ impl StringTable {
         }
 
         // 写路径
-        let mut buf = bytes.to_vec();
+        let mut buf = Vec::with_capacity(bytes.len() + 1); // 预分配含 NUL 的容量
+        buf.extend_from_slice(bytes);
         buf.push(0); // NUL 终止符
         let ts = ArcRc::new(ShortString {
             hash: h,
@@ -456,7 +457,8 @@ impl StringTable {
         }
         drop(ht_reader);
 
-        let mut buf = bytes.to_vec();
+        let mut buf = Vec::with_capacity(bytes.len() + 1); // 预分配含 NUL 的容量
+        buf.extend_from_slice(bytes);
         buf.push(0);
         let mut ht = self.ht.write();
         let ts = ArcRc::new(ShortString {
@@ -559,8 +561,10 @@ pub fn rust_hash(str: &str) -> u64 {
 // ============================================================================
 impl LuaString {
     /// 新建时自动追加 NUL 字节，确保作为 *const c_char 返回时安全。
+    /// 预分配 str.len()+1 容量，避免 push('\0') 触发扩容。
     pub(crate) fn with_nul(str: &str) -> String {
-        let mut s = str.to_string();
+        let mut s = String::with_capacity(str.len() + 1);
+        s.push_str(str);
         s.push('\0');
         s
     }
@@ -667,6 +671,7 @@ pub fn new_long_str_from_string(mut s: String) -> LuaString {
         s.len() > LUAI_MAXSHORTLEN,
         "长字符串长度必须大于 LUAI_MAXSHORTLEN"
     );
+    s.reserve(1); // 确保 capacity >= len+1，避免 push('\0') 扩容
     s.push('\0');
     LuaString::Long(Box::new(LongString {
         hash: AtomicU64::new(0),
@@ -678,6 +683,7 @@ pub fn new_long_str_from_string(mut s: String) -> LuaString {
 
 pub fn new_long_bytes(bytes: Vec<u8>) -> LuaString {
     let mut buf = bytes;
+    buf.reserve(1); // 避免 push(0) 扩容
     buf.push(0);
     LuaString::Long(Box::new(LongString {
         hash: AtomicU64::new(0),
@@ -697,6 +703,7 @@ pub fn new_short_bytes(bytes: Vec<u8>) -> LuaString {
     // 与 intern_bytes 相同的哈希算法：rust_hash_bytes
     let h = rust_hash_bytes(&bytes);
     let mut buf = bytes;
+    buf.reserve(1); // 避免 push(0) 扩容
     buf.push(0);
     LuaString::Short(ArcRc::new(ShortString {
         hash: h,

@@ -2897,6 +2897,7 @@ pub fn str_pack(fmt: &str, args: &[TValue]) -> Result<Vec<u8>, String> {
                         arg + 1
                     ));
                 }
+                buf.reserve(len + 1); // 预留内容+NUL的空间，避免 push(0) 扩容
                 buf.extend_from_slice(s);
                 buf.push(0); // 添加终止零
                 totalsize += len + 1;

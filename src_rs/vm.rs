@@ -920,7 +920,8 @@ pub fn concat_stack(stack: &mut Vec<TValue>, total: usize) -> Result<(), TagMeth
             n += 1;
         }
         // 拼接 n 个值
-        let mut result = String::with_capacity(total_len);
+        // 预分配 total_len + 1 容量 (含 NUL 终止符), 避免 push('\0') 扩容
+        let mut result = String::with_capacity(total_len + 1);
         for i in 0..n {
             let idx = top - n + i;
             append_val_to_string(&mut result, &stack[idx]);

@@ -1303,7 +1303,8 @@ impl BytecodeWriter {
                     let idx = self.nstr;
                     self.strings.insert(content.to_string(), idx);
                     self.dump_size(content.len() + 1);
-                    let mut bytes = content.as_bytes().to_vec();
+                    let mut bytes = Vec::with_capacity(content.len() + 1);
+                    bytes.extend_from_slice(content.as_bytes());
                     bytes.push(0);
                     self.dump_block(&bytes);
                 }
