@@ -813,11 +813,18 @@ impl<'a> LexState<'a> {
         // 用 from_utf8_unchecked 跳过验证,省去 perf 中 2.50% 的 from_utf8 开销。
         let bytes = &self.source.as_bytes()[start..self.pos];
         let s = unsafe { std::str::from_utf8_unchecked(bytes) };
-        // 直接 intern 到 StringTable, 避免每次都 s.to_string() 分配新 String。
-        // intern 命中时只增加 Rc refcount, 不分配新堆内存 (perf 显示 read_name malloc 1.66%)。
+        // 先检查关键字: 关键字 token 不含 LuaString, 无需 intern。
+        // perf: constructs.lua 大量 load() 产生关键字(local/function/return/if/then/end 等),
+        // 跳过关键字的 intern 可省去 hash 计算 + HashTable 查找 + Rc 引用计数操作。
+        if let Some(tok) = Token::is_keyword(s) {
+            self.token = tok;
+            return;
+        }
+        // 非关键字: intern 到 StringTable, 避免每次都 s.to_string() 分配新 String。
+        // intern 命中时只增加 Rc refcount, 不分配新堆内存。
         // 对应 C 的 luaX_newstring: 直接返回 intern 后的 TString*。
         let ls = self.anchor_string(s);
-        self.token = Token::is_keyword(s).unwrap_or(Token::Name(ls));
+        self.token = Token::Name(ls);
     }
 
     fn read_number(&mut self) {

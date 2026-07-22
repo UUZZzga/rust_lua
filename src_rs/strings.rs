@@ -659,6 +659,23 @@ pub fn new_long_str(str: &str) -> LuaString {
     }))
 }
 
+/// 创建一个长字符串对象，直接 consume 传入的 String，避免 clone。
+/// 用于 str_format 等已知结果为长字符串且不再需要原 String 的场景。
+/// perf: 消除 new_long_str 中 with_nul 的 to_string() clone（constructs.lua 热点）。
+pub fn new_long_str_from_string(mut s: String) -> LuaString {
+    debug_assert!(
+        s.len() > LUAI_MAXSHORTLEN,
+        "长字符串长度必须大于 LUAI_MAXSHORTLEN"
+    );
+    s.push('\0');
+    LuaString::Long(Box::new(LongString {
+        hash: AtomicU64::new(0),
+        extra: AtomicU8::new(0),
+        contents: s,
+        ptr_id: crate::gc::new_ptr_id(),
+    }))
+}
+
 pub fn new_long_bytes(bytes: Vec<u8>) -> LuaString {
     let mut buf = bytes;
     buf.push(0);
@@ -712,6 +729,17 @@ pub fn new_lstr(table: &StringTable, str: &str) -> LuaString {
         table.intern(str)
     } else {
         new_long_str(str)
+    }
+}
+
+/// 从 String 创建 LuaString，长字符串路径直接 consume 避免 clone。
+/// 短字符串仍走 intern（需要查表去重，intern 未命中时内部会 clone，但短串开销小）。
+#[inline]
+pub fn new_lstr_from_string(table: &StringTable, s: String) -> LuaString {
+    if s.len() <= LUAI_MAXSHORTLEN {
+        table.intern(&s)
+    } else {
+        new_long_str_from_string(s)
     }
 }
 

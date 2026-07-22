@@ -3608,19 +3608,25 @@ fn call_str_format(
     nresults: i32,
 ) -> Result<(), VmError> {
     let fmt = get_str_arg(state, a, 0)?;
-    let mut args: Vec<TValue> = (1..nargs)
-        .map(|i| {
-            let idx = a + 1 + i;
-            if idx < state.stack.len() {
-                state.stack[idx].clone()
-            } else {
-                TValue::Nil(NilKind::Strict)
-            }
-        })
-        .collect();
-    // Fast path: only need __tostring conversion when a %s arg is a table.
-    // Avoid HashSet allocation + format scan for the common case (all string args).
-    if args.iter().any(|arg| matches!(arg, TValue::Table(_))) {
+    // 检查是否有 Table 参数 (需要 __tostring 转换)。
+    // constructs.lua 的 string.format args 都是 string/number, 走快速路径避免 clone。
+    let args_start = a + 2;
+    let args_end = a + 1 + nargs;
+    let has_table = (args_start..args_end)
+        .any(|idx| idx < state.stack.len() && matches!(state.stack[idx], TValue::Table(_)));
+
+    if has_table {
+        // 慢速路径: clone args, 转换 table 为 string
+        let mut args: Vec<TValue> = (1..nargs)
+            .map(|i| {
+                let idx = a + 1 + i;
+                if idx < state.stack.len() {
+                    state.stack[idx].clone()
+                } else {
+                    TValue::Nil(NilKind::Strict)
+                }
+            })
+            .collect();
         let s_indices = find_s_arg_indices(&fmt);
         for (i, arg) in args.iter_mut().enumerate() {
             if s_indices.contains(&i) {
@@ -3629,18 +3635,58 @@ fn call_str_format(
                 }
             }
         }
-    }
-    match str_format(&fmt, &args) {
-        Ok(result) => {
-            push_results(
-                state,
-                a,
-                nresults,
-                vec![TValue::Str(state.intern_str(&result))],
-            );
-            Ok(())
+        match str_format(&fmt, &args) {
+            Ok(result) => {
+                push_results(
+                    state,
+                    a,
+                    nresults,
+                    vec![TValue::Str(state.intern_str_owned(result))],
+                );
+                Ok(())
+            }
+            Err(msg) => Err(VmError::RuntimeError(msg)),
         }
-        Err(msg) => Err(VmError::RuntimeError(msg)),
+    } else if args_end <= state.stack.len() {
+        // 快速路径: 直接借用 stack 切片, 避免 TValue clone (perf: 省约 4% TValue::clone)
+        // str_format 不修改 state (不触发 GC), 借用安全; 借用在 str_format 返回后释放。
+        let result = str_format(&fmt, &state.stack[args_start..args_end]);
+        match result {
+            Ok(result) => {
+                push_results(
+                    state,
+                    a,
+                    nresults,
+                    vec![TValue::Str(state.intern_str_owned(result))],
+                );
+                Ok(())
+            }
+            Err(msg) => Err(VmError::RuntimeError(msg)),
+        }
+    } else {
+        // stack 不足 (罕见): clone + nil 填充
+        let args: Vec<TValue> = (1..nargs)
+            .map(|i| {
+                let idx = a + 1 + i;
+                if idx < state.stack.len() {
+                    state.stack[idx].clone()
+                } else {
+                    TValue::Nil(NilKind::Strict)
+                }
+            })
+            .collect();
+        match str_format(&fmt, &args) {
+            Ok(result) => {
+                push_results(
+                    state,
+                    a,
+                    nresults,
+                    vec![TValue::Str(state.intern_str_owned(result))],
+                );
+                Ok(())
+            }
+            Err(msg) => Err(VmError::RuntimeError(msg)),
+        }
     }
 }
 

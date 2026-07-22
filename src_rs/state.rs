@@ -2582,6 +2582,12 @@ impl LuaState {
         str_to_ls(&self.string_table, s)
     }
 
+    /// 从 owned String 创建 LuaString，长字符串路径直接 consume 避免 clone。
+    /// perf: str_format 等产生临时长 String 的场景，消除 with_nul 的 to_string() clone。
+    pub fn intern_str_owned(&self, s: String) -> LuaString {
+        crate::strings::new_lstr_from_string(&self.string_table, s)
+    }
+
     /// 获取缓存的 "__mode" 字符串键（用于 GC mark_tvalue/process_ephemerons）
     /// 第一次调用时 intern 并缓存，后续直接返回缓存值。
     /// 避免每次 mark_tvalue 都做 hash+查找（perf: 节省 ~2%）
