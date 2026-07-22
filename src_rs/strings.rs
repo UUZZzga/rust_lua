@@ -205,9 +205,10 @@ impl PartialEq for LuaString {
             (LuaString::Short(a), LuaString::Short(b)) => {
                 // ptr_eq 优先（内部化保证同一内容只有一个实例 → 极快）
                 // hash 预比较（不同 hash → 内容必然不同 → 立即 false）
-                // 最后才 content_eq（仅 hash 冲突时触发）
+                // ShortString 末尾必然有 NUL, 直接比较 contents (含 NUL) 即可,
+                // 无需 content_eq 的 last() 检查 + slice 切片
                 ArcRc::ptr_eq(a, b)
-                    || (a.hash == b.hash && content_eq(&a.contents, &b.contents))
+                    || (a.hash == b.hash && a.contents == b.contents)
             }
             (LuaString::Long(a), LuaString::Long(b)) => a == b,
             _ => self.as_str() == other.as_str(),
@@ -594,14 +595,14 @@ impl LuaString {
     }
 
     /// 内部实现：返回 (str, has_nul)
+    /// ShortString 的 contents 末尾必然有 NUL 终止符 (所有创建路径都保证)，
+    /// 因此 Short 分支直接 slice 去掉末尾 NUL，无需 last() 检查。
+    /// LongString 的 contents 可能没有 NUL (从 String 直接构造)，需保留检查。
     fn as_str_inner(&self) -> (&str, bool) {
         match self {
             LuaString::Short(s) => {
-                if s.contents.as_bytes().last() == Some(&0) {
-                    (&s.contents[..s.contents.len() - 1], true)
-                } else {
-                    (&s.contents, false)
-                }
+                // ShortString 末尾必然有 NUL (intern/new_short_bytes/string_from_int 等都保证)
+                (&s.contents[..s.contents.len() - 1], true)
             }
             LuaString::Long(s) => {
                 if s.contents.as_bytes().last() == Some(&0) {
@@ -623,8 +624,18 @@ impl LuaString {
     }
 
     /// 返回字符串长度（O(1)，不含末尾 NUL）。
+    /// ShortString 末尾必然有 NUL, 直接 contents.len()-1 省去 as_str 的 slice 操作。
     pub fn len(&self) -> usize {
-        self.as_str().len()
+        match self {
+            LuaString::Short(s) => s.contents.len() - 1,
+            LuaString::Long(s) => {
+                if s.contents.as_bytes().last() == Some(&0) {
+                    s.contents.len() - 1
+                } else {
+                    s.contents.len()
+                }
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {

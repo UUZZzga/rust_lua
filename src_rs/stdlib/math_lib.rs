@@ -1100,7 +1100,7 @@ mod tests {
         TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
-                contents: s.to_string(),
+                contents: crate::strings::LuaString::with_nul(s),
             },
         )))
     }

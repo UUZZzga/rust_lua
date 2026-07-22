@@ -735,7 +735,7 @@ mod tests {
         let t = Table::new();
         let key = LuaString::Short(crate::strings::ArcRc::new(ShortString {
             hash: 0,
-            contents: "name".into(),
+            contents: crate::strings::LuaString::with_nul("name"),
         }));
         t.set(TValue::Str(key.clone()), TValue::Integer(42));
         let lookup = TValue::Str(key);
@@ -831,7 +831,7 @@ mod tests {
         let t = Table::new();
         let key = LuaString::Short(crate::strings::ArcRc::new(ShortString {
             hash: 0,
-            contents: "key".into(),
+            contents: crate::strings::LuaString::with_nul("key"),
         }));
         t.set(TValue::Str(key.clone()), TValue::Integer(7));
         assert_eq!(t.hash_size(), 1);
@@ -1095,7 +1095,7 @@ mod tests {
         let t = Table::new();
         let key = LuaString::Short(crate::strings::ArcRc::new(ShortString {
             hash: 0,
-            contents: "mykey".into(),
+            contents: crate::strings::LuaString::with_nul("mykey"),
         }));
         t.set(TValue::Str(key.clone()), TValue::Integer(77));
         t.set_int(1, TValue::Integer(10));

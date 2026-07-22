@@ -4558,7 +4558,7 @@ mod tests {
         let args = vec![TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
-                contents: "world".to_string(),
+                contents: crate::strings::LuaString::with_nul("world"),
             },
         )))];
         let result = str_format("hello %s", &args).unwrap();
@@ -4606,7 +4606,7 @@ mod tests {
             TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
                 crate::strings::ShortString {
                     hash: 0,
-                    contents: "two".to_string(),
+                    contents: crate::strings::LuaString::with_nul("two"),
                 },
             ))),
             TValue::Float(3.0),
@@ -4635,7 +4635,7 @@ mod tests {
         let args = vec![TValue::Str(crate::strings::LuaString::Short(
             crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
-                contents: "hello".to_string(),
+                contents: crate::strings::LuaString::with_nul("hello"),
             }),
         ))];
         let result = str_format("%q", &args).unwrap();
@@ -4779,7 +4779,7 @@ mod tests {
         let v = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
-                contents: "42".to_string(),
+                contents: crate::strings::LuaString::with_nul("42"),
             },
         )));
         let result = to_num(&v);
@@ -4791,7 +4791,7 @@ mod tests {
         let v = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
-                contents: "3.14".to_string(),
+                contents: crate::strings::LuaString::with_nul("3.14"),
             },
         )));
         let result = to_num(&v);
@@ -4803,7 +4803,7 @@ mod tests {
         let v = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
-                contents: "abc".to_string(),
+                contents: crate::strings::LuaString::with_nul("abc"),
             },
         )));
         let result = to_num(&v);
@@ -4824,7 +4824,7 @@ mod tests {
             TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
                 crate::strings::ShortString {
                     hash: 0,
-                    contents: s.to_string(),
+                    contents: crate::strings::LuaString::with_nul(s),
                 },
             )))
         };
@@ -5228,7 +5228,7 @@ mod tests {
             &[TValue::Str(crate::strings::LuaString::Short(
                 crate::strings::ArcRc::new(crate::strings::ShortString {
                     hash: 0,
-                    contents: "abc".to_string(),
+                    contents: crate::strings::LuaString::with_nul("abc"),
                 }),
             ))],
             &[b'a', b'b', b'c'],
@@ -5240,7 +5240,7 @@ mod tests {
             &[TValue::Str(crate::strings::LuaString::Short(
                 crate::strings::ArcRc::new(crate::strings::ShortString {
                     hash: 0,
-                    contents: "ab".to_string(),
+                    contents: crate::strings::LuaString::with_nul("ab"),
                 }),
             ))],
             &[b'a', b'b', 0, 0, 0],
@@ -5253,7 +5253,7 @@ mod tests {
         let s = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
-                contents: "hello".to_string(),
+                contents: crate::strings::LuaString::with_nul("hello"),
             },
         )));
         assert_pack_eq("<z", &[s], &[b'h', b'e', b'l', b'l', b'o', 0]);
@@ -5265,7 +5265,7 @@ mod tests {
         let s = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
-                contents: "hi".to_string(),
+                contents: crate::strings::LuaString::with_nul("hi"),
             },
         )));
         let result = str_pack("<s", &[s]).unwrap();
@@ -5281,7 +5281,7 @@ mod tests {
         let s = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
-                contents: "hi".to_string(),
+                contents: crate::strings::LuaString::with_nul("hi"),
             },
         )));
         assert_pack_eq("<s1", &[s], &[2, b'h', b'i']);
@@ -5292,7 +5292,7 @@ mod tests {
         let empty = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
-                contents: "".to_string(),
+                contents: crate::strings::LuaString::with_nul(""),
             },
         )));
 
@@ -5314,7 +5314,7 @@ mod tests {
         let sval = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
-                contents: s,
+                contents: crate::strings::LuaString::with_nul(&s),
             },
         )));
         assert_pack_eq("<c6", &[sval.clone()], &bytes);
@@ -5324,7 +5324,7 @@ mod tests {
         let sval2 = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
-                contents: s2,
+                contents: crate::strings::LuaString::with_nul(&s2),
             },
         )));
         assert_pack_eq("<z", &[sval2], &[1, 2, 3, 0]);
@@ -5576,7 +5576,7 @@ mod tests {
         let s = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
-                contents: "hello".to_string(),
+                contents: crate::strings::LuaString::with_nul("hello"),
             },
         )));
         // c3 容纳 3 字节, 但字符串有 5 字节
@@ -5600,7 +5600,7 @@ mod tests {
         let s = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
-                contents: "abc".to_string(),
+                contents: crate::strings::LuaString::with_nul("abc"),
             },
         )));
         let result = str_pack("<i1c3i2", &[TValue::Integer(1), s, TValue::Integer(2)]).unwrap();
@@ -5612,7 +5612,7 @@ mod tests {
         let s = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
             crate::strings::ShortString {
                 hash: 0,
-                contents: "XY".to_string(),
+                contents: crate::strings::LuaString::with_nul("XY"),
             },
         )));
         let fmt = "<i1c2i2d";

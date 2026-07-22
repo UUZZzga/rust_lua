@@ -945,8 +945,10 @@ pub fn concat_stack(stack: &mut Vec<TValue>, total: usize) -> Result<(), TagMeth
 
 fn string_from_int(i: i64) -> LuaString {
     use crate::strings::ShortString;
-    let s = i.to_string();
+    let mut s = i.to_string();
     let h = crate::strings::rust_hash(&s);
+    s.reserve(1); // 避免 push('\0') 扩容
+    s.push('\0'); // NUL 终止符, 与 intern/new_short_bytes 保持一致
     LuaString::Short(crate::strings::ArcRc::new(ShortString {
         hash: h,
         contents: s,
@@ -955,8 +957,10 @@ fn string_from_int(i: i64) -> LuaString {
 
 fn string_from_float(f: f64) -> LuaString {
     use crate::strings::ShortString;
-    let s = format_float(f);
+    let mut s = format_float(f);
     let h = crate::strings::rust_hash(&s);
+    s.reserve(1); // 避免 push('\0') 扩容
+    s.push('\0'); // NUL 终止符, 与 intern/new_short_bytes 保持一致
     LuaString::Short(crate::strings::ArcRc::new(ShortString {
         hash: h,
         contents: s,

@@ -1426,7 +1426,7 @@ impl VarargTable {
         t.set(
             TValue::Str(LuaString::Short(crate::strings::ArcRc::new(ShortString {
                 hash: rust_hash("n"),
-                contents: "n".to_string(),
+                contents: crate::strings::LuaString::with_nul("n"),
             }))),
             TValue::Integer(count as i64),
         );
@@ -1499,14 +1499,14 @@ pub fn make_tm_tvalue(tm: TagMethod) -> TValue {
     let name = tm.name();
     TValue::Str(LuaString::Short(crate::strings::ArcRc::new(ShortString {
         hash: rust_hash(name),
-        contents: name.to_string(),
+        contents: crate::strings::LuaString::with_nul(name),
     })))
 }
 
 fn make_ls(s: &str) -> TValue {
     TValue::Str(LuaString::Short(crate::strings::ArcRc::new(ShortString {
         hash: rust_hash(s),
-        contents: s.to_string(),
+        contents: crate::strings::LuaString::with_nul(s),
     })))
 }
 

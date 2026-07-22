@@ -3546,7 +3546,7 @@ mod tests {
             upvalues: Rc::new(vec![UpvalDesc {
                 name: Some(LuaString::Short(crate::strings::ArcRc::new(crate::strings::ShortString {
                     hash: 0,
-                    contents: "x".to_string(),
+                    contents: crate::strings::LuaString::with_nul("x"),
                 }))),
                 in_stack: false,
                 idx: 0,
@@ -3737,7 +3737,7 @@ mod tests {
         let make_str = |s: &str| -> LuaString {
             LuaString::Short(crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
-                contents: s.to_string(),
+                contents: crate::strings::LuaString::with_nul(s),
             }))
         };
 
