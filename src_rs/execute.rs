@@ -2738,7 +2738,6 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[inline]
     fn op_settable(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);

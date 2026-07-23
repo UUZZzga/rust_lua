@@ -866,10 +866,10 @@ impl LuaState {
             let in_op_call = self.call_info.last().map(|e| e.is_c).unwrap_or(false);
             if in_op_call {
                 let first_result_pos = self.stack.len();
-                for v in &results {
-                    self.stack.push(v.clone());
-                }
-                self.pending_return_adjust = Some((a, nresults, results.len(), first_result_pos));
+                // perf: 用 into_iter drain 避免 clone (每个 results[i].clone() 对 Rc 变体需 incq)
+                let n = results.len();
+                self.stack.extend(results);
+                self.pending_return_adjust = Some((a, nresults, n, first_result_pos));
                 return;
             }
         }
@@ -880,10 +880,14 @@ impl LuaState {
         } else {
             nresults as usize
         };
-        for i in 0..n {
-            if i < results.len() {
-                self.stack.push(results[i].clone());
-            } else {
+        // perf: 用 into_iter drain 避免 clone。n <= results.len() 时直接 drain 前 n 个;
+        // n > results.len() 时 drain 全部后补 Nil。
+        let rlen = results.len();
+        if n <= rlen {
+            self.stack.extend(results.into_iter().take(n));
+        } else {
+            self.stack.extend(results);
+            for _ in rlen..n {
                 self.stack.push(TValue::Nil(NilKind::Strict));
             }
         }
