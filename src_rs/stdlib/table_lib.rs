@@ -265,6 +265,28 @@ fn call_unpack(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     // 直接 push 到 state.stack，不创建中间 Vec
     // 对应 C 版 tunpack: while (i < e) { lua_geti(L, 1, i); i++; } lua_geti(L, 1, e);
     let first_result_pos = state.stack.len();
+    // perf: 快速路径 — table 无元表时直接用 Table::get, 跳过 table_get 的包装层
+    // (current.take/unwrap_or/match Table/MAXTAGLOOP 循环), call_unpack 占 2.37%。
+    // 大量 unpack 调用操作普通数组表 (无 __index), 快速路径省去每元素 ~10 条指令。
+    if let TValue::Table(t) = &list_val {
+        if !t.has_metatable() {
+            let mut idx = i;
+            while idx < j {
+                // perf: 用 get_int 直接传 i64, 避免每次循环创建 TValue::Integer + 模式匹配
+                let val = t
+                    .get_int(idx)
+                    .unwrap_or(TValue::Nil(NilKind::Strict));
+                state.stack.push(val);
+                idx += 1;
+            }
+            let val = t
+                .get_int(j)
+                .unwrap_or(TValue::Nil(NilKind::Strict));
+            state.stack.push(val);
+            state.adjust_results_on_stack(a, nresults, n, first_result_pos);
+            return Ok(());
+        }
+    }
     let mut idx = i;
     while idx < j {
         let val = geti_meta(state, &list_val, idx)?;

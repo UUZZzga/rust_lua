@@ -1686,13 +1686,6 @@ impl VmExecutor {
         state.base + opcodes::getarg_c(inst) as usize
     }
 
-    #[inline]
-    fn ensure_stack(state: &mut LuaState, idx: usize) {
-        if idx >= state.stack.len() {
-            Self::write_stack_grow(state, idx);
-        }
-    }
-
     #[cold]
     #[inline(never)]
     fn write_stack_grow(state: &mut LuaState, idx: usize) {
@@ -1721,7 +1714,7 @@ impl VmExecutor {
 
     #[cold]
     #[inline(never)]
-    fn read_stack_panic(state: &LuaState, idx: usize) -> &TValue {
+    fn read_stack_panic(state: &LuaState, idx: usize) -> ! {
         // 打印完整的调试信息
         eprintln!("\n=== STACK UNDERFLOW PANIC ===");
         eprintln!("尝试访问栈索引: {}, 栈大小: {}", idx, state.stack.len());
@@ -2589,6 +2582,34 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
+        // perf 快速路径: table 无元表时直接用 get_and_metatable, 跳过 table_get 包装层
+        // + table_val/key 两次 clone。直接用栈索引访问避免 read_stack 借用冲突。
+        let fast_result: Option<Option<TValue>> = {
+            let stack = &state.stack;
+            if b < stack.len() && c < stack.len() {
+                let table_val = &stack[b];
+                if let TValue::Table(t) = table_val {
+                    let key = &stack[c];
+                    let (val, has_mt) = t.get_and_metatable(key);
+                    if !has_mt {
+                        Some(val)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(get_result) = fast_result {
+            let val = get_result.unwrap_or(TValue::Nil(NilKind::Strict));
+            Self::write_stack(state, a, val);
+            state.pc += 1;
+            return Ok(());
+        }
+        // 慢速路径: 有元表或非 Table 类型, 需要走 table_get 查 __index
         let table_val = Self::read_stack(state, b).clone();
         let key = Self::read_stack(state, c).clone();
         let result = Self::table_get(
@@ -2607,8 +2628,31 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = opcodes::getarg_c(inst) as i64;
-        let table_val = Self::read_stack(state, b).clone();
         let key = TValue::Integer(c);
+        // perf 快速路径: table 无元表时直接用 get_and_metatable, 跳过 table_get 包装层
+        // (current.take/unwrap_or/match Table/MAXTAGLOOP 循环 + table_val clone)。
+        // 大量数组访问 (t[i]) 操作普通数组表 (无 __index), 命中路径省去 TValue clone+drop。
+        let fast_result: Option<Option<TValue>> = {
+            let table_val = Self::read_stack(state, b);
+            if let TValue::Table(t) = table_val {
+                let (val, has_mt) = t.get_and_metatable(&key);
+                if !has_mt {
+                    Some(val)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(get_result) = fast_result {
+            let val = get_result.unwrap_or(TValue::Nil(NilKind::Strict));
+            Self::write_stack(state, a, val);
+            state.pc += 1;
+            return Ok(());
+        }
+        // 慢速路径: 有元表或非 Table 类型, 需要走 table_get 查 __index
+        let table_val = Self::read_stack(state, b).clone();
         let result = Self::table_get(
             state,
             &table_val,
@@ -2625,12 +2669,34 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        let table_val = Self::read_stack(state, b).clone();
         let key = state
             .constants
             .get(c_key)
             .cloned()
             .unwrap_or(TValue::Nil(NilKind::Strict));
+        // perf 快速路径: table 无元表时直接用 get_and_metatable, 跳过 table_get 包装层
+        // + table_val clone。大量表字段访问 (t.field) 操作普通表 (无 __index)。
+        let fast_result: Option<Option<TValue>> = {
+            let table_val = Self::read_stack(state, b);
+            if let TValue::Table(t) = table_val {
+                let (val, has_mt) = t.get_and_metatable(&key);
+                if !has_mt {
+                    Some(val)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(get_result) = fast_result {
+            let val = get_result.unwrap_or(TValue::Nil(NilKind::Strict));
+            Self::write_stack(state, a, val);
+            state.pc += 1;
+            return Ok(());
+        }
+        // 慢速路径: 有元表或非 Table 类型
+        let table_val = Self::read_stack(state, b).clone();
         let result = Self::table_get(
             state,
             &table_val,
@@ -2764,6 +2830,36 @@ impl VmExecutor {
             .get(opcodes::getarg_c(inst) as usize)
             .cloned()
             .unwrap_or(TValue::Nil(NilKind::Strict));
+        // perf 快速路径: table 无元表时直接用 get_and_metatable, 跳过 table_get 包装层。
+        // obj 只需 clone 一次 (写入 a+1), 慢速路径需两次 (obj + obj.clone for table_get)。
+        let fast_result: Option<Option<TValue>> = {
+            let stack = &state.stack;
+            if b < stack.len() {
+                let obj = &stack[b];
+                if let TValue::Table(t) = obj {
+                    let (val, has_mt) = t.get_and_metatable(&key);
+                    if !has_mt {
+                        Some(val)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(get_result) = fast_result {
+            let method = get_result.unwrap_or(TValue::Nil(NilKind::Strict));
+            // 先写 R[A+1] (obj), 再写 R[A] (method) — 与 C Lua 顺序一致
+            let obj = Self::read_stack(state, b).clone();
+            Self::write_stack(state, a + 1, obj);
+            Self::write_stack(state, a, method);
+            state.pc += 1;
+            return Ok(());
+        }
+        // 慢速路径: 有元表或非 Table 类型
         let obj = Self::read_stack(state, b).clone();
         Self::write_stack(state, a + 1, obj.clone());
         let result = Self::table_get(
@@ -5037,11 +5133,13 @@ impl VmExecutor {
         let f = Self::read_stack(state, ra).clone();
         let s = Self::read_stack(state, ra + 1).clone();
         let ctrl = Self::read_stack(state, ra + 3).clone();
-        Self::write_stack(state, ra + 3, f);
+        // perf: clone f 到 ra+3 (而非 move), 使 f 保留在局部变量中供后续 func_val 使用,
+        // 省去一次 read_stack(ra+3).clone() 的栈访问 + 边界检查开销。
+        Self::write_stack(state, ra + 3, f.clone());
         Self::write_stack(state, ra + 4, s);
         Self::write_stack(state, ra + 5, ctrl);
 
-        let mut func_val = Self::read_stack(state, ra + 3).clone();
+        let mut func_val = f;
         // 可调用表 (带 __call 元方法) 支持 — 对应 op_call 中的 luaT_tryfuncTM
         // string.gmatch 返回的迭代器是带 __call 的表,这里提取 __call 作为
         // 实际函数,原表作为 self 参数放到 ra+4,ra+5 保持 ctrl

@@ -679,7 +679,7 @@ fn match_pattern_inner(
                         }
                     }
                     b'f' => {
-                        let mut p2 = p + 2;
+                        let p2 = p + 2;
                         if p2 >= ms.p_end || ms.pat_byte(p2) != b'[' {
                             return Err("missing '[' after '%f' in pattern".to_string());
                         }
@@ -715,6 +715,23 @@ fn match_pattern_inner(
             }
             // perf: 其他 % (如 %a, %d, %s) fall through 到默认分支, 与 _ 合并以改善 icache 密度
             _ => {
+                // perf 快速路径: 普通字符 (非 . % [ ) 且无后缀量词时,
+                // 直接比较两个字节, 跳过 class_end + single_match 调用。
+                // all.lua 中大量简单模式 (如字面量字符串匹配) 走此路径,
+                // match_pattern 是最大热点 (12.82%), 每次省 2 次函数调用 + 分支判断。
+                let c = ms.pat_byte(p);
+                if c != b'.' && c != b'%' && c != b'[' {
+                    let next = if p + 1 < ms.p_end { ms.pat_byte(p + 1) } else { 0 };
+                    if next != b'*' && next != b'+' && next != b'?' && next != b'-' {
+                        if s < ms.src_end && ms.src_byte(s) == c {
+                            s += 1;
+                            p += 1;
+                            continue;
+                        }
+                        return Ok(None);
+                    }
+                }
+                // 慢速路径: 带量词或特殊字符类
                 let ep = class_end(ms, p)?;
                 let suffix = if ep < ms.p_end { ms.pat_byte(ep) } else { 0 };
                 if !single_match(ms, s, p, ep) {
