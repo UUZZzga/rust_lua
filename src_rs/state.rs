@@ -19,6 +19,24 @@ use std::rc::Rc;
 /// 因为 key 是 usize（对象 ID/指针），用 SipHash 是浪费（perf 显示占 ~4%）。
 type GcHashSet = HashSet<usize, FxBuildHasher>;
 
+/// GC worklist 的原始值项 — TValue 的字节拷贝，不做引用计数。
+/// GC 期间所有对象有效（sweep 在 mark 完成后），所以 push/pop 无需 incq/decq。
+/// 消除 worklist 的 TValue clone (3.11%) + drop_glue (4.26%) 开销。
+/// 用 MaybeUninit<TValue> 保证大小和对齐与 TValue 完全一致。
+type RawTValue = std::mem::MaybeUninit<TValue>;
+
+/// 从 &TValue 拷贝原始字节到 RawTValue（不 incq Rc）
+#[inline(always)]
+unsafe fn raw_from_tvalue(val: &TValue) -> RawTValue {
+    std::mem::MaybeUninit::new(std::ptr::read(val as *const TValue))
+}
+
+/// 将 RawTValue 重建为 &TValue 引用
+#[inline(always)]
+unsafe fn raw_as_tvalue(raw: &RawTValue) -> &TValue {
+    raw.assume_init_ref()
+}
+
 const EOFMARK: &str = "<eof>";
 
 pub const LUA_YIELD: i32 = 1;
@@ -2681,7 +2699,7 @@ impl LuaState {
         &self,
         reachable: &mut GcHashSet,
         visited: &mut GcHashSet,
-        worklist: &mut Vec<TValue>,
+        worklist: &mut Vec<RawTValue>,
         extra_size: &mut usize,
     ) {
         let mode_key = TValue::Str(self.mode_key_cached());
@@ -2730,18 +2748,19 @@ impl LuaState {
                             if let Some(id) = k_id {
                                 reachable.insert(id.0 as usize);
                             }
-                            worklist.push(k.clone());
+                            unsafe { worklist.push(raw_from_tvalue(k)) };
                             changed = true;
                         }
                     }
                     if k_reachable && !v_reachable {
-                        worklist.push(v.clone());
+                        unsafe { worklist.push(raw_from_tvalue(v)) };
                         changed = true;
                     }
                 }
             }
-            while let Some(val) = worklist.pop() {
-                self.mark_tvalue(&val, reachable, visited, worklist, extra_size);
+            while let Some(raw) = worklist.pop() {
+                let val = unsafe { raw_as_tvalue(&raw) };
+                self.mark_tvalue(val, reachable, visited, worklist, extra_size);
             }
         }
     }
@@ -2911,7 +2930,9 @@ impl LuaState {
             FxBuildHasher::default(),
         );
         // worklist 预分配为估计可达对象的 2 倍（根 + 一层引用）
-        let mut worklist: Vec<TValue> = Vec::with_capacity(est_reachable * 2);
+        // perf: 用 RawTValue（16字节值拷贝）替代 TValue clone，消除 push/pop 的 Rc incq/decq。
+        // GC 期间所有对象有效（sweep 在 mark 完成后），无需调整引用计数。
+        let mut worklist: Vec<RawTValue> = Vec::with_capacity(est_reachable * 2);
 
         // 收集根：栈 — 遍历到 self.top（对应 C Lua 的 traversethread: o < th->top）
         // self.top 在 OP_CALL 中被设为 ra + b（函数+参数末尾），
@@ -2919,13 +2940,22 @@ impl LuaState {
         let stack_top = self.top.min(self.stack.len());
         for val in &self.stack[..stack_top] {
             if Self::needs_gc_mark(val) {
-                worklist.push(val.clone());
+                unsafe { worklist.push(raw_from_tvalue(val)) };
             }
         }
 
         // 收集根：全局表、registry
-        worklist.push(TValue::Table(self.globals.clone()));
-        worklist.push(TValue::Table(self.registry.clone()));
+        // 这两处仍需 clone（创建临时 TValue），但只有 2 个调用，非热点
+        {
+            let tv = TValue::Table(self.globals.clone());
+            unsafe { worklist.push(raw_from_tvalue(&tv)) };
+            std::mem::forget(tv);  // forget 避免 decq（RawTValue 已拷贝字节，Rc 引用通过 self.globals 保持）
+        }
+        {
+            let tv = TValue::Table(self.registry.clone());
+            unsafe { worklist.push(raw_from_tvalue(&tv)) };
+            std::mem::forget(tv);
+        }
 
         // 收集根：closure_upvals
         for uv_ref in &self.closure_upvals {
@@ -2933,14 +2963,14 @@ impl LuaState {
             match &*uv {
                 UpVal::Closed { value } => {
                     if Self::needs_gc_mark(value) {
-                        worklist.push((**value).clone());
+                        unsafe { worklist.push(raw_from_tvalue(value)) };
                     }
                 }
                 UpVal::Open { stack_index, .. } => {
                     if *stack_index < self.stack.len() {
                         let val = &self.stack[*stack_index];
                         if Self::needs_gc_mark(val) {
-                            worklist.push(val.clone());
+                            unsafe { worklist.push(raw_from_tvalue(val)) };
                         }
                     }
                 }
@@ -2951,14 +2981,14 @@ impl LuaState {
         for frame in &self.call_stack {
             for val in &frame.constants[..] {
                 if Self::needs_gc_mark(val) {
-                    worklist.push(val.clone());
+                    unsafe { worklist.push(raw_from_tvalue(val)) };
                 }
             }
             for uv_ref in &frame.closure_upvals {
                 let uv = uv_ref.borrow();
                 if let UpVal::Closed { value } = &*uv {
                     if Self::needs_gc_mark(value) {
-                        worklist.push((**value).clone());
+                        unsafe { worklist.push(raw_from_tvalue(value)) };
                     }
                 }
             }
@@ -2967,14 +2997,16 @@ impl LuaState {
         // 收集根：call_info 中的 closures
         for ci in &self.call_info {
             if let Some(ref closure) = ci.closure {
-                worklist.push(TValue::LClosure(closure.clone()));
+                let tv = TValue::LClosure(closure.clone());
+                unsafe { worklist.push(raw_from_tvalue(&tv)) };
+                std::mem::forget(tv);
             }
         }
 
         // 收集根：hook_func
         if let Some(ref hook) = self.hook_func {
             if Self::needs_gc_mark(hook) {
-                worklist.push(hook.clone());
+                unsafe { worklist.push(raw_from_tvalue(hook)) };
             }
         }
 
@@ -2984,7 +3016,7 @@ impl LuaState {
         for stack in &self.caller_gc_stacks {
             for val in stack {
                 if Self::needs_gc_mark(val) {
-                    worklist.push(val.clone());
+                    unsafe { worklist.push(raw_from_tvalue(val)) };
                 }
             }
         }
@@ -3000,8 +3032,10 @@ impl LuaState {
         let mut extra_size: usize = 0;
 
         // 处理工作列表
-        while let Some(val) = worklist.pop() {
-            self.mark_tvalue(&val, &mut reachable, &mut visited, &mut worklist, &mut extra_size);
+        // perf: pop RawTValue（无 drop），unsafe 重建 &TValue 引用
+        while let Some(raw) = worklist.pop() {
+            let val = unsafe { raw_as_tvalue(&raw) };
+            self.mark_tvalue(val, &mut reachable, &mut visited, &mut worklist, &mut extra_size);
         }
 
         // ephemeron 表传递性处理：对于弱键表，如果值可达，则保留键。
@@ -3092,7 +3126,7 @@ impl LuaState {
         &mut self,
         reachable: &mut GcHashSet,
         visited: &mut GcHashSet,
-        worklist: &mut Vec<TValue>,
+        worklist: &mut Vec<RawTValue>,
         extra_size: &mut usize,
     ) -> Vec<TValue> {
         let gc_key = TValue::Str(self.gc_key_cached());
@@ -3117,8 +3151,11 @@ impl LuaState {
                 }
             };
             if has_gc {
-                worklist.push(TValue::Table(t.clone()));
-                to_finalize.push(TValue::Table(t));
+                // to_finalize 持有 owned TValue（需 incq），worklist 用 RawTValue（无 incq）
+                to_finalize.push(TValue::Table(t.clone()));
+                let tv = TValue::Table(t);
+                unsafe { worklist.push(raw_from_tvalue(&tv)) };
+                std::mem::forget(tv);
             }
         }
         self.finobj_list = keep;
@@ -3141,14 +3178,17 @@ impl LuaState {
                 }
             };
             if has_gc {
-                worklist.push(TValue::UserData(Rc::clone(&u)));
-                to_finalize.push(TValue::UserData(u));
+                to_finalize.push(TValue::UserData(Rc::clone(&u)));
+                let tv = TValue::UserData(u);
+                unsafe { worklist.push(raw_from_tvalue(&tv)) };
+                std::mem::forget(tv);
             }
         }
         self.ud_finobj_list = ud_keep;
 
-        while let Some(val) = worklist.pop() {
-            self.mark_tvalue(&val, reachable, visited, worklist, extra_size);
+        while let Some(raw) = worklist.pop() {
+            let val = unsafe { raw_as_tvalue(&raw) };
+            self.mark_tvalue(val, reachable, visited, worklist, extra_size);
         }
 
         to_finalize
@@ -3302,26 +3342,26 @@ impl LuaState {
     }
 
     /// 收集协程的根对象
-    fn collect_thread_roots(&self, thread: &LuaThread, worklist: &mut Vec<TValue>) {
+    fn collect_thread_roots(&self, thread: &LuaThread, worklist: &mut Vec<RawTValue>) {
         for val in &thread.stack {
             if Self::needs_gc_mark(val) {
-                worklist.push(val.clone());
+                unsafe { worklist.push(raw_from_tvalue(val)) };
             }
         }
         if let Some(ref func) = thread.function {
             if Self::needs_gc_mark(func) {
-                worklist.push((**func).clone());
+                unsafe { worklist.push(raw_from_tvalue(func)) };
             }
         }
         let ctx = thread.context.borrow();
         for val in &ctx.saved_stack {
             if Self::needs_gc_mark(val) {
-                worklist.push(val.clone());
+                unsafe { worklist.push(raw_from_tvalue(val)) };
             }
         }
         for val in &ctx.saved_constants[..] {
             if Self::needs_gc_mark(val) {
-                worklist.push(val.clone());
+                unsafe { worklist.push(raw_from_tvalue(val)) };
             }
         }
         for uv_ref in &ctx.saved_closure_upvals {
@@ -3329,14 +3369,14 @@ impl LuaState {
             match &*uv {
                 UpVal::Closed { value } => {
                     if Self::needs_gc_mark(value) {
-                        worklist.push((**value).clone());
+                        unsafe { worklist.push(raw_from_tvalue(value)) };
                     }
                 }
                 UpVal::Open { stack_index, .. } => {
                     if *stack_index < ctx.saved_stack.len() {
                         let val = &ctx.saved_stack[*stack_index];
                         if Self::needs_gc_mark(val) {
-                            worklist.push(val.clone());
+                            unsafe { worklist.push(raw_from_tvalue(val)) };
                         }
                     }
                 }
@@ -3345,31 +3385,33 @@ impl LuaState {
         for frame in &ctx.saved_call_stack {
             for val in &frame.constants[..] {
                 if Self::needs_gc_mark(val) {
-                    worklist.push(val.clone());
+                    unsafe { worklist.push(raw_from_tvalue(val)) };
                 }
             }
             for uv_ref in &frame.closure_upvals {
                 let uv = uv_ref.borrow();
                 if let UpVal::Closed { value } = &*uv {
                     if Self::needs_gc_mark(value) {
-                        worklist.push((**value).clone());
+                        unsafe { worklist.push(raw_from_tvalue(value)) };
                     }
                 }
             }
         }
         if let Some(ref hook) = ctx.saved_hook_func {
             if Self::needs_gc_mark(hook) {
-                worklist.push(hook.clone());
+                unsafe { worklist.push(raw_from_tvalue(hook)) };
             }
         }
         if let Some(ref err) = ctx.error_msg {
             if Self::needs_gc_mark(err) {
-                worklist.push(err.clone());
+                unsafe { worklist.push(raw_from_tvalue(err)) };
             }
         }
         for ci in &ctx.saved_call_info {
             if let Some(ref closure) = ci.closure {
-                worklist.push(TValue::LClosure(closure.clone()));
+                let tv = TValue::LClosure(closure.clone());
+                unsafe { worklist.push(raw_from_tvalue(&tv)) };
+                std::mem::forget(tv);
             }
         }
     }
@@ -3397,7 +3439,7 @@ impl LuaState {
         val: &TValue,
         reachable: &mut GcHashSet,
         visited: &mut GcHashSet,
-        worklist: &mut Vec<TValue>,
+        worklist: &mut Vec<RawTValue>,
         extra_size: &mut usize,
     ) {
         match val {
@@ -3423,15 +3465,15 @@ impl LuaState {
                     };
                     for v in data.array.iter() {
                         if !weak_v && Self::needs_gc_mark(v) {
-                            worklist.push(v.clone());
+                            unsafe { worklist.push(raw_from_tvalue(v)) };
                         }
                     }
                     for (k, v) in data.hash_buckets.iter() {
                         if !weak_k && Self::needs_gc_mark(k) {
-                            worklist.push(k.clone());
+                            unsafe { worklist.push(raw_from_tvalue(k)) };
                         }
                         if !weak_k && !weak_v && Self::needs_gc_mark(v) {
-                            worklist.push(v.clone());
+                            unsafe { worklist.push(raw_from_tvalue(v)) };
                         }
                     }
                     if let Some(ref mt) = data.metatable {
@@ -3439,7 +3481,9 @@ impl LuaState {
                         // （多表共享同一 metatable 时显著减少 worklist 操作）
                         let mt_ptr = mt.gc_header.ptr_id as usize;
                         if !visited.contains(&mt_ptr) {
-                            worklist.push(TValue::Table((**mt).clone()));
+                            let tv = TValue::Table((**mt).clone());
+                            unsafe { worklist.push(raw_from_tvalue(&tv)) };
+                            std::mem::forget(tv);
                         }
                     }
                 }
@@ -3459,14 +3503,14 @@ impl LuaState {
                     match &*uv {
                         UpVal::Closed { value } => {
                             if Self::needs_gc_mark(value) {
-                                worklist.push((**value).clone());
+                                unsafe { worklist.push(raw_from_tvalue(value)) };
                             }
                         }
                         UpVal::Open { stack_index, .. } => {
                             if *stack_index < self.stack.len() {
                                 let val = &self.stack[*stack_index];
                                 if Self::needs_gc_mark(val) {
-                                    worklist.push(val.clone());
+                                    unsafe { worklist.push(raw_from_tvalue(val)) };
                                 }
                             }
                         }
@@ -3486,7 +3530,7 @@ impl LuaState {
                     *extra_size += cc.gc_mem_size();
                     for uv in &cc.upvalue {
                         if Self::needs_gc_mark(uv) {
-                            worklist.push(uv.clone());
+                            unsafe { worklist.push(raw_from_tvalue(uv)) };
                         }
                     }
                 }
@@ -3505,7 +3549,7 @@ impl LuaState {
                     let upvals = rc.upvalues.borrow();
                     for uv in upvals.iter() {
                         if Self::needs_gc_mark(uv) {
-                            worklist.push(uv.clone());
+                            unsafe { worklist.push(raw_from_tvalue(uv)) };
                         }
                     }
                 }
@@ -3519,12 +3563,14 @@ impl LuaState {
                     if let Some(ref mt) = u.metatable {
                         let mt_ptr = mt.gc_header.ptr_id as usize;
                         if !visited.contains(&mt_ptr) {
-                            worklist.push(TValue::Table((**mt).clone()));
+                            let tv = TValue::Table((**mt).clone());
+                            unsafe { worklist.push(raw_from_tvalue(&tv)) };
+                            std::mem::forget(tv);
                         }
                     }
                     for uv in &u.user_values {
                         if Self::needs_gc_mark(uv) {
-                            worklist.push(uv.clone());
+                            unsafe { worklist.push(raw_from_tvalue(uv)) };
                         }
                     }
                 }
