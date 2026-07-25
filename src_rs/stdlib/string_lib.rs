@@ -580,18 +580,70 @@ fn match_capture(ms: &MatchState<'_>, s: usize, l: u8) -> Result<Option<usize>, 
 
 /// 对应 C 的 max_expand
 fn max_expand(ms: &mut MatchState<'_>, s: usize, p: usize, ep: usize) -> Result<Option<usize>, String> {
-    let mut i = 0i32;
-    while single_match(ms, s + i as usize, p, ep) {
-        i += 1;
-    }
+    // perf: 批量扫描快速路径 — 对常见模式类 (., %a, %d, %s 等) 用循环直接计数,
+    // 避免逐字符调用 single_match 的函数调用 + match 分支判断开销。
+    // max_expand 占 3.68%, 前进阶段 (while single_match) 是主要开销。
+    // all.lua 中大量模式使用 .* / %a* / %d+ 等, 走此快速路径。
+    let pb = ms.pat_byte(p);
+    let count: i32 = if pb == b'.' {
+        // '.' 匹配任意字节 (s..src_end), 直接计数
+        (ms.src_end.saturating_sub(s)) as i32
+    } else if pb == b'%' && p + 1 < ms.p_end {
+        // %c 匹配字符类 (如 %a, %d, %s), 批量扫描
+        let cl = ms.pat_byte(p + 1);
+        let mut i = 0i32;
+        // 安全性: s + i < src_end 已在循环条件中检查
+        while s + (i as usize) < ms.src_end && match_class(ms.src_byte(s + i as usize), cl) {
+            i += 1;
+        }
+        i
+    } else {
+        // 其他模式类 (如 [...] 字符集或普通字符): 逐字符 single_match
+        let mut i = 0i32;
+        while single_match(ms, s + i as usize, p, ep) {
+            i += 1;
+        }
+        i
+    };
+
     // 快速路径: ep+1 是模式末尾时, 最长匹配即为最终结果,
     // 省去回溯阶段的 match_pattern 递归调用 (每次调用含 depth 检查 + 循环入口)。
-    // all.lua 大量模式以 * / + 结尾 (如 "%a*", ".*", "%w+"), max_expand 占 2.41%。
     if ep + 1 >= ms.p_end {
-        return Ok(Some(s + i as usize));
+        return Ok(Some(s + count as usize));
     }
+
+    // perf: 回溯优化 — 如果后续模式 (ep+1) 是一个简单的字面量字符 (非 . % [ ( ) $ 且无后缀量词),
+    // 在回溯循环中先检查 src[s+i] 是否等于该字面量, 不匹配则跳过 match_pattern 调用。
+    // 对 `.*x` / `%a*y` 等贪婪匹配后跟字面量的常见模式, 大部分回溯位置 src[s+i] != x,
+    // 提前检查可避免 ~90% 的 match_pattern 函数调用 (含函数入口 + depth 检查 + 分支分发)。
+    // perf 数据 (perf3): max_expand 慢速路径中回溯循环占主要开销 (call 9.70% + dec 14.81% +
+    // 返回值检查 16.77% + 错误检查 10.72%), 字面量预检后 match_pattern 从 14.24% 降到 0.38%。
+    // 注意: 必须排除 ( ) $ 等在 match_pattern_inner 中有特殊处理的字符, 否则会错误地
+    // 将它们当作字面量比较 (如 $ 应检查 src_end 而非字符匹配)。
+    let next_p = ep + 1;
+    let next_c = if next_p < ms.p_end { ms.pat_byte(next_p) } else { 0 };
+    // 字面量字符判断: 非 . % [ ( ) $ 且 next_p+1 不是量词 (* + ? -)
+    let next_is_literal = next_c != 0
+        && next_c != b'.'
+        && next_c != b'%'
+        && next_c != b'['
+        && next_c != b'('
+        && next_c != b')'
+        && next_c != b'$'
+        && (next_p + 1 >= ms.p_end
+            || !matches!(ms.pat_byte(next_p + 1), b'*' | b'+' | b'?' | b'-'));
+
+    // 慢速路径: 逐次回溯, 对每个位置调用 match_pattern
+    let mut i = count;
     while i >= 0 {
-        let res = match_pattern(ms, s + i as usize, ep + 1)?;
+        let pos = s + i as usize;
+        // 字面量预检: 后续模式以字面量字符开头时, 先检查 src[pos] == next_c
+        // 不匹配则跳过 match_pattern 调用 (省去函数调用 + depth 检查 + 入口分发)
+        if next_is_literal && (pos >= ms.src_end || ms.src_byte(pos) != next_c) {
+            i -= 1;
+            continue;
+        }
+        let res = match_pattern(ms, pos, ep + 1)?;
         if res.is_some() {
             return Ok(res);
         }
@@ -647,7 +699,10 @@ fn match_pattern_inner(
         if p >= ms.p_end {
             return Ok(Some(s));
         }
-        match ms.pat_byte(p) {
+        // perf: 读取一次 pat_byte(p), 避免 match + 默认分支中重复读取。
+        // match_pattern 是 all.lua 最大热点 (11.80%), 每次省一次 unsafe 内存读取。
+        let c = ms.pat_byte(p);
+        match c {
             b'(' => {
                 if p + 1 < ms.p_end && ms.pat_byte(p + 1) == b')' {
                     return start_capture(ms, s, p + 2, CAP_POSITION);
@@ -663,8 +718,8 @@ fn match_pattern_inner(
             }
             // perf: $ 非末尾时 fall through 到默认分支 (代码与 _ 完全相同, 合并以改善 icache 密度)
             b'%' if p + 1 < ms.p_end && {
-                let c = ms.pat_byte(p + 1);
-                c == b'b' || c == b'f' || c.is_ascii_digit()
+                let c2 = ms.pat_byte(p + 1);
+                c2 == b'b' || c2 == b'f' || c2.is_ascii_digit()
             } => {
                 match ms.pat_byte(p + 1) {
                     b'b' => {
@@ -718,8 +773,8 @@ fn match_pattern_inner(
                 // perf 快速路径: 普通字符 (非 . % [ ) 且无后缀量词时,
                 // 直接比较两个字节, 跳过 class_end + single_match 调用。
                 // all.lua 中大量简单模式 (如字面量字符串匹配) 走此路径,
-                // match_pattern 是最大热点 (12.82%), 每次省 2 次函数调用 + 分支判断。
-                let c = ms.pat_byte(p);
+                // match_pattern 是最大热点 (11.80%), 每次省 2 次函数调用 + 分支判断。
+                // c 已在 match 前读取, 无需再调 pat_byte(p)。
                 if c != b'.' && c != b'%' && c != b'[' {
                     let next = if p + 1 < ms.p_end { ms.pat_byte(p + 1) } else { 0 };
                     if next != b'*' && next != b'+' && next != b'?' && next != b'-' {

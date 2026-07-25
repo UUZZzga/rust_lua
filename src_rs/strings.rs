@@ -347,11 +347,23 @@ impl StringTable {
         let ht = unsafe { &mut *self.ht.as_ptr() };
 
         // 单级查找: HashTable 用预计算 hash 做 SIMD 探测,
-        // 等效函数仅在 hash tag 匹配时调用, 比较字符串内容。
+        // 等效函数仅在 hash tag (hash 低位 7bit) 匹配时调用。
         // 相比之前 HashMap<u64, Vec<...>> 两级结构:
         // 1. 消除 Vec 迭代开销 (len 检查、索引、边界检查)
         // 2. 条目大小 8 字节 (vs 32 字节), 4 倍缓存密度
+        //
+        // perf 优化: hashbrown 的 tag 只有 7bit (128 种值), 字符串表 256+ 条目时
+        // 平均每个 tag 有 2+ 个条目。先比较完整 hash (O(1), 仅读 ShortString.hash
+        // 字段), 快速淘汰 tag 匹配但完整 hash 不匹配的桶, 避免不必要的
+        // contents.as_bytes() (Rc deref + String 字段访问) + memcmp。
+        // perf 数据显示 Rc::deref 占 1.20%, memcmp 占 1.09%,
+        // hash 预比较可减少这两项的开销。
         if let Some(ts) = ht.find(h, |ts| {
+            // 先比较完整 hash: hash 不同 → 内容必然不同 → 立即 false
+            // (ts.hash 是 ShortString 第一个字段, 读取无需额外偏移)
+            if ts.hash != h {
+                return false;
+            }
             let content_bytes = ts.contents.as_bytes();
             // 字符串表中所有 ShortString 都通过 LuaString::with_nul 或
             // buf.push(0) 创建, contents 末尾必有 NUL 终止符。
@@ -383,9 +395,12 @@ impl StringTable {
         let str_bytes = str.as_bytes();
         let str_len = str_bytes.len();
 
-        // 单级查找 (见非 threaded 版本注释)
+        // 单级查找 (见非 threaded 版本注释), 先比较完整 hash 快速淘汰
         let ht_reader = self.ht.read();
         if let Some(ts) = ht_reader.find(h, |ts| {
+            if ts.hash != h {
+                return false;
+            }
             let content_bytes = ts.contents.as_bytes();
             content_bytes.len() == str_len + 1 && content_bytes[..str_len] == *str_bytes
         }) {
@@ -420,8 +435,11 @@ impl StringTable {
         // SAFETY: 同 intern, 非 threaded 模式下 StringTable 是 !Sync, 单线程独占.
         let ht = unsafe { &mut *self.ht.as_ptr() };
 
-        // 单级查找 (见 intern 注释)
+        // 单级查找 (见 intern 注释), 先比较完整 hash 快速淘汰
         if let Some(ts) = ht.find(h, |ts| {
+            if ts.hash != h {
+                return false;
+            }
             let content_bytes = ts.contents.as_bytes();
             content_bytes.len() == bytes_len + 1 && content_bytes[..bytes_len] == *bytes
         }) {
@@ -429,9 +447,17 @@ impl StringTable {
         }
 
         // 写路径
-        let mut buf = Vec::with_capacity(bytes.len() + 1); // 预分配含 NUL 的容量
-        buf.extend_from_slice(bytes);
-        buf.push(0); // NUL 终止符
+        // perf: 用 unsafe copy_nonoverlapping + set_len 替代 extend_from_slice + push,
+        // 消除两次容量检查 (extend_from_slice 和 push 各检查一次)。
+        // SAFETY: with_capacity(len+1) 保证至少 len+1 字节;
+        //         copy 复制 len 字节; 写 0 在 [len] (≤ capacity); set_len(len+1) 合法。
+        let blen = bytes.len();
+        let mut buf = Vec::with_capacity(blen + 1);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_mut_ptr(), blen);
+            *buf.as_mut_ptr().add(blen) = 0;
+            buf.set_len(blen + 1);
+        }
         let ts = ArcRc::new(ShortString {
             hash: h,
             contents: unsafe { String::from_utf8_unchecked(buf) },
@@ -452,6 +478,9 @@ impl StringTable {
 
         let ht_reader = self.ht.read();
         if let Some(ts) = ht_reader.find(h, |ts| {
+            if ts.hash != h {
+                return false;
+            }
             let content_bytes = ts.contents.as_bytes();
             content_bytes.len() == bytes_len + 1 && content_bytes[..bytes_len] == *bytes
         }) {
@@ -459,9 +488,14 @@ impl StringTable {
         }
         drop(ht_reader);
 
-        let mut buf = Vec::with_capacity(bytes.len() + 1); // 预分配含 NUL 的容量
-        buf.extend_from_slice(bytes);
-        buf.push(0);
+        // perf: 同非 threaded 版本, 用 unsafe 避免 extend_from_slice + push 的容量检查
+        let blen = bytes.len();
+        let mut buf = Vec::with_capacity(blen + 1);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_mut_ptr(), blen);
+            *buf.as_mut_ptr().add(blen) = 0;
+            buf.set_len(blen + 1);
+        }
         let mut ht = self.ht.write();
         let ts = ArcRc::new(ShortString {
             hash: h,
@@ -546,8 +580,10 @@ pub fn rust_hash_bytes(bytes: &[u8]) -> u64 {
     let mut h: u64 = (l as u64).wrapping_mul(0x5bd1e995);
     // 反向遍历对应 C 的 `for (; l > 0; l--) h ^= ((h<<5) + (h>>2) + str[l-1]);`
     // 改为 64 位以充分利用寄存器，移位常量也相应调整。
-    for i in (0..l).rev() {
-        let b = bytes[i] as u64;
+    // perf: 用 iter().rev() 替代索引循环, 消除每次迭代的边界检查。
+    // 迭代器版本编译器可证明无越界, 生成更紧凑的循环体。
+    for &b in bytes.iter().rev() {
+        let b = b as u64;
         h ^= h.wrapping_shl(7).wrapping_add(h.wrapping_shr(2)).wrapping_add(b);
     }
     h
@@ -564,11 +600,22 @@ pub fn rust_hash(str: &str) -> u64 {
 impl LuaString {
     /// 新建时自动追加 NUL 字节，确保作为 *const c_char 返回时安全。
     /// 预分配 str.len()+1 容量，避免 push('\0') 触发扩容。
+    /// perf: with_nul 在 intern 未命中路径上调用，每次分配一个新 String。
+    /// 用 unsafe 直接 copy_nonoverlapping + set_len 替代 push_str + push,
+    /// 消除两次容量检查和两次长度更新 (push_str 和 push 各检查一次容量)。
+    /// SAFETY: with_capacity(len+1) 保证至少 len+1 字节可用;
+    ///         copy_nonoverlapping 复制 len 字节; 写 0 在 [len] 位置 (≤ capacity);
+    ///         set_len(len+1) 不超过已分配容量; from_utf8_unchecked 安全因为
+    ///         源数据来自 &str (已验证 UTF-8) + NUL (合法 UTF-8 单字节)。
     pub(crate) fn with_nul(str: &str) -> String {
-        let mut s = String::with_capacity(str.len() + 1);
-        s.push_str(str);
-        s.push('\0');
-        s
+        let len = str.len();
+        let mut buf = Vec::with_capacity(len + 1);
+        unsafe {
+            std::ptr::copy_nonoverlapping(str.as_ptr(), buf.as_mut_ptr(), len);
+            *buf.as_mut_ptr().add(len) = 0;
+            buf.set_len(len + 1);
+            String::from_utf8_unchecked(buf)
+        }
     }
 
     /// 估算字符串真实堆占用（用于 GC 内存计费）。
@@ -715,8 +762,14 @@ pub fn new_short_bytes(bytes: Vec<u8>) -> LuaString {
     // 与 intern_bytes 相同的哈希算法：rust_hash_bytes
     let h = rust_hash_bytes(&bytes);
     let mut buf = bytes;
-    buf.reserve(1); // 避免 push(0) 扩容
-    buf.push(0);
+    buf.reserve(1); // 确保 push NUL 不扩容
+    // perf: 用 unsafe 直接写 NUL + set_len 替代 push(0), 消除冗余容量检查
+    // SAFETY: reserve(1) 保证至少 1 字节空闲; 写 [len] 在容量内; set_len(len+1) 合法。
+    let len = buf.len();
+    unsafe {
+        *buf.as_mut_ptr().add(len) = 0;
+        buf.set_len(len + 1);
+    }
     LuaString::Short(ArcRc::new(ShortString {
         hash: h,
         contents: unsafe { String::from_utf8_unchecked(buf) },

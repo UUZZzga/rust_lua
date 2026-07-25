@@ -31,6 +31,12 @@ use crate::vm::{
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::OnceLock;
+
+// perf: 缓存 LUA_VM_TRACE 环境变量值,避免每次 execute_loop 入口都调用 getenv。
+// perf 数据显示 getenv 占 1.28%,主要来自 all.lua 中大量 pcall/dofile 导致
+// execute_loop 被频繁调用。OnceLock 保证只读取一次环境变量。
+static LUA_VM_TRACE_LEVEL: OnceLock<u8> = OnceLock::new();
 
 /// 信号中断标志 — 对应 C 的 globalL + laction + lstop 机制。
 /// 信号处理器 (cli.rs::laction) 设置此标志，VM 循环在每条指令前检查，
@@ -940,10 +946,13 @@ impl VmExecutor {
 
         // 调试跟踪：通过环境变量 LUA_VM_TRACE=1 启用
         // LUA_VM_TRACE=2 时额外打印完整栈内容
-        let trace_level: u8 = std::env::var("LUA_VM_TRACE")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+        // perf: 用 OnceLock 缓存,避免每次 execute_loop 都调用 getenv (1.28% → ~0%)
+        let trace_level: u8 = *LUA_VM_TRACE_LEVEL.get_or_init(|| {
+            std::env::var("LUA_VM_TRACE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0)
+        });
 
         loop {
             // 检查信号中断 — 对应 C 的 lstop hook 抛出 "interrupted!" 错误
@@ -2742,9 +2751,51 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = opcodes::getarg_c(inst);
+        let mut val_opt = Some(Self::resolve_val(state, inst, c));
+        // perf 快速路径: table 无元表且 key 非 nil/NaN 时直接用 Table::set + GC barrier,
+        // 跳过 table_set 包装层 (t.get(&key) 预检查 + 元方法查找 + MAXTAGLOOP 循环)。
+        // nil/NaN key 必须走慢速路径以返回 "table index is nil/NaN" 错误 (attrib.lua:438)。
+        let fast_done = {
+            let stack = &state.stack;
+            if a < stack.len() && b < stack.len() {
+                if let TValue::Table(t) = &stack[a] {
+                    if !t.has_metatable() {
+                        // nil/NaN key 走慢速路径报错 (attrib.lua:438)
+                        // 用单个 match 一次读取 discriminant, 比两个独立 matches! 更高效
+                        let key = &stack[b];
+                        let key_ok = match key {
+                            TValue::Nil(_) => false,
+                            TValue::Float(f) => !f.is_nan(),
+                            _ => true,
+                        };
+                        if key_ok {
+                            t.set(stack[b].clone(), val_opt.take().unwrap());
+                            // GC barrier — 与 table_set 的 key_exists 路径一致
+                            if let Some(tid) = t.gc_header.id() {
+                                state.gc.barrier_back(tid);
+                            }
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if fast_done {
+            state.pc += 1;
+            return Ok(());
+        }
+        // 慢速路径: 有元表或非 Table 类型
+        let val = val_opt.unwrap();
         let table_val = Self::read_stack(state, a).clone();
         let key = Self::read_stack(state, b).clone();
-        let val = Self::resolve_val(state, inst, c);
         Self::table_set(
             state,
             table_val,
@@ -2761,8 +2812,36 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as i64;
         let c = opcodes::getarg_c(inst);
+        let mut val_opt = Some(Self::resolve_val(state, inst, c));
+        // perf 快速路径: table 无元表时直接用 Table::set + GC barrier, 跳过 table_set 包装层
+        // (t.get(&key) 预检查 + 元方法查找 + MAXTAGLOOP 循环)。
+        let fast_done = {
+            let stack = &state.stack;
+            if a < stack.len() {
+                if let TValue::Table(t) = &stack[a] {
+                    if !t.has_metatable() {
+                        t.set(TValue::Integer(b), val_opt.take().unwrap());
+                        if let Some(tid) = t.gc_header.id() {
+                            state.gc.barrier_back(tid);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if fast_done {
+            state.pc += 1;
+            return Ok(());
+        }
+        // 慢速路径: 有元表或非 Table 类型
+        let val = val_opt.unwrap();
         let table_val = Self::read_stack(state, a).clone();
-        let val = Self::resolve_val(state, inst, c);
         Self::table_set(
             state,
             table_val,
@@ -2779,13 +2858,43 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b_key = opcodes::getarg_b(inst) as usize;
         let c = opcodes::getarg_c(inst);
+        let mut val_opt = Some(Self::resolve_val(state, inst, c));
+        let mut key_opt = Some(
+            state
+                .constants
+                .get(b_key)
+                .cloned()
+                .unwrap_or(TValue::Nil(NilKind::Strict)),
+        );
+        // perf 快速路径: table 无元表时直接用 Table::set + GC barrier
+        let fast_done = {
+            let stack = &state.stack;
+            if a < stack.len() {
+                if let TValue::Table(t) = &stack[a] {
+                    if !t.has_metatable() {
+                        t.set(key_opt.take().unwrap(), val_opt.take().unwrap());
+                        if let Some(tid) = t.gc_header.id() {
+                            state.gc.barrier_back(tid);
+                        }
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                }
+            } else {
+                false
+            }
+        };
+        if fast_done {
+            state.pc += 1;
+            return Ok(());
+        }
+        // 慢速路径: 有元表或非 Table 类型
+        let val = val_opt.unwrap();
+        let key = key_opt.unwrap();
         let table_val = Self::read_stack(state, a).clone();
-        let key = state
-            .constants
-            .get(b_key)
-            .cloned()
-            .unwrap_or(TValue::Nil(NilKind::Strict));
-        let val = Self::resolve_val(state, inst, c);
         Self::table_set(
             state,
             table_val,
@@ -5772,6 +5881,9 @@ impl VmExecutor {
         // 调用方已 clone 了 table_val，此处再 clone 是冗余的。
         // take() 将值移出 current（变为 None），使 curr 借用 owned 而非 current，
         // 从而可以在循环体内安全地设置 current = Some(...)。
+        // perf 实验: 尝试用 scope 模式 / raw pointer 避免 take() 的 40 字节复制,
+        // 但编译器会把 as_ref + 赋值优化回 take() (movapd 仍占 27%),
+        // raw pointer 阻止优化反而更慢 (4.52s vs 4.39s)。保留 take() 模式。
         let mut current: Option<TValue> = None;
         for _ in 0..MAXTAGLOOP {
             let owned = current.take();
@@ -5786,7 +5898,7 @@ impl VmExecutor {
                         }
                     }
                     // key 未命中: 仅在有元表时才 clone 元表查 __index (延迟 clone,
-                    // 避免命中路径的冗余 Rc incq; all.lua table_get 占 10.65%)
+                    // 避免命中路径的冗余 Rc incq; all.lua table_get 占 10.67%)
                     if has_mt {
                         let mt = t.get_metatable();
                         let tmnames = &state.tmnames;

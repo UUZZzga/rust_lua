@@ -945,9 +945,19 @@ impl LuaState {
         } else {
             let nr = nresults as usize;
             if nr > n_actual {
-                self.stack.truncate(a + n_actual);
-                for _ in n_actual..nr {
-                    self.stack.push(TValue::Nil(NilKind::Strict));
+                // perf: 直接在 a+n_actual..a+nr 范围填 Nil，避免 truncate+push 的双次操作。
+                // truncate 会 drop 多余元素然后可能缩容，push 又可能扩容。
+                // 直接 resize 一次完成（resize 内部对增长部分用 Nil 填充）。
+                let target = a + nr;
+                if target <= self.stack.len() {
+                    // 栈够长: 只需覆盖 a+n_actual..a+nr 为 Nil
+                    for k in n_actual..nr {
+                        self.stack[a + k] = TValue::Nil(NilKind::Strict);
+                    }
+                } else {
+                    // 栈不够长: 先截断到 a+n_actual，再 resize 到 a+nr
+                    self.stack.truncate(a + n_actual);
+                    self.stack.resize(target, TValue::Nil(NilKind::Strict));
                 }
             }
             a + nr

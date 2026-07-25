@@ -453,6 +453,23 @@ impl<'a> LexState<'a> {
         };
     }
 
+    /// 仅更新 current 到 self.pos 位置, 不推进 pos。
+    /// 用于批量扫描后同步 current (如 read_number/read_name 的 ASCII 快速路径)。
+    /// 逻辑与 advance_pos 的 current 更新部分一致。
+    #[inline(always)]
+    fn update_current(&mut self) {
+        let bytes = self.source.as_bytes();
+        let len = bytes.len();
+        let p = self.pos;
+        self.current = if p >= len {
+            EOF_CHAR
+        } else if bytes[p] < 0x80 {
+            bytes[p] as char
+        } else {
+            read_char_at(bytes, p)
+        };
+    }
+
     #[inline(always)]
     fn peek(&self) -> char {
         let bytes = self.source.as_bytes();
@@ -478,28 +495,37 @@ impl<'a> LexState<'a> {
     fn skip_whitespace(&mut self) {
         let bytes = self.source.as_bytes();
         let len = bytes.len();
+        // perf: 把 pos 提取到本地变量, 避免快速路径循环内每次都加载/存储 self.pos。
+        // 汇编显示原版 14.36% 时间在 movzbl (读字节), 但 5.07% 在 mov 0x20(%rsp)
+        // (从栈加载 bytes 指针) + 3.38% 在 mov 0xb8(%rbx) (重新加载 self.pos)。
+        // 用本地 pos 后, 编译器可将其分配到寄存器, 循环内只需 inc + cmp + je。
+        let mut pos = self.pos;
         loop {
             // ASCII 快速路径: 批量跳过 ' ' 和 '\t' (最常见的空白, 如缩进),
             // 避免每字符调用 next_char → advance_pos + 换行检查的开销。
             // (perf: skip_whitespace 占 read_token 9.14% 中的 2.58%,
             //  其中绝大部分是 ' '/'\t' 的逐字符 next_char 调用)
-            while self.pos < len && (bytes[self.pos] == b' ' || bytes[self.pos] == b'\t') {
-                self.pos += 1;
+            while pos < len && (bytes[pos] == b' ' || bytes[pos] == b'\t') {
+                pos += 1;
             }
+            self.pos = pos;
             // 更新 current 到新位置 (与 advance_pos 的 current 更新逻辑一致)
-            self.current = if self.pos >= len {
+            self.current = if pos >= len {
                 EOF_CHAR
-            } else if bytes[self.pos] < 0x80 {
-                bytes[self.pos] as char
+            } else if bytes[pos] < 0x80 {
+                bytes[pos] as char
             } else {
-                read_char_at(bytes, self.pos)
+                read_char_at(bytes, pos)
             };
             match self.current {
                 // 对应 C llex 中的空白: ' ', '\f', '\t', '\v' (以及 '\n','\r' 通过 inclinenumber)
                 // lispace 表 (lctype.c) 将这 6 个字符均标记为 SPACEBIT
                 // ' ' 和 '\t' 已在快速路径处理, 这里只处理需要行号更新的换行符
                 // 和 \u{0B}/\u{0C} (较少见, 不值得在快速路径中处理)
-                '\r' | '\n' | '\u{0B}' | '\u{0C}' => self.next_char(),
+                '\r' | '\n' | '\u{0B}' | '\u{0C}' => {
+                    self.next_char();
+                    pos = self.pos;
+                }
                 '-' if self.peek() == '-' => {
                     self.next_char();
                     self.next_char();
@@ -508,12 +534,14 @@ impl<'a> LexState<'a> {
                         let equals = self.count_equals();
                         if self.current == '[' {
                             self.read_long_comment(equals);
+                            pos = self.pos;
                             continue;
                         }
                     }
                     while self.current != '\n' && self.current != '\r' && self.current != EOF_CHAR {
                         self.next_char();
                     }
+                    pos = self.pos;
                 }
                 _ => break,
             }
@@ -871,6 +899,8 @@ impl<'a> LexState<'a> {
     }
 
     fn read_number(&mut self) {
+        let bytes = self.source.as_bytes();
+        let len = bytes.len();
         let mut start = self.pos;
         let mut is_float = false;
         let mut is_hex = false;
@@ -885,16 +915,32 @@ impl<'a> LexState<'a> {
             }
         }
 
+        // ASCII 快速路径: 批量扫描数字字符, 避免逐字符 advance_pos 调用
+        // (perf: read_number 占 1.10%, 其中 advance_pos 调用开销显著)
+        // Lua 数字只含 ASCII 字符 (0-9, a-f, A-F, ., e/E, p/P, +/-, x/X)
         if is_hex {
-            while self.current.is_ascii_hexdigit() {
-                self.advance_pos();
+            // 批量扫描 hex 整数部分
+            while self.pos < len {
+                let b = bytes[self.pos];
+                if (b >= b'0' && b <= b'9') || (b >= b'a' && b <= b'f') || (b >= b'A' && b <= b'F') {
+                    self.pos += 1;
+                } else {
+                    break;
+                }
             }
+            self.update_current();
             if self.current == '.' {
                 is_float = true;
                 self.advance_pos();
-                while self.current.is_ascii_hexdigit() {
-                    self.advance_pos();
+                while self.pos < len {
+                    let b = bytes[self.pos];
+                    if (b >= b'0' && b <= b'9') || (b >= b'a' && b <= b'f') || (b >= b'A' && b <= b'F') {
+                        self.pos += 1;
+                    } else {
+                        break;
+                    }
                 }
+                self.update_current();
             }
             if self.current == 'p' || self.current == 'P' {
                 is_float = true;
@@ -902,20 +948,24 @@ impl<'a> LexState<'a> {
                 if self.current == '+' || self.current == '-' {
                     self.advance_pos();
                 }
-                while self.current.is_ascii_digit() {
-                    self.advance_pos();
+                while self.pos < len && bytes[self.pos] >= b'0' && bytes[self.pos] <= b'9' {
+                    self.pos += 1;
                 }
+                self.update_current();
             }
         } else {
-            while self.current.is_ascii_digit() {
-                self.advance_pos();
+            // 批量扫描十进制整数部分
+            while self.pos < len && bytes[self.pos] >= b'0' && bytes[self.pos] <= b'9' {
+                self.pos += 1;
             }
+            self.update_current();
             if self.current == '.' {
                 is_float = true;
                 self.advance_pos();
-                while self.current.is_ascii_digit() {
-                    self.advance_pos();
+                while self.pos < len && bytes[self.pos] >= b'0' && bytes[self.pos] <= b'9' {
+                    self.pos += 1;
                 }
+                self.update_current();
             }
             if self.current == 'e' || self.current == 'E' {
                 is_float = true;
@@ -923,9 +973,10 @@ impl<'a> LexState<'a> {
                 if self.current == '+' || self.current == '-' {
                     self.advance_pos();
                 }
-                while self.current.is_ascii_digit() {
-                    self.advance_pos();
+                while self.pos < len && bytes[self.pos] >= b'0' && bytes[self.pos] <= b'9' {
+                    self.pos += 1;
                 }
+                self.update_current();
             }
         }
 
@@ -937,8 +988,8 @@ impl<'a> LexState<'a> {
 
         // read_number 只消费数字、'.'、'e/E'、'+/-'、'x/X'、'p/P'、'a-f/A-F' 等 ASCII 字符,
         // 字节切片必为合法 ASCII (UTF-8 子集)。用 from_utf8_unchecked 跳过验证。
-        let bytes = &self.source.as_bytes()[start..self.pos];
-        let s = unsafe { std::str::from_utf8_unchecked(bytes) };
+        let num_bytes = &self.source.as_bytes()[start..self.pos];
+        let s = unsafe { std::str::from_utf8_unchecked(num_bytes) };
         self.token_text.clear();
         self.token_text.push_str(s);
         if is_float {

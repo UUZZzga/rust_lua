@@ -265,14 +265,40 @@ fn call_unpack(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     // 直接 push 到 state.stack，不创建中间 Vec
     // 对应 C 版 tunpack: while (i < e) { lua_geti(L, 1, i); i++; } lua_geti(L, 1, e);
     let first_result_pos = state.stack.len();
-    // perf: 快速路径 — table 无元表时直接用 Table::get, 跳过 table_get 的包装层
-    // (current.take/unwrap_or/match Table/MAXTAGLOOP 循环), call_unpack 占 2.37%。
-    // 大量 unpack 调用操作普通数组表 (无 __index), 快速路径省去每元素 ~10 条指令。
+    // perf: 快速路径 — table 无元表时直接持有 Ref<TableData> 访问 array,
+    // 跳过每元素的 Table::get_int (含 RefCell::borrow + Option + unwrap_or 临时对象)。
+    // perf3 数据: call_unpack 占 3.01%, 快速路径热点 145e78 (62.43% Vec::push 写入) +
+    // 145ea7 (3.47% get_int 调用) + 145eb4 (5.78% unwrap_or 初始化)。
+    // 一次 borrow 同时检查 metatable 和访问 array, 避免每元素重新 borrow。
+    // 注意: data 借用 t.data, 与 state.stack 独立, 可同时持有。
     if let TValue::Table(t) = &list_val {
-        if !t.has_metatable() {
+        let data = t.data.borrow();
+        if data.metatable.is_none() {
+            // 整个范围 [i, j] 在 array 内: 直接遍历 array, 跳过 get_int/hash_get
+            // 1-based → 0-based: i-1, j-1
+            let array = &data.array;
+            let array_len = array.len();
+            let start_idx = (i - 1) as usize;
+            let end_idx = (j - 1) as usize;
+            if end_idx < array_len {
+                // perf: 直接遍历 array, Empty 槽位转换为 Strict Nil (与 get_int 语义一致)
+                // 已 try_reserve_exact(n), push 不会触发 grow
+                for idx in start_idx..=end_idx {
+                    let val = match &array[idx] {
+                        TValue::Nil(NilKind::Empty) => TValue::Nil(NilKind::Strict),
+                        other => other.clone(),
+                    };
+                    state.stack.push(val);
+                }
+                drop(data);
+                state.adjust_results_on_stack(a, nresults, n, first_result_pos);
+                return Ok(());
+            }
+            // 部分范围超出 array: 走 get_int 逻辑 (仍借用 data, 但 get_int 会重新 borrow)
+            // drop data 避免双重 borrow
+            drop(data);
             let mut idx = i;
             while idx < j {
-                // perf: 用 get_int 直接传 i64, 避免每次循环创建 TValue::Integer + 模式匹配
                 let val = t
                     .get_int(idx)
                     .unwrap_or(TValue::Nil(NilKind::Strict));
@@ -286,6 +312,7 @@ fn call_unpack(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
             state.adjust_results_on_stack(a, nresults, n, first_result_pos);
             return Ok(());
         }
+        drop(data);
     }
     let mut idx = i;
     while idx < j {

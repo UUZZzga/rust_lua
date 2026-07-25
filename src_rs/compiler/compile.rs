@@ -585,6 +585,7 @@ impl<'a> FuncState<'a> {
             // (0→8→16→32...)。给 16 初始容量可容纳约 11 个常量不扩容 (16*0.7),
             // 覆盖大多数小函数的常量数量, 减少 rehash 开销。
             // 内存开销: 16 桶 * 24 字节 ≈ 384 字节, 可忽略。
+            // 注意: 增加到 32 会导致 all.lua 性能下降约 7% (内存浪费影响缓存)。
             const_index: HashMap::with_capacity(16),
             #[cfg(debug_assertions)]
             reg_alloc_stack: Vec::new(),
@@ -2657,6 +2658,13 @@ fn parse_chunk_finish(fs: &mut FuncState) {
     // 从 inst_lines 计算 line_info 和 abs_line_info
     // (对应 C 的 savelineinfo，在 luaK_code 中每条指令发射时调用)
     // C 的 open_func 中: fs->previousline = f->linedefined
+    //
+    // perf: close_func 占 2.32%, 其中 line_info push 的扩容是主要开销之一。
+    // line_info 初始容量 8 (new_proto), 对于大函数会多次扩容 (8→16→32→...).
+    // 预分配为 inst_lines.len() (1:1 对应), 消除循环内所有扩容。
+    // abs_line_info 通常很少 (仅行号差 >= 128 时), 不预分配。
+    let inst_count = fs.inst_lines.len();
+    fs.proto.line_info.reserve(inst_count);
     let mut previousline: i32 = fs.proto.line_defined;
     let mut iwthabs: i32 = 0;
     for (pc, &line) in fs.inst_lines.iter().enumerate() {
