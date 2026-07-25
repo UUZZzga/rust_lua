@@ -43,6 +43,20 @@
 
 例外：`tests_lua/gc_linkedlist_*.lua` 与 `tests_lua/constructs.lua` 因虚拟内存峰值较高，`verify.sh` 内部将其限制提升至 512MB；`deps/test.sh` 因 C 模块测试需要也将限制提升至 512MB。
 
+## 命令执行规则
+
+禁止使用 `sleep N | exe` 形式的管道命令。原因：shell 会等待管道中所有命令结束，`exe` 退出后 `sleep` 仍会继续运行至计时结束，造成大量无效等待（如 `lua` 1 秒结束，整体却要等 300 秒）。`tools/check_sleep_pipe.sh` hook 会拦截此类命令。
+
+禁止使用 `exe < /dev/null` 重定向 stdin。原因：`all.lua` 等测试用例会从 stdin 读取输入，stdin 立即 EOF 会导致测试用例报错失败。
+
+替代方案（按用途选择）：
+
+- 仅需 stdin 不可 seek（如 `tests_lua/files.lua:88` 的 `io.stdin:seek` 场景）：使用 `printf '' | exe`，空管道立即 EOF 且 stdin 不可 seek。
+- 需少量数据输入：使用 `echo "..." | exe` 或 `printf '%s\n' "..." | exe`。
+- 需从文件读取：使用 `exe < file`。
+- 不需要 stdin：使用 `printf '' | exe`（空管道）或直接放任 stdin 继承终端。
+- 需超时控制：使用 `timeout N exe`。
+
 ## 测试体系
 
 ### 一键测试入口
@@ -63,9 +77,11 @@
 
 ## Hook 机制
 
-`.claude/settings.json` 配置了两个 hook：
+`.claude/settings.json` 配置了以下 hook：
 
-- **PreToolUse / Bash**：`tools/check_memory.sh`，扫描命令（包括脚本内容）是否符合内存限制规则。构建命令必须用 `systemd-run --property=LimitAS=infinity`；测试命令必须用 `systemd-run --property=LimitAS=204800` 并加 `timeout`。
+- **PreToolUse / Bash**：
+  - `tools/check_memory.sh`：扫描命令（包括脚本内容）是否符合内存限制规则。构建命令必须用 `systemd-run --property=LimitAS=infinity`；测试命令必须用 `systemd-run --property=LimitAS=204800` 并加 `timeout`。
+  - `tools/check_sleep_pipe.sh`：拦截 `sleep N | exe` 形式的命令。详见"命令执行规则"章节。
 - **Stop**：`tools/verify.sh`，每次 Agent 停止时自动运行编译器比对、cargo test、构建与 Lua 测试。失败时查看 `logs/compiler_test.log` / `logs/cargo_test.log` / `logs/build.log` / `logs/*_run.log`。
 
 ## CI 流程

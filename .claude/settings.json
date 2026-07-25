@@ -8,6 +8,11 @@
             "type": "command",
             "command": "tools/check_memory.sh",
             "timeout": 10
+          },
+          {
+            "type": "command",
+            "command": "tools/check_sleep_pipe.sh",
+            "timeout": 10
           }
         ]
       }
