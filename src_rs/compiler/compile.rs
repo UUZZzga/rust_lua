@@ -815,6 +815,13 @@ impl<'a> FuncState<'a> {
     /// 修复跳转指令偏移量: 根据 OpMode 计算 dest 与 pc 之差写入指令
     fn fix_jump(&mut self, pc: i32, dest: i32, back: bool) {
         let i = &mut Rc::make_mut(&mut self.proto.code)[pc as usize];
+        Self::fix_jump_impl(i, pc, dest, back);
+    }
+
+    /// fix_jump 的核心逻辑,直接操作单条指令。
+    /// 提取为静态函数使 parse_chunk_finish 能共用一次 Rc::make_mut,
+    /// 避免循环内每次调用 fix_jump 都重复 Rc::make_mut (refcount 检查)。
+    fn fix_jump_impl(i: &mut u32, pc: i32, dest: i32, back: bool) {
         let op = get_opcode(*i);
         match get_opmode(op) {
             OpMode::IABC => {
@@ -955,15 +962,22 @@ impl<'a> FuncState<'a> {
     }
 
     /// 查找或添加常量到常量表: 去重后返回常量索引
+    ///
+    /// perf: 用 entry API 替代 get+insert,消除命中路径的双重 hash 计算。
+    /// 原 get+insert 对 key 哈希两次;entry 只哈希一次。
+    /// 同时命中路径 key 不进入 map 也不被 drop (Occupied 不消费 key),
+    /// 避免 Str 类型 key 的 Rc inc/dec (to_const_key 对 Str 调用 s.clone())。
+    /// perf 数据显示 const_k 占 2.26%, 此优化预期减少 ~0.7-1%。
     fn const_k(&mut self, value: TValue) -> i32 {
         let key = to_const_key(&value);
-        if let Some(&idx) = self.const_index.get(&key) {
-            return idx;
+        match self.const_index.entry(key) {
+            std::collections::hash_map::Entry::Occupied(e) => *e.get(),
+            std::collections::hash_map::Entry::Vacant(e) => {
+                let idx = self.proto.constants.len() as i32;
+                Rc::make_mut(&mut self.proto.constants).push(value);
+                *e.insert(idx)
+            }
         }
-        let idx = self.proto.constants.len() as i32;
-        Rc::make_mut(&mut self.proto.constants).push(value);
-        self.const_index.insert(key, idx);
-        idx
     }
 
     /// 创建字符串常量并添加到常量表
@@ -2590,11 +2604,17 @@ impl<'a> FuncState<'a> {
 fn parse_chunk_finish(fs: &mut FuncState) {
     // JMP→JMP optimization: like C's luaK_finish, process in-place
     // so that earlier optimizations are visible to later ones
-    let code_len = fs.proto.code.len();
+    //
+    // perf: close_func 占 2.32%, 其中 parse_chunk_finish 的第一次遍历每次
+    // fs.proto.code[i] 都要 Rc deref, 且 fix_jump 内部再次 Rc::make_mut。
+    // 改为一次 Rc::make_mut 取出 &mut Vec, 循环内直接用 code[i] +
+    // fix_jump_impl, 消除每条 JMP 指令的重复 Rc 操作。
+    let code = Rc::make_mut(&mut fs.proto.code);
+    let code_len = code.len();
     for i in 0..code_len {
-        if get_opcode(fs.proto.code[i]) == OpCode::JMP {
-            let target = final_target(&fs.proto.code, i as i32);
-            fs.fix_jump(i as i32, target, false);
+        if get_opcode(code[i]) == OpCode::JMP {
+            let target = final_target(code, i as i32);
+            FuncState::fix_jump_impl(&mut code[i], i as i32, target, false);
         }
     }
 

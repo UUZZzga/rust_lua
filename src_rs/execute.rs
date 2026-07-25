@@ -2678,17 +2678,18 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        let key = state
-            .constants
-            .get(c_key)
-            .cloned()
-            .unwrap_or(TValue::Nil(NilKind::Strict));
         // perf 快速路径: table 无元表时直接用 get_and_metatable, 跳过 table_get 包装层
         // + table_val clone。大量表字段访问 (t.field) 操作普通表 (无 __index)。
+        //
+        // perf 优化: 快速路径用 state.constants.get(c_key) 返回的 &TValue 引用,
+        // 避免每次都 clone key (Str 类型 → Rc inc/dec)。state.constants 是 Rc<Vec<TValue>>,
+        // get 返回 Option<&TValue>, 与 read_stack 的 &state.stack 借用兼容 (均不可变借用)。
+        // get_and_metatable 返回 owned Option<TValue>, block 结束后借用释放, 再调 write_stack。
         let fast_result: Option<Option<TValue>> = {
+            let key_opt = state.constants.get(c_key);
             let table_val = Self::read_stack(state, b);
-            if let TValue::Table(t) = table_val {
-                let (val, has_mt) = t.get_and_metatable(&key);
+            if let (Some(key), TValue::Table(t)) = (key_opt, table_val) {
+                let (val, has_mt) = t.get_and_metatable(key);
                 if !has_mt {
                     Some(val)
                 } else {
@@ -2704,7 +2705,12 @@ impl VmExecutor {
             state.pc += 1;
             return Ok(());
         }
-        // 慢速路径: 有元表或非 Table 类型
+        // 慢速路径: 有元表或非 Table 类型 — 此处才 clone key
+        let key = state
+            .constants
+            .get(c_key)
+            .cloned()
+            .unwrap_or(TValue::Nil(NilKind::Strict));
         let table_val = Self::read_stack(state, b).clone();
         let result = Self::table_get(
             state,
