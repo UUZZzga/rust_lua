@@ -2562,6 +2562,44 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as usize;
         let kb_idx = opcodes::getarg_c(inst) as usize;
+        // perf 快速路径: table 无元表时用引用避免 key 和 upval_val 的 clone
+        // (类似 op_getfield 优化)。
+        // Split borrowing: 显式取 state 各字段引用,允许同时借用 stack/constants/closure_upvals。
+        // uv_ref (RefCell::borrow) 在 block 内存活; get_and_metatable 返回 owned,
+        // block 结束后释放借用,再调 write_stack。
+        let fast_result: Option<Option<TValue>> = {
+            let stack = &state.stack;
+            let constants = &state.constants;
+            let closure_upvals = &state.closure_upvals;
+            let key_opt = constants.get(kb_idx);
+            if b < closure_upvals.len() {
+                let uv_ref = closure_upvals[b].borrow();
+                let table_ref: Option<&TValue> = match &*uv_ref {
+                    UpVal::Closed { value } => Some(&**value),
+                    UpVal::Open { stack_index, .. } => stack.get(*stack_index),
+                };
+                match (key_opt, table_ref) {
+                    (Some(key), Some(TValue::Table(t))) => {
+                        let (val, has_mt) = t.get_and_metatable(key);
+                        if !has_mt {
+                            Some(val)
+                        } else {
+                            None
+                        }
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(get_result) = fast_result {
+            let val = get_result.unwrap_or(TValue::Nil(NilKind::Strict));
+            Self::write_stack(state, a, val);
+            state.pc += 1;
+            return Ok(());
+        }
+        // 慢速路径: 有元表或非 Table 类型 — 此处才 clone
         let key = state
             .constants
             .get(kb_idx)
