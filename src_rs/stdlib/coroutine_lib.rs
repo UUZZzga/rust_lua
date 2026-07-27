@@ -932,9 +932,13 @@ fn call_create(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         status: ThreadStatus::Suspended,
         function: Some(Box::new(func)),
         is_main: false,
-        context,
+        context: context.clone(),
+        c_state: std::cell::Cell::new(std::ptr::null_mut()),
     };
-    push_single_result(state, a, nresults, TValue::Thread(Rc::new(thread)));
+    let thread_rc = Rc::new(thread);
+    // 设置 thread_ref，让 coroutine.running() 能返回同一对象
+    context.borrow_mut().thread_ref = Rc::downgrade(&thread_rc);
+    push_single_result(state, a, nresults, TValue::Thread(thread_rc));
     Ok(())
 }
 
@@ -1228,15 +1232,24 @@ fn call_running(
 ) -> Result<(), VmError> {
     let (thread_val, ismain) = match &state.current_thread {
         Some(ctx) => {
-            // 在协程中 — 返回该协程 + false
-            let thread = LuaThread {
-                stack: Vec::new(),
-                status: ctx.borrow().status,
-                function: None,
-                is_main: false,
-                context: ctx.clone(),
-            };
-            (TValue::Thread(Rc::new(thread)), false)
+            // 在协程中 — 返回该协程的原始 LuaThread 对象（通过 thread_ref）
+            // 这样 coroutine.running() 每次返回同一对象，table 查找才能正确工作
+            let thread_rc = ctx.borrow().thread_ref.upgrade();
+            match thread_rc {
+                Some(rc) => (TValue::Thread(rc), false),
+                None => {
+                    // thread_ref 已失效（不应发生），回退到创建临时对象
+                    let thread = LuaThread {
+                        stack: Vec::new(),
+                        status: ctx.borrow().status,
+                        function: None,
+                        is_main: false,
+                        context: ctx.clone(),
+                        c_state: std::cell::Cell::new(std::ptr::null_mut()),
+                    };
+                    (TValue::Thread(Rc::new(thread)), false)
+                }
+            }
         }
         None => {
             // 主线程 — 返回 main_thread + true
@@ -1349,6 +1362,12 @@ fn call_resume(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         state.n_ny_calls = saved_n_ny_calls;
         state.force_noyield_close = saved_force_noyield_close;
         return Err(e);
+    }
+
+    // 首次 resume setup 成功后立即标记 started=true，
+    // 这样协程 yield 后的后续 resume 会走 setup_subsequent_resume 而非重新初始化
+    if is_first_resume {
+        co_context.borrow_mut().started = true;
     }
 
     // 从 ThreadContext 恢复协程的 hook 设置到 state
@@ -1830,7 +1849,6 @@ fn call_yield(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
             }
         })
         .collect();
-
     // 截断栈到 `a`（移除 yield 函数和参数）
     state.stack.truncate(a);
     state.top = a;
@@ -1867,20 +1885,24 @@ fn call_wrap(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
         status: ThreadStatus::Suspended,
         function: Some(Box::new(func)),
         is_main: false,
-        context,
+        context: context.clone(),
+        c_state: std::cell::Cell::new(std::ptr::null_mut()),
     };
+    let thread_rc = Rc::new(thread);
+    // 设置 thread_ref，让 coroutine.running() 能返回同一对象
+    context.borrow_mut().thread_ref = Rc::downgrade(&thread_rc);
     // 收集开 upvalue 信息并保存到 ThreadContext（不关闭！）
     // 首次 resume 时根据同栈/跨栈决定用最新值还是 saved_value 关闭
     // 这样支持 `A = coroutine.wrap(function() ... A() ... end)` 的自引用模式
     // （A 在 call_wrap 时还是旧值，在 call_wrap_fn 首次调用时才被赋值为 wrap RustClosure）
-    let pending = collect_wrap_upvals_info(&thread, state);
+    let pending = collect_wrap_upvals_info(&thread_rc, state);
     let creator_ptr = state
         .current_thread
         .as_ref()
         .map(|c| Rc::as_ptr(c) as usize)
         .unwrap_or(0);
     {
-        let mut ctx = thread.context.borrow_mut();
+        let mut ctx = thread_rc.context.borrow_mut();
         ctx.wrap_creator_thread_ptr = creator_ptr;
         ctx.pending_wrap_upvals = pending;
     }
@@ -1890,7 +1912,7 @@ fn call_wrap(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
     let wrap_closure = crate::objects::RustClosure {
         func: call_wrap_fn,
         name: c"wrap".as_ptr() as *const u8,
-        upvalues: Rc::new(RefCell::new(vec![TValue::Thread(Rc::new(thread))])),
+        upvalues: Rc::new(RefCell::new(vec![TValue::Thread(thread_rc)])),
     };
     push_single_result(state, a, nresults, TValue::RustClosure(Rc::new(wrap_closure)));
     Ok(())
@@ -2035,6 +2057,12 @@ fn call_wrap_fn(
         state.n_ccalls = saved_n_ccalls;
         state.n_ny_calls = saved_n_ny_calls;
         return Err(e);
+    }
+
+    // 首次 resume setup 成功后立即标记 started=true，
+    // 这样协程 yield 后的后续 resume 会走 setup_subsequent_resume 而非重新初始化
+    if is_first_resume {
+        co_context.borrow_mut().started = true;
     }
 
     // 从 ThreadContext 恢复协程的 hook 设置到 state
@@ -2238,6 +2266,235 @@ fn call_wrap_fn(
     state.top = state.stack.len();
 
     Ok(())
+}
+
+// ============================================================================
+// C API lua_resume 的实现 — 供 capi.rs::lua_resume 调用
+// ============================================================================
+//
+// 与 Lua 层 call_resume 的区别：
+// - NL 是独立的 LuaState（由 lua_newthread 创建），不需要 save/restore caller context
+// - 函数从 NL 栈获取（由 lua_xmove 移入），而非从 thread.function 获取
+// - 结果直接放回 NL 栈，由调用方通过 lua_xmove 取回
+
+/// C API lua_resume 的核心实现。
+///
+/// 从 `state.current_thread` 获取 ThreadContext，根据 started 标志判断首次/后续 resume。
+/// 首次 resume 时从栈取函数（栈布局: [nil, func, arg1, ..., argN]），创建临时 LuaThread
+/// 复用 setup_first_resume 逻辑。后续 resume 直接调用 setup_subsequent_resume。
+///
+/// 返回 (status, nresults)，status 为 LUA_OK/LUA_YIELD/LUA_ERRRUN，
+/// nresults 为结果数（已放在 state.stack 上）。
+pub fn c_api_resume(state: &mut LuaState, nargs: usize) -> Result<(i32, usize), VmError> {
+    let co_context = match state.current_thread.clone() {
+        Some(ctx) => ctx,
+        None => {
+            return Err(VmError::RuntimeError(
+                "lua_resume: not a C API thread".to_string(),
+            ));
+        }
+    };
+
+    // 检查协程状态
+    let co_status = co_context.borrow().status;
+    match co_status {
+        ThreadStatus::Suspended => {}
+        ThreadStatus::Normal => {
+            return Ok((crate::capi::LUA_ERRRUN, push_error(state, "cannot resume non-suspended coroutine")));
+        }
+        ThreadStatus::OK | ThreadStatus::Error => {
+            return Ok((crate::capi::LUA_ERRRUN, push_error(state, "cannot resume dead coroutine")));
+        }
+    }
+
+    let is_first_resume = !co_context.borrow().started;
+    let saved_n_ccalls = state.n_ccalls;
+    let saved_n_ny_calls = state.n_ny_calls;
+    state.n_ny_calls = 0;
+    // 准备 setup（首次/后续）
+    let setup_result = if is_first_resume {
+        // 首次 resume: 从 NL 栈取函数和参数
+        // 栈布局: [nil, func, arg1, ..., argN]
+        let stack_len = state.stack.len();
+        if stack_len < nargs + 1 {
+            state.n_ny_calls = saved_n_ny_calls;
+            return Err(VmError::RuntimeError(
+                "lua_resume: not enough values on stack".to_string(),
+            ));
+        }
+        let func_idx = stack_len - nargs - 1;
+        let func = state.stack[func_idx].clone();
+        let resume_args: Vec<TValue> = state.stack[func_idx + 1..].to_vec();
+
+        // 创建临时 LuaThread（共享 context），让 setup_first_resume 能取到 function
+        let temp_thread = LuaThread {
+            stack: Vec::new(),
+            status: ThreadStatus::Suspended,
+            function: Some(Box::new(func)),
+            is_main: false,
+            context: co_context.clone(),
+            c_state: std::cell::Cell::new(std::ptr::null_mut()),
+        };
+        setup_first_resume(state, &temp_thread, &resume_args)
+    } else {
+        // 后续 resume: 收集栈顶 nargs 个值作为 resume 参数
+        let stack_len = state.stack.len();
+        let start = if stack_len >= nargs {
+            stack_len - nargs
+        } else {
+            stack_len
+        };
+        let resume_args: Vec<TValue> = state.stack[start..].to_vec();
+        setup_subsequent_resume(state, &co_context, &resume_args)
+    };
+
+    if let Err(e) = setup_result {
+        state.n_ccalls = saved_n_ccalls;
+        state.n_ny_calls = saved_n_ny_calls;
+        return Err(e);
+    }
+
+    // 首次 resume setup 成功后立即标记 started=true，
+    // 这样协程 yield 后的后续 resume 会走 setup_subsequent_resume 而非重新初始化
+    if is_first_resume {
+        co_context.borrow_mut().started = true;
+    }
+
+    // 递增 n_ccalls 防止协程嵌套过深
+    state.n_ccalls = state.n_ccalls.saturating_add(1);
+    if state.n_ccalls >= crate::state::LUAI_MAXCCALLS {
+        state.n_ccalls = saved_n_ccalls;
+        state.n_ny_calls = saved_n_ny_calls;
+        return Ok((crate::capi::LUA_ERRRUN, push_error(state, "C stack overflow")));
+    }
+
+    // 设置 current_thread 和状态为 Normal
+    state.current_thread = Some(co_context.clone());
+    co_context.borrow_mut().status = ThreadStatus::Normal;
+
+    // 执行
+    let exec_result = VmExecutor::execute_with_state(state);
+
+    // 处理结果
+    let (status, nresults) = match exec_result {
+        Ok(VmResult::Yield { values }) => {
+            // yield: 保存 VM 状态到 ThreadContext
+            let n = values.len();
+            {
+                let mut ctx = co_context.borrow_mut();
+                ctx.saved_code = std::mem::take(&mut state.code);
+                ctx.saved_constants = std::mem::take(&mut state.constants);
+                ctx.saved_upval_descs = std::mem::take(&mut state.upval_descs);
+                ctx.saved_protos = std::mem::take(&mut state.protos);
+                ctx.saved_base = state.base;
+                ctx.saved_pc = state.pc + 1;
+                ctx.saved_top = state.top;
+                ctx.saved_num_params = state.num_params;
+                ctx.saved_is_vararg = state.is_vararg;
+                ctx.saved_proto_flag = state.proto_flag;
+                ctx.saved_nextraargs = state.nextraargs;
+                ctx.saved_closure_upvals = std::mem::take(&mut state.closure_upvals);
+                ctx.saved_open_upvals = std::mem::take(&mut state.open_upvals);
+                ctx.saved_open_upval = state.open_upval;
+                ctx.saved_tbc_list = state.tbc_list;
+                ctx.saved_call_stack = std::mem::take(&mut state.call_stack);
+                ctx.saved_stack = std::mem::take(&mut state.stack);
+                ctx.saved_call_info = std::mem::take(&mut state.call_info);
+                ctx.saved_hook_old_pc = state.hook_old_pc;
+                ctx.saved_hook_func = state.hook_func.take();
+                ctx.saved_hook_mask = state.hook_mask;
+                ctx.saved_hook_count = state.hook_count;
+                ctx.saved_current_hook_count = state.current_hook_count;
+                ctx.saved_allowhook = state.allowhook;
+                ctx.saved_pcall_protection_stack =
+                    std::mem::take(&mut state.pcall_protection_stack);
+                ctx.saved_close_error_status = state.close_error_status.take();
+                ctx.status = ThreadStatus::Suspended;
+            }
+            // push yield 值到 state.stack: [nil, val1, val2, ...]
+            state.stack = Vec::with_capacity(n + 1);
+            state.stack.push(TValue::Nil(NilKind::Strict));
+            for v in values {
+                state.stack.push(v);
+            }
+            state.top = state.stack.len();
+            (crate::capi::LUA_YIELD, n)
+        }
+        Ok(VmResult::Return { nresults: ret_n, result_base }) => {
+            // 协程返回 — 取出返回值，重新设置栈
+            let co_stack = std::mem::take(&mut state.stack);
+            co_context.borrow_mut().status = ThreadStatus::OK;
+            co_context.borrow_mut().started = true;
+            co_context.borrow_mut().saved_call_info.clear();
+            // push 返回值: [nil, result1, result2, ...]
+            state.stack = Vec::with_capacity(ret_n + 1);
+            state.stack.push(TValue::Nil(NilKind::Strict));
+            for i in 0..ret_n {
+                let val = if result_base + i < co_stack.len() {
+                    co_stack[result_base + i].clone()
+                } else {
+                    TValue::Nil(NilKind::Strict)
+                };
+                state.stack.push(val);
+            }
+            state.top = state.stack.len();
+            (crate::capi::LUA_OK, ret_n)
+        }
+        Ok(_) => {
+            co_context.borrow_mut().status = ThreadStatus::OK;
+            co_context.borrow_mut().saved_call_info.clear();
+            state.stack = vec![TValue::Nil(NilKind::Strict)];
+            state.top = 1;
+            (crate::capi::LUA_OK, 0)
+        }
+        Err(e) => {
+            // 错误: 保存错误状态到 ctx，关闭 TBC 变量
+            {
+                let mut ctx = co_context.borrow_mut();
+                ctx.saved_call_info = std::mem::take(&mut state.call_info);
+                let save_end = state.base.min(state.stack.len());
+                ctx.saved_stack = state.stack[..save_end].to_vec();
+                ctx.saved_base = state.base;
+                ctx.saved_pc = state.pc.wrapping_add(1);
+                ctx.status = ThreadStatus::Error;
+            }
+            // 关闭 TBC 变量
+            let close_level = state.base;
+            if close_level > 0 && close_level <= state.stack.len() {
+                state.stack[close_level - 1] = TValue::Nil(NilKind::Strict);
+            }
+            let _ = crate::func::close(state, close_level, 1, 0);
+            // 获取错误值
+            let err_val = state.last_error_value.take().unwrap_or_else(|| match &e {
+                VmError::RuntimeErrorValue(val) => val.clone(),
+                _ => {
+                    let msg = if !state.last_error_msg.is_empty() {
+                        state.last_error_msg.clone()
+                    } else {
+                        format!("{}", e)
+                    };
+                    TValue::Str(state.intern_str(&msg))
+                }
+            });
+            // push 错误消息: [nil, err_msg]
+            state.stack = vec![TValue::Nil(NilKind::Strict), err_val];
+            state.top = 2;
+            (crate::capi::LUA_ERRRUN, 1)
+        }
+    };
+
+    // 恢复 n_ccalls / n_ny_calls
+    state.n_ccalls = saved_n_ccalls;
+    state.n_ny_calls = saved_n_ny_calls;
+
+    Ok((status, nresults))
+}
+
+/// 把错误消息 push 到 state.stack，返回 nresults (1)
+fn push_error(state: &mut LuaState, msg: &str) -> usize {
+    state.stack = vec![TValue::Nil(NilKind::Strict), TValue::Str(state.intern_str(msg))];
+    state.top = 2;
+    1
 }
 
 // ============================================================================

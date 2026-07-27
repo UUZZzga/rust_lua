@@ -193,11 +193,15 @@ pub struct LuaState {
     // 高层 API 字段（原 LuaState）
     pub globals: Table,
     pub registry: Table,
-    pub string_table: StringTable,
+    /// 字符串表 — 通过 Rc 共享以支持 lua_newthread 创建的 thread 共享主线程的字符串表
+    /// （对应 C Lua 中 global_State 的 strt 字段，所有 thread 共享同一份 string table）
+    pub string_table: Rc<StringTable>,
     /// 预 intern 的元方法名数组 — 对应 C 的 `G(L)->tmname[TM_N]`。
     /// 在 `LuaState::new` 时用 `string_table.intern` 初始化一次，
     /// 后续 `make_tm_tvalue` 直接 `clone()` 复用，保证 ptr_eq 快速路径。
-    pub tmnames: Box<[LuaString; TM_N]>,
+    /// 通过 Rc 共享以支持 lua_newthread 创建的 thread 共享主线程的 tmnames
+    /// （保证不同 thread 间元方法名 ptr_eq 一致，元表查找快速路径不被破坏）
+    pub tmnames: Rc<Box<[LuaString; TM_N]>>,
 
     // C API 导出层使用：当前 C 函数帧的 func 位置（0-based 栈索引）。
     // C API 的正索引相对于此位置；Lua 代码路径不使用此字段。
@@ -353,6 +357,13 @@ pub struct LuaState {
     /// Rc 引用计数为 0 时 userdata 内存被释放，导致悬空指针。
     /// 此字段模拟 C Lua 的 GC 延迟释放行为。
     pub c_safety_keepalive: Vec<TValue>,
+
+    /// lua_newstate 时传入的 allocator userdata 指针。
+    /// 对应 C Lua 的 `lstate->ud`，由 lua_getallocf 返回给 C 代码。
+    /// skynet 的 service_snlua.c 用此机制存储 snlua 结构体指针，
+    /// lua_resumeX 通过 lua_getallocf 取回 snlua 指针调用 switchL。
+    /// 不归 GC 管理（外部 C 代码所有），Rust 仅持有裸指针。
+    pub allocf_ud: *mut std::ffi::c_void,
 }
 
 /// 调用栈条目 — 用于堆栈回溯和 debug.getinfo
@@ -417,8 +428,8 @@ impl LuaState {
         let stack = Self::init_stack();
         let top = stack.len();
 
-        let string_table = StringTable::new();
-        let tmnames = init_tmnames(&string_table);
+        let string_table = Rc::new(StringTable::new());
+        let tmnames = Rc::new(init_tmnames(&string_table));
 
         LuaState {
             constants: Rc::new(Vec::new()),
@@ -483,6 +494,7 @@ impl LuaState {
                 function: None,
                 is_main: true,
                 context: Rc::new(RefCell::new(ThreadContext::default())),
+                c_state: std::cell::Cell::new(std::ptr::null_mut()),
             },
             call_stack: Vec::with_capacity(32),
             current_thread: None,
@@ -506,6 +518,7 @@ impl LuaState {
             cached_gc_key: std::cell::RefCell::new(None),
             last_gc_estimate: 0,
             c_safety_keepalive: Vec::new(),
+            allocf_ud: std::ptr::null_mut(),
         }
     }
 
@@ -617,8 +630,8 @@ impl LuaState {
         let stack = Self::init_stack();
         let top = stack.len();
 
-        let string_table = StringTable::new();
-        let tmnames = init_tmnames(&string_table);
+        let string_table = Rc::new(StringTable::new());
+        let tmnames = Rc::new(init_tmnames(&string_table));
 
         let state = LuaState {
             constants: Rc::new(Vec::new()),
@@ -683,6 +696,7 @@ impl LuaState {
                 function: None,
                 is_main: true,
                 context: Rc::new(RefCell::new(ThreadContext::default())),
+                c_state: std::cell::Cell::new(std::ptr::null_mut()),
             },
             call_stack: Vec::with_capacity(32),
             current_thread: None,
@@ -706,8 +720,119 @@ impl LuaState {
             cached_gc_key: std::cell::RefCell::new(None),
             last_gc_estimate: 0,
             c_safety_keepalive: Vec::new(),
+            allocf_ud: std::ptr::null_mut(),
         };
         state
+    }
+
+    /// 创建新 thread，共享原 L 的全局状态（globals, registry, string_table, gc 等），
+    /// 但有独立的 stack 和执行状态。对应 C Lua 的 lua_newthread。
+    ///
+    /// 共享字段（对应 C Lua 中 G(L) 共享部分）：
+    /// - gc / global_state: 共享 GC 状态
+    /// - globals / registry: 共享全局表和注册表（Table 是 Rc<RefCell<TableData>>）
+    /// - string_table: 共享字符串表（Rc<StringTable>）
+    /// - tmnames: 共享元方法名数组（Rc<Box<[LuaString; TM_N]>>）
+    /// - dmt: 共享默认元表（DefaultMetatables::clone 共享内部 Table Rc）
+    /// - main_thread: 共享主线程对象
+    /// - weak_tables / finobj_list / ud_finobj_list: 共享 GC 跟踪列表
+    /// - file_handles / popen_handles / io_input_handle / io_output_handle: 共享文件句柄
+    /// - allocf_ud: 共享 C allocator userdata（skynet 的 snlua 指针）
+    ///
+    /// 独立字段（对应 C Lua 中 lua_State 独有部分）：
+    /// - stack / top / base / pc / call_info / call_stack: 独立执行栈
+    /// - constants / code / upval_descs / protos / closure_upvals: 独立函数上下文
+    /// - hook_func / hook_mask 等: 独立 debug hook
+    /// - last_error_*/pending_*: 独立错误状态
+    ///
+    /// 注：stdout 字段无法共享（Box<dyn Write> 不 Clone），新 thread 创建自己的 stdout handle，
+    /// 底层 fd 与原 L 相同（std::io::stdout() 全局共享），io.write 输出仍一致。
+    pub fn new_thread(&self) -> Self {
+        let stack = Self::init_stack();
+        let top = stack.len();
+
+        LuaState {
+            // === 共享字段 ===
+            gc: Rc::clone(&self.gc),
+            globals: self.globals.clone(),
+            registry: self.registry.clone(),
+            string_table: Rc::clone(&self.string_table),
+            tmnames: Rc::clone(&self.tmnames),
+            dmt: self.dmt.clone(),
+            global_state: Rc::clone(&self.global_state),
+            main_thread: self.main_thread.clone(),
+            weak_tables: self.weak_tables.clone(),
+            finobj_list: self.finobj_list.clone(),
+            ud_finobj_list: self.ud_finobj_list.clone(),
+            file_handles: self.file_handles.clone(),
+            popen_handles: self.popen_handles.clone(),
+            io_input_handle: self.io_input_handle,
+            io_output_handle: self.io_output_handle,
+            allocf_ud: self.allocf_ud,
+            warn_on: self.warn_on,
+            warn_pending: self.warn_pending,
+
+            // === 独立字段（执行栈和函数上下文）===
+            constants: Rc::new(Vec::new()),
+            code: Rc::new(Vec::new()),
+            upval_descs: Rc::new(Vec::new()),
+            protos: Rc::new(Vec::new()),
+            top,
+            base: 0,
+            pc: 0,
+            trap: false,
+            num_params: 0,
+            is_vararg: false,
+            proto_flag: 0,
+            nextraargs: 0,
+            closure_upvals: Vec::new(),
+            open_upvals: Vec::new(),
+            open_upval: None,
+            tbc_list: None,
+            twups_linked: false,
+            is_in_twups: false,
+            stack,
+            api_func_base: 0,
+            n_ccalls: 0,
+            n_ny_calls: 0,
+            stdout: Box::new(std::io::stdout()),
+            io_output: None,
+            ci: None,
+            call_info: Vec::new(),
+            last_traceback: String::new(),
+            last_error_msg: String::new(),
+            last_error_value: None,
+            pending_error: None,
+            error_no_prefix: false,
+            pending_yield: None,
+            last_c_function: None,
+            math_random_state: None,
+            hook_func: None,
+            hook_mask: 0,
+            hook_count: 0,
+            current_hook_count: 0,
+            hook_old_pc: 0,
+            allowhook: true,
+            call_stack: Vec::with_capacity(32),
+            current_thread: None,
+            caller_gc_stacks: Vec::new(),
+            pcall_protection_stack: Vec::new(),
+            concat_gc_counter: std::cell::Cell::new(0),
+            concat_gc_interval: std::cell::Cell::new(32768),
+            gc_closing: false,
+            exit_requested: None,
+            transferinfo_ftransfer: 0,
+            transferinfo_ntransfer: 0,
+            pending_return_adjust: None,
+            last_error_call_info: None,
+            last_close_frame: None,
+            close_error_status: None,
+            force_noyield_close: false,
+            cached_mode_key: std::cell::RefCell::new(None),
+            cached_gc_key: std::cell::RefCell::new(None),
+            last_gc_estimate: 0,
+            c_safety_keepalive: Vec::new(),
+        }
     }
 
     /// 执行 Lua 字节码 (顶层主函数)
@@ -767,8 +892,8 @@ impl LuaState {
             t
         };
 
-        let string_table = StringTable::new();
-        let tmnames = init_tmnames(&string_table);
+        let string_table = Rc::new(StringTable::new());
+        let tmnames = Rc::new(init_tmnames(&string_table));
 
         LuaState {
             constants: proto.constants.clone(),
@@ -833,6 +958,7 @@ impl LuaState {
                 function: None,
                 is_main: true,
                 context: Rc::new(RefCell::new(ThreadContext::default())),
+                c_state: std::cell::Cell::new(std::ptr::null_mut()),
             },
             call_stack: Vec::with_capacity(32),
             current_thread: None,
@@ -856,6 +982,7 @@ impl LuaState {
             cached_gc_key: std::cell::RefCell::new(None),
             last_gc_estimate: 0,
             c_safety_keepalive: Vec::new(),
+            allocf_ud: std::ptr::null_mut(),
         }
     }
 }
@@ -2048,11 +2175,13 @@ impl LuaState {
                 if !matches!(&result, Ok(VmResult::Yield { .. })) {
                     self.call_stack = saved_call_stack_frames;
                 } else {
-                    // yield: 合并残留帧（如果有）到 saved 帧之前
-                    // 通常 yield 时 call_stack 包含被中断的调用帧
-                    let mut remaining = std::mem::take(&mut self.call_stack);
-                    remaining.extend(saved_call_stack_frames);
-                    self.call_stack = remaining;
+                    // yield: 合并残留帧（被中断的内层调用帧）到 saved 帧（外层调用帧）之后
+                    // call_stack 是栈结构：外层帧在底部（先 push），内层帧在顶部（后 push）
+                    // OP_RETURN 从顶部 pop（先 pop 内层帧），所以顺序必须是 [outer..., inner...]
+                    let remaining = std::mem::take(&mut self.call_stack);
+                    let mut combined = saved_call_stack_frames;
+                    combined.extend(remaining);
+                    self.call_stack = combined;
                 }
                 // 恢复 n_ccalls (对应 C 的 decnny / longjmp 恢复 ci->nCcalls)。
                 // 非 yield 路径下恢复到 pcall 调用前的值:
@@ -2416,6 +2545,14 @@ impl LuaState {
         self.api_func_base = saved_api_base;
         self.n_ccalls = self.n_ccalls.saturating_sub(1);
         self.call_info.pop();
+
+        // 检查 C 函数内部是否发生了 yield（通过 lua_pcall → pcall → pending_yield）
+        // 对应 C Lua 中 yield 通过 longjmp 跨 C 函数传播。
+        // 注意: 不 take pending_yield，留给外层 call_c_function 处理（多层 C 调用传播）
+        if self.pending_yield.is_some() {
+            // yield: 不处理结果，返回 LUA_YIELD
+            return LUA_YIELD;
+        }
 
         // 错误路径：lua_error 触发 panic + pending_error
         if let Err(payload) = panic_result {

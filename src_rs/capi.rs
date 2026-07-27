@@ -24,7 +24,10 @@ use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::ptr;
 use std::rc::Rc;
 
-use crate::objects::{CClosure, LCFunction, LClosure, LuaType, NilKind, Proto, TValue, Table, Udata};
+use crate::objects::{
+    CClosure, LCFunction, LClosure, LuaThread, LuaType, NilKind, Proto, TValue, Table,
+    ThreadContext, ThreadStatus, Udata,
+};
 use crate::state::LuaState;
 use crate::strings::LuaString;
 use crate::vm::F2IMode;
@@ -157,15 +160,18 @@ pub fn lua_upvalueindex(i: c_int) -> c_int {
 
 /// 创建新的 Lua state。
 ///
-/// 对应 C 的 lua_newstate（简化版，忽略 alloc/seed 参数）。
+/// 对应 C 的 lua_newstate。
+/// 保存 allocf 的 ud 到 LuaState.allocf_ud，供 lua_getallocf 取回。
+/// （Rust 用自己的分配器，忽略 f；seed 由 LuaState::new 内部生成。）
 /// 返回的指针需要由 lua_close 释放。
 #[no_mangle]
 pub extern "C" fn lua_newstate(
     _f: *mut c_void,
-    _ud: *mut c_void,
+    ud: *mut c_void,
     _seed: std::ffi::c_uint,
 ) -> *mut lua_State {
-    let state = LuaState::new();
+    let mut state = LuaState::new();
+    state.allocf_ud = ud;
     Box::into_raw(Box::new(state))
 }
 
@@ -179,10 +185,84 @@ pub extern "C" fn lua_close(L: *mut lua_State) {
     }
 }
 
+/// lua_newthread: 创建新线程（coroutine）。
+///
+/// Lua 5.5 标准 C API。创建一个共享全局状态但有独立栈的新 `lua_State`。
+/// 新 state 通过 `LuaState::new_thread` 创建，共享原 L 的 globals/registry/string_table/gc 等，
+/// 但拥有独立的 stack/call_info/执行状态。
+///
+/// 同时创建一个 `TValue::Thread` 并 push 到 L 的栈上（对应 C 中 newthread 把 thread
+/// 对象留在栈上的语义），让 Lua 代码能引用此线程。`LuaThread.c_state` 保存新 state 指针，
+/// 供 `lua_tothread` 反查。
+///
+/// 返回的指针需要由调用方持有（通常存在 userdata 的 uservalue 中），
+/// 不可通过 lua_close 关闭（关闭主 L 时会一并释放所有 thread）。
+#[no_mangle]
+pub extern "C" fn lua_newthread(L: *mut lua_State) -> *mut lua_State {
+    if L.is_null() {
+        return ptr::null_mut();
+    }
+    let L_ref = unsafe { &mut *L };
+    let new_state = L_ref.new_thread();
+    let new_state_ptr: *mut lua_State = Box::into_raw(Box::new(new_state));
+
+    // 创建 LuaThread 并关联到新 state
+    let context = Rc::new(std::cell::RefCell::new(ThreadContext::default()));
+    context.borrow_mut().status = ThreadStatus::Suspended;
+    let thread = LuaThread {
+        stack: Vec::new(),
+        status: ThreadStatus::Suspended,
+        function: None,
+        is_main: false,
+        context: context.clone(),
+        c_state: std::cell::Cell::new(new_state_ptr),
+    };
+    let thread_rc = Rc::new(thread);
+    // 设置 thread_ref，让 coroutine.running() 能返回同一对象
+    context.borrow_mut().thread_ref = Rc::downgrade(&thread_rc);
+
+    // 设置新 state 的 current_thread（让 lua_resume 能找到 ThreadContext）
+    unsafe {
+        (*new_state_ptr).current_thread = Some(context);
+    }
+
+    // push TValue::Thread 到 L 的栈上（对应 C 中 lua_newthread 留下 thread 对象的语义）
+    L_ref.stack.push(TValue::Thread(thread_rc));
+    new_state_ptr
+}
+
+/// lua_closethread: 关闭线程（coroutine）。
+///
+/// Lua 5.5 标准 C API。关闭 thread 中的 TBC 变量并重置状态。
+/// 简化实现为空操作，返回 LUA_OK（0）。
+#[no_mangle]
+pub extern "C" fn lua_closethread(_L: *mut lua_State, _from: *mut lua_State) -> c_int {
+    0 // LUA_OK
+}
+
 /// luaL_newstate —— 兼容 lauxlib.h
 #[no_mangle]
 pub extern "C" fn luaL_newstate() -> *mut lua_State {
-    lua_newstate(ptr::null_mut(), ptr::null_mut(), 0)
+    lua_newstate(ptr::null_mut(), ptr::null_mut(), luaL_makeseed(ptr::null_mut()))
+}
+
+/// luaL_makeseed: 生成随机种子。
+///
+/// 对应 C 的 lauxlib.c::luaL_makeseed。用当前时间和局部变量地址生成种子，
+/// 供 luaL_newstate → lua_newstate 创建 Lua state 时使用。
+/// 简化实现：用 time + 局部变量地址混合，与 C 的 luai_makeseed 等价。
+#[no_mangle]
+pub extern "C" fn luaL_makeseed(_L: *mut lua_State) -> c_uint {
+    // 对应 C 的 luai_makeseed: time(NULL) + 局部变量地址
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    // 局部变量地址（对应 C 的 addbuff(b, b)）
+    let local_addr = &t as *const _ as usize;
+    let mut res = t as u32;
+    res ^= res.rotate_left(7).wrapping_add(local_addr as u32);
+    res
 }
 
 // ============================================================================
@@ -1189,10 +1269,11 @@ unsafe extern "C" fn default_allocf(
 }
 
 #[no_mangle]
-pub extern "C" fn lua_getallocf(_L: *mut lua_State, ud: *mut *mut c_void) -> lua_Alloc {
+pub extern "C" fn lua_getallocf(L: *mut lua_State, ud: *mut *mut c_void) -> lua_Alloc {
+    let L = unsafe { &*L };
     if !ud.is_null() {
         unsafe {
-            *ud = ptr::null_mut();
+            *ud = L.allocf_ud;
         }
     }
     Some(default_allocf)
@@ -1933,15 +2014,10 @@ pub extern "C" fn lua_getinfo(
 
     if what_str.contains('n') {
         // name/namewhat: 从调用者代码分析
-        // 对应 C getfuncname: 仅当调用者是 Lua 函数时分析
-        if ci.is_c {
-            // C 函数帧: name=NULL, namewhat=""（无调用点代码可分析）
-            unsafe {
-                (*ar).name = ptr::null();
-                (*ar).namewhat = EMPTY_STR.as_ptr() as *const c_char;
-            }
-        } else if let Some(ref caller_proto) = ci.caller_proto {
-            // Lua 函数帧: 从 caller_proto 的 saved_pc 处分析调用指令
+        // 对应 C getfuncname: 从 caller_proto 的 saved_pc 处分析调用指令。
+        // C 函数帧和 Lua 函数帧都存储了 caller_proto（execute.rs 中 push 时设置），
+        // 统一处理。仅当 caller_proto 为 None（如 hook 帧）时才返回空。
+        if let Some(ref caller_proto) = ci.caller_proto {
             let (name, namewhat) = crate::execute::compute_name_from_proto(caller_proto, ci.saved_pc);
             if name.is_empty() {
                 unsafe {
@@ -2355,6 +2431,94 @@ pub extern "C" fn luaL_loadbuffer(
     luaL_loadbufferx(L, buff, size, name, ptr::null())
 }
 
+/// luaL_loadfilex: 从文件加载 Lua 代码块。
+///
+/// Lua 5.5 标准 C API。读取文件内容，跳过 `#!` shebang 行，调用
+/// `luaL_loadbufferx` 加载。`filename` 为 NULL 时从 stdin 读取。
+/// `mode` 为 "b"（仅字节码）、"t"（仅文本）、"bt"（两者皆可）或 NULL。
+#[no_mangle]
+pub extern "C" fn luaL_loadfilex(
+    L: *mut lua_State,
+    filename: *const c_char,
+    mode: *const c_char,
+) -> c_int {
+    use std::io::Read;
+
+    // 读取文件内容
+    let content: Vec<u8> = if filename.is_null() {
+        // 从 stdin 读取
+        let mut buf = Vec::new();
+        match std::io::stdin().lock().read_to_end(&mut buf) {
+            Ok(_) => buf,
+            Err(_) => {
+                let L = unsafe { &mut *L };
+                L.push_string("cannot read from stdin");
+                return 3; // LUA_ERRSYNTAX
+            }
+        }
+    } else {
+        let fname = unsafe { CStr::from_ptr(filename) };
+        let path = match fname.to_str() {
+            Ok(s) => s,
+            Err(_) => {
+                let L = unsafe { &mut *L };
+                L.push_string("invalid filename");
+                return 3; // LUA_ERRSYNTAX
+            }
+        };
+        match std::fs::File::open(path) {
+            Ok(mut f) => {
+                let mut buf = Vec::new();
+                match f.read_to_end(&mut buf) {
+                    Ok(_) => buf,
+                    Err(e) => {
+                        let L = unsafe { &mut *L };
+                        L.push_string(&format!("cannot read {}: {}", path, e));
+                        return 3; // LUA_ERRSYNTAX
+                    }
+                }
+            }
+            Err(e) => {
+                let L = unsafe { &mut *L };
+                L.push_string(&format!("cannot open {}: {}", path, e));
+                return 6; // LUA_ERRFILE = LUA_ERRERR(5) + 1
+            }
+        }
+    };
+
+    // 跳过 #! shebang 行（Lua 标准行为）
+    let content = if content.starts_with(b"#!") {
+        // 找到第一个换行符后的内容
+        if let Some(pos) = content.iter().position(|&b| b == b'\n') {
+            &content[pos + 1..]
+        } else {
+            &content[..]
+        }
+    } else {
+        &content[..]
+    };
+
+    // 构造 chunk name: "@filename" (必须 NUL 终止，因为 luaL_loadbufferx 内部用 CStr::from_ptr)
+    let name_buf: Vec<u8> = if filename.is_null() {
+        b"=stdin\0".to_vec()
+    } else {
+        let fname = unsafe { CStr::from_ptr(filename) };
+        let mut name = Vec::with_capacity(fname.to_bytes().len() + 2); // +1 for '@', +1 for NUL
+        name.push(b'@');
+        name.extend_from_slice(fname.to_bytes());
+        name.push(0); // NUL 终止符
+        name
+    };
+
+    luaL_loadbufferx(
+        L,
+        content.as_ptr() as *const c_char,
+        content.len(),
+        name_buf.as_ptr() as *const c_char,
+        mode,
+    )
+}
+
 /// luaL_loadstring: 加载字符串
 #[no_mangle]
 pub extern "C" fn luaL_loadstring(L: *mut lua_State, s: *const c_char) -> c_int {
@@ -2506,9 +2670,10 @@ pub extern "C" fn luaL_requiref(
     openf: lua_CFunction,
     glb: c_int,
 ) {
-    // 获取 registry[LUA_LOADED_TABLE]
-    // LUA_LOADED_TABLE = LUA_REGISTRYINDEX 下 "LOADED" 子表
-    // 简化：直接用 registry 的 hash 部分，key 是模块名
+    // 对应 C 的 luaL_requiref:
+    //   1. 检查 package.loaded[modname] (= registry["_LOADED"][modname])
+    //   2. 若未加载，调用 openf(modname)，结果存入 package.loaded[modname]
+    //   3. 可选设置全局变量 modname = result
     let L = unsafe { &mut *L };
     let modname_str = if modname.is_null() {
         String::new()
@@ -2518,10 +2683,23 @@ pub extern "C" fn luaL_requiref(
             .into_owned()
     };
 
-    // 检查是否已加载：registry[modname]
     let mod_key = crate::state::str_to_ls(&L.string_table, &modname_str);
-    let loaded_val = L
-        .registry
+
+    // 获取 registry["_LOADED"] 表（与 package.loaded 共享同一 Rc 引用）
+    let loaded_key = crate::state::str_to_ls(&L.string_table, "_LOADED");
+    let loaded_table = match L.registry.get(&TValue::Str(loaded_key.clone())) {
+        Some(TValue::Table(t)) => t,
+        _ => {
+            // _LOADED 表不存在：创建并注册到 registry
+            let t = crate::table::Table::new();
+            L.registry
+                .set(TValue::Str(loaded_key), TValue::Table(t.clone()));
+            t
+        }
+    };
+
+    // 检查是否已加载：_LOADED[modname]
+    let loaded_val = loaded_table
         .get(&TValue::Str(mod_key.clone()))
         .unwrap_or(TValue::Nil(NilKind::Strict));
 
@@ -2530,8 +2708,6 @@ pub extern "C" fn luaL_requiref(
         L.stack.push(loaded_val);
     } else {
         // 未加载，调用 openf
-        // push openf 作为 C 函数到栈顶，push modname 作为参数，pcall 调用
-        // pcall 内部会保存/恢复 api_func_base，无需手动设置
         L.stack.push(TValue::LCFn(LCFunction { func: openf }));
         L.push_string(&modname_str);
         let status = L.pcall(1, 1, 0);
@@ -2541,10 +2717,10 @@ pub extern "C" fn luaL_requiref(
             L.push_string(&modname_str);
         }
 
-        // 注册到 registry[modname] = result
+        // 注册到 package.loaded[modname] = result
         if let Some(val) = L.stack.last() {
             let val = val.clone();
-            L.registry.set(TValue::Str(mod_key.clone()), val);
+            loaded_table.set(TValue::Str(mod_key.clone()), val);
         }
 
         // 如果 glb，设置全局变量
@@ -2612,6 +2788,18 @@ pub extern "C" fn luaL_traceback(
 // ============================================================================
 // 每个函数调用对应的 Rust open_*_lib，然后 push 库表（或全局表）到栈顶，
 // 返回 1。签名与 C 实现一致：int luaopen_xxx(lua_State *L)。
+
+/// luaL_openselectedlibs: 选择性打开标准库（Lua 5.5 标准 C API）。
+///
+/// 对应 C 的 `luaL_openselectedlibs(L, load, preload)`。lua-rs 不支持选择性打开
+/// （load/preload 参数被忽略），调用一次即打开所有标准库。`luaL_openlibs(L)`
+/// 在 lualib.h 中定义为 `luaL_openselectedlibs(L, ~0, 0)`，skynet 等第三方 C
+/// 代码会调用 `luaL_openlibs`，此函数确保标准库被正确初始化。
+#[no_mangle]
+pub extern "C" fn luaL_openselectedlibs(L: *mut lua_State, _load: c_int, _preload: c_int) {
+    let L = unsafe { &mut *L };
+    L.open_selected_libs(-1, 0);
+}
 
 /// luaopen_base: 打开基础库
 #[no_mangle]
@@ -2751,6 +2939,865 @@ pub extern "C" fn luaopen_package(L: *mut lua_State) -> c_int {
         .unwrap_or(TValue::Nil(NilKind::Strict));
     L.stack.push(val);
     1
+}
+
+// ============================================================================
+// skynet 兼容 API — Lua 5.5 标准 C API 补全
+// ============================================================================
+// 本区域补全 skynet 框架链接 lua-rs 静态库时所需的 24 个标准 C API。
+// 实现遵循 lua.h / lauxlib.h 的签名与语义，部分复杂 API（如 coroutine）
+// 做了简化处理，注释中标注简化点。
+
+// ---------------------------------------------------------------------------
+// 类型定义（与 lua.h / lauxlib.h 对齐）
+// ---------------------------------------------------------------------------
+
+/// lua_Hook — 调试钩子回调类型（对应 C lua.h 的 lua_Hook）
+pub type lua_Hook = unsafe extern "C" fn(L: *mut lua_State, ar: *mut lua_Debug);
+
+/// lua_KContext — 延续函数上下文类型（对应 C 的 intptr_t）
+pub type lua_KContext = isize;
+
+/// lua_KFunction — 延续函数类型（对应 C lua.h 的 lua_KFunction）
+pub type lua_KFunction =
+    unsafe extern "C" fn(L: *mut lua_State, status: c_int, ctx: lua_KContext) -> c_int;
+
+/// LUAL_BUFFERSIZE — 初始内联缓冲区大小（与 C luaconf.h 一致：16 * sizeof(void*) * sizeof(lua_Number)）
+pub const LUAL_BUFFERSIZE: usize = 16 * std::mem::size_of::<*mut c_void>() * std::mem::size_of::<lua_Number>();
+
+/// luaL_Buffer — 字符串拼接缓冲区（与 C lauxlib.h 布局兼容）
+///
+/// 对应 C 的 `struct luaL_Buffer`。使用 `#[repr(C)]` 确保与 C 代码在栈上分配的
+/// luaL_Buffer 布局一致，使 C 代码传入的指针可被 Rust 函数安全操作。
+/// 字段 b 初始指向 init 内联缓冲区，数据超过 LUAL_BUFFERSIZE 时切换到堆分配。
+#[repr(C)]
+pub struct luaL_Buffer {
+    /// 缓冲区当前地址（初始指向 init，扩容后指向堆分配的内存）
+    b: *mut c_char,
+    /// 缓冲区总容量
+    size: usize,
+    /// 已使用的字节数
+    n: usize,
+    /// 关联的 lua_State（供 pushresult/addvalue 使用）
+    L: *mut lua_State,
+    /// 初始内联缓冲区（避免小字符串堆分配）
+    init: [u8; LUAL_BUFFERSIZE],
+}
+
+// ---------------------------------------------------------------------------
+// 内部辅助：错误消息构造
+// ---------------------------------------------------------------------------
+
+/// 将 &str 压栈为 Lua 字符串（不依赖 CString，避免 NUL 截断问题）
+fn push_str_to_stack(L: *mut lua_State, s: &str) {
+    let L = unsafe { &mut *L };
+    L.push_string(s);
+}
+
+// ---------------------------------------------------------------------------
+// 1. 类型检查 API（对应 C lauxlib.cpp）
+// ---------------------------------------------------------------------------
+
+/// luaL_checktype: 检查 idx 处参数类型是否为 t，不匹配则 luaL_typeerror。
+///
+/// 对应 C lauxlib.cpp::luaL_checktype。通过 lua_type 获取实际类型并与 t 比较，
+/// 不匹配时调用 luaL_typeerror 抛错（不返回）。
+#[no_mangle]
+pub extern "C-unwind" fn luaL_checktype(L: *mut lua_State, arg: c_int, t: c_int) {
+    let actual = lua_type(L, arg);
+    if actual != t {
+        let tname = lua_typename(L, t);
+        luaL_typeerror(L, arg, tname);
+    }
+}
+
+/// luaL_checkany: 检查 idx 处是否有参数（非 NONE），否则 luaL_argerror。
+///
+/// 对应 C lauxlib.cpp::luaL_checkany。lua_type 返回 LUA_TNONE 表示无参数。
+#[no_mangle]
+pub extern "C-unwind" fn luaL_checkany(L: *mut lua_State, arg: c_int) {
+    if lua_type(L, arg) == LUA_TNONE {
+        let msg = CString::new("value expected").unwrap();
+        luaL_argerror(L, arg, msg.as_ptr());
+    }
+}
+
+/// luaL_checkinteger: 检查并返回整数，非数字则 luaL_typeerror。
+///
+/// 对应 C lauxlib.cpp::luaL_checkinteger。用 lua_tointegerx 尝试转换，
+/// isnum=0 表示非数字，抛出类型错误。
+#[no_mangle]
+pub extern "C-unwind" fn luaL_checkinteger(L: *mut lua_State, arg: c_int) -> lua_Integer {
+    let mut isnum: c_int = 0;
+    let n = lua_tointegerx(L, arg, &mut isnum);
+    if isnum == 0 {
+        let tname = lua_typename(L, LUA_TNUMBER);
+        luaL_typeerror(L, arg, tname);
+    }
+    n
+}
+
+/// luaL_checknumber: 检查并返回数字，非数字则 luaL_typeerror。
+///
+/// 对应 C lauxlib.cpp::luaL_checknumber。用 lua_tonumberx 尝试转换。
+#[no_mangle]
+pub extern "C-unwind" fn luaL_checknumber(L: *mut lua_State, arg: c_int) -> lua_Number {
+    let mut isnum: c_int = 0;
+    let n = lua_tonumberx(L, arg, &mut isnum);
+    if isnum == 0 {
+        let tname = lua_typename(L, LUA_TNUMBER);
+        luaL_typeerror(L, arg, tname);
+    }
+    n
+}
+
+/// luaL_optinteger: 可选整数，nil 返回 def，非数字则 luaL_typeerror。
+///
+/// 对应 C lauxlib.cpp::luaL_optinteger。idx 处为 nil 时返回 def，
+/// 否则按 luaL_checkinteger 语义检查。
+#[no_mangle]
+pub extern "C-unwind" fn luaL_optinteger(
+    L: *mut lua_State,
+    arg: c_int,
+    def: lua_Integer,
+) -> lua_Integer {
+    if lua_type(L, arg) == LUA_TNIL {
+        return def;
+    }
+    luaL_checkinteger(L, arg)
+}
+
+/// luaL_optnumber: 可选数字，nil 返回 def，非数字则 luaL_typeerror。
+///
+/// 对应 C lauxlib.cpp::luaL_optnumber。
+#[no_mangle]
+pub extern "C-unwind" fn luaL_optnumber(
+    L: *mut lua_State,
+    arg: c_int,
+    def: lua_Number,
+) -> lua_Number {
+    if lua_type(L, arg) == LUA_TNIL {
+        return def;
+    }
+    luaL_checknumber(L, arg)
+}
+
+/// luaL_argerror: 抛出参数错误。
+///
+/// 对应 C lauxlib.cpp::luaL_argerror。调用 lua_getstack/lua_getinfo 获取
+/// 调用者函数名，格式化为 "bad argument #N to 'func' (msg)"（与 C 一致）。
+/// 若无法获取函数名，使用 "?" 作为函数名（与 C 一致）。
+#[no_mangle]
+pub extern "C-unwind" fn luaL_argerror(
+    L: *mut lua_State,
+    arg: c_int,
+    extramsg: *const c_char,
+) -> c_int {
+    let extra = if extramsg.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(extramsg) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    // 对应 C luaL_argerror: level=0 获取当前运行的 C 函数帧
+    // （luaL_argerror 本身不在 Lua 栈中，level=0 即调用它的 C 函数）
+    let mut ar: lua_Debug = unsafe { std::mem::zeroed() };
+    if lua_getstack(L, 0, &mut ar) == 0 {
+        let msg = format!("bad argument #{} ({})", arg, extra);
+        push_str_to_stack(L, &msg);
+        return lua_error(L);
+    }
+    // 获取 n(名字) 和 t(extraargs/istailcall) 信息
+    let what = b"nt\0";
+    lua_getinfo(L, what.as_ptr() as *const c_char, &mut ar);
+    // 对应 C luaL_argerror 的 argword/arg 调整逻辑
+    let extraargs = ar.extraargs as c_int;
+    let namewhat_str = if ar.namewhat.is_null() {
+        ""
+    } else {
+        unsafe { CStr::from_ptr(ar.namewhat) }
+            .to_str()
+            .unwrap_or("")
+    };
+    // 处理 method（冒号语法）和 extraargs
+    let (argword, adj_arg, is_self_error) = if arg <= extraargs {
+        ("extra argument", arg, false)
+    } else {
+        let adj = arg - extraargs;
+        if namewhat_str == "method" {
+            let adj2 = adj - 1;
+            if adj2 == 0 {
+                // 错误在 self 参数中
+                (".", 0, true)
+            } else {
+                ("argument", adj2, false)
+            }
+        } else {
+            ("argument", adj, false)
+        }
+    };
+    // 对应 C: if (ar.name == NULL) ar.name = "?";
+    let name_str = if ar.name.is_null() {
+        "?".to_string()
+    } else {
+        unsafe { CStr::from_ptr(ar.name) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let msg = if is_self_error {
+        // self 参数错误：calling 'name' on bad self (msg)
+        format!("calling '{}' on bad self ({})", name_str, extra)
+    } else {
+        format!("bad {} #{} to '{}' ({})", argword, adj_arg, name_str, extra)
+    };
+    push_str_to_stack(L, &msg);
+    lua_error(L)
+}
+
+/// luaL_typeerror: 抛出类型错误。
+///
+/// 对应 C lauxlib.cpp::luaL_typeerror。格式化为 "tname expected, got typearg"，
+/// 然后调用 luaL_argerror。typearg 优先取 __name 元字段，否则用 lua_typename。
+#[no_mangle]
+pub extern "C-unwind" fn luaL_typeerror(
+    L: *mut lua_State,
+    arg: c_int,
+    tname: *const c_char,
+) -> c_int {
+    let tname_str = if tname.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(tname) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    // 获取实际参数的类型名
+    let typearg = {
+        let L_ref = unsafe { &*L };
+        match index2val(L_ref, arg) {
+            // 轻量 userdata 特殊处理（与 C 一致）
+            Some(TValue::LightUserData(_)) => "light userdata".to_string(),
+            // 其他类型用 lua_typename
+            Some(v) => {
+                let tn = lua_typename(L, lua_type_code(v.ty()));
+                if tn.is_null() {
+                    "no value".to_string()
+                } else {
+                    unsafe { CStr::from_ptr(tn) }
+                        .to_string_lossy()
+                        .into_owned()
+                }
+            }
+            None => "no value".to_string(),
+        }
+    };
+    let msg = format!("{} expected, got {}", tname_str, typearg);
+    let cmsg = CString::new(msg).unwrap();
+    luaL_argerror(L, arg, cmsg.as_ptr())
+}
+
+/// luaL_checkudata: 检查 userdata 是否有指定名称的元表，不匹配则 luaL_typeerror。
+///
+/// 对应 C lauxlib.cpp::luaL_checkudata。先调用 luaL_testudata 检查，
+/// 不匹配时调用 luaL_typeerror 抛错。返回 userdata 的数据区指针。
+#[no_mangle]
+pub extern "C-unwind" fn luaL_checkudata(
+    L: *mut lua_State,
+    ud: c_int,
+    tname: *const c_char,
+) -> *mut c_void {
+    // luaL_testudata 逻辑：lua_touserdata 获取指针，lua_getmetatable 获取元表，
+    // luaL_getmetatable 获取注册表中的元表，lua_rawequal 比较。
+    let p = lua_touserdata(L, ud);
+    if !p.is_null() {
+        if lua_getmetatable(L, ud) != 0 {
+            // 栈顶是 userdata 的元表
+            luaL_getmetatable(L, tname);
+            // 栈顶是注册表中的元表，-2 是 userdata 的元表
+            if lua_rawequal(L, -1, -2) != 0 {
+                // 匹配：弹出两个元表，返回指针
+                lua_pop(L, 2);
+                return p;
+            }
+            // 不匹配：弹出两个元表
+            lua_pop(L, 2);
+        }
+    }
+    // 不匹配或非 userdata：抛出类型错误
+    let tname_str = if tname.is_null() {
+        String::new()
+    } else {
+        unsafe { CStr::from_ptr(tname) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let cmsg = CString::new(tname_str).unwrap_or_else(|_| CString::new("").unwrap());
+    luaL_typeerror(L, ud, cmsg.as_ptr());
+    std::ptr::null_mut()
+}
+
+/// luaL_getmetafield: 获取 idx 处对象的元表中名为 name 的字段，压栈并返回类型。
+///
+/// 对应 C lauxlib.cpp::luaL_getmetafield。先 lua_getmetatable 获取元表，
+/// 然后 lua_rawget 查找字段；nil 时弹出元表和字段，返回 LUA_TNIL。
+#[no_mangle]
+pub extern "C" fn luaL_getmetafield(
+    L: *mut lua_State,
+    obj: c_int,
+    event: *const c_char,
+) -> c_int {
+    // 没有元表：返回 LUA_TNIL（不压栈）
+    if lua_getmetatable(L, obj) == 0 {
+        return LUA_TNIL;
+    }
+    // 栈顶是元表，push event 名字，rawget 查找
+    lua_pushstring(L, event);
+    // lua_rawget 弹出 key，压入 value，返回 value 类型
+    let tt = lua_rawget(L, -2);
+    if tt == LUA_TNIL {
+        // 字段是 nil：弹出元表和 nil（2 个元素）
+        lua_pop(L, 2);
+    } else {
+        // 字段非 nil：移除元表（保留字段在栈顶）
+        lua_remove(L, -2);
+    }
+    tt
+}
+
+/// luaL_tolstring: 将 idx 处值转为字符串，压栈并返回指针。
+///
+/// 对应 C lauxlib.cpp::luaL_tolstring。先尝试 __tostring 元方法，
+/// 否则按类型转换：number→数字字符串，string→副本，boolean→"true"/"false"，
+/// nil→"nil"，其他→"type: 0xptr"。
+#[no_mangle]
+pub extern "C" fn luaL_tolstring(
+    L: *mut lua_State,
+    idx: c_int,
+    len: *mut usize,
+) -> *const c_char {
+    let absidx = lua_absindex(L, idx);
+    // 尝试 __tostring 元方法（对应 C 的 luaL_callmeta）
+    if luaL_getmetafield(L, absidx, c"__tostring".as_ptr()) != LUA_TNIL {
+        // 栈顶是 __tostring 元方法，push 对象，调用
+        lua_pushvalue(L, absidx);
+        // lua_callk 会 panic 传播错误（与 C 的 lua_call 一致）
+        lua_callk(L, 1, 1, 0, None);
+        // 检查返回值是否为字符串
+        if lua_isstring(L, -1) == 0 {
+            let msg = CString::new("'__tostring' must return a string").unwrap();
+            push_str_to_stack(L, &msg.to_string_lossy());
+            lua_error(L);
+        }
+    } else {
+        // 无 __tostring：按类型转换
+        let ty = lua_type(L, absidx);
+        match ty {
+            LUA_TNUMBER => {
+                // 数字：用 lua_tolstring 转换（会原地修改栈值为字符串）
+                lua_tolstring(L, absidx, std::ptr::null_mut());
+                lua_pushvalue(L, absidx);
+            }
+            LUA_TSTRING => {
+                lua_pushvalue(L, absidx);
+            }
+            LUA_TBOOLEAN => {
+                let b = lua_toboolean(L, absidx);
+                if b != 0 {
+                    lua_pushstring(L, c"true".as_ptr());
+                } else {
+                    lua_pushstring(L, c"false".as_ptr());
+                }
+            }
+            LUA_TNIL => {
+                lua_pushstring(L, c"nil".as_ptr());
+            }
+            _ => {
+                // 其他类型：尝试 __name 元字段，否则用 typename
+                let tt = luaL_getmetafield(L, absidx, c"__name".as_ptr());
+                let kind = if tt == LUA_TSTRING {
+                    // 栈顶是 __name 字符串
+                    let p = lua_tolstring(L, -1, std::ptr::null_mut());
+                    if !p.is_null() {
+                        unsafe { CStr::from_ptr(p) }
+                            .to_string_lossy()
+                            .into_owned()
+                    } else {
+                        String::new()
+                    }
+                } else {
+                    // 无 __name：用 typename
+                    if tt != LUA_TNIL {
+                        lua_pop(L, 1); // 弹出 nil 或非字符串值
+                    }
+                    let tn = lua_typename(L, ty);
+                    if tn.is_null() {
+                        String::new()
+                    } else {
+                        unsafe { CStr::from_ptr(tn) }
+                            .to_string_lossy()
+                            .into_owned()
+                    }
+                };
+                let ptr = lua_topointer(L, absidx);
+                let msg = format!("{}: {:p}", kind, ptr);
+                if tt == LUA_TSTRING {
+                    // 弹出 __name，push 格式化字符串
+                    lua_pop(L, 1);
+                }
+                push_str_to_stack(L, &msg);
+            }
+        }
+    }
+    // 返回栈顶字符串的指针和长度
+    lua_tolstring(L, -1, len)
+}
+
+// ---------------------------------------------------------------------------
+// 2. Buffer API（对应 C lauxlib.cpp 的 luaL_Buffer 系列）
+// ---------------------------------------------------------------------------
+
+/// luaL_buffinit: 初始化 buffer。
+///
+/// 对应 C lauxlib.cpp::luaL_buffinit。设置 b 指向内联 init 缓冲区。
+/// 简化点：C 版本会 push 一个 light userdata 占位符到栈顶（供 addvalue 的
+/// prepbuffsize 错误路径使用），此简化版不 push 占位符，buffer 期间栈深度不变。
+#[no_mangle]
+pub extern "C" fn luaL_buffinit(L: *mut lua_State, B: *mut luaL_Buffer) {
+    if B.is_null() {
+        return;
+    }
+    unsafe {
+        (*B).b = (*B).init.as_mut_ptr() as *mut c_char;
+        (*B).size = LUAL_BUFFERSIZE;
+        (*B).n = 0;
+        (*B).L = L;
+    }
+}
+
+/// luaL_prepbuffsize: 确保 buffer 有 sz 字节可用空间，返回可用空间起始指针。
+///
+/// 对应 C lauxlib.cpp::luaL_prepbuffsize。当剩余空间不足时扩容：
+/// - 若当前用的是 init 内联缓冲区，malloc 新内存并拷贝
+/// - 若当前用的是堆内存，realloc 扩容
+#[no_mangle]
+pub extern "C" fn luaL_prepbuffsize(B: *mut luaL_Buffer, sz: usize) -> *mut c_char {
+    if B.is_null() {
+        return ptr::null_mut();
+    }
+    unsafe {
+        if (*B).size - (*B).n < sz {
+            // 计算新容量：至少满足需求，且至少翻倍（与 C luaH_resize 类似策略）
+            let need = (*B).n + sz;
+            let new_size = need.max((*B).size * 2);
+            let init_ptr = (*B).init.as_mut_ptr() as *mut c_char;
+            if (*B).b == init_ptr {
+                // 从 init 内联缓冲区升级到堆分配
+                let new_buf = libc::malloc(new_size) as *mut c_char;
+                if new_buf.is_null() {
+                    return ptr::null_mut();
+                }
+                std::ptr::copy_nonoverlapping((*B).b, new_buf, (*B).n);
+                (*B).b = new_buf;
+            } else {
+                // 已是堆分配，realloc 扩容
+                let new_buf =
+                    libc::realloc((*B).b as *mut c_void, new_size) as *mut c_char;
+                if new_buf.is_null() {
+                    return ptr::null_mut();
+                }
+                (*B).b = new_buf;
+            }
+            (*B).size = new_size;
+        }
+        (*B).b.add((*B).n)
+    }
+}
+
+/// luaL_addlstring: 追加长度为 l 的字符串到 buffer。
+///
+/// 对应 C lauxlib.cpp::luaL_addlstring。l=0 时不操作（避免 NULL 解引用）。
+#[no_mangle]
+pub extern "C" fn luaL_addlstring(B: *mut luaL_Buffer, s: *const c_char, l: usize) {
+    if B.is_null() || s.is_null() || l == 0 {
+        return;
+    }
+    let dst = luaL_prepbuffsize(B, l);
+    if dst.is_null() {
+        return;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(s, dst, l);
+        (*B).n += l;
+    }
+}
+
+/// luaL_addvalue: 弹出栈顶字符串追加到 buffer。
+///
+/// 对应 C lauxlib.cpp::luaL_addvalue。用 lua_tolstring 获取栈顶字符串，
+/// 调用 luaL_addlstring 追加，然后 lua_pop 弹出栈顶值。
+#[no_mangle]
+pub extern "C" fn luaL_addvalue(B: *mut luaL_Buffer) {
+    if B.is_null() {
+        return;
+    }
+    let L = unsafe { (*B).L };
+    if L.is_null() {
+        return;
+    }
+    let mut len: usize = 0;
+    let s = lua_tolstring(L, -1, &mut len);
+    if !s.is_null() && len > 0 {
+        luaL_addlstring(B, s, len);
+    }
+    lua_pop(L, 1);
+}
+
+/// luaL_pushresult: 将 buffer 内容作为字符串压栈。
+///
+/// 对应 C lauxlib.cpp::luaL_pushresult。用 lua_pushlstring 把 buffer 内容
+/// 压栈，然后释放堆分配的缓冲区（若已扩容）。
+#[no_mangle]
+pub extern "C" fn luaL_pushresult(B: *mut luaL_Buffer) {
+    if B.is_null() {
+        return;
+    }
+    let L = unsafe { (*B).L };
+    if L.is_null() {
+        return;
+    }
+    unsafe {
+        let s = (*B).b;
+        let n = (*B).n;
+        lua_pushlstring(L, s, n);
+        // 释放堆分配的缓冲区（若 b 不再指向 init）
+        let init_ptr = (*B).init.as_ptr() as *mut c_char;
+        if (*B).b != init_ptr {
+            libc::free((*B).b as *mut c_void);
+        }
+    }
+}
+
+/// luaL_pushresultsize: 增加 sz 字节后压栈结果。
+///
+/// 对应 C lauxlib.cpp::luaL_pushresultsize。先 `luaL_addsize(B, sz)`（即
+/// `B->n += sz`，对应 C 中的宏），再调用 `luaL_pushresult` 把结果压栈。
+#[no_mangle]
+pub extern "C" fn luaL_pushresultsize(B: *mut luaL_Buffer, sz: usize) {
+    if B.is_null() {
+        return;
+    }
+    unsafe {
+        (*B).n += sz;
+    }
+    luaL_pushresult(B);
+}
+
+/// luaL_addstring: 追加以 NUL 结尾的字符串到 buffer。
+///
+/// 对应 C lauxlib.cpp::luaL_addstring。内部用 `strlen(s)` 计算长度后调用
+/// `luaL_addlstring`。
+#[no_mangle]
+pub extern "C" fn luaL_addstring(B: *mut luaL_Buffer, s: *const c_char) {
+    if B.is_null() || s.is_null() {
+        return;
+    }
+    let len = unsafe { libc::strlen(s) };
+    luaL_addlstring(B, s, len);
+}
+
+/// luaL_buffinitsize: 初始化 buffer 并预分配 size 字节。
+///
+/// 对应 C lauxlib.cpp::luaL_buffinitsize。先 luaL_buffinit，再 luaL_prepbuffsize。
+/// 返回可用空间起始指针。
+#[no_mangle]
+pub extern "C" fn luaL_buffinitsize(
+    L: *mut lua_State,
+    B: *mut luaL_Buffer,
+    sz: usize,
+) -> *mut c_char {
+    luaL_buffinit(L, B);
+    luaL_prepbuffsize(B, sz)
+}
+
+// ---------------------------------------------------------------------------
+// 3. Userdata API（对应 C lapi.cpp）
+// ---------------------------------------------------------------------------
+
+/// lua_getiuservalue: 获取 userdata 的第 n 个关联值，压栈并返回类型。
+///
+/// 对应 C lapi.cpp::lua_getiuservalue。n 超出 [1, nuvalue] 范围时压 nil
+/// 返回 LUA_TNONE。
+#[no_mangle]
+pub extern "C" fn lua_getiuservalue(L: *mut lua_State, idx: c_int, n: c_int) -> c_int {
+    let L = unsafe { &mut *L };
+    let off = match index2offset(L, idx) {
+        Some(o) => o,
+        None => {
+            L.stack.push(TValue::Nil(NilKind::Strict));
+            return LUA_TNONE;
+        }
+    };
+    let val = match &L.stack[off] {
+        TValue::UserData(u) => {
+            let n = n as usize;
+            if n >= 1 && n <= u.user_values.len() {
+                u.user_values[n - 1].clone()
+            } else {
+                TValue::Nil(NilKind::Strict)
+            }
+        }
+        _ => TValue::Nil(NilKind::Strict),
+    };
+    let ty = lua_type_code(val.ty());
+    L.stack.push(val);
+    ty
+}
+
+/// lua_setiuservalue: 弹出栈顶值设为 userdata 的第 n 个关联值。
+///
+/// 对应 C lapi.cpp::lua_setiuservalue。n 超出范围时不设置（仍弹出值）。
+/// 返回 1 成功，0 失败（C 版本返回 int，此处省略返回值以匹配签名）。
+#[no_mangle]
+pub extern "C" fn lua_setiuservalue(L: *mut lua_State, idx: c_int, n: c_int) {
+    let L = unsafe { &mut *L };
+    // 先基于当前 top（包含 val）定位 userdata，再 pop val
+    let off = match index2offset(L, idx) {
+        Some(o) => o,
+        None => {
+            L.stack.pop();
+            return;
+        }
+    };
+    let val = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+    if let TValue::UserData(ref u) = L.stack[off] {
+        let n = n as usize;
+        if n >= 1 && n <= u.user_values.len() {
+            // 通过裸指针原地修改（与 lua_setmetatable 一致，避免 Rc::make_mut 克隆）
+            let ptr = Rc::as_ptr(u) as *mut Udata;
+            unsafe {
+                let udata = &mut *ptr;
+                udata.user_values[n - 1] = val;
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 4. 表操作（指针键版本，对应 C lapi.cpp）
+// ---------------------------------------------------------------------------
+
+/// lua_rawgetp: t[lightuserdata(p)]，结果压栈（不走元方法）。
+///
+/// 对应 C lapi.cpp::lua_rawgetp。用 light userdata p 作为 key 查表。
+#[no_mangle]
+pub extern "C" fn lua_rawgetp(L: *mut lua_State, idx: c_int, p: *const c_void) -> c_int {
+    let L = unsafe { &mut *L };
+    let key = TValue::LightUserData(p as *mut c_void);
+    if is_registry(idx) {
+        let val = L
+            .registry
+            .get(&key)
+            .unwrap_or(TValue::Nil(NilKind::Strict));
+        let ty = lua_type_code(val.ty());
+        L.stack.push(val);
+        return ty;
+    }
+    let off = match index2offset(L, idx) {
+        Some(o) => o,
+        None => {
+            L.stack.push(TValue::Nil(NilKind::Strict));
+            return LUA_TNIL;
+        }
+    };
+    let val = match &L.stack[off] {
+        TValue::Table(t) => t.get(&key).unwrap_or(TValue::Nil(NilKind::Strict)),
+        _ => TValue::Nil(NilKind::Strict),
+    };
+    let ty = lua_type_code(val.ty());
+    L.stack.push(val);
+    ty
+}
+
+/// lua_rawsetp: t[lightuserdata(p)] = v，v 从栈顶弹出（不走元方法）。
+///
+/// 对应 C lapi.cpp::lua_rawsetp。用 light userdata p 作为 key 设置值。
+#[no_mangle]
+pub extern "C" fn lua_rawsetp(L: *mut lua_State, idx: c_int, p: *const c_void) {
+    let L = unsafe { &mut *L };
+    // 先基于当前 top（包含 val）定位 table，再 pop
+    let key = TValue::LightUserData(p as *mut c_void);
+    if is_registry(idx) {
+        let val = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        L.registry.set(key, val);
+        return;
+    }
+    let off = match index2offset(L, idx) {
+        Some(o) => o,
+        None => {
+            L.stack.pop();
+            return;
+        }
+    };
+    let val = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+    if let TValue::Table(ref mut t) = L.stack[off] {
+        t.set(key, val);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 5. Coroutine API（对应 C ldo.cpp / lapi.cpp）
+// ---------------------------------------------------------------------------
+
+/// lua_resume: 恢复 coroutine，nargs 个参数在栈顶。
+///
+/// 对应 C ldo.cpp::lua_resume。委托给 `coroutine_lib::c_api_resume` 实现：
+/// - 首次 resume: 从栈取函数和参数，调用 setup_first_resume 初始化 VM 状态
+/// - 后续 resume: 调用 setup_subsequent_resume 从 ThreadContext 恢复
+/// - 执行 VmExecutor::execute_with_state，处理 Yield/Return/Error
+///
+/// 栈布局（首次 resume）: [nil, func, arg1, ..., argN]
+/// 结果布局: [nil, result1, ..., resultM]，nres = M
+#[no_mangle]
+pub extern "C" fn lua_resume(
+    L: *mut lua_State,
+    _from: *mut lua_State,
+    nargs: c_int,
+    nres: *mut c_int,
+) -> c_int {
+    let L = unsafe { &mut *L };
+    let nargs = nargs as usize;
+    let r = crate::stdlib::coroutine_lib::c_api_resume(L, nargs);
+    match r {
+        Ok((status, n)) => {
+            if !nres.is_null() {
+                unsafe { *nres = n as c_int };
+            }
+            status
+        }
+        Err(_e) => {
+            // c_api_resume 内部已处理错误并 push 错误消息到栈
+            // 此分支仅在非预期错误时到达
+            if !nres.is_null() {
+                unsafe { *nres = 1 };
+            }
+            LUA_ERRRUN
+        }
+    }
+}
+
+/// lua_yieldk: 让出当前 coroutine。
+///
+/// 对应 C ldo.cpp::lua_yieldk。简化实现：lua-rs 的协程 yield 由 VM 内部
+/// OP_YIELD 指令处理，C API 的 yield 无法直接挂起 VM。
+/// 此实现设置 pending_yield 暂存 yield 值并返回 LUA_YIELD。
+/// 若在非协程上下文调用（pending_yield 被忽略），调用方需自行处理。
+#[no_mangle]
+pub extern "C" fn lua_yieldk(
+    L: *mut lua_State,
+    nresults: c_int,
+    _ctx: lua_KContext,
+    _k: Option<lua_KFunction>,
+) -> c_int {
+    let L = unsafe { &mut *L };
+    // 收集栈顶 nresults 个值作为 yield 值
+    let nresults = nresults as usize;
+    let stack_len = L.stack.len();
+    let start = if stack_len >= nresults {
+        stack_len - nresults
+    } else {
+        0
+    };
+    let yield_vals: Vec<TValue> = L.stack.drain(start..).collect();
+    L.pending_yield = Some(yield_vals);
+    LUA_YIELD
+}
+
+/// lua_status: 返回 thread 状态。
+///
+/// 对应 C lapi.cpp::lua_status。主线程返回 LUA_OK。
+/// 若 current_thread 存在（协程执行中），返回协程的 status 映射值。
+#[no_mangle]
+pub extern "C" fn lua_status(L: *mut lua_State) -> c_int {
+    let L = unsafe { &*L };
+    if let Some(ref ctx) = L.current_thread {
+        let status = ctx.borrow().status;
+        match status {
+            crate::objects::ThreadStatus::OK => LUA_OK,
+            crate::objects::ThreadStatus::Suspended => LUA_YIELD,
+            crate::objects::ThreadStatus::Normal => LUA_OK,
+            crate::objects::ThreadStatus::Error => LUA_ERRRUN,
+        }
+    } else {
+        // 主线程或无活动协程
+        LUA_OK
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 6. 其他 API（对应 C lapi.cpp / ldebug.cpp）
+// ---------------------------------------------------------------------------
+
+/// lua_tothread: 返回 idx 处的 thread（lua_State*）。
+///
+/// 对应 C lapi.cpp::lua_tothread。从栈 idx 处取 `TValue::Thread`，
+/// 返回其关联的 `c_state`（由 `lua_newthread` 设置的 lua_State 指针）。
+/// 若 c_state 为 null（由 lua-rs 的 coroutine.create 创建的内部 LuaThread），
+/// 惰性创建关联的 LuaState：共享当前 L 的全局状态，设置 current_thread，
+/// 并把 LuaThread.function push 到新 state 栈底（供 lua_resume 首次执行）。
+#[no_mangle]
+pub extern "C" fn lua_tothread(L: *mut lua_State, idx: c_int) -> *mut lua_State {
+    let L_ref = unsafe { &mut *L };
+    let thread_rc = match index2val(L_ref, idx) {
+        Some(TValue::Thread(t)) => t.clone(),
+        _ => return ptr::null_mut(),
+    };
+    let p = thread_rc.c_state.get();
+    if !p.is_null() {
+        return p;
+    }
+    // c_state 为 null：由 lua-rs 的 coroutine.create 创建的内部 LuaThread
+    // 惰性创建关联的 LuaState（共享全局状态，独立栈）
+    let mut new_state = L_ref.new_thread();
+    new_state.current_thread = Some(thread_rc.context.clone());
+    // 如果 LuaThread 有 function（首次 resume 前），push 到新 state 栈底
+    // 这样 lua_resume 的 c_api_resume 能从栈底取函数执行
+    if let Some(ref func) = thread_rc.function {
+        new_state.stack.push((**func).clone());
+    }
+    let ptr = Box::into_raw(Box::new(new_state));
+    thread_rc.c_state.set(ptr);
+    ptr
+}
+
+/// lua_sethook: 设置调试钩子。
+///
+/// 对应 C ldebug.cpp::lua_sethook。简化实现：设置 hook_mask 和 hook_count，
+/// 但不存储 C 钩子函数（lua-rs 的 hook_func 是 TValue，无法存 C 函数指针）。
+/// 因此钩子掩码被正确设置，但钩子不会实际触发。
+/// func=NULL 或 mask=0 时清除所有钩子。
+#[no_mangle]
+pub extern "C" fn lua_sethook(
+    L: *mut lua_State,
+    func: Option<lua_Hook>,
+    mask: c_int,
+    count: c_int,
+) {
+    let L = unsafe { &mut *L };
+    if func.is_none() || mask == 0 {
+        // 清除钩子
+        L.hook_func = None;
+        L.hook_mask = 0;
+        L.hook_count = 0;
+        L.current_hook_count = 0;
+    } else {
+        // 设置钩子掩码和计数（不存储 C 函数指针，钩子不会触发）
+        L.hook_mask = mask;
+        L.hook_count = count;
+        L.current_hook_count = count;
+        // hook_func 保持原值（若原本是 Lua 函数则保留，否则为 None）
+        // 注意：C 函数指针无法存储为 TValue，因此钩子不会实际触发
+    }
 }
 
 // ============================================================================

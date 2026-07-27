@@ -1484,13 +1484,13 @@ pub fn dump_proto(f: &Proto, strip: bool) -> Vec<u8> {
 // ============================================================================
 
 use crate::objects::{LocVar, UpvalDesc};
-use crate::strings::{LongString, LuaString};
+use crate::strings::{ArcRc, LongString, LuaString};
 use std::sync::atomic::{AtomicU64, AtomicU8};
 
 /// 创建长字符串的辅助函数
 /// 使用 with_nul 添加额外 NUL 终止符，与 as_str_inner 的 NUL 剥离机制配合
 fn make_long_string(s: &str) -> LuaString {
-    LuaString::Long(Box::new(LongString {
+    LuaString::Long(ArcRc::new(LongString {
         contents: LuaString::with_nul(s),
         hash: AtomicU64::new(0),
         extra: AtomicU8::new(0),

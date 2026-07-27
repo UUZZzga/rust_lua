@@ -1346,6 +1346,9 @@ pub struct ThreadContext {
     /// 对应 C Lua 的 CIST_RECST 保存的错误状态。
     /// pcall error 路径的 close_yield 时设置，resume 后由 finish_close_continuation 读取。
     pub saved_close_error_status: Option<TValue>,
+    /// 原始 LuaThread 的弱引用 — 用于 coroutine.running() 返回同一对象
+    /// 避免 sleep_session/wakeup_queue 等 table 查找因对象不一致而失败
+    pub thread_ref: std::rc::Weak<LuaThread>,
 }
 
 /// Lua 线程（协程）
@@ -1366,6 +1369,10 @@ pub struct LuaThread {
     pub is_main: bool,
     /// 持久化执行上下文（Rc 共享，clone 后仍指向同一份状态）
     pub context: Rc<RefCell<ThreadContext>>,
+    /// C API 关联的 lua_State 指针（lua_newthread 创建时设置）
+    /// 用于 lua_tothread 从 TValue::Thread 反查关联的 lua_State。
+    /// 主线程和 Lua 层 coroutine.create 创建的协程此字段为 null。
+    pub c_state: std::cell::Cell<*mut LuaState>,
 }
 
 impl LuaThread {
@@ -2200,7 +2207,7 @@ pub fn twoto(n: u8) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::strings::{LongString, ShortString};
+    use crate::strings::{ArcRc, LongString, ShortString};
     use std::sync::atomic::{AtomicU64, AtomicU8};
 
     // ========================================================================
@@ -2371,7 +2378,7 @@ mod tests {
             contents: LuaString::with_nul(&"a".repeat(100)),
             ptr_id: 0,
         };
-        let ts = LuaString::Long(Box::new(long));
+        let ts = LuaString::Long(ArcRc::new(long));
         assert_eq!(ts.len(), 100);
         assert!(matches!(ts, LuaString::Long(_)));
     }
@@ -2406,13 +2413,13 @@ mod tests {
         let ts3 = LuaString::Short(arc3);
         assert_ne!(ts1, ts3);
 
-        let long1 = LuaString::Long(Box::new(LongString {
+        let long1 = LuaString::Long(ArcRc::new(LongString {
             hash: AtomicU64::new(0),
             extra: AtomicU8::new(0),
             contents: LuaString::with_nul("test"),
             ptr_id: 0,
         }));
-        let long2 = LuaString::Long(Box::new(LongString {
+        let long2 = LuaString::Long(ArcRc::new(LongString {
             hash: AtomicU64::new(0),
             extra: AtomicU8::new(0),
             contents: LuaString::with_nul("test"),

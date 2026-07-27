@@ -488,8 +488,8 @@ mod tests {
             gc: std::rc::Rc::new(crate::gc::GCState::default_incremental()),
             globals: crate::table::Table::new(),
             registry: crate::table::Table::new(),
-            string_table: crate::strings::StringTable::new(),
-            tmnames: crate::tm::init_tmnames(&crate::strings::StringTable::new()),
+            string_table: std::rc::Rc::new(crate::strings::StringTable::new()),
+            tmnames: std::rc::Rc::new(crate::tm::init_tmnames(&crate::strings::StringTable::new())),
             api_func_base: 0,
             n_ccalls: 0,
             dmt: crate::tm::DefaultMetatables::new(),
@@ -521,6 +521,7 @@ mod tests {
                 function: None,
                 is_main: true,
                 context: Rc::new(RefCell::new(ThreadContext::default())),
+                c_state: std::cell::Cell::new(std::ptr::null_mut()),
             },
             call_stack: Vec::new(),
             current_thread: None,
@@ -548,6 +549,7 @@ mod tests {
             cached_gc_key: std::cell::RefCell::new(None),
             last_gc_estimate: 0,
             c_safety_keepalive: Vec::new(),
+            allocf_ud: std::ptr::null_mut(),
         }
     }
 

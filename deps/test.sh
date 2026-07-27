@@ -7,6 +7,8 @@
 #   3. lsqlite3    - tests-sqlite3.lua (完整 SQL 功能)
 #   4. luarocks    - --version + 基础 make/build 命令
 #   5. sol2        - sol2_smoke 冒烟测试 (C++ ↔ Lua 交互)
+#   6. skynet      - 启动 abort 服务立即退出 (验证 lua-rs C ABI 兼容性)
+#   6b. skynet/e2e - 端到端测试：完整服务端 + 客户端连接 (验证 socket 通信和服务间消息分发)
 #
 # 用法: ./test.sh
 # 退出码: 0=全部通过, 非0=有失败
@@ -215,6 +217,87 @@ if [[ -x "$SOL2_SMOKE" ]]; then
     run_bin_test "sol2/smoke" "$SOL2_SMOKE"
 else
     fail "sol2 (smoke 二进制未构建: $SOL2_SMOKE)"
+fi
+
+# ============================================================================
+# 6. skynet (启动 abort 服务立即退出，验证 lua-rs C ABI 兼容性)
+# ============================================================================
+# skynet 是基于 actor 模型的并发框架，每个 Lua 服务对应独立 lua_State。
+# 测试方案：用最小 config 启动 skynet，以 abort 服务（examples/abort.lua）作为
+# bootstrap 直接调用 skynet.abort() 退出整个进程。验证：
+#   - liblua_rs.a 能成功链接进 skynet 主二进制
+#   - lua_newstate/luaL_openlibs/luaL_loadfile/lua_pcall 等核心 C API 兼容
+#   - snlua 服务容器能正常初始化 Lua 服务
+#   - lua-skynet.so (C 模块) 能正确加载并调用
+#   - require "skynet" / require "skynet.manager" 模块加载正常
+# 注：不使用完整 bootstrap 序列（launcher/cdummy/harbor/datacenterd/service_mgr），
+# 因为 lua-rs 的 lua_newthread 返回主 L 而非独立 thread，skynet 的完整 bootstrap
+# 依赖独立 thread 栈的 callback 机制，会卡在 harbor 启动阶段。
+SKYNET_DIR="$SCRIPT_DIR/src/skynet"
+SKYNET_BIN="$SKYNET_DIR/skynet"
+if [[ -x "$SKYNET_BIN" ]]; then
+    # 生成最小 config：单节点模式 (harbor=0)，abort 作为 bootstrap 直接退出
+    SKYNET_TEST_CONFIG="$SKYNET_DIR/examples/config.rstest"
+    cat > "$SKYNET_TEST_CONFIG" <<'EOF'
+include "config.path"
+thread = 2
+harbor = 0
+bootstrap = "snlua abort"
+cpath = root.."cservice/?.so"
+EOF
+    log "运行 skynet/abort ..."
+    # skynet 启动后会加载 abort.lua 并调用 skynet.abort() 退出
+    # 用 timeout 30 作为兜底（正常应在 3s 内退出）
+    ( cd "$SKYNET_DIR" && timeout 30 ./skynet examples/config.rstest ) >"$SCRIPT_DIR/.test_$$.log" 2>&1
+    rc=$?
+    if [[ $rc -eq 0 ]]; then
+        ok "skynet/abort"
+        # 显示最后几行输出
+        tail -5 "$SCRIPT_DIR/.test_$$.log" 2>/dev/null | sed 's/^/    /'
+    elif [[ $rc -eq 124 ]]; then
+        fail "skynet/abort (超时)"
+        tail -20 "$SCRIPT_DIR/.test_$$.log" 2>/dev/null | sed 's/^/    /'
+        save_fail_log "skynet_abort" "$SCRIPT_DIR/.test_$$.log"
+    else
+        fail "skynet/abort (退出码 $rc)"
+        tail -20 "$SCRIPT_DIR/.test_$$.log" 2>/dev/null | sed 's/^/    /'
+        save_fail_log "skynet_abort" "$SCRIPT_DIR/.test_$$.log"
+    fi
+    rm -f "$SCRIPT_DIR/.test_$$.log"
+else
+    fail "skynet (二进制未构建: $SKYNET_BIN)"
+fi
+
+# ============================================================================
+# 6b. skynet/e2e (端到端测试：启动完整服务端 + 客户端连接验证)
+# ============================================================================
+# 对应 Skynet README.md 第 33-34 行的测试步骤：
+#   ./skynet examples/config            # 启动 skynet 节点（链接 lua-rs）
+#   ./3rd/lua/lua examples/client.lua   # 启动客户端（用 C lua，因 lpeg.so 兼容性问题）
+# 验证 lua-rs 能支撑 skynet 的完整 bootstrap 序列和 socket 通信：
+#   - cmaster/cslave/harbor/datacenterd/service_mgr/main 等服务正常启动
+#   - console/debug_console/simpledb/watchdog/gate 服务正常工作
+#   - gate 监听 8888 端口，客户端能连接并发送 sproto 协议消息
+#   - simpledb 服务正确处理 get/set 请求（RESPONSE 3 result=world）
+# 客户端使用 C lua (build/lua)，因为 client.lua 依赖 lpeg.so 进行 sproto 解析，
+# 而 lpeg pattern 编译在 lua-rs 上有 segfault 兼容性问题。
+# 客户端用 C lua 不影响对服务端（lua-rs）的验证，网络协议是跨实现的。
+LUA_C_BIN="$PROJECT_ROOT/build/lua"
+if [[ -x "$SKYNET_BIN" && -x "$LUA_C_BIN" ]]; then
+    log "运行 skynet/e2e (完整服务端 + 客户端) ..."
+    # 复用 run_skynet_e2e.sh 脚本
+    if bash "$SCRIPT_DIR/run_skynet_e2e.sh" >"$SCRIPT_DIR/.test_e2e_$$.log" 2>&1; then
+        ok "skynet/e2e"
+        # 显示响应内容
+        grep -E "Request:|RESPONSE|msg|result" "$SCRIPT_DIR/.test_e2e_$$.log" 2>/dev/null | sed 's/^/    /'
+    else
+        fail "skynet/e2e"
+        tail -30 "$SCRIPT_DIR/.test_e2e_$$.log" 2>/dev/null | sed 's/^/    /'
+        save_fail_log "skynet_e2e" "$SCRIPT_DIR/.test_e2e_$$.log"
+    fi
+    rm -f "$SCRIPT_DIR/.test_e2e_$$.log"
+else
+    fail "skynet/e2e (二进制未构建: $SKYNET_BIN 或 $LUA_C_BIN)"
 fi
 
 # ============================================================================

@@ -1005,28 +1005,31 @@ impl VmExecutor {
                 Self::trace_exec(state, trace_level);
             }
 
+            // 主分发: 热门 opcode 内联处理, 冷门 opcode 路由到 #[cold] 函数
+            // 提取冷门 opcode 改善 icache 密度 — 主循环代码体积减少约 40%
+            // (perf 显示 execute_loop 占 10.65%, 主循环本身是 icache 敏感的热点)
             let result = match op {
+                // === 热门 opcode: 数据移动/加载 ===
                 OpCode::MOVE => Self::op_move(state, inst),
                 OpCode::LOADI => Self::op_loadi(state, inst),
                 OpCode::LOADF => Self::op_loadf(state, inst),
                 OpCode::LOADK => Self::op_loadk(state, inst),
-                OpCode::LOADKX => Self::op_loadkx(state, inst),
                 OpCode::LOADFALSE => Self::op_loadfalse(state, inst),
                 OpCode::LFALSESKIP => Self::op_lfalseskip(state, inst),
                 OpCode::LOADTRUE => Self::op_loadtrue(state, inst),
                 OpCode::LOADNIL => Self::op_loadnil(state, inst),
+                // === 热门 opcode: 表读 ===
                 OpCode::GETUPVAL => Self::op_getupval(state, inst),
-                OpCode::SETUPVAL => Self::op_setupval(state, inst),
                 OpCode::GETTABUP => Self::op_gettabup(state, inst),
                 OpCode::GETTABLE => Self::op_gettable(state, inst),
                 OpCode::GETI => Self::op_geti(state, inst),
                 OpCode::GETFIELD => Self::op_getfield(state, inst),
+                // === 热门 opcode: 表写 ===
                 OpCode::SETTABUP => Self::op_settabup(state, inst),
                 OpCode::SETTABLE => Self::op_settable(state, inst),
                 OpCode::SETI => Self::op_seti(state, inst),
                 OpCode::SETFIELD => Self::op_setfield(state, inst),
-                OpCode::NEWTABLE => Self::op_newtable(state, inst),
-                OpCode::SELF => Self::op_self(state, inst),
+                // === 热门 opcode: 算术运算 (常量版本) ===
                 OpCode::ADDI => Self::op_addi(state, inst),
                 OpCode::ADDK => Self::op_addk(state, inst),
                 OpCode::SUBK => Self::op_subk(state, inst),
@@ -1035,11 +1038,7 @@ impl VmExecutor {
                 OpCode::POWK => Self::op_powk(state, inst),
                 OpCode::DIVK => Self::op_divk(state, inst),
                 OpCode::IDIVK => Self::op_idivk(state, inst),
-                OpCode::BANDK => Self::op_bandk(state, inst),
-                OpCode::BORK => Self::op_bork(state, inst),
-                OpCode::BXORK => Self::op_bxork(state, inst),
-                OpCode::SHLI => Self::op_shli(state, inst),
-                OpCode::SHRI => Self::op_shri(state, inst),
+                // === 热门 opcode: 算术运算 ===
                 OpCode::ADD => Self::op_add(state, inst),
                 OpCode::SUB => Self::op_sub(state, inst),
                 OpCode::MUL => Self::op_mul(state, inst),
@@ -1047,21 +1046,9 @@ impl VmExecutor {
                 OpCode::POW => Self::op_pow(state, inst),
                 OpCode::DIV => Self::op_div(state, inst),
                 OpCode::IDIV => Self::op_idiv(state, inst),
-                OpCode::BAND => Self::op_band(state, inst),
-                OpCode::BOR => Self::op_bor(state, inst),
-                OpCode::BXOR => Self::op_bxor(state, inst),
-                OpCode::SHL => Self::op_shl(state, inst),
-                OpCode::SHR => Self::op_shr(state, inst),
-                OpCode::MMBIN => Self::op_mmbin(state, inst),
-                OpCode::MMBINI => Self::op_mmbini(state, inst),
-                OpCode::MMBINK => Self::op_mmbink(state, inst),
-                OpCode::UNM => Self::op_unm(state, inst),
-                OpCode::BNOT => Self::op_bnot(state, inst),
+                // === 热门 opcode: 逻辑非 ===
                 OpCode::NOT => Self::op_not(state, inst),
-                OpCode::LEN => Self::op_len(state, inst),
-                OpCode::CONCAT => Self::op_concat(state, inst),
-                OpCode::CLOSE => Self::op_close(state, inst),
-                OpCode::TBC => Self::op_tbc(state, inst),
+                // === 热门 opcode: 跳转/比较 ===
                 OpCode::JMP => Self::op_jmp(state, inst),
                 OpCode::EQ => Self::op_eq(state, inst),
                 OpCode::LT => Self::op_lt(state, inst),
@@ -1074,6 +1061,7 @@ impl VmExecutor {
                 OpCode::GEI => Self::op_gei(state, inst),
                 OpCode::TEST => Self::op_test(state, inst),
                 OpCode::TESTSET => Self::op_testset(state, inst),
+                // === 热门 opcode: 调用/返回 ===
                 OpCode::CALL => Self::op_call(state, inst),
                 OpCode::TAILCALL => Self::op_tailcall(state, inst),
                 OpCode::RETURN => match Self::op_return(state, inst) {
@@ -1094,20 +1082,16 @@ impl VmExecutor {
                     Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
                     Err(e) => Err(e),
                 },
+                // === 热门 opcode: numeric for 循环 ===
                 OpCode::FORLOOP => Self::op_forloop(state, inst),
                 OpCode::FORPREP => Self::op_forprep(state, inst),
-                OpCode::TFORPREP => Self::op_tforprep(state, inst),
-                OpCode::TFORCALL => Self::op_tforcall(state, inst),
-                OpCode::TFORLOOP => Self::op_tforloop(state, inst),
-                OpCode::SETLIST => Self::op_setlist(state, inst),
-                OpCode::CLOSURE => Self::op_closure(state, inst),
-                OpCode::VARARG => Self::op_vararg(state, inst),
-                OpCode::GETVARG => Self::op_getvarg(state, inst),
-                OpCode::ERRNNIL => Self::op_errnnil(state, inst),
-                OpCode::VARARGPREP => Self::op_varargprep(state, inst),
-                OpCode::EXTRAARG => {
-                    return Err(VmError::IllegalOpcode(OpCode::EXTRAARG as u8));
-                }
+                // === 冷门 opcode: 路由到 cold 函数 ===
+                // LOADKX(扩展常量), SETUPVAL(写upvalue), NEWTABLE(建表), SELF(method调用)
+                // BANDK/BORK/BXORK/SHLI/SHRI(位运算变体), BAND/BOR/BXOR/SHL/SHR(位运算)
+                // MMBIN/MMBINI/MMBINK(元方法), UNM/BNOT(一元), LEN/CONCAT(长度/拼接)
+                // CLOSE/TBC(关闭/标记), TFORPREP/TFORCALL/TFORLOOP(generic for)
+                // SETLIST/CLOSURE/VARARG/GETVARG(少用), ERRNNIL/VARARGPREP/EXTRAARG(错误/特殊)
+                _ => Self::dispatch_cold_opcodes(state, op, inst),
             };
             match result {
                 Ok(()) => {}
@@ -1381,6 +1365,71 @@ impl VmExecutor {
                     continue;
                 }
             }
+        }
+    }
+
+    /// 冷门 opcode 分发 — 从 execute_loop 主循环提取的 cold 路径。
+    ///
+    /// 包含所有低频 opcode (位运算/元方法/generic for/变参/错误处理/表构造等)。
+    /// 标注 #[cold] + #[inline(never)] 让编译器将这些 opcode 的代码放到
+    /// 代码段的冷区域, 避免污染主循环的 icache。
+    ///
+    /// perf 显示 execute_loop 主循环占 10.65%, 是 icache 敏感的热点。
+    /// 提取冷门 opcode 后, 主循环代码体积减少约 40%, 改善分支预测器和
+    /// icache 利用率。冷门 opcode 调用频率低, 额外的一次间接跳转开销可忽略。
+    #[cold]
+    #[inline(never)]
+    fn dispatch_cold_opcodes(
+        state: &mut LuaState,
+        op: OpCode,
+        inst: Instruction,
+    ) -> Result<(), VmError> {
+        match op {
+            // === 冷门: 扩展常量加载 / 写 upvalue / 建表 / method 调用 ===
+            OpCode::LOADKX => Self::op_loadkx(state, inst),
+            OpCode::SETUPVAL => Self::op_setupval(state, inst),
+            OpCode::NEWTABLE => Self::op_newtable(state, inst),
+            OpCode::SELF => Self::op_self(state, inst),
+            // === 冷门: 位运算 (常量版本) ===
+            OpCode::BANDK => Self::op_bandk(state, inst),
+            OpCode::BORK => Self::op_bork(state, inst),
+            OpCode::BXORK => Self::op_bxork(state, inst),
+            OpCode::SHLI => Self::op_shli(state, inst),
+            OpCode::SHRI => Self::op_shri(state, inst),
+            // === 冷门: 位运算 ===
+            OpCode::BAND => Self::op_band(state, inst),
+            OpCode::BOR => Self::op_bor(state, inst),
+            OpCode::BXOR => Self::op_bxor(state, inst),
+            OpCode::SHL => Self::op_shl(state, inst),
+            OpCode::SHR => Self::op_shr(state, inst),
+            // === 冷门: 元方法占位符 (算术运算回退到元方法时才执行) ===
+            OpCode::MMBIN => Self::op_mmbin(state, inst),
+            OpCode::MMBINI => Self::op_mmbini(state, inst),
+            OpCode::MMBINK => Self::op_mmbink(state, inst),
+            // === 冷门: 一元运算 ===
+            OpCode::UNM => Self::op_unm(state, inst),
+            OpCode::BNOT => Self::op_bnot(state, inst),
+            // === 冷门: 长度 / 字符串拼接 ===
+            OpCode::LEN => Self::op_len(state, inst),
+            OpCode::CONCAT => Self::op_concat(state, inst),
+            // === 冷门: 关闭 upvalue / 标记 to-be-closed ===
+            OpCode::CLOSE => Self::op_close(state, inst),
+            OpCode::TBC => Self::op_tbc(state, inst),
+            // === 冷门: generic for 循环 ===
+            OpCode::TFORPREP => Self::op_tforprep(state, inst),
+            OpCode::TFORCALL => Self::op_tforcall(state, inst),
+            OpCode::TFORLOOP => Self::op_tforloop(state, inst),
+            // === 冷门: 批量设表 / 创建闭包 / 变参 ===
+            OpCode::SETLIST => Self::op_setlist(state, inst),
+            OpCode::CLOSURE => Self::op_closure(state, inst),
+            OpCode::VARARG => Self::op_vararg(state, inst),
+            OpCode::GETVARG => Self::op_getvarg(state, inst),
+            // === 冷门: 错误处理 / 函数入口初始化 / 扩展参数 ===
+            OpCode::ERRNNIL => Self::op_errnnil(state, inst),
+            OpCode::VARARGPREP => Self::op_varargprep(state, inst),
+            OpCode::EXTRAARG => Err(VmError::IllegalOpcode(OpCode::EXTRAARG as u8)),
+            // 热门 opcode 已在主循环处理, 此处理论上不可达
+            _ => unreachable!("hot opcode reached cold dispatcher: {:?}", op),
         }
     }
 
@@ -2086,6 +2135,32 @@ impl VmExecutor {
     ///   4. push true + 返回值，按 nresults 调整栈 (模拟 call_pcall/call_xpcall 成功返回)
     ///   5. 返回 true，execute_loop 继续循环 (pcall 调用者从 CALL 指令之后继续执行)
     ///
+    /// 检查当前函数是否是 pcall 保护的函数（yield 穿过 pcall 后 resume 继续执行），
+    /// 如果是则调用 finish_pcall_return 恢复 pcall 调用者状态。
+    ///
+    /// 背景: state.pcall 不为被保护函数 push CallFrame（不像 op_call），
+    /// 所以被保护函数返回时 call_stack 可能有外层帧（pcall 调用者的帧）。
+    /// 如果直接 pop 会弹出错误的外层帧，导致 base/pc 恢复到错误位置。
+    ///
+    /// 判定条件: 顶部 PcallProtection saved_filled=true（yield 穿过 pcall）
+    /// 且 func_idx+1 == state.base（当前函数就是被 pcall 保护的函数）。
+    fn try_finish_pcall_return(
+        state: &mut LuaState,
+        nret: usize,
+        result_base: usize,
+    ) -> Result<bool, VmError> {
+        let is_protected = state.pcall_protection_stack.last().map_or(false, |t| {
+            t.saved_filled
+                && !t.is_close_continuation
+                && !t.is_metamethod
+                && t.func_idx + 1 == state.base
+        });
+        if !is_protected {
+            return Ok(false);
+        }
+        Self::finish_pcall_return(state, nret, result_base)
+    }
+
     /// 注意: 只处理非 close continuation、非 metamethod 的 PcallProtection。
     /// close continuation 由 finish_close_continuation 处理，
     /// metamethod 由 try_finish_metamethod 处理。
@@ -4361,16 +4436,14 @@ impl VmExecutor {
         // 外部 C 函数（通过 dlopen 加载的 .so）也需要 call_info 条目，
         // 否则 lua_getstack/lua_getinfo 返回 0，导致 luaL_argerror 无法获取
         // 函数名（如 cjson.encode_max_depth 错误消息缺少 "to 'xxx'" 部分）。
-        // caller_proto 从当前执行上下文获取（调用者的 LClosure）。
-        let caller_proto = if state.base > 0 && state.base <= state.stack.len() {
-            if let TValue::LClosure(c) = &state.stack[state.base - 1] {
-                Some(Rc::clone(&c.proto))
-            } else {
-                None
-            }
-        } else {
-            None
-        };
+        // caller_proto 从最后一个 call_info 条目获取（调用者的 LClosure）。
+        // 不能从 state.stack[state.base - 1] 读取，因为元方法调用路径
+        // （__index/__newindex）在调用 call_c_function 前已更新 state.base。
+        let caller_proto = state
+            .call_info
+            .last()
+            .and_then(|ci| ci.closure.as_ref())
+            .map(|c| Rc::clone(&c.proto));
         state.call_info.push(crate::state::CallInfoEntry {
             caller_proto,
             is_c: true,
@@ -4432,6 +4505,20 @@ impl VmExecutor {
                 return Err(VmError::RuntimeError(err_msg));
             }
         };
+
+        // 检查 C 函数内部是否发生了 yield（通过 lua_pcall → pcall → pending_yield）
+        // 对应 C Lua 中 yield 通过 longjmp 跨 C 函数传播到 lua_resume:
+        // C 函数调用 lua_pcall，Lua 代码 yield 时 longjmp 跳过 C 函数栈帧，
+        // 直接回到 lua_resume。Rust 无 longjmp，pcall 将 yield 存入 pending_yield，
+        // 这里检测并传播，使外层 execute_loop 能收到 Yield 信号。
+        if let Some(values) = state.pending_yield.take() {
+            // yield: 恢复 api_func_base 和 n_ccalls，pop call_info
+            // 不处理结果（不移动、不截断栈）— 栈保留 yield 时的状态
+            state.api_func_base = saved_api_base;
+            state.n_ccalls = state.n_ccalls.saturating_sub(1);
+            state.call_info.pop();
+            return Err(VmError::Yield(values));
+        }
 
         // poscall: 把栈顶 n 个结果移动到 a 位置
         let top = state.stack.len();
@@ -4755,6 +4842,12 @@ impl VmExecutor {
                 return Err(e);
             }
         }
+        // pcall 保护函数返回检查 (在 call_stack.pop() 之前)
+        // yield 穿过 pcall 后 resume 继续执行，被保护函数返回时应由
+        // finish_pcall_return 恢复 pcall 调用者状态，而非弹出外层帧
+        if Self::try_finish_pcall_return(state, nresults, a)? {
+            return Ok(None);
+        }
         if let Some(frame) = state.call_stack.pop() {
             // 递减 C 调用深度 (对应 op_call 中递增的 n_ccalls)
             state.n_ccalls = state.n_ccalls.saturating_sub(1);
@@ -4875,6 +4968,10 @@ impl VmExecutor {
                 return Err(e);
             }
         }
+        // pcall 保护函数返回检查 (在 call_stack.pop() 之前)
+        if Self::try_finish_pcall_return(state, 0, state.base)? {
+            return Ok(None);
+        }
         if let Some(frame) = state.call_stack.pop() {
             // 递减 C 调用深度 (对应 op_call 中递增的 n_ccalls)
             state.n_ccalls = state.n_ccalls.saturating_sub(1);
@@ -4968,6 +5065,14 @@ impl VmExecutor {
                 // close yield 或出错: 不 pop call_stack，传播错误
                 return Err(e);
             }
+        }
+        // pcall 保护函数返回检查 (在 call_stack.pop() 之前)
+        // 注意: val 已被 take，需要先放回栈，让 try_finish_pcall_return 能读到
+        if a < state.stack.len() {
+            state.stack[a] = val.clone();
+        }
+        if Self::try_finish_pcall_return(state, 1, a)? {
+            return Ok(None);
         }
         if let Some(frame) = state.call_stack.pop() {
             // 递减 C 调用深度 (对应 op_call 中递增的 n_ccalls)

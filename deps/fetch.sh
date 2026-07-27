@@ -8,6 +8,7 @@
 #   - luarocks    (3.13.0)
 #   - sol2        (v3.3.0)
 #   - sqlite3     (amalgamation 3450100, 供 lsqlite3 静态链接)
+#   - skynet      (cloudwu/skynet, master, 含修改版 Lua 5.5.1)
 #
 # 用法：./fetch.sh
 #
@@ -155,6 +156,22 @@ else
     ln -sf sqlite-amalgamation-3450100/sqlite3.h "$SRC_DIR/sqlite3/sqlite3.h"
     ln -sf sqlite-amalgamation-3450100/sqlite3.c "$SRC_DIR/sqlite3/sqlite3.c"
     log "完成: src/sqlite3/sqlite-amalgamation-3450100"
+fi
+
+# ============================================================================
+# 7. skynet (cloudwu/skynet, master)
+# ============================================================================
+# skynet 自带修改版 Lua 5.5.1 (ejoy/lua skynet55 分支)，但本项目通过
+# LUA_LIB/LUA_INC 覆盖为 lua-rs 的 liblua_rs.a 与 src/ 头文件，仅用 skynet
+# 的 C 框架代码 (skynet-src/, service-src/, lualib-src/) 与 Lua 服务脚本。
+SKYNET_REPO="https://github.com/cloudwu/skynet.git"
+if [[ -d "$SRC_DIR/skynet" && -f "$SRC_DIR/skynet/Makefile" ]]; then
+    log "已存在: src/skynet (跳过 clone)"
+else
+    log "git clone: $SKYNET_REPO"
+    rm -rf "$SRC_DIR/skynet"
+    git clone --depth=1 "$SKYNET_REPO" "$SRC_DIR/skynet"
+    log "完成: src/skynet"
 fi
 
 log "全部依赖下载完成"

@@ -9,6 +9,7 @@
 #   make cjson        Build only lua-cjson
 #   make luasocket    Build only luasocket (core + mime)
 #   make lsqlite3     Build only lsqlite3 (requires sqlite3 headers)
+#   make skynet       Build only skynet (linked against liblua_rs.a)
 #   make clean        Remove build artifacts
 
 SHELL := /bin/bash
@@ -163,11 +164,39 @@ $(SOL2_SMOKETEST): $(SOL2_SMOKETEST_SRC) $(LUA_INCLUDE)/lua.hpp $(LUA_INCLUDE)/l
 sol2: $(SOL2_SMOKETEST)
 	@echo "=== sol2 smoke test built: $< ==="
 
+# --- skynet (链接 lua-rs 静态库，禁用 jemalloc) ----------------------------
+# skynet 自带修改版 Lua 5.5.1，本项目通过 LUA_LIB/LUA_INC 覆盖为 lua-rs 的
+# liblua_rs.a 与 src/ 头文件。setup.sh 已应用补丁去除 luaL_makeseed 硬依赖。
+# 禁用 jemalloc (MALLOC_STATICLIB="") 避免构建 jemalloc 子模块；
+# NOUSE_JEMALLOC 让 skynet 使用系统 malloc。
+#
+# capi_variadic.o 提供 luaL_error / lua_pushfstring / lua_pushvfstring 等
+# C variadic 函数（stable Rust 不支持 c_variadic），与 liblua_rs.a 一起链接。
+SKYNET_SRC := $(DEPS_SRC)/skynet
+SKYNET_BIN := $(SKYNET_SRC)/skynet
+CAPI_VARIADIC_O := $(DEPS_BUILD)/capi_variadic.o
+CAPI_VARIADIC_C := $(PROJECT_ROOT)/src_rs/capi_variadic.c
+
+$(CAPI_VARIADIC_O): $(CAPI_VARIADIC_C)
+	@mkdir -p $(@D)
+	$(CC) -O2 -fPIC -I$(LUA_INCLUDE) -c $< -o $@
+
+skynet: $(LUA_RS_LIB) $(CAPI_VARIADIC_O)
+	@echo "=== Building skynet with lua-rs ==="
+	# lua-rs 已实现 luaL_makeseed/lua_newthread/lua_resume，无需 LUA_RUST_COMPAT 宏
+	cd $(SKYNET_SRC) && $(MAKE) linux \
+		LUA_LIB=$(LUA_RS_LIB) \
+		LUA_INC=$(LUA_INCLUDE) \
+		MALLOC_STATICLIB="$(CAPI_VARIADIC_O)" \
+		MYCFLAGS="" \
+		SKYNET_DEFINES="-DNOUSE_JEMALLOC"
+	@echo "=== skynet built: $(SKYNET_BIN) ==="
+
 # --- Phony targets --------------------------------------------------------
-.PHONY: all clean cjson luasocket lsqlite3 sol2
+.PHONY: all clean cjson luasocket lsqlite3 sol2 skynet
 
 # 依赖 phony targets 而非 .so 文件目标，确保 luasocket 的 cp（安装 Lua 文件）被执行
-all: cjson luasocket lsqlite3 sol2
+all: cjson luasocket lsqlite3 sol2 skynet
 	@echo "=== Build complete ==="
 	@ls -la $(DEPS_LIB)/
 
@@ -175,4 +204,5 @@ clean:
 	rm -rf $(DEPS_BUILD)
 	rm -f $(CJSON_TARGET) $(SOCKET_CORE_TARGET) $(MIME_TARGET) $(LSQLITE3_TARGET)
 	rm -f $(SOL2_SMOKETEST)
+	cd $(SKYNET_SRC) && $(MAKE) clean 2>/dev/null || true
 	rmdir $(DEPS_LIB) 2>/dev/null; true
