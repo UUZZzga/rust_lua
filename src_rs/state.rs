@@ -2726,6 +2726,9 @@ impl LuaState {
         crate::stdlib::coroutine_lib::open_coroutine_lib(self);
 
         // 打开 I/O 库 (注册 io 全局表, 包含 stdin/stdout/stderr)
+        // Miri 不支持 extern static stdin/stdout/stderr 与 fdopen,跳过 io 库初始化
+        // (print 用 state.stdout 而非 io.stdout,基础测试不受影响)
+        #[cfg(not(miri))]
         crate::stdlib::io_lib::open_io_lib(self);
 
         // 把标准库注册到 package.loaded（对应 C 的 luaL_requiref），

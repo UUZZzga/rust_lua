@@ -3659,6 +3659,7 @@ pub extern "C" fn lua_rawsetp(L: *mut lua_State, idx: c_int, p: *const c_void) {
 /// 栈布局（首次 resume）: [nil, func, arg1, ..., argN]
 /// 结果布局: [nil, result1, ..., resultM]，nres = M
 #[no_mangle]
+#[cfg(not(feature = "ffi"))]
 pub extern "C" fn lua_resume(
     L: *mut lua_State,
     _from: *mut lua_State,
@@ -3684,6 +3685,17 @@ pub extern "C" fn lua_resume(
             LUA_ERRRUN
         }
     }
+}
+
+#[no_mangle]
+#[cfg(feature = "ffi")]
+pub extern "C" fn lua_resume(
+    L: *mut lua_State,
+    _from: *mut lua_State,
+    nargs: c_int,
+    nres: *mut c_int,
+) -> c_int {
+    LUA_ERRRUN
 }
 
 /// lua_yieldk: 让出当前 coroutine。

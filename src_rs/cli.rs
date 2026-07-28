@@ -709,6 +709,8 @@ unsafe extern "C" fn laction(sig: i32) {
 }
 
 fn setup_signal_handler() {
+    // Miri 不支持信号操作 (sigemptyset/sigaction),跳过
+    #[cfg(not(miri))]
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = laction as *const () as usize;
@@ -719,6 +721,8 @@ fn setup_signal_handler() {
 }
 
 fn reset_signal_handler() {
+    // Miri 不支持信号操作 (sigaction),跳过
+    #[cfg(not(miri))]
     unsafe {
         let mut sa: libc::sigaction = std::mem::zeroed();
         sa.sa_sigaction = libc::SIG_DFL;

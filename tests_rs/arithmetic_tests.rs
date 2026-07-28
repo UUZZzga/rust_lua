@@ -228,6 +228,8 @@ fn test_mixed_idiv() {
 // 4. 幂运算
 // ============================================================================
 
+// Miri 下 2.0 ^ 10.0 可能输出 1023.9999999999999 而非 1024.0,字符串匹配失败
+#[cfg_attr(miri, ignore)]
 #[test]
 fn test_pow_int() {
     let output = run_lua(&["-e", "print(2 ^ 10)"]);
@@ -248,6 +250,8 @@ fn test_pow_float() {
     );
 }
 
+// Miri 下 2.0 ^ -1.0 可能输出 0.5000000000000001 而非 0.5,字符串匹配失败
+#[cfg_attr(miri, ignore)]
 #[test]
 fn test_pow_negative() {
     let output = run_lua(&["-e", "print(2 ^ -1)"]);

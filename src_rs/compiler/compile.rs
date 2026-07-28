@@ -506,16 +506,16 @@ pub struct FuncState<'a> {
 
 /// ANTLR4: `chunk: block ;` — 编译器入口，初始化 FuncState，解析整个脚本块并生成原型
 pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
+    let source = crate::strings::new_lstr(&ls.state.string_table, &ls.chunk_name);
+    let env_name = crate::strings::new_lstr(&ls.state.string_table, "_ENV");
+
     let mut fs = FuncState::new(ls);
     fs.proto.num_params = 0;
     fs.proto.flag = PF_VAHID;
 
     // 设置源名 — 对应 C 的 lexstate.source = luaX_newstring(L, name, ...)
     // 源名用于错误消息和堆栈回溯中的位置信息
-    fs.proto.source = Some(crate::strings::new_lstr(
-        &ls.state.string_table,
-        &ls.chunk_name,
-    ));
+    fs.proto.source = Some(source);
 
     // Like C's mainfunc: register _ENV as upvalue #0 (instack=1, idx=0).
     // In C, _ENV is also a local variable at register 0, but we handle it
@@ -523,7 +523,7 @@ pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
     // and global variable access uses GETTABUP/SETTABUP instead of GETFIELD/SETFIELD.
     // This avoids the register offset issue that would occur if _ENV were a local.
     Rc::make_mut(&mut fs.proto.upvalues).push(crate::objects::UpvalDesc {
-        name: Some(crate::strings::new_lstr(&ls.state.string_table, "_ENV")),
+        name: Some(env_name),
         in_stack: true,
         idx: 0,
         parent_local_idx: 0,
@@ -531,7 +531,7 @@ pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
     });
     fs.proto.size_upvalues = 1;
 
-    ls.next();
+    fs.ls_mut().next();
     fs.code_abc(OpCode::VARARGPREP, 0, 0, 0);
     parse_chunk(&mut fs);
     // 对应 C 的 mainfunc 中 check(ls, TK_EOS)：所有语句解析完后必须到达 EOF
@@ -12774,14 +12774,16 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     new_fs.prev = fs as *mut FuncState; // like C's fs->prev = ls->fs
     new_fs.proto.num_params = n_params;
     new_fs.proto.line_defined = line_defined;
-    let ls = fs.ls_mut();
 
     // 设置源名 — 对应 C 的 lexstate.source = luaX_newstring(L, name, ...)
     // 源名用于错误消息和堆栈回溯中的位置信息
-    new_fs.proto.source = Some(crate::strings::new_lstr(
-        &ls.state.string_table,
-        &ls.chunk_name,
-    ));
+    // 注意:必须通过 new_fs.ls() 访问 LexState,不能再用 fs.ls_mut(),
+    // 否则会导致 Tree Borrows aliasing 违规 (new_fs 持有的裸指针标签被 foreign write 禁用)
+    let source = {
+        let ls_ref = new_fs.ls();
+        crate::strings::new_lstr(&ls_ref.state.string_table, &ls_ref.chunk_name)
+    };
+    new_fs.proto.source = Some(source);
     // then generate VARARGPREP, then add vararg parameter (start_pc after VARARGPREP).
     // This order ensures regular parameters have start_pc=0, so that
     // debug.getlocal(func, n) with pc=0 can find them.

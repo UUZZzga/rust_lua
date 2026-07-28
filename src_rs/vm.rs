@@ -14,7 +14,6 @@
 //! 每个公开函数都包含规约注释。
 
 use std::cmp::Ordering;
-use std::ffi::CString;
 
 use crate::gc::GCState;
 use crate::objects::{NilKind, TValue, UpVal, UpValRef};
@@ -233,6 +232,7 @@ pub fn to_integer(obj: &TValue, mode: F2IMode) -> Option<i64> {
 /// 比较两个 LuaString，返回 Ordering。
 ///
 /// 使用 C locale 的 strcoll 进行逐段比较（支持内含 '\0' 的字符串）。
+/// 直接使用字符串内部 NUL 终止的指针，避免 CString 堆分配。
 ///
 /// Scenario: 相同短字符串
 /// Given: "hello" 和 "hello"
@@ -244,65 +244,64 @@ pub fn to_integer(obj: &TValue, mode: F2IMode) -> Option<i64> {
 /// When: 调用 strcmp
 /// Then: 返回 Ordering::Less
 pub fn strcmp(ts1: &LuaString, ts2: &LuaString) -> Ordering {
-    let s1 = ts1.as_str();
-    let s2 = ts2.as_str();
-
-    let has_null1 = s1.contains('\0');
-    let has_null2 = s2.contains('\0');
-
-    if !has_null1 && !has_null2 {
-        return strcoll_compare(s1, s2);
-    }
-
-    let mut pos1 = 0;
-    let mut pos2 = 0;
-    let bytes1 = s1.as_bytes();
-    let bytes2 = s2.as_bytes();
+    // ShortString 末尾必然有 NUL；LongString 所有构造路径都追加 NUL。
+    // as_c_str_ptr 返回的指针始终指向 NUL 终止的字节序列，可直接用于 strcoll。
+    // 对应 C 实现 lvm.c:l_strcmp 的逻辑。
+    let mut s1 = ts1.as_c_str_ptr();
+    let mut s2 = ts2.as_c_str_ptr();
+    let mut rl1 = ts1.len();  // 不含末尾 NUL 的长度
+    let mut rl2 = ts2.len();
 
     loop {
-        let seg1_end = bytes1[pos1..]
-            .iter()
-            .position(|&b| b == 0)
-            .map(|p| pos1 + p)
-            .unwrap_or(s1.len());
-        let seg2_end = bytes2[pos2..]
-            .iter()
-            .position(|&b| b == 0)
-            .map(|p| pos2 + p)
-            .unwrap_or(s2.len());
-
-        let seg1 = &s1[pos1..seg1_end];
-        let seg2 = &s2[pos2..seg2_end];
-
-        let cmp = strcoll_compare(seg1, seg2);
-        if cmp != Ordering::Equal {
-            return cmp;
+        // strcoll 在第一个 NUL 处停止，比较当前段
+        let temp = strcoll_ptrs(s1, s2);
+        if temp != Ordering::Equal {
+            return temp;
         }
-
-        let finished1 = seg1_end == s1.len();
-        let finished2 = seg2_end == s2.len();
-
-        if finished2 {
-            return if finished1 {
-                Ordering::Equal
-            } else {
-                Ordering::Greater
-            };
+        // 段相等，计算当前段长度（到第一个 NUL）
+        // SAFETY: s1/s2 指向 NUL 终止的段，CStr::from_ptr 读取到 NUL 为止
+        let zl1 = unsafe { std::ffi::CStr::from_ptr(s1) }.to_bytes().len();
+        let zl2 = unsafe { std::ffi::CStr::from_ptr(s2) }.to_bytes().len();
+        if zl2 == rl2 {
+            // s2 结束
+            return if zl1 == rl1 { Ordering::Equal } else { Ordering::Greater };
         }
-        if finished1 {
+        if zl1 == rl1 {
+            // s1 结束，s2 未结束
             return Ordering::Less;
         }
-
-        pos1 = seg1_end + 1;
-        pos2 = seg2_end + 1;
+        // 跳过 NUL，比较下一段
+        // SAFETY: zl1 < rl1 保证 s1[zl1] == 0，s1.add(zl1+1) 仍在原始 contents 范围内
+        s1 = unsafe { s1.add(zl1 + 1) };
+        s2 = unsafe { s2.add(zl2 + 1) };
+        rl1 -= zl1 + 1;
+        rl2 -= zl2 + 1;
     }
 }
 
-fn strcoll_compare(a: &str, b: &str) -> Ordering {
-    let ca = CString::new(a).unwrap_or_default();
-    let cb = CString::new(b).unwrap_or_default();
-    let result = unsafe { libc::strcoll(ca.as_ptr(), cb.as_ptr()) };
-    result.cmp(&0)
+/// 通过裸指针调用 strcoll，避免 CString 堆分配。
+/// 调用者必须保证两个指针都指向 NUL 终止的字符串。
+#[inline]
+fn strcoll_ptrs(
+    s1: *const std::os::raw::c_char,
+    s2: *const std::os::raw::c_char,
+) -> Ordering {
+    // Miri 不支持 libc::strcoll,用字节比较代替
+    // (默认 "C" locale 下 strcoll 等同于字节比较)
+    #[cfg(miri)]
+    {
+        // SAFETY: 调用者保证指针指向 NUL 终止的字符串
+        unsafe {
+            let b1 = std::ffi::CStr::from_ptr(s1).to_bytes();
+            let b2 = std::ffi::CStr::from_ptr(s2).to_bytes();
+            b1.cmp(b2)
+        }
+    }
+    #[cfg(not(miri))]
+    {
+        let result = unsafe { libc::strcoll(s1, s2) };
+        result.cmp(&0)
+    }
 }
 
 // ============================================================================
@@ -456,42 +455,16 @@ pub fn raw_equal(t1: &TValue, t2: &TValue) -> bool {
         (TValue::Table(a), TValue::Table(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
         (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
         (TValue::CClosure(a), TValue::CClosure(b)) => Rc::ptr_eq(a, b),
-        (TValue::LCFn(a), TValue::LCFn(b)) => std::ptr::eq(a.func as *const (), b.func as *const ()),
-        (TValue::BuiltinFn(a), TValue::BuiltinFn(b)) => std::ptr::eq(a.func as *const (), b.func as *const ()),
+        (TValue::LCFn(a), TValue::LCFn(b)) => {
+            std::ptr::eq(a.func as *const (), b.func as *const ())
+        }
+        (TValue::BuiltinFn(a), TValue::BuiltinFn(b)) => {
+            std::ptr::eq(a.func as *const (), b.func as *const ())
+        }
         (TValue::UserData(a), TValue::UserData(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
         (TValue::Thread(a), TValue::Thread(b)) => Rc::ptr_eq(&a.context, &b.context),
         _ => false,
     }
-}
-
-// ============================================================================
-// 小于比较 (原始比较，不含元方法 — 元方法在 tm.rs 的 call_order_tm 中处理)
-// ============================================================================
-
-/// 原始小于比较 (不含元方法): 数字用 lt_num，字符串用 strcmp。
-/// 其他类型返回 false。
-/// 对应 C 的 luaV_lessthan 中的快速路径 (非元方法部分)。
-pub fn less_than_raw(l: &TValue, r: &TValue) -> Option<bool> {
-    if l.is_number() && r.is_number() {
-        return Some(lt_num(l, r));
-    }
-    if let (TValue::Str(a), TValue::Str(b)) = (l, r) {
-        return Some(strcmp(a, b) == Ordering::Less);
-    }
-    None
-}
-
-/// 原始小于等于比较 (不含元方法): 数字用 le_num，字符串用 strcmp。
-/// 其他类型返回 false。
-/// 对应 C 的 luaV_lessequal 中的快速路径 (非元方法部分)。
-pub fn less_equal_raw(l: &TValue, r: &TValue) -> Option<bool> {
-    if l.is_number() && r.is_number() {
-        return Some(le_num(l, r));
-    }
-    if let (TValue::Str(a), TValue::Str(b)) = (l, r) {
-        return Some(strcmp(a, b) != Ordering::Greater);
-    }
-    None
 }
 
 // ============================================================================
@@ -1321,6 +1294,36 @@ mod tests {
 
     fn make_gc() -> Rc<crate::gc::GCState> {
         Rc::new(crate::gc::GCState::default_incremental())
+    }
+
+    // ============================================================================
+    // 小于比较 (原始比较，不含元方法 — 元方法在 tm.rs 的 call_order_tm 中处理)
+    // ============================================================================
+
+    /// 原始小于比较 (不含元方法): 数字用 lt_num，字符串用 strcmp。
+    /// 其他类型返回 false。
+    /// 对应 C 的 luaV_lessthan 中的快速路径 (非元方法部分)。
+    fn less_than_raw(l: &TValue, r: &TValue) -> Option<bool> {
+        if l.is_number() && r.is_number() {
+            return Some(lt_num(l, r));
+        }
+        if let (TValue::Str(a), TValue::Str(b)) = (l, r) {
+            return Some(strcmp(a, b) == Ordering::Less);
+        }
+        None
+    }
+
+    /// 原始小于等于比较 (不含元方法): 数字用 le_num，字符串用 strcmp。
+    /// 其他类型返回 false。
+    /// 对应 C 的 luaV_lessequal 中的快速路径 (非元方法部分)。
+    fn less_equal_raw(l: &TValue, r: &TValue) -> Option<bool> {
+        if l.is_number() && r.is_number() {
+            return Some(le_num(l, r));
+        }
+        if let (TValue::Str(a), TValue::Str(b)) = (l, r) {
+            return Some(strcmp(a, b) != Ordering::Greater);
+        }
+        None
     }
 
     // ========================================================================

@@ -29,6 +29,9 @@ pub trait Allocator {
 
 pub struct DefaultAllocator;
 
+/// 默认对齐：1 字节，用于非类型化分配（C 的 realloc 语义）。
+/// 类型化分配（new_vec / grow_vec / shrink_vec）直接用 std::alloc API
+/// 并传入 T 的对齐，确保与 Vec<T> 的 drop（用 std::alloc::Global 释放）一致。
 impl Allocator for DefaultAllocator {
     fn alloc(&mut self, ptr: *mut u8, old_size: usize, new_size: usize) -> *mut u8 {
         if new_size == 0 {
@@ -203,7 +206,13 @@ impl<'a, A: Allocator> MemState<'a, A> {
 
     pub fn new_box<T>(&mut self) -> Result<Box<T>, MemError> {
         let layout = Layout::new::<T>();
-        let ptr = self.malloc(layout.size())?;
+        let ptr = unsafe { alloc::alloc(layout) };
+        if ptr.is_null() {
+            return Err(MemError {
+                msg: "allocation failed".into(),
+            });
+        }
+        self.gc_debt -= layout.size() as LuaMem;
         Ok(unsafe { Box::from_raw(ptr as *mut T) })
     }
 
@@ -219,8 +228,14 @@ impl<'a, A: Allocator> MemState<'a, A> {
         let layout = Layout::array::<T>(n).map_err(|_| MemError {
             msg: "block too big".into(),
         })?;
-        let ptr = self.malloc(layout.size())? as *mut T;
-        Ok(unsafe { Vec::from_raw_parts(ptr, n, n) })
+        let ptr = unsafe { alloc::alloc(layout) };
+        if ptr.is_null() {
+            return Err(MemError {
+                msg: "allocation failed".into(),
+            });
+        }
+        self.gc_debt -= layout.size() as LuaMem;
+        Ok(unsafe { Vec::from_raw_parts(ptr as *mut T, n, n) })
     }
 
     // ========================================================================
@@ -262,13 +277,23 @@ impl<'a, A: Allocator> MemState<'a, A> {
             }
         }
         debug_assert!(nelems + 1 <= size && size <= limit);
-        let new_size_bytes = size * mem::size_of::<T>();
-        let old_size_bytes = v.capacity() * mem::size_of::<T>();
-        self.safe_realloc(std::ptr::null_mut(), 0, new_size_bytes)?;
+        // 直接用 std::alloc API 并传入 T 的对齐，确保与 Vec<T> 的 drop
+        // （用 std::alloc::Global 释放）对齐一致，避免 Miri 检测到对齐不匹配 UB。
+        // 不通过 self.safe_realloc（DefaultAllocator 用 1 字节对齐，与 Vec<T> 的 drop 不匹配）。
+        let new_layout = Layout::array::<T>(size).map_err(|_| MemError {
+            msg: "block too big".into(),
+        })?;
+        let old_layout = Layout::array::<T>(v.capacity()).unwrap();
         let mut v = ManuallyDrop::new(v);
         let old_ptr = v.as_mut_ptr() as *mut u8;
-        let new_block = self.safe_realloc(old_ptr, old_size_bytes, new_size_bytes)? as *mut T;
-        let new_vec = unsafe { Vec::from_raw_parts(new_block, nelems, size) };
+        let new_ptr = unsafe { alloc::realloc(old_ptr, old_layout, new_layout.size()) };
+        if new_ptr.is_null() {
+            return Err(MemError {
+                msg: "allocation failed".into(),
+            });
+        }
+        self.gc_debt -= (new_layout.size() as LuaMem) - (old_layout.size() as LuaMem);
+        let new_vec = unsafe { Vec::from_raw_parts(new_ptr as *mut T, nelems, size) };
         Ok(new_vec)
     }
 
@@ -278,16 +303,24 @@ impl<'a, A: Allocator> MemState<'a, A> {
 
     pub fn shrink_vec<T>(&mut self, v: Vec<T>, final_n: usize) -> Result<Vec<T>, MemError> {
         let old_cap = v.capacity();
-        let old_size_bytes = old_cap * mem::size_of::<T>();
-        let new_size_bytes = final_n * mem::size_of::<T>();
-        debug_assert!(new_size_bytes <= old_size_bytes);
         if old_cap == final_n {
             return Ok(v);
         }
+        let new_layout = Layout::array::<T>(final_n).map_err(|_| MemError {
+            msg: "block too big".into(),
+        })?;
+        let old_layout = Layout::array::<T>(old_cap).unwrap();
+        debug_assert!(new_layout.size() <= old_layout.size());
         let mut v = ManuallyDrop::new(v);
         let old_ptr = v.as_mut_ptr() as *mut u8;
-        let new_block = self.safe_realloc(old_ptr, old_size_bytes, new_size_bytes)? as *mut T;
-        let new_vec = unsafe { Vec::from_raw_parts(new_block, final_n, final_n) };
+        let new_ptr = unsafe { alloc::realloc(old_ptr, old_layout, new_layout.size()) };
+        if new_ptr.is_null() {
+            return Err(MemError {
+                msg: "allocation failed".into(),
+            });
+        }
+        self.gc_debt -= (new_layout.size() as LuaMem) - (old_layout.size() as LuaMem);
+        let new_vec = unsafe { Vec::from_raw_parts(new_ptr as *mut T, final_n, final_n) };
         Ok(new_vec)
     }
 }

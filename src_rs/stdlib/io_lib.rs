@@ -24,6 +24,9 @@ use std::rc::Rc;
 use std::os::raw::c_int;
 
 // C 标准库的 stdin/stdout/stderr — libc crate 不直接导出，用 extern 声明
+// Miri 不支持 extern static stdin/stdout/stderr，改用 fdopen(fd, mode) 获取等价 FILE*
+// (Miri 通过 libc 桩支持 fdopen)，用 thread_local OnceCell 缓存避免重复创建
+#[cfg(not(miri))]
 extern "C" {
     #[link_name = "stdin"]
     static C_STDIN: *mut libc::FILE;
@@ -35,15 +38,42 @@ extern "C" {
 
 /// 获取 C 的 stdin
 fn c_stdin() -> *mut libc::FILE {
-    unsafe { C_STDIN }
+    #[cfg(miri)]
+    {
+        use std::cell::OnceCell;
+        thread_local!(static STDIN: OnceCell<*mut libc::FILE> = OnceCell::new());
+        STDIN.with(|s| *s.get_or_init(|| unsafe {
+            libc::fdopen(libc::STDIN_FILENO, b"r\0".as_ptr() as *const _)
+        }))
+    }
+    #[cfg(not(miri))]
+    { unsafe { C_STDIN } }
 }
 /// 获取 C 的 stdout
 fn c_stdout() -> *mut libc::FILE {
-    unsafe { C_STDOUT }
+    #[cfg(miri)]
+    {
+        use std::cell::OnceCell;
+        thread_local!(static STDOUT: OnceCell<*mut libc::FILE> = OnceCell::new());
+        STDOUT.with(|s| *s.get_or_init(|| unsafe {
+            libc::fdopen(libc::STDOUT_FILENO, b"w\0".as_ptr() as *const _)
+        }))
+    }
+    #[cfg(not(miri))]
+    { unsafe { C_STDOUT } }
 }
 /// 获取 C 的 stderr
 fn c_stderr() -> *mut libc::FILE {
-    unsafe { C_STDERR }
+    #[cfg(miri)]
+    {
+        use std::cell::OnceCell;
+        thread_local!(static STDERR: OnceCell<*mut libc::FILE> = OnceCell::new());
+        STDERR.with(|s| *s.get_or_init(|| unsafe {
+            libc::fdopen(libc::STDERR_FILENO, b"w\0".as_ptr() as *const _)
+        }))
+    }
+    #[cfg(not(miri))]
+    { unsafe { C_STDERR } }
 }
 
 // ============================================================================

@@ -3907,6 +3907,8 @@ mod tests {
         }
     }
 
+    // Miri 下函数指针地址比较不可靠 (bf.func as usize != fn as usize),跳过
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_call_ipairs() {
         let mut state = LuaState::new();
@@ -3934,6 +3936,8 @@ mod tests {
         }
     }
 
+    // Miri 下函数指针地址比较不可靠 (bf.func as usize != fn as usize),跳过
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_call_pairs() {
         let mut state = LuaState::new();

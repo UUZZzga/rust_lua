@@ -239,6 +239,8 @@ fn test_inline_e_expression() {
     assert!(stdout.contains("inline"));
 }
 
+// Miri 不支持 Command::spawn (run_lua_input 启动子进程),跳过
+#[cfg_attr(miri, ignore)]
 #[test]
 fn test_stdin_execution() {
     let output = run_lua_input(&[], "print('from_stdin')\n");

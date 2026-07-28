@@ -2285,6 +2285,7 @@ fn call_wrap_fn(
 ///
 /// 返回 (status, nresults)，status 为 LUA_OK/LUA_YIELD/LUA_ERRRUN，
 /// nresults 为结果数（已放在 state.stack 上）。
+#[cfg(not(feature = "ffi"))]
 pub fn c_api_resume(state: &mut LuaState, nargs: usize) -> Result<(i32, usize), VmError> {
     let co_context = match state.current_thread.clone() {
         Some(ctx) => ctx,

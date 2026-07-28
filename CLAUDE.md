@@ -63,6 +63,7 @@
 - `tools/verify.sh`：编译器比对 → `cargo test` → `cargo build --release` → 运行 `tests_lua/` 全套 Lua 测试（含 `all.lua`）。日志输出到 `logs/` 目录。
 - `deps/test.sh`：第三方依赖库（lua-cjson / luasocket / lsqlite3 / luarocks / sol2）测试。
 - `tools/gc_bench_run.sh`：C 与 Rust 实现的 GC 性能对比测试。
+- `tools/miri.sh`：Miri UB 检测（本地工具，需 nightly 工具链）。检测 `tests_rs/` 与 `src_rs/` 单元测试中的未定义行为（越界访问、未初始化内存、Tree Borrows 违规等）。日志输出到 `logs/miri_test.log`。
 
 ### 测试分类
 1. **编译器比对测试**：`src_rs/compiler/cmp_tests.rs`，确保 Rust 编译器输出与 C 实现一致。
@@ -70,10 +71,52 @@
 3. **Lua 官方测试套件**：`tests_lua/` 下 30+ 个 `.lua` 测试文件，由 `verify.sh` 调用 `target/release/lua` 执行。
 4. **依赖库测试**：`deps/test.sh`，验证 Rust lua 的 C ABI 兼容性。
 5. **GC 性能对比**：`tools/gc_bench_run.sh`，对比 C 与 Rust 的 GC 性能。
+6. **Miri UB 检测**：`tools/miri.sh`，用 Miri 解释执行 Rust 测试检测 UB。覆盖范围与限制见下方"Miri 检测规则"章节。
 
 ## 编译器改动校验
 
 修改 `src_rs/` 下的核心数据文件或 `src_rs/compiler/` 目录时，需执行编译器比对测试（已固化到 hook），确保 Rust 输出与 C 实现一致。测试输出重定向到 `test.log` 查看。
+
+## Miri 检测规则
+
+### 使用方式
+```bash
+bash tools/miri.sh                # 运行全部可检测测试（首次会自动安装 nightly + miri）
+bash tools/miri.sh --setup        # 仅安装 nightly + miri 组件
+bash tools/miri.sh --filter math  # 仅运行名称含 "math" 的测试
+bash tools/miri.sh --lib          # 仅运行库单元测试 (src_rs/)
+bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
+```
+
+### 检测范围
+- **覆盖**：`tests_rs/` 7 个集成测试 + `src_rs/` 22 个含 `#[cfg(test)]` 的模块单元测试
+- **跳过**：
+  - `ffi` feature（链接 C liblua，Miri 无法解释 C 代码）
+  - `src_rs/compiler/cmp_tests.rs`（依赖 `ffi` feature）
+  - `tests_rs/integration_tests::test_stdin_execution`（`Command::spawn` 启动子进程，Miri 不支持）
+  - 任何调用 `lua_pushfstring` / `luaL_error`（来自 `capi_variadic.c`）的测试路径
+
+### 检测模型
+- **Tree Borrows**（`-Zmiri-tree-borrows`）：比 Stacked Borrows 宽松，适合本项目 `Rc` / `Arc` 重度共享场景，减少误报
+- **禁用环境隔离**（`-Zmiri-disable-isolation`）：允许测试访问文件系统与环境变量（`env!("CARGO_MANIFEST_DIR")` 等）
+
+### 编码约定
+- 新增测试若涉及 `Command::spawn`、`dlopen`、`extern "C"` 调用 C 代码、文件 IO、网络等 Miri 不支持的操作，必须用 `#[cfg_attr(miri, ignore)]` 标注跳过，并附注释说明原因
+- 新增 `unsafe` 块后建议运行 `bash tools/miri.sh --filter <相关测试名>` 验证无 UB
+- Miri 是本地工具，不集成 CI；开发者按需运行，日志输出到 `logs/miri_test.log`
+
+### 已知 Miri 兼容性处理
+- **io 库初始化跳过**：`src_rs/state.rs` 的 `open_selected_libs` 中，`open_io_lib` 用 `#[cfg(not(miri))]` 包围。原因：Miri 不支持 `extern static stdin/stdout/stderr`（`src_rs/stdlib/io_lib.rs`）与 `fdopen`。跳过后 `io` 全局表不存在，但 `print` 用 `state.stdout`（Rust `Box<dyn Write>`）不受影响。
+- **stdin_execution 测试跳过**：`tests_rs/integration_tests::test_stdin_execution` 用 `#[cfg_attr(miri, ignore)]` 跳过。原因：`Command::spawn` 启动子进程，Miri 不支持。
+- **信号处理跳过**：`src_rs/cli.rs` 的 `setup_signal_handler` / `reset_signal_handler` 用 `#[cfg(not(miri))]` 包围。原因：Miri 不支持 `sigemptyset` / `sigaction` 等信号操作。
+- **strcoll 替代**：`src_rs/vm.rs` 的 `strcoll_compare` 在 Miri 下用字节比较（`a.cmp(b)`）代替 `libc::strcoll`。原因：Miri 不支持 `strcoll`。默认 "C" locale 下两者行为一致。
+- **内存泄漏忽略**：MIRIFLAGS 中加 `-Zmiri-ignore-leaks`。原因：LuaState 中 Rc 循环引用（如 metatable/registry）导致测试结束时内存未释放，这是已知设计特性，不是 UB。
+- **函数指针比较跳过**：`test_call_ipairs` / `test_call_pairs` 用 `#[cfg_attr(miri, ignore)]` 跳过。原因：Miri 下函数指针地址比较不可靠（`bf.func as usize != fn as usize`）。
+- **浮点精度测试跳过/放宽**：`test_math_log_base_10` 跳过（`log10(100)` 输出 `1.9999999999999998` 而非 `2.0`）；`test_math_log_base` 容差在 Miri 下放宽至 `1e-10`。原因：Miri 浮点运算精度略低。
+
+### 已修复的 UB
+- **编译器 aliasing 违规**（已修复）：`src_rs/compiler/compile.rs` 中 `FuncState` 通过 `ls: *mut LexState` 裸指针持有 `LexState` 引用。在 `compile_chunk` 和 `parse_func_body` 中，`FuncState::new(ls)` 后仍直接使用 `ls`（如 `ls.next()`），这是 foreign write，导致 `FuncState` 持有的 Tree Borrows 标签变为 Disabled。修复方案：把 `FuncState::new` 后所有直接使用 `ls` 的地方改为通过 `fs.ls()` / `fs.ls_mut()` 访问，用临时变量分离借用范围避免与 `fs.proto` 冲突。
+- **内存分配对齐不匹配**（已修复）：`src_rs/mem.rs` 中 `DefaultAllocator` 用 `Layout::from_size_align(new_size, 1)` 即 1 字节对齐分配内存，但 `new_vec<T>` / `grow_vec<T>` / `shrink_vec<T>` 返回的 `Vec<T>` 在 drop 时用 `std::alloc::Global` 以 `T` 的对齐（如 `i32` 为 4 字节）释放，导致对齐不匹配 UB。修复方案：`new_vec` / `grow_vec` / `shrink_vec` / `new_box` 直接用 `std::alloc` API 并通过 `Layout::array::<T>(n)` 传入 `T` 的正确对齐，确保分配与释放的对齐一致；同时移除 `grow_vec` 中泄漏的"探测分配"（`safe_realloc(null, 0, new_size_bytes)` 分配后未释放）。
 
 ## Hook 机制
 

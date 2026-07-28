@@ -272,6 +272,8 @@ fn test_math_log_natural() {
     assert!(stdout.contains("0"));
 }
 
+// Miri 下 math.log(math.exp(1)) 精度不足,输出可能不含 "1"
+#[cfg_attr(miri, ignore)]
 #[test]
 fn test_math_log_e() {
     let output = run_lua_expr("print(math.log(math.exp(1)))");
@@ -288,6 +290,8 @@ fn test_math_log_base_2() {
     assert!(stdout.contains("3"));
 }
 
+// Miri 下 log10(100) 输出 1.9999999999999998 而非 2.0,字符串匹配失败
+#[cfg_attr(miri, ignore)]
 #[test]
 fn test_math_log_base_10() {
     let output = run_lua_expr("print(math.log(100, 10))");
@@ -786,6 +790,8 @@ fn test_math_random_no_args() {
     );
 }
 
+// Miri 下循环 100 次太慢
+#[cfg_attr(miri, ignore)]
 #[test]
 fn test_math_random_single_arg() {
     // 测试 100 次, 都应该在 [1, 6] 范围内
@@ -833,6 +839,8 @@ fn test_math_random_single_arg() {
     assert!(max_val <= 6, "max value {} should be <= 6", max_val);
 }
 
+// Miri 下循环 100 次太慢,导致 timeout
+#[cfg_attr(miri, ignore)]
 #[test]
 fn test_math_random_two_args() {
     // 测试 100 次, 都应该在 [10, 20] 范围内
