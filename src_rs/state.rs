@@ -2503,6 +2503,11 @@ impl LuaState {
         self.api_func_base = func_idx;
         self.n_ccalls = self.n_ccalls.saturating_add(1);
 
+        // 保存 call_info 长度，用于调用后清理（同 pcall_rust_fn 的处理）。
+        // C 函数内部可能推入额外 call_info 条目（如元方法条目），
+        // 错误路径下这些条目可能未被弹出。
+        let saved_call_info_len = self.call_info.len();
+
         // 推入 CallInfoEntry — 对应 C 的 luaD_precall 创建新 CallInfo
         // pcall 路径下，调用者是 pcall（内部 C 函数），不是 Lua 函数，
         // caller_proto=None 表示无法从代码分析函数名，lua_getinfo("n") 返回 NULL，
@@ -2544,7 +2549,13 @@ impl LuaState {
         // 恢复 api_func_base 和 n_ccalls（无论成功失败）
         self.api_func_base = saved_api_base;
         self.n_ccalls = self.n_ccalls.saturating_sub(1);
-        self.call_info.pop();
+
+        // 清理 call_info: 截断到调用前的长度（同 pcall_rust_fn 的处理）。
+        // yield 路径: 不截断（保留 call_info 供 resume 使用）。
+        let is_yield = self.pending_yield.is_some();
+        if !is_yield {
+            self.call_info.truncate(saved_call_info_len);
+        }
 
         // 检查 C 函数内部是否发生了 yield（通过 lua_pcall → pcall → pending_yield）
         // 对应 C Lua 中 yield 通过 longjmp 跨 C 函数传播。
@@ -2610,6 +2621,12 @@ impl LuaState {
     ) -> i32 {
         let nargs = self.stack.len().saturating_sub(func_idx + 1);
 
+        // 保存 call_info 长度，用于调用后清理。
+        // 函数指针内部可能推入额外 call_info 条目（如元方法条目），
+        // 错误路径下这些条目可能未被弹出（call_tm_res 在错误路径下保留元方法条目）。
+        // 使用 truncate 确保正确清理，而非简单的 pop（pop 会弹出错误的条目）。
+        let saved_call_info_len = self.call_info.len();
+
         // 推入 CallInfoEntry，让 debug.getinfo/traceback 能正确看到 C 函数帧
         self.call_info.push(crate::state::CallInfoEntry {
             caller_proto: None,
@@ -2628,8 +2645,14 @@ impl LuaState {
         let dispatch_result: Result<(), crate::execute::VmError> =
             func(self, func_idx, nargs, nresults);
 
-        // 弹出 C 函数的 CallInfoEntry
-        self.call_info.pop();
+        // 清理 call_info: 截断到调用前的长度，移除 pcall_rust_fn 推入的条目
+        // 以及函数指针内部可能残留的额外条目（如元方法条目）。
+        // yield 路径: 不截断（保留 call_info 供 resume 使用，对应 C Lua 中
+        // yield 通过 longjmp 跳出，CallInfo 保留在链表中）。
+        let is_yield = matches!(&dispatch_result, Err(crate::execute::VmError::Yield(_)));
+        if !is_yield {
+            self.call_info.truncate(saved_call_info_len);
+        }
 
         match dispatch_result {
             Ok(()) => 0,

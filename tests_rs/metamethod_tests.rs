@@ -537,6 +537,141 @@ fn test_unm_no_metamethod_error() {
     );
 }
 
+// ============================================================================
+// 9. call_info 残留测试 — pcall 捕获元方法错误后 traceback 无残留条目
+//
+// Bug 复现: pcall_rust_fn/pcall_c_function 在 BuiltinFn 内部触发元方法错误时,
+// call_tm_res 在错误路径下不弹出元方法条目, 而 pcall_rust_fn 的 call_info.pop()
+// 弹出的是元方法条目(最后一个)而非自己推入的函数条目, 导致 call_info 残留.
+// 修复: 改用 call_info.truncate(saved_call_info_len) 清理所有额外条目.
+// ============================================================================
+
+/// pcall 捕获 __newindex 元方法错误后, debug.traceback() 不应包含残留条目.
+///
+/// 场景: Lua 函数内部触发 __newindex 元方法, 元方法调用 error().
+/// pcall 捕获错误后, call_info 应恢复到 pcall 调用前的状态.
+#[test]
+fn test_pcall_metamethod_error_no_callinfo_leak() {
+    let output = run_lua(&[
+        "-e",
+        "local t = setmetatable({}, {\n\
+         \x20 __newindex = function(_, k) error(\"newindex error\") end,\n\
+         })\n\
+         local ok, err = pcall(function() t.x = 1 end)\n\
+         print(ok)\n\
+         print(debug.traceback(\"marker\", 0))",
+    ]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    // 第一行: false (pcall 捕获到错误)
+    assert!(lines[0].contains("false"), "pcall 应返回 false, got: {}", lines[0]);
+    // traceback 不应包含 "__newindex" 或 "newindex" 残留条目
+    let tb = &lines[1];
+    assert!(
+        !tb.contains("__newindex") && !tb.contains("newindex"),
+        "traceback 不应包含残留的元方法条目, got: {}",
+        tb
+    );
+}
+
+/// pcall 调用 BuiltinFn (table.move) 触发元方法错误后, traceback 无残留.
+///
+/// 场景: table.move 向带 __newindex 元方法的表写入, 触发 error().
+/// pcall 捕获错误后, call_info 不应残留 table.move 或元方法条目.
+/// 这是 sort.lua:201 `pcall(table.move, a, f, e, t)` 的最小复现.
+#[test]
+fn test_pcall_builtin_metamethod_error_no_callinfo_leak() {
+    let output = run_lua(&[
+        "-e",
+        "local src = {1, 2, 3}\n\
+         local dst = setmetatable({}, {\n\
+         \x20 __newindex = function(_, k, v) error(\"move error\") end,\n\
+         })\n\
+         local ok, err = pcall(table.move, src, 1, 3, 1, dst)\n\
+         print(ok)\n\
+         print(debug.traceback(\"marker\", 0))",
+    ]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(lines[0].contains("false"), "pcall 应返回 false, got: {}", lines[0]);
+    // traceback 不应包含 "move" 或 "__newindex" 残留条目
+    let tb = &lines[1];
+    assert!(
+        !tb.contains("move") && !tb.contains("__newindex"),
+        "traceback 不应包含残留的 BuiltinFn/元方法条目, got: {}",
+        tb
+    );
+}
+
+/// 连续多次 pcall 捕获元方法错误后, call_info 不累积残留条目.
+///
+/// 场景: 循环 100 次 pcall 触发 __newindex 错误, 每次 pcall 捕获错误后
+/// call_info 应完全清理. 第 100 次后的 traceback 不应包含任何残留.
+#[test]
+fn test_pcall_metamethod_error_repeated_no_callinfo_leak() {
+    let output = run_lua(&[
+        "-e",
+        "local t = setmetatable({}, {\n\
+         \x20 __newindex = function(_, k) error(\"err\") end,\n\
+         })\n\
+         for i = 1, 100 do\n\
+         \x20 pcall(function() t.x = 1 end)\n\
+         end\n\
+         print(debug.traceback(\"marker\", 0))",
+    ]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    // traceback 行数应很少 (只有 marker + main chunk), 不应有 100 个残留条目
+    let tb_line = stdout.lines().next().unwrap_or("");
+    assert!(
+        tb_line.contains("marker"),
+        "应输出 traceback marker, got: {}",
+        tb_line
+    );
+    // 整个 stdout 不应包含大量 "__newindex" 残留
+    let leak_count = stdout.matches("__newindex").count();
+    assert_eq!(
+        leak_count, 0,
+        "traceback 不应包含残留的 __newindex 条目, 但发现 {} 个",
+        leak_count
+    );
+}
+
+/// pcall 捕获元方法错误后, 后续 error 的 traceback 不包含残留条目.
+///
+/// 场景: pcall 捕获 __newindex 错误后, 触发一个新的 error.
+/// 新 error 的 traceback 不应包含之前 pcall 的残留 call_info 条目.
+/// 这正是 all.lua 中 dofile('sort.lua') 后 dofile('files.lua') assert 失败的场景.
+#[test]
+fn test_pcall_metamethod_error_no_traceback_leak_on_subsequent_error() {
+    let output = run_lua(&[
+        "-e",
+        "local t = setmetatable({}, {\n\
+         \x20 __newindex = function(_, k) error(\"inner error\") end,\n\
+         })\n\
+         -- pcall 捕获元方法错误 (可能残留 call_info)\n\
+         pcall(function() t.x = 1 end)\n\
+         -- 后续 error 的 traceback 不应包含残留条目\n\
+         local ok, err = pcall(error, \"outer error\")\n\
+         print(ok)\n\
+         -- 检查 err 中的 traceback (pcall 返回的 err 包含 traceback)\n\
+         -- 不应包含 __newindex 残留\n\
+         local has_leak = string.find(err, \"__newindex\", 1, true) ~= nil\n\
+         print(not has_leak)",
+    ]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert!(lines[0].contains("false"), "pcall 应返回 false, got: {}", lines[0]);
+    assert!(
+        lines[1].contains("true"),
+        "后续 error 的 traceback 不应包含 __newindex 残留, got: {}",
+        lines[1]
+    );
+}
+
 /// 无元方法时: ~表 应报错
 #[test]
 fn test_bnot_no_metamethod_error() {
