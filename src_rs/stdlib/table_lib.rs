@@ -12,8 +12,10 @@
 use crate::execute::{arg_error, VmError};
 use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
+use crate::table::Table;
 use crate::tm::{call_order_tm, obj_type_name, TagMethod};
 use crate::vm::VmExecutor;
+use std::rc::Rc;
 
 // ============================================================================
 // 函数标签 (已迁移到 BuiltinFn，不再使用 LightUserData tag)
@@ -299,15 +301,11 @@ fn call_unpack(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
             drop(data);
             let mut idx = i;
             while idx < j {
-                let val = t
-                    .get_int(idx)
-                    .unwrap_or(TValue::Nil(NilKind::Strict));
+                let val = t.get_int(idx).unwrap_or(TValue::Nil(NilKind::Strict));
                 state.stack.push(val);
                 idx += 1;
             }
-            let val = t
-                .get_int(j)
-                .unwrap_or(TValue::Nil(NilKind::Strict));
+            let val = t.get_int(j).unwrap_or(TValue::Nil(NilKind::Strict));
             state.stack.push(val);
             state.adjust_results_on_stack(a, nresults, n, first_result_pos);
             return Ok(());
@@ -329,7 +327,7 @@ fn call_unpack(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
 
 /// table.pack(...)
 fn call_pack(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
-    let t = crate::table::Table::new();
+    let t = Table::new();
     for i in 0..nargs {
         let val = get_arg(state, a, i);
         t.set_int((i + 1) as i64, val);
@@ -693,7 +691,7 @@ fn call_create(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         return Err(VmError::RuntimeError("table overflow".to_string()));
     }
 
-    let table = crate::table::Table::with_capacity(sizeseq as usize, sizerest as usize);
+    let table = Table::with_capacity(sizeseq as usize, sizerest as usize);
     // 注册到 GC 并估算大小 (对应 C 中 lua_createtable 触发的 GC 跟踪)
     // 估算: array 部分 sizeseq * sizeof(TValue) + hash 部分预留容量 * 节点大小
     let estimated_size = sizeseq as usize * std::mem::size_of::<TValue>()
@@ -765,7 +763,7 @@ fn call_move(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
         // 决定复制方向: 当源和目标重叠时反向复制避免覆盖未读取元素
         // C: t > e || t <= f || (tt != 1 && !lua_compare(L, 1, tt, LUA_OPEQ))
         let src_eq_dst = match (&src_val, &dst_val) {
-            (TValue::Table(s), TValue::Table(d)) => std::rc::Rc::ptr_eq(&s.data, &d.data),
+            (TValue::Table(s), TValue::Table(d)) => Rc::ptr_eq(&s.data, &d.data),
             _ => false,
         };
         let ascending = t > e || t <= f || !src_eq_dst;
@@ -913,7 +911,7 @@ fn call_comp_function(
 
 /// 打开 Table 库并注册到全局变量 table
 pub fn open_table_lib(state: &mut LuaState) {
-    let mut lib = crate::table::Table::new();
+    let mut lib = Table::new();
 
     // 注册所有 Table 函数 (使用 BuiltinFn 函数指针)
     let register = |lib: &mut crate::table::Table,
@@ -921,7 +919,13 @@ pub fn open_table_lib(state: &mut LuaState) {
                     func: crate::objects::BuiltinFnPtr| {
         let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
         let name_ptr = name.as_ptr() as *const u8;
-        lib.set(key, TValue::BuiltinFn(BuiltinFn { func, name: name_ptr }));
+        lib.set(
+            key,
+            TValue::BuiltinFn(BuiltinFn {
+                func,
+                name: name_ptr,
+            }),
+        );
     };
 
     register(&mut lib, c"concat", call_concat);

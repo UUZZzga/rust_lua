@@ -13,7 +13,9 @@
 //!   由 op_call 的 RustClosure 分支派发到 call_wrap_fn
 
 use crate::execute::{VmError, VmExecutor, VmResult};
-use crate::objects::{BuiltinFn, LuaThread, NilKind, TValue, Table, ThreadContext, ThreadStatus, UpVal, UpValRef};
+use crate::objects::{
+    BuiltinFn, LuaThread, NilKind, TValue, Table, ThreadContext, ThreadStatus, UpVal, UpValRef,
+};
 use crate::state::LuaState;
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -174,7 +176,10 @@ fn save_caller_context(state: &mut LuaState) -> CallerContext {
         is_vararg: state.is_vararg,
         proto_flag: state.proto_flag,
         nextraargs: state.nextraargs,
-        closure_upvals: std::mem::replace(&mut state.closure_upvals, Rc::new(RefCell::new(Vec::new()))),
+        closure_upvals: std::mem::replace(
+            &mut state.closure_upvals,
+            Rc::new(RefCell::new(Vec::new())),
+        ),
         open_upvals: std::mem::take(&mut state.open_upvals),
         open_upval: state.open_upval,
         tbc_list: state.tbc_list,
@@ -249,7 +254,9 @@ fn close_open_upvals(thread: &LuaThread, state: &mut LuaState) -> Vec<OpenUpvalI
         if let Some(boxed_func) = &thread.function {
             if let TValue::LClosure(closure) = boxed_func.as_ref() {
                 // Lua 函数体: 递归收集所有可达 LClosure 的 Open upvalue（包括嵌套闭包的 upvalue）
-                let mut visited = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
+                let mut visited = std::collections::HashSet::with_hasher(
+                    crate::objects::FxBuildHasher::default(),
+                );
                 collect_and_close_upvals(
                     &closure.upvals.borrow(),
                     state,
@@ -262,7 +269,9 @@ fn close_open_upvals(thread: &LuaThread, state: &mut LuaState) -> Vec<OpenUpvalI
                 // 参数在 call_resume 中通过 state.stack[a+2..] 访问（resume_args 之前）
                 // 但此时还未 save_caller_context，state.stack 仍是父栈
                 // 直接扫描栈上的 LClosure 参数
-                let mut visited = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
+                let mut visited = std::collections::HashSet::with_hasher(
+                    crate::objects::FxBuildHasher::default(),
+                );
                 scan_stack_for_closures(state, &mut result, &mut visited);
             }
         }
@@ -283,7 +292,8 @@ fn scan_stack_for_closures(
     result: &mut Vec<OpenUpvalInfo>,
     visited: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
 ) {
-    let mut visited_tables = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
+    let mut visited_tables =
+        std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
     // 先 clone 栈上的 LClosure/Table 引用（避免遍历时借用 state.stack）
     let closures: Vec<Rc<RefCell<Vec<UpValRef>>>> = state
         .stack
@@ -347,7 +357,8 @@ fn collect_and_close_upvals(
     result: &mut Vec<OpenUpvalInfo>,
     visited: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
 ) {
-    let mut visited_tables = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
+    let mut visited_tables =
+        std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
     collect_and_close_upvals_impl(upvals, state, result, visited, &mut visited_tables);
 }
 
@@ -481,7 +492,8 @@ fn scan_table_and_close_upvals(
 pub fn close_hook_upvals(hook: &TValue, state: &mut LuaState) {
     if let TValue::LClosure(closure) = hook {
         let mut result = Vec::new();
-        let mut visited = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
+        let mut visited =
+            std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
         collect_and_close_upvals(&closure.upvals.borrow(), state, &mut result, &mut visited);
     }
 }
@@ -495,7 +507,8 @@ fn collect_wrap_upvals_info(
 ) -> Vec<(UpValRef, usize, TValue)> {
     let mut result = Vec::new();
     if let Some(boxed_func) = &thread.function {
-        let mut visited = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
+        let mut visited =
+            std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
         if let TValue::LClosure(closure) = boxed_func.as_ref() {
             collect_open_upvals_recursive(
                 &closure.upvals.borrow(),
@@ -505,7 +518,8 @@ fn collect_wrap_upvals_info(
             );
         } else {
             // C 函数体: 扫描栈上的 LClosure 和 Table 参数
-            let mut visited_tables = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
+            let mut visited_tables =
+                std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
             for v in state.stack.iter() {
                 match v {
                     TValue::LClosure(closure) => {
@@ -541,7 +555,8 @@ fn collect_open_upvals_recursive(
     result: &mut Vec<(UpValRef, usize, TValue)>,
     visited: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
 ) {
-    let mut visited_tables = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
+    let mut visited_tables =
+        std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
     collect_open_upvals_recursive_impl(upvals, state, result, visited, &mut visited_tables);
 }
 
@@ -715,8 +730,10 @@ fn sync_upvals_back(
 /// 返回 (uv_ref, original_stack_index) 列表，供 resume 时同步回协程栈
 fn close_yield_upvals(yield_values: &[TValue], state: &mut LuaState) -> Vec<(UpValRef, usize)> {
     let mut result_info: Vec<OpenUpvalInfo> = Vec::new();
-    let mut visited = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
-    let mut visited_tables = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
+    let mut visited =
+        std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
+    let mut visited_tables =
+        std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
     for v in yield_values {
         match v {
             TValue::LClosure(closure) => {
@@ -1441,7 +1458,8 @@ fn call_resume(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
                 ctx.saved_is_vararg = state.is_vararg;
                 ctx.saved_proto_flag = state.proto_flag;
                 ctx.saved_nextraargs = state.nextraargs;
-                ctx.saved_closure_upvals = std::mem::replace(&mut state.closure_upvals, Rc::new(RefCell::new(Vec::new())));
+                ctx.saved_closure_upvals =
+                    std::mem::replace(&mut state.closure_upvals, Rc::new(RefCell::new(Vec::new())));
                 ctx.saved_open_upvals = std::mem::take(&mut state.open_upvals);
                 ctx.saved_open_upval = state.open_upval;
                 ctx.saved_tbc_list = state.tbc_list;
@@ -1539,7 +1557,8 @@ fn call_resume(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
                     if let TValue::BuiltinFn(bf) = f.as_ref() {
                         let func_ptr = bf.func as *const () as usize;
                         func_ptr == crate::stdlib::base_lib::call_pcall as *const () as usize
-                            || func_ptr == crate::stdlib::base_lib::call_xpcall as *const () as usize
+                            || func_ptr
+                                == crate::stdlib::base_lib::call_xpcall as *const () as usize
                     } else {
                         false
                     }
@@ -1913,7 +1932,12 @@ fn call_wrap(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
         name: c"wrap".as_ptr() as *const u8,
         upvalues: Rc::new(RefCell::new(vec![TValue::Thread(thread_rc)])),
     };
-    push_single_result(state, a, nresults, TValue::RustClosure(Rc::new(wrap_closure)));
+    push_single_result(
+        state,
+        a,
+        nresults,
+        TValue::RustClosure(Rc::new(wrap_closure)),
+    );
     Ok(())
 }
 
@@ -2116,7 +2140,8 @@ fn call_wrap_fn(
                 ctx.saved_is_vararg = state.is_vararg;
                 ctx.saved_proto_flag = state.proto_flag;
                 ctx.saved_nextraargs = state.nextraargs;
-                ctx.saved_closure_upvals = std::mem::replace(&mut state.closure_upvals, Rc::new(RefCell::new(Vec::new())));
+                ctx.saved_closure_upvals =
+                    std::mem::replace(&mut state.closure_upvals, Rc::new(RefCell::new(Vec::new())));
                 ctx.saved_open_upvals = std::mem::take(&mut state.open_upvals);
                 ctx.saved_open_upval = state.open_upval;
                 ctx.saved_tbc_list = state.tbc_list;
@@ -2300,10 +2325,16 @@ pub fn c_api_resume(state: &mut LuaState, nargs: usize) -> Result<(i32, usize), 
     match co_status {
         ThreadStatus::Suspended => {}
         ThreadStatus::Normal => {
-            return Ok((crate::capi::LUA_ERRRUN, push_error(state, "cannot resume non-suspended coroutine")));
+            return Ok((
+                crate::capi::LUA_ERRRUN,
+                push_error(state, "cannot resume non-suspended coroutine"),
+            ));
         }
         ThreadStatus::OK | ThreadStatus::Error => {
-            return Ok((crate::capi::LUA_ERRRUN, push_error(state, "cannot resume dead coroutine")));
+            return Ok((
+                crate::capi::LUA_ERRRUN,
+                push_error(state, "cannot resume dead coroutine"),
+            ));
         }
     }
 
@@ -2365,7 +2396,10 @@ pub fn c_api_resume(state: &mut LuaState, nargs: usize) -> Result<(i32, usize), 
     if state.n_ccalls >= crate::state::LUAI_MAXCCALLS {
         state.n_ccalls = saved_n_ccalls;
         state.n_ny_calls = saved_n_ny_calls;
-        return Ok((crate::capi::LUA_ERRRUN, push_error(state, "C stack overflow")));
+        return Ok((
+            crate::capi::LUA_ERRRUN,
+            push_error(state, "C stack overflow"),
+        ));
     }
 
     // 设置 current_thread 和状态为 Normal
@@ -2393,7 +2427,8 @@ pub fn c_api_resume(state: &mut LuaState, nargs: usize) -> Result<(i32, usize), 
                 ctx.saved_is_vararg = state.is_vararg;
                 ctx.saved_proto_flag = state.proto_flag;
                 ctx.saved_nextraargs = state.nextraargs;
-                ctx.saved_closure_upvals = std::mem::replace(&mut state.closure_upvals, Rc::new(RefCell::new(Vec::new())));
+                ctx.saved_closure_upvals =
+                    std::mem::replace(&mut state.closure_upvals, Rc::new(RefCell::new(Vec::new())));
                 ctx.saved_open_upvals = std::mem::take(&mut state.open_upvals);
                 ctx.saved_open_upval = state.open_upval;
                 ctx.saved_tbc_list = state.tbc_list;
@@ -2420,7 +2455,10 @@ pub fn c_api_resume(state: &mut LuaState, nargs: usize) -> Result<(i32, usize), 
             state.top = state.stack.len();
             (crate::capi::LUA_YIELD, n)
         }
-        Ok(VmResult::Return { nresults: ret_n, result_base }) => {
+        Ok(VmResult::Return {
+            nresults: ret_n,
+            result_base,
+        }) => {
             // 协程返回 — 取出返回值，重新设置栈
             let co_stack = std::mem::take(&mut state.stack);
             co_context.borrow_mut().status = ThreadStatus::OK;
@@ -2492,7 +2530,10 @@ pub fn c_api_resume(state: &mut LuaState, nargs: usize) -> Result<(i32, usize), 
 
 /// 把错误消息 push 到 state.stack，返回 nresults (1)
 fn push_error(state: &mut LuaState, msg: &str) -> usize {
-    state.stack = vec![TValue::Nil(NilKind::Strict), TValue::Str(state.intern_str(msg))];
+    state.stack = vec![
+        TValue::Nil(NilKind::Strict),
+        TValue::Str(state.intern_str(msg)),
+    ];
     state.top = 2;
     1
 }
@@ -2502,7 +2543,7 @@ fn push_error(state: &mut LuaState, msg: &str) -> usize {
 // ============================================================================
 
 pub fn open_coroutine_lib(state: &mut LuaState) {
-    let mut lib = crate::table::Table::new();
+    let mut lib = Table::new();
 
     // 注册 BuiltinFn 的辅助闭包：用函数指针 + 名字注册到表
     // (state 作为参数传入，避免闭包捕获 state 导致借用冲突)
@@ -2512,7 +2553,13 @@ pub fn open_coroutine_lib(state: &mut LuaState) {
                     func: crate::objects::BuiltinFnPtr| {
         let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
         let name_ptr = name.as_ptr() as *const u8;
-        lib.set(key, TValue::BuiltinFn(BuiltinFn { func, name: name_ptr }));
+        lib.set(
+            key,
+            TValue::BuiltinFn(BuiltinFn {
+                func,
+                name: name_ptr,
+            }),
+        );
     };
 
     register(&mut lib, state, c"create", call_create);

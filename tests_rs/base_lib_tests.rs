@@ -881,7 +881,7 @@ fn test_unit_base_rawlen() {
     assert_eq!(base_lib::base_rawlen(&make_str("hello")).unwrap(), 5);
     assert_eq!(base_lib::base_rawlen(&make_str("")).unwrap(), 0);
 
-    let mut t = Table::new();
+    let t = Table::new();
     t.set(TValue::Integer(1), TValue::Integer(10));
     t.set(TValue::Integer(2), TValue::Integer(20));
     assert_eq!(base_lib::base_rawlen(&TValue::Table(t)).unwrap(), 2);
@@ -974,15 +974,17 @@ fn test_unit_open_base_lib() {
 fn test_unit_call_ipairs_aux() {
     let mut state = LuaState::new();
     state.stack.clear();
-    let mut t = Table::new();
+    let t = Table::new();
     t.set(TValue::Integer(1), TValue::Integer(10));
     t.set(TValue::Integer(2), TValue::Integer(20));
     // base 库已迁移到 BuiltinFn，ipairs 返回的迭代器是 BuiltinFn(call_ipairs_aux)。
     // call_ipairs_aux 不读取函数槽 (position a)，此处用 BuiltinFn 占位以模拟真实场景。
-    state.stack.push(TValue::BuiltinFn(lua_rs::objects::BuiltinFn {
-        func: base_lib::call_ipairs_aux,
-        name: b"for iterator\0".as_ptr() as *const u8,
-    }));
+    state
+        .stack
+        .push(TValue::BuiltinFn(lua_rs::objects::BuiltinFn {
+            func: base_lib::call_ipairs_aux,
+            name: b"for iterator\0".as_ptr() as *const u8,
+        }));
     state.stack.push(TValue::Table(t));
     state.stack.push(TValue::Integer(0));
     base_lib::call_ipairs_aux(&mut state, 0, 2, -1).unwrap();

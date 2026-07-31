@@ -58,10 +58,12 @@ impl Table {
                 array: (0..narray).map(|_| TValue::Nil(NilKind::Empty)).collect(),
                 hash_buckets: Vec::with_capacity(nhash),
                 key_to_bucket: if nhash > 0 {
-                    Some(Box::new(crate::objects::TableHashMap::with_capacity_and_hasher(
-                        nhash,
-                        crate::objects::FxBuildHasher::default(),
-                    )))
+                    Some(Box::new(
+                        crate::objects::TableHashMap::with_capacity_and_hasher(
+                            nhash,
+                            crate::objects::FxBuildHasher::default(),
+                        ),
+                    ))
                 } else {
                     None
                 },
@@ -281,13 +283,11 @@ impl Table {
         } else {
             value
         };
-        let ktb = data
-            .key_to_bucket
-            .get_or_insert_with(|| {
-                Box::new(crate::objects::TableHashMap::with_hasher(
-                    crate::objects::FxBuildHasher::default(),
-                ))
-            });
+        let ktb = data.key_to_bucket.get_or_insert_with(|| {
+            Box::new(crate::objects::TableHashMap::with_hasher(
+                crate::objects::FxBuildHasher::default(),
+            ))
+        });
         // 先检查 key 是否已存在，避免克隆 key
         if let Some(idx) = ktb.get(key) {
             data.hash_buckets[*idx].1 = val;
@@ -543,8 +543,7 @@ impl Table {
         let data = self.data.borrow();
         let mut size = std::mem::size_of::<Table>()
             + data.array.capacity() * std::mem::size_of::<TValue>()
-            + data.hash_buckets.capacity()
-                * (std::mem::size_of::<TValue>() * 2);
+            + data.hash_buckets.capacity() * (std::mem::size_of::<TValue>() * 2);
         // key_to_bucket HashMap 堆占用：capacity * (size_of::<TValue>() + size_of::<usize>())
         // + HashMap 内部控制结构（约 56 字节）
         if let Some(ref ktb) = data.key_to_bucket {

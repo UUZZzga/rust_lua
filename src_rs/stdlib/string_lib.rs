@@ -11,64 +11,10 @@
 use crate::execute::{arg_error, VmError};
 use crate::objects::{BuiltinFn, BuiltinFnPtr, LuaType, NilKind, TValue};
 use crate::state::LuaState;
+use crate::strings::LuaString;
 use crate::table::Table;
 use crate::tm::{make_tm_tvalue, Metatable, TagMethod, TM_N};
-use crate::strings::LuaString;
 use std::rc::Rc;
-
-// ============================================================================
-// 算术元方法 (对应 C 的 arith_add, arith_sub, ...)
-// ============================================================================
-
-/// 将 TValue 转换为数字 (整数优先，其次浮点)
-/// 对应 C 的 tonum: 尝试将栈值转为数字
-fn to_num(v: &TValue) -> Option<TValue> {
-    match v {
-        TValue::Integer(i) => Some(TValue::Integer(*i)),
-        TValue::Float(f) => Some(TValue::Float(*f)),
-        TValue::Str(s) => {
-            let s = s.as_str();
-            if let Ok(i) = s.parse::<i64>() {
-                Some(TValue::Integer(i))
-            } else if let Some(f) = crate::float_utils::f64_from_str(s) {
-                Some(TValue::Float(f))
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-/// 通用算术元方法 — 对应 C 的 arith 函数
-///
-/// 尝试将两个操作数转为数字并执行算术运算。
-/// 返回 None 表示无法转换，需要回退到其他元方法。
-fn arith_op(
-    v1: &TValue,
-    v2: &TValue,
-    int_op: fn(i64, i64) -> Option<i64>,
-    float_op: fn(f64, f64) -> f64,
-) -> Option<TValue> {
-    let n1 = to_num(v1)?;
-    let n2 = to_num(v2)?;
-    match (&n1, &n2) {
-        (TValue::Integer(i1), TValue::Integer(i2)) => int_op(*i1, *i2).map(TValue::Integer),
-        _ => {
-            let f1 = match &n1 {
-                TValue::Integer(i) => *i as f64,
-                TValue::Float(f) => *f,
-                _ => return None,
-            };
-            let f2 = match &n2 {
-                TValue::Integer(i) => *i as f64,
-                TValue::Float(f) => *f,
-                _ => return None,
-            };
-            Some(TValue::Float(float_op(f1, f2)))
-        }
-    }
-}
 
 // 算术运算辅助函数
 fn add_int(a: i64, b: i64) -> Option<i64> {
@@ -595,7 +541,12 @@ fn match_capture(ms: &MatchState<'_>, s: usize, l: u8) -> Result<Option<usize>, 
 }
 
 /// 对应 C 的 max_expand
-fn max_expand(ms: &mut MatchState<'_>, s: usize, p: usize, ep: usize) -> Result<Option<usize>, String> {
+fn max_expand(
+    ms: &mut MatchState<'_>,
+    s: usize,
+    p: usize,
+    ep: usize,
+) -> Result<Option<usize>, String> {
     // perf: 批量扫描快速路径 — 对常见模式类 (., %a, %d, %s 等) 用循环直接计数,
     // 避免逐字符调用 single_match 的函数调用 + match 分支判断开销。
     // max_expand 占 3.68%, 前进阶段 (while single_match) 是主要开销。
@@ -637,7 +588,11 @@ fn max_expand(ms: &mut MatchState<'_>, s: usize, p: usize, ep: usize) -> Result<
     // 注意: 必须排除 ( ) $ 等在 match_pattern_inner 中有特殊处理的字符, 否则会错误地
     // 将它们当作字面量比较 (如 $ 应检查 src_end 而非字符匹配)。
     let next_p = ep + 1;
-    let next_c = if next_p < ms.p_end { ms.pat_byte(next_p) } else { 0 };
+    let next_c = if next_p < ms.p_end {
+        ms.pat_byte(next_p)
+    } else {
+        0
+    };
     // 字面量字符判断: 非 . % [ ( ) $ 且 next_p+1 不是量词 (* + ? -)
     let next_is_literal = next_c != 0
         && next_c != b'.'
@@ -736,7 +691,8 @@ fn match_pattern_inner(
             b'%' if p + 1 < ms.p_end && {
                 let c2 = ms.pat_byte(p + 1);
                 c2 == b'b' || c2 == b'f' || c2.is_ascii_digit()
-            } => {
+            } =>
+            {
                 match ms.pat_byte(p + 1) {
                     b'b' => {
                         let res = match_balance(ms, s, p + 2)?;
@@ -792,7 +748,11 @@ fn match_pattern_inner(
                 // match_pattern 是最大热点 (11.80%), 每次省 2 次函数调用 + 分支判断。
                 // c 已在 match 前读取, 无需再调 pat_byte(p)。
                 if c != b'.' && c != b'%' && c != b'[' {
-                    let next = if p + 1 < ms.p_end { ms.pat_byte(p + 1) } else { 0 };
+                    let next = if p + 1 < ms.p_end {
+                        ms.pat_byte(p + 1)
+                    } else {
+                        0
+                    };
                     if next != b'*' && next != b'+' && next != b'?' && next != b'-' {
                         if s < ms.src_end && ms.src_byte(s) == c {
                             s += 1;
@@ -846,7 +806,12 @@ fn match_pattern_inner(
 
 /// 获取第 i 个捕获的内容
 /// 返回 (start, length) 或位置捕获
-fn get_one_capture(ms: &MatchState<'_>, i: usize, s: usize, e: usize) -> Result<CaptureResult, String> {
+fn get_one_capture(
+    ms: &MatchState<'_>,
+    i: usize,
+    s: usize,
+    e: usize,
+) -> Result<CaptureResult, String> {
     if i >= ms.level {
         if i != 0 {
             return Err(format!("invalid capture index %{}", i + 1));
@@ -1034,10 +999,7 @@ impl GMatchIterator {
         }
     }
 
-    pub fn next(
-        &mut self,
-        table: &crate::strings::StringTable,
-    ) -> Result<Vec<TValue>, String> {
+    pub fn next(&mut self, table: &crate::strings::StringTable) -> Result<Vec<TValue>, String> {
         let src_bytes = self.src.as_bytes();
         let len = src_bytes.len();
         while self.pos <= len {
@@ -1057,9 +1019,9 @@ impl GMatchIterator {
                     };
                     if captures.is_empty() {
                         // 无捕获时返回整个匹配的子串
-                        return Ok(vec![TValue::Str(table.intern_bytes(
-                            &src_bytes[match_start..end],
-                        ))]);
+                        return Ok(vec![TValue::Str(
+                            table.intern_bytes(&src_bytes[match_start..end]),
+                        )]);
                     }
                     return Ok(captures);
                 }
@@ -1254,7 +1216,11 @@ fn add_value_from_repl(
         }
         // function 替换 — 对应 C 的 LUA_TFUNCTION 分支
         // LightUserData (base 库 tag 函数) 和 BuiltinFn (已迁移库) 都算 function
-        TValue::LClosure(_) | TValue::CClosure(_) | TValue::LCFn(_) | TValue::LightUserData(_) | TValue::BuiltinFn(_) => {
+        TValue::LClosure(_)
+        | TValue::CClosure(_)
+        | TValue::LCFn(_)
+        | TValue::LightUserData(_)
+        | TValue::BuiltinFn(_) => {
             // push_captures(ms, s, e) — 所有捕获作为参数
             let n = if ms.level == 0 { 1 } else { ms.level };
             let mut captures = Vec::with_capacity(n);
@@ -1335,7 +1301,12 @@ fn format_float_value(f: f64) -> String {
 }
 
 /// 处理替换字符串中的 %0, %1-%9
-fn apply_replacement(repl: &str, ms: &MatchState<'_>, s: usize, e: usize) -> Result<String, String> {
+fn apply_replacement(
+    repl: &str,
+    ms: &MatchState<'_>,
+    s: usize,
+    e: usize,
+) -> Result<String, String> {
     // 使用 Vec<u8> 构建结果，避免 as char 转换导致字节值变化
     let mut result: Vec<u8> = Vec::new();
     let repl_bytes = repl.as_bytes();
@@ -1361,7 +1332,7 @@ fn apply_replacement(repl: &str, ms: &MatchState<'_>, s: usize, e: usize) -> Res
                     }
                     CaptureResult::Pos(pos) => {
                         result.extend_from_slice(
-                            crate::float_utils::i64_to_string(pos as i64).as_bytes()
+                            crate::float_utils::i64_to_string(pos as i64).as_bytes(),
                         );
                     }
                 }
@@ -1521,9 +1492,9 @@ fn format_hex_float(n: f64, precision: Option<usize>, upper: bool) -> String {
     // 尾数位 0-51, 最高 4 位 (48-51) 是第一个十六进制数字
     let mut frac_str = String::new();
     for i in 0..prec {
-        let shift = 52 - 4 * (i + 1);
+        let shift = 52i32 - 4 * (i as i32 + 1);
         let digit = if shift >= 0 {
-            ((frac_bits >> shift) & 0xF) as usize
+            ((frac_bits >> (shift as usize)) & 0xF) as usize
         } else {
             // 超出尾数精度, 补 0
             0
@@ -2084,7 +2055,8 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                             } else {
                                 // 使用 %f 格式
                                 let decimal_places = ((p as i32 - 1 - exp).max(0)) as usize;
-                                let mut s = crate::float_utils::f64_to_string_fixed(n, decimal_places);
+                                let mut s =
+                                    crate::float_utils::f64_to_string_fixed(n, decimal_places);
                                 // 去除尾随零 (除非有 # 标志)
                                 if !alt_form && s.contains('.') {
                                     s = s.trim_end_matches('0').to_string();
@@ -2157,7 +2129,13 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                             }
                         }
                         TValue::Nil(_) => "nil".to_string(),
-                        TValue::Boolean(b) => if *b { "true".to_string() } else { "false".to_string() },
+                        TValue::Boolean(b) => {
+                            if *b {
+                                "true".to_string()
+                            } else {
+                                "false".to_string()
+                            }
+                        }
                         _ => {
                             return Err(format!(
                                 "bad argument #{} to 'format' (no proper format)",
@@ -2189,7 +2167,9 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                     // 无修饰符: 直接输出，避免 String 分配
                     match arg {
                         TValue::Str(s) => result.push_str(s.as_str()),
-                        TValue::Integer(n) => result.push_str(&crate::float_utils::i64_to_string(*n)),
+                        TValue::Integer(n) => {
+                            result.push_str(&crate::float_utils::i64_to_string(*n))
+                        }
                         TValue::Float(f) => {
                             if f.is_nan() {
                                 result.push_str("nan");
@@ -3250,8 +3230,11 @@ fn tostring_for_format(state: &mut LuaState, val: &TValue) -> Option<String> {
 /// 预扫描格式字符串,返回使用 %s (或 %.Ns 等) 的参数索引集合 (0-based)。
 /// 仅这些参数需要对 table 调用 __tostring 元方法 (对应 C 的 luaL_tolstring)。
 /// %q 等其他 specifier 不应转换 table,以便 str_format 能正确报 "value has no literal form"。
-fn find_s_arg_indices(fmt: &str) -> std::collections::HashSet<usize, crate::objects::FxBuildHasher> {
-    let mut indices = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
+fn find_s_arg_indices(
+    fmt: &str,
+) -> std::collections::HashSet<usize, crate::objects::FxBuildHasher> {
+    let mut indices =
+        std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
     let bytes = fmt.as_bytes();
     let mut i = 0;
     let mut arg_idx = 0usize;
@@ -3823,7 +3806,7 @@ fn call_str_gmatch(
     let pat_start = if anchor { 1 } else { 0 };
 
     // 创建状态表
-    let mut state_table = crate::table::Table::new();
+    let mut state_table = Table::new();
     state_table.set(
         TValue::Str(state.intern_str("s")),
         TValue::Str(state.intern_str(&s)),
@@ -3853,7 +3836,7 @@ fn call_str_gmatch(
 
     // 创建元表,设置 __call = BuiltinFn(call_gmatch_iter)
     // 迭代器作为 BuiltinFn 注册,无需 tag 派发
-    let mut mt = crate::table::Table::new();
+    let mut mt = Table::new();
     mt.set(
         TValue::Str(state.intern_str("__call")),
         TValue::BuiltinFn(BuiltinFn {
@@ -4016,14 +3999,62 @@ pub fn create_string_metatable(state: &mut LuaState) {
     let mut mt_table = Table::new();
 
     // 设置算术元方法 (对应 C 的 stringmetamethods 数组)
-    set_arith_method(&mut mt_table, &state.tmnames, TagMethod::Add, add_int, add_f);
-    set_arith_method(&mut mt_table, &state.tmnames, TagMethod::Sub, sub_int, sub_f);
-    set_arith_method(&mut mt_table, &state.tmnames, TagMethod::Mul, mul_int, mul_f);
-    set_arith_method(&mut mt_table, &state.tmnames, TagMethod::Mod, mod_int, mod_f);
-    set_arith_method(&mut mt_table, &state.tmnames, TagMethod::Pow, |_, _| None, pow_f);
-    set_arith_method(&mut mt_table, &state.tmnames, TagMethod::Div, |_, _| None, div_f);
-    set_arith_method(&mut mt_table, &state.tmnames, TagMethod::IDiv, idiv_int, idiv_f);
-    set_arith_method(&mut mt_table, &state.tmnames, TagMethod::Unm, unm_int, unm_f);
+    set_arith_method(
+        &mut mt_table,
+        &state.tmnames,
+        TagMethod::Add,
+        add_int,
+        add_f,
+    );
+    set_arith_method(
+        &mut mt_table,
+        &state.tmnames,
+        TagMethod::Sub,
+        sub_int,
+        sub_f,
+    );
+    set_arith_method(
+        &mut mt_table,
+        &state.tmnames,
+        TagMethod::Mul,
+        mul_int,
+        mul_f,
+    );
+    set_arith_method(
+        &mut mt_table,
+        &state.tmnames,
+        TagMethod::Mod,
+        mod_int,
+        mod_f,
+    );
+    set_arith_method(
+        &mut mt_table,
+        &state.tmnames,
+        TagMethod::Pow,
+        |_, _| None,
+        pow_f,
+    );
+    set_arith_method(
+        &mut mt_table,
+        &state.tmnames,
+        TagMethod::Div,
+        |_, _| None,
+        div_f,
+    );
+    set_arith_method(
+        &mut mt_table,
+        &state.tmnames,
+        TagMethod::IDiv,
+        idiv_int,
+        idiv_f,
+    );
+    set_arith_method(
+        &mut mt_table,
+        &state.tmnames,
+        TagMethod::Unm,
+        unm_int,
+        unm_f,
+    );
 
     // __index 指向字符串库表
     // 对应 C: lua_pushvalue(L, -2); lua_setfield(L, -2, "__index");
@@ -4060,7 +4091,13 @@ fn create_string_lib_table(state: &LuaState) -> Table {
     let register = |lib: &Table, name: &'static std::ffi::CStr, func: BuiltinFnPtr| {
         let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
         let name_ptr = name.as_ptr() as *const u8;
-        lib.set(key, TValue::BuiltinFn(BuiltinFn { func, name: name_ptr }));
+        lib.set(
+            key,
+            TValue::BuiltinFn(BuiltinFn {
+                func,
+                name: name_ptr,
+            }),
+        );
     };
     register(&lib, c"upper", call_str_upper);
     register(&lib, c"lower", call_str_lower);
@@ -4099,6 +4136,52 @@ pub fn open_string_lib(state: &mut LuaState) {
 
     // 创建字符串元表
     create_string_metatable(state);
+}
+
+#[cfg(test)]
+fn to_num(v: &TValue) -> Option<TValue> {
+    match v {
+        TValue::Integer(i) => Some(TValue::Integer(*i)),
+        TValue::Float(f) => Some(TValue::Float(*f)),
+        TValue::Str(s) => {
+            let s = s.as_str();
+            if let Ok(i) = s.parse::<i64>() {
+                Some(TValue::Integer(i))
+            } else if let Some(f) = crate::float_utils::f64_from_str(s) {
+                Some(TValue::Float(f))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+fn arith_op(
+    v1: &TValue,
+    v2: &TValue,
+    int_op: fn(i64, i64) -> Option<i64>,
+    float_op: fn(f64, f64) -> f64,
+) -> Option<TValue> {
+    let n1 = to_num(v1)?;
+    let n2 = to_num(v2)?;
+    match (&n1, &n2) {
+        (TValue::Integer(i1), TValue::Integer(i2)) => int_op(*i1, *i2).map(TValue::Integer),
+        _ => {
+            let f1 = match &n1 {
+                TValue::Integer(i) => *i as f64,
+                TValue::Float(f) => *f,
+                _ => return None,
+            };
+            let f2 = match &n2 {
+                TValue::Integer(i) => *i as f64,
+                TValue::Float(f) => *f,
+                _ => return None,
+            };
+            Some(TValue::Float(float_op(f1, f2)))
+        }
+    }
 }
 
 // ============================================================================
@@ -4590,12 +4673,12 @@ mod tests {
 
     #[test]
     fn test_str_format_string() {
-        let args = vec![TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
-            crate::strings::ShortString {
+        let args = vec![TValue::Str(crate::strings::LuaString::Short(
+            crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
                 contents: crate::strings::LuaString::with_nul("world"),
-            },
-        )))];
+            }),
+        ))];
         let result = str_format("hello %s", &args).unwrap();
         assert_eq!(result, "hello world");
     }
@@ -4638,12 +4721,12 @@ mod tests {
     fn test_str_format_multiple() {
         let args = vec![
             TValue::Integer(1),
-            TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
-                crate::strings::ShortString {
+            TValue::Str(crate::strings::LuaString::Short(
+                crate::strings::ArcRc::new(crate::strings::ShortString {
                     hash: 0,
                     contents: crate::strings::LuaString::with_nul("two"),
-                },
-            ))),
+                }),
+            )),
             TValue::Float(3.0),
         ];
         let result = str_format("%d %s %f", &args).unwrap();
@@ -4811,36 +4894,36 @@ mod tests {
 
     #[test]
     fn test_to_num_string_integer() {
-        let v = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
-            crate::strings::ShortString {
+        let v = TValue::Str(crate::strings::LuaString::Short(
+            crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
                 contents: crate::strings::LuaString::with_nul("42"),
-            },
-        )));
+            }),
+        ));
         let result = to_num(&v);
         assert_eq!(result, Some(TValue::Integer(42)));
     }
 
     #[test]
     fn test_to_num_string_float() {
-        let v = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
-            crate::strings::ShortString {
+        let v = TValue::Str(crate::strings::LuaString::Short(
+            crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
                 contents: crate::strings::LuaString::with_nul("3.14"),
-            },
-        )));
+            }),
+        ));
         let result = to_num(&v);
         assert!(matches!(result, Some(TValue::Float(f)) if (f - 3.14).abs() < 1e-10));
     }
 
     #[test]
     fn test_to_num_invalid_string() {
-        let v = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
-            crate::strings::ShortString {
+        let v = TValue::Str(crate::strings::LuaString::Short(
+            crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
                 contents: crate::strings::LuaString::with_nul("abc"),
-            },
-        )));
+            }),
+        ));
         let result = to_num(&v);
         assert_eq!(result, None);
     }
@@ -4856,12 +4939,12 @@ mod tests {
     #[test]
     fn test_arith_op_add_strings() {
         let make_str = |s: &str| {
-            TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
-                crate::strings::ShortString {
+            TValue::Str(crate::strings::LuaString::Short(
+                crate::strings::ArcRc::new(crate::strings::ShortString {
                     hash: 0,
                     contents: crate::strings::LuaString::with_nul(s),
-                },
-            )))
+                }),
+            ))
         };
         let v1 = make_str("10");
         let v2 = make_str("20");
@@ -5064,11 +5147,6 @@ mod tests {
     // ========================================================================
     // pack / packsize / unpack 测试
     // ========================================================================
-
-    /// 辅助: 将字节数组转为包含原始字节的 String (用于比较)
-    fn bytes_to_string(b: &[u8]) -> String {
-        unsafe { String::from_utf8_unchecked(b.to_vec()) }
-    }
 
     /// 辅助: 比较打包结果与期望的字节序列
     fn assert_pack_eq(fmt: &str, args: &[TValue], expected: &[u8]) {
@@ -5287,24 +5365,24 @@ mod tests {
     #[test]
     fn test_pack_string_zstr() {
         // z = 零终止字符串
-        let s = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
-            crate::strings::ShortString {
+        let s = TValue::Str(crate::strings::LuaString::Short(
+            crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
                 contents: crate::strings::LuaString::with_nul("hello"),
-            },
-        )));
+            }),
+        ));
         assert_pack_eq("<z", &[s], &[b'h', b'e', b'l', b'l', b'o', 0]);
     }
 
     #[test]
     fn test_pack_string_s() {
         // s = 带长度前缀的字符串 (默认 size_t = 8 字节)
-        let s = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
-            crate::strings::ShortString {
+        let s = TValue::Str(crate::strings::LuaString::Short(
+            crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
                 contents: crate::strings::LuaString::with_nul("hi"),
-            },
-        )));
+            }),
+        ));
         let result = str_pack("<s", &[s]).unwrap();
         // 8 字节长度前缀 (小端) + 字符串内容
         assert_eq!(result.len(), 10);
@@ -5315,23 +5393,23 @@ mod tests {
     #[test]
     fn test_pack_string_s1() {
         // s1 = 1 字节长度前缀的字符串
-        let s = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
-            crate::strings::ShortString {
+        let s = TValue::Str(crate::strings::LuaString::Short(
+            crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
                 contents: crate::strings::LuaString::with_nul("hi"),
-            },
-        )));
+            }),
+        ));
         assert_pack_eq("<s1", &[s], &[2, b'h', b'i']);
     }
 
     #[test]
     fn test_pack_empty_string() {
-        let empty = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
-            crate::strings::ShortString {
+        let empty = TValue::Str(crate::strings::LuaString::Short(
+            crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
                 contents: crate::strings::LuaString::with_nul(""),
-            },
-        )));
+            }),
+        ));
 
         // 空字符串 c0
         assert_pack_eq("<c0", &[empty.clone()], &[]);
@@ -5348,22 +5426,22 @@ mod tests {
         // 包含特殊字符的字符串
         let bytes = vec![0u8, 1, 2, 255, 254, 128];
         let s = unsafe { String::from_utf8_unchecked(bytes.clone()) };
-        let sval = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
-            crate::strings::ShortString {
+        let sval = TValue::Str(crate::strings::LuaString::Short(
+            crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
                 contents: crate::strings::LuaString::with_nul(&s),
-            },
-        )));
+            }),
+        ));
         assert_pack_eq("<c6", &[sval.clone()], &bytes);
 
         // z 字符串中不能包含 0 (除了终止符)
         let s2 = unsafe { String::from_utf8_unchecked(vec![1u8, 2, 3]) };
-        let sval2 = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
-            crate::strings::ShortString {
+        let sval2 = TValue::Str(crate::strings::LuaString::Short(
+            crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
                 contents: crate::strings::LuaString::with_nul(&s2),
-            },
-        )));
+            }),
+        ));
         assert_pack_eq("<z", &[sval2], &[1, 2, 3, 0]);
     }
 
@@ -5615,12 +5693,12 @@ mod tests {
 
     #[test]
     fn test_pack_string_too_long() {
-        let s = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
-            crate::strings::ShortString {
+        let s = TValue::Str(crate::strings::LuaString::Short(
+            crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
                 contents: crate::strings::LuaString::with_nul("hello"),
-            },
-        )));
+            }),
+        ));
         // c3 容纳 3 字节, 但字符串有 5 字节
         assert!(str_pack("<c3", &[s]).is_err());
     }
@@ -5639,24 +5717,24 @@ mod tests {
     #[test]
     fn test_pack_complex_format() {
         // 复合格式: i1 + c3 + i2
-        let s = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
-            crate::strings::ShortString {
+        let s = TValue::Str(crate::strings::LuaString::Short(
+            crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
                 contents: crate::strings::LuaString::with_nul("abc"),
-            },
-        )));
+            }),
+        ));
         let result = str_pack("<i1c3i2", &[TValue::Integer(1), s, TValue::Integer(2)]).unwrap();
         assert_eq!(result, vec![1, b'a', b'b', b'c', 2, 0]);
     }
 
     #[test]
     fn test_pack_unpack_complex_roundtrip() {
-        let s = TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
-            crate::strings::ShortString {
+        let s = TValue::Str(crate::strings::LuaString::Short(
+            crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
                 contents: crate::strings::LuaString::with_nul("XY"),
-            },
-        )));
+            }),
+        ));
         let fmt = "<i1c2i2d";
         let args = vec![
             TValue::Integer(42),

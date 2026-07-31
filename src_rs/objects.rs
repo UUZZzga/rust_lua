@@ -22,16 +22,14 @@
 //! ```
 
 use std::fmt;
-#[cfg(not(size_optimized))]
-use std::hash::{BuildHasher, BuildHasherDefault};
 use std::hash::{Hash, Hasher};
 
 use crate::strings::LuaString;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::gc::GCObjectHeader;
 use crate::execute::VmError;
+use crate::gc::GCObjectHeader;
 use crate::state::LuaState;
 
 // ============================================================================
@@ -87,25 +85,45 @@ mod fx_hash_impl {
         }
 
         #[cfg_attr(not(size_optimized), inline)]
-        fn write_u8(&mut self, i: u8) { self.add_to_hash(i as u64); }
+        fn write_u8(&mut self, i: u8) {
+            self.add_to_hash(i as u64);
+        }
         #[cfg_attr(not(size_optimized), inline)]
-        fn write_u16(&mut self, i: u16) { self.add_to_hash(i as u64); }
+        fn write_u16(&mut self, i: u16) {
+            self.add_to_hash(i as u64);
+        }
         #[cfg_attr(not(size_optimized), inline)]
-        fn write_u32(&mut self, i: u32) { self.add_to_hash(i as u64); }
+        fn write_u32(&mut self, i: u32) {
+            self.add_to_hash(i as u64);
+        }
         #[cfg_attr(not(size_optimized), inline)]
-        fn write_u64(&mut self, i: u64) { self.add_to_hash(i); }
+        fn write_u64(&mut self, i: u64) {
+            self.add_to_hash(i);
+        }
         #[cfg_attr(not(size_optimized), inline)]
-        fn write_i8(&mut self, i: i8) { self.add_to_hash(i as u64); }
+        fn write_i8(&mut self, i: i8) {
+            self.add_to_hash(i as u64);
+        }
         #[cfg_attr(not(size_optimized), inline)]
-        fn write_i16(&mut self, i: i16) { self.add_to_hash(i as u64); }
+        fn write_i16(&mut self, i: i16) {
+            self.add_to_hash(i as u64);
+        }
         #[cfg_attr(not(size_optimized), inline)]
-        fn write_i32(&mut self, i: i32) { self.add_to_hash(i as u64); }
+        fn write_i32(&mut self, i: i32) {
+            self.add_to_hash(i as u64);
+        }
         #[cfg_attr(not(size_optimized), inline)]
-        fn write_i64(&mut self, i: i64) { self.add_to_hash(i as u64); }
+        fn write_i64(&mut self, i: i64) {
+            self.add_to_hash(i as u64);
+        }
         #[cfg_attr(not(size_optimized), inline)]
-        fn write_usize(&mut self, i: usize) { self.add_to_hash(i as u64); }
+        fn write_usize(&mut self, i: usize) {
+            self.add_to_hash(i as u64);
+        }
         #[cfg_attr(not(size_optimized), inline)]
-        fn write_isize(&mut self, i: isize) { self.add_to_hash(i as u64); }
+        fn write_isize(&mut self, i: isize) {
+            self.add_to_hash(i as u64);
+        }
     }
 
     /// FxBuildHasher — BuildHasher 实现，构造 FxHasher
@@ -230,12 +248,8 @@ impl fmt::Display for LuaType {
 /// - `Err(other)`: 运行时错误
 ///
 /// 对应 C 的 `lua_CFunction`，但更适合 Rust 用户使用。
-pub type BuiltinFnPtr = fn(
-    state: &mut LuaState,
-    a: usize,
-    nargs: usize,
-    nresults: i32,
-) -> Result<(), VmError>;
+pub type BuiltinFnPtr =
+    fn(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError>;
 
 /// Rust 原生内置函数
 ///
@@ -392,9 +406,8 @@ impl RustClosure {
         // RustClosure = { func: fn ptr, name: *const u8, upvalues: Rc<RefCell<Vec<TValue>>> }
         // upvalues Vec 堆分配 = capacity * size_of::<TValue>()
         let upvals_cap = self.upvalues.borrow().capacity();
-        std::mem::size_of::<RustClosure>()
-            + upvals_cap * std::mem::size_of::<TValue>()
-            + 16 // Rc<RefCell<Vec>> 分配头估算
+        std::mem::size_of::<RustClosure>() + upvals_cap * std::mem::size_of::<TValue>() + 16
+        // Rc<RefCell<Vec>> 分配头估算
     }
 }
 
@@ -822,16 +835,24 @@ impl fmt::Display for TValue {
             TValue::Boolean(b) => {
                 // 体积优先: 避免 write!(f,"{}",b) 引入 core::fmt::num
                 #[cfg(size_optimized)]
-                { f.write_str(if *b { "true" } else { "false" }) }
+                {
+                    f.write_str(if *b { "true" } else { "false" })
+                }
                 #[cfg(not(size_optimized))]
-                { write!(f, "{}", b) }
+                {
+                    write!(f, "{}", b)
+                }
             }
             TValue::Integer(i) => {
                 // 体积优先: 用 i64_to_string 避免 write!(f,"{}",i) 引入 core::fmt::num
                 #[cfg(size_optimized)]
-                { f.write_str(&crate::float_utils::i64_to_string(*i)) }
+                {
+                    f.write_str(&crate::float_utils::i64_to_string(*i))
+                }
                 #[cfg(not(size_optimized))]
-                { write!(f, "{}", i) }
+                {
+                    write!(f, "{}", i)
+                }
             }
             TValue::Float(n) => write!(f, "{}", crate::float_utils::f64_to_string(*n)),
             TValue::Str(s) => write!(f, "{}", s.as_str()),
@@ -855,7 +876,11 @@ impl fmt::Debug for TValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TValue::Nil(n) => write!(f, "Nil({:?})", n),
-            TValue::Boolean(b) => f.write_str(if *b { "Boolean(true)" } else { "Boolean(false)" }),
+            TValue::Boolean(b) => f.write_str(if *b {
+                "Boolean(true)"
+            } else {
+                "Boolean(false)"
+            }),
             TValue::LightUserData(p) => write!(f, "LightUserData({:p})", p),
             // 用 i64_to_string 避免 write!(f,"{}",i) 引入 core::fmt::num
             TValue::Integer(i) => write!(f, "Integer({})", crate::float_utils::i64_to_string(*i)),
@@ -864,13 +889,13 @@ impl fmt::Debug for TValue {
             // 用 Display 而非 Debug 格式化字符串, 避免 str::Debug 引入 unicode 转义表
             TValue::Str(s) => write!(f, "Str({})", s.as_str()),
             TValue::Table(t) => write!(f, "Table({:p})", t),
-            TValue::LClosure(lc) => write!(f, "LClosure({:p})", std::rc::Rc::as_ptr(lc)),
-            TValue::CClosure(cc) => write!(f, "CClosure({:p})", std::rc::Rc::as_ptr(cc)),
+            TValue::LClosure(lc) => write!(f, "LClosure({:p})", Rc::as_ptr(lc)),
+            TValue::CClosure(cc) => write!(f, "CClosure({:p})", Rc::as_ptr(cc)),
             TValue::LCFn(lcf) => write!(f, "LCFn({:x})", lcf.func as usize),
             TValue::BuiltinFn(b) => write!(f, "BuiltinFn({})", b.name_str()),
             TValue::RustClosure(rc) => write!(f, "RustClosure({})", rc.name_str()),
-            TValue::UserData(ud) => write!(f, "UserData({:p})", std::rc::Rc::as_ptr(ud)),
-            TValue::Thread(t) => write!(f, "Thread({:p})", std::rc::Rc::as_ptr(t)),
+            TValue::UserData(ud) => write!(f, "UserData({:p})", Rc::as_ptr(ud)),
+            TValue::Thread(t) => write!(f, "Thread({:p})", Rc::as_ptr(t)),
         }
     }
 }
@@ -1064,9 +1089,8 @@ impl LClosure {
         // Rc<LClosure> 堆分配 = LClosure 自身
         // upvals: Rc<RefCell<Vec<UpValRef>>>，Vec 堆分配 = capacity * size_of::<UpValRef>()
         let upvals_cap = self.upvals.borrow().capacity();
-        std::mem::size_of::<LClosure>()
-            + upvals_cap * std::mem::size_of::<UpValRef>()
-            + 16 // Rc<RefCell<Vec>> 分配头估算
+        std::mem::size_of::<LClosure>() + upvals_cap * std::mem::size_of::<UpValRef>() + 16
+        // Rc<RefCell<Vec>> 分配头估算
     }
 }
 
@@ -1076,8 +1100,7 @@ impl CClosure {
     pub fn gc_mem_size(&self) -> usize {
         // Rc<CClosure> 堆分配 = CClosure 自身
         // upvalue: Vec<TValue>，Vec 堆分配 = capacity * size_of::<TValue>()
-        std::mem::size_of::<CClosure>()
-            + self.upvalue.capacity() * std::mem::size_of::<TValue>()
+        std::mem::size_of::<CClosure>() + self.upvalue.capacity() * std::mem::size_of::<TValue>()
     }
 }
 
@@ -2500,7 +2523,6 @@ mod tests {
         }));
         assert_eq!(short.as_str(), "abc");
     }
-
 
     // ========================================================================
     // Proto 测试

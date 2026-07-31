@@ -1,17 +1,17 @@
 use crate::debug::runerror;
 use crate::execute::{VmError, VmExecutor, VmResult};
 use crate::gc::{GCObjectHeader, GCState};
+use crate::objects::FxBuildHasher;
 use crate::objects::{
     BuiltinFn, BuiltinFnPtr, CallFrame, Instruction, LClosure, LuaThread, LuaType, NilKind, Proto,
     TValue, TableData, ThreadContext, ThreadStatus, UpVal, UpValRef, UpvalDesc,
 };
 use crate::strings::{LuaString, StringTable};
-use crate::tm::{init_tmnames, TM_N};
 use crate::table::Table;
 use crate::tm::DefaultMetatables;
+use crate::tm::{init_tmnames, TM_N};
 use std::cell::RefCell;
 use std::collections::HashSet;
-use crate::objects::FxBuildHasher;
 use std::io::{Read, Write};
 use std::rc::Rc;
 
@@ -27,11 +27,19 @@ pub struct LuaStdout(pub std::io::Stdout);
 
 #[cfg(size_optimized)]
 impl Write for LuaStdout {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.0.write(buf) }
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> { self.0.write_all(buf) }
-    fn flush(&mut self) -> std::io::Result<()> { self.0.flush() }
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.0.write_all(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
     // 覆盖 write_fmt: no-op (代码中仅使用 write_all + flush)
-    fn write_fmt(&mut self, _: std::fmt::Arguments<'_>) -> std::io::Result<()> { Ok(()) }
+    fn write_fmt(&mut self, _: std::fmt::Arguments<'_>) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(size_optimized)]
@@ -39,17 +47,29 @@ pub struct LuaStderr(pub std::io::Stderr);
 
 #[cfg(size_optimized)]
 impl Write for LuaStderr {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.0.write(buf) }
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> { self.0.write_all(buf) }
-    fn flush(&mut self) -> std::io::Result<()> { self.0.flush() }
-    fn write_fmt(&mut self, _: std::fmt::Arguments<'_>) -> std::io::Result<()> { Ok(()) }
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
+        self.0.write_all(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+    fn write_fmt(&mut self, _: std::fmt::Arguments<'_>) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(size_optimized)]
-pub fn lua_stdout() -> Box<dyn Write> { Box::new(LuaStdout(std::io::stdout())) }
+pub fn lua_stdout() -> Box<dyn Write> {
+    Box::new(LuaStdout(std::io::stdout()))
+}
 
 #[cfg(not(size_optimized))]
-pub fn lua_stdout() -> Box<dyn Write> { Box::new(std::io::stdout()) }
+pub fn lua_stdout() -> Box<dyn Write> {
+    Box::new(std::io::stdout())
+}
 
 /// GC worklist 的原始值项 — TValue 的字节拷贝，不做引用计数。
 /// GC 期间所有对象有效（sweep 在 mark 完成后），所以 push/pop 无需 incq/decq。
@@ -69,8 +89,6 @@ unsafe fn raw_as_tvalue(raw: &RawTValue) -> &TValue {
     raw.assume_init_ref()
 }
 
-const EOFMARK: &str = "<eof>";
-
 pub const LUA_YIELD: i32 = 1;
 pub const ERR_RUN: i32 = 2;
 pub const ERR_SYNTAX: i32 = 3;
@@ -78,7 +96,6 @@ pub const ERR_FILE: i32 = 6; // LUA_ERRERR + 1, used by luaL_loadfilex
 pub const MULT_RET: i32 = -1;
 
 const LUA_SIGNATURE: &[u8] = b"\x1bLua";
-const UTF8_BOM: &[u8] = b"\xef\xbb\xbf";
 
 pub const LUA_MINSTACK: usize = 20;
 pub const BASIC_STACK_SIZE: usize = 256;
@@ -252,7 +269,8 @@ pub struct LuaState {
     pub io_output: Option<Box<dyn Write>>,
     /// 文件句柄注册表 — key 是 UserData 的 gc_header.ptr_id，value 是 FILE* 指针
     /// 对应 C 的 luaL_Stream 中存储的 FILE*。UserData 本身不存数据，通过此 map 关联。
-    pub file_handles: std::collections::HashMap<u32, *mut libc::FILE, crate::objects::FxBuildHasher>,
+    pub file_handles:
+        std::collections::HashMap<u32, *mut libc::FILE, crate::objects::FxBuildHasher>,
     /// 标记哪些文件句柄是 io.popen 创建的（关闭时用 pclose 而非 fclose）
     /// 对应 C 的 LStream.closef = &io_pclose
     pub popen_handles: std::collections::HashSet<u32, crate::objects::FxBuildHasher>,
@@ -471,10 +489,7 @@ pub fn get_closure_from_stack<'a>(
 ///
 /// 优先返回 entry.closure (若已设置, 如 hook/metamethod 路径);
 /// 否则从 state.stack[entry.base - 1] 延迟计算 (op_call 快速路径)
-pub fn get_closure_for_ci<'a>(
-    state: &'a LuaState,
-    ci_idx: usize,
-) -> Option<&'a Rc<LClosure>> {
+pub fn get_closure_for_ci<'a>(state: &'a LuaState, ci_idx: usize) -> Option<&'a Rc<LClosure>> {
     let entry = &state.call_info[ci_idx];
     if entry.closure.is_some() {
         return entry.closure.as_ref();
@@ -524,10 +539,7 @@ pub fn get_caller_proto_ref<'a>(
 /// 对于 C 函数帧 (有预设置 name, 如 BuiltinFn/RustClosure): 返回 None
 ///
 /// perf: 替代 CallInfoEntry.caller_proto 字段, 避免 op_call/call_c_function 中 Rc::clone
-pub fn get_caller_proto_for_ci<'a>(
-    state: &'a LuaState,
-    ci_idx: usize,
-) -> Option<&'a Rc<Proto>> {
+pub fn get_caller_proto_for_ci<'a>(state: &'a LuaState, ci_idx: usize) -> Option<&'a Rc<Proto>> {
     let entry = &state.call_info[ci_idx];
     if !entry.is_c {
         return get_caller_proto_ref(state, entry);
@@ -542,10 +554,6 @@ pub fn get_caller_proto_for_ci<'a>(
         }
     }
     None
-}
-
-fn G(l: &LuaState) -> &GlobalState {
-    &l.global_state
 }
 
 // ============================================================================
@@ -614,8 +622,12 @@ impl LuaState {
             dmt: DefaultMetatables::new(),
             stdout: lua_stdout(),
             io_output: None,
-            file_handles: std::collections::HashMap::with_hasher(crate::objects::FxBuildHasher::default()),
-            popen_handles: std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default()),
+            file_handles: std::collections::HashMap::with_hasher(
+                crate::objects::FxBuildHasher::default(),
+            ),
+            popen_handles: std::collections::HashSet::with_hasher(
+                crate::objects::FxBuildHasher::default(),
+            ),
             io_input_handle: None,
             io_output_handle: None,
             global_state: Rc::new(GlobalState { gcstopem: false }),
@@ -752,18 +764,6 @@ impl LuaState {
         Ok(())
     }
 
-    /// 对应 C 的 relstack: 将指针转为偏移量
-    /// Rust 版本: 无操作 (Vec 自行管理内存，使用索引)
-    fn relstack(&mut self) {
-        // no-op in Rust
-    }
-
-    /// 对应 C 的 correctstack: 将偏移量转回指针
-    /// Rust 版本: 无操作 (Vec 自行管理内存，使用索引)
-    fn correctstack(&mut self) {
-        // no-op in Rust
-    }
-
     /// 使用已有的 GCState 创建 LuaState
     pub fn with_gc(gc: Rc<GCState>) -> Self {
         let globals = {
@@ -817,8 +817,12 @@ impl LuaState {
             dmt: DefaultMetatables::new(),
             stdout: lua_stdout(),
             io_output: None,
-            file_handles: std::collections::HashMap::with_hasher(crate::objects::FxBuildHasher::default()),
-            popen_handles: std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default()),
+            file_handles: std::collections::HashMap::with_hasher(
+                crate::objects::FxBuildHasher::default(),
+            ),
+            popen_handles: std::collections::HashSet::with_hasher(
+                crate::objects::FxBuildHasher::default(),
+            ),
             io_input_handle: None,
             io_output_handle: None,
             global_state: Rc::new(GlobalState { gcstopem: false }),
@@ -1081,8 +1085,12 @@ impl LuaState {
             dmt: DefaultMetatables::new(),
             stdout: lua_stdout(),
             io_output: None,
-            file_handles: std::collections::HashMap::with_hasher(crate::objects::FxBuildHasher::default()),
-            popen_handles: std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default()),
+            file_handles: std::collections::HashMap::with_hasher(
+                crate::objects::FxBuildHasher::default(),
+            ),
+            popen_handles: std::collections::HashSet::with_hasher(
+                crate::objects::FxBuildHasher::default(),
+            ),
             io_input_handle: None,
             io_output_handle: None,
             global_state: Rc::new(GlobalState { gcstopem: false }),
@@ -1579,8 +1587,13 @@ impl LuaState {
         let name_str = name.to_str().unwrap_or("");
         let key = TValue::Str(str_to_ls(&self.string_table, name_str));
         let name_ptr = name.as_ptr() as *const u8;
-        self.globals
-            .set(key, TValue::BuiltinFn(BuiltinFn { func, name: name_ptr }));
+        self.globals.set(
+            key,
+            TValue::BuiltinFn(BuiltinFn {
+                func,
+                name: name_ptr,
+            }),
+        );
     }
 
     /// 注册 Rust 原生内置函数到指定表（Rust 风格 API）
@@ -1603,7 +1616,13 @@ impl LuaState {
         let name_str = name.to_str().unwrap_or("");
         let key = TValue::Str(str_to_ls(&self.string_table, name_str));
         let name_ptr = name.as_ptr() as *const u8;
-        table.set(key, TValue::BuiltinFn(BuiltinFn { func, name: name_ptr }));
+        table.set(
+            key,
+            TValue::BuiltinFn(BuiltinFn {
+                func,
+                name: name_ptr,
+            }),
+        );
     }
 
     pub fn set_field(&mut self, idx: isize, key_name: &str) {
@@ -2165,7 +2184,8 @@ impl LuaState {
                 let saved_is_vararg = self.is_vararg;
                 let saved_proto_flag = self.proto_flag;
                 let saved_nextraargs = self.nextraargs;
-                let saved_closure_upvals = std::mem::replace(&mut self.closure_upvals, Rc::new(RefCell::new(Vec::new())));
+                let saved_closure_upvals =
+                    std::mem::replace(&mut self.closure_upvals, Rc::new(RefCell::new(Vec::new())));
                 let saved_tbc_list = self.tbc_list.take();
 
                 // 推入 call_info — 对应 C 的 luaD_precall 创建新 CallInfo
@@ -2686,9 +2706,8 @@ impl LuaState {
             {
                 // 将 f 转换为 extern "C-unwind" 以允许 panic 跨 C 帧展开回 catch_unwind
                 // （C 模块编译时加 -fexceptions，GCC 生成 unwind 表使 Rust panic 能通过）
-                let f_unwind: unsafe extern "C-unwind" fn(*mut c_void) -> i32 = unsafe {
-                    std::mem::transmute(f)
-                };
+                let f_unwind: unsafe extern "C-unwind" fn(*mut c_void) -> i32 =
+                    unsafe { std::mem::transmute(f) };
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
                     f_unwind(ptr as *mut c_void)
                 })) {
@@ -2710,7 +2729,11 @@ impl LuaState {
                 let mut jmp_buf: [u8; 512] = [0; 512]; // >= sizeof(jmp_buf) on all platforms
                 self.error_jmp_bufs.push(jmp_buf.as_mut_ptr());
                 let result = unsafe {
-                    lua_rs_pcall_c(Some(f), ptr as *mut c_void, jmp_buf.as_mut_ptr() as *mut c_void)
+                    lua_rs_pcall_c(
+                        Some(f),
+                        ptr as *mut c_void,
+                        jmp_buf.as_mut_ptr() as *mut c_void,
+                    )
                 };
                 self.error_jmp_bufs.pop();
                 if result == -1 {
@@ -3001,7 +3024,7 @@ impl LuaState {
     /// 注册弱引用表 — 当 setmetatable 设置包含 __mode 的元表时调用
     /// 使用 Weak 引用避免阻止表本身的回收
     pub fn register_weak_table(&mut self, t: &Table) {
-        self.weak_tables.push(std::rc::Rc::downgrade(&t.data));
+        self.weak_tables.push(Rc::downgrade(&t.data));
     }
 
     /// 注册有 __gc 元方法的对象 — 当 setmetatable 设置包含 __gc 的元表时调用
@@ -3268,14 +3291,10 @@ impl LuaState {
         // 预分配可达集容量 — 估计可达对象约为活跃对象的 60%（其余是垃圾）
         // 过大预分配会增加内存压力（500K 对象 * 8B = 4MB/集），反而变慢
         let est_reachable = (active * 3 / 5).max(64);
-        let mut reachable: GcHashSet = GcHashSet::with_capacity_and_hasher(
-            est_reachable,
-            FxBuildHasher::default(),
-        );
-        let mut visited: GcHashSet = GcHashSet::with_capacity_and_hasher(
-            est_reachable,
-            FxBuildHasher::default(),
-        );
+        let mut reachable: GcHashSet =
+            GcHashSet::with_capacity_and_hasher(est_reachable, FxBuildHasher::default());
+        let mut visited: GcHashSet =
+            GcHashSet::with_capacity_and_hasher(est_reachable, FxBuildHasher::default());
         // worklist 预分配为估计可达对象的 2 倍（根 + 一层引用）
         // perf: 用 RawTValue（16字节值拷贝）替代 TValue clone，消除 push/pop 的 Rc incq/decq。
         // GC 期间所有对象有效（sweep 在 mark 完成后），无需调整引用计数。
@@ -3296,7 +3315,7 @@ impl LuaState {
         {
             let tv = TValue::Table(self.globals.clone());
             unsafe { worklist.push(raw_from_tvalue(&tv)) };
-            std::mem::forget(tv);  // forget 避免 decq（RawTValue 已拷贝字节，Rc 引用通过 self.globals 保持）
+            std::mem::forget(tv); // forget 避免 decq（RawTValue 已拷贝字节，Rc 引用通过 self.globals 保持）
         }
         {
             let tv = TValue::Table(self.registry.clone());
@@ -3382,7 +3401,13 @@ impl LuaState {
         // perf: pop RawTValue（无 drop），unsafe 重建 &TValue 引用
         while let Some(raw) = worklist.pop() {
             let val = unsafe { raw_as_tvalue(&raw) };
-            self.mark_tvalue(val, &mut reachable, &mut visited, &mut worklist, &mut extra_size);
+            self.mark_tvalue(
+                val,
+                &mut reachable,
+                &mut visited,
+                &mut worklist,
+                &mut extra_size,
+            );
         }
 
         // ephemeron 表传递性处理：对于弱键表，如果值可达，则保留键。
@@ -3393,7 +3418,8 @@ impl LuaState {
         // 收集需要 finalize 的对象并"复活"它们 — 在 clear_weak_tables 之前调用。
         // 对应 C Lua 的 finalizer 对象"复活"语义：finalizer 执行时对象仍可达，
         // 其引用的对象也应被标记，然后才能清除弱表（避免误清除 finalizer 引用的弱表条目）。
-        let to_finalize = self.collect_finalizers(&mut reachable, &mut visited, &mut worklist, &mut extra_size);
+        let to_finalize =
+            self.collect_finalizers(&mut reachable, &mut visited, &mut worklist, &mut extra_size);
 
         // 复活后可能引入新的 ephemeron 关系，再次处理 ephemeron 直到收敛
         self.process_ephemerons(&mut reachable, &mut visited, &mut worklist, &mut extra_size);
@@ -3421,9 +3447,9 @@ impl LuaState {
         // 长串由 Arc 引用计数管理（Box<LongString> 每次 clone 独立内存），
         //   不在此累加（ptr_id 去重困难且长串通常数量少），偏差可容忍。
         self.string_table.for_each(|ss| {
-            extra_size += std::mem::size_of::<crate::strings::ShortString>()
-                + ss.contents.capacity()
-                + 16; // Arc 内部控制结构
+            extra_size +=
+                std::mem::size_of::<crate::strings::ShortString>() + ss.contents.capacity() + 16;
+            // Arc 内部控制结构
         });
 
         // 重算 extra_estimate：反映当前可达的无 gc_header 对象的内存占用
@@ -3552,8 +3578,11 @@ impl LuaState {
 
         // 构建 upval_origins 映射：UpVal Rc 指针 -> original_stack_index
         // 遍历主线程栈上的所有协程，收集它们的 upval_origins（首次 resume 时记录）
-        let mut upval_origins_map: std::collections::HashMap<usize, usize, crate::objects::FxBuildHasher> =
-            std::collections::HashMap::with_hasher(crate::objects::FxBuildHasher::default());
+        let mut upval_origins_map: std::collections::HashMap<
+            usize,
+            usize,
+            crate::objects::FxBuildHasher,
+        > = std::collections::HashMap::with_hasher(crate::objects::FxBuildHasher::default());
         for val in self.stack.iter() {
             if let TValue::Thread(t) = val {
                 let origins = t.context.borrow().upval_origins.clone();
@@ -3835,24 +3864,24 @@ impl LuaState {
                     // 累加 proto.gc_mem_size() 到 extra_size，使 GC estimate 含 Proto 内存。
                     *extra_size += c.proto.gc_mem_size();
                     let upvals = c.upvals.borrow();
-                for uv_ref in upvals.iter() {
-                    let uv = uv_ref.borrow();
-                    match &*uv {
-                        UpVal::Closed { value } => {
-                            if Self::needs_gc_mark(value) {
-                                unsafe { worklist.push(raw_from_tvalue(value)) };
+                    for uv_ref in upvals.iter() {
+                        let uv = uv_ref.borrow();
+                        match &*uv {
+                            UpVal::Closed { value } => {
+                                if Self::needs_gc_mark(value) {
+                                    unsafe { worklist.push(raw_from_tvalue(value)) };
+                                }
                             }
-                        }
-                        UpVal::Open { stack_index, .. } => {
-                            if *stack_index < self.stack.len() {
-                                let val = &self.stack[*stack_index];
-                                if Self::needs_gc_mark(val) {
-                                    unsafe { worklist.push(raw_from_tvalue(val)) };
+                            UpVal::Open { stack_index, .. } => {
+                                if *stack_index < self.stack.len() {
+                                    let val = &self.stack[*stack_index];
+                                    if Self::needs_gc_mark(val) {
+                                        unsafe { worklist.push(raw_from_tvalue(val)) };
+                                    }
                                 }
                             }
                         }
                     }
-                }
                 }
             }
             TValue::CClosure(cc) => {

@@ -13,6 +13,7 @@ use crate::execute::VmError;
 use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
 use crate::strings::LuaString;
+use crate::table::Table;
 use std::ffi::{CStr, CString};
 
 // ============================================================================
@@ -167,7 +168,12 @@ fn call_clock(state: &mut LuaState, a: usize, _nargs: usize, nresults: i32) -> R
 ///
 /// 对应 C 的 os_tmpname (POSIX 路径)：使用 mkstemp 创建临时文件，
 /// 关闭后返回文件名。模板为 "/tmp/lua_XXXXXX"。
-fn call_tmpname(state: &mut LuaState, a: usize, _nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_tmpname(
+    state: &mut LuaState,
+    a: usize,
+    _nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
     let mut buf: [u8; 32] = *b"/tmp/lua_XXXXXX\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
     let ptr = buf.as_mut_ptr() as *mut libc::c_char;
     let fd = unsafe { libc::mkstemp(ptr) };
@@ -225,7 +231,11 @@ fn call_remove(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         #[cfg(size_optimized)]
         let msg = {
             let estr = unsafe { libc::strerror(errno) };
-            let estr_str = unsafe { std::ffi::CStr::from_ptr(estr).to_string_lossy().into_owned() };
+            let estr_str = unsafe {
+                std::ffi::CStr::from_ptr(estr)
+                    .to_string_lossy()
+                    .into_owned()
+            };
             format!("{}: {}", filename_cstr.to_str().unwrap_or(""), estr_str)
         };
         #[cfg(not(size_optimized))]
@@ -364,7 +374,11 @@ fn call_rename(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         #[cfg(size_optimized)]
         let msg = {
             let estr = unsafe { libc::strerror(errno) };
-            let estr_str = unsafe { std::ffi::CStr::from_ptr(estr).to_string_lossy().into_owned() };
+            let estr_str = unsafe {
+                std::ffi::CStr::from_ptr(estr)
+                    .to_string_lossy()
+                    .into_owned()
+            };
             format!(
                 "{} -> {}: {}",
                 oldname_cstr.to_str().unwrap_or(""),
@@ -646,7 +660,7 @@ fn call_os_date(
     // 检查是否是 "*t" 模式
     let fmt_rest = &fmt[fmt_start..];
     if fmt_rest == b"*t" {
-        let table = crate::table::Table::new();
+        let table = Table::new();
         set_field(&table, state, "year", tmr.tm_year, 1900);
         set_field(&table, state, "month", tmr.tm_mon, 1);
         set_field(&table, state, "day", tmr.tm_mday, 0);
@@ -849,7 +863,7 @@ fn call_os_difftime(
 
 /// 打开 OS 库并注册到全局变量 os
 pub fn open_os_lib(state: &mut LuaState) {
-    let mut lib = crate::table::Table::new();
+    let mut lib = Table::new();
 
     // 注册所有 OS 函数 (使用 BuiltinFn 函数指针)
     let register = |lib: &mut crate::table::Table,
@@ -857,7 +871,13 @@ pub fn open_os_lib(state: &mut LuaState) {
                     func: crate::objects::BuiltinFnPtr| {
         let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
         let name_ptr = name.as_ptr() as *const u8;
-        lib.set(key, TValue::BuiltinFn(BuiltinFn { func, name: name_ptr }));
+        lib.set(
+            key,
+            TValue::BuiltinFn(BuiltinFn {
+                func,
+                name: name_ptr,
+            }),
+        );
     };
 
     register(&mut lib, c"setlocale", call_setlocale);

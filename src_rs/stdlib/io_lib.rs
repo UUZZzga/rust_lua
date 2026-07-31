@@ -20,8 +20,8 @@ use crate::state::LuaState;
 use crate::table::Table;
 use std::cell::RefCell;
 use std::io::Write;
-use std::rc::Rc;
 use std::os::raw::c_int;
+use std::rc::Rc;
 
 // C 标准库的 stdin/stdout/stderr — libc crate 不直接导出，用 extern 声明
 // Miri 不支持 extern static stdin/stdout/stderr，改用 fdopen(fd, mode) 获取等价 FILE*
@@ -42,12 +42,16 @@ fn c_stdin() -> *mut libc::FILE {
     {
         use std::cell::OnceCell;
         thread_local!(static STDIN: OnceCell<*mut libc::FILE> = OnceCell::new());
-        STDIN.with(|s| *s.get_or_init(|| unsafe {
-            libc::fdopen(libc::STDIN_FILENO, b"r\0".as_ptr() as *const _)
-        }))
+        STDIN.with(|s| {
+            *s.get_or_init(|| unsafe {
+                libc::fdopen(libc::STDIN_FILENO, b"r\0".as_ptr() as *const _)
+            })
+        })
     }
     #[cfg(not(miri))]
-    { unsafe { C_STDIN } }
+    {
+        unsafe { C_STDIN }
+    }
 }
 /// 获取 C 的 stdout
 fn c_stdout() -> *mut libc::FILE {
@@ -55,12 +59,16 @@ fn c_stdout() -> *mut libc::FILE {
     {
         use std::cell::OnceCell;
         thread_local!(static STDOUT: OnceCell<*mut libc::FILE> = OnceCell::new());
-        STDOUT.with(|s| *s.get_or_init(|| unsafe {
-            libc::fdopen(libc::STDOUT_FILENO, b"w\0".as_ptr() as *const _)
-        }))
+        STDOUT.with(|s| {
+            *s.get_or_init(|| unsafe {
+                libc::fdopen(libc::STDOUT_FILENO, b"w\0".as_ptr() as *const _)
+            })
+        })
     }
     #[cfg(not(miri))]
-    { unsafe { C_STDOUT } }
+    {
+        unsafe { C_STDOUT }
+    }
 }
 /// 获取 C 的 stderr
 fn c_stderr() -> *mut libc::FILE {
@@ -68,12 +76,16 @@ fn c_stderr() -> *mut libc::FILE {
     {
         use std::cell::OnceCell;
         thread_local!(static STDERR: OnceCell<*mut libc::FILE> = OnceCell::new());
-        STDERR.with(|s| *s.get_or_init(|| unsafe {
-            libc::fdopen(libc::STDERR_FILENO, b"w\0".as_ptr() as *const _)
-        }))
+        STDERR.with(|s| {
+            *s.get_or_init(|| unsafe {
+                libc::fdopen(libc::STDERR_FILENO, b"w\0".as_ptr() as *const _)
+            })
+        })
     }
     #[cfg(not(miri))]
-    { unsafe { C_STDERR } }
+    {
+        unsafe { C_STDERR }
+    }
 }
 
 // ============================================================================
@@ -187,18 +199,6 @@ fn new_file_userdata(state: &mut LuaState, file: *mut libc::FILE, file_mt: &Tabl
         state.register_ud_finobj(&ud_rc);
     }
     TValue::UserData(ud_rc)
-}
-
-/// 创建已关闭的 FILE* userdata — 用于 io.type 检查已关闭文件
-fn new_closed_userdata(file_mt: &Table) -> TValue {
-    TValue::UserData(Rc::new(crate::objects::Udata {
-        gc_header: crate::gc::GCObjectHeader::new(),
-        nuvalue: 0,
-        len: 0,
-        metatable: Some(Box::new(file_mt.clone())),
-        user_values: vec![],
-        data: vec![],
-    }))
 }
 
 /// 检查文件模式是否合法 — 对应 C 的 l_checkmode
@@ -380,7 +380,7 @@ fn call_io_open(
             .get(LuaType::UserData)
             .cloned()
             .unwrap_or_else(|| {
-                let mut t = crate::table::Table::new();
+                let mut t = Table::new();
                 t.set(
                     TValue::Str(state.intern_str("__name")),
                     TValue::Str(state.intern_str("FILE*")),
@@ -416,7 +416,7 @@ fn call_io_tmpfile(
             .get(LuaType::UserData)
             .cloned()
             .unwrap_or_else(|| {
-                let mut t = crate::table::Table::new();
+                let mut t = Table::new();
                 t.set(
                     TValue::Str(state.intern_str("__name")),
                     TValue::Str(state.intern_str("FILE*")),
@@ -503,7 +503,7 @@ fn call_io_popen(
             .get(LuaType::UserData)
             .cloned()
             .unwrap_or_else(|| {
-                let mut t = crate::table::Table::new();
+                let mut t = Table::new();
                 t.set(
                     TValue::Str(state.intern_str("__name")),
                     TValue::Str(state.intern_str("FILE*")),
@@ -665,7 +665,7 @@ fn call_io_output(
                         .get(LuaType::UserData)
                         .cloned()
                         .unwrap_or_else(|| {
-                            let mut t = crate::table::Table::new();
+                            let mut t = Table::new();
                             t.set(
                                 TValue::Str(state.intern_str("__name")),
                                 TValue::Str(state.intern_str("FILE*")),
@@ -753,7 +753,7 @@ fn call_io_input(
                         .get(LuaType::UserData)
                         .cloned()
                         .unwrap_or_else(|| {
-                            let mut t = crate::table::Table::new();
+                            let mut t = Table::new();
                             t.set(
                                 TValue::Str(state.intern_str("__name")),
                                 TValue::Str(state.intern_str("FILE*")),
@@ -1799,7 +1799,7 @@ fn call_io_lines(
                 .get(LuaType::UserData)
                 .cloned()
                 .unwrap_or_else(|| {
-                    let mut t = crate::table::Table::new();
+                    let mut t = Table::new();
                     t.set(
                         TValue::Str(state.intern_str("__name")),
                         TValue::Str(state.intern_str("FILE*")),
@@ -1824,8 +1824,8 @@ fn call_io_lines(
             // lua_pushvalue(file); return 4;
             // generic for 的第 4 个值是 to-be-closed 变量，循环结束时自动关闭
             results.push(iter);
-            results.push(TValue::Nil(crate::objects::NilKind::Strict)); // state
-            results.push(TValue::Nil(crate::objects::NilKind::Strict)); // control
+            results.push(TValue::Nil(NilKind::Strict)); // state
+            results.push(TValue::Nil(NilKind::Strict)); // control
             results.push(udata); // file (to-be-closed)
             state.adjust_results(a, nresults, results);
             Ok(())
@@ -2178,7 +2178,7 @@ fn call_file_tostring(
 // ============================================================================
 
 pub fn open_io_lib(state: &mut LuaState) {
-    let mut lib = crate::table::Table::new();
+    let mut lib = Table::new();
 
     // 注册 BuiltinFn 的辅助闭包：用函数指针 + 名字注册到表
     // (state 作为参数传入，避免闭包捕获 state 导致借用冲突)
@@ -2188,11 +2188,17 @@ pub fn open_io_lib(state: &mut LuaState) {
                     func: crate::objects::BuiltinFnPtr| {
         let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
         let name_ptr = name.as_ptr() as *const u8;
-        table.set(key, TValue::BuiltinFn(BuiltinFn { func, name: name_ptr }));
+        table.set(
+            key,
+            TValue::BuiltinFn(BuiltinFn {
+                func,
+                name: name_ptr,
+            }),
+        );
     };
 
     // 创建 FILE* 元表 (对应 C 的 LUA_FILEHANDLE)
-    let mut file_mt = crate::table::Table::new();
+    let mut file_mt = Table::new();
     let name_key = TValue::Str(state.intern_str("__name"));
     file_mt.set(name_key, TValue::Str(state.intern_str("FILE*")));
     // FILE* 元方法 (用 BuiltinFn 注册)
@@ -2201,7 +2207,7 @@ pub fn open_io_lib(state: &mut LuaState) {
     register(&mut file_mt, state, c"__tostring", call_file_tostring);
 
     // 创建 FILE* 方法表 (用 BuiltinFn 注册)
-    let mut file_methods = crate::table::Table::new();
+    let mut file_methods = Table::new();
     register(&mut file_methods, state, c"close", call_file_close_method);
     register(&mut file_methods, state, c"read", call_file_read);
     register(&mut file_methods, state, c"write", call_file_write);

@@ -371,7 +371,10 @@ fn to_integer(v: &TValue) -> Result<i64, String> {
                 Ok(i)
             } else {
                 // 用 float_utils 而非 format!("{}", f), 避免 size_optimized 模式引入 flt2dec 代码.
-                Err(format!("bad argument (integer expected, got float {})", crate::float_utils::f64_to_string(*f)))
+                Err(format!(
+                    "bad argument (integer expected, got float {})",
+                    crate::float_utils::f64_to_string(*f)
+                ))
             }
         }
         _ => Err(format!("bad argument (integer expected, got {})", v.ty())),
@@ -628,17 +631,6 @@ fn get_number_arg(state: &LuaState, a: usize, idx: usize, fname: &str) -> Result
             fname,
             crate::tm::obj_type_name(&v)
         ))),
-    }
-}
-
-/// 从栈中读取可选数字参数, 缺失时返回默认值
-fn get_opt_number_arg(state: &LuaState, a: usize, idx: usize, default: f64) -> f64 {
-    let v = get_arg(state, a, idx);
-    match &v {
-        TValue::Integer(n) => *n as f64,
-        TValue::Float(f) => *f,
-        TValue::Nil(_) => default,
-        _ => default,
     }
 }
 
@@ -1053,11 +1045,18 @@ pub fn open_math_lib(state: &mut LuaState) {
     let lib = Table::new();
 
     // 注册所有数学库函数 (使用 BuiltinFn 函数指针)
-    let register = |lib: &Table, name: &'static std::ffi::CStr, func: crate::objects::BuiltinFnPtr| {
-        let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
-        let name_ptr = name.as_ptr() as *const u8;
-        lib.set(key, TValue::BuiltinFn(BuiltinFn { func, name: name_ptr }));
-    };
+    let register =
+        |lib: &Table, name: &'static std::ffi::CStr, func: crate::objects::BuiltinFnPtr| {
+            let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
+            let name_ptr = name.as_ptr() as *const u8;
+            lib.set(
+                key,
+                TValue::BuiltinFn(BuiltinFn {
+                    func,
+                    name: name_ptr,
+                }),
+            );
+        };
 
     register(&lib, c"abs", call_abs);
     register(&lib, c"acos", call_acos);
@@ -1123,12 +1122,12 @@ mod tests {
     use super::*;
 
     fn make_str(s: &str) -> TValue {
-        TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
-            crate::strings::ShortString {
+        TValue::Str(crate::strings::LuaString::Short(
+            crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
                 contents: crate::strings::LuaString::with_nul(s),
-            },
-        )))
+            }),
+        ))
     }
 
     // ========================================================================

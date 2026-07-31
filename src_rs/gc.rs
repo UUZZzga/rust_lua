@@ -16,6 +16,7 @@
 //! - 灰色链表使用 `VecDeque` + 索引，类型安全且无裸指针
 //! - 使用 `Cell`/`RefCell` 实现 interior mutability，支持 `&self` 共享引用
 
+use crate::objects::TValue;
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
@@ -486,12 +487,17 @@ impl GCState {
     /// 返回总估算占用 = gc_estimate（已注册对象）+ gc_extra_estimate（无 gc_header 对象）。
     /// collectgarbage("count") 和 GC 触发阈值应基于此值。
     pub fn total_estimate(&self) -> usize {
-        self.gc_estimate.get().saturating_add(self.gc_extra_estimate.get())
+        self.gc_estimate
+            .get()
+            .saturating_add(self.gc_extra_estimate.get())
     }
 
     /// 清扫不可达对象：只遍历 all_objects 活跃列表，释放所有不在 `reachable` 集合中的对象。
     /// 对应 C 的 sweep 阶段（C 遍历 allgc 链表，此处遍历 all_objects 列表）。
-    pub fn sweep_unreachable(&self, reachable: &std::collections::HashSet<usize, crate::objects::FxBuildHasher>) {
+    pub fn sweep_unreachable(
+        &self,
+        reachable: &std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
+    ) {
         let mut metas = self.metas.borrow_mut();
         let mut all_objects = self.all_objects.borrow_mut();
         let mut free_ids = self.free_ids.borrow_mut();
@@ -661,12 +667,12 @@ impl GCState {
             return;
         }
         match v {
-            crate::objects::TValue::Table(_)
-            | crate::objects::TValue::LClosure(_)
-            | crate::objects::TValue::CClosure(_)
-            | crate::objects::TValue::Thread(_)
-            | crate::objects::TValue::UserData(_)
-            | crate::objects::TValue::Str(_) => {
+            TValue::Table(_)
+            | TValue::LClosure(_)
+            | TValue::CClosure(_)
+            | TValue::Thread(_)
+            | TValue::UserData(_)
+            | TValue::Str(_) => {
                 // 这些是 GC 对象类型，需要从 TValue 中提取 GCObjectId
                 // 当前 TValue 变体持有具体类型值，不包含 ID。
                 // 在完整集成时，需要将 TValue 改为持有 GCObjectId + Ref。
@@ -928,12 +934,12 @@ impl GCState {
 
     pub fn mark_value(&self, _value: &crate::objects::TValue) {
         match _value {
-            crate::objects::TValue::Table(_) => {}
-            crate::objects::TValue::LClosure(_) => {}
-            crate::objects::TValue::CClosure(_) => {}
-            crate::objects::TValue::Thread(_) => {}
-            crate::objects::TValue::UserData(_) => {}
-            crate::objects::TValue::Str(_) => {}
+            TValue::Table(_) => {}
+            TValue::LClosure(_) => {}
+            TValue::CClosure(_) => {}
+            TValue::Thread(_) => {}
+            TValue::UserData(_) => {}
+            TValue::Str(_) => {}
             _ => {}
         }
     }

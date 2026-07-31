@@ -17,6 +17,7 @@ use crate::gc::GCObjectHeader;
 use crate::objects::{LClosure, NilKind, Proto, TValue, UpVal, UpValRef};
 use crate::state::LuaState;
 use crate::strings::LuaString;
+use crate::table::Table;
 use std::io::Write;
 use std::rc::Rc;
 
@@ -433,7 +434,12 @@ fn call_type(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 }
 
 /// pcall(f, args...) — 对应 C 的 luaB_pcall
-pub(crate) fn call_pcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+pub(crate) fn call_pcall(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
     let func = get_arg(state, a, 0);
     let pcall_nargs = nargs.saturating_sub(1);
 
@@ -1208,7 +1214,12 @@ fn call_pairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
 }
 
 /// xpcall(f, err, args...) — 对应 C 的 luaB_xpcall
-pub(crate) fn call_xpcall(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+pub(crate) fn call_xpcall(
+    state: &mut LuaState,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError> {
     let func = get_arg(state, a, 0);
     let err_fn = get_arg(state, a, 1);
     let xpcall_nargs = nargs.saturating_sub(2);
@@ -1742,17 +1753,6 @@ fn findfile(
     Ok((None, errmsg))
 }
 
-/// 旧版兼容：仅返回找到的路径，不返回错误消息
-fn search_path(
-    state: &LuaState,
-    name: &str,
-    fieldname: &str,
-    dirsep: &str,
-    sep: &str,
-) -> Result<Option<String>, String> {
-    findfile(state, name, fieldname, dirsep, sep).map(|(opt, _)| opt)
-}
-
 /// loadfunc — 对应 C loadlib.cpp 的 loadfunc
 ///
 /// 在 filename 中查找 luaopen_<modname> 函数。
@@ -1903,7 +1903,7 @@ fn lookforfunc(state: &mut LuaState, path: &str, sym: &str) -> Result<TValue, Lo
         let clibs = match state.registry.get(&clibs_key) {
             Some(TValue::Table(t)) => t,
             _ => {
-                let new_clibs = crate::table::Table::new();
+                let new_clibs = Table::new();
                 state
                     .registry
                     .set(clibs_key.clone(), TValue::Table(new_clibs.clone()));
@@ -2098,52 +2098,6 @@ fn call_searcher_placeholder(
     ))
 }
 
-/// 读取 package.path 并搜索模块文件 (旧版兼容,保留供 loadfile 等使用)
-///
-/// package.path 是用 `;` 分隔的模板列表,`?` 替换为 modname。
-/// 返回第一个存在的文件路径。
-fn search_module_file(state: &LuaState, modname: &str) -> Option<String> {
-    search_path(state, modname, "path", "/", ".").ok().flatten()
-}
-
-/// 加载并执行模块文件,缓存结果到 package.loaded (对应 C 的 requiref 语义)
-fn load_and_run_module(
-    state: &mut LuaState,
-    a: usize,
-    nresults: i32,
-    modname: &str,
-    filepath: &str,
-) -> Result<(), VmError> {
-    let saved_len = state.stack.len();
-    let load_status = state.load_file(Some(filepath));
-    if load_status != 0 {
-        let err = state.to_string(-1).unwrap_or_default();
-        state.settop(saved_len);
-        return Err(VmError::RuntimeError(format!(
-            "error loading module '{}' from '{}': {}",
-            modname, filepath, err
-        )));
-    }
-    let call_status = state.pcall(0, 1, 0);
-    if call_status != 0 {
-        let err = state.to_string(-1).unwrap_or_default();
-        state.settop(saved_len);
-        return Err(VmError::RuntimeError(format!(
-            "error loading module '{}' from '{}': {}",
-            modname, filepath, err
-        )));
-    }
-    let result = state
-        .stack
-        .get(saved_len)
-        .cloned()
-        .unwrap_or_else(|| TValue::Nil(NilKind::Strict));
-    state.settop(saved_len);
-    cache_module_loaded(state, modname, result.clone());
-    push_results(state, a, nresults, vec![result]);
-    Ok(())
-}
-
 /// 缓存模块到 package.loaded[modname]
 fn cache_module_loaded(state: &mut LuaState, modname: &str, val: TValue) {
     let loaded_key = TValue::Str(state.intern_str("loaded"));
@@ -2200,8 +2154,8 @@ fn setpath(state: &LuaState, envname: &str, dft: &str) -> String {
 /// 对应 C loadlib.cpp 的 luaopen_package
 fn init_package_table(state: &mut LuaState) {
     let package_key = TValue::Str(state.intern_str("package"));
-    let pkg = crate::table::Table::new();
-    let loaded = crate::table::Table::new();
+    let pkg = Table::new();
+    let loaded = Table::new();
     // registry._LOADED 和 package.loaded 共享同一个 Rc 引用（对应 C luaopen_package）
     let loaded_shared = loaded.clone();
     pkg.set(
@@ -2209,7 +2163,7 @@ fn init_package_table(state: &mut LuaState) {
         TValue::Table(loaded),
     );
     // preload 表 — 对应 registry[LUA_PRELOAD_TABLE]
-    let preload = crate::table::Table::new();
+    let preload = Table::new();
     pkg.set(
         TValue::Str(state.intern_str("preload")),
         TValue::Table(preload),
@@ -2257,7 +2211,7 @@ fn init_package_table(state: &mut LuaState) {
             name: name.as_ptr() as *const u8,
         })
     };
-    let searchers = crate::table::Table::new();
+    let searchers = Table::new();
     searchers.set(TValue::Integer(1), make_searcher(c"searcher_preload"));
     searchers.set(TValue::Integer(2), make_searcher(c"searcher_Lua"));
     searchers.set(TValue::Integer(3), make_searcher(c"searcher_C"));
@@ -2556,18 +2510,18 @@ fn call_load(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
                 intern_proto_strings(&mut proto, state);
             }
             let mut upvals: Vec<UpValRef> = Vec::with_capacity(nup.max(1));
-            upvals.push(std::rc::Rc::new(std::cell::RefCell::new(UpVal::Closed {
+            upvals.push(Rc::new(std::cell::RefCell::new(UpVal::Closed {
                 value: Box::new(env_val),
             })));
             for _ in 1..nup {
-                upvals.push(std::rc::Rc::new(std::cell::RefCell::new(UpVal::Closed {
+                upvals.push(Rc::new(std::cell::RefCell::new(UpVal::Closed {
                     value: Box::new(TValue::Nil(NilKind::Strict)),
                 })));
             }
             let closure = Rc::new(LClosure {
                 gc_header: GCObjectHeader::new(),
-                proto: std::rc::Rc::new(proto),
-                upvals: std::rc::Rc::new(std::cell::RefCell::new(upvals)),
+                proto: Rc::new(proto),
+                upvals: Rc::new(std::cell::RefCell::new(upvals)),
             });
             push_results(state, a, nresults, vec![TValue::LClosure(closure)]);
             Ok(())
@@ -2820,8 +2774,8 @@ pub fn intern_proto_strings(proto: &mut Proto, state: &LuaState) {
     }
     // 递归处理子 proto — Rc::make_mut 在 protos 独占时（refcount=1）直接返回 &mut Vec，
     // 否则 clone-on-write；此处 intern_proto_strings 在加载后调用，protos 通常独占
-    for p in std::rc::Rc::make_mut(&mut proto.protos).iter_mut() {
-        intern_proto_strings(std::rc::Rc::make_mut(p), state);
+    for p in Rc::make_mut(&mut proto.protos).iter_mut() {
+        intern_proto_strings(Rc::make_mut(p), state);
     }
 }
 
@@ -3178,12 +3132,18 @@ fn call_collectgarbage(
 /// 2. 设置 _G 和 _VERSION
 pub fn open_base_lib(state: &mut LuaState) {
     // 注册所有基础库函数 (使用 BuiltinFn 函数指针)
-    let register = |state: &mut LuaState, name: &'static std::ffi::CStr, func: crate::objects::BuiltinFnPtr| {
+    let register = |state: &mut LuaState,
+                    name: &'static std::ffi::CStr,
+                    func: crate::objects::BuiltinFnPtr| {
         let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
         let name_ptr = name.as_ptr() as *const u8;
-        state
-            .globals
-            .set(key, TValue::BuiltinFn(crate::objects::BuiltinFn { func, name: name_ptr }));
+        state.globals.set(
+            key,
+            TValue::BuiltinFn(crate::objects::BuiltinFn {
+                func,
+                name: name_ptr,
+            }),
+        );
     };
 
     // 基础库函数
@@ -3236,12 +3196,12 @@ mod tests {
     use super::*;
 
     fn make_str(s: &str) -> TValue {
-        TValue::Str(crate::strings::LuaString::Short(crate::strings::ArcRc::new(
-            crate::strings::ShortString {
+        TValue::Str(crate::strings::LuaString::Short(
+            crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
                 contents: crate::strings::LuaString::with_nul(s),
-            },
-        )))
+            }),
+        ))
     }
 
     // ========================================================================
@@ -3294,10 +3254,7 @@ mod tests {
         assert_eq!(base_type_name(&TValue::Integer(42)), "number");
         assert_eq!(base_type_name(&TValue::Float(3.14)), "number");
         assert_eq!(base_type_name(&make_str("hello")), "string");
-        assert_eq!(
-            base_type_name(&TValue::Table(crate::table::Table::new())),
-            "table"
-        );
+        assert_eq!(base_type_name(&TValue::Table(Table::new())), "table");
     }
 
     /// 验证 LightUserData 在用户指针范围（超出内置 tag 范围）不被误判为 function
@@ -3309,12 +3266,12 @@ mod tests {
     fn test_lightuserdata_not_misjudged_as_function() {
         // 真实用户指针值（超出内置 tag 范围）不应被误判为 function
         let user_ptrs: [usize; 6] = [
-            0,                    // NULL 指针
-            1,                    // 原 BASE_PRINT 范围，基础库迁移后不再是内置 tag
-            100,                  // 原字符串库范围，已迁移
-            200,                  // 原数学库范围，已迁移
-            1000,                 // 原 wrap_call 上限附近，coroutine.wrap 已改用 Table
-            0x7fff_0000_0000,     // 真实用户指针高位 (Linux stack)
+            0,                // NULL 指针
+            1,                // 原 BASE_PRINT 范围，基础库迁移后不再是内置 tag
+            100,              // 原字符串库范围，已迁移
+            200,              // 原数学库范围，已迁移
+            1000,             // 原 wrap_call 上限附近，coroutine.wrap 已改用 Table
+            0x7fff_0000_0000, // 真实用户指针高位 (Linux stack)
         ];
         for tag_val in user_ptrs {
             let v = TValue::LightUserData(tag_val as *mut std::ffi::c_void);
@@ -3467,7 +3424,7 @@ mod tests {
 
     #[test]
     fn test_base_rawlen_table() {
-        let mut t = crate::table::Table::new();
+        let t = Table::new();
         t.set(TValue::Integer(1), TValue::Integer(10));
         t.set(TValue::Integer(2), TValue::Integer(20));
         assert_eq!(base_rawlen(&TValue::Table(t)).unwrap(), 2);
@@ -3737,7 +3694,7 @@ mod tests {
     fn test_call_rawget() {
         let mut state = LuaState::new();
         state.stack.clear();
-        let mut t = crate::table::Table::new();
+        let t = Table::new();
         t.set(TValue::Integer(1), TValue::Integer(100));
         state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
@@ -3753,7 +3710,7 @@ mod tests {
     fn test_call_rawset() {
         let mut state = LuaState::new();
         state.stack.clear();
-        let t = crate::table::Table::new();
+        let t = Table::new();
         state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
         state.stack.push(TValue::Integer(1));
@@ -3849,8 +3806,8 @@ mod tests {
     fn test_call_setmetatable() {
         let mut state = LuaState::new();
         state.stack.clear();
-        let t = crate::table::Table::new();
-        let mt = crate::table::Table::new();
+        let t = Table::new();
+        let mt = Table::new();
         state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
         state.stack.push(TValue::Table(mt));
@@ -3865,8 +3822,8 @@ mod tests {
     fn test_call_getmetatable() {
         let mut state = LuaState::new();
         state.stack.clear();
-        let t = crate::table::Table::new();
-        t.set_metatable(Some(crate::table::Table::new()));
+        let t = Table::new();
+        t.set_metatable(Some(Table::new()));
         state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
         call_getmetatable(&mut state, 0, 1, 1).unwrap();
@@ -3880,7 +3837,7 @@ mod tests {
     fn test_call_getmetatable_no_mt() {
         let mut state = LuaState::new();
         state.stack.clear();
-        let t = crate::table::Table::new();
+        let t = Table::new();
         state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
         call_getmetatable(&mut state, 0, 1, 1).unwrap();
@@ -3896,7 +3853,7 @@ mod tests {
     fn test_call_ipairs() {
         let mut state = LuaState::new();
         state.stack.clear();
-        let mut t = crate::table::Table::new();
+        let t = Table::new();
         t.set(TValue::Integer(1), TValue::Integer(10));
         t.set(TValue::Integer(2), TValue::Integer(20));
         state.stack.push(placeholder_builtin());
@@ -3906,7 +3863,7 @@ mod tests {
         // 第一个返回值是迭代器函数 (BuiltinFn, func 指向 call_ipairs_aux)
         match &state.stack[0] {
             TValue::BuiltinFn(bf) => {
-                assert_eq!(bf.func as usize, call_ipairs_aux as usize);
+                assert_eq!(bf.func as usize, call_ipairs_aux as *const () as usize);
             }
             _ => panic!("expected BuiltinFn"),
         }
@@ -3925,7 +3882,7 @@ mod tests {
     fn test_call_pairs() {
         let mut state = LuaState::new();
         state.stack.clear();
-        let t = crate::table::Table::new();
+        let t = Table::new();
         state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
         call_pairs(&mut state, 0, 1, 3).unwrap();
@@ -3933,7 +3890,7 @@ mod tests {
         // 第一个返回值是 next 迭代器 (BuiltinFn, func 指向 call_next_iter)
         match &state.stack[0] {
             TValue::BuiltinFn(bf) => {
-                assert_eq!(bf.func as usize, call_next_iter as usize);
+                assert_eq!(bf.func as usize, call_next_iter as *const () as usize);
             }
             _ => panic!("expected BuiltinFn"),
         }
@@ -3945,7 +3902,7 @@ mod tests {
     fn test_call_ipairs_aux() {
         let mut state = LuaState::new();
         state.stack.clear();
-        let mut t = crate::table::Table::new();
+        let t = Table::new();
         t.set(TValue::Integer(1), TValue::Integer(10));
         t.set(TValue::Integer(2), TValue::Integer(20));
         state.stack.push(placeholder_builtin());
@@ -3967,7 +3924,7 @@ mod tests {
     fn test_call_ipairs_aux_end() {
         let mut state = LuaState::new();
         state.stack.clear();
-        let t = crate::table::Table::new();
+        let t = Table::new();
         state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
         state.stack.push(TValue::Integer(0));
@@ -3987,7 +3944,7 @@ mod tests {
     #[test]
     fn test_table_next_array() {
         // 使用 with_capacity 预分配数组部分, 确保值存储在数组中 (顺序迭代)
-        let mut t = crate::table::Table::with_capacity(2, 0);
+        let t = Table::with_capacity(2, 0);
         t.set(TValue::Integer(1), TValue::Integer(10));
         t.set(TValue::Integer(2), TValue::Integer(20));
 

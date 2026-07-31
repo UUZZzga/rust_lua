@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
+use crate::objects::FxBuildHasher;
 use crate::state::LuaState;
 use crate::strings::LuaString;
-use crate::objects::FxBuildHasher;
 
 /// 编译器内部缓冲区的缓存,用于避免每次编译时重复分配 Vec/String/HashMap 的堆内存。
 /// 通过 `COMPILER_CACHE` 线程局部变量跨编译调用复用,减少 glibc 堆碎片和 RSS。
@@ -892,7 +892,9 @@ impl<'a> LexState<'a> {
         let mut i = start;
         while i < bytes.len() {
             let b = bytes[i];
-            if (b >= b'a' && b <= b'z') || (b >= b'A' && b <= b'Z') || b == b'_'
+            if (b >= b'a' && b <= b'z')
+                || (b >= b'A' && b <= b'Z')
+                || b == b'_'
                 || (b >= b'0' && b <= b'9')
             {
                 i += 1;
@@ -950,7 +952,8 @@ impl<'a> LexState<'a> {
             // 批量扫描 hex 整数部分
             while self.pos < len {
                 let b = bytes[self.pos];
-                if (b >= b'0' && b <= b'9') || (b >= b'a' && b <= b'f') || (b >= b'A' && b <= b'F') {
+                if (b >= b'0' && b <= b'9') || (b >= b'a' && b <= b'f') || (b >= b'A' && b <= b'F')
+                {
                     self.pos += 1;
                 } else {
                     break;
@@ -962,7 +965,10 @@ impl<'a> LexState<'a> {
                 self.advance_pos();
                 while self.pos < len {
                     let b = bytes[self.pos];
-                    if (b >= b'0' && b <= b'9') || (b >= b'a' && b <= b'f') || (b >= b'A' && b <= b'F') {
+                    if (b >= b'0' && b <= b'9')
+                        || (b >= b'a' && b <= b'f')
+                        || (b >= b'A' && b <= b'F')
+                    {
                         self.pos += 1;
                     } else {
                         break;
@@ -1276,7 +1282,7 @@ impl<'a> LexState<'a> {
                     let actual = self.count_equals(); // count (并跳过) '='
                     if actual == eqs && self.current == ']' {
                         self.next_char(); // skip 2nd ']'
-                        // intern 长字符串字面量 (anchor_string 内部走 scanner_strings 去重)
+                                          // intern 长字符串字面量 (anchor_string 内部走 scanner_strings 去重)
                         let ls = self.anchor_string(&s);
                         self.token = Token::String(ls);
                         return;

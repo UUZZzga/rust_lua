@@ -88,8 +88,8 @@ pub type ArcRc<T> = std::sync::Arc<T>;
 
 use std::fmt::{self, Debug, Formatter};
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::os::raw::c_char;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 // 默认模式 (性能优先): 使用 hashbrown::HashTable 单级哈希表
 // size_optimized: 使用 std::collections::HashMap 两级结构, 减小二进制体积
@@ -173,8 +173,16 @@ pub enum LuaString {
 fn content_eq(a: &str, b: &str) -> bool {
     let ab = a.as_bytes();
     let bb = b.as_bytes();
-    let ab = if ab.last() == Some(&0) { &ab[..ab.len() - 1] } else { ab };
-    let bb = if bb.last() == Some(&0) { &bb[..bb.len() - 1] } else { bb };
+    let ab = if ab.last() == Some(&0) {
+        &ab[..ab.len() - 1]
+    } else {
+        ab
+    };
+    let bb = if bb.last() == Some(&0) {
+        &bb[..bb.len() - 1]
+    } else {
+        bb
+    };
     ab == bb
 }
 
@@ -211,8 +219,7 @@ impl PartialEq for LuaString {
                 // hash 预比较（不同 hash → 内容必然不同 → 立即 false）
                 // ShortString 末尾必然有 NUL, 直接比较 contents (含 NUL) 即可,
                 // 无需 content_eq 的 last() 检查 + slice 切片
-                ArcRc::ptr_eq(a, b)
-                    || (a.hash == b.hash && a.contents == b.contents)
+                ArcRc::ptr_eq(a, b) || (a.hash == b.hash && a.contents == b.contents)
             }
             (LuaString::Long(a), LuaString::Long(b)) => a == b,
             _ => self.as_str() == other.as_str(),
@@ -251,8 +258,7 @@ impl PartialEq<LuaString> for str {
 pub fn eq_str(a: &LuaString, b: &LuaString) -> bool {
     match (a, b) {
         (LuaString::Short(a), LuaString::Short(b)) => {
-            ArcRc::ptr_eq(a, b)
-                || (a.hash == b.hash && content_eq(&a.contents, &b.contents))
+            ArcRc::ptr_eq(a, b) || (a.hash == b.hash && content_eq(&a.contents, &b.contents))
         }
         (LuaString::Long(a), LuaString::Long(b)) => content_eq(&a.contents, &b.contents),
         _ => false,
@@ -312,7 +318,9 @@ pub struct StringTable {
 
 #[cfg(size_optimized)]
 pub struct StringTable {
-    ht: RwLock<std::collections::HashMap<u64, Vec<ArcRc<ShortString>>, crate::objects::FxBuildHasher>>,
+    ht: RwLock<
+        std::collections::HashMap<u64, Vec<ArcRc<ShortString>>, crate::objects::FxBuildHasher>,
+    >,
     nuse: RwLock<usize>,
 }
 
@@ -445,7 +453,10 @@ impl StringTable {
     #[cfg_attr(not(size_optimized), inline)]
     #[cfg(not(feature = "threaded"))]
     pub fn intern_bytes(&self, bytes: &[u8]) -> LuaString {
-        debug_assert!(bytes.len() <= LUAI_MAXSHORTLEN, "intern_bytes 只用于短字符串");
+        debug_assert!(
+            bytes.len() <= LUAI_MAXSHORTLEN,
+            "intern_bytes 只用于短字符串"
+        );
         // 必须使用与 intern() 相同的哈希算法（rust_hash_bytes）。
         // intern_bytes 与 intern 在相同字节输入下必须产生相同 hash。
         let h = rust_hash_bytes(bytes);
@@ -492,7 +503,10 @@ impl StringTable {
     #[cfg_attr(not(size_optimized), inline)]
     #[cfg(feature = "threaded")]
     pub fn intern_bytes(&self, bytes: &[u8]) -> LuaString {
-        debug_assert!(bytes.len() <= LUAI_MAXSHORTLEN, "intern_bytes 只用于短字符串");
+        debug_assert!(
+            bytes.len() <= LUAI_MAXSHORTLEN,
+            "intern_bytes 只用于短字符串"
+        );
         let h = rust_hash_bytes(bytes);
         let bytes_len = bytes.len();
 
@@ -536,7 +550,9 @@ impl StringTable {
         let mut ht = self.ht.write();
         // 用指针相等性匹配要删除的条目
         // HashTable 没有 remove_entry 方法，改用 find_entry + remove
-        if let Ok(entry) = ht.find_entry(h, |item: &ArcRc<ShortString>| std::ptr::eq(item.as_ref(), ptr)) {
+        if let Ok(entry) = ht.find_entry(h, |item: &ArcRc<ShortString>| {
+            std::ptr::eq(item.as_ref(), ptr)
+        }) {
             entry.remove();
         }
         let mut nuse = self.nuse.write();
@@ -566,7 +582,9 @@ impl StringTable {
         let freed = to_remove.len();
         for (hash, ptr) in to_remove {
             // HashTable 没有 remove_entry 方法，改用 find_entry + remove
-            if let Ok(entry) = ht.find_entry(hash, |item: &ArcRc<ShortString>| ArcRc::as_ptr(item) == ptr) {
+            if let Ok(entry) =
+                ht.find_entry(hash, |item: &ArcRc<ShortString>| ArcRc::as_ptr(item) == ptr)
+            {
                 entry.remove();
             }
         }
@@ -586,7 +604,9 @@ impl StringTable {
     pub fn new() -> Self {
         // size_optimized: 不预分配, 减小二进制体积
         StringTable {
-            ht: RwLock::new(std::collections::HashMap::with_hasher(crate::objects::FxBuildHasher::default())),
+            ht: RwLock::new(std::collections::HashMap::with_hasher(
+                crate::objects::FxBuildHasher::default(),
+            )),
             nuse: RwLock::new(0),
         }
     }
@@ -671,7 +691,10 @@ impl StringTable {
     #[cfg_attr(not(size_optimized), inline)]
     #[cfg(not(feature = "threaded"))]
     pub fn intern_bytes(&self, bytes: &[u8]) -> LuaString {
-        debug_assert!(bytes.len() <= LUAI_MAXSHORTLEN, "intern_bytes 只用于短字符串");
+        debug_assert!(
+            bytes.len() <= LUAI_MAXSHORTLEN,
+            "intern_bytes 只用于短字符串"
+        );
         let h = rust_hash_bytes(bytes);
         let bytes_len = bytes.len();
 
@@ -708,7 +731,10 @@ impl StringTable {
     #[cfg_attr(not(size_optimized), inline)]
     #[cfg(feature = "threaded")]
     pub fn intern_bytes(&self, bytes: &[u8]) -> LuaString {
-        debug_assert!(bytes.len() <= LUAI_MAXSHORTLEN, "intern_bytes 只用于短字符串");
+        debug_assert!(
+            bytes.len() <= LUAI_MAXSHORTLEN,
+            "intern_bytes 只用于短字符串"
+        );
         let h = rust_hash_bytes(bytes);
         let bytes_len = bytes.len();
 
@@ -816,7 +842,10 @@ pub fn rust_hash_bytes(bytes: &[u8]) -> u64 {
     // 迭代器版本编译器可证明无越界, 生成更紧凑的循环体。
     for &b in bytes.iter().rev() {
         let b = b as u64;
-        h ^= h.wrapping_shl(7).wrapping_add(h.wrapping_shr(2)).wrapping_add(b);
+        h ^= h
+            .wrapping_shl(7)
+            .wrapping_add(h.wrapping_shr(2))
+            .wrapping_add(b);
     }
     h
 }
@@ -858,14 +887,10 @@ impl LuaString {
         match self {
             // ArcRc 分配 = ArcInner<ShortString>（含引用计数 usize）+ ShortString 自身
             // ShortString = { hash: u64, contents: String }，String 堆分配 = capacity
-            LuaString::Short(s) => {
-                std::mem::size_of::<ShortString>() + s.contents.capacity() + 16
-            }
+            LuaString::Short(s) => std::mem::size_of::<ShortString>() + s.contents.capacity() + 16,
             // Box<LongString> 堆分配 = LongString 自身（Box 无额外头）
             // LongString = { hash: AtomicU64, extra: AtomicU8, contents: String, ptr_id: u32 }
-            LuaString::Long(s) => {
-                std::mem::size_of::<LongString>() + s.contents.capacity() + 8
-            }
+            LuaString::Long(s) => std::mem::size_of::<LongString>() + s.contents.capacity() + 8,
         }
     }
 
@@ -995,8 +1020,8 @@ pub fn new_short_bytes(bytes: Vec<u8>) -> LuaString {
     let h = rust_hash_bytes(&bytes);
     let mut buf = bytes;
     buf.reserve(1); // 确保 push NUL 不扩容
-    // perf: 用 unsafe 直接写 NUL + set_len 替代 push(0), 消除冗余容量检查
-    // SAFETY: reserve(1) 保证至少 1 字节空闲; 写 [len] 在容量内; set_len(len+1) 合法。
+                    // perf: 用 unsafe 直接写 NUL + set_len 替代 push(0), 消除冗余容量检查
+                    // SAFETY: reserve(1) 保证至少 1 字节空闲; 写 [len] 在容量内; set_len(len+1) 合法。
     let len = buf.len();
     unsafe {
         *buf.as_mut_ptr().add(len) = 0;
@@ -1460,7 +1485,10 @@ mod tests {
         let a = tb.intern("shared");
         let b = tb.intern("shared");
         if let (LuaString::Short(ra), LuaString::Short(rb)) = (&a, &b) {
-            assert!(ArcRc::ptr_eq(ra, rb), "同一字符串的内部化应该返回相同的 ArcRc");
+            assert!(
+                ArcRc::ptr_eq(ra, rb),
+                "同一字符串的内部化应该返回相同的 ArcRc"
+            );
             assert_eq!(ArcRc::strong_count(ra), 3, "引用计数应为 3（表 + a + b）");
         } else {
             panic!("应为短字符串");

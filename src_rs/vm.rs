@@ -249,7 +249,7 @@ pub fn strcmp(ts1: &LuaString, ts2: &LuaString) -> Ordering {
     // 对应 C 实现 lvm.c:l_strcmp 的逻辑。
     let mut s1 = ts1.as_c_str_ptr();
     let mut s2 = ts2.as_c_str_ptr();
-    let mut rl1 = ts1.len();  // 不含末尾 NUL 的长度
+    let mut rl1 = ts1.len(); // 不含末尾 NUL 的长度
     let mut rl2 = ts2.len();
 
     loop {
@@ -264,7 +264,11 @@ pub fn strcmp(ts1: &LuaString, ts2: &LuaString) -> Ordering {
         let zl2 = unsafe { std::ffi::CStr::from_ptr(s2) }.to_bytes().len();
         if zl2 == rl2 {
             // s2 结束
-            return if zl1 == rl1 { Ordering::Equal } else { Ordering::Greater };
+            return if zl1 == rl1 {
+                Ordering::Equal
+            } else {
+                Ordering::Greater
+            };
         }
         if zl1 == rl1 {
             // s1 结束，s2 未结束
@@ -282,10 +286,7 @@ pub fn strcmp(ts1: &LuaString, ts2: &LuaString) -> Ordering {
 /// 通过裸指针调用 strcoll，避免 CString 堆分配。
 /// 调用者必须保证两个指针都指向 NUL 终止的字符串。
 #[cfg_attr(not(size_optimized), inline)]
-fn strcoll_ptrs(
-    s1: *const std::os::raw::c_char,
-    s2: *const std::os::raw::c_char,
-) -> Ordering {
+fn strcoll_ptrs(s1: *const std::os::raw::c_char, s2: *const std::os::raw::c_char) -> Ordering {
     // Miri 不支持 libc::strcoll,用字节比较代替
     // (默认 "C" locale 下 strcoll 等同于字节比较)
     #[cfg(miri)]
@@ -680,17 +681,16 @@ pub fn finish_get(key: &TValue, t: &TValue, _metatable: Option<&Table>) -> Resul
                 // 通过 get_metatable() 获取元表（共享 Rc，开销极小）
                 if let Some(mt) = table.get_metatable() {
                     return Ok(table.get(&current_key).unwrap_or_else(|| {
-                        mt.get(&current_key)
-                            .unwrap_or(TValue::Nil(crate::objects::NilKind::Strict))
+                        mt.get(&current_key).unwrap_or(TValue::Nil(NilKind::Strict))
                     }));
                 } else {
                     return Ok(table
                         .get(&current_key)
-                        .unwrap_or(TValue::Nil(crate::objects::NilKind::Strict)));
+                        .unwrap_or(TValue::Nil(NilKind::Strict)));
                 }
             }
             _ => {
-                return Ok(TValue::Nil(crate::objects::NilKind::Strict));
+                return Ok(TValue::Nil(NilKind::Strict));
             }
         }
     }
@@ -1231,7 +1231,7 @@ pub fn push_closure(
     if ra < stack.len() {
         stack[ra] = TValue::LClosure(closure);
     } else {
-        stack.resize(ra + 1, TValue::Nil(crate::objects::NilKind::Strict));
+        stack.resize(ra + 1, TValue::Nil(NilKind::Strict));
         stack[ra] = TValue::LClosure(closure);
     }
 }
@@ -1997,7 +1997,7 @@ mod tests {
 
     #[test]
     fn test_objlen_table() {
-        let mut t = Table::with_capacity(3, 0);
+        let t = Table::with_capacity(3, 0);
         t.set_int(1, TValue::Integer(10));
         t.set_int(2, TValue::Integer(20));
         t.set_int(3, TValue::Integer(30));
@@ -2021,7 +2021,7 @@ mod tests {
 
     #[test]
     fn test_objlen_table_hash_only() {
-        let mut t = Table::new();
+        let t = Table::new();
         t.set(TValue::Boolean(true), TValue::Integer(1));
         assert_eq!(objlen_raw(&TValue::Table(t)), Some(TValue::Integer(0)));
     }
@@ -2164,7 +2164,7 @@ mod tests {
 
     #[test]
     fn test_finish_get_table_present_key() {
-        let mut t = Table::new();
+        let t = Table::new();
         t.set(TValue::Str(make_ls("key")), TValue::Integer(42));
         let tv = TValue::Table(t);
         let result = finish_get(&TValue::Str(make_ls("key")), &tv, None);

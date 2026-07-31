@@ -1487,14 +1487,6 @@ pub fn make_tm_tvalue(tmnames: &[LuaString; TM_N], tm: TagMethod) -> TValue {
     TValue::Str(tmnames[tm as usize].clone())
 }
 
-fn make_ls(table: &StringTable, s: &str) -> TValue {
-    TValue::Str(table.intern(s))
-}
-
-fn make_name_key(table: &StringTable) -> TValue {
-    make_ls(table, "__name")
-}
-
 // ============================================================================
 // 测试
 // ============================================================================
@@ -1572,8 +1564,10 @@ mod tests {
     fn test_metatable_get_tm_and_cache() {
         let (_table, tmnames) = make_table_and_tmnames();
         let mut mt = Metatable::empty();
-        mt.table
-            .set(make_tm_tvalue(&tmnames, TagMethod::Index), TValue::Integer(42));
+        mt.table.set(
+            make_tm_tvalue(&tmnames, TagMethod::Index),
+            TValue::Integer(42),
+        );
         assert!(mt.get_tm(&tmnames, TagMethod::Index).is_some());
         assert!(mt.get_tm(&tmnames, TagMethod::Len).is_none());
         assert!(mt.flags.contains(MetatableFlags::NO_LEN));
@@ -1584,8 +1578,10 @@ mod tests {
         let (_table, tmnames) = make_table_and_tmnames();
         let mut mt = Metatable::empty();
         mt.flags.insert(MetatableFlags::NO_INDEX);
-        mt.table
-            .set(make_tm_tvalue(&tmnames, TagMethod::Index), TValue::Integer(99));
+        mt.table.set(
+            make_tm_tvalue(&tmnames, TagMethod::Index),
+            TValue::Integer(99),
+        );
         assert!(mt.get_tm(&tmnames, TagMethod::Index).is_none());
     }
 
@@ -1619,8 +1615,11 @@ mod tests {
     fn test_default_metatables_set_and_get() {
         let (_table, tmnames) = make_table_and_tmnames();
         let mut dmt = DefaultMetatables::new();
-        let mut mt_data = Table::new();
-        mt_data.set(make_tm_tvalue(&tmnames, TagMethod::Add), TValue::Integer(99));
+        let mt_data = Table::new();
+        mt_data.set(
+            make_tm_tvalue(&tmnames, TagMethod::Add),
+            TValue::Integer(99),
+        );
         let mt = Metatable::new(mt_data);
         dmt.set(LuaType::Number, mt);
         assert!(dmt.get(LuaType::Number).is_some());

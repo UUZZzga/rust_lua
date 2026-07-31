@@ -336,7 +336,6 @@ struct LocalVar {
     /// 避免对每个不匹配的 local 都解引用 Rc 读取 hash (perf: LuaString::eq 占 2.87%,
     /// 其中大部分是 ptr_eq 失败后 deref Rc 读 hash 的开销)。
     name_hash: u64,
-    start_pc: i32,
     active: bool,
     /// 是否为 `global *` 声明 (name == "(global *)")。
     /// 预存 bool 避免 lookup_local/find_global_decl 每次迭代都做 as_str() == "(global *)" 字符串比较。
@@ -347,9 +346,8 @@ struct LocalVar {
     ctc_kind: Option<ExpKind>,
     ctc_info: Option<i64>,
     ctc_str: Option<LuaString>,
-    vidx: i32, // variable index at declaration time (like C's vidx = nactvar at declaration)
     nactvar: i32, // compact active variable count at declaration time (like C's fs->nactvar)
-    pidx: i32, // index into proto.locvars (-1 if no debug info, like C's vd.pidx)
+    pidx: i32,    // index into proto.locvars (-1 if no debug info, like C's vd.pidx)
 }
 
 /// Result of searching for a variable in parent/grandparent scope.
@@ -372,9 +370,9 @@ enum LocalLookup {
     /// 普通 local (RDKREG/RDKCONST/RDKTOCLOSE/RDKVAVAR) — 对应 find_local_ex 返回 Some
     Local { reg: i32, kind: i32 },
     /// 命中具名 global 声明 (GDKREG/GDKCONST) — 对应 find_named_global_decl 返回 Some
-    NamedGlobal(i32),
+    NamedGlobal,
     /// 命中 collective `global *` 声明 (GDKREG/GDKCONST)
-    GlobalStar(i32),
+    GlobalStar,
     /// 有非匹配的具名 global 声明且无 `global *` 覆盖 → 未声明全局 (当前作用域)
     /// 对应 is_undeclared_global 当前作用域 info == -2
     Undeclared,
@@ -384,10 +382,9 @@ enum LocalLookup {
 
 struct LabelDesc {
     name: LuaString,
-    pc: i32,        // label 位置（跳转目标）
-    nactvar: i32,   // label 处的活跃变量计数（对应 C 的 bl->nactvar）
-    nlocals: usize, // label 处的 locals 数组长度（等价于 C 的 nactvar 作为紧凑数组索引）
-    reglevel: i32,  // label 处的寄存器级别（对应 C 的 reglevel(fs, nactvar)）
+    pc: i32,       // label 位置（跳转目标）
+    nactvar: i32,  // label 处的活跃变量计数（对应 C 的 bl->nactvar）
+    reglevel: i32, // label 处的寄存器级别（对应 C 的 reglevel(fs, nactvar)）
     line: i32,
 }
 
@@ -556,8 +553,14 @@ impl Hasher for FixedSipHasher13 {
         let mut i = 0;
         while i + 8 <= bytes.len() {
             let m = u64::from_le_bytes([
-                bytes[i], bytes[i+1], bytes[i+2], bytes[i+3],
-                bytes[i+4], bytes[i+5], bytes[i+6], bytes[i+7],
+                bytes[i],
+                bytes[i + 1],
+                bytes[i + 2],
+                bytes[i + 3],
+                bytes[i + 4],
+                bytes[i + 5],
+                bytes[i + 6],
+                bytes[i + 7],
             ]);
             self.length += 8;
             self.v3 ^= m;
@@ -617,9 +620,7 @@ impl Hash for ConstKey {
                 let v = *i as u64;
                 0x200 ^ v.wrapping_mul(0x9E3779B97F4A7C15)
             }
-            ConstKey::Float(f) => {
-                0x300 ^ (*f).wrapping_mul(0x9E3779B97F4A7C15)
-            }
+            ConstKey::Float(f) => 0x300 ^ (*f).wrapping_mul(0x9E3779B97F4A7C15),
             ConstKey::Str(s) => {
                 // 短字符串已有预计算的 hash (rust_hash, 分布良好)
                 0x400 ^ s.hash()
@@ -688,8 +689,6 @@ pub struct FuncState<'a> {
 enum EnvCache {
     /// 未缓存 (首次查找前 / 失效后)
     None,
-    /// _ENV 是当前函数的 local (如 `local _ENV = ...`)
-    Local { reg: i32, kind: i32 },
     /// _ENV 是 upvalue (嵌套函数捕获外层 _ENV)
     Upvalue(i32),
     /// _ENV 是隐式 upvalue 0 (顶层函数 / 未捕获的嵌套函数)
@@ -1105,8 +1104,7 @@ impl<'a> FuncState<'a> {
         let inst = create_vabck(OpCode::NEWTABLE, ra, hsize, rc, if k { 1 } else { 0 });
         let code = Rc::make_mut(&mut self.proto.code);
         code[pc as usize] = inst;
-        code[(pc + 1) as usize] =
-            ((OpCode::EXTRAARG as u32) << POS_OP) | ((extra as u32) << POS_A);
+        code[(pc + 1) as usize] = ((OpCode::EXTRAARG as u32) << POS_OP) | ((extra as u32) << POS_A);
     }
 
     /// 生成 JMP 无条件跳转指令，返回指令 pc 位置
@@ -1161,22 +1159,6 @@ impl<'a> FuncState<'a> {
             POS_SJ,
             SIZE_sJ,
         );
-    }
-
-    fn new_break(&mut self) -> i32 {
-        let pc = self.jump();
-        self.code_abc(OpCode::CLOSE, 0, 1, 0);
-        pc
-    }
-
-    fn patch_breaks(&mut self, target: i32) {
-        let mut cur = self.break_list;
-        while cur != NO_JUMP {
-            let next = self.get_jump(cur);
-            self.fix_jump(cur, target, false);
-            cur = next;
-        }
-        self.break_list = NO_JUMP;
     }
 
     /// 查找或添加常量到常量表: 去重后返回常量索引
@@ -1347,38 +1329,6 @@ impl<'a> FuncState<'a> {
         }
     }
 
-    fn free_exps(&mut self, e1: &ExpDesc, e2: &ExpDesc) {
-        let r1 = if matches!(e1.kind, ExpKind::NonReloc | ExpKind::Relocable)
-            && (e1.info as i32) >= self.nvarstack()
-        {
-            e1.info as i32
-        } else {
-            -1
-        };
-        let r2 = if matches!(e2.kind, ExpKind::NonReloc | ExpKind::Relocable)
-            && (e2.info as i32) >= self.nvarstack()
-        {
-            e2.info as i32
-        } else {
-            -1
-        };
-        if r1 > r2 {
-            if r1 >= 0 && r1 == self.freereg - 1 {
-                self.free_reg();
-            }
-            if r2 >= 0 && r2 == self.freereg - 1 {
-                self.free_reg();
-            }
-        } else {
-            if r2 >= 0 && r2 == self.freereg - 1 {
-                self.free_reg();
-            }
-            if r1 >= 0 && r1 == self.freereg - 1 {
-                self.free_reg();
-            }
-        }
-    }
-
     #[cfg(debug_assertions)]
     fn reg_alloc_entry_desc(entry: &RegAllocEntry) -> String {
         format!(
@@ -1441,7 +1391,6 @@ impl<'a> FuncState<'a> {
             self.error_limit(MAXVARS, "local variables");
         }
         let reg = self.alloc_reg();
-        let vidx = self.locals.len() as i32;
         let nactvar = self.active_nactvar();
         // 注册到 proto.locvars (对应 C 的 registerlocalvar)
         let pidx = self.proto.loc_vars.len() as i32;
@@ -1460,7 +1409,6 @@ impl<'a> FuncState<'a> {
         self.locals.push(LocalVar {
             name: name_ls,
             name_hash,
-            start_pc,
             active: true,
             is_global_star: false,
             reg,
@@ -1468,7 +1416,6 @@ impl<'a> FuncState<'a> {
             ctc_kind: None,
             ctc_info: None,
             ctc_str: None,
-            vidx,
             nactvar,
             pidx,
         });
@@ -1494,7 +1441,6 @@ impl<'a> FuncState<'a> {
         } else {
             0
         };
-        let vidx = self.locals.len() as i32;
         let nactvar = self.active_nactvar();
         // C: registerlocalvar 只在 adjustlocalvars 中调用，只对 varinreg (kind <= RDKTOCLOSE)
         // 的变量注册到 locvars。global 变量 (kind >= GDKREG) 不注册。
@@ -1516,7 +1462,6 @@ impl<'a> FuncState<'a> {
         self.locals.push(LocalVar {
             name: name_ls,
             name_hash,
-            start_pc,
             active: true,
             is_global_star,
             reg,
@@ -1524,7 +1469,6 @@ impl<'a> FuncState<'a> {
             ctc_kind: None,
             ctc_info: None,
             ctc_str: None,
-            vidx,
             nactvar,
             pidx,
         });
@@ -1553,7 +1497,6 @@ impl<'a> FuncState<'a> {
                 self.error_limit(MAXVARS, "local variables");
             }
         }
-        let vidx = self.locals.len() as i32;
         let nactvar = self.active_nactvar();
         // C: registerlocalvar 只在 adjustlocalvars 中调用，只对 varinreg (kind <= RDKTOCLOSE)
         // 的变量注册到 locvars。global 变量 (kind >= GDKREG) 不注册。
@@ -1575,7 +1518,6 @@ impl<'a> FuncState<'a> {
         self.locals.push(LocalVar {
             name: name_ls,
             name_hash,
-            start_pc,
             active: true,
             is_global_star,
             reg,
@@ -1583,7 +1525,6 @@ impl<'a> FuncState<'a> {
             ctc_kind: None,
             ctc_info: None,
             ctc_str: None,
-            vidx,
             nactvar,
             pidx,
         });
@@ -1638,9 +1579,8 @@ impl<'a> FuncState<'a> {
     #[cfg_attr(not(size_optimized), inline)]
     fn lookup_local(&mut self, name: &LuaString) -> LocalLookup {
         let name_hash = name.hash();
-        // info: -1 = 无 global 声明, >=0 = 有 global * (存 collective_kind), -2 = 有非匹配 named global
+        // info: -1 = 无 global 声明, >=0 = 有 global *, -2 = 有非匹配 named global
         let mut info: i32 = -1;
-        let mut collective_kind: i32 = GDKREG;
 
         for lv in self.locals.iter().rev() {
             if !lv.active {
@@ -1653,11 +1593,10 @@ impl<'a> FuncState<'a> {
                     // collective: 记录 (仅首次, 对应 C 的 info < 0 检查)
                     if info < 0 {
                         info = 0;
-                        collective_kind = lv.kind;
                     }
                 } else if lv.name_hash == name_hash && lv.name == *name {
                     // named global 匹配: 立即返回 (影子规则)
-                    return LocalLookup::NamedGlobal(lv.kind);
+                    return LocalLookup::NamedGlobal;
                 } else {
                     // named global 不匹配: 设置 -2 (仅当之前无 global *)
                     if info == -1 {
@@ -1683,12 +1622,15 @@ impl<'a> FuncState<'a> {
                     return LocalLookup::Ctc(ExpDesc::new(kind, lv.ctc_info.unwrap()));
                 }
                 // RDKREG/RDKCONST/RDKTOCLOSE/RDKVAVAR
-                return LocalLookup::Local { reg: lv.reg, kind: lv.kind };
+                return LocalLookup::Local {
+                    reg: lv.reg,
+                    kind: lv.kind,
+                };
             }
         }
 
         if info >= 0 {
-            LocalLookup::GlobalStar(collective_kind)
+            LocalLookup::GlobalStar
         } else if info == -2 {
             LocalLookup::Undeclared
         } else {
@@ -1720,13 +1662,13 @@ impl<'a> FuncState<'a> {
         // 缓存未命中: lookup_local + find_upvalue, 然后缓存
         let env_lookup = self.lookup_local(env_ls);
         match env_lookup {
-            LocalLookup::NamedGlobal(_) => EnvResolution::NamedGlobal,
+            LocalLookup::NamedGlobal => EnvResolution::NamedGlobal,
             LocalLookup::Ctc(ctc) => EnvResolution::Ctc(ctc),
             LocalLookup::Local { reg, kind } => {
                 // 不缓存 Local: `local _ENV` 声明在 block 退出后 deactivate
                 EnvResolution::Local { reg, kind }
             }
-            LocalLookup::GlobalStar(_) | LocalLookup::Undeclared | LocalLookup::NotFound => {
+            LocalLookup::GlobalStar | LocalLookup::Undeclared | LocalLookup::NotFound => {
                 // 不是 local, 查 upvalue
                 match self.find_upvalue(env_ls) {
                     Some(UpvalueOrCtc::Upvalue(idx)) => {
@@ -2135,33 +2077,6 @@ impl<'a> FuncState<'a> {
         } else {
             None
         }
-    }
-
-    /// 只查找具名 global 声明（如 `global a`），不包含 collective `global *`。
-    /// 匹配 C 的 searchvar：具名 global 匹配时立即返回 VGLOBAL，优先于 upvalue 查找。
-    /// 而 `global *` 只记录不返回，upvalue 查找优先。
-    fn find_named_global_decl(&self, name: &LuaString) -> Option<i32> {
-        for lv in self.locals.iter().rev() {
-            if !lv.active {
-                continue;
-            }
-            if lv.kind >= GDKREG {
-                if lv.is_global_star {
-                    // collective declaration: skip (handled by find_global_decl)
-                    continue;
-                } else if lv.name == *name {
-                    // named global declaration matches
-                    return Some(lv.kind);
-                }
-                // named global non-match: continue
-            } else {
-                // non-global variable: if name matches, it's a local, not a global
-                if lv.name == *name {
-                    return None;
-                }
-            }
-        }
-        None
     }
 
     /// Check whether `name` is an undeclared global variable, matching C's
@@ -2633,16 +2548,6 @@ impl<'a> FuncState<'a> {
         }
     }
 
-    fn cond_to_reg(&mut self, e: &ExpDesc) -> i32 {
-        if matches!(e.kind, ExpKind::Void | ExpKind::Nil) {
-            let r = self.alloc_reg();
-            self.code_abc(OpCode::LOADFALSE, r, 0, 0);
-            r
-        } else {
-            self.exp_to_reg(e)
-        }
-    }
-
     fn resolve_jumps(&mut self, e: &ExpDesc, r: i32) {
         if e.kind != ExpKind::VJMP && (e.t != NO_JUMP || e.f != NO_JUMP) {
             let need_f = self.need_value(e.f);
@@ -2730,7 +2635,8 @@ impl<'a> FuncState<'a> {
             );
         } else {
             let k = testarg_k(i);
-            Rc::make_mut(&mut self.proto.code)[(node - 1) as usize] = ((OpCode::TEST as u32) << POS_OP)
+            Rc::make_mut(&mut self.proto.code)[(node - 1) as usize] = ((OpCode::TEST as u32)
+                << POS_OP)
                 | ((b as u32) << POS_A)
                 | (if k { 1u32 << POS_K } else { 0 });
         }
@@ -2808,20 +2714,6 @@ impl<'a> FuncState<'a> {
         reglevel
     }
 
-    /// 将变量索引 nvar 转换为寄存器层级（对应 C 的 reglevel）
-    /// C 的 reglevel 从 nvar-1 向下迭代到 0，找到第一个 varinreg 的变量
-    /// C 的紧凑数组中 0..nactvar 的所有变量都"活跃"，但 Rust 的 locals 数组中
-    /// 有 inactive 变量（已退出块的变量仍保留在 Vec 中），需要跳过它们才能
-    /// 得到正确的寄存器层级，否则会找到已退出块的变量返回错误的 reg+1。
-    fn reglevel(&self, nvar: i32) -> i32 {
-        for i in (0..nvar as usize).rev() {
-            if i < self.locals.len() && self.locals[i].active && self.locals[i].kind <= RDKTOCLOSE {
-                return self.locals[i].reg + 1;
-            }
-        }
-        0
-    }
-
     /// 计算当前活跃变量的数量（等价于 C 的 fs->nactvar）
     /// C 中 nactvar 包含所有变量（包括 GDKREG/GDKCONST/RDKCTC），
     /// 变量离开作用域时通过 removevars 减小。
@@ -2841,20 +2733,6 @@ impl<'a> FuncState<'a> {
             .iter()
             .filter(|l| l.active)
             .count() as i32
-    }
-
-    /// 给定 locals 数组长度 nlocals，计算对应的寄存器级别
-    /// 等价于 C 的 reglevel(fs, nvar)：遍历 locals[0..nlocals]，
-    /// 从后往前找第一个在寄存器中的变量（varinreg: kind <= RDKTOCLOSE），返回 reg+1。
-    /// 不依赖 active 标志，因为 locals[0..nlocals] 在创建时都是 active 的，
-    /// 即使后来被 deactivate，kind 和 reg 不变。
-    fn reglevel_for_nlocals(&self, nlocals: usize) -> i32 {
-        for i in (0..nlocals).rev() {
-            if self.locals[i].kind <= RDKTOCLOSE {
-                return self.locals[i].reg + 1;
-            }
-        }
-        0
     }
 
     /// 给定活跃变量计数 nactvar，计算对应的寄存器级别
@@ -2911,13 +2789,6 @@ impl<'a> FuncState<'a> {
             .last()
             .map(|b| b.has_upval)
             .unwrap_or(false)
-    }
-
-    // Returns true if current block has to-be-closed variables
-    fn current_block_has_tbc(&self, saved_nlocals: usize) -> bool {
-        self.locals[saved_nlocals..]
-            .iter()
-            .any(|l| l.kind == RDKTOCLOSE && l.active)
     }
 
     /// Mark the innermost non-function block as having upvalues.
@@ -3257,20 +3128,10 @@ fn create_label(fs: &mut FuncState, name: &LuaString, line: i32, last: bool) {
     }
 
     let reglevel = fs.reglevel_for_nactvar(nactvar);
-    let nlocals = if last {
-        if let Some(blk) = fs.block_stack.last() {
-            blk.saved_nlocals
-        } else {
-            fs.locals.len()
-        }
-    } else {
-        fs.locals.len()
-    };
     fs.labels.push(LabelDesc {
         name: name.clone(),
         pc,
         nactvar,
-        nlocals,
         reglevel,
         line,
     });
@@ -3768,11 +3629,10 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
         // When key is a Kstr (index <= MAXINDEXRK), no pre-evaluation is needed
         // because SETTABUP can encode it directly. When key > MAXINDEXRK,
         // we must emit GETUPVAL + LOADK before expressions are parsed.
-        // Structure: PreEvalInfo { table_reg, key_reg, table_allocated } for non-Kstr keys.
+        // Structure: PreEvalInfo { table_reg, key_reg } for non-Kstr keys.
         struct PreEvalInfo {
-            table_reg: i32,        // register holding _ENV (or -1 if not pre-evaluated)
-            key_reg: i32,          // register holding key constant (or -1)
-            table_allocated: bool, // true if table_reg was alloc'd (needs free)
+            table_reg: i32, // register holding _ENV (or -1 if not pre-evaluated)
+            key_reg: i32,   // register holding key constant (or -1)
         }
         let mut pre_evals: Vec<PreEvalInfo> = Vec::new();
         // 检查 _ENV 是否是 local（包括 VVARGVAR）还是 upvalue
@@ -3789,20 +3649,16 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
                 // Pre-emit table + LOADK, matching C's luaK_indexed behavior.
                 // _ENV local: no table alloc needed (use env_reg directly);
                 // _ENV upvalue: GETUPVAL into allocated register.
-                let (table_reg, table_allocated) = if env_is_local {
-                    (env_reg, false)
+                let table_reg = if env_is_local {
+                    env_reg
                 } else {
                     let r = fs.alloc_reg();
                     fs.code_abc(OpCode::GETUPVAL, r, 0, 0);
-                    (r, true)
+                    r
                 };
                 let key_reg = fs.alloc_reg();
                 fs.code_loadk(key_reg, var_k_names[i]);
-                pre_evals.push(PreEvalInfo {
-                    table_reg,
-                    key_reg,
-                    table_allocated,
-                });
+                pre_evals.push(PreEvalInfo { table_reg, key_reg });
             } else if env_is_vvargvar {
                 // _ENV 是 VVARGVAR：预评估 key（LOADK），匹配 C 的 buildglobal
                 // （C 的 luaK_indexed 对 VVARGVAR 总是将 key 加载到寄存器）
@@ -3811,13 +3667,11 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
                 pre_evals.push(PreEvalInfo {
                     table_reg: env_reg,
                     key_reg,
-                    table_allocated: false,
                 });
             } else {
                 pre_evals.push(PreEvalInfo {
                     table_reg: -1,
                     key_reg: -1,
-                    table_allocated: false,
                 });
             }
         }
@@ -4852,7 +4706,8 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                         let gettabup_pc = v.env_gettabup_pc;
                         let (env_k, adjusted_key) =
                             if gettabup_pc >= 0 && (gettabup_pc as usize) < fs.proto.code.len() {
-                                let gettabup_inst = Rc::make_mut(&mut fs.proto.code).remove(gettabup_pc as usize);
+                                let gettabup_inst =
+                                    Rc::make_mut(&mut fs.proto.code).remove(gettabup_pc as usize);
                                 fs.inst_lines.remove(gettabup_pc as usize);
                                 fs.pc -= 1;
                                 let env_k = getarg_c(gettabup_inst);
@@ -5628,12 +5483,16 @@ fn code_global_via_env_prefix(fs: &mut FuncState, name: &str) -> PrefixResult {
     let is_env = name == "_ENV";
     // Intern name once; reuse for both string_k and var_name (避免重复 anchor + to_string 分配)
     let name_ls = crate::strings::new_lstr(&fs.ls().state.string_table, name);
-    let k = if is_env { 0 } else { fs.string_k_ls(name_ls.clone()) };
+    let k = if is_env {
+        0
+    } else {
+        fs.string_k_ls(name_ls.clone())
+    };
     // 检查是否有 global <const> 声明（read-only）
     // 搜索父函数链以检测子函数中的 global const 赋值（对应 C 的 singlevaraux 递归）
     let is_readonly = !is_env && fs.find_global_kind_in_chain(&name_ls) == Some(GDKCONST);
-    let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
-        && (k as u32) <= crate::opcodes::MAXINDEXRK;
+    let is_short_str =
+        name.len() <= crate::strings::LUAI_MAXSHORTLEN && (k as u32) <= crate::opcodes::MAXINDEXRK;
     // Like C buildglobal: singlevaraux(fs, "_ENV", ...) finds _ENV.
     // _ENV can be a local (VLOCAL), a local const (VCONST), or an upvalue (VUPVAL).
     // For VCONST, luaK_exp2anyregup discharges it to a register first.
@@ -5874,8 +5733,8 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
             let name = name.clone();
             fs.ls_mut().next();
             let name_str = name.as_str(); // 用于 code_global_via_env_prefix(&str) 等需要 &str 的位置
-            // perf: 一次扫描 locals 合并 find_local_ctc + find_local_ex + find_named_global_decl
-            // + is_undeclared_global(当前作用域), 消除 3-4 次重复迭代 (parse_prefix_exp 占 4.47% 热点)。
+                                          // perf: 一次扫描 locals 合并 find_local_ctc + find_local_ex + find_named_global_decl
+                                          // + is_undeclared_global(当前作用域), 消除 3-4 次重复迭代 (parse_prefix_exp 占 4.47% 热点)。
             let lookup = fs.lookup_local(&name);
             match lookup {
                 LocalLookup::Ctc(mut ctc) => {
@@ -5930,11 +5789,9 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     }
                 }
                 // 具名 global 声明（如 `global a`）：优先于 upvalue，通过 _ENV[name] 访问。
-                LocalLookup::NamedGlobal(_) => {
-                    code_global_via_env_prefix(fs, name_str)
-                }
+                LocalLookup::NamedGlobal => code_global_via_env_prefix(fs, name_str),
                 // collective `global *` / Undeclared / NotFound: 先查 upvalue
-                LocalLookup::GlobalStar(_) | LocalLookup::Undeclared | LocalLookup::NotFound => {
+                LocalLookup::GlobalStar | LocalLookup::Undeclared | LocalLookup::NotFound => {
                     if let Some(result) = fs.find_upvalue(&name) {
                         match result {
                             UpvalueOrCtc::Upvalue(upval_idx) => {
@@ -6206,8 +6063,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     fs.code_loadk(kr, k);
                     (kr, false, true)
                 };
-                let new_is_upvalue =
-                    (result.is_upvalue || can_revert_getupval) && is_short_str;
+                let new_is_upvalue = (result.is_upvalue || can_revert_getupval) && is_short_str;
                 result = PrefixResult {
                     var_name: None,
                     local_idx: None,
@@ -6407,10 +6263,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                             // Long string key (index > MAXINDEXRK): for upvalue tables,
                             // defer LOADK until after table's GETUPVAL (matching C's luaK_indexed:
                             // luaK_exp2anyreg(t) first, then luaK_exp2anyreg(k)).
-                            if is_upvalue_table
-                                && !getupval_emitted_before_key
-                                && !key_has_jumps
-                            {
+                            if is_upvalue_table && !getupval_emitted_before_key && !key_has_jumps {
                                 (-1, false, false)
                             } else {
                                 let kr = fs.alloc_reg();
@@ -6421,10 +6274,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     } else {
                         // Long string (not Short): for upvalue tables, defer LOADK until after
                         // table's GETUPVAL (matching C's luaK_indexed order).
-                        if is_upvalue_table
-                            && !getupval_emitted_before_key
-                            && !key_has_jumps
-                        {
+                        if is_upvalue_table && !getupval_emitted_before_key && !key_has_jumps {
                             (-1, false, false)
                         } else {
                             let kr = fs.alloc_reg();
@@ -6455,12 +6305,10 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                 } else {
                     (fs.exp_to_reg(&ei.exp), false, false)
                 };
-                let key_allocated =
-                    !key_is_const && kr != -1 && fs.freereg > saved_freereg_before;
+                let key_allocated = !key_is_const && kr != -1 && fs.freereg > saved_freereg_before;
                 let (base_reg, new_is_upvalue, allocated_reg) = if is_upvalue_table {
-                    let can_use_settabup = key_is_const
-                        && !key_is_int
-                        && (kr as u32) <= crate::opcodes::MAXINDEXRK;
+                    let can_use_settabup =
+                        key_is_const && !key_is_int && (kr as u32) <= crate::opcodes::MAXINDEXRK;
                     if can_use_settabup {
                         if getupval_emitted_before_key {
                             fs.remove_last_instruction();
@@ -6556,9 +6404,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     // temp register before calling.
                     // Skip indexed access (table_reg set): load_func must discharge
                     // the pending GETFIELD/GETTABLE.
-                    if reg == fs.freereg - 1
-                        && reg >= fs.nvarstack()
-                        && result.table_reg.is_none()
+                    if reg == fs.freereg - 1 && reg >= fs.nvarstack() && result.table_reg.is_none()
                     {
                         (reg, false, result.allocated_reg, None)
                     } else {
@@ -7398,11 +7244,8 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     // BOR variant: like C's codebinNoK + codebinexpval
                     // Like C's codebinNoK: if flip, swap back to original order,
                     // then codebinexpval processes original e2 first, then e1.
-                    let (first_ec, first_e2): (&ExpDesc, &ExpDesc) = if flip {
-                        (&ec, &e2.exp)
-                    } else {
-                        (&e2.exp, &ec)
-                    };
+                    let (first_ec, first_e2): (&ExpDesc, &ExpDesc) =
+                        if flip { (&ec, &e2.exp) } else { (&e2.exp, &ec) };
                     // Process the first operand (original e2 in C's codebinexpval)
                     let v2 = if matches!(first_ec.kind, ExpKind::NonReloc) && !first_ec.has_jumps()
                     {
@@ -7537,11 +7380,8 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     // BXOR variant: like C's codebinNoK + codebinexpval
                     // Like C's codebinNoK: if flip, swap back to original order,
                     // then codebinexpval processes original e2 first, then e1.
-                    let (first_ec, first_e2): (&ExpDesc, &ExpDesc) = if flip {
-                        (&ec, &e2.exp)
-                    } else {
-                        (&e2.exp, &ec)
-                    };
+                    let (first_ec, first_e2): (&ExpDesc, &ExpDesc) =
+                        if flip { (&ec, &e2.exp) } else { (&e2.exp, &ec) };
                     // Process the first operand (original e2 in C's codebinexpval)
                     let v2 = if matches!(first_ec.kind, ExpKind::NonReloc) && !first_ec.has_jumps()
                     {
@@ -10664,24 +10504,20 @@ fn parse_simple_exp_name(fs: &mut FuncState, name: LuaString) -> ExpDesc {
             }
         }
         // 具名 global 声明（如 `global a`）: 优先于 upvalue，通过 _ENV[name] 访问
-        LocalLookup::NamedGlobal(_) => {
-            code_global_via_env(fs, name.as_str())
-        }
+        LocalLookup::NamedGlobal => code_global_via_env(fs, name.as_str()),
         // collective `global *`: 不阻止 upvalue 查找 (CLAUDE.md 约定)
         // 先查 upvalue, 若失败再走 _ENV[name]
-        LocalLookup::GlobalStar(_) => {
+        LocalLookup::GlobalStar => {
             if let Some(result) = fs.find_upvalue(&name) {
                 match result {
-                    UpvalueOrCtc::Upvalue(upval_idx) => {
-                        ExpDesc {
-                            kind: ExpKind::Upval,
-                            info: upval_idx as i64,
-                            info2: 0,
-                            t: NO_JUMP,
-                            f: NO_JUMP,
-                            str_val: None,
-                        }
-                    }
+                    UpvalueOrCtc::Upvalue(upval_idx) => ExpDesc {
+                        kind: ExpKind::Upval,
+                        info: upval_idx as i64,
+                        info2: 0,
+                        t: NO_JUMP,
+                        f: NO_JUMP,
+                        str_val: None,
+                    },
                     UpvalueOrCtc::CtcConst(ctc) => ctc,
                 }
             } else {
@@ -10693,16 +10529,14 @@ fn parse_simple_exp_name(fs: &mut FuncState, name: LuaString) -> ExpDesc {
         LocalLookup::Undeclared => {
             if let Some(result) = fs.find_upvalue(&name) {
                 match result {
-                    UpvalueOrCtc::Upvalue(upval_idx) => {
-                        ExpDesc {
-                            kind: ExpKind::Upval,
-                            info: upval_idx as i64,
-                            info2: 0,
-                            t: NO_JUMP,
-                            f: NO_JUMP,
-                            str_val: None,
-                        }
-                    }
+                    UpvalueOrCtc::Upvalue(upval_idx) => ExpDesc {
+                        kind: ExpKind::Upval,
+                        info: upval_idx as i64,
+                        info2: 0,
+                        t: NO_JUMP,
+                        f: NO_JUMP,
+                        str_val: None,
+                    },
                     UpvalueOrCtc::CtcConst(ctc) => ctc,
                 }
             } else {
@@ -10768,7 +10602,9 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
             _ => unreachable!(),
         };
         fs.ls_mut().next();
-        return ExprItem { exp: ExpDesc::new_str(s) };
+        return ExprItem {
+            exp: ExpDesc::new_str(s),
+        };
     }
     // fast path: Token::Name — 用 mem::replace 取出 String, 避免 clone 的堆分配。
     // read_name 中 s.to_string() 已分配过一次, 这里 clone 是二次分配
@@ -10784,228 +10620,243 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
         parse_simple_exp_name(fs, name)
     } else {
         match &fs.ls().token {
-        Token::Nil => {
-            fs.ls_mut().next();
-            return ExprItem {
-                exp: ExpDesc::new(ExpKind::Nil, 0),
-            };
-        }
-        Token::True => {
-            fs.ls_mut().next();
-            return ExprItem {
-                exp: ExpDesc::new(ExpKind::Boolean, 1),
-            };
-        }
-        Token::False => {
-            fs.ls_mut().next();
-            return ExprItem {
-                exp: ExpDesc::new(ExpKind::Boolean, 0),
-            };
-        }
-        Token::Int(v) => {
-            let val = *v;
-            fs.ls_mut().next();
-            return ExprItem {
-                exp: ExpDesc::new(ExpKind::Int, val),
-            };
-        }
-        Token::Float(v) => {
-            let val = *v;
-            fs.ls_mut().next();
-            return ExprItem {
-                exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64),
-            };
-        }
-        Token::String(s) => {
-            let s = s.clone();
-            fs.ls_mut().next();
-            return ExprItem {
-                exp: ExpDesc::new_str(s),
-            };
-        }
-        Token::DotDotDot => {
-            fs.ls_mut().next();
-            // Like C: '...' always creates VVARARG, regardless of named vararg params.
-            // Named vararg params (RDKVAVAR) are accessed by their name, not by '...'.
-            // init_exp(v, VVARARG, luaK_codeABC(fs, OP_VARARG, 0, fs->f->numparams, 1));
-            // A=0 (placeholder, set later by setoneret/setreturns), B=numparams, C=1 (multret)
-            let numparams = fs.proto.num_params as i32;
-            let pc = fs.code_abc(OpCode::VARARG, 0, numparams, 1);
-            // info stores PC (like C's u.info), info2 also stores PC for set_c
-            ExpDesc {
-                kind: ExpKind::Vararg,
-                info: pc as i64,
-                info2: pc,
-                t: NO_JUMP,
-                f: NO_JUMP,
-                str_val: None,
+            Token::Nil => {
+                fs.ls_mut().next();
+                return ExprItem {
+                    exp: ExpDesc::new(ExpKind::Nil, 0),
+                };
             }
-        }
-        Token::LBrace => {
-            let (r, _n) = parse_constructor(fs);
-            return ExprItem {
-                exp: ExpDesc::new(ExpKind::NonReloc, r as i64),
-            };
-        }
-        Token::Name(name) => {
-            // fallback: fast path 已拦截 Token::Name, 此分支理论上不执行。
-            // 保留 clone + parse_simple_exp_name 调用作为防御性 fallback。
-            let name = name.clone();
-            fs.ls_mut().next();
-            parse_simple_exp_name(fs, name)
-        }
-        Token::LParen => {
-            fs.ls_mut().next();
-            let ei = parse_expr(fs);
-            expect(fs, &Token::RParen);
-            // Like C's primaryexp: luaK_dischargevars(ls->fs, v);
-            // For VCALL/Vararg: setoneret sets C=2 (1 result) and converts to
-            // VNONRELOC (Call) or VRELOC (Vararg). This ensures `(...)` returns
-            // exactly one value, not multret.
-            match ei.exp.kind {
-                ExpKind::Call => {
-                    let call_pc = ei.exp.info2;
-                    if call_pc >= 0 {
-                        setarg(&mut Rc::make_mut(&mut fs.proto.code)[call_pc as usize], 2, POS_C, SIZE_C);
-                    }
-                    ExpDesc {
-                        kind: ExpKind::NonReloc,
-                        info: ei.exp.info,
-                        info2: -1,
-                        t: NO_JUMP,
-                        f: NO_JUMP,
-                        str_val: None,
-                    }
-                }
-                ExpKind::Vararg => {
-                    // Like C's setoneret for VVARARG: SETARG_C(pc, 2), then VRELOC
-                    let pc = ei.exp.info2;
-                    if pc >= 0 {
-                        fs.set_c(pc, 2);
-                    }
-                    ExpDesc {
-                        kind: ExpKind::Relocable,
-                        info: ei.exp.info,
-                        info2: pc,
-                        t: NO_JUMP,
-                        f: NO_JUMP,
-                        str_val: None,
-                    }
-                }
-                _ => ei.exp,
+            Token::True => {
+                fs.ls_mut().next();
+                return ExprItem {
+                    exp: ExpDesc::new(ExpKind::Boolean, 1),
+                };
             }
-        }
-        Token::Not | Token::Minus | Token::Hash | Token::Tilde => {
-            let op_tok = fs.ls().token.clone();
-            let op_line = fs.ls().linenumber;
-            fs.ls_mut().next();
-            let ei = parse_subexpr(fs, PREC_UNARY);
-            // perf: 把 ei.exp 提前 move 出来, 避免 VJMP 分支的 ei.exp.clone()。
-            // 其他分支只读 i32 字段 (Copy), 不影响。
-            let ei_exp = ei.exp;
-            match op_tok {
-                Token::Not => {
-                    match ei_exp.kind {
-                        ExpKind::Nil | ExpKind::Boolean if ei_exp.info == 0 => {
-                            let mut e = ExpDesc::new(ExpKind::Boolean, 1);
-                            e.t = ei_exp.f;
-                            e.f = ei_exp.t;
-                            fs.remove_values(e.t);
-                            fs.remove_values(e.f);
-                            e
+            Token::False => {
+                fs.ls_mut().next();
+                return ExprItem {
+                    exp: ExpDesc::new(ExpKind::Boolean, 0),
+                };
+            }
+            Token::Int(v) => {
+                let val = *v;
+                fs.ls_mut().next();
+                return ExprItem {
+                    exp: ExpDesc::new(ExpKind::Int, val),
+                };
+            }
+            Token::Float(v) => {
+                let val = *v;
+                fs.ls_mut().next();
+                return ExprItem {
+                    exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64),
+                };
+            }
+            Token::String(s) => {
+                let s = s.clone();
+                fs.ls_mut().next();
+                return ExprItem {
+                    exp: ExpDesc::new_str(s),
+                };
+            }
+            Token::DotDotDot => {
+                fs.ls_mut().next();
+                // Like C: '...' always creates VVARARG, regardless of named vararg params.
+                // Named vararg params (RDKVAVAR) are accessed by their name, not by '...'.
+                // init_exp(v, VVARARG, luaK_codeABC(fs, OP_VARARG, 0, fs->f->numparams, 1));
+                // A=0 (placeholder, set later by setoneret/setreturns), B=numparams, C=1 (multret)
+                let numparams = fs.proto.num_params as i32;
+                let pc = fs.code_abc(OpCode::VARARG, 0, numparams, 1);
+                // info stores PC (like C's u.info), info2 also stores PC for set_c
+                ExpDesc {
+                    kind: ExpKind::Vararg,
+                    info: pc as i64,
+                    info2: pc,
+                    t: NO_JUMP,
+                    f: NO_JUMP,
+                    str_val: None,
+                }
+            }
+            Token::LBrace => {
+                let (r, _n) = parse_constructor(fs);
+                return ExprItem {
+                    exp: ExpDesc::new(ExpKind::NonReloc, r as i64),
+                };
+            }
+            Token::Name(name) => {
+                // fallback: fast path 已拦截 Token::Name, 此分支理论上不执行。
+                // 保留 clone + parse_simple_exp_name 调用作为防御性 fallback。
+                let name = name.clone();
+                fs.ls_mut().next();
+                parse_simple_exp_name(fs, name)
+            }
+            Token::LParen => {
+                fs.ls_mut().next();
+                let ei = parse_expr(fs);
+                expect(fs, &Token::RParen);
+                // Like C's primaryexp: luaK_dischargevars(ls->fs, v);
+                // For VCALL/Vararg: setoneret sets C=2 (1 result) and converts to
+                // VNONRELOC (Call) or VRELOC (Vararg). This ensures `(...)` returns
+                // exactly one value, not multret.
+                match ei.exp.kind {
+                    ExpKind::Call => {
+                        let call_pc = ei.exp.info2;
+                        if call_pc >= 0 {
+                            setarg(
+                                &mut Rc::make_mut(&mut fs.proto.code)[call_pc as usize],
+                                2,
+                                POS_C,
+                                SIZE_C,
+                            );
                         }
-                        ExpKind::Int | ExpKind::Float | ExpKind::Str | ExpKind::Boolean => {
-                            let mut e = ExpDesc::new(ExpKind::Boolean, 0);
-                            e.t = ei_exp.f;
-                            e.f = ei_exp.t;
-                            fs.remove_values(e.t);
-                            fs.remove_values(e.f);
-                            e
-                        }
-                        ExpKind::VJMP => {
-                            // perf: 直接 move ei_exp, 避免 clone (40 字节拷贝)
-                            let mut e = ei_exp;
-                            fs.negate_condition(e.info as i32);
-                            std::mem::swap(&mut e.t, &mut e.f);
-                            fs.remove_values(e.t);
-                            fs.remove_values(e.f);
-                            e
-                        }
-                        _ => {
-                            // Like C's codenot: discharge2anyreg (no jump resolution),
-                            // freeexp, code NOT, set VRELOC, swap t/f, removevalues.
-                            let r = fs.discharge_to_any_reg(&ei_exp);
-                            // freeexp: free the register if it's a temp at top of stack
-                            if r >= fs.nvarstack() && r == fs.freereg - 1 {
-                                fs.free_reg();
-                            }
-                            let pc = fs.code_abc(OpCode::NOT, 0, r, 0);
-                            let mut e = ExpDesc::new_reloc_with_pc(0, pc);
-                            // Swap t/f (NOT inverts truthiness)
-                            e.t = ei_exp.f;
-                            e.f = ei_exp.t;
-                            fs.remove_values(e.t);
-                            fs.remove_values(e.f);
-                            e
+                        ExpDesc {
+                            kind: ExpKind::NonReloc,
+                            info: ei.exp.info,
+                            info2: -1,
+                            t: NO_JUMP,
+                            f: NO_JUMP,
+                            str_val: None,
                         }
                     }
+                    ExpKind::Vararg => {
+                        // Like C's setoneret for VVARARG: SETARG_C(pc, 2), then VRELOC
+                        let pc = ei.exp.info2;
+                        if pc >= 0 {
+                            fs.set_c(pc, 2);
+                        }
+                        ExpDesc {
+                            kind: ExpKind::Relocable,
+                            info: ei.exp.info,
+                            info2: pc,
+                            t: NO_JUMP,
+                            f: NO_JUMP,
+                            str_val: None,
+                        }
+                    }
+                    _ => ei.exp,
                 }
-                Token::Minus => {
-                    if ei_exp.has_jumps() {
-                        let r = fs.exp_to_reg(&ei_exp);
-                        let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
-                        fs.fixline(op_line);
-                        fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
-                        ExpDesc::new_reloc_with_pc(r as i64, pc)
-                    } else {
+            }
+            Token::Not | Token::Minus | Token::Hash | Token::Tilde => {
+                let op_tok = fs.ls().token.clone();
+                let op_line = fs.ls().linenumber;
+                fs.ls_mut().next();
+                let ei = parse_subexpr(fs, PREC_UNARY);
+                // perf: 把 ei.exp 提前 move 出来, 避免 VJMP 分支的 ei.exp.clone()。
+                // 其他分支只读 i32 字段 (Copy), 不影响。
+                let ei_exp = ei.exp;
+                match op_tok {
+                    Token::Not => {
                         match ei_exp.kind {
-                            ExpKind::Int => ExpDesc::new(ExpKind::Int, ei_exp.info.wrapping_neg()),
-                            ExpKind::Float => {
-                                let f = f64::from_bits(ei_exp.info as u64);
-                                let result = -f;
-                                if result.is_nan() || result == 0.0 {
+                            ExpKind::Nil | ExpKind::Boolean if ei_exp.info == 0 => {
+                                let mut e = ExpDesc::new(ExpKind::Boolean, 1);
+                                e.t = ei_exp.f;
+                                e.f = ei_exp.t;
+                                fs.remove_values(e.t);
+                                fs.remove_values(e.f);
+                                e
+                            }
+                            ExpKind::Int | ExpKind::Float | ExpKind::Str | ExpKind::Boolean => {
+                                let mut e = ExpDesc::new(ExpKind::Boolean, 0);
+                                e.t = ei_exp.f;
+                                e.f = ei_exp.t;
+                                fs.remove_values(e.t);
+                                fs.remove_values(e.f);
+                                e
+                            }
+                            ExpKind::VJMP => {
+                                // perf: 直接 move ei_exp, 避免 clone (40 字节拷贝)
+                                let mut e = ei_exp;
+                                fs.negate_condition(e.info as i32);
+                                std::mem::swap(&mut e.t, &mut e.f);
+                                fs.remove_values(e.t);
+                                fs.remove_values(e.f);
+                                e
+                            }
+                            _ => {
+                                // Like C's codenot: discharge2anyreg (no jump resolution),
+                                // freeexp, code NOT, set VRELOC, swap t/f, removevalues.
+                                let r = fs.discharge_to_any_reg(&ei_exp);
+                                // freeexp: free the register if it's a temp at top of stack
+                                if r >= fs.nvarstack() && r == fs.freereg - 1 {
+                                    fs.free_reg();
+                                }
+                                let pc = fs.code_abc(OpCode::NOT, 0, r, 0);
+                                let mut e = ExpDesc::new_reloc_with_pc(0, pc);
+                                // Swap t/f (NOT inverts truthiness)
+                                e.t = ei_exp.f;
+                                e.f = ei_exp.t;
+                                fs.remove_values(e.t);
+                                fs.remove_values(e.f);
+                                e
+                            }
+                        }
+                    }
+                    Token::Minus => {
+                        if ei_exp.has_jumps() {
+                            let r = fs.exp_to_reg(&ei_exp);
+                            let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
+                            fs.fixline(op_line);
+                            fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
+                            ExpDesc::new_reloc_with_pc(r as i64, pc)
+                        } else {
+                            match ei_exp.kind {
+                                ExpKind::Int => {
+                                    ExpDesc::new(ExpKind::Int, ei_exp.info.wrapping_neg())
+                                }
+                                ExpKind::Float => {
+                                    let f = f64::from_bits(ei_exp.info as u64);
+                                    let result = -f;
+                                    if result.is_nan() || result == 0.0 {
+                                        let r = fs.exp_to_reg(&ei_exp);
+                                        let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
+                                        fs.fixline(op_line);
+                                        fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
+                                        ExpDesc::new_reloc_with_pc(r as i64, pc)
+                                    } else {
+                                        ExpDesc::new(ExpKind::Float, result.to_bits() as i64)
+                                    }
+                                }
+                                _ => {
                                     let r = fs.exp_to_reg(&ei_exp);
                                     let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
                                     fs.fixline(op_line);
                                     fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
                                     ExpDesc::new_reloc_with_pc(r as i64, pc)
-                                } else {
-                                    ExpDesc::new(ExpKind::Float, result.to_bits() as i64)
                                 }
-                            }
-                            _ => {
-                                let r = fs.exp_to_reg(&ei_exp);
-                                let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
-                                fs.fixline(op_line);
-                                fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
-                                ExpDesc::new_reloc_with_pc(r as i64, pc)
                             }
                         }
                     }
-                }
-                Token::Hash => {
-                    // Like C's codeunexpval: exp2anyreg + freeexp + codeABC(A=0) + VRELOC
-                    let r = fs.exp_to_reg(&ei_exp);
-                    fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
-                    let pc = fs.code_abc(OpCode::LEN, 0, r, 0);
-                    fs.fixline(op_line);
-                    ExpDesc::new_reloc_with_pc(r as i64, pc)
-                }
-                Token::Tilde => {
-                    if ei_exp.has_jumps() {
+                    Token::Hash => {
+                        // Like C's codeunexpval: exp2anyreg + freeexp + codeABC(A=0) + VRELOC
                         let r = fs.exp_to_reg(&ei_exp);
-                        let pc = fs.code_abc(OpCode::BNOT, 0, r, 0);
-                        fs.fixline(op_line);
                         fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
+                        let pc = fs.code_abc(OpCode::LEN, 0, r, 0);
+                        fs.fixline(op_line);
                         ExpDesc::new_reloc_with_pc(r as i64, pc)
-                    } else {
-                        match ei_exp.kind {
-                            ExpKind::Int => ExpDesc::new(ExpKind::Int, !(ei_exp.info)),
-                            ExpKind::Float => {
-                                // Like C's constfolding: convert float to int, then BNOT
-                                if let Some(i) = to_int_const(&ei_exp) {
-                                    ExpDesc::new(ExpKind::Int, !i)
-                                } else {
+                    }
+                    Token::Tilde => {
+                        if ei_exp.has_jumps() {
+                            let r = fs.exp_to_reg(&ei_exp);
+                            let pc = fs.code_abc(OpCode::BNOT, 0, r, 0);
+                            fs.fixline(op_line);
+                            fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
+                            ExpDesc::new_reloc_with_pc(r as i64, pc)
+                        } else {
+                            match ei_exp.kind {
+                                ExpKind::Int => ExpDesc::new(ExpKind::Int, !(ei_exp.info)),
+                                ExpKind::Float => {
+                                    // Like C's constfolding: convert float to int, then BNOT
+                                    if let Some(i) = to_int_const(&ei_exp) {
+                                        ExpDesc::new(ExpKind::Int, !i)
+                                    } else {
+                                        let r = fs.exp_to_reg(&ei_exp);
+                                        let pc = fs.code_abc(OpCode::BNOT, 0, r, 0);
+                                        fs.fixline(op_line);
+                                        fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
+                                        ExpDesc::new_reloc_with_pc(r as i64, pc)
+                                    }
+                                }
+                                _ => {
                                     let r = fs.exp_to_reg(&ei_exp);
                                     let pc = fs.code_abc(OpCode::BNOT, 0, r, 0);
                                     fs.fixline(op_line);
@@ -11013,35 +10864,27 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                                     ExpDesc::new_reloc_with_pc(r as i64, pc)
                                 }
                             }
-                            _ => {
-                                let r = fs.exp_to_reg(&ei_exp);
-                                let pc = fs.code_abc(OpCode::BNOT, 0, r, 0);
-                                fs.fixline(op_line);
-                                fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
-                                ExpDesc::new_reloc_with_pc(r as i64, pc)
-                            }
                         }
                     }
-                }
-                _ => {
-                    let r = fs.exp_to_reg(&ei_exp);
-                    ExpDesc::new(ExpKind::Relocable, r as i64)
+                    _ => {
+                        let r = fs.exp_to_reg(&ei_exp);
+                        ExpDesc::new(ExpKind::Relocable, r as i64)
+                    }
                 }
             }
-        }
-        Token::Function => {
-            fs.ls_mut().next();
-            let r = parse_body(fs, None);
-            ExpDesc::new(ExpKind::Relocable, r as i64)
-        }
-        _ => {
-            fs.error(&format!(
-                "unexpected symbol near {}",
-                fs.ls().token_display()
-            ));
-            fs.ls_mut().next();
-            ExpDesc::new(ExpKind::Nil, 0)
-        }
+            Token::Function => {
+                fs.ls_mut().next();
+                let r = parse_body(fs, None);
+                ExpDesc::new(ExpKind::Relocable, r as i64)
+            }
+            _ => {
+                fs.error(&format!(
+                    "unexpected symbol near {}",
+                    fs.ls().token_display()
+                ));
+                fs.ls_mut().next();
+                ExpDesc::new(ExpKind::Nil, 0)
+            }
         }
     };
 
@@ -11701,7 +11544,6 @@ fn parse_while(fs: &mut FuncState) {
         name: break_name,
         pc: fs.pc,
         nactvar: block_entry.nactvar,
-        nlocals: saved_nlocals,
         reglevel: block_entry.reglevel,
         line: 0,
     });
@@ -11896,7 +11738,6 @@ fn parse_repeat(fs: &mut FuncState) {
         name: break_name,
         pc: fs.pc,
         nactvar: bl1_entry.nactvar,
-        nlocals: bl1_nlocals,
         reglevel: bl1_entry.reglevel,
         line: 0,
     });
@@ -12064,7 +11905,6 @@ fn parse_for(fs: &mut FuncState) {
             name: break_name,
             pc: fs.pc,
             nactvar: forstat_entry.nactvar,
-            nlocals: forstat_nlocals,
             reglevel: forstat_entry.reglevel,
             line: 0,
         });
@@ -12120,13 +11960,11 @@ fn parse_for(fs: &mut FuncState) {
         // Add user-declared variables as INACTIVE (they'll be activated inside body block)
         // Like C's forlist: first variable (control) is RDKCONST, others are VDKREG
         for (i, var_name) in vars.iter().enumerate() {
-            let vidx = fs.locals.len() as i32;
             let nactvar = fs.active_nactvar();
             let kind = if i == 0 { RDKCONST } else { VDKREG };
             fs.locals.push(LocalVar {
                 name: var_name.clone(),
                 name_hash: var_name.hash(),
-                start_pc: fs.pc,
                 active: false,
                 is_global_star: false,
                 reg: 0,
@@ -12134,7 +11972,6 @@ fn parse_for(fs: &mut FuncState) {
                 ctc_kind: None,
                 ctc_info: None,
                 ctc_str: None,
-                vidx,
                 nactvar,
                 pidx: -1,
             });
@@ -12170,7 +12007,12 @@ fn parse_for(fs: &mut FuncState) {
             if fs.pc > pc_before {
                 for i in (pc_before..fs.pc).rev() {
                     if get_opcode(fs.proto.code[i as usize]) == OpCode::CALL {
-                        setarg(&mut Rc::make_mut(&mut fs.proto.code)[i as usize], needed, POS_C, SIZE_C);
+                        setarg(
+                            &mut Rc::make_mut(&mut fs.proto.code)[i as usize],
+                            needed,
+                            POS_C,
+                            SIZE_C,
+                        );
                         break;
                     }
                 }
@@ -12323,7 +12165,6 @@ fn parse_for(fs: &mut FuncState) {
             name: break_name,
             pc: fs.pc,
             nactvar: forstat_entry.nactvar,
-            nlocals: forstat_nlocals,
             reglevel: forstat_entry.reglevel,
             line: 0,
         });
@@ -12760,7 +12601,12 @@ fn parse_local(fs: &mut FuncState) {
                     let call_pc = last_e.info2;
                     if call_pc >= 0 {
                         let needed = ((n_reg - n_vals + 2) as i32).min(255);
-                        setarg(&mut Rc::make_mut(&mut fs.proto.code)[call_pc as usize], needed, POS_C, SIZE_C);
+                        setarg(
+                            &mut Rc::make_mut(&mut fs.proto.code)[call_pc as usize],
+                            needed,
+                            POS_C,
+                            SIZE_C,
+                        );
                     }
                 }
             } else if last_is_vararg {
@@ -12792,12 +12638,10 @@ fn parse_local(fs: &mut FuncState) {
                 } else {
                     last_e.info
                 };
-                let vidx = fs.locals.len() as i32;
                 let nactvar = fs.active_nactvar();
                 fs.locals.push(LocalVar {
                     name: names[nvars - 1].clone(),
                     name_hash: names[nvars - 1].hash(),
-                    start_pc: pc,
                     active: true,
                     is_global_star: false,
                     reg: 0,
@@ -12805,7 +12649,6 @@ fn parse_local(fs: &mut FuncState) {
                     ctc_kind: Some(last_e.kind.clone()),
                     ctc_info: Some(ctc_info),
                     ctc_str,
-                    vidx,
                     nactvar,
                     pidx: -1,
                 });
@@ -12927,24 +12770,6 @@ fn parse_return(fs: &mut FuncState) {
     if check(fs, &Token::Semi) {
         fs.ls_mut().next();
     }
-}
-
-/// ANTLR4: `explist: expr (',' expr)* ;` — 解析逗号分隔的表达式列表
-/// Matches C's explist: force each expression to next reg before parsing the next one.
-/// The last expression is NOT forced (caller decides).
-fn parse_expr_list(fs: &mut FuncState) -> i32 {
-    let mut ei = parse_expr(fs);
-    let mut n = 1;
-    while check(fs, &Token::Comma) {
-        fs.ls_mut().next();
-        // Force previous expression to next reg (like C's luaK_exp2nextreg in explist)
-        fs.exp_to_next_reg(&ei.exp);
-        ei = parse_expr(fs);
-        n += 1;
-    }
-    // Force the last expression to next reg too (for return context, caller handles this)
-    fs.exp_to_next_reg(&ei.exp);
-    n
 }
 
 /// Compute a limit for how many registers a constructor can use before
@@ -13388,7 +13213,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     // Rc::make_mut 在编译期独占 protos（refcount=1）时直接返回 &mut Vec，无开销；
     // 此处 fs.proto 是新建 Proto，protos 一定独占，所以 push 不触发 clone-on-write。
     // 包装为 Rc<Vec> 后 op_call 共享该 Vec 时 refcount>1，运行期不再 mutate。
-    std::rc::Rc::make_mut(&mut fs.proto.protos).push(std::rc::Rc::new(proto));
+    Rc::make_mut(&mut fs.proto.protos).push(Rc::new(proto));
     let r = target.unwrap_or_else(|| fs.alloc_reg());
     fs.code_abx(OpCode::CLOSURE, r, p_idx);
     r

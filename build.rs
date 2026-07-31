@@ -99,7 +99,7 @@ fn main() {
 
     build
         .cpp(false)
-        .std("gnu99")  // 匹配原版 Lua 5.5.0 Makefile 的 -std=gnu99
+        .std("gnu99") // 匹配原版 Lua 5.5.0 Makefile 的 -std=gnu99
         .include(&lua_src_dir)
         .flag("-Wall")
         .flag("-Wextra")

@@ -13,6 +13,7 @@
 use crate::execute::VmError;
 use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
+use crate::table::Table;
 
 // ============================================================================
 // 常量 (对应 C 源码的宏定义)
@@ -206,9 +207,13 @@ fn get_str_bytes(state: &LuaState, a: usize, idx: usize) -> Result<Vec<u8>, VmEr
         TValue::Integer(n) => {
             // 体积优先: 用 i64_to_string 避免 n.to_string() 引入 core::fmt::num
             #[cfg(size_optimized)]
-            { Ok(crate::float_utils::i64_to_string(*n).into_bytes()) }
+            {
+                Ok(crate::float_utils::i64_to_string(*n).into_bytes())
+            }
             #[cfg(not(size_optimized))]
-            { Ok(n.to_string().into_bytes()) }
+            {
+                Ok(n.to_string().into_bytes())
+            }
         }
         TValue::Float(f) => Ok(crate::float_utils::f64_to_string(*f).into_bytes()),
         _ => Err(VmError::RuntimeError(format!(
@@ -749,7 +754,7 @@ fn call_iter(
 /// 2. 设置 charpattern 字段
 /// 3. 返回库表 (调用者负责注册到全局或 package.loaded)
 pub fn create_utf8_lib_table(state: &LuaState) -> crate::table::Table {
-    let mut lib = crate::table::Table::new();
+    let mut lib = Table::new();
 
     // 注册所有 UTF-8 函数 (使用 BuiltinFn 函数指针)
     let register = |lib: &mut crate::table::Table,
@@ -757,7 +762,13 @@ pub fn create_utf8_lib_table(state: &LuaState) -> crate::table::Table {
                     func: crate::objects::BuiltinFnPtr| {
         let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
         let name_ptr = name.as_ptr() as *const u8;
-        lib.set(key, TValue::BuiltinFn(BuiltinFn { func, name: name_ptr }));
+        lib.set(
+            key,
+            TValue::BuiltinFn(BuiltinFn {
+                func,
+                name: name_ptr,
+            }),
+        );
     };
 
     register(&mut lib, c"offset", call_offset);

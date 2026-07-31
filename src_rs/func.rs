@@ -1,6 +1,7 @@
 use crate::execute::VmError;
 use crate::objects::*;
-use crate::state::{LuaState, lua_stdout};
+use crate::state::{lua_stdout, LuaState};
+use crate::table::Table;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -376,8 +377,13 @@ pub fn new_tbc_upval(state: &mut LuaState, level: usize) -> Result<Option<usize>
         return Ok(None); // false/nil 不需要关闭
     }
     // 对应 C 的 checkclosemth: 检查 __close 元方法是否存在
-    let has_close =
-        crate::tm::get_tm_by_obj(&val, crate::tm::TagMethod::Close, &state.dmt, &state.tmnames).is_some();
+    let has_close = crate::tm::get_tm_by_obj(
+        &val,
+        crate::tm::TagMethod::Close,
+        &state.dmt,
+        &state.tmnames,
+    )
+    .is_some();
     if !has_close {
         // 获取变量名 — 对应 C 的 luaG_findlocal(L, L->ci, idx, NULL)
         let varname = get_var_name_at(state, level).unwrap_or_else(|| "?".to_string());
@@ -487,21 +493,25 @@ mod tests {
             is_vararg: false,
             proto_flag: 0,
             nextraargs: 0,
-            gc: std::rc::Rc::new(crate::gc::GCState::default_incremental()),
-            globals: crate::table::Table::new(),
-            registry: crate::table::Table::new(),
-            string_table: std::rc::Rc::new(crate::strings::StringTable::new()),
-            tmnames: std::rc::Rc::new(crate::tm::init_tmnames(&crate::strings::StringTable::new())),
+            gc: Rc::new(crate::gc::GCState::default_incremental()),
+            globals: Table::new(),
+            registry: Table::new(),
+            string_table: Rc::new(crate::strings::StringTable::new()),
+            tmnames: Rc::new(crate::tm::init_tmnames(&crate::strings::StringTable::new())),
             api_func_base: 0,
             n_ccalls: 0,
             dmt: crate::tm::DefaultMetatables::new(),
             stdout: lua_stdout(),
             io_output: None,
-            file_handles: std::collections::HashMap::with_hasher(crate::objects::FxBuildHasher::default()),
-            popen_handles: std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default()),
+            file_handles: std::collections::HashMap::with_hasher(
+                crate::objects::FxBuildHasher::default(),
+            ),
+            popen_handles: std::collections::HashSet::with_hasher(
+                crate::objects::FxBuildHasher::default(),
+            ),
             io_input_handle: None,
             io_output_handle: None,
-            global_state: std::rc::Rc::new(crate::state::GlobalState { gcstopem: false }),
+            global_state: Rc::new(crate::state::GlobalState { gcstopem: false }),
             ci: None,
             call_info: Vec::new(),
             last_traceback: String::new(),
@@ -663,7 +673,7 @@ mod tests {
         let _uv0 = find_upval(&mut state, 0);
         let _uv1 = find_upval(&mut state, 1);
         let _uv2 = find_upval(&mut state, 2);
-        close(&mut state, 1, 0, 0);
+        let _ = close(&mut state, 1, 0, 0);
         assert_eq!(state.open_upval, Some(0));
     }
 
@@ -672,9 +682,9 @@ mod tests {
         let mut state = make_vm_state();
         // 创建带 __close 元方法的 Table
         let close_key = TValue::Str(state.intern_str("__close"));
-        let mt = crate::table::Table::new();
+        let mt = Table::new();
         mt.set(close_key, TValue::Integer(0));
-        let obj = crate::table::Table::new();
+        let obj = Table::new();
         obj.set_metatable(Some(mt));
         state.stack = vec![TValue::Table(obj)];
         let uv = new_tbc_upval(&mut state, 0).expect("closable value should succeed");
@@ -704,9 +714,9 @@ mod tests {
         let mut state = make_vm_state();
         // 创建带 __close 元方法的 Table
         let close_key = TValue::Str(state.intern_str("__close"));
-        let mt = crate::table::Table::new();
+        let mt = Table::new();
         mt.set(close_key, TValue::Integer(0));
-        let obj = crate::table::Table::new();
+        let obj = Table::new();
         obj.set_metatable(Some(mt));
         state.stack = vec![TValue::Table(obj)];
         let _uv = new_tbc_upval(&mut state, 0).expect("closable value should succeed");

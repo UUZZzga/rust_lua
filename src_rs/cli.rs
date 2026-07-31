@@ -82,7 +82,9 @@ impl Interpreter {
                 .unwrap_or_else(|| "(error message not a string)".to_string());
             // 体积优先: 用 write_all + format! 替代 write!(self.stderr, ...)
             // 避免 io::Write::write_fmt 默认实现引入 StringError + Unicode 表 (~4KB)
-            let _ = self.stderr.write_all(format!("{}: {}\n", self.progname, msg).as_bytes());
+            let _ = self
+                .stderr
+                .write_all(format!("{}: {}\n", self.progname, msg).as_bytes());
             self.l.pop(1);
         }
         status
@@ -539,7 +541,7 @@ impl Interpreter {
                     .to_string(-1)
                     .unwrap_or_else(|| "(error)".to_string());
                 let _ = self.stderr.write_all(
-                    format!("{}: error calling 'print' ({})\n", self.progname, err_msg).as_bytes()
+                    format!("{}: error calling 'print' ({})\n", self.progname, err_msg).as_bytes(),
                 );
             }
         }
@@ -635,17 +637,24 @@ impl Interpreter {
     fn print_usage(&mut self, badoption: &str) {
         // 体积优先: 用 write_all + format! 替代 write!/writeln!(self.stderr, ...)
         // 避免 io::Write::write_fmt 默认实现引入 StringError + Unicode 表 (~4KB)
-        let _ = self.stderr.write_all(format!("{}: ", LUA_PROGNAME).as_bytes());
+        let _ = self
+            .stderr
+            .write_all(format!("{}: ", LUA_PROGNAME).as_bytes());
         match badoption.chars().nth(1) {
             Some('e' | 'l') => {
-                let _ = self.stderr.write_all(format!("'{}' needs argument\n", badoption).as_bytes());
+                let _ = self
+                    .stderr
+                    .write_all(format!("'{}' needs argument\n", badoption).as_bytes());
             }
             _ => {
-                let _ = self.stderr.write_all(format!("unrecognized option '{}'\n", badoption).as_bytes());
+                let _ = self
+                    .stderr
+                    .write_all(format!("unrecognized option '{}'\n", badoption).as_bytes());
             }
         }
-        let _ = self.stderr.write_all(format!(
-            "usage: {} [options] [script [args]]\n\
+        let _ = self.stderr.write_all(
+            format!(
+                "usage: {} [options] [script [args]]\n\
              Available options are:\n\
                -e stat   execute string 'stat'\n\
                -i        enter interactive mode after executing 'script'\n\
@@ -656,8 +665,10 @@ impl Interpreter {
                -W        turn warnings on\n\
                --        stop handling options\n\
                -         stop handling options and execute stdin\n",
-            LUA_PROGNAME
-        ).as_bytes());
+                LUA_PROGNAME
+            )
+            .as_bytes(),
+        );
     }
 
     pub fn pmain(&mut self, argv: &[String]) -> bool {

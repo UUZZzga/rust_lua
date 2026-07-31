@@ -300,26 +300,6 @@ impl BytecodeReader {
         }
     }
 
-    fn read_num_info_int(&mut self) {
-        let _size = self.read_byte();
-        let _value = self.read_bytes(4);
-    }
-
-    fn read_num_info_inst(&mut self) {
-        let _size = self.read_byte();
-        let _value = self.read_bytes(4);
-    }
-
-    fn read_num_info_integer(&mut self) {
-        let _size = self.read_byte();
-        let _value = self.read_bytes(8);
-    }
-
-    fn read_num_info_number(&mut self) {
-        let _size = self.read_byte();
-        let _value = self.read_bytes(8);
-    }
-
     fn read_debug(
         &mut self,
     ) -> (
@@ -1516,40 +1496,42 @@ pub fn dumped_to_proto(df: &DumpedFunction) -> Proto {
     proto.code = Rc::new(df.code.iter().map(|inst| dump_inst_to_raw(inst)).collect());
 
     // constants: DumpConstant → TValue
-    proto.constants = Rc::new(df
-        .constants
-        .iter()
-        .map(|c| match c {
-            DumpConstant::Nil => TValue::Nil(NilKind::Strict),
-            DumpConstant::Boolean(b) => TValue::Boolean(*b),
-            DumpConstant::Integer(i) => TValue::Integer(*i),
-            DumpConstant::Float(f) => TValue::Float(*f),
-            DumpConstant::String(s) => TValue::Str(make_long_string(s)),
-        })
-        .collect());
+    proto.constants = Rc::new(
+        df.constants
+            .iter()
+            .map(|c| match c {
+                DumpConstant::Nil => TValue::Nil(NilKind::Strict),
+                DumpConstant::Boolean(b) => TValue::Boolean(*b),
+                DumpConstant::Integer(i) => TValue::Integer(*i),
+                DumpConstant::Float(f) => TValue::Float(*f),
+                DumpConstant::String(s) => TValue::Str(make_long_string(s)),
+            })
+            .collect(),
+    );
 
     // upvalues: (bool, u8, u8) → UpvalDesc
-    proto.upvalues = Rc::new(df
-        .upvalues
-        .iter()
-        .enumerate()
-        .map(|(i, (instack, idx, kind))| UpvalDesc {
-            name: df
-                .upvalue_names
-                .get(i)
-                .and_then(|n| n.as_ref().map(|s| make_long_string(s))),
-            in_stack: *instack,
-            idx: *idx,
-            parent_local_idx: 0,
-            kind: *kind,
-        })
-        .collect());
+    proto.upvalues = Rc::new(
+        df.upvalues
+            .iter()
+            .enumerate()
+            .map(|(i, (instack, idx, kind))| UpvalDesc {
+                name: df
+                    .upvalue_names
+                    .get(i)
+                    .and_then(|n| n.as_ref().map(|s| make_long_string(s))),
+                in_stack: *instack,
+                idx: *idx,
+                parent_local_idx: 0,
+                kind: *kind,
+            })
+            .collect(),
+    );
 
     // protos: 递归转换 — 包装为 Rc<Vec> 让 op_call 共享，避免每次调用 clone O(n) Vec 分配
     proto.protos = Rc::new(
         df.protos
             .iter()
-            .map(|p| std::rc::Rc::new(dumped_to_proto(p)))
+            .map(|p| Rc::new(dumped_to_proto(p)))
             .collect(),
     );
 

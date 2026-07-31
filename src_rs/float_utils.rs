@@ -10,28 +10,6 @@
 use std::ffi::CString;
 
 // ============================================================================
-// 内部辅助: 将 precision (0-99) 写入字节缓冲区, 返回长度
-// ============================================================================
-
-/// 将 precision (0-99) 写入 `out` (从 offset 开始), 返回写入的字节数.
-/// 避免用 `format!` 拼接 precision (会引入 fmt 代码).
-fn write_precision(out: &mut [u8], offset: usize, precision: usize) -> usize {
-    if precision < 10 {
-        out[offset] = b'0' + precision as u8;
-        1
-    } else if precision < 100 {
-        out[offset] = b'0' + (precision / 10) as u8;
-        out[offset + 1] = b'0' + (precision % 10) as u8;
-        2
-    } else {
-        // precision >= 100 极罕见, 截断到 99
-        out[offset] = b'9';
-        out[offset + 1] = b'9';
-        2
-    }
-}
-
-// ============================================================================
 // f64 -> String
 // ============================================================================
 
@@ -50,7 +28,11 @@ pub fn f64_to_string(f: f64) -> String {
         return "nan".to_string();
     }
     if f.is_infinite() {
-        return if f > 0.0 { "inf".to_string() } else { "-inf".to_string() };
+        return if f > 0.0 {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        };
     }
     unsafe {
         let mut buf = [0u8; 64];
@@ -108,7 +90,11 @@ pub fn f64_to_string(f: f64) -> String {
         return "nan".to_string();
     }
     if f.is_infinite() {
-        return if f > 0.0 { "inf".to_string() } else { "-inf".to_string() };
+        return if f > 0.0 {
+            "inf".to_string()
+        } else {
+            "-inf".to_string()
+        };
     }
     // -0.0 应输出 "0.0" 而非 "-0.0" (对应 C Lua 的行为)
     if f == 0.0 {

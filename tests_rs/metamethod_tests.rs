@@ -565,7 +565,11 @@ fn test_pcall_metamethod_error_no_callinfo_leak() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
     // 第一行: false (pcall 捕获到错误)
-    assert!(lines[0].contains("false"), "pcall 应返回 false, got: {}", lines[0]);
+    assert!(
+        lines[0].contains("false"),
+        "pcall 应返回 false, got: {}",
+        lines[0]
+    );
     // traceback 不应包含 "__newindex" 或 "newindex" 残留条目
     let tb = &lines[1];
     assert!(
@@ -595,7 +599,11 @@ fn test_pcall_builtin_metamethod_error_no_callinfo_leak() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
-    assert!(lines[0].contains("false"), "pcall 应返回 false, got: {}", lines[0]);
+    assert!(
+        lines[0].contains("false"),
+        "pcall 应返回 false, got: {}",
+        lines[0]
+    );
     // traceback 不应包含 "move" 或 "__newindex" 残留条目
     let tb = &lines[1];
     assert!(
@@ -664,7 +672,11 @@ fn test_pcall_metamethod_error_no_traceback_leak_on_subsequent_error() {
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
     let lines: Vec<&str> = stdout.lines().collect();
-    assert!(lines[0].contains("false"), "pcall 应返回 false, got: {}", lines[0]);
+    assert!(
+        lines[0].contains("false"),
+        "pcall 应返回 false, got: {}",
+        lines[0]
+    );
     assert!(
         lines[1].contains("true"),
         "后续 error 的 traceback 不应包含 __newindex 残留, got: {}",

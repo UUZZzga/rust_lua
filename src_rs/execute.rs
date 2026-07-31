@@ -337,7 +337,12 @@ pub fn compute_caller_info(
 
         // name/namewhat: 如果已预设置 (hook/metamethod)，直接使用
         if !entry.namewhat.is_empty() {
-            return (source, line, entry.name.map(|s| s.to_string()).unwrap_or_default(), entry.namewhat.to_string());
+            return (
+                source,
+                line,
+                entry.name.map(|s| s.to_string()).unwrap_or_default(),
+                entry.namewhat.to_string(),
+            );
         }
 
         // 普通 Lua 函数帧: 从 caller_proto.code[saved_pc] 实时计算 name/namewhat
@@ -372,8 +377,8 @@ pub fn compute_caller_info_with_fallback(
         );
     }
 
-    let caller_proto = crate::state::get_caller_proto_from_stack(stack, entry)
-        .or_else(|| fallback_proto);
+    let caller_proto =
+        crate::state::get_caller_proto_from_stack(stack, entry).or_else(|| fallback_proto);
     if let Some(caller_proto) = caller_proto {
         let source = caller_proto
             .source
@@ -383,7 +388,12 @@ pub fn compute_caller_info_with_fallback(
         let line = get_proto_line(caller_proto, entry.saved_pc);
 
         if !entry.namewhat.is_empty() {
-            return (source, line, entry.name.map(|s| s.to_string()).unwrap_or_default(), entry.namewhat.to_string());
+            return (
+                source,
+                line,
+                entry.name.map(|s| s.to_string()).unwrap_or_default(),
+                entry.namewhat.to_string(),
+            );
         }
 
         let (name, namewhat) = compute_name_from_proto(caller_proto, entry.saved_pc);
@@ -1738,35 +1748,35 @@ impl VmExecutor {
         }
         #[cfg(not(size_optimized))]
         {
-        let mut output = String::new();
-        output.push_str(&format!(
-            "\n=== code ({} instructions, pc={}) ===\n",
-            state.code.len(),
-            current_pc
-        ));
+            let mut output = String::new();
+            output.push_str(&format!(
+                "\n=== code ({} instructions, pc={}) ===\n",
+                state.code.len(),
+                current_pc
+            ));
 
-        for (i, &inst) in state.code.iter().enumerate() {
-            let inst_str = crate::compiler::bytecode_dump::format_instruction(inst);
-            let is_current = i == current_pc;
+            for (i, &inst) in state.code.iter().enumerate() {
+                let inst_str = crate::compiler::bytecode_dump::format_instruction(inst);
+                let is_current = i == current_pc;
 
-            if is_current {
-                if use_color {
-                    // ANSI 黄色高亮 + <- 标记
-                    output.push_str(&format!(
-                        "\x1b[33m{}\t[-]\t{}\t<-\x1b[0m\n",
-                        i + 1,
-                        inst_str
-                    ));
+                if is_current {
+                    if use_color {
+                        // ANSI 黄色高亮 + <- 标记
+                        output.push_str(&format!(
+                            "\x1b[33m{}\t[-]\t{}\t<-\x1b[0m\n",
+                            i + 1,
+                            inst_str
+                        ));
+                    } else {
+                        // 纯文本 <- 标记
+                        output.push_str(&format!("{}\t[-]\t{}\t<-\n", i + 1, inst_str));
+                    }
                 } else {
-                    // 纯文本 <- 标记
-                    output.push_str(&format!("{}\t[-]\t{}\t<-\n", i + 1, inst_str));
+                    output.push_str(&format!("{}\t[-]\t{}\n", i + 1, inst_str));
                 }
-            } else {
-                output.push_str(&format!("{}\t[-]\t{}\n", i + 1, inst_str));
             }
-        }
-        output.push_str("=== end code ===\n");
-        output
+            output.push_str("=== end code ===\n");
+            output
         }
     }
 
@@ -1780,30 +1790,30 @@ impl VmExecutor {
         }
         #[cfg(not(size_optimized))]
         {
-        let mut output = String::new();
-        output.push_str(&format!(
-            "\n=== stack (len={}, base={}, pc={}) ===\n",
-            state.stack.len(),
-            state.base,
-            state.pc
-        ));
-        for (i, val) in state.stack.iter().enumerate() {
-            let mut markers = String::new();
-            if i == state.base {
-                markers.push_str(" <-- base");
-            }
-            if i == state.base + state.num_params as usize {
-                markers.push_str(" <-- after params");
-            }
+            let mut output = String::new();
             output.push_str(&format!(
-                "  [{:03}] {:<30}{}\n",
-                i,
-                format!("{}", val),
-                markers
+                "\n=== stack (len={}, base={}, pc={}) ===\n",
+                state.stack.len(),
+                state.base,
+                state.pc
             ));
-        }
-        output.push_str("=== end stack ===\n");
-        output
+            for (i, val) in state.stack.iter().enumerate() {
+                let mut markers = String::new();
+                if i == state.base {
+                    markers.push_str(" <-- base");
+                }
+                if i == state.base + state.num_params as usize {
+                    markers.push_str(" <-- after params");
+                }
+                output.push_str(&format!(
+                    "  [{:03}] {:<30}{}\n",
+                    i,
+                    format!("{}", val),
+                    markers
+                ));
+            }
+            output.push_str("=== end stack ===\n");
+            output
         }
     }
 
@@ -1897,7 +1907,10 @@ impl VmExecutor {
                 // 检查旧值是否为 trivially-droppable 类型 (无 Rc/Table 等需 decq 的字段)
                 // 用 discriminant 范围检查: Nil=0, Boolean=1, Integer=4, Float=5
                 // (编译器优化为 2 次 cmp+jcc, 比完整 match 更快)
-                if matches!(slot, TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)) {
+                if matches!(
+                    slot,
+                    TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)
+                ) {
                     std::ptr::write(slot, val);
                 } else {
                     *slot = val;
@@ -1923,36 +1936,9 @@ impl VmExecutor {
         }
     }
 
-    /// 快速栈截断 — 跳过 trivially-droppable 类型 (Integer/Float/Boolean/Nil) 的 drop_glue。
-    ///
-    /// perf: Vec::truncate 对每个元素调用 drop_in_place, 即使是 Integer/Nil (no-op drop)
-    /// 也会执行 match 判别式检查。在函数调用密集的基准测试中, 每次 op_return 截断 3-5 个
-    /// TValue, drop_glue 占 6.62%。此函数先用 all() 检查是否全部为 trivial 类型,
-    /// 若是则用 set_len 跳过 drop_glue (O(1) after check), 否则回退到 truncate。
-    #[cfg_attr(not(size_optimized), inline(always))]
-    fn fast_truncate_stack(state: &mut LuaState, new_len: usize) {
-        let stack = &mut state.stack;
-        if new_len >= stack.len() {
-            return;
-        }
-        // 检查待截断区域是否全部为 trivially-droppable 类型
-        // (Integer/Float/Boolean/Nil 没有 Rc/Table 等需要 decq 引用计数的字段)
-        // 这些类型的 drop_in_place 是 no-op, 但 Vec::truncate 仍会逐个调用,
-        // 每次 ~3-5 cycles (match 判别式 + 间接 call)。set_len 完全跳过。
-        let all_trivial = stack[new_len..]
-            .iter()
-            .all(|v| matches!(v, TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)));
-        if all_trivial {
-            // SAFETY: trivially-droppable 类型没有需要清理的资源, set_len 跳过 drop_glue 是安全的
-            unsafe { stack.set_len(new_len); }
-        } else {
-            stack.truncate(new_len);
-        }
-    }
-
     /// 智能栈清除 — 不截断 Vec, 仅设置 state.top, 避免 write_stack_grow 开销。
     ///
-    /// perf: op_return 中的 fast_truncate_stack 截断 Vec 后, 调用者执行时 write_stack
+    /// perf: op_return 截断 Vec 后, 调用者执行时 write_stack
     /// 需要重新扩展 Vec (write_stack_grow 占函数调用基准 4.67%)。此函数在值全为
     /// trivially-droppable 时不截断 Vec, 仅设置 state.top:
     /// - GC 不扫描 beyond state.top, 不会发现 stale 值
@@ -1967,9 +1953,12 @@ impl VmExecutor {
             return;
         }
         // 检查待清除区域是否全部为 trivially-droppable 类型
-        let all_trivial = state.stack[keep_len..]
-            .iter()
-            .all(|v| matches!(v, TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)));
+        let all_trivial = state.stack[keep_len..].iter().all(|v| {
+            matches!(
+                v,
+                TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)
+            )
+        });
         if all_trivial {
             // 全部 trivially-droppable: 不截断 Vec, 仅设置 state.top
             // stale 值不持有 Rc 引用, GC 不扫描 beyond top, 无泄漏风险
@@ -2907,8 +2896,13 @@ impl VmExecutor {
                     state.gc.cond_gc();
                     // perf: 跳过 trivially-droppable 旧值的 drop_glue
                     // (与 write_stack 同理, upvalue 常持有 number 值)
-                    if matches!(**value, TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)) {
-                        unsafe { std::ptr::write(&mut **value, val); }
+                    if matches!(
+                        **value,
+                        TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)
+                    ) {
+                        unsafe {
+                            std::ptr::write(&mut **value, val);
+                        }
                     } else {
                         **value = val;
                     }
@@ -2917,8 +2911,16 @@ impl VmExecutor {
                     if *stack_index < state.stack.len() {
                         // perf: 同上, 跳过 trivially-droppable 旧值的 drop_glue
                         let slot = &mut state.stack[*stack_index];
-                        if matches!(slot, TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)) {
-                            unsafe { std::ptr::write(slot, val); }
+                        if matches!(
+                            slot,
+                            TValue::Nil(_)
+                                | TValue::Boolean(_)
+                                | TValue::Integer(_)
+                                | TValue::Float(_)
+                        ) {
+                            unsafe {
+                                std::ptr::write(slot, val);
+                            }
                         } else {
                             *slot = val;
                         }
@@ -4051,9 +4053,9 @@ impl VmExecutor {
         match concat_result {
             Ok(mut vals) => {
                 // 拼接成功: concat_stack 保证 vals 长度为 1
-                let result = vals.pop().unwrap_or_else(|| {
-                    TValue::Str(state.string_table.intern(""))
-                });
+                let result = vals
+                    .pop()
+                    .unwrap_or_else(|| TValue::Str(state.string_table.intern("")));
                 // state.stack 已被 split_off(a) 截断到 a,无需再 truncate
                 state.stack.push(result);
                 state.stack.append(&mut saved_tail);
@@ -4445,8 +4447,8 @@ impl VmExecutor {
                 b.saturating_sub(1)
             };
             let nresults = c - 1; // -1 表示 MULTRET (对应 C 的 nresults = GETARG_C(i) - 1)
-            // perf: 不再 Rc::clone(&closure.proto) — 直接访问 closure.proto 字段
-            // closure 在下方被 move 进 CallInfoEntry, 移动后需要的值提前缓存
+                                  // perf: 不再 Rc::clone(&closure.proto) — 直接访问 closure.proto 字段
+                                  // closure 在下方被 move 进 CallInfoEntry, 移动后需要的值提前缓存
             let upvals = Rc::clone(&closure.upvals);
             let fsize = closure.proto.max_stack_size as usize;
             let nfixparams = closure.proto.num_params as usize;
@@ -4475,9 +4477,12 @@ impl VmExecutor {
             // perf: 用 mem::replace 代替 mem::take + 后续赋值
             // 直接从 closure.proto 提取 Rc 引用 (closure 此时尚未 move)
             let saved_code = std::mem::replace(&mut state.code, Rc::clone(&closure.proto.code));
-            let saved_constants = std::mem::replace(&mut state.constants, Rc::clone(&closure.proto.constants));
-            let saved_upval_descs = std::mem::replace(&mut state.upval_descs, Rc::clone(&closure.proto.upvalues));
-            let saved_protos = std::mem::replace(&mut state.protos, Rc::clone(&closure.proto.protos));
+            let saved_constants =
+                std::mem::replace(&mut state.constants, Rc::clone(&closure.proto.constants));
+            let saved_upval_descs =
+                std::mem::replace(&mut state.upval_descs, Rc::clone(&closure.proto.upvalues));
+            let saved_protos =
+                std::mem::replace(&mut state.protos, Rc::clone(&closure.proto.protos));
             // perf: mem::replace closure_upvals — move old to frame, move new to state
             // 省 1 次 Rc::clone (旧: clone old → frame) + 1 次 Rc::drop (old state value)
             let saved_closure_upvals = std::mem::replace(&mut state.closure_upvals, upvals);
@@ -4599,13 +4604,13 @@ impl VmExecutor {
                 let proto_is_vararg = closure.proto.is_vararg();
 
                 // 提前提取 proto 和 upvals 的 Rc 引用，使后续可以 move closure（而非 clone）
-            // perf: 消除 CallInfoEntry.closure 的 Box 堆分配
-            let proto = Rc::clone(&closure.proto);
-            let upvals = Rc::clone(&closure.upvals);
+                // perf: 消除 CallInfoEntry.closure 的 Box 堆分配
+                let proto = Rc::clone(&closure.proto);
+                let upvals = Rc::clone(&closure.upvals);
 
-            // perf: caller_proto 延迟计算 (同 fast path), 从 state.stack[base-1] 获取
+                // perf: caller_proto 延迟计算 (同 fast path), 从 state.stack[base-1] 获取
 
-            // 检查 C 调用深度 (对应 C 的 luaE_incCstack / luaE_checkcstack)
+                // 检查 C 调用深度 (对应 C 的 luaE_incCstack / luaE_checkcstack)
                 // 每次 Lua 闭包调用递增 n_ccalls,达到 LUAI_MAXCCALLS(200) 时
                 // 抛出 "C stack overflow",防止无限递归导致内存耗尽。
                 state.n_ccalls = state.n_ccalls.saturating_add(1);
@@ -4628,8 +4633,10 @@ impl VmExecutor {
                 // mem::take 会创建 4 个空 Rc::new(Vec::new()) 堆分配, 赋值时又立即 drop
                 // mem::replace 直接交换指针, 零堆分配
                 let saved_code = std::mem::replace(&mut state.code, Rc::clone(&proto.code));
-                let saved_constants = std::mem::replace(&mut state.constants, Rc::clone(&proto.constants));
-                let saved_upval_descs = std::mem::replace(&mut state.upval_descs, Rc::clone(&proto.upvalues));
+                let saved_constants =
+                    std::mem::replace(&mut state.constants, Rc::clone(&proto.constants));
+                let saved_upval_descs =
+                    std::mem::replace(&mut state.upval_descs, Rc::clone(&proto.upvalues));
                 let saved_protos = std::mem::replace(&mut state.protos, proto.protos.clone());
 
                 state.call_stack.push(CallFrame {
@@ -4903,8 +4910,8 @@ impl VmExecutor {
                 // （与 state.rs::pcall_c_function 保持一致，否则 panic 跨 extern "C" 边界会 abort）
                 let f_unwind: unsafe extern "C-unwind" fn(*mut c_void) -> i32 =
                     unsafe { std::mem::transmute(f) };
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    unsafe { f_unwind(ptr as *mut c_void) }
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                    f_unwind(ptr as *mut c_void)
                 })) {
                     Ok(n) => Ok(n),
                     Err(_panic) => Err(()),
@@ -5357,10 +5364,8 @@ impl VmExecutor {
                 let dst = return_base + i;
                 if src < state.stack.len() {
                     // 源位置在栈范围内: take 出来填 Nil(Empty), 写入目标位置
-                    state.stack[dst] = std::mem::replace(
-                        &mut state.stack[src],
-                        TValue::Nil(NilKind::Empty),
-                    );
+                    state.stack[dst] =
+                        std::mem::replace(&mut state.stack[src], TValue::Nil(NilKind::Empty));
                 } else {
                     state.stack[dst] = TValue::Nil(NilKind::Strict);
                 }
@@ -6523,7 +6528,8 @@ impl VmExecutor {
                         let mt = t.get_metatable();
                         let tmnames = &state.tmnames;
                         let index_val = mt.and_then(|mt| {
-                            let index_key = crate::tm::make_tm_tvalue(tmnames, crate::tm::TagMethod::Index);
+                            let index_key =
+                                crate::tm::make_tm_tvalue(tmnames, crate::tm::TagMethod::Index);
                             mt.get(&index_key)
                         });
                         if let Some(index_val) = index_val {
@@ -6557,7 +6563,8 @@ impl VmExecutor {
                 TValue::Str(_) => {
                     // 字符串类型: 查找字符串元表的 __index
                     if let Some(mt) = state.dmt.get(LuaType::String) {
-                        let index_key = crate::tm::make_tm_tvalue(&state.tmnames, crate::tm::TagMethod::Index);
+                        let index_key =
+                            crate::tm::make_tm_tvalue(&state.tmnames, crate::tm::TagMethod::Index);
                         if let Some(index_val) = mt.get(&index_key) {
                             match index_val {
                                 TValue::Table(index_table) => {
@@ -6574,8 +6581,12 @@ impl VmExecutor {
                 other => {
                     // 非表/字符串值: 查找 __index 元方法 (基本类型如 number/boolean/nil)
                     // 对应 C Lua 的 luaV_finishget: 对非表值调用 getTMbyobj
-                    let index_val =
-                        crate::tm::get_tm_by_obj(other, crate::tm::TagMethod::Index, &state.dmt, &state.tmnames);
+                    let index_val = crate::tm::get_tm_by_obj(
+                        other,
+                        crate::tm::TagMethod::Index,
+                        &state.dmt,
+                        &state.tmnames,
+                    );
                     match index_val {
                         Some(f) => match &f {
                             TValue::LClosure(_)
@@ -6648,25 +6659,6 @@ impl VmExecutor {
         state.stack.truncate(res);
         state.top = state.stack.len();
         Ok(result)
-    }
-
-    fn table_set_tv(mut table_val: TValue, key: TValue, val: TValue, gc: &GCState) -> TValue {
-        let table_id = if let TValue::Table(ref t) = table_val {
-            t.gc_header.id()
-        } else {
-            None
-        };
-
-        if let TValue::Table(ref mut t) = table_val {
-            t.set(key, val);
-        }
-
-        if let Some(tid) = table_id {
-            gc.obj_barrier_back(tid, tid);
-            gc.barrier_back(tid);
-        }
-
-        table_val
     }
 
     /// 设置表字段，支持 `__newindex` 元方法和 yield
@@ -6780,21 +6772,21 @@ impl VmExecutor {
                     match newindex_val {
                         Some(f) => {
                             match &f {
-                                    TValue::LClosure(_)
-                                    | TValue::LCFn(_)
-                                    | TValue::CClosure(_)
-                                    | TValue::BuiltinFn(_)
-                                    | TValue::RustClosure(_)
-                                    | TValue::LightUserData(_) => {
-                                        // __newindex 是函数: 调用 (可能 yield)
-                                        crate::tm::call_tm(
-                                            state,
-                                            &f,
-                                            &current,
-                                            &key,
-                                            &val,
-                                            crate::tm::TagMethod::NewIndex,
-                                        )?;
+                                TValue::LClosure(_)
+                                | TValue::LCFn(_)
+                                | TValue::CClosure(_)
+                                | TValue::BuiltinFn(_)
+                                | TValue::RustClosure(_)
+                                | TValue::LightUserData(_) => {
+                                    // __newindex 是函数: 调用 (可能 yield)
+                                    crate::tm::call_tm(
+                                        state,
+                                        &f,
+                                        &current,
+                                        &key,
+                                        &val,
+                                        crate::tm::TagMethod::NewIndex,
+                                    )?;
                                     return Ok(());
                                 }
                                 TValue::Table(_) => {
@@ -6876,10 +6868,7 @@ impl VmExecutor {
     }
 }
 
-// ============================================================================
-// format_float
-// ============================================================================
-
+#[cfg(test)]
 fn format_float(f: f64) -> String {
     crate::float_utils::f64_to_string(f)
 }
