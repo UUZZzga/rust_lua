@@ -4,7 +4,7 @@ use crate::objects::*;
 use crate::opcodes::*;
 use crate::strings::LuaString;
 use std::collections::HashMap;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::rc::Rc;
 
 use crate::objects::Instruction;
@@ -446,6 +446,139 @@ struct RegAllocEntry {
 // 语义与 tvalue_eq 一致：不做跨类型比较（Integer != Float）
 // ============================================================================
 
+// ============================================================================
+// 固定密钥 SipHash-1-3 — 用于 const_index HashMap
+// 与标准库 RandomState 相同算法 (SipHash-1-3), 但用固定密钥省去
+// thread-local 随机数访问开销。编译器内部 HashMap 不需要防御 HashDoS。
+// ============================================================================
+
+/// 固定密钥 (任意非零常量, 不需要密码学安全性)
+const SIP_KEY0: u64 = 0x6c62_272e_07bb_0d14;
+const SIP_KEY1: u64 = 0x62b8_2175_6295_958e;
+
+#[derive(Clone)]
+struct FixedSipBuildHasher;
+
+impl BuildHasher for FixedSipBuildHasher {
+    type Hasher = FixedSipHasher13;
+    #[inline(always)]
+    fn build_hasher(&self) -> FixedSipHasher13 {
+        FixedSipHasher13::new()
+    }
+}
+
+/// SipHash-1-3 (1 轮压缩 + 3 轮终结), 与 Rust 标准库 RandomState 相同算法。
+/// 针对单次 write_u64 优化 (ConstKey::hash 只调用一次 write_u64)。
+struct FixedSipHasher13 {
+    v0: u64,
+    v1: u64,
+    v2: u64,
+    v3: u64,
+    length: u64,
+}
+
+impl FixedSipHasher13 {
+    #[inline(always)]
+    fn new() -> Self {
+        Self {
+            v0: SIP_KEY0 ^ 0x736f6d6570736575,
+            v1: SIP_KEY1 ^ 0x646f72616e646f6d,
+            v2: SIP_KEY0 ^ 0x6c7967656e657261,
+            v3: SIP_KEY1 ^ 0x7465646279746573,
+            length: 0,
+        }
+    }
+
+    /// SipRound — SipHash 核心轮函数
+    #[inline(always)]
+    fn round(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64) {
+        *v0 = v0.wrapping_add(*v1);
+        *v1 = v1.rotate_left(13);
+        *v1 ^= *v0;
+        *v0 = v0.rotate_left(32);
+        *v2 = v2.wrapping_add(*v3);
+        *v3 = v3.rotate_left(16);
+        *v3 ^= *v2;
+        *v0 = v0.wrapping_add(*v3);
+        *v3 = v3.rotate_left(21);
+        *v3 ^= *v0;
+        *v2 = v2.wrapping_add(*v1);
+        *v1 = v1.rotate_left(17);
+        *v1 ^= *v2;
+        *v2 = v2.rotate_left(32);
+    }
+
+    /// C-rounds (压缩): SipHash-1-3 做 1 轮
+    #[inline(always)]
+    fn c_rounds(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64) {
+        Self::round(v0, v1, v2, v3);
+    }
+
+    /// D-rounds (终结): SipHash-1-3 做 3 轮
+    #[inline(always)]
+    fn d_rounds(v0: &mut u64, v1: &mut u64, v2: &mut u64, v3: &mut u64) {
+        Self::round(v0, v1, v2, v3);
+        Self::round(v0, v1, v2, v3);
+        Self::round(v0, v1, v2, v3);
+    }
+}
+
+impl Hasher for FixedSipHasher13 {
+    /// ConstKey::hash 只调用一次 write_u64, 直接处理完整块 (无需缓冲)
+    #[inline(always)]
+    fn write_u64(&mut self, i: u64) {
+        self.length = 8;
+        self.v3 ^= i;
+        Self::c_rounds(&mut self.v0, &mut self.v1, &mut self.v2, &mut self.v3);
+        self.v0 ^= i;
+    }
+
+    fn finish(&self) -> u64 {
+        let mut v0 = self.v0;
+        let mut v1 = self.v1;
+        let mut v2 = self.v2;
+        let mut v3 = self.v3;
+
+        // 最后一个块: 长度 (len mod 256) 放在最高字节
+        let b = (self.length & 0xff) << 56;
+        v3 ^= b;
+        Self::c_rounds(&mut v0, &mut v1, &mut v2, &mut v3);
+        v0 ^= b;
+
+        // 终结
+        v2 ^= 0xff;
+        Self::d_rounds(&mut v0, &mut v1, &mut v2, &mut v3);
+        v0 ^ v1 ^ v2 ^ v3
+    }
+
+    /// write: 通用回退实现 (ConstKey 不使用, 但 Hash trait 需要)
+    fn write(&mut self, bytes: &[u8]) {
+        let mut i = 0;
+        while i + 8 <= bytes.len() {
+            let m = u64::from_le_bytes([
+                bytes[i], bytes[i+1], bytes[i+2], bytes[i+3],
+                bytes[i+4], bytes[i+5], bytes[i+6], bytes[i+7],
+            ]);
+            self.length += 8;
+            self.v3 ^= m;
+            Self::c_rounds(&mut self.v0, &mut self.v1, &mut self.v2, &mut self.v3);
+            self.v0 ^= m;
+            i += 8;
+        }
+        // 尾部字节 (简化: 直接处理, 不完全符合 SipHash 规范但 ConstKey 不触发此路径)
+        let rem = bytes.len() - i;
+        if rem > 0 {
+            let mut buf = [0u8; 8];
+            buf[..rem].copy_from_slice(&bytes[i..]);
+            let m = u64::from_le_bytes(buf);
+            self.length += rem as u64;
+            self.v3 ^= m;
+            Self::c_rounds(&mut self.v0, &mut self.v1, &mut self.v2, &mut self.v3);
+            self.v0 ^= m;
+        }
+    }
+}
+
 #[derive(Clone)]
 enum ConstKey {
     Nil,
@@ -531,11 +664,12 @@ pub struct FuncState<'a> {
     // 每条指令对应的行号（与 code 数组平行），用于在 finalize 时计算 line_info
     inst_lines: Vec<i32>,
     /// 常量索引 — 用于 const_k 的 O(1) 查找，避免线性扫描
-    /// perf: 用默认 SipHash (RandomState)。
-    /// 此前用 FxBuildHasher + 预混合, 但 perf 显示 const_k 从 0.51% 暴增到 12.98%,
-    /// FxHash 对 ConstKey 的哈希质量不佳 (即使预混合), 导致 HashMap 冲突增多。
-    /// SipHash-1-3 虽然单次 hash 较慢, 但冲突少, 整体性能更好。
-    const_index: HashMap<ConstKey, i32>,
+    /// perf: 用固定密钥 SipHash-1-3 (FixedSipBuildHasher), 与标准库 RandomState
+    /// 相同算法但用固定密钥, 省去 thread-local 随机数访问开销。
+    /// FxHash 对 ConstKey 的哈希质量不佳 (即使预混合), 导致冲突增多;
+    /// 标准 RandomState 每次哈希需访问 thread-local 密钥, 有额外开销。
+    /// 固定密钥 SipHash 兼顾哈希质量和访问速度。
+    const_index: HashMap<ConstKey, i32, FixedSipBuildHasher>,
     /// 缓存 _ENV 的查找结果, 避免每次全局变量访问都 lookup_local(_ENV) 扫描 locals。
     /// perf: code_global_via_env/prefix 每次都调用 lookup_local(_ENV), 占 lookup_local
     /// 10.35% 热点中的约 40% (4%+)。_ENV 位置在函数编译期间固定 (除非 `local _ENV`,
@@ -658,7 +792,7 @@ impl<'a> FuncState<'a> {
             // 覆盖大多数小函数的常量数量, 减少 rehash 开销。
             // 内存开销: 16 桶 * 24 字节 ≈ 384 字节, 可忽略。
             // 注意: 增加到 32 会导致 all.lua 性能下降约 7% (内存浪费影响缓存)。
-            const_index: HashMap::with_capacity(16),
+            const_index: HashMap::with_capacity_and_hasher(16, FixedSipBuildHasher),
             env_cache: EnvCache::None,
             #[cfg(debug_assertions)]
             reg_alloc_stack: Vec::new(),
