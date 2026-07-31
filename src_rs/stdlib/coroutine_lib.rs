@@ -249,7 +249,7 @@ fn close_open_upvals(thread: &LuaThread, state: &mut LuaState) -> Vec<OpenUpvalI
         if let Some(boxed_func) = &thread.function {
             if let TValue::LClosure(closure) = boxed_func.as_ref() {
                 // Lua 函数体: 递归收集所有可达 LClosure 的 Open upvalue（包括嵌套闭包的 upvalue）
-                let mut visited = std::collections::HashSet::new();
+                let mut visited = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
                 collect_and_close_upvals(
                     &closure.upvals.borrow(),
                     state,
@@ -262,7 +262,7 @@ fn close_open_upvals(thread: &LuaThread, state: &mut LuaState) -> Vec<OpenUpvalI
                 // 参数在 call_resume 中通过 state.stack[a+2..] 访问（resume_args 之前）
                 // 但此时还未 save_caller_context，state.stack 仍是父栈
                 // 直接扫描栈上的 LClosure 参数
-                let mut visited = std::collections::HashSet::new();
+                let mut visited = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
                 scan_stack_for_closures(state, &mut result, &mut visited);
             }
         }
@@ -281,9 +281,9 @@ fn close_open_upvals(thread: &LuaThread, state: &mut LuaState) -> Vec<OpenUpvalI
 fn scan_stack_for_closures(
     state: &mut LuaState,
     result: &mut Vec<OpenUpvalInfo>,
-    visited: &mut std::collections::HashSet<usize>,
+    visited: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
 ) {
-    let mut visited_tables = std::collections::HashSet::new();
+    let mut visited_tables = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
     // 先 clone 栈上的 LClosure/Table 引用（避免遍历时借用 state.stack）
     let closures: Vec<Rc<RefCell<Vec<UpValRef>>>> = state
         .stack
@@ -345,9 +345,9 @@ fn collect_and_close_upvals(
     upvals: &[Rc<RefCell<UpVal>>],
     state: &mut LuaState,
     result: &mut Vec<OpenUpvalInfo>,
-    visited: &mut std::collections::HashSet<usize>,
+    visited: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
 ) {
-    let mut visited_tables = std::collections::HashSet::new();
+    let mut visited_tables = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
     collect_and_close_upvals_impl(upvals, state, result, visited, &mut visited_tables);
 }
 
@@ -355,8 +355,8 @@ fn collect_and_close_upvals_impl(
     upvals: &[Rc<RefCell<UpVal>>],
     state: &mut LuaState,
     result: &mut Vec<OpenUpvalInfo>,
-    visited: &mut std::collections::HashSet<usize>,
-    visited_tables: &mut std::collections::HashSet<usize>,
+    visited: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
+    visited_tables: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
 ) {
     for uv_ref in upvals.iter() {
         let ptr = Rc::as_ptr(uv_ref) as usize;
@@ -410,8 +410,8 @@ fn scan_table_and_close_upvals(
     table: &Table,
     state: &mut LuaState,
     result: &mut Vec<OpenUpvalInfo>,
-    visited: &mut std::collections::HashSet<usize>,
-    visited_tables: &mut std::collections::HashSet<usize>,
+    visited: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
+    visited_tables: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
 ) {
     let table_ptr = Rc::as_ptr(&table.data) as usize;
     if !visited_tables.insert(table_ptr) {
@@ -481,7 +481,7 @@ fn scan_table_and_close_upvals(
 pub fn close_hook_upvals(hook: &TValue, state: &mut LuaState) {
     if let TValue::LClosure(closure) = hook {
         let mut result = Vec::new();
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
         collect_and_close_upvals(&closure.upvals.borrow(), state, &mut result, &mut visited);
     }
 }
@@ -495,7 +495,7 @@ fn collect_wrap_upvals_info(
 ) -> Vec<(UpValRef, usize, TValue)> {
     let mut result = Vec::new();
     if let Some(boxed_func) = &thread.function {
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
         if let TValue::LClosure(closure) = boxed_func.as_ref() {
             collect_open_upvals_recursive(
                 &closure.upvals.borrow(),
@@ -505,7 +505,7 @@ fn collect_wrap_upvals_info(
             );
         } else {
             // C 函数体: 扫描栈上的 LClosure 和 Table 参数
-            let mut visited_tables = std::collections::HashSet::new();
+            let mut visited_tables = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
             for v in state.stack.iter() {
                 match v {
                     TValue::LClosure(closure) => {
@@ -539,9 +539,9 @@ fn collect_open_upvals_recursive(
     upvals: &[Rc<RefCell<UpVal>>],
     state: &LuaState,
     result: &mut Vec<(UpValRef, usize, TValue)>,
-    visited: &mut std::collections::HashSet<usize>,
+    visited: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
 ) {
-    let mut visited_tables = std::collections::HashSet::new();
+    let mut visited_tables = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
     collect_open_upvals_recursive_impl(upvals, state, result, visited, &mut visited_tables);
 }
 
@@ -549,8 +549,8 @@ fn collect_open_upvals_recursive_impl(
     upvals: &[Rc<RefCell<UpVal>>],
     state: &LuaState,
     result: &mut Vec<(UpValRef, usize, TValue)>,
-    visited: &mut std::collections::HashSet<usize>,
-    visited_tables: &mut std::collections::HashSet<usize>,
+    visited: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
+    visited_tables: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
 ) {
     for uv_ref in upvals.iter() {
         let ptr = Rc::as_ptr(uv_ref) as usize;
@@ -596,8 +596,8 @@ fn scan_table_and_collect_upvals(
     table: &Table,
     state: &LuaState,
     result: &mut Vec<(UpValRef, usize, TValue)>,
-    visited: &mut std::collections::HashSet<usize>,
-    visited_tables: &mut std::collections::HashSet<usize>,
+    visited: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
+    visited_tables: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
 ) {
     let table_ptr = Rc::as_ptr(&table.data) as usize;
     if !visited_tables.insert(table_ptr) {
@@ -715,8 +715,8 @@ fn sync_upvals_back(
 /// 返回 (uv_ref, original_stack_index) 列表，供 resume 时同步回协程栈
 fn close_yield_upvals(yield_values: &[TValue], state: &mut LuaState) -> Vec<(UpValRef, usize)> {
     let mut result_info: Vec<OpenUpvalInfo> = Vec::new();
-    let mut visited = std::collections::HashSet::new();
-    let mut visited_tables = std::collections::HashSet::new();
+    let mut visited = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
+    let mut visited_tables = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
     for v in yield_values {
         match v {
             TValue::LClosure(closure) => {

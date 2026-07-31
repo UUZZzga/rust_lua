@@ -252,10 +252,10 @@ pub struct LuaState {
     pub io_output: Option<Box<dyn Write>>,
     /// 文件句柄注册表 — key 是 UserData 的 gc_header.ptr_id，value 是 FILE* 指针
     /// 对应 C 的 luaL_Stream 中存储的 FILE*。UserData 本身不存数据，通过此 map 关联。
-    pub file_handles: std::collections::HashMap<u32, *mut libc::FILE>,
+    pub file_handles: std::collections::HashMap<u32, *mut libc::FILE, crate::objects::FxBuildHasher>,
     /// 标记哪些文件句柄是 io.popen 创建的（关闭时用 pclose 而非 fclose）
     /// 对应 C 的 LStream.closef = &io_pclose
-    pub popen_handles: std::collections::HashSet<u32>,
+    pub popen_handles: std::collections::HashSet<u32, crate::objects::FxBuildHasher>,
     /// 当前默认输入流的 UserData ptr_id — None 表示使用 io.stdin
     /// 对应 C 的 registry[IO_INPUT]
     pub io_input_handle: Option<u32>,
@@ -614,8 +614,8 @@ impl LuaState {
             dmt: DefaultMetatables::new(),
             stdout: lua_stdout(),
             io_output: None,
-            file_handles: std::collections::HashMap::new(),
-            popen_handles: std::collections::HashSet::new(),
+            file_handles: std::collections::HashMap::with_hasher(crate::objects::FxBuildHasher::default()),
+            popen_handles: std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default()),
             io_input_handle: None,
             io_output_handle: None,
             global_state: Rc::new(GlobalState { gcstopem: false }),
@@ -817,8 +817,8 @@ impl LuaState {
             dmt: DefaultMetatables::new(),
             stdout: lua_stdout(),
             io_output: None,
-            file_handles: std::collections::HashMap::new(),
-            popen_handles: std::collections::HashSet::new(),
+            file_handles: std::collections::HashMap::with_hasher(crate::objects::FxBuildHasher::default()),
+            popen_handles: std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default()),
             io_input_handle: None,
             io_output_handle: None,
             global_state: Rc::new(GlobalState { gcstopem: false }),
@@ -1081,8 +1081,8 @@ impl LuaState {
             dmt: DefaultMetatables::new(),
             stdout: lua_stdout(),
             io_output: None,
-            file_handles: std::collections::HashMap::new(),
-            popen_handles: std::collections::HashSet::new(),
+            file_handles: std::collections::HashMap::with_hasher(crate::objects::FxBuildHasher::default()),
+            popen_handles: std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default()),
             io_input_handle: None,
             io_output_handle: None,
             global_state: Rc::new(GlobalState { gcstopem: false }),
@@ -3552,8 +3552,8 @@ impl LuaState {
 
         // 构建 upval_origins 映射：UpVal Rc 指针 -> original_stack_index
         // 遍历主线程栈上的所有协程，收集它们的 upval_origins（首次 resume 时记录）
-        let mut upval_origins_map: std::collections::HashMap<usize, usize> =
-            std::collections::HashMap::new();
+        let mut upval_origins_map: std::collections::HashMap<usize, usize, crate::objects::FxBuildHasher> =
+            std::collections::HashMap::with_hasher(crate::objects::FxBuildHasher::default());
         for val in self.stack.iter() {
             if let TValue::Thread(t) = val {
                 let origins = t.context.borrow().upval_origins.clone();

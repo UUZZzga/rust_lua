@@ -312,7 +312,7 @@ pub struct StringTable {
 
 #[cfg(size_optimized)]
 pub struct StringTable {
-    ht: RwLock<std::collections::HashMap<u64, Vec<ArcRc<ShortString>>>>,
+    ht: RwLock<std::collections::HashMap<u64, Vec<ArcRc<ShortString>>, crate::objects::FxBuildHasher>>,
     nuse: RwLock<usize>,
 }
 
@@ -586,7 +586,7 @@ impl StringTable {
     pub fn new() -> Self {
         // size_optimized: 不预分配, 减小二进制体积
         StringTable {
-            ht: RwLock::new(std::collections::HashMap::new()),
+            ht: RwLock::new(std::collections::HashMap::with_hasher(crate::objects::FxBuildHasher::default())),
             nuse: RwLock::new(0),
         }
     }

@@ -3250,8 +3250,8 @@ fn tostring_for_format(state: &mut LuaState, val: &TValue) -> Option<String> {
 /// 预扫描格式字符串,返回使用 %s (或 %.Ns 等) 的参数索引集合 (0-based)。
 /// 仅这些参数需要对 table 调用 __tostring 元方法 (对应 C 的 luaL_tolstring)。
 /// %q 等其他 specifier 不应转换 table,以便 str_format 能正确报 "value has no literal form"。
-fn find_s_arg_indices(fmt: &str) -> std::collections::HashSet<usize> {
-    let mut indices = std::collections::HashSet::new();
+fn find_s_arg_indices(fmt: &str) -> std::collections::HashSet<usize, crate::objects::FxBuildHasher> {
+    let mut indices = std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
     let bytes = fmt.as_bytes();
     let mut i = 0;
     let mut arg_idx = 0usize;

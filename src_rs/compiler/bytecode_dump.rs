@@ -1219,7 +1219,7 @@ struct BytecodeWriter {
     offset: usize,
     strip: bool,
     /// 字符串去重表: 字符串内容 -> 索引 (1-based)
-    strings: HashMap<String, usize>,
+    strings: HashMap<String, usize, crate::objects::FxBuildHasher>,
     /// 下一个字符串索引
     nstr: usize,
 }
@@ -1230,7 +1230,7 @@ impl BytecodeWriter {
             data: Vec::new(),
             offset: 0,
             strip,
-            strings: HashMap::new(),
+            strings: HashMap::with_hasher(crate::objects::FxBuildHasher::default()),
             nstr: 0,
         }
     }
