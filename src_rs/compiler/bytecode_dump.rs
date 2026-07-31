@@ -5,12 +5,14 @@ use crate::opcodes::{
     getarg_sj, getarg_vb, getarg_vc, testarg_k, OFFSET_sJ, OpCode, OpMode, OPNAMES, POS_A, POS_B,
     POS_BX, POS_C, POS_K, POS_SJ, POS_VB, POS_VC, SIZE_A, SIZE_BX, TM_EVENT_NAMES,
 };
+#[cfg(test)]
 use imara_diff::{Algorithm, Diff, InternedInput};
 use std::ffi::{c_int, c_void};
 use std::ptr;
 use std::rc::Rc;
 
-#[derive(Debug, Clone)]
+#[cfg_attr(not(size_optimized), derive(Debug))]
+#[derive(Clone)]
 pub struct DumpInstruction {
     pub opcode: u8,
     pub a: u32,
@@ -20,7 +22,8 @@ pub struct DumpInstruction {
     pub bx: u32,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(size_optimized), derive(Debug))]
+#[derive(Clone, PartialEq)]
 pub enum DumpConstant {
     Nil,
     Boolean(bool),
@@ -29,7 +32,7 @@ pub enum DumpConstant {
     String(String),
 }
 
-#[derive(Debug)]
+#[cfg_attr(not(size_optimized), derive(Debug))]
 pub struct DumpedFunction {
     pub linedefined: i32,
     pub lastlinedefined: i32,
@@ -587,7 +590,7 @@ fn format_constant(constants: &[DumpConstant], idx: usize) -> String {
         DumpConstant::Boolean(b) => if *b { "true" } else { "false" }.to_string(),
         DumpConstant::Integer(i) => format!("{}", i),
         DumpConstant::Float(f) => {
-            let s = format!("{}", f);
+            let s = crate::float_utils::f64_to_string(*f);
             if !s.contains('.') && !s.contains('e') && !s.contains('E') {
                 format!("{}.0", s)
             } else {
@@ -1062,6 +1065,7 @@ fn normalize_instruction(raw: u32) -> String {
     }
 }
 
+#[cfg(test)]
 pub fn compare_instructions(rust_code: &[u32], c_code: &[DumpInstruction]) -> Vec<String> {
     let mut diffs = Vec::new();
 

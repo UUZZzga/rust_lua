@@ -62,27 +62,8 @@ pub fn lua_value_to_string(v: &TValue) -> String {
 }
 
 /// 格式化浮点数 (对应 C 的 tostringbuffFloat)
-///
-/// 如果浮点数看起来像整数 (如 3.0), 则添加 ".0" 后缀。
 fn format_float(f: f64) -> String {
-    if f.is_nan() {
-        return "nan".to_string();
-    }
-    if f.is_infinite() {
-        return if f > 0.0 {
-            "inf".to_string()
-        } else {
-            "-inf".to_string()
-        };
-    }
-    let s = format!("{}", f);
-    // 如果结果看起来像整数 (只有数字和负号), 添加 ".0"
-    let looks_like_int = s.chars().all(|c| c.is_ascii_digit() || c == '-');
-    if looks_like_int && !s.is_empty() {
-        format!("{}.0", s)
-    } else {
-        s
-    }
+    crate::float_utils::f64_to_string(f)
 }
 
 // ============================================================================
@@ -315,7 +296,9 @@ fn call_print(state: &mut LuaState, a: usize, nargs: usize, _nresults: i32) -> R
         let val = get_arg(state, a, i);
         s.push_str(&lua_value_to_string(&val));
     }
-    let _ = writeln!(state.stdout, "{}", s);
+    // 体积优先: 用 write_all 替代 writeln! 避免 io::Write::write_fmt 引入 StringError
+    s.push('\n');
+    let _ = state.stdout.write_all(s.as_bytes());
     let _ = state.stdout.flush();
     // print 返回 0 个结果
     state.stack.truncate(a);
@@ -487,7 +470,7 @@ pub(crate) fn call_pcall(state: &mut LuaState, a: usize, nargs: usize, nresults:
             saved_is_vararg: state.is_vararg,
             saved_proto_flag: state.proto_flag,
             saved_nextraargs: state.nextraargs,
-            saved_closure_upvals: state.closure_upvals.clone(),
+            saved_closure_upvals: Rc::clone(&state.closure_upvals),
             saved_tbc_list: state.tbc_list,
             func_idx: a,
             // 保存 pcall 调用者期望的返回值数 (非 state.pcall 的 -1)，
@@ -820,7 +803,7 @@ fn call_tostring(
                 let err = if base < state.stack.len() {
                     match &state.stack[base] {
                         TValue::Str(s) => s.as_str().to_string(),
-                        other => format!("{:?}", other),
+                        other => format!("{}", other),
                     }
                 } else {
                     String::new()
@@ -862,7 +845,7 @@ fn call_tostring(
                 let err = if base < state.stack.len() {
                     match &state.stack[base] {
                         TValue::Str(s) => s.as_str().to_string(),
-                        other => format!("{:?}", other),
+                        other => format!("{}", other),
                     }
                 } else {
                     String::new()
@@ -1166,7 +1149,7 @@ fn call_pairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
                 saved_is_vararg: state.is_vararg,
                 saved_proto_flag: state.proto_flag,
                 saved_nextraargs: state.nextraargs,
-                saved_closure_upvals: state.closure_upvals.clone(),
+                saved_closure_upvals: Rc::clone(&state.closure_upvals),
                 saved_tbc_list: state.tbc_list,
                 func_idx: a,
                 nresults,
@@ -1263,7 +1246,7 @@ pub(crate) fn call_xpcall(state: &mut LuaState, a: usize, nargs: usize, nresults
             saved_is_vararg: state.is_vararg,
             saved_proto_flag: state.proto_flag,
             saved_nextraargs: state.nextraargs,
-            saved_closure_upvals: state.closure_upvals.clone(),
+            saved_closure_upvals: Rc::clone(&state.closure_upvals),
             saved_tbc_list: state.tbc_list,
             func_idx: a,
             // 保存 xpcall 调用者期望的返回值数 (非 state.pcall 的 -1)，

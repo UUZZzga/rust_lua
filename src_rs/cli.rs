@@ -5,6 +5,9 @@
 use crate::objects::{LuaType, TValue};
 use crate::state::{LuaState, ERR_RUN, ERR_SYNTAX, MIN_STACK, MULT_RET};
 
+#[cfg(size_optimized)]
+use crate::state::LuaStderr;
+
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
@@ -36,6 +39,10 @@ impl Interpreter {
         Some(Interpreter {
             l,
             progname: LUA_PROGNAME.to_string(),
+            // 体积优先: 用 LuaStderr 包装, 覆盖 write_fmt 避免 default_write_fmt → StringError
+            #[cfg(size_optimized)]
+            stderr: Box::new(LuaStderr(io::stderr())),
+            #[cfg(not(size_optimized))]
             stderr: Box::new(io::stderr()),
         })
     }
@@ -73,7 +80,9 @@ impl Interpreter {
                 .l
                 .to_string(-1)
                 .unwrap_or_else(|| "(error message not a string)".to_string());
-            let _ = write!(self.stderr, "{}: {}\n", self.progname, msg);
+            // 体积优先: 用 write_all + format! 替代 write!(self.stderr, ...)
+            // 避免 io::Write::write_fmt 默认实现引入 StringError + Unicode 表 (~4KB)
+            let _ = self.stderr.write_all(format!("{}: {}\n", self.progname, msg).as_bytes());
             self.l.pop(1);
         }
         status
@@ -142,13 +151,12 @@ impl Interpreter {
                                 // 返回 main chunk 的 currentline = error(m) 的行号
                                 if let Some(mc) = &main_closure {
                                     constructed_ci.push(crate::state::CallInfoEntry {
-                                        caller_proto: Some(Rc::clone(&mc.proto)),
                                         is_c: true, // C 调用者
                                         closure: Some(mc.clone()),
                                         base: 0,
                                         saved_pc: error_pc, // error(m) 的 pc
-                                        name: String::new(),
-                                        namewhat: String::new(),
+                                        name: None,
+                                        namewhat: "",
                                         proto_flag: mc.proto.flag,
                                         nextraargs: 0,
                                         is_tailcall: false,
@@ -156,13 +164,12 @@ impl Interpreter {
                                 }
                                 // 推入 msghandler C 函数帧
                                 constructed_ci.push(crate::state::CallInfoEntry {
-                                    caller_proto: None,
                                     is_c: true,
                                     closure: None,
                                     base: 0,
                                     saved_pc: 0,
-                                    name: "msghandler".to_string(),
-                                    namewhat: String::new(),
+                                    name: Some("msghandler"),
+                                    namewhat: "",
                                     proto_flag: 0,
                                     nextraargs: 0,
                                     is_tailcall: false,
@@ -354,24 +361,51 @@ impl Interpreter {
         let _ = self.l.stdout.write_all(prompt.as_bytes());
         let _ = self.l.stdout.flush();
         let stdin = io::stdin();
-        let mut line = String::with_capacity(LUA_MAXINPUT);
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) => None,
-            Ok(_) => {
-                // 非终端时回显输入行（模拟 readline 库在管道/重定向时的行为）
-                if !stdin.is_terminal() {
-                    let _ = self.l.stdout.write_all(line.as_bytes());
-                    let _ = self.l.stdout.flush();
-                }
-                if line.ends_with('\n') {
-                    line.pop();
-                    if line.ends_with('\r') {
-                        line.pop();
-                    }
-                }
-                Some(line)
+        // 体积优先: 用 read_until 代替 read_line, 避免 read_line 引入
+        // core::unicode::grapheme_extend 表 (~4KB, 用于 UTF-8 行边界检测)
+        #[cfg(size_optimized)]
+        {
+            let mut buf: Vec<u8> = Vec::with_capacity(LUA_MAXINPUT);
+            match stdin.lock().read_until(b'\n', &mut buf) {
+                Ok(0) => return None,
+                Ok(_) => {}
+                Err(_) => return None,
             }
-            Err(_) => None,
+            // 非终端时回显输入行
+            if !stdin.is_terminal() {
+                let _ = self.l.stdout.write_all(&buf);
+                let _ = self.l.stdout.flush();
+            }
+            // 去除行尾 \n 和 \r (手动处理, 避免 String::from_utf8 引入额外代码)
+            while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
+                buf.pop();
+            }
+            match String::from_utf8(buf) {
+                Ok(s) => Some(s),
+                Err(_) => None,
+            }
+        }
+        #[cfg(not(size_optimized))]
+        {
+            let mut line = String::with_capacity(LUA_MAXINPUT);
+            match stdin.lock().read_line(&mut line) {
+                Ok(0) => None,
+                Ok(_) => {
+                    // 非终端时回显输入行（模拟 readline 库在管道/重定向时的行为）
+                    if !stdin.is_terminal() {
+                        let _ = self.l.stdout.write_all(line.as_bytes());
+                        let _ = self.l.stdout.flush();
+                    }
+                    if line.ends_with('\n') {
+                        line.pop();
+                        if line.ends_with('\r') {
+                            line.pop();
+                        }
+                    }
+                    Some(line)
+                }
+                Err(_) => None,
+            }
         }
     }
 
@@ -504,10 +538,8 @@ impl Interpreter {
                     .l
                     .to_string(-1)
                     .unwrap_or_else(|| "(error)".to_string());
-                let _ = write!(
-                    self.stderr,
-                    "{}: error calling 'print' ({})\n",
-                    self.progname, err_msg
+                let _ = self.stderr.write_all(
+                    format!("{}: error calling 'print' ({})\n", self.progname, err_msg).as_bytes()
                 );
             }
         }
@@ -601,17 +633,18 @@ impl Interpreter {
     }
 
     fn print_usage(&mut self, badoption: &str) {
-        let _ = write!(self.stderr, "{}: ", LUA_PROGNAME);
+        // 体积优先: 用 write_all + format! 替代 write!/writeln!(self.stderr, ...)
+        // 避免 io::Write::write_fmt 默认实现引入 StringError + Unicode 表 (~4KB)
+        let _ = self.stderr.write_all(format!("{}: ", LUA_PROGNAME).as_bytes());
         match badoption.chars().nth(1) {
             Some('e' | 'l') => {
-                let _ = writeln!(self.stderr, "'{}' needs argument", badoption);
+                let _ = self.stderr.write_all(format!("'{}' needs argument\n", badoption).as_bytes());
             }
             _ => {
-                let _ = writeln!(self.stderr, "unrecognized option '{}'", badoption);
+                let _ = self.stderr.write_all(format!("unrecognized option '{}'\n", badoption).as_bytes());
             }
         }
-        let _ = writeln!(
-            self.stderr,
+        let _ = self.stderr.write_all(format!(
             "usage: {} [options] [script [args]]\n\
              Available options are:\n\
                -e stat   execute string 'stat'\n\
@@ -624,7 +657,7 @@ impl Interpreter {
                --        stop handling options\n\
                -         stop handling options and execute stdin\n",
             LUA_PROGNAME
-        );
+        ).as_bytes());
     }
 
     pub fn pmain(&mut self, argv: &[String]) -> bool {
@@ -733,6 +766,8 @@ fn reset_signal_handler() {
 /// CLI 入口点
 pub fn main() {
     // 调试: 输出关键类型大小（用 LUA_DEBUG_SIZES 环境变量控制）
+    // size_optimized 模式下跳过: eprintln! 的 format! 会引入 core::fmt 代码
+    #[cfg(not(size_optimized))]
     if std::env::var("LUA_DEBUG_SIZES").is_ok() {
         eprintln!("TValue: {}", std::mem::size_of::<crate::objects::TValue>());
         eprintln!("Table: {}", std::mem::size_of::<crate::objects::Table>());

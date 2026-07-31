@@ -4,3 +4,57 @@ This is Lua 5.5.0, released on 15 Dec 2025.
 For installation instructions, license details, and
 further information about Lua, see doc/readme.html.
 
+============================================================================
+lua-rs — Rust 实现的 Lua 5.5.0
+============================================================================
+
+本项目是 Lua 5.5.0 的 Rust 实现 (`lua-rs`)，目标是替代 `src/` 下的 C/C++ 官方实现。
+Rust 实现自给自足，通过 `capi.rs` 以 `#[no_mangle] extern "C"` 形式导出 C ABI，
+使第三方 Lua C 模块 (`.so`) 能够直接链接调用。
+
+构建:
+    cargo build --release                    # 默认 release 构建 (~1.83MB)
+    bash tools/build_size_opt.sh             # 体积优先构建 (~609KB, 需 nightly)
+
+测试:
+    bash tools/verify.sh                     # 编译器比对 + cargo test + Lua 测试套件
+    bash deps/test.sh                        # 第三方 C 模块兼容性测试 (cjson/lsqlite3/luasocket)
+
+----------------------------------------------------------------------------
+Feature: lua_longjmp — C 函数错误处理机制开关
+----------------------------------------------------------------------------
+
+对应 C 官方实现的 `LUA_USE_LONGJMP` 宏 (见 src/ldo.c)。
+控制 `lua_error` / `lua_callk` 等需要跨 C 栈抛错的 C API 错误处理机制:
+
+  默认 (未启用):
+    用 `catch_unwind` 捕获 panic (`lua_error` → `panic!` → `catch_unwind`),
+    类似 C++ 异常机制。C 模块 `.so` 需用 `-fexceptions` 编译以生成 unwind 表。
+
+  --features lua_longjmp:
+    用 `setjmp` / `longjmp` 替代 `catch_unwind` (对应 C 的 `LUAI_THROW`)。
+    `capi_variadic.c` 中的 `lua_rs_pcall_c` / `lua_rs_longjmp` 提供 C 包装函数。
+
+启用条件 (任一即可):
+  1. 显式启用 feature:
+        cargo build --features lua_longjmp
+        cargo build --release --features lua_longjmp
+
+  2. size_optimized 模式自动启用 (panic=abort 下 catch_unwind 不工作):
+        bash tools/build_size_opt.sh         # 自动启用, 无需手动指定
+
+何时不启用 lua_longjmp (用默认 catch_unwind):
+  - 需要 Rust panic 跨 C 帧展开的场景 (如 sol2 C++ 异常交互)
+  - 需要捕获非 `lua_error` 触发的 panic 并 re-panic 的场景
+
+何时启用 lua_longjmp:
+  - panic=abort 模式 (size_optimized) — 必须启用, 否则 catch_unwind 不工作
+  - 希望避免 Rust unwind 开销, 用更轻量的 setjmp/longjmp
+  - C 模块用 `-fno-exceptions` 编译 (无 unwind 表)
+
+实现细节:
+  - `build.rs` 检测 feature 或 size_optimized, 设置 `cfg(lua_use_longjmp)`
+    并向 `capi_variadic.c` 传入 `-DLUA_USE_LONGJMP` 编译 longjmp 包装函数
+  - `state.rs` / `execute.rs` / `capi.rs` 用 `#[cfg(lua_use_longjmp)]` 切换
+    catch_unwind 与 setjmp/longjmp 两条错误处理路径
+  - `error_jmp_bufs` 字段始终存在 (空 Vec 开销极小), 仅 longjmp 模式使用

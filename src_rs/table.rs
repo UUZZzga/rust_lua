@@ -58,7 +58,7 @@ impl Table {
                 array: (0..narray).map(|_| TValue::Nil(NilKind::Empty)).collect(),
                 hash_buckets: Vec::with_capacity(nhash),
                 key_to_bucket: if nhash > 0 {
-                    Some(Box::new(hashbrown::HashMap::with_capacity_and_hasher(
+                    Some(Box::new(crate::objects::TableHashMap::with_capacity_and_hasher(
                         nhash,
                         crate::objects::FxBuildHasher::default(),
                     )))
@@ -284,7 +284,7 @@ impl Table {
         let ktb = data
             .key_to_bucket
             .get_or_insert_with(|| {
-                Box::new(hashbrown::HashMap::with_hasher(
+                Box::new(crate::objects::TableHashMap::with_hasher(
                     crate::objects::FxBuildHasher::default(),
                 ))
             });
@@ -378,7 +378,7 @@ impl Table {
     /// - 存在：进入指数增长 + 二分查找
     /// 使用 key_to_bucket 代替原 hash HashMap 做 O(1) 存在性检查。
     fn hash_boundary_impl_key_to_bucket(
-        key_to_bucket: &hashbrown::HashMap<TValue, usize, crate::objects::FxBuildHasher>,
+        key_to_bucket: &crate::objects::TableHashMap<usize>,
         asize: i64,
         seed: u32,
     ) -> i64 {
@@ -512,7 +512,7 @@ impl Table {
                         data.hash_buckets.push((k.clone(), v));
                         data.key_to_bucket
                             .get_or_insert_with(|| {
-                                Box::new(hashbrown::HashMap::with_hasher(
+                                Box::new(crate::objects::TableHashMap::with_hasher(
                                     crate::objects::FxBuildHasher::default(),
                                 ))
                             })
@@ -524,7 +524,7 @@ impl Table {
                     data.hash_buckets.push((k.clone(), v));
                     data.key_to_bucket
                         .get_or_insert_with(|| {
-                            Box::new(hashbrown::HashMap::with_hasher(
+                            Box::new(crate::objects::TableHashMap::with_hasher(
                                 crate::objects::FxBuildHasher::default(),
                             ))
                         })

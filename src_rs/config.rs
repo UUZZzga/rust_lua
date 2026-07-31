@@ -195,37 +195,37 @@ pub const N2S_BUFF_SIZE: usize = 64;
 // 辅助函数
 // ============================================================================
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn upvalue_index(i: i32) -> i32 {
     REGISTRY_INDEX - i
 }
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn is_pow2(x: usize) -> bool {
     x & (x.wrapping_sub(1)) == 0
 }
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub const fn num_bits<T>() -> usize {
     std::mem::size_of::<T>() * 8
 }
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn integer_to_str(n: LuaInteger) -> String {
     n.to_string()
 }
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn unsigned_to_str(n: LuaUnsigned) -> String {
     n.to_string()
 }
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn pointer_to_str(ptr: *const u8) -> String {
     format!("{:p}", ptr)
 }
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn number_to_integer(n: LuaNumber) -> Option<LuaInteger> {
     if n >= (MIN_INTEGER as LuaNumber) && n < (-(MIN_INTEGER as LuaNumber)) {
         let i = n as LuaInteger;
@@ -239,12 +239,12 @@ pub fn number_to_integer(n: LuaNumber) -> Option<LuaInteger> {
     }
 }
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn floor_div(a: LuaNumber, b: LuaNumber) -> LuaNumber {
     (a / b).floor()
 }
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn float_mod(a: LuaNumber, b: LuaNumber) -> LuaNumber {
     let m = a % b;
     if (m > 0.0) == (b < 0.0) && m != 0.0 {
@@ -254,7 +254,7 @@ pub fn float_mod(a: LuaNumber, b: LuaNumber) -> LuaNumber {
     }
 }
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn float_pow(a: LuaNumber, b: LuaNumber) -> LuaNumber {
     if b == 2.0 {
         a * a
@@ -263,7 +263,7 @@ pub fn float_pow(a: LuaNumber, b: LuaNumber) -> LuaNumber {
     }
 }
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn num_is_nan(n: LuaNumber) -> bool {
     n.is_nan()
 }
@@ -284,7 +284,7 @@ pub unsafe fn cstr_to_str<'a>(ptr: *const c_char) -> &'a str {
 // sz → LuaInteger 安全转换（对 Lua 内部已知不超 MAX_SIZE 的 size_t）
 // ============================================================================
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn size_to_integer(sz: usize) -> LuaInteger {
     sz as LuaInteger
 }

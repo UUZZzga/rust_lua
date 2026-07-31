@@ -100,7 +100,7 @@ pub type Instruction = u32;
 pub const NUM_OPCODES: usize = 85;
 
 impl OpCode {
-    #[inline]
+    #[cfg_attr(not(size_optimized), inline)]
     pub fn from_u8(v: u8) -> Option<OpCode> {
         if (v as usize) < NUM_OPCODES {
             Some(unsafe { std::mem::transmute::<u8, OpCode>(v) })
@@ -159,19 +159,19 @@ pub const MAXARG_Ax: u32 = (1u32 << SIZE_Ax) - 1;
 // 位操作
 // ============================================================================
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub const fn mask1(n: u32, p: u32) -> u32 {
     (!((!0u32) << n)) << p
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub const fn mask0(n: u32, p: u32) -> u32 {
     !mask1(n, p)
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub const fn getarg(i: u32, pos: u32, size: u32) -> i32 {
     ((i >> pos) & mask1(size, 0)) as i32
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn setarg(i: &mut u32, v: i32, pos: u32, size: u32) {
     *i = (*i & mask0(size, pos)) | (((v as u32) << pos) & mask1(size, pos));
 }
@@ -180,59 +180,64 @@ pub fn setarg(i: &mut u32, v: i32, pos: u32, size: u32) {
 // 指令编解码
 // ============================================================================
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn get_opcode(i: Instruction) -> OpCode {
-    OpCode::from_u8(((i >> POS_OP) & mask1(SIZE_OP, 0)) as u8).unwrap_or(OpCode::MOVE)
+    // perf: 直接 transmute 跳过 Option/unwrap_or 开销 (get_opcode 占 5.84% + unwrap_or 占 2.68% = 8.52%)
+    // 编译器保证字节码中的 opcode 总是有效 (0..NUM_OPCODES-1), 无需运行时检查。
+    // debug 模式下保留断言捕获损坏的字节码。
+    let v = ((i >> POS_OP) & mask1(SIZE_OP, 0)) as u8;
+    debug_assert!((v as usize) < NUM_OPCODES, "invalid opcode: {}", v);
+    unsafe { std::mem::transmute::<u8, OpCode>(v) }
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn getarg_a(i: Instruction) -> i32 {
     getarg(i, POS_A, SIZE_A)
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn getarg_ax(i: Instruction) -> i32 {
     getarg(i, POS_A, SIZE_Ax)
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn getarg_b(i: Instruction) -> i32 {
     getarg(i, POS_B, SIZE_B)
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn getarg_vb(i: Instruction) -> i32 {
     getarg(i, POS_VB, SIZE_VB)
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn getarg_vc(i: Instruction) -> i32 {
     getarg(i, POS_VC, SIZE_VC)
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn getarg_c(i: Instruction) -> i32 {
     getarg(i, POS_C, SIZE_C)
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn testarg_k(i: Instruction) -> bool {
     (i & (1u32 << POS_K)) != 0
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn getarg_bx(i: Instruction) -> i32 {
     getarg(i, POS_BX, SIZE_BX)
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn SET_OPCODE(i: &mut Instruction, o: OpCode) {
     *i = (*i & mask0(SIZE_OP, POS_OP)) | ((o as u32) << POS_OP);
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn SETARG_k(i: &mut Instruction, v: u32) {
     setarg(i, v as i32, POS_K, 1);
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn SETARG_C(i: &mut Instruction, v: i32) {
     setarg(i, v, POS_C, SIZE_C);
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn getarg_sbx(i: Instruction) -> i32 {
     getarg(i, POS_BX, SIZE_BX) - OFFSET_SBX
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn getarg_sj(i: Instruction) -> i32 {
     let v = getarg(i, POS_SJ, SIZE_BX + SIZE_A);
     v - ((((1i64 << (SIZE_BX + SIZE_A)) - 1) >> 1) as i32)
@@ -240,11 +245,11 @@ pub fn getarg_sj(i: Instruction) -> i32 {
 
 pub const OFFSET_SC: i32 = (((1 << SIZE_C) - 1) >> 1) as i32;
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn getarg_sc(i: Instruction) -> i32 {
     getarg_c(i) - OFFSET_SC
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn getarg_sb(i: Instruction) -> i32 {
     getarg_b(i) - OFFSET_SC
 }
@@ -349,13 +354,13 @@ pub fn opmodes() -> &'static [u8] {
     &OP_MODES
 }
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn get_opmode(op: OpCode) -> OpMode {
     let raw = OP_MODES[op as usize] & 7;
     unsafe { std::mem::transmute::<u8, OpMode>(raw) }
 }
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn is_ot(i: Instruction) -> bool {
     let op = get_opcode(i);
     match op {
@@ -364,7 +369,7 @@ pub fn is_ot(i: Instruction) -> bool {
     }
 }
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn is_it(i: Instruction) -> bool {
     let op = get_opcode(i);
     match op {
@@ -373,23 +378,23 @@ pub fn is_it(i: Instruction) -> bool {
     }
 }
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn test_a_mode(op: OpCode) -> bool {
     OP_MODES[op as usize] & (1 << 3) != 0
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn test_t_mode(op: OpCode) -> bool {
     OP_MODES[op as usize] & (1 << 4) != 0
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn test_it_mode(op: OpCode) -> bool {
     OP_MODES[op as usize] & (1 << 5) != 0
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn test_ot_mode(op: OpCode) -> bool {
     OP_MODES[op as usize] & (1 << 6) != 0
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn test_mm_mode(op: OpCode) -> bool {
     OP_MODES[op as usize] & (1 << 7) != 0
 }
@@ -398,7 +403,7 @@ pub fn test_mm_mode(op: OpCode) -> bool {
 // 指令创建
 // ============================================================================
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn create_abck(o: OpCode, a: i32, b: i32, c: i32, k: i32) -> Instruction {
     ((o as u32) << POS_OP)
         | ((a as u32) << POS_A)
@@ -407,7 +412,7 @@ pub fn create_abck(o: OpCode, a: i32, b: i32, c: i32, k: i32) -> Instruction {
         | ((k as u32) << POS_K)
 }
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn create_vabck(o: OpCode, a: i32, b: i32, c: i32, k: i32) -> Instruction {
     ((o as u32) << POS_OP)
         | ((a as u32) << POS_A)

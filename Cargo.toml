@@ -45,14 +45,41 @@ ffi = []
 # 默认关闭: StringTable/StringCache 使用 std::cell::RefCell (零开销,单线程)
 # 启用时改用 parking_lot::RwLock (多线程安全,有原子操作开销)
 threaded = ["parking_lot"]
+# 强制使用 setjmp/longjmp 实现 C 函数错误处理 (对应 C 的 LUA_USE_LONGJMP 宏)。
+# 默认 (非启用): 用 catch_unwind 捕获 panic (lua_error → panic), 类似 C++ 异常机制。
+# 启用 lua_longjmp: 用 setjmp/longjmp 替代 catch_unwind。
+#   - panic=abort 模式下 catch_unwind 不工作, 必须启用 (size_optimized 自动启用)
+#   - 也可独立启用: cargo build --features lua_longjmp
+# 注意: size_optimized 模式 (OPT_LEVEL=s/z) 自动启用此 feature, 无需手动指定。
+lua_longjmp = []
+# 体积优先模式: 通过 [profile.size-opt] 实现 (opt-level="z" + panic="abort"),
+# build.rs 检测 OPT_LEVEL=s/z 自动设置 cfg(size_optimized) 切换代码层面优化:
+#   - hashbrown::HashMap/HashTable → std::collections::HashMap (减小二进制体积)
+#   - 自定义 FxHash → std 默认 SipHash (消除特化方法代码)
+#   - 浮点格式化/解析用 libc snprintf/strtod 替代 Rust flt2dec/dec2flt (~34KB)
+#   - f64_to_string 两阶段格式化匹配 C Lua 5.5 (先 %.15g, 不往返再用 %.17g)
+#   - main.rs 不使用 std::thread::Builder, 减少线程 panic 处理代码
+#   - C 代码用 -fno-exceptions -fno-unwind-tables 禁用异常 unwind 表
+#   - 用 ASCII 版本替代 Unicode 函数 (to_ascii_uppercase/lowercase) 移除 Unicode 表 (~14KB)
+#   - 所有 #[inline] / #[inline(always)] 改为 #[cfg_attr(not(size_optimized), inline)]
+#   - linker 添加 --no-eh-frame-hdr + --icf=all + -z,norelro
+# 用法 (推荐): bash tools/build_size_opt.sh
+#   自动检测 nightly 工具链:
+#     - 有 nightly: panic=immediate-abort + build-std, 移除 backtrace 代码 (~150KB)
+#     - 无 nightly: panic=abort (stable 兼容)
+#   自动执行 cargo build + objcopy --strip-all + 移除 .eh_frame 等无用段
+# 用法 (手动, stable): cargo build --profile size-opt
+#   需手动执行: objcopy --strip-all --remove-section=.eh_frame ... target/size-opt/lua
+# 最终体积: ~635KB (nightly) / ~968KB (stable) / ~1.87MB (release)
 
 [dependencies]
 libc = "0.2"
-arc-swap = "1"
 hashbrown = "0.15"
 bitflags = "2"
-imara-diff = "0.2"
 parking_lot = { version = "0.12", optional = true }
+
+[dev-dependencies]
+imara-diff = "0.2"
 
 [build-dependencies]
 cc = "1.0"
@@ -71,3 +98,23 @@ overflow-checks = false
 inherits = "release"
 debug = "line-tables-only"
 strip = "none"
+
+# 体积优先 profile (对应 GCC -Oz): 在 release 基础上切换为体积优化。
+# 用法: bash tools/build_size_opt.sh (推荐, 自动 strip)
+#    或 cargo build --profile size-opt (手动, 需自行 strip .eh_frame)
+#   - opt-level = "z": 优化体积 (对应 GCC -Oz, 比 -Os 更激进), 禁用会增大代码体积的优化
+#   - panic = "abort": 移除 panic unwind 表, 减小二进制体积
+#     (代价: panic 时不 unwind 栈, 直接终止; 对体积优先场景可接受)
+#   - lto/codegen-units/strip 继承 release (fat LTO + 单 codegen unit + strip symbols)
+[profile.size-opt]
+inherits = "release"
+opt-level = "z"
+panic = "abort"
+
+# 临时分析 profile: 保留符号用于分析大函数
+[profile.size-opt-analysis]
+inherits = "size-opt"
+strip = "none"
+
+# Nightly 专用 profile (panic=immediate-abort) 由 build_size_opt.sh 动态注入,
+# 避免 cargo-features = ["panic-immediate-abort"] 破坏 stable 兼容性。

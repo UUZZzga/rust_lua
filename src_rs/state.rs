@@ -19,6 +19,38 @@ use std::rc::Rc;
 /// 因为 key 是 usize（对象 ID/指针），用 SipHash 是浪费（perf 显示占 ~4%）。
 type GcHashSet = HashSet<usize, FxBuildHasher>;
 
+// 体积优先: 包装 Stdout/Stderr, 覆盖 write_fmt 方法
+// 避免 default_write_fmt → Error::new → StringError → Unicode grapheme/whitespace 表 (~4KB)
+// Box<dyn Write> 的 vtable 会引用 write_fmt, 即使不调用也会被链接器保留
+#[cfg(size_optimized)]
+pub struct LuaStdout(pub std::io::Stdout);
+
+#[cfg(size_optimized)]
+impl Write for LuaStdout {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.0.write(buf) }
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> { self.0.write_all(buf) }
+    fn flush(&mut self) -> std::io::Result<()> { self.0.flush() }
+    // 覆盖 write_fmt: no-op (代码中仅使用 write_all + flush)
+    fn write_fmt(&mut self, _: std::fmt::Arguments<'_>) -> std::io::Result<()> { Ok(()) }
+}
+
+#[cfg(size_optimized)]
+pub struct LuaStderr(pub std::io::Stderr);
+
+#[cfg(size_optimized)]
+impl Write for LuaStderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> { self.0.write(buf) }
+    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> { self.0.write_all(buf) }
+    fn flush(&mut self) -> std::io::Result<()> { self.0.flush() }
+    fn write_fmt(&mut self, _: std::fmt::Arguments<'_>) -> std::io::Result<()> { Ok(()) }
+}
+
+#[cfg(size_optimized)]
+pub fn lua_stdout() -> Box<dyn Write> { Box::new(LuaStdout(std::io::stdout())) }
+
+#[cfg(not(size_optimized))]
+pub fn lua_stdout() -> Box<dyn Write> { Box::new(std::io::stdout()) }
+
 /// GC worklist 的原始值项 — TValue 的字节拷贝，不做引用计数。
 /// GC 期间所有对象有效（sweep 在 mark 完成后），所以 push/pop 无需 incq/decq。
 /// 消除 worklist 的 TValue clone (3.11%) + drop_glue (4.26%) 开销。
@@ -26,13 +58,13 @@ type GcHashSet = HashSet<usize, FxBuildHasher>;
 type RawTValue = std::mem::MaybeUninit<TValue>;
 
 /// 从 &TValue 拷贝原始字节到 RawTValue（不 incq Rc）
-#[inline(always)]
+#[cfg_attr(not(size_optimized), inline(always))]
 unsafe fn raw_from_tvalue(val: &TValue) -> RawTValue {
     std::mem::MaybeUninit::new(std::ptr::read(val as *const TValue))
 }
 
 /// 将 RawTValue 重建为 &TValue 引用
-#[inline(always)]
+#[cfg_attr(not(size_optimized), inline(always))]
 unsafe fn raw_as_tvalue(raw: &RawTValue) -> &TValue {
     raw.assume_init_ref()
 }
@@ -100,7 +132,7 @@ pub struct PcallProtection {
     pub saved_is_vararg: bool,
     pub saved_proto_flag: u8,
     pub saved_nextraargs: i32,
-    pub saved_closure_upvals: Vec<UpValRef>,
+    pub saved_closure_upvals: Rc<RefCell<Vec<UpValRef>>>,
     pub saved_tbc_list: Option<usize>,
     /// pcall 的 func 位置（栈索引）— 用于截断栈和放置返回值
     pub func_idx: usize,
@@ -177,7 +209,7 @@ pub struct LuaState {
     pub proto_flag: u8,
     /// PF_VAHID 模式下隐藏变参的数量（对应 C 的 ci->u.l.nextraargs）
     pub nextraargs: i32,
-    pub closure_upvals: Vec<UpValRef>,
+    pub closure_upvals: Rc<RefCell<Vec<UpValRef>>>,
     /// 全局 open upvalue 存储 — 不随函数调用/返回保存/恢复（对应 C 的 L->openupval 链表节点存储）
     /// open_upval 链表索引此 vec，tbc_list 也索引此 vec
     pub open_upvals: Vec<UpValRef>,
@@ -364,32 +396,152 @@ pub struct LuaState {
     /// lua_resumeX 通过 lua_getallocf 取回 snlua 指针调用 switchL。
     /// 不归 GC 管理（外部 C 代码所有），Rust 仅持有裸指针。
     pub allocf_ud: *mut std::ffi::c_void,
+
+    /// setjmp/longjmp 缓冲区栈 — 用于 lua_use_longjmp 模式下
+    /// C 函数错误处理，替代 catch_unwind。
+    /// 每个元素指向调用方栈上的 [u8; 512] 缓冲区 (>= sizeof(jmp_buf))。
+    /// 仅在 lua_use_longjmp 模式下使用 (size_optimized 自动启用, 或 --features lua_longjmp)。
+    pub error_jmp_bufs: Vec<*mut u8>,
+}
+
+/// C 辅助函数: setjmp/longjmp 包装 (capi_variadic.c)
+/// 用于 lua_use_longjmp 模式下替代 catch_unwind (对应 C 的 LUA_USE_LONGJMP)。
+/// 启用条件: size_optimized (panic=abort) 或显式 --features lua_longjmp。
+#[cfg(lua_use_longjmp)]
+extern "C" {
+    pub(crate) fn lua_rs_pcall_c(
+        f: Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> i32>,
+        L: *mut std::ffi::c_void,
+        buf: *mut std::ffi::c_void,
+    ) -> i32;
+    pub(crate) fn lua_rs_longjmp(buf: *mut std::ffi::c_void) -> !;
 }
 
 /// 调用栈条目 — 用于堆栈回溯和 debug.getinfo
 #[derive(Debug, Clone)]
 pub struct CallInfoEntry {
-    /// 调用者的 Proto（用于 traceback 时实时计算 source/line/name）
-    /// C 函数帧和 hook 帧可能为 None
-    pub caller_proto: Option<Rc<Proto>>,
     pub is_c: bool,
     /// Lua 函数引用（C 函数为 None）
     pub closure: Option<Rc<crate::objects::LClosure>>,
     /// 栈帧基址（对应 C 的 ci->func + 1）
+    /// Lua 函数帧: caller's base (state.base before op_call updates it)
+    /// C 函数帧: callee's base (func_idx + 1)
+    /// perf: 用于从 state.stack[base - 1] 延迟计算 caller_proto, 避免 op_call 中 Rc::clone
     pub base: usize,
     /// 调用时的 PC（用于计算 currentline）
     pub saved_pc: usize,
-    /// 函数名（C 函数帧/hook/metamethod 预设置；Lua 函数帧默认空，traceback 时实时计算）
-    pub name: String,
+    /// 函数名（C 函数帧/hook/metamethod 预设置；Lua 函数帧默认 None，traceback 时实时计算）
+    /// perf: 用 Option<&'static str> 替代 String, 避免 op_call 热路径中 String::new 的 24 字节开销
+    pub name: Option<&'static str>,
     /// 函数名类型: "local", "global", "method", "field", "hook", "metamethod", ""
     /// （C 函数帧/hook/metamethod 预设置；Lua 函数帧默认空，traceback 时实时计算）
-    pub namewhat: String,
+    /// perf: 用 &'static str 替代 String, 所有值均为静态字符串
+    pub namewhat: &'static str,
     /// 调用者的 proto_flag（PF_VAHID / PF_VATAB）— 用于 debug.getlocal level > 1
     pub proto_flag: u8,
     /// 调用者的 nextraargs — 用于 debug.getlocal level > 1 的 vararg 访问
     pub nextraargs: i32,
     /// 是否为尾调用（对应 C 的 CIST_TAIL）— debug.getinfo(1).istailcall
     pub is_tailcall: bool,
+}
+
+/// 从栈切片延迟计算 closure 引用 — 核心逻辑
+///
+/// 对于 Lua 函数帧: closure = stack[entry.base - 1] (若为 LClosure)
+/// 对于 C 函数帧: 返回 None
+/// 对于 base=0 或 stack 越界: 返回 None
+///
+/// perf: 替代 CallInfoEntry.closure 字段, 避免 op_call 中 Rc::clone
+pub fn get_closure_from_stack<'a>(
+    stack: &'a [TValue],
+    entry: &CallInfoEntry,
+) -> Option<&'a Rc<LClosure>> {
+    if entry.is_c {
+        return None;
+    }
+    if entry.base > 0 && entry.base <= stack.len() {
+        if let TValue::LClosure(c) = &stack[entry.base - 1] {
+            return Some(c);
+        }
+    }
+    None
+}
+
+/// 从 CallInfoEntry 延迟计算 closure 引用 — 避免 op_call 热路径中 Rc::clone
+///
+/// 优先返回 entry.closure (若已设置, 如 hook/metamethod 路径);
+/// 否则从 state.stack[entry.base - 1] 延迟计算 (op_call 快速路径)
+pub fn get_closure_for_ci<'a>(
+    state: &'a LuaState,
+    ci_idx: usize,
+) -> Option<&'a Rc<LClosure>> {
+    let entry = &state.call_info[ci_idx];
+    if entry.closure.is_some() {
+        return entry.closure.as_ref();
+    }
+    get_closure_from_stack(&state.stack, entry)
+}
+
+/// 从栈切片延迟计算 caller_proto 引用 — 核心逻辑
+///
+/// 对于 Lua 函数帧: caller_proto = stack[entry.base - 1].proto (若为 LClosure)
+/// 对于 C 函数帧: 返回 None
+/// 对于 base=0 或 stack 越界: 返回 None
+pub fn get_caller_proto_from_stack<'a>(
+    stack: &'a [TValue],
+    entry: &CallInfoEntry,
+) -> Option<&'a Rc<Proto>> {
+    if entry.is_c {
+        return None;
+    }
+    if entry.base > 0 && entry.base <= stack.len() {
+        if let TValue::LClosure(c) = &stack[entry.base - 1] {
+            return Some(&c.proto);
+        }
+    }
+    None
+}
+
+/// 从 CallInfoEntry 延迟计算 caller_proto 引用 — 避免在 op_call 热路径中 Rc::clone
+///
+/// 对于 Lua 函数帧: caller_proto = state.stack[entry.base - 1].proto (若为 LClosure)
+/// 对于 C 函数帧: 返回 None (由 get_caller_proto_for_ci 处理 C 帧的特殊路径)
+/// 对于 base=0 或 stack 越界: 返回 None
+///
+/// perf: op_call 中移除 1 次 Rc::clone (atomic inc) + CallInfoEntry drop 时 1 次 Rc dec
+pub fn get_caller_proto_ref<'a>(
+    state: &'a LuaState,
+    entry: &CallInfoEntry,
+) -> Option<&'a Rc<Proto>> {
+    get_caller_proto_from_stack(&state.stack, entry)
+}
+
+/// 从 call_info 索引延迟计算 caller_proto 引用 (用于 lua_getinfo / traceback)
+///
+/// 对于 Lua 函数帧: 从 state.stack[entry.base - 1] 获取 (同 get_caller_proto_ref)
+/// 对于 C 函数帧 (无预设置 name, 即 call_c_function 外部 C 函数):
+///   从前一个 call_info 条目的 closure 获取 (对应原 call_c_function 的计算逻辑)
+/// 对于 C 函数帧 (有预设置 name, 如 BuiltinFn/RustClosure): 返回 None
+///
+/// perf: 替代 CallInfoEntry.caller_proto 字段, 避免 op_call/call_c_function 中 Rc::clone
+pub fn get_caller_proto_for_ci<'a>(
+    state: &'a LuaState,
+    ci_idx: usize,
+) -> Option<&'a Rc<Proto>> {
+    let entry = &state.call_info[ci_idx];
+    if !entry.is_c {
+        return get_caller_proto_ref(state, entry);
+    }
+    // C frame: 仅 call_c_function (name=None) 需要 caller_proto 用于 lua_getinfo('n')
+    if entry.name.is_some() {
+        return None;
+    }
+    if ci_idx > 0 {
+        if let Some(c) = get_closure_for_ci(state, ci_idx - 1) {
+            return Some(&c.proto);
+        }
+    }
+    None
 }
 
 fn G(l: &LuaState) -> &GlobalState {
@@ -444,7 +596,7 @@ impl LuaState {
             is_vararg: false,
             proto_flag: 0,
             nextraargs: 0,
-            closure_upvals: Vec::new(),
+            closure_upvals: Rc::new(RefCell::new(Vec::new())),
             open_upvals: Vec::new(),
             open_upval: None,
             tbc_list: None,
@@ -460,7 +612,7 @@ impl LuaState {
             n_ccalls: 0,
             n_ny_calls: 0,
             dmt: DefaultMetatables::new(),
-            stdout: Box::new(std::io::stdout()),
+            stdout: lua_stdout(),
             io_output: None,
             file_handles: std::collections::HashMap::new(),
             popen_handles: std::collections::HashSet::new(),
@@ -519,6 +671,7 @@ impl LuaState {
             last_gc_estimate: 0,
             c_safety_keepalive: Vec::new(),
             allocf_ud: std::ptr::null_mut(),
+            error_jmp_bufs: Vec::new(),
         }
     }
 
@@ -646,7 +799,7 @@ impl LuaState {
             is_vararg: false,
             proto_flag: 0,
             nextraargs: 0,
-            closure_upvals: Vec::new(),
+            closure_upvals: Rc::new(RefCell::new(Vec::new())),
             open_upvals: Vec::new(),
             open_upval: None,
             tbc_list: None,
@@ -662,7 +815,7 @@ impl LuaState {
             n_ccalls: 0,
             n_ny_calls: 0,
             dmt: DefaultMetatables::new(),
-            stdout: Box::new(std::io::stdout()),
+            stdout: lua_stdout(),
             io_output: None,
             file_handles: std::collections::HashMap::new(),
             popen_handles: std::collections::HashSet::new(),
@@ -721,6 +874,7 @@ impl LuaState {
             last_gc_estimate: 0,
             c_safety_keepalive: Vec::new(),
             allocf_ud: std::ptr::null_mut(),
+            error_jmp_bufs: Vec::new(),
         };
         state
     }
@@ -785,7 +939,7 @@ impl LuaState {
             is_vararg: false,
             proto_flag: 0,
             nextraargs: 0,
-            closure_upvals: Vec::new(),
+            closure_upvals: Rc::new(RefCell::new(Vec::new())),
             open_upvals: Vec::new(),
             open_upval: None,
             tbc_list: None,
@@ -795,7 +949,7 @@ impl LuaState {
             api_func_base: 0,
             n_ccalls: 0,
             n_ny_calls: 0,
-            stdout: Box::new(std::io::stdout()),
+            stdout: lua_stdout(),
             io_output: None,
             ci: None,
             call_info: Vec::new(),
@@ -832,6 +986,7 @@ impl LuaState {
             cached_gc_key: std::cell::RefCell::new(None),
             last_gc_estimate: 0,
             c_safety_keepalive: Vec::new(),
+            error_jmp_bufs: Vec::new(),
         }
     }
 
@@ -852,7 +1007,7 @@ impl LuaState {
         self.is_vararg = proto.is_vararg();
         self.proto_flag = proto.flag;
         self.nextraargs = 0;
-        self.closure_upvals = Vec::new();
+        self.closure_upvals = Rc::new(RefCell::new(Vec::new()));
         self.tbc_list = None;
         self.open_upval = None;
 
@@ -908,7 +1063,7 @@ impl LuaState {
             is_vararg: proto.is_vararg(),
             proto_flag: proto.flag,
             nextraargs: 0,
-            closure_upvals: Vec::new(),
+            closure_upvals: Rc::new(RefCell::new(Vec::new())),
             open_upvals: Vec::new(),
             open_upval: None,
             tbc_list: None,
@@ -924,7 +1079,7 @@ impl LuaState {
             n_ccalls: 0,
             n_ny_calls: 0,
             dmt: DefaultMetatables::new(),
-            stdout: Box::new(std::io::stdout()),
+            stdout: lua_stdout(),
             io_output: None,
             file_handles: std::collections::HashMap::new(),
             popen_handles: std::collections::HashSet::new(),
@@ -983,6 +1138,7 @@ impl LuaState {
             last_gc_estimate: 0,
             c_safety_keepalive: Vec::new(),
             allocf_ud: std::ptr::null_mut(),
+            error_jmp_bufs: Vec::new(),
         }
     }
 }
@@ -1015,6 +1171,7 @@ impl LuaState {
                 let n = results.len();
                 self.stack.extend(results);
                 self.pending_return_adjust = Some((a, nresults, n, first_result_pos));
+                self.top = self.stack.len();
                 return;
             }
         }
@@ -1036,6 +1193,9 @@ impl LuaState {
                 self.stack.push(TValue::Nil(NilKind::Strict));
             }
         }
+        // 关键: 更新 state.top — 后续 MULTRET CALL (b=0) 用 state.top 计算 nargs,
+        // 若不更新, state.top 保留 CALL 设置的 a+b (过大), 导致 nargs 计算错误
+        self.top = self.stack.len();
     }
 
     /// 与 adjust_results 类似，但结果已在栈上 [first_result_pos..first_result_pos+n_actual)。
@@ -1090,6 +1250,7 @@ impl LuaState {
             a + nr
         };
         self.stack.truncate(new_len);
+        self.top = self.stack.len();
     }
 
     /// 执行待定的返回值调整 — 由 op_call 在 return hook 后调用
@@ -1121,6 +1282,7 @@ impl LuaState {
                 a + nr
             };
             self.stack.truncate(new_len);
+            self.top = self.stack.len();
         }
     }
 }
@@ -1134,26 +1296,7 @@ pub fn str_to_ls(table: &StringTable, s: &str) -> LuaString {
 }
 
 fn format_float(f: f64) -> String {
-    if f.is_nan() {
-        return "nan".to_string();
-    }
-    if f.is_infinite() {
-        return if f > 0.0 {
-            "inf".to_string()
-        } else {
-            "-inf".to_string()
-        };
-    }
-    if f == 0.0 {
-        return "0.0".to_string();
-    }
-    let s = format!("{:.15}", f);
-    let s = s.trim_end_matches('0');
-    if s.ends_with('.') {
-        format!("{}0", s)
-    } else {
-        s.to_string()
-    }
+    crate::float_utils::f64_to_string(f)
 }
 
 // ============================================================================
@@ -1339,7 +1482,7 @@ impl LuaState {
         match self.obj_at(idx) {
             Some(TValue::Integer(i)) => Some(*i as f64),
             Some(TValue::Float(f)) => Some(*f),
-            Some(TValue::Str(s)) => s.as_str().parse::<f64>().ok(),
+            Some(TValue::Str(s)) => crate::float_utils::f64_from_str(s.as_str()),
             _ => None,
         }
     }
@@ -1661,7 +1804,7 @@ impl LuaState {
             // warnfon: 输出前缀 + 消息
             let stderr = std::io::stderr();
             let mut h = stderr.lock();
-            let _ = write!(h, "Lua warning: ");
+            let _ = h.write_all(b"Lua warning: ");
             let _ = h.write_all(msg.as_bytes());
             if tocont {
                 self.warn_pending = true;
@@ -1721,7 +1864,7 @@ impl LuaState {
             result.push_str("\n\t[C]: in ?");
         } else {
             for entry in &self.call_info {
-                let (src, line, name, _) = crate::execute::compute_caller_info(entry);
+                let (src, line, name, _) = crate::execute::compute_caller_info(&self.stack, entry);
                 result.push('\n');
                 result.push('\t');
                 if entry.is_c {
@@ -2022,7 +2165,7 @@ impl LuaState {
                 let saved_is_vararg = self.is_vararg;
                 let saved_proto_flag = self.proto_flag;
                 let saved_nextraargs = self.nextraargs;
-                let saved_closure_upvals = std::mem::take(&mut self.closure_upvals);
+                let saved_closure_upvals = std::mem::replace(&mut self.closure_upvals, Rc::new(RefCell::new(Vec::new())));
                 let saved_tbc_list = self.tbc_list.take();
 
                 // 推入 call_info — 对应 C 的 luaD_precall 创建新 CallInfo
@@ -2048,29 +2191,26 @@ impl LuaState {
                     e.closure
                         .as_ref()
                         .map_or(false, |c| Rc::ptr_eq(&c.proto, &proto))
+                        || get_closure_from_stack(&self.stack, e)
+                            .map_or(false, |c| Rc::ptr_eq(&c.proto, &proto))
                         || (!e.namewhat.is_empty() && !e.is_c)
                 });
                 let pushed_call_info = !already_has_entry;
                 if pushed_call_info {
-                    let (caller_proto, caller_base, caller_pc) = if caller_is_lua {
-                        if let TValue::LClosure(prev_closure) = &self.stack[self.base - 1] {
-                            (Some(Rc::clone(&prev_closure.proto)), self.base, self.pc)
-                        } else {
-                            unreachable!()
-                        }
+                    let (caller_base, caller_pc) = if caller_is_lua {
+                        (self.base, self.pc)
                     } else {
-                        // C 调用者: caller_proto=None, base=0, saved_pc=0
-                        (None, 0usize, 0usize)
+                        // C 调用者: base=0, saved_pc=0
+                        (0usize, 0usize)
                     };
                     self.call_info.push(crate::state::CallInfoEntry {
-                        caller_proto,
                         is_c: !caller_is_lua,
                         // move closure 避免 clone + Box 堆分配
                         closure: Some(closure),
                         base: caller_base,
                         saved_pc: caller_pc,
-                        name: String::new(),
-                        namewhat: String::new(),
+                        name: None,
+                        namewhat: "",
                         proto_flag: self.proto_flag,
                         nextraargs: self.nextraargs,
                         is_tailcall: false,
@@ -2092,7 +2232,7 @@ impl LuaState {
                 self.nextraargs = 0;
                 // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
                 // upvals 是 Rc<RefCell<Vec>>，这里 clone 出 Vec 供执行期使用
-                self.closure_upvals = upvals.borrow().clone();
+                self.closure_upvals = Rc::clone(&upvals);
                 self.tbc_list = None;
                 // 不清空 state.open_upval: 全局链表机制下，open_upval 不随函数调用/返回保存/恢复
                 // (对应 C 的 L->openupval 全局链表，luaD_precall 不修改它)
@@ -2141,7 +2281,7 @@ impl LuaState {
                             saved_is_vararg: false,
                             saved_proto_flag: 0,
                             saved_nextraargs: 0,
-                            saved_closure_upvals: Vec::new(),
+                            saved_closure_upvals: Rc::new(RefCell::new(Vec::new())),
                             saved_tbc_list: None,
                             func_idx: 0,
                             nresults: 0,
@@ -2244,7 +2384,7 @@ impl LuaState {
                         top.saved_is_vararg = saved_is_vararg;
                         top.saved_proto_flag = saved_proto_flag;
                         top.saved_nextraargs = saved_nextraargs;
-                        top.saved_closure_upvals = saved_closure_upvals.clone();
+                        top.saved_closure_upvals = Rc::clone(&saved_closure_upvals);
                         top.saved_tbc_list = saved_tbc_list;
                         top.func_idx = func_idx;
                         // 不覆盖 nresults: PcallProtection.nresults 保存的是
@@ -2352,7 +2492,7 @@ impl LuaState {
                         top.saved_is_vararg = saved_is_vararg;
                         top.saved_proto_flag = saved_proto_flag;
                         top.saved_nextraargs = saved_nextraargs;
-                        top.saved_closure_upvals = saved_closure_upvals.clone();
+                        top.saved_closure_upvals = Rc::clone(&saved_closure_upvals);
                         top.saved_tbc_list = saved_tbc_list;
                         top.func_idx = func_idx;
                         top.saved_filled = true;
@@ -2510,16 +2650,15 @@ impl LuaState {
 
         // 推入 CallInfoEntry — 对应 C 的 luaD_precall 创建新 CallInfo
         // pcall 路径下，调用者是 pcall（内部 C 函数），不是 Lua 函数，
-        // caller_proto=None 表示无法从代码分析函数名，lua_getinfo("n") 返回 NULL，
-        // 触发 luaL_argerror 调用 pushglobalfuncname 查找全局名。
+        // caller_proto 延迟计算为 None 表示无法从代码分析函数名，
+        // lua_getinfo("n") 返回 NULL，触发 luaL_argerror 调用 pushglobalfuncname 查找全局名。
         self.call_info.push(crate::state::CallInfoEntry {
-            caller_proto: None,
             is_c: true,
             closure: None,
             base: func_idx + 1,
             saved_pc: 0,
-            name: String::new(),
-            namewhat: String::new(),
+            name: None,
+            namewhat: "",
             proto_flag: self.proto_flag,
             nextraargs: self.nextraargs,
             is_tailcall: false,
@@ -2533,18 +2672,54 @@ impl LuaState {
             self.stack.reserve(MIN_STACK);
         }
 
-        // 清空 pending_error，捕获 C 函数中 lua_error 触发的 panic
+        // 清空 pending_error，捕获 C 函数中 lua_error 触发的错误
         // 对应 C 的 longjmp 跨 C 函数抛错到 pcall 的 setjmp
-        // 将 f 转换为 extern "C-unwind" 以允许 panic 跨 C 帧展开回 catch_unwind
-        // （C 模块编译时加 -fexceptions，GCC 生成 unwind 表使 Rust panic 能通过）
         self.pending_error = None;
         let ptr: *mut LuaState = self;
-        let f_unwind: unsafe extern "C-unwind" fn(*mut c_void) -> i32 = unsafe {
-            std::mem::transmute(f)
+
+        // 调用 C 函数并捕获错误:
+        // - 非 lua_use_longjmp: 用 catch_unwind 捕获 panic (lua_error → panic)
+        // - lua_use_longjmp: 用 setjmp/longjmp (panic=abort 下 catch_unwind 不工作)
+        // 返回 Ok(n) 表示成功, Err(()) 表示 lua_error (pending_error 已设置)
+        let call_result: Result<i32, ()> = {
+            #[cfg(not(lua_use_longjmp))]
+            {
+                // 将 f 转换为 extern "C-unwind" 以允许 panic 跨 C 帧展开回 catch_unwind
+                // （C 模块编译时加 -fexceptions，GCC 生成 unwind 表使 Rust panic 能通过）
+                let f_unwind: unsafe extern "C-unwind" fn(*mut c_void) -> i32 = unsafe {
+                    std::mem::transmute(f)
+                };
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                    f_unwind(ptr as *mut c_void)
+                })) {
+                    Ok(n) => Ok(n),
+                    Err(payload) => {
+                        if self.pending_error.is_some() {
+                            Err(())
+                        } else {
+                            // 非 lua_error 触发的 panic，re-panic 保持原行为
+                            std::panic::resume_unwind(payload);
+                        }
+                    }
+                }
+            }
+            #[cfg(lua_use_longjmp)]
+            {
+                // lua_use_longjmp 模式: 用 setjmp/longjmp 替代 catch_unwind
+                // jmp_buf 分配在 Rust 栈上，指针压入 error_jmp_bufs 供 do_lua_error 取用
+                let mut jmp_buf: [u8; 512] = [0; 512]; // >= sizeof(jmp_buf) on all platforms
+                self.error_jmp_bufs.push(jmp_buf.as_mut_ptr());
+                let result = unsafe {
+                    lua_rs_pcall_c(Some(f), ptr as *mut c_void, jmp_buf.as_mut_ptr() as *mut c_void)
+                };
+                self.error_jmp_bufs.pop();
+                if result == -1 {
+                    Err(())
+                } else {
+                    Ok(result)
+                }
+            }
         };
-        let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
-            f_unwind(ptr as *mut c_void)
-        }));
 
         // 恢复 api_func_base 和 n_ccalls（无论成功失败）
         self.api_func_base = saved_api_base;
@@ -2565,18 +2740,18 @@ impl LuaState {
             return LUA_YIELD;
         }
 
-        // 错误路径：lua_error 触发 panic + pending_error
-        if let Err(payload) = panic_result {
+        // 错误路径：lua_error 触发 (longjmp 或 panic) + pending_error
+        if let Err(()) = call_result {
             if let Some(err_val) = self.pending_error.take() {
                 self.stack.truncate(func_idx);
                 self.stack.push(err_val);
                 return ERR_RUN;
             }
-            // 非 lua_error 触发的 panic，re-panic 保持原行为
-            std::panic::resume_unwind(payload);
+            // 不应到达此处: longjmp/panic 必须伴随 pending_error
+            unreachable!("C function error without pending_error");
         }
 
-        let n = panic_result.unwrap();
+        let n = call_result.unwrap();
         // poscall: 把栈顶 n 个结果移动到 func_idx 位置
         let top = self.stack.len();
         let n = n as usize;
@@ -2617,7 +2792,7 @@ impl LuaState {
         func_idx: usize,
         nresults: i32,
         func: crate::objects::BuiltinFnPtr,
-        name: &str,
+        name: &'static str,
     ) -> i32 {
         let nargs = self.stack.len().saturating_sub(func_idx + 1);
 
@@ -2629,13 +2804,12 @@ impl LuaState {
 
         // 推入 CallInfoEntry，让 debug.getinfo/traceback 能正确看到 C 函数帧
         self.call_info.push(crate::state::CallInfoEntry {
-            caller_proto: None,
             is_c: true,
             closure: None,
             base: func_idx + 1,
-            saved_pc: self.pc,
-            name: name.to_string(),
-            namewhat: "function".to_string(),
+            saved_pc: 0,
+            name: Some(name),
+            namewhat: "function",
             proto_flag: self.proto_flag,
             nextraargs: self.nextraargs,
             is_tailcall: false,
@@ -2685,7 +2859,7 @@ impl LuaState {
                     top.saved_is_vararg = self.is_vararg;
                     top.saved_proto_flag = self.proto_flag;
                     top.saved_nextraargs = self.nextraargs;
-                    top.saved_closure_upvals = self.closure_upvals.clone();
+                    top.saved_closure_upvals = Rc::clone(&self.closure_upvals);
                     top.saved_tbc_list = self.tbc_list;
                     top.func_idx = func_idx;
                     top.saved_filled = true;
@@ -3131,7 +3305,7 @@ impl LuaState {
         }
 
         // 收集根：closure_upvals
-        for uv_ref in &self.closure_upvals {
+        for uv_ref in self.closure_upvals.borrow().iter() {
             let uv = uv_ref.borrow();
             match &*uv {
                 UpVal::Closed { value } => {
@@ -3157,7 +3331,7 @@ impl LuaState {
                     unsafe { worklist.push(raw_from_tvalue(val)) };
                 }
             }
-            for uv_ref in &frame.closure_upvals {
+            for uv_ref in frame.closure_upvals.borrow().iter() {
                 let uv = uv_ref.borrow();
                 if let UpVal::Closed { value } = &*uv {
                     if Self::needs_gc_mark(value) {
@@ -3428,30 +3602,20 @@ impl LuaState {
             let stack_base = self.stack.len();
             let saved_base = self.base;
             let saved_pc = self.pc;
-            let saved_closure_upvals = self.closure_upvals.clone();
+            let saved_closure_upvals = Rc::clone(&self.closure_upvals);
             let saved_proto_flag = self.proto_flag;
             let saved_nextraargs = self.nextraargs;
             self.stack.push(gc_func);
             self.stack.push(obj_val);
             self.top = self.stack.len();
 
-            let caller_proto = if self.base > 0 && self.base <= self.stack.len() {
-                if let TValue::LClosure(c) = &self.stack[self.base - 1] {
-                    Some(Rc::clone(&c.proto))
-                } else {
-                    None
-                }
-            } else {
-                None
-            };
             self.call_info.push(CallInfoEntry {
-                caller_proto,
                 is_c: false,
                 closure: None,
                 base: self.base,
                 saved_pc: self.pc,
-                name: "__gc".to_string(),
-                namewhat: "metamethod".to_string(),
+                name: Some("__gc"),
+                namewhat: "metamethod",
                 proto_flag: self.proto_flag,
                 nextraargs: self.nextraargs,
                 is_tailcall: false,
@@ -3537,7 +3701,7 @@ impl LuaState {
                 unsafe { worklist.push(raw_from_tvalue(val)) };
             }
         }
-        for uv_ref in &ctx.saved_closure_upvals {
+        for uv_ref in ctx.saved_closure_upvals.borrow().iter() {
             let uv = uv_ref.borrow();
             match &*uv {
                 UpVal::Closed { value } => {
@@ -3561,7 +3725,7 @@ impl LuaState {
                     unsafe { worklist.push(raw_from_tvalue(val)) };
                 }
             }
-            for uv_ref in &frame.closure_upvals {
+            for uv_ref in frame.closure_upvals.borrow().iter() {
                 let uv = uv_ref.borrow();
                 if let UpVal::Closed { value } = &*uv {
                     if Self::needs_gc_mark(value) {
@@ -3594,7 +3758,7 @@ impl LuaState {
     /// 只处理 Table/LClosure/UserData/Thread（mark_tvalue 的 match 分支）。
     /// 其他类型（Nil/Boolean/Integer/Float/Str 等）不需要 GC 标记，
     /// 过滤掉可避免大量无意义的 clone（perf 显示 TValue::clone 占 7.75%）。
-    #[inline]
+    #[cfg_attr(not(size_optimized), inline)]
     fn needs_gc_mark(val: &TValue) -> bool {
         matches!(
             val,

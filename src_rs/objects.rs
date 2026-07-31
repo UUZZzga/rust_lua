@@ -22,7 +22,9 @@
 //! ```
 
 use std::fmt;
-use std::hash::{BuildHasher, BuildHasherDefault, Hash, Hasher};
+#[cfg(not(size_optimized))]
+use std::hash::{BuildHasher, BuildHasherDefault};
+use std::hash::{Hash, Hasher};
 
 use crate::strings::LuaString;
 use std::cell::RefCell;
@@ -40,67 +42,90 @@ use crate::state::LuaState;
 // （Integer/Float 直接哈希，String 有预计算哈希，Table 用 ptr_id），
 // 不需要 SipHash 的加密强度。FxHash 速度快 5-10 倍，显著降低哈希开销。
 // 对应 C Lua 的 luaH_hashstr 等使用简单哈希的策略。
+//
+// size_optimized 模式下用 std 默认 SipHash (RandomState), 减小二进制体积:
+// FxHasher 的 write_u8/u16/u32/... 等特化方法各生成独立代码。
 
-/// FxHash 常量种子（来自 rustc-hash crate）
-const FX_HASH_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+#[cfg(not(size_optimized))]
+mod fx_hash_impl {
+    use std::hash::{BuildHasherDefault, Hasher};
 
-/// FxHasher — 快速非加密哈希器，用于 Table 的 key_to_bucket HashMap。
-/// 替代默认 SipHash，减少哈希计算开销（perf 显示 SipHash 占 ~4.36%）。
-#[derive(Default)]
-pub struct FxHasher {
-    hash: u64,
-}
+    /// FxHash 常量种子（来自 rustc-hash crate）
+    const FX_HASH_SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
 
-impl FxHasher {
-    #[inline]
-    fn add_to_hash(&mut self, i: u64) {
-        self.hash = (self.hash.rotate_left(5) ^ i).wrapping_mul(FX_HASH_SEED);
-    }
-}
-
-impl Hasher for FxHasher {
-    fn finish(&self) -> u64 {
-        self.hash
+    /// FxHasher — 快速非加密哈希器，用于 Table 的 key_to_bucket HashMap。
+    /// 替代默认 SipHash，减少哈希计算开销（perf 显示 SipHash 占 ~4.36%）。
+    #[derive(Default)]
+    pub struct FxHasher {
+        hash: u64,
     }
 
-    fn write(&mut self, bytes: &[u8]) {
-        for chunk in bytes.chunks_exact(8) {
-            let mut buf = [0u8; 8];
-            buf.copy_from_slice(chunk);
-            self.add_to_hash(u64::from_le_bytes(buf));
-        }
-        let rem = bytes.len() % 8;
-        if rem > 0 {
-            let mut buf = [0u8; 8];
-            buf[..rem].copy_from_slice(&bytes[bytes.len() - rem..]);
-            self.add_to_hash(u64::from_le_bytes(buf));
+    impl FxHasher {
+        #[cfg_attr(not(size_optimized), inline)]
+        fn add_to_hash(&mut self, i: u64) {
+            self.hash = (self.hash.rotate_left(5) ^ i).wrapping_mul(FX_HASH_SEED);
         }
     }
 
-    #[inline]
-    fn write_u8(&mut self, i: u8) { self.add_to_hash(i as u64); }
-    #[inline]
-    fn write_u16(&mut self, i: u16) { self.add_to_hash(i as u64); }
-    #[inline]
-    fn write_u32(&mut self, i: u32) { self.add_to_hash(i as u64); }
-    #[inline]
-    fn write_u64(&mut self, i: u64) { self.add_to_hash(i); }
-    #[inline]
-    fn write_i8(&mut self, i: i8) { self.add_to_hash(i as u64); }
-    #[inline]
-    fn write_i16(&mut self, i: i16) { self.add_to_hash(i as u64); }
-    #[inline]
-    fn write_i32(&mut self, i: i32) { self.add_to_hash(i as u64); }
-    #[inline]
-    fn write_i64(&mut self, i: i64) { self.add_to_hash(i as u64); }
-    #[inline]
-    fn write_usize(&mut self, i: usize) { self.add_to_hash(i as u64); }
-    #[inline]
-    fn write_isize(&mut self, i: isize) { self.add_to_hash(i as u64); }
+    impl Hasher for FxHasher {
+        fn finish(&self) -> u64 {
+            self.hash
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            for chunk in bytes.chunks_exact(8) {
+                let mut buf = [0u8; 8];
+                buf.copy_from_slice(chunk);
+                self.add_to_hash(u64::from_le_bytes(buf));
+            }
+            let rem = bytes.len() % 8;
+            if rem > 0 {
+                let mut buf = [0u8; 8];
+                buf[..rem].copy_from_slice(&bytes[bytes.len() - rem..]);
+                self.add_to_hash(u64::from_le_bytes(buf));
+            }
+        }
+
+        #[cfg_attr(not(size_optimized), inline)]
+        fn write_u8(&mut self, i: u8) { self.add_to_hash(i as u64); }
+        #[cfg_attr(not(size_optimized), inline)]
+        fn write_u16(&mut self, i: u16) { self.add_to_hash(i as u64); }
+        #[cfg_attr(not(size_optimized), inline)]
+        fn write_u32(&mut self, i: u32) { self.add_to_hash(i as u64); }
+        #[cfg_attr(not(size_optimized), inline)]
+        fn write_u64(&mut self, i: u64) { self.add_to_hash(i); }
+        #[cfg_attr(not(size_optimized), inline)]
+        fn write_i8(&mut self, i: i8) { self.add_to_hash(i as u64); }
+        #[cfg_attr(not(size_optimized), inline)]
+        fn write_i16(&mut self, i: i16) { self.add_to_hash(i as u64); }
+        #[cfg_attr(not(size_optimized), inline)]
+        fn write_i32(&mut self, i: i32) { self.add_to_hash(i as u64); }
+        #[cfg_attr(not(size_optimized), inline)]
+        fn write_i64(&mut self, i: i64) { self.add_to_hash(i as u64); }
+        #[cfg_attr(not(size_optimized), inline)]
+        fn write_usize(&mut self, i: usize) { self.add_to_hash(i as u64); }
+        #[cfg_attr(not(size_optimized), inline)]
+        fn write_isize(&mut self, i: isize) { self.add_to_hash(i as u64); }
+    }
+
+    /// FxBuildHasher — BuildHasher 实现，构造 FxHasher
+    pub type FxBuildHasher = BuildHasherDefault<FxHasher>;
 }
 
-/// FxBuildHasher — BuildHasher 实现，构造 FxHasher
-pub type FxBuildHasher = BuildHasherDefault<FxHasher>;
+#[cfg(not(size_optimized))]
+pub use fx_hash_impl::FxBuildHasher;
+
+// size_optimized: 用 std 默认 RandomState (SipHash) 替代 FxHash
+#[cfg(size_optimized)]
+pub type FxBuildHasher = std::collections::hash_map::RandomState;
+
+// ============================================================================
+// Table 哈希表类型别名
+// ============================================================================
+#[cfg(not(size_optimized))]
+pub type TableHashMap<V> = hashbrown::HashMap<TValue, V, FxBuildHasher>;
+#[cfg(size_optimized)]
+pub type TableHashMap<V> = std::collections::HashMap<TValue, V, FxBuildHasher>;
 
 // ============================================================================
 // 规约：Lua 基础类型标签
@@ -268,7 +293,7 @@ impl BuiltinFn {
     /// 获取函数名的 &str（unsafe，因为从裸指针构造）
     ///
     /// 安全性：name 必须是有效的 NUL 终止 C 字符串指针
-    pub fn name_str(&self) -> &str {
+    pub fn name_str(&self) -> &'static str {
         if self.name.is_null() {
             ""
         } else {
@@ -348,7 +373,7 @@ impl std::fmt::Debug for RustClosure {
 
 impl RustClosure {
     /// 获取函数名的 &str
-    pub fn name_str(&self) -> &str {
+    pub fn name_str(&self) -> &'static str {
         if self.name.is_null() {
             ""
         } else {
@@ -388,7 +413,8 @@ impl RustClosure {
 /// Given: 创建各种类型的 TValue
 /// When: 调用 .ty() 方法
 /// Then: 返回正确的 LuaType
-#[derive(Debug, Clone)]
+#[derive(Clone)]
+#[cfg_attr(not(size_optimized), derive(Debug))]
 pub enum TValue {
     /// nil 值，带子变体（标准 nil / 空槽 / 缺键）
     Nil(NilKind),
@@ -793,9 +819,21 @@ impl fmt::Display for TValue {
             TValue::Nil(NilKind::Empty) => write!(f, "(empty)"),
             TValue::Nil(NilKind::AbsentKey) => write!(f, "(absent key)"),
             TValue::Nil(NilKind::NotTable) => write!(f, "(not a table)"),
-            TValue::Boolean(b) => write!(f, "{}", b),
-            TValue::Integer(i) => write!(f, "{}", i),
-            TValue::Float(n) => write!(f, "{}", n),
+            TValue::Boolean(b) => {
+                // 体积优先: 避免 write!(f,"{}",b) 引入 core::fmt::num
+                #[cfg(size_optimized)]
+                { f.write_str(if *b { "true" } else { "false" }) }
+                #[cfg(not(size_optimized))]
+                { write!(f, "{}", b) }
+            }
+            TValue::Integer(i) => {
+                // 体积优先: 用 i64_to_string 避免 write!(f,"{}",i) 引入 core::fmt::num
+                #[cfg(size_optimized)]
+                { f.write_str(&crate::float_utils::i64_to_string(*i)) }
+                #[cfg(not(size_optimized))]
+                { write!(f, "{}", i) }
+            }
+            TValue::Float(n) => write!(f, "{}", crate::float_utils::f64_to_string(*n)),
             TValue::Str(s) => write!(f, "{}", s.as_str()),
             TValue::LightUserData(p) => write!(f, "lightuserdata({:p})", p),
             TValue::Table(_) => write!(f, "table"),
@@ -806,6 +844,33 @@ impl fmt::Display for TValue {
             TValue::RustClosure(rc) => write!(f, "function: {}", rc.name_str()),
             TValue::UserData(_) => write!(f, "userdata"),
             TValue::Thread(_) => write!(f, "thread"),
+        }
+    }
+}
+
+// size_optimized 模式: 手动实现 Debug 避免 f64::fmt 引入 flt2dec 代码 (~2.8KB)
+// 同时避免 debug_tuple+field 格式化字符串 (会引入 core::unicode 转义表 ~4KB)
+#[cfg(size_optimized)]
+impl fmt::Debug for TValue {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TValue::Nil(n) => write!(f, "Nil({:?})", n),
+            TValue::Boolean(b) => f.write_str(if *b { "Boolean(true)" } else { "Boolean(false)" }),
+            TValue::LightUserData(p) => write!(f, "LightUserData({:p})", p),
+            // 用 i64_to_string 避免 write!(f,"{}",i) 引入 core::fmt::num
+            TValue::Integer(i) => write!(f, "Integer({})", crate::float_utils::i64_to_string(*i)),
+            // 用 f64_to_string 避免直接格式化 f64 引入 flt2dec
+            TValue::Float(n) => write!(f, "Float({})", crate::float_utils::f64_to_string(*n)),
+            // 用 Display 而非 Debug 格式化字符串, 避免 str::Debug 引入 unicode 转义表
+            TValue::Str(s) => write!(f, "Str({})", s.as_str()),
+            TValue::Table(t) => write!(f, "Table({:p})", t),
+            TValue::LClosure(lc) => write!(f, "LClosure({:p})", std::rc::Rc::as_ptr(lc)),
+            TValue::CClosure(cc) => write!(f, "CClosure({:p})", std::rc::Rc::as_ptr(cc)),
+            TValue::LCFn(lcf) => write!(f, "LCFn({:x})", lcf.func as usize),
+            TValue::BuiltinFn(b) => write!(f, "BuiltinFn({})", b.name_str()),
+            TValue::RustClosure(rc) => write!(f, "RustClosure({})", rc.name_str()),
+            TValue::UserData(ud) => write!(f, "UserData({:p})", std::rc::Rc::as_ptr(ud)),
+            TValue::Thread(t) => write!(f, "Thread({:p})", std::rc::Rc::as_ptr(t)),
         }
     }
 }
@@ -843,7 +908,7 @@ pub struct TableData {
     /// `key → hash_buckets index` 映射 — 让 get / set / next 能 O(1) 定位
     /// Option<Box<…>> 使空表不浪费 HashMap 结构体内存（~56 bytes）
     /// 使用 FxBuildHasher 替代默认 SipHash，减少哈希计算开销
-    pub key_to_bucket: Option<Box<hashbrown::HashMap<TValue, usize, FxBuildHasher>>>,
+    pub key_to_bucket: Option<Box<TableHashMap<usize>>>,
     /// 元表
     pub metatable: Option<Box<Table>>,
 }
@@ -1277,7 +1342,9 @@ pub struct CallFrame {
     pub is_vararg: bool,
     pub proto_flag: u8,
     pub nextraargs: i32,
-    pub closure_upvals: Vec<UpValRef>,
+    /// perf: Rc 共享避免 op_call 中 Vec 深拷贝 (N 个 UpValRef 各 1 次 atomic inc)
+    /// 对应 C Lua 的 ci->u.l.upvals = cl->upvals (指针共享, O(1))
+    pub closure_upvals: Rc<RefCell<Vec<UpValRef>>>,
     pub tbc_list: Option<usize>,
 }
 
@@ -1304,7 +1371,7 @@ pub struct ThreadContext {
     pub saved_is_vararg: bool,
     pub saved_proto_flag: u8,
     pub saved_nextraargs: i32,
-    pub saved_closure_upvals: Vec<UpValRef>,
+    pub saved_closure_upvals: Rc<RefCell<Vec<UpValRef>>>,
     pub saved_open_upvals: Vec<UpValRef>,
     pub saved_open_upval: Option<usize>,
     pub saved_tbc_list: Option<usize>,
@@ -1634,7 +1701,12 @@ pub fn hexavalue(c: u8) -> u8 {
 /// When: 调用 str2num("")
 /// Then: 返回 None
 pub fn str2num(s: &str) -> Option<TValue> {
+    // 性能优先: 用 s.trim() (Unicode whitespace, 但性能优化的 std 实现)
+    #[cfg(not(size_optimized))]
     let s = s.trim();
+    // 体积优先: 用 ASCII trim 避免 Unicode whitespace 表 (~4KB)
+    #[cfg(size_optimized)]
+    let s = s.trim_matches(|c: char| c.is_ascii_whitespace());
     if s.is_empty() {
         return None;
     }
@@ -1646,6 +1718,16 @@ pub fn str2num(s: &str) -> Option<TValue> {
     } else {
         (false, s)
     };
+    // 符号后不能紧跟空格 (如 "+ 0.01" 无效).
+    // strtod 会跳过前导空格导致 "+ 0.01" 被误解析为 0.01, 需显式拒绝.
+    #[cfg(not(size_optimized))]
+    if s.starts_with(char::is_whitespace) {
+        return None;
+    }
+    #[cfg(size_optimized)]
+    if s.starts_with(|c: char| c.is_ascii_whitespace()) {
+        return None;
+    }
     // 尝试十六进制 — 对应 C: if (s[0]=='0' && (s[1]=='x'||s[1]=='X'))
     if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
         // 检查是否是浮点数（包含 '.' 或 'p'/'P'）
@@ -1662,8 +1744,12 @@ pub fn str2num(s: &str) -> Option<TValue> {
         });
     }
     // 尝试十进制整数（含符号）
+    // 体积优先: 手动拼接避免 format! 引入 fmt 代码
     let signed_s = if neg {
-        format!("-{}", s)
+        let mut tmp = String::with_capacity(s.len() + 1);
+        tmp.push('-');
+        tmp.push_str(s);
+        tmp
     } else {
         s.to_string()
     };
@@ -1672,7 +1758,7 @@ pub fn str2num(s: &str) -> Option<TValue> {
     }
     // 尝试浮点数（含符号）— 拒绝 "inf"/"nan"（对应 C 的 l_str2d 检查 .xXnN）
     if !signed_s.contains('n') && !signed_s.contains('N') {
-        if let Ok(f) = signed_s.parse::<f64>() {
+        if let Some(f) = crate::float_utils::f64_from_str(&signed_s) {
             return Some(TValue::Float(f));
         }
     }
@@ -1897,14 +1983,14 @@ pub fn tostringbuff(obj: &TValue, buffer: &mut [u8]) -> usize {
     // 规约: 待实现
     match obj {
         TValue::Integer(i) => {
-            let s = i.to_string();
+            let s = crate::float_utils::i64_to_string(*i);
             let len = s.len();
             buffer[..len].copy_from_slice(s.as_bytes());
             len
         }
         TValue::Float(f) => {
             // 用足够精度格式化
-            let s = format!("{:.15}", f);
+            let s = crate::float_utils::f64_to_string_fixed(*f, 15);
             // 去掉尾部多余的零（保留至少一位小数，如果看起来像整数加 ".0"）
             let trimmed = trim_float_str(&s);
             let len = trimmed.len();
@@ -1917,8 +2003,12 @@ pub fn tostringbuff(obj: &TValue, buffer: &mut [u8]) -> usize {
 
 fn trim_float_str(s: &str) -> String {
     // 如果看起来像整数，添加 ".0"
+    // 体积优先: 手动拼接避免 format! 引入 fmt 代码
     if s.bytes().all(|b| b == b'-' || b.is_ascii_digit()) {
-        return format!("{}.0", s);
+        let mut tmp = String::with_capacity(s.len() + 2);
+        tmp.push_str(s);
+        tmp.push_str(".0");
+        return tmp;
     }
     s.to_string()
 }
@@ -2167,32 +2257,6 @@ fn float_mod(a: f64, b: f64) -> f64 {
 pub fn arith(_op: ArithOp, _p1: &TValue, _p2: &TValue, _res: &mut TValue) -> bool {
     // 简化实现：直接返回 false（元方法回退预留）
     false
-}
-
-// ============================================================================
-// 规约：hashpow2 — 2 的幂取模
-// ============================================================================
-
-/// 对 2 的幂 size 取模（等价于 x & (size - 1)）。
-///
-/// Scenario: 取模计算
-/// Given: x = 7, size = 8 (2^3)
-/// When: 调用 hashmod(7, 8)
-/// Then: 返回 7
-///
-/// Given: x = 10, size = 8
-/// When: 调用 hashmod(10, 8)
-/// Then: 返回 2
-///
-/// Given: x = 0, size = 4
-/// When: 调用 hashmod(0, 4)
-/// Then: 返回 0
-///
-/// If: size 不是 2 的幂
-/// Then: panic (debug)
-pub fn hashmod(x: usize, size: usize) -> usize {
-    debug_assert!(size.is_power_of_two(), "hashmod: size must be a power of 2");
-    x & (size - 1)
 }
 
 /// 计算 2^n
@@ -2816,23 +2880,8 @@ mod tests {
     }
 
     // ========================================================================
-    // hashmod 测试
+    // twoto 测试
     // ========================================================================
-
-    #[test]
-    fn test_hashmod() {
-        assert_eq!(hashmod(7, 8), 7);
-        assert_eq!(hashmod(10, 8), 2);
-        assert_eq!(hashmod(0, 4), 0);
-        assert_eq!(hashmod(16, 8), 0);
-        assert_eq!(hashmod(17, 8), 1);
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_hashmod_non_power_of_two() {
-        hashmod(10, 7);
-    }
 
     #[test]
     fn test_twoto() {

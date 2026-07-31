@@ -281,7 +281,7 @@ pub fn strcmp(ts1: &LuaString, ts2: &LuaString) -> Ordering {
 
 /// 通过裸指针调用 strcoll，避免 CString 堆分配。
 /// 调用者必须保证两个指针都指向 NUL 终止的字符串。
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 fn strcoll_ptrs(
     s1: *const std::os::raw::c_char,
     s2: *const std::os::raw::c_char,
@@ -920,7 +920,7 @@ pub fn concat_stack(
 }
 
 fn string_from_int(table: &crate::strings::StringTable, i: i64) -> LuaString {
-    let s = i.to_string();
+    let s = crate::float_utils::i64_to_string(i);
     // 对应 C 的 tostringbuff: 短字符串走 intern (luaS_newlstr → internshrstr)
     table.intern(&s)
 }
@@ -934,15 +934,7 @@ fn string_from_float(table: &crate::strings::StringTable, f: f64) -> LuaString {
 fn value_str_len(v: &TValue) -> usize {
     match v {
         TValue::Str(s) => s.len(),
-        TValue::Integer(i) => {
-            if *i == 0 {
-                1
-            } else if *i < 0 {
-                (*i as i128).unsigned_abs().to_string().len() + 1
-            } else {
-                (*i as u64).to_string().len()
-            }
-        }
+        TValue::Integer(i) => crate::float_utils::i64_str_len(*i),
         TValue::Float(f) => format_float_len(*f),
         _ => 0,
     }
@@ -951,7 +943,7 @@ fn value_str_len(v: &TValue) -> usize {
 fn append_val_to_string(buf: &mut String, v: &TValue) {
     match v {
         TValue::Str(s) => buf.push_str(s.as_str()),
-        TValue::Integer(i) => buf.push_str(&i.to_string()),
+        TValue::Integer(i) => buf.push_str(&crate::float_utils::i64_to_string(*i)),
         TValue::Float(f) => buf.push_str(&format_float(*f)),
         _ => {}
     }
@@ -1258,26 +1250,7 @@ pub fn gc_id_of_tvalue(val: &TValue) -> Option<crate::gc::GCObjectId> {
 // ============================================================================
 
 fn format_float(f: f64) -> String {
-    if f.is_nan() {
-        return "nan".to_string();
-    }
-    if f.is_infinite() {
-        return if f > 0.0 {
-            "inf".to_string()
-        } else {
-            "-inf".to_string()
-        };
-    }
-    if f == 0.0 {
-        return "0.0".to_string();
-    }
-    let s = format!("{:.15}", f);
-    let s = s.trim_end_matches('0');
-    if s.ends_with('.') {
-        format!("{}0", s)
-    } else {
-        s.to_string()
-    }
+    crate::float_utils::f64_to_string(f)
 }
 
 // ============================================================================
@@ -2545,7 +2518,12 @@ mod tests {
 
     #[test]
     fn test_format_float_precision() {
-        assert_eq!(super::format_float(1.0 / 3.0), "0.333333333333333");
+        // size_optimized: %.15g/%.17g 两阶段, 输出 "0.33333333333333331" (17 位有效数字)
+        // 默认: format!("{}", f) 输出 "0.3333333333333333" (最短往返表示)
+        #[cfg(size_optimized)]
+        assert_eq!(super::format_float(1.0 / 3.0), "0.33333333333333331");
+        #[cfg(not(size_optimized))]
+        assert_eq!(super::format_float(1.0 / 3.0), "0.3333333333333333");
     }
 
     // ========================================================================

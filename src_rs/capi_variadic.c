@@ -12,6 +12,9 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef LUA_USE_LONGJMP
+#include <setjmp.h>
+#endif
 
 /* 可见性宏：导出符号供 .so 链接 */
 #define LUA_RS_API __attribute__((visibility("default")))
@@ -61,4 +64,39 @@ LUA_RS_API int luaL_error(void *L, const char *fmt, ...) {
     lua_concat(L, 2);
     return lua_error(L);
 }
+
+/*
+ * setjmp/longjmp 包装函数 — 用于 panic=abort 模式下替代 catch_unwind。
+ *
+ * Rust 实现用 panic!("lua_error") + catch_unwind 模拟 C 的 longjmp/setjmp，
+ * 但 panic=abort 模式下 catch_unwind 不工作，改用 setjmp/longjmp。
+ *
+ * 启用方式 (对应 C 的 LUA_USE_LONGJMP 宏):
+ *   - cargo build --features lua_longjmp
+ *   - size_optimized 模式 (panic=abort) 自动启用
+ * build.rs 检测后向本文件传入 -DLUA_USE_LONGJMP, 编译以下两个函数。
+ *
+ * 调用流程:
+ *   Rust pcall_c_function → lua_rs_pcall_c(f, L, buf)
+ *     → setjmp(buf) == 0 → f(L) [正常调用]
+ *     → setjmp(buf) != 0 → return -1 [lua_error/longjmp 返回]
+ *   C 模块 → lua_error → lua_rs_longjmp(buf) → longjmp 回 lua_rs_pcall_c
+ *
+ * buf 指向 Rust 栈上分配的 512 字节缓冲区 (>= sizeof(jmp_buf) on all platforms)。
+ */
+
+#ifdef LUA_USE_LONGJMP
+
+LUA_RS_API int lua_rs_pcall_c(int (*f)(void *), void *L, void *buf) {
+    if (setjmp(*(jmp_buf *)buf) != 0) {
+        return -1;
+    }
+    return f(L);
+}
+
+LUA_RS_API __attribute__((noreturn)) void lua_rs_longjmp(void *buf) {
+    longjmp(*(jmp_buf *)buf, 1);
+}
+
+#endif /* LUA_USE_LONGJMP */
 

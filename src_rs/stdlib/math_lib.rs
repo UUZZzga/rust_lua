@@ -354,8 +354,8 @@ fn to_float(v: &TValue) -> Result<f64, String> {
         TValue::Float(f) => Ok(*f),
         TValue::Str(s) => {
             let s = s.as_str();
-            s.parse::<f64>()
-                .map_err(|_| format!("bad argument (number expected, got string '{}')", s))
+            crate::float_utils::f64_from_str(s)
+                .ok_or_else(|| format!("bad argument (number expected, got string '{}')", s))
         }
         _ => Err(format!("bad argument (number expected, got {})", v.ty())),
     }
@@ -370,7 +370,8 @@ fn to_integer(v: &TValue) -> Result<i64, String> {
             if (i as f64) == *f {
                 Ok(i)
             } else {
-                Err(format!("bad argument (integer expected, got float {})", f))
+                // 用 float_utils 而非 format!("{}", f), 避免 size_optimized 模式引入 flt2dec 代码.
+                Err(format!("bad argument (integer expected, got float {})", crate::float_utils::f64_to_string(*f)))
             }
         }
         _ => Err(format!("bad argument (integer expected, got {})", v.ty())),
@@ -605,7 +606,7 @@ fn get_number_arg(state: &LuaState, a: usize, idx: usize, fname: &str) -> Result
             let s = s.as_str();
             if let Ok(i) = s.parse::<i64>() {
                 Ok(TValue::Integer(i))
-            } else if let Ok(f) = s.parse::<f64>() {
+            } else if let Some(f) = crate::float_utils::f64_from_str(s) {
                 Ok(TValue::Float(f))
             } else {
                 Err(VmError::RuntimeError(format!(
@@ -651,11 +652,12 @@ fn get_int_arg(state: &LuaState, a: usize, idx: usize, fname: &str) -> Result<i6
             if (i as f64) == *f {
                 Ok(i)
             } else {
+                // 用 float_utils 而非 format!("{}", f), 避免 size_optimized 模式引入 flt2dec 代码.
                 Err(VmError::RuntimeError(format!(
                     "bad argument #{} to '{}' (integer expected, got float {})",
                     idx + 1,
                     fname,
-                    f
+                    crate::float_utils::f64_to_string(*f)
                 )))
             }
         }

@@ -220,10 +220,20 @@ fn call_remove(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     if result == 0 {
         push_single_result(state, a, nresults, TValue::Boolean(true));
     } else {
-        let err = std::io::Error::last_os_error();
-        let fname = filename_cstr.to_str().unwrap_or("");
-        let msg = format!("{}: {}", fname, err);
-        let errno = err.raw_os_error().unwrap_or(0);
+        let errno = unsafe { *libc::__errno_location() };
+        // 体积优先: 用 libc::strerror 避免格式化 io::Error (会引入 StringError vtable + Unicode 表 ~4KB)
+        #[cfg(size_optimized)]
+        let msg = {
+            let estr = unsafe { libc::strerror(errno) };
+            let estr_str = unsafe { std::ffi::CStr::from_ptr(estr).to_string_lossy().into_owned() };
+            format!("{}: {}", filename_cstr.to_str().unwrap_or(""), estr_str)
+        };
+        #[cfg(not(size_optimized))]
+        let msg = {
+            let err = std::io::Error::last_os_error();
+            let fname = filename_cstr.to_str().unwrap_or("");
+            format!("{}: {}", fname, err)
+        };
         state.adjust_results(
             a,
             nresults,
@@ -349,9 +359,29 @@ fn call_rename(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     if result == 0 {
         push_single_result(state, a, nresults, TValue::Boolean(true));
     } else {
-        let err = std::io::Error::last_os_error();
-        let msg = err.to_string();
-        let errno = err.raw_os_error().unwrap_or(0);
+        let errno = unsafe { *libc::__errno_location() };
+        // 体积优先: 用 libc::strerror 避免格式化 io::Error (会引入 StringError vtable + Unicode 表 ~4KB)
+        #[cfg(size_optimized)]
+        let msg = {
+            let estr = unsafe { libc::strerror(errno) };
+            let estr_str = unsafe { std::ffi::CStr::from_ptr(estr).to_string_lossy().into_owned() };
+            format!(
+                "{} -> {}: {}",
+                oldname_cstr.to_str().unwrap_or(""),
+                newname_cstr.to_str().unwrap_or(""),
+                estr_str
+            )
+        };
+        #[cfg(not(size_optimized))]
+        let msg = {
+            let err = std::io::Error::last_os_error();
+            format!(
+                "{} -> {}: {}",
+                oldname_cstr.to_str().unwrap_or(""),
+                newname_cstr.to_str().unwrap_or(""),
+                err
+            )
+        };
         state.adjust_results(
             a,
             nresults,

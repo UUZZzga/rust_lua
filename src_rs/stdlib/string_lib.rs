@@ -30,7 +30,7 @@ fn to_num(v: &TValue) -> Option<TValue> {
             let s = s.as_str();
             if let Ok(i) = s.parse::<i64>() {
                 Some(TValue::Integer(i))
-            } else if let Ok(f) = s.parse::<f64>() {
+            } else if let Some(f) = crate::float_utils::f64_from_str(s) {
                 Some(TValue::Float(f))
             } else {
                 None
@@ -175,15 +175,31 @@ fn get_end_pos(pos: i64, len: usize) -> usize {
 // ============================================================================
 
 /// string.upper(s) — 将字符串转换为大写
-/// 对应 C 的 str_upper
+/// 对应 C 的 str_upper (使用 toupper, 仅处理 ASCII)
 pub fn str_upper(s: &str) -> String {
-    s.to_uppercase()
+    #[cfg(not(size_optimized))]
+    {
+        s.to_uppercase()
+    }
+    #[cfg(size_optimized)]
+    {
+        // 体积优先: 用 ASCII 版本避免 Unicode 表 (~14KB)
+        s.to_ascii_uppercase()
+    }
 }
 
 /// string.lower(s) — 将字符串转换为小写
-/// 对应 C 的 str_lower
+/// 对应 C 的 str_lower (使用 tolower, 仅处理 ASCII)
 pub fn str_lower(s: &str) -> String {
-    s.to_lowercase()
+    #[cfg(not(size_optimized))]
+    {
+        s.to_lowercase()
+    }
+    #[cfg(size_optimized)]
+    {
+        // 体积优先: 用 ASCII 版本避免 Unicode 表 (~14KB)
+        s.to_ascii_lowercase()
+    }
 }
 
 /// string.len(s) — 返回字符串长度
@@ -348,14 +364,14 @@ impl<'a> MatchState<'a> {
     }
 
     /// 获取源字符串字节 — 所有调用点已确保 idx < src_end <= src.len()
-    #[inline(always)]
+    #[cfg_attr(not(size_optimized), inline(always))]
     fn src_byte(&self, idx: usize) -> u8 {
         // 安全性：调用点已在访问前检查 idx < src_end
         unsafe { *self.src.get_unchecked(idx) }
     }
 
     /// 获取模式字符串字节 — 所有调用点已确保 idx < p_end <= pattern.len()
-    #[inline(always)]
+    #[cfg_attr(not(size_optimized), inline(always))]
     fn pat_byte(&self, idx: usize) -> u8 {
         // 安全性：调用点已在访问前检查 idx < p_end
         unsafe { *self.pattern.get_unchecked(idx) }
@@ -419,7 +435,7 @@ fn match_bracket_class(c: u8, p: &[u8], ec: usize) -> bool {
 }
 
 /// 对应 C 的 classend: 找到模式类的结束位置
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 fn class_end(ms: &MatchState<'_>, p: usize) -> Result<usize, String> {
     if p >= ms.p_end {
         return Err("malformed pattern (ends with '%')".to_string());
@@ -457,7 +473,7 @@ fn class_end(ms: &MatchState<'_>, p: usize) -> Result<usize, String> {
 }
 
 /// 对应 C 的 singlematch: 检查单个字符是否匹配
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 fn single_match(ms: &MatchState<'_>, s: usize, p: usize, ep: usize) -> bool {
     if s >= ms.src_end {
         return false;
@@ -679,7 +695,7 @@ fn min_expand(
 /// perf: match_pattern 是 all.lua 最大热点 (11.88%)。它是一个小包装层, 仅做 depth
 /// 检查 + 递减/递增, 实际逻辑在 match_pattern_inner。内联后递归调用直接进入
 /// match_pattern_inner, 省去每次递归的 call/ret 开销 (约 5-10 cycles/次)。
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 fn match_pattern(ms: &mut MatchState<'_>, s: usize, p: usize) -> Result<Option<usize>, String> {
     if ms.match_depth == 0 {
         return Err("pattern too complex".to_string());
@@ -1231,7 +1247,7 @@ fn add_value_from_repl(
                     ))
                 }
                 TValue::Str(st) => Ok((st.as_str().to_string(), true)),
-                TValue::Integer(i) => Ok((i.to_string(), true)),
+                TValue::Integer(i) => Ok((crate::float_utils::i64_to_string(i), true)),
                 TValue::Float(f) => Ok((format_float_value(f), true)),
                 other => Err(format!("invalid replacement value (a {})", other.ty())),
             }
@@ -1282,7 +1298,7 @@ fn add_value_from_repl(
                     ))
                 }
                 TValue::Str(st) => Ok((st.as_str().to_string(), true)),
-                TValue::Integer(i) => Ok((i.to_string(), true)),
+                TValue::Integer(i) => Ok((crate::float_utils::i64_to_string(i), true)),
                 TValue::Float(f) => Ok((format_float_value(f), true)),
                 other => Err(format!("invalid replacement value (a {})", other.ty())),
             }
@@ -1313,27 +1329,9 @@ fn get_capture_as_tvalue(
 }
 
 /// 格式化浮点数为字符串 — 与 Lua 的 tostring 行为一致
+/// f64_to_string 已处理 nan/inf 和 ".0" 后缀, 直接委托.
 fn format_float_value(f: f64) -> String {
-    if f.is_nan() {
-        return "nan".to_string();
-    }
-    if f.is_infinite() {
-        return if f > 0.0 {
-            "inf".to_string()
-        } else {
-            "-inf".to_string()
-        };
-    }
-    if f == 0.0 {
-        return "0.0".to_string();
-    }
-    let s = format!("{}", f);
-    // Rust 的 Display 对整数值浮点数不输出小数点，需补 ".0"
-    if s.contains('.') || s.contains('e') || s.contains('E') {
-        s
-    } else {
-        format!("{}.0", s)
-    }
+    crate::float_utils::f64_to_string(f)
 }
 
 /// 处理替换字符串中的 %0, %1-%9
@@ -1362,7 +1360,9 @@ fn apply_replacement(repl: &str, ms: &MatchState<'_>, s: usize, e: usize) -> Res
                         result.extend_from_slice(&ms.src[start..start + len]);
                     }
                     CaptureResult::Pos(pos) => {
-                        result.extend_from_slice(pos.to_string().as_bytes());
+                        result.extend_from_slice(
+                            crate::float_utils::i64_to_string(pos as i64).as_bytes()
+                        );
                     }
                 }
             } else {
@@ -1987,7 +1987,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                     )
                 })?;
                 let p = precision.unwrap_or(6); // 默认精度为 6
-                let mut s = format!("{:.*}", p, n);
+                let mut s = crate::float_utils::f64_to_string_fixed(n, p);
                 // # 标志: 总是显示小数点
                 if alt_form && !s.contains('.') {
                     s.push('.');
@@ -2037,9 +2037,9 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                         // %e/%E: 科学计数法，指数至少 2 位，带符号
                         let uppercase = spec == b'E';
                         let raw = if uppercase {
-                            format!("{:.*E}", p, n)
+                            crate::float_utils::f64_to_string_exp(n, p, true)
                         } else {
-                            format!("{:.*e}", p, n)
+                            crate::float_utils::f64_to_string_exp(n, p, false)
                         };
                         // 转换指数部分为 C 格式 (1e2 -> 1e+02)
                         format_exponent_c(raw)
@@ -2065,9 +2065,9 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                             if exp < -4 || exp >= p as i32 {
                                 // 使用 %e/%E 格式
                                 let raw = if uppercase {
-                                    format!("{:.*E}", p - 1, n)
+                                    crate::float_utils::f64_to_string_exp(n, p - 1, true)
                                 } else {
-                                    format!("{:.*e}", p - 1, n)
+                                    crate::float_utils::f64_to_string_exp(n, p - 1, false)
                                 };
                                 let mut s = format_exponent_c(raw);
                                 // 去除尾随零 (除非有 # 标志)
@@ -2084,7 +2084,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                             } else {
                                 // 使用 %f 格式
                                 let decimal_places = ((p as i32 - 1 - exp).max(0)) as usize;
-                                let mut s = format!("{:.*}", decimal_places, n);
+                                let mut s = crate::float_utils::f64_to_string_fixed(n, decimal_places);
                                 // 去除尾随零 (除非有 # 标志)
                                 if !alt_form && s.contains('.') {
                                     s = s.trim_end_matches('0').to_string();
@@ -2142,7 +2142,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                 if has_modifiers {
                     let s = match arg {
                         TValue::Str(s) => s.as_str().to_string(),
-                        TValue::Integer(n) => n.to_string(),
+                        TValue::Integer(n) => crate::float_utils::i64_to_string(*n),
                         TValue::Float(f) => {
                             if f.is_nan() {
                                 "nan".to_string()
@@ -2153,11 +2153,11 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                                     "-inf".to_string()
                                 }
                             } else {
-                                format!("{}", f)
+                                crate::float_utils::f64_to_string(*f)
                             }
                         }
                         TValue::Nil(_) => "nil".to_string(),
-                        TValue::Boolean(b) => b.to_string(),
+                        TValue::Boolean(b) => if *b { "true".to_string() } else { "false".to_string() },
                         _ => {
                             return Err(format!(
                                 "bad argument #{} to 'format' (no proper format)",
@@ -2189,7 +2189,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                     // 无修饰符: 直接输出，避免 String 分配
                     match arg {
                         TValue::Str(s) => result.push_str(s.as_str()),
-                        TValue::Integer(n) => result.push_str(&n.to_string()),
+                        TValue::Integer(n) => result.push_str(&crate::float_utils::i64_to_string(*n)),
                         TValue::Float(f) => {
                             if f.is_nan() {
                                 result.push_str("nan");
@@ -2200,11 +2200,11 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                                     result.push_str("-inf");
                                 }
                             } else {
-                                result.push_str(&format!("{}", f));
+                                result.push_str(&crate::float_utils::f64_to_string(*f));
                             }
                         }
                         TValue::Nil(_) => result.push_str("nil"),
-                        TValue::Boolean(b) => result.push_str(&b.to_string()),
+                        TValue::Boolean(b) => result.push_str(if *b { "true" } else { "false" }),
                         _ => {
                             return Err(format!(
                                 "bad argument #{} to 'format' (no proper format)",
@@ -2263,7 +2263,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                         if *n == i64::MIN {
                             result.push_str(&format!("0x{:x}", *n as u64));
                         } else {
-                            result.push_str(&n.to_string());
+                            result.push_str(&crate::float_utils::i64_to_string(*n));
                         }
                     }
                     TValue::Float(f) => {
@@ -2278,7 +2278,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                         } else {
                             // C 用十六进制浮点 (%a) 确保精度;
                             // Rust 无原生 %a,用十进制格式 (Display trait 保证往返精度)
-                            result.push_str(&format!("{}", f));
+                            result.push_str(&crate::float_utils::f64_to_string(*f));
                         }
                     }
                     TValue::Nil(_) => result.push_str("nil"),
@@ -3086,7 +3086,7 @@ fn get_str_arg(state: &LuaState, a: usize, idx: usize) -> Result<String, VmError
     match val {
         TValue::Str(s) => Ok(s.as_str().to_string()),
         TValue::Integer(n) => Ok(n.to_string()),
-        TValue::Float(f) => Ok(format!("{}", f)),
+        TValue::Float(f) => Ok(crate::float_utils::f64_to_string(*f)),
         _ => Err(arg_error(
             state,
             idx + 1,

@@ -72,7 +72,7 @@ fn get_obj_len(state: &mut LuaState, obj: &TValue) -> Result<i64, VmError> {
 
 /// 获取 t[i]，支持 __index 元方法 (对应 C lua_geti → luaV_finishget)
 /// 用于 table 库函数对表元素访问时透明地调用元方法（如 proxy 表）
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 fn geti_meta(state: &mut LuaState, table_val: &TValue, i: i64) -> Result<TValue, VmError> {
     VmExecutor::table_get(
         state,
@@ -83,7 +83,7 @@ fn geti_meta(state: &mut LuaState, table_val: &TValue, i: i64) -> Result<TValue,
 }
 
 /// 设置 t[i] = v，支持 __newindex 元方法 (对应 C lua_seti → luaV_finishset)
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 fn seti_meta(state: &mut LuaState, table_val: &TValue, i: i64, val: TValue) -> Result<(), VmError> {
     VmExecutor::table_set(
         state,
@@ -94,7 +94,7 @@ fn seti_meta(state: &mut LuaState, table_val: &TValue, i: i64, val: TValue) -> R
     )
 }
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 fn seti_meta_(state: &mut LuaState, table_val: TValue, i: i64, val: TValue) -> Result<(), VmError> {
     VmExecutor::table_set(
         state,
@@ -106,7 +106,7 @@ fn seti_meta_(state: &mut LuaState, table_val: TValue, i: i64, val: TValue) -> R
 }
 
 /// 将结果压入栈并调整栈顶
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 fn push_results(state: &mut LuaState, a: usize, nresults: i32, results: Vec<TValue>) {
     state.adjust_results(a, nresults, results);
 }
@@ -131,8 +131,8 @@ fn table_concat_impl(
     let push_val = |result: &mut String, val: &TValue, idx: i64| -> Result<(), VmError> {
         match val {
             TValue::Str(s) => result.push_str(s.as_str()),
-            TValue::Integer(n) => result.push_str(&n.to_string()),
-            TValue::Float(f) => result.push_str(&format!("{}", f)),
+            TValue::Integer(n) => result.push_str(&crate::float_utils::i64_to_string(*n)),
+            TValue::Float(f) => result.push_str(&crate::float_utils::f64_to_string(*f)),
             _ => {
                 return Err(VmError::RuntimeError(format!(
                     "invalid value (at index {}) in table for 'concat'",

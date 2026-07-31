@@ -217,7 +217,8 @@ const GDKCONST: i32 = 6;
 // Expression descriptor
 // ============================================================================
 
-#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(size_optimized), derive(Debug))]
+#[derive(Clone, PartialEq)]
 pub enum ExpKind {
     Void,
     Nil,
@@ -237,7 +238,8 @@ pub enum ExpKind {
     Upval,
 }
 
-#[derive(Debug, Clone)]
+#[cfg_attr(not(size_optimized), derive(Debug))]
+#[derive(Clone)]
 pub struct ExpDesc {
     pub kind: ExpKind,
     pub info: i64,
@@ -330,8 +332,16 @@ struct ParentVar {
 #[derive(Clone)]
 struct LocalVar {
     name: LuaString,
+    /// 预缓存的 name hash,用于 find_local_ex/find_local_ctc 的快速比较。
+    /// 避免对每个不匹配的 local 都解引用 Rc 读取 hash (perf: LuaString::eq 占 2.87%,
+    /// 其中大部分是 ptr_eq 失败后 deref Rc 读 hash 的开销)。
+    name_hash: u64,
     start_pc: i32,
     active: bool,
+    /// 是否为 `global *` 声明 (name == "(global *)")。
+    /// 预存 bool 避免 lookup_local/find_global_decl 每次迭代都做 as_str() == "(global *)" 字符串比较。
+    /// 放在 active 后的 padding 中, 不增大结构体。
+    is_global_star: bool,
     reg: i32,
     kind: i32,
     ctc_kind: Option<ExpKind>,
@@ -348,6 +358,28 @@ struct LocalVar {
 enum UpvalueOrCtc {
     Upvalue(i32),
     CtcConst(ExpDesc),
+}
+
+/// 一次扫描 locals Vec 的完整查找结果。
+/// 合并 find_local_ctc + find_local_ex + find_named_global_decl + is_undeclared_global(当前作用域)
+/// 为单次线性扫描, 消除 3-4 次重复迭代 + 重复的 active/hash/name 比较。
+/// perf: 这 4 个函数合计占 api.lua 编译热点的 ~18% (find_named_global_decl 6.53%
+/// + find_local_ctc 6.21% + is_undeclared_global 3.42% + find_global_decl 2.33%)。
+#[derive(Debug)]
+enum LocalLookup {
+    /// 编译时常量 (RDKCTC) — 对应 find_local_ctc 返回 Some
+    Ctc(ExpDesc),
+    /// 普通 local (RDKREG/RDKCONST/RDKTOCLOSE/RDKVAVAR) — 对应 find_local_ex 返回 Some
+    Local { reg: i32, kind: i32 },
+    /// 命中具名 global 声明 (GDKREG/GDKCONST) — 对应 find_named_global_decl 返回 Some
+    NamedGlobal(i32),
+    /// 命中 collective `global *` 声明 (GDKREG/GDKCONST)
+    GlobalStar(i32),
+    /// 有非匹配的具名 global 声明且无 `global *` 覆盖 → 未声明全局 (当前作用域)
+    /// 对应 is_undeclared_global 当前作用域 info == -2
+    Undeclared,
+    /// 当前作用域未找到 (无 global 声明或仅有 global *) — 需要查 upvalue
+    NotFound,
 }
 
 struct LabelDesc {
@@ -440,25 +472,27 @@ impl Eq for ConstKey {}
 
 impl Hash for ConstKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            ConstKey::Nil => 0u8.hash(state),
-            ConstKey::Boolean(b) => {
-                1u8.hash(state);
-                b.hash(state);
-            }
+        // perf: 预混合每个 key 为单个 u64, 用 0x9E3779B97F4A7C15 (黄金比例常量)
+        // 乘法扩散, 避免 FxHash 对连续整数的聚类问题 (此前 FxHasher 直接 hash 整数
+        // 导致 const_k 从 0.51% 暴增到 16.09%)。预混合后 FxHash 仅做 1 次 write_u64,
+        // 且不同值的 hash 位分布均匀。SipHash 也受益 (减少 write 调用次数)。
+        // hash_one (ConstKey) 占 2.21%, 切换 FxHash + 预混合后预期降至 < 0.5%。
+        let h = match self {
+            ConstKey::Nil => 0u64,
+            ConstKey::Boolean(b) => 0x100 | (*b as u64),
             ConstKey::Integer(i) => {
-                2u8.hash(state);
-                i.hash(state);
+                let v = *i as u64;
+                0x200 ^ v.wrapping_mul(0x9E3779B97F4A7C15)
             }
             ConstKey::Float(f) => {
-                3u8.hash(state);
-                f.hash(state);
+                0x300 ^ (*f).wrapping_mul(0x9E3779B97F4A7C15)
             }
             ConstKey::Str(s) => {
-                4u8.hash(state);
-                Hash::hash(s, state);
+                // 短字符串已有预计算的 hash (rust_hash, 分布良好)
+                0x400 ^ s.hash()
             }
-        }
+        };
+        state.write_u64(h);
     }
 }
 
@@ -497,11 +531,49 @@ pub struct FuncState<'a> {
     // 每条指令对应的行号（与 code 数组平行），用于在 finalize 时计算 line_info
     inst_lines: Vec<i32>,
     /// 常量索引 — 用于 const_k 的 O(1) 查找，避免线性扫描
+    /// perf: 用默认 SipHash (RandomState)。
+    /// 此前用 FxBuildHasher + 预混合, 但 perf 显示 const_k 从 0.51% 暴增到 12.98%,
+    /// FxHash 对 ConstKey 的哈希质量不佳 (即使预混合), 导致 HashMap 冲突增多。
+    /// SipHash-1-3 虽然单次 hash 较慢, 但冲突少, 整体性能更好。
     const_index: HashMap<ConstKey, i32>,
+    /// 缓存 _ENV 的查找结果, 避免每次全局变量访问都 lookup_local(_ENV) 扫描 locals。
+    /// perf: code_global_via_env/prefix 每次都调用 lookup_local(_ENV), 占 lookup_local
+    /// 10.35% 热点中的约 40% (4%+)。_ENV 位置在函数编译期间固定 (除非 `local _ENV`,
+    /// 极少见), 首次查找后缓存, 后续直接复用。
+    /// 失效: add_local/add_local_kind 中新 local 名为 "_ENV" 时清空。
+    /// 不缓存 Ctc/NamedGlobal (极少见, 每次查)。
+    env_cache: EnvCache,
     #[cfg(debug_assertions)]
     reg_alloc_stack: Vec<RegAllocEntry>,
     #[cfg(debug_assertions)]
     reg_alloc_counter: i32,
+}
+
+/// _ENV 查找结果的缓存 (避免重复扫描 locals + find_upvalue)
+#[derive(Clone, Copy)]
+enum EnvCache {
+    /// 未缓存 (首次查找前 / 失效后)
+    None,
+    /// _ENV 是当前函数的 local (如 `local _ENV = ...`)
+    Local { reg: i32, kind: i32 },
+    /// _ENV 是 upvalue (嵌套函数捕获外层 _ENV)
+    Upvalue(i32),
+    /// _ENV 是隐式 upvalue 0 (顶层函数 / 未捕获的嵌套函数)
+    Implicit,
+}
+
+/// resolve_env 返回的 _ENV 位置 (不缓存 Ctc/NamedGlobal)
+enum EnvResolution {
+    /// _ENV 是 local (reg, kind)
+    Local { reg: i32, kind: i32 },
+    /// _ENV 是 upvalue (idx)
+    Upvalue(i32),
+    /// _ENV 是隐式 upvalue 0
+    Implicit,
+    /// _ENV 是 named global 声明 (报错情况, 不缓存)
+    NamedGlobal,
+    /// _ENV 是编译时常量 (不缓存)
+    Ctc(ExpDesc),
 }
 
 /// ANTLR4: `chunk: block ;` — 编译器入口，初始化 FuncState，解析整个脚本块并生成原型
@@ -587,6 +659,7 @@ impl<'a> FuncState<'a> {
             // 内存开销: 16 桶 * 24 字节 ≈ 384 字节, 可忽略。
             // 注意: 增加到 32 会导致 all.lua 性能下降约 7% (内存浪费影响缓存)。
             const_index: HashMap::with_capacity(16),
+            env_cache: EnvCache::None,
             #[cfg(debug_assertions)]
             reg_alloc_stack: Vec::new(),
             #[cfg(debug_assertions)]
@@ -594,11 +667,11 @@ impl<'a> FuncState<'a> {
         }
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(size_optimized), inline(always))]
     fn ls(&self) -> &LexState<'a> {
         unsafe { &*self.ls }
     }
-    #[inline(always)]
+    #[cfg_attr(not(size_optimized), inline(always))]
     fn ls_mut(&mut self) -> &mut LexState<'a> {
         unsafe { &mut *self.ls }
     }
@@ -641,7 +714,7 @@ impl<'a> FuncState<'a> {
 
     /// Increment nesting level; error if too deep (like C's enterlevel/luaE_incCstack).
     /// Returns false if nesting level exceeded (caller should bail out).
-    #[inline(always)]
+    #[cfg_attr(not(size_optimized), inline(always))]
     fn enterlevel(&mut self) -> bool {
         self.ls_mut().nesting_level += 1;
         if self.ls().nesting_level >= LUAI_MAXCCALLS {
@@ -652,13 +725,13 @@ impl<'a> FuncState<'a> {
     }
 
     /// Decrement nesting level (like C's leavelevel)
-    #[inline(always)]
+    #[cfg_attr(not(size_optimized), inline(always))]
     fn leavelevel(&mut self) {
         self.ls_mut().nesting_level -= 1;
     }
 
     /// Check if there are pending errors (for bailing out of recursion)
-    #[inline(always)]
+    #[cfg_attr(not(size_optimized), inline(always))]
     fn has_errors(&self) -> bool {
         !self.errors.is_empty()
     }
@@ -678,7 +751,14 @@ const MAXIWTHABS: i32 = 128;
 impl<'a> FuncState<'a> {
     /// 发射指令到原型代码数组，返回当前 pc 并自增
     fn emit(&mut self, ins: Instruction) -> i32 {
-        Rc::make_mut(&mut self.proto.code).push(ins);
+        // perf: Rc::get_mut 是非原子指针检查, 比 make_mut 的原子 strong_count 加载快。
+        // 编译期间 proto.code 独占 (refcount=1), get_mut 总是成功。
+        // 用 match 而非 unwrap_or_else 避免闭包借用冲突。
+        let code = match Rc::get_mut(&mut self.proto.code) {
+            Some(v) => v,
+            None => Rc::make_mut(&mut self.proto.code),
+        };
+        code.push(ins);
         self.inst_lines.push(self.ls().lastline);
         let cur = self.pc;
         self.pc += 1;
@@ -688,10 +768,14 @@ impl<'a> FuncState<'a> {
     /// 移除最后一条指令 (对应 C 的 removelastinstruction)。
     /// O(1) pop, 替代 O(n) 的 Vec::remove(index)。
     /// 调用方必须确保要移除的指令就是当前最后一条 (pc - 1)。
-    #[inline(always)]
+    #[cfg_attr(not(size_optimized), inline(always))]
     fn remove_last_instruction(&mut self) {
         debug_assert!(self.pc > 0);
-        Rc::make_mut(&mut self.proto.code).pop();
+        let code = match Rc::get_mut(&mut self.proto.code) {
+            Some(v) => v,
+            None => Rc::make_mut(&mut self.proto.code),
+        };
+        code.pop();
         self.inst_lines.pop();
         self.pc -= 1;
     }
@@ -974,7 +1058,12 @@ impl<'a> FuncState<'a> {
             std::collections::hash_map::Entry::Occupied(e) => *e.get(),
             std::collections::hash_map::Entry::Vacant(e) => {
                 let idx = self.proto.constants.len() as i32;
-                Rc::make_mut(&mut self.proto.constants).push(value);
+                // perf: Rc::get_mut 非原子检查, 编译期独占 (见 emit 注释)
+                let constants = match Rc::get_mut(&mut self.proto.constants) {
+                    Some(v) => v,
+                    None => Rc::make_mut(&mut self.proto.constants),
+                };
+                constants.push(value);
                 *e.insert(idx)
             }
         }
@@ -1223,16 +1312,23 @@ impl<'a> FuncState<'a> {
         // 注册到 proto.locvars (对应 C 的 registerlocalvar)
         let pidx = self.proto.loc_vars.len() as i32;
         let name_ls = self.ls_mut().anchor_string(name);
+        // 失效 _ENV 缓存: 新声明 `local _ENV` 会改变 _ENV 的 resolution
+        if name == "_ENV" {
+            self.env_cache = EnvCache::None;
+        }
         let varname = Some(name_ls.clone());
         self.proto.loc_vars.push(LocVar {
             varname,
             start_pc,
             end_pc: 0,
         });
+        let name_hash = name_ls.hash();
         self.locals.push(LocalVar {
             name: name_ls,
+            name_hash,
             start_pc,
             active: true,
+            is_global_star: false,
             reg,
             kind: VDKREG,
             ctc_kind: None,
@@ -1249,6 +1345,10 @@ impl<'a> FuncState<'a> {
     fn add_local_kind(&mut self, name: &str, start_pc: i32, kind: i32) -> i32 {
         const MAXVARS: i32 = 200;
         let in_reg = kind <= RDKTOCLOSE;
+        // 失效 _ENV 缓存
+        if name == "_ENV" {
+            self.env_cache = EnvCache::None;
+        }
         if in_reg {
             let reglevel = self.reglevel_for_nactvar(self.active_nactvar());
             if reglevel + 1 > MAXVARS {
@@ -1277,10 +1377,14 @@ impl<'a> FuncState<'a> {
         } else {
             -1
         };
+        let name_hash = name_ls.hash();
+        let is_global_star = name == "(global *)";
         self.locals.push(LocalVar {
             name: name_ls,
+            name_hash,
             start_pc,
             active: true,
+            is_global_star,
             reg,
             kind,
             ctc_kind: None,
@@ -1305,6 +1409,10 @@ impl<'a> FuncState<'a> {
     fn add_local_kind_reg(&mut self, name: &str, start_pc: i32, kind: i32, reg: i32) {
         const MAXVARS: i32 = 200;
         let in_reg = kind <= RDKTOCLOSE;
+        // 失效 _ENV 缓存
+        if name == "_ENV" {
+            self.env_cache = EnvCache::None;
+        }
         if in_reg {
             let reglevel = self.reglevel_for_nactvar(self.active_nactvar());
             if reglevel + 1 > MAXVARS {
@@ -1328,10 +1436,14 @@ impl<'a> FuncState<'a> {
         } else {
             -1
         };
+        let name_hash = name_ls.hash();
+        let is_global_star = name == "(global *)";
         self.locals.push(LocalVar {
             name: name_ls,
+            name_hash,
             start_pc,
             active: true,
+            is_global_star,
             reg,
             kind,
             ctc_kind: None,
@@ -1355,11 +1467,18 @@ impl<'a> FuncState<'a> {
 
     fn find_local_ctc(&mut self, name: &LuaString) -> Option<ExpDesc> {
         // 单次线性扫描合并两段逻辑：找到首个匹配后立即返回（ctc_str 或 ctc_info）。
-        // 用 LuaString 之间的比较走 ArcRc::ptr_eq 快速路径，避免 memcmp。
+        // perf: 用 name_hash 预比较快速淘汰不匹配的 local,避免对每个 local 都
+        // 解引用 Rc 读取 hash (LuaString::eq 在 ptr_eq 失败时会 deref Rc 读 hash)。
+        let name_hash = name.hash();
         for lv in self.locals.iter().rev() {
             if !lv.active {
                 continue;
             }
+            // hash 不匹配 → 内容必然不同 → 跳过 (inline 比较,零 Rc deref)
+            if lv.name_hash != name_hash {
+                continue;
+            }
+            // hash 匹配 (极少数情况): 做完整比较确认
             if lv.name == *name {
                 // 找到首个匹配（影子规则）：非 RDKCTC 立即返回 None
                 if lv.kind != RDKCTC {
@@ -1376,6 +1495,117 @@ impl<'a> FuncState<'a> {
             }
         }
         None
+    }
+
+    /// 一次扫描 locals, 合并 find_local_ctc + find_local_ex + find_named_global_decl
+    /// + is_undeclared_global(当前作用域) 的完整查找。
+    /// 消除 3-4 次重复的 locals.iter().rev() 迭代 + 重复的 active/hash/name 比较。
+    /// 行为等价于依次调用这 4 个函数, 但仅扫描一次。
+    #[cfg_attr(not(size_optimized), inline)]
+    fn lookup_local(&mut self, name: &LuaString) -> LocalLookup {
+        let name_hash = name.hash();
+        // info: -1 = 无 global 声明, >=0 = 有 global * (存 collective_kind), -2 = 有非匹配 named global
+        let mut info: i32 = -1;
+        let mut collective_kind: i32 = GDKREG;
+
+        for lv in self.locals.iter().rev() {
+            if !lv.active {
+                continue;
+            }
+
+            if lv.kind >= GDKREG {
+                // global declaration
+                if lv.is_global_star {
+                    // collective: 记录 (仅首次, 对应 C 的 info < 0 检查)
+                    if info < 0 {
+                        info = 0;
+                        collective_kind = lv.kind;
+                    }
+                } else if lv.name_hash == name_hash && lv.name == *name {
+                    // named global 匹配: 立即返回 (影子规则)
+                    return LocalLookup::NamedGlobal(lv.kind);
+                } else {
+                    // named global 不匹配: 设置 -2 (仅当之前无 global *)
+                    if info == -1 {
+                        info = -2;
+                    }
+                }
+            } else {
+                // regular local (RDKREG/RDKCONST/RDKTOCLOSE/RDKCTC/RDKVAVAR)
+                if lv.name_hash != name_hash {
+                    continue;
+                }
+                if lv.name != *name {
+                    continue;
+                }
+                // 名字匹配 (影子规则: 首个匹配立即返回)
+                if lv.kind == RDKCTC {
+                    let kind = lv.ctc_kind.clone().unwrap();
+                    if kind == ExpKind::Str {
+                        if let Some(ref s) = lv.ctc_str {
+                            return LocalLookup::Ctc(ExpDesc::new_str(s.clone()));
+                        }
+                    }
+                    return LocalLookup::Ctc(ExpDesc::new(kind, lv.ctc_info.unwrap()));
+                }
+                // RDKREG/RDKCONST/RDKTOCLOSE/RDKVAVAR
+                return LocalLookup::Local { reg: lv.reg, kind: lv.kind };
+            }
+        }
+
+        if info >= 0 {
+            LocalLookup::GlobalStar(collective_kind)
+        } else if info == -2 {
+            LocalLookup::Undeclared
+        } else {
+            LocalLookup::NotFound
+        }
+    }
+
+    /// 解析 _ENV 的位置, 带缓存。
+    /// 返回 (is_local, local_reg, local_kind, upval_idx):
+    /// - is_local=true: _ENV 是 local, 用 local_reg/local_kind
+    /// - is_local=false, upval_idx>=0: _ENV 是 upvalue idx
+    /// - is_local=false, upval_idx<0: _ENV 是 implicit upvalue 0 (顶层函数)
+    /// 不缓存 Ctc/NamedGlobal (极少见), 调用方需处理这两种情况。
+    /// perf: code_global_via_env/prefix 每次调用 lookup_local(_ENV) 扫描 locals,
+    /// 占 lookup_local 10.35% 热点的约 40%。缓存后直接复用, 跳过 locals 扫描。
+    fn resolve_env(&mut self, env_ls: &LuaString) -> EnvResolution {
+        // 快速路径: 缓存命中 (仅 Upvalue/Implicit, 不缓存 Local)
+        // Local 不缓存: `local _ENV` 在 block 退出后 deactivate, 缓存会失效。
+        // Upvalue/Implicit 在函数编译期间位置固定, 可安全缓存。
+        match self.env_cache {
+            EnvCache::Upvalue(idx) => {
+                return EnvResolution::Upvalue(idx);
+            }
+            EnvCache::Implicit => {
+                return EnvResolution::Implicit;
+            }
+            _ => {}
+        }
+        // 缓存未命中: lookup_local + find_upvalue, 然后缓存
+        let env_lookup = self.lookup_local(env_ls);
+        match env_lookup {
+            LocalLookup::NamedGlobal(_) => EnvResolution::NamedGlobal,
+            LocalLookup::Ctc(ctc) => EnvResolution::Ctc(ctc),
+            LocalLookup::Local { reg, kind } => {
+                // 不缓存 Local: `local _ENV` 声明在 block 退出后 deactivate
+                EnvResolution::Local { reg, kind }
+            }
+            LocalLookup::GlobalStar(_) | LocalLookup::Undeclared | LocalLookup::NotFound => {
+                // 不是 local, 查 upvalue
+                match self.find_upvalue(env_ls) {
+                    Some(UpvalueOrCtc::Upvalue(idx)) => {
+                        self.env_cache = EnvCache::Upvalue(idx);
+                        EnvResolution::Upvalue(idx)
+                    }
+                    _ => {
+                        self.env_cache = EnvCache::Implicit;
+                        EnvResolution::Implicit
+                    }
+                }
+            }
+        }
     }
 
     /// 在父作用域中查找上值，若找到则创建 UpvalDesc 并返回上值索引
@@ -1700,8 +1930,17 @@ impl<'a> FuncState<'a> {
     /// 如果名字匹配则不继续搜索（返回 None 表示是全局变量）。
     /// 遇到 global * 时不停止搜索，继续查找 local 变量。
     fn find_local_ex(&self, name: &LuaString) -> Option<(i32, i32)> {
+        // perf: 用 name_hash 预比较快速淘汰不匹配的 local,避免对每个 local 都
+        // 解引用 Rc 读取 hash (LuaString::eq 在 ptr_eq 失败时会 deref Rc 读 hash)。
+        let name_hash = name.hash();
         for lv in self.locals.iter().rev() {
             if !lv.active {
+                continue;
+            }
+            // hash 不匹配 → 内容必然不同 → 跳过 (inline 比较,零 Rc deref)
+            // 例外: global * 的名字是 "(global *)",hash 不会匹配用户变量,
+            // 所以 global * 仍然会被正确跳过 (C 的 searchvar 也不匹配 global *)
+            if lv.name_hash != name_hash {
                 continue;
             }
             if lv.kind >= GDKREG {
@@ -1728,6 +1967,7 @@ impl<'a> FuncState<'a> {
         // - collective (global *): if info < 0, record info & remember kind
         // - named global matches: return its kind
         // - named global non-match: if info == -1, set info = -2 (invalidate preambular only)
+        let name_hash = name.hash();
         let mut info: i32 = -1;
         let mut collective_kind: i32 = GDKREG;
         for lv in self.locals.iter().rev() {
@@ -1735,20 +1975,25 @@ impl<'a> FuncState<'a> {
                 continue;
             }
             if lv.kind >= GDKREG {
-                if lv.name.as_str() == "(global *)" {
+                // global declaration: must process even if hash doesn't match,
+                // because global * sets collective_kind for all variables
+                if lv.is_global_star {
                     if info < 0 {
                         info = 0;
                         collective_kind = lv.kind;
                     }
-                } else if lv.name == *name {
+                } else if lv.name_hash == name_hash && lv.name == *name {
                     return Some(lv.kind);
                 } else {
                     if info == -1 {
                         info = -2;
                     }
                 }
-            } else if lv.name == *name {
-                return None;
+            } else {
+                // regular local: hash 预比较快速淘汰不匹配的 local
+                if lv.name_hash == name_hash && lv.name == *name {
+                    return None;
+                }
             }
         }
         if info >= 0 {
@@ -1767,7 +2012,7 @@ impl<'a> FuncState<'a> {
                 continue;
             }
             if lv.kind >= GDKREG {
-                if lv.name.as_str() == "(global *)" {
+                if lv.is_global_star {
                     // collective declaration: skip (handled by find_global_decl)
                     continue;
                 } else if lv.name == *name {
@@ -1800,7 +2045,7 @@ impl<'a> FuncState<'a> {
                 continue;
             }
             if lv.kind >= GDKREG {
-                if lv.name.as_str() == "(global *)" {
+                if lv.is_global_star {
                     if info < 0 {
                         info = 0; // any non-negative value
                     }
@@ -1819,6 +2064,13 @@ impl<'a> FuncState<'a> {
         // Parent function scopes (singlevaraux recursion). A named global
         // declaration in an ancestor that isn't covered by a collective also
         // makes the variable undeclared.
+        self.is_undeclared_global_parent(name)
+    }
+
+    /// 只检查 parent_locals 中的 global 声明状态 (当前作用域已由 lookup_local 处理)。
+    /// 供 lookup_local 返回 Undeclared/NotFound 后, find_upvalue 也失败时调用。
+    /// 对应 is_undeclared_global 的 parent 扫描部分。
+    fn is_undeclared_global_parent(&self, name: &LuaString) -> bool {
         let mut parent_info: i32 = -1;
         let mut global_star_active = false;
         for pvar in self.parent_locals.iter().rev() {
@@ -2734,13 +2986,13 @@ fn final_target(code: &[u32], mut i: i32) -> i32 {
 // ============================================================================
 
 /// ANTLR4: 终端匹配 — 检查当前 token 是否与给定 token 类型相同
-#[inline(always)]
+#[cfg_attr(not(size_optimized), inline(always))]
 fn check(fs: &FuncState, t: &Token) -> bool {
     std::mem::discriminant(&fs.ls().token) == std::mem::discriminant(t)
 }
 
 /// ANTLR4: 终端匹配+消费 — 检查并消费当前 token
-#[inline(always)]
+#[cfg_attr(not(size_optimized), inline(always))]
 fn test_next(fs: &mut FuncState, t: &Token) -> bool {
     let l = fs.ls_mut();
     if std::mem::discriminant(&l.token) == std::mem::discriminant(t) {
@@ -2753,7 +3005,7 @@ fn test_next(fs: &mut FuncState, t: &Token) -> bool {
 
 /// ANTLR4: 终端匹配断言 — 期望当前 token 匹配，否则报错并跳过
 /// 对应 C 的 error_expected: 调用 luaX_syntaxerror 生成 "TOKEN expected near CURTOKEN"
-#[inline(always)]
+#[cfg_attr(not(size_optimized), inline(always))]
 fn expect(fs: &mut FuncState, t: &Token) {
     if !check(fs, t) {
         syntax_error_with_token(fs, &format!("{} expected", t.to_display_str()));
@@ -2952,7 +3204,7 @@ fn solve_gotos_for_block(
                     .rev()
                     .find(|lv| lv.nactvar == gt.nactvar)
                     .map(|lv| {
-                        if lv.name == "(global *)" {
+                        if lv.is_global_star {
                             "*".to_string()
                         } else {
                             lv.name.to_string()
@@ -5200,7 +5452,8 @@ fn parse_args(fs: &mut FuncState) -> (i32, bool) {
     (n, last_is_call || last_is_vararg)
 }
 
-#[derive(Debug, Clone)]
+#[cfg_attr(not(size_optimized), derive(Debug))]
+#[derive(Clone)]
 struct PrefixResult {
     var_name: Option<LuaString>,
     local_idx: Option<i32>,
@@ -5227,9 +5480,12 @@ struct PrefixResult {
 fn code_global_via_env_prefix(fs: &mut FuncState, name: &str) -> PrefixResult {
     // 一次性获取缓存的 "_ENV" LuaString，所有查找复用同一指针，走 ArcRc::ptr_eq 快速路径
     let env_ls = fs.ls_mut().env_str_cached();
+    // perf: 用 resolve_env 缓存 _ENV 位置, 避免每次全局变量访问都 lookup_local(_ENV) 扫描 locals。
+    // 缓存命中时 O(1) 直接返回 Local/Upvalue/Implicit, 跳过 locals 扫描 + find_upvalue。
+    let env_resolution = fs.resolve_env(&env_ls);
     // C's buildglobal raises "_ENV is global when accessing variable 'X'" when
     // _ENV itself is a named global declaration.
-    if fs.find_named_global_decl(&env_ls).is_some() {
+    if matches!(env_resolution, EnvResolution::NamedGlobal) {
         fs.error(&format!(
             "_ENV is global when accessing variable '{}'",
             name
@@ -5242,132 +5498,87 @@ fn code_global_via_env_prefix(fs: &mut FuncState, name: &str) -> PrefixResult {
     // 检查是否有 global <const> 声明（read-only）
     // 搜索父函数链以检测子函数中的 global const 赋值（对应 C 的 singlevaraux 递归）
     let is_readonly = !is_env && fs.find_global_kind_in_chain(&name_ls) == Some(GDKCONST);
+    let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
+        && (k as u32) <= crate::opcodes::MAXINDEXRK;
     // Like C buildglobal: singlevaraux(fs, "_ENV", ...) finds _ENV.
     // _ENV can be a local (VLOCAL), a local const (VCONST), or an upvalue (VUPVAL).
     // For VCONST, luaK_exp2anyregup discharges it to a register first.
-    if let Some(env_ctc) = fs.find_local_ctc(&env_ls) {
-        // _ENV is a compile-time constant (local _ENV <const> = ...).
-        // Like C's luaK_exp2anyregup + luaK_indexed:
-        // discharge the constant to a register, then use GETFIELD/SETFIELD.
-        let env_r = fs.alloc_reg();
-        match env_ctc.kind {
-            ExpKind::Int => {
-                let val = env_ctc.info;
-                if fits_sbx(val) {
-                    fs.code_asbx(OpCode::LOADI, env_r, val as i32);
-                } else {
-                    let kk = fs.int_k(val);
-                    fs.code_loadk(env_r, kk);
-                }
-            }
-            ExpKind::Float => {
-                let f = f64::from_bits(env_ctc.info as u64);
-                let fi = f as i64;
-                if (fi as f64) == f && fits_sbx(fi) {
-                    fs.code_asbx(OpCode::LOADF, env_r, fi as i32);
-                } else {
-                    let kk = fs.float_k(f);
-                    fs.code_loadk(env_r, kk);
-                }
-            }
-            ExpKind::Str => {
-                let kk = fs.get_str_k(&env_ctc);
-                fs.code_loadk(env_r, kk);
-            }
-            ExpKind::Boolean => {
-                if env_ctc.info != 0 {
-                    fs.code_abc(OpCode::LOADTRUE, env_r, 0, 0);
-                } else {
-                    fs.code_abc(OpCode::LOADFALSE, env_r, 0, 0);
-                }
-            }
-            ExpKind::Nil => {
-                fs.code_nil(env_r, 1);
-            }
-            _ => {
-                let kk = fs.discharge_str(&mut env_ctc.clone());
-                fs.code_loadk(env_r, kk);
-            }
-        }
-        let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
-            && (k as u32) <= crate::opcodes::MAXINDEXRK;
-        if is_short_str {
-            PrefixResult {
-                var_name: Some(name_ls.clone()),
-                local_idx: None,
-                key: None,
-                reg: None,
-                table_reg: Some(env_r),
-                table_key: Some(k),
-                table_key_is_const: true,
-                table_key_is_int: false,
-                key_allocated_reg: false,
-                allocated_reg: true,
-                is_upvalue: false,
-                upval_idx: None,
-                env_gettabup_pc: -1,
-                has_call: false,
-                call_pc: -1,
-                is_vvargvar: false,
-                is_readonly,
-            }
-        } else {
-            let kr = fs.alloc_reg();
-            fs.code_loadk(kr, k);
-            PrefixResult {
-                var_name: Some(name_ls.clone()),
-                local_idx: None,
-                key: None,
-                reg: None,
-                table_reg: Some(env_r),
-                table_key: Some(kr),
-                table_key_is_const: false,
-                table_key_is_int: false,
-                key_allocated_reg: true,
-                allocated_reg: true,
-                is_upvalue: false,
-                upval_idx: None,
-                env_gettabup_pc: -1,
-                has_call: false,
-                call_pc: -1,
-                is_vvargvar: false,
-                is_readonly,
-            }
-        }
-    } else if let Some((env_reg, kind)) = fs.find_local_ex(&env_ls) {
-        let is_vvargvar = kind == RDKVAVAR;
-        if is_vvargvar {
-            // _ENV 是命名 vararg 参数（VVARGVAR）：键必须在寄存器中。
-            // 匹配 C 的 luaK_indexed：对 VVARGVAR 调用 luaK_exp2anyreg 强制键到寄存器，
-            // 使用 SETTABLE/GETTABLE 而非 SETFIELD/GETFIELD。
-            // is_vvargvar: true 让赋值时设置 PF_VATAB，这样：
-            // 1. GETVARG 会被 luaK_finish 转为 GETTABLE
-            // 2. RETURN1 不会被转为 RETURN（PF_VAHID 被清除）
-            let kr = fs.alloc_reg();
-            fs.code_loadk(kr, k);
-            PrefixResult {
-                var_name: Some(name_ls.clone()),
-                local_idx: None,
-                key: None,
-                reg: None,
-                table_reg: Some(env_reg),
-                table_key: Some(kr),
-                table_key_is_const: false,
-                table_key_is_int: false,
-                key_allocated_reg: true,
-                allocated_reg: false,
-                is_upvalue: false,
-                upval_idx: None,
-                env_gettabup_pc: -1,
-                has_call: false,
-                call_pc: -1,
-                is_vvargvar: true,
-                is_readonly,
-            }
-        } else {
-            let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
-                && (k as u32) <= crate::opcodes::MAXINDEXRK;
+    match env_resolution {
+        EnvResolution::Ctc(mut env_ctc) => {
+            // _ENV is a compile-time constant (local _ENV <const> = ...).
+            // discharge the constant to a register, then use GETFIELD/SETFIELD.
+            let env_r = fs.alloc_reg();
+            discharge_ctc_to_reg(fs, &mut env_ctc, env_r);
             if is_short_str {
+                PrefixResult {
+                    var_name: Some(name_ls.clone()),
+                    local_idx: None,
+                    key: None,
+                    reg: None,
+                    table_reg: Some(env_r),
+                    table_key: Some(k),
+                    table_key_is_const: true,
+                    table_key_is_int: false,
+                    key_allocated_reg: false,
+                    allocated_reg: true,
+                    is_upvalue: false,
+                    upval_idx: None,
+                    env_gettabup_pc: -1,
+                    has_call: false,
+                    call_pc: -1,
+                    is_vvargvar: false,
+                    is_readonly,
+                }
+            } else {
+                let kr = fs.alloc_reg();
+                fs.code_loadk(kr, k);
+                PrefixResult {
+                    var_name: Some(name_ls.clone()),
+                    local_idx: None,
+                    key: None,
+                    reg: None,
+                    table_reg: Some(env_r),
+                    table_key: Some(kr),
+                    table_key_is_const: false,
+                    table_key_is_int: false,
+                    key_allocated_reg: true,
+                    allocated_reg: true,
+                    is_upvalue: false,
+                    upval_idx: None,
+                    env_gettabup_pc: -1,
+                    has_call: false,
+                    call_pc: -1,
+                    is_vvargvar: false,
+                    is_readonly,
+                }
+            }
+        }
+        EnvResolution::Local { reg: env_reg, kind } => {
+            let is_vvargvar = kind == RDKVAVAR;
+            if is_vvargvar {
+                // _ENV 是命名 vararg 参数（VVARGVAR）：键必须在寄存器中。
+                let kr = fs.alloc_reg();
+                fs.code_loadk(kr, k);
+                PrefixResult {
+                    var_name: Some(name_ls.clone()),
+                    local_idx: None,
+                    key: None,
+                    reg: None,
+                    table_reg: Some(env_reg),
+                    table_key: Some(kr),
+                    table_key_is_const: false,
+                    table_key_is_int: false,
+                    key_allocated_reg: true,
+                    allocated_reg: false,
+                    is_upvalue: false,
+                    upval_idx: None,
+                    env_gettabup_pc: -1,
+                    has_call: false,
+                    call_pc: -1,
+                    is_vvargvar: true,
+                    is_readonly,
+                }
+            } else if is_short_str {
                 PrefixResult {
                     var_name: Some(name_ls.clone()),
                     local_idx: None,
@@ -5414,38 +5625,112 @@ fn code_global_via_env_prefix(fs: &mut FuncState, name: &str) -> PrefixResult {
                 }
             }
         }
-    } else {
-        // _ENV is not a local: it must be an upvalue.
-        // Register _ENV as an upvalue first (like C's singlevaraux searching for _ENV),
-        // so it gets the correct upvalue index before any user upvalues are created.
-        let env_upval_idx = match fs.find_upvalue(&env_ls) {
-            Some(UpvalueOrCtc::Upvalue(idx)) => idx,
-            _ => 0, // fallback: implicit _ENV at upvalue #0
-        };
-        PrefixResult {
-            var_name: Some(name_ls.clone()),
-            local_idx: None,
-            key: Some(k),
-            reg: None,
-            table_reg: None,
-            table_key: None,
-            table_key_is_const: false,
-            table_key_is_int: false,
-            key_allocated_reg: false,
-            allocated_reg: false,
-            is_upvalue: is_env,
-            upval_idx: if is_env {
-                Some(env_upval_idx)
-            } else {
-                Some(env_upval_idx)
-            },
-            env_gettabup_pc: -1,
-            has_call: false,
-            call_pc: -1,
-            is_vvargvar: false,
-            is_readonly,
+        EnvResolution::Upvalue(env_upval_idx) => {
+            // _ENV is an upvalue captured from parent.
+            PrefixResult {
+                var_name: Some(name_ls.clone()),
+                local_idx: None,
+                key: Some(k),
+                reg: None,
+                table_reg: None,
+                table_key: None,
+                table_key_is_const: false,
+                table_key_is_int: false,
+                key_allocated_reg: false,
+                allocated_reg: false,
+                is_upvalue: is_env,
+                upval_idx: Some(env_upval_idx),
+                env_gettabup_pc: -1,
+                has_call: false,
+                call_pc: -1,
+                is_vvargvar: false,
+                is_readonly,
+            }
+        }
+        EnvResolution::Implicit => {
+            // _ENV is the implicit upvalue #0 (top-level function)
+            PrefixResult {
+                var_name: Some(name_ls.clone()),
+                local_idx: None,
+                key: Some(k),
+                reg: None,
+                table_reg: None,
+                table_key: None,
+                table_key_is_const: false,
+                table_key_is_int: false,
+                key_allocated_reg: false,
+                allocated_reg: false,
+                is_upvalue: is_env,
+                upval_idx: Some(0),
+                env_gettabup_pc: -1,
+                has_call: false,
+                call_pc: -1,
+                is_vvargvar: false,
+                is_readonly,
+            }
+        }
+        EnvResolution::NamedGlobal => {
+            // 上面已报错, 降级到 implicit upvalue 0
+            PrefixResult {
+                var_name: Some(name_ls.clone()),
+                local_idx: None,
+                key: Some(k),
+                reg: None,
+                table_reg: None,
+                table_key: None,
+                table_key_is_const: false,
+                table_key_is_int: false,
+                key_allocated_reg: false,
+                allocated_reg: false,
+                is_upvalue: is_env,
+                upval_idx: Some(0),
+                env_gettabup_pc: -1,
+                has_call: false,
+                call_pc: -1,
+                is_vvargvar: false,
+                is_readonly,
+            }
         }
     }
+}
+
+/// 将 CTC (编译时常量) ExpDesc discharge 到指定寄存器 r。
+/// 提取自 parse_prefix_exp 的 CTC 处理分支, 供 LocalLookup::Ctc 和 UpvalueOrCtc::CtcConst 复用。
+fn discharge_ctc_to_reg(fs: &mut FuncState, ctc: &mut ExpDesc, r: i32) {
+    match ctc.kind {
+        ExpKind::Int => {
+            let val = ctc.info;
+            if fits_sbx(val) {
+                fs.code_asbx(OpCode::LOADI, r, val as i32);
+            } else {
+                let k = fs.int_k(val);
+                fs.code_loadk(r, k);
+            }
+        }
+        ExpKind::Float => {
+            let f = f64::from_bits(ctc.info as u64);
+            let k = fs.float_k(f);
+            fs.code_loadk(r, k);
+        }
+        ExpKind::Str => {
+            let k = fs.discharge_str(ctc);
+            fs.code_loadk(r, k);
+        }
+        ExpKind::Boolean => {
+            if ctc.info != 0 {
+                fs.code_abc(OpCode::LOADTRUE, r, 0, 0);
+            } else {
+                fs.code_abc(OpCode::LOADFALSE, r, 0, 0);
+            }
+        }
+        ExpKind::Nil => {
+            fs.code_nil(r, 1);
+        }
+        _ => {
+            let k = fs.discharge_str(ctc);
+            fs.code_loadk(r, k);
+        }
+    };
 }
 
 /// ANTLR4: `prefixexp: varOrExp | functioncall | '(' expr ')' ;` 以及 `var: NAME | prefixexp '[' expr ']' | prefixexp '.' NAME ;`
@@ -5455,194 +5740,139 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
             let name = name.clone();
             fs.ls_mut().next();
             let name_str = name.as_str(); // 用于 code_global_via_env_prefix(&str) 等需要 &str 的位置
-            if let Some(mut ctc) = fs.find_local_ctc(&name) {
-                let r = fs.alloc_reg();
-                match ctc.kind {
-                    ExpKind::Int => {
-                        let val = ctc.info;
-                        if fits_sbx(val) {
-                            fs.code_asbx(OpCode::LOADI, r, val as i32);
-                        } else {
-                            let k = fs.int_k(val);
-                            fs.code_loadk(r, k);
-                        }
+            // perf: 一次扫描 locals 合并 find_local_ctc + find_local_ex + find_named_global_decl
+            // + is_undeclared_global(当前作用域), 消除 3-4 次重复迭代 (parse_prefix_exp 占 4.47% 热点)。
+            let lookup = fs.lookup_local(&name);
+            match lookup {
+                LocalLookup::Ctc(mut ctc) => {
+                    // CTC: discharge 常量到寄存器
+                    let r = fs.alloc_reg();
+                    discharge_ctc_to_reg(fs, &mut ctc, r);
+                    PrefixResult {
+                        var_name: Some(name.clone()),
+                        local_idx: Some(r),
+                        key: None,
+                        reg: Some(r),
+                        table_reg: None,
+                        table_key: None,
+                        table_key_is_const: false,
+                        table_key_is_int: false,
+                        key_allocated_reg: false,
+                        allocated_reg: true,
+                        is_upvalue: false,
+                        upval_idx: None,
+                        env_gettabup_pc: -1,
+                        has_call: false,
+                        call_pc: -1,
+                        is_vvargvar: false,
+                        is_readonly: true,
                     }
-                    ExpKind::Float => {
-                        let f = f64::from_bits(ctc.info as u64);
-                        let k = fs.float_k(f);
-                        fs.code_loadk(r, k);
-                    }
-                    ExpKind::Str => {
-                        let k = fs.discharge_str(&mut ctc);
-                        fs.code_loadk(r, k);
-                    }
-                    ExpKind::Boolean => {
-                        if ctc.info != 0 {
-                            fs.code_abc(OpCode::LOADTRUE, r, 0, 0);
-                        } else {
-                            fs.code_abc(OpCode::LOADFALSE, r, 0, 0);
-                        }
-                    }
-                    ExpKind::Nil => {
-                        fs.code_nil(r, 1);
-                    }
-                    _ => {
-                        let k = fs.discharge_str(&mut ctc);
-                        fs.code_loadk(r, k);
-                    }
-                };
-                PrefixResult {
-                    var_name: Some(name.clone()),
-                    local_idx: Some(r),
-                    key: None,
-                    reg: Some(r),
-                    table_reg: None,
-                    table_key: None,
-                    table_key_is_const: false,
-                    table_key_is_int: false,
-                    key_allocated_reg: false,
-                    allocated_reg: true,
-                    is_upvalue: false,
-                    upval_idx: None,
-                    env_gettabup_pc: -1,
-                    has_call: false,
-                    call_pc: -1,
-                    is_vvargvar: false,
-                    is_readonly: true,
                 }
-            } else if let Some((reg, kind)) = fs.find_local_ex(&name) {
-                let is_vvargvar = kind == RDKVAVAR;
-                let is_readonly = kind != VDKREG;
-                PrefixResult {
-                    var_name: if is_readonly {
-                        Some(name.clone())
-                    } else {
-                        None
-                    },
-                    local_idx: Some(reg),
-                    key: None,
-                    reg: Some(reg),
-                    table_reg: None,
-                    table_key: None,
-                    table_key_is_const: false,
-                    table_key_is_int: false,
-                    key_allocated_reg: false,
-                    allocated_reg: false,
-                    is_upvalue: false,
-                    upval_idx: None,
-                    env_gettabup_pc: -1,
-                    has_call: false,
-                    call_pc: -1,
-                    is_vvargvar,
-                    is_readonly,
+                LocalLookup::Local { reg, kind } => {
+                    let is_vvargvar = kind == RDKVAVAR;
+                    let is_readonly = kind != VDKREG;
+                    PrefixResult {
+                        var_name: if is_readonly {
+                            Some(name.clone())
+                        } else {
+                            None
+                        },
+                        local_idx: Some(reg),
+                        key: None,
+                        reg: Some(reg),
+                        table_reg: None,
+                        table_key: None,
+                        table_key_is_const: false,
+                        table_key_is_int: false,
+                        key_allocated_reg: false,
+                        allocated_reg: false,
+                        is_upvalue: false,
+                        upval_idx: None,
+                        env_gettabup_pc: -1,
+                        has_call: false,
+                        call_pc: -1,
+                        is_vvargvar,
+                        is_readonly,
+                    }
                 }
-            } else if fs.find_named_global_decl(&name).is_some() {
                 // 具名 global 声明（如 `global a`）：优先于 upvalue，通过 _ENV[name] 访问。
-                // 匹配 C 的 searchvar：具名 global 匹配时立即返回 VGLOBAL，优先于 upvalue 查找。
-                code_global_via_env_prefix(fs, name_str)
-            } else if let Some(result) = fs.find_upvalue(&name) {
-                match result {
-                    UpvalueOrCtc::Upvalue(upval_idx) => {
-                        // Don't eagerly load the upvalue into a register.
-                        // Like C's singlevar which returns VUPVAL, we delay the GETUPVAL
-                        // until load_func or the Dot/LBracket suffix handlers need it.
-                        // This avoids duplicate GETUPVAL instructions and matches C's behavior.
-                        // check_readonly: propagate const-ness from upvalue kind
-                        // (corresponds to C's check_readonly for VUPVAL with kind!=VDKREG)
-                        let uv_kind = fs.proto.upvalues[upval_idx as usize].kind as i32;
-                        let is_readonly = uv_kind != VDKREG;
-                        PrefixResult {
-                            var_name: if is_readonly {
-                                Some(name.clone())
-                            } else {
-                                None
-                            },
-                            local_idx: None,
-                            key: None,
-                            reg: None,
-                            table_reg: None,
-                            table_key: None,
-                            table_key_is_const: false,
-                            table_key_is_int: false,
-                            key_allocated_reg: false,
-                            allocated_reg: false,
-                            is_upvalue: true,
-                            upval_idx: Some(upval_idx),
-                            env_gettabup_pc: -1,
-                            has_call: false,
-                            call_pc: -1,
-                            is_vvargvar: false,
-                            is_readonly,
-                        }
-                    }
-                    UpvalueOrCtc::CtcConst(mut ctc) => {
-                        // Like find_local_ctc handling: load constant into a register
-                        let r = fs.alloc_reg();
-                        match ctc.kind {
-                            ExpKind::Int => {
-                                let val = ctc.info;
-                                if fits_sbx(val) {
-                                    fs.code_asbx(OpCode::LOADI, r, val as i32);
-                                } else {
-                                    let k = fs.int_k(val);
-                                    fs.code_loadk(r, k);
+                LocalLookup::NamedGlobal(_) => {
+                    code_global_via_env_prefix(fs, name_str)
+                }
+                // collective `global *` / Undeclared / NotFound: 先查 upvalue
+                LocalLookup::GlobalStar(_) | LocalLookup::Undeclared | LocalLookup::NotFound => {
+                    if let Some(result) = fs.find_upvalue(&name) {
+                        match result {
+                            UpvalueOrCtc::Upvalue(upval_idx) => {
+                                // Don't eagerly load the upvalue into a register.
+                                // Like C's singlevar which returns VUPVAL, we delay the GETUPVAL
+                                // until load_func or the Dot/LBracket suffix handlers need it.
+                                // This avoids duplicate GETUPVAL instructions and matches C's behavior.
+                                // check_readonly: propagate const-ness from upvalue kind
+                                // (corresponds to C's check_readonly for VUPVAL with kind!=VDKREG)
+                                let uv_kind = fs.proto.upvalues[upval_idx as usize].kind as i32;
+                                let is_readonly = uv_kind != VDKREG;
+                                PrefixResult {
+                                    var_name: if is_readonly {
+                                        Some(name.clone())
+                                    } else {
+                                        None
+                                    },
+                                    local_idx: None,
+                                    key: None,
+                                    reg: None,
+                                    table_reg: None,
+                                    table_key: None,
+                                    table_key_is_const: false,
+                                    table_key_is_int: false,
+                                    key_allocated_reg: false,
+                                    allocated_reg: false,
+                                    is_upvalue: true,
+                                    upval_idx: Some(upval_idx),
+                                    env_gettabup_pc: -1,
+                                    has_call: false,
+                                    call_pc: -1,
+                                    is_vvargvar: false,
+                                    is_readonly,
                                 }
                             }
-                            ExpKind::Float => {
-                                let f = f64::from_bits(ctc.info as u64);
-                                let k = fs.float_k(f);
-                                fs.code_loadk(r, k);
-                            }
-                            ExpKind::Str => {
-                                let k = fs.discharge_str(&mut ctc);
-                                fs.code_loadk(r, k);
-                            }
-                            ExpKind::Boolean => {
-                                if ctc.info != 0 {
-                                    fs.code_abc(OpCode::LOADTRUE, r, 0, 0);
-                                } else {
-                                    fs.code_abc(OpCode::LOADFALSE, r, 0, 0);
+                            UpvalueOrCtc::CtcConst(mut ctc) => {
+                                // Like find_local_ctc handling: load constant into a register
+                                let r = fs.alloc_reg();
+                                discharge_ctc_to_reg(fs, &mut ctc, r);
+                                PrefixResult {
+                                    var_name: Some(name.clone()),
+                                    local_idx: Some(r),
+                                    key: None,
+                                    reg: Some(r),
+                                    table_reg: None,
+                                    table_key: None,
+                                    table_key_is_const: false,
+                                    table_key_is_int: false,
+                                    key_allocated_reg: false,
+                                    allocated_reg: true,
+                                    is_upvalue: false,
+                                    upval_idx: None,
+                                    env_gettabup_pc: -1,
+                                    has_call: false,
+                                    call_pc: -1,
+                                    is_vvargvar: false,
+                                    is_readonly: true,
                                 }
                             }
-                            ExpKind::Nil => {
-                                fs.code_nil(r, 1);
-                            }
-                            _ => {
-                                let k = fs.discharge_str(&mut ctc);
-                                fs.code_loadk(r, k);
-                            }
-                        };
-                        PrefixResult {
-                            var_name: Some(name.clone()),
-                            local_idx: Some(r),
-                            key: None,
-                            reg: Some(r),
-                            table_reg: None,
-                            table_key: None,
-                            table_key_is_const: false,
-                            table_key_is_int: false,
-                            key_allocated_reg: false,
-                            allocated_reg: true,
-                            is_upvalue: false,
-                            upval_idx: None,
-                            env_gettabup_pc: -1,
-                            has_call: false,
-                            call_pc: -1,
-                            is_vvargvar: false,
-                            is_readonly: true,
                         }
+                    } else {
+                        // upvalue 未找到: 检查 undeclared
+                        // Undeclared: 当前作用域有非匹配 named global 无 global * → is_undeclared_global 返回 true
+                        // GlobalStar/NotFound: 当前作用域无 undeclared, 但 parent 可能有 → 检查 parent
+                        if matches!(lookup, LocalLookup::Undeclared) {
+                            fs.error(&format!("variable '{}' not declared", name));
+                        } else if fs.is_undeclared_global_parent(&name) {
+                            fs.error(&format!("variable '{}' not declared", name));
+                        }
+                        code_global_via_env_prefix(fs, name_str)
                     }
                 }
-            } else {
-                // 全局变量（collective `global *` 或隐式全局）通过 _ENV[name] 访问。
-                // 匹配 C 的 buildvar：先 singlevaraux 查找 local/upvalue（已在上面处理），
-                // 未找到则 buildglobal 通过 _ENV[name] 访问。
-                // C's buildvar: if singlevaraux returns VGLOBAL with info==-2,
-                // raise "variable 'X' not declared".
-                if fs.is_undeclared_global(&name) {
-                    fs.error(&format!("variable '{}' not declared", name));
-                }
-                code_global_via_env_prefix(fs, name_str)
             }
         }
         Token::LParen => {
@@ -6245,7 +6475,8 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
 // Expressions (Pratt)
 // ============================================================================
 
-#[derive(Debug, Clone)]
+#[cfg_attr(not(size_optimized), derive(Debug))]
+#[derive(Clone)]
 struct ExprItem {
     exp: ExpDesc,
 }
@@ -6284,7 +6515,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         let mut matched = false;
 
         if limit <= PREC_AND && check(fs, &Token::And) {
-            let mut e_left = e.exp.clone();
+            let mut e_left = std::mem::replace(&mut e.exp, ExpDesc::new(ExpKind::Void, 0));
             fs.ls_mut().next();
 
             if e_left.kind == ExpKind::VJMP && e_left.info != NO_JUMP as i64 {
@@ -6341,7 +6572,9 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             }
 
             let e2 = parse_subexpr(fs, PREC_AND + 1);
-            let mut e2_exp = e2.exp.clone();
+            // perf: 用 destructure 替代 clone, 避免 ExpDesc (40 字节) 的深拷贝。
+            // e2 后续不再使用, 可直接 move 出 exp 字段。
+            let ExprItem { exp: mut e2_exp } = e2;
             if e2_exp.kind == ExpKind::Call {
                 // Like C's luaK_dischargevars + setoneret for VCALL:
                 // VCALL → VNONRELOC (info = A register), clear info2
@@ -6355,7 +6588,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         }
 
         if limit <= PREC_OR && check(fs, &Token::Or) {
-            let mut e_left = e.exp.clone();
+            let mut e_left = std::mem::replace(&mut e.exp, ExpDesc::new(ExpKind::Void, 0));
             fs.ls_mut().next();
 
             if e_left.kind == ExpKind::VJMP && e_left.info != NO_JUMP as i64 {
@@ -6411,7 +6644,8 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
             }
 
             let e2 = parse_subexpr(fs, PREC_AND);
-            let mut e2_exp = e2.exp.clone();
+            // perf: 用 destructure 替代 clone, 避免 ExpDesc (40 字节) 的深拷贝。
+            let ExprItem { exp: mut e2_exp } = e2;
             if e2_exp.kind == ExpKind::Call {
                 // Like C's luaK_dischargevars + setoneret for VCALL:
                 // VCALL → VNONRELOC (info = A register), clear info2
@@ -6425,7 +6659,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         }
 
         if limit <= PREC_COMP && check_compare(fs) {
-            let mut ec = e.exp.clone();
+            let mut ec = std::mem::replace(&mut e.exp, ExpDesc::new(ExpKind::Void, 0));
             let op_tok = fs.ls().token.clone();
             let is_gt = matches!(op_tok, Token::Gt | Token::GtEq);
             let is_eq = matches!(op_tok, Token::EqEq | Token::TildeEq);
@@ -6951,7 +7185,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         }
 
         if limit <= PREC_BOR && check(fs, &Token::Pipe) {
-            let mut ec = e.exp.clone();
+            let mut ec = std::mem::replace(&mut e.exp, ExpDesc::new(ExpKind::Void, 0));
             let mut flip = false;
             // Like C's subexpr: consume operator first, then discharge e1
             fs.ls_mut().next();
@@ -7030,10 +7264,10 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     // BOR variant: like C's codebinNoK + codebinexpval
                     // Like C's codebinNoK: if flip, swap back to original order,
                     // then codebinexpval processes original e2 first, then e1.
-                    let (first_ec, first_e2) = if flip {
-                        (&ec.clone(), &e2.exp.clone())
+                    let (first_ec, first_e2): (&ExpDesc, &ExpDesc) = if flip {
+                        (&ec, &e2.exp)
                     } else {
-                        (&e2.exp.clone(), &ec.clone())
+                        (&e2.exp, &ec)
                     };
                     // Process the first operand (original e2 in C's codebinexpval)
                     let v2 = if matches!(first_ec.kind, ExpKind::NonReloc) && !first_ec.has_jumps()
@@ -7090,7 +7324,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         }
 
         if limit <= PREC_BXOR && check(fs, &Token::Tilde) {
-            let mut ec = e.exp.clone();
+            let mut ec = std::mem::replace(&mut e.exp, ExpDesc::new(ExpKind::Void, 0));
             let mut flip = false;
             // Like C's subexpr: consume operator first, then discharge e1
             fs.ls_mut().next();
@@ -7169,10 +7403,10 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     // BXOR variant: like C's codebinNoK + codebinexpval
                     // Like C's codebinNoK: if flip, swap back to original order,
                     // then codebinexpval processes original e2 first, then e1.
-                    let (first_ec, first_e2) = if flip {
-                        (&ec.clone(), &e2.exp.clone())
+                    let (first_ec, first_e2): (&ExpDesc, &ExpDesc) = if flip {
+                        (&ec, &e2.exp)
                     } else {
-                        (&e2.exp.clone(), &ec.clone())
+                        (&e2.exp, &ec)
                     };
                     // Process the first operand (original e2 in C's codebinexpval)
                     let v2 = if matches!(first_ec.kind, ExpKind::NonReloc) && !first_ec.has_jumps()
@@ -7229,7 +7463,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         }
 
         if limit <= PREC_BAND && check(fs, &Token::Ampersand) {
-            let mut ec = e.exp.clone();
+            let mut ec = std::mem::replace(&mut e.exp, ExpDesc::new(ExpKind::Void, 0));
             let mut flip = false;
             // Like C's subexpr: consume operator first, then discharge e1
             fs.ls_mut().next();
@@ -7309,12 +7543,12 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
                     // When flip=true, C's codebinNoK swaps back to original order,
                     // then codebinexpval processes e2 (original) first, then e1.
                     // We need to match this order for correct register allocation.
-                    let (first_ec, first_e2) = if flip {
+                    let (first_ec, first_e2): (&ExpDesc, &ExpDesc) = if flip {
                         // Swap back to original order: ec was e2, e2 was e1
                         // C processes original e2 first (now ec), then original e1 (now e2)
-                        (&ec.clone(), &e2.exp.clone())
+                        (&ec, &e2.exp)
                     } else {
-                        (&e2.exp.clone(), &ec.clone())
+                        (&e2.exp, &ec)
                     };
                     // Process the first operand (original e2 in C's codebinexpval)
                     let v2 = if matches!(first_ec.kind, ExpKind::NonReloc) && !first_ec.has_jumps()
@@ -7371,7 +7605,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         }
 
         if limit <= PREC_SHL && check(fs, &Token::LtLt) {
-            let mut ec = e.exp.clone();
+            let mut ec = std::mem::replace(&mut e.exp, ExpDesc::new(ExpKind::Void, 0));
             // Like C's subexpr: consume operator first, then discharge e1
             fs.ls_mut().next();
             let bin_line = fs.ls().lastline;
@@ -7520,7 +7754,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         }
 
         if limit <= PREC_SHL && check(fs, &Token::GtGt) {
-            let mut ec = e.exp.clone();
+            let mut ec = std::mem::replace(&mut e.exp, ExpDesc::new(ExpKind::Void, 0));
             // Like C's subexpr: consume operator first, then discharge e1
             fs.ls_mut().next();
             let bin_line = fs.ls().lastline;
@@ -7643,7 +7877,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         }
 
         if limit <= PREC_CONCAT && check(fs, &Token::DotDot) {
-            let mut ec = e.exp.clone();
+            let mut ec = std::mem::replace(&mut e.exp, ExpDesc::new(ExpKind::Void, 0));
             // Like C's subexpr: consume operator first, then discharge e1
             // (so GETTABLE/MOVE get operator's line, matching C's luaK_infix for OPR_CONCAT)
             fs.ls_mut().next();
@@ -7731,7 +7965,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         }
 
         if limit <= PREC_ADD && check_addop(fs) {
-            let mut ec = e.exp.clone();
+            let mut ec = std::mem::replace(&mut e.exp, ExpDesc::new(ExpKind::Void, 0));
             let is_add = check(fs, &Token::Plus);
             // Like C's subexpr: capture operator's line, consume operator,
             // THEN discharge e1 (so GETTABLE gets operator's line).
@@ -8610,7 +8844,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         }
 
         if limit <= PREC_MUL && check_mulop(fs) {
-            let mut ec = e.exp.clone();
+            let mut ec = std::mem::replace(&mut e.exp, ExpDesc::new(ExpKind::Void, 0));
             let is_mul = check(fs, &Token::Star);
             let is_div = check(fs, &Token::Slash);
             let is_idiv = check(fs, &Token::SlashSlash);
@@ -9799,7 +10033,7 @@ fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
         }
 
         if limit <= PREC_POW && check(fs, &Token::Caret) {
-            let mut ec = e.exp.clone();
+            let mut ec = std::mem::replace(&mut e.exp, ExpDesc::new(ExpKind::Void, 0));
             // Like C's subexpr: consume operator first, then discharge e1
             fs.ls_mut().next();
             let bin_line = fs.ls().lastline;
@@ -10166,10 +10400,12 @@ fn check_mulop(fs: &FuncState) -> bool {
 fn code_global_via_env(fs: &mut FuncState, name: &str) -> ExpDesc {
     // 一次性获取缓存的 "_ENV" LuaString，所有查找复用同一指针，走 ArcRc::ptr_eq 快速路径
     let env_ls = fs.ls_mut().env_str_cached();
-    // C's buildglobal calls singlevaraux(fs, "_ENV", ...) which returns VGLOBAL
-    // when _ENV itself is a named global declaration, then raises
-    // "_ENV is global when accessing variable 'X'".
-    if fs.find_named_global_decl(&env_ls).is_some() {
+    // perf: 用 resolve_env 缓存 _ENV 位置, 避免每次全局变量访问都 lookup_local(_ENV) 扫描 locals。
+    // 缓存命中时 O(1) 直接返回 Local/Upvalue/Implicit, 跳过 locals 扫描 + find_upvalue。
+    let env_resolution = fs.resolve_env(&env_ls);
+    // C's buildglobal raises "_ENV is global when accessing variable 'X'" when
+    // _ENV itself is a named global declaration.
+    if matches!(env_resolution, EnvResolution::NamedGlobal) {
         fs.error(&format!(
             "_ENV is global when accessing variable '{}'",
             name
@@ -10179,75 +10415,85 @@ fn code_global_via_env(fs: &mut FuncState, name: &str) -> ExpDesc {
     // Like C's singlevar + luaK_indexed: resolve _ENV as local, upvalue, or implicit
     let is_short_str =
         name.len() <= crate::strings::LUAI_MAXSHORTLEN && (k as u32) <= crate::opcodes::MAXINDEXRK;
-    let env_local_ex = fs.find_local_ex(&env_ls);
-    let env_upval = if env_local_ex.is_none() {
-        match fs.find_upvalue(&env_ls) {
-            Some(UpvalueOrCtc::Upvalue(idx)) => Some(idx),
-            _ => None,
-        }
-    } else {
-        None
-    };
-    let (r, pc) = if let Some((env_reg, kind)) = env_local_ex {
-        let is_vvargvar = kind == RDKVAVAR;
-        if is_vvargvar {
-            // _ENV 是命名 vararg 参数（VVARGVAR）：键必须在寄存器中。
-            // 匹配 C 的 luaK_indexed + VVARGIND discharge：
-            // 1. LOADK 加载键到 kr
-            // 2. 释放 kr（freeregs）
-            // 3. 生成 GETVARG A=0（VRELOC），后续 exp_to_reg 会复用 kr 并 patch A
-            // 4. luaK_finish 将 GETVARG 转为 GETTABLE（因为有 PF_VATAB）
-            let kr = fs.alloc_reg();
-            fs.code_loadk(kr, k);
-            // Free key register (like C's freeregs in VVARGIND discharge)
-            if kr >= fs.nvarstack() && kr == fs.freereg - 1 {
+    let (r, pc) = match env_resolution {
+        EnvResolution::Local { reg: env_reg, kind } => {
+            let is_vvargvar = kind == RDKVAVAR;
+            if is_vvargvar {
+                // _ENV 是命名 vararg 参数（VVARGVAR）：键必须在寄存器中。
+                let kr = fs.alloc_reg();
+                fs.code_loadk(kr, k);
+                if kr >= fs.nvarstack() && kr == fs.freereg - 1 {
+                    fs.free_reg();
+                }
+                let pc = fs.code_abc(OpCode::GETVARG, 0, env_reg, kr);
+                return ExpDesc::new_reloc_with_pc(kr as i64, pc);
+            } else if is_short_str {
+                let r = fs.alloc_reg();
+                let pc = code_getfield(fs, r, env_reg, k);
+                (r, pc)
+            } else {
+                let env_r = fs.alloc_reg();
+                fs.code_abc(OpCode::MOVE, env_r, env_reg, 0);
+                let r = fs.alloc_reg();
+                let pc = code_getfield(fs, r, env_r, k);
                 fs.free_reg();
+                (r, pc)
             }
-            // Generate GETVARG with A=0 (relocatable), like C compiler
-            let pc = fs.code_abc(OpCode::GETVARG, 0, env_reg, kr);
-            return ExpDesc::new_reloc_with_pc(kr as i64, pc);
-        } else if is_short_str {
-            // _ENV is a local variable in current function: use GETFIELD
-            let r = fs.alloc_reg();
-            let pc = code_getfield(fs, r, env_reg, k);
-            (r, pc)
-        } else {
-            let env_r = fs.alloc_reg();
-            fs.code_abc(OpCode::MOVE, env_r, env_reg, 0);
-            let r = fs.alloc_reg();
-            let pc = code_getfield(fs, r, env_r, k);
-            fs.free_reg(); // free env_r
-            (r, pc)
         }
-    } else if let Some(uv_idx) = env_upval {
-        // _ENV is an upvalue captured from parent: use GETTABUP with actual upvalue index
-        if is_short_str {
-            let r = fs.alloc_reg();
-            let pc = code_gettabup(fs, r, uv_idx, k);
-            (r, pc)
-        } else {
-            let env_r = fs.alloc_reg();
-            fs.code_abc(OpCode::GETUPVAL, env_r, uv_idx, 0);
-            let kr = fs.alloc_reg();
-            fs.code_loadk(kr, k);
-            let pc = fs.code_abc(OpCode::GETTABLE, env_r, env_r, kr);
-            fs.free_reg(); // free kr
-            (env_r, pc)
+        EnvResolution::Upvalue(uv_idx) => {
+            if is_short_str {
+                let r = fs.alloc_reg();
+                let pc = code_gettabup(fs, r, uv_idx, k);
+                (r, pc)
+            } else {
+                let env_r = fs.alloc_reg();
+                fs.code_abc(OpCode::GETUPVAL, env_r, uv_idx, 0);
+                let kr = fs.alloc_reg();
+                fs.code_loadk(kr, k);
+                let pc = fs.code_abc(OpCode::GETTABLE, env_r, env_r, kr);
+                fs.free_reg();
+                (env_r, pc)
+            }
         }
-    } else {
-        // _ENV is the implicit upvalue #0 (top-level function)
-        if is_short_str {
+        EnvResolution::Implicit => {
+            // _ENV is the implicit upvalue #0 (top-level function)
+            if is_short_str {
+                let r = fs.alloc_reg();
+                let pc = code_gettabup(fs, r, 0, k);
+                (r, pc)
+            } else {
+                let env_r = fs.alloc_reg();
+                fs.code_abc(OpCode::GETUPVAL, env_r, 0, 0);
+                let kr = fs.alloc_reg();
+                fs.code_loadk(kr, k);
+                let pc = fs.code_abc(OpCode::GETTABLE, env_r, env_r, kr);
+                fs.free_reg();
+                (env_r, pc)
+            }
+        }
+        EnvResolution::NamedGlobal => {
+            // 上面已报错, 降级到 implicit
             let r = fs.alloc_reg();
             let pc = code_gettabup(fs, r, 0, k);
             (r, pc)
-        } else {
+        }
+        EnvResolution::Ctc(mut env_ctc) => {
+            // _ENV is a compile-time constant (local _ENV <const> = ...).
+            // discharge the constant to a register, then use GETFIELD.
             let env_r = fs.alloc_reg();
-            fs.code_abc(OpCode::GETUPVAL, env_r, 0, 0);
-            let kr = fs.alloc_reg();
-            fs.code_loadk(kr, k);
-            let pc = fs.code_abc(OpCode::GETTABLE, env_r, env_r, kr);
-            fs.free_reg(); // free kr
-            (env_r, pc)
+            discharge_ctc_to_reg(fs, &mut env_ctc, env_r);
+            if is_short_str {
+                let r = fs.alloc_reg();
+                let pc = code_getfield(fs, r, env_r, k);
+                fs.free_reg(); // free env_r
+                (r, pc)
+            } else {
+                let kr = fs.alloc_reg();
+                fs.code_loadk(kr, k);
+                let pc = fs.code_abc(OpCode::GETTABLE, env_r, env_r, kr);
+                fs.free_reg(); // free kr
+                (env_r, pc)
+            }
         }
     };
     ExpDesc {
@@ -10269,66 +10515,112 @@ fn code_global_via_env(fs: &mut FuncState, name: &str) -> ExpDesc {
 /// 2. 查找具名 global 声明（如 `global a`），优先于 upvalue
 /// 3. 查找 upvalue（`global *` 不阻止 upvalue 查找）
 /// 4. 未找到则作为全局变量（`global *` 或隐式全局）通过 _ENV[name] 访问
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 fn parse_simple_exp_name(fs: &mut FuncState, name: LuaString) -> ExpDesc {
-    if let Some(ctc) = fs.find_local_ctc(&name) {
-        ctc
-    } else if let Some((reg, kind)) = fs.find_local_ex(&name) {
-        if kind == RDKVAVAR {
-            ExpDesc::new(ExpKind::VVARGVAR, reg as i64)
-        } else {
-            ExpDesc::new(ExpKind::NonReloc, reg as i64)
+    // perf: 一次扫描 locals 合并 find_local_ctc + find_local_ex + find_named_global_decl
+    // + is_undeclared_global(当前作用域), 消除 3-4 次重复迭代。
+    // 这 4 个函数合计占 api.lua 编译热点 ~18%。
+    match fs.lookup_local(&name) {
+        LocalLookup::Ctc(ctc) => ctc,
+        LocalLookup::Local { reg, kind } => {
+            if kind == RDKVAVAR {
+                ExpDesc::new(ExpKind::VVARGVAR, reg as i64)
+            } else {
+                ExpDesc::new(ExpKind::NonReloc, reg as i64)
+            }
         }
-    } else if let Some(_kind) = fs.find_named_global_decl(&name) {
-        // 具名 global 声明（如 `global a`）：优先于 upvalue，通过 _ENV[name] 访问
-        code_global_via_env(fs, name.as_str())
-    } else if let Some(result) = fs.find_upvalue(&name) {
-        match result {
-            UpvalueOrCtc::Upvalue(upval_idx) => {
-                // Like C's singlevar returning VUPVAL: delay GETUPVAL emission.
-                // GETUPVAL is emitted when the value is needed (e.g., in expr_to_reg).
+        // 具名 global 声明（如 `global a`）: 优先于 upvalue，通过 _ENV[name] 访问
+        LocalLookup::NamedGlobal(_) => {
+            code_global_via_env(fs, name.as_str())
+        }
+        // collective `global *`: 不阻止 upvalue 查找 (CLAUDE.md 约定)
+        // 先查 upvalue, 若失败再走 _ENV[name]
+        LocalLookup::GlobalStar(_) => {
+            if let Some(result) = fs.find_upvalue(&name) {
+                match result {
+                    UpvalueOrCtc::Upvalue(upval_idx) => {
+                        ExpDesc {
+                            kind: ExpKind::Upval,
+                            info: upval_idx as i64,
+                            info2: 0,
+                            t: NO_JUMP,
+                            f: NO_JUMP,
+                            str_val: None,
+                        }
+                    }
+                    UpvalueOrCtc::CtcConst(ctc) => ctc,
+                }
+            } else {
+                code_global_via_env(fs, name.as_str())
+            }
+        }
+        // 当前作用域有非匹配 named global 无 global * 覆盖 → 可能 undeclared
+        // 需查 upvalue (parent_locals) 确认 parent 是否有覆盖或匹配
+        LocalLookup::Undeclared => {
+            if let Some(result) = fs.find_upvalue(&name) {
+                match result {
+                    UpvalueOrCtc::Upvalue(upval_idx) => {
+                        ExpDesc {
+                            kind: ExpKind::Upval,
+                            info: upval_idx as i64,
+                            info2: 0,
+                            t: NO_JUMP,
+                            f: NO_JUMP,
+                            str_val: None,
+                        }
+                    }
+                    UpvalueOrCtc::CtcConst(ctc) => ctc,
+                }
+            } else {
+                // parent 也未覆盖: undeclared
+                fs.error(&format!("variable '{}' not declared", name));
+                code_global_via_env(fs, name.as_str())
+            }
+        }
+        // 当前作用域未找到 (无 global 声明): 查 upvalue
+        LocalLookup::NotFound => {
+            if let Some(result) = fs.find_upvalue(&name) {
+                match result {
+                    UpvalueOrCtc::Upvalue(upval_idx) => {
+                        // Like C's singlevar returning VUPVAL: delay GETUPVAL emission.
+                        // GETUPVAL is emitted when the value is needed (e.g., in expr_to_reg).
+                        ExpDesc {
+                            kind: ExpKind::Upval,
+                            info: upval_idx as i64,
+                            info2: 0,
+                            t: NO_JUMP,
+                            f: NO_JUMP,
+                            str_val: None,
+                        }
+                    }
+                    UpvalueOrCtc::CtcConst(ctc) => ctc,
+                }
+            } else if name == "_ENV" {
+                // _ENV 是 upvalue (在 Rust 实现中不是 local)。
+                // 返回 ExpKind::Upval 延迟 GETUPVAL 发射, LBracket/Dot 处理器会在正确时机发射。
+                let env_ls = fs.ls_mut().env_str_cached();
+                let env_idx = match fs.find_upvalue(&env_ls) {
+                    Some(UpvalueOrCtc::Upvalue(idx)) => idx,
+                    _ => 0, // fallback: should not happen for _ENV
+                };
                 ExpDesc {
                     kind: ExpKind::Upval,
-                    info: upval_idx as i64,
+                    info: env_idx as i64,
                     info2: 0,
                     t: NO_JUMP,
                     f: NO_JUMP,
                     str_val: None,
                 }
-            }
-            UpvalueOrCtc::CtcConst(ctc) => ctc,
-        }
-    } else if name == "_ENV" {
-        if let Some(env_reg) = fs.find_local("_ENV") {
-            ExpDesc::new(ExpKind::NonReloc, env_reg as i64)
-        } else {
-            // _ENV is an upvalue (not a local). Return ExpKind::Upval to delay
-            // GETUPVAL emission, matching C's singlevar returning VUPVAL.
-            // The LBracket/Dot handlers will emit GETUPVAL at the right time.
-            // Use find_upvalue to get the correct upvalue index (not hardcoded 0).
-            let env_ls = fs.ls_mut().env_str_cached();
-            let env_idx = match fs.find_upvalue(&env_ls) {
-                Some(UpvalueOrCtc::Upvalue(idx)) => idx,
-                _ => 0, // fallback: should not happen for _ENV
-            };
-            ExpDesc {
-                kind: ExpKind::Upval,
-                info: env_idx as i64,
-                info2: 0,
-                t: NO_JUMP,
-                f: NO_JUMP,
-                str_val: None,
+            } else {
+                // 当前作用域无 global 声明, parent 也无 upvalue:
+                // is_undeclared_global 当前作用域返回 false (info == -1),
+                // 但 parent 可能有非匹配 named global → 需检查 parent
+                if fs.is_undeclared_global_parent(&name) {
+                    fs.error(&format!("variable '{}' not declared", name));
+                }
+                code_global_via_env(fs, name.as_str())
             }
         }
-    } else {
-        // 全局变量（`global *` 或隐式全局）通过 _ENV[name] 访问
-        // C's buildvar: if singlevaraux returns VGLOBAL with info==-2,
-        // raise "variable 'X' not declared" (named global declaration
-        // without a covering collective).
-        if fs.is_undeclared_global(&name) {
-            fs.error(&format!("variable '{}' not declared", name));
-        }
-        code_global_via_env(fs, name.as_str())
     }
 }
 
@@ -10474,27 +10766,31 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
             let op_line = fs.ls().linenumber;
             fs.ls_mut().next();
             let ei = parse_subexpr(fs, PREC_UNARY);
+            // perf: 把 ei.exp 提前 move 出来, 避免 VJMP 分支的 ei.exp.clone()。
+            // 其他分支只读 i32 字段 (Copy), 不影响。
+            let ei_exp = ei.exp;
             match op_tok {
                 Token::Not => {
-                    match ei.exp.kind {
-                        ExpKind::Nil | ExpKind::Boolean if ei.exp.info == 0 => {
+                    match ei_exp.kind {
+                        ExpKind::Nil | ExpKind::Boolean if ei_exp.info == 0 => {
                             let mut e = ExpDesc::new(ExpKind::Boolean, 1);
-                            e.t = ei.exp.f;
-                            e.f = ei.exp.t;
+                            e.t = ei_exp.f;
+                            e.f = ei_exp.t;
                             fs.remove_values(e.t);
                             fs.remove_values(e.f);
                             e
                         }
                         ExpKind::Int | ExpKind::Float | ExpKind::Str | ExpKind::Boolean => {
                             let mut e = ExpDesc::new(ExpKind::Boolean, 0);
-                            e.t = ei.exp.f;
-                            e.f = ei.exp.t;
+                            e.t = ei_exp.f;
+                            e.f = ei_exp.t;
                             fs.remove_values(e.t);
                             fs.remove_values(e.f);
                             e
                         }
                         ExpKind::VJMP => {
-                            let mut e = ei.exp.clone();
+                            // perf: 直接 move ei_exp, 避免 clone (40 字节拷贝)
+                            let mut e = ei_exp;
                             fs.negate_condition(e.info as i32);
                             std::mem::swap(&mut e.t, &mut e.f);
                             fs.remove_values(e.t);
@@ -10504,7 +10800,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                         _ => {
                             // Like C's codenot: discharge2anyreg (no jump resolution),
                             // freeexp, code NOT, set VRELOC, swap t/f, removevalues.
-                            let r = fs.discharge_to_any_reg(&ei.exp);
+                            let r = fs.discharge_to_any_reg(&ei_exp);
                             // freeexp: free the register if it's a temp at top of stack
                             if r >= fs.nvarstack() && r == fs.freereg - 1 {
                                 fs.free_reg();
@@ -10512,8 +10808,8 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                             let pc = fs.code_abc(OpCode::NOT, 0, r, 0);
                             let mut e = ExpDesc::new_reloc_with_pc(0, pc);
                             // Swap t/f (NOT inverts truthiness)
-                            e.t = ei.exp.f;
-                            e.f = ei.exp.t;
+                            e.t = ei_exp.f;
+                            e.f = ei_exp.t;
                             fs.remove_values(e.t);
                             fs.remove_values(e.f);
                             e
@@ -10521,20 +10817,20 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     }
                 }
                 Token::Minus => {
-                    if ei.exp.has_jumps() {
-                        let r = fs.exp_to_reg(&ei.exp);
+                    if ei_exp.has_jumps() {
+                        let r = fs.exp_to_reg(&ei_exp);
                         let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
                         fs.fixline(op_line);
                         fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
                         ExpDesc::new_reloc_with_pc(r as i64, pc)
                     } else {
-                        match ei.exp.kind {
-                            ExpKind::Int => ExpDesc::new(ExpKind::Int, ei.exp.info.wrapping_neg()),
+                        match ei_exp.kind {
+                            ExpKind::Int => ExpDesc::new(ExpKind::Int, ei_exp.info.wrapping_neg()),
                             ExpKind::Float => {
-                                let f = f64::from_bits(ei.exp.info as u64);
+                                let f = f64::from_bits(ei_exp.info as u64);
                                 let result = -f;
                                 if result.is_nan() || result == 0.0 {
-                                    let r = fs.exp_to_reg(&ei.exp);
+                                    let r = fs.exp_to_reg(&ei_exp);
                                     let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
                                     fs.fixline(op_line);
                                     fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
@@ -10544,7 +10840,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                                 }
                             }
                             _ => {
-                                let r = fs.exp_to_reg(&ei.exp);
+                                let r = fs.exp_to_reg(&ei_exp);
                                 let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
                                 fs.fixline(op_line);
                                 fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
@@ -10555,28 +10851,28 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 }
                 Token::Hash => {
                     // Like C's codeunexpval: exp2anyreg + freeexp + codeABC(A=0) + VRELOC
-                    let r = fs.exp_to_reg(&ei.exp);
+                    let r = fs.exp_to_reg(&ei_exp);
                     fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
                     let pc = fs.code_abc(OpCode::LEN, 0, r, 0);
                     fs.fixline(op_line);
                     ExpDesc::new_reloc_with_pc(r as i64, pc)
                 }
                 Token::Tilde => {
-                    if ei.exp.has_jumps() {
-                        let r = fs.exp_to_reg(&ei.exp);
+                    if ei_exp.has_jumps() {
+                        let r = fs.exp_to_reg(&ei_exp);
                         let pc = fs.code_abc(OpCode::BNOT, 0, r, 0);
                         fs.fixline(op_line);
                         fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
                         ExpDesc::new_reloc_with_pc(r as i64, pc)
                     } else {
-                        match ei.exp.kind {
-                            ExpKind::Int => ExpDesc::new(ExpKind::Int, !(ei.exp.info)),
+                        match ei_exp.kind {
+                            ExpKind::Int => ExpDesc::new(ExpKind::Int, !(ei_exp.info)),
                             ExpKind::Float => {
                                 // Like C's constfolding: convert float to int, then BNOT
-                                if let Some(i) = to_int_const(&ei.exp) {
+                                if let Some(i) = to_int_const(&ei_exp) {
                                     ExpDesc::new(ExpKind::Int, !i)
                                 } else {
-                                    let r = fs.exp_to_reg(&ei.exp);
+                                    let r = fs.exp_to_reg(&ei_exp);
                                     let pc = fs.code_abc(OpCode::BNOT, 0, r, 0);
                                     fs.fixline(op_line);
                                     fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
@@ -10584,7 +10880,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                                 }
                             }
                             _ => {
-                                let r = fs.exp_to_reg(&ei.exp);
+                                let r = fs.exp_to_reg(&ei_exp);
                                 let pc = fs.code_abc(OpCode::BNOT, 0, r, 0);
                                 fs.fixline(op_line);
                                 fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
@@ -10594,7 +10890,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     }
                 }
                 _ => {
-                    let r = fs.exp_to_reg(&ei.exp);
+                    let r = fs.exp_to_reg(&ei_exp);
                     ExpDesc::new(ExpKind::Relocable, r as i64)
                 }
             }
@@ -11695,8 +11991,10 @@ fn parse_for(fs: &mut FuncState) {
             let kind = if i == 0 { RDKCONST } else { VDKREG };
             fs.locals.push(LocalVar {
                 name: var_name.clone(),
+                name_hash: var_name.hash(),
                 start_pc: fs.pc,
                 active: false,
+                is_global_star: false,
                 reg: 0,
                 kind,
                 ctc_kind: None,
@@ -12222,7 +12520,8 @@ fn parse_local(fs: &mut FuncState) {
                     // Don't discharge Vararg now; handle after loop like C's adjust_assign
                     last_is_vararg = true;
                     last_vararg_pc = ei.exp.info2;
-                    last_exp = Some(ei.exp.clone());
+                    // perf: move 替代 clone, break 后 ei.exp 不再使用
+                    last_exp = Some(ei.exp);
                     n_vals += 1;
                     break;
                 }
@@ -12266,7 +12565,8 @@ fn parse_local(fs: &mut FuncState) {
                             fs.set_freereg(target);
                             let _ = fs.exp_to_reg(&ei.exp);
                         }
-                        last_exp = Some(ei.exp.clone());
+                        // perf: move 替代 clone, 这是 ei.exp 的最后一次使用
+                        last_exp = Some(ei.exp);
                     }
                 }
                 n_vals += 1;
@@ -12362,8 +12662,10 @@ fn parse_local(fs: &mut FuncState) {
                 let nactvar = fs.active_nactvar();
                 fs.locals.push(LocalVar {
                     name: names[nvars - 1].clone(),
+                    name_hash: names[nvars - 1].hash(),
                     start_pc: pc,
                     active: true,
+                    is_global_star: false,
                     reg: 0,
                     kind: RDKCTC,
                     ctc_kind: Some(last_e.kind.clone()),

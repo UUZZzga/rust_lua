@@ -40,21 +40,21 @@ mod inner_lock {
     pub struct RwLock<T: ?Sized>(pub RefCell<T>);
 
     impl<T> RwLock<T> {
-        #[inline(always)]
+        #[cfg_attr(not(size_optimized), inline(always))]
         pub const fn new(val: T) -> Self {
             RwLock(RefCell::new(val))
         }
-        #[inline(always)]
+        #[cfg_attr(not(size_optimized), inline(always))]
         pub fn read(&self) -> std::cell::Ref<'_, T> {
             self.0.borrow()
         }
-        #[inline(always)]
+        #[cfg_attr(not(size_optimized), inline(always))]
         pub fn write(&self) -> std::cell::RefMut<'_, T> {
             self.0.borrow_mut()
         }
         /// UNSAFE: 直接获取内部 RefCell 的裸指针 (供绕过借用检查使用)。
         /// 调用方需保证单线程独占访问 (非 threaded 模式下 StringTable 是 !Sync)。
-        #[inline(always)]
+        #[cfg_attr(not(size_optimized), inline(always))]
         pub fn as_ptr(&self) -> *mut T {
             self.0.as_ptr()
         }
@@ -91,6 +91,9 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::os::raw::c_char;
 
+// 默认模式 (性能优先): 使用 hashbrown::HashTable 单级哈希表
+// size_optimized: 使用 std::collections::HashMap 两级结构, 减小二进制体积
+#[cfg(not(size_optimized))]
 use hashbrown::HashTable;
 
 // ============================================================================
@@ -166,7 +169,7 @@ pub enum LuaString {
 // ============================================================================
 
 /// 比较两个字符串的内容是否相同，忽略任一侧末尾可能的 NUL 字节。
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 fn content_eq(a: &str, b: &str) -> bool {
     let ab = a.as_bytes();
     let bb = b.as_bytes();
@@ -200,7 +203,7 @@ impl PartialEq for LongString {
 /// 加 hash 预比较后：hash 不同 → 立即返回 false（O(1)，仅 1 条 `cmp` 指令），
 /// 避免进入 content_eq。hash 相同时（hash 冲突，极少见）才走 content_eq 检查实际内容。
 impl PartialEq for LuaString {
-    #[inline]
+    #[cfg_attr(not(size_optimized), inline)]
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (LuaString::Short(a), LuaString::Short(b)) => {
@@ -222,19 +225,19 @@ impl Eq for LuaString {}
 // 与 &str / String 的内容比较 (用于编译器内部 `lv.name == "x"` 等便捷比较)
 // 通过 as_str() O(1) 取 slice 再做字节比较, 无额外分配。
 impl PartialEq<str> for LuaString {
-    #[inline]
+    #[cfg_attr(not(size_optimized), inline)]
     fn eq(&self, other: &str) -> bool {
         self.as_str() == other
     }
 }
 impl PartialEq<&str> for LuaString {
-    #[inline]
+    #[cfg_attr(not(size_optimized), inline)]
     fn eq(&self, other: &&str) -> bool {
         self.as_str() == *other
     }
 }
 impl PartialEq<LuaString> for str {
-    #[inline]
+    #[cfg_attr(not(size_optimized), inline)]
     fn eq(&self, other: &LuaString) -> bool {
         self == other.as_str()
     }
@@ -294,19 +297,22 @@ impl Hash for LuaString {
 
 /// 字符串表 — 管理短字符串的内部化。
 ///
-/// 使用 `HashTable<ArcRc<ShortString>>` 单级哈希表，每个条目仅 8 字节（指针）。
-/// 相比之前 `HashMap<u64, Vec<ArcRc<ShortString>>>` 的两级结构（每条目 32 字节）：
+/// # 默认模式 (性能优先)
+/// 使用 `hashbrown::HashTable<ArcRc<ShortString>>` 单级哈希表，每个条目仅 8 字节（指针）。
+/// 相比 `HashMap<u64, Vec<ArcRc<ShortString>>>` 的两级结构（每条目 32 字节）：
 /// - 4 倍缓存密度（每缓存行 8 条目 vs 2 条目），减少 cache miss
 /// - 消除 Vec 迭代开销（len 检查、索引、边界检查）
 /// - hashbrown SIMD 探测直接在字符串 hash 上进行，等效函数仅比较内容
-/// perf annotate 显示原结构中 `shl $0x5`（×32 偏移）占 intern 时间显著比例，
-/// 改为 8 字节条目后变为 `shl $0x3`（×8 偏移）。
 ///
-/// 注：使用 `hashbrown::HashTable`（公开 API），它包装了内部的 `RawTable`，
-/// 提供 `find(hash, eq)` / `insert_unique(hash, value)` / `find_entry(hash, eq)`
-/// 等方法（无需传 hasher，由调用方传入预计算 hash）。
+#[cfg(not(size_optimized))]
 pub struct StringTable {
     ht: RwLock<HashTable<ArcRc<ShortString>>>,
+    nuse: RwLock<usize>,
+}
+
+#[cfg(size_optimized)]
+pub struct StringTable {
+    ht: RwLock<std::collections::HashMap<u64, Vec<ArcRc<ShortString>>>>,
     nuse: RwLock<usize>,
 }
 
@@ -318,6 +324,7 @@ impl Debug for StringTable {
     }
 }
 
+#[cfg(not(size_optimized))]
 impl StringTable {
     pub fn new() -> Self {
         // 初始容量 256: perf 显示 intern 是 finish_grow 的主要 caller (12 次),
@@ -330,10 +337,17 @@ impl StringTable {
         }
     }
     /// 内部化一个短字符串。
-    #[inline]
+    #[cfg_attr(not(size_optimized), inline)]
     #[cfg(not(feature = "threaded"))]
     pub fn intern(&self, str: &str) -> LuaString {
-        let h = rust_hash(str);
+        self.intern_with_hash(str, rust_hash(str))
+    }
+
+    /// 内部化一个短字符串 (使用预计算的 hash, 避免重复计算)。
+    /// 用于词法分析器标识符缓存: 缓存查找时已计算 hash, 未命中时直接传入。
+    #[cfg_attr(not(size_optimized), inline)]
+    #[cfg(not(feature = "threaded"))]
+    pub fn intern_with_hash(&self, str: &str, h: u64) -> LuaString {
         debug_assert!(str.len() <= LUAI_MAXSHORTLEN, "intern 只用于短字符串");
 
         let str_bytes = str.as_bytes();
@@ -386,10 +400,16 @@ impl StringTable {
     }
 
     /// 内部化一个短字符串 (threaded 模式 — 走 RwLock 保证线程安全).
-    #[inline]
+    #[cfg_attr(not(size_optimized), inline)]
     #[cfg(feature = "threaded")]
     pub fn intern(&self, str: &str) -> LuaString {
-        let h = rust_hash(str);
+        self.intern_with_hash(str, rust_hash(str))
+    }
+
+    /// 内部化一个短字符串 (使用预计算的 hash, threaded 模式).
+    #[cfg_attr(not(size_optimized), inline)]
+    #[cfg(feature = "threaded")]
+    pub fn intern_with_hash(&self, str: &str, h: u64) -> LuaString {
         debug_assert!(str.len() <= LUAI_MAXSHORTLEN, "intern 只用于短字符串");
 
         let str_bytes = str.as_bytes();
@@ -422,7 +442,7 @@ impl StringTable {
 
     /// 内部化一个短字符串（从任意字节，8-bit clean，绕过 UTF-8 验证）。
     /// 用于 C API 的 lua_pushlstring/lua_pushstring 等需要保留原始字节的场景。
-    #[inline]
+    #[cfg_attr(not(size_optimized), inline)]
     #[cfg(not(feature = "threaded"))]
     pub fn intern_bytes(&self, bytes: &[u8]) -> LuaString {
         debug_assert!(bytes.len() <= LUAI_MAXSHORTLEN, "intern_bytes 只用于短字符串");
@@ -469,7 +489,7 @@ impl StringTable {
     }
 
     /// 内部化一个短字符串 (threaded 模式 — 走 RwLock).
-    #[inline]
+    #[cfg_attr(not(size_optimized), inline)]
     #[cfg(feature = "threaded")]
     pub fn intern_bytes(&self, bytes: &[u8]) -> LuaString {
         debug_assert!(bytes.len() <= LUAI_MAXSHORTLEN, "intern_bytes 只用于短字符串");
@@ -559,6 +579,218 @@ impl StringTable {
 }
 
 // ============================================================================
+// 规约：字符串表 (size_optimized 版本 — 使用 std HashMap)
+// ============================================================================
+#[cfg(size_optimized)]
+impl StringTable {
+    pub fn new() -> Self {
+        // size_optimized: 不预分配, 减小二进制体积
+        StringTable {
+            ht: RwLock::new(std::collections::HashMap::new()),
+            nuse: RwLock::new(0),
+        }
+    }
+
+    /// 内部化一个短字符串。
+    #[cfg_attr(not(size_optimized), inline)]
+    #[cfg(not(feature = "threaded"))]
+    pub fn intern(&self, str: &str) -> LuaString {
+        self.intern_with_hash(str, rust_hash(str))
+    }
+
+    /// 内部化一个短字符串 (使用预计算的 hash, 避免重复计算)。
+    #[cfg(not(feature = "threaded"))]
+    pub fn intern_with_hash(&self, str: &str, h: u64) -> LuaString {
+        debug_assert!(str.len() <= LUAI_MAXSHORTLEN, "intern 只用于短字符串");
+
+        let str_bytes = str.as_bytes();
+        let str_len = str_bytes.len();
+
+        // size_optimized: 直接用 RefCell::borrow (无需 unsafe 优化)
+        let ht = self.ht.read();
+        if let Some(vec) = ht.get(&h) {
+            if let Some(ts) = vec.iter().find(|ts| {
+                let content_bytes = ts.contents.as_bytes();
+                content_bytes.len() == str_len + 1 && content_bytes[..str_len] == *str_bytes
+            }) {
+                return LuaString::Short(ArcRc::clone(ts));
+            }
+        }
+        drop(ht);
+
+        // 写路径: 需要插入新字符串
+        let ts = ArcRc::new(ShortString {
+            hash: h,
+            contents: LuaString::with_nul(str),
+        });
+        let mut ht = self.ht.write();
+        ht.entry(h).or_default().push(ArcRc::clone(&ts));
+        *self.nuse.write() += 1;
+        LuaString::Short(ts)
+    }
+
+    /// 内部化一个短字符串 (threaded 模式 — 走 RwLock 保证线程安全).
+    #[cfg_attr(not(size_optimized), inline)]
+    #[cfg(feature = "threaded")]
+    pub fn intern(&self, str: &str) -> LuaString {
+        self.intern_with_hash(str, rust_hash(str))
+    }
+
+    /// 内部化一个短字符串 (使用预计算的 hash, threaded + size_optimized 模式).
+    #[cfg(feature = "threaded")]
+    pub fn intern_with_hash(&self, str: &str, h: u64) -> LuaString {
+        debug_assert!(str.len() <= LUAI_MAXSHORTLEN, "intern 只用于短字符串");
+
+        let str_bytes = str.as_bytes();
+        let str_len = str_bytes.len();
+
+        let ht_reader = self.ht.read();
+        if let Some(vec) = ht_reader.get(&h) {
+            if let Some(ts) = vec.iter().find(|ts| {
+                let content_bytes = ts.contents.as_bytes();
+                content_bytes.len() == str_len + 1 && content_bytes[..str_len] == *str_bytes
+            }) {
+                return LuaString::Short(ArcRc::clone(ts));
+            }
+        }
+        drop(ht_reader);
+
+        // 写路径: 需要插入新字符串
+        // TOCTOU 在单线程执行中安全; 多线程下最多导致重复桶条目(无害)
+        let ts = ArcRc::new(ShortString {
+            hash: h,
+            contents: LuaString::with_nul(str),
+        });
+        let mut ht = self.ht.write();
+        ht.entry(h).or_default().push(ArcRc::clone(&ts));
+        *self.nuse.write() += 1;
+        LuaString::Short(ts)
+    }
+
+    /// 内部化一个短字符串（从任意字节，8-bit clean，绕过 UTF-8 验证）。
+    #[cfg_attr(not(size_optimized), inline)]
+    #[cfg(not(feature = "threaded"))]
+    pub fn intern_bytes(&self, bytes: &[u8]) -> LuaString {
+        debug_assert!(bytes.len() <= LUAI_MAXSHORTLEN, "intern_bytes 只用于短字符串");
+        let h = rust_hash_bytes(bytes);
+        let bytes_len = bytes.len();
+
+        let ht = self.ht.read();
+        if let Some(vec) = ht.get(&h) {
+            if let Some(ts) = vec.iter().find(|ts| {
+                let content_bytes = ts.contents.as_bytes();
+                content_bytes.len() == bytes_len + 1 && content_bytes[..bytes_len] == *bytes
+            }) {
+                return LuaString::Short(ArcRc::clone(ts));
+            }
+        }
+        drop(ht);
+
+        // 写路径
+        let blen = bytes.len();
+        let mut buf = Vec::with_capacity(blen + 1);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_mut_ptr(), blen);
+            *buf.as_mut_ptr().add(blen) = 0;
+            buf.set_len(blen + 1);
+        }
+        let ts = ArcRc::new(ShortString {
+            hash: h,
+            contents: unsafe { String::from_utf8_unchecked(buf) },
+        });
+        let mut ht = self.ht.write();
+        ht.entry(h).or_default().push(ArcRc::clone(&ts));
+        *self.nuse.write() += 1;
+        LuaString::Short(ts)
+    }
+
+    /// 内部化一个短字符串 (threaded 模式 — 走 RwLock).
+    #[cfg_attr(not(size_optimized), inline)]
+    #[cfg(feature = "threaded")]
+    pub fn intern_bytes(&self, bytes: &[u8]) -> LuaString {
+        debug_assert!(bytes.len() <= LUAI_MAXSHORTLEN, "intern_bytes 只用于短字符串");
+        let h = rust_hash_bytes(bytes);
+        let bytes_len = bytes.len();
+
+        let ht_reader = self.ht.read();
+        if let Some(vec) = ht_reader.get(&h) {
+            if let Some(ts) = vec.iter().find(|ts| {
+                let content_bytes = ts.contents.as_bytes();
+                content_bytes.len() == bytes_len + 1 && content_bytes[..bytes_len] == *bytes
+            }) {
+                return LuaString::Short(ArcRc::clone(ts));
+            }
+        }
+        drop(ht_reader);
+
+        let blen = bytes.len();
+        let mut buf = Vec::with_capacity(blen + 1);
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), buf.as_mut_ptr(), blen);
+            *buf.as_mut_ptr().add(blen) = 0;
+            buf.set_len(blen + 1);
+        }
+        let ts = ArcRc::new(ShortString {
+            hash: h,
+            contents: unsafe { String::from_utf8_unchecked(buf) },
+        });
+        let mut ht = self.ht.write();
+        ht.entry(h).or_default().push(ArcRc::clone(&ts));
+        *self.nuse.write() += 1;
+        LuaString::Short(ts)
+    }
+
+    pub fn count(&self) -> usize {
+        *self.nuse.read()
+    }
+
+    pub fn remove(&self, ts: &ShortString) {
+        let h = ts.hash;
+        let ptr = ts as *const ShortString;
+        let mut ht = self.ht.write();
+        // 用指针相等性匹配要删除的条目
+        if let Some(vec) = ht.get_mut(&h) {
+            if let Some(pos) = vec
+                .iter()
+                .position(|item: &ArcRc<ShortString>| std::ptr::eq(item.as_ref(), ptr))
+            {
+                vec.remove(pos);
+            }
+        }
+        let mut nuse = self.nuse.write();
+        *nuse = nuse.saturating_sub(1);
+    }
+
+    pub fn for_each<F: FnMut(&ShortString)>(&self, mut f: F) {
+        let ht = self.ht.read();
+        for ts in ht.values().flatten() {
+            f(ts);
+        }
+    }
+
+    /// 清理字符串表中的死字符串（只有字符串表持有的字符串）。
+    /// 对应 C Lua 的 sweep 阶段清理 string table 的逻辑。
+    /// 返回被清理的字符串数量。
+    pub fn sweep(&self) -> usize {
+        let mut ht = self.ht.write();
+        let mut freed = 0;
+        for vec in ht.values_mut() {
+            let before = vec.len();
+            // strong_count > 1 表示有其他引用 → 保留; <= 1 表示只有表持有 → 回收
+            vec.retain(|ts| ArcRc::strong_count(ts) > 1);
+            freed += before - vec.len();
+        }
+        // 清理空 Vec, 避免长期累积空桶
+        ht.retain(|_, vec| !vec.is_empty());
+
+        let mut nuse = self.nuse.write();
+        *nuse = nuse.saturating_sub(freed);
+
+        freed
+    }
+}
+
+// ============================================================================
 // 规约：哈希计算
 // ============================================================================
 
@@ -573,7 +805,7 @@ impl StringTable {
 ///
 /// 注意：编译器场景不面临 hash 碰撞 DoS 攻击（源码可信），因此无需
 /// SipHash 的密码学安全性。固定 seed 即可。
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn rust_hash_bytes(bytes: &[u8]) -> u64 {
     let l = bytes.len();
     // seed = length * 0x5bd1e995（MurmurHash2 常量，扩散性好）
@@ -589,7 +821,7 @@ pub fn rust_hash_bytes(bytes: &[u8]) -> u64 {
     h
 }
 
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn rust_hash(str: &str) -> u64 {
     rust_hash_bytes(str.as_bytes())
 }
@@ -637,7 +869,7 @@ impl LuaString {
         }
     }
 
-    #[inline]
+    #[cfg_attr(not(size_optimized), inline)]
     pub fn as_str(&self) -> &str {
         self.as_str_inner().0
     }
@@ -795,7 +1027,7 @@ pub fn ensure_long_hash(ls: &mut LongString) -> u64 {
     }
     ls.hash.load(Ordering::Relaxed)
 }
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn new_lstr(table: &StringTable, str: &str) -> LuaString {
     if str.len() <= LUAI_MAXSHORTLEN {
         table.intern(str)
@@ -806,7 +1038,7 @@ pub fn new_lstr(table: &StringTable, str: &str) -> LuaString {
 
 /// 从 String 创建 LuaString，长字符串路径直接 consume 避免 clone。
 /// 短字符串仍走 intern（需要查表去重，intern 未命中时内部会 clone，但短串开销小）。
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn new_lstr_from_string(table: &StringTable, s: String) -> LuaString {
     if s.len() <= LUAI_MAXSHORTLEN {
         table.intern(&s)
@@ -817,7 +1049,7 @@ pub fn new_lstr_from_string(table: &StringTable, s: String) -> LuaString {
 
 /// 从任意字节创建 LuaString（8-bit clean，绕过 UTF-8 验证）。
 /// 用于 C API 的 lua_pushlstring/lua_pushstring 等需要保留原始字节的场景。
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn new_lstr_bytes(table: &StringTable, bytes: &[u8]) -> LuaString {
     if bytes.len() <= LUAI_MAXSHORTLEN {
         table.intern_bytes(bytes)

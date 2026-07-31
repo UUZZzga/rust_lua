@@ -48,13 +48,13 @@ const UTF8PATT_BYTES: &[u8] = &[
 // ============================================================================
 
 /// 检查字节是否为续字节 — 对应 C 的 iscont 宏
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 fn iscont(c: u8) -> bool {
     (c & 0xC0) == 0x80
 }
 
 /// 检查指针位置的字节是否为续字节 — 对应 C 的 iscontp 宏
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 fn iscontp(s: &[u8], idx: usize) -> bool {
     idx < s.len() && iscont(s[idx])
 }
@@ -203,8 +203,14 @@ fn get_str_bytes(state: &LuaState, a: usize, idx: usize) -> Result<Vec<u8>, VmEr
     }
     match &state.stack[stack_idx] {
         TValue::Str(s) => Ok(s.as_str().as_bytes().to_vec()),
-        TValue::Integer(n) => Ok(n.to_string().into_bytes()),
-        TValue::Float(f) => Ok(format!("{}", f).into_bytes()),
+        TValue::Integer(n) => {
+            // 体积优先: 用 i64_to_string 避免 n.to_string() 引入 core::fmt::num
+            #[cfg(size_optimized)]
+            { Ok(crate::float_utils::i64_to_string(*n).into_bytes()) }
+            #[cfg(not(size_optimized))]
+            { Ok(n.to_string().into_bytes()) }
+        }
+        TValue::Float(f) => Ok(crate::float_utils::f64_to_string(*f).into_bytes()),
         _ => Err(VmError::RuntimeError(format!(
             "bad argument #{} (string expected, got {})",
             idx + 1,

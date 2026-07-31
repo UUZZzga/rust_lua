@@ -72,6 +72,8 @@ impl std::fmt::Display for MemError {
     }
 }
 
+// 体积优先: 不实现 std::error::Error trait, 避免 Box<dyn Error> 引入 StringError
+#[cfg(not(size_optimized))]
 impl std::error::Error for MemError {}
 
 // ============================================================================

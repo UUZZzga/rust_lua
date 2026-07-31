@@ -55,6 +55,9 @@ pub mod mem;
 // 调试工具
 pub mod debug;
 
+// 浮点数格式化/解析工具 (size_optimized 模式下用 libc 避免 flt2dec/dec2flt)
+pub mod float_utils;
+
 // 标准库 (lstrlib.cpp, lmathlib.cpp 等)
 pub mod stdlib;
 

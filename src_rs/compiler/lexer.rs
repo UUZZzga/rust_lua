@@ -46,7 +46,8 @@ thread_local! {
 /// 模式下读到的字节流) 能被词法分析器正确处理。
 pub const EOF_CHAR: char = '\u{10FFFF}';
 
-#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(not(size_optimized), derive(Debug))]
+#[derive(Clone, PartialEq)]
 pub enum Token {
     // Keywords
     And,
@@ -162,7 +163,7 @@ impl Token {
             Token::Name(s) => format!("'{}'", s.as_str()),
             Token::String(s) => format!("'{}'", s.as_str()),
             Token::Int(n) => format!("'{}'", n),
-            Token::Float(f) => format!("'{}'", f),
+            Token::Float(f) => format!("'{}'", crate::float_utils::f64_to_string(*f)),
             Token::Eof => "<eof>".to_string(),
             // 关键字
             Token::And => "'and'".to_string(),
@@ -238,7 +239,7 @@ impl Token {
 ///
 /// pos 越界时返回 `EOF_CHAR` (而非 '\0'),以便区分源码中的真实 \0 字节与 EOF。
 /// (C 版本用 int 的 -1 表示 EOZ; Rust 中用 U+10FFFF sentinel。)
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 fn read_char_at(bytes: &[u8], pos: usize) -> char {
     if pos >= bytes.len() {
         return EOF_CHAR;
@@ -333,6 +334,13 @@ pub struct LexState<'a> {
     /// 当前 token 的原始文本 — 对应 C 的 `luaZ_buffer(ls->buff)`。
     /// 用于错误消息中显示数字/字符串的原始文本 (如 "1.000" 而不是 "1")。
     pub token_text: String,
+    /// perf: 4 路 round-robin 标识符缓存,避免重复 intern 的 hashbrown 查找开销。
+    /// StringTable::intern 占 13.32% 热点, 大量重复标识符 (self/print/string 等)
+    /// 每次都做完整 hashbrown 查找 + Rc::clone。缓存命中时仅做 4 次 u64 比较 +
+    /// 1 次 Rc::clone, 跳过 hashbrown 的 SIMD 探测 + 控制字节比较 + 闭包调用。
+    /// 缓存未命中时仍走 intern (用预计算的 hash 避免重复哈希)。
+    ident_cache: [Option<(u64, LuaString)>; 4],
+    ident_cache_idx: usize,
     /// 编译器执行缓存句柄。持有 `CompilerCache` 的 Box,确保其堆内存不被释放。
     /// Drop 时将内部缓冲 (`errors`、`scanner_strings`、`token_text`)回收到线程局部缓存,
     /// 供下一次编译复用,避免每次编译时重新分配堆内存。
@@ -368,13 +376,15 @@ impl<'a> LexState<'a> {
             scanner_strings,
             cached_env: None,
             token_text,
+            ident_cache: [None, None, None, None],
+            ident_cache_idx: 0,
             _cache: Some(cache_holder),
         }
     }
 
     /// 获取缓存的 "_ENV" LuaString。第一次调用时 intern 并缓存，
     /// 后续直接 clone（refcount++），避免每次 code_global_via_env* 都做 hash+查找。
-    #[inline]
+    #[cfg_attr(not(size_optimized), inline)]
     pub fn env_str_cached(&mut self) -> LuaString {
         if let Some(ref k) = self.cached_env {
             return k.clone();
@@ -387,9 +397,27 @@ impl<'a> LexState<'a> {
     /// 锚定字符串字面量,对应 C 的 `anchorstr` (llex.cpp)。
     /// 短字符串走全局 `StringTable` 内部化;长字符串走 scanner table 去重,
     /// 确保同一源码字面量跨 proto 返回同一 `LuaString` (相同 `ptr_id`)。
+    /// perf: 短字符串先查 4 路标识符缓存, 命中时跳过 hashbrown 查找 (节省 ~7%)。
     pub fn anchor_string(&mut self, s: &str) -> LuaString {
         if s.len() <= crate::strings::LUAI_MAXSHORTLEN {
-            crate::strings::new_lstr(&self.state.string_table, s)
+            // perf: 计算 hash 一次, 缓存查找 + intern 复用
+            let h = crate::strings::rust_hash(s);
+            // 4 路 round-robin 缓存查找: 4 次 u64 比较 (可 SIMD), 命中时 1 次 Rc::clone
+            for entry in &self.ident_cache {
+                if let Some((eh, els)) = entry {
+                    // 先比 hash (8 字节, 内联), 再比内容 (仅 hash 碰撞时执行)
+                    if *eh == h && els.as_str() == s {
+                        return els.clone();
+                    }
+                }
+            }
+            // 缓存未命中: 用预计算 hash 调用 intern (避免 intern 内部重复计算 hash)
+            let ls = self.state.string_table.intern_with_hash(s, h);
+            // round-robin 替换: 覆盖最旧条目
+            let idx = self.ident_cache_idx;
+            self.ident_cache[idx] = Some((h, ls.clone()));
+            self.ident_cache_idx = (idx + 1) & 3;
+            ls
         } else {
             if let Some(existing) = self.scanner_strings.get(s).cloned() {
                 return existing;
@@ -400,7 +428,7 @@ impl<'a> LexState<'a> {
         }
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(size_optimized), inline(always))]
     fn next_char(&mut self) {
         let old = self.current;
         self.advance_pos();
@@ -416,7 +444,7 @@ impl<'a> LexState<'a> {
     }
 
     /// 仅推进位置指针并更新 current,不处理行号。
-    #[inline(always)]
+    #[cfg_attr(not(size_optimized), inline(always))]
     fn advance_pos(&mut self) {
         let bytes = self.source.as_bytes();
         let len = bytes.len();
@@ -456,7 +484,7 @@ impl<'a> LexState<'a> {
     /// 仅更新 current 到 self.pos 位置, 不推进 pos。
     /// 用于批量扫描后同步 current (如 read_number/read_name 的 ASCII 快速路径)。
     /// 逻辑与 advance_pos 的 current 更新部分一致。
-    #[inline(always)]
+    #[cfg_attr(not(size_optimized), inline(always))]
     fn update_current(&mut self) {
         let bytes = self.source.as_bytes();
         let len = bytes.len();
@@ -470,7 +498,7 @@ impl<'a> LexState<'a> {
         };
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(size_optimized), inline(always))]
     fn peek(&self) -> char {
         let bytes = self.source.as_bytes();
         let mut pos = self.pos;
@@ -491,7 +519,7 @@ impl<'a> LexState<'a> {
         read_char_at(bytes, pos)
     }
 
-    #[inline(always)]
+    #[cfg_attr(not(size_optimized), inline(always))]
     fn skip_whitespace(&mut self) {
         let bytes = self.source.as_bytes();
         let len = bytes.len();
@@ -1004,9 +1032,9 @@ impl<'a> LexState<'a> {
                     }
                 }
             } else {
-                match s.parse::<f64>() {
-                    Ok(v) => self.token = Token::Float(v),
-                    Err(_) => {
+                match crate::float_utils::f64_from_str(s) {
+                    Some(v) => self.token = Token::Float(v),
+                    None => {
                         self.error(&format!("malformed number near '{}'", s));
                         self.token = Token::Eof;
                     }
@@ -1032,9 +1060,9 @@ impl<'a> LexState<'a> {
                         }
                     }
                 }
-                Err(_) => match s.parse::<f64>() {
-                    Ok(v) => self.token = Token::Float(v),
-                    Err(_) => {
+                Err(_) => match crate::float_utils::f64_from_str(s) {
+                    Some(v) => self.token = Token::Float(v),
+                    None => {
                         self.error(&format!("malformed number near '{}'", s));
                         self.token = Token::Eof;
                     }

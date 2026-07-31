@@ -144,7 +144,7 @@ struct CallerContext {
     is_vararg: bool,
     proto_flag: u8,
     nextraargs: i32,
-    closure_upvals: Vec<crate::objects::UpValRef>,
+    closure_upvals: Rc<RefCell<Vec<crate::objects::UpValRef>>>,
     open_upvals: Vec<crate::objects::UpValRef>,
     open_upval: Option<usize>,
     tbc_list: Option<usize>,
@@ -174,7 +174,7 @@ fn save_caller_context(state: &mut LuaState) -> CallerContext {
         is_vararg: state.is_vararg,
         proto_flag: state.proto_flag,
         nextraargs: state.nextraargs,
-        closure_upvals: std::mem::take(&mut state.closure_upvals),
+        closure_upvals: std::mem::replace(&mut state.closure_upvals, Rc::new(RefCell::new(Vec::new()))),
         open_upvals: std::mem::take(&mut state.open_upvals),
         open_upval: state.open_upval,
         tbc_list: state.tbc_list,
@@ -1113,7 +1113,7 @@ fn close_suspended_coroutine(
         state.is_vararg = ctx.saved_is_vararg;
         state.proto_flag = ctx.saved_proto_flag;
         state.nextraargs = ctx.saved_nextraargs;
-        state.closure_upvals = ctx.saved_closure_upvals.clone();
+        state.closure_upvals = Rc::clone(&ctx.saved_closure_upvals);
         state.open_upvals = ctx.saved_open_upvals.clone();
         state.open_upval = ctx.saved_open_upval;
         state.tbc_list = ctx.saved_tbc_list;
@@ -1157,7 +1157,7 @@ fn close_suspended_coroutine(
         ctx.saved_constants = Rc::new(Vec::new());
         ctx.saved_upval_descs = Rc::new(Vec::new());
         ctx.saved_protos = Rc::new(Vec::new());
-        ctx.saved_closure_upvals = Vec::new();
+        ctx.saved_closure_upvals = Rc::new(RefCell::new(Vec::new()));
         ctx.saved_call_stack = Vec::new();
         ctx.saved_stack = Vec::new();
         ctx.saved_open_upval = None;
@@ -1441,7 +1441,7 @@ fn call_resume(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
                 ctx.saved_is_vararg = state.is_vararg;
                 ctx.saved_proto_flag = state.proto_flag;
                 ctx.saved_nextraargs = state.nextraargs;
-                ctx.saved_closure_upvals = std::mem::take(&mut state.closure_upvals);
+                ctx.saved_closure_upvals = std::mem::replace(&mut state.closure_upvals, Rc::new(RefCell::new(Vec::new())));
                 ctx.saved_open_upvals = std::mem::take(&mut state.open_upvals);
                 ctx.saved_open_upval = state.open_upval;
                 ctx.saved_tbc_list = state.tbc_list;
@@ -1648,7 +1648,7 @@ fn setup_first_resume(
         state.is_vararg = closure.proto.is_vararg();
         state.proto_flag = closure.proto.flag;
         state.nextraargs = 0;
-        state.closure_upvals = closure.upvals.borrow().clone();
+        state.closure_upvals = Rc::clone(&closure.upvals);
         state.open_upval = None;
         state.tbc_list = None;
         state.call_stack = Vec::new();
@@ -1687,15 +1687,14 @@ fn setup_first_resume(
 
         // 推入初始 CallInfoEntry — 对应 C 中协程的 base CallInfo
         // 记录协程主函数的信息，使 traceback/getinfo 能正确显示最外层帧
-        // caller_proto 设为协程主函数的 proto，让 compute_caller_info 能提取 source
+        // perf: caller_proto 延迟计算, 从 state.stack[0] (= base-1) 获取主函数 proto
         state.call_info = vec![crate::state::CallInfoEntry {
-            caller_proto: Some(Rc::clone(&closure.proto)),
             is_c: false,
             closure: Some(closure.clone()),
             base: 1,
             saved_pc: 0,
-            name: String::new(),
-            namewhat: String::new(),
+            name: None,
+            namewhat: "",
             proto_flag: closure.proto.flag,
             nextraargs: 0,
             is_tailcall: false,
@@ -1719,7 +1718,7 @@ fn setup_first_resume(
         state.is_vararg = false;
         state.proto_flag = 0;
         state.nextraargs = 0;
-        state.closure_upvals = Vec::new();
+        state.closure_upvals = Rc::new(RefCell::new(Vec::new()));
         state.open_upval = None;
         state.tbc_list = None;
         state.call_stack = Vec::new();
@@ -1764,7 +1763,7 @@ fn setup_subsequent_resume(
     state.is_vararg = ctx.saved_is_vararg;
     state.proto_flag = ctx.saved_proto_flag;
     state.nextraargs = ctx.saved_nextraargs;
-    state.closure_upvals = ctx.saved_closure_upvals.clone();
+    state.closure_upvals = Rc::clone(&ctx.saved_closure_upvals);
     state.open_upvals = ctx.saved_open_upvals.clone();
     state.open_upval = ctx.saved_open_upval;
     state.tbc_list = ctx.saved_tbc_list;
@@ -2117,7 +2116,7 @@ fn call_wrap_fn(
                 ctx.saved_is_vararg = state.is_vararg;
                 ctx.saved_proto_flag = state.proto_flag;
                 ctx.saved_nextraargs = state.nextraargs;
-                ctx.saved_closure_upvals = std::mem::take(&mut state.closure_upvals);
+                ctx.saved_closure_upvals = std::mem::replace(&mut state.closure_upvals, Rc::new(RefCell::new(Vec::new())));
                 ctx.saved_open_upvals = std::mem::take(&mut state.open_upvals);
                 ctx.saved_open_upval = state.open_upval;
                 ctx.saved_tbc_list = state.tbc_list;
@@ -2394,7 +2393,7 @@ pub fn c_api_resume(state: &mut LuaState, nargs: usize) -> Result<(i32, usize), 
                 ctx.saved_is_vararg = state.is_vararg;
                 ctx.saved_proto_flag = state.proto_flag;
                 ctx.saved_nextraargs = state.nextraargs;
-                ctx.saved_closure_upvals = std::mem::take(&mut state.closure_upvals);
+                ctx.saved_closure_upvals = std::mem::replace(&mut state.closure_upvals, Rc::new(RefCell::new(Vec::new())));
                 ctx.saved_open_upvals = std::mem::take(&mut state.open_upvals);
                 ctx.saved_open_upval = state.open_upval;
                 ctx.saved_tbc_list = state.tbc_list;

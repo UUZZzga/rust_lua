@@ -102,7 +102,7 @@ pub enum OpName {
 pub const NUM_OPNAMES: usize = 85;
 
 impl OpName {
-    #[inline]
+    #[cfg_attr(not(size_optimized), inline)]
     pub fn from_u8(v: u8) -> Option<Self> {
         if (v as usize) < NUM_OPNAMES {
             Some(unsafe { std::mem::transmute::<u8, OpName>(v) })
@@ -111,12 +111,12 @@ impl OpName {
         }
     }
 
-    #[inline]
+    #[cfg_attr(not(size_optimized), inline)]
     pub fn to_str(self) -> &'static str {
         OPCODE_NAMES[self as usize]
     }
 
-    #[inline]
+    #[cfg_attr(not(size_optimized), inline)]
     pub fn to_uppercase_str(self) -> &'static str {
         OPCODE_NAMES[self as usize]
     }

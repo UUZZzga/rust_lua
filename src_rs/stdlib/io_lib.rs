@@ -1073,16 +1073,18 @@ fn read_number(f: *mut libc::FILE) -> Option<TValue> {
         return None;
     }
     let s = String::from_utf8_lossy(&buf).into_owned();
-    // 先尝试解析为整数
+    // 先尝试解析为十进制整数
     if let Ok(n) = s.parse::<i64>() {
         return Some(TValue::Integer(n));
     }
-    if let Ok(n) = s.parse::<f64>() {
-        return Some(TValue::Float(n));
-    }
-    // 尝试 hex 解析
+    // hex 解析必须在 f64_from_str 之前: strtod 会把 hex 整数解析为 Float,
+    // 对大整数 (如 maxint = 0x7fffffffffffffff) 丢失精度.
+    // 对应 C Lua 的 l_str2int (处理十进制和 hex 整数) 先于 l_str2d (处理浮点数).
     if hex {
+        #[cfg(not(size_optimized))]
         let s_lower = s.to_lowercase();
+        #[cfg(size_optimized)]
+        let s_lower = s.to_ascii_lowercase();
         // 处理可选的正负号
         let (neg, rest) = if let Some(r) = s_lower.strip_prefix('-') {
             (true, r)
@@ -1135,6 +1137,9 @@ fn read_number(f: *mut libc::FILE) -> Option<TValue> {
                 }
             }
         }
+    }
+    if let Some(n) = crate::float_utils::f64_from_str(&s) {
+        return Some(TValue::Float(n));
     }
     None
 }

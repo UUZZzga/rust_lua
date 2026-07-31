@@ -136,7 +136,7 @@ fn index2val<'a>(L: &'a LuaState, idx: c_int) -> Option<&'a TValue> {
 }
 
 /// 判断 idx 是否是 registry 伪索引
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 fn is_registry(idx: c_int) -> bool {
     idx == LUA_REGISTRYINDEX
 }
@@ -149,7 +149,7 @@ fn lua_type_code(t: LuaType) -> c_int {
 /// lua_upvalueindex: 返回第 i 个上值的伪索引。
 ///
 /// 对应 C 的 `#define lua_upvalueindex(i) (LUA_REGISTRYINDEX - (i))`
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn lua_upvalueindex(i: c_int) -> c_int {
     LUA_REGISTRYINDEX - i
 }
@@ -616,7 +616,7 @@ pub extern "C" fn lua_isnumber(L: *mut lua_State, idx: c_int) -> c_int {
     let L = unsafe { &*L };
     match index2val(L, idx) {
         Some(TValue::Integer(_)) | Some(TValue::Float(_)) => 1,
-        Some(TValue::Str(s)) => s.as_str().parse::<f64>().is_ok() as c_int,
+        Some(TValue::Str(s)) => crate::float_utils::f64_from_str(s.as_str()).is_some() as c_int,
         _ => 0,
     }
 }
@@ -679,9 +679,7 @@ pub extern "C" fn lua_tointegerx(L: *mut lua_State, idx: c_int, isnum: *mut c_in
         Some(TValue::Integer(i)) => Some(*i),
         Some(TValue::Float(f)) => crate::vm::float_to_integer(*f, F2IMode::Eq),
         Some(TValue::Str(s)) => s.as_str().parse::<i64>().ok().or_else(|| {
-            s.as_str()
-                .parse::<f64>()
-                .ok()
+            crate::float_utils::f64_from_str(s.as_str())
                 .and_then(|f| crate::vm::float_to_integer(f, F2IMode::Eq))
         }),
         _ => None,
@@ -709,7 +707,7 @@ pub extern "C" fn lua_tonumberx(L: *mut lua_State, idx: c_int, isnum: *mut c_int
     let result = match index2val(L, idx) {
         Some(TValue::Integer(i)) => Some(*i as f64),
         Some(TValue::Float(f)) => Some(*f),
-        Some(TValue::Str(s)) => s.as_str().parse::<f64>().ok(),
+        Some(TValue::Str(s)) => crate::float_utils::f64_from_str(s.as_str()),
         _ => None,
     };
     match result {
@@ -1050,26 +1048,7 @@ pub extern "C" fn lua_setglobal(L: *mut lua_State, name: *const c_char) {
 
 /// 浮点数格式化（与 vm.rs 保持一致）
 fn format_float(f: f64) -> String {
-    if f.is_nan() {
-        return "nan".to_string();
-    }
-    if f.is_infinite() {
-        return if f > 0.0 {
-            "inf".to_string()
-        } else {
-            "-inf".to_string()
-        };
-    }
-    if f == 0.0 {
-        return "0.0".to_string();
-    }
-    let s = format!("{:.14}", f);
-    let s = s.trim_end_matches('0');
-    if s.ends_with('.') {
-        format!("{}0", s)
-    } else {
-        s.to_string()
-    }
+    crate::float_utils::f64_to_string(f)
 }
 
 // ============================================================================
@@ -1209,7 +1188,20 @@ unsafe fn do_lua_callk(L: *mut lua_State, nargs: usize, nresults: i32) {
     if status != 0 {
         let err = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
         L.pending_error = Some(err);
-        panic!("lua_callk error");
+        #[cfg(not(lua_use_longjmp))]
+        {
+            panic!("lua_callk error");
+        }
+        #[cfg(lua_use_longjmp)]
+        {
+            // lua_use_longjmp 模式: 用 longjmp 替代 panic 跳回最近的 setjmp
+            let buf = L
+                .error_jmp_bufs
+                .last()
+                .copied()
+                .expect("lua_callk error without jmp_buf");
+            crate::state::lua_rs_longjmp(buf as *mut std::ffi::c_void);
+        }
     }
 }
 #[no_mangle]
@@ -1240,7 +1232,20 @@ unsafe fn do_lua_error(L: *mut lua_State) -> ! {
     let L = &mut *L;
     let err = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
     L.pending_error = Some(err);
-    panic!("lua_error");
+    #[cfg(not(lua_use_longjmp))]
+    {
+        panic!("lua_error");
+    }
+    #[cfg(lua_use_longjmp)]
+    {
+        // lua_use_longjmp 模式: 用 longjmp 替代 panic 跳回最近的 setjmp
+        let buf = L
+            .error_jmp_bufs
+            .last()
+            .copied()
+            .expect("lua_error without jmp_buf");
+        crate::state::lua_rs_longjmp(buf as *mut std::ffi::c_void);
+    }
 }
 
 #[no_mangle]
@@ -2015,9 +2020,8 @@ pub extern "C" fn lua_getinfo(
     if what_str.contains('n') {
         // name/namewhat: 从调用者代码分析
         // 对应 C getfuncname: 从 caller_proto 的 saved_pc 处分析调用指令。
-        // C 函数帧和 Lua 函数帧都存储了 caller_proto（execute.rs 中 push 时设置），
-        // 统一处理。仅当 caller_proto 为 None（如 hook 帧）时才返回空。
-        if let Some(ref caller_proto) = ci.caller_proto {
+        // perf: caller_proto 延迟计算 (get_caller_proto_for_ci), 替代 CallInfoEntry 字段
+        if let Some(caller_proto) = crate::state::get_caller_proto_for_ci(L, ci_idx) {
             let (name, namewhat) = crate::execute::compute_name_from_proto(caller_proto, ci.saved_pc);
             if name.is_empty() {
                 unsafe {
@@ -2085,7 +2089,7 @@ pub extern "C" fn lua_getinfo(
             if what_str.contains('l') {
                 unsafe { (*ar).currentline = -1; }
             }
-        } else if let Some(ref closure) = ci.closure {
+        } else if let Some(closure) = crate::state::get_closure_for_ci(L, ci_idx) {
             // Lua 函数
             let proto = &closure.proto;
             if what_str.contains('S') {
@@ -2127,7 +2131,8 @@ pub extern "C" fn lua_getinfo(
                 // 注意: saved_pc 是调用点 PC，不是当前执行 PC
                 // 对于 luaL_where(level=1)，level 1 = 调用者，需要调用者当前行号
                 // = 调用点行号 = get_proto_line(caller_proto, saved_pc)
-                let line = if let Some(ref caller_proto) = ci.caller_proto {
+                // perf: caller_proto 延迟计算 (get_caller_proto_for_ci)
+                let line = if let Some(caller_proto) = crate::state::get_caller_proto_for_ci(L, ci_idx) {
                     crate::execute::get_proto_line(caller_proto, ci.saved_pc)
                 } else {
                     -1
@@ -2153,7 +2158,7 @@ pub extern "C" fn lua_getinfo(
     }
 
     if what_str.contains('u') {
-        if let Some(ref closure) = ci.closure {
+        if let Some(closure) = crate::state::get_closure_for_ci(L, ci_idx) {
             unsafe {
                 (*ar).nups = closure.proto.size_upvalues as u8;
                 (*ar).nparams = closure.proto.num_params as u8;

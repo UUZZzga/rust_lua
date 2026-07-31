@@ -1,6 +1,6 @@
 use crate::execute::VmError;
 use crate::objects::*;
-use crate::state::LuaState;
+use crate::state::{LuaState, lua_stdout};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -53,9 +53,10 @@ fn tvalue_size(v: &TValue) -> usize {
 }
 
 pub fn new_c_closure(state: &mut LuaState, _nupvals: usize) -> usize {
-    let idx = state.closure_upvals.len();
+    let idx = state.closure_upvals.borrow().len();
     state
         .closure_upvals
+        .borrow_mut()
         .push(Rc::new(RefCell::new(UpVal::Closed {
             value: Box::new(TValue::Nil(NilKind::Strict)),
         })));
@@ -63,10 +64,11 @@ pub fn new_c_closure(state: &mut LuaState, _nupvals: usize) -> usize {
 }
 
 pub fn new_l_closure(state: &mut LuaState, nupvals: usize) -> usize {
-    let idx = state.closure_upvals.len();
+    let idx = state.closure_upvals.borrow().len();
     for _ in 0..nupvals {
         state
             .closure_upvals
+            .borrow_mut()
             .push(Rc::new(RefCell::new(UpVal::Closed {
                 value: Box::new(TValue::Nil(NilKind::Strict)),
             })));
@@ -470,7 +472,7 @@ mod tests {
             stack: Vec::new(),
             top: 0,
             base: 0,
-            closure_upvals: Vec::new(),
+            closure_upvals: Rc::new(RefCell::new(Vec::new())),
             open_upvals: Vec::new(),
             open_upval: None,
             tbc_list: None,
@@ -493,7 +495,7 @@ mod tests {
             api_func_base: 0,
             n_ccalls: 0,
             dmt: crate::tm::DefaultMetatables::new(),
-            stdout: Box::new(std::io::stdout()),
+            stdout: lua_stdout(),
             io_output: None,
             file_handles: std::collections::HashMap::new(),
             popen_handles: std::collections::HashSet::new(),
@@ -550,6 +552,7 @@ mod tests {
             last_gc_estimate: 0,
             c_safety_keepalive: Vec::new(),
             allocf_ud: std::ptr::null_mut(),
+            error_jmp_bufs: Vec::new(),
         }
     }
 
@@ -592,14 +595,14 @@ mod tests {
     fn test_new_c_closure_creates_closure() {
         let mut state = make_vm_state();
         let _idx = new_c_closure(&mut state, 2);
-        assert!(state.closure_upvals.len() > 0);
+        assert!(state.closure_upvals.borrow().len() > 0);
     }
 
     #[test]
     fn test_new_l_closure_creates_closure_with_upvals() {
         let mut state = make_vm_state();
         let idx = new_l_closure(&mut state, 3);
-        let end = state.closure_upvals.len();
+        let end = state.closure_upvals.borrow().len();
         assert!(idx < end);
     }
 

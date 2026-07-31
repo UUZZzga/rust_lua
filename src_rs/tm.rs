@@ -11,6 +11,7 @@
 //! - Vararg 处理用 Rust enum + Vec，消除 C 的手动栈操作
 //! - 错误处理使用 `Result<(), VmError>` 替代 C 的 longjmp
 
+use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 
@@ -28,7 +29,7 @@ use crate::strings::{LuaString, StringTable};
 
 /// 从 MMBIN/MMBINI/MMBINK 指令中提取元方法事件索引。
 /// C 对应: GETARG_C(i) → 取指令的 C 字段 (bits 24-31)
-#[inline]
+#[cfg_attr(not(size_optimized), inline)]
 pub fn get_mmbin_tm(inst: Instruction) -> u8 {
     ((inst >> 24) & 0xFF) as u8
 }
@@ -375,6 +376,8 @@ impl fmt::Display for TagMethodError {
     }
 }
 
+// 体积优先: 不实现 std::error::Error trait, 避免 Box<dyn Error> 引入 StringError
+#[cfg(not(size_optimized))]
 impl std::error::Error for TagMethodError {}
 
 // ============================================================================
@@ -428,25 +431,16 @@ pub(crate) fn call_tm_res(
     let caller_is_vararg = state.is_vararg;
     let caller_proto_flag = state.proto_flag;
     let caller_nextraargs = state.nextraargs;
-    let caller_closure_upvals = state.closure_upvals.clone();
+    let caller_closure_upvals = Rc::clone(&state.closure_upvals);
     let caller_tbc_list = state.tbc_list;
-    let caller_proto = if state.base > 0 && state.base <= state.stack.len() {
-        if let TValue::LClosure(c) = &state.stack[state.base - 1] {
-            Some(Rc::clone(&c.proto))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[base-1] 获取
     state.call_info.push(crate::state::CallInfoEntry {
-        caller_proto,
         is_c: false,
         closure: None,
         base: caller_base,
         saved_pc: caller_pc,
-        name: tm.event_name().to_string(),
-        namewhat: "metamethod".to_string(),
+        name: Some(tm.event_name()),
+        namewhat: "metamethod",
         proto_flag: caller_proto_flag,
         nextraargs: caller_nextraargs,
         is_tailcall: false,
@@ -470,7 +464,7 @@ pub(crate) fn call_tm_res(
             saved_is_vararg: caller_is_vararg,
             saved_proto_flag: caller_proto_flag,
             saved_nextraargs: caller_nextraargs,
-            saved_closure_upvals: caller_closure_upvals.clone(),
+            saved_closure_upvals: Rc::clone(&caller_closure_upvals),
             saved_tbc_list: caller_tbc_list,
             func_idx: func_idx,
             nresults: 1,
@@ -597,25 +591,16 @@ pub(crate) fn call_tm(
     let caller_is_vararg = state.is_vararg;
     let caller_proto_flag = state.proto_flag;
     let caller_nextraargs = state.nextraargs;
-    let caller_closure_upvals = state.closure_upvals.clone();
+    let caller_closure_upvals = Rc::clone(&state.closure_upvals);
     let caller_tbc_list = state.tbc_list;
-    let caller_proto = if state.base > 0 && state.base <= state.stack.len() {
-        if let TValue::LClosure(c) = &state.stack[state.base - 1] {
-            Some(Rc::clone(&c.proto))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[base-1] 获取
     state.call_info.push(crate::state::CallInfoEntry {
-        caller_proto,
         is_c: false,
         closure: None,
         base: caller_base,
         saved_pc: caller_pc,
-        name: tm.event_name().to_string(),
-        namewhat: "metamethod".to_string(),
+        name: Some(tm.event_name()),
+        namewhat: "metamethod",
         proto_flag: caller_proto_flag,
         nextraargs: caller_nextraargs,
         is_tailcall: false,
@@ -638,7 +623,7 @@ pub(crate) fn call_tm(
             saved_is_vararg: caller_is_vararg,
             saved_proto_flag: caller_proto_flag,
             saved_nextraargs: caller_nextraargs,
-            saved_closure_upvals: caller_closure_upvals.clone(),
+            saved_closure_upvals: Rc::clone(&caller_closure_upvals),
             saved_tbc_list: caller_tbc_list,
             func_idx: func_idx,
             nresults: 0,
@@ -776,23 +761,14 @@ pub fn call_close_method(
     // 推入 CallInfoEntry — 对应 C 的 luaD_callnoyield 推入 CallInfo
     let caller_base = state.base;
     let caller_pc = state.pc;
-    let caller_proto = if state.base > 0 && state.base <= state.stack.len() {
-        if let TValue::LClosure(c) = &state.stack[state.base - 1] {
-            Some(Rc::clone(&c.proto))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[base-1] 获取
     state.call_info.push(crate::state::CallInfoEntry {
-        caller_proto,
         is_c: false,
         closure: None,
         base: caller_base,
         saved_pc: caller_pc,
-        name: "close".to_string(),
-        namewhat: "metamethod".to_string(),
+        name: Some("close"),
+        namewhat: "metamethod",
         proto_flag: state.proto_flag,
         nextraargs: state.nextraargs,
         is_tailcall: false,
@@ -814,7 +790,7 @@ pub fn call_close_method(
             saved_is_vararg: false,
             saved_proto_flag: 0,
             saved_nextraargs: 0,
-            saved_closure_upvals: Vec::new(),
+            saved_closure_upvals: Rc::new(RefCell::new(Vec::new())),
             saved_tbc_list: None,
             func_idx: 0,
             nresults: 0,
