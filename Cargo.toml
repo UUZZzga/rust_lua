@@ -41,7 +41,10 @@ name = "math_lib_tests"
 path = "tests_rs/math_lib_tests.rs"
 
 [features]
-ffi = []
+# 链接 C 实现的 liblua 作为参考基准, 用于编译器比对测试 (compiler::cmp_tests)。
+# 启用时: bindings.rs / parser.rs / lua_ffi.rs 模块生效, capi.rs 模块禁用以避免符号冲突。
+# 用法: cargo test --features cmp_c -- compiler::cmp_tests::compiler_compare_tests
+cmp_c = []
 # 默认关闭: StringTable/StringCache 使用 std::cell::RefCell (零开销,单线程)
 # 启用时改用 parking_lot::RwLock (多线程安全,有原子操作开销)
 threaded = ["parking_lot"]

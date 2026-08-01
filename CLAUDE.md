@@ -2,7 +2,7 @@
 
 ## 项目概述
 
-本项目是 **Lua 5.5.0 的 Rust 实现**（`lua-rs`），目标是逐步替代 `src/` 下的 C/C++ 官方实现。Rust 实现自给自足，默认通过 `capi.rs` 以 `#[no_mangle] extern "C"` 形式导出 C ABI，使第三方 Lua C 模块（`.so`）能够直接链接调用。启用 `ffi` feature 时改为链接 C 实现的 `liblua`，用于编译器比对测试等场景。
+本项目是 **Lua 5.5.0 的 Rust 实现**（`lua-rs`），目标是逐步替代 `src/` 下的 C/C++ 官方实现。Rust 实现自给自足，默认通过 `capi.rs` 以 `#[no_mangle] extern "C"` 形式导出 C ABI，使第三方 Lua C 模块（`.so`）能够直接链接调用。启用 `cmp_c` feature 时改为链接 C 实现的 `liblua`，用于编译器比对测试等场景。
 
 ## 项目目录结构
 
@@ -30,8 +30,8 @@
 
 ## Feature Flags
 
-- `ffi`（默认关闭）：启用时链接 C 实现的 `liblua`，`bindings.rs` / `parser.rs` / `lua_ffi.rs` 模块生效，`capi.rs` 模块禁用以避免符号冲突。用于编译器比对测试（`cargo test --features ffi -- compiler::cmp_tests::compiler_compare_tests`）。
-- 默认（非 `ffi`）：Rust 实现自给自足，`capi.rs` 导出 C API 符号。
+- `cmp_c`（默认关闭）：启用时链接 C 实现的 `liblua`，`bindings.rs` / `parser.rs` / `lua_ffi.rs` 模块生效，`capi.rs` 模块禁用以避免符号冲突。用于编译器比对测试（`cargo test --features cmp_c -- compiler::cmp_tests::compiler_compare_tests`）。
+- 默认（非 `cmp_c`）：Rust 实现自给自足，`capi.rs` 导出 C API 符号。
 
 ## 内存限制规则
 
@@ -91,8 +91,8 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
 ### 检测范围
 - **覆盖**：`tests_rs/` 7 个集成测试 + `src_rs/` 22 个含 `#[cfg(test)]` 的模块单元测试
 - **跳过**：
-  - `ffi` feature（链接 C liblua，Miri 无法解释 C 代码）
-  - `src_rs/compiler/cmp_tests.rs`（依赖 `ffi` feature）
+  - `cmp_c` feature（链接 C liblua，Miri 无法解释 C 代码）
+  - `src_rs/compiler/cmp_tests.rs`（依赖 `cmp_c` feature）
   - `tests_rs/integration_tests::test_stdin_execution`（`Command::spawn` 启动子进程，Miri 不支持）
   - 任何调用 `lua_pushfstring` / `luaL_error`（来自 `capi_variadic.c`）的测试路径
 
@@ -136,7 +136,7 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
 - **Rc 共享避免深拷贝**：`Proto.code` / `constants` / `upvalues` 字段使用 `Rc<Vec<...>>`，避免 `op_call` / `op_tailcall` 中的 O(n) 深拷贝。
 - **NUL 终止字符串**：`ShortString` / `LongString` 从字节数据构造时必须使用 `new_short_bytes()` / `new_long_bytes()`，确保正确处理 NUL 终止。
 - **TValue 布局**：`TValue` 包含 `BuiltinFn`（函数指针 + NUL 终止字符串，24 字节）与 `RustClosure`（`Rc<RustClosure>`，函数指针 + upvalues）变体，用于有状态内置函数（如 `coroutine.wrap`）。`is_callable()` 统一处理 `LightUserData` 内置 tag。
-- **ffi feature 隔离**：`parser.rs` / `bindings.rs` 引用 C 符号（`luaY_checklimit` / `luaY_nvarstack`），必须在 `#[cfg(feature = "ffi")]` 下；`capi` 模块在 `ffi` feature 下不存在，任何引用 `crate::capi::` 的代码必须用 `#[cfg(not(feature = "ffi"))]` 包围或改用本地辅助函数。
+- **cmp_c feature 隔离**：`parser.rs` / `bindings.rs` 引用 C 符号（`luaY_checklimit` / `luaY_nvarstack`），必须在 `#[cfg(feature = "cmp_c")]` 下；`capi` 模块在 `cmp_c` feature 下不存在，任何引用 `crate::capi::` 的代码必须用 `#[cfg(not(feature = "cmp_c"))]` 包围或改用本地辅助函数。
 - **LuaState 初始化完整性**：测试代码中初始化 `LuaState` 时必须包含所有字段（如 `func.rs` 中的 `make_vm_state`）。新增字段时同步更新所有测试初始化代码。
 - **pending_return_adjust 机制**：当 return hook 启用（`hook_mask & 2 != 0`）且 `allowhook` 且 `in_op_call` 时，`adjust_results` 不立即截断栈，而是设置 pending 由调用方的 `op_call` / `op_tailcall` / `op_tforcall` 在 return hook 完成后通过 `finish_pending_adjust` 执行实际截断。任何调用 BuiltinFn 的指令都必须保证最终会执行 `finish_pending_adjust`。
 - **op_tailcall 与 op_call 一致性**：`op_tailcall` 的 BuiltinFn / RustClosure 分支必须与 `op_call` 的 BuiltinFn 分支保持结构一致，包括 call hook（"tail call" 事件）、return hook（LUA_MASKRET，含 `saved_pending = take()` / `pending = saved_pending` 保存恢复）、`finish_pending_adjust()`。
@@ -157,5 +157,5 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
 
 - **接续后第一件事**：检查 `logs/` 目录下是否有报错日志（`compiler_test.log`、`cargo_test.log`、`build.log`），或运行 `tools/verify.sh` 验证上次修改是否引入编译错误。
 - **hook 自动报错处理**：修改 `src_rs/` 后 hook 会自动运行 `verify.sh`，如果 Terminal 中出现 "Compiler compare tests failed" 或类似报错，必须立即查看 `logs/compiler_test.log` 并修复，不要等待用户提醒。
-- **ffi feature 编译检查**：`verify.sh` 用 `cargo test --features ffi` 编译，启用 ffi feature 时 `capi` 模块不存在。任何引用 `crate::capi::` 的代码必须用 `#[cfg(not(feature = "ffi"))]` 包围，或改用本地辅助函数。
+- **cmp_c feature 编译检查**：`verify.sh` 用 `cargo test --features cmp_c` 编译，启用 cmp_c feature 时 `capi` 模块不存在。任何引用 `crate::capi::` 的代码必须用 `#[cfg(not(feature = "cmp_c"))]` 包围，或改用本地辅助函数。
 - **LuaState 初始化完整性**：在测试代码中初始化 `LuaState` 时，必须包含所有字段。新增字段时同步更新 `func.rs` 等文件中的测试用 `make_vm_state` 函数。

@@ -19,7 +19,7 @@ run_build() {
 
 # 1. 执行编译器比对测试
 echo "Running compiler compare tests..."
-run_build cargo test --features ffi -- compiler::cmp_tests::compiler_compare_tests > logs/compiler_test.log 2>&1 < /dev/null
+run_build cargo test --features cmp_c -- compiler::cmp_tests::compiler_compare_tests > logs/compiler_test.log 2>&1 < /dev/null
 CMP_EXIT=$?
 
 if [ $CMP_EXIT -ne 0 ]; then

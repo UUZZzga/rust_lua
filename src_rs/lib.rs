@@ -3,8 +3,8 @@
 //! 通过 CMake 将 Rust 源码编译为静态库，再用 C++ 调用。
 //! 逐步替代 Lua 的 C 实现。
 
-// 原始 FFI 声明（extern "C"）— 仅 ffi feature 时编译（引用 C 符号）
-#[cfg(feature = "ffi")]
+// 原始 FFI 声明（extern "C"）— 仅 cmp_c feature 时编译（引用 C 符号）
+#[cfg(feature = "cmp_c")]
 pub mod bindings;
 
 // 核心配置（luaconf.h）— 类型定义、常量、路径、数值运算
@@ -16,8 +16,8 @@ pub mod opcodes;
 // 安全包装层 —— 操作码名称（lopnames.h）
 pub mod opnames;
 
-// 安全包装层 —— 解析器（lparser.h / lparser.cpp）— 仅 ffi feature 时编译
-#[cfg(feature = "ffi")]
+// 安全包装层 —— 解析器（lparser.h / lparser.cpp）— 仅 cmp_c feature 时编译
+#[cfg(feature = "cmp_c")]
 pub mod parser;
 
 // Lua 对象和值的表示
@@ -63,15 +63,15 @@ pub mod stdlib;
 
 // FFI 接口，用于与 C/C++ 代码交互
 // C Lua API FFI 声明（lua.h / lauxlib.h）
-// 仅在 ffi feature 启用时编译（需要链接 C 实现的 liblua）。
+// 仅在 cmp_c feature 启用时编译（需要链接 C 实现的 liblua）。
 // 默认情况下 Rust 实现自给自足，capi.rs 导出 #[no_mangle] 符号供第三方使用。
-#[cfg(feature = "ffi")]
+#[cfg(feature = "cmp_c")]
 pub mod lua_ffi;
 
 // C API 导出层（#[no_mangle] extern "C" fn）
 // 将 Rust VM 以 C ABI 形式导出，供第三方 Lua C 模块链接调用。
-// 启用 ffi feature 时禁用，避免与 C 库的符号冲突。
-#[cfg(not(feature = "ffi"))]
+// 启用 cmp_c feature 时禁用，避免与 C 库的符号冲突。
+#[cfg(not(feature = "cmp_c"))]
 pub mod capi;
 
 // 命令行解释器

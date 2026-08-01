@@ -1,4 +1,4 @@
-#[cfg(feature = "ffi")]
+#[cfg(feature = "cmp_c")]
 use crate::lua_ffi;
 use crate::opcodes::{
     self, get_opcode, get_opmode, getarg, getarg_a, getarg_b, getarg_bx, getarg_c, getarg_sbx,
@@ -7,9 +7,9 @@ use crate::opcodes::{
 };
 #[cfg(test)]
 use imara_diff::{Algorithm, Diff, InternedInput};
-#[cfg(feature = "ffi")]
+#[cfg(feature = "cmp_c")]
 use std::ffi::{c_int, c_void};
-#[cfg(feature = "ffi")]
+#[cfg(feature = "cmp_c")]
 use std::ptr;
 use std::rc::Rc;
 
@@ -501,7 +501,7 @@ pub fn parse_dump(data: Vec<u8>) -> Result<DumpedFunction, String> {
 }
 
 pub unsafe fn compile_with_c_lua(source: &[u8]) -> Result<Vec<u8>, String> {
-    #[cfg(feature = "ffi")]
+    #[cfg(feature = "cmp_c")]
     {
         let L = lua_ffi::luaL_newstate();
         if L.is_null() {
@@ -556,10 +556,10 @@ pub unsafe fn compile_with_c_lua(source: &[u8]) -> Result<Vec<u8>, String> {
 
         Ok(result_data)
     }
-    #[cfg(not(feature = "ffi"))]
+    #[cfg(not(feature = "cmp_c"))]
     {
         let _ = source;
-        Err("compile_with_c_lua requires the 'ffi' feature (links C lua)".to_string())
+        Err("compile_with_c_lua requires the 'cmp_c' feature (links C lua)".to_string())
     }
 }
 

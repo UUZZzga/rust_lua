@@ -43,7 +43,7 @@ fn main() {
         println!("cargo:rustc-cfg=lua_use_longjmp");
     }
 
-    // 默认构建（非 ffi）也需导出 C API 符号到动态符号表，
+    // 默认构建（非 cmp_c）也需导出 C API 符号到动态符号表，
     // 让 dlopen 加载的 C 模块（.so）能解析 lua_xxx/luaL_xxx 符号。
     println!("cargo:rustc-link-arg=-Wl,--export-dynamic");
 
@@ -51,13 +51,13 @@ fn main() {
     // 注意: glibc 2.34+ 已将 dlopen/dlsym 合入 libc, 但旧版本仍需 -ldl
     println!("cargo:rustc-link-lib=dl");
 
-    // 仅在启用 ffi feature 时编译 C Lua 源码。
+    // 仅在启用 cmp_c feature 时编译 C Lua 源码。
     // 默认情况下 Rust 实现自给自足，capi.rs 导出 #[no_mangle] 符号；
     // 若同时链接 C 库会导致符号重复定义。
-    let ffi_enabled = env::var("CARGO_FEATURE_FFI").is_ok();
+    let cmp_c_enabled = env::var("CARGO_FEATURE_CMP_C").is_ok();
 
-    if !ffi_enabled {
-        // 非 ffi: stable Rust 不支持 c_variadic，lua_pushfstring/lua_pushvfstring
+    if !cmp_c_enabled {
+        // 非 cmp_c: stable Rust 不支持 c_variadic，lua_pushfstring/lua_pushvfstring
         // 由 capi_variadic.c 提供。Rust 代码不引用它们，但 dlopen 加载的 .so 需要，
         // 用 --undefined 强制保留。
         let mut variadic_build = cc::Build::new();

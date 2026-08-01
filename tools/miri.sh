@@ -11,8 +11,8 @@
 # 覆盖范围:
 #   - tests_rs/ 下 7 个集成测试文件
 #   - src_rs/ 中 22 个含 #[cfg(test)] 的模块单元测试
-#   - 跳过 ffi feature (链接 C liblua,Miri 无法解释)
-#   - 跳过 compiler/cmp_tests (依赖 ffi feature)
+#   - 跳过 cmp_c feature (链接 C liblua,Miri 无法解释)
+#   - 跳过 compiler/cmp_tests (依赖 cmp_c feature)
 #   - 跳过 tests_rs/integration_tests::test_stdin_input (Command::spawn)
 #
 # 使用方式:
@@ -126,8 +126,8 @@ export MIRIFLAGS="-Zmiri-tree-borrows -Zmiri-disable-isolation -Zmiri-ignore-lea
 # ============================================================================
 # 3. 构建 cargo miri test 命令
 # ============================================================================
-# 不启用 ffi feature: ffi 链接 C liblua,Miri 无法解释 C 代码
-# 不运行 compiler/cmp_tests: 依赖 ffi feature
+# 不启用 cmp_c feature: cmp_c 链接 C liblua,Miri 无法解释 C 代码
+# 不运行 compiler/cmp_tests: 依赖 cmp_c feature
 MIRI_CMD=(cargo +nightly miri test)
 
 # 测试过滤
@@ -190,6 +190,6 @@ fi
 echo ""
 echo "Miri tests passed!"
 echo "  - 检测模型: Tree Borrows"
-echo "  - 检测范围: tests_rs + src_rs 单元测试 (ffi feature 关闭)"
+echo "  - 检测范围: tests_rs + src_rs 单元测试 (cmp_c feature 关闭)"
 echo "  - 完整日志: logs/miri_test.log"
 exit 0

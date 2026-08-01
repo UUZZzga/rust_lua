@@ -3682,7 +3682,7 @@ pub extern "C" fn lua_rawsetp(L: *mut lua_State, idx: c_int, p: *const c_void) {
 /// 栈布局（首次 resume）: [nil, func, arg1, ..., argN]
 /// 结果布局: [nil, result1, ..., resultM]，nres = M
 #[no_mangle]
-#[cfg(not(feature = "ffi"))]
+#[cfg(not(feature = "cmp_c"))]
 pub extern "C" fn lua_resume(
     L: *mut lua_State,
     _from: *mut lua_State,
@@ -3711,7 +3711,7 @@ pub extern "C" fn lua_resume(
 }
 
 #[no_mangle]
-#[cfg(feature = "ffi")]
+#[cfg(feature = "cmp_c")]
 pub extern "C" fn lua_resume(
     L: *mut lua_State,
     _from: *mut lua_State,
