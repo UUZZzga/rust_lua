@@ -394,7 +394,6 @@ pub extern "C" fn lua_rotate(L: *mut lua_State, idx: c_int, n: c_int) {
     // 旋转: [abs..top] 向上移 n
     // 切片旋转
     let mut slice: Vec<TValue> = L.stack.drain(abs..top).collect();
-    let split = count - n;
     slice.rotate_right(n);
     // 重新放回
     L.stack.extend(slice);
@@ -2657,7 +2656,7 @@ pub extern "C" fn luaL_getsubtable(L: *mut lua_State, idx: c_int, fname: *const 
 /// 对应 C 的 lauxlib.cpp::luaL_checkstack。
 #[no_mangle]
 pub extern "C-unwind" fn luaL_checkstack(L: *mut lua_State, space: c_int, msg: *const c_char) {
-    if unsafe { lua_checkstack(L, space) } == 0 {
+    if lua_checkstack(L, space) == 0 {
         // 栈溢出：构造错误消息并抛出
         let errmsg = if !msg.is_null() {
             let cstr = unsafe { CStr::from_ptr(msg) };
@@ -3854,79 +3853,71 @@ mod tests {
     #[test]
     fn test_basic_stack_ops() {
         let L = luaL_newstate();
-        unsafe {
-            // LuaState::new 会推入一个 nil 作为函数入口槽（stack[0]），
-            // api_func_base=0 指向函数槽。lua_gettop 返回 top-(func+1)，
-            // 所以初始 top=0（函数槽不算入可用栈）。
-            assert_eq!(lua_gettop(L), 0);
+        // LuaState::new 会推入一个 nil 作为函数入口槽（stack[0]），
+        // api_func_base=0 指向函数槽。lua_gettop 返回 top-(func+1)，
+        // 所以初始 top=0（函数槽不算入可用栈）。
+        assert_eq!(lua_gettop(L), 0);
 
-            lua_pushinteger(L, 42);
-            assert_eq!(lua_gettop(L), 1);
-            assert_eq!(lua_type(L, 1), LUA_TNUMBER);
-            assert!(lua_isinteger(L, 1) != 0);
+        lua_pushinteger(L, 42);
+        assert_eq!(lua_gettop(L), 1);
+        assert_eq!(lua_type(L, 1), LUA_TNUMBER);
+        assert!(lua_isinteger(L, 1) != 0);
 
-            let mut isnum: c_int = 0;
-            let i = lua_tointegerx(L, 1, &mut isnum);
-            assert_eq!(i, 42);
-            assert_eq!(isnum, 1);
+        let mut isnum: c_int = 0;
+        let i = lua_tointegerx(L, 1, &mut isnum);
+        assert_eq!(i, 42);
+        assert_eq!(isnum, 1);
 
-            lua_pop(L, 1);
-            assert_eq!(lua_gettop(L), 0);
-        }
+        lua_pop(L, 1);
+        assert_eq!(lua_gettop(L), 0);
         lua_close(L);
     }
 
     #[test]
     fn test_pushcclosure_light_cfn() {
         let L = luaL_newstate();
-        unsafe {
-            unsafe extern "C" fn dummy(_L: *mut c_void) -> c_int {
-                0
-            }
-            lua_pushcfunction(L, dummy);
-            assert_eq!(lua_type(L, 1), LUA_TFUNCTION);
-            assert!(lua_iscfunction(L, 1) != 0);
-            assert!(lua_tocfunction(L, 1).is_some());
+        unsafe extern "C" fn dummy(_L: *mut c_void) -> c_int {
+            0
         }
+        lua_pushcfunction(L, dummy);
+        assert_eq!(lua_type(L, 1), LUA_TFUNCTION);
+        assert!(lua_iscfunction(L, 1) != 0);
+        assert!(lua_tocfunction(L, 1).is_some());
         lua_close(L);
     }
 
     #[test]
     fn test_table_ops() {
         let L = luaL_newstate();
-        unsafe {
-            lua_createtable(L, 0, 0);
-            assert_eq!(lua_type(L, 1), LUA_TTABLE);
+        lua_createtable(L, 0, 0);
+        assert_eq!(lua_type(L, 1), LUA_TTABLE);
 
-            // t["key"] = 100
-            lua_pushinteger(L, 100);
-            lua_setfield(L, 1, c"key".as_ptr());
+        // t["key"] = 100
+        lua_pushinteger(L, 100);
+        lua_setfield(L, 1, c"key".as_ptr());
 
-            // x = t["key"]
-            let ty = lua_getfield(L, 1, c"key".as_ptr());
-            assert_eq!(ty, LUA_TNUMBER);
-            let mut isnum: c_int = 0;
-            assert_eq!(lua_tointegerx(L, -1, &mut isnum), 100);
-            assert_eq!(isnum, 1);
+        // x = t["key"]
+        let ty = lua_getfield(L, 1, c"key".as_ptr());
+        assert_eq!(ty, LUA_TNUMBER);
+        let mut isnum: c_int = 0;
+        assert_eq!(lua_tointegerx(L, -1, &mut isnum), 100);
+        assert_eq!(isnum, 1);
 
-            lua_pop(L, 2); // 弹出 value 和 table
-        }
+        lua_pop(L, 2); // 弹出 value 和 table
         lua_close(L);
     }
 
     #[test]
     fn test_global_ops() {
         let L = luaL_newstate();
-        unsafe {
-            lua_pushinteger(L, 999);
-            lua_setglobal(L, c"myvar".as_ptr());
+        lua_pushinteger(L, 999);
+        lua_setglobal(L, c"myvar".as_ptr());
 
-            let ty = lua_getglobal(L, c"myvar".as_ptr());
-            assert_eq!(ty, LUA_TNUMBER);
-            let mut isnum: c_int = 0;
-            assert_eq!(lua_tointegerx(L, -1, &mut isnum), 999);
-            lua_pop(L, 1);
-        }
+        let ty = lua_getglobal(L, c"myvar".as_ptr());
+        assert_eq!(ty, LUA_TNUMBER);
+        let mut isnum: c_int = 0;
+        assert_eq!(lua_tointegerx(L, -1, &mut isnum), 999);
+        lua_pop(L, 1);
         lua_close(L);
     }
 
@@ -3950,27 +3941,25 @@ mod tests {
     #[test]
     fn test_cclosure_with_upvalues() {
         let L = luaL_newstate();
-        unsafe {
-            unsafe extern "C" fn adder(L: *mut c_void) -> c_int {
-                // 读取上值（idx 用 lua_upvalueindex）
-                // upvalueindex(1) = LUA_REGISTRYINDEX - 1
-                let upv = lua_tointegerx(
-                    L as *mut lua_State,
-                    LUA_REGISTRYINDEX - 1,
-                    std::ptr::null_mut(),
-                );
-                let arg = lua_tointegerx(L as *mut lua_State, 1, std::ptr::null_mut());
-                lua_pushinteger(L as *mut lua_State, upv + arg);
-                1
-            }
-            // 创建闭包，上值为 100
-            lua_pushinteger(L, 100);
-            lua_pushcclosure(L, adder, 1);
-            assert_eq!(lua_type(L, 1), LUA_TFUNCTION);
-
-            // 调用: push 闭包, push 参数 23, 调用
-            // 这里只验证闭包创建成功，实际调用在 execute.rs 的 C 函数调用支持完成后测试
+        unsafe extern "C" fn adder(L: *mut c_void) -> c_int {
+            // 读取上值（idx 用 lua_upvalueindex）
+            // upvalueindex(1) = LUA_REGISTRYINDEX - 1
+            let upv = lua_tointegerx(
+                L as *mut lua_State,
+                LUA_REGISTRYINDEX - 1,
+                std::ptr::null_mut(),
+            );
+            let arg = lua_tointegerx(L as *mut lua_State, 1, std::ptr::null_mut());
+            lua_pushinteger(L as *mut lua_State, upv + arg);
+            1
         }
+        // 创建闭包，上值为 100
+        lua_pushinteger(L, 100);
+        lua_pushcclosure(L, adder, 1);
+        assert_eq!(lua_type(L, 1), LUA_TFUNCTION);
+
+        // 调用: push 闭包, push 参数 23, 调用
+        // 这里只验证闭包创建成功，实际调用在 execute.rs 的 C 函数调用支持完成后测试
         lua_close(L);
     }
 

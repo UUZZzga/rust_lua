@@ -95,7 +95,7 @@ pub fn opinterror(p1: &TValue, p2: &TValue, op: &str, p1_info: &str, p2_info: &s
 ///
 /// p1_info / p2_info 是调用方通过 varinfo_str 预先构造的变量信息字符串
 /// （如 " (field 'huge')"），对应 C 的 varinfo(L, p1) / varinfo(L, p2)。
-pub fn tointerror(p1: &TValue, p2: &TValue, p1_info: &str, p2_info: &str) -> VmError {
+pub fn tointerror(p1: &TValue, _p2: &TValue, p1_info: &str, p2_info: &str) -> VmError {
     let info = if to_integer_ns(p1, F2IMode::Floor).is_none() {
         p1_info
     } else {

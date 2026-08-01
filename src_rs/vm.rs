@@ -19,7 +19,7 @@ use crate::gc::GCState;
 use crate::objects::{NilKind, TValue, UpVal, UpValRef};
 use crate::strings::LuaString;
 use crate::table::Table;
-use crate::tm::{get_tm_by_obj, obj_type_name, DefaultMetatables, TagMethod, TagMethodError};
+use crate::tm::{obj_type_name, TagMethodError};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -2012,7 +2012,7 @@ mod tests {
 
     #[test]
     fn test_objlen_table_with_gaps() {
-        let mut t = Table::with_capacity(5, 0);
+        let t = Table::with_capacity(5, 0);
         t.set_int(1, TValue::Integer(10));
         t.set_int(2, TValue::Integer(20));
         t.set_int(4, TValue::Integer(40));

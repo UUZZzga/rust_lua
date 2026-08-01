@@ -679,22 +679,22 @@ pub(crate) fn call_tm(
     Ok(())
 }
 
-/// 调用 __close 元方法 — 对应 C 的 callclosemethod
-///
-/// C 实现:
-/// ```c
-/// static void callclosemethod (lua_State *L, TValue *obj, TValue *err, int yy) {
-///   StkId top = L->top.p;
-///   const TValue *tm = luaT_gettmbyobj(L, obj, TM_CLOSE);
-///   setobj2s(L, top, tm);        /* will call metamethod... */
-///   setobj2s(L, top + 1, obj);   /* with 'self' as the 1st argument */
-///   setobj2s(L, top + 2, err);   /* and error msg. as 2nd argument */
-///   L->top.p = top + 3;
-///   luaD_call(L, top, 0);
-/// }
-/// ```
-///
-/// 找不到 __close 元方法时返回 Ok(false)，调用成功返回 Ok(true)，调用错误返回 Err。
+// 调用 __close 元方法 — 对应 C 的 callclosemethod
+//
+// C 实现:
+// ```c
+// static void callclosemethod (lua_State *L, TValue *obj, TValue *err, int yy) {
+//   StkId top = L->top.p;
+//   const TValue *tm = luaT_gettmbyobj(L, obj, TM_CLOSE);
+//   setobj2s(L, top, tm);        /* will call metamethod... */
+//   setobj2s(L, top + 1, obj);   /* with 'self' as the 1st argument */
+//   setobj2s(L, top + 2, err);   /* and error msg. as 2nd argument */
+//   L->top.p = top + 3;
+//   luaD_call(L, top, 0);
+// }
+// ```
+//
+// 找不到 __close 元方法时返回 Ok(false)，调用成功返回 Ok(true)，调用错误返回 Err。
 thread_local! {
     static CLOSE_METHOD_DEPTH: std::cell::Cell<usize> = std::cell::Cell::new(0);
 }
@@ -1397,7 +1397,7 @@ impl VarargTable {
     }
 
     pub fn from_args(table: &StringTable, args: &[TValue]) -> Self {
-        let mut t = Table::new();
+        let t = Table::new();
         let count = args.len();
         for (i, v) in args.iter().enumerate() {
             t.set_int(i as i64 + 1, v.clone());

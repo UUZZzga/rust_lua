@@ -3686,7 +3686,7 @@ impl LuaState {
                     'outer: for val in self.stack.iter() {
                         if let TValue::Thread(t) = val {
                             let origins = t.context.borrow().upval_origins.clone();
-                            for (uv_ref, idx) in &origins {
+                            for (uv_ref, _idx) in &origins {
                                 if Rc::as_ptr(uv_ref) as usize == *uv_ptr {
                                     let uv = uv_ref.borrow();
                                     if let UpVal::Closed { value } = &*uv {

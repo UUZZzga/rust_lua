@@ -178,7 +178,7 @@ fn is_closed(state: &LuaState, ptr_id: u32) -> bool {
 /// 创建带 FILE* 元表的 UserData，并把 FILE* 存入 state.file_handles。
 /// 注册到 GC（设置 id）和 ud_finobj_list（如果有 __gc 元方法）。
 fn new_file_userdata(state: &mut LuaState, file: *mut libc::FILE, file_mt: &Table) -> TValue {
-    let mut udata = crate::objects::Udata {
+    let udata = crate::objects::Udata {
         gc_header: crate::gc::GCObjectHeader::new(),
         nuvalue: 0,
         len: 0,
@@ -380,7 +380,7 @@ fn call_io_open(
             .get(LuaType::UserData)
             .cloned()
             .unwrap_or_else(|| {
-                let mut t = Table::new();
+                let t = Table::new();
                 t.set(
                     TValue::Str(state.intern_str("__name")),
                     TValue::Str(state.intern_str("FILE*")),
@@ -416,7 +416,7 @@ fn call_io_tmpfile(
             .get(LuaType::UserData)
             .cloned()
             .unwrap_or_else(|| {
-                let mut t = Table::new();
+                let t = Table::new();
                 t.set(
                     TValue::Str(state.intern_str("__name")),
                     TValue::Str(state.intern_str("FILE*")),
@@ -503,7 +503,7 @@ fn call_io_popen(
             .get(LuaType::UserData)
             .cloned()
             .unwrap_or_else(|| {
-                let mut t = Table::new();
+                let t = Table::new();
                 t.set(
                     TValue::Str(state.intern_str("__name")),
                     TValue::Str(state.intern_str("FILE*")),
@@ -530,7 +530,7 @@ fn call_io_popen(
 /// 将多个参数写入 FILE*，返回 (true) 或 (nil, err, errno, count)
 fn g_write(
     state: &mut LuaState,
-    a: usize,
+    _a: usize,
     nargs: usize,
     f: *mut libc::FILE,
     first_arg: usize,
@@ -549,7 +549,7 @@ fn g_write(
         let bytes: Vec<u8> = match &val {
             TValue::Str(s) => s.as_str().as_bytes().to_vec(),
             TValue::Integer(n) => n.to_string().into_bytes(),
-            TValue::Float(fl) => crate::stdlib::base_lib::lua_value_to_string(&val).into_bytes(),
+            TValue::Float(_fl) => crate::stdlib::base_lib::lua_value_to_string(&val).into_bytes(),
             _ => {
                 // 对应 C 的 luaL_checklstring 抛出错误
                 return Err(VmError::RuntimeError(format!(
@@ -665,7 +665,7 @@ fn call_io_output(
                         .get(LuaType::UserData)
                         .cloned()
                         .unwrap_or_else(|| {
-                            let mut t = Table::new();
+                            let t = Table::new();
                             t.set(
                                 TValue::Str(state.intern_str("__name")),
                                 TValue::Str(state.intern_str("FILE*")),
@@ -753,7 +753,7 @@ fn call_io_input(
                         .get(LuaType::UserData)
                         .cloned()
                         .unwrap_or_else(|| {
-                            let mut t = Table::new();
+                            let t = Table::new();
                             t.set(
                                 TValue::Str(state.intern_str("__name")),
                                 TValue::Str(state.intern_str("FILE*")),
@@ -1222,7 +1222,7 @@ fn read_chars(f: *mut libc::FILE, n: usize) -> Option<Vec<u8>> {
 /// first_arg: 第一个读取格式参数在栈上的索引 (io.read: 1, f:read: 2)
 fn g_read(
     state: &mut LuaState,
-    a: usize,
+    _a: usize,
     nargs: usize,
     f: *mut libc::FILE,
     first_arg: usize,
@@ -1709,7 +1709,7 @@ const LINES_UP_FORMATS_BASE: usize = 3;
 
 /// 构造 lines 迭代器的 RustClosure
 fn new_lines_iterator(
-    state: &LuaState,
+    _state: &LuaState,
     file_ptr_id: u32,
     to_close: bool,
     formats: Vec<TValue>,
@@ -1799,7 +1799,7 @@ fn call_io_lines(
                 .get(LuaType::UserData)
                 .cloned()
                 .unwrap_or_else(|| {
-                    let mut t = Table::new();
+                    let t = Table::new();
                     t.set(
                         TValue::Str(state.intern_str("__name")),
                         TValue::Str(state.intern_str("FILE*")),

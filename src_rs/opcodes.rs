@@ -130,6 +130,7 @@ pub const SIZE_B: u32 = 8;
 pub const SIZE_VB: u32 = 6;
 pub const SIZE_VC: u32 = 10;
 pub const SIZE_BX: u32 = SIZE_C + SIZE_B + 1;
+#[allow(non_upper_case_globals)]
 pub const SIZE_Ax: u32 = SIZE_BX + SIZE_A;
 pub const SIZE_A: u32 = 8;
 pub const SIZE_OP: u32 = 7;
@@ -144,7 +145,9 @@ pub const POS_BX: u32 = POS_K;
 pub const POS_SJ: u32 = POS_A;
 pub const OFFSET_SBX: i32 = (((1i64 << SIZE_BX) - 1) >> 1) as i32;
 
+#[allow(non_upper_case_globals)]
 pub const SIZE_sJ: u32 = SIZE_BX + SIZE_A;
+#[allow(non_upper_case_globals)]
 pub const OFFSET_sJ: i32 = (((1i64 << SIZE_sJ) - 1) >> 1) as i32;
 
 pub const NO_REG: u8 = ((1u16 << SIZE_A) - 1) as u8;
@@ -153,6 +156,7 @@ pub const MAX_FSTACK: u8 = NO_REG;
 pub const MAXARG_B: u32 = (1u32 << SIZE_B) - 1;
 pub const MAXINDEXRK: u32 = MAXARG_B;
 pub const MAXARG_BX: u32 = (1u32 << SIZE_BX) - 1;
+#[allow(non_upper_case_globals)]
 pub const MAXARG_Ax: u32 = (1u32 << SIZE_Ax) - 1;
 
 // ============================================================================
@@ -222,14 +226,17 @@ pub fn getarg_bx(i: Instruction) -> i32 {
     getarg(i, POS_BX, SIZE_BX)
 }
 #[cfg_attr(not(size_optimized), inline)]
+#[allow(non_snake_case)]
 pub fn SET_OPCODE(i: &mut Instruction, o: OpCode) {
     *i = (*i & mask0(SIZE_OP, POS_OP)) | ((o as u32) << POS_OP);
 }
 #[cfg_attr(not(size_optimized), inline)]
+#[allow(non_snake_case)]
 pub fn SETARG_k(i: &mut Instruction, v: u32) {
     setarg(i, v as i32, POS_K, 1);
 }
 #[cfg_attr(not(size_optimized), inline)]
+#[allow(non_snake_case)]
 pub fn SETARG_C(i: &mut Instruction, v: i32) {
     setarg(i, v, POS_C, SIZE_C);
 }

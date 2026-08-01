@@ -26,6 +26,7 @@ use crate::state::LuaState;
 use crate::strings::LuaString;
 use crate::table::Table;
 use crate::tm::Metatable;
+#[cfg(test)]
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -659,8 +660,7 @@ fn call_getinfo(
     }
 
     // 构建结果表
-    let mut result_table = Table::new();
-    let what_bytes = what.as_bytes();
+    let result_table = Table::new();
 
     if what.contains('S') {
         result_table.set(
@@ -1818,7 +1818,7 @@ fn set_local_from_thread(
 fn call_getlocal(
     state: &mut LuaState,
     a: usize,
-    nargs: usize,
+    _nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
     let mut arg_offset = 0;
@@ -2032,7 +2032,7 @@ fn call_getlocal(
 fn call_setlocal(
     state: &mut LuaState,
     a: usize,
-    nargs: usize,
+    _nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
     let mut arg_offset = 0;
@@ -2166,7 +2166,7 @@ fn call_setlocal(
 fn call_getupvalue(
     state: &mut LuaState,
     a: usize,
-    nargs: usize,
+    _nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
     let arg1 = get_arg(state, a, 0);
@@ -2265,7 +2265,7 @@ fn call_getupvalue(
 fn call_setupvalue(
     state: &mut LuaState,
     a: usize,
-    nargs: usize,
+    _nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
     let arg1 = get_arg(state, a, 0);
@@ -2363,7 +2363,7 @@ fn call_setupvalue(
 fn call_upvalueid(
     state: &mut LuaState,
     a: usize,
-    nargs: usize,
+    _nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
     let arg1 = get_arg(state, a, 0);
@@ -2431,7 +2431,7 @@ fn call_upvalueid(
 fn call_upvaluejoin(
     state: &mut LuaState,
     a: usize,
-    nargs: usize,
+    _nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
     // 对应 C 的 db_upvaluejoin -> lua_upvaluejoin -> getupvalref:
@@ -2571,13 +2571,11 @@ fn call_sethook(
 fn call_gethook(
     state: &mut LuaState,
     a: usize,
-    nargs: usize,
+    _nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
-    let mut arg_offset = 0;
     let arg0 = get_arg(state, a, 0);
     let co_thread = if let TValue::Thread(t) = &arg0 {
-        arg_offset = 1;
         Some(t.clone())
     } else {
         None
@@ -2659,12 +2657,12 @@ fn set_hook_in_registry(state: &mut LuaState, hook: Option<TValue>, mask: i32, c
     let hookkey = TValue::Str(state.intern_str(HOOKKEY));
 
     // 获取或创建 hook 表
-    let mut hook_table = match state.registry.get(&hookkey) {
+    let hook_table = match state.registry.get(&hookkey) {
         Some(TValue::Table(t)) => t.clone(),
         _ => {
             // 创建新表并设置元表 (__mode = "k")
-            let mut t = Table::new();
-            let mut mt = Table::new();
+            let t = Table::new();
+            let mt = Table::new();
             mt.set(
                 TValue::Str(state.intern_str("__mode")),
                 TValue::Str(state.intern_str("k")),

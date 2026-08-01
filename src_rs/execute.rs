@@ -1652,7 +1652,7 @@ impl VmExecutor {
 
     /// 格式化单条指令为 bytecode_dump 格式
     /// 格式: "{pc}\t[-]\t{OP_NAME}\t{operands}"
-    pub fn format_instruction(state: &LuaState, inst: Instruction, pc: usize) -> String {
+    pub fn format_instruction(_state: &LuaState, inst: Instruction, pc: usize) -> String {
         // 使用 bytecode_dump 的格式: pc [-] instruction
         format!(
             "{}\t[-]\t{}",
@@ -4116,9 +4116,6 @@ impl VmExecutor {
                 state.stack.append(&mut saved_tail);
                 state.top = state.stack.len();
             }
-            Err(_) => {
-                return Err(VmError::RuntimeError("concat error".into()));
-            }
         }
         // 对应 C 的 luaC_checkGC(L)（在 luaV_concat 结束时调用）
         // 字符串不注册到 GC metas，metas_len 无法反映拼接产生的分配压力，
@@ -6106,7 +6103,7 @@ impl VmExecutor {
 
         let table_val = Self::read_stack(state, ra);
         if let TValue::Table(ref table) = table_val {
-            let mut t = table.clone();
+            let t = table.clone();
             for i in 0..n_actual {
                 let val = Self::read_stack(state, ra + 1 + i).clone();
                 let pos = last - n_actual + i;
@@ -6400,7 +6397,7 @@ impl VmExecutor {
             // PF_VATAB: 创建 vararg 表
             // 变参在 state.base + nfixparams .. state.base + nfixparams + nextra
             let vatab_pos = state.base + nfixparams;
-            let mut table = Table::new();
+            let table = Table::new();
             for i in 0..nextra {
                 let val = state.stack[vatab_pos + i].clone();
                 table.set_int((i + 1) as i64, val);

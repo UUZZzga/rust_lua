@@ -871,7 +871,6 @@ impl<'a> LexState<'a> {
             '\'' | '"' => self.read_short_string(),
             c if c.is_ascii_digit() => self.read_number(),
             c if c.is_ascii_alphabetic() || c == '_' => self.read_name(),
-            EOF_CHAR => self.token = Token::Eof,
             c => {
                 // 对应 C llex default 分支: 非字母数字的单字符直接返回为 token
                 // (如控制字符 \1), 解析器在 primaryexp/exprstat 中报 "syntax error"

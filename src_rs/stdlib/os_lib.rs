@@ -12,7 +12,6 @@
 use crate::execute::VmError;
 use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
-use crate::strings::LuaString;
 use crate::table::Table;
 use std::ffi::{CStr, CString};
 
@@ -146,8 +145,8 @@ fn call_setlocale(
 // 派发函数 — 已迁移到 BuiltinFn，直接通过函数指针调用
 // ============================================================================
 
-/// os.clock() — 返回程序使用的 CPU 时间（秒）
-/// 对应 C: lua_pushnumber(L, ((lua_Number)clock())/(lua_Number)CLOCKS_PER_SEC);
+// os.clock() — 返回程序使用的 CPU 时间（秒）
+// 对应 C: lua_pushnumber(L, ((lua_Number)clock())/(lua_Number)CLOCKS_PER_SEC);
 extern "C" {
     fn clock() -> isize;
 }

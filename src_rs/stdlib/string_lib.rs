@@ -3296,7 +3296,7 @@ pub fn call_gmatch_iter(
         TValue::Nil(NilKind::Strict)
     };
 
-    let mut state_table = match state_val {
+    let state_table = match state_val {
         TValue::Table(t) => t,
         _ => {
             return Err(VmError::RuntimeError(
@@ -3806,7 +3806,7 @@ fn call_str_gmatch(
     let pat_start = if anchor { 1 } else { 0 };
 
     // 创建状态表
-    let mut state_table = Table::new();
+    let state_table = Table::new();
     state_table.set(
         TValue::Str(state.intern_str("s")),
         TValue::Str(state.intern_str(&s)),
@@ -3836,7 +3836,7 @@ fn call_str_gmatch(
 
     // 创建元表,设置 __call = BuiltinFn(call_gmatch_iter)
     // 迭代器作为 BuiltinFn 注册,无需 tag 派发
-    let mut mt = Table::new();
+    let mt = Table::new();
     mt.set(
         TValue::Str(state.intern_str("__call")),
         TValue::BuiltinFn(BuiltinFn {

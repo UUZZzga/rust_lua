@@ -1,7 +1,8 @@
 use crate::execute::VmError;
 use crate::objects::*;
-use crate::state::{lua_stdout, LuaState};
-use crate::table::Table;
+use crate::state::LuaState;
+#[cfg(test)]
+use crate::state::lua_stdout;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -233,7 +234,7 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
         if uv_idx >= state.open_upvals.len() {
             break;
         }
-        let (should_close, next, stack_idx) = {
+        let (should_close, next, _stack_idx) = {
             let uv_ref = state.open_upvals[uv_idx].borrow();
             match &*uv_ref {
                 UpVal::Open {
@@ -258,7 +259,6 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
     // 对每个 should_close 的 upvalue，按顺序处理
     // 对 TBC upvalue，先调用 __close metamethod，再 close_upval
     // 错误传播: __close 出错时，错误值传递给下一个 __close 的 err 参数
-    let mut current_status = status;
     let mut current_err: TValue = if status != 0 {
         state
             .last_error_value
@@ -273,17 +273,6 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
         let is_tbc = {
             let uv_ref = state.open_upvals[uv_idx].borrow();
             matches!(&*uv_ref, UpVal::Open { tbc: true, .. })
-        };
-        let (stack_idx, tbc_flag) = {
-            let uv_ref = state.open_upvals[uv_idx].borrow();
-            if let UpVal::Open {
-                stack_index, tbc, ..
-            } = &*uv_ref
-            {
-                (*stack_index, *tbc)
-            } else {
-                (0, false)
-            }
         };
         if is_tbc {
             // TBC upvalue: 读取栈上的值（在 close_upval 之前，因为 close_upval 会改为 Closed）
@@ -333,7 +322,6 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
                             other => TValue::Str(state.intern_str(&format!("{}", other))),
                         };
                         has_error = true;
-                        current_status = 1; // 错误状态
                     }
                 }
             }

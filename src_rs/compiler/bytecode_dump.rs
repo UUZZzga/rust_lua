@@ -3,11 +3,13 @@ use crate::lua_ffi;
 use crate::opcodes::{
     self, get_opcode, get_opmode, getarg, getarg_a, getarg_b, getarg_bx, getarg_c, getarg_sbx,
     getarg_sj, getarg_vb, getarg_vc, testarg_k, OFFSET_sJ, OpCode, OpMode, OPNAMES, POS_A, POS_B,
-    POS_BX, POS_C, POS_K, POS_SJ, POS_VB, POS_VC, SIZE_A, SIZE_BX, TM_EVENT_NAMES,
+    POS_C, POS_K, POS_VB, POS_VC, SIZE_A, SIZE_BX, TM_EVENT_NAMES,
 };
 #[cfg(test)]
 use imara_diff::{Algorithm, Diff, InternedInput};
+#[cfg(feature = "ffi")]
 use std::ffi::{c_int, c_void};
+#[cfg(feature = "ffi")]
 use std::ptr;
 use std::rc::Rc;
 
@@ -266,7 +268,7 @@ impl BytecodeReader {
         }
         let source_str = self.read_string();
         let (
-            source,
+            _source,
             line_info,
             abs_line_info,
             loc_vars,
@@ -864,6 +866,7 @@ pub fn dump_inst_to_raw(inst: &DumpInstruction) -> u32 {
 
 /// Normalize an instruction for comparison: replace constant indices with a placeholder.
 /// This allows comparing instruction structure while ignoring differences in constant pool ordering.
+#[cfg(test)]
 fn normalize_instruction(raw: u32) -> String {
     let opcode = get_opcode(raw);
     let a = getarg_a(raw);

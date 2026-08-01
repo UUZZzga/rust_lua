@@ -647,13 +647,13 @@ pub struct FuncState<'a> {
     pub pc: i32,
     pub freereg: i32,
     pub max_freereg: i32,
-    pub locals: Vec<LocalVar>,
+    locals: Vec<LocalVar>,
     pub errors: Vec<String>,
     pub needclose: bool,
-    pub parent_locals: Vec<ParentVar>, // variables visible from parent/grandparent functions
+    parent_locals: Vec<ParentVar>, // variables visible from parent/grandparent functions
     pub break_list: i32,
-    pub labels: Vec<LabelDesc>,
-    pub gotos: Vec<GotoDesc>,
+    labels: Vec<LabelDesc>,
+    gotos: Vec<GotoDesc>,
     lasttarget: i32,
     block_stack: Vec<BlockEntry>, // 每个块的信息，栈顶是当前块
     /// Pending function body block info, saved by parse_chunk for close_func.
@@ -756,7 +756,7 @@ pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
         return Err(all_errors.into_iter().next().unwrap());
     }
 
-    let mut proto = fs.proto;
+    let proto = fs.proto;
     // size/max_stack_size 字段已在 parse_chunk_finish 中设置
     Ok(proto)
 }
@@ -1363,6 +1363,7 @@ impl<'a> FuncState<'a> {
     }
 
     #[cfg(not(debug_assertions))]
+    #[allow(dead_code)]
     fn assert_regs_at(&self, _expected_nregs: i32, _context: &str) {}
 
     #[cfg(not(debug_assertions))]
@@ -1935,7 +1936,7 @@ impl<'a> FuncState<'a> {
             }
         }
         // Step 2: search parent's upvalues (is_local=false, is_parent_upval=true)
-        for (j, pvar) in prev.parent_locals.iter().enumerate().rev() {
+        for (_j, pvar) in prev.parent_locals.iter().enumerate().rev() {
             if pvar.is_local || !pvar.is_parent_upval {
                 continue;
             }
@@ -1961,7 +1962,7 @@ impl<'a> FuncState<'a> {
             }
         }
         // Step 3: search grandparent vars (is_local=false, is_parent_upval=false)
-        for (j, pvar) in prev.parent_locals.iter().enumerate().rev() {
+        for (_j, pvar) in prev.parent_locals.iter().enumerate().rev() {
             if pvar.is_local || pvar.is_parent_upval {
                 continue;
             }
@@ -2625,7 +2626,6 @@ impl<'a> FuncState<'a> {
             return false;
         }
         let b = getarg_b(i);
-        let old_a = getarg_a(i);
         if reg != NO_REG as i32 && reg != b {
             setarg(
                 &mut Rc::make_mut(&mut self.proto.code)[(node - 1) as usize],
@@ -3677,7 +3677,7 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
         }
 
         // Now parse expressions
-        let mut last_exp = ExpDesc::new(ExpKind::Void, 0);
+        let last_exp;
         let mut nexps = 0;
         loop {
             let ei = parse_expr(fs);
@@ -4132,7 +4132,6 @@ fn parse_assign_or_call(fs: &mut FuncState) {
     let mut first = parse_prefix_exp(fs);
 
     let mut has_call = first.has_call;
-    let mut freg: i32 = first.reg.unwrap_or(-1);
     let mut call_pc: i32 = first.call_pc;
     if !has_call
         && (check(fs, &Token::LParen)
@@ -4143,7 +4142,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
         has_call = true;
         let is_method = check(fs, &Token::Colon);
         let (fr, _ef, func_allocated, src_reg) = load_func(fs, &first, is_method);
-        freg = fr;
+        let freg = fr;
         call_pc = parse_func_args(fs, freg, src_reg);
         loop {
             match &fs.ls().token {
@@ -4704,7 +4703,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     if can_settabup {
                         let upval_idx = v.upval_idx.unwrap_or(0);
                         let gettabup_pc = v.env_gettabup_pc;
-                        let (env_k, adjusted_key) =
+                        let (_env_k, adjusted_key) =
                             if gettabup_pc >= 0 && (gettabup_pc as usize) < fs.proto.code.len() {
                                 let gettabup_inst =
                                     Rc::make_mut(&mut fs.proto.code).remove(gettabup_pc as usize);
@@ -11053,7 +11052,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 } else {
                     fs.exp_to_reg(&e)
                 };
-                let mut base_is_nonreloc_local = !table_is_upvalue
+                let base_is_nonreloc_local = !table_is_upvalue
                     && matches!(e.kind, ExpKind::NonReloc)
                     && (e.info as i32) < fs.nvarstack();
                 // Parse the index expression (like C's yindex)
@@ -11129,7 +11128,6 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                     let r = fs.alloc_reg();
                     fs.code_abc(OpCode::GETUPVAL, r, table_upval_idx, 0);
                     base_reg = r;
-                    base_is_nonreloc_local = false;
                     // Handle key based on type
                     if ei.exp.kind == ExpKind::Int
                         && ei.exp.info >= 0
@@ -11372,7 +11370,7 @@ fn parse_if_cond(fs: &mut FuncState, entry_freereg: i32) -> i32 {
     let is_const_true = matches!(ei.exp.kind, ExpKind::Boolean) && ei.exp.info != 0
         || matches!(ei.exp.kind, ExpKind::Int | ExpKind::Float | ExpKind::Str);
 
-    let mut if_jmp = NO_JUMP;
+    let if_jmp;
 
     if is_const_true {
         // Like C's luaK_goiftrue for VTRUE/VK: pc = NO_JUMP (no new jump).
@@ -11762,7 +11760,6 @@ fn parse_for(fs: &mut FuncState) {
 
     if check(fs, &Token::Eq) {
         fs.ls_mut().next();
-        let saved_freereg = fs.freereg;
         let base = fs.freereg;
 
         // Push forstat block (like C's enterblock in forstat)
@@ -11930,7 +11927,6 @@ fn parse_for(fs: &mut FuncState) {
 
         // C: line = ls->linenumber (after checknext(TK_IN), line of first expr token)
         let for_line = fs.ls().linenumber;
-        let saved_freereg = fs.freereg;
         let base = fs.freereg;
 
         // Push forstat block (like C's enterblock in forstat)
@@ -12199,7 +12195,6 @@ fn parse_func_stat(fs: &mut FuncState) {
 
     if chain.len() == 1 {
         let name = &chain[0].1;
-        let name_str = name.as_str();
         // Like C's searchvar: search from back to front, local variables
         // can shadow global declarations (e.g., `local f` shadows `global <const> *`).
         let local_result = fs.find_local_ex(name);
@@ -12481,7 +12476,7 @@ fn parse_local(fs: &mut FuncState) {
         if has_init {
             fs.ls_mut().next();
             let saved_freereg = fs.freereg;
-            let mut last_exp: Option<ExpDesc> = None;
+            let mut last_exp: Option<ExpDesc>;
             let mut n_vals = 0;
             let mut last_is_vararg = false;
             let mut last_vararg_pc: i32 = -1;
@@ -12624,7 +12619,6 @@ fn parse_local(fs: &mut FuncState) {
                 fs.add_local_kind_reg(names[i].as_str(), fs.pc, kinds[i], saved_freereg + i as i32);
             }
             if last_is_ctc {
-                let pc = fs.pc;
                 let last_e = last_exp.as_ref().unwrap();
                 let ctc_str = if last_e.kind == ExpKind::Str {
                     // String constant was already popped above (LOADK case).
@@ -12991,7 +12985,6 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     let mut n_params: u8 = 0;
 
     let mut param_names: Vec<LuaString> = Vec::new();
-    let mut vararg_named = false;
     if ismethod {
         param_names.push(fs.ls_mut().anchor_string("self"));
         n_params = 1;
@@ -13007,7 +13000,6 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
                     fs.ls_mut().next();
                     // Add as RDKVAVAR kind local variable (not counted in n_params, like C)
                     param_names.push(name);
-                    vararg_named = true;
                 } else {
                     // Traditional ... without name (not counted in n_params, like C)
                     param_names.push(fs.ls_mut().anchor_string("(vararg table)"));
