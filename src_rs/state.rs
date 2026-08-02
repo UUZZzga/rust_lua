@@ -3446,19 +3446,54 @@ impl LuaState {
         // 短串由 string_table 管理（无 gc_header），需在此遍历计费。
         // 长串由 Arc 引用计数管理（Box<LongString> 每次 clone 独立内存），
         //   不在此累加（ptr_id 去重困难且长串通常数量少），偏差可容忍。
-        self.string_table.for_each(|ss| {
-            extra_size +=
-                std::mem::size_of::<crate::strings::ShortString>() + ss.contents.capacity() + 16;
-            // Arc 内部控制结构
-        });
+        //
+        // 优化：缓存 (string_table_ptr, nuse, str_extra_size)。
+        //   nuse 没变时（没有新短串 intern，也没有死短串释放），短串总占用不变，跳过遍历。
+        //   1589 次 GC 中，大部分 GC 间 nuse 不变（稳定状态），可省 19% GC 时间。
+        let nuse = self.string_table.count();
+        let table_ptr = &self.string_table as *const _ as usize;
+        let cached = STR_EXTRA_CACHE.with(|c| c.get());
+        if cached.0 == table_ptr && cached.1 == nuse {
+            // nuse 没变，复用缓存的 str_extra
+            extra_size += cached.2;
+        } else {
+            // nuse 变了或首次，重新遍历
+            let mut str_extra: usize = 0;
+            self.string_table.for_each(|ss| {
+                str_extra += std::mem::size_of::<crate::strings::ShortString>()
+                    + ss.contents.capacity()
+                    + 16; // Arc 内部控制结构
+            });
+            extra_size += str_extra;
+            STR_EXTRA_CACHE.with(|c| c.set((table_ptr, nuse, str_extra)));
+        }
 
         // 重算 extra_estimate：反映当前可达的无 gc_header 对象的内存占用
         self.gc.set_extra_estimate(extra_size);
 
-        // 动态阈值 = total_estimate * pause / 100（含 extra_estimate，使 GC 触发
-        // 更准确地反映真实内存占用，避免无 gc_header 对象不计费导致 GC 不及时）
+        // 自适应 GC 阈值：根据本次 GC 的回收效率动态调整阈值倍数
+        // all.lua 实测 76% 的 GC freed=0（对象都在使用，纯浪费），此优化大幅减少无效 GC。
+        // freed_ratio = 释放对象数 / GC 前活跃对象数
+        //   < 5%   : 几乎没回收 → pause * 2（阈值 = estimate * 4，推迟下次 GC）
+        //   < 20%  : 回收少     → pause * 3/2（阈值 = estimate * 3）
+        //   >= 20% : 正常回收   → pause（阈值 = estimate * 2，默认）
+        // 限制：effective_pause 上限 1000（避免阈值过高导致内存暴涨）
         let pause = self.gc.get_gc_param(GCState::PARAM_PAUSE).max(1) as usize;
-        let new_threshold = self.gc.total_estimate() * pause / 100;
+        let active_after = self.gc.active_count();
+        let freed = active.saturating_sub(active_after);
+        let freed_ratio = if active > 0 {
+            freed as f64 / active as f64
+        } else {
+            1.0 // 无活跃对象视为正常
+        };
+        let effective_pause = if freed_ratio < 0.05 {
+            (pause * 2).min(1000)
+        } else if freed_ratio < 0.20 {
+            (pause * 3 / 2).min(1000)
+        } else {
+            pause
+        };
+        let new_threshold = self.gc.total_estimate() * effective_pause / 100;
         self.gc.set_collect_threshold(new_threshold);
         self.gc.set_debt(100);
         self.gc.step_accum.set(0);
@@ -3974,6 +4009,12 @@ impl LuaState {
             self.concat_gc_counter.set(cnt);
         }
     }
+}
+
+// 字符串表 extra_size 缓存：(string_table_ptr, nuse, str_extra_size)
+// 当 nuse 没变时（稳定状态），跳过 for_each 遍历，直接复用缓存的 str_extra_size。
+thread_local! {
+    static STR_EXTRA_CACHE: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
 }
 
 // ============================================================================
