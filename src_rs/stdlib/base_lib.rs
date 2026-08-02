@@ -2489,6 +2489,7 @@ fn call_load(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
     // For large source (>=64KB), force full GC before compilation to avoid
     // OOM during the allocation-heavy compilation process.
     if source.len() >= 65536 {
+        crate::state::gc_trigger_explicit();
         state.collect_gc();
     }
     let proto_result = if is_binary {
@@ -3014,6 +3015,7 @@ fn call_collectgarbage(
                 // 协程可达性由 RustClosure 的 upvalues[0] (Thread) 跟踪，
                 // collect_gc 会通过 mark_tvalue 遍历 RustClosure，自动回收不可达的协程。
                 // collect_gc 内部会清理弱引用表中的死条目
+                crate::state::gc_trigger_explicit();
                 state.collect_gc();
                 TValue::Integer(0)
             }

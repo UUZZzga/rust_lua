@@ -89,6 +89,75 @@ unsafe fn raw_as_tvalue(raw: &RawTValue) -> &TValue {
     raw.assume_init_ref()
 }
 
+// ============================================================================
+// GC 统计 — 由环境变量 LUA_GC_STATS=1 启用，用于分析循环引用对象占比
+// ============================================================================
+
+#[derive(Default, Clone, Copy)]
+struct GcTypeStats {
+    table: u64,
+    /// 有 metatable 的 Table（潜在循环引用源）
+    table_with_mt: u64,
+    lclosure: u64,
+    /// 有 upvalues 的 LClosure
+    lclosure_with_upvals: u64,
+    cclosure: u64,
+    rust_closure: u64,
+    thread: u64,
+    userdata: u64,
+    /// Proto（被 LClosure 引用，单向，不形成循环）
+    proto: u64,
+    /// 短串（叶子对象，不引用 GC 对象）
+    short_string: u64,
+    /// GC 调用次数
+    gc_cycles: u64,
+    /// 本次 GC 标记的可达对象总数（含所有类型）
+    reachable_total: u64,
+    /// 本次 GC 时的活跃对象总数（含不可达）
+    active_total: u64,
+}
+
+impl GcTypeStats {
+    const ZERO: Self = GcTypeStats {
+        table: 0,
+        table_with_mt: 0,
+        lclosure: 0,
+        lclosure_with_upvals: 0,
+        cclosure: 0,
+        rust_closure: 0,
+        thread: 0,
+        userdata: 0,
+        proto: 0,
+        short_string: 0,
+        gc_cycles: 0,
+        reachable_total: 0,
+        active_total: 0,
+    };
+}
+
+thread_local! {
+    static GC_STATS: std::cell::Cell<GcTypeStats> = const { std::cell::Cell::new(GcTypeStats::ZERO) };
+}
+
+/// 是否启用 GC 统计（读取环境变量 LUA_GC_STATS，首次调用后缓存）
+fn gc_stats_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| std::env::var("LUA_GC_STATS").map(|v| v == "1" || v == "true").unwrap_or(false))
+}
+
+/// 累加统计到 thread_local（仅在 gc_stats_enabled() 时调用）
+fn gc_stats_inc<F: FnOnce(&mut GcTypeStats)>(f: F) {
+    if !gc_stats_enabled() {
+        return;
+    }
+    GC_STATS.with(|cell| {
+        let mut s = cell.get();
+        f(&mut s);
+        cell.set(s);
+    });
+}
+
 pub const LUA_YIELD: i32 = 1;
 pub const ERR_RUN: i32 = 2;
 pub const ERR_SYNTAX: i32 = 3;
@@ -3259,6 +3328,12 @@ impl LuaState {
     /// 完整的 mark-sweep GC：从根集合开始标记所有可达对象，然后清扫不可达对象。
     /// 对应 C 的 luaC_fullgc。
     pub fn collect_gc(&mut self) {
+        // GC 时间统计（LUA_GC_STATS=1 时启用）
+        let gc_start = if gc_stats_enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         // 设置 GC 正在运行标志 — 阻止 finalizer 中重入 collectgarbage("collect")
         self.gc.gc_running.set(true);
         // 临时禁用 hook — GC 期间的 finalizer 调用不应触发用户的 hook
@@ -3283,11 +3358,40 @@ impl LuaState {
             }
         }
         self.last_gc_estimate = cur_estimate;
+        // 累计 GC 时间
+        if let Some(start) = gc_start {
+            let elapsed = start.elapsed();
+            GC_TIME_STATS.with(|cell| {
+                let mut s = cell.get();
+                s.total_us += elapsed.as_micros() as u64;
+                s.count += 1;
+                let this_us = elapsed.as_micros() as u64;
+                if this_us > s.max_us { s.max_us = this_us; }
+                cell.set(s);
+            });
+        }
         result
     }
 
     fn collect_gc_inner(&mut self) {
         let active = self.gc.active_count();
+        // GC 统计：重置类型计数（保留 gc_cycles 累计），记录本次 GC 的类型分布
+        if gc_stats_enabled() {
+            GC_STATS.with(|cell| {
+                let mut s = cell.get();
+                s.table = 0;
+                s.table_with_mt = 0;
+                s.lclosure = 0;
+                s.lclosure_with_upvals = 0;
+                s.cclosure = 0;
+                s.rust_closure = 0;
+                s.thread = 0;
+                s.userdata = 0;
+                s.proto = 0;
+                s.short_string = 0;
+                cell.set(s);
+            });
+        }
         // 预分配可达集容量 — 估计可达对象约为活跃对象的 60%（其余是垃圾）
         // 过大预分配会增加内存压力（500K 对象 * 8B = 4MB/集），反而变慢
         let est_reachable = (active * 3 / 5).max(64);
@@ -3440,7 +3544,20 @@ impl LuaState {
 
         // 清理字符串表：移除只有字符串表持有的死字符串
         // 对应 C Lua 的 sweepstrings；字符串不注册到 GC metas，需单独清理
+        let str_sweep_start = if gc_stats_enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         self.string_table.sweep();
+        if let Some(start) = str_sweep_start {
+            let elapsed = start.elapsed().as_micros() as u64;
+            GC_TIME_STATS.with(|cell| {
+                let mut s = cell.get();
+                s.str_sweep_us += elapsed;
+                cell.set(s);
+            });
+        }
 
         // 累加 string_table 中存活短串的 gc_mem_size() 到 extra_size。
         // 短串由 string_table 管理（无 gc_header），需在此遍历计费。
@@ -3450,23 +3567,42 @@ impl LuaState {
         // 优化：缓存 (string_table_ptr, nuse, str_extra_size)。
         //   nuse 没变时（没有新短串 intern，也没有死短串释放），短串总占用不变，跳过遍历。
         //   1589 次 GC 中，大部分 GC 间 nuse 不变（稳定状态），可省 19% GC 时间。
+        let str_for_each_start = if gc_stats_enabled() {
+            Some(std::time::Instant::now())
+        } else {
+            None
+        };
         let nuse = self.string_table.count();
         let table_ptr = &self.string_table as *const _ as usize;
         let cached = STR_EXTRA_CACHE.with(|c| c.get());
+        let short_string_count: u64;
         if cached.0 == table_ptr && cached.1 == nuse {
             // nuse 没变，复用缓存的 str_extra
             extra_size += cached.2;
+            short_string_count = nuse as u64;
         } else {
             // nuse 变了或首次，重新遍历
             let mut str_extra: usize = 0;
+            let mut count: u64 = 0;
             self.string_table.for_each(|ss| {
                 str_extra += std::mem::size_of::<crate::strings::ShortString>()
                     + ss.contents.capacity()
                     + 16; // Arc 内部控制结构
+                count += 1;
             });
             extra_size += str_extra;
             STR_EXTRA_CACHE.with(|c| c.set((table_ptr, nuse, str_extra)));
+            short_string_count = count;
         }
+        if let Some(start) = str_for_each_start {
+            let elapsed = start.elapsed().as_micros() as u64;
+            GC_TIME_STATS.with(|cell| {
+                let mut s = cell.get();
+                s.str_for_each_us += elapsed;
+                cell.set(s);
+            });
+        }
+        gc_stats_inc(|s| { s.short_string += short_string_count; });
 
         // 重算 extra_estimate：反映当前可达的无 gc_header 对象的内存占用
         self.gc.set_extra_estimate(extra_size);
@@ -3497,6 +3633,54 @@ impl LuaState {
         self.gc.set_collect_threshold(new_threshold);
         self.gc.set_debt(100);
         self.gc.step_accum.set(0);
+
+        // GC 统计输出：累计统计 + 本次 GC 的可达/活跃对象数
+        if gc_stats_enabled() {
+            let reachable_count = reachable.len() as u64;
+            let active_count = active as u64;
+            gc_stats_inc(|s| {
+                s.gc_cycles += 1;
+                s.reachable_total = reachable_count;
+                s.active_total = active_count;
+            });
+            GC_STATS.with(|cell| {
+                let s = cell.get();
+                // 可能循环引用的对象 = Table + LClosure + CClosure + RustClosure + Thread + UserData
+                // （这些对象持有 GC 对象引用，可能形成 Rc 循环）
+                let cyclic = s.table + s.lclosure + s.cclosure + s.rust_closure + s.thread + s.userdata;
+                // 非循环对象 = Proto + ShortString（叶子或单向引用）
+                let non_cyclic = s.proto + s.short_string;
+                let total = cyclic + non_cyclic;
+                eprintln!(
+                    "[GC stats] cycle={} reachable={} active={} freed={} | \
+                     Table={} (with_mt={}) LClosure={} (with_upvals={}) CClosure={} RustClosure={} \
+                     Thread={} UserData={} | cyclic={} non_cyclic={} | Proto={} ShortString={}",
+                    s.gc_cycles,
+                    s.reachable_total,
+                    s.active_total,
+                    s.active_total.saturating_sub(s.reachable_total),
+                    s.table, s.table_with_mt,
+                    s.lclosure, s.lclosure_with_upvals,
+                    s.cclosure, s.rust_closure,
+                    s.thread, s.userdata,
+                    cyclic, non_cyclic,
+                    s.proto, s.short_string,
+                );
+                let pct = if total > 0 { cyclic as f64 * 100.0 / total as f64 } else { 0.0 };
+                eprintln!(
+                    "[GC stats] cyclic_ratio={:.2}% (cyclic={} / total={})",
+                    pct, cyclic, total
+                );
+                // 输出 GC 触发源统计
+                GC_TRIGGER_STATS.with(|cell| {
+                    let t = cell.get();
+                    eprintln!(
+                        "[GC stats] triggers: maybe={} concat={} step={} explicit={}",
+                        t.maybe, t.concat, t.step, t.explicit
+                    );
+                });
+            });
+        }
     }
     /// 增量 GC 步进
     /// - siz=0: 无参数 collectgarbage("step")，C Lua 强制执行一步基本 GC。
@@ -3507,6 +3691,7 @@ impl LuaState {
     ///   达到 active_count 阈值才触发完整 GC。大多数 step 只累积不触发，P95 接近 0。
     pub fn step_gc(&mut self, siz: usize) -> bool {
         if siz == 0 {
+            gc_trigger_inc(GcTrigger::Step);
             self.collect_gc();
             self.gc.step_accum.set(0);
             true
@@ -3514,6 +3699,7 @@ impl LuaState {
             let acc = self.gc.step_accum.get() + siz;
             let threshold = self.gc.active_count().max(1);
             if acc >= threshold {
+                gc_trigger_inc(GcTrigger::Step);
                 self.collect_gc();
                 self.gc.step_accum.set(0);
                 true
@@ -3864,6 +4050,12 @@ impl LuaState {
                         }
                         None => (false, false),
                     };
+                    // GC 统计：Table + 有 metatable 的 Table
+                    let has_mt = data.metatable.is_some();
+                    gc_stats_inc(|s| {
+                        s.table += 1;
+                        if has_mt { s.table_with_mt += 1; }
+                    });
                     for v in data.array.iter() {
                         if !weak_v && Self::needs_gc_mark(v) {
                             unsafe { worklist.push(raw_from_tvalue(v)) };
@@ -3899,6 +4091,13 @@ impl LuaState {
                     // 累加 proto.gc_mem_size() 到 extra_size，使 GC estimate 含 Proto 内存。
                     *extra_size += c.proto.gc_mem_size();
                     let upvals = c.upvals.borrow();
+                    // GC 统计：LClosure + Proto + 有 upvalues 的 LClosure
+                    let upvals_len = upvals.len();
+                    gc_stats_inc(|s| {
+                        s.lclosure += 1;
+                        s.proto += 1;
+                        if upvals_len > 0 { s.lclosure_with_upvals += 1; }
+                    });
                     for uv_ref in upvals.iter() {
                         let uv = uv_ref.borrow();
                         match &*uv {
@@ -3929,6 +4128,8 @@ impl LuaState {
                 if visited.insert(ptr) {
                     reachable.insert(ptr);
                     *extra_size += cc.gc_mem_size();
+                    // GC 统计：CClosure
+                    gc_stats_inc(|s| { s.cclosure += 1; });
                     for uv in &cc.upvalue {
                         if Self::needs_gc_mark(uv) {
                             unsafe { worklist.push(raw_from_tvalue(uv)) };
@@ -3947,6 +4148,8 @@ impl LuaState {
                 if visited.insert(ptr) {
                     reachable.insert(ptr);
                     *extra_size += rc.gc_mem_size();
+                    // GC 统计：RustClosure
+                    gc_stats_inc(|s| { s.rust_closure += 1; });
                     let upvals = rc.upvalues.borrow();
                     for uv in upvals.iter() {
                         if Self::needs_gc_mark(uv) {
@@ -3961,6 +4164,8 @@ impl LuaState {
                 }
                 let ptr_id = u.gc_header.ptr_id;
                 if visited.insert(ptr_id as usize) {
+                    // GC 统计：UserData
+                    gc_stats_inc(|s| { s.userdata += 1; });
                     if let Some(ref mt) = u.metatable {
                         let mt_ptr = mt.gc_header.ptr_id as usize;
                         if !visited.contains(&mt_ptr) {
@@ -3981,6 +4186,8 @@ impl LuaState {
                 if visited.insert(ptr) {
                     reachable.insert(ptr);
                     *extra_size += t.gc_mem_size();
+                    // GC 统计：Thread（总是可能循环：栈引用闭包，闭包 upvalue 引用回 Thread）
+                    gc_stats_inc(|s| { s.thread += 1; });
                     self.collect_thread_roots(t, worklist);
                 }
             }
@@ -3993,6 +4200,7 @@ impl LuaState {
     /// 使 GC 触发更准确反映真实内存占用
     pub fn maybe_collect_gc(&mut self) {
         if self.gc.is_running() && self.gc.total_estimate() > self.gc.collect_threshold() {
+            gc_trigger_inc(GcTrigger::Maybe);
             self.collect_gc();
         }
     }
@@ -4003,6 +4211,7 @@ impl LuaState {
     pub fn concat_gc_check(&mut self) {
         let cnt = self.concat_gc_counter.get() + 1;
         if cnt >= self.concat_gc_interval.get() {
+            gc_trigger_inc(GcTrigger::Concat);
             self.collect_gc();
             self.concat_gc_counter.set(0);
         } else {
@@ -4011,10 +4220,107 @@ impl LuaState {
     }
 }
 
+// GC 触发源统计（LUA_GC_STATS=1 时启用）
+#[derive(Default, Clone, Copy)]
+struct GcTriggerStats {
+    maybe: u64,
+    concat: u64,
+    step: u64,
+    explicit: u64,
+}
+
+#[derive(Clone, Copy)]
+enum GcTrigger {
+    Maybe,
+    Concat,
+    Step,
+    Explicit,
+}
+
+thread_local! {
+    static GC_TRIGGER_STATS: std::cell::Cell<GcTriggerStats> = const { std::cell::Cell::new(GcTriggerStats::ZERO) };
+}
+
+impl GcTriggerStats {
+    const ZERO: Self = GcTriggerStats { maybe: 0, concat: 0, step: 0, explicit: 0 };
+}
+
+fn gc_trigger_inc(trigger: GcTrigger) {
+    if !gc_stats_enabled() {
+        return;
+    }
+    GC_TRIGGER_STATS.with(|cell| {
+        let mut s = cell.get();
+        match trigger {
+            GcTrigger::Maybe => s.maybe += 1,
+            GcTrigger::Concat => s.concat += 1,
+            GcTrigger::Step => s.step += 1,
+            GcTrigger::Explicit => s.explicit += 1,
+        }
+        cell.set(s);
+    });
+}
+
+/// 标记显式 GC 触发（collectgarbage("collect") 等）— 供外部模块调用
+pub(crate) fn gc_trigger_explicit() {
+    gc_trigger_inc(GcTrigger::Explicit);
+}
+
+// GC 时间统计（LUA_GC_STATS=1 时启用）
+#[derive(Default, Clone, Copy)]
+struct GcTimeStats {
+    total_us: u64,
+    count: u64,
+    max_us: u64,
+    /// string_table.sweep 累计耗时
+    str_sweep_us: u64,
+    /// string_table.for_each（计费遍历）累计耗时
+    str_for_each_us: u64,
+}
+
+impl GcTimeStats {
+    const ZERO: Self = GcTimeStats {
+        total_us: 0,
+        count: 0,
+        max_us: 0,
+        str_sweep_us: 0,
+        str_for_each_us: 0,
+    };
+}
+
+thread_local! {
+    static GC_TIME_STATS: std::cell::Cell<GcTimeStats> = const { std::cell::Cell::new(GcTimeStats::ZERO) };
+}
+
 // 字符串表 extra_size 缓存：(string_table_ptr, nuse, str_extra_size)
 // 当 nuse 没变时（稳定状态），跳过 for_each 遍历，直接复用缓存的 str_extra_size。
 thread_local! {
     static STR_EXTRA_CACHE: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
+}
+
+/// 输出 GC 时间统计汇总（在进程退出时调用）
+pub fn print_gc_time_summary() {
+    if !gc_stats_enabled() {
+        return;
+    }
+    GC_TIME_STATS.with(|cell| {
+        let s = cell.get();
+        if s.count == 0 {
+            return;
+        }
+        let avg_us = s.total_us / s.count;
+        eprintln!(
+            "[GC time] count={} total={:.3}s avg={:.3}ms max={:.3}ms | \
+             str_sweep={:.3}s str_for_each={:.3}s mark_other={:.3}s",
+            s.count,
+            s.total_us as f64 / 1_000_000.0,
+            avg_us as f64 / 1000.0,
+            s.max_us as f64 / 1000.0,
+            s.str_sweep_us as f64 / 1_000_000.0,
+            s.str_for_each_us as f64 / 1_000_000.0,
+            (s.total_us.saturating_sub(s.str_sweep_us).saturating_sub(s.str_for_each_us)) as f64 / 1_000_000.0,
+        );
+    });
 }
 
 // ============================================================================
