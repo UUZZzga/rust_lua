@@ -26,7 +26,7 @@ use std::rc::Rc;
 
 use crate::objects::{
     CClosure, LCFunction, LClosure, LuaThread, LuaType, NilKind, Proto, TValue, Table,
-    ThreadContext, ThreadStatus, Udata,
+    ThreadContext, ThreadStatus, Udata, UpVal,
 };
 use crate::state::LuaState;
 use crate::strings::LuaString;
@@ -788,6 +788,7 @@ pub extern "C" fn lua_rawlen(L: *mut lua_State, idx: c_int) -> lua_Unsigned {
     match index2val(L, idx) {
         Some(TValue::Str(s)) => s.len() as lua_Unsigned,
         Some(TValue::Table(t)) => t.len() as lua_Unsigned,
+        Some(TValue::UserData(u)) => u.len as lua_Unsigned,
         _ => 0,
     }
 }
@@ -1311,13 +1312,16 @@ pub extern "C-unwind" fn lua_newuserdatauv(
 ) -> *mut c_void {
     let L = unsafe { &mut *L };
     let nuv = if nuvalue >= 0 { nuvalue as usize } else { 0 };
+    // 用 Vec<u64> 分配内存，保证 8 字节对齐
+    // C 代码（如 skynet netpack 的 struct queue）可能包含指针数组，需要正确对齐
+    let n_u64 = (sz + 7) / 8; // 向上取整到 8 字节
     let mut udata = crate::objects::Udata {
         gc_header: crate::gc::GCObjectHeader::new(),
         nuvalue: nuv as u16,
         len: sz,
         metatable: None,
         user_values: (0..nuv).map(|_| TValue::Nil(NilKind::Strict)).collect(),
-        data: vec![0u8; sz],
+        data: vec![0u64; n_u64],
     };
     // 注册到 GC 并设置 id（使 mark_tvalue 能正确标记 reachable）
     // 用 gc_mem_size() 计费含 data/user_values 容量，比 size_of::<Udata>() 更接近真实占用
@@ -3833,6 +3837,299 @@ pub extern "C" fn lua_sethook(
         // hook_func 保持原值（若原本是 Lua 函数则保留，否则为 None）
         // 注意：C 函数指针无法存储为 TValue，因此钩子不会实际触发
     }
+}
+
+// ============================================================================
+// Upvalue 管理 (lua_getupvalue / lua_setupvalue / lua_upvalueid / lua_upvaluejoin)
+// ============================================================================
+// 对应 C lapi.c 的 4 个 upvalue C API. skynet.so 等第三方 C 模块通过这些
+// API 读取/修改闭包的上值. 之前仅 debug 库 (debug_lib.rs) 在 Rust 层面实现,
+// C API 层未导出, 导致 dlopen 加载的 skynet.so 找不到 lua_getupvalue 符号.
+
+/// lua_getupvalue: 获取函数的第 n 个上值, 压栈并返回名称.
+///
+/// 返回 NULL 表示 n 超出范围或不是闭包. C 闭包返回 "" (空字符串),
+/// Lua 闭包返回上值名 (无名称时返回 "(no name)").
+#[no_mangle]
+pub extern "C" fn lua_getupvalue(L: *mut lua_State, funcindex: c_int, n: c_int) -> *const c_char {
+    let L = unsafe { &mut *L };
+    let n = n as usize;
+    if n == 0 {
+        return std::ptr::null();
+    }
+    let off = match index2offset(L, funcindex) {
+        Some(o) => o,
+        None => return std::ptr::null(),
+    };
+    // 先提取值和名称 (raw pointer 不受借用检查约束), 再 push
+    let (value, name_ptr) = match &L.stack.get(off) {
+        Some(TValue::CClosure(cc)) => {
+            if n <= cc.upvalue.len() {
+                (Some(cc.upvalue[n - 1].clone()), b"\0".as_ptr() as *const c_char)
+            } else {
+                (None, std::ptr::null())
+            }
+        }
+        Some(TValue::LClosure(closure)) => {
+            let upvals = closure.upvals.borrow();
+            if n <= upvals.len() {
+                let val = {
+                    let uv = upvals[n - 1].borrow();
+                    match &*uv {
+                        UpVal::Closed { value } => (**value).clone(),
+                        UpVal::Open { stack_index, .. } => {
+                            if *stack_index < L.stack.len() {
+                                L.stack[*stack_index].clone()
+                            } else {
+                                TValue::Nil(NilKind::Strict)
+                            }
+                        }
+                    }
+                };
+                let name_ptr = closure
+                    .proto
+                    .upvalues
+                    .get(n - 1)
+                    .and_then(|u| u.name.as_ref())
+                    .map(|s| s.as_c_str_ptr())
+                    .unwrap_or_else(|| b"(no name)\0".as_ptr() as *const c_char);
+                (Some(val), name_ptr)
+            } else {
+                (None, std::ptr::null())
+            }
+        }
+        _ => (None, std::ptr::null()),
+    };
+    if let Some(v) = value {
+        L.stack.push(v);
+        name_ptr
+    } else {
+        std::ptr::null()
+    }
+}
+
+/// lua_setupvalue: 设置函数的第 n 个上值为栈顶值, 弹出并返回名称.
+#[no_mangle]
+pub extern "C" fn lua_setupvalue(L: *mut lua_State, funcindex: c_int, n: c_int) -> *const c_char {
+    let L = unsafe { &mut *L };
+    let n = n as usize;
+    if n == 0 {
+        return std::ptr::null();
+    }
+    // 先解析偏移 (在 pop 之前, 因为 pop 会改变负索引的语义)
+    let off = match index2offset(L, funcindex) {
+        Some(o) => o,
+        None => return std::ptr::null(),
+    };
+    // 先检查类型并获取名称指针
+    let (is_cc, is_lc, upvals_len, name_ptr) = match &L.stack.get(off) {
+        Some(TValue::CClosure(cc)) => {
+            (true, false, cc.upvalue.len(), b"\0".as_ptr() as *const c_char)
+        }
+        Some(TValue::LClosure(closure)) => {
+            let len = closure.upvals.borrow().len();
+            let name_ptr = closure
+                .proto
+                .upvalues
+                .get(n - 1)
+                .and_then(|u| u.name.as_ref())
+                .map(|s| s.as_c_str_ptr())
+                .unwrap_or_else(|| b"(no name)\0".as_ptr() as *const c_char);
+            (false, true, len, name_ptr)
+        }
+        _ => (false, false, 0, std::ptr::null()),
+    };
+    if (!is_cc && !is_lc) || n > upvals_len {
+        return std::ptr::null();
+    }
+    // 弹出栈顶值
+    let value = match L.stack.pop() {
+        Some(v) => v,
+        None => return std::ptr::null(),
+    };
+    if is_cc {
+        if let Some(TValue::CClosure(cc)) = &mut L.stack.get_mut(off) {
+            Rc::make_mut(cc).upvalue[n - 1] = value;
+        }
+    } else if is_lc {
+        if let Some(TValue::LClosure(closure)) = &mut L.stack.get_mut(off) {
+            let action = {
+                let upvals = closure.upvals.borrow();
+                let mut uv = upvals[n - 1].borrow_mut();
+                match &mut *uv {
+                    UpVal::Closed { value: val } => {
+                        **val = value.clone();
+                        None
+                    }
+                    UpVal::Open { stack_index, .. } => Some(*stack_index),
+                }
+            };
+            if let Some(idx) = action {
+                if idx < L.stack.len() {
+                    L.stack[idx] = value;
+                }
+            }
+        }
+    }
+    name_ptr
+}
+
+/// lua_upvalueid: 返回上值的唯一标识 (指针).
+///
+/// Lua 闭包返回 UpVal 的 Rc 指针, C 闭包返回 upvalue TValue 的地址.
+/// 轻量 C 函数返回 NULL.
+#[no_mangle]
+pub extern "C" fn lua_upvalueid(L: *mut lua_State, fidx: c_int, n: c_int) -> *mut c_void {
+    let L = unsafe { &*L };
+    let n = n as usize;
+    if n == 0 {
+        return std::ptr::null_mut();
+    }
+    let off = match index2offset(L, fidx) {
+        Some(o) => o,
+        None => return std::ptr::null_mut(),
+    };
+    match &L.stack.get(off) {
+        Some(TValue::CClosure(cc)) => {
+            if n <= cc.upvalue.len() {
+                &cc.upvalue[n - 1] as *const TValue as *mut c_void
+            } else {
+                std::ptr::null_mut()
+            }
+        }
+        Some(TValue::LClosure(closure)) => {
+            let upvals = closure.upvals.borrow();
+            if n <= upvals.len() {
+                Rc::as_ptr(&upvals[n - 1]) as *mut c_void
+            } else {
+                std::ptr::null_mut()
+            }
+        }
+        _ => std::ptr::null_mut(),
+    }
+}
+
+/// lua_upvaluejoin: 让 f1 的第 n1 个上值共享 f2 的第 n2 个上值.
+///
+/// 仅支持 Lua 闭包 (LClosure). 对应 C 的 lua_upvaluejoin.
+#[no_mangle]
+pub extern "C" fn lua_upvaluejoin(
+    L: *mut lua_State,
+    fidx1: c_int,
+    n1: c_int,
+    fidx2: c_int,
+    n2: c_int,
+) {
+    let L = unsafe { &mut *L };
+    let n1 = n1 as usize;
+    let n2 = n2 as usize;
+    let off1 = match index2offset(L, fidx1) {
+        Some(o) => o,
+        None => return,
+    };
+    let off2 = match index2offset(L, fidx2) {
+        Some(o) => o,
+        None => return,
+    };
+    // 从 f2 取出第 n2 个 upval Rc (clone)
+    let upval_rc = {
+        let f2 = match &L.stack.get(off2) {
+            Some(TValue::LClosure(c2)) => c2,
+            _ => return,
+        };
+        let upvals = f2.upvals.borrow();
+        if n2 == 0 || n2 > upvals.len() {
+            return;
+        }
+        upvals[n2 - 1].clone()
+    };
+    // 赋给 f1 的第 n1 个 upval
+    let f1_slot = L.stack.get_mut(off1);
+    let f1 = match f1_slot {
+        Some(TValue::LClosure(c1)) => c1,
+        _ => return,
+    };
+    let mut upvals = f1.upvals.borrow_mut();
+    if n1 > 0 && n1 <= upvals.len() {
+        upvals[n1 - 1] = upval_rc;
+    }
+}
+
+// ============================================================================
+// skynet 扩展 API (feature = "skynet")
+// ============================================================================
+// skynet 修改版 Lua 5.5.1 (ejoy/lua skynet55 分支) 在标准 Lua 5.5 基础上添加了
+// 以下扩展 API, 用于 sharetable 共享机制和 codecache. lua-rs 启用 skynet feature
+// 后导出这些符号, 让 dlopen 加载的 luaclib/skynet.so 能正确解析.
+//
+// 当前实现状态:
+//   - luaL_alloc: 真实实现 (realloc/free 包装, 复用 default_allocf)
+//   - luaL_loadfilex_: 转发到 luaL_loadfilex (skynet 版本带 codecache, 但 lua-rs
+//     无 codecache, 直接用标准 loadfilex 替代)
+//   - lua_clonetable / lua_sharefunction / lua_sharestring: stub 实现
+//     (推 nil 到栈顶或返回, 不真正共享). 调用方在 abort 测试路径不会触发这些.
+//     真正的 sharetable 跨 LuaState 共享 Table/Proto/String 机制未实现.
+
+#[cfg(feature = "skynet")]
+#[no_mangle]
+pub extern "C" fn luaL_alloc(
+    _ud: *mut c_void,
+    ptr: *mut c_void,
+    _osize: usize,
+    nsize: usize,
+) -> *mut c_void {
+    // 与 skynet 3rd/lua/lauxlib.c:1062 一致: realloc/free 包装.
+    // 复用 capi.rs:1267 的 default_allocf 逻辑.
+    if nsize == 0 {
+        if !ptr.is_null() {
+            unsafe { libc::free(ptr) };
+        }
+        ptr::null_mut()
+    } else {
+        unsafe { libc::realloc(ptr, nsize) }
+    }
+}
+
+/// skynet 修改版 luaL_loadfilex_ (lauxlib.c:821), 带 codecache 查询.
+/// lua-rs 无 codecache, 直接转发到标准 luaL_loadfilex.
+/// 调用方: lua-sharetable.c:177 (matrix_from_file), skynet codecache 内部.
+#[cfg(feature = "skynet")]
+#[no_mangle]
+pub extern "C" fn luaL_loadfilex_(
+    L: *mut lua_State,
+    filename: *const c_char,
+    mode: *const c_char,
+) -> c_int {
+    luaL_loadfilex(L, filename, mode)
+}
+
+/// skynet sharetable: 将 shared table 推到栈顶 (跨 LuaState 共享引用).
+/// lua-rs 未实现跨 LuaState 共享 Table, stub 推 nil.
+/// 调用方: lua-sharetable.c (matrix_from_file 等共享 table 路径).
+#[cfg(feature = "skynet")]
+#[no_mangle]
+pub extern "C" fn lua_clonetable(L: *mut lua_State, _t: *const c_void) {
+    let L = unsafe { &mut *L };
+    L.push_nil();
+}
+
+/// skynet sharetable: 将 Lua function 的 proto 标记为 shared (跨 LuaState 共享).
+/// lua-rs 未实现 proto 共享机制, stub 不做任何操作 (void 返回).
+/// 调用方: lua-sharetable.c (sharefunction 路径).
+#[cfg(feature = "skynet")]
+#[no_mangle]
+pub extern "C" fn lua_sharefunction(_L: *mut lua_State, _index: c_int) {
+    // stub: 不做任何操作. 调用方期望 function 被标记为 shared,
+    // 但 lua-rs 无共享机制, 后续 lua_clonetable 会推 nil, 调用方应处理 nil 情况.
+}
+
+/// skynet sharetable: 将 string 标记为 shared (跨 LuaState 共享).
+/// lua-rs 未实现字符串跨 state 共享, stub 不做任何操作.
+/// 调用方: lua-sharetable.c (sharestring 路径).
+#[cfg(feature = "skynet")]
+#[no_mangle]
+pub extern "C" fn lua_sharestring(_L: *mut lua_State, _index: c_int) {
+    // stub: 不做任何操作.
 }
 
 // ============================================================================

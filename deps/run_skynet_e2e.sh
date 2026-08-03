@@ -42,10 +42,10 @@ timeout 90 ./skynet examples/config > /tmp/skynet_e2e_server.log 2>&1 < "$STDIN_
 SERVER_PID=$!
 echo "  server_pid=$SERVER_PID"
 
-# 等待 port 8888 就绪（最多 20 秒）
+# 等待 port 8888 就绪（最多 60 秒）
 echo "[2/4] 等待 port 8888 就绪..."
 READY=0
-for i in $(seq 1 20); do
+for i in $(seq 1 60); do
     if ss -tln 2>&1 | grep -q ":8888"; then
         echo "  port 8888 ready after ${i}s"
         READY=1

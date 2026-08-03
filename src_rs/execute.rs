@@ -2110,9 +2110,8 @@ impl VmExecutor {
     /// 拆分两步避免借用冲突: 检查只读 state, 处理需要 &mut state + result 引用。
     /// (perf: 主路径 is_mm=false, 完全避免 clone TValue)
     fn is_metamethod_return(state: &LuaState) -> bool {
-        let cur_call_stack_len = state.call_stack.len();
         state.pcall_protection_stack.last().map_or(false, |t| {
-            t.is_metamethod && t.saved_filled && t.saved_call_stack_len == cur_call_stack_len
+            t.is_metamethod && t.saved_filled && t.func_idx + 1 == state.base
         })
     }
 
@@ -2320,11 +2319,10 @@ impl VmExecutor {
     /// 返回 true 表示已处理 continuation，op_return 应返回 Ok(None) 让 execute_loop
     /// 重新执行 OP_RETURN/OP_CLOSE。返回 false 表示不是 close continuation。
     fn finish_close_continuation(state: &mut LuaState) -> Result<bool, VmError> {
-        let cur_call_stack_len = state.call_stack.len();
         let is_close_cont = state.pcall_protection_stack.last().map_or(false, |t| {
             t.is_close_continuation
                 && t.saved_filled
-                && t.saved_call_stack_len == cur_call_stack_len
+                && t.func_idx + 1 == state.base
         });
         if !is_close_cont {
             return Ok(false);
@@ -2480,6 +2478,10 @@ impl VmExecutor {
         state.nextraargs = protection.saved_nextraargs;
         state.closure_upvals = protection.saved_closure_upvals;
         state.tbc_list = protection.saved_tbc_list;
+        // 恢复外层 call_stack 帧（yield 时保存到 PcallProtection.saved_call_stack）
+        // 这些帧持有 Rc 引用（code/constants/protos 等），恢复后 pcall 调用者
+        // 继续执行/返回时能正确 pop 帧恢复调用者的 state。
+        state.call_stack = protection.saved_call_stack;
         // open_upval is now global, not saved/restored per-function
 
         // push true + 返回值，按 nresults 调整栈
@@ -2675,8 +2677,15 @@ impl VmExecutor {
         state.transferinfo_ftransfer = ftransfer;
         state.transferinfo_ntransfer = ntransfer;
 
-        // 保存当前栈顶
-        let saved_top = state.stack.len();
+        // 保存当前栈顶 — 对应 C 的 savestack(L, L->top.p)
+        // 必须同时保存 stack.len() 和 state.top:
+        // - stack.len() 用于 truncate 恢复栈
+        // - state.top 用于恢复 MULTRET 结果的栈顶指针
+        //   (如 table.unpack 返回多值后, state.top 指向结果末尾;
+        //    hook 函数执行期间 state.top 被 pcall/op_call 修改,
+        //    若不恢复, state.top > stack.len() 导致后续 SETLIST 越界)
+        let saved_stack_len = state.stack.len();
+        let saved_state_top = state.top;
 
         // 对应 C 的 L->allowhook = 0 (防止递归)
         state.allowhook = false;
@@ -2730,9 +2739,9 @@ impl VmExecutor {
 
         // 如果出错，从栈上获取错误消息（pcall 把错误消息推入 func_idx 位置）
         let err_msg = if status != 0 {
-            // pcall 出错时，错误消息在 saved_top 位置（func_idx）
-            let msg = if saved_top < state.stack.len() {
-                match &state.stack[saved_top] {
+            // pcall 出错时，错误消息在 saved_stack_len 位置（func_idx）
+            let msg = if saved_stack_len < state.stack.len() {
+                match &state.stack[saved_stack_len] {
                     TValue::Str(s) => s.as_str().to_string(),
                     _ => String::new(),
                 }
@@ -2744,8 +2753,14 @@ impl VmExecutor {
             None
         };
 
-        // 恢复栈顶
-        state.stack.truncate(saved_top);
+        // 恢复栈顶 — 对应 C 的 L->top.p = restorestack(L, top)
+        // 必须同时恢复 stack 和 state.top:
+        // - stack.truncate 恢复栈内容
+        // - state.top 恢复 MULTRET 结果的栈顶指针
+        //   (hook 函数执行期间 state.top 被 pcall/op_call 修改为 hook 帧大小,
+        //    若不恢复, 后续 SETLIST 用 state.top 计算 n_actual 时越界)
+        state.stack.truncate(saved_stack_len);
+        state.top = saved_state_top;
 
         // 对应 C 的 L->allowhook = 1 (恢复 hook)
         state.allowhook = true;
@@ -4530,6 +4545,9 @@ impl VmExecutor {
                 if nargs < nfixparams {
                     Self::fast_resize_stack_nil(state, a + 1 + nfixparams);
                 }
+                // 设置 state.top 供 VARARGPREP 计算 totalargs
+                // (对应 C 的 L->top = ci->func + 1 + nargs)
+                state.top = state.stack.len();
             } else {
                 let frame_end = a + 1 + fsize;
                 if state.stack.len() < frame_end {
@@ -4691,6 +4709,8 @@ impl VmExecutor {
                     if nargs < nfixparams {
                         Self::fast_resize_stack_nil(state, a + 1 + nfixparams);
                     }
+                    // 设置 state.top 供 VARARGPREP 计算 totalargs
+                    state.top = state.stack.len();
                     // VARARGPREP 会扩展栈到 fsize 并更新 self.top
                     // call hook 对 vararg 函数在 VARARGPREP 中触发
                 } else {
@@ -5029,6 +5049,17 @@ impl VmExecutor {
     fn op_tailcall(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let mut b = opcodes::getarg_b(inst) as usize;
+        // 对应 C 的 OP_TAILCALL:
+        //   if (b != 0) L->top.p = ra + b;
+        //   else b = cast_int(L->top.p - ra);
+        // 必须用 state.top 而非 stack.len(): smart_clear_stack 可能不截断 Vec,
+        // stack.len() > top 时会多读 stale 栈元素 (MULTRET 参数场景, 如 return f(g()))。
+        // b != 0 时设置 top 供后续 BuiltinFn 分支的 nargs 计算使用。
+        if b != 0 {
+            state.top = a + b;
+        } else {
+            b = state.top.saturating_sub(a);
+        }
         let mut func_val = Self::read_stack(state, a).clone();
 
         // 对应 C 的 OP_TAILCALL: if (TESTARG_k(i)) luaF_closeupval(L, base);
@@ -5071,13 +5102,15 @@ impl VmExecutor {
 
         match func_val {
             TValue::LClosure(closure) => {
-                let nargs_total = state.stack.len().saturating_sub(a);
+                // 用 state.top 而非 stack.len(): smart_clear_stack 可能不截断 Vec,
+                // stack.len() > top 时会多读 stale 栈元素 (MULTRET 参数场景)。
+                // 对应 C: b = cast_int(L->top.p - ra) (已在上方计算 b)
+                let nargs_total = b;
                 let fsize = closure.proto.max_stack_size as usize;
                 let nfixparams = closure.proto.num_params as usize;
                 let nargs = nargs_total.saturating_sub(1);
                 let func_slot = state.base.saturating_sub(1);
                 let proto_is_vararg = closure.proto.is_vararg();
-
                 // 提前提取 proto 和 upvals 的 Rc 引用，使后续可以 move closure（而非 clone）
                 // perf: 消除 CallInfoEntry.closure 的 Box 堆分配
                 let proto = Rc::clone(&closure.proto);
@@ -5123,6 +5156,8 @@ impl VmExecutor {
                     for i in nargs..nfixparams {
                         Self::write_stack(state, func_slot + 1 + i, TValue::Nil(NilKind::Strict));
                     }
+                    // 设置 state.top 供 VARARGPREP 计算 totalargs (对应 C 的 L->top = ra + b)
+                    state.top = state.stack.len();
                     // call hook 对 vararg 函数在 VARARGPREP 中触发 (tail call 事件)
                 } else {
                     let frame_end = func_slot + 1 + fsize;
@@ -5138,6 +5173,8 @@ impl VmExecutor {
                     for i in nargs..nfixparams {
                         state.stack[func_slot + 1 + i] = TValue::Nil(NilKind::Strict);
                     }
+                    // 设置 state.top 为帧末尾 (对应 C 的 L->top = ci->top)
+                    state.top = frame_end;
                     // 对应 C 的 startfunc -> luaG_tracecall -> luaD_hookcall:
                     // 非 vararg 尾调用触发 "tail call" hook (CIST_TAIL 已设置)
                     if state.hook_mask & 1 != 0 {
@@ -5909,8 +5946,8 @@ impl VmExecutor {
 
                 // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[base-1] 获取
                 // "for iterator" name 由 compute_caller_info 从 TFORCALL opcode 检测
-
-                let nresults = (c + 1) as i32;
+                // TFORCALL 的 C 操作数 = 实际结果数（与 OP_CALL 的 C = nresults+1 不同）
+                let nresults = c as i32;
                 let fsize = proto_max_stack as usize;
                 let nfixparams = proto_num_params as usize;
                 let nargs = 2;
@@ -5968,6 +6005,10 @@ impl VmExecutor {
                     for i in nargs..nfixparams {
                         Self::write_stack(state, ra + 4 + i, TValue::Nil(NilKind::Strict));
                     }
+                    // 关键: 设置 state.top — VARARGPREP 用 state.top 计算 totalargs
+                    // 若不设置, state.top 保留上一次迭代的值 (可能很大),
+                    // 导致 totalargs > 2, vararg 函数的 ... 包含多余的栈上残留值
+                    state.top = state.stack.len();
                 } else {
                     let frame_end = ra + 4 + fsize;
                     while state.stack.len() < frame_end {
@@ -5976,6 +6017,7 @@ impl VmExecutor {
                     for i in nargs..nfixparams {
                         state.stack[ra + 4 + i] = TValue::Nil(NilKind::Strict);
                     }
+                    state.top = frame_end;
                 }
                 Ok(())
             }
@@ -5990,7 +6032,8 @@ impl VmExecutor {
                     TValue::RustClosure(rc) => rc.func,
                     _ => unreachable!(),
                 };
-                let nresults = (c + 1) as i32;
+                // TFORCALL 的 C 操作数 = 实际结果数（BuiltinFn 期望实际结果数，非 C 操作数约定）
+                let nresults = c as i32;
                 let nargs = 2;
                 state.call_info.push(crate::state::CallInfoEntry {
                     is_c: true,
@@ -6014,51 +6057,21 @@ impl VmExecutor {
                 Ok(())
             }
             TValue::CClosure(cc) => {
-                let nresults = (c + 1) as i32;
-                state.call_stack.push(CallFrame {
-                    code: std::mem::take(&mut state.code),
-                    constants: std::mem::take(&mut state.constants),
-                    upval_descs: std::mem::take(&mut state.upval_descs),
-                    protos: std::mem::take(&mut state.protos),
-                    base: state.base,
-                    return_pc: state.pc + 1,
-                    return_base: ra + 3,
-                    num_results: nresults,
-                    num_params: state.num_params,
-                    is_vararg: state.is_vararg,
-                    proto_flag: state.proto_flag,
-                    nextraargs: state.nextraargs,
-                    closure_upvals: Rc::clone(&state.closure_upvals),
-                    tbc_list: state.tbc_list.take(),
-                });
-                state.base = ra + 4;
-                Self::call_c_function(state, ra + 3, 2, nresults, cc.f)?;
+                // call_c_function 的 c 参数使用 C 操作数约定（nresults+1），
+                // TFORCALL 的 C 操作数 = 实际结果数，故传 c + 1。
+                // b = 3（2 个参数：state + control，+1 为 Lua 惯例）。
+                // 不推 CallFrame、不修改 state.base：call_c_function 通过 api_func_base
+                // 和 call_info 自管理，与 op_call 的 CClosure 分支一致。
+                // 注意：call_c_function 内部已执行 state.pc += 1（指向 TFORLOOP），
+                // 此处不再重复递增 PC，否则会跳过 TFORLOOP 导致循环体不执行。
+                Self::call_c_function(state, ra + 3, 3, (c + 1) as i32, cc.f)?;
                 state.finish_pending_adjust();
-                state.pc += 1;
                 Ok(())
             }
             TValue::LCFn(lcf) => {
-                let nresults = (c + 1) as i32;
-                state.call_stack.push(CallFrame {
-                    code: std::mem::take(&mut state.code),
-                    constants: std::mem::take(&mut state.constants),
-                    upval_descs: std::mem::take(&mut state.upval_descs),
-                    protos: std::mem::take(&mut state.protos),
-                    base: state.base,
-                    return_pc: state.pc + 1,
-                    return_base: ra + 3,
-                    num_results: nresults,
-                    num_params: state.num_params,
-                    is_vararg: state.is_vararg,
-                    proto_flag: state.proto_flag,
-                    nextraargs: state.nextraargs,
-                    closure_upvals: Rc::clone(&state.closure_upvals),
-                    tbc_list: state.tbc_list.take(),
-                });
-                state.base = ra + 4;
-                Self::call_c_function(state, ra + 3, 2, nresults, lcf.func)?;
+                // 同 CClosure 分支：call_c_function 内部已递增 PC
+                Self::call_c_function(state, ra + 3, 3, (c + 1) as i32, lcf.func)?;
                 state.finish_pending_adjust();
-                state.pc += 1;
                 Ok(())
             }
             _ => {
@@ -6094,8 +6107,12 @@ impl VmExecutor {
             state.pc += 1;
         }
 
+        // 对应 C: n = cast_uint(L->top.p - ra) - 1
+        // 必须用 state.top 而非 state.stack.len(): smart_clear_stack 在 MULTRET 返回后
+        // 可能不截断 Vec (待清除区域全是 trivial 类型时仅设 top), stack.len() > top,
+        // 用 stack.len() 会多读 stale 栈元素 (如 packvalue 的局部变量 id)。
         let n_actual = if n == 0 {
-            state.stack.len().saturating_sub(ra + 1)
+            state.top.saturating_sub(ra + 1)
         } else {
             n
         };
@@ -6389,8 +6406,11 @@ impl VmExecutor {
         }
 
         let nfixparams = state.num_params as usize;
-        // totalargs = L->top - ci->func - 1 = stack.len() - (base - 1) - 1 = stack.len() - base
-        let totalargs = state.stack.len().saturating_sub(state.base);
+        // 对应 C: totalargs = cast_int(L->top.p - ci->func.p) - 1
+        // = state.top - (state.base - 1) - 1 = state.top - state.base
+        // 用 state.top 而非 stack.len(): smart_clear_stack 可能不截断 Vec,
+        // MULTRET 参数场景 stack.len() > top 会多算 stale 栈元素。
+        let totalargs = state.top.saturating_sub(state.base);
         let nextra = totalargs.saturating_sub(nfixparams);
 
         if flag & PF_VATAB != 0 {

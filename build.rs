@@ -92,6 +92,19 @@ fn main() {
             println!("cargo:rustc-link-arg=-Wl,--undefined=lua_rs_pcall_c");
             println!("cargo:rustc-link-arg=-Wl,--undefined=lua_rs_longjmp");
         }
+
+        // skynet feature: 导出 skynet 修改版 Lua 扩展 API (luaL_alloc / lua_clonetable /
+        // lua_sharefunction / lua_sharestring / luaL_loadfilex_), 供 dlopen 加载的
+        // luaclib/skynet.so 解析. Rust 代码不引用这些符号, 必须用 --undefined 强制保留.
+        // 见 src_rs/capi.rs 末尾 "skynet 扩展 API" 章节.
+        let skynet_feature = env::var("CARGO_FEATURE_SKYNET").is_ok();
+        if skynet_feature {
+            println!("cargo:rustc-link-arg=-Wl,--undefined=luaL_alloc");
+            println!("cargo:rustc-link-arg=-Wl,--undefined=luaL_loadfilex_");
+            println!("cargo:rustc-link-arg=-Wl,--undefined=lua_clonetable");
+            println!("cargo:rustc-link-arg=-Wl,--undefined=lua_sharefunction");
+            println!("cargo:rustc-link-arg=-Wl,--undefined=lua_sharestring");
+        }
         return;
     }
 

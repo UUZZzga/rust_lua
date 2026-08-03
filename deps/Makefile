@@ -183,12 +183,12 @@ $(CAPI_VARIADIC_O): $(CAPI_VARIADIC_C)
 
 skynet: $(LUA_RS_LIB) $(CAPI_VARIADIC_O)
 	@echo "=== Building skynet with lua-rs ==="
-	# lua-rs 已实现 luaL_makeseed/lua_newthread/lua_resume，无需 LUA_RUST_COMPAT 宏
+	# LUA_RUST_COMPAT: 跳过 coroutine.resume/wrap 替换 (lua-rs 的 lua_resume 与 skynet timing_resume 不兼容)
 	cd $(SKYNET_SRC) && $(MAKE) linux \
 		LUA_LIB=$(LUA_RS_LIB) \
 		LUA_INC=$(LUA_INCLUDE) \
 		MALLOC_STATICLIB="$(CAPI_VARIADIC_O)" \
-		MYCFLAGS="" \
+		MYCFLAGS="-DLUA_RUST_COMPAT" \
 		SKYNET_DEFINES="-DNOUSE_JEMALLOC"
 	@echo "=== skynet built: $(SKYNET_BIN) ==="
 

@@ -248,6 +248,11 @@ pub struct PcallProtection {
     /// continuation（对应 C Lua 的 lua_callk + pairscont 机制）
     /// 与普通 pcall continuation 区别: 不 push true 前缀，直接返回 __pairs 的结果
     pub is_pairs_continuation: bool,
+    /// yield 穿越 pcall 时保存的外层 call_stack 帧 — 由 finish_pcall_return 恢复
+    /// 这些帧持有 Rc 引用（code/constants/protos 等），丢弃会导致悬空指针。
+    /// 不合并到 call_stack: 否则 resume 后内层帧 pop 完会错误 pop 外层帧，
+    /// 导致 state.base 跳过 pcall 的 func_idx+1。
+    pub saved_call_stack: Vec<crate::objects::CallFrame>,
 }
 
 pub struct GlobalState {
@@ -2336,6 +2341,9 @@ impl LuaState {
                         }
                         self.stack[idx] = TValue::Nil(NilKind::Strict);
                     }
+                    // 设置 state.top 供 VARARGPREP 计算 totalargs
+                    // (对应 C 的 L->top = ci->func + 1 + nargs)
+                    self.top = self.stack.len();
                 } else {
                     let frame_end = func_idx + 1 + fsize;
                     while self.stack.len() < frame_end {
@@ -2344,6 +2352,8 @@ impl LuaState {
                     for i in nargs_actual..nfixparams {
                         self.stack[func_idx + 1 + i] = TValue::Nil(NilKind::Strict);
                     }
+                    // 设置 state.top 为帧末尾 (对应 C 的 L->top = ci->top)
+                    self.top = frame_end;
                 }
 
                 // Shield 机制: 防止内层 pcall 的 error 被外层 PcallProtection 错误捕获
@@ -2381,6 +2391,7 @@ impl LuaState {
                             saved_call_stack_len: 0,
                             is_close_continuation: false,
                             is_pairs_continuation: false,
+                            saved_call_stack: Vec::new(),
                         });
                 }
 
@@ -2399,18 +2410,40 @@ impl LuaState {
                 // 恢复 call_stack（execute_loop 可能修改了它）
                 // 非 yield 路径: execute_loop 中的 op_return 应该走 else 分支（call_stack 为空），
                 //   不会 pop 帧也不会 push 帧，call_stack 仍为空。
-                // yield 路径: execute_loop 返回 Yield，call_stack 可能有残留（被中断的调用），
-                //   保留这些帧供协程恢复时使用。
+                // yield 路径: execute_loop 返回 Yield，call_stack 可能有残留（被中断的内层调用），
+                //   只保留这些内层帧供协程恢复时使用。
+                //   外层帧（saved_call_stack_frames）保存到 PcallProtection.saved_call_stack，
+                //   由 finish_pcall_return 恢复。不合并到 call_stack: 否则 resume 后内层帧 pop 完
+                //   会错误 pop 外层帧，导致 state.base 跳过 pcall 的 func_idx+1。
+                //   外层帧持有 Rc 引用（code/constants/protos 等），必须保存以防释放后悬空指针。
                 if !matches!(&result, Ok(VmResult::Yield { .. })) {
                     self.call_stack = saved_call_stack_frames;
                 } else {
-                    // yield: 合并残留帧（被中断的内层调用帧）到 saved 帧（外层调用帧）之后
-                    // call_stack 是栈结构：外层帧在底部（先 push），内层帧在顶部（后 push）
-                    // OP_RETURN 从顶部 pop（先 pop 内层帧），所以顺序必须是 [outer..., inner...]
-                    let remaining = std::mem::take(&mut self.call_stack);
-                    let mut combined = saved_call_stack_frames;
-                    combined.extend(remaining);
-                    self.call_stack = combined;
+                    // yield: 只保留内层残留帧（被中断的调用），外层帧保存到 PcallProtection
+                    let pp_len = self.pcall_protection_stack.len();
+                    // 向下查找第一个未填充的 PcallProtection（与下方 saved_filled 更新逻辑一致）
+                    let target_idx = if pp_len > 0 {
+                        (0..pp_len)
+                            .rev()
+                            .find(|&i| !self.pcall_protection_stack[i].saved_filled)
+                    } else {
+                        None
+                    };
+                    match target_idx {
+                        Some(idx) => {
+                            self.pcall_protection_stack[idx].saved_call_stack =
+                                saved_call_stack_frames;
+                            // remaining（内层帧）已在 self.call_stack 中
+                        }
+                        None => {
+                            // fallback: 找不到目标 PcallProtection（嵌套 yield 场景）时，
+                            // 合并到 call_stack 以避免丢弃 Rc 引用导致悬空指针
+                            let remaining = std::mem::take(&mut self.call_stack);
+                            let mut combined = saved_call_stack_frames;
+                            combined.extend(remaining);
+                            self.call_stack = combined;
+                        }
+                    }
                 }
                 // 恢复 n_ccalls (对应 C 的 decnny / longjmp 恢复 ci->nCcalls)。
                 // 非 yield 路径下恢复到 pcall 调用前的值:
@@ -2626,7 +2659,8 @@ impl LuaState {
                         let mut tmp_results = Vec::new();
                         for i in 0..nret {
                             if result_base + i < self.stack.len() {
-                                tmp_results.push(std::mem::take(&mut self.stack[result_base + i]));
+                                let v = std::mem::take(&mut self.stack[result_base + i]);
+                                tmp_results.push(v);
                             } else {
                                 tmp_results.push(TValue::Nil(NilKind::Strict));
                             }

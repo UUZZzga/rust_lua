@@ -56,16 +56,30 @@ run_unlimited() {
 }
 
 # ============================================================================
-# 1. 构建 Rust lua
+# 1. 构建 Rust lua (启用 threaded + skynet feature)
 # ============================================================================
+# threaded feature: 让 StringTable/ArcRc/LongString 走线程安全路径
+#   - StringTable 内部用 parking_lot::RwLock 保护 (替代 RefCell)
+#   - ArcRc 切换为 Arc (替代 Rc), 引用计数原子化
+#   - LongString 的 hash/cached 字段用 AtomicU64/AtomicU8
+# 这让 StringTable 自身是 Sync, 即使 skynet 多 worker 线程并发访问同一个
+# string_table (理论上 actor 模型保证不会, 但作为防御性措施更安全).
+#
+# skynet feature: 导出 skynet 修改版 Lua 扩展 API (luaL_alloc/lua_clonetable/
+#   lua_sharefunction/lua_sharestring/luaL_loadfilex_), 让 luaclib/skynet.so
+#   能正确解析符号. 见 src_rs/capi.rs 末尾 "skynet 扩展 API" 章节.
+#
+# 注: LuaState 整体仍 !Sync (含 Rc<GCState>/Rc<RefCell<...>> 等共享字段),
+#     跨线程共享同一个 LuaState 仍不允许. skynet 每个 service 用 luaL_newstate
+#     创建独立 LuaState, 不跨线程共享.
 LUA_BIN="$PROJECT_ROOT/target/release/lua"
 LUA_LIB="$PROJECT_ROOT/target/release/liblua_rs.a"
 
 if [[ -f "$LUA_BIN" && -f "$LUA_LIB" && "${1:-}" != "--rebuild-lua" ]]; then
     ok "Rust lua 已构建: $LUA_BIN"
 else
-    log "构建 Rust lua (cargo build --release)..."
-    run_unlimited cargo build --release
+    log "构建 Rust lua (cargo build --release --features threaded,skynet)..."
+    run_unlimited cargo build --release --features threaded,skynet
     [[ -f "$LUA_BIN" ]] || die "lua 二进制未生成: $LUA_BIN"
     [[ -f "$LUA_LIB" ]] || die "liblua_rs.a 静态库未生成: $LUA_LIB"
     ok "Rust lua 构建完成"

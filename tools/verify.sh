@@ -36,7 +36,9 @@ fi
 
 echo "Compiler compare tests passed."
 
-# 2. 执行所有 cargo test
+# 2. 执行所有 cargo test (默认 features)
+# threaded/skynet feature 仅在 deps 测试 (deps/setup.sh) 中启用,
+# verify.sh 的 cargo test 和 Lua 测试用例不需要多线程/skynet 扩展 API.
 echo "Running all cargo tests..."
 run_build cargo test > logs/cargo_test.log 2>&1 < /dev/null
 TEST_EXIT=$?
@@ -53,7 +55,8 @@ if grep -q "test result: FAILED" logs/cargo_test.log 2>/dev/null; then
     exit 2
 fi
 
-# 3. 构建项目
+# 3. 构建项目 (默认 features, 不启用 threaded/skynet)
+# threaded/skynet 版本由 deps/setup.sh 负责构建, verify.sh 使用默认 features.
 echo "Building project..."
 run_build cargo build --release > logs/build.log 2>&1
 BUILD_EXIT=$?

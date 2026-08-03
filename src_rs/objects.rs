@@ -1325,8 +1325,10 @@ pub struct Udata {
     pub metatable: Option<Box<Table>>,
     /// 用户值列表
     pub user_values: Vec<TValue>,
-    /// 原始数据
-    pub data: Vec<u8>,
+    /// 原始数据 — 使用 Vec<u64> 保证 8 字节对齐
+    /// C 代码（如 skynet netpack 的 struct queue）可能包含指针数组，
+    /// 需要正确对齐，否则未对齐访问导致数据损坏。
+    pub data: Vec<u64>,
 }
 
 impl Udata {
@@ -1334,10 +1336,10 @@ impl Udata {
     /// Udata 通过 register_object 注册，但 size_of::<Udata>() 不含 data/user_values 容量。
     pub fn gc_mem_size(&self) -> usize {
         // Rc<Udata> 堆分配 = Udata 自身
-        // data: Vec<u8>，堆分配 = capacity
+        // data: Vec<u64>，堆分配 = capacity * 8
         // user_values: Vec<TValue>，堆分配 = capacity * size_of::<TValue>()
         std::mem::size_of::<Udata>()
-            + self.data.capacity()
+            + self.data.capacity() * 8
             + self.user_values.capacity() * std::mem::size_of::<TValue>()
     }
 }

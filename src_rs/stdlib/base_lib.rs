@@ -486,9 +486,10 @@ pub(crate) fn call_pcall(
             saved_filled: false,
             is_metamethod: false,
             metamethod_res: 0,
-            saved_call_stack_len: 0,
+            saved_call_stack_len: state.call_stack.len(),
             is_close_continuation: false,
             is_pairs_continuation: false,
+            saved_call_stack: Vec::new(),
         });
     let pcall_protection_idx = state.pcall_protection_stack.len() - 1;
 
@@ -1166,6 +1167,7 @@ fn call_pairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
                 saved_call_stack_len: 0,
                 is_close_continuation: false,
                 is_pairs_continuation: true,
+                saved_call_stack: Vec::new(),
             });
 
         // state.pcall(1, 4): 1 arg (t), 4 results
@@ -1269,9 +1271,10 @@ pub(crate) fn call_xpcall(
             saved_filled: false,
             is_metamethod: false,
             metamethod_res: 0,
-            saved_call_stack_len: 0,
+            saved_call_stack_len: state.call_stack.len(),
             is_close_continuation: false,
             is_pairs_continuation: false,
+            saved_call_stack: Vec::new(),
         });
     let xpcall_protection_idx = state.pcall_protection_stack.len() - 1;
 

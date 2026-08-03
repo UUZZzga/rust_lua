@@ -48,6 +48,12 @@ cmp_c = []
 # 默认关闭: StringTable/StringCache 使用 std::cell::RefCell (零开销,单线程)
 # 启用时改用 parking_lot::RwLock (多线程安全,有原子操作开销)
 threaded = ["parking_lot"]
+# skynet 扩展 API: 实现 skynet 修改版 Lua 5.5.1 的扩展 (luaL_alloc/lua_clonetable/
+# lua_sharefunction/lua_sharestring/luaL_loadfilex_), 让 lua-rs 能作为 skynet 的 Lua 后端.
+# 启用后这些符号从 liblua_rs.a 导出, 供 dlopen 加载的 luaclib/skynet.so 解析.
+# 当前 luaL_alloc 为真实实现 (realloc 包装), 其余为 stub (调用时报错).
+# 真正的 sharetable 共享机制 (跨 LuaState 共享 Table/Proto/String) 未实现.
+skynet = []
 # 强制使用 setjmp/longjmp 实现 C 函数错误处理 (对应 C 的 LUA_USE_LONGJMP 宏)。
 # 默认 (非启用): 用 catch_unwind 捕获 panic (lua_error → panic), 类似 C++ 异常机制。
 # 启用 lua_longjmp: 用 setjmp/longjmp 替代 catch_unwind。

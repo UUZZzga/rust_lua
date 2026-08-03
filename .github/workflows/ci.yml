@@ -74,6 +74,9 @@ jobs:
 
       # ----------------------------------------------------------------------
       # 1. 构建 Rust lua (target/release/lua + liblua_rs.a)
+      #    默认 features: 不启用 threaded/skynet (单线程 + 官方 Lua API).
+      #    deps/setup.sh 会在 deps 测试前重新构建 threaded,skynet 版本.
+      #    verify.sh 和 gc_bench_run.sh 使用默认 features.
       # ----------------------------------------------------------------------
       - name: Build Rust lua
         run: cargo build --release
