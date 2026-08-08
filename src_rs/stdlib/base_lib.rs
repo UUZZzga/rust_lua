@@ -1825,10 +1825,12 @@ impl LoadlibError {
 
 // ============================================================================
 // 动态库加载辅助函数 — 对应 C loadlib.cpp 的 lsys_load / lsys_sym / lsys_unload
-// 直接调用 libc dlopen/dlsym/dlclose，不依赖 capi 模块（避免 ffi feature 冲突）
+// Unix: 直接调用 libc dlopen/dlsym/dlclose，不依赖 capi 模块（避免 ffi feature 冲突）
+// Windows: 用 kernel32 LoadLibraryA/GetProcAddress/FreeLibrary
 // ============================================================================
 
-/// dlopen 加载动态库，返回库句柄。seeglb=true 时用 RTLD_GLOBAL。
+/// 加载动态库，返回库句柄。seeglb=true 时用 RTLD_GLOBAL。
+#[cfg(not(target_os = "windows"))]
 unsafe fn sys_load(path: &str, seeglb: bool) -> *mut std::ffi::c_void {
     let cpath = match std::ffi::CString::new(path) {
         Ok(c) => c,
@@ -1842,7 +1844,17 @@ unsafe fn sys_load(path: &str, seeglb: bool) -> *mut std::ffi::c_void {
     unsafe { libc::dlopen(cpath.as_ptr(), flags) }
 }
 
-/// dlsym 查找符号，返回函数指针
+#[cfg(target_os = "windows")]
+unsafe fn sys_load(path: &str, _seeglb: bool) -> *mut std::ffi::c_void {
+    let cpath = match std::ffi::CString::new(path) {
+        Ok(c) => c,
+        Err(_) => return std::ptr::null_mut(),
+    };
+    unsafe { win32_dl::LoadLibraryA(cpath.as_ptr() as *const u8) as *mut std::ffi::c_void }
+}
+
+/// 查找符号，返回函数指针
+#[cfg(not(target_os = "windows"))]
 unsafe fn sys_sym(
     lib: *mut std::ffi::c_void,
     sym: &str,
@@ -1861,7 +1873,27 @@ unsafe fn sys_sym(
     }
 }
 
-/// dlerror 获取错误消息
+#[cfg(target_os = "windows")]
+unsafe fn sys_sym(
+    lib: *mut std::ffi::c_void,
+    sym: &str,
+) -> Option<unsafe extern "C" fn(*mut std::ffi::c_void) -> i32> {
+    let csym = std::ffi::CString::new(sym).ok()?;
+    let ptr = unsafe { win32_dl::GetProcAddress(lib, csym.as_ptr() as *const u8) };
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe {
+            std::mem::transmute::<
+                *mut std::ffi::c_void,
+                unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
+            >(ptr)
+        })
+    }
+}
+
+/// 获取错误消息
+#[cfg(not(target_os = "windows"))]
 unsafe fn sys_dlerror() -> String {
     let ptr = unsafe { libc::dlerror() };
     if ptr.is_null() {
@@ -1870,6 +1902,61 @@ unsafe fn sys_dlerror() -> String {
         unsafe { std::ffi::CStr::from_ptr(ptr) }
             .to_string_lossy()
             .into_owned()
+    }
+}
+
+#[cfg(target_os = "windows")]
+unsafe fn sys_dlerror() -> String {
+    unsafe { win32_dl::last_error_message() }
+}
+
+// Windows 动态库加载 FFI (kernel32)
+#[cfg(target_os = "windows")]
+mod win32_dl {
+    use std::ffi::c_void;
+
+    const FORMAT_MESSAGE_FROM_SYSTEM: u32 = 0x0000_1000;
+    const FORMAT_MESSAGE_IGNORE_INSERTS: u32 = 0x0000_0200;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn LoadLibraryA(name: *const u8) -> *mut c_void;
+        pub fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+        fn GetLastError() -> u32;
+        fn FormatMessageA(
+            flags: u32,
+            source: *const c_void,
+            msg_id: u32,
+            lang_id: u32,
+            buf: *mut u8,
+            size: u32,
+            args: *const c_void,
+        ) -> u32;
+    }
+
+    pub unsafe fn last_error_message() -> String {
+        let err = unsafe { GetLastError() };
+        if err == 0 {
+            return String::new();
+        }
+        let mut buf = [0u8; 512];
+        let len = unsafe {
+            FormatMessageA(
+                FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                std::ptr::null(),
+                err,
+                0,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                std::ptr::null(),
+            )
+        };
+        if len == 0 {
+            format!("error code {}", err)
+        } else {
+            let msg = std::str::from_utf8(&buf[..len as usize]).unwrap_or("unknown error");
+            msg.trim_end().to_string()
+        }
     }
 }
 
@@ -2182,6 +2269,10 @@ fn init_package_table(state: &mut LuaState) {
         TValue::Str(state.intern_str(&cpath)),
     );
     // config 字段 — 对应 C 的 package.config: DIRSEP \n PATH_SEP \n PATH_MARK \n EXEC_DIR \n IGMARK \n
+    // Windows 用 \ 作目录分隔符 (对应 LUA_USE_WINDOWS 的 LUA_DIRSEP)
+    #[cfg(target_os = "windows")]
+    let config = "\\\n;\n?\n!\n-\n";
+    #[cfg(not(target_os = "windows"))]
     let config = "/\n;\n?\n!\n-\n";
     pkg.set(
         TValue::Str(state.intern_str("config")),

@@ -17,7 +17,10 @@ use lua_rs::objects::TValue;
 use lua_rs::state::LuaState;
 use lua_rs::stdlib::math_lib;
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
+#[cfg(windows)]
+use std::os::windows::process::ExitStatusExt;
 use std::sync::{Arc, Mutex};
 
 // ============================================================================
@@ -77,7 +80,7 @@ fn run_lua(args: &[&str]) -> std::process::Output {
     }
 
     std::process::Output {
-        status: std::process::ExitStatus::from_raw(if success { 0 } else { 1 }),
+        status: std::process::ExitStatus::from_raw(if success { 0 } else { 1 } as _),
         stdout: stdout_buf,
         stderr: stderr_buf,
     }

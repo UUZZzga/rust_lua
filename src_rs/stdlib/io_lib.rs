@@ -23,10 +23,60 @@ use std::io::Write;
 use std::os::raw::c_int;
 use std::rc::Rc;
 
-// C 标准库的 stdin/stdout/stderr — libc crate 不直接导出，用 extern 声明
-// Miri 不支持 extern static stdin/stdout/stderr，改用 fdopen(fd, mode) 获取等价 FILE*
-// (Miri 通过 libc 桩支持 fdopen)，用 thread_local OnceCell 缓存避免重复创建
-#[cfg(not(miri))]
+// ============================================================================
+// 跨平台兼容层 — 提供 Windows 下缺失的 POSIX 函数
+// ============================================================================
+#[cfg(not(target_os = "windows"))]
+mod compat {
+    use std::os::raw::c_int;
+    pub unsafe fn errno_ptr() -> *mut c_int {
+        libc::__errno_location()
+    }
+    pub use libc::clearerr;
+    pub fn wifexited(stat: i32) -> bool {
+        libc::WIFEXITED(stat)
+    }
+    pub fn wexitstatus(stat: i32) -> i32 {
+        libc::WEXITSTATUS(stat)
+    }
+    pub fn wifsignaled(stat: i32) -> bool {
+        libc::WIFSIGNALED(stat)
+    }
+    pub fn wtermsig(stat: i32) -> i32 {
+        libc::WTERMSIG(stat)
+    }
+}
+#[cfg(target_os = "windows")]
+mod compat {
+    use std::os::raw::c_int;
+    extern "C" {
+        fn _errno() -> *mut c_int;
+    }
+    pub unsafe fn errno_ptr() -> *mut c_int {
+        unsafe { _errno() }
+    }
+    extern "C" {
+        pub fn clearerr(stream: *mut libc::FILE);
+    }
+    pub fn wifexited(stat: i32) -> bool {
+        stat != -1
+    }
+    pub fn wexitstatus(stat: i32) -> i32 {
+        stat
+    }
+    pub fn wifsignaled(_stat: i32) -> bool {
+        false
+    }
+    pub fn wtermsig(_stat: i32) -> i32 {
+        0
+    }
+}
+
+// C 标准库的 stdin/stdout/stderr
+// - Linux: 用 extern 声明链接 C 的 stdin/stdout/stderr 符号
+// - Windows MSVC: stdin/stdout/stderr 不是真实符号 (是宏), 用 __acrt_iob_func 获取 FILE*
+// - Miri: 用 fdopen(fd, mode) 获取等价 FILE*
+#[cfg(all(not(miri), not(target_os = "windows")))]
 extern "C" {
     #[link_name = "stdin"]
     static C_STDIN: *mut libc::FILE;
@@ -34,6 +84,12 @@ extern "C" {
     static C_STDOUT: *mut libc::FILE;
     #[link_name = "stderr"]
     static C_STDERR: *mut libc::FILE;
+}
+
+// Windows MSVC: stdin/stdout/stderr 是宏, 展开为 __acrt_iob_func(index)
+#[cfg(all(not(miri), target_os = "windows"))]
+extern "C" {
+    fn __acrt_iob_func(idx: u32) -> *mut libc::FILE;
 }
 
 /// 获取 C 的 stdin
@@ -48,9 +104,13 @@ fn c_stdin() -> *mut libc::FILE {
             })
         })
     }
-    #[cfg(not(miri))]
+    #[cfg(all(not(miri), not(target_os = "windows")))]
     {
         unsafe { C_STDIN }
+    }
+    #[cfg(all(not(miri), target_os = "windows"))]
+    {
+        unsafe { __acrt_iob_func(0) }
     }
 }
 /// 获取 C 的 stdout
@@ -65,9 +125,13 @@ fn c_stdout() -> *mut libc::FILE {
             })
         })
     }
-    #[cfg(not(miri))]
+    #[cfg(all(not(miri), not(target_os = "windows")))]
     {
         unsafe { C_STDOUT }
+    }
+    #[cfg(all(not(miri), target_os = "windows"))]
+    {
+        unsafe { __acrt_iob_func(1) }
     }
 }
 /// 获取 C 的 stderr
@@ -82,9 +146,13 @@ fn c_stderr() -> *mut libc::FILE {
             })
         })
     }
-    #[cfg(not(miri))]
+    #[cfg(all(not(miri), not(target_os = "windows")))]
     {
         unsafe { C_STDERR }
+    }
+    #[cfg(all(not(miri), target_os = "windows"))]
+    {
+        unsafe { __acrt_iob_func(2) }
     }
 }
 
@@ -242,7 +310,7 @@ fn file_result(
         results.push(TValue::Boolean(true));
         1
     } else {
-        let en = unsafe { *libc::__errno_location() };
+        let en = unsafe { *compat::errno_ptr() };
         let msg = if en != 0 {
             unsafe { std::ffi::CStr::from_ptr(libc::strerror(en)) }
                 .to_string_lossy()
@@ -278,7 +346,7 @@ fn check_modep(mode: &str) -> bool {
 /// - 被信号终止: 返回 nil, "signal", signo
 /// - errno 错误: 返回 nil, error_msg, errno
 pub fn exec_result(state: &mut LuaState, results: &mut Vec<TValue>, stat: i32) -> usize {
-    let en = unsafe { *libc::__errno_location() };
+    let en = unsafe { *compat::errno_ptr() };
     if stat != 0 && en != 0 {
         // errno 错误 — 对应 luaL_fileresult(L, 0, NULL)
         let msg = unsafe { std::ffi::CStr::from_ptr(libc::strerror(en)) }
@@ -292,10 +360,10 @@ pub fn exec_result(state: &mut LuaState, results: &mut Vec<TValue>, stat: i32) -
     // 解析 wait status — 对应 C 的 l_inspectstat
     let mut what = "exit";
     let mut code = stat;
-    if libc::WIFEXITED(stat) {
-        code = libc::WEXITSTATUS(stat);
-    } else if libc::WIFSIGNALED(stat) {
-        code = libc::WTERMSIG(stat);
+    if compat::wifexited(stat) {
+        code = compat::wexitstatus(stat);
+    } else if compat::wifsignaled(stat) {
+        code = compat::wtermsig(stat);
         what = "signal";
     }
     if what == "exit" && code == 0 {
@@ -364,7 +432,7 @@ fn call_io_open(
 
     // 设置 errno = 0
     unsafe {
-        *libc::__errno_location() = 0;
+        *compat::errno_ptr() = 0;
     }
     let c_filename = std::ffi::CString::new(filename.clone()).unwrap();
     let c_mode = std::ffi::CString::new(mode.clone()).unwrap();
@@ -404,7 +472,7 @@ fn call_io_tmpfile(
     nresults: i32,
 ) -> Result<(), VmError> {
     unsafe {
-        *libc::__errno_location() = 0;
+        *compat::errno_ptr() = 0;
     }
     let f = unsafe { libc::tmpfile() };
     let mut results = Vec::new();
@@ -490,7 +558,7 @@ fn call_io_popen(
         libc::fflush(std::ptr::null_mut());
     }
     unsafe {
-        *libc::__errno_location() = 0;
+        *compat::errno_ptr() = 0;
     }
     let f = unsafe { libc::popen(c_prog.as_ptr(), c_mode.as_ptr()) };
 
@@ -537,7 +605,7 @@ fn g_write(
 ) -> Result<Vec<TValue>, VmError> {
     let mut total_bytes: u64 = 0;
     unsafe {
-        *libc::__errno_location() = 0;
+        *compat::errno_ptr() = 0;
     }
     for i in 0..nargs {
         let arg_idx = first_arg + i;
@@ -564,7 +632,7 @@ fn g_write(
         total_bytes += written as u64;
         if written < bytes.len() {
             // 写入错误
-            let en = unsafe { *libc::__errno_location() };
+            let en = unsafe { *compat::errno_ptr() };
             let msg = if en != 0 {
                 unsafe { std::ffi::CStr::from_ptr(libc::strerror(en)) }
                     .to_string_lossy()
@@ -648,13 +716,13 @@ fn call_io_output(
                     let filename = s.as_str().to_string();
                     // 用 fopen 打开文件，模式 "w"
                     unsafe {
-                        *libc::__errno_location() = 0;
+                        *compat::errno_ptr() = 0;
                     }
                     let c_filename = std::ffi::CString::new(filename.clone()).unwrap();
                     let c_mode = std::ffi::CString::new("w").unwrap();
                     let f = unsafe { libc::fopen(c_filename.as_ptr(), c_mode.as_ptr()) };
                     if f.is_null() {
-                        let en = unsafe { *libc::__errno_location() };
+                        let en = unsafe { *compat::errno_ptr() };
                         let msg = unsafe { std::ffi::CStr::from_ptr(libc::strerror(en)) }
                             .to_string_lossy()
                             .into_owned();
@@ -736,13 +804,13 @@ fn call_io_input(
                 TValue::Str(s) => {
                     let filename = s.as_str().to_string();
                     unsafe {
-                        *libc::__errno_location() = 0;
+                        *compat::errno_ptr() = 0;
                     }
                     let c_filename = std::ffi::CString::new(filename.clone()).unwrap();
                     let c_mode = std::ffi::CString::new("r").unwrap();
                     let f = unsafe { libc::fopen(c_filename.as_ptr(), c_mode.as_ptr()) };
                     if f.is_null() {
-                        let en = unsafe { *libc::__errno_location() };
+                        let en = unsafe { *compat::errno_ptr() };
                         let msg = unsafe { std::ffi::CStr::from_ptr(libc::strerror(en)) }
                             .to_string_lossy()
                             .into_owned();
@@ -832,7 +900,7 @@ fn call_io_close(
             if let Some(f) = state.file_handles.get(&pid).copied() {
                 let is_popen = state.popen_handles.remove(&pid);
                 unsafe {
-                    *libc::__errno_location() = 0;
+                    *compat::errno_ptr() = 0;
                 }
                 let mut results = Vec::new();
                 if is_popen {
@@ -915,7 +983,7 @@ fn close_file_handle(
     let f = state.file_handles.remove(&ptr_id).unwrap();
     let is_popen = state.popen_handles.remove(&ptr_id);
     unsafe {
-        *libc::__errno_location() = 0;
+        *compat::errno_ptr() = 0;
     }
     let mut results = Vec::new();
     if is_popen {
@@ -1228,10 +1296,10 @@ fn g_read(
     first_arg: usize,
 ) -> Result<Vec<TValue>, VmError> {
     unsafe {
-        libc::clearerr(f);
+        compat::clearerr(f);
     }
     unsafe {
-        *libc::__errno_location() = 0;
+        *compat::errno_ptr() = 0;
     }
 
     let mut results: Vec<TValue> = Vec::new();
@@ -1374,7 +1442,7 @@ fn g_read(
 
     // 检查 ferror
     if unsafe { libc::ferror(f) } != 0 {
-        let en = unsafe { *libc::__errno_location() };
+        let en = unsafe { *compat::errno_ptr() };
         let msg = if en != 0 {
             unsafe { std::ffi::CStr::from_ptr(libc::strerror(en)) }
                 .to_string_lossy()
@@ -1541,11 +1609,11 @@ fn call_file_seek(
     };
 
     unsafe {
-        *libc::__errno_location() = 0;
+        *compat::errno_ptr() = 0;
     }
     let res = unsafe { libc::fseek(f, offset as libc::c_long, mode) };
     if res != 0 {
-        let en = unsafe { *libc::__errno_location() };
+        let en = unsafe { *compat::errno_ptr() };
         let msg = if en != 0 {
             unsafe { std::ffi::CStr::from_ptr(libc::strerror(en)) }
                 .to_string_lossy()
@@ -1589,7 +1657,7 @@ fn call_file_flush(
         }
     };
     unsafe {
-        *libc::__errno_location() = 0;
+        *compat::errno_ptr() = 0;
     }
     let res = unsafe { libc::fflush(f) };
     let mut results = Vec::new();
@@ -1607,7 +1675,7 @@ fn call_io_flush(
 ) -> Result<(), VmError> {
     let f = get_default_output(state)?;
     unsafe {
-        *libc::__errno_location() = 0;
+        *compat::errno_ptr() = 0;
     }
     let res = unsafe { libc::fflush(f) };
     let mut results = Vec::new();
@@ -1684,7 +1752,7 @@ fn call_file_setvbuf(
     };
 
     unsafe {
-        *libc::__errno_location() = 0;
+        *compat::errno_ptr() = 0;
     }
     let res = unsafe { libc::setvbuf(f, std::ptr::null_mut(), mode, size) };
     let mut results = Vec::new();
@@ -1782,13 +1850,13 @@ fn call_io_lines(
         TValue::Str(s) => {
             let filename = s.as_str().to_string();
             unsafe {
-                *libc::__errno_location() = 0;
+                *compat::errno_ptr() = 0;
             }
             let c_filename = std::ffi::CString::new(filename.clone()).unwrap();
             let c_mode = std::ffi::CString::new("r").unwrap();
             let f = unsafe { libc::fopen(c_filename.as_ptr(), c_mode.as_ptr()) };
             if f.is_null() {
-                let en = unsafe { *libc::__errno_location() };
+                let en = unsafe { *compat::errno_ptr() };
                 let msg = unsafe { std::ffi::CStr::from_ptr(libc::strerror(en)) }
                     .to_string_lossy()
                     .into_owned();

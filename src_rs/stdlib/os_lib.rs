@@ -16,6 +16,86 @@ use crate::table::Table;
 use std::ffi::{CStr, CString};
 
 // ============================================================================
+// 跨平台兼容层 — 提供 Windows 下缺失的 POSIX 函数
+// ============================================================================
+#[cfg(not(target_os = "windows"))]
+mod compat {
+    use std::os::raw::c_int;
+    pub unsafe fn errno_ptr() -> *mut c_int {
+        libc::__errno_location()
+    }
+    pub use libc::{mkstemp, strftime, mktime};
+    pub unsafe fn gmtime_r(timep: *const libc::time_t, result: *mut libc::tm) -> *mut libc::tm {
+        libc::gmtime_r(timep, result)
+    }
+    pub unsafe fn localtime_r(
+        timep: *const libc::time_t,
+        result: *mut libc::tm,
+    ) -> *mut libc::tm {
+        libc::localtime_r(timep, result)
+    }
+}
+#[cfg(target_os = "windows")]
+mod compat {
+    use std::ffi::c_char;
+    use std::os::raw::c_int;
+
+    extern "C" {
+        fn _errno() -> *mut c_int;
+    }
+    pub unsafe fn errno_ptr() -> *mut c_int {
+        unsafe { _errno() }
+    }
+
+    /// Windows 没有 mkstemp, 用 tmpnam 生成唯一文件名。
+    /// 返回 0 表示成功 (不返回真实 fd, 调用方仅用于判断成功/失败)。
+    pub unsafe fn mkstemp(template: *mut c_char) -> c_int {
+        extern "C" {
+            fn tmpnam(s: *mut c_char) -> *mut c_char;
+        }
+        if unsafe { tmpnam(template) }.is_null() {
+            -1
+        } else {
+            0
+        }
+    }
+
+    /// gmtime_r → gmtime_s (Windows 参数顺序相反, 返回 errno_t)
+    pub unsafe fn gmtime_r(timep: *const libc::time_t, result: *mut libc::tm) -> *mut libc::tm {
+        let rc = unsafe { libc::gmtime_s(result, timep) };
+        if rc == 0 {
+            result
+        } else {
+            std::ptr::null_mut()
+        }
+    }
+
+    /// localtime_r → localtime_s (Windows 参数顺序相反, 返回 errno_t)
+    pub unsafe fn localtime_r(
+        timep: *const libc::time_t,
+        result: *mut libc::tm,
+    ) -> *mut libc::tm {
+        let rc = unsafe { libc::localtime_s(result, timep) };
+        if rc == 0 {
+            result
+        } else {
+            std::ptr::null_mut()
+        }
+    }
+
+    // strftime 和 mktime: UCRT 提供, libc crate 在 Windows 上未暴露
+    extern "C" {
+        pub fn strftime(
+            s: *mut c_char,
+            max: usize,
+            fmt: *const c_char,
+            tm: *const libc::tm,
+        ) -> usize;
+        pub fn mktime(tm: *mut libc::tm) -> libc::time_t;
+    }
+}
+
+// ============================================================================
 // 函数标签 (已迁移到 BuiltinFn，不再使用 LightUserData tag)
 // ============================================================================
 // 标签 600+: OS 库（已迁移到 BuiltinFn，不再使用 tag）
@@ -147,14 +227,17 @@ fn call_setlocale(
 
 // os.clock() — 返回程序使用的 CPU 时间（秒）
 // 对应 C: lua_pushnumber(L, ((lua_Number)clock())/(lua_Number)CLOCKS_PER_SEC);
+// CLOCKS_PER_SEC 是平台相关的宏 (Windows=1000, Linux=1000000),
+// 由 capi_variadic.c 的 lua_rs_clocks_per_sec() 返回真实值。
 extern "C" {
     fn clock() -> isize;
+    fn lua_rs_clocks_per_sec() -> f64;
 }
-const CLOCKS_PER_SEC: f64 = 1_000_000.0;
 
 fn call_clock(state: &mut LuaState, a: usize, _nargs: usize, nresults: i32) -> Result<(), VmError> {
     let ticks = unsafe { clock() };
-    let seconds = ticks as f64 / CLOCKS_PER_SEC;
+    let cps = unsafe { lua_rs_clocks_per_sec() };
+    let seconds = ticks as f64 / cps;
     push_single_result(state, a, nresults, TValue::Float(seconds));
     Ok(())
 }
@@ -165,29 +248,49 @@ fn call_clock(state: &mut LuaState, a: usize, _nargs: usize, nresults: i32) -> R
 
 /// os.tmpname() — 返回一个临时文件名
 ///
-/// 对应 C 的 os_tmpname (POSIX 路径)：使用 mkstemp 创建临时文件，
-/// 关闭后返回文件名。模板为 "/tmp/lua_XXXXXX"。
+/// 对应 C 的 os_tmpname:
+/// - POSIX: 使用 mkstemp 创建临时文件，关闭后返回文件名。
+/// - Windows: 使用 tmpnam 生成唯一文件名。
 fn call_tmpname(
     state: &mut LuaState,
     a: usize,
     _nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
-    let mut buf: [u8; 32] = *b"/tmp/lua_XXXXXX\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
-    let ptr = buf.as_mut_ptr() as *mut libc::c_char;
-    let fd = unsafe { libc::mkstemp(ptr) };
-    if fd == -1 {
-        return Err(VmError::RuntimeError(
-            "unable to generate a unique filename".to_string(),
-        ));
+    #[cfg(not(target_os = "windows"))]
+    {
+        let mut buf: [u8; 32] = *b"/tmp/lua_XXXXXX\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+        let ptr = buf.as_mut_ptr() as *mut libc::c_char;
+        let fd = unsafe { compat::mkstemp(ptr) };
+        if fd == -1 {
+            return Err(VmError::RuntimeError(
+                "unable to generate a unique filename".to_string(),
+            ));
+        }
+        unsafe {
+            libc::close(fd);
+        }
+        let cstr = unsafe { CStr::from_ptr(ptr) };
+        let s = cstr.to_str().unwrap_or("").to_string();
+        push_single_result(state, a, nresults, TValue::Str(state.intern_str(&s)));
+        Ok(())
     }
-    unsafe {
-        libc::close(fd);
+    #[cfg(target_os = "windows")]
+    {
+        // Windows: tmpnam 生成的路径可能较长 (如 C:\Users\...\Temp\...), 用 260 字节缓冲区
+        let mut buf: [u8; 260] = [0u8; 260];
+        let ptr = buf.as_mut_ptr() as *mut libc::c_char;
+        let rc = unsafe { compat::mkstemp(ptr) };
+        if rc == -1 {
+            return Err(VmError::RuntimeError(
+                "unable to generate a unique filename".to_string(),
+            ));
+        }
+        let cstr = unsafe { CStr::from_ptr(ptr) };
+        let s = cstr.to_str().unwrap_or("").to_string();
+        push_single_result(state, a, nresults, TValue::Str(state.intern_str(&s)));
+        Ok(())
     }
-    let cstr = unsafe { CStr::from_ptr(ptr) };
-    let s = cstr.to_str().unwrap_or("").to_string();
-    push_single_result(state, a, nresults, TValue::Str(state.intern_str(&s)));
-    Ok(())
 }
 
 // ============================================================================
@@ -225,7 +328,7 @@ fn call_remove(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     if result == 0 {
         push_single_result(state, a, nresults, TValue::Boolean(true));
     } else {
-        let errno = unsafe { *libc::__errno_location() };
+        let errno = unsafe { *compat::errno_ptr() };
         // 体积优先: 用 libc::strerror 避免格式化 io::Error (会引入 StringError vtable + Unicode 表 ~4KB)
         #[cfg(size_optimized)]
         let msg = {
@@ -368,7 +471,7 @@ fn call_rename(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     if result == 0 {
         push_single_result(state, a, nresults, TValue::Boolean(true));
     } else {
-        let errno = unsafe { *libc::__errno_location() };
+        let errno = unsafe { *compat::errno_ptr() };
         // 体积优先: 用 libc::strerror 避免格式化 io::Error (会引入 StringError vtable + Unicode 表 ~4KB)
         #[cfg(size_optimized)]
         let msg = {
@@ -440,7 +543,7 @@ fn call_os_execute(
     };
 
     unsafe {
-        *libc::__errno_location() = 0;
+        *compat::errno_ptr() = 0;
     }
     let c_cmd = cmd.as_ref().and_then(|s| CString::new(s.clone()).ok());
     let stat = unsafe { libc::system(c_cmd.as_ref().map_or(std::ptr::null(), |c| c.as_ptr())) };
@@ -646,9 +749,9 @@ fn call_os_date(
     // 获取 tm 结构
     let mut tmr: libc::tm = unsafe { std::mem::zeroed() };
     let stm: *mut libc::tm = if is_utc {
-        unsafe { libc::gmtime_r(&t, &mut tmr) }
+        unsafe { compat::gmtime_r(&t, &mut tmr) }
     } else {
-        unsafe { libc::localtime_r(&t, &mut tmr) }
+        unsafe { compat::localtime_r(&t, &mut tmr) }
     };
     if stm.is_null() {
         return Err(VmError::RuntimeError(
@@ -733,7 +836,7 @@ fn call_os_date(
                 .map_err(|_| VmError::RuntimeError("invalid conversion specifier".to_string()))?;
             let mut buf = [0u8; 250];
             let reslen =
-                unsafe { libc::strftime(buf.as_mut_ptr() as *mut i8, 250, cc.as_ptr(), &tmr) };
+                unsafe { compat::strftime(buf.as_mut_ptr() as *mut i8, 250, cc.as_ptr(), &tmr) };
             result.extend_from_slice(&buf[..reslen]);
         }
     }
@@ -795,7 +898,7 @@ fn call_os_time(
             }
             _ => -1,
         };
-        let t = unsafe { libc::mktime(&mut ts) };
+        let t = unsafe { compat::mktime(&mut ts) };
         if t == -1 as libc::time_t {
             return Err(VmError::RuntimeError(
                 "time result cannot be represented in this installation".to_string(),

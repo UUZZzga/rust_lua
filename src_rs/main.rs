@@ -2,12 +2,17 @@ fn main() {
     // 体积优先: 自定义 panic hook, 避免 std 默认 hook 引入 backtrace 符号化代码
     // (~93KB gimli/addr2line/miniz_oxide)。panic=abort 模式下直接 abort 即可。
     // 注意: 不打印 PanicInfo 的 Display (会调用 backtrace), 只打印简单信息 + 直接 abort.
-    #[cfg(size_optimized)]
+    #[cfg(all(size_optimized, not(target_os = "windows")))]
     std::panic::set_hook(Box::new(|_info| {
         unsafe {
             let msg = b"lua-rs: panic occurred, aborting\n";
             libc::write(2, msg.as_ptr() as *const libc::c_void, msg.len());
         }
+        std::process::abort();
+    }));
+    #[cfg(all(size_optimized, target_os = "windows"))]
+    std::panic::set_hook(Box::new(|_info| {
+        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"lua-rs: panic occurred, aborting\n");
         std::process::abort();
     }));
 

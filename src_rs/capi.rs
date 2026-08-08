@@ -2354,9 +2354,10 @@ pub extern "C" fn lua_pushexternalstring(
 // package.loadlib 支持函数 — 供 base_lib.rs 调用
 // ============================================================================
 
-/// 内部函数：dlopen 加载动态库，返回库句柄
+/// 内部函数：加载动态库，返回库句柄
 ///
 /// 对应 C loadlib.cpp 的 lsys_load。seeglb=true 时用 RTLD_GLOBAL。
+#[cfg(not(target_os = "windows"))]
 pub unsafe fn sys_load(path: &str, seeglb: bool) -> *mut c_void {
     let cpath = match CString::new(path) {
         Ok(c) => c,
@@ -2370,9 +2371,20 @@ pub unsafe fn sys_load(path: &str, seeglb: bool) -> *mut c_void {
     unsafe { libc::dlopen(cpath.as_ptr(), flags) }
 }
 
-/// 内部函数：dlsym 查找符号，返回函数指针
+#[cfg(target_os = "windows")]
+pub unsafe fn sys_load(path: &str, _seeglb: bool) -> *mut c_void {
+    // Windows: LoadLibraryA, seeglb 无对应概念 (Windows 不支持 RTLD_GLOBAL)
+    let cpath = match CString::new(path) {
+        Ok(c) => c,
+        Err(_) => return ptr::null_mut(),
+    };
+    unsafe { win32::LoadLibraryA(cpath.as_ptr() as *const u8) as *mut c_void }
+}
+
+/// 内部函数：查找符号，返回函数指针
 ///
 /// 对应 C loadlib.cpp 的 lsys_sym。
+#[cfg(not(target_os = "windows"))]
 pub unsafe fn sys_sym(lib: *mut c_void, sym: &str) -> Option<lua_CFunction> {
     let csym = CString::new(sym).ok()?;
     let ptr = unsafe { libc::dlsym(lib, csym.as_ptr()) };
@@ -2383,6 +2395,18 @@ pub unsafe fn sys_sym(lib: *mut c_void, sym: &str) -> Option<lua_CFunction> {
     }
 }
 
+#[cfg(target_os = "windows")]
+pub unsafe fn sys_sym(lib: *mut c_void, sym: &str) -> Option<lua_CFunction> {
+    let csym = CString::new(sym).ok()?;
+    let ptr = unsafe { win32::GetProcAddress(lib, csym.as_ptr() as *const u8) };
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute::<*mut c_void, lua_CFunction>(ptr) })
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
 pub unsafe fn sys_unload(lib: *mut c_void) {
     if !lib.is_null() {
         unsafe {
@@ -2391,7 +2415,17 @@ pub unsafe fn sys_unload(lib: *mut c_void) {
     }
 }
 
-/// 内部函数：dlerror 获取错误消息
+#[cfg(target_os = "windows")]
+pub unsafe fn sys_unload(lib: *mut c_void) {
+    if !lib.is_null() {
+        unsafe {
+            win32::FreeLibrary(lib);
+        }
+    }
+}
+
+/// 内部函数：获取错误消息
+#[cfg(not(target_os = "windows"))]
 pub unsafe fn sys_dlerror() -> String {
     let ptr = unsafe { libc::dlerror() };
     if ptr.is_null() {
@@ -2400,6 +2434,62 @@ pub unsafe fn sys_dlerror() -> String {
         unsafe { CStr::from_ptr(ptr) }
             .to_string_lossy()
             .into_owned()
+    }
+}
+
+#[cfg(target_os = "windows")]
+pub unsafe fn sys_dlerror() -> String {
+    unsafe { win32::last_error_message() }
+}
+
+// Windows 动态库加载 FFI (kernel32)
+#[cfg(target_os = "windows")]
+mod win32 {
+    use std::ffi::c_void;
+
+    const FORMAT_MESSAGE_FROM_SYSTEM: u32 = 0x0000_1000;
+    const FORMAT_MESSAGE_IGNORE_INSERTS: u32 = 0x0000_0200;
+
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn LoadLibraryA(name: *const u8) -> *mut c_void;
+        pub fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+        pub fn FreeLibrary(module: *mut c_void) -> i32;
+        fn GetLastError() -> u32;
+        fn FormatMessageA(
+            flags: u32,
+            source: *const c_void,
+            msg_id: u32,
+            lang_id: u32,
+            buf: *mut u8,
+            size: u32,
+            args: *const c_void,
+        ) -> u32;
+    }
+
+    pub unsafe fn last_error_message() -> String {
+        let err = unsafe { GetLastError() };
+        if err == 0 {
+            return String::new();
+        }
+        let mut buf = [0u8; 512];
+        let len = unsafe {
+            FormatMessageA(
+                FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                std::ptr::null(),
+                err,
+                0,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                std::ptr::null(),
+            )
+        };
+        if len == 0 {
+            format!("error code {}", err)
+        } else {
+            let msg = std::str::from_utf8(&buf[..len as usize]).unwrap_or("unknown error");
+            msg.trim_end().to_string()
+        }
     }
 }
 

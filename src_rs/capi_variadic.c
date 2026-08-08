@@ -12,12 +12,19 @@
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #ifdef LUA_USE_LONGJMP
 #include <setjmp.h>
 #endif
 
-/* 可见性宏：导出符号供 .so 链接 */
+/* 可见性宏：导出符号供 .so/.dll 链接 */
+#ifdef _WIN32
+#define LUA_RS_API __declspec(dllexport)
+#define LUA_RS_NORETURN __declspec(noreturn)
+#else
 #define LUA_RS_API __attribute__((visibility("default")))
+#define LUA_RS_NORETURN __attribute__((noreturn))
+#endif
 
 /* Rust 端 capi.rs 导出的符号 */
 extern const char *lua_pushlstring(void *L, const char *s, size_t len);
@@ -85,6 +92,17 @@ LUA_RS_API int luaL_error(void *L, const char *fmt, ...) {
  * buf 指向 Rust 栈上分配的 512 字节缓冲区 (>= sizeof(jmp_buf) on all platforms)。
  */
 
+/*
+ * lua_rs_clocks_per_sec — 返回 C 库的 CLOCKS_PER_SEC 值
+ *
+ * CLOCKS_PER_SEC 是 <time.h> 中的宏, Rust 无法直接读取。
+ * 不同平台的值不同: Windows (UCRT/MSVC/MinGW) = 1000, Linux (glibc) = 1000000。
+ * os.clock() 用 clock() / CLOCKS_PER_SEC 计算 CPU 时间, 必须使用匹配的值。
+ */
+LUA_RS_API double lua_rs_clocks_per_sec(void) {
+    return (double)CLOCKS_PER_SEC;
+}
+
 #ifdef LUA_USE_LONGJMP
 
 LUA_RS_API int lua_rs_pcall_c(int (*f)(void *), void *L, void *buf) {
@@ -94,7 +112,7 @@ LUA_RS_API int lua_rs_pcall_c(int (*f)(void *), void *L, void *buf) {
     return f(L);
 }
 
-LUA_RS_API __attribute__((noreturn)) void lua_rs_longjmp(void *buf) {
+LUA_RS_API LUA_RS_NORETURN void lua_rs_longjmp(void *buf) {
     longjmp(*(jmp_buf *)buf, 1);
 }
 

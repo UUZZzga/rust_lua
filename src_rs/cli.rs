@@ -755,22 +755,37 @@ unsafe extern "C" fn laction(sig: i32) {
 fn setup_signal_handler() {
     // Miri 不支持信号操作 (sigemptyset/sigaction),跳过
     #[cfg(not(miri))]
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = laction as *const () as usize;
-        sa.sa_flags = 0;
-        libc::sigemptyset(&mut sa.sa_mask);
-        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+    {
+        #[cfg(target_os = "windows")]
+        unsafe {
+            // Windows: 用 signal() 代替 sigaction
+            libc::signal(libc::SIGINT, laction as *const () as usize);
+        }
+        #[cfg(not(target_os = "windows"))]
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = laction as *const () as usize;
+            sa.sa_flags = 0;
+            libc::sigemptyset(&mut sa.sa_mask);
+            libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        }
     }
 }
 
 fn reset_signal_handler() {
     // Miri 不支持信号操作 (sigaction),跳过
     #[cfg(not(miri))]
-    unsafe {
-        let mut sa: libc::sigaction = std::mem::zeroed();
-        sa.sa_sigaction = libc::SIG_DFL;
-        libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+    {
+        #[cfg(target_os = "windows")]
+        unsafe {
+            libc::signal(libc::SIGINT, libc::SIG_DFL);
+        }
+        #[cfg(not(target_os = "windows"))]
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = libc::SIG_DFL;
+            libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        }
     }
 }
 

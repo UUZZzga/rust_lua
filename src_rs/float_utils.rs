@@ -7,7 +7,6 @@
 //! libc 的 `snprintf("%.14g")` / `strtod` 对应 C Lua 的浮点处理方式,
 //! 行为更接近 C 实现, 且不引入额外 Rust 代码。
 
-#[cfg(size_optimized)]
 use std::ffi::CString;
 
 // ============================================================================
@@ -199,13 +198,12 @@ pub fn f64_to_string_exp(f: f64, precision: usize, uppercase: bool) -> String {
 
 /// 将字符串解析为 f64。
 ///
-/// size_optimized 模式: 用 `libc::strtod` (对应 C Lua 的 lua_str2number)
-/// 默认模式: 用 `str::parse::<f64>()` (Rust dec2flt)
+/// 用 `libc::strtod` (对应 C Lua 的 lua_str2number), 支持 locale 小数点
+/// (如 pt_BR locale 下 "3,4" 解析为 3.4)。
 ///
-/// 注意: `strtod` 会解析前缀有效部分, 忽略尾部无效字符 (如 "1e" 解析为 1.0).
-/// 为匹配 Lua `tonumber` 语义 (整个字符串必须是有效数字), 需检查 `end` 是否
-/// 指向字符串末尾 (跳过尾随空格).
-#[cfg(size_optimized)]
+/// 对应 C Lua l_str2d 的 locale fallback: 若 strtod 失败且字符串含 '.',
+/// 将 '.' 替换为 locale 的 decimal_point 后重试。
+/// (如 pt_BR locale 下 "3.4" → 替换为 "3,4" → strtod 成功)
 pub fn f64_from_str(s: &str) -> Option<f64> {
     // strtod 内部会跳过前导空格, 但 Lua 的 tonumber 也允许前导/尾随空格.
     // 先去除尾随空格, 便于检查 end 是否到达字符串末尾.
@@ -213,16 +211,32 @@ pub fn f64_from_str(s: &str) -> Option<f64> {
     if trimmed.is_empty() {
         return None;
     }
-    let c_str = CString::new(trimmed).ok()?;
+    // 第一次尝试: 用原始字符串 (strtod 会尊重 locale)
+    if let Some(val) = try_strtod(trimmed) {
+        return Some(val);
+    }
+    // Locale fallback (对应 C Lua l_str2d):
+    // 若字符串含 '.', 替换为 locale 的 decimal_point 后重试
+    if trimmed.contains('.') {
+        let dec_point = unsafe { get_locale_decpoint() };
+        if dec_point != '.' {
+            let alt = trimmed.replace('.', &dec_point.to_string());
+            if let Some(val) = try_strtod(&alt) {
+                return Some(val);
+            }
+        }
+    }
+    None
+}
+
+fn try_strtod(s: &str) -> Option<f64> {
+    let c_str = CString::new(s).ok()?;
     let mut end: *mut libc::c_char = std::ptr::null_mut();
     unsafe {
         let val = libc::strtod(c_str.as_ptr(), &mut end);
         if end as *const libc::c_char == c_str.as_ptr() {
-            // 没有解析到任何字符
             return None;
         }
-        // 检查是否整个字符串都被消费 (end 指向 NUL 终止符).
-        // strtod 会解析 "1e" 为 1.0 并把 end 指向 'e', 这种情况应拒绝.
         if *end != 0 {
             return None;
         }
@@ -230,10 +244,21 @@ pub fn f64_from_str(s: &str) -> Option<f64> {
     }
 }
 
-#[cfg(not(size_optimized))]
-#[cfg_attr(not(size_optimized), inline)]
-pub fn f64_from_str(s: &str) -> Option<f64> {
-    s.parse::<f64>().ok()
+/// 获取当前 locale 的小数点字符 (对应 C 的 lua_getlocaledecpoint)
+pub unsafe fn get_locale_decpoint() -> char {
+    #[repr(C)]
+    struct LConv {
+        decimal_point: *const libc::c_char,
+    }
+    extern "C" {
+        fn localeconv() -> *const LConv;
+    }
+    let lc = unsafe { localeconv() };
+    if lc.is_null() || (*lc).decimal_point.is_null() {
+        '.'
+    } else {
+        *(*lc).decimal_point as u8 as char
+    }
 }
 
 // ============================================================================

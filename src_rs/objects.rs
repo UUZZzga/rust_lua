@@ -1755,10 +1755,20 @@ pub fn str2num(s: &str) -> Option<TValue> {
     }
     // 尝试十六进制 — 对应 C: if (s[0]=='0' && (s[1]=='x'||s[1]=='X'))
     if let Some(rest) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
-        // 检查是否是浮点数（包含 '.' 或 'p'/'P'）
-        let is_float = rest.contains('.') || rest.contains('p') || rest.contains('P');
+        // 检查是否是浮点数（包含 '.', locale 小数点, 或 'p'/'P'）
+        let dec_point = unsafe { crate::float_utils::get_locale_decpoint() };
+        let is_float = rest.contains('.')
+            || (dec_point != '.' && rest.contains(dec_point))
+            || rest.contains('p')
+            || rest.contains('P');
         if is_float {
-            return parse_hex_float(rest).map(|f| TValue::Float(if neg { -f } else { f }));
+            // hex float 的小数点总是 '.', 若 locale 用其他字符则替换
+            let hex_rest = if dec_point != '.' && rest.contains(dec_point) {
+                rest.replace(dec_point, ".")
+            } else {
+                rest.to_string()
+            };
+            return parse_hex_float(&hex_rest).map(|f| TValue::Float(if neg { -f } else { f }));
         }
         return parse_hex_int(rest).map(|v| {
             TValue::Integer(if neg {

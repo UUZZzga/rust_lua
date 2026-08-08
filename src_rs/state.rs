@@ -3385,8 +3385,10 @@ impl LuaState {
         // GC 回收对象后，Rust 分配器（glibc malloc）可能仍持有释放的内存不归还操作系统。
         // malloc_trim(0) 是系统调用，开销较大（perf 显示 ~1.5%）。
         // 仅当释放了大量内存（>1MB）时才调用，避免在小 GC 中浪费。
+        // 注意: malloc_trim 是 glibc 专属函数, Windows/musl 无此函数。
         let cur_estimate = self.gc.total_estimate();
         if prev_estimate > cur_estimate + 1024 * 1024 {
+            #[cfg(target_os = "linux")]
             unsafe {
                 libc::malloc_trim(0);
             }

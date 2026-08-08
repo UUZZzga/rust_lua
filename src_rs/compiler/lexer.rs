@@ -944,26 +944,41 @@ impl<'a> LexState<'a> {
             }
         }
 
-        // ASCII 快速路径: 批量扫描数字字符, 避免逐字符 advance_pos 调用
-        // (perf: read_number 占 1.10%, 其中 advance_pos 调用开销显著)
-        // Lua 数字只含 ASCII 字符 (0-9, a-f, A-F, ., e/E, p/P, +/-, x/X)
-        if is_hex {
-            // 批量扫描 hex 整数部分
-            while self.pos < len {
-                let b = bytes[self.pos];
-                if (b >= b'0' && b <= b'9') || (b >= b'a' && b <= b'f') || (b >= b'A' && b <= b'F')
-                {
-                    self.pos += 1;
-                } else {
-                    break;
-                }
-            }
-            self.update_current();
-            if self.current == '.' {
+        // 对应 C read_numeral 的扫描循环 (llex.c):
+        //   for (;;) {
+        //     if (check_next2(ls, expo))  check_next2(ls, "-+");
+        //     else if (lisxdigit(ls->current) || ls->current == '.')  save_and_next(ls);
+        //     else break;
+        //   }
+        // 接受 hex 数字 (0-9,a-f,A-F) 或 '.' 反复消费; 遇指数标记消费可选符号.
+        // 注意: C 用 lisxdigit, 十进制数也接受 a-f, 交给 luaO_str2num 判定合法性,
+        // 这样畸形数字 (如 "4.5.", "4abc") 会被完整扫描后统一报 "malformed number".
+        let expo_lo = if is_hex { 'p' } else { 'e' };
+        let expo_hi = if is_hex { 'P' } else { 'E' };
+        loop {
+            let c = self.current;
+            if c == expo_lo || c == expo_hi {
+                // 指数标记: 消费后消费可选符号
                 is_float = true;
                 self.advance_pos();
+                if self.current == '+' || self.current == '-' {
+                    self.advance_pos();
+                }
+            } else if c.is_ascii_hexdigit() || c == '.' {
+                // lisxdigit (0-9,a-f,A-F) 或 '.'
+                if c == '.' {
+                    is_float = true;
+                }
+                // 批量消费连续 hex 数字, 减少 advance_pos 调用.
+                // 排除 '.' 与指数标记 (e/E 或 p/P), 交给外层循环处理:
+                //   - '.' 需设置 is_float 并单独处理
+                //   - 指数标记需消费可选符号
+                self.pos += 1;
                 while self.pos < len {
                     let b = bytes[self.pos];
+                    if b == expo_lo as u8 || b == expo_hi as u8 || b == b'.' {
+                        break;
+                    }
                     if (b >= b'0' && b <= b'9')
                         || (b >= b'a' && b <= b'f')
                         || (b >= b'A' && b <= b'F')
@@ -974,42 +989,8 @@ impl<'a> LexState<'a> {
                     }
                 }
                 self.update_current();
-            }
-            if self.current == 'p' || self.current == 'P' {
-                is_float = true;
-                self.advance_pos();
-                if self.current == '+' || self.current == '-' {
-                    self.advance_pos();
-                }
-                while self.pos < len && bytes[self.pos] >= b'0' && bytes[self.pos] <= b'9' {
-                    self.pos += 1;
-                }
-                self.update_current();
-            }
-        } else {
-            // 批量扫描十进制整数部分
-            while self.pos < len && bytes[self.pos] >= b'0' && bytes[self.pos] <= b'9' {
-                self.pos += 1;
-            }
-            self.update_current();
-            if self.current == '.' {
-                is_float = true;
-                self.advance_pos();
-                while self.pos < len && bytes[self.pos] >= b'0' && bytes[self.pos] <= b'9' {
-                    self.pos += 1;
-                }
-                self.update_current();
-            }
-            if self.current == 'e' || self.current == 'E' {
-                is_float = true;
-                self.advance_pos();
-                if self.current == '+' || self.current == '-' {
-                    self.advance_pos();
-                }
-                while self.pos < len && bytes[self.pos] >= b'0' && bytes[self.pos] <= b'9' {
-                    self.pos += 1;
-                }
-                self.update_current();
+            } else {
+                break;
             }
         }
 
