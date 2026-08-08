@@ -170,25 +170,30 @@ sol2: $(SOL2_SMOKETEST)
 # 禁用 jemalloc (MALLOC_STATICLIB="") 避免构建 jemalloc 子模块；
 # NOUSE_JEMALLOC 让 skynet 使用系统 malloc。
 #
-# capi_variadic.o 提供 luaL_error / lua_pushfstring / lua_pushvfstring 等
-# C variadic 函数（stable Rust 不支持 c_variadic），与 liblua_rs.a 一起链接。
+# capi_variadic.c（luaL_error / lua_pushfstring / lua_pushvfstring 等 C variadic
+# 函数，stable Rust 不支持 c_variadic）已由 build.rs 编译进 liblua_rs.a，无需
+# 单独提供 .o。Rust 端 os_lib 引用 lua_rs_clocks_per_sec，确保 capi_variadic.o
+# 从归档中被拉取；-Wl,-E 导出符号供 dlopen 加载的 .so 使用。
+# --undefined 作为 fail-fast 安全网：若符号未被拉取，链接阶段即报错而非运行时。
 SKYNET_SRC := $(DEPS_SRC)/skynet
 SKYNET_BIN := $(SKYNET_SRC)/skynet
-CAPI_VARIADIC_O := $(DEPS_BUILD)/capi_variadic.o
-CAPI_VARIADIC_C := $(PROJECT_ROOT)/src_rs/capi_variadic.c
 
-$(CAPI_VARIADIC_O): $(CAPI_VARIADIC_C)
-	@mkdir -p $(@D)
-	$(CC) -O2 -fPIC -I$(LUA_INCLUDE) -c $< -o $@
+# 强制保留 capi_variadic.c 的 variadic 符号（供 .so 模块运行时解析）
+SKYNET_EXPORT := -Wl,-E \
+	-Wl,--undefined=lua_pushfstring \
+	-Wl,--undefined=lua_pushvfstring \
+	-Wl,--undefined=luaL_error \
+	-Wl,--undefined=lua_rs_clocks_per_sec
 
-skynet: $(LUA_RS_LIB) $(CAPI_VARIADIC_O)
+skynet: $(LUA_RS_LIB)
 	@echo "=== Building skynet with lua-rs ==="
 	# LUA_RUST_COMPAT: 跳过 coroutine.resume/wrap 替换 (lua-rs 的 lua_resume 与 skynet timing_resume 不兼容)
 	cd $(SKYNET_SRC) && $(MAKE) linux \
 		LUA_LIB=$(LUA_RS_LIB) \
 		LUA_INC=$(LUA_INCLUDE) \
-		MALLOC_STATICLIB="$(CAPI_VARIADIC_O)" \
+		MALLOC_STATICLIB="" \
 		MYCFLAGS="-DLUA_RUST_COMPAT" \
+		EXPORT="$(SKYNET_EXPORT)" \
 		SKYNET_DEFINES="-DNOUSE_JEMALLOC"
 	@echo "=== skynet built: $(SKYNET_BIN) ==="
 
