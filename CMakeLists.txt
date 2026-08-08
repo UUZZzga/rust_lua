@@ -18,7 +18,11 @@ if(C_COMPILER_SUPPORTS_G3)
     set(CMAKE_C_FLAGS_DEBUG "${CMAKE_C_FLAGS_DEBUG} -g3")
 endif()
 
-set(LUA_COMPILE_OPTIONS -Wall -Wextra)
+set(LUA_COMPILE_OPTIONS -Wall)
+check_c_compiler_flag("-Wextra" C_COMPILER_SUPPORTS_WEXTRA)
+if(C_COMPILER_SUPPORTS_WEXTRA)
+    set(LUA_COMPILE_OPTIONS "${LUA_COMPILE_OPTIONS} -Wextra")
+endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
     list(APPEND LUA_COMPILE_OPTIONS -O0)
@@ -69,7 +73,10 @@ set(LIB_SOURCES
 # Build C library
 add_library(lualib STATIC ${CORE_SOURCES} ${LIB_SOURCES})
 target_compile_options(lualib PRIVATE ${LUA_COMPILE_OPTIONS})
-target_link_libraries(lualib PUBLIC m)
+
+if(NOT WIN32)
+    target_link_libraries(lualib PUBLIC m)
+endif()
 
 if(UNIX AND NOT APPLE)
     target_compile_definitions(lualib PUBLIC LUA_USE_LINUX)
