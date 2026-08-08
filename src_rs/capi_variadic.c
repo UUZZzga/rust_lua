@@ -33,6 +33,13 @@ extern int lua_error(void *L);
 extern void lua_concat(void *L, int n);
 extern void luaL_where(void *L, int level);
 
+/*
+ * CMP_C_MODE: 启用 cmp_c feature 时，C Lua 源码 (lauxlib.c / lapi.c) 已提供
+ * lua_pushvfstring / lua_pushfstring / luaL_error，此处跳过以避免符号重复定义。
+ * lua_rs_clocks_per_sec 和 longjmp 包装函数不受影响 (C Lua 不提供)。
+ */
+#ifndef CMP_C_MODE
+
 LUA_RS_API const char *lua_pushvfstring(void *L, const char *fmt, va_list argp) {
     char buffer[4096];
     int n = vsnprintf(buffer, sizeof(buffer), fmt, argp);
@@ -71,6 +78,8 @@ LUA_RS_API int luaL_error(void *L, const char *fmt, ...) {
     lua_concat(L, 2);
     return lua_error(L);
 }
+
+#endif /* !CMP_C_MODE */
 
 /*
  * setjmp/longjmp 包装函数 — 用于 panic=abort 模式下替代 catch_unwind。

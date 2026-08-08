@@ -128,6 +128,21 @@ fn main() {
         return;
     }
 
+    // cmp_c 模式下仍需编译 capi_variadic.c 提供 lua_rs_clocks_per_sec 和
+    // lua_rs_pcall_c / lua_rs_longjmp (C Lua 源码不提供这些)。
+    // CMP_C_MODE 排除 lua_pushfstring / lua_pushvfstring / luaL_error
+    // (由 C Lua 的 lauxlib.c / lapi.c 提供，避免符号重复定义)。
+    let mut variadic_build = cc::Build::new();
+    variadic_build
+        .file(rs_src_dir.join("capi_variadic.c"))
+        .define("CMP_C_MODE", None)
+        .define("LUA_USE_LONGJMP", None);
+    let variadic_compiler = variadic_build.get_compiler();
+    if !variadic_compiler.is_like_msvc() {
+        variadic_build.flag("-Wall").flag("-Wextra");
+    }
+    variadic_build.compile("lua_rs_variadic");
+
     let mut build = cc::Build::new();
 
     build
