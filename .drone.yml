@@ -32,7 +32,7 @@ steps:
     RUST_BACKTRACE: 1
   commands:
   - cargo install sccache
-  - export RUSTC_WRAPPER=/usr/local/cargo/bin/sccache
+  - export RUSTC_WRAPPER=/drone/src/.cargo/bin/sccache
   - export SCCACHE_DIR=/drone/src/target/sccache
   - export SCCACHE_CACHE_SIZE=2G
   - cargo build --release
