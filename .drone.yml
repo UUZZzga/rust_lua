@@ -14,14 +14,15 @@ platform:
 
 steps:
 - name: restore-deps
-  image: meltwater/drone-cache
+  pull: if-not-exists # 如果镜像不存在则拉取,免去每次都要重新下载
+  image: drillster/drone-volume-cache
+  volumes:
+  - name: cache
+    path: /cache
   settings:
-    backend: "filesystem"
     restore: true
-    cache_key: "cargo-registry"
     mount:
       - .cargo/registry
-    local_root: "/tmp/drone-cache"
 - name: build
   image: lua-ci:latest
   pull: if-not-exists
@@ -38,18 +39,19 @@ steps:
   - ./target/release/lua -v
 
 - name: save-deps
-  image: meltwater/drone-cache
+  image: drillster/drone-volume-cache
+  volumes:
+  - name: cache
+    path: /cache
   settings:
-    backend: "filesystem"
     rebuild: true
-    cache_key: "cargo-registry"
     mount:
       - .cargo/registry
-    local_root: "/tmp/drone-cache"
 
 volumes:
-  - name: cache
-    temp: {}
+- name: cache
+  host:
+    path: /tmp/drone-cache
 
 ---
 # Windows Rust Build
