@@ -1,12 +1,9 @@
-# Drone CI: Linux (docker) + Windows (exec) Rust 构建与测试
-# 完整测试套件 (deps / verify / gc_bench) 仍由 GitHub Actions 手动触发:
-# .github/workflows/ci.yml
-
 ---
 # Linux Rust Build
-# image 需先在 Drone 宿主机预构建 (见 ci/Dockerfile 内注释):
+# Image must be pre-built once on the Drone host (see ci/Dockerfile):
 #   docker build -t lua-ci:latest -f ci/Dockerfile .
-# runner 使用宿主机 docker daemon, 本地镜像不会被自动 pull/构建
+# drone-runner-docker talks to the host docker daemon;
+# local images are never pulled, so keep the tag in sync manually.
 kind: pipeline
 type: docker
 name: rust-linux
@@ -29,6 +26,7 @@ steps:
 
 ---
 # Windows Rust Build
+# Requires cargo on the runner service PATH (exec runner runs PowerShell).
 kind: pipeline
 type: exec
 name: rust-windows
