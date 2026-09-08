@@ -47,6 +47,10 @@ steps:
       - .cargo/registry
     local_root: "/tmp/drone-cache"
 
+volumes:
+  - name: cache
+    temp: {}
+
 ---
 # Windows Rust Build
 # Requires cargo on the runner service PATH (exec runner runs PowerShell).
