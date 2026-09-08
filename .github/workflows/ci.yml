@@ -12,17 +12,15 @@ name: CI
 #   - CMake build/: actions/cache (C 实现增量构建)
 #   - deps sources: actions/cache (deps/cache 下载档 + deps/src 解压源码，避免重复下载)
 
+# 仅手动触发 (Actions 页面 "Run workflow")
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
-# 同一分支新推送时取消旧的运行
+# 同一分支并发运行时取消旧的运行
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true

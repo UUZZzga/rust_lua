@@ -1,0 +1,43 @@
+# Drone CI: Linux (docker) + Windows (exec) Rust 构建与测试
+# 完整测试套件 (deps / verify / gc_bench) 仍由 GitHub Actions 手动触发:
+# .github/workflows/ci.yml
+
+---
+# Linux Rust Build
+kind: pipeline
+type: docker
+name: rust-linux
+
+platform:
+  os: linux
+  arch: amd64
+
+steps:
+- name: build
+  image: rust:latest
+  environment:
+    CARGO_TERM_COLOR: always
+    RUST_BACKTRACE: 1
+  commands:
+  # build.rs 编译 C 代码需要 gcc (rust:latest 基于 Debian, 不自带)
+  - apt-get update && apt-get install -y --no-install-recommends build-essential
+  - cargo build --release
+  - cargo test
+  - ./target/release/lua -v
+
+---
+# Windows Rust Build
+kind: pipeline
+type: exec
+name: rust-windows
+
+platform:
+  os: windows
+  arch: amd64
+
+steps:
+- name: build
+  commands:
+  - cargo build --release
+  - cargo test
+  - .\target\release\lua.exe -v
