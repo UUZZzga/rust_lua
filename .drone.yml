@@ -18,6 +18,7 @@ platform:
 steps:
 - name: build
   image: lua-ci:latest
+  pull: if-not-exists
   environment:
     CARGO_TERM_COLOR: always
     RUST_BACKTRACE: 1
