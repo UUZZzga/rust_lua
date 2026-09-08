@@ -13,8 +13,8 @@ platform:
   arch: amd64
 
 steps:
-- name: restore-deps
-  pull: if-not-exists # 如果镜像不存在则拉取,免去每次都要重新下载
+- name: restore-cache
+  pull: if-not-exists
   image: drillster/drone-volume-cache
   volumes:
   - name: cache
@@ -23,6 +23,7 @@ steps:
     restore: true
     mount:
       - .cargo/registry
+      - target/sccache
 - name: build
   image: lua-ci:latest
   pull: if-not-exists
@@ -39,7 +40,7 @@ steps:
   - cargo test
   - ./target/release/lua -v
 
-- name: save-deps
+- name: save-cache
   image: drillster/drone-volume-cache
   volumes:
   - name: cache
@@ -48,6 +49,7 @@ steps:
     rebuild: true
     mount:
       - .cargo/registry
+      - target/sccache
 
 volumes:
 - name: cache
