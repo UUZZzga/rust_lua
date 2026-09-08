@@ -22,8 +22,8 @@ steps:
   settings:
     restore: true
     mount:
-      - .cargo/registry
-      - target/sccache
+      - .cargo
+      - target
 - name: build
   image: lua-ci:latest
   pull: if-not-exists
@@ -48,8 +48,8 @@ steps:
   settings:
     rebuild: true
     mount:
-      - .cargo/registry
-      - target/sccache
+      - .cargo
+      - target
 
 volumes:
 - name: cache
