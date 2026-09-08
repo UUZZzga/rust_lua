@@ -32,11 +32,8 @@ steps:
     CARGO_TERM_COLOR: always
     RUST_BACKTRACE: 1
   commands:
-  - cargo install sccache
-  - export RUSTC_WRAPPER=/drone/src/.cargo/bin/sccache
-  - export SCCACHE_DIR=/drone/src/target/sccache
-  - export SCCACHE_CACHE_SIZE=2G
   - cargo build --release
+  - sccache --show-stats
   - cargo test
   - ./target/release/lua -v
 

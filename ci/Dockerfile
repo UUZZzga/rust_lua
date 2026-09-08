@@ -6,3 +6,11 @@ FROM rust:latest
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential cmake curl unzip perl ca-certificates \
     && rm -rf /var/lib/apt/lists/*
+
+RUN cargo install sccache
+
+ENV RUSTC_WRAPPER=/usr/local/cargo/bin/sccache
+ENV SCCACHE_DIR=/drone/src/target/sccache
+ENV SCCACHE_CACHE_SIZE=2G
+
+WORKDIR /drone/src
