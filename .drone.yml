@@ -4,6 +4,9 @@
 
 ---
 # Linux Rust Build
+# image 需先在 Drone 宿主机预构建 (见 ci/Dockerfile 内注释):
+#   docker build -t lua-ci:latest -f ci/Dockerfile .
+# runner 使用宿主机 docker daemon, 本地镜像不会被自动 pull/构建
 kind: pipeline
 type: docker
 name: rust-linux
@@ -14,13 +17,11 @@ platform:
 
 steps:
 - name: build
-  image: rust:latest
+  image: lua-ci:latest
   environment:
     CARGO_TERM_COLOR: always
     RUST_BACKTRACE: 1
   commands:
-  # build.rs 编译 C 代码需要 gcc (rust:latest 基于 Debian, 不自带)
-  - apt-get update && apt-get install -y --no-install-recommends build-essential
   - cargo build --release
   - cargo test
   - ./target/release/lua -v
