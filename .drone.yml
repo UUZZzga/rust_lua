@@ -27,6 +27,7 @@ steps:
   image: lua-ci:latest
   pull: if-not-exists
   environment:
+    CARGO_HOME: /drone/src/.cargo
     CARGO_TERM_COLOR: always
     RUST_BACKTRACE: 1
     RUSTC_WRAPPER: /usr/local/cargo/bin/sccache
