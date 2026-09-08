@@ -13,6 +13,15 @@ platform:
   arch: amd64
 
 steps:
+- name: restore-deps
+  image: meltwater/drone-cache
+  settings:
+    backend: "filesystem"
+    restore: true
+    cache_key: "cargo-registry"
+    mount:
+      - .cargo/registry
+    local_root: "/tmp/drone-cache"
 - name: build
   image: lua-ci:latest
   pull: if-not-exists
@@ -28,10 +37,15 @@ steps:
   - cargo test
   - ./target/release/lua -v
 
-volumes:
-  - name: cache
-    host:
-      path: /tmp/drone-cache
+- name: save-deps
+  image: meltwater/drone-cache
+  settings:
+    backend: "filesystem"
+    rebuild: true
+    cache_key: "cargo-registry"
+    mount:
+      - .cargo/registry
+    local_root: "/tmp/drone-cache"
 
 ---
 # Windows Rust Build
