@@ -51,7 +51,8 @@ steps:
 
 volumes:
 - name: cache
-  temp: {}
+  host:
+    path: /tmp/drone-cache
 
 ---
 # Windows Rust Build
