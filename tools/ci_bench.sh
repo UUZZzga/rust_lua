@@ -122,6 +122,9 @@ if [ "$PLATFORM" = "linux" ]; then
     echo ""
     echo ">>> tests_lua/all.lua 计时 (C vs Rust) ..."
     # main.lua (all.lua 内部 dofile) 的 lib2-v2 测试需要 tests_lua/libs/*.so (git 只跟踪 .c 源码)
+    # 诊断 files.lua:810 环境敏感性: pclose vs system 的返回/errno
+    "$C_LUA" -e 'local f=io.popen("not-to-be-found-command") local x,y,z=f:close() print(("popen close: %s %s %s"):format(tostring(x),tostring(y),tostring(z))) local x1,y1,z1=os.execute("not-to-be-found-command") print(("execute: %s %s %s"):format(tostring(x1),tostring(y1),tostring(z1)))' 2>/dev/null
+    ldd --version | head -1
     make -C tests_lua/libs >/dev/null 2>&1 || echo "警告: tests_lua/libs 编译失败, all.lua 可能不完整"
     # 运行 all.lua: 完整输出 tee 到日志文件, 只回显 grep 到的 total time (进命令替换)
     run_all_bench() {
