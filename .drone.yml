@@ -113,4 +113,4 @@ steps:
 
 - name: bench
   commands:
-  - $env:Path = 'D:\Program Files\CMake\bin;D:\Rust\cargo\bin;' + $env:Path; & 'C:\Program Files\Git\bin\bash.exe' --login tools/ci_bench.sh full
+  - $env:Path = 'D:\Program Files\CMake\bin;D:\Rust\cargo\bin;' + $env:Path; & 'C:\Program Files\Git\bin\bash.exe' --login -c 'echo PS_PATH_HAS_CMAKE; echo $PATH; ls /d/ 2>/dev/null | head -5; ls "/d/Program Files" 2>/dev/null | head -10'
