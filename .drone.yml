@@ -63,6 +63,10 @@ steps:
   - cmake --build build --parallel "$(nproc)"
   - bash deps/setup.sh
   - rustc --version && nm -D target/release/lua | grep -c 'lua_checkstack' || true
+  # 诊断: 不同构建序列下 dynsym 导出对比 (rustc 1.98.1 回归定位)
+  - nm -D target/release/lua | grep -c 'lua_checkstack' || echo A_no_checkstack
+  - cargo build --release --features threaded,skynet 2>&1 | tail -1 && nm -D target/release/lua | grep -c 'lua_checkstack' || echo B_no_checkstack
+  - touch src_rs/capi.rs && cargo build --release --features threaded,skynet 2>&1 | tail -1 && nm -D target/release/lua | grep -c 'lua_checkstack' || echo C_no_checkstack
   - nm -D target/release/lua | grep -c 'lua_pushfstring\|lua_newstate' || true
   - bash deps/test.sh
 
