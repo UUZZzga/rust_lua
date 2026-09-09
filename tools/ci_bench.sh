@@ -124,7 +124,7 @@ if [ "$PLATFORM" = "linux" ]; then
     run_main_bench() {
         local lua="$1"
         ( cd tests_lua && timeout 120 "$OLDPWD/$lua" -e \
-            'local t0=os.clock(); dofile("main.lua"); io.stderr:write(string.format("MAINTIME %.4f\\n", os.clock()-t0))' ) \
+            'local t0=os.clock(); dofile("main.lua"); io.stderr:write(string.format("MAINTIME %.4f\n", os.clock()-t0))' 2>&1 ) \
             | grep '^MAINTIME' | sed 's/^MAINTIME //'
     }
     C_MAIN=$(run_main_bench "$C_LUA")
