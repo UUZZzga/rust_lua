@@ -62,6 +62,7 @@ steps:
   - cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
   - cmake --build build --parallel "$(nproc)"
   - bash deps/setup.sh
+  - nm target/release/lua | grep -c 'lua_checkstack\|lua_pushfstring' || true
   - bash deps/test.sh
 
 - name: bench
