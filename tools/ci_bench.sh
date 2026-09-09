@@ -114,6 +114,26 @@ while IFS=$'\t' read -r c_line r_line; do
     printf "%-28s %20s %20s\n" "$metric" "$c_val" "$r_val"
 done
 echo "========================================================================="
+
+# tests_lua/main.lua 计时对比 (仅 Linux; main.lua 依赖 Unix shell, Windows 跳过)
+if [ "$PLATFORM" = "linux" ]; then
+    echo ""
+    echo ">>> tests_lua/main.lua 计时 (C vs Rust) ..."
+    run_main_bench() {
+        local lua="$1"
+        ( cd tests_lua && timeout 120 "$OLDPWD/$lua" -e \
+            'local t0=os.clock(); dofile("main.lua"); io.stderr:write(string.format("MAINTIME %.4f\\n", os.clock()-t0))' ) \
+            | grep '^MAINTIME' | sed 's/^MAINTIME //'
+    }
+    C_MAIN=$(run_main_bench "$C_LUA")
+    RS_MAIN=$(run_main_bench "$RS_LUA")
+    if [ -n "$C_MAIN" ] && [ -n "$RS_MAIN" ]; then
+        printf "%-28s %20s %20s\n" "main.lua 计时" "C" "Rust"
+        printf "%-28s %20s %20s\n" "耗时 (秒)" "$C_MAIN" "$RS_MAIN"
+    else
+        echo "警告: main.lua 计时未完成 (C='$C_MAIN' Rust='$RS_MAIN'), 跳过对比"
+    fi
+fi
 echo ""
 echo ">>> 基准完成。结果已保存:"
 echo "  C 实现:    $C_OUT"
