@@ -5,6 +5,7 @@ cbuild
 target
 target_perf
 logs
+.env
 
 # Rust/Cargo
 Cargo.lock

@@ -21,7 +21,7 @@ endif()
 set(LUA_COMPILE_OPTIONS -Wall)
 check_c_compiler_flag("-Wextra" C_COMPILER_SUPPORTS_WEXTRA)
 if(C_COMPILER_SUPPORTS_WEXTRA)
-    set(LUA_COMPILE_OPTIONS "${LUA_COMPILE_OPTIONS} -Wextra")
+    list(APPEND LUA_COMPILE_OPTIONS -Wextra)
 endif()
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug")
