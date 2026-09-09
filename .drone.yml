@@ -113,4 +113,4 @@ steps:
 
 - name: bench
   commands:
-  - powershell -Command "& 'C:\PROGRA~1\Git\bin\bash.exe' -c 'echo HOME=\$HOME; which cmake cargo; ls /c/ProgramData/chocolatey/bin 2>/dev/null | grep -i cmake; ls \"/c/Program Files/CMake/bin\" 2>/dev/null; where.exe cmake 2>/dev/null'"
+  - powershell -ExecutionPolicy Bypass -File tools/ci_bench_win.ps1 -Scale full
