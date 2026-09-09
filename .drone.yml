@@ -62,7 +62,8 @@ steps:
   - cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
   - cmake --build build --parallel "$(nproc)"
   - bash deps/setup.sh
-  - nm target/release/lua | grep -c 'lua_checkstack\|lua_pushfstring' || true
+  - rustc --version && nm -D target/release/lua | grep -c 'lua_checkstack' || true
+  - nm -D target/release/lua | grep -c 'lua_pushfstring\|lua_newstate' || true
   - bash deps/test.sh
 
 - name: bench
