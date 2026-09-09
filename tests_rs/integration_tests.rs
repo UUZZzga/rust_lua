@@ -8,8 +8,10 @@ use std::process::Command;
 use std::sync::{Arc, Mutex};
 
 fn lua_path() -> String {
+    // 与测试二进制同 profile: cargo test --release 时二进制在 target/release
+    let profile = if cfg!(debug_assertions) { "debug" } else { "release" };
     let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    path.push("target/debug/lua");
+    path.push(format!("target/{profile}/lua"));
     path.to_str().unwrap().to_string()
 }
 
