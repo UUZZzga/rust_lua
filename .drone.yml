@@ -34,7 +34,7 @@ steps:
   commands:
   - cargo build --release
   - sccache --show-stats
-  - cargo test
+  - cargo test --release
   - ./target/release/lua -v
 
 - name: cmp-tests
@@ -46,7 +46,7 @@ steps:
     RUST_BACKTRACE: 1
   commands:
   # 编译器比对测试: build.rs 仅在 cmp_c feature 下编译 src/ C Lua 源码并链接
-  - cargo test --features cmp_c -- compiler::cmp_tests::compiler_compare_tests
+  - cargo test --features cmp_c --release -- compiler::cmp_tests::compiler_compare_tests
 
 - name: deps-tests
   image: lua-ci:latest
@@ -108,7 +108,7 @@ steps:
 - name: build
   commands:
   - cargo build --release
-  - cargo test
+  - cargo test --release
   - .\target\release\lua.exe -v
 
 - name: bench

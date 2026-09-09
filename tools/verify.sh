@@ -19,7 +19,7 @@ run_build() {
 
 # 1. 执行编译器比对测试
 echo "Running compiler compare tests..."
-run_build cargo test --features cmp_c -- compiler::cmp_tests::compiler_compare_tests > logs/compiler_test.log 2>&1 < /dev/null
+run_build cargo test --features cmp_c --release -- compiler::cmp_tests::compiler_compare_tests > logs/compiler_test.log 2>&1 < /dev/null
 CMP_EXIT=$?
 
 if [ $CMP_EXIT -ne 0 ]; then
@@ -40,7 +40,7 @@ echo "Compiler compare tests passed."
 # threaded/skynet feature 仅在 deps 测试 (deps/setup.sh) 中启用,
 # verify.sh 的 cargo test 和 Lua 测试用例不需要多线程/skynet 扩展 API.
 echo "Running all cargo tests..."
-run_build cargo test > logs/cargo_test.log 2>&1 < /dev/null
+run_build cargo test --release > logs/cargo_test.log 2>&1 < /dev/null
 TEST_EXIT=$?
 
 if [ $TEST_EXIT -ne 0 ]; then
