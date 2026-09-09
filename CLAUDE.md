@@ -134,7 +134,7 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
 
 `.github/workflows/ci.yml` 仅手动触发（workflow_dispatch），依次执行：构建 Rust lua → 构建 C lua → `deps/setup.sh` → `deps/test.sh` → `tools/verify.sh` → `tools/gc_bench_run.sh --diff` → `tools/ci_bench.sh --skip-build full`。失败时上传 `logs/` 与 bench 输出作为 artifact。
 
-`.drone.yml` 定义 Drone CI 双流水线：`rust-linux`（docker，镜像 `lua-ci:latest`，见 `ci/Dockerfile`）执行 `cargo build/test` → CMP 编译器比对测试（`cargo test --features cmp_c -- compiler::cmp_tests::compiler_compare_tests`）→ deps 依赖库测试（构建 C lua 后运行 `deps/setup.sh` + `deps/test.sh`，含 skynet e2e）→ bench 性能基准（`cargo build --release` 恢复默认 features 后运行 `bash tools/ci_bench.sh --skip-build full`）；`rust-windows`（exec）执行 `cargo build/test` → bench 性能基准（`bash tools/ci_bench.sh full`，脚本内自建 C lua 与 Rust 二进制）。镜像需在 Drone 宿主机预构建（`docker build -t lua-ci:latest -f ci/Dockerfile .`），修改 `ci/Dockerfile` 后需重建镜像。
+`.drone.yml` 定义 Drone CI 双流水线：`rust-linux`（docker，镜像 `lua-ci:latest`，见 `ci/Dockerfile`）执行 `cargo build/test` → CMP 编译器比对测试（`cargo test --features cmp_c -- compiler::cmp_tests::compiler_compare_tests`）→ deps 依赖库测试（构建 C lua 后运行 `deps/setup.sh` + `deps/test.sh`，含 skynet e2e）→ bench 性能基准（`cargo build --release` 恢复默认 features 后运行 `bash tools/ci_bench.sh --skip-build full`）；`rust-windows`（exec）执行 `cargo build/test` → bench 性能基准（经 `tools/ci_bench_win.ps1` 包装：初始化 VS DevShell 提供 cmake，剥离 VS 环境变量后调 Git Bash 运行 `tools/ci_bench.sh full`，脚本内自建 C lua 与 Rust 二进制）。镜像需在 Drone 宿主机预构建（`docker build -t lua-ci:latest -f ci/Dockerfile .`），修改 `ci/Dockerfile` 后需重建镜像。
 
 ## 关键编码约定
 
