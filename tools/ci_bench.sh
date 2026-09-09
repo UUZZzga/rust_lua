@@ -124,9 +124,16 @@ if [ "$PLATFORM" = "linux" ]; then
     # main.lua (all.lua 内部 dofile) 的 lib2-v2 测试需要 tests_lua/libs/*.so (git 只跟踪 .c 源码)
     make -C tests_lua/libs >/dev/null 2>&1 || echo "警告: tests_lua/libs 编译失败, all.lua 可能不完整"
     run_all_bench() {
+        # OLDPWD 在 ( cd … ) 管道右段不可靠 (管道各段在主 shell, 未见 cd);
+        # 用绝对路径变量。lua 参数可能是相对路径, cd 后需绝对化。
         local lua="$1"
-        ( cd tests_lua && timeout 600 "$OLDPWD/$lua" all.lua 2>&1 ) \
-            | tee "$OLDPWD/logs/ci_bench_all_$2.txt" | grep '^total time' | sed 's/total time: //'
+        local abs_lua
+        case "$lua" in
+            /*) abs_lua="$lua" ;;
+            *)  abs_lua="$PWD/$lua" ;;
+        esac
+        ( cd tests_lua && timeout 600 "$abs_lua" all.lua 2>&1 ) \
+            | tee "logs/ci_bench_all_$2.txt" | grep '^total time' | sed 's/total time: //'
     }
     C_MAIN=$(run_all_bench "$C_LUA" c)
     RS_MAIN=$(run_all_bench "$RS_LUA" rs)
