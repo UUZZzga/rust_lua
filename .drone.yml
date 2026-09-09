@@ -64,6 +64,19 @@ steps:
   - bash deps/setup.sh
   - bash deps/test.sh
 
+- name: bench
+  image: lua-ci:latest
+  pull: if-not-exists
+  environment:
+    CARGO_HOME: /drone/src/.cargo
+    CARGO_TERM_COLOR: always
+    RUST_BACKTRACE: 1
+  commands:
+  # 性能基准: C vs Rust (build/lua 已由 deps-tests 构建; cargo build 恢复默认 features
+  # — deps/setup.sh 在 target/release/lua 留下了 threaded,skynet 变体, 不能用于基准)
+  - cargo build --release
+  - bash tools/ci_bench.sh --skip-build full
+
 - name: save-cache
   image: drillster/drone-volume-cache
   volumes:
@@ -97,3 +110,7 @@ steps:
   - cargo build --release
   - cargo test
   - .\target\release\lua.exe -v
+
+- name: bench
+  commands:
+  - bash tools/ci_bench.sh full

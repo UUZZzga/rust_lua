@@ -18,8 +18,9 @@
 | `target/` | Lua Rust 实现的构建目录，如果需要重新构建，也只能使用该目录 |
 | `target_perf/` | Lua Rust 实现的性能测试目录，如果需要重新构建，也只能使用该目录 |
 | `deps/` | 第三方依赖库（lua-cjson / luasocket / lsqlite3 / luarocks / sol2），仅 `Makefile` / `fetch.sh` / `setup.sh` / `test.sh` / `sol2_smoke.cpp` 入库 |
-| `tools/` | 工具脚本（`verify.sh` / `check_memory.sh` / `gc_bench_run.sh`） |
 | `doc/` | Lua 官方文档 |
+| `bench/` | CI 性能基准目录（`harness.lua` 公共驱动 + `bench_*.lua` 按测试项拆分，每项一个文件） |
+| `tools/` | 工具脚本（`verify.sh` / `check_memory.sh` / `gc_bench_run.sh` / `ci_bench.sh`） |
 | `logs/` | 测试与构建日志输出目录（由 `verify.sh` 等自动创建，已 gitignore） |
 
 ## 构建系统
@@ -63,6 +64,7 @@
 - `tools/verify.sh`：编译器比对 → `cargo test` → `cargo build --release` → 运行 `tests_lua/` 全套 Lua 测试（含 `all.lua`）。日志输出到 `logs/` 目录。
 - `deps/test.sh`：第三方依赖库（lua-cjson / luasocket / lsqlite3 / luarocks / sol2）测试。
 - `tools/gc_bench_run.sh`：C 与 Rust 实现的 GC 性能对比测试。
+- `tools/ci_bench.sh`：C 与 Rust 实现的通用性能基准（12 项解释器热点，bench/ 按项拆分），Drone 两条流水线 + GitHub Actions Linux job 均执行，日志 `logs/ci_bench_*`。
 - `tools/miri.sh`：Miri UB 检测（本地工具，需 nightly 工具链）。检测 `tests_rs/` 与 `src_rs/` 单元测试中的未定义行为（越界访问、未初始化内存、Tree Borrows 违规等）。日志输出到 `logs/miri_test.log`。
 
 ### 测试分类
@@ -71,7 +73,8 @@
 3. **Lua 官方测试套件**：`tests_lua/` 下 30+ 个 `.lua` 测试文件，由 `verify.sh` 调用 `target/release/lua` 执行。
 4. **依赖库测试**：`deps/test.sh`，验证 Rust lua 的 C ABI 兼容性。
 5. **GC 性能对比**：`tools/gc_bench_run.sh`，对比 C 与 Rust 的 GC 性能。
-6. **Miri UB 检测**：`tools/miri.sh`，用 Miri 解释执行 Rust 测试检测 UB。覆盖范围与限制见下方"Miri 检测规则"章节。
+6. **CI 性能基准**：`tools/ci_bench.sh`，对比 C 与 Rust 实现的 12 项解释器热点性能（bench/ 按项拆分），quick/full 两种规模。
+7. **Miri UB 检测**：`tools/miri.sh`，用 Miri 解释执行 Rust 测试检测 UB。覆盖范围与限制见下方"Miri 检测规则"章节。
 
 ## 编译器改动校验
 
@@ -129,9 +132,9 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
 
 ## CI 流程
 
-`.github/workflows/ci.yml` 在 push/PR 到 `main` 时触发，依次执行：构建 Rust lua → 构建 C lua → `deps/setup.sh` → `deps/test.sh` → `tools/verify.sh` → `tools/gc_bench_run.sh --diff`。失败时上传 `logs/` 与 GC bench 输出作为 artifact。
+`.github/workflows/ci.yml` 仅手动触发（workflow_dispatch），依次执行：构建 Rust lua → 构建 C lua → `deps/setup.sh` → `deps/test.sh` → `tools/verify.sh` → `tools/gc_bench_run.sh --diff` → `tools/ci_bench.sh --skip-build full`。失败时上传 `logs/` 与 bench 输出作为 artifact。
 
-`.drone.yml` 定义 Drone CI 双流水线：`rust-linux`（docker，镜像 `lua-ci:latest`，见 `ci/Dockerfile`）执行 `cargo build/test` → CMP 编译器比对测试（`cargo test --features cmp_c -- compiler::cmp_tests::compiler_compare_tests`）→ deps 依赖库测试（构建 C lua 后运行 `deps/setup.sh` + `deps/test.sh`，含 skynet e2e）；`rust-windows`（exec）执行 `cargo build/test`。镜像需在 Drone 宿主机预构建（`docker build -t lua-ci:latest -f ci/Dockerfile .`），修改 `ci/Dockerfile` 后需重建镜像。
+`.drone.yml` 定义 Drone CI 双流水线：`rust-linux`（docker，镜像 `lua-ci:latest`，见 `ci/Dockerfile`）执行 `cargo build/test` → CMP 编译器比对测试（`cargo test --features cmp_c -- compiler::cmp_tests::compiler_compare_tests`）→ deps 依赖库测试（构建 C lua 后运行 `deps/setup.sh` + `deps/test.sh`，含 skynet e2e）→ bench 性能基准（`cargo build --release` 恢复默认 features 后运行 `bash tools/ci_bench.sh --skip-build full`）；`rust-windows`（exec）执行 `cargo build/test` → bench 性能基准（`bash tools/ci_bench.sh full`，脚本内自建 C lua 与 Rust 二进制）。镜像需在 Drone 宿主机预构建（`docker build -t lua-ci:latest -f ci/Dockerfile .`），修改 `ci/Dockerfile` 后需重建镜像。
 
 ## 关键编码约定
 
