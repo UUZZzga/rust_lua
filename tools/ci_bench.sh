@@ -123,17 +123,22 @@ if [ "$PLATFORM" = "linux" ]; then
     echo ">>> tests_lua/all.lua 计时 (C vs Rust) ..."
     # main.lua (all.lua 内部 dofile) 的 lib2-v2 测试需要 tests_lua/libs/*.so (git 只跟踪 .c 源码)
     make -C tests_lua/libs >/dev/null 2>&1 || echo "警告: tests_lua/libs 编译失败, all.lua 可能不完整"
+    # 运行 all.lua: 完整输出 tee 到日志文件, 只回显 grep 到的 total time (进命令替换)
     run_all_bench() {
-        # OLDPWD 在 ( cd … ) 管道右段不可靠 (管道各段在主 shell, 未见 cd);
-        # 用绝对路径变量。lua 参数可能是相对路径, cd 后需绝对化。
-        local lua="$1"
-        local abs_lua
+        local lua="$1" tag="$2" abs_lua
         case "$lua" in
             /*) abs_lua="$lua" ;;
             *)  abs_lua="$PWD/$lua" ;;
         esac
-        ( cd tests_lua && timeout 600 "$abs_lua" all.lua 2>&1 ) \
-            | tee "logs/ci_bench_all_$2.txt" | grep '^total time' | sed 's/total time: //'
+        local logfile="logs/ci_bench_all_$tag.txt"
+        ( cd tests_lua && timeout 600 "$abs_lua" all.lua 2>&1 ) | tee "$logfile" >&2
+        local rc=${PIPESTATUS[0]}
+        if [ "$rc" -ne 0 ]; then
+            echo "all.lua ($tag) 退出码 $rc — 最后 5 行: " >&2
+            tail -5 "$logfile" >&2
+            return 1
+        fi
+        grep '^total time' "$logfile" | sed 's/total time: //'
     }
     C_MAIN=$(run_all_bench "$C_LUA" c)
     RS_MAIN=$(run_all_bench "$RS_LUA" rs)
