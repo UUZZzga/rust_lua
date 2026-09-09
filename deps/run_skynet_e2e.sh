@@ -85,10 +85,16 @@ echo "[3/4] 运行 client.lua (C lua, 发送 handshake + set + hello)..."
 # 因此不能用 printf | lua 管道（管道立即 EOF 导致 exit(1)），
 # 也不能用 ( printf > FIFO; sleep ) 形式（printf 退出后 FIFO 写端关闭导致 EOF），
 # 必须用子 shell 级别重定向 ( cmd1; sleep ) > FIFO，让 sleep 也持有 FIFO 写端。
+#
+# quit 必须与 hello 分开发送（中间 sleep 等待响应）：
+# 客户端主循环每次 readstdin 取一行即发送，若 hello 和 quit 同时入队，
+# quit 会紧跟 hello 发出，服务端处理 quit 后 KILL self 断连，
+# hello 的响应 (RESPONSE 3 result=world) 丢失导致测试失败。
 CLIENT_STDIN_FIFO=$(mktemp -u /tmp/skynet_client_stdin_XXXXXX)
 mkfifo "$CLIENT_STDIN_FIFO"
-# 后台子 shell：stdout 重定向到 FIFO，printf 写入命令后 sleep 保持 FIFO 写端打开
-( printf 'hello\nquit\n'; sleep 15 ) > "$CLIENT_STDIN_FIFO" &
+# 后台子 shell：先写 hello，等 2s 让客户端发出 get 请求并收到响应，
+# 再写 quit；sleep 保持 FIFO 写端打开。
+( printf 'hello\n'; sleep 2; printf 'quit\n'; sleep 15 ) > "$CLIENT_STDIN_FIFO" &
 CLIENT_WRITER_PID=$!
 cd "$SKYNET_DIR"
 timeout 15 "$LUA_C_BIN" examples/client.lua < "$CLIENT_STDIN_FIFO" > /tmp/skynet_e2e_client.log 2>&1
