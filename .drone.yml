@@ -37,6 +37,33 @@ steps:
   - cargo test
   - ./target/release/lua -v
 
+- name: cmp-tests
+  image: lua-ci:latest
+  pull: if-not-exists
+  environment:
+    CARGO_HOME: /drone/src/.cargo
+    CARGO_TERM_COLOR: always
+    RUST_BACKTRACE: 1
+  commands:
+  # 编译器比对测试: build.rs 仅在 cmp_c feature 下编译 src/ C Lua 源码并链接
+  - cargo test --features cmp_c -- compiler::cmp_tests::compiler_compare_tests
+
+- name: deps-tests
+  image: lua-ci:latest
+  pull: if-not-exists
+  environment:
+    CARGO_HOME: /drone/src/.cargo
+    CARGO_TERM_COLOR: always
+    RUST_BACKTRACE: 1
+  commands:
+  # 依赖库测试 (lua-cjson/luasocket/lsqlite3/luarocks/sol2/skynet/skynet-e2e):
+  # setup.sh 重建 threaded,skynet 版 lua + 构建 C lua (e2e 客户端用)
+  # + 下载/补丁/编译 C 模块与 skynet (lsqlite3/skynet 用 git clone, 需 git)
+  - cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
+  - cmake --build build --parallel "$(nproc)"
+  - bash deps/setup.sh
+  - bash deps/test.sh
+
 - name: save-cache
   image: drillster/drone-volume-cache
   volumes:

@@ -131,6 +131,8 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
 
 `.github/workflows/ci.yml` 在 push/PR 到 `main` 时触发，依次执行：构建 Rust lua → 构建 C lua → `deps/setup.sh` → `deps/test.sh` → `tools/verify.sh` → `tools/gc_bench_run.sh --diff`。失败时上传 `logs/` 与 GC bench 输出作为 artifact。
 
+`.drone.yml` 定义 Drone CI 双流水线：`rust-linux`（docker，镜像 `lua-ci:latest`，见 `ci/Dockerfile`）执行 `cargo build/test` → CMP 编译器比对测试（`cargo test --features cmp_c -- compiler::cmp_tests::compiler_compare_tests`）→ deps 依赖库测试（构建 C lua 后运行 `deps/setup.sh` + `deps/test.sh`，含 skynet e2e）；`rust-windows`（exec）执行 `cargo build/test`。镜像需在 Drone 宿主机预构建（`docker build -t lua-ci:latest -f ci/Dockerfile .`），修改 `ci/Dockerfile` 后需重建镜像。
+
 ## 关键编码约定
 
 - **Rc 共享避免深拷贝**：`Proto.code` / `constants` / `upvalues` 字段使用 `Rc<Vec<...>>`，避免 `op_call` / `op_tailcall` 中的 O(n) 深拷贝。

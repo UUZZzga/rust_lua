@@ -5,6 +5,7 @@ FROM rust:latest
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential cmake curl unzip perl ca-certificates \
+      git iproute2 procps \
     && rm -rf /var/lib/apt/lists/*
 
 RUN cargo install sccache
