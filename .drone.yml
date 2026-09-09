@@ -113,4 +113,4 @@ steps:
 
 - name: bench
   commands:
-  - bash tools/ci_bench.sh full
+  - cmd /c "\"C:\Program Files\Git\bin\bash.exe\" tools/ci_bench.sh full"
