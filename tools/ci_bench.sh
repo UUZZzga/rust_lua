@@ -115,25 +115,26 @@ while IFS=$'\t' read -r c_line r_line; do
 done
 echo "========================================================================="
 
-# tests_lua/main.lua 计时对比 (仅 Linux; main.lua 依赖 Unix shell, Windows 跳过)
+# tests_lua/all.lua 计时对比 (仅 Linux; 其内部 dofile 的 main.lua 依赖 Unix shell, Windows 跳过)
+# all.lua 自带计时打印 (每文件 "time: %g (+%g)", 结尾 "total time: %.2fs (wall time: %gs)"),
+# 直接运行并提取其内部打印的 total time。
 if [ "$PLATFORM" = "linux" ]; then
     echo ""
-    echo ">>> tests_lua/main.lua 计时 (C vs Rust) ..."
-    # main.lua 的 lib2-v2 测试需要 tests_lua/libs/*.so (git 只跟踪 .c 源码)
-    make -C tests_lua/libs >/dev/null 2>&1 || echo "警告: tests_lua/libs 编译失败, main.lua 可能不完整"
-    run_main_bench() {
+    echo ">>> tests_lua/all.lua 计时 (C vs Rust) ..."
+    # main.lua (all.lua 内部 dofile) 的 lib2-v2 测试需要 tests_lua/libs/*.so (git 只跟踪 .c 源码)
+    make -C tests_lua/libs >/dev/null 2>&1 || echo "警告: tests_lua/libs 编译失败, all.lua 可能不完整"
+    run_all_bench() {
         local lua="$1"
-        ( cd tests_lua && timeout 120 "$OLDPWD/$lua" -e \
-            'local t0=os.clock(); dofile("main.lua"); io.stderr:write(string.format("MAINTIME %.4f\n", os.clock()-t0))' 2>&1 ) \
-            | grep '^MAINTIME' | sed 's/^MAINTIME //'
+        ( cd tests_lua && timeout 600 "$OLDPWD/$lua" all.lua 2>&1 ) \
+            | tee "logs/ci_bench_all_$2.txt" | grep '^total time' | sed 's/total time: //'
     }
-    C_MAIN=$(run_main_bench "$C_LUA")
-    RS_MAIN=$(run_main_bench "$RS_LUA")
+    C_MAIN=$(run_all_bench "$C_LUA" c)
+    RS_MAIN=$(run_all_bench "$RS_LUA" rs)
     if [ -n "$C_MAIN" ] && [ -n "$RS_MAIN" ]; then
-        printf "%-28s %20s %20s\n" "main.lua 计时" "C" "Rust"
+        printf "%-28s %20s %20s\n" "all.lua total time" "C" "Rust"
         printf "%-28s %20s %20s\n" "耗时 (秒)" "$C_MAIN" "$RS_MAIN"
     else
-        echo "警告: main.lua 计时未完成 (C='$C_MAIN' Rust='$RS_MAIN'), 跳过对比"
+        echo "警告: all.lua 计时未完成 (C='$C_MAIN' Rust='$RS_MAIN'), 跳过对比"
     fi
 fi
 echo ""
