@@ -126,7 +126,7 @@ if [ "$PLATFORM" = "linux" ]; then
     run_all_bench() {
         local lua="$1"
         ( cd tests_lua && timeout 600 "$OLDPWD/$lua" all.lua 2>&1 ) \
-            | tee "logs/ci_bench_all_$2.txt" | grep '^total time' | sed 's/total time: //'
+            | tee "$OLDPWD/logs/ci_bench_all_$2.txt" | grep '^total time' | sed 's/total time: //'
     }
     C_MAIN=$(run_all_bench "$C_LUA" c)
     RS_MAIN=$(run_all_bench "$RS_LUA" rs)
