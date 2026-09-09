@@ -119,6 +119,8 @@ echo "========================================================================="
 if [ "$PLATFORM" = "linux" ]; then
     echo ""
     echo ">>> tests_lua/main.lua 计时 (C vs Rust) ..."
+    # main.lua 的 lib2-v2 测试需要 tests_lua/libs/*.so (git 只跟踪 .c 源码)
+    make -C tests_lua/libs >/dev/null 2>&1 || echo "警告: tests_lua/libs 编译失败, main.lua 可能不完整"
     run_main_bench() {
         local lua="$1"
         ( cd tests_lua && timeout 120 "$OLDPWD/$lua" -e \
