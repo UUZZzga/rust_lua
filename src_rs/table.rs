@@ -112,10 +112,22 @@ impl Table {
     // get / get_int —— 返回 owned TValue（RefCell 无法返回引用）
     // ========================================================================
 
+    /// 获取 TableData 的裸引用 — 读路径专用 (绕过 RefCell borrow 计数)。
+    ///
+    /// 安全性: 仅限"同步读、不重入、不触发元方法/GC/写操作"的路径
+    /// (get/hash_get/边界计算)。此类路径在函数返回前完成全部读取,
+    /// 期间不可能发生 borrow_mut (VM 单线程, 无重入点)。
+    /// Miri Tree Borrows 验证: as_ptr + 只读访问 + 立即结束生命周期,
+    /// 与正常 borrow 等价但省去 borrow flag 读写 (各 1 次依赖加载 + 分支)。
+    #[cfg_attr(not(size_optimized), inline(always))]
+    fn data_ro(&self) -> &TableData {
+        unsafe { &*self.data.as_ptr() }
+    }
+
     /// 一次 borrow 内同时查找值并返回元表 — 消除 metamethod 路径的第二次 borrow。
     /// 返回 (查找结果, 元表)。元表为 Some 时调用方无需再次 borrow 获取 __index。
     pub fn get_and_metatable(&self, key: &TValue) -> (Option<TValue>, bool) {
-        let data = self.data.borrow();
+        let data = self.data_ro();
         // perf: 只返回是否有元表的标志, 不 clone 元表 (Table 是 Rc, clone 需 incq)。
         // table_get 在 key 命中时直接返回, 无需元表; 仅 key 未命中时才调用 get_metatable()
         // 获取元表查 __index。命中路径省去一次冗余的 Rc incq/drop (all.lua table_get 占 10.65%)。
