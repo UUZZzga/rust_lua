@@ -45,7 +45,7 @@ use crate::state::LuaState;
 // FxHasher 的 write_u8/u16/u32/... 等特化方法各生成独立代码。
 
 #[cfg(not(size_optimized))]
-mod fx_hash_impl {
+pub(crate) mod fx_hash_impl {
     use std::hash::{BuildHasherDefault, Hasher};
 
     /// FxHash 常量种子（来自 rustc-hash crate）
@@ -128,6 +128,7 @@ mod fx_hash_impl {
 
     /// FxBuildHasher — BuildHasher 实现，构造 FxHasher
     pub type FxBuildHasher = BuildHasherDefault<FxHasher>;
+    pub use FxHasher as FxHasherPub;
 }
 
 #[cfg(not(size_optimized))]
@@ -144,6 +145,35 @@ pub type FxBuildHasher = std::collections::hash_map::RandomState;
 pub type TableHashMap<V> = hashbrown::HashMap<TValue, V, FxBuildHasher>;
 #[cfg(size_optimized)]
 pub type TableHashMap<V> = std::collections::HashMap<TValue, V, FxBuildHasher>;
+
+// ============================================================================
+// Table 哈希索引 — hashbrown::HashTable<(TValue, usize)>
+// ============================================================================
+
+/// Table 的 key→bucket 索引：开放寻址 HashTable，每条目 (key, bucket_index)。
+///
+/// perf: 替代原 HashMap<TValue, usize> — HashTable::find 用预计算哈希（存于
+/// 控制字节 SIMD 组）+ 调用方 eq 闭包探测，eq 直接比较条目内的 key 克隆，
+/// 单跳定位（对应 C Lua Node 的 main position 比较模式），省去 HashMap
+/// 每次 get 的 BuildHasher 调用链与 Result/Eq 适配层。
+#[cfg(not(size_optimized))]
+pub type TableHashIndex = hashbrown::HashTable<(TValue, usize)>;
+#[cfg(size_optimized)]
+pub type TableHashIndex = TableHashMap<usize>;
+
+/// 计算 TValue 的 FxHash 哈希 — 与 impl Hash for TValue + FxBuildHasher 一致。
+///
+/// TableHashIndex 以 (hash, eq) 二元组驱动 find/insert，此函数提供 hash 侧。
+/// Str 键的 hash 在驻留时缓存于 s.hash，此处仅 2 轮 rotate-xor-mul 混合。
+#[cfg(not(size_optimized))]
+pub fn tvalue_fx_hash(v: &TValue) -> u64 {
+    use std::hash::Hasher;
+    let mut h = fx_hash_impl::FxHasherPub::default();
+    std::hash::Hash::hash(v, &mut h);
+    h.finish()
+}
+
+
 
 // ============================================================================
 // 规约：Lua 基础类型标签
@@ -935,15 +965,73 @@ pub struct LCFunction {
 pub struct TableData {
     /// 数组部分（1-based，索引 0 对应键 1）
     pub array: Vec<TValue>,
-    /// 哈希部分：(key, value) 对 — 替代原来的 hash + hash_buckets 双结构
-    /// 通过 key_to_bucket 进行 O(1) 查找，此 Vec 保持插入顺序用于 next() 遍历
+    /// 哈希部分：(key, value) 对 — 保持插入顺序用于 next() 遍历与 GC 标记
     pub hash_buckets: Vec<(TValue, TValue)>,
-    /// `key → hash_buckets index` 映射 — 让 get / set / next 能 O(1) 定位
-    /// Option<Box<…>> 使空表不浪费 HashMap 结构体内存（~56 bytes）
-    /// 使用 FxBuildHasher 替代默认 SipHash，减少哈希计算开销
-    pub key_to_bucket: Option<Box<TableHashMap<usize>>>,
+    /// `key → hash_buckets index` 索引 — 让 get / set / next 能 O(1) 定位。
+    /// TableHashIndex = HashTable<(TValue, usize)>: 开放寻址 + 预计算哈希 +
+    /// eq 直接比较条目内 key 克隆，单跳定位（同 C Lua Node main position）。
+    /// Option<Box<…>> 使空表不浪费结构体内存
+    pub key_to_bucket: Option<Box<TableHashIndex>>,
     /// 元表
     pub metatable: Option<Box<Table>>,
+}
+
+impl TableData {
+    /// 索引查找 — O(1) 返回 key 所在的 hash_buckets 下标
+    #[cfg(not(size_optimized))]
+    #[cfg_attr(not(size_optimized), inline)]
+    pub fn idx_get(&self, key: &TValue) -> Option<usize> {
+        let ktb = self.key_to_bucket.as_ref()?;
+        let hash = tvalue_fx_hash(key);
+        ktb.find(hash, |(k, _)| k == key).map(|(_, idx)| *idx)
+    }
+
+    /// 索引插入 — key 必须不存在（insert_unique 不检查重复）
+    #[cfg(not(size_optimized))]
+    #[cfg_attr(not(size_optimized), inline)]
+    pub fn idx_insert(&mut self, key: &TValue, idx: usize) {
+        let ktb = self
+            .key_to_bucket
+            .get_or_insert_with(|| Box::new(hashbrown::HashTable::default()));
+        let hash = tvalue_fx_hash(key);
+        ktb.insert_unique(hash, (key.clone(), idx), |(k, _)| tvalue_fx_hash(k));
+    }
+
+    /// 索引删除 — 返回被删 key 的 bucket 下标
+    #[cfg(not(size_optimized))]
+    #[cfg_attr(not(size_optimized), inline)]
+    pub fn idx_remove(&mut self, key: &TValue) -> Option<usize> {
+        let ktb = self.key_to_bucket.as_mut()?;
+        let hash = tvalue_fx_hash(key);
+        ktb.find_entry(hash, |(k, _)| k == key)
+            .ok()
+            .map(|entry| {
+                let ((_, idx), _) = entry.remove();
+                idx
+            })
+    }
+
+    // size_optimized 回退: TableHashMap<usize> (std HashMap) — 走其原生 API
+    #[cfg(size_optimized)]
+    pub fn idx_get(&self, key: &TValue) -> Option<usize> {
+        self.key_to_bucket.as_ref()?.get(key).copied()
+    }
+
+    #[cfg(size_optimized)]
+    pub fn idx_insert(&mut self, key: &TValue, idx: usize) {
+        self.key_to_bucket
+            .get_or_insert_with(|| {
+                Box::new(crate::objects::TableHashMap::with_hasher(
+                    crate::objects::FxBuildHasher::default(),
+                ))
+            })
+            .insert(key.clone(), idx);
+    }
+
+    #[cfg(size_optimized)]
+    pub fn idx_remove(&mut self, key: &TValue) -> Option<usize> {
+        self.key_to_bucket.as_mut()?.remove(key)
+    }
 }
 
 impl Drop for TableData {

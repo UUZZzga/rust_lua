@@ -2909,10 +2909,7 @@ pub fn table_next(
             }
         }
         if !exists {
-            exists = data
-                .key_to_bucket
-                .as_ref()
-                .map_or(false, |m| m.contains_key(&key));
+            exists = data.idx_get(&key).is_some();
         }
         exists
     };
@@ -2976,13 +2973,13 @@ fn find_first_hash(table: &crate::table::Table) -> (Option<TValue>, TValue) {
 
 /// 在哈希部分中查找给定 key 之后的下一个 key (跳过 tombstone)
 ///
-/// 用 `key_to_bucket.get(key)` O(1) 定位 prev 的位置，然后线性扫描
+/// 用 `idx_get(key)` O(1) 定位 prev 的位置，然后线性扫描
 /// `hash_buckets[idx+1..]` 找下一个 live entry — 对应 C 的 findindex O(1)
 /// (C 用 hash→mainposition→chain 定位 node index)。
 fn find_next_hash(table: &crate::table::Table, key: &TValue) -> (Option<TValue>, TValue) {
     let data = table.data.borrow();
-    let start_idx = match data.key_to_bucket.as_ref().and_then(|m| m.get(key)) {
-        Some(&i) => i + 1,
+    let start_idx = match data.idx_get(key) {
+        Some(i) => i + 1,
         None => return (None, TValue::Nil(NilKind::Strict)),
     };
     for (k, v) in data.hash_buckets[start_idx..].iter() {
@@ -2992,10 +2989,6 @@ fn find_next_hash(table: &crate::table::Table, key: &TValue) -> (Option<TValue>,
     }
     (None, TValue::Nil(NilKind::Strict))
 }
-// ipairs 辅助函数 — 对应 C 的 ipairsaux
-// ============================================================================
-
-/// ipairs 迭代器函数 (对应 C 的 ipairsaux)
 ///
 /// 参数: state=t, control=i
 /// 返回: i+1, t[i+1] (如果 t[i+1] 不为 nil)

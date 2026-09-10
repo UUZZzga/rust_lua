@@ -3371,15 +3371,14 @@ impl LuaState {
                                 data.array[idx] = TValue::Nil(NilKind::Empty);
                             }
                             for k in to_clear_hash {
-                                if let Some(i) =
-                                    data.key_to_bucket.as_mut().and_then(|m| m.remove(&k))
-                                {
+                                if let Some(i) = data.idx_remove(&k) {
                                     let last_idx = data.hash_buckets.len() - 1;
                                     if i != last_idx {
                                         // 把最后一个条目移到空隙，保持连续性
                                         let key = data.hash_buckets.last().unwrap().0.clone();
                                         data.hash_buckets.swap_remove(i);
-                                        data.key_to_bucket.as_mut().unwrap().insert(key, i);
+                                        data.idx_remove(&key);
+                                        data.idx_insert(&key, i);
                                     } else {
                                         data.hash_buckets.pop();
                                     }

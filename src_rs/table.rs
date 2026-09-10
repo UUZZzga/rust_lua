@@ -26,8 +26,8 @@ fn ceillog2(x: u64) -> u32 {
     (x - 1).ilog2() + 1
 }
 fn hash_get(td: &TableData, key: &TValue) -> Option<TValue> {
-    if let Some(idx) = td.key_to_bucket.as_ref().and_then(|m| m.get(key)) {
-        let v = &td.hash_buckets[*idx].1;
+    if let Some(idx) = td.idx_get(key) {
+        let v = &td.hash_buckets[idx].1;
         if !matches!(v, TValue::Nil(NilKind::Empty)) {
             return Some(v.clone());
         }
@@ -58,12 +58,17 @@ impl Table {
                 array: (0..narray).map(|_| TValue::Nil(NilKind::Empty)).collect(),
                 hash_buckets: Vec::with_capacity(nhash),
                 key_to_bucket: if nhash > 0 {
-                    Some(Box::new(
-                        crate::objects::TableHashMap::with_capacity_and_hasher(
+                    #[cfg(not(size_optimized))]
+                    {
+                        Some(Box::new(hashbrown::HashTable::with_capacity(nhash)))
+                    }
+                    #[cfg(size_optimized)]
+                    {
+                        Some(Box::new(crate::objects::TableHashMap::with_capacity_and_hasher(
                             nhash,
                             crate::objects::FxBuildHasher::default(),
-                        ),
-                    ))
+                        )))
+                    }
                 } else {
                     None
                 },
@@ -283,14 +288,9 @@ impl Table {
         } else {
             value
         };
-        let ktb = data.key_to_bucket.get_or_insert_with(|| {
-            Box::new(crate::objects::TableHashMap::with_hasher(
-                crate::objects::FxBuildHasher::default(),
-            ))
-        });
         // 先检查 key 是否已存在，避免克隆 key
-        if let Some(idx) = ktb.get(key) {
-            data.hash_buckets[*idx].1 = val;
+        if let Some(idx) = data.idx_get(key) {
+            data.hash_buckets[idx].1 = val;
             return;
         }
         if is_nil {
@@ -298,7 +298,7 @@ impl Table {
         }
         let idx = data.hash_buckets.len();
         data.hash_buckets.push((key.clone(), val));
-        ktb.insert(key.clone(), idx);
+        data.idx_insert(key, idx);
     }
     // ========================================================================
 
@@ -310,8 +310,8 @@ impl Table {
         let data = self.data.borrow();
         let asize = data.array.len();
         if asize == 0 {
-            return match &data.key_to_bucket {
-                Some(ktb) => Self::hash_boundary_impl_key_to_bucket(ktb, asize as i64, 1u32),
+            return match data.key_to_bucket.as_ref() {
+                Some(_) => Self::hash_boundary_impl(&data, asize as i64, 1u32),
                 None => asize as i64,
             };
         }
@@ -350,8 +350,8 @@ impl Table {
             return Self::bin_search_array(&data.array, 0, limit) as i64;
         }
 
-        match &data.key_to_bucket {
-            Some(ktb) => Self::hash_boundary_impl_key_to_bucket(ktb, asize as i64, 1u32),
+        match data.key_to_bucket.as_ref() {
+            Some(_) => Self::hash_boundary_impl(&data, asize as i64, 1u32),
             None => asize as i64,
         }
     }
@@ -376,14 +376,11 @@ impl Table {
     /// 或 asize==0。此处检查 t[asize+1] 是否存在：
     /// - 不存在：asize 即边界
     /// - 存在：进入指数增长 + 二分查找
-    /// 使用 key_to_bucket 代替原 hash HashMap 做 O(1) 存在性检查。
-    fn hash_boundary_impl_key_to_bucket(
-        key_to_bucket: &crate::objects::TableHashMap<usize>,
-        asize: i64,
-        seed: u32,
-    ) -> i64 {
+    /// 使用 key_to_bucket 索引做 O(1) 存在性检查。
+    fn hash_boundary_impl(data: &TableData, asize: i64, seed: u32) -> i64 {
         use TValue::Integer;
-        if !key_to_bucket.contains_key(&Integer(asize + 1)) {
+        let contains = |k: &TValue| data.idx_get(k).is_some();
+        if !contains(&Integer(asize + 1)) {
             return asize;
         }
         let max_int = i64::MAX as u64;
@@ -394,14 +391,14 @@ impl Table {
         let incr: u64 = (rnd & mask) as u64 + 1;
         let mut j: u64 = if incr <= max_int - i { i + incr } else { i + 1 };
         rnd >>= n;
-        while key_to_bucket.contains_key(&Integer(j as i64)) {
+        while contains(&Integer(j as i64)) {
             i = j;
             if j <= max_int / 2 - 1 {
                 j = j * 2 + (rnd & 1) as u64;
                 rnd >>= 1;
             } else {
                 j = max_int;
-                if !key_to_bucket.contains_key(&Integer(j as i64)) {
+                if !contains(&Integer(j as i64)) {
                     break;
                 } else {
                     return j as i64;
@@ -410,7 +407,7 @@ impl Table {
         }
         while j - i > 1 {
             let m = (i + j) / 2;
-            if key_to_bucket.contains_key(&Integer(m as i64)) {
+            if contains(&Integer(m as i64)) {
                 i = m;
             } else {
                 j = m;
@@ -456,8 +453,8 @@ impl Table {
                     None
                 }
                 _ => {
-                    let start = match data.key_to_bucket.as_ref().and_then(|m| m.get(prev)) {
-                        Some(&i) => i + 1,
+                    let start = match data.idx_get(prev) {
+                        Some(i) => i + 1,
                         None => return None,
                     };
                     for (k, v) in data.hash_buckets[start..].iter() {
@@ -510,29 +507,18 @@ impl Table {
                     } else {
                         let bidx = data.hash_buckets.len();
                         data.hash_buckets.push((k.clone(), v));
-                        data.key_to_bucket
-                            .get_or_insert_with(|| {
-                                Box::new(crate::objects::TableHashMap::with_hasher(
-                                    crate::objects::FxBuildHasher::default(),
-                                ))
-                            })
-                            .insert(k, bidx);
+                        data.idx_insert(&k, bidx);
                     }
                 }
                 _ => {
                     let bidx = data.hash_buckets.len();
                     data.hash_buckets.push((k.clone(), v));
-                    data.key_to_bucket
-                        .get_or_insert_with(|| {
-                            Box::new(crate::objects::TableHashMap::with_hasher(
-                                crate::objects::FxBuildHasher::default(),
-                            ))
-                        })
-                        .insert(k, bidx);
+                    data.idx_insert(&k, bidx);
                 }
             }
         }
     }
+
 
     pub fn resize_array(&self, nasize: usize) {
         let nhsize = self.data.borrow().hash_buckets.len();
@@ -544,11 +530,11 @@ impl Table {
         let mut size = std::mem::size_of::<Table>()
             + data.array.capacity() * std::mem::size_of::<TValue>()
             + data.hash_buckets.capacity() * (std::mem::size_of::<TValue>() * 2);
-        // key_to_bucket HashMap 堆占用：capacity * (size_of::<TValue>() + size_of::<usize>())
-        // + HashMap 内部控制结构（约 56 字节）
+        // key_to_bucket 索引堆占用：capacity * (size_of::<TValue>() + size_of::<usize>())
+        // + HashTable 控制结构（约 24 字节）
         if let Some(ref ktb) = data.key_to_bucket {
             size += ktb.capacity() * (std::mem::size_of::<TValue>() + std::mem::size_of::<usize>())
-                + 56;
+                + 24;
         }
         size
     }
@@ -788,13 +774,7 @@ mod tests {
     fn test_set_int_hash() {
         let t = Table::new();
         t.set_int(100, TValue::Integer(42));
-        assert!(t
-            .data
-            .borrow()
-            .key_to_bucket
-            .as_ref()
-            .unwrap()
-            .contains_key(&TValue::Integer(100)));
+        assert!(t.data.borrow().idx_get(&TValue::Integer(100)).is_some());
         assert_eq!(t.get_int(100), Some(TValue::Integer(42)));
     }
 
