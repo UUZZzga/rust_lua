@@ -1099,10 +1099,7 @@ fn call_ipairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     let t = get_arg(state, a, 0);
     // 返回迭代器函数 (ipairsaux), 状态 t, 初始值 0
     // ipairsaux 作为 BuiltinFn 注册（名称 "for iterator" 对应 C 的 luaB_auxlib_getn 语义）
-    let iter = TValue::BuiltinFn(crate::objects::BuiltinFn {
-        func: call_ipairs_aux,
-        name: c"for iterator".as_ptr() as *const u8,
-    });
+    let iter = TValue::BuiltinFn(crate::objects::BuiltinFn::impure(call_ipairs_aux, c"for iterator".as_ptr() as *const u8));
     push_results(state, a, nresults, vec![iter, t, TValue::Integer(0)]);
     Ok(())
 }
@@ -1196,10 +1193,7 @@ fn call_pairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
     } else {
         // 无 __pairs: 返回 next, t, nil, nil (第 4 个 nil 是 TBC 占位)
         // next 作为 BuiltinFn 注册（名称 "next" 对应 C 的 luaB_next）
-        let next_fn = TValue::BuiltinFn(crate::objects::BuiltinFn {
-            func: call_next_iter,
-            name: c"next".as_ptr() as *const u8,
-        });
+        let next_fn = TValue::BuiltinFn(crate::objects::BuiltinFn::impure(call_next_iter, c"next".as_ptr() as *const u8));
         push_results(
             state,
             a,
@@ -2281,18 +2275,12 @@ fn init_package_table(state: &mut LuaState) {
     // loadlib 函数 — BuiltinFn 注册
     pkg.set(
         TValue::Str(state.intern_str("loadlib")),
-        TValue::BuiltinFn(crate::objects::BuiltinFn {
-            func: call_loadlib,
-            name: c"loadlib".as_ptr() as *const u8,
-        }),
+        TValue::BuiltinFn(crate::objects::BuiltinFn::impure(call_loadlib, c"loadlib".as_ptr() as *const u8)),
     );
     // searchpath 函数 — BuiltinFn 注册
     pkg.set(
         TValue::Str(state.intern_str("searchpath")),
-        TValue::BuiltinFn(crate::objects::BuiltinFn {
-            func: call_searchpath,
-            name: c"searchpath".as_ptr() as *const u8,
-        }),
+        TValue::BuiltinFn(crate::objects::BuiltinFn::impure(call_searchpath, c"searchpath".as_ptr() as *const u8)),
     );
     // searchers 表 — 对应 C createsearcherstable (loadlib.cpp:703)
     // 包含 4 个 searcher 占位函数 (preload/Lua/C/Croot)
@@ -2300,10 +2288,7 @@ fn init_package_table(state: &mut LuaState) {
     // 这些 BuiltinFn 仅用于让 searchers 表元素显示为 "function" 类型，
     // 直接调用会报错（与原 tag 行为一致）。
     let make_searcher = |name: &'static std::ffi::CStr| -> TValue {
-        TValue::BuiltinFn(crate::objects::BuiltinFn {
-            func: call_searcher_placeholder,
-            name: name.as_ptr() as *const u8,
-        })
+        TValue::BuiltinFn(crate::objects::BuiltinFn::impure(call_searcher_placeholder, name.as_ptr() as *const u8))
     };
     let searchers = Table::new();
     searchers.set(TValue::Integer(1), make_searcher(c"searcher_preload"));
@@ -3228,6 +3213,10 @@ fn call_collectgarbage(
 /// 2. 设置 _G 和 _VERSION
 pub fn open_base_lib(state: &mut LuaState) {
     // 注册所有基础库函数 (使用 BuiltinFn 函数指针)
+    //
+    // 安全: 必须经 BuiltinFn::impure 构造 — 原始字面量会把 CStr 打包地址的
+    // 低位泄漏进 purity 标志位 (CStr 静态字面量仅 1 字节对齐, 地址可奇可偶),
+    // 导致 print/pcall 等按地址随机被判定为 pure, 丢失 CallInfoEntry 调试信息。
     let register = |state: &mut LuaState,
                     name: &'static std::ffi::CStr,
                     func: crate::objects::BuiltinFnPtr| {
@@ -3235,10 +3224,7 @@ pub fn open_base_lib(state: &mut LuaState) {
         let name_ptr = name.as_ptr() as *const u8;
         state.globals.set(
             key,
-            TValue::BuiltinFn(crate::objects::BuiltinFn {
-                func,
-                name: name_ptr,
-            }),
+            TValue::BuiltinFn(crate::objects::BuiltinFn::impure(func, name_ptr)),
         );
     };
 
@@ -3397,10 +3383,7 @@ mod tests {
             Ok(())
         }
 
-        let v = TValue::BuiltinFn(crate::objects::BuiltinFn {
-            func: dummy_fn,
-            name: c"dummy".as_ptr() as *const u8,
-        });
+        let v = TValue::BuiltinFn(crate::objects::BuiltinFn::impure(dummy_fn, c"dummy".as_ptr() as *const u8));
         assert_eq!(base_type_name(&v), "function");
         assert!(v.is_function());
         assert_eq!(v.ty(), crate::objects::LuaType::Function);
@@ -3713,10 +3696,7 @@ mod tests {
 
     /// 辅助：构造一个占位 BuiltinFn 作为栈上的 "函数" 位置
     fn placeholder_builtin() -> TValue {
-        TValue::BuiltinFn(crate::objects::BuiltinFn {
-            func: call_searcher_placeholder,
-            name: c"placeholder".as_ptr() as *const u8,
-        })
+        TValue::BuiltinFn(crate::objects::BuiltinFn::impure(call_searcher_placeholder, c"placeholder".as_ptr() as *const u8))
     }
 
     #[test]

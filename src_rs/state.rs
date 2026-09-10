@@ -1723,10 +1723,7 @@ impl LuaState {
         let name_ptr = name.as_ptr() as *const u8;
         self.globals.set(
             key,
-            TValue::BuiltinFn(BuiltinFn {
-                func,
-                name: name_ptr,
-            }),
+            TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)),
         );
     }
 
@@ -1752,10 +1749,7 @@ impl LuaState {
         let name_ptr = name.as_ptr() as *const u8;
         table.set(
             key,
-            TValue::BuiltinFn(BuiltinFn {
-                func,
-                name: name_ptr,
-            }),
+            TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)),
         );
     }
 

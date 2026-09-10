@@ -4187,10 +4187,7 @@ fn create_string_lib_table(state: &LuaState) -> Table {
         let name_ptr = name.as_ptr() as *const u8;
         lib.set(
             key,
-            TValue::BuiltinFn(BuiltinFn {
-                func,
-                name: name_ptr,
-            }),
+            TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)),
         );
     };
     register(&lib, c"upper", call_str_upper);

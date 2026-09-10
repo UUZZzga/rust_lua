@@ -282,16 +282,80 @@ pub struct BuiltinFn {
     /// 函数指针
     pub func: BuiltinFnPtr,
     /// 函数名（NUL 终止的 C 字符串指针，用于 traceback）
+    ///
+    /// 位 0 是 purity 标志：
+    /// - 0 (默认, 原始字面量 / `impure` 构造): 可能回调 Lua / yield / 调用 hook 的函数
+    /// - 1 (`pure` 构造): 永不回调 Lua、永不 yield 的纯函数 (math.sin 等)
+    ///
+    /// op_call 对 pure 函数走无 CallInfoEntry 快速路径（成功时不 push/pop
+    /// call_info，错误时补 push），可省 ~20ns/次的 72 字节结构体写往返。
+    /// 默认 0 = impure：所有未显式声明 pure 的构造（含历史字面量与第三方路径）
+    /// 语义不变，pure 必须显式 opt-in，杜绝 base 库等"漏标"导致调试信息丢失。
+    /// 标志复用 name 指针低位而非新增字段，保持 TValue 24 字节不变。
+    /// CStr 静态字面量指针至少 1 字节对齐，位 0 可安全借用。
+    /// 所有解码 name 的路径必须经 `name_ptr()` 剥离标志位。
     pub name: *const u8,
+}
+
+impl BuiltinFn {
+    /// impure 构造 — 可能回调 Lua / yield 的函数（默认语义，与原始字面量一致）。
+    pub fn impure(func: BuiltinFnPtr, name: *const u8) -> Self {
+        Self {
+            func,
+            name: (name as usize & !1) as *const u8,
+        }
+    }
+
+    /// 纯函数构造 — 声明该函数从不回调 Lua、从不 yield。
+    /// op_call 据此在成功路径跳过 CallInfoEntry push/pop。
+    /// 仅限满足全部条件的函数：
+    /// 1. 不调用任何可执行 Lua 代码的路径（metatable/pcall/coroutine/回调参数）
+    /// 2. 不 yield
+    /// 3. 参数错误返回 Err（VM 会在错误时补推 CallInfoEntry）
+    pub fn pure(func: BuiltinFnPtr, name: *const u8) -> Self {
+        Self {
+            func,
+            name: (name as usize | 1) as *const u8,
+        }
+    }
+
+    /// 是否为纯函数（成功调用无需维护 CallInfoEntry）
+    #[cfg_attr(not(size_optimized), inline(always))]
+    pub fn is_pure(&self) -> bool {
+        self.name as usize & 1 == 1
+    }
+
+    /// 剥离 purity 标志位的 name 裸指针
+    #[cfg_attr(not(size_optimized), inline(always))]
+    pub fn name_ptr(&self) -> *const u8 {
+        (self.name as usize & !1) as *const u8
+    }
+
+    /// 获取函数名的 &str（unsafe，因为从裸指针构造）
+    ///
+    /// 安全性：name 必须是有效的 NUL 终止 C 字符串指针
+    pub fn name_str(&self) -> &'static str {
+        let p = self.name_ptr();
+        if p.is_null() {
+            ""
+        } else {
+            unsafe {
+                std::ffi::CStr::from_ptr(p as *const std::ffi::c_char)
+                    .to_str()
+                    .unwrap_or("")
+            }
+        }
+    }
 }
 
 impl std::fmt::Debug for BuiltinFn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let p = self.name_ptr();
         let name = unsafe {
-            if self.name.is_null() {
+            if p.is_null() {
                 "<null>".to_string()
             } else {
-                std::ffi::CStr::from_ptr(self.name as *const std::ffi::c_char)
+                std::ffi::CStr::from_ptr(p as *const std::ffi::c_char)
                     .to_string_lossy()
                     .into_owned()
             }
@@ -300,23 +364,6 @@ impl std::fmt::Debug for BuiltinFn {
             .field("name", &name)
             .field("func", &(self.func as usize))
             .finish()
-    }
-}
-
-impl BuiltinFn {
-    /// 获取函数名的 &str（unsafe，因为从裸指针构造）
-    ///
-    /// 安全性：name 必须是有效的 NUL 终止 C 字符串指针
-    pub fn name_str(&self) -> &'static str {
-        if self.name.is_null() {
-            ""
-        } else {
-            unsafe {
-                std::ffi::CStr::from_ptr(self.name as *const std::ffi::c_char)
-                    .to_str()
-                    .unwrap_or("")
-            }
-        }
     }
 }
 

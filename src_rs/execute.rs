@@ -4442,25 +4442,107 @@ impl VmExecutor {
         // LClosure 是最常见的调用对象, 且不经过 __call 元方法循环。
         // 直接从栈提取 Rc::clone(closure), 跳过 TValue::clone 的 discriminant match +
         // Rc incq + 构造新 TValue 开销。慢路径 (Table/__call/BuiltinFn 等) 仍走原逻辑。
-        let fast_lclosure: Option<Rc<LClosure>> = {
+        //
+        // perf: pure BuiltinFn 快速路径 — 在 LClosure 探测同一处栈读取中检查
+        // BuiltinFn(pure)。math.sin 等纯函数调用是浮点热循环的主体, 提前到此可省去
+        // 慢路径的第二次栈读 + TValue clone + __call 循环匹配 + match func_val 分发,
+        // 剩余仅: is_pure 位测试 + hook_mask 检查 + 函数指针调用。
+        // (成功时不维护 CallInfoEntry; 错误时慢路径补推; hook 启用时回退慢路径)
+        // perf: 单次栈读分发 — LClosure 走快速路径 (Rc::clone 后帧建立),
+        // pure BuiltinFn 走零簿记快速路径 (BuiltinFn 是 Copy, 提取后立即释放
+        // 栈借用再调用, 避免可变借用冲突), 其余走 op_call_generic 慢路径。
+        // pure 路径成功时: 无 CallInfoEntry push/pop、无 name_str() strlen、
+        // 无 TValue clone — 与 C precallC 开销同级; 错误时补推 entry,
+        // traceback / debug.getinfo 语义不变。
+        let func_is_lclosure: Option<Rc<LClosure>> = {
             let func_at_a = Self::read_stack(state, a);
-            if let TValue::LClosure(ref closure) = func_at_a {
-                Some(Rc::clone(closure))
-            } else {
-                None
+            match func_at_a {
+                TValue::LClosure(closure) => Some(Rc::clone(closure)),
+                _ => None,
             }
         };
+        if let Some(closure) = func_is_lclosure {
+            return Self::op_call_lclosure(state, a, b, c, closure);
+        }
 
-        if let Some(closure) = fast_lclosure {
+        // pure BuiltinFn 探测: BuiltinFn 是 Copy, 提取所需字段后结束栈借用
+        let pure_bf: Option<crate::objects::BuiltinFn> = {
+            let func_at_a = Self::read_stack(state, a);
+            match func_at_a {
+                TValue::BuiltinFn(bf) if bf.is_pure() && state.hook_mask & 3 == 0 => Some(*bf),
+                _ => None,
+            }
+        };
+        if let Some(bf) = pure_bf {
             let nargs = if b == 0 {
-                // perf: 用 state.top 而非 state.stack.len() — smart_clear_stack 不截断 Vec
                 state.top.saturating_sub(a + 1)
             } else {
                 b.saturating_sub(1)
             };
-            let nresults = c - 1; // -1 表示 MULTRET (对应 C 的 nresults = GETARG_C(i) - 1)
-                                  // perf: 不再 Rc::clone(&closure.proto) — 直接访问 closure.proto 字段
-                                  // closure 在下方被 move 进 CallInfoEntry, 移动后需要的值提前缓存
+            let nresults = if c == 0 { -1 } else { c - 1 };
+            match (bf.func)(state, a, nargs, nresults) {
+                Ok(()) => {
+                    state.pc += 1;
+                    return Ok(());
+                }
+                Err(VmError::Yield(values)) => {
+                    // 防御: 被误标 pure 的函数 yield — 补推 CallInfoEntry 后按
+                    // impure 慢路径语义传播 yield (call_info 保留供 resume 使用,
+                    // 对应 op_call_generic 的 is_yield 分支: 不 pop、不截断)
+                    state.call_info.push(crate::state::CallInfoEntry {
+                        is_c: true,
+                        closure: None,
+                        base: a + 1,
+                        saved_pc: state.pc,
+                        name: Some(bf.name_str()),
+                        namewhat: "function",
+                        proto_flag: state.proto_flag,
+                        nextraargs: state.nextraargs,
+                        is_tailcall: false,
+                    });
+                    return Err(VmError::Yield(values));
+                }
+                Err(e) => {
+                    // 补推 CallInfoEntry 供 traceback / debug.getinfo 读取
+                    state.call_info.push(crate::state::CallInfoEntry {
+                        is_c: true,
+                        closure: None,
+                        base: a + 1,
+                        saved_pc: state.pc,
+                        name: Some(bf.name_str()),
+                        namewhat: "function",
+                        proto_flag: state.proto_flag,
+                        nextraargs: state.nextraargs,
+                        is_tailcall: false,
+                    });
+                    return Err(e);
+                }
+            }
+        }
+
+        // 慢路径: Table/__call / impure BuiltinFn / RustClosure / LCFn / CClosure / 错误
+        Self::op_call_generic(state, a, b, c)
+    }
+
+    /// op_call 的 LClosure 路径 — Lua 函数调用帧建立。
+    /// 从 op_call 快速路径进入 (closure 已从栈提取, Rc 已 +1)。
+    #[inline(never)]
+    fn op_call_lclosure(
+        state: &mut LuaState,
+        a: usize,
+        b: usize,
+        c: i32,
+        closure: Rc<LClosure>,
+    ) -> Result<(), VmError> {
+        let nargs = if b == 0 {
+            // perf: 用 state.top 而非 state.stack.len() — smart_clear_stack 不截断 Vec
+            state.top.saturating_sub(a + 1)
+        } else {
+            b.saturating_sub(1)
+        };
+        let nresults = c - 1; // -1 表示 MULTRET (对应 C 的 nresults = GETARG_C(i) - 1)
+        // perf: 不再 Rc::clone(&closure.proto) — 直接访问 closure.proto 字段
+        // closure 在下方被 move 进 CallInfoEntry, 移动后需要的值提前缓存
             let upvals = Rc::clone(&closure.upvals);
             let fsize = closure.proto.max_stack_size as usize;
             let nfixparams = closure.proto.num_params as usize;
@@ -4561,10 +4643,18 @@ impl VmExecutor {
                     Self::call_hook(state, "call", -1, None, 1, nfixparams as i32)?;
                 }
             }
-            return Ok(());
-        }
+        Ok(())
+    }
 
-        // 慢路径: Table (__call 元方法) / BuiltinFn / RustClosure / LCFn / CClosure / 错误
+    /// op_call 慢路径 — Table/__call/impure BuiltinFn/RustClosure/LCFn/CClosure/错误。
+    /// 从 op_call 快速路径兜底进入, 完整流程与原 op_call 慢路径一致。
+    #[inline(never)]
+    fn op_call_generic(
+        state: &mut LuaState,
+        a: usize,
+        mut b: usize,
+        c: i32,
+    ) -> Result<(), VmError> {
         let mut func_val = Self::read_stack(state, a).clone();
 
         // __call 元方法支持 — 对应 C 的 luaT_tryfuncTM + precall 的 goto retry
@@ -4738,18 +4828,53 @@ impl VmExecutor {
             TValue::BuiltinFn(_) | TValue::RustClosure(_) => {
                 // Rust 原生函数派发（BuiltinFn 无状态，RustClosure 携带 upvalues）
                 // 直接调用函数指针，无需 tag 范围匹配
-                // 性能：~5-10 cycles（与 C Lua 持平），比 LightUserData tag 派发快 2-3 倍
-                let (func, name) = match &func_val {
-                    TValue::BuiltinFn(bf) => (bf.func, bf.name_str()),
-                    TValue::RustClosure(rc) => (rc.func, rc.name_str()),
-                    _ => unreachable!(),
-                };
+                //
+                // perf: pure 快速路径 — BuiltinFn::pure 声明的纯函数
+                // (math.sin 等: 不回调 Lua / 不 yield / 错误仅返回 Err) 成功时
+                // 完全跳过 CallInfoEntry push/pop (~72B 结构体写往返, ~20ns/次)
+                // 与 name_str() strlen。错误时在慢路径补推 entry, traceback 语义不变。
+                // impure 函数 (可能回调 Lua/yield) 仍走原完整路径。
                 let nargs = if b == 0 {
                     state.top.saturating_sub(a + 1)
                 } else {
                     b.saturating_sub(1)
                 };
                 let nresults: i32 = if c == 0 { -1 } else { c - 1 };
+
+                if let TValue::BuiltinFn(bf) = &func_val {
+                    if bf.is_pure() && state.hook_mask & 3 == 0 {
+                        // hook_mask&1 (call) 或 &2 (return) 任一启用时不能走快速路径:
+                        // hook 需要 call_info 中存在 C 帧
+                        match (bf.func)(state, a, nargs, nresults) {
+                            Ok(()) => {
+                                state.pc += 1;
+                                return Ok(());
+                            }
+                            Err(VmError::Yield(_)) => unreachable!("pure function cannot yield"),
+                            Err(e) => {
+                                // 补推 CallInfoEntry 供 traceback/getinfo 读取
+                                state.call_info.push(crate::state::CallInfoEntry {
+                                    is_c: true,
+                                    closure: None,
+                                    base: a + 1,
+                                    saved_pc: state.pc,
+                                    name: Some(bf.name_str()),
+                                    namewhat: "function",
+                                    proto_flag: state.proto_flag,
+                                    nextraargs: state.nextraargs,
+                                    is_tailcall: false,
+                                });
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+
+                let (func, name) = match &func_val {
+                    TValue::BuiltinFn(bf) => (bf.func, bf.name_str()),
+                    TValue::RustClosure(rc) => (rc.func, rc.name_str()),
+                    _ => unreachable!(),
+                };
 
                 // 推入 CallInfoEntry（对应 C 的 luaD_precall -> inc_ci）
                 // name 直接从函数取，无需调用 get_func_name
@@ -5196,15 +5321,59 @@ impl VmExecutor {
             TValue::BuiltinFn(_) | TValue::RustClosure(_) => {
                 // TAILCALL Rust 原生函数: 调用后结果放在 a 位置，后续 RETURN 处理返回
                 // 对应 C 的 luaD_callnoyield + precallC + poscall（nresults=-1 由 RETURN 调整）
-                let (func, name) = match &func_val {
-                    TValue::BuiltinFn(bf) => (bf.func, bf.name_str()),
-                    TValue::RustClosure(rc) => (rc.func, rc.name_str()),
-                    _ => unreachable!(),
-                };
                 let nargs = if b == 0 {
                     state.top.saturating_sub(a + 1)
                 } else {
                     b.saturating_sub(1)
+                };
+
+                // perf: pure 快速路径 (同 op_call) — 成功时跳过 CallInfoEntry
+                // push/pop 与 name_str()。TAILCALL 的 nresults 恒为 -1 (由后续
+                // RETURN 调整), pure 函数成功时结果已在栈上, 直接放行。
+                if let TValue::BuiltinFn(bf) = &func_val {
+                    if bf.is_pure() && state.hook_mask & 3 == 0 {
+                        match (bf.func)(state, a, nargs, -1) {
+                            Ok(()) => {
+                                state.pc += 1;
+                                return Ok(());
+                            }
+                            Err(VmError::Yield(values)) => {
+                                // 防御: 被误标 pure 的函数 yield — 补推 entry 后传播
+                                state.call_info.push(crate::state::CallInfoEntry {
+                                    is_c: true,
+                                    closure: None,
+                                    base: a + 1,
+                                    saved_pc: state.pc,
+                                    name: Some(bf.name_str()),
+                                    namewhat: "function",
+                                    proto_flag: state.proto_flag,
+                                    nextraargs: state.nextraargs,
+                                    is_tailcall: false,
+                                });
+                                return Err(VmError::Yield(values));
+                            }
+                            Err(e) => {
+                                state.call_info.push(crate::state::CallInfoEntry {
+                                    is_c: true,
+                                    closure: None,
+                                    base: a + 1,
+                                    saved_pc: state.pc,
+                                    name: Some(bf.name_str()),
+                                    namewhat: "function",
+                                    proto_flag: state.proto_flag,
+                                    nextraargs: state.nextraargs,
+                                    is_tailcall: false,
+                                });
+                                return Err(e);
+                            }
+                        }
+                    }
+                }
+
+                let (func, name) = match &func_val {
+                    TValue::BuiltinFn(bf) => (bf.func, bf.name_str()),
+                    TValue::RustClosure(rc) => (rc.func, rc.name_str()),
+                    _ => unreachable!(),
                 };
                 // 推入 CallInfoEntry（与 op_call 一致，但 nresults=-1 表示 MULTRET，
                 // 由后续 RETURN 指令根据返回值数量调整）
@@ -5673,6 +5842,7 @@ impl VmExecutor {
 
     // ---- 循环 ----
 
+    #[cfg_attr(not(size_optimized), inline)]
     fn op_forloop(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let ra = Self::ra(state, inst);
 

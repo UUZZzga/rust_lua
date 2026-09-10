@@ -595,8 +595,12 @@ fn push_results(state: &mut LuaState, a: usize, nresults: i32, results: Vec<TVal
 }
 
 /// 将单个结果压入栈
+///
+/// perf: 直接走 state.adjust_single_result (零堆分配)。
+/// 原实现经 push_results → adjust_results(a, nresults, vec![result]),
+/// 每次调用一次 1 元素 Vec 堆分配 + 释放。
 fn push_single_result(state: &mut LuaState, a: usize, nresults: i32, result: TValue) {
-    push_results(state, a, nresults, vec![result]);
+    state.adjust_single_result(a, nresults, result);
 }
 
 /// 从栈中读取数字参数 (整数或浮点)
@@ -667,23 +671,87 @@ fn get_int_arg(state: &LuaState, a: usize, idx: usize, fname: &str) -> Result<i6
 // ============================================================================
 
 /// math.abs(v) — 对应 C 的 math_abs
+///
+/// perf: 直接栈读 + 单次 match, 错误构造走 #[cold] 路径 (同 call_simple_unary)
 fn call_abs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'abs' (number expected, got no value)".to_string(),
         ));
     }
-    let v = get_number_arg(state, a, 0, "abs")?;
-    match math_abs(&v) {
-        Ok(result) => {
-            push_single_result(state, a, nresults, result);
-            Ok(())
+    let arg = &state.stack[a + 1];
+    match arg {
+        TValue::Integer(i) => {
+            state.adjust_single_result(a, nresults, TValue::Integer(i.wrapping_abs()));
         }
-        Err(msg) => Err(VmError::RuntimeError(msg)),
+        TValue::Float(f) => {
+            state.adjust_single_result(a, nresults, TValue::Float(f.abs()));
+        }
+        other => {
+            // 慢路径: 字符串参数按 get_number_arg 语义转换 — "42" → Integer(42)
+            // (整数字符串优先解析为整数, 与原实现及 C 的 lua_tonumber 一致)
+            let v = match other {
+                TValue::Str(s) => {
+                    let s = s.as_str();
+                    if let Ok(i) = s.parse::<i64>() {
+                        TValue::Integer(i)
+                    } else if let Some(f) = crate::float_utils::f64_from_str(s) {
+                        TValue::Float(f)
+                    } else {
+                        return Err(VmError::RuntimeError(format!(
+                            "bad argument #1 to 'abs' (number expected, got string '{}')",
+                            s
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(VmError::RuntimeError(format!(
+                        "bad argument #1 to 'abs' (number expected, got {})",
+                        crate::tm::obj_type_name(other)
+                    )))
+                }
+            };
+            let result = math_abs(&v).map_err(VmError::RuntimeError)?;
+            state.adjust_single_result(a, nresults, result);
+        }
+    }
+    Ok(())
+}
+
+/// 一元浮点参数的慢速转换 — 冷路径 (字符串转数字 / 类型错误)
+///
+/// perf: 从 call_simple_unary 热路径拆出, 避免热路径携带 format! 与字符串解析代码
+#[cold]
+#[inline(never)]
+fn unary_slow_convert(v: &TValue, fname: &str) -> Result<f64, VmError> {
+    match v {
+        TValue::Str(s) => {
+            let s = s.as_str();
+            crate::float_utils::f64_from_str(s)
+                .or_else(|| s.parse::<i64>().ok().map(|i| i as f64))
+                .ok_or_else(|| {
+                    VmError::RuntimeError(format!(
+                        "bad argument #1 to '{}' (number expected, got string)",
+                        fname
+                    ))
+                })
+        }
+        _ => Err(VmError::RuntimeError(format!(
+            "bad argument #1 to '{}' (number expected, got {})",
+            fname,
+            crate::tm::obj_type_name(v)
+        ))),
     }
 }
 
 /// 通用一元浮点函数派发 — 用于 sin/cos/tan/asin/acos/deg/rad/exp/sqrt
+///
+/// perf: 热路径零分配零冗余匹配 —
+/// - 直接索引 state.stack[a+1] (nargs>=1 时 VM 保证参数在栈上), 不经 get_arg 的
+///   clone + 边界分支;
+/// - 单次 match 同时完成 Integer/Float 提取 (原 get_number_arg + to_float 两轮 match);
+/// - adjust_single_result 替代 push_single_result (原 vec![result] 每次调用一次堆分配);
+/// - 错误消息构造全部推入 #[cold] 路径。
 fn call_simple_unary(
     state: &mut LuaState,
     a: usize,
@@ -698,10 +766,13 @@ fn call_simple_unary(
             fname
         )));
     }
-    let v = get_number_arg(state, a, 0, fname)?;
-    let x = to_float(&v).map_err(|msg| VmError::RuntimeError(msg))?;
-    let result = f(x);
-    push_single_result(state, a, nresults, TValue::Float(result));
+    let arg = &state.stack[a + 1];
+    let x = match arg {
+        TValue::Float(fl) => *fl,
+        TValue::Integer(i) => *i as f64,
+        other => unary_slow_convert(other, fname)?,
+    };
+    state.adjust_single_result(a, nresults, TValue::Float(f(x)));
     Ok(())
 }
 
@@ -735,42 +806,58 @@ fn call_sqrt(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 }
 
 /// math.atan(y [, x]) — 对应 C 的 math_atan
+///
+/// perf: 直接栈读 + 单次 match (同 call_simple_unary), 零 clone 零堆分配
 fn call_atan(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'atan' (number expected, got no value)".to_string(),
         ));
     }
-    let yv = get_number_arg(state, a, 0, "atan")?;
-    let y = to_float(&yv).map_err(|msg| VmError::RuntimeError(msg))?;
+    let y = match &state.stack[a + 1] {
+        TValue::Float(fl) => *fl,
+        TValue::Integer(i) => *i as f64,
+        other => unary_slow_convert(other, "atan")?,
+    };
     let x = if nargs >= 2 {
-        let xv = get_number_arg(state, a, 1, "atan")?;
-        Some(to_float(&xv).map_err(|msg| VmError::RuntimeError(msg))?)
+        match &state.stack[a + 2] {
+            TValue::Float(fl) => Some(*fl),
+            TValue::Integer(i) => Some(*i as f64),
+            other => Some(unary_slow_convert(other, "atan")?),
+        }
     } else {
         None
     };
     let result = math_atan(y, x);
-    push_single_result(state, a, nresults, TValue::Float(result));
+    state.adjust_single_result(a, nresults, TValue::Float(result));
     Ok(())
 }
 
 /// math.log(x [, base]) — 对应 C 的 math_log
+///
+/// perf: 直接栈读 + 单次 match (同 call_simple_unary), 零 clone 零堆分配
 fn call_log(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'log' (number expected, got no value)".to_string(),
         ));
     }
-    let xv = get_number_arg(state, a, 0, "log")?;
-    let x = to_float(&xv).map_err(|msg| VmError::RuntimeError(msg))?;
+    let x = match &state.stack[a + 1] {
+        TValue::Float(fl) => *fl,
+        TValue::Integer(i) => *i as f64,
+        other => unary_slow_convert(other, "log")?,
+    };
     let base = if nargs >= 2 {
-        let bv = get_number_arg(state, a, 1, "log")?;
-        Some(to_float(&bv).map_err(|msg| VmError::RuntimeError(msg))?)
+        match &state.stack[a + 2] {
+            TValue::Float(fl) => Some(*fl),
+            TValue::Integer(i) => Some(*i as f64),
+            other => Some(unary_slow_convert(other, "log")?),
+        }
     } else {
         None
     };
     let result = math_log(x, base);
-    push_single_result(state, a, nresults, TValue::Float(result));
+    state.adjust_single_result(a, nresults, TValue::Float(result));
     Ok(())
 }
 
@@ -1045,16 +1132,16 @@ pub fn open_math_lib(state: &mut LuaState) {
     let lib = Table::new();
 
     // 注册所有数学库函数 (使用 BuiltinFn 函数指针)
+    //
+    // perf: math 库全部函数注册为 pure — 均不回调 Lua / 不 yield /
+    // 参数错误直接返回 Err，op_call 成功路径可跳过 CallInfoEntry push/pop。
     let register =
         |lib: &Table, name: &'static std::ffi::CStr, func: crate::objects::BuiltinFnPtr| {
             let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
             let name_ptr = name.as_ptr() as *const u8;
             lib.set(
                 key,
-                TValue::BuiltinFn(BuiltinFn {
-                    func,
-                    name: name_ptr,
-                }),
+                TValue::BuiltinFn(BuiltinFn::pure(func, name_ptr)),
             );
         };
 

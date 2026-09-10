@@ -627,10 +627,7 @@ fn call_codes(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
 
     // 返回 BuiltinFn 迭代器（strict 或 lax）
     let iter_fn = if lax { call_iter_lax } else { call_iter_strict };
-    let iter_val = TValue::BuiltinFn(BuiltinFn {
-        func: iter_fn,
-        name: c"iter".as_ptr() as *const u8,
-    });
+    let iter_val = TValue::BuiltinFn(BuiltinFn::impure(iter_fn, c"iter".as_ptr() as *const u8));
     let s_val = state.stack[a + 1].clone();
     let init_pos = TValue::Integer(0);
 
@@ -764,10 +761,7 @@ pub fn create_utf8_lib_table(state: &LuaState) -> crate::table::Table {
         let name_ptr = name.as_ptr() as *const u8;
         lib.set(
             key,
-            TValue::BuiltinFn(BuiltinFn {
-                func,
-                name: name_ptr,
-            }),
+            TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)),
         );
     };
 
