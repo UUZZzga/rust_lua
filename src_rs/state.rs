@@ -285,6 +285,12 @@ pub struct LuaState {
     // 执行上下文（原 VmState）
     // Rc<Vec> 避免 op_call 中深拷贝 proto 字段（perf: 省 ~5.3% malloc+memmove）
     pub constants: Rc<Vec<TValue>>,
+    /// 纯 BuiltinFn 函数指针集合（math.sin 等） — op_call/op_tailcall 据此走
+    /// 无 CallInfoEntry 快速路径。以指针值为键（地址语义），FxHash 降低
+    /// contains 开销到 ~5ns/次。Rc 共享：协程线程与主状态共享同一集合。
+    /// 为什么不用 BuiltinFn.name 指针位 0 当标志: CStr 静态字面量仅
+    /// 1 字节对齐, 指针奇偶不可控 (Linux 链接器实测为奇数导致 name 损坏)。
+    pub pure_fns: std::rc::Rc<hashbrown::HashSet<usize, crate::objects::FxBuildHasher>>,
     pub code: Rc<Vec<Instruction>>,
     pub upval_descs: Rc<Vec<UpvalDesc>>,
     /// 当前执行函数的子原型列表 — Rc 共享，op_call 切换 proto 时 O(1) 引用计数
@@ -667,6 +673,9 @@ impl LuaState {
 
         LuaState {
             constants: Rc::new(Vec::new()),
+            pure_fns: std::rc::Rc::new(hashbrown::HashSet::with_hasher(
+                crate::objects::FxBuildHasher::default(),
+            )),
             code: Rc::new(Vec::new()),
             upval_descs: Rc::new(Vec::new()),
             protos: Rc::new(Vec::new()),
@@ -862,6 +871,9 @@ impl LuaState {
 
         let state = LuaState {
             constants: Rc::new(Vec::new()),
+            pure_fns: std::rc::Rc::new(hashbrown::HashSet::with_hasher(
+                crate::objects::FxBuildHasher::default(),
+            )),
             code: Rc::new(Vec::new()),
             upval_descs: Rc::new(Vec::new()),
             protos: Rc::new(Vec::new()),
@@ -1006,6 +1018,9 @@ impl LuaState {
 
             // === 独立字段（执行栈和函数上下文）===
             constants: Rc::new(Vec::new()),
+            pure_fns: std::rc::Rc::new(hashbrown::HashSet::with_hasher(
+                crate::objects::FxBuildHasher::default(),
+            )),
             code: Rc::new(Vec::new()),
             upval_descs: Rc::new(Vec::new()),
             protos: Rc::new(Vec::new()),
@@ -1130,6 +1145,9 @@ impl LuaState {
 
         LuaState {
             constants: proto.constants.clone(),
+            pure_fns: std::rc::Rc::new(hashbrown::HashSet::with_hasher(
+                crate::objects::FxBuildHasher::default(),
+            )),
             code: proto.code.clone(),
             upval_descs: proto.upvalues.clone(),
             protos: proto.protos.clone(),

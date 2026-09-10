@@ -4469,7 +4469,7 @@ impl VmExecutor {
         let pure_bf: Option<crate::objects::BuiltinFn> = {
             let func_at_a = Self::read_stack(state, a);
             match func_at_a {
-                TValue::BuiltinFn(bf) if bf.is_pure() && state.hook_mask & 3 == 0 => Some(*bf),
+                TValue::BuiltinFn(bf) if state.pure_fns.contains(&(bf.func as usize)) && state.hook_mask & 3 == 0 => Some(*bf),
                 _ => None,
             }
         };
@@ -4841,34 +4841,6 @@ impl VmExecutor {
                 };
                 let nresults: i32 = if c == 0 { -1 } else { c - 1 };
 
-                if let TValue::BuiltinFn(bf) = &func_val {
-                    if bf.is_pure() && state.hook_mask & 3 == 0 {
-                        // hook_mask&1 (call) 或 &2 (return) 任一启用时不能走快速路径:
-                        // hook 需要 call_info 中存在 C 帧
-                        match (bf.func)(state, a, nargs, nresults) {
-                            Ok(()) => {
-                                state.pc += 1;
-                                return Ok(());
-                            }
-                            Err(VmError::Yield(_)) => unreachable!("pure function cannot yield"),
-                            Err(e) => {
-                                // 补推 CallInfoEntry 供 traceback/getinfo 读取
-                                state.call_info.push(crate::state::CallInfoEntry {
-                                    is_c: true,
-                                    closure: None,
-                                    base: a + 1,
-                                    saved_pc: state.pc,
-                                    name: Some(bf.name_str()),
-                                    namewhat: "function",
-                                    proto_flag: state.proto_flag,
-                                    nextraargs: state.nextraargs,
-                                    is_tailcall: false,
-                                });
-                                return Err(e);
-                            }
-                        }
-                    }
-                }
 
                 let (func, name) = match &func_val {
                     TValue::BuiltinFn(bf) => (bf.func, bf.name_str()),
@@ -5185,8 +5157,6 @@ impl VmExecutor {
         } else {
             b = state.top.saturating_sub(a);
         }
-        let mut func_val = Self::read_stack(state, a).clone();
-
         // 对应 C 的 OP_TAILCALL: if (TESTARG_k(i)) luaF_closeupval(L, base);
         // K 标志位表示可能有 open upvalues,必须在移动栈数据之前关闭,
         // 否则 open upvalue 指向的栈位置会被覆盖,导致 upvalue 值错误
@@ -5194,6 +5164,68 @@ impl VmExecutor {
         if opcodes::testarg_k(inst) {
             crate::func::close(state, state.base, 0, 0)?;
         }
+
+        // perf: pure BuiltinFn 快速路径 (同 op_call) — close 之后判断。
+        // 成功时跳过 __call 循环 + TValue clone + CallInfoEntry push/pop;
+        // 结果留在栈上由后续 RETURN 调整 (对应 C precallC + poscall 由 RETURN 执行)。
+        // BuiltinFn 是 Copy, 提取后结束栈借用, 再调用避免借用冲突。
+        let pure_bf: Option<crate::objects::BuiltinFn> = {
+            let func_at_a = Self::read_stack(state, a);
+            match func_at_a {
+                TValue::BuiltinFn(bf)
+                    if state.pure_fns.contains(&(bf.func as usize))
+                        && state.hook_mask & 3 == 0 =>
+                {
+                    Some(*bf)
+                }
+                _ => None,
+            }
+        };
+        if let Some(bf) = pure_bf {
+            let nargs = if b == 0 {
+                state.top.saturating_sub(a + 1)
+            } else {
+                b.saturating_sub(1)
+            };
+            match (bf.func)(state, a, nargs, -1) {
+                Ok(()) => {
+                    state.pc += 1;
+                    return Ok(());
+                }
+                Err(VmError::Yield(values)) => {
+                    // 防御: 被误标 pure 的函数 yield — 补推 entry 后传播
+                    state.call_info.push(crate::state::CallInfoEntry {
+                        is_c: true,
+                        closure: None,
+                        base: a + 1,
+                        saved_pc: state.pc,
+                        name: Some(bf.name_str()),
+                        namewhat: "function",
+                        proto_flag: state.proto_flag,
+                        nextraargs: state.nextraargs,
+                        is_tailcall: false,
+                    });
+                    return Err(VmError::Yield(values));
+                }
+                Err(e) => {
+                    // 补推 CallInfoEntry 供 traceback/getinfo 读取
+                    state.call_info.push(crate::state::CallInfoEntry {
+                        is_c: true,
+                        closure: None,
+                        base: a + 1,
+                        saved_pc: state.pc,
+                        name: Some(bf.name_str()),
+                        namewhat: "function",
+                        proto_flag: state.proto_flag,
+                        nextraargs: state.nextraargs,
+                        is_tailcall: false,
+                    });
+                    return Err(e);
+                }
+            }
+        }
+
+        let mut func_val = Self::read_stack(state, a).clone();
 
         // __call 元方法支持 — 对应 C 的 luaT_tryfuncTM + precall 的 goto retry
         // (同 op_call 的处理,循环解析 __call 链,处理嵌套 __call 表)
@@ -5330,45 +5362,6 @@ impl VmExecutor {
                 // perf: pure 快速路径 (同 op_call) — 成功时跳过 CallInfoEntry
                 // push/pop 与 name_str()。TAILCALL 的 nresults 恒为 -1 (由后续
                 // RETURN 调整), pure 函数成功时结果已在栈上, 直接放行。
-                if let TValue::BuiltinFn(bf) = &func_val {
-                    if bf.is_pure() && state.hook_mask & 3 == 0 {
-                        match (bf.func)(state, a, nargs, -1) {
-                            Ok(()) => {
-                                state.pc += 1;
-                                return Ok(());
-                            }
-                            Err(VmError::Yield(values)) => {
-                                // 防御: 被误标 pure 的函数 yield — 补推 entry 后传播
-                                state.call_info.push(crate::state::CallInfoEntry {
-                                    is_c: true,
-                                    closure: None,
-                                    base: a + 1,
-                                    saved_pc: state.pc,
-                                    name: Some(bf.name_str()),
-                                    namewhat: "function",
-                                    proto_flag: state.proto_flag,
-                                    nextraargs: state.nextraargs,
-                                    is_tailcall: false,
-                                });
-                                return Err(VmError::Yield(values));
-                            }
-                            Err(e) => {
-                                state.call_info.push(crate::state::CallInfoEntry {
-                                    is_c: true,
-                                    closure: None,
-                                    base: a + 1,
-                                    saved_pc: state.pc,
-                                    name: Some(bf.name_str()),
-                                    namewhat: "function",
-                                    proto_flag: state.proto_flag,
-                                    nextraargs: state.nextraargs,
-                                    is_tailcall: false,
-                                });
-                                return Err(e);
-                            }
-                        }
-                    }
-                }
 
                 let (func, name) = match &func_val {
                     TValue::BuiltinFn(bf) => (bf.func, bf.name_str()),

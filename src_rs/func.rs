@@ -473,6 +473,9 @@ mod tests {
             twups_linked: false,
             is_in_twups: false,
             constants: Rc::new(Vec::new()),
+            pure_fns: std::rc::Rc::new(hashbrown::HashSet::with_hasher(
+                crate::objects::FxBuildHasher::default(),
+            )),
             code: Rc::new(Vec::new()),
             upval_descs: Rc::new(Vec::new()),
             protos: Rc::new(Vec::new()),

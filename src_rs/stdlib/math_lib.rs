@@ -16,6 +16,7 @@ use crate::execute::VmError;
 use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
 use crate::table::Table;
+use std::rc::Rc;
 
 // ============================================================================
 // 常量
@@ -1133,15 +1134,20 @@ pub fn open_math_lib(state: &mut LuaState) {
 
     // 注册所有数学库函数 (使用 BuiltinFn 函数指针)
     //
-    // perf: math 库全部函数注册为 pure — 均不回调 Lua / 不 yield /
-    // 参数错误直接返回 Err，op_call 成功路径可跳过 CallInfoEntry push/pop。
-    let register =
+    // perf: math 库全部函数登记为 pure — 均不回调 Lua / 不 yield /
+    // 参数错误直接返回 Err，op_call/op_tailcall 成功路径可跳过
+    // CallInfoEntry push/pop。pure 标志存于 state.pure_fns (按 func 指针值),
+    // 不借用 name 指针位。登记用 Rc::make_mut (open 时唯一引用, 注册后才
+    // 被协程线程共享)。
+    let mut pure_ptrs: Vec<usize> = Vec::new();
+    let mut register =
         |lib: &Table, name: &'static std::ffi::CStr, func: crate::objects::BuiltinFnPtr| {
             let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
             let name_ptr = name.as_ptr() as *const u8;
+            pure_ptrs.push(func as usize);
             lib.set(
                 key,
-                TValue::BuiltinFn(BuiltinFn::pure(func, name_ptr)),
+                TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)),
             );
         };
 
@@ -1170,6 +1176,9 @@ pub fn open_math_lib(state: &mut LuaState) {
     register(&lib, c"type", call_type);
     register(&lib, c"random", call_random);
     register(&lib, c"randomseed", call_randomseed);
+    // 登记全部 math 函数为 pure（open_math_lib 时 state.pure_fns 尚无共享者,
+    // make_mut 不会 clone 集合）
+    Rc::make_mut(&mut state.pure_fns).extend(pure_ptrs.iter().copied());
 
     // 设置常量 (对应 C 的 lua_pushnumber/lua_pushinteger + lua_setfield)
     lib.set(TValue::Str(state.intern_str("pi")), TValue::Float(PI));
