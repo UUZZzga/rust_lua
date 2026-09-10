@@ -1280,6 +1280,66 @@ impl LuaState {
         self.top = self.stack.len();
     }
 
+    /// adjust_results 的单值版本 — 消除 vec![value] 的堆分配。
+    /// 热路径（find 未命中 / gmatch 迭代结束 / 字符串库单返回值）每调用一次，
+    /// 1 元素 Vec 分配 + move 开销不可忽略（D 循环基准中每 find 一次）。
+    pub fn adjust_single_result(&mut self, a: usize, nresults: i32, result: TValue) {
+        if self.hook_mask & 2 != 0 && self.allowhook {
+            let in_op_call = self.call_info.last().map(|e| e.is_c).unwrap_or(false);
+            if in_op_call {
+                let first_result_pos = self.stack.len();
+                self.stack.push(result);
+                self.pending_return_adjust = Some((a, nresults, 1, first_result_pos));
+                self.top = self.stack.len();
+                return;
+            }
+        }
+        if nresults == 0 {
+            self.stack.truncate(a);
+        } else {
+            self.stack.truncate(a);
+            self.stack.push(result);
+            if nresults > 1 {
+                for _ in 1..nresults {
+                    self.stack.push(TValue::Nil(NilKind::Strict));
+                }
+            }
+        }
+        self.top = self.stack.len();
+    }
+
+    /// adjust_results 的双值版本 — 消除 vec![v1, v2] 堆分配（gsub 返回 热点）。
+    pub fn adjust_two_results(&mut self, a: usize, nresults: i32, v1: TValue, v2: TValue) {
+        if self.hook_mask & 2 != 0 && self.allowhook {
+            let in_op_call = self.call_info.last().map(|e| e.is_c).unwrap_or(false);
+            if in_op_call {
+                let first_result_pos = self.stack.len();
+                self.stack.push(v1);
+                self.stack.push(v2);
+                self.pending_return_adjust = Some((a, nresults, 2, first_result_pos));
+                self.top = self.stack.len();
+                return;
+            }
+        }
+        if nresults == 0 {
+            self.stack.truncate(a);
+        } else {
+            self.stack.truncate(a);
+            self.stack.push(v1);
+            if nresults == 1 {
+                self.top = self.stack.len();
+                return;
+            }
+            self.stack.push(v2);
+            if nresults > 2 {
+                for _ in 2..nresults {
+                    self.stack.push(TValue::Nil(NilKind::Strict));
+                }
+            }
+        }
+        self.top = self.stack.len();
+    }
+
     /// 与 adjust_results 类似，但结果已在栈上 [first_result_pos..first_result_pos+n_actual)。
     /// 避免创建临时 Vec（对 table.unpack 等大量结果的场景至关重要，防止 OOM）。
     pub fn adjust_results_on_stack(

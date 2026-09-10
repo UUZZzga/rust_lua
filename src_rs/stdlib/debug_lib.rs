@@ -577,6 +577,18 @@ fn call_getinfo(
         if let TValue::LClosure(closure) = &level_or_func {
             fill_info_from_closure(&mut info, closure, &what);
         }
+    } else if let TValue::RustClosure(rc) = &level_or_func {
+        // Rust 闭包 (string.gmatch 迭代器 / coroutine.wrap / io.lines):
+        // 对应 C 的 C closure — what="C", nups 为实际 upvalue 数
+        info.what = "C".to_string();
+        info.short_src = "[C]".to_string();
+        info.source = "=[C]".to_string();
+        info.currentline = -1;
+        info.nparams = 0;
+        info.isvararg = true;
+        info.name = None;
+        info.namewhat = String::new();
+        info.nups = rc.upvalues.borrow().len();
     } else if matches!(
         level_or_func,
         TValue::LightUserData(_) | TValue::BuiltinFn(_) | TValue::CClosure(_) | TValue::LCFn(_)
@@ -2225,9 +2237,20 @@ fn call_getupvalue(
             }
             Ok(())
         }
-        TValue::LightUserData(_) => {
-            // 轻量 C 函数没有上值
-            push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
+        TValue::RustClosure(rc) => {
+            // Rust 闭包（string.gmatch 迭代器 / coroutine.wrap / io.lines）。
+            // 对应 C 的 LUA_TLCL... 实际为 C 闭包语义: upvalue 名始终为空字符串。
+            let upvals = rc.upvalues.borrow();
+            if n > 0 && n <= upvals.len() {
+                push_results(
+                    state,
+                    a,
+                    nresults,
+                    vec![TValue::Str(state.intern_str("")), upvals[n - 1].clone()],
+                );
+            } else {
+                push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
+            }
             Ok(())
         }
         TValue::Table(t) => {
@@ -2336,10 +2359,19 @@ fn call_setupvalue(
             push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
             Ok(())
         }
+        TValue::RustClosure(_) => {
+            // Rust 闭包 (string.gmatch / coroutine.wrap / io.lines):
+            // upvalues 是可变状态 (pos/lastmatch 等), 但 RustClosure 用 Rc 共享,
+            // 栈上仅是 Rc 引用; 直接设置会破坏迭代器内部状态。
+            // 与旧 Table 实现行为一致: 无法设置, 返回 nil。
+            push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
+            Ok(())
+        }
         TValue::Table(t) => {
-            // 带有 __call 元方法的 Table 是可调用对象 (如 string.gmatch 返回值)
+            // 带有 __call 元方法的 Table 是可调用对象 (旧版 string.gmatch 返回值)
             // 模拟 C 闭包行为: 无法设置 upvalue, 返回 nil
-            if t.get_metatable()
+            if t
+                .get_metatable()
                 .and_then(|mt| mt.get(&TValue::Str(state.intern_str("__call"))))
                 .is_some()
             {
@@ -2386,6 +2418,20 @@ fn call_upvalueid(
                 // 使用 upvalue 的引用地址
                 let ptr = &cc.upvalue[n - 1] as *const TValue as *mut std::ffi::c_void;
                 push_single_result(state, a, nresults, TValue::LightUserData(ptr));
+            } else {
+                push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
+            }
+            Ok(())
+        }
+        TValue::RustClosure(rc) => {
+            // Rust 闭包 (string.gmatch 迭代器 / coroutine.wrap / io.lines):
+            // upvalues 存于 Rc<RefCell<Vec<TValue>>>，n 在范围内时返回
+            // 闭包指针 + n 的唯一标识（与 Table 版一致基于指针生成）。
+            let upvals = rc.upvalues.borrow();
+            if n > 0 && n <= upvals.len() {
+                let ptr = Rc::as_ptr(rc) as *mut std::ffi::c_void;
+                let id_ptr = (ptr as usize + n) as *mut std::ffi::c_void;
+                push_single_result(state, a, nresults, TValue::LightUserData(id_ptr));
             } else {
                 push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
             }
