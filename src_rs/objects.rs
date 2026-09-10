@@ -464,7 +464,6 @@ impl RustClosure {
 /// Given: 创建各种类型的 TValue
 /// When: 调用 .ty() 方法
 /// Then: 返回正确的 LuaType
-#[derive(Clone)]
 #[cfg_attr(not(size_optimized), derive(Debug))]
 pub enum TValue {
     /// nil 值，带子变体（标准 nil / 空槽 / 缺键）
@@ -529,12 +528,49 @@ pub enum NilKind {
     NotTable,
 }
 
+impl Clone for TValue {
+    /// perf: 手写 Clone — trivial 变体 (Nil/Boolean/LightUserData/Integer/Float)
+    /// 占 VM 栈/表值的绝大多数, 直接 ptr::read 位拷贝零分支;
+    /// 仅 Rc 携带变体走 derive 等价的逐变体克隆。
+    /// derive 版整体体积过大被 LLVM 拒绝内联, execute_loop 中残留
+    /// 106 处非内联 clone 调用 (每次 ~2-3ns call 开销)。
+    #[inline(always)]
+    fn clone(&self) -> Self {
+        if matches!(
+            self,
+            TValue::Nil(_)
+                | TValue::Boolean(_)
+                | TValue::LightUserData(_)
+                | TValue::Integer(_)
+                | TValue::Float(_)
+        ) {
+            // safety: trivial 变体均为 Copy 型载荷, 位拷贝即语义克隆;
+            // 枚举布局保证按值读取不产生别名问题
+            unsafe { std::ptr::read(self) }
+        } else {
+            match self {
+                TValue::Str(s) => TValue::Str(s.clone()),
+                TValue::Table(t) => TValue::Table(t.clone()),
+                TValue::LClosure(c) => TValue::LClosure(Rc::clone(c)),
+                TValue::CClosure(c) => TValue::CClosure(Rc::clone(c)),
+                TValue::LCFn(f) => TValue::LCFn(*f),
+                TValue::BuiltinFn(b) => TValue::BuiltinFn(*b),
+                TValue::RustClosure(rc) => TValue::RustClosure(Rc::clone(rc)),
+                TValue::UserData(u) => TValue::UserData(Rc::clone(u)),
+                TValue::Thread(th) => TValue::Thread(Rc::clone(th)),
+                // 下方 match 已穷尽 trivial 变体, 此分支不可达
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
 impl TValue {
     /// 获取 TValue 的 LuaType
     ///
     /// Scenario: 查询值的类型
     /// Given: 任意 TValue
-    /// When: 调用 .ty()
+    /// When: 调用 .ty() 方法
     /// Then: 返回对应的 LuaType
     pub fn ty(&self) -> LuaType {
         match self {
