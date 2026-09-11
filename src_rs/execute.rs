@@ -3445,14 +3445,20 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        let v2 = state
-            .constants
-            .get(c_key)
-            .cloned()
-            .unwrap_or(TValue::Nil(NilKind::Strict));
+        // perf: K 常量免 clone — 引用展开 (同 op_mulk)
         let v1 = Self::read_stack(state, b);
-        if v1.is_number() && v2.is_number() {
-            let result = arith_bin!(v1, &v2, +, wrapping_add);
+        let v2 = state.constants.get(c_key);
+        let result: Option<TValue> = match (v1, v2) {
+            (TValue::Float(f1), Some(TValue::Float(f2))) => Some(TValue::Float(f1 + f2)),
+            (TValue::Integer(i1), Some(TValue::Integer(i2))) => {
+                Some(TValue::Integer(i1.wrapping_add(*i2)))
+            }
+            _ => match (to_number_ns(v1), v2.and_then(to_number_ns)) {
+                (Some(n1), Some(n2)) => Some(TValue::Float(n1 + n2)),
+                _ => None,
+            },
+        };
+        if let Some(result) = result {
             Self::write_stack(state, a, result);
             state.pc += 2; // skip MMBINK
         } else {
@@ -3466,14 +3472,20 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        let v2 = state
-            .constants
-            .get(c_key)
-            .cloned()
-            .unwrap_or(TValue::Nil(NilKind::Strict));
+        // perf: K 常量免 clone — 引用展开 (同 op_mulk)
         let v1 = Self::read_stack(state, b);
-        if v1.is_number() && v2.is_number() {
-            let result = arith_bin!(v1, &v2, -, wrapping_sub);
+        let v2 = state.constants.get(c_key);
+        let result: Option<TValue> = match (v1, v2) {
+            (TValue::Float(f1), Some(TValue::Float(f2))) => Some(TValue::Float(f1 - f2)),
+            (TValue::Integer(i1), Some(TValue::Integer(i2))) => {
+                Some(TValue::Integer(i1.wrapping_sub(*i2)))
+            }
+            _ => match (to_number_ns(v1), v2.and_then(to_number_ns)) {
+                (Some(n1), Some(n2)) => Some(TValue::Float(n1 - n2)),
+                _ => None,
+            },
+        };
+        if let Some(result) = result {
             Self::write_stack(state, a, result);
             state.pc += 2; // skip MMBINK
         } else {
@@ -3487,14 +3499,21 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        let v2 = state
-            .constants
-            .get(c_key)
-            .cloned()
-            .unwrap_or(TValue::Nil(NilKind::Strict));
+        // perf: K 常量免 clone — 直接引用展开 (常量池不可变, 借用与 read_stack 兼容)。
+        // 语义对齐 arith_bin!: number*number 直接算 (含 int*int → int), 否则 Nil 走 MMBINK。
         let v1 = Self::read_stack(state, b);
-        if v1.is_number() && v2.is_number() {
-            let result = arith_bin!(v1, &v2, *, wrapping_mul);
+        let v2 = state.constants.get(c_key);
+        let result: Option<TValue> = match (v1, v2) {
+            (TValue::Float(f1), Some(TValue::Float(f2))) => Some(TValue::Float(f1 * f2)),
+            (TValue::Integer(i1), Some(TValue::Integer(i2))) => {
+                Some(TValue::Integer(i1.wrapping_mul(*i2)))
+            }
+            _ => match (to_number_ns(v1), v2.and_then(to_number_ns)) {
+                (Some(n1), Some(n2)) => Some(TValue::Float(n1 * n2)),
+                _ => None,
+            },
+        };
+        if let Some(result) = result {
             Self::write_stack(state, a, result);
             state.pc += 2; // skip MMBINK
         } else {
@@ -3502,20 +3521,28 @@ impl VmExecutor {
         }
         Ok(())
     }
-
     #[cfg_attr(not(size_optimized), inline)]
     fn op_modk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        let v2 = state
-            .constants
-            .get(c_key)
-            .cloned()
-            .unwrap_or(TValue::Nil(NilKind::Strict));
+        // perf: K 常量免 clone — 引用展开
         let v1 = Self::read_stack(state, b);
-        if v1.is_number() && v2.is_number() {
-            let result = Self::arith_mod(&v1, &v2)?;
+        let v2 = state.constants.get(c_key);
+        let result: Result<Option<TValue>, VmError> = match (v1, v2) {
+            (TValue::Integer(i1), Some(TValue::Integer(i2))) => {
+                // 除零: arith_mod 语义返回 ModuloByZero 错误 ('n%0' 消息)
+                match modulus(*i1, *i2) {
+                    Ok(r) => Ok(Some(TValue::Integer(r))),
+                    Err(_) => Err(VmError::ModuloByZero),
+                }
+            }
+            _ => match (to_number_ns(v1), v2.and_then(to_number_ns)) {
+                (Some(n1), Some(n2)) => Ok(Some(TValue::Float(modulus_float(n1, n2)))),
+                _ => Ok(None),
+            },
+        };
+        if let Some(result) = result? {
             Self::write_stack(state, a, result);
             state.pc += 2; // skip MMBINK
         } else {

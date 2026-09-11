@@ -209,6 +209,36 @@ impl Table {
         (val, has_mt)
     }
 
+    /// BuiltinFn 特化查找 — GETTABUP/GETFIELD 热路径专用。
+    ///
+    /// perf: math.sin/cos/sqrt 等库函数表访问是浮点循环的主体。BuiltinFn 是
+    /// 16B Copy, 直接拷贝返回; 免去 TValue::clone 的 enum match + Rc inc/dec
+    /// (编译器无法内联的大 sret call)。命中返回 Some(bf), 值非 BuiltinFn 或
+    /// 未命中返回 None (调用方回退 get_and_metatable)。
+    #[cfg_attr(not(size_optimized), inline)]
+    pub fn get_builtin_fn(&self, key: &TValue) -> Option<crate::objects::BuiltinFn> {
+        // 快速预检: 键必须是 interned ShortString, 表有元表时走原路径
+        // (元表 __index 可能拦截, 语义不能绕过)
+        let data = self.data_ro();
+        if data.metatable.is_some() {
+            return None;
+        }
+        let ktb = data.key_to_bucket.as_ref()?;
+        let sh = match key {
+            TValue::Str(crate::strings::LuaString::Short(ss)) => ss.hash,
+            _ => return None,
+        };
+        let hash = crate::objects::tvalue_fx_hash(key);
+        let entry = ktb.find(hash, |(k, _)| match (k, key) {
+            (TValue::Str(a), TValue::Str(b)) => a == b,
+            _ => false,
+        })?;
+        match &data.hash_buckets[entry.1].1 {
+            TValue::BuiltinFn(bf) => Some(*bf),
+            _ => None, // 非 BuiltinFn 值: 回退原路径 (保证语义一致)
+        }
+    }
+
     pub fn get(&self, key: &TValue) -> Option<TValue> {
         let data = self.data.borrow();
         match key {
