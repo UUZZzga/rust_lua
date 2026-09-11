@@ -164,13 +164,58 @@ pub type TableHashIndex = TableHashMap<usize>;
 /// 计算 TValue 的 FxHash 哈希 — 与 impl Hash for TValue + FxBuildHasher 一致。
 ///
 /// TableHashIndex 以 (hash, eq) 二元组驱动 find/insert，此函数提供 hash 侧。
-/// Str 键的 hash 在驻留时缓存于 s.hash，此处仅 2 轮 rotate-xor-mul 混合。
+/// perf: 直接展开 FxHasher 轮函数 (rotate_left(5) ^ x) * SEED, 热键类型
+/// (Str/Integer) 免泛型 Hash trait 分发。Str 键首轮 5*SEED 为编译期常量。
 #[cfg(not(size_optimized))]
 pub fn tvalue_fx_hash(v: &TValue) -> u64 {
-    use std::hash::Hasher;
-    let mut h = fx_hash_impl::FxHasherPub::default();
-    std::hash::Hash::hash(v, &mut h);
-    h.finish()
+    const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+    match v {
+        TValue::Str(s) => {
+            let h1 = 5u64.wrapping_mul(SEED);
+            let sh = match s {
+                crate::strings::LuaString::Short(ss) => ss.hash,
+                crate::strings::LuaString::Long(ls) => {
+                    if ls.extra.load(std::sync::atomic::Ordering::Relaxed) == 1 {
+                        ls.hash.load(std::sync::atomic::Ordering::Relaxed)
+                    } else {
+                        // 冷路径: 长字符串首哈希 — 走 trait Hash (含缓存写回)
+                        use std::hash::Hasher;
+                        let mut h = fx_hash_impl::FxHasherPub::default();
+                        std::hash::Hash::hash(v, &mut h);
+                        return h.finish();
+                    }
+                }
+            };
+            (h1.rotate_left(5) ^ sh).wrapping_mul(SEED)
+        }
+        TValue::Integer(i) => {
+            let h1 = 3u64.wrapping_mul(SEED);
+            (h1.rotate_left(5) ^ (*i as u64)).wrapping_mul(SEED)
+        }
+        TValue::Boolean(b) => {
+            // 对应 Hash: 1u8 + bool(u8 0/1) 两轮
+            let h1 = 1u64.wrapping_mul(SEED);
+            let h2 = (h1.rotate_left(5) ^ (*b as u64)).wrapping_mul(SEED);
+            (h2.rotate_left(5) ^ 0u64).wrapping_mul(SEED)
+        }
+        TValue::Nil(kind) => {
+            // 对应 Hash: 0u8 + NilKind(u8 枚举) 两轮
+            let kind_u8 = match kind {
+                NilKind::Strict => 0u64,
+                NilKind::Empty => 1u64,
+                NilKind::AbsentKey => 2u64,
+                NilKind::NotTable => 3u64,
+            };
+            let h2 = (0u64.rotate_left(5) ^ kind_u8).wrapping_mul(SEED);
+            (h2.rotate_left(5) ^ 0u64).wrapping_mul(SEED)
+        }
+        _ => {
+            use std::hash::Hasher;
+            let mut h = fx_hash_impl::FxHasherPub::default();
+            std::hash::Hash::hash(v, &mut h);
+            h.finish()
+        }
+    }
 }
 
 

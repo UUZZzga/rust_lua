@@ -25,7 +25,10 @@ fn ceillog2(x: u64) -> u32 {
     }
     (x - 1).ilog2() + 1
 }
-fn hash_get(td: &TableData, key: &TValue) -> Option<TValue> {
+/// 表哈希查找 — TableData 上直接单跳探测 (key_to_bucket 索引)。
+/// VM opcode 热路径 (op_getfield 等) 专用; 返回值 clone。
+#[cfg_attr(not(size_optimized), inline)]
+pub(crate) fn hash_get(td: &TableData, key: &TValue) -> Option<TValue> {
     if let Some(idx) = td.idx_get(key) {
         let v = &td.hash_buckets[idx].1;
         if !matches!(v, TValue::Nil(NilKind::Empty)) {
@@ -120,7 +123,7 @@ impl Table {
     /// Miri Tree Borrows 验证: as_ptr + 只读访问 + 立即结束生命周期,
     /// 与正常 borrow 等价但省去 borrow flag 读写 (各 1 次依赖加载 + 分支)。
     #[cfg_attr(not(size_optimized), inline(always))]
-    fn data_ro(&self) -> &TableData {
+    pub(crate) fn data_ro(&self) -> &TableData {
         unsafe { &*self.data.as_ptr() }
     }
 
