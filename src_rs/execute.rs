@@ -4457,7 +4457,7 @@ impl VmExecutor {
 
     fn op_call(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
-        let mut b = opcodes::getarg_b(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
         let c = opcodes::getarg_c(inst) as i32;
         // 对应 C 的 OP_CALL: if (b != 0) L->top.p = ra + b
         // 设置栈顶为函数+参数末尾，用于 GC 栈遍历和栈空间检查
@@ -4481,26 +4481,36 @@ impl VmExecutor {
         // pure 路径成功时: 无 CallInfoEntry push/pop、无 name_str() strlen、
         // 无 TValue clone — 与 C precallC 开销同级; 错误时补推 entry,
         // traceback / debug.getinfo 语义不变。
-        let func_is_lclosure: Option<Rc<LClosure>> = {
-            let func_at_a = Self::read_stack(state, a);
-            match func_at_a {
-                TValue::LClosure(closure) => Some(Rc::clone(closure)),
-                _ => None,
+        // perf: 单次栈读三分支探测 — LClosure / pure BuiltinFn / 其余。
+        // 两次独立 read_stack (LClosure 探测 + pure 探测) 各有一次栈访问 + match;
+        // 合并为一次读: LClosure → Rc::clone 走帧建立; pure BuiltinFn → Copy 提取
+        // 走零簿记调用; 其他 → 慢路径。BuiltinFn 分支不 clone TValue (16B Copy)。
+        let func_at_a = Self::read_stack(state, a);
+        match func_at_a {
+            TValue::LClosure(closure) => {
+                let closure = Rc::clone(closure);
+                return Self::op_call_lclosure(state, a, b, c, closure);
             }
-        };
-        if let Some(closure) = func_is_lclosure {
-            return Self::op_call_lclosure(state, a, b, c, closure);
+            TValue::BuiltinFn(bf)
+                if state.pure_fns.contains(&(bf.func as usize)) && state.hook_mask & 3 == 0 =>
+            {
+                let bf = *bf; // Copy — 借用结束
+                Self::call_pure_builtin(state, a, b, c, bf)
+            }
+            _ => Self::op_call_generic(state, a, b, c),
         }
+    }
 
-        // pure BuiltinFn 探测: BuiltinFn 是 Copy, 提取所需字段后结束栈借用
-        let pure_bf: Option<crate::objects::BuiltinFn> = {
-            let func_at_a = Self::read_stack(state, a);
-            match func_at_a {
-                TValue::BuiltinFn(bf) if state.pure_fns.contains(&(bf.func as usize)) && state.hook_mask & 3 == 0 => Some(*bf),
-                _ => None,
-            }
-        };
-        if let Some(bf) = pure_bf {
+    /// op_call 的 pure BuiltinFn 调用体 — 从单次栈读探测进入。
+    #[inline(never)]
+    fn call_pure_builtin(
+        state: &mut LuaState,
+        a: usize,
+        b: usize,
+        c: i32,
+        bf: crate::objects::BuiltinFn,
+    ) -> Result<(), VmError> {
+        {
             let nargs = if b == 0 {
                 state.top.saturating_sub(a + 1)
             } else {
@@ -4546,10 +4556,8 @@ impl VmExecutor {
                 }
             }
         }
-
-        // 慢路径: Table/__call / impure BuiltinFn / RustClosure / LCFn / CClosure / 错误
-        Self::op_call_generic(state, a, b, c)
     }
+
 
     /// op_call 的 LClosure 路径 — Lua 函数调用帧建立。
     /// 从 op_call 快速路径进入 (closure 已从栈提取, Rc 已 +1)。
