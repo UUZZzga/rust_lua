@@ -1077,44 +1077,12 @@ impl TableData {
     pub fn idx_remove(&mut self, key: &TValue) -> Option<usize> {
         self.key_to_bucket.as_mut()?.remove(key)
     }
+}
 
-    /// 索引查找 (借用版) — 返回 hash_buckets[idx].1 的引用而非 clone。
+impl Drop for TableData {
+    /// 迭代式释放，避免长链表等递归结构导致栈溢出。
     ///
-    /// 只读路径专用 (data_ro 同款安全性论证: 同步只读无重入)。
-    #[cfg(not(size_optimized))]
-    pub fn idx_get_ref(&self, key: &TValue) -> Option<&TValue> {
-        let ktb = self.key_to_bucket.as_ref()?;
-        let hash = tvalue_fx_hash(key);
-        let (_, idx) = ktb.find(hash, |(k, _)| k == key)?;
-        Some(&self.hash_buckets[*idx].1)
-    }
-
-    /// 索引查找 (LuaString 键直查借用版) — 不构造临时 TValue 键。
-    ///
-    /// 等价 idx_get_ref(&TValue::Str(s)) 但免 Str 的 Rc inc/dec。
-    /// 键的哈希直接用 Str 专化公式 (tag 5 首轮常量 + s 内容哈希缓存)。
-    #[cfg(not(size_optimized))]
-    pub fn idx_get_ref_str(&self, s: &crate::strings::LuaString) -> Option<&TValue> {
-        const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
-        let ktb = self.key_to_bucket.as_ref()?;
-        // Str 专化 hash: h1 = 5*SEED; h2 = (h1.rotl(5) ^ s_hash) * SEED
-        let sh = match s {
-            crate::strings::LuaString::Short(ss) => ss.hash,
-            _ => {
-                use std::hash::{Hash, Hasher};
-                let mut h = crate::objects::fx_hash_impl::FxHasherPub::default();
-                Hash::hash(s, &mut h);
-                h.finish()
-            }
-        };
-        let hash = (5u64.wrapping_mul(SEED).rotate_left(5) ^ sh).wrapping_mul(SEED);
-        let (_, idx) = ktb
-            .find(hash, |(k, _)| {
-                matches!(k, TValue::Str(ks) if ks == s)
-            })?;
-        Some(&self.hash_buckets[*idx].1)
-    }
-
+    /// 编译器自动生成的 Drop 会递归释放 array/hash_buckets 中的 TValue::Table，
     /// 当 Table 通过 `next` 等字段形成长链表时（如 400K+ 节点），递归深度超过
     /// 主线程 8MB 栈限制导致栈溢出。
     ///
