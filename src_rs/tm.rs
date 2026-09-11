@@ -318,18 +318,30 @@ pub fn get_tm_by_obj(
     default_mts: &DefaultMetatables,
     tmnames: &[LuaString; TM_N],
 ) -> Option<TValue> {
-    // RefCell 无法返回引用，故返回 owned TValue
-    let mt: Option<Table> = match obj {
-        TValue::Table(t) => t.get_metatable(),
-        TValue::UserData(u) => u.metatable.as_ref().map(|b| (**b).clone()),
-        _ => default_mts.get(obj.ty()).cloned(),
+    // perf: 全程零临时 clone — 元表槽借用 + tm 键直查 (免 Str Rc inc/dec)
+    // + 值借用过滤, 仅最终命中时 clone 一次。
+    // 原实现每次调用 clone 元表 Table (Rc inc) + 构造 Str 键 (Rc inc)
+    // + Table::get 内再哈希查找并 clone 值 — 三重开销。
+    let key: &LuaString = &tmnames[tm as usize];
+    let lookup = |mt: &Table| -> Option<TValue> {
+        // safety/data_ro 论证: 同步只读, 返回前完成 clone, 无重入
+        let v = mt.data_ro().idx_get_ref_str(key)?;
+        // C: notm(tm) — nil 值（含 Empty tombstone）视为无元方法
+        if v.is_nil() {
+            None
+        } else {
+            Some(v.clone())
+        }
     };
-    let mt = mt?;
-    let key = make_tm_tvalue(tmnames, tm);
-    // C: notm(tm) — ttisnil 检查，nil 值（含 Empty tombstone）视为无元方法
-    mt.get(&key).filter(|v| !v.is_nil())
+    match obj {
+        TValue::Table(t) => {
+            let data = t.data_ro();
+            lookup(data.metatable.as_ref()?)
+        }
+        TValue::UserData(u) => lookup(u.metatable.as_ref()?),
+        other => lookup(default_mts.get(other.ty())?),
+    }
 }
-
 // ============================================================================
 // TagMethodError
 // ============================================================================
