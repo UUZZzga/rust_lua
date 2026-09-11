@@ -956,15 +956,37 @@ fn call_select(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         }
     };
 
-    let args: Vec<TValue> = (1..nargs).map(|i| get_arg(state, a, i)).collect();
-    match base_select(n, &args) {
-        Ok(results) => {
-            push_results(state, a, nresults, results);
-            Ok(())
+    let nargs_after = nargs.saturating_sub(1); // 排除 first 参数后的实际参数数
+    let src_idx: usize = if n < 0 {
+        let idx = nargs_after as i64 + n;
+        if idx < 0 {
+            return Err(VmError::RuntimeError(
+                "bad argument #1 to 'select' (index out of range)".to_string(),
+            ));
         }
-        Err(msg) => Err(VmError::RuntimeError(msg)),
-    }
+        idx as usize
+    } else if n == 0 {
+        return Err(VmError::RuntimeError(
+            "bad argument #1 to 'select' (index out of range)".to_string(),
+        ));
+    } else {
+        let idx = (n - 1) as usize;
+        if idx >= nargs_after {
+            // 越界: 空结果
+            state.adjust_results(a, nresults, Vec::new());
+            return Ok(());
+        }
+        idx
+    };
+    // 结果区间 stack[a+2+src_idx .. a+1+nargs) — 移动到结果槽 a。
+    // 栈布局: [a]=fn, [a+1]=n(first 参数), [a+2..a+1+nargs]=其余参数。
+    // 语义与 base_select 对齐: args[k] 即 stack[a+2+k]。
+    let first_result_pos = a + 2 + src_idx;
+    let n_actual = a + 1 + nargs - first_result_pos;
+    state.adjust_results_on_stack(a, nresults, n_actual, first_result_pos);
+    Ok(())
 }
+
 
 /// rawequal(v1, v2) — 对应 C 的 luaB_rawequal
 fn call_rawequal(
