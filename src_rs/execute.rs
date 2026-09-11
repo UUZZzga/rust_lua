@@ -2957,6 +2957,31 @@ impl VmExecutor {
         // Split borrowing: 显式取 state 各字段引用,允许同时借用 stack/constants/closure_upvals。
         // uv_ref (RefCell::borrow) 在 block 内存活; get_and_metatable 返回 owned,
         // block 结束后释放借用,再调 write_stack。
+        // perf: BuiltinFn 特化 (math.sin 等库函数) — Copy 返回零 clone (16B)。
+        // 两段式: 借用 block 内取 BuiltinFn (Copy 借用结束仍有效), 块外写栈。
+        let builtin_bf: Option<crate::objects::BuiltinFn> = {
+            let constants = &state.constants;
+            let key_opt = constants.get(kb_idx);
+            let upvals = unsafe { &*state.closure_upvals.as_ptr() };
+            if b < upvals.len() {
+                let uv = unsafe { &*upvals[b].as_ptr() };
+                let table_ref: Option<&TValue> = match uv {
+                    UpVal::Closed { value } => Some(&**value),
+                    UpVal::Open { stack_index, .. } => state.stack.get(*stack_index),
+                };
+                match (key_opt, table_ref) {
+                    (Some(key), Some(TValue::Table(t))) => t.get_builtin_fn(key),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(bf) = builtin_bf {
+            Self::write_stack(state, a, TValue::BuiltinFn(bf));
+            state.pc += 1;
+            return Ok(());
+        }
         let fast_result: Option<Option<TValue>> = {
             let stack = &state.stack;
             let constants = &state.constants;
@@ -3114,6 +3139,22 @@ impl VmExecutor {
         // 避免每次都 clone key (Str 类型 → Rc inc/dec)。state.constants 是 Rc<Vec<TValue>>,
         // get 返回 Option<&TValue>, 与 read_stack 的 &state.stack 借用兼容 (均不可变借用)。
         // get_and_metatable 返回 owned Option<TValue>, block 结束后借用释放, 再调 write_stack。
+        // perf: BuiltinFn 特化 (math.sin 等库函数) — Copy 返回零 clone (16B)。
+        // 未命中 (非 BuiltinFn 值/元表/LongString 键) 落到下方通用路径, 语义不变。
+        let builtin_bf: Option<crate::objects::BuiltinFn> = {
+            let key_opt = state.constants.get(c_key);
+            let table_val = Self::read_stack(state, b);
+            if let (Some(key), TValue::Table(t)) = (key_opt, table_val) {
+                t.get_builtin_fn(key)
+            } else {
+                None
+            }
+        };
+        if let Some(bf) = builtin_bf {
+            Self::write_stack(state, a, TValue::BuiltinFn(bf));
+            state.pc += 1;
+            return Ok(());
+        }
         let fast_result: Option<Option<TValue>> = {
             let key_opt = state.constants.get(c_key);
             let table_val = Self::read_stack(state, b);
