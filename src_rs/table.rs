@@ -101,6 +101,45 @@ impl Table {
         self.data.borrow().metatable.as_ref().map(|b| (**b).clone())
     }
 
+    /// 按元方法名直查元表 (安全借用版, 零临时 clone) — 返回值引用。
+    ///
+    /// 用 Ref::filter_map 把 RefCell 借用收窄到命中的值槽上:
+    /// guard 全程持有 (无 unsafe, 无 data_ro), 返回 Ref<TValue>。
+    /// 查找本身用 LuaString 直查公式 (免构造 TValue 键的 Str clone)。
+    /// 未命中 (含 nil tombstone / 无元表) 返回 None。
+    /// 供 get_tm_by_obj 热路径使用。
+    #[cfg(not(size_optimized))]
+    pub fn get_tm_ref(
+        &self,
+        key: &crate::strings::LuaString,
+    ) -> Option<std::cell::Ref<'_, TValue>> {
+        let guard = self.data.borrow();
+        let r = std::cell::Ref::filter_map(guard, |d| {
+            let ktb = d.key_to_bucket.as_ref()?;
+            const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
+            let sh = match key {
+                crate::strings::LuaString::Short(ss) => ss.hash,
+                _ => {
+                    use std::hash::{Hash, Hasher};
+                    let mut h = crate::objects::fx_hash_impl::FxHasherPub::default();
+                    Hash::hash(key, &mut h);
+                    h.finish()
+                }
+            };
+            let hash = (5u64.wrapping_mul(SEED).rotate_left(5) ^ sh).wrapping_mul(SEED);
+            let (_, idx) = ktb.find(hash, |(k, _)| matches!(k, TValue::Str(ks) if ks == key))?;
+            let v = &d.hash_buckets[*idx].1;
+            // C: notm — nil (含 Empty tombstone) 视为无元方法
+            if v.is_nil() {
+                None
+            } else {
+                Some(v)
+            }
+        });
+        r.ok()
+    }
+
+
     /// 设置元表。
     pub fn set_metatable(&self, mt: Option<Table>) {
         self.data.borrow_mut().metatable = mt.map(Box::new);

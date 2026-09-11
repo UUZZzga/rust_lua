@@ -318,16 +318,31 @@ pub fn get_tm_by_obj(
     default_mts: &DefaultMetatables,
     tmnames: &[LuaString; TM_N],
 ) -> Option<TValue> {
-    // RefCell 无法返回引用，故返回 owned TValue
-    let mt: Option<Table> = match obj {
-        TValue::Table(t) => t.get_metatable(),
-        TValue::UserData(u) => u.metatable.as_ref().map(|b| (**b).clone()),
-        _ => default_mts.get(obj.ty()).cloned(),
-    };
-    let mt = mt?;
-    let key = make_tm_tvalue(tmnames, tm);
-    // C: notm(tm) — ttisnil 检查，nil 值（含 Empty tombstone）视为无元方法
-    mt.get(&key).filter(|v| !v.is_nil())
+    // perf: 零临时 clone — 元表槽借 Table (不再 clone 整个 Table, Rc inc),
+    // 元方法名 LuaString 直查 (免构造 TValue 键的 Str clone),
+    // Ref::filter_map 安全新式借用 (无 unsafe), 命中后仅 clone 一次值。
+    let key: &LuaString = &tmnames[tm as usize];
+    match obj {
+        TValue::Table(t) => {
+            // 元表槽: 外层 Table 的 data.metatable 借用 (无 Table clone)
+            let mt_guard = std::cell::Ref::filter_map(t.data.borrow(), |d| {
+                d.metatable.as_ref().map(|b| &**b)
+            })
+            .ok()?;
+            let v = mt_guard.get_tm_ref(key)?;
+            Some(v.clone())
+        }
+        TValue::UserData(u) => {
+            let mt: &Table = u.metatable.as_ref()?;
+            let v = mt.get_tm_ref(key)?;
+            Some(v.clone())
+        }
+        other => {
+            let mt: &Table = default_mts.get(other.ty())?;
+            let v = mt.get_tm_ref(key)?;
+            Some(v.clone())
+        }
+    }
 }
 
 // ============================================================================
