@@ -1301,6 +1301,7 @@ impl LuaState {
     /// adjust_results 的单值版本 — 消除 vec![value] 的堆分配。
     /// 热路径（find 未命中 / gmatch 迭代结束 / 字符串库单返回值）每调用一次，
     /// 1 元素 Vec 分配 + move 开销不可忽略（D 循环基准中每 find 一次）。
+    #[cfg_attr(not(size_optimized), inline)]
     pub fn adjust_single_result(&mut self, a: usize, nresults: i32, result: TValue) {
         if self.hook_mask & 2 != 0 && self.allowhook {
             let in_op_call = self.call_info.last().map(|e| e.is_c).unwrap_or(false);
@@ -1312,15 +1313,35 @@ impl LuaState {
                 return;
             }
         }
-        if nresults == 0 {
-            self.stack.truncate(a);
+        // perf: 热路径直写 — truncate+push 改为覆写函数槽 + 单次截断。
+        // 调用点 op_call 时 stack 长度 = a+1+nargs (函数+参数), 结果直写 a,
+        // 多余参数槽由 truncate(a+1) 逐槽正常 drop (单参时 1 槽, trivial)。
+        // 对应 C 的 setobj2s(L, func_slot, result); L->top = func+2。
+        if nresults <= 0 {
+            if nresults == 0 {
+                self.stack.truncate(a);
+            } else {
+                // MULTRET (nresults < 0): 单值即全部结果
+                if self.stack.len() > a {
+                    self.stack[a] = result;
+                    self.stack.truncate(a + 1);
+                } else {
+                    self.stack.truncate(a);
+                    self.stack.push(result);
+                }
+            }
+        } else if (nresults as usize) == 1 {
+            if self.stack.len() > a {
+                self.stack[a] = result;
+                self.stack.truncate(a + 1);
+            } else {
+                self.stack.push(result);
+            }
         } else {
             self.stack.truncate(a);
             self.stack.push(result);
-            if nresults > 1 {
-                for _ in 1..nresults {
-                    self.stack.push(TValue::Nil(NilKind::Strict));
-                }
+            for _ in 1..nresults {
+                self.stack.push(TValue::Nil(NilKind::Strict));
             }
         }
         self.top = self.stack.len();
