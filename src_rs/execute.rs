@@ -1033,19 +1033,19 @@ impl VmExecutor {
                 INTERRUPTED.store(false, Ordering::Release);
                 return Err(VmError::RuntimeError("interrupted!".to_string()));
             }
-            // pc 越界处理: 编译器保证字节码末尾总有 OP_RETURN, 正常执行不会越界。
-            // 但测试用例/异常路径可能越界 (fallthrough), 提取到冷函数避免污染主循环 icache。
-            // 分支预测器总是预测 "in bounds", 实际开销 ~0 cycle。
-            let code = &*state.code;
-            if state.pc >= code.len() {
+            // pc 越界处理 — 周期化 (每 1024 指令一次, 与中断检查同批)。
+            // 编译器保证字节码末尾总有 OP_RETURN, 正常执行 pc 不会越界;
+            // 异常 fallthrough 由周期检查兜底 (最多滞后 1024 条, handle_pc_overflow
+            // 按 pc 精确恢复)。省去每指令 code.len() 的 Rc→Vec→len 三跳。
+            if (tick & 1023) == 0 && state.pc >= state.code.len() {
                 if let Some(ret) = Self::handle_pc_overflow(state)? {
                     return Ok(ret);
                 }
                 continue;
             }
 
-            // perf: get_unchecked 跳过边界检查 (上方已检查 pc < code.len())
-            let inst = unsafe { *code.get_unchecked(state.pc) };
+            // perf: 直接解引用取指 (pc 越界由周期检查兜底, get_unchecked 消除边界 panic)
+            let inst = unsafe { *state.code.as_ptr().add(state.pc) };
             let op = opcodes::get_opcode(inst);
 
             // 检查 count hook 和 line hook — 对应 C 的 luaG_traceexec
