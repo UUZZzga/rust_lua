@@ -654,13 +654,13 @@ impl LuaState {
         let globals = {
             let t = Table::new();
             let id = gc.register_object(t.mem_size());
-            t.gc_header.set_id(id);
+            t.data.borrow().gc_header.set_id(id);
             t
         };
         let registry = {
             let t = Table::new();
             let id = gc.register_object(t.mem_size());
-            t.gc_header.set_id(id);
+            t.data.borrow().gc_header.set_id(id);
             t
         };
         registry.set(TValue::Integer(2), TValue::Table(globals.clone()));
@@ -852,13 +852,13 @@ impl LuaState {
         let globals = {
             let t = Table::new();
             let id = gc.register_object(t.mem_size());
-            t.gc_header.set_id(id);
+            t.data.borrow().gc_header.set_id(id);
             t
         };
         let registry = {
             let t = Table::new();
             let id = gc.register_object(t.mem_size());
-            t.gc_header.set_id(id);
+            t.data.borrow().gc_header.set_id(id);
             t
         };
         registry.set(TValue::Integer(2), TValue::Table(globals.clone()));
@@ -1129,14 +1129,14 @@ impl LuaState {
         let globals = {
             let t = Table::new();
             let id = gc.register_object(t.mem_size());
-            t.gc_header.set_id(id);
+            t.data.borrow().gc_header.set_id(id);
             t
         };
 
         let registry = {
             let t = Table::new();
             let id = gc.register_object(t.mem_size());
-            t.gc_header.set_id(id);
+            t.data.borrow().gc_header.set_id(id);
             t
         };
 
@@ -3243,11 +3243,11 @@ impl LuaState {
         if self.gc_closing {
             return;
         }
-        let ptr_id = t.gc_header.ptr_id;
+        let ptr_id = t.data.borrow().gc_header.ptr_id;
         if !self
             .finobj_list
             .iter()
-            .any(|x| x.gc_header.ptr_id == ptr_id)
+            .any(|x| x.data.borrow().gc_header.ptr_id == ptr_id)
         {
             self.finobj_list.push(t.clone());
         }
@@ -3321,7 +3321,7 @@ impl LuaState {
                         );
                         if v_is_gc {
                             let k_id = match k {
-                                TValue::Table(t) => t.gc_header.id(),
+                                TValue::Table(t) => t.data.borrow().gc_header.id(),
                                 TValue::LClosure(c) => c.gc_header.id(),
                                 TValue::UserData(u) => u.gc_header.id(),
                                 _ => None,
@@ -3435,7 +3435,7 @@ impl LuaState {
     fn is_marked(val: &TValue, reachable: &GcHashSet) -> bool {
         match val {
             TValue::Table(t) => t
-                .gc_header
+                .data.borrow().gc_header
                 .id()
                 .map_or(true, |id| reachable.contains(&(id.0 as usize))),
             TValue::LClosure(c) => c
@@ -3872,7 +3872,7 @@ impl LuaState {
 
         for t in self.finobj_list.drain(..) {
             let is_reachable = t
-                .gc_header
+                .data.borrow().gc_header
                 .id()
                 .map_or(false, |id| reachable.contains(&(id.0 as usize)));
             if is_reachable {
@@ -4174,10 +4174,10 @@ impl LuaState {
     ) {
         match val {
             TValue::Table(t) => {
-                if let Some(id) = t.gc_header.id() {
+                if let Some(id) = t.data.borrow().gc_header.id() {
                     reachable.insert(id.0 as usize);
                 }
-                let ptr_id = t.gc_header.ptr_id;
+                let ptr_id = t.data.borrow().gc_header.ptr_id;
                 if visited.insert(ptr_id as usize) {
                     let data = t.data.borrow();
                     let (weak_k, weak_v) = match &data.metatable {
@@ -4215,7 +4215,7 @@ impl LuaState {
                     if let Some(ref mt) = data.metatable {
                         // 提前检查 visited，避免已访问的 metatable 被 push/pop
                         // （多表共享同一 metatable 时显著减少 worklist 操作）
-                        let mt_ptr = mt.gc_header.ptr_id as usize;
+                        let mt_ptr = mt.data.borrow().gc_header.ptr_id as usize;
                         if !visited.contains(&mt_ptr) {
                             let tv = TValue::Table((**mt).clone());
                             unsafe { worklist.push(raw_from_tvalue(&tv)) };
@@ -4310,7 +4310,7 @@ impl LuaState {
                     // GC 统计：UserData
                     gc_stats_inc(|s| { s.userdata += 1; });
                     if let Some(ref mt) = u.metatable {
-                        let mt_ptr = mt.gc_header.ptr_id as usize;
+                        let mt_ptr = mt.data.borrow().gc_header.ptr_id as usize;
                         if !visited.contains(&mt_ptr) {
                             let tv = TValue::Table((**mt).clone());
                             unsafe { worklist.push(raw_from_tvalue(&tv)) };

@@ -2339,7 +2339,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                         }
                     }
                     TValue::Table(t) => {
-                        format!("0x{:x}", t.gc_header.ptr_id)
+                        format!("0x{:x}", t.data.borrow().gc_header.ptr_id)
                     }
                     TValue::LClosure(l) => {
                         format!("0x{:x}", l.gc_header.ptr_id)
@@ -3291,7 +3291,7 @@ fn tostring_for_format(state: &mut LuaState, val: &TValue) -> Option<String> {
             })
             .unwrap_or_else(|| "table".to_string())
     };
-    Some(format!("{}: 0x{:x}", type_name, table.gc_header.ptr_id))
+    Some(format!("{}: 0x{:x}", type_name, table.data.borrow().gc_header.ptr_id))
 }
 
 /// 预扫描格式字符串,返回使用 %s (或 %.Ns 等) 的参数索引集合 (0-based)。

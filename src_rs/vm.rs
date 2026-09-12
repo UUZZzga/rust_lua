@@ -453,7 +453,7 @@ pub fn raw_equal(t1: &TValue, t2: &TValue) -> bool {
         }
         (TValue::Str(a), TValue::Str(b)) => a.as_str() == b.as_str(),
         (TValue::LightUserData(a), TValue::LightUserData(b)) => std::ptr::eq(*a, *b),
-        (TValue::Table(a), TValue::Table(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
+        (TValue::Table(a), TValue::Table(b)) => a.data.borrow().gc_header.ptr_id == b.data.borrow().gc_header.ptr_id,
         (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
         (TValue::CClosure(a), TValue::CClosure(b)) => Rc::ptr_eq(a, b),
         (TValue::LCFn(a), TValue::LCFn(b)) => {
@@ -1239,7 +1239,7 @@ pub fn push_closure(
 /// 从 TValue 中提取 GCObjectId（如果值是 GC 对象）
 pub fn gc_id_of_tvalue(val: &TValue) -> Option<crate::gc::GCObjectId> {
     match val {
-        TValue::Table(t) => t.gc_header.id(),
+        TValue::Table(t) => t.data.borrow().gc_header.id(),
         TValue::LClosure(c) => c.gc_header.id(),
         _ => None,
     }

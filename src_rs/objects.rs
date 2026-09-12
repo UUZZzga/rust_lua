@@ -354,52 +354,89 @@ pub type BuiltinFnPtr =
 /// Then: Lua 代码调用该函数时，VM 直接通过函数指针调用，无需 tag 派发
 #[derive(Clone, Copy)]
 pub struct BuiltinFn {
-    /// 函数指针
+    /// 函数指针 — 唯一标识该内置函数
     pub func: BuiltinFnPtr,
-    /// 函数名（NUL 终止的 C 字符串指针，用于 traceback）
-    pub name: *const u8,
 }
 
 impl BuiltinFn {
     /// 标准 BuiltinFn 构造（impure — 可能回调 Lua / yield）。
-    /// 纯函数标志不在此结构上：CStr 静态字面量仅 1 字节对齐，指针位 0
-    /// 不可借用；pure 集合由 LuaState.pure_fns (按 func 指针值) 维护，
+    /// 纯函数标志不在此结构上：pure 集合由 LuaState.pure_fns (按 func 指针值) 维护，
     /// math 库在注册时显式登记。
+    ///
+    /// name 不再存储在结构体内（为压缩 TValue 到 16 字节）：注册时登记到
+    /// 全局 BUILTIN_NAMES 表（func 指针 → NUL 终止名字），traceback 冷路径查表。
     pub fn impure(func: BuiltinFnPtr, name: *const u8) -> Self {
-        Self { func, name }
+        builtin_names::register(func, name);
+        Self { func }
     }
 
-    /// 获取函数名的 &str（unsafe，因为从裸指针构造）
+    /// 获取函数名的 &str（冷路径：traceback / Debug 输出）
     ///
-    /// 安全性：name 必须是有效的 NUL 终止 C 字符串指针
+    /// 从全局 BUILTIN_NAMES 表按 func 指针查找；未登记（跨版本老数据）返回 ""。
     pub fn name_str(&self) -> &'static str {
-        if self.name.is_null() {
-            ""
-        } else {
-            unsafe {
-                std::ffi::CStr::from_ptr(self.name as *const std::ffi::c_char)
-                    .to_str()
-                    .unwrap_or("")
-            }
-        }
+        builtin_names::lookup(self.func)
     }
 }
 
 impl std::fmt::Debug for BuiltinFn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = unsafe {
-            if self.name.is_null() {
-                "<null>".to_string()
-            } else {
-                std::ffi::CStr::from_ptr(self.name as *const std::ffi::c_char)
-                    .to_string_lossy()
-                    .into_owned()
-            }
-        };
         f.debug_struct("BuiltinFn")
-            .field("name", &name)
+            .field("name", &self.name_str())
             .field("func", &(self.func as usize))
             .finish()
+    }
+}
+
+/// 全局内置函数名字表 — func 指针 → NUL 终止静态名字。
+///
+/// BuiltinFn 压缩到 8 字节后，name 无法随值存储；注册（impure 构造，冷路径）
+/// 与查名（name_str，traceback 冷路径）都走此表。
+///
+/// 并发模型：std::sync::RwLock——注册只在库 open 时发生，查名只在错误路径；
+/// 两者都远离热指令路径，锁开销可忽略。threaded feature 下多 LuaState 并发
+/// open 库时写锁保证安全。
+mod builtin_names {
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    // HashMap 按需扩容 — 注册总量 ~200 (9 个库)
+    static NAMES: RwLock<Option<HashMap<usize, &'static str>>> =
+        RwLock::new(None);
+
+    /// 登记 func → name（重复登记以先注册者为准，语义与 C 静态注册一致）
+    pub fn register(func: super::BuiltinFnPtr, name: *const u8) {
+        if name.is_null() {
+            return;
+        }
+        // SAFETY: name 来自注册点的 c"..." 静态字面量, 指向 NUL 终止字节数组
+        let name_str: &'static str = unsafe {
+            match std::ffi::CStr::from_ptr(name as *const std::ffi::c_char).to_str() {
+                Ok(s) => std::mem::transmute::<&str, &'static str>(s),
+                Err(_) => return,
+            }
+        };
+        // 锁毒化不可能发生 (闭包内无 panic 路径); Err 时直接放弃登记,
+        // name_str 返回 "" 不影响正确性
+        if let Ok(mut guard) = NAMES.write() {
+            guard
+                .get_or_insert_with(HashMap::new)
+                .entry(func as usize)
+                .or_insert(name_str);
+        }
+    }
+
+    /// 按 func 指针查名 — 未登记返回 ""
+    pub fn lookup(func: super::BuiltinFnPtr) -> &'static str {
+        // 读锁失败(毒化) → 返回 "", traceback 降级为无名帧, 可接受。
+        // 返回的 &'static str 不借用守卫: 表值本身是 'static 引用, copied() 拷出。
+        let guard = match NAMES.read() {
+            Ok(g) => g,
+            Err(_) => return "",
+        };
+        match guard.as_ref() {
+            Some(m) => m.get(&(func as usize)).copied().unwrap_or(""),
+            None => "",
+        }
     }
 }
 
@@ -814,7 +851,7 @@ impl PartialEq for TValue {
                 }
             }
             (TValue::Str(a), TValue::Str(b)) => a == b,
-            (TValue::Table(a), TValue::Table(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
+            (TValue::Table(a), TValue::Table(b)) => a.data.borrow().gc_header.ptr_id == b.data.borrow().gc_header.ptr_id,
             (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
             (TValue::CClosure(a), TValue::CClosure(b)) => Rc::ptr_eq(a, b),
             (TValue::LCFn(a), TValue::LCFn(b)) => {
@@ -873,7 +910,7 @@ impl Hash for TValue {
             }
             TValue::Table(t) => {
                 6u8.hash(state);
-                t.gc_header.ptr_id.hash(state);
+                t.data.borrow().gc_header.ptr_id.hash(state);
             }
             TValue::LClosure(c) => {
                 7u8.hash(state);
@@ -1008,6 +1045,7 @@ pub struct LCFunction {
 /// 这解决了 `_ENV` upvalue 与 `state.globals` 不同步的问题：
 /// 克隆后的 Table 仍然指向同一份数据，修改对两者都可见。
 pub struct TableData {
+    pub gc_header: GCObjectHeader,
     /// 数组部分（1-based，索引 0 对应键 1）
     pub array: Vec<TValue>,
     /// 哈希部分：(key, value) 对 — 保持插入顺序用于 next() 遍历与 GC 标记
@@ -1148,7 +1186,6 @@ impl Drop for TableData {
 ///
 /// 方法实现见 [crate::table]。
 pub struct Table {
-    pub gc_header: GCObjectHeader,
     /// 共享数据 —— 克隆 Table 时仅增加 Rc 引用计数
     pub data: Rc<RefCell<TableData>>,
 }
@@ -1157,7 +1194,6 @@ impl Clone for Table {
     /// 克隆 Table：仅克隆 `Rc`（共享数据），并克隆 `gc_header`（保持同一 `ptr_id`）。
     fn clone(&self) -> Self {
         Table {
-            gc_header: self.gc_header.clone(),
             data: Rc::clone(&self.data),
         }
     }
@@ -1166,7 +1202,7 @@ impl Clone for Table {
 impl fmt::Debug for Table {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Table")
-            .field("ptr_id", &self.gc_header.ptr_id)
+            .field("ptr_id", &self.data.borrow().gc_header.ptr_id)
             .finish_non_exhaustive()
     }
 }
@@ -1174,8 +1210,8 @@ impl fmt::Debug for Table {
 impl Default for Table {
     fn default() -> Self {
         Table {
-            gc_header: GCObjectHeader::new(),
             data: Rc::new(RefCell::new(TableData {
+                gc_header: GCObjectHeader::new(),
                 array: Vec::new(),
                 hash_buckets: Vec::new(),
                 key_to_bucket: None,
@@ -2446,6 +2482,7 @@ pub fn twoto(n: u8) -> usize {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use crate::strings::{ArcRc, LongString, ShortString};
     use std::sync::atomic::{AtomicU64, AtomicU8};
@@ -2460,9 +2497,11 @@ mod tests {
         println!("TValue align: {}", std::mem::align_of::<TValue>());
         println!("BuiltinFn size: {}", std::mem::size_of::<BuiltinFn>());
         println!("BuiltinFnPtr size: {}", std::mem::size_of::<BuiltinFnPtr>());
-        // 添加 BuiltinFn 变体后 TValue 应保持 24 字节
-        assert_eq!(std::mem::size_of::<TValue>(), 24);
-        assert_eq!(std::mem::size_of::<BuiltinFn>(), 16);
+        // BuiltinFn 压缩到 8 字节 (name 移入全局表) 后, rustc 把 TValue 的
+        // tag 放入 LuaString 变体的 padding — TValue 16 字节 (tag 8 + payload 8)。
+        // 这是 C Lua TValue (16 字节) 的同级布局。
+        assert_eq!(std::mem::size_of::<TValue>(), 16);
+        assert_eq!(std::mem::size_of::<BuiltinFn>(), 8);
     }
 
     // ========================================================================

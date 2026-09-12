@@ -3313,7 +3313,7 @@ impl VmExecutor {
                         if key_ok {
                             t.set(stack[b].clone(), val_opt.take().unwrap());
                             // GC barrier — 与 table_set 的 key_exists 路径一致
-                            if let Some(tid) = t.gc_header.id() {
+                            if let Some(tid) = t.data.borrow().gc_header.id() {
                                 state.gc.barrier_back(tid);
                             }
                             true
@@ -3363,7 +3363,7 @@ impl VmExecutor {
                 if let TValue::Table(t) = &stack[a] {
                     if !t.has_metatable() {
                         t.set(TValue::Integer(b), val_opt.take().unwrap());
-                        if let Some(tid) = t.gc_header.id() {
+                        if let Some(tid) = t.data.borrow().gc_header.id() {
                             state.gc.barrier_back(tid);
                         }
                         true
@@ -3415,7 +3415,7 @@ impl VmExecutor {
                 if let TValue::Table(t) = &stack[a] {
                     if !t.has_metatable() {
                         t.set(key_opt.take().unwrap(), val_opt.take().unwrap());
-                        if let Some(tid) = t.gc_header.id() {
+                        if let Some(tid) = t.data.borrow().gc_header.id() {
                             state.gc.barrier_back(tid);
                         }
                         true
@@ -3465,7 +3465,7 @@ impl VmExecutor {
         // 使用 mem_size() 计算实际内存占用（含 Table 结构 + array + hash），
         // 避免 GC 低估内存导致不及时回收（big.lua/verybig.lua 内存分配失败）
         let table_id = state.gc.register_object(table.mem_size());
-        table.gc_header.set_id(table_id);
+        table.data.borrow().gc_header.set_id(table_id);
         Self::write_stack(state, a, TValue::Table(table));
         state.pc += 1;
         Ok(())
@@ -6431,7 +6431,7 @@ impl VmExecutor {
                 t.set_int((pos + 1) as i64, val);
             }
             // 表可能已增长（array.push / hash.insert），更新 GC 估算大小
-            if let Some(id) = t.gc_header.id() {
+            if let Some(id) = t.data.borrow().gc_header.id() {
                 state.gc.set_obj_size(id, t.mem_size());
             }
             // 表增长后检查是否需要 GC
@@ -7012,7 +7012,7 @@ impl VmExecutor {
                         // key 已存在: 直接设置
                         t.set(key, val);
                         // GC barrier
-                        let tid = t.gc_header.id();
+                        let tid = t.data.borrow().gc_header.id();
                         if let Some(tid) = tid {
                             state.gc.obj_barrier_back(tid, tid);
                             state.gc.barrier_back(tid);
@@ -7071,7 +7071,7 @@ impl VmExecutor {
 
                     // 没有 __newindex 元方法: 直接设置
                     t.set(key, val);
-                    let tid = t.gc_header.id();
+                    let tid = t.data.borrow().gc_header.id();
                     if let Some(tid) = tid {
                         state.gc.obj_barrier_back(tid, tid);
                         state.gc.barrier_back(tid);

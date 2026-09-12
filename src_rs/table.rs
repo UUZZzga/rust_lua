@@ -44,8 +44,8 @@ pub(crate) fn hash_get(td: &TableData, key: &TValue) -> Option<TValue> {
 impl Table {
     pub fn new() -> Self {
         Table {
-            gc_header: GCObjectHeader::new(),
             data: Rc::new(RefCell::new(TableData {
+                gc_header: GCObjectHeader::new(),
                 array: Vec::new(),
                 hash_buckets: Vec::new(),
                 key_to_bucket: None,
@@ -56,8 +56,8 @@ impl Table {
 
     pub fn with_capacity(narray: usize, nhash: usize) -> Self {
         Table {
-            gc_header: GCObjectHeader::new(),
             data: Rc::new(RefCell::new(TableData {
+                gc_header: GCObjectHeader::new(),
                 array: (0..narray).map(|_| TValue::Nil(NilKind::Empty)).collect(),
                 hash_buckets: Vec::with_capacity(nhash),
                 key_to_bucket: if nhash > 0 {

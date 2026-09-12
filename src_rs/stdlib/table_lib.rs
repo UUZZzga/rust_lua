@@ -697,7 +697,7 @@ fn call_create(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     let estimated_size = sizeseq as usize * std::mem::size_of::<TValue>()
         + sizerest as usize * (std::mem::size_of::<TValue>() * 2 + 16);
     let table_id = state.gc.register_object(estimated_size);
-    table.gc_header.set_id(table_id);
+    table.data.borrow().gc_header.set_id(table_id);
     push_results(state, a, nresults, vec![TValue::Table(table)]);
     Ok(())
 }
