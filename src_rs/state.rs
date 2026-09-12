@@ -1333,7 +1333,22 @@ impl LuaState {
         } else if (nresults as usize) == 1 {
             if self.stack.len() > a {
                 self.stack[a] = result;
-                self.stack.truncate(a + 1);
+                // perf: 被截断区 (a+1..len) 是 CALL 的参数槽, 常为 trivial (Float/
+                // Integer)。全部 trivial 时用 set_len 跳过 Vec::truncate 的逐槽
+                // drop glue (非内联调用); 有 Rc 变体则回退 truncate 正常 drop。
+                let tail_all_trivial = self.stack[a + 1..].iter().all(|v| {
+                    matches!(
+                        v,
+                        TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)
+                    )
+                });
+                if tail_all_trivial {
+                    // SAFETY: 尾部全 trivially-droppable, set_len 略过 drop 安全;
+                    // 槽位保留给后续 write_stack 复用 (与 smart_clear_stack 同策略)。
+                    unsafe { self.stack.set_len(a + 1) };
+                } else {
+                    self.stack.truncate(a + 1);
+                }
             } else {
                 self.stack.push(result);
             }
