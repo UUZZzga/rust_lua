@@ -6110,17 +6110,9 @@ impl VmExecutor {
                 };
 
                 if count > 0 {
-                    // perf: 三槽由 FORPREP 初始化且类型锁定 Integer, 直写免
-                    // write_stack 的 trivial 判别 (旧值必 Integer)。
-                    // SAFETY: ra/ra+2 < stack.len() — FORPREP 保证且循环不变。
-                    // 经裸指针绕 &mut state 借用: 单线程 VM, 此块内无其他栈访问。
-                    unsafe {
-                        let slot0 = std::ptr::addr_of!(state.stack[ra]) as *mut TValue;
-                        std::ptr::write(slot0, TValue::Integer((count - 1) as i64));
-                        let new_idx = (idx as u64).wrapping_add(step as u64) as i64;
-                        let slot2 = std::ptr::addr_of!(state.stack[ra + 2]) as *mut TValue;
-                        std::ptr::write(slot2, TValue::Integer(new_idx));
-                    }
+                    Self::write_stack(state, ra, TValue::Integer((count - 1) as i64));
+                    let new_idx = (idx as u64).wrapping_add(step as u64) as i64;
+                    Self::write_stack(state, ra + 2, TValue::Integer(new_idx));
                     let bx = opcodes::getarg_bx(inst);
                     state.pc = ((state.pc as i32) - bx) as usize;
                 }
