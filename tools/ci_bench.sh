@@ -81,7 +81,10 @@ uname -a > "$RS_OUT"
 "$RS_LUA" -v >> "$RS_OUT" 2>&1
 
 echo ">>> 运行 C 实现基准 ($C_LUA, $SCALE) ..."
-timeout 600 "$C_LUA" bench/harness.lua "$SCALE" bench/bench_*.lua 2>&1 | tee -a "$C_OUT"
+# full 规模 3 轮取最小值 — CI runner 单轮噪声实测 ±8% (同 commit 两次运行浮点
+# 项 1.84 vs 2.05), 3 轮最小值可把判定噪声压到 ±2-3%。
+if [ "$SCALE" = "full" ]; then export BENCH_REPEAT=3; fi
+timeout 900 "$C_LUA" bench/harness.lua "$SCALE" bench/bench_*.lua 2>&1 | tee -a "$C_OUT"
 C_RC=$?
 if [ "$C_RC" -ne 0 ]; then
     echo "错误: C 实现基准失败 (退出码 $C_RC, 日志 $C_OUT)"
@@ -90,7 +93,7 @@ fi
 
 echo ""
 echo ">>> 运行 Rust 实现基准 ($RS_LUA, $SCALE) ..."
-timeout 600 "$RS_LUA" bench/harness.lua "$SCALE" bench/bench_*.lua 2>&1 | tee -a "$RS_OUT"
+timeout 900 "$RS_LUA" bench/harness.lua "$SCALE" bench/bench_*.lua 2>&1 | tee -a "$RS_OUT"
 RS_RC=$?
 if [ "$RS_RC" -ne 0 ]; then
     echo "错误: Rust 实现基准失败 (退出码 $RS_RC, 日志 $RS_OUT)"
