@@ -1919,22 +1919,7 @@ impl VmExecutor {
                     slot,
                     TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)
                 ) {
-                    std::ptr::write(slot, val);
-                } else if let (TValue::Table(old_t), TValue::Table(new_t)) = (&*slot, &val) {
-                    // perf: 同一 Table 的槽位覆写 (GETTABUP(math) 每迭代写同一槽) —
-                    // ptr 相等时跳过 Rc inc/dec 往返 (调用方已 clone 过, 净计数不变)
-                    if std::rc::Rc::ptr_eq(&old_t.data, &new_t.data) {
-                        std::ptr::write(slot, val);
-                    } else {
-                        *slot = val;
-                    }
-                } else if let (TValue::Str(old_s), TValue::Str(new_s)) = (&*slot, &val) {
-                    // LuaString PartialEq 的 Short-Short 路径有 ArcRc::ptr_eq 快速判断
-                    if old_s == new_s {
-                        std::ptr::write(slot, val);
-                    } else {
-                        *slot = val;
-                    }
+                std::ptr::write(slot, val);
                 } else {
                     *slot = val;
                 }
