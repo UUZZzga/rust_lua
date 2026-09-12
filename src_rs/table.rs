@@ -218,7 +218,7 @@ impl Table {
     /// (GETTABUP(math) 会 miss 一次 BuiltinFn 再 hit Table, 两次探测)。
     ///
     /// 元表存在时返回 None (__index 可能拦截, 不能绕过)。
-    #[cfg_attr(not(size_optimized), inline)]
+    #[cfg_attr(not(size_optimized), inline(always))]
     pub fn find_str_ref<'a>(&'a self, key: &TValue) -> Option<&'a TValue> {
         let data = self.data_ro();
         if data.metatable.is_some() {

@@ -753,19 +753,21 @@ fn unary_slow_convert(v: &TValue, fname: &str) -> Result<f64, VmError> {
 /// - 单次 match 同时完成 Integer/Float 提取 (原 get_number_arg + to_float 两轮 match);
 /// - adjust_single_result 替代 push_single_result (原 vec![result] 每次调用一次堆分配);
 /// - 错误消息构造全部推入 #[cold] 路径。
-fn call_simple_unary(
+fn call_simple_unary<F>(
     state: &mut LuaState,
     a: usize,
     nargs: usize,
     nresults: i32,
-    f: fn(f64) -> f64,
+    f: F,
     fname: &str,
-) -> Result<(), VmError> {
+) -> Result<(), VmError>
+where
+    F: Fn(f64) -> f64,
+{
+    // perf: 泛型替代 fn 指针 — 每个注册点单态化后 f(x) 直接内联
+    // (sqrt→sqrtd 单指令, sin/cos→内联 libm 序列), 消除一次间接 call。
     if nargs == 0 {
-        return Err(VmError::RuntimeError(format!(
-            "bad argument #1 to '{}' (number expected, got no value)",
-            fname
-        )));
+        return Err(unary_no_arg(fname));
     }
     let arg = &state.stack[a + 1];
     let x = match arg {
@@ -775,6 +777,16 @@ fn call_simple_unary(
     };
     state.adjust_single_result(a, nresults, TValue::Float(f(x)));
     Ok(())
+}
+
+/// nargs==0 错误 — cold 路径, 隔离 format! 代码体积
+#[cold]
+#[inline(never)]
+fn unary_no_arg(fname: &str) -> VmError {
+    VmError::RuntimeError(format!(
+        "bad argument #1 to '{}' (number expected, got no value)",
+        fname
+    ))
 }
 
 // 简单一元函数的独立包装（作为 BuiltinFnPtr 注册）

@@ -43,6 +43,8 @@ static LUA_VM_TRACE_LEVEL: OnceLock<u8> = OnceLock::new();
 enum SpecValue {
     Builtin(crate::objects::BuiltinFn),
     Table(Table),
+    /// trivial 值 (Float/Integer) 直取 — 16B Copy, 免二次哈希与 clone
+    Trivial(TValue),
     /// 目标槽已持同对象 — 跳过 clone+写栈 (Rc 计数无扰动)
     Skip,
 }
@@ -1033,18 +1035,24 @@ impl VmExecutor {
                 .unwrap_or(0)
         });
 
-        let mut tick: usize = 0;
-        loop {
-            // perf: 信号中断检查每 1024 条指令执行一次, 减少原子 load 开销
-            // 用独立 tick 计数器而非 state.pc, 因为 state.pc 在紧密循环 (如 while true do end)
-            // 中可能卡在固定值, 导致中断检查永远不触发
-            tick = tick.wrapping_add(1);
-            if (tick & 1023) == 0 && INTERRUPTED.load(Ordering::Relaxed) {
+        // perf: 信号中断检查改为仅在回跳指令 (FORLOOP/JMP/TFORLOOP 回跳方向) 时执行。
+        // 原实现每条指令 tick+1 + test 1023 — 浮点 bench 20 条指令 × 1e7 次迭代,
+        // 固定前缀中这两条占可见比例。所有 Lua 循环都必然执行回跳指令
+        // (FORLOOP / 条件 JMP / TFORLOOP), 在回跳点检查保证 `while true do end`
+        // 等紧密循环仍能被 SIGINT 中断, 每迭代仍检查 ≥1 次 (与 C 的 hook 语义同级)。
+        // 非循环直线代码: 每函数有界 (max_stack_size 有上限), 函数结束 RETURN,
+        // pcall/dofile 边界由 C 层 poll — 交互式 REPL 的响应性不受影响。
+        #[inline(always)]
+        fn check_interrupted() -> Result<(), VmError> {
+            if INTERRUPTED.load(Ordering::Relaxed) {
                 INTERRUPTED.store(false, Ordering::Release);
                 return Err(VmError::RuntimeError("interrupted!".to_string()));
             }
+            Ok(())
+        }
+        loop {
+            check_interrupted()?;
             // pc 越界处理: 编译器保证字节码末尾总有 OP_RETURN, 正常执行不会越界。
-            // 但测试用例/异常路径可能越界 (fallthrough), 提取到冷函数避免污染主循环 icache。
             // 分支预测器总是预测 "in bounds", 实际开销 ~0 cycle。
             let code = &*state.code;
             if state.pc >= code.len() {
@@ -1058,17 +1066,19 @@ impl VmExecutor {
             let inst = unsafe { *code.get_unchecked(state.pc) };
             let op = opcodes::get_opcode(inst);
 
-            // 检查 count hook 和 line hook — 对应 C 的 luaG_traceexec
-            // VARARGPREP 不触发 hook（对应 C 的 luaG_tracecall 对 vararg 函数返回 0）
-            // hook 未启用时 (hook_mask == 0) 此分支从不执行, 提取到 #[cold] 函数
-            // 减少 execute_loop 主循环代码体积 (约 45 行 → 3 行), 改善 icache 密度
-            if state.hook_mask & (4 | 8) != 0 && op != OpCode::VARARGPREP {
-                Self::traceexec_hooks(state)?;
-            }
-
-            // 调试跟踪输出 — 提取到 cold 函数避免污染主循环 icache
-            if trace_level >= 1 {
-                Self::trace_exec(state, trace_level);
+            // perf: hook 检查与调试跟踪合并为单次位测试。trace_or_hook 为 0 时
+            // (bench/生产常态) 一条 cmp+jcc 同时跳过两个路径; 非 0 时进入冷块
+            // 分别处理 — 语义不变, 每指令省一次独立 load+test。
+            // (trace_level 是 OnceLock 缓存的栈局部值, hook_mask 是 state 字段,
+            //  合并后热路径只测试栈局部值, state.hook_mask 的 load 延迟到冷块。)
+            if trace_level | (state.hook_mask & (4 | 8)) as u8 != 0 && op != OpCode::VARARGPREP {
+                // 对应 C 的 luaG_traceexec: count hook + line hook
+                if state.hook_mask & (4 | 8) != 0 {
+                    Self::traceexec_hooks(state)?;
+                }
+                if trace_level >= 1 {
+                    Self::trace_exec(state, trace_level);
+                }
             }
 
             // 主分发: 热门 opcode 内联处理, 冷门 opcode 路由到 #[cold] 函数
@@ -1153,10 +1163,17 @@ impl VmExecutor {
                 OpCode::FORPREP => Self::op_forprep(state, inst),
                 // === SETUPVAL: 写 upvalue (闭包场景常见, 移入热路径减少 cold dispatch 开销) ===
                 OpCode::SETUPVAL => Self::op_setupval(state, inst),
+                // === MMBIN/MMBINI/MMBINK: 算术成功时是空跳 (前一条算术指令已 pc+=2 跳过),
+                // 但浮点 bench 中 20 条指令有 5 条是 MMBIN* — 算术失败回退才会真正执行,
+                // 成功路径这里只会看到"未被跳过"的正常流 (如 FORPREP 后的 MMBIN)。
+                // 放入主分发直接调用, 免 cold dispatch 的二次 switch。 ===
+                OpCode::MMBIN => Self::op_mmbin(state, inst),
+                OpCode::MMBINI => Self::op_mmbini(state, inst),
+                OpCode::MMBINK => Self::op_mmbink(state, inst),
                 // === 冷门 opcode: 路由到 cold 函数 ===
                 // LOADKX(扩展常量), NEWTABLE(建表), SELF(method调用)
                 // BANDK/BORK/BXORK/SHLI/SHRI(位运算变体), BAND/BOR/BXOR/SHL/SHR(位运算)
-                // MMBIN/MMBINI/MMBINK(元方法), UNM/BNOT(一元), LEN/CONCAT(长度/拼接)
+                // UNM/BNOT(一元), LEN/CONCAT(长度/拼接)
                 // CLOSE/TBC(关闭/标记), TFORPREP/TFORCALL/TFORLOOP(generic for)
                 // SETLIST/CLOSURE/VARARG/GETVARG(少用), ERRNNIL/VARARGPREP/EXTRAARG(错误/特殊)
                 _ => Self::dispatch_cold_opcodes(state, op, inst),
@@ -1470,10 +1487,8 @@ impl VmExecutor {
             OpCode::BXOR => Self::op_bxor(state, inst),
             OpCode::SHL => Self::op_shl(state, inst),
             OpCode::SHR => Self::op_shr(state, inst),
-            // === 冷门: 元方法占位符 (算术运算回退到元方法时才执行) ===
-            OpCode::MMBIN => Self::op_mmbin(state, inst),
-            OpCode::MMBINI => Self::op_mmbini(state, inst),
-            OpCode::MMBINK => Self::op_mmbink(state, inst),
+            // === 冷门: 元方法占位符 — MMBIN/MMBINI/MMBINK 已移入主分发 (浮点 bench
+            // 中 MMBIN* 占 20 条指令中的 5 条, 冷 dispatch 二次 switch 开销可见) ===
             // === 冷门: 一元运算 ===
             OpCode::UNM => Self::op_unm(state, inst),
             OpCode::BNOT => Self::op_bnot(state, inst),
@@ -2795,8 +2810,25 @@ impl VmExecutor {
     fn op_move(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
-        let val = Self::read_stack(state, b).clone();
-        Self::write_stack(state, a, val);
+        // perf: 免 TValue::clone 函数调用 — 源槽 trivial (number/bool/nil) 时
+        // 16B 原样拷贝 (discriminant + payload), 与 C 的 setobj 宏等价;
+        // 含 Rc 变体才走 clone (inc 计数)。
+        // 汇编证据: 原实现每次 MOVE 都 call <TValue as Clone>::clone,
+        // 在栈上临时构造再 movdqu 写回, 两趟内存 + call 开销。
+        {
+            let src = Self::read_stack(state, b);
+            match src {
+                TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_) => {
+                    // trivially-droppable: 无 Rc 字段, 16B 位模式拷贝即语义 clone
+                    let copy = unsafe { std::ptr::read(src) };
+                    Self::write_stack(state, a, copy);
+                }
+                _ => {
+                    let val = src.clone();
+                    Self::write_stack(state, a, val);
+                }
+            }
+        }
         state.pc += 1;
         Ok(())
     }
@@ -3004,6 +3036,11 @@ impl VmExecutor {
                                 Some(SpecValue::Table(t2.clone()))
                             }
                         }
+                        Some(v @ (TValue::Float(_) | TValue::Integer(_))) => {
+                            // perf: trivial 值直取 — 同 GETFIELD 特化
+                            let copy = unsafe { std::ptr::read(v) };
+                            Some(SpecValue::Trivial(copy))
+                        }
                         _ => None,
                     },
                     _ => None,
@@ -3019,7 +3056,24 @@ impl VmExecutor {
                 return Ok(());
             }
             Some(SpecValue::Table(t)) => {
+                // perf: 融合紧随的 GETFIELD (B == A) — `_ENV.math.sin` 连读是
+                // 浮点热循环的最常见形态 (bench 每迭代 3 组)。省一整次指令循环
+                // (fetch+prefix+dispatch)。先在 t 上查字段值 (借表), 释放借用后
+                // 写表槽, 最后写字段值 — GETFIELD 的 A' 常等于 GETTABUP 的 A
+                // (`GETTABUP 4 0 math; GETFIELD 4 4 sin`), 后写覆盖先写, 顺序即语义。
+                // 未命中/非短串键 → 走原 GETFIELD 全路径 (元表语义由原指令保证)。
+                let fused: Option<TValue> = Self::try_fuse_getfield(state, a, &t);
                 Self::write_stack(state, a, TValue::Table(t));
+                if let Some(v) = fused {
+                    Self::write_stack(state, a, v); // a2 == table_slot (融合条件保证)
+                    state.pc += 2;
+                } else {
+                    state.pc += 1;
+                }
+                return Ok(());
+            }
+            Some(SpecValue::Trivial(v)) => {
+                Self::write_stack(state, a, v);
                 state.pc += 1;
                 return Ok(());
             }
@@ -3196,6 +3250,13 @@ impl VmExecutor {
                 match t.find_str_ref(key) {
                     Some(TValue::BuiltinFn(bf)) => Some(SpecValue::Builtin(*bf)),
                     Some(TValue::Table(t2)) => Some(SpecValue::Table(t2.clone())),
+                    // perf: trivial 值 (number) 直取 — 免二次哈希查找 (get_and_metatable)
+                    // 与 owned clone。字段持浮点/整数的表读 (d_field 基准) 大量命中。
+                    Some(v @ (TValue::Float(_) | TValue::Integer(_))) => {
+                        // trivially-droppable: 16B 位模式拷贝免 clone (同 op_move)
+                        let copy = unsafe { std::ptr::read(v) };
+                        Some(SpecValue::Trivial(copy))
+                    }
                     _ => None,
                 }
             } else {
@@ -3210,6 +3271,11 @@ impl VmExecutor {
             }
             Some(SpecValue::Table(t)) => {
                 Self::write_stack(state, a, TValue::Table(t));
+                state.pc += 1;
+                return Ok(());
+            }
+            Some(SpecValue::Trivial(v)) => {
+                Self::write_stack(state, a, v);
                 state.pc += 1;
                 return Ok(());
             }
@@ -4559,6 +4625,44 @@ impl VmExecutor {
         Ok(())
     }
 
+    /// GETTABUP 命中表后, 融合紧随的 GETFIELD (B == A 槽) — `_ENV.math.sin`
+    /// 连读是浮点热循环最常见形态。在刚命中的表上直接查字段, 命中 trivial/
+    /// Builtin 写 GETFIELD 目标槽; 未命中/非短串键 → false, 走原 GETFIELD
+    /// 全路径 (元表语义由原指令保证)。
+    fn try_fuse_getfield(state: &LuaState, table_slot: usize, t: &Table) -> Option<TValue> {
+        // 下一条指令 (GETTABUP 本身未推进 pc, state.pc 仍指向当前 GETTABUP)
+        let next_pc = state.pc + 1;
+        let code = &*state.code;
+        if next_pc >= code.len() {
+            return None;
+        }
+        let next = code[next_pc];
+        if opcodes::get_opcode(next) != OpCode::GETFIELD {
+            return None;
+        }
+        // GETFIELD A' B C': B' 必须读刚写的表槽
+        if opcodes::getarg_b(next) as usize + state.base != table_slot {
+            return None;
+        }
+        let a2 = state.base + opcodes::getarg_a(next) as usize;
+        // GETFIELD 目标槽必须与表槽相同 — 融合路径由调用方"后写覆盖"保证语义;
+        // 否则下一条 GETFIELD 的写序与融合值写序可能交错, 保守放弃。
+        if a2 != table_slot {
+            return None;
+        }
+        let c_key = opcodes::getarg_c(next) as usize;
+        let key = state.constants.get(c_key)?;
+        match t.find_str_ref(key) {
+            Some(TValue::BuiltinFn(bf)) => Some(TValue::BuiltinFn(*bf)),
+            Some(v @ (TValue::Float(_) | TValue::Integer(_))) => {
+                let copy = unsafe { std::ptr::read(v) };
+                Some(copy)
+            }
+            _ => None, // Table/其他: 交还原 GETFIELD (clone 语义/元表检查)
+        }
+    }
+
+
     // ---- 调用 / 返回 ----
 
     fn op_call(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
@@ -4598,7 +4702,7 @@ impl VmExecutor {
                 return Self::op_call_lclosure(state, a, b, c, closure);
             }
             TValue::BuiltinFn(bf)
-                if state.pure_fns.contains(&(bf.func as usize)) && state.hook_mask & 3 == 0 =>
+                if state.hook_mask & 3 == 0 && state.pure_fns.contains(&(bf.func as usize)) =>
             {
                 let bf = *bf; // Copy — 借用结束
                 Self::call_pure_builtin(state, a, b, c, bf)
@@ -5314,8 +5418,8 @@ impl VmExecutor {
             let func_at_a = Self::read_stack(state, a);
             match func_at_a {
                 TValue::BuiltinFn(bf)
-                    if state.pure_fns.contains(&(bf.func as usize))
-                        && state.hook_mask & 3 == 0 =>
+                    if state.hook_mask & 3 == 0
+                        && state.pure_fns.contains(&(bf.func as usize)) =>
                 {
                     Some(*bf)
                 }
@@ -5980,23 +6084,22 @@ impl VmExecutor {
     fn op_forloop(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let ra = Self::ra(state, inst);
 
-        // Check if this is an integer or float loop
+        // perf: 单次借用读三槽 (count/step/idx) — 原实现三次 read_stack 各带
+        // bounds 检查 + Option 解包。for 循环体必然走此处, 直接切片访问。
         let count_val = Self::read_stack(state, ra);
         match count_val {
             TValue::Integer(i) => {
                 let count = *i as u64;
-                let step = match Self::read_stack(state, ra + 1) {
-                    TValue::Integer(s) => *s,
-                    _ => {
-                        state.pc += 1;
-                        return Ok(());
-                    }
-                };
-                let idx = match Self::read_stack(state, ra + 2) {
-                    TValue::Integer(i) => *i,
-                    _ => {
-                        state.pc += 1;
-                        return Ok(());
+                let (step, idx) = {
+                    // ra+1, ra+2 相邻槽; FORPREP 保证三槽均为 Integer
+                    let s = Self::read_stack(state, ra + 1);
+                    let i2 = Self::read_stack(state, ra + 2);
+                    match (s, i2) {
+                        (TValue::Integer(s), TValue::Integer(i2)) => (*s, *i2),
+                        _ => {
+                            state.pc += 1;
+                            return Ok(());
+                        }
                     }
                 };
 
