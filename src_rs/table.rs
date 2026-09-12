@@ -239,6 +239,32 @@ impl Table {
         }
     }
 
+    /// Table 值特化查找 — GETTABUP 返回表 (如 _ENV.math) 的热路径。
+    /// 绕过 TValue::clone 的非内联 24B sret call: Table 结构 (gc_header + Rc
+    /// 指针) 直接 copy, 仅 Rc 引用计数 inc。命中返回 Some(table), 值非 Table
+    /// 或未命中返回 None (调用方回退通用路径)。
+    #[cfg_attr(not(size_optimized), inline)]
+    pub fn get_table_value(&self, key: &TValue) -> Option<Table> {
+        let data = self.data_ro();
+        if data.metatable.is_some() {
+            return None;
+        }
+        let ktb = data.key_to_bucket.as_ref()?;
+        let sh = match key {
+            TValue::Str(crate::strings::LuaString::Short(ss)) => ss.hash,
+            _ => return None,
+        };
+        let hash = crate::objects::tvalue_fx_hash(key);
+        let entry = ktb.find(hash, |(k, _)| match (k, key) {
+            (TValue::Str(a), TValue::Str(b)) => a == b,
+            _ => false,
+        })?;
+        match &data.hash_buckets[entry.1].1 {
+            TValue::Table(t) => Some(t.clone()),
+            _ => None,
+        }
+    }
+
     pub fn get(&self, key: &TValue) -> Option<TValue> {
         let data = self.data.borrow();
         match key {

@@ -2982,6 +2982,31 @@ impl VmExecutor {
             state.pc += 1;
             return Ok(());
         }
+        // perf: Table 值特化 (GETTABUP 返回表, 如 _ENV.math) — 免 TValue::clone
+        // 的非内联调用, Table 结构直接 copy (Rc inc 照常)。
+        let table_val: Option<crate::objects::Table> = {
+            let constants = &state.constants;
+            let key_opt = constants.get(kb_idx);
+            let upvals = unsafe { &*state.closure_upvals.as_ptr() };
+            if b < upvals.len() {
+                let uv = unsafe { &*upvals[b].as_ptr() };
+                let table_ref: Option<&TValue> = match uv {
+                    UpVal::Closed { value } => Some(&**value),
+                    UpVal::Open { stack_index, .. } => state.stack.get(*stack_index),
+                };
+                match (key_opt, table_ref) {
+                    (Some(key), Some(TValue::Table(t))) => t.get_table_value(key),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(t) = table_val {
+            Self::write_stack(state, a, TValue::Table(t));
+            state.pc += 1;
+            return Ok(());
+        }
         let fast_result: Option<Option<TValue>> = {
             let stack = &state.stack;
             let constants = &state.constants;
