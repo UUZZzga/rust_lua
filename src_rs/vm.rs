@@ -453,7 +453,9 @@ pub fn raw_equal(t1: &TValue, t2: &TValue) -> bool {
         }
         (TValue::Str(a), TValue::Str(b)) => a.as_str() == b.as_str(),
         (TValue::LightUserData(a), TValue::LightUserData(b)) => std::ptr::eq(*a, *b),
-        (TValue::Table(a), TValue::Table(b)) => a.data.borrow().gc_header.ptr_id == b.data.borrow().gc_header.ptr_id,
+        (TValue::Table(a), TValue::Table(b)) => {
+            Rc::as_ptr(&a.data) == Rc::as_ptr(&b.data)
+        }
         (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
         (TValue::CClosure(a), TValue::CClosure(b)) => Rc::ptr_eq(a, b),
         (TValue::LCFn(a), TValue::LCFn(b)) => {

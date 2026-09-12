@@ -851,7 +851,11 @@ impl PartialEq for TValue {
                 }
             }
             (TValue::Str(a), TValue::Str(b)) => a == b,
-            (TValue::Table(a), TValue::Table(b)) => a.data.borrow().gc_header.ptr_id == b.data.borrow().gc_header.ptr_id,
+            (TValue::Table(a), TValue::Table(b)) => {
+                // 与 Hash impl 一致: Rc 地址身份比较, 免 RefCell borrow
+                // (borrow_mut 作用域内比较键相等性会 double-borrow panic)
+                Rc::as_ptr(&a.data) == Rc::as_ptr(&b.data)
+            }
             (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
             (TValue::CClosure(a), TValue::CClosure(b)) => Rc::ptr_eq(a, b),
             (TValue::LCFn(a), TValue::LCFn(b)) => {
@@ -909,8 +913,14 @@ impl Hash for TValue {
                 Hash::hash(s, state);
             }
             TValue::Table(t) => {
+                // 身份哈希用 Rc 地址而非 gc_header.ptr_id: gc_header 已移入
+                // TableData (Rc 内), 读它需 borrow — 若哈希发生在宿主表自身的
+                // borrow_mut 作用域内 (如 t[t]=x 触发 rehash 对键 t 求哈希) 会
+                // double-borrow panic (CI #78 all.lua attrib 复现)。
+                // Rc 地址与 ptr_id 同为唯一身份: 同一表的所有 clone 共享同一
+                // Rc → 同地址; 活表键持有 Rc 强引用, 地址不会复用。
                 6u8.hash(state);
-                t.data.borrow().gc_header.ptr_id.hash(state);
+                (Rc::as_ptr(&t.data) as usize).hash(state);
             }
             TValue::LClosure(c) => {
                 7u8.hash(state);

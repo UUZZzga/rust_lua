@@ -197,7 +197,9 @@ pub fn base_rawequal(v1: &TValue, v2: &TValue) -> bool {
         }
         (TValue::Str(a), TValue::Str(b)) => a == b,
         (TValue::LightUserData(a), TValue::LightUserData(b)) => std::ptr::eq(*a, *b),
-        (TValue::Table(a), TValue::Table(b)) => a.data.borrow().gc_header.ptr_id == b.data.borrow().gc_header.ptr_id,
+        (TValue::Table(a), TValue::Table(b)) => {
+            std::rc::Rc::as_ptr(&a.data) == std::rc::Rc::as_ptr(&b.data)
+        }
         (TValue::UserData(a), TValue::UserData(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
         _ => false,
     }
