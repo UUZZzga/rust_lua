@@ -74,11 +74,6 @@ macro_rules! arith_bin {
             (TValue::Integer(i1), TValue::Integer(i2)) => {
                 TValue::Integer((*i1).$int_method(*i2))
             }
-            // perf: Float-Float 显式分支 — 免 to_number_ns 的两次 Option
-            // 解包 (浮点 bench 的 MUL/ADD 全走此分支)
-            (TValue::Float(f1), TValue::Float(f2)) => {
-                TValue::Float(*f1 $op *f2)
-            }
             _ => {
                 if let (Some(n1), Some(n2)) = (to_number_ns($v1), to_number_ns($v2)) {
                     TValue::Float(n1 $op n2)
