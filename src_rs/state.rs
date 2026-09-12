@@ -1332,7 +1332,17 @@ impl LuaState {
             }
         } else if (nresults as usize) == 1 {
             if self.stack.len() > a {
-                self.stack[a] = result;
+                // perf: trivial 旧值 ptr::write 跳过 drop glue (结果槽旧值是
+                // CALL 的函数槽/参数, 常为 BuiltinFn/number)
+                let slot = &mut self.stack[a];
+                if matches!(
+                    slot,
+                    TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)
+                ) {
+                    unsafe { std::ptr::write(slot, result) };
+                } else {
+                    *slot = result;
+                }
                 // perf: 被截断区 (a+1..len) 是 CALL 的参数槽, 常为 trivial (Float/
                 // Integer)。全部 trivial 时用 set_len 跳过 Vec::truncate 的逐槽
                 // drop glue (非内联调用); 有 Rc 变体则回退 truncate 正常 drop。

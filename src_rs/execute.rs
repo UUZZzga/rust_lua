@@ -74,6 +74,11 @@ macro_rules! arith_bin {
             (TValue::Integer(i1), TValue::Integer(i2)) => {
                 TValue::Integer((*i1).$int_method(*i2))
             }
+            // perf: Float-Float 显式分支 — 免 to_number_ns 的两次 Option
+            // 解包 (浮点 bench 的 MUL/ADD 全走此分支)
+            (TValue::Float(f1), TValue::Float(f2)) => {
+                TValue::Float(*f1 $op *f2)
+            }
             _ => {
                 if let (Some(n1), Some(n2)) = (to_number_ns($v1), to_number_ns($v2)) {
                     TValue::Float(n1 $op n2)
@@ -4630,6 +4635,12 @@ impl VmExecutor {
     /// Builtin 写 GETFIELD 目标槽; 未命中/非短串键 → false, 走原 GETFIELD
     /// 全路径 (元表语义由原指令保证)。
     fn try_fuse_getfield(state: &LuaState, table_slot: usize, t: &Table) -> Option<TValue> {
+        // hook 前提: line hook (4) / count hook (8) 启用时放弃融合 — 融合跳过
+        // GETFIELD 的指令级 hook 事件 (行号变化 / 计数递减), 语义要求每条
+        // 指令都被 traceexec 观察。
+        if state.hook_mask & (4 | 8) != 0 {
+            return None;
+        }
         // 下一条指令 (GETTABUP 本身未推进 pc, state.pc 仍指向当前 GETTABUP)
         let next_pc = state.pc + 1;
         let code = &*state.code;
@@ -6104,9 +6115,17 @@ impl VmExecutor {
                 };
 
                 if count > 0 {
-                    Self::write_stack(state, ra, TValue::Integer((count - 1) as i64));
-                    let new_idx = (idx as u64).wrapping_add(step as u64) as i64;
-                    Self::write_stack(state, ra + 2, TValue::Integer(new_idx));
+                    // perf: 三槽由 FORPREP 初始化且类型锁定 Integer, 直写免
+                    // write_stack 的 trivial 判别 (旧值必 Integer)。
+                    // SAFETY: ra/ra+2 < stack.len() — FORPREP 保证且循环不变。
+                    // 经裸指针绕 &mut state 借用: 单线程 VM, 此块内无其他栈访问。
+                    unsafe {
+                        let slot0 = std::ptr::addr_of!(state.stack[ra]) as *mut TValue;
+                        std::ptr::write(slot0, TValue::Integer((count - 1) as i64));
+                        let new_idx = (idx as u64).wrapping_add(step as u64) as i64;
+                        let slot2 = std::ptr::addr_of!(state.stack[ra + 2]) as *mut TValue;
+                        std::ptr::write(slot2, TValue::Integer(new_idx));
+                    }
                     let bx = opcodes::getarg_bx(inst);
                     state.pc = ((state.pc as i32) - bx) as usize;
                 }
