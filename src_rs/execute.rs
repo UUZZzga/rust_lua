@@ -1024,11 +1024,6 @@ impl VmExecutor {
         });
 
         let mut tick: usize = 0;
-        // hook_mask 缓存: 仅能执行 Lua/C 代码的指令 (CALL 族/RETURN 族/MMBIN 族/
-        // TFORCALL/SETLIST 等, 统称"可回调点") 能改变 hook_mask (debug.sethook)。
-        // 这些点全部在下方 match 的对应分支内 — 分支结束时刷新缓存。纯栈/算术
-        // 指令序列 (浮点热循环主体) 每指令省一次 state 字段内存读 (1304B 结构偏移)。
-        let mut hook_mask_cached = state.hook_mask;
         loop {
             // perf: 信号中断检查每 1024 条指令执行一次, 减少原子 load 开销
             // 用独立 tick 计数器而非 state.pc, 因为 state.pc 在紧密循环 (如 while true do end)
@@ -1057,10 +1052,8 @@ impl VmExecutor {
             // VARARGPREP 不触发 hook（对应 C 的 luaG_tracecall 对 vararg 函数返回 0）
             // hook 未启用时 (hook_mask == 0) 此分支从不执行, 提取到 #[cold] 函数
             // 减少 execute_loop 主循环代码体积 (约 45 行 → 3 行), 改善 icache 密度
-            // perf: 用缓存值 — 每指令省 state 字段读; 可回调点分支尾部刷新
-            if hook_mask_cached & (4 | 8) != 0 && op != OpCode::VARARGPREP {
+            if state.hook_mask & (4 | 8) != 0 && op != OpCode::VARARGPREP {
                 Self::traceexec_hooks(state)?;
-                hook_mask_cached = state.hook_mask;
             }
 
             // 调试跟踪输出 — 提取到 cold 函数避免污染主循环 icache
@@ -1083,15 +1076,15 @@ impl VmExecutor {
                 OpCode::LOADNIL => Self::op_loadnil(state, inst),
                 // === 热门 opcode: 表读 ===
                 OpCode::GETUPVAL => Self::op_getupval(state, inst),
-                OpCode::GETTABUP => { let r = Self::op_gettabup(state, inst); hook_mask_cached = state.hook_mask; r }
-                OpCode::GETTABLE => { let r = Self::op_gettable(state, inst); hook_mask_cached = state.hook_mask; r }
-                OpCode::GETI => { let r = Self::op_geti(state, inst); hook_mask_cached = state.hook_mask; r }
-                OpCode::GETFIELD => { let r = Self::op_getfield(state, inst); hook_mask_cached = state.hook_mask; r }
+                OpCode::GETTABUP => Self::op_gettabup(state, inst),
+                OpCode::GETTABLE => Self::op_gettable(state, inst),
+                OpCode::GETI => Self::op_geti(state, inst),
+                OpCode::GETFIELD => Self::op_getfield(state, inst),
                 // === 热门 opcode: 表写 ===
-                OpCode::SETTABUP => { let r = Self::op_settabup(state, inst); hook_mask_cached = state.hook_mask; r }
-                OpCode::SETTABLE => { let r = Self::op_settable(state, inst); hook_mask_cached = state.hook_mask; r }
-                OpCode::SETI => { let r = Self::op_seti(state, inst); hook_mask_cached = state.hook_mask; r }
-                OpCode::SETFIELD => { let r = Self::op_setfield(state, inst); hook_mask_cached = state.hook_mask; r }
+                OpCode::SETTABUP => Self::op_settabup(state, inst),
+                OpCode::SETTABLE => Self::op_settable(state, inst),
+                OpCode::SETI => Self::op_seti(state, inst),
+                OpCode::SETFIELD => Self::op_setfield(state, inst),
                 // === 热门 opcode: 算术运算 (常量版本) ===
                 OpCode::ADDI => Self::op_addi(state, inst),
                 OpCode::ADDK => Self::op_addk(state, inst),
@@ -1113,9 +1106,9 @@ impl VmExecutor {
                 OpCode::NOT => Self::op_not(state, inst),
                 // === 热门 opcode: 跳转/比较 ===
                 OpCode::JMP => Self::op_jmp(state, inst),
-                OpCode::EQ => { let r = Self::op_eq(state, inst); hook_mask_cached = state.hook_mask; r }
-                OpCode::LT => { let r = Self::op_lt(state, inst); hook_mask_cached = state.hook_mask; r }
-                OpCode::LE => { let r = Self::op_le(state, inst); hook_mask_cached = state.hook_mask; r }
+                OpCode::EQ => Self::op_eq(state, inst),
+                OpCode::LT => Self::op_lt(state, inst),
+                OpCode::LE => Self::op_le(state, inst),
                 OpCode::EQK => Self::op_eqk(state, inst),
                 OpCode::EQI => Self::op_eqi(state, inst),
                 OpCode::LTI => Self::op_lti(state, inst),
@@ -1125,25 +1118,25 @@ impl VmExecutor {
                 OpCode::TEST => Self::op_test(state, inst),
                 OpCode::TESTSET => Self::op_testset(state, inst),
                 // === 热门 opcode: 调用/返回 ===
-                OpCode::CALL => { let r = Self::op_call(state, inst); hook_mask_cached = state.hook_mask; r }
-                OpCode::TAILCALL => { let r = Self::op_tailcall(state, inst); hook_mask_cached = state.hook_mask; r }
+                OpCode::CALL => Self::op_call(state, inst),
+                OpCode::TAILCALL => Self::op_tailcall(state, inst),
                 OpCode::RETURN => match Self::op_return(state, inst) {
                     Ok(Some(vr)) => return Ok(vr),
-                    Ok(None) => { hook_mask_cached = state.hook_mask; Ok(()) }
+                    Ok(None) => Ok(()),
                     Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
-                    Err(e) => { hook_mask_cached = state.hook_mask; Err(e) }
+                    Err(e) => Err(e),
                 },
                 OpCode::RETURN0 => match Self::op_return0(state, inst) {
                     Ok(Some(vr)) => return Ok(vr),
-                    Ok(None) => { hook_mask_cached = state.hook_mask; Ok(()) }
+                    Ok(None) => Ok(()),
                     Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
-                    Err(e) => { hook_mask_cached = state.hook_mask; Err(e) }
+                    Err(e) => Err(e),
                 },
                 OpCode::RETURN1 => match Self::op_return1(state, inst) {
                     Ok(Some(vr)) => return Ok(vr),
-                    Ok(None) => { hook_mask_cached = state.hook_mask; Ok(()) }
+                    Ok(None) => Ok(()),
                     Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
-                    Err(e) => { hook_mask_cached = state.hook_mask; Err(e) }
+                    Err(e) => Err(e),
                 },
                 // === 热门 opcode: numeric for 循环 ===
                 OpCode::FORLOOP => Self::op_forloop(state, inst),
@@ -1156,11 +1149,7 @@ impl VmExecutor {
                 // MMBIN/MMBINI/MMBINK(元方法), UNM/BNOT(一元), LEN/CONCAT(长度/拼接)
                 // CLOSE/TBC(关闭/标记), TFORPREP/TFORCALL/TFORLOOP(generic for)
                 // SETLIST/CLOSURE/VARARG/GETVARG(少用), ERRNNIL/VARARGPREP/EXTRAARG(错误/特殊)
-                _ => {
-                    let r = Self::dispatch_cold_opcodes(state, op, inst);
-                    hook_mask_cached = state.hook_mask;
-                    r
-                }
+                _ => Self::dispatch_cold_opcodes(state, op, inst),
             };
             match result {
                 Ok(()) => {}
