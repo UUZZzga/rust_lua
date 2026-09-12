@@ -4726,7 +4726,13 @@ impl VmExecutor {
     }
 
     /// op_call 的 pure BuiltinFn 调用体 — 从单次栈读探测进入。
-    #[inline(never)]
+    ///
+    /// perf: 薄中转设计 — nargs/nresults 计算与 `call rax` 留在本函数
+    /// (#[inline] 让 LLVM 将其折叠进 op_call 内联体), 两个 Err 分支的
+    /// CallInfoEntry 补推 (大体积: name_str + 结构体构造) 提取到 #[cold]
+    /// 恢复函数。相比整函数 #[inline] (体积 +7%, CI 已证无益), 这里错误
+    /// 路径体积被剥离, 内联膨胀仅剩 ~15 条指令的成功路径。
+    #[cfg_attr(not(size_optimized), inline)]
     fn call_pure_builtin(
         state: &mut LuaState,
         a: usize,
@@ -4734,52 +4740,69 @@ impl VmExecutor {
         c: i32,
         bf: crate::objects::BuiltinFn,
     ) -> Result<(), VmError> {
-        {
-            let nargs = if b == 0 {
-                state.top.saturating_sub(a + 1)
-            } else {
-                b.saturating_sub(1)
-            };
-            let nresults = if c == 0 { -1 } else { c - 1 };
-            match (bf.func)(state, a, nargs, nresults) {
-                Ok(()) => {
-                    state.pc += 1;
-                    return Ok(());
-                }
-                Err(VmError::Yield(values)) => {
-                    // 防御: 被误标 pure 的函数 yield — 补推 CallInfoEntry 后按
-                    // impure 慢路径语义传播 yield (call_info 保留供 resume 使用,
-                    // 对应 op_call_generic 的 is_yield 分支: 不 pop、不截断)
-                    state.call_info.push(crate::state::CallInfoEntry {
-                        is_c: true,
-                        closure: None,
-                        base: a + 1,
-                        saved_pc: state.pc,
-                        name: Some(bf.name_str()),
-                        namewhat: "function",
-                        proto_flag: state.proto_flag,
-                        nextraargs: state.nextraargs,
-                        is_tailcall: false,
-                    });
-                    return Err(VmError::Yield(values));
-                }
-                Err(e) => {
-                    // 补推 CallInfoEntry 供 traceback / debug.getinfo 读取
-                    state.call_info.push(crate::state::CallInfoEntry {
-                        is_c: true,
-                        closure: None,
-                        base: a + 1,
-                        saved_pc: state.pc,
-                        name: Some(bf.name_str()),
-                        namewhat: "function",
-                        proto_flag: state.proto_flag,
-                        nextraargs: state.nextraargs,
-                        is_tailcall: false,
-                    });
-                    return Err(e);
-                }
+        let nargs = if b == 0 {
+            state.top.saturating_sub(a + 1)
+        } else {
+            b.saturating_sub(1)
+        };
+        let nresults = if c == 0 { -1 } else { c - 1 };
+        match (bf.func)(state, a, nargs, nresults) {
+            Ok(()) => {
+                state.pc += 1;
+                Ok(())
             }
+            Err(VmError::Yield(values)) => Err(Self::pure_builtin_yielded(state, a, bf, values)),
+            Err(e) => Err(Self::pure_builtin_errored(state, a, bf, e)),
         }
+    }
+
+    /// pure BuiltinFn 防御路径 — 被误标 pure 的函数 yield。
+    /// 补推 CallInfoEntry 后按 impure 慢路径语义传播 yield
+    /// (call_info 保留供 resume 使用, 对应 op_call_generic 的 is_yield 分支:
+    /// 不 pop、不截断)。
+    #[cold]
+    #[inline(never)]
+    fn pure_builtin_yielded(
+        state: &mut LuaState,
+        a: usize,
+        bf: crate::objects::BuiltinFn,
+        values: Vec<TValue>,
+    ) -> VmError {
+        state.call_info.push(crate::state::CallInfoEntry {
+            is_c: true,
+            closure: None,
+            base: a + 1,
+            saved_pc: state.pc,
+            name: Some(bf.name_str()),
+            namewhat: "function",
+            proto_flag: state.proto_flag,
+            nextraargs: state.nextraargs,
+            is_tailcall: false,
+        });
+        VmError::Yield(values)
+    }
+
+    /// pure BuiltinFn 错误路径 — 补推 CallInfoEntry 供 traceback / debug.getinfo。
+    #[cold]
+    #[inline(never)]
+    fn pure_builtin_errored(
+        state: &mut LuaState,
+        a: usize,
+        bf: crate::objects::BuiltinFn,
+        e: VmError,
+    ) -> VmError {
+        state.call_info.push(crate::state::CallInfoEntry {
+            is_c: true,
+            closure: None,
+            base: a + 1,
+            saved_pc: state.pc,
+            name: Some(bf.name_str()),
+            namewhat: "function",
+            proto_flag: state.proto_flag,
+            nextraargs: state.nextraargs,
+            is_tailcall: false,
+        });
+        e
     }
 
 
