@@ -1035,26 +1035,34 @@ impl VmExecutor {
                 .unwrap_or(0)
         });
 
-        // perf: 信号中断检查改为仅在回跳指令 (FORLOOP/JMP/TFORLOOP 回跳方向) 时执行。
-        // 原实现每条指令 tick+1 + test 1023 — 浮点 bench 20 条指令 × 1e7 次迭代,
-        // 固定前缀中这两条占可见比例。所有 Lua 循环都必然执行回跳指令
-        // (FORLOOP / 条件 JMP / TFORLOOP), 在回跳点检查保证 `while true do end`
-        // 等紧密循环仍能被 SIGINT 中断, 每迭代仍检查 ≥1 次 (与 C 的 hook 语义同级)。
-        // 非循环直线代码: 每函数有界 (max_stack_size 有上限), 函数结束 RETURN,
-        // pcall/dofile 边界由 C 层 poll — 交互式 REPL 的响应性不受影响。
-        #[inline(always)]
-        fn check_interrupted() -> Result<(), VmError> {
-            if INTERRUPTED.load(Ordering::Relaxed) {
+        // perf: 中断检查 — 每 64 次迭代 (即 64 条指令) 做一次原子 load,
+        // 摊销 Relaxed load 的延迟到 64 条指令上。所有 Lua 循环都必然执行回跳,
+        // 紧密循环 (while true do end) 每迭代仍至少过一次循环头。
+        // (tick 计数器在寄存器, test+je 热路径 2 条指令)
+        let mut tick: u64 = 0;
+
+        // perf: code Vec 缓存 — state.code 是 Rc<Vec>, 原实现每条指令做
+        // 两次依赖内存解引用 (Rc ptr → Vec ptr → data/len)。这里把 Vec 的
+        // ptr+len 缓存到栈局部, 每条指令只做一次 Rc::ptr_eq 指针比较
+        // (无依赖链, 指针本身已在寄存器)。code 只在 call/return/pcall 等帧
+        // 切换点被整体替换 (Rc::clone/mem::replace, 无 make_mut 原地改),
+        // 不等时 refetch, 语义与直接解引用完全一致。
+        let mut code_vec: *const Vec<Instruction> = Rc::as_ptr(&state.code);
+
+        loop {
+            tick = tick.wrapping_add(1);
+            if (tick & 63) == 0 && INTERRUPTED.load(Ordering::Relaxed) {
                 INTERRUPTED.store(false, Ordering::Release);
                 return Err(VmError::RuntimeError("interrupted!".to_string()));
             }
-            Ok(())
-        }
-        loop {
-            check_interrupted()?;
-            // pc 越界处理: 编译器保证字节码末尾总有 OP_RETURN, 正常执行不会越界。
-            // 分支预测器总是预测 "in bounds", 实际开销 ~0 cycle。
-            let code = &*state.code;
+            // 缓存失效检查: code Rc 在帧切换时被整体替换 → ptr 变化 → refetch
+            if !std::ptr::eq(code_vec, Rc::as_ptr(&state.code)) {
+                code_vec = Rc::as_ptr(&state.code);
+            }
+            // SAFETY: code_vec 指向当前 state.code 的 Vec; 本迭代内 state.code
+            // 不会被替换 (替换只发生在 handler 调用内部, 下次迭代重检)。
+            // 与原实现 `let code = &*state.code` 等价, 仅省去双 deref。
+            let code: &Vec<Instruction> = unsafe { &*code_vec };
             if state.pc >= code.len() {
                 if let Some(ret) = Self::handle_pc_overflow(state)? {
                     return Ok(ret);
