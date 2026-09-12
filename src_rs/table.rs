@@ -209,60 +209,36 @@ impl Table {
         (val, has_mt)
     }
 
-    /// BuiltinFn 特化查找 — GETTABUP/GETFIELD 热路径专用。
+    /// 单次探测特化查找 — GETTABUP/GETFIELD 热路径专用。
     ///
-    /// perf: math.sin/cos/sqrt 等库函数表访问是浮点循环的主体。BuiltinFn 是
-    /// 16B Copy, 直接拷贝返回; 免去 TValue::clone 的 enum match + Rc inc/dec
-    /// (编译器无法内联的大 sret call)。命中返回 Some(bf), 值非 BuiltinFn 或
-    /// 未命中返回 None (调用方回退 get_and_metatable)。
+    /// 一次哈希探测返回命中槽的 &TValue 引用, 调用方按值类型分支处理:
+    /// BuiltinFn → Copy 直取 (零 clone); Table → 结构 copy + Rc inc;
+    /// 其他类型/未命中 → 调用方回退通用路径 (语义不变)。
+    /// 取代此前 BuiltinFn/Table 各自探测的双查找
+    /// (GETTABUP(math) 会 miss 一次 BuiltinFn 再 hit Table, 两次探测)。
+    ///
+    /// 元表存在时返回 None (__index 可能拦截, 不能绕过)。
     #[cfg_attr(not(size_optimized), inline)]
-    pub fn get_builtin_fn(&self, key: &TValue) -> Option<crate::objects::BuiltinFn> {
-        // 快速预检: 键必须是 interned ShortString, 表有元表时走原路径
-        // (元表 __index 可能拦截, 语义不能绕过)
+    pub fn find_str_ref<'a>(&'a self, key: &TValue) -> Option<&'a TValue> {
         let data = self.data_ro();
         if data.metatable.is_some() {
             return None;
         }
         let ktb = data.key_to_bucket.as_ref()?;
-        let sh = match key {
-            TValue::Str(crate::strings::LuaString::Short(ss)) => ss.hash,
-            _ => return None,
-        };
+        match key {
+            TValue::Str(crate::strings::LuaString::Short(_)) => {}
+            _ => return None, // 只特化 interned 短字符串键
+        }
         let hash = crate::objects::tvalue_fx_hash(key);
         let entry = ktb.find(hash, |(k, _)| match (k, key) {
             (TValue::Str(a), TValue::Str(b)) => a == b,
             _ => false,
         })?;
-        match &data.hash_buckets[entry.1].1 {
-            TValue::BuiltinFn(bf) => Some(*bf),
-            _ => None, // 非 BuiltinFn 值: 回退原路径 (保证语义一致)
+        let v = &data.hash_buckets[entry.1].1;
+        if matches!(v, TValue::Nil(NilKind::Empty)) {
+            return None; // tombstone 视为未命中
         }
-    }
-
-    /// Table 值特化查找 — GETTABUP 返回表 (如 _ENV.math) 的热路径。
-    /// 绕过 TValue::clone 的非内联 24B sret call: Table 结构 (gc_header + Rc
-    /// 指针) 直接 copy, 仅 Rc 引用计数 inc。命中返回 Some(table), 值非 Table
-    /// 或未命中返回 None (调用方回退通用路径)。
-    #[cfg_attr(not(size_optimized), inline)]
-    pub fn get_table_value(&self, key: &TValue) -> Option<Table> {
-        let data = self.data_ro();
-        if data.metatable.is_some() {
-            return None;
-        }
-        let ktb = data.key_to_bucket.as_ref()?;
-        let sh = match key {
-            TValue::Str(crate::strings::LuaString::Short(ss)) => ss.hash,
-            _ => return None,
-        };
-        let hash = crate::objects::tvalue_fx_hash(key);
-        let entry = ktb.find(hash, |(k, _)| match (k, key) {
-            (TValue::Str(a), TValue::Str(b)) => a == b,
-            _ => false,
-        })?;
-        match &data.hash_buckets[entry.1].1 {
-            TValue::Table(t) => Some(t.clone()),
-            _ => None,
-        }
+        Some(v)
     }
 
     pub fn get(&self, key: &TValue) -> Option<TValue> {
