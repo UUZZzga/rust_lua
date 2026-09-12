@@ -43,6 +43,8 @@ static LUA_VM_TRACE_LEVEL: OnceLock<u8> = OnceLock::new();
 enum SpecValue {
     Builtin(crate::objects::BuiltinFn),
     Table(Table),
+    /// 目标槽已持同对象 — 跳过 clone+写栈 (Rc 计数无扰动)
+    Skip,
 }
 
 
@@ -2983,7 +2985,25 @@ impl VmExecutor {
                 match (key_opt, table_ref) {
                     (Some(key), Some(TValue::Table(t))) => match t.find_str_ref(key) {
                         Some(TValue::BuiltinFn(bf)) => Some(SpecValue::Builtin(*bf)),
-                        Some(TValue::Table(t2)) => Some(SpecValue::Table(t2.clone())),
+                        Some(TValue::Table(t2)) => {
+                            // perf: 目标槽若已持同一表 (GETTABUP(math) 每迭代写同槽),
+                            // 跳过 clone + 覆写 — Rc 计数无扰动, 免 inc/dec 往返。
+                            // 判定用 data Rc 指针 (同 heap 对象)。命中跳过时槽内容
+                            // 已是期望值, 无需写栈。
+                            if a < state.stack.len() {
+                                if let TValue::Table(old) = &state.stack[a] {
+                                    if std::rc::Rc::ptr_eq(&old.data, &t2.data) {
+                                        Some(SpecValue::Skip)
+                                    } else {
+                                        Some(SpecValue::Table(t2.clone()))
+                                    }
+                                } else {
+                                    Some(SpecValue::Table(t2.clone()))
+                                }
+                            } else {
+                                Some(SpecValue::Table(t2.clone()))
+                            }
+                        }
                         _ => None,
                     },
                     _ => None,
@@ -3000,6 +3020,11 @@ impl VmExecutor {
             }
             Some(SpecValue::Table(t)) => {
                 Self::write_stack(state, a, TValue::Table(t));
+                state.pc += 1;
+                return Ok(());
+            }
+            Some(SpecValue::Skip) => {
+                // 目标槽已持同对象: 槽内容即期望值, 只推进 pc
                 state.pc += 1;
                 return Ok(());
             }
@@ -3185,6 +3210,11 @@ impl VmExecutor {
             }
             Some(SpecValue::Table(t)) => {
                 Self::write_stack(state, a, TValue::Table(t));
+                state.pc += 1;
+                return Ok(());
+            }
+            Some(SpecValue::Skip) => {
+                // 目标槽已持同对象: 槽内容即期望值, 只推进 pc
                 state.pc += 1;
                 return Ok(());
             }
