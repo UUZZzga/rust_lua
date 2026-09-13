@@ -3256,6 +3256,10 @@ pub fn open_base_lib(state: &mut LuaState) {
     register(state, c"tostring", call_tostring);
     register(state, c"assert", call_assert);
     register(state, c"select", call_select);
+    // perf: select 登记为 pure — 不回调 Lua / 不 yield / 参数错误返回 Err,
+    // op_call 走零簿记快速路径 (vararg 调用 select('#', ...) / select(n, ...) 热路径)。
+    // open_base_lib 时 state.pure_fns 尚无共享者, make_mut 不会 clone 集合。
+    Rc::make_mut(&mut state.pure_fns).insert(call_select as usize);
     register(state, c"rawequal", call_rawequal);
     register(state, c"rawlen", call_rawlen);
     register(state, c"rawget", call_rawget);
