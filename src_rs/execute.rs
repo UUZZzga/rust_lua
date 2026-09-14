@@ -1044,10 +1044,12 @@ impl VmExecutor {
                 .unwrap_or(0)
         });
 
-        // perf: 中断检查 — 每 64 次迭代 (即 64 条指令) 做一次原子 load,
-        // 摊销 Relaxed load 的延迟到 64 条指令上。所有 Lua 循环都必然执行回跳,
-        // 紧密循环 (while true do end) 每迭代仍至少过一次循环头。
-        // (tick 计数器在寄存器, test+je 热路径 2 条指令)
+        // perf: 中断检查 — 不再按指令摊销。信号中断 (SIGINT → laction 设置
+        // INTERRUPTED) 的观测点移至所有向后跳转处 (JMP 回跳 / FORLOOP 继续 /
+        // 条件跳回 / 冷分发), 无限循环必然每迭代过一次回跳, 直线代码段由
+        // 函数末尾 RETURN / pc 越界兜底 (同样带检查)。热循环指令前缀省去
+        // tick 自增 + test + je 三条指令。
+        // (tick 计数器仅用于回跳处的 64 次摊销, 回跳点自增。)
         let mut tick: u64 = 0;
 
         // perf: code Vec 缓存 v2 — ptr+len 直接驻留主循环局部, 每指令零内存
@@ -1058,12 +1060,22 @@ impl VmExecutor {
         // 写点均为整体替换且伴随帧切换 (#136 审计)。
         let mut code_ptr: *const Instruction = state.code.as_ptr();
         let mut code_len: usize = state.code.len();
-        // perf: constants Vec 数据指针缓存 — K 常量指令 (ADDK/MULK/MODK/GETFIELD/)
+        // perf: constants Vec 数据指针缓存 — K 常量指令 (ADDK/MULK/MODK/GETFIELD/
         // GETTABUP 等) 原每指令 Rc→Vec 双 deref 取常量。与 code_ptr 同点刷新
         // (帧切换 9 点), 帧内 constants Vec 不被整体替换 (与 code 相同的 Rc 写点
         // 审计结论)。K 越界由 len 检查兜底 (constants_len)。
         let mut constants_ptr: *const TValue = state.constants.as_ptr();
         let mut constants_len: usize = state.constants.len();
+
+        // perf: hook/trace 活动字节缓存 — trace_level | (hook_mask & (4|8))。
+        // hook_mask 只能被 Lua/C 回调路径修改 (debug.sethook 是被调函数; 元方法
+        // 经 CALL 机制; 协程切换经 execute_loop 进出), 这些路径全部收敛到
+        // CALL/TAILCALL/RETURN 族 / FORPREP / 错误恢复 / pc 越界的分支尾刷新。
+        // 直线指令段 (热循环主体) 每条指令省一次 state 内存读 (~1300B 结构体
+        // 深偏移)。原 ef62e03 缓存版在表读指令尾部也刷新导致净亏已 revert,
+        // 本版仅在真实回调收敛点刷新 (GETTABUP/GETFIELD 等 fast 路径不刷新 —
+        // 其慢路径元方法必然经 ErrOutcome::Continue 恢复, 该处刷新)。
+        let mut hook_active: u8 = trace_level | (state.hook_mask & (4 | 8)) as u8;
 
         // C 形状 pc 寄存器化 — 对应 C luaV_execute 的局部 pc (vmfetch: i = *(pc++))。
         // 主循环仅在帧切换点 (CALL/TAILCALL/RETURN*/cold dispatch/FORPREP 后) 从
@@ -1078,15 +1090,17 @@ impl VmExecutor {
         let mut pc: usize = state.pc;
 
         loop {
-            tick = tick.wrapping_add(1);
-            if (tick & 63) == 0 && INTERRUPTED.load(Ordering::Relaxed) {
-                INTERRUPTED.store(false, Ordering::Release);
-                state.pc = pc; // 中断错误行号需要当前指令 (对应 HEAD 的 state.pc 语义)
-                return Err(VmError::RuntimeError("interrupted!".to_string()));
-            }
             // SAFETY: code_ptr 指向当前帧 state.code 的 Vec 数据区; 直线指令段内
             // state.code 不被替换 (见上方缓存 v2 注释)。pc < code_len 已检查。
             if pc >= code_len {
+                // 直线段兜底中断检查 (无回跳长直线段至此必经; 每函数末尾 RETURN
+                // 之外的最后防线, 64 次摊销)
+                tick = tick.wrapping_add(1);
+                if tick & 63 == 0 && INTERRUPTED.load(Ordering::Relaxed) {
+                    state.pc = pc;
+                    INTERRUPTED.store(false, Ordering::Release);
+                    return Err(VmError::RuntimeError("interrupted!".to_string()));
+                }
                 state.pc = pc; // sync 供 handle_pc_overflow 弹帧
                 if let Some(ret) = Self::handle_pc_overflow(state)? {
                     return Ok(ret);
@@ -1096,6 +1110,7 @@ impl VmExecutor {
                 constants_ptr = state.constants.as_ptr();
                 code_len = state.code.len();
                 constants_len = state.constants.len();
+                hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
                 continue;
             }
             // perf: constants 缓存切片 — 由常量指针构建, LLVM 可将其 ptr+len
@@ -1110,12 +1125,11 @@ impl VmExecutor {
             pc += 1; // 寄存器自增 (对应 C 的 *(pc++))
             let op = opcodes::get_opcode(inst);
 
-            // perf: hook 检查与调试跟踪合并为单次位测试。trace_or_hook 为 0 时
-            // (bench/生产常态) 一条 cmp+jcc 同时跳过两个路径; 非 0 时进入冷块
-            // 分别处理 — 语义不变, 每指令省一次独立 load+test。
-            // (trace_level 是 OnceLock 缓存的栈局部值, hook_mask 是 state 字段,
-            //  合并后热路径只测试栈局部值, state.hook_mask 的 load 延迟到冷块。)
-            if trace_level | (state.hook_mask & (4 | 8)) as u8 != 0 && op != OpCode::VARARGPREP {
+            // perf: hook/trace 合并单测试 — 缓存字节 (栈局部) 非 0 时进冷块。
+            // 热路径 (bench/生产常态) 仅 test+jcc, 零 state 内存读。
+            // (hook_active 在所有回调收敛点刷新: CALL/RETURN 族分支尾、
+            //  错误恢复、pc 越界、本冷块出口。)
+            if hook_active != 0 && op != OpCode::VARARGPREP {
                 state.pc = cur; // sync: 行 hook/trace 需要 state.pc = 当前指令 (C savepc)
                 // 对应 C 的 luaG_traceexec: count hook + line hook
                 if state.hook_mask & (4 | 8) != 0 {
@@ -1124,6 +1138,7 @@ impl VmExecutor {
                 if trace_level >= 1 {
                     Self::trace_exec(state, trace_level);
                 }
+                hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
             }
 
             // 主分发: 热门 opcode 内联处理, 冷门 opcode 路由到 #[cold] 函数
@@ -1171,18 +1186,18 @@ impl VmExecutor {
                 // === 热门 opcode: 逻辑非 (deleted) ===
                 OpCode::NOT => Self::op_not(state, inst),
                 // === 热门 opcode: 跳转/比较 (param-pc; 比较冷路径带 cur sync) ===
-                OpCode::JMP => Self::op_jmp(state, inst, &mut pc),
-                OpCode::EQ => Self::op_eq(state, inst, cur, &mut pc),
-                OpCode::LT => Self::op_lt(state, inst, cur, &mut pc),
-                OpCode::LE => Self::op_le(state, inst, cur, &mut pc),
-                OpCode::EQK => Self::op_eqk(state, inst, cur, &mut pc),
-                OpCode::EQI => Self::op_eqi(state, inst, cur, &mut pc),
-                OpCode::LTI => Self::op_lti(state, inst, cur, &mut pc),
-                OpCode::LEI => Self::op_lei(state, inst, cur, &mut pc),
-                OpCode::GTI => Self::op_gti(state, inst, cur, &mut pc),
-                OpCode::GEI => Self::op_gei(state, inst, cur, &mut pc),
-                OpCode::TEST => Self::op_test(state, inst, &mut pc),
-                OpCode::TESTSET => Self::op_testset(state, inst, &mut pc),
+                OpCode::JMP => Self::op_jmp(state, inst, &mut pc, &mut tick),
+                OpCode::EQ => Self::op_eq(state, inst, cur, &mut pc, &mut tick),
+                OpCode::LT => Self::op_lt(state, inst, cur, &mut pc, &mut tick),
+                OpCode::LE => Self::op_le(state, inst, cur, &mut pc, &mut tick),
+                OpCode::EQK => Self::op_eqk(state, inst, cur, &mut pc, &mut tick),
+                OpCode::EQI => Self::op_eqi(state, inst, cur, &mut pc, &mut tick),
+                OpCode::LTI => Self::op_lti(state, inst, cur, &mut pc, &mut tick),
+                OpCode::LEI => Self::op_lei(state, inst, cur, &mut pc, &mut tick),
+                OpCode::GTI => Self::op_gti(state, inst, cur, &mut pc, &mut tick),
+                OpCode::GEI => Self::op_gei(state, inst, cur, &mut pc, &mut tick),
+                OpCode::TEST => Self::op_test(state, inst, &mut pc, &mut tick),
+                OpCode::TESTSET => Self::op_testset(state, inst, &mut pc, &mut tick),
                 // === 热门 opcode: 调用/返回 (flow 类: sync → handler → 重载) ===
                 OpCode::CALL => {
                     state.pc = cur;
@@ -1192,6 +1207,7 @@ impl VmExecutor {
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
                     constants_len = state.constants.len();
+                    hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
                     r
                 }
                 OpCode::TAILCALL => {
@@ -1202,6 +1218,7 @@ impl VmExecutor {
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
                     constants_len = state.constants.len();
+                    hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
                     r
                 }
                 OpCode::RETURN => {
@@ -1212,6 +1229,7 @@ impl VmExecutor {
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
                     constants_len = state.constants.len();
+                    hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
                         Ok(None) => Ok(()),
@@ -1227,6 +1245,7 @@ impl VmExecutor {
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
                     constants_len = state.constants.len();
+                    hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
                         Ok(None) => Ok(()),
@@ -1242,6 +1261,7 @@ impl VmExecutor {
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
                     constants_len = state.constants.len();
+                    hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
                         Ok(None) => Ok(()),
@@ -1252,7 +1272,7 @@ impl VmExecutor {
                 // === 热门 opcode: numeric for 循环 ===
                 // FORLOOP 每迭代执行 (param-pc); FORPREP 每循环一次 (flow-lite:
                 // sync/reload, 内部错误路径天然持有正确 state.pc, 零内部改动)
-                OpCode::FORLOOP => Self::op_forloop(state, inst, &mut pc),
+                OpCode::FORLOOP => Self::op_forloop(state, inst, &mut pc, &mut tick),
                 OpCode::FORPREP => {
                     state.pc = cur;
                     let r = Self::op_forprep(state, inst);
@@ -1261,6 +1281,7 @@ impl VmExecutor {
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
                     constants_len = state.constants.len();
+                    hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
                     r
                 }
                 // === SETUPVAL: 写 upvalue (deleted) ===
@@ -1283,6 +1304,7 @@ impl VmExecutor {
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
                     constants_len = state.constants.len();
+                    hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
                     r
                 }
             };
@@ -1295,6 +1317,7 @@ impl VmExecutor {
                         constants_ptr = state.constants.as_ptr();
                         code_len = state.code.len();
                         constants_len = state.constants.len();
+                        hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
                         continue;
                     }
                     ErrOutcome::Return(r) => return Ok(r),
@@ -2237,7 +2260,13 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline(always))]
-    fn do_conditional_jump(state: &LuaState, inst: Instruction, cond: bool, cur: usize) -> usize {
+    fn do_conditional_jump(
+        state: &mut LuaState,
+        inst: Instruction,
+        cond: bool,
+        cur: usize,
+        tick: Option<&mut u64>,
+    ) -> Result<usize, VmError> {
         // 对应 C 的 docondjump: 纯计算下一 pc, 不写 state.pc。
         // 热路径调用方把结果写入寄存器 pc; finishOp (yield 恢复) 写回 state.pc。
         let expected = opcodes::testarg_k(inst);
@@ -2246,16 +2275,39 @@ impl VmExecutor {
             // cur 是当前比较指令位置，JMP 在 cur + 1
             let jmp_pc = cur + 1;
             if jmp_pc >= state.code.len() {
-                return jmp_pc; // 越界: 调用方写入后由循环头 handle_pc_overflow 弹帧
+                return Ok(jmp_pc); // 越界: 调用方写入后由循环头 handle_pc_overflow 弹帧
             }
             let jmp_inst = state.code[jmp_pc];
             let sj = opcodes::getarg_sj(jmp_inst);
-            ((jmp_pc as i32) + sj + 1) as usize
+            let target = ((jmp_pc as i32) + sj + 1) as usize;
+            // 回跳 (target <= cur): 中断观测点。主循环传入 tick; finishOp
+            // 恢复路径 (无 tick) 传 None — 恢复点本身伴随 CALL/RETURN 刷新兜底。
+            if target <= cur {
+                if let Some(t) = tick {
+                    Self::backedge_check(state, t, target)?;
+                }
+            }
+            Ok(target)
         } else {
-            cur + 2 // Skip the jump (对应 C 的 pc++): 跳过 TEST 和 JMP
+            Ok(cur + 2) // Skip the jump (对应 C 的 pc++): 跳过 TEST 和 JMP
         }
     }
 
+    /// 回边中断检查 — 跳转目标向后 (target <= src) 时在调用方调用。
+    /// perf: 中断观测点从每指令 tick 移到所有回跳处; 无限循环必然每迭代过
+    /// 一次回跳, 64 次摊销 atomic load。回跳路径仅 4 条热指令
+    /// (target/src cmp 在调用方已做, 此处 add tick + test + jcc)。
+    /// 直线段由循环头 pc 越界兜底 (同样带检查)。
+    #[cfg_attr(not(size_optimized), inline)]
+    fn backedge_check(state: &mut LuaState, tick: &mut u64, cur: usize) -> Result<(), VmError> {
+        *tick = tick.wrapping_add(1);
+        if *tick & 63 == 0 && INTERRUPTED.load(Ordering::Relaxed) {
+            INTERRUPTED.store(false, Ordering::Release);
+            state.pc = cur; // 中断错误行号 (savepc 语义)
+            return Err(VmError::RuntimeError("interrupted!".to_string()));
+        }
+        Ok(())
+    }
     /// 元方法 continuation — 对应 C Lua 的 luaV_finishOp
     ///
     /// yield 穿过元方法后，resume 时元方法返回，由此函数完成被中断的指令
@@ -2345,7 +2397,7 @@ impl VmExecutor {
             match op {
                 OpCode::LE | OpCode::LT | OpCode::LEI | OpCode::LTI | OpCode::GTI | OpCode::GEI => {
                     let cond = !result_val.is_false();
-                    state.pc = Self::do_conditional_jump(state, inst, cond, state.pc);
+                    state.pc = Self::do_conditional_jump(state, inst, cond, state.pc, None)?;
                 }
                 OpCode::MMBIN | OpCode::MMBINI | OpCode::MMBINK => {
                     // 结果已在目标寄存器 (metamethod_res = RA(pi))
@@ -4477,10 +4529,20 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_jmp(_state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_jmp(
+        _state: &mut LuaState,
+        inst: Instruction,
+        pc: &mut usize,
+        tick: &mut u64,
+    ) -> Result<(), VmError> {
         let sj = opcodes::getarg_sj(inst);
         // pc 已 = cur+1 (对应 C fetch 后的 pc), 目标 = cur+1+sj == *pc + sj
-        *pc = ((*pc as i32) + sj) as usize;
+        let target = ((*pc as i32) + sj) as usize;
+        *pc = target;
+        // 回跳 (sj < 0): 中断观测点
+        if sj < 0 {
+            Self::backedge_check(_state, tick, target)?;
+        }
         Ok(())
     }
 
@@ -4492,6 +4554,7 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
+        tick: &mut u64,
     ) -> Result<(), VmError> {
         // C: StkId ra = RA(i); TValue *rb = vRB(i);
         //     Protect(cond = luaV_equalobj(L, s2v(ra), rb));
@@ -4523,7 +4586,7 @@ impl VmExecutor {
                 equal_obj(state, &v1, &v2)?
             }
         };
-        *pc = Self::do_conditional_jump(state, inst, cond, cur);
+        *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
         Ok(())
     }
 
@@ -4533,6 +4596,7 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
+        tick: &mut u64,
     ) -> Result<(), VmError> {
         // C: op_order(L, l_lti, LTnum, lessthanothers)
         // lessthanothers: if (string) strcmp; else luaT_callorderTM(L, l, r, TM_LT)
@@ -4559,7 +4623,7 @@ impl VmExecutor {
                 call_order_tm(state, &v1, &v2, TagMethod::Lt)?
             }
         };
-        *pc = Self::do_conditional_jump(state, inst, cond, cur);
+        *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
         Ok(())
     }
 
@@ -4569,6 +4633,7 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
+        tick: &mut u64,
     ) -> Result<(), VmError> {
         // C: op_order(L, l_lei, LEnum, lessequalothers)
         // lessequalothers: if (string) strcmp; else luaT_callorderTM(L, l, r, TM_LE)
@@ -4595,7 +4660,7 @@ impl VmExecutor {
                 call_order_tm(state, &v1, &v2, TagMethod::Le)?
             }
         };
-        *pc = Self::do_conditional_jump(state, inst, cond, cur);
+        *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
         Ok(())
     }
 
@@ -4605,13 +4670,14 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
+        tick: &mut u64,
     ) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b_key = opcodes::getarg_b(inst) as usize;
         let v1 = Self::read_stack(state, a);
         let v2 = state.constants.get(b_key).unwrap();
         let cond = raw_equal(v1, v2);
-        *pc = Self::do_conditional_jump(state, inst, cond, cur);
+        *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
         Ok(())
     }
 
@@ -4621,6 +4687,7 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
+        tick: &mut u64,
     ) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         // EQI 是 IABC 模式,使用 sB 参数 (有符号 B, 8 位)
@@ -4632,7 +4699,7 @@ impl VmExecutor {
             TValue::Float(f) => (*f - im as f64).abs() < f64::EPSILON,
             _ => false,
         };
-        *pc = Self::do_conditional_jump(state, inst, cond, cur);
+        *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
         Ok(())
     }
 
@@ -4642,6 +4709,7 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
+        tick: &mut u64,
     ) -> Result<(), VmError> {
         // C: op_orderI(L, l_lti, luai_numlt, 0, TM_LT)
         // flip = 0, event = LT → __lt(a, im)
@@ -4667,7 +4735,7 @@ impl VmExecutor {
                 crate::tm::call_orderi_tm(state, &v, im, false, isfloat, TagMethod::Lt)?
             }
         };
-        *pc = Self::do_conditional_jump(state, inst, cond, cur);
+        *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
         Ok(())
     }
 
@@ -4677,6 +4745,7 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
+        tick: &mut u64,
     ) -> Result<(), VmError> {
         // C: op_orderI(L, l_lei, luai_numle, 0, TM_LE)
         // flip = 0, event = LE → __le(a, im)
@@ -4699,7 +4768,7 @@ impl VmExecutor {
                 crate::tm::call_orderi_tm(state, &v, im, false, isfloat, TagMethod::Le)?
             }
         };
-        *pc = Self::do_conditional_jump(state, inst, cond, cur);
+        *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
         Ok(())
     }
 
@@ -4709,6 +4778,7 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
+        tick: &mut u64,
     ) -> Result<(), VmError> {
         // C: op_orderI(L, l_gti, luai_numgt, 1, TM_LT)
         // flip = 1, event = LT → __lt(im, a)  (a > im 等价于 im < a)
@@ -4731,7 +4801,7 @@ impl VmExecutor {
                 crate::tm::call_orderi_tm(state, &v, im, true, isfloat, TagMethod::Lt)?
             }
         };
-        *pc = Self::do_conditional_jump(state, inst, cond, cur);
+        *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
         Ok(())
     }
 
@@ -4741,6 +4811,7 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
+        tick: &mut u64,
     ) -> Result<(), VmError> {
         // C: op_orderI(L, l_gei, luai_numge, 1, TM_LE)
         // flip = 1, event = LE → __le(im, a)  (a >= im 等价于 im <= a)
@@ -4763,21 +4834,31 @@ impl VmExecutor {
                 crate::tm::call_orderi_tm(state, &v, im, true, isfloat, TagMethod::Le)?
             }
         };
-        *pc = Self::do_conditional_jump(state, inst, cond, cur);
+        *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
         Ok(())
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_test(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_test(
+        state: &mut LuaState,
+        inst: Instruction,
+        pc: &mut usize,
+        tick: &mut u64,
+    ) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let v = Self::read_stack(state, a);
         let cond = !is_false(v);
-        *pc = Self::do_conditional_jump(state, inst, cond, *pc - 1);
+        *pc = Self::do_conditional_jump(state, inst, cond, *pc - 1, Some(tick))?;
         Ok(())
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_testset(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_testset(
+        state: &mut LuaState,
+        inst: Instruction,
+        pc: &mut usize,
+        tick: &mut u64,
+    ) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v = Self::read_stack(state, b).clone();
@@ -4787,7 +4868,7 @@ impl VmExecutor {
         if cond == expected {
             // 对应 C: setobj2s(L, ra, rb); donextjump(ci);
             Self::write_stack(state, a, v);
-            *pc = Self::do_conditional_jump(state, inst, cond, cur);
+            *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
         } else {
             // 对应 C: pc++ (跳过 JMP) — TESTSET 和 JMP 共 2 条, pc 已 = cur+1
             *pc += 1;
@@ -6281,7 +6362,12 @@ impl VmExecutor {
     // ---- 循环 ----
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_forloop(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_forloop(
+        state: &mut LuaState,
+        inst: Instruction,
+        pc: &mut usize,
+        tick: &mut u64,
+    ) -> Result<(), VmError> {
         let ra = Self::ra(state, inst);
 
         // perf: 单次借用读三槽 (count/step/idx) — 原实现三次 read_stack 各带
@@ -6308,7 +6394,9 @@ impl VmExecutor {
                     Self::write_stack(state, ra + 2, TValue::Integer(new_idx));
                     let bx = opcodes::getarg_bx(inst);
                     // 回跳: pc 已 = cur+1, 目标 = cur+1-bx (对应 C 的 pc -= bx)
-                    *pc = ((*pc as i32) - bx) as usize;
+                    let target = ((*pc as i32) - bx) as usize;
+                    *pc = target;
+                    Self::backedge_check(state, tick, target)?;
                 }
             }
             TValue::Float(limit) => {
@@ -6334,7 +6422,9 @@ impl VmExecutor {
                 if should_continue {
                     Self::write_stack(state, ra + 2, TValue::Float(new_idx));
                     let bx = opcodes::getarg_bx(inst);
-                    *pc = ((*pc as i32) - bx) as usize;
+                    let target = ((*pc as i32) - bx) as usize;
+                    *pc = target;
+                    Self::backedge_check(state, tick, target)?;
                 }
             }
             _ => {}
