@@ -1058,6 +1058,12 @@ impl VmExecutor {
         // 写点均为整体替换且伴随帧切换 (#136 审计)。
         let mut code_ptr: *const Instruction = state.code.as_ptr();
         let mut code_len: usize = state.code.len();
+        // perf: constants Vec 数据指针缓存 — K 常量指令 (ADDK/MULK/MODK/GETFIELD/)
+        // GETTABUP 等) 原每指令 Rc→Vec 双 deref 取常量。与 code_ptr 同点刷新
+        // (帧切换 9 点), 帧内 constants Vec 不被整体替换 (与 code 相同的 Rc 写点
+        // 审计结论)。K 越界由 len 检查兜底 (constants_len)。
+        let mut constants_ptr: *const TValue = state.constants.as_ptr();
+        let mut constants_len: usize = state.constants.len();
 
         // C 形状 pc 寄存器化 — 对应 C luaV_execute 的局部 pc (vmfetch: i = *(pc++))。
         // 主循环仅在帧切换点 (CALL/TAILCALL/RETURN*/cold dispatch/FORPREP 后) 从
@@ -1087,9 +1093,16 @@ impl VmExecutor {
                 }
                 pc = state.pc; // 帧可能已切换, 重载
                 code_ptr = state.code.as_ptr();
+                constants_ptr = state.constants.as_ptr();
                 code_len = state.code.len();
+                constants_len = state.constants.len();
                 continue;
             }
+            // perf: constants 缓存切片 — 由常量指针构建, LLVM 可将其 ptr+len
+            // 驻留寄存器传递给内联 K-handler (原 state.constants 每指令双 deref)
+            let constants_slice: &[TValue] =
+                unsafe { std::slice::from_raw_parts(constants_ptr, constants_len) };
+
 
             // perf: get_unchecked 跳过边界检查 (上方已检查 pc < code_len)
             let inst = unsafe { *code_ptr.add(pc) };
@@ -1141,7 +1154,7 @@ impl VmExecutor {
                 OpCode::SETFIELD => Self::op_setfield(state, inst, cur),
                 // === 热门 opcode: 算术运算 (param-pc: 成功 *pc += 1 跳过 MMBIN) ===
                 OpCode::ADDI => Self::op_addi(state, inst, &mut pc),
-                OpCode::ADDK => Self::op_addk(state, inst, &mut pc),
+                OpCode::ADDK => Self::op_addk(state, inst, &mut pc, constants_slice),
                 OpCode::SUBK => Self::op_subk(state, inst, &mut pc),
                 OpCode::MULK => Self::op_mulk(state, inst, &mut pc),
                 OpCode::MODK => Self::op_modk(state, inst, cur, &mut pc),
@@ -1176,7 +1189,9 @@ impl VmExecutor {
                     let r = Self::op_call(state, inst);
                     pc = state.pc;
                     code_ptr = state.code.as_ptr();
+                    constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
+                    constants_len = state.constants.len();
                     r
                 }
                 OpCode::TAILCALL => {
@@ -1184,7 +1199,9 @@ impl VmExecutor {
                     let r = Self::op_tailcall(state, inst);
                     pc = state.pc;
                     code_ptr = state.code.as_ptr();
+                    constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
+                    constants_len = state.constants.len();
                     r
                 }
                 OpCode::RETURN => {
@@ -1192,7 +1209,9 @@ impl VmExecutor {
                     let r = Self::op_return(state, inst);
                     pc = state.pc;
                     code_ptr = state.code.as_ptr();
+                    constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
+                    constants_len = state.constants.len();
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
                         Ok(None) => Ok(()),
@@ -1205,7 +1224,9 @@ impl VmExecutor {
                     let r = Self::op_return0(state, inst);
                     pc = state.pc;
                     code_ptr = state.code.as_ptr();
+                    constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
+                    constants_len = state.constants.len();
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
                         Ok(None) => Ok(()),
@@ -1218,7 +1239,9 @@ impl VmExecutor {
                     let r = Self::op_return1(state, inst);
                     pc = state.pc;
                     code_ptr = state.code.as_ptr();
+                    constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
+                    constants_len = state.constants.len();
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
                         Ok(None) => Ok(()),
@@ -1235,7 +1258,9 @@ impl VmExecutor {
                     let r = Self::op_forprep(state, inst);
                     pc = state.pc;
                     code_ptr = state.code.as_ptr();
+                    constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
+                    constants_len = state.constants.len();
                     r
                 }
                 // === SETUPVAL: 写 upvalue (deleted) ===
@@ -1255,7 +1280,9 @@ impl VmExecutor {
                     let r = Self::dispatch_cold_opcodes(state, op, inst);
                     pc = state.pc;
                     code_ptr = state.code.as_ptr();
+                    constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
+                    constants_len = state.constants.len();
                     r
                 }
             };
@@ -1265,7 +1292,9 @@ impl VmExecutor {
                     ErrOutcome::Continue => {
                         pc = state.pc;
                         code_ptr = state.code.as_ptr();
+                        constants_ptr = state.constants.as_ptr();
                         code_len = state.code.len();
+                        constants_len = state.constants.len();
                         continue;
                     }
                     ErrOutcome::Return(r) => return Ok(r),
@@ -3693,18 +3722,24 @@ impl VmExecutor {
         };
         if has_imm_result {
             Self::write_stack(state, a, result);
-            *pc += 1; // skip MMBINK
+            *pc += 1; // skip MMBINI
         }
         Ok(())
     }
-    #[cfg_attr(not(size_optimized), inline)]
-    fn op_addk(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+
+    fn op_addk(
+        state: &mut LuaState,
+        inst: Instruction,
+        pc: &mut usize,
+        constants: &[TValue],
+    ) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        // perf: K 常量免 clone — 引用展开 (同 op_mulk)
+        // perf: K 常量免 clone — 引用展开; constants 是主循环缓存切片
+        // (帧切换点刷新), 免每指令 Rc→Vec 双 deref。
         let v1 = Self::read_stack(state, b);
-        let v2 = state.constants.get(c_key);
+        let v2 = constants.get(c_key);
         let result: Option<TValue> = match (v1, v2) {
             (TValue::Float(f1), Some(TValue::Float(f2))) => Some(TValue::Float(f1 + f2)),
             (TValue::Integer(i1), Some(TValue::Integer(i2))) => {
