@@ -1080,6 +1080,13 @@ impl VmExecutor {
         //             code_ptr/code_len 从 state.code 重载。
         let mut pc: usize = state.pc;
 
+        // perf: C 形状 base 寄存器化 — 对应 C luaV_execute 的局部 base 指针。
+        // 主循环仅在与 pc/code_ptr 相同的帧切换点 (CALL/TAILCALL/RETURN*/
+        // FORPREP/cold dispatch/pc 溢出/错误恢复) 从 state.base 重载; 直线指令段
+        // 内 state.base 不变 (成功路径的直线 handler 不改帧基; 慢路径元方法
+        // 帧 push/pop 配对恢复, 与 pc 缓存的同一契约)。
+        let mut base: usize = state.base;
+
         loop {
             // SAFETY: code_ptr 指向当前帧 state.code 的 Vec 数据区; 直线指令段内
             // state.code 不被替换 (见上方缓存 v2 注释)。pc < code_len 已检查。
@@ -1092,6 +1099,7 @@ impl VmExecutor {
                     return Ok(ret);
                 }
                 pc = state.pc; // 帧可能已切换, 重载
+                base = state.base;
                 code_ptr = state.code.as_ptr();
                 constants_ptr = state.constants.as_ptr();
                 code_len = state.code.len();
@@ -1134,7 +1142,7 @@ impl VmExecutor {
             let result = match op {
                 // === deleted 类: 直线指令 — 零 pc 内存操作 (循环头 pc+=1 覆盖推进) ===
                 // 数据移动/加载
-                OpCode::MOVE => Self::op_move(state, inst),
+                OpCode::MOVE => Self::op_move(state, inst, base),
                 OpCode::LOADI => Self::op_loadi(state, inst),
                 OpCode::LOADF => Self::op_loadf(state, inst),
                 OpCode::LOADK => Self::op_loadk(state, inst),
@@ -1145,10 +1153,10 @@ impl VmExecutor {
                 // === 热门 opcode: 表读 (GETTABUP/GETTABLE/GETI/GETFIELD 为 param-cur:
                 //     慢路径 sync state.pc = cur, 对应 C 的 savepc) ===
                 OpCode::GETUPVAL => Self::op_getupval(state, inst),
-                OpCode::GETTABUP => Self::op_gettabup(state, inst, cur, &mut pc),
+                OpCode::GETTABUP => Self::op_gettabup(state, inst, cur, &mut pc, base),
                 OpCode::GETTABLE => Self::op_gettable(state, inst, cur),
                 OpCode::GETI => Self::op_geti(state, inst, cur),
-                OpCode::GETFIELD => Self::op_getfield(state, inst, cur),
+                OpCode::GETFIELD => Self::op_getfield(state, inst, cur, base),
                 // === 热门 opcode: 表写 (param-cur) ===
                 OpCode::SETTABUP => Self::op_settabup(state, inst, cur),
                 OpCode::SETTABLE => Self::op_settable(state, inst, cur),
@@ -1163,13 +1171,13 @@ impl VmExecutor {
                 OpCode::POWK => Self::op_powk(state, inst, &mut pc),
                 OpCode::DIVK => Self::op_divk(state, inst, &mut pc),
                 OpCode::IDIVK => Self::op_idivk(state, inst, cur, &mut pc),
-                OpCode::ADD => Self::op_add(state, inst, &mut pc),
-                OpCode::SUB => Self::op_sub(state, inst, &mut pc),
-                OpCode::MUL => Self::op_mul(state, inst, &mut pc),
-                OpCode::MOD => Self::op_mod(state, inst, cur, &mut pc),
-                OpCode::POW => Self::op_pow(state, inst, &mut pc),
-                OpCode::DIV => Self::op_div(state, inst, &mut pc),
-                OpCode::IDIV => Self::op_idiv(state, inst, cur, &mut pc),
+                OpCode::ADD => Self::op_add(state, inst, &mut pc, base),
+                OpCode::SUB => Self::op_sub(state, inst, &mut pc, base),
+                OpCode::MUL => Self::op_mul(state, inst, &mut pc, base),
+                OpCode::MOD => Self::op_mod(state, inst, cur, &mut pc, base),
+                OpCode::POW => Self::op_pow(state, inst, &mut pc, base),
+                OpCode::DIV => Self::op_div(state, inst, &mut pc, base),
+                OpCode::IDIV => Self::op_idiv(state, inst, cur, &mut pc, base),
                 // === 热门 opcode: 逻辑非 (deleted) ===
                 OpCode::NOT => Self::op_not(state, inst),
                 // === 热门 opcode: 跳转/比较 (param-pc; 比较冷路径带 cur sync) ===
@@ -1188,8 +1196,9 @@ impl VmExecutor {
                 // === 热门 opcode: 调用/返回 (flow 类: sync → handler → 重载) ===
                 OpCode::CALL => {
                     state.pc = cur;
-                    let r = Self::op_call(state, inst);
+                    let r = Self::op_call(state, inst, base);
                     pc = state.pc;
+                    base = state.base;
                     code_ptr = state.code.as_ptr();
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
@@ -1200,6 +1209,7 @@ impl VmExecutor {
                     state.pc = cur;
                     let r = Self::op_tailcall(state, inst);
                     pc = state.pc;
+                    base = state.base;
                     code_ptr = state.code.as_ptr();
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
@@ -1210,6 +1220,7 @@ impl VmExecutor {
                     state.pc = cur;
                     let r = Self::op_return(state, inst);
                     pc = state.pc;
+                    base = state.base;
                     code_ptr = state.code.as_ptr();
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
@@ -1225,6 +1236,7 @@ impl VmExecutor {
                     state.pc = cur;
                     let r = Self::op_return0(state, inst);
                     pc = state.pc;
+                    base = state.base;
                     code_ptr = state.code.as_ptr();
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
@@ -1240,6 +1252,7 @@ impl VmExecutor {
                     state.pc = cur;
                     let r = Self::op_return1(state, inst);
                     pc = state.pc;
+                    base = state.base;
                     code_ptr = state.code.as_ptr();
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
@@ -1254,11 +1267,12 @@ impl VmExecutor {
                 // === 热门 opcode: numeric for 循环 ===
                 // FORLOOP 每迭代执行 (param-pc); FORPREP 每循环一次 (flow-lite:
                 // sync/reload, 内部错误路径天然持有正确 state.pc, 零内部改动)
-                OpCode::FORLOOP => Self::op_forloop(state, inst, &mut pc),
+                OpCode::FORLOOP => Self::op_forloop(state, inst, &mut pc, base),
                 OpCode::FORPREP => {
                     state.pc = cur;
                     let r = Self::op_forprep(state, inst);
                     pc = state.pc;
+                    base = state.base;
                     code_ptr = state.code.as_ptr();
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
@@ -1272,15 +1286,26 @@ impl VmExecutor {
                 OpCode::MMBIN => Self::op_mmbin(state, inst, cur),
                 OpCode::MMBINI => Self::op_mmbini(state, inst, cur),
                 OpCode::MMBINK => Self::op_mmbink(state, inst, cur),
-                // === VARARG/VARARGPREP: vararg 调用热路径 (pass(...) 每次调用都
-                //     执行 VARARGPREP + VARARG), 从 cold dispatch 移入 (param-cur) ===
                 OpCode::VARARG => Self::op_vararg(state, inst, cur),
-                OpCode::VARARGPREP => Self::op_varargprep(state, inst, cur),
+                OpCode::VARARGPREP => {
+                    // 混合类: handler 不写 state.pc (保持 param-cur 推进契约),
+                    // 但 PF_VAHID 路径调整 state.base — 仅刷新 base 缓存。
+                    // (其他 flow 分支的 pc = state.pc 重载不适用: op_varargprep
+                    // 不更新 state.pc, 重载会把 pc 拉回 pcall 入口的旧值。)
+                    let r = Self::op_varargprep(state, inst, cur);
+                    base = state.base; // PF_VAHID 路径调整帧基
+                    r
+                }
+
+                // === VARARG/VARARGPREP: vararg 调用热路径 (pass(...) 每次调用都
+                //     执行 VARARGPREP + VARARG); VARARGPREP 为 flow 类 (PF_VAHID
+                //     路径调整 state.base, 需刷新 base 缓存) ===
                 // === 冷门 opcode: 路由到 cold 函数 (flow 类: sync → dispatch → 重载) ===
                 _ => {
                     state.pc = cur;
                     let r = Self::dispatch_cold_opcodes(state, op, inst);
                     pc = state.pc;
+                    base = state.base;
                     code_ptr = state.code.as_ptr();
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
@@ -1293,6 +1318,7 @@ impl VmExecutor {
                 Err(e) => match Self::handle_instruction_error(state, e)? {
                     ErrOutcome::Continue => {
                         pc = state.pc;
+                        base = state.base;
                         code_ptr = state.code.as_ptr();
                         constants_ptr = state.constants.as_ptr();
                         code_len = state.code.len();
@@ -1994,6 +2020,22 @@ impl VmExecutor {
     #[cfg_attr(not(size_optimized), inline(always))]
     fn rc(state: &LuaState, inst: Instruction) -> usize {
         state.base + opcodes::getarg_c(inst) as usize
+    }
+    // perf: base 寄存器化变体 — 主循环以局部变量驻留 base (对应 C luaV_execute
+    // 的 base 寄存器, 帧切换点刷新), 热直线指令经此计算操作数槽位, 免去每次
+    // ra/rb/rc 对 state.base 的内存 load (算术指令 3 操作数 = 3 次冗余 load,
+    // LLVM 无法跨 dispatch 分支目标做 CSE)。
+    #[cfg_attr(not(size_optimized), inline(always))]
+    fn rab(base: usize, inst: Instruction) -> usize {
+        base + opcodes::getarg_a(inst) as usize
+    }
+    #[cfg_attr(not(size_optimized), inline(always))]
+    fn rbb(base: usize, inst: Instruction) -> usize {
+        base + opcodes::getarg_b(inst) as usize
+    }
+    #[cfg_attr(not(size_optimized), inline(always))]
+    fn rcb(base: usize, inst: Instruction) -> usize {
+        base + opcodes::getarg_c(inst) as usize
     }
 
     #[cold]
@@ -2981,9 +3023,9 @@ impl VmExecutor {
     // ========================================================================
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_move(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
-        let a = Self::ra(state, inst);
-        let b = Self::rb(state, inst);
+    fn op_move(state: &mut LuaState, inst: Instruction, base: usize) -> Result<(), VmError> {
+        let a = Self::rab(base, inst);
+        let b = Self::rbb(base, inst);
         // perf: 免 TValue::clone 函数调用 — 源槽 trivial (number/bool/nil) 时
         // 16B 原样拷贝 (discriminant + payload), 与 C 的 setobj 宏等价;
         // 含 Rc 变体才走 clone (inc 计数)。
@@ -3161,8 +3203,9 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
+        base: usize,
     ) -> Result<(), VmError> {
-        let a = Self::ra(state, inst);
+        let a = Self::rab(base, inst);
         let b = opcodes::getarg_b(inst) as usize;
         let kb_idx = opcodes::getarg_c(inst) as usize;
         // perf 快速路径: table 无元表时用引用避免 key 和 upval_val 的 clone
@@ -3393,9 +3436,14 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_getfield(state: &mut LuaState, inst: Instruction, cur: usize) -> Result<(), VmError> {
-        let a = Self::ra(state, inst);
-        let b = Self::rb(state, inst);
+    fn op_getfield(
+        state: &mut LuaState,
+        inst: Instruction,
+        cur: usize,
+        base: usize,
+    ) -> Result<(), VmError> {
+        let a = Self::rab(base, inst);
+        let b = Self::rbb(base, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
         // perf 快速路径: table 无元表时直接用 get_and_metatable, 跳过 table_get 包装层
         // + table_val clone。大量表字段访问 (t.field) 操作普通表 (无 __index)。
@@ -4038,11 +4086,16 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_add(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_add(
+        state: &mut LuaState,
+        inst: Instruction,
+        pc: &mut usize,
+        base: usize,
+    ) -> Result<(), VmError> {
         // C: op_arith — if both numbers, compute and pc++ (skip MMBIN); else fall through
-        let a = Self::ra(state, inst);
-        let b = Self::rb(state, inst);
-        let c = Self::rc(state, inst);
+        let a = Self::rab(base, inst);
+        let b = Self::rbb(base, inst);
+        let c = Self::rcb(base, inst);
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if v1.is_number() && v2.is_number() {
@@ -4055,10 +4108,15 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_sub(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
-        let a = Self::ra(state, inst);
-        let b = Self::rb(state, inst);
-        let c = Self::rc(state, inst);
+    fn op_sub(
+        state: &mut LuaState,
+        inst: Instruction,
+        pc: &mut usize,
+        base: usize,
+    ) -> Result<(), VmError> {
+        let a = Self::rab(base, inst);
+        let b = Self::rbb(base, inst);
+        let c = Self::rcb(base, inst);
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if v1.is_number() && v2.is_number() {
@@ -4070,10 +4128,15 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_mul(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
-        let a = Self::ra(state, inst);
-        let b = Self::rb(state, inst);
-        let c = Self::rc(state, inst);
+    fn op_mul(
+        state: &mut LuaState,
+        inst: Instruction,
+        pc: &mut usize,
+        base: usize,
+    ) -> Result<(), VmError> {
+        let a = Self::rab(base, inst);
+        let b = Self::rbb(base, inst);
+        let c = Self::rcb(base, inst);
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if v1.is_number() && v2.is_number() {
@@ -4090,10 +4153,11 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
+        base: usize,
     ) -> Result<(), VmError> {
-        let a = Self::ra(state, inst);
-        let b = Self::rb(state, inst);
-        let c = Self::rc(state, inst);
+        let a = Self::rab(base, inst);
+        let b = Self::rbb(base, inst);
+        let c = Self::rcb(base, inst);
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if v1.is_number() && v2.is_number() {
@@ -4108,10 +4172,15 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_pow(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
-        let a = Self::ra(state, inst);
-        let b = Self::rb(state, inst);
-        let c = Self::rc(state, inst);
+    fn op_pow(
+        state: &mut LuaState,
+        inst: Instruction,
+        pc: &mut usize,
+        base: usize,
+    ) -> Result<(), VmError> {
+        let a = Self::rab(base, inst);
+        let b = Self::rbb(base, inst);
+        let c = Self::rcb(base, inst);
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if let (Some(n1), Some(n2)) = (to_number_ns(&v1), to_number_ns(&v2)) {
@@ -4122,10 +4191,15 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_div(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
-        let a = Self::ra(state, inst);
-        let b = Self::rb(state, inst);
-        let c = Self::rc(state, inst);
+    fn op_div(
+        state: &mut LuaState,
+        inst: Instruction,
+        pc: &mut usize,
+        base: usize,
+    ) -> Result<(), VmError> {
+        let a = Self::rab(base, inst);
+        let b = Self::rbb(base, inst);
+        let c = Self::rcb(base, inst);
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if let (Some(n1), Some(n2)) = (to_number_ns(&v1), to_number_ns(&v2)) {
@@ -4141,10 +4215,11 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
+        base: usize,
     ) -> Result<(), VmError> {
-        let a = Self::ra(state, inst);
-        let b = Self::rb(state, inst);
-        let c = Self::rc(state, inst);
+        let a = Self::rab(base, inst);
+        let b = Self::rbb(base, inst);
+        let c = Self::rcb(base, inst);
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
         if v1.is_number() && v2.is_number() {
@@ -4890,8 +4965,8 @@ impl VmExecutor {
 
     // ---- 调用 / 返回 ----
 
-    fn op_call(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
-        let a = Self::ra(state, inst);
+    fn op_call(state: &mut LuaState, inst: Instruction, base: usize) -> Result<(), VmError> {
+        let a = Self::rab(base, inst);
         let b = opcodes::getarg_b(inst) as usize;
         let c = opcodes::getarg_c(inst) as i32;
         // 对应 C 的 OP_CALL: if (b != 0) L->top.p = ra + b
@@ -6323,10 +6398,14 @@ impl VmExecutor {
     }
 
     // ---- 循环 ----
-
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_forloop(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
-        let ra = Self::ra(state, inst);
+    fn op_forloop(
+        state: &mut LuaState,
+        inst: Instruction,
+        pc: &mut usize,
+        base: usize,
+    ) -> Result<(), VmError> {
+        let ra = Self::rab(base, inst);
 
         // perf: 单次借用读三槽 (count/step/idx) — 原实现三次 read_stack 各带
         // bounds 检查 + Option 解包。for 循环体必然走此处, 直接切片访问。
