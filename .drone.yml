@@ -63,7 +63,7 @@ steps:
   # + 下载/补丁/编译 C 模块与 skynet (lsqlite3/skynet 用 git clone, 需 git)
   # deps/cache + deps/src 由 restore/save-cache 步骤持久化 (归档与 git clone 不再重复联网);
   # cron 构建时清空缓存, 强制重新拉取 master 分支最新源码 (cjson/luasocket/skynet 跟踪 master)
-  - if [[ "${DRONE_BUILD_EVENT:-}" == "cron" ]]; then echo "cron 构建: 清空 deps 下载缓存"; rm -rf deps/cache deps/src; fi
+  - if [[ "${DRONE_BUILD_EVENT:-}" == "cron" ]]; then echo "cron build, clearing deps download cache"; rm -rf deps/cache deps/src; fi
   - cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
   - cmake --build build --parallel "$(nproc)"
   - bash deps/setup.sh --rebuild-lua
