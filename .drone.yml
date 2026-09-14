@@ -24,6 +24,8 @@ steps:
     mount:
       - .cargo
       - target
+      - deps/cache
+      - deps/src
 - name: build
   image: lua-ci:latest
   pull: if-not-exists
@@ -59,6 +61,9 @@ steps:
   # 依赖库测试 (lua-cjson/luasocket/lsqlite3/luarocks/sol2/skynet/skynet-e2e):
   # setup.sh 重建 threaded,skynet 版 lua + 构建 C lua (e2e 客户端用)
   # + 下载/补丁/编译 C 模块与 skynet (lsqlite3/skynet 用 git clone, 需 git)
+  # deps/cache + deps/src 由 restore/save-cache 步骤持久化 (归档与 git clone 不再重复联网);
+  # cron 构建时清空缓存, 强制重新拉取 master 分支最新源码 (cjson/luasocket/skynet 跟踪 master)
+  - if [[ "${DRONE_BUILD_EVENT:-}" == "cron" ]]; then echo "cron 构建: 清空 deps 下载缓存"; rm -rf deps/cache deps/src; fi
   - cmake -B build -S . -DCMAKE_BUILD_TYPE=Release
   - cmake --build build --parallel "$(nproc)"
   - bash deps/setup.sh --rebuild-lua
@@ -87,6 +92,8 @@ steps:
     mount:
       - .cargo
       - target
+      - deps/cache
+      - deps/src
 
 volumes:
 - name: cache
