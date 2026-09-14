@@ -1319,7 +1319,25 @@ impl LuaState {
             }
         } else if (nresults as usize) == 1 {
             if self.stack.len() > a {
-                self.stack[a] = result;
+                // perf: 槽位平凡值检查 — 槽 a 现值多为 BuiltinFn (函数槽,
+                // Copy 无 drop) 或 trivial; 平凡/Copy 槽用 ptr::write 跳过
+                // drop_in_place 调用 (非内联 call, adjust 热路径实证)。
+                // 非平凡 (Rc/Table 等) 保守走原赋值 (正常 drop)。
+                // 检查用判别范围: BuiltinFn 及其他 Copy 变体由 matches 显式列出。
+                let slot = unsafe { self.stack.get_unchecked_mut(a) };
+                if matches!(
+                    slot,
+                    TValue::Nil(_)
+                        | TValue::Boolean(_)
+                        | TValue::Integer(_)
+                        | TValue::Float(_)
+                        | TValue::BuiltinFn(_)
+                ) {
+                    // SAFETY: 槽现值无 drop glue (Copy 变体), ptr::write 覆盖安全
+                    unsafe { std::ptr::write(slot, result) };
+                } else {
+                    *slot = result;
+                }
                 // perf: 被截断区 (a+1..len) 是 CALL 的参数槽, 常为 trivial (Float/
                 // Integer)。全部 trivial 时用 set_len 跳过 Vec::truncate 的逐槽
                 // drop glue (非内联调用); 有 Rc 变体则回退 truncate 正常 drop。
