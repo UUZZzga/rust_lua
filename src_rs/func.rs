@@ -477,6 +477,7 @@ mod tests {
             upval_descs: Rc::new(Vec::new()),
             protos: Rc::new(Vec::new()),
             trap: false,
+            tick: std::cell::Cell::new(0),
             num_params: 0,
             is_vararg: false,
             proto_flag: 0,

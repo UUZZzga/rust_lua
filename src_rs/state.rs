@@ -298,6 +298,12 @@ pub struct LuaState {
     pub top: usize,
     pub base: usize,
     pub pc: usize,
+    /// 回边中断检查摊销计数器 — 仅回跳指令 (JMP/FORLOOP/条件跳回) 递增,
+    /// 64 次边界时原子加载 INTERRUPTED。放 state 而非循环局部: 借用安全
+    /// (Cell 通过 &LuaState 可写), 跳转 handler 内联增量免 &mut 引用穿透
+    /// (CI #90 实证引用参数把增量编译成每次回跳的内存往返, 整数 bench +27%)。
+    /// 值不参与语义, 重置/不重置均只影响中断延迟最多 63 次回跳。
+    pub tick: std::cell::Cell<u64>,
     pub trap: bool,
     pub num_params: u8,
     pub is_vararg: bool,
@@ -679,6 +685,7 @@ impl LuaState {
             base: 0,
             pc: 0,
             trap: false,
+            tick: std::cell::Cell::new(0),
             num_params: 0,
             is_vararg: false,
             proto_flag: 0,
@@ -874,6 +881,7 @@ impl LuaState {
             base: 0,
             pc: 0,
             trap: false,
+            tick: std::cell::Cell::new(0),
             num_params: 0,
             is_vararg: false,
             proto_flag: 0,
@@ -1018,6 +1026,7 @@ impl LuaState {
             base: 0,
             pc: 0,
             trap: false,
+            tick: std::cell::Cell::new(0),
             num_params: 0,
             is_vararg: false,
             proto_flag: 0,
@@ -1142,6 +1151,7 @@ impl LuaState {
             base,
             pc: 0,
             trap: false,
+            tick: std::cell::Cell::new(0),
             num_params: proto.num_params,
             is_vararg: proto.is_vararg(),
             proto_flag: proto.flag,

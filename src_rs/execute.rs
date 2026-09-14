@@ -1046,11 +1046,11 @@ impl VmExecutor {
 
         // perf: 中断检查 — 不再按指令摊销。信号中断 (SIGINT → laction 设置
         // INTERRUPTED) 的观测点移至所有向后跳转处 (JMP 回跳 / FORLOOP 继续 /
-        // 条件跳回 / 冷分发), 无限循环必然每迭代过一次回跳, 直线代码段由
-        // 函数末尾 RETURN / pc 越界兜底 (同样带检查)。热循环指令前缀省去
-        // tick 自增 + test + je 三条指令。
-        // (tick 计数器仅用于回跳处的 64 次摊销, 回跳点自增。)
-        let mut tick: u64 = 0;
+        // 条件跳回), 无限循环必然每迭代过一次回跳; 直线代码段由 pc 越界
+        // 兜底 (同样带检查)。热循环指令前缀省去 tick 自增 + test + je。
+        // 计数器在 state.tick (Cell): 回跳 handler 内增量 + 64 边界原子读。
+        // (CI #90 实证: &mut tick 引用穿透 handler → FORLOOP 每次回跳内存
+        // 往返, 整数 bench +27%; Cell 方案增量编译为 inc [rsi+off] 单指令。)
 
         // perf: code Vec 缓存 v2 — ptr+len 直接驻留主循环局部, 每指令零内存
         // 解引用。原 code_vec+ptr::eq 方案被 LLVM 识别 ptr::eq 为恒真, 编译回
@@ -1095,12 +1095,7 @@ impl VmExecutor {
             if pc >= code_len {
                 // 直线段兜底中断检查 (无回跳长直线段至此必经; 每函数末尾 RETURN
                 // 之外的最后防线, 64 次摊销)
-                tick = tick.wrapping_add(1);
-                if tick & 63 == 0 && INTERRUPTED.load(Ordering::Relaxed) {
-                    state.pc = pc;
-                    INTERRUPTED.store(false, Ordering::Release);
-                    return Err(VmError::RuntimeError("interrupted!".to_string()));
-                }
+                Self::tick_check_interrupted(state, pc)?;
                 state.pc = pc; // sync 供 handle_pc_overflow 弹帧
                 if let Some(ret) = Self::handle_pc_overflow(state)? {
                     return Ok(ret);
@@ -1186,18 +1181,18 @@ impl VmExecutor {
                 // === 热门 opcode: 逻辑非 (deleted) ===
                 OpCode::NOT => Self::op_not(state, inst),
                 // === 热门 opcode: 跳转/比较 (param-pc; 比较冷路径带 cur sync) ===
-                OpCode::JMP => Self::op_jmp(state, inst, &mut pc, &mut tick),
-                OpCode::EQ => Self::op_eq(state, inst, cur, &mut pc, &mut tick),
-                OpCode::LT => Self::op_lt(state, inst, cur, &mut pc, &mut tick),
-                OpCode::LE => Self::op_le(state, inst, cur, &mut pc, &mut tick),
-                OpCode::EQK => Self::op_eqk(state, inst, cur, &mut pc, &mut tick),
-                OpCode::EQI => Self::op_eqi(state, inst, cur, &mut pc, &mut tick),
-                OpCode::LTI => Self::op_lti(state, inst, cur, &mut pc, &mut tick),
-                OpCode::LEI => Self::op_lei(state, inst, cur, &mut pc, &mut tick),
-                OpCode::GTI => Self::op_gti(state, inst, cur, &mut pc, &mut tick),
-                OpCode::GEI => Self::op_gei(state, inst, cur, &mut pc, &mut tick),
-                OpCode::TEST => Self::op_test(state, inst, &mut pc, &mut tick),
-                OpCode::TESTSET => Self::op_testset(state, inst, &mut pc, &mut tick),
+                OpCode::JMP => Self::op_jmp(state, inst, &mut pc),
+                OpCode::EQ => Self::op_eq(state, inst, cur, &mut pc),
+                OpCode::LT => Self::op_lt(state, inst, cur, &mut pc),
+                OpCode::LE => Self::op_le(state, inst, cur, &mut pc),
+                OpCode::EQK => Self::op_eqk(state, inst, cur, &mut pc),
+                OpCode::EQI => Self::op_eqi(state, inst, cur, &mut pc),
+                OpCode::LTI => Self::op_lti(state, inst, cur, &mut pc),
+                OpCode::LEI => Self::op_lei(state, inst, cur, &mut pc),
+                OpCode::GTI => Self::op_gti(state, inst, cur, &mut pc),
+                OpCode::GEI => Self::op_gei(state, inst, cur, &mut pc),
+                OpCode::TEST => Self::op_test(state, inst, &mut pc),
+                OpCode::TESTSET => Self::op_testset(state, inst, &mut pc),
                 // === 热门 opcode: 调用/返回 (flow 类: sync → handler → 重载) ===
                 OpCode::CALL => {
                     state.pc = cur;
@@ -1272,7 +1267,7 @@ impl VmExecutor {
                 // === 热门 opcode: numeric for 循环 ===
                 // FORLOOP 每迭代执行 (param-pc); FORPREP 每循环一次 (flow-lite:
                 // sync/reload, 内部错误路径天然持有正确 state.pc, 零内部改动)
-                OpCode::FORLOOP => Self::op_forloop(state, inst, &mut pc, &mut tick),
+                OpCode::FORLOOP => Self::op_forloop(state, inst, &mut pc),
                 OpCode::FORPREP => {
                     state.pc = cur;
                     let r = Self::op_forprep(state, inst);
@@ -2265,7 +2260,6 @@ impl VmExecutor {
         inst: Instruction,
         cond: bool,
         cur: usize,
-        tick: Option<&mut u64>,
     ) -> Result<usize, VmError> {
         // 对应 C 的 docondjump: 纯计算下一 pc, 不写 state.pc。
         // 热路径调用方把结果写入寄存器 pc; finishOp (yield 恢复) 写回 state.pc。
@@ -2280,12 +2274,9 @@ impl VmExecutor {
             let jmp_inst = state.code[jmp_pc];
             let sj = opcodes::getarg_sj(jmp_inst);
             let target = ((jmp_pc as i32) + sj + 1) as usize;
-            // 回跳 (target <= cur): 中断观测点。主循环传入 tick; finishOp
-            // 恢复路径 (无 tick) 传 None — 恢复点本身伴随 CALL/RETURN 刷新兜底。
+            // 回跳 (target <= cur): 中断观测点 (state.tick Cell, inc 单指令)
             if target <= cur {
-                if let Some(t) = tick {
-                    Self::backedge_check(state, t, target)?;
-                }
+                Self::backedge_tick(state, target)?;
             }
             Ok(target)
         } else {
@@ -2293,17 +2284,29 @@ impl VmExecutor {
         }
     }
 
-    /// 回边中断检查 — 跳转目标向后 (target <= src) 时在调用方调用。
-    /// perf: 中断观测点从每指令 tick 移到所有回跳处; 无限循环必然每迭代过
-    /// 一次回跳, 64 次摊销 atomic load。回跳路径仅 4 条热指令
-    /// (target/src cmp 在调用方已做, 此处 add tick + test + jcc)。
-    /// 直线段由循环头 pc 越界兜底 (同样带检查)。
+    /// 回边中断观测 — 跳转目标向后 (回跳) 时调用。tick 是 state 上的 Cell,
+    /// 增量在调用点内联 (inc [rsi+off] 单指令), 64 边界才原子读 INTERRUPTED。
+    /// 中断错误行号 = cur (回跳指令自身, 对应循环头旧方案的 state.pc = pc)。
     #[cfg_attr(not(size_optimized), inline)]
-    fn backedge_check(state: &mut LuaState, tick: &mut u64, cur: usize) -> Result<(), VmError> {
-        *tick = tick.wrapping_add(1);
-        if *tick & 63 == 0 && INTERRUPTED.load(Ordering::Relaxed) {
+    fn backedge_tick(state: &mut LuaState, cur: usize) -> Result<(), VmError> {
+        let t = state.tick.get().wrapping_add(1);
+        state.tick.set(t);
+        if t & 63 == 0 && INTERRUPTED.load(Ordering::Relaxed) {
             INTERRUPTED.store(false, Ordering::Release);
-            state.pc = cur; // 中断错误行号 (savepc 语义)
+            state.pc = cur; // savepc: 中断错误行号
+            return Err(VmError::RuntimeError("interrupted!".to_string()));
+        }
+        Ok(())
+    }
+
+    /// 直线段兜底中断检查 (pc 越界路径) — 与 backedge_tick 同摊销计数器。
+    #[cfg_attr(not(size_optimized), inline)]
+    fn tick_check_interrupted(state: &mut LuaState, pc: usize) -> Result<(), VmError> {
+        let t = state.tick.get().wrapping_add(1);
+        state.tick.set(t);
+        if t & 63 == 0 && INTERRUPTED.load(Ordering::Relaxed) {
+            INTERRUPTED.store(false, Ordering::Release);
+            state.pc = pc;
             return Err(VmError::RuntimeError("interrupted!".to_string()));
         }
         Ok(())
@@ -2397,7 +2400,7 @@ impl VmExecutor {
             match op {
                 OpCode::LE | OpCode::LT | OpCode::LEI | OpCode::LTI | OpCode::GTI | OpCode::GEI => {
                     let cond = !result_val.is_false();
-                    state.pc = Self::do_conditional_jump(state, inst, cond, state.pc, None)?;
+                    state.pc = Self::do_conditional_jump(state, inst, cond, state.pc)?;
                 }
                 OpCode::MMBIN | OpCode::MMBINI | OpCode::MMBINK => {
                     // 结果已在目标寄存器 (metamethod_res = RA(pi))
@@ -4529,19 +4532,14 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_jmp(
-        _state: &mut LuaState,
-        inst: Instruction,
-        pc: &mut usize,
-        tick: &mut u64,
-    ) -> Result<(), VmError> {
+    fn op_jmp(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
         let sj = opcodes::getarg_sj(inst);
         // pc 已 = cur+1 (对应 C fetch 后的 pc), 目标 = cur+1+sj == *pc + sj
         let target = ((*pc as i32) + sj) as usize;
         *pc = target;
         // 回跳 (sj < 0): 中断观测点
         if sj < 0 {
-            Self::backedge_check(_state, tick, target)?;
+            Self::backedge_tick(state, target)?;
         }
         Ok(())
     }
@@ -4554,7 +4552,6 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-        tick: &mut u64,
     ) -> Result<(), VmError> {
         // C: StkId ra = RA(i); TValue *rb = vRB(i);
         //     Protect(cond = luaV_equalobj(L, s2v(ra), rb));
@@ -4586,7 +4583,7 @@ impl VmExecutor {
                 equal_obj(state, &v1, &v2)?
             }
         };
-        *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
+        *pc = Self::do_conditional_jump(state, inst, cond, cur)?;
         Ok(())
     }
 
@@ -4596,7 +4593,6 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-        tick: &mut u64,
     ) -> Result<(), VmError> {
         // C: op_order(L, l_lti, LTnum, lessthanothers)
         // lessthanothers: if (string) strcmp; else luaT_callorderTM(L, l, r, TM_LT)
@@ -4623,7 +4619,7 @@ impl VmExecutor {
                 call_order_tm(state, &v1, &v2, TagMethod::Lt)?
             }
         };
-        *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
+        *pc = Self::do_conditional_jump(state, inst, cond, cur)?;
         Ok(())
     }
 
@@ -4633,7 +4629,6 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-        tick: &mut u64,
     ) -> Result<(), VmError> {
         // C: op_order(L, l_lei, LEnum, lessequalothers)
         // lessequalothers: if (string) strcmp; else luaT_callorderTM(L, l, r, TM_LE)
@@ -4660,7 +4655,7 @@ impl VmExecutor {
                 call_order_tm(state, &v1, &v2, TagMethod::Le)?
             }
         };
-        *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
+        *pc = Self::do_conditional_jump(state, inst, cond, cur)?;
         Ok(())
     }
 
@@ -4670,14 +4665,13 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-        tick: &mut u64,
     ) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b_key = opcodes::getarg_b(inst) as usize;
         let v1 = Self::read_stack(state, a);
         let v2 = state.constants.get(b_key).unwrap();
         let cond = raw_equal(v1, v2);
-        *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
+        *pc = Self::do_conditional_jump(state, inst, cond, cur)?;
         Ok(())
     }
 
@@ -4687,7 +4681,6 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-        tick: &mut u64,
     ) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         // EQI 是 IABC 模式,使用 sB 参数 (有符号 B, 8 位)
@@ -4699,7 +4692,7 @@ impl VmExecutor {
             TValue::Float(f) => (*f - im as f64).abs() < f64::EPSILON,
             _ => false,
         };
-        *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
+        *pc = Self::do_conditional_jump(state, inst, cond, cur)?;
         Ok(())
     }
 
@@ -4709,7 +4702,6 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-        tick: &mut u64,
     ) -> Result<(), VmError> {
         // C: op_orderI(L, l_lti, luai_numlt, 0, TM_LT)
         // flip = 0, event = LT → __lt(a, im)
@@ -4735,7 +4727,7 @@ impl VmExecutor {
                 crate::tm::call_orderi_tm(state, &v, im, false, isfloat, TagMethod::Lt)?
             }
         };
-        *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
+        *pc = Self::do_conditional_jump(state, inst, cond, cur)?;
         Ok(())
     }
 
@@ -4745,7 +4737,6 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-        tick: &mut u64,
     ) -> Result<(), VmError> {
         // C: op_orderI(L, l_lei, luai_numle, 0, TM_LE)
         // flip = 0, event = LE → __le(a, im)
@@ -4768,7 +4759,7 @@ impl VmExecutor {
                 crate::tm::call_orderi_tm(state, &v, im, false, isfloat, TagMethod::Le)?
             }
         };
-        *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
+        *pc = Self::do_conditional_jump(state, inst, cond, cur)?;
         Ok(())
     }
 
@@ -4778,7 +4769,6 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-        tick: &mut u64,
     ) -> Result<(), VmError> {
         // C: op_orderI(L, l_gti, luai_numgt, 1, TM_LT)
         // flip = 1, event = LT → __lt(im, a)  (a > im 等价于 im < a)
@@ -4801,7 +4791,7 @@ impl VmExecutor {
                 crate::tm::call_orderi_tm(state, &v, im, true, isfloat, TagMethod::Lt)?
             }
         };
-        *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
+        *pc = Self::do_conditional_jump(state, inst, cond, cur)?;
         Ok(())
     }
 
@@ -4811,7 +4801,6 @@ impl VmExecutor {
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-        tick: &mut u64,
     ) -> Result<(), VmError> {
         // C: op_orderI(L, l_gei, luai_numge, 1, TM_LE)
         // flip = 1, event = LE → __le(im, a)  (a >= im 等价于 im <= a)
@@ -4834,31 +4823,21 @@ impl VmExecutor {
                 crate::tm::call_orderi_tm(state, &v, im, true, isfloat, TagMethod::Le)?
             }
         };
-        *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
+        *pc = Self::do_conditional_jump(state, inst, cond, cur)?;
         Ok(())
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_test(
-        state: &mut LuaState,
-        inst: Instruction,
-        pc: &mut usize,
-        tick: &mut u64,
-    ) -> Result<(), VmError> {
+    fn op_test(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let v = Self::read_stack(state, a);
         let cond = !is_false(v);
-        *pc = Self::do_conditional_jump(state, inst, cond, *pc - 1, Some(tick))?;
+        *pc = Self::do_conditional_jump(state, inst, cond, *pc - 1)?;
         Ok(())
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_testset(
-        state: &mut LuaState,
-        inst: Instruction,
-        pc: &mut usize,
-        tick: &mut u64,
-    ) -> Result<(), VmError> {
+    fn op_testset(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v = Self::read_stack(state, b).clone();
@@ -4868,7 +4847,7 @@ impl VmExecutor {
         if cond == expected {
             // 对应 C: setobj2s(L, ra, rb); donextjump(ci);
             Self::write_stack(state, a, v);
-            *pc = Self::do_conditional_jump(state, inst, cond, cur, Some(tick))?;
+            *pc = Self::do_conditional_jump(state, inst, cond, cur)?;
         } else {
             // 对应 C: pc++ (跳过 JMP) — TESTSET 和 JMP 共 2 条, pc 已 = cur+1
             *pc += 1;
@@ -6362,12 +6341,7 @@ impl VmExecutor {
     // ---- 循环 ----
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_forloop(
-        state: &mut LuaState,
-        inst: Instruction,
-        pc: &mut usize,
-        tick: &mut u64,
-    ) -> Result<(), VmError> {
+    fn op_forloop(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
         let ra = Self::ra(state, inst);
 
         // perf: 单次借用读三槽 (count/step/idx) — 原实现三次 read_stack 各带
@@ -6396,7 +6370,7 @@ impl VmExecutor {
                     // 回跳: pc 已 = cur+1, 目标 = cur+1-bx (对应 C 的 pc -= bx)
                     let target = ((*pc as i32) - bx) as usize;
                     *pc = target;
-                    Self::backedge_check(state, tick, target)?;
+                    Self::backedge_tick(state, target)?;
                 }
             }
             TValue::Float(limit) => {
@@ -6424,7 +6398,7 @@ impl VmExecutor {
                     let bx = opcodes::getarg_bx(inst);
                     let target = ((*pc as i32) - bx) as usize;
                     *pc = target;
-                    Self::backedge_check(state, tick, target)?;
+                    Self::backedge_tick(state, target)?;
                 }
             }
             _ => {}
