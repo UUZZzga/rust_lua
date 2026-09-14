@@ -290,7 +290,6 @@ pub struct LuaState {
     /// contains 开销到 ~5ns/次。Rc 共享：协程线程与主状态共享同一集合。
     /// 为什么不用 BuiltinFn.name 指针位 0 当标志: CStr 静态字面量仅
     /// 1 字节对齐, 指针奇偶不可控 (Linux 链接器实测为奇数导致 name 损坏)。
-    pub pure_fns: std::rc::Rc<hashbrown::HashSet<usize, crate::objects::FxBuildHasher>>,
     pub code: Rc<Vec<Instruction>>,
     pub upval_descs: Rc<Vec<UpvalDesc>>,
     /// 当前执行函数的子原型列表 — Rc 共享，op_call 切换 proto 时 O(1) 引用计数
@@ -673,9 +672,6 @@ impl LuaState {
 
         LuaState {
             constants: Rc::new(Vec::new()),
-            pure_fns: std::rc::Rc::new(hashbrown::HashSet::with_hasher(
-                crate::objects::FxBuildHasher::default(),
-            )),
             code: Rc::new(Vec::new()),
             upval_descs: Rc::new(Vec::new()),
             protos: Rc::new(Vec::new()),
@@ -871,9 +867,6 @@ impl LuaState {
 
         let state = LuaState {
             constants: Rc::new(Vec::new()),
-            pure_fns: std::rc::Rc::new(hashbrown::HashSet::with_hasher(
-                crate::objects::FxBuildHasher::default(),
-            )),
             code: Rc::new(Vec::new()),
             upval_descs: Rc::new(Vec::new()),
             protos: Rc::new(Vec::new()),
@@ -1018,9 +1011,6 @@ impl LuaState {
 
             // === 独立字段（执行栈和函数上下文）===
             constants: Rc::new(Vec::new()),
-            pure_fns: std::rc::Rc::new(hashbrown::HashSet::with_hasher(
-                crate::objects::FxBuildHasher::default(),
-            )),
             code: Rc::new(Vec::new()),
             upval_descs: Rc::new(Vec::new()),
             protos: Rc::new(Vec::new()),
@@ -1145,9 +1135,6 @@ impl LuaState {
 
         LuaState {
             constants: proto.constants.clone(),
-            pure_fns: std::rc::Rc::new(hashbrown::HashSet::with_hasher(
-                crate::objects::FxBuildHasher::default(),
-            )),
             code: proto.code.clone(),
             upval_descs: proto.upvalues.clone(),
             protos: proto.protos.clone(),
@@ -2840,7 +2827,7 @@ impl LuaState {
             TValue::LCFn(lcf) => Self::pcall_c_function(self, func_idx, nresults, lcf.func),
             TValue::CClosure(cc) => Self::pcall_c_function(self, func_idx, nresults, cc.f),
             TValue::BuiltinFn(bf) => {
-                Self::pcall_rust_fn(self, func_idx, nresults, bf.func, bf.name_str())
+                Self::pcall_rust_fn(self, func_idx, nresults, bf.call_target(), bf.name_str())
             }
             TValue::RustClosure(rc) => {
                 Self::pcall_rust_fn(self, func_idx, nresults, rc.func, rc.name_str())

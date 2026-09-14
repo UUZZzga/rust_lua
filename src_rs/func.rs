@@ -1,10 +1,10 @@
+use std::rc::Rc;
 use crate::execute::VmError;
 use crate::objects::*;
 use crate::state::LuaState;
 #[cfg(test)]
 use crate::state::lua_stdout;
 use std::cell::RefCell;
-use std::rc::Rc;
 
 pub fn new_proto() -> Proto {
     Proto {
@@ -473,9 +473,6 @@ mod tests {
             twups_linked: false,
             is_in_twups: false,
             constants: Rc::new(Vec::new()),
-            pure_fns: std::rc::Rc::new(hashbrown::HashSet::with_hasher(
-                crate::objects::FxBuildHasher::default(),
-            )),
             code: Rc::new(Vec::new()),
             upval_descs: Rc::new(Vec::new()),
             protos: Rc::new(Vec::new()),

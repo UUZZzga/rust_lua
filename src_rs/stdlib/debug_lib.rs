@@ -614,7 +614,7 @@ fn call_getinfo(
             .map(|v| {
                 if let TValue::BuiltinFn(bf) = &v {
                     std::ptr::eq(
-                        bf.func as *const (),
+                        bf.raw_func() as *const (),
                         crate::stdlib::string_lib::call_gmatch_iter as *const (),
                     )
                 } else {
@@ -2446,7 +2446,7 @@ fn call_upvalueid(
                 .map(|v| {
                     if let TValue::BuiltinFn(bf) = &v {
                         std::ptr::eq(
-                            bf.func as *const (),
+                            bf.raw_func() as *const (),
                             crate::stdlib::string_lib::call_gmatch_iter as *const (),
                         )
                     } else {

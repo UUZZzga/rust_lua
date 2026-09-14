@@ -3255,11 +3255,20 @@ pub fn open_base_lib(state: &mut LuaState) {
     register(state, c"tonumber", call_tonumber);
     register(state, c"tostring", call_tostring);
     register(state, c"assert", call_assert);
-    register(state, c"select", call_select);
     // perf: select 登记为 pure — 不回调 Lua / 不 yield / 参数错误返回 Err,
     // op_call 走零簿记快速路径 (vararg 调用 select('#', ...) / select(n, ...) 热路径)。
-    // open_base_lib 时 state.pure_fns 尚无共享者, make_mut 不会 clone 集合。
-    Rc::make_mut(&mut state.pure_fns).insert(call_select as usize);
+    // pure 标志内嵌 BuiltinFn.pure 字段 (原 state.pure_fns HashSet 查询每次
+    // 调用 2 个非内联 call)。
+    {
+        let key = TValue::Str(state.intern_str("select"));
+        state.globals.set(
+            key,
+            TValue::BuiltinFn(crate::objects::BuiltinFn::pure_fn(
+                call_select,
+                c"select".as_ptr() as *const u8,
+            )),
+        );
+    }
     register(state, c"rawequal", call_rawequal);
     register(state, c"rawlen", call_rawlen);
     register(state, c"rawget", call_rawget);
@@ -3960,7 +3969,7 @@ mod tests {
         // 第一个返回值是迭代器函数 (BuiltinFn, func 指向 call_ipairs_aux)
         match &state.stack[0] {
             TValue::BuiltinFn(bf) => {
-                assert_eq!(bf.func as usize, call_ipairs_aux as *const () as usize);
+                assert_eq!(bf.raw_func() as usize, call_ipairs_aux as *const () as usize);
             }
             _ => panic!("expected BuiltinFn"),
         }
@@ -3987,7 +3996,7 @@ mod tests {
         // 第一个返回值是 next 迭代器 (BuiltinFn, func 指向 call_next_iter)
         match &state.stack[0] {
             TValue::BuiltinFn(bf) => {
-                assert_eq!(bf.func as usize, call_next_iter as *const () as usize);
+                assert_eq!(bf.raw_func() as usize, call_next_iter as *const () as usize);
             }
             _ => panic!("expected BuiltinFn"),
         }

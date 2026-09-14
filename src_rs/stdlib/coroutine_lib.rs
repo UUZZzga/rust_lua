@@ -1555,7 +1555,7 @@ fn call_resume(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
                 .as_ref()
                 .map(|f| {
                     if let TValue::BuiltinFn(bf) = f.as_ref() {
-                        let func_ptr = bf.func as *const () as usize;
+                        let func_ptr = bf.raw_func() as *const () as usize;
                         func_ptr == crate::stdlib::base_lib::call_pcall as *const () as usize
                             || func_ptr
                                 == crate::stdlib::base_lib::call_xpcall as *const () as usize

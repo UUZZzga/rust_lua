@@ -354,27 +354,73 @@ pub type BuiltinFnPtr =
 /// Then: Lua 代码调用该函数时，VM 直接通过函数指针调用，无需 tag 派发
 #[derive(Clone, Copy)]
 pub struct BuiltinFn {
-    /// 函数指针 — 唯一标识该内置函数
+    /// 编码后的函数指针 — bit0 = pure 标志 (1: 纯函数), bit1.. = 真实函数地址。
+    ///
+    /// 函数指针按机器字长对齐 (≥2), bit0 恒 0 可安全借用。pure 标志内嵌
+    /// 指针低位使 BuiltinFn 保持 8 字节 (TValue 16B 布局不变), 取代原
+    /// LuaState.pure_fns HashSet 查询 (每次调用 2 个非内联 call:
+    /// tvalue_fx_hash + RawTable::find, ~25 cycles) — op_call 现为一条 test。
+    ///
+    /// 任何调用/比较该指针的位置必须经 call_target()/raw_func() 解码。
+    /// name 登记表 (builtin_names) 用解码后的原始指针, 与 impure 注册一致。
     pub func: BuiltinFnPtr,
 }
 
 impl BuiltinFn {
+    /// bit0 掩码 — pure 标志位
+    const PURE_BIT: usize = 1;
+
     /// 标准 BuiltinFn 构造（impure — 可能回调 Lua / yield）。
-    /// 纯函数标志不在此结构上：pure 集合由 LuaState.pure_fns (按 func 指针值) 维护，
-    /// math 库在注册时显式登记。
     ///
-    /// name 不再存储在结构体内（为压缩 TValue 到 16 字节）：注册时登记到
+    /// name 不存储在结构体内（为压缩 TValue 到 16 字节）：注册时登记到
     /// 全局 BUILTIN_NAMES 表（func 指针 → NUL 终止名字），traceback 冷路径查表。
     pub fn impure(func: BuiltinFnPtr, name: *const u8) -> Self {
         builtin_names::register(func, name);
         Self { func }
     }
 
+    /// 纯函数 BuiltinFn 构造 — 不回调 Lua / 不 yield / 错误只返回 Err。
+    /// 数学库等纯函数注册用此构造; op_call 见 pure 位 (func bit0) 直接走
+    /// 零簿记快速路径 (跳过 CallInfoEntry push/pop + name_str strlen)。
+    pub fn pure_fn(func: BuiltinFnPtr, name: *const u8) -> Self {
+        builtin_names::register(func, name);
+        Self {
+            func: Self::encode_pure(func),
+        }
+    }
+
+    /// 编码: 原始函数指针 | PURE_BIT
+    fn encode_pure(func: BuiltinFnPtr) -> BuiltinFnPtr {
+        // SAFETY: 函数指针对齐 >= 2, bit0 恒 0, | 1 不改变高位地址
+        unsafe { std::mem::transmute::<usize, BuiltinFnPtr>(func as usize | Self::PURE_BIT) }
+    }
+
+    /// 解码: 剥离 pure 位得到可调用函数指针
+    #[inline]
+    pub fn call_target(&self) -> BuiltinFnPtr {
+        // SAFETY: bit0 是自设标志位, 剥离后恢复原始函数指针
+        unsafe {
+            std::mem::transmute::<usize, BuiltinFnPtr>(self.func as usize & !Self::PURE_BIT)
+        }
+    }
+
+    /// 解码后的原始函数指针 (比较/查表用, 与注册时的指针一致)
+    #[inline]
+    pub fn raw_func(&self) -> BuiltinFnPtr {
+        self.call_target()
+    }
+
+    /// 是否为纯函数 (bit0 测试)
+    #[inline]
+    pub fn is_pure(&self) -> bool {
+        self.func as usize & Self::PURE_BIT != 0
+    }
+
     /// 获取函数名的 &str（冷路径：traceback / Debug 输出）
     ///
-    /// 从全局 BUILTIN_NAMES 表按 func 指针查找；未登记（跨版本老数据）返回 ""。
+    /// 从全局 BUILTIN_NAMES 表按原始 func 指针查找；未登记返回 ""。
     pub fn name_str(&self) -> &'static str {
-        builtin_names::lookup(self.func)
+        builtin_names::lookup(self.raw_func())
     }
 }
 
