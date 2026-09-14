@@ -1067,15 +1067,6 @@ impl VmExecutor {
         let mut constants_ptr: *const TValue = state.constants.as_ptr();
         let mut constants_len: usize = state.constants.len();
 
-        // perf: hook/trace 活动字节缓存 — trace_level | (hook_mask & (4|8))。
-        // hook_mask 只能被 Lua/C 回调路径修改 (debug.sethook 是被调函数; 元方法
-        // 经 CALL 机制; 协程切换经 execute_loop 进出), 这些路径全部收敛到
-        // CALL/TAILCALL/RETURN 族 / FORPREP / 错误恢复 / pc 越界的分支尾刷新。
-        // 直线指令段 (热循环主体) 每条指令省一次 state 内存读 (~1300B 结构体
-        // 深偏移)。原 ef62e03 缓存版在表读指令尾部也刷新导致净亏已 revert,
-        // 本版仅在真实回调收敛点刷新 (GETTABUP/GETFIELD 等 fast 路径不刷新 —
-        // 其慢路径元方法必然经 ErrOutcome::Continue 恢复, 该处刷新)。
-        let mut hook_active: u8 = trace_level | (state.hook_mask & (4 | 8)) as u8;
 
         // C 形状 pc 寄存器化 — 对应 C luaV_execute 的局部 pc (vmfetch: i = *(pc++))。
         // 主循环仅在帧切换点 (CALL/TAILCALL/RETURN*/cold dispatch/FORPREP 后) 从
@@ -1105,7 +1096,6 @@ impl VmExecutor {
                 constants_ptr = state.constants.as_ptr();
                 code_len = state.code.len();
                 constants_len = state.constants.len();
-                hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
                 continue;
             }
             // perf: constants 缓存切片 — 由常量指针构建, LLVM 可将其 ptr+len
@@ -1120,11 +1110,14 @@ impl VmExecutor {
             pc += 1; // 寄存器自增 (对应 C 的 *(pc++))
             let op = opcodes::get_opcode(inst);
 
-            // perf: hook/trace 合并单测试 — 缓存字节 (栈局部) 非 0 时进冷块。
-            // 热路径 (bench/生产常态) 仅 test+jcc, 零 state 内存读。
-            // (hook_active 在所有回调收敛点刷新: CALL/RETURN 族分支尾、
-            //  错误恢复、pc 越界、本冷块出口。)
-            if hook_active != 0 && op != OpCode::VARARGPREP {
+            // perf: hook 检查与调试跟踪合并为单次位测试。trace_or_hook 为 0 时
+            // (bench/生产常态) 一条 cmp+jcc 同时跳过两个路径; 非 0 时进入冷块
+            // 分别处理 — 语义不变, 每指令省一次独立 load+test。
+            // (trace_level 是 OnceLock 缓存的栈局部值, hook_mask 是 state 字段,
+            //  合并后热路径只测试栈局部值, state.hook_mask 的 load 延迟到冷块。)
+            // 注意: 必须每指令读 state.hook_mask — VARARGPREP 的 call hook 内可
+            // sethook 安装 line hook (db.lua:491 场景), 缓存字节会错过新 mask。
+            if trace_level | (state.hook_mask & (4 | 8)) as u8 != 0 && op != OpCode::VARARGPREP {
                 state.pc = cur; // sync: 行 hook/trace 需要 state.pc = 当前指令 (C savepc)
                 // 对应 C 的 luaG_traceexec: count hook + line hook
                 if state.hook_mask & (4 | 8) != 0 {
@@ -1133,7 +1126,6 @@ impl VmExecutor {
                 if trace_level >= 1 {
                     Self::trace_exec(state, trace_level);
                 }
-                hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
             }
 
             // 主分发: 热门 opcode 内联处理, 冷门 opcode 路由到 #[cold] 函数
@@ -1202,7 +1194,6 @@ impl VmExecutor {
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
                     constants_len = state.constants.len();
-                    hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
                     r
                 }
                 OpCode::TAILCALL => {
@@ -1213,7 +1204,6 @@ impl VmExecutor {
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
                     constants_len = state.constants.len();
-                    hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
                     r
                 }
                 OpCode::RETURN => {
@@ -1224,7 +1214,6 @@ impl VmExecutor {
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
                     constants_len = state.constants.len();
-                    hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
                         Ok(None) => Ok(()),
@@ -1240,7 +1229,6 @@ impl VmExecutor {
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
                     constants_len = state.constants.len();
-                    hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
                         Ok(None) => Ok(()),
@@ -1256,7 +1244,6 @@ impl VmExecutor {
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
                     constants_len = state.constants.len();
-                    hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
                         Ok(None) => Ok(()),
@@ -1276,7 +1263,6 @@ impl VmExecutor {
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
                     constants_len = state.constants.len();
-                    hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
                     r
                 }
                 // === SETUPVAL: 写 upvalue (deleted) ===
@@ -1299,7 +1285,6 @@ impl VmExecutor {
                     constants_ptr = state.constants.as_ptr();
                     code_len = state.code.len();
                     constants_len = state.constants.len();
-                    hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
                     r
                 }
             };
@@ -1312,8 +1297,7 @@ impl VmExecutor {
                         constants_ptr = state.constants.as_ptr();
                         code_len = state.code.len();
                         constants_len = state.constants.len();
-                        hook_active = trace_level | (state.hook_mask & (4 | 8)) as u8;
-                        continue;
+                            continue;
                     }
                     ErrOutcome::Return(r) => return Ok(r),
                 },
