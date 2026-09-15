@@ -766,6 +766,48 @@ where
 {
     // perf: 泛型替代 fn 指针 — 每个注册点单态化后 f(x) 直接内联
     // (sqrt→sqrtd 单指令, sin/cos→内联 libm 序列), 消除一次间接 call。
+    // perf: 1in/1out + 数值参数特化 — math.sin(i) (循环变量为 Integer!) 是浮点
+    // 热循环主体形态, 但本函数也会从 generic 路径进入 (hook 开启时 pure 探测
+    // 回退慢路), 故条件自带 adjust_single_result hook 分支的否定式
+    // (hook_mask&2==0 || !allowhook, #147: 读本指令时刻最新 mask)。命中时复刻
+    // adjust 的 nresults==1 直线段, 省掉: 二次参数判别、尾部逐槽扫描循环 (唯一
+    // 尾槽即本参数, 已确认数值 trivial)、stack.len() 回读 (top = a+1 常数)。
+    // 不满足 (多参/非 1-out/非数值参/hook) 落回原通用路径, 语义逐位不变。
+    let spec_x: Option<f64> = if nargs == 1
+        && nresults == 1
+        && state.stack.len() == a + 2
+        && (state.hook_mask & 2 == 0 || !state.allowhook)
+    {
+        match unsafe { state.stack.get_unchecked(a + 1) } {
+            TValue::Float(v) => Some(*v),
+            TValue::Integer(v) => Some(*v as f64),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if let Some(x) = spec_x {
+        let y = f(x);
+        unsafe {
+            let slot = state.stack.get_unchecked_mut(a);
+            if matches!(
+                slot,
+                TValue::Nil(_)
+                    | TValue::Boolean(_)
+                    | TValue::Integer(_)
+                    | TValue::Float(_)
+                    | TValue::BuiltinFn(_)
+            ) {
+                std::ptr::write(slot, TValue::Float(y));
+            } else {
+                *slot = TValue::Float(y);
+            }
+            // 唯一尾槽 = 数值参数 (trivially droppable), set_len 免 drop
+            state.stack.set_len(a + 1);
+        }
+        state.top = a + 1;
+        return Ok(());
+    }
     if nargs == 0 {
         return Err(unary_no_arg(fname));
     }
