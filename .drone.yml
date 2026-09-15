@@ -81,7 +81,11 @@ steps:
   # features — deps/setup.sh 在 target/release/lua 留下了 threaded,skynet 变体,
   # 不能用于基准)。PGO 三步: instrumented 构建 → tests_lua+bench 通用负载训练 →
   # profile-use 重建; 工具链缺失或任一步失败自动回退普通 cargo build (PGO_FALLBACK)。
-  - bash tools/build_pgo.sh
+  # target-cpu=native 安全性: bench 二进制只在构建它的同一 runner 主机上运行;
+  # 其他步骤的 plain build 由 cargo 指纹 (RUSTFLAGS 变更) 强制独立重建, 不会
+  # 复用 native 产物。
+  - lscpu | grep -m1 "Model name" || true
+  - PGO_RUSTFLAGS="-Ctarget-cpu=native" bash tools/build_pgo.sh
   - ./target/release/lua -v
   - bash tools/ci_bench.sh --skip-build full
 
