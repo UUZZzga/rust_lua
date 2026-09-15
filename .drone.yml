@@ -77,9 +77,12 @@ steps:
     CARGO_TERM_COLOR: always
     RUST_BACKTRACE: 1
   commands:
-  # 性能基准: C vs Rust (build/lua 已由 deps-tests 构建; cargo build 恢复默认 features
-  # — deps/setup.sh 在 target/release/lua 留下了 threaded,skynet 变体, 不能用于基准)
-  - cargo build --release
+  # 性能基准: C vs Rust (build/lua 已由 deps-tests 构建; PGO 构建恢复默认
+  # features — deps/setup.sh 在 target/release/lua 留下了 threaded,skynet 变体,
+  # 不能用于基准)。PGO 三步: instrumented 构建 → tests_lua+bench 通用负载训练 →
+  # profile-use 重建; 工具链缺失或任一步失败自动回退普通 cargo build (PGO_FALLBACK)。
+  - bash tools/build_pgo.sh
+  - ./target/release/lua -v
   - bash tools/ci_bench.sh --skip-build full
 
 - name: save-cache

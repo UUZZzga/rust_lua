@@ -35,3 +35,5 @@ tests_lua/time.txt
 /deps/*.tar.gz
 /deps/*.zip
 /deps/.test_*.log
+# PGO 构建中间产物 (tools/build_pgo.sh)
+pgo/
