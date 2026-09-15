@@ -83,42 +83,62 @@ uname -a > "$C_OUT"
 uname -a > "$RS_OUT"
 "$RS_LUA" -v >> "$RS_OUT" 2>&1
 
-echo ">>> 运行 C 实现基准 ($C_LUA, $SCALE) ..."
-# full 规模 3 轮取最小值 — CI runner 单轮噪声实测 ±8% (同 commit 两次运行浮点
-# 项 1.84 vs 2.05), 3 轮最小值可把判定噪声压到 ±2-3%。
-if [ "$SCALE" = "full" ]; then export BENCH_REPEAT=3; fi
-timeout 900 "$C_LUA" bench/harness.lua "$SCALE" bench/bench_*.lua 2>&1 | tee -a "$C_OUT"
-C_RC=$?
-if [ "$C_RC" -ne 0 ]; then
-    echo "错误: C 实现基准失败 (退出码 $C_RC, 日志 $C_OUT)"
-    exit "$C_RC"
+echo ">>> 运行 C/Rust 基准 (交错, $SCALE) ..."
+# 交错采样: 每轮先 C 后 RS 紧挨着跑 (BENCH_REPEAT=1), 最后对每个指标取全部
+# 轮次的【最小值】。同轮内两侧经历几乎相同的热状态/调度噪声 — 漂移变共模,
+# 比值噪声从 ±5% (块式: C 全跑完再跑 RS, 中间机器状态漂移) 压到 ±1-2%。
+# (块式 3 轮取 min 的同 commit 实证带: #120 1.0318 / #122 1.0861 / #123 1.0500
+#  / #124 1.0256 — ±4.9%, 一切 <5% 的候选不可判定。)
+if [ "$PLATFORM" = "windows" ] || [ "$SCALE" = "quick" ]; then
+    ROUNDS=3
+else
+    ROUNDS=5
 fi
+export BENCH_REPEAT=1
+for r in $(seq 1 "$ROUNDS"); do
+    echo "--- round $r/$ROUNDS: C ---"
+    timeout 900 "$C_LUA" bench/harness.lua "$SCALE" bench/bench_*.lua 2>&1 | tee -a "$C_OUT"
+    C_RC=$?
+    if [ "$C_RC" -ne 0 ]; then
+        echo "错误: C 实现基准失败 (退出码 $C_RC, 轮 $r, 日志 $C_OUT)"
+        exit "$C_RC"
+    fi
+    echo "--- round $r/$ROUNDS: Rust ---"
+    timeout 900 "$RS_LUA" bench/harness.lua "$SCALE" bench/bench_*.lua 2>&1 | tee -a "$RS_OUT"
+    RS_RC=$?
+    if [ "$RS_RC" -ne 0 ]; then
+        echo "错误: Rust 实现基准失败 (退出码 $RS_RC, 轮 $r, 日志 $RS_OUT)"
+        exit "$RS_RC"
+    fi
+done
 
+# 对比表: 按指标名聚合两侧全部 ">>" 行取最小值 (不再 paste 行配对)。
+# awk 用 seen[who SUBSEP key] 单数组兼容 mawk/gawk (镜像默认 mawk, 不支持 a[x][y])。
 echo ""
-echo ">>> 运行 Rust 实现基准 ($RS_LUA, $SCALE) ..."
-timeout 900 "$RS_LUA" bench/harness.lua "$SCALE" bench/bench_*.lua 2>&1 | tee -a "$RS_OUT"
-RS_RC=$?
-if [ "$RS_RC" -ne 0 ]; then
-    echo "错误: Rust 实现基准失败 (退出码 $RS_RC, 日志 $RS_OUT)"
-    exit "$RS_RC"
-fi
-
-# 对比表 (paste 文件参数; <() 在 Git Bash 不可用)
-echo ""
-echo "================ 性能基准对比 ($PLATFORM, $SCALE) ================"
+echo "================ 性能基准对比 ($PLATFORM, $SCALE, ${ROUNDS} 轮交错取min) ================"
 printf "%-28s %20s %20s\n" "指标" "C" "Rust"
 echo "-------------------------------------------------------------------------"
-paste "$C_OUT" "$RS_OUT" | \
-while IFS=$'\t' read -r c_line r_line; do
-    case "$c_line" in
-        *" >> "*) ;;
-        *) continue ;;
-    esac
-    metric=$(echo "$c_line" | sed 's/^  >> *//; s/:.*//')
-    c_val=$(echo "$c_line" | sed 's/^.*: *//')
-    r_val=$(echo "$r_line" | sed 's/^.*: *//')
-    printf "%-28s %20s %20s\n" "$metric" "$c_val" "$r_val"
-done
+awk -v cfile="$C_OUT" '
+    /^  >> / {
+        line = $0
+        sub(/^  >> /, "", line)
+        pos = match(line, /: [0-9.]+$/)
+        if (pos == 0) next
+        key = substr(line, 1, pos - 1)
+        val = substr(line, pos + 2) + 0
+        which = (FILENAME == cfile) ? "c" : "r"
+        sk = which SUBSEP key
+        if (!(sk in seen) || val < memo[sk]) memo[sk] = val
+        seen[sk] = 1
+        if (!(key in oseen)) { order[++n] = key; oseen[key] = 1 }
+    }
+    END {
+        for (i = 1; i <= n; i++) {
+            k = order[i]
+            printf "%-28s %20.4f %20.4f\n", k, memo["c" SUBSEP k], memo["r" SUBSEP k]
+        }
+    }
+' "$C_OUT" "$RS_OUT"
 echo "========================================================================="
 
 # tests_lua/all.lua 计时对比 (仅 Linux; 其内部 dofile 的 main.lua 依赖 Unix shell, Windows 跳过)
