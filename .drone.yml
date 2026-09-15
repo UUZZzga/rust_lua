@@ -77,15 +77,14 @@ steps:
     CARGO_TERM_COLOR: always
     RUST_BACKTRACE: 1
   commands:
-  # 性能基准: C vs Rust (build/lua 已由 deps-tests 构建; cargo build 恢复默认
-  # features — deps/setup.sh 在 target/release/lua 留下了 threaded,skynet 变体,
-  # 不能用于基准)。默认走 build_pgo.sh 三步 PGO (CI #103 实证浮点 1.5223→
-  # 1.3340; full 规模训练劣化, 保持 quick); BENCH_PGO=0 退普通构建 (代码改动
-  # 轮次的纯 A/B)。BENCH_ABORT=0 关 abort; 默认 bench 二进制加 -Cpanic=abort
-  # + lua_longjmp (错误路径 setjmp/longjmp, 与 size-opt 模式同源已有实战):
-  # 移除 execute_loop 全部 unwind landing pads, 本地 float -2.7% / meta -7%。
-  - if [ "$BENCH_PGO" = "0" ]; then cargo build --release; else if [ "$BENCH_ABORT" = "0" ]; then bash tools/build_pgo.sh; else PGO_RUSTFLAGS="-Cpanic=abort" PGO_FEATURES="lua_longjmp" bash tools/build_pgo.sh; fi; fi
-  - ./target/release/lua -v
+  # 性能基准: C vs Rust。构建决策 (PGO + panic=abort/lua_longjmp 平台默认)
+  # 全部内聚在 tools/build_release_opt.sh, 本行是无内联逻辑的单条 bash 调用 —
+  # Windows exec runner 对 commands 做启动期 bash 解析且内联 VAR=x 前缀在
+  # #120 实证会泄漏为 cargo 参数, 命令行保持极简 (记忆 #148/#97)。
+  # C lua 由 deps-tests 的 cmake 构建提供; build_release_opt.sh 恢复默认
+  # features (deps/setup.sh 在 target/release/lua 留下的 threaded,skynet
+  # 变体不能用于基准)。
+  - bash tools/build_release_opt.sh
   - bash tools/ci_bench.sh --skip-build full
 
 - name: save-cache
