@@ -4934,84 +4934,55 @@ impl VmExecutor {
         Ok(())
     }
     /// 窄 superblock 第二阶段: 字段值 (pure BuiltinFn) 已写入 a2 后, 探测紧随的
-    /// 实参装载+调用连缀并在本 handler 内执行。命中省 2-3 次完整 dispatch
-    /// (fetch + prefix hook 测 + match + 返回簿记) — wave5 实测每次调用
-    /// ~14ns 包络差的主体。两种形态:
-    /// A. `MOVE a2+1 src; CALL a2 2 2` (math.sin(i) 直传参) → 省 2;
-    /// B. `MODK a2+1 b c; MMBINK; CALL a2 2 2` (math.sqrt(i%1000) 带表达式
-    ///    实参; b/c 均 Integer 且除数非零时 MODK 必成功跳 MMBINK, 其余落回
-    ///    原路径) → 省 3。
-    /// mv_idx = 形态首指令索引; 返回省掉的指令数 (0 = 原样执行)。前提逐项与
-    /// op_call 快速探测一致: 任一 hook 位开启放弃 (#147 行号/计数语义),
-    /// 函数 pure, CALL 固定 B=2/C=2 非 k 形态。出错 sync state.pc = CALL 索引
-    /// (traceback 行号 = 原 CALL 行, cold 路径补推 CallInfoEntry)。
+    /// `MOVE a2+1 src; CALL a2 2 2` 连缀 (math.sin(i) 形态 — 编译器把实参 MOVE
+    /// 到函数槽隔壁再 CALL) 并在本 handler 内执行。命中省 2 次完整 dispatch
+    /// (fetch + prefix hook 测 + match + 返回簿记) — 即 wave5 实测的每次调用
+    /// ~14ns 包络差的主体。
+    /// mv_idx = MOVE 指令索引; 命中返回 2 (caller pc += 2 跳过 MOVE+CALL),
+    /// 未命中返回 0 (三条指令原样执行)。前提逐项与 op_call 快速探测 +
+    /// 既有 GETFIELD 融合一致: line/count hook 关 (外层已测, 跳指令语义)、
+    /// call/ret hook 关 (hook_mask&3)、C 臂固定 (B=2,C=2,非 k)、函数 pure。
+    /// 纯调用出错: sync state.pc = CALL 索引 (错误行号语义 = 原 CALL 行),
+    /// call_pure_builtin 的 cold 路径已补推 CallInfoEntry, traceback 一致。
     fn fuse_pure_call(
         state: &mut LuaState,
         a2: usize,
         bf: crate::objects::BuiltinFn,
         mv_idx: usize,
     ) -> Result<usize, VmError> {
+        // 任一 hook 位开启都放弃: call/ret (3) 是 pure 路径前提; line/count (12)
+        // 要求每条指令被 traceexec 观察, 融合跳指令会破坏 db.lua 行号/计数语义
+        // (#147)。LUA_VM_TRACE 环境仅影响调试输出, 不进 CI/bench, 不在此防护。
         if state.hook_mask != 0 || !bf.is_pure() {
             return Ok(0);
         }
-        let (i0, i1) = {
+        let (im, ic) = {
             let code = &*state.code;
             if mv_idx + 1 >= code.len() {
                 return Ok(0);
             }
             (code[mv_idx], code[mv_idx + 1])
         };
-        // CALL 检查提取共用: 形态 A 在 i1, 形态 B 在 i2
-        let call_ok = |ic: Instruction| -> bool {
-            opcodes::get_opcode(ic) == OpCode::CALL
-                && opcodes::getarg_a(ic) as usize + state.base == a2
-                && opcodes::getarg_b(ic) == 2
-                && opcodes::getarg_c(ic) == 2
-                && !opcodes::testarg_k(ic)
-        };
-        // 形态 A: MOVE + CALL
-        if opcodes::get_opcode(i0) == OpCode::MOVE
-            && opcodes::getarg_a(i0) as usize + state.base == a2 + 1
-            && call_ok(i1)
-        {
-            // 参数装载: 复用 op_move (恒 Ok; 越界走其 grow 分支, 与原指令逐位相同)
-            Self::op_move(state, i0)?;
-            state.top = a2 + 2;
-            state.pc = mv_idx + 1; // CALL 索引 (C savepc 同形)
-            Self::call_pure_builtin(state, a2, 2, 2, bf)?;
-            return Ok(2);
+        if opcodes::get_opcode(im) != OpCode::MOVE || opcodes::get_opcode(ic) != OpCode::CALL {
+            return Ok(0);
         }
-        // 形态 B: MODK + MMBINK + CALL (双 Integer 参、除数非零才融)
-        if opcodes::get_opcode(i0) == OpCode::MODK
-            && opcodes::get_opcode(i1) == OpCode::MMBINK
-            && opcodes::getarg_a(i0) as usize + state.base == a2 + 1
+        if opcodes::getarg_a(im) as usize + state.base != a2 + 1
+            || opcodes::getarg_a(ic) as usize + state.base != a2
+            || opcodes::getarg_b(ic) != 2
+            || opcodes::getarg_c(ic) != 2
+            || opcodes::testarg_k(ic)
         {
-            let code = &*state.code;
-            let i2 = if mv_idx + 2 < code.len() {
-                code[mv_idx + 2]
-            } else {
-                return Ok(0);
-            };
-            if !call_ok(i2) {
-                return Ok(0);
-            }
-            let b_src = opcodes::getarg_b(i0) as usize + state.base;
-            let k_idx = opcodes::getarg_c(i0) as usize;
-            let arg = match (state.stack.get(b_src), state.constants.get(k_idx)) {
-                (Some(TValue::Integer(v1)), Some(TValue::Integer(v2))) => {
-                    modulus(*v1, *v2).ok().map(|r| TValue::Integer(r))
-                }
-                _ => None,
-            };
-            if let Some(v) = arg {
-                Self::write_stack(state, a2 + 1, v);
-                state.top = a2 + 2;
-                state.pc = mv_idx + 2; // CALL 索引
-                Self::call_pure_builtin(state, a2, 2, 2, bf)?;
-                return Ok(3);
-            }
+            return Ok(0);
         }
-        Ok(0)
+        // 参数装载: 复用 op_move (恒 Ok; 越界走其 grow 分支, 与原指令逐位相同)
+        Self::op_move(state, im)?;
+        // 对应 op_call 的 `if (b != 0) top = ra + b` (B=2 → a2+2)
+        state.top = a2 + 2;
+        // 与主循环 CALL 臂同形: 先 sync state.pc = CALL 索引 (错误行号与
+        // CallInfoEntry.saved_pc 消费点), 成功路径无人消费 state.pc。
+        state.pc = mv_idx + 1;
+        Self::call_pure_builtin(state, a2, 2, 2, bf)?;
+        Ok(2)
     }
 
     fn try_fuse_getfield(
