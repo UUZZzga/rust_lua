@@ -319,9 +319,9 @@ fn call_setmetatable(
 
     // 检查第二个参数是否为 nil 或表
     if !matches!(&arg2, TValue::Table(_) | TValue::Nil(_)) {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument #2 to 'setmetatable' (nil or table expected)".to_string(),
-        )));
+        ));
     }
 
     // 先 intern 字符串, 避免借用冲突
@@ -335,9 +335,9 @@ fn call_setmetatable(
                 // 检查是否有 __metatable 元方法 (受保护的元表)
                 if let Some(mt) = t.get_metatable() {
                     if mt.get(&metatable_key).is_some() {
-                        return Err(VmError::RuntimeError(Box::new(
+                        return Err(VmError::RuntimeError(
                             "cannot change a protected metatable".to_string(),
-                        )));
+                        ));
                     }
                 }
                 // 设置元表
@@ -353,9 +353,9 @@ fn call_setmetatable(
                 state.stack[a + 1].clone()
             }
             _ => {
-                return Err(VmError::RuntimeError(Box::new(
+                return Err(VmError::RuntimeError(
                     "bad argument #1 to 'setmetatable' (table expected)".to_string(),
-                )));
+                ));
             }
         }
     };
@@ -424,9 +424,9 @@ fn call_getmetatable(
 /// 这里用 nargs == 0 区分“参数缺失”与“显式 nil”。
 fn call_type(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     if nargs == 0 {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument #1 to 'type' (value expected)".to_string(),
-        )));
+        ));
     }
     let arg = get_arg(state, a, 0);
     let name = base_type_name(&arg);
@@ -519,7 +519,7 @@ pub(crate) fn call_pcall(
         let yield_values = state.pending_yield.take().unwrap_or_default();
         // yield 时不截断栈，保留 foo 的执行状态供第二次 resume 恢复
         // 对应 C Lua 中 yield 穿过 pcall，pcall 的状态被销毁
-        return Err(VmError::Yield(Box::new(yield_values)));
+        return Err(VmError::Yield(yield_values));
     }
 
     // pcall 后: 栈截断到 a, 结果在 a..
@@ -718,18 +718,18 @@ fn call_error(state: &mut LuaState, a: usize, nargs: usize, _nresults: i32) -> R
             state.error_no_prefix = false; // 字符串 + level>0：已加前缀，build_traceback 不再处理
         }
         state.last_error_value = Some(TValue::Str(state.intern_str(&err_msg)));
-        Err(VmError::RuntimeError(Box::new(err_msg)))
+        Err(VmError::RuntimeError(err_msg))
     } else {
         // 非字符串错误值: 原样返回（对应 C Lua 中 errfunc 为非字符串时的行为）
         // 特殊处理：error() 即 error(nil) 应返回 "<no error object>"（对应 C luaG_errormsg）
         if matches!(msg, TValue::Nil(_)) {
             let err_msg = "<no error object>".to_string();
             state.last_error_value = Some(TValue::Str(state.intern_str(&err_msg)));
-            return Err(VmError::RuntimeError(Box::new(err_msg)));
+            return Err(VmError::RuntimeError(err_msg));
         }
         // 保留原始 TValue 类型（coroutine.close 需要返回原始值）
         state.last_error_value = Some(msg.clone());
-        Err(VmError::RuntimeErrorValue(Box::new(msg)))
+        Err(VmError::RuntimeErrorValue(msg))
     }
 }
 
@@ -742,9 +742,9 @@ fn call_tonumber(
 ) -> Result<(), VmError> {
     // 对应 C 的 luaL_checkany(L, 1)：必须有一个参数
     if nargs == 0 {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument #1 to 'tonumber' (value expected)".to_string(),
-        )));
+        ));
     }
     let arg = get_arg(state, a, 0);
     let base_arg = if nargs >= 2 {
@@ -766,9 +766,9 @@ fn call_tonumber(
         match base {
             Some(b) if (2..=36).contains(&b) => base_tonumber(&arg, Some(b)),
             _ => {
-                return Err(VmError::RuntimeError(Box::new(
+                return Err(VmError::RuntimeError(
                     "bad argument #2 to 'tonumber' (base out of range)".to_string(),
-                )));
+                ));
             }
         }
     };
@@ -789,9 +789,9 @@ fn call_tostring(
 ) -> Result<(), VmError> {
     // 对应 C 的 luaL_checkany(L, 1)：必须有一个参数
     if nargs == 0 {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument #1 to 'tostring' (value expected)".to_string(),
-        )));
+        ));
     }
     let arg = get_arg(state, a, 0);
     // 对应 C 的 luaL_tolstring: 先尝试调用 __tostring 元方法
@@ -818,7 +818,7 @@ fn call_tostring(
                     String::new()
                 };
                 state.stack.truncate(base);
-                return Err(VmError::RuntimeError(Box::new(err)));
+                return Err(VmError::RuntimeError(err));
             }
             // 检查返回值是否为字符串
             let result_str = if base < state.stack.len() {
@@ -835,9 +835,9 @@ fn call_tostring(
                     push_single_result(state, a, nresults, TValue::Str(state.intern_str(&s)));
                     Ok(())
                 }
-                None => Err(VmError::RuntimeError(Box::new(
+                None => Err(VmError::RuntimeError(
                     "'__tostring' must return a string".to_string(),
-                ))),
+                )),
             };
         }
     }
@@ -860,7 +860,7 @@ fn call_tostring(
                     String::new()
                 };
                 state.stack.truncate(base);
-                return Err(VmError::RuntimeError(Box::new(err)));
+                return Err(VmError::RuntimeError(err));
             }
             let result_str = if base < state.stack.len() {
                 match &state.stack[base] {
@@ -876,9 +876,9 @@ fn call_tostring(
                     push_single_result(state, a, nresults, TValue::Str(state.intern_str(&s)));
                     Ok(())
                 }
-                None => Err(VmError::RuntimeError(Box::new(
+                None => Err(VmError::RuntimeError(
                     "'__tostring' must return a string".to_string(),
-                ))),
+                )),
             };
         }
     }
@@ -903,10 +903,10 @@ fn call_assert(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     // 然后 luaL_checkany(L, 1) 触发 "bad argument #1 (value expected)" 错误
     if nargs == 0 {
         let prefix = lua_l_where(state, 1);
-        return Err(VmError::RuntimeError(Box::new(format!(
+        return Err(VmError::RuntimeError(format!(
             "{}bad argument #1 to 'assert' (value expected)",
             prefix
-        ))));
+        )));
     }
     let args: Vec<TValue> = (0..nargs).map(|i| get_arg(state, a, i)).collect();
     match base_assert(&args) {
@@ -920,10 +920,10 @@ fn call_assert(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
             if args.len() >= 2 && !matches!(args[1], TValue::Str(_) | TValue::Nil(_)) {
                 let err_val = args[1].clone();
                 state.last_error_value = Some(err_val.clone());
-                Err(VmError::RuntimeErrorValue(Box::new(err_val)))
+                Err(VmError::RuntimeErrorValue(err_val))
             } else {
                 let prefix = lua_l_where(state, 1);
-                Err(VmError::RuntimeError(Box::new(format!("{}{}", prefix, msg))))
+                Err(VmError::RuntimeError(format!("{}{}", prefix, msg)))
             }
         }
     }
@@ -932,9 +932,9 @@ fn call_assert(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
 /// select(n, ...) — 对应 C 的 luaB_select
 fn call_select(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     if nargs == 0 {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument #1 to 'select' (value expected)".to_string(),
-        )));
+        ));
     }
     let first = get_arg(state, a, 0);
 
@@ -952,9 +952,9 @@ fn call_select(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         TValue::Integer(n) => *n,
         TValue::Float(f) => *f as i64,
         _ => {
-            return Err(VmError::RuntimeError(Box::new(
+            return Err(VmError::RuntimeError(
                 "bad argument #1 to 'select' (number expected)".to_string(),
-            )));
+            ));
         }
     };
 
@@ -962,15 +962,15 @@ fn call_select(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     let src_idx: usize = if n < 0 {
         let idx = nargs_after as i64 + n;
         if idx < 0 {
-            return Err(VmError::RuntimeError(Box::new(
+            return Err(VmError::RuntimeError(
                 "bad argument #1 to 'select' (index out of range)".to_string(),
-            )));
+            ));
         }
         idx as usize
     } else if n == 0 {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument #1 to 'select' (index out of range)".to_string(),
-        )));
+        ));
     } else {
         let idx = (n - 1) as usize;
         if idx >= nargs_after {
@@ -1017,7 +1017,7 @@ fn call_rawlen(
             push_single_result(state, a, nresults, TValue::Integer(len));
             Ok(())
         }
-        Err(msg) => Err(VmError::RuntimeError(Box::new(msg))),
+        Err(msg) => Err(VmError::RuntimeError(msg)),
     }
 }
 
@@ -1036,9 +1036,9 @@ fn call_rawget(
             push_single_result(state, a, nresults, result);
             Ok(())
         }
-        _ => Err(VmError::RuntimeError(Box::new(
+        _ => Err(VmError::RuntimeError(
             "bad argument #1 to 'rawget' (table expected)".to_string(),
-        ))),
+        )),
     }
 }
 
@@ -1056,10 +1056,10 @@ fn call_rawset(
     // NaN 永远不等于自身, 故每次都是新键插入; nil 键同理
     match &k {
         TValue::Nil(_) => {
-            return Err(VmError::RuntimeError(Box::new("table index is nil".to_string())));
+            return Err(VmError::RuntimeError("table index is nil".to_string()));
         }
         TValue::Float(f) if f.is_nan() => {
-            return Err(VmError::RuntimeError(Box::new("table index is NaN".to_string())));
+            return Err(VmError::RuntimeError("table index is NaN".to_string()));
         }
         _ => {}
     }
@@ -1073,9 +1073,9 @@ fn call_rawset(
                 state.stack[a + 1].clone()
             }
             _ => {
-                return Err(VmError::RuntimeError(Box::new(
+                return Err(VmError::RuntimeError(
                     "bad argument #1 to 'rawset' (table expected)".to_string(),
-                )));
+                ));
             }
         }
     };
@@ -1096,7 +1096,7 @@ fn call_next(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
     match &t {
         TValue::Table(table) => {
             let (next_key, next_val) =
-                table_next(table, &key).map_err(|e| VmError::RuntimeError(Box::new(e.to_string())))?;
+                table_next(table, &key).map_err(|e| VmError::RuntimeError(e.to_string()))?;
             match next_key {
                 Some(k) => {
                     push_results(state, a, nresults, vec![k, next_val]);
@@ -1107,18 +1107,18 @@ fn call_next(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
             }
             Ok(())
         }
-        _ => Err(VmError::RuntimeError(Box::new(
+        _ => Err(VmError::RuntimeError(
             "bad argument #1 to 'next' (table expected)".to_string(),
-        ))),
+        )),
     }
 }
 
 /// ipairs(t) — 对应 C 的 luaB_ipairs
 fn call_ipairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     if nargs < 1 {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument #1 to 'ipairs' (value expected)".to_string(),
-        )));
+        ));
     }
     let t = get_arg(state, a, 0);
     // 返回迭代器函数 (ipairsaux), 状态 t, 初始值 0
@@ -1135,9 +1135,9 @@ fn call_ipairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
 ///   __pairs 内部可能 yield (对应 C 的 lua_callk + pairscont continuation)
 fn call_pairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     if nargs < 1 {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument #1 to 'pairs' (value expected)".to_string(),
-        )));
+        ));
     }
     let t = get_arg(state, a, 0);
     // 对应 C luaB_pairs: 检查 __pairs 元方法
@@ -1197,7 +1197,7 @@ fn call_pairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
         if status == crate::state::LUA_YIELD {
             // __pairs 内部 yield: 传播 yield (保护状态保留，saved_filled 由 state.pcall 设为 true)
             let yield_values = state.pending_yield.take().unwrap_or_default();
-            return Err(VmError::Yield(Box::new(yield_values)));
+            return Err(VmError::Yield(yield_values));
         }
 
         // 非 yield: pop 保护状态，取 4 个返回值
@@ -1317,7 +1317,7 @@ pub(crate) fn call_xpcall(
     // 对应 C 的 finishpcall: status == LUA_YIELD 时视为成功，不调用错误处理函数
     if status == crate::state::LUA_YIELD {
         let yield_values = state.pending_yield.take().unwrap_or_default();
-        return Err(VmError::Yield(Box::new(yield_values)));
+        return Err(VmError::Yield(yield_values));
     }
 
     let nret = state.stack.len().saturating_sub(a);
@@ -1435,9 +1435,9 @@ pub(crate) fn call_xpcall(
 /// warn(...) — 对应 C 的 luaB_warn
 fn call_warn(state: &mut LuaState, a: usize, nargs: usize, _nresults: i32) -> Result<(), VmError> {
     if nargs == 0 {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument #1 to 'warn' (string expected)".to_string(),
-        )));
+        ));
     }
     // 对应 C: for (i = 1; i < n; i++) lua_warning(L, msg_i, 1);
     //         lua_warning(L, msg_n, 0);
@@ -1449,10 +1449,10 @@ fn call_warn(state: &mut LuaState, a: usize, nargs: usize, _nresults: i32) -> Re
                 state.warning(s.as_str(), tocont);
             }
             _ => {
-                return Err(VmError::RuntimeError(Box::new(format!(
+                return Err(VmError::RuntimeError(format!(
                     "bad argument #{} to 'warn' (string expected)",
                     i + 1
-                ))));
+                )));
             }
         }
     }
@@ -1476,18 +1476,18 @@ fn call_require(
     nresults: i32,
 ) -> Result<(), VmError> {
     if nargs == 0 {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument #1 to 'require' (string expected, got no value)".to_string(),
-        )));
+        ));
     }
     let modname_val = get_arg(state, a, 0);
     let modname = match &modname_val {
         TValue::Str(s) => s.as_str().to_string(),
         _ => {
-            return Err(VmError::RuntimeError(Box::new(format!(
+            return Err(VmError::RuntimeError(format!(
                 "bad argument #1 to 'require' (string expected, got {})",
                 modname_val.ty()
-            ))));
+            )));
         }
     };
 
@@ -1515,9 +1515,9 @@ fn call_require(
         match package_table.get(&searchers_key) {
             Some(TValue::Table(_)) => {}
             _ => {
-                return Err(VmError::RuntimeError(Box::new(
+                return Err(VmError::RuntimeError(
                     "'package.searchers' must be a table".to_string(),
-                )));
+                ));
             }
         }
     }
@@ -1543,7 +1543,7 @@ fn call_require(
             err_msgs.push(errmsg);
         }
         Err(e) => {
-            return Err(VmError::RuntimeError(Box::new(e)));
+            return Err(VmError::RuntimeError(e));
         }
     }
 
@@ -1577,7 +1577,7 @@ fn call_require(
                 err_msgs.push(errmsg);
             }
             Err(e) => {
-                return Err(VmError::RuntimeError(Box::new(e)));
+                return Err(VmError::RuntimeError(e));
             }
         }
     }
@@ -1592,11 +1592,11 @@ fn call_require(
         }
     }
 
-    Err(VmError::RuntimeError(Box::new(format!(
+    Err(VmError::RuntimeError(format!(
         "module '{}' not found:\n\t{}",
         modname,
         err_msgs.join("\n\t")
-    ))))
+    )))
 }
 
 /// 获取 package.preload[modname]
@@ -1632,7 +1632,7 @@ fn run_loader(
     if status != 0 {
         let err = state.to_string(-1).unwrap_or_default();
         state.settop(saved_len);
-        return Err(VmError::RuntimeError(Box::new(err)));
+        return Err(VmError::RuntimeError(err));
     }
     let result = state
         .stack
@@ -1668,10 +1668,10 @@ fn load_lua_module(
     if load_status != 0 {
         let err = state.to_string(-1).unwrap_or_default();
         state.settop(saved_len);
-        return Err(VmError::RuntimeError(Box::new(format!(
+        return Err(VmError::RuntimeError(format!(
             "error loading module '{}' from '{}': {}",
             modname, filepath, err
-        ))));
+        )));
     }
     // 调用加载的函数：(modname, filepath)
     state.stack.push(TValue::Str(state.intern_str(modname)));
@@ -1680,10 +1680,10 @@ fn load_lua_module(
     if call_status != 0 {
         let err = state.to_string(-1).unwrap_or_default();
         state.settop(saved_len);
-        return Err(VmError::RuntimeError(Box::new(format!(
+        return Err(VmError::RuntimeError(format!(
             "error loading module '{}' from '{}': {}",
             modname, filepath, err
-        ))));
+        )));
     }
     let result = state
         .stack
@@ -2050,26 +2050,26 @@ fn call_loadlib(
     nresults: i32,
 ) -> Result<(), VmError> {
     if nargs < 2 {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument to 'loadlib' (needs 2 arguments)".to_string(),
-        )));
+        ));
     }
     let path_val = get_arg(state, a, 0);
     let init_val = get_arg(state, a, 1);
     let path = match &path_val {
         TValue::Str(s) => s.as_str().to_string(),
         _ => {
-            return Err(VmError::RuntimeError(Box::new(
+            return Err(VmError::RuntimeError(
                 "bad argument #1 to 'loadlib' (string expected)".to_string(),
-            )))
+            ))
         }
     };
     let init = match &init_val {
         TValue::Str(s) => s.as_str().to_string(),
         _ => {
-            return Err(VmError::RuntimeError(Box::new(
+            return Err(VmError::RuntimeError(
                 "bad argument #2 to 'loadlib' (string expected)".to_string(),
-            )))
+            ))
         }
     };
 
@@ -2120,26 +2120,26 @@ fn call_searchpath(
     nresults: i32,
 ) -> Result<(), VmError> {
     if nargs < 2 {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument to 'searchpath' (needs at least 2 arguments)".to_string(),
-        )));
+        ));
     }
     let name_val = get_arg(state, a, 0);
     let path_val = get_arg(state, a, 1);
     let name = match &name_val {
         TValue::Str(s) => s.as_str().to_string(),
         _ => {
-            return Err(VmError::RuntimeError(Box::new(
+            return Err(VmError::RuntimeError(
                 "bad argument #1 to 'searchpath' (string expected)".to_string(),
-            )))
+            ))
         }
     };
     let path = match &path_val {
         TValue::Str(s) => s.as_str().to_string(),
         _ => {
-            return Err(VmError::RuntimeError(Box::new(
+            return Err(VmError::RuntimeError(
                 "bad argument #2 to 'searchpath' (string expected)".to_string(),
-            )))
+            ))
         }
     };
     let sep = match nargs >= 3 {
@@ -2201,9 +2201,9 @@ fn call_searcher_placeholder(
     _nargs: usize,
     _nresults: i32,
 ) -> Result<(), VmError> {
-    Err(VmError::RuntimeError(Box::new(
+    Err(VmError::RuntimeError(
         "package.searchers functions are not directly callable".to_string(),
-    )))
+    ))
 }
 
 /// 缓存模块到 package.loaded[modname]
@@ -2368,9 +2368,9 @@ fn get_package_table(state: &LuaState) -> Option<crate::table::Table> {
 /// (对应 C 的 load_aux 中 status != LUA_OK 的分支)。
 fn call_load(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     if nargs == 0 {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument #1 to 'load' (string expected, got no value)".to_string(),
-        )));
+        ));
     }
 
     let chunk_val = get_arg(state, a, 0);
@@ -2423,9 +2423,9 @@ fn call_load(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
                 let m = s.as_str().to_string();
                 // C 的 getMode: if (strchr(mode, 'B') != NULL) luaL_argerror(...)
                 if m.contains('B') {
-                    return Err(VmError::RuntimeError(Box::new(
+                    return Err(VmError::RuntimeError(
                         "bad argument #3 to 'load' (invalid mode)".to_string(),
-                    )));
+                    ));
                 }
                 Some(m)
             }
@@ -2537,10 +2537,10 @@ fn call_load(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
             source = &_source_owned;
         }
         _ => {
-            return Err(VmError::RuntimeError(Box::new(format!(
+            return Err(VmError::RuntimeError(format!(
                 "bad argument #1 to 'load' (string or function expected, got {})",
                 chunk_val.ty()
-            ))));
+            )));
         }
     }
 
@@ -2666,10 +2666,10 @@ fn call_dofile(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
             TValue::Str(s) => Some(s.as_str().to_string()),
             TValue::Nil(_) => None,
             _ => {
-                return Err(VmError::RuntimeError(Box::new(format!(
+                return Err(VmError::RuntimeError(format!(
                     "bad argument #1 to 'dofile' (string expected, got {})",
                     arg.ty()
-                ))));
+                )));
             }
         }
     } else {
@@ -2685,7 +2685,7 @@ fn call_dofile(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     if load_status != 0 {
         let err = state.to_string(-1).unwrap_or_default();
         state.settop(saved_len);
-        return Err(VmError::RuntimeError(Box::new(format!("{}", err))));
+        return Err(VmError::RuntimeError(format!("{}", err)));
     }
 
     let call_status = state.pcall(0, -1, 0);
@@ -2693,7 +2693,7 @@ fn call_dofile(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     if call_status == crate::state::LUA_YIELD {
         let yield_values = state.pending_yield.take().unwrap_or_default();
         // yield 时不截断栈，保留 chunk 的执行状态供第二次 resume 恢复
-        return Err(VmError::Yield(Box::new(yield_values)));
+        return Err(VmError::Yield(yield_values));
     }
     if call_status != 0 {
         let err_val = state
@@ -2703,8 +2703,8 @@ fn call_dofile(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
             .unwrap_or_else(|| TValue::Str(state.intern_str("dofile error")));
         state.settop(saved_len);
         match err_val {
-            TValue::Str(s) => return Err(VmError::RuntimeError(Box::new(s.as_str().to_string()))),
-            other => return Err(VmError::RuntimeErrorValue(Box::new(other))),
+            TValue::Str(s) => return Err(VmError::RuntimeError(s.as_str().to_string())),
+            other => return Err(VmError::RuntimeErrorValue(other)),
         }
     }
 
@@ -2749,10 +2749,10 @@ fn call_loadfile(
             TValue::Str(s) => Some(s.as_str().to_string()),
             TValue::Nil(_) => None,
             _ => {
-                return Err(VmError::RuntimeError(Box::new(format!(
+                return Err(VmError::RuntimeError(format!(
                     "bad argument #1 to 'loadfile' (string expected, got {})",
                     arg.ty()
-                ))));
+                )));
             }
         }
     } else {
@@ -2767,18 +2767,18 @@ fn call_loadfile(
             TValue::Str(s) => {
                 let mode_str = s.as_str().to_string();
                 if mode_str.contains('B') {
-                    return Err(VmError::RuntimeError(Box::new(
+                    return Err(VmError::RuntimeError(
                         "bad argument #2 to 'loadfile' (invalid mode)".to_string(),
-                    )));
+                    ));
                 }
                 Some(mode_str)
             }
             TValue::Nil(_) => None,
             _ => {
-                return Err(VmError::RuntimeError(Box::new(format!(
+                return Err(VmError::RuntimeError(format!(
                     "bad argument #2 to 'loadfile' (string expected, got {})",
                     m.ty()
-                ))));
+                )));
             }
         }
     } else {
@@ -3028,9 +3028,9 @@ pub fn call_ipairs_aux(
         TValue::Integer(n) => *n,
         TValue::Float(f) => *f as i64,
         _ => {
-            return Err(VmError::RuntimeError(Box::new(
+            return Err(VmError::RuntimeError(
                 "bad argument #2 to 'ipairs' iterator (number expected)".to_string(),
-            )));
+            ));
         }
     };
     // 对应 C 的 luaL_intop(+, i, 1): unsigned 算术 wrap-around
@@ -3089,10 +3089,10 @@ fn call_collectgarbage(
             TValue::Str(s) => s.as_str().to_string(),
             TValue::Nil(_) => "collect".to_string(),
             ref other => {
-                return Err(VmError::RuntimeError(Box::new(format!(
+                return Err(VmError::RuntimeError(format!(
                     "bad argument #1 to 'collectgarbage' (string expected, got {})",
                     crate::tm::obj_type_name(other)
-                ))))
+                )))
             }
         }
     } else {
@@ -3169,10 +3169,10 @@ fn call_collectgarbage(
             let pname = match get_arg(state, a, 1) {
                 TValue::Str(s) => s.as_str().to_string(),
                 ref other => {
-                    return Err(VmError::RuntimeError(Box::new(format!(
+                    return Err(VmError::RuntimeError(format!(
                         "bad argument #2 to 'collectgarbage' (string expected, got {})",
                         crate::tm::obj_type_name(other)
-                    ))))
+                    )))
                 }
             };
             let pidx = match pname.as_str() {
@@ -3183,10 +3183,10 @@ fn call_collectgarbage(
                 "stepmul" => GCState::PARAM_STEPMUL,
                 "stepsize" => GCState::PARAM_STEPSIZE,
                 _ => {
-                    return Err(VmError::RuntimeError(Box::new(format!(
+                    return Err(VmError::RuntimeError(format!(
                         "bad argument #2 to 'collectgarbage' (invalid parameter name '{}')",
                         pname
-                    ))))
+                    )))
                 }
             };
             if nargs >= 3 {
@@ -3194,10 +3194,10 @@ fn call_collectgarbage(
                     TValue::Integer(i) => i as i32,
                     TValue::Float(f) => f as i32,
                     ref other => {
-                        return Err(VmError::RuntimeError(Box::new(format!(
+                        return Err(VmError::RuntimeError(format!(
                             "bad argument #3 to 'collectgarbage' (number expected, got {})",
                             crate::tm::obj_type_name(other)
-                        ))))
+                        )))
                     }
                 };
                 let old = state.gc.swap_gc_param(pidx, val);
@@ -3208,10 +3208,10 @@ fn call_collectgarbage(
             }
         }
         _ => {
-            return Err(VmError::RuntimeError(Box::new(format!(
+            return Err(VmError::RuntimeError(format!(
                 "bad argument #1 to 'collectgarbage' (invalid option '{}')",
                 opt
-            ))));
+            )));
         }
     };
 
@@ -3903,7 +3903,7 @@ mod tests {
         let result = call_error(&mut state, 0, 1, 0);
         assert!(result.is_err());
         match result {
-            Err(VmError::RuntimeError(msg)) => assert_eq!(&*msg, "test error"),
+            Err(VmError::RuntimeError(msg)) => assert_eq!(msg, "test error"),
             _ => panic!("expected RuntimeError"),
         }
     }

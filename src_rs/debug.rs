@@ -43,7 +43,7 @@ pub fn runerror(_state: &mut LuaState, _msg: &str, _args: &[&TValue]) {
 pub fn concaterror(p1: &TValue, p2: &TValue) -> VmError {
     let err_obj = if is_string_or_cvt2str(p1) { p2 } else { p1 };
     let tname = obj_type_name(err_obj);
-    VmError::RuntimeError(Box::new(format!("attempt to concatenate a {} value", tname)))
+    VmError::RuntimeError(format!("attempt to concatenate a {} value", tname))
 }
 
 /// 顺序比较错误 — 对应 C 的 luaG_ordererror
@@ -55,7 +55,7 @@ pub fn ordererror(p1: &TValue, p2: &TValue) -> VmError {
     } else {
         format!("attempt to compare {} with {}", t1, t2)
     };
-    VmError::RuntimeError(Box::new(msg))
+    VmError::RuntimeError(msg)
 }
 
 /// 算术/位运算错误 — 对应 C 的 luaG_opinterror
@@ -78,7 +78,7 @@ pub fn opinterror(p1: &TValue, p2: &TValue, op: &str, p1_info: &str, p2_info: &s
         (p2, p2_info)
     };
     let tname = obj_type_name(err_obj);
-    VmError::RuntimeError(Box::new(format!("attempt to {} a {} value{}", op, tname, info)))
+    VmError::RuntimeError(format!("attempt to {} a {} value{}", op, tname, info))
 }
 
 /// 整数转换错误 — 对应 C 的 luaG_tointerror
@@ -101,7 +101,7 @@ pub fn tointerror(p1: &TValue, _p2: &TValue, p1_info: &str, p2_info: &str) -> Vm
     } else {
         p2_info
     };
-    VmError::RuntimeError(Box::new(format!("number{} has no integer representation", info)))
+    VmError::RuntimeError(format!("number{} has no integer representation", info))
 }
 
 /// 判断值是否为数字 — 对应 C 的 ttisnumber

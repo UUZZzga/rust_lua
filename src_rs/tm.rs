@@ -513,7 +513,7 @@ pub(crate) fn call_tm_res(
             // saved_pc 已在 push 时设置为 caller_pc（被中断指令），不需 +1
         }
         let yield_values = state.pending_yield.take().unwrap_or_default();
-        return Err(VmError::Yield(Box::new(yield_values)));
+        return Err(VmError::Yield(yield_values));
     }
 
     // 非 yield: pop PcallProtection
@@ -539,12 +539,12 @@ pub(crate) fn call_tm_res(
                 let msg = s.as_str().to_string();
                 // 仅对 "attempt to call" 错误附加元方法名（对应 C 的 luaG_callerror）
                 if msg.starts_with("attempt to call") && !msg.contains("metamethod") {
-                    VmError::RuntimeError(Box::new(format!("{} (metamethod '{}')", msg, mm_name)))
+                    VmError::RuntimeError(format!("{} (metamethod '{}')", msg, mm_name))
                 } else {
-                    VmError::RuntimeError(Box::new(msg))
+                    VmError::RuntimeError(msg)
                 }
             }
-            _ => VmError::RuntimeErrorValue(Box::new(result.clone())),
+            _ => VmError::RuntimeErrorValue(result.clone()),
         });
     }
 
@@ -665,7 +665,7 @@ pub(crate) fn call_tm(
             protection.func_idx = func_idx;
         }
         let yield_values = state.pending_yield.take().unwrap_or_default();
-        return Err(VmError::Yield(Box::new(yield_values)));
+        return Err(VmError::Yield(yield_values));
     }
 
     // 非 yield: pop PcallProtection
@@ -685,8 +685,8 @@ pub(crate) fn call_tm(
         state.stack.truncate(func_idx);
         state.top = state.stack.len();
         return Err(match &result {
-            TValue::Str(s) => VmError::RuntimeError(Box::new(s.as_str().to_string())),
-            _ => VmError::RuntimeErrorValue(Box::new(result.clone())),
+            TValue::Str(s) => VmError::RuntimeError(s.as_str().to_string()),
+            _ => VmError::RuntimeErrorValue(result.clone()),
         });
     }
     // 成功: pop CallInfoEntry, 截断栈
@@ -732,7 +732,7 @@ pub fn call_close_method(
     // 不能 panic，否则 coroutine.close 无法返回 (false, msg)。
     if depth >= crate::state::LUAI_MAXCCALLS as usize {
         CLOSE_METHOD_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
-        return Err(VmError::RuntimeError(Box::new("C stack overflow".to_string())));
+        return Err(VmError::RuntimeError("C stack overflow".to_string()));
     }
     struct DepthGuard;
     impl Drop for DepthGuard {
@@ -755,10 +755,10 @@ pub fn call_close_method(
                 Some(v) => type_name(v.ty()),
                 None => "nil",
             };
-            return Err(VmError::RuntimeError(Box::new(format!(
+            return Err(VmError::RuntimeError(format!(
                 "attempt to call a {} value (metamethod 'close')",
                 tn
-            ))));
+            )));
         }
     };
 
@@ -838,7 +838,7 @@ pub fn call_close_method(
         // __close 函数 yield: 不 pop PcallProtection (保留供 resume 时使用)
         // 对应 C Lua 的 luaV_finishOp: savedpc-- 重新执行 OP_RETURN/OP_CLOSE
         let values = state.pending_yield.take().unwrap_or_default();
-        return Err(VmError::Yield(Box::new(values)));
+        return Err(VmError::Yield(values));
     }
 
     // 成功或错误: pop PcallProtection
@@ -862,12 +862,12 @@ pub fn call_close_method(
         state.last_close_frame = close_frame;
         // 非字符串错误用 RuntimeErrorValue 保留原始类型（如数字 200）
         return Err(if matches!(err_val, TValue::Str(_)) {
-            VmError::RuntimeError(Box::new(match &err_val {
+            VmError::RuntimeError(match &err_val {
                 TValue::Str(s) => s.as_str().to_string(),
                 _ => String::new(),
-            }))
+            })
         } else {
-            VmError::RuntimeErrorValue(Box::new(err_val))
+            VmError::RuntimeErrorValue(err_val)
         });
     }
     // 截断栈，移除临时压入的函数/参数
@@ -924,10 +924,10 @@ fn callbin_tm(
                 let opname = tm.event_name();
                 let t1 = obj_type_name(p1);
                 let t2 = obj_type_name(p2);
-                return Err(VmError::RuntimeError(Box::new(format!(
+                return Err(VmError::RuntimeError(format!(
                     "attempt to {} a '{}' with a '{}'",
                     opname, t1, t2
-                ))));
+                )));
             }
             call_tm_res(state, &f, p1, p2, res, tm)?;
             Ok(true)
@@ -972,7 +972,7 @@ fn string_arith(
             TagMethod::Mul => Some(TValue::Integer(i1.wrapping_mul(i2))),
             TagMethod::Mod => {
                 if i2 == 0 {
-                    return Err(VmError::RuntimeError(Box::new(String::from("attempt to perform 'n%0'"))));
+                    return Err(VmError::RuntimeError("attempt to perform 'n%0'".into()));
                 }
                 Some(TValue::Integer(
                     crate::vm::modulus(i1, i2).map_err(|_| VmError::ModuloByZero)?,
@@ -980,7 +980,7 @@ fn string_arith(
             }
             TagMethod::IDiv => {
                 if i2 == 0 {
-                    return Err(VmError::RuntimeError(Box::new(String::from("attempt to perform 'n//0'"))));
+                    return Err(VmError::RuntimeError("attempt to perform 'n//0'".into()));
                 }
                 Some(TValue::Integer(i1 / i2))
             }
@@ -1368,11 +1368,11 @@ pub fn obj_len(state: &mut LuaState, ra: usize, rb: &TValue, varinfo: &str) -> R
             // C: luaT_callTMres(L, tm, rb, rb, ra);
             call_tm_res(state, &f, rb, rb, ra, TagMethod::Len)
         }
-        None => Err(VmError::RuntimeError(Box::new(format!(
+        None => Err(VmError::RuntimeError(format!(
             "attempt to get length of a {} value{}",
             obj_type_name(rb),
             varinfo
-        )))),
+        ))),
     }
 }
 

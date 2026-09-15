@@ -200,10 +200,10 @@ fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
 /// 对应 C 的 tolstream -> luaL_checkudata
 fn check_file_arg(state: &LuaState, a: usize, nargs: usize, fname: &str) -> Result<u32, VmError> {
     if nargs < 1 {
-        return Err(VmError::RuntimeError(Box::new(format!(
+        return Err(VmError::RuntimeError(format!(
             "bad argument #1 to '{}' (FILE* expected, got no value)",
             fname
-        ))));
+        )));
     }
     let arg = get_arg(state, a, 0);
     match &arg {
@@ -214,19 +214,19 @@ fn check_file_arg(state: &LuaState, a: usize, nargs: usize, fname: &str) -> Resu
                 mt.get(&name_key) == Some(TValue::Str(state.intern_str("FILE*")))
             });
             if !is_file {
-                return Err(VmError::RuntimeError(Box::new(format!(
+                return Err(VmError::RuntimeError(format!(
                     "bad argument #1 to '{}' (FILE* expected, got userdata)",
                     fname
-                ))));
+                )));
             }
             Ok(u.gc_header.ptr_id)
         }
         _ => {
             let typearg = crate::tm::obj_type_name(&arg);
-            Err(VmError::RuntimeError(Box::new(format!(
+            Err(VmError::RuntimeError(format!(
                 "bad argument #1 to '{}' (FILE* expected, got {})",
                 fname, typearg
-            ))))
+            )))
         }
     }
 }
@@ -394,18 +394,18 @@ fn call_io_open(
     nresults: i32,
 ) -> Result<(), VmError> {
     if nargs < 1 {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument #1 to 'open' (string expected, got no value)".to_string(),
-        )));
+        ));
     }
     let filename_val = get_arg(state, a, 0);
     let filename = match &filename_val {
         TValue::Str(s) => s.as_str().to_string(),
         _ => {
-            return Err(VmError::RuntimeError(Box::new(format!(
+            return Err(VmError::RuntimeError(format!(
                 "bad argument #1 to 'open' (string expected, got {})",
                 crate::tm::obj_type_name(&filename_val)
-            ))));
+            )));
         }
     };
     let mode = if nargs >= 2 {
@@ -414,10 +414,10 @@ fn call_io_open(
             TValue::Str(s) => s.as_str().to_string(),
             TValue::Nil(_) => "r".to_string(),
             _ => {
-                return Err(VmError::RuntimeError(Box::new(format!(
+                return Err(VmError::RuntimeError(format!(
                     "bad argument #2 to 'open' (string expected, got {})",
                     crate::tm::obj_type_name(&m)
-                ))));
+                )));
             }
         }
     } else {
@@ -425,9 +425,9 @@ fn call_io_open(
     };
 
     if !check_mode(&mode) {
-        return Err(VmError::RuntimeError(Box::new(format!(
+        return Err(VmError::RuntimeError(format!(
             "bad argument #2 to 'open' (invalid mode)"
-        ))));
+        )));
     }
 
     // 设置 errno = 0
@@ -515,18 +515,18 @@ fn call_io_popen(
     nresults: i32,
 ) -> Result<(), VmError> {
     if nargs < 1 {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument #1 to 'popen' (string expected, got no value)".to_string(),
-        )));
+        ));
     }
     let prog_val = get_arg(state, a, 0);
     let prog = match &prog_val {
         TValue::Str(s) => s.as_str().to_string(),
         _ => {
-            return Err(VmError::RuntimeError(Box::new(format!(
+            return Err(VmError::RuntimeError(format!(
                 "bad argument #1 to 'popen' (string expected, got {})",
                 crate::tm::obj_type_name(&prog_val)
-            ))));
+            )));
         }
     };
     let mode = if nargs >= 2 {
@@ -535,10 +535,10 @@ fn call_io_popen(
             TValue::Str(s) => s.as_str().to_string(),
             TValue::Nil(_) => "r".to_string(),
             _ => {
-                return Err(VmError::RuntimeError(Box::new(format!(
+                return Err(VmError::RuntimeError(format!(
                     "bad argument #2 to 'popen' (string expected, got {})",
                     crate::tm::obj_type_name(&m)
-                ))));
+                )));
             }
         }
     } else {
@@ -546,9 +546,9 @@ fn call_io_popen(
     };
 
     if !check_modep(&mode) {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument #2 to 'popen' (invalid mode)".to_string(),
-        )));
+        ));
     }
 
     let c_prog = std::ffi::CString::new(prog.clone()).unwrap();
@@ -620,11 +620,11 @@ fn g_write(
             TValue::Float(_fl) => crate::stdlib::base_lib::lua_value_to_string(&val).into_bytes(),
             _ => {
                 // 对应 C 的 luaL_checklstring 抛出错误
-                return Err(VmError::RuntimeError(Box::new(format!(
+                return Err(VmError::RuntimeError(format!(
                     "bad argument #{} to 'write' (string or number expected, got {})",
                     i + 1,
                     crate::tm::obj_type_name(&val)
-                ))));
+                )));
             }
         };
         let written =
@@ -697,9 +697,9 @@ fn call_io_output(
                         mt.get(&name_key) == Some(TValue::Str(state.intern_str("FILE*")))
                     });
                     if !is_file {
-                        return Err(VmError::RuntimeError(Box::new(format!(
+                        return Err(VmError::RuntimeError(format!(
                             "bad argument #1 to 'output' (FILE* expected, got userdata)"
-                        ))));
+                        )));
                     }
                     state.io_output_handle = Some(u.gc_header.ptr_id);
                     state.io_output = None; // 清除 Box<dyn Write>
@@ -726,7 +726,7 @@ fn call_io_output(
                         let msg = unsafe { std::ffi::CStr::from_ptr(libc::strerror(en)) }
                             .to_string_lossy()
                             .into_owned();
-                        return Err(VmError::RuntimeError(Box::new(format!("{}: {}", filename, msg))));
+                        return Err(VmError::RuntimeError(format!("{}: {}", filename, msg)));
                     }
                     let file_mt = state
                         .dmt
@@ -756,10 +756,10 @@ fn call_io_output(
                 }
                 _ => {
                     let typearg = crate::tm::obj_type_name(&arg);
-                    return Err(VmError::RuntimeError(Box::new(format!(
+                    return Err(VmError::RuntimeError(format!(
                         "bad argument #1 to 'output' (FILE* expected, got {})",
                         typearg
-                    ))));
+                    )));
                 }
             }
         }
@@ -790,9 +790,9 @@ fn call_io_input(
                         mt.get(&name_key) == Some(TValue::Str(state.intern_str("FILE*")))
                     });
                     if !is_file {
-                        return Err(VmError::RuntimeError(Box::new(format!(
+                        return Err(VmError::RuntimeError(format!(
                             "bad argument #1 to 'input' (FILE* expected, got userdata)"
-                        ))));
+                        )));
                     }
                     state.io_input_handle = Some(u.gc_header.ptr_id);
                     // 保存到 io 表的 _current_input 字段
@@ -814,7 +814,7 @@ fn call_io_input(
                         let msg = unsafe { std::ffi::CStr::from_ptr(libc::strerror(en)) }
                             .to_string_lossy()
                             .into_owned();
-                        return Err(VmError::RuntimeError(Box::new(format!("{}: {}", filename, msg))));
+                        return Err(VmError::RuntimeError(format!("{}: {}", filename, msg)));
                     }
                     let file_mt = state
                         .dmt
@@ -843,10 +843,10 @@ fn call_io_input(
                 }
                 _ => {
                     let typearg = crate::tm::obj_type_name(&arg);
-                    return Err(VmError::RuntimeError(Box::new(format!(
+                    return Err(VmError::RuntimeError(format!(
                         "bad argument #1 to 'input' (FILE* expected, got {})",
                         typearg
-                    ))));
+                    )));
                 }
             }
         }
@@ -974,9 +974,9 @@ fn close_file_handle(
 
     // 已关闭文件: 报错 "attempt to use a closed file" (对应 C 的 tofile -> luaL_error)
     if is_closed(state, ptr_id) {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "attempt to use a closed file".to_string(),
-        )));
+        ));
     }
 
     // 关闭文件
@@ -1010,9 +1010,9 @@ fn call_io_type(
     nresults: i32,
 ) -> Result<(), VmError> {
     if nargs < 1 {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument #1 to 'type' (value expected)".to_string(),
-        )));
+        ));
     }
     let arg = get_arg(state, a, 0);
     let result = match &arg {
@@ -1387,10 +1387,10 @@ fn g_read(
                     let p = if p.starts_with('*') { &p[1..] } else { p };
                     if p.is_empty() {
                         // 无效格式
-                        return Err(VmError::RuntimeError(Box::new(format!(
+                        return Err(VmError::RuntimeError(format!(
                             "bad argument #{} to 'read' (invalid format)",
                             i + 1
-                        ))));
+                        )));
                     }
                     match p.as_bytes()[0] {
                         b'n' => match read_number(f) {
@@ -1423,18 +1423,18 @@ fn g_read(
                             results.push(TValue::Str(crate::strings::new_long_bytes(buf)));
                         }
                         _ => {
-                            return Err(VmError::RuntimeError(Box::new(format!(
+                            return Err(VmError::RuntimeError(format!(
                                 "bad argument #{} to 'read' (invalid format)",
                                 i + 1
-                            ))));
+                            )));
                         }
                     }
                 }
                 _ => {
-                    return Err(VmError::RuntimeError(Box::new(format!(
+                    return Err(VmError::RuntimeError(format!(
                         "bad argument #{} to 'read' (invalid format)",
                         i + 1
-                    ))));
+                    )));
                 }
             }
         }
@@ -1490,9 +1490,9 @@ fn call_file_read(
     let f = match get_file_ptr(state, ptr_id) {
         Some(f) => f,
         None => {
-            return Err(VmError::RuntimeError(Box::new(
+            return Err(VmError::RuntimeError(
                 "attempt to use a closed file".to_string(),
-            )));
+            ));
         }
     };
     // nargs 包含 self，first_arg=a+2 已跳过 self，故传 nargs-1
@@ -1516,9 +1516,9 @@ fn call_file_write(
     let f = match get_file_ptr(state, ptr_id) {
         Some(f) => f,
         None => {
-            return Err(VmError::RuntimeError(Box::new(
+            return Err(VmError::RuntimeError(
                 "attempt to use a closed file".to_string(),
-            )));
+            ));
         }
     };
     // nargs 包含 self，first_arg=a+2 已跳过 self，故传 nargs-1
@@ -1548,9 +1548,9 @@ fn call_file_seek(
     let f = match get_file_ptr(state, ptr_id) {
         Some(f) => f,
         None => {
-            return Err(VmError::RuntimeError(Box::new(
+            return Err(VmError::RuntimeError(
                 "attempt to use a closed file".to_string(),
-            )));
+            ));
         }
     };
 
@@ -1561,10 +1561,10 @@ fn call_file_seek(
             TValue::Str(s) => s.as_str().to_string(),
             TValue::Nil(_) => "cur".to_string(),
             _ => {
-                return Err(VmError::RuntimeError(Box::new(format!(
+                return Err(VmError::RuntimeError(format!(
                     "bad argument #2 to 'seek' (string expected, got {})",
                     crate::tm::obj_type_name(&v)
-                ))));
+                )));
             }
         }
     } else {
@@ -1576,10 +1576,10 @@ fn call_file_seek(
         "cur" => libc::SEEK_CUR,
         "end" => libc::SEEK_END,
         _ => {
-            return Err(VmError::RuntimeError(Box::new(format!(
+            return Err(VmError::RuntimeError(format!(
                 "bad argument #2 to 'seek' (invalid option '{}')",
                 whence
-            ))));
+            )));
         }
     };
 
@@ -1590,18 +1590,18 @@ fn call_file_seek(
             TValue::Integer(n) => *n,
             TValue::Float(fl) => {
                 if fl.fract() != 0.0 {
-                    return Err(VmError::RuntimeError(Box::new(
+                    return Err(VmError::RuntimeError(
                         "bad argument #3 to 'seek' (not an integer in proper range)".to_string(),
-                    )));
+                    ));
                 }
                 *fl as i64
             }
             TValue::Nil(_) => 0,
             _ => {
-                return Err(VmError::RuntimeError(Box::new(format!(
+                return Err(VmError::RuntimeError(format!(
                     "bad argument #3 to 'seek' (integer expected, got {})",
                     crate::tm::obj_type_name(&v)
-                ))));
+                )));
             }
         }
     } else {
@@ -1651,9 +1651,9 @@ fn call_file_flush(
     let f = match get_file_ptr(state, ptr_id) {
         Some(f) => f,
         None => {
-            return Err(VmError::RuntimeError(Box::new(
+            return Err(VmError::RuntimeError(
                 "attempt to use a closed file".to_string(),
-            )));
+            ));
         }
     };
     unsafe {
@@ -1698,9 +1698,9 @@ fn call_file_setvbuf(
     let f = match get_file_ptr(state, ptr_id) {
         Some(f) => f,
         None => {
-            return Err(VmError::RuntimeError(Box::new(
+            return Err(VmError::RuntimeError(
                 "attempt to use a closed file".to_string(),
-            )));
+            ));
         }
     };
 
@@ -1709,16 +1709,16 @@ fn call_file_setvbuf(
         match &v {
             TValue::Str(s) => s.as_str().to_string(),
             _ => {
-                return Err(VmError::RuntimeError(Box::new(format!(
+                return Err(VmError::RuntimeError(format!(
                     "bad argument #2 to 'setvbuf' (string expected, got {})",
                     crate::tm::obj_type_name(&v)
-                ))));
+                )));
             }
         }
     } else {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument #2 to 'setvbuf' (string expected, got no value)".to_string(),
-        )));
+        ));
     };
 
     let mode = match mode_str.as_str() {
@@ -1726,10 +1726,10 @@ fn call_file_setvbuf(
         "full" => libc::_IOFBF,
         "line" => libc::_IOLBF,
         _ => {
-            return Err(VmError::RuntimeError(Box::new(format!(
+            return Err(VmError::RuntimeError(format!(
                 "bad argument #2 to 'setvbuf' (invalid option '{}')",
                 mode_str
-            ))));
+            )));
         }
     };
 
@@ -1808,10 +1808,10 @@ fn call_io_lines(
     if nargs > 0 {
         let n_fmts = nargs - 1;
         if n_fmts > MAXARGLINE {
-            return Err(VmError::RuntimeError(Box::new(format!(
+            return Err(VmError::RuntimeError(format!(
                 "bad argument #{} to 'lines' (too many arguments)",
                 MAXARGLINE + 2
-            ))));
+            )));
         }
     }
     let mut results: Vec<TValue> = Vec::new();
@@ -1860,7 +1860,7 @@ fn call_io_lines(
                 let msg = unsafe { std::ffi::CStr::from_ptr(libc::strerror(en)) }
                     .to_string_lossy()
                     .into_owned();
-                return Err(VmError::RuntimeError(Box::new(format!("{}: {}", filename, msg))));
+                return Err(VmError::RuntimeError(format!("{}: {}", filename, msg)));
             }
             let file_mt = state
                 .dmt
@@ -1898,10 +1898,10 @@ fn call_io_lines(
             state.adjust_results(a, nresults, results);
             Ok(())
         }
-        _ => Err(VmError::RuntimeError(Box::new(format!(
+        _ => Err(VmError::RuntimeError(format!(
             "bad argument #1 to 'lines' (string expected, got {})",
             crate::tm::obj_type_name(&first)
-        )))),
+        ))),
     }
 }
 
@@ -1916,10 +1916,10 @@ fn call_file_lines(
     // nargs 含 self，格式参数数量 = nargs - 1
     let n_fmts = nargs.saturating_sub(1);
     if n_fmts > MAXARGLINE {
-        return Err(VmError::RuntimeError(Box::new(format!(
+        return Err(VmError::RuntimeError(format!(
             "bad argument #{} to 'lines' (too many arguments)",
             MAXARGLINE + 2
-        ))));
+        )));
     }
     let ptr_id = check_file_arg(state, a, nargs, "lines")?;
     let formats = if nargs >= 2 {
@@ -1950,22 +1950,22 @@ fn call_lines_iterator_fn(
             .stack
             .get(a)
             .cloned()
-            .ok_or_else(|| VmError::RuntimeError(Box::new("lines iterator missing".to_string())))?;
+            .ok_or_else(|| VmError::RuntimeError("lines iterator missing".to_string()))?;
         let rc = match func_val {
             TValue::RustClosure(rc) => rc,
             _ => {
-                return Err(VmError::RuntimeError(Box::new(
+                return Err(VmError::RuntimeError(
                     "lines iterator: expected RustClosure".to_string(),
-                )));
+                ));
             }
         };
         let upvals = rc.upvalues.borrow();
         let file_ptr_id = match upvals.get(LINES_UP_FILE) {
             Some(TValue::Integer(i)) => *i as u32,
             _ => {
-                return Err(VmError::RuntimeError(Box::new(
+                return Err(VmError::RuntimeError(
                     "lines iterator: bad file_ptr_id upvalue".to_string(),
-                )));
+                ));
             }
         };
         let to_close = matches!(upvals.get(LINES_UP_TO_CLOSE), Some(TValue::Boolean(true)));
@@ -1979,7 +1979,7 @@ fn call_lines_iterator_fn(
     };
 
     if finished {
-        return Err(VmError::RuntimeError(Box::new("file is already closed".to_string())));
+        return Err(VmError::RuntimeError("file is already closed".to_string()));
     }
 
     // 检查文件是否已关闭
@@ -1988,7 +1988,7 @@ fn call_lines_iterator_fn(
         None => {
             // 文件已被关闭 — 标记 finished
             mark_lines_finished(state, a);
-            return Err(VmError::RuntimeError(Box::new("file is already closed".to_string())));
+            return Err(VmError::RuntimeError("file is already closed".to_string()));
         }
     };
 
@@ -2020,7 +2020,7 @@ fn call_lines_iterator_fn(
                 }
             }
             mark_lines_finished(state, a);
-            return Err(VmError::RuntimeError(Box::new(err_msg)));
+            return Err(VmError::RuntimeError(err_msg));
         }
         // EOF: 关闭文件
         if to_close {
@@ -2062,9 +2062,9 @@ fn get_default_output(state: &mut LuaState) -> Result<*mut libc::FILE, VmError> 
         if let Some(f) = state.file_handles.get(&pid).copied() {
             return Ok(f);
         }
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "default output file is closed".to_string(),
-        )));
+        ));
     }
     // 检查 io_output: Box<dyn Write> (向后兼容)
     if state.io_output.is_some() {
@@ -2086,7 +2086,7 @@ fn get_default_input(state: &mut LuaState) -> Result<*mut libc::FILE, VmError> {
         if let Some(f) = state.file_handles.get(&pid).copied() {
             return Ok(f);
         }
-        return Err(VmError::RuntimeError(Box::new(" input file is closed".to_string())));
+        return Err(VmError::RuntimeError(" input file is closed".to_string()));
     }
     // 默认使用 stdin
     Ok(c_stdin())

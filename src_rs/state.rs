@@ -2658,7 +2658,7 @@ impl LuaState {
                             // 从 e 构造错误值（始终更新，避免上次 pcall 残留的 last_error_value 污染）
                             // 对应 C Lua 的 longjmp 恢复：错误值来自当前错误，而非全局状态
                             let err_from_e = match e {
-                                VmError::RuntimeErrorValue(val) => (**val).clone(),
+                                VmError::RuntimeErrorValue(val) => val.clone(),
                                 VmError::RuntimeError(s) => TValue::Str(self.intern_str(s)),
                                 other => TValue::Str(self.intern_str(&format!("{}", other))),
                             };
@@ -2698,7 +2698,7 @@ impl LuaState {
                             match crate::func::close(self, close_level, 1, close_yy) {
                                 Ok(()) => {}
                                 Err(VmError::Yield(values)) => {
-                                    close_yield = Some(*values);
+                                    close_yield = Some(values);
                                 }
                                 Err(_) => {}
                             }
@@ -3083,7 +3083,7 @@ impl LuaState {
             // 对应 C 中 yield 通过 longjmp 穿过 pcall:
             // 不截断栈,保留被调用函数的执行状态供协程恢复时使用
             Err(crate::execute::VmError::Yield(values)) => {
-                self.pending_yield = Some(*values);
+                self.pending_yield = Some(values);
                 self.last_error_value = None;
                 self.last_error_msg.clear();
                 // C 函数 __close (如 coroutine.yield 作为 __close) yield 时，
@@ -3124,7 +3124,7 @@ impl LuaState {
                 // 非字符串错误值（如 error(foo)）：保留原始 TValue 放到栈上，
                 // 供 pcall 返回 (false, original_value) 而非 (false, string)
                 self.stack.truncate(func_idx);
-                self.stack.push(*val);
+                self.stack.push(val);
                 self.top = self.stack.len();
                 ERR_RUN
             }

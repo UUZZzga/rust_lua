@@ -384,9 +384,9 @@ fn call_setmetatable(
 
     // 检查第二个参数是否为 nil 或表
     if !matches!(&arg2, TValue::Table(_) | TValue::Nil(_)) {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument #2 to 'setmetatable' (nil or table expected)".to_string(),
-        )));
+        ));
     }
 
     match (&arg1, &arg2) {
@@ -515,10 +515,10 @@ fn call_setuservalue(
                 TValue::LightUserData(_) => "light userdata".to_string(),
                 _ => crate::tm::obj_type_name(&arg1),
             };
-            return Err(VmError::RuntimeError(Box::new(format!(
+            return Err(VmError::RuntimeError(format!(
                 "bad argument #1 to 'setuservalue' (userdata expected, got {})",
                 typearg
-            ))));
+            )));
         }
     };
     push_single_result(state, a, nresults, result);
@@ -556,17 +556,17 @@ fn call_getinfo(
 
     // 检查无效选项
     if what.starts_with('>') {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument to 'getinfo' (invalid option '>')".to_string(),
-        )));
+        ));
     }
     // 验证每个选项字符 (对应 C 的 lua_getinfo 返回 0 时报错)
     // 合法选项: S l u n r t L f
     for ch in what.chars() {
         if !matches!(ch, 'S' | 'l' | 'u' | 'n' | 'r' | 't' | 'L' | 'f') {
-            return Err(VmError::RuntimeError(Box::new(
+            return Err(VmError::RuntimeError(
                 "bad argument to 'getinfo' (invalid option)".to_string(),
-            )));
+            ));
         }
     }
 
@@ -2034,7 +2034,7 @@ fn call_getlocal(
             }
             return Ok(());
         }
-        None => Err(VmError::RuntimeError(Box::new("level out of range".to_string()))),
+        None => Err(VmError::RuntimeError("level out of range".to_string())),
     }
 }
 
@@ -2061,7 +2061,7 @@ fn call_setlocal(
     let value = get_arg(state, a, arg_offset + 2);
 
     if level < 1 {
-        return Err(VmError::RuntimeError(Box::new("level out of range".to_string())));
+        return Err(VmError::RuntimeError("level out of range".to_string()));
     }
 
     // 协程模式: 从 ThreadContext 设置局部变量
@@ -2168,7 +2168,7 @@ fn call_setlocal(
             }
             return Ok(());
         }
-        None => Err(VmError::RuntimeError(Box::new("level out of range".to_string()))),
+        None => Err(VmError::RuntimeError("level out of range".to_string())),
     }
 }
 
@@ -2270,15 +2270,15 @@ fn call_getupvalue(
                     ],
                 );
             } else {
-                return Err(VmError::RuntimeError(Box::new(
+                return Err(VmError::RuntimeError(
                     "bad argument #1 to 'getupvalue' (function expected)".to_string(),
-                )));
+                ));
             }
             Ok(())
         }
-        _ => Err(VmError::RuntimeError(Box::new(
+        _ => Err(VmError::RuntimeError(
             "bad argument #1 to 'getupvalue' (function expected)".to_string(),
-        ))),
+        )),
     }
 }
 
@@ -2377,15 +2377,15 @@ fn call_setupvalue(
             {
                 push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
             } else {
-                return Err(VmError::RuntimeError(Box::new(
+                return Err(VmError::RuntimeError(
                     "bad argument #1 to 'setupvalue' (function expected)".to_string(),
-                )));
+                ));
             }
             Ok(())
         }
-        _ => Err(VmError::RuntimeError(Box::new(
+        _ => Err(VmError::RuntimeError(
             "bad argument #1 to 'setupvalue' (function expected)".to_string(),
-        ))),
+        )),
     }
 }
 
@@ -2489,39 +2489,39 @@ fn call_upvaluejoin(
 
     // 检查 f1 是 LClosure，且 n1 在有效范围内
     if f1_stack_idx >= state.stack.len() {
-        return Err(VmError::RuntimeError(Box::new(
+        return Err(VmError::RuntimeError(
             "bad argument #1 to 'upvaluejoin' (Lua function expected)".to_string(),
-        )));
+        ));
     }
     let f1_upvals_len = match &state.stack[f1_stack_idx] {
         TValue::LClosure(c1) => c1.upvals.borrow().len(),
         _ => {
-            return Err(VmError::RuntimeError(Box::new(
+            return Err(VmError::RuntimeError(
                 "bad argument #1 to 'upvaluejoin' (Lua function expected)".to_string(),
-            )));
+            ));
         }
     };
     if n1 == 0 || n1 > f1_upvals_len {
-        return Err(VmError::RuntimeError(Box::new(format!(
+        return Err(VmError::RuntimeError(format!(
             "bad argument #2 to 'upvaluejoin' (invalid upvalue index {})",
             n1
-        ))));
+        )));
     }
 
     // 检查 f2 是 LClosure，且 n2 在有效范围内
     let f2_upvals_len = match &f2 {
         TValue::LClosure(c2) => c2.upvals.borrow().len(),
         _ => {
-            return Err(VmError::RuntimeError(Box::new(
+            return Err(VmError::RuntimeError(
                 "bad argument #3 to 'upvaluejoin' (Lua function expected)".to_string(),
-            )));
+            ));
         }
     };
     if n2 == 0 || n2 > f2_upvals_len {
-        return Err(VmError::RuntimeError(Box::new(format!(
+        return Err(VmError::RuntimeError(format!(
             "bad argument #4 to 'upvaluejoin' (invalid upvalue index {})",
             n2
-        ))));
+        )));
     }
 
     // 获取 f2 的第 n2 个上值引用 (Rc<RefCell<UpVal>>)
