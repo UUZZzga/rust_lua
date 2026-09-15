@@ -3309,20 +3309,38 @@ impl VmExecutor {
                 // (`GETTABUP 4 0 math; GETFIELD 4 4 sin`), 后写覆盖先写, 顺序即语义。
                 // 未命中/非短串键 → 走原 GETFIELD 全路径 (元表语义由原指令保证)。
                 let fused: Option<TValue> = Self::try_fuse_getfield(state, a, &t, cur);
-                Self::write_stack(state, a, TValue::Table(t));
                 if let Some(v) = fused {
-                    // 先判别再写 (v 将被 write_stack 消费)
-                    let builtin = match v {
-                        TValue::BuiltinFn(bf) => Some(bf),
-                        _ => None,
-                    };
-                    Self::write_stack(state, a, v); // a2 == table_slot (融合条件保证)
+                    // 中间表写会被字段值覆写 (a2 == table_slot) — 直写终值。
+                    // 旧槽为同 BuiltinFn 时跳过覆写: 判别式+函数指针位级相等
+                    // (同 name 指针 ⇒ 同全局名表条目, 语义同对象)。
+                    // 关键: 旧值恰为 BuiltinFn (非 Table) 时, 表写与字段写都被
+                    // 省略 → t 在借用结束自然 drop, 无泄漏; 旧值为 Table 时
+                    // 必须表写 (t 吸收其 Rc), 再字段写。
                     let mut skip = 1usize; // GETFIELD
-                    if let Some(bf) = builtin {
-                        // 连缀 MOVE+CALL: mv_idx = cur+2 (GETFIELD 后一条)
-                        skip += Self::fuse_pure_call(state, a, bf, cur + 2)?;
+                    match v {
+                        TValue::BuiltinFn(nf) => {
+                            let mut overwrite = true;
+                            if let Some(TValue::BuiltinFn(of)) = state.stack.get(a) {
+                                if of.func == nf.func {
+                                    overwrite = false;
+                                }
+                            }
+                            if overwrite {
+                                // write_stack 自带旧值 trivial/Copy 检查: 旧槽若
+                                // 是其他指令刚写的 Table 等带 Rc 值, 正常走 drop,
+                                // 不能裸 ptr::write (泄漏)。
+                                Self::write_stack(state, a, v);
+                            }
+                            skip += Self::fuse_pure_call(state, a, nf, cur + 2)?;
+                        }
+                        other => {
+                            Self::write_stack(state, a, TValue::Table(t));
+                            Self::write_stack(state, a, other);
+                        }
                     }
                     *pc += skip;
+                } else {
+                    Self::write_stack(state, a, TValue::Table(t));
                 }
                 return Ok(());
             }
