@@ -101,6 +101,20 @@ pub enum VmResult {
     },
     Done,
 }
+/// op_call / op_tailcall 结果 — perf: pure BuiltinFn 成功不切帧, 主循环据此
+/// 跳过 code_ptr/constants_ptr/code_len/constants_len 四件套重载 (每快速 CALL
+/// 省 8-10 条指令)。对应 C 的 precallC + updatetrap (C 的 pc 是寄存器, C 调用
+/// 后无需重载 cl/k/base; Rust 的帧缓存在主循环局部, 帧未切换时重载是纯浪费)。
+/// 安全不变量: 仅当 callee 既不切换 state.code 也不改栈容量时返回 Fast。
+/// pure BuiltinFn 契约 (#107: 不回调 Lua / 不 yield / 错误只返回 Err) 保证
+/// 函数体内无 resize/reserve/truncate — 快速臂成立。
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CallOutcome {
+    /// 帧已切换或栈状态未知 (LClosure/impure/generic/tailcall/错误): 重载缓存
+    Reload,
+    /// pure BuiltinFn 成功: 帧不变, state.pc 已由 call_pure_builtin +1
+    Fast,
+}
 /// 指令错误处理的后续动作 — execute_loop 主循环与冷函数 handle_instruction_error
 /// 之间的控制流协议。
 enum ErrOutcome {
@@ -1187,13 +1201,19 @@ impl VmExecutor {
                 // === 热门 opcode: 调用/返回 (flow 类: sync → handler → 重载) ===
                 OpCode::CALL => {
                     state.pc = pc - 1;
-                    let r = Self::op_call(state, inst);
-                    pc = state.pc;
-                    code_ptr = state.code.as_ptr();
-                    constants_ptr = state.constants.as_ptr();
-                    code_len = state.code.len();
-                    constants_len = state.constants.len();
-                    r
+                    match Self::op_call(state, inst) {
+                        Ok(CallOutcome::Fast) => Ok(()), // pure builtin: 帧未切,
+                        // 缓存与 pc 均有效 (state.pc 已 +1 = 局部 pc), 跳过重载
+                        Ok(CallOutcome::Reload) => {
+                            pc = state.pc;
+                            code_ptr = state.code.as_ptr();
+                            constants_ptr = state.constants.as_ptr();
+                            code_len = state.code.len();
+                            constants_len = state.constants.len();
+                            Ok(())
+                        }
+                        Err(e) => Err(e),
+                    }
                 }
                 OpCode::TAILCALL => {
                     state.pc = pc - 1;
@@ -4941,7 +4961,7 @@ impl VmExecutor {
 
     // ---- 调用 / 返回 ----
 
-    fn op_call(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_call(state: &mut LuaState, inst: Instruction) -> Result<CallOutcome, VmError> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as usize;
         let c = opcodes::getarg_c(inst) as i32;
@@ -4975,13 +4995,13 @@ impl VmExecutor {
         match func_at_a {
             TValue::LClosure(closure) => {
                 let closure = Rc::clone(closure);
-                return Self::op_call_lclosure(state, a, b, c, closure);
+                Self::op_call_lclosure(state, a, b, c, closure).map(|_| CallOutcome::Reload)
             }
             TValue::BuiltinFn(bf) if state.hook_mask & 3 == 0 && bf.is_pure() => {
                 let bf = *bf; // Copy — 借用结束
-                Self::call_pure_builtin(state, a, b, c, bf)
+                Self::call_pure_builtin(state, a, b, c, bf).map(|_| CallOutcome::Fast)
             }
-            _ => Self::op_call_generic(state, a, b, c),
+            _ => Self::op_call_generic(state, a, b, c).map(|_| CallOutcome::Reload),
         }
     }
 
