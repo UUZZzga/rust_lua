@@ -10,6 +10,7 @@
 #   bash tools/build_pgo.sh                 # 默认负载 (tests_lua 套件 + bench)
 #   PGO_TRAIN_SCALE=quick bash tools/build_pgo.sh
 #   PGO_RUSTFLAGS="-Ctarget-cpu=native" bash tools/build_pgo.sh   # 追加编译 flag
+#   PGO_FEATURES="lua_longjmp" bash tools/build_pgo.sh            # 追加 cargo features
 #
 # 设计要点:
 # - PGO 只改优化决策, 不改语义; 正确性由调用方的测试步骤保证。
@@ -40,9 +41,11 @@ if [ -z "$PROFDATA" ]; then
         || rustup component add llvm-tools-preview >/dev/null 2>&1 || true
     PROFDATA=$(find_profdata || true)
 fi
+FEATURE_ARGS=""
+[ -n "${PGO_FEATURES:-}" ] && FEATURE_ARGS="--features $PGO_FEATURES"
 if [ -z "$PROFDATA" ]; then
     echo "PGO_FALLBACK: llvm-profdata 未找到, 改用普通构建"
-    exec cargo build --release
+    exec cargo build --release $FEATURE_ARGS
 fi
 
 PGO_DIR="$ROOT/pgo"
@@ -55,12 +58,12 @@ case "$(uname -s)" in
     MINGW*|MSYS*|CYGWIN*|Windows*) EXE_SUFFIX=".exe" ;;
 esac
 LUA="$ROOT/target/release/lua$EXE_SUFFIX"
-
+# (FEATURE_ARGS 已在 profdata 回退前定义)
 echo ">>> [1/3] instrumented 构建 (profile-generate)"
-if ! RUSTFLAGS="-Cprofile-generate=$PGO_DIR ${PGO_RUSTFLAGS:-}" cargo build --release; then
+if ! RUSTFLAGS="-Cprofile-generate=$PGO_DIR ${PGO_RUSTFLAGS:-}" cargo build --release $FEATURE_ARGS; then
     echo "PGO_FALLBACK: instrumented 构建失败, 改用普通构建"
     unset RUSTFLAGS
-    exec cargo build --release
+    exec cargo build --release $FEATURE_ARGS
 fi
 
 echo ">>> [2/3] 训练 ($SCALE)"
@@ -81,20 +84,20 @@ PROFRAW_COUNT=$(find "$PGO_DIR" -name '*.profraw' 2>/dev/null | wc -l | tr -d ' 
 if [ "$PROFRAW_COUNT" = "0" ]; then
     echo "PGO_FALLBACK: 未产出 .profraw, 改用普通构建"
     unset RUSTFLAGS
-    exec cargo build --release
+    exec cargo build --release $FEATURE_ARGS
 fi
 
 echo ">>> merge $PROFRAW_COUNT profraw"
 if ! "$PROFDATA" merge -sparse "$PGO_DIR"/*.profraw -o "$PGO_DIR/default.profdata"; then
     echo "PGO_FALLBACK: llvm-profdata merge 失败, 改用普通构建"
     unset RUSTFLAGS
-    exec cargo build --release
+    exec cargo build --release $FEATURE_ARGS
 fi
 
 echo ">>> [3/3] 优化构建 (profile-use)"
-if ! RUSTFLAGS="-Cprofile-use=$PGO_DIR/default.profdata ${PGO_RUSTFLAGS:-}" cargo build --release; then
+if ! RUSTFLAGS="-Cprofile-use=$PGO_DIR/default.profdata ${PGO_RUSTFLAGS:-}" cargo build --release $FEATURE_ARGS; then
     echo "PGO_FALLBACK: profile-use 构建失败, 改用普通构建"
     unset RUSTFLAGS
-    exec cargo build --release
+    exec cargo build --release $FEATURE_ARGS
 fi
 echo ">>> PGO 完成: $LUA"

@@ -79,11 +79,12 @@ steps:
   commands:
   # 性能基准: C vs Rust (build/lua 已由 deps-tests 构建; cargo build 恢复默认
   # features — deps/setup.sh 在 target/release/lua 留下了 threaded,skynet 变体,
-  # 不能用于基准)。BENCH_PGO=1 时走 tools/build_pgo.sh 三步 (instrumented →
-  # tests_lua+bench quick 通用负载训练 → profile-use 重建; CI #103 实证浮点
-  # 1.5223→1.3340, 12 项全面改善零回退; full 规模训练反而劣化 8.6% 表插入,
-  # 保持 quick)。未设置 BENCH_PGO 时普通构建 — 代码改动轮次与历史基线纯 A/B。
-  - if [ "$BENCH_PGO" = "0" ]; then cargo build --release; else bash tools/build_pgo.sh; fi
+  # 不能用于基准)。默认走 build_pgo.sh 三步 PGO (CI #103 实证浮点 1.5223→
+  # 1.3340; full 规模训练劣化, 保持 quick); BENCH_PGO=0 退普通构建 (代码改动
+  # 轮次的纯 A/B)。BENCH_ABORT=0 关 abort; 默认 bench 二进制加 -Cpanic=abort
+  # + lua_longjmp (错误路径 setjmp/longjmp, 与 size-opt 模式同源已有实战):
+  # 移除 execute_loop 全部 unwind landing pads, 本地 float -2.7% / meta -7%。
+  - if [ "$BENCH_PGO" = "0" ]; then cargo build --release; else if [ "$BENCH_ABORT" = "0" ]; then bash tools/build_pgo.sh; else PGO_RUSTFLAGS="-Cpanic=abort" PGO_FEATURES="lua_longjmp" bash tools/build_pgo.sh; fi; fi
   - ./target/release/lua -v
   - bash tools/ci_bench.sh --skip-build full
 
