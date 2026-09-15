@@ -50,7 +50,6 @@ impl Table {
                 hash_buckets: Vec::new(),
                 key_to_bucket: None,
                 metatable: None,
-                probe_cache: [const { std::cell::Cell::new(0u32) }; crate::objects::PROBE_CACHE_SIZE],
             })),
         }
     }
@@ -77,7 +76,6 @@ impl Table {
                     None
                 },
                 metatable: None,
-                probe_cache: [const { std::cell::Cell::new(0u32) }; crate::objects::PROBE_CACHE_SIZE],
             })),
         }
     }
@@ -220,20 +218,6 @@ impl Table {
     /// (GETTABUP(math) 会 miss 一次 BuiltinFn 再 hit Table, 两次探测)。
     ///
     /// 元表存在时返回 None (__index 可能拦截, 不能绕过)。
-    /// 单次探测特化查找 + 自验证内联探测缓存 — GETTABUP/GETFIELD 热路径专用。
-    ///
-    /// 一次哈希探测返回命中槽的 &TValue 引用, 调用方按值类型分支处理:
-    /// BuiltinFn → Copy 直取 (零 clone); Table → 结构 copy + Rc inc;
-    /// 其他类型/未命中 → 调用方回退通用路径 (语义不变)。
-    /// 取代此前 BuiltinFn/Table 各自探测的双查找
-    /// (GETTABUP(math) 会 miss 一次 BuiltinFn 再 hit Table, 两次探测)。
-    ///
-    /// 元表存在时返回 None (__index 可能拦截, 不能绕过)。
-    ///
-    /// probe_cache: 查询键自身预计算 hash 高位选槽, 存 hash_buckets 索引 +1。
-    /// 命中 = 桶键与查询键 ArcRc ptr_eq。自验证设计 (免失效钩子): 值从同桶
-    /// 实时读取; 键指针相等 + 内部化单实例 ⇒ 同一字符串。写/删/rehash 只
-    /// 可能造成假 miss (退全探测), 不可能返回错值。
     #[cfg_attr(not(size_optimized), inline(always))]
     pub fn find_str_ref<'a>(&'a self, key: &TValue) -> Option<&'a TValue> {
         let data = self.data_ro();
@@ -241,22 +225,9 @@ impl Table {
             return None;
         }
         let ktb = data.key_to_bucket.as_ref()?;
-        let qs = match key {
-            TValue::Str(crate::strings::LuaString::Short(s)) => s,
+        match key {
+            TValue::Str(crate::strings::LuaString::Short(_)) => {}
             _ => return None, // 只特化 interned 短字符串键
-        };
-        let slot = (qs.hash >> 60) as usize;
-        let cached = data.probe_cache[slot].get();
-        if cached != 0 {
-            if let Some((bk, bv)) = data.hash_buckets.get((cached - 1) as usize) {
-                if let (TValue::Str(crate::strings::LuaString::Short(bs)), false) =
-                    (bk, matches!(bv, TValue::Nil(NilKind::Empty)))
-                {
-                    if crate::strings::ArcRc::ptr_eq(bs, qs) {
-                        return Some(bv);
-                    }
-                }
-            }
         }
         let hash = crate::objects::tvalue_fx_hash(key);
         let entry = ktb.find(hash, |(k, _)| match (k, key) {
@@ -267,7 +238,6 @@ impl Table {
         if matches!(v, TValue::Nil(NilKind::Empty)) {
             return None; // tombstone 视为未命中
         }
-        data.probe_cache[slot].set((entry.1 + 1) as u32);
         Some(v)
     }
 
