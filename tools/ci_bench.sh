@@ -47,7 +47,9 @@ else
     cmake --build build --config Release || exit 1
 fi
 if [ "$SKIP_BUILD" != "1" ]; then
-    cargo build --release || exit 1
+    # 未跳过构建时同样走 PGO (含缺失工具链/失败自动回退普通构建)。
+    # Windows 管线 (ci_bench_win.ps1 → 本脚本) 由此获得与 Linux 同源的 PGO 收益。
+    bash tools/build_pgo.sh || exit 1
 fi
 
 # C 实现路径探测 (build/lua -> build/Release/lua)
