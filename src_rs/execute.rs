@@ -5028,7 +5028,12 @@ impl VmExecutor {
         let nresults = if c == 0 { -1 } else { c - 1 };
         match (bf.call_target())(state, a, nargs, nresults) {
             Ok(()) => {
-                state.pc += 1;
+                // perf: 不写 state.pc — 主循环 CALL Fast 臂保持循环局部 pc 有效,
+                // 不回载 pc = state.pc。state.pc 在纯调用后停留在 CALL 指令索引
+                // (call_pure_builtin 前主循环已 state.pc = pc - 1)。这与所有
+                // deleted/param handler 的既有不变量一致: state.pc 仅在 flow/
+                // error/hook 同步点被消费, 且每个消费点先重写它 (#134/#147)。
+                // 省一次对 1300B 结构体字段的 load+add+store 内存往返。
                 Ok(())
             }
             Err(VmError::Yield(values)) => Err(Self::pure_builtin_yielded(state, a, bf, values)),
