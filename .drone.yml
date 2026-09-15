@@ -81,11 +81,10 @@ steps:
   # features — deps/setup.sh 在 target/release/lua 留下了 threaded,skynet 变体,
   # 不能用于基准)。PGO 三步: instrumented 构建 → tests_lua+bench 通用负载训练 →
   # profile-use 重建; 工具链缺失或任一步失败自动回退普通 cargo build (PGO_FALLBACK)。
-  # target-cpu=native 安全性: bench 二进制只在构建它的同一 runner 主机上运行;
-  # 其他步骤的 plain build 由 cargo 指纹 (RUSTFLAGS 变更) 强制独立重建, 不会
-  # 复用 native 产物。
-  - lscpu | grep -m1 "Model name" || true
-  - PGO_RUSTFLAGS="-Ctarget-cpu=native" bash tools/build_pgo.sh
+  # 不加 -Ctarget-cpu=native: CI #104 实证 runner (7800X3D, Zen4) 上 native 使
+  # 浮点 1.334→1.462 (+9.6%, 远超 3 轮内部 ±1%), pattern 4.98→5.59, 调用
+  # 0.386→0.442 — Zen4 双泵 AVX-512 对解释器代码gen不利, CI 数据回退 plain PGO。
+  - PGO_TRAIN_SCALE=full bash tools/build_pgo.sh
   - ./target/release/lua -v
   - bash tools/ci_bench.sh --skip-build full
 
