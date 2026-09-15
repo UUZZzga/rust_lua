@@ -1106,8 +1106,7 @@ impl VmExecutor {
 
             // perf: get_unchecked 跳过边界检查 (上方已检查 pc < code_len)
             let inst = unsafe { *code_ptr.add(pc) };
-            let cur = pc; // 当前指令索引 (对应 HEAD handler 执行期的 state.pc 语义)
-            pc += 1; // 寄存器自增 (对应 C 的 *(pc++))
+            pc += 1; // 寄存器自增 (对应 C 的 *(pc++)); 当前指令索引 = pc - 1
             let op = opcodes::get_opcode(inst);
 
             // perf: hook 检查与调试跟踪合并为单次位测试。trace_or_hook 为 0 时
@@ -1118,7 +1117,7 @@ impl VmExecutor {
             // 注意: 必须每指令读 state.hook_mask — VARARGPREP 的 call hook 内可
             // sethook 安装 line hook (db.lua:491 场景), 缓存字节会错过新 mask。
             if trace_level | (state.hook_mask & (4 | 8)) as u8 != 0 && op != OpCode::VARARGPREP {
-                state.pc = cur; // sync: 行 hook/trace 需要 state.pc = 当前指令 (C savepc)
+                state.pc = pc - 1; // sync: 行 hook/trace 需要 state.pc = 当前指令 (C savepc)
                 // 对应 C 的 luaG_traceexec: count hook + line hook
                 if state.hook_mask & (4 | 8) != 0 {
                     Self::traceexec_hooks(state)?;
@@ -1145,49 +1144,49 @@ impl VmExecutor {
                 // === 热门 opcode: 表读 (GETTABUP/GETTABLE/GETI/GETFIELD 为 param-cur:
                 //     慢路径 sync state.pc = cur, 对应 C 的 savepc) ===
                 OpCode::GETUPVAL => Self::op_getupval(state, inst),
-                OpCode::GETTABUP => Self::op_gettabup(state, inst, cur, &mut pc),
-                OpCode::GETTABLE => Self::op_gettable(state, inst, cur),
-                OpCode::GETI => Self::op_geti(state, inst, cur),
-                OpCode::GETFIELD => Self::op_getfield(state, inst, cur),
+                OpCode::GETTABUP => Self::op_gettabup(state, inst, pc - 1, &mut pc),
+                OpCode::GETTABLE => Self::op_gettable(state, inst, pc - 1),
+                OpCode::GETI => Self::op_geti(state, inst, pc - 1),
+                OpCode::GETFIELD => Self::op_getfield(state, inst, pc - 1),
                 // === 热门 opcode: 表写 (param-cur) ===
-                OpCode::SETTABUP => Self::op_settabup(state, inst, cur),
-                OpCode::SETTABLE => Self::op_settable(state, inst, cur),
-                OpCode::SETI => Self::op_seti(state, inst, cur),
-                OpCode::SETFIELD => Self::op_setfield(state, inst, cur),
+                OpCode::SETTABUP => Self::op_settabup(state, inst, pc - 1),
+                OpCode::SETTABLE => Self::op_settable(state, inst, pc - 1),
+                OpCode::SETI => Self::op_seti(state, inst, pc - 1),
+                OpCode::SETFIELD => Self::op_setfield(state, inst, pc - 1),
                 // === 热门 opcode: 算术运算 (param-pc: 成功 *pc += 1 跳过 MMBIN) ===
                 OpCode::ADDI => Self::op_addi(state, inst, &mut pc),
                 OpCode::ADDK => Self::op_addk(state, inst, &mut pc, constants_slice),
                 OpCode::SUBK => Self::op_subk(state, inst, &mut pc),
                 OpCode::MULK => Self::op_mulk(state, inst, &mut pc),
-                OpCode::MODK => Self::op_modk(state, inst, cur, &mut pc),
+                OpCode::MODK => Self::op_modk(state, inst, pc - 1, &mut pc),
                 OpCode::POWK => Self::op_powk(state, inst, &mut pc),
                 OpCode::DIVK => Self::op_divk(state, inst, &mut pc),
-                OpCode::IDIVK => Self::op_idivk(state, inst, cur, &mut pc),
+                OpCode::IDIVK => Self::op_idivk(state, inst, pc - 1, &mut pc),
                 OpCode::ADD => Self::op_add(state, inst, &mut pc),
                 OpCode::SUB => Self::op_sub(state, inst, &mut pc),
                 OpCode::MUL => Self::op_mul(state, inst, &mut pc),
-                OpCode::MOD => Self::op_mod(state, inst, cur, &mut pc),
+                OpCode::MOD => Self::op_mod(state, inst, pc - 1, &mut pc),
                 OpCode::POW => Self::op_pow(state, inst, &mut pc),
                 OpCode::DIV => Self::op_div(state, inst, &mut pc),
-                OpCode::IDIV => Self::op_idiv(state, inst, cur, &mut pc),
+                OpCode::IDIV => Self::op_idiv(state, inst, pc - 1, &mut pc),
                 // === 热门 opcode: 逻辑非 (deleted) ===
                 OpCode::NOT => Self::op_not(state, inst),
                 // === 热门 opcode: 跳转/比较 (param-pc; 比较冷路径带 cur sync) ===
                 OpCode::JMP => Self::op_jmp(state, inst, &mut pc),
-                OpCode::EQ => Self::op_eq(state, inst, cur, &mut pc),
-                OpCode::LT => Self::op_lt(state, inst, cur, &mut pc),
-                OpCode::LE => Self::op_le(state, inst, cur, &mut pc),
-                OpCode::EQK => Self::op_eqk(state, inst, cur, &mut pc),
-                OpCode::EQI => Self::op_eqi(state, inst, cur, &mut pc),
-                OpCode::LTI => Self::op_lti(state, inst, cur, &mut pc),
-                OpCode::LEI => Self::op_lei(state, inst, cur, &mut pc),
-                OpCode::GTI => Self::op_gti(state, inst, cur, &mut pc),
-                OpCode::GEI => Self::op_gei(state, inst, cur, &mut pc),
+                OpCode::EQ => Self::op_eq(state, inst, pc - 1, &mut pc),
+                OpCode::LT => Self::op_lt(state, inst, pc - 1, &mut pc),
+                OpCode::LE => Self::op_le(state, inst, pc - 1, &mut pc),
+                OpCode::EQK => Self::op_eqk(state, inst, pc - 1, &mut pc),
+                OpCode::EQI => Self::op_eqi(state, inst, pc - 1, &mut pc),
+                OpCode::LTI => Self::op_lti(state, inst, pc - 1, &mut pc),
+                OpCode::LEI => Self::op_lei(state, inst, pc - 1, &mut pc),
+                OpCode::GTI => Self::op_gti(state, inst, pc - 1, &mut pc),
+                OpCode::GEI => Self::op_gei(state, inst, pc - 1, &mut pc),
                 OpCode::TEST => Self::op_test(state, inst, &mut pc),
                 OpCode::TESTSET => Self::op_testset(state, inst, &mut pc),
                 // === 热门 opcode: 调用/返回 (flow 类: sync → handler → 重载) ===
                 OpCode::CALL => {
-                    state.pc = cur;
+                    state.pc = pc - 1;
                     let r = Self::op_call(state, inst);
                     pc = state.pc;
                     code_ptr = state.code.as_ptr();
@@ -1197,7 +1196,7 @@ impl VmExecutor {
                     r
                 }
                 OpCode::TAILCALL => {
-                    state.pc = cur;
+                    state.pc = pc - 1;
                     let r = Self::op_tailcall(state, inst);
                     pc = state.pc;
                     code_ptr = state.code.as_ptr();
@@ -1207,7 +1206,7 @@ impl VmExecutor {
                     r
                 }
                 OpCode::RETURN => {
-                    state.pc = cur;
+                    state.pc = pc - 1;
                     let r = Self::op_return(state, inst);
                     pc = state.pc;
                     code_ptr = state.code.as_ptr();
@@ -1222,7 +1221,7 @@ impl VmExecutor {
                     }
                 }
                 OpCode::RETURN0 => {
-                    state.pc = cur;
+                    state.pc = pc - 1;
                     let r = Self::op_return0(state, inst);
                     pc = state.pc;
                     code_ptr = state.code.as_ptr();
@@ -1237,7 +1236,7 @@ impl VmExecutor {
                     }
                 }
                 OpCode::RETURN1 => {
-                    state.pc = cur;
+                    state.pc = pc - 1;
                     let r = Self::op_return1(state, inst);
                     pc = state.pc;
                     code_ptr = state.code.as_ptr();
@@ -1256,7 +1255,7 @@ impl VmExecutor {
                 // sync/reload, 内部错误路径天然持有正确 state.pc, 零内部改动)
                 OpCode::FORLOOP => Self::op_forloop(state, inst, &mut pc),
                 OpCode::FORPREP => {
-                    state.pc = cur;
+                    state.pc = pc - 1;
                     let r = Self::op_forprep(state, inst);
                     pc = state.pc;
                     code_ptr = state.code.as_ptr();
@@ -1269,16 +1268,66 @@ impl VmExecutor {
                 OpCode::SETUPVAL => Self::op_setupval(state, inst),
                 // === MMBIN/MMBINI/MMBINK: 元方法占位 (param-cur: pi = code[cur-1],
                 //     try_*_tm 前 sync state.pc = cur) ===
-                OpCode::MMBIN => Self::op_mmbin(state, inst, cur),
-                OpCode::MMBINI => Self::op_mmbini(state, inst, cur),
-                OpCode::MMBINK => Self::op_mmbink(state, inst, cur),
+                OpCode::MMBIN => Self::op_mmbin(state, inst, pc - 1),
+                OpCode::MMBINI => Self::op_mmbini(state, inst, pc - 1),
+                OpCode::MMBINK => Self::op_mmbink(state, inst, pc - 1),
                 // === VARARG/VARARGPREP: vararg 调用热路径 (pass(...) 每次调用都
                 //     执行 VARARGPREP + VARARG), 从 cold dispatch 移入 (param-cur) ===
-                OpCode::VARARG => Self::op_vararg(state, inst, cur),
-                OpCode::VARARGPREP => Self::op_varargprep(state, inst, cur),
-                // === 冷门 opcode: 路由到 cold 函数 (flow 类: sync → dispatch → 重载) ===
+                OpCode::VARARG => Self::op_vararg(state, inst, pc - 1),
+                OpCode::VARARGPREP => Self::op_varargprep(state, inst, pc - 1),
+                // === Unused* 填充变体 (85..=127) — 显式列出而非并入 `_` 通配:
+                // match 全值域显式化后 LLVM 跳转表覆盖 0..=127, 分发前的
+                // `cmpb $0x53; ja` 范围检查消失 (对应 C ljumptab.h 全值域跳转表)。
+                // 语义: 损坏字节码防御, 与 _ 臂同走 dispatch_cold_opcodes →
+                // IllegalOpcode 错误。 ===
+                OpCode::Unused85
+                | OpCode::Unused86
+                | OpCode::Unused87
+                | OpCode::Unused88
+                | OpCode::Unused89
+                | OpCode::Unused90
+                | OpCode::Unused91
+                | OpCode::Unused92
+                | OpCode::Unused93
+                | OpCode::Unused94
+                | OpCode::Unused95
+                | OpCode::Unused96
+                | OpCode::Unused97
+                | OpCode::Unused98
+                | OpCode::Unused99
+                | OpCode::Unused100
+                | OpCode::Unused101
+                | OpCode::Unused102
+                | OpCode::Unused103
+                | OpCode::Unused104
+                | OpCode::Unused105
+                | OpCode::Unused106
+                | OpCode::Unused107
+                | OpCode::Unused108
+                | OpCode::Unused109
+                | OpCode::Unused110
+                | OpCode::Unused111
+                | OpCode::Unused112
+                | OpCode::Unused113
+                | OpCode::Unused114
+                | OpCode::Unused115
+                | OpCode::Unused116
+                | OpCode::Unused117
+                | OpCode::Unused118
+                | OpCode::Unused119
+                | OpCode::Unused120
+                | OpCode::Unused121
+                | OpCode::Unused122
+                | OpCode::Unused123
+                | OpCode::Unused124
+                | OpCode::Unused125
+                | OpCode::Unused126
+                | OpCode::Unused127 => {
+                    state.pc = pc - 1;
+                    Err(VmError::IllegalOpcode(op as u8))
+                }
                 _ => {
-                    state.pc = cur;
+                    state.pc = pc - 1;
                     let r = Self::dispatch_cold_opcodes(state, op, inst);
                     pc = state.pc;
                     code_ptr = state.code.as_ptr();
@@ -1648,8 +1697,10 @@ impl VmExecutor {
             // === 冷门: 错误处理 / 函数入口初始化 / 扩展参数 ===
             OpCode::ERRNNIL => Self::op_errnnil(state, inst),
             OpCode::EXTRAARG => Err(VmError::IllegalOpcode(OpCode::EXTRAARG as u8)),
-            // 热门 opcode 已在主循环处理, 此处理论上不可达
-            _ => unreachable!("hot opcode reached cold dispatcher: {:?}", op),
+            // Unused* 填充变体 (85..=127) 与任何未来 opcode — 损坏字节码防御:
+            // 对应 C get_opcode 无校验但 switch 编译为跳转表全值域, 非法 opcode
+            // 落 default 臂。这里返回 IllegalOpcode 错误而非 panic。
+            _ => Err(VmError::IllegalOpcode(op as u8)),
         }
     }
 

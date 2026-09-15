@@ -94,6 +94,56 @@ pub enum OpCode {
     ERRNNIL = 82,
     VARARGPREP = 83,
     EXTRAARG = 84,
+
+    // === 填充变体 (85..=127) — 永不出现在合法字节码中 ===
+    // perf: 枚举填满 7-bit opcode 值域 (128) 后, LLVM 对 match 分发的跳转表
+    // 不再需要范围检查 (cmpb $0x53; ja) — 全值域被跳转表覆盖, 分发降为纯
+    // 间接跳转, 与 C luaV_execute 的 LUA_USE_JUMPTABLE (ljumptab.h, 85 项
+    // 全覆盖) 同形。非法 opcode (Unused*) 落入主分发 `_` 冷臂 → IllegalOpcode
+    // 错误, 语义与之前 from_u8 返回 None 的防御一致。
+    Unused85 = 85,
+    Unused86 = 86,
+    Unused87 = 87,
+    Unused88 = 88,
+    Unused89 = 89,
+    Unused90 = 90,
+    Unused91 = 91,
+    Unused92 = 92,
+    Unused93 = 93,
+    Unused94 = 94,
+    Unused95 = 95,
+    Unused96 = 96,
+    Unused97 = 97,
+    Unused98 = 98,
+    Unused99 = 99,
+    Unused100 = 100,
+    Unused101 = 101,
+    Unused102 = 102,
+    Unused103 = 103,
+    Unused104 = 104,
+    Unused105 = 105,
+    Unused106 = 106,
+    Unused107 = 107,
+    Unused108 = 108,
+    Unused109 = 109,
+    Unused110 = 110,
+    Unused111 = 111,
+    Unused112 = 112,
+    Unused113 = 113,
+    Unused114 = 114,
+    Unused115 = 115,
+    Unused116 = 116,
+    Unused117 = 117,
+    Unused118 = 118,
+    Unused119 = 119,
+    Unused120 = 120,
+    Unused121 = 121,
+    Unused122 = 122,
+    Unused123 = 123,
+    Unused124 = 124,
+    Unused125 = 125,
+    Unused126 = 126,
+    Unused127 = 127,
 }
 
 pub type Instruction = u32;

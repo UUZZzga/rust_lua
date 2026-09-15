@@ -680,6 +680,8 @@ fn format_operands(op: u32, a: i32, b: i32, c: i32, bx: i32, sbx: i32, sj: i32, 
             let ax = getarg(op, POS_A, SIZE_BX + SIZE_A) as i32;
             format!("{}", ax)
         }
+        // Unused* 填充变体 (85..=127): 永不出现在合法字节码, 防御性兜底
+        _ => format!("{} {} {}", a, b, c),
     }
 }
 
