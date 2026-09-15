@@ -1161,7 +1161,7 @@ impl VmExecutor {
                 OpCode::GETTABUP => Self::op_gettabup(state, inst, pc - 1, &mut pc),
                 OpCode::GETTABLE => Self::op_gettable(state, inst, pc - 1),
                 OpCode::GETI => Self::op_geti(state, inst, pc - 1),
-                OpCode::GETFIELD => Self::op_getfield(state, inst, pc - 1),
+                OpCode::GETFIELD => Self::op_getfield(state, inst, pc - 1, &mut pc),
                 // === 热门 opcode: 表写 (param-cur) ===
                 OpCode::SETTABUP => Self::op_settabup(state, inst, pc - 1),
                 OpCode::SETTABLE => Self::op_settable(state, inst, pc - 1),
@@ -3294,6 +3294,11 @@ impl VmExecutor {
         match spec {
             Some(SpecValue::Builtin(bf)) => {
                 Self::write_stack(state, a, TValue::BuiltinFn(bf));
+                // 窄 superblock: `sin(i)` 直取字段后接 MOVE+CALL 连缀 → 在本
+                // handler 内完成参数装载与纯调用, 省 2 次 dispatch。mv_idx =
+                // GETFIELD 位 (cur+1); 命中返回 2 → 跳过 MOVE+CALL。
+                let n = Self::fuse_pure_call(state, a, bf, cur + 1)?;
+                *pc += n;
                 return Ok(());
             }
             Some(SpecValue::Table(t)) => {
@@ -3306,8 +3311,18 @@ impl VmExecutor {
                 let fused: Option<TValue> = Self::try_fuse_getfield(state, a, &t, cur);
                 Self::write_stack(state, a, TValue::Table(t));
                 if let Some(v) = fused {
+                    // 先判别再写 (v 将被 write_stack 消费)
+                    let builtin = match v {
+                        TValue::BuiltinFn(bf) => Some(bf),
+                        _ => None,
+                    };
                     Self::write_stack(state, a, v); // a2 == table_slot (融合条件保证)
-                    *pc += 1; // 跳过 GETFIELD (pc 已 = cur+1, 循环头覆盖 +1)
+                    let mut skip = 1usize; // GETFIELD
+                    if let Some(bf) = builtin {
+                        // 连缀 MOVE+CALL: mv_idx = cur+2 (GETFIELD 后一条)
+                        skip += Self::fuse_pure_call(state, a, bf, cur + 2)?;
+                    }
+                    *pc += skip;
                 }
                 return Ok(());
             }
@@ -3464,7 +3479,12 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_getfield(state: &mut LuaState, inst: Instruction, cur: usize) -> Result<(), VmError> {
+    fn op_getfield(
+        state: &mut LuaState,
+        inst: Instruction,
+        cur: usize,
+        pc: &mut usize,
+    ) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -3500,6 +3520,10 @@ impl VmExecutor {
         match spec {
             Some(SpecValue::Builtin(bf)) => {
                 Self::write_stack(state, a, TValue::BuiltinFn(bf));
+                // 窄 superblock: `f(i)` 全局直取 (GETTABUP _ENV f + 此处融合) 或
+                // 任意表字段 pure 函数后接 MOVE+CALL → 省 2 次 dispatch。
+                let n = Self::fuse_pure_call(state, a, bf, cur + 1)?;
+                *pc += n;
                 return Ok(());
             }
             Some(SpecValue::Table(t)) => {
@@ -4909,11 +4933,58 @@ impl VmExecutor {
         }
         Ok(())
     }
+    /// 窄 superblock 第二阶段: 字段值 (pure BuiltinFn) 已写入 a2 后, 探测紧随的
+    /// `MOVE a2+1 src; CALL a2 2 2` 连缀 (math.sin(i) 形态 — 编译器把实参 MOVE
+    /// 到函数槽隔壁再 CALL) 并在本 handler 内执行。命中省 2 次完整 dispatch
+    /// (fetch + prefix hook 测 + match + 返回簿记) — 即 wave5 实测的每次调用
+    /// ~14ns 包络差的主体。
+    /// mv_idx = MOVE 指令索引; 命中返回 2 (caller pc += 2 跳过 MOVE+CALL),
+    /// 未命中返回 0 (三条指令原样执行)。前提逐项与 op_call 快速探测 +
+    /// 既有 GETFIELD 融合一致: line/count hook 关 (外层已测, 跳指令语义)、
+    /// call/ret hook 关 (hook_mask&3)、C 臂固定 (B=2,C=2,非 k)、函数 pure。
+    /// 纯调用出错: sync state.pc = CALL 索引 (错误行号语义 = 原 CALL 行),
+    /// call_pure_builtin 的 cold 路径已补推 CallInfoEntry, traceback 一致。
+    fn fuse_pure_call(
+        state: &mut LuaState,
+        a2: usize,
+        bf: crate::objects::BuiltinFn,
+        mv_idx: usize,
+    ) -> Result<usize, VmError> {
+        // 任一 hook 位开启都放弃: call/ret (3) 是 pure 路径前提; line/count (12)
+        // 要求每条指令被 traceexec 观察, 融合跳指令会破坏 db.lua 行号/计数语义
+        // (#147)。LUA_VM_TRACE 环境仅影响调试输出, 不进 CI/bench, 不在此防护。
+        if state.hook_mask != 0 || !bf.is_pure() {
+            return Ok(0);
+        }
+        let (im, ic) = {
+            let code = &*state.code;
+            if mv_idx + 1 >= code.len() {
+                return Ok(0);
+            }
+            (code[mv_idx], code[mv_idx + 1])
+        };
+        if opcodes::get_opcode(im) != OpCode::MOVE || opcodes::get_opcode(ic) != OpCode::CALL {
+            return Ok(0);
+        }
+        if opcodes::getarg_a(im) as usize + state.base != a2 + 1
+            || opcodes::getarg_a(ic) as usize + state.base != a2
+            || opcodes::getarg_b(ic) != 2
+            || opcodes::getarg_c(ic) != 2
+            || opcodes::testarg_k(ic)
+        {
+            return Ok(0);
+        }
+        // 参数装载: 复用 op_move (恒 Ok; 越界走其 grow 分支, 与原指令逐位相同)
+        Self::op_move(state, im)?;
+        // 对应 op_call 的 `if (b != 0) top = ra + b` (B=2 → a2+2)
+        state.top = a2 + 2;
+        // 与主循环 CALL 臂同形: 先 sync state.pc = CALL 索引 (错误行号与
+        // CallInfoEntry.saved_pc 消费点), 成功路径无人消费 state.pc。
+        state.pc = mv_idx + 1;
+        Self::call_pure_builtin(state, a2, 2, 2, bf)?;
+        Ok(2)
+    }
 
-    /// GETTABUP 命中表后, 融合紧随的 GETFIELD (B == A 槽) — `_ENV.math.sin`
-    /// 连读是浮点热循环最常见形态。在刚命中的表上直接查字段, 命中 trivial/
-    /// Builtin 写 GETFIELD 目标槽; 未命中/非短串键 → false, 走原 GETFIELD
-    /// 全路径 (元表语义由原指令保证)。
     fn try_fuse_getfield(
         state: &LuaState,
         table_slot: usize,
