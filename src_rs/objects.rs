@@ -1095,6 +1095,9 @@ pub struct LCFunction {
 // 规约：表类型 (用 hashbrown::HashMap 重写)
 // ============================================================================
 
+/// 探测缓存槽数 (2 的幂)。16 槽覆盖小表热字段集, 每表 +64B。
+pub(crate) const PROBE_CACHE_SIZE: usize = 16;
+
 /// Lua 表的数据部分 —— 被 `Rc<RefCell<TableData>>` 包装以实现共享语义。
 ///
 /// 将数据分离到 `TableData` 中，使得 `Table` 的克隆（仅克隆 `Rc`）共享同一份数据。
@@ -1113,6 +1116,13 @@ pub struct TableData {
     pub key_to_bucket: Option<Box<TableHashIndex>>,
     /// 元表
     pub metatable: Option<Box<Table>>,
+    /// 内联探测缓存 (自验证, 免失效钩子): hash_buckets 索引 +1 (0=空),
+    /// 槽 = 短串自身预计算 hash 的高位。命中判据 = 桶内键 ArcRc 与查询键
+    /// ptr_eq (内部化保证同内容单实例, 指针相等即字面同一对象); 值从同一
+    /// 桶实时读取 — 桶内容被 set/rehash/GC 弱清除改动时, 陈旧索引要么键
+    /// 验证失败走全探测, 要么读到该键的当前值, 不可能返回错值。
+    /// Cell 数组: data_ro 的 &TableData 下可写 (interior mutability)。
+    pub(crate) probe_cache: [std::cell::Cell<u32>; PROBE_CACHE_SIZE],
 }
 
 impl TableData {
@@ -1272,6 +1282,7 @@ impl Default for Table {
                 hash_buckets: Vec::new(),
                 key_to_bucket: None,
                 metatable: None,
+                probe_cache: [const { std::cell::Cell::new(0u32) }; crate::objects::PROBE_CACHE_SIZE],
             })),
         }
     }
