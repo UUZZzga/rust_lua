@@ -88,6 +88,11 @@ steps:
   - bash tools/ci_bench.sh --skip-build full
 
 - name: save-cache
+  # 缓存写回纯属加速优化, 与构建/测试结果无关。CI #114 实证宿主 /tmp/drone-cache
+  # 分区写满 (rsync code 11 "No space left on device") 会把这个步骤变红并连带
+  # 整条流水线 failure — 尽管 build/cmp/deps/bench 四步全绿。失败降级为警告,
+  # 下次构建 restore-cache miss 时自然回退全量重建。
+  failure: ignore
   image: drillster/drone-volume-cache
   volumes:
   - name: cache
