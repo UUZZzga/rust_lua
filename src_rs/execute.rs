@@ -129,17 +129,25 @@ enum ErrOutcome {
 pub enum VmError {
     DivisionByZero,
     ModuloByZero,
-    TypeError(String),
+    /// perf: 全部 payload 变体逐变体 Box 化 — enum 从 32B 收缩到 16B。
+    /// `Result<(), VmError>` 随之从 sret (>16B 内存返回) 变为 SysV RAX:RDX
+    /// 寄存器返回: 跨函数指针边界的每次 BuiltinFn 调用 (math.sin/cos/sqrt
+    /// 每浮点迭代 3 次) 与每个 #[inline(never)] 慢路径 handler 的返回都省
+    /// 一次栈 sret 往返 (记忆 #134 dispatch 地板要素之一)。
+    /// String/Vec/TValue 本身即堆缓冲, Box 只是 8B 薄壳; 错误构造 (冷路径)
+    /// 多付一次分配, Ok 热路径零成本。变体名与 pattern 形状全部保留
+    /// (VmError::Yield(Box::new(v)) 绑定 &mut Box<Vec<TValue>>, 消费点解引用)。
+    TypeError(Box<String>),
     StackOverflow,
     StackError,
     IllegalOpcode(u8),
-    RuntimeError(String),
+    RuntimeError(Box<String>),
     /// 非字符串错误值 — error() 传入非字符串参数时使用，保留原始 TValue
     /// 对应 C Lua 中 errfunc 为非字符串时的行为
-    RuntimeErrorValue(TValue),
-    MetaMethodNotImplemented(String),
+    RuntimeErrorValue(Box<TValue>),
+    MetaMethodNotImplemented(Box<String>),
     /// 协程 yield 信号 — 携带 yield 的值（非真实错误，由 execute_loop 转换为 VmResult::Yield）
-    Yield(Vec<TValue>),
+    Yield(Box<Vec<TValue>>),
 }
 
 impl std::fmt::Display for VmError {
@@ -561,18 +569,18 @@ pub fn arg_error(state: &LuaState, arg: usize, msg: &str) -> VmError {
     };
     if namewhat == "method" {
         if arg == 1 {
-            return VmError::RuntimeError(format!("calling '{}' on bad self ({})", func_name, msg));
+            return VmError::RuntimeError(Box::new(format!("calling '{}' on bad self ({})", func_name, msg)));
         }
         let real_arg = arg - 1;
-        return VmError::RuntimeError(format!(
+        return VmError::RuntimeError(Box::new(format!(
             "bad argument #{} to '{}' ({})",
             real_arg, func_name, msg
-        ));
+        )));
     }
-    VmError::RuntimeError(format!(
+    VmError::RuntimeError(Box::new(format!(
         "bad argument #{} to '{}' ({})",
         arg, func_name, msg
-    ))
+    )))
 }
 
 /// 通过 call_info 获取当前函数的调用方式 (对应 C 的 getfuncname -> funcnamefromcall)
@@ -1236,7 +1244,7 @@ impl VmExecutor {
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
                         Ok(None) => Ok(()),
-                        Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
+                        Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values: *values }),
                         Err(e) => Err(e),
                     }
                 }
@@ -1251,7 +1259,7 @@ impl VmExecutor {
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
                         Ok(None) => Ok(()),
-                        Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
+                        Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values: *values }),
                         Err(e) => Err(e),
                     }
                 }
@@ -1266,7 +1274,7 @@ impl VmExecutor {
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
                         Ok(None) => Ok(()),
-                        Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
+                        Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values: *values }),
                         Err(e) => Err(e),
                     }
                 }
@@ -1390,7 +1398,7 @@ impl VmExecutor {
         e: VmError,
     ) -> Result<ErrOutcome, VmError> {
         if let VmError::Yield(values) = e {
-            return Ok(ErrOutcome::Return(VmResult::Yield { values }));
+            return Ok(ErrOutcome::Return(VmResult::Yield { values: *values }));
         }
         let mut current_error = e;
         loop {
@@ -1434,7 +1442,7 @@ impl VmExecutor {
                 // （对应 C Lua 的 CIST_RECST 保存错误状态，luaF_close 用 status 读取）
                 if state.last_error_value.is_none() {
                     state.last_error_value = Some(match &current_error {
-                        VmError::RuntimeErrorValue(val) => val.clone(),
+                        VmError::RuntimeErrorValue(val) => (**val).clone(),
                         VmError::RuntimeError(s) => TValue::Str(state.intern_str(s)),
                         _ => {
                             TValue::Str(state.intern_str(&format!("{}", current_error)))
@@ -1452,8 +1460,8 @@ impl VmExecutor {
                             // 有 pending error，转换回 current_error，fall through 到 pcall 处理
                             state.last_error_value = Some(err.clone());
                             current_error = match err {
-                                TValue::Str(s) => VmError::RuntimeError(s.to_string()),
-                                v => VmError::RuntimeErrorValue(v),
+                                TValue::Str(s) => VmError::RuntimeError(Box::new(s.to_string())),
+                                v => VmError::RuntimeErrorValue(Box::new(v)),
                             };
                             continue; // 下一轮迭代处理 pcall
                         }
@@ -1461,7 +1469,7 @@ impl VmExecutor {
                         break;
                     }
                     Err(VmError::Yield(values)) => {
-                        return Ok(ErrOutcome::Return(VmResult::Yield { values }));
+                        return Ok(ErrOutcome::Return(VmResult::Yield { values: *values }));
                     }
                     Err(e2) => {
                         // close 出错（非 yield），更新 current_error，fall through 到 pcall
@@ -1487,7 +1495,7 @@ impl VmExecutor {
                 let mut error_val =
                     state.last_error_value.clone().unwrap_or_else(|| {
                         match &current_error {
-                            VmError::RuntimeErrorValue(val) => val.clone(),
+                            VmError::RuntimeErrorValue(val) => (**val).clone(),
                             VmError::RuntimeError(s) => {
                                 TValue::Str(state.intern_str(s))
                             }
@@ -1525,7 +1533,7 @@ impl VmExecutor {
                             state.closure_upvals = cu;
                             state.tbc_list = tl;
                         }
-                        return Ok(ErrOutcome::Return(VmResult::Yield { values }));
+                        return Ok(ErrOutcome::Return(VmResult::Yield { values: *values }));
                     }
                     Err(_) => {}
                 }
@@ -1852,7 +1860,7 @@ impl VmExecutor {
 
         // 格式化错误消息（添加 source:line 前缀）— 对应 C 的 luaG_addinfo
         let error_msg = match error {
-            VmError::RuntimeError(msg) => msg.clone(),
+            VmError::RuntimeError(msg) => (**msg).clone(),
             VmError::RuntimeErrorValue(val) => format!("{}", val),
             other => format!("{}", other),
         };
@@ -2349,7 +2357,7 @@ impl VmExecutor {
         if t & 63 == 0 && INTERRUPTED.load(Ordering::Relaxed) {
             INTERRUPTED.store(false, Ordering::Release);
             state.pc = cur; // savepc: 中断错误行号
-            return Err(VmError::RuntimeError("interrupted!".to_string()));
+            return Err(VmError::RuntimeError(Box::new("interrupted!".to_string())));
         }
         Ok(())
     }
@@ -2362,7 +2370,7 @@ impl VmExecutor {
         if t & 63 == 0 && INTERRUPTED.load(Ordering::Relaxed) {
             INTERRUPTED.store(false, Ordering::Release);
             state.pc = pc;
-            return Err(VmError::RuntimeError("interrupted!".to_string()));
+            return Err(VmError::RuntimeError(Box::new("interrupted!".to_string())));
         }
         Ok(())
     }
@@ -2526,7 +2534,7 @@ impl VmExecutor {
                                 Self::finish_concat_loop(state, a)?;
                             }
                             Err(_) => {
-                                return Err(VmError::RuntimeError("concat error".into()));
+                                return Err(VmError::RuntimeError(Box::new(String::from("concat error"))));
                             }
                         }
                     }
@@ -2646,8 +2654,8 @@ impl VmExecutor {
                 Ok(()) => {
                     // close 完成: 返回 pending error 给上层 pcall
                     return match err {
-                        TValue::Str(s) => Err(VmError::RuntimeError(s.to_string())),
-                        v => Err(VmError::RuntimeErrorValue(v)),
+                        TValue::Str(s) => Err(VmError::RuntimeError(Box::new(s.to_string()))),
+                        v => Err(VmError::RuntimeErrorValue(Box::new(v))),
                     };
                 }
                 Err(VmError::Yield(values)) => {
@@ -2825,7 +2833,7 @@ impl VmExecutor {
                     continue;
                 }
                 Err(_) => {
-                    return Err(VmError::RuntimeError("concat error".into()));
+                    return Err(VmError::RuntimeError(Box::new(String::from("concat error"))));
                 }
             }
         }
@@ -3041,7 +3049,7 @@ impl VmExecutor {
             } else {
                 msg
             };
-            return Err(VmError::RuntimeError(msg));
+            return Err(VmError::RuntimeError(Box::new(msg)));
         }
 
         Ok(())
@@ -4551,7 +4559,7 @@ impl VmExecutor {
                             continue;
                         }
                         Err(_) => {
-                            return Err(VmError::RuntimeError("concat error".into()));
+                            return Err(VmError::RuntimeError(Box::new(String::from("concat error"))));
                         }
                     }
                 }
@@ -5036,7 +5044,7 @@ impl VmExecutor {
                 // 省一次对 1300B 结构体字段的 load+add+store 内存往返。
                 Ok(())
             }
-            Err(VmError::Yield(values)) => Err(Self::pure_builtin_yielded(state, a, bf, values)),
+            Err(VmError::Yield(values)) => Err(Self::pure_builtin_yielded(state, a, bf, *values)),
             Err(e) => Err(Self::pure_builtin_errored(state, a, bf, e)),
         }
     }
@@ -5064,7 +5072,7 @@ impl VmExecutor {
             nextraargs: state.nextraargs,
             is_tailcall: false,
         });
-        VmError::Yield(values)
+        VmError::Yield(Box::new(values))
     }
 
     /// pure BuiltinFn 错误路径 — 补推 CallInfoEntry 供 traceback / debug.getinfo。
@@ -5132,7 +5140,7 @@ impl VmExecutor {
                 } else {
                     "C stack overflow"
                 };
-                return Err(VmError::RuntimeError(msg.to_string()));
+                return Err(VmError::RuntimeError(Box::new(msg.to_string())));
             }
 
             // perf: 用 mem::replace 代替 mem::take + 后续赋值
@@ -5251,14 +5259,14 @@ impl VmExecutor {
                     }
                     // 对应 C: if ((status & MAX_CCMT) == MAX_CCMT) luaG_runerror(...)
                     if chain_len >= MAX_CALL_CHAIN {
-                        return Err(VmError::RuntimeError("'__call' chain too long".to_string()));
+                        return Err(VmError::RuntimeError(Box::new("'__call' chain too long".to_string())));
                     }
                     chain_len += 1;
                     func_val = call_fn;
                     continue; // 对应 C 的 goto retry
                 }
                 let type_name = state.typename(func_val.ty());
-                return Err(VmError::RuntimeError(call_error_message(state, &type_name)));
+                return Err(VmError::RuntimeError(Box::new(call_error_message(state, &type_name))));
             }
             break;
         }
@@ -5298,7 +5306,7 @@ impl VmExecutor {
                     } else {
                         "C stack overflow"
                     };
-                    return Err(VmError::RuntimeError(msg.to_string()));
+                    return Err(VmError::RuntimeError(Box::new(msg.to_string())));
                 }
 
                 // perf: 用 mem::replace 代替 mem::take + 后续赋值
@@ -5491,7 +5499,7 @@ impl VmExecutor {
                 // - coroutine.wrap 返回 RustClosure（由 RustClosure 分支自动派发）
                 // 普通用户传入的 LightUserData 永远不是可调用对象。
                 let type_name = state.typename(func_val.ty());
-                Err(VmError::RuntimeError(call_error_message(state, &type_name)))
+                Err(VmError::RuntimeError(Box::new(call_error_message(state, &type_name))))
             }
             TValue::LCFn(lcf) => {
                 Self::call_c_function(state, a, b, c, lcf.func)?;
@@ -5505,7 +5513,7 @@ impl VmExecutor {
                 // 非可调用对象: 抛出 "attempt to call a {type} value" 错误
                 // 对应 C 的 luaG_callerror
                 let type_name = state.typename(other.ty());
-                Err(VmError::RuntimeError(call_error_message(state, &type_name)))
+                Err(VmError::RuntimeError(Box::new(call_error_message(state, &type_name))))
             }
         }
     }
@@ -5633,7 +5641,7 @@ impl VmExecutor {
                     Some(other) => format!("{:?}", other.ty()),
                     None => "error in C function".to_string(),
                 };
-                return Err(VmError::RuntimeError(err_msg));
+                return Err(VmError::RuntimeError(Box::new(err_msg)));
             }
         };
 
@@ -5648,7 +5656,7 @@ impl VmExecutor {
             state.api_func_base = saved_api_base;
             state.n_ccalls = state.n_ccalls.saturating_sub(1);
             state.call_info.pop();
-            return Err(VmError::Yield(values));
+            return Err(VmError::Yield(Box::new(values)));
         }
 
         // poscall: 把栈顶 n 个结果移动到 a 位置
@@ -5810,14 +5818,14 @@ impl VmExecutor {
                     }
                     // 对应 C: if ((status & MAX_CCMT) == MAX_CCMT) luaG_runerror(...)
                     if chain_len >= MAX_CALL_CHAIN {
-                        return Err(VmError::RuntimeError("'__call' chain too long".to_string()));
+                        return Err(VmError::RuntimeError(Box::new("'__call' chain too long".to_string())));
                     }
                     chain_len += 1;
                     func_val = call_fn;
                     continue;
                 }
                 let type_name = state.typename(func_val.ty());
-                return Err(VmError::RuntimeError(call_error_message(state, &type_name)));
+                return Err(VmError::RuntimeError(Box::new(call_error_message(state, &type_name))));
             }
             break;
         }
@@ -6004,7 +6012,7 @@ impl VmExecutor {
                 // 非可调用对象: 抛出 "attempt to call a {type} value" 错误
                 // 对应 C 的 luaG_callerror (同 op_call)
                 let type_name = state.typename(other.ty());
-                Err(VmError::RuntimeError(call_error_message(state, &type_name)))
+                Err(VmError::RuntimeError(Box::new(call_error_message(state, &type_name))))
             }
         }
     }
@@ -6476,7 +6484,7 @@ impl VmExecutor {
         match (&init_val, &step_val) {
             (TValue::Integer(init_i), TValue::Integer(step_i)) => {
                 if *step_i == 0 {
-                    return Err(VmError::RuntimeError("'for' step is zero".into()));
+                    return Err(VmError::RuntimeError(Box::new(String::from("'for' step is zero"))));
                 }
                 // 对应 C 的 forlimit: 将 limit 转为整数
                 // 返回 Ok(Some(i)) = 成功, Ok(None) = 跳过循环 (超范围), Err(()) = 转换失败
@@ -6492,10 +6500,10 @@ impl VmExecutor {
                             TValue::Str(_) => "string",
                             _ => "value",
                         };
-                        return Err(VmError::RuntimeError(format!(
+                        return Err(VmError::RuntimeError(Box::new(format!(
                             "bad 'for' limit (number expected, got {})",
                             what
-                        )));
+                        ))));
                     }
                 };
 
@@ -6533,33 +6541,33 @@ impl VmExecutor {
                 let limit_f = match to_number(&limit_val) {
                     Some(f) => f,
                     None => {
-                        return Err(VmError::RuntimeError(format!(
+                        return Err(VmError::RuntimeError(Box::new(format!(
                             "bad 'for' limit (number expected, got {})",
                             obj_type_name(&limit_val)
-                        )))
+                        ))))
                     }
                 };
                 let step_f = match to_number(&step_val) {
                     Some(f) => f,
                     None => {
-                        return Err(VmError::RuntimeError(format!(
+                        return Err(VmError::RuntimeError(Box::new(format!(
                             "bad 'for' step (number expected, got {})",
                             obj_type_name(&step_val)
-                        )))
+                        ))))
                     }
                 };
                 let init_f = match to_number(&init_val) {
                     Some(f) => f,
                     None => {
-                        return Err(VmError::RuntimeError(format!(
+                        return Err(VmError::RuntimeError(Box::new(format!(
                             "bad 'for' initial value (number expected, got {})",
                             obj_type_name(&init_val)
-                        )))
+                        ))))
                     }
                 };
 
                 if step_f == 0.0 {
-                    return Err(VmError::RuntimeError("'for' step is zero".into()));
+                    return Err(VmError::RuntimeError(Box::new(String::from("'for' step is zero"))));
                 }
                 let skip = if step_f > 0.0 {
                     limit_f < init_f
@@ -6805,7 +6813,7 @@ impl VmExecutor {
             _ => {
                 // 非可调用对象: 抛出 "attempt to call a {type} value" 错误
                 let type_name = state.typename(func_val.ty());
-                Err(VmError::RuntimeError(call_error_message(state, &type_name)))
+                Err(VmError::RuntimeError(Box::new(call_error_message(state, &type_name))))
             }
         }
     }
@@ -6955,17 +6963,17 @@ impl VmExecutor {
                     Some(TValue::Integer(n)) => {
                         if n < 0 || (n as u64) > (i32::MAX as u64) / 2 {
                             state.pc = cur; // sync (C savepc): 错误行号需要当前指令
-                            return Err(VmError::RuntimeError(
+                            return Err(VmError::RuntimeError(Box::new(
                                 "vararg table has no proper 'n'".to_string(),
-                            ));
+                            )));
                         }
                         n as usize
                     }
                     _ => {
                         state.pc = cur; // sync (C savepc): 错误行号需要当前指令
-                        return Err(VmError::RuntimeError(
+                        return Err(VmError::RuntimeError(Box::new(
                             "vararg table has no proper 'n'".to_string(),
-                        ));
+                        )));
                     }
                 }
             } else {
@@ -7105,10 +7113,10 @@ impl VmExecutor {
             } else {
                 "?".to_string()
             };
-            return Err(VmError::RuntimeError(format!(
+            return Err(VmError::RuntimeError(Box::new(format!(
                 "global '{}' already defined",
                 globalname
-            )));
+            ))));
         }
         state.pc += 1;
         Ok(())
@@ -7356,27 +7364,27 @@ impl VmExecutor {
                             _ => {
                                 let type_name = state.typename(other.ty());
                                 let info = index_varinfo(state, table_source);
-                                return Err(VmError::RuntimeError(format!(
+                                return Err(VmError::RuntimeError(Box::new(format!(
                                     "attempt to index a {} value{}",
                                     type_name, info
-                                )));
+                                ))));
                             }
                         },
                         None => {
                             let type_name = state.typename(other.ty());
                             let info = index_varinfo(state, table_source);
-                            return Err(VmError::RuntimeError(format!(
+                            return Err(VmError::RuntimeError(Box::new(format!(
                                 "attempt to index a {} value{}",
                                 type_name, info
-                            )));
+                            ))));
                         }
                     }
                 }
             }
         }
-        Err(VmError::RuntimeError(
+        Err(VmError::RuntimeError(Box::new(
             "'__index' chain too long; possible loop".into(),
-        ))
+        )))
     }
 
     /// 调用 __index 元方法函数: __index(table, key)
@@ -7485,10 +7493,10 @@ impl VmExecutor {
                     // 检查 NaN/nil 键 (NaN 永远不等于自身, 故每次都是新键)
                     match &key {
                         TValue::Nil(_) => {
-                            return Err(VmError::RuntimeError("table index is nil".to_string()));
+                            return Err(VmError::RuntimeError(Box::new("table index is nil".to_string())));
                         }
                         TValue::Float(f) if f.is_nan() => {
-                            return Err(VmError::RuntimeError("table index is NaN".to_string()));
+                            return Err(VmError::RuntimeError(Box::new("table index is NaN".to_string())));
                         }
                         _ => {}
                     }
@@ -7542,28 +7550,28 @@ impl VmExecutor {
                                 _ => {
                                     let type_name = state.typename(current.ty());
                                     let info = index_varinfo(state, table_source);
-                                    return Err(VmError::RuntimeError(format!(
+                                    return Err(VmError::RuntimeError(Box::new(format!(
                                         "attempt to index a {} value{}",
                                         type_name, info
-                                    )));
+                                    ))));
                                 }
                             }
                         }
                         None => {
                             let type_name = state.typename(current.ty());
                             let info = index_varinfo(state, table_source);
-                            return Err(VmError::RuntimeError(format!(
+                            return Err(VmError::RuntimeError(Box::new(format!(
                                 "attempt to index a {} value{}",
                                 type_name, info
-                            )));
+                            ))));
                         }
                     }
                 }
             }
         }
-        Err(VmError::RuntimeError(
+        Err(VmError::RuntimeError(Box::new(
             "'__newindex' chain too long; possible loop".into(),
-        ))
+        )))
     }
 
     fn resolve_val(state: &LuaState, inst: Instruction, c: i32) -> TValue {
@@ -8509,7 +8517,7 @@ mod tests {
     #[test]
     fn test_vm_error_all_displays() {
         assert_eq!(
-            format!("{}", VmError::TypeError("bad type".into())),
+            format!("{}", VmError::TypeError(Box::new(String::from("bad type")))),
             "type error: bad type"
         );
         assert_eq!(format!("{}", VmError::StackOverflow), "stack overflow");
@@ -8518,7 +8526,7 @@ mod tests {
             "illegal opcode: 99"
         );
         assert_eq!(
-            format!("{}", VmError::RuntimeError("boom".into())),
+            format!("{}", VmError::RuntimeError(Box::new(String::from("boom")))),
             "runtime error: boom"
         );
     }

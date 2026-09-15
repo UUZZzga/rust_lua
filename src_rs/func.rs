@@ -317,7 +317,7 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
                         // __close 出错: 从返回的 VmError 提取错误值，更新 current_err
                         // (pcall 已清除 last_error_value，不能从 state 读取)
                         current_err = match e {
-                            VmError::RuntimeErrorValue(val) => val,
+                            VmError::RuntimeErrorValue(val) => *val,
                             VmError::RuntimeError(s) => TValue::Str(state.intern_str(&s)),
                             other => TValue::Str(state.intern_str(&format!("{}", other))),
                         };
@@ -345,8 +345,8 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
         // state.last_error_value 已包含最终错误值，调用者可通过它获取原始 TValue
         // 字符串错误用 RuntimeError，非字符串错误用 RuntimeErrorValue 保留原始 TValue
         Err(match &current_err {
-            TValue::Str(s) => VmError::RuntimeError(s.as_str().to_string()),
-            _ => VmError::RuntimeErrorValue(current_err.clone()),
+            TValue::Str(s) => VmError::RuntimeError(Box::new(s.as_str().to_string())),
+            _ => VmError::RuntimeErrorValue(Box::new(current_err.clone())),
         })
     } else {
         Ok(())
@@ -375,10 +375,10 @@ pub fn new_tbc_upval(state: &mut LuaState, level: usize) -> Result<Option<usize>
     if !has_close {
         // 获取变量名 — 对应 C 的 luaG_findlocal(L, L->ci, idx, NULL)
         let varname = get_var_name_at(state, level).unwrap_or_else(|| "?".to_string());
-        return Err(VmError::RuntimeError(format!(
+        return Err(VmError::RuntimeError(Box::new(format!(
             "variable '{}' got a non-closable value",
             varname
-        )));
+        ))));
     }
     // TBC upvalue 复用 open_upval 链表（通过 find_upval 加入），用 tbc 字段标记
     let uv_idx = find_upval(state, level);

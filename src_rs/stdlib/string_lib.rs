@@ -1240,7 +1240,7 @@ fn add_value_from_repl(
                 crate::execute::VarSource::None,
             )
             .map_err(|e| match e {
-                VmError::RuntimeError(s) => s,
+                VmError::RuntimeError(s) => *s,
                 _ => "error in table indexing".to_string(),
             })?;
             match val {
@@ -3373,9 +3373,9 @@ pub fn call_gmatch_iter(
     let rc = match state.stack.get(a).or_else(|| state.stack.get(a + 1)) {
         Some(TValue::RustClosure(rc)) => rc.clone(),
         _ => {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "gmatch iterator: expected RustClosure".to_string(),
-            ))
+            )))
         }
     };
 
@@ -3385,25 +3385,25 @@ pub fn call_gmatch_iter(
         let s_val = match upvals.get(GMATCH_UP_SRC) {
             Some(TValue::Str(s)) => s.clone(),
             _ => {
-                return Err(VmError::RuntimeError(
+                return Err(VmError::RuntimeError(Box::new(
                     "gmatch iterator: invalid state (missing subject)".to_string(),
-                ))
+                )))
             }
         };
         let p_val = match upvals.get(GMATCH_UP_PAT) {
             Some(TValue::Str(s)) => s.clone(),
             _ => {
-                return Err(VmError::RuntimeError(
+                return Err(VmError::RuntimeError(Box::new(
                     "gmatch iterator: invalid state (missing pattern)".to_string(),
-                ))
+                )))
             }
         };
         let pos = match upvals.get(GMATCH_UP_POS) {
             Some(TValue::Integer(n)) => *n as usize,
             _ => {
-                return Err(VmError::RuntimeError(
+                return Err(VmError::RuntimeError(Box::new(
                     "gmatch iterator: invalid state (missing pos)".to_string(),
-                ))
+                )))
             }
         };
         let pat_start = match upvals.get(GMATCH_UP_PAT_START) {
@@ -3451,7 +3451,7 @@ pub fn call_gmatch_iter(
                             Ok(c) => c,
                             Err(e) => {
                                 state.stack.truncate(first_result_pos);
-                                return Err(VmError::RuntimeError(e));
+                                return Err(VmError::RuntimeError(Box::new(e)));
                             }
                         };
                         let val = match cap {
@@ -3482,7 +3482,7 @@ pub fn call_gmatch_iter(
             }
             Err(e) => {
                 state.stack.truncate(first_result_pos);
-                return Err(VmError::RuntimeError(e));
+                return Err(VmError::RuntimeError(Box::new(e)));
             }
         }
 
@@ -3630,7 +3630,7 @@ fn call_str_char(
             );
             Ok(())
         }
-        Err(msg) => Err(VmError::RuntimeError(msg)),
+        Err(msg) => Err(VmError::RuntimeError(Box::new(msg))),
     }
 }
 
@@ -3658,7 +3658,7 @@ fn call_str_rep(
             );
             Ok(())
         }
-        Err(msg) => Err(VmError::RuntimeError(msg)),
+        Err(msg) => Err(VmError::RuntimeError(Box::new(msg))),
     }
 }
 
@@ -3682,7 +3682,7 @@ fn call_str_find(
     let mut caps = Vec::new();
     let found =
         str_find_into(&s, &pattern, init, plain, true, &state.string_table, &mut caps)
-            .map_err(VmError::RuntimeError)?;
+            .map_err(|e| VmError::RuntimeError(Box::new(e)))?;
     match found {
         Some((start, end)) => {
             let n_caps = caps.len();
@@ -3745,7 +3745,7 @@ fn call_str_format(
                 );
                 Ok(())
             }
-            Err(msg) => Err(VmError::RuntimeError(msg)),
+            Err(msg) => Err(VmError::RuntimeError(Box::new(msg))),
         }
     } else if args_end <= state.stack.len() {
         // 快速路径: 直接借用 stack 切片, 避免 TValue clone (perf: 省约 4% TValue::clone)
@@ -3761,7 +3761,7 @@ fn call_str_format(
                 );
                 Ok(())
             }
-            Err(msg) => Err(VmError::RuntimeError(msg)),
+            Err(msg) => Err(VmError::RuntimeError(Box::new(msg))),
         }
     } else {
         // stack 不足 (罕见): clone + nil 填充
@@ -3785,7 +3785,7 @@ fn call_str_format(
                 );
                 Ok(())
             }
-            Err(msg) => Err(VmError::RuntimeError(msg)),
+            Err(msg) => Err(VmError::RuntimeError(Box::new(msg))),
         }
     }
 }
@@ -3808,7 +3808,7 @@ fn call_str_match(
             push_results(state, a, nresults, results);
             Ok(())
         }
-        Err(msg) => Err(VmError::RuntimeError(msg)),
+        Err(msg) => Err(VmError::RuntimeError(Box::new(msg))),
     }
 }
 
@@ -3854,7 +3854,7 @@ fn call_str_gsub(
                     state.adjust_two_results(a, nresults, result_val, TValue::Integer(n));
                     Ok(())
                 }
-                Err(msg) => Err(VmError::RuntimeError(msg)),
+                Err(msg) => Err(VmError::RuntimeError(Box::new(msg))),
             }
         }
         // string/number 替换 — 对应 C 的 default 分支 (add_s)
@@ -3871,13 +3871,13 @@ fn call_str_gsub(
                     state.adjust_two_results(a, nresults, result_val, TValue::Integer(n));
                     Ok(())
                 }
-                Err(msg) => Err(VmError::RuntimeError(msg)),
+                Err(msg) => Err(VmError::RuntimeError(Box::new(msg))),
             }
         }
-        _ => Err(VmError::RuntimeError(format!(
+        _ => Err(VmError::RuntimeError(Box::new(format!(
             "bad argument #3 (string/function/table expected, got {})",
             repl_val.ty()
-        ))),
+        )))),
     }
 }
 
@@ -3971,7 +3971,7 @@ fn call_str_pack(
             push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&s))]);
             Ok(())
         }
-        Err(msg) => Err(VmError::RuntimeError(msg)),
+        Err(msg) => Err(VmError::RuntimeError(Box::new(msg))),
     }
 }
 
@@ -3988,7 +3988,7 @@ fn call_str_packsize(
             push_results(state, a, nresults, vec![TValue::Integer(size as i64)]);
             Ok(())
         }
-        Err(msg) => Err(VmError::RuntimeError(msg)),
+        Err(msg) => Err(VmError::RuntimeError(Box::new(msg))),
     }
 }
 
@@ -4004,17 +4004,17 @@ fn call_str_unpack(
     let data_bytes = {
         let stack_idx = a + 1 + 1;
         if stack_idx >= state.stack.len() {
-            return Err(VmError::RuntimeError(format!(
+            return Err(VmError::RuntimeError(Box::new(format!(
                 "bad argument #2 to 'unpack' (string expected, got no value)"
-            )));
+            ))));
         }
         match &state.stack[stack_idx] {
             TValue::Str(s) => s.as_str().as_bytes().to_vec(),
             _ => {
-                return Err(VmError::RuntimeError(format!(
+                return Err(VmError::RuntimeError(Box::new(format!(
                     "bad argument #2 to 'unpack' (string expected, got {})",
                     state.stack[stack_idx].ty()
-                )))
+                ))))
             }
         }
     };
@@ -4026,7 +4026,7 @@ fn call_str_unpack(
             push_results(state, a, nresults, values);
             Ok(())
         }
-        Err(msg) => Err(VmError::RuntimeError(msg)),
+        Err(msg) => Err(VmError::RuntimeError(Box::new(msg))),
     }
 }
 
@@ -4040,15 +4040,15 @@ fn call_str_dump(
     nresults: i32,
 ) -> Result<(), VmError> {
     if nargs == 0 {
-        return Err(VmError::RuntimeError(
+        return Err(VmError::RuntimeError(Box::new(
             "bad argument #1 to 'dump' (function expected, got no value)".to_string(),
-        ));
+        )));
     }
     let stack_idx = a + 1;
     if stack_idx >= state.stack.len() {
-        return Err(VmError::RuntimeError(
+        return Err(VmError::RuntimeError(Box::new(
             "bad argument #1 to 'dump' (function expected, got no value)".to_string(),
-        ));
+        )));
     }
     let func_val = state.stack[stack_idx].clone();
     let strip = if nargs >= 2 {
@@ -4072,10 +4072,10 @@ fn call_str_dump(
             );
             Ok(())
         }
-        _ => Err(VmError::RuntimeError(format!(
+        _ => Err(VmError::RuntimeError(Box::new(format!(
             "bad argument #1 to 'dump' (function expected, got {})",
             func_val.ty()
-        ))),
+        )))),
     }
 }
 

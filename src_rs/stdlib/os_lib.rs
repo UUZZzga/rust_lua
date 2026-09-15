@@ -152,17 +152,17 @@ fn call_setlocale(
             let bytes = s.as_str().as_bytes();
             // 确保字符串不包含内部 \0
             if bytes.contains(&0) {
-                return Err(VmError::RuntimeError(
+                return Err(VmError::RuntimeError(Box::new(
                     "bad argument #1 to 'setlocale' (string contains embedded zeros)".to_string(),
-                ));
+                )));
             }
             Some(CString::new(bytes).unwrap_or_else(|_| CString::new("").unwrap()))
         }
         TValue::Nil(_) => None, // NULL: 查询当前 locale
         _ => {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "bad argument #1 to 'setlocale' (string expected)".to_string(),
-            ));
+            )));
         }
     };
 
@@ -181,17 +181,17 @@ fn call_setlocale(
             "numeric" => libc::LC_NUMERIC,
             "time" => libc::LC_TIME,
             other => {
-                return Err(VmError::RuntimeError(format!(
+                return Err(VmError::RuntimeError(Box::new(format!(
                     "bad argument #2 to 'setlocale' (invalid option '{}')",
                     other
-                )));
+                ))));
             }
         },
         TValue::Nil(_) => libc::LC_ALL, // 默认 "all"
         _ => {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "bad argument #2 to 'setlocale' (string expected)".to_string(),
-            ));
+            )));
         }
     };
 
@@ -263,9 +263,9 @@ fn call_tmpname(
         let ptr = buf.as_mut_ptr() as *mut libc::c_char;
         let fd = unsafe { compat::mkstemp(ptr) };
         if fd == -1 {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "unable to generate a unique filename".to_string(),
-            ));
+            )));
         }
         unsafe {
             libc::close(fd);
@@ -282,9 +282,9 @@ fn call_tmpname(
         let ptr = buf.as_mut_ptr() as *mut libc::c_char;
         let rc = unsafe { compat::mkstemp(ptr) };
         if rc == -1 {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "unable to generate a unique filename".to_string(),
-            ));
+            )));
         }
         let cstr = unsafe { CStr::from_ptr(ptr) };
         let s = cstr.to_str().unwrap_or("").to_string();
@@ -311,16 +311,16 @@ fn call_remove(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         TValue::Str(s) => {
             let bytes = s.as_str().as_bytes();
             if bytes.contains(&0) {
-                return Err(VmError::RuntimeError(
+                return Err(VmError::RuntimeError(Box::new(
                     "bad argument #1 to 'remove' (string contains embedded zeros)".to_string(),
-                ));
+                )));
             }
             CString::new(bytes).unwrap_or_else(|_| CString::new("").unwrap())
         }
         _ => {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "bad argument #1 to 'remove' (string expected)".to_string(),
-            ));
+            )));
         }
     };
 
@@ -383,16 +383,16 @@ fn call_getenv(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         TValue::Str(s) => {
             let bytes = s.as_str().as_bytes();
             if bytes.contains(&0) {
-                return Err(VmError::RuntimeError(
+                return Err(VmError::RuntimeError(Box::new(
                     "bad argument #1 to 'getenv' (string contains embedded zeros)".to_string(),
-                ));
+                )));
             }
             CString::new(bytes).unwrap_or_else(|_| CString::new("").unwrap())
         }
         _ => {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "bad argument #1 to 'getenv' (string expected)".to_string(),
-            ));
+            )));
         }
     };
 
@@ -432,16 +432,16 @@ fn call_rename(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         TValue::Str(s) => {
             let bytes = s.as_str().as_bytes();
             if bytes.contains(&0) {
-                return Err(VmError::RuntimeError(
+                return Err(VmError::RuntimeError(Box::new(
                     "bad argument #1 to 'rename' (string contains embedded zeros)".to_string(),
-                ));
+                )));
             }
             CString::new(bytes).unwrap_or_else(|_| CString::new("").unwrap())
         }
         _ => {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "bad argument #1 to 'rename' (string expected)".to_string(),
-            ));
+            )));
         }
     };
 
@@ -454,16 +454,16 @@ fn call_rename(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         TValue::Str(s) => {
             let bytes = s.as_str().as_bytes();
             if bytes.contains(&0) {
-                return Err(VmError::RuntimeError(
+                return Err(VmError::RuntimeError(Box::new(
                     "bad argument #2 to 'rename' (string contains embedded zeros)".to_string(),
-                ));
+                )));
             }
             CString::new(bytes).unwrap_or_else(|_| CString::new("").unwrap())
         }
         _ => {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "bad argument #2 to 'rename' (string expected)".to_string(),
-            ));
+            )));
         }
     };
 
@@ -535,10 +535,10 @@ fn call_os_execute(
         TValue::Str(s) => Some(s.as_str().to_string()),
         TValue::Nil(_) => None,
         _ => {
-            return Err(VmError::RuntimeError(format!(
+            return Err(VmError::RuntimeError(Box::new(format!(
                 "bad argument #1 to 'execute' (string expected, got {})",
                 crate::tm::obj_type_name(&cmd_val)
-            )));
+            ))));
         }
     };
 
@@ -588,10 +588,10 @@ fn call_os_exit(
             TValue::Integer(n) => *n as i32,
             TValue::Nil(_) => 0,
             _ => {
-                return Err(VmError::RuntimeError(format!(
+                return Err(VmError::RuntimeError(Box::new(format!(
                     "bad argument #1 to 'exit' (number or boolean expected, got {})",
                     crate::tm::obj_type_name(&v)
-                )));
+                ))));
             }
         }
     } else {
@@ -607,7 +607,7 @@ fn call_os_exit(
             // close_state 处理完剩余 finalizer 后据此退出
             state.exit_requested = Some(status);
             // 用 VmError 中断当前 finalizer 的 pcall，让 close_state 继续处理后续对象
-            return Err(VmError::RuntimeError("__exit_requested__".to_string()));
+            return Err(VmError::RuntimeError(Box::new("__exit_requested__".to_string())));
         } else {
             // 普通脚本中调用 os.exit(code, true)：触发 close_state，内部会 exit
             state.close_state();
@@ -638,10 +638,10 @@ fn get_field(
         Some(TValue::Nil(_)) | None => {
             // 字段不存在或为 nil: 用默认值
             if d < 0 {
-                Err(VmError::RuntimeError(format!(
+                Err(VmError::RuntimeError(Box::new(format!(
                     "field '{}' missing in date table",
                     key
-                )))
+                ))))
             } else {
                 Ok(d)
             }
@@ -657,19 +657,19 @@ fn get_field(
                         i32::MIN as i64 + delta as i64 <= res
                     };
                     if !in_bounds {
-                        return Err(VmError::RuntimeError(format!(
+                        return Err(VmError::RuntimeError(Box::new(format!(
                             "field '{}' is out-of-bound",
                             key
-                        )));
+                        ))));
                     }
                     Ok((res - delta as i64) as i32)
                 }
                 None => {
                     // 非数字或不可转换的 Float
-                    Err(VmError::RuntimeError(format!(
+                    Err(VmError::RuntimeError(Box::new(format!(
                         "field '{}' is not an integer",
                         key
-                    )))
+                    ))))
                 }
             }
         }
@@ -710,10 +710,10 @@ fn call_os_date(
             TValue::Str(s) => s.as_str().as_bytes().to_vec(),
             TValue::Nil(_) => b"%c".to_vec(),
             _ => {
-                return Err(VmError::RuntimeError(format!(
+                return Err(VmError::RuntimeError(Box::new(format!(
                     "bad argument #1 to 'date' (string expected, got {})",
                     crate::tm::obj_type_name(&v)
-                )));
+                ))));
             }
         }
     } else {
@@ -728,10 +728,10 @@ fn call_os_date(
             _ => match crate::vm::to_integer_ns(&v, crate::vm::F2IMode::Eq) {
                 Some(n) => n as libc::time_t,
                 None => {
-                    return Err(VmError::RuntimeError(format!(
+                    return Err(VmError::RuntimeError(Box::new(format!(
                         "bad argument #2 to 'date' (number has no integer representation, got {})",
                         crate::tm::obj_type_name(&v)
-                    )));
+                    ))));
                 }
             },
         }
@@ -754,9 +754,9 @@ fn call_os_date(
         unsafe { compat::localtime_r(&t, &mut tmr) }
     };
     if stm.is_null() {
-        return Err(VmError::RuntimeError(
+        return Err(VmError::RuntimeError(Box::new(
             "date result cannot be represented in this installation".to_string(),
-        ));
+        )));
     }
 
     // 检查是否是 "*t" 模式
@@ -792,9 +792,9 @@ fn call_os_date(
             i += 1; // 跳过 %
             if i >= fmt.len() {
                 // % 在末尾: 非法转换说明符
-                return Err(VmError::RuntimeError(
+                return Err(VmError::RuntimeError(Box::new(
                     "invalid conversion specifier '%'".to_string(),
-                ));
+                )));
             }
             // 收集转换说明符 (支持可选的 E/O 修饰符 + 单字符)
             let mut spec = Vec::new();
@@ -806,10 +806,10 @@ fn call_os_date(
                 if i >= fmt.len() {
                     // 修饰符在末尾: 非法
                     let spec_str = String::from_utf8_lossy(&spec);
-                    return Err(VmError::RuntimeError(format!(
+                    return Err(VmError::RuntimeError(Box::new(format!(
                         "invalid conversion specifier '{}'",
                         spec_str
-                    )));
+                    ))));
                 }
             }
             spec.push(fmt[i]);
@@ -826,14 +826,14 @@ fn call_os_date(
             };
             if !valid {
                 let spec_str = String::from_utf8_lossy(&spec);
-                return Err(VmError::RuntimeError(format!(
+                return Err(VmError::RuntimeError(Box::new(format!(
                     "invalid conversion specifier '{}'",
                     spec_str
-                )));
+                ))));
             }
             // 用 strftime 格式化 (spec 是合法的 C 格式字符串, 不含 \0)
             let cc = std::ffi::CString::new(spec.clone())
-                .map_err(|_| VmError::RuntimeError("invalid conversion specifier".to_string()))?;
+                .map_err(|_| VmError::RuntimeError(Box::new("invalid conversion specifier".to_string())))?;
             let mut buf = [0u8; 250];
             let reslen =
                 unsafe { compat::strftime(buf.as_mut_ptr() as *mut i8, 250, cc.as_ptr(), &tmr) };
@@ -862,9 +862,9 @@ fn call_os_time(
         // 无参数: 返回当前时间
         let t = unsafe { libc::time(std::ptr::null_mut()) };
         if t == -1 as libc::time_t {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "time result cannot be represented in this installation".to_string(),
-            ));
+            )));
         }
         TValue::Integer(t as i64)
     } else {
@@ -873,10 +873,10 @@ fn call_os_time(
         let table = match &v {
             TValue::Table(t) => t.clone(),
             _ => {
-                return Err(VmError::RuntimeError(format!(
+                return Err(VmError::RuntimeError(Box::new(format!(
                     "bad argument #1 to 'time' (table expected, got {})",
                     crate::tm::obj_type_name(&v)
-                )));
+                ))));
             }
         };
         let mut ts: libc::tm = unsafe { std::mem::zeroed() };
@@ -900,9 +900,9 @@ fn call_os_time(
         };
         let t = unsafe { compat::mktime(&mut ts) };
         if t == -1 as libc::time_t {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "time result cannot be represented in this installation".to_string(),
-            ));
+            )));
         }
         // 更新表的字段为规范化值 — 对应 C 的 setallfields
         set_field(&table, state, "year", ts.tm_year, 1900);
@@ -930,28 +930,28 @@ fn call_os_difftime(
     nresults: i32,
 ) -> Result<(), VmError> {
     if nargs < 2 {
-        return Err(VmError::RuntimeError(
+        return Err(VmError::RuntimeError(Box::new(
             "bad argument to 'difftime' (two numbers expected)".to_string(),
-        ));
+        )));
     }
     let v1 = get_arg(state, a, 0);
     let t1 = match crate::vm::to_integer_ns(&v1, crate::vm::F2IMode::Eq) {
         Some(n) => n as libc::time_t,
         None => {
-            return Err(VmError::RuntimeError(format!(
+            return Err(VmError::RuntimeError(Box::new(format!(
                 "bad argument #1 to 'difftime' (number has no integer representation, got {})",
                 crate::tm::obj_type_name(&v1)
-            )))
+            ))))
         }
     };
     let v2 = get_arg(state, a, 1);
     let t2 = match crate::vm::to_integer_ns(&v2, crate::vm::F2IMode::Eq) {
         Some(n) => n as libc::time_t,
         None => {
-            return Err(VmError::RuntimeError(format!(
+            return Err(VmError::RuntimeError(Box::new(format!(
                 "bad argument #2 to 'difftime' (number has no integer representation, got {})",
                 crate::tm::obj_type_name(&v2)
-            )))
+            ))))
         }
     };
     let diff = unsafe { libc::difftime(t1, t2) };

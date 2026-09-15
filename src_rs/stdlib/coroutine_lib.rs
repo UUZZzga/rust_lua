@@ -930,16 +930,16 @@ fn is_callable(v: &TValue) -> bool {
 
 fn call_create(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     if nargs < 1 {
-        return Err(VmError::RuntimeError(
+        return Err(VmError::RuntimeError(Box::new(
             "bad argument #1 to 'create' (function expected)".to_string(),
-        ));
+        )));
     }
     let func = get_arg(state, a, 0);
     if !is_callable(&func) {
-        return Err(VmError::RuntimeError(format!(
+        return Err(VmError::RuntimeError(Box::new(format!(
             "bad argument #1 to 'create' (function expected, got {})",
             func.ty()
-        )));
+        ))));
     }
     let context = Rc::new(RefCell::new(ThreadContext::default()));
     // 初始化状态为 Suspended（Default 已是 Suspended，显式设置以示清晰）
@@ -965,9 +965,9 @@ fn call_create(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
 
 fn call_status(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     if nargs < 1 {
-        return Err(VmError::RuntimeError(
+        return Err(VmError::RuntimeError(Box::new(
             "bad argument #1 to 'status' (thread expected)".to_string(),
-        ));
+        )));
     }
     let arg = get_arg(state, a, 0);
     let status_str = match &arg {
@@ -997,10 +997,10 @@ fn call_status(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
             }
         }
         _ => {
-            return Err(VmError::RuntimeError(format!(
+            return Err(VmError::RuntimeError(Box::new(format!(
                 "bad argument #1 to 'status' (thread expected, got {})",
                 arg.ty()
-            )));
+            ))));
         }
     };
     push_single_result(
@@ -1024,18 +1024,18 @@ fn call_close(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
         // 改为设置 force_noyield_close 标志，让后续 OP_RETURN 的 func::close 使用
         // 不可 yield 模式 (yy=0)，使 __close 中的 yield 失败。
         state.force_noyield_close = true;
-        return Err(VmError::RuntimeError(
+        return Err(VmError::RuntimeError(Box::new(
             "bad argument #1 to 'close' (thread expected)".to_string(),
-        ));
+        )));
     }
     let arg = get_arg(state, a, 0);
     let thread = match &arg {
         TValue::Thread(t) => t.clone(),
         _ => {
-            return Err(VmError::RuntimeError(format!(
+            return Err(VmError::RuntimeError(Box::new(format!(
                 "bad argument #1 to 'close' (thread expected, got {})",
                 arg.ty()
-            )));
+            ))));
         }
     };
 
@@ -1044,13 +1044,13 @@ fn call_close(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
         // 判断 main 当前状态: 若在协程中执行,main 是 "normal";否则 "running"
         let in_coroutine = state.current_thread.is_some();
         if in_coroutine {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "cannot close a normal coroutine".to_string(),
-            ));
+            )));
         } else {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "cannot close the main thread".to_string(),
-            ));
+            )));
         }
     }
 
@@ -1069,9 +1069,9 @@ fn call_close(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
                 push_resume_results(state, a, nresults, true, Vec::new());
                 return Ok(());
             }
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "cannot close a normal coroutine".to_string(),
-            ));
+            )));
         }
         ThreadStatus::OK => {
             // 已正常结束的协程: 返回 true, nil
@@ -1299,18 +1299,18 @@ fn call_running(
 
 fn call_resume(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     if nargs < 1 {
-        return Err(VmError::RuntimeError(
+        return Err(VmError::RuntimeError(Box::new(
             "bad argument #1 to 'resume' (thread expected)".to_string(),
-        ));
+        )));
     }
     let arg = get_arg(state, a, 0);
     let thread = match &arg {
         TValue::Thread(t) => t.clone(),
         _ => {
-            return Err(VmError::RuntimeError(format!(
+            return Err(VmError::RuntimeError(Box::new(format!(
                 "bad argument #1 to 'resume' (thread expected, got {})",
                 arg.ty()
-            )));
+            ))));
         }
     };
 
@@ -1535,7 +1535,7 @@ fn call_resume(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
             let _ = crate::func::close(state, close_level, 1, 0);
             // 获取最终错误值（经过 __close 错误传播后）
             let final_err = state.last_error_value.take().unwrap_or_else(|| match &e {
-                VmError::RuntimeErrorValue(val) => val.clone(),
+                VmError::RuntimeErrorValue(val) => (**val).clone(),
                 _ => {
                     let msg = if !state.last_error_msg.is_empty() {
                         state.last_error_msg.clone()
@@ -1648,9 +1648,9 @@ fn setup_first_resume(
     let func = match thread.function.as_ref() {
         Some(f) => (**f).clone(),
         None => {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "coroutine has no body function".to_string(),
-            ));
+            )));
         }
     };
     let nargs = resume_args.len();
@@ -1752,9 +1752,9 @@ fn setup_first_resume(
             state.stack.push(arg.clone());
         }
     } else {
-        return Err(VmError::RuntimeError(
+        return Err(VmError::RuntimeError(Box::new(
             "coroutine body must be a function".to_string(),
-        ));
+        )));
     }
     state.top = state.stack.len();
 
@@ -1844,16 +1844,16 @@ fn call_yield(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
     let current_thread = match &state.current_thread {
         Some(ctx) => ctx.clone(),
         None => {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "attempt to yield from outside a coroutine".to_string(),
-            ));
+            )));
         }
     };
     // 检查是否可 yield（无非可 yield 的 C 函数调用在栈上）
     if state.n_ny_calls > 0 {
-        return Err(VmError::RuntimeError(
+        return Err(VmError::RuntimeError(Box::new(
             "attempt to yield across a C-call boundary".to_string(),
-        ));
+        )));
     }
 
     // 收集 yield 值
@@ -1875,7 +1875,7 @@ fn call_yield(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
     current_thread.borrow_mut().saved_yield_nresults = nresults;
 
     // 返回 Yield 错误 — execute_loop 会转换为 Ok(VmResult::Yield)
-    Err(VmError::Yield(yield_values))
+    Err(VmError::Yield(Box::new(yield_values)))
 }
 
 // ============================================================================
@@ -1884,16 +1884,16 @@ fn call_yield(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
 
 fn call_wrap(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     if nargs < 1 {
-        return Err(VmError::RuntimeError(
+        return Err(VmError::RuntimeError(Box::new(
             "bad argument #1 to 'wrap' (function expected)".to_string(),
-        ));
+        )));
     }
     let func = get_arg(state, a, 0);
     if !is_callable(&func) {
-        return Err(VmError::RuntimeError(format!(
+        return Err(VmError::RuntimeError(Box::new(format!(
             "bad argument #1 to 'wrap' (function expected, got {})",
             func.ty()
-        )));
+        ))));
     }
     // 创建协程
     let context = Rc::new(RefCell::new(ThreadContext::default()));
@@ -1959,9 +1959,9 @@ fn call_wrap_fn(
     let rc = match state.stack.get(a) {
         Some(TValue::RustClosure(rc)) => rc.clone(),
         _ => {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "coroutine.wrap: invalid closure".to_string(),
-            ));
+            )));
         }
     };
     let thread = {
@@ -1969,9 +1969,9 @@ fn call_wrap_fn(
         match upvals.get(0) {
             Some(TValue::Thread(t)) => t.clone(),
             _ => {
-                return Err(VmError::RuntimeError(
+                return Err(VmError::RuntimeError(Box::new(
                     "cannot resume dead coroutine".to_string(),
-                ));
+                )));
             }
         }
     };
@@ -1981,14 +1981,14 @@ fn call_wrap_fn(
     match co_status {
         ThreadStatus::Suspended => {}
         ThreadStatus::Normal => {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "cannot resume non-suspended coroutine".to_string(),
-            ));
+            )));
         }
         ThreadStatus::OK | ThreadStatus::Error => {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "cannot resume dead coroutine".to_string(),
-            ));
+            )));
         }
     }
 
@@ -2057,7 +2057,7 @@ fn call_wrap_fn(
         state.n_ccalls = saved_n_ccalls;
         caller_ctx.stack = state.caller_gc_stacks.pop().unwrap_or_default();
         restore_caller_context(state, caller_ctx);
-        return Err(VmError::RuntimeError("C stack overflow".to_string()));
+        return Err(VmError::RuntimeError(Box::new("C stack overflow".to_string())));
     }
     // 保存 n_ny_calls 并重置为 0（协程初始状态是可 yield 的）
     let saved_n_ny_calls = state.n_ny_calls;
@@ -2265,8 +2265,8 @@ fn call_wrap_fn(
     // 字符串错误用 RuntimeError，非字符串错误用 RuntimeErrorValue 保留原始 TValue
     if let Some(err_val) = error_val {
         return Err(match err_val {
-            TValue::Str(s) => VmError::RuntimeError(s.as_str().to_string()),
-            other => VmError::RuntimeErrorValue(other),
+            TValue::Str(s) => VmError::RuntimeError(Box::new(s.as_str().to_string())),
+            other => VmError::RuntimeErrorValue(Box::new(other)),
         });
     }
 
@@ -2314,9 +2314,9 @@ pub fn c_api_resume(state: &mut LuaState, nargs: usize) -> Result<(i32, usize), 
     let co_context = match state.current_thread.clone() {
         Some(ctx) => ctx,
         None => {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "lua_resume: not a C API thread".to_string(),
-            ));
+            )));
         }
     };
 
@@ -2349,9 +2349,9 @@ pub fn c_api_resume(state: &mut LuaState, nargs: usize) -> Result<(i32, usize), 
         let stack_len = state.stack.len();
         if stack_len < nargs + 1 {
             state.n_ny_calls = saved_n_ny_calls;
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "lua_resume: not enough values on stack".to_string(),
-            ));
+            )));
         }
         let func_idx = stack_len - nargs - 1;
         let func = state.stack[func_idx].clone();
@@ -2504,7 +2504,7 @@ pub fn c_api_resume(state: &mut LuaState, nargs: usize) -> Result<(i32, usize), 
             let _ = crate::func::close(state, close_level, 1, 0);
             // 获取错误值
             let err_val = state.last_error_value.take().unwrap_or_else(|| match &e {
-                VmError::RuntimeErrorValue(val) => val.clone(),
+                VmError::RuntimeErrorValue(val) => (**val).clone(),
                 _ => {
                     let msg = if !state.last_error_msg.is_empty() {
                         state.last_error_msg.clone()

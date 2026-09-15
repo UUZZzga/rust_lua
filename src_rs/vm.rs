@@ -696,9 +696,9 @@ pub fn finish_get(key: &TValue, t: &TValue, _metatable: Option<&Table>) -> Resul
             }
         }
     }
-    Err(VmError::RuntimeError(
+    Err(VmError::RuntimeError(Box::new(
         "'__index' chain too long; possible loop".into(),
-    ))
+    )))
 }
 
 // ============================================================================
@@ -741,15 +741,15 @@ pub fn finish_set(
                 return Ok(());
             }
             _ => {
-                return Err(VmError::TypeError(
+                return Err(VmError::TypeError(Box::new(
                     "attempt to index a non-table value".into(),
-                ));
+                )));
             }
         }
     }
-    Err(VmError::RuntimeError(
+    Err(VmError::RuntimeError(Box::new(
         "'__newindex' chain too long; possible loop".into(),
-    ))
+    )))
 }
 
 // ============================================================================
@@ -998,9 +998,9 @@ pub fn for_limit(init: i64, limit_val: &TValue, step: i64) -> Result<(i64, bool)
     let flim = match to_number_ns(limit_val) {
         Some(n) => n,
         None => {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "bad 'for' limit (number expected, got value)".into(),
-            ))
+            )))
         }
     };
 
@@ -1050,7 +1050,7 @@ pub fn for_prep(stack: &mut Vec<TValue>, ra: usize) -> Result<bool, VmError> {
     match (&init, &step) {
         (TValue::Integer(init_i), TValue::Integer(step_i)) => {
             if *step_i == 0 {
-                return Err(VmError::RuntimeError("'for' step is zero".into()));
+                return Err(VmError::RuntimeError(Box::new(String::from("'for' step is zero"))));
             }
             let (limit_i, skip) = for_limit(*init_i, &limit, *step_i)?;
             if skip {
@@ -1076,13 +1076,13 @@ pub fn for_prep(stack: &mut Vec<TValue>, ra: usize) -> Result<bool, VmError> {
         }
         _ => {
             let init_f = to_number(&init)
-                .ok_or_else(|| VmError::RuntimeError("bad 'for' initial value".into()))?;
+                .ok_or_else(|| VmError::RuntimeError(Box::new(String::from("bad 'for' initial value"))))?;
             let limit_f =
-                to_number(&limit).ok_or_else(|| VmError::RuntimeError("bad 'for' limit".into()))?;
+                to_number(&limit).ok_or_else(|| VmError::RuntimeError(Box::new(String::from("bad 'for' limit"))))?;
             let step_f =
-                to_number(&step).ok_or_else(|| VmError::RuntimeError("bad 'for' step".into()))?;
+                to_number(&step).ok_or_else(|| VmError::RuntimeError(Box::new(String::from("bad 'for' step"))))?;
             if step_f == 0.0 {
-                return Err(VmError::RuntimeError("'for' step is zero".into()));
+                return Err(VmError::RuntimeError(Box::new(String::from("'for' step is zero"))));
             }
             let skip = if step_f > 0.0 {
                 limit_f < init_f

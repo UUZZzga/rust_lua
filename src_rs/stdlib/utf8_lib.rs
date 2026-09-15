@@ -197,10 +197,10 @@ fn utf8_encode(code: u32) -> Vec<u8> {
 fn get_str_bytes(state: &LuaState, a: usize, idx: usize) -> Result<Vec<u8>, VmError> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.stack.len() {
-        return Err(VmError::RuntimeError(format!(
+        return Err(VmError::RuntimeError(Box::new(format!(
             "bad argument #{} (string expected, got no value)",
             idx + 1
-        )));
+        ))));
     }
     match &state.stack[stack_idx] {
         TValue::Str(s) => Ok(s.as_str().as_bytes().to_vec()),
@@ -216,11 +216,11 @@ fn get_str_bytes(state: &LuaState, a: usize, idx: usize) -> Result<Vec<u8>, VmEr
             }
         }
         TValue::Float(f) => Ok(crate::float_utils::f64_to_string(*f).into_bytes()),
-        _ => Err(VmError::RuntimeError(format!(
+        _ => Err(VmError::RuntimeError(Box::new(format!(
             "bad argument #{} (string expected, got {})",
             idx + 1,
             state.stack[stack_idx].ty()
-        ))),
+        )))),
     }
 }
 
@@ -257,28 +257,28 @@ fn get_required_int_arg(
 ) -> Result<i64, VmError> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.stack.len() {
-        return Err(VmError::RuntimeError(format!(
+        return Err(VmError::RuntimeError(Box::new(format!(
             "bad argument #{} to '{}' (number expected, got no value)",
             idx + 1,
             fname
-        )));
+        ))));
     }
     match &state.stack[stack_idx] {
         TValue::Integer(n) => Ok(*n),
         TValue::Float(f) => Ok(*f as i64),
         TValue::Str(s) => s.as_str().parse::<i64>().map_err(|_| {
-            VmError::RuntimeError(format!(
+            VmError::RuntimeError(Box::new(format!(
                 "bad argument #{} to '{}' (number expected, got string)",
                 idx + 1,
                 fname
-            ))
+            )))
         }),
-        _ => Err(VmError::RuntimeError(format!(
+        _ => Err(VmError::RuntimeError(Box::new(format!(
             "bad argument #{} to '{}' (number expected, got {})",
             idx + 1,
             fname,
             state.stack[stack_idx].ty()
-        ))),
+        )))),
     }
 }
 
@@ -494,7 +494,7 @@ fn call_offset(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
             push_results(state, a, nresults, vec![TValue::Nil(NilKind::Strict)]);
             Ok(())
         }
-        Err(msg) => Err(VmError::RuntimeError(msg)),
+        Err(msg) => Err(VmError::RuntimeError(Box::new(msg))),
     }
 }
 
@@ -527,7 +527,7 @@ fn call_codepoint(
             push_results(state, a, nresults, results);
             Ok(())
         }
-        Err(msg) => Err(VmError::RuntimeError(msg)),
+        Err(msg) => Err(VmError::RuntimeError(Box::new(msg))),
     }
 }
 
@@ -545,7 +545,7 @@ fn call_char(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
             push_results(state, a, nresults, vec![result]);
             Ok(())
         }
-        Err(msg) => Err(VmError::RuntimeError(msg)),
+        Err(msg) => Err(VmError::RuntimeError(Box::new(msg))),
     }
 }
 
@@ -570,15 +570,15 @@ fn call_len(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Resu
     // C: --posj < len  (posj 先转 0-based)
     let posi_rel = u_posrelat(posi, len);
     if !(1 <= posi_rel && posi_rel - 1 <= len as i64) {
-        return Err(VmError::RuntimeError(
+        return Err(VmError::RuntimeError(Box::new(
             "initial position out of bounds".to_string(),
-        ));
+        )));
     }
     let posj_rel = u_posrelat(posj, len);
     if !(posj_rel - 1 < len as i64) {
-        return Err(VmError::RuntimeError(
+        return Err(VmError::RuntimeError(Box::new(
             "final position out of bounds".to_string(),
-        ));
+        )));
     }
 
     // 转为 0-based (对应 C 的 --posi, --posj)
@@ -622,7 +622,7 @@ fn call_codes(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
 
     // 检查字符串首字节不是续字节
     if !s.is_empty() && iscont(s[0]) {
-        return Err(VmError::RuntimeError(MSG_INVALID.to_string()));
+        return Err(VmError::RuntimeError(Box::new(MSG_INVALID.to_string())));
     }
 
     // 返回 BuiltinFn 迭代器（strict 或 lax）
@@ -681,18 +681,18 @@ fn call_iter(
     let s_bytes: Vec<u8> = match &s_val {
         TValue::Str(s) => s.as_str().as_bytes().to_vec(),
         _ => {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "bad argument #1 to 'iter' (string expected)".to_string(),
-            ))
+            )))
         }
     };
     let n: i64 = match &n_val {
         TValue::Integer(n) => *n,
         TValue::Float(f) => *f as i64,
         _ => {
-            return Err(VmError::RuntimeError(
+            return Err(VmError::RuntimeError(Box::new(
                 "bad argument #2 to 'iter' (number expected)".to_string(),
-            ))
+            )))
         }
     };
 
@@ -723,7 +723,7 @@ fn call_iter(
             // 例如 "in\x80valid": 解码 'n' 后,下一个字节是 \x80 (续字节),应报错
             let next_pos = pos + consumed;
             if next_pos < len && iscont(s_bytes[next_pos]) {
-                return Err(VmError::RuntimeError(MSG_INVALID.to_string()));
+                return Err(VmError::RuntimeError(Box::new(MSG_INVALID.to_string())));
             }
             push_results(
                 state,
@@ -736,7 +736,7 @@ fn call_iter(
             );
             Ok(())
         }
-        None => Err(VmError::RuntimeError(MSG_INVALID.to_string())),
+        None => Err(VmError::RuntimeError(Box::new(MSG_INVALID.to_string()))),
     }
 }
 
