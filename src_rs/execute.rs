@@ -3293,7 +3293,17 @@ impl VmExecutor {
         };
         match spec {
             Some(SpecValue::Builtin(bf)) => {
-                Self::write_stack(state, a, TValue::BuiltinFn(bf));
+                // 覆写跳过: 循环内同槽每迭代落同 BuiltinFn (全局 pure 函数直取)
+                // — func 指针位级相等即同对象, 免 write_stack。跳过时仍须执行
+                // write_stack 的 top 抬升语义 (top 可能曾被截到槽 a 之下, 漏抬
+                // 会丢 nargs/GC 扫描, #130 类)。
+                if matches!(state.stack.get(a), Some(TValue::BuiltinFn(of)) if of.func == bf.func) {
+                    if a >= state.top {
+                        state.top = a + 1;
+                    }
+                } else {
+                    Self::write_stack(state, a, TValue::BuiltinFn(bf));
+                }
                 // 窄 superblock: `sin(i)` 直取字段后接 MOVE+CALL 连缀 → 在本
                 // handler 内完成参数装载与纯调用, 省 2 次 dispatch。mv_idx =
                 // GETFIELD 位 (cur+1); 命中返回 2 → 跳过 MOVE+CALL。
@@ -3319,13 +3329,13 @@ impl VmExecutor {
                     let mut skip = 1usize; // GETFIELD
                     match v {
                         TValue::BuiltinFn(nf) => {
-                            let mut overwrite = true;
-                            if let Some(TValue::BuiltinFn(of)) = state.stack.get(a) {
-                                if of.func == nf.func {
-                                    overwrite = false;
+                            if matches!(state.stack.get(a), Some(TValue::BuiltinFn(of)) if of.func == nf.func)
+                            {
+                                // 跳过覆写仍需 top 抬升语义 (write_stack 副作用)
+                                if a >= state.top {
+                                    state.top = a + 1;
                                 }
-                            }
-                            if overwrite {
+                            } else {
                                 // write_stack 自带旧值 trivial/Copy 检查: 旧槽若
                                 // 是其他指令刚写的 Table 等带 Rc 值, 正常走 drop,
                                 // 不能裸 ptr::write (泄漏)。
@@ -3537,7 +3547,13 @@ impl VmExecutor {
         };
         match spec {
             Some(SpecValue::Builtin(bf)) => {
-                Self::write_stack(state, a, TValue::BuiltinFn(bf));
+                if matches!(state.stack.get(a), Some(TValue::BuiltinFn(of)) if of.func == bf.func) {
+                    if a >= state.top {
+                        state.top = a + 1;
+                    }
+                } else {
+                    Self::write_stack(state, a, TValue::BuiltinFn(bf));
+                }
                 // 窄 superblock: `f(i)` 全局直取 (GETTABUP _ENV f + 此处融合) 或
                 // 任意表字段 pure 函数后接 MOVE+CALL → 省 2 次 dispatch。
                 let n = Self::fuse_pure_call(state, a, bf, cur + 1)?;
