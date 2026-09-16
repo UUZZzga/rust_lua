@@ -79,6 +79,15 @@ done
 for f in bench/bench_*.lua; do
     printf '' | "$LUA" bench/harness.lua "$SCALE" "$f" >/dev/null 2>&1 || true
 done
+# 目标负载加权 (PGO_FOCUS="bench/bench_arith_float.lua:full bench/...:quick"):
+# 对特定 bench 以指定规模追加训练采样, 把内联/布局决策向热路径倾斜。
+# 与 #105 的全量 full 训练不同 (那劣化表插入 8.6% 已回退): 只加权被优化
+# 的目标, 其余保持 quick 覆盖; 副作用由 CI 交错 12 项面板裁判。
+for spec in ${PGO_FOCUS:-}; do
+    file=${spec%:*}; scale=${spec##*:}
+    [ -f "$file" ] || continue
+    printf '' | "$LUA" bench/harness.lua "$scale" "$file" >/dev/null 2>&1 || true
+done
 
 PROFRAW_COUNT=$(find "$PGO_DIR" -name '*.profraw' 2>/dev/null | wc -l | tr -d ' ')
 if [ "$PROFRAW_COUNT" = "0" ]; then
