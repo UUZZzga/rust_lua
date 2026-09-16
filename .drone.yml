@@ -78,7 +78,7 @@ steps:
     RUST_BACKTRACE: 1
     # PGO 训练加权: 浮点 bench full 规模追加采样 (wave17, 目标负载特化;
     # 12 项面板监控副作用)。清空 = 恢复纯通用画像。
-    PGO_FOCUS: "bench/bench_arith_float.lua:full"
+    PGO_FOCUS: "bench/bench_arith_float.lua:full bench/bench_string_concat.lua:full bench/bench_metamethod.lua:full"
   commands:
   # 性能基准: C vs Rust。构建决策 (PGO + panic=abort/lua_longjmp 平台默认)
   # 全部内聚在 tools/build_release_opt.sh, 本行是无内联逻辑的单条 bash 调用 —
