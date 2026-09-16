@@ -5010,18 +5010,10 @@ impl VmExecutor {
         {
             // 参数装载: 复用 op_move (恒 Ok; 越界走其 grow 分支, 与原指令逐位相同)
             Self::op_move(state, i0)?;
-            // 对应 op_call 的 `if (b != 0) top = ra + b` (B=2 → a2+2)
             state.top = a2 + 2;
-            // 与主循环 CALL 臂同形: 先 sync state.pc = CALL 索引 (错误行号与
-            // CallInfoEntry.saved_pc 消费点), 成功路径无人消费 state.pc。
-            state.pc = mv_idx + 1;
+            state.pc = mv_idx + 1; // CALL 索引 (C savepc 同形)
             Self::call_pure_builtin(state, a2, 2, 2, bf)?;
-            let mut ret = 2usize;
-            // 尾部算术: CALL 结果常被紧随 ADD/SUB/MUL 消费 (cos 结果入 MUL)
-            if Self::fuse_tail_arith(state, mv_idx + 2) {
-                ret += 2;
-            }
-            return Ok(ret);
+            return Ok(2);
         }
         // 形态 B: MODK + MMBINK + CALL (双 Integer 参、除数非零才融)
         if opcodes::get_opcode(i0) == OpCode::MODK
@@ -5050,54 +5042,10 @@ impl VmExecutor {
                 state.top = a2 + 2;
                 state.pc = mv_idx + 2; // CALL 索引
                 Self::call_pure_builtin(state, a2, 2, 2, bf)?;
-                let mut ret = 3usize;
-                if Self::fuse_tail_arith(state, mv_idx + 3) {
-                    ret += 2; // sqrt 结果入 ADD (bench 的 s = s + .. + sqrt)
-                }
-                return Ok(ret);
+                return Ok(3);
             }
         }
         Ok(0)
-    }
-
-    /// CALL 后的尾部算术融合: `ADD/SUB/MUL t ...; MMBIN` 双操作数均 Float 时
-    /// 就地执行并让 caller 跳过指令+占位符 (省 2 dispatch)。Float⊕Float 与
-    /// arith_bin! 同语义且不可能出错 (IEEE), 整数/元表/其他一律 false 落回
-    /// 原逐条路径。hook 前提由调用方 hook_mask==0 gate 覆盖 (#147)。
-    /// 与 ADDK 链式融合 (arith_chain, 已证伪) 的关键区别: 本窥探只发生在
-    /// fused pure call 之后 (call-heavy 代码每调用一次, bench 命中率 2/3),
-    /// 而非每条算术指令之后 (低命中率, peek 成本被纯算术循环全额支付)。
-    #[cfg_attr(not(size_optimized), inline(always))]
-    fn fuse_tail_arith(state: &mut LuaState, t: usize) -> bool {
-        let code = &*state.code;
-        if t + 1 >= code.len() {
-            return false;
-        }
-        let ni = code[t];
-        let bit = match opcodes::get_opcode(ni) {
-            OpCode::ADD => 1u8,
-            OpCode::SUB => 2,
-            OpCode::MUL => 3,
-            _ => return false,
-        };
-        // 编译器对每条 ADD/SUB/MUL 必发紧随的 MMBIN 占位; 校验防形态意外
-        if opcodes::get_opcode(code[t + 1]) != OpCode::MMBIN {
-            return false;
-        }
-        let nb = state.base + opcodes::getarg_b(ni) as usize;
-        let nc = state.base + opcodes::getarg_c(ni) as usize;
-        let (x1, x2) = match (state.stack.get(nb), state.stack.get(nc)) {
-            (Some(TValue::Float(f1)), Some(TValue::Float(f2))) => (*f1, *f2),
-            _ => return false,
-        };
-        let r = match bit {
-            1 => x1 + x2,
-            2 => x1 - x2,
-            _ => x1 * x2,
-        };
-        let na = state.base + opcodes::getarg_a(ni) as usize;
-        Self::write_stack(state, na, TValue::Float(r));
-        true
     }
 
     fn try_fuse_getfield(
