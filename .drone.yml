@@ -76,9 +76,11 @@ steps:
     CARGO_HOME: /drone/src/.cargo
     CARGO_TERM_COLOR: always
     RUST_BACKTRACE: 1
-    # PGO 训练加权: 浮点 bench full 规模追加采样 (wave17, 目标负载特化;
-    # 12 项面板监控副作用)。清空 = 恢复纯通用画像。
-    PGO_FOCUS: "bench/bench_arith_float.lua:full bench/bench_string_concat.lua:full bench/bench_metamethod.lua:full"
+    # PGO 训练加权钩子 (build_pgo.sh PGO_FOCUS) 实验后关闭 — inline 预算零和:
+    # float-only 加权 = 浮点 -5% (0.9728/0.9713 双样本) 但元方法 +8% 带外
+    # (CI #131/#132); 三项加权 (float+concat+meta) = 浮点增益回带 1.0193 +
+    # 表插入 +28% 回归 (CI #133)。保持通用画像; 重试在下方加
+    # PGO_FOCUS: "bench/bench_X.lua:full ..." 即可 (钩子留在脚本)。
   commands:
   # 性能基准: C vs Rust。构建决策 (PGO + panic=abort/lua_longjmp 平台默认)
   # 全部内聚在 tools/build_release_opt.sh, 本行是无内联逻辑的单条 bash 调用 —
