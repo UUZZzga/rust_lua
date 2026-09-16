@@ -20,7 +20,7 @@
 | `deps/` | 第三方依赖库（lua-cjson / luasocket / lsqlite3 / luarocks / sol2），仅 `Makefile` / `fetch.sh` / `setup.sh` / `test.sh` / `sol2_smoke.cpp` 入库 |
 | `doc/` | Lua 官方文档 |
 | `bench/` | CI 性能基准目录（`harness.lua` 公共驱动 + `bench_*.lua` 按测试项拆分，每项一个文件） |
-| `tools/` | 工具脚本（`verify.sh` / `check_memory.sh` / `gc_bench_run.sh` / `ci_bench.sh`） |
+| `tools/` | 工具脚本（`verify.sh` / `check_memory.sh` / `gc_bench_run.sh` / `ci_bench.sh` / `build_pgo.sh` / `build_release_opt.sh` / `ci_bench_win.ps1`） |
 | `logs/` | 测试与构建日志输出目录（由 `verify.sh` 等自动创建，已 gitignore） |
 
 ## 构建系统
@@ -134,7 +134,7 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
 
 `.github/workflows/ci.yml` 仅手动触发（workflow_dispatch），依次执行：构建 Rust lua → 构建 C lua → `deps/setup.sh` → `deps/test.sh` → `tools/verify.sh` → `tools/gc_bench_run.sh --diff` → `tools/ci_bench.sh --skip-build full`。失败时上传 `logs/` 与 bench 输出作为 artifact。
 
-`.drone.yml` 定义 Drone CI 双流水线：`rust-linux`（docker，镜像 `lua-ci:latest`，见 `ci/Dockerfile`）执行 `cargo build/test` → CMP 编译器比对测试（`cargo test --features cmp_c -- compiler::cmp_tests::compiler_compare_tests`）→ deps 依赖库测试（构建 C lua 后运行 `deps/setup.sh` + `deps/test.sh`，含 skynet e2e）→ bench 性能基准（`cargo build --release` 恢复默认 features 后运行 `bash tools/ci_bench.sh --skip-build full`）；`rust-windows`（exec）执行 `cargo build/test` → bench 性能基准（经 `tools/ci_bench_win.ps1` 包装：初始化 VS DevShell 提供 cmake，剥离 VS 环境变量后调 Git Bash 运行 `tools/ci_bench.sh full`，脚本内自建 C lua 与 Rust 二进制）。镜像需在 Drone 宿主机预构建（`docker build -t lua-ci:latest -f ci/Dockerfile .`），修改 `ci/Dockerfile` 后需重建镜像。
+`.drone.yml` 定义 Drone CI 双流水线：`rust-linux`（docker，镜像 `lua-ci:latest`，见 `ci/Dockerfile`）执行 `cargo build/test` → CMP 编译器比对测试（`cargo test --features cmp_c -- compiler::cmp_tests::compiler_compare_tests`）→ deps 依赖库测试（构建 C lua 后运行 `deps/setup.sh` + `deps/test.sh`，含 skynet e2e）→ bench 性能基准（`bash tools/build_release_opt.sh` 构建 bench 二进制后 `bash tools/ci_bench.sh --skip-build full`）；`rust-windows`（exec）执行 `cargo build/test` → bench 性能基准（经 `tools/ci_bench_win.ps1` 包装：初始化 VS DevShell 提供 cmake，剥离 VS 环境变量后调 Git Bash 运行 `tools/ci_bench.sh full`，脚本内自建 C lua 与 Rust 二进制）。bench 构建策略全部内聚在 `tools/build_release_opt.sh`：默认 PGO（`build_pgo.sh` 三步：instrumented → tests_lua+bench quick 通用负载训练 → profile-use 重建）+ `-Cpanic=abort` + `lua_longjmp` feature（C 模块错误边界用 setjmp/longjmp 替代 catch_unwind）；`BENCH_PGO=0` / `BENCH_ABORT=0` 显式退档；任一步失败自动回退普通构建（`PGO_FALLBACK` 日志标记）。drone 命令行必须保持单条无内联逻辑（Windows exec runner 对全部 pipeline commands 做启动期 bash 解析，内联 `VAR=x` 前缀会泄漏成 cargo 参数）。ci_bench.sh 采用 C/Rust **交错采样**（每轮先 C 后 Rust，指标级取全部轮次最小值；linux full 5 轮、windows/quick 3 轮），比值噪声 ~±1-2%——低于 ~1.5% 的改动不可判定，判定性能改动必须看 CI 比值多轮均值而非本地 plain build（本地收益在 PGO 下常归零甚至反号）。`save-cache` 步骤 `failure: ignore`（宿主缓存盘写满不连累流水线）。镜像需在 Drone 宿主机预构建（`docker build -t lua-ci:latest -f ci/Dockerfile .`），修改 `ci/Dockerfile` 后需重建镜像。
 
 ## 关键编码约定
 
@@ -153,6 +153,8 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
 - **package.config**：必须为 `"/\n;\n?\n!\n-\n"`（DIRSEP / PATH_SEP / PATH_MARK / EXEC_DIR / IGMARK 以换行分隔）。
 - **searchpath / findfile**：不能跳过空模板；`findfile` 应返回列出所有尝试路径的完整错误消息（`no file 'X'\n\tno file 'Y'`）。
 - **concat_gc_interval**：保持 4096，设置为 100 会因 GC 触发过于频繁导致 `constructs.lua` 性能下降。
+- **窄 superblock 融合前提**：`fuse_pure_call`（MOVE+CALL / MODK+MMBINK+CALL 并入 GETTABUP/GETFIELD 处理器）与 GETFIELD 融合共享 gate：`hook_mask == 0`（line/count hook 要求逐指令观察，#147）、函数 `is_pure`、CALL 固定 B=2/C=2 非 k；出错路径先 `state.pc = CALL 索引` 再传播（traceback 行号 = 原 CALL 行）。前向 peek 类融合只在命中率 ≥50% 的形态划算（arith_chain 低命中被证伪；call 后尾部算术 form-C 被 PGO 吃掉，Linux +0.5% 已 revert）。
+- **TableData.probe_cache 禁令**：`find_str_ref`/`data_ro` 读路径上不得引入 Cell 内部状态写回（Linux OOO 隐藏探测延迟无收益，Windows MSVC+PGO 实测 +35% 回归，#118 证伪）。
 
 ## .gitignore 关键排除项
 
