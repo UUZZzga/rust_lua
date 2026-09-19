@@ -3,7 +3,7 @@ use crate::execute::{VmError, VmExecutor, VmResult};
 use crate::gc::{GCObjectHeader, GCState};
 use crate::objects::FxBuildHasher;
 use crate::objects::{
-    BuiltinFn, BuiltinFnPtr, CallFrame, Instruction, LClosure, LuaThread, LuaType, NilKind, Proto,
+    BuiltinFn, BuiltinFnPtr, Instruction, LClosure, LuaThread, LuaType, NilKind, Proto,
     TValue, TableData, ThreadContext, ThreadStatus, UpVal, UpValRef, UpvalDesc,
 };
 use crate::strings::{LuaString, StringTable};
@@ -251,7 +251,7 @@ pub struct PcallProtection {
     /// yield 穿越 pcall 时保存的外层 call_stack 帧 — 由 finish_pcall_return 恢复
     /// 这些帧持有 Rc 引用（code/constants/protos 等），丢弃会导致悬空指针。
     /// 不合并到 call_stack: 否则 resume 后内层帧 pop 完会错误 pop 外层帧，
-    /// 导致 state.base 跳过 pcall 的 func_idx+1。
+    /// 导致 state.exec.base 跳过 pcall 的 func_idx+1。
     pub saved_call_stack: Vec<crate::objects::CallFrame>,
 }
 
@@ -278,33 +278,25 @@ pub struct CallInfo {
 }
 
 // ============================================================================
-// LuaState — 合并 VmState + LuaState 的所有字段
+// ExecState — 单线程/单协程的 VM 执行上下文
 // ============================================================================
+//
+// 对应 C Lua 中每个 lua_State 独立的执行状态 (stack / ci 链 / openupval /
+// hook 等)。协程切换 = 把 LuaState.exec 与 ThreadContext.exec 两个 Box 指针
+// 整体交换 (O(1)), 替代原先的 ~30 字段逐个 save/restore (CI coroutine 4.57x
+// 的开关开销主因)。非交换的字段 (registry/globals/gc 等) 留在 LuaState 共享。
 
-pub struct LuaState {
-    // 执行上下文（原 VmState）
+#[derive(Debug)]
+pub struct ExecState {
     // Rc<Vec> 避免 op_call 中深拷贝 proto 字段（perf: 省 ~5.3% malloc+memmove）
     pub constants: Rc<Vec<TValue>>,
-    /// 纯 BuiltinFn 函数指针集合（math.sin 等） — op_call/op_tailcall 据此走
-    /// 无 CallInfoEntry 快速路径。以指针值为键（地址语义），FxHash 降低
-    /// contains 开销到 ~5ns/次。Rc 共享：协程线程与主状态共享同一集合。
-    /// 为什么不用 BuiltinFn.name 指针位 0 当标志: CStr 静态字面量仅
-    /// 1 字节对齐, 指针奇偶不可控 (Linux 链接器实测为奇数导致 name 损坏)。
     pub code: Rc<Vec<Instruction>>,
     pub upval_descs: Rc<Vec<UpvalDesc>>,
     /// 当前执行函数的子原型列表 — Rc 共享，op_call 切换 proto 时 O(1) 引用计数
-    /// （替代原 `state.protos = proto.protos.clone()` 的 O(n) Vec 分配）
     pub protos: Rc<Vec<Rc<Proto>>>,
     pub top: usize,
     pub base: usize,
     pub pc: usize,
-    /// 回边中断检查摊销计数器 — 仅回跳指令 (JMP/FORLOOP/条件跳回) 递增,
-    /// 64 次边界时原子加载 INTERRUPTED。放 state 而非循环局部: 借用安全
-    /// (Cell 通过 &LuaState 可写), 跳转 handler 内联增量免 &mut 引用穿透
-    /// (CI #90 实证引用参数把增量编译成每次回跳的内存往返, 整数 bench +27%)。
-    /// 值不参与语义, 重置/不重置均只影响中断延迟最多 63 次回跳。
-    pub tick: std::cell::Cell<u64>,
-    pub trap: bool,
     pub num_params: u8,
     pub is_vararg: bool,
     /// 当前执行函数原型的 flag（PF_VAHID / PF_VATAB / PF_FIXED）
@@ -317,11 +309,94 @@ pub struct LuaState {
     pub open_upvals: Vec<UpValRef>,
     pub open_upval: Option<usize>,
     pub tbc_list: Option<usize>,
+    pub call_stack: Vec<crate::objects::CallFrame>,
+    pub stack: Vec<TValue>,
+    pub hook_old_pc: i32,
+    /// debug hook 函数 — 对应 C 的 L->hook
+    pub hook_func: Option<TValue>,
+    /// debug hook 掩码 — 对应 C 的 L->hookmask
+    pub hook_mask: i32,
+    /// debug hook count — 对应 C 的 L->basehookcount
+    pub hook_count: i32,
+    /// 当前 hook count (每条指令递减) — 对应 C 的 L->hookcount
+    pub current_hook_count: i32,
+    /// 是否允许调用 hook — 对应 C 的 L->allowhook
+    pub allowhook: bool,
+    /// 当前活动协程的上下文 — None 表示主线程执行中
+    pub current_thread: Option<Rc<RefCell<ThreadContext>>>,
+    /// 调用栈 — 保存 caller 的 VM 执行上下文（原 execute_loop 局部变量，提升为字段以支持协程挂起）
+    pub call_info: Vec<CallInfoEntry>,
+    /// pcall 保护栈 — 对应 C Lua 的 CIST_YPCALL CallInfo 链
+    pub pcall_protection_stack: Vec<PcallProtection>,
+    /// close continuation 的 pending error — 对应 C Lua 的 CIST_RECST 保存的错误状态
+    pub close_error_status: Option<TValue>,
+    /// coroutine.close() 关闭自身时设置 — 对应 C Lua 的 lua_closethread(co, L) 场景
+    pub force_noyield_close: bool,
+    /// C 函数调用嵌套计数（对应 C 的 L->nCcalls），用于检测 C 栈溢出
+    pub n_ccalls: u32,
+    /// 非可 yield 调用计数（对应 C 的 nCcalls 高 16 位 / incnny）
+    pub n_ny_calls: u32,
+    /// yield 调用的 nresults（恢复时用于调整 resume 参数数量）
+    /// 仅在 started=true 且上次是 yield 挂起时有意义
+    pub saved_yield_nresults: i32,
+}
+
+impl Default for ExecState {
+    fn default() -> Self {
+        ExecState {
+            constants: Rc::new(Vec::new()),
+            code: Rc::new(Vec::new()),
+            upval_descs: Rc::new(Vec::new()),
+            protos: Rc::new(Vec::new()),
+            top: 0,
+            base: 0,
+            pc: 0,
+            num_params: 0,
+            is_vararg: false,
+            proto_flag: 0,
+            nextraargs: 0,
+            closure_upvals: Rc::new(RefCell::new(Vec::new())),
+            open_upvals: Vec::new(),
+            open_upval: None,
+            tbc_list: None,
+            call_stack: Vec::new(),
+            stack: Vec::new(),
+            hook_old_pc: 0,
+            hook_func: None,
+            hook_mask: 0,
+            hook_count: 0,
+            current_hook_count: 0,
+            allowhook: true,
+            current_thread: None,
+            call_info: Vec::new(),
+            pcall_protection_stack: Vec::new(),
+            close_error_status: None,
+            force_noyield_close: false,
+            n_ccalls: 0,
+            n_ny_calls: 0,
+            saved_yield_nresults: 0,
+        }
+    }
+}
+
+// ============================================================================
+// LuaState — 共享(跨协程)字段 + 执行上下文 ExecState
+// ============================================================================
+
+pub struct LuaState {
+    // === 执行上下文（协程切换时与 ThreadContext.exec 整体交换, O(1)）===
+    pub exec: Box<ExecState>,
+    /// 回边中断检查摊销计数器 — 仅回跳指令 (JMP/FORLOOP/条件跳回) 递增,
+    /// 64 次边界时原子加载 INTERRUPTED。放 state 而非循环局部: 借用安全
+    /// (Cell 通过 &LuaState 可写), 跳转 handler 内联增量免 &mut 引用穿透
+    /// (CI #90 实证引用参数把增量编译成每次回跳的内存往返, 整数 bench +27%)。
+    /// 值不参与语义, 重置/不重置均只影响中断延迟最多 63 次回跳。
+    pub tick: std::cell::Cell<u64>,
+    pub trap: bool,
     pub twups_linked: bool,
     pub is_in_twups: bool,
 
     // 公用字段
-    pub stack: Vec<TValue>,
     pub gc: Rc<GCState>,
 
     // 高层 API 字段（原 LuaState）
@@ -341,12 +416,6 @@ pub struct LuaState {
     // C API 的正索引相对于此位置；Lua 代码路径不使用此字段。
     // 0 表示栈底（主线程初始状态）。
     pub api_func_base: usize,
-    // C 函数调用嵌套计数（对应 C 的 L->nCcalls），用于检测 C 栈溢出
-    pub n_ccalls: u32,
-    // 非可 yield 调用计数（对应 C 的 nCcalls 高 16 位 / incnny）
-    // 常规 C 函数调用递增此计数，pcall/xpcall 例外（CIST_YPCALL）
-    // coroutine.isyieldable() 检查此计数是否为 0
-    pub n_ny_calls: u32,
     pub dmt: DefaultMetatables,
     pub stdout: Box<dyn Write>,
     /// io.output 设置的当前输出流 — None 表示使用 stdout
@@ -367,9 +436,6 @@ pub struct LuaState {
     pub io_output_handle: Option<u32>,
     pub global_state: Rc<GlobalState>,
     pub ci: Option<Box<CallInfo>>,
-    /// 调用栈信息，用于构建堆栈回溯 — 对应 C 的 CallInfo 链表
-    /// 每个元素是 (source, line, function_name)
-    pub call_info: Vec<CallInfoEntry>,
     /// 最后一次错误的堆栈回溯字符串
     pub last_traceback: String,
     /// 最后一次错误的格式化消息（含 source:line 前缀）
@@ -389,38 +455,16 @@ pub struct LuaState {
     pub last_c_function: Option<String>,
     /// 数学库随机数生成器状态 — 对应 C 的 RanState (math.random/randomseed)
     pub math_random_state: Option<Box<crate::stdlib::math_lib::RandState>>,
-    /// debug hook 函数 — 对应 C 的 L->hook
-    pub hook_func: Option<TValue>,
-    /// debug hook 掩码 — 对应 C 的 L->hookmask
-    pub hook_mask: i32,
-    /// debug hook count — 对应 C 的 L->basehookcount
-    pub hook_count: i32,
-    /// 当前 hook count (每条指令递减) — 对应 C 的 L->hookcount
-    pub current_hook_count: i32,
-    /// 上次 line hook 检查的 pc — 对应 C 的 L->oldpc（指令索引，不是行号）
-    pub hook_old_pc: i32,
-    /// 是否允许调用 hook — 对应 C 的 L->allowhook
-    /// 在 hook 执行期间设为 false，防止递归调用
-    pub allowhook: bool,
     /// warning 系统是否开启 — 对应 C 的 G(L)->warnf == warnfon
     pub warn_on: bool,
     /// warning 是否有未完成的消息（tocont=true 后等待下一段）— 对应 C 的 warnfcont 状态
     pub warn_pending: bool,
     /// 主线程对象（用于 coroutine.running() 在主线程返回 thread）
     pub main_thread: LuaThread,
-    /// 调用栈 — 保存 caller 的 VM 执行上下文（原 execute_loop 局部变量，提升为字段以支持协程挂起）
-    pub call_stack: Vec<CallFrame>,
-    /// 当前活动协程的上下文 — None 表示主线程执行中
-    pub current_thread: Option<Rc<RefCell<ThreadContext>>>,
     /// call_wrap_fn 执行期间，调用者栈（含活跃的 wrap RustClosure 引用）暂存于此，
     /// 让 GC 能看到内层协程引用，避免误判为不可达。
     /// 嵌套 wrap 调用时按栈顺序 push/pop。
     pub caller_gc_stacks: Vec<Vec<TValue>>,
-    /// pcall 保护栈 — 对应 C Lua 的 CIST_YPCALL CallInfo 链
-    /// 当 pcall 保护可 yield 的 Lua 函数时，push 保护状态。
-    /// yield 穿过 pcall 后，保护状态保留。
-    /// execute_loop 收到 error/return 时检查此栈，处理 pcall 的返回/error。
-    pub pcall_protection_stack: Vec<PcallProtection>,
     /// 弱引用表列表 — setmetatable 设置 __mode 时注册，collectgarbage 时清理
     /// 使用 Weak 引用避免阻止表本身的回收
     pub weak_tables: Vec<std::rc::Weak<std::cell::RefCell<TableData>>>,
@@ -462,18 +506,6 @@ pub struct LuaState {
     /// 到此字段。state.pcall 保存 call_info 快照时将此帧追加到快照末尾，让 xpcall 的错误
     /// 处理函数（如 debug.traceback）能看到 __close 帧。
     pub last_close_frame: Option<CallInfoEntry>,
-    /// close continuation 的 pending error — 对应 C Lua 的 CIST_RECST 保存的错误状态。
-    /// 当 __close 出错时，execute_loop 错误处理分支将 error 保存到此字段，然后调用
-    /// func::close 继续关闭剩余 TBC 变量。func::close 处理完毕后检查此字段，
-    /// 若有 pending error 则传播给上层 pcall。
-    pub close_error_status: Option<TValue>,
-    /// coroutine.close() 关闭自身时设置 — 对应 C Lua 的 lua_closethread(co, L) 中
-    /// co == L 的场景。C Lua 中 coroutine.close() 会立即调用 luaF_close 关闭所有 TBC 变量，
-    /// 并通过 luaD_throwbaselevel 抛到协程 base level。我们的实现未完整支持此语义，
-    /// 改为设置此标志，让后续 OP_RETURN 的 func::close 使用不可 yield 模式 (yy=0)，
-    /// 使 __close 中的 yield 失败（对应 nny > 0 场景）。
-    /// call_resume 开始时清除。
-    pub force_noyield_close: bool,
     /// GC 标记阶段缓存的 "__mode" 字符串键 — 避免每次 mark_tvalue 都 intern_str
     /// （perf: mark_tvalue 中 __mode 查找占 ~2%）
     pub cached_mode_key: std::cell::RefCell<Option<LuaString>>,
@@ -527,9 +559,9 @@ pub struct CallInfoEntry {
     /// Lua 函数引用（C 函数为 None）
     pub closure: Option<Rc<crate::objects::LClosure>>,
     /// 栈帧基址（对应 C 的 ci->func + 1）
-    /// Lua 函数帧: caller's base (state.base before op_call updates it)
+    /// Lua 函数帧: caller's base (state.exec.base before op_call updates it)
     /// C 函数帧: callee's base (func_idx + 1)
-    /// perf: 用于从 state.stack[base - 1] 延迟计算 caller_proto, 避免 op_call 中 Rc::clone
+    /// perf: 用于从 state.exec.stack[base - 1] 延迟计算 caller_proto, 避免 op_call 中 Rc::clone
     pub base: usize,
     /// 调用时的 PC（用于计算 currentline）
     pub saved_pc: usize,
@@ -573,13 +605,13 @@ pub fn get_closure_from_stack<'a>(
 /// 从 CallInfoEntry 延迟计算 closure 引用 — 避免 op_call 热路径中 Rc::clone
 ///
 /// 优先返回 entry.closure (若已设置, 如 hook/metamethod 路径);
-/// 否则从 state.stack[entry.base - 1] 延迟计算 (op_call 快速路径)
+/// 否则从 state.exec.stack[entry.base - 1] 延迟计算 (op_call 快速路径)
 pub fn get_closure_for_ci<'a>(state: &'a LuaState, ci_idx: usize) -> Option<&'a Rc<LClosure>> {
-    let entry = &state.call_info[ci_idx];
+    let entry = &state.exec.call_info[ci_idx];
     if entry.closure.is_some() {
         return entry.closure.as_ref();
     }
-    get_closure_from_stack(&state.stack, entry)
+    get_closure_from_stack(&state.exec.stack, entry)
 }
 
 /// 从栈切片延迟计算 caller_proto 引用 — 核心逻辑
@@ -604,7 +636,7 @@ pub fn get_caller_proto_from_stack<'a>(
 
 /// 从 CallInfoEntry 延迟计算 caller_proto 引用 — 避免在 op_call 热路径中 Rc::clone
 ///
-/// 对于 Lua 函数帧: caller_proto = state.stack[entry.base - 1].proto (若为 LClosure)
+/// 对于 Lua 函数帧: caller_proto = state.exec.stack[entry.base - 1].proto (若为 LClosure)
 /// 对于 C 函数帧: 返回 None (由 get_caller_proto_for_ci 处理 C 帧的特殊路径)
 /// 对于 base=0 或 stack 越界: 返回 None
 ///
@@ -613,19 +645,19 @@ pub fn get_caller_proto_ref<'a>(
     state: &'a LuaState,
     entry: &CallInfoEntry,
 ) -> Option<&'a Rc<Proto>> {
-    get_caller_proto_from_stack(&state.stack, entry)
+    get_caller_proto_from_stack(&state.exec.stack, entry)
 }
 
 /// 从 call_info 索引延迟计算 caller_proto 引用 (用于 lua_getinfo / traceback)
 ///
-/// 对于 Lua 函数帧: 从 state.stack[entry.base - 1] 获取 (同 get_caller_proto_ref)
+/// 对于 Lua 函数帧: 从 state.exec.stack[entry.base - 1] 获取 (同 get_caller_proto_ref)
 /// 对于 C 函数帧 (无预设置 name, 即 call_c_function 外部 C 函数):
 ///   从前一个 call_info 条目的 closure 获取 (对应原 call_c_function 的计算逻辑)
 /// 对于 C 函数帧 (有预设置 name, 如 BuiltinFn/RustClosure): 返回 None
 ///
 /// perf: 替代 CallInfoEntry.caller_proto 字段, 避免 op_call/call_c_function 中 Rc::clone
 pub fn get_caller_proto_for_ci<'a>(state: &'a LuaState, ci_idx: usize) -> Option<&'a Rc<Proto>> {
-    let entry = &state.call_info[ci_idx];
+    let entry = &state.exec.call_info[ci_idx];
     if !entry.is_c {
         return get_caller_proto_ref(state, entry);
     }
@@ -677,34 +709,49 @@ impl LuaState {
         let tmnames = Rc::new(init_tmnames(&string_table));
 
         LuaState {
-            constants: Rc::new(Vec::new()),
-            code: Rc::new(Vec::new()),
-            upval_descs: Rc::new(Vec::new()),
-            protos: Rc::new(Vec::new()),
-            top,
-            base: 0,
-            pc: 0,
+            exec: Box::new(ExecState {
+                constants: Rc::new(Vec::new()),
+                code: Rc::new(Vec::new()),
+                upval_descs: Rc::new(Vec::new()),
+                protos: Rc::new(Vec::new()),
+                top,
+                base: 0,
+                pc: 0,
+                num_params: 0,
+                is_vararg: false,
+                proto_flag: 0,
+                nextraargs: 0,
+                closure_upvals: Rc::new(RefCell::new(Vec::new())),
+                open_upvals: Vec::new(),
+                open_upval: None,
+                tbc_list: None,
+                call_stack: Vec::with_capacity(32),
+                stack,
+                hook_old_pc: 0,
+                hook_func: None,
+                hook_mask: 0,
+                hook_count: 0,
+                current_hook_count: 0,
+                allowhook: true,
+                current_thread: None,
+                call_info: Vec::new(),
+                pcall_protection_stack: Vec::new(),
+                close_error_status: None,
+                force_noyield_close: false,
+                n_ccalls: 0,
+                n_ny_calls: 0,
+                saved_yield_nresults: 0,
+            }),
             trap: false,
             tick: std::cell::Cell::new(0),
-            num_params: 0,
-            is_vararg: false,
-            proto_flag: 0,
-            nextraargs: 0,
-            closure_upvals: Rc::new(RefCell::new(Vec::new())),
-            open_upvals: Vec::new(),
-            open_upval: None,
-            tbc_list: None,
             twups_linked: false,
             is_in_twups: false,
-            stack,
             gc,
             globals,
             registry,
             string_table,
             tmnames,
             api_func_base: 0,
-            n_ccalls: 0,
-            n_ny_calls: 0,
             dmt: DefaultMetatables::new(),
             stdout: lua_stdout(),
             io_output: None,
@@ -718,7 +765,6 @@ impl LuaState {
             io_output_handle: None,
             global_state: Rc::new(GlobalState { gcstopem: false }),
             ci: None,
-            call_info: Vec::new(),
             last_traceback: String::new(),
             last_error_msg: String::new(),
             last_error_value: None,
@@ -727,12 +773,6 @@ impl LuaState {
             pending_yield: None,
             last_c_function: None,
             math_random_state: None,
-            hook_func: None,
-            hook_mask: 0,
-            hook_count: 0,
-            current_hook_count: 0,
-            hook_old_pc: 0,
-            allowhook: true,
             warn_on: true,
             warn_pending: false,
             main_thread: LuaThread {
@@ -746,10 +786,7 @@ impl LuaState {
                 context: Rc::new(RefCell::new(ThreadContext::default())),
                 c_state: std::cell::Cell::new(std::ptr::null_mut()),
             },
-            call_stack: Vec::with_capacity(32),
-            current_thread: None,
             caller_gc_stacks: Vec::new(),
-            pcall_protection_stack: Vec::new(),
             weak_tables: Vec::new(),
             concat_gc_counter: std::cell::Cell::new(0),
             concat_gc_interval: std::cell::Cell::new(32768),
@@ -762,8 +799,6 @@ impl LuaState {
             pending_return_adjust: None,
             last_error_call_info: None,
             last_close_frame: None,
-            close_error_status: None,
-            force_noyield_close: false,
             cached_mode_key: std::cell::RefCell::new(None),
             cached_gc_key: std::cell::RefCell::new(None),
             last_gc_estimate: 0,
@@ -789,7 +824,7 @@ impl LuaState {
     }
 
     pub fn checkstackaux(&mut self, n: usize, pre: usize, pos: usize) {
-        if self.stack.len() - self.top <= n {
+        if self.exec.stack.len() - self.exec.top <= n {
             let _ = self.growstack(n, true);
         } else {
             self.condmovestack(pre, pos);
@@ -803,7 +838,7 @@ impl LuaState {
     /// 对应 C 的 luaD_growstack
     /// 尝试将栈增长至少 n 个元素。raiseerror=true 时报告错误，否则返回错误。
     pub fn growstack(&mut self, n: usize, raiseerror: bool) -> Result<(), VmError> {
-        let size = self.stack.len();
+        let size = self.exec.stack.len();
         if size > MAXSTACK {
             // 栈已超过最大值，线程正在使用为错误保留的额外空间
             debug_assert_eq!(size, ERRORSTACKSIZE);
@@ -814,7 +849,7 @@ impl LuaState {
             return Err(VmError::StackError);
         } else if n < MAXSTACK {
             let mut newsize = size + (size >> 1); /* tentative new size (size * 1.5) */
-            let needed = self.top + n;
+            let needed = self.exec.top + n;
             if newsize > MAXSTACK {
                 newsize = MAXSTACK;
             }
@@ -837,14 +872,14 @@ impl LuaState {
     /// 对应 C 的 luaD_reallocstack
     /// Rust 版本: Vec 自行管理内存，relstack/correctstack 为空操作
     pub fn reallocstack(&mut self, newsize: usize, _raiseerror: bool) -> Result<(), VmError> {
-        let oldsize = self.stack.len();
+        let oldsize = self.exec.stack.len();
         debug_assert!(newsize <= MAXSTACK || newsize == ERRORSTACKSIZE);
         // relstack: Rust 中无需将指针转为偏移量 (Vec 自行管理内存)
         // G(self).gcstopem = true: 简化，不停止紧急 GC
         // 扩展栈到 newsize + EXTRA_STACK，新位置填 nil
         let target = newsize + EXTRA_STACK;
         if target > oldsize {
-            self.stack.resize(target, TValue::Nil(NilKind::Strict));
+            self.exec.stack.resize(target, TValue::Nil(NilKind::Strict));
         }
         // correctstack: Rust 中无需修正指针 (使用索引而非指针)
         Ok(())
@@ -873,34 +908,49 @@ impl LuaState {
         let tmnames = Rc::new(init_tmnames(&string_table));
 
         let state = LuaState {
-            constants: Rc::new(Vec::new()),
-            code: Rc::new(Vec::new()),
-            upval_descs: Rc::new(Vec::new()),
-            protos: Rc::new(Vec::new()),
-            top,
-            base: 0,
-            pc: 0,
+            exec: Box::new(ExecState {
+                constants: Rc::new(Vec::new()),
+                code: Rc::new(Vec::new()),
+                upval_descs: Rc::new(Vec::new()),
+                protos: Rc::new(Vec::new()),
+                top,
+                base: 0,
+                pc: 0,
+                num_params: 0,
+                is_vararg: false,
+                proto_flag: 0,
+                nextraargs: 0,
+                closure_upvals: Rc::new(RefCell::new(Vec::new())),
+                open_upvals: Vec::new(),
+                open_upval: None,
+                tbc_list: None,
+                call_stack: Vec::with_capacity(32),
+                stack,
+                hook_old_pc: 0,
+                hook_func: None,
+                hook_mask: 0,
+                hook_count: 0,
+                current_hook_count: 0,
+                allowhook: true,
+                current_thread: None,
+                call_info: Vec::new(),
+                pcall_protection_stack: Vec::new(),
+                close_error_status: None,
+                force_noyield_close: false,
+                n_ccalls: 0,
+                n_ny_calls: 0,
+                saved_yield_nresults: 0,
+            }),
             trap: false,
             tick: std::cell::Cell::new(0),
-            num_params: 0,
-            is_vararg: false,
-            proto_flag: 0,
-            nextraargs: 0,
-            closure_upvals: Rc::new(RefCell::new(Vec::new())),
-            open_upvals: Vec::new(),
-            open_upval: None,
-            tbc_list: None,
             twups_linked: false,
             is_in_twups: false,
-            stack,
             gc,
             globals,
             registry,
             string_table,
             tmnames,
             api_func_base: 0,
-            n_ccalls: 0,
-            n_ny_calls: 0,
             dmt: DefaultMetatables::new(),
             stdout: lua_stdout(),
             io_output: None,
@@ -914,7 +964,6 @@ impl LuaState {
             io_output_handle: None,
             global_state: Rc::new(GlobalState { gcstopem: false }),
             ci: None,
-            call_info: Vec::new(),
             last_traceback: String::new(),
             last_error_msg: String::new(),
             last_error_value: None,
@@ -923,12 +972,6 @@ impl LuaState {
             pending_yield: None,
             last_c_function: None,
             math_random_state: None,
-            hook_func: None,
-            hook_mask: 0,
-            hook_count: 0,
-            current_hook_count: 0,
-            hook_old_pc: 0,
-            allowhook: true,
             warn_on: true,
             warn_pending: false,
             main_thread: LuaThread {
@@ -942,10 +985,7 @@ impl LuaState {
                 context: Rc::new(RefCell::new(ThreadContext::default())),
                 c_state: std::cell::Cell::new(std::ptr::null_mut()),
             },
-            call_stack: Vec::with_capacity(32),
-            current_thread: None,
             caller_gc_stacks: Vec::new(),
-            pcall_protection_stack: Vec::new(),
             weak_tables: Vec::new(),
             concat_gc_counter: std::cell::Cell::new(0),
             concat_gc_interval: std::cell::Cell::new(32768),
@@ -958,8 +998,6 @@ impl LuaState {
             pending_return_adjust: None,
             last_error_call_info: None,
             last_close_frame: None,
-            close_error_status: None,
-            force_noyield_close: false,
             cached_mode_key: std::cell::RefCell::new(None),
             cached_gc_key: std::cell::RefCell::new(None),
             last_gc_estimate: 0,
@@ -1017,34 +1055,48 @@ impl LuaState {
             warn_on: self.warn_on,
             warn_pending: self.warn_pending,
 
-            // === 独立字段（执行栈和函数上下文）===
-            constants: Rc::new(Vec::new()),
-            code: Rc::new(Vec::new()),
-            upval_descs: Rc::new(Vec::new()),
-            protos: Rc::new(Vec::new()),
-            top,
-            base: 0,
-            pc: 0,
+            // === 独立字段（执行栈和函数上下文，放入 exec）===
+            exec: Box::new(ExecState {
+                constants: Rc::new(Vec::new()),
+                code: Rc::new(Vec::new()),
+                upval_descs: Rc::new(Vec::new()),
+                protos: Rc::new(Vec::new()),
+                top,
+                base: 0,
+                pc: 0,
+                num_params: 0,
+                is_vararg: false,
+                proto_flag: 0,
+                nextraargs: 0,
+                closure_upvals: Rc::new(RefCell::new(Vec::new())),
+                open_upvals: Vec::new(),
+                open_upval: None,
+                tbc_list: None,
+                call_stack: Vec::with_capacity(32),
+                stack,
+                hook_old_pc: 0,
+                hook_func: None,
+                hook_mask: 0,
+                hook_count: 0,
+                current_hook_count: 0,
+                allowhook: true,
+                current_thread: None,
+                call_info: Vec::new(),
+                pcall_protection_stack: Vec::new(),
+                close_error_status: None,
+                force_noyield_close: false,
+                n_ccalls: 0,
+                n_ny_calls: 0,
+                saved_yield_nresults: 0,
+            }),
             trap: false,
             tick: std::cell::Cell::new(0),
-            num_params: 0,
-            is_vararg: false,
-            proto_flag: 0,
-            nextraargs: 0,
-            closure_upvals: Rc::new(RefCell::new(Vec::new())),
-            open_upvals: Vec::new(),
-            open_upval: None,
-            tbc_list: None,
             twups_linked: false,
             is_in_twups: false,
-            stack,
             api_func_base: 0,
-            n_ccalls: 0,
-            n_ny_calls: 0,
             stdout: lua_stdout(),
             io_output: None,
             ci: None,
-            call_info: Vec::new(),
             last_traceback: String::new(),
             last_error_msg: String::new(),
             last_error_value: None,
@@ -1053,16 +1105,7 @@ impl LuaState {
             pending_yield: None,
             last_c_function: None,
             math_random_state: None,
-            hook_func: None,
-            hook_mask: 0,
-            hook_count: 0,
-            current_hook_count: 0,
-            hook_old_pc: 0,
-            allowhook: true,
-            call_stack: Vec::with_capacity(32),
-            current_thread: None,
             caller_gc_stacks: Vec::new(),
-            pcall_protection_stack: Vec::new(),
             concat_gc_counter: std::cell::Cell::new(0),
             concat_gc_interval: std::cell::Cell::new(32768),
             gc_closing: false,
@@ -1072,8 +1115,6 @@ impl LuaState {
             pending_return_adjust: None,
             last_error_call_info: None,
             last_close_frame: None,
-            close_error_status: None,
-            force_noyield_close: false,
             cached_mode_key: std::cell::RefCell::new(None),
             cached_gc_key: std::cell::RefCell::new(None),
             last_gc_estimate: 0,
@@ -1085,26 +1126,26 @@ impl LuaState {
     /// 执行 Lua 字节码 (顶层主函数)
     /// base=0: stack[0] 兼作函数入口和寄存器 0
     pub fn execute(&mut self, proto: &Proto) -> Result<VmResult, VmError> {
-        if self.stack.is_empty() {
-            self.stack.push(TValue::Nil(NilKind::Strict));
+        if self.exec.stack.is_empty() {
+            self.exec.stack.push(TValue::Nil(NilKind::Strict));
         }
         let fsize = proto.max_stack_size as usize;
-        self.code = proto.code.clone();
-        self.constants = proto.constants.clone();
-        self.upval_descs = proto.upvalues.clone();
-        self.protos = proto.protos.clone();
-        self.base = 0;
-        self.pc = 0;
-        self.num_params = proto.num_params;
-        self.is_vararg = proto.is_vararg();
-        self.proto_flag = proto.flag;
-        self.nextraargs = 0;
-        self.closure_upvals = Rc::new(RefCell::new(Vec::new()));
-        self.tbc_list = None;
-        self.open_upval = None;
+        self.exec.code = proto.code.clone();
+        self.exec.constants = proto.constants.clone();
+        self.exec.upval_descs = proto.upvalues.clone();
+        self.exec.protos = proto.protos.clone();
+        self.exec.base = 0;
+        self.exec.pc = 0;
+        self.exec.num_params = proto.num_params;
+        self.exec.is_vararg = proto.is_vararg();
+        self.exec.proto_flag = proto.flag;
+        self.exec.nextraargs = 0;
+        self.exec.closure_upvals = Rc::new(RefCell::new(Vec::new()));
+        self.exec.tbc_list = None;
+        self.exec.open_upval = None;
 
-        while self.stack.len() < fsize {
-            self.stack.push(TValue::Nil(NilKind::Strict));
+        while self.exec.stack.len() < fsize {
+            self.exec.stack.push(TValue::Nil(NilKind::Strict));
         }
         VmExecutor::execute_loop(self)
     }
@@ -1143,34 +1184,49 @@ impl LuaState {
         let tmnames = Rc::new(init_tmnames(&string_table));
 
         LuaState {
-            constants: proto.constants.clone(),
-            code: proto.code.clone(),
-            upval_descs: proto.upvalues.clone(),
-            protos: proto.protos.clone(),
-            top,
-            base,
-            pc: 0,
+            exec: Box::new(ExecState {
+                constants: proto.constants.clone(),
+                code: proto.code.clone(),
+                upval_descs: proto.upvalues.clone(),
+                protos: proto.protos.clone(),
+                top,
+                base,
+                pc: 0,
+                num_params: proto.num_params,
+                is_vararg: proto.is_vararg(),
+                proto_flag: proto.flag,
+                nextraargs: 0,
+                closure_upvals: Rc::new(RefCell::new(Vec::new())),
+                open_upvals: Vec::new(),
+                open_upval: None,
+                tbc_list: None,
+                call_stack: Vec::with_capacity(32),
+                stack,
+                hook_old_pc: 0,
+                hook_func: None,
+                hook_mask: 0,
+                hook_count: 0,
+                current_hook_count: 0,
+                allowhook: true,
+                current_thread: None,
+                call_info: Vec::new(),
+                pcall_protection_stack: Vec::new(),
+                close_error_status: None,
+                force_noyield_close: false,
+                n_ccalls: 0,
+                n_ny_calls: 0,
+                saved_yield_nresults: 0,
+            }),
             trap: false,
             tick: std::cell::Cell::new(0),
-            num_params: proto.num_params,
-            is_vararg: proto.is_vararg(),
-            proto_flag: proto.flag,
-            nextraargs: 0,
-            closure_upvals: Rc::new(RefCell::new(Vec::new())),
-            open_upvals: Vec::new(),
-            open_upval: None,
-            tbc_list: None,
             twups_linked: false,
             is_in_twups: false,
-            stack,
             gc,
             globals,
             registry,
             string_table,
             tmnames,
             api_func_base: 0,
-            n_ccalls: 0,
-            n_ny_calls: 0,
             dmt: DefaultMetatables::new(),
             stdout: lua_stdout(),
             io_output: None,
@@ -1184,7 +1240,6 @@ impl LuaState {
             io_output_handle: None,
             global_state: Rc::new(GlobalState { gcstopem: false }),
             ci: None,
-            call_info: Vec::new(),
             last_traceback: String::new(),
             last_error_msg: String::new(),
             last_error_value: None,
@@ -1193,12 +1248,6 @@ impl LuaState {
             pending_yield: None,
             last_c_function: None,
             math_random_state: None,
-            hook_func: None,
-            hook_mask: 0,
-            hook_count: 0,
-            current_hook_count: 0,
-            hook_old_pc: 0,
-            allowhook: true,
             warn_on: true,
             warn_pending: false,
             main_thread: LuaThread {
@@ -1212,10 +1261,7 @@ impl LuaState {
                 context: Rc::new(RefCell::new(ThreadContext::default())),
                 c_state: std::cell::Cell::new(std::ptr::null_mut()),
             },
-            call_stack: Vec::with_capacity(32),
-            current_thread: None,
             caller_gc_stacks: Vec::new(),
-            pcall_protection_stack: Vec::new(),
             weak_tables: Vec::new(),
             concat_gc_counter: std::cell::Cell::new(0),
             concat_gc_interval: std::cell::Cell::new(32768),
@@ -1228,8 +1274,6 @@ impl LuaState {
             pending_return_adjust: None,
             last_error_call_info: None,
             last_close_frame: None,
-            close_error_status: None,
-            force_noyield_close: false,
             cached_mode_key: std::cell::RefCell::new(None),
             cached_gc_key: std::cell::RefCell::new(None),
             last_gc_estimate: 0,
@@ -1259,21 +1303,21 @@ impl LuaState {
         // 只有在 op_call 路径中（call_info 栈顶有 is_c=true 的 entry）才推迟，
         // 因为只有 op_call 会调用 finish_pending_adjust。单元测试直接调用 C 函数时
         // call_info 为空，不应推迟。
-        if self.hook_mask & 2 != 0 && self.allowhook {
+        if self.exec.hook_mask & 2 != 0 && self.exec.allowhook {
             // LUA_MASKRET
-            let in_op_call = self.call_info.last().map(|e| e.is_c).unwrap_or(false);
+            let in_op_call = self.exec.call_info.last().map(|e| e.is_c).unwrap_or(false);
             if in_op_call {
-                let first_result_pos = self.stack.len();
+                let first_result_pos = self.exec.stack.len();
                 // perf: 用 into_iter drain 避免 clone (每个 results[i].clone() 对 Rc 变体需 incq)
                 let n = results.len();
-                self.stack.extend(results);
+                self.exec.stack.extend(results);
                 self.pending_return_adjust = Some((a, nresults, n, first_result_pos));
-                self.top = self.stack.len();
+                self.exec.top = self.exec.stack.len();
                 return;
             }
         }
 
-        self.stack.truncate(a);
+        self.exec.stack.truncate(a);
         let n = if nresults < 0 {
             results.len()
         } else {
@@ -1283,16 +1327,16 @@ impl LuaState {
         // n > results.len() 时 drain 全部后补 Nil。
         let rlen = results.len();
         if n <= rlen {
-            self.stack.extend(results.into_iter().take(n));
+            self.exec.stack.extend(results.into_iter().take(n));
         } else {
-            self.stack.extend(results);
+            self.exec.stack.extend(results);
             for _ in rlen..n {
-                self.stack.push(TValue::Nil(NilKind::Strict));
+                self.exec.stack.push(TValue::Nil(NilKind::Strict));
             }
         }
-        // 关键: 更新 state.top — 后续 MULTRET CALL (b=0) 用 state.top 计算 nargs,
-        // 若不更新, state.top 保留 CALL 设置的 a+b (过大), 导致 nargs 计算错误
-        self.top = self.stack.len();
+        // 关键: 更新 state.exec.top — 后续 MULTRET CALL (b=0) 用 state.exec.top 计算 nargs,
+        // 若不更新, state.exec.top 保留 CALL 设置的 a+b (过大), 导致 nargs 计算错误
+        self.exec.top = self.exec.stack.len();
     }
 
     /// adjust_results 的单值版本 — 消除 vec![value] 的堆分配。
@@ -1300,13 +1344,13 @@ impl LuaState {
     /// 1 元素 Vec 分配 + move 开销不可忽略（D 循环基准中每 find 一次）。
     #[cfg_attr(not(size_optimized), inline)]
     pub fn adjust_single_result(&mut self, a: usize, nresults: i32, result: TValue) {
-        if self.hook_mask & 2 != 0 && self.allowhook {
-            let in_op_call = self.call_info.last().map(|e| e.is_c).unwrap_or(false);
+        if self.exec.hook_mask & 2 != 0 && self.exec.allowhook {
+            let in_op_call = self.exec.call_info.last().map(|e| e.is_c).unwrap_or(false);
             if in_op_call {
-                let first_result_pos = self.stack.len();
-                self.stack.push(result);
+                let first_result_pos = self.exec.stack.len();
+                self.exec.stack.push(result);
                 self.pending_return_adjust = Some((a, nresults, 1, first_result_pos));
-                self.top = self.stack.len();
+                self.exec.top = self.exec.stack.len();
                 return;
             }
         }
@@ -1316,25 +1360,25 @@ impl LuaState {
         // 对应 C 的 setobj2s(L, func_slot, result); L->top = func+2。
         if nresults <= 0 {
             if nresults == 0 {
-                self.stack.truncate(a);
+                self.exec.stack.truncate(a);
             } else {
                 // MULTRET (nresults < 0): 单值即全部结果
-                if self.stack.len() > a {
-                    self.stack[a] = result;
-                    self.stack.truncate(a + 1);
+                if self.exec.stack.len() > a {
+                    self.exec.stack[a] = result;
+                    self.exec.stack.truncate(a + 1);
                 } else {
-                    self.stack.truncate(a);
-                    self.stack.push(result);
+                    self.exec.stack.truncate(a);
+                    self.exec.stack.push(result);
                 }
             }
         } else if (nresults as usize) == 1 {
-            if self.stack.len() > a {
+            if self.exec.stack.len() > a {
                 // perf: 槽位平凡值检查 — 槽 a 现值多为 BuiltinFn (函数槽,
                 // Copy 无 drop) 或 trivial; 平凡/Copy 槽用 ptr::write 跳过
                 // drop_in_place 调用 (非内联 call, adjust 热路径实证)。
                 // 非平凡 (Rc/Table 等) 保守走原赋值 (正常 drop)。
                 // 检查用判别范围: BuiltinFn 及其他 Copy 变体由 matches 显式列出。
-                let slot = unsafe { self.stack.get_unchecked_mut(a) };
+                let slot = unsafe { self.exec.stack.get_unchecked_mut(a) };
                 if matches!(
                     slot,
                     TValue::Nil(_)
@@ -1351,7 +1395,7 @@ impl LuaState {
                 // perf: 被截断区 (a+1..len) 是 CALL 的参数槽, 常为 trivial (Float/
                 // Integer)。全部 trivial 时用 set_len 跳过 Vec::truncate 的逐槽
                 // drop glue (非内联调用); 有 Rc 变体则回退 truncate 正常 drop。
-                let tail_all_trivial = self.stack[a + 1..].iter().all(|v| {
+                let tail_all_trivial = self.exec.stack[a + 1..].iter().all(|v| {
                     matches!(
                         v,
                         TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)
@@ -1360,53 +1404,53 @@ impl LuaState {
                 if tail_all_trivial {
                     // SAFETY: 尾部全 trivially-droppable, set_len 略过 drop 安全;
                     // 槽位保留给后续 write_stack 复用 (与 smart_clear_stack 同策略)。
-                    unsafe { self.stack.set_len(a + 1) };
+                    unsafe { self.exec.stack.set_len(a + 1) };
                 } else {
-                    self.stack.truncate(a + 1);
+                    self.exec.stack.truncate(a + 1);
                 }
             } else {
-                self.stack.push(result);
+                self.exec.stack.push(result);
             }
         } else {
-            self.stack.truncate(a);
-            self.stack.push(result);
+            self.exec.stack.truncate(a);
+            self.exec.stack.push(result);
             for _ in 1..nresults {
-                self.stack.push(TValue::Nil(NilKind::Strict));
+                self.exec.stack.push(TValue::Nil(NilKind::Strict));
             }
         }
-        self.top = self.stack.len();
+        self.exec.top = self.exec.stack.len();
     }
 
     /// adjust_results 的双值版本 — 消除 vec![v1, v2] 堆分配（gsub 返回 热点）。
     pub fn adjust_two_results(&mut self, a: usize, nresults: i32, v1: TValue, v2: TValue) {
-        if self.hook_mask & 2 != 0 && self.allowhook {
-            let in_op_call = self.call_info.last().map(|e| e.is_c).unwrap_or(false);
+        if self.exec.hook_mask & 2 != 0 && self.exec.allowhook {
+            let in_op_call = self.exec.call_info.last().map(|e| e.is_c).unwrap_or(false);
             if in_op_call {
-                let first_result_pos = self.stack.len();
-                self.stack.push(v1);
-                self.stack.push(v2);
+                let first_result_pos = self.exec.stack.len();
+                self.exec.stack.push(v1);
+                self.exec.stack.push(v2);
                 self.pending_return_adjust = Some((a, nresults, 2, first_result_pos));
-                self.top = self.stack.len();
+                self.exec.top = self.exec.stack.len();
                 return;
             }
         }
         if nresults == 0 {
-            self.stack.truncate(a);
+            self.exec.stack.truncate(a);
         } else {
-            self.stack.truncate(a);
-            self.stack.push(v1);
+            self.exec.stack.truncate(a);
+            self.exec.stack.push(v1);
             if nresults == 1 {
-                self.top = self.stack.len();
+                self.exec.top = self.exec.stack.len();
                 return;
             }
-            self.stack.push(v2);
+            self.exec.stack.push(v2);
             if nresults > 2 {
                 for _ in 2..nresults {
-                    self.stack.push(TValue::Nil(NilKind::Strict));
+                    self.exec.stack.push(TValue::Nil(NilKind::Strict));
                 }
             }
         }
-        self.top = self.stack.len();
+        self.exec.top = self.exec.stack.len();
     }
 
     /// 与 adjust_results 类似，但结果已在栈上 [first_result_pos..first_result_pos+n_actual)。
@@ -1418,8 +1462,8 @@ impl LuaState {
         n_actual: usize,
         first_result_pos: usize,
     ) {
-        if self.hook_mask & 2 != 0 && self.allowhook {
-            let in_op_call = self.call_info.last().map(|e| e.is_c).unwrap_or(false);
+        if self.exec.hook_mask & 2 != 0 && self.exec.allowhook {
+            let in_op_call = self.exec.call_info.last().map(|e| e.is_c).unwrap_or(false);
             if in_op_call {
                 self.pending_return_adjust = Some((a, nresults, n_actual, first_result_pos));
                 return;
@@ -1429,13 +1473,13 @@ impl LuaState {
         // 用 mem::replace 避免 clone：源位置的值被移出（填 Nil(Empty)），
         // 后续 truncate 会删除源位置，不会留下垃圾。
         // 正向循环安全：a < first_result_pos，写 a+k 不会覆盖尚未读取的源 first_result_pos+k
-        if n_actual > 0 && first_result_pos + n_actual <= self.stack.len() {
+        if n_actual > 0 && first_result_pos + n_actual <= self.exec.stack.len() {
             for k in 0..n_actual {
                 let val = std::mem::replace(
-                    &mut self.stack[first_result_pos + k],
+                    &mut self.exec.stack[first_result_pos + k],
                     TValue::Nil(NilKind::Empty),
                 );
-                self.stack[a + k] = val;
+                self.exec.stack[a + k] = val;
             }
         }
         let new_len = if nresults < 0 {
@@ -1447,21 +1491,21 @@ impl LuaState {
                 // truncate 会 drop 多余元素然后可能缩容，push 又可能扩容。
                 // 直接 resize 一次完成（resize 内部对增长部分用 Nil 填充）。
                 let target = a + nr;
-                if target <= self.stack.len() {
+                if target <= self.exec.stack.len() {
                     // 栈够长: 只需覆盖 a+n_actual..a+nr 为 Nil
                     for k in n_actual..nr {
-                        self.stack[a + k] = TValue::Nil(NilKind::Strict);
+                        self.exec.stack[a + k] = TValue::Nil(NilKind::Strict);
                     }
                 } else {
                     // 栈不够长: 先截断到 a+n_actual，再 resize 到 a+nr
-                    self.stack.truncate(a + n_actual);
-                    self.stack.resize(target, TValue::Nil(NilKind::Strict));
+                    self.exec.stack.truncate(a + n_actual);
+                    self.exec.stack.resize(target, TValue::Nil(NilKind::Strict));
                 }
             }
             a + nr
         };
-        self.stack.truncate(new_len);
-        self.top = self.stack.len();
+        self.exec.stack.truncate(new_len);
+        self.exec.top = self.exec.stack.len();
     }
 
     /// 执行待定的返回值调整 — 由 op_call 在 return hook 后调用
@@ -1471,13 +1515,13 @@ impl LuaState {
             // 当 allowhook=true 时会重新设置 pending_return_adjust 而不执行实际调整，
             // 导致 pending_return_adjust 保留到下一个 C 函数调用的 finish_pending_adjust
             // 错误执行，把栈截断到错误的 a 值）
-            if n_actual > 0 && first_result_pos + n_actual <= self.stack.len() {
+            if n_actual > 0 && first_result_pos + n_actual <= self.exec.stack.len() {
                 for k in 0..n_actual {
                     let val = std::mem::replace(
-                        &mut self.stack[first_result_pos + k],
+                        &mut self.exec.stack[first_result_pos + k],
                         TValue::Nil(NilKind::Empty),
                     );
-                    self.stack[a + k] = val;
+                    self.exec.stack[a + k] = val;
                 }
             }
             let new_len = if nresults < 0 {
@@ -1485,15 +1529,15 @@ impl LuaState {
             } else {
                 let nr = nresults as usize;
                 if nr > n_actual {
-                    self.stack.truncate(a + n_actual);
+                    self.exec.stack.truncate(a + n_actual);
                     for _ in n_actual..nr {
-                        self.stack.push(TValue::Nil(NilKind::Strict));
+                        self.exec.stack.push(TValue::Nil(NilKind::Strict));
                     }
                 }
                 a + nr
             };
-            self.stack.truncate(new_len);
-            self.top = self.stack.len();
+            self.exec.stack.truncate(new_len);
+            self.exec.top = self.exec.stack.len();
         }
     }
 }
@@ -1518,36 +1562,36 @@ impl LuaState {
     // ====== Stack ======
 
     pub fn gettop(&self) -> usize {
-        self.stack.len()
+        self.exec.stack.len()
     }
 
     pub fn settop(&mut self, idx: usize) {
-        if idx < self.stack.len() {
-            self.stack.truncate(idx);
+        if idx < self.exec.stack.len() {
+            self.exec.stack.truncate(idx);
         } else {
-            self.stack.resize(idx, TValue::Nil(NilKind::Strict));
+            self.exec.stack.resize(idx, TValue::Nil(NilKind::Strict));
         }
     }
 
     pub fn pop(&mut self, n: usize) {
-        let new_len = self.stack.len().saturating_sub(n);
-        self.stack.truncate(new_len);
+        let new_len = self.exec.stack.len().saturating_sub(n);
+        self.exec.stack.truncate(new_len);
     }
 
     /// 对应 C 的 lua_remove：删除指定索引处的元素，上方元素下移。
     pub fn remove(&mut self, idx: isize) {
         let abs = self.abs_index(idx);
-        if abs == 0 || abs > self.stack.len() {
+        if abs == 0 || abs > self.exec.stack.len() {
             return;
         }
-        self.stack.remove(abs - 1);
+        self.exec.stack.remove(abs - 1);
     }
 
     /// 对应 C 的 lua_absindex:
     ///   return (idx > 0 || is_pseudo(idx)) ? idx : cast_int(L->top - L->ci->func) + idx + 1
     /// 其中 L->top - L->ci->func 等价于 stack.len()（函数帧内有效元素数）
     pub fn abs_index(&self, idx: isize) -> usize {
-        let len = self.stack.len() as isize;
+        let len = self.exec.stack.len() as isize;
         if idx > 0 {
             idx as usize
         } else {
@@ -1562,33 +1606,33 @@ impl LuaState {
 
     pub fn rotate(&mut self, idx: isize, n: isize) {
         let abs = self.abs_index(idx);
-        if abs == 0 || abs > self.stack.len() {
+        if abs == 0 || abs > self.exec.stack.len() {
             return;
         }
         if n > 0 {
             for _ in 0..n {
-                let val = self.stack.pop().unwrap();
-                self.stack.insert(abs - 1, val);
+                let val = self.exec.stack.pop().unwrap();
+                self.exec.stack.insert(abs - 1, val);
             }
         } else {
             let count = (-n) as usize;
             for _ in 0..count {
-                let val = self.stack.remove(abs - 1);
-                self.stack.push(val);
+                let val = self.exec.stack.remove(abs - 1);
+                self.exec.stack.push(val);
             }
         }
     }
 
     pub fn copy(&mut self, from_idx: isize, to_idx: isize) {
         let from = self.abs_index(from_idx);
-        if from > 0 && from <= self.stack.len() {
-            let val = self.stack[from - 1].clone();
+        if from > 0 && from <= self.exec.stack.len() {
+            let val = self.exec.stack[from - 1].clone();
             let to = self.abs_index(to_idx);
             if to > 0 {
-                if to > self.stack.len() {
-                    self.stack.resize(to, TValue::Nil(NilKind::Strict));
+                if to > self.exec.stack.len() {
+                    self.exec.stack.resize(to, TValue::Nil(NilKind::Strict));
                 }
-                self.stack[to - 1] = val;
+                self.exec.stack[to - 1] = val;
             }
         }
     }
@@ -1596,37 +1640,37 @@ impl LuaState {
     // ====== Push ======
 
     pub fn push_nil(&mut self) {
-        self.stack.push(TValue::Nil(NilKind::Strict));
+        self.exec.stack.push(TValue::Nil(NilKind::Strict));
     }
 
     pub fn push_boolean(&mut self, b: bool) {
-        self.stack.push(TValue::Boolean(b));
+        self.exec.stack.push(TValue::Boolean(b));
     }
 
     pub fn push_integer(&mut self, n: i64) {
-        self.stack.push(TValue::Integer(n));
+        self.exec.stack.push(TValue::Integer(n));
     }
 
     pub fn push_float(&mut self, n: f64) {
-        self.stack.push(TValue::Float(n));
+        self.exec.stack.push(TValue::Float(n));
     }
 
     pub fn push_string(&mut self, s: &str) {
         let ls = str_to_ls(&self.string_table, s);
-        self.stack.push(TValue::Str(ls));
+        self.exec.stack.push(TValue::Str(ls));
     }
 
     pub fn push_lstring(&mut self, s: &[u8]) {
         let ls = crate::strings::new_lstr_bytes(&self.string_table, s);
-        self.stack.push(TValue::Str(ls));
+        self.exec.stack.push(TValue::Str(ls));
     }
 
     pub fn push_value(&mut self, val: TValue) {
-        self.stack.push(val);
+        self.exec.stack.push(val);
     }
 
     pub fn push_light_userdata(&mut self, p: *mut std::ffi::c_void) {
-        self.stack.push(TValue::LightUserData(p));
+        self.exec.stack.push(TValue::LightUserData(p));
     }
 
     pub fn push_fstring(&mut self, fmt: &str) {
@@ -1634,15 +1678,15 @@ impl LuaState {
     }
 
     pub fn push_lua_value(&mut self, val: &TValue) {
-        self.stack.push(val.clone());
+        self.exec.stack.push(val.clone());
     }
 
     // ====== Access / Type ======
 
     pub fn obj_at(&self, idx: isize) -> Option<&TValue> {
         let abs = self.abs_index(idx);
-        if abs > 0 && abs <= self.stack.len() {
-            Some(&self.stack[abs - 1])
+        if abs > 0 && abs <= self.exec.stack.len() {
+            Some(&self.exec.stack[abs - 1])
         } else {
             None
         }
@@ -1650,8 +1694,8 @@ impl LuaState {
 
     pub fn obj_at_mut(&mut self, idx: isize) -> Option<&mut TValue> {
         let abs = self.abs_index(idx);
-        if abs > 0 && abs <= self.stack.len() {
-            Some(&mut self.stack[abs - 1])
+        if abs > 0 && abs <= self.exec.stack.len() {
+            Some(&mut self.exec.stack[abs - 1])
         } else {
             None
         }
@@ -1739,11 +1783,11 @@ impl LuaState {
         match self.globals.get(&key) {
             Some(val) => {
                 let ty = val.ty();
-                self.stack.push(val.clone());
+                self.exec.stack.push(val.clone());
                 ty
             }
             None => {
-                self.stack.push(TValue::Nil(NilKind::Strict));
+                self.exec.stack.push(TValue::Nil(NilKind::Strict));
                 LuaType::Nil
             }
         }
@@ -1751,7 +1795,7 @@ impl LuaState {
 
     pub fn set_global(&mut self, name: &str) {
         let key = TValue::Str(str_to_ls(&self.string_table, name));
-        if let Some(val) = self.stack.pop() {
+        if let Some(val) = self.exec.stack.pop() {
             self.globals.set(key, val);
         }
     }
@@ -1776,10 +1820,10 @@ impl LuaState {
     ///
     /// ```ignore
     /// fn my_add(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
-    ///     let x = state.stack[a + 1].as_integer().unwrap_or(0);
-    ///     let y = state.stack[a + 2].as_integer().unwrap_or(0);
-    ///     state.stack.truncate(a);
-    ///     state.stack.push(TValue::Integer(x + y));
+    ///     let x = state.exec.stack[a + 1].as_integer().unwrap_or(0);
+    ///     let y = state.exec.stack[a + 2].as_integer().unwrap_or(0);
+    ///     state.exec.stack.truncate(a);
+    ///     state.exec.stack.push(TValue::Integer(x + y));
     ///     Ok(())
     /// }
     ///
@@ -1824,10 +1868,10 @@ impl LuaState {
 
     pub fn set_field(&mut self, idx: isize, key_name: &str) {
         let abs = self.abs_index(idx);
-        let val = self.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        let val = self.exec.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
         let key = TValue::Str(str_to_ls(&self.string_table, key_name));
-        if abs > 0 && abs <= self.stack.len() {
-            let tbl = &mut self.stack[abs - 1];
+        if abs > 0 && abs <= self.exec.stack.len() {
+            let tbl = &mut self.exec.stack[abs - 1];
             if let TValue::Table(ref mut t) = tbl {
                 t.set(key, val);
             }
@@ -1837,17 +1881,17 @@ impl LuaState {
     pub fn get_field(&mut self, idx: isize, key_name: &str) -> LuaType {
         let abs = self.abs_index(idx);
         let key = TValue::Str(str_to_ls(&self.string_table, key_name));
-        if abs > 0 && abs <= self.stack.len() {
-            let val = if let TValue::Table(ref t) = &self.stack[abs - 1] {
+        if abs > 0 && abs <= self.exec.stack.len() {
+            let val = if let TValue::Table(ref t) = &self.exec.stack[abs - 1] {
                 t.get(&key).unwrap_or(TValue::Nil(NilKind::Strict))
             } else {
                 TValue::Nil(NilKind::Strict)
             };
             let ty = val.ty();
-            self.stack.push(val);
+            self.exec.stack.push(val);
             ty
         } else {
-            self.stack.push(TValue::Nil(NilKind::Strict));
+            self.exec.stack.push(TValue::Nil(NilKind::Strict));
             LuaType::Nil
         }
     }
@@ -1856,66 +1900,66 @@ impl LuaState {
 
     pub fn create_table(&mut self, narr: usize, nrec: usize) {
         let t = Table::with_capacity(narr, nrec);
-        self.stack.push(TValue::Table(t));
+        self.exec.stack.push(TValue::Table(t));
     }
 
     pub fn new_table(&mut self) {
         let t = Table::new();
-        self.stack.push(TValue::Table(t));
+        self.exec.stack.push(TValue::Table(t));
     }
 
     pub fn raw_get_i(&mut self, idx: isize, i: i64) -> LuaType {
         let abs = self.abs_index(idx);
-        if abs > 0 && abs <= self.stack.len() {
-            let val = if let TValue::Table(ref t) = &self.stack[abs - 1] {
+        if abs > 0 && abs <= self.exec.stack.len() {
+            let val = if let TValue::Table(ref t) = &self.exec.stack[abs - 1] {
                 let tkey = TValue::Integer(i);
                 t.get(&tkey).unwrap_or(TValue::Nil(NilKind::Strict))
             } else {
                 TValue::Nil(NilKind::Strict)
             };
             let ty = val.ty();
-            self.stack.push(val);
+            self.exec.stack.push(val);
             ty
         } else {
-            self.stack.push(TValue::Nil(NilKind::Strict));
+            self.exec.stack.push(TValue::Nil(NilKind::Strict));
             LuaType::Nil
         }
     }
 
     pub fn raw_set_i(&mut self, idx: isize, i: i64) {
         let abs = self.abs_index(idx);
-        let val = self.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
-        if abs > 0 && abs <= self.stack.len() {
-            if let TValue::Table(ref mut t) = self.stack[abs - 1] {
+        let val = self.exec.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        if abs > 0 && abs <= self.exec.stack.len() {
+            if let TValue::Table(ref mut t) = self.exec.stack[abs - 1] {
                 t.set_int(i, val);
             }
         }
     }
 
     pub fn raw_get(&mut self, idx: isize) -> LuaType {
-        let key = self.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        let key = self.exec.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
         let abs = self.abs_index(idx);
-        if abs > 0 && abs <= self.stack.len() {
-            let val = if let TValue::Table(ref t) = &self.stack[abs - 1] {
+        if abs > 0 && abs <= self.exec.stack.len() {
+            let val = if let TValue::Table(ref t) = &self.exec.stack[abs - 1] {
                 t.get(&key).unwrap_or(TValue::Nil(NilKind::Strict))
             } else {
                 TValue::Nil(NilKind::Strict)
             };
             let ty = val.ty();
-            self.stack.push(val);
+            self.exec.stack.push(val);
             ty
         } else {
-            self.stack.push(TValue::Nil(NilKind::Strict));
+            self.exec.stack.push(TValue::Nil(NilKind::Strict));
             LuaType::Nil
         }
     }
 
     pub fn raw_set(&mut self, idx: isize) {
-        let val = self.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
-        let key = self.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        let val = self.exec.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        let key = self.exec.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
         let abs = self.abs_index(idx);
-        if abs > 0 && abs <= self.stack.len() {
-            if let TValue::Table(ref mut t) = self.stack[abs - 1] {
+        if abs > 0 && abs <= self.exec.stack.len() {
+            if let TValue::Table(ref mut t) = self.exec.stack[abs - 1] {
                 t.set(key, val);
             }
         }
@@ -1925,8 +1969,8 @@ impl LuaState {
 
     pub fn len(&self, idx: isize) -> usize {
         let abs = self.abs_index(idx);
-        if abs > 0 && abs <= self.stack.len() {
-            match &self.stack[abs - 1] {
+        if abs > 0 && abs <= self.exec.stack.len() {
+            match &self.exec.stack[abs - 1] {
                 TValue::Table(t) => t.len() as usize,
                 TValue::Str(s) => s.len(),
                 TValue::Integer(_) | TValue::Float(_) => 0,
@@ -1940,9 +1984,9 @@ impl LuaState {
     // ====== Check stack ======
 
     pub fn check_stack(&mut self, extra: usize) -> bool {
-        let needed = self.stack.len() + extra;
-        if needed > self.stack.capacity() {
-            self.stack.reserve(extra);
+        let needed = self.exec.stack.len() + extra;
+        if needed > self.exec.stack.capacity() {
+            self.exec.stack.reserve(extra);
         }
         true
     }
@@ -2075,12 +2119,12 @@ impl LuaState {
         }
         result.push_str("stack traceback:");
         // 从 call_info 构建回溯
-        if self.call_info.is_empty() {
+        if self.exec.call_info.is_empty() {
             // 没有调用信息，使用简化的回溯
             result.push_str("\n\t[C]: in ?");
         } else {
-            for entry in &self.call_info {
-                let (src, line, name, _) = crate::execute::compute_caller_info(&self.stack, entry);
+            for entry in &self.exec.call_info {
+                let (src, line, name, _) = crate::execute::compute_caller_info(&self.exec.stack, entry);
                 result.push('\n');
                 result.push('\t');
                 if entry.is_c {
@@ -2103,12 +2147,12 @@ impl LuaState {
 
     /// 推入调用栈条目 — 用于堆栈回溯
     pub fn push_call_info(&mut self, entry: CallInfoEntry) {
-        self.call_info.push(entry);
+        self.exec.call_info.push(entry);
     }
 
     /// 弹出调用栈条目
     pub fn pop_call_info(&mut self) {
-        self.call_info.pop();
+        self.exec.call_info.pop();
     }
 
     pub fn error(&mut self, msg: &str) -> String {
@@ -2146,7 +2190,7 @@ impl LuaState {
                     proto: Rc::new(proto),
                     upvals: Rc::new(RefCell::new(upvals)),
                 });
-                self.stack.push(TValue::LClosure(closure));
+                self.exec.stack.push(TValue::LClosure(closure));
                 0
             }
             Err(err_msg) => {
@@ -2229,7 +2273,7 @@ impl LuaState {
                         proto: Rc::new(proto),
                         upvals: Rc::new(RefCell::new(upvals)),
                     });
-                    self.stack.push(TValue::LClosure(closure));
+                    self.exec.stack.push(TValue::LClosure(closure));
                     0
                 }
                 Err(e) => {
@@ -2254,13 +2298,13 @@ impl LuaState {
 
     /// 对应 C 的 getCcalls: 获取 C 调用嵌套数 (低 16 位)
     pub fn get_ccalls(&self) -> u32 {
-        self.n_ccalls & 0xffff
+        self.exec.n_ccalls & 0xffff
     }
 
     /// 对应 C 的 ccall: 调用函数 (无错误保护)
     /// Rust 版本: 简化实现，委托给 pcall 并忽略错误
     fn ccall(&mut self, nargs: usize, n_results: i32, inc: u32) {
-        self.n_ccalls = self.n_ccalls.saturating_add(inc);
+        self.exec.n_ccalls = self.exec.n_ccalls.saturating_add(inc);
         if self.get_ccalls() >= LUAI_MAXCCALLS {
             // 对应 C 的 checkstackp + luaE_checkcstack
             // 简化: 仅检查栈空间
@@ -2271,7 +2315,7 @@ impl LuaState {
         }
         // 委托给 pcall 执行实际调用 (忽略错误)
         let _ = self.pcall(nargs, n_results, 0);
-        self.n_ccalls = self.n_ccalls.saturating_sub(inc);
+        self.exec.n_ccalls = self.exec.n_ccalls.saturating_sub(inc);
     }
 
     pub fn call(&mut self, nargs: usize, nresults: i32) {
@@ -2290,8 +2334,8 @@ impl LuaState {
         // func_idx 是函数在栈中的 0-based 绝对索引。
         // 栈布局: [... | func | arg1 | arg2 | ... | top]
         // func_idx = stack.len() - nargs - 1
-        let func_idx = self.stack.len().saturating_sub(nargs + 1);
-        if func_idx >= self.stack.len() {
+        let func_idx = self.exec.stack.len().saturating_sub(nargs + 1);
+        if func_idx >= self.exec.stack.len() {
             return ERR_RUN;
         }
 
@@ -2303,7 +2347,7 @@ impl LuaState {
         //  调用 state.pcall,所以这里也需要相同的处理。)
         let mut chain_len: usize = 0;
         loop {
-            let cur_val = self.stack[func_idx].clone();
+            let cur_val = self.exec.stack[func_idx].clone();
             if let TValue::Table(ref t) = cur_val {
                 let mt_opt = t.get_metatable();
                 let call_fn = mt_opt.as_ref().and_then(|mt| {
@@ -2313,9 +2357,9 @@ impl LuaState {
                 if let Some(call_fn) = call_fn {
                     // 在 func_idx 位置插入元方法,原 func 和参数右移 1 位
                     // 对应 C: for (p = L->top.p; p > func; p--) setobjs2s(L, p, p-1);
-                    self.stack.insert(func_idx, call_fn.clone());
+                    self.exec.stack.insert(func_idx, call_fn.clone());
                     if chain_len >= MAX_CALL_CHAIN {
-                        self.stack.truncate(func_idx);
+                        self.exec.stack.truncate(func_idx);
                         self.push_string("'__call' chain too long");
                         return ERR_RUN;
                     }
@@ -2323,7 +2367,7 @@ impl LuaState {
                     continue; // 对应 goto retry
                 }
                 // 表无 __call 元方法,报 "attempt to call a table value"
-                self.stack.truncate(func_idx);
+                self.exec.stack.truncate(func_idx);
                 self.push_string(&format!(
                     "attempt to call a {} value",
                     self.typename(cur_val.ty())
@@ -2333,22 +2377,22 @@ impl LuaState {
             break; // 非表类型,退出循环进入原有 match
         }
 
-        let func_val = self.stack[func_idx].clone();
+        let func_val = self.exec.stack[func_idx].clone();
         match func_val {
             TValue::LClosure(closure) => {
                 // 检查 C 调用深度 (对应 C 的 luaE_incCstack / luaE_checkcstack)
                 // 每次 Lua 闭包调用递增 n_ccalls,达到 LUAI_MAXCCALLS(200) 时
                 // 抛出可被 pcall 捕获的 "C stack overflow",防止 Rust 原生栈溢出。
                 // 注意: 必须在 execute_loop 之前检查,否则递归仍会无限进行。
-                self.n_ccalls = self.n_ccalls.saturating_add(1);
+                self.exec.n_ccalls = self.exec.n_ccalls.saturating_add(1);
                 let cc = self.get_ccalls();
                 // 对应 C 的 luaE_checkcstack:
                 // cc == LUAI_MAXCCALLS → "C stack overflow"
                 // cc >= LUAI_MAXCCALLS * 11 / 10 → "error in error handling"
                 // cc 在 (MAXCCALLS, MAXCCALLS*1.1) 之间 → 不触发错误（error handler 中的调用）
                 if cc == LUAI_MAXCCALLS || cc >= LUAI_MAXCCALLS * 11 / 10 {
-                    self.n_ccalls = self.n_ccalls.saturating_sub(1);
-                    self.stack.truncate(func_idx);
+                    self.exec.n_ccalls = self.exec.n_ccalls.saturating_sub(1);
+                    self.exec.stack.truncate(func_idx);
                     if cc >= LUAI_MAXCCALLS * 11 / 10 {
                         self.push_string("error in error handling");
                     } else {
@@ -2359,9 +2403,9 @@ impl LuaState {
                 // 保存 n_ccalls，用于 error 路径恢复（对应 C Lua 的 longjmp 恢复 ci->nCcalls）
                 // error() 抛出时，execute_loop 中 OP_CALL 递增的 n_ccalls 不会由 op_return 递减，
                 // 导致计数失衡。非 yield 路径需恢复到 pcall 调用前的值。
-                let saved_n_ccalls = self.n_ccalls.saturating_sub(1);
+                let saved_n_ccalls = self.exec.n_ccalls.saturating_sub(1);
 
-                let nargs_actual = self.stack.len().saturating_sub(func_idx + 1);
+                let nargs_actual = self.exec.stack.len().saturating_sub(func_idx + 1);
                 let fsize = closure.proto.max_stack_size as usize;
                 let nfixparams = closure.proto.num_params as usize;
                 let proto_is_vararg = closure.proto.is_vararg();
@@ -2371,23 +2415,23 @@ impl LuaState {
                 let proto = Rc::clone(&closure.proto);
                 let upvals = Rc::clone(&closure.upvals);
 
-                let saved_code = std::mem::take(&mut self.code);
-                let saved_constants = std::mem::take(&mut self.constants);
-                let saved_upval_descs = std::mem::take(&mut self.upval_descs);
-                let saved_protos = std::mem::take(&mut self.protos);
-                let saved_base = self.base;
-                let saved_pc = self.pc;
-                let saved_num_params = self.num_params;
-                let saved_is_vararg = self.is_vararg;
-                let saved_proto_flag = self.proto_flag;
-                let saved_nextraargs = self.nextraargs;
+                let saved_code = std::mem::take(&mut self.exec.code);
+                let saved_constants = std::mem::take(&mut self.exec.constants);
+                let saved_upval_descs = std::mem::take(&mut self.exec.upval_descs);
+                let saved_protos = std::mem::take(&mut self.exec.protos);
+                let saved_base = self.exec.base;
+                let saved_pc = self.exec.pc;
+                let saved_num_params = self.exec.num_params;
+                let saved_is_vararg = self.exec.is_vararg;
+                let saved_proto_flag = self.exec.proto_flag;
+                let saved_nextraargs = self.exec.nextraargs;
                 let saved_closure_upvals =
-                    std::mem::replace(&mut self.closure_upvals, Rc::new(RefCell::new(Vec::new())));
-                let saved_tbc_list = self.tbc_list.take();
+                    std::mem::replace(&mut self.exec.closure_upvals, Rc::new(RefCell::new(Vec::new())));
+                let saved_tbc_list = self.exec.tbc_list.take();
 
                 // 推入 call_info — 对应 C 的 luaD_precall 创建新 CallInfo
                 // state.pcall 不是通过 OP_CALL 调用的（从 C 函数内部调用），
-                // 不能用 get_func_name 获取函数名（state.pc 指向调用 pcall/xpcall
+                // 不能用 get_func_name 获取函数名（state.exec.pc 指向调用 pcall/xpcall
                 // 的指令而非调用 g 的指令），name/namewhat 设为空。
                 // caller_source/caller_line 从当前 state（调用者的执行上下文）获取。
                 //
@@ -2400,27 +2444,27 @@ impl LuaState {
                 // 若调用者已推入相同闭包的条目（如 call_hook 已推入 namewhat="hook"
                 // 的条目），或已推入 namewhat 非空的条目（如 call_tm_res 已推入
                 // namewhat="metamethod" 的条目），跳过以避免覆盖 namewhat。
-                let saved_call_info_len = self.call_info.len();
-                let caller_is_lua = self.base > 0
-                    && self.base <= self.stack.len()
-                    && matches!(&self.stack[self.base - 1], TValue::LClosure(_));
-                let already_has_entry = self.call_info.last().map_or(false, |e| {
+                let saved_call_info_len = self.exec.call_info.len();
+                let caller_is_lua = self.exec.base > 0
+                    && self.exec.base <= self.exec.stack.len()
+                    && matches!(&self.exec.stack[self.exec.base - 1], TValue::LClosure(_));
+                let already_has_entry = self.exec.call_info.last().map_or(false, |e| {
                     e.closure
                         .as_ref()
                         .map_or(false, |c| Rc::ptr_eq(&c.proto, &proto))
-                        || get_closure_from_stack(&self.stack, e)
+                        || get_closure_from_stack(&self.exec.stack, e)
                             .map_or(false, |c| Rc::ptr_eq(&c.proto, &proto))
                         || (!e.namewhat.is_empty() && !e.is_c)
                 });
                 let pushed_call_info = !already_has_entry;
                 if pushed_call_info {
                     let (caller_base, caller_pc) = if caller_is_lua {
-                        (self.base, self.pc)
+                        (self.exec.base, self.exec.pc)
                     } else {
                         // C 调用者: base=0, saved_pc=0
                         (0usize, 0usize)
                     };
-                    self.call_info.push(crate::state::CallInfoEntry {
+                    self.exec.call_info.push(crate::state::CallInfoEntry {
                         is_c: !caller_is_lua,
                         // move closure 避免 clone + Box 堆分配
                         closure: Some(closure),
@@ -2428,8 +2472,8 @@ impl LuaState {
                         saved_pc: caller_pc,
                         name: None,
                         namewhat: "",
-                        proto_flag: self.proto_flag,
-                        nextraargs: self.nextraargs,
+                        proto_flag: self.exec.proto_flag,
+                        nextraargs: self.exec.nextraargs,
                         is_tailcall: false,
                     });
                 } else {
@@ -2437,46 +2481,46 @@ impl LuaState {
                     drop(closure);
                 }
 
-                self.code = Rc::clone(&proto.code);
-                self.constants = Rc::clone(&proto.constants);
-                self.upval_descs = Rc::clone(&proto.upvalues);
-                self.protos = proto.protos.clone();
-                self.base = func_idx + 1;
-                self.pc = 0;
-                self.num_params = proto.num_params;
-                self.is_vararg = proto.is_vararg();
-                self.proto_flag = proto.flag;
-                self.nextraargs = 0;
+                self.exec.code = Rc::clone(&proto.code);
+                self.exec.constants = Rc::clone(&proto.constants);
+                self.exec.upval_descs = Rc::clone(&proto.upvalues);
+                self.exec.protos = proto.protos.clone();
+                self.exec.base = func_idx + 1;
+                self.exec.pc = 0;
+                self.exec.num_params = proto.num_params;
+                self.exec.is_vararg = proto.is_vararg();
+                self.exec.proto_flag = proto.flag;
+                self.exec.nextraargs = 0;
                 // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
                 // upvals 是 Rc<RefCell<Vec>>，这里 clone 出 Vec 供执行期使用
-                self.closure_upvals = Rc::clone(&upvals);
-                self.tbc_list = None;
-                // 不清空 state.open_upval: 全局链表机制下，open_upval 不随函数调用/返回保存/恢复
+                self.exec.closure_upvals = Rc::clone(&upvals);
+                self.exec.tbc_list = None;
+                // 不清空 state.exec.open_upval: 全局链表机制下，open_upval 不随函数调用/返回保存/恢复
                 // (对应 C 的 L->openupval 全局链表，luaD_precall 不修改它)
 
                 if proto_is_vararg {
                     // vararg 函数: 截断栈到实际参数末尾，VARARGPREP 会处理
-                    self.stack.truncate(func_idx + 1 + nargs_actual);
+                    self.exec.stack.truncate(func_idx + 1 + nargs_actual);
                     for i in nargs_actual..nfixparams {
                         let idx = func_idx + 1 + i;
-                        while self.stack.len() <= idx {
-                            self.stack.push(TValue::Nil(NilKind::Strict));
+                        while self.exec.stack.len() <= idx {
+                            self.exec.stack.push(TValue::Nil(NilKind::Strict));
                         }
-                        self.stack[idx] = TValue::Nil(NilKind::Strict);
+                        self.exec.stack[idx] = TValue::Nil(NilKind::Strict);
                     }
-                    // 设置 state.top 供 VARARGPREP 计算 totalargs
+                    // 设置 state.exec.top 供 VARARGPREP 计算 totalargs
                     // (对应 C 的 L->top = ci->func + 1 + nargs)
-                    self.top = self.stack.len();
+                    self.exec.top = self.exec.stack.len();
                 } else {
                     let frame_end = func_idx + 1 + fsize;
-                    while self.stack.len() < frame_end {
-                        self.stack.push(TValue::Nil(NilKind::Strict));
+                    while self.exec.stack.len() < frame_end {
+                        self.exec.stack.push(TValue::Nil(NilKind::Strict));
                     }
                     for i in nargs_actual..nfixparams {
-                        self.stack[func_idx + 1 + i] = TValue::Nil(NilKind::Strict);
+                        self.exec.stack[func_idx + 1 + i] = TValue::Nil(NilKind::Strict);
                     }
-                    // 设置 state.top 为帧末尾 (对应 C 的 L->top = ci->top)
-                    self.top = frame_end;
+                    // 设置 state.exec.top 为帧末尾 (对应 C 的 L->top = ci->top)
+                    self.exec.top = frame_end;
                 }
 
                 // Shield 机制: 防止内层 pcall 的 error 被外层 PcallProtection 错误捕获
@@ -2486,12 +2530,12 @@ impl LuaState {
                 // 使 error 传播到本 state.pcall，而非被外层 PcallProtection 捕获。
                 // 典型场景: pcall(foo) yield 后，foo 的 __close error 应被
                 // call_close_method 的 state.pcall 捕获，而非 pcall(foo) 的 PcallProtection。
-                let need_shield = self
+                let need_shield = self.exec
                     .pcall_protection_stack
                     .last()
                     .map_or(false, |t| t.saved_filled);
                 if need_shield {
-                    self.pcall_protection_stack
+                    self.exec.pcall_protection_stack
                         .push(crate::state::PcallProtection {
                             saved_code: Rc::new(Vec::new()),
                             saved_constants: Rc::new(Vec::new()),
@@ -2526,7 +2570,7 @@ impl LuaState {
                 // 注意: 不清空 call_info，因为 op_return 只在 call_stack.pop() 成功时
                 // 才 pop call_info（call_stack 为空时不会 pop），且调用者（如 call_hook）
                 // 可能已 push call_info 供 debug.getinfo 使用。
-                let saved_call_stack_frames = std::mem::take(&mut self.call_stack);
+                let saved_call_stack_frames = std::mem::take(&mut self.exec.call_stack);
 
                 let result = VmExecutor::execute_loop(self);
 
@@ -2537,34 +2581,34 @@ impl LuaState {
                 //   只保留这些内层帧供协程恢复时使用。
                 //   外层帧（saved_call_stack_frames）保存到 PcallProtection.saved_call_stack，
                 //   由 finish_pcall_return 恢复。不合并到 call_stack: 否则 resume 后内层帧 pop 完
-                //   会错误 pop 外层帧，导致 state.base 跳过 pcall 的 func_idx+1。
+                //   会错误 pop 外层帧，导致 state.exec.base 跳过 pcall 的 func_idx+1。
                 //   外层帧持有 Rc 引用（code/constants/protos 等），必须保存以防释放后悬空指针。
                 if !matches!(&result, Ok(VmResult::Yield { .. })) {
-                    self.call_stack = saved_call_stack_frames;
+                    self.exec.call_stack = saved_call_stack_frames;
                 } else {
                     // yield: 只保留内层残留帧（被中断的调用），外层帧保存到 PcallProtection
-                    let pp_len = self.pcall_protection_stack.len();
+                    let pp_len = self.exec.pcall_protection_stack.len();
                     // 向下查找第一个未填充的 PcallProtection（与下方 saved_filled 更新逻辑一致）
                     let target_idx = if pp_len > 0 {
                         (0..pp_len)
                             .rev()
-                            .find(|&i| !self.pcall_protection_stack[i].saved_filled)
+                            .find(|&i| !self.exec.pcall_protection_stack[i].saved_filled)
                     } else {
                         None
                     };
                     match target_idx {
                         Some(idx) => {
-                            self.pcall_protection_stack[idx].saved_call_stack =
+                            self.exec.pcall_protection_stack[idx].saved_call_stack =
                                 saved_call_stack_frames;
-                            // remaining（内层帧）已在 self.call_stack 中
+                            // remaining（内层帧）已在 self.exec.call_stack 中
                         }
                         None => {
                             // fallback: 找不到目标 PcallProtection（嵌套 yield 场景）时，
                             // 合并到 call_stack 以避免丢弃 Rc 引用导致悬空指针
-                            let remaining = std::mem::take(&mut self.call_stack);
+                            let remaining = std::mem::take(&mut self.exec.call_stack);
                             let mut combined = saved_call_stack_frames;
                             combined.extend(remaining);
-                            self.call_stack = combined;
+                            self.exec.call_stack = combined;
                         }
                     }
                 }
@@ -2574,13 +2618,13 @@ impl LuaState {
                 //   - error 路径: op_call 的增量未被 op_return 递减,需整体恢复
                 // yield 路径不恢复 (协程恢复时由 ThreadContext 处理)。
                 if !matches!(&result, Ok(VmResult::Yield { .. })) {
-                    self.n_ccalls = saved_n_ccalls;
+                    self.exec.n_ccalls = saved_n_ccalls;
                 }
 
                 // pop shield: shield 只在 execute_loop 执行期间需要
                 // (yield 路径下也需先 pop shield，再更新顶部 PcallProtection)
                 if need_shield {
-                    self.pcall_protection_stack.pop();
+                    self.exec.pcall_protection_stack.pop();
                 }
 
                 // yield 不是错误: 暂存 yield 值,不关闭 TBC 变量
@@ -2600,16 +2644,16 @@ impl LuaState {
                     // 当 inner_func 后续执行 error/return 时,由 execute_loop 检查并处理。
                     // 跳过已 saved_filled=true 的（嵌套 yield 场景，内层 state.pcall 已更新），
                     // 向下查找第一个未填充的 PcallProtection（对应 C Lua 的多层 CallInfo）
-                    let pp_len = self.pcall_protection_stack.len();
+                    let pp_len = self.exec.pcall_protection_stack.len();
                     let target_idx = (0..pp_len)
                         .rev()
-                        .find(|&i| !self.pcall_protection_stack[i].saved_filled)
+                        .find(|&i| !self.exec.pcall_protection_stack[i].saved_filled)
                         .or_else(|| {
                             // 全部已填充: 无可更新目标（不应发生）
                             None
                         });
                     if let Some(idx) = target_idx {
-                        let top = &mut self.pcall_protection_stack[idx];
+                        let top = &mut self.exec.pcall_protection_stack[idx];
                         top.saved_code = saved_code.clone();
                         top.saved_constants = saved_constants.clone();
                         top.saved_upval_descs = saved_upval_descs.clone();
@@ -2640,7 +2684,7 @@ impl LuaState {
                 }
 
                 // 错误时关闭 to-be-closed 变量（对应 C 的 luaD_closeprotected -> luaF_close）
-                // 必须在恢复 saved 状态之前调用，此时 state.closure_upvals/open_upval 仍是 foo 的
+                // 必须在恢复 saved 状态之前调用，此时 state.exec.closure_upvals/open_upval 仍是 foo 的
                 //
                 // 在协程中 pcall 走 CIST_YPCALL 路径（对应 C Lua 的 lua_pcallk + continuation），
                 // error 时由 finishpcallk 用 yy=1（可 yield）处理 close。这里模拟该机制：
@@ -2668,7 +2712,7 @@ impl LuaState {
                             // 恢复此快照，让 debug.traceback 能看到错误发生时的帧（如 __close 帧）。
                             // 如果有 __close 帧（call_close_method 出错时保存到 last_close_frame），
                             // 追加到快照末尾，模拟 C Lua 中 CallInfo 节点保留在链表中的行为。
-                            let mut snapshot = self.call_info.clone();
+                            let mut snapshot = self.exec.call_info.clone();
                             if let Some(ref close_frame) = self.last_close_frame {
                                 snapshot.push(close_frame.clone());
                             }
@@ -2676,20 +2720,20 @@ impl LuaState {
                             self.last_close_frame = None;
                             // 清理 call_info 中 foo 执行期间的残留条目（对应 C 的 L->ci = old_ci）
                             // 必须在 func::close 之前执行，否则 debug.getinfo(2) 会读到残留条目
-                            self.call_info.truncate(saved_call_info_len);
-                            let close_level = self.base; // foo 的 base
+                            self.exec.call_info.truncate(saved_call_info_len);
+                            let close_level = self.exec.base; // foo 的 base
                                                          // __close 的调用者应是 pcall（C 函数），对应 C 版本中 foo 的 ci
                                                          // 在 error 时被弹出，调用栈上只剩 pcall 的 ci。
-                                                         // call_close_method 推入的 __close CallInfoEntry 的 base = state.base
-                                                         // = close_level。state.stack[close_level-1] 是 foo 闭包（LClosure），
+                                                         // call_close_method 推入的 __close CallInfoEntry 的 base = state.exec.base
+                                                         // = close_level。state.exec.stack[close_level-1] 是 foo 闭包（LClosure），
                                                          // 因为 call_pcall 把 foo 覆盖到 pcall 闭包位置。
                                                          // 临时设为 nil（非 LClosure），让 debug.getinfo(2) 返回 "C"。
                                                          // close 后会 truncate 栈到 func_idx，无需恢复。
-                            if close_level > 0 && close_level <= self.stack.len() {
-                                self.stack[close_level - 1] = TValue::Nil(NilKind::Strict);
+                            if close_level > 0 && close_level <= self.exec.stack.len() {
+                                self.exec.stack[close_level - 1] = TValue::Nil(NilKind::Strict);
                             }
                             // 在协程中用 yy=1（可 yield），对应 C Lua 的 finishpcallk 用 yy=1
-                            let close_yy = if self.n_ny_calls == 0 && self.current_thread.is_some()
+                            let close_yy = if self.exec.n_ny_calls == 0 && self.exec.current_thread.is_some()
                             {
                                 1
                             } else {
@@ -2717,16 +2761,16 @@ impl LuaState {
                 if is_close_yield {
                     // 设置 close_error_status — 保存 error 状态供 resume 时 finish_close_continuation 使用
                     // 对应 C Lua 的 CIST_RECST 保存的错误状态
-                    self.close_error_status = self.last_error_value.clone();
+                    self.exec.close_error_status = self.last_error_value.clone();
                     // 设置 pending_yield 供 call_pcall 传播
                     self.pending_yield = close_yield;
                     // 更新 PcallProtection saved_filled=true（类似 is_yield 路径）
-                    let pp_len = self.pcall_protection_stack.len();
+                    let pp_len = self.exec.pcall_protection_stack.len();
                     let target_idx = (0..pp_len)
                         .rev()
-                        .find(|&i| !self.pcall_protection_stack[i].saved_filled);
+                        .find(|&i| !self.exec.pcall_protection_stack[i].saved_filled);
                     if let Some(idx) = target_idx {
-                        let top = &mut self.pcall_protection_stack[idx];
+                        let top = &mut self.exec.pcall_protection_stack[idx];
                         top.saved_code = saved_code.clone();
                         top.saved_constants = saved_constants.clone();
                         top.saved_upval_descs = saved_upval_descs.clone();
@@ -2750,18 +2794,18 @@ impl LuaState {
                 // is_close_yield: __close 正在执行，state 是 __close 的状态
                 // is_yield: foo 直接 yield，state 是 foo 的状态
                 if !is_yield && !is_close_yield {
-                    self.code = saved_code;
-                    self.constants = saved_constants;
-                    self.upval_descs = saved_upval_descs;
-                    self.protos = saved_protos;
-                    self.base = saved_base;
-                    self.pc = saved_pc;
-                    self.num_params = saved_num_params;
-                    self.is_vararg = saved_is_vararg;
-                    self.proto_flag = saved_proto_flag;
-                    self.nextraargs = saved_nextraargs;
-                    self.closure_upvals = saved_closure_upvals;
-                    self.tbc_list = saved_tbc_list;
+                    self.exec.code = saved_code;
+                    self.exec.constants = saved_constants;
+                    self.exec.upval_descs = saved_upval_descs;
+                    self.exec.protos = saved_protos;
+                    self.exec.base = saved_base;
+                    self.exec.pc = saved_pc;
+                    self.exec.num_params = saved_num_params;
+                    self.exec.is_vararg = saved_is_vararg;
+                    self.exec.proto_flag = saved_proto_flag;
+                    self.exec.nextraargs = saved_nextraargs;
+                    self.exec.closure_upvals = saved_closure_upvals;
+                    self.exec.tbc_list = saved_tbc_list;
                 }
 
                 match result {
@@ -2781,23 +2825,23 @@ impl LuaState {
                         // 从 result_base 位置取结果（可能是 VARARGPREP 调整后的 base）
                         let mut tmp_results = Vec::new();
                         for i in 0..nret {
-                            if result_base + i < self.stack.len() {
-                                let v = std::mem::take(&mut self.stack[result_base + i]);
+                            if result_base + i < self.exec.stack.len() {
+                                let v = std::mem::take(&mut self.exec.stack[result_base + i]);
                                 tmp_results.push(v);
                             } else {
                                 tmp_results.push(TValue::Nil(NilKind::Strict));
                             }
                         }
-                        self.stack.truncate(func_idx);
+                        self.exec.stack.truncate(func_idx);
                         for i in 0..expected {
                             if i < tmp_results.len() {
-                                self.stack.push(std::mem::take(&mut tmp_results[i]));
+                                self.exec.stack.push(std::mem::take(&mut tmp_results[i]));
                             } else {
-                                self.stack.push(TValue::Nil(NilKind::Strict));
+                                self.exec.stack.push(TValue::Nil(NilKind::Strict));
                             }
                         }
                         if pushed_call_info {
-                            self.call_info.pop();
+                            self.exec.call_info.pop();
                         }
                         0
                     }
@@ -2807,9 +2851,9 @@ impl LuaState {
                         LUA_YIELD
                     }
                     Ok(_) => {
-                        self.stack.truncate(func_idx);
+                        self.exec.stack.truncate(func_idx);
                         if pushed_call_info {
-                            self.call_info.pop();
+                            self.exec.call_info.pop();
                         }
                         0
                     }
@@ -2825,8 +2869,8 @@ impl LuaState {
                             // truncate 只移动 top 指针，userdata 在 GC 前保持有效。
                             // Rust 用 Vec<TValue>，truncate 立即 drop，Rc 引用计数为 0 时
                             // userdata 内存被释放，导致悬空指针。此 keepalive 模拟 C Lua 行为。
-                            if self.stack.len() > func_idx {
-                                let drained = self.stack.split_off(func_idx);
+                            if self.exec.stack.len() > func_idx {
+                                let drained = self.exec.stack.split_off(func_idx);
                                 self.c_safety_keepalive.extend(drained);
                             }
                             // close 后 last_error_value 包含最终错误值（可能是原始错误或 __close 错误）
@@ -2846,7 +2890,7 @@ impl LuaState {
                             // 清除 last_error_value，防止残留值污染后续 pcall
                             // (对应 C Lua 的 longjmp 后错误状态不跨 pcall 保留)
                             self.last_error_value = None;
-                            self.stack.push(err_val);
+                            self.exec.stack.push(err_val);
                             ERR_RUN
                         }
                     }
@@ -2861,7 +2905,7 @@ impl LuaState {
                 Self::pcall_rust_fn(self, func_idx, nresults, rc.func, rc.name_str())
             }
             _ => {
-                self.stack.truncate(func_idx);
+                self.exec.stack.truncate(func_idx);
                 self.push_string(&format!(
                     "attempt to call a {} value",
                     self.typename(func_val.ty())
@@ -2887,35 +2931,35 @@ impl LuaState {
         // precallC: 设置 api_func_base，确保栈 capacity（不改变 len，避免干扰 lua_gettop）
         let saved_api_base = self.api_func_base;
         self.api_func_base = func_idx;
-        self.n_ccalls = self.n_ccalls.saturating_add(1);
+        self.exec.n_ccalls = self.exec.n_ccalls.saturating_add(1);
 
         // 保存 call_info 长度，用于调用后清理（同 pcall_rust_fn 的处理）。
         // C 函数内部可能推入额外 call_info 条目（如元方法条目），
         // 错误路径下这些条目可能未被弹出。
-        let saved_call_info_len = self.call_info.len();
+        let saved_call_info_len = self.exec.call_info.len();
 
         // 推入 CallInfoEntry — 对应 C 的 luaD_precall 创建新 CallInfo
         // pcall 路径下，调用者是 pcall（内部 C 函数），不是 Lua 函数，
         // caller_proto 延迟计算为 None 表示无法从代码分析函数名，
         // lua_getinfo("n") 返回 NULL，触发 luaL_argerror 调用 pushglobalfuncname 查找全局名。
-        self.call_info.push(crate::state::CallInfoEntry {
+        self.exec.call_info.push(crate::state::CallInfoEntry {
             is_c: true,
             closure: None,
             base: func_idx + 1,
             saved_pc: 0,
             name: None,
             namewhat: "",
-            proto_flag: self.proto_flag,
-            nextraargs: self.nextraargs,
+            proto_flag: self.exec.proto_flag,
+            nextraargs: self.exec.nextraargs,
             is_tailcall: false,
         });
 
         // 预留 capacity，但不 push nil（push 会改变 stack.len()，导致 C 函数中
         // lua_gettop 返回值偏移）。C 函数需要空间时通过 lua_checkstack 或
         // lua_pushxxx 自动扩展栈。
-        let needed_cap = self.stack.len() + MIN_STACK;
-        if self.stack.capacity() < needed_cap {
-            self.stack.reserve(MIN_STACK);
+        let needed_cap = self.exec.stack.len() + MIN_STACK;
+        if self.exec.stack.capacity() < needed_cap {
+            self.exec.stack.reserve(MIN_STACK);
         }
 
         // 清空 pending_error，捕获 C 函数中 lua_error 触发的错误
@@ -2972,13 +3016,13 @@ impl LuaState {
 
         // 恢复 api_func_base 和 n_ccalls（无论成功失败）
         self.api_func_base = saved_api_base;
-        self.n_ccalls = self.n_ccalls.saturating_sub(1);
+        self.exec.n_ccalls = self.exec.n_ccalls.saturating_sub(1);
 
         // 清理 call_info: 截断到调用前的长度（同 pcall_rust_fn 的处理）。
         // yield 路径: 不截断（保留 call_info 供 resume 使用）。
         let is_yield = self.pending_yield.is_some();
         if !is_yield {
-            self.call_info.truncate(saved_call_info_len);
+            self.exec.call_info.truncate(saved_call_info_len);
         }
 
         // 检查 C 函数内部是否发生了 yield（通过 lua_pcall → pcall → pending_yield）
@@ -2992,8 +3036,8 @@ impl LuaState {
         // 错误路径：lua_error 触发 (longjmp 或 panic) + pending_error
         if let Err(()) = call_result {
             if let Some(err_val) = self.pending_error.take() {
-                self.stack.truncate(func_idx);
-                self.stack.push(err_val);
+                self.exec.stack.truncate(func_idx);
+                self.exec.stack.push(err_val);
                 return ERR_RUN;
             }
             // 不应到达此处: longjmp/panic 必须伴随 pending_error
@@ -3002,7 +3046,7 @@ impl LuaState {
 
         let n = call_result.unwrap();
         // poscall: 把栈顶 n 个结果移动到 func_idx 位置
-        let top = self.stack.len();
+        let top = self.exec.stack.len();
         let n = n as usize;
         let first_result = top.saturating_sub(n);
 
@@ -3017,16 +3061,16 @@ impl LuaState {
 
         // 把结果复制到临时 Vec，避免覆盖问题
         let results: Vec<TValue> = (0..n)
-            .map(|i| self.stack[first_result + i].clone())
+            .map(|i| self.exec.stack[first_result + i].clone())
             .collect();
 
         // 截断到 func_idx，然后推入 expected 个结果
-        self.stack.truncate(func_idx);
+        self.exec.stack.truncate(func_idx);
         for i in 0..expected {
             if i < results.len() {
-                self.stack.push(results[i].clone());
+                self.exec.stack.push(results[i].clone());
             } else {
-                self.stack.push(TValue::Nil(NilKind::Strict));
+                self.exec.stack.push(TValue::Nil(NilKind::Strict));
             }
         }
         0
@@ -3043,24 +3087,24 @@ impl LuaState {
         func: crate::objects::BuiltinFnPtr,
         name: &'static str,
     ) -> i32 {
-        let nargs = self.stack.len().saturating_sub(func_idx + 1);
+        let nargs = self.exec.stack.len().saturating_sub(func_idx + 1);
 
         // 保存 call_info 长度，用于调用后清理。
         // 函数指针内部可能推入额外 call_info 条目（如元方法条目），
         // 错误路径下这些条目可能未被弹出（call_tm_res 在错误路径下保留元方法条目）。
         // 使用 truncate 确保正确清理，而非简单的 pop（pop 会弹出错误的条目）。
-        let saved_call_info_len = self.call_info.len();
+        let saved_call_info_len = self.exec.call_info.len();
 
         // 推入 CallInfoEntry，让 debug.getinfo/traceback 能正确看到 C 函数帧
-        self.call_info.push(crate::state::CallInfoEntry {
+        self.exec.call_info.push(crate::state::CallInfoEntry {
             is_c: true,
             closure: None,
             base: func_idx + 1,
             saved_pc: 0,
             name: Some(name),
             namewhat: "function",
-            proto_flag: self.proto_flag,
-            nextraargs: self.nextraargs,
+            proto_flag: self.exec.proto_flag,
+            nextraargs: self.exec.nextraargs,
             is_tailcall: false,
         });
 
@@ -3074,7 +3118,7 @@ impl LuaState {
         // yield 通过 longjmp 跳出，CallInfo 保留在链表中）。
         let is_yield = matches!(&dispatch_result, Err(crate::execute::VmError::Yield(_)));
         if !is_yield {
-            self.call_info.truncate(saved_call_info_len);
+            self.exec.call_info.truncate(saved_call_info_len);
         }
 
         match dispatch_result {
@@ -3087,49 +3131,49 @@ impl LuaState {
                 self.last_error_value = None;
                 self.last_error_msg.clear();
                 // C 函数 __close (如 coroutine.yield 作为 __close) yield 时，
-                // state.code/state.pc 未被修改（仍为 close 调用者的上下文）。
+                // state.exec.code/state.exec.pc 未被修改（仍为 close 调用者的上下文）。
                 // 需要更新 close continuation 的 PcallProtection，
                 // 以便 resume 时 finish_close_continuation 能正确恢复并重新执行 OP_RETURN/OP_CLOSE。
-                let pp_len = self.pcall_protection_stack.len();
+                let pp_len = self.exec.pcall_protection_stack.len();
                 let target_idx = (0..pp_len).rev().find(|&i| {
-                    !self.pcall_protection_stack[i].saved_filled
-                        && self.pcall_protection_stack[i].is_close_continuation
+                    !self.exec.pcall_protection_stack[i].saved_filled
+                        && self.exec.pcall_protection_stack[i].is_close_continuation
                 });
                 if let Some(idx) = target_idx {
-                    let top = &mut self.pcall_protection_stack[idx];
-                    top.saved_code = self.code.clone();
-                    top.saved_constants = self.constants.clone();
-                    top.saved_upval_descs = self.upval_descs.clone();
-                    top.saved_protos = self.protos.clone();
-                    top.saved_base = self.base;
+                    let top = &mut self.exec.pcall_protection_stack[idx];
+                    top.saved_code = self.exec.code.clone();
+                    top.saved_constants = self.exec.constants.clone();
+                    top.saved_upval_descs = self.exec.upval_descs.clone();
+                    top.saved_protos = self.exec.protos.clone();
+                    top.saved_base = self.exec.base;
                     // is_close_continuation: saved_pc 不 +1，保留指向 OP_RETURN/OP_CLOSE
-                    top.saved_pc = self.pc;
-                    top.saved_num_params = self.num_params;
-                    top.saved_is_vararg = self.is_vararg;
-                    top.saved_proto_flag = self.proto_flag;
-                    top.saved_nextraargs = self.nextraargs;
-                    top.saved_closure_upvals = Rc::clone(&self.closure_upvals);
-                    top.saved_tbc_list = self.tbc_list;
+                    top.saved_pc = self.exec.pc;
+                    top.saved_num_params = self.exec.num_params;
+                    top.saved_is_vararg = self.exec.is_vararg;
+                    top.saved_proto_flag = self.exec.proto_flag;
+                    top.saved_nextraargs = self.exec.nextraargs;
+                    top.saved_closure_upvals = Rc::clone(&self.exec.closure_upvals);
+                    top.saved_tbc_list = self.exec.tbc_list;
                     top.func_idx = func_idx;
                     top.saved_filled = true;
                 }
                 LUA_YIELD
             }
             Err(crate::execute::VmError::RuntimeError(msg)) => {
-                self.stack.truncate(func_idx);
+                self.exec.stack.truncate(func_idx);
                 self.push_string(&msg);
                 ERR_RUN
             }
             Err(crate::execute::VmError::RuntimeErrorValue(val)) => {
                 // 非字符串错误值（如 error(foo)）：保留原始 TValue 放到栈上，
                 // 供 pcall 返回 (false, original_value) 而非 (false, string)
-                self.stack.truncate(func_idx);
-                self.stack.push(val);
-                self.top = self.stack.len();
+                self.exec.stack.truncate(func_idx);
+                self.exec.stack.push(val);
+                self.exec.top = self.exec.stack.len();
                 ERR_RUN
             }
             Err(e) => {
-                self.stack.truncate(func_idx);
+                self.exec.stack.truncate(func_idx);
                 self.push_string(&format!("{}", e));
                 ERR_RUN
             }
@@ -3494,14 +3538,14 @@ impl LuaState {
         self.gc.gc_running.set(true);
         // 临时禁用 hook — GC 期间的 finalizer 调用不应触发用户的 hook
         // （对应 C 的 luaD_rawrunprotected 中 L->allowhook = 0 语义）
-        let saved_allowhook = self.allowhook;
-        self.allowhook = false;
+        let saved_allowhook = self.exec.allowhook;
+        self.exec.allowhook = false;
 
         let prev_estimate = self.gc.total_estimate();
         let result = self.collect_gc_inner();
 
         // 恢复 hook 状态
-        self.allowhook = saved_allowhook;
+        self.exec.allowhook = saved_allowhook;
         // 清除标志
         self.gc.gc_running.set(false);
         // GC 回收对象后，Rust 分配器（glibc malloc）可能仍持有释放的内存不归还操作系统。
@@ -3562,11 +3606,11 @@ impl LuaState {
         // GC 期间所有对象有效（sweep 在 mark 完成后），无需调整引用计数。
         let mut worklist: Vec<RawTValue> = Vec::with_capacity(est_reachable * 2);
 
-        // 收集根：栈 — 遍历到 self.top（对应 C Lua 的 traversethread: o < th->top）
-        // self.top 在 OP_CALL 中被设为 ra + b（函数+参数末尾），
-        // 在 OP_RETURN 中被设为返回值末尾。超出 self.top 的栈槽是"死亡"的。
-        let stack_top = self.top.min(self.stack.len());
-        for val in &self.stack[..stack_top] {
+        // 收集根：栈 — 遍历到 self.exec.top（对应 C Lua 的 traversethread: o < th->top）
+        // self.exec.top 在 OP_CALL 中被设为 ra + b（函数+参数末尾），
+        // 在 OP_RETURN 中被设为返回值末尾。超出 self.exec.top 的栈槽是"死亡"的。
+        let stack_top = self.exec.top.min(self.exec.stack.len());
+        for val in &self.exec.stack[..stack_top] {
             if Self::needs_gc_mark(val) {
                 unsafe { worklist.push(raw_from_tvalue(val)) };
             }
@@ -3586,7 +3630,7 @@ impl LuaState {
         }
 
         // 收集根：closure_upvals
-        for uv_ref in self.closure_upvals.borrow().iter() {
+        for uv_ref in self.exec.closure_upvals.borrow().iter() {
             let uv = uv_ref.borrow();
             match &*uv {
                 UpVal::Closed { value } => {
@@ -3595,8 +3639,8 @@ impl LuaState {
                     }
                 }
                 UpVal::Open { stack_index, .. } => {
-                    if *stack_index < self.stack.len() {
-                        let val = &self.stack[*stack_index];
+                    if *stack_index < self.exec.stack.len() {
+                        let val = &self.exec.stack[*stack_index];
                         if Self::needs_gc_mark(val) {
                             unsafe { worklist.push(raw_from_tvalue(val)) };
                         }
@@ -3606,7 +3650,7 @@ impl LuaState {
         }
 
         // 收集根：call_stack 中的 constants 和 closure_upvals
-        for frame in &self.call_stack {
+        for frame in &self.exec.call_stack {
             for val in &frame.constants[..] {
                 if Self::needs_gc_mark(val) {
                     unsafe { worklist.push(raw_from_tvalue(val)) };
@@ -3623,7 +3667,7 @@ impl LuaState {
         }
 
         // 收集根：call_info 中的 closures
-        for ci in &self.call_info {
+        for ci in &self.exec.call_info {
             if let Some(ref closure) = ci.closure {
                 let tv = TValue::LClosure(closure.clone());
                 unsafe { worklist.push(raw_from_tvalue(&tv)) };
@@ -3632,7 +3676,7 @@ impl LuaState {
         }
 
         // 收集根：hook_func
-        if let Some(ref hook) = self.hook_func {
+        if let Some(ref hook) = self.exec.hook_func {
             if Self::needs_gc_mark(hook) {
                 unsafe { worklist.push(raw_from_tvalue(hook)) };
             }
@@ -3962,7 +4006,7 @@ impl LuaState {
             usize,
             crate::objects::FxBuildHasher,
         > = std::collections::HashMap::with_hasher(crate::objects::FxBuildHasher::default());
-        for val in self.stack.iter() {
+        for val in self.exec.stack.iter() {
             if let TValue::Thread(t) = val {
                 let origins = t.context.borrow().upval_origins.clone();
                 for (uv_ref, stack_index) in origins {
@@ -4007,25 +4051,25 @@ impl LuaState {
                 Vec::new()
             };
 
-            let stack_base = self.stack.len();
-            let saved_base = self.base;
-            let saved_pc = self.pc;
-            let saved_closure_upvals = Rc::clone(&self.closure_upvals);
-            let saved_proto_flag = self.proto_flag;
-            let saved_nextraargs = self.nextraargs;
-            self.stack.push(gc_func);
-            self.stack.push(obj_val);
-            self.top = self.stack.len();
+            let stack_base = self.exec.stack.len();
+            let saved_base = self.exec.base;
+            let saved_pc = self.exec.pc;
+            let saved_closure_upvals = Rc::clone(&self.exec.closure_upvals);
+            let saved_proto_flag = self.exec.proto_flag;
+            let saved_nextraargs = self.exec.nextraargs;
+            self.exec.stack.push(gc_func);
+            self.exec.stack.push(obj_val);
+            self.exec.top = self.exec.stack.len();
 
-            self.call_info.push(CallInfoEntry {
+            self.exec.call_info.push(CallInfoEntry {
                 is_c: false,
                 closure: None,
-                base: self.base,
-                saved_pc: self.pc,
+                base: self.exec.base,
+                saved_pc: self.exec.pc,
                 name: Some("__gc"),
                 namewhat: "metamethod",
-                proto_flag: self.proto_flag,
-                nextraargs: self.nextraargs,
+                proto_flag: self.exec.proto_flag,
+                nextraargs: self.exec.nextraargs,
                 is_tailcall: false,
             });
 
@@ -4034,7 +4078,7 @@ impl LuaState {
             // os.exit(code, true) 在 finalizer 中设置 exit_requested 并用
             // "__exit_requested__" 错误中断 pcall，这是正常退出流程，不生成 warning
             if status != 0 && self.exit_requested.is_none() {
-                let msg = match self.stack.last() {
+                let msg = match self.exec.stack.last() {
                     Some(TValue::Str(s)) => s.as_str().to_string(),
                     _ => "error object is not a string".to_string(),
                 };
@@ -4045,14 +4089,14 @@ impl LuaState {
                 self.warning(")", false);
             }
 
-            self.stack.truncate(stack_base);
-            self.call_info.pop();
-            self.top = stack_base;
-            self.base = saved_base;
-            self.pc = saved_pc;
-            self.closure_upvals = saved_closure_upvals;
-            self.proto_flag = saved_proto_flag;
-            self.nextraargs = saved_nextraargs;
+            self.exec.stack.truncate(stack_base);
+            self.exec.call_info.pop();
+            self.exec.top = stack_base;
+            self.exec.base = saved_base;
+            self.exec.pc = saved_pc;
+            self.exec.closure_upvals = saved_closure_upvals;
+            self.exec.proto_flag = saved_proto_flag;
+            self.exec.nextraargs = saved_nextraargs;
 
             // 同步 finalizer 函数的 closed upvalue 值回主线程栈
             // finalizer 可能修改了 closed upvalue 的值（如 collected = true），
@@ -4062,7 +4106,7 @@ impl LuaState {
                     // 通过 Rc 指针找到对应的 upvalue，读取当前值
                     // 遍历栈上的协程找到该 upvalue 的 Rc 引用
                     let mut found_val = None;
-                    'outer: for val in self.stack.iter() {
+                    'outer: for val in self.exec.stack.iter() {
                         if let TValue::Thread(t) = val {
                             let origins = t.context.borrow().upval_origins.clone();
                             for (uv_ref, _idx) in &origins {
@@ -4077,8 +4121,8 @@ impl LuaState {
                         }
                     }
                     if let Some(val) = found_val {
-                        if stack_index < self.stack.len() {
-                            self.stack[stack_index] = val;
+                        if stack_index < self.exec.stack.len() {
+                            self.exec.stack[stack_index] = val;
                         }
                     }
                 }
@@ -4099,17 +4143,17 @@ impl LuaState {
             }
         }
         let ctx = thread.context.borrow();
-        for val in &ctx.saved_stack {
+        for val in &ctx.exec.stack {
             if Self::needs_gc_mark(val) {
                 unsafe { worklist.push(raw_from_tvalue(val)) };
             }
         }
-        for val in &ctx.saved_constants[..] {
+        for val in &ctx.exec.constants[..] {
             if Self::needs_gc_mark(val) {
                 unsafe { worklist.push(raw_from_tvalue(val)) };
             }
         }
-        for uv_ref in ctx.saved_closure_upvals.borrow().iter() {
+        for uv_ref in ctx.exec.closure_upvals.borrow().iter() {
             let uv = uv_ref.borrow();
             match &*uv {
                 UpVal::Closed { value } => {
@@ -4118,8 +4162,8 @@ impl LuaState {
                     }
                 }
                 UpVal::Open { stack_index, .. } => {
-                    if *stack_index < ctx.saved_stack.len() {
-                        let val = &ctx.saved_stack[*stack_index];
+                    if *stack_index < ctx.exec.stack.len() {
+                        let val = &ctx.exec.stack[*stack_index];
                         if Self::needs_gc_mark(val) {
                             unsafe { worklist.push(raw_from_tvalue(val)) };
                         }
@@ -4127,7 +4171,7 @@ impl LuaState {
                 }
             }
         }
-        for frame in &ctx.saved_call_stack {
+        for frame in &ctx.exec.call_stack {
             for val in &frame.constants[..] {
                 if Self::needs_gc_mark(val) {
                     unsafe { worklist.push(raw_from_tvalue(val)) };
@@ -4142,7 +4186,7 @@ impl LuaState {
                 }
             }
         }
-        if let Some(ref hook) = ctx.saved_hook_func {
+        if let Some(ref hook) = ctx.exec.hook_func {
             if Self::needs_gc_mark(hook) {
                 unsafe { worklist.push(raw_from_tvalue(hook)) };
             }
@@ -4152,7 +4196,7 @@ impl LuaState {
                 unsafe { worklist.push(raw_from_tvalue(err)) };
             }
         }
-        for ci in &ctx.saved_call_info {
+        for ci in &ctx.exec.call_info {
             if let Some(ref closure) = ci.closure {
                 let tv = TValue::LClosure(closure.clone());
                 unsafe { worklist.push(raw_from_tvalue(&tv)) };
@@ -4265,8 +4309,8 @@ impl LuaState {
                                 }
                             }
                             UpVal::Open { stack_index, .. } => {
-                                if *stack_index < self.stack.len() {
-                                    let val = &self.stack[*stack_index];
+                                if *stack_index < self.exec.stack.len() {
+                                    let val = &self.exec.stack[*stack_index];
                                     if Self::needs_gc_mark(val) {
                                         unsafe { worklist.push(raw_from_tvalue(val)) };
                                     }
@@ -4588,9 +4632,9 @@ mod tests {
             "stack length must be 1 (function entry slot)"
         );
         // stack[0] 必须是函数入口 nil
-        assert!(matches!(state.stack[0], TValue::Nil(NilKind::Strict)));
+        assert!(matches!(state.exec.stack[0], TValue::Nil(NilKind::Strict)));
         // 容量 = BASIC_STACK_SIZE + EXTRA_STACK
-        assert_eq!(state.stack.capacity(), BASIC_STACK_SIZE + EXTRA_STACK);
+        assert_eq!(state.exec.stack.capacity(), BASIC_STACK_SIZE + EXTRA_STACK);
     }
 
     #[test]
@@ -4622,22 +4666,22 @@ mod tests {
 
         // case 1: base=0, empty stack → main function scenario
         let state = LuaState::from_proto(&proto, 0, vec![], gc.clone());
-        assert_eq!(state.base, 0);
+        assert_eq!(state.exec.base, 0);
         assert_eq!(
-            state.stack.len(),
+            state.exec.stack.len(),
             10,
             "base=0 with max_stack_size=10 must allocate 10 register slots"
         );
 
         // case 2: base=1, empty stack → called function scenario
         let state = LuaState::from_proto(&proto, 1, vec![], gc.clone());
-        assert_eq!(state.base, 1);
+        assert_eq!(state.exec.base, 1);
         assert_eq!(
-            state.stack.len(),
+            state.exec.stack.len(),
             11,
             "base=1 with max_stack_size=10 must allocate 1+10=11 slots"
         );
-        assert!(matches!(state.stack[0], TValue::Nil(NilKind::Strict)));
+        assert!(matches!(state.exec.stack[0], TValue::Nil(NilKind::Strict)));
 
         // case 3: base=1, stack with args → called function
         let state = LuaState::from_proto(
@@ -4646,14 +4690,14 @@ mod tests {
             vec![TValue::Nil(NilKind::Strict), TValue::Integer(42)],
             gc.clone(),
         );
-        assert_eq!(state.base, 1);
+        assert_eq!(state.exec.base, 1);
         assert_eq!(
-            state.stack.len(),
+            state.exec.stack.len(),
             11,
             "base=1 with max_stack_size=10 must allocate 1+10=11 slots"
         );
-        assert!(matches!(state.stack[0], TValue::Nil(NilKind::Strict)));
-        assert_eq!(state.stack[1], TValue::Integer(42));
+        assert!(matches!(state.exec.stack[0], TValue::Nil(NilKind::Strict)));
+        assert_eq!(state.exec.stack[1], TValue::Integer(42));
     }
 
     #[test]
@@ -4661,7 +4705,7 @@ mod tests {
         let gc = Rc::new(GCState::default_incremental());
         let state = LuaState::with_gc(gc);
         assert_eq!(state.gettop(), 1, "with_gc must also init stack");
-        assert_eq!(state.stack.capacity(), BASIC_STACK_SIZE + EXTRA_STACK);
+        assert_eq!(state.exec.stack.capacity(), BASIC_STACK_SIZE + EXTRA_STACK);
     }
 
     #[test]
@@ -4747,7 +4791,7 @@ mod tests {
             state.to_string(-1)
         );
         assert!(
-            matches!(state.stack.last(), Some(TValue::LClosure(_))),
+            matches!(state.exec.stack.last(), Some(TValue::LClosure(_))),
             "stack top should be a closure"
         );
     }
@@ -4763,7 +4807,7 @@ mod tests {
             "load_file should succeed: {:?}",
             state.to_string(-1)
         );
-        assert!(matches!(state.stack.last(), Some(TValue::LClosure(_))));
+        assert!(matches!(state.exec.stack.last(), Some(TValue::LClosure(_))));
     }
 
     #[test]
@@ -4827,7 +4871,7 @@ mod tests {
             "load_file should succeed: {:?}",
             state.to_string(-1)
         );
-        assert!(matches!(state.stack.last(), Some(TValue::LClosure(_))));
+        assert!(matches!(state.exec.stack.last(), Some(TValue::LClosure(_))));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -4842,7 +4886,7 @@ mod tests {
             "empty shebang file should load: {:?}",
             state.to_string(-1)
         );
-        assert!(matches!(state.stack.last(), Some(TValue::LClosure(_))));
+        assert!(matches!(state.exec.stack.last(), Some(TValue::LClosure(_))));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -4861,7 +4905,7 @@ mod tests {
             "latin1 string literal should load: {:?}",
             state.to_string(-1)
         );
-        assert!(matches!(state.stack.last(), Some(TValue::LClosure(_))));
+        assert!(matches!(state.exec.stack.last(), Some(TValue::LClosure(_))));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -4880,7 +4924,7 @@ mod tests {
             "shebang + latin1 should load: {:?}",
             state.to_string(-1)
         );
-        assert!(matches!(state.stack.last(), Some(TValue::LClosure(_))));
+        assert!(matches!(state.exec.stack.last(), Some(TValue::LClosure(_))));
         let _ = std::fs::remove_file(&path);
     }
 }

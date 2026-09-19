@@ -106,10 +106,10 @@ mod compat {
 
 fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.stack.len() {
+    if stack_idx >= state.exec.stack.len() {
         return TValue::Nil(NilKind::Strict);
     }
-    state.stack[stack_idx].clone()
+    state.exec.stack[stack_idx].clone()
 }
 
 fn push_single_result(state: &mut LuaState, a: usize, nresults: i32, result: TValue) {

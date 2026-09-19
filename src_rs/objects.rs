@@ -313,7 +313,7 @@ impl fmt::Display for LuaType {
 /// 使用 Rust ABI 和 `Result` 错误处理，类型安全且无 `unsafe`：
 ///
 /// - `state`: VM 状态（可变引用，非裸指针）
-/// - `a`: 函数在栈中的位置（0-based，`state.stack[a]` 是函数本身，参数从 `a+1` 开始）
+/// - `a`: 函数在栈中的位置（0-based，`state.exec.stack[a]` 是函数本身，参数从 `a+1` 开始）
 /// - `nargs`: 参数数量
 /// - `nresults`: 期望结果数（-1 = MULTRET，>=0 = 固定数量）
 ///
@@ -510,7 +510,7 @@ mod builtin_names {
 /// ## 调用路径
 ///
 /// 与 `BuiltinFn` 相同：op_call/op_tailcall/TFORCALL/pcall 直接通过函数指针派发，
-/// 无需 tag 匹配或 metatable 查找。被调用函数从 `state.stack[a]` 取回 RustClosure，
+/// 无需 tag 匹配或 metatable 查找。被调用函数从 `state.exec.stack[a]` 取回 RustClosure，
 /// 再从 upvalues 取状态。
 ///
 /// ## GC
@@ -1608,44 +1608,16 @@ pub struct CallFrame {
 
 /// 协程挂起时保存的 VM 执行上下文
 ///
-/// coroutine.yield 时把当前执行状态保存到 ThreadContext，
-/// coroutine.resume 时从 ThreadContext 恢复继续执行。
-#[derive(Debug, Clone, Default)]
+/// coroutine.yield 时把当前执行状态 (ExecState) 整体交换到 ThreadContext.exec，
+/// coroutine.resume 时与 LuaState.exec 两个 Box 指针整体交换回来 (O(1))。
+#[derive(Debug)]
 pub struct ThreadContext {
     /// 是否已开始执行（首次 resume 后置 true）
     pub started: bool,
     /// 协程当前状态（共享可变，对应 LuaThread.status 的真实来源）
     pub status: ThreadStatus,
-    /// 挂起时保存的 VM 执行上下文
-    pub saved_code: Rc<Vec<Instruction>>,
-    pub saved_constants: Rc<Vec<TValue>>,
-    pub saved_upval_descs: Rc<Vec<UpvalDesc>>,
-    /// 协程挂起时保存的子原型列表 — Rc 共享，yield/resume 时 O(1) 引用计数
-    pub saved_protos: Rc<Vec<Rc<Proto>>>,
-    pub saved_base: usize,
-    pub saved_pc: usize,
-    pub saved_top: usize,
-    pub saved_num_params: u8,
-    pub saved_is_vararg: bool,
-    pub saved_proto_flag: u8,
-    pub saved_nextraargs: i32,
-    pub saved_closure_upvals: Rc<RefCell<Vec<UpValRef>>>,
-    pub saved_open_upvals: Vec<UpValRef>,
-    pub saved_open_upval: Option<usize>,
-    pub saved_tbc_list: Option<usize>,
-    pub saved_call_stack: Vec<CallFrame>,
-    pub saved_stack: Vec<TValue>,
-    pub saved_hook_old_pc: i32,
-    /// 协程自己的 hook 设置（由 debug.sethook(co, ...) 设置）
-    /// resume 时恢复到 state，yield 时从 state 保存回此处
-    pub saved_hook_func: Option<TValue>,
-    pub saved_hook_mask: i32,
-    pub saved_hook_count: i32,
-    pub saved_current_hook_count: i32,
-    pub saved_allowhook: bool,
-    /// yield 调用的 nresults（恢复时用于调整 resume 参数数量）
-    /// 仅在 started=true 且上次是 yield 挂起时有意义
-    pub saved_yield_nresults: i32,
+    /// 挂起时保存的 VM 执行上下文 — resume 时与 LuaState.exec 整体交换
+    pub exec: Box<crate::state::ExecState>,
     /// 协程错误时保存的错误信息（status=Error 时有效）
     /// coroutine.close 时若协程已 dead 且有错误，应返回该错误
     pub error_msg: Option<TValue>,
@@ -1656,24 +1628,30 @@ pub struct ThreadContext {
     /// 0 表示在主线程创建；非 0 表示在某个协程内创建（Rc::as_ptr 的 usize 值）
     pub wrap_creator_thread_ptr: usize,
     /// wrap 协程创建时保存的开 upvalue 信息（uv_ref, original_stack_index, saved_value）
-    /// 首次 resume 时若同栈则从 state.stack 读最新值关闭；若跨栈则用 saved_value 关闭
+    /// 首次 resume 时若同栈则从 state.exec.stack 读最新值关闭；若跨栈则用 saved_value 关闭
     pub pending_wrap_upvals: Vec<(UpValRef, usize, TValue)>,
     /// yield 时关闭的 Open upvalue 信息（协程内部创建的闭包的 upvalue）
     /// resume 时把 Closed 值同步回协程栈并恢复 Open
     pub yield_upval_origins: Vec<(UpValRef, usize)>,
-    /// 协程 yield 时保存的 pcall_protection_stack 片段（协程内部 push 的部分）
-    /// resume 时恢复到 state.pcall_protection_stack，协程结束时不清除（由调用者清理）
-    pub saved_pcall_protection_stack: Vec<crate::state::PcallProtection>,
-    /// 协程 yield 时保存的 call_info（调用栈信息）
-    /// 用于 debug.traceback(co) 和 debug.getinfo(co, level) 在协程挂起时查看调用栈
-    pub saved_call_info: Vec<crate::state::CallInfoEntry>,
-    /// 协程 yield 时保存的 close_error_status（close continuation 的 pending error）
-    /// 对应 C Lua 的 CIST_RECST 保存的错误状态。
-    /// pcall error 路径的 close_yield 时设置，resume 后由 finish_close_continuation 读取。
-    pub saved_close_error_status: Option<TValue>,
     /// 原始 LuaThread 的弱引用 — 用于 coroutine.running() 返回同一对象
     /// 避免 sleep_session/wakeup_queue 等 table 查找因对象不一致而失败
     pub thread_ref: std::rc::Weak<LuaThread>,
+}
+
+impl Default for ThreadContext {
+    fn default() -> Self {
+        ThreadContext {
+            started: false,
+            status: ThreadStatus::Suspended,
+            exec: Box::new(crate::state::ExecState::default()),
+            error_msg: None,
+            upval_origins: Vec::new(),
+            wrap_creator_thread_ptr: 0,
+            pending_wrap_upvals: Vec::new(),
+            yield_upval_origins: Vec::new(),
+            thread_ref: std::rc::Weak::new(),
+        }
+    }
 }
 
 /// Lua 线程（协程）

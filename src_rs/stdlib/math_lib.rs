@@ -583,8 +583,8 @@ pub fn math_randomseed(state: &mut RandState, args: &[TValue]) -> Result<(i64, i
 /// 从栈中读取参数 (0-based 索引, 相对于函数位置 a)
 fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
     let stack_idx = a + 1 + idx;
-    if stack_idx < state.stack.len() {
-        state.stack[stack_idx].clone()
+    if stack_idx < state.exec.stack.len() {
+        state.exec.stack[stack_idx].clone()
     } else {
         TValue::Nil(NilKind::Strict)
     }
@@ -680,7 +680,7 @@ fn call_abs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Resu
             "bad argument #1 to 'abs' (number expected, got no value)".to_string(),
         ));
     }
-    let arg = &state.stack[a + 1];
+    let arg = &state.exec.stack[a + 1];
     match arg {
         TValue::Integer(i) => {
             state.adjust_single_result(a, nresults, TValue::Integer(i.wrapping_abs()));
@@ -748,7 +748,7 @@ fn unary_slow_convert(v: &TValue, fname: &str) -> Result<f64, VmError> {
 /// 通用一元浮点函数派发 — 用于 sin/cos/tan/asin/acos/deg/rad/exp/sqrt
 ///
 /// perf: 热路径零分配零冗余匹配 —
-/// - 直接索引 state.stack[a+1] (nargs>=1 时 VM 保证参数在栈上), 不经 get_arg 的
+/// - 直接索引 state.exec.stack[a+1] (nargs>=1 时 VM 保证参数在栈上), 不经 get_arg 的
 ///   clone + 边界分支;
 /// - 单次 match 同时完成 Integer/Float 提取 (原 get_number_arg + to_float 两轮 match);
 /// - adjust_single_result 替代 push_single_result (原 vec![result] 每次调用一次堆分配);
@@ -775,10 +775,10 @@ where
     // 不满足 (多参/非 1-out/非数值参/hook) 落回原通用路径, 语义逐位不变。
     let spec_x: Option<f64> = if nargs == 1
         && nresults == 1
-        && state.stack.len() == a + 2
-        && (state.hook_mask & 2 == 0 || !state.allowhook)
+        && state.exec.stack.len() == a + 2
+        && (state.exec.hook_mask & 2 == 0 || !state.exec.allowhook)
     {
-        match unsafe { state.stack.get_unchecked(a + 1) } {
+        match unsafe { state.exec.stack.get_unchecked(a + 1) } {
             TValue::Float(v) => Some(*v),
             TValue::Integer(v) => Some(*v as f64),
             _ => None,
@@ -789,7 +789,7 @@ where
     if let Some(x) = spec_x {
         let y = f(x);
         unsafe {
-            let slot = state.stack.get_unchecked_mut(a);
+            let slot = state.exec.stack.get_unchecked_mut(a);
             if matches!(
                 slot,
                 TValue::Nil(_)
@@ -803,15 +803,15 @@ where
                 *slot = TValue::Float(y);
             }
             // 唯一尾槽 = 数值参数 (trivially droppable), set_len 免 drop
-            state.stack.set_len(a + 1);
+            state.exec.stack.set_len(a + 1);
         }
-        state.top = a + 1;
+        state.exec.top = a + 1;
         return Ok(());
     }
     if nargs == 0 {
         return Err(unary_no_arg(fname));
     }
-    let arg = &state.stack[a + 1];
+    let arg = &state.exec.stack[a + 1];
     let x = match arg {
         TValue::Float(fl) => *fl,
         TValue::Integer(i) => *i as f64,
@@ -869,13 +869,13 @@ fn call_atan(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
             "bad argument #1 to 'atan' (number expected, got no value)".to_string(),
         ));
     }
-    let y = match &state.stack[a + 1] {
+    let y = match &state.exec.stack[a + 1] {
         TValue::Float(fl) => *fl,
         TValue::Integer(i) => *i as f64,
         other => unary_slow_convert(other, "atan")?,
     };
     let x = if nargs >= 2 {
-        match &state.stack[a + 2] {
+        match &state.exec.stack[a + 2] {
             TValue::Float(fl) => Some(*fl),
             TValue::Integer(i) => Some(*i as f64),
             other => Some(unary_slow_convert(other, "atan")?),
@@ -897,13 +897,13 @@ fn call_log(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Resu
             "bad argument #1 to 'log' (number expected, got no value)".to_string(),
         ));
     }
-    let x = match &state.stack[a + 1] {
+    let x = match &state.exec.stack[a + 1] {
         TValue::Float(fl) => *fl,
         TValue::Integer(i) => *i as f64,
         other => unary_slow_convert(other, "log")?,
     };
     let base = if nargs >= 2 {
-        match &state.stack[a + 2] {
+        match &state.exec.stack[a + 2] {
             TValue::Float(fl) => Some(*fl),
             TValue::Integer(i) => Some(*i as f64),
             other => Some(unary_slow_convert(other, "log")?),

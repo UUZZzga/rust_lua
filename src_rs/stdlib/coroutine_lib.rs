@@ -16,7 +16,7 @@ use crate::execute::{VmError, VmExecutor, VmResult};
 use crate::objects::{
     BuiltinFn, LuaThread, NilKind, TValue, Table, ThreadContext, ThreadStatus, UpVal, UpValRef,
 };
-use crate::state::LuaState;
+use crate::state::{ExecState, LuaState};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -26,10 +26,10 @@ use std::rc::Rc;
 
 fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.stack.len() {
+    if stack_idx >= state.exec.stack.len() {
         return TValue::Nil(NilKind::Strict);
     }
-    state.stack[stack_idx].clone()
+    state.exec.stack[stack_idx].clone()
 }
 
 fn push_single_result(state: &mut LuaState, a: usize, nresults: i32, result: TValue) {
@@ -44,25 +44,25 @@ fn push_resume_results(
     success: bool,
     values: Vec<TValue>,
 ) {
-    state.stack.truncate(a);
+    state.exec.stack.truncate(a);
     if nresults == 0 {
         return;
     }
-    state.stack.push(TValue::Boolean(success));
+    state.exec.stack.push(TValue::Boolean(success));
     for v in values {
-        state.stack.push(v);
+        state.exec.stack.push(v);
     }
     if nresults > 0 {
-        let current = state.stack.len() - a;
+        let current = state.exec.stack.len() - a;
         if current > nresults as usize {
-            state.stack.truncate(a + nresults as usize);
+            state.exec.stack.truncate(a + nresults as usize);
         } else {
-            while (state.stack.len() - a) < nresults as usize {
-                state.stack.push(TValue::Nil(NilKind::Strict));
+            while (state.exec.stack.len() - a) < nresults as usize {
+                state.exec.stack.push(TValue::Nil(NilKind::Strict));
             }
         }
     }
-    state.top = state.stack.len();
+    state.exec.top = state.exec.stack.len();
 }
 
 /// 推送 resume 结果(从协程栈中直接读取返回值，避免创建中间 Vec)
@@ -76,11 +76,11 @@ fn push_resume_results_from_stack(
     result_base: usize,
     n: usize,
 ) {
-    state.stack.truncate(a);
+    state.exec.stack.truncate(a);
     if nresults == 0 {
         return;
     }
-    state.stack.push(TValue::Boolean(success));
+    state.exec.stack.push(TValue::Boolean(success));
     if nresults > 0 {
         // 固定结果数: 只需 nresults-1 个返回值，避免 push 全部 n 个值导致 OOM
         let nvals = (nresults as usize).saturating_sub(1);
@@ -90,11 +90,11 @@ fn push_resume_results_from_stack(
             } else {
                 TValue::Nil(NilKind::Strict)
             };
-            state.stack.push(val);
+            state.exec.stack.push(val);
         }
         // 不足则补 nil
-        while (state.stack.len() - a) < nresults as usize {
-            state.stack.push(TValue::Nil(NilKind::Strict));
+        while (state.exec.stack.len() - a) < nresults as usize {
+            state.exec.stack.push(TValue::Nil(NilKind::Strict));
         }
     } else {
         // LUA_MULTRET: push 全部返回值
@@ -104,11 +104,11 @@ fn push_resume_results_from_stack(
             } else {
                 TValue::Nil(NilKind::Strict)
             };
-            state.stack.push(val);
+            state.exec.stack.push(val);
         }
     }
     // co_stack 在此 drop，释放协程栈内存
-    state.top = state.stack.len();
+    state.exec.top = state.exec.stack.len();
 }
 
 /// 推送 resume 错误结果: false + error message
@@ -129,104 +129,36 @@ fn push_resume_error(
 }
 
 // ============================================================================
-// 调用者上下文保存/恢复 — 用于 call_resume 切换到协程上下文
+// 执行上下文交换 — 协程切换的核心
 // ============================================================================
+//
+// 协程的整个执行状态 (ExecState) 存放在 ThreadContext.exec (Box<ExecState>)，
+// 运行中的协程状态在 LuaState.exec。resume/yield 只需交换两个 Box 指针 (O(1))，
+// 替代原先 ~30 字段逐个 save/restore。caller 的 exec 随 swap 进入 ctx.exec，
+// 挂起的协程 exec 随 swap 进入 state.exec，语义与 C Lua 的每线程 lua_State 一致。
 
-/// 保存调用者的 VM 执行上下文到局部变量（使用 mem::take 避免克隆）
-struct CallerContext {
-    code: Rc<Vec<crate::objects::Instruction>>,
-    constants: Rc<Vec<TValue>>,
-    upval_descs: Rc<Vec<crate::objects::UpvalDesc>>,
-    /// 调用者子原型列表 — Rc 共享，save/restore 时 O(1) 引用计数
-    protos: Rc<Vec<Rc<crate::objects::Proto>>>,
-    base: usize,
-    pc: usize,
-    top: usize,
-    num_params: u8,
-    is_vararg: bool,
-    proto_flag: u8,
-    nextraargs: i32,
-    closure_upvals: Rc<RefCell<Vec<crate::objects::UpValRef>>>,
-    open_upvals: Vec<crate::objects::UpValRef>,
-    open_upval: Option<usize>,
-    tbc_list: Option<usize>,
-    call_stack: Vec<crate::objects::CallFrame>,
-    stack: Vec<TValue>,
-    hook_old_pc: i32,
-    hook_func: Option<TValue>,
-    hook_mask: i32,
-    hook_count: i32,
-    current_hook_count: i32,
-    allowhook: bool,
-    current_thread: Option<Rc<RefCell<ThreadContext>>>,
-    call_info: Vec<crate::state::CallInfoEntry>,
+/// 把 LuaState.exec（当前运行协程）与 ThreadContext.exec（挂起协程）整体交换。
+/// 调用后 state.exec = 协程的 exec，ctx.exec = 调用者的 exec。
+#[inline]
+fn swap_exec(state: &mut LuaState, ctx: &Rc<RefCell<ThreadContext>>) {
+    let mut borrowed = ctx.borrow_mut();
+    std::mem::swap(&mut state.exec, &mut borrowed.exec);
 }
 
-/// 保存调用者上下文（使用 mem::take 避免克隆）
-fn save_caller_context(state: &mut LuaState) -> CallerContext {
-    CallerContext {
-        code: std::mem::take(&mut state.code),
-        constants: std::mem::take(&mut state.constants),
-        upval_descs: std::mem::take(&mut state.upval_descs),
-        protos: std::mem::take(&mut state.protos),
-        base: state.base,
-        pc: state.pc,
-        top: state.top,
-        num_params: state.num_params,
-        is_vararg: state.is_vararg,
-        proto_flag: state.proto_flag,
-        nextraargs: state.nextraargs,
-        closure_upvals: std::mem::replace(
-            &mut state.closure_upvals,
-            Rc::new(RefCell::new(Vec::new())),
-        ),
-        open_upvals: std::mem::take(&mut state.open_upvals),
-        open_upval: state.open_upval,
-        tbc_list: state.tbc_list,
-        call_stack: std::mem::take(&mut state.call_stack),
-        stack: std::mem::take(&mut state.stack),
-        hook_old_pc: state.hook_old_pc,
-        hook_func: state.hook_func.take(),
-        hook_mask: state.hook_mask,
-        hook_count: state.hook_count,
-        current_hook_count: state.current_hook_count,
-        allowhook: state.allowhook,
-        current_thread: state.current_thread.take(),
-        call_info: std::mem::take(&mut state.call_info),
-    }
+/// 首次 resume: 用全新构建的协程 ExecState 替换 state.exec，
+/// 并把调用者的 exec 存入 ThreadContext.exec。
+fn install_fresh_exec(state: &mut LuaState, ctx: &Rc<RefCell<ThreadContext>>, co_exec: ExecState) {
+    let caller_exec = std::mem::replace(&mut state.exec, Box::new(co_exec));
+    ctx.borrow_mut().exec = caller_exec;
 }
 
-/// 恢复调用者上下文
-fn restore_caller_context(state: &mut LuaState, ctx: CallerContext) {
-    state.code = ctx.code;
-    state.constants = ctx.constants;
-    state.upval_descs = ctx.upval_descs;
-    state.protos = ctx.protos;
-    state.base = ctx.base;
-    state.pc = ctx.pc;
-    state.top = ctx.top;
-    state.num_params = ctx.num_params;
-    state.is_vararg = ctx.is_vararg;
-    state.proto_flag = ctx.proto_flag;
-    state.nextraargs = ctx.nextraargs;
-    state.closure_upvals = ctx.closure_upvals;
-    state.open_upvals = ctx.open_upvals;
-    state.open_upval = ctx.open_upval;
-    state.tbc_list = ctx.tbc_list;
-    state.call_stack = ctx.call_stack;
-    state.stack = ctx.stack;
-    state.hook_old_pc = ctx.hook_old_pc;
-    state.hook_func = ctx.hook_func;
-    state.hook_mask = ctx.hook_mask;
-    state.hook_count = ctx.hook_count;
-    state.current_hook_count = ctx.current_hook_count;
-    state.allowhook = ctx.allowhook;
-    state.current_thread = ctx.current_thread;
-    state.call_info = ctx.call_info;
-    // 确保 top 与 stack 同步
-    if state.top > state.stack.len() {
-        state.top = state.stack.len();
-    }
+/// resume 进入协程后的公共初始化（swap 之后调用）:
+/// 按调用者的计数重置协程的 C 栈保护计数，保证跨多次 resume 不累积。
+#[inline]
+fn init_coroutine_guards(state: &mut LuaState, saved_n_ccalls: u32) {
+    state.exec.n_ccalls = saved_n_ccalls.saturating_add(1);
+    state.exec.n_ny_calls = 0;
+    state.exec.force_noyield_close = false;
 }
 
 // ============================================================================
@@ -266,8 +198,8 @@ fn close_open_upvals(thread: &LuaThread, state: &mut LuaState) -> Vec<OpenUpvalI
             } else {
                 // C 函数体 (如 pcall): 函数本身没有 upvalue，但其参数中可能有 LClosure
                 // 这些 LClosure 的 Open upvalue 仍指向父栈，需要转为 Closed
-                // 参数在 call_resume 中通过 state.stack[a+2..] 访问（resume_args 之前）
-                // 但此时还未 save_caller_context，state.stack 仍是父栈
+                // 参数在 call_resume 中通过 state.exec.stack[a+2..] 访问（resume_args 之前）
+                // 但此时还未 save_caller_context，state.exec.stack 仍是父栈
                 // 直接扫描栈上的 LClosure 参数
                 let mut visited = std::collections::HashSet::with_hasher(
                     crate::objects::FxBuildHasher::default(),
@@ -294,8 +226,8 @@ fn scan_stack_for_closures(
 ) {
     let mut visited_tables =
         std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
-    // 先 clone 栈上的 LClosure/Table 引用（避免遍历时借用 state.stack）
-    let closures: Vec<Rc<RefCell<Vec<UpValRef>>>> = state
+    // 先 clone 栈上的 LClosure/Table 引用（避免遍历时借用 state.exec.stack）
+    let closures: Vec<Rc<RefCell<Vec<UpValRef>>>> = state.exec
         .stack
         .iter()
         .filter_map(|v| {
@@ -306,7 +238,7 @@ fn scan_stack_for_closures(
             }
         })
         .collect();
-    let tables: Vec<Table> = state
+    let tables: Vec<Table> = state.exec
         .stack
         .iter()
         .filter_map(|v| {
@@ -336,7 +268,7 @@ fn scan_stack_for_closures(
 /// 否则链表中残留的 Closed upvalue 会让 func::close 遍历中断（Closed 无 next 字段）
 fn close_upval_by_ref(state: &mut LuaState, uv_ref: &Rc<RefCell<UpVal>>, val: TValue) {
     let ptr = Rc::as_ptr(uv_ref) as usize;
-    if let Some(uv_idx) = state
+    if let Some(uv_idx) = state.exec
         .open_upvals
         .iter()
         .position(|r| Rc::as_ptr(r) as usize == ptr)
@@ -380,7 +312,7 @@ fn collect_and_close_upvals_impl(
             match &*uv {
                 UpVal::Open { stack_index, .. } => {
                     let original_idx = *stack_index;
-                    let val = state
+                    let val = state.exec
                         .stack
                         .get(original_idx)
                         .cloned()
@@ -488,7 +420,7 @@ fn scan_table_and_close_upvals(
 
 /// 关闭 hook 函数的 Open upvalue（供 debug.sethook 使用）
 /// 把 hook 函数及其嵌套 LClosure 的 Open upvalue 转为 Closed，
-/// 避免协程执行期间 state.stack 被替换后 upvalue 失效
+/// 避免协程执行期间 state.exec.stack 被替换后 upvalue 失效
 pub fn close_hook_upvals(hook: &TValue, state: &mut LuaState) {
     if let TValue::LClosure(closure) = hook {
         let mut result = Vec::new();
@@ -520,7 +452,7 @@ fn collect_wrap_upvals_info(
             // C 函数体: 扫描栈上的 LClosure 和 Table 参数
             let mut visited_tables =
                 std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
-            for v in state.stack.iter() {
+            for v in state.exec.stack.iter() {
                 match v {
                     TValue::LClosure(closure) => {
                         collect_open_upvals_recursive_impl(
@@ -577,7 +509,7 @@ fn collect_open_upvals_recursive_impl(
             match &*uv {
                 UpVal::Open { stack_index, .. } => {
                     let original_idx = *stack_index;
-                    let val = state
+                    let val = state.exec
                         .stack
                         .get(original_idx)
                         .cloned()
@@ -691,9 +623,9 @@ fn sync_upvals_back(
                 UpVal::Open { .. } => continue, // 已是 Open，跳过
             }
         };
-        // 写入父栈原位置（跨栈时跳过：state.stack 不是原始父栈）
-        if write_back && info.original_stack_index < state.stack.len() {
-            state.stack[info.original_stack_index] = latest_val.clone();
+        // 写入父栈原位置（跨栈时跳过：state.exec.stack 不是原始父栈）
+        if write_back && info.original_stack_index < state.exec.stack.len() {
+            state.exec.stack[info.original_stack_index] = latest_val.clone();
         }
         // 协程已结束: 恢复为 Open（指向父栈原位置）并重新加入链表
         if co_finished {
@@ -713,7 +645,7 @@ fn sync_upvals_back(
             };
             if need_relink {
                 let ptr = Rc::as_ptr(&info.uv_ref) as usize;
-                if let Some(uv_idx) = state
+                if let Some(uv_idx) = state.exec
                     .open_upvals
                     .iter()
                     .position(|r| Rc::as_ptr(r) as usize == ptr)
@@ -726,7 +658,7 @@ fn sync_upvals_back(
 }
 
 /// yield 时关闭 yield 出来的闭包的 Open upvalue（指向协程栈）
-/// 在 saved_stack = take(state.stack) 之前调用（state.stack 仍是协程栈）
+/// 在 saved_stack = take(state.exec.stack) 之前调用（state.exec.stack 仍是协程栈）
 /// 返回 (uv_ref, original_stack_index) 列表，供 resume 时同步回协程栈
 fn close_yield_upvals(yield_values: &[TValue], state: &mut LuaState) -> Vec<(UpValRef, usize)> {
     let mut result_info: Vec<OpenUpvalInfo> = Vec::new();
@@ -757,8 +689,8 @@ fn close_yield_upvals(yield_values: &[TValue], state: &mut LuaState) -> Vec<(UpV
             _ => {}
         }
     }
-    // 遍历 state.open_upval 链表，关闭所有剩余的 open upvalue。
-    // 这些 upvalue 指向协程栈，yield 后 state.stack 切回主线程栈，
+    // 遍历 state.exec.open_upval 链表，关闭所有剩余的 open upvalue。
+    // 这些 upvalue 指向协程栈，yield 后 state.exec.stack 切回主线程栈，
     // 若不关闭，外部持有的闭包（前一次 yield 传出但不在本次 yield 值中）
     // 会通过 Open upvalue 访问主线程栈的错误位置。
     // 跳过 TBC upvalue：它们只在协程内部通过 func::close 访问，
@@ -767,12 +699,12 @@ fn close_yield_upvals(yield_values: &[TValue], state: &mut LuaState) -> Vec<(UpV
     // 导致后续 close 不调用 __close。
     // 先收集要关闭的 uv_idx（遍历链表时不能修改链表），再逐个 unlink + close
     let mut to_close: Vec<(usize, usize)> = Vec::new(); // (uv_idx, stack_index)
-    let mut current = state.open_upval;
+    let mut current = state.exec.open_upval;
     while let Some(uv_idx) = current {
-        if uv_idx >= state.open_upvals.len() {
+        if uv_idx >= state.exec.open_upvals.len() {
             break;
         }
-        let uv_ref = state.open_upvals[uv_idx].clone();
+        let uv_ref = state.exec.open_upvals[uv_idx].clone();
         let (stack_index, next, is_open, is_tbc) = {
             let uv = uv_ref.borrow();
             match &*uv {
@@ -794,12 +726,12 @@ fn close_yield_upvals(yield_values: &[TValue], state: &mut LuaState) -> Vec<(UpV
         current = next;
     }
     for (uv_idx, stack_index) in to_close {
-        let val = state
+        let val = state.exec
             .stack
             .get(stack_index)
             .cloned()
             .unwrap_or(TValue::Nil(NilKind::Strict));
-        let uv_ref = state.open_upvals[uv_idx].clone();
+        let uv_ref = state.exec.open_upvals[uv_idx].clone();
         crate::func::unlink_upval(state, uv_idx);
         *uv_ref.borrow_mut() = UpVal::Closed {
             value: Box::new(val),
@@ -820,20 +752,20 @@ fn close_yield_upvals(yield_values: &[TValue], state: &mut LuaState) -> Vec<(UpV
 /// 否则后续 close_yield_upvals 遍历链表时找不到该 upvalue
 fn relink_upval(state: &mut LuaState, uv_idx: usize) {
     let stack_index = {
-        let uv = state.open_upvals[uv_idx].borrow();
+        let uv = state.exec.open_upvals[uv_idx].borrow();
         match &*uv {
             UpVal::Open { stack_index, .. } => *stack_index,
             _ => return,
         }
     };
     let mut prev: Option<usize> = None;
-    let mut current = state.open_upval;
+    let mut current = state.exec.open_upval;
     while let Some(idx) = current {
         if idx == uv_idx {
             return; // 已在链表中
         }
         let (cur_level, next) = {
-            let uv = state.open_upvals[idx].borrow();
+            let uv = state.exec.open_upvals[idx].borrow();
             match &*uv {
                 UpVal::Open {
                     stack_index, next, ..
@@ -849,7 +781,7 @@ fn relink_upval(state: &mut LuaState, uv_idx: usize) {
     }
     let next_node = current;
     {
-        let mut uv = state.open_upvals[uv_idx].borrow_mut();
+        let mut uv = state.exec.open_upvals[uv_idx].borrow_mut();
         if let UpVal::Open {
             ref mut previous,
             ref mut next,
@@ -862,17 +794,17 @@ fn relink_upval(state: &mut LuaState, uv_idx: usize) {
     }
     match prev {
         Some(p_idx) => {
-            let mut p = state.open_upvals[p_idx].borrow_mut();
+            let mut p = state.exec.open_upvals[p_idx].borrow_mut();
             if let UpVal::Open { ref mut next, .. } = &mut *p {
                 *next = Some(uv_idx);
             }
         }
         None => {
-            state.open_upval = Some(uv_idx);
+            state.exec.open_upval = Some(uv_idx);
         }
     }
     if let Some(n_idx) = next_node {
-        let mut n = state.open_upvals[n_idx].borrow_mut();
+        let mut n = state.exec.open_upvals[n_idx].borrow_mut();
         if let UpVal::Open {
             ref mut previous, ..
         } = &mut *n
@@ -883,7 +815,7 @@ fn relink_upval(state: &mut LuaState, uv_idx: usize) {
 }
 
 /// resume 时把 yield 时关闭的 upvalue 的 Closed 值同步回协程栈，并恢复 Open
-/// 在 setup_subsequent_resume 恢复 state.stack 之后调用
+/// 在 setup_subsequent_resume 恢复 state.exec.stack 之后调用
 fn sync_yield_upvals_back(state: &mut LuaState, origins: &[(UpValRef, usize)]) {
     for (uv_ref, stack_index) in origins {
         let val = {
@@ -894,8 +826,8 @@ fn sync_yield_upvals_back(state: &mut LuaState, origins: &[(UpValRef, usize)]) {
             }
         };
         // 写回协程栈
-        if *stack_index < state.stack.len() {
-            state.stack[*stack_index] = val;
+        if *stack_index < state.exec.stack.len() {
+            state.exec.stack[*stack_index] = val;
         }
         // 恢复为 Open（指向协程栈）
         *uv_ref.borrow_mut() = UpVal::Open {
@@ -906,7 +838,7 @@ fn sync_yield_upvals_back(state: &mut LuaState, origins: &[(UpValRef, usize)]) {
         };
         // 重新加入 open_upval 链表
         let ptr = Rc::as_ptr(uv_ref) as usize;
-        if let Some(uv_idx) = state
+        if let Some(uv_idx) = state.exec
             .open_upvals
             .iter()
             .position(|r| Rc::as_ptr(r) as usize == ptr)
@@ -977,7 +909,7 @@ fn call_status(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
                 "running"
             } else {
                 // 检查是否为当前正在运行的协程
-                let is_current = state
+                let is_current = state.exec
                     .current_thread
                     .as_ref()
                     .map(|ctx| Rc::ptr_eq(ctx, &t.context))
@@ -1023,7 +955,7 @@ fn call_close(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
         // 并通过 luaD_throwbaselevel 抛到 base level。我们的实现未完整支持此语义，
         // 改为设置 force_noyield_close 标志，让后续 OP_RETURN 的 func::close 使用
         // 不可 yield 模式 (yy=0)，使 __close 中的 yield 失败。
-        state.force_noyield_close = true;
+        state.exec.force_noyield_close = true;
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'close' (thread expected)".to_string(),
         ));
@@ -1042,7 +974,7 @@ fn call_close(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
     // 主线程不可关闭
     if thread.is_main {
         // 判断 main 当前状态: 若在协程中执行,main 是 "normal";否则 "running"
-        let in_coroutine = state.current_thread.is_some();
+        let in_coroutine = state.exec.current_thread.is_some();
         if in_coroutine {
             return Err(VmError::RuntimeError(
                 "cannot close a normal coroutine".to_string(),
@@ -1060,7 +992,7 @@ fn call_close(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
             // 正在运行的协程：如果是当前协程自身（close itself，在 __close 内调用），
             // 返回 (true, nil)（对应 C 的 lua_closethread(co, co) close itself）；
             // 否则报错
-            let is_current = state
+            let is_current = state.exec
                 .current_thread
                 .as_ref()
                 .map(|ct| Rc::ptr_eq(ct, &thread.context))
@@ -1112,37 +1044,12 @@ fn close_suspended_coroutine(
     a: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
-    // 保存调用者上下文
-    let caller_ctx = save_caller_context(state);
-    let saved_n_ccalls = state.n_ccalls;
-
-    // 从 ThreadContext 恢复协程上下文（不推入 resume 参数，因为我们要关闭而非恢复）
+    // 交换: caller exec -> ctx.exec, 协程 exec -> state.exec (O(1))
     let co_context = thread.context.clone();
-    {
-        let ctx = co_context.borrow();
-        state.code = ctx.saved_code.clone();
-        state.constants = ctx.saved_constants.clone();
-        state.upval_descs = ctx.saved_upval_descs.clone();
-        state.protos = ctx.saved_protos.clone();
-        state.base = ctx.saved_base;
-        state.pc = ctx.saved_pc;
-        state.num_params = ctx.saved_num_params;
-        state.is_vararg = ctx.saved_is_vararg;
-        state.proto_flag = ctx.saved_proto_flag;
-        state.nextraargs = ctx.saved_nextraargs;
-        state.closure_upvals = Rc::clone(&ctx.saved_closure_upvals);
-        state.open_upvals = ctx.saved_open_upvals.clone();
-        state.open_upval = ctx.saved_open_upval;
-        state.tbc_list = ctx.saved_tbc_list;
-        state.call_stack = ctx.saved_call_stack.clone();
-        state.stack = ctx.saved_stack.clone();
-        state.top = ctx.saved_top;
-        state.hook_old_pc = ctx.saved_hook_old_pc;
-        state.call_info = Vec::new();
-    }
+    swap_exec(state, &co_context);
 
     // 设置 current_thread 和状态
-    state.current_thread = Some(co_context.clone());
+    state.exec.current_thread = Some(co_context.clone());
     co_context.borrow_mut().status = ThreadStatus::Normal;
 
     // 保存 close 前的 last_error_msg 状态（用于检测 __close 是否出错）
@@ -1153,7 +1060,7 @@ fn close_suspended_coroutine(
     // 调用 close 关闭所有 TBC upvalue（运行 __close metamethod）
     // close 函数内部对 TBC upvalue 调用 call_close_method，使用 pcall 处理错误
     // status=0 表示正常关闭（err 参数为 nil）
-    crate::func::close(state, state.base, 0, 1).ok();
+    crate::func::close(state, state.exec.base, 0, 1).ok();
 
     // 检查 close 过程中是否有错误
     let close_error: Option<TValue> = if !state.last_error_msg.is_empty() {
@@ -1167,25 +1074,14 @@ fn close_suspended_coroutine(
         None
     };
 
-    // 清空协程的 ThreadContext（协程已结束）
+    // 交换回调用者；协程已结束，清空其 exec（释放挂起栈内存）
     {
         let mut ctx = co_context.borrow_mut();
-        ctx.saved_code = Rc::new(Vec::new());
-        ctx.saved_constants = Rc::new(Vec::new());
-        ctx.saved_upval_descs = Rc::new(Vec::new());
-        ctx.saved_protos = Rc::new(Vec::new());
-        ctx.saved_closure_upvals = Rc::new(RefCell::new(Vec::new()));
-        ctx.saved_call_stack = Vec::new();
-        ctx.saved_stack = Vec::new();
-        ctx.saved_open_upval = None;
-        ctx.saved_tbc_list = None;
+        std::mem::swap(&mut state.exec, &mut ctx.exec);
+        ctx.exec = Box::new(ExecState::default());
         ctx.status = ThreadStatus::OK;
         ctx.error_msg = None;
     }
-
-    // 恢复调用者上下文
-    restore_caller_context(state, caller_ctx);
-    state.n_ccalls = saved_n_ccalls;
 
     // 恢复 last_error_msg 状态（清理 close 期间的错误）
     state.last_error_msg = saved_err_msg;
@@ -1231,7 +1127,7 @@ fn call_isyieldable(
         }
     } else {
         // 无参数：当前是否可 yield（在协程中且无非可 yield 的 C 函数调用）
-        state.current_thread.is_some() && state.n_ny_calls == 0
+        state.exec.current_thread.is_some() && state.exec.n_ny_calls == 0
     };
     push_single_result(state, a, nresults, TValue::Boolean(yieldable));
     Ok(())
@@ -1247,7 +1143,7 @@ fn call_running(
     _nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
-    let (thread_val, ismain) = match &state.current_thread {
+    let (thread_val, ismain) = match &state.exec.current_thread {
         Some(ctx) => {
             // 在协程中 — 返回该协程的原始 LuaThread 对象（通过 thread_ref）
             // 这样 coroutine.running() 每次返回同一对象，table 查找才能正确工作
@@ -1274,22 +1170,22 @@ fn call_running(
         }
     };
 
-    state.stack.truncate(a);
+    state.exec.stack.truncate(a);
     if nresults >= 1 {
-        state.stack.push(thread_val);
+        state.exec.stack.push(thread_val);
         if nresults >= 2 {
-            state.stack.push(TValue::Boolean(ismain));
+            state.exec.stack.push(TValue::Boolean(ismain));
         }
-        let current = state.stack.len() - a;
+        let current = state.exec.stack.len() - a;
         for _ in current..nresults as usize {
-            state.stack.push(TValue::Nil(NilKind::Strict));
+            state.exec.stack.push(TValue::Nil(NilKind::Strict));
         }
     } else if nresults < 0 {
         // MULTRET
-        state.stack.push(thread_val);
-        state.stack.push(TValue::Boolean(ismain));
+        state.exec.stack.push(thread_val);
+        state.exec.stack.push(TValue::Boolean(ismain));
     }
-    state.top = state.stack.len();
+    state.exec.top = state.exec.stack.len();
     Ok(())
 }
 
@@ -1336,48 +1232,35 @@ fn call_resume(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     // 收集 resume 参数（thread 之后的参数）
     let resume_args: Vec<TValue> = if nargs > 1 {
         (0..nargs - 1)
-            .map(|i| state.stack[a + 2 + i].clone())
+            .map(|i| state.exec.stack[a + 2 + i].clone())
             .collect()
     } else {
         Vec::new()
     };
 
-    // 收集开 upvalue 信息（在 save_caller_context 之前，state.stack 仍是父栈）
+    // 收集开 upvalue 信息（在 save_caller_context 之前，state.exec.stack 仍是父栈）
     let open_upvals = close_open_upvals(&thread, state);
 
-    // 保存调用者上下文
-    let caller_ctx = save_caller_context(state);
-    // 保存 n_ccalls (协程执行期间可能修改,退出时恢复)
-    let saved_n_ccalls = state.n_ccalls;
-    // 保存 n_ny_calls 并重置为 0（协程初始状态是可 yield 的）
-    let saved_n_ny_calls = state.n_ny_calls;
-    state.n_ny_calls = 0;
-    // 保存 force_noyield_close 并重置为 false
-    // 协程内 coroutine.close() 关闭自身时设置，只在协程内有效；
-    // 调用者的 force_noyield_close 不应泄漏到协程，反之亦然。
-    let saved_force_noyield_close = state.force_noyield_close;
-    state.force_noyield_close = false;
-    // 保存 pcall_protection_stack 长度（协程内部 push 的 PcallProtection 不应泄漏到外部）
-    let saved_pcall_protection_len = state.pcall_protection_stack.len();
+    // 保存调用者的 C 栈保护计数（协程执行期间可能修改；协程 exec 与调用者 exec
+    // 随 swap 交换，退出时调用者原值自动恢复，无需显式还原）
+    let saved_n_ccalls = state.exec.n_ccalls;
 
     // 设置协程上下文
     let co_context = thread.context.clone();
     let is_first_resume = !co_context.borrow().started;
 
+    // setup 内部完成 exec 交换：调用者 exec -> ctx.exec，协程 exec -> state.exec (O(1))
     let setup_result = if is_first_resume {
         // 首次 resume — 从协程体函数初始化
         setup_first_resume(state, &thread, &resume_args)
     } else {
-        // 后续 resume — 从 ThreadContext 恢复
+        // 后续 resume — 交换回协程 exec 并推送 resume 参数
         setup_subsequent_resume(state, &co_context, &resume_args)
     };
 
     if let Err(e) = setup_result {
-        restore_caller_context(state, caller_ctx);
-        // 恢复 n_ccalls (协程 yield/error 可能导致 n_ccalls 不准确)
-        state.n_ccalls = saved_n_ccalls;
-        state.n_ny_calls = saved_n_ny_calls;
-        state.force_noyield_close = saved_force_noyield_close;
+        // setup 失败（仅首次 resume 的"body 不是函数"路径）：未发生交换，
+        // state.exec 仍是调用者的，直接返回
         return Err(e);
     }
 
@@ -1387,34 +1270,22 @@ fn call_resume(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         co_context.borrow_mut().started = true;
     }
 
-    // 从 ThreadContext 恢复协程的 hook 设置到 state
-    // (save_caller_context 已保存主线程的 hook，restore_caller_context 会恢复)
-    {
-        let ctx = co_context.borrow();
-        state.hook_func = ctx.saved_hook_func.clone();
-        state.hook_mask = ctx.saved_hook_mask;
-        state.hook_count = ctx.saved_hook_count;
-        state.current_hook_count = ctx.saved_current_hook_count;
-        state.allowhook = ctx.saved_allowhook;
-    }
-
-    // 递增 n_ccalls 防止协程嵌套过深导致 Rust 栈溢出
-    // (对应 C Lua 的 luaD_resume: L->ci->nCcalls = L->nCcalls + 1)
-    state.n_ccalls = state.n_ccalls.saturating_add(1);
-    if state.n_ccalls >= crate::state::LUAI_MAXCCALLS {
-        state.n_ccalls = saved_n_ccalls;
-        state.n_ny_calls = saved_n_ny_calls;
-        state.force_noyield_close = saved_force_noyield_close;
-        restore_caller_context(state, caller_ctx);
+    // 按调用者计数初始化协程的 C 栈保护（跨多次 resume 不累积）。
+    // 协程的 hook 已随 swap 就位（首次 resume 由 setup_first_resume 从旧 ctx.exec
+    // 保留 pre-hook，后续 resume 由上次 yield 保存的 exec 带来）。
+    init_coroutine_guards(state, saved_n_ccalls);
+    if state.exec.n_ccalls >= crate::state::LUAI_MAXCCALLS {
+        // C 栈溢出：交换回调用者 exec
+        swap_exec(state, &co_context);
         return push_resume_error(state, a, nresults, "C stack overflow");
     }
 
     // 设置 current_thread 和状态
-    state.current_thread = Some(co_context.clone());
+    state.exec.current_thread = Some(co_context.clone());
     co_context.borrow_mut().status = ThreadStatus::Normal;
 
     // 首次 resume 时触发 call hook（对应 C Lua 的 luaD_hook(L, LUA_HOOKCALL, -1, 0, 0)）
-    if is_first_resume && state.hook_mask & 1 != 0 && state.hook_func.is_some() {
+    if is_first_resume && state.exec.hook_mask & 1 != 0 && state.exec.hook_func.is_some() {
         VmExecutor::call_hook(state, "call", -1, None, 0, 0)?;
     }
 
@@ -1424,6 +1295,7 @@ fn call_resume(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     // 处理结果
     // co_stack_info: Return 分支取出协程整个栈，避免 clone 大量返回值导致 OOM
     // (stack, result_base, n) — 从取出的栈的 [result_base, result_base+n) 读取返回值
+    // 每个分支内部完成 swap 交换回调用者 exec，之后 state.exec = 调用者。
     let (success, result_values, mut co_stack_info): (
         bool,
         Vec<TValue>,
@@ -1432,59 +1304,24 @@ fn call_resume(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         Ok(VmResult::Yield { values }) => {
             // 关闭 yield 出来的闭包的 Open upvalue（协程栈还有效时）
             let yield_origins = close_yield_upvals(&values, state);
-            // 协程 yield — 保存上下文到 ThreadContext
-            {
-                let mut ctx = co_context.borrow_mut();
-                ctx.saved_code = std::mem::take(&mut state.code);
-                ctx.saved_constants = std::mem::take(&mut state.constants);
-                ctx.saved_upval_descs = std::mem::take(&mut state.upval_descs);
-                ctx.saved_protos = std::mem::take(&mut state.protos);
-                ctx.saved_base = state.base;
-                // C 函数 __close (如 coroutine.yield 作为 __close) yield 时，
-                // state.pc 指向 OP_RETURN/OP_CLOSE（非 CALL 指令），不应 +1。
-                // 此时 PcallProtection.saved_pc == state.pc（都指向 OP_RETURN/OP_CLOSE）。
-                // Lua __close yield 时，state.pc 指向 __close 中的 CALL 指令，
-                // saved_pc 指向 OP_RETURN/OP_CLOSE，二者不同，需要 +1 跳过 CALL。
-                let is_c_close_yield = state.pcall_protection_stack.last().map_or(false, |t| {
-                    t.is_close_continuation && t.saved_filled && t.saved_pc == state.pc
-                });
-                ctx.saved_pc = if is_c_close_yield {
-                    state.pc
-                } else {
-                    state.pc + 1
-                };
-                ctx.saved_top = state.top;
-                ctx.saved_num_params = state.num_params;
-                ctx.saved_is_vararg = state.is_vararg;
-                ctx.saved_proto_flag = state.proto_flag;
-                ctx.saved_nextraargs = state.nextraargs;
-                ctx.saved_closure_upvals =
-                    std::mem::replace(&mut state.closure_upvals, Rc::new(RefCell::new(Vec::new())));
-                ctx.saved_open_upvals = std::mem::take(&mut state.open_upvals);
-                ctx.saved_open_upval = state.open_upval;
-                ctx.saved_tbc_list = state.tbc_list;
-                ctx.saved_call_stack = std::mem::take(&mut state.call_stack);
-                ctx.saved_stack = std::mem::take(&mut state.stack);
-                ctx.saved_call_info = std::mem::take(&mut state.call_info);
-                ctx.yield_upval_origins = yield_origins;
-                ctx.saved_hook_old_pc = state.hook_old_pc;
-                ctx.saved_hook_func = state.hook_func.take();
-                ctx.saved_hook_mask = state.hook_mask;
-                ctx.saved_hook_count = state.hook_count;
-                ctx.saved_current_hook_count = state.current_hook_count;
-                ctx.saved_allowhook = state.allowhook;
-                ctx.saved_pcall_protection_stack =
-                    state.pcall_protection_stack[saved_pcall_protection_len..].to_vec();
-                // 保存 close_error_status（close continuation 的 pending error）
-                // 对应 C Lua 的 CIST_RECST 保存的错误状态，跨 yield/resume 保留
-                ctx.saved_close_error_status = state.close_error_status.take();
-                ctx.status = ThreadStatus::Suspended;
-                // saved_yield_nresults 已由 call_yield 设置
-            }
-            // yield 时从 state 中移除协程的 PcallProtection（避免污染调用者 state）
-            state
-                .pcall_protection_stack
-                .truncate(saved_pcall_protection_len);
+            // C 函数 __close (如 coroutine.yield 作为 __close) yield 时，
+            // state.exec.pc 指向 OP_RETURN/OP_CLOSE（非 CALL 指令），不应 +1。
+            // 此时 PcallProtection.saved_pc == state.exec.pc（都指向 OP_RETURN/OP_CLOSE）。
+            // Lua __close yield 时，state.exec.pc 指向 __close 中的 CALL 指令，
+            // saved_pc 指向 OP_RETURN/OP_CLOSE，二者不同，需要 +1 跳过 CALL。
+            let is_c_close_yield = state.exec.pcall_protection_stack.last().map_or(false, |t| {
+                t.is_close_continuation && t.saved_filled && t.saved_pc == state.exec.pc
+            });
+            state.exec.pc = if is_c_close_yield {
+                state.exec.pc
+            } else {
+                state.exec.pc + 1
+            };
+            // 保存 yield 关闭的 upvalue 来源（resume 时同步回协程栈）
+            co_context.borrow_mut().yield_upval_origins = yield_origins;
+            // 交换回调用者（协程 exec 连同 pc/pcall 保护等进入 ctx.exec）
+            swap_exec(state, &co_context);
+            co_context.borrow_mut().status = ThreadStatus::Suspended;
             (true, values, None)
         }
         Ok(VmResult::Return {
@@ -1493,44 +1330,47 @@ fn call_resume(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         }) => {
             // 协程返回 — 取出协程整个栈(用 mem::take 避免分配新 Vec)
             // 返回值在 stack[result_base..result_base+ret_n]，后续从取出的栈中读取
-            let co_stack = std::mem::take(&mut state.stack);
+            let co_stack = std::mem::take(&mut state.exec.stack);
             {
                 let mut ctx = co_context.borrow_mut();
                 ctx.status = ThreadStatus::OK;
                 ctx.started = true;
-                // 协程结束，清空 saved_call_info（对应 C 中协程 dead 后 ci 链为空）
-                ctx.saved_call_info.clear();
+                // 交换回调用者（协程 exec 进入 ctx.exec）
+                std::mem::swap(&mut state.exec, &mut ctx.exec);
+                // 协程结束，清空 call_info（对应 C 中协程 dead 后 ci 链为空）
+                ctx.exec.call_info.clear();
             }
             (true, Vec::new(), Some((co_stack, result_base, ret_n)))
         }
         Ok(_) => {
             let mut ctx = co_context.borrow_mut();
             ctx.status = ThreadStatus::OK;
-            ctx.saved_call_info.clear();
+            // 交换回调用者
+            std::mem::swap(&mut state.exec, &mut ctx.exec);
+            ctx.exec.call_info.clear();
             (true, Vec::new(), None)
         }
         Err(e) => {
-            // 保存 error 状态到 ctx — 对应 C 中 lua_resume 不可恢复错误时
-            // CallInfo 链不展开（luaD_throw longjmp 跳过正常清理），
-            // 保留 error 时的状态供 debug.traceback 使用。
+            // 保存 error 状态快照（pre-close 的调用栈，供 debug.traceback(co) 使用）。
             // 必须在 TBC 关闭之前保存（TBC 关闭会修改 stack[base-1]）。
             // 只克隆到 base 的部分栈（build_traceback_from_thread 只需要
-            // saved_stack[saved_base-1] 处的 LClosure），避免克隆整个栈导致 OOM。
-            {
-                let mut ctx = co_context.borrow_mut();
-                ctx.saved_call_info = std::mem::take(&mut state.call_info);
-                let save_end = state.base.min(state.stack.len());
-                ctx.saved_stack = state.stack[..save_end].to_vec();
-                ctx.saved_base = state.base;
-                ctx.saved_pc = state.pc.wrapping_add(1);
-            }
+            // ctx.exec.stack[ctx.exec.base-1] 处的 LClosure），避免克隆整个栈导致 OOM。
+            let (err_call_info, err_stack, err_base, err_pc) = {
+                let save_end = state.exec.base.min(state.exec.stack.len());
+                (
+                    std::mem::take(&mut state.exec.call_info),
+                    state.exec.stack[..save_end].to_vec(),
+                    state.exec.base,
+                    state.exec.pc.wrapping_add(1),
+                )
+            };
             // 第二次 resume 时 pcall 的保护已丢失（state.pcall 的 saved 状态是局部变量，
             // yield 后被销毁）。需要在此手动关闭协程（foo）的 TBC 变量，
             // 对应 C Lua 中 pcall 错误时 luaD_closeprotected -> luaF_close 的行为。
-            let close_level = state.base;
-            if close_level > 0 && close_level <= state.stack.len() {
+            let close_level = state.exec.base;
+            if close_level > 0 && close_level <= state.exec.stack.len() {
                 // 设为 nil 让 debug.getinfo 返回 "C"（对应 pcall 的 C 函数帧）
-                state.stack[close_level - 1] = TValue::Nil(NilKind::Strict);
+                state.exec.stack[close_level - 1] = TValue::Nil(NilKind::Strict);
             }
             let _ = crate::func::close(state, close_level, 1, 0);
             // 获取最终错误值（经过 __close 错误传播后）
@@ -1568,13 +1408,31 @@ fn call_resume(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
             if body_is_protective {
                 // pcall/xpcall 捕获了错误，协程正常返回 (false, err)
                 // resume 返回 (true, false, err)
-                co_context.borrow_mut().status = ThreadStatus::OK;
-                co_context.borrow_mut().error_msg = None;
+                {
+                    let mut ctx = co_context.borrow_mut();
+                    // 交换回调用者（协程 exec 进入 ctx.exec）
+                    std::mem::swap(&mut state.exec, &mut ctx.exec);
+                    ctx.exec.call_info = err_call_info;
+                    ctx.exec.stack = err_stack;
+                    ctx.exec.base = err_base;
+                    ctx.exec.pc = err_pc;
+                    ctx.status = ThreadStatus::OK;
+                    ctx.error_msg = None;
+                }
                 (true, vec![TValue::Boolean(false), final_err], None)
             } else {
                 // 协程错误，resume 返回 (false, err)
-                co_context.borrow_mut().status = ThreadStatus::Error;
-                co_context.borrow_mut().error_msg = Some(final_err.clone());
+                {
+                    let mut ctx = co_context.borrow_mut();
+                    // 交换回调用者（协程 exec 进入 ctx.exec，保留错误状态）
+                    std::mem::swap(&mut state.exec, &mut ctx.exec);
+                    ctx.exec.call_info = err_call_info;
+                    ctx.exec.stack = err_stack;
+                    ctx.exec.base = err_base;
+                    ctx.exec.pc = err_pc;
+                    ctx.status = ThreadStatus::Error;
+                    ctx.error_msg = Some(final_err.clone());
+                }
                 let result_val = match &final_err {
                     TValue::Str(_) => {
                         let msg = if !state.last_error_msg.is_empty() {
@@ -1597,19 +1455,8 @@ fn call_resume(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         ThreadStatus::OK | ThreadStatus::Error
     );
 
-    // 恢复调用者上下文
-    restore_caller_context(state, caller_ctx);
-    // 恢复 n_ccalls (协程 yield/error 可能导致 n_ccalls 不准确)
-    state.n_ccalls = saved_n_ccalls;
-    state.n_ny_calls = saved_n_ny_calls;
-    // 恢复调用者的 force_noyield_close（协程内的设置不泄漏到调用者）
-    state.force_noyield_close = saved_force_noyield_close;
-    // 协程结束时清理 pcall_protection_stack（移除协程内部 push 的 PcallProtection）
-    if co_finished {
-        state
-            .pcall_protection_stack
-            .truncate(saved_pcall_protection_len);
-    }
+    // 各分支已完成 swap 交换回调用者 exec；调用者的 n_ccalls/n_ny_calls/
+    // force_noyield_close/pcall_protection_stack 均随 swap 自动恢复。
 
     // 把 Closed upvalue 值同步回父栈，协程结束则恢复 Open
     if is_first_resume {
@@ -1655,29 +1502,31 @@ fn setup_first_resume(
     };
     let nargs = resume_args.len();
 
+    let mut co = ExecState::default();
+
     if let TValue::LClosure(closure) = &func {
         // Lua 函数: 从 proto 加载执行上下文 — Rc::clone O(1) 替代 Vec 深拷贝
-        state.code = Rc::clone(&closure.proto.code);
-        state.constants = Rc::clone(&closure.proto.constants);
-        state.upval_descs = Rc::clone(&closure.proto.upvalues);
-        state.protos = closure.proto.protos.clone();
-        state.base = 1; // closure 在 stack[0]，寄存器从 stack[1] 开始
-        state.pc = 0;
-        state.num_params = closure.proto.num_params;
-        state.is_vararg = closure.proto.is_vararg();
-        state.proto_flag = closure.proto.flag;
-        state.nextraargs = 0;
-        state.closure_upvals = Rc::clone(&closure.upvals);
-        state.open_upval = None;
-        state.tbc_list = None;
-        state.call_stack = Vec::new();
-        state.hook_old_pc = 0;
+        co.code = Rc::clone(&closure.proto.code);
+        co.constants = Rc::clone(&closure.proto.constants);
+        co.upval_descs = Rc::clone(&closure.proto.upvalues);
+        co.protos = closure.proto.protos.clone();
+        co.base = 1; // closure 在 stack[0]，寄存器从 stack[1] 开始
+        co.pc = 0;
+        co.num_params = closure.proto.num_params;
+        co.is_vararg = closure.proto.is_vararg();
+        co.proto_flag = closure.proto.flag;
+        co.nextraargs = 0;
+        co.closure_upvals = Rc::clone(&closure.upvals);
+        co.open_upval = None;
+        co.tbc_list = None;
+        co.call_stack = Vec::new();
+        co.hook_old_pc = 0;
 
         // 设置栈: stack[0] = closure, stack[1..1+nargs] = resume_args
-        state.stack = Vec::new();
-        state.stack.push(TValue::LClosure(closure.clone()));
+        co.stack = Vec::new();
+        co.stack.push(TValue::LClosure(closure.clone()));
         for arg in resume_args {
-            state.stack.push(arg.clone());
+            co.stack.push(arg.clone());
         }
 
         let nfixparams = closure.proto.num_params as usize;
@@ -1685,29 +1534,29 @@ fn setup_first_resume(
 
         if closure.proto.is_vararg() {
             // vararg 函数: 截断到实际参数末尾，VARARGPREP 会处理变参
-            state.stack.truncate(1 + nargs);
+            co.stack.truncate(1 + nargs);
             // 填充不足的固定参数为 nil
             for i in nargs..nfixparams {
-                while state.stack.len() <= 1 + i {
-                    state.stack.push(TValue::Nil(NilKind::Strict));
+                while co.stack.len() <= 1 + i {
+                    co.stack.push(TValue::Nil(NilKind::Strict));
                 }
-                state.stack[1 + i] = TValue::Nil(NilKind::Strict);
+                co.stack[1 + i] = TValue::Nil(NilKind::Strict);
             }
         } else {
             // 非 vararg 函数: 扩展到 fsize
             let frame_end = 1 + fsize;
-            while state.stack.len() < frame_end {
-                state.stack.push(TValue::Nil(NilKind::Strict));
+            while co.stack.len() < frame_end {
+                co.stack.push(TValue::Nil(NilKind::Strict));
             }
             for i in nargs..nfixparams {
-                state.stack[1 + i] = TValue::Nil(NilKind::Strict);
+                co.stack[1 + i] = TValue::Nil(NilKind::Strict);
             }
         }
 
         // 推入初始 CallInfoEntry — 对应 C 中协程的 base CallInfo
         // 记录协程主函数的信息，使 traceback/getinfo 能正确显示最外层帧
-        // perf: caller_proto 延迟计算, 从 state.stack[0] (= base-1) 获取主函数 proto
-        state.call_info = vec![crate::state::CallInfoEntry {
+        // perf: caller_proto 延迟计算, 从 co.stack[0] (= base-1) 获取主函数 proto
+        co.call_info = vec![crate::state::CallInfoEntry {
             is_c: false,
             closure: Some(closure.clone()),
             base: 1,
@@ -1727,36 +1576,58 @@ fn setup_first_resume(
         use crate::opcodes::{create_abck, OpCode};
         let call_inst = create_abck(OpCode::CALL, 0, (nargs + 1) as i32, 0, 0);
         let return_inst = create_abck(OpCode::RETURN, 0, 0, 0, 0);
-        state.code = Rc::new(vec![call_inst, return_inst]);
-        state.constants = Rc::new(Vec::new());
-        state.upval_descs = Rc::new(Vec::new());
-        state.protos = Rc::new(Vec::new());
-        state.base = 1;
-        state.pc = 0;
-        state.num_params = nargs as u8;
-        state.is_vararg = false;
-        state.proto_flag = 0;
-        state.nextraargs = 0;
-        state.closure_upvals = Rc::new(RefCell::new(Vec::new()));
-        state.open_upval = None;
-        state.tbc_list = None;
-        state.call_stack = Vec::new();
-        state.call_info = Vec::new();
-        state.hook_old_pc = 0;
+        co.code = Rc::new(vec![call_inst, return_inst]);
+        co.constants = Rc::new(Vec::new());
+        co.upval_descs = Rc::new(Vec::new());
+        co.protos = Rc::new(Vec::new());
+        co.base = 1;
+        co.pc = 0;
+        co.num_params = nargs as u8;
+        co.is_vararg = false;
+        co.proto_flag = 0;
+        co.nextraargs = 0;
+        co.closure_upvals = Rc::new(RefCell::new(Vec::new()));
+        co.open_upval = None;
+        co.tbc_list = None;
+        co.call_stack = Vec::new();
+        co.call_info = Vec::new();
+        co.hook_old_pc = 0;
 
         // 设置栈: stack[0] = func, stack[1] = func (寄存器 0), stack[2..] = args
-        state.stack = Vec::new();
-        state.stack.push(func.clone()); // stack[0] = func (base-1)
-        state.stack.push(func.clone()); // stack[1] = func (寄存器 0)
+        co.stack = Vec::new();
+        co.stack.push(func.clone()); // stack[0] = func (base-1)
+        co.stack.push(func.clone()); // stack[1] = func (寄存器 0)
         for arg in resume_args {
-            state.stack.push(arg.clone());
+            co.stack.push(arg.clone());
         }
     } else {
         return Err(VmError::RuntimeError(
             "coroutine body must be a function".to_string(),
         ));
     }
-    state.top = state.stack.len();
+    co.top = co.stack.len();
+
+    // 保留 first resume 前由 debug.sethook(co, ...) 设置的 hook（存于旧 ctx.exec）
+    let pre_hook = {
+        let ctx = thread.context.borrow();
+        (
+            ctx.exec.hook_func.clone(),
+            ctx.exec.hook_mask,
+            ctx.exec.hook_count,
+            ctx.exec.current_hook_count,
+            ctx.exec.hook_old_pc,
+            ctx.exec.allowhook,
+        )
+    };
+    co.hook_func = pre_hook.0;
+    co.hook_mask = pre_hook.1;
+    co.hook_count = pre_hook.2;
+    co.current_hook_count = pre_hook.3;
+    co.hook_old_pc = pre_hook.4;
+    co.allowhook = pre_hook.5;
+
+    // 安装: 调用者 exec -> ThreadContext.exec, co exec -> state.exec
+    install_fresh_exec(state, &thread.context, co);
 
     // 标记为已开始
     thread.context.borrow_mut().started = true;
@@ -1770,44 +1641,18 @@ fn setup_subsequent_resume(
     co_context: &Rc<RefCell<ThreadContext>>,
     resume_args: &[TValue],
 ) -> Result<(), VmError> {
-    let ctx = co_context.borrow();
+    // 交换: caller exec -> ctx.exec, 协程 exec -> state.exec (O(1) 指针交换)
+    swap_exec(state, co_context);
 
-    state.code = ctx.saved_code.clone();
-    state.constants = ctx.saved_constants.clone();
-    state.upval_descs = ctx.saved_upval_descs.clone();
-    state.protos = ctx.saved_protos.clone();
-    state.base = ctx.saved_base;
-    state.pc = ctx.saved_pc;
-    state.num_params = ctx.saved_num_params;
-    state.is_vararg = ctx.saved_is_vararg;
-    state.proto_flag = ctx.saved_proto_flag;
-    state.nextraargs = ctx.saved_nextraargs;
-    state.closure_upvals = Rc::clone(&ctx.saved_closure_upvals);
-    state.open_upvals = ctx.saved_open_upvals.clone();
-    state.open_upval = ctx.saved_open_upval;
-    state.tbc_list = ctx.saved_tbc_list;
-    state.call_stack = ctx.saved_call_stack.clone();
-    state.stack = ctx.saved_stack.clone();
-    state.top = ctx.saved_top;
-    state.hook_old_pc = ctx.saved_hook_old_pc;
-    // 恢复协程的 pcall_protection_stack（yield 时保存到 ThreadContext）
-    state
-        .pcall_protection_stack
-        .extend(ctx.saved_pcall_protection_stack.iter().cloned());
-    // 恢复 close_error_status（yield 时保存到 ThreadContext）
-    state.close_error_status = ctx.saved_close_error_status.clone();
-    // 恢复协程的 call_info（yield 时保存到 ThreadContext）
-    state.call_info = ctx.saved_call_info.clone();
     // pop 掉 yield 时保留的 C 函数 CallInfoEntry
     // 对应 C 中 yield 的 C 函数返回后 ci 被正常 pop
     // （Rust 中 yield 通过 Err(Yield) 返回，op_call 跳过了 pop，这里补偿）
-    if state.call_info.last().map(|e| e.is_c).unwrap_or(false) {
-        state.call_info.pop();
+    if state.exec.call_info.last().map(|e| e.is_c).unwrap_or(false) {
+        state.exec.call_info.pop();
     }
 
-    let yield_nresults = ctx.saved_yield_nresults;
-    let yield_origins = ctx.yield_upval_origins.clone();
-    drop(ctx); // 释放 borrow
+    let yield_nresults = state.exec.saved_yield_nresults;
+    let yield_origins = std::mem::take(&mut co_context.borrow_mut().yield_upval_origins);
 
     // 同步 yield 时关闭的 upvalue 回协程栈，恢复 Open
     // （协程内部修改栈值时，Open upvalue 能自动反映最新值）
@@ -1816,21 +1661,21 @@ fn setup_subsequent_resume(
     }
 
     // 推送 resume 参数作为 yield 的"返回值"
-    // state.stack 已被 call_yield 截断到 `a`，所以 stack.len() = a
-    let stack_base = state.stack.len();
+    // state.exec.stack 已被 call_yield 截断到 `a`，所以 stack.len() = a
+    let stack_base = state.exec.stack.len();
     for arg in resume_args {
-        state.stack.push(arg.clone());
+        state.exec.stack.push(arg.clone());
     }
     // 根据 yield 的 nresults 调整
     if yield_nresults >= 0 {
         // 固定数量: 填充 nil 或截断
-        while (state.stack.len() - stack_base) < yield_nresults as usize {
-            state.stack.push(TValue::Nil(NilKind::Strict));
+        while (state.exec.stack.len() - stack_base) < yield_nresults as usize {
+            state.exec.stack.push(TValue::Nil(NilKind::Strict));
         }
-        state.stack.truncate(stack_base + yield_nresults as usize);
+        state.exec.stack.truncate(stack_base + yield_nresults as usize);
     }
     // nresults < 0 (MULTRET): 保留所有参数
-    state.top = state.stack.len();
+    state.exec.top = state.exec.stack.len();
 
     Ok(())
 }
@@ -1841,16 +1686,13 @@ fn setup_subsequent_resume(
 
 fn call_yield(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
     // 检查是否在协程中
-    let current_thread = match &state.current_thread {
-        Some(ctx) => ctx.clone(),
-        None => {
-            return Err(VmError::RuntimeError(
-                "attempt to yield from outside a coroutine".to_string(),
-            ));
-        }
-    };
+    if state.exec.current_thread.is_none() {
+        return Err(VmError::RuntimeError(
+            "attempt to yield from outside a coroutine".to_string(),
+        ));
+    }
     // 检查是否可 yield（无非可 yield 的 C 函数调用在栈上）
-    if state.n_ny_calls > 0 {
+    if state.exec.n_ny_calls > 0 {
         return Err(VmError::RuntimeError(
             "attempt to yield across a C-call boundary".to_string(),
         ));
@@ -1860,19 +1702,20 @@ fn call_yield(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
     let yield_values: Vec<TValue> = (0..nargs)
         .map(|i| {
             let idx = a + 1 + i;
-            if idx < state.stack.len() {
-                state.stack[idx].clone()
+            if idx < state.exec.stack.len() {
+                state.exec.stack[idx].clone()
             } else {
                 TValue::Nil(NilKind::Strict)
             }
         })
         .collect();
     // 截断栈到 `a`（移除 yield 函数和参数）
-    state.stack.truncate(a);
-    state.top = a;
+    state.exec.stack.truncate(a);
+    state.exec.top = a;
 
-    // 保存 yield 的 nresults 到 ThreadContext（恢复时用于调整 resume 参数）
-    current_thread.borrow_mut().saved_yield_nresults = nresults;
+    // 保存 yield 的 nresults 到协程 exec（恢复时用于调整 resume 参数，
+    // yield 时随 exec 交换到 ThreadContext.exec）
+    state.exec.saved_yield_nresults = nresults;
 
     // 返回 Yield 错误 — execute_loop 会转换为 Ok(VmResult::Yield)
     Err(VmError::Yield(yield_values))
@@ -1914,7 +1757,7 @@ fn call_wrap(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
     // 这样支持 `A = coroutine.wrap(function() ... A() ... end)` 的自引用模式
     // （A 在 call_wrap 时还是旧值，在 call_wrap_fn 首次调用时才被赋值为 wrap RustClosure）
     let pending = collect_wrap_upvals_info(&thread_rc, state);
-    let creator_ptr = state
+    let creator_ptr = state.exec
         .current_thread
         .as_ref()
         .map(|c| Rc::as_ptr(c) as usize)
@@ -1955,8 +1798,8 @@ fn call_wrap_fn(
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError> {
-    // 从 state.stack[a] 取 RustClosure → upvalues[0] 取 Thread
-    let rc = match state.stack.get(a) {
+    // 从 state.exec.stack[a] 取 RustClosure → upvalues[0] 取 Thread
+    let rc = match state.exec.stack.get(a) {
         Some(TValue::RustClosure(rc)) => rc.clone(),
         _ => {
             return Err(VmError::RuntimeError(
@@ -1993,13 +1836,13 @@ fn call_wrap_fn(
     }
 
     // 收集所有参数作为 resume 参数（无 thread 参数需要跳过）
-    let resume_args: Vec<TValue> = (0..nargs).map(|i| state.stack[a + 1 + i].clone()).collect();
+    let resume_args: Vec<TValue> = (0..nargs).map(|i| state.exec.stack[a + 1 + i].clone()).collect();
 
-    // 收集开 upvalue 信息（在 save_caller_context 之前，state.stack 仍是父栈）
+    // 收集开 upvalue 信息（在 save_caller_context 之前，state.exec.stack 仍是父栈）
     // 首次 resume 时从 ThreadContext 取出 pending_wrap_upvals（call_wrap 时保存），
     // 根据同栈/跨栈决定关闭值：
-    //   同栈: 从 state.stack 读最新值（支持变量在 call_wrap 后被重新赋值，如自引用 wrap）
-    //   跨栈: state.stack 不是原始父栈，用 call_wrap 时保存的 saved_value
+    //   同栈: 从 state.exec.stack 读最新值（支持变量在 call_wrap 后被重新赋值，如自引用 wrap）
+    //   跨栈: state.exec.stack 不是原始父栈，用 call_wrap 时保存的 saved_value
     let is_first_resume = !thread.context.borrow().started;
     let same_stack: bool;
     let open_upvals: Vec<OpenUpvalInfo> = if is_first_resume {
@@ -2009,7 +1852,7 @@ fn call_wrap_fn(
             let c = ctx.wrap_creator_thread_ptr;
             (p, c)
         };
-        let caller_ptr = state
+        let caller_ptr = state.exec
             .current_thread
             .as_ref()
             .map(|c| Rc::as_ptr(c) as usize)
@@ -2019,7 +1862,7 @@ fn call_wrap_fn(
         let mut origins: Vec<(UpValRef, usize)> = Vec::new();
         for (uv_ref, orig_idx, saved_val) in pending {
             let val = if same_stack {
-                state
+                state.exec
                     .stack
                     .get(orig_idx)
                     .cloned()
@@ -2041,33 +1884,18 @@ fn call_wrap_fn(
         Vec::new()
     };
 
-    // 保存调用者上下文
-    let mut caller_ctx = save_caller_context(state);
+    // 保存调用者的 C 栈保护计数（swap 时随调用者 exec 进出 ctx.exec 自动恢复）
+    let saved_n_ccalls = state.exec.n_ccalls;
     // 暂存调用者栈到 state.caller_gc_stacks — 协程执行期间 GC 需要看到调用者栈
     // 中的 wrap table 引用，否则内层协程会被误判为不可达（big.lua 嵌套 wrap 场景）
     state
         .caller_gc_stacks
-        .push(std::mem::take(&mut caller_ctx.stack));
-    // 保存 n_ccalls (协程执行期间可能修改,退出时恢复)
-    let saved_n_ccalls = state.n_ccalls;
-    // 递增 n_ccalls 防止协程嵌套过深导致 Rust 栈溢出
-    // (wrap 调用不经过 op_call 的 n_ccalls 递增路径，需要在此手动递增)
-    state.n_ccalls = state.n_ccalls.saturating_add(1);
-    if state.n_ccalls >= crate::state::LUAI_MAXCCALLS {
-        state.n_ccalls = saved_n_ccalls;
-        caller_ctx.stack = state.caller_gc_stacks.pop().unwrap_or_default();
-        restore_caller_context(state, caller_ctx);
-        return Err(VmError::RuntimeError("C stack overflow".to_string()));
-    }
-    // 保存 n_ny_calls 并重置为 0（协程初始状态是可 yield 的）
-    let saved_n_ny_calls = state.n_ny_calls;
-    state.n_ny_calls = 0;
-    // 保存 pcall_protection_stack 长度（协程内部 push 的 PcallProtection 不应泄漏到外部）
-    let saved_pcall_protection_len = state.pcall_protection_stack.len();
+        .push(std::mem::take(&mut state.exec.stack));
 
     // 设置协程上下文
     let co_context = thread.context.clone();
 
+    // setup 内部完成 exec 交换：调用者 exec -> ctx.exec，协程 exec -> state.exec (O(1))
     let setup_result = if is_first_resume {
         setup_first_resume(state, &thread, &resume_args)
     } else {
@@ -2075,10 +1903,9 @@ fn call_wrap_fn(
     };
 
     if let Err(e) = setup_result {
-        caller_ctx.stack = state.caller_gc_stacks.pop().unwrap_or_default();
-        restore_caller_context(state, caller_ctx);
-        state.n_ccalls = saved_n_ccalls;
-        state.n_ny_calls = saved_n_ny_calls;
+        // setup 失败（仅首次 resume 的"body 不是函数"路径）：未发生交换，
+        // state.exec 仍是调用者的（栈为空），恢复调用者栈
+        state.exec.stack = state.caller_gc_stacks.pop().unwrap_or_default();
         return Err(e);
     }
 
@@ -2088,22 +1915,22 @@ fn call_wrap_fn(
         co_context.borrow_mut().started = true;
     }
 
-    // 从 ThreadContext 恢复协程的 hook 设置到 state
-    {
-        let ctx = co_context.borrow();
-        state.hook_func = ctx.saved_hook_func.clone();
-        state.hook_mask = ctx.saved_hook_mask;
-        state.hook_count = ctx.saved_hook_count;
-        state.current_hook_count = ctx.saved_current_hook_count;
-        state.allowhook = ctx.saved_allowhook;
+    // 按调用者计数初始化协程的 C 栈保护
+    // (wrap 调用不经过 op_call 的 n_ccalls 递增路径，在此手动递增)
+    init_coroutine_guards(state, saved_n_ccalls);
+    if state.exec.n_ccalls >= crate::state::LUAI_MAXCCALLS {
+        // C 栈溢出：交换回调用者 exec 并恢复调用者栈
+        swap_exec(state, &co_context);
+        state.exec.stack = state.caller_gc_stacks.pop().unwrap_or_default();
+        return Err(VmError::RuntimeError("C stack overflow".to_string()));
     }
 
     // 设置 current_thread 和状态
-    state.current_thread = Some(co_context.clone());
+    state.exec.current_thread = Some(co_context.clone());
     co_context.borrow_mut().status = ThreadStatus::Normal;
 
     // 首次 resume 时触发 call hook（对应 C Lua 的 luaD_hook(L, LUA_HOOKCALL, -1, 0, 0)）
-    if is_first_resume && state.hook_mask & 1 != 0 && state.hook_func.is_some() {
+    if is_first_resume && state.exec.hook_mask & 1 != 0 && state.exec.hook_func.is_some() {
         VmExecutor::call_hook(state, "call", -1, None, 0, 0)?;
     }
 
@@ -2115,55 +1942,24 @@ fn call_wrap_fn(
         Ok(VmResult::Yield { values }) => {
             // 关闭 yield 出来的闭包的 Open upvalue（协程栈还有效时）
             let yield_origins = close_yield_upvals(&values, state);
-            {
-                let mut ctx = co_context.borrow_mut();
-                ctx.saved_code = std::mem::take(&mut state.code);
-                ctx.saved_constants = std::mem::take(&mut state.constants);
-                ctx.saved_upval_descs = std::mem::take(&mut state.upval_descs);
-                ctx.saved_protos = std::mem::take(&mut state.protos);
-                ctx.saved_base = state.base;
-                // C 函数 __close (如 coroutine.yield 作为 __close) yield 时，
-                // state.pc 指向 OP_RETURN/OP_CLOSE（非 CALL 指令），不应 +1。
-                // 此时 PcallProtection.saved_pc == state.pc（都指向 OP_RETURN/OP_CLOSE）。
-                // Lua __close yield 时，state.pc 指向 __close 中的 CALL 指令，
-                // saved_pc 指向 OP_RETURN/OP_CLOSE，二者不同，需要 +1 跳过 CALL。
-                let is_c_close_yield = state.pcall_protection_stack.last().map_or(false, |t| {
-                    t.is_close_continuation && t.saved_filled && t.saved_pc == state.pc
-                });
-                ctx.saved_pc = if is_c_close_yield {
-                    state.pc
-                } else {
-                    state.pc + 1
-                };
-                ctx.saved_top = state.top;
-                ctx.saved_num_params = state.num_params;
-                ctx.saved_is_vararg = state.is_vararg;
-                ctx.saved_proto_flag = state.proto_flag;
-                ctx.saved_nextraargs = state.nextraargs;
-                ctx.saved_closure_upvals =
-                    std::mem::replace(&mut state.closure_upvals, Rc::new(RefCell::new(Vec::new())));
-                ctx.saved_open_upvals = std::mem::take(&mut state.open_upvals);
-                ctx.saved_open_upval = state.open_upval;
-                ctx.saved_tbc_list = state.tbc_list;
-                ctx.saved_call_stack = std::mem::take(&mut state.call_stack);
-                ctx.saved_stack = std::mem::take(&mut state.stack);
-                ctx.yield_upval_origins = yield_origins;
-                ctx.saved_hook_old_pc = state.hook_old_pc;
-                ctx.saved_hook_func = state.hook_func.take();
-                ctx.saved_hook_mask = state.hook_mask;
-                ctx.saved_hook_count = state.hook_count;
-                ctx.saved_current_hook_count = state.current_hook_count;
-                ctx.saved_allowhook = state.allowhook;
-                ctx.saved_pcall_protection_stack =
-                    state.pcall_protection_stack[saved_pcall_protection_len..].to_vec();
-                // 保存 close_error_status（close continuation 的 pending error）
-                ctx.saved_close_error_status = state.close_error_status.take();
-                ctx.status = ThreadStatus::Suspended;
-            }
-            // yield 时从 state 中移除协程的 PcallProtection（避免污染调用者 state）
-            state
-                .pcall_protection_stack
-                .truncate(saved_pcall_protection_len);
+            // C 函数 __close (如 coroutine.yield 作为 __close) yield 时，
+            // state.exec.pc 指向 OP_RETURN/OP_CLOSE（非 CALL 指令），不应 +1。
+            // 此时 PcallProtection.saved_pc == state.exec.pc（都指向 OP_RETURN/OP_CLOSE）。
+            // Lua __close yield 时，state.exec.pc 指向 __close 中的 CALL 指令，
+            // saved_pc 指向 OP_RETURN/OP_CLOSE，二者不同，需要 +1 跳过 CALL。
+            let is_c_close_yield = state.exec.pcall_protection_stack.last().map_or(false, |t| {
+                t.is_close_continuation && t.saved_filled && t.saved_pc == state.exec.pc
+            });
+            state.exec.pc = if is_c_close_yield {
+                state.exec.pc
+            } else {
+                state.exec.pc + 1
+            };
+            // 保存 yield 关闭的 upvalue 来源（resume 时同步回协程栈）
+            co_context.borrow_mut().yield_upval_origins = yield_origins;
+            // 交换回调用者（协程 exec 连同 pc/pcall 保护等进入 ctx.exec）
+            swap_exec(state, &co_context);
+            co_context.borrow_mut().status = ThreadStatus::Suspended;
             (values, false, None)
         }
         Ok(VmResult::Return {
@@ -2172,8 +1968,8 @@ fn call_wrap_fn(
         }) => {
             let return_values: Vec<TValue> = (0..ret_n)
                 .map(|i| {
-                    if result_base + i < state.stack.len() {
-                        state.stack[result_base + i].clone()
+                    if result_base + i < state.exec.stack.len() {
+                        state.exec.stack[result_base + i].clone()
                     } else {
                         TValue::Nil(NilKind::Strict)
                     }
@@ -2183,28 +1979,35 @@ fn call_wrap_fn(
                 let mut ctx = co_context.borrow_mut();
                 ctx.status = ThreadStatus::OK;
                 ctx.started = true;
+                // 交换回调用者（协程 exec 进入 ctx.exec）
+                std::mem::swap(&mut state.exec, &mut ctx.exec);
             }
             (return_values, true, None)
         }
         Ok(_) => {
-            co_context.borrow_mut().status = ThreadStatus::OK;
+            {
+                let mut ctx = co_context.borrow_mut();
+                ctx.status = ThreadStatus::OK;
+                // 交换回调用者
+                std::mem::swap(&mut state.exec, &mut ctx.exec);
+            }
             (Vec::new(), true, None)
         }
         Err(e) => {
             // 保存 error 状态到 ctx（必须在 TBC 关闭之前保存）
-            {
-                let mut ctx = co_context.borrow_mut();
-                ctx.status = ThreadStatus::Error;
-                ctx.saved_call_info = state.call_info.clone();
-                let save_end = state.base.min(state.stack.len());
-                ctx.saved_stack = state.stack[..save_end].to_vec();
-                ctx.saved_base = state.base;
-                ctx.saved_pc = state.pc.wrapping_add(1);
-            }
+            let (err_call_info, err_stack, err_base, err_pc) = {
+                let save_end = state.exec.base.min(state.exec.stack.len());
+                (
+                    std::mem::take(&mut state.exec.call_info),
+                    state.exec.stack[..save_end].to_vec(),
+                    state.exec.base,
+                    state.exec.pc.wrapping_add(1),
+                )
+            };
             // 关闭协程的 TBC 变量，对应 C Lua 中 luaD_closeprotected -> luaF_close
-            let close_level = state.base;
-            if close_level > 0 && close_level <= state.stack.len() {
-                state.stack[close_level - 1] = TValue::Nil(NilKind::Strict);
+            let close_level = state.exec.base;
+            if close_level > 0 && close_level <= state.exec.stack.len() {
+                state.exec.stack[close_level - 1] = TValue::Nil(NilKind::Strict);
             }
             let _ = crate::func::close(state, close_level, 1, 0);
             // 保留原始错误值（非字符串错误如 error(foo) 应原样传播），
@@ -2217,6 +2020,17 @@ fn call_wrap_fn(
                 };
                 TValue::Str(state.intern_str(&msg))
             });
+            {
+                let mut ctx = co_context.borrow_mut();
+                // 交换回调用者（协程 exec 进入 ctx.exec，保留错误状态）
+                std::mem::swap(&mut state.exec, &mut ctx.exec);
+                ctx.exec.call_info = err_call_info;
+                ctx.exec.stack = err_stack;
+                ctx.exec.base = err_base;
+                ctx.exec.pc = err_pc;
+                ctx.status = ThreadStatus::Error;
+                ctx.error_msg = Some(err_val.clone());
+            }
             (Vec::new(), true, Some(err_val))
         }
     };
@@ -2230,21 +2044,11 @@ fn call_wrap_fn(
         }
     }
 
-    // 恢复调用者上下文
-    caller_ctx.stack = state.caller_gc_stacks.pop().unwrap_or_default();
-    restore_caller_context(state, caller_ctx);
-    // 恢复 n_ccalls (协程 yield/error 可能导致 n_ccalls 不准确)
-    state.n_ccalls = saved_n_ccalls;
-    state.n_ny_calls = saved_n_ny_calls;
-    // 协程结束时清理 pcall_protection_stack（移除协程内部 push 的 PcallProtection）
-    if is_dead {
-        state
-            .pcall_protection_stack
-            .truncate(saved_pcall_protection_len);
-    }
+    // 各分支已完成 swap 交换回调用者 exec；恢复调用者栈
+    state.exec.stack = state.caller_gc_stacks.pop().unwrap_or_default();
 
     // 把 Closed upvalue 值同步回父栈，协程结束则恢复 Open
-    // 同栈时写回 state.stack（原始父栈）；跨栈时跳过写回（父栈不可访问），仅恢复 Open
+    // 同栈时写回 state.exec.stack（原始父栈）；跨栈时跳过写回（父栈不可访问），仅恢复 Open
     if is_first_resume {
         sync_upvals_back(state, &open_upvals, is_dead, same_stack);
     } else {
@@ -2271,23 +2075,23 @@ fn call_wrap_fn(
     }
 
     // 推送结果（无 success flag）
-    state.stack.truncate(a);
+    state.exec.stack.truncate(a);
     if nresults != 0 {
         for v in result_values {
-            state.stack.push(v);
+            state.exec.stack.push(v);
         }
         if nresults > 0 {
-            let current = state.stack.len() - a;
+            let current = state.exec.stack.len() - a;
             if current > nresults as usize {
-                state.stack.truncate(a + nresults as usize);
+                state.exec.stack.truncate(a + nresults as usize);
             } else {
-                while (state.stack.len() - a) < nresults as usize {
-                    state.stack.push(TValue::Nil(NilKind::Strict));
+                while (state.exec.stack.len() - a) < nresults as usize {
+                    state.exec.stack.push(TValue::Nil(NilKind::Strict));
                 }
             }
         }
     }
-    state.top = state.stack.len();
+    state.exec.top = state.exec.stack.len();
 
     Ok(())
 }
@@ -2303,15 +2107,15 @@ fn call_wrap_fn(
 
 /// C API lua_resume 的核心实现。
 ///
-/// 从 `state.current_thread` 获取 ThreadContext，根据 started 标志判断首次/后续 resume。
+/// 从 `state.exec.current_thread` 获取 ThreadContext，根据 started 标志判断首次/后续 resume。
 /// 首次 resume 时从栈取函数（栈布局: [nil, func, arg1, ..., argN]），创建临时 LuaThread
 /// 复用 setup_first_resume 逻辑。后续 resume 直接调用 setup_subsequent_resume。
 ///
 /// 返回 (status, nresults)，status 为 LUA_OK/LUA_YIELD/LUA_ERRRUN，
-/// nresults 为结果数（已放在 state.stack 上）。
+/// nresults 为结果数（已放在 state.exec.stack 上）。
 #[cfg(not(feature = "cmp_c"))]
 pub fn c_api_resume(state: &mut LuaState, nargs: usize) -> Result<(i32, usize), VmError> {
-    let co_context = match state.current_thread.clone() {
+    let co_context = match state.exec.current_thread.clone() {
         Some(ctx) => ctx,
         None => {
             return Err(VmError::RuntimeError(
@@ -2339,23 +2143,22 @@ pub fn c_api_resume(state: &mut LuaState, nargs: usize) -> Result<(i32, usize), 
     }
 
     let is_first_resume = !co_context.borrow().started;
-    let saved_n_ccalls = state.n_ccalls;
-    let saved_n_ny_calls = state.n_ny_calls;
-    state.n_ny_calls = 0;
+    let saved_n_ccalls = state.exec.n_ccalls;
+    let saved_n_ny_calls = state.exec.n_ny_calls;
     // 准备 setup（首次/后续）
     let setup_result = if is_first_resume {
         // 首次 resume: 从 NL 栈取函数和参数
         // 栈布局: [nil, func, arg1, ..., argN]
-        let stack_len = state.stack.len();
+        let stack_len = state.exec.stack.len();
         if stack_len < nargs + 1 {
-            state.n_ny_calls = saved_n_ny_calls;
+            state.exec.n_ny_calls = saved_n_ny_calls;
             return Err(VmError::RuntimeError(
                 "lua_resume: not enough values on stack".to_string(),
             ));
         }
         let func_idx = stack_len - nargs - 1;
-        let func = state.stack[func_idx].clone();
-        let resume_args: Vec<TValue> = state.stack[func_idx + 1..].to_vec();
+        let func = state.exec.stack[func_idx].clone();
+        let resume_args: Vec<TValue> = state.exec.stack[func_idx + 1..].to_vec();
 
         // 创建临时 LuaThread（共享 context），让 setup_first_resume 能取到 function
         let temp_thread = LuaThread {
@@ -2369,19 +2172,19 @@ pub fn c_api_resume(state: &mut LuaState, nargs: usize) -> Result<(i32, usize), 
         setup_first_resume(state, &temp_thread, &resume_args)
     } else {
         // 后续 resume: 收集栈顶 nargs 个值作为 resume 参数
-        let stack_len = state.stack.len();
+        let stack_len = state.exec.stack.len();
         let start = if stack_len >= nargs {
             stack_len - nargs
         } else {
             stack_len
         };
-        let resume_args: Vec<TValue> = state.stack[start..].to_vec();
+        let resume_args: Vec<TValue> = state.exec.stack[start..].to_vec();
         setup_subsequent_resume(state, &co_context, &resume_args)
     };
 
     if let Err(e) = setup_result {
-        state.n_ccalls = saved_n_ccalls;
-        state.n_ny_calls = saved_n_ny_calls;
+        state.exec.n_ccalls = saved_n_ccalls;
+        state.exec.n_ny_calls = saved_n_ny_calls;
         return Err(e);
     }
 
@@ -2391,11 +2194,14 @@ pub fn c_api_resume(state: &mut LuaState, nargs: usize) -> Result<(i32, usize), 
         co_context.borrow_mut().started = true;
     }
 
-    // 递增 n_ccalls 防止协程嵌套过深
-    state.n_ccalls = state.n_ccalls.saturating_add(1);
-    if state.n_ccalls >= crate::state::LUAI_MAXCCALLS {
-        state.n_ccalls = saved_n_ccalls;
-        state.n_ny_calls = saved_n_ny_calls;
+    // 按调用者计数初始化协程的 C 栈保护（跨多次 resume 不累积）
+    init_coroutine_guards(state, saved_n_ccalls);
+    if state.exec.n_ccalls >= crate::state::LUAI_MAXCCALLS {
+        // C 栈溢出：协程 exec 放回 ctx.exec（保持挂起），恢复 NL 计数器
+        co_context.borrow_mut().exec = std::mem::take(&mut state.exec);
+        state.exec.current_thread = Some(co_context.clone());
+        state.exec.n_ccalls = saved_n_ccalls;
+        state.exec.n_ny_calls = saved_n_ny_calls;
         return Ok((
             crate::capi::LUA_ERRRUN,
             push_error(state, "C stack overflow"),
@@ -2403,7 +2209,7 @@ pub fn c_api_resume(state: &mut LuaState, nargs: usize) -> Result<(i32, usize), 
     }
 
     // 设置 current_thread 和状态为 Normal
-    state.current_thread = Some(co_context.clone());
+    state.exec.current_thread = Some(co_context.clone());
     co_context.borrow_mut().status = ThreadStatus::Normal;
 
     // 执行
@@ -2412,47 +2218,31 @@ pub fn c_api_resume(state: &mut LuaState, nargs: usize) -> Result<(i32, usize), 
     // 处理结果
     let (status, nresults) = match exec_result {
         Ok(VmResult::Yield { values }) => {
-            // yield: 保存 VM 状态到 ThreadContext
+            // yield: 保存 VM 状态到 ThreadContext（整体移动 ExecState）
             let n = values.len();
+            // C 函数 __close yield 时 pc 不应 +1（见 call_resume 同处说明）
+            let is_c_close_yield = state.exec.pcall_protection_stack.last().map_or(false, |t| {
+                t.is_close_continuation && t.saved_filled && t.saved_pc == state.exec.pc
+            });
+            state.exec.pc = if is_c_close_yield {
+                state.exec.pc
+            } else {
+                state.exec.pc + 1
+            };
             {
                 let mut ctx = co_context.borrow_mut();
-                ctx.saved_code = std::mem::take(&mut state.code);
-                ctx.saved_constants = std::mem::take(&mut state.constants);
-                ctx.saved_upval_descs = std::mem::take(&mut state.upval_descs);
-                ctx.saved_protos = std::mem::take(&mut state.protos);
-                ctx.saved_base = state.base;
-                ctx.saved_pc = state.pc + 1;
-                ctx.saved_top = state.top;
-                ctx.saved_num_params = state.num_params;
-                ctx.saved_is_vararg = state.is_vararg;
-                ctx.saved_proto_flag = state.proto_flag;
-                ctx.saved_nextraargs = state.nextraargs;
-                ctx.saved_closure_upvals =
-                    std::mem::replace(&mut state.closure_upvals, Rc::new(RefCell::new(Vec::new())));
-                ctx.saved_open_upvals = std::mem::take(&mut state.open_upvals);
-                ctx.saved_open_upval = state.open_upval;
-                ctx.saved_tbc_list = state.tbc_list;
-                ctx.saved_call_stack = std::mem::take(&mut state.call_stack);
-                ctx.saved_stack = std::mem::take(&mut state.stack);
-                ctx.saved_call_info = std::mem::take(&mut state.call_info);
-                ctx.saved_hook_old_pc = state.hook_old_pc;
-                ctx.saved_hook_func = state.hook_func.take();
-                ctx.saved_hook_mask = state.hook_mask;
-                ctx.saved_hook_count = state.hook_count;
-                ctx.saved_current_hook_count = state.current_hook_count;
-                ctx.saved_allowhook = state.allowhook;
-                ctx.saved_pcall_protection_stack =
-                    std::mem::take(&mut state.pcall_protection_stack);
-                ctx.saved_close_error_status = state.close_error_status.take();
+                ctx.exec = std::mem::take(&mut state.exec);
                 ctx.status = ThreadStatus::Suspended;
             }
-            // push yield 值到 state.stack: [nil, val1, val2, ...]
-            state.stack = Vec::with_capacity(n + 1);
-            state.stack.push(TValue::Nil(NilKind::Strict));
+            // NL 的 exec 被取空后恢复 current_thread，供下一次 lua_resume 定位协程
+            state.exec.current_thread = Some(co_context.clone());
+            // push yield 值到 state.exec.stack: [nil, val1, val2, ...]
+            state.exec.stack = Vec::with_capacity(n + 1);
+            state.exec.stack.push(TValue::Nil(NilKind::Strict));
             for v in values {
-                state.stack.push(v);
+                state.exec.stack.push(v);
             }
-            state.top = state.stack.len();
+            state.exec.top = state.exec.stack.len();
             (crate::capi::LUA_YIELD, n)
         }
         Ok(VmResult::Return {
@@ -2460,46 +2250,59 @@ pub fn c_api_resume(state: &mut LuaState, nargs: usize) -> Result<(i32, usize), 
             result_base,
         }) => {
             // 协程返回 — 取出返回值，重新设置栈
-            let co_stack = std::mem::take(&mut state.stack);
-            co_context.borrow_mut().status = ThreadStatus::OK;
-            co_context.borrow_mut().started = true;
-            co_context.borrow_mut().saved_call_info.clear();
+            let co_stack = std::mem::take(&mut state.exec.stack);
+            {
+                let mut ctx = co_context.borrow_mut();
+                ctx.status = ThreadStatus::OK;
+                ctx.started = true;
+                // 协程 exec 存入 ctx（dead），NL 恢复默认
+                ctx.exec = std::mem::take(&mut state.exec);
+                ctx.exec.call_info.clear();
+            }
+            // NL 的 exec 被取空后恢复 current_thread
+            state.exec.current_thread = Some(co_context.clone());
             // push 返回值: [nil, result1, result2, ...]
-            state.stack = Vec::with_capacity(ret_n + 1);
-            state.stack.push(TValue::Nil(NilKind::Strict));
+            state.exec.stack = Vec::with_capacity(ret_n + 1);
+            state.exec.stack.push(TValue::Nil(NilKind::Strict));
             for i in 0..ret_n {
                 let val = if result_base + i < co_stack.len() {
                     co_stack[result_base + i].clone()
                 } else {
                     TValue::Nil(NilKind::Strict)
                 };
-                state.stack.push(val);
+                state.exec.stack.push(val);
             }
-            state.top = state.stack.len();
+            state.exec.top = state.exec.stack.len();
             (crate::capi::LUA_OK, ret_n)
         }
         Ok(_) => {
-            co_context.borrow_mut().status = ThreadStatus::OK;
-            co_context.borrow_mut().saved_call_info.clear();
-            state.stack = vec![TValue::Nil(NilKind::Strict)];
-            state.top = 1;
+            {
+                let mut ctx = co_context.borrow_mut();
+                ctx.status = ThreadStatus::OK;
+                ctx.started = true;
+                ctx.exec = std::mem::take(&mut state.exec);
+                ctx.exec.call_info.clear();
+            }
+            state.exec.current_thread = Some(co_context.clone());
+            state.exec.stack = vec![TValue::Nil(NilKind::Strict)];
+            state.exec.top = 1;
             (crate::capi::LUA_OK, 0)
         }
         Err(e) => {
-            // 错误: 保存错误状态到 ctx，关闭 TBC 变量
-            {
-                let mut ctx = co_context.borrow_mut();
-                ctx.saved_call_info = std::mem::take(&mut state.call_info);
-                let save_end = state.base.min(state.stack.len());
-                ctx.saved_stack = state.stack[..save_end].to_vec();
-                ctx.saved_base = state.base;
-                ctx.saved_pc = state.pc.wrapping_add(1);
-                ctx.status = ThreadStatus::Error;
-            }
+            // 错误: 保存错误状态到 ctx（pre-close 快照），关闭 TBC 变量
+            let (err_call_info, err_stack, err_base, err_pc) = {
+                let save_end = state.exec.base.min(state.exec.stack.len());
+                (
+                    std::mem::take(&mut state.exec.call_info),
+                    state.exec.stack[..save_end].to_vec(),
+                    state.exec.base,
+                    state.exec.pc.wrapping_add(1),
+                )
+            };
             // 关闭 TBC 变量
-            let close_level = state.base;
-            if close_level > 0 && close_level <= state.stack.len() {
-                state.stack[close_level - 1] = TValue::Nil(NilKind::Strict);
+            let close_level = state.exec.base;
+            if close_level > 0 && close_level <= state.exec.stack.len() {
+                state.exec.stack[close_level - 1] = TValue::Nil(NilKind::Strict);
             }
             let _ = crate::func::close(state, close_level, 1, 0);
             // 获取错误值
@@ -2514,27 +2317,37 @@ pub fn c_api_resume(state: &mut LuaState, nargs: usize) -> Result<(i32, usize), 
                     TValue::Str(state.intern_str(&msg))
                 }
             });
+            {
+                let mut ctx = co_context.borrow_mut();
+                ctx.exec = std::mem::take(&mut state.exec);
+                ctx.exec.call_info = err_call_info;
+                ctx.exec.stack = err_stack;
+                ctx.exec.base = err_base;
+                ctx.exec.pc = err_pc;
+                ctx.status = ThreadStatus::Error;
+            }
+            state.exec.current_thread = Some(co_context.clone());
             // push 错误消息: [nil, err_msg]
-            state.stack = vec![TValue::Nil(NilKind::Strict), err_val];
-            state.top = 2;
+            state.exec.stack = vec![TValue::Nil(NilKind::Strict), err_val];
+            state.exec.top = 2;
             (crate::capi::LUA_ERRRUN, 1)
         }
     };
 
     // 恢复 n_ccalls / n_ny_calls
-    state.n_ccalls = saved_n_ccalls;
-    state.n_ny_calls = saved_n_ny_calls;
+    state.exec.n_ccalls = saved_n_ccalls;
+    state.exec.n_ny_calls = saved_n_ny_calls;
 
     Ok((status, nresults))
 }
 
-/// 把错误消息 push 到 state.stack，返回 nresults (1)
+/// 把错误消息 push 到 state.exec.stack，返回 nresults (1)
 fn push_error(state: &mut LuaState, msg: &str) -> usize {
-    state.stack = vec![
+    state.exec.stack = vec![
         TValue::Nil(NilKind::Strict),
         TValue::Str(state.intern_str(msg)),
     ];
-    state.top = 2;
+    state.exec.top = 2;
     1
 }
 

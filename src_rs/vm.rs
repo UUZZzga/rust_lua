@@ -1311,7 +1311,7 @@ mod tests {
         // 对应 C 的 stack_init: top = stack + 1, stacksize = BASIC_STACK_SIZE + EXTRA_STACK
         assert_eq!(l.gettop(), 1, "stack must have function entry slot");
         assert_eq!(
-            l.stack.capacity(),
+            l.exec.stack.capacity(),
             crate::state::BASIC_STACK_SIZE + crate::state::EXTRA_STACK
         );
     }

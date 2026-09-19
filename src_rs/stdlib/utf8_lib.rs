@@ -196,13 +196,13 @@ fn utf8_encode(code: u32) -> Vec<u8> {
 /// 从栈中读取字符串参数（返回字节切片）
 fn get_str_bytes(state: &LuaState, a: usize, idx: usize) -> Result<Vec<u8>, VmError> {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.stack.len() {
+    if stack_idx >= state.exec.stack.len() {
         return Err(VmError::RuntimeError(format!(
             "bad argument #{} (string expected, got no value)",
             idx + 1
         )));
     }
-    match &state.stack[stack_idx] {
+    match &state.exec.stack[stack_idx] {
         TValue::Str(s) => Ok(s.as_str().as_bytes().to_vec()),
         TValue::Integer(n) => {
             // 体积优先: 用 i64_to_string 避免 n.to_string() 引入 core::fmt::num
@@ -219,7 +219,7 @@ fn get_str_bytes(state: &LuaState, a: usize, idx: usize) -> Result<Vec<u8>, VmEr
         _ => Err(VmError::RuntimeError(format!(
             "bad argument #{} (string expected, got {})",
             idx + 1,
-            state.stack[stack_idx].ty()
+            state.exec.stack[stack_idx].ty()
         ))),
     }
 }
@@ -227,10 +227,10 @@ fn get_str_bytes(state: &LuaState, a: usize, idx: usize) -> Result<Vec<u8>, VmEr
 /// 从栈中读取可选整数参数
 fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: i64) -> i64 {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.stack.len() {
+    if stack_idx >= state.exec.stack.len() {
         return default;
     }
-    match &state.stack[stack_idx] {
+    match &state.exec.stack[stack_idx] {
         TValue::Nil(_) => default,
         TValue::Integer(n) => *n,
         TValue::Float(f) => *f as i64,
@@ -242,10 +242,10 @@ fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: i64) -> i64 
 /// 从栈中读取布尔参数
 fn get_bool_arg(state: &LuaState, a: usize, idx: usize, default: bool) -> bool {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.stack.len() {
+    if stack_idx >= state.exec.stack.len() {
         return default;
     }
-    !state.stack[stack_idx].is_false()
+    !state.exec.stack[stack_idx].is_false()
 }
 
 /// 从栈中读取必需的整数参数（带错误消息）
@@ -256,14 +256,14 @@ fn get_required_int_arg(
     fname: &str,
 ) -> Result<i64, VmError> {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.stack.len() {
+    if stack_idx >= state.exec.stack.len() {
         return Err(VmError::RuntimeError(format!(
             "bad argument #{} to '{}' (number expected, got no value)",
             idx + 1,
             fname
         )));
     }
-    match &state.stack[stack_idx] {
+    match &state.exec.stack[stack_idx] {
         TValue::Integer(n) => Ok(*n),
         TValue::Float(f) => Ok(*f as i64),
         TValue::Str(s) => s.as_str().parse::<i64>().map_err(|_| {
@@ -277,7 +277,7 @@ fn get_required_int_arg(
             "bad argument #{} to '{}' (number expected, got {})",
             idx + 1,
             fname,
-            state.stack[stack_idx].ty()
+            state.exec.stack[stack_idx].ty()
         ))),
     }
 }
@@ -628,7 +628,7 @@ fn call_codes(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
     // 返回 BuiltinFn 迭代器（strict 或 lax）
     let iter_fn = if lax { call_iter_lax } else { call_iter_strict };
     let iter_val = TValue::BuiltinFn(BuiltinFn::impure(iter_fn, c"iter".as_ptr() as *const u8));
-    let s_val = state.stack[a + 1].clone();
+    let s_val = state.exec.stack[a + 1].clone();
     let init_pos = TValue::Integer(0);
 
     push_results(state, a, nresults, vec![iter_val, s_val, init_pos]);
@@ -667,13 +667,13 @@ fn call_iter(
     nresults: i32,
     strict: bool,
 ) -> Result<(), VmError> {
-    let s_val = if a + 1 < state.stack.len() {
-        state.stack[a + 1].clone()
+    let s_val = if a + 1 < state.exec.stack.len() {
+        state.exec.stack[a + 1].clone()
     } else {
         TValue::Nil(NilKind::Strict)
     };
-    let n_val = if a + 2 < state.stack.len() {
-        state.stack[a + 2].clone()
+    let n_val = if a + 2 < state.exec.stack.len() {
+        state.exec.stack[a + 2].clone()
     } else {
         TValue::Nil(NilKind::Strict)
     };

@@ -186,10 +186,10 @@ const MAXARGLINE: usize = 250;
 
 fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.stack.len() {
+    if stack_idx >= state.exec.stack.len() {
         return TValue::Nil(NilKind::Strict);
     }
-    state.stack[stack_idx].clone()
+    state.exec.stack[stack_idx].clone()
 }
 
 // ============================================================================
@@ -609,8 +609,8 @@ fn g_write(
     }
     for i in 0..nargs {
         let arg_idx = first_arg + i;
-        let val = if arg_idx < state.stack.len() {
-            state.stack[arg_idx].clone()
+        let val = if arg_idx < state.exec.stack.len() {
+            state.exec.stack[arg_idx].clone()
         } else {
             TValue::Nil(NilKind::Strict)
         };
@@ -1315,8 +1315,8 @@ fn g_read(
     } else {
         for i in 0..nargs {
             let arg_idx = first_arg + i;
-            let val = if arg_idx < state.stack.len() {
-                state.stack[arg_idx].clone()
+            let val = if arg_idx < state.exec.stack.len() {
+                state.exec.stack[arg_idx].clone()
             } else {
                 TValue::Nil(NilKind::Strict)
             };
@@ -1934,7 +1934,7 @@ fn call_file_lines(
 
 /// lines 迭代器函数 — 对应 C 的 io_readline
 ///
-/// 从 state.stack[a] 取回 RustClosure，再从 upvalues 取状态。
+/// 从 state.exec.stack[a] 取回 RustClosure，再从 upvalues 取状态。
 /// upvalues 布局见 [`new_lines_iterator`]。
 fn call_lines_iterator_fn(
     state: &mut LuaState,
@@ -1944,9 +1944,9 @@ fn call_lines_iterator_fn(
 ) -> Result<(), VmError> {
     let _ = nargs; // lines 迭代器无参数
 
-    // 从 state.stack[a] 取出 RustClosure，提取状态
+    // 从 state.exec.stack[a] 取出 RustClosure，提取状态
     let (file_ptr_id, to_close, finished, formats) = {
-        let func_val = state
+        let func_val = state.exec
             .stack
             .get(a)
             .cloned()
@@ -1993,14 +1993,14 @@ fn call_lines_iterator_fn(
     };
 
     // 把 formats 推入临时栈, 调用 g_read
-    let saved_stack_len = state.stack.len();
-    state.stack.truncate(a + 1);
+    let saved_stack_len = state.exec.stack.len();
+    state.exec.stack.truncate(a + 1);
     for fmt in &formats {
-        state.stack.push(fmt.clone());
+        state.exec.stack.push(fmt.clone());
     }
     let n_formats = formats.len();
     let results = g_read(state, a, n_formats, f, a + 1)?;
-    state.stack.truncate(saved_stack_len);
+    state.exec.stack.truncate(saved_stack_len);
 
     if results.is_empty() || results[0].is_nil() {
         // EOF 或错误
@@ -2043,7 +2043,7 @@ fn call_lines_iterator_fn(
 
 /// 标记 lines 迭代器为已完成 — 更新 upvalues[LINES_UP_FINISHED] = true
 fn mark_lines_finished(state: &mut LuaState, a: usize) {
-    if let Some(TValue::RustClosure(rc)) = state.stack.get(a).cloned() {
+    if let Some(TValue::RustClosure(rc)) = state.exec.stack.get(a).cloned() {
         let mut upvals = rc.upvalues.borrow_mut();
         if upvals.len() > LINES_UP_FINISHED {
             upvals[LINES_UP_FINISHED] = TValue::Boolean(true);
