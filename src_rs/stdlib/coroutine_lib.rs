@@ -661,6 +661,14 @@ fn sync_upvals_back(
 /// 在 saved_stack = take(state.exec.stack) 之前调用（state.exec.stack 仍是协程栈）
 /// 返回 (uv_ref, original_stack_index) 列表，供 resume 时同步回协程栈
 fn close_yield_upvals(yield_values: &[TValue], state: &mut LuaState) -> Vec<(UpValRef, usize)> {
+    // 快速路径: yield 值不含 LClosure/Table 且 open_upval 链为空时，
+    // 无需分配 visited HashSet 也无需遍历链表，直接返回空（coroutine bench 热路径）
+    let has_container = yield_values
+        .iter()
+        .any(|v| matches!(v, TValue::LClosure(_) | TValue::Table(_)));
+    if !has_container && state.exec.open_upval.is_none() {
+        return Vec::new();
+    }
     let mut result_info: Vec<OpenUpvalInfo> = Vec::new();
     let mut visited =
         std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
