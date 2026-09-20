@@ -35,7 +35,6 @@ steps:
     RUST_BACKTRACE: 1
   commands:
   - cargo build --release
-  - sccache --show-stats
   - cargo test --release
   - ./target/release/lua -v
 
