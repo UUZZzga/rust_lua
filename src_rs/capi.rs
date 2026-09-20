@@ -3963,7 +3963,7 @@ pub extern "C" fn lua_getupvalue(L: *mut lua_State, funcindex: c_int, n: c_int) 
                 let val = {
                     let uv = upvals[n - 1].borrow();
                     match &*uv {
-                        UpVal::Closed { value } => (**value).clone(),
+                        UpVal::Closed { value } => value.clone(),
                         UpVal::Open { stack_index, .. } => {
                             if *stack_index < L.exec.stack.len() {
                                 L.exec.stack[*stack_index].clone()
@@ -4045,7 +4045,7 @@ pub extern "C" fn lua_setupvalue(L: *mut lua_State, funcindex: c_int, n: c_int) 
                 let mut uv = upvals[n - 1].borrow_mut();
                 match &mut *uv {
                     UpVal::Closed { value: val } => {
-                        **val = value.clone();
+                        *val = value.clone();
                         None
                     }
                     UpVal::Open { stack_index, .. } => Some(*stack_index),

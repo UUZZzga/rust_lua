@@ -16,7 +16,7 @@
 use std::cmp::Ordering;
 
 use crate::gc::GCState;
-use crate::objects::{NilKind, TValue, UpVal, UpValRef};
+use crate::objects::{NilKind, TValue, UpVal, UpValRef, UpValVec};
 use crate::strings::LuaString;
 use crate::table::Table;
 use crate::tm::{obj_type_name, TagMethodError};
@@ -1174,28 +1174,28 @@ pub fn push_closure(
     gc: &GCState,
 ) {
     let nup = proto.size_upvalues as usize;
-    let mut upvals: Vec<UpValRef> = Vec::with_capacity(nup);
+    let upvals = Rc::new(RefCell::new(UpValVec::new()));
 
     for i in 0..nup {
         if i < proto.upvalues.len() && proto.upvalues[i].in_stack {
             let idx = _base + proto.upvalues[i].idx as usize;
             if idx < stack.len() {
-                upvals.push(Rc::new(RefCell::new(UpVal::Open {
+                upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Open {
                     stack_index: idx,
                     next: None,
                     previous: None,
                     tbc: false,
                 })));
             } else {
-                upvals.push(Rc::new(RefCell::new(UpVal::Closed {
-                    value: Box::new(TValue::Nil(NilKind::Strict)),
+                upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
+                    value: TValue::Nil(NilKind::Strict),
                 })));
             }
         } else if i < _enc_upvals.len() {
-            upvals.push(_enc_upvals[i].clone());
+            upvals.borrow_mut().push(_enc_upvals[i].clone());
         } else {
-            upvals.push(Rc::new(RefCell::new(UpVal::Closed {
-                value: Box::new(TValue::Nil(NilKind::Strict)),
+            upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
+                value: TValue::Nil(NilKind::Strict),
             })));
         }
     }
@@ -1203,7 +1203,7 @@ pub fn push_closure(
     let closure = Rc::new(crate::objects::LClosure {
         gc_header: crate::gc::GCObjectHeader::new(),
         proto: Rc::new(proto.clone()),
-        upvals: Rc::new(RefCell::new(upvals)),
+        upvals,
     });
     // 用 gc_mem_size() 计费含 upvals 容量，比 size_of::<LClosure>() 更接近真实占用
     let closure_id = gc.register_object(closure.gc_mem_size());

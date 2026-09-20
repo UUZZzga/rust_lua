@@ -1297,7 +1297,7 @@ pub struct LClosure {
     /// 使用 Rc<RefCell<Vec>> 包装，使 LClosure clone 时所有副本共享同一个 upvals Vec。
     /// 这样 debug.upvaluejoin 修改栈上副本的 upvals 会影响所有共享同一 Rc 的闭包
     /// （对应 C 中 Closure 是堆分配对象、栈上存 Closure* 指针的语义）。
-    pub upvals: Rc<RefCell<Vec<UpValRef>>>,
+    pub upvals: Rc<RefCell<UpValVec>>,
 }
 
 /// C 闭包 —— C 函数 + 捕获的上值
@@ -1320,7 +1320,7 @@ impl LClosure {
     /// Proto 由 gc_extra_estimate 单独跟踪（共享，避免重复计费）。
     pub fn gc_mem_size(&self) -> usize {
         // Rc<LClosure> 堆分配 = LClosure 自身
-        // upvals: Rc<RefCell<Vec<UpValRef>>>，Vec 堆分配 = capacity * size_of::<UpValRef>()
+        // upvals: Rc<RefCell<UpValVec>>，Vec 堆分配 = capacity * size_of::<UpValRef>()
         let upvals_cap = self.upvals.borrow().capacity();
         std::mem::size_of::<LClosure>() + upvals_cap * std::mem::size_of::<UpValRef>() + 16
         // Rc<RefCell<Vec>> 分配头估算
@@ -1371,7 +1371,7 @@ pub enum UpVal {
     /// 关闭的上值（持有值的副本）
     Closed {
         /// 存储的值
-        value: Box<TValue>,
+        value: TValue,
     },
 }
 
@@ -1385,6 +1385,140 @@ impl UpVal {
             UpVal::Open { stack_index, .. } => Some(*stack_index),
             UpVal::Closed { .. } => None,
         }
+    }
+}
+
+/// 上值数组 — 小数组内联存储，避免小闭包的上值 Vec 缓冲分配。
+///
+/// 对应 C Lua 的 `LClosure.upvals`（内联柔性数组）。闭包上值数量在创建后固定，
+/// 常见闭包 ≤ 4 个上值，内联存储使创建闭包时少一次堆分配
+/// （`Rc<RefCell<Vec>>` 的 Vec 缓冲由内联数组替代）。
+///
+/// 通过 `Deref<Target=[UpValRef]>` 暴露切片 API，调用点（`.len()` / `.iter()` /
+/// `[idx]` / `.is_empty()`）无需改动。
+#[derive(Debug)]
+pub struct UpValVec {
+    len: u8,
+    inline: [std::mem::MaybeUninit<UpValRef>; 4],
+    heap: Option<Box<[UpValRef]>>,
+}
+
+impl Clone for UpValVec {
+    fn clone(&self) -> Self {
+        let mut v = UpValVec::new();
+        for x in self.iter() {
+            v.push(x.clone());
+        }
+        v
+    }
+}
+
+impl UpValVec {
+    pub fn new() -> Self {
+        UpValVec {
+            len: 0,
+            inline: std::array::from_fn(|_| std::mem::MaybeUninit::uninit()),
+            heap: None,
+        }
+    }
+
+    /// 存储容量：内联为固定 4，堆为实际长度。
+    /// （GC 内存计费用，见 `LClosure::gc_mem_size`。）
+    pub fn capacity(&self) -> usize {
+        match &self.heap {
+            Some(h) => h.len(),
+            None => 4,
+        }
+    }
+
+    pub fn push(&mut self, val: UpValRef) {
+        if self.heap.is_none() && self.len as usize >= 4 {
+            // 内联已满: 迁移到堆
+            let mut v = Vec::with_capacity(8);
+            for i in 0..self.len as usize {
+                // SAFETY: 迁移只发生一次, i < len 的元素均已初始化
+                v.push(unsafe { self.inline[i].assume_init_read() });
+            }
+            v.push(val);
+            self.heap = Some(v.into_boxed_slice());
+            self.len += 1;
+            return;
+        }
+        match &mut self.heap {
+            Some(h) => {
+                let mut v = h.to_vec();
+                v.push(val);
+                *h = v.into_boxed_slice();
+            }
+            None => {
+                // SAFETY: len < 4, 槽位未初始化, ptr::write 语义
+                self.inline[self.len as usize].write(val);
+            }
+        }
+        self.len += 1;
+    }
+
+    fn as_slice(&self) -> &[UpValRef] {
+        match &self.heap {
+            Some(h) => &h[..self.len as usize],
+            // SAFETY: 0..len 的槽位均已初始化
+            None => unsafe {
+                std::slice::from_raw_parts(
+                    self.inline.as_ptr() as *const UpValRef,
+                    self.len as usize,
+                )
+            },
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [UpValRef] {
+        match &mut self.heap {
+            Some(h) => &mut h[..self.len as usize],
+            // SAFETY: 0..len 的槽位均已初始化
+            None => unsafe {
+                std::slice::from_raw_parts_mut(
+                    self.inline.as_mut_ptr() as *mut UpValRef,
+                    self.len as usize,
+                )
+            },
+        }
+    }
+}
+
+impl Default for UpValVec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl From<Vec<UpValRef>> for UpValVec {
+    fn from(v: Vec<UpValRef>) -> Self {
+        if v.len() <= 4 {
+            let mut u = UpValVec::new();
+            for x in v {
+                u.push(x);
+            }
+            u
+        } else {
+            UpValVec {
+                len: v.len() as u8,
+                inline: std::array::from_fn(|_| std::mem::MaybeUninit::uninit()),
+                heap: Some(v.into_boxed_slice()),
+            }
+        }
+    }
+}
+
+impl std::ops::Deref for UpValVec {
+    type Target = [UpValRef];
+    fn deref(&self) -> &Self::Target {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for UpValVec {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.as_mut_slice()
     }
 }
 
@@ -1602,7 +1736,7 @@ pub struct CallFrame {
     pub nextraargs: i32,
     /// perf: Rc 共享避免 op_call 中 Vec 深拷贝 (N 个 UpValRef 各 1 次 atomic inc)
     /// 对应 C Lua 的 ci->u.l.upvals = cl->upvals (指针共享, O(1))
-    pub closure_upvals: Rc<RefCell<Vec<UpValRef>>>,
+    pub closure_upvals: Rc<RefCell<UpValVec>>,
     pub tbc_list: Option<usize>,
 }
 
@@ -3172,10 +3306,10 @@ mod tests {
     #[test]
     fn test_upval_closed() {
         let uv = UpVal::Closed {
-            value: Box::new(TValue::Integer(42)),
+            value: TValue::Integer(42),
         };
         match uv {
-            UpVal::Closed { value } => assert_eq!(*value, TValue::Integer(42)),
+            UpVal::Closed { value } => assert_eq!(value, TValue::Integer(42)),
             _ => panic!("expected Closed"),
         }
     }
@@ -3183,7 +3317,7 @@ mod tests {
     #[test]
     fn test_upval_closed_not_open() {
         let uv = UpVal::Closed {
-            value: Box::new(TValue::Integer(42)),
+            value: TValue::Integer(42),
         };
         assert!(!uv.is_open());
         assert_eq!(uv.level(), None);

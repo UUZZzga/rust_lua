@@ -21,7 +21,7 @@
 //! - 标签 500+: 调试库
 
 use crate::execute::VmError;
-use crate::objects::{BuiltinFn, LClosure, NilKind, Proto, TValue, UpVal, UpValRef, PF_VAHID};
+use crate::objects::{BuiltinFn, LClosure, NilKind, Proto, TValue, UpVal, UpValRef, UpValVec, PF_VAHID};
 use crate::state::LuaState;
 use crate::strings::LuaString;
 use crate::table::Table;
@@ -2195,7 +2195,7 @@ fn call_getupvalue(
                 let upvals_ref = closure.upvals.borrow();
                 let uv_ref = upvals_ref[n - 1].borrow();
                 let val = match &*uv_ref {
-                    UpVal::Closed { value } => (**value).clone(),
+                    UpVal::Closed { value } => value.clone(),
                     UpVal::Open { stack_index, .. } => {
                         if *stack_index < state.exec.stack.len() {
                             state.exec.stack[*stack_index].clone()
@@ -2324,7 +2324,7 @@ fn call_setupvalue(
                                 let mut uv_ref = upvals_ref[n - 1].borrow_mut();
                                 match &mut *uv_ref {
                                     UpVal::Closed { value: val } => {
-                                        **val = value.clone();
+                                        *val = value.clone();
                                         None
                                     }
                                     UpVal::Open { stack_index, .. } => Some(*stack_index),
@@ -3603,12 +3603,14 @@ mod tests {
             loc_vars: vec![],
             source: None,
         };
+        let upvals = Rc::new(RefCell::new(UpValVec::new()));
+        upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
+            value: TValue::Integer(42),
+        })));
         let closure = Rc::new(LClosure {
             gc_header: GCObjectHeader::new(),
             proto: Rc::new(proto),
-            upvals: Rc::new(RefCell::new(vec![Rc::new(RefCell::new(UpVal::Closed {
-                value: Box::new(TValue::Integer(42)),
-            }))])),
+            upvals,
         });
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
@@ -3633,7 +3635,7 @@ mod tests {
         let closure = Rc::new(LClosure {
             gc_header: GCObjectHeader::new(),
             proto: Rc::new(crate::func::new_proto()),
-            upvals: Rc::new(RefCell::new(vec![])),
+            upvals: Rc::new(RefCell::new(UpValVec::new())),
         });
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
@@ -3822,12 +3824,14 @@ mod tests {
     fn test_call_upvalueid_closure() {
         use crate::gc::GCObjectHeader;
         let mut state = LuaState::new();
+        let upvals = Rc::new(RefCell::new(UpValVec::new()));
+        upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
+            value: TValue::Integer(42),
+        })));
         let closure = Rc::new(LClosure {
             gc_header: GCObjectHeader::new(),
             proto: Rc::new(crate::func::new_proto()),
-            upvals: Rc::new(RefCell::new(vec![Rc::new(RefCell::new(UpVal::Closed {
-                value: Box::new(TValue::Integer(42)),
-            }))])),
+            upvals,
         });
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
@@ -3844,7 +3848,7 @@ mod tests {
         let closure = Rc::new(LClosure {
             gc_header: GCObjectHeader::new(),
             proto: Rc::new(crate::func::new_proto()),
-            upvals: Rc::new(RefCell::new(vec![])),
+            upvals: Rc::new(RefCell::new(UpValVec::new())),
         });
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));

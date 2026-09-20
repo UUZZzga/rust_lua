@@ -14,8 +14,8 @@
 
 use crate::gc::GCState;
 use crate::objects::{
-    CallFrame, Instruction, LClosure, LuaType, NilKind, Proto, TValue, UpVal, UpValRef, PF_VAHID,
-    PF_VATAB,
+    CallFrame, Instruction, LClosure, LuaType, NilKind, Proto, TValue, UpVal, UpValRef, UpValVec,
+    PF_VAHID, PF_VATAB,
 };
 use crate::opcodes::{self, OpCode};
 use crate::state::{LuaState, LUAI_MAXCCALLS, LUA_MINSTACK, MAX_CALL_CHAIN};
@@ -3159,7 +3159,7 @@ impl VmExecutor {
             if b < upvals.len() {
                 let uv = unsafe { &*upvals[b].as_ptr() };
                 Some(match uv {
-                    UpVal::Closed { value } => (**value).clone(),
+                    UpVal::Closed { value } => value.clone(),
                     UpVal::Open { stack_index, .. } => state.exec
                         .stack
                         .get(*stack_index)
@@ -3192,14 +3192,14 @@ impl VmExecutor {
                     // perf: 跳过 trivially-droppable 旧值的 drop_glue
                     // (与 write_stack 同理, upvalue 常持有 number 值)
                     if matches!(
-                        **value,
+                        *value,
                         TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)
                     ) {
                         unsafe {
-                            std::ptr::write(&mut **value, val);
+                            std::ptr::write(value, val);
                         }
                     } else {
-                        **value = val;
+                        *value = val;
                     }
                 }
                 UpVal::Open { stack_index, .. } => {
@@ -3253,7 +3253,7 @@ impl VmExecutor {
             if b < upvals.len() {
                 let uv = unsafe { &*upvals[b].as_ptr() };
                 let table_ref: Option<&TValue> = match uv {
-                    UpVal::Closed { value } => Some(&**value),
+                    UpVal::Closed { value } => Some(value),
                     UpVal::Open { stack_index, .. } => state.exec.stack.get(*stack_index),
                 };
                 match (key_opt, table_ref) {
@@ -3372,7 +3372,7 @@ impl VmExecutor {
             if b < closure_upvals.len() {
                 let uv_ref = closure_upvals[b].borrow();
                 let table_ref: Option<&TValue> = match &*uv_ref {
-                    UpVal::Closed { value } => Some(&**value),
+                    UpVal::Closed { value } => Some(value),
                     UpVal::Open { stack_index, .. } => stack.get(*stack_index),
                 };
                 match (key_opt, table_ref) {
@@ -3405,7 +3405,7 @@ impl VmExecutor {
             let upvals = state.exec.closure_upvals.borrow();
             let uv_ref = upvals[b].borrow();
             match &*uv_ref {
-                UpVal::Closed { value } => (**value).clone(),
+                UpVal::Closed { value } => value.clone(),
                 UpVal::Open { stack_index, .. } => state.exec
                     .stack
                     .get(*stack_index)
@@ -3625,7 +3625,7 @@ impl VmExecutor {
             let upvals = state.exec.closure_upvals.borrow();
             let uv_ref = upvals[a].borrow();
             match &*uv_ref {
-                UpVal::Closed { value } => (**value).clone(),
+                UpVal::Closed { value } => value.clone(),
                 UpVal::Open { stack_index, .. } => state.exec
                     .stack
                     .get(*stack_index)
@@ -7016,7 +7016,8 @@ impl VmExecutor {
         if bx < state.exec.protos.len() {
             let proto = state.exec.protos[bx].clone();
             let nup = proto.size_upvalues as usize;
-            let mut upvals: Vec<UpValRef> = Vec::with_capacity(nup);
+            // perf: UpValVec 内联存储 (≤4 上值零堆分配), 替代 Vec::with_capacity + 二次 move
+            let upvals = Rc::new(RefCell::new(UpValVec::new()));
             for i in 0..nup {
                 if i < proto.upvalues.len() {
                     let desc = &proto.upvalues[i];
@@ -7025,22 +7026,24 @@ impl VmExecutor {
                         // 对应 C: upv[i] = luaF_findupval(L, base + p->upvalues[i].idx);
                         let stack_idx = state.exec.base + desc.idx as usize;
                         let uv_idx = crate::func::find_upval(state, stack_idx);
-                        upvals.push(state.exec.open_upvals[uv_idx].clone());
+                        upvals.borrow_mut().push(state.exec.open_upvals[uv_idx].clone());
                     } else {
                         // 上值来自外层闭包: 共享同一个 Rc<RefCell<UpVal>>
                         // 对应 C: upv[i] = cl->upvals[p->upvalues[i].idx];
                         let parent_idx = desc.idx as usize;
                         if parent_idx < state.exec.closure_upvals.borrow().len() {
-                            upvals.push(state.exec.closure_upvals.borrow()[parent_idx].clone());
+                            upvals
+                                .borrow_mut()
+                                .push(state.exec.closure_upvals.borrow()[parent_idx].clone());
                         } else {
-                            upvals.push(Rc::new(RefCell::new(UpVal::Closed {
-                                value: Box::new(TValue::Nil(NilKind::Strict)),
+                            upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
+                                value: TValue::Nil(NilKind::Strict),
                             })));
                         }
                     }
                 } else {
-                    upvals.push(Rc::new(RefCell::new(UpVal::Closed {
-                        value: Box::new(TValue::Nil(NilKind::Strict)),
+                    upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
+                        value: TValue::Nil(NilKind::Strict),
                     })));
                 }
             }
@@ -7050,7 +7053,7 @@ impl VmExecutor {
             let closure = Rc::new(LClosure {
                 gc_header: crate::gc::GCObjectHeader::new(),
                 proto,
-                upvals: Rc::new(RefCell::new(upvals)),
+                upvals,
             });
             // 注册到 GC metas，使 gc_estimate 增长，让 maybe_collect_gc 的阈值检查能正常工作
             // 用 gc_mem_size() 计费含 upvals 容量，比 size_of::<LClosure>() 更接近真实占用
@@ -8412,7 +8415,7 @@ mod tests {
         let closure = Rc::new(LClosure {
             gc_header: GCObjectHeader::new(),
             proto: Rc::new(inner_proto),
-            upvals: Rc::new(RefCell::new(vec![])),
+            upvals: Rc::new(RefCell::new(UpValVec::new())),
         });
 
         let mut stack = default_stack(10);
@@ -8429,7 +8432,7 @@ mod tests {
         let closure = Rc::new(LClosure {
             gc_header: GCObjectHeader::new(),
             proto: Rc::new(inner_proto),
-            upvals: Rc::new(RefCell::new(vec![])),
+            upvals: Rc::new(RefCell::new(UpValVec::new())),
         });
 
         let mut stack = default_stack(10);

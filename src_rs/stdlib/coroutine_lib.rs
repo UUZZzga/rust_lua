@@ -15,6 +15,7 @@
 use crate::execute::{VmError, VmExecutor, VmResult};
 use crate::objects::{
     BuiltinFn, LuaThread, NilKind, TValue, Table, ThreadContext, ThreadStatus, UpVal, UpValRef,
+    UpValVec,
 };
 use crate::state::{ExecState, LuaState};
 use std::cell::RefCell;
@@ -227,7 +228,7 @@ fn scan_stack_for_closures(
     let mut visited_tables =
         std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
     // 先 clone 栈上的 LClosure/Table 引用（避免遍历时借用 state.exec.stack）
-    let closures: Vec<Rc<RefCell<Vec<UpValRef>>>> = state.exec
+    let closures: Vec<Rc<RefCell<UpValVec>>> = state.exec
         .stack
         .iter()
         .filter_map(|v| {
@@ -276,7 +277,7 @@ fn close_upval_by_ref(state: &mut LuaState, uv_ref: &Rc<RefCell<UpVal>>, val: TV
         crate::func::unlink_upval(state, uv_idx);
     }
     *uv_ref.borrow_mut() = UpVal::Closed {
-        value: Box::new(val),
+        value: val,
     };
 }
 
@@ -319,7 +320,7 @@ fn collect_and_close_upvals_impl(
                         .unwrap_or(TValue::Nil(NilKind::Strict));
                     (true, original_idx, val)
                 }
-                UpVal::Closed { value } => (false, 0, (**value).clone()),
+                UpVal::Closed { value } => (false, 0, value.clone()),
             }
         };
         // 如果是 Open，转为 Closed（先从链表移除，再设为 Closed）
@@ -516,7 +517,7 @@ fn collect_open_upvals_recursive_impl(
                         .unwrap_or(TValue::Nil(NilKind::Strict));
                     (true, original_idx, val)
                 }
-                UpVal::Closed { value } => (false, 0, (**value).clone()),
+                UpVal::Closed { value } => (false, 0, value.clone()),
             }
         };
         if is_open {
@@ -619,7 +620,7 @@ fn sync_upvals_back(
         let latest_val = {
             let uv = info.uv_ref.borrow();
             match &*uv {
-                UpVal::Closed { value } => (**value).clone(),
+                UpVal::Closed { value } => value.clone(),
                 UpVal::Open { .. } => continue, // 已是 Open，跳过
             }
         };
@@ -742,7 +743,7 @@ fn close_yield_upvals(yield_values: &[TValue], state: &mut LuaState) -> Vec<(UpV
         let uv_ref = state.exec.open_upvals[uv_idx].clone();
         crate::func::unlink_upval(state, uv_idx);
         *uv_ref.borrow_mut() = UpVal::Closed {
-            value: Box::new(val),
+            value: val,
         };
         result_info.push(OpenUpvalInfo {
             uv_ref,
@@ -829,7 +830,7 @@ fn sync_yield_upvals_back(state: &mut LuaState, origins: &[(UpValRef, usize)]) {
         let val = {
             let uv = uv_ref.borrow();
             match &*uv {
-                UpVal::Closed { value } => (**value).clone(),
+                UpVal::Closed { value } => value.clone(),
                 UpVal::Open { .. } => continue, // 已是 Open，跳过
             }
         };
@@ -1594,7 +1595,7 @@ fn setup_first_resume(
         co.is_vararg = false;
         co.proto_flag = 0;
         co.nextraargs = 0;
-        co.closure_upvals = Rc::new(RefCell::new(Vec::new()));
+        co.closure_upvals = Rc::new(RefCell::new(UpValVec::new()));
         co.open_upval = None;
         co.tbc_list = None;
         co.call_stack = Vec::new();

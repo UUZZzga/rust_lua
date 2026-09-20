@@ -14,7 +14,7 @@
 
 use crate::execute::VmError;
 use crate::gc::GCObjectHeader;
-use crate::objects::{LClosure, NilKind, Proto, TValue, UpVal, UpValRef};
+use crate::objects::{LClosure, NilKind, Proto, TValue, UpVal, UpValRef, UpValVec};
 use crate::state::LuaState;
 use crate::strings::LuaString;
 use crate::table::Table;
@@ -2613,19 +2613,19 @@ fn call_load(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
             if is_binary {
                 intern_proto_strings(&mut proto, state);
             }
-            let mut upvals: Vec<UpValRef> = Vec::with_capacity(nup.max(1));
-            upvals.push(Rc::new(std::cell::RefCell::new(UpVal::Closed {
-                value: Box::new(env_val),
+            let upvals = Rc::new(std::cell::RefCell::new(UpValVec::new()));
+            upvals.borrow_mut().push(Rc::new(std::cell::RefCell::new(UpVal::Closed {
+                value: env_val,
             })));
             for _ in 1..nup {
-                upvals.push(Rc::new(std::cell::RefCell::new(UpVal::Closed {
-                    value: Box::new(TValue::Nil(NilKind::Strict)),
+                upvals.borrow_mut().push(Rc::new(std::cell::RefCell::new(UpVal::Closed {
+                    value: TValue::Nil(NilKind::Strict),
                 })));
             }
             let closure = Rc::new(LClosure {
                 gc_header: GCObjectHeader::new(),
                 proto: Rc::new(proto),
-                upvals: Rc::new(std::cell::RefCell::new(upvals)),
+                upvals,
             });
             push_results(state, a, nresults, vec![TValue::LClosure(closure)]);
             Ok(())
@@ -2814,7 +2814,7 @@ fn call_loadfile(
                 let upvals = closure.upvals.borrow();
                 if !upvals.is_empty() {
                     *upvals[0].borrow_mut() = UpVal::Closed {
-                        value: Box::new(env_val),
+                        value: env_val,
                     };
                 }
             }

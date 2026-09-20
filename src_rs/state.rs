@@ -4,7 +4,7 @@ use crate::gc::{GCObjectHeader, GCState};
 use crate::objects::FxBuildHasher;
 use crate::objects::{
     BuiltinFn, BuiltinFnPtr, Instruction, LClosure, LuaThread, LuaType, NilKind, Proto,
-    TValue, TableData, ThreadContext, ThreadStatus, UpVal, UpValRef, UpvalDesc,
+    TValue, TableData, ThreadContext, ThreadStatus, UpVal, UpValRef, UpvalDesc, UpValVec,
 };
 use crate::strings::{LuaString, StringTable};
 use crate::table::Table;
@@ -218,7 +218,7 @@ pub struct PcallProtection {
     pub saved_is_vararg: bool,
     pub saved_proto_flag: u8,
     pub saved_nextraargs: i32,
-    pub saved_closure_upvals: Rc<RefCell<Vec<UpValRef>>>,
+    pub saved_closure_upvals: Rc<RefCell<UpValVec>>,
     pub saved_tbc_list: Option<usize>,
     /// pcall 的 func 位置（栈索引）— 用于截断栈和放置返回值
     pub func_idx: usize,
@@ -303,7 +303,7 @@ pub struct ExecState {
     pub proto_flag: u8,
     /// PF_VAHID 模式下隐藏变参的数量（对应 C 的 ci->u.l.nextraargs）
     pub nextraargs: i32,
-    pub closure_upvals: Rc<RefCell<Vec<UpValRef>>>,
+    pub closure_upvals: Rc<RefCell<UpValVec>>,
     /// 全局 open upvalue 存储 — 不随函数调用/返回保存/恢复（对应 C 的 L->openupval 链表节点存储）
     /// open_upval 链表索引此 vec，tbc_list 也索引此 vec
     pub open_upvals: Vec<UpValRef>,
@@ -355,7 +355,7 @@ impl Default for ExecState {
             is_vararg: false,
             proto_flag: 0,
             nextraargs: 0,
-            closure_upvals: Rc::new(RefCell::new(Vec::new())),
+            closure_upvals: Rc::new(RefCell::new(UpValVec::new())),
             open_upvals: Vec::new(),
             open_upval: None,
             tbc_list: None,
@@ -721,7 +721,7 @@ impl LuaState {
                 is_vararg: false,
                 proto_flag: 0,
                 nextraargs: 0,
-                closure_upvals: Rc::new(RefCell::new(Vec::new())),
+                closure_upvals: Rc::new(RefCell::new(UpValVec::new())),
                 open_upvals: Vec::new(),
                 open_upval: None,
                 tbc_list: None,
@@ -920,7 +920,7 @@ impl LuaState {
                 is_vararg: false,
                 proto_flag: 0,
                 nextraargs: 0,
-                closure_upvals: Rc::new(RefCell::new(Vec::new())),
+                closure_upvals: Rc::new(RefCell::new(UpValVec::new())),
                 open_upvals: Vec::new(),
                 open_upval: None,
                 tbc_list: None,
@@ -1068,7 +1068,7 @@ impl LuaState {
                 is_vararg: false,
                 proto_flag: 0,
                 nextraargs: 0,
-                closure_upvals: Rc::new(RefCell::new(Vec::new())),
+                closure_upvals: Rc::new(RefCell::new(UpValVec::new())),
                 open_upvals: Vec::new(),
                 open_upval: None,
                 tbc_list: None,
@@ -1140,7 +1140,7 @@ impl LuaState {
         self.exec.is_vararg = proto.is_vararg();
         self.exec.proto_flag = proto.flag;
         self.exec.nextraargs = 0;
-        self.exec.closure_upvals = Rc::new(RefCell::new(Vec::new()));
+        self.exec.closure_upvals = Rc::new(RefCell::new(UpValVec::new()));
         self.exec.tbc_list = None;
         self.exec.open_upval = None;
 
@@ -1196,7 +1196,7 @@ impl LuaState {
                 is_vararg: proto.is_vararg(),
                 proto_flag: proto.flag,
                 nextraargs: 0,
-                closure_upvals: Rc::new(RefCell::new(Vec::new())),
+                closure_upvals: Rc::new(RefCell::new(UpValVec::new())),
                 open_upvals: Vec::new(),
                 open_upval: None,
                 tbc_list: None,
@@ -2176,19 +2176,19 @@ impl LuaState {
         match crate::compiler::compile(self, code, chunk_name) {
             Ok(proto) => {
                 let nup = proto.size_upvalues as usize;
-                let mut upvals: Vec<UpValRef> = Vec::with_capacity(nup.max(1));
-                upvals.push(Rc::new(RefCell::new(UpVal::Closed {
-                    value: Box::new(TValue::Table(self.globals.clone())),
+                let upvals = Rc::new(RefCell::new(UpValVec::new()));
+                upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
+                    value: TValue::Table(self.globals.clone()),
                 })));
                 for _ in 1..nup {
-                    upvals.push(Rc::new(RefCell::new(UpVal::Closed {
-                        value: Box::new(TValue::Nil(NilKind::Strict)),
+                    upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
+                        value: TValue::Nil(NilKind::Strict),
                     })));
                 }
                 let closure = Rc::new(LClosure {
                     gc_header: GCObjectHeader::new(),
                     proto: Rc::new(proto),
-                    upvals: Rc::new(RefCell::new(upvals)),
+                    upvals,
                 });
                 self.exec.stack.push(TValue::LClosure(closure));
                 0
@@ -2259,19 +2259,19 @@ impl LuaState {
                     // 驻留化字符串 (LongString → ShortString)
                     crate::stdlib::base_lib::intern_proto_strings(&mut proto, self);
                     let nup = proto.size_upvalues as usize;
-                    let mut upvals: Vec<UpValRef> = Vec::with_capacity(nup.max(1));
-                    upvals.push(Rc::new(RefCell::new(UpVal::Closed {
-                        value: Box::new(TValue::Table(self.globals.clone())),
+                    let upvals = Rc::new(RefCell::new(UpValVec::new()));
+                    upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
+                        value: TValue::Table(self.globals.clone()),
                     })));
                     for _ in 1..nup {
-                        upvals.push(Rc::new(RefCell::new(UpVal::Closed {
-                            value: Box::new(TValue::Nil(NilKind::Strict)),
+                        upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
+                            value: TValue::Nil(NilKind::Strict),
                         })));
                     }
                     let closure = Rc::new(LClosure {
                         gc_header: GCObjectHeader::new(),
                         proto: Rc::new(proto),
-                        upvals: Rc::new(RefCell::new(upvals)),
+                        upvals,
                     });
                     self.exec.stack.push(TValue::LClosure(closure));
                     0
@@ -2426,7 +2426,7 @@ impl LuaState {
                 let saved_proto_flag = self.exec.proto_flag;
                 let saved_nextraargs = self.exec.nextraargs;
                 let saved_closure_upvals =
-                    std::mem::replace(&mut self.exec.closure_upvals, Rc::new(RefCell::new(Vec::new())));
+                    std::mem::replace(&mut self.exec.closure_upvals, Rc::new(RefCell::new(UpValVec::new())));
                 let saved_tbc_list = self.exec.tbc_list.take();
 
                 // 推入 call_info — 对应 C 的 luaD_precall 创建新 CallInfo
@@ -2547,7 +2547,7 @@ impl LuaState {
                             saved_is_vararg: false,
                             saved_proto_flag: 0,
                             saved_nextraargs: 0,
-                            saved_closure_upvals: Rc::new(RefCell::new(Vec::new())),
+                            saved_closure_upvals: Rc::new(RefCell::new(UpValVec::new())),
                             saved_tbc_list: None,
                             func_idx: 0,
                             nresults: 0,
@@ -4113,7 +4113,7 @@ impl LuaState {
                                 if Rc::as_ptr(uv_ref) as usize == *uv_ptr {
                                     let uv = uv_ref.borrow();
                                     if let UpVal::Closed { value } = &*uv {
-                                        found_val = Some((**value).clone());
+                                        found_val = Some(value.clone());
                                     }
                                     break 'outer;
                                 }

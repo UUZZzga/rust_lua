@@ -60,7 +60,7 @@ pub fn new_c_closure(state: &mut LuaState, _nupvals: usize) -> usize {
         .closure_upvals
         .borrow_mut()
         .push(Rc::new(RefCell::new(UpVal::Closed {
-            value: Box::new(TValue::Nil(NilKind::Strict)),
+            value: TValue::Nil(NilKind::Strict),
         })));
     idx
 }
@@ -72,7 +72,7 @@ pub fn new_l_closure(state: &mut LuaState, nupvals: usize) -> usize {
             .closure_upvals
             .borrow_mut()
             .push(Rc::new(RefCell::new(UpVal::Closed {
-                value: Box::new(TValue::Nil(NilKind::Strict)),
+                value: TValue::Nil(NilKind::Strict),
             })));
     }
     idx
@@ -175,7 +175,7 @@ pub fn close_upval(state: &mut LuaState, uv_idx: usize) {
                 .get(*stack_index)
                 .cloned()
                 .unwrap_or(TValue::Nil(NilKind::Strict)),
-            UpVal::Closed { value } => (**value).clone(),
+            UpVal::Closed { value } => value.clone(),
         }
     };
     // GC barrier: when upvalue is closed, mark the value
@@ -184,7 +184,7 @@ pub fn close_upval(state: &mut LuaState, uv_idx: usize) {
     }
     unlink_upval(state, uv_idx);
     *state.exec.open_upvals[uv_idx].borrow_mut() = UpVal::Closed {
-        value: Box::new(val),
+        value: val,
     };
 }
 
@@ -226,8 +226,60 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
     // （对应 C Lua 中 nny > 0 时 yield 报错的场景）。
     let yy = if state.exec.force_noyield_close { 0 } else { yy };
 
-    // 收集所有 should_close 的 upvalue（按 open_upval 链表顺序，stack_index 降序）
-    // open_upval 链表是按 stack_index 降序，对应 Lua 5.5 的关闭顺序
+    // 快速路径 (无 TBC 上值): 就地关闭, 避免 to_close Vec 分配。
+    // 先第一趟检查是否有 TBC — 有 TBC 时必须走慢路径 (保持 __close yield 时
+    // 剩余 upvalue 不提前关闭的顺序语义)。
+    let mut current = state.exec.open_upval;
+    let mut found_tbc = false;
+    while let Some(uv_idx) = current {
+        if uv_idx >= state.exec.open_upvals.len() {
+            break;
+        }
+        let (should_close, next, is_tbc) = {
+            let uv_ref = state.exec.open_upvals[uv_idx].borrow();
+            match &*uv_ref {
+                UpVal::Open {
+                    stack_index,
+                    next,
+                    tbc,
+                    ..
+                } => (*stack_index >= level, *next, *tbc),
+                UpVal::Closed { .. } => (false, None, false),
+            }
+        };
+        if should_close && is_tbc {
+            found_tbc = true;
+        }
+        current = next;
+    }
+
+    if !found_tbc {
+        // 无 TBC: 第二趟就地关闭 (对应 C 的 luaF_close 从链表头摘取关闭)
+        let mut current = state.exec.open_upval;
+        while let Some(uv_idx) = current {
+            if uv_idx >= state.exec.open_upvals.len() {
+                break;
+            }
+            let (should_close, next) = {
+                let uv_ref = state.exec.open_upvals[uv_idx].borrow();
+                match &*uv_ref {
+                    UpVal::Open { stack_index, next, .. } => (*stack_index >= level, *next),
+                    UpVal::Closed { .. } => (false, None),
+                }
+            };
+            if should_close {
+                close_upval(state, uv_idx);
+            }
+            current = next;
+        }
+        // 直接返回，不修改错误状态
+        // (避免 status!=0 但无 TBC 变量时用 Nil 覆盖原有错误)
+        state.twups_linked = false;
+        return Ok(());
+    }
+
+    // 慢路径: 存在 TBC 上值 — 重新收集并完整处理
+    // (保持 __close 元方法调用顺序与错误传播语义)
     let mut to_close: Vec<usize> = Vec::new();
     let mut current = state.exec.open_upval;
     while let Some(uv_idx) = current {
@@ -249,8 +301,7 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
         current = next;
     }
 
-    // 没有需要关闭的 upvalue: 直接返回，不修改错误状态
-    // (避免 status!=0 但无 TBC 变量时用 Nil 覆盖原有错误)
+    // 没有需要关闭的 upvalue: 直接返回
     if to_close.is_empty() {
         state.twups_linked = false;
         return Ok(());
@@ -467,7 +518,7 @@ mod tests {
                 stack: Vec::new(),
                 top: 0,
                 base: 0,
-                closure_upvals: Rc::new(RefCell::new(Vec::new())),
+                closure_upvals: Rc::new(RefCell::new(UpValVec::new())),
                 open_upvals: Vec::new(),
                 open_upval: None,
                 tbc_list: None,
@@ -637,7 +688,7 @@ mod tests {
         close_upval(&mut state, uv);
         let uv_ref = state.exec.open_upvals[uv].borrow();
         match &*uv_ref {
-            UpVal::Closed { value } => assert_eq!(**value, TValue::Integer(42)),
+            UpVal::Closed { value } => assert_eq!(*value, TValue::Integer(42)),
             _ => panic!("expected Closed"),
         }
     }

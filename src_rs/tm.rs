@@ -19,7 +19,7 @@ use bitflags::bitflags;
 
 use crate::debug::{concaterror, opinterror, ordererror, tointerror};
 use crate::execute::VmError;
-use crate::objects::{Instruction, LuaType, NilKind, TValue, Table};
+use crate::objects::{Instruction, LuaType, NilKind, TValue, Table, UpValVec};
 use crate::state::LuaState;
 use crate::strings::{LuaString, StringTable};
 
@@ -807,7 +807,7 @@ pub fn call_close_method(
             saved_is_vararg: false,
             saved_proto_flag: 0,
             saved_nextraargs: 0,
-            saved_closure_upvals: Rc::new(RefCell::new(Vec::new())),
+            saved_closure_upvals: Rc::new(RefCell::new(UpValVec::new())),
             saved_tbc_list: None,
             func_idx: 0,
             nresults: 0,
