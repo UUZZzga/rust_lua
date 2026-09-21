@@ -89,6 +89,7 @@ parking_lot = { version = "0.12", optional = true }
 
 [dev-dependencies]
 imara-diff = "0.2"
+cargo-husky = { version = "1", features = ["precommit-hook", "run-cargo-fmt"] }
 
 [build-dependencies]
 cc = "1.0"
