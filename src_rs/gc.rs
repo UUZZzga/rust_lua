@@ -729,14 +729,23 @@ impl GCState {
     // ========================================================================
 
     pub fn cond_gc(&self) {
+        // 增量 step 机器无根标记 (enter_cycle 不标记根, sweep 为空), 实际回收由
+        // maybe_collect_gc (阈值触发 full collect_gc) 完成。这里仅在确有 gray 工作
+        // 或机器处于周期中途时推进, 避免每次分配都空转 phase 机器 (~130ns/次)。
         if self.gc_debt.get() <= 0 {
-            self.step();
+            let phase = self.phase.get();
+            if phase != GCPhase::Pause || !self.gray_is_empty() {
+                self.step();
+            }
         }
     }
 
     pub fn check_gc(&self) {
         if self.gc_debt.get() <= 0 {
-            self.step();
+            let phase = self.phase.get();
+            if phase != GCPhase::Pause || !self.gray_is_empty() {
+                self.step();
+            }
         }
     }
 

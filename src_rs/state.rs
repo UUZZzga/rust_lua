@@ -209,7 +209,6 @@ pub struct PcallProtection {
     /// pcall 调用者的执行上下文（saved_*）— 用于恢复 pcall 调用者的执行
     pub saved_code: Rc<Vec<Instruction>>,
     pub saved_constants: Rc<Vec<TValue>>,
-    pub saved_upval_descs: Rc<Vec<UpvalDesc>>,
     /// 调用者的子原型列表 — Rc 共享，yield 穿越 pcall 时 O(1) 引用计数
     pub saved_protos: Rc<Vec<Rc<Proto>>>,
     pub saved_base: usize,
@@ -291,7 +290,6 @@ pub struct ExecState {
     // Rc<Vec> 避免 op_call 中深拷贝 proto 字段（perf: 省 ~5.3% malloc+memmove）
     pub constants: Rc<Vec<TValue>>,
     pub code: Rc<Vec<Instruction>>,
-    pub upval_descs: Rc<Vec<UpvalDesc>>,
     /// 当前执行函数的子原型列表 — Rc 共享，op_call 切换 proto 时 O(1) 引用计数
     pub protos: Rc<Vec<Rc<Proto>>>,
     pub top: usize,
@@ -346,7 +344,6 @@ impl Default for ExecState {
         ExecState {
             constants: Rc::new(Vec::new()),
             code: Rc::new(Vec::new()),
-            upval_descs: Rc::new(Vec::new()),
             protos: Rc::new(Vec::new()),
             top: 0,
             base: 0,
@@ -712,7 +709,6 @@ impl LuaState {
             exec: Box::new(ExecState {
                 constants: Rc::new(Vec::new()),
                 code: Rc::new(Vec::new()),
-                upval_descs: Rc::new(Vec::new()),
                 protos: Rc::new(Vec::new()),
                 top,
                 base: 0,
@@ -911,7 +907,6 @@ impl LuaState {
             exec: Box::new(ExecState {
                 constants: Rc::new(Vec::new()),
                 code: Rc::new(Vec::new()),
-                upval_descs: Rc::new(Vec::new()),
                 protos: Rc::new(Vec::new()),
                 top,
                 base: 0,
@@ -1024,7 +1019,7 @@ impl LuaState {
     ///
     /// 独立字段（对应 C Lua 中 lua_State 独有部分）：
     /// - stack / top / base / pc / call_info / call_stack: 独立执行栈
-    /// - constants / code / upval_descs / protos / closure_upvals: 独立函数上下文
+    /// - constants / code / protos / closure_upvals: 独立函数上下文
     /// - hook_func / hook_mask 等: 独立 debug hook
     /// - last_error_*/pending_*: 独立错误状态
     ///
@@ -1059,7 +1054,6 @@ impl LuaState {
             exec: Box::new(ExecState {
                 constants: Rc::new(Vec::new()),
                 code: Rc::new(Vec::new()),
-                upval_descs: Rc::new(Vec::new()),
                 protos: Rc::new(Vec::new()),
                 top,
                 base: 0,
@@ -1132,7 +1126,6 @@ impl LuaState {
         let fsize = proto.max_stack_size as usize;
         self.exec.code = proto.code.clone();
         self.exec.constants = proto.constants.clone();
-        self.exec.upval_descs = proto.upvalues.clone();
         self.exec.protos = proto.protos.clone();
         self.exec.base = 0;
         self.exec.pc = 0;
@@ -1187,7 +1180,6 @@ impl LuaState {
             exec: Box::new(ExecState {
                 constants: proto.constants.clone(),
                 code: proto.code.clone(),
-                upval_descs: proto.upvalues.clone(),
                 protos: proto.protos.clone(),
                 top,
                 base,
@@ -2417,7 +2409,6 @@ impl LuaState {
 
                 let saved_code = std::mem::take(&mut self.exec.code);
                 let saved_constants = std::mem::take(&mut self.exec.constants);
-                let saved_upval_descs = std::mem::take(&mut self.exec.upval_descs);
                 let saved_protos = std::mem::take(&mut self.exec.protos);
                 let saved_base = self.exec.base;
                 let saved_pc = self.exec.pc;
@@ -2483,7 +2474,6 @@ impl LuaState {
 
                 self.exec.code = Rc::clone(&proto.code);
                 self.exec.constants = Rc::clone(&proto.constants);
-                self.exec.upval_descs = Rc::clone(&proto.upvalues);
                 self.exec.protos = proto.protos.clone();
                 self.exec.base = func_idx + 1;
                 self.exec.pc = 0;
@@ -2539,8 +2529,7 @@ impl LuaState {
                         .push(crate::state::PcallProtection {
                             saved_code: Rc::new(Vec::new()),
                             saved_constants: Rc::new(Vec::new()),
-                            saved_upval_descs: Rc::new(Vec::new()),
-                            saved_protos: Rc::new(Vec::new()),
+                                            saved_protos: Rc::new(Vec::new()),
                             saved_base: 0,
                             saved_pc: 0,
                             saved_num_params: 0,
@@ -2656,7 +2645,6 @@ impl LuaState {
                         let top = &mut self.exec.pcall_protection_stack[idx];
                         top.saved_code = saved_code.clone();
                         top.saved_constants = saved_constants.clone();
-                        top.saved_upval_descs = saved_upval_descs.clone();
                         top.saved_protos = saved_protos.clone();
                         top.saved_base = saved_base;
                         // is_metamethod: saved_pc 不 +1，保留指向被中断的指令（OP_LE/OP_MMBIN），
@@ -2773,7 +2761,6 @@ impl LuaState {
                         let top = &mut self.exec.pcall_protection_stack[idx];
                         top.saved_code = saved_code.clone();
                         top.saved_constants = saved_constants.clone();
-                        top.saved_upval_descs = saved_upval_descs.clone();
                         top.saved_protos = saved_protos.clone();
                         top.saved_base = saved_base;
                         top.saved_pc = saved_pc + 1;
@@ -2796,7 +2783,6 @@ impl LuaState {
                 if !is_yield && !is_close_yield {
                     self.exec.code = saved_code;
                     self.exec.constants = saved_constants;
-                    self.exec.upval_descs = saved_upval_descs;
                     self.exec.protos = saved_protos;
                     self.exec.base = saved_base;
                     self.exec.pc = saved_pc;
@@ -3143,7 +3129,6 @@ impl LuaState {
                     let top = &mut self.exec.pcall_protection_stack[idx];
                     top.saved_code = self.exec.code.clone();
                     top.saved_constants = self.exec.constants.clone();
-                    top.saved_upval_descs = self.exec.upval_descs.clone();
                     top.saved_protos = self.exec.protos.clone();
                     top.saved_base = self.exec.base;
                     // is_close_continuation: saved_pc 不 +1，保留指向 OP_RETURN/OP_CLOSE

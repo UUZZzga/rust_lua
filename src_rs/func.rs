@@ -524,7 +524,6 @@ mod tests {
                 tbc_list: None,
                 constants: Rc::new(Vec::new()),
                 code: Rc::new(Vec::new()),
-                upval_descs: Rc::new(Vec::new()),
                 protos: Rc::new(Vec::new()),
                 num_params: 0,
                 is_vararg: false,

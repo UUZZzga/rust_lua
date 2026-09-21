@@ -1416,7 +1416,6 @@ impl VmExecutor {
                 // 恢复 close 调用者的执行上下文 (对应 C 的 L->ci = ci->previous)
                 state.exec.code = pp.saved_code;
                 state.exec.constants = pp.saved_constants;
-                state.exec.upval_descs = pp.saved_upval_descs;
                 state.exec.protos = pp.saved_protos;
                 state.exec.base = pp.saved_base;
                 state.exec.pc = pp.saved_pc;
@@ -1558,7 +1557,6 @@ impl VmExecutor {
                     // 恢复 pcall 调用者的执行上下文
                     state.exec.code = protection.saved_code;
                     state.exec.constants = protection.saved_constants;
-                    state.exec.upval_descs = protection.saved_upval_descs;
                     state.exec.protos = protection.saved_protos;
                     state.exec.base = protection.saved_base;
                     state.exec.pc = protection.saved_pc;
@@ -2086,7 +2084,6 @@ impl VmExecutor {
             let num_results = frame.num_results;
             state.exec.code = frame.code;
             state.exec.constants = frame.constants;
-            state.exec.upval_descs = frame.upval_descs;
             state.exec.protos = frame.protos;
             state.exec.base = frame.base;
             state.exec.pc = frame.return_pc;
@@ -2406,7 +2403,6 @@ impl VmExecutor {
         // 恢复调用者的执行上下文 (对应 C 的 L->ci = ci->previous)
         state.exec.code = protection.saved_code;
         state.exec.constants = protection.saved_constants;
-        state.exec.upval_descs = protection.saved_upval_descs;
         state.exec.protos = protection.saved_protos;
         state.exec.base = protection.saved_base;
         state.exec.pc = protection.saved_pc; // 指向被中断的指令
@@ -2616,7 +2612,6 @@ impl VmExecutor {
         // 恢复 close 调用者的执行上下文 (对应 C 的 L->ci = ci->previous)
         state.exec.code = protection.saved_code;
         state.exec.constants = protection.saved_constants;
-        state.exec.upval_descs = protection.saved_upval_descs;
         state.exec.protos = protection.saved_protos;
         state.exec.base = protection.saved_base;
         state.exec.pc = protection.saved_pc; // 指向 OP_RETURN/OP_CLOSE (不 +1, 重新执行)
@@ -2738,7 +2733,6 @@ impl VmExecutor {
         // 恢复 pcall 调用者的执行上下文
         state.exec.code = protection.saved_code;
         state.exec.constants = protection.saved_constants;
-        state.exec.upval_descs = protection.saved_upval_descs;
         state.exec.protos = protection.saved_protos;
         state.exec.base = protection.saved_base;
         state.exec.pc = protection.saved_pc; // 指向 CALL pcall 指令之后
@@ -5274,8 +5268,6 @@ impl VmExecutor {
             let saved_code = std::mem::replace(&mut state.exec.code, Rc::clone(&closure.proto.code));
             let saved_constants =
                 std::mem::replace(&mut state.exec.constants, Rc::clone(&closure.proto.constants));
-            let saved_upval_descs =
-                std::mem::replace(&mut state.exec.upval_descs, Rc::clone(&closure.proto.upvalues));
             let saved_protos =
                 std::mem::replace(&mut state.exec.protos, Rc::clone(&closure.proto.protos));
             // perf: mem::replace closure_upvals — move old to frame, move new to state
@@ -5285,7 +5277,6 @@ impl VmExecutor {
             state.exec.call_stack.push(CallFrame {
                 code: saved_code,
                 constants: saved_constants,
-                upval_descs: saved_upval_descs,
                 protos: saved_protos,
                 base: state.exec.base,
                 return_pc: state.exec.pc + 1,
@@ -5441,15 +5432,12 @@ impl VmExecutor {
                 let saved_code = std::mem::replace(&mut state.exec.code, Rc::clone(&proto.code));
                 let saved_constants =
                     std::mem::replace(&mut state.exec.constants, Rc::clone(&proto.constants));
-                let saved_upval_descs =
-                    std::mem::replace(&mut state.exec.upval_descs, Rc::clone(&proto.upvalues));
                 let saved_protos = std::mem::replace(&mut state.exec.protos, proto.protos.clone());
 
                 state.exec.call_stack.push(CallFrame {
                     code: saved_code,
                     constants: saved_constants,
-                    upval_descs: saved_upval_descs,
-                    protos: saved_protos,
+                        protos: saved_protos,
                     base: state.exec.base,
                     return_pc: state.exec.pc + 1,
                     return_base: a,
@@ -5984,8 +5972,7 @@ impl VmExecutor {
                 // perf: 消除 op_call/op_tailcall 中 4 次 malloc+memmove（~5.3% 热点）
                 state.exec.code = Rc::clone(&proto.code);
                 state.exec.constants = Rc::clone(&proto.constants);
-                state.exec.upval_descs = Rc::clone(&proto.upvalues);
-                state.exec.protos = proto.protos.clone();
+                    state.exec.protos = proto.protos.clone();
                 state.exec.pc = 0;
                 state.exec.num_params = proto.num_params;
                 state.exec.is_vararg = proto.is_vararg();
@@ -6225,7 +6212,6 @@ impl VmExecutor {
             // 新实现: 先 resize 目标区间, 用 mem::take 直接从源位置移到目标位置
             state.exec.code = frame.code;
             state.exec.constants = frame.constants;
-            state.exec.upval_descs = frame.upval_descs;
             state.exec.protos = frame.protos;
             state.exec.base = frame.base;
             state.exec.pc = frame.return_pc;
@@ -6350,7 +6336,6 @@ impl VmExecutor {
             state.exec.call_info.pop();
             state.exec.code = frame.code;
             state.exec.constants = frame.constants;
-            state.exec.upval_descs = frame.upval_descs;
             state.exec.protos = frame.protos;
             state.exec.base = frame.base;
             state.exec.pc = frame.return_pc;
@@ -6470,7 +6455,6 @@ impl VmExecutor {
             state.exec.call_info.pop();
             state.exec.code = frame.code;
             state.exec.constants = frame.constants;
-            state.exec.upval_descs = frame.upval_descs;
             state.exec.protos = frame.protos;
             state.exec.base = frame.base;
             state.exec.pc = frame.return_pc;
@@ -6817,14 +6801,12 @@ impl VmExecutor {
                 // perf: 用 mem::replace 代替 mem::take, 避免临时空 Rc 堆分配
                 let saved_code = std::mem::replace(&mut state.exec.code, proto_code);
                 let saved_constants = std::mem::replace(&mut state.exec.constants, proto_constants);
-                let saved_upval_descs = std::mem::replace(&mut state.exec.upval_descs, proto_upvals);
                 let saved_protos = std::mem::replace(&mut state.exec.protos, proto_protos);
 
                 state.exec.call_stack.push(CallFrame {
                     code: saved_code,
                     constants: saved_constants,
-                    upval_descs: saved_upval_descs,
-                    protos: saved_protos,
+                        protos: saved_protos,
                     base: state.exec.base,
                     return_pc: state.exec.pc + 1,
                     return_base: ra + 3,

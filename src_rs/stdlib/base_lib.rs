@@ -470,7 +470,6 @@ pub(crate) fn call_pcall(
         .push(crate::state::PcallProtection {
             saved_code: state.exec.code.clone(),
             saved_constants: state.exec.constants.clone(),
-            saved_upval_descs: state.exec.upval_descs.clone(),
             saved_protos: state.exec.protos.clone(),
             saved_base: state.exec.base,
             saved_pc: state.exec.pc,
@@ -1169,8 +1168,7 @@ fn call_pairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
             .push(crate::state::PcallProtection {
                 saved_code: state.exec.code.clone(),
                 saved_constants: state.exec.constants.clone(),
-                saved_upval_descs: state.exec.upval_descs.clone(),
-                saved_protos: state.exec.protos.clone(),
+                    saved_protos: state.exec.protos.clone(),
                 saved_base: state.exec.base,
                 saved_pc: state.exec.pc + 1, // 跳过调用 pairs 的 CALL 指令
                 saved_num_params: state.exec.num_params,
@@ -1269,7 +1267,6 @@ pub(crate) fn call_xpcall(
         .push(crate::state::PcallProtection {
             saved_code: state.exec.code.clone(),
             saved_constants: state.exec.constants.clone(),
-            saved_upval_descs: state.exec.upval_descs.clone(),
             saved_protos: state.exec.protos.clone(),
             saved_base: state.exec.base,
             saved_pc: state.exec.pc,

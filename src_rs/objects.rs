@@ -1723,7 +1723,6 @@ impl Udata {
 pub struct CallFrame {
     pub code: Rc<Vec<Instruction>>,
     pub constants: Rc<Vec<TValue>>,
-    pub upval_descs: Rc<Vec<UpvalDesc>>,
     /// 子原型列表 — Rc 共享，op_call 保存调用现场时 O(1) 引用计数（perf: 消除 Vec 分配）
     pub protos: Rc<Vec<Rc<Proto>>>,
     pub base: usize,

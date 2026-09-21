@@ -440,7 +440,6 @@ pub(crate) fn call_tm_res(
     let caller_pc = state.exec.pc;
     let caller_code = state.exec.code.clone();
     let caller_constants = state.exec.constants.clone();
-    let caller_upval_descs = state.exec.upval_descs.clone();
     let caller_protos = state.exec.protos.clone();
     let caller_num_params = state.exec.num_params;
     let caller_is_vararg = state.exec.is_vararg;
@@ -471,7 +470,6 @@ pub(crate) fn call_tm_res(
         .push(crate::state::PcallProtection {
             saved_code: caller_code.clone(),
             saved_constants: caller_constants.clone(),
-            saved_upval_descs: caller_upval_descs.clone(),
             saved_protos: caller_protos.clone(),
             saved_base: caller_base,
             saved_pc: caller_pc,
@@ -601,7 +599,6 @@ pub(crate) fn call_tm(
     let caller_pc = state.exec.pc;
     let caller_code = state.exec.code.clone();
     let caller_constants = state.exec.constants.clone();
-    let caller_upval_descs = state.exec.upval_descs.clone();
     let caller_protos = state.exec.protos.clone();
     let caller_num_params = state.exec.num_params;
     let caller_is_vararg = state.exec.is_vararg;
@@ -631,7 +628,6 @@ pub(crate) fn call_tm(
         .push(crate::state::PcallProtection {
             saved_code: caller_code.clone(),
             saved_constants: caller_constants.clone(),
-            saved_upval_descs: caller_upval_descs.clone(),
             saved_protos: caller_protos.clone(),
             saved_base: caller_base,
             saved_pc: caller_pc,
@@ -799,7 +795,6 @@ pub fn call_close_method(
         .push(crate::state::PcallProtection {
             saved_code: Rc::new(Vec::new()),
             saved_constants: Rc::new(Vec::new()),
-            saved_upval_descs: Rc::new(Vec::new()),
             saved_protos: Rc::new(Vec::new()),
             saved_base: 0,
             saved_pc: 0,

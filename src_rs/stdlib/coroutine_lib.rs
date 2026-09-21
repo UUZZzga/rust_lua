@@ -1517,7 +1517,6 @@ fn setup_first_resume(
         // Lua 函数: 从 proto 加载执行上下文 — Rc::clone O(1) 替代 Vec 深拷贝
         co.code = Rc::clone(&closure.proto.code);
         co.constants = Rc::clone(&closure.proto.constants);
-        co.upval_descs = Rc::clone(&closure.proto.upvalues);
         co.protos = closure.proto.protos.clone();
         co.base = 1; // closure 在 stack[0]，寄存器从 stack[1] 开始
         co.pc = 0;
@@ -1587,7 +1586,6 @@ fn setup_first_resume(
         let return_inst = create_abck(OpCode::RETURN, 0, 0, 0, 0);
         co.code = Rc::new(vec![call_inst, return_inst]);
         co.constants = Rc::new(Vec::new());
-        co.upval_descs = Rc::new(Vec::new());
         co.protos = Rc::new(Vec::new());
         co.base = 1;
         co.pc = 0;
