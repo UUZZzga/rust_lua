@@ -56,7 +56,8 @@ fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: i64) -> i64 
 fn get_obj_len(state: &mut LuaState, obj: &TValue) -> Result<i64, VmError> {
     let tmp_ra = state.exec.stack.len();
     crate::tm::obj_len(state, tmp_ra, obj, "")?;
-    let result = state.exec
+    let result = state
+        .exec
         .stack
         .get(tmp_ra)
         .cloned()
@@ -259,7 +260,8 @@ fn call_unpack(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     // 用 try_reserve_exact 避免 panic，将 OOM 转为可被 pcall/resume 捕获的运行时错误。
     // 沿用 "too many results to unpack" 消息（与 MAXSTACK 检查一致），让 errors.lua:615 的
     // checkerr("too many results", f) 能匹配。
-    state.exec
+    state
+        .exec
         .stack
         .try_reserve_exact(n)
         .map_err(|_| VmError::RuntimeError("too many results to unpack".to_string()))?;
@@ -881,7 +883,8 @@ fn call_comp_function(
 
     if status != 0 {
         // 获取原始错误值并传播 (对应 C 的 lua_call 直接传播错误)
-        let err_val = state.exec
+        let err_val = state
+            .exec
             .stack
             .last()
             .cloned()
@@ -919,10 +922,7 @@ pub fn open_table_lib(state: &mut LuaState) {
                     func: crate::objects::BuiltinFnPtr| {
         let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
         let name_ptr = name.as_ptr() as *const u8;
-        lib.set(
-            key,
-            TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)),
-        );
+        lib.set(key, TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)));
     };
 
     register(&mut lib, c"concat", call_concat);

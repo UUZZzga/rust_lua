@@ -1946,7 +1946,8 @@ fn call_lines_iterator_fn(
 
     // 从 state.exec.stack[a] 取出 RustClosure，提取状态
     let (file_ptr_id, to_close, finished, formats) = {
-        let func_val = state.exec
+        let func_val = state
+            .exec
             .stack
             .get(a)
             .cloned()
@@ -2256,10 +2257,7 @@ pub fn open_io_lib(state: &mut LuaState) {
                     func: crate::objects::BuiltinFnPtr| {
         let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
         let name_ptr = name.as_ptr() as *const u8;
-        table.set(
-            key,
-            TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)),
-        );
+        table.set(key, TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)));
     };
 
     // 创建 FILE* 元表 (对应 C 的 LUA_FILEHANDLE)

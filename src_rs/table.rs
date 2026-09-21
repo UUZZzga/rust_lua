@@ -67,10 +67,12 @@ impl Table {
                     }
                     #[cfg(size_optimized)]
                     {
-                        Some(Box::new(crate::objects::TableHashMap::with_capacity_and_hasher(
-                            nhash,
-                            crate::objects::FxBuildHasher::default(),
-                        )))
+                        Some(Box::new(
+                            crate::objects::TableHashMap::with_capacity_and_hasher(
+                                nhash,
+                                crate::objects::FxBuildHasher::default(),
+                            ),
+                        ))
                     }
                 } else {
                     None
@@ -138,7 +140,6 @@ impl Table {
         });
         r.ok()
     }
-
 
     /// 设置元表。
     pub fn set_metatable(&self, mt: Option<Table>) {
@@ -604,7 +605,6 @@ impl Table {
             }
         }
     }
-
 
     pub fn resize_array(&self, nasize: usize) {
         let nhsize = self.data.borrow().hash_buckets.len();

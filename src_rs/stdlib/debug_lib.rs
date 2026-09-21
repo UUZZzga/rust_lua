@@ -21,7 +21,9 @@
 //! - 标签 500+: 调试库
 
 use crate::execute::VmError;
-use crate::objects::{BuiltinFn, LClosure, NilKind, Proto, TValue, UpVal, UpValRef, UpValVec, PF_VAHID};
+use crate::objects::{
+    BuiltinFn, LClosure, NilKind, Proto, TValue, UpVal, UpValRef, UpValVec, PF_VAHID,
+};
 use crate::state::LuaState;
 use crate::strings::LuaString;
 use crate::table::Table;
@@ -240,7 +242,8 @@ fn get_frame_info(state: &LuaState, level: i32) -> Option<FrameInfo> {
     } else {
         0
     };
-    let idx = state.exec
+    let idx = state
+        .exec
         .call_info
         .len()
         .checked_sub((level as usize).saturating_sub(1) + c_func_offset)?;
@@ -915,11 +918,13 @@ fn fill_info_from_level(state: &LuaState, info: &mut DebugInfo, level: i32, what
             } else {
                 state.exec.call_info.len().saturating_sub(1)
             };
-            let (name, namewhat) = state.exec
+            let (name, namewhat) = state
+                .exec
                 .call_info
                 .get(name_idx)
                 .map(|entry| {
-                    let (_, _, n, nw) = crate::execute::compute_caller_info(&state.exec.stack, entry);
+                    let (_, _, n, nw) =
+                        crate::execute::compute_caller_info(&state.exec.stack, entry);
                     (if n.is_empty() { None } else { Some(n) }, nw)
                 })
                 .unwrap_or((None, String::new()));
@@ -969,7 +974,8 @@ fn fill_info_from_level(state: &LuaState, info: &mut DebugInfo, level: i32, what
                 } else {
                     state.exec.call_info.len().saturating_sub(1)
                 };
-                let istailcall = state.exec
+                let istailcall = state
+                    .exec
                     .call_info
                     .get(tail_idx)
                     .map(|e| e.is_tailcall)
@@ -1029,7 +1035,8 @@ fn fill_info_from_level(state: &LuaState, info: &mut DebugInfo, level: i32, what
         0
     };
 
-    let ci_idx = match state.exec
+    let ci_idx = match state
+        .exec
         .call_info
         .len()
         .checked_sub((level as usize).saturating_sub(1) + c_func_offset)
@@ -2370,8 +2377,7 @@ fn call_setupvalue(
         TValue::Table(t) => {
             // 带有 __call 元方法的 Table 是可调用对象 (旧版 string.gmatch 返回值)
             // 模拟 C 闭包行为: 无法设置 upvalue, 返回 nil
-            if t
-                .get_metatable()
+            if t.get_metatable()
                 .and_then(|mt| mt.get(&TValue::Str(state.intern_str("__call"))))
                 .is_some()
             {
@@ -2867,7 +2873,8 @@ fn build_traceback(state: &LuaState, msg: &str, level: i32) -> String {
         let is_error_handler = last_lua_idx.is_some() && {
             let idx = last_lua_idx.unwrap();
             let ci_closure = crate::state::get_closure_for_ci(state, idx);
-            let stack_closure = if state.exec.base > 0 && state.exec.base <= state.exec.stack.len() {
+            let stack_closure = if state.exec.base > 0 && state.exec.base <= state.exec.stack.len()
+            {
                 if let TValue::LClosure(c) = &state.exec.stack[state.exec.base - 1] {
                     Some(c)
                 } else {
@@ -2895,33 +2902,41 @@ fn build_traceback(state: &LuaState, msg: &str, level: i32) -> String {
                     .unwrap_or_else(|| "?".to_string());
                 let line = get_proto_line(proto, entry.saved_pc);
                 let is_main = proto.line_defined == 0;
-                let (name, namewhat) = if state.exec.call_info.last().map(|e| e.is_c).unwrap_or(false)
-                    && n >= 2
-                {
-                    let e = &state.exec.call_info[n - 2];
-                    // e 的 caller_proto 回退到前一个条目的 closure (若有)
-                    let prev_fb = if n >= 3 {
-                        state.exec.call_info[n - 3].closure.as_ref().map(|c| &c.proto)
+                let (name, namewhat) =
+                    if state.exec.call_info.last().map(|e| e.is_c).unwrap_or(false) && n >= 2 {
+                        let e = &state.exec.call_info[n - 2];
+                        // e 的 caller_proto 回退到前一个条目的 closure (若有)
+                        let prev_fb = if n >= 3 {
+                            state.exec.call_info[n - 3]
+                                .closure
+                                .as_ref()
+                                .map(|c| &c.proto)
+                        } else {
+                            None
+                        };
+                        let (_, _, nm, nw) = crate::execute::compute_caller_info_with_fallback(
+                            &state.exec.stack,
+                            e,
+                            prev_fb,
+                        );
+                        (nm, nw)
                     } else {
-                        None
+                        // entry 的 caller_proto 回退到前一个条目的 closure (若有)
+                        let prev_fb = if idx > 0 {
+                            state.exec.call_info[idx - 1]
+                                .closure
+                                .as_ref()
+                                .map(|c| &c.proto)
+                        } else {
+                            None
+                        };
+                        let (_, _, nm, nw) = crate::execute::compute_caller_info_with_fallback(
+                            &state.exec.stack,
+                            entry,
+                            prev_fb,
+                        );
+                        (nm, nw)
                     };
-                    let (_, _, nm, nw) =
-                        crate::execute::compute_caller_info_with_fallback(&state.exec.stack, e, prev_fb);
-                    (nm, nw)
-                } else {
-                    // entry 的 caller_proto 回退到前一个条目的 closure (若有)
-                    let prev_fb = if idx > 0 {
-                        state.exec.call_info[idx - 1].closure.as_ref().map(|c| &c.proto)
-                    } else {
-                        None
-                    };
-                    let (_, _, nm, nw) = crate::execute::compute_caller_info_with_fallback(
-                        &state.exec.stack,
-                        entry,
-                        prev_fb,
-                    );
-                    (nm, nw)
-                };
                 lines.push(make_traceback_line(
                     &src,
                     line,
@@ -2933,15 +2948,16 @@ fn build_traceback(state: &LuaState, msg: &str, level: i32) -> String {
                 ));
             }
         } else if let Some((src, line, name, namewhat, is_main)) = get_current_frame_info(state) {
-            let (is_c, linedefined) = if state.exec.base > 0 && state.exec.base <= state.exec.stack.len() {
-                if let TValue::LClosure(closure) = &state.exec.stack[state.exec.base - 1] {
-                    (false, closure.proto.line_defined)
+            let (is_c, linedefined) =
+                if state.exec.base > 0 && state.exec.base <= state.exec.stack.len() {
+                    if let TValue::LClosure(closure) = &state.exec.stack[state.exec.base - 1] {
+                        (false, closure.proto.line_defined)
+                    } else {
+                        (true, 0)
+                    }
                 } else {
                     (true, 0)
-                }
-            } else {
-                (true, 0)
-            };
+                };
             lines.push(make_traceback_line(
                 &src,
                 line,
@@ -2993,7 +3009,10 @@ fn build_traceback(state: &LuaState, msg: &str, level: i32) -> String {
                 let linedefined = closure_ref.map(|c| c.proto.line_defined).unwrap_or(0);
                 // entry 的 caller_proto 回退到前一个条目的 closure (若有)
                 let prev_fallback = if i > 0 {
-                    state.exec.call_info[i - 1].closure.as_ref().map(|c| &c.proto)
+                    state.exec.call_info[i - 1]
+                        .closure
+                        .as_ref()
+                        .map(|c| &c.proto)
                 } else {
                     None
                 };
@@ -3232,7 +3251,8 @@ fn get_current_frame_info(state: &LuaState) -> Option<(String, i32, String, Stri
             let (_, _, nm, nw) = crate::execute::compute_caller_info(&state.exec.stack, entry);
             (nm, nw)
         } else {
-            state.exec
+            state
+                .exec
                 .call_info
                 .last()
                 .map(|e| {
@@ -3402,10 +3422,7 @@ pub fn create_debug_lib_table(state: &LuaState) -> Table {
         |lib: &mut Table, name: &'static std::ffi::CStr, func: crate::objects::BuiltinFnPtr| {
             let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
             let name_ptr = name.as_ptr() as *const u8;
-            lib.set(
-                key,
-                TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)),
-            );
+            lib.set(key, TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)));
         };
 
     register(&mut lib, c"traceback", call_traceback);
@@ -3604,9 +3621,11 @@ mod tests {
             source: None,
         };
         let upvals = Rc::new(RefCell::new(UpValVec::new()));
-        upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
-            value: TValue::Integer(42),
-        })));
+        upvals
+            .borrow_mut()
+            .push(Rc::new(RefCell::new(UpVal::Closed {
+                value: TValue::Integer(42),
+            })));
         let closure = Rc::new(LClosure {
             gc_header: GCObjectHeader::new(),
             proto: Rc::new(proto),
@@ -3719,7 +3738,8 @@ mod tests {
         let mut state = LuaState::new();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec
+        state
+            .exec
             .stack
             .push(TValue::Str(state.intern_str("error message")));
         call_traceback(&mut state, 0, 1, 1).unwrap();
@@ -3825,9 +3845,11 @@ mod tests {
         use crate::gc::GCObjectHeader;
         let mut state = LuaState::new();
         let upvals = Rc::new(RefCell::new(UpValVec::new()));
-        upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
-            value: TValue::Integer(42),
-        })));
+        upvals
+            .borrow_mut()
+            .push(Rc::new(RefCell::new(UpVal::Closed {
+                value: TValue::Integer(42),
+            })));
         let closure = Rc::new(LClosure {
             gc_header: GCObjectHeader::new(),
             proto: Rc::new(crate::func::new_proto()),

@@ -24,14 +24,11 @@ mod compat {
     pub unsafe fn errno_ptr() -> *mut c_int {
         libc::__errno_location()
     }
-    pub use libc::{mkstemp, strftime, mktime};
+    pub use libc::{mkstemp, mktime, strftime};
     pub unsafe fn gmtime_r(timep: *const libc::time_t, result: *mut libc::tm) -> *mut libc::tm {
         libc::gmtime_r(timep, result)
     }
-    pub unsafe fn localtime_r(
-        timep: *const libc::time_t,
-        result: *mut libc::tm,
-    ) -> *mut libc::tm {
+    pub unsafe fn localtime_r(timep: *const libc::time_t, result: *mut libc::tm) -> *mut libc::tm {
         libc::localtime_r(timep, result)
     }
 }
@@ -71,10 +68,7 @@ mod compat {
     }
 
     /// localtime_r → localtime_s (Windows 参数顺序相反, 返回 errno_t)
-    pub unsafe fn localtime_r(
-        timep: *const libc::time_t,
-        result: *mut libc::tm,
-    ) -> *mut libc::tm {
+    pub unsafe fn localtime_r(timep: *const libc::time_t, result: *mut libc::tm) -> *mut libc::tm {
         let rc = unsafe { libc::localtime_s(result, timep) };
         if rc == 0 {
             result
@@ -973,10 +967,7 @@ pub fn open_os_lib(state: &mut LuaState) {
                     func: crate::objects::BuiltinFnPtr| {
         let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
         let name_ptr = name.as_ptr() as *const u8;
-        lib.set(
-            key,
-            TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)),
-        );
+        lib.set(key, TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)));
     };
 
     register(&mut lib, c"setlocale", call_setlocale);

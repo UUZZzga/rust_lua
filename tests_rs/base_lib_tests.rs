@@ -982,10 +982,13 @@ fn test_unit_call_ipairs_aux() {
     t.set(TValue::Integer(2), TValue::Integer(20));
     // base 库已迁移到 BuiltinFn，ipairs 返回的迭代器是 BuiltinFn(call_ipairs_aux)。
     // call_ipairs_aux 不读取函数槽 (position a)，此处用 BuiltinFn 占位以模拟真实场景。
-    state.exec.stack.push(TValue::BuiltinFn(lua_rs::objects::BuiltinFn::impure(
-        base_lib::call_ipairs_aux,
-        b"for iterator\0".as_ptr() as *const u8,
-    )));
+    state
+        .exec
+        .stack
+        .push(TValue::BuiltinFn(lua_rs::objects::BuiltinFn::impure(
+            base_lib::call_ipairs_aux,
+            b"for iterator\0".as_ptr() as *const u8,
+        )));
     state.exec.stack.push(TValue::Table(t));
     state.exec.stack.push(TValue::Integer(0));
     base_lib::call_ipairs_aux(&mut state, 0, 2, -1).unwrap();

@@ -759,10 +759,7 @@ pub fn create_utf8_lib_table(state: &LuaState) -> crate::table::Table {
                     func: crate::objects::BuiltinFnPtr| {
         let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
         let name_ptr = name.as_ptr() as *const u8;
-        lib.set(
-            key,
-            TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)),
-        );
+        lib.set(key, TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)));
     };
 
     register(&mut lib, c"offset", call_offset);

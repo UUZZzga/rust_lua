@@ -325,10 +325,9 @@ pub fn get_tm_by_obj(
     match obj {
         TValue::Table(t) => {
             // 元表槽: 外层 Table 的 data.metatable 借用 (无 Table clone)
-            let mt_guard = std::cell::Ref::filter_map(t.data.borrow(), |d| {
-                d.metatable.as_ref().map(|b| &**b)
-            })
-            .ok()?;
+            let mt_guard =
+                std::cell::Ref::filter_map(t.data.borrow(), |d| d.metatable.as_ref().map(|b| &**b))
+                    .ok()?;
             let v = mt_guard.get_tm_ref(key)?;
             Some(v.clone())
         }
@@ -465,7 +464,8 @@ pub(crate) fn call_tm_res(
     // 并执行 continuation（对应 C Lua 的 luaV_finishOp + unroll 机制）。
     // saved_pc 保留指向被中断的指令（OP_LE/OP_MMBIN 等），不 +1，
     // 以便 continuation 时读取该指令并完成。
-    state.exec
+    state
+        .exec
         .pcall_protection_stack
         .push(crate::state::PcallProtection {
             saved_code: caller_code.clone(),
@@ -623,7 +623,8 @@ pub(crate) fn call_tm(
     // saved_pc 保留指向被中断的指令 (SETTABLE/SETI/SETFIELD), 不 +1,
     // 以便 continuation 时读取该指令并完成。
     // metamethod_res 设为 func_idx (不使用, 因为 0 个返回值)。
-    state.exec
+    state
+        .exec
         .pcall_protection_stack
         .push(crate::state::PcallProtection {
             saved_code: caller_code.clone(),
@@ -790,7 +791,8 @@ pub fn call_close_method(
     // Push PcallProtection — close continuation 机制
     // yield 穿过 __close 后，resume 时 __close 返回，op_return 检测到 is_close_continuation=true
     // 并执行 continuation（对应 C Lua 的 luaV_finishOp 对 OP_RETURN/OP_CLOSE 的 savedpc-- 机制）
-    state.exec
+    state
+        .exec
         .pcall_protection_stack
         .push(crate::state::PcallProtection {
             saved_code: Rc::new(Vec::new()),
@@ -842,7 +844,8 @@ pub fn call_close_method(
     if status != 0 {
         // 元方法调用失败 — pcall 将错误值推入栈中 func_idx 位置
         // 在截断栈之前读取错误值，保留原始 TValue 类型
-        let err_val = state.exec
+        let err_val = state
+            .exec
             .stack
             .get(func_idx)
             .cloned()

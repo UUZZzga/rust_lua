@@ -3,8 +3,8 @@ use crate::execute::{VmError, VmExecutor, VmResult};
 use crate::gc::{GCObjectHeader, GCState};
 use crate::objects::FxBuildHasher;
 use crate::objects::{
-    BuiltinFn, BuiltinFnPtr, Instruction, LClosure, LuaThread, LuaType, NilKind, Proto,
-    TValue, TableData, ThreadContext, ThreadStatus, UpVal, UpValRef, UpvalDesc, UpValVec,
+    BuiltinFn, BuiltinFnPtr, Instruction, LClosure, LuaThread, LuaType, NilKind, Proto, TValue,
+    TableData, ThreadContext, ThreadStatus, UpVal, UpValRef, UpValVec, UpvalDesc,
 };
 use crate::strings::{LuaString, StringTable};
 use crate::table::Table;
@@ -143,7 +143,11 @@ thread_local! {
 fn gc_stats_enabled() -> bool {
     use std::sync::OnceLock;
     static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| std::env::var("LUA_GC_STATS").map(|v| v == "1" || v == "true").unwrap_or(false))
+    *FLAG.get_or_init(|| {
+        std::env::var("LUA_GC_STATS")
+            .map(|v| v == "1" || v == "true")
+            .unwrap_or(false)
+    })
 }
 
 /// 累加统计到 thread_local（仅在 gc_stats_enabled() 时调用）
@@ -1826,10 +1830,8 @@ impl LuaState {
         let name_str = name.to_str().unwrap_or("");
         let key = TValue::Str(str_to_ls(&self.string_table, name_str));
         let name_ptr = name.as_ptr() as *const u8;
-        self.globals.set(
-            key,
-            TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)),
-        );
+        self.globals
+            .set(key, TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)));
     }
 
     /// 注册 Rust 原生内置函数到指定表（Rust 风格 API）
@@ -1852,15 +1854,16 @@ impl LuaState {
         let name_str = name.to_str().unwrap_or("");
         let key = TValue::Str(str_to_ls(&self.string_table, name_str));
         let name_ptr = name.as_ptr() as *const u8;
-        table.set(
-            key,
-            TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)),
-        );
+        table.set(key, TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)));
     }
 
     pub fn set_field(&mut self, idx: isize, key_name: &str) {
         let abs = self.abs_index(idx);
-        let val = self.exec.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        let val = self
+            .exec
+            .stack
+            .pop()
+            .unwrap_or(TValue::Nil(NilKind::Strict));
         let key = TValue::Str(str_to_ls(&self.string_table, key_name));
         if abs > 0 && abs <= self.exec.stack.len() {
             let tbl = &mut self.exec.stack[abs - 1];
@@ -1920,7 +1923,11 @@ impl LuaState {
 
     pub fn raw_set_i(&mut self, idx: isize, i: i64) {
         let abs = self.abs_index(idx);
-        let val = self.exec.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        let val = self
+            .exec
+            .stack
+            .pop()
+            .unwrap_or(TValue::Nil(NilKind::Strict));
         if abs > 0 && abs <= self.exec.stack.len() {
             if let TValue::Table(ref mut t) = self.exec.stack[abs - 1] {
                 t.set_int(i, val);
@@ -1929,7 +1936,11 @@ impl LuaState {
     }
 
     pub fn raw_get(&mut self, idx: isize) -> LuaType {
-        let key = self.exec.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        let key = self
+            .exec
+            .stack
+            .pop()
+            .unwrap_or(TValue::Nil(NilKind::Strict));
         let abs = self.abs_index(idx);
         if abs > 0 && abs <= self.exec.stack.len() {
             let val = if let TValue::Table(ref t) = &self.exec.stack[abs - 1] {
@@ -1947,8 +1958,16 @@ impl LuaState {
     }
 
     pub fn raw_set(&mut self, idx: isize) {
-        let val = self.exec.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
-        let key = self.exec.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        let val = self
+            .exec
+            .stack
+            .pop()
+            .unwrap_or(TValue::Nil(NilKind::Strict));
+        let key = self
+            .exec
+            .stack
+            .pop()
+            .unwrap_or(TValue::Nil(NilKind::Strict));
         let abs = self.abs_index(idx);
         if abs > 0 && abs <= self.exec.stack.len() {
             if let TValue::Table(ref mut t) = self.exec.stack[abs - 1] {
@@ -2116,7 +2135,8 @@ impl LuaState {
             result.push_str("\n\t[C]: in ?");
         } else {
             for entry in &self.exec.call_info {
-                let (src, line, name, _) = crate::execute::compute_caller_info(&self.exec.stack, entry);
+                let (src, line, name, _) =
+                    crate::execute::compute_caller_info(&self.exec.stack, entry);
                 result.push('\n');
                 result.push('\t');
                 if entry.is_c {
@@ -2169,13 +2189,17 @@ impl LuaState {
             Ok(proto) => {
                 let nup = proto.size_upvalues as usize;
                 let upvals = Rc::new(RefCell::new(UpValVec::new()));
-                upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
-                    value: TValue::Table(self.globals.clone()),
-                })));
-                for _ in 1..nup {
-                    upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
-                        value: TValue::Nil(NilKind::Strict),
+                upvals
+                    .borrow_mut()
+                    .push(Rc::new(RefCell::new(UpVal::Closed {
+                        value: TValue::Table(self.globals.clone()),
                     })));
+                for _ in 1..nup {
+                    upvals
+                        .borrow_mut()
+                        .push(Rc::new(RefCell::new(UpVal::Closed {
+                            value: TValue::Nil(NilKind::Strict),
+                        })));
                 }
                 let closure = Rc::new(LClosure {
                     gc_header: GCObjectHeader::new(),
@@ -2252,13 +2276,17 @@ impl LuaState {
                     crate::stdlib::base_lib::intern_proto_strings(&mut proto, self);
                     let nup = proto.size_upvalues as usize;
                     let upvals = Rc::new(RefCell::new(UpValVec::new()));
-                    upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
-                        value: TValue::Table(self.globals.clone()),
-                    })));
-                    for _ in 1..nup {
-                        upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
-                            value: TValue::Nil(NilKind::Strict),
+                    upvals
+                        .borrow_mut()
+                        .push(Rc::new(RefCell::new(UpVal::Closed {
+                            value: TValue::Table(self.globals.clone()),
                         })));
+                    for _ in 1..nup {
+                        upvals
+                            .borrow_mut()
+                            .push(Rc::new(RefCell::new(UpVal::Closed {
+                                value: TValue::Nil(NilKind::Strict),
+                            })));
                     }
                     let closure = Rc::new(LClosure {
                         gc_header: GCObjectHeader::new(),
@@ -2416,8 +2444,10 @@ impl LuaState {
                 let saved_is_vararg = self.exec.is_vararg;
                 let saved_proto_flag = self.exec.proto_flag;
                 let saved_nextraargs = self.exec.nextraargs;
-                let saved_closure_upvals =
-                    std::mem::replace(&mut self.exec.closure_upvals, Rc::new(RefCell::new(UpValVec::new())));
+                let saved_closure_upvals = std::mem::replace(
+                    &mut self.exec.closure_upvals,
+                    Rc::new(RefCell::new(UpValVec::new())),
+                );
                 let saved_tbc_list = self.exec.tbc_list.take();
 
                 // 推入 call_info — 对应 C 的 luaD_precall 创建新 CallInfo
@@ -2520,16 +2550,18 @@ impl LuaState {
                 // 使 error 传播到本 state.pcall，而非被外层 PcallProtection 捕获。
                 // 典型场景: pcall(foo) yield 后，foo 的 __close error 应被
                 // call_close_method 的 state.pcall 捕获，而非 pcall(foo) 的 PcallProtection。
-                let need_shield = self.exec
+                let need_shield = self
+                    .exec
                     .pcall_protection_stack
                     .last()
                     .map_or(false, |t| t.saved_filled);
                 if need_shield {
-                    self.exec.pcall_protection_stack
+                    self.exec
+                        .pcall_protection_stack
                         .push(crate::state::PcallProtection {
                             saved_code: Rc::new(Vec::new()),
                             saved_constants: Rc::new(Vec::new()),
-                                            saved_protos: Rc::new(Vec::new()),
+                            saved_protos: Rc::new(Vec::new()),
                             saved_base: 0,
                             saved_pc: 0,
                             saved_num_params: 0,
@@ -2710,18 +2742,19 @@ impl LuaState {
                             // 必须在 func::close 之前执行，否则 debug.getinfo(2) 会读到残留条目
                             self.exec.call_info.truncate(saved_call_info_len);
                             let close_level = self.exec.base; // foo 的 base
-                                                         // __close 的调用者应是 pcall（C 函数），对应 C 版本中 foo 的 ci
-                                                         // 在 error 时被弹出，调用栈上只剩 pcall 的 ci。
-                                                         // call_close_method 推入的 __close CallInfoEntry 的 base = state.exec.base
-                                                         // = close_level。state.exec.stack[close_level-1] 是 foo 闭包（LClosure），
-                                                         // 因为 call_pcall 把 foo 覆盖到 pcall 闭包位置。
-                                                         // 临时设为 nil（非 LClosure），让 debug.getinfo(2) 返回 "C"。
-                                                         // close 后会 truncate 栈到 func_idx，无需恢复。
+                                                              // __close 的调用者应是 pcall（C 函数），对应 C 版本中 foo 的 ci
+                                                              // 在 error 时被弹出，调用栈上只剩 pcall 的 ci。
+                                                              // call_close_method 推入的 __close CallInfoEntry 的 base = state.exec.base
+                                                              // = close_level。state.exec.stack[close_level-1] 是 foo 闭包（LClosure），
+                                                              // 因为 call_pcall 把 foo 覆盖到 pcall 闭包位置。
+                                                              // 临时设为 nil（非 LClosure），让 debug.getinfo(2) 返回 "C"。
+                                                              // close 后会 truncate 栈到 func_idx，无需恢复。
                             if close_level > 0 && close_level <= self.exec.stack.len() {
                                 self.exec.stack[close_level - 1] = TValue::Nil(NilKind::Strict);
                             }
                             // 在协程中用 yy=1（可 yield），对应 C Lua 的 finishpcallk 用 yy=1
-                            let close_yy = if self.exec.n_ny_calls == 0 && self.exec.current_thread.is_some()
+                            let close_yy = if self.exec.n_ny_calls == 0
+                                && self.exec.current_thread.is_some()
                             {
                                 1
                             } else {
@@ -3479,7 +3512,9 @@ impl LuaState {
     fn is_marked(val: &TValue, reachable: &GcHashSet) -> bool {
         match val {
             TValue::Table(t) => t
-                .data.borrow().gc_header
+                .data
+                .borrow()
+                .gc_header
                 .id()
                 .map_or(true, |id| reachable.contains(&(id.0 as usize))),
             TValue::LClosure(c) => c
@@ -3553,7 +3588,9 @@ impl LuaState {
                 s.total_us += elapsed.as_micros() as u64;
                 s.count += 1;
                 let this_us = elapsed.as_micros() as u64;
-                if this_us > s.max_us { s.max_us = this_us; }
+                if this_us > s.max_us {
+                    s.max_us = this_us;
+                }
                 cell.set(s);
             });
         }
@@ -3789,7 +3826,9 @@ impl LuaState {
                 cell.set(s);
             });
         }
-        gc_stats_inc(|s| { s.short_string += short_string_count; });
+        gc_stats_inc(|s| {
+            s.short_string += short_string_count;
+        });
 
         // 重算 extra_estimate：反映当前可达的无 gc_header 对象的内存占用
         self.gc.set_extra_estimate(extra_size);
@@ -3834,7 +3873,8 @@ impl LuaState {
                 let s = cell.get();
                 // 可能循环引用的对象 = Table + LClosure + CClosure + RustClosure + Thread + UserData
                 // （这些对象持有 GC 对象引用，可能形成 Rc 循环）
-                let cyclic = s.table + s.lclosure + s.cclosure + s.rust_closure + s.thread + s.userdata;
+                let cyclic =
+                    s.table + s.lclosure + s.cclosure + s.rust_closure + s.thread + s.userdata;
                 // 非循环对象 = Proto + ShortString（叶子或单向引用）
                 let non_cyclic = s.proto + s.short_string;
                 let total = cyclic + non_cyclic;
@@ -3846,14 +3886,24 @@ impl LuaState {
                     s.reachable_total,
                     s.active_total,
                     s.active_total.saturating_sub(s.reachable_total),
-                    s.table, s.table_with_mt,
-                    s.lclosure, s.lclosure_with_upvals,
-                    s.cclosure, s.rust_closure,
-                    s.thread, s.userdata,
-                    cyclic, non_cyclic,
-                    s.proto, s.short_string,
+                    s.table,
+                    s.table_with_mt,
+                    s.lclosure,
+                    s.lclosure_with_upvals,
+                    s.cclosure,
+                    s.rust_closure,
+                    s.thread,
+                    s.userdata,
+                    cyclic,
+                    non_cyclic,
+                    s.proto,
+                    s.short_string,
                 );
-                let pct = if total > 0 { cyclic as f64 * 100.0 / total as f64 } else { 0.0 };
+                let pct = if total > 0 {
+                    cyclic as f64 * 100.0 / total as f64
+                } else {
+                    0.0
+                };
                 eprintln!(
                     "[GC stats] cyclic_ratio={:.2}% (cyclic={} / total={})",
                     pct, cyclic, total
@@ -3916,7 +3966,9 @@ impl LuaState {
 
         for t in self.finobj_list.drain(..) {
             let is_reachable = t
-                .data.borrow().gc_header
+                .data
+                .borrow()
+                .gc_header
                 .id()
                 .map_or(false, |id| reachable.contains(&(id.0 as usize)));
             if is_reachable {
@@ -4241,7 +4293,9 @@ impl LuaState {
                     let has_mt = data.metatable.is_some();
                     gc_stats_inc(|s| {
                         s.table += 1;
-                        if has_mt { s.table_with_mt += 1; }
+                        if has_mt {
+                            s.table_with_mt += 1;
+                        }
                     });
                     for v in data.array.iter() {
                         if !weak_v && Self::needs_gc_mark(v) {
@@ -4283,7 +4337,9 @@ impl LuaState {
                     gc_stats_inc(|s| {
                         s.lclosure += 1;
                         s.proto += 1;
-                        if upvals_len > 0 { s.lclosure_with_upvals += 1; }
+                        if upvals_len > 0 {
+                            s.lclosure_with_upvals += 1;
+                        }
                     });
                     for uv_ref in upvals.iter() {
                         let uv = uv_ref.borrow();
@@ -4316,7 +4372,9 @@ impl LuaState {
                     reachable.insert(ptr);
                     *extra_size += cc.gc_mem_size();
                     // GC 统计：CClosure
-                    gc_stats_inc(|s| { s.cclosure += 1; });
+                    gc_stats_inc(|s| {
+                        s.cclosure += 1;
+                    });
                     for uv in &cc.upvalue {
                         if Self::needs_gc_mark(uv) {
                             unsafe { worklist.push(raw_from_tvalue(uv)) };
@@ -4336,7 +4394,9 @@ impl LuaState {
                     reachable.insert(ptr);
                     *extra_size += rc.gc_mem_size();
                     // GC 统计：RustClosure
-                    gc_stats_inc(|s| { s.rust_closure += 1; });
+                    gc_stats_inc(|s| {
+                        s.rust_closure += 1;
+                    });
                     let upvals = rc.upvalues.borrow();
                     for uv in upvals.iter() {
                         if Self::needs_gc_mark(uv) {
@@ -4352,7 +4412,9 @@ impl LuaState {
                 let ptr_id = u.gc_header.ptr_id;
                 if visited.insert(ptr_id as usize) {
                     // GC 统计：UserData
-                    gc_stats_inc(|s| { s.userdata += 1; });
+                    gc_stats_inc(|s| {
+                        s.userdata += 1;
+                    });
                     if let Some(ref mt) = u.metatable {
                         let mt_ptr = mt.data.borrow().gc_header.ptr_id as usize;
                         if !visited.contains(&mt_ptr) {
@@ -4374,7 +4436,9 @@ impl LuaState {
                     reachable.insert(ptr);
                     *extra_size += t.gc_mem_size();
                     // GC 统计：Thread（总是可能循环：栈引用闭包，闭包 upvalue 引用回 Thread）
-                    gc_stats_inc(|s| { s.thread += 1; });
+                    gc_stats_inc(|s| {
+                        s.thread += 1;
+                    });
                     self.collect_thread_roots(t, worklist);
                 }
             }
@@ -4429,7 +4493,12 @@ thread_local! {
 }
 
 impl GcTriggerStats {
-    const ZERO: Self = GcTriggerStats { maybe: 0, concat: 0, step: 0, explicit: 0 };
+    const ZERO: Self = GcTriggerStats {
+        maybe: 0,
+        concat: 0,
+        step: 0,
+        explicit: 0,
+    };
 }
 
 fn gc_trigger_inc(trigger: GcTrigger) {
@@ -4505,7 +4574,10 @@ pub fn print_gc_time_summary() {
             s.max_us as f64 / 1000.0,
             s.str_sweep_us as f64 / 1_000_000.0,
             s.str_for_each_us as f64 / 1_000_000.0,
-            (s.total_us.saturating_sub(s.str_sweep_us).saturating_sub(s.str_for_each_us)) as f64 / 1_000_000.0,
+            (s.total_us
+                .saturating_sub(s.str_sweep_us)
+                .saturating_sub(s.str_for_each_us)) as f64
+                / 1_000_000.0,
         );
     });
 }

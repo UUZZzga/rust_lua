@@ -453,9 +453,7 @@ pub fn raw_equal(t1: &TValue, t2: &TValue) -> bool {
         }
         (TValue::Str(a), TValue::Str(b)) => a.as_str() == b.as_str(),
         (TValue::LightUserData(a), TValue::LightUserData(b)) => std::ptr::eq(*a, *b),
-        (TValue::Table(a), TValue::Table(b)) => {
-            Rc::as_ptr(&a.data) == Rc::as_ptr(&b.data)
-        }
+        (TValue::Table(a), TValue::Table(b)) => Rc::as_ptr(&a.data) == Rc::as_ptr(&b.data),
         (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
         (TValue::CClosure(a), TValue::CClosure(b)) => Rc::ptr_eq(a, b),
         (TValue::LCFn(a), TValue::LCFn(b)) => {
@@ -1187,16 +1185,20 @@ pub fn push_closure(
                     tbc: false,
                 })));
             } else {
-                upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
-                    value: TValue::Nil(NilKind::Strict),
-                })));
+                upvals
+                    .borrow_mut()
+                    .push(Rc::new(RefCell::new(UpVal::Closed {
+                        value: TValue::Nil(NilKind::Strict),
+                    })));
             }
         } else if i < _enc_upvals.len() {
             upvals.borrow_mut().push(_enc_upvals[i].clone());
         } else {
-            upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
-                value: TValue::Nil(NilKind::Strict),
-            })));
+            upvals
+                .borrow_mut()
+                .push(Rc::new(RefCell::new(UpVal::Closed {
+                    value: TValue::Nil(NilKind::Strict),
+                })));
         }
     }
 

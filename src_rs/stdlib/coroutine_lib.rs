@@ -228,7 +228,8 @@ fn scan_stack_for_closures(
     let mut visited_tables =
         std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
     // 先 clone 栈上的 LClosure/Table 引用（避免遍历时借用 state.exec.stack）
-    let closures: Vec<Rc<RefCell<UpValVec>>> = state.exec
+    let closures: Vec<Rc<RefCell<UpValVec>>> = state
+        .exec
         .stack
         .iter()
         .filter_map(|v| {
@@ -239,7 +240,8 @@ fn scan_stack_for_closures(
             }
         })
         .collect();
-    let tables: Vec<Table> = state.exec
+    let tables: Vec<Table> = state
+        .exec
         .stack
         .iter()
         .filter_map(|v| {
@@ -269,16 +271,15 @@ fn scan_stack_for_closures(
 /// 否则链表中残留的 Closed upvalue 会让 func::close 遍历中断（Closed 无 next 字段）
 fn close_upval_by_ref(state: &mut LuaState, uv_ref: &Rc<RefCell<UpVal>>, val: TValue) {
     let ptr = Rc::as_ptr(uv_ref) as usize;
-    if let Some(uv_idx) = state.exec
+    if let Some(uv_idx) = state
+        .exec
         .open_upvals
         .iter()
         .position(|r| Rc::as_ptr(r) as usize == ptr)
     {
         crate::func::unlink_upval(state, uv_idx);
     }
-    *uv_ref.borrow_mut() = UpVal::Closed {
-        value: val,
-    };
+    *uv_ref.borrow_mut() = UpVal::Closed { value: val };
 }
 
 /// 递归收集并关闭所有可达的 Open upvalue
@@ -313,7 +314,8 @@ fn collect_and_close_upvals_impl(
             match &*uv {
                 UpVal::Open { stack_index, .. } => {
                     let original_idx = *stack_index;
-                    let val = state.exec
+                    let val = state
+                        .exec
                         .stack
                         .get(original_idx)
                         .cloned()
@@ -510,7 +512,8 @@ fn collect_open_upvals_recursive_impl(
             match &*uv {
                 UpVal::Open { stack_index, .. } => {
                     let original_idx = *stack_index;
-                    let val = state.exec
+                    let val = state
+                        .exec
                         .stack
                         .get(original_idx)
                         .cloned()
@@ -646,7 +649,8 @@ fn sync_upvals_back(
             };
             if need_relink {
                 let ptr = Rc::as_ptr(&info.uv_ref) as usize;
-                if let Some(uv_idx) = state.exec
+                if let Some(uv_idx) = state
+                    .exec
                     .open_upvals
                     .iter()
                     .position(|r| Rc::as_ptr(r) as usize == ptr)
@@ -735,16 +739,15 @@ fn close_yield_upvals(yield_values: &[TValue], state: &mut LuaState) -> Vec<(UpV
         current = next;
     }
     for (uv_idx, stack_index) in to_close {
-        let val = state.exec
+        let val = state
+            .exec
             .stack
             .get(stack_index)
             .cloned()
             .unwrap_or(TValue::Nil(NilKind::Strict));
         let uv_ref = state.exec.open_upvals[uv_idx].clone();
         crate::func::unlink_upval(state, uv_idx);
-        *uv_ref.borrow_mut() = UpVal::Closed {
-            value: val,
-        };
+        *uv_ref.borrow_mut() = UpVal::Closed { value: val };
         result_info.push(OpenUpvalInfo {
             uv_ref,
             original_stack_index: stack_index,
@@ -847,7 +850,8 @@ fn sync_yield_upvals_back(state: &mut LuaState, origins: &[(UpValRef, usize)]) {
         };
         // 重新加入 open_upval 链表
         let ptr = Rc::as_ptr(uv_ref) as usize;
-        if let Some(uv_idx) = state.exec
+        if let Some(uv_idx) = state
+            .exec
             .open_upvals
             .iter()
             .position(|r| Rc::as_ptr(r) as usize == ptr)
@@ -918,7 +922,8 @@ fn call_status(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
                 "running"
             } else {
                 // 检查是否为当前正在运行的协程
-                let is_current = state.exec
+                let is_current = state
+                    .exec
                     .current_thread
                     .as_ref()
                     .map(|ctx| Rc::ptr_eq(ctx, &t.context))
@@ -1001,7 +1006,8 @@ fn call_close(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
             // 正在运行的协程：如果是当前协程自身（close itself，在 __close 内调用），
             // 返回 (true, nil)（对应 C 的 lua_closethread(co, co) close itself）；
             // 否则报错
-            let is_current = state.exec
+            let is_current = state
+                .exec
                 .current_thread
                 .as_ref()
                 .map(|ct| Rc::ptr_eq(ct, &thread.context))
@@ -1679,7 +1685,10 @@ fn setup_subsequent_resume(
         while (state.exec.stack.len() - stack_base) < yield_nresults as usize {
             state.exec.stack.push(TValue::Nil(NilKind::Strict));
         }
-        state.exec.stack.truncate(stack_base + yield_nresults as usize);
+        state
+            .exec
+            .stack
+            .truncate(stack_base + yield_nresults as usize);
     }
     // nresults < 0 (MULTRET): 保留所有参数
     state.exec.top = state.exec.stack.len();
@@ -1764,7 +1773,8 @@ fn call_wrap(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
     // 这样支持 `A = coroutine.wrap(function() ... A() ... end)` 的自引用模式
     // （A 在 call_wrap 时还是旧值，在 call_wrap_fn 首次调用时才被赋值为 wrap RustClosure）
     let pending = collect_wrap_upvals_info(&thread_rc, state);
-    let creator_ptr = state.exec
+    let creator_ptr = state
+        .exec
         .current_thread
         .as_ref()
         .map(|c| Rc::as_ptr(c) as usize)
@@ -1843,7 +1853,9 @@ fn call_wrap_fn(
     }
 
     // 收集所有参数作为 resume 参数（无 thread 参数需要跳过）
-    let resume_args: Vec<TValue> = (0..nargs).map(|i| state.exec.stack[a + 1 + i].clone()).collect();
+    let resume_args: Vec<TValue> = (0..nargs)
+        .map(|i| state.exec.stack[a + 1 + i].clone())
+        .collect();
 
     // 收集开 upvalue 信息（在 save_caller_context 之前，state.exec.stack 仍是父栈）
     // 首次 resume 时从 ThreadContext 取出 pending_wrap_upvals（call_wrap 时保存），
@@ -1859,7 +1871,8 @@ fn call_wrap_fn(
             let c = ctx.wrap_creator_thread_ptr;
             (p, c)
         };
-        let caller_ptr = state.exec
+        let caller_ptr = state
+            .exec
             .current_thread
             .as_ref()
             .map(|c| Rc::as_ptr(c) as usize)
@@ -1869,7 +1882,8 @@ fn call_wrap_fn(
         let mut origins: Vec<(UpValRef, usize)> = Vec::new();
         for (uv_ref, orig_idx, saved_val) in pending {
             let val = if same_stack {
-                state.exec
+                state
+                    .exec
                     .stack
                     .get(orig_idx)
                     .cloned()
@@ -2373,10 +2387,7 @@ pub fn open_coroutine_lib(state: &mut LuaState) {
                     func: crate::objects::BuiltinFnPtr| {
         let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
         let name_ptr = name.as_ptr() as *const u8;
-        lib.set(
-            key,
-            TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)),
-        );
+        lib.set(key, TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)));
     };
 
     register(&mut lib, state, c"create", call_create);

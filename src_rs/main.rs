@@ -12,7 +12,10 @@ fn main() {
     }));
     #[cfg(all(size_optimized, target_os = "windows"))]
     std::panic::set_hook(Box::new(|_info| {
-        let _ = std::io::Write::write_all(&mut std::io::stderr(), b"lua-rs: panic occurred, aborting\n");
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            b"lua-rs: panic occurred, aborting\n",
+        );
         std::process::abort();
     }));
 

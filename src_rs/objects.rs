@@ -218,8 +218,6 @@ pub fn tvalue_fx_hash(v: &TValue) -> u64 {
     }
 }
 
-
-
 // ============================================================================
 // 规约：Lua 基础类型标签
 // ============================================================================
@@ -399,9 +397,7 @@ impl BuiltinFn {
     #[inline]
     pub fn call_target(&self) -> BuiltinFnPtr {
         // SAFETY: bit0 是自设标志位, 剥离后恢复原始函数指针
-        unsafe {
-            std::mem::transmute::<usize, BuiltinFnPtr>(self.func as usize & !Self::PURE_BIT)
-        }
+        unsafe { std::mem::transmute::<usize, BuiltinFnPtr>(self.func as usize & !Self::PURE_BIT) }
     }
 
     /// 解码后的原始函数指针 (比较/查表用, 与注册时的指针一致)
@@ -446,8 +442,7 @@ mod builtin_names {
     use std::sync::RwLock;
 
     // HashMap 按需扩容 — 注册总量 ~200 (9 个库)
-    static NAMES: RwLock<Option<HashMap<usize, &'static str>>> =
-        RwLock::new(None);
+    static NAMES: RwLock<Option<HashMap<usize, &'static str>>> = RwLock::new(None);
 
     /// 登记 func → name（重复登记以先注册者为准，语义与 C 静态注册一致）
     pub fn register(func: super::BuiltinFnPtr, name: *const u8) {
@@ -1142,12 +1137,10 @@ impl TableData {
     pub fn idx_remove(&mut self, key: &TValue) -> Option<usize> {
         let ktb = self.key_to_bucket.as_mut()?;
         let hash = tvalue_fx_hash(key);
-        ktb.find_entry(hash, |(k, _)| k == key)
-            .ok()
-            .map(|entry| {
-                let ((_, idx), _) = entry.remove();
-                idx
-            })
+        ktb.find_entry(hash, |(k, _)| k == key).ok().map(|entry| {
+            let ((_, idx), _) = entry.remove();
+            idx
+        })
     }
 
     // size_optimized 回退: TableHashMap<usize> (std HashMap) — 走其原生 API

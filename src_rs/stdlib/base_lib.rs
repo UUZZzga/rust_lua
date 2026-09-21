@@ -465,7 +465,8 @@ pub(crate) fn call_pcall(
     // push pcall 保护状态 — 对应 C Lua 的 CIST_YPCALL
     // yield 穿过 pcall 后，pcall 的 C 函数栈帧被销毁，但保护状态保留。
     // 当 inner_func 后续执行 error/return 时，由 execute_loop 检查并处理。
-    state.exec
+    state
+        .exec
         .pcall_protection_stack
         .push(crate::state::PcallProtection {
             saved_code: state.exec.code.clone(),
@@ -988,7 +989,6 @@ fn call_select(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     Ok(())
 }
 
-
 /// rawequal(v1, v2) — 对应 C 的 luaB_rawequal
 fn call_rawequal(
     state: &mut LuaState,
@@ -1122,7 +1122,10 @@ fn call_ipairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
     let t = get_arg(state, a, 0);
     // 返回迭代器函数 (ipairsaux), 状态 t, 初始值 0
     // ipairsaux 作为 BuiltinFn 注册（名称 "for iterator" 对应 C 的 luaB_auxlib_getn 语义）
-    let iter = TValue::BuiltinFn(crate::objects::BuiltinFn::impure(call_ipairs_aux, c"for iterator".as_ptr() as *const u8));
+    let iter = TValue::BuiltinFn(crate::objects::BuiltinFn::impure(
+        call_ipairs_aux,
+        c"for iterator".as_ptr() as *const u8,
+    ));
     push_results(state, a, nresults, vec![iter, t, TValue::Integer(0)]);
     Ok(())
 }
@@ -1163,12 +1166,13 @@ fn call_pairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
         // __pairs 内部 yield 时，call_pairs 返回 Yield，保护状态保留。
         // resume 时 __pairs 返回，op_return 检查 pcall_protection_stack，
         // 调用 finish_pcall_return 执行 continuation（不 push true 前缀）。
-        state.exec
+        state
+            .exec
             .pcall_protection_stack
             .push(crate::state::PcallProtection {
                 saved_code: state.exec.code.clone(),
                 saved_constants: state.exec.constants.clone(),
-                    saved_protos: state.exec.protos.clone(),
+                saved_protos: state.exec.protos.clone(),
                 saved_base: state.exec.base,
                 saved_pc: state.exec.pc + 1, // 跳过调用 pairs 的 CALL 指令
                 saved_num_params: state.exec.num_params,
@@ -1204,7 +1208,8 @@ fn call_pairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
         // 取 __pairs 的 4 个返回值 (state.pcall 已调整栈到 a..a+4)
         let results: Vec<TValue> = (0..4)
             .map(|i| {
-                state.exec
+                state
+                    .exec
                     .stack
                     .get(a + i)
                     .cloned()
@@ -1215,7 +1220,10 @@ fn call_pairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
     } else {
         // 无 __pairs: 返回 next, t, nil, nil (第 4 个 nil 是 TBC 占位)
         // next 作为 BuiltinFn 注册（名称 "next" 对应 C 的 luaB_next）
-        let next_fn = TValue::BuiltinFn(crate::objects::BuiltinFn::impure(call_next_iter, c"next".as_ptr() as *const u8));
+        let next_fn = TValue::BuiltinFn(crate::objects::BuiltinFn::impure(
+            call_next_iter,
+            c"next".as_ptr() as *const u8,
+        ));
         push_results(
             state,
             a,
@@ -1262,7 +1270,8 @@ pub(crate) fn call_xpcall(
     // push pcall 保护状态 — 对应 C Lua 的 CIST_YPCALL
     // yield 穿过 xpcall 后，xpcall 的 C 函数栈帧被销毁，但保护状态保留。
     // 当 inner_func 后续执行 error/return 时，由 execute_loop 检查并处理。
-    state.exec
+    state
+        .exec
         .pcall_protection_stack
         .push(crate::state::PcallProtection {
             saved_code: state.exec.code.clone(),
@@ -1623,15 +1632,22 @@ fn run_loader(
 ) -> Result<(), VmError> {
     let saved_len = state.exec.stack.len();
     state.exec.stack.push(loader);
-    state.exec.stack.push(TValue::Str(state.intern_str(modname)));
-    state.exec.stack.push(TValue::Str(state.intern_str(loader_data)));
+    state
+        .exec
+        .stack
+        .push(TValue::Str(state.intern_str(modname)));
+    state
+        .exec
+        .stack
+        .push(TValue::Str(state.intern_str(loader_data)));
     let status = state.pcall(2, 1, 0);
     if status != 0 {
         let err = state.to_string(-1).unwrap_or_default();
         state.settop(saved_len);
         return Err(VmError::RuntimeError(err));
     }
-    let result = state.exec
+    let result = state
+        .exec
         .stack
         .get(saved_len)
         .cloned()
@@ -1671,8 +1687,14 @@ fn load_lua_module(
         )));
     }
     // 调用加载的函数：(modname, filepath)
-    state.exec.stack.push(TValue::Str(state.intern_str(modname)));
-    state.exec.stack.push(TValue::Str(state.intern_str(filepath)));
+    state
+        .exec
+        .stack
+        .push(TValue::Str(state.intern_str(modname)));
+    state
+        .exec
+        .stack
+        .push(TValue::Str(state.intern_str(filepath)));
     let call_status = state.pcall(2, 1, 0);
     if call_status != 0 {
         let err = state.to_string(-1).unwrap_or_default();
@@ -1682,7 +1704,8 @@ fn load_lua_module(
             modname, filepath, err
         )));
     }
-    let result = state.exec
+    let result = state
+        .exec
         .stack
         .get(saved_len)
         .cloned()
@@ -2296,12 +2319,18 @@ fn init_package_table(state: &mut LuaState) {
     // loadlib 函数 — BuiltinFn 注册
     pkg.set(
         TValue::Str(state.intern_str("loadlib")),
-        TValue::BuiltinFn(crate::objects::BuiltinFn::impure(call_loadlib, c"loadlib".as_ptr() as *const u8)),
+        TValue::BuiltinFn(crate::objects::BuiltinFn::impure(
+            call_loadlib,
+            c"loadlib".as_ptr() as *const u8,
+        )),
     );
     // searchpath 函数 — BuiltinFn 注册
     pkg.set(
         TValue::Str(state.intern_str("searchpath")),
-        TValue::BuiltinFn(crate::objects::BuiltinFn::impure(call_searchpath, c"searchpath".as_ptr() as *const u8)),
+        TValue::BuiltinFn(crate::objects::BuiltinFn::impure(
+            call_searchpath,
+            c"searchpath".as_ptr() as *const u8,
+        )),
     );
     // searchers 表 — 对应 C createsearcherstable (loadlib.cpp:703)
     // 包含 4 个 searcher 占位函数 (preload/Lua/C/Croot)
@@ -2309,7 +2338,10 @@ fn init_package_table(state: &mut LuaState) {
     // 这些 BuiltinFn 仅用于让 searchers 表元素显示为 "function" 类型，
     // 直接调用会报错（与原 tag 行为一致）。
     let make_searcher = |name: &'static std::ffi::CStr| -> TValue {
-        TValue::BuiltinFn(crate::objects::BuiltinFn::impure(call_searcher_placeholder, name.as_ptr() as *const u8))
+        TValue::BuiltinFn(crate::objects::BuiltinFn::impure(
+            call_searcher_placeholder,
+            name.as_ptr() as *const u8,
+        ))
     };
     let searchers = Table::new();
     searchers.set(TValue::Integer(1), make_searcher(c"searcher_preload"));
@@ -2611,13 +2643,17 @@ fn call_load(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
                 intern_proto_strings(&mut proto, state);
             }
             let upvals = Rc::new(std::cell::RefCell::new(UpValVec::new()));
-            upvals.borrow_mut().push(Rc::new(std::cell::RefCell::new(UpVal::Closed {
-                value: env_val,
-            })));
-            for _ in 1..nup {
-                upvals.borrow_mut().push(Rc::new(std::cell::RefCell::new(UpVal::Closed {
-                    value: TValue::Nil(NilKind::Strict),
+            upvals
+                .borrow_mut()
+                .push(Rc::new(std::cell::RefCell::new(UpVal::Closed {
+                    value: env_val,
                 })));
+            for _ in 1..nup {
+                upvals
+                    .borrow_mut()
+                    .push(Rc::new(std::cell::RefCell::new(UpVal::Closed {
+                        value: TValue::Nil(NilKind::Strict),
+                    })));
             }
             let closure = Rc::new(LClosure {
                 gc_header: GCObjectHeader::new(),
@@ -2693,7 +2729,8 @@ fn call_dofile(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
         return Err(VmError::Yield(yield_values));
     }
     if call_status != 0 {
-        let err_val = state.exec
+        let err_val = state
+            .exec
             .stack
             .get(saved_len)
             .cloned()
@@ -2798,7 +2835,8 @@ fn call_loadfile(
     let status = state.load_filex(filename.as_deref(), mode.as_deref());
     if status == 0 {
         // 成功: 栈顶是加载的 chunk 函数
-        let chunk = state.exec
+        let chunk = state
+            .exec
             .stack
             .get(saved_len)
             .cloned()
@@ -2810,16 +2848,15 @@ fn call_loadfile(
             if let TValue::LClosure(closure) = &chunk {
                 let upvals = closure.upvals.borrow();
                 if !upvals.is_empty() {
-                    *upvals[0].borrow_mut() = UpVal::Closed {
-                        value: env_val,
-                    };
+                    *upvals[0].borrow_mut() = UpVal::Closed { value: env_val };
                 }
             }
         }
         push_results(state, a, nresults, vec![chunk]);
     } else {
         // 失败: 栈顶是错误消息
-        let err_msg = state.exec
+        let err_msg = state
+            .exec
             .stack
             .get(saved_len)
             .cloned()
@@ -3410,7 +3447,10 @@ mod tests {
             Ok(())
         }
 
-        let v = TValue::BuiltinFn(crate::objects::BuiltinFn::impure(dummy_fn, c"dummy".as_ptr() as *const u8));
+        let v = TValue::BuiltinFn(crate::objects::BuiltinFn::impure(
+            dummy_fn,
+            c"dummy".as_ptr() as *const u8,
+        ));
         assert_eq!(base_type_name(&v), "function");
         assert!(v.is_function());
         assert_eq!(v.ty(), crate::objects::LuaType::Function);
@@ -3723,7 +3763,10 @@ mod tests {
 
     /// 辅助：构造一个占位 BuiltinFn 作为栈上的 "函数" 位置
     fn placeholder_builtin() -> TValue {
-        TValue::BuiltinFn(crate::objects::BuiltinFn::impure(call_searcher_placeholder, c"placeholder".as_ptr() as *const u8))
+        TValue::BuiltinFn(crate::objects::BuiltinFn::impure(
+            call_searcher_placeholder,
+            c"placeholder".as_ptr() as *const u8,
+        ))
     }
 
     #[test]
@@ -3785,7 +3828,10 @@ mod tests {
         let mut state = LuaState::new();
         state.exec.stack.clear();
         state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(TValue::Str(state.intern_str("hello")));
+        state
+            .exec
+            .stack
+            .push(TValue::Str(state.intern_str("hello")));
         call_rawlen(&mut state, 0, 1, 1).unwrap();
         match &state.exec.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 5),
@@ -3894,7 +3940,8 @@ mod tests {
         let mut state = LuaState::new();
         state.exec.stack.clear();
         state.exec.stack.push(placeholder_builtin());
-        state.exec
+        state
+            .exec
             .stack
             .push(TValue::Str(state.intern_str("test error")));
         let result = call_error(&mut state, 0, 1, 0);
@@ -3966,7 +4013,10 @@ mod tests {
         // 第一个返回值是迭代器函数 (BuiltinFn, func 指向 call_ipairs_aux)
         match &state.exec.stack[0] {
             TValue::BuiltinFn(bf) => {
-                assert_eq!(bf.raw_func() as usize, call_ipairs_aux as *const () as usize);
+                assert_eq!(
+                    bf.raw_func() as usize,
+                    call_ipairs_aux as *const () as usize
+                );
             }
             _ => panic!("expected BuiltinFn"),
         }

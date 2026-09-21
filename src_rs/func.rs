@@ -1,10 +1,10 @@
-use std::rc::Rc;
 use crate::execute::VmError;
 use crate::objects::*;
-use crate::state::LuaState;
 #[cfg(test)]
 use crate::state::lua_stdout;
+use crate::state::LuaState;
 use std::cell::RefCell;
+use std::rc::Rc;
 
 pub fn new_proto() -> Proto {
     Proto {
@@ -56,7 +56,8 @@ fn tvalue_size(v: &TValue) -> usize {
 
 pub fn new_c_closure(state: &mut LuaState, _nupvals: usize) -> usize {
     let idx = state.exec.closure_upvals.borrow().len();
-    state.exec
+    state
+        .exec
         .closure_upvals
         .borrow_mut()
         .push(Rc::new(RefCell::new(UpVal::Closed {
@@ -68,7 +69,8 @@ pub fn new_c_closure(state: &mut LuaState, _nupvals: usize) -> usize {
 pub fn new_l_closure(state: &mut LuaState, nupvals: usize) -> usize {
     let idx = state.exec.closure_upvals.borrow().len();
     for _ in 0..nupvals {
-        state.exec
+        state
+            .exec
             .closure_upvals
             .borrow_mut()
             .push(Rc::new(RefCell::new(UpVal::Closed {
@@ -156,12 +158,15 @@ fn new_upval(state: &mut LuaState, level: usize, prev: Option<usize>) -> usize {
             *previous = Some(uv_idx);
         }
     }
-    state.exec.open_upvals.push(Rc::new(RefCell::new(UpVal::Open {
-        stack_index: level,
-        next,
-        previous: prev,
-        tbc: false,
-    })));
+    state
+        .exec
+        .open_upvals
+        .push(Rc::new(RefCell::new(UpVal::Open {
+            stack_index: level,
+            next,
+            previous: prev,
+            tbc: false,
+        })));
     uv_idx
 }
 
@@ -170,7 +175,8 @@ pub fn close_upval(state: &mut LuaState, uv_idx: usize) {
     let val = {
         let uv_ref = state.exec.open_upvals[uv_idx].borrow();
         match &*uv_ref {
-            UpVal::Open { stack_index, .. } => state.exec
+            UpVal::Open { stack_index, .. } => state
+                .exec
                 .stack
                 .get(*stack_index)
                 .cloned()
@@ -183,9 +189,7 @@ pub fn close_upval(state: &mut LuaState, uv_idx: usize) {
         state.gc.mark_object(gc_id);
     }
     unlink_upval(state, uv_idx);
-    *state.exec.open_upvals[uv_idx].borrow_mut() = UpVal::Closed {
-        value: val,
-    };
+    *state.exec.open_upvals[uv_idx].borrow_mut() = UpVal::Closed { value: val };
 }
 
 pub fn unlink_upval(state: &mut LuaState, uv_idx: usize) {
@@ -224,7 +228,11 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
     // 并通过 luaD_throwbaselevel 抛到 base level。我们的实现未完整支持此语义，改为设置标志，
     // 让 OP_RETURN 的 func::close 使用不可 yield 模式 (yy=0)，使 __close 中的 yield 失败
     // （对应 C Lua 中 nny > 0 时 yield 报错的场景）。
-    let yy = if state.exec.force_noyield_close { 0 } else { yy };
+    let yy = if state.exec.force_noyield_close {
+        0
+    } else {
+        yy
+    };
 
     // 快速路径 (无 TBC 上值): 就地关闭, 避免 to_close Vec 分配。
     // 先第一趟检查是否有 TBC — 有 TBC 时必须走慢路径 (保持 __close yield 时
@@ -263,7 +271,9 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
             let (should_close, next) = {
                 let uv_ref = state.exec.open_upvals[uv_idx].borrow();
                 match &*uv_ref {
-                    UpVal::Open { stack_index, next, .. } => (*stack_index >= level, *next),
+                    UpVal::Open {
+                        stack_index, next, ..
+                    } => (*stack_index >= level, *next),
                     UpVal::Closed { .. } => (false, None),
                 }
             };
@@ -330,7 +340,8 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
             let val = {
                 let uv_ref = state.exec.open_upvals[uv_idx].borrow();
                 if let UpVal::Open { stack_index, .. } = &*uv_ref {
-                    state.exec
+                    state
+                        .exec
                         .stack
                         .get(*stack_index)
                         .cloned()
@@ -406,7 +417,8 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
 
 pub fn new_tbc_upval(state: &mut LuaState, level: usize) -> Result<Option<usize>, VmError> {
     // 对应 C 的 luaF_newtbcupval: 检查 __close 元方法，复用或创建 open upvalue，然后标记 tbc
-    let val = state.exec
+    let val = state
+        .exec
         .stack
         .get(level)
         .cloned()

@@ -2852,7 +2852,8 @@ pub extern "C" fn luaL_requiref(
 
         // 如果 glb，设置全局变量
         if glb != 0 {
-            let val = L.exec
+            let val = L
+                .exec
                 .stack
                 .last()
                 .cloned()
@@ -3952,7 +3953,10 @@ pub extern "C" fn lua_getupvalue(L: *mut lua_State, funcindex: c_int, n: c_int) 
     let (value, name_ptr) = match &L.exec.stack.get(off) {
         Some(TValue::CClosure(cc)) => {
             if n <= cc.upvalue.len() {
-                (Some(cc.upvalue[n - 1].clone()), b"\0".as_ptr() as *const c_char)
+                (
+                    Some(cc.upvalue[n - 1].clone()),
+                    b"\0".as_ptr() as *const c_char,
+                )
             } else {
                 (None, std::ptr::null())
             }
@@ -4010,9 +4014,12 @@ pub extern "C" fn lua_setupvalue(L: *mut lua_State, funcindex: c_int, n: c_int) 
     };
     // 先检查类型并获取名称指针
     let (is_cc, is_lc, upvals_len, name_ptr) = match &L.exec.stack.get(off) {
-        Some(TValue::CClosure(cc)) => {
-            (true, false, cc.upvalue.len(), b"\0".as_ptr() as *const c_char)
-        }
+        Some(TValue::CClosure(cc)) => (
+            true,
+            false,
+            cc.upvalue.len(),
+            b"\0".as_ptr() as *const c_char,
+        ),
         Some(TValue::LClosure(closure)) => {
             let len = closure.upvals.borrow().len();
             let name_ptr = closure

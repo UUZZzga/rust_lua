@@ -49,7 +49,6 @@ enum SpecValue {
     Skip,
 }
 
-
 /// 信号中断标志 — 对应 C 的 globalL + laction + lstop 机制。
 /// 信号处理器 (cli.rs::laction) 设置此标志，VM 循环在每条指令前检查，
 /// 若设置则抛出 "interrupted!" 错误（可被 pcall 捕获）。
@@ -123,7 +122,6 @@ enum ErrOutcome {
     /// 直接返回该 VmResult (yield)
     Return(VmResult),
 }
-
 
 #[derive(Debug)]
 pub enum VmError {
@@ -611,7 +609,10 @@ fn get_current_func_name(state: &LuaState) -> (String, String) {
         // 此时 state.exec.code/state.exec.pc 对应该 Lua 帧的代码。
         // 检查 state.exec.pc 处的 OP_CALL 调用的函数寄存器是否等于当前 C 函数位置,
         // 若是则说明 state.exec.code 对应当前 C 函数的调用者,可用 get_obj_name 分析。
-        if state.exec.pc < state.exec.code.len() && state.exec.base > 0 && state.exec.base <= state.exec.stack.len() {
+        if state.exec.pc < state.exec.code.len()
+            && state.exec.base > 0
+            && state.exec.base <= state.exec.stack.len()
+        {
             let call_inst = state.exec.code[state.exec.pc];
             let op = opcodes::get_opcode(call_inst);
             if op == OpCode::CALL || op == OpCode::TAILCALL {
@@ -1081,7 +1082,6 @@ impl VmExecutor {
         let mut constants_ptr: *const TValue = state.exec.constants.as_ptr();
         let mut constants_len: usize = state.exec.constants.len();
 
-
         // C 形状 pc 寄存器化 — 对应 C luaV_execute 的局部 pc (vmfetch: i = *(pc++))。
         // 主循环仅在帧切换点 (CALL/TAILCALL/RETURN*/cold dispatch/FORPREP 后) 从
         // state.exec.pc 重载; 直线指令零 pc 内存往返 (HEAD: 每指令 1 load + 1 store)。
@@ -1117,7 +1117,6 @@ impl VmExecutor {
             let constants_slice: &[TValue] =
                 unsafe { std::slice::from_raw_parts(constants_ptr, constants_len) };
 
-
             // perf: get_unchecked 跳过边界检查 (上方已检查 pc < code_len)
             let inst = unsafe { *code_ptr.add(pc) };
             pc += 1; // 寄存器自增 (对应 C 的 *(pc++)); 当前指令索引 = pc - 1
@@ -1130,9 +1129,10 @@ impl VmExecutor {
             //  合并后热路径只测试栈局部值, state.exec.hook_mask 的 load 延迟到冷块。)
             // 注意: 必须每指令读 state.exec.hook_mask — VARARGPREP 的 call hook 内可
             // sethook 安装 line hook (db.lua:491 场景), 缓存字节会错过新 mask。
-            if trace_level | (state.exec.hook_mask & (4 | 8)) as u8 != 0 && op != OpCode::VARARGPREP {
+            if trace_level | (state.exec.hook_mask & (4 | 8)) as u8 != 0 && op != OpCode::VARARGPREP
+            {
                 state.exec.pc = pc - 1; // sync: 行 hook/trace 需要 state.exec.pc = 当前指令 (C savepc)
-                // 对应 C 的 luaG_traceexec: count hook + line hook
+                                        // 对应 C 的 luaG_traceexec: count hook + line hook
                 if state.exec.hook_mask & (4 | 8) != 0 {
                     Self::traceexec_hooks(state)?;
                 }
@@ -1366,14 +1366,13 @@ impl VmExecutor {
                         constants_ptr = state.exec.constants.as_ptr();
                         code_len = state.exec.code.len();
                         constants_len = state.exec.constants.len();
-                            continue;
+                        continue;
                     }
                     ErrOutcome::Return(r) => return Ok(r),
                 },
             }
         }
     }
-
 
     /// 指令错误处理 — 从 execute_loop 主循环提取的冷路径 (原内联 ~270 行
     /// Err 巨块, 抽出后主循环寄存器压力显著下降, pc 可望驻留寄存器)。
@@ -1385,10 +1384,7 @@ impl VmExecutor {
     /// - 错误未被任何保护捕获 → Err(current_error) (caller 经 ? 传播)
     #[cold]
     #[inline(never)]
-    fn handle_instruction_error(
-        state: &mut LuaState,
-        e: VmError,
-    ) -> Result<ErrOutcome, VmError> {
+    fn handle_instruction_error(state: &mut LuaState, e: VmError) -> Result<ErrOutcome, VmError> {
         if let VmError::Yield(values) = e {
             return Ok(ErrOutcome::Return(VmResult::Yield { values }));
         }
@@ -1407,7 +1403,8 @@ impl VmExecutor {
             //        到 pcall 处理；否则继续 execute_loop
             //      - yield：返回 Yield
             //      - 出错：更新 current_error，fall through 到 pcall 处理
-            if state.exec
+            if state
+                .exec
                 .pcall_protection_stack
                 .last()
                 .map_or(false, |t| t.saved_filled && t.is_close_continuation)
@@ -1435,9 +1432,7 @@ impl VmExecutor {
                     state.last_error_value = Some(match &current_error {
                         VmError::RuntimeErrorValue(val) => val.clone(),
                         VmError::RuntimeError(s) => TValue::Str(state.intern_str(s)),
-                        _ => {
-                            TValue::Str(state.intern_str(&format!("{}", current_error)))
-                        }
+                        _ => TValue::Str(state.intern_str(&format!("{}", current_error))),
                     });
                 }
                 let error_val = state.last_error_value.clone().unwrap();
@@ -1477,24 +1472,22 @@ impl VmExecutor {
             // 避免误处理 state.pcall 的 LClosure 分支调用的 execute_loop 中的 error。
             // 跳过 is_close_continuation 的 PcallProtection：close continuation 的 error
             // 已在上面的 close continuation 分支处理。
-            if state.exec
+            if state
+                .exec
                 .pcall_protection_stack
                 .last()
                 .map_or(false, |t| t.saved_filled && !t.is_close_continuation)
             {
                 // 获取 error 值（保留原始 TValue 类型，如 error({s}) 的表）
                 let mut error_val =
-                    state.last_error_value.clone().unwrap_or_else(|| {
-                        match &current_error {
+                    state
+                        .last_error_value
+                        .clone()
+                        .unwrap_or_else(|| match &current_error {
                             VmError::RuntimeErrorValue(val) => val.clone(),
-                            VmError::RuntimeError(s) => {
-                                TValue::Str(state.intern_str(s))
-                            }
-                            _ => TValue::Str(
-                                state.intern_str(&format!("{}", current_error)),
-                            ),
-                        }
-                    });
+                            VmError::RuntimeError(s) => TValue::Str(state.intern_str(s)),
+                            _ => TValue::Str(state.intern_str(&format!("{}", current_error))),
+                        });
                 state.last_error_value = None;
                 state.last_error_msg.clear();
 
@@ -1510,8 +1503,7 @@ impl VmExecutor {
                         &mut state.exec.closure_upvals,
                         Rc::clone(&frame.closure_upvals),
                     );
-                    let saved_tl =
-                        std::mem::replace(&mut state.exec.tbc_list, frame.tbc_list);
+                    let saved_tl = std::mem::replace(&mut state.exec.tbc_list, frame.tbc_list);
                     Some((saved_cu, saved_tl))
                 } else {
                     None
@@ -1577,10 +1569,8 @@ impl VmExecutor {
                                 state.exec.stack.push(TValue::Boolean(false));
                                 state.exec.stack.push(current_results[0].clone());
                                 state.exec.top = protection.func_idx + 2;
-                                current_results = vec![
-                                    TValue::Boolean(false),
-                                    current_results[0].clone(),
-                                ];
+                                current_results =
+                                    vec![TValue::Boolean(false), current_results[0].clone()];
                                 // pcall 已捕获 error，后续 PcallProtection 处理成功返回值
                                 is_error = false;
                             }
@@ -1591,23 +1581,16 @@ impl VmExecutor {
                                 state.exec.stack.push(current_results[0].clone());
                                 state.exec.top = protection.func_idx + 2;
                                 let handler_status = state.pcall(1, -1, 0);
-                                let handler_nret = state.exec
-                                    .stack
-                                    .len()
-                                    .saturating_sub(protection.func_idx);
-                                let handler_result: Vec<TValue> = if handler_status == 0
-                                {
+                                let handler_nret =
+                                    state.exec.stack.len().saturating_sub(protection.func_idx);
+                                let handler_result: Vec<TValue> = if handler_status == 0 {
                                     // handler 成功: 返回 handler 的结果
                                     (0..handler_nret)
-                                        .map(|i| {
-                                            state.exec.stack[protection.func_idx + i].clone()
-                                        })
+                                        .map(|i| state.exec.stack[protection.func_idx + i].clone())
                                         .collect()
                                 } else {
                                     // handler 失败: 返回 "error in error handling"
-                                    vec![TValue::Str(
-                                        state.intern_str("error in error handling"),
-                                    )]
+                                    vec![TValue::Str(state.intern_str("error in error handling"))]
                                 };
                                 // xpcall 返回 (false, handler_result...)
                                 state.exec.stack.truncate(protection.func_idx);
@@ -1615,8 +1598,7 @@ impl VmExecutor {
                                 for r in &handler_result {
                                     state.exec.stack.push(r.clone());
                                 }
-                                state.exec.top =
-                                    protection.func_idx + 1 + handler_result.len();
+                                state.exec.top = protection.func_idx + 1 + handler_result.len();
                                 current_results = {
                                     let mut v = vec![TValue::Boolean(false)];
                                     v.extend(handler_result);
@@ -1957,7 +1939,10 @@ impl VmExecutor {
                 .ok()
                 .map(|t| t != "dumb")
                 .unwrap_or(false);
-            eprint!("{}", Self::dump_code_with_pc(state, state.exec.pc, use_color));
+            eprint!(
+                "{}",
+                Self::dump_code_with_pc(state, state.exec.pc, use_color)
+            );
             if trace_level >= 2 {
                 eprint!("{}", Self::dump_stack(state));
             }
@@ -2099,7 +2084,10 @@ impl VmExecutor {
             if num_results >= 0 {
                 let target_len = return_base + num_results as usize;
                 if state.exec.stack.len() < target_len {
-                    state.exec.stack.resize(target_len, TValue::Nil(NilKind::Strict));
+                    state
+                        .exec
+                        .stack
+                        .resize(target_len, TValue::Nil(NilKind::Strict));
                 }
                 for i in 0..num_results as usize {
                     state.exec.stack[return_base + i] = TValue::Nil(NilKind::Strict);
@@ -2141,7 +2129,7 @@ impl VmExecutor {
                     slot,
                     TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)
                 ) {
-                std::ptr::write(slot, val);
+                    std::ptr::write(slot, val);
                 } else {
                     *slot = val;
                 }
@@ -2242,14 +2230,21 @@ impl VmExecutor {
         #[cfg(not(size_optimized))]
         {
             eprintln!("\n=== STACK UNDERFLOW PANIC ===");
-            eprintln!("尝试访问栈索引: {}, 栈大小: {}", idx, state.exec.stack.len());
+            eprintln!(
+                "尝试访问栈索引: {}, 栈大小: {}",
+                idx,
+                state.exec.stack.len()
+            );
             eprintln!("当前 PC: {}, Base: {}", state.exec.pc, state.exec.base);
 
             let use_color = std::env::var("TERM")
                 .ok()
                 .map(|t| t != "dumb")
                 .unwrap_or(false);
-            eprint!("{}", Self::dump_code_with_pc(state, state.exec.pc, use_color));
+            eprint!(
+                "{}",
+                Self::dump_code_with_pc(state, state.exec.pc, use_color)
+            );
             eprint!("{}", Self::dump_stack(state));
 
             eprintln!("\n--- 栈帧信息 ---");
@@ -2468,7 +2463,11 @@ impl VmExecutor {
                     // 即将栈顶结果 (临时位置) 移到 RA 位置
                     let ra = state.exec.base + opcodes::getarg_a(inst) as usize;
                     // 结果在栈顶 (metamethod_res 位置)
-                    let result = state.exec.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+                    let result = state
+                        .exec
+                        .stack
+                        .pop()
+                        .unwrap_or(TValue::Nil(NilKind::Strict));
                     while state.exec.stack.len() <= ra {
                         state.exec.stack.push(TValue::Nil(NilKind::Strict));
                     }
@@ -2586,9 +2585,7 @@ impl VmExecutor {
     /// 重新执行 OP_RETURN/OP_CLOSE。返回 false 表示不是 close continuation。
     fn finish_close_continuation(state: &mut LuaState) -> Result<bool, VmError> {
         let is_close_cont = state.exec.pcall_protection_stack.last().map_or(false, |t| {
-            t.is_close_continuation
-                && t.saved_filled
-                && t.func_idx + 1 == state.exec.base
+            t.is_close_continuation && t.saved_filled && t.func_idx + 1 == state.exec.base
         });
         if !is_close_cont {
             return Ok(false);
@@ -3116,7 +3113,11 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_lfalseskip(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_lfalseskip(
+        state: &mut LuaState,
+        inst: Instruction,
+        pc: &mut usize,
+    ) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         Self::write_stack(state, a, TValue::Boolean(false));
         // C 形状 param-pc: state.exec.pc += 2 (cur 基准) == *pc += 1 (pc 已 = cur+1)
@@ -3154,7 +3155,8 @@ impl VmExecutor {
                 let uv = unsafe { &*upvals[b].as_ptr() };
                 Some(match uv {
                     UpVal::Closed { value } => value.clone(),
-                    UpVal::Open { stack_index, .. } => state.exec
+                    UpVal::Open { stack_index, .. } => state
+                        .exec
                         .stack
                         .get(*stack_index)
                         .cloned()
@@ -3291,7 +3293,8 @@ impl VmExecutor {
                 // — func 指针位级相等即同对象, 免 write_stack。跳过时仍须执行
                 // write_stack 的 top 抬升语义 (top 可能曾被截到槽 a 之下, 漏抬
                 // 会丢 nargs/GC 扫描, #130 类)。
-                if matches!(state.exec.stack.get(a), Some(TValue::BuiltinFn(of)) if of.func == bf.func) {
+                if matches!(state.exec.stack.get(a), Some(TValue::BuiltinFn(of)) if of.func == bf.func)
+                {
                     if a >= state.exec.top {
                         state.exec.top = a + 1;
                     }
@@ -3390,7 +3393,8 @@ impl VmExecutor {
             return Ok(());
         }
         // 慢速路径: 有元表或非 Table 类型 — 此处才 clone
-        let key = state.exec
+        let key = state
+            .exec
             .constants
             .get(kb_idx)
             .cloned()
@@ -3400,7 +3404,8 @@ impl VmExecutor {
             let uv_ref = upvals[b].borrow();
             match &*uv_ref {
                 UpVal::Closed { value } => value.clone(),
-                UpVal::Open { stack_index, .. } => state.exec
+                UpVal::Open { stack_index, .. } => state
+                    .exec
                     .stack
                     .get(*stack_index)
                     .cloned()
@@ -3541,7 +3546,8 @@ impl VmExecutor {
         };
         match spec {
             Some(SpecValue::Builtin(bf)) => {
-                if matches!(state.exec.stack.get(a), Some(TValue::BuiltinFn(of)) if of.func == bf.func) {
+                if matches!(state.exec.stack.get(a), Some(TValue::BuiltinFn(of)) if of.func == bf.func)
+                {
                     if a >= state.exec.top {
                         state.exec.top = a + 1;
                     }
@@ -3588,7 +3594,8 @@ impl VmExecutor {
             return Ok(());
         }
         // 慢速路径: 有元表或非 Table 类型 — 此处才 clone key
-        let key = state.exec
+        let key = state
+            .exec
             .constants
             .get(c_key)
             .cloned()
@@ -3609,7 +3616,8 @@ impl VmExecutor {
         let a = opcodes::getarg_a(inst) as usize;
         let b_key = opcodes::getarg_b(inst) as usize;
         let c = opcodes::getarg_c(inst);
-        let key = state.exec
+        let key = state
+            .exec
             .constants
             .get(b_key)
             .cloned()
@@ -3620,7 +3628,8 @@ impl VmExecutor {
             let uv_ref = upvals[a].borrow();
             match &*uv_ref {
                 UpVal::Closed { value } => value.clone(),
-                UpVal::Open { stack_index, .. } => state.exec
+                UpVal::Open { stack_index, .. } => state
+                    .exec
                     .stack
                     .get(*stack_index)
                     .cloned()
@@ -3747,7 +3756,8 @@ impl VmExecutor {
         let c = opcodes::getarg_c(inst);
         let mut val_opt = Some(Self::resolve_val(state, inst, c));
         let mut key_opt = Some(
-            state.exec
+            state
+                .exec
                 .constants
                 .get(b_key)
                 .cloned()
@@ -3819,7 +3829,8 @@ impl VmExecutor {
     fn op_self(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
-        let key = state.exec
+        let key = state
+            .exec
             .constants
             .get(opcodes::getarg_c(inst) as usize)
             .cloned()
@@ -4010,7 +4021,8 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        let v2 = state.exec
+        let v2 = state
+            .exec
             .constants
             .get(c_key)
             .cloned()
@@ -4028,7 +4040,8 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        let v2 = state.exec
+        let v2 = state
+            .exec
             .constants
             .get(c_key)
             .cloned()
@@ -4051,7 +4064,8 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        let v2 = state.exec
+        let v2 = state
+            .exec
             .constants
             .get(c_key)
             .cloned()
@@ -4073,7 +4087,8 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        let v2 = state.exec
+        let v2 = state
+            .exec
             .constants
             .get(c_key)
             .cloned()
@@ -4093,7 +4108,8 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        let v2 = state.exec
+        let v2 = state
+            .exec
             .constants
             .get(c_key)
             .cloned()
@@ -4113,7 +4129,8 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        let v2 = state.exec
+        let v2 = state
+            .exec
             .constants
             .get(c_key)
             .cloned()
@@ -4390,7 +4407,7 @@ impl VmExecutor {
             let pi = state.exec.code[cur - 1];
             let result = Self::ra(state, pi);
             state.exec.pc = cur; // sync (C savepc): 先同步, varinfo 回扫与元方法/错误都需要当前指令
-            // varinfo_str 需要相对于 base 的寄存器编号，而非绝对栈位置
+                                 // varinfo_str 需要相对于 base 的寄存器编号，而非绝对栈位置
             let p1_info = varinfo_str(state, opcodes::getarg_a(inst) as usize);
             let p2_info = varinfo_str(state, opcodes::getarg_b(inst) as usize);
             try_bin_tm(state, &p1, &p2, result, tm, p1_info, p2_info)?;
@@ -4424,7 +4441,8 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as usize;
         let p1 = Self::read_stack(state, a).clone();
-        let p2 = state.exec
+        let p2 = state
+            .exec
             .constants
             .get(b)
             .cloned()
@@ -5086,7 +5104,6 @@ impl VmExecutor {
         }
     }
 
-
     // ---- 调用 / 返回 ----
 
     fn op_call(state: &mut LuaState, inst: Instruction) -> Result<CallOutcome, VmError> {
@@ -5218,7 +5235,6 @@ impl VmExecutor {
         e
     }
 
-
     /// op_call 的 LClosure 路径 — Lua 函数调用帧建立。
     /// 从 op_call 快速路径进入 (closure 已从栈提取, Rc 已 +1)。
     #[inline(never)]
@@ -5236,105 +5252,107 @@ impl VmExecutor {
             b.saturating_sub(1)
         };
         let nresults = c - 1; // -1 表示 MULTRET (对应 C 的 nresults = GETARG_C(i) - 1)
-        // perf: 不再 Rc::clone(&closure.proto) — 直接访问 closure.proto 字段
-        // closure 在下方被 move 进 CallInfoEntry, 移动后需要的值提前缓存
-            let upvals = Rc::clone(&closure.upvals);
-            let fsize = closure.proto.max_stack_size as usize;
-            let nfixparams = closure.proto.num_params as usize;
-            let proto_is_vararg = closure.proto.is_vararg();
-            // 缓存 move 后需要的值 (省 1 次 Rc incq + 1 次 decq)
-            let proto_num_params = closure.proto.num_params;
-            let proto_is_vararg_val = closure.proto.is_vararg();
-            let proto_flag = closure.proto.flag;
+                              // perf: 不再 Rc::clone(&closure.proto) — 直接访问 closure.proto 字段
+                              // closure 在下方被 move 进 CallInfoEntry, 移动后需要的值提前缓存
+        let upvals = Rc::clone(&closure.upvals);
+        let fsize = closure.proto.max_stack_size as usize;
+        let nfixparams = closure.proto.num_params as usize;
+        let proto_is_vararg = closure.proto.is_vararg();
+        // 缓存 move 后需要的值 (省 1 次 Rc incq + 1 次 decq)
+        let proto_num_params = closure.proto.num_params;
+        let proto_is_vararg_val = closure.proto.is_vararg();
+        let proto_flag = closure.proto.flag;
 
-            // perf: caller_proto 不再在 op_call 中 Rc::clone, 改为 traceback/getinfo 时
-            // 从 state.exec.stack[entry.base - 1] 延迟计算 (见 state::get_caller_proto_ref)
+        // perf: caller_proto 不再在 op_call 中 Rc::clone, 改为 traceback/getinfo 时
+        // 从 state.exec.stack[entry.base - 1] 延迟计算 (见 state::get_caller_proto_ref)
 
-            // 检查 C 调用深度 (对应 C 的 luaE_incCstack / luaE_checkcstack)
-            state.exec.n_ccalls = state.exec.n_ccalls.saturating_add(1);
-            let cc = state.get_ccalls();
-            if cc == LUAI_MAXCCALLS || cc >= LUAI_MAXCCALLS * 11 / 10 {
-                state.exec.n_ccalls = state.exec.n_ccalls.saturating_sub(1);
-                let msg = if cc >= LUAI_MAXCCALLS * 11 / 10 {
-                    "error in error handling"
-                } else {
-                    "C stack overflow"
-                };
-                return Err(VmError::RuntimeError(msg.to_string()));
-            }
-
-            // perf: 用 mem::replace 代替 mem::take + 后续赋值
-            // 直接从 closure.proto 提取 Rc 引用 (closure 此时尚未 move)
-            let saved_code = std::mem::replace(&mut state.exec.code, Rc::clone(&closure.proto.code));
-            let saved_constants =
-                std::mem::replace(&mut state.exec.constants, Rc::clone(&closure.proto.constants));
-            let saved_protos =
-                std::mem::replace(&mut state.exec.protos, Rc::clone(&closure.proto.protos));
-            // perf: mem::replace closure_upvals — move old to frame, move new to state
-            // 省 1 次 Rc::clone (旧: clone old → frame) + 1 次 Rc::drop (old state value)
-            let saved_closure_upvals = std::mem::replace(&mut state.exec.closure_upvals, upvals);
-
-            state.exec.call_stack.push(CallFrame {
-                code: saved_code,
-                constants: saved_constants,
-                protos: saved_protos,
-                base: state.exec.base,
-                return_pc: state.exec.pc + 1,
-                return_base: a,
-                num_results: nresults,
-                num_params: state.exec.num_params,
-                is_vararg: state.exec.is_vararg,
-                proto_flag: state.exec.proto_flag,
-                nextraargs: state.exec.nextraargs,
-                closure_upvals: saved_closure_upvals,
-                tbc_list: state.exec.tbc_list.take(),
-            });
-
-            // move closure 避免 clone + Box 堆分配
-            // (closure 保留在 CallInfoEntry 中, 供 traceback/getinfo 在栈截断时访问)
-            state.exec.call_info.push(crate::state::CallInfoEntry {
-                is_c: false,
-                closure: Some(closure),
-                base: state.exec.base,
-                saved_pc: state.exec.pc,
-                name: None,
-                namewhat: "",
-                proto_flag: state.exec.proto_flag,
-                nextraargs: state.exec.nextraargs,
-                is_tailcall: false,
-            });
-
-            state.exec.base = a + 1;
-            state.exec.pc = 0;
-            state.exec.num_params = proto_num_params;
-            state.exec.is_vararg = proto_is_vararg_val;
-            state.exec.proto_flag = proto_flag;
-            state.exec.nextraargs = 0;
-            // state.exec.closure_upvals 已通过 mem::replace 设置
-            state.exec.tbc_list = None;
-            state.exec.hook_old_pc = 0;
-
-            if proto_is_vararg {
-                state.exec.stack.truncate(a + 1 + nargs);
-                if nargs < nfixparams {
-                    Self::fast_resize_stack_nil(state, a + 1 + nfixparams);
-                }
-                // 设置 state.exec.top 供 VARARGPREP 计算 totalargs
-                // (对应 C 的 L->top = ci->func + 1 + nargs)
-                state.exec.top = state.exec.stack.len();
+        // 检查 C 调用深度 (对应 C 的 luaE_incCstack / luaE_checkcstack)
+        state.exec.n_ccalls = state.exec.n_ccalls.saturating_add(1);
+        let cc = state.get_ccalls();
+        if cc == LUAI_MAXCCALLS || cc >= LUAI_MAXCCALLS * 11 / 10 {
+            state.exec.n_ccalls = state.exec.n_ccalls.saturating_sub(1);
+            let msg = if cc >= LUAI_MAXCCALLS * 11 / 10 {
+                "error in error handling"
             } else {
-                let frame_end = a + 1 + fsize;
-                if state.exec.stack.len() < frame_end {
-                    Self::fast_resize_stack_nil(state, frame_end);
-                }
-                for i in nargs..nfixparams {
-                    state.exec.stack[a + 1 + i] = TValue::Nil(NilKind::Strict);
-                }
-                state.exec.top = frame_end;
-                if state.exec.hook_mask & 1 != 0 {
-                    Self::call_hook(state, "call", -1, None, 1, nfixparams as i32)?;
-                }
+                "C stack overflow"
+            };
+            return Err(VmError::RuntimeError(msg.to_string()));
+        }
+
+        // perf: 用 mem::replace 代替 mem::take + 后续赋值
+        // 直接从 closure.proto 提取 Rc 引用 (closure 此时尚未 move)
+        let saved_code = std::mem::replace(&mut state.exec.code, Rc::clone(&closure.proto.code));
+        let saved_constants = std::mem::replace(
+            &mut state.exec.constants,
+            Rc::clone(&closure.proto.constants),
+        );
+        let saved_protos =
+            std::mem::replace(&mut state.exec.protos, Rc::clone(&closure.proto.protos));
+        // perf: mem::replace closure_upvals — move old to frame, move new to state
+        // 省 1 次 Rc::clone (旧: clone old → frame) + 1 次 Rc::drop (old state value)
+        let saved_closure_upvals = std::mem::replace(&mut state.exec.closure_upvals, upvals);
+
+        state.exec.call_stack.push(CallFrame {
+            code: saved_code,
+            constants: saved_constants,
+            protos: saved_protos,
+            base: state.exec.base,
+            return_pc: state.exec.pc + 1,
+            return_base: a,
+            num_results: nresults,
+            num_params: state.exec.num_params,
+            is_vararg: state.exec.is_vararg,
+            proto_flag: state.exec.proto_flag,
+            nextraargs: state.exec.nextraargs,
+            closure_upvals: saved_closure_upvals,
+            tbc_list: state.exec.tbc_list.take(),
+        });
+
+        // move closure 避免 clone + Box 堆分配
+        // (closure 保留在 CallInfoEntry 中, 供 traceback/getinfo 在栈截断时访问)
+        state.exec.call_info.push(crate::state::CallInfoEntry {
+            is_c: false,
+            closure: Some(closure),
+            base: state.exec.base,
+            saved_pc: state.exec.pc,
+            name: None,
+            namewhat: "",
+            proto_flag: state.exec.proto_flag,
+            nextraargs: state.exec.nextraargs,
+            is_tailcall: false,
+        });
+
+        state.exec.base = a + 1;
+        state.exec.pc = 0;
+        state.exec.num_params = proto_num_params;
+        state.exec.is_vararg = proto_is_vararg_val;
+        state.exec.proto_flag = proto_flag;
+        state.exec.nextraargs = 0;
+        // state.exec.closure_upvals 已通过 mem::replace 设置
+        state.exec.tbc_list = None;
+        state.exec.hook_old_pc = 0;
+
+        if proto_is_vararg {
+            state.exec.stack.truncate(a + 1 + nargs);
+            if nargs < nfixparams {
+                Self::fast_resize_stack_nil(state, a + 1 + nfixparams);
             }
+            // 设置 state.exec.top 供 VARARGPREP 计算 totalargs
+            // (对应 C 的 L->top = ci->func + 1 + nargs)
+            state.exec.top = state.exec.stack.len();
+        } else {
+            let frame_end = a + 1 + fsize;
+            if state.exec.stack.len() < frame_end {
+                Self::fast_resize_stack_nil(state, frame_end);
+            }
+            for i in nargs..nfixparams {
+                state.exec.stack[a + 1 + i] = TValue::Nil(NilKind::Strict);
+            }
+            state.exec.top = frame_end;
+            if state.exec.hook_mask & 1 != 0 {
+                Self::call_hook(state, "call", -1, None, 1, nfixparams as i32)?;
+            }
+        }
         Ok(())
     }
 
@@ -5437,7 +5455,7 @@ impl VmExecutor {
                 state.exec.call_stack.push(CallFrame {
                     code: saved_code,
                     constants: saved_constants,
-                        protos: saved_protos,
+                    protos: saved_protos,
                     base: state.exec.base,
                     return_pc: state.exec.pc + 1,
                     return_base: a,
@@ -5529,7 +5547,6 @@ impl VmExecutor {
                     b.saturating_sub(1)
                 };
                 let nresults: i32 = if c == 0 { -1 } else { c - 1 };
-
 
                 let (func, name) = match &func_val {
                     TValue::BuiltinFn(bf) => (bf.call_target(), bf.name_str()),
@@ -5861,9 +5878,7 @@ impl VmExecutor {
         let pure_bf: Option<crate::objects::BuiltinFn> = {
             let func_at_a = Self::read_stack(state, a);
             match func_at_a {
-                TValue::BuiltinFn(bf) if state.exec.hook_mask & 3 == 0 && bf.is_pure() => {
-                    Some(*bf)
-                }
+                TValue::BuiltinFn(bf) if state.exec.hook_mask & 3 == 0 && bf.is_pure() => Some(*bf),
 
                 _ => None,
             }
@@ -5972,7 +5987,7 @@ impl VmExecutor {
                 // perf: 消除 op_call/op_tailcall 中 4 次 malloc+memmove（~5.3% 热点）
                 state.exec.code = Rc::clone(&proto.code);
                 state.exec.constants = Rc::clone(&proto.constants);
-                    state.exec.protos = proto.protos.clone();
+                state.exec.protos = proto.protos.clone();
                 state.exec.pc = 0;
                 state.exec.num_params = proto.num_params;
                 state.exec.is_vararg = proto.is_vararg();
@@ -6145,7 +6160,9 @@ impl VmExecutor {
         // (is_metamethod_return / finish_close_continuation / try_finish_pcall_return 各做
         // 一次 pcall_protection_stack.last() Vec 访问, 普通函数调用全为空, 占 ~69% 热点)
         // 此分支命中时直接走 call_stack.pop() 主路径
-        if state.exec.pcall_protection_stack.is_empty() && !Self::need_close_upvals(state, state.exec.base) {
+        if state.exec.pcall_protection_stack.is_empty()
+            && !Self::need_close_upvals(state, state.exec.base)
+        {
             state.twups_linked = false;
             // 直接走 call_stack.pop() 主路径 (下方代码)
             return Self::op_return_finish(state, a, nresults);
@@ -6288,7 +6305,9 @@ impl VmExecutor {
 
     fn op_return0(state: &mut LuaState, _inst: Instruction) -> Result<Option<VmResult>, VmError> {
         // perf: 快速路径 — 无 pcall 保护且无 open upvalue 时跳过 continuation 检查
-        if state.exec.pcall_protection_stack.is_empty() && !Self::need_close_upvals(state, state.exec.base) {
+        if state.exec.pcall_protection_stack.is_empty()
+            && !Self::need_close_upvals(state, state.exec.base)
+        {
             state.twups_linked = false;
             return Self::op_return0_finish(state);
         }
@@ -6386,7 +6405,9 @@ impl VmExecutor {
     fn op_return1(state: &mut LuaState, inst: Instruction) -> Result<Option<VmResult>, VmError> {
         let a = Self::ra(state, inst);
         // perf: 快速路径 — 无 pcall 保护且无 open upvalue 时跳过 continuation 检查
-        if state.exec.pcall_protection_stack.is_empty() && !Self::need_close_upvals(state, state.exec.base) {
+        if state.exec.pcall_protection_stack.is_empty()
+            && !Self::need_close_upvals(state, state.exec.base)
+        {
             state.twups_linked = false;
             let val = if a < state.exec.stack.len() {
                 std::mem::take(&mut state.exec.stack[a])
@@ -6806,7 +6827,7 @@ impl VmExecutor {
                 state.exec.call_stack.push(CallFrame {
                     code: saved_code,
                     constants: saved_constants,
-                        protos: saved_protos,
+                    protos: saved_protos,
                     base: state.exec.base,
                     return_pc: state.exec.pc + 1,
                     return_base: ra + 3,
@@ -7008,7 +7029,9 @@ impl VmExecutor {
                         // 对应 C: upv[i] = luaF_findupval(L, base + p->upvalues[i].idx);
                         let stack_idx = state.exec.base + desc.idx as usize;
                         let uv_idx = crate::func::find_upval(state, stack_idx);
-                        upvals.borrow_mut().push(state.exec.open_upvals[uv_idx].clone());
+                        upvals
+                            .borrow_mut()
+                            .push(state.exec.open_upvals[uv_idx].clone());
                     } else {
                         // 上值来自外层闭包: 共享同一个 Rc<RefCell<UpVal>>
                         // 对应 C: upv[i] = cl->upvals[p->upvalues[i].idx];
@@ -7018,15 +7041,19 @@ impl VmExecutor {
                                 .borrow_mut()
                                 .push(state.exec.closure_upvals.borrow()[parent_idx].clone());
                         } else {
-                            upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
-                                value: TValue::Nil(NilKind::Strict),
-                            })));
+                            upvals
+                                .borrow_mut()
+                                .push(Rc::new(RefCell::new(UpVal::Closed {
+                                    value: TValue::Nil(NilKind::Strict),
+                                })));
                         }
                     }
                 } else {
-                    upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Closed {
-                        value: TValue::Nil(NilKind::Strict),
-                    })));
+                    upvals
+                        .borrow_mut()
+                        .push(Rc::new(RefCell::new(UpVal::Closed {
+                            value: TValue::Nil(NilKind::Strict),
+                        })));
                 }
             }
             // GC: 在创建新闭包前检查 GC 阈值，回收不可达的旧闭包。
@@ -7172,7 +7199,8 @@ impl VmExecutor {
 
         let result = if let Some(n) = as_int {
             if n >= 1 && (n as usize) <= nextra as usize {
-                let idx = state.exec
+                let idx = state
+                    .exec
                     .base
                     .saturating_sub(nextra as usize + 1)
                     .saturating_add(n as usize - 1);
@@ -7329,7 +7357,8 @@ impl VmExecutor {
             // LUA_MASKCALL
             // ftransfer=1 (参数从 func+1 开始), ntransfer=numparams
             let nfixparams = state.exec.num_params as i32;
-            let event = if state.exec
+            let event = if state
+                .exec
                 .call_info
                 .last()
                 .map(|e| e.is_tailcall)
@@ -7687,7 +7716,8 @@ impl VmExecutor {
 
     fn resolve_val(state: &LuaState, inst: Instruction, c: i32) -> TValue {
         if opcodes::testarg_k(inst) {
-            state.exec
+            state
+                .exec
                 .constants
                 .get(c as usize)
                 .cloned()
