@@ -211,10 +211,11 @@ impl<'a> BytecodeReader<'a> {
         self.align(4);
         let mut code = Vec::with_capacity(sizecode);
         for _i in 0..sizecode {
-            let bytes: [u8; 4] = self.read_bytes(4).try_into().unwrap();
-            if bytes.len() < 4 {
+            let bytes: [u8; 4] = if let Ok(bytes) = self.read_bytes(4).try_into() {
+                bytes
+            } else {
                 return code;
-            }
+            };
             let raw = u32::from_le_bytes(bytes);
             code.push(self.read_instruction(raw));
         }
@@ -392,8 +393,12 @@ pub fn parse_dump(data: &[u8]) -> Result<DumpedFunction, String> {
     }
 
     // 校验签名 \x1bLua — 对应 C 的 checkliteral(LUA_SIGNATURE)
-    let sig: [u8; 4] = reader.read_bytes(4).try_into().unwrap();
-    reader.check()?;
+    let sig: [u8; 4] = if let Ok(bytes) = reader.read_bytes(4).try_into() {
+        bytes
+    } else {
+        reader.check()?;
+        unreachable!("signature size mismatch");
+    };
     if sig != crate::config::SIGNATURE.as_bytes() {
         return Err("not a binary chunk".to_string());
     }
@@ -413,8 +418,12 @@ pub fn parse_dump(data: &[u8]) -> Result<DumpedFunction, String> {
     }
 
     // 校验 LUAC_DATA — 对应 C 的 checkliteral(LUAC_DATA, "corrupted chunk")
-    let luac_data: [u8; 6] = reader.read_bytes(6).try_into().unwrap();
-    reader.check()?;
+    let luac_data: [u8; 6] = if let Ok(bytes) = reader.read_bytes(6).try_into() {
+        bytes
+    } else {
+        reader.check()?;
+        unreachable!("LUAC_DATA size mismatch");
+    };
     if luac_data != LUAC_DATA {
         return Err("corrupted chunk".to_string());
     }
@@ -425,8 +434,12 @@ pub fn parse_dump(data: &[u8]) -> Result<DumpedFunction, String> {
     if int_size as usize != std::mem::size_of::<i32>() {
         return Err("int size mismatch".to_string());
     }
-    let int_val_bytes: [u8; 4] = reader.read_bytes(4).try_into().unwrap();
-    reader.check()?;
+    let int_val_bytes: [u8; 4] = if let Ok(bytes) = reader.read_bytes(4).try_into() {
+        bytes
+    } else {
+        reader.check()?;
+        unreachable!("int size mismatch");
+    };
     let int_val = i32::from_ne_bytes([
         int_val_bytes[0],
         int_val_bytes[1],
@@ -443,8 +456,12 @@ pub fn parse_dump(data: &[u8]) -> Result<DumpedFunction, String> {
     if inst_size as usize != std::mem::size_of::<u32>() {
         return Err("instruction size mismatch".to_string());
     }
-    let inst_val_bytes: [u8; 4] = reader.read_bytes(4).try_into().unwrap();
-    reader.check()?;
+    let inst_val_bytes: [u8; 4] = if let Ok(bytes) = reader.read_bytes(4).try_into() {
+        bytes
+    } else {
+        reader.check()?;
+        unreachable!("instruction size mismatch");
+    };
     let inst_val = u32::from_ne_bytes([
         inst_val_bytes[0],
         inst_val_bytes[1],
@@ -461,8 +478,12 @@ pub fn parse_dump(data: &[u8]) -> Result<DumpedFunction, String> {
     if integer_size as usize != std::mem::size_of::<i64>() {
         return Err("Lua integer size mismatch".to_string());
     }
-    let integer_val_bytes: [u8; 8] = reader.read_bytes(8).try_into().unwrap();
-    reader.check()?;
+    let integer_val_bytes: [u8; 8] = if let Ok(bytes) = reader.read_bytes(8).try_into() {
+        bytes
+    } else {
+        reader.check()?;
+        unreachable!("Lua integer size mismatch");
+    };
     let integer_val = i64::from_ne_bytes([
         integer_val_bytes[0],
         integer_val_bytes[1],
