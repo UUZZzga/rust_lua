@@ -183,13 +183,13 @@ impl MetatableFlags {
 // ============================================================================
 
 #[derive(Debug, Clone)]
-pub struct Metatable {
-    pub table: Table,
+pub struct Metatable<'a> {
+    pub table: Table<'a>,
     pub flags: MetatableFlags,
 }
 
-impl Metatable {
-    pub fn new(table: Table) -> Self {
+impl<'a> Metatable<'a> {
+    pub fn new(table: Table<'a>) -> Self {
         Metatable {
             table,
             flags: MetatableFlags::empty(),
@@ -203,7 +203,7 @@ impl Metatable {
         }
     }
 
-    pub fn get_tm(&mut self, tmnames: &[LuaString; TM_N], tm: TagMethod) -> Option<TValue> {
+    pub fn get_tm(&mut self, tmnames: &[LuaString; TM_N], tm: TagMethod) -> Option<TValue<'a>> {
         if let Some(flag) = MetatableFlags::from_tag_method(tm) {
             if self.flags.contains(flag) {
                 return None;
@@ -226,22 +226,23 @@ impl Metatable {
 // ============================================================================
 
 #[derive(Debug, Clone)]
-pub struct DefaultMetatables {
-    tables: [Option<Metatable>; 9],
+pub struct DefaultMetatables<'a> {
+    tables: [Option<Metatable<'a>>; 9],
 }
 
-impl DefaultMetatables {
+impl<'a> DefaultMetatables<'a> {
     pub fn new() -> Self {
-        const NONE: Option<Metatable> = None;
-        DefaultMetatables { tables: [NONE; 9] }
+        Self {
+            tables: [const { None }; 9],
+        }
     }
 
-    pub fn get(&self, ty: LuaType) -> Option<&Table> {
+    pub fn get(&self, ty: LuaType) -> Option<&Table<'a>> {
         let idx = ty as usize;
         self.tables.get(idx)?.as_ref().map(|m| &m.table)
     }
 
-    pub fn set(&mut self, ty: LuaType, mt: Metatable) {
+    pub fn set(&mut self, ty: LuaType, mt: Metatable<'a>) {
         let idx = ty as usize;
         if idx < self.tables.len() {
             self.tables[idx] = Some(mt);
@@ -257,13 +258,13 @@ impl DefaultMetatables {
         }
     }
 
-    pub fn get_mut(&mut self, ty: LuaType) -> Option<&mut Metatable> {
+    pub fn get_mut(&mut self, ty: LuaType) -> Option<&mut Metatable<'a>> {
         let idx = ty as usize;
         self.tables.get_mut(idx)?.as_mut()
     }
 }
 
-impl Default for DefaultMetatables {
+impl<'a> Default for DefaultMetatables<'a> {
     fn default() -> Self {
         Self::new()
     }
@@ -292,7 +293,7 @@ pub fn type_name(ty: LuaType) -> &'static str {
     }
 }
 
-pub fn obj_type_name(obj: &TValue) -> String {
+pub fn obj_type_name<'a>(obj: &TValue<'a>) -> String {
     // 获取元表（Table 通过 get_metatable() 共享 Rc；UserData 直接克隆）
     let meta: Option<Table> = match obj {
         TValue::Table(t) => t.get_metatable(),
@@ -312,12 +313,12 @@ pub fn obj_type_name(obj: &TValue) -> String {
     crate::stdlib::base_lib::base_type_name(obj).to_string()
 }
 
-pub fn get_tm_by_obj(
-    obj: &TValue,
+pub fn get_tm_by_obj<'a>(
+    obj: &TValue<'a>,
     tm: TagMethod,
-    default_mts: &DefaultMetatables,
+    default_mts: &DefaultMetatables<'a>,
     tmnames: &[LuaString; TM_N],
-) -> Option<TValue> {
+) -> Option<TValue<'a>> {
     // perf: 零临时 clone — 元表槽借 Table (不再 clone 整个 Table, Rc inc),
     // 元方法名 LuaString 直查 (免构造 TValue 键的 Str clone),
     // Ref::filter_map 安全新式借用 (无 unsafe), 命中后仅 clone 一次值。
@@ -418,14 +419,14 @@ impl std::error::Error for TagMethodError {}
 /// ```
 ///
 /// Rust 版本: 在栈顶压入函数和参数，调用 pcall，将结果写入 res 槽位。
-pub(crate) fn call_tm_res(
-    state: &mut LuaState,
-    f: &TValue,
-    p1: &TValue,
-    p2: &TValue,
+pub(crate) fn call_tm_res<'a>(
+    state: &mut LuaState<'a>,
+    f: &TValue<'a>,
+    p1: &TValue<'a>,
+    p2: &TValue<'a>,
     res: usize,
     tm: TagMethod,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let func_idx = state.exec.stack.len();
     // 压入函数和两个参数 (对应 C 的 setobj2s)
     state.exec.stack.push(f.clone());
@@ -580,14 +581,14 @@ pub(crate) fn call_tm_res(
 /// Rust 版本: 在栈顶压入函数和 3 个参数，调用 pcall (0 个返回值)。
 /// 用于 `__newindex` 元方法 (table, key, value)。
 /// 支持 yield (使用 PcallProtection 机制)。
-pub(crate) fn call_tm(
-    state: &mut LuaState,
-    f: &TValue,
-    p1: &TValue,
-    p2: &TValue,
-    p3: &TValue,
+pub(crate) fn call_tm<'a>(
+    state: &mut LuaState<'a>,
+    f: &TValue<'a>,
+    p1: &TValue<'a>,
+    p2: &TValue<'a>,
+    p3: &TValue<'a>,
     tm: TagMethod,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let func_idx = state.exec.stack.len();
     state.exec.stack.push(f.clone());
     state.exec.stack.push(p1.clone());
@@ -713,12 +714,12 @@ thread_local! {
     static CLOSE_METHOD_DEPTH: std::cell::Cell<usize> = std::cell::Cell::new(0);
 }
 
-pub fn call_close_method(
-    state: &mut LuaState,
-    obj: &TValue,
-    err: Option<&TValue>,
+pub fn call_close_method<'a>(
+    state: &mut LuaState<'a>,
+    obj: &TValue<'a>,
+    err: Option<&TValue<'a>>,
     yy: bool,
-) -> Result<bool, VmError> {
+) -> Result<bool, VmError<'a>> {
     let depth = CLOSE_METHOD_DEPTH.with(|d| {
         let v = d.get();
         d.set(v + 1);
@@ -888,13 +889,13 @@ pub fn call_close_method(
 /// ```
 ///
 /// 返回 true 表示找到并调用了元方法，false 表示未找到。
-fn callbin_tm(
-    state: &mut LuaState,
-    p1: &TValue,
-    p2: &TValue,
+fn callbin_tm<'a>(
+    state: &mut LuaState<'a>,
+    p1: &TValue<'a>,
+    p2: &TValue<'a>,
     res: usize,
     tm: TagMethod,
-) -> Result<bool, VmError> {
+) -> Result<bool, VmError<'a>> {
     // 先从 p1 查找元方法，再从 p2 查找 — 对应 C 的 callbinTM
     let tm_val = get_tm_by_obj(p1, tm, &state.dmt, &state.tmnames)
         .or_else(|| get_tm_by_obj(p2, tm, &state.dmt, &state.tmnames));
@@ -949,13 +950,13 @@ fn callbin_tm(
 ///
 /// 尝试将操作数转换为数字 (含字符串强制转换)，然后执行算术运算。
 /// 转换失败时返回 false (让调用者报错或尝试其他元方法)。
-fn string_arith(
-    state: &mut LuaState,
-    p1: &TValue,
-    p2: &TValue,
+fn string_arith<'a>(
+    state: &mut LuaState<'a>,
+    p1: &TValue<'a>,
+    p2: &TValue<'a>,
     res: usize,
     tm: TagMethod,
-) -> Result<bool, VmError> {
+) -> Result<bool, VmError<'a>> {
     use crate::objects::NilKind;
     use crate::vm::{to_integer, to_number, F2IMode};
 
@@ -1048,15 +1049,15 @@ fn string_arith(
 /// ```
 ///
 /// 找到元方法时调用它并将结果写入 res 槽位；未找到时返回 VmError。
-pub fn try_bin_tm(
-    state: &mut LuaState,
-    p1: &TValue,
-    p2: &TValue,
+pub fn try_bin_tm<'a>(
+    state: &mut LuaState<'a>,
+    p1: &TValue<'a>,
+    p2: &TValue<'a>,
     res: usize,
     tm: TagMethod,
     p1_info: String,
     p2_info: String,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     if !callbin_tm(state, p1, p2, res, tm)? {
         // 未找到元方法 — 根据事件类型报错
         return Err(match tm {
@@ -1088,16 +1089,16 @@ pub fn try_bin_tm(
 ///   else      luaT_trybinTM(L, p1, p2, res, event);
 /// }
 /// ```
-pub fn try_bin_assoc_tm(
-    state: &mut LuaState,
-    p1: &TValue,
-    p2: &TValue,
+pub fn try_bin_assoc_tm<'a>(
+    state: &mut LuaState<'a>,
+    p1: &TValue<'a>,
+    p2: &TValue<'a>,
     flip: bool,
     res: usize,
     tm: TagMethod,
     p1_info: String,
     p2_info: String,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     if flip {
         // flip 时传给 try_bin_tm 的是 (p2, p1)，info 也要对应交换
         try_bin_tm(state, p2, p1, res, tm, p2_info, p1_info)
@@ -1117,15 +1118,15 @@ pub fn try_bin_assoc_tm(
 ///   luaT_trybinassocTM(L, p1, &aux, flip, res, event);
 /// }
 /// ```
-pub fn try_bini_tm(
-    state: &mut LuaState,
-    p1: &TValue,
+pub fn try_bini_tm<'a>(
+    state: &mut LuaState<'a>,
+    p1: &TValue<'a>,
     i2: i64,
     flip: bool,
     res: usize,
     tm: TagMethod,
     p1_info: String,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let aux = TValue::Integer(i2);
     // i2 是立即数，没有寄存器位置，info 为空
     try_bin_assoc_tm(state, p1, &aux, flip, res, tm, p1_info, String::new())
@@ -1143,12 +1144,12 @@ pub fn try_bini_tm(
 /// ```
 ///
 /// Rust 版本: p1, p2 为操作数，res 为结果槽位。
-pub fn try_concat_tm(
-    state: &mut LuaState,
-    p1: &TValue,
-    p2: &TValue,
+pub fn try_concat_tm<'a>(
+    state: &mut LuaState<'a>,
+    p1: &TValue<'a>,
+    p2: &TValue<'a>,
     res: usize,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     if !callbin_tm(state, p1, p2, res, TagMethod::Concat)? {
         return Err(concaterror(p1, p2));
     }
@@ -1167,12 +1168,12 @@ pub fn try_concat_tm(
 ///   return 0;
 /// }
 /// ```
-pub fn call_order_tm(
-    state: &mut LuaState,
-    p1: &TValue,
-    p2: &TValue,
+pub fn call_order_tm<'a>(
+    state: &mut LuaState<'a>,
+    p1: &TValue<'a>,
+    p2: &TValue<'a>,
     tm: TagMethod,
-) -> Result<bool, VmError> {
+) -> Result<bool, VmError<'a>> {
     debug_assert!(tm == TagMethod::Lt || tm == TagMethod::Le);
     // 使用栈顶作为临时结果槽位
     let res = state.exec.stack.len();
@@ -1212,14 +1213,14 @@ pub fn call_order_tm(
 ///
 /// `isfloat` 为 true 时，`v2` 原本是浮点常量（如 `5.0`），需还原为 Float 类型，
 /// 以确保元方法收到与源码类型一致的参数。
-pub fn call_orderi_tm(
-    state: &mut LuaState,
-    p1: &TValue,
+pub fn call_orderi_tm<'a>(
+    state: &mut LuaState<'a>,
+    p1: &TValue<'a>,
     v2: i64,
     flip: bool,
     isfloat: bool,
     tm: TagMethod,
-) -> Result<bool, VmError> {
+) -> Result<bool, VmError<'a>> {
     let aux = if isfloat {
         TValue::Float(v2 as f64)
     } else {
@@ -1255,7 +1256,11 @@ pub fn call_orderi_tm(
 ///   }
 /// }
 /// ```
-pub fn equal_obj(state: &mut LuaState, t1: &TValue, t2: &TValue) -> Result<bool, VmError> {
+pub fn equal_obj<'a>(
+    state: &mut LuaState<'a>,
+    t1: &TValue<'a>,
+    t2: &TValue<'a>,
+) -> Result<bool, VmError<'a>> {
     // C: if (ttype(t1) != ttype(t2)) return 0;
     // ttype 检查基类型: Integer 和 Float 同属 LUA_TNUMBER
     // 先处理数字混合比较 (integer == float), 与 C 的 ttypetag 分支一致
@@ -1324,8 +1329,13 @@ pub fn equal_obj(state: &mut LuaState, t1: &TValue, t2: &TValue) -> Result<bool,
 ///   luaT_callTMres(L, tm, rb, rb, ra);
 /// }
 /// ```
-pub fn obj_len(state: &mut LuaState, ra: usize, rb: &TValue, varinfo: &str) -> Result<(), VmError> {
-    let tm: Option<TValue> = match rb {
+pub fn obj_len<'a>(
+    state: &mut LuaState<'a>,
+    ra: usize,
+    rb: &TValue<'a>,
+    varinfo: &str,
+) -> Result<(), VmError<'a>> {
+    let tm: Option<TValue<'a>> = match rb {
         TValue::Table(t) => {
             // 先查表自身元表的 __len
             let tm_val = t.get_metatable().and_then(|mt| {
@@ -1402,17 +1412,17 @@ impl VarargInfo {
 }
 
 #[derive(Debug, Clone)]
-pub enum VarargTable {
-    Table { table: Table, count: usize },
-    Hidden { args: Vec<TValue> },
+pub enum VarargTable<'a> {
+    Table { table: Table<'a>, count: usize },
+    Hidden { args: Vec<TValue<'a>> },
 }
 
-impl VarargTable {
-    pub fn from_hidden(args: Vec<TValue>) -> Self {
+impl<'a> VarargTable<'a> {
+    pub fn from_hidden(args: Vec<TValue<'a>>) -> Self {
         VarargTable::Hidden { args }
     }
 
-    pub fn from_args(table: &StringTable, args: &[TValue]) -> Self {
+    pub fn from_args(table: &StringTable, args: &[TValue<'a>]) -> Self {
         let t = Table::new();
         let count = args.len();
         for (i, v) in args.iter().enumerate() {
@@ -1432,7 +1442,7 @@ impl VarargTable {
         }
     }
 
-    pub fn get(&self, idx: usize) -> Option<TValue> {
+    pub fn get(&self, idx: usize) -> Option<TValue<'a>> {
         if idx < 1 {
             return None;
         }
@@ -1448,7 +1458,7 @@ impl VarargTable {
         }
     }
 
-    pub fn get_vararg(&self, key: &TValue) -> Option<TValue> {
+    pub fn get_vararg(&self, key: &TValue) -> Option<TValue<'a>> {
         match key {
             TValue::Integer(i) => self.get(*i as usize),
             TValue::Str(s) if s.as_str() == "n" => Some(TValue::Integer(self.count() as i64)),
@@ -1456,7 +1466,7 @@ impl VarargTable {
         }
     }
 
-    pub fn get_varargs(&self, wanted: isize) -> Vec<TValue> {
+    pub fn get_varargs(&self, wanted: isize) -> Vec<TValue<'a>> {
         let n = self.count();
         let take = if wanted < 0 {
             n
@@ -1499,7 +1509,7 @@ pub fn init_tmnames(table: &StringTable) -> Box<[LuaString; TM_N]> {
 }
 
 /// 从预 intern 的元方法名数组创建 TValue — O(1) clone，对应 C 的 `G(L)->tmname[event]`。
-pub fn make_tm_tvalue(tmnames: &[LuaString; TM_N], tm: TagMethod) -> TValue {
+pub fn make_tm_tvalue<'a>(tmnames: &[LuaString; TM_N], tm: TagMethod) -> TValue<'a> {
     TValue::Str(tmnames[tm as usize].clone())
 }
 
@@ -1663,7 +1673,7 @@ mod tests {
 
     #[test]
     fn test_try_bin_tm_not_found() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let p1 = TValue::Integer(1);
         let p2 = TValue::Integer(2);
         // 整数没有 __add 元方法，应返回 RuntimeError
@@ -1684,7 +1694,7 @@ mod tests {
     #[test]
     fn test_try_bin_tm_nil_operand() {
         // 对应闭包 n=n+1 时 n 为 nil 的场景
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let p1 = TValue::Nil(NilKind::Strict);
         let p2 = TValue::Integer(1);
         let result = try_bin_tm(
@@ -1705,7 +1715,7 @@ mod tests {
 
     #[test]
     fn test_try_concat_tm_no_metamethod() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         // nil 不能拼接
         let result = try_concat_tm(
             &mut state,
@@ -1719,7 +1729,7 @@ mod tests {
 
     #[test]
     fn test_call_order_tm_no_metamethod() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         // nil 和 integer 无法比较
         let result = call_order_tm(
             &mut state,
@@ -1733,7 +1743,7 @@ mod tests {
 
     #[test]
     fn test_call_orderi_tm_no_metamethod() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let p1 = TValue::Nil(NilKind::Strict);
         let result = call_orderi_tm(&mut state, &p1, 3, false, false, TagMethod::Lt);
         assert!(result.is_err());
@@ -1824,7 +1834,7 @@ mod tests {
         assert_eq!(result.len(), 3);
     }
 
-    fn _make_tm_tvalue_local(tm: TagMethod) -> TValue {
+    fn _make_tm_tvalue_local<'a>(tm: TagMethod) -> TValue<'a> {
         let table = StringTable::new();
         let tmnames = init_tmnames(&table);
         super::make_tm_tvalue(&tmnames, tm)

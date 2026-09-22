@@ -40,14 +40,14 @@ pub fn runerror(_state: &mut LuaState, _msg: &str, _args: &[&TValue]) {
 ///   luaG_typeerror(L, p1, "concatenate");
 /// }
 /// ```
-pub fn concaterror(p1: &TValue, p2: &TValue) -> VmError {
+pub fn concaterror<'a>(p1: &TValue<'a>, p2: &TValue<'a>) -> VmError<'a> {
     let err_obj = if is_string_or_cvt2str(p1) { p2 } else { p1 };
     let tname = obj_type_name(err_obj);
     VmError::RuntimeError(format!("attempt to concatenate a {} value", tname))
 }
 
 /// 顺序比较错误 — 对应 C 的 luaG_ordererror
-pub fn ordererror(p1: &TValue, p2: &TValue) -> VmError {
+pub fn ordererror<'a>(p1: &TValue<'a>, p2: &TValue<'a>) -> VmError<'a> {
     let t1 = obj_type_name(p1);
     let t2 = obj_type_name(p2);
     let msg = if t1 == t2 {
@@ -70,7 +70,13 @@ pub fn ordererror(p1: &TValue, p2: &TValue) -> VmError {
 ///   luaG_typeerror(L, p2, msg);
 /// }
 /// ```
-pub fn opinterror(p1: &TValue, p2: &TValue, op: &str, p1_info: &str, p2_info: &str) -> VmError {
+pub fn opinterror<'a>(
+    p1: &TValue<'a>,
+    p2: &TValue<'a>,
+    op: &str,
+    p1_info: &str,
+    p2_info: &str,
+) -> VmError<'a> {
     // C: 如果 p1 不是数字，则错误对象是 p1；否则错误对象是 p2
     let (err_obj, info) = if !is_number(p1) {
         (p1, p1_info)
@@ -95,7 +101,12 @@ pub fn opinterror(p1: &TValue, p2: &TValue, op: &str, p1_info: &str, p2_info: &s
 ///
 /// p1_info / p2_info 是调用方通过 varinfo_str 预先构造的变量信息字符串
 /// （如 " (field 'huge')"），对应 C 的 varinfo(L, p1) / varinfo(L, p2)。
-pub fn tointerror(p1: &TValue, _p2: &TValue, p1_info: &str, p2_info: &str) -> VmError {
+pub fn tointerror<'a>(
+    p1: &TValue<'a>,
+    _p2: &TValue<'a>,
+    p1_info: &str,
+    p2_info: &str,
+) -> VmError<'a> {
     let info = if to_integer_ns(p1, F2IMode::Floor).is_none() {
         p1_info
     } else {

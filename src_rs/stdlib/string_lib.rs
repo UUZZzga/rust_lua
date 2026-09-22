@@ -819,7 +819,7 @@ fn match_pattern_inner(
 
 /// 获取第 i 个捕获的内容
 /// 返回 (start, length) 或位置捕获
-fn get_one_capture(
+fn get_one_capture<'a>(
     ms: &MatchState<'_>,
     i: usize,
     s: usize,
@@ -849,12 +849,12 @@ enum CaptureResult {
 
 /// 获取所有捕获的字符串 — 写入调用者提供的缓冲区（复用容量，零分配）。
 /// 热路径（find/match 每次调用一次）：clear + 复用，避免 Vec::with_capacity。
-fn get_captures_into(
+fn get_captures_into<'a>(
     ms: &MatchState<'_>,
     s: usize,
     e: usize,
     table: &crate::strings::StringTable,
-    out: &mut Vec<TValue>,
+    out: &mut Vec<TValue<'a>>,
 ) -> Result<(), String> {
     let nlevels = if ms.level == 0 { 1 } else { ms.level };
     out.clear();
@@ -878,14 +878,14 @@ fn get_captures_into(
 /// find_mode=false: 对应 C 的 str_match（level==0 时整个匹配作为唯一捕获）
 /// captures_out: 匹配成功时写入（复用调用者缓冲区）。
 /// 返回 Some((start, end)) 或 None（未找到）。
-pub fn str_find_into(
+pub fn str_find_into<'a>(
     s: &str,
     pattern: &str,
     init: i64,
     plain: bool,
     find_mode: bool,
     table: &crate::strings::StringTable,
-    captures_out: &mut Vec<TValue>,
+    captures_out: &mut Vec<TValue<'a>>,
 ) -> Result<Option<(usize, usize)>, String> {
     let len = s.len();
     let init_pos = posrelat_i(init, len).saturating_sub(1);
@@ -958,13 +958,13 @@ pub fn str_find_into(
 
 /// string.find(s, pattern, [init], [plain]) — 查找模式
 /// 对应 C 的 str_find（兼容包装：结果转 FindResult）
-pub fn str_find(
+pub fn str_find<'a>(
     s: &str,
     pattern: &str,
     init: i64,
     plain: bool,
     table: &crate::strings::StringTable,
-) -> Result<FindResult, String> {
+) -> Result<FindResult<'a>, String> {
     let mut caps = Vec::new();
     match str_find_into(s, pattern, init, plain, true, table, &mut caps)? {
         Some((start, end)) => Ok(FindResult::Found {
@@ -976,23 +976,23 @@ pub fn str_find(
     }
 }
 
-pub enum FindResult {
+pub enum FindResult<'a> {
     Found {
         start: usize,
         end: usize,
-        captures: Vec<TValue>,
+        captures: Vec<TValue<'a>>,
     },
     NotFound,
 }
 
 /// string.match(s, pattern, [init]) — 模式匹配
 /// 对应 C 的 str_match
-pub fn str_match(
+pub fn str_match<'a>(
     s: &str,
     pattern: &str,
     init: i64,
     table: &crate::strings::StringTable,
-) -> Result<Vec<TValue>, String> {
+) -> Result<Vec<TValue<'a>>, String> {
     let mut caps = Vec::new();
     match str_find_into(s, pattern, init, false, false, table, &mut caps)? {
         Some((start, end)) => {
@@ -1030,7 +1030,10 @@ impl GMatchIterator {
         }
     }
 
-    pub fn next(&mut self, table: &crate::strings::StringTable) -> Result<Vec<TValue>, String> {
+    pub fn next<'a>(
+        &mut self,
+        table: &crate::strings::StringTable,
+    ) -> Result<Vec<TValue<'a>>, String> {
         let src_bytes = self.src.as_bytes();
         let len = src_bytes.len();
         while self.pos <= len {
@@ -1148,11 +1151,11 @@ pub fn str_gsub(s: &str, pattern: &str, repl: &str, max_s: i64) -> Result<(Strin
 /// - table: 以第一个捕获（或整个匹配）为键查表
 /// - function: 以所有捕获为参数调用函数
 /// 若结果为 nil/false，保留原匹配文本；若为 string/number，用作替换；否则报错。
-fn str_gsub_with_repl(
-    state: &mut LuaState,
+fn str_gsub_with_repl<'a>(
+    state: &mut LuaState<'a>,
     s: &str,
     pattern: &str,
-    repl: &TValue,
+    repl: &TValue<'a>,
     max_s: i64,
 ) -> Result<(String, i64, bool), String> {
     let src_bytes = s.as_bytes();
@@ -1219,12 +1222,12 @@ fn str_gsub_with_repl(
 ///
 /// 返回 (替换后的字符串, changed 标志)。
 /// 若结果为 nil/false，保留原匹配文本，changed = false（对应 C 的 return 0）。
-fn add_value_from_repl(
-    state: &mut LuaState,
+fn add_value_from_repl<'a>(
+    state: &mut LuaState<'a>,
     ms: &MatchState<'_>,
     s: usize,
     e: usize,
-    repl: &TValue,
+    repl: &TValue<'a>,
 ) -> Result<(String, bool), String> {
     match repl {
         // table 替换 — 对应 C 的 LUA_TTABLE 分支
@@ -1323,13 +1326,13 @@ fn add_value_from_repl(
 /// 获取第 i 个捕获并转换为 TValue — 对应 C 的 push_onecapture
 ///
 /// 使用 state.intern_str() 创建字符串，确保哈希值与表查找一致。
-fn get_capture_as_tvalue(
-    state: &mut LuaState,
+fn get_capture_as_tvalue<'a>(
+    state: &mut LuaState<'a>,
     ms: &MatchState<'_>,
     i: usize,
     s: usize,
     e: usize,
-) -> Result<TValue, String> {
+) -> Result<TValue<'a>, String> {
     let cap = get_one_capture(ms, i, s, e)?;
     match cap {
         CaptureResult::Str(start, len) => {
@@ -2992,12 +2995,12 @@ pub fn str_packsize(fmt: &str) -> Result<usize, String> {
 /// string.unpack(fmt, data, [pos]) — 从二进制字符串解包值
 /// 对应 C 的 str_unpack
 /// 返回 (解包的值列表, 下一个位置)
-pub fn str_unpack(
+pub fn str_unpack<'a>(
     fmt: &str,
     data: &[u8],
     init_pos: i64,
     table: &crate::strings::StringTable,
-) -> Result<(Vec<TValue>, usize), String> {
+) -> Result<(Vec<TValue<'a>>, usize), String> {
     let fmt_bytes = fmt.as_bytes();
     let ld = data.len();
     // posrelatI 将相对位置转为绝对位置 (1-based),然后 -1 转为 0-based
@@ -3104,7 +3107,7 @@ pub fn str_unpack(
 // ============================================================================
 
 /// 从栈中读取字符串参数
-fn get_str_arg(state: &LuaState, a: usize, idx: usize) -> Result<String, VmError> {
+fn get_str_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> Result<String, VmError<'a>> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.exec.stack.len() {
         return Err(arg_error(state, idx + 1, "string expected, got no value"));
@@ -3127,7 +3130,7 @@ fn get_str_arg(state: &LuaState, a: usize, idx: usize) -> Result<String, VmError
 /// get_str_arg 的 to_string() 全量拷贝。number 参数仍转换为字符串
 /// （通过 intern）。
 #[cfg_attr(not(size_optimized), inline)]
-fn get_lstr_arg(state: &LuaState, a: usize, idx: usize) -> Result<LuaString, VmError> {
+fn get_lstr_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> Result<LuaString, VmError<'a>> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.exec.stack.len() {
         return Err(arg_error(state, idx + 1, "string expected, got no value"));
@@ -3147,13 +3150,13 @@ fn get_lstr_arg(state: &LuaState, a: usize, idx: usize) -> Result<LuaString, VmE
 
 /// 从栈中读取整数参数 (对应 C 的 luaL_checkinteger)
 /// 浮点数必须能精确转为整数，否则报 "number has no integer representation"
-fn get_int_arg(
-    state: &LuaState,
+fn get_int_arg<'a>(
+    state: &LuaState<'a>,
     a: usize,
     idx: usize,
     default: i64,
     _funcname: &str,
-) -> Result<i64, VmError> {
+) -> Result<i64, VmError<'a>> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.exec.stack.len() {
         return Ok(default);
@@ -3186,14 +3189,14 @@ fn get_int_arg(
 
 /// 从栈中读取可选整数参数 (对应 C 的 luaL_optinteger)
 /// nargs 是实际参数个数，用 nargs 判断参数是否存在（对应 C 的 lua_gettop）
-fn get_opt_int_arg(
-    state: &LuaState,
+fn get_opt_int_arg<'a>(
+    state: &LuaState<'a>,
     a: usize,
     nargs: usize,
     idx: usize,
     default: i64,
     _funcname: &str,
-) -> Result<i64, VmError> {
+) -> Result<i64, VmError<'a>> {
     if idx >= nargs {
         return Ok(default);
     }
@@ -3240,14 +3243,14 @@ fn get_bool_arg(state: &LuaState, a: usize, nargs: usize, idx: usize, default: b
 }
 
 /// 将结果压入栈并调整栈顶
-fn push_results(state: &mut LuaState, a: usize, nresults: i32, results: Vec<TValue>) {
+fn push_results<'a>(state: &mut LuaState<'a>, a: usize, nresults: i32, results: Vec<TValue<'a>>) {
     state.adjust_results(a, nresults, results);
 }
 
 /// 对应 C 的 luaL_tolstring: 将值转为字符串用于 string.format 的 %s。
 /// - table: 调用 __tostring 元方法;若无则用 __name (或 "table") + 指针地址
 /// - 其他类型: 返回 None (由 str_format 自行处理)
-fn tostring_for_format(state: &mut LuaState, val: &TValue) -> Option<String> {
+fn tostring_for_format<'a>(state: &mut LuaState<'a>, val: &TValue<'a>) -> Option<String> {
     let table = match val {
         TValue::Table(t) => t.clone(),
         _ => return None,
@@ -3370,12 +3373,12 @@ const GMATCH_UP_LAST: usize = 4;
 /// 在 TFORCALL 的 BuiltinFn/RustClosure 分支直接派发，零字符串拷贝、
 /// 零 Table 读写（旧实现用带 __call 的表，每次迭代器调用拷贝整个 subject
 /// + 6 次 hash 查找 + 2 次 hash 写入 + 元表链解析）。
-pub fn call_gmatch_iter(
-    state: &mut LuaState,
+pub fn call_gmatch_iter<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     // 从栈位置 a 取出 RustClosure（TFORCALL 传 ra+3，直接调用时传函数位置）
     let rc = match state
         .exec
@@ -3518,12 +3521,12 @@ pub fn call_gmatch_iter(
 // ============================================================================
 
 /// string.upper(s) — 对应 C 的 str_upper
-fn call_str_upper(
-    state: &mut LuaState,
+fn call_str_upper<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let s = get_str_arg(state, a, 0)?;
     let result = str_upper(&s);
     push_results(
@@ -3536,12 +3539,12 @@ fn call_str_upper(
 }
 
 /// string.lower(s) — 对应 C 的 str_lower
-fn call_str_lower(
-    state: &mut LuaState,
+fn call_str_lower<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let s = get_str_arg(state, a, 0)?;
     let result = str_lower(&s);
     push_results(
@@ -3554,12 +3557,12 @@ fn call_str_lower(
 }
 
 /// string.len(s) — 对应 C 的 str_len
-fn call_str_len(
-    state: &mut LuaState,
+fn call_str_len<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let s = get_str_arg(state, a, 0)?;
     let result = str_len(&s);
     push_results(state, a, nresults, vec![TValue::Integer(result)]);
@@ -3567,12 +3570,12 @@ fn call_str_len(
 }
 
 /// string.sub(s, i [, j]) — 对应 C 的 str_sub
-fn call_str_sub(
-    state: &mut LuaState,
+fn call_str_sub<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let s = get_str_arg(state, a, 0)?;
     let start = get_int_arg(state, a, 1, 1, "sub")?;
     let end = get_opt_int_arg(state, a, nargs, 2, -1, "sub")?;
@@ -3587,12 +3590,12 @@ fn call_str_sub(
 }
 
 /// string.reverse(s) — 对应 C 的 str_reverse
-fn call_str_reverse(
-    state: &mut LuaState,
+fn call_str_reverse<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let s = get_str_arg(state, a, 0)?;
     let result = str_reverse(&s);
     push_results(
@@ -3605,12 +3608,12 @@ fn call_str_reverse(
 }
 
 /// string.byte(s [, i [, j]]) — 对应 C 的 str_byte
-fn call_str_byte(
-    state: &mut LuaState,
+fn call_str_byte<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let s = get_str_arg(state, a, 0)?;
     let i = get_opt_int_arg(state, a, nargs, 1, 1, "byte")?;
     let j = get_opt_int_arg(state, a, nargs, 2, i, "byte")?;
@@ -3621,12 +3624,12 @@ fn call_str_byte(
 }
 
 /// string.char(...) — 对应 C 的 str_char
-fn call_str_char(
-    state: &mut LuaState,
+fn call_str_char<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let mut codes = Vec::new();
     for idx in 0..nargs {
         codes.push(get_int_arg(state, a, idx, 0, "char")?);
@@ -3646,12 +3649,12 @@ fn call_str_char(
 }
 
 /// string.rep(s, n [, sep]) — 对应 C 的 str_rep
-fn call_str_rep(
-    state: &mut LuaState,
+fn call_str_rep<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let s = get_str_arg(state, a, 0)?;
     let n = get_int_arg(state, a, 1, 0, "rep")?;
     let sep = if nargs >= 3 {
@@ -3674,12 +3677,12 @@ fn call_str_rep(
 }
 
 /// string.find(s, pattern [, init [, plain]]) — 对应 C 的 str_find
-fn call_str_find(
-    state: &mut LuaState,
+fn call_str_find<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let s_val = get_lstr_arg(state, a, 0)?;
     let s = s_val.as_str();
     // perf: pattern 借用 LuaString 避免拷贝
@@ -3719,12 +3722,12 @@ fn call_str_find(
 }
 
 /// string.format(fmt, ...) — 对应 C 的 str_format
-fn call_str_format(
-    state: &mut LuaState,
+fn call_str_format<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let fmt = get_str_arg(state, a, 0)?;
     // 检查是否有 Table 参数 (需要 __tostring 转换)。
     // constructs.lua 的 string.format args 都是 string/number, 走快速路径避免 clone。
@@ -3810,12 +3813,12 @@ fn call_str_format(
 }
 
 /// string.match(s, pattern [, init]) — 对应 C 的 str_match
-fn call_str_match(
-    state: &mut LuaState,
+fn call_str_match<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     // perf: subject 用 LuaString Rc-clone 避免数 KB 长串的 to_string() 拷贝
     // （match/gsub/find 是模式匹配热点，C 直接传指针）
     let s_val = get_lstr_arg(state, a, 0)?;
@@ -3832,12 +3835,12 @@ fn call_str_match(
 }
 
 /// string.gsub(s, pattern, repl [, max_s]) — 对应 C 的 str_gsub
-fn call_str_gsub(
-    state: &mut LuaState,
+fn call_str_gsub<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let s_val = get_lstr_arg(state, a, 0)?;
     let s = s_val.as_str();
     let pattern = get_str_arg(state, a, 1)?;
@@ -3905,12 +3908,12 @@ fn call_str_gsub(
 ///
 /// 返回 RustClosure 迭代器（upvalues 布局见 [`GMATCH_UP_*`]），
 /// 对应 C 的 lua_pushcclosure(gmatch_aux, 3)（2 个字符串 upvalue + userdata 状态）。
-fn call_str_gmatch(
-    state: &mut LuaState,
+fn call_str_gmatch<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     // 借用栈上的原始 LuaString（s 与 pattern），避免 get_str_arg 的 String 拷贝
     let (s_str, p_str) = {
         let s_val = state
@@ -3972,12 +3975,12 @@ fn call_str_gmatch(
 }
 
 /// string.pack(fmt, ...) — 对应 C 的 str_pack
-fn call_str_pack(
-    state: &mut LuaState,
+fn call_str_pack<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let fmt = get_str_arg(state, a, 0)?;
     // 收集参数 (从索引 1 开始,即第 2 个参数及之后)
     let args: Vec<TValue> = (1..nargs)
@@ -4002,12 +4005,12 @@ fn call_str_pack(
 }
 
 /// string.packsize(fmt) — 对应 C 的 str_packsize
-fn call_str_packsize(
-    state: &mut LuaState,
+fn call_str_packsize<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let fmt = get_str_arg(state, a, 0)?;
     match str_packsize(&fmt) {
         Ok(size) => {
@@ -4019,12 +4022,12 @@ fn call_str_packsize(
 }
 
 /// string.unpack(fmt, data [, pos]) — 对应 C 的 str_unpack
-fn call_str_unpack(
-    state: &mut LuaState,
+fn call_str_unpack<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let fmt = get_str_arg(state, a, 0)?;
     // 获取数据字符串的字节
     let data_bytes = {
@@ -4059,12 +4062,12 @@ fn call_str_unpack(
 /// string.dump(f [, strip]) — 对应 C 的 str_dump
 ///
 /// 将 Lua 函数序列化为二进制格式
-fn call_str_dump(
-    state: &mut LuaState,
+fn call_str_dump<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'dump' (function expected, got no value)".to_string(),
@@ -4204,14 +4207,14 @@ fn set_arith_method(
 }
 
 /// 创建字符串库函数表
-fn create_string_lib_table(state: &LuaState) -> Table {
+fn create_string_lib_table<'a>(state: &LuaState<'a>) -> Table<'a> {
     let lib = Table::new();
     // 注册所有字符串库函数 (使用 BuiltinFn 函数指针)
     // 重要: 必须使用 state.intern_str() 创建键，确保哈希值与后续查找时一致
-    let register = |lib: &Table, name: &'static std::ffi::CStr, func: BuiltinFnPtr| {
-        let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
+    let register = |lib: &Table<'a>, name: &'static std::ffi::CStr, func: BuiltinFnPtr<'a>| {
+        let key = state.intern(name.to_str().unwrap_or(""));
         let name_ptr = name.as_ptr() as *const u8;
-        lib.set(key, TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)));
+        lib.set(key, BuiltinFn::impure_tvalue(func, name_ptr));
     };
     register(&lib, c"upper", call_str_upper);
     register(&lib, c"lower", call_str_lower);
@@ -4253,7 +4256,7 @@ pub fn open_string_lib(state: &mut LuaState) {
 }
 
 #[cfg(test)]
-fn to_num(v: &TValue) -> Option<TValue> {
+fn to_num<'a>(v: &TValue<'a>) -> Option<TValue<'a>> {
     match v {
         TValue::Integer(i) => Some(TValue::Integer(*i)),
         TValue::Float(f) => Some(TValue::Float(*f)),
@@ -4272,12 +4275,12 @@ fn to_num(v: &TValue) -> Option<TValue> {
 }
 
 #[cfg(test)]
-fn arith_op(
-    v1: &TValue,
-    v2: &TValue,
+fn arith_op<'a>(
+    v1: &TValue<'a>,
+    v2: &TValue<'a>,
     int_op: fn(i64, i64) -> Option<i64>,
     float_op: fn(f64, f64) -> f64,
-) -> Option<TValue> {
+) -> Option<TValue<'a>> {
     let n1 = to_num(v1)?;
     let n2 = to_num(v2)?;
     match (&n1, &n2) {
@@ -4923,7 +4926,7 @@ mod tests {
 
     #[test]
     fn test_create_string_metatable() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         assert!(state.dmt.get(LuaType::String).is_none());
         create_string_metatable(&mut state);
         assert!(state.dmt.get(LuaType::String).is_some());
@@ -4931,7 +4934,7 @@ mod tests {
 
     #[test]
     fn test_string_metatable_has_arith_methods() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         create_string_metatable(&mut state);
         let mt = state
             .dmt
@@ -4954,7 +4957,7 @@ mod tests {
 
     #[test]
     fn test_string_metatable_has_index() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         create_string_metatable(&mut state);
         let mt = state
             .dmt
@@ -4970,7 +4973,7 @@ mod tests {
 
     #[test]
     fn test_open_string_lib_registers_global() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         open_string_lib(&mut state);
         let key = TValue::Str(state.intern_str("string"));
         let string_table = state.globals.get(&key);
@@ -4987,7 +4990,7 @@ mod tests {
 
     #[test]
     fn test_open_string_lib_has_all_functions() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         open_string_lib(&mut state);
         let key = TValue::Str(state.intern_str("string"));
         let string_table = state.globals.get(&key).expect("string global must exist");
@@ -5120,15 +5123,12 @@ mod tests {
 
     #[test]
     fn test_call_str_upper() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         // 清空栈 (LuaState::new() 会预置一个 Nil)
         state.exec.stack.clear();
         // 模拟栈: [func, "hello"] (位置 a=0 是函数占位,参数从 a+1 开始)
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state
-            .exec
-            .stack
-            .push(TValue::Str(state.intern_str("hello")));
+        state.exec.stack.push(state.intern("hello"));
         call_str_upper(&mut state, 0, 1, 1).unwrap();
         assert_eq!(state.exec.stack.len(), 1);
         match &state.exec.stack[0] {
@@ -5139,7 +5139,7 @@ mod tests {
 
     #[test]
     fn test_call_str_len() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
         state
@@ -5155,7 +5155,7 @@ mod tests {
 
     #[test]
     fn test_call_str_sub() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
         state
@@ -5173,7 +5173,7 @@ mod tests {
 
     #[test]
     fn test_call_str_reverse() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
         state.exec.stack.push(TValue::Str(state.intern_str("abc")));
@@ -5186,7 +5186,7 @@ mod tests {
 
     #[test]
     fn test_call_str_byte() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
         state.exec.stack.push(TValue::Str(state.intern_str("AB")));
@@ -5206,7 +5206,7 @@ mod tests {
 
     #[test]
     fn test_call_str_char() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
         state.exec.stack.push(TValue::Integer(65));
@@ -5220,7 +5220,7 @@ mod tests {
 
     #[test]
     fn test_call_str_rep() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
         state.exec.stack.push(TValue::Str(state.intern_str("ab")));
@@ -5234,7 +5234,7 @@ mod tests {
 
     #[test]
     fn test_call_str_find() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
         state
@@ -5259,7 +5259,7 @@ mod tests {
 
     #[test]
     fn test_call_str_format() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
         state

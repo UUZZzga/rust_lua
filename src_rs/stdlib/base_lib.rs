@@ -14,11 +14,10 @@
 
 use crate::execute::VmError;
 use crate::gc::GCObjectHeader;
-use crate::objects::{LClosure, NilKind, Proto, TValue, UpVal, UpValRef, UpValVec};
+use crate::objects::{LClosure, NilKind, Proto, TValue, UpVal, UpValVec};
 use crate::state::LuaState;
 use crate::strings::LuaString;
 use crate::table::Table;
-use std::io::Write;
 use std::rc::Rc;
 
 // ============================================================================
@@ -43,7 +42,7 @@ use std::rc::Rc;
 ///
 /// 用于 print 和 tostring 函数。
 /// 注意: 此函数不调用 __tostring 元方法 (简化实现)。
-pub fn lua_value_to_string(v: &TValue) -> String {
+pub fn lua_value_to_string<'a>(v: &TValue<'a>) -> String {
     match v {
         TValue::Nil(_) => "nil".to_string(),
         TValue::Boolean(b) => b.to_string(),
@@ -135,7 +134,7 @@ pub fn b_str2int(s: &str, base: u32) -> Option<i64> {
 // ============================================================================
 
 /// type(v) — 返回类型名字符串 (对应 C 的 luaB_type)
-pub fn base_type_name(v: &TValue) -> &'static str {
+pub fn base_type_name<'a>(v: &TValue<'a>) -> &'static str {
     match v {
         TValue::Nil(_) => "nil",
         TValue::Boolean(_) => "boolean",
@@ -157,7 +156,7 @@ pub fn base_type_name(v: &TValue) -> &'static str {
 ///
 /// 无 base 参数时: 标准转换 (数字直接返回, 字符串解析为整数或浮点)
 /// 有 base 参数时: 按进制解析字符串为整数
-pub fn base_tonumber(v: &TValue, base: Option<i64>) -> Option<TValue> {
+pub fn base_tonumber<'a>(v: &TValue<'a>, base: Option<i64>) -> Option<TValue<'a>> {
     match base {
         None => {
             // 标准转换
@@ -181,12 +180,12 @@ pub fn base_tonumber(v: &TValue, base: Option<i64>) -> Option<TValue> {
 }
 
 /// tostring(v) — 转换为字符串 (对应 C 的 luaB_tostring)
-pub fn base_tostring(v: &TValue) -> String {
+pub fn base_tostring<'a>(v: &TValue<'a>) -> String {
     lua_value_to_string(v)
 }
 
 /// rawequal(v1, v2) — 原始相等比较 (对应 C 的 luaB_rawequal)
-pub fn base_rawequal(v1: &TValue, v2: &TValue) -> bool {
+pub fn base_rawequal<'a>(v1: &TValue<'a>, v2: &TValue<'a>) -> bool {
     match (v1, v2) {
         (TValue::Nil(_), TValue::Nil(_)) => true,
         (TValue::Boolean(a), TValue::Boolean(b)) => a == b,
@@ -206,7 +205,7 @@ pub fn base_rawequal(v1: &TValue, v2: &TValue) -> bool {
 }
 
 /// rawlen(v) — 原始长度 (对应 C 的 luaB_rawlen)
-pub fn base_rawlen(v: &TValue) -> Result<i64, String> {
+pub fn base_rawlen<'a>(v: &TValue<'a>) -> Result<i64, String> {
     match v {
         TValue::Table(t) => Ok(t.len()),
         TValue::Str(s) => Ok(s.len() as i64),
@@ -222,7 +221,7 @@ pub fn base_rawlen(v: &TValue) -> Result<i64, String> {
 /// n == "#": 返回参数总数
 /// n > 0: 返回第 n 个及之后的参数
 /// n < 0: 从末尾计数
-pub fn base_select(n: i64, args: &[TValue]) -> Result<Vec<TValue>, String> {
+pub fn base_select<'a>(n: i64, args: &[TValue<'a>]) -> Result<Vec<TValue<'a>>, String> {
     if n < 0 {
         let idx = (args.len() as i64 + n) as i64;
         if idx < 0 {
@@ -245,7 +244,7 @@ pub fn base_select(n: i64, args: &[TValue]) -> Result<Vec<TValue>, String> {
 ///
 /// v 为真: 返回所有参数
 /// v 为假: 抛出错误 (使用 message 或默认 "assertion failed!")
-pub fn base_assert(args: &[TValue]) -> Result<Vec<TValue>, String> {
+pub fn base_assert<'a>(args: &[TValue<'a>]) -> Result<Vec<TValue<'a>>, String> {
     if args.is_empty() {
         return Err("assertion failed!".to_string());
     }
@@ -266,7 +265,7 @@ pub fn base_assert(args: &[TValue]) -> Result<Vec<TValue>, String> {
 // ============================================================================
 
 /// 从栈中读取参数 (0-based 索引, 相对于函数位置 a)
-fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
+fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
     let stack_idx = a + 1 + idx;
     if stack_idx < state.exec.stack.len() {
         state.exec.stack[stack_idx].clone()
@@ -276,12 +275,12 @@ fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
 }
 
 /// 将结果压入栈并调整栈顶
-fn push_results(state: &mut LuaState, a: usize, nresults: i32, results: Vec<TValue>) {
+fn push_results<'a>(state: &mut LuaState<'a>, a: usize, nresults: i32, results: Vec<TValue<'a>>) {
     state.adjust_results(a, nresults, results);
 }
 
 /// 将单个结果压入栈
-fn push_single_result(state: &mut LuaState, a: usize, nresults: i32, result: TValue) {
+fn push_single_result<'a>(state: &mut LuaState<'a>, a: usize, nresults: i32, result: TValue<'a>) {
     push_results(state, a, nresults, vec![result]);
 }
 
@@ -290,7 +289,12 @@ fn push_single_result(state: &mut LuaState, a: usize, nresults: i32, result: TVa
 // ============================================================================
 
 /// print(...) — 对应 C 的 luaB_print
-fn call_print(state: &mut LuaState, a: usize, nargs: usize, _nresults: i32) -> Result<(), VmError> {
+fn call_print<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    _nresults: i32,
+) -> Result<(), VmError<'a>> {
     let mut s = String::new();
     for i in 0..nargs {
         if i > 0 {
@@ -301,20 +305,20 @@ fn call_print(state: &mut LuaState, a: usize, nargs: usize, _nresults: i32) -> R
     }
     // 体积优先: 用 write_all 替代 writeln! 避免 io::Write::write_fmt 引入 StringError
     s.push('\n');
-    let _ = state.stdout.write_all(s.as_bytes());
-    let _ = state.stdout.flush();
+    let _ = state.io.out(s.as_str());
+    let _ = state.io.out_flush();
     // print 返回 0 个结果
     state.exec.stack.truncate(a);
     Ok(())
 }
 
 /// setmetatable(t, mt) — 对应 C 的 luaB_setmetatable
-fn call_setmetatable(
-    state: &mut LuaState,
+fn call_setmetatable<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let arg2 = get_arg(state, a, 1);
 
     // 检查第二个参数是否为 nil 或表
@@ -385,12 +389,12 @@ fn call_setmetatable(
 }
 
 /// getmetatable(t) — 对应 C 的 luaB_getmetatable
-fn call_getmetatable(
-    state: &mut LuaState,
+fn call_getmetatable<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let arg = get_arg(state, a, 0);
     // 先 intern 字符串, 避免借用冲突
     let metatable_key = TValue::Str(state.intern_str("__metatable"));
@@ -422,7 +426,12 @@ fn call_getmetatable(
 /// 当参数缺失时 lua_type 返回 LUA_TNONE,从而报错;
 /// 显式传入 nil 时返回 LUA_TNIL,正常返回 "nil"。
 /// 这里用 nargs == 0 区分“参数缺失”与“显式 nil”。
-fn call_type(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_type<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'type' (value expected)".to_string(),
@@ -436,12 +445,12 @@ fn call_type(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 }
 
 /// pcall(f, args...) — 对应 C 的 luaB_pcall
-pub(crate) fn call_pcall(
-    state: &mut LuaState,
+pub(crate) fn call_pcall<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let func = get_arg(state, a, 0);
     let pcall_nargs = nargs.saturating_sub(1);
 
@@ -630,7 +639,7 @@ fn get_current_lua_func_position(state: &LuaState) -> String {
 /// C 版本中 C 函数（error/assert/pcall）创建 CallInfo, level=1 跳过当前 C 函数帧。
 /// Rust 版本中 C 函数推入 call_info 但不改变 state.exec.base, 需要检查 call_info
 /// 来正确模拟 C 的 level 语义。
-fn lua_l_where(state: &LuaState, level: usize) -> String {
+fn lua_l_where<'a>(state: &LuaState<'a>, level: usize) -> String {
     if level == 0 {
         return String::new();
     }
@@ -700,7 +709,12 @@ fn lua_l_where(state: &LuaState, level: usize) -> String {
 }
 
 /// error(msg [, level]) — 对应 C 的 luaB_error
-fn call_error(state: &mut LuaState, a: usize, nargs: usize, _nresults: i32) -> Result<(), VmError> {
+fn call_error<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    _nresults: i32,
+) -> Result<(), VmError<'a>> {
     let msg = get_arg(state, a, 0);
     let level = if nargs >= 2 {
         get_arg(state, a, 1).as_integer().unwrap_or(1) as i32
@@ -734,12 +748,12 @@ fn call_error(state: &mut LuaState, a: usize, nargs: usize, _nresults: i32) -> R
 }
 
 /// tonumber(v [, base]) — 对应 C 的 luaB_tonumber
-fn call_tonumber(
-    state: &mut LuaState,
+fn call_tonumber<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     // 对应 C 的 luaL_checkany(L, 1)：必须有一个参数
     if nargs == 0 {
         return Err(VmError::RuntimeError(
@@ -781,12 +795,12 @@ fn call_tonumber(
 }
 
 /// tostring(v) — 对应 C 的 luaB_tostring
-fn call_tostring(
-    state: &mut LuaState,
+fn call_tostring<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     // 对应 C 的 luaL_checkany(L, 1)：必须有一个参数
     if nargs == 0 {
         return Err(VmError::RuntimeError(
@@ -898,7 +912,12 @@ fn call_tostring(
 }
 
 /// assert(v [, message]) — 对应 C 的 luaB_assert
-fn call_assert(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_assert<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     // C 中 luaB_assert 先检查 lua_toboolean(L, 1)，无参数时返回 false 进入 else 分支，
     // 然后 luaL_checkany(L, 1) 触发 "bad argument #1 (value expected)" 错误
     if nargs == 0 {
@@ -930,7 +949,12 @@ fn call_assert(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
 }
 
 /// select(n, ...) — 对应 C 的 luaB_select
-fn call_select(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_select<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'select' (value expected)".to_string(),
@@ -990,12 +1014,12 @@ fn call_select(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
 }
 
 /// rawequal(v1, v2) — 对应 C 的 luaB_rawequal
-fn call_rawequal(
-    state: &mut LuaState,
+fn call_rawequal<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let v1 = get_arg(state, a, 0);
     let v2 = get_arg(state, a, 1);
     let result = base_rawequal(&v1, &v2);
@@ -1004,12 +1028,12 @@ fn call_rawequal(
 }
 
 /// rawlen(v) — 对应 C 的 luaB_rawlen
-fn call_rawlen(
-    state: &mut LuaState,
+fn call_rawlen<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let v = get_arg(state, a, 0);
     match base_rawlen(&v) {
         Ok(len) => {
@@ -1021,12 +1045,12 @@ fn call_rawlen(
 }
 
 /// rawget(t, k) — 对应 C 的 luaB_rawget
-fn call_rawget(
-    state: &mut LuaState,
+fn call_rawget<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let t = get_arg(state, a, 0);
     let k = get_arg(state, a, 1);
     match &t {
@@ -1042,12 +1066,12 @@ fn call_rawget(
 }
 
 /// rawset(t, k, v) — 对应 C 的 luaB_rawset
-fn call_rawset(
-    state: &mut LuaState,
+fn call_rawset<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let k = get_arg(state, a, 1);
     let v = get_arg(state, a, 2);
 
@@ -1084,7 +1108,12 @@ fn call_rawset(
 }
 
 /// next(t [, key]) — 对应 C 的 luaB_next
-fn call_next(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_next<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     let t = get_arg(state, a, 0);
     let key = if nargs >= 2 {
         get_arg(state, a, 1)
@@ -1113,7 +1142,12 @@ fn call_next(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 }
 
 /// ipairs(t) — 对应 C 的 luaB_ipairs
-fn call_ipairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_ipairs<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     if nargs < 1 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'ipairs' (value expected)".to_string(),
@@ -1135,7 +1169,12 @@ fn call_ipairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
 /// 无 __pairs 元方法时: 返回 next, t, nil, nil (第 4 个 nil 是 TBC 占位)
 /// 有 __pairs 元方法时: 调用 __pairs(t) 获取迭代器/state/control/closing
 ///   __pairs 内部可能 yield (对应 C 的 lua_callk + pairscont continuation)
-fn call_pairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_pairs<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     if nargs < 1 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'pairs' (value expected)".to_string(),
@@ -1240,12 +1279,12 @@ fn call_pairs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
 }
 
 /// xpcall(f, err, args...) — 对应 C 的 luaB_xpcall
-pub(crate) fn call_xpcall(
-    state: &mut LuaState,
+pub(crate) fn call_xpcall<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let func = get_arg(state, a, 0);
     let err_fn = get_arg(state, a, 1);
     let xpcall_nargs = nargs.saturating_sub(2);
@@ -1439,7 +1478,12 @@ pub(crate) fn call_xpcall(
 }
 
 /// warn(...) — 对应 C 的 luaB_warn
-fn call_warn(state: &mut LuaState, a: usize, nargs: usize, _nresults: i32) -> Result<(), VmError> {
+fn call_warn<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    _nresults: i32,
+) -> Result<(), VmError<'a>> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'warn' (string expected)".to_string(),
@@ -1475,12 +1519,12 @@ fn call_warn(state: &mut LuaState, a: usize, nargs: usize, _nresults: i32) -> Re
 /// 4. 全局表 _G[modname] — 内置库兼容（Rust 扩展，非 C 标准行为）
 ///
 /// 返回 (module_value, loader_data)，loader_data 通常是文件路径。
-fn call_require(
-    state: &mut LuaState,
+fn call_require<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'require' (string expected, got no value)".to_string(),
@@ -1606,7 +1650,7 @@ fn call_require(
 }
 
 /// 获取 package.preload[modname]
-fn get_preload(state: &LuaState, modname: &str) -> Option<TValue> {
+fn get_preload<'a>(state: &LuaState<'a>, modname: &str) -> Option<TValue<'a>> {
     if let Some(package_table) = get_package_table(state) {
         let preload_key = TValue::Str(state.intern_str("preload"));
         if let Some(TValue::Table(preload_table)) = package_table.get(&preload_key) {
@@ -1622,14 +1666,14 @@ fn get_preload(state: &LuaState, modname: &str) -> Option<TValue> {
 }
 
 /// 调用 loader 函数（preload 或 Lua 文件返回的函数）
-fn run_loader(
-    state: &mut LuaState,
+fn run_loader<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nresults: i32,
     modname: &str,
-    loader: TValue,
+    loader: TValue<'a>,
     loader_data: &str,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let saved_len = state.exec.stack.len();
     state.exec.stack.push(loader);
     state
@@ -1669,13 +1713,13 @@ fn run_loader(
 }
 
 /// 加载并执行 .lua 模块文件
-fn load_lua_module(
-    state: &mut LuaState,
+fn load_lua_module<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nresults: i32,
     modname: &str,
     filepath: &str,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let saved_len = state.exec.stack.len();
     let load_status = state.load_file(Some(filepath));
     if load_status != 0 {
@@ -1760,8 +1804,8 @@ fn load_lua_module(
 /// 模板中 ? 替换为 name。返回 (找到的路径, 错误消息)。
 /// 找到时错误消息为空；未找到时路径为 None，错误消息列出所有尝试的文件。
 /// path 不是字符串时返回 Err（对应 C 的 luaL_error）。
-fn findfile(
-    state: &LuaState,
+fn findfile<'a>(
+    state: &LuaState<'a>,
     name: &str,
     fieldname: &str,
     dirsep: &str,
@@ -1798,7 +1842,11 @@ fn findfile(
 ///
 /// 在 filename 中查找 luaopen_<modname> 函数。
 /// modname 中 `.` → `_`，处理 `-` ignore mark（先试前缀，再试后缀）。
-fn loadfunc(state: &mut LuaState, filename: &str, modname: &str) -> Result<TValue, LoadlibError> {
+fn loadfunc<'a>(
+    state: &mut LuaState<'a>,
+    filename: &str,
+    modname: &str,
+) -> Result<TValue<'a>, LoadlibError> {
     let modname_normalized = modname.replace('.', "_");
     let openfunc = if let Some(dash_pos) = modname_normalized.find('-') {
         let prefix = &modname_normalized[..dash_pos];
@@ -1821,7 +1869,10 @@ fn loadfunc(state: &mut LuaState, filename: &str, modname: &str) -> Result<TValu
 ///
 /// 在 package.cpath 中搜索 .so 文件，调用 luaopen_xxx 函数。
 /// 返回 Ok((loader_func, filepath)) 或 Err(error_message)。
-fn search_c_module(state: &mut LuaState, modname: &str) -> Result<(TValue, String), String> {
+fn search_c_module<'a>(
+    state: &mut LuaState<'a>,
+    modname: &str,
+) -> Result<(TValue<'a>, String), String> {
     let (filename_opt, errmsg) = findfile(state, modname, "cpath", "/", ".")?;
     let filename = match filename_opt {
         Some(f) => f,
@@ -1834,7 +1885,11 @@ fn search_c_module(state: &mut LuaState, modname: &str) -> Result<(TValue, Strin
 /// C root 加载 — 对应 C loadlib.cpp 的 searcher_Croot
 ///
 /// 在已找到的 root 文件中查找 modname 对应的 openfunc。
-fn load_c_root(state: &mut LuaState, filepath: &str, modname: &str) -> Result<TValue, String> {
+fn load_c_root<'a>(
+    state: &mut LuaState<'a>,
+    filepath: &str,
+    modname: &str,
+) -> Result<TValue<'a>, String> {
     match loadfunc(state, filepath, modname) {
         Ok(val) => Ok(val),
         Err(LoadlibError::FuncNotFound) => {
@@ -2004,7 +2059,11 @@ mod win32_dl {
 /// 2. 未加载则 dlopen
 /// 3. sym == "*" 返回 true（仅加载库）
 /// 4. 否则 dlsym 找函数，返回 C 函数
-fn lookforfunc(state: &mut LuaState, path: &str, sym: &str) -> Result<TValue, LoadlibError> {
+fn lookforfunc<'a>(
+    state: &mut LuaState<'a>,
+    path: &str,
+    sym: &str,
+) -> Result<TValue<'a>, LoadlibError> {
     // 检查 CLIBS 缓存
     let clibs_key = TValue::Str(state.intern_str("CLIBS"));
     let clibs_table = match state.registry.get(&clibs_key) {
@@ -2063,12 +2122,12 @@ fn lookforfunc(state: &mut LuaState, path: &str, sym: &str) -> Result<TValue, Lo
 /// init == "*": 仅加载库，返回 true
 /// 否则: dlopen + dlsym，返回 C 函数
 /// 错误: 返回 (nil, errmsg, when) — when 是 "open"（dlopen 失败）或 "init"（dlsym 失败）
-fn call_loadlib(
-    state: &mut LuaState,
+fn call_loadlib<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     if nargs < 2 {
         return Err(VmError::RuntimeError(
             "bad argument to 'loadlib' (needs 2 arguments)".to_string(),
@@ -2133,12 +2192,12 @@ fn call_loadlib(
 ///
 /// 在 path 中搜索 name，返回找到的文件路径。
 /// 失败返回 (nil, errmsg)。
-fn call_searchpath(
-    state: &mut LuaState,
+fn call_searchpath<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     if nargs < 2 {
         return Err(VmError::RuntimeError(
             "bad argument to 'searchpath' (needs at least 2 arguments)".to_string(),
@@ -2215,19 +2274,19 @@ fn call_searchpath(
 /// 当前 call_require 硬编码搜索逻辑,不遍历 package.searchers 表;
 /// 这些 BuiltinFn 仅用于让 searchers 表元素显示为 "function" 类型。
 /// 直接调用会报错（与原 tag 行为一致）。
-fn call_searcher_placeholder(
-    _state: &mut LuaState,
+fn call_searcher_placeholder<'a>(
+    _state: &mut LuaState<'a>,
     _a: usize,
     _nargs: usize,
     _nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     Err(VmError::RuntimeError(
         "package.searchers functions are not directly callable".to_string(),
     ))
 }
 
 /// 缓存模块到 package.loaded[modname]
-fn cache_module_loaded(state: &mut LuaState, modname: &str, val: TValue) {
+fn cache_module_loaded<'a>(state: &mut LuaState<'a>, modname: &str, val: TValue<'a>) {
     let loaded_key = TValue::Str(state.intern_str("loaded"));
     let mod_key = TValue::Str(state.intern_str(modname));
     if let Some(package_table) = get_package_table(state) {
@@ -2243,7 +2302,7 @@ fn cache_module_loaded(state: &mut LuaState, modname: &str, val: TValue) {
 /// 顺序:版本化变量 (envname + "_5_5") → 未版本化变量 → 默认值。
 /// 若 registry 中 LUA_NOENV 为真 (命令行 -E),忽略环境变量直接用默认值。
 /// 路径中的 ";;" 会被替换为默认路径。
-fn setpath(state: &LuaState, envname: &str, dft: &str) -> String {
+fn setpath<'a>(state: &LuaState<'a>, envname: &str, dft: &str) -> String {
     let noenv_key = TValue::Str(state.intern_str("LUA_NOENV"));
     let noenv = matches!(state.registry.get(&noenv_key), Some(TValue::Boolean(true)));
 
@@ -2280,7 +2339,7 @@ fn setpath(state: &LuaState, envname: &str, dft: &str) -> String {
 
 /// 初始化 package 表:设置 path/cpath/loaded/preload/loadlib/searchpath/searchers/config
 /// 对应 C loadlib.cpp 的 luaopen_package
-fn init_package_table(state: &mut LuaState) {
+fn init_package_table<'a>(state: &mut LuaState<'a>) {
     let package_key = TValue::Str(state.intern_str("package"));
     let pkg = Table::new();
     let loaded = Table::new();
@@ -2371,7 +2430,7 @@ fn init_package_table(state: &mut LuaState) {
 ///
 /// Lua 代码可能重置全局 `package = {}`，但 require 内部必须使用注册时的
 /// package 表（含 loaded/preload/searchers/path/cpath），否则会破坏模块加载。
-fn get_package_table(state: &LuaState) -> Option<crate::table::Table> {
+fn get_package_table<'a>(state: &LuaState<'a>) -> Option<crate::table::Table<'a>> {
     let registry_pkg_key = TValue::Str(state.intern_str("_PACKAGE"));
     match state.registry.get(&registry_pkg_key) {
         Some(TValue::Table(t)) => Some(t),
@@ -2395,7 +2454,12 @@ fn get_package_table(state: &LuaState) -> Option<crate::table::Table> {
 ///
 /// 错误处理: 编译失败或 reader 抛错时返回 (nil, error_msg), 不向上抛错
 /// (对应 C 的 load_aux 中 status != LUA_OK 的分支)。
-fn call_load(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_load<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'load' (string expected, got no value)".to_string(),
@@ -2692,7 +2756,12 @@ fn call_load(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 ///   return lua_gettop(L);
 /// }
 /// ```
-fn call_dofile(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_dofile<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     let filename: Option<String> = if nargs > 0 {
         let arg = get_arg(state, a, 0);
         match &arg {
@@ -2770,12 +2839,12 @@ fn call_dofile(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
 ///   }
 /// }
 /// ```
-fn call_loadfile(
-    state: &mut LuaState,
+fn call_loadfile<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     // 获取可选的 filename 参数 (默认 nil → 从 stdin 读取)
     let filename: Option<String> = if nargs >= 1 {
         let arg = get_arg(state, a, 0);
@@ -2928,10 +2997,10 @@ pub fn intern_proto_strings(proto: &mut Proto, state: &LuaState) {
 /// - key 为最后一个 key 时返回 None
 ///
 /// 遍历顺序: 先数组部分 (1, 2, ...), 再哈希部分
-pub fn table_next(
-    table: &crate::table::Table,
-    key: &TValue,
-) -> Result<(Option<TValue>, TValue), &'static str> {
+pub fn table_next<'a>(
+    table: &crate::table::Table<'a>,
+    key: &TValue<'a>,
+) -> Result<(Option<TValue<'a>>, TValue<'a>), &'static str> {
     // 如果 key 是 nil, 从数组部分开始
     if matches!(key, TValue::Nil(_)) {
         return Ok(find_first(table));
@@ -3002,7 +3071,7 @@ pub fn table_next(
 }
 
 /// 查找第一个非空元素 (数组部分)
-fn find_first(table: &crate::table::Table) -> (Option<TValue>, TValue) {
+fn find_first<'a>(table: &crate::table::Table<'a>) -> (Option<TValue<'a>>, TValue<'a>) {
     // 先查找数组部分
     let data = table.data.borrow();
     for (i, v) in data.array.iter().enumerate() {
@@ -3019,7 +3088,7 @@ fn find_first(table: &crate::table::Table) -> (Option<TValue>, TValue) {
 ///
 /// 用 `hash_buckets` 顺序遍历 + `hash.get(k)` 检查 live — 对应 C `luaH_next` 的
 /// hash 部分扫描，但 Rust 用插入顺序而非 hash bucket 顺序。
-fn find_first_hash(table: &crate::table::Table) -> (Option<TValue>, TValue) {
+fn find_first_hash<'a>(table: &crate::table::Table<'a>) -> (Option<TValue<'a>>, TValue<'a>) {
     let data = table.data.borrow();
     for (k, v) in &data.hash_buckets {
         if !matches!(v, TValue::Nil(NilKind::Empty)) {
@@ -3034,7 +3103,10 @@ fn find_first_hash(table: &crate::table::Table) -> (Option<TValue>, TValue) {
 /// 用 `idx_get(key)` O(1) 定位 prev 的位置，然后线性扫描
 /// `hash_buckets[idx+1..]` 找下一个 live entry — 对应 C 的 findindex O(1)
 /// (C 用 hash→mainposition→chain 定位 node index)。
-fn find_next_hash(table: &crate::table::Table, key: &TValue) -> (Option<TValue>, TValue) {
+fn find_next_hash<'a>(
+    table: &crate::table::Table<'a>,
+    key: &TValue<'a>,
+) -> (Option<TValue<'a>>, TValue<'a>) {
     let data = table.data.borrow();
     let start_idx = match data.idx_get(key) {
         Some(i) => i + 1,
@@ -3050,12 +3122,12 @@ fn find_next_hash(table: &crate::table::Table, key: &TValue) -> (Option<TValue>,
 ///
 /// 参数: state=t, control=i
 /// 返回: i+1, t[i+1] (如果 t[i+1] 不为 nil)
-pub fn call_ipairs_aux(
-    state: &mut LuaState,
+pub fn call_ipairs_aux<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let t = get_arg(state, a, 0);
     let i = get_arg(state, a, 1);
     let i = match &i {
@@ -3091,12 +3163,12 @@ pub fn call_ipairs_aux(
 ///
 /// 参数: state=t, control=key
 /// 返回: next_key, next_value (如果到达末尾则返回 nil)
-pub fn call_next_iter(
-    state: &mut LuaState,
+pub fn call_next_iter<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     call_next(state, a, nargs, nresults)
 }
 
@@ -3112,12 +3184,12 @@ pub fn call_next_iter(
 /// - "isrunning": 返回 GC 是否运行
 /// - "generational"/"incremental": 切换模式, 返回之前的模式字符串
 /// - "param": 查询/设置 GC 参数 (简化, 返回 0)
-fn call_collectgarbage(
-    state: &mut LuaState,
+fn call_collectgarbage<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let opt = if nargs >= 1 {
         match get_arg(state, a, 0) {
             TValue::Str(s) => s.as_str().to_string(),
@@ -3262,20 +3334,20 @@ fn call_collectgarbage(
 /// 对应 C 源码 lbaselib.cpp 的 luaopen_base 函数:
 /// 1. 注册所有基础函数到全局表 (使用 BuiltinFn 函数指针)
 /// 2. 设置 _G 和 _VERSION
-pub fn open_base_lib(state: &mut LuaState) {
+pub fn open_base_lib<'a>(state: &mut LuaState<'a>) {
     // 注册所有基础库函数 (使用 BuiltinFn 函数指针)
     //
     // 安全: 必须经 BuiltinFn::impure 构造 — 原始字面量会把 CStr 打包地址的
     // 低位泄漏进 purity 标志位 (CStr 静态字面量仅 1 字节对齐, 地址可奇可偶),
     // 导致 print/pcall 等按地址随机被判定为 pure, 丢失 CallInfoEntry 调试信息。
-    let register = |state: &mut LuaState,
+    let register = |state: &mut LuaState<'a>,
                     name: &'static std::ffi::CStr,
-                    func: crate::objects::BuiltinFnPtr| {
-        let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
+                    func: crate::objects::BuiltinFnPtr<'a>| {
+        let key = state.intern(name.to_str().unwrap_or(""));
         let name_ptr = name.as_ptr() as *const u8;
         state.globals.set(
             key,
-            TValue::BuiltinFn(crate::objects::BuiltinFn::impure(func, name_ptr)),
+            crate::objects::BuiltinFn::impure_tvalue(func, name_ptr),
         );
     };
 
@@ -3341,7 +3413,7 @@ pub fn open_base_lib(state: &mut LuaState) {
 mod tests {
     use super::*;
 
-    fn make_str(s: &str) -> TValue {
+    fn make_str(s: &str) -> TValue<'_> {
         TValue::Str(crate::strings::LuaString::Short(
             crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
@@ -3438,12 +3510,12 @@ mod tests {
     /// 验证 BuiltinFn 被正确识别为 function
     #[test]
     fn test_builtin_fn_type_recognition() {
-        fn dummy_fn(
-            _state: &mut crate::state::LuaState,
+        fn dummy_fn<'a>(
+            _state: &mut crate::state::LuaState<'a>,
             _a: usize,
             _nargs: usize,
             _nresults: i32,
-        ) -> Result<(), crate::execute::VmError> {
+        ) -> Result<(), crate::execute::VmError<'a>> {
             Ok(())
         }
 
@@ -3694,7 +3766,7 @@ mod tests {
 
     #[test]
     fn test_open_base_lib_registers_functions() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         open_base_lib(&mut state);
 
         // 验证所有基础库函数注册为 BuiltinFn
@@ -3737,7 +3809,7 @@ mod tests {
 
     #[test]
     fn test_open_base_lib_registers_version() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         open_base_lib(&mut state);
         let key = TValue::Str(state.intern_str("_VERSION"));
         let val = state.globals.get(&key);
@@ -3749,7 +3821,7 @@ mod tests {
 
     #[test]
     fn test_open_base_lib_registers_g() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         open_base_lib(&mut state);
         let key = TValue::Str(state.intern_str("_G"));
         let val = state.globals.get(&key);
@@ -3762,7 +3834,7 @@ mod tests {
     // ========================================================================
 
     /// 辅助：构造一个占位 BuiltinFn 作为栈上的 "函数" 位置
-    fn placeholder_builtin() -> TValue {
+    fn placeholder_builtin<'a>() -> TValue<'a> {
         TValue::BuiltinFn(crate::objects::BuiltinFn::impure(
             call_searcher_placeholder,
             c"placeholder".as_ptr() as *const u8,
@@ -3771,7 +3843,7 @@ mod tests {
 
     #[test]
     fn test_call_type() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(placeholder_builtin());
         state.exec.stack.push(TValue::Integer(42));
@@ -3785,7 +3857,7 @@ mod tests {
 
     #[test]
     fn test_call_tonumber() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(placeholder_builtin());
         state.exec.stack.push(TValue::Str(state.intern_str("42")));
@@ -3798,7 +3870,7 @@ mod tests {
 
     #[test]
     fn test_call_tostring() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(placeholder_builtin());
         state.exec.stack.push(TValue::Integer(42));
@@ -3811,7 +3883,7 @@ mod tests {
 
     #[test]
     fn test_call_rawequal() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(placeholder_builtin());
         state.exec.stack.push(TValue::Integer(42));
@@ -3825,7 +3897,7 @@ mod tests {
 
     #[test]
     fn test_call_rawlen() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(placeholder_builtin());
         state
@@ -3841,7 +3913,7 @@ mod tests {
 
     #[test]
     fn test_call_rawget() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         let t = Table::new();
         t.set(TValue::Integer(1), TValue::Integer(100));
@@ -3857,7 +3929,7 @@ mod tests {
 
     #[test]
     fn test_call_rawset() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         let t = Table::new();
         state.exec.stack.push(placeholder_builtin());
@@ -3876,7 +3948,7 @@ mod tests {
 
     #[test]
     fn test_call_select_hash() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(placeholder_builtin());
         state.exec.stack.push(TValue::Str(state.intern_str("#")));
@@ -3892,7 +3964,7 @@ mod tests {
 
     #[test]
     fn test_call_select_index() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(placeholder_builtin());
         state.exec.stack.push(TValue::Integer(2));
@@ -3913,7 +3985,7 @@ mod tests {
 
     #[test]
     fn test_call_assert_true() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(placeholder_builtin());
         state.exec.stack.push(TValue::Boolean(true));
@@ -3927,7 +3999,7 @@ mod tests {
 
     #[test]
     fn test_call_assert_false() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(placeholder_builtin());
         state.exec.stack.push(TValue::Boolean(false));
@@ -3937,7 +4009,7 @@ mod tests {
 
     #[test]
     fn test_call_error() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(placeholder_builtin());
         state
@@ -3954,7 +4026,7 @@ mod tests {
 
     #[test]
     fn test_call_setmetatable() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         let t = Table::new();
         let mt = Table::new();
@@ -3970,7 +4042,7 @@ mod tests {
 
     #[test]
     fn test_call_getmetatable() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         let t = Table::new();
         t.set_metatable(Some(Table::new()));
@@ -3985,7 +4057,7 @@ mod tests {
 
     #[test]
     fn test_call_getmetatable_no_mt() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         let t = Table::new();
         state.exec.stack.push(placeholder_builtin());
@@ -4001,7 +4073,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn test_call_ipairs() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         let t = Table::new();
         t.set(TValue::Integer(1), TValue::Integer(10));
@@ -4033,7 +4105,7 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn test_call_pairs() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         let t = Table::new();
         state.exec.stack.push(placeholder_builtin());
@@ -4053,7 +4125,7 @@ mod tests {
 
     #[test]
     fn test_call_ipairs_aux() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         let t = Table::new();
         t.set(TValue::Integer(1), TValue::Integer(10));
@@ -4075,7 +4147,7 @@ mod tests {
 
     #[test]
     fn test_call_ipairs_aux_end() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         let t = Table::new();
         state.exec.stack.push(placeholder_builtin());

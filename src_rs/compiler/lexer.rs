@@ -311,8 +311,8 @@ pub fn format_chunk_id(chunk_name: &str) -> String {
     }
 }
 
-pub struct LexState<'a> {
-    pub state: &'a mut LuaState,
+pub struct LexState<'a, 'b> {
+    pub state: &'a mut LuaState<'b>,
     pub source: &'a str,
     pub chunk_name: &'a str,
     pub pos: usize,
@@ -346,8 +346,8 @@ pub struct LexState<'a> {
     /// 供下一次编译复用,避免每次编译时重新分配堆内存。
     _cache: Option<Box<CompilerCache>>,
 }
-impl<'a> LexState<'a> {
-    pub fn new(state: &'a mut LuaState, source: &'a str, chunk_name: &'a str) -> Self {
+impl<'a, 'b> LexState<'a, 'b> {
+    pub fn new(state: &'a mut LuaState<'b>, source: &'a str, chunk_name: &'a str) -> Self {
         // 从线程局部缓存中获取可重用的内部缓冲,避免每次编译时重新分配堆内存。
         let (errors, scanner_strings, token_text, cache_holder) = COMPILER_CACHE.with(|c| {
             let mut cell = c.borrow_mut();
@@ -389,7 +389,7 @@ impl<'a> LexState<'a> {
         if let Some(ref k) = self.cached_env {
             return k.clone();
         }
-        let k = self.state.intern("_ENV");
+        let k = self.state.intern_str("_ENV");
         self.cached_env = Some(k.clone());
         k
     }
@@ -1315,7 +1315,7 @@ impl<'a> LexState<'a> {
     }
 }
 
-impl<'a> Drop for LexState<'a> {
+impl<'a, 'b> Drop for LexState<'a, 'b> {
     /// 将内部缓冲 (`errors`、`scanner_strings`、`token_text`) 回收到线程局部缓存,
     /// 供下一次编译复用。避免 glibc 因频繁分配／释放小对象产生的堆碎片和页缓存膨胀。
     fn drop(&mut self) {

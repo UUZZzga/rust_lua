@@ -142,9 +142,9 @@ pub type FxBuildHasher = std::collections::hash_map::RandomState;
 // Table 哈希表类型别名
 // ============================================================================
 #[cfg(not(size_optimized))]
-pub type TableHashMap<V> = hashbrown::HashMap<TValue, V, FxBuildHasher>;
+pub type TableHashMap<'a, V> = hashbrown::HashMap<TValue<'a>, V, FxBuildHasher>;
 #[cfg(size_optimized)]
-pub type TableHashMap<V> = std::collections::HashMap<TValue, V, FxBuildHasher>;
+pub type TableHashMap<'a, V> = std::collections::HashMap<TValue<'a>, V, FxBuildHasher>;
 
 // ============================================================================
 // Table 哈希索引 — hashbrown::HashTable<(TValue, usize)>
@@ -157,9 +157,9 @@ pub type TableHashMap<V> = std::collections::HashMap<TValue, V, FxBuildHasher>;
 /// 单跳定位（对应 C Lua Node 的 main position 比较模式），省去 HashMap
 /// 每次 get 的 BuildHasher 调用链与 Result/Eq 适配层。
 #[cfg(not(size_optimized))]
-pub type TableHashIndex = hashbrown::HashTable<(TValue, usize)>;
+pub type TableHashIndex<'a> = hashbrown::HashTable<(TValue<'a>, usize)>;
 #[cfg(size_optimized)]
-pub type TableHashIndex = TableHashMap<usize>;
+pub type TableHashIndex<'_> = TableHashMap<usize>;
 
 /// 计算 TValue 的 FxHash 哈希 — 与 impl Hash for TValue + FxBuildHasher 一致。
 ///
@@ -224,7 +224,7 @@ pub fn tvalue_fx_hash(v: &TValue) -> u64 {
 
 /// 共享上值引用 —— 多个闭包可以共享同一个 UpVal（对应 C 中 UpVal 是堆分配对象）。
 /// 当 Open 上值被关闭时，所有持有该引用的闭包都能看到 Closed 状态。
-pub type UpValRef = Rc<RefCell<UpVal>>;
+pub type UpValRef<'a> = Rc<RefCell<UpVal<'a>>>;
 
 /// Lua 类型标签 —— 使用 Rust enum 替代 C 的整数常量 + 位掩码
 ///
@@ -321,8 +321,8 @@ impl fmt::Display for LuaType {
 /// - `Err(other)`: 运行时错误
 ///
 /// 对应 C 的 `lua_CFunction`，但更适合 Rust 用户使用。
-pub type BuiltinFnPtr =
-    fn(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError>;
+pub type BuiltinFnPtr<'a> =
+    fn(state: &mut LuaState<'a>, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError<'a>>;
 
 /// Rust 原生内置函数
 ///
@@ -351,7 +351,7 @@ pub type BuiltinFnPtr =
 /// When: 用 `TValue::BuiltinFn(BuiltinFn { func, name })` 注册到表中
 /// Then: Lua 代码调用该函数时，VM 直接通过函数指针调用，无需 tag 派发
 #[derive(Clone, Copy)]
-pub struct BuiltinFn {
+pub struct BuiltinFn<'a> {
     /// 编码后的函数指针 — bit0 = pure 标志 (1: 纯函数), bit1.. = 真实函数地址。
     ///
     /// 函数指针按机器字长对齐 (≥2), bit0 恒 0 可安全借用。pure 标志内嵌
@@ -361,10 +361,10 @@ pub struct BuiltinFn {
     ///
     /// 任何调用/比较该指针的位置必须经 call_target()/raw_func() 解码。
     /// name 登记表 (builtin_names) 用解码后的原始指针, 与 impure 注册一致。
-    pub func: BuiltinFnPtr,
+    pub func: BuiltinFnPtr<'a>,
 }
 
-impl BuiltinFn {
+impl<'a> BuiltinFn<'a> {
     /// bit0 掩码 — pure 标志位
     const PURE_BIT: usize = 1;
 
@@ -372,37 +372,47 @@ impl BuiltinFn {
     ///
     /// name 不存储在结构体内（为压缩 TValue 到 16 字节）：注册时登记到
     /// 全局 BUILTIN_NAMES 表（func 指针 → NUL 终止名字），traceback 冷路径查表。
-    pub fn impure(func: BuiltinFnPtr, name: *const u8) -> Self {
+    pub fn impure(func: BuiltinFnPtr<'a>, name: *const u8) -> Self {
         builtin_names::register(func, name);
         Self { func }
+    }
+
+    /// 构造 BuiltinFn 并返回 TValue 包装
+    pub fn impure_tvalue(func: BuiltinFnPtr<'a>, name: *const u8) -> TValue<'a> {
+        TValue::BuiltinFn(Self::impure(func, name))
     }
 
     /// 纯函数 BuiltinFn 构造 — 不回调 Lua / 不 yield / 错误只返回 Err。
     /// 数学库等纯函数注册用此构造; op_call 见 pure 位 (func bit0) 直接走
     /// 零簿记快速路径 (跳过 CallInfoEntry push/pop + name_str strlen)。
-    pub fn pure_fn(func: BuiltinFnPtr, name: *const u8) -> Self {
+    pub fn pure_fn(func: BuiltinFnPtr<'a>, name: *const u8) -> Self {
         builtin_names::register(func, name);
         Self {
             func: Self::encode_pure(func),
         }
     }
 
+    /// 构造 BuiltinFn 并返回 TValue 包装
+    pub fn pure_fn_tvalue(func: BuiltinFnPtr<'a>, name: *const u8) -> TValue<'a> {
+        TValue::BuiltinFn(Self::pure_fn(func, name))
+    }
+
     /// 编码: 原始函数指针 | PURE_BIT
-    fn encode_pure(func: BuiltinFnPtr) -> BuiltinFnPtr {
+    fn encode_pure(func: BuiltinFnPtr<'a>) -> BuiltinFnPtr<'a> {
         // SAFETY: 函数指针对齐 >= 2, bit0 恒 0, | 1 不改变高位地址
         unsafe { std::mem::transmute::<usize, BuiltinFnPtr>(func as usize | Self::PURE_BIT) }
     }
 
     /// 解码: 剥离 pure 位得到可调用函数指针
     #[inline]
-    pub fn call_target(&self) -> BuiltinFnPtr {
+    pub fn call_target(&self) -> BuiltinFnPtr<'a> {
         // SAFETY: bit0 是自设标志位, 剥离后恢复原始函数指针
         unsafe { std::mem::transmute::<usize, BuiltinFnPtr>(self.func as usize & !Self::PURE_BIT) }
     }
 
     /// 解码后的原始函数指针 (比较/查表用, 与注册时的指针一致)
     #[inline]
-    pub fn raw_func(&self) -> BuiltinFnPtr {
+    pub fn raw_func(&self) -> BuiltinFnPtr<'a> {
         self.call_target()
     }
 
@@ -420,7 +430,7 @@ impl BuiltinFn {
     }
 }
 
-impl std::fmt::Debug for BuiltinFn {
+impl<'a> std::fmt::Debug for BuiltinFn<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BuiltinFn")
             .field("name", &self.name_str())
@@ -518,16 +528,16 @@ mod builtin_names {
 /// When: 用 `TValue::RustClosure(Rc::new(RustClosure { func, name, upvalues }))` 注册
 /// Then: Lua 代码调用时，VM 直接通过函数指针调用，从 upvalues 取状态
 #[derive(Clone)]
-pub struct RustClosure {
+pub struct RustClosure<'a> {
     /// 函数指针 — 签名与 BuiltinFnPtr 相同
-    pub func: BuiltinFnPtr,
+    pub func: BuiltinFnPtr<'a>,
     /// 函数名（NUL 终止 C 字符串，用于 traceback）
     pub name: *const u8,
     /// 上值列表 — 可变，存储 coroutine.wrap 的 Thread 或 io.lines 的文件/格式
-    pub upvalues: Rc<RefCell<Vec<TValue>>>,
+    pub upvalues: Rc<RefCell<Vec<TValue<'a>>>>,
 }
 
-impl std::fmt::Debug for RustClosure {
+impl<'a> std::fmt::Debug for RustClosure<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = unsafe {
             if self.name.is_null() {
@@ -546,7 +556,7 @@ impl std::fmt::Debug for RustClosure {
     }
 }
 
-impl RustClosure {
+impl<'a> RustClosure<'a> {
     /// 获取函数名的 &str
     pub fn name_str(&self) -> &'static str {
         if self.name.is_null() {
@@ -589,7 +599,7 @@ impl RustClosure {
 /// Then: 返回正确的 LuaType
 #[derive(Clone)]
 #[cfg_attr(not(size_optimized), derive(Debug))]
-pub enum TValue {
+pub enum TValue<'a> {
     /// nil 值，带子变体（标准 nil / 空槽 / 缺键）
     Nil(NilKind),
     /// 布尔值
@@ -607,31 +617,31 @@ pub enum TValue {
     /// 字符串（短字符串和长字符串）
     Str(LuaString),
     /// 表
-    Table(Table),
+    Table(Table<'a>),
     /// Lua 闭包
     /// 使用 Rc 而非 Box：clone 时仅增加引用计数（O(1)），不触发 malloc/free。
     /// Box<LClosure> 的 clone 需要 Box::new(LClosure::clone()) 即 malloc+memcpy，
     /// 在高频栈操作（OP_MOVE/OP_CALL 等）中是性能瓶颈。
     /// Rc 与 Box 一样支持 niche 优化（NonNull），TValue 大小保持 16 字节不变。
-    LClosure(Rc<LClosure>),
+    LClosure(Rc<LClosure<'a>>),
     /// C 闭包（同理用 Rc）
-    CClosure(Rc<CClosure>),
+    CClosure(Rc<CClosure<'a>>),
     /// 轻量 C 函数
     LCFn(LCFunction),
     /// Rust 原生内置函数（函数指针 + 静态名）
     ///
     /// 用于注册 Rust 实现的内置函数。调用时直接通过函数指针派发，
     /// 无需 tag 范围匹配。详见 `BuiltinFn` 类型文档。
-    BuiltinFn(BuiltinFn),
+    BuiltinFn(BuiltinFn<'a>),
     /// Rust 闭包（函数指针 + 可变 upvalues）
     ///
     /// 用于 coroutine.wrap 和 io.lines 等需要携带状态的内置函数。
     /// 详见 `RustClosure` 类型文档。
-    RustClosure(Rc<RustClosure>),
+    RustClosure(Rc<RustClosure<'a>>),
     /// 用户数据（同理用 Rc）
-    UserData(Rc<Udata>),
+    UserData(Rc<Udata<'a>>),
     /// 线程/协程（同理用 Rc）
-    Thread(Rc<LuaThread>),
+    Thread(Rc<LuaThread<'a>>),
 }
 
 /// nil 的子变体 —— 用 enum 替代 C 的 variant bit
@@ -652,7 +662,7 @@ pub enum NilKind {
     NotTable,
 }
 
-impl TValue {
+impl<'a> TValue<'a> {
     /// 获取 TValue 的 LuaType
     ///
     /// Scenario: 查询值的类型
@@ -863,13 +873,13 @@ impl TValue {
     }
 }
 
-impl Default for TValue {
+impl<'a> Default for TValue<'a> {
     fn default() -> Self {
         TValue::Nil(NilKind::Strict)
     }
 }
 
-impl PartialEq for TValue {
+impl<'a> PartialEq for TValue<'a> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (TValue::Nil(a), TValue::Nil(b)) => a == b,
@@ -913,9 +923,9 @@ impl PartialEq for TValue {
     }
 }
 
-impl Eq for TValue {}
+impl<'a> Eq for TValue<'a> {}
 
-impl Hash for TValue {
+impl<'a> Hash for TValue<'a> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         match self {
             TValue::Nil(kind) => {
@@ -996,7 +1006,7 @@ impl Hash for TValue {
 }
 
 // TValue 的 Display 实现用于调试输出
-impl fmt::Display for TValue {
+impl<'a> fmt::Display for TValue<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TValue::Nil(NilKind::Strict) => write!(f, "nil"),
@@ -1043,7 +1053,7 @@ impl fmt::Display for TValue {
 // size_optimized 模式: 手动实现 Debug 避免 f64::fmt 引入 flt2dec 代码 (~2.8KB)
 // 同时避免 debug_tuple+field 格式化字符串 (会引入 core::unicode 转义表 ~4KB)
 #[cfg(size_optimized)]
-impl fmt::Debug for TValue {
+impl<'a> fmt::Debug for TValue<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             TValue::Nil(n) => write!(f, "Nil({:?})", n),
@@ -1095,26 +1105,26 @@ pub struct LCFunction {
 /// 将数据分离到 `TableData` 中，使得 `Table` 的克隆（仅克隆 `Rc`）共享同一份数据。
 /// 这解决了 `_ENV` upvalue 与 `state.globals` 不同步的问题：
 /// 克隆后的 Table 仍然指向同一份数据，修改对两者都可见。
-pub struct TableData {
+pub struct TableData<'a> {
     pub gc_header: GCObjectHeader,
     /// 数组部分（1-based，索引 0 对应键 1）
-    pub array: Vec<TValue>,
+    pub array: Vec<TValue<'a>>,
     /// 哈希部分：(key, value) 对 — 保持插入顺序用于 next() 遍历与 GC 标记
-    pub hash_buckets: Vec<(TValue, TValue)>,
+    pub hash_buckets: Vec<(TValue<'a>, TValue<'a>)>,
     /// `key → hash_buckets index` 索引 — 让 get / set / next 能 O(1) 定位。
     /// TableHashIndex = HashTable<(TValue, usize)>: 开放寻址 + 预计算哈希 +
     /// eq 直接比较条目内 key 克隆，单跳定位（同 C Lua Node main position）。
     /// Option<Box<…>> 使空表不浪费结构体内存
-    pub key_to_bucket: Option<Box<TableHashIndex>>,
+    pub key_to_bucket: Option<Box<TableHashIndex<'a>>>,
     /// 元表
-    pub metatable: Option<Box<Table>>,
+    pub metatable: Option<Box<Table<'a>>>,
 }
 
-impl TableData {
+impl<'a> TableData<'a> {
     /// 索引查找 — O(1) 返回 key 所在的 hash_buckets 下标
     #[cfg(not(size_optimized))]
     #[cfg_attr(not(size_optimized), inline)]
-    pub fn idx_get(&self, key: &TValue) -> Option<usize> {
+    pub fn idx_get(&self, key: &TValue<'a>) -> Option<usize> {
         let ktb = self.key_to_bucket.as_ref()?;
         let hash = tvalue_fx_hash(key);
         ktb.find(hash, |(k, _)| k == key).map(|(_, idx)| *idx)
@@ -1123,7 +1133,7 @@ impl TableData {
     /// 索引插入 — key 必须不存在（insert_unique 不检查重复）
     #[cfg(not(size_optimized))]
     #[cfg_attr(not(size_optimized), inline)]
-    pub fn idx_insert(&mut self, key: &TValue, idx: usize) {
+    pub fn idx_insert(&mut self, key: &TValue<'a>, idx: usize) {
         let ktb = self
             .key_to_bucket
             .get_or_insert_with(|| Box::new(hashbrown::HashTable::default()));
@@ -1134,7 +1144,7 @@ impl TableData {
     /// 索引删除 — 返回被删 key 的 bucket 下标
     #[cfg(not(size_optimized))]
     #[cfg_attr(not(size_optimized), inline)]
-    pub fn idx_remove(&mut self, key: &TValue) -> Option<usize> {
+    pub fn idx_remove(&mut self, key: &TValue<'a>) -> Option<usize> {
         let ktb = self.key_to_bucket.as_mut()?;
         let hash = tvalue_fx_hash(key);
         ktb.find_entry(hash, |(k, _)| k == key).ok().map(|entry| {
@@ -1145,12 +1155,12 @@ impl TableData {
 
     // size_optimized 回退: TableHashMap<usize> (std HashMap) — 走其原生 API
     #[cfg(size_optimized)]
-    pub fn idx_get(&self, key: &TValue) -> Option<usize> {
+    pub fn idx_get(&self, key: &TValue<'a>) -> Option<usize> {
         self.key_to_bucket.as_ref()?.get(key).copied()
     }
 
     #[cfg(size_optimized)]
-    pub fn idx_insert(&mut self, key: &TValue, idx: usize) {
+    pub fn idx_insert(&mut self, key: &TValue<'a>, idx: usize) {
         self.key_to_bucket
             .get_or_insert_with(|| {
                 Box::new(crate::objects::TableHashMap::with_hasher(
@@ -1161,12 +1171,12 @@ impl TableData {
     }
 
     #[cfg(size_optimized)]
-    pub fn idx_remove(&mut self, key: &TValue) -> Option<usize> {
+    pub fn idx_remove(&mut self, key: &TValue<'a>) -> Option<usize> {
         self.key_to_bucket.as_mut()?.remove(key)
     }
 }
 
-impl Drop for TableData {
+impl<'a> Drop for TableData<'a> {
     /// 迭代式释放，避免长链表等递归结构导致栈溢出。
     ///
     /// 编译器自动生成的 Drop 会递归释放 array/hash_buckets 中的 TValue::Table，
@@ -1177,14 +1187,14 @@ impl Drop for TableData {
     /// - 独占引用（Rc::strong_count == 1）：取出 TableData 并继续收集子 Table
     /// - 共享引用：减少 Rc 引用计数，由其他持有者负责释放
     fn drop(&mut self) {
-        fn extract(v: TValue, pending: &mut Vec<Table>) {
+        fn extract<'a>(v: TValue<'a>, pending: &mut Vec<Table<'a>>) {
             if let TValue::Table(t) = v {
                 pending.push(t);
             }
         }
 
         // 取走所有字段，避免编译器自动生成的 Drop 递归处理
-        let mut pending: Vec<Table> = Vec::new();
+        let mut pending: Vec<Table<'a>> = Vec::new();
 
         for v in self.array.drain(..) {
             extract(v, &mut pending);
@@ -1234,12 +1244,12 @@ impl Drop for TableData {
 /// `gc_header` 保留在 `Table` 上（不在 `TableData` 中），因为 `ptr_id` 需要在克隆时保持一致。
 ///
 /// 方法实现见 [crate::table]。
-pub struct Table {
+pub struct Table<'a> {
     /// 共享数据 —— 克隆 Table 时仅增加 Rc 引用计数
-    pub data: Rc<RefCell<TableData>>,
+    pub data: Rc<RefCell<TableData<'a>>>,
 }
 
-impl Clone for Table {
+impl<'a> Clone for Table<'a> {
     /// 克隆 Table：仅克隆 `Rc`（共享数据），并克隆 `gc_header`（保持同一 `ptr_id`）。
     fn clone(&self) -> Self {
         Table {
@@ -1248,7 +1258,7 @@ impl Clone for Table {
     }
 }
 
-impl fmt::Debug for Table {
+impl<'a> fmt::Debug for Table<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Table")
             .field("ptr_id", &self.data.borrow().gc_header.ptr_id)
@@ -1256,7 +1266,7 @@ impl fmt::Debug for Table {
     }
 }
 
-impl Default for Table {
+impl<'a> Default for Table<'a> {
     fn default() -> Self {
         Table {
             data: Rc::new(RefCell::new(TableData {
@@ -1281,16 +1291,16 @@ impl Default for Table {
 /// When: 构造 LClosure
 /// Then: nupvalues = 3, p 指向该 Proto
 #[derive(Debug, Clone)]
-pub struct LClosure {
+pub struct LClosure<'a> {
     pub gc_header: GCObjectHeader,
     /// 函数原型（Rc 共享，clone 为 O(1)，避免每次 OP_CALL 深拷贝整个 Proto）
-    pub proto: Rc<Proto>,
+    pub proto: Rc<Proto<'a>>,
     /// 上值列表（共享引用，多个闭包可共享同一个 UpVal）。
     ///
     /// 使用 Rc<RefCell<Vec>> 包装，使 LClosure clone 时所有副本共享同一个 upvals Vec。
     /// 这样 debug.upvaluejoin 修改栈上副本的 upvals 会影响所有共享同一 Rc 的闭包
     /// （对应 C 中 Closure 是堆分配对象、栈上存 Closure* 指针的语义）。
-    pub upvals: Rc<RefCell<UpValVec>>,
+    pub upvals: Rc<RefCell<UpValVec<'a>>>,
 }
 
 /// C 闭包 —— C 函数 + 捕获的上值
@@ -1300,14 +1310,14 @@ pub struct LClosure {
 /// When: 构造 CClosure
 /// Then: f 指向该函数，upvalue 有 2 个元素
 #[derive(Debug, Clone)]
-pub struct CClosure {
+pub struct CClosure<'a> {
     /// C 函数指针
     pub f: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
     /// 上值列表
-    pub upvalue: Vec<TValue>,
+    pub upvalue: Vec<TValue<'a>>,
 }
 
-impl LClosure {
+impl<'a> LClosure<'a> {
     /// 估算 LClosure 真实堆占用（用于 GC 内存计费）。
     /// LClosure 通过 register_object 注册，但 size_of::<LClosure>() 不含 upvals 容量。
     /// Proto 由 gc_extra_estimate 单独跟踪（共享，避免重复计费）。
@@ -1320,7 +1330,7 @@ impl LClosure {
     }
 }
 
-impl CClosure {
+impl<'a> CClosure<'a> {
     /// 估算 CClosure 真实堆占用（用于 GC 内存计费）。
     /// CClosure 不调用 register_object（无 gc_header），由 gc_extra_estimate 跟踪。
     pub fn gc_mem_size(&self) -> usize {
@@ -1348,7 +1358,7 @@ impl CClosure {
 /// When: 读取上值
 /// Then: 返回 TValue::Integer(42)
 #[derive(Debug, Clone)]
-pub enum UpVal {
+pub enum UpVal<'a> {
     /// 打开的上值（指向栈上的活跃变量）
     Open {
         /// 栈上位置索引
@@ -1364,11 +1374,11 @@ pub enum UpVal {
     /// 关闭的上值（持有值的副本）
     Closed {
         /// 存储的值
-        value: TValue,
+        value: TValue<'a>,
     },
 }
 
-impl UpVal {
+impl<'a> UpVal<'a> {
     pub fn is_open(&self) -> bool {
         matches!(self, UpVal::Open { .. })
     }
@@ -1390,13 +1400,13 @@ impl UpVal {
 /// 通过 `Deref<Target=[UpValRef]>` 暴露切片 API，调用点（`.len()` / `.iter()` /
 /// `[idx]` / `.is_empty()`）无需改动。
 #[derive(Debug)]
-pub struct UpValVec {
+pub struct UpValVec<'a> {
     len: u8,
-    inline: [std::mem::MaybeUninit<UpValRef>; 4],
-    heap: Option<Box<[UpValRef]>>,
+    inline: [std::mem::MaybeUninit<UpValRef<'a>>; 4],
+    heap: Option<Box<[UpValRef<'a>]>>,
 }
 
-impl Clone for UpValVec {
+impl<'a> Clone for UpValVec<'a> {
     fn clone(&self) -> Self {
         let mut v = UpValVec::new();
         for x in self.iter() {
@@ -1406,7 +1416,7 @@ impl Clone for UpValVec {
     }
 }
 
-impl UpValVec {
+impl<'a> UpValVec<'a> {
     pub fn new() -> Self {
         UpValVec {
             len: 0,
@@ -1424,7 +1434,7 @@ impl UpValVec {
         }
     }
 
-    pub fn push(&mut self, val: UpValRef) {
+    pub fn push(&mut self, val: UpValRef<'a>) {
         if self.heap.is_none() && self.len as usize >= 4 {
             // 内联已满: 迁移到堆
             let mut v = Vec::with_capacity(8);
@@ -1451,7 +1461,7 @@ impl UpValVec {
         self.len += 1;
     }
 
-    fn as_slice(&self) -> &[UpValRef] {
+    fn as_slice(&self) -> &[UpValRef<'a>] {
         match &self.heap {
             Some(h) => &h[..self.len as usize],
             // SAFETY: 0..len 的槽位均已初始化
@@ -1464,7 +1474,7 @@ impl UpValVec {
         }
     }
 
-    fn as_mut_slice(&mut self) -> &mut [UpValRef] {
+    fn as_mut_slice(&mut self) -> &mut [UpValRef<'a>] {
         match &mut self.heap {
             Some(h) => &mut h[..self.len as usize],
             // SAFETY: 0..len 的槽位均已初始化
@@ -1478,14 +1488,14 @@ impl UpValVec {
     }
 }
 
-impl Default for UpValVec {
+impl<'a> Default for UpValVec<'a> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl From<Vec<UpValRef>> for UpValVec {
-    fn from(v: Vec<UpValRef>) -> Self {
+impl<'a> From<Vec<UpValRef<'a>>> for UpValVec<'a> {
+    fn from(v: Vec<UpValRef<'a>>) -> Self {
         if v.len() <= 4 {
             let mut u = UpValVec::new();
             for x in v {
@@ -1502,14 +1512,14 @@ impl From<Vec<UpValRef>> for UpValVec {
     }
 }
 
-impl std::ops::Deref for UpValVec {
-    type Target = [UpValRef];
+impl<'a> std::ops::Deref for UpValVec<'a> {
+    type Target = [UpValRef<'a>];
     fn deref(&self) -> &Self::Target {
         self.as_slice()
     }
 }
 
-impl std::ops::DerefMut for UpValVec {
+impl<'a> std::ops::DerefMut for UpValVec<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_mut_slice()
     }
@@ -1573,7 +1583,7 @@ pub struct AbsLineInfo {
 /// When: 编译为 Proto
 /// Then: numparams = 2, code 为非空, maxstacksize ≥ 2
 #[derive(Debug, Clone)]
-pub struct Proto {
+pub struct Proto<'a> {
     /// 固定参数数量
     pub num_params: u8,
     /// 标志位 (PF_VAHID, PF_VATAB, PF_FIXED)
@@ -1599,13 +1609,13 @@ pub struct Proto {
     /// 定义结束行
     pub last_line_defined: i32,
     /// 常量表 — Rc<Vec> 避免 op_call 中深拷贝（perf: 省 ~5.3% malloc+memmove）
-    pub constants: Rc<Vec<TValue>>,
+    pub constants: Rc<Vec<TValue<'a>>>,
     /// 指令序列 — Rc<Vec> 避免 op_call 中深拷贝
     pub code: Rc<Vec<Instruction>>,
     /// 子原型 — Rc<Vec> 避免 op_call 中 O(n) Vec 分配与 Rc 指针数组深拷贝
     /// （op_call 调用频度高，原 `proto.protos.clone()` 每次都 malloc 新 Vec；
     ///  改为 Rc 共享后变为 O(1) 引用计数；编译期通过 Rc::make_mut 独占修改）
-    pub protos: Rc<Vec<Rc<Proto>>>,
+    pub protos: Rc<Vec<Rc<Proto<'a>>>>,
     /// 上值描述 — Rc<Vec> 避免 op_call 中深拷贝
     pub upvalues: Rc<Vec<UpvalDesc>>,
     /// 行号差值数组
@@ -1618,7 +1628,7 @@ pub struct Proto {
     pub source: Option<LuaString>,
 }
 
-impl Proto {
+impl<'a> Proto<'a> {
     /// 是否为变参函数
     ///
     /// Scenario: 判断变参函数
@@ -1674,7 +1684,7 @@ pub const PF_FIXED: u8 = 4;
 /// When: 构造 Udata
 /// Then: len = 64, nuvalue = 0, data 指向 64 字节内存
 #[derive(Debug, Clone)]
-pub struct Udata {
+pub struct Udata<'a> {
     /// GC 对象头 — ptr_id 在克隆时保持一致，用于哈希和相等性比较
     pub gc_header: GCObjectHeader,
     /// 用户值数量
@@ -1682,23 +1692,23 @@ pub struct Udata {
     /// 数据长度
     pub len: usize,
     /// 元表
-    pub metatable: Option<Box<Table>>,
+    pub metatable: Option<Box<Table<'a>>>,
     /// 用户值列表
-    pub user_values: Vec<TValue>,
+    pub user_values: Vec<TValue<'a>>,
     /// 原始数据 — 使用 Vec<u64> 保证 8 字节对齐
     /// C 代码（如 skynet netpack 的 struct queue）可能包含指针数组，
     /// 需要正确对齐，否则未对齐访问导致数据损坏。
     pub data: Vec<u64>,
 }
 
-impl Udata {
+impl<'a> Udata<'a> {
     /// 估算 Udata 真实堆占用（用于 GC 内存计费）。
     /// Udata 通过 register_object 注册，但 size_of::<Udata>() 不含 data/user_values 容量。
     pub fn gc_mem_size(&self) -> usize {
         // Rc<Udata> 堆分配 = Udata 自身
         // data: Vec<u64>，堆分配 = capacity * 8
         // user_values: Vec<TValue>，堆分配 = capacity * size_of::<TValue>()
-        std::mem::size_of::<Udata>()
+        std::mem::size_of::<Udata<'a>>()
             + self.data.capacity() * 8
             + self.user_values.capacity() * std::mem::size_of::<TValue>()
     }
@@ -1713,11 +1723,11 @@ impl Udata {
 /// 当 op_call 调用一个 LClosure 时，把当前 code/base/pc 等保存到 CallFrame，
 /// 切换到被调用函数的原型；op_return 时从 CallFrame 恢复。
 #[derive(Debug, Clone)]
-pub struct CallFrame {
+pub struct CallFrame<'a> {
     pub code: Rc<Vec<Instruction>>,
-    pub constants: Rc<Vec<TValue>>,
+    pub constants: Rc<Vec<TValue<'a>>>,
     /// 子原型列表 — Rc 共享，op_call 保存调用现场时 O(1) 引用计数（perf: 消除 Vec 分配）
-    pub protos: Rc<Vec<Rc<Proto>>>,
+    pub protos: Rc<Vec<Rc<Proto<'a>>>>,
     pub base: usize,
     pub return_pc: usize,
     pub return_base: usize,
@@ -1728,7 +1738,7 @@ pub struct CallFrame {
     pub nextraargs: i32,
     /// perf: Rc 共享避免 op_call 中 Vec 深拷贝 (N 个 UpValRef 各 1 次 atomic inc)
     /// 对应 C Lua 的 ci->u.l.upvals = cl->upvals (指针共享, O(1))
-    pub closure_upvals: Rc<RefCell<UpValVec>>,
+    pub closure_upvals: Rc<RefCell<UpValVec<'a>>>,
     pub tbc_list: Option<usize>,
 }
 
@@ -1737,34 +1747,34 @@ pub struct CallFrame {
 /// coroutine.yield 时把当前执行状态 (ExecState) 整体交换到 ThreadContext.exec，
 /// coroutine.resume 时与 LuaState.exec 两个 Box 指针整体交换回来 (O(1))。
 #[derive(Debug)]
-pub struct ThreadContext {
+pub struct ThreadContext<'a> {
     /// 是否已开始执行（首次 resume 后置 true）
     pub started: bool,
     /// 协程当前状态（共享可变，对应 LuaThread.status 的真实来源）
     pub status: ThreadStatus,
     /// 挂起时保存的 VM 执行上下文 — resume 时与 LuaState.exec 整体交换
-    pub exec: Box<crate::state::ExecState>,
+    pub exec: Box<crate::state::ExecState<'a>>,
     /// 协程错误时保存的错误信息（status=Error 时有效）
     /// coroutine.close 时若协程已 dead 且有错误，应返回该错误
-    pub error_msg: Option<TValue>,
+    pub error_msg: Option<TValue<'a>>,
     /// 首次 resume 时收集的跨协程 upvalue 信息（uv_ref + original_stack_index）
     /// 用于 close_suspended_coroutine 时把 Closed upvalue 值同步回父栈
-    pub upval_origins: Vec<(UpValRef, usize)>,
+    pub upval_origins: Vec<(UpValRef<'a>, usize)>,
     /// wrap 协程创建时的 current_thread 指针值（用于检测首次 resume 是否跨栈）
     /// 0 表示在主线程创建；非 0 表示在某个协程内创建（Rc::as_ptr 的 usize 值）
     pub wrap_creator_thread_ptr: usize,
     /// wrap 协程创建时保存的开 upvalue 信息（uv_ref, original_stack_index, saved_value）
     /// 首次 resume 时若同栈则从 state.exec.stack 读最新值关闭；若跨栈则用 saved_value 关闭
-    pub pending_wrap_upvals: Vec<(UpValRef, usize, TValue)>,
+    pub pending_wrap_upvals: Vec<(UpValRef<'a>, usize, TValue<'a>)>,
     /// yield 时关闭的 Open upvalue 信息（协程内部创建的闭包的 upvalue）
     /// resume 时把 Closed 值同步回协程栈并恢复 Open
-    pub yield_upval_origins: Vec<(UpValRef, usize)>,
+    pub yield_upval_origins: Vec<(UpValRef<'a>, usize)>,
     /// 原始 LuaThread 的弱引用 — 用于 coroutine.running() 返回同一对象
     /// 避免 sleep_session/wakeup_queue 等 table 查找因对象不一致而失败
-    pub thread_ref: std::rc::Weak<LuaThread>,
+    pub thread_ref: std::rc::Weak<LuaThread<'a>>,
 }
 
-impl Default for ThreadContext {
+impl<'a> Default for ThreadContext<'a> {
     fn default() -> Self {
         ThreadContext {
             started: false,
@@ -1787,24 +1797,24 @@ impl Default for ThreadContext {
 /// When: 检查其状态
 /// Then: status = ThreadStatus::Suspended, stack 为空
 #[derive(Debug, Clone)]
-pub struct LuaThread {
+pub struct LuaThread<'a> {
     /// 线程栈
-    pub stack: Vec<TValue>,
+    pub stack: Vec<TValue<'a>>,
     /// 线程状态
     pub status: ThreadStatus,
     /// 协程体函数 (coroutine.create 的参数)
-    pub function: Option<Box<TValue>>,
+    pub function: Option<Box<TValue<'a>>>,
     /// 是否为主线程
     pub is_main: bool,
     /// 持久化执行上下文（Rc 共享，clone 后仍指向同一份状态）
-    pub context: Rc<RefCell<ThreadContext>>,
+    pub context: Rc<RefCell<ThreadContext<'a>>>,
     /// C API 关联的 lua_State 指针（lua_newthread 创建时设置）
     /// 用于 lua_tothread 从 TValue::Thread 反查关联的 lua_State。
     /// 主线程和 Lua 层 coroutine.create 创建的协程此字段为 null。
-    pub c_state: std::cell::Cell<*mut LuaState>,
+    pub c_state: std::cell::Cell<*mut LuaState<'a>>,
 }
 
-impl LuaThread {
+impl<'a> LuaThread<'a> {
     /// 估算 LuaThread 真实堆占用（用于 GC 内存计费）。
     /// LuaThread 不调用 register_object（无 gc_header），由 gc_extra_estimate 跟踪。
     /// stack 在运行期会扩容，collect_gc 后重算以反映当前容量。
@@ -1844,9 +1854,9 @@ impl Default for ThreadStatus {
 /// When: 构造 StackValue
 /// Then: val 包含该 TValue, tbc_delta 包含该 delta
 #[derive(Debug, Clone)]
-pub struct StackValue {
+pub struct StackValue<'a> {
     /// 栈上的值
-    pub val: TValue,
+    pub val: TValue<'a>,
     /// to-be-closed 变量的距离 delta
     pub tbc_delta: u16,
 }
@@ -2062,7 +2072,7 @@ pub fn hexavalue(c: u8) -> u8 {
 /// Given: s = ""
 /// When: 调用 str2num("")
 /// Then: 返回 None
-pub fn str2num(s: &str) -> Option<TValue> {
+pub fn str2num<'a>(s: &str) -> Option<TValue<'a>> {
     // 性能优先: 用 s.trim() (Unicode whitespace, 但性能优化的 std 实现)
     #[cfg(not(size_optimized))]
     let s = s.trim();

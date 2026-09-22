@@ -76,3 +76,6 @@ pub mod capi;
 
 // 命令行解释器
 pub mod cli;
+
+// 测试用模拟接口
+pub mod mock;

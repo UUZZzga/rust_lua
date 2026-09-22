@@ -98,7 +98,7 @@ mod compat {
 // 栈操作辅助函数
 // ============================================================================
 
-fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
+fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.exec.stack.len() {
         return TValue::Nil(NilKind::Strict);
@@ -106,7 +106,7 @@ fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
     state.exec.stack[stack_idx].clone()
 }
 
-fn push_single_result(state: &mut LuaState, a: usize, nresults: i32, result: TValue) {
+fn push_single_result<'a>(state: &mut LuaState<'a>, a: usize, nresults: i32, result: TValue<'a>) {
     state.adjust_results(a, nresults, vec![result]);
 }
 
@@ -129,12 +129,12 @@ fn push_single_result(state: &mut LuaState, a: usize, nresults: i32, result: TVa
 ///   return 1;
 /// }
 /// ```
-fn call_setlocale(
-    state: &mut LuaState,
+fn call_setlocale<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     // 获取 locale 参数 (可选, 默认 NULL = 查询)
     let locale_val = if nargs > 0 {
         get_arg(state, a, 0)
@@ -228,7 +228,12 @@ extern "C" {
     fn lua_rs_clocks_per_sec() -> f64;
 }
 
-fn call_clock(state: &mut LuaState, a: usize, _nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_clock<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    _nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     let ticks = unsafe { clock() };
     let cps = unsafe { lua_rs_clocks_per_sec() };
     let seconds = ticks as f64 / cps;
@@ -245,12 +250,12 @@ fn call_clock(state: &mut LuaState, a: usize, _nargs: usize, nresults: i32) -> R
 /// 对应 C 的 os_tmpname:
 /// - POSIX: 使用 mkstemp 创建临时文件，关闭后返回文件名。
 /// - Windows: 使用 tmpnam 生成唯一文件名。
-fn call_tmpname(
-    state: &mut LuaState,
+fn call_tmpname<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     #[cfg(not(target_os = "windows"))]
     {
         let mut buf: [u8; 32] = *b"/tmp/lua_XXXXXX\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
@@ -295,7 +300,12 @@ fn call_tmpname(
 ///
 /// 对应 C 的 os_remove + luaL_fileresult：
 /// 成功返回 true；失败返回 nil, error message, errno。
-fn call_remove(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_remove<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     let filename_val = if nargs > 0 {
         get_arg(state, a, 0)
     } else {
@@ -367,7 +377,12 @@ fn call_remove(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
 /// }
 /// ```
 /// 环境变量不存在时返回 nil。
-fn call_getenv(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_getenv<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     let name_val = if nargs > 0 {
         get_arg(state, a, 0)
     } else {
@@ -416,7 +431,12 @@ fn call_getenv(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
 ///
 /// 对应 C 的 os_rename + luaL_fileresult：
 /// 成功返回 true；失败返回 nil, error message, errno。
-fn call_rename(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_rename<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     let oldname_val = if nargs > 0 {
         get_arg(state, a, 0)
     } else {
@@ -514,12 +534,12 @@ fn call_rename(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
 /// 对应 C 的 os_execute:
 /// - 有 command 参数: 用 system() 执行, 返回 execresult (true/nil, "exit"/"signal", code)
 /// - 无 command 参数: 返回 boolean 表示 shell 是否可用
-fn call_os_execute(
-    state: &mut LuaState,
+fn call_os_execute<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let cmd_val = if nargs > 0 {
         get_arg(state, a, 0)
     } else {
@@ -563,12 +583,12 @@ fn call_os_execute(
 /// - code 是 boolean: true → 0 (SUCCESS), false → 1 (FAILURE)
 /// - code 是 number: 用作退出码 (默认 0)
 /// - close 为 true: 调用 close_state 触发 finalizer，然后 exit
-fn call_os_exit(
-    state: &mut LuaState,
+fn call_os_exit<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     _nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let status = if nargs >= 1 {
         let v = get_arg(state, a, 0);
         match &v {
@@ -620,13 +640,13 @@ fn call_os_exit(
 ///
 /// key: 字段名, d: 默认值 (< 0 表示必须存在), delta: 偏移量
 /// 接受 Integer 或可无损转换的 Float (对应 C 的 lua_tointegerx)
-fn get_field(
-    table: &crate::table::Table,
-    state: &LuaState,
+fn get_field<'a>(
+    table: &crate::table::Table<'a>,
+    state: &LuaState<'a>,
     key: &str,
     d: i32,
     delta: i32,
-) -> Result<i32, VmError> {
+) -> Result<i32, VmError<'a>> {
     let k = TValue::Str(state.intern_str(key));
     match table.get(&k) {
         Some(TValue::Nil(_)) | None => {
@@ -691,12 +711,12 @@ fn set_boolfield(table: &crate::table::Table, state: &LuaState, key: &str, value
 /// - format 默认 "%c", 以 "!" 开头表示 UTC
 /// - format == "*t" 返回时间表
 /// - 其他用 strftime 格式化
-fn call_os_date(
-    state: &mut LuaState,
+fn call_os_date<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     // 获取格式字符串 (默认 "%c") — 保留原始字节 (可能含 \0)
     let fmt: Vec<u8> = if nargs >= 1 {
         let v = get_arg(state, a, 0);
@@ -846,12 +866,12 @@ fn call_os_date(
 /// 对应 C 的 os_time:
 /// - 无参数: 返回当前时间
 /// - 表参数: 从表读取字段构造时间
-fn call_os_time(
-    state: &mut LuaState,
+fn call_os_time<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let result = if nargs < 1 || matches!(get_arg(state, a, 0), TValue::Nil(_)) {
         // 无参数: 返回当前时间
         let t = unsafe { libc::time(std::ptr::null_mut()) };
@@ -917,12 +937,12 @@ fn call_os_time(
 /// os.difftime(t2, t1) — 返回时间差
 ///
 /// 对应 C 的 os_difftime: 返回 (lua_Number)difftime(t1, t2)
-fn call_os_difftime(
-    state: &mut LuaState,
+fn call_os_difftime<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     if nargs < 2 {
         return Err(VmError::RuntimeError(
             "bad argument to 'difftime' (two numbers expected)".to_string(),
@@ -958,16 +978,16 @@ fn call_os_difftime(
 // ============================================================================
 
 /// 打开 OS 库并注册到全局变量 os
-pub fn open_os_lib(state: &mut LuaState) {
+pub fn open_os_lib<'a>(state: &mut LuaState<'a>) {
     let mut lib = Table::new();
 
     // 注册所有 OS 函数 (使用 BuiltinFn 函数指针)
-    let register = |lib: &mut crate::table::Table,
+    let register = |lib: &mut crate::table::Table<'a>,
                     name: &'static std::ffi::CStr,
-                    func: crate::objects::BuiltinFnPtr| {
-        let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
+                    func: crate::objects::BuiltinFnPtr<'a>| {
+        let key = state.intern(name.to_str().unwrap_or(""));
         let name_ptr = name.as_ptr() as *const u8;
-        lib.set(key, TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)));
+        lib.set(key, BuiltinFn::impure_tvalue(func, name_ptr));
     };
 
     register(&mut lib, c"setlocale", call_setlocale);

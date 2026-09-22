@@ -4,7 +4,7 @@ use crate::gc::{GCObjectHeader, GCState};
 use crate::objects::FxBuildHasher;
 use crate::objects::{
     BuiltinFn, BuiltinFnPtr, Instruction, LClosure, LuaThread, LuaType, NilKind, Proto, TValue,
-    TableData, ThreadContext, ThreadStatus, UpVal, UpValRef, UpValVec, UpvalDesc,
+    TableData, ThreadContext, ThreadStatus, UpVal, UpValRef, UpValVec,
 };
 use crate::strings::{LuaString, StringTable};
 use crate::table::Table;
@@ -19,73 +19,21 @@ use std::rc::Rc;
 /// 因为 key 是 usize（对象 ID/指针），用 SipHash 是浪费（perf 显示占 ~4%）。
 type GcHashSet = HashSet<usize, FxBuildHasher>;
 
-// 体积优先: 包装 Stdout/Stderr, 覆盖 write_fmt 方法
-// 避免 default_write_fmt → Error::new → StringError → Unicode grapheme/whitespace 表 (~4KB)
-// Box<dyn Write> 的 vtable 会引用 write_fmt, 即使不调用也会被链接器保留
-#[cfg(size_optimized)]
-pub struct LuaStdout(pub std::io::Stdout);
-
-#[cfg(size_optimized)]
-impl Write for LuaStdout {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
-    }
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.0.write_all(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
-    }
-    // 覆盖 write_fmt: no-op (代码中仅使用 write_all + flush)
-    fn write_fmt(&mut self, _: std::fmt::Arguments<'_>) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-#[cfg(size_optimized)]
-pub struct LuaStderr(pub std::io::Stderr);
-
-#[cfg(size_optimized)]
-impl Write for LuaStderr {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.write(buf)
-    }
-    fn write_all(&mut self, buf: &[u8]) -> std::io::Result<()> {
-        self.0.write_all(buf)
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.0.flush()
-    }
-    fn write_fmt(&mut self, _: std::fmt::Arguments<'_>) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-#[cfg(size_optimized)]
-pub fn lua_stdout() -> Box<dyn Write> {
-    Box::new(LuaStdout(std::io::stdout()))
-}
-
-#[cfg(not(size_optimized))]
-pub fn lua_stdout() -> Box<dyn Write> {
-    Box::new(std::io::stdout())
-}
-
 /// GC worklist 的原始值项 — TValue 的字节拷贝，不做引用计数。
 /// GC 期间所有对象有效（sweep 在 mark 完成后），所以 push/pop 无需 incq/decq。
 /// 消除 worklist 的 TValue clone (3.11%) + drop_glue (4.26%) 开销。
 /// 用 MaybeUninit<TValue> 保证大小和对齐与 TValue 完全一致。
-type RawTValue = std::mem::MaybeUninit<TValue>;
+type RawTValue<'a> = std::mem::MaybeUninit<TValue<'a>>;
 
 /// 从 &TValue 拷贝原始字节到 RawTValue（不 incq Rc）
 #[cfg_attr(not(size_optimized), inline(always))]
-unsafe fn raw_from_tvalue(val: &TValue) -> RawTValue {
+unsafe fn raw_from_tvalue<'a>(val: &TValue<'a>) -> RawTValue<'a> {
     std::mem::MaybeUninit::new(std::ptr::read(val as *const TValue))
 }
 
 /// 将 RawTValue 重建为 &TValue 引用
 #[cfg_attr(not(size_optimized), inline(always))]
-unsafe fn raw_as_tvalue(raw: &RawTValue) -> &TValue {
+unsafe fn raw_as_tvalue<'a, 'b>(raw: &'b RawTValue<'a>) -> &'b TValue<'a> {
     raw.assume_init_ref()
 }
 
@@ -195,11 +143,11 @@ pub const ERRORSTACKSIZE: usize = MAXSTACK + STACKERRSPACE;
 
 /// pcall 类型 — 区分 pcall 和 xpcall 的 error 处理行为
 #[derive(Clone, Debug)]
-pub enum PcallKind {
+pub enum PcallKind<'a> {
     /// pcall: error 时返回 (false, error)
     Pcall,
     /// xpcall: error 时调用 handler(error)，返回 (false, handler_result)
-    Xpcall { handler: TValue },
+    Xpcall { handler: TValue<'a> },
 }
 
 /// pcall 保护状态 — 对应 C Lua 的 CIST_YPCALL CallInfo
@@ -209,26 +157,26 @@ pub enum PcallKind {
 /// 当 inner_func 后续执行 error 或正常返回时，由 execute_loop 检查并处理
 /// （对应 C Lua 的 precover + finishpcallk 机制）。
 #[derive(Clone, Debug)]
-pub struct PcallProtection {
+pub struct PcallProtection<'a> {
     /// pcall 调用者的执行上下文（saved_*）— 用于恢复 pcall 调用者的执行
     pub saved_code: Rc<Vec<Instruction>>,
-    pub saved_constants: Rc<Vec<TValue>>,
+    pub saved_constants: Rc<Vec<TValue<'a>>>,
     /// 调用者的子原型列表 — Rc 共享，yield 穿越 pcall 时 O(1) 引用计数
-    pub saved_protos: Rc<Vec<Rc<Proto>>>,
+    pub saved_protos: Rc<Vec<Rc<Proto<'a>>>>,
     pub saved_base: usize,
     pub saved_pc: usize,
     pub saved_num_params: u8,
     pub saved_is_vararg: bool,
     pub saved_proto_flag: u8,
     pub saved_nextraargs: i32,
-    pub saved_closure_upvals: Rc<RefCell<UpValVec>>,
+    pub saved_closure_upvals: Rc<RefCell<UpValVec<'a>>>,
     pub saved_tbc_list: Option<usize>,
     /// pcall 的 func 位置（栈索引）— 用于截断栈和放置返回值
     pub func_idx: usize,
     /// pcall 期望的返回值数量（-1 = MULTRET）
     pub nresults: i32,
     /// pcall 类型 — 区分 pcall 和 xpcall 的 error/return 处理
-    pub pcall_kind: PcallKind,
+    pub pcall_kind: PcallKind<'a>,
     /// saved_* 是否已填充（即是否被 yield 穿过）
     /// false: call_pcall/call_xpcall push 的空壳，由 state.pcall 处理 error
     /// true: yield 穿过后由 state.pcall 更新，由 execute_loop 处理 error/return
@@ -255,7 +203,7 @@ pub struct PcallProtection {
     /// 这些帧持有 Rc 引用（code/constants/protos 等），丢弃会导致悬空指针。
     /// 不合并到 call_stack: 否则 resume 后内层帧 pop 完会错误 pop 外层帧，
     /// 导致 state.exec.base 跳过 pcall 的 func_idx+1。
-    pub saved_call_stack: Vec<crate::objects::CallFrame>,
+    pub saved_call_stack: Vec<crate::objects::CallFrame<'a>>,
 }
 
 pub struct GlobalState {
@@ -290,12 +238,12 @@ pub struct CallInfo {
 // 的开关开销主因)。非交换的字段 (registry/globals/gc 等) 留在 LuaState 共享。
 
 #[derive(Debug)]
-pub struct ExecState {
+pub struct ExecState<'a> {
     // Rc<Vec> 避免 op_call 中深拷贝 proto 字段（perf: 省 ~5.3% malloc+memmove）
-    pub constants: Rc<Vec<TValue>>,
+    pub constants: Rc<Vec<TValue<'a>>>,
     pub code: Rc<Vec<Instruction>>,
     /// 当前执行函数的子原型列表 — Rc 共享，op_call 切换 proto 时 O(1) 引用计数
-    pub protos: Rc<Vec<Rc<Proto>>>,
+    pub protos: Rc<Vec<Rc<Proto<'a>>>>,
     pub top: usize,
     pub base: usize,
     pub pc: usize,
@@ -305,17 +253,17 @@ pub struct ExecState {
     pub proto_flag: u8,
     /// PF_VAHID 模式下隐藏变参的数量（对应 C 的 ci->u.l.nextraargs）
     pub nextraargs: i32,
-    pub closure_upvals: Rc<RefCell<UpValVec>>,
+    pub closure_upvals: Rc<RefCell<UpValVec<'a>>>,
     /// 全局 open upvalue 存储 — 不随函数调用/返回保存/恢复（对应 C 的 L->openupval 链表节点存储）
     /// open_upval 链表索引此 vec，tbc_list 也索引此 vec
-    pub open_upvals: Vec<UpValRef>,
+    pub open_upvals: Vec<UpValRef<'a>>,
     pub open_upval: Option<usize>,
     pub tbc_list: Option<usize>,
-    pub call_stack: Vec<crate::objects::CallFrame>,
-    pub stack: Vec<TValue>,
+    pub call_stack: Vec<crate::objects::CallFrame<'a>>,
+    pub stack: Vec<TValue<'a>>,
     pub hook_old_pc: i32,
     /// debug hook 函数 — 对应 C 的 L->hook
-    pub hook_func: Option<TValue>,
+    pub hook_func: Option<TValue<'a>>,
     /// debug hook 掩码 — 对应 C 的 L->hookmask
     pub hook_mask: i32,
     /// debug hook count — 对应 C 的 L->basehookcount
@@ -325,13 +273,13 @@ pub struct ExecState {
     /// 是否允许调用 hook — 对应 C 的 L->allowhook
     pub allowhook: bool,
     /// 当前活动协程的上下文 — None 表示主线程执行中
-    pub current_thread: Option<Rc<RefCell<ThreadContext>>>,
+    pub current_thread: Option<Rc<RefCell<ThreadContext<'a>>>>,
     /// 调用栈 — 保存 caller 的 VM 执行上下文（原 execute_loop 局部变量，提升为字段以支持协程挂起）
-    pub call_info: Vec<CallInfoEntry>,
+    pub call_info: Vec<CallInfoEntry<'a>>,
     /// pcall 保护栈 — 对应 C Lua 的 CIST_YPCALL CallInfo 链
-    pub pcall_protection_stack: Vec<PcallProtection>,
+    pub pcall_protection_stack: Vec<PcallProtection<'a>>,
     /// close continuation 的 pending error — 对应 C Lua 的 CIST_RECST 保存的错误状态
-    pub close_error_status: Option<TValue>,
+    pub close_error_status: Option<TValue<'a>>,
     /// coroutine.close() 关闭自身时设置 — 对应 C Lua 的 lua_closethread(co, L) 场景
     pub force_noyield_close: bool,
     /// C 函数调用嵌套计数（对应 C 的 L->nCcalls），用于检测 C 栈溢出
@@ -343,7 +291,7 @@ pub struct ExecState {
     pub saved_yield_nresults: i32,
 }
 
-impl Default for ExecState {
+impl<'a> Default for ExecState<'a> {
     fn default() -> Self {
         ExecState {
             constants: Rc::new(Vec::new()),
@@ -384,9 +332,9 @@ impl Default for ExecState {
 // LuaState — 共享(跨协程)字段 + 执行上下文 ExecState
 // ============================================================================
 
-pub struct LuaState {
+pub struct LuaState<'a> {
     // === 执行上下文（协程切换时与 ThreadContext.exec 整体交换, O(1)）===
-    pub exec: Box<ExecState>,
+    pub exec: Box<ExecState<'a>>,
     /// 回边中断检查摊销计数器 — 仅回跳指令 (JMP/FORLOOP/条件跳回) 递增,
     /// 64 次边界时原子加载 INTERRUPTED。放 state 而非循环局部: 借用安全
     /// (Cell 通过 &LuaState 可写), 跳转 handler 内联增量免 &mut 引用穿透
@@ -401,8 +349,8 @@ pub struct LuaState {
     pub gc: Rc<GCState>,
 
     // 高层 API 字段（原 LuaState）
-    pub globals: Table,
-    pub registry: Table,
+    pub globals: Table<'a>,
+    pub registry: Table<'a>,
     /// 字符串表 — 通过 Rc 共享以支持 lua_newthread 创建的 thread 共享主线程的字符串表
     /// （对应 C Lua 中 global_State 的 strt 字段，所有 thread 共享同一份 string table）
     pub string_table: Rc<StringTable>,
@@ -417,8 +365,7 @@ pub struct LuaState {
     // C API 的正索引相对于此位置；Lua 代码路径不使用此字段。
     // 0 表示栈底（主线程初始状态）。
     pub api_func_base: usize,
-    pub dmt: DefaultMetatables,
-    pub stdout: Box<dyn Write>,
+    pub dmt: DefaultMetatables<'a>,
     /// io.output 设置的当前输出流 — None 表示使用 stdout
     /// 对应 C liolib 中存储在 registry[IO_OUTPUT] 的默认输出文件句柄
     pub io_output: Option<Box<dyn Write>>,
@@ -443,15 +390,15 @@ pub struct LuaState {
     pub last_error_msg: String,
     /// 最后一次错误的原始值（保留原始 TValue 类型，如 error(100) 的数字 100）
     /// coroutine.close 需要返回此原始值
-    pub last_error_value: Option<TValue>,
+    pub last_error_value: Option<TValue<'a>>,
     /// C API 的 lua_error 抛错暂存槽 — 对应 C 的 longjmp 错误值
     /// lua_error 设置此字段并 panic，pcall_c_function 用 catch_unwind 捕获后取出
-    pub pending_error: Option<TValue>,
+    pub pending_error: Option<TValue<'a>>,
     /// 标记错误消息是否应跳过 source:line 前缀
     /// error() level=0 或非字符串错误值时为 true，build_traceback 不再添加前缀
     pub error_no_prefix: bool,
     /// pcall 内部发生 yield 时暂存的 yield 值，供调用者传播
-    pub pending_yield: Option<Vec<TValue>>,
+    pub pending_yield: Option<Vec<TValue<'a>>>,
     /// 当前正在调用的 C 函数名（用于 traceback）— None 表示不在 C 函数中
     pub last_c_function: Option<String>,
     /// 数学库随机数生成器状态 — 对应 C 的 RanState (math.random/randomseed)
@@ -461,26 +408,26 @@ pub struct LuaState {
     /// warning 是否有未完成的消息（tocont=true 后等待下一段）— 对应 C 的 warnfcont 状态
     pub warn_pending: bool,
     /// 主线程对象（用于 coroutine.running() 在主线程返回 thread）
-    pub main_thread: LuaThread,
+    pub main_thread: LuaThread<'a>,
     /// call_wrap_fn 执行期间，调用者栈（含活跃的 wrap RustClosure 引用）暂存于此，
     /// 让 GC 能看到内层协程引用，避免误判为不可达。
     /// 嵌套 wrap 调用时按栈顺序 push/pop。
-    pub caller_gc_stacks: Vec<Vec<TValue>>,
+    pub caller_gc_stacks: Vec<Vec<TValue<'a>>>,
     /// 弱引用表列表 — setmetatable 设置 __mode 时注册，collectgarbage 时清理
     /// 使用 Weak 引用避免阻止表本身的回收
-    pub weak_tables: Vec<std::rc::Weak<std::cell::RefCell<TableData>>>,
+    pub weak_tables: Vec<std::rc::Weak<std::cell::RefCell<TableData<'a>>>>,
     /// op_concat 的 GC 计数器 — 字符串不注册到 GC metas，用计数器限制
     /// 每 concat_gc_interval 次 op_concat 触发一次 GC（清理弱引用表等）
     pub concat_gc_counter: std::cell::Cell<usize>,
     pub concat_gc_interval: std::cell::Cell<usize>,
     /// 有 __gc 元方法的对象列表 — setmetatable 设置 __gc 时注册
     /// GC 时检查不可达的对象，调用其 finalizer 后再释放
-    pub finobj_list: Vec<Table>,
+    pub finobj_list: Vec<Table<'a>>,
     /// 有 __gc 元方法的 UserData 列表 — FILE* 等通过默认元表设置的 userdata
     /// GC 时检查不可达的 UserData，调用其 finalizer（fclose）后释放
     /// 存储 Rc<Udata> 而非 Udata 深拷贝：确保 __gc 在原始 userdata 上调用，
     /// 这样 C 模块（如 lsqlite3）能通过 light userdata 指针正确清理 registry 引用
-    pub ud_finobj_list: Vec<Rc<crate::objects::Udata>>,
+    pub ud_finobj_list: Vec<Rc<crate::objects::Udata<'a>>>,
     /// 状态正在关闭 — 对应 C 的 g->gcstp & GCSTPCLS
     /// true 时不再注册新的 finalizer 对象（close 中创建的对象不会被 finalize）
     pub gc_closing: bool,
@@ -501,12 +448,12 @@ pub struct LuaState {
     /// state.pcall 错误时在 truncate call_info 之前保存快照。
     /// call_xpcall 调用错误处理函数之前恢复此快照，让 debug.traceback 能看到错误发生时的帧
     /// (如 __close 帧)。调用错误处理函数后清除。
-    pub last_error_call_info: Option<Vec<CallInfoEntry>>,
+    pub last_error_call_info: Option<Vec<CallInfoEntry<'a>>>,
     /// 最后一个出错的 __close 的 CallInfoEntry — 对应 C Lua 中 longjmp 跳过 callclosemethod
     /// 的弹出代码，CallInfo 节点保留在链表中。call_close_method 出错时 pop __close 帧并保存
     /// 到此字段。state.pcall 保存 call_info 快照时将此帧追加到快照末尾，让 xpcall 的错误
     /// 处理函数（如 debug.traceback）能看到 __close 帧。
-    pub last_close_frame: Option<CallInfoEntry>,
+    pub last_close_frame: Option<CallInfoEntry<'a>>,
     /// GC 标记阶段缓存的 "__mode" 字符串键 — 避免每次 mark_tvalue 都 intern_str
     /// （perf: mark_tvalue 中 __mode 查找占 ~2%）
     pub cached_mode_key: std::cell::RefCell<Option<LuaString>>,
@@ -524,7 +471,7 @@ pub struct LuaState {
     /// userdata 在 GC 前保持有效。Rust 用 Vec<TValue>，truncate 立即 drop，
     /// Rc 引用计数为 0 时 userdata 内存被释放，导致悬空指针。
     /// 此字段模拟 C Lua 的 GC 延迟释放行为。
-    pub c_safety_keepalive: Vec<TValue>,
+    pub c_safety_keepalive: Vec<TValue<'a>>,
 
     /// lua_newstate 时传入的 allocator userdata 指针。
     /// 对应 C Lua 的 `lstate->ud`，由 lua_getallocf 返回给 C 代码。
@@ -538,6 +485,9 @@ pub struct LuaState {
     /// 每个元素指向调用方栈上的 [u8; 512] 缓冲区 (>= sizeof(jmp_buf))。
     /// 仅在 lua_use_longjmp 模式下使用 (size_optimized 自动启用, 或 --features lua_longjmp)。
     pub error_jmp_bufs: Vec<*mut u8>,
+
+    /// 输入输出缓冲区 — 用于模拟标准输入输出
+    pub io: &'a mut dyn crate::mock::io_mock::Io,
 }
 
 /// C 辅助函数: setjmp/longjmp 包装 (capi_variadic.c)
@@ -555,10 +505,10 @@ extern "C" {
 
 /// 调用栈条目 — 用于堆栈回溯和 debug.getinfo
 #[derive(Debug, Clone)]
-pub struct CallInfoEntry {
+pub struct CallInfoEntry<'a> {
     pub is_c: bool,
     /// Lua 函数引用（C 函数为 None）
-    pub closure: Option<Rc<crate::objects::LClosure>>,
+    pub closure: Option<Rc<crate::objects::LClosure<'a>>>,
     /// 栈帧基址（对应 C 的 ci->func + 1）
     /// Lua 函数帧: caller's base (state.exec.base before op_call updates it)
     /// C 函数帧: callee's base (func_idx + 1)
@@ -588,10 +538,10 @@ pub struct CallInfoEntry {
 /// 对于 base=0 或 stack 越界: 返回 None
 ///
 /// perf: 替代 CallInfoEntry.closure 字段, 避免 op_call 中 Rc::clone
-pub fn get_closure_from_stack<'a>(
-    stack: &'a [TValue],
-    entry: &CallInfoEntry,
-) -> Option<&'a Rc<LClosure>> {
+pub fn get_closure_from_stack<'a, 'b>(
+    stack: &'b [TValue<'a>],
+    entry: &CallInfoEntry<'a>,
+) -> Option<&'b Rc<LClosure<'a>>> {
     if entry.is_c {
         return None;
     }
@@ -607,7 +557,10 @@ pub fn get_closure_from_stack<'a>(
 ///
 /// 优先返回 entry.closure (若已设置, 如 hook/metamethod 路径);
 /// 否则从 state.exec.stack[entry.base - 1] 延迟计算 (op_call 快速路径)
-pub fn get_closure_for_ci<'a>(state: &'a LuaState, ci_idx: usize) -> Option<&'a Rc<LClosure>> {
+pub fn get_closure_for_ci<'a, 'b>(
+    state: &'b LuaState<'a>,
+    ci_idx: usize,
+) -> Option<&'b Rc<LClosure<'a>>> {
     let entry = &state.exec.call_info[ci_idx];
     if entry.closure.is_some() {
         return entry.closure.as_ref();
@@ -620,10 +573,10 @@ pub fn get_closure_for_ci<'a>(state: &'a LuaState, ci_idx: usize) -> Option<&'a 
 /// 对于 Lua 函数帧: caller_proto = stack[entry.base - 1].proto (若为 LClosure)
 /// 对于 C 函数帧: 返回 None
 /// 对于 base=0 或 stack 越界: 返回 None
-pub fn get_caller_proto_from_stack<'a>(
-    stack: &'a [TValue],
-    entry: &CallInfoEntry,
-) -> Option<&'a Rc<Proto>> {
+pub fn get_caller_proto_from_stack<'a, 'b>(
+    stack: &'b [TValue<'a>],
+    entry: &CallInfoEntry<'a>,
+) -> Option<&'b Rc<Proto<'a>>> {
     if entry.is_c {
         return None;
     }
@@ -642,10 +595,10 @@ pub fn get_caller_proto_from_stack<'a>(
 /// 对于 base=0 或 stack 越界: 返回 None
 ///
 /// perf: op_call 中移除 1 次 Rc::clone (atomic inc) + CallInfoEntry drop 时 1 次 Rc dec
-pub fn get_caller_proto_ref<'a>(
-    state: &'a LuaState,
-    entry: &CallInfoEntry,
-) -> Option<&'a Rc<Proto>> {
+pub fn get_caller_proto_ref<'a, 'b>(
+    state: &'b LuaState<'a>,
+    entry: &CallInfoEntry<'a>,
+) -> Option<&'b Rc<Proto<'a>>> {
     get_caller_proto_from_stack(&state.exec.stack, entry)
 }
 
@@ -657,7 +610,10 @@ pub fn get_caller_proto_ref<'a>(
 /// 对于 C 函数帧 (有预设置 name, 如 BuiltinFn/RustClosure): 返回 None
 ///
 /// perf: 替代 CallInfoEntry.caller_proto 字段, 避免 op_call/call_c_function 中 Rc::clone
-pub fn get_caller_proto_for_ci<'a>(state: &'a LuaState, ci_idx: usize) -> Option<&'a Rc<Proto>> {
+pub fn get_caller_proto_for_ci<'a, 'b>(
+    state: &'a LuaState<'b>,
+    ci_idx: usize,
+) -> Option<&'a Rc<Proto<'b>>> {
     let entry = &state.exec.call_info[ci_idx];
     if !entry.is_c {
         return get_caller_proto_ref(state, entry);
@@ -678,7 +634,7 @@ pub fn get_caller_proto_for_ci<'a>(state: &'a LuaState, ci_idx: usize) -> Option
 // 构造
 // ============================================================================
 
-impl LuaState {
+impl<'a> LuaState<'a> {
     /// 对应 C 的 lua_newstate → stack_init + resetCI
     ///
     /// stack_init: 预分配 BASIC_STACK_SIZE + EXTRA_STACK 个槽位容量
@@ -687,7 +643,7 @@ impl LuaState {
     /// L->top = stack + 1  (函数入口 nil 在位索引 0)
     ///
     /// 验证: gettop() 必须返回 1（函数入口槽）
-    pub fn new() -> Self {
+    pub fn new(io: &'a mut dyn crate::mock::io_mock::Io) -> Self {
         let gc = Rc::new(GCState::default_incremental());
         let globals = {
             let t = Table::new();
@@ -753,7 +709,6 @@ impl LuaState {
             tmnames,
             api_func_base: 0,
             dmt: DefaultMetatables::new(),
-            stdout: lua_stdout(),
             io_output: None,
             file_handles: std::collections::HashMap::with_hasher(
                 crate::objects::FxBuildHasher::default(),
@@ -805,6 +760,7 @@ impl LuaState {
             c_safety_keepalive: Vec::new(),
             allocf_ud: std::ptr::null_mut(),
             error_jmp_bufs: Vec::new(),
+            io: io,
         }
     }
 
@@ -812,7 +768,7 @@ impl LuaState {
     /// 分配 BASIC_STACK_SIZE + EXTRA_STACK 容量，推入函数入口 nil
     /// stack[0] = nil (函数入口, ci->func)
     /// top = stack + 1 (1 个元素在用)
-    fn init_stack() -> Vec<TValue> {
+    fn init_stack() -> Vec<TValue<'a>> {
         let mut stack = Vec::with_capacity(BASIC_STACK_SIZE + EXTRA_STACK);
         stack.push(TValue::Nil(NilKind::Strict));
         stack
@@ -837,7 +793,7 @@ impl LuaState {
 
     /// 对应 C 的 luaD_growstack
     /// 尝试将栈增长至少 n 个元素。raiseerror=true 时报告错误，否则返回错误。
-    pub fn growstack(&mut self, n: usize, raiseerror: bool) -> Result<(), VmError> {
+    pub fn growstack(&mut self, n: usize, raiseerror: bool) -> Result<(), VmError<'a>> {
         let size = self.exec.stack.len();
         if size > MAXSTACK {
             // 栈已超过最大值，线程正在使用为错误保留的额外空间
@@ -871,7 +827,7 @@ impl LuaState {
 
     /// 对应 C 的 luaD_reallocstack
     /// Rust 版本: Vec 自行管理内存，relstack/correctstack 为空操作
-    pub fn reallocstack(&mut self, newsize: usize, _raiseerror: bool) -> Result<(), VmError> {
+    pub fn reallocstack(&mut self, newsize: usize, _raiseerror: bool) -> Result<(), VmError<'a>> {
         let oldsize = self.exec.stack.len();
         debug_assert!(newsize <= MAXSTACK || newsize == ERRORSTACKSIZE);
         // relstack: Rust 中无需将指针转为偏移量 (Vec 自行管理内存)
@@ -951,7 +907,6 @@ impl LuaState {
             tmnames,
             api_func_base: 0,
             dmt: DefaultMetatables::new(),
-            stdout: lua_stdout(),
             io_output: None,
             file_handles: std::collections::HashMap::with_hasher(
                 crate::objects::FxBuildHasher::default(),
@@ -1003,6 +958,7 @@ impl LuaState {
             c_safety_keepalive: Vec::new(),
             allocf_ud: std::ptr::null_mut(),
             error_jmp_bufs: Vec::new(),
+            io: crate::mock::io_mock::lua_io(),
         };
         state
     }
@@ -1092,7 +1048,6 @@ impl LuaState {
             twups_linked: false,
             is_in_twups: false,
             api_func_base: 0,
-            stdout: lua_stdout(),
             io_output: None,
             ci: None,
             last_traceback: String::new(),
@@ -1118,12 +1073,13 @@ impl LuaState {
             last_gc_estimate: 0,
             c_safety_keepalive: Vec::new(),
             error_jmp_bufs: Vec::new(),
+            io: crate::mock::io_mock::lua_io(),
         }
     }
 
     /// 执行 Lua 字节码 (顶层主函数)
     /// base=0: stack[0] 兼作函数入口和寄存器 0
-    pub fn execute(&mut self, proto: &Proto) -> Result<VmResult, VmError> {
+    pub fn execute(&mut self, proto: &Proto<'a>) -> Result<VmResult<'a>, VmError<'a>> {
         if self.exec.stack.is_empty() {
             self.exec.stack.push(TValue::Nil(NilKind::Strict));
         }
@@ -1151,7 +1107,12 @@ impl LuaState {
     ///
     /// 函数帧布局: stack[base-1] = 函数入口, stack[base+0..base+N] = 寄存器/参数
     /// 当 base=0 时，stack[0] 兼作函数入口和寄存器 0（主函数场景）
-    pub fn from_proto(proto: &Proto, base: usize, mut stack: Vec<TValue>, gc: Rc<GCState>) -> Self {
+    pub fn from_proto(
+        proto: &Proto<'a>,
+        base: usize,
+        mut stack: Vec<TValue<'a>>,
+        gc: Rc<GCState>,
+    ) -> Self {
         if base > 0 {
             while stack.len() < base {
                 stack.push(TValue::Nil(NilKind::Strict));
@@ -1224,7 +1185,6 @@ impl LuaState {
             tmnames,
             api_func_base: 0,
             dmt: DefaultMetatables::new(),
-            stdout: lua_stdout(),
             io_output: None,
             file_handles: std::collections::HashMap::with_hasher(
                 crate::objects::FxBuildHasher::default(),
@@ -1276,23 +1236,24 @@ impl LuaState {
             c_safety_keepalive: Vec::new(),
             allocf_ud: std::ptr::null_mut(),
             error_jmp_bufs: Vec::new(),
+            io: crate::mock::io_mock::lua_io(),
         }
     }
 }
 
-impl Default for LuaState {
+impl Default for LuaState<'static> {
     fn default() -> Self {
-        Self::new()
+        Self::new(crate::mock::io_mock::lua_io())
     }
 }
 
-impl LuaState {
+impl<'a> LuaState<'a> {
     /// 调整 C 函数返回值到栈上 — 对应 C 的 luaD_poscall 中的栈调整
     ///
     /// 当 return hook 启用时，不立即 adjust，而是把结果放到栈顶之上，
     /// 设置 pending_return_adjust，由 op_call 在 return hook 后执行 adjust。
     /// 这样 return hook 中的 debug.getlocal 能从栈上读到返回值。
-    pub fn adjust_results(&mut self, a: usize, nresults: i32, results: Vec<TValue>) {
+    pub fn adjust_results(&mut self, a: usize, nresults: i32, results: Vec<TValue<'a>>) {
         // 如果 return hook 启用且允许调用 hook，先把 results 放到栈顶之上（不 truncate），
         // 设置 pending_return_adjust，由 op_call 在 return hook 后执行 adjust。
         // hook 执行期间 allowhook=false，return hook 不会被调用，不应推迟。
@@ -1339,7 +1300,7 @@ impl LuaState {
     /// 热路径（find 未命中 / gmatch 迭代结束 / 字符串库单返回值）每调用一次，
     /// 1 元素 Vec 分配 + move 开销不可忽略（D 循环基准中每 find 一次）。
     #[cfg_attr(not(size_optimized), inline)]
-    pub fn adjust_single_result(&mut self, a: usize, nresults: i32, result: TValue) {
+    pub fn adjust_single_result(&mut self, a: usize, nresults: i32, result: TValue<'a>) {
         if self.exec.hook_mask & 2 != 0 && self.exec.allowhook {
             let in_op_call = self.exec.call_info.last().map(|e| e.is_c).unwrap_or(false);
             if in_op_call {
@@ -1418,7 +1379,7 @@ impl LuaState {
     }
 
     /// adjust_results 的双值版本 — 消除 vec![v1, v2] 堆分配（gsub 返回 热点）。
-    pub fn adjust_two_results(&mut self, a: usize, nresults: i32, v1: TValue, v2: TValue) {
+    pub fn adjust_two_results(&mut self, a: usize, nresults: i32, v1: TValue<'a>, v2: TValue<'a>) {
         if self.exec.hook_mask & 2 != 0 && self.exec.allowhook {
             let in_op_call = self.exec.call_info.last().map(|e| e.is_c).unwrap_or(false);
             if in_op_call {
@@ -1554,7 +1515,7 @@ fn format_float(f: f64) -> String {
 // 高层 API 方法（原 LuaState）
 // ============================================================================
 
-impl LuaState {
+impl<'a> LuaState<'a> {
     // ====== Stack ======
 
     pub fn gettop(&self) -> usize {
@@ -1661,7 +1622,7 @@ impl LuaState {
         self.exec.stack.push(TValue::Str(ls));
     }
 
-    pub fn push_value(&mut self, val: TValue) {
+    pub fn push_value(&mut self, val: TValue<'a>) {
         self.exec.stack.push(val);
     }
 
@@ -1673,13 +1634,13 @@ impl LuaState {
         self.push_string(fmt);
     }
 
-    pub fn push_lua_value(&mut self, val: &TValue) {
+    pub fn push_lua_value(&mut self, val: &TValue<'a>) {
         self.exec.stack.push(val.clone());
     }
 
     // ====== Access / Type ======
 
-    pub fn obj_at(&self, idx: isize) -> Option<&TValue> {
+    pub fn obj_at(&self, idx: isize) -> Option<&TValue<'a>> {
         let abs = self.abs_index(idx);
         if abs > 0 && abs <= self.exec.stack.len() {
             Some(&self.exec.stack[abs - 1])
@@ -1688,7 +1649,7 @@ impl LuaState {
         }
     }
 
-    pub fn obj_at_mut(&mut self, idx: isize) -> Option<&mut TValue> {
+    pub fn obj_at_mut(&mut self, idx: isize) -> Option<&mut TValue<'a>> {
         let abs = self.abs_index(idx);
         if abs > 0 && abs <= self.exec.stack.len() {
             Some(&mut self.exec.stack[abs - 1])
@@ -1815,7 +1776,7 @@ impl LuaState {
     /// ## 示例
     ///
     /// ```ignore
-    /// fn my_add(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+    /// fn my_add<'a>(state: &mut LuaState<'a>, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError<'a>> {
     ///     let x = state.exec.stack[a + 1].as_integer().unwrap_or(0);
     ///     let y = state.exec.stack[a + 2].as_integer().unwrap_or(0);
     ///     state.exec.stack.truncate(a);
@@ -1826,7 +1787,7 @@ impl LuaState {
     /// state.set_builtin("my_add", my_add);
     /// state.do_string("print(my_add(3, 4))");  // 输出 7
     /// ```
-    pub fn set_builtin(&mut self, name: &'static std::ffi::CStr, func: BuiltinFnPtr) {
+    pub fn set_builtin(&mut self, name: &'static std::ffi::CStr, func: BuiltinFnPtr<'a>) {
         let name_str = name.to_str().unwrap_or("");
         let key = TValue::Str(str_to_ls(&self.string_table, name_str));
         let name_ptr = name.as_ptr() as *const u8;
@@ -1847,9 +1808,9 @@ impl LuaState {
     /// ```
     pub fn set_builtin_in_table(
         &self,
-        table: &Table,
+        table: &Table<'a>,
         name: &'static std::ffi::CStr,
-        func: BuiltinFnPtr,
+        func: BuiltinFnPtr<'a>,
     ) {
         let name_str = name.to_str().unwrap_or("");
         let key = TValue::Str(str_to_ls(&self.string_table, name_str));
@@ -2158,7 +2119,7 @@ impl LuaState {
     }
 
     /// 推入调用栈条目 — 用于堆栈回溯
-    pub fn push_call_info(&mut self, entry: CallInfoEntry) {
+    pub fn push_call_info(&mut self, entry: CallInfoEntry<'a>) {
         self.exec.call_info.push(entry);
     }
 
@@ -2723,7 +2684,9 @@ impl LuaState {
                             // 对应 C Lua 的 longjmp 恢复：错误值来自当前错误，而非全局状态
                             let err_from_e = match e {
                                 VmError::RuntimeErrorValue(val) => val.clone(),
-                                VmError::RuntimeError(s) => TValue::Str(self.intern_str(s)),
+                                VmError::RuntimeError(s) => {
+                                    TValue::Str(self.intern_str(s.as_str()))
+                                }
                                 other => TValue::Str(self.intern_str(&format!("{}", other))),
                             };
                             self.last_error_value = Some(err_from_e);
@@ -3103,7 +3066,7 @@ impl LuaState {
         &mut self,
         func_idx: usize,
         nresults: i32,
-        func: crate::objects::BuiltinFnPtr,
+        func: crate::objects::BuiltinFnPtr<'a>,
         name: &'static str,
     ) -> i32 {
         let nargs = self.exec.stack.len().saturating_sub(func_idx + 1);
@@ -3275,8 +3238,8 @@ impl LuaState {
         str_to_ls(&self.string_table, s)
     }
 
-    pub fn intern(&self, s: &str) -> LuaString {
-        str_to_ls(&self.string_table, s)
+    pub fn intern(&self, s: &str) -> TValue<'a> {
+        TValue::Str(str_to_ls(&self.string_table, s))
     }
 
     /// 从 owned String 创建 LuaString，长字符串路径直接 consume 避免 clone。
@@ -3311,12 +3274,12 @@ impl LuaState {
 
     /// 注册弱引用表 — 当 setmetatable 设置包含 __mode 的元表时调用
     /// 使用 Weak 引用避免阻止表本身的回收
-    pub fn register_weak_table(&mut self, t: &Table) {
+    pub fn register_weak_table(&mut self, t: &Table<'a>) {
         self.weak_tables.push(Rc::downgrade(&t.data));
     }
 
     /// 注册有 __gc 元方法的对象 — 当 setmetatable 设置包含 __gc 的元表时调用
-    pub fn register_finobj(&mut self, t: &Table) {
+    pub fn register_finobj(&mut self, t: &Table<'a>) {
         if self.gc_closing {
             return;
         }
@@ -3332,7 +3295,7 @@ impl LuaState {
 
     /// 注册有 __gc 元方法的 UserData — FILE* 等通过默认元表设置的 userdata
     /// 存储 Rc<Udata> 引用（而非深拷贝），确保 __gc 在原始 userdata 上调用
-    pub fn register_ud_finobj(&mut self, u: &Rc<crate::objects::Udata>) {
+    pub fn register_ud_finobj(&mut self, u: &Rc<crate::objects::Udata<'a>>) {
         if self.gc_closing {
             return;
         }
@@ -3357,7 +3320,7 @@ impl LuaState {
         &self,
         reachable: &mut GcHashSet,
         visited: &mut GcHashSet,
-        worklist: &mut Vec<RawTValue>,
+        worklist: &mut Vec<RawTValue<'a>>,
         extra_size: &mut usize,
     ) {
         let mode_key = TValue::Str(self.mode_key_cached());
@@ -3957,9 +3920,9 @@ impl LuaState {
         &mut self,
         reachable: &mut GcHashSet,
         visited: &mut GcHashSet,
-        worklist: &mut Vec<RawTValue>,
+        worklist: &mut Vec<RawTValue<'a>>,
         extra_size: &mut usize,
-    ) -> Vec<TValue> {
+    ) -> Vec<TValue<'a>> {
         let gc_key = TValue::Str(self.gc_key_cached());
         let mut to_finalize: Vec<TValue> = Vec::new();
         let mut keep: Vec<Table> = Vec::new();
@@ -4033,7 +3996,7 @@ impl LuaState {
     /// finalizer 调用后同步 closed upvalue 值回主线程栈：协程首次 resume 时
     /// open upvalue 被关闭，finalizer 修改 closed upvalue 的值不会自动同步回
     /// 主线程栈上的原始位置，需要在此手动同步（通过协程的 upval_origins 记录）。
-    fn call_finalizers(&mut self, to_finalize: Vec<TValue>) {
+    fn call_finalizers(&mut self, to_finalize: Vec<TValue<'a>>) {
         let gc_key = TValue::Str(self.gc_key_cached());
 
         // 构建 upval_origins 映射：UpVal Rc 指针 -> original_stack_index
@@ -4168,7 +4131,7 @@ impl LuaState {
     }
 
     /// 收集协程的根对象
-    fn collect_thread_roots(&self, thread: &LuaThread, worklist: &mut Vec<RawTValue>) {
+    fn collect_thread_roots(&self, thread: &LuaThread<'a>, worklist: &mut Vec<RawTValue<'a>>) {
         for val in &thread.stack {
             if Self::needs_gc_mark(val) {
                 unsafe { worklist.push(raw_from_tvalue(val)) };
@@ -4248,7 +4211,7 @@ impl LuaState {
     /// 其他类型（Nil/Boolean/Integer/Float/Str 等）不需要 GC 标记，
     /// 过滤掉可避免大量无意义的 clone（perf 显示 TValue::clone 占 7.75%）。
     #[cfg_attr(not(size_optimized), inline)]
-    fn needs_gc_mark(val: &TValue) -> bool {
+    fn needs_gc_mark(val: &TValue<'a>) -> bool {
         matches!(
             val,
             TValue::Table(_)
@@ -4262,10 +4225,10 @@ impl LuaState {
 
     fn mark_tvalue(
         &self,
-        val: &TValue,
+        val: &TValue<'a>,
         reachable: &mut GcHashSet,
         visited: &mut GcHashSet,
-        worklist: &mut Vec<RawTValue>,
+        worklist: &mut Vec<RawTValue<'a>>,
         extra_size: &mut usize,
     ) {
         match val {
@@ -4681,7 +4644,7 @@ mod tests {
     #[test]
     fn test_stack_init_matches_cpp() {
         // 验证 stack_init: 参考 lstate.cpp L158-169
-        let state = LuaState::new();
+        let state = LuaState::default();
         // L->top = stack + 1 → gettop() 必须返回 1
         assert_eq!(
             state.gettop(),
@@ -4838,7 +4801,7 @@ mod tests {
 
     #[test]
     fn test_load_file_decodes_iso8859_strings() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests_lua/strings.lua");
         let status = state.load_file(Some(path));
         assert_eq!(
@@ -4855,7 +4818,7 @@ mod tests {
 
     #[test]
     fn test_load_file_skips_shebang_all() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests_lua/all.lua");
         let status = state.load_file(Some(path));
         assert_eq!(
@@ -4869,7 +4832,7 @@ mod tests {
 
     #[test]
     fn test_load_file_missing() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let status = state.load_file(Some("/nonexistent/path/file.lua"));
         assert_eq!(status, ERR_FILE);
         let msg = state.to_string(-1).unwrap_or_default();
@@ -4881,7 +4844,7 @@ mod tests {
         let mut content = b"\x1bLua\x55".to_vec();
         content.extend_from_slice(&[0; 10]);
         let path = write_tmp("binary", &content);
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let status = state.load_file(Some(path.to_str().unwrap()));
         assert_eq!(status, ERR_SYNTAX);
         let msg = state.to_string(-1).unwrap_or_default();
@@ -4894,7 +4857,7 @@ mod tests {
         let mut content = b"\x1bLua\x55".to_vec();
         content.extend_from_slice(&[0; 10]);
         let path = write_tmp("bin_text_mode", &content);
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let status = state.load_filex(Some(path.to_str().unwrap()), Some("t"));
         assert_eq!(status, ERR_SYNTAX);
         let msg = state.to_string(-1).unwrap_or_default();
@@ -4905,7 +4868,7 @@ mod tests {
     #[test]
     fn test_load_file_mode_binary_rejects_text() {
         let path = write_tmp("text_bin_mode", b"return 42\n");
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let status = state.load_filex(Some(path.to_str().unwrap()), Some("b"));
         assert_eq!(status, ERR_SYNTAX);
         let msg = state.to_string(-1).unwrap_or_default();
@@ -4920,7 +4883,7 @@ mod tests {
     #[test]
     fn test_load_file_bom() {
         let path = write_tmp("bom", b"\xef\xbb\xbfreturn 42\n");
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let status = state.load_file(Some(path.to_str().unwrap()));
         assert_eq!(
             status,
@@ -4935,7 +4898,7 @@ mod tests {
     #[test]
     fn test_load_file_shebang_only() {
         let path = write_tmp("shebang_only", b"#!/usr/bin/env lua\n");
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let status = state.load_file(Some(path.to_str().unwrap()));
         assert_eq!(
             status,
@@ -4954,7 +4917,7 @@ mod tests {
         bytes.extend_from_slice(&[0xe1, 0xe9, 0xed]);
         bytes.extend_from_slice(b"\"\nreturn #s\n");
         let path = write_tmp("latin1_str", &bytes);
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let status = state.load_file(Some(path.to_str().unwrap()));
         assert_eq!(
             status,
@@ -4973,7 +4936,7 @@ mod tests {
         bytes.extend_from_slice(&[0xc1, 0xc9, 0xcd]);
         bytes.extend_from_slice(b"\"\n");
         let path = write_tmp("shebang_latin1", &bytes);
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let status = state.load_file(Some(path.to_str().unwrap()));
         assert_eq!(
             status,

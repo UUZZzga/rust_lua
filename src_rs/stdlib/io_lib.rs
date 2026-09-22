@@ -184,7 +184,7 @@ const MAXARGLINE: usize = 250;
 // 栈操作辅助函数
 // ============================================================================
 
-fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
+fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.exec.stack.len() {
         return TValue::Nil(NilKind::Strict);
@@ -198,7 +198,12 @@ fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
 
 /// 检查参数是否是 FILE* userdata 并返回其 ptr_id
 /// 对应 C 的 tolstream -> luaL_checkudata
-fn check_file_arg(state: &LuaState, a: usize, nargs: usize, fname: &str) -> Result<u32, VmError> {
+fn check_file_arg<'a>(
+    state: &LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    fname: &str,
+) -> Result<u32, VmError<'a>> {
     if nargs < 1 {
         return Err(VmError::RuntimeError(format!(
             "bad argument #1 to '{}' (FILE* expected, got no value)",
@@ -245,7 +250,11 @@ fn is_closed(state: &LuaState, ptr_id: u32) -> bool {
 ///
 /// 创建带 FILE* 元表的 UserData，并把 FILE* 存入 state.file_handles。
 /// 注册到 GC（设置 id）和 ud_finobj_list（如果有 __gc 元方法）。
-fn new_file_userdata(state: &mut LuaState, file: *mut libc::FILE, file_mt: &Table) -> TValue {
+fn new_file_userdata<'a>(
+    state: &mut LuaState<'a>,
+    file: *mut libc::FILE,
+    file_mt: &Table<'a>,
+) -> TValue<'a> {
     let udata = crate::objects::Udata {
         gc_header: crate::gc::GCObjectHeader::new(),
         nuvalue: 0,
@@ -300,9 +309,9 @@ fn check_mode(mode: &str) -> bool {
 ///
 /// 成功: 推入 true，返回 1
 /// 失败: 推入 nil, "filename: error" 或 "error", errno，返回 3
-fn file_result(
-    state: &mut LuaState,
-    results: &mut Vec<TValue>,
+fn file_result<'a>(
+    state: &mut LuaState<'a>,
+    results: &mut Vec<TValue<'a>>,
     stat: bool,
     fname: Option<&str>,
 ) -> usize {
@@ -345,7 +354,11 @@ fn check_modep(mode: &str) -> bool {
 /// - 非零退出: 返回 nil, "exit", exitcode
 /// - 被信号终止: 返回 nil, "signal", signo
 /// - errno 错误: 返回 nil, error_msg, errno
-pub fn exec_result(state: &mut LuaState, results: &mut Vec<TValue>, stat: i32) -> usize {
+pub fn exec_result<'a>(
+    state: &mut LuaState<'a>,
+    results: &mut Vec<TValue<'a>>,
+    stat: i32,
+) -> usize {
     let en = unsafe { *compat::errno_ptr() };
     if stat != 0 && en != 0 {
         // errno 错误 — 对应 luaL_fileresult(L, 0, NULL)
@@ -387,12 +400,12 @@ pub fn exec_result(state: &mut LuaState, results: &mut Vec<TValue>, stat: i32) -
 /// - 用 libc::fopen 打开文件
 /// - 成功: 返回 userdata (带 FILE* 元表)
 /// - 失败: 返回 nil, error_msg, errno
-fn call_io_open(
-    state: &mut LuaState,
+fn call_io_open<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     if nargs < 1 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'open' (string expected, got no value)".to_string(),
@@ -465,12 +478,12 @@ fn call_io_open(
 // io.tmpfile 实现 (对应 C 的 io_tmpfile)
 // ============================================================================
 
-fn call_io_tmpfile(
-    state: &mut LuaState,
+fn call_io_tmpfile<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     unsafe {
         *compat::errno_ptr() = 0;
     }
@@ -508,12 +521,12 @@ fn call_io_tmpfile(
 /// - 用 libc::popen 打开进程
 /// - 成功: 返回 userdata (带 FILE* 元表), 标记为 popen 文件
 /// - 失败: 返回 nil, error_msg, errno
-fn call_io_popen(
-    state: &mut LuaState,
+fn call_io_popen<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     if nargs < 1 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'popen' (string expected, got no value)".to_string(),
@@ -596,13 +609,13 @@ fn call_io_popen(
 /// 通用 write 实现 — 对应 C 的 g_write
 ///
 /// 将多个参数写入 FILE*，返回 (true) 或 (nil, err, errno, count)
-fn g_write(
-    state: &mut LuaState,
+fn g_write<'a>(
+    state: &mut LuaState<'a>,
     _a: usize,
     nargs: usize,
     f: *mut libc::FILE,
     first_arg: usize,
-) -> Result<Vec<TValue>, VmError> {
+) -> Result<Vec<TValue<'a>>, VmError<'a>> {
     let mut total_bytes: u64 = 0;
     unsafe {
         *compat::errno_ptr() = 0;
@@ -652,12 +665,12 @@ fn g_write(
 }
 
 /// io.write(...) — 写入到默认输出流
-fn call_io_write(
-    state: &mut LuaState,
+fn call_io_write<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     // 获取默认输出流
     let f = get_default_output(state)?;
     if nargs == 0 {
@@ -680,12 +693,12 @@ fn call_io_write(
 // ============================================================================
 
 /// io.output([file]) — 设置或获取默认输出流
-fn call_io_output(
-    state: &mut LuaState,
+fn call_io_output<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     if nargs > 0 {
         let arg = get_arg(state, a, 0);
         if !arg.is_nil() {
@@ -774,12 +787,12 @@ fn call_io_output(
 // io.input 实现 (对应 C 的 io_input / g_iofile)
 // ============================================================================
 
-fn call_io_input(
-    state: &mut LuaState,
+fn call_io_input<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     if nargs > 0 {
         let arg = get_arg(state, a, 0);
         if !arg.is_nil() {
@@ -861,12 +874,12 @@ fn call_io_input(
 // io.close / file:close 实现 (对应 C 的 io_close / f_close)
 // ============================================================================
 
-fn call_io_close(
-    state: &mut LuaState,
+fn call_io_close<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     if nargs == 0 {
         // 关闭默认输出流 (对应 C: io_close 无参数时取 IO_OUTPUT 再调用 f_close)
         let ptr_id = state.io_output_handle;
@@ -928,21 +941,21 @@ fn call_io_close(
     close_file_handle(state, a, nargs, nresults)
 }
 
-fn call_file_close_method(
-    state: &mut LuaState,
+fn call_file_close_method<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     close_file_handle(state, a, nargs, nresults)
 }
 
-fn close_file_handle(
-    state: &mut LuaState,
+fn close_file_handle<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let ptr_id = check_file_arg(state, a, nargs, "close")?;
 
     // 检查是否是标准文件 (stdin/stdout/stderr)
@@ -1003,12 +1016,12 @@ fn close_file_handle(
 // io.type 实现 (对应 C 的 io_type)
 // ============================================================================
 
-fn call_io_type(
-    state: &mut LuaState,
+fn call_io_type<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     if nargs < 1 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'type' (value expected)".to_string(),
@@ -1042,7 +1055,7 @@ fn call_io_type(
 // ============================================================================
 
 /// 读取数字 — 对应 C 的 read_number
-fn read_number(f: *mut libc::FILE) -> Option<TValue> {
+fn read_number<'a>(f: *mut libc::FILE) -> Option<TValue<'a>> {
     // 对应 C 的 L_MAXLENNUM: 缓冲区最大长度，超过则解析失败
     const L_MAXLENNUM: usize = 200;
     let mut buf: Vec<u8> = Vec::with_capacity(L_MAXLENNUM + 1);
@@ -1288,13 +1301,13 @@ fn read_chars(f: *mut libc::FILE, n: usize) -> Option<Vec<u8>> {
 /// 通用 read 实现 — 对应 C 的 g_read
 ///
 /// first_arg: 第一个读取格式参数在栈上的索引 (io.read: 1, f:read: 2)
-fn g_read(
-    state: &mut LuaState,
+fn g_read<'a>(
+    state: &mut LuaState<'a>,
     _a: usize,
     nargs: usize,
     f: *mut libc::FILE,
     first_arg: usize,
-) -> Result<Vec<TValue>, VmError> {
+) -> Result<Vec<TValue<'a>>, VmError<'a>> {
     unsafe {
         compat::clearerr(f);
     }
@@ -1467,12 +1480,12 @@ fn g_read(
 }
 
 /// io.read(...) — 从默认输入流读取
-fn call_io_read(
-    state: &mut LuaState,
+fn call_io_read<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let f = get_default_input(state)?;
     let results = g_read(state, a, nargs, f, a + 1)?;
     state.adjust_results(a, nresults, results);
@@ -1480,12 +1493,12 @@ fn call_io_read(
 }
 
 /// file:read(...) — 从指定文件读取
-fn call_file_read(
-    state: &mut LuaState,
+fn call_file_read<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let ptr_id = check_file_arg(state, a, nargs, "read")?;
     let f = match get_file_ptr(state, ptr_id) {
         Some(f) => f,
@@ -1506,12 +1519,12 @@ fn call_file_read(
 // file:write 实现 (对应 C 的 f_write / g_write)
 // ============================================================================
 
-fn call_file_write(
-    state: &mut LuaState,
+fn call_file_write<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let ptr_id = check_file_arg(state, a, nargs, "write")?;
     let f = match get_file_ptr(state, ptr_id) {
         Some(f) => f,
@@ -1538,12 +1551,12 @@ fn call_file_write(
 // file:seek 实现 (对应 C 的 f_seek)
 // ============================================================================
 
-fn call_file_seek(
-    state: &mut LuaState,
+fn call_file_seek<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let ptr_id = check_file_arg(state, a, nargs, "seek")?;
     let f = match get_file_ptr(state, ptr_id) {
         Some(f) => f,
@@ -1641,12 +1654,12 @@ fn call_file_seek(
 // file:flush 实现 (对应 C 的 f_flush / aux_flush)
 // ============================================================================
 
-fn call_file_flush(
-    state: &mut LuaState,
+fn call_file_flush<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let ptr_id = check_file_arg(state, a, nargs, "flush")?;
     let f = match get_file_ptr(state, ptr_id) {
         Some(f) => f,
@@ -1667,12 +1680,12 @@ fn call_file_flush(
 }
 
 /// io.flush() — 刷新默认输出流
-fn call_io_flush(
-    state: &mut LuaState,
+fn call_io_flush<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let f = get_default_output(state)?;
     unsafe {
         *compat::errno_ptr() = 0;
@@ -1688,12 +1701,12 @@ fn call_io_flush(
 // file:setvbuf 实现 (对应 C 的 f_setvbuf)
 // ============================================================================
 
-fn call_file_setvbuf(
-    state: &mut LuaState,
+fn call_file_setvbuf<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let ptr_id = check_file_arg(state, a, nargs, "setvbuf")?;
     let f = match get_file_ptr(state, ptr_id) {
         Some(f) => f,
@@ -1776,12 +1789,12 @@ const LINES_UP_FINISHED: usize = 2;
 const LINES_UP_FORMATS_BASE: usize = 3;
 
 /// 构造 lines 迭代器的 RustClosure
-fn new_lines_iterator(
-    _state: &LuaState,
+fn new_lines_iterator<'a>(
+    _state: &LuaState<'a>,
     file_ptr_id: u32,
     to_close: bool,
-    formats: Vec<TValue>,
-) -> TValue {
+    formats: Vec<TValue<'a>>,
+) -> TValue<'a> {
     let mut upvalues = Vec::with_capacity(LINES_UP_FORMATS_BASE + formats.len());
     upvalues.push(TValue::Integer(file_ptr_id as i64));
     upvalues.push(TValue::Boolean(to_close));
@@ -1797,12 +1810,12 @@ fn new_lines_iterator(
 }
 
 /// io.lines([filename, [fmt1, ...]]) — 创建行迭代器
-fn call_io_lines(
-    state: &mut LuaState,
+fn call_io_lines<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     // 检查参数数量（对应 C 的 luaL_argcheck n <= MAXARGLINE）
     // nargs 含文件名，格式参数数量 = nargs - 1
     if nargs > 0 {
@@ -1906,12 +1919,12 @@ fn call_io_lines(
 }
 
 /// file:lines([fmt1, ...]) — 创建行迭代器
-fn call_file_lines(
-    state: &mut LuaState,
+fn call_file_lines<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     // 检查参数数量（对应 C 的 luaL_argcheck n <= MAXARGLINE）
     // nargs 含 self，格式参数数量 = nargs - 1
     let n_fmts = nargs.saturating_sub(1);
@@ -1936,12 +1949,12 @@ fn call_file_lines(
 ///
 /// 从 state.exec.stack[a] 取回 RustClosure，再从 upvalues 取状态。
 /// upvalues 布局见 [`new_lines_iterator`]。
-fn call_lines_iterator_fn(
-    state: &mut LuaState,
+fn call_lines_iterator_fn<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let _ = nargs; // lines 迭代器无参数
 
     // 从 state.exec.stack[a] 取出 RustClosure，提取状态
@@ -2043,7 +2056,7 @@ fn call_lines_iterator_fn(
 }
 
 /// 标记 lines 迭代器为已完成 — 更新 upvalues[LINES_UP_FINISHED] = true
-fn mark_lines_finished(state: &mut LuaState, a: usize) {
+fn mark_lines_finished<'a>(state: &mut LuaState<'a>, a: usize) {
     if let Some(TValue::RustClosure(rc)) = state.exec.stack.get(a).cloned() {
         let mut upvals = rc.upvalues.borrow_mut();
         if upvals.len() > LINES_UP_FINISHED {
@@ -2057,7 +2070,7 @@ fn mark_lines_finished(state: &mut LuaState, a: usize) {
 // ============================================================================
 
 /// 获取默认输出流的 FILE* — 对应 C 的 getiofile(L, IO_OUTPUT)
-fn get_default_output(state: &mut LuaState) -> Result<*mut libc::FILE, VmError> {
+fn get_default_output<'a>(state: &mut LuaState<'a>) -> Result<*mut libc::FILE, VmError<'a>> {
     // 优先检查 io_output_handle
     if let Some(pid) = state.io_output_handle {
         if let Some(f) = state.file_handles.get(&pid).copied() {
@@ -2082,7 +2095,7 @@ fn get_default_output(state: &mut LuaState) -> Result<*mut libc::FILE, VmError> 
 }
 
 /// 获取默认输入流的 FILE* — 对应 C 的 getiofile(L, IO_INPUT)
-fn get_default_input(state: &mut LuaState) -> Result<*mut libc::FILE, VmError> {
+fn get_default_input<'a>(state: &mut LuaState<'a>) -> Result<*mut libc::FILE, VmError<'a>> {
     if let Some(pid) = state.io_input_handle {
         if let Some(f) = state.file_handles.get(&pid).copied() {
             return Ok(f);
@@ -2094,7 +2107,7 @@ fn get_default_input(state: &mut LuaState) -> Result<*mut libc::FILE, VmError> {
 }
 
 /// 获取当前输出流的 UserData (用于 io.output() 返回值)
-fn get_current_output_userdata(state: &mut LuaState) -> TValue {
+fn get_current_output_userdata<'a>(state: &mut LuaState<'a>) -> TValue<'a> {
     let io_key = TValue::Str(state.intern_str("io"));
     if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
         if let Some(pid) = state.io_output_handle {
@@ -2128,7 +2141,7 @@ fn get_current_output_userdata(state: &mut LuaState) -> TValue {
 }
 
 /// 获取当前输入流的 UserData (用于 io.input() 返回值)
-fn get_current_input_userdata(state: &mut LuaState) -> TValue {
+fn get_current_input_userdata<'a>(state: &mut LuaState<'a>) -> TValue<'a> {
     let io_key = TValue::Str(state.intern_str("io"));
     if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
         if let Some(pid) = state.io_input_handle {
@@ -2175,12 +2188,12 @@ fn get_stdin_ptr_id(state: &LuaState) -> u32 {
 // FILE* 元方法实现 (对应 C 的 metameth: __gc, __close, __tostring)
 // ============================================================================
 
-fn call_file_gc(
-    state: &mut LuaState,
+fn call_file_gc<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let ptr_id = check_file_arg(state, a, nargs, "__gc")?;
     if let Some(f) = state.file_handles.get(&ptr_id).copied() {
         // 检查是否是标准文件
@@ -2215,22 +2228,22 @@ fn call_file_gc(
     Ok(())
 }
 
-fn call_file_close(
-    state: &mut LuaState,
+fn call_file_close<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     // __close 行为同 __gc
     call_file_gc(state, a, nargs, nresults)
 }
 
-fn call_file_tostring(
-    state: &mut LuaState,
+fn call_file_tostring<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let ptr_id = check_file_arg(state, a, nargs, "__tostring")?;
     let result = if is_closed(state, ptr_id) {
         TValue::Str(state.intern_str("file (closed)"))
@@ -2246,18 +2259,18 @@ fn call_file_tostring(
 // 打开 I/O 库 — 对应 C 的 luaopen_io
 // ============================================================================
 
-pub fn open_io_lib(state: &mut LuaState) {
+pub fn open_io_lib<'a>(state: &mut LuaState<'a>) {
     let mut lib = Table::new();
 
     // 注册 BuiltinFn 的辅助闭包：用函数指针 + 名字注册到表
     // (state 作为参数传入，避免闭包捕获 state 导致借用冲突)
-    let register = |table: &mut crate::table::Table,
-                    state: &LuaState,
+    let register = |table: &mut crate::table::Table<'a>,
+                    state: &LuaState<'a>,
                     name: &'static std::ffi::CStr,
-                    func: crate::objects::BuiltinFnPtr| {
-        let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
+                    func: crate::objects::BuiltinFnPtr<'a>| {
+        let key = state.intern(name.to_str().unwrap_or(""));
         let name_ptr = name.as_ptr() as *const u8;
-        table.set(key, TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)));
+        table.set(key, BuiltinFn::impure_tvalue(func, name_ptr));
     };
 
     // 创建 FILE* 元表 (对应 C 的 LUA_FILEHANDLE)

@@ -8,52 +8,23 @@
 //! 5. SETUPVAL/GETUPVAL — 上值读写正确性
 
 use lua_rs::cli::Interpreter;
-use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 #[cfg(windows)]
 use std::os::windows::process::ExitStatusExt;
 use std::sync::{Arc, Mutex};
 
-struct SharedWriter {
-    buffer: Arc<Mutex<Vec<u8>>>,
-}
-
-impl SharedWriter {
-    fn new() -> (Self, Arc<Mutex<Vec<u8>>>) {
-        let buffer = Arc::new(Mutex::new(Vec::new()));
-        (
-            Self {
-                buffer: buffer.clone(),
-            },
-            buffer,
-        )
-    }
-}
-
-impl Write for SharedWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.buffer.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
+/// 运行 Lua 代码并返回输出
 fn run_lua(args: &[&str]) -> std::process::Output {
-    let mut interpreter = Interpreter::new().unwrap();
-    let (stdout_writer, stdout_buffer) = SharedWriter::new();
-    let (stderr_writer, stderr_buffer) = SharedWriter::new();
-    interpreter.set_stdout(Box::new(stdout_writer));
-    interpreter.set_stderr(Box::new(stderr_writer));
-
-    let mut args_vec: Vec<String> = vec!["lua".to_string()];
-    args_vec.extend(args.iter().map(|s| s.to_string()));
-    let success = interpreter.pmain(&args_vec);
-
-    let stdout_buf = stdout_buffer.lock().unwrap().clone();
-    let stderr_buf = stderr_buffer.lock().unwrap().clone();
+    let mut buff = lua_rs::mock::io_mock::BufferIo::new("");
+    let success = {
+        let mut interpreter = Interpreter::new(&mut buff);
+        let mut args_vec: Vec<String> = vec!["lua".to_string()];
+        args_vec.extend(args.iter().map(|s| s.to_string()));
+        interpreter.pmain(&args_vec)
+    };
+    let stdout_buf = buff.stdout();
+    let stderr_buf = buff.stderr();
 
     let stdout_str = String::from_utf8_lossy(&stdout_buf);
     let stderr_str = String::from_utf8_lossy(&stderr_buf);
@@ -66,8 +37,8 @@ fn run_lua(args: &[&str]) -> std::process::Output {
 
     std::process::Output {
         status: std::process::ExitStatus::from_raw(if success { 0 } else { 1 } as _),
-        stdout: stdout_buf,
-        stderr: stderr_buf,
+        stdout: stdout_buf.to_vec(),
+        stderr: stderr_buf.to_vec(),
     }
 }
 

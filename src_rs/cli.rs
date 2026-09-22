@@ -8,7 +8,7 @@ use crate::state::{LuaState, ERR_RUN, ERR_SYNTAX, MIN_STACK, MULT_RET};
 #[cfg(size_optimized)]
 use crate::state::LuaStderr;
 
-use std::io::{self, BufRead, IsTerminal, Write};
+use std::io::{self, IsTerminal};
 use std::rc::Rc;
 use std::sync::atomic::Ordering;
 
@@ -26,46 +26,32 @@ const HAS_V: i32 = 4;
 const HAS_E: i32 = 8;
 const HAS_EE: i32 = 16;
 
-pub struct Interpreter {
-    l: LuaState,
+pub struct Interpreter<'io> {
+    l: LuaState<'io>,
     progname: String,
-    stderr: Box<dyn Write>,
 }
 
-impl Interpreter {
-    pub fn new() -> Option<Self> {
-        let l = LuaState::new();
+impl<'io> Interpreter<'io> {
+    pub fn new(io: &'io mut dyn crate::mock::io_mock::Io) -> Self {
+        let l = LuaState::new(io);
         l.gc_stop();
-        Some(Interpreter {
+        Interpreter {
             l,
             progname: LUA_PROGNAME.to_string(),
-            // 体积优先: 用 LuaStderr 包装, 覆盖 write_fmt 避免 default_write_fmt → StringError
-            #[cfg(size_optimized)]
-            stderr: Box::new(LuaStderr(io::stderr())),
-            #[cfg(not(size_optimized))]
-            stderr: Box::new(io::stderr()),
-        })
-    }
-
-    pub fn set_stdout(&mut self, writer: Box<dyn Write>) {
-        self.l.stdout = writer;
-    }
-
-    pub fn set_stderr(&mut self, writer: Box<dyn Write>) {
-        self.stderr = writer;
+        }
     }
 
     fn writestring(&mut self, s: &str) {
-        let _ = self.l.stdout.write_all(s.as_bytes());
+        let _ = self.l.io.out(s);
     }
 
     fn writestring_error(&mut self, s: &str) {
-        let _ = self.stderr.write_all(s.as_bytes());
+        let _ = self.l.io.err(s);
     }
 
     fn writeline(&mut self) {
-        let _ = self.l.stdout.write_all(b"\n");
-        let _ = self.l.stdout.flush();
+        let _ = self.l.io.out("\n");
+        let _ = self.l.io.out_flush();
     }
 
     fn print_version(&mut self) {
@@ -83,8 +69,9 @@ impl Interpreter {
             // 体积优先: 用 write_all + format! 替代 write!(self.stderr, ...)
             // 避免 io::Write::write_fmt 默认实现引入 StringError + Unicode 表 (~4KB)
             let _ = self
-                .stderr
-                .write_all(format!("{}: {}\n", self.progname, msg).as_bytes());
+                .l
+                .io
+                .err(format!("{}: {}\n", self.progname, msg).as_str());
             self.l.pop(1);
         }
         status
@@ -360,43 +347,18 @@ impl Interpreter {
     }
 
     fn readline(&mut self, prompt: &str) -> Option<String> {
-        let _ = self.l.stdout.write_all(prompt.as_bytes());
-        let _ = self.l.stdout.flush();
+        let _ = self.l.io.out(prompt);
+        let _ = self.l.io.out_flush();
         let stdin = io::stdin();
-        // 体积优先: 用 read_until 代替 read_line, 避免 read_line 引入
-        // core::unicode::grapheme_extend 表 (~4KB, 用于 UTF-8 行边界检测)
-        #[cfg(size_optimized)]
-        {
-            let mut buf: Vec<u8> = Vec::with_capacity(LUA_MAXINPUT);
-            match stdin.lock().read_until(b'\n', &mut buf) {
-                Ok(0) => return None,
-                Ok(_) => {}
-                Err(_) => return None,
-            }
-            // 非终端时回显输入行
-            if !stdin.is_terminal() {
-                let _ = self.l.stdout.write_all(&buf);
-                let _ = self.l.stdout.flush();
-            }
-            // 去除行尾 \n 和 \r (手动处理, 避免 String::from_utf8 引入额外代码)
-            while buf.last() == Some(&b'\n') || buf.last() == Some(&b'\r') {
-                buf.pop();
-            }
-            match String::from_utf8(buf) {
-                Ok(s) => Some(s),
-                Err(_) => None,
-            }
-        }
-        #[cfg(not(size_optimized))]
         {
             let mut line = String::with_capacity(LUA_MAXINPUT);
-            match stdin.lock().read_line(&mut line) {
+            match self.l.io.read_line(&mut line) {
                 Ok(0) => None,
                 Ok(_) => {
                     // 非终端时回显输入行（模拟 readline 库在管道/重定向时的行为）
                     if !stdin.is_terminal() {
-                        let _ = self.l.stdout.write_all(line.as_bytes());
-                        let _ = self.l.stdout.flush();
+                        let _ = self.l.io.out(line.as_str());
+                        let _ = self.l.io.out_flush();
                     }
                     if line.ends_with('\n') {
                         line.pop();
@@ -540,8 +502,8 @@ impl Interpreter {
                     .l
                     .to_string(-1)
                     .unwrap_or_else(|| "(error)".to_string());
-                let _ = self.stderr.write_all(
-                    format!("{}: error calling 'print' ({})\n", self.progname, err_msg).as_bytes(),
+                let _ = self.l.io.err(
+                    format!("{}: error calling 'print' ({})\n", self.progname, err_msg).as_str(),
                 );
             }
         }
@@ -637,22 +599,22 @@ impl Interpreter {
     fn print_usage(&mut self, badoption: &str) {
         // 体积优先: 用 write_all + format! 替代 write!/writeln!(self.stderr, ...)
         // 避免 io::Write::write_fmt 默认实现引入 StringError + Unicode 表 (~4KB)
-        let _ = self
-            .stderr
-            .write_all(format!("{}: ", LUA_PROGNAME).as_bytes());
+        let _ = self.l.io.err(format!("{}: ", LUA_PROGNAME).as_str());
         match badoption.chars().nth(1) {
             Some('e' | 'l') => {
                 let _ = self
-                    .stderr
-                    .write_all(format!("'{}' needs argument\n", badoption).as_bytes());
+                    .l
+                    .io
+                    .err(format!("'{}' needs argument\n", badoption).as_str());
             }
             _ => {
                 let _ = self
-                    .stderr
-                    .write_all(format!("unrecognized option '{}'\n", badoption).as_bytes());
+                    .l
+                    .io
+                    .err(format!("unrecognized option '{}'\n", badoption).as_str());
             }
         }
-        let _ = self.stderr.write_all(
+        let _ = self.l.io.err(
             format!(
                 "usage: {} [options] [script [args]]\n\
              Available options are:\n\
@@ -667,7 +629,7 @@ impl Interpreter {
                -         stop handling options and execute stdin\n",
                 LUA_PROGNAME
             )
-            .as_bytes(),
+            .as_str(),
         );
     }
 
@@ -745,6 +707,12 @@ impl Interpreter {
     }
 }
 
+impl Default for Interpreter<'static> {
+    fn default() -> Self {
+        Self::new(crate::mock::io_mock::lua_io())
+    }
+}
+
 unsafe extern "C" fn laction(sig: i32) {
     // 对应 C 的 laction: setsignal(i, SIG_DFL) — 恢复默认信号处理
     // 如果另一个 SIGINT 发生，终止进程
@@ -813,12 +781,7 @@ pub fn main() {
     }
     let args: Vec<String> = std::env::args().collect();
 
-    let mut interpreter = match Interpreter::new() {
-        Some(ip) => ip,
-        None => {
-            std::process::exit(1);
-        }
-    };
+    let mut interpreter = Interpreter::default();
 
     let result = interpreter.pmain(&args);
     interpreter.l.close_state();
@@ -832,12 +795,6 @@ pub fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_interpreter_new() {
-        let interp = Interpreter::new();
-        assert!(interp.is_some());
-    }
 
     #[test]
     fn test_collect_args_empty() {

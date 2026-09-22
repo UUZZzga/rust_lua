@@ -1489,7 +1489,7 @@ fn make_long_string(s: &str) -> LuaString {
 
 /// 将 DumpedFunction 转换为 Proto
 /// 对应 C 的 luaU_undump 后的 Proto 构建
-pub fn dumped_to_proto(df: &DumpedFunction) -> Proto {
+pub fn dumped_to_proto<'a>(df: &DumpedFunction) -> Proto<'a> {
     let mut proto = new_proto_internal();
     proto.line_defined = df.linedefined;
     proto.last_line_defined = df.lastlinedefined;
@@ -1576,7 +1576,7 @@ pub fn dumped_to_proto(df: &DumpedFunction) -> Proto {
 }
 
 /// 创建新的 Proto（内部使用，避免循环依赖）
-fn new_proto_internal() -> Proto {
+fn new_proto_internal<'a>() -> Proto<'a> {
     Proto {
         num_params: 0,
         flag: 0,
@@ -1603,7 +1603,7 @@ fn new_proto_internal() -> Proto {
 
 /// 从二进制数据加载 Proto
 /// 对应 C 的 luaU_undump
-pub fn undump_to_proto(data: &[u8]) -> Result<Proto, String> {
+pub fn undump_to_proto<'a>(data: &[u8]) -> Result<Proto<'a>, String> {
     let df = parse_dump(data.to_vec())?;
     Ok(dumped_to_proto(&df))
 }

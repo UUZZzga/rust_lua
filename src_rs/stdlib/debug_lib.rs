@@ -21,9 +21,7 @@
 //! - 标签 500+: 调试库
 
 use crate::execute::VmError;
-use crate::objects::{
-    BuiltinFn, LClosure, NilKind, Proto, TValue, UpVal, UpValRef, UpValVec, PF_VAHID,
-};
+use crate::objects::{BuiltinFn, LClosure, NilKind, Proto, TValue, UpVal, UpValRef, PF_VAHID};
 use crate::state::LuaState;
 use crate::strings::LuaString;
 use crate::table::Table;
@@ -54,7 +52,7 @@ const HOOKKEY: &str = "_HOOKKEY";
 // ============================================================================
 
 /// 从栈中读取参数 (0-based 索引, 相对于函数位置 a)
-fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
+fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
     let stack_idx = a + 1 + idx;
     if stack_idx < state.exec.stack.len() {
         state.exec.stack[stack_idx].clone()
@@ -64,12 +62,12 @@ fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
 }
 
 /// 将结果压入栈并调整栈顶
-fn push_results(state: &mut LuaState, a: usize, nresults: i32, results: Vec<TValue>) {
+fn push_results<'a>(state: &mut LuaState<'a>, a: usize, nresults: i32, results: Vec<TValue<'a>>) {
     state.adjust_results(a, nresults, results);
 }
 
 /// 将单个结果压入栈
-fn push_single_result(state: &mut LuaState, a: usize, nresults: i32, result: TValue) {
+fn push_single_result<'a>(state: &mut LuaState<'a>, a: usize, nresults: i32, result: TValue<'a>) {
     push_results(state, a, nresults, vec![result]);
 }
 
@@ -184,13 +182,13 @@ fn get_local_name(proto: &Proto, local_number: usize, pc: usize) -> Option<Strin
 }
 
 /// 栈帧信息 — 用于 debug.getlocal/setlocal 的 level > 1 支持
-struct FrameInfo {
+struct FrameInfo<'a> {
     base: usize,
     pc: usize,
     proto_flag: u8,
     nextraargs: i32,
     /// 指向栈上的 LClosure（已 clone）；C 函数帧为 None
-    closure: Option<Rc<LClosure>>,
+    closure: Option<Rc<LClosure<'a>>>,
     /// 栈上有效槽位的上限（对应 C 的 limit = ci->next->func.p 或 L->top）
     /// 槽位 n 满足 limit - base >= n && n > 0 时为 "(temporary)" / "(C temporary)"
     limit: usize,
@@ -202,7 +200,7 @@ struct FrameInfo {
 ///
 /// level 1 = 当前函数, level 2 = 调用者, ...
 /// 返回 None 表示 level 超出范围
-fn get_frame_info(state: &LuaState, level: i32) -> Option<FrameInfo> {
+fn get_frame_info<'a>(state: &LuaState<'a>, level: i32) -> Option<FrameInfo<'a>> {
     if level < 1 {
         return None;
     }
@@ -327,12 +325,12 @@ fn unmake_mask(mask: i32) -> String {
 /// debug.getregistry() — 对应 C 的 db_getregistry
 ///
 /// 返回注册表
-fn call_getregistry(
-    state: &mut LuaState,
+fn call_getregistry<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     push_single_result(state, a, nresults, TValue::Table(state.registry.clone()));
     Ok(())
 }
@@ -340,12 +338,12 @@ fn call_getregistry(
 /// debug.getmetatable(v) — 对应 C 的 db_getmetatable
 ///
 /// 返回值的元表 (不调用 __metatable)
-fn call_getmetatable(
-    state: &mut LuaState,
+fn call_getmetatable<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let arg = get_arg(state, a, 0);
     let result = match &arg {
         TValue::Table(t) => {
@@ -376,12 +374,12 @@ fn call_getmetatable(
 ///
 /// 设置值的元表, 返回原值。对 Table/UserData 设置自身元表;
 /// 对基本类型(number/boolean/nil/string)设置全局 G(L)->mt[type]。
-fn call_setmetatable(
-    state: &mut LuaState,
+fn call_setmetatable<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let arg1 = get_arg(state, a, 0);
     let arg2 = get_arg(state, a, 1);
 
@@ -441,12 +439,12 @@ fn call_setmetatable(
 /// debug.getuservalue(u, [n]) — 对应 C 的 db_getuservalue
 ///
 /// 返回用户数据的第 n 个用户值
-fn call_getuservalue(
-    state: &mut LuaState,
+fn call_getuservalue<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let arg = get_arg(state, a, 0);
     let n = if nargs >= 2 {
         get_arg(state, a, 1).as_integer().unwrap_or(1) as usize
@@ -472,12 +470,12 @@ fn call_getuservalue(
 ///
 /// 设置用户数据的第 n 个用户值。若 n 超出 userdata 的 uservalue 容量，
 /// 返回 false（对应 C 的 lua_setiuservalue 返回 0 + luaL_pushfail）。
-fn call_setuservalue(
-    state: &mut LuaState,
+fn call_setuservalue<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let arg1 = get_arg(state, a, 0);
     let arg2 = get_arg(state, a, 1);
     let n = if nargs >= 3 {
@@ -531,12 +529,12 @@ fn call_setuservalue(
 /// debug.getinfo([thread,] level_or_func [, what]) — 对应 C 的 db_getinfo
 ///
 /// 返回包含调试信息的表
-fn call_getinfo(
-    state: &mut LuaState,
+fn call_getinfo<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     // 解析参数: 可选 thread, level/func, 可选 what
     let mut arg_offset = 0;
     let arg0 = get_arg(state, a, 0);
@@ -804,7 +802,7 @@ fn call_getinfo(
 
 /// 调试信息结构
 #[derive(Default)]
-struct DebugInfo {
+struct DebugInfo<'a> {
     source: String,
     short_src: String,
     linedefined: i32,
@@ -820,12 +818,12 @@ struct DebugInfo {
     ntransfer: i32,
     istailcall: bool,
     extraargs: i32,
-    func: Option<TValue>,
-    closure: Option<Rc<LClosure>>,
+    func: Option<TValue<'a>>,
+    closure: Option<Rc<LClosure<'a>>>,
 }
 
 /// 从闭包填充调试信息
-fn fill_info_from_closure(info: &mut DebugInfo, closure: &LClosure, what: &str) {
+fn fill_info_from_closure<'a>(info: &mut DebugInfo<'a>, closure: &LClosure<'a>, what: &str) {
     let proto = &closure.proto;
     // 注意: 不在此设置 info.func, 由 call_getinfo 直接从栈上获取原始值
     // 以确保 b.func == 原始函数 (引用语义)
@@ -878,7 +876,12 @@ fn fill_info_from_closure(info: &mut DebugInfo, closure: &LClosure, what: &str) 
 /// 从栈级别填充调试信息
 ///
 /// 返回 false 表示级别超出范围
-fn fill_info_from_level(state: &LuaState, info: &mut DebugInfo, level: i32, what: &str) -> bool {
+fn fill_info_from_level<'a>(
+    state: &LuaState<'a>,
+    info: &mut DebugInfo<'a>,
+    level: i32,
+    what: &str,
+) -> bool {
     // level 0 = 当前函数 (debug.getinfo 自身, 通常是 C 函数)
     // level 1 = 调用 debug.getinfo 的函数 (当前 Lua 帧)
     // level 2 = 调用 level 1 的函数 (call_info 的最后一个元素)
@@ -1202,9 +1205,9 @@ fn fill_info_from_level(state: &LuaState, info: &mut DebugInfo, level: i32, what
 /// - Level 0 到 c_chain_len-1: C 函数链（如 yield）
 /// - Level c_chain_len: 当前 Lua 帧（saved_base/saved_pc）
 /// - Level c_chain_len+1+: 剩余 call_info 条目
-fn fill_info_from_thread(
-    ctx: &crate::objects::ThreadContext,
-    info: &mut DebugInfo,
+fn fill_info_from_thread<'a>(
+    ctx: &crate::objects::ThreadContext<'a>,
+    info: &mut DebugInfo<'a>,
     level: i32,
     what: &str,
 ) -> bool {
@@ -1507,11 +1510,11 @@ fn fill_active_lines(table: &mut Table, proto: &Proto) {
 /// 从 ThreadContext 获取局部变量名和值 — 用于 debug.getlocal(co, level, nvar)
 ///
 /// 返回 Some((name, value)) 或 None（超出范围）
-fn get_local_from_thread(
-    ctx: &crate::objects::ThreadContext,
+fn get_local_from_thread<'a>(
+    ctx: &crate::objects::ThreadContext<'a>,
     level: i32,
     nvar: i32,
-) -> Option<(String, TValue)> {
+) -> Option<(String, TValue<'a>)> {
     if level < 0 {
         return None;
     }
@@ -1671,11 +1674,11 @@ fn get_local_from_thread(
 /// 从 ThreadContext 设置局部变量值 — 用于 debug.setlocal(co, level, nvar, value)
 ///
 /// 返回变量名（成功）或 None（超出范围）
-fn set_local_from_thread(
-    ctx: &mut crate::objects::ThreadContext,
+fn set_local_from_thread<'a>(
+    ctx: &mut crate::objects::ThreadContext<'a>,
     level: i32,
     nvar: i32,
-    value: TValue,
+    value: TValue<'a>,
 ) -> Option<String> {
     if level < 0 {
         return None;
@@ -1685,7 +1688,7 @@ fn set_local_from_thread(
     let n = call_info.len();
     let c_chain_len = call_info.iter().rev().take_while(|e| e.is_c).count();
 
-    let write_stack = |stack: &mut Vec<TValue>, idx: usize| {
+    let write_stack = |stack: &mut Vec<TValue<'a>>, idx: usize| {
         if idx < stack.len() {
             stack[idx] = value.clone();
         }
@@ -1834,12 +1837,12 @@ fn set_local_from_thread(
 /// debug.getlocal([thread,] level, local) — 对应 C 的 db_getlocal
 ///
 /// 返回局部变量名和值
-fn call_getlocal(
-    state: &mut LuaState,
+fn call_getlocal<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let mut arg_offset = 0;
     let arg0 = get_arg(state, a, 0);
     let co_thread = if let TValue::Thread(t) = &arg0 {
@@ -2048,12 +2051,12 @@ fn call_getlocal(
 /// debug.setlocal([thread,] level, local, value) — 对应 C 的 db_setlocal
 ///
 /// 设置局部变量值, 返回变量名
-fn call_setlocal(
-    state: &mut LuaState,
+fn call_setlocal<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let mut arg_offset = 0;
     let arg0 = get_arg(state, a, 0);
     let co_thread = if let TValue::Thread(t) = &arg0 {
@@ -2182,12 +2185,12 @@ fn call_setlocal(
 /// debug.getupvalue(f, n) — 对应 C 的 db_getupvalue
 ///
 /// 返回上值名和值
-fn call_getupvalue(
-    state: &mut LuaState,
+fn call_getupvalue<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let arg1 = get_arg(state, a, 0);
     let n = get_arg(state, a, 1).as_integer().unwrap_or(0) as usize;
 
@@ -2292,12 +2295,12 @@ fn call_getupvalue(
 /// debug.setupvalue(f, n, v) — 对应 C 的 db_setupvalue
 ///
 /// 设置上值, 返回上值名
-fn call_setupvalue(
-    state: &mut LuaState,
+fn call_setupvalue<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let arg1 = get_arg(state, a, 0);
     let n = get_arg(state, a, 1).as_integer().unwrap_or(0) as usize;
     let value = get_arg(state, a, 2);
@@ -2398,12 +2401,12 @@ fn call_setupvalue(
 /// debug.upvalueid(f, n) — 对应 C 的 db_upvalueid
 ///
 /// 返回上值的唯一标识 (light userdata)
-fn call_upvalueid(
-    state: &mut LuaState,
+fn call_upvalueid<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let arg1 = get_arg(state, a, 0);
     let n = get_arg(state, a, 1).as_integer().unwrap_or(0) as usize;
 
@@ -2480,12 +2483,12 @@ fn call_upvalueid(
 /// debug.upvaluejoin(f1, n1, f2, n2) — 对应 C 的 db_upvaluejoin
 ///
 /// 让 f1 的第 n1 个上值共享 f2 的第 n2 个上值
-fn call_upvaluejoin(
-    state: &mut LuaState,
+fn call_upvaluejoin<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     // 对应 C 的 db_upvaluejoin -> lua_upvaluejoin -> getupvalref:
     //   f1/f2 必须是 Lua 函数 (LClosure)，n1/n2 必须在 [1, nupvalues] 范围内
     let f1_stack_idx = a + 1; // f1 在栈上的位置
@@ -2556,12 +2559,12 @@ fn call_upvaluejoin(
 /// debug.sethook([thread,] hook, mask, [count]) — 对应 C 的 db_sethook
 ///
 /// 设置钩子函数
-fn call_sethook(
-    state: &mut LuaState,
+fn call_sethook<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let mut arg_offset = 0;
     let arg0 = get_arg(state, a, 0);
     let target_thread = if let TValue::Thread(t) = &arg0 {
@@ -2620,12 +2623,12 @@ fn call_sethook(
 /// debug.gethook([thread]) — 对应 C 的 db_gethook
 ///
 /// 返回当前钩子函数、掩码字符串和计数
-fn call_gethook(
-    state: &mut LuaState,
+fn call_gethook<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let arg0 = get_arg(state, a, 0);
     let co_thread = if let TValue::Thread(t) = &arg0 {
         Some(t.clone())
@@ -2705,7 +2708,12 @@ fn call_gethook(
 }
 
 /// 在注册表中设置钩子
-fn set_hook_in_registry(state: &mut LuaState, hook: Option<TValue>, mask: i32, count: i32) {
+fn set_hook_in_registry<'a>(
+    state: &mut LuaState<'a>,
+    hook: Option<TValue<'a>>,
+    mask: i32,
+    count: i32,
+) {
     let hookkey = TValue::Str(state.intern_str(HOOKKEY));
 
     // 获取或创建 hook 表
@@ -2759,12 +2767,12 @@ fn set_hook_in_registry(state: &mut LuaState, hook: Option<TValue>, mask: i32, c
 /// debug.traceback([thread,] [message [, level]]) — 对应 C 的 db_traceback
 ///
 /// 返回堆栈回溯字符串
-fn call_traceback(
-    state: &mut LuaState,
+fn call_traceback<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let mut arg_offset = 0;
     let arg0 = get_arg(state, a, 0);
     let co_thread = if let TValue::Thread(t) = &arg0 {
@@ -2822,7 +2830,7 @@ fn call_traceback(
 ///
 /// 当 call_info 末尾有 C 函数链时（C 函数调用 C 函数），
 /// state.exec.base 不随 C 函数调用改变，所以需要计算 C 函数链长度来正确映射 level。
-fn build_traceback(state: &LuaState, msg: &str, level: i32) -> String {
+fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> String {
     let mut lines: Vec<String> = Vec::new();
 
     // Level 0: debug.traceback 自身 (C/tagged 函数)
@@ -3354,30 +3362,19 @@ fn push_traceback_line(
 ///
 /// 交互式调试器: 循环读取 stdin, 输出 prompt 到 stderr, 执行用户输入的 Lua 代码。
 /// 读到 "cont" 或 EOF 时退出。
-fn call_debug(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
-    use std::io::{self, BufRead, Write};
+fn call_debug<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     let _ = nargs;
     loop {
-        let _ = io::stderr().write_all(b"lua_debug> ");
-        let _ = io::stderr().flush();
-        // 体积优先: 用 read_until 代替 read_line, 避免 Unicode grapheme_extend 表 (~4KB)
-        #[cfg(size_optimized)]
-        let buffer: String = {
-            let mut buf: Vec<u8> = Vec::new();
-            match io::stdin().lock().read_until(b'\n', &mut buf) {
-                Ok(0) => break,
-                Ok(_) => {}
-                Err(_) => break,
-            }
-            match String::from_utf8(buf) {
-                Ok(s) => s,
-                Err(_) => break,
-            }
-        };
-        #[cfg(not(size_optimized))]
+        let _ = state.io.err("lua_debug> ");
+        let _ = state.io.err_flush();
         let buffer: String = {
             let mut buffer = String::new();
-            match io::stdin().lock().read_line(&mut buffer) {
+            match state.io.read_line(&mut buffer) {
                 Ok(0) => break,
                 Ok(_) => {}
                 Err(_) => break,
@@ -3393,14 +3390,15 @@ fn call_debug(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
             let pcall_status = state.pcall(0, 0, 0);
             if pcall_status != 0 {
                 let msg = state.to_string(-1).unwrap_or_default();
-                let _ = io::stderr().write_all(msg.as_bytes());
-                let _ = io::stderr().write_all(b"\n");
+                let _ = state.io.err(&msg);
+                let _ = state.io.err("\n");
             }
         } else {
             let msg = state.to_string(-1).unwrap_or_default();
-            let _ = io::stderr().write_all(msg.as_bytes());
-            let _ = io::stderr().write_all(b"\n");
+            let _ = state.io.err(&msg);
+            let _ = state.io.err("\n");
         }
+        let _ = state.io.err_flush();
         state.settop(a);
     }
     push_results(state, a, nresults, vec![]);
@@ -3414,16 +3412,17 @@ fn call_debug(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
 /// 创建调试库表
 ///
 /// 对应 C 源码 ldblib.cpp 的 luaopen_debug 函数
-pub fn create_debug_lib_table(state: &LuaState) -> Table {
+pub fn create_debug_lib_table<'a>(state: &LuaState<'a>) -> Table<'a> {
     let mut lib = Table::new();
 
     // 注册所有 debug 函数 (使用 BuiltinFn 函数指针)
-    let register =
-        |lib: &mut Table, name: &'static std::ffi::CStr, func: crate::objects::BuiltinFnPtr| {
-            let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
-            let name_ptr = name.as_ptr() as *const u8;
-            lib.set(key, TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)));
-        };
+    let register = |lib: &mut Table<'a>,
+                    name: &'static std::ffi::CStr,
+                    func: crate::objects::BuiltinFnPtr<'a>| {
+        let key = state.intern(name.to_str().unwrap_or(""));
+        let name_ptr = name.as_ptr() as *const u8;
+        lib.set(key, BuiltinFn::impure_tvalue(func, name_ptr));
+    };
 
     register(&mut lib, c"traceback", call_traceback);
     register(&mut lib, c"debug", call_debug);
@@ -3458,6 +3457,8 @@ pub fn open_debug_lib(state: &mut LuaState) {
 
 #[cfg(test)]
 mod tests {
+    use crate::objects::UpValVec;
+
     use super::*;
 
     #[test]
@@ -3488,7 +3489,7 @@ mod tests {
 
     #[test]
     fn test_open_debug_lib_registers_table() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         open_debug_lib(&mut state);
 
         let key = TValue::Str(state.intern_str("debug"));
@@ -3524,7 +3525,7 @@ mod tests {
 
     #[test]
     fn test_call_getregistry() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         call_getregistry(&mut state, 0, 0, 1).unwrap();
         assert_eq!(state.exec.stack.len(), 1);
@@ -3533,7 +3534,7 @@ mod tests {
 
     #[test]
     fn test_call_getmetatable_table() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let t = Table::new();
         t.set_metatable(Some(Table::new()));
         state.exec.stack.clear();
@@ -3545,7 +3546,7 @@ mod tests {
 
     #[test]
     fn test_call_getmetatable_no_metatable() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let t = Table::new();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
@@ -3556,7 +3557,7 @@ mod tests {
 
     #[test]
     fn test_call_setmetatable() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let t = Table::new();
         let mt = Table::new();
         state.exec.stack.clear();
@@ -3572,7 +3573,7 @@ mod tests {
 
     #[test]
     fn test_call_getuservalue_non_userdata() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
         state.exec.stack.push(TValue::Integer(42));
@@ -3586,7 +3587,7 @@ mod tests {
         use crate::objects::UpvalDesc;
         use crate::strings::LuaString;
 
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let proto = Proto {
             num_params: 0,
             flag: 0,
@@ -3650,7 +3651,7 @@ mod tests {
     #[test]
     fn test_call_getupvalue_out_of_range() {
         use crate::gc::GCObjectHeader;
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let closure = Rc::new(LClosure {
             gc_header: GCObjectHeader::new(),
             proto: Rc::new(crate::func::new_proto()),
@@ -3666,7 +3667,7 @@ mod tests {
 
     #[test]
     fn test_call_gethook_no_hook() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         call_gethook(&mut state, 0, 0, 1).unwrap();
         assert!(matches!(state.exec.stack[0], TValue::Nil(_)));
@@ -3674,7 +3675,7 @@ mod tests {
 
     #[test]
     fn test_call_sethook_and_gethook() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         // 设置钩子
         let hook_fn = TValue::LightUserData(999 as *mut std::ffi::c_void);
         state.exec.stack.clear();
@@ -3701,7 +3702,7 @@ mod tests {
 
     #[test]
     fn test_call_sethook_nil_clears() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         // 先设置钩子
         let hook_fn = TValue::LightUserData(999 as *mut std::ffi::c_void);
         state.exec.stack.clear();
@@ -3724,7 +3725,7 @@ mod tests {
 
     #[test]
     fn test_call_traceback_empty() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         call_traceback(&mut state, 0, 0, 1).unwrap();
         match &state.exec.stack[0] {
@@ -3735,7 +3736,7 @@ mod tests {
 
     #[test]
     fn test_call_traceback_with_message() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
         state
@@ -3755,7 +3756,7 @@ mod tests {
 
     #[test]
     fn test_call_traceback_non_string_msg() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
         state.exec.stack.push(TValue::Integer(42));
@@ -3768,7 +3769,7 @@ mod tests {
 
     #[test]
     fn test_call_getinfo_out_of_range() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
         state.exec.stack.push(TValue::Integer(1000));
@@ -3778,7 +3779,7 @@ mod tests {
 
     #[test]
     fn test_call_getinfo_negative_level() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
         state.exec.stack.push(TValue::Integer(-1));
@@ -3788,7 +3789,7 @@ mod tests {
 
     #[test]
     fn test_call_getlocal_out_of_range() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
         state.exec.stack.push(TValue::Integer(20));
@@ -3843,7 +3844,7 @@ mod tests {
     #[test]
     fn test_call_upvalueid_closure() {
         use crate::gc::GCObjectHeader;
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let upvals = Rc::new(RefCell::new(UpValVec::new()));
         upvals
             .borrow_mut()
@@ -3866,7 +3867,7 @@ mod tests {
     #[test]
     fn test_call_upvalueid_out_of_range() {
         use crate::gc::GCObjectHeader;
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         let closure = Rc::new(LClosure {
             gc_header: GCObjectHeader::new(),
             proto: Rc::new(crate::func::new_proto()),
@@ -3882,7 +3883,8 @@ mod tests {
 
     #[test]
     fn test_call_debug_returns_nothing() {
-        let mut state = LuaState::new();
+        let mut buff = crate::mock::io_mock::BufferIo::new("cont\n");
+        let mut state = LuaState::new(&mut buff);
         state.exec.stack.clear();
         call_debug(&mut state, 0, 0, 0).unwrap();
         assert_eq!(state.exec.stack.len(), 0);

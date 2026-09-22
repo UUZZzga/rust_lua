@@ -28,7 +28,7 @@ fn ceillog2(x: u64) -> u32 {
 /// 表哈希查找 — TableData 上直接单跳探测 (key_to_bucket 索引)。
 /// VM opcode 热路径 (op_getfield 等) 专用; 返回值 clone。
 #[cfg_attr(not(size_optimized), inline)]
-pub(crate) fn hash_get(td: &TableData, key: &TValue) -> Option<TValue> {
+pub(crate) fn hash_get<'a>(td: &TableData<'a>, key: &TValue<'a>) -> Option<TValue<'a>> {
     if let Some(idx) = td.idx_get(key) {
         let v = &td.hash_buckets[idx].1;
         if !matches!(v, TValue::Nil(NilKind::Empty)) {
@@ -41,7 +41,7 @@ pub(crate) fn hash_get(td: &TableData, key: &TValue) -> Option<TValue> {
 // Table 方法实现
 // ============================================================================
 
-impl Table {
+impl<'a> Table<'a> {
     pub fn new() -> Self {
         Table {
             data: Rc::new(RefCell::new(TableData {
@@ -99,7 +99,7 @@ impl Table {
     // ========================================================================
 
     /// 获取元表的共享引用（克隆 Table，仅增加 Rc 引用计数，开销极小）。
-    pub fn get_metatable(&self) -> Option<Table> {
+    pub fn get_metatable(&self) -> Option<Table<'a>> {
         self.data.borrow().metatable.as_ref().map(|b| (**b).clone())
     }
 
@@ -114,7 +114,7 @@ impl Table {
     pub fn get_tm_ref(
         &self,
         key: &crate::strings::LuaString,
-    ) -> Option<std::cell::Ref<'_, TValue>> {
+    ) -> Option<std::cell::Ref<'_, TValue<'a>>> {
         let guard = self.data.borrow();
         let r = std::cell::Ref::filter_map(guard, |d| {
             let ktb = d.key_to_bucket.as_ref()?;
@@ -142,7 +142,7 @@ impl Table {
     }
 
     /// 设置元表。
-    pub fn set_metatable(&self, mt: Option<Table>) {
+    pub fn set_metatable(&self, mt: Option<Table<'a>>) {
         self.data.borrow_mut().metatable = mt.map(Box::new);
     }
 
@@ -163,13 +163,13 @@ impl Table {
     /// Miri Tree Borrows 验证: as_ptr + 只读访问 + 立即结束生命周期,
     /// 与正常 borrow 等价但省去 borrow flag 读写 (各 1 次依赖加载 + 分支)。
     #[cfg_attr(not(size_optimized), inline(always))]
-    pub(crate) fn data_ro(&self) -> &TableData {
+    pub(crate) fn data_ro(&self) -> &TableData<'a> {
         unsafe { &*self.data.as_ptr() }
     }
 
     /// 一次 borrow 内同时查找值并返回元表 — 消除 metamethod 路径的第二次 borrow。
     /// 返回 (查找结果, 元表)。元表为 Some 时调用方无需再次 borrow 获取 __index。
-    pub fn get_and_metatable(&self, key: &TValue) -> (Option<TValue>, bool) {
+    pub fn get_and_metatable(&self, key: &TValue<'a>) -> (Option<TValue<'a>>, bool) {
         let data = self.data_ro();
         // perf: 只返回是否有元表的标志, 不 clone 元表 (Table 是 Rc, clone 需 incq)。
         // table_get 在 key 命中时直接返回, 无需元表; 仅 key 未命中时才调用 get_metatable()
@@ -220,7 +220,7 @@ impl Table {
     ///
     /// 元表存在时返回 None (__index 可能拦截, 不能绕过)。
     #[cfg_attr(not(size_optimized), inline(always))]
-    pub fn find_str_ref<'a>(&'a self, key: &TValue) -> Option<&'a TValue> {
+    pub fn find_str_ref<'b>(&'b self, key: &TValue<'a>) -> Option<&'b TValue<'a>> {
         let data = self.data_ro();
         if data.metatable.is_some() {
             return None;
@@ -242,7 +242,7 @@ impl Table {
         Some(v)
     }
 
-    pub fn get(&self, key: &TValue) -> Option<TValue> {
+    pub fn get(&self, key: &TValue<'a>) -> Option<TValue<'a>> {
         let data = self.data.borrow();
         match key {
             TValue::Integer(i) if *i > 0 => {
@@ -274,7 +274,7 @@ impl Table {
             _ => hash_get(&data, key),
         }
     }
-    pub fn get_int(&self, key: i64) -> Option<TValue> {
+    pub fn get_int(&self, key: i64) -> Option<TValue<'a>> {
         let data = self.data.borrow();
         if key > 0 {
             let idx = (key - 1) as usize;
@@ -292,7 +292,7 @@ impl Table {
     // set / set_int —— 使用 borrow_mut 实现内部可变性
     // ========================================================================
 
-    pub fn set(&self, key: TValue, value: TValue) {
+    pub fn set(&self, key: TValue<'a>, value: TValue<'a>) {
         let is_nil = matches!(&value, TValue::Nil(NilKind::Strict));
         let mut data = self.data.borrow_mut();
         match &key {
@@ -339,7 +339,7 @@ impl Table {
         Self::hash_set(&mut data, &key, value, is_nil);
     }
 
-    pub fn set_int(&self, key: i64, value: TValue) {
+    pub fn set_int(&self, key: i64, value: TValue<'a>) {
         let is_nil = matches!(&value, TValue::Nil(NilKind::Strict));
         let mut data = self.data.borrow_mut();
         if key > 0 {
@@ -369,7 +369,7 @@ impl Table {
     ///   避免无意义 tombstone 累积
     /// - 若 key 不存在且写入非 nil，追加到 hash_buckets + 记录 key_to_bucket
     /// - 若 key 存在 (含 tombstone)，覆盖值 (nil 写为 Nil(Empty) tombstone)
-    fn hash_set(data: &mut TableData, key: &TValue, value: TValue, is_nil: bool) {
+    fn hash_set(data: &mut TableData<'a>, key: &TValue<'a>, value: TValue<'a>, is_nil: bool) {
         let val = if is_nil {
             TValue::Nil(NilKind::Empty)
         } else {
@@ -443,7 +443,7 @@ impl Table {
         }
     }
 
-    fn bin_search_array(array: &[TValue], lo: usize, hi: usize) -> usize {
+    fn bin_search_array(array: &[TValue<'a>], lo: usize, hi: usize) -> usize {
         let mut i = lo;
         let mut j = hi;
         while j - i > 1 {
@@ -464,9 +464,9 @@ impl Table {
     /// - 不存在：asize 即边界
     /// - 存在：进入指数增长 + 二分查找
     /// 使用 key_to_bucket 索引做 O(1) 存在性检查。
-    fn hash_boundary_impl(data: &TableData, asize: i64, seed: u32) -> i64 {
+    fn hash_boundary_impl(data: &TableData<'a>, asize: i64, seed: u32) -> i64 {
         use TValue::Integer;
-        let contains = |k: &TValue| data.idx_get(k).is_some();
+        let contains = |k: &TValue<'a>| data.idx_get(k).is_some();
         if !contains(&Integer(asize + 1)) {
             return asize;
         }
@@ -507,7 +507,7 @@ impl Table {
     // next: 表遍历
     // ========================================================================
 
-    pub fn next(&self, prev_key: Option<&TValue>) -> Option<(TValue, TValue)> {
+    pub fn next(&self, prev_key: Option<&TValue<'a>>) -> Option<(TValue<'a>, TValue<'a>)> {
         let data = self.data.borrow();
         match prev_key {
             None => {
@@ -626,11 +626,11 @@ impl Table {
     }
 }
 
-pub struct LuaTable {
-    table: Table,
+pub struct LuaTable<'a> {
+    table: Table<'a>,
 }
 
-impl LuaTable {
+impl<'a> LuaTable<'a> {
     pub fn new() -> Self {
         LuaTable {
             table: Table::new(),
@@ -643,27 +643,27 @@ impl LuaTable {
         }
     }
 
-    pub fn inner(&self) -> &Table {
+    pub fn inner(&self) -> &Table<'a> {
         &self.table
     }
 
-    pub fn inner_mut(&mut self) -> &mut Table {
+    pub fn inner_mut(&mut self) -> &mut Table<'a> {
         &mut self.table
     }
 
-    pub fn get(&self, key: &TValue) -> Option<TValue> {
+    pub fn get(&self, key: &TValue<'a>) -> Option<TValue<'a>> {
         self.table.get(key)
     }
 
-    pub fn get_int(&self, key: i64) -> Option<TValue> {
+    pub fn get_int(&self, key: i64) -> Option<TValue<'a>> {
         self.table.get_int(key)
     }
 
-    pub fn set(&mut self, key: TValue, value: TValue) {
+    pub fn set(&mut self, key: TValue<'a>, value: TValue<'a>) {
         self.table.set(key, value);
     }
 
-    pub fn set_int(&mut self, key: i64, value: TValue) {
+    pub fn set_int(&mut self, key: i64, value: TValue<'a>) {
         self.table.set_int(key, value);
     }
 
@@ -671,7 +671,7 @@ impl LuaTable {
         self.table.len()
     }
 
-    pub fn next(&self, prev_key: Option<&TValue>) -> Option<(TValue, TValue)> {
+    pub fn next(&self, prev_key: Option<&TValue<'a>>) -> Option<(TValue<'a>, TValue<'a>)> {
         self.table.next(prev_key)
     }
 
@@ -684,17 +684,17 @@ impl LuaTable {
     }
 }
 
-impl Default for LuaTable {
+impl<'a> Default for LuaTable<'a> {
     fn default() -> Self {
         Self::new()
     }
 }
 
-pub fn new_table() -> Table {
+pub fn new_table<'a>() -> Table<'a> {
     Table::new()
 }
 
-pub fn new_table_with_capacity(narray: usize, nhsize: usize) -> Table {
+pub fn new_table_with_capacity<'a>(narray: usize, nhsize: usize) -> Table<'a> {
     Table::with_capacity(narray, nhsize)
 }
 

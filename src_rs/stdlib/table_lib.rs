@@ -27,7 +27,7 @@ use std::rc::Rc;
 // ============================================================================
 
 /// 从栈中读取参数
-fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
+fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.exec.stack.len() {
         return TValue::Nil(NilKind::Strict);
@@ -53,7 +53,7 @@ fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: i64) -> i64 
 ///
 /// 调用 obj_len (会触发 __len 元方法)，然后转为整数。
 /// 如果结果不是整数，报 "object length is not an integer"。
-fn get_obj_len(state: &mut LuaState, obj: &TValue) -> Result<i64, VmError> {
+fn get_obj_len<'a>(state: &mut LuaState<'a>, obj: &TValue<'a>) -> Result<i64, VmError<'a>> {
     let tmp_ra = state.exec.stack.len();
     crate::tm::obj_len(state, tmp_ra, obj, "")?;
     let result = state
@@ -76,7 +76,11 @@ fn get_obj_len(state: &mut LuaState, obj: &TValue) -> Result<i64, VmError> {
 /// 获取 t[i]，支持 __index 元方法 (对应 C lua_geti → luaV_finishget)
 /// 用于 table 库函数对表元素访问时透明地调用元方法（如 proxy 表）
 #[cfg_attr(not(size_optimized), inline)]
-fn geti_meta(state: &mut LuaState, table_val: &TValue, i: i64) -> Result<TValue, VmError> {
+fn geti_meta<'a>(
+    state: &mut LuaState<'a>,
+    table_val: &TValue<'a>,
+    i: i64,
+) -> Result<TValue<'a>, VmError<'a>> {
     VmExecutor::table_get(
         state,
         table_val,
@@ -87,7 +91,12 @@ fn geti_meta(state: &mut LuaState, table_val: &TValue, i: i64) -> Result<TValue,
 
 /// 设置 t[i] = v，支持 __newindex 元方法 (对应 C lua_seti → luaV_finishset)
 #[cfg_attr(not(size_optimized), inline)]
-fn seti_meta(state: &mut LuaState, table_val: &TValue, i: i64, val: TValue) -> Result<(), VmError> {
+fn seti_meta<'a>(
+    state: &mut LuaState<'a>,
+    table_val: &TValue<'a>,
+    i: i64,
+    val: TValue<'a>,
+) -> Result<(), VmError<'a>> {
     VmExecutor::table_set(
         state,
         table_val.clone(),
@@ -98,7 +107,12 @@ fn seti_meta(state: &mut LuaState, table_val: &TValue, i: i64, val: TValue) -> R
 }
 
 #[cfg_attr(not(size_optimized), inline)]
-fn seti_meta_(state: &mut LuaState, table_val: TValue, i: i64, val: TValue) -> Result<(), VmError> {
+fn seti_meta_<'a>(
+    state: &mut LuaState<'a>,
+    table_val: TValue<'a>,
+    i: i64,
+    val: TValue<'a>,
+) -> Result<(), VmError<'a>> {
     VmExecutor::table_set(
         state,
         table_val,
@@ -110,7 +124,7 @@ fn seti_meta_(state: &mut LuaState, table_val: TValue, i: i64, val: TValue) -> R
 
 /// 将结果压入栈并调整栈顶
 #[cfg_attr(not(size_optimized), inline)]
-fn push_results(state: &mut LuaState, a: usize, nresults: i32, results: Vec<TValue>) {
+fn push_results<'a>(state: &mut LuaState<'a>, a: usize, nresults: i32, results: Vec<TValue<'a>>) {
     state.adjust_results(a, nresults, results);
 }
 
@@ -120,13 +134,13 @@ fn push_results(state: &mut LuaState, a: usize, nresults: i32, results: Vec<TVal
 
 /// table.concat(list [, sep [, i [, j]]]) — 对应 C 的 tconcat
 /// 通过 __index 元方法访问元素 (对应 C lua_geti)
-fn table_concat_impl(
-    state: &mut LuaState,
-    table_val: &TValue,
+fn table_concat_impl<'a>(
+    state: &mut LuaState<'a>,
+    table_val: &TValue<'a>,
     sep: &str,
     i: i64,
     j: i64,
-) -> Result<String, VmError> {
+) -> Result<String, VmError<'a>> {
     if i > j {
         return Ok(String::new());
     }
@@ -166,7 +180,12 @@ fn table_concat_impl(
 // ============================================================================
 
 /// table.concat(list [, sep [, i [, j]]])
-fn call_concat(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_concat<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     let list_val = get_arg(state, a, 0);
     match &list_val {
         TValue::Table(_) => {}
@@ -212,7 +231,12 @@ fn call_concat(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
 
 /// table.unpack(list [, i [, j]])
 /// 对应 C Lua 的 tunpack: 直接 push 到栈,不创建中间 Vec
-fn call_unpack(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_unpack<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     let list_val = get_arg(state, a, 0);
     match &list_val {
         TValue::Table(_) => {}
@@ -328,7 +352,12 @@ fn call_unpack(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
 }
 
 /// table.pack(...)
-fn call_pack(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_pack<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     let t = Table::new();
     for i in 0..nargs {
         let val = get_arg(state, a, i);
@@ -343,7 +372,12 @@ fn call_pack(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 }
 
 /// table.insert(list, [pos,] value)
-fn call_insert(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_insert<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     let list_val = get_arg(state, a, 0);
     match &list_val {
         TValue::Table(_) => {}
@@ -391,7 +425,12 @@ fn call_insert(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
 }
 
 /// table.remove(list [, pos])
-fn call_remove(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_remove<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     let list_val = get_arg(state, a, 0);
     match &list_val {
         TValue::Table(_) => {}
@@ -446,7 +485,12 @@ fn call_remove(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
 
 const RANLIMIT: u32 = 100;
 
-fn sort_comp(state: &mut LuaState, comp: &TValue, a: &TValue, b: &TValue) -> Result<bool, VmError> {
+fn sort_comp<'a>(
+    state: &mut LuaState<'a>,
+    comp: &TValue<'a>,
+    a: &TValue<'a>,
+    b: &TValue<'a>,
+) -> Result<bool, VmError<'a>> {
     if matches!(comp, TValue::Nil(_)) {
         if a.is_number() && b.is_number() {
             Ok(crate::vm::lt_num(a, b))
@@ -460,13 +504,13 @@ fn sort_comp(state: &mut LuaState, comp: &TValue, a: &TValue, b: &TValue) -> Res
     }
 }
 
-fn partition(
-    state: &mut LuaState,
-    elems: &mut [TValue],
+fn partition<'a>(
+    state: &mut LuaState<'a>,
+    elems: &mut [TValue<'a>],
     lo: i64,
     up: i64,
-    comp: &TValue,
-) -> Result<i64, VmError> {
+    comp: &TValue<'a>,
+) -> Result<i64, VmError<'a>> {
     let pivot = elems[(up - 1) as usize].clone();
     let mut i = lo;
     let mut j = up - 1;
@@ -505,14 +549,14 @@ fn partition(
     }
 }
 
-fn auxsort(
-    state: &mut LuaState,
-    elems: &mut [TValue],
+fn auxsort<'a>(
+    state: &mut LuaState<'a>,
+    elems: &mut [TValue<'a>],
     lo: i64,
     up: i64,
     rnd: u32,
-    comp: &TValue,
-) -> Result<(), VmError> {
+    comp: &TValue<'a>,
+) -> Result<(), VmError<'a>> {
     let mut lo = lo;
     let mut up = up;
     let mut rnd = rnd;
@@ -563,7 +607,12 @@ fn auxsort(
 /// 对 table 的数组部分进行原地排序。comp 是可选的比较函数，
 /// 接受两个参数，返回 true 如果第一个小于第二个。
 /// 无 comp 时使用 Lua 的 < 运算符。
-fn call_sort(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_sort<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     let table_val = get_arg(state, a, 0);
     let comp_val = if nargs >= 2 {
         get_arg(state, a, 1)
@@ -619,7 +668,12 @@ fn call_sort(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 /// sizeseq > INT_MAX → "out of range" (arg #1)
 /// sizerest > INT_MAX → "out of range" (arg #2)
 /// sizerest > MAXHSIZE (2^30) → "table overflow"
-fn call_create(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_create<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     // 参数 1: sizeseq (必需)
     let sizeseq = if nargs >= 1 {
         match &state.exec.stack[a + 1] {
@@ -708,7 +762,12 @@ fn call_create(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
 ///
 /// 将 a1[f..e] 移动到 a2[t..t+e-f]，默认 a2 = a1。返回 a2。
 /// 通过 VmExecutor::table_get/table_set 调用元方法 (__index/__newindex)。
-fn call_move(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_move<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     // 参数 1: 源表 (必需)
     let src_val = get_arg(state, a, 0);
     if !matches!(src_val, TValue::Table(_)) {
@@ -824,13 +883,13 @@ fn call_move(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 }
 
 /// 从栈中读取必需整数参数 (对应 C 的 luaL_checkinteger)
-fn get_int_arg(
-    state: &LuaState,
+fn get_int_arg<'a>(
+    state: &LuaState<'a>,
     a: usize,
     idx: usize,
     fname: &str,
     arg_num: usize,
-) -> Result<i64, VmError> {
+) -> Result<i64, VmError<'a>> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.exec.stack.len() {
         return Err(VmError::RuntimeError(format!(
@@ -864,12 +923,12 @@ fn get_int_arg(
 /// 推入 comp(a, b) 并通过 state.pcall 调用,返回布尔结果。
 /// 注意: C Lua 使用 lua_call(不可 yield),这里通过递增 n_ny_calls 模拟,
 /// 使比较函数内部不能 yield(对应 C Lua 的 nny 计数)。
-fn call_comp_function(
-    state: &mut LuaState,
-    comp: &TValue,
-    a: &TValue,
-    b: &TValue,
-) -> Result<bool, VmError> {
+fn call_comp_function<'a>(
+    state: &mut LuaState<'a>,
+    comp: &TValue<'a>,
+    a: &TValue<'a>,
+    b: &TValue<'a>,
+) -> Result<bool, VmError<'a>> {
     let saved_len = state.exec.stack.len();
     // 推入: comp, a, b
     state.exec.stack.push(comp.clone());
@@ -913,16 +972,16 @@ fn call_comp_function(
 // ============================================================================
 
 /// 打开 Table 库并注册到全局变量 table
-pub fn open_table_lib(state: &mut LuaState) {
+pub fn open_table_lib<'a>(state: &mut LuaState<'a>) {
     let mut lib = Table::new();
 
     // 注册所有 Table 函数 (使用 BuiltinFn 函数指针)
-    let register = |lib: &mut crate::table::Table,
+    let register = |lib: &mut crate::table::Table<'a>,
                     name: &'static std::ffi::CStr,
-                    func: crate::objects::BuiltinFnPtr| {
-        let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
+                    func: crate::objects::BuiltinFnPtr<'a>| {
+        let key = state.intern(name.to_str().unwrap_or(""));
         let name_ptr = name.as_ptr() as *const u8;
-        lib.set(key, TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)));
+        lib.set(key, BuiltinFn::impure_tvalue(func, name_ptr));
     };
 
     register(&mut lib, c"concat", call_concat);

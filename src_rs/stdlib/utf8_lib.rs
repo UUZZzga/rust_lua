@@ -194,7 +194,7 @@ fn utf8_encode(code: u32) -> Vec<u8> {
 // ============================================================================
 
 /// 从栈中读取字符串参数（返回字节切片）
-fn get_str_bytes(state: &LuaState, a: usize, idx: usize) -> Result<Vec<u8>, VmError> {
+fn get_str_bytes<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> Result<Vec<u8>, VmError<'a>> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.exec.stack.len() {
         return Err(VmError::RuntimeError(format!(
@@ -249,12 +249,12 @@ fn get_bool_arg(state: &LuaState, a: usize, idx: usize, default: bool) -> bool {
 }
 
 /// 从栈中读取必需的整数参数（带错误消息）
-fn get_required_int_arg(
-    state: &LuaState,
+fn get_required_int_arg<'a>(
+    state: &LuaState<'a>,
     a: usize,
     idx: usize,
     fname: &str,
-) -> Result<i64, VmError> {
+) -> Result<i64, VmError<'a>> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.exec.stack.len() {
         return Err(VmError::RuntimeError(format!(
@@ -283,12 +283,12 @@ fn get_required_int_arg(
 }
 
 /// 将结果压入栈并调整栈顶
-fn push_results(state: &mut LuaState, a: usize, nresults: i32, results: Vec<TValue>) {
+fn push_results<'a>(state: &mut LuaState<'a>, a: usize, nresults: i32, results: Vec<TValue<'a>>) {
     state.adjust_results(a, nresults, results);
 }
 
 /// 将字节序列创建为 Lua 字符串（使用 unsafe 绕过 UTF-8 校验，与 string 库一致）
-fn bytes_to_lua_str(state: &LuaState, bytes: &[u8]) -> TValue {
+fn bytes_to_lua_str<'a>(state: &LuaState<'a>, bytes: &[u8]) -> TValue<'a> {
     let s = unsafe { String::from_utf8_unchecked(bytes.to_vec()) };
     TValue::Str(state.intern_str(&s))
 }
@@ -428,7 +428,7 @@ fn utf8_offset_impl(s: &[u8], n: i64, posi_arg: i64) -> Result<Option<(i64, i64)
 /// 参数: s (字符串), n (当前位置, 0-based)
 /// 返回: (next_position, codepoint) 或空 Vec (结束)
 #[cfg(test)]
-fn utf8_iter_aux_impl(s: &[u8], n_arg: i64, strict: bool) -> Vec<TValue> {
+fn utf8_iter_aux_impl(s: &[u8], n_arg: i64, strict: bool) -> Vec<TValue<'_>> {
     let len = s.len();
     // 将 n 视为无符号 (对应 C 的 lua_Unsigned)
     let n = if n_arg < 0 {
@@ -469,7 +469,12 @@ fn utf8_iter_aux_impl(s: &[u8], n_arg: i64, strict: bool) -> Vec<TValue> {
 // ============================================================================
 
 /// utf8.offset(s, n, [i]) — 对应 C 的 byteoffset
-fn call_offset(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_offset<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     let s = get_str_bytes(state, a, 0)?;
     let n = get_required_int_arg(state, a, 1, "offset")?;
     let default_posi = if n >= 0 { 1 } else { s.len() as i64 + 1 };
@@ -499,12 +504,12 @@ fn call_offset(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
 }
 
 /// utf8.codepoint(s, [i, [j [, lax]]]) — 对应 C 的 codepoint
-fn call_codepoint(
-    state: &mut LuaState,
+fn call_codepoint<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let s = get_str_bytes(state, a, 0)?;
     let posi = if nargs >= 2 {
         get_opt_int_arg(state, a, 1, 1)
@@ -532,7 +537,12 @@ fn call_codepoint(
 }
 
 /// utf8.char(n1, n2, ...) — 对应 C 的 utfchar
-fn call_char(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_char<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     let mut codes = Vec::with_capacity(nargs);
     for i in 0..nargs {
         let c = get_required_int_arg(state, a, i, "char")?;
@@ -550,7 +560,12 @@ fn call_char(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 }
 
 /// utf8.len(s [, i [, j [, lax]]]) — 对应 C 的 utflen
-fn call_len(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_len<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     let s = get_str_bytes(state, a, 0)?;
     let len = s.len();
     let posi = if nargs >= 2 {
@@ -616,7 +631,12 @@ fn call_len(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Resu
 /// utf8.codes(s, [lax]) — 对应 C 的 iter_codes
 ///
 /// 返回 3 个值: 迭代器函数, 字符串 s, 初始位置 0
-fn call_codes(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_codes<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     let s = get_str_bytes(state, a, 0)?;
     let lax = nargs >= 2 && get_bool_arg(state, a, 1, false);
 
@@ -638,35 +658,35 @@ fn call_codes(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
 /// utf8 迭代器函数（strict 模式）— 对应 C 的 iter_auxstrict
 ///
 /// 在 TFORCALL 中调用，参数: s (字符串), n (当前位置)
-fn call_iter_strict(
-    state: &mut LuaState,
+fn call_iter_strict<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     call_iter(state, a, nargs, nresults, true)
 }
 
 /// utf8 迭代器函数（lax 模式）— 对应 C 的 iter_auxlax
-fn call_iter_lax(
-    state: &mut LuaState,
+fn call_iter_lax<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     call_iter(state, a, nargs, nresults, false)
 }
 
 /// utf8 迭代器函数实现 — 对应 C 的 iter_auxstrict / iter_auxlax
 ///
 /// 在 TFORCALL 中调用，参数: s (字符串), n (当前位置)
-fn call_iter(
-    state: &mut LuaState,
+fn call_iter<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     _nargs: usize,
     nresults: i32,
     strict: bool,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let s_val = if a + 1 < state.exec.stack.len() {
         state.exec.stack[a + 1].clone()
     } else {
@@ -750,16 +770,16 @@ fn call_iter(
 /// 1. 创建 utf8 库函数表
 /// 2. 设置 charpattern 字段
 /// 3. 返回库表 (调用者负责注册到全局或 package.loaded)
-pub fn create_utf8_lib_table(state: &LuaState) -> crate::table::Table {
+pub fn create_utf8_lib_table<'a>(state: &LuaState<'a>) -> crate::table::Table<'a> {
     let mut lib = Table::new();
 
     // 注册所有 UTF-8 函数 (使用 BuiltinFn 函数指针)
-    let register = |lib: &mut crate::table::Table,
+    let register = |lib: &mut crate::table::Table<'a>,
                     name: &'static std::ffi::CStr,
-                    func: crate::objects::BuiltinFnPtr| {
-        let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
+                    func: crate::objects::BuiltinFnPtr<'a>| {
+        let key = state.intern(name.to_str().unwrap_or(""));
         let name_ptr = name.as_ptr() as *const u8;
-        lib.set(key, TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)));
+        lib.set(key, BuiltinFn::impure_tvalue(func, name_ptr));
     };
 
     register(&mut lib, c"offset", call_offset);

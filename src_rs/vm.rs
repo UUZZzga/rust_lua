@@ -374,7 +374,7 @@ fn le_float_int(f: f64, i: i64) -> bool {
 // ============================================================================
 
 /// 比较两个数值 TValue: 返回 l < r。
-pub fn lt_num(l: &TValue, r: &TValue) -> bool {
+pub fn lt_num<'a>(l: &TValue<'a>, r: &TValue<'a>) -> bool {
     match (l, r) {
         (TValue::Integer(li), TValue::Integer(ri)) => li < ri,
         (TValue::Integer(li), TValue::Float(rf)) => lt_int_float(*li, *rf),
@@ -391,7 +391,7 @@ pub fn lt_num(l: &TValue, r: &TValue) -> bool {
 }
 
 /// 比较两个数值 TValue: 返回 l <= r。
-pub fn le_num(l: &TValue, r: &TValue) -> bool {
+pub fn le_num<'a>(l: &TValue<'a>, r: &TValue<'a>) -> bool {
     match (l, r) {
         (TValue::Integer(li), TValue::Integer(ri)) => li <= ri,
         (TValue::Integer(li), TValue::Float(rf)) => le_int_float(*li, *rf),
@@ -431,7 +431,7 @@ pub fn le_num(l: &TValue, r: &TValue) -> bool {
 /// Given: Float(NaN) 和 Float(NaN)
 /// When: 调用 raw_equal
 /// Then: 返回 false
-pub fn raw_equal(t1: &TValue, t2: &TValue) -> bool {
+pub fn raw_equal<'a>(t1: &TValue<'a>, t2: &TValue<'a>) -> bool {
     match (t1, t2) {
         (TValue::Nil(a), TValue::Nil(b)) => a == b,
         (TValue::Boolean(a), TValue::Boolean(b)) => a == b,
@@ -599,7 +599,7 @@ pub fn shiftr(x: i64, y: i64) -> i64 {
 /// - Table: 返回表长度
 /// - String: 返回字符串长度
 /// - 其他: 返回 None (需要调用 __len 元方法)
-pub fn objlen_raw(obj: &TValue) -> Option<TValue> {
+pub fn objlen_raw<'a>(obj: &TValue<'a>) -> Option<TValue<'a>> {
     match obj {
         TValue::Table(t) => Some(TValue::Integer(t.len())),
         TValue::Str(s) => Some(TValue::Integer(s.len() as i64)),
@@ -671,7 +671,11 @@ const MAX_TAG_LOOP: i32 = 2000;
 /// Given: __index 链形成循环
 /// When: 遍历超过 MAXTAGLOOP 次
 /// Then: 返回 RuntimeError
-pub fn finish_get(key: &TValue, t: &TValue, _metatable: Option<&Table>) -> Result<TValue, VmError> {
+pub fn finish_get<'a>(
+    key: &TValue<'a>,
+    t: &TValue<'a>,
+    _metatable: Option<&Table<'a>>,
+) -> Result<TValue<'a>, VmError<'a>> {
     let current = t.clone();
     let current_key = key.clone();
 
@@ -726,12 +730,12 @@ pub fn finish_get(key: &TValue, t: &TValue, _metatable: Option<&Table>) -> Resul
 /// Given: __newindex 链形成循环
 /// When: 遍历超过 MAXTAGLOOP 次
 /// Then: 返回 RuntimeError
-pub fn finish_set(
-    t: &mut TValue,
-    key: TValue,
-    val: TValue,
+pub fn finish_set<'a>(
+    t: &mut TValue<'a>,
+    key: TValue<'a>,
+    val: TValue<'a>,
     _hres: FastAccess,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     for _loop_count in 0..MAX_TAG_LOOP {
         match t {
             TValue::Table(table) => {
@@ -765,7 +769,7 @@ pub fn finish_set(
 /// Given: 中断前的栈状态，其中元方法结果已放置
 /// When: 调用 finish_op
 /// Then: 完成剩余字符串拼接
-pub fn finish_op(_interrupted_op: u8, _stack: &mut Vec<TValue>) -> Result<(), VmError> {
+pub fn finish_op<'a>(_interrupted_op: u8, _stack: &mut Vec<TValue<'a>>) -> Result<(), VmError<'a>> {
     // 占位实现 — 在实际系统中有完整的元方法调用和 yield 支持时填充
     Ok(())
 }
@@ -981,7 +985,11 @@ fn append_val_to_string(buf: &mut String, v: &TValue) {
 /// Given: init = 3, limit = 5, step = -1
 /// When: 调用 for_limit
 /// Then: 返回 true（跳过循环）
-pub fn for_limit(init: i64, limit_val: &TValue, step: i64) -> Result<(i64, bool), VmError> {
+pub fn for_limit<'a>(
+    init: i64,
+    limit_val: &TValue<'a>,
+    step: i64,
+) -> Result<(i64, bool), VmError<'a>> {
     let mode = if step < 0 {
         F2IMode::Ceil
     } else {
@@ -1040,7 +1048,7 @@ pub fn for_limit(init: i64, limit_val: &TValue, step: i64) -> Result<(i64, bool)
 /// Given: init=5, limit=3, step=1
 /// When: 调用 for_prep
 /// Then: 返回 true（跳过）
-pub fn for_prep(stack: &mut Vec<TValue>, ra: usize) -> Result<bool, VmError> {
+pub fn for_prep<'a>(stack: &mut Vec<TValue<'a>>, ra: usize) -> Result<bool, VmError<'a>> {
     let init = stack[ra].clone();
     let limit = stack[ra + 1].clone();
     let step = stack[ra + 2].clone();
@@ -1163,10 +1171,10 @@ pub fn float_for_loop(stack: &mut Vec<TValue>, ra: usize) -> bool {
 /// Given: 一个 proto 有一个上值，instack=true
 /// When: 调用 push_closure
 /// Then: 创建闭包，上值指向栈上对应位置
-pub fn push_closure(
-    stack: &mut Vec<TValue>,
-    proto: &crate::objects::Proto,
-    _enc_upvals: &[UpValRef],
+pub fn push_closure<'a>(
+    stack: &mut Vec<TValue<'a>>,
+    proto: &crate::objects::Proto<'a>,
+    _enc_upvals: &[UpValRef<'a>],
     _base: usize,
     ra: usize,
     gc: &GCState,
@@ -1280,7 +1288,7 @@ mod tests {
     /// 原始小于比较 (不含元方法): 数字用 lt_num，字符串用 strcmp。
     /// 其他类型返回 false。
     /// 对应 C 的 luaV_lessthan 中的快速路径 (非元方法部分)。
-    fn less_than_raw(l: &TValue, r: &TValue) -> Option<bool> {
+    fn less_than_raw<'a>(l: &TValue<'a>, r: &TValue<'a>) -> Option<bool> {
         if l.is_number() && r.is_number() {
             return Some(lt_num(l, r));
         }
@@ -1293,7 +1301,7 @@ mod tests {
     /// 原始小于等于比较 (不含元方法): 数字用 le_num，字符串用 strcmp。
     /// 其他类型返回 false。
     /// 对应 C 的 luaV_lessequal 中的快速路径 (非元方法部分)。
-    fn less_equal_raw(l: &TValue, r: &TValue) -> Option<bool> {
+    fn less_equal_raw<'a>(l: &TValue<'a>, r: &TValue<'a>) -> Option<bool> {
         if l.is_number() && r.is_number() {
             return Some(le_num(l, r));
         }
@@ -1309,7 +1317,7 @@ mod tests {
 
     #[test]
     fn test_lua_state_new_stack_init() {
-        let l = LuaState::new();
+        let l = LuaState::default();
         // 对应 C 的 stack_init: top = stack + 1, stacksize = BASIC_STACK_SIZE + EXTRA_STACK
         assert_eq!(l.gettop(), 1, "stack must have function entry slot");
         assert_eq!(

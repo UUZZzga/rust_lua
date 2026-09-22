@@ -49,7 +49,7 @@ pub const MIN_INTEGER: i64 = i64::MIN;
 ///
 /// 整数输入返回整数, 浮点输入返回浮点。
 /// 整数最小值取绝对值会产生回绕 (与 C 行为一致)。
-pub fn math_abs(v: &TValue) -> Result<TValue, String> {
+pub fn math_abs<'a>(v: &TValue<'a>) -> Result<TValue<'a>, String> {
     match v {
         TValue::Integer(n) => {
             // 对应 C: if (n < 0) n = (lua_Integer)(0u - (lua_Unsigned)n);
@@ -120,7 +120,7 @@ pub fn math_tointeger(v: &TValue) -> Option<i64> {
 
 /// 将浮点数转为整数 (如果可以无损转换), 否则保持浮点
 /// 对应 C 的 pushnumint
-fn push_num_int(d: f64) -> TValue {
+fn push_num_int<'a>(d: f64) -> TValue<'a> {
     // C 的 lua_numbertointeger: d >= MININTEGER && d < -MININTEGER
     // -MININTEGER = 2^63 (可精确表示为 f64)
     let min_int_f = i64::MIN as f64;
@@ -135,7 +135,7 @@ fn push_num_int(d: f64) -> TValue {
 /// math.floor(v) — 向下取整 (对应 C 的 math_floor)
 ///
 /// 整数输入返回自身, 浮点输入返回 floor (可能为整数或浮点)。
-pub fn math_floor(v: &TValue) -> Result<TValue, String> {
+pub fn math_floor<'a>(v: &TValue<'a>) -> Result<TValue<'a>, String> {
     match v {
         TValue::Integer(_) => Ok(v.clone()),
         TValue::Float(f) => Ok(push_num_int(f.floor())),
@@ -149,7 +149,7 @@ pub fn math_floor(v: &TValue) -> Result<TValue, String> {
 /// math.ceil(v) — 向上取整 (对应 C 的 math_ceil)
 ///
 /// 整数输入返回自身, 浮点输入返回 ceil (可能为整数或浮点)。
-pub fn math_ceil(v: &TValue) -> Result<TValue, String> {
+pub fn math_ceil<'a>(v: &TValue<'a>) -> Result<TValue<'a>, String> {
     match v {
         TValue::Integer(_) => Ok(v.clone()),
         TValue::Float(f) => Ok(push_num_int(f.ceil())),
@@ -164,7 +164,7 @@ pub fn math_ceil(v: &TValue) -> Result<TValue, String> {
 ///
 /// 整数操作数: 整数取模 (C 的 % 运算符)
 /// 浮点操作数: 浮点取模 (C 的 fmod)
-pub fn math_fmod(v1: &TValue, v2: &TValue) -> Result<TValue, String> {
+pub fn math_fmod<'a>(v1: &TValue<'a>, v2: &TValue<'a>) -> Result<TValue<'a>, String> {
     match (v1, v2) {
         (TValue::Integer(a), TValue::Integer(b)) => {
             if *b == 0 {
@@ -194,7 +194,7 @@ pub fn math_fmod(v1: &TValue, v2: &TValue) -> Result<TValue, String> {
 /// 返回 (整数部分, 小数部分)。
 /// 整数输入: (自身, 0.0)
 /// 浮点输入: (向零取整的整数部分, 小数部分)
-pub fn math_modf(v: &TValue) -> Result<(TValue, TValue), String> {
+pub fn math_modf<'a>(v: &TValue<'a>) -> Result<(TValue<'a>, TValue<'a>), String> {
     match v {
         TValue::Integer(_) => Ok((v.clone(), TValue::Float(0.0))),
         TValue::Float(f) => {
@@ -306,7 +306,7 @@ pub fn math_ldexp(x: f64, e: i64) -> f64 {
 ///
 /// 比较所有参数, 返回最小值。
 /// 混合整数和浮点时, 比较使用 Lua 的 < 运算符语义。
-pub fn math_min(args: &[TValue]) -> Result<TValue, String> {
+pub fn math_min<'a>(args: &[TValue<'a>]) -> Result<TValue<'a>, String> {
     if args.is_empty() {
         return Err("bad argument #1 to 'min' (value expected)".to_string());
     }
@@ -320,7 +320,7 @@ pub fn math_min(args: &[TValue]) -> Result<TValue, String> {
 }
 
 /// math.max(...) — 最大值 (对应 C 的 math_max)
-pub fn math_max(args: &[TValue]) -> Result<TValue, String> {
+pub fn math_max<'a>(args: &[TValue<'a>]) -> Result<TValue<'a>, String> {
     if args.is_empty() {
         return Err("bad argument #1 to 'max' (value expected)".to_string());
     }
@@ -507,7 +507,7 @@ impl Default for RandState {
 /// 单参数 0: 返回全范围随机整数
 /// 单参数 n: 返回 [1, n] 范围的整数
 /// 双参数 low, up: 返回 [low, up] 范围的整数
-pub fn math_random(state: &mut RandState, args: &[TValue]) -> Result<TValue, String> {
+pub fn math_random<'a>(state: &mut RandState, args: &[TValue<'a>]) -> Result<TValue<'a>, String> {
     let rv = state.nextrand();
     match args.len() {
         0 => {
@@ -549,7 +549,10 @@ pub fn math_random(state: &mut RandState, args: &[TValue]) -> Result<TValue, Str
 /// 双参数 x, y: 使用 x, y 作为种子
 ///
 /// 返回 (主种子, 次种子)
-pub fn math_randomseed(state: &mut RandState, args: &[TValue]) -> Result<(i64, i64), String> {
+pub fn math_randomseed<'a>(
+    state: &mut RandState,
+    args: &[TValue<'a>],
+) -> Result<(i64, i64), String> {
     let (n1, n2) = match args.len() {
         0 => {
             // 使用当前时间作为种子 (对应 C 的 luaL_makeseed)
@@ -581,7 +584,7 @@ pub fn math_randomseed(state: &mut RandState, args: &[TValue]) -> Result<(i64, i
 // ============================================================================
 
 /// 从栈中读取参数 (0-based 索引, 相对于函数位置 a)
-fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
+fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
     let stack_idx = a + 1 + idx;
     if stack_idx < state.exec.stack.len() {
         state.exec.stack[stack_idx].clone()
@@ -591,7 +594,7 @@ fn get_arg(state: &LuaState, a: usize, idx: usize) -> TValue {
 }
 
 /// 将结果压入栈并调整栈顶
-fn push_results(state: &mut LuaState, a: usize, nresults: i32, results: Vec<TValue>) {
+fn push_results<'a>(state: &mut LuaState<'a>, a: usize, nresults: i32, results: Vec<TValue<'a>>) {
     state.adjust_results(a, nresults, results);
 }
 
@@ -600,12 +603,17 @@ fn push_results(state: &mut LuaState, a: usize, nresults: i32, results: Vec<TVal
 /// perf: 直接走 state.adjust_single_result (零堆分配)。
 /// 原实现经 push_results → adjust_results(a, nresults, vec![result]),
 /// 每次调用一次 1 元素 Vec 堆分配 + 释放。
-fn push_single_result(state: &mut LuaState, a: usize, nresults: i32, result: TValue) {
+fn push_single_result<'a>(state: &mut LuaState<'a>, a: usize, nresults: i32, result: TValue<'a>) {
     state.adjust_single_result(a, nresults, result);
 }
 
 /// 从栈中读取数字参数 (整数或浮点)
-fn get_number_arg(state: &LuaState, a: usize, idx: usize, fname: &str) -> Result<TValue, VmError> {
+fn get_number_arg<'a>(
+    state: &LuaState<'a>,
+    a: usize,
+    idx: usize,
+    fname: &str,
+) -> Result<TValue<'a>, VmError<'a>> {
     let v = get_arg(state, a, idx);
     match &v {
         TValue::Integer(_) | TValue::Float(_) => Ok(v),
@@ -640,7 +648,12 @@ fn get_number_arg(state: &LuaState, a: usize, idx: usize, fname: &str) -> Result
 }
 
 /// 从栈中读取整数参数
-fn get_int_arg(state: &LuaState, a: usize, idx: usize, fname: &str) -> Result<i64, VmError> {
+fn get_int_arg<'a>(
+    state: &LuaState<'a>,
+    a: usize,
+    idx: usize,
+    fname: &str,
+) -> Result<i64, VmError<'a>> {
     let v = get_arg(state, a, idx);
     match &v {
         TValue::Integer(n) => Ok(*n),
@@ -674,7 +687,12 @@ fn get_int_arg(state: &LuaState, a: usize, idx: usize, fname: &str) -> Result<i6
 /// math.abs(v) — 对应 C 的 math_abs
 ///
 /// perf: 直接栈读 + 单次 match, 错误构造走 #[cold] 路径 (同 call_simple_unary)
-fn call_abs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_abs<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'abs' (number expected, got no value)".to_string(),
@@ -724,7 +742,7 @@ fn call_abs(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Resu
 /// perf: 从 call_simple_unary 热路径拆出, 避免热路径携带 format! 与字符串解析代码
 #[cold]
 #[inline(never)]
-fn unary_slow_convert(v: &TValue, fname: &str) -> Result<f64, VmError> {
+fn unary_slow_convert<'a>(v: &TValue<'a>, fname: &str) -> Result<f64, VmError<'a>> {
     match v {
         TValue::Str(s) => {
             let s = s.as_str();
@@ -753,14 +771,14 @@ fn unary_slow_convert(v: &TValue, fname: &str) -> Result<f64, VmError> {
 /// - 单次 match 同时完成 Integer/Float 提取 (原 get_number_arg + to_float 两轮 match);
 /// - adjust_single_result 替代 push_single_result (原 vec![result] 每次调用一次堆分配);
 /// - 错误消息构造全部推入 #[cold] 路径。
-fn call_simple_unary<F>(
-    state: &mut LuaState,
+fn call_simple_unary<'a, F>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
     f: F,
     fname: &str,
-) -> Result<(), VmError>
+) -> Result<(), VmError<'a>>
 where
     F: Fn(f64) -> f64,
 {
@@ -824,7 +842,7 @@ where
 /// nargs==0 错误 — cold 路径, 隔离 format! 代码体积
 #[cold]
 #[inline(never)]
-fn unary_no_arg(fname: &str) -> VmError {
+fn unary_no_arg<'a>(fname: &str) -> VmError<'a> {
     VmError::RuntimeError(format!(
         "bad argument #1 to '{}' (number expected, got no value)",
         fname
@@ -832,38 +850,88 @@ fn unary_no_arg(fname: &str) -> VmError {
 }
 
 // 简单一元函数的独立包装（作为 BuiltinFnPtr 注册）
-fn call_sin(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_sin<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     call_simple_unary(state, a, nargs, nresults, math_sin, "sin")
 }
-fn call_cos(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_cos<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     call_simple_unary(state, a, nargs, nresults, math_cos, "cos")
 }
-fn call_tan(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_tan<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     call_simple_unary(state, a, nargs, nresults, math_tan, "tan")
 }
-fn call_asin(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_asin<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     call_simple_unary(state, a, nargs, nresults, math_asin, "asin")
 }
-fn call_acos(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_acos<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     call_simple_unary(state, a, nargs, nresults, math_acos, "acos")
 }
-fn call_deg(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_deg<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     call_simple_unary(state, a, nargs, nresults, math_deg, "deg")
 }
-fn call_rad(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_rad<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     call_simple_unary(state, a, nargs, nresults, math_rad, "rad")
 }
-fn call_exp(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_exp<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     call_simple_unary(state, a, nargs, nresults, math_exp, "exp")
 }
-fn call_sqrt(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_sqrt<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     call_simple_unary(state, a, nargs, nresults, math_sqrt, "sqrt")
 }
 
 /// math.atan(y [, x]) — 对应 C 的 math_atan
 ///
 /// perf: 直接栈读 + 单次 match (同 call_simple_unary), 零 clone 零堆分配
-fn call_atan(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_atan<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'atan' (number expected, got no value)".to_string(),
@@ -891,7 +959,12 @@ fn call_atan(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 /// math.log(x [, base]) — 对应 C 的 math_log
 ///
 /// perf: 直接栈读 + 单次 match (同 call_simple_unary), 零 clone 零堆分配
-fn call_log(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_log<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'log' (number expected, got no value)".to_string(),
@@ -917,7 +990,12 @@ fn call_log(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Resu
 }
 
 /// math.floor(v) — 对应 C 的 math_floor
-fn call_floor(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_floor<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'floor' (number expected, got no value)".to_string(),
@@ -934,7 +1012,12 @@ fn call_floor(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
 }
 
 /// math.ceil(v) — 对应 C 的 math_ceil
-fn call_ceil(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_ceil<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'ceil' (number expected, got no value)".to_string(),
@@ -951,7 +1034,12 @@ fn call_ceil(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 }
 
 /// math.fmod(a, b) — 对应 C 的 math_fmod
-fn call_fmod(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_fmod<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     if nargs < 2 {
         return Err(VmError::RuntimeError(format!(
             "bad argument #{} to 'fmod' (number expected, got no value)",
@@ -970,7 +1058,12 @@ fn call_fmod(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 }
 
 /// math.modf(x) — 对应 C 的 math_modf
-fn call_modf(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_modf<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'modf' (number expected, got no value)".to_string(),
@@ -987,12 +1080,12 @@ fn call_modf(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 }
 
 /// math.tointeger(v) — 对应 C 的 math_toint
-fn call_tointeger(
-    state: &mut LuaState,
+fn call_tointeger<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'tointeger' (value expected)".to_string(),
@@ -1013,7 +1106,12 @@ fn call_tointeger(
 }
 
 /// math.ult(a, b) — 对应 C 的 math_ult
-fn call_ult(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_ult<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     if nargs < 2 {
         return Err(VmError::RuntimeError(format!(
             "bad argument #{} to 'ult' (integer expected, got no value)",
@@ -1028,7 +1126,12 @@ fn call_ult(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Resu
 }
 
 /// math.frexp(x) — 对应 C 的 math_frexp
-fn call_frexp(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_frexp<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'frexp' (number expected, got no value)".to_string(),
@@ -1047,7 +1150,12 @@ fn call_frexp(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
 }
 
 /// math.ldexp(x, e) — 对应 C 的 math_ldexp
-fn call_ldexp(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_ldexp<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     if nargs < 2 {
         return Err(VmError::RuntimeError(format!(
             "bad argument #{} to 'ldexp' (value expected, got no value)",
@@ -1063,7 +1171,12 @@ fn call_ldexp(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Re
 }
 
 /// math.min(...) — 对应 C 的 math_min
-fn call_min(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_min<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'min' (value expected)".to_string(),
@@ -1090,7 +1203,12 @@ fn call_min(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Resu
 }
 
 /// math.max(...) — 对应 C 的 math_max
-fn call_max(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_max<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'max' (value expected)".to_string(),
@@ -1117,7 +1235,12 @@ fn call_max(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Resu
 }
 
 /// math.type(v) — 对应 C 的 math_type
-fn call_type(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_type<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     if nargs == 0 {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'type' (value expected)".to_string(),
@@ -1138,7 +1261,12 @@ fn call_type(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Res
 }
 
 /// math.random([low [, up]]) — 对应 C 的 math_random
-fn call_random(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError> {
+fn call_random<'a>(
+    state: &mut LuaState<'a>,
+    a: usize,
+    nargs: usize,
+    nresults: i32,
+) -> Result<(), VmError<'a>> {
     let args: Vec<TValue> = (0..nargs).map(|i| get_arg(state, a, i)).collect();
     let rand_state = state.math_random_state.as_mut().unwrap();
     match math_random(rand_state, &args) {
@@ -1151,12 +1279,12 @@ fn call_random(state: &mut LuaState, a: usize, nargs: usize, nresults: i32) -> R
 }
 
 /// math.randomseed([x [, y]]) — 对应 C 的 math_randomseed
-fn call_randomseed(
-    state: &mut LuaState,
+fn call_randomseed<'a>(
+    state: &mut LuaState<'a>,
     a: usize,
     nargs: usize,
     nresults: i32,
-) -> Result<(), VmError> {
+) -> Result<(), VmError<'a>> {
     let args: Vec<TValue> = (0..nargs).map(|i| get_arg(state, a, i)).collect();
     let rand_state = state.math_random_state.as_mut().unwrap();
     match math_randomseed(rand_state, &args) {
@@ -1183,7 +1311,7 @@ fn call_randomseed(
 /// 1. 创建数学库函数表并注册为全局变量 math
 /// 2. 设置常量: pi, huge, maxinteger, mininteger
 /// 3. 初始化随机数生成器状态
-pub fn open_math_lib(state: &mut LuaState) {
+pub fn open_math_lib<'a>(state: &mut LuaState<'a>) {
     let lib = Table::new();
 
     // 注册所有数学库函数 (使用 BuiltinFn 函数指针)
@@ -1194,10 +1322,10 @@ pub fn open_math_lib(state: &mut LuaState) {
     // (原 state.pure_fns HashSet 查询每次调用 2 个非内联 call:
     // tvalue_fx_hash + RawTable::find)。
     let register =
-        |lib: &Table, name: &'static std::ffi::CStr, func: crate::objects::BuiltinFnPtr| {
-            let key = TValue::Str(state.intern_str(name.to_str().unwrap_or("")));
+        |lib: &Table<'a>, name: &'static std::ffi::CStr, func: crate::objects::BuiltinFnPtr<'a>| {
+            let key = state.intern(name.to_str().unwrap_or(""));
             let name_ptr = name.as_ptr() as *const u8;
-            lib.set(key, TValue::BuiltinFn(BuiltinFn::pure_fn(func, name_ptr)));
+            lib.set(key, BuiltinFn::pure_fn_tvalue(func, name_ptr));
         };
 
     register(&lib, c"abs", call_abs);
@@ -1261,7 +1389,7 @@ pub fn open_math_lib(state: &mut LuaState) {
 mod tests {
     use super::*;
 
-    fn make_str(s: &str) -> TValue {
+    fn make_str(s: &str) -> TValue<'_> {
         TValue::Str(crate::strings::LuaString::Short(
             crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
@@ -1835,7 +1963,7 @@ mod tests {
 
     #[test]
     fn test_open_math_lib_registers_global() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         open_math_lib(&mut state);
         let key = TValue::Str(state.intern_str("math"));
         let val = state.globals.get(&key);
@@ -1845,7 +1973,7 @@ mod tests {
 
     #[test]
     fn test_open_math_lib_has_all_functions() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         open_math_lib(&mut state);
 
         // 获取 math 表
@@ -1894,7 +2022,7 @@ mod tests {
 
     #[test]
     fn test_open_math_lib_has_constants() {
-        let mut state = LuaState::new();
+        let mut state = LuaState::default();
         open_math_lib(&mut state);
 
         let math_key = TValue::Str(state.intern_str("math"));

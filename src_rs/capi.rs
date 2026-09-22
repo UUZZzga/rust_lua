@@ -37,7 +37,7 @@ use crate::vm::F2IMode;
 // ============================================================================
 
 /// lua_State 不透明指针 —— 直接用 LuaState
-pub type lua_State = LuaState;
+pub type lua_State = LuaState<'static>;
 
 /// C 函数类型（与 objects.rs 的 LCFunction.func / CClosure.f 类型一致）
 pub type lua_CFunction = unsafe extern "C" fn(L: *mut c_void) -> c_int;
@@ -109,7 +109,7 @@ fn index2offset(L: &LuaState, idx: c_int) -> Option<usize> {
 }
 
 /// 获取栈上 idx 处的 TValue 引用（只读）。
-fn index2val<'a>(L: &'a LuaState, idx: c_int) -> Option<&'a TValue> {
+fn index2val<'a, 'b>(L: &'a LuaState<'b>, idx: c_int) -> Option<&'a TValue<'b>> {
     // 伪索引：registry
     if idx == LUA_REGISTRYINDEX {
         // registry 是一个 table，存放在 LuaState.registry
@@ -170,7 +170,7 @@ pub extern "C" fn lua_newstate(
     ud: *mut c_void,
     _seed: std::ffi::c_uint,
 ) -> *mut lua_State {
-    let mut state = LuaState::new();
+    let mut state = LuaState::default();
     state.allocf_ud = ud;
     Box::into_raw(Box::new(state))
 }

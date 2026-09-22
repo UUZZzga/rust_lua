@@ -14,8 +14,8 @@
 
 use crate::gc::GCState;
 use crate::objects::{
-    CallFrame, Instruction, LClosure, LuaType, NilKind, Proto, TValue, UpVal, UpValRef, UpValVec,
-    PF_VAHID, PF_VATAB,
+    CallFrame, Instruction, LClosure, LuaType, NilKind, Proto, TValue, UpVal, UpValVec, PF_VAHID,
+    PF_VATAB,
 };
 use crate::opcodes::{self, OpCode};
 use crate::state::{LuaState, LUAI_MAXCCALLS, LUA_MINSTACK, MAX_CALL_CHAIN};
@@ -40,11 +40,11 @@ static LUA_VM_TRACE_LEVEL: OnceLock<u8> = OnceLock::new();
 
 /// GETTABUP/GETFIELD 单次探测特化的命中值 — 借用块内提取 owned,
 /// 块外写栈 (write_stack 需要 &mut state, 与表借用冲突)。
-enum SpecValue {
-    Builtin(crate::objects::BuiltinFn),
-    Table(Table),
+enum SpecValue<'a> {
+    Builtin(crate::objects::BuiltinFn<'a>),
+    Table(Table<'a>),
     /// trivial 值 (Float/Integer) 直取 — 16B Copy, 免二次哈希与 clone
-    Trivial(TValue),
+    Trivial(TValue<'a>),
     /// 目标槽已持同对象 — 跳过 clone+写栈 (Rc 计数无扰动)
     Skip,
 }
@@ -89,14 +89,14 @@ macro_rules! arith_bin {
 // ============================================================================
 
 #[derive(Debug)]
-pub enum VmResult {
+pub enum VmResult<'a> {
     Return {
         nresults: usize,
         result_base: usize,
     },
     /// 协程 yield — 携带 yield 的值
     Yield {
-        values: Vec<TValue>,
+        values: Vec<TValue<'a>>,
     },
     Done,
 }
@@ -116,15 +116,15 @@ enum CallOutcome {
 }
 /// 指令错误处理的后续动作 — execute_loop 主循环与冷函数 handle_instruction_error
 /// 之间的控制流协议。
-enum ErrOutcome {
+enum ErrOutcome<'a> {
     /// 恢复执行 (close continuation / pcall 保护已恢复帧) — caller 重载 pc = state.exec.pc
     Continue,
     /// 直接返回该 VmResult (yield)
-    Return(VmResult),
+    Return(VmResult<'a>),
 }
 
 #[derive(Debug)]
-pub enum VmError {
+pub enum VmError<'a> {
     DivisionByZero,
     ModuloByZero,
     TypeError(String),
@@ -134,13 +134,13 @@ pub enum VmError {
     RuntimeError(String),
     /// 非字符串错误值 — error() 传入非字符串参数时使用，保留原始 TValue
     /// 对应 C Lua 中 errfunc 为非字符串时的行为
-    RuntimeErrorValue(TValue),
+    RuntimeErrorValue(TValue<'a>),
     MetaMethodNotImplemented(String),
     /// 协程 yield 信号 — 携带 yield 的值（非真实错误，由 execute_loop 转换为 VmResult::Yield）
-    Yield(Vec<TValue>),
+    Yield(Vec<TValue<'a>>),
 }
 
-impl std::fmt::Display for VmError {
+impl<'a> std::fmt::Display for VmError<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             VmError::DivisionByZero => write!(f, "attempt to divide by zero"),
@@ -301,7 +301,7 @@ pub fn get_proto_line(proto: &Proto, pc: usize) -> i32 {
 /// 逻辑:
 /// 1. 获取 OP_CALL 指令的操作数 A（函数寄存器）
 /// 2. 调用 get_obj_name 查找寄存器 A 的值是如何被设置的
-pub fn get_func_name(state: &LuaState, call_pc: usize) -> (String, String) {
+pub fn get_func_name<'a>(state: &LuaState, call_pc: usize) -> (String, String) {
     if call_pc >= state.exec.code.len() {
         return (String::new(), String::new());
     }
@@ -343,9 +343,9 @@ pub fn get_func_name(state: &LuaState, call_pc: usize) -> (String, String) {
 ///
 /// perf: caller_proto 从 stack[entry.base - 1] 延迟计算, 避免 op_call 中 Rc::clone
 /// 参数为 stack 切片而非 &LuaState, 支持 ThreadContext.saved_stack 场景
-pub fn compute_caller_info(
-    stack: &[TValue],
-    entry: &crate::state::CallInfoEntry,
+pub fn compute_caller_info<'a>(
+    stack: &[TValue<'a>],
+    entry: &crate::state::CallInfoEntry<'a>,
 ) -> (String, i32, String, String) {
     if entry.is_c {
         return (
@@ -396,10 +396,10 @@ pub fn compute_caller_info(
 ///
 /// 当 stack[entry.base - 1] 因栈截断失效时, 用 fallback_proto (前一个 call_info 条目的 closure.proto)
 /// 这解决了 compute_caller_info 中 entry.closure 是被调用者闭包而非调用者闭包的问题
-pub fn compute_caller_info_with_fallback(
-    stack: &[TValue],
-    entry: &crate::state::CallInfoEntry,
-    fallback_proto: Option<&Rc<Proto>>,
+pub fn compute_caller_info_with_fallback<'a>(
+    stack: &[TValue<'a>],
+    entry: &crate::state::CallInfoEntry<'a>,
+    fallback_proto: Option<&Rc<Proto<'a>>>,
 ) -> (String, i32, String, String) {
     if entry.is_c {
         return (
@@ -470,7 +470,7 @@ pub fn compute_name_from_proto(caller_proto: &Proto, saved_pc: usize) -> (String
 /// 2. 获取 loaded 表 (package.loaded)
 /// 3. 在 loaded 表中递归查找函数 (2 层深度)
 /// 4. 去掉 "_G." 前缀
-pub fn push_global_func_name(state: &LuaState) -> Option<String> {
+pub fn push_global_func_name<'a>(state: &LuaState) -> Option<String> {
     // 获取当前函数
     let func_val = state.exec.call_info.last().and_then(|ci| {
         if ci.base > 0 {
@@ -515,7 +515,7 @@ pub fn push_global_func_name(state: &LuaState) -> Option<String> {
 
 /// 在表中递归查找对象 (对应 C 的 findfield)
 /// level = 递归深度 (2 表示查找 2 层)
-fn find_field(table: &Table, obj: &TValue, level: usize) -> Option<String> {
+fn find_field<'a>(table: &Table<'a>, obj: &TValue<'a>, level: usize) -> Option<String> {
     if level == 0 {
         return None;
     }
@@ -550,7 +550,7 @@ fn find_field(table: &Table, obj: &TValue, level: usize) -> Option<String> {
 ///    - arg == 1: self 参数错误, 返回 "calling 'X' on bad self (msg)"
 ///    - arg > 1: 普通参数错误, arg 减去 self, 返回 "bad argument #{arg-1} to 'X' (msg)"
 /// 4. 否则返回 "bad argument #{arg} to 'X' (msg)"
-pub fn arg_error(state: &LuaState, arg: usize, msg: &str) -> VmError {
+pub fn arg_error<'a>(state: &LuaState<'a>, arg: usize, msg: &str) -> VmError<'a> {
     let (name, namewhat) = get_current_func_name(state);
     let func_name = if !name.is_empty() {
         name
@@ -580,7 +580,7 @@ pub fn arg_error(state: &LuaState, arg: usize, msg: &str) -> VmError {
 /// 2. 调用者帧 = call_info[last-1]
 /// 3. 若调用者是 Lua 函数,用当前帧的 saved_pc 分析调用指令获取 (name, namewhat)
 /// 4. 若调用者是 C 函数,返回空 (无法分析代码)
-fn get_current_func_name(state: &LuaState) -> (String, String) {
+fn get_current_func_name<'a>(state: &LuaState) -> (String, String) {
     let ci_len = state.exec.call_info.len();
     if ci_len < 2 {
         // call_info 不足 2 层,回退到 get_func_name
@@ -634,7 +634,7 @@ fn get_current_func_name(state: &LuaState) -> (String, String) {
 /// 生成 "attempt to call a {type} value" 错误消息，附加变量名信息
 /// 对应 C 的 luaG_callerror: typeerror(L, o, "call", extra)
 /// extra = funcnamefromcall 找到名字时为 " (kind 'name')"，否则为 varinfo 结果
-fn call_error_message(state: &LuaState, type_name: &str) -> String {
+fn call_error_message<'a>(state: &LuaState, type_name: &str) -> String {
     let (name, namewhat) = get_func_name(state, state.exec.pc);
     if !namewhat.is_empty() && !name.is_empty() {
         format!(
@@ -953,7 +953,7 @@ fn is_env_register(proto: &Proto, pc: usize, reg: usize) -> bool {
 ///
 /// Rust 版本直接接收寄存器编号（调用方已知），通过 get_obj_name 获取
 /// kind 和 name，返回 " (kind 'name')" 或空字符串。
-fn varinfo_str(state: &LuaState, reg: usize) -> String {
+fn varinfo_str<'a>(state: &LuaState<'a>, reg: usize) -> String {
     if state.exec.base == 0 || state.exec.base > state.exec.stack.len() {
         return String::new();
     }
@@ -981,7 +981,7 @@ pub enum VarSource {
 
 /// 生成索引错误的变量信息字符串
 /// 对应 C 的 varinfo(L, o): 通过寄存器号或上值索引获取变量信息
-fn index_varinfo(state: &LuaState, source: VarSource) -> String {
+fn index_varinfo<'a>(state: &LuaState, source: VarSource) -> String {
     match source {
         VarSource::Reg(reg) => varinfo_str(state, reg),
         VarSource::Upval(idx) => {
@@ -1032,21 +1032,21 @@ fn has_source_line_prefix(msg: &str) -> bool {
 pub struct VmExecutor;
 
 impl VmExecutor {
-    pub fn execute(
-        proto: &Proto,
+    pub fn execute<'a>(
+        proto: &Proto<'a>,
         base: usize,
-        stack: Vec<TValue>,
+        stack: Vec<TValue<'a>>,
         gc: Rc<GCState>,
-    ) -> Result<VmResult, VmError> {
+    ) -> Result<VmResult<'a>, VmError<'a>> {
         let mut state = LuaState::from_proto(proto, base, stack, gc);
         Self::execute_loop(&mut state)
     }
 
-    pub fn execute_with_state(state: &mut LuaState) -> Result<VmResult, VmError> {
+    pub fn execute_with_state<'a>(state: &mut LuaState<'a>) -> Result<VmResult<'a>, VmError<'a>> {
         Self::execute_loop(state)
     }
 
-    pub fn execute_loop(state: &mut LuaState) -> Result<VmResult, VmError> {
+    pub fn execute_loop<'a>(state: &mut LuaState<'a>) -> Result<VmResult<'a>, VmError<'a>> {
         // call_stack 已提升为 state.exec.call_stack 字段，以支持协程挂起/恢复
 
         // 调试跟踪：通过环境变量 LUA_VM_TRACE=1 启用
@@ -1384,7 +1384,10 @@ impl VmExecutor {
     /// - 错误未被任何保护捕获 → Err(current_error) (caller 经 ? 传播)
     #[cold]
     #[inline(never)]
-    fn handle_instruction_error(state: &mut LuaState, e: VmError) -> Result<ErrOutcome, VmError> {
+    fn handle_instruction_error<'a>(
+        state: &mut LuaState<'a>,
+        e: VmError<'a>,
+    ) -> Result<ErrOutcome<'a>, VmError<'a>> {
         if let VmError::Yield(values) = e {
             return Ok(ErrOutcome::Return(VmResult::Yield { values }));
         }
@@ -1651,11 +1654,11 @@ impl VmExecutor {
     /// icache 利用率。冷门 opcode 调用频率低, 额外的一次间接跳转开销可忽略。
     #[cold]
     #[inline(never)]
-    fn dispatch_cold_opcodes(
-        state: &mut LuaState,
+    fn dispatch_cold_opcodes<'a>(
+        state: &mut LuaState<'a>,
         op: OpCode,
         inst: Instruction,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         match op {
             // === 冷门: 扩展常量加载 / 写 upvalue / 建表 / method 调用 ===
             OpCode::LOADKX => Self::op_loadkx(state, inst),
@@ -1709,7 +1712,7 @@ impl VmExecutor {
     /// 在错误发生时调用，从当前状态和调用栈构建回溯信息。
     /// 遍历 call_info 中的所有调用帧，构建完整的堆栈回溯。
     /// 同时格式化错误消息（添加 source:line 前缀）并存储到 state.last_error_msg。
-    fn build_traceback(state: &mut LuaState, error: &VmError) {
+    fn build_traceback<'a>(state: &mut LuaState<'a>, error: &VmError<'a>) {
         // LEVELS1/LEVELS2: 对应 C 的 traceback 层数限制
         // 超过 LEVELS1+LEVELS2 帧时，只显示前 LEVELS1 帧和后 LEVELS2 帧，中间用 "..." 跳过
         const LEVELS1: usize = 10;
@@ -1881,7 +1884,7 @@ impl VmExecutor {
     /// 改善 icache 密度。hook 未启用时此函数从不被调用。
     #[cold]
     #[inline(never)]
-    fn traceexec_hooks(state: &mut LuaState) -> Result<(), VmError> {
+    fn traceexec_hooks<'a>(state: &mut LuaState<'a>) -> Result<(), VmError<'a>> {
         if state.exec.hook_func.is_some() {
             // count hook — 对应 C: counthook = (mask & LUA_MASKCOUNT) && (--L->hookcount == 0)
             let mut counthook = false;
@@ -1931,7 +1934,7 @@ impl VmExecutor {
     /// 对应原 execute_loop 中 trace_level >= 1 的内联逻辑
     #[cold]
     #[inline(never)]
-    fn trace_exec(state: &LuaState, trace_level: u8) {
+    fn trace_exec<'a>(state: &LuaState, trace_level: u8) {
         // 体积优先: 移除调试输出, 避免 format!/eprintln! 引入 fmt 代码
         #[cfg(not(size_optimized))]
         {
@@ -1955,7 +1958,7 @@ impl VmExecutor {
 
     /// 打印完整代码列表，标记当前执行的 PC
     /// 支持 ANSI 颜色高亮（终端）和 <- 标记
-    pub fn dump_code_with_pc(state: &LuaState, current_pc: usize, use_color: bool) -> String {
+    pub fn dump_code_with_pc<'a>(state: &LuaState, current_pc: usize, use_color: bool) -> String {
         // 体积优先: 返回空字符串, 避免 format! 引入 fmt 代码
         #[cfg(size_optimized)]
         {
@@ -1997,7 +2000,7 @@ impl VmExecutor {
     }
 
     /// 打印完整栈内容（调试用）
-    pub fn dump_stack(state: &LuaState) -> String {
+    pub fn dump_stack<'a>(state: &LuaState) -> String {
         // 体积优先: 返回空字符串, 避免 format! 引入 fmt 代码
         #[cfg(size_optimized)]
         {
@@ -2038,21 +2041,21 @@ impl VmExecutor {
     // ========================================================================
 
     #[cfg_attr(not(size_optimized), inline(always))]
-    fn ra(state: &LuaState, inst: Instruction) -> usize {
+    fn ra<'a>(state: &LuaState, inst: Instruction) -> usize {
         state.exec.base + opcodes::getarg_a(inst) as usize
     }
     #[cfg_attr(not(size_optimized), inline(always))]
-    fn rb(state: &LuaState, inst: Instruction) -> usize {
+    fn rb<'a>(state: &LuaState, inst: Instruction) -> usize {
         state.exec.base + opcodes::getarg_b(inst) as usize
     }
     #[cfg_attr(not(size_optimized), inline(always))]
-    fn rc(state: &LuaState, inst: Instruction) -> usize {
+    fn rc<'a>(state: &LuaState, inst: Instruction) -> usize {
         state.exec.base + opcodes::getarg_c(inst) as usize
     }
 
     #[cold]
     #[inline(never)]
-    fn write_stack_grow(state: &mut LuaState, idx: usize) {
+    fn write_stack_grow<'a>(state: &mut LuaState, idx: usize) {
         Self::fast_resize_stack_nil(state, idx + 1);
     }
 
@@ -2061,7 +2064,9 @@ impl VmExecutor {
     /// 返回 Some(VmResult) 表示顶层返回, None 表示继续执行 (恢复调用者帧)。
     #[cold]
     #[inline(never)]
-    fn handle_pc_overflow(state: &mut LuaState) -> Result<Option<VmResult>, VmError> {
+    fn handle_pc_overflow<'a>(
+        state: &mut LuaState<'a>,
+    ) -> Result<Option<VmResult<'a>>, VmError<'a>> {
         if let Some(frame) = state.exec.call_stack.pop() {
             state.exec.call_info.pop();
             state.exec.n_ccalls = state.exec.n_ccalls.saturating_sub(1);
@@ -2116,7 +2121,7 @@ impl VmExecutor {
     /// 算术循环中旧值几乎总是 number, 分支预测器命中率 ~100%, 成本 ~1 cycle,
     /// 节省的 drop_glue match 开销 ~3-5 cycles/次。
     #[cfg_attr(not(size_optimized), inline(always))]
-    fn write_stack(state: &mut LuaState, idx: usize, val: TValue) {
+    fn write_stack<'a>(state: &mut LuaState<'a>, idx: usize, val: TValue<'a>) {
         // 热路径: idx 在范围内 (VM 保证, 编译器生成的寄存器索引总是有效)
         // 用 unsafe 索引跳过边界检查
         if idx < state.exec.stack.len() {
@@ -2146,7 +2151,7 @@ impl VmExecutor {
     /// 读取栈槽 — VM 字节码路径专用 (idx 保证在范围内)
     /// perf: unsafe get_unchecked 跳过边界检查
     #[cfg_attr(not(size_optimized), inline(always))]
-    fn read_stack<'a>(state: &'a LuaState, idx: usize) -> &'a TValue {
+    fn read_stack<'a, 'b>(state: &'b LuaState<'a>, idx: usize) -> &'b TValue<'a> {
         if idx < state.exec.stack.len() {
             unsafe { state.exec.stack.get_unchecked(idx) }
         } else {
@@ -2164,7 +2169,7 @@ impl VmExecutor {
     /// - 调用者 write_stack 直接写入已有槽位 (idx < stack.len()), 跳过 write_stack_grow
     /// 若有非 trivial 值 (Rc/Table 等), 仍需截断以 drop 它们 (避免 Rc 泄漏)。
     #[cfg_attr(not(size_optimized), inline(always))]
-    fn smart_clear_stack(state: &mut LuaState, keep_len: usize) {
+    fn smart_clear_stack<'a>(state: &mut LuaState, keep_len: usize) {
         let stack_len = state.exec.stack.len();
         if keep_len >= stack_len {
             state.exec.top = keep_len;
@@ -2198,7 +2203,7 @@ impl VmExecutor {
     /// 此函数用 ptr::write 直接写入 Nil(Strict), 不调用旧值的 drop (旧值可能已被
     /// fast_truncate_stack 的 set_len 跳过 drop, 或被 Vec::truncate 已 drop).
     #[cfg_attr(not(size_optimized), inline(always))]
-    fn fast_resize_stack_nil(state: &mut LuaState, new_len: usize) {
+    fn fast_resize_stack_nil<'a>(state: &mut LuaState, new_len: usize) {
         let stack = &mut state.exec.stack;
         let old_len = stack.len();
         if new_len <= old_len {
@@ -2225,7 +2230,7 @@ impl VmExecutor {
 
     #[cold]
     #[inline(never)]
-    fn read_stack_panic(state: &LuaState, idx: usize) -> ! {
+    fn read_stack_panic<'a>(state: &LuaState, idx: usize) -> ! {
         // 体积优先: 直接 abort, 避免 eprintln!/format! 引入 fmt 代码 (~3KB)
         #[cfg(not(size_optimized))]
         {
@@ -2295,19 +2300,19 @@ impl VmExecutor {
     }
 
     #[allow(dead_code)]
-    fn push_stack(state: &mut LuaState, val: TValue) -> usize {
+    fn push_stack<'a>(state: &mut LuaState<'a>, val: TValue<'a>) -> usize {
         let idx = state.exec.stack.len();
         state.exec.stack.push(val);
         idx
     }
 
     #[cfg_attr(not(size_optimized), inline(always))]
-    fn do_conditional_jump(
-        state: &mut LuaState,
+    fn do_conditional_jump<'a>(
+        state: &mut LuaState<'a>,
         inst: Instruction,
         cond: bool,
         cur: usize,
-    ) -> Result<usize, VmError> {
+    ) -> Result<usize, VmError<'a>> {
         // 对应 C 的 docondjump: 纯计算下一 pc, 不写 state.exec.pc。
         // 热路径调用方把结果写入寄存器 pc; finishOp (yield 恢复) 写回 state.exec.pc。
         let expected = opcodes::testarg_k(inst);
@@ -2335,7 +2340,7 @@ impl VmExecutor {
     /// 增量在调用点内联 (inc [rsi+off] 单指令), 64 边界才原子读 INTERRUPTED。
     /// 中断错误行号 = cur (回跳指令自身, 对应循环头旧方案的 state.exec.pc = pc)。
     #[cfg_attr(not(size_optimized), inline)]
-    fn backedge_tick(state: &mut LuaState, cur: usize) -> Result<(), VmError> {
+    fn backedge_tick<'a>(state: &mut LuaState<'a>, cur: usize) -> Result<(), VmError<'a>> {
         let t = state.tick.get().wrapping_add(1);
         state.tick.set(t);
         if t & 63 == 0 && INTERRUPTED.load(Ordering::Relaxed) {
@@ -2348,7 +2353,7 @@ impl VmExecutor {
 
     /// 直线段兜底中断检查 (pc 越界路径) — 与 backedge_tick 同摊销计数器。
     #[cfg_attr(not(size_optimized), inline)]
-    fn tick_check_interrupted(state: &mut LuaState, pc: usize) -> Result<(), VmError> {
+    fn tick_check_interrupted<'a>(state: &mut LuaState<'a>, pc: usize) -> Result<(), VmError<'a>> {
         let t = state.tick.get().wrapping_add(1);
         state.tick.set(t);
         if t & 63 == 0 && INTERRUPTED.load(Ordering::Relaxed) {
@@ -2371,16 +2376,16 @@ impl VmExecutor {
     /// 返回 true 时调用者应调用 `finish_metamethod` 完成 continuation。
     /// 拆分两步避免借用冲突: 检查只读 state, 处理需要 &mut state + result 引用。
     /// (perf: 主路径 is_mm=false, 完全避免 clone TValue)
-    fn is_metamethod_return(state: &LuaState) -> bool {
+    fn is_metamethod_return<'a>(state: &LuaState) -> bool {
         state.exec.pcall_protection_stack.last().map_or(false, |t| {
             t.is_metamethod && t.saved_filled && t.func_idx + 1 == state.exec.base
         })
     }
 
-    fn try_finish_metamethod(
-        state: &mut LuaState,
-        result: Option<TValue>,
-    ) -> Result<bool, VmError> {
+    fn try_finish_metamethod<'a>(
+        state: &mut LuaState<'a>,
+        result: Option<TValue<'a>>,
+    ) -> Result<bool, VmError<'a>> {
         if !Self::is_metamethod_return(state) {
             return Ok(false);
         }
@@ -2551,7 +2556,7 @@ impl VmExecutor {
     /// perf: closure_upvalue 基准中 f 的 upvalue 在外部栈帧, 每次 return 都触发
     /// func::close 但实际无需关闭任何 upvalue。此检查避免 200M 次空函数调用。
     #[cfg_attr(not(size_optimized), inline(always))]
-    fn need_close_upvals(state: &LuaState, level: usize) -> bool {
+    fn need_close_upvals<'a>(state: &LuaState, level: usize) -> bool {
         let uv_idx = match state.exec.open_upval {
             Some(idx) => idx,
             None => return false,
@@ -2568,7 +2573,7 @@ impl VmExecutor {
 
     /// 关闭 upvalue 或跳过 — 封装 op_return/op_return0/op_return1 的公共逻辑
     #[cfg_attr(not(size_optimized), inline(always))]
-    fn close_or_skip(state: &mut LuaState) -> Result<(), VmError> {
+    fn close_or_skip<'a>(state: &mut LuaState<'a>) -> Result<(), VmError<'a>> {
         if Self::need_close_upvals(state, state.exec.base) {
             crate::func::close(state, state.exec.base, 0, 1)
         } else {
@@ -2583,7 +2588,7 @@ impl VmExecutor {
     ///
     /// 返回 true 表示已处理 continuation，op_return 应返回 Ok(None) 让 execute_loop
     /// 重新执行 OP_RETURN/OP_CLOSE。返回 false 表示不是 close continuation。
-    fn finish_close_continuation(state: &mut LuaState) -> Result<bool, VmError> {
+    fn finish_close_continuation<'a>(state: &mut LuaState<'a>) -> Result<bool, VmError<'a>> {
         let is_close_cont = state.exec.pcall_protection_stack.last().map_or(false, |t| {
             t.is_close_continuation && t.saved_filled && t.func_idx + 1 == state.exec.base
         });
@@ -2680,11 +2685,11 @@ impl VmExecutor {
     ///
     /// 判定条件: 顶部 PcallProtection saved_filled=true（yield 穿过 pcall）
     /// 且 func_idx+1 == state.exec.base（当前函数就是被 pcall 保护的函数）。
-    fn try_finish_pcall_return(
-        state: &mut LuaState,
+    fn try_finish_pcall_return<'a>(
+        state: &mut LuaState<'a>,
         nret: usize,
         result_base: usize,
-    ) -> Result<bool, VmError> {
+    ) -> Result<bool, VmError<'a>> {
         let is_protected = state.exec.pcall_protection_stack.last().map_or(false, |t| {
             t.saved_filled
                 && !t.is_close_continuation
@@ -2700,11 +2705,11 @@ impl VmExecutor {
     /// 注意: 只处理非 close continuation、非 metamethod 的 PcallProtection。
     /// close continuation 由 finish_close_continuation 处理，
     /// metamethod 由 try_finish_metamethod 处理。
-    fn finish_pcall_return(
-        state: &mut LuaState,
+    fn finish_pcall_return<'a>(
+        state: &mut LuaState<'a>,
         nret: usize,
         result_base: usize,
-    ) -> Result<bool, VmError> {
+    ) -> Result<bool, VmError<'a>> {
         let need_finish = state.exec.pcall_protection_stack.last().map_or(false, |t| {
             t.saved_filled && !t.is_close_continuation && !t.is_metamethod
         });
@@ -2777,7 +2782,7 @@ impl VmExecutor {
     /// 对应 op_concat 的 Err 分支循环逻辑 (从 try_concat_tm 之后)
     /// 栈状态: [a, a+1, ..., result] (result 在 top-1 位置)
     /// 尝试直接拼接,如果失败继续调用 try_concat_tm (可能 yield)
-    fn finish_concat_loop(state: &mut LuaState, a: usize) -> Result<(), VmError> {
+    fn finish_concat_loop<'a>(state: &mut LuaState<'a>, a: usize) -> Result<(), VmError<'a>> {
         loop {
             let remaining = state.exec.stack.len() - a;
             if remaining <= 1 {
@@ -2828,7 +2833,7 @@ impl VmExecutor {
     // ========================================================================
 
     /// 获取当前指令所在行号 — 对应 C 的 luaG_getfuncline
-    fn get_current_line(state: &LuaState) -> i32 {
+    fn get_current_line<'a>(state: &LuaState) -> i32 {
         if state.exec.base == 0 || state.exec.base > state.exec.stack.len() {
             return -1;
         }
@@ -2863,7 +2868,7 @@ impl VmExecutor {
     }
 
     /// 检查从 old_pc 到 new_pc 是否发生了行号变化 — 对应 C 的 changedline
-    fn changed_line(state: &LuaState, old_pc: i32, new_pc: i32) -> bool {
+    fn changed_line<'a>(state: &LuaState, old_pc: i32, new_pc: i32) -> bool {
         if state.exec.base == 0 || state.exec.base > state.exec.stack.len() {
             return false;
         }
@@ -2916,14 +2921,14 @@ impl VmExecutor {
     /// `frame_base`: 指定 hook_entry 的 base（触发 hook 的帧的 base）。
     ///   - None: 使用 state.exec.base（适用于 line hook、Lua 函数 call hook、return hook）
     ///   - Some(base): 使用指定 base（适用于 C 函数 call hook，此时 state.exec.base 尚未更新）
-    pub fn call_hook(
-        state: &mut LuaState,
+    pub fn call_hook<'a>(
+        state: &mut LuaState<'a>,
         event: &str,
         line: i32,
         frame_base: Option<usize>,
         ftransfer: i32,
         ntransfer: i32,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         let hook_fn = match &state.exec.hook_func {
             Some(f) => f.clone(),
             None => return Ok(()),
@@ -3043,7 +3048,7 @@ impl VmExecutor {
     // ========================================================================
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_move(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_move<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         // perf: 免 TValue::clone 函数调用 — 源槽 trivial (number/bool/nil) 时
@@ -3069,7 +3074,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_loadi(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_loadi<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let val = opcodes::getarg_sbx(inst) as i64;
         Self::write_stack(state, a, TValue::Integer(val));
@@ -3077,7 +3082,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_loadf(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_loadf<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let val = opcodes::getarg_sbx(inst) as f64;
         Self::write_stack(state, a, TValue::Float(val));
@@ -3085,7 +3090,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_loadk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_loadk<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let idx = opcodes::getarg_bx(inst) as usize;
         let val = state.exec.constants[idx].clone();
@@ -3094,7 +3099,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_loadkx(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_loadkx<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         state.exec.pc += 1;
         let extra = state.exec.code[state.exec.pc];
@@ -3106,18 +3111,18 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_loadfalse(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_loadfalse<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         Self::write_stack(state, a, TValue::Boolean(false));
         Ok(())
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_lfalseskip(
-        state: &mut LuaState,
+    fn op_lfalseskip<'a>(
+        state: &mut LuaState<'a>,
         inst: Instruction,
         pc: &mut usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         Self::write_stack(state, a, TValue::Boolean(false));
         // C 形状 param-pc: state.exec.pc += 2 (cur 基准) == *pc += 1 (pc 已 = cur+1)
@@ -3126,14 +3131,14 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_loadtrue(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_loadtrue<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         Self::write_stack(state, a, TValue::Boolean(true));
         Ok(())
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_loadnil(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_loadnil<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst);
         for i in 0..=b {
@@ -3143,7 +3148,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_getupval(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_getupval<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as usize;
         // perf: 用 as_ptr() 跳过双重 RefCell borrow/unborrow 开销
@@ -3173,7 +3178,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_setupval(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_setupval<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as usize;
         let val = Self::read_stack(state, a).clone();
@@ -3223,12 +3228,12 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_gettabup(
-        state: &mut LuaState,
+    fn op_gettabup<'a>(
+        state: &mut LuaState<'a>,
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as usize;
         let kb_idx = opcodes::getarg_c(inst) as usize;
@@ -3242,15 +3247,17 @@ impl VmExecutor {
         // / 其他 → 通用路径。元表/非短串键 → None 走原路径, 语义不变。
         // 借用冲突处理: BuiltinFn/Table 分支先提取 owned 值 (Copy/clone)
         // 后结束借用, 再调 write_stack (需要 &mut state)。
-        let spec: Option<SpecValue> = {
+        let spec: Option<SpecValue<'a>> = {
             let constants = &state.exec.constants;
             let key_opt = constants.get(kb_idx);
-            let upvals = unsafe { &*state.exec.closure_upvals.as_ptr() };
+            let upvals: &UpValVec<'a> = unsafe { &*state.exec.closure_upvals.as_ptr() };
             if b < upvals.len() {
-                let uv = unsafe { &*upvals[b].as_ptr() };
-                let table_ref: Option<&TValue> = match uv {
-                    UpVal::Closed { value } => Some(value),
-                    UpVal::Open { stack_index, .. } => state.exec.stack.get(*stack_index),
+                let uv: &UpVal<'a> = unsafe { &*upvals[b].as_ptr() };
+                let table_ref: Option<&TValue<'a>> = match uv {
+                    UpVal::Closed { value } => Some(value as &TValue<'a>),
+                    UpVal::Open { stack_index, .. } => {
+                        state.exec.stack.get(*stack_index) as Option<&TValue<'a>>
+                    }
                 };
                 match (key_opt, table_ref) {
                     (Some(key), Some(TValue::Table(t))) => match t.find_str_ref(key) {
@@ -3293,7 +3300,7 @@ impl VmExecutor {
                 // — func 指针位级相等即同对象, 免 write_stack。跳过时仍须执行
                 // write_stack 的 top 抬升语义 (top 可能曾被截到槽 a 之下, 漏抬
                 // 会丢 nargs/GC 扫描, #130 类)。
-                if matches!(state.exec.stack.get(a), Some(TValue::BuiltinFn(of)) if of.func == bf.func)
+                if matches!(state.exec.stack.get(a), Some(TValue::BuiltinFn(of)) if std::ptr::fn_addr_eq(of.func, bf.func))
                 {
                     if a >= state.exec.top {
                         state.exec.top = a + 1;
@@ -3315,7 +3322,7 @@ impl VmExecutor {
                 // 写表槽, 最后写字段值 — GETFIELD 的 A' 常等于 GETTABUP 的 A
                 // (`GETTABUP 4 0 math; GETFIELD 4 4 sin`), 后写覆盖先写, 顺序即语义。
                 // 未命中/非短串键 → 走原 GETFIELD 全路径 (元表语义由原指令保证)。
-                let fused: Option<TValue> = Self::try_fuse_getfield(state, a, &t, cur);
+                let fused: Option<TValue<'a>> = Self::try_fuse_getfield(state, a, &t, cur);
                 if let Some(v) = fused {
                     // 中间表写会被字段值覆写 (a2 == table_slot) — 直写终值。
                     // 旧槽为同 BuiltinFn 时跳过覆写: 判别式+函数指针位级相等
@@ -3326,7 +3333,7 @@ impl VmExecutor {
                     let mut skip = 1usize; // GETFIELD
                     match v {
                         TValue::BuiltinFn(nf) => {
-                            if matches!(state.exec.stack.get(a), Some(TValue::BuiltinFn(of)) if of.func == nf.func)
+                            if matches!(state.exec.stack.get(a), Some(TValue::BuiltinFn(of)) if std::ptr::fn_addr_eq(of.func, nf.func))
                             {
                                 // 跳过覆写仍需 top 抬升语义 (write_stack 副作用)
                                 if a >= state.exec.top {
@@ -3421,7 +3428,11 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_gettable(state: &mut LuaState, inst: Instruction, cur: usize) -> Result<(), VmError> {
+    fn op_gettable<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        cur: usize,
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -3466,7 +3477,11 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_geti(state: &mut LuaState, inst: Instruction, cur: usize) -> Result<(), VmError> {
+    fn op_geti<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        cur: usize,
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = opcodes::getarg_c(inst) as i64;
@@ -3506,12 +3521,12 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_getfield(
-        state: &mut LuaState,
+    fn op_getfield<'a>(
+        state: &mut LuaState<'a>,
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -3546,7 +3561,7 @@ impl VmExecutor {
         };
         match spec {
             Some(SpecValue::Builtin(bf)) => {
-                if matches!(state.exec.stack.get(a), Some(TValue::BuiltinFn(of)) if of.func == bf.func)
+                if matches!(state.exec.stack.get(a), Some(TValue::BuiltinFn(of)) if std::ptr::fn_addr_eq(of.func, bf.func))
                 {
                     if a >= state.exec.top {
                         state.exec.top = a + 1;
@@ -3612,7 +3627,11 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_settabup(state: &mut LuaState, inst: Instruction, cur: usize) -> Result<(), VmError> {
+    fn op_settabup<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        cur: usize,
+    ) -> Result<(), VmError<'a>> {
         let a = opcodes::getarg_a(inst) as usize;
         let b_key = opcodes::getarg_b(inst) as usize;
         let c = opcodes::getarg_c(inst);
@@ -3645,7 +3664,11 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_settable(state: &mut LuaState, inst: Instruction, cur: usize) -> Result<(), VmError> {
+    fn op_settable<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        cur: usize,
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = opcodes::getarg_c(inst);
@@ -3705,7 +3728,11 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_seti(state: &mut LuaState, inst: Instruction, cur: usize) -> Result<(), VmError> {
+    fn op_seti<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        cur: usize,
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as i64;
         let c = opcodes::getarg_c(inst);
@@ -3750,7 +3777,11 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_setfield(state: &mut LuaState, inst: Instruction, cur: usize) -> Result<(), VmError> {
+    fn op_setfield<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        cur: usize,
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b_key = opcodes::getarg_b(inst) as usize;
         let c = opcodes::getarg_c(inst);
@@ -3802,7 +3833,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_newtable(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_newtable<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_vb(inst) as u32;
         let mut c = opcodes::getarg_vc(inst) as u32;
@@ -3826,7 +3857,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_self(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_self<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let key = state
@@ -3881,7 +3912,11 @@ impl VmExecutor {
     // ---- 算术运算 (param-pc: 成功 *pc += 1 跳过 MMBIN, 对应 C 宏内 pc++) ----
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_addi(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_addi<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        pc: &mut usize,
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let imm = opcodes::getarg_sc(inst) as i64;
@@ -3900,12 +3935,12 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_addk(
-        state: &mut LuaState,
+    fn op_addk<'a>(
+        state: &mut LuaState<'a>,
         inst: Instruction,
         pc: &mut usize,
-        constants: &[TValue],
-    ) -> Result<(), VmError> {
+        constants: &[TValue<'a>],
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -3931,7 +3966,11 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_subk(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_subk<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        pc: &mut usize,
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -3956,7 +3995,11 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_mulk(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_mulk<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        pc: &mut usize,
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -3981,12 +4024,12 @@ impl VmExecutor {
         Ok(())
     }
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_modk(
-        state: &mut LuaState,
+    fn op_modk<'a>(
+        state: &mut LuaState<'a>,
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -4017,7 +4060,11 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_powk(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_powk<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        pc: &mut usize,
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -4036,7 +4083,11 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_divk(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_divk<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        pc: &mut usize,
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -4055,12 +4106,12 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_idivk(
-        state: &mut LuaState,
+    fn op_idivk<'a>(
+        state: &mut LuaState<'a>,
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -4083,7 +4134,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_bandk(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_bandk<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -4104,7 +4155,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_bork(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_bork<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -4125,7 +4176,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_bxork(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_bxork<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -4146,7 +4197,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_shli(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_shli<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         // C 使用 GETARG_sC (有符号常量), 与 C 版本一致
@@ -4162,7 +4213,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_shri(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_shri<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         // C 使用 GETARG_sC (有符号常量), 与 C 版本一致
@@ -4178,7 +4229,11 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_add(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_add<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        pc: &mut usize,
+    ) -> Result<(), VmError<'a>> {
         // C: op_arith — if both numbers, compute and pc++ (skip MMBIN); else fall through
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -4195,7 +4250,11 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_sub(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_sub<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        pc: &mut usize,
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -4210,7 +4269,11 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_mul(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_mul<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        pc: &mut usize,
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -4225,12 +4288,12 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_mod(
-        state: &mut LuaState,
+    fn op_mod<'a>(
+        state: &mut LuaState<'a>,
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -4248,7 +4311,11 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_pow(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_pow<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        pc: &mut usize,
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -4262,7 +4329,11 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_div(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_div<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        pc: &mut usize,
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -4276,12 +4347,12 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_idiv(
-        state: &mut LuaState,
+    fn op_idiv<'a>(
+        state: &mut LuaState<'a>,
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -4299,7 +4370,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_band(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_band<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -4318,7 +4389,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_bor(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_bor<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -4337,7 +4408,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_bxor(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_bxor<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -4356,7 +4427,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_shl(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_shl<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -4375,7 +4446,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_shr(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_shr<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c = Self::rc(state, inst);
@@ -4393,7 +4464,11 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_mmbin(state: &mut LuaState, inst: Instruction, cur: usize) -> Result<(), VmError> {
+    fn op_mmbin<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        cur: usize,
+    ) -> Result<(), VmError<'a>> {
         // C: ra = RA(i), rb = vRB(i), tm = GETARG_C(i), result = RA(pi)
         // C: luaT_trybinTM(L, s2v(ra), rb, result, tm)
         let a = Self::ra(state, inst);
@@ -4415,7 +4490,11 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_mmbini(state: &mut LuaState, inst: Instruction, cur: usize) -> Result<(), VmError> {
+    fn op_mmbini<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        cur: usize,
+    ) -> Result<(), VmError<'a>> {
         // C: ra = RA(i), imm = GETARG_sB(i), tm = GETARG_C(i), flip = GETARG_k(i)
         // C: result = RA(pi)
         // C: luaT_trybiniTM(L, s2v(ra), imm, flip, result, tm)
@@ -4434,7 +4513,11 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_mmbink(state: &mut LuaState, inst: Instruction, cur: usize) -> Result<(), VmError> {
+    fn op_mmbink<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        cur: usize,
+    ) -> Result<(), VmError<'a>> {
         // C: ra = RA(i), imm = KB(i), tm = GETARG_C(i), flip = GETARG_k(i)
         // C: result = RA(pi)
         // C: luaT_trybinassocTM(L, s2v(ra), imm, flip, result, tm)
@@ -4460,7 +4543,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_unm(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_unm<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         // C: ra = RA(i), rb = vRB(i)
         // C: if integer: setivalue(s2v(ra), -ib)
         // C: if float: setfltvalue(s2v(ra), -nb)
@@ -4490,7 +4573,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_bnot(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_bnot<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         // C: ra = RA(i), rb = vRB(i)
         // C: if tointegerns(rb, &ib): setivalue(s2v(ra), ~ib)
         // C: else: luaT_trybinTM(L, rb, rb, ra, TM_BNOT)
@@ -4515,7 +4598,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_not(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_not<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v = Self::read_stack(state, b);
@@ -4529,7 +4612,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_len(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_len<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         // C: StkId ra = RA(i); Protect(luaV_objlen(L, ra, vRB(i)));
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -4540,7 +4623,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_concat(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_concat<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         // C: StkId ra = RA(i); int n = GETARG_B(i);
         //     L->top.p = ra + n; ProtectNT(luaV_concat(L, n));
         let a = Self::ra(state, inst);
@@ -4642,14 +4725,14 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_close(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_close<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         crate::func::close(state, a, 0, 1)?;
         state.exec.pc += 1;
         Ok(())
     }
 
-    fn op_tbc(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_tbc<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         crate::func::new_tbc_upval(state, a)?;
         state.exec.pc += 1;
@@ -4657,7 +4740,11 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_jmp(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_jmp<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        pc: &mut usize,
+    ) -> Result<(), VmError<'a>> {
         let sj = opcodes::getarg_sj(inst);
         // pc 已 = cur+1 (对应 C fetch 后的 pc), 目标 = cur+1+sj == *pc + sj
         let target = ((*pc as i32) + sj) as usize;
@@ -4672,12 +4759,12 @@ impl VmExecutor {
     // ---- 比较运算 ----
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_eq(
-        state: &mut LuaState,
+    fn op_eq<'a>(
+        state: &mut LuaState<'a>,
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         // C: StkId ra = RA(i); TValue *rb = vRB(i);
         //     Protect(cond = luaV_equalobj(L, s2v(ra), rb));
         let a = Self::ra(state, inst);
@@ -4713,12 +4800,12 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_lt(
-        state: &mut LuaState,
+    fn op_lt<'a>(
+        state: &mut LuaState<'a>,
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         // C: op_order(L, l_lti, LTnum, lessthanothers)
         // lessthanothers: if (string) strcmp; else luaT_callorderTM(L, l, r, TM_LT)
         let a = Self::ra(state, inst);
@@ -4749,12 +4836,12 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_le(
-        state: &mut LuaState,
+    fn op_le<'a>(
+        state: &mut LuaState<'a>,
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         // C: op_order(L, l_lei, LEnum, lessequalothers)
         // lessequalothers: if (string) strcmp; else luaT_callorderTM(L, l, r, TM_LE)
         let a = Self::ra(state, inst);
@@ -4785,12 +4872,12 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_eqk(
-        state: &mut LuaState,
+    fn op_eqk<'a>(
+        state: &mut LuaState<'a>,
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b_key = opcodes::getarg_b(inst) as usize;
         let v1 = Self::read_stack(state, a);
@@ -4801,12 +4888,12 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_eqi(
-        state: &mut LuaState,
+    fn op_eqi<'a>(
+        state: &mut LuaState<'a>,
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         // EQI 是 IABC 模式,使用 sB 参数 (有符号 B, 8 位)
         // 对应 C: int im = GETARG_sB(i);
@@ -4822,12 +4909,12 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_lti(
-        state: &mut LuaState,
+    fn op_lti<'a>(
+        state: &mut LuaState<'a>,
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         // C: op_orderI(L, l_lti, luai_numlt, 0, TM_LT)
         // flip = 0, event = LT → __lt(a, im)
         // C 字段 (isfloat): 原常量是否为浮点数（如 5.0）
@@ -4857,12 +4944,12 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_lei(
-        state: &mut LuaState,
+    fn op_lei<'a>(
+        state: &mut LuaState<'a>,
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         // C: op_orderI(L, l_lei, luai_numle, 0, TM_LE)
         // flip = 0, event = LE → __le(a, im)
         let a = Self::ra(state, inst);
@@ -4889,12 +4976,12 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_gti(
-        state: &mut LuaState,
+    fn op_gti<'a>(
+        state: &mut LuaState<'a>,
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         // C: op_orderI(L, l_gti, luai_numgt, 1, TM_LT)
         // flip = 1, event = LT → __lt(im, a)  (a > im 等价于 im < a)
         let a = Self::ra(state, inst);
@@ -4921,12 +5008,12 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_gei(
-        state: &mut LuaState,
+    fn op_gei<'a>(
+        state: &mut LuaState<'a>,
         inst: Instruction,
         cur: usize,
         pc: &mut usize,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         // C: op_orderI(L, l_gei, luai_numge, 1, TM_LE)
         // flip = 1, event = LE → __le(im, a)  (a >= im 等价于 im <= a)
         let a = Self::ra(state, inst);
@@ -4953,7 +5040,11 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_test(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_test<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        pc: &mut usize,
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let v = Self::read_stack(state, a);
         let cond = !is_false(v);
@@ -4962,7 +5053,11 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_testset(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_testset<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        pc: &mut usize,
+    ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let v = Self::read_stack(state, b).clone();
@@ -4991,12 +5086,12 @@ impl VmExecutor {
     /// op_call 快速探测一致: 任一 hook 位开启放弃 (#147 行号/计数语义),
     /// 函数 pure, CALL 固定 B=2/C=2 非 k 形态。出错 sync state.exec.pc = CALL 索引
     /// (traceback 行号 = 原 CALL 行, cold 路径补推 CallInfoEntry)。
-    fn fuse_pure_call(
-        state: &mut LuaState,
+    fn fuse_pure_call<'a>(
+        state: &mut LuaState<'a>,
         a2: usize,
-        bf: crate::objects::BuiltinFn,
+        bf: crate::objects::BuiltinFn<'a>,
         mv_idx: usize,
-    ) -> Result<usize, VmError> {
+    ) -> Result<usize, VmError<'a>> {
         if state.exec.hook_mask != 0 || !bf.is_pure() {
             return Ok(0);
         }
@@ -5060,12 +5155,12 @@ impl VmExecutor {
         Ok(0)
     }
 
-    fn try_fuse_getfield(
-        state: &LuaState,
+    fn try_fuse_getfield<'a>(
+        state: &LuaState<'a>,
         table_slot: usize,
-        t: &Table,
+        t: &Table<'a>,
         cur: usize,
-    ) -> Option<TValue> {
+    ) -> Option<TValue<'a>> {
         // hook 前提: line hook (4) / count hook (8) 启用时放弃融合 — 融合跳过
         // GETFIELD 的指令级 hook 事件 (行号变化 / 计数递减), 语义要求每条
         // 指令都被 traceexec 观察。
@@ -5106,7 +5201,10 @@ impl VmExecutor {
 
     // ---- 调用 / 返回 ----
 
-    fn op_call(state: &mut LuaState, inst: Instruction) -> Result<CallOutcome, VmError> {
+    fn op_call<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+    ) -> Result<CallOutcome, VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as usize;
         let c = opcodes::getarg_c(inst) as i32;
@@ -5158,13 +5256,13 @@ impl VmExecutor {
     /// 恢复函数。相比整函数 #[inline] (体积 +7%, CI 已证无益), 这里错误
     /// 路径体积被剥离, 内联膨胀仅剩 ~15 条指令的成功路径。
     #[cfg_attr(not(size_optimized), inline)]
-    fn call_pure_builtin(
-        state: &mut LuaState,
+    fn call_pure_builtin<'a>(
+        state: &mut LuaState<'a>,
         a: usize,
         b: usize,
         c: i32,
-        bf: crate::objects::BuiltinFn,
-    ) -> Result<(), VmError> {
+        bf: crate::objects::BuiltinFn<'a>,
+    ) -> Result<(), VmError<'a>> {
         let nargs = if b == 0 {
             state.exec.top.saturating_sub(a + 1)
         } else {
@@ -5192,12 +5290,12 @@ impl VmExecutor {
     /// 不 pop、不截断)。
     #[cold]
     #[inline(never)]
-    fn pure_builtin_yielded(
-        state: &mut LuaState,
+    fn pure_builtin_yielded<'a>(
+        state: &mut LuaState<'a>,
         a: usize,
-        bf: crate::objects::BuiltinFn,
-        values: Vec<TValue>,
-    ) -> VmError {
+        bf: crate::objects::BuiltinFn<'a>,
+        values: Vec<TValue<'a>>,
+    ) -> VmError<'a> {
         state.exec.call_info.push(crate::state::CallInfoEntry {
             is_c: true,
             closure: None,
@@ -5215,12 +5313,12 @@ impl VmExecutor {
     /// pure BuiltinFn 错误路径 — 补推 CallInfoEntry 供 traceback / debug.getinfo。
     #[cold]
     #[inline(never)]
-    fn pure_builtin_errored(
-        state: &mut LuaState,
+    fn pure_builtin_errored<'a>(
+        state: &mut LuaState<'a>,
         a: usize,
-        bf: crate::objects::BuiltinFn,
-        e: VmError,
-    ) -> VmError {
+        bf: crate::objects::BuiltinFn<'a>,
+        e: VmError<'a>,
+    ) -> VmError<'a> {
         state.exec.call_info.push(crate::state::CallInfoEntry {
             is_c: true,
             closure: None,
@@ -5238,13 +5336,13 @@ impl VmExecutor {
     /// op_call 的 LClosure 路径 — Lua 函数调用帧建立。
     /// 从 op_call 快速路径进入 (closure 已从栈提取, Rc 已 +1)。
     #[inline(never)]
-    fn op_call_lclosure(
-        state: &mut LuaState,
+    fn op_call_lclosure<'a>(
+        state: &mut LuaState<'a>,
         a: usize,
         b: usize,
         c: i32,
-        closure: Rc<LClosure>,
-    ) -> Result<(), VmError> {
+        closure: Rc<LClosure<'a>>,
+    ) -> Result<(), VmError<'a>> {
         let nargs = if b == 0 {
             // perf: 用 state.exec.top 而非 state.exec.stack.len() — smart_clear_stack 不截断 Vec
             state.exec.top.saturating_sub(a + 1)
@@ -5359,12 +5457,12 @@ impl VmExecutor {
     /// op_call 慢路径 — Table/__call/impure BuiltinFn/RustClosure/LCFn/CClosure/错误。
     /// 从 op_call 快速路径兜底进入, 完整流程与原 op_call 慢路径一致。
     #[inline(never)]
-    fn op_call_generic(
-        state: &mut LuaState,
+    fn op_call_generic<'a>(
+        state: &mut LuaState<'a>,
         a: usize,
         mut b: usize,
         c: i32,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         let mut func_val = Self::read_stack(state, a).clone();
 
         // __call 元方法支持 — 对应 C 的 luaT_tryfuncTM + precall 的 goto retry
@@ -5660,13 +5758,13 @@ impl VmExecutor {
     /// - b: 指令的 B 操作数（参数数+1，0 表示 MULTRET）
     /// - c: 指令的 C 操作数（结果数+1，0 表示 MULTRET）
     /// - f: C 函数指针
-    fn call_c_function(
-        state: &mut LuaState,
+    fn call_c_function<'a>(
+        state: &mut LuaState<'a>,
         a: usize,
         b: usize,
         c: i32,
         f: unsafe extern "C" fn(*mut c_void) -> i32,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         // nresults: -1 = MULTRET, >=0 = 固定结果数
         let nresults: i32 = if c == 0 { -1 } else { c - 1 };
 
@@ -5849,7 +5947,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_tailcall(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_tailcall<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let mut b = opcodes::getarg_b(inst) as usize;
         // 对应 C 的 OP_TAILCALL:
@@ -6145,7 +6243,10 @@ impl VmExecutor {
         }
     }
 
-    fn op_return(state: &mut LuaState, inst: Instruction) -> Result<Option<VmResult>, VmError> {
+    fn op_return<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+    ) -> Result<Option<VmResult<'a>>, VmError<'a>> {
         let a = Self::ra(state, inst);
         let n = opcodes::getarg_b(inst) as i32 - 1;
         let nresults = if n < 0 {
@@ -6205,11 +6306,11 @@ impl VmExecutor {
     /// op_return / op_return1 的共享收尾: pop call_stack 恢复调用者状态
     /// perf: 从 op_return 快速路径直接调用, 避免重复 pcall_protection_stack 检查
     #[inline]
-    fn op_return_finish(
-        state: &mut LuaState,
+    fn op_return_finish<'a>(
+        state: &mut LuaState<'a>,
         a: usize,
         nresults: usize,
-    ) -> Result<Option<VmResult>, VmError> {
+    ) -> Result<Option<VmResult<'a>>, VmError<'a>> {
         if let Some(frame) = state.exec.call_stack.pop() {
             // 递减 C 调用深度 (对应 op_call 中递增的 n_ccalls)
             state.exec.n_ccalls = state.exec.n_ccalls.saturating_sub(1);
@@ -6303,7 +6404,10 @@ impl VmExecutor {
         }
     }
 
-    fn op_return0(state: &mut LuaState, _inst: Instruction) -> Result<Option<VmResult>, VmError> {
+    fn op_return0<'a>(
+        state: &mut LuaState<'a>,
+        _inst: Instruction,
+    ) -> Result<Option<VmResult<'a>>, VmError<'a>> {
         // perf: 快速路径 — 无 pcall 保护且无 open upvalue 时跳过 continuation 检查
         if state.exec.pcall_protection_stack.is_empty()
             && !Self::need_close_upvals(state, state.exec.base)
@@ -6340,7 +6444,9 @@ impl VmExecutor {
     /// op_return0 收尾: pop call_stack 恢复调用者状态
     /// perf: 从快速路径直接调用
     #[inline]
-    fn op_return0_finish(state: &mut LuaState) -> Result<Option<VmResult>, VmError> {
+    fn op_return0_finish<'a>(
+        state: &mut LuaState<'a>,
+    ) -> Result<Option<VmResult<'a>>, VmError<'a>> {
         if let Some(frame) = state.exec.call_stack.pop() {
             // 递减 C 调用深度 (对应 op_call 中递增的 n_ccalls)
             state.exec.n_ccalls = state.exec.n_ccalls.saturating_sub(1);
@@ -6402,7 +6508,10 @@ impl VmExecutor {
         }
     }
 
-    fn op_return1(state: &mut LuaState, inst: Instruction) -> Result<Option<VmResult>, VmError> {
+    fn op_return1<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+    ) -> Result<Option<VmResult<'a>>, VmError<'a>> {
         let a = Self::ra(state, inst);
         // perf: 快速路径 — 无 pcall 保护且无 open upvalue 时跳过 continuation 检查
         if state.exec.pcall_protection_stack.is_empty()
@@ -6456,11 +6565,11 @@ impl VmExecutor {
     /// op_return1 收尾: pop call_stack 恢复调用者状态
     /// perf: 从快速路径直接调用
     #[inline]
-    fn op_return1_finish(
-        state: &mut LuaState,
+    fn op_return1_finish<'a>(
+        state: &mut LuaState<'a>,
         a: usize,
-        val: TValue,
-    ) -> Result<Option<VmResult>, VmError> {
+        val: TValue<'a>,
+    ) -> Result<Option<VmResult<'a>>, VmError<'a>> {
         if let Some(frame) = state.exec.call_stack.pop() {
             // 递减 C 调用深度 (对应 op_call 中递增的 n_ccalls)
             state.exec.n_ccalls = state.exec.n_ccalls.saturating_sub(1);
@@ -6540,7 +6649,11 @@ impl VmExecutor {
     // ---- 循环 ----
 
     #[cfg_attr(not(size_optimized), inline)]
-    fn op_forloop(state: &mut LuaState, inst: Instruction, pc: &mut usize) -> Result<(), VmError> {
+    fn op_forloop<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        pc: &mut usize,
+    ) -> Result<(), VmError<'a>> {
         let ra = Self::ra(state, inst);
 
         // perf: 单次借用读三槽 (count/step/idx) — 原实现三次 read_stack 各带
@@ -6605,7 +6718,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_forprep(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_forprep<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let ra = Self::ra(state, inst);
 
         let init_val = Self::read_stack(state, ra).clone();
@@ -6722,7 +6835,7 @@ impl VmExecutor {
 
     /// 对应 C 的 forlimit: 将 limit 转为整数 (整数循环分支用)
     /// 返回 Ok(Some(i)) = 转换成功, Ok(None) = 超范围需跳过循环, Err(()) = tonumber 失败
-    fn forlimit(lim: &TValue, step: i64) -> Result<Option<i64>, ()> {
+    fn forlimit<'a>(lim: &TValue<'a>, step: i64) -> Result<Option<i64>, ()> {
         let mode = if step < 0 {
             F2IMode::Ceil
         } else {
@@ -6754,7 +6867,7 @@ impl VmExecutor {
         }
     }
 
-    fn op_tforprep(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_tforprep<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let ra = Self::ra(state, inst);
         let tmp = Self::read_stack(state, ra + 2).clone();
         let closing = Self::read_stack(state, ra + 3).clone();
@@ -6769,7 +6882,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_tforcall(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_tforcall<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let ra = Self::ra(state, inst);
         let c = opcodes::getarg_c(inst) as usize;
         let f = Self::read_stack(state, ra).clone();
@@ -6804,7 +6917,7 @@ impl VmExecutor {
             TValue::LClosure(closure) => {
                 let proto_code = Rc::clone(&closure.proto.code);
                 let proto_constants = Rc::clone(&closure.proto.constants);
-                let proto_upvals = Rc::clone(&closure.proto.upvalues);
+                let _proto_upvals = Rc::clone(&closure.proto.upvalues);
                 let proto_protos = closure.proto.protos.clone();
                 let proto_num_params = closure.proto.num_params;
                 let proto_is_vararg = closure.proto.is_vararg();
@@ -6947,7 +7060,7 @@ impl VmExecutor {
         }
     }
 
-    fn op_tforloop(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_tforloop<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let ra = Self::ra(state, inst);
         let control = Self::read_stack(state, ra + 3).clone();
         match control {
@@ -6962,7 +7075,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_setlist(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_setlist<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let ra = Self::ra(state, inst);
         let n = opcodes::getarg_vb(inst) as usize;
         let mut last = opcodes::getarg_vc(inst) as usize;
@@ -7003,7 +7116,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    fn op_closure(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_closure<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         // C: OP_CLOSURE — 创建新闭包并初始化上值
         // 对应 C 源码:
         //   Proto *p = p->p[bx];
@@ -7080,7 +7193,11 @@ impl VmExecutor {
     /// - A: 目标寄存器起始位置
     /// - C - 1: 需要的结果数（0 = MULTRET，取全部）
     /// - k 位 + B: 如果 k=1，B 是 vararg 表的寄存器偏移；否则无表（PF_VAHID 模式）
-    fn op_vararg(state: &mut LuaState, inst: Instruction, cur: usize) -> Result<(), VmError> {
+    fn op_vararg<'a>(
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        cur: usize,
+    ) -> Result<(), VmError<'a>> {
         let ra = Self::ra(state, inst);
         let c = opcodes::getarg_c(inst) as i32;
         let wanted: i32 = c - 1; // -1 = MULTRET
@@ -7184,7 +7301,7 @@ impl VmExecutor {
     /// - R[C]: 键（整数 n 取第 n 个变参，字符串 "n" 返回变参数量）
     ///
     /// 仅用于 PF_VAHID 模式（PF_VATAB 模式下编译器会生成 GETTABLE）
-    fn op_getvarg(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_getvarg<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let ra = Self::ra(state, inst);
         let c = Self::rc(state, inst);
         let key = Self::read_stack(state, c).clone();
@@ -7233,7 +7350,7 @@ impl VmExecutor {
     /// - Bx: 常量表索引+1（Bx==0 表示索引不可用，用 "?" 作为名字）
     ///
     /// 对应 C 的 OP_ERRNNIL + luaG_errnnil
-    fn op_errnnil(state: &mut LuaState, inst: Instruction) -> Result<(), VmError> {
+    fn op_errnnil<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let val = Self::read_stack(state, a);
         if !matches!(val, TValue::Nil(_)) {
@@ -7273,7 +7390,11 @@ impl VmExecutor {
     ///   ^state.exec.base-1        ^state.exec.base     ^state.exec.base+nfixparams
     ///
     /// totalargs = stack.len() - state.exec.base (即 func 之后的所有参数)
-    fn op_varargprep(state: &mut LuaState, _inst: Instruction, cur: usize) -> Result<(), VmError> {
+    fn op_varargprep<'a>(
+        state: &mut LuaState<'a>,
+        _inst: Instruction,
+        cur: usize,
+    ) -> Result<(), VmError<'a>> {
         let flag = state.exec.proto_flag;
         if flag & (PF_VAHID | PF_VATAB) == 0 {
             // 非变参函数，无需调整 (pc 已 = cur+1, 循环头覆盖)
@@ -7386,12 +7507,12 @@ impl VmExecutor {
     // 辅助: 表操作
     // ========================================================================
 
-    pub fn table_get(
-        state: &mut LuaState,
-        table_val: &TValue,
-        key: &TValue,
+    pub fn table_get<'a>(
+        state: &mut LuaState<'a>,
+        table_val: &TValue<'a>,
+        key: &TValue<'a>,
         table_source: VarSource,
-    ) -> Result<TValue, VmError> {
+    ) -> Result<TValue<'a>, VmError<'a>> {
         // 对应 C Lua 的 luaV_finishget — 用循环代替递归，加 MAXTAGLOOP 限制
         // 防止 __index 链无限循环（如 a.__index = a 导致栈溢出）
         const MAXTAGLOOP: usize = 2000;
@@ -7529,12 +7650,12 @@ impl VmExecutor {
 
     /// 调用 __index 元方法函数: __index(table, key)
     /// 使用 call_tm_res 支持 yield (PcallProtection 机制)
-    fn call_index_metamethod(
-        state: &mut LuaState,
-        index_fn: TValue,
-        table: TValue,
-        key: TValue,
-    ) -> Result<TValue, VmError> {
+    fn call_index_metamethod<'a>(
+        state: &mut LuaState<'a>,
+        index_fn: TValue<'a>,
+        table: TValue<'a>,
+        key: TValue<'a>,
+    ) -> Result<TValue<'a>, VmError<'a>> {
         // res 设为当前栈顶 (call_tm_res 会 push func/p1/p2 在这之后)
         let res = state.exec.stack.len();
         // 调用 call_tm_res (支持 yield)
@@ -7557,13 +7678,13 @@ impl VmExecutor {
     /// 设置表字段，支持 `__newindex` 元方法和 yield
     /// 对应 C Lua 的 luaV_finishset
     /// 成功时表已被修改 (通过 Rc<RefCell<Table>> 的内部可变性)
-    pub fn table_set(
-        state: &mut LuaState,
-        table_val: TValue,
-        key: TValue,
-        val: TValue,
+    pub fn table_set<'a>(
+        state: &mut LuaState<'a>,
+        table_val: TValue<'a>,
+        key: TValue<'a>,
+        val: TValue<'a>,
         table_source: VarSource,
-    ) -> Result<(), VmError> {
+    ) -> Result<(), VmError<'a>> {
         // 对应 C Lua 的 luaV_finishset — 用循环代替递归，加 MAXTAGLOOP 限制
         // 防止 __newindex 链无限循环（如 a.__newindex = a 导致栈溢出）
         const MAXTAGLOOP: usize = 2000;
@@ -7714,7 +7835,7 @@ impl VmExecutor {
         ))
     }
 
-    fn resolve_val(state: &LuaState, inst: Instruction, c: i32) -> TValue {
+    fn resolve_val<'a>(state: &LuaState<'a>, inst: Instruction, c: i32) -> TValue<'a> {
         if opcodes::testarg_k(inst) {
             state
                 .exec
@@ -7728,7 +7849,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline(always))]
-    fn arith_mod(v1: &TValue, v2: &TValue) -> Result<TValue, VmError> {
+    fn arith_mod<'a>(v1: &TValue<'a>, v2: &TValue<'a>) -> Result<TValue<'a>, VmError<'a>> {
         match (v1, v2) {
             (TValue::Integer(i1), TValue::Integer(i2)) => {
                 let r = modulus(*i1, *i2).map_err(|_| VmError::ModuloByZero)?;
@@ -7745,7 +7866,7 @@ impl VmExecutor {
     }
 
     #[cfg_attr(not(size_optimized), inline(always))]
-    fn arith_idiv(v1: &TValue, v2: &TValue) -> Result<TValue, VmError> {
+    fn arith_idiv<'a>(v1: &TValue<'a>, v2: &TValue<'a>) -> Result<TValue<'a>, VmError<'a>> {
         match (v1, v2) {
             (TValue::Integer(i1), TValue::Integer(i2)) => {
                 let r = idiv(*i1, *i2).map_err(|_| VmError::DivisionByZero)?;
@@ -7783,7 +7904,11 @@ mod tests {
         Rc::new(GCState::default_incremental())
     }
 
-    fn execute_test(proto: &Proto, base: usize, stack: Vec<TValue>) -> Result<VmResult, VmError> {
+    fn execute_test<'a>(
+        proto: &Proto<'a>,
+        base: usize,
+        stack: Vec<TValue<'a>>,
+    ) -> Result<VmResult<'a>, VmError<'a>> {
         VmExecutor::execute(proto, base, stack, make_gc())
     }
 
@@ -7862,7 +7987,7 @@ mod tests {
         inst
     }
 
-    fn default_stack(size: usize) -> Vec<TValue> {
+    fn default_stack<'a>(size: usize) -> Vec<TValue<'a>> {
         vec![TValue::Nil(NilKind::Strict); size]
     }
 

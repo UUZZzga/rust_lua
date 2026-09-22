@@ -641,9 +641,9 @@ fn to_const_key(v: &TValue) -> ConstKey {
     }
 }
 
-pub struct FuncState<'a> {
-    pub proto: Proto,
-    pub prev: *mut FuncState<'a>, // raw pointer to parent FuncState (like C's fs->prev)
+pub struct FuncState<'a, 'b> {
+    pub proto: Proto<'b>,
+    pub prev: *mut FuncState<'a, 'b>, // raw pointer to parent FuncState (like C's fs->prev)
     pub pc: i32,
     pub freereg: i32,
     pub max_freereg: i32,
@@ -661,7 +661,7 @@ pub struct FuncState<'a> {
     /// parse_chunk saves the block info here (without deactivating locals),
     /// and close_func does the leaveblock work AFTER generating RETURN.
     pending_func_block: Option<PendingFuncBlock>,
-    ls: *mut LexState<'a>,
+    ls: *mut LexState<'a, 'b>,
     // 每条指令对应的行号（与 code 数组平行），用于在 finalize 时计算 line_info
     inst_lines: Vec<i32>,
     /// 常量索引 — 用于 const_k 的 O(1) 查找，避免线性扫描
@@ -710,7 +710,7 @@ enum EnvResolution {
 }
 
 /// ANTLR4: `chunk: block ;` — 编译器入口，初始化 FuncState，解析整个脚本块并生成原型
-pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
+pub fn compile_chunk<'a, 'b>(ls: &mut LexState<'a, 'b>) -> Result<Proto<'b>, String> {
     let source = crate::strings::new_lstr(&ls.state.string_table, &ls.chunk_name);
     let env_name = crate::strings::new_lstr(&ls.state.string_table, "_ENV");
 
@@ -761,8 +761,8 @@ pub fn compile_chunk(ls: &mut LexState) -> Result<Proto, String> {
     Ok(proto)
 }
 
-impl<'a> FuncState<'a> {
-    fn new(ls: &mut LexState<'a>) -> Self {
+impl<'a, 'b> FuncState<'a, 'b> {
+    fn new(ls: &mut LexState<'a, 'b>) -> Self {
         FuncState {
             proto: crate::func::new_proto(),
             prev: std::ptr::null_mut(),
@@ -779,7 +779,7 @@ impl<'a> FuncState<'a> {
             lasttarget: 0,
             block_stack: Vec::new(),
             pending_func_block: None,
-            ls: ls as *mut LexState<'a>,
+            ls: ls as *mut LexState<'a, 'b>,
             // perf: inst_lines 与 proto.code 在 emit 中 1:1 同步 push,
             // proto.code 初始容量 8 (new_proto), inst_lines 初始容量 0 导致
             // 前 8 条指令期间 inst_lines 扩容 2 次 (0→4→8)。
@@ -801,11 +801,11 @@ impl<'a> FuncState<'a> {
     }
 
     #[cfg_attr(not(size_optimized), inline(always))]
-    fn ls(&self) -> &LexState<'a> {
+    fn ls(&self) -> &LexState<'a, 'b> {
         unsafe { &*self.ls }
     }
     #[cfg_attr(not(size_optimized), inline(always))]
-    fn ls_mut(&mut self) -> &mut LexState<'a> {
+    fn ls_mut(&mut self) -> &mut LexState<'a, 'b> {
         unsafe { &mut *self.ls }
     }
 
@@ -881,7 +881,7 @@ const ABSLINEINFO: i8 = -0x80;
 /// 连续指令数上限，超过则插入绝对行号 (C: MAXIWTHABS = 128)
 const MAXIWTHABS: i32 = 128;
 
-impl<'a> FuncState<'a> {
+impl<'a, 'b> FuncState<'a, 'b> {
     /// 发射指令到原型代码数组，返回当前 pc 并自增
     fn emit(&mut self, ins: Instruction) -> i32 {
         // perf: Rc::get_mut 是非原子指针检查, 比 make_mut 的原子 strong_count 加载快。
@@ -1168,7 +1168,7 @@ impl<'a> FuncState<'a> {
     /// 同时命中路径 key 不进入 map 也不被 drop (Occupied 不消费 key),
     /// 避免 Str 类型 key 的 Rc inc/dec (to_const_key 对 Str 调用 s.clone())。
     /// perf 数据显示 const_k 占 2.26%, 此优化预期减少 ~0.7-1%。
-    fn const_k(&mut self, value: TValue) -> i32 {
+    fn const_k(&mut self, value: TValue<'b>) -> i32 {
         let key = to_const_key(&value);
         match self.const_index.entry(key) {
             std::collections::hash_map::Entry::Occupied(e) => *e.get(),

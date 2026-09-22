@@ -1,12 +1,10 @@
 use crate::execute::VmError;
 use crate::objects::*;
-#[cfg(test)]
-use crate::state::lua_stdout;
 use crate::state::LuaState;
 use std::cell::RefCell;
 use std::rc::Rc;
 
-pub fn new_proto() -> Proto {
+pub fn new_proto<'a>() -> Proto<'a> {
     Proto {
         num_params: 0,
         flag: 0,
@@ -192,7 +190,7 @@ pub fn close_upval(state: &mut LuaState, uv_idx: usize) {
     *state.exec.open_upvals[uv_idx].borrow_mut() = UpVal::Closed { value: val };
 }
 
-pub fn unlink_upval(state: &mut LuaState, uv_idx: usize) {
+pub fn unlink_upval<'a>(state: &mut LuaState<'a>, uv_idx: usize) {
     let (prev, nxt) = {
         let uv_ref = state.exec.open_upvals[uv_idx].borrow();
         match &*uv_ref {
@@ -222,7 +220,12 @@ pub fn unlink_upval(state: &mut LuaState, uv_idx: usize) {
     }
 }
 
-pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result<(), VmError> {
+pub fn close<'a>(
+    state: &mut LuaState<'a>,
+    level: usize,
+    status: i32,
+    yy: i32,
+) -> Result<(), VmError<'a>> {
     // force_noyield_close: coroutine.close() 关闭自身时设置（对应 C Lua 的 lua_closethread(co, L)
     // 中 co == L 场景）。C Lua 会立即调用 luaF_close(L, L->stack, LUA_OK, 1) 关闭所有 TBC 变量，
     // 并通过 luaD_throwbaselevel 抛到 base level。我们的实现未完整支持此语义，改为设置标志，
@@ -415,7 +418,10 @@ pub fn close(state: &mut LuaState, level: usize, status: i32, yy: i32) -> Result
     }
 }
 
-pub fn new_tbc_upval(state: &mut LuaState, level: usize) -> Result<Option<usize>, VmError> {
+pub fn new_tbc_upval<'a>(
+    state: &mut LuaState<'a>,
+    level: usize,
+) -> Result<Option<usize>, VmError<'a>> {
     // 对应 C 的 luaF_newtbcupval: 检查 __close 元方法，复用或创建 open upvalue，然后标记 tbc
     let val = state
         .exec
@@ -514,7 +520,11 @@ pub fn pop_tbc_list(state: &mut LuaState, level: usize) {
     state.exec.tbc_list = None;
 }
 
-pub fn get_local_name(_proto: &Proto, _local_number: usize, _pc: usize) -> Option<&str> {
+pub fn get_local_name<'a, 'b>(
+    _proto: &'b Proto<'a>,
+    _local_number: usize,
+    _pc: usize,
+) -> Option<&'b str> {
     None
 }
 
@@ -523,7 +533,7 @@ mod tests {
     use super::*;
     use crate::state::LuaState;
 
-    fn make_vm_state() -> LuaState {
+    fn make_vm_state() -> LuaState<'static> {
         LuaState {
             exec: Box::new(crate::state::ExecState {
                 pc: 0,
@@ -568,7 +578,6 @@ mod tests {
             tmnames: Rc::new(crate::tm::init_tmnames(&crate::strings::StringTable::new())),
             api_func_base: 0,
             dmt: crate::tm::DefaultMetatables::new(),
-            stdout: lua_stdout(),
             io_output: None,
             file_handles: std::collections::HashMap::with_hasher(
                 crate::objects::FxBuildHasher::default(),
@@ -617,6 +626,7 @@ mod tests {
             c_safety_keepalive: Vec::new(),
             allocf_ud: std::ptr::null_mut(),
             error_jmp_bufs: Vec::new(),
+            io: crate::mock::io_mock::lua_io(),
         }
     }
 
