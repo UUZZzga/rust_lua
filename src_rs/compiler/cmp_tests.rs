@@ -15,7 +15,7 @@ mod compiler_compare_tests {
     unsafe fn compile_c(source: &str) -> bytecode_dump::DumpedFunction {
         let dump_data =
             bytecode_dump::compile_with_c_lua(source.as_bytes()).expect("C compile failed");
-        bytecode_dump::parse_dump(dump_data).expect("dump parse failed")
+        bytecode_dump::parse_dump(&dump_data).expect("dump parse failed")
     }
 
     fn compare_proto_recursive(
