@@ -4,6 +4,8 @@ use crate::objects::FxBuildHasher;
 use crate::state::LuaState;
 use crate::strings::LuaString;
 
+const UTF8BUFFSZ: usize = 8;
+
 /// 编译器内部缓冲区的缓存,用于避免每次编译时重复分配 Vec/String/HashMap 的堆内存。
 /// 通过 `COMPILER_CACHE` 线程局部变量跨编译调用复用,减少 glibc 堆碎片和 RSS。
 struct CompilerCache {
@@ -1201,9 +1203,10 @@ impl<'a, 'b> LexState<'a, 'b> {
                 }
                 self.next_char(); // skip '}'
                                   // 使用 UTF-8 编码（支持 1-6 字节，等价于 C 版本 luaO_utf8esc）
-                for b in utf8_encode(r) {
+                let mut buff = [0u8; UTF8BUFFSZ];
+                for b in utf8_encode(&mut buff, r) {
                     unsafe {
-                        s.as_mut_vec().push(b);
+                        s.as_mut_vec().push(*b);
                     }
                 }
             }
@@ -1379,9 +1382,7 @@ fn parse_hex_float(s: &str) -> Option<f64> {
 /// 与标准 Rust `char::encode_utf8` 不同，此函数支持超出 Unicode 范围的码点
 /// （0x110000 到 0x7FFFFFFF），生成 5-6 字节的"扩展 UTF-8"序列，
 /// 与 Lua C 实现保持一致。
-fn utf8_encode(x: u32) -> Vec<u8> {
-    const UTF8BUFFSZ: usize = 8;
-    let mut buff = [0u8; UTF8BUFFSZ];
+fn utf8_encode(buff: &mut [u8; UTF8BUFFSZ], x: u32) -> &[u8] {
     let mut n = 1usize;
     if x < 0x80 {
         // ASCII: 单字节序列
@@ -1401,5 +1402,5 @@ fn utf8_encode(x: u32) -> Vec<u8> {
         }
         buff[UTF8BUFFSZ - n] = (((!mfb) << 1) | x) as u8;
     }
-    buff[UTF8BUFFSZ - n..UTF8BUFFSZ].to_vec()
+    &buff[UTF8BUFFSZ - n..UTF8BUFFSZ]
 }

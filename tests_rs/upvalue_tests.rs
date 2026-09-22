@@ -12,7 +12,6 @@ use lua_rs::cli::Interpreter;
 use std::os::unix::process::ExitStatusExt;
 #[cfg(windows)]
 use std::os::windows::process::ExitStatusExt;
-use std::sync::{Arc, Mutex};
 
 /// 运行 Lua 代码并返回输出
 fn run_lua(args: &[&str]) -> std::process::Output {

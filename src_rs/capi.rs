@@ -24,6 +24,8 @@ use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::ptr;
 use std::rc::Rc;
 
+use const_format::formatcp;
+
 use crate::objects::{
     CClosure, LCFunction, LClosure, LuaThread, LuaType, NilKind, Proto, TValue, Table,
     ThreadContext, ThreadStatus, Udata, UpVal,
@@ -51,6 +53,8 @@ pub type lua_Unsigned = u64;
 // 常量（与 lua.h 对齐）
 // ============================================================================
 
+pub const LUAL_NUMSIZES: usize =
+    std::mem::size_of::<lua_Integer>() * 16 + std::mem::size_of::<lua_Number>();
 pub const LUA_OK: c_int = 0;
 pub const LUA_YIELD: c_int = 1;
 pub const LUA_ERRRUN: c_int = 2;
@@ -75,6 +79,16 @@ pub const LUA_TTHREAD: c_int = 8;
 pub const LUA_NUMTYPES: c_int = 9;
 
 pub const LUA_RIDX_GLOBALS: c_int = 2;
+
+const LUA_IDENT_STR: &str = formatcp!(
+    "$LuaVersion: {0} $$LuaAuthors: {1} $\0",
+    crate::config::COPYRIGHT,
+    crate::config::AUTHORS
+);
+
+#[unsafe(no_mangle)]
+#[used]
+pub static lua_ident: [u8; LUA_IDENT_STR.len()] = str_as_array(LUA_IDENT_STR);
 
 // ============================================================================
 // 内部辅助：索引转换
@@ -152,6 +166,17 @@ fn lua_type_code(t: LuaType) -> c_int {
 #[cfg_attr(not(size_optimized), inline)]
 pub fn lua_upvalueindex(i: c_int) -> c_int {
     LUA_REGISTRYINDEX - i
+}
+
+const fn str_as_array<const N: usize>(s: &str) -> [u8; N] {
+    let src = s.as_bytes();
+    let mut arr = [0u8; N];
+    let mut i = 0;
+    while i < N {
+        arr[i] = src[i];
+        i += 1;
+    }
+    arr
 }
 
 // ============================================================================
@@ -1069,10 +1094,25 @@ pub struct luaL_Reg {
 /// luaL_checkversion_: 版本兼容性检查（简化为空实现）
 ///
 /// C 版本检查 LUA_VERSION_NUM 和 LUAL_NUMSIZES，不匹配则 luaL_error。
-/// Rust 实现暂不检查，因为 .so 都是与同版本编译的。
 #[no_mangle]
-pub extern "C" fn luaL_checkversion_(_L: *mut lua_State, _ver: lua_Number, _sz: usize) {
-    // 简化：不做任何检查
+pub extern "C" fn luaL_checkversion_(L: *mut lua_State, ver: lua_Number, sz: usize) {
+    let v = lua_version(L);
+    // check numeric types
+    let l = unsafe { L.as_mut() };
+    if sz != LUAL_NUMSIZES {
+        l.unwrap()
+            .push_string("core and library have incompatible numeric types");
+        lua_error(L);
+    } else if v != ver {
+        l.unwrap().push_string(
+            &format!(
+                "version mismatch: app. needs {0}, Lua core provides {1}",
+                ver, v
+            )
+            .to_string(),
+        );
+        lua_error(L);
+    }
 }
 
 /// luaL_setfuncs: 把 luaL_Reg 数组中的函数注册到栈顶表
@@ -1828,7 +1868,7 @@ pub extern "C" fn lua_arith(L: *mut lua_State, op: c_int) {
 /// lua_version: 返回 Lua 版本号。
 #[no_mangle]
 pub extern "C" fn lua_version(_L: *mut lua_State) -> lua_Number {
-    505.0 // LUA_VERSION_NUM = 5*100 + 5
+    crate::config::VERSION_NUM.into()
 }
 
 // ============================================================================
@@ -2624,16 +2664,17 @@ pub extern "C" fn luaL_loadfilex(
         &content[..]
     };
 
+    let mut name;
     // 构造 chunk name: "@filename" (必须 NUL 终止，因为 luaL_loadbufferx 内部用 CStr::from_ptr)
-    let name_buf: Vec<u8> = if filename.is_null() {
-        b"=stdin\0".to_vec()
+    let name_buf: &[u8] = if filename.is_null() {
+        b"=stdin\0"
     } else {
         let fname = unsafe { CStr::from_ptr(filename) };
-        let mut name = Vec::with_capacity(fname.to_bytes().len() + 2); // +1 for '@', +1 for NUL
+        name = Vec::with_capacity(fname.to_bytes().len() + 2); // +1 for '@', +1 for NUL
         name.push(b'@');
         name.extend_from_slice(fname.to_bytes());
         name.push(0); // NUL 终止符
-        name
+        &name
     };
 
     luaL_loadbufferx(

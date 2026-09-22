@@ -57,16 +57,16 @@ pub struct DumpedFunction {
     pub size_loc_vars: i32,
 }
 
-struct BytecodeReader {
-    data: Vec<u8>,
+struct BytecodeReader<'a> {
+    data: &'a [u8],
     pos: usize,
     strings: Vec<String>,
     /// 截断错误标志 — 对应 C 的 error(S, "truncated chunk")
     error: Option<String>,
 }
 
-impl BytecodeReader {
-    fn new(data: Vec<u8>) -> Self {
+impl<'a> BytecodeReader<'a> {
+    fn new(data: &'a [u8]) -> Self {
         BytecodeReader {
             data,
             pos: 0,
@@ -211,11 +211,11 @@ impl BytecodeReader {
         self.align(4);
         let mut code = Vec::with_capacity(sizecode);
         for _i in 0..sizecode {
-            let bytes = self.read_bytes(4).to_vec();
+            let bytes: [u8; 4] = self.read_bytes(4).try_into().unwrap();
             if bytes.len() < 4 {
                 return code;
             }
-            let raw = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            let raw = u32::from_le_bytes(bytes);
             code.push(self.read_instruction(raw));
         }
         code
@@ -384,7 +384,7 @@ impl BytecodeReader {
     }
 }
 
-pub fn parse_dump(data: Vec<u8>) -> Result<DumpedFunction, String> {
+pub fn parse_dump(data: &[u8]) -> Result<DumpedFunction, String> {
     let mut reader = BytecodeReader::new(data);
 
     if reader.data.len() < 12 {
@@ -392,9 +392,9 @@ pub fn parse_dump(data: Vec<u8>) -> Result<DumpedFunction, String> {
     }
 
     // 校验签名 \x1bLua — 对应 C 的 checkliteral(LUA_SIGNATURE)
-    let sig = reader.read_bytes(4).to_vec();
+    let sig: [u8; 4] = reader.read_bytes(4).try_into().unwrap();
     reader.check()?;
-    if sig != b"\x1bLua" {
+    if sig != crate::config::SIGNATURE.as_bytes() {
         return Err("not a binary chunk".to_string());
     }
 
@@ -413,9 +413,9 @@ pub fn parse_dump(data: Vec<u8>) -> Result<DumpedFunction, String> {
     }
 
     // 校验 LUAC_DATA — 对应 C 的 checkliteral(LUAC_DATA, "corrupted chunk")
-    let luac_data = reader.read_bytes(6).to_vec();
+    let luac_data: [u8; 6] = reader.read_bytes(6).try_into().unwrap();
     reader.check()?;
-    if luac_data != b"\x19\x93\r\n\x1a\n" {
+    if luac_data != LUAC_DATA {
         return Err("corrupted chunk".to_string());
     }
 
@@ -425,7 +425,7 @@ pub fn parse_dump(data: Vec<u8>) -> Result<DumpedFunction, String> {
     if int_size as usize != std::mem::size_of::<i32>() {
         return Err("int size mismatch".to_string());
     }
-    let int_val_bytes = reader.read_bytes(4).to_vec();
+    let int_val_bytes: [u8; 4] = reader.read_bytes(4).try_into().unwrap();
     reader.check()?;
     let int_val = i32::from_ne_bytes([
         int_val_bytes[0],
@@ -443,7 +443,7 @@ pub fn parse_dump(data: Vec<u8>) -> Result<DumpedFunction, String> {
     if inst_size as usize != std::mem::size_of::<u32>() {
         return Err("instruction size mismatch".to_string());
     }
-    let inst_val_bytes = reader.read_bytes(4).to_vec();
+    let inst_val_bytes: [u8; 4] = reader.read_bytes(4).try_into().unwrap();
     reader.check()?;
     let inst_val = u32::from_ne_bytes([
         inst_val_bytes[0],
@@ -461,7 +461,7 @@ pub fn parse_dump(data: Vec<u8>) -> Result<DumpedFunction, String> {
     if integer_size as usize != std::mem::size_of::<i64>() {
         return Err("Lua integer size mismatch".to_string());
     }
-    let integer_val_bytes = reader.read_bytes(8).to_vec();
+    let integer_val_bytes: [u8; 8] = reader.read_bytes(8).try_into().unwrap();
     reader.check()?;
     let integer_val = i64::from_ne_bytes([
         integer_val_bytes[0],
@@ -1604,6 +1604,6 @@ fn new_proto_internal<'a>() -> Proto<'a> {
 /// 从二进制数据加载 Proto
 /// 对应 C 的 luaU_undump
 pub fn undump_to_proto<'a>(data: &[u8]) -> Result<Proto<'a>, String> {
-    let df = parse_dump(data.to_vec())?;
+    let df = parse_dump(data)?;
     Ok(dumped_to_proto(&df))
 }

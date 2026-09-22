@@ -42,7 +42,7 @@ pub unsafe fn from_cstr<'a>(ptr: *const c_char) -> Option<&'a str> {
 pub unsafe fn luaL_checkversion(L: *mut lua_State) {
     luaL_checkversion_(
         L,
-        505.0,
+        crate::config::VERSION_NUM.into(),
         std::mem::size_of::<lua_Integer>() * 16 + std::mem::size_of::<lua_Number>(),
     );
 }

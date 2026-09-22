@@ -86,6 +86,7 @@ libc = "0.2"
 hashbrown = "0.15"
 bitflags = "2"
 parking_lot = { version = "0.12", optional = true }
+const_format = "0.2"
 
 [dev-dependencies]
 imara-diff = "0.2"

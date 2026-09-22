@@ -16,7 +16,6 @@ use crate::execute::VmError;
 use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
 use crate::table::Table;
-use std::rc::Rc;
 
 // ============================================================================
 // 常量

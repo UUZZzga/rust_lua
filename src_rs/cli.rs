@@ -2,6 +2,8 @@
 //!
 //! 提供 Lua REPL 和脚本执行功能。
 
+use const_format::concatcp;
+
 use crate::objects::{LuaType, TValue};
 use crate::state::{LuaState, ERR_RUN, ERR_SYNTAX, MIN_STACK, MULT_RET};
 
@@ -55,9 +57,7 @@ impl<'io> Interpreter<'io> {
     }
 
     fn print_version(&mut self) {
-        self.writestring(concat!(
-            "Lua 5.5.0 Rust Edition  Copyright (C) 1994-2025 Lua.org, PUC-Rio\n"
-        ));
+        self.writestring(&concatcp!(crate::config::COPYRIGHT, "\n"));
     }
 
     fn report(&mut self, status: i32) -> i32 {

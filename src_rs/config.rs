@@ -3,6 +3,7 @@
 //! 对应 C 源码: luaconf.h
 //! 提供 Lua 虚拟机所需的基础类型定义、常量、路径配置和数值运算辅助函数。
 
+use const_format::concatcp;
 use std::ffi::CStr;
 use std::os::raw::c_char;
 
@@ -19,9 +20,12 @@ pub const VERSION_RELEASE_NUM: u32 = VERSION_NUM * 100 + (VERSION_RELEASE as u32
 pub const VERSION_MAJOR_STR: &str = "5";
 pub const VERSION_MINOR_STR: &str = "5";
 pub const VERSION_RELEASE_STR: &str = "0";
-pub const VERSION: &str = "Lua 5.5";
-pub const RELEASE: &str = "Lua 5.5.0";
-pub const COPYRIGHT: &str = "Lua 5.5.0  Copyright (C) 1994-2025 Lua.org, PUC-Rio";
+pub const VERSION: &str = concatcp!("Lua ", VERSION_MAJOR_STR, ".", VERSION_MINOR_STR);
+pub const RELEASE: &str = concatcp!(VERSION, ".", VERSION_RELEASE_STR);
+pub const COPYRIGHT: &str = concatcp!(
+    RELEASE,
+    " Rust Edition  Copyright (C) 1994-2025 Lua.org, PUC-Rio"
+);
 pub const AUTHORS: &str = "R. Ierusalimschy, L. H. de Figueiredo, W. Celes";
 
 // ============================================================================
