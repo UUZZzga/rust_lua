@@ -3,9 +3,9 @@ mod compiler_compare_tests {
     use crate::compiler::bytecode_dump;
     use crate::opcodes;
 
-    fn compile_rust(source: &str, name: Option<&str>) -> crate::objects::Proto {
+    fn compile_rust(source: &str, name: Option<&str>) -> crate::objects::Proto<'static> {
         crate::compiler::compile(
-            &mut crate::state::LuaState::new(),
+            &mut crate::state::LuaState::default(),
             source,
             name.unwrap_or("=test"),
         )
@@ -1785,7 +1785,7 @@ assert(a == 2)
 
     fn assert_compile_ok(source: &str, name: Option<&str>) {
         let result = crate::compiler::compile(
-            &mut crate::state::LuaState::new(),
+            &mut crate::state::LuaState::default(),
             source,
             name.unwrap_or("=test_assert"),
         );
@@ -3007,11 +3007,11 @@ end
         let source = std::fs::read_to_string("tests_lua/events.lua").unwrap();
         let rust_proto = compile_rust(&source, None);
         let c_func = unsafe { compile_c(&source) };
-        fn find_proto<'a>(
-            p: &'a crate::objects::Proto,
+        fn find_proto<'a, 'b>(
+            p: &'b crate::objects::Proto<'a>,
             path: &str,
             target: &str,
-        ) -> Option<&'a crate::objects::Proto> {
+        ) -> Option<&'b crate::objects::Proto<'a>> {
             if path == target {
                 return Some(p);
             }
