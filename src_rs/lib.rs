@@ -79,3 +79,5 @@ pub mod cli;
 
 // 测试用模拟接口
 pub mod mock;
+
+pub mod helper;

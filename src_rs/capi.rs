@@ -20,7 +20,9 @@
 
 #![allow(non_snake_case, non_camel_case_types, unused_imports)]
 
+use std::any::{type_name, Any};
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
+use std::fmt::Write;
 use std::ptr;
 use std::rc::Rc;
 
@@ -178,6 +180,111 @@ const fn str_as_array<const N: usize>(s: &str) -> [u8; N] {
         i += 1;
     }
     arr
+}
+
+fn isnoneornil(state: &LuaState, idx: c_int) -> bool {
+    if is_registry(idx) {
+        return false;
+    }
+    match index2val(state, idx) {
+        Some(v) => lua_type_code(v.ty()) <= 0,
+        None => true,
+    }
+}
+
+fn tolstring<'a>(state: &'a mut LuaState, idx: c_int) -> Option<&'a str> {
+    let off = if is_registry(idx) {
+        return None; // registry 不是字符串
+    } else {
+        match index2offset(state, idx) {
+            Some(o) => o,
+            None => return None,
+        }
+    };
+
+    // 如果不是字符串，尝试转换（数字 → 字符串）
+    let need_convert = !matches!(
+        state.exec.stack[off],
+        TValue::LongStr(_) | TValue::ShortStr(_)
+    );
+    if need_convert {
+        let converted = match &state.exec.stack[off] {
+            TValue::Integer(i) => Some(i.to_string()),
+            TValue::Float(f) => Some(format_float(*f)),
+            _ => None,
+        };
+        if let Some(s) = converted {
+            state.exec.stack[off] = crate::state::str_to_ls(&state.string_table, &s);
+        } else {
+            return None;
+        }
+    } else {
+        return None;
+    }
+
+    // 返回 NUL 结尾的 C 字符串指针（LuaString 内部已保证末尾有 NUL）
+    match &state.exec.stack[off] {
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => Some(lua_string_as_str(&s)),
+        _ => unreachable!("tolstring: invalid value"),
+    }
+}
+
+fn optstring<'s, 'd>(state: &'s mut LuaState, idx: c_int, def: &'d str) -> &'s str
+where
+    'd: 's,
+{
+    if isnoneornil(state, idx) {
+        def // 'd: 's 成立，可协变为 &'s str
+    } else {
+        tolstring(state, idx).unwrap_or(def)
+    }
+}
+
+fn checkstring<'s>(state: &'s mut LuaState, idx: c_int) -> Result<&'s str, ([u8; 64], usize)> {
+    // The temporary Option is dropped at the end of this statement,
+    // so this call's borrow of *state does NOT need to be 's.
+    if tolstring(state, idx).is_none() {
+        let tname = state.typename(LuaType::String).to_owned();
+        return Err(typeerror(state, idx, &tname));
+    }
+    // Fresh call; on this path the borrow legitimately lasts for 's.
+    Ok(tolstring(state, idx).unwrap())
+}
+
+fn getmeta<'a>(state: &LuaState<'a>, idx: c_int) -> Option<Table<'a>> {
+    match index2val(state, idx)? {
+        TValue::Table(t) => t.get_metatable(),
+        TValue::UserData(u) => u
+            .metatable
+            .as_ref()
+            .map_or(None, |t| Some(t.as_ref().clone())),
+        _ => None,
+    }
+}
+fn getmetafield<'a>(state: &LuaState<'a>, idx: c_int, key: &str) -> Option<TValue<'a>> {
+    if let Some(t) = getmeta(state, idx) {
+        t.get(&state.intern_str(key))
+    } else {
+        None
+    }
+}
+
+fn typeerror(state: &LuaState, idx: c_int, tname: &str) -> ([u8; 64], usize) {
+    let mut arr = [0u8; 64];
+    let mut w = crate::helper::SliceWriter::new(&mut arr);
+    if let Some(s @ (TValue::ShortStr(_) | TValue::LongStr(_))) = getmetafield(state, idx, "__name")
+    {
+        write!(w, "{} expected, got {}", tname, lua_string_as_str(&s)).unwrap();
+    } else {
+        let typearg = match index2val(state, idx) {
+            Some(TValue::LightUserData(_)) => "light userdata",
+            Some(value) => state.typename(value.ty()),
+            None => "no value",
+        };
+        write!(w, "{} expected, got {}", tname, typearg).unwrap();
+    }
+    let pos = w.pos;
+    (arr, pos)
 }
 
 // ============================================================================
@@ -1186,6 +1293,30 @@ pub extern "C-unwind" fn luaL_checklstring(
     ptr
 }
 
+#[no_mangle]
+pub extern "C-unwind" fn luaL_optlstring(
+    L: *mut lua_State,
+    arg: c_int,
+    def: *const c_char,
+    len: *mut usize,
+) -> *const c_char {
+    let L = unsafe { &mut *L };
+    if isnoneornil(L, arg) {
+        if !len.is_null() {
+            unsafe {
+                *len = if !def.is_null() {
+                    CStr::from_ptr(def).to_bytes().len()
+                } else {
+                    0
+                }
+            };
+        }
+        return def;
+    } else {
+        return luaL_checklstring(L, arg, len);
+    }
+}
+
 /// luaL_ref: 在表 t（栈顶）中创建对栈顶值的引用
 ///
 /// 返回引用编号（整数）。栈顶值被弹出。
@@ -1230,6 +1361,44 @@ pub extern "C" fn luaL_unref(L: *mut lua_State, _t: c_int, ref_: c_int) {
     }
     let registry = L.registry.clone();
     registry.set(TValue::Integer(ref_ as i64), TValue::Nil(NilKind::Strict));
+}
+
+#[no_mangle]
+pub extern "C" fn luaL_checkoption(
+    L: *mut lua_State,
+    arg: c_int,
+    def: *const c_char,
+    lst: *const *const c_char,
+) -> c_int {
+    let L = unsafe { &mut *L };
+    let cow;
+    let name = if !def.is_null() {
+        cow = unsafe { CStr::from_ptr(def) }.to_string_lossy();
+        optstring(L, arg, &cow)
+    } else {
+        match checkstring(L, arg) {
+            Ok(s) => s,
+            Err((err, len)) => {
+                L.push_value(L.string_table.intern_bytes(&err[..len]));
+                unsafe { do_lua_error(L) };
+            }
+        }
+    };
+    let mut i: c_int = 0;
+    loop {
+        if lst.is_null() {
+            break;
+        }
+        let s = unsafe { *lst } as *const c_char;
+        let s = &unsafe { CStr::from_ptr(s) }.to_string_lossy();
+        if s == name {
+            return i;
+        }
+        i += 1;
+    }
+    let name = name.to_string();
+    let str = crate::strings::new_lstr(&L.string_table, &format!("invalid option '{}'", name));
+    return luaL_argerror(L, arg, lua_string_as_c_str_ptr(&str));
 }
 
 // ============================================================================
@@ -1310,7 +1479,7 @@ unsafe fn do_lua_error(L: *mut lua_State) -> ! {
 }
 
 #[no_mangle]
-pub extern "C-unwind" fn lua_error(L: *mut lua_State) -> c_int {
+extern "C-unwind" fn lua_error(L: *mut lua_State) -> c_int {
     unsafe { do_lua_error(L) }
 }
 /// ud 设为 NULL（Rust VM 用自己的分配器，C 模块分配的内存由其自行管理）。
@@ -3259,65 +3428,67 @@ pub extern "C-unwind" fn luaL_argerror(
     arg: c_int,
     extramsg: *const c_char,
 ) -> c_int {
-    let extra = if extramsg.is_null() {
-        String::new()
-    } else {
-        unsafe { CStr::from_ptr(extramsg) }
-            .to_string_lossy()
-            .into_owned()
-    };
-    // 对应 C luaL_argerror: level=0 获取当前运行的 C 函数帧
-    // （luaL_argerror 本身不在 Lua 栈中，level=0 即调用它的 C 函数）
-    let mut ar: lua_Debug = unsafe { std::mem::zeroed() };
-    if lua_getstack(L, 0, &mut ar) == 0 {
-        let msg = format!("bad argument #{} ({})", arg, extra);
-        push_str_to_stack(L, &msg);
-        return lua_error(L);
-    }
-    // 获取 n(名字) 和 t(extraargs/istailcall) 信息
-    let what = b"nt\0";
-    lua_getinfo(L, what.as_ptr() as *const c_char, &mut ar);
-    // 对应 C luaL_argerror 的 argword/arg 调整逻辑
-    let extraargs = ar.extraargs as c_int;
-    let namewhat_str = if ar.namewhat.is_null() {
-        ""
-    } else {
-        unsafe { CStr::from_ptr(ar.namewhat) }
-            .to_str()
-            .unwrap_or("")
-    };
-    // 处理 method（冒号语法）和 extraargs
-    let (argword, adj_arg, is_self_error) = if arg <= extraargs {
-        ("extra argument", arg, false)
-    } else {
-        let adj = arg - extraargs;
-        if namewhat_str == "method" {
-            let adj2 = adj - 1;
-            if adj2 == 0 {
-                // 错误在 self 参数中
-                (".", 0, true)
-            } else {
-                ("argument", adj2, false)
-            }
+    {
+        let extra = if extramsg.is_null() {
+            String::new()
         } else {
-            ("argument", adj, false)
+            unsafe { CStr::from_ptr(extramsg) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        // 对应 C luaL_argerror: level=0 获取当前运行的 C 函数帧
+        // （luaL_argerror 本身不在 Lua 栈中，level=0 即调用它的 C 函数）
+        let mut ar: lua_Debug = unsafe { std::mem::zeroed() };
+        if lua_getstack(L, 0, &mut ar) == 0 {
+            let msg = format!("bad argument #{} ({})", arg, extra);
+            push_str_to_stack(L, &msg);
+        } else {
+            // 获取 n(名字) 和 t(extraargs/istailcall) 信息
+            let what = b"nt\0";
+            lua_getinfo(L, what.as_ptr() as *const c_char, &mut ar);
+            // 对应 C luaL_argerror 的 argword/arg 调整逻辑
+            let extraargs = ar.extraargs as c_int;
+            let namewhat_str = if ar.namewhat.is_null() {
+                ""
+            } else {
+                unsafe { CStr::from_ptr(ar.namewhat) }
+                    .to_str()
+                    .unwrap_or("")
+            };
+            // 处理 method（冒号语法）和 extraargs
+            let (argword, adj_arg, is_self_error) = if arg <= extraargs {
+                ("extra argument", arg, false)
+            } else {
+                let adj = arg - extraargs;
+                if namewhat_str == "method" {
+                    let adj2 = adj - 1;
+                    if adj2 == 0 {
+                        // 错误在 self 参数中
+                        (".", 0, true)
+                    } else {
+                        ("argument", adj2, false)
+                    }
+                } else {
+                    ("argument", adj, false)
+                }
+            };
+            // 对应 C: if (ar.name == NULL) ar.name = "?";
+            let name_str = if ar.name.is_null() {
+                "?".to_string()
+            } else {
+                unsafe { CStr::from_ptr(ar.name) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let msg = if is_self_error {
+                // self 参数错误：calling 'name' on bad self (msg)
+                format!("calling '{}' on bad self ({})", name_str, extra)
+            } else {
+                format!("bad {} #{} to '{}' ({})", argword, adj_arg, name_str, extra)
+            };
+            push_str_to_stack(L, &msg);
         }
-    };
-    // 对应 C: if (ar.name == NULL) ar.name = "?";
-    let name_str = if ar.name.is_null() {
-        "?".to_string()
-    } else {
-        unsafe { CStr::from_ptr(ar.name) }
-            .to_string_lossy()
-            .into_owned()
-    };
-    let msg = if is_self_error {
-        // self 参数错误：calling 'name' on bad self (msg)
-        format!("calling '{}' on bad self ({})", name_str, extra)
-    } else {
-        format!("bad {} #{} to '{}' ({})", argword, adj_arg, name_str, extra)
-    };
-    push_str_to_stack(L, &msg);
+    }
     lua_error(L)
 }
 
@@ -3359,6 +3530,32 @@ pub extern "C-unwind" fn luaL_typeerror(
     let msg = format!("{} expected, got {}", tname_str, typearg);
     let cmsg = CString::new(msg).unwrap();
     luaL_argerror(L, arg, cmsg.as_ptr())
+}
+
+#[no_mangle]
+pub extern "C-unwind" fn luaL_testudata(
+    L: *mut lua_State,
+    ud: c_int,
+    tname: *const c_char,
+) -> *mut c_void {
+    // luaL_testudata 逻辑：lua_touserdata 获取指针，lua_getmetatable 获取元表，
+    // luaL_getmetatable 获取注册表中的元表，lua_rawequal 比较。
+    let p = lua_touserdata(L, ud);
+    if !p.is_null() {
+        if lua_getmetatable(L, ud) != 0 {
+            // 栈顶是 userdata 的元表
+            luaL_getmetatable(L, tname);
+            // 栈顶是注册表中的元表，-2 是 userdata 的元表
+            if lua_rawequal(L, -1, -2) != 0 {
+                // 匹配：弹出两个元表，返回指针
+                lua_pop(L, 2);
+                return p;
+            }
+            // 不匹配：弹出两个元表
+            lua_pop(L, 2);
+        }
+    }
+    std::ptr::null_mut()
 }
 
 /// luaL_checkudata: 检查 userdata 是否有指定名称的元表，不匹配则 luaL_typeerror。

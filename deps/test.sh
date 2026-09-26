@@ -35,6 +35,8 @@ PASS=0
 FAIL=0
 FAILED_TESTS=()
 
+PLATFORM=$(uname -s)
+
 log()  { echo -e "${BLUE}[test]${NC} $*"; }
 ok()   { echo -e "${GREEN}[PASS]${NC} $*"; PASS=$((PASS+1)); }
 fail() { echo -e "${RED}[FAIL]${NC} $*"; FAIL=$((FAIL+1)); FAILED_TESTS+=("$1"); }
@@ -75,9 +77,42 @@ if [[ ! -d "$DEPS_LIB" ]]; then
 fi
 
 # 设置 Lua 模块搜索路径
-export LUA_CPATH="$DEPS_LIB/?.so;$DEPS_LIB/?/core.so;;"
+DLL_SUFFIX=".so"
+
+case "$PLATFORM" in
+    *LINUX*)   DLL_SUFFIX=".so"    ;;
+    *MACOS*)   DLL_SUFFIX=".dylib" ;;
+    *WINDOWS*) DLL_SUFFIX=".dll"   ;;
+    *CYGWIN*)  DLL_SUFFIX=".dll"   ;;
+    *MINGW*)   DLL_SUFFIX=".dll"   ;;
+    *MSYS*)    DLL_SUFFIX=".dll"   ;;
+esac
+
+case "$PLATFORM" in
+    *WINDOWS*) DEPS_LIB=$(cygpath -w -m "$DEPS_LIB") SCRIPT_DIR=$(cygpath -w -m "$SCRIPT_DIR") ;;
+    *CYGWIN*)  DEPS_LIB=$(cygpath -w -m "$DEPS_LIB") SCRIPT_DIR=$(cygpath -w -m "$SCRIPT_DIR") ;;
+    *MINGW*)   DEPS_LIB=$(cygpath -w -m "$DEPS_LIB") SCRIPT_DIR=$(cygpath -w -m "$SCRIPT_DIR") ;;
+    *MSYS*)    DEPS_LIB=$(cygpath -w -m "$DEPS_LIB") SCRIPT_DIR=$(cygpath -w -m "$SCRIPT_DIR") ;;
+esac
+
+export LUA_CPATH="$DEPS_LIB/?$DLL_SUFFIX;$DEPS_LIB/?/core$DLL_SUFFIX;;"
 export LUA_PATH="$DEPS_LIB/?.lua;$SCRIPT_DIR/src/lua-cjson/lua/?.lua;$SCRIPT_DIR/src/luarocks-3.13.0/src/?.lua;$SCRIPT_DIR/src/lsqlite3/?.lua;;"
 export LD_LIBRARY_PATH="$DEPS_LIB:${LD_LIBRARY_PATH:-}"
+
+case "$PLATFORM" in
+    *WINDOWS*) export PATH="$DEPS_LIB:${PATH:-}" ;;
+    *CYGWIN*)  export PATH="$DEPS_LIB:${PATH:-}" ;;
+    *MINGW*)   export PATH="$DEPS_LIB:${PATH:-}" ;;
+    *MSYS*)    export PATH="$DEPS_LIB:${PATH:-}" ;;
+esac
+
+
+echo "  平台: $PLATFORM"
+echo "  模块后缀: $DLL_SUFFIX"
+echo "  Lua 模块搜索路径: $LUA_CPATH"
+echo "  Lua 路径: $LUA_PATH"
+echo "  LD_LIBRARY_PATH: $LD_LIBRARY_PATH"
+echo "  PATH: $PATH"
 
 # 测试运行函数：超时 60s，限制内存 512MB（C 模块测试可能需要更多内存）
 # 用法: run_test <name> <workdir> <lua_args...>
@@ -243,7 +278,7 @@ include "config.path"
 thread = 2
 harbor = 0
 bootstrap = "snlua abort"
-cpath = root.."cservice/?.so"
+cpath = root.."cservice/?$DLL_SUFFIX"
 EOF
     log "运行 skynet/abort ..."
     # skynet 启动后会加载 abort.lua 并调用 skynet.abort() 退出

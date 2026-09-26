@@ -6,7 +6,7 @@
 #   - luasocket   (lunarmodules, master)
 #   - lsqlite3    (LuaDist fork, 含 lunit.lua 测试框架)
 #   - luarocks    (3.13.0)
-#   - sol2        (v3.3.0)
+#   - sol2        (v3.5.0)
 #   - sqlite3     (amalgamation 3450100, 供 lsqlite3 静态链接)
 #   - skynet      (cloudwu/skynet, master, 含修改版 Lua 5.5.1)
 #
@@ -128,12 +128,12 @@ download "$LUAROCKS_URL" "$LUAROCKS_ARCHIVE"
 extract_tarball "$CACHE_DIR/$LUAROCKS_ARCHIVE" "luarocks-3.13.0" "luarocks-3.13.0"
 
 # ============================================================================
-# 5. sol2 v3.3.0
+# 5. sol2 v3.5.0
 # ============================================================================
-SOL2_URL="https://github.com/ThePhD/sol2/archive/refs/tags/v3.3.0.tar.gz"
-SOL2_ARCHIVE="sol2-3.3.0.tar.gz"
+SOL2_URL="https://github.com/ThePhD/sol2/archive/refs/tags/v3.5.0.tar.gz"
+SOL2_ARCHIVE="sol2-3.5.0.tar.gz"
 download "$SOL2_URL" "$SOL2_ARCHIVE"
-extract_tarball "$CACHE_DIR/$SOL2_ARCHIVE" "sol2-3.3.0" "sol2"
+extract_tarball "$CACHE_DIR/$SOL2_ARCHIVE" "sol2-3.5.0" "sol2"
 
 # ============================================================================
 # 6. sqlite3 amalgamation (供 lsqlite3 静态链接)

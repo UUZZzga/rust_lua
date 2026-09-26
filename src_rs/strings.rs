@@ -22,7 +22,6 @@ use std::cell::Cell;
 use std::fmt::{self, Debug, Formatter};
 use std::os::raw::c_char;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 // ============================================================================
 // RwLock 抽象层 — 根据 `threaded` feature 切换实现
@@ -382,7 +381,7 @@ impl StringTable {
             let content_bytes = ts.contents.as_bytes();
             content_bytes.len() == str_len + 1 && content_bytes[..str_len] == *str_bytes
         }) {
-            return (ArcRc::clone(ts));
+            return ArcRc::clone(ts);
         }
         drop(ht_reader);
 
@@ -395,7 +394,7 @@ impl StringTable {
         });
         ht.insert_unique(h, ArcRc::clone(&ts), |ts| ts.hash);
         *self.nuse.write() += 1;
-        (ts)
+        ts
     }
 
     /// 内部化一个短字符串（从任意字节，8-bit clean，绕过 UTF-8 验证）。

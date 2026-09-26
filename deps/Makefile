@@ -14,6 +14,28 @@
 
 SHELL := /bin/bash
 
+ifndef PLATFORM
+  UNAME_S := $(shell uname -s 2>/dev/null)
+
+  ifneq (,$(findstring MINGW,$(UNAME_S)))
+    PLATFORM := MINGW
+  else ifneq (,$(findstring MSYS,$(UNAME_S)))
+    PLATFORM := MSYS
+  else ifneq (,$(findstring CYGWIN,$(UNAME_S)))
+    PLATFORM := CYGWIN
+  else ifeq ($(UNAME_S),Linux)
+    PLATFORM := LINUX
+  else ifeq ($(UNAME_S),Darwin)
+    PLATFORM := MACOS
+  else ifeq ($(OS),Windows_NT)
+    PLATFORM := WINDOWS
+  else
+    PLATFORM := UNKNOWN
+  endif
+endif
+
+PLATFORM_LC := $(shell echo $(PLATFORM) | sed 's/.*/\L&/')
+
 # --- Paths ----------------------------------------------------------------
 PROJECT_ROOT := $(realpath $(CURDIR)/..)
 LUA_INCLUDE  := $(PROJECT_ROOT)/src
@@ -24,6 +46,18 @@ DEPS_LIB     := $(CURDIR)/lib/lua/5.5
 CC       := gcc
 CFLAGS   := -O2 -fPIC -fexceptions -Wall -Wextra -I$(LUA_INCLUDE)
 LDFLAGS  := -shared
+LDLIBS   := -lm
+
+ifeq ($(PLATFORM),MINGW)
+	CFLAGS := $(CFLAGS) -DLUA_BUILD_AS_DLL -DLUA_LIB
+	LDLIBS := $(LDLIBS) -lws2_32 -lNtosKrnl -lntdll -luserenv
+else ifeq ($(PLATFORM),MSYS)
+	CFLAGS := $(CFLAGS) -DLUA_BUILD_AS_DLL -DLUA_LIB
+	LDLIBS := $(LDLIBS) -lws2_32 -lNtosKrnl -lntdll -luserenv
+else ifeq ($(PLATFORM),LINUX)
+	CFLAGS := $(CFLAGS) -DLUA_BUILD_AS_DLL -DLUA_LIB
+	LDLIBS := $(LDLIBS) -ldl -lpthread
+endif
 
 
 # --- Targets --------------------------------------------------------------
@@ -32,14 +66,19 @@ SOCKET_CORE_TARGET := $(DEPS_LIB)/socket/core.so
 MIME_TARGET       := $(DEPS_LIB)/mime/core.so
 LSQLITE3_TARGET   := $(DEPS_LIB)/lsqlite3.so
 
+ifeq ($(PLATFORM),MINGW)
+	CJSON_TARGET     := $(DEPS_LIB)/cjson.dll
+	SOCKET_CORE_TARGET := $(DEPS_LIB)/socket/core.dll
+	MIME_TARGET       := $(DEPS_LIB)/mime/core.dll
+	LSQLITE3_TARGET   := $(DEPS_LIB)/lsqlite3.dll
+else ifeq ($(PLATFORM),MSYS)
+	CJSON_TARGET     := $(DEPS_LIB)/cjson.dll
+	SOCKET_CORE_TARGET := $(DEPS_LIB)/socket/core.dll
+	MIME_TARGET       := $(DEPS_LIB)/mime/core.dll
+	LSQLITE3_TARGET   := $(DEPS_LIB)/lsqlite3.dll
+endif
+
 ALL_TARGETS := $(CJSON_TARGET) $(SOCKET_CORE_TARGET) $(MIME_TARGET)
-
-# --- lauxlib object (statically linked into each .so) ---------------------
-LAUXLIB_O := $(DEPS_BUILD)/lauxlib.o
-
-$(LAUXLIB_O): $(LUA_INCLUDE)/lauxlib.c $(LUA_INCLUDE)/lauxlib.h $(LUA_INCLUDE)/lua.h
-	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
 
 # --- lua-cjson ------------------------------------------------------------
 CJSON_SRC := $(DEPS_SRC)/lua-cjson
@@ -55,14 +94,20 @@ $(DEPS_BUILD)/strbuf.o: $(CJSON_SRC)/strbuf.c
 $(DEPS_BUILD)/fpconv.o: $(CJSON_SRC)/fpconv.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(CJSON_TARGET): $(CJSON_OBJS) $(LAUXLIB_O)
+$(CJSON_TARGET): $(CJSON_OBJS)
 	@mkdir -p $(@D)
-	$(CC) $(LDFLAGS) -o $@ $^ -lm
+	$(CC) $(LDFLAGS) -o $@ $^ $(LUA_RS_LIB) $(LDLIBS)
 
 cjson: $(CJSON_TARGET)
 
 # --- luasocket (core + mime) ----------------------------------------------
 LUASOCKET_SRC := $(DEPS_SRC)/luasocket/src
+SOCK_OBJ:=usocket.o
+ifeq ($(PLATFORM),MINGW)
+	SOCK_OBJ := wsocket.o
+else ifeq ($(PLATFORM),MSYS)
+	SOCK_OBJ := wsocket.o
+endif
 SOCKET_OBJS := \
 	$(DEPS_BUILD)/luasocket.o \
 	$(DEPS_BUILD)/auxiliar.o \
@@ -76,7 +121,7 @@ SOCKET_OBJS := \
 	$(DEPS_BUILD)/tcp.o \
 	$(DEPS_BUILD)/timeout.o \
 	$(DEPS_BUILD)/udp.o \
-	$(DEPS_BUILD)/usocket.o \
+	$(DEPS_BUILD)/$(SOCK_OBJ) \
 	$(DEPS_BUILD)/compat.o
 
 SOCKET_CFLAGS := $(CFLAGS) -DLUASOCKET_API=extern
@@ -85,17 +130,17 @@ $(DEPS_BUILD)/%.o: $(LUASOCKET_SRC)/%.c
 	@mkdir -p $(@D)
 	$(CC) $(SOCKET_CFLAGS) -c $< -o $@
 
-$(SOCKET_CORE_TARGET): $(SOCKET_OBJS) $(LAUXLIB_O)
+$(SOCKET_CORE_TARGET): $(SOCKET_OBJS)
 	@mkdir -p $(@D)
-	$(CC) $(LDFLAGS) -o $@ $^ -lm
+	$(CC) $(LDFLAGS) -o $@ $^ $(LUA_RS_LIB) $(LDLIBS)
 
 $(DEPS_BUILD)/mime.o: $(LUASOCKET_SRC)/mime.c
 	@mkdir -p $(@D)
 	$(CC) $(SOCKET_CFLAGS) -c $< -o $@
 
-$(MIME_TARGET): $(DEPS_BUILD)/mime.o $(LAUXLIB_O)
+$(MIME_TARGET): $(DEPS_BUILD)/mime.o
 	@mkdir -p $(@D)
-	$(CC) $(LDFLAGS) -o $@ $^ -lm
+	$(CC) $(LDFLAGS) -o $@ $^ $(LUA_RS_LIB) $(LDLIBS)
 
 luasocket: $(SOCKET_CORE_TARGET) $(MIME_TARGET)
 	@mkdir -p $(DEPS_LIB)
@@ -132,9 +177,9 @@ $(DEPS_BUILD)/lsqlite3.o: $(DEPS_SRC)/lsqlite3/lsqlite3.c
 	@mkdir -p $(@D)
 	$(CC) $(LSQLITE3_CFLAGS) -c $< -o $@
 
-$(LSQLITE3_TARGET): $(DEPS_BUILD)/lsqlite3.o $(DEPS_BUILD)/sqlite3.o $(LAUXLIB_O)
+$(LSQLITE3_TARGET): $(DEPS_BUILD)/lsqlite3.o $(DEPS_BUILD)/sqlite3.o
 	@mkdir -p $(@D)
-	$(CC) $(LDFLAGS) -o $@ $^ -lm
+	$(CC) $(LDFLAGS) -o $@ $^ $(LUA_RS_LIB) $(LDLIBS)
 
 lsqlite3: $(LSQLITE3_TARGET)
 ALL_TARGETS += $(LSQLITE3_TARGET)
@@ -159,7 +204,7 @@ SOL2_SMOKETEST_SRC := $(CURDIR)/sol2_smoke.cpp
 
 $(SOL2_SMOKETEST): $(SOL2_SMOKETEST_SRC) $(LUA_INCLUDE)/lua.hpp $(LUA_INCLUDE)/lua.h
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $< -o $@ $(LUA_RS_LIB) -lm -ldl -lpthread
+	$(CXX) $(CXXFLAGS) $< -o $@ $(LUA_RS_LIB) $(LDLIBS)
 
 sol2: $(SOL2_SMOKETEST)
 	@echo "=== sol2 smoke test built: $< ==="
@@ -185,14 +230,28 @@ SKYNET_EXPORT := -Wl,-E \
 	-Wl,--undefined=luaL_error \
 	-Wl,--undefined=lua_rs_clocks_per_sec
 
+SKYNET_MINGW_CC_ARGS  :=
+SKYNET_MINGW_EXTRA_CFLAGS :=
+
+ifeq ($(PLATFORM),MINGW)
+  SKYNET_MINGW_CC_ARGS      := CC=gcc AR=ar RANLIB=ranlib
+  SKYNET_MINGW_EXTRA_CFLAGS := -DIN_WINPTHREAD -DCLOCK_REALTIME=0 \
+                        -DCLOCK_MONOTONIC=1 -DCLOCK_THREAD_CPUTIME_ID=3
+else ifeq ($(PLATFORM),MSYS)
+  SKYNET_MINGW_CC_ARGS      := CC=gcc AR=ar RANLIB=ranlib
+  SKYNET_MINGW_EXTRA_CFLAGS := -DIN_WINPTHREAD -DCLOCK_REALTIME=0 \
+                        -DCLOCK_MONOTONIC=1 -DCLOCK_THREAD_CPUTIME_ID=3
+endif
+
 skynet: $(LUA_RS_LIB)
 	@echo "=== Building skynet with lua-rs ==="
 	# LUA_RUST_COMPAT: 跳过 coroutine.resume/wrap 替换 (lua-rs 的 lua_resume 与 skynet timing_resume 不兼容)
-	cd $(SKYNET_SRC) && $(MAKE) linux \
+	cd $(SKYNET_SRC) && $(MAKE) $(PLATFORM_LC) \
+		$(SKYNET_MINGW_CC_ARGS) \
 		LUA_LIB=$(LUA_RS_LIB) \
 		LUA_INC=$(LUA_INCLUDE) \
 		MALLOC_STATICLIB="" \
-		MYCFLAGS="-DLUA_RUST_COMPAT" \
+		MYCFLAGS="-DLUA_RUST_COMPAT $(SKYNET_MINGW_EXTRA_CFLAGS)" \
 		EXPORT="$(SKYNET_EXPORT)" \
 		SKYNET_DEFINES="-DNOUSE_JEMALLOC"
 	@echo "=== skynet built: $(SKYNET_BIN) ==="
