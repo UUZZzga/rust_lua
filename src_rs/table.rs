@@ -11,6 +11,7 @@
 
 use crate::gc::GCObjectHeader;
 use crate::objects::{NilKind, TValue, TableData};
+use crate::strings::lua_string_eq;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -111,25 +112,17 @@ impl<'a> Table<'a> {
     /// 未命中 (含 nil tombstone / 无元表) 返回 None。
     /// 供 get_tm_by_obj 热路径使用。
     #[cfg(not(size_optimized))]
-    pub fn get_tm_ref(
-        &self,
-        key: &crate::strings::LuaString,
-    ) -> Option<std::cell::Ref<'_, TValue<'a>>> {
+    pub fn get_tm_ref(&self, key: &TValue<'a>) -> Option<std::cell::Ref<'_, TValue<'a>>> {
         let guard = self.data.borrow();
         let r = std::cell::Ref::filter_map(guard, |d| {
+            use crate::objects::tvalue_fx_hash;
+
             let ktb = d.key_to_bucket.as_ref()?;
-            const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
-            let sh = match key {
-                crate::strings::LuaString::Short(ss) => ss.hash,
-                _ => {
-                    use std::hash::{Hash, Hasher};
-                    let mut h = crate::objects::fx_hash_impl::FxHasherPub::default();
-                    Hash::hash(key, &mut h);
-                    h.finish()
-                }
-            };
-            let hash = (5u64.wrapping_mul(SEED).rotate_left(5) ^ sh).wrapping_mul(SEED);
-            let (_, idx) = ktb.find(hash, |(k, _)| matches!(k, TValue::Str(ks) if ks == key))?;
+            let hash = tvalue_fx_hash(key);
+            let (_, idx) = ktb.find(
+                hash,
+                |(k, _)| matches!(k, ks@(TValue::LongStr(_)|TValue::ShortStr(_)) if ks == key),
+            )?;
             let v = &d.hash_buckets[*idx].1;
             // C: notm — nil (含 Empty tombstone) 视为无元方法
             if v.is_nil() {
@@ -227,12 +220,15 @@ impl<'a> Table<'a> {
         }
         let ktb = data.key_to_bucket.as_ref()?;
         match key {
-            TValue::Str(crate::strings::LuaString::Short(_)) => {}
+            TValue::ShortStr(_) => {}
             _ => return None, // 只特化 interned 短字符串键
         }
         let hash = crate::objects::tvalue_fx_hash(key);
         let entry = ktb.find(hash, |(k, _)| match (k, key) {
-            (TValue::Str(a), TValue::Str(b)) => a == b,
+            (
+                a @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+                b @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+            ) => lua_string_eq(a, b),
             _ => false,
         })?;
         let v = &data.hash_buckets[entry.1].1;
@@ -728,7 +724,7 @@ pub(crate) fn float_key_to_int(f: f64) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::objects::{NilKind, TValue};
-    use crate::strings::{LuaString, ShortString};
+    use crate::strings::{lua_string_with_nul, ShortString};
 
     // ------------------------------------------------------------------------
     // 构造 & 容量
@@ -807,12 +803,12 @@ mod tests {
     #[test]
     fn test_get_string_key() {
         let t = Table::new();
-        let key = LuaString::Short(crate::strings::ArcRc::new(ShortString {
+        let key = TValue::ShortStr(crate::strings::ArcRc::new(ShortString {
             hash: 0,
-            contents: crate::strings::LuaString::with_nul("name"),
+            contents: lua_string_with_nul("name"),
         }));
-        t.set(TValue::Str(key.clone()), TValue::Integer(42));
-        let lookup = TValue::Str(key);
+        t.set(key.clone(), TValue::Integer(42));
+        let lookup = key;
         assert_eq!(t.get(&lookup), Some(TValue::Integer(42)));
     }
 
@@ -897,13 +893,13 @@ mod tests {
     #[test]
     fn test_set_string_key() {
         let t = Table::new();
-        let key = LuaString::Short(crate::strings::ArcRc::new(ShortString {
+        let key = TValue::ShortStr(crate::strings::ArcRc::new(ShortString {
             hash: 0,
-            contents: crate::strings::LuaString::with_nul("key"),
+            contents: lua_string_with_nul("key"),
         }));
-        t.set(TValue::Str(key.clone()), TValue::Integer(7));
+        t.set(key.clone(), TValue::Integer(7));
         assert_eq!(t.hash_size(), 1);
-        let lookup = TValue::Str(key);
+        let lookup = key;
         assert_eq!(t.get(&lookup), Some(TValue::Integer(7)));
     }
 
@@ -1161,16 +1157,16 @@ mod tests {
     #[test]
     fn test_rehash_preserves_string_keys() {
         let t = Table::new();
-        let key = LuaString::Short(crate::strings::ArcRc::new(ShortString {
+        let key = TValue::ShortStr(crate::strings::ArcRc::new(ShortString {
             hash: 0,
-            contents: crate::strings::LuaString::with_nul("mykey"),
+            contents: lua_string_with_nul("mykey"),
         }));
-        t.set(TValue::Str(key.clone()), TValue::Integer(77));
+        t.set(key.clone(), TValue::Integer(77));
         t.set_int(1, TValue::Integer(10));
 
         t.rehash(5, 10);
         assert_eq!(t.get_int(1), Some(TValue::Integer(10)));
-        let lookup = TValue::Str(key);
+        let lookup = key;
         assert_eq!(t.get(&lookup), Some(TValue::Integer(77)));
     }
 

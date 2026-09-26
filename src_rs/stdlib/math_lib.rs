@@ -15,6 +15,7 @@
 use crate::execute::VmError;
 use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
+use crate::strings::lua_string_as_str;
 use crate::table::Table;
 
 // ============================================================================
@@ -105,9 +106,9 @@ pub fn math_tointeger(v: &TValue) -> Option<i64> {
     match v {
         TValue::Integer(n) => Some(*n),
         TValue::Float(f) => crate::vm::float_to_integer(*f, crate::vm::F2IMode::Eq),
-        TValue::Str(s) => {
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
             // 对应 C 的 luaV_tointeger: l_strton 转成数字，再转整数
-            match crate::objects::str2num(s.as_str()) {
+            match crate::objects::str2num(lua_string_as_str(s)) {
                 Some(TValue::Integer(n)) => Some(n),
                 Some(TValue::Float(f)) => crate::vm::float_to_integer(f, crate::vm::F2IMode::Eq),
                 _ => None,
@@ -352,8 +353,8 @@ fn to_float(v: &TValue) -> Result<f64, String> {
     match v {
         TValue::Integer(n) => Ok(*n as f64),
         TValue::Float(f) => Ok(*f),
-        TValue::Str(s) => {
-            let s = s.as_str();
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+            let s = lua_string_as_str(s);
             crate::float_utils::f64_from_str(s)
                 .ok_or_else(|| format!("bad argument (number expected, got string '{}')", s))
         }
@@ -391,7 +392,10 @@ fn lua_lt(a: &TValue, b: &TValue) -> Result<bool, String> {
         (TValue::Float(x), TValue::Float(y)) => Ok(x < y),
         (TValue::Integer(x), TValue::Float(y)) => Ok((*x as f64) < *y),
         (TValue::Float(x), TValue::Integer(y)) => Ok(*x < (*y as f64)),
-        (TValue::Str(x), TValue::Str(y)) => Ok(x.as_str() < y.as_str()),
+        (
+            x @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+            y @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+        ) => Ok(lua_string_as_str(x) < lua_string_as_str(y)),
         _ => Err(format!("attempt to compare {} with {}", a.ty(), b.ty())),
     }
 }
@@ -616,9 +620,9 @@ fn get_number_arg<'a>(
     let v = get_arg(state, a, idx);
     match &v {
         TValue::Integer(_) | TValue::Float(_) => Ok(v),
-        TValue::Str(s) => {
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
             // 尝试解析字符串为数字
-            let s = s.as_str();
+            let s = lua_string_as_str(s);
             if let Ok(i) = s.parse::<i64>() {
                 Ok(TValue::Integer(i))
             } else if let Some(f) = crate::float_utils::f64_from_str(s) {
@@ -641,7 +645,7 @@ fn get_number_arg<'a>(
             "bad argument #{} to '{}' (number expected, got {})",
             idx + 1,
             fname,
-            crate::tm::obj_type_name(&v)
+            crate::tm::obj_type_name(state, &v)
         ))),
     }
 }
@@ -709,8 +713,8 @@ fn call_abs<'a>(
             // 慢路径: 字符串参数按 get_number_arg 语义转换 — "42" → Integer(42)
             // (整数字符串优先解析为整数, 与原实现及 C 的 lua_tonumber 一致)
             let v = match other {
-                TValue::Str(s) => {
-                    let s = s.as_str();
+                s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                    let s = lua_string_as_str(s);
                     if let Ok(i) = s.parse::<i64>() {
                         TValue::Integer(i)
                     } else if let Some(f) = crate::float_utils::f64_from_str(s) {
@@ -725,7 +729,7 @@ fn call_abs<'a>(
                 _ => {
                     return Err(VmError::RuntimeError(format!(
                         "bad argument #1 to 'abs' (number expected, got {})",
-                        crate::tm::obj_type_name(other)
+                        crate::tm::obj_type_name(state, other)
                     )))
                 }
             };
@@ -741,10 +745,14 @@ fn call_abs<'a>(
 /// perf: 从 call_simple_unary 热路径拆出, 避免热路径携带 format! 与字符串解析代码
 #[cold]
 #[inline(never)]
-fn unary_slow_convert<'a>(v: &TValue<'a>, fname: &str) -> Result<f64, VmError<'a>> {
+fn unary_slow_convert<'a>(
+    state: &LuaState<'a>,
+    v: &TValue<'a>,
+    fname: &str,
+) -> Result<f64, VmError<'a>> {
     match v {
-        TValue::Str(s) => {
-            let s = s.as_str();
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+            let s = lua_string_as_str(s);
             crate::float_utils::f64_from_str(s)
                 .or_else(|| s.parse::<i64>().ok().map(|i| i as f64))
                 .ok_or_else(|| {
@@ -757,7 +765,7 @@ fn unary_slow_convert<'a>(v: &TValue<'a>, fname: &str) -> Result<f64, VmError<'a
         _ => Err(VmError::RuntimeError(format!(
             "bad argument #1 to '{}' (number expected, got {})",
             fname,
-            crate::tm::obj_type_name(v)
+            crate::tm::obj_type_name(state, v)
         ))),
     }
 }
@@ -832,7 +840,7 @@ where
     let x = match arg {
         TValue::Float(fl) => *fl,
         TValue::Integer(i) => *i as f64,
-        other => unary_slow_convert(other, fname)?,
+        other => unary_slow_convert(state, other, fname)?,
     };
     state.adjust_single_result(a, nresults, TValue::Float(f(x)));
     Ok(())
@@ -939,13 +947,13 @@ fn call_atan<'a>(
     let y = match &state.exec.stack[a + 1] {
         TValue::Float(fl) => *fl,
         TValue::Integer(i) => *i as f64,
-        other => unary_slow_convert(other, "atan")?,
+        other => unary_slow_convert(state, other, "atan")?,
     };
     let x = if nargs >= 2 {
         match &state.exec.stack[a + 2] {
             TValue::Float(fl) => Some(*fl),
             TValue::Integer(i) => Some(*i as f64),
-            other => Some(unary_slow_convert(other, "atan")?),
+            other => Some(unary_slow_convert(state, other, "atan")?),
         }
     } else {
         None
@@ -972,13 +980,13 @@ fn call_log<'a>(
     let x = match &state.exec.stack[a + 1] {
         TValue::Float(fl) => *fl,
         TValue::Integer(i) => *i as f64,
-        other => unary_slow_convert(other, "log")?,
+        other => unary_slow_convert(state, other, "log")?,
     };
     let base = if nargs >= 2 {
         match &state.exec.stack[a + 2] {
             TValue::Float(fl) => Some(*fl),
             TValue::Integer(i) => Some(*i as f64),
-            other => Some(unary_slow_convert(other, "log")?),
+            other => Some(unary_slow_convert(state, other, "log")?),
         }
     } else {
         None
@@ -1248,7 +1256,7 @@ fn call_type<'a>(
     let v = get_arg(state, a, 0);
     match math_type(&v) {
         Some(name) => {
-            push_single_result(state, a, nresults, TValue::Str(state.intern_str(name)));
+            push_single_result(state, a, nresults, state.intern_str(name));
             Ok(())
         }
         None => {
@@ -1353,19 +1361,13 @@ pub fn open_math_lib<'a>(state: &mut LuaState<'a>) {
     register(&lib, c"random", call_random);
     register(&lib, c"randomseed", call_randomseed);
     // 设置常量 (对应 C 的 lua_pushnumber/lua_pushinteger + lua_setfield)
-    lib.set(TValue::Str(state.intern_str("pi")), TValue::Float(PI));
-    lib.set(TValue::Str(state.intern_str("huge")), TValue::Float(HUGE));
-    lib.set(
-        TValue::Str(state.intern_str("maxinteger")),
-        TValue::Integer(MAX_INTEGER),
-    );
-    lib.set(
-        TValue::Str(state.intern_str("mininteger")),
-        TValue::Integer(MIN_INTEGER),
-    );
+    lib.set(state.intern_str("pi"), TValue::Float(PI));
+    lib.set(state.intern_str("huge"), TValue::Float(HUGE));
+    lib.set(state.intern_str("maxinteger"), TValue::Integer(MAX_INTEGER));
+    lib.set(state.intern_str("mininteger"), TValue::Integer(MIN_INTEGER));
 
     // 注册为全局变量 math
-    let key = TValue::Str(state.intern_str("math"));
+    let key = state.intern_str("math");
     state.globals.set(key, TValue::Table(lib));
     // 初始化随机数生成器状态 (对应 C 的 setrandfunc)
     // 使用时间种子初始化
@@ -1387,14 +1389,13 @@ pub fn open_math_lib<'a>(state: &mut LuaState<'a>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::strings::lua_string_with_nul;
 
     fn make_str(s: &str) -> TValue<'_> {
-        TValue::Str(crate::strings::LuaString::Short(
-            crate::strings::ArcRc::new(crate::strings::ShortString {
-                hash: 0,
-                contents: crate::strings::LuaString::with_nul(s),
-            }),
-        ))
+        TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
+            hash: 0,
+            contents: lua_string_with_nul(s),
+        }))
     }
 
     // ========================================================================
@@ -1964,7 +1965,7 @@ mod tests {
     fn test_open_math_lib_registers_global() {
         let mut state = LuaState::default();
         open_math_lib(&mut state);
-        let key = TValue::Str(state.intern_str("math"));
+        let key = state.intern_str("math");
         let val = state.globals.get(&key);
         assert!(val.is_some(), "math global must be registered");
         assert!(matches!(val, Some(TValue::Table(_))));
@@ -1976,7 +1977,7 @@ mod tests {
         open_math_lib(&mut state);
 
         // 获取 math 表
-        let math_key = TValue::Str(state.intern_str("math"));
+        let math_key = state.intern_str("math");
         let math_table = match state.globals.get(&math_key) {
             Some(TValue::Table(t)) => t.clone(),
             _ => panic!("math table not found"),
@@ -2010,7 +2011,7 @@ mod tests {
             "random",
             "randomseed",
         ] {
-            let key = TValue::Str(state.intern_str(name));
+            let key = state.intern_str(name);
             assert!(
                 math_table.get(&key).is_some(),
                 "math.{} must be registered",
@@ -2024,32 +2025,32 @@ mod tests {
         let mut state = LuaState::default();
         open_math_lib(&mut state);
 
-        let math_key = TValue::Str(state.intern_str("math"));
+        let math_key = state.intern_str("math");
         let math_table = match state.globals.get(&math_key) {
             Some(TValue::Table(t)) => t.clone(),
             _ => panic!("math table not found"),
         };
 
         // 验证常量
-        let pi_key = TValue::Str(state.intern_str("pi"));
+        let pi_key = state.intern_str("pi");
         match math_table.get(&pi_key) {
             Some(TValue::Float(f)) => assert!((f - PI).abs() < 1e-15),
             _ => panic!("math.pi not found or wrong type"),
         }
 
-        let huge_key = TValue::Str(state.intern_str("huge"));
+        let huge_key = state.intern_str("huge");
         match math_table.get(&huge_key) {
             Some(TValue::Float(f)) => assert!(f.is_infinite() && f > 0.0),
             _ => panic!("math.huge not found or wrong type"),
         }
 
-        let maxint_key = TValue::Str(state.intern_str("maxinteger"));
+        let maxint_key = state.intern_str("maxinteger");
         match math_table.get(&maxint_key) {
             Some(TValue::Integer(n)) => assert_eq!(n, i64::MAX),
             _ => panic!("math.maxinteger not found or wrong type"),
         }
 
-        let minint_key = TValue::Str(state.intern_str("mininteger"));
+        let minint_key = state.intern_str("mininteger");
         match math_table.get(&minint_key) {
             Some(TValue::Integer(n)) => assert_eq!(n, i64::MIN),
             _ => panic!("math.mininteger not found or wrong type"),

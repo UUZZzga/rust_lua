@@ -1,10 +1,12 @@
 #[cfg(feature = "cmp_c")]
 use crate::lua_ffi;
+use crate::objects::{LocVar, UpvalDesc};
 use crate::opcodes::{
     self, get_opcode, get_opmode, getarg, getarg_a, getarg_b, getarg_bx, getarg_c, getarg_sbx,
     getarg_sj, getarg_vb, getarg_vc, testarg_k, OFFSET_sJ, OpCode, OpMode, OPNAMES, POS_A, POS_B,
     POS_C, POS_K, POS_VB, POS_VC, SIZE_A, SIZE_BX, TM_EVENT_NAMES,
 };
+use crate::strings::{lua_string_as_str, lua_string_with_nul, LongString};
 #[cfg(test)]
 use imara_diff::{Algorithm, Diff, InternedInput};
 #[cfg(feature = "cmp_c")]
@@ -12,6 +14,7 @@ use std::ffi::{c_int, c_void};
 #[cfg(feature = "cmp_c")]
 use std::ptr;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, AtomicU8};
 
 #[cfg_attr(not(size_optimized), derive(Debug))]
 #[derive(Clone)]
@@ -399,7 +402,7 @@ pub fn parse_dump(data: &[u8]) -> Result<DumpedFunction, String> {
         reader.check()?;
         unreachable!("signature size mismatch");
     };
-    if sig != crate::config::SIGNATURE.as_bytes() {
+    if sig != *crate::config::SIGNATURE {
         return Err("not a binary chunk".to_string());
     }
 
@@ -1382,16 +1385,17 @@ impl BytecodeWriter {
                     self.dump_byte(LUA_VNUMFLT);
                     self.dump_number(*fl);
                 }
-                TValue::Str(s) => {
+                s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                     match s {
-                        crate::strings::LuaString::Short(_) => {
+                        TValue::ShortStr(_) => {
                             self.dump_byte(LUA_VSHRSTR);
                         }
-                        crate::strings::LuaString::Long(_) => {
+                        TValue::LongStr(_) => {
                             self.dump_byte(LUA_VLNGSTR);
                         }
+                        _ => unreachable!(),
                     }
-                    self.dump_string(Some(s.as_str()));
+                    self.dump_string(Some(lua_string_as_str(s)));
                 }
                 _ => {
                     self.dump_byte(LUA_VNIL);
@@ -1442,7 +1446,7 @@ impl BytecodeWriter {
         self.dump_int(n as i32);
         if !self.strip {
             for lv in &f.loc_vars {
-                self.dump_string(lv.varname.as_ref().map(|s| s.as_str()));
+                self.dump_string(lv.varname.as_ref().map(|s| lua_string_as_str(s)));
                 self.dump_int(lv.start_pc);
                 self.dump_int(lv.end_pc);
             }
@@ -1453,7 +1457,7 @@ impl BytecodeWriter {
         self.dump_int(n as i32);
         if !self.strip {
             for uv in &f.upvalues[..] {
-                self.dump_string(uv.name.as_ref().map(|s| s.as_str()));
+                self.dump_string(uv.name.as_ref().map(|s| lua_string_as_str(s)));
             }
         }
     }
@@ -1472,7 +1476,7 @@ impl BytecodeWriter {
         if self.strip {
             self.dump_string(None);
         } else {
-            self.dump_string(f.source.as_ref().map(|s| s.as_str()));
+            self.dump_string(f.source.as_ref().map(|s| lua_string_as_str(s)));
         }
         self.dump_debug(f);
     }
@@ -1493,17 +1497,13 @@ pub fn dump_proto(f: &Proto, strip: bool) -> Vec<u8> {
 // DumpedFunction → Proto 转换 (用于 load 加载二进制格式)
 // ============================================================================
 
-use crate::objects::{LocVar, UpvalDesc};
-use crate::strings::{ArcRc, LongString, LuaString};
-use std::sync::atomic::{AtomicU64, AtomicU8};
-
 /// 创建长字符串的辅助函数
 /// 使用 with_nul 添加额外 NUL 终止符，与 as_str_inner 的 NUL 剥离机制配合
-fn make_long_string(s: &str) -> LuaString {
-    LuaString::Long(ArcRc::new(LongString {
-        contents: LuaString::with_nul(s),
-        hash: AtomicU64::new(0),
-        extra: AtomicU8::new(0),
+fn make_long_string<'a>(s: &str) -> TValue<'a> {
+    TValue::LongStr(Rc::new(LongString {
+        contents: lua_string_with_nul(s),
+        hash: 0.into(),
+        extra: 0.into(),
         ptr_id: crate::gc::new_ptr_id(),
     }))
 }
@@ -1530,7 +1530,7 @@ pub fn dumped_to_proto<'a>(df: &DumpedFunction) -> Proto<'a> {
                 DumpConstant::Boolean(b) => TValue::Boolean(*b),
                 DumpConstant::Integer(i) => TValue::Integer(*i),
                 DumpConstant::Float(f) => TValue::Float(*f),
-                DumpConstant::String(s) => TValue::Str(make_long_string(s)),
+                DumpConstant::String(s) => make_long_string(s),
             })
             .collect(),
     );

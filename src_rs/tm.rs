@@ -21,7 +21,7 @@ use crate::debug::{concaterror, opinterror, ordererror, tointerror};
 use crate::execute::VmError;
 use crate::objects::{Instruction, LuaType, NilKind, TValue, Table, UpValVec};
 use crate::state::LuaState;
-use crate::strings::{LuaString, StringTable};
+use crate::strings::{lua_string_as_str, lua_string_len, StringTable};
 
 // ============================================================================
 // get_mmbin_tm — 从 MM 系列指令中提取元方法事件索引
@@ -203,7 +203,7 @@ impl<'a> Metatable<'a> {
         }
     }
 
-    pub fn get_tm(&mut self, tmnames: &[LuaString; TM_N], tm: TagMethod) -> Option<TValue<'a>> {
+    pub fn get_tm(&mut self, tmnames: &[TValue<'a>; TM_N], tm: TagMethod) -> Option<TValue<'a>> {
         if let Some(flag) = MetatableFlags::from_tag_method(tm) {
             if self.flags.contains(flag) {
                 return None;
@@ -293,7 +293,11 @@ pub fn type_name(ty: LuaType) -> &'static str {
     }
 }
 
-pub fn obj_type_name<'a>(obj: &TValue<'a>) -> String {
+pub fn obj_type_name<'a>(state: &LuaState<'a>, obj: &TValue<'a>) -> String {
+    obj_type_name_(&state.string_table, obj)
+}
+
+pub fn obj_type_name_<'a>(table: &StringTable, obj: &TValue<'a>) -> String {
     // 获取元表（Table 通过 get_metatable() 共享 Rc；UserData 直接克隆）
     let meta: Option<Table> = match obj {
         TValue::Table(t) => t.get_metatable(),
@@ -302,10 +306,10 @@ pub fn obj_type_name<'a>(obj: &TValue<'a>) -> String {
     };
     if let Some(mt) = meta {
         // __name 查找: 错误消息路径, 非热路径, 用一次性 key 即可 (不走 intern)
-        let name_key = TValue::Str(crate::strings::new_short_str("__name"));
+        let name_key = table.intern_value("__name");
         if let Some(name_val) = mt.get(&name_key) {
-            if let TValue::Str(s) = &name_val {
-                return s.as_str().to_string();
+            if let s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = &name_val {
+                return lua_string_as_str(s).to_string();
             }
         }
     }
@@ -317,12 +321,12 @@ pub fn get_tm_by_obj<'a>(
     obj: &TValue<'a>,
     tm: TagMethod,
     default_mts: &DefaultMetatables<'a>,
-    tmnames: &[LuaString; TM_N],
+    tmnames: &[TValue<'a>; TM_N],
 ) -> Option<TValue<'a>> {
     // perf: 零临时 clone — 元表槽借 Table (不再 clone 整个 Table, Rc inc),
     // 元方法名 LuaString 直查 (免构造 TValue 键的 Str clone),
     // Ref::filter_map 安全新式借用 (无 unsafe), 命中后仅 clone 一次值。
-    let key: &LuaString = &tmnames[tm as usize];
+    let key = &tmnames[tm as usize];
     match obj {
         TValue::Table(t) => {
             // 元表槽: 外层 Table 的 data.metatable 借用 (无 Table clone)
@@ -534,8 +538,8 @@ pub(crate) fn call_tm_res<'a>(
         state.exec.top = state.exec.stack.len();
         let mm_name = tm.event_name();
         return Err(match &result {
-            TValue::Str(s) => {
-                let msg = s.as_str().to_string();
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                let msg = lua_string_as_str(s).to_string();
                 // 仅对 "attempt to call" 错误附加元方法名（对应 C 的 luaG_callerror）
                 if msg.starts_with("attempt to call") && !msg.contains("metamethod") {
                     VmError::RuntimeError(format!("{} (metamethod '{}')", msg, mm_name))
@@ -683,7 +687,9 @@ pub(crate) fn call_tm<'a>(
         state.exec.stack.truncate(func_idx);
         state.exec.top = state.exec.stack.len();
         return Err(match &result {
-            TValue::Str(s) => VmError::RuntimeError(s.as_str().to_string()),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                VmError::RuntimeError(lua_string_as_str(s).to_string())
+            }
             _ => VmError::RuntimeErrorValue(result.clone()),
         });
     }
@@ -860,14 +866,18 @@ pub fn call_close_method<'a>(
         // __close 帧。
         state.last_close_frame = close_frame;
         // 非字符串错误用 RuntimeErrorValue 保留原始类型（如数字 200）
-        return Err(if matches!(err_val, TValue::Str(_)) {
-            VmError::RuntimeError(match &err_val {
-                TValue::Str(s) => s.as_str().to_string(),
-                _ => String::new(),
-            })
-        } else {
-            VmError::RuntimeErrorValue(err_val)
-        });
+        return Err(
+            if matches!(err_val, TValue::LongStr(_) | TValue::ShortStr(_)) {
+                VmError::RuntimeError(match &err_val {
+                    s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                        lua_string_as_str(s).to_string()
+                    }
+                    _ => String::new(),
+                })
+            } else {
+                VmError::RuntimeErrorValue(err_val)
+            },
+        );
     }
     // 截断栈，移除临时压入的函数/参数
     state.exec.stack.truncate(func_idx);
@@ -921,8 +931,8 @@ fn callbin_tm<'a>(
                 // p2 没有元方法或也是字符串，报错
                 // 对应 C: luaL_error("attempt to %s a '%s' with a '%s'", ...)
                 let opname = tm.event_name();
-                let t1 = obj_type_name(p1);
-                let t2 = obj_type_name(p2);
+                let t1 = obj_type_name(state, p1);
+                let t2 = obj_type_name(state, p2);
                 return Err(VmError::RuntimeError(format!(
                     "attempt to {} a '{}' with a '{}'",
                     opname, t1, t2
@@ -1070,10 +1080,17 @@ pub fn try_bin_tm<'a>(
                 if p1.is_number() && p2.is_number() {
                     tointerror(p1, p2, &p1_info, &p2_info)
                 } else {
-                    opinterror(p1, p2, "perform bitwise operation on", &p1_info, &p2_info)
+                    opinterror(
+                        state,
+                        p1,
+                        p2,
+                        "perform bitwise operation on",
+                        &p1_info,
+                        &p2_info,
+                    )
                 }
             }
-            _ => opinterror(p1, p2, "perform arithmetic on", &p1_info, &p2_info),
+            _ => opinterror(state, p1, p2, "perform arithmetic on", &p1_info, &p2_info),
         });
     }
     Ok(())
@@ -1151,7 +1168,7 @@ pub fn try_concat_tm<'a>(
     res: usize,
 ) -> Result<(), VmError<'a>> {
     if !callbin_tm(state, p1, p2, res, TagMethod::Concat)? {
-        return Err(concaterror(p1, p2));
+        return Err(concaterror(state, p1, p2));
     }
     Ok(())
 }
@@ -1189,7 +1206,7 @@ pub fn call_order_tm<'a>(
     } else {
         state.exec.stack.truncate(res);
         state.exec.top = state.exec.stack.len();
-        Err(ordererror(p1, p2))
+        Err(ordererror(state, p1, p2))
     }
 }
 
@@ -1355,9 +1372,9 @@ pub fn obj_len<'a>(
                 return Ok(());
             }
         }
-        TValue::Str(s) => {
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
             // 字符串: 返回长度
-            let len = s.len();
+            let len = lua_string_len(s);
             while state.exec.stack.len() <= ra {
                 state.exec.stack.push(TValue::Nil(NilKind::Strict));
             }
@@ -1378,7 +1395,7 @@ pub fn obj_len<'a>(
         }
         None => Err(VmError::RuntimeError(format!(
             "attempt to get length of a {} value{}",
-            obj_type_name(rb),
+            obj_type_name(state, rb),
             varinfo
         ))),
     }
@@ -1428,10 +1445,7 @@ impl<'a> VarargTable<'a> {
         for (i, v) in args.iter().enumerate() {
             t.set_int(i as i64 + 1, v.clone());
         }
-        t.set(
-            TValue::Str(table.intern("n")),
-            TValue::Integer(count as i64),
-        );
+        t.set(table.intern_value("n"), TValue::Integer(count as i64));
         VarargTable::Table { table: t, count }
     }
 
@@ -1461,7 +1475,9 @@ impl<'a> VarargTable<'a> {
     pub fn get_vararg(&self, key: &TValue) -> Option<TValue<'a>> {
         match key {
             TValue::Integer(i) => self.get(*i as usize),
-            TValue::Str(s) if s.as_str() == "n" => Some(TValue::Integer(self.count() as i64)),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) if lua_string_as_str(s) == "n" => {
+                Some(TValue::Integer(self.count() as i64))
+            }
             _ => None,
         }
     }
@@ -1500,17 +1516,17 @@ impl<'a> VarargTable<'a> {
 /// 初始化元方法名数组 — 对应 C 的 `luaT_init` 中 `G(L)->tmname[i] = luaS_new(L, eventname[i])`。
 /// 在 `LuaState::new` 时调用一次，后续 `make_tm_tvalue` 直接 `clone()` 复用，
 /// 保证同一元方法名始终返回同一 `ArcRc<ShortString>`（ptr_eq 快速路径）。
-pub fn init_tmnames(table: &StringTable) -> Box<[LuaString; TM_N]> {
-    let arr: [LuaString; TM_N] = std::array::from_fn(|i| {
+pub fn init_tmnames<'a>(table: &StringTable) -> Box<[TValue<'a>; TM_N]> {
+    let arr: [TValue<'a>; TM_N] = std::array::from_fn(|i| {
         let tm = TagMethod::from_u8(i as u8).expect("TM_N 与 TagMethod 变体数一致");
-        table.intern(tm.name())
+        table.intern_value(tm.name())
     });
     Box::new(arr)
 }
 
 /// 从预 intern 的元方法名数组创建 TValue — O(1) clone，对应 C 的 `G(L)->tmname[event]`。
-pub fn make_tm_tvalue<'a>(tmnames: &[LuaString; TM_N], tm: TagMethod) -> TValue<'a> {
-    TValue::Str(tmnames[tm as usize].clone())
+pub fn make_tm_tvalue<'a>(tmnames: &[TValue<'a>; TM_N], tm: TagMethod) -> TValue<'a> {
+    tmnames[tm as usize].clone()
 }
 
 // ============================================================================
@@ -1523,7 +1539,7 @@ mod tests {
     use crate::strings::StringTable;
 
     /// 测试辅助: 创建 StringTable + tmnames
-    fn make_table_and_tmnames() -> (StringTable, Box<[LuaString; TM_N]>) {
+    fn make_table_and_tmnames<'a>() -> (StringTable, Box<[TValue<'a>; TM_N]>) {
         let table = StringTable::new();
         let tmnames = init_tmnames(&table);
         (table, tmnames)
@@ -1625,12 +1641,14 @@ mod tests {
 
     #[test]
     fn test_obj_type_name_plain_table() {
-        assert_eq!(obj_type_name(&TValue::Table(Table::new())), "table");
+        let state = LuaState::default();
+        assert_eq!(obj_type_name(&state, &TValue::Table(Table::new())), "table");
     }
 
     #[test]
     fn test_obj_type_name_integer() {
-        assert_eq!(obj_type_name(&TValue::Integer(42)), "number");
+        let state = LuaState::default();
+        assert_eq!(obj_type_name(&state, &TValue::Integer(42)), "number");
     }
 
     // ========================================================================
@@ -1840,8 +1858,8 @@ mod tests {
         super::make_tm_tvalue(&tmnames, tm)
     }
 
-    fn _make_ls(s: &str) -> LuaString {
+    fn _make_ls<'a>(s: &str) -> TValue<'a> {
         let tb = StringTable::new();
-        tb.intern(s)
+        tb.intern_value(s)
     }
 }

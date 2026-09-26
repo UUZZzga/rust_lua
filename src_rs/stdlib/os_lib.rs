@@ -12,6 +12,7 @@
 use crate::execute::VmError;
 use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
+use crate::strings::lua_string_as_str;
 use crate::table::Table;
 use std::ffi::{CStr, CString};
 
@@ -142,8 +143,8 @@ fn call_setlocale<'a>(
         TValue::Nil(NilKind::Strict)
     };
     let locale_cstr = match &locale_val {
-        TValue::Str(s) => {
-            let bytes = s.as_str().as_bytes();
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+            let bytes = lua_string_as_str(s).as_bytes();
             // 确保字符串不包含内部 \0
             if bytes.contains(&0) {
                 return Err(VmError::RuntimeError(
@@ -167,7 +168,7 @@ fn call_setlocale<'a>(
         TValue::Nil(NilKind::Strict)
     };
     let cat = match &category_val {
-        TValue::Str(s) => match s.as_str() {
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => match lua_string_as_str(s) {
             "all" => libc::LC_ALL,
             "collate" => libc::LC_COLLATE,
             "ctype" => libc::LC_CTYPE,
@@ -205,12 +206,7 @@ fn call_setlocale<'a>(
             .to_str()
             .unwrap_or("")
             .to_string();
-        push_single_result(
-            state,
-            a,
-            nresults,
-            TValue::Str(state.intern_str(&result_str)),
-        );
+        push_single_result(state, a, nresults, state.intern_str(&result_str));
     }
     Ok(())
 }
@@ -271,7 +267,7 @@ fn call_tmpname<'a>(
         }
         let cstr = unsafe { CStr::from_ptr(ptr) };
         let s = cstr.to_str().unwrap_or("").to_string();
-        push_single_result(state, a, nresults, TValue::Str(state.intern_str(&s)));
+        push_single_result(state, a, nresults, (state.intern_str(&s)));
         Ok(())
     }
     #[cfg(target_os = "windows")]
@@ -287,7 +283,7 @@ fn call_tmpname<'a>(
         }
         let cstr = unsafe { CStr::from_ptr(ptr) };
         let s = cstr.to_str().unwrap_or("").to_string();
-        push_single_result(state, a, nresults, TValue::Str(state.intern_str(&s)));
+        push_single_result(state, a, nresults, state.intern_str(&s));
         Ok(())
     }
 }
@@ -312,8 +308,8 @@ fn call_remove<'a>(
         TValue::Nil(NilKind::Strict)
     };
     let filename_cstr = match &filename_val {
-        TValue::Str(s) => {
-            let bytes = s.as_str().as_bytes();
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+            let bytes = lua_string_as_str(s).as_bytes();
             if bytes.contains(&0) {
                 return Err(VmError::RuntimeError(
                     "bad argument #1 to 'remove' (string contains embedded zeros)".to_string(),
@@ -355,7 +351,7 @@ fn call_remove<'a>(
             nresults,
             vec![
                 TValue::Nil(NilKind::Strict),
-                TValue::Str(state.intern_str(&msg)),
+                (state.intern_str(&msg)),
                 TValue::Integer(errno as i64),
             ],
         );
@@ -389,8 +385,8 @@ fn call_getenv<'a>(
         TValue::Nil(NilKind::Strict)
     };
     let name_cstr = match &name_val {
-        TValue::Str(s) => {
-            let bytes = s.as_str().as_bytes();
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+            let bytes = lua_string_as_str(s).as_bytes();
             if bytes.contains(&0) {
                 return Err(VmError::RuntimeError(
                     "bad argument #1 to 'getenv' (string contains embedded zeros)".to_string(),
@@ -413,12 +409,7 @@ fn call_getenv<'a>(
             .to_str()
             .unwrap_or("")
             .to_string();
-        push_single_result(
-            state,
-            a,
-            nresults,
-            TValue::Str(state.intern_str(&result_str)),
-        );
+        push_single_result(state, a, nresults, state.intern_str(&result_str));
     }
     Ok(())
 }
@@ -443,8 +434,8 @@ fn call_rename<'a>(
         TValue::Nil(NilKind::Strict)
     };
     let oldname_cstr = match &oldname_val {
-        TValue::Str(s) => {
-            let bytes = s.as_str().as_bytes();
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+            let bytes = lua_string_as_str(s).as_bytes();
             if bytes.contains(&0) {
                 return Err(VmError::RuntimeError(
                     "bad argument #1 to 'rename' (string contains embedded zeros)".to_string(),
@@ -465,8 +456,8 @@ fn call_rename<'a>(
         TValue::Nil(NilKind::Strict)
     };
     let newname_cstr = match &newname_val {
-        TValue::Str(s) => {
-            let bytes = s.as_str().as_bytes();
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+            let bytes = lua_string_as_str(s).as_bytes();
             if bytes.contains(&0) {
                 return Err(VmError::RuntimeError(
                     "bad argument #2 to 'rename' (string contains embedded zeros)".to_string(),
@@ -517,7 +508,7 @@ fn call_rename<'a>(
             nresults,
             vec![
                 TValue::Nil(NilKind::Strict),
-                TValue::Str(state.intern_str(&msg)),
+                (state.intern_str(&msg)),
                 TValue::Integer(errno as i64),
             ],
         );
@@ -546,12 +537,12 @@ fn call_os_execute<'a>(
         TValue::Nil(NilKind::Strict)
     };
     let cmd = match &cmd_val {
-        TValue::Str(s) => Some(s.as_str().to_string()),
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => Some(lua_string_as_str(s).to_string()),
         TValue::Nil(_) => None,
         _ => {
             return Err(VmError::RuntimeError(format!(
                 "bad argument #1 to 'execute' (string expected, got {})",
-                crate::tm::obj_type_name(&cmd_val)
+                crate::tm::obj_type_name(state, &cmd_val)
             )));
         }
     };
@@ -604,7 +595,7 @@ fn call_os_exit<'a>(
             _ => {
                 return Err(VmError::RuntimeError(format!(
                     "bad argument #1 to 'exit' (number or boolean expected, got {})",
-                    crate::tm::obj_type_name(&v)
+                    crate::tm::obj_type_name(state, &v)
                 )));
             }
         }
@@ -647,7 +638,7 @@ fn get_field<'a>(
     d: i32,
     delta: i32,
 ) -> Result<i32, VmError<'a>> {
-    let k = TValue::Str(state.intern_str(key));
+    let k = state.intern_str(key);
     match table.get(&k) {
         Some(TValue::Nil(_)) | None => {
             // 字段不存在或为 nil: 用默认值
@@ -691,17 +682,23 @@ fn get_field<'a>(
 }
 
 /// 设置表整数字段 — 对应 C 的 setfield
-fn set_field(table: &crate::table::Table, state: &LuaState, key: &str, value: i32, delta: i32) {
-    let k = TValue::Str(state.intern_str(key));
+fn set_field<'a>(
+    table: &crate::table::Table<'a>,
+    state: &LuaState<'a>,
+    key: &str,
+    value: i32,
+    delta: i32,
+) {
+    let k = state.intern_str(key);
     table.set(k, TValue::Integer((value as i64) + delta as i64));
 }
 
 /// 设置表布尔字段 — 对应 C 的 setboolfield (value < 0 时不设置)
-fn set_boolfield(table: &crate::table::Table, state: &LuaState, key: &str, value: i32) {
+fn set_boolfield<'a>(table: &crate::table::Table<'a>, state: &LuaState<'a>, key: &str, value: i32) {
     if value < 0 {
         return;
     }
-    let k = TValue::Str(state.intern_str(key));
+    let k = state.intern_str(key);
     table.set(k, TValue::Boolean(value != 0));
 }
 
@@ -721,12 +718,14 @@ fn call_os_date<'a>(
     let fmt: Vec<u8> = if nargs >= 1 {
         let v = get_arg(state, a, 0);
         match &v {
-            TValue::Str(s) => s.as_str().as_bytes().to_vec(),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                lua_string_as_str(s).as_bytes().to_vec()
+            }
             TValue::Nil(_) => b"%c".to_vec(),
             _ => {
                 return Err(VmError::RuntimeError(format!(
                     "bad argument #1 to 'date' (string expected, got {})",
-                    crate::tm::obj_type_name(&v)
+                    crate::tm::obj_type_name(state, &v)
                 )));
             }
         }
@@ -744,7 +743,7 @@ fn call_os_date<'a>(
                 None => {
                     return Err(VmError::RuntimeError(format!(
                         "bad argument #2 to 'date' (number has no integer representation, got {})",
-                        crate::tm::obj_type_name(&v)
+                        crate::tm::obj_type_name(state, &v)
                     )));
                 }
             },
@@ -856,8 +855,8 @@ fn call_os_date<'a>(
     }
 
     // 返回结果 (可能包含 \0, 用 new_long_bytes 保留原始字节)
-    let result_str = crate::strings::new_long_bytes(result);
-    state.adjust_results(a, nresults, vec![TValue::Str(result_str)]);
+    let result_str = crate::strings::new_lstr_bytes(&state.string_table, &result);
+    state.adjust_results(a, nresults, vec![(result_str)]);
     Ok(())
 }
 
@@ -889,7 +888,7 @@ fn call_os_time<'a>(
             _ => {
                 return Err(VmError::RuntimeError(format!(
                     "bad argument #1 to 'time' (table expected, got {})",
-                    crate::tm::obj_type_name(&v)
+                    crate::tm::obj_type_name(state, &v)
                 )));
             }
         };
@@ -901,7 +900,7 @@ fn call_os_time<'a>(
         ts.tm_min = get_field(&table, state, "min", 0, 0)?;
         ts.tm_sec = get_field(&table, state, "sec", 0, 0)?;
         // isdst: -1 表示未知 (让 mktime 自动判断)
-        let isdst_key = TValue::Str(state.intern_str("isdst"));
+        let isdst_key = state.intern_str("isdst");
         ts.tm_isdst = match table.get(&isdst_key) {
             Some(TValue::Boolean(b)) => {
                 if b {
@@ -954,7 +953,7 @@ fn call_os_difftime<'a>(
         None => {
             return Err(VmError::RuntimeError(format!(
                 "bad argument #1 to 'difftime' (number has no integer representation, got {})",
-                crate::tm::obj_type_name(&v1)
+                crate::tm::obj_type_name(state, &v1)
             )))
         }
     };
@@ -964,7 +963,7 @@ fn call_os_difftime<'a>(
         None => {
             return Err(VmError::RuntimeError(format!(
                 "bad argument #2 to 'difftime' (number has no integer representation, got {})",
-                crate::tm::obj_type_name(&v2)
+                crate::tm::obj_type_name(state, &v2)
             )))
         }
     };
@@ -1002,6 +1001,6 @@ pub fn open_os_lib<'a>(state: &mut LuaState<'a>) {
     register(&mut lib, c"time", call_os_time);
     register(&mut lib, c"difftime", call_os_difftime);
 
-    let key = TValue::Str(state.intern_str("os"));
+    let key = state.intern_str("os");
     state.globals.set(key, TValue::Table(lib));
 }

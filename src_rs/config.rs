@@ -28,6 +28,8 @@ pub const COPYRIGHT: &str = concatcp!(
 );
 pub const AUTHORS: &str = "R. Ierusalimschy, L. H. de Figueiredo, W. Celes";
 
+pub const LUA_VERSUFFIX: &str = concatcp!("_", VERSION_MAJOR_STR, "_", VERSION_MINOR_STR);
+
 // ============================================================================
 // 数值类型 — Lua 的核心数字类型
 // ============================================================================
@@ -190,10 +192,11 @@ pub const CPATH_DEFAULT: &str =
 // 其他常量
 // ============================================================================
 
-pub const SIGNATURE: &str = "\x1bLua";
+pub const SIGNATURE: &[u8; 4] = b"\x1bLua";
 pub const EXTRASPACE: usize = std::mem::size_of::<*const u8>();
 pub const ID_SIZE: usize = 60;
 pub const N2S_BUFF_SIZE: usize = 64;
+pub const FILEHANDLE: &str = "FILE*";
 
 // ============================================================================
 // 辅助函数

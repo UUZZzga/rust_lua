@@ -1242,7 +1242,7 @@ fn test_rust_api_open_math_lib() {
     math_lib::open_math_lib(&mut state);
 
     // 验证 math 全局表已注册
-    let key = TValue::Str(state.intern_str("math"));
+    let key = state.intern_str("math");
     assert!(state.globals.get(&key).is_some());
 
     // 验证随机状态已初始化

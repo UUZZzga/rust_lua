@@ -23,7 +23,7 @@
 use crate::execute::VmError;
 use crate::objects::{BuiltinFn, LClosure, NilKind, Proto, TValue, UpVal, UpValRef, PF_VAHID};
 use crate::state::LuaState;
-use crate::strings::LuaString;
+use crate::strings::lua_string_as_str;
 use crate::table::Table;
 use crate::tm::Metatable;
 #[cfg(test)]
@@ -77,13 +77,13 @@ fn push_single_result<'a>(state: &mut LuaState<'a>, a: usize, nresults: i32, res
 /// RETS = "..." (lobject.cpp)
 /// PRE = "[string \"" (lobject.cpp)
 /// POS = "\"]" (lobject.cpp)
-fn short_src(source: &LuaString) -> String {
+fn short_src(source: &TValue) -> String {
     const LUA_IDSIZE: usize = 60;
     const RETS: &str = "...";
     const PRE: &str = "[string \"";
     const POS: &str = "\"]";
 
-    let bytes = source.as_str().as_bytes();
+    let bytes = lua_string_as_str(source).as_bytes();
     match bytes.first() {
         Some(&b'=') => {
             // 'literal' source: strip '=' prefix
@@ -172,7 +172,7 @@ fn get_local_name(proto: &Proto, local_number: usize, pc: usize) -> Option<Strin
             n -= 1;
             if n == 0 {
                 if let Some(ref name) = loc_var.varname {
-                    return Some(name.as_str().to_string());
+                    return Some(lua_string_as_str(name).to_string());
                 }
                 return None;
             }
@@ -403,7 +403,7 @@ fn call_setmetatable<'a>(
                 let has_mode = {
                     let data = t.data.borrow();
                     if let Some(ref mt) = data.metatable {
-                        let mode_key = TValue::Str(state.intern_str("__mode"));
+                        let mode_key = state.intern_str("__mode");
                         mt.get(&mode_key).is_some()
                     } else {
                         false
@@ -514,7 +514,7 @@ fn call_setuservalue<'a>(
             // LightUserData 有特殊消息 "light userdata"
             let typearg = match &arg1 {
                 TValue::LightUserData(_) => "light userdata".to_string(),
-                _ => crate::tm::obj_type_name(&arg1),
+                _ => crate::tm::obj_type_name(state, &arg1),
             };
             return Err(VmError::RuntimeError(format!(
                 "bad argument #1 to 'setuservalue' (userdata expected, got {})",
@@ -548,7 +548,7 @@ fn call_getinfo<'a>(
     let level_or_func = get_arg(state, a, arg_offset);
     let what = if nargs > arg_offset + 1 {
         match &get_arg(state, a, arg_offset + 1) {
-            TValue::Str(s) => s.as_str().to_string(),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => lua_string_as_str(s).to_string(),
             _ => "flnSrtu".to_string(),
         }
     } else {
@@ -611,7 +611,7 @@ fn call_getinfo<'a>(
         // (字符串、模式、userdata 状态)，Rust 版本用带 __call 的表模拟
         let is_gmatch_iter = t
             .get_metatable()
-            .and_then(|mt| mt.get(&TValue::Str(state.intern_str("__call"))))
+            .and_then(|mt| mt.get(&(state.intern_str("__call"))))
             .map(|v| {
                 if let TValue::BuiltinFn(bf) = &v {
                     std::ptr::eq(
@@ -676,84 +676,66 @@ fn call_getinfo<'a>(
     let result_table = Table::new();
 
     if what.contains('S') {
+        result_table.set(state.intern_str("source"), state.intern_str(&info.source));
         result_table.set(
-            TValue::Str(state.intern_str("source")),
-            TValue::Str(state.intern_str(&info.source)),
+            state.intern_str("short_src"),
+            state.intern_str(&info.short_src),
         );
         result_table.set(
-            TValue::Str(state.intern_str("short_src")),
-            TValue::Str(state.intern_str(&info.short_src)),
-        );
-        result_table.set(
-            TValue::Str(state.intern_str("linedefined")),
+            state.intern_str("linedefined"),
             TValue::Integer(info.linedefined as i64),
         );
         result_table.set(
-            TValue::Str(state.intern_str("lastlinedefined")),
+            state.intern_str("lastlinedefined"),
             TValue::Integer(info.lastlinedefined as i64),
         );
-        result_table.set(
-            TValue::Str(state.intern_str("what")),
-            TValue::Str(state.intern_str(&info.what)),
-        );
+        result_table.set(state.intern_str("what"), state.intern_str(&info.what));
     }
     if what.contains('l') {
         result_table.set(
-            TValue::Str(state.intern_str("currentline")),
+            state.intern_str("currentline"),
             TValue::Integer(info.currentline as i64),
         );
     }
     if what.contains('u') {
+        result_table.set(state.intern_str("nups"), TValue::Integer(info.nups as i64));
         result_table.set(
-            TValue::Str(state.intern_str("nups")),
-            TValue::Integer(info.nups as i64),
-        );
-        result_table.set(
-            TValue::Str(state.intern_str("nparams")),
+            state.intern_str("nparams"),
             TValue::Integer(info.nparams as i64),
         );
-        result_table.set(
-            TValue::Str(state.intern_str("isvararg")),
-            TValue::Boolean(info.isvararg),
-        );
+        result_table.set(state.intern_str("isvararg"), TValue::Boolean(info.isvararg));
     }
     if what.contains('n') {
         match &info.name {
             Some(name) => {
-                result_table.set(
-                    TValue::Str(state.intern_str("name")),
-                    TValue::Str(state.intern_str(name)),
-                );
+                result_table.set(state.intern_str("name"), state.intern_str(name));
             }
             None => {
-                result_table.set(
-                    TValue::Str(state.intern_str("name")),
-                    TValue::Nil(NilKind::Strict),
-                );
+                result_table.set(state.intern_str("name"), TValue::Nil(NilKind::Strict));
             }
         }
         result_table.set(
-            TValue::Str(state.intern_str("namewhat")),
-            TValue::Str(state.intern_str(&info.namewhat)),
+            state.intern_str("namewhat"),
+            state.intern_str(&info.namewhat),
         );
     }
     if what.contains('r') {
         result_table.set(
-            TValue::Str(state.intern_str("ftransfer")),
+            state.intern_str("ftransfer"),
             TValue::Integer(info.ftransfer as i64),
         );
         result_table.set(
-            TValue::Str(state.intern_str("ntransfer")),
+            state.intern_str("ntransfer"),
             TValue::Integer(info.ntransfer as i64),
         );
     }
     if what.contains('t') {
         result_table.set(
-            TValue::Str(state.intern_str("istailcall")),
+            state.intern_str("istailcall"),
             TValue::Boolean(info.istailcall),
         );
         result_table.set(
-            TValue::Str(state.intern_str("extraargs")),
+            state.intern_str("extraargs"),
             TValue::Integer(info.extraargs as i64),
         );
     }
@@ -763,14 +745,11 @@ fn call_getinfo<'a>(
         if let Some(ref closure) = info.closure {
             let mut actlines = Table::new();
             fill_active_lines(&mut actlines, &closure.proto);
-            result_table.set(
-                TValue::Str(state.intern_str("activelines")),
-                TValue::Table(actlines),
-            );
+            result_table.set(state.intern_str("activelines"), TValue::Table(actlines));
         } else {
             // C 函数: activelines = nil
             result_table.set(
-                TValue::Str(state.intern_str("activelines")),
+                state.intern_str("activelines"),
                 TValue::Nil(NilKind::Strict),
             );
         }
@@ -779,19 +758,16 @@ fn call_getinfo<'a>(
         // level 模式下使用 info.func (由 fill_info_from_level 设置)
         // 函数参数模式下从栈上获取原始函数值 (保持引用语义)
         if let Some(func_val) = info.func.take() {
-            result_table.set(TValue::Str(state.intern_str("func")), func_val);
+            result_table.set(state.intern_str("func"), func_val);
         } else {
             // 函数参数模式: 从栈上获取原始函数值
             // 对应 C 的 lua_pushvalue(L, arg + 1)
             let func_idx = a + 1 + arg_offset;
             if func_idx < state.exec.stack.len() {
                 let func_val = state.exec.stack[func_idx].clone();
-                result_table.set(TValue::Str(state.intern_str("func")), func_val);
+                result_table.set(state.intern_str("func"), func_val);
             } else {
-                result_table.set(
-                    TValue::Str(state.intern_str("func")),
-                    TValue::Nil(NilKind::Strict),
-                );
+                result_table.set(state.intern_str("func"), TValue::Nil(NilKind::Strict));
             }
         }
     }
@@ -833,7 +809,7 @@ fn fill_info_from_closure<'a>(info: &mut DebugInfo<'a>, closure: &LClosure<'a>, 
         info.source = proto
             .source
             .as_ref()
-            .map(|s| s.as_str().to_string())
+            .map(|s| lua_string_as_str(s).to_string())
             .unwrap_or_else(|| "=?".to_string());
         info.short_src = proto
             .source
@@ -936,7 +912,7 @@ fn fill_info_from_level<'a>(
                 info.source = proto
                     .source
                     .as_ref()
-                    .map(|s| s.as_str().to_string())
+                    .map(|s| lua_string_as_str(s).to_string())
                     .unwrap_or_else(|| "=?".to_string());
                 info.short_src = proto
                     .source
@@ -1108,7 +1084,7 @@ fn fill_info_from_level<'a>(
             info.source = proto
                 .source
                 .as_ref()
-                .map(|s| s.as_str().to_string())
+                .map(|s| lua_string_as_str(s).to_string())
                 .unwrap_or_else(|| "=?".to_string());
             info.short_src = proto
                 .source
@@ -1276,7 +1252,7 @@ fn fill_info_from_thread<'a>(
                 info.source = proto
                     .source
                     .as_ref()
-                    .map(|s| s.as_str().to_string())
+                    .map(|s| lua_string_as_str(s).to_string())
                     .unwrap_or_else(|| "=?".to_string());
                 info.short_src = proto
                     .source
@@ -1386,7 +1362,7 @@ fn fill_info_from_thread<'a>(
             info.source = proto
                 .source
                 .as_ref()
-                .map(|s| s.as_str().to_string())
+                .map(|s| lua_string_as_str(s).to_string())
                 .unwrap_or_else(|| "=?".to_string());
             info.short_src = proto
                 .source
@@ -1872,7 +1848,7 @@ fn call_getlocal<'a>(
             let name = get_local_name(&closure.proto, nvar as usize, 0);
             match name {
                 Some(n) => {
-                    push_single_result(state, a, nresults, TValue::Str(state.intern_str(&n)));
+                    push_single_result(state, a, nresults, state.intern_str(&n));
                 }
                 None => {
                     push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
@@ -1894,12 +1870,7 @@ fn call_getlocal<'a>(
         let ctx = thread.context.borrow();
         match get_local_from_thread(&ctx, level, nvar) {
             Some((name, val)) => {
-                push_results(
-                    state,
-                    a,
-                    nresults,
-                    vec![TValue::Str(state.intern_str(&name)), val],
-                );
+                push_results(state, a, nresults, vec![(state.intern_str(&name)), val]);
             }
             None => {
                 push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
@@ -1915,20 +1886,14 @@ fn call_getlocal<'a>(
                 state,
                 a,
                 nresults,
-                vec![
-                    TValue::Str(state.intern_str("(C temporary)")),
-                    TValue::Integer(0),
-                ],
+                vec![(state.intern_str("(C temporary)")), TValue::Integer(0)],
             );
         } else if nvar == 2 {
             push_results(
                 state,
                 a,
                 nresults,
-                vec![
-                    TValue::Str(state.intern_str("(C temporary)")),
-                    TValue::Integer(2),
-                ],
+                vec![(state.intern_str("(C temporary)")), TValue::Integer(2)],
             );
         } else {
             push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
@@ -1961,7 +1926,7 @@ fn call_getlocal<'a>(
                         state,
                         a,
                         nresults,
-                        vec![TValue::Str(state.intern_str("(C temporary)")), val],
+                        vec![(state.intern_str("(C temporary)")), val],
                     );
                 } else {
                     push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
@@ -1989,7 +1954,7 @@ fn call_getlocal<'a>(
                             state,
                             a,
                             nresults,
-                            vec![TValue::Str(state.intern_str("(vararg)")), val],
+                            vec![(state.intern_str("(vararg)")), val],
                         );
                     } else {
                         push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
@@ -2011,12 +1976,7 @@ fn call_getlocal<'a>(
                     } else {
                         TValue::Nil(NilKind::Strict)
                     };
-                    push_results(
-                        state,
-                        a,
-                        nresults,
-                        vec![TValue::Str(state.intern_str(&n)), val],
-                    );
+                    push_results(state, a, nresults, vec![(state.intern_str(&n)), val]);
                 }
                 None => {
                     // 对应 C 的 luaG_findlocal: 没有命名局部变量时，检查是否是临时变量
@@ -2035,7 +1995,7 @@ fn call_getlocal<'a>(
                             state,
                             a,
                             nresults,
-                            vec![TValue::Str(state.intern_str("(temporary)")), val],
+                            vec![(state.intern_str("(temporary)")), val],
                         );
                     } else {
                         push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
@@ -2079,7 +2039,7 @@ fn call_setlocal<'a>(
         let mut ctx = thread.context.borrow_mut();
         match set_local_from_thread(&mut ctx, level, nvar, value) {
             Some(name) => {
-                push_single_result(state, a, nresults, TValue::Str(state.intern_str(&name)));
+                push_single_result(state, a, nresults, state.intern_str(&name));
             }
             None => {
                 push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
@@ -2105,12 +2065,7 @@ fn call_setlocal<'a>(
                     if stack_idx < state.exec.stack.len() {
                         state.exec.stack[stack_idx] = value;
                     }
-                    push_single_result(
-                        state,
-                        a,
-                        nresults,
-                        TValue::Str(state.intern_str("(C temporary)")),
-                    );
+                    push_single_result(state, a, nresults, state.intern_str("(C temporary)"));
                 } else {
                     push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
                 }
@@ -2130,12 +2085,7 @@ fn call_setlocal<'a>(
                         if pos < state.exec.stack.len() {
                             state.exec.stack[pos] = value;
                         }
-                        push_single_result(
-                            state,
-                            a,
-                            nresults,
-                            TValue::Str(state.intern_str("(vararg)")),
-                        );
+                        push_single_result(state, a, nresults, state.intern_str("(vararg)"));
                     } else {
                         push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
                     }
@@ -2153,7 +2103,7 @@ fn call_setlocal<'a>(
                     if stack_idx < state.exec.stack.len() {
                         state.exec.stack[stack_idx] = value;
                     }
-                    push_single_result(state, a, nresults, TValue::Str(state.intern_str(&n)));
+                    push_single_result(state, a, nresults, state.intern_str(&n));
                 }
                 None => {
                     // 对应 C 的 luaG_findlocal: 临时变量
@@ -2165,12 +2115,7 @@ fn call_setlocal<'a>(
                         if stack_idx < state.exec.stack.len() {
                             state.exec.stack[stack_idx] = value;
                         }
-                        push_single_result(
-                            state,
-                            a,
-                            nresults,
-                            TValue::Str(state.intern_str("(temporary)")),
-                        );
+                        push_single_result(state, a, nresults, state.intern_str("(temporary)"));
                     } else {
                         push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
                     }
@@ -2220,14 +2165,9 @@ fn call_getupvalue<'a>(
                     .upvalues
                     .get(n - 1)
                     .and_then(|u| u.name.as_ref())
-                    .map(|s| s.as_str().to_string())
+                    .map(|s| lua_string_as_str(s).to_string())
                     .unwrap_or_else(|| "(no name)".to_string());
-                push_results(
-                    state,
-                    a,
-                    nresults,
-                    vec![TValue::Str(state.intern_str(&name)), val],
-                );
+                push_results(state, a, nresults, vec![(state.intern_str(&name)), val]);
             } else {
                 push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
             }
@@ -2240,7 +2180,7 @@ fn call_getupvalue<'a>(
                     state,
                     a,
                     nresults,
-                    vec![TValue::Str(state.intern_str("")), cc.upvalue[n - 1].clone()],
+                    vec![(state.intern_str("")), cc.upvalue[n - 1].clone()],
                 );
             } else {
                 push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
@@ -2256,7 +2196,7 @@ fn call_getupvalue<'a>(
                     state,
                     a,
                     nresults,
-                    vec![TValue::Str(state.intern_str("")), upvals[n - 1].clone()],
+                    vec![(state.intern_str("")), upvals[n - 1].clone()],
                 );
             } else {
                 push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
@@ -2267,17 +2207,14 @@ fn call_getupvalue<'a>(
             // 带有 __call 元方法的 Table 是可调用对象 (如 string.gmatch 返回值)
             // 模拟 C 闭包行为: upvalue 名为空字符串, 值为 nil
             if t.get_metatable()
-                .and_then(|mt| mt.get(&TValue::Str(state.intern_str("__call"))))
+                .and_then(|mt| mt.get(&(state.intern_str("__call"))))
                 .is_some()
             {
                 push_results(
                     state,
                     a,
                     nresults,
-                    vec![
-                        TValue::Str(state.intern_str("")),
-                        TValue::Nil(NilKind::Strict),
-                    ],
+                    vec![(state.intern_str("")), TValue::Nil(NilKind::Strict)],
                 );
             } else {
                 return Err(VmError::RuntimeError(
@@ -2319,7 +2256,7 @@ fn call_setupvalue<'a>(
                     .upvalues
                     .get(n - 1)
                     .and_then(|u| u.name.as_ref())
-                    .map(|s| s.as_str().to_string())
+                    .map(|s| lua_string_as_str(s).to_string())
                     .unwrap_or_else(|| "(no name)".to_string());
 
                 // 设置上值
@@ -2348,7 +2285,7 @@ fn call_setupvalue<'a>(
                         }
                     }
                 }
-                push_single_result(state, a, nresults, TValue::Str(state.intern_str(&name)));
+                push_single_result(state, a, nresults, state.intern_str(&name));
             } else {
                 push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
             }
@@ -2361,7 +2298,7 @@ fn call_setupvalue<'a>(
                     let cc = Rc::make_mut(cc);
                     if n > 0 && n <= cc.upvalue.len() {
                         cc.upvalue[n - 1] = value;
-                        push_single_result(state, a, nresults, TValue::Str(state.intern_str("")));
+                        push_single_result(state, a, nresults, state.intern_str(""));
                         return Ok(());
                     }
                 }
@@ -2381,7 +2318,7 @@ fn call_setupvalue<'a>(
             // 带有 __call 元方法的 Table 是可调用对象 (旧版 string.gmatch 返回值)
             // 模拟 C 闭包行为: 无法设置 upvalue, 返回 nil
             if t.get_metatable()
-                .and_then(|mt| mt.get(&TValue::Str(state.intern_str("__call"))))
+                .and_then(|mt| mt.get(&(state.intern_str("__call"))))
                 .is_some()
             {
                 push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
@@ -2451,7 +2388,7 @@ fn call_upvalueid<'a>(
             // (字符串、模式、userdata 状态)，Rust 版本用带 __call 的表模拟
             let is_gmatch_iter = t
                 .get_metatable()
-                .and_then(|mt| mt.get(&TValue::Str(state.intern_str("__call"))))
+                .and_then(|mt| mt.get(&(state.intern_str("__call"))))
                 .map(|v| {
                     if let TValue::BuiltinFn(bf) = &v {
                         std::ptr::eq(
@@ -2591,7 +2528,7 @@ fn call_sethook<'a>(
         }
     } else {
         let mask_str = match &get_arg(state, a, arg_offset + 1) {
-            TValue::Str(s) => s.as_str().to_string(),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => lua_string_as_str(s).to_string(),
             _ => String::new(),
         };
         let count = if nargs > arg_offset + 2 {
@@ -2648,7 +2585,7 @@ fn call_gethook<'a>(
                     nresults,
                     vec![
                         f.clone(),
-                        TValue::Str(state.intern_str(&mask_str)),
+                        (state.intern_str(&mask_str)),
                         TValue::Integer(ctx.exec.hook_count as i64),
                     ],
                 );
@@ -2661,7 +2598,7 @@ fn call_gethook<'a>(
     }
 
     // 从注册表获取 hook 表
-    let hookkey = TValue::Str(state.intern_str(HOOKKEY));
+    let hookkey = state.intern_str(HOOKKEY);
     let hook_table = match state.registry.get(&hookkey) {
         Some(TValue::Table(t)) => t.clone(),
         _ => {
@@ -2678,8 +2615,8 @@ fn call_gethook<'a>(
     match hook_fn {
         Some(f) if !matches!(f, TValue::Nil(_)) => {
             // 获取掩码和计数 (存储在另一个表中)
-            let maskkey = TValue::Str(state.intern_str("_mask"));
-            let countkey = TValue::Str(state.intern_str("_count"));
+            let maskkey = state.intern_str("_mask");
+            let countkey = state.intern_str("_count");
             let mask = hook_table
                 .get(&maskkey)
                 .and_then(|v| v.as_integer())
@@ -2695,7 +2632,7 @@ fn call_gethook<'a>(
                 nresults,
                 vec![
                     f.clone(),
-                    TValue::Str(state.intern_str(&mask_str)),
+                    (state.intern_str(&mask_str)),
                     TValue::Integer(count as i64),
                 ],
             );
@@ -2714,7 +2651,7 @@ fn set_hook_in_registry<'a>(
     mask: i32,
     count: i32,
 ) {
-    let hookkey = TValue::Str(state.intern_str(HOOKKEY));
+    let hookkey = state.intern_str(HOOKKEY);
 
     // 获取或创建 hook 表
     let hook_table = match state.registry.get(&hookkey) {
@@ -2723,10 +2660,7 @@ fn set_hook_in_registry<'a>(
             // 创建新表并设置元表 (__mode = "k")
             let t = Table::new();
             let mt = Table::new();
-            mt.set(
-                TValue::Str(state.intern_str("__mode")),
-                TValue::Str(state.intern_str("k")),
-            );
+            mt.set(state.intern_str("__mode"), state.intern_str("k"));
             t.set_metatable(Some(mt));
             t
         }
@@ -2744,14 +2678,8 @@ fn set_hook_in_registry<'a>(
     }
 
     // 存储掩码和计数
-    hook_table.set(
-        TValue::Str(state.intern_str("_mask")),
-        TValue::Integer(mask as i64),
-    );
-    hook_table.set(
-        TValue::Str(state.intern_str("_count")),
-        TValue::Integer(count as i64),
-    );
+    hook_table.set(state.intern_str("_mask"), TValue::Integer(mask as i64));
+    hook_table.set(state.intern_str("_count"), TValue::Integer(count as i64));
 
     state.registry.set(hookkey, TValue::Table(hook_table));
 
@@ -2794,13 +2722,16 @@ fn call_traceback<'a>(
     };
 
     // 如果 msg 不是字符串且不是 nil, 直接返回
-    if !matches!(msg_val, TValue::Str(_) | TValue::Nil(_)) {
+    if !matches!(
+        msg_val,
+        TValue::LongStr(_) | TValue::ShortStr(_) | TValue::Nil(_)
+    ) {
         push_single_result(state, a, nresults, msg_val);
         return Ok(());
     }
 
     let msg = match &msg_val {
-        TValue::Str(s) => s.as_str().to_string(),
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => lua_string_as_str(s).to_string(),
         _ => String::new(),
     };
 
@@ -2812,12 +2743,7 @@ fn call_traceback<'a>(
     } else {
         build_traceback(state, &msg, level)
     };
-    push_single_result(
-        state,
-        a,
-        nresults,
-        TValue::Str(state.intern_str(&traceback)),
-    );
+    push_single_result(state, a, nresults, state.intern_str(&traceback));
     Ok(())
 }
 
@@ -2830,7 +2756,7 @@ fn call_traceback<'a>(
 ///
 /// 当 call_info 末尾有 C 函数链时（C 函数调用 C 函数），
 /// state.exec.base 不随 C 函数调用改变，所以需要计算 C 函数链长度来正确映射 level。
-fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> String {
+pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> String {
     let mut lines: Vec<String> = Vec::new();
 
     // Level 0: debug.traceback 自身 (C/tagged 函数)
@@ -3447,7 +3373,7 @@ pub fn create_debug_lib_table<'a>(state: &LuaState<'a>) -> Table<'a> {
 /// 打开调试库并注册到全局变量 debug
 pub fn open_debug_lib(state: &mut LuaState) {
     let lib = create_debug_lib_table(state);
-    let key = TValue::Str(state.intern_str("debug"));
+    let key = state.intern_str("debug");
     state.globals.set(key, TValue::Table(lib));
 }
 
@@ -3492,7 +3418,7 @@ mod tests {
         let mut state = LuaState::default();
         open_debug_lib(&mut state);
 
-        let key = TValue::Str(state.intern_str("debug"));
+        let key = state.intern_str("debug");
         let val = state.globals.get(&key);
         assert!(val.is_some(), "debug must be registered");
         assert!(matches!(val, Some(TValue::Table(_))));
@@ -3517,7 +3443,7 @@ mod tests {
                 "setupvalue",
                 "traceback",
             ] {
-                let key = TValue::Str(state.intern_str(name));
+                let key = state.intern_str(name);
                 assert!(t.get(&key).is_some(), "{} must be registered", name);
             }
         }
@@ -3585,7 +3511,6 @@ mod tests {
     fn test_call_getupvalue_closure() {
         use crate::gc::GCObjectHeader;
         use crate::objects::UpvalDesc;
-        use crate::strings::LuaString;
 
         let mut state = LuaState::default();
         let proto = Proto {
@@ -3605,10 +3530,10 @@ mod tests {
             code: Rc::new(vec![]),
             protos: Rc::new(vec![]),
             upvalues: Rc::new(vec![UpvalDesc {
-                name: Some(LuaString::Short(crate::strings::ArcRc::new(
+                name: Some(TValue::ShortStr(crate::strings::ArcRc::new(
                     crate::strings::ShortString {
                         hash: 0,
-                        contents: crate::strings::LuaString::with_nul("x"),
+                        contents: crate::strings::lua_string_with_nul("x"),
                     },
                 ))),
                 in_stack: false,
@@ -3639,7 +3564,7 @@ mod tests {
         call_getupvalue(&mut state, 0, 2, 2).unwrap();
         assert_eq!(state.exec.stack.len(), 2);
         match &state.exec.stack[0] {
-            TValue::Str(s) => assert_eq!(s.as_str(), "x"),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => assert_eq!(lua_string_as_str(s), "x"),
             _ => panic!("expected string 'x'"),
         }
         match &state.exec.stack[1] {
@@ -3681,7 +3606,7 @@ mod tests {
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
         state.exec.stack.push(hook_fn.clone());
-        state.exec.stack.push(TValue::Str(state.intern_str("crl")));
+        state.exec.stack.push(state.intern_str("crl"));
         state.exec.stack.push(TValue::Integer(0));
         call_sethook(&mut state, 0, 3, 0).unwrap();
 
@@ -3691,7 +3616,9 @@ mod tests {
         assert_eq!(state.exec.stack.len(), 3);
         assert_eq!(state.exec.stack[0], hook_fn);
         match &state.exec.stack[1] {
-            TValue::Str(s) => assert_eq!(s.as_str(), "crl"),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                assert_eq!(lua_string_as_str(s), "crl")
+            }
             _ => panic!("expected mask string 'crl'"),
         }
         match &state.exec.stack[2] {
@@ -3708,7 +3635,7 @@ mod tests {
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
         state.exec.stack.push(hook_fn);
-        state.exec.stack.push(TValue::Str(state.intern_str("l")));
+        state.exec.stack.push(state.intern_str("l"));
         call_sethook(&mut state, 0, 2, 0).unwrap();
 
         // 用 nil 清除
@@ -3729,7 +3656,9 @@ mod tests {
         state.exec.stack.clear();
         call_traceback(&mut state, 0, 0, 1).unwrap();
         match &state.exec.stack[0] {
-            TValue::Str(s) => assert!(s.as_str().starts_with("stack traceback:")),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                assert!(lua_string_as_str(s).starts_with("stack traceback:"))
+            }
             _ => panic!("expected string result"),
         }
     }
@@ -3739,14 +3668,11 @@ mod tests {
         let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state
-            .exec
-            .stack
-            .push(TValue::Str(state.intern_str("error message")));
+        state.exec.stack.push(state.intern_str("error message"));
         call_traceback(&mut state, 0, 1, 1).unwrap();
         match &state.exec.stack[0] {
-            TValue::Str(s) => {
-                let s = s.as_str();
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                let s = lua_string_as_str(s);
                 assert!(s.starts_with("error message\n"));
                 assert!(s.contains("stack traceback:"));
             }
@@ -3800,12 +3726,10 @@ mod tests {
 
     #[test]
     fn test_short_src() {
-        use crate::strings::LuaString;
-
-        let make_str = |s: &str| -> LuaString {
-            LuaString::Short(crate::strings::ArcRc::new(crate::strings::ShortString {
+        let make_str = |s: &str| -> TValue {
+            TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
                 hash: 0,
-                contents: crate::strings::LuaString::with_nul(s),
+                contents: crate::strings::lua_string_with_nul(s),
             }))
         };
 

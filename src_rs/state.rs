@@ -6,13 +6,14 @@ use crate::objects::{
     BuiltinFn, BuiltinFnPtr, Instruction, LClosure, LuaThread, LuaType, NilKind, Proto, TValue,
     TableData, ThreadContext, ThreadStatus, UpVal, UpValRef, UpValVec,
 };
-use crate::strings::{LuaString, StringTable};
+use crate::strings::{lua_string_as_str, lua_string_len, StringTable};
 use crate::table::Table;
 use crate::tm::DefaultMetatables;
 use crate::tm::{init_tmnames, TM_N};
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::io::{Read, Write};
+use std::ptr::NonNull;
 use std::rc::Rc;
 
 /// GC 标记阶段使用的集合类型 — 用 FxHash 替代默认 SipHash，
@@ -206,8 +207,9 @@ pub struct PcallProtection<'a> {
     pub saved_call_stack: Vec<crate::objects::CallFrame<'a>>,
 }
 
-pub struct GlobalState {
+pub struct GlobalState<'a> {
     pub gcstopem: bool,
+    pub gc: GCState<'a>,
 }
 
 pub struct LuaFunctionCallInfo {
@@ -346,7 +348,7 @@ pub struct LuaState<'a> {
     pub is_in_twups: bool,
 
     // 公用字段
-    pub gc: Rc<GCState>,
+    pub gc: NonNull<GCState<'a>>,
 
     // 高层 API 字段（原 LuaState）
     pub globals: Table<'a>,
@@ -359,7 +361,7 @@ pub struct LuaState<'a> {
     /// 后续 `make_tm_tvalue` 直接 `clone()` 复用，保证 ptr_eq 快速路径。
     /// 通过 Rc 共享以支持 lua_newthread 创建的 thread 共享主线程的 tmnames
     /// （保证不同 thread 间元方法名 ptr_eq 一致，元表查找快速路径不被破坏）
-    pub tmnames: Rc<Box<[LuaString; TM_N]>>,
+    pub tmnames: Rc<Box<[TValue<'a>; TM_N]>>,
 
     // C API 导出层使用：当前 C 函数帧的 func 位置（0-based 栈索引）。
     // C API 的正索引相对于此位置；Lua 代码路径不使用此字段。
@@ -382,7 +384,7 @@ pub struct LuaState<'a> {
     /// 当前默认输出流的 UserData ptr_id — None 表示使用 io.stdout
     /// 对应 C 的 registry[IO_OUTPUT]
     pub io_output_handle: Option<u32>,
-    pub global_state: Rc<GlobalState>,
+    pub global_state: Rc<RefCell<GlobalState<'a>>>,
     pub ci: Option<Box<CallInfo>>,
     /// 最后一次错误的堆栈回溯字符串
     pub last_traceback: String,
@@ -456,9 +458,9 @@ pub struct LuaState<'a> {
     pub last_close_frame: Option<CallInfoEntry<'a>>,
     /// GC 标记阶段缓存的 "__mode" 字符串键 — 避免每次 mark_tvalue 都 intern_str
     /// （perf: mark_tvalue 中 __mode 查找占 ~2%）
-    pub cached_mode_key: std::cell::RefCell<Option<LuaString>>,
+    pub cached_mode_key: std::cell::RefCell<Option<TValue<'a>>>,
     /// GC finalizer 阶段缓存的 "__gc" 字符串键 — 避免每次 collect_finalizers/call_finalizers 都 intern_str
-    pub cached_gc_key: std::cell::RefCell<Option<LuaString>>,
+    pub cached_gc_key: std::cell::RefCell<Option<TValue<'a>>>,
     /// 上次 GC 后的 gc_estimate 快照 — 用于判断 malloc_trim 是否值得调用
     /// （仅当释放了大量内存时才 trim，避免每次 GC 都做系统调用）
     pub last_gc_estimate: usize,
@@ -644,16 +646,20 @@ impl<'a> LuaState<'a> {
     ///
     /// 验证: gettop() 必须返回 1（函数入口槽）
     pub fn new(io: &'a mut dyn crate::mock::io_mock::Io) -> Self {
-        let gc = Rc::new(GCState::default_incremental());
+        let global_state: Rc<RefCell<GlobalState<'a>>> = Rc::new(RefCell::new(GlobalState {
+            gcstopem: false,
+            gc: GCState::default_incremental(),
+        }));
+        let gs = &mut global_state.borrow_mut();
         let globals = {
-            let t = Table::new();
-            let id = gc.register_object(t.mem_size());
+            let t: Table<'a> = Table::new();
+            let id = gs.gc.register_object(t.mem_size());
             t.data.borrow().gc_header.set_id(id);
             t
         };
         let registry = {
-            let t = Table::new();
-            let id = gc.register_object(t.mem_size());
+            let t: Table<'a> = Table::new();
+            let id = gs.gc.register_object(t.mem_size());
             t.data.borrow().gc_header.set_id(id);
             t
         };
@@ -664,7 +670,6 @@ impl<'a> LuaState<'a> {
 
         let string_table = Rc::new(StringTable::new());
         let tmnames = Rc::new(init_tmnames(&string_table));
-
         LuaState {
             exec: Box::new(ExecState {
                 constants: Rc::new(Vec::new()),
@@ -702,7 +707,7 @@ impl<'a> LuaState<'a> {
             tick: std::cell::Cell::new(0),
             twups_linked: false,
             is_in_twups: false,
-            gc,
+            gc: NonNull::new(&mut gs.gc).unwrap(),
             globals,
             registry,
             string_table,
@@ -718,7 +723,7 @@ impl<'a> LuaState<'a> {
             ),
             io_input_handle: None,
             io_output_handle: None,
-            global_state: Rc::new(GlobalState { gcstopem: false }),
+            global_state: global_state.clone(),
             ci: None,
             last_traceback: String::new(),
             last_error_msg: String::new(),
@@ -841,128 +846,6 @@ impl<'a> LuaState<'a> {
         Ok(())
     }
 
-    /// 使用已有的 GCState 创建 LuaState
-    pub fn with_gc(gc: Rc<GCState>) -> Self {
-        let globals = {
-            let t = Table::new();
-            let id = gc.register_object(t.mem_size());
-            t.data.borrow().gc_header.set_id(id);
-            t
-        };
-        let registry = {
-            let t = Table::new();
-            let id = gc.register_object(t.mem_size());
-            t.data.borrow().gc_header.set_id(id);
-            t
-        };
-        registry.set(TValue::Integer(2), TValue::Table(globals.clone()));
-
-        let stack = Self::init_stack();
-        let top = stack.len();
-
-        let string_table = Rc::new(StringTable::new());
-        let tmnames = Rc::new(init_tmnames(&string_table));
-
-        let state = LuaState {
-            exec: Box::new(ExecState {
-                constants: Rc::new(Vec::new()),
-                code: Rc::new(Vec::new()),
-                protos: Rc::new(Vec::new()),
-                top,
-                base: 0,
-                pc: 0,
-                num_params: 0,
-                is_vararg: false,
-                proto_flag: 0,
-                nextraargs: 0,
-                closure_upvals: Rc::new(RefCell::new(UpValVec::new())),
-                open_upvals: Vec::new(),
-                open_upval: None,
-                tbc_list: None,
-                call_stack: Vec::with_capacity(32),
-                stack,
-                hook_old_pc: 0,
-                hook_func: None,
-                hook_mask: 0,
-                hook_count: 0,
-                current_hook_count: 0,
-                allowhook: true,
-                current_thread: None,
-                call_info: Vec::new(),
-                pcall_protection_stack: Vec::new(),
-                close_error_status: None,
-                force_noyield_close: false,
-                n_ccalls: 0,
-                n_ny_calls: 0,
-                saved_yield_nresults: 0,
-            }),
-            trap: false,
-            tick: std::cell::Cell::new(0),
-            twups_linked: false,
-            is_in_twups: false,
-            gc,
-            globals,
-            registry,
-            string_table,
-            tmnames,
-            api_func_base: 0,
-            dmt: DefaultMetatables::new(),
-            io_output: None,
-            file_handles: std::collections::HashMap::with_hasher(
-                crate::objects::FxBuildHasher::default(),
-            ),
-            popen_handles: std::collections::HashSet::with_hasher(
-                crate::objects::FxBuildHasher::default(),
-            ),
-            io_input_handle: None,
-            io_output_handle: None,
-            global_state: Rc::new(GlobalState { gcstopem: false }),
-            ci: None,
-            last_traceback: String::new(),
-            last_error_msg: String::new(),
-            last_error_value: None,
-            pending_error: None,
-            error_no_prefix: false,
-            pending_yield: None,
-            last_c_function: None,
-            math_random_state: None,
-            warn_on: true,
-            warn_pending: false,
-            main_thread: LuaThread {
-                // 预分配 64 个槽位: 对应 C Lua 的 BASIC_STACK_SIZE = 60,
-                // 避免 main 函数加载时栈从 0 开始频繁扩容 (Vec::new() → 1 → 2 → 4 → ... → 64)
-                // Rust TValue 96 字节, 64 * 96 = 6KB, 内存开销可忽略
-                stack: Vec::with_capacity(64),
-                status: ThreadStatus::OK,
-                function: None,
-                is_main: true,
-                context: Rc::new(RefCell::new(ThreadContext::default())),
-                c_state: std::cell::Cell::new(std::ptr::null_mut()),
-            },
-            caller_gc_stacks: Vec::new(),
-            weak_tables: Vec::new(),
-            concat_gc_counter: std::cell::Cell::new(0),
-            concat_gc_interval: std::cell::Cell::new(32768),
-            finobj_list: Vec::new(),
-            ud_finobj_list: Vec::new(),
-            gc_closing: false,
-            exit_requested: None,
-            transferinfo_ftransfer: 0,
-            transferinfo_ntransfer: 0,
-            pending_return_adjust: None,
-            last_error_call_info: None,
-            last_close_frame: None,
-            cached_mode_key: std::cell::RefCell::new(None),
-            cached_gc_key: std::cell::RefCell::new(None),
-            last_gc_estimate: 0,
-            c_safety_keepalive: Vec::new(),
-            allocf_ud: std::ptr::null_mut(),
-            error_jmp_bufs: Vec::new(),
-            io: crate::mock::io_mock::lua_io(),
-        };
-        state
-    }
-
     /// 创建新 thread，共享原 L 的全局状态（globals, registry, string_table, gc 等），
     /// 但有独立的 stack 和执行状态。对应 C Lua 的 lua_newthread。
     ///
@@ -991,7 +874,7 @@ impl<'a> LuaState<'a> {
 
         LuaState {
             // === 共享字段 ===
-            gc: Rc::clone(&self.gc),
+            gc: self.gc,
             globals: self.globals.clone(),
             registry: self.registry.clone(),
             string_table: Rc::clone(&self.string_table),
@@ -1111,8 +994,9 @@ impl<'a> LuaState<'a> {
         proto: &Proto<'a>,
         base: usize,
         mut stack: Vec<TValue<'a>>,
-        gc: Rc<GCState>,
+        mut global_state: Rc<RefCell<GlobalState<'a>>>,
     ) -> Self {
+        let mut gs = global_state.borrow_mut();
         if base > 0 {
             while stack.len() < base {
                 stack.push(TValue::Nil(NilKind::Strict));
@@ -1126,21 +1010,20 @@ impl<'a> LuaState<'a> {
 
         let globals = {
             let t = Table::new();
-            let id = gc.register_object(t.mem_size());
+            let id = gs.gc.register_object(t.mem_size());
             t.data.borrow().gc_header.set_id(id);
             t
         };
 
         let registry = {
             let t = Table::new();
-            let id = gc.register_object(t.mem_size());
+            let id = gs.gc.register_object(t.mem_size());
             t.data.borrow().gc_header.set_id(id);
             t
         };
 
         let string_table = Rc::new(StringTable::new());
         let tmnames = Rc::new(init_tmnames(&string_table));
-
         LuaState {
             exec: Box::new(ExecState {
                 constants: proto.constants.clone(),
@@ -1178,7 +1061,7 @@ impl<'a> LuaState<'a> {
             tick: std::cell::Cell::new(0),
             twups_linked: false,
             is_in_twups: false,
-            gc,
+            gc: NonNull::new(&mut gs.gc).unwrap(),
             globals,
             registry,
             string_table,
@@ -1194,7 +1077,7 @@ impl<'a> LuaState<'a> {
             ),
             io_input_handle: None,
             io_output_handle: None,
-            global_state: Rc::new(GlobalState { gcstopem: false }),
+            global_state: global_state.clone(),
             ci: None,
             last_traceback: String::new(),
             last_error_msg: String::new(),
@@ -1503,7 +1386,7 @@ impl<'a> LuaState<'a> {
 // 字符串工具
 // ============================================================================
 
-pub fn str_to_ls(table: &StringTable, s: &str) -> LuaString {
+pub fn str_to_ls<'a>(table: &StringTable, s: &str) -> TValue<'a> {
     crate::strings::new_lstr(table, s)
 }
 
@@ -1614,12 +1497,12 @@ impl<'a> LuaState<'a> {
 
     pub fn push_string(&mut self, s: &str) {
         let ls = str_to_ls(&self.string_table, s);
-        self.exec.stack.push(TValue::Str(ls));
+        self.exec.stack.push(ls);
     }
 
     pub fn push_lstring(&mut self, s: &[u8]) {
         let ls = crate::strings::new_lstr_bytes(&self.string_table, s);
-        self.exec.stack.push(TValue::Str(ls));
+        self.exec.stack.push(ls);
     }
 
     pub fn push_value(&mut self, val: TValue<'a>) {
@@ -1685,7 +1568,9 @@ impl<'a> LuaState<'a> {
         match self.obj_at(idx) {
             Some(TValue::Integer(i)) => Some(*i),
             Some(TValue::Float(f)) => crate::vm::float_to_integer(*f, crate::vm::F2IMode::Eq),
-            Some(TValue::Str(s)) => s.as_str().parse::<i64>().ok(),
+            Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
+                lua_string_as_str(s).parse::<i64>().ok()
+            }
             _ => None,
         }
     }
@@ -1694,7 +1579,9 @@ impl<'a> LuaState<'a> {
         match self.obj_at(idx) {
             Some(TValue::Integer(i)) => Some(*i as f64),
             Some(TValue::Float(f)) => Some(*f),
-            Some(TValue::Str(s)) => crate::float_utils::f64_from_str(s.as_str()),
+            Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
+                crate::float_utils::f64_from_str(lua_string_as_str(s))
+            }
             _ => None,
         }
     }
@@ -1708,7 +1595,9 @@ impl<'a> LuaState<'a> {
 
     pub fn to_string(&self, idx: isize) -> Option<String> {
         match self.obj_at(idx) {
-            Some(TValue::Str(s)) => Some(s.as_str().to_string()),
+            Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
+                Some(lua_string_as_str(s).to_string())
+            }
             Some(TValue::Integer(i)) => Some(i.to_string()),
             Some(TValue::Float(f)) => Some(format_float(*f)),
             _ => None,
@@ -1717,9 +1606,9 @@ impl<'a> LuaState<'a> {
 
     pub fn to_lstring(&self, idx: isize) -> Option<(String, usize)> {
         match self.obj_at(idx) {
-            Some(TValue::Str(s)) => {
-                let text = s.as_str().to_string();
-                let len = s.len();
+            Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
+                let text = lua_string_as_str(s).to_string();
+                let len = lua_string_len(s);
                 Some((text, len))
             }
             _ => None,
@@ -1736,7 +1625,7 @@ impl<'a> LuaState<'a> {
     // ====== Globals ======
 
     pub fn get_global(&mut self, name: &str) -> LuaType {
-        let key = TValue::Str(str_to_ls(&self.string_table, name));
+        let key = str_to_ls(&self.string_table, name);
         match self.globals.get(&key) {
             Some(val) => {
                 let ty = val.ty();
@@ -1751,7 +1640,7 @@ impl<'a> LuaState<'a> {
     }
 
     pub fn set_global(&mut self, name: &str) {
-        let key = TValue::Str(str_to_ls(&self.string_table, name));
+        let key = str_to_ls(&self.string_table, name);
         if let Some(val) = self.exec.stack.pop() {
             self.globals.set(key, val);
         }
@@ -1789,7 +1678,7 @@ impl<'a> LuaState<'a> {
     /// ```
     pub fn set_builtin(&mut self, name: &'static std::ffi::CStr, func: BuiltinFnPtr<'a>) {
         let name_str = name.to_str().unwrap_or("");
-        let key = TValue::Str(str_to_ls(&self.string_table, name_str));
+        let key = str_to_ls(&self.string_table, name_str);
         let name_ptr = name.as_ptr() as *const u8;
         self.globals
             .set(key, TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)));
@@ -1813,7 +1702,7 @@ impl<'a> LuaState<'a> {
         func: BuiltinFnPtr<'a>,
     ) {
         let name_str = name.to_str().unwrap_or("");
-        let key = TValue::Str(str_to_ls(&self.string_table, name_str));
+        let key = str_to_ls(&self.string_table, name_str);
         let name_ptr = name.as_ptr() as *const u8;
         table.set(key, TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)));
     }
@@ -1825,7 +1714,7 @@ impl<'a> LuaState<'a> {
             .stack
             .pop()
             .unwrap_or(TValue::Nil(NilKind::Strict));
-        let key = TValue::Str(str_to_ls(&self.string_table, key_name));
+        let key = str_to_ls(&self.string_table, key_name);
         if abs > 0 && abs <= self.exec.stack.len() {
             let tbl = &mut self.exec.stack[abs - 1];
             if let TValue::Table(ref mut t) = tbl {
@@ -1836,7 +1725,7 @@ impl<'a> LuaState<'a> {
 
     pub fn get_field(&mut self, idx: isize, key_name: &str) -> LuaType {
         let abs = self.abs_index(idx);
-        let key = TValue::Str(str_to_ls(&self.string_table, key_name));
+        let key = str_to_ls(&self.string_table, key_name);
         if abs > 0 && abs <= self.exec.stack.len() {
             let val = if let TValue::Table(ref t) = &self.exec.stack[abs - 1] {
                 t.get(&key).unwrap_or(TValue::Nil(NilKind::Strict))
@@ -1944,7 +1833,7 @@ impl<'a> LuaState<'a> {
         if abs > 0 && abs <= self.exec.stack.len() {
             match &self.exec.stack[abs - 1] {
                 TValue::Table(t) => t.len() as usize,
-                TValue::Str(s) => s.len(),
+                s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => lua_string_len(s),
                 TValue::Integer(_) | TValue::Float(_) => 0,
                 _ => 0,
             }
@@ -1965,20 +1854,20 @@ impl<'a> LuaState<'a> {
 
     // ====== Garbage Collection ======
 
-    pub fn gc_stop(&self) {
-        self.gc.gc_stop.set(1);
+    pub fn gc_stop(&mut self) {
+        unsafe { self.gc.as_mut().gc_stop.set(1) };
     }
 
-    pub fn gc_restart(&self) {
-        self.gc.gc_stop.set(0);
+    pub fn gc_restart(&mut self) {
+        unsafe { self.gc.as_mut().gc_stop.set(0) };
     }
 
-    pub fn gc_gen(&self) {
-        self.gc.set_mode(crate::gc::GCMode::Generational);
+    pub fn gc_gen(&mut self) {
+        unsafe { self.gc.as_mut().set_mode(crate::gc::GCMode::Generational) };
     }
 
-    pub fn gc_inc(&self) {
-        self.gc.set_mode(crate::gc::GCMode::Incremental);
+    pub fn gc_inc(&mut self) {
+        unsafe { self.gc.as_mut().set_mode(crate::gc::GCMode::Incremental) };
     }
 
     /// 关闭状态：调用所有注册了 __gc 的对象的 finalizer（不检查可达性）。
@@ -2332,7 +2221,7 @@ impl<'a> LuaState<'a> {
             if let TValue::Table(ref t) = cur_val {
                 let mt_opt = t.get_metatable();
                 let call_fn = mt_opt.as_ref().and_then(|mt| {
-                    let call_key = TValue::Str(self.intern_str("__call"));
+                    let call_key = self.intern_str("__call");
                     mt.get(&call_key)
                 });
                 if let Some(call_fn) = call_fn {
@@ -2684,10 +2573,8 @@ impl<'a> LuaState<'a> {
                             // 对应 C Lua 的 longjmp 恢复：错误值来自当前错误，而非全局状态
                             let err_from_e = match e {
                                 VmError::RuntimeErrorValue(val) => val.clone(),
-                                VmError::RuntimeError(s) => {
-                                    TValue::Str(self.intern_str(s.as_str()))
-                                }
-                                other => TValue::Str(self.intern_str(&format!("{}", other))),
+                                VmError::RuntimeError(s) => self.intern_str(s.as_str()),
+                                other => self.intern_str(&format!("{}", other)),
                             };
                             self.last_error_value = Some(err_from_e);
                             // 保存错误发生时的 call_info 快照 — 对应 C Lua 中 longjmp 后
@@ -2861,13 +2748,14 @@ impl<'a> LuaState<'a> {
                             // 对字符串错误，使用 build_traceback 添加了 source:line 前缀的
                             // last_error_msg（VM 错误如 "attempt to call" 需要前缀；
                             // error()/assert() 的前缀已在 last_error_value 中，二者一致）
-                            let err_val = if matches!(err_val, TValue::Str(_))
-                                && !self.last_error_msg.is_empty()
-                            {
-                                TValue::Str(self.intern_str(&self.last_error_msg))
-                            } else {
-                                err_val
-                            };
+                            let err_val =
+                                if matches!(err_val, TValue::LongStr(_) | TValue::ShortStr(_))
+                                    && !self.last_error_msg.is_empty()
+                                {
+                                    self.intern_str(&self.last_error_msg)
+                                } else {
+                                    err_val
+                                };
                             self.last_error_msg.clear();
                             // 清除 last_error_value，防止残留值污染后续 pcall
                             // (对应 C Lua 的 longjmp 后错误状态不跨 pcall 保留)
@@ -3166,7 +3054,7 @@ impl<'a> LuaState<'a> {
     pub fn open_selected_libs(&mut self, _mask: i32, _ignored: i32) {
         let arg_table = Table::new();
         self.globals.set(
-            TValue::Str(str_to_ls(&self.string_table, "arg")),
+            str_to_ls(&self.string_table, "arg"),
             TValue::Table(arg_table),
         );
 
@@ -3215,11 +3103,11 @@ impl<'a> LuaState<'a> {
             "io",
             "package",
         ] {
-            let name_val = TValue::Str(self.intern_str(name));
+            let name_val = self.intern_str(name);
             if let Some(lib) = self.globals.get(&name_val) {
-                let package_key = TValue::Str(self.intern_str("package"));
+                let package_key = self.intern_str("package");
                 if let Some(TValue::Table(pkg)) = self.globals.get(&package_key) {
-                    let loaded_key = TValue::Str(self.intern_str("loaded"));
+                    let loaded_key = self.intern_str("loaded");
                     if let Some(TValue::Table(loaded)) = pkg.get(&loaded_key) {
                         loaded.set(name_val, lib);
                     }
@@ -3234,24 +3122,24 @@ impl<'a> LuaState<'a> {
 
     // ====== String Helpers ======
 
-    pub fn intern_str(&self, s: &str) -> LuaString {
+    pub fn intern_str(&self, s: &str) -> TValue<'a> {
         str_to_ls(&self.string_table, s)
     }
 
     pub fn intern(&self, s: &str) -> TValue<'a> {
-        TValue::Str(str_to_ls(&self.string_table, s))
+        str_to_ls(&self.string_table, s)
     }
 
     /// 从 owned String 创建 LuaString，长字符串路径直接 consume 避免 clone。
     /// perf: str_format 等产生临时长 String 的场景，消除 with_nul 的 to_string() clone。
-    pub fn intern_str_owned(&self, s: String) -> LuaString {
+    pub fn intern_str_owned(&self, s: String) -> TValue<'a> {
         crate::strings::new_lstr_from_string(&self.string_table, s)
     }
 
     /// 获取缓存的 "__mode" 字符串键（用于 GC mark_tvalue/process_ephemerons）
     /// 第一次调用时 intern 并缓存，后续直接返回缓存值。
     /// 避免每次 mark_tvalue 都做 hash+查找（perf: 节省 ~2%）
-    fn mode_key_cached(&self) -> LuaString {
+    fn mode_key_cached(&self) -> TValue<'a> {
         if let Some(ref k) = *self.cached_mode_key.borrow() {
             return k.clone();
         }
@@ -3261,7 +3149,7 @@ impl<'a> LuaState<'a> {
     }
 
     /// 获取缓存的 "__gc" 字符串键（用于 GC collect_finalizers/call_finalizers）
-    fn gc_key_cached(&self) -> LuaString {
+    fn gc_key_cached(&self) -> TValue<'a> {
         if let Some(ref k) = *self.cached_gc_key.borrow() {
             return k.clone();
         }
@@ -3323,7 +3211,7 @@ impl<'a> LuaState<'a> {
         worklist: &mut Vec<RawTValue<'a>>,
         extra_size: &mut usize,
     ) {
-        let mode_key = TValue::Str(self.mode_key_cached());
+        let mode_key = self.mode_key_cached();
         let mut changed = true;
         while changed {
             changed = false;
@@ -3336,8 +3224,8 @@ impl<'a> LuaState<'a> {
                     let data = data_rc.borrow();
                     match &data.metatable {
                         Some(mt) => match mt.get(&mode_key) {
-                            Some(TValue::Str(s)) => {
-                                let mode = s.as_str();
+                            Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
+                                let mode = lua_string_as_str(&s);
                                 (mode.contains('k'), mode.contains('v'))
                             }
                             _ => (false, false),
@@ -3389,7 +3277,7 @@ impl<'a> LuaState<'a> {
     /// 清理弱引用表 — 在 collect_gc 标记完成后、sweep 之前调用
     /// 基于 GC reachable 集合判断键/值是否死亡，清除死亡的弱引用条目
     fn clear_weak_tables(&mut self, reachable: &GcHashSet) {
-        let mode_key = TValue::Str(self.mode_key_cached());
+        let mode_key = self.mode_key_cached();
         let mut i = 0;
         while i < self.weak_tables.len() {
             match self.weak_tables[i].upgrade() {
@@ -3401,8 +3289,8 @@ impl<'a> LuaState<'a> {
                         let data = data_rc.borrow();
                         match &data.metatable {
                             Some(mt) => match mt.get(&mode_key) {
-                                Some(TValue::Str(s)) => {
-                                    let mode = s.as_str();
+                                Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
+                                    let mode = lua_string_as_str(&s);
                                     (mode.contains('k'), mode.contains('v'))
                                 }
                                 _ => (false, false),
@@ -3518,24 +3406,24 @@ impl<'a> LuaState<'a> {
             None
         };
         // 设置 GC 正在运行标志 — 阻止 finalizer 中重入 collectgarbage("collect")
-        self.gc.gc_running.set(true);
+        unsafe { self.gc.as_mut().gc_running.set(true) };
         // 临时禁用 hook — GC 期间的 finalizer 调用不应触发用户的 hook
         // （对应 C 的 luaD_rawrunprotected 中 L->allowhook = 0 语义）
         let saved_allowhook = self.exec.allowhook;
         self.exec.allowhook = false;
 
-        let prev_estimate = self.gc.total_estimate();
+        let prev_estimate = unsafe { self.gc.as_mut().total_estimate() };
         let result = self.collect_gc_inner();
 
         // 恢复 hook 状态
         self.exec.allowhook = saved_allowhook;
         // 清除标志
-        self.gc.gc_running.set(false);
+        unsafe { self.gc.as_mut().gc_running.set(false) };
         // GC 回收对象后，Rust 分配器（glibc malloc）可能仍持有释放的内存不归还操作系统。
         // malloc_trim(0) 是系统调用，开销较大（perf 显示 ~1.5%）。
         // 仅当释放了大量内存（>1MB）时才调用，避免在小 GC 中浪费。
         // 注意: malloc_trim 是 glibc 专属函数, Windows/musl 无此函数。
-        let cur_estimate = self.gc.total_estimate();
+        let cur_estimate = unsafe { self.gc.as_mut().total_estimate() };
         if prev_estimate > cur_estimate + 1024 * 1024 {
             #[cfg(target_os = "linux")]
             unsafe {
@@ -3561,7 +3449,7 @@ impl<'a> LuaState<'a> {
     }
 
     fn collect_gc_inner(&mut self) {
-        let active = self.gc.active_count();
+        let active = unsafe { self.gc.as_mut().active_count() };
         // GC 统计：重置类型计数（保留 gc_cycles 累计），记录本次 GC 的类型分布
         if gc_stats_enabled() {
             GC_STATS.with(|cell| {
@@ -3723,7 +3611,7 @@ impl<'a> LuaState<'a> {
         self.call_finalizers(to_finalize);
 
         // 清扫（sweep_unreachable 会自动减少 gc_estimate）
-        self.gc.sweep_unreachable(&reachable);
+        unsafe { self.gc.as_mut().sweep_unreachable(&reachable) };
 
         // 协程回收：RustClosure 的 upvalues[0] 持有 Thread，由 mark_tvalue 遍历。
         // 协程可达性完全由 RustClosure 引用决定，无需额外清理（与原 wrap_coros 机制不同）。
@@ -3794,7 +3682,7 @@ impl<'a> LuaState<'a> {
         });
 
         // 重算 extra_estimate：反映当前可达的无 gc_header 对象的内存占用
-        self.gc.set_extra_estimate(extra_size);
+        unsafe { self.gc.as_mut().set_extra_estimate(extra_size) };
 
         // 自适应 GC 阈值：根据本次 GC 的回收效率动态调整阈值倍数
         // all.lua 实测 76% 的 GC freed=0（对象都在使用，纯浪费），此优化大幅减少无效 GC。
@@ -3803,8 +3691,8 @@ impl<'a> LuaState<'a> {
         //   < 20%  : 回收少     → pause * 3/2（阈值 = estimate * 3）
         //   >= 20% : 正常回收   → pause（阈值 = estimate * 2，默认）
         // 限制：effective_pause 上限 1000（避免阈值过高导致内存暴涨）
-        let pause = self.gc.get_gc_param(GCState::PARAM_PAUSE).max(1) as usize;
-        let active_after = self.gc.active_count();
+        let pause = unsafe { self.gc.as_mut().get_gc_param(GCState::PARAM_PAUSE).max(1) } as usize;
+        let active_after = unsafe { self.gc.as_mut().active_count() };
         let freed = active.saturating_sub(active_after);
         let freed_ratio = if active > 0 {
             freed as f64 / active as f64
@@ -3818,10 +3706,10 @@ impl<'a> LuaState<'a> {
         } else {
             pause
         };
-        let new_threshold = self.gc.total_estimate() * effective_pause / 100;
-        self.gc.set_collect_threshold(new_threshold);
-        self.gc.set_debt(100);
-        self.gc.step_accum.set(0);
+        let new_threshold = unsafe { self.gc.as_mut().total_estimate() } * effective_pause / 100;
+        unsafe { self.gc.as_mut().set_collect_threshold(new_threshold) };
+        unsafe { self.gc.as_mut().set_debt(100) };
+        unsafe { self.gc.as_mut().step_accum.set(0) };
 
         // GC 统计输出：累计统计 + 本次 GC 的可达/活跃对象数
         if gc_stats_enabled() {
@@ -3893,18 +3781,18 @@ impl<'a> LuaState<'a> {
         if siz == 0 {
             gc_trigger_inc(GcTrigger::Step);
             self.collect_gc();
-            self.gc.step_accum.set(0);
+            unsafe { self.gc.as_mut().step_accum.set(0) };
             true
         } else {
-            let acc = self.gc.step_accum.get() + siz;
-            let threshold = self.gc.active_count().max(1);
+            let acc = unsafe { self.gc.as_mut().step_accum.get() } + siz;
+            let threshold = unsafe { self.gc.as_mut().active_count().max(1) };
             if acc >= threshold {
                 gc_trigger_inc(GcTrigger::Step);
                 self.collect_gc();
-                self.gc.step_accum.set(0);
+                unsafe { self.gc.as_mut().step_accum.set(0) };
                 true
             } else {
-                self.gc.step_accum.set(acc);
+                unsafe { self.gc.as_mut().step_accum.set(acc) };
                 false
             }
         }
@@ -3923,7 +3811,7 @@ impl<'a> LuaState<'a> {
         worklist: &mut Vec<RawTValue<'a>>,
         extra_size: &mut usize,
     ) -> Vec<TValue<'a>> {
-        let gc_key = TValue::Str(self.gc_key_cached());
+        let gc_key = self.gc_key_cached();
         let mut to_finalize: Vec<TValue> = Vec::new();
         let mut keep: Vec<Table> = Vec::new();
 
@@ -3997,7 +3885,7 @@ impl<'a> LuaState<'a> {
     /// open upvalue 被关闭，finalizer 修改 closed upvalue 的值不会自动同步回
     /// 主线程栈上的原始位置，需要在此手动同步（通过协程的 upval_origins 记录）。
     fn call_finalizers(&mut self, to_finalize: Vec<TValue<'a>>) {
-        let gc_key = TValue::Str(self.gc_key_cached());
+        let gc_key = self.gc_key_cached();
 
         // 构建 upval_origins 映射：UpVal Rc 指针 -> original_stack_index
         // 遍历主线程栈上的所有协程，收集它们的 upval_origins（首次 resume 时记录）
@@ -4079,7 +3967,9 @@ impl<'a> LuaState<'a> {
             // "__exit_requested__" 错误中断 pcall，这是正常退出流程，不生成 warning
             if status != 0 && self.exit_requested.is_none() {
                 let msg = match self.exec.stack.last() {
-                    Some(TValue::Str(s)) => s.as_str().to_string(),
+                    Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
+                        lua_string_as_str(s).to_string()
+                    }
                     _ => "error object is not a string".to_string(),
                 };
                 self.warning("error in ", true);
@@ -4241,10 +4131,10 @@ impl<'a> LuaState<'a> {
                     let data = t.data.borrow();
                     let (weak_k, weak_v) = match &data.metatable {
                         Some(mt) => {
-                            let mode_key = TValue::Str(self.mode_key_cached());
+                            let mode_key = self.mode_key_cached();
                             match mt.get(&mode_key) {
-                                Some(TValue::Str(s)) => {
-                                    let mode = s.as_str();
+                                Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
+                                    let mode = lua_string_as_str(&s);
                                     (mode.contains('k'), mode.contains('v'))
                                 }
                                 _ => (false, false),
@@ -4413,7 +4303,10 @@ impl<'a> LuaState<'a> {
     /// 使用 total_estimate（含无 gc_header 对象的 extra_estimate）判断阈值，
     /// 使 GC 触发更准确反映真实内存占用
     pub fn maybe_collect_gc(&mut self) {
-        if self.gc.is_running() && self.gc.total_estimate() > self.gc.collect_threshold() {
+        if unsafe { self.gc.as_mut().is_running() }
+            && unsafe { self.gc.as_mut().total_estimate() }
+                > unsafe { self.gc.as_mut().collect_threshold() }
+        {
             gc_trigger_inc(GcTrigger::Maybe);
             self.collect_gc();
         }
@@ -4682,10 +4575,13 @@ mod tests {
             loc_vars: vec![],
             source: None,
         };
-        let gc = Rc::new(GCState::default_incremental());
+        let gs = Rc::new(RefCell::new(GlobalState {
+            gcstopem: false,
+            gc: GCState::default_incremental(),
+        }));
 
         // case 1: base=0, empty stack → main function scenario
-        let state = LuaState::from_proto(&proto, 0, vec![], gc.clone());
+        let state = LuaState::from_proto(&proto, 0, vec![], Rc::clone(&gs));
         assert_eq!(state.exec.base, 0);
         assert_eq!(
             state.exec.stack.len(),
@@ -4694,7 +4590,7 @@ mod tests {
         );
 
         // case 2: base=1, empty stack → called function scenario
-        let state = LuaState::from_proto(&proto, 1, vec![], gc.clone());
+        let state = LuaState::from_proto(&proto, 1, vec![], Rc::clone(&gs));
         assert_eq!(state.exec.base, 1);
         assert_eq!(
             state.exec.stack.len(),
@@ -4708,7 +4604,7 @@ mod tests {
             &proto,
             1,
             vec![TValue::Nil(NilKind::Strict), TValue::Integer(42)],
-            gc.clone(),
+            gs.clone(),
         );
         assert_eq!(state.exec.base, 1);
         assert_eq!(
@@ -4718,14 +4614,6 @@ mod tests {
         );
         assert!(matches!(state.exec.stack[0], TValue::Nil(NilKind::Strict)));
         assert_eq!(state.exec.stack[1], TValue::Integer(42));
-    }
-
-    #[test]
-    fn test_stack_init_with_gc() {
-        let gc = Rc::new(GCState::default_incremental());
-        let state = LuaState::with_gc(gc);
-        assert_eq!(state.gettop(), 1, "with_gc must also init stack");
-        assert_eq!(state.exec.stack.capacity(), BASIC_STACK_SIZE + EXTRA_STACK);
     }
 
     #[test]

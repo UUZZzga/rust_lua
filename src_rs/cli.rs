@@ -9,6 +9,7 @@ use crate::state::{LuaState, ERR_RUN, ERR_SYNTAX, MIN_STACK, MULT_RET};
 
 #[cfg(size_optimized)]
 use crate::state::LuaStderr;
+use crate::strings::lua_string_as_str;
 
 use std::io::{self, IsTerminal};
 use std::rc::Rc;
@@ -16,7 +17,8 @@ use std::sync::atomic::Ordering;
 
 const LUA_PROGNAME: &str = "lua";
 const LUA_INIT_VAR: &str = "LUA_INIT";
-const LUA_VERSUFFIX: &str = "_5_5";
+const LUA_VERSUFFIX: &str = crate::config::LUA_VERSUFFIX;
+const LUA_INITVARVERSION: &str = concatcp!(LUA_INIT_VAR, LUA_VERSUFFIX);
 const LUA_PROMPT: &str = "> ";
 const LUA_PROMPT2: &str = ">> ";
 const LUA_MAXINPUT: usize = 512;
@@ -35,7 +37,7 @@ pub struct Interpreter<'io> {
 
 impl<'io> Interpreter<'io> {
     pub fn new(io: &'io mut dyn crate::mock::io_mock::Io) -> Self {
-        let l = LuaState::new(io);
+        let mut l = LuaState::new(io);
         l.gc_stop();
         Interpreter {
             l,
@@ -91,7 +93,7 @@ impl<'io> Interpreter<'io> {
                 let errobj = self.l.obj_at(-1).cloned();
                 let ts_result = match &errobj {
                     Some(TValue::Table(t)) => {
-                        let tostring_key = TValue::Str(self.l.intern_str("__tostring"));
+                        let tostring_key = self.l.intern_str("__tostring");
                         let meta_fn = {
                             let data = t.data.borrow();
                             data.metatable.as_ref().and_then(|mt| mt.get(&tostring_key))
@@ -258,23 +260,23 @@ impl<'io> Interpreter<'io> {
     }
 
     fn handle_luainit(&mut self) -> i32 {
-        let init_var = format!("{}{}", LUA_INIT_VAR, LUA_VERSUFFIX);
-        if let Ok(init) = std::env::var(&init_var) {
+        let init_var = concatcp!("=", LUA_INITVARVERSION);
+        if let Ok(init) = std::env::var(&init_var[1..]) {
             return self.doinit(&init, &init_var);
         }
-        if let Ok(init) = std::env::var(LUA_INIT_VAR) {
-            return self.doinit(&init, LUA_INIT_VAR);
+        let init_var = concatcp!("=", LUA_INIT_VAR);
+        if let Ok(init) = std::env::var(&init_var[1..]) {
+            return self.doinit(&init, &init_var);
         }
         0
     }
 
-    fn doinit(&mut self, init: &str, varname: &str) -> i32 {
+    fn doinit(&mut self, init: &str, name: &str) -> i32 {
         if let Some(stripped) = init.strip_prefix('@') {
             let status = self.l.load_file(Some(stripped));
             self.dochunk(status)
         } else {
-            let name = format!("={}", varname);
-            self.dostring(init, &name)
+            self.dostring(init, name)
         }
     }
 
@@ -400,9 +402,11 @@ impl<'io> Interpreter<'io> {
         }
         // 对应 C 的 luaL_tolstring: 字符串直接用，表调用 __tostring
         let result = match self.l.obj_at(-1).cloned() {
-            Some(TValue::Str(s)) => Some(s.as_str().to_string()),
+            Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
+                Some(lua_string_as_str(&s).to_string())
+            }
             Some(TValue::Table(t)) => {
-                let tostring_key = TValue::Str(self.l.intern_str("__tostring"));
+                let tostring_key = self.l.intern_str("__tostring");
                 let meta_fn = {
                     let data = t.data.borrow();
                     data.metatable.as_ref().and_then(|mt| mt.get(&tostring_key))
@@ -658,7 +662,7 @@ impl<'io> Interpreter<'io> {
         }
 
         if args & HAS_EE != 0 {
-            let key = TValue::Str(self.l.intern_str("LUA_NOENV"));
+            let key = self.l.intern_str("LUA_NOENV");
             self.l.registry.set(key, TValue::Boolean(true));
         }
 
@@ -768,10 +772,6 @@ pub fn main() {
         eprintln!(
             "LClosure: {}",
             std::mem::size_of::<crate::objects::LClosure>()
-        );
-        eprintln!(
-            "LuaString: {}",
-            std::mem::size_of::<crate::strings::LuaString>()
         );
         eprintln!("Proto: {}", std::mem::size_of::<crate::objects::Proto>());
         eprintln!(

@@ -13,6 +13,7 @@
 use crate::execute::VmError;
 use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
+use crate::strings::lua_string_as_str;
 use crate::table::Table;
 
 // ============================================================================
@@ -203,7 +204,9 @@ fn get_str_bytes<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> Result<Vec<u
         )));
     }
     match &state.exec.stack[stack_idx] {
-        TValue::Str(s) => Ok(s.as_str().as_bytes().to_vec()),
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+            Ok(lua_string_as_str(s).as_bytes().to_vec())
+        }
         TValue::Integer(n) => {
             // 体积优先: 用 i64_to_string 避免 n.to_string() 引入 core::fmt::num
             #[cfg(size_optimized)]
@@ -234,7 +237,9 @@ fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: i64) -> i64 
         TValue::Nil(_) => default,
         TValue::Integer(n) => *n,
         TValue::Float(f) => *f as i64,
-        TValue::Str(s) => s.as_str().parse::<i64>().unwrap_or(default),
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+            lua_string_as_str(s).parse::<i64>().unwrap_or(default)
+        }
         _ => default,
     }
 }
@@ -266,13 +271,15 @@ fn get_required_int_arg<'a>(
     match &state.exec.stack[stack_idx] {
         TValue::Integer(n) => Ok(*n),
         TValue::Float(f) => Ok(*f as i64),
-        TValue::Str(s) => s.as_str().parse::<i64>().map_err(|_| {
-            VmError::RuntimeError(format!(
-                "bad argument #{} to '{}' (number expected, got string)",
-                idx + 1,
-                fname
-            ))
-        }),
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+            lua_string_as_str(s).parse::<i64>().map_err(|_| {
+                VmError::RuntimeError(format!(
+                    "bad argument #{} to '{}' (number expected, got string)",
+                    idx + 1,
+                    fname
+                ))
+            })
+        }
         _ => Err(VmError::RuntimeError(format!(
             "bad argument #{} to '{}' (number expected, got {})",
             idx + 1,
@@ -290,7 +297,7 @@ fn push_results<'a>(state: &mut LuaState<'a>, a: usize, nresults: i32, results: 
 /// 将字节序列创建为 Lua 字符串（使用 unsafe 绕过 UTF-8 校验，与 string 库一致）
 fn bytes_to_lua_str<'a>(state: &LuaState<'a>, bytes: &[u8]) -> TValue<'a> {
     let s = unsafe { String::from_utf8_unchecked(bytes.to_vec()) };
-    TValue::Str(state.intern_str(&s))
+    state.intern_str(&s)
 }
 
 // ============================================================================
@@ -699,7 +706,7 @@ fn call_iter<'a>(
     };
 
     let s_bytes: Vec<u8> = match &s_val {
-        TValue::Str(s) => s.as_str().as_bytes().to_vec(),
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => lua_string_as_str(s).as_bytes().to_vec(),
         _ => {
             return Err(VmError::RuntimeError(
                 "bad argument #1 to 'iter' (string expected)".to_string(),
@@ -791,8 +798,8 @@ pub fn create_utf8_lib_table<'a>(state: &LuaState<'a>) -> crate::table::Table<'a
     // 设置 charpattern 字段
     let pattern_str = unsafe { String::from_utf8_unchecked(UTF8PATT_BYTES.to_vec()) };
     lib.set(
-        TValue::Str(state.intern_str("charpattern")),
-        TValue::Str(state.intern_str(&pattern_str)),
+        state.intern_str("charpattern"),
+        state.intern_str(&pattern_str),
     );
 
     lib
@@ -801,7 +808,7 @@ pub fn create_utf8_lib_table<'a>(state: &LuaState<'a>) -> crate::table::Table<'a
 /// 打开 UTF-8 库并注册到全局变量 utf8
 pub fn open_utf8_lib(state: &mut LuaState) {
     let lib = create_utf8_lib_table(state);
-    let key = TValue::Str(state.intern_str("utf8"));
+    let key = state.intern_str("utf8");
     state.globals.set(key, TValue::Table(lib));
 }
 

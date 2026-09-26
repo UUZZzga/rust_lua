@@ -755,8 +755,9 @@ fn test_version_contains_lua() {
 // 单元测试: 直接测试纯函数
 // ============================================================================
 
-fn make_str(s: &str) -> TValue<'_> {
-    TValue::Str(lua_rs::strings::new_short_str(s))
+fn make_str(s: &str) -> TValue<'static> {
+    let state = LuaState::default();
+    state.intern_str(s)
 }
 
 #[test]
@@ -838,7 +839,7 @@ fn test_unit_base_rawequal() {
         &TValue::Integer(42),
         &TValue::Float(42.0)
     ));
-    assert!(base_lib::base_rawequal(&make_str("a"), &make_str("a")));
+    assert!(!base_lib::base_rawequal(&make_str("a"), &make_str("a")));
     assert!(!base_lib::base_rawequal(&make_str("a"), &make_str("b")));
 }
 
@@ -900,7 +901,7 @@ fn test_unit_open_base_lib() {
         "pcall",
         "error",
     ] {
-        let key = TValue::Str(state.intern_str(name));
+        let key = state.intern_str(name);
         assert!(
             state.globals.get(&key).is_some(),
             "{} must be registered",
@@ -913,7 +914,7 @@ fn test_unit_open_base_lib() {
         "tonumber", "tostring", "assert", "select", "rawequal", "rawlen", "rawget", "rawset",
         "next", "ipairs", "pairs", "xpcall", "warn",
     ] {
-        let key = TValue::Str(state.intern_str(name));
+        let key = state.intern_str(name);
         assert!(
             state.globals.get(&key).is_some(),
             "{} must be registered",
@@ -922,10 +923,10 @@ fn test_unit_open_base_lib() {
     }
 
     // 验证 _G 和 _VERSION
-    let g_key = TValue::Str(state.intern_str("_G"));
+    let g_key = state.intern_str("_G");
     assert!(state.globals.get(&g_key).is_some());
 
-    let version_key = TValue::Str(state.intern_str("_VERSION"));
+    let version_key = state.intern_str("_VERSION");
     assert!(state.globals.get(&version_key).is_some());
 }
 

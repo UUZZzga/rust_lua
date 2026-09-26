@@ -17,6 +17,7 @@
 use crate::execute::VmError;
 use crate::objects::{BuiltinFn, LuaType, NilKind, RustClosure, TValue};
 use crate::state::LuaState;
+use crate::strings::lua_string_as_str;
 use crate::table::Table;
 use std::cell::RefCell;
 use std::io::Write;
@@ -215,8 +216,8 @@ fn check_file_arg<'a>(
         TValue::UserData(u) => {
             // 检查元表 __name == "FILE*"
             let is_file = u.metatable.as_ref().map_or(false, |mt| {
-                let name_key = TValue::Str(state.intern_str("__name"));
-                mt.get(&name_key) == Some(TValue::Str(state.intern_str("FILE*")))
+                let name_key = state.intern_str("__name");
+                mt.get(&name_key) == Some(state.intern_str(crate::config::FILEHANDLE))
             });
             if !is_file {
                 return Err(VmError::RuntimeError(format!(
@@ -227,7 +228,7 @@ fn check_file_arg<'a>(
             Ok(u.gc_header.ptr_id)
         }
         _ => {
-            let typearg = crate::tm::obj_type_name(&arg);
+            let typearg = crate::tm::obj_type_name(state, &arg);
             Err(VmError::RuntimeError(format!(
                 "bad argument #1 to '{}' (FILE* expected, got {})",
                 fname, typearg
@@ -265,12 +266,12 @@ fn new_file_userdata<'a>(
     };
     // 注册到 GC 并设置 id（使 mark_tvalue 能正确标记 reachable）
     // 用 gc_mem_size() 计费含 data/user_values 容量，比 size_of::<Udata>() 更接近真实占用
-    let ud_id = state.gc.register_object(udata.gc_mem_size());
+    let ud_id = unsafe { state.gc.as_mut().register_object(udata.gc_mem_size()) };
     udata.gc_header.set_id(ud_id);
     let ptr_id = udata.gc_header.ptr_id;
     state.file_handles.insert(ptr_id, file);
     // 如果元表有 __gc，注册到 ud_finobj_list
-    let gc_key = TValue::Str(state.intern_str("__gc"));
+    let gc_key = state.intern_str("__gc");
     let ud_rc = Rc::new(udata);
     if file_mt.get(&gc_key).is_some() {
         state.register_ud_finobj(&ud_rc);
@@ -333,7 +334,7 @@ fn file_result<'a>(
         } else {
             msg
         };
-        results.push(TValue::Str(state.intern_str(&full_msg)));
+        results.push(state.intern_str(&full_msg));
         results.push(TValue::Integer(en as i64));
         3
     }
@@ -366,7 +367,7 @@ pub fn exec_result<'a>(
             .to_string_lossy()
             .into_owned();
         results.push(TValue::Nil(NilKind::Strict));
-        results.push(TValue::Str(state.intern_str(&msg)));
+        results.push(state.intern_str(&msg));
         results.push(TValue::Integer(en as i64));
         return 3;
     }
@@ -384,7 +385,7 @@ pub fn exec_result<'a>(
     } else {
         results.push(TValue::Nil(NilKind::Strict));
     }
-    results.push(TValue::Str(state.intern_str(what)));
+    results.push(state.intern_str(what));
     results.push(TValue::Integer(code as i64));
     3
 }
@@ -413,23 +414,23 @@ fn call_io_open<'a>(
     }
     let filename_val = get_arg(state, a, 0);
     let filename = match &filename_val {
-        TValue::Str(s) => s.as_str().to_string(),
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => lua_string_as_str(s).to_string(),
         _ => {
             return Err(VmError::RuntimeError(format!(
                 "bad argument #1 to 'open' (string expected, got {})",
-                crate::tm::obj_type_name(&filename_val)
+                crate::tm::obj_type_name(state, &filename_val)
             )));
         }
     };
     let mode = if nargs >= 2 {
         let m = get_arg(state, a, 1);
         match &m {
-            TValue::Str(s) => s.as_str().to_string(),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => lua_string_as_str(s).to_string(),
             TValue::Nil(_) => "r".to_string(),
             _ => {
                 return Err(VmError::RuntimeError(format!(
                     "bad argument #2 to 'open' (string expected, got {})",
-                    crate::tm::obj_type_name(&m)
+                    crate::tm::obj_type_name(state, &m)
                 )));
             }
         }
@@ -463,8 +464,8 @@ fn call_io_open<'a>(
             .unwrap_or_else(|| {
                 let t = Table::new();
                 t.set(
-                    TValue::Str(state.intern_str("__name")),
-                    TValue::Str(state.intern_str("FILE*")),
+                    state.intern_str("__name"),
+                    state.intern_str(crate::config::FILEHANDLE),
                 );
                 t
             });
@@ -499,8 +500,8 @@ fn call_io_tmpfile<'a>(
             .unwrap_or_else(|| {
                 let t = Table::new();
                 t.set(
-                    TValue::Str(state.intern_str("__name")),
-                    TValue::Str(state.intern_str("FILE*")),
+                    state.intern_str("__name"),
+                    state.intern_str(crate::config::FILEHANDLE),
                 );
                 t
             });
@@ -534,23 +535,23 @@ fn call_io_popen<'a>(
     }
     let prog_val = get_arg(state, a, 0);
     let prog = match &prog_val {
-        TValue::Str(s) => s.as_str().to_string(),
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => lua_string_as_str(s).to_string(),
         _ => {
             return Err(VmError::RuntimeError(format!(
                 "bad argument #1 to 'popen' (string expected, got {})",
-                crate::tm::obj_type_name(&prog_val)
+                crate::tm::obj_type_name(state, &prog_val)
             )));
         }
     };
     let mode = if nargs >= 2 {
         let m = get_arg(state, a, 1);
         match &m {
-            TValue::Str(s) => s.as_str().to_string(),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => lua_string_as_str(s).to_string(),
             TValue::Nil(_) => "r".to_string(),
             _ => {
                 return Err(VmError::RuntimeError(format!(
                     "bad argument #2 to 'popen' (string expected, got {})",
-                    crate::tm::obj_type_name(&m)
+                    crate::tm::obj_type_name(state, &m)
                 )));
             }
         }
@@ -586,8 +587,8 @@ fn call_io_popen<'a>(
             .unwrap_or_else(|| {
                 let t = Table::new();
                 t.set(
-                    TValue::Str(state.intern_str("__name")),
-                    TValue::Str(state.intern_str("FILE*")),
+                    state.intern_str("__name"),
+                    state.intern_str(crate::config::FILEHANDLE),
                 );
                 t
             });
@@ -628,7 +629,9 @@ fn g_write<'a>(
             TValue::Nil(NilKind::Strict)
         };
         let bytes: Vec<u8> = match &val {
-            TValue::Str(s) => s.as_str().as_bytes().to_vec(),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                lua_string_as_str(s).as_bytes().to_vec()
+            }
             TValue::Integer(n) => n.to_string().into_bytes(),
             TValue::Float(_fl) => crate::stdlib::base_lib::lua_value_to_string(&val).into_bytes(),
             _ => {
@@ -636,7 +639,7 @@ fn g_write<'a>(
                 return Err(VmError::RuntimeError(format!(
                     "bad argument #{} to 'write' (string or number expected, got {})",
                     i + 1,
-                    crate::tm::obj_type_name(&val)
+                    crate::tm::obj_type_name(state, &val)
                 )));
             }
         };
@@ -655,7 +658,7 @@ fn g_write<'a>(
             };
             return Ok(vec![
                 TValue::Nil(NilKind::Strict),
-                TValue::Str(state.intern_str(&msg)),
+                (state.intern_str(&msg)),
                 TValue::Integer(en as i64),
                 TValue::Integer(total_bytes as i64),
             ]);
@@ -706,8 +709,8 @@ fn call_io_output<'a>(
                 TValue::UserData(u) => {
                     // 校验是 FILE* userdata
                     let is_file = u.metatable.as_ref().map_or(false, |mt| {
-                        let name_key = TValue::Str(state.intern_str("__name"));
-                        mt.get(&name_key) == Some(TValue::Str(state.intern_str("FILE*")))
+                        let name_key = state.intern_str("__name");
+                        mt.get(&name_key) == Some(state.intern_str(crate::config::FILEHANDLE))
                     });
                     if !is_file {
                         return Err(VmError::RuntimeError(format!(
@@ -717,16 +720,13 @@ fn call_io_output<'a>(
                     state.io_output_handle = Some(u.gc_header.ptr_id);
                     state.io_output = None; // 清除 Box<dyn Write>
                                             // 保存到 io 表的 _current_output 字段
-                    let io_key = TValue::Str(state.intern_str("io"));
+                    let io_key = state.intern_str("io");
                     if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
-                        io_table.set(
-                            TValue::Str(state.intern_str("_current_output")),
-                            arg.clone(),
-                        );
+                        io_table.set(state.intern_str("_current_output"), arg.clone());
                     }
                 }
-                TValue::Str(s) => {
-                    let filename = s.as_str().to_string();
+                s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                    let filename = lua_string_as_str(s).to_string();
                     // 用 fopen 打开文件，模式 "w"
                     unsafe {
                         *compat::errno_ptr() = 0;
@@ -748,8 +748,8 @@ fn call_io_output<'a>(
                         .unwrap_or_else(|| {
                             let t = Table::new();
                             t.set(
-                                TValue::Str(state.intern_str("__name")),
-                                TValue::Str(state.intern_str("FILE*")),
+                                state.intern_str("__name"),
+                                state.intern_str(crate::config::FILEHANDLE),
                             );
                             t
                         });
@@ -759,16 +759,13 @@ fn call_io_output<'a>(
                     }
                     state.io_output = None;
                     // 保存到 io 表的 _current_output 字段
-                    let io_key = TValue::Str(state.intern_str("io"));
+                    let io_key = state.intern_str("io");
                     if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
-                        io_table.set(
-                            TValue::Str(state.intern_str("_current_output")),
-                            udata.clone(),
-                        );
+                        io_table.set(state.intern_str("_current_output"), udata.clone());
                     }
                 }
                 _ => {
-                    let typearg = crate::tm::obj_type_name(&arg);
+                    let typearg = crate::tm::obj_type_name(state, &arg);
                     return Err(VmError::RuntimeError(format!(
                         "bad argument #1 to 'output' (FILE* expected, got {})",
                         typearg
@@ -799,8 +796,8 @@ fn call_io_input<'a>(
             match &arg {
                 TValue::UserData(u) => {
                     let is_file = u.metatable.as_ref().map_or(false, |mt| {
-                        let name_key = TValue::Str(state.intern_str("__name"));
-                        mt.get(&name_key) == Some(TValue::Str(state.intern_str("FILE*")))
+                        let name_key = state.intern_str("__name");
+                        mt.get(&name_key) == Some(state.intern_str(crate::config::FILEHANDLE))
                     });
                     if !is_file {
                         return Err(VmError::RuntimeError(format!(
@@ -809,13 +806,13 @@ fn call_io_input<'a>(
                     }
                     state.io_input_handle = Some(u.gc_header.ptr_id);
                     // 保存到 io 表的 _current_input 字段
-                    let io_key = TValue::Str(state.intern_str("io"));
+                    let io_key = state.intern_str("io");
                     if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
-                        io_table.set(TValue::Str(state.intern_str("_current_input")), arg.clone());
+                        io_table.set(state.intern_str("_current_input"), arg.clone());
                     }
                 }
-                TValue::Str(s) => {
-                    let filename = s.as_str().to_string();
+                s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                    let filename = lua_string_as_str(s).to_string();
                     unsafe {
                         *compat::errno_ptr() = 0;
                     }
@@ -836,8 +833,8 @@ fn call_io_input<'a>(
                         .unwrap_or_else(|| {
                             let t = Table::new();
                             t.set(
-                                TValue::Str(state.intern_str("__name")),
-                                TValue::Str(state.intern_str("FILE*")),
+                                state.intern_str("__name"),
+                                state.intern_str(crate::config::FILEHANDLE),
                             );
                             t
                         });
@@ -846,16 +843,13 @@ fn call_io_input<'a>(
                         state.io_input_handle = Some(u.gc_header.ptr_id);
                     }
                     // 保存到 io 表的 _current_input 字段
-                    let io_key = TValue::Str(state.intern_str("io"));
+                    let io_key = state.intern_str("io");
                     if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
-                        io_table.set(
-                            TValue::Str(state.intern_str("_current_input")),
-                            udata.clone(),
-                        );
+                        io_table.set(state.intern_str("_current_input"), udata.clone());
                     }
                 }
                 _ => {
-                    let typearg = crate::tm::obj_type_name(&arg);
+                    let typearg = crate::tm::obj_type_name(state, &arg);
                     return Err(VmError::RuntimeError(format!(
                         "bad argument #1 to 'input' (FILE* expected, got {})",
                         typearg
@@ -885,10 +879,10 @@ fn call_io_close<'a>(
         let ptr_id = state.io_output_handle;
         if let Some(pid) = ptr_id {
             // 检查是否是标准文件 (stdin/stdout/stderr) — 对应 C 的 io_noclose
-            let io_key = TValue::Str(state.intern_str("io"));
+            let io_key = state.intern_str("io");
             let is_standard = if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
                 ["stdin", "stdout", "stderr"].iter().any(|name| {
-                    let key = TValue::Str(state.intern_str(name));
+                    let key = state.intern_str(name);
                     if let Some(TValue::UserData(u2)) = io_table.get(&key) {
                         u2.gc_header.ptr_id == pid
                     } else {
@@ -905,7 +899,7 @@ fn call_io_close<'a>(
                     nresults,
                     vec![
                         TValue::Nil(NilKind::Strict),
-                        TValue::Str(state.intern_str("cannot close standard file")),
+                        (state.intern_str("cannot close standard file")),
                     ],
                 );
                 return Ok(());
@@ -959,10 +953,10 @@ fn close_file_handle<'a>(
     let ptr_id = check_file_arg(state, a, nargs, "close")?;
 
     // 检查是否是标准文件 (stdin/stdout/stderr)
-    let io_key = TValue::Str(state.intern_str("io"));
+    let io_key = state.intern_str("io");
     let is_standard = if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
         ["stdin", "stdout", "stderr"].iter().any(|name| {
-            let key = TValue::Str(state.intern_str(name));
+            let key = state.intern_str(name);
             if let Some(TValue::UserData(u)) = io_table.get(&key) {
                 u.gc_header.ptr_id == ptr_id
             } else {
@@ -979,7 +973,7 @@ fn close_file_handle<'a>(
             nresults,
             vec![
                 TValue::Nil(NilKind::Strict),
-                TValue::Str(state.intern_str("cannot close standard file")),
+                (state.intern_str("cannot close standard file")),
             ],
         );
         return Ok(());
@@ -1031,14 +1025,14 @@ fn call_io_type<'a>(
     let result = match &arg {
         TValue::UserData(u) => {
             let is_file = u.metatable.as_ref().map_or(false, |mt| {
-                let name_key = TValue::Str(state.intern_str("__name"));
-                mt.get(&name_key) == Some(TValue::Str(state.intern_str("FILE*")))
+                let name_key = state.intern_str("__name");
+                mt.get(&name_key) == Some(state.intern_str(crate::config::FILEHANDLE))
             });
             if is_file {
                 if is_closed(state, u.gc_header.ptr_id) {
-                    TValue::Str(state.intern_str("closed file"))
+                    state.intern_str("closed file")
                 } else {
-                    TValue::Str(state.intern_str("file"))
+                    state.intern_str("file")
                 }
             } else {
                 TValue::Nil(NilKind::Strict)
@@ -1321,7 +1315,7 @@ fn g_read<'a>(
     if nargs == 0 {
         // 默认读一行
         match read_line(f, true) {
-            Some(buf) => results.push(TValue::Str(crate::strings::new_long_bytes(buf))),
+            Some(buf) => results.push(crate::strings::new_lstr_bytes(&state.string_table, &buf)),
             None => results.push(TValue::Nil(NilKind::Strict)),
         }
         success = !results[0].is_nil();
@@ -1349,7 +1343,7 @@ fn g_read<'a>(
                             unsafe {
                                 libc::ungetc(c, f);
                             }
-                            results.push(TValue::Str(state.intern_str("")));
+                            results.push(state.intern_str(""));
                         } else {
                             success = false;
                             results.push(TValue::Nil(NilKind::Strict));
@@ -1357,7 +1351,10 @@ fn g_read<'a>(
                     } else {
                         match read_chars(f, n as usize) {
                             Some(buf) => {
-                                results.push(TValue::Str(crate::strings::new_long_bytes(buf)));
+                                results.push(crate::strings::new_lstr_bytes(
+                                    &state.string_table,
+                                    &buf,
+                                ));
                             }
                             None => {
                                 success = false;
@@ -1378,7 +1375,7 @@ fn g_read<'a>(
                             unsafe {
                                 libc::ungetc(c, f);
                             }
-                            results.push(TValue::Str(state.intern_str("")));
+                            results.push(state.intern_str(""));
                         } else {
                             success = false;
                             results.push(TValue::Nil(NilKind::Strict));
@@ -1386,7 +1383,10 @@ fn g_read<'a>(
                     } else {
                         match read_chars(f, n as usize) {
                             Some(buf) => {
-                                results.push(TValue::Str(crate::strings::new_long_bytes(buf)));
+                                results.push(crate::strings::new_lstr_bytes(
+                                    &state.string_table,
+                                    &buf,
+                                ));
                             }
                             None => {
                                 success = false;
@@ -1395,8 +1395,8 @@ fn g_read<'a>(
                         }
                     }
                 }
-                TValue::Str(s) => {
-                    let p = s.as_str();
+                s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                    let p = lua_string_as_str(s);
                     let p = if p.starts_with('*') { &p[1..] } else { p };
                     if p.is_empty() {
                         // 无效格式
@@ -1414,18 +1414,16 @@ fn g_read<'a>(
                             }
                         },
                         b'l' => match read_line(f, true) {
-                            Some(buf) => {
-                                results.push(TValue::Str(crate::strings::new_long_bytes(buf)))
-                            }
+                            Some(buf) => results
+                                .push(crate::strings::new_lstr_bytes(&state.string_table, &buf)),
                             None => {
                                 success = false;
                                 results.push(TValue::Nil(NilKind::Strict));
                             }
                         },
                         b'L' => match read_line(f, false) {
-                            Some(buf) => {
-                                results.push(TValue::Str(crate::strings::new_long_bytes(buf)))
-                            }
+                            Some(buf) => results
+                                .push(crate::strings::new_lstr_bytes(&state.string_table, &buf)),
                             None => {
                                 success = false;
                                 results.push(TValue::Nil(NilKind::Strict));
@@ -1433,7 +1431,7 @@ fn g_read<'a>(
                         },
                         b'a' => {
                             let buf = read_all(f);
-                            results.push(TValue::Str(crate::strings::new_long_bytes(buf)));
+                            results.push(crate::strings::new_lstr_bytes(&state.string_table, &buf));
                         }
                         _ => {
                             return Err(VmError::RuntimeError(format!(
@@ -1465,7 +1463,7 @@ fn g_read<'a>(
         };
         return Ok(vec![
             TValue::Nil(NilKind::Strict),
-            TValue::Str(state.intern_str(&msg)),
+            (state.intern_str(&msg)),
             TValue::Integer(en as i64),
         ]);
     }
@@ -1571,12 +1569,12 @@ fn call_file_seek<'a>(
     let whence = if nargs >= 2 {
         let v = get_arg(state, a, 1);
         match &v {
-            TValue::Str(s) => s.as_str().to_string(),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => lua_string_as_str(s).to_string(),
             TValue::Nil(_) => "cur".to_string(),
             _ => {
                 return Err(VmError::RuntimeError(format!(
                     "bad argument #2 to 'seek' (string expected, got {})",
-                    crate::tm::obj_type_name(&v)
+                    crate::tm::obj_type_name(state, &v)
                 )));
             }
         }
@@ -1613,7 +1611,7 @@ fn call_file_seek<'a>(
             _ => {
                 return Err(VmError::RuntimeError(format!(
                     "bad argument #3 to 'seek' (integer expected, got {})",
-                    crate::tm::obj_type_name(&v)
+                    crate::tm::obj_type_name(state, &v)
                 )));
             }
         }
@@ -1639,7 +1637,7 @@ fn call_file_seek<'a>(
             nresults,
             vec![
                 TValue::Nil(NilKind::Strict),
-                TValue::Str(state.intern_str(&msg)),
+                (state.intern_str(&msg)),
                 TValue::Integer(en as i64),
             ],
         );
@@ -1720,11 +1718,11 @@ fn call_file_setvbuf<'a>(
     let mode_str = if nargs >= 2 {
         let v = get_arg(state, a, 1);
         match &v {
-            TValue::Str(s) => s.as_str().to_string(),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => lua_string_as_str(s).to_string(),
             _ => {
                 return Err(VmError::RuntimeError(format!(
                     "bad argument #2 to 'setvbuf' (string expected, got {})",
-                    crate::tm::obj_type_name(&v)
+                    crate::tm::obj_type_name(state, &v)
                 )));
             }
         }
@@ -1836,7 +1834,7 @@ fn call_io_lines<'a>(
             get_stdin_ptr_id(state)
         });
         // io.lines() 默认格式 "l"
-        let formats = vec![TValue::Str(state.intern_str("l"))];
+        let formats = vec![(state.intern_str("l"))];
         results.push(new_lines_iterator(state, ptr_id, false, formats));
         state.adjust_results(a, nresults, results);
         return Ok(());
@@ -1851,7 +1849,7 @@ fn call_io_lines<'a>(
         let formats = if nargs >= 2 {
             (1..nargs).map(|i| get_arg(state, a, i)).collect::<Vec<_>>()
         } else {
-            vec![TValue::Str(state.intern_str("l"))]
+            vec![(state.intern_str("l"))]
         };
         results.push(new_lines_iterator(state, ptr_id, false, formats));
         state.adjust_results(a, nresults, results);
@@ -1860,8 +1858,8 @@ fn call_io_lines<'a>(
 
     // 第一个参数是字符串: 打开文件
     match &first {
-        TValue::Str(s) => {
-            let filename = s.as_str().to_string();
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+            let filename = lua_string_as_str(s).to_string();
             unsafe {
                 *compat::errno_ptr() = 0;
             }
@@ -1882,8 +1880,8 @@ fn call_io_lines<'a>(
                 .unwrap_or_else(|| {
                     let t = Table::new();
                     t.set(
-                        TValue::Str(state.intern_str("__name")),
-                        TValue::Str(state.intern_str("FILE*")),
+                        state.intern_str("__name"),
+                        state.intern_str(crate::config::FILEHANDLE),
                     );
                     t
                 });
@@ -1897,7 +1895,7 @@ fn call_io_lines<'a>(
             let formats = if nargs >= 2 {
                 (1..nargs).map(|i| get_arg(state, a, i)).collect::<Vec<_>>()
             } else {
-                vec![TValue::Str(state.intern_str("l"))]
+                vec![(state.intern_str("l"))]
             };
             let iter = new_lines_iterator(state, ptr_id, true, formats);
             // toclose=1: 返回 4 个值 (迭代器, nil state, nil control, file to-be-closed)
@@ -1913,7 +1911,7 @@ fn call_io_lines<'a>(
         }
         _ => Err(VmError::RuntimeError(format!(
             "bad argument #1 to 'lines' (string expected, got {})",
-            crate::tm::obj_type_name(&first)
+            crate::tm::obj_type_name(state, &first)
         ))),
     }
 }
@@ -1938,7 +1936,7 @@ fn call_file_lines<'a>(
     let formats = if nargs >= 2 {
         (1..nargs).map(|i| get_arg(state, a, i)).collect::<Vec<_>>()
     } else {
-        vec![TValue::Str(state.intern_str("l"))]
+        vec![(state.intern_str("l"))]
     };
     let result = new_lines_iterator(state, ptr_id, false, formats);
     state.adjust_results(a, nresults, vec![result]);
@@ -2020,8 +2018,8 @@ fn call_lines_iterator_fn<'a>(
         // EOF 或错误
         if results.len() > 1 {
             // 错误信息
-            let err_msg = if let TValue::Str(s) = &results[1] {
-                s.as_str().to_string()
+            let err_msg = if let s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = &results[1] {
+                lua_string_as_str(s).to_string()
             } else {
                 String::new()
             };
@@ -2108,11 +2106,11 @@ fn get_default_input<'a>(state: &mut LuaState<'a>) -> Result<*mut libc::FILE, Vm
 
 /// 获取当前输出流的 UserData (用于 io.output() 返回值)
 fn get_current_output_userdata<'a>(state: &mut LuaState<'a>) -> TValue<'a> {
-    let io_key = TValue::Str(state.intern_str("io"));
+    let io_key = state.intern_str("io");
     if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
         if let Some(pid) = state.io_output_handle {
             // 先检查 _current_output 字段
-            let cur_key = TValue::Str(state.intern_str("_current_output"));
+            let cur_key = state.intern_str("_current_output");
             if let Some(v) = io_table.get(&cur_key) {
                 if let TValue::UserData(u) = &v {
                     if u.gc_header.ptr_id == pid {
@@ -2121,7 +2119,7 @@ fn get_current_output_userdata<'a>(state: &mut LuaState<'a>) -> TValue<'a> {
                 }
             }
             // 再检查 stdout
-            let stdout_key = TValue::Str(state.intern_str("stdout"));
+            let stdout_key = state.intern_str("stdout");
             if let Some(stdout_val) = io_table.get(&stdout_key) {
                 if let TValue::UserData(u) = &stdout_val {
                     if u.gc_header.ptr_id == pid {
@@ -2132,7 +2130,7 @@ fn get_current_output_userdata<'a>(state: &mut LuaState<'a>) -> TValue<'a> {
             return TValue::Nil(NilKind::Strict);
         }
         // 默认返回 io.stdout
-        let stdout_key = TValue::Str(state.intern_str("stdout"));
+        let stdout_key = state.intern_str("stdout");
         if let Some(stdout_val) = io_table.get(&stdout_key) {
             return stdout_val;
         }
@@ -2142,18 +2140,18 @@ fn get_current_output_userdata<'a>(state: &mut LuaState<'a>) -> TValue<'a> {
 
 /// 获取当前输入流的 UserData (用于 io.input() 返回值)
 fn get_current_input_userdata<'a>(state: &mut LuaState<'a>) -> TValue<'a> {
-    let io_key = TValue::Str(state.intern_str("io"));
+    let io_key = state.intern_str("io");
     if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
         if let Some(pid) = state.io_input_handle {
             // 先检查 _current_input 字段
-            let cur_key = TValue::Str(state.intern_str("_current_input"));
+            let cur_key = state.intern_str("_current_input");
             if let Some(TValue::UserData(u)) = io_table.get(&cur_key) {
                 if u.gc_header.ptr_id == pid {
                     return TValue::UserData(u);
                 }
             }
             // 再检查 stdin
-            let stdin_key = TValue::Str(state.intern_str("stdin"));
+            let stdin_key = state.intern_str("stdin");
             if let Some(stdin_val) = io_table.get(&stdin_key) {
                 if let TValue::UserData(u) = &stdin_val {
                     if u.gc_header.ptr_id == pid {
@@ -2164,7 +2162,7 @@ fn get_current_input_userdata<'a>(state: &mut LuaState<'a>) -> TValue<'a> {
             return TValue::Nil(NilKind::Strict);
         }
         // 默认返回 io.stdin
-        let stdin_key = TValue::Str(state.intern_str("stdin"));
+        let stdin_key = state.intern_str("stdin");
         if let Some(stdin_val) = io_table.get(&stdin_key) {
             return stdin_val;
         }
@@ -2174,9 +2172,9 @@ fn get_current_input_userdata<'a>(state: &mut LuaState<'a>) -> TValue<'a> {
 
 /// 获取 io.stdin 的 ptr_id
 fn get_stdin_ptr_id(state: &LuaState) -> u32 {
-    let io_key = TValue::Str(state.intern_str("io"));
+    let io_key = state.intern_str("io");
     if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
-        let stdin_key = TValue::Str(state.intern_str("stdin"));
+        let stdin_key = state.intern_str("stdin");
         if let Some(TValue::UserData(u)) = io_table.get(&stdin_key) {
             return u.gc_header.ptr_id;
         }
@@ -2197,10 +2195,10 @@ fn call_file_gc<'a>(
     let ptr_id = check_file_arg(state, a, nargs, "__gc")?;
     if let Some(f) = state.file_handles.get(&ptr_id).copied() {
         // 检查是否是标准文件
-        let io_key = TValue::Str(state.intern_str("io"));
+        let io_key = state.intern_str("io");
         let is_standard = if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
             ["stdin", "stdout", "stderr"].iter().any(|name| {
-                let key = TValue::Str(state.intern_str(name));
+                let key = state.intern_str(name);
                 if let Some(TValue::UserData(u2)) = io_table.get(&key) {
                     u2.gc_header.ptr_id == ptr_id
                 } else {
@@ -2246,10 +2244,10 @@ fn call_file_tostring<'a>(
 ) -> Result<(), VmError<'a>> {
     let ptr_id = check_file_arg(state, a, nargs, "__tostring")?;
     let result = if is_closed(state, ptr_id) {
-        TValue::Str(state.intern_str("file (closed)"))
+        state.intern_str("file (closed)")
     } else {
         // 简化: 返回 "file (0x0)"
-        TValue::Str(state.intern_str("file (0x0)"))
+        state.intern_str("file (0x0)")
     };
     state.adjust_results(a, nresults, vec![result]);
     Ok(())
@@ -2275,8 +2273,8 @@ pub fn open_io_lib<'a>(state: &mut LuaState<'a>) {
 
     // 创建 FILE* 元表 (对应 C 的 LUA_FILEHANDLE)
     let mut file_mt = Table::new();
-    let name_key = TValue::Str(state.intern_str("__name"));
-    file_mt.set(name_key, TValue::Str(state.intern_str("FILE*")));
+    let name_key = state.intern_str("__name");
+    file_mt.set(name_key, state.intern_str(crate::config::FILEHANDLE));
     // FILE* 元方法 (用 BuiltinFn 注册)
     register(&mut file_mt, state, c"__gc", call_file_gc);
     register(&mut file_mt, state, c"__close", call_file_close);
@@ -2291,10 +2289,7 @@ pub fn open_io_lib<'a>(state: &mut LuaState<'a>) {
     register(&mut file_methods, state, c"lines", call_file_lines);
     register(&mut file_methods, state, c"flush", call_file_flush);
     register(&mut file_methods, state, c"setvbuf", call_file_setvbuf);
-    file_mt.set(
-        TValue::Str(state.intern_str("__index")),
-        TValue::Table(file_methods),
-    );
+    file_mt.set(state.intern_str("__index"), TValue::Table(file_methods));
 
     // 注册为 UserData 的默认元表
     let mt = crate::tm::Metatable::new(file_mt.clone());
@@ -2319,13 +2314,13 @@ pub fn open_io_lib<'a>(state: &mut LuaState<'a>) {
     let stdout_val = make_stream(state, c_stdout());
     let stderr_val = make_stream(state, c_stderr());
 
-    let stdin_key = TValue::Str(state.intern_str("stdin"));
+    let stdin_key = state.intern_str("stdin");
     lib.set(stdin_key, stdin_val);
 
-    let stdout_key = TValue::Str(state.intern_str("stdout"));
+    let stdout_key = state.intern_str("stdout");
     lib.set(stdout_key, stdout_val);
 
-    let stderr_key = TValue::Str(state.intern_str("stderr"));
+    let stderr_key = state.intern_str("stderr");
     lib.set(stderr_key, stderr_val);
 
     // 注册 io 库函数 (用 BuiltinFn 注册)
@@ -2341,6 +2336,6 @@ pub fn open_io_lib<'a>(state: &mut LuaState<'a>) {
     register(&mut lib, state, c"tmpfile", call_io_tmpfile);
     register(&mut lib, state, c"popen", call_io_popen);
 
-    let key = TValue::Str(state.intern_str("io"));
+    let key = state.intern_str("io");
     state.globals.set(key, TValue::Table(lib));
 }

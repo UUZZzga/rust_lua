@@ -18,6 +18,7 @@ use crate::objects::{
     UpValVec,
 };
 use crate::state::{ExecState, LuaState};
+use crate::strings::lua_string_as_str;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -119,13 +120,7 @@ fn push_resume_error<'a>(
     nresults: i32,
     msg: &str,
 ) -> Result<(), VmError<'a>> {
-    push_resume_results(
-        state,
-        a,
-        nresults,
-        false,
-        vec![TValue::Str(state.intern_str(msg))],
-    );
+    push_resume_results(state, a, nresults, false, vec![(state.intern_str(msg))]);
     Ok(())
 }
 
@@ -973,12 +968,7 @@ fn call_status<'a>(
             )));
         }
     };
-    push_single_result(
-        state,
-        a,
-        nresults,
-        TValue::Str(state.intern_str(status_str)),
-    );
+    push_single_result(state, a, nresults, state.intern_str(status_str));
     Ok(())
 }
 
@@ -1062,7 +1052,7 @@ fn call_close<'a>(
                 .borrow()
                 .error_msg
                 .clone()
-                .unwrap_or_else(|| TValue::Str(state.intern_str("unknown error")));
+                .unwrap_or_else(|| state.intern_str("unknown error"));
             thread.context.borrow_mut().status = ThreadStatus::OK;
             thread.context.borrow_mut().error_msg = None;
             push_resume_results(state, a, nresults, false, vec![err]);
@@ -1112,7 +1102,7 @@ fn close_suspended_coroutine<'a>(
         let err_val = state
             .last_error_value
             .take()
-            .unwrap_or_else(|| TValue::Str(state.intern_str(&state.last_error_msg.clone())));
+            .unwrap_or_else(|| state.intern_str(&state.last_error_msg.clone()));
         Some(err_val)
     } else {
         None
@@ -1431,7 +1421,7 @@ fn call_resume<'a>(
                     } else {
                         format!("{}", e)
                     };
-                    TValue::Str(state.intern_str(&msg))
+                    state.intern_str(&msg)
                 }
             });
 
@@ -1483,13 +1473,13 @@ fn call_resume<'a>(
                     ctx.error_msg = Some(final_err.clone());
                 }
                 let result_val = match &final_err {
-                    TValue::Str(_) => {
+                    TValue::LongStr(_) | TValue::ShortStr(_) => {
                         let msg = if !state.last_error_msg.is_empty() {
                             state.last_error_msg.clone()
                         } else {
                             format!("{}", e)
                         };
-                        TValue::Str(state.intern_str(&msg))
+                        state.intern_str(&msg)
                     }
                     _ => final_err,
                 };
@@ -2083,7 +2073,7 @@ fn call_wrap_fn<'a>(
                 } else {
                     format!("{}", e)
                 };
-                TValue::Str(state.intern_str(&msg))
+                state.intern_str(&msg)
             });
             {
                 let mut ctx = co_context.borrow_mut();
@@ -2134,7 +2124,9 @@ fn call_wrap_fn<'a>(
     // 字符串错误用 RuntimeError，非字符串错误用 RuntimeErrorValue 保留原始 TValue
     if let Some(err_val) = error_val {
         return Err(match err_val {
-            TValue::Str(s) => VmError::RuntimeError(s.as_str().to_string()),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                VmError::RuntimeError(lua_string_as_str(&s).to_string())
+            }
             other => VmError::RuntimeErrorValue(other),
         });
     }
@@ -2382,7 +2374,7 @@ pub fn c_api_resume<'a>(
                     } else {
                         format!("{}", e)
                     };
-                    TValue::Str(state.intern_str(&msg))
+                    state.intern_str(&msg)
                 }
             });
             {
@@ -2411,10 +2403,7 @@ pub fn c_api_resume<'a>(
 
 /// 把错误消息 push 到 state.exec.stack，返回 nresults (1)
 fn push_error(state: &mut LuaState, msg: &str) -> usize {
-    state.exec.stack = vec![
-        TValue::Nil(NilKind::Strict),
-        TValue::Str(state.intern_str(msg)),
-    ];
+    state.exec.stack = vec![TValue::Nil(NilKind::Strict), (state.intern_str(msg))];
     state.exec.top = 2;
     1
 }
@@ -2446,6 +2435,6 @@ pub fn open_coroutine_lib<'a>(state: &mut LuaState<'a>) {
     register(&mut lib, state, c"yield", call_yield);
     register(&mut lib, state, c"close", call_close);
 
-    let key = TValue::Str(state.intern_str("coroutine"));
+    let key = state.intern_str("coroutine");
     state.globals.set(key, TValue::Table(lib));
 }

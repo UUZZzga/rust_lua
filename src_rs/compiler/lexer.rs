@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
-use crate::objects::FxBuildHasher;
+use crate::objects::{FxBuildHasher, TValue};
 use crate::state::LuaState;
-use crate::strings::LuaString;
+use crate::strings::{lua_string_as_str, LLuaString};
 
 const UTF8BUFFSZ: usize = 8;
 
@@ -12,7 +12,7 @@ struct CompilerCache {
     errors: Vec<String>,
     /// 用 FxBuildHasher 替代默认 SipHash,减少长字符串去重时的哈希开销
     /// (String 内容有足够熵,FxHash 分布足够均匀)
-    scanner_strings: HashMap<String, LuaString, FxBuildHasher>,
+    scanner_strings: HashMap<String, LLuaString, FxBuildHasher>,
     token_text: String,
 }
 
@@ -78,10 +78,10 @@ pub enum Token {
     // Literals
     // Name/String 直接保存已 intern 的 LuaString (Rc 引用),
     // 避免每次 lex 都 malloc 新 String。clone 时只增加 refcount, 零分配。
-    Name(LuaString),
+    Name(LLuaString),
     Int(i64),
     Float(f64),
-    String(LuaString),
+    String(LLuaString),
 
     // Symbols
     Plus,
@@ -162,8 +162,7 @@ impl Token {
     /// - 关键字/符号: 返回 `"'<name>'"` (如 `"'and'"`, `"'//'"`)
     pub fn to_display_str(&self) -> String {
         match self {
-            Token::Name(s) => format!("'{}'", s.as_str()),
-            Token::String(s) => format!("'{}'", s.as_str()),
+            Token::Name(s) | Token::String(s) => format!("'{}'", lua_string_as_str(&s.to_value())),
             Token::Int(n) => format!("'{}'", n),
             Token::Float(f) => format!("'{}'", crate::float_utils::f64_to_string(*f)),
             Token::Eof => "<eof>".to_string(),
@@ -329,10 +328,10 @@ pub struct LexState<'a, 'b> {
     /// 锚定长字符串字面量,确保同一源码中的长字符串返回同一 `LuaString` (相同 ptr_id)。
     /// 短字符串已通过全局 `StringTable` 内部化去重,无需在此重复。
     /// 用 FxBuildHasher 替代默认 SipHash,减少哈希开销
-    scanner_strings: HashMap<String, LuaString, FxBuildHasher>,
+    scanner_strings: HashMap<String, LLuaString, FxBuildHasher>,
     /// 缓存的 "_ENV" LuaString — 避免每次 code_global_via_env* 都重新 hash+查找
     /// 全局 StringTable。第一次 env_str_cached() 调用时填充，后续直接 clone（refcount++）。
-    cached_env: Option<LuaString>,
+    cached_env: Option<LLuaString>,
     /// 当前 token 的原始文本 — 对应 C 的 `luaZ_buffer(ls->buff)`。
     /// 用于错误消息中显示数字/字符串的原始文本 (如 "1.000" 而不是 "1")。
     pub token_text: String,
@@ -341,7 +340,7 @@ pub struct LexState<'a, 'b> {
     /// 每次都做完整 hashbrown 查找 + Rc::clone。缓存命中时仅做 4 次 u64 比较 +
     /// 1 次 Rc::clone, 跳过 hashbrown 的 SIMD 探测 + 控制字节比较 + 闭包调用。
     /// 缓存未命中时仍走 intern (用预计算的 hash 避免重复哈希)。
-    ident_cache: [Option<(u64, LuaString)>; 4],
+    ident_cache: [Option<(u64, LLuaString)>; 4],
     ident_cache_idx: usize,
     /// 编译器执行缓存句柄。持有 `CompilerCache` 的 Box,确保其堆内存不被释放。
     /// Drop 时将内部缓冲 (`errors`、`scanner_strings`、`token_text`)回收到线程局部缓存,
@@ -387,12 +386,12 @@ impl<'a, 'b> LexState<'a, 'b> {
     /// 获取缓存的 "_ENV" LuaString。第一次调用时 intern 并缓存，
     /// 后续直接 clone（refcount++），避免每次 code_global_via_env* 都做 hash+查找。
     #[cfg_attr(not(size_optimized), inline)]
-    pub fn env_str_cached(&mut self) -> LuaString {
+    pub fn env_str_cached(&mut self) -> TValue<'b> {
         if let Some(ref k) = self.cached_env {
-            return k.clone();
+            return k.to_value();
         }
         let k = self.state.intern_str("_ENV");
-        self.cached_env = Some(k.clone());
+        self.cached_env = Some(k.as_str());
         k
     }
 
@@ -400,7 +399,7 @@ impl<'a, 'b> LexState<'a, 'b> {
     /// 短字符串走全局 `StringTable` 内部化;长字符串走 scanner table 去重,
     /// 确保同一源码字面量跨 proto 返回同一 `LuaString` (相同 `ptr_id`)。
     /// perf: 短字符串先查 4 路标识符缓存, 命中时跳过 hashbrown 查找 (节省 ~7%)。
-    pub fn anchor_string(&mut self, s: &str) -> LuaString {
+    pub fn anchor_string(&mut self, s: &str) -> TValue<'b> {
         if s.len() <= crate::strings::LUAI_MAXSHORTLEN {
             // perf: 计算 hash 一次, 缓存查找 + intern 复用
             let h = crate::strings::rust_hash(s);
@@ -408,26 +407,27 @@ impl<'a, 'b> LexState<'a, 'b> {
             for entry in &self.ident_cache {
                 if let Some((eh, els)) = entry {
                     // 先比 hash (8 字节, 内联), 再比内容 (仅 hash 碰撞时执行)
-                    if *eh == h && els.as_str() == s {
-                        return els.clone();
+                    if *eh == h && lua_string_as_str(&els.to_value()) == s {
+                        return els.to_value();
                     }
                 }
             }
             // 缓存未命中: 用预计算 hash 调用 intern (避免 intern 内部重复计算 hash)
-            let ls = self.state.string_table.intern_with_hash(s, h);
+            let ls = TValue::ShortStr(self.state.string_table.intern_with_hash(s, h));
             // round-robin 替换: 覆盖最旧条目
             let idx = self.ident_cache_idx;
-            self.ident_cache[idx] = Some((h, ls.clone()));
+            self.ident_cache[idx] = Some((h, ls.as_str()));
             self.ident_cache_idx = (idx + 1) & 3;
-            ls
+            ls.as_str()
         } else {
             if let Some(existing) = self.scanner_strings.get(s).cloned() {
-                return existing;
+                return existing.to_value();
             }
             let ls = crate::strings::new_long_str(s);
-            self.scanner_strings.insert(s.to_string(), ls.clone());
-            ls
+            self.scanner_strings.insert(s.to_string(), ls.as_str());
+            ls.as_str()
         }
+        .to_value()
     }
 
     #[cfg_attr(not(size_optimized), inline(always))]
@@ -926,7 +926,7 @@ impl<'a, 'b> LexState<'a, 'b> {
         // intern 命中时只增加 Rc refcount, 不分配新堆内存。
         // 对应 C 的 luaX_newstring: 直接返回 intern 后的 TString*。
         let ls = self.anchor_string(s);
-        self.token = Token::Name(ls);
+        self.token = Token::Name(ls.as_str());
     }
 
     fn read_number(&mut self) {
@@ -1105,7 +1105,7 @@ impl<'a, 'b> LexState<'a, 'b> {
         // intern 字符串字面量 (对应 C anchorstr), 避免保留临时 String 导致 GC 压力。
         // 短字符串走全局 StringTable 内部化去重; 长字符串走 scanner_strings 去重。
         let ls = self.anchor_string(&s);
-        self.token = Token::String(ls);
+        self.token = Token::String(ls.as_str());
     }
 
     fn read_escape(&mut self, s: &mut String, backslash_pos: usize) {
@@ -1267,7 +1267,7 @@ impl<'a, 'b> LexState<'a, 'b> {
                         self.next_char(); // skip 2nd ']'
                                           // intern 长字符串字面量 (anchor_string 内部走 scanner_strings 去重)
                         let ls = self.anchor_string(&s);
-                        self.token = Token::String(ls);
+                        self.token = Token::String(ls.as_str());
                         return;
                     }
                     // 不匹配: ']' 与 '=' 需作为内容保留 (对应 C skip_sep 的 save 行为)
@@ -1296,7 +1296,7 @@ impl<'a, 'b> LexState<'a, 'b> {
         }
         // EOF 中断的 fallback 路径 (错误恢复)
         let ls = self.anchor_string(&s);
-        self.token = Token::String(ls);
+        self.token = Token::String(ls.as_str());
     }
 
     pub fn check(&self, tok: &Token) -> bool {

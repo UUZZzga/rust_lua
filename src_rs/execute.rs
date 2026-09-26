@@ -19,6 +19,7 @@ use crate::objects::{
 };
 use crate::opcodes::{self, OpCode};
 use crate::state::{LuaState, LUAI_MAXCCALLS, LUA_MINSTACK, MAX_CALL_CHAIN};
+use crate::strings::lua_string_as_str;
 use crate::table::Table;
 use crate::tm::{
     call_order_tm, equal_obj, obj_len, obj_type_name, try_bin_assoc_tm, try_bin_tm, try_bini_tm,
@@ -231,8 +232,8 @@ fn short_source_bytes(bytes: &[u8]) -> String {
 }
 
 /// 对应 C 的 luaO_chunkid：将源名转换为短源名
-fn short_source(source: &crate::strings::LuaString) -> String {
-    short_source_bytes(source.as_str().as_bytes())
+fn short_source<'a>(source: &TValue<'a>) -> String {
+    short_source_bytes(lua_string_as_str(source).as_bytes())
 }
 
 /// 格式化函数名 — 对应 C 的 pushfuncname
@@ -363,7 +364,7 @@ pub fn compute_caller_info<'a>(
         let source = caller_proto
             .source
             .as_ref()
-            .map(|s| s.as_str().to_string())
+            .map(|s| lua_string_as_str(s).to_string())
             .unwrap_or_else(|| "=?".to_string());
         // Rust 版 saved_pc 直接指向 CALL 指令（pc 在读取时未递增）
         let line = get_proto_line(caller_proto, entry.saved_pc);
@@ -416,7 +417,7 @@ pub fn compute_caller_info_with_fallback<'a>(
         let source = caller_proto
             .source
             .as_ref()
-            .map(|s| s.as_str().to_string())
+            .map(|s| lua_string_as_str(s).to_string())
             .unwrap_or_else(|| "=?".to_string());
         let line = get_proto_line(caller_proto, entry.saved_pc);
 
@@ -481,8 +482,8 @@ pub fn push_global_func_name<'a>(state: &LuaState) -> Option<String> {
     })?;
 
     // 获取 loaded 表
-    let package_key = TValue::Str(state.intern_str("package"));
-    let loaded_key = TValue::Str(state.intern_str("loaded"));
+    let package_key = state.intern_str("package");
+    let loaded_key = state.intern_str("loaded");
     let loaded_table = state
         .globals
         .get(&package_key)
@@ -523,13 +524,13 @@ fn find_field<'a>(table: &Table<'a>, obj: &TValue<'a>, level: usize) -> Option<S
     loop {
         match table.next(prev_key.as_ref()) {
             Some((key, val)) => {
-                if let TValue::Str(k) = &key {
+                if let TValue::LongStr(_) | TValue::ShortStr(_) = &key {
                     if val == *obj {
-                        return Some(k.as_str().to_string());
+                        return Some(lua_string_as_str(&key).to_string());
                     }
                     if let TValue::Table(t) = &val {
                         if let Some(name) = find_field(t, obj, level - 1) {
-                            return Some(format!("{}.{}", k, name));
+                            return Some(format!("{}.{}", &key, name));
                         }
                     }
                 }
@@ -715,7 +716,7 @@ fn get_local_name_at(proto: &Proto, reg: usize, pc: usize) -> Option<String> {
             count -= 1;
             if count == 0 {
                 if let Some(ref name) = loc_var.varname {
-                    return Some(name.as_str().to_string());
+                    return Some(lua_string_as_str(name).to_string());
                 }
             }
         }
@@ -746,7 +747,9 @@ fn get_local_name_at(proto: &Proto, reg: usize, pc: usize) -> Option<String> {
 fn kname(proto: &Proto, index: usize) -> (String, String) {
     if index < proto.constants.len() {
         match &proto.constants[index] {
-            TValue::Str(s) => (s.as_str().to_string(), "constant".to_string()),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                (lua_string_as_str(s).to_string(), "constant".to_string())
+            }
             _ => ("?".to_string(), String::new()),
         }
     } else {
@@ -810,7 +813,7 @@ fn basic_get_obj_name(proto: &Proto, pc: usize, reg: usize) -> (String, String) 
             let b = opcodes::getarg_b(set_inst) as usize;
             if b < proto.upvalues.len() {
                 if let Some(ref name) = proto.upvalues[b].name {
-                    return (name.as_str().to_string(), "upvalue".to_string());
+                    return (lua_string_as_str(name).to_string(), "upvalue".to_string());
                 }
             }
             (String::new(), String::new())
@@ -861,7 +864,11 @@ fn get_obj_name(proto: &Proto, pc: usize, reg: usize) -> (String, String) {
             let name = kname(proto, c).0;
             // 检查上值是否是 _ENV
             let is_env = b < proto.upvalues.len()
-                && proto.upvalues[b].name.as_ref().map(|s| s.as_str()) == Some("_ENV");
+                && proto.upvalues[b]
+                    .name
+                    .as_ref()
+                    .map(|s| lua_string_as_str(s))
+                    == Some("_ENV");
             let namewhat = if is_env { "global" } else { "field" };
             (name, namewhat.to_string())
         }
@@ -994,7 +1001,7 @@ fn index_varinfo<'a>(state: &LuaState, source: VarSource) -> String {
             };
             if idx < proto.upvalues.len() {
                 if let Some(ref name) = proto.upvalues[idx].name {
-                    return format!(" (upvalue '{}')", name.as_str());
+                    return format!(" (upvalue '{}')", lua_string_as_str(name));
                 }
             }
             String::new()
@@ -1032,16 +1039,6 @@ fn has_source_line_prefix(msg: &str) -> bool {
 pub struct VmExecutor;
 
 impl VmExecutor {
-    pub fn execute<'a>(
-        proto: &Proto<'a>,
-        base: usize,
-        stack: Vec<TValue<'a>>,
-        gc: Rc<GCState>,
-    ) -> Result<VmResult<'a>, VmError<'a>> {
-        let mut state = LuaState::from_proto(proto, base, stack, gc);
-        Self::execute_loop(&mut state)
-    }
-
     pub fn execute_with_state<'a>(state: &mut LuaState<'a>) -> Result<VmResult<'a>, VmError<'a>> {
         Self::execute_loop(state)
     }
@@ -1129,6 +1126,7 @@ impl VmExecutor {
             //  合并后热路径只测试栈局部值, state.exec.hook_mask 的 load 延迟到冷块。)
             // 注意: 必须每指令读 state.exec.hook_mask — VARARGPREP 的 call hook 内可
             // sethook 安装 line hook (db.lua:491 场景), 缓存字节会错过新 mask。
+            #[cfg(debug_assertions)]
             if trace_level | (state.exec.hook_mask & (4 | 8)) as u8 != 0 && op != OpCode::VARARGPREP
             {
                 state.exec.pc = pc - 1; // sync: 行 hook/trace 需要 state.exec.pc = 当前指令 (C savepc)
@@ -1434,8 +1432,8 @@ impl VmExecutor {
                 if state.last_error_value.is_none() {
                     state.last_error_value = Some(match &current_error {
                         VmError::RuntimeErrorValue(val) => val.clone(),
-                        VmError::RuntimeError(s) => TValue::Str(state.intern_str(s)),
-                        _ => TValue::Str(state.intern_str(&format!("{}", current_error))),
+                        VmError::RuntimeError(s) => state.intern_str(s),
+                        _ => state.intern_str(&format!("{}", current_error)),
                     });
                 }
                 let error_val = state.last_error_value.clone().unwrap();
@@ -1449,7 +1447,9 @@ impl VmExecutor {
                             // 有 pending error，转换回 current_error，fall through 到 pcall 处理
                             state.last_error_value = Some(err.clone());
                             current_error = match err {
-                                TValue::Str(s) => VmError::RuntimeError(s.to_string()),
+                                s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                                    VmError::RuntimeError(s.to_string())
+                                }
                                 v => VmError::RuntimeErrorValue(v),
                             };
                             continue; // 下一轮迭代处理 pcall
@@ -1488,8 +1488,8 @@ impl VmExecutor {
                         .clone()
                         .unwrap_or_else(|| match &current_error {
                             VmError::RuntimeErrorValue(val) => val.clone(),
-                            VmError::RuntimeError(s) => TValue::Str(state.intern_str(s)),
-                            _ => TValue::Str(state.intern_str(&format!("{}", current_error))),
+                            VmError::RuntimeError(s) => state.intern_str(s),
+                            _ => state.intern_str(&format!("{}", current_error)),
                         });
                 state.last_error_value = None;
                 state.last_error_msg.clear();
@@ -1593,7 +1593,7 @@ impl VmExecutor {
                                         .collect()
                                 } else {
                                     // handler 失败: 返回 "error in error handling"
-                                    vec![TValue::Str(state.intern_str("error in error handling"))]
+                                    vec![(state.intern_str("error in error handling"))]
                                 };
                                 // xpcall 返回 (false, handler_result...)
                                 state.exec.stack.truncate(protection.func_idx);
@@ -2124,6 +2124,7 @@ impl VmExecutor {
     fn write_stack<'a>(state: &mut LuaState<'a>, idx: usize, val: TValue<'a>) {
         // 热路径: idx 在范围内 (VM 保证, 编译器生成的寄存器索引总是有效)
         // 用 unsafe 索引跳过边界检查
+        let top = state.exec.top;
         if idx < state.exec.stack.len() {
             unsafe {
                 let slot = state.exec.stack.get_unchecked_mut(idx);
@@ -2132,18 +2133,29 @@ impl VmExecutor {
                 // (编译器优化为 2 次 cmp+jcc, 比完整 match 更快)
                 if matches!(
                     slot,
-                    TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)
+                    TValue::LongStr(_)
+                        | TValue::ShortStr(_)
+                        | TValue::Table(_)
+                        | TValue::LClosure(_)
+                        | TValue::CClosure(_)
+                        | TValue::RustClosure(_)
+                        | TValue::UserData(_)
+                        | TValue::Thread(_)
                 ) {
-                    std::ptr::write(slot, val);
-                } else {
-                    *slot = val;
+                    // 1) 按位读出旧值，把所有权 "搬" 出来，不调用 Drop
+                    let old = std::ptr::read(slot);
+
+                    // 2) 交给延迟队列
+                    let gc = state.gc.as_mut();
+                    gc.deferred_drop.push(old);
                 }
+                std::ptr::write(slot, val);
             }
         } else {
             Self::write_stack_grow(state, idx);
             state.exec.stack[idx] = val;
         }
-        if idx >= state.exec.top {
+        if idx >= top {
             state.exec.top = idx + 1;
         }
     }
@@ -2643,7 +2655,9 @@ impl VmExecutor {
                 Ok(()) => {
                     // close 完成: 返回 pending error 给上层 pcall
                     return match err {
-                        TValue::Str(s) => Err(VmError::RuntimeError(s.to_string())),
+                        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                            Err(VmError::RuntimeError(s.to_string()))
+                        }
                         v => Err(VmError::RuntimeErrorValue(v)),
                     };
                 }
@@ -2960,7 +2974,7 @@ impl VmExecutor {
         // 对应 C 的 hookf: currentline >= 0 时推入 integer, 否则推入 nil
         state.exec.stack.push(hook_fn.clone());
         let event_str = state.intern_str(event);
-        state.exec.stack.push(TValue::Str(event_str));
+        state.exec.stack.push(event_str);
         if line >= 0 {
             state.exec.stack.push(TValue::Integer(line as i64));
         } else {
@@ -3008,7 +3022,9 @@ impl VmExecutor {
             // pcall 出错时，错误消息在 saved_stack_len 位置（func_idx）
             let msg = if saved_stack_len < state.exec.stack.len() {
                 match &state.exec.stack[saved_stack_len] {
-                    TValue::Str(s) => s.as_str().to_string(),
+                    s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                        lua_string_as_str(s).to_string()
+                    }
                     _ => String::new(),
                 }
             } else {
@@ -3189,7 +3205,9 @@ impl VmExecutor {
             let uv = unsafe { &mut *upvals[b].as_ptr() };
             match uv {
                 UpVal::Closed { value } => {
-                    state.gc.cond_gc();
+                    unsafe {
+                        state.gc.as_mut().cond_gc();
+                    }
                     // perf: 跳过 trivially-droppable 旧值的 drop_glue
                     // (与 write_stack 同理, upvalue 常持有 number 值)
                     if matches!(
@@ -3693,7 +3711,7 @@ impl VmExecutor {
                             t.set(stack[b].clone(), val_opt.take().unwrap());
                             // GC barrier — 与 table_set 的 key_exists 路径一致
                             if let Some(tid) = t.data.borrow().gc_header.id() {
-                                state.gc.barrier_back(tid);
+                                unsafe { state.gc.as_mut().barrier_back(tid) };
                             }
                             true
                         } else {
@@ -3746,7 +3764,7 @@ impl VmExecutor {
                     if !t.has_metatable() {
                         t.set(TValue::Integer(b), val_opt.take().unwrap());
                         if let Some(tid) = t.data.borrow().gc_header.id() {
-                            state.gc.barrier_back(tid);
+                            unsafe { state.gc.as_mut().barrier_back(tid) };
                         }
                         true
                     } else {
@@ -3802,7 +3820,7 @@ impl VmExecutor {
                     if !t.has_metatable() {
                         t.set(key_opt.take().unwrap(), val_opt.take().unwrap());
                         if let Some(tid) = t.data.borrow().gc_header.id() {
-                            state.gc.barrier_back(tid);
+                            unsafe { state.gc.as_mut().barrier_back(tid) };
                         }
                         true
                     } else {
@@ -3849,7 +3867,7 @@ impl VmExecutor {
         let table = Table::with_capacity(array_size, hash_size as usize);
         // 使用 mem_size() 计算实际内存占用（含 Table 结构 + array + hash），
         // 避免 GC 低估内存导致不及时回收（big.lua/verybig.lua 内存分配失败）
-        let table_id = state.gc.register_object(table.mem_size());
+        let table_id = unsafe { state.gc.as_mut().register_object(table.mem_size()) };
         table.data.borrow().gc_header.set_id(table_id);
         Self::write_stack(state, a, TValue::Table(table));
         state.exec.pc += 1;
@@ -4655,7 +4673,7 @@ impl VmExecutor {
                 // 拼接成功: concat_stack 保证 vals 长度为 1
                 let result = vals
                     .pop()
-                    .unwrap_or_else(|| TValue::Str(state.string_table.intern("")));
+                    .unwrap_or_else(|| state.string_table.intern_value(""));
                 // state.exec.stack 已被 split_off(a) 截断到 a,无需再 truncate
                 state.exec.stack.push(result);
                 state.exec.stack.append(&mut saved_tail);
@@ -4816,7 +4834,11 @@ impl VmExecutor {
             let v2 = Self::read_stack(state, b);
             if v1.is_number() && v2.is_number() {
                 Some(crate::vm::lt_num(v1, v2))
-            } else if let (TValue::Str(s1), TValue::Str(s2)) = (v1, v2) {
+            } else if let (
+                s1 @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+                s2 @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+            ) = (v1, v2)
+            {
                 Some(crate::vm::strcmp(s1, s2) == std::cmp::Ordering::Less)
             } else {
                 None
@@ -4852,7 +4874,11 @@ impl VmExecutor {
             let v2 = Self::read_stack(state, b);
             if v1.is_number() && v2.is_number() {
                 Some(crate::vm::le_num(v1, v2))
-            } else if let (TValue::Str(s1), TValue::Str(s2)) = (v1, v2) {
+            } else if let (
+                s1 @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+                s2 @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+            ) = (v1, v2)
+            {
                 Some(crate::vm::strcmp(s1, s2) != std::cmp::Ordering::Greater)
             } else {
                 None
@@ -5475,7 +5501,7 @@ impl VmExecutor {
             if let TValue::Table(ref t) = func_val {
                 let mt_opt = t.get_metatable();
                 let call_fn = mt_opt.as_ref().and_then(|mt| {
-                    let call_key = TValue::Str(state.intern_str("__call"));
+                    let call_key = state.intern_str("__call");
                     mt.get(&call_key)
                 });
                 if let Some(call_fn) = call_fn {
@@ -5864,7 +5890,9 @@ impl VmExecutor {
                 state.exec.n_ccalls = state.exec.n_ccalls.saturating_sub(1);
                 state.exec.call_info.pop();
                 let err_msg = match state.pending_error.take() {
-                    Some(TValue::Str(s)) => s.as_str().to_string(),
+                    Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
+                        lua_string_as_str(&s).to_string()
+                    }
                     Some(TValue::Integer(i)) => crate::float_utils::i64_to_string(i),
                     Some(TValue::Float(f)) => crate::float_utils::f64_to_string(f),
                     Some(other) => format!("{:?}", other.ty()),
@@ -6035,7 +6063,7 @@ impl VmExecutor {
             if let TValue::Table(ref t) = func_val {
                 let mt_opt = t.get_metatable();
                 let call_fn = mt_opt.as_ref().and_then(|mt| {
-                    let call_key = TValue::Str(state.intern_str("__call"));
+                    let call_key = state.intern_str("__call");
                     mt.get(&call_key)
                 });
                 if let Some(call_fn) = call_fn {
@@ -6669,6 +6697,7 @@ impl VmExecutor {
                     match (s, i2) {
                         (TValue::Integer(s), TValue::Integer(i2)) => (*s, *i2),
                         _ => {
+                            unsafe { state.gc.as_mut().deferred_drop.clear() };
                             return Ok(()); // pc 已 = cur+1 (循环头覆盖)
                         }
                     }
@@ -6689,12 +6718,14 @@ impl VmExecutor {
                 let step = match Self::read_stack(state, ra + 1) {
                     TValue::Float(s) => *s,
                     _ => {
+                        unsafe { state.gc.as_mut().deferred_drop.clear() };
                         return Ok(());
                     }
                 };
                 let idx = match Self::read_stack(state, ra + 2) {
                     TValue::Float(f) => *f,
                     _ => {
+                        unsafe { state.gc.as_mut().deferred_drop.clear() };
                         return Ok(());
                     }
                 };
@@ -6715,6 +6746,7 @@ impl VmExecutor {
             }
             _ => {}
         }
+        unsafe { state.gc.as_mut().deferred_drop.clear() };
         Ok(())
     }
 
@@ -6741,7 +6773,7 @@ impl VmExecutor {
                     }
                     Err(()) => {
                         let what = match &limit_val {
-                            TValue::Str(_) => "string",
+                            TValue::LongStr(_) | TValue::ShortStr(_) => "string",
                             _ => "value",
                         };
                         return Err(VmError::RuntimeError(format!(
@@ -6787,7 +6819,7 @@ impl VmExecutor {
                     None => {
                         return Err(VmError::RuntimeError(format!(
                             "bad 'for' limit (number expected, got {})",
-                            obj_type_name(&limit_val)
+                            obj_type_name(state, &limit_val)
                         )))
                     }
                 };
@@ -6796,7 +6828,7 @@ impl VmExecutor {
                     None => {
                         return Err(VmError::RuntimeError(format!(
                             "bad 'for' step (number expected, got {})",
-                            obj_type_name(&step_val)
+                            obj_type_name(state, &step_val)
                         )))
                     }
                 };
@@ -6805,7 +6837,7 @@ impl VmExecutor {
                     None => {
                         return Err(VmError::RuntimeError(format!(
                             "bad 'for' initial value (number expected, got {})",
-                            obj_type_name(&init_val)
+                            obj_type_name(state, &init_val)
                         )))
                     }
                 };
@@ -6900,7 +6932,7 @@ impl VmExecutor {
         // 实际函数,原表作为 self 参数放到 ra+4,ra+5 保持 ctrl
         if let TValue::Table(t) = &func_val {
             if let Some(mt) = t.get_metatable() {
-                let call_key = TValue::Str(state.intern_str("__call"));
+                let call_key = state.intern_str("__call");
                 if let Some(call_fn) = mt.get(&call_key) {
                     let table_clone = func_val.clone();
                     Self::write_stack(state, ra + 4, table_clone);
@@ -7106,7 +7138,7 @@ impl VmExecutor {
             }
             // 表可能已增长（array.push / hash.insert），更新 GC 估算大小
             if let Some(id) = t.data.borrow().gc_header.id() {
-                state.gc.set_obj_size(id, t.mem_size());
+                unsafe { state.gc.as_mut().set_obj_size(id, t.mem_size()) };
             }
             // 表增长后检查是否需要 GC
             state.maybe_collect_gc();
@@ -7179,7 +7211,7 @@ impl VmExecutor {
             });
             // 注册到 GC metas，使 gc_estimate 增长，让 maybe_collect_gc 的阈值检查能正常工作
             // 用 gc_mem_size() 计费含 upvals 容量，比 size_of::<LClosure>() 更接近真实占用
-            let closure_id = state.gc.register_object(closure.gc_mem_size());
+            let closure_id = unsafe { state.gc.as_mut().register_object(closure.gc_mem_size()) };
             closure.gc_header.set_id(closure_id);
             Self::write_stack(state, ra, TValue::LClosure(closure));
         }
@@ -7214,7 +7246,7 @@ impl VmExecutor {
             let table_pos = state.exec.base + vatab;
             let table_val = Self::read_stack(state, table_pos).clone();
             let nargs = if let TValue::Table(ref t) = table_val {
-                match t.get(&TValue::Str(state.string_table.intern("n"))) {
+                match t.get(&(state.string_table.intern_value("n"))) {
                     Some(TValue::Integer(n)) => {
                         if n < 0 || (n as u64) > (i32::MAX as u64) / 2 {
                             state.exec.pc = cur; // sync (C savepc): 错误行号需要当前指令
@@ -7329,8 +7361,8 @@ impl VmExecutor {
             } else {
                 TValue::Nil(NilKind::Strict)
             }
-        } else if let TValue::Str(s) = &key {
-            if s.as_str() == "n" {
+        } else if let s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = &key {
+            if lua_string_as_str(s) == "n" {
                 TValue::Integer(nextra as i64)
             } else {
                 TValue::Nil(NilKind::Strict)
@@ -7358,8 +7390,10 @@ impl VmExecutor {
             let globalname = if bx > 0 {
                 let k_idx = bx - 1;
                 if k_idx < state.exec.constants.len() {
-                    if let TValue::Str(s) = &state.exec.constants[k_idx] {
-                        s.as_str().to_string()
+                    if let s @ (TValue::LongStr(_) | TValue::ShortStr(_)) =
+                        &state.exec.constants[k_idx]
+                    {
+                        lua_string_as_str(s).to_string()
                     } else {
                         "?".to_string()
                     }
@@ -7419,8 +7453,8 @@ impl VmExecutor {
                 table.set_int((i + 1) as i64, val);
             }
             // t.n = nextra
-            let key_n = state.string_table.intern("n");
-            table.set(TValue::Str(key_n), TValue::Integer(nextra as i64));
+            let key_n = state.string_table.intern_value("n");
+            table.set(key_n, TValue::Integer(nextra as i64));
             // 把表放到 vatab_pos 位置，截断后续
             // nextra=0 时 vatab_pos 可能等于 stack_len，需要先扩展栈
             while state.exec.stack.len() <= vatab_pos {
@@ -7574,7 +7608,7 @@ impl VmExecutor {
                     }
                     return Ok(TValue::Nil(NilKind::Strict));
                 }
-                TValue::Str(_) => {
+                TValue::LongStr(_) | TValue::ShortStr(_) => {
                     // 字符串类型: 查找字符串元表的 __index
                     if let Some(mt) = state.dmt.get(LuaType::String) {
                         let index_key =
@@ -7707,8 +7741,10 @@ impl VmExecutor {
                         // GC barrier
                         let tid = t.data.borrow().gc_header.id();
                         if let Some(tid) = tid {
-                            state.gc.obj_barrier_back(tid, tid);
-                            state.gc.barrier_back(tid);
+                            unsafe {
+                                state.gc.as_mut().obj_barrier_back(tid, tid);
+                                state.gc.as_mut().barrier_back(tid);
+                            }
                         }
                         return Ok(());
                     }
@@ -7766,10 +7802,12 @@ impl VmExecutor {
                     t.set(key, val);
                     let tid = t.data.borrow().gc_header.id();
                     if let Some(tid) = tid {
-                        state.gc.obj_barrier_back(tid, tid);
-                        state.gc.barrier_back(tid);
-                        // 新键插入可能增长表，更新 GC 估算大小
-                        state.gc.set_obj_size(tid, t.mem_size());
+                        unsafe {
+                            state.gc.as_mut().obj_barrier_back(tid, tid);
+                            state.gc.as_mut().barrier_back(tid);
+                            // 新键插入可能增长表，更新 GC 估算大小
+                            state.gc.as_mut().set_obj_size(tid, t.mem_size());
+                        }
                     }
                     // 表可能已增长，检查是否需要 GC（对应 C 的 luaC_condGC）
                     state.maybe_collect_gc();
@@ -7897,11 +7935,25 @@ mod tests {
     use super::*;
     use crate::gc::GCObjectHeader;
     use crate::objects::NilKind;
+    use crate::state::GlobalState;
     use crate::strings::StringTable;
     use std::rc::Rc;
 
-    fn make_gc() -> Rc<GCState> {
-        Rc::new(GCState::default_incremental())
+    pub fn execute<'a>(
+        proto: &Proto<'a>,
+        base: usize,
+        stack: Vec<TValue<'a>>,
+    ) -> Result<VmResult<'a>, VmError<'a>> {
+        let mut state = LuaState::from_proto(
+            proto,
+            base,
+            stack,
+            Rc::new(RefCell::new(GlobalState {
+                gcstopem: false,
+                gc: GCState::default_incremental(),
+            })),
+        );
+        VmExecutor::execute_loop(&mut state)
     }
 
     fn execute_test<'a>(
@@ -7909,7 +7961,7 @@ mod tests {
         base: usize,
         stack: Vec<TValue<'a>>,
     ) -> Result<VmResult<'a>, VmError<'a>> {
-        VmExecutor::execute(proto, base, stack, make_gc())
+        execute(proto, base, stack)
     }
 
     fn make_proto(code: Vec<Instruction>, constants: Vec<TValue>) -> Proto {
@@ -8063,8 +8115,8 @@ mod tests {
     fn test_execute_concat() {
         let tb = StringTable::new();
         let mut stack = default_stack(10);
-        stack[0] = TValue::Str(tb.intern("hello"));
-        stack[1] = TValue::Str(tb.intern("world"));
+        stack[0] = tb.intern_value("hello");
+        stack[1] = tb.intern_value("world");
 
         let code = vec![make_abc(OpCode::CONCAT, 0, 2, 0)];
         let proto = make_proto(code, vec![]);
@@ -8503,7 +8555,7 @@ mod tests {
     fn test_execute_len() {
         let tb = StringTable::new();
         let mut stack = default_stack(10);
-        stack[0] = TValue::Str(tb.intern("hello"));
+        stack[0] = tb.intern_value("hello");
 
         let code = vec![make_abc(OpCode::LEN, 1, 0, 0)];
         let proto = make_proto(code, vec![]);

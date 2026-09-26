@@ -228,7 +228,7 @@ struct GcObjects {
     all_objects: Vec<u32>,
 }
 
-pub struct GCState {
+pub struct GCState<'a> {
     pub phase: Cell<GCPhase>,
     pub mode: Cell<GCMode>,
     pub current_white: Cell<u8>,
@@ -254,9 +254,10 @@ pub struct GCState {
     pub step_accum: Cell<usize>,
     /// GC 是否正在运行（collect_gc 进行中）— 用于阻止 finalizer 中重入
     pub gc_running: Cell<bool>,
+    pub deferred_drop: Vec<TValue<'a>>,
 }
 
-impl GCState {
+impl<'a> GCState<'a> {
     pub fn new(mode: GCMode) -> Self {
         GCState {
             phase: Cell::new(GCPhase::Pause),
@@ -285,6 +286,7 @@ impl GCState {
             next_collect_threshold: Cell::new(200000),
             step_accum: Cell::new(0),
             gc_running: Cell::new(false),
+            deferred_drop: Vec::with_capacity(1024),
         }
     }
 
@@ -672,7 +674,8 @@ impl GCState {
             | TValue::CClosure(_)
             | TValue::Thread(_)
             | TValue::UserData(_)
-            | TValue::Str(_) => {
+            | TValue::LongStr(_)
+            | TValue::ShortStr(_) => {
                 // 这些是 GC 对象类型，需要从 TValue 中提取 GCObjectId
                 // 当前 TValue 变体持有具体类型值，不包含 ID。
                 // 在完整集成时，需要将 TValue 改为持有 GCObjectId + Ref。
@@ -728,7 +731,7 @@ impl GCState {
     // GC 循环控制
     // ========================================================================
 
-    pub fn cond_gc(&self) {
+    pub fn cond_gc(&mut self) {
         // 增量 step 机器无根标记 (enter_cycle 不标记根, sweep 为空), 实际回收由
         // maybe_collect_gc (阈值触发 full collect_gc) 完成。这里仅在确有 gray 工作
         // 或机器处于周期中途时推进, 避免每次分配都空转 phase 机器 (~130ns/次)。
@@ -740,7 +743,7 @@ impl GCState {
         }
     }
 
-    pub fn check_gc(&self) {
+    pub fn check_gc(&mut self) {
         if self.gc_debt.get() <= 0 {
             let phase = self.phase.get();
             if phase != GCPhase::Pause || !self.gray_is_empty() {
@@ -749,7 +752,7 @@ impl GCState {
         }
     }
 
-    pub fn step(&self) {
+    pub fn step(&mut self) {
         if !self.is_running() {
             return;
         }
@@ -771,7 +774,7 @@ impl GCState {
     }
 
     /// 执行最多 n 步 GC 工作，返回是否完成一个完整周期（phase 回到 Pause）
-    pub fn step_n(&self, n: usize) -> bool {
+    pub fn step_n(&mut self, n: usize) -> bool {
         if !self.is_running() {
             return self.phase.get() == GCPhase::Pause;
         }
@@ -839,8 +842,9 @@ impl GCState {
         self.phase.set(GCPhase::SweepAllGC);
     }
 
-    fn sweep_step(&self) {
+    fn sweep_step(&mut self) {
         self.phase.set(GCPhase::SweepEnd);
+        self.deferred_drop.clear();
     }
 
     fn end_cycle(&self) {
@@ -897,7 +901,7 @@ impl GCState {
     // 完整 GC (luaC_fullgc)
     // ========================================================================
 
-    pub fn full_gc(&self) {
+    pub fn full_gc(&mut self) {
         if !self.is_running() {
             return;
         }
@@ -948,7 +952,7 @@ impl GCState {
             TValue::CClosure(_) => {}
             TValue::Thread(_) => {}
             TValue::UserData(_) => {}
-            TValue::Str(_) => {}
+            TValue::LongStr(_) | TValue::ShortStr(_) => {}
             _ => {}
         }
     }
@@ -987,11 +991,11 @@ pub fn gc_obj_barrier_back(gc: &GCState, p_id: GCObjectId, o_id: GCObjectId) {
     gc.obj_barrier_back(p_id, o_id);
 }
 
-pub fn gc_cond_gc(gc: &GCState) {
+pub fn gc_cond_gc(gc: &mut GCState) {
     gc.cond_gc();
 }
 
-pub fn gc_check_gc(gc: &GCState) {
+pub fn gc_check_gc(gc: &mut GCState) {
     gc.check_gc();
 }
 
@@ -1271,7 +1275,7 @@ mod tests {
 
     #[test]
     fn test_enter_cycle() {
-        let gc = GCState::default_incremental();
+        let mut gc = GCState::default_incremental();
         let initial_white = gc.current_white.get();
         gc.phase.set(GCPhase::Pause);
         gc.step();
@@ -1281,7 +1285,7 @@ mod tests {
 
     #[test]
     fn test_full_gc() {
-        let gc = GCState::default_incremental();
+        let mut gc = GCState::default_incremental();
         let _id1 = gc.register_object(100);
         let id2 = gc.register_object(200);
         gc.fix(id2);

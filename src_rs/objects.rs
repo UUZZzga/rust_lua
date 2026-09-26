@@ -24,7 +24,9 @@
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-use crate::strings::LuaString;
+use crate::strings::{
+    lua_string_as_str, lua_string_eq, lua_string_hash, ArcRc, LongString, ShortString,
+};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -170,22 +172,9 @@ pub type TableHashIndex<'_> = TableHashMap<usize>;
 pub fn tvalue_fx_hash(v: &TValue) -> u64 {
     const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
     match v {
-        TValue::Str(s) => {
+        TValue::ShortStr(_) | TValue::LongStr(_) => {
             let h1 = 5u64.wrapping_mul(SEED);
-            let sh = match s {
-                crate::strings::LuaString::Short(ss) => ss.hash,
-                crate::strings::LuaString::Long(ls) => {
-                    if ls.extra.load(std::sync::atomic::Ordering::Relaxed) == 1 {
-                        ls.hash.load(std::sync::atomic::Ordering::Relaxed)
-                    } else {
-                        // 冷路径: 长字符串首哈希 — 走 trait Hash (含缓存写回)
-                        use std::hash::Hasher;
-                        let mut h = fx_hash_impl::FxHasherPub::default();
-                        std::hash::Hash::hash(v, &mut h);
-                        return h.finish();
-                    }
-                }
-            };
+            let sh = lua_string_hash(v);
             (h1.rotate_left(5) ^ sh).wrapping_mul(SEED)
         }
         TValue::Integer(i) => {
@@ -615,7 +604,8 @@ pub enum TValue<'a> {
     /// 数值 —— 浮点子变体
     Float(f64),
     /// 字符串（短字符串和长字符串）
-    Str(LuaString),
+    ShortStr(ArcRc<ShortString>),
+    LongStr(Rc<LongString>),
     /// 表
     Table(Table<'a>),
     /// Lua 闭包
@@ -675,7 +665,7 @@ impl<'a> TValue<'a> {
             TValue::Boolean(_) => LuaType::Boolean,
             TValue::LightUserData(_) => LuaType::LightUserData,
             TValue::Integer(_) | TValue::Float(_) => LuaType::Number,
-            TValue::Str(_) => LuaType::String,
+            TValue::ShortStr(_) | TValue::LongStr(_) => LuaType::String,
             TValue::Table(_) => LuaType::Table,
             TValue::LClosure(_)
             | TValue::CClosure(_)
@@ -778,7 +768,7 @@ impl<'a> TValue<'a> {
     /// When: 调用 .is_string()
     /// Then: 返回 true
     pub fn is_string(&self) -> bool {
-        matches!(self, TValue::Str(_))
+        matches!(self, TValue::LongStr(_) | TValue::ShortStr(_))
     }
 
     /// 是否为表
@@ -901,7 +891,10 @@ impl<'a> PartialEq for TValue<'a> {
                     *a == (*b as f64)
                 }
             }
-            (TValue::Str(a), TValue::Str(b)) => a == b,
+            (
+                a @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+                b @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+            ) => lua_string_eq(a, b),
             (TValue::Table(a), TValue::Table(b)) => {
                 // 与 Hash impl 一致: Rc 地址身份比较, 免 RefCell borrow
                 // (borrow_mut 作用域内比较键相等性会 double-borrow panic)
@@ -959,9 +952,8 @@ impl<'a> Hash for TValue<'a> {
                     }
                 }
             }
-            TValue::Str(s) => {
-                5u8.hash(state);
-                Hash::hash(s, state);
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                state.write_u64(lua_string_hash(s));
             }
             TValue::Table(t) => {
                 // 身份哈希用 Rc 地址而非 gc_header.ptr_id: gc_header 已移入
@@ -1036,7 +1028,7 @@ impl<'a> fmt::Display for TValue<'a> {
                 }
             }
             TValue::Float(n) => write!(f, "{}", crate::float_utils::f64_to_string(*n)),
-            TValue::Str(s) => write!(f, "{}", s.as_str()),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => write!(f, "{}", lua_string_as_str(s)),
             TValue::LightUserData(p) => write!(f, "lightuserdata({:p})", p),
             TValue::Table(_) => write!(f, "table"),
             TValue::LClosure(_) => write!(f, "function"),
@@ -1068,7 +1060,7 @@ impl<'a> fmt::Debug for TValue<'a> {
             // 用 f64_to_string 避免直接格式化 f64 引入 flt2dec
             TValue::Float(n) => write!(f, "Float({})", crate::float_utils::f64_to_string(*n)),
             // 用 Display 而非 Debug 格式化字符串, 避免 str::Debug 引入 unicode 转义表
-            TValue::Str(s) => write!(f, "Str({})", s.as_str()),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => write!(f, "Str({})", s.as_str()),
             TValue::Table(t) => write!(f, "Table({:p})", t),
             TValue::LClosure(lc) => write!(f, "LClosure({:p})", Rc::as_ptr(lc)),
             TValue::CClosure(cc) => write!(f, "CClosure({:p})", Rc::as_ptr(cc)),
@@ -1539,9 +1531,9 @@ pub type Instruction = u32;
 /// When: 构造 UpvalDesc
 /// Then: instack = true, idx = 0
 #[derive(Debug, Clone)]
-pub struct UpvalDesc {
+pub struct UpvalDesc<'a> {
     /// 上值名称（调试信息）
-    pub name: Option<LuaString>,
+    pub name: Option<TValue<'a>>,
     /// 是否在栈上
     pub in_stack: bool,
     /// 索引（栈索引或外层函数上值列表索引）
@@ -1560,9 +1552,9 @@ pub struct UpvalDesc {
 /// When: 构造 LocVar
 /// Then: varname = "i", startpc = 0, endpc = 5
 #[derive(Debug, Clone)]
-pub struct LocVar {
+pub struct LocVar<'a> {
     /// 变量名
-    pub varname: Option<LuaString>,
+    pub varname: Option<TValue<'a>>,
     /// 变量活跃的起始 PC
     pub start_pc: i32,
     /// 变量失效的起始 PC
@@ -1617,15 +1609,15 @@ pub struct Proto<'a> {
     ///  改为 Rc 共享后变为 O(1) 引用计数；编译期通过 Rc::make_mut 独占修改）
     pub protos: Rc<Vec<Rc<Proto<'a>>>>,
     /// 上值描述 — Rc<Vec> 避免 op_call 中深拷贝
-    pub upvalues: Rc<Vec<UpvalDesc>>,
+    pub upvalues: Rc<Vec<UpvalDesc<'a>>>,
     /// 行号差值数组
     pub line_info: Vec<i8>,
     /// 绝对行号信息
     pub abs_line_info: Vec<AbsLineInfo>,
     /// 局部变量
-    pub loc_vars: Vec<LocVar>,
+    pub loc_vars: Vec<LocVar<'a>>,
     /// 源文件名（调试信息）
-    pub source: Option<LuaString>,
+    pub source: Option<TValue<'a>>,
 }
 
 impl<'a> Proto<'a> {
@@ -2654,7 +2646,9 @@ pub fn twoto(n: u8) -> usize {
 mod tests {
 
     use super::*;
-    use crate::strings::{ArcRc, LongString, ShortString};
+    use crate::strings::{
+        lua_string_is_empty, lua_string_len, lua_string_with_nul, LongString, ShortString,
+    };
     use std::sync::atomic::{AtomicU64, AtomicU8};
 
     // ========================================================================
@@ -2810,68 +2804,68 @@ mod tests {
     fn test_luastring_short() {
         let short = ShortString {
             hash: 0,
-            contents: LuaString::with_nul("hello"),
+            contents: lua_string_with_nul("hello"),
         };
-        let ts = LuaString::Short(crate::strings::ArcRc::new(short));
-        assert_eq!(ts.as_str(), "hello");
-        assert_eq!(ts.len(), 5);
-        assert!(matches!(ts, LuaString::Short(_)));
-        assert!(!ts.is_empty());
+        let ts = TValue::ShortStr(crate::strings::ArcRc::new(short));
+        assert_eq!(lua_string_as_str(&ts), "hello");
+        assert_eq!(lua_string_len(&ts), 5);
+        assert!(matches!(ts, TValue::ShortStr(_)));
+        assert!(!lua_string_is_empty(&ts));
     }
 
     #[test]
     fn test_luastring_long() {
         let long = LongString {
-            hash: AtomicU64::new(0),
-            extra: AtomicU8::new(0),
-            contents: LuaString::with_nul(&"a".repeat(100)),
+            hash: 0.into(),
+            extra: 0.into(),
+            contents: lua_string_with_nul(&"a".repeat(100)),
             ptr_id: 0,
         };
-        let ts = LuaString::Long(ArcRc::new(long));
-        assert_eq!(ts.len(), 100);
-        assert!(matches!(ts, LuaString::Long(_)));
+        let ts = TValue::LongStr(Rc::new(long));
+        assert_eq!(lua_string_len(&ts), 100);
+        assert!(matches!(ts, TValue::LongStr(_)));
     }
 
     #[test]
     fn test_luastring_empty() {
         let short = ShortString {
             hash: 0,
-            contents: LuaString::with_nul(""),
+            contents: lua_string_with_nul(""),
         };
-        let ts = LuaString::Short(crate::strings::ArcRc::new(short));
-        assert!(ts.is_empty());
-        assert_eq!(ts.len(), 0);
-        assert_eq!(ts.as_str(), "");
+        let ts = TValue::ShortStr(crate::strings::ArcRc::new(short));
+        assert!(lua_string_is_empty(&ts));
+        assert_eq!(lua_string_len(&ts), 0);
+        assert_eq!(lua_string_as_str(&ts), "");
     }
 
     #[test]
     fn test_luastring_eq() {
         let arc1 = crate::strings::ArcRc::new(ShortString {
             hash: 0,
-            contents: LuaString::with_nul("foo"),
+            contents: lua_string_with_nul("foo"),
         });
         let arc2 = crate::strings::ArcRc::clone(&arc1);
-        let ts1 = LuaString::Short(arc1);
-        let ts2 = LuaString::Short(arc2);
+        let ts1 = TValue::ShortStr(arc1);
+        let ts2 = TValue::ShortStr(arc2);
         assert_eq!(ts1, ts2);
 
         let arc3 = crate::strings::ArcRc::new(ShortString {
             hash: 1,
-            contents: LuaString::with_nul("bar"),
+            contents: lua_string_with_nul("bar"),
         });
-        let ts3 = LuaString::Short(arc3);
+        let ts3 = TValue::ShortStr(arc3);
         assert_ne!(ts1, ts3);
 
-        let long1 = LuaString::Long(ArcRc::new(LongString {
-            hash: AtomicU64::new(0),
-            extra: AtomicU8::new(0),
-            contents: LuaString::with_nul("test"),
+        let long1 = TValue::LongStr(Rc::new(LongString {
+            hash: 0.into(),
+            extra: 0.into(),
+            contents: lua_string_with_nul("test"),
             ptr_id: 0,
         }));
-        let long2 = LuaString::Long(ArcRc::new(LongString {
-            hash: AtomicU64::new(0),
-            extra: AtomicU8::new(0),
-            contents: LuaString::with_nul("test"),
+        let long2 = TValue::LongStr(Rc::new(LongString {
+            hash: 0.into(),
+            extra: 0.into(),
+            contents: lua_string_with_nul("test"),
             ptr_id: 0,
         }));
         assert_eq!(long1, long2);
@@ -2879,11 +2873,11 @@ mod tests {
 
     #[test]
     fn test_luastring_as_str() {
-        let short = LuaString::Short(crate::strings::ArcRc::new(ShortString {
+        let short: TValue<'_> = TValue::ShortStr(crate::strings::ArcRc::new(ShortString {
             hash: 0,
-            contents: LuaString::with_nul("abc"),
+            contents: lua_string_with_nul("abc"),
         }));
-        assert_eq!(short.as_str(), "abc");
+        assert_eq!(lua_string_as_str(&short), "abc");
     }
 
     // ========================================================================
@@ -3388,7 +3382,6 @@ mod tests {
         println!("LuaThread: {}", size_of::<LuaThread>());
         println!("Udata: {}", size_of::<Udata>());
         println!("LCFunction: {}", size_of::<LCFunction>());
-        println!("LuaString: {}", size_of::<crate::strings::LuaString>());
         println!("ShortString: {}", size_of::<crate::strings::ShortString>());
         println!("LongString: {}", size_of::<crate::strings::LongString>());
         println!("NilKind: {}", size_of::<NilKind>());

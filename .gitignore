@@ -17,6 +17,7 @@ Cargo.lock
 /*.swp
 /*.swo
 /tests_lua/libs/*.so
+/tests_lua/libs/*.dll
 
 # 构建产物和临时文件
 librust_out.rlib

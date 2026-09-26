@@ -18,6 +18,12 @@
 //! - **多线程安全**：StringTable 使用 `RefCell/RwLock` 保护 HashTable，读可并发、写互斥
 //!   LongString 使用 `AtomicU64`/`AtomicU8` 实现 Sync 内部可变性
 
+use std::cell::Cell;
+use std::fmt::{self, Debug, Formatter};
+use std::os::raw::c_char;
+use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+
 // ============================================================================
 // RwLock 抽象层 — 根据 `threaded` feature 切换实现
 // ============================================================================
@@ -82,19 +88,16 @@ use inner_lock::RwLock;
 // `lock incq` (Arc::clone 的原子 CAS) 占 intern 时间的 14.61%。
 // 改用 Rc 后 `incq` (非原子) 消除 cache line 上的 LOCK 前缀开销。
 #[cfg(not(feature = "threaded"))]
-pub type ArcRc<T> = std::rc::Rc<T>;
+pub type ArcRc<T> = Rc<T>;
 #[cfg(feature = "threaded")]
 pub type ArcRc<T> = std::sync::Arc<T>;
-
-use std::fmt::{self, Debug, Formatter};
-use std::hash::{Hash, Hasher};
-use std::os::raw::c_char;
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 // 默认模式 (性能优先): 使用 hashbrown::HashTable 单级哈希表
 // size_optimized: 使用 std::collections::HashMap 两级结构, 减小二进制体积
 #[cfg(not(size_optimized))]
 use hashbrown::HashTable;
+
+use crate::objects::TValue;
 
 // ============================================================================
 // 规约：常量
@@ -123,12 +126,10 @@ pub struct ShortString {
 /// 长字符串 — 长度 > 40 字节，不进行内部化，支持惰性哈希。
 ///
 /// `contents: String` 内含长度信息，无需独立的 `lnglen` 字段。
-/// `hash` / `extra` 使用 `Atomic` 实现线程安全内部可变性：
 /// - `Hash::hash` 首次调用时自动计算并缓存 hash，后续 O(1) 复用
-/// - 并发安全：Race 仅导致重复计算同一值（无安全隐患）
 pub struct LongString {
-    pub hash: AtomicU64,
-    pub extra: AtomicU8,
+    pub hash: Cell<u64>,
+    pub extra: Cell<u8>,
     pub contents: String,
     /// 稳定的唯一标识符，用于 %p 格式输出。
     /// 克隆时保留同一值（表示同一个字符串实例）。
@@ -138,8 +139,8 @@ pub struct LongString {
 impl Clone for LongString {
     fn clone(&self) -> Self {
         LongString {
-            hash: AtomicU64::new(self.hash.load(Ordering::Relaxed)),
-            extra: AtomicU8::new(self.extra.load(Ordering::Relaxed)),
+            hash: self.hash.clone(),
+            extra: self.extra.clone(),
             contents: self.contents.clone(),
             ptr_id: self.ptr_id,
         }
@@ -149,8 +150,8 @@ impl Clone for LongString {
 impl Debug for LongString {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         f.debug_struct("LongString")
-            .field("hash", &self.hash.load(Ordering::Relaxed))
-            .field("extra", &self.extra.load(Ordering::Relaxed))
+            .field("hash", &self.hash)
+            .field("extra", &self.extra)
             .field("len", &self.contents.len())
             .field("contents", &self.contents)
             .finish()
@@ -159,9 +160,45 @@ impl Debug for LongString {
 
 /// 统一字符串类型。
 #[derive(Clone, Debug)]
-pub enum LuaString {
+pub enum LLuaString {
     Short(ArcRc<ShortString>),
-    Long(ArcRc<LongString>),
+    Long(Rc<LongString>),
+}
+
+impl LLuaString {
+    pub fn to_value<'a>(&self) -> TValue<'a> {
+        match self {
+            LLuaString::Short(s) => TValue::ShortStr(s.clone()),
+            LLuaString::Long(s) => TValue::LongStr(s.clone()),
+        }
+    }
+
+    pub fn get_string(&self) -> &String {
+        match self {
+            LLuaString::Short(s) => &s.contents,
+            LLuaString::Long(s) => &s.contents,
+        }
+    }
+}
+
+impl PartialEq for LLuaString {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Short(l0), Self::Short(r0)) => core::ptr::eq(l0, r0),
+            (Self::Long(l0), Self::Long(r0)) => l0 == r0,
+            _ => false,
+        }
+    }
+}
+
+impl<'a> TValue<'a> {
+    pub fn as_str(&self) -> LLuaString {
+        match self {
+            TValue::ShortStr(s) => LLuaString::Short(s.clone()),
+            TValue::LongStr(s) => LLuaString::Long(s.clone()),
+            _ => panic!("TValue::as_str: not a string"),
+        }
+    }
 }
 
 // ============================================================================
@@ -189,64 +226,12 @@ fn content_eq(a: &str, b: &str) -> bool {
 /// 长字符串相等性：若双方均已哈希 → 先比 hash（快速淘汰），否则直接比内容。
 impl PartialEq for LongString {
     fn eq(&self, other: &Self) -> bool {
-        if self.extra.load(Ordering::Relaxed) == 1 && other.extra.load(Ordering::Relaxed) == 1 {
-            if self.hash.load(Ordering::Relaxed) != other.hash.load(Ordering::Relaxed) {
+        if self.extra.get() == 1 && other.extra.get() == 1 {
+            if self.hash != other.hash {
                 return false;
             }
         }
         content_eq(&self.contents, &other.contents)
-    }
-}
-
-/// 短字符串：`ArcRc::ptr_eq` 快速路径，否则比较 `hash` 后再 `content_eq`。
-/// 长字符串：委派给 `LongString::eq`。
-/// 跨类型（Short vs Long）：比较内容 — 对应 C Lua 的 luaS_eqlngstr/luaS_hash 比较逻辑。
-///
-/// 性能：Short-Short 路径是编译器热点（const_index 查找）。
-/// perf 数据显示 PartialEq::eq (LuaString) 占 4.18%，主要发生在
-/// `const_index.get(&key)` → `ConstKey::PartialEq::eq` → `LuaString::PartialEq::eq`
-/// 链路中。当不同常量字符串落在同一 hash 桶时，ptr_eq 失败后直接走 content_eq
-/// 字节比较（涉及 NUL 处理与 slice 切片），开销较大。
-///
-/// 加 hash 预比较后：hash 不同 → 立即返回 false（O(1)，仅 1 条 `cmp` 指令），
-/// 避免进入 content_eq。hash 相同时（hash 冲突，极少见）才走 content_eq 检查实际内容。
-impl PartialEq for LuaString {
-    #[cfg_attr(not(size_optimized), inline)]
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (LuaString::Short(a), LuaString::Short(b)) => {
-                // ptr_eq 优先（内部化保证同一内容只有一个实例 → 极快）
-                // hash 预比较（不同 hash → 内容必然不同 → 立即 false）
-                // ShortString 末尾必然有 NUL, 直接比较 contents (含 NUL) 即可,
-                // 无需 content_eq 的 last() 检查 + slice 切片
-                ArcRc::ptr_eq(a, b) || (a.hash == b.hash && a.contents == b.contents)
-            }
-            (LuaString::Long(a), LuaString::Long(b)) => a == b,
-            _ => self.as_str() == other.as_str(),
-        }
-    }
-}
-
-impl Eq for LuaString {}
-
-// 与 &str / String 的内容比较 (用于编译器内部 `lv.name == "x"` 等便捷比较)
-// 通过 as_str() O(1) 取 slice 再做字节比较, 无额外分配。
-impl PartialEq<str> for LuaString {
-    #[cfg_attr(not(size_optimized), inline)]
-    fn eq(&self, other: &str) -> bool {
-        self.as_str() == other
-    }
-}
-impl PartialEq<&str> for LuaString {
-    #[cfg_attr(not(size_optimized), inline)]
-    fn eq(&self, other: &&str) -> bool {
-        self.as_str() == *other
-    }
-}
-impl PartialEq<LuaString> for str {
-    #[cfg_attr(not(size_optimized), inline)]
-    fn eq(&self, other: &LuaString) -> bool {
-        self == other.as_str()
     }
 }
 
@@ -255,45 +240,13 @@ impl PartialEq<LuaString> for str {
 // ============================================================================
 
 /// 比较两个 `LuaString` 的内容是否相同。
-pub fn eq_str(a: &LuaString, b: &LuaString) -> bool {
+pub fn eq_str<'a>(a: &TValue<'a>, b: &TValue<'a>) -> bool {
     match (a, b) {
-        (LuaString::Short(a), LuaString::Short(b)) => {
+        (TValue::ShortStr(a), TValue::ShortStr(b)) => {
             ArcRc::ptr_eq(a, b) || (a.hash == b.hash && content_eq(&a.contents, &b.contents))
         }
-        (LuaString::Long(a), LuaString::Long(b)) => content_eq(&a.contents, &b.contents),
+        (TValue::LongStr(a), TValue::LongStr(b)) => content_eq(&a.contents, &b.contents),
         _ => false,
-    }
-}
-
-// ============================================================================
-// 规约：哈希实现
-// ============================================================================
-
-/// 统一使用 Lua 风格快速 hash，始终写入 u64 到 Hasher。
-///
-/// 短字符串：`state.write_u64(hash)` → O(1)。
-/// 长字符串：extra == 1 时 `state.write_u64(hash)` → O(1)；
-/// extra == 0 时计算 `rust_hash` 后写入并**自动缓存**，后续 O(1)。
-impl Hash for LuaString {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        match self {
-            LuaString::Short(s) => state.write_u64(s.hash),
-            LuaString::Long(s) => {
-                if s.extra.load(Ordering::Relaxed) == 1 {
-                    state.write_u64(s.hash.load(Ordering::Relaxed));
-                } else {
-                    let content = if s.contents.as_bytes().last() == Some(&0) {
-                        &s.contents[..s.contents.len() - 1]
-                    } else {
-                        &s.contents
-                    };
-                    let h = rust_hash(content);
-                    s.hash.store(h, Ordering::Relaxed);
-                    s.extra.store(1, Ordering::Relaxed);
-                    state.write_u64(h);
-                }
-            }
-        }
     }
 }
 
@@ -346,16 +299,20 @@ impl StringTable {
     }
     /// 内部化一个短字符串。
     #[cfg_attr(not(size_optimized), inline)]
-    #[cfg(not(feature = "threaded"))]
-    pub fn intern(&self, str: &str) -> LuaString {
+    pub fn intern(&self, str: &str) -> ArcRc<ShortString> {
         self.intern_with_hash(str, rust_hash(str))
+    }
+
+    #[inline]
+    pub fn intern_value<'a>(&self, str: &str) -> TValue<'a> {
+        TValue::ShortStr(self.intern_with_hash(str, rust_hash(str)))
     }
 
     /// 内部化一个短字符串 (使用预计算的 hash, 避免重复计算)。
     /// 用于词法分析器标识符缓存: 缓存查找时已计算 hash, 未命中时直接传入。
     #[cfg_attr(not(size_optimized), inline)]
     #[cfg(not(feature = "threaded"))]
-    pub fn intern_with_hash(&self, str: &str, h: u64) -> LuaString {
+    pub fn intern_with_hash(&self, str: &str, h: u64) -> ArcRc<ShortString> {
         debug_assert!(str.len() <= LUAI_MAXSHORTLEN, "intern 只用于短字符串");
 
         let str_bytes = str.as_bytes();
@@ -387,37 +344,30 @@ impl StringTable {
                 return false;
             }
             let content_bytes = ts.contents.as_bytes();
-            // 字符串表中所有 ShortString 都通过 LuaString::with_nul 或
+            // 字符串表中所有 ShortString 都通过 lua_string_with_nul 或
             // buf.push(0) 创建, contents 末尾必有 NUL 终止符。
             // 当 content_bytes.len() == str_len + 1 时, NUL 检查冗余 (已去除)。
             content_bytes.len() == str_len + 1 && content_bytes[..str_len] == *str_bytes
         }) {
-            return LuaString::Short(ArcRc::clone(ts));
+            return ArcRc::clone(ts);
         }
 
         // 写路径: 需要插入新字符串
         let ts = ArcRc::new(ShortString {
             hash: h,
-            contents: LuaString::with_nul(str),
+            contents: lua_string_with_nul(str),
         });
         // hasher 函数仅在 resize 时调用, 返回预计算 hash
         ht.insert_unique(h, ArcRc::clone(&ts), |ts| ts.hash);
         // SAFETY: 同上, nuse 也是 RefCell 包装, 单线程下安全.
         *unsafe { &mut *self.nuse.as_ptr() } += 1;
-        LuaString::Short(ts)
-    }
-
-    /// 内部化一个短字符串 (threaded 模式 — 走 RwLock 保证线程安全).
-    #[cfg_attr(not(size_optimized), inline)]
-    #[cfg(feature = "threaded")]
-    pub fn intern(&self, str: &str) -> LuaString {
-        self.intern_with_hash(str, rust_hash(str))
+        ts
     }
 
     /// 内部化一个短字符串 (使用预计算的 hash, threaded 模式).
     #[cfg_attr(not(size_optimized), inline)]
     #[cfg(feature = "threaded")]
-    pub fn intern_with_hash(&self, str: &str, h: u64) -> LuaString {
+    pub fn intern_with_hash(&self, str: &str, h: u64) -> ArcRc<ShortString> {
         debug_assert!(str.len() <= LUAI_MAXSHORTLEN, "intern 只用于短字符串");
 
         let str_bytes = str.as_bytes();
@@ -432,7 +382,7 @@ impl StringTable {
             let content_bytes = ts.contents.as_bytes();
             content_bytes.len() == str_len + 1 && content_bytes[..str_len] == *str_bytes
         }) {
-            return LuaString::Short(ArcRc::clone(ts));
+            return (ArcRc::clone(ts));
         }
         drop(ht_reader);
 
@@ -441,18 +391,18 @@ impl StringTable {
         let mut ht = self.ht.write();
         let ts = ArcRc::new(ShortString {
             hash: h,
-            contents: LuaString::with_nul(str),
+            contents: lua_string_with_nul(str),
         });
         ht.insert_unique(h, ArcRc::clone(&ts), |ts| ts.hash);
         *self.nuse.write() += 1;
-        LuaString::Short(ts)
+        (ts)
     }
 
     /// 内部化一个短字符串（从任意字节，8-bit clean，绕过 UTF-8 验证）。
     /// 用于 C API 的 lua_pushlstring/lua_pushstring 等需要保留原始字节的场景。
     #[cfg_attr(not(size_optimized), inline)]
     #[cfg(not(feature = "threaded"))]
-    pub fn intern_bytes(&self, bytes: &[u8]) -> LuaString {
+    pub fn intern_bytes<'a>(&self, bytes: &[u8]) -> TValue<'a> {
         debug_assert!(
             bytes.len() <= LUAI_MAXSHORTLEN,
             "intern_bytes 只用于短字符串"
@@ -474,7 +424,7 @@ impl StringTable {
             let content_bytes = ts.contents.as_bytes();
             content_bytes.len() == bytes_len + 1 && content_bytes[..bytes_len] == *bytes
         }) {
-            return LuaString::Short(ArcRc::clone(ts));
+            return TValue::ShortStr(ArcRc::clone(ts));
         }
 
         // 写路径
@@ -496,13 +446,13 @@ impl StringTable {
         ht.insert_unique(h, ArcRc::clone(&ts), |ts| ts.hash);
         // SAFETY: 同上
         *unsafe { &mut *self.nuse.as_ptr() } += 1;
-        LuaString::Short(ts)
+        TValue::ShortStr(ts)
     }
 
     /// 内部化一个短字符串 (threaded 模式 — 走 RwLock).
     #[cfg_attr(not(size_optimized), inline)]
     #[cfg(feature = "threaded")]
-    pub fn intern_bytes(&self, bytes: &[u8]) -> LuaString {
+    pub fn intern_bytes<'a>(&self, bytes: &[u8]) -> TValue<'a> {
         debug_assert!(
             bytes.len() <= LUAI_MAXSHORTLEN,
             "intern_bytes 只用于短字符串"
@@ -518,7 +468,7 @@ impl StringTable {
             let content_bytes = ts.contents.as_bytes();
             content_bytes.len() == bytes_len + 1 && content_bytes[..bytes_len] == *bytes
         }) {
-            return LuaString::Short(ArcRc::clone(ts));
+            return TValue::ShortStr(ArcRc::clone(ts));
         }
         drop(ht_reader);
 
@@ -537,7 +487,7 @@ impl StringTable {
         });
         ht.insert_unique(h, ArcRc::clone(&ts), |ts| ts.hash);
         *self.nuse.write() += 1;
-        LuaString::Short(ts)
+        TValue::ShortStr(ts)
     }
 
     pub fn count(&self) -> usize {
@@ -641,7 +591,7 @@ impl StringTable {
         // 写路径: 需要插入新字符串
         let ts = ArcRc::new(ShortString {
             hash: h,
-            contents: LuaString::with_nul(str),
+            contents: lua_string_with_nul(str),
         });
         let mut ht = self.ht.write();
         ht.entry(h).or_default().push(ArcRc::clone(&ts));
@@ -679,7 +629,7 @@ impl StringTable {
         // TOCTOU 在单线程执行中安全; 多线程下最多导致重复桶条目(无害)
         let ts = ArcRc::new(ShortString {
             hash: h,
-            contents: LuaString::with_nul(str),
+            contents: lua_string_with_nul(str),
         });
         let mut ht = self.ht.write();
         ht.entry(h).or_default().push(ArcRc::clone(&ts));
@@ -858,106 +808,107 @@ pub fn rust_hash(str: &str) -> u64 {
 // ============================================================================
 // 规约：字符串方法
 // ============================================================================
-impl LuaString {
-    /// 新建时自动追加 NUL 字节，确保作为 *const c_char 返回时安全。
-    /// 预分配 str.len()+1 容量，避免 push('\0') 触发扩容。
-    /// perf: with_nul 在 intern 未命中路径上调用，每次分配一个新 String。
-    /// 用 unsafe 直接 copy_nonoverlapping + set_len 替代 push_str + push,
-    /// 消除两次容量检查和两次长度更新 (push_str 和 push 各检查一次容量)。
-    /// SAFETY: with_capacity(len+1) 保证至少 len+1 字节可用;
-    ///         copy_nonoverlapping 复制 len 字节; 写 0 在 [len] 位置 (≤ capacity);
-    ///         set_len(len+1) 不超过已分配容量; from_utf8_unchecked 安全因为
-    ///         源数据来自 &str (已验证 UTF-8) + NUL (合法 UTF-8 单字节)。
-    pub(crate) fn with_nul(str: &str) -> String {
-        let len = str.len();
-        let mut buf = Vec::with_capacity(len + 1);
-        unsafe {
-            std::ptr::copy_nonoverlapping(str.as_ptr(), buf.as_mut_ptr(), len);
-            *buf.as_mut_ptr().add(len) = 0;
-            buf.set_len(len + 1);
-            String::from_utf8_unchecked(buf)
+
+pub fn lua_string_eq(s1: &TValue, s2: &TValue) -> bool {
+    match (s1, s2) {
+        (TValue::LongStr(_), TValue::LongStr(_)) => {
+            lua_string_hash(s1) == lua_string_hash(s2)
+                && lua_string_as_str(s1) == lua_string_as_str(s2)
         }
-    }
-
-    /// 估算字符串真实堆占用（用于 GC 内存计费）。
-    /// 短串: ArcRc 分配头 + ShortString 结构 + contents 堆分配
-    /// 长串: Box 指针 + LongString 结构 + contents 堆分配
-    /// 字符串不调用 register_object（无 gc_header），由 gc_extra_estimate 跟踪。
-    pub fn gc_mem_size(&self) -> usize {
-        match self {
-            // ArcRc 分配 = ArcInner<ShortString>（含引用计数 usize）+ ShortString 自身
-            // ShortString = { hash: u64, contents: String }，String 堆分配 = capacity
-            LuaString::Short(s) => std::mem::size_of::<ShortString>() + s.contents.capacity() + 16,
-            // Box<LongString> 堆分配 = LongString 自身（Box 无额外头）
-            // LongString = { hash: AtomicU64, extra: AtomicU8, contents: String, ptr_id: u32 }
-            LuaString::Long(s) => std::mem::size_of::<LongString>() + s.contents.capacity() + 8,
-        }
-    }
-
-    #[cfg_attr(not(size_optimized), inline)]
-    pub fn as_str(&self) -> &str {
-        self.as_str_inner().0
-    }
-
-    /// 内部实现：返回 (str, has_nul)
-    /// ShortString 的 contents 末尾必然有 NUL 终止符 (所有创建路径都保证)，
-    /// 因此 Short 分支直接 slice 去掉末尾 NUL，无需 last() 检查。
-    /// LongString 的 contents 可能没有 NUL (从 String 直接构造)，需保留检查。
-    fn as_str_inner(&self) -> (&str, bool) {
-        match self {
-            LuaString::Short(s) => {
-                // ShortString 末尾必然有 NUL (intern/new_short_bytes/string_from_int 等都保证)
-                (&s.contents[..s.contents.len() - 1], true)
-            }
-            LuaString::Long(s) => {
-                if s.contents.as_bytes().last() == Some(&0) {
-                    (&s.contents[..s.contents.len() - 1], true)
-                } else {
-                    (&s.contents, false)
-                }
-            }
-        }
-    }
-
-    /// 返回一个 NUL 结尾的 C 字符串指针（供 C API 使用）。
-    /// 指针在 LuaString 自身存活期间有效。
-    pub fn as_c_str_ptr(&self) -> *const c_char {
-        match self {
-            LuaString::Short(s) => s.contents.as_ptr() as *const c_char,
-            LuaString::Long(s) => s.contents.as_ptr() as *const c_char,
-        }
-    }
-
-    /// 返回字符串长度（O(1)，不含末尾 NUL）。
-    /// ShortString 末尾必然有 NUL, 直接 contents.len()-1 省去 as_str 的 slice 操作。
-    pub fn len(&self) -> usize {
-        match self {
-            LuaString::Short(s) => s.contents.len() - 1,
-            LuaString::Long(s) => {
-                if s.contents.as_bytes().last() == Some(&0) {
-                    s.contents.len() - 1
-                } else {
-                    s.contents.len()
-                }
-            }
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    /// 返回预计算的哈希值（短字符串始终有效；长字符串 extra==0 时为 0）。
-    pub fn hash(&self) -> u64 {
-        match self {
-            LuaString::Short(s) => s.hash,
-            LuaString::Long(s) => s.hash.load(Ordering::Relaxed),
-        }
+        (TValue::ShortStr(s1), TValue::ShortStr(s2)) => ArcRc::ptr_eq(s1, s2),
+        _ => false,
     }
 }
-impl std::fmt::Display for LuaString {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.as_str())
+
+/// 新建时自动追加 NUL 字节，确保作为 *const c_char 返回时安全。
+/// 预分配 str.len()+1 容量，避免 push('\0') 触发扩容。
+/// perf: with_nul 在 intern 未命中路径上调用，每次分配一个新 String。
+/// 用 unsafe 直接 copy_nonoverlapping + set_len 替代 push_str + push,
+/// 消除两次容量检查和两次长度更新 (push_str 和 push 各检查一次容量)。
+/// SAFETY: with_capacity(len+1) 保证至少 len+1 字节可用;
+///         copy_nonoverlapping 复制 len 字节; 写 0 在 [len] 位置 (≤ capacity);
+///         set_len(len+1) 不超过已分配容量; from_utf8_unchecked 安全因为
+///         源数据来自 &str (已验证 UTF-8) + NUL (合法 UTF-8 单字节)。
+pub fn lua_string_with_nul(str: &str) -> String {
+    let len = str.len();
+    let mut buf = Vec::with_capacity(len + 1);
+    unsafe {
+        std::ptr::copy_nonoverlapping(str.as_ptr(), buf.as_mut_ptr(), len);
+        *buf.as_mut_ptr().add(len) = 0;
+        buf.set_len(len + 1);
+    }
+    unsafe { String::from_utf8_unchecked(buf) }
+}
+
+/// 估算字符串真实堆占用（用于 GC 内存计费）。
+/// 短串: ArcRc 分配头 + ShortString 结构 + contents 堆分配
+/// 长串: Box 指针 + LongString 结构 + contents 堆分配
+/// 字符串不调用 register_object（无 gc_header），由 gc_extra_estimate 跟踪。
+pub fn lua_string_gc_mem_size(str: &TValue) -> usize {
+    match str {
+        // ArcRc 分配 = ArcInner<ShortString>（含引用计数 usize）+ ShortString 自身
+        // ShortString = { hash: u64, contents: String }，String 堆分配 = capacity
+        TValue::ShortStr(s) => std::mem::size_of::<ShortString>() + s.contents.capacity() + 16,
+        // Box<LongString> 堆分配 = LongString 自身（Box 无额外头）
+        // LongString = { hash: AtomicU64, extra: AtomicU8, contents: String, ptr_id: u32 }
+        TValue::LongStr(s) => std::mem::size_of::<LongString>() + s.contents.capacity() + 8,
+        _ => unreachable!("Not a string"),
+    }
+}
+
+#[cfg_attr(not(size_optimized), inline)]
+pub fn lua_string_as_str<'a, 'b>(str: &'b TValue<'a>) -> &'b str {
+    lua_string_as_str_inner(str)
+}
+
+/// 内部实现：返回 (str, has_nul)
+/// ShortString 的 contents 末尾必然有 NUL 终止符 (所有创建路径都保证)，
+/// 因此 Short 分支直接 slice 去掉末尾 NUL，无需 last() 检查。
+/// LongString 的 contents 可能没有 NUL (从 String 直接构造)，需保留检查。
+fn lua_string_as_str_inner<'a, 'b>(str: &'b TValue<'a>) -> &'b str {
+    match str {
+        TValue::ShortStr(s) => {
+            assert!(s.contents.ends_with('\0'));
+            &s.contents[..s.contents.len() - 1]
+        }
+        TValue::LongStr(s) => {
+            assert!(s.contents.ends_with('\0'));
+            &s.contents[..s.contents.len() - 1]
+        }
+        _ => unreachable!("Not a string"),
+    }
+}
+
+/// 返回一个 NUL 结尾的 C 字符串指针（供 C API 使用）。
+/// 指针在 LuaString 自身存活期间有效。
+pub fn lua_string_as_c_str_ptr(str: &TValue) -> *const c_char {
+    match str {
+        TValue::ShortStr(s) => s.contents.as_ptr() as *const c_char,
+        TValue::LongStr(s) => s.contents.as_ptr() as *const c_char,
+        _ => unreachable!("Not a string"),
+    }
+}
+
+/// 返回字符串长度（O(1)，不含末尾 NUL）。
+/// ShortString 末尾必然有 NUL, 直接 contents.len()-1 省去 as_str 的 slice 操作。
+pub fn lua_string_len(str: &TValue) -> usize {
+    match str {
+        TValue::ShortStr(s) => s.contents.len() - 1,
+        TValue::LongStr(s) => s.contents.len() - 1,
+        _ => unreachable!("Not a string"),
+    }
+}
+
+pub fn lua_string_is_empty(str: &TValue) -> bool {
+    lua_string_len(str) == 0
+}
+
+/// 返回预计算的哈希值（短字符串始终有效；长字符串 extra==0 时为 0）。
+pub fn lua_string_hash(str: &TValue) -> u64 {
+    match str {
+        TValue::ShortStr(s) => s.hash,
+        TValue::LongStr(s) => ensure_long_hash(s),
+        _ => unreachable!("Not a string"),
     }
 }
 
@@ -966,15 +917,15 @@ impl std::fmt::Display for LuaString {
 // ============================================================================
 
 /// 创建一个长字符串对象，不预先计算哈希（惰性）。
-pub fn new_long_str(str: &str) -> LuaString {
+pub fn new_long_str<'a>(str: &str) -> TValue<'a> {
     debug_assert!(
         str.len() > LUAI_MAXSHORTLEN,
         "长字符串长度必须大于 LUAI_MAXSHORTLEN"
     );
-    LuaString::Long(ArcRc::new(LongString {
-        hash: AtomicU64::new(0),
-        extra: AtomicU8::new(0),
-        contents: LuaString::with_nul(str),
+    TValue::LongStr(Rc::new(LongString {
+        hash: 0.into(),
+        extra: 0.into(),
+        contents: lua_string_with_nul(str),
         ptr_id: crate::gc::new_ptr_id(),
     }))
 }
@@ -982,80 +933,48 @@ pub fn new_long_str(str: &str) -> LuaString {
 /// 创建一个长字符串对象，直接 consume 传入的 String，避免 clone。
 /// 用于 str_format 等已知结果为长字符串且不再需要原 String 的场景。
 /// perf: 消除 new_long_str 中 with_nul 的 to_string() clone（constructs.lua 热点）。
-pub fn new_long_str_from_string(mut s: String) -> LuaString {
+pub fn new_long_str_from_string<'a>(mut s: String) -> TValue<'a> {
     debug_assert!(
         s.len() > LUAI_MAXSHORTLEN,
         "长字符串长度必须大于 LUAI_MAXSHORTLEN"
     );
     s.reserve(1); // 确保 capacity >= len+1，避免 push('\0') 扩容
     s.push('\0');
-    LuaString::Long(ArcRc::new(LongString {
-        hash: AtomicU64::new(0),
-        extra: AtomicU8::new(0),
+    TValue::LongStr(Rc::new(LongString {
+        hash: 0.into(),
+        extra: 0.into(),
         contents: s,
         ptr_id: crate::gc::new_ptr_id(),
     }))
 }
 
-pub fn new_long_bytes(bytes: Vec<u8>) -> LuaString {
+pub fn new_long_bytes<'a>(bytes: Vec<u8>) -> TValue<'a> {
     let mut buf = bytes;
     buf.reserve(1); // 避免 push(0) 扩容
     buf.push(0);
-    LuaString::Long(ArcRc::new(LongString {
-        hash: AtomicU64::new(0),
-        extra: AtomicU8::new(0),
+    TValue::LongStr(Rc::new(LongString {
+        hash: 0.into(),
+        extra: 0.into(),
         contents: unsafe { String::from_utf8_unchecked(buf) },
         ptr_id: crate::gc::new_ptr_id(),
     }))
 }
 
-/// 从字节创建短字符串（自动追加 NUL 终止符，与 as_str_inner 的 NUL 剥离机制配合）
-/// 用于模式匹配、pack/unpack 等需要直接构造 ShortString 的场景
-///
-/// hash 必须与 `StringTable::intern_bytes` 保持一致，否则违反 Hash/Eq 契约：
-/// 两个内容相同的 ShortString（一个由 intern 创建，一个由此函数创建）
-/// PartialEq 为 true 但 hash 不同，会导致 HashMap 查找失败。
-pub fn new_short_bytes(bytes: Vec<u8>) -> LuaString {
-    // 与 intern_bytes 相同的哈希算法：rust_hash_bytes
-    let h = rust_hash_bytes(&bytes);
-    let mut buf = bytes;
-    buf.reserve(1); // 确保 push NUL 不扩容
-                    // perf: 用 unsafe 直接写 NUL + set_len 替代 push(0), 消除冗余容量检查
-                    // SAFETY: reserve(1) 保证至少 1 字节空闲; 写 [len] 在容量内; set_len(len+1) 合法。
-    let len = buf.len();
-    unsafe {
-        *buf.as_mut_ptr().add(len) = 0;
-        buf.set_len(len + 1);
-    }
-    LuaString::Short(ArcRc::new(ShortString {
-        hash: h,
-        contents: unsafe { String::from_utf8_unchecked(buf) },
-    }))
-}
-
-/// 从 &str 创建短字符串（自动追加 NUL 终止符）
-pub fn new_short_str(s: &str) -> LuaString {
-    new_short_bytes(s.as_bytes().to_vec())
-}
-
 /// 确保长字符串有哈希值（惰性计算）。
-pub fn ensure_long_hash(ls: &mut LongString) -> u64 {
-    if ls.extra.load(Ordering::Relaxed) == 0 {
-        let content = if ls.contents.as_bytes().last() == Some(&0) {
-            &ls.contents[..ls.contents.len() - 1]
-        } else {
-            &ls.contents
-        };
+#[inline]
+pub fn ensure_long_hash(ls: &LongString) -> u64 {
+    if ls.extra.get() == 0 {
+        let content = &ls.contents[..ls.contents.len() - 1];
         let h = rust_hash(content);
-        ls.hash.store(h, Ordering::Relaxed);
-        ls.extra.store(1, Ordering::Relaxed);
+        ls.hash.set(h);
+        ls.extra.set(1);
     }
-    ls.hash.load(Ordering::Relaxed)
+    ls.hash.get()
 }
 #[cfg_attr(not(size_optimized), inline)]
-pub fn new_lstr(table: &StringTable, str: &str) -> LuaString {
+pub fn new_lstr<'a>(table: &StringTable, str: &str) -> TValue<'a> {
     if str.len() <= LUAI_MAXSHORTLEN {
-        table.intern(str)
+        table.intern_value(str)
     } else {
         new_long_str(str)
     }
@@ -1064,9 +983,9 @@ pub fn new_lstr(table: &StringTable, str: &str) -> LuaString {
 /// 从 String 创建 LuaString，长字符串路径直接 consume 避免 clone。
 /// 短字符串仍走 intern（需要查表去重，intern 未命中时内部会 clone，但短串开销小）。
 #[cfg_attr(not(size_optimized), inline)]
-pub fn new_lstr_from_string(table: &StringTable, s: String) -> LuaString {
+pub fn new_lstr_from_string<'a>(table: &StringTable, s: String) -> TValue<'a> {
     if s.len() <= LUAI_MAXSHORTLEN {
-        table.intern(&s)
+        table.intern_value(&s)
     } else {
         new_long_str_from_string(s)
     }
@@ -1075,86 +994,11 @@ pub fn new_lstr_from_string(table: &StringTable, s: String) -> LuaString {
 /// 从任意字节创建 LuaString（8-bit clean，绕过 UTF-8 验证）。
 /// 用于 C API 的 lua_pushlstring/lua_pushstring 等需要保留原始字节的场景。
 #[cfg_attr(not(size_optimized), inline)]
-pub fn new_lstr_bytes(table: &StringTable, bytes: &[u8]) -> LuaString {
+pub fn new_lstr_bytes<'a>(table: &StringTable, bytes: &[u8]) -> TValue<'a> {
     if bytes.len() <= LUAI_MAXSHORTLEN {
         table.intern_bytes(bytes)
     } else {
         new_long_bytes(bytes.to_vec())
-    }
-}
-
-// ============================================================================
-// 规约：字符串缓存
-// ============================================================================
-
-#[derive(Debug)]
-pub struct StringCache {
-    cached: RwLock<LuaString>,
-}
-
-impl StringCache {
-    pub fn new(memerrmsg: LuaString) -> Self {
-        StringCache {
-            cached: RwLock::new(memerrmsg),
-        }
-    }
-
-    /// 通过指针快速创建字符串。命中缓存时直接返回，否则创建并更新缓存。
-    ///
-    /// # Safety
-    /// `str_ptr` 必须指向长度为 `len` 的有效 UTF-8 字符串。
-    pub fn cached_new(&self, str_ptr: *const u8, len: usize, table: &StringTable) -> LuaString {
-        let cached = self.cached.read();
-        let cached_ptr = cached.as_str().as_ptr();
-        let cached_len = cached.len();
-
-        if cached_ptr == str_ptr && cached_len == len {
-            return cached.clone();
-        }
-        drop(cached);
-
-        let slice =
-            unsafe { std::str::from_utf8_unchecked(std::slice::from_raw_parts(str_ptr, len)) };
-        let new_s = new_lstr(table, slice);
-
-        let mut cached = self.cached.write();
-        *cached = new_s.clone();
-        new_s
-    }
-
-    pub fn clear(&self, new_base: LuaString) {
-        let mut cached = self.cached.write();
-        *cached = new_base;
-    }
-}
-
-// ============================================================================
-// 规约：字符串状态
-// ============================================================================
-
-#[derive(Debug)]
-pub struct StringState {
-    pub table: StringTable,
-    pub cache: StringCache,
-    pub memerrmsg: LuaString,
-}
-
-impl StringState {
-    pub fn new() -> Self {
-        let table = StringTable::new();
-        let memerrmsg = table.intern(MEMERRMSG);
-        let cache = StringCache::new(memerrmsg.clone());
-        StringState {
-            table,
-            cache,
-            memerrmsg,
-        }
-    }
-}
-
-impl Default for StringState {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -1209,17 +1053,17 @@ mod tests {
     #[test]
     fn test_intern_new_short_string() {
         let tb = StringTable::new();
-        let s = tb.intern("hello");
-        assert_eq!(s.as_str(), "hello");
-        assert_eq!(s.len(), 5);
+        let s = tb.intern_value("hello");
+        assert_eq!(lua_string_as_str(&s), "hello");
+        assert_eq!(lua_string_len(&s), 5);
         assert_eq!(tb.count(), 1, "nuse 应为 1");
     }
 
     #[test]
     fn test_intern_duplicate_returns_same() {
         let tb = StringTable::new();
-        let s1 = tb.intern("hello");
-        let s2 = tb.intern("hello");
+        let s1 = tb.intern_value("hello");
+        let s2 = tb.intern_value("hello");
         assert_eq!(s1, s2, "相同内容应返回同一个实例");
         assert!(eq_str(&s1, &s2), "通过 eq_str 比较也应相等");
         assert_eq!(tb.count(), 1, "内部化后 nuse 仍应为 1");
@@ -1228,14 +1072,14 @@ mod tests {
     #[test]
     fn test_intern_multiple_strings() {
         let tb = StringTable::new();
-        let s1 = tb.intern("hello");
-        let s2 = tb.intern("world");
-        let s3 = tb.intern("lua");
-        assert_eq!(s1.as_str(), "hello");
-        assert_eq!(s2.as_str(), "world");
-        assert_eq!(s3.as_str(), "lua");
+        let s1 = tb.intern_value("hello");
+        let s2 = tb.intern_value("world");
+        let s3 = tb.intern_value("lua");
+        assert_eq!(lua_string_as_str(&s1), "hello");
+        assert_eq!(lua_string_as_str(&s2), "world");
+        assert_eq!(lua_string_as_str(&s3), "lua");
         assert_eq!(tb.count(), 3);
-        let s1_dup = tb.intern("hello");
+        let s1_dup = tb.intern_value("hello");
         assert_eq!(s1, s1_dup);
         assert_eq!(tb.count(), 3);
     }
@@ -1243,10 +1087,10 @@ mod tests {
     #[test]
     fn test_intern_empty_string() {
         let tb = StringTable::new();
-        let s = tb.intern("");
-        assert_eq!(s.as_str(), "");
-        assert_eq!(s.len(), 0);
-        assert!(s.is_empty());
+        let s = tb.intern_value("");
+        assert_eq!(lua_string_as_str(&s), "");
+        assert_eq!(lua_string_len(&s), 0);
+        assert!(lua_string_is_empty(&s));
         assert_eq!(tb.count(), 1);
     }
 
@@ -1254,9 +1098,9 @@ mod tests {
     fn test_intern_max_short_length() {
         let tb = StringTable::new();
         let content = "a".repeat(LUAI_MAXSHORTLEN);
-        let s = tb.intern(&content);
-        assert_eq!(s.as_str(), content);
-        assert_eq!(s.len(), LUAI_MAXSHORTLEN);
+        let s = tb.intern_value(&content);
+        assert_eq!(lua_string_as_str(&s), content);
+        assert_eq!(lua_string_len(&s), LUAI_MAXSHORTLEN);
     }
 
     #[test]
@@ -1276,16 +1120,16 @@ mod tests {
     #[test]
     fn test_remove_short_string() {
         let tb = StringTable::new();
-        let s1 = tb.intern("hello");
-        let s2 = tb.intern("world");
+        let s1 = tb.intern_value("hello");
+        let s2 = tb.intern_value("world");
         assert_eq!(tb.count(), 2);
 
-        if let LuaString::Short(ref ts) = s1 {
+        if let TValue::ShortStr(ref ts) = s1 {
             tb.remove(ts);
         }
         assert_eq!(tb.count(), 1, "移除后 nuse 应为 1");
 
-        let s2_again = tb.intern("world");
+        let s2_again = tb.intern_value("world");
         assert_eq!(s2, s2_again);
         assert_eq!(tb.count(), 1, "重新查找 world 不应增加 nuse");
     }
@@ -1297,16 +1141,16 @@ mod tests {
     #[test]
     fn test_eq_str_short_same_pointer() {
         let tb = StringTable::new();
-        let a = tb.intern("foo");
-        let b = tb.intern("foo");
+        let a = tb.intern_value("foo");
+        let b = tb.intern_value("foo");
         assert!(eq_str(&a, &b), "相同短字符串必须相等");
     }
 
     #[test]
     fn test_eq_str_short_different() {
         let tb = StringTable::new();
-        let a = tb.intern("foo");
-        let b = tb.intern("bar");
+        let a = tb.intern_value("foo");
+        let b = tb.intern_value("bar");
         assert!(!eq_str(&a, &b), "不同短字符串必须不等");
     }
 
@@ -1328,10 +1172,10 @@ mod tests {
     #[test]
     fn test_eq_str_short_vs_long() {
         let tb = StringTable::new();
-        let short = tb.intern("hello");
-        let long = LuaString::Long(ArcRc::new(LongString {
-            hash: AtomicU64::new(0),
-            extra: AtomicU8::new(0),
+        let short = tb.intern_value("hello");
+        let long = TValue::LongStr(Rc::new(LongString {
+            hash: 0.into(),
+            extra: 0.into(),
             contents: "hello".to_string(),
             ptr_id: 0,
         }));
@@ -1346,9 +1190,9 @@ mod tests {
     fn test_new_lstr_short() {
         let tb = StringTable::new();
         let s = new_lstr(&tb, "hello");
-        assert!(matches!(s, LuaString::Short(_)));
-        assert_eq!(s.as_str(), "hello");
-        assert_eq!(s.len(), 5);
+        assert!(matches!(s, TValue::ShortStr(_)));
+        assert_eq!(lua_string_as_str(&s), "hello");
+        assert_eq!(lua_string_len(&s), 5);
     }
 
     #[test]
@@ -1356,9 +1200,9 @@ mod tests {
         let tb = StringTable::new();
         let content = "a".repeat(LUAI_MAXSHORTLEN + 1);
         let s = new_lstr(&tb, &content);
-        assert!(matches!(s, LuaString::Long(_)));
-        assert_eq!(s.as_str(), content);
-        assert_eq!(s.len(), LUAI_MAXSHORTLEN + 1);
+        assert!(matches!(s, TValue::LongStr(_)));
+        assert_eq!(lua_string_as_str(&s), content);
+        assert_eq!(lua_string_len(&s), LUAI_MAXSHORTLEN + 1);
     }
 
     // ------------------------------------------------------------------------
@@ -1368,13 +1212,9 @@ mod tests {
     #[test]
     fn test_new_long_str_has_hashing_marker() {
         let ls = new_long_str(&"a".repeat(LUAI_MAXSHORTLEN + 1));
-        assert_eq!(ls.len(), LUAI_MAXSHORTLEN + 1);
+        assert_eq!(lua_string_len(&ls), LUAI_MAXSHORTLEN + 1);
         match &ls {
-            LuaString::Long(ls) => assert_eq!(
-                ls.extra.load(Ordering::Relaxed),
-                0,
-                "新长字符串 extra 应为 0"
-            ),
+            TValue::LongStr(ls) => assert_eq!(ls.extra.get(), 0, "新长字符串 extra 应为 0"),
             _ => panic!("应为长字符串"),
         }
     }
@@ -1386,75 +1226,28 @@ mod tests {
     #[test]
     fn test_ensure_long_hash_computes_on_first_call() {
         let mut ls = LongString {
-            hash: AtomicU64::new(123),
-            extra: AtomicU8::new(0),
+            hash: 123.into(),
+            extra: 0.into(),
             contents: "a".repeat(50),
             ptr_id: 0,
         };
         let hash = ensure_long_hash(&mut ls);
-        assert_eq!(
-            ls.extra.load(Ordering::Relaxed),
-            1,
-            "extra 应为 1（标记已计算哈希）"
-        );
-        assert_eq!(
-            hash,
-            ls.hash.load(Ordering::Relaxed),
-            "返回的哈希应与存储的一致"
-        );
+        assert_eq!(ls.extra.get(), 1, "extra 应为 1（标记已计算哈希）");
+        assert_eq!(hash, ls.hash.get(), "返回的哈希应与存储的一致");
     }
 
     #[test]
     fn test_ensure_long_hash_idempotent() {
         let mut ls = LongString {
-            hash: AtomicU64::new(0),
-            extra: AtomicU8::new(1),
+            hash: 0.into(),
+            extra: 1.into(),
             contents: "a".repeat(50),
             ptr_id: 0,
         };
-        let hash_before = ls.hash.load(Ordering::Relaxed);
+        let hash_before = ls.hash.get();
         let hash = ensure_long_hash(&mut ls);
         assert_eq!(hash, hash_before, "已有哈希不应重新计算");
-        assert_eq!(ls.extra.load(Ordering::Relaxed), 1, "extra 仍为 1");
-    }
-
-    // ------------------------------------------------------------------------
-    // StringState 测试
-    // ------------------------------------------------------------------------
-
-    #[test]
-    fn test_string_state_new() {
-        let state = StringState::new();
-        assert_eq!(state.table.count(), 1, "应包含 memerrmsg");
-        assert_eq!(
-            state.memerrmsg.as_str(),
-            MEMERRMSG,
-            "memerrmsg 应为 MEMERRMSG"
-        );
-    }
-
-    // ------------------------------------------------------------------------
-    // StringCache 测试
-    // ------------------------------------------------------------------------
-
-    #[test]
-    fn test_cache_cached_new_hit() {
-        let state = StringState::new();
-        let str_ptr = "hello".as_ptr();
-        let s1 = state.cache.cached_new(str_ptr, 5, &state.table);
-        let s2 = state.cache.cached_new(str_ptr, 5, &state.table);
-        assert_eq!(s1, s2, "缓存命中返回相同实例");
-    }
-
-    #[test]
-    fn test_cache_clear() {
-        let state = StringState::new();
-        let str_ptr = "test".as_ptr();
-        let s = state.cache.cached_new(str_ptr, 4, &state.table);
-        assert_eq!(s.as_str(), "test");
-
-        let memerr = state.memerrmsg.clone();
-        state.cache.clear(memerr);
+        assert_eq!(ls.extra.get(), 1, "extra 仍为 1");
     }
 
     // ------------------------------------------------------------------------
@@ -1464,27 +1257,27 @@ mod tests {
     #[test]
     fn test_lua_string_hash() {
         let tb = StringTable::new();
-        let s = tb.intern("hello");
+        let s = tb.intern_value("hello");
         let h = rust_hash("hello");
-        assert_eq!(s.hash(), h);
+        assert_eq!(lua_string_hash(&s), h);
     }
 
     #[test]
     fn test_lua_string_len_and_is_empty() {
         let tb = StringTable::new();
-        let empty = tb.intern("");
-        let non_empty = tb.intern("x");
-        assert!(empty.is_empty());
-        assert!(!non_empty.is_empty());
-        assert_eq!(non_empty.len(), 1);
+        let empty = tb.intern_value("");
+        let non_empty = tb.intern_value("x");
+        assert!(lua_string_is_empty(&empty));
+        assert!(!lua_string_is_empty(&non_empty));
+        assert_eq!(lua_string_len(&non_empty), 1);
     }
 
     #[test]
     fn test_intern_arc_identity() {
         let tb = StringTable::new();
-        let a = tb.intern("shared");
-        let b = tb.intern("shared");
-        if let (LuaString::Short(ra), LuaString::Short(rb)) = (&a, &b) {
+        let a = tb.intern_value("shared");
+        let b = tb.intern_value("shared");
+        if let (TValue::ShortStr(ra), TValue::ShortStr(rb)) = (&a, &b) {
             assert!(
                 ArcRc::ptr_eq(ra, rb),
                 "同一字符串的内部化应该返回相同的 ArcRc"
@@ -1506,10 +1299,6 @@ mod tests {
         fn assert_sync<T: Sync>() {}
         assert_send::<StringTable>();
         assert_sync::<StringTable>();
-        assert_send::<StringState>();
-        assert_sync::<StringState>();
-        assert_send::<LuaString>();
-        assert_sync::<LuaString>();
     }
 
     #[cfg(feature = "threaded")]
@@ -1528,7 +1317,7 @@ mod tests {
             let table = ArcRc::clone(&table);
             let strings = strings.clone();
             handles.push(std::thread::spawn(move || {
-                let mut results = Vec::new();
+                let mut results: Vec<ArcRc<ShortString>> = Vec::new();
                 for s in &strings {
                     let ls = table.intern(s);
                     results.push(ls);
@@ -1537,14 +1326,14 @@ mod tests {
             }));
         }
 
-        let all_results: Vec<Vec<LuaString>> =
+        let all_results: Vec<Vec<ArcRc<ShortString>>> =
             handles.into_iter().map(|h| h.join().unwrap()).collect();
 
         for i in 0..count {
             let first = &all_results[0][i];
             for t in 1..4 {
-                assert_eq!(
-                    first, &all_results[t][i],
+                assert!(
+                    ArcRc::ptr_eq(first, &all_results[t][i]),
                     "线程间同一字符串应返回相同 Arc 实例: '{}'",
                     strings[i]
                 );
@@ -1552,41 +1341,6 @@ mod tests {
         }
 
         assert_eq!(table.count(), count, "count 应为去重后的字符串数");
-    }
-
-    #[cfg(feature = "threaded")]
-    #[test]
-    fn test_concurrent_intern_with_state() {
-        let state = ArcRc::new(StringState::new());
-
-        let mut handles = Vec::new();
-        for _ in 0..4 {
-            let state = ArcRc::clone(&state);
-            handles.push(std::thread::spawn(move || {
-                let mut results = Vec::new();
-                for i in 0..50 {
-                    let content = format!("var_{}", i % 25);
-                    let ls = state.table.intern(&content);
-                    results.push(ls);
-                }
-                results
-            }));
-        }
-
-        let all_results: Vec<Vec<LuaString>> =
-            handles.into_iter().map(|h| h.join().unwrap()).collect();
-
-        for i in 0..25 {
-            let first = &all_results[0][i];
-            for t in 1..4 {
-                assert_eq!(
-                    first, &all_results[t][i],
-                    "跨线程 intern 同一内容应返回相同实例"
-                );
-            }
-        }
-
-        assert_eq!(state.table.count(), 26);
     }
 
     #[cfg(feature = "threaded")]
@@ -1618,17 +1372,15 @@ mod tests {
     // Hash 行为测试 — 验证 impl Hash for LuaString 的正确性
     // ========================================================================
 
-    fn hash_one<T: Hash>(t: &T) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        t.hash(&mut hasher);
-        hasher.finish()
+    fn hash_one(t: &TValue) -> u64 {
+        lua_string_hash(t)
     }
 
     #[test]
     fn test_hash_same_content_same_hash() {
         let tb = StringTable::new();
-        let a = tb.intern("hello");
-        let b = tb.intern("hello");
+        let a = tb.intern_value("hello");
+        let b = tb.intern_value("hello");
         assert_eq!(
             hash_one(&a),
             hash_one(&b),
@@ -1639,29 +1391,12 @@ mod tests {
     #[test]
     fn test_rust_hash_different_content_different() {
         let tb = StringTable::new();
-        let a = tb.intern("hello");
-        let b = tb.intern("world");
+        let a = tb.intern_value("hello");
+        let b = tb.intern_value("world");
         assert_ne!(
             hash_one(&a),
             hash_one(&b),
             "不同内容应产生不同的 Rust Hash 值"
-        );
-    }
-
-    #[test]
-    fn test_u64_hash_equals_write_u64() {
-        let value: u64 = 0xDEAD_BEEF_CAFE_BABE;
-        let mut hasher1 = std::collections::hash_map::DefaultHasher::new();
-        value.hash(&mut hasher1);
-        let h1 = hasher1.finish();
-
-        let mut hasher2 = std::collections::hash_map::DefaultHasher::new();
-        hasher2.write_u64(value);
-        let h2 = hasher2.finish();
-
-        assert_eq!(
-            h1, h2,
-            "u64::hash() 等价于 hasher.write_u64()，不是\"hash 的 hash\""
         );
     }
 
@@ -1671,14 +1406,14 @@ mod tests {
         let content = "a".repeat(LUAI_MAXSHORTLEN + 1);
         let ls = new_long_str(&content);
         match &ls {
-            LuaString::Long(inner) => {
+            TValue::LongStr(inner) => {
                 assert_eq!(
-                    inner.extra.load(Ordering::Relaxed),
+                    inner.extra.get(),
                     0,
                     "new_long_str 创建的字符串 extra 应为 0"
                 );
                 assert_eq!(
-                    inner.hash.load(Ordering::Relaxed),
+                    inner.hash.get(),
                     0,
                     "惰性策略：extra == 0 时 hash == 0，未计算"
                 );
@@ -1689,17 +1424,13 @@ mod tests {
         let h1 = hash_one(&ls);
 
         match &ls {
-            LuaString::Long(inner) => {
+            TValue::LongStr(inner) => {
                 assert_eq!(
-                    inner.extra.load(Ordering::Relaxed),
+                    inner.extra.get(),
                     1,
                     "Hash::hash 调用后 extra 应自动变为 1（已缓存）"
                 );
-                assert_ne!(
-                    inner.hash.load(Ordering::Relaxed),
-                    0,
-                    "Hash::hash 调用后 hash 被缓存为非零值"
-                );
+                assert_ne!(inner.hash.get(), 0, "Hash::hash 调用后 hash 被缓存为非零值");
             }
             _ => panic!("应为 Long"),
         }
@@ -1711,21 +1442,21 @@ mod tests {
     /// 同内容长字符串：extra=0 和 extra=1 产生相同 Hash
     #[test]
     fn test_hash_mixed_extra_same_content() {
-        let content = "a".repeat(LUAI_MAXSHORTLEN + 1);
-        let unhashed = LuaString::Long(ArcRc::new(LongString {
-            hash: AtomicU64::new(0),
-            extra: AtomicU8::new(0),
+        let content = lua_string_with_nul(&"a".repeat(LUAI_MAXSHORTLEN + 1));
+        let unhashed = TValue::LongStr(Rc::new(LongString {
+            hash: 0.into(),
+            extra: 0.into(),
             contents: content.clone(),
             ptr_id: 0,
         }));
-        let mut ls = LongString {
-            hash: AtomicU64::new(0),
-            extra: AtomicU8::new(0),
+        let ls = LongString {
+            hash: 0.into(),
+            extra: 0.into(),
             contents: content.clone(),
             ptr_id: 0,
         };
-        ensure_long_hash(&mut ls);
-        let hashed = LuaString::Long(ArcRc::new(ls));
+        ensure_long_hash(&ls);
+        let hashed = TValue::LongStr(Rc::new(ls));
 
         assert_eq!(unhashed, hashed, "同内容的不同 extra 状态应相等");
 
@@ -1735,7 +1466,7 @@ mod tests {
             "extra=0 和 extra=1 的同内容长字符串必须产生相同 Rust Hash"
         );
 
-        let mut map: HashMap<LuaString, i32> = HashMap::new();
+        let mut map: HashMap<TValue, i32> = HashMap::new();
         map.insert(hashed.clone(), 42);
         assert_eq!(
             map.get(&unhashed),
@@ -1748,16 +1479,16 @@ mod tests {
     #[test]
     fn test_hash_same_content_different_hash_field() {
         let h = rust_hash("hello");
-        let ls1 = LuaString::Long(ArcRc::new(LongString {
-            hash: AtomicU64::new(0),
-            extra: AtomicU8::new(0),
-            contents: "hello".to_string(),
+        let ls1 = TValue::LongStr(Rc::new(LongString {
+            hash: 0.into(),
+            extra: 0.into(),
+            contents: lua_string_with_nul("hello"),
             ptr_id: 0,
         }));
-        let ls2 = LuaString::Long(ArcRc::new(LongString {
-            hash: AtomicU64::new(h),
-            extra: AtomicU8::new(1),
-            contents: "hello".to_string(),
+        let ls2 = TValue::LongStr(Rc::new(LongString {
+            hash: h.into(),
+            extra: 1.into(),
+            contents: lua_string_with_nul("hello"),
             ptr_id: 0,
         }));
 
@@ -1774,13 +1505,9 @@ mod tests {
         let content = "a".repeat(LUAI_MAXSHORTLEN + 1);
         for _ in 0..100 {
             let ls = new_long_str(&content);
-            if let LuaString::Long(inner) = &ls {
-                assert_eq!(
-                    inner.hash.load(Ordering::Relaxed),
-                    0,
-                    "所有长字符串创建时不计算 hash"
-                );
-                assert_eq!(inner.extra.load(Ordering::Relaxed), 0);
+            if let TValue::LongStr(inner) = &ls {
+                assert_eq!(inner.hash.get(), 0, "所有长字符串创建时不计算 hash");
+                assert_eq!(inner.extra.get(), 0);
             }
         }
     }
@@ -1790,23 +1517,23 @@ mod tests {
     fn test_hashmap_with_mixed_strings() {
         let tb = StringTable::new();
 
-        let short1 = tb.intern("key1");
-        let short2 = tb.intern("key2");
+        let short1 = tb.intern_value("key1");
+        let short2 = tb.intern_value("key2");
         let long_content = "a".repeat(LUAI_MAXSHORTLEN + 1);
         let long1 = new_long_str(&long_content);
 
-        let mut map: HashMap<LuaString, &str> = HashMap::new();
+        let mut map: HashMap<TValue, &str> = HashMap::new();
         map.insert(short1.clone(), "value1");
         map.insert(short2.clone(), "value2");
         map.insert(long1.clone(), "value3");
 
-        let short1_lookup = tb.intern("key1");
+        let short1_lookup = tb.intern_value("key1");
         let long1_lookup = new_long_str(&long_content);
 
         assert_eq!(map.get(&short1_lookup), Some(&"value1"));
         assert_eq!(map.get(&long1_lookup), Some(&"value3"));
 
-        let nonexistent = tb.intern("nonexistent");
+        let nonexistent = tb.intern_value("nonexistent");
         assert_eq!(map.get(&nonexistent), None);
     }
 
@@ -1815,14 +1542,14 @@ mod tests {
     fn test_ensure_long_hash_same_content() {
         let content = "a".repeat(LUAI_MAXSHORTLEN + 1);
         let mut a = LongString {
-            hash: AtomicU64::new(0),
-            extra: AtomicU8::new(0),
+            hash: 0.into(),
+            extra: 0.into(),
             contents: content.clone(),
             ptr_id: 0,
         };
         let mut b = LongString {
-            hash: AtomicU64::new(0),
-            extra: AtomicU8::new(0),
+            hash: 0.into(),
+            extra: 0.into(),
             contents: content.clone(),
             ptr_id: 0,
         };
@@ -1831,8 +1558,8 @@ mod tests {
         let h1 = ensure_long_hash(&mut b);
         assert_eq!(h0, h1, "同一内容应产生相同的 Rust hash");
 
-        assert_eq!(a.extra.load(Ordering::Relaxed), 1);
-        assert_eq!(b.extra.load(Ordering::Relaxed), 1);
+        assert_eq!(a.extra.get(), 1);
+        assert_eq!(b.extra.get(), 1);
 
         let h0_again = ensure_long_hash(&mut a);
         assert_eq!(h0, h0_again, "再次调用不重复计算");

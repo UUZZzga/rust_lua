@@ -1,6 +1,7 @@
 use crate::execute::VmError;
 use crate::objects::*;
 use crate::state::LuaState;
+use crate::strings::lua_string_as_str;
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -47,7 +48,7 @@ pub fn proto_size(p: &Proto) -> usize {
 
 fn tvalue_size(v: &TValue) -> usize {
     match v {
-        TValue::Str(_s) => std::mem::size_of_val(v),
+        TValue::LongStr(_) | TValue::ShortStr(_) => std::mem::size_of_val(v),
         _ => std::mem::size_of_val(v),
     }
 }
@@ -169,7 +170,7 @@ fn new_upval(state: &mut LuaState, level: usize, prev: Option<usize>) -> usize {
 }
 
 pub fn close_upval(state: &mut LuaState, uv_idx: usize) {
-    state.gc.cond_gc();
+    unsafe { state.gc.as_mut().cond_gc() };
     let val = {
         let uv_ref = state.exec.open_upvals[uv_idx].borrow();
         match &*uv_ref {
@@ -184,7 +185,7 @@ pub fn close_upval(state: &mut LuaState, uv_idx: usize) {
     };
     // GC barrier: when upvalue is closed, mark the value
     if let Some(gc_id) = crate::vm::gc_id_of_tvalue(&val) {
-        state.gc.mark_object(gc_id);
+        unsafe { state.gc.as_mut().mark_object(gc_id) };
     }
     unlink_upval(state, uv_idx);
     *state.exec.open_upvals[uv_idx].borrow_mut() = UpVal::Closed { value: val };
@@ -383,8 +384,8 @@ pub fn close<'a>(
                         // (pcall 已清除 last_error_value，不能从 state 读取)
                         current_err = match e {
                             VmError::RuntimeErrorValue(val) => val,
-                            VmError::RuntimeError(s) => TValue::Str(state.intern_str(&s)),
-                            other => TValue::Str(state.intern_str(&format!("{}", other))),
+                            VmError::RuntimeError(s) => state.intern_str(&s),
+                            other => state.intern_str(&format!("{}", other)),
                         };
                         has_error = true;
                     }
@@ -399,7 +400,7 @@ pub fn close<'a>(
         state.last_error_value = Some(current_err.clone());
         // 同时设置 last_error_msg（用于 close_suspended_coroutine 检测错误）
         let msg = match &current_err {
-            TValue::Str(s) => s.as_str().to_string(),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => lua_string_as_str(s).to_string(),
             _ => format!("{}", current_err),
         };
         state.last_error_msg = msg;
@@ -410,7 +411,9 @@ pub fn close<'a>(
         // state.last_error_value 已包含最终错误值，调用者可通过它获取原始 TValue
         // 字符串错误用 RuntimeError，非字符串错误用 RuntimeErrorValue 保留原始 TValue
         Err(match &current_err {
-            TValue::Str(s) => VmError::RuntimeError(s.as_str().to_string()),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                VmError::RuntimeError(lua_string_as_str(s).to_string())
+            }
             _ => VmError::RuntimeErrorValue(current_err.clone()),
         })
     } else {
@@ -483,7 +486,7 @@ fn get_var_name_at(state: &LuaState, reg: usize) -> Option<String> {
                 n -= 1;
                 if n == 0 {
                     if let Some(ref name) = loc_var.varname {
-                        return Some(name.as_str().to_string());
+                        return Some(lua_string_as_str(name).to_string());
                     }
                     return None;
                 }
@@ -534,100 +537,7 @@ mod tests {
     use crate::state::LuaState;
 
     fn make_vm_state() -> LuaState<'static> {
-        LuaState {
-            exec: Box::new(crate::state::ExecState {
-                pc: 0,
-                stack: Vec::new(),
-                top: 0,
-                base: 0,
-                closure_upvals: Rc::new(RefCell::new(UpValVec::new())),
-                open_upvals: Vec::new(),
-                open_upval: None,
-                tbc_list: None,
-                constants: Rc::new(Vec::new()),
-                code: Rc::new(Vec::new()),
-                protos: Rc::new(Vec::new()),
-                num_params: 0,
-                is_vararg: false,
-                proto_flag: 0,
-                nextraargs: 0,
-                call_stack: Vec::new(),
-                hook_old_pc: 0,
-                hook_func: None,
-                hook_mask: 0,
-                hook_count: 0,
-                current_hook_count: 0,
-                allowhook: true,
-                current_thread: None,
-                call_info: Vec::new(),
-                pcall_protection_stack: Vec::new(),
-                close_error_status: None,
-                force_noyield_close: false,
-                n_ccalls: 0,
-                n_ny_calls: 0,
-                saved_yield_nresults: 0,
-            }),
-            twups_linked: false,
-            is_in_twups: false,
-            trap: false,
-            tick: std::cell::Cell::new(0),
-            gc: Rc::new(crate::gc::GCState::default_incremental()),
-            globals: Table::new(),
-            registry: Table::new(),
-            string_table: Rc::new(crate::strings::StringTable::new()),
-            tmnames: Rc::new(crate::tm::init_tmnames(&crate::strings::StringTable::new())),
-            api_func_base: 0,
-            dmt: crate::tm::DefaultMetatables::new(),
-            io_output: None,
-            file_handles: std::collections::HashMap::with_hasher(
-                crate::objects::FxBuildHasher::default(),
-            ),
-            popen_handles: std::collections::HashSet::with_hasher(
-                crate::objects::FxBuildHasher::default(),
-            ),
-            io_input_handle: None,
-            io_output_handle: None,
-            global_state: Rc::new(crate::state::GlobalState { gcstopem: false }),
-            ci: None,
-            last_traceback: String::new(),
-            last_error_msg: String::new(),
-            last_c_function: None,
-            math_random_state: None,
-            last_error_value: None,
-            pending_yield: None,
-            main_thread: LuaThread {
-                stack: Vec::new(),
-                status: ThreadStatus::OK,
-                function: None,
-                is_main: true,
-                context: Rc::new(RefCell::new(ThreadContext::default())),
-                c_state: std::cell::Cell::new(std::ptr::null_mut()),
-            },
-            caller_gc_stacks: Vec::new(),
-            weak_tables: Vec::new(),
-            concat_gc_counter: std::cell::Cell::new(0),
-            concat_gc_interval: std::cell::Cell::new(32768),
-            finobj_list: Vec::new(),
-            ud_finobj_list: Vec::new(),
-            transferinfo_ftransfer: 0,
-            transferinfo_ntransfer: 0,
-            pending_return_adjust: None,
-            last_error_call_info: None,
-            last_close_frame: None,
-            error_no_prefix: false,
-            pending_error: None,
-            warn_on: false,
-            warn_pending: false,
-            gc_closing: false,
-            exit_requested: None,
-            cached_mode_key: std::cell::RefCell::new(None),
-            cached_gc_key: std::cell::RefCell::new(None),
-            last_gc_estimate: 0,
-            c_safety_keepalive: Vec::new(),
-            allocf_ud: std::ptr::null_mut(),
-            error_jmp_bufs: Vec::new(),
-            io: crate::mock::io_mock::lua_io(),
-        }
+        LuaState::default()
     }
 
     #[test]
@@ -745,7 +655,7 @@ mod tests {
     fn test_new_tbc_upval_creates_tbc_entry() {
         let mut state = make_vm_state();
         // 创建带 __close 元方法的 Table
-        let close_key = TValue::Str(state.intern_str("__close"));
+        let close_key = state.intern_str("__close");
         let mt = Table::new();
         mt.set(close_key, TValue::Integer(0));
         let obj = Table::new();
@@ -777,7 +687,7 @@ mod tests {
     fn test_pop_tbc_list_removes_entry() {
         let mut state = make_vm_state();
         // 创建带 __close 元方法的 Table
-        let close_key = TValue::Str(state.intern_str("__close"));
+        let close_key = state.intern_str("__close");
         let mt = Table::new();
         mt.set(close_key, TValue::Integer(0));
         let obj = Table::new();

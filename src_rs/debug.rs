@@ -40,16 +40,16 @@ pub fn runerror(_state: &mut LuaState, _msg: &str, _args: &[&TValue]) {
 ///   luaG_typeerror(L, p1, "concatenate");
 /// }
 /// ```
-pub fn concaterror<'a>(p1: &TValue<'a>, p2: &TValue<'a>) -> VmError<'a> {
+pub fn concaterror<'a>(state: &LuaState<'a>, p1: &TValue<'a>, p2: &TValue<'a>) -> VmError<'a> {
     let err_obj = if is_string_or_cvt2str(p1) { p2 } else { p1 };
-    let tname = obj_type_name(err_obj);
+    let tname = obj_type_name(state, err_obj);
     VmError::RuntimeError(format!("attempt to concatenate a {} value", tname))
 }
 
 /// 顺序比较错误 — 对应 C 的 luaG_ordererror
-pub fn ordererror<'a>(p1: &TValue<'a>, p2: &TValue<'a>) -> VmError<'a> {
-    let t1 = obj_type_name(p1);
-    let t2 = obj_type_name(p2);
+pub fn ordererror<'a>(state: &LuaState<'a>, p1: &TValue<'a>, p2: &TValue<'a>) -> VmError<'a> {
+    let t1 = obj_type_name(state, p1);
+    let t2 = obj_type_name(state, p2);
     let msg = if t1 == t2 {
         format!("attempt to compare two {} values", t1)
     } else {
@@ -71,6 +71,7 @@ pub fn ordererror<'a>(p1: &TValue<'a>, p2: &TValue<'a>) -> VmError<'a> {
 /// }
 /// ```
 pub fn opinterror<'a>(
+    state: &LuaState<'a>,
     p1: &TValue<'a>,
     p2: &TValue<'a>,
     op: &str,
@@ -83,7 +84,7 @@ pub fn opinterror<'a>(
     } else {
         (p2, p2_info)
     };
-    let tname = obj_type_name(err_obj);
+    let tname = obj_type_name(state, err_obj);
     VmError::RuntimeError(format!("attempt to {} a {} value{}", op, tname, info))
 }
 
@@ -122,5 +123,8 @@ fn is_number(v: &TValue) -> bool {
 
 /// 判断值是否为字符串或可转换为字符串 — 对应 C 的 ttisstring || cvt2str
 fn is_string_or_cvt2str(v: &TValue) -> bool {
-    matches!(v, TValue::Str(_) | TValue::Integer(_) | TValue::Float(_))
+    matches!(
+        v,
+        TValue::LongStr(_) | TValue::ShortStr(_) | TValue::Integer(_) | TValue::Float(_)
+    )
 }

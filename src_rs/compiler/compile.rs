@@ -2,7 +2,9 @@ use super::lexer::{LexState, Token};
 use crate::objects::PF_VAHID;
 use crate::objects::*;
 use crate::opcodes::*;
-use crate::strings::LuaString;
+use crate::strings::lua_string_as_str;
+use crate::strings::lua_string_hash;
+use crate::strings::lua_string_len;
 use std::collections::HashMap;
 use std::hash::{BuildHasher, Hash, Hasher};
 use std::rc::Rc;
@@ -240,7 +242,7 @@ pub enum ExpKind {
 
 #[cfg_attr(not(size_optimized), derive(Debug))]
 #[derive(Clone)]
-pub struct ExpDesc {
+pub struct ExpDesc<'a> {
     pub kind: ExpKind,
     pub info: i64,
     pub info2: i32,
@@ -249,10 +251,10 @@ pub struct ExpDesc {
     /// For ExpKind::Str: stores the string value before it's added to the constant table.
     /// When Some(s), the string hasn't been added yet (info is unused).
     /// When None, the string has been added and info stores the constant index.
-    pub str_val: Option<LuaString>,
+    pub str_val: Option<TValue<'a>>,
 }
 
-impl ExpDesc {
+impl<'a> ExpDesc<'a> {
     pub fn new(kind: ExpKind, info: i64) -> Self {
         ExpDesc {
             kind,
@@ -264,7 +266,7 @@ impl ExpDesc {
         }
     }
 
-    pub fn new_str(s: LuaString) -> Self {
+    pub fn new_str(s: TValue<'a>) -> Self {
         ExpDesc {
             kind: ExpKind::Str,
             info: -1,
@@ -309,8 +311,8 @@ impl ExpDesc {
 /// Variable visible from a parent/grandparent function.
 /// Used by find_upvalue to create upvalue references.
 #[derive(Clone)]
-struct ParentVar {
-    name: LuaString,
+struct ParentVar<'a> {
+    name: TValue<'a>,
     is_local: bool,  // true = direct parent's local, false = inherited from ancestor
     is_global: bool, // true = GDKREG/GDKCONST variable (global declaration)
     is_ctc: bool,    // true = RDKCTC variable (compile-time constant, not an upvalue)
@@ -318,7 +320,7 @@ struct ParentVar {
     kind: i32,       // variable kind (VDKREG/RDKCONST/RDKCTC/GDKREG/GDKCONST etc.)
     ctc_kind: Option<ExpKind>, // constant kind (for is_ctc)
     ctc_info: Option<i64>, // constant info (for is_ctc)
-    ctc_str: Option<LuaString>, // constant string value (for is_ctc Str)
+    ctc_str: Option<TValue<'a>>, // constant string value (for is_ctc Str)
     // is_local=true:
     reg: i32,         // register in direct parent
     local_idx: usize, // index in direct parent's locals array
@@ -330,8 +332,8 @@ struct ParentVar {
 }
 
 #[derive(Clone)]
-struct LocalVar {
-    name: LuaString,
+struct LocalVar<'a> {
+    name: TValue<'a>,
     /// 预缓存的 name hash,用于 find_local_ex/find_local_ctc 的快速比较。
     /// 避免对每个不匹配的 local 都解引用 Rc 读取 hash (perf: LuaString::eq 占 2.87%,
     /// 其中大部分是 ptr_eq 失败后 deref Rc 读 hash 的开销)。
@@ -345,7 +347,7 @@ struct LocalVar {
     kind: i32,
     ctc_kind: Option<ExpKind>,
     ctc_info: Option<i64>,
-    ctc_str: Option<LuaString>,
+    ctc_str: Option<TValue<'a>>,
     nactvar: i32, // compact active variable count at declaration time (like C's fs->nactvar)
     pidx: i32,    // index into proto.locvars (-1 if no debug info, like C's vd.pidx)
 }
@@ -353,9 +355,9 @@ struct LocalVar {
 /// Result of searching for a variable in parent/grandparent scope.
 /// Like C's singlevaraux: VCONST variables are returned as constants,
 /// while VLOCAL/VUPVAL variables create upvalues.
-enum UpvalueOrCtc {
+enum UpvalueOrCtc<'a> {
     Upvalue(i32),
-    CtcConst(ExpDesc),
+    CtcConst(ExpDesc<'a>),
 }
 
 /// 一次扫描 locals Vec 的完整查找结果。
@@ -364,9 +366,9 @@ enum UpvalueOrCtc {
 /// perf: 这 4 个函数合计占 api.lua 编译热点的 ~18% (find_named_global_decl 6.53%
 /// + find_local_ctc 6.21% + is_undeclared_global 3.42% + find_global_decl 2.33%)。
 #[derive(Debug)]
-enum LocalLookup {
+enum LocalLookup<'a> {
     /// 编译时常量 (RDKCTC) — 对应 find_local_ctc 返回 Some
-    Ctc(ExpDesc),
+    Ctc(ExpDesc<'a>),
     /// 普通 local (RDKREG/RDKCONST/RDKTOCLOSE/RDKVAVAR) — 对应 find_local_ex 返回 Some
     Local { reg: i32, kind: i32 },
     /// 命中具名 global 声明 (GDKREG/GDKCONST) — 对应 find_named_global_decl 返回 Some
@@ -380,16 +382,16 @@ enum LocalLookup {
     NotFound,
 }
 
-struct LabelDesc {
-    name: LuaString,
+struct LabelDesc<'a> {
+    name: TValue<'a>,
     pc: i32,       // label 位置（跳转目标）
     nactvar: i32,  // label 处的活跃变量计数（对应 C 的 bl->nactvar）
     reglevel: i32, // label 处的寄存器级别（对应 C 的 reglevel(fs, nactvar)）
     line: i32,
 }
 
-struct GotoDesc {
-    name: LuaString,
+struct GotoDesc<'a> {
+    name: TValue<'a>,
     pc: i32, // JMP 指令的 pc
     line: i32,
     nactvar: i32,   // goto 处的活跃变量计数（对应 C 的 fs->nactvar）
@@ -583,15 +585,15 @@ impl Hasher for FixedSipHasher13 {
 }
 
 #[derive(Clone)]
-enum ConstKey {
+enum ConstKey<'a> {
     Nil,
     Boolean(bool),
     Integer(i64),
     Float(u64), // f64::to_bits
-    Str(LuaString),
+    Str(TValue<'a>),
 }
 
-impl PartialEq for ConstKey {
+impl<'a> PartialEq for ConstKey<'a> {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (ConstKey::Nil, ConstKey::Nil) => true,
@@ -604,9 +606,9 @@ impl PartialEq for ConstKey {
     }
 }
 
-impl Eq for ConstKey {}
+impl<'a> Eq for ConstKey<'a> {}
 
-impl Hash for ConstKey {
+impl<'a> Hash for ConstKey<'a> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         // perf: 预混合每个 key 为单个 u64, 用 0x9E3779B97F4A7C15 (黄金比例常量)
         // 乘法扩散, 避免 FxHash 对连续整数的聚类问题 (此前 FxHasher 直接 hash 整数
@@ -623,20 +625,20 @@ impl Hash for ConstKey {
             ConstKey::Float(f) => 0x300 ^ (*f).wrapping_mul(0x9E3779B97F4A7C15),
             ConstKey::Str(s) => {
                 // 短字符串已有预计算的 hash (rust_hash, 分布良好)
-                0x400 ^ s.hash()
+                0x400 ^ lua_string_hash(s)
             }
         };
         state.write_u64(h);
     }
 }
 
-fn to_const_key(v: &TValue) -> ConstKey {
+fn to_const_key<'a>(v: &TValue<'a>) -> ConstKey<'a> {
     match v {
         TValue::Nil(_) => ConstKey::Nil,
         TValue::Boolean(b) => ConstKey::Boolean(*b),
         TValue::Integer(i) => ConstKey::Integer(*i),
         TValue::Float(f) => ConstKey::Float(f.to_bits()),
-        TValue::Str(s) => ConstKey::Str(s.clone()),
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => ConstKey::Str(s.clone()),
         _ => ConstKey::Nil,
     }
 }
@@ -647,13 +649,13 @@ pub struct FuncState<'a, 'b> {
     pub pc: i32,
     pub freereg: i32,
     pub max_freereg: i32,
-    locals: Vec<LocalVar>,
+    locals: Vec<LocalVar<'b>>,
     pub errors: Vec<String>,
     pub needclose: bool,
-    parent_locals: Vec<ParentVar>, // variables visible from parent/grandparent functions
+    parent_locals: Vec<ParentVar<'b>>, // variables visible from parent/grandparent functions
     pub break_list: i32,
-    labels: Vec<LabelDesc>,
-    gotos: Vec<GotoDesc>,
+    labels: Vec<LabelDesc<'b>>,
+    gotos: Vec<GotoDesc<'b>>,
     lasttarget: i32,
     block_stack: Vec<BlockEntry>, // 每个块的信息，栈顶是当前块
     /// Pending function body block info, saved by parse_chunk for close_func.
@@ -670,7 +672,7 @@ pub struct FuncState<'a, 'b> {
     /// FxHash 对 ConstKey 的哈希质量不佳 (即使预混合), 导致冲突增多;
     /// 标准 RandomState 每次哈希需访问 thread-local 密钥, 有额外开销。
     /// 固定密钥 SipHash 兼顾哈希质量和访问速度。
-    const_index: HashMap<ConstKey, i32, FixedSipBuildHasher>,
+    const_index: HashMap<ConstKey<'b>, i32, FixedSipBuildHasher>,
     /// 缓存 _ENV 的查找结果, 避免每次全局变量访问都 lookup_local(_ENV) 扫描 locals。
     /// perf: code_global_via_env/prefix 每次都调用 lookup_local(_ENV), 占 lookup_local
     /// 10.35% 热点中的约 40% (4%+)。_ENV 位置在函数编译期间固定 (除非 `local _ENV`,
@@ -696,7 +698,7 @@ enum EnvCache {
 }
 
 /// resolve_env 返回的 _ENV 位置 (不缓存 Ctc/NamedGlobal)
-enum EnvResolution {
+enum EnvResolution<'a> {
     /// _ENV 是 local (reg, kind)
     Local { reg: i32, kind: i32 },
     /// _ENV 是 upvalue (idx)
@@ -706,7 +708,7 @@ enum EnvResolution {
     /// _ENV 是 named global 声明 (报错情况, 不缓存)
     NamedGlobal,
     /// _ENV 是编译时常量 (不缓存)
-    Ctc(ExpDesc),
+    Ctc(ExpDesc<'a>),
 }
 
 /// ANTLR4: `chunk: block ;` — 编译器入口，初始化 FuncState，解析整个脚本块并生成原型
@@ -1188,18 +1190,18 @@ impl<'a, 'b> FuncState<'a, 'b> {
     /// 创建字符串常量并添加到常量表
     fn string_k(&mut self, s: &str) -> i32 {
         let ls = self.ls_mut().anchor_string(s);
-        self.const_k(TValue::Str(ls))
+        self.const_k(ls)
     }
 
     /// 直接用已 intern 的 LuaString 创建字符串常量 (跳过重复 anchor)。
     /// 用于从 Token::Name/String(LuaString) 直接添加到常量表, 避免再次 anchor_string 的 hash 查找。
-    fn string_k_ls(&mut self, ls: LuaString) -> i32 {
-        self.const_k(TValue::Str(ls))
+    fn string_k_ls(&mut self, ls: TValue<'b>) -> i32 {
+        self.const_k(ls)
     }
 
     /// 将 ExpKind::Str 表达式的字符串添加到常量表（如果尚未添加），
     /// 返回常量索引。这实现了延迟添加，与 C++ 编译器的 VKSTR 行为一致。
-    fn discharge_str(&mut self, e: &mut ExpDesc) -> i32 {
+    fn discharge_str(&mut self, e: &mut ExpDesc<'b>) -> i32 {
         if let Some(s) = e.str_val.take() {
             let k = self.string_k_ls(s);
             e.info = k as i64;
@@ -1211,7 +1213,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
 
     /// 获取 ExpKind::Str 表达式的常量索引（不修改 ExpDesc）。
     /// 如果字符串尚未添加到常量表，则添加之。
-    fn get_str_k(&mut self, e: &ExpDesc) -> i32 {
+    fn get_str_k(&mut self, e: &ExpDesc<'b>) -> i32 {
         if let Some(ref s) = e.str_val {
             self.string_k_ls(s.clone())
         } else {
@@ -1406,7 +1408,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
             start_pc,
             end_pc: 0,
         });
-        let name_hash = name_ls.hash();
+        let name_hash = lua_string_hash(&name_ls);
         self.locals.push(LocalVar {
             name: name_ls,
             name_hash,
@@ -1458,7 +1460,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
         } else {
             -1
         };
-        let name_hash = name_ls.hash();
+        let name_hash = lua_string_hash(&name_ls);
         let is_global_star = name == "(global *)";
         self.locals.push(LocalVar {
             name: name_ls,
@@ -1514,7 +1516,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
         } else {
             -1
         };
-        let name_hash = name_ls.hash();
+        let name_hash = lua_string_hash(&name_ls);
         let is_global_star = name == "(global *)";
         self.locals.push(LocalVar {
             name: name_ls,
@@ -1534,18 +1536,18 @@ impl<'a, 'b> FuncState<'a, 'b> {
     /// 在当前作用域中查找局部变量 (从后往前)
     fn find_local(&self, name: &str) -> Option<i32> {
         for lv in self.locals.iter().rev() {
-            if lv.active && lv.name.as_str() == name && lv.kind <= RDKTOCLOSE {
+            if lv.active && lua_string_as_str(&lv.name) == name && lv.kind <= RDKTOCLOSE {
                 return Some(lv.reg);
             }
         }
         None
     }
 
-    fn find_local_ctc(&mut self, name: &LuaString) -> Option<ExpDesc> {
+    fn find_local_ctc(&mut self, name: &TValue<'b>) -> Option<ExpDesc<'b>> {
         // 单次线性扫描合并两段逻辑：找到首个匹配后立即返回（ctc_str 或 ctc_info）。
         // perf: 用 name_hash 预比较快速淘汰不匹配的 local,避免对每个 local 都
         // 解引用 Rc 读取 hash (LuaString::eq 在 ptr_eq 失败时会 deref Rc 读 hash)。
-        let name_hash = name.hash();
+        let name_hash = lua_string_hash(name);
         for lv in self.locals.iter().rev() {
             if !lv.active {
                 continue;
@@ -1578,8 +1580,8 @@ impl<'a, 'b> FuncState<'a, 'b> {
     /// 消除 3-4 次重复的 locals.iter().rev() 迭代 + 重复的 active/hash/name 比较。
     /// 行为等价于依次调用这 4 个函数, 但仅扫描一次。
     #[cfg_attr(not(size_optimized), inline)]
-    fn lookup_local(&mut self, name: &LuaString) -> LocalLookup {
-        let name_hash = name.hash();
+    fn lookup_local(&mut self, name: &TValue<'b>) -> LocalLookup<'b> {
+        let name_hash = lua_string_hash(name);
         // info: -1 = 无 global 声明, >=0 = 有 global *, -2 = 有非匹配 named global
         let mut info: i32 = -1;
 
@@ -1647,7 +1649,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
     /// 不缓存 Ctc/NamedGlobal (极少见), 调用方需处理这两种情况。
     /// perf: code_global_via_env/prefix 每次调用 lookup_local(_ENV) 扫描 locals,
     /// 占 lookup_local 10.35% 热点的约 40%。缓存后直接复用, 跳过 locals 扫描。
-    fn resolve_env(&mut self, env_ls: &LuaString) -> EnvResolution {
+    fn resolve_env(&mut self, env_ls: &TValue<'b>) -> EnvResolution<'b> {
         // 快速路径: 缓存命中 (仅 Upvalue/Implicit, 不缓存 Local)
         // Local 不缓存: `local _ENV` 在 block 退出后 deactivate, 缓存会失效。
         // Upvalue/Implicit 在函数编译期间位置固定, 可安全缓存。
@@ -1691,7 +1693,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
     /// - 遇到 RDKCTC 变量时，名字匹配返回 CtcConst（编译时常量，不创建 upvalue）
     ///   对应 C 中 singlevaraux 找到 VCONST 时不创建 upvalue 直接返回
     /// - 遇到 RDKREG/RDKCONST/RDKTOCLOSE 变量时，名字匹配则创建 upvalue
-    fn find_upvalue(&mut self, name: &LuaString) -> Option<UpvalueOrCtc> {
+    fn find_upvalue(&mut self, name: &TValue<'b>) -> Option<UpvalueOrCtc<'b>> {
         for (i, uv) in self.proto.upvalues.iter().enumerate() {
             if let Some(ref n) = uv.name {
                 if *n == *name {
@@ -1727,7 +1729,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
                     continue;
                 }
                 if pvar.is_global {
-                    if pvar.name.as_str() == "(global *)" {
+                    if lua_string_as_str(&pvar.name) == "(global *)" {
                         if !global_star_active {
                             global_star_active = true;
                         }
@@ -1757,7 +1759,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
             }
             // global * covers this name: variable is global, not an upvalue.
             // But _ENV is special: it's an upvalue in Rust, not covered by global *.
-            if global_star_active && name.as_str() != "_ENV" {
+            if global_star_active && lua_string_as_str(name) != "_ENV" {
                 return None;
             }
         }
@@ -1782,7 +1784,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
                 self.error_limit(MAXUPVAL as i32, "upvalues");
             }
             let idx = self.proto.upvalues.len() as i32;
-            let ls = self.ls_mut().anchor_string(name.as_str());
+            let ls = self.ls_mut().anchor_string(lua_string_as_str(name));
             Rc::make_mut(&mut self.proto.upvalues).push(crate::objects::UpvalDesc {
                 name: Some(ls),
                 in_stack: false,
@@ -1824,7 +1826,10 @@ impl<'a, 'b> FuncState<'a, 'b> {
                     self.error_limit(MAXUPVAL as i32, "upvalues");
                 }
                 let idx = self.proto.upvalues.len() as i32;
-                let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name.as_str());
+                let ls = crate::strings::new_lstr(
+                    &self.ls_mut().state.string_table,
+                    lua_string_as_str(name),
+                );
                 Rc::make_mut(&mut self.proto.upvalues).push(crate::objects::UpvalDesc {
                     name: Some(ls),
                     in_stack: false,
@@ -1841,7 +1846,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
 
     /// Helper: create an upvalue from a parent local variable (is_local=true).
     /// Like C's newupvalue with VLOCAL: instack=true, idx=ridx.
-    fn create_upvalue_from_parent_local(&mut self, pvar: &ParentVar) -> UpvalueOrCtc {
+    fn create_upvalue_from_parent_local(&mut self, pvar: &ParentVar<'b>) -> UpvalueOrCtc<'b> {
         const MAXUPVAL: usize = 255;
         if self.proto.upvalues.len() + 1 > MAXUPVAL {
             self.error_limit(MAXUPVAL as i32, "upvalues");
@@ -1867,7 +1872,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
     ///   1. parent's locals (searchvar) -> in_stack=true upvalue
     ///   2. parent's upvalues (searchupvalue) -> in_stack=false upvalue
     ///   3. grandparent vars (recurse singlevaraux) -> in_stack=false upvalue
-    fn find_or_create_parent_upvalue(&mut self, name: &LuaString) -> usize {
+    fn find_or_create_parent_upvalue(&mut self, name: &TValue<'b>) -> usize {
         let prev = self.prev;
         if prev.is_null() {
             return 0;
@@ -1893,7 +1898,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
                     continue;
                 }
                 if pvar.is_global {
-                    if pvar.name.as_str() == "(global *)" {
+                    if lua_string_as_str(&pvar.name) == "(global *)" {
                         if !global_star_active {
                             global_star_active = true;
                         }
@@ -1919,7 +1924,10 @@ impl<'a, 'b> FuncState<'a, 'b> {
                     let line_defined = prev.proto.line_defined;
                     self.error_limit_at(line_defined, MAXUPVAL as i32, "upvalues");
                 }
-                let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name.as_str());
+                let ls = crate::strings::new_lstr(
+                    &self.ls_mut().state.string_table,
+                    lua_string_as_str(&name),
+                );
                 let idx = prev.proto.upvalues.len();
                 Rc::make_mut(&mut prev.proto.upvalues).push(crate::objects::UpvalDesc {
                     name: Some(ls),
@@ -1931,7 +1939,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
                 prev.proto.size_upvalues = prev.proto.upvalues.len() as i32;
                 return idx;
             }
-            if global_star_active && name.as_str() != "_ENV" {
+            if global_star_active && lua_string_as_str(name) != "_ENV" {
                 return usize::MAX;
             }
         }
@@ -1948,7 +1956,10 @@ impl<'a, 'b> FuncState<'a, 'b> {
                     let line_defined = prev.proto.line_defined;
                     self.error_limit_at(line_defined, MAXUPVAL as i32, "upvalues");
                 }
-                let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name.as_str());
+                let ls = crate::strings::new_lstr(
+                    &self.ls_mut().state.string_table,
+                    lua_string_as_str(name),
+                );
                 let idx = prev.proto.upvalues.len();
                 Rc::make_mut(&mut prev.proto.upvalues).push(crate::objects::UpvalDesc {
                     name: Some(ls),
@@ -1985,7 +1996,10 @@ impl<'a, 'b> FuncState<'a, 'b> {
                     let line_defined = prev.proto.line_defined;
                     self.error_limit_at(line_defined, MAXUPVAL as i32, "upvalues");
                 }
-                let ls = crate::strings::new_lstr(&self.ls_mut().state.string_table, name.as_str());
+                let ls = crate::strings::new_lstr(
+                    &self.ls_mut().state.string_table,
+                    lua_string_as_str(name),
+                );
                 let idx = prev.proto.upvalues.len();
                 Rc::make_mut(&mut prev.proto.upvalues).push(crate::objects::UpvalDesc {
                     name: Some(ls),
@@ -2006,10 +2020,10 @@ impl<'a, 'b> FuncState<'a, 'b> {
     /// 匹配 C 的 searchvar 逻辑：遇到 GDKREG/GDKCONST 变量时，
     /// 如果名字匹配则不继续搜索（返回 None 表示是全局变量）。
     /// 遇到 global * 时不停止搜索，继续查找 local 变量。
-    fn find_local_ex(&self, name: &LuaString) -> Option<(i32, i32)> {
+    fn find_local_ex(&self, name: &TValue<'b>) -> Option<(i32, i32)> {
         // perf: 用 name_hash 预比较快速淘汰不匹配的 local,避免对每个 local 都
         // 解引用 Rc 读取 hash (LuaString::eq 在 ptr_eq 失败时会 deref Rc 读 hash)。
-        let name_hash = name.hash();
+        let name_hash = lua_string_hash(name);
         for lv in self.locals.iter().rev() {
             if !lv.active {
                 continue;
@@ -2039,12 +2053,12 @@ impl<'a, 'b> FuncState<'a, 'b> {
     ///   Some(kind) - 找到匹配的 global 变量（GDKREG 或 GDKCONST）
     ///   None - 没有找到匹配的 global 声明
     ///   如果遇到 global * 但名字不匹配，会设置 global_star_active
-    fn find_global_decl(&self, name: &LuaString) -> Option<i32> {
+    fn find_global_decl(&self, name: &TValue<'b>) -> Option<i32> {
         // C's searchvar: info starts at -1 (preambular active).
         // - collective (global *): if info < 0, record info & remember kind
         // - named global matches: return its kind
         // - named global non-match: if info == -1, set info = -2 (invalidate preambular only)
-        let name_hash = name.hash();
+        let name_hash = lua_string_hash(name);
         let mut info: i32 = -1;
         let mut collective_kind: i32 = GDKREG;
         for lv in self.locals.iter().rev() {
@@ -2086,7 +2100,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
     /// declaration covers it. In that case C raises "variable 'X' not declared".
     /// Also searches parent function chains (like singlevaraux recursion), because
     /// a global declaration in an enclosing function also restricts inner scopes.
-    fn is_undeclared_global(&self, name: &LuaString) -> bool {
+    fn is_undeclared_global(&self, name: &TValue<'b>) -> bool {
         // Current function scope (C's searchvar). info starts at -1 (preambular);
         // named global non-match sets it to -2; collective sets it to >= 0 if < 0.
         let mut info: i32 = -1;
@@ -2120,7 +2134,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
     /// 只检查 parent_locals 中的 global 声明状态 (当前作用域已由 lookup_local 处理)。
     /// 供 lookup_local 返回 Undeclared/NotFound 后, find_upvalue 也失败时调用。
     /// 对应 is_undeclared_global 的 parent 扫描部分。
-    fn is_undeclared_global_parent(&self, name: &LuaString) -> bool {
+    fn is_undeclared_global_parent(&self, name: &TValue<'b>) -> bool {
         let mut parent_info: i32 = -1;
         let mut global_star_active = false;
         for pvar in self.parent_locals.iter().rev() {
@@ -2128,7 +2142,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
                 continue;
             }
             if pvar.is_global {
-                if pvar.name.as_str() == "(global *)" {
+                if lua_string_as_str(&pvar.name) == "(global *)" {
                     if !global_star_active {
                         global_star_active = true;
                         parent_info = 0; // collective covers
@@ -2148,7 +2162,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
     /// 搜索当前函数及父函数链中的 global 声明，返回其 kind。
     /// 对应 C 的 singlevaraux 递归搜索：先在当前函数 searchvar，
     /// 未找到则递归到父函数。用于检测子函数中的 global const 赋值。
-    fn find_global_kind_in_chain(&self, name: &LuaString) -> Option<i32> {
+    fn find_global_kind_in_chain(&self, name: &TValue<'b>) -> Option<i32> {
         // First, check current function's locals
         if let Some(kind) = self.find_global_decl(name) {
             return Some(kind);
@@ -2162,7 +2176,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
         let mut collective_kind: i32 = GDKREG;
         for pvar in self.parent_locals.iter().rev() {
             if pvar.is_global {
-                if pvar.name.as_str() == "(global *)" {
+                if lua_string_as_str(&pvar.name) == "(global *)" {
                     if info < 0 {
                         info = 0;
                         collective_kind = pvar.kind;
@@ -2193,7 +2207,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
     }
 
     /// 将表达式结果确保在寄存器中: 根据 ExpKind 生成相应 LOAD/MOVE 指令
-    fn expr_to_reg(&mut self, e: &ExpDesc) -> i32 {
+    fn expr_to_reg(&mut self, e: &ExpDesc<'b>) -> i32 {
         let r = match e.kind {
             ExpKind::VVARGVAR => {
                 self.proto.flag |= PF_VATAB;
@@ -2362,7 +2376,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
     /// discharge the expression value into it.
     /// For Call, like C's dischargevars(setoneret) + discharge2anyreg:
     /// convert Call to NonReloc first, then return the register.
-    fn discharge_to_any_reg(&mut self, e: &ExpDesc) -> i32 {
+    fn discharge_to_any_reg(&mut self, e: &ExpDesc<'b>) -> i32 {
         if e.kind == ExpKind::NonReloc {
             return e.info as i32;
         }
@@ -2380,7 +2394,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
 
     /// Like C's discharge2reg: put expression value into a specific register.
     /// Does NOT handle jump lists. After this, expression becomes NonReloc.
-    fn discharge_to_reg(&mut self, e: &ExpDesc, reg: i32) {
+    fn discharge_to_reg(&mut self, e: &ExpDesc<'b>, reg: i32) {
         match e.kind {
             ExpKind::Nil => {
                 self.code_nil(reg, 1);
@@ -2459,7 +2473,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
     /// If NonReloc with no jumps, return existing register.
     /// If NonReloc with jumps and reg >= nvarstack, resolve jumps to that register.
     /// Otherwise, use exp_to_next_reg (allocate new register).
-    fn exp_to_reg(&mut self, e: &ExpDesc) -> i32 {
+    fn exp_to_reg(&mut self, e: &ExpDesc<'b>) -> i32 {
         // Like C's luaK_exp2anyreg: dischargevars first, then check VNONRELOC
         // Call is like VNONRELOC after dischargevars (setoneret converts VCALL to VNONRELOC)
         if e.kind == ExpKind::NonReloc || e.kind == ExpKind::Call {
@@ -2488,7 +2502,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
 
     /// Like C's luaK_exp2nextreg: discharge, free, reserve a register, then exp2reg.
     /// Always allocates a new register for the expression result.
-    fn exp_to_next_reg(&mut self, e: &ExpDesc) -> i32 {
+    fn exp_to_next_reg(&mut self, e: &ExpDesc<'b>) -> i32 {
         // Like C: dischargevars + freeexp + reserveregs(1) + exp2reg
         // For NonReloc locals (info < nvarstack) with jumps, we need a new register.
         // For Call, dischargevars converts to NonReloc first.
@@ -2549,7 +2563,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
         }
     }
 
-    fn resolve_jumps(&mut self, e: &ExpDesc, r: i32) {
+    fn resolve_jumps(&mut self, e: &ExpDesc<'b>, r: i32) {
         if e.kind != ExpKind::VJMP && (e.t != NO_JUMP || e.f != NO_JUMP) {
             let need_f = self.need_value(e.f);
             let need_t = self.need_value(e.t);
@@ -2828,8 +2842,12 @@ impl<'a, 'b> FuncState<'a, 'b> {
                     // In Rust, _ENV is not a local, so parent_local_idx may point
                     // to a different variable. If names don't match, skip marking
                     // this level (the variable is actually an upvalue in the parent).
-                    let local_name = prev.locals[local_idx].name.as_str();
-                    let uv_name = parent_uv.name.as_ref().map(|s| s.as_str()).unwrap_or("");
+                    let local_name = lua_string_as_str(&prev.locals[local_idx].name);
+                    let uv_name = parent_uv
+                        .name
+                        .as_ref()
+                        .map(|s| lua_string_as_str(s))
+                        .unwrap_or("");
                     if local_name == uv_name {
                         prev.mark_block_upval(local_idx);
                     } else {
@@ -2992,13 +3010,13 @@ fn final_target(code: &[u32], mut i: i32) -> i32 {
 
 /// ANTLR4: 终端匹配 — 检查当前 token 是否与给定 token 类型相同
 #[cfg_attr(not(size_optimized), inline(always))]
-fn check(fs: &FuncState, t: &Token) -> bool {
+fn check<'a, 'b>(fs: &FuncState<'a, 'b>, t: &Token) -> bool {
     std::mem::discriminant(&fs.ls().token) == std::mem::discriminant(t)
 }
 
 /// ANTLR4: 终端匹配+消费 — 检查并消费当前 token
 #[cfg_attr(not(size_optimized), inline(always))]
-fn test_next(fs: &mut FuncState, t: &Token) -> bool {
+fn test_next<'a, 'b>(fs: &mut FuncState<'a, 'b>, t: &Token) -> bool {
     let l = fs.ls_mut();
     if std::mem::discriminant(&l.token) == std::mem::discriminant(t) {
         l.next();
@@ -3011,7 +3029,7 @@ fn test_next(fs: &mut FuncState, t: &Token) -> bool {
 /// ANTLR4: 终端匹配断言 — 期望当前 token 匹配，否则报错并跳过
 /// 对应 C 的 error_expected: 调用 luaX_syntaxerror 生成 "TOKEN expected near CURTOKEN"
 #[cfg_attr(not(size_optimized), inline(always))]
-fn expect(fs: &mut FuncState, t: &Token) {
+fn expect<'a, 'b>(fs: &mut FuncState<'a, 'b>, t: &Token) {
     if !check(fs, t) {
         syntax_error_with_token(fs, &format!("{} expected", t.to_display_str()));
     } else {
@@ -3021,7 +3039,7 @@ fn expect(fs: &mut FuncState, t: &Token) {
 
 /// 对应 C 的 check_match：期望 token t，若不匹配且跨行，则报 "X expected (to close Y at line Z) near TOKEN"
 /// `who` 是开始符号（如 '{'），`where` 是开始行号
-fn check_match(fs: &mut FuncState, t: &Token, who: &Token, where_line: i32) {
+fn check_match<'a, 'b>(fs: &mut FuncState<'a, 'b>, t: &Token, who: &Token, where_line: i32) {
     if !check(fs, t) {
         if where_line == fs.ls().linenumber {
             // 同一行：简单错误消息（对应 C 的 error_expected → luaX_syntaxerror）
@@ -3065,10 +3083,10 @@ fn block_follow(fs: &FuncState, with_until: bool) -> bool {
 }
 
 /// ANTLR4: NAME — 获取标识符名称并消费当前 token
-fn get_name(fs: &mut FuncState) -> LuaString {
+fn get_name<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> TValue<'b> {
     match &fs.ls().token {
         Token::Name(s) => {
-            let name = s.clone();
+            let name = s.to_value();
             fs.ls_mut().next();
             name
         }
@@ -3085,7 +3103,11 @@ fn get_name(fs: &mut FuncState) -> LuaString {
 // ============================================================================
 
 /// Like C's findlabel: search labels from the end, starting at or after given index
-fn find_label_from(fs: &FuncState, name: &LuaString, start_idx: usize) -> Option<usize> {
+fn find_label_from<'a, 'b>(
+    fs: &FuncState<'a, 'b>,
+    name: &TValue<'b>,
+    start_idx: usize,
+) -> Option<usize> {
     for (i, lb) in fs.labels.iter().enumerate().rev() {
         if i >= start_idx && &lb.name == name {
             return Some(i);
@@ -3098,7 +3120,7 @@ fn find_label_from(fs: &FuncState, name: &LuaString, start_idx: usize) -> Option
 /// `last`: whether the label is the last non-op statement in its block.
 /// When true, locals are assumed to already be out of scope, so nactvar
 /// is set to the block's entry level (bl->nactvar), not the current level.
-fn create_label(fs: &mut FuncState, name: &LuaString, line: i32, last: bool) {
+fn create_label<'a, 'b>(fs: &mut FuncState<'a, 'b>, name: &TValue<'b>, line: i32, last: bool) {
     // C's labelstat calls checkrepeated before createlabel: scan the current
     // function's labels (fs->firstlabel..end) for a duplicate name and raise
     // "label 'X' already defined on line Y". In Rust each FuncState owns its
@@ -3428,7 +3450,7 @@ fn getvarattribute(fs: &mut FuncState, df: i32) -> i32 {
     if test_next(fs, &Token::Lt) {
         let attr = get_name(fs);
         expect(fs, &Token::Gt);
-        match attr.as_str() {
+        match lua_string_as_str(&attr) {
             "const" => RDKCONST,
             "close" => RDKTOCLOSE,
             _ => {
@@ -3508,7 +3530,7 @@ fn is_kstr(fs: &FuncState, k: i32) -> bool {
         return false;
     }
     if let Some(tv) = fs.proto.constants.get(k as usize) {
-        matches!(tv, TValue::Str(crate::strings::LuaString::Short(_)))
+        matches!(tv, TValue::ShortStr(_))
     } else {
         false
     }
@@ -3578,8 +3600,8 @@ fn checkglobal(fs: &mut FuncState, varname: &str, line: i32) {
 /// ANTLR4: 全局变量声明 — 解析带有 global 前缀的属性变量声明列表
 /// C 的 initglobal 递归逻辑：对每个变量从后往前，buildglobal → (表达式) → checkglobal → storevartop
 /// 关键：当 key > MAXINDEXRK 时，buildglobal 会在解析表达式之前发射 GETUPVAL + LOADK
-fn globalnames(fs: &mut FuncState, defkind: i32) {
-    let mut names: Vec<LuaString> = Vec::new();
+fn globalnames<'a, 'b>(fs: &mut FuncState<'a, 'b>, defkind: i32) {
+    let mut names: Vec<TValue<'b>> = Vec::new();
     let mut kinds: Vec<i32> = Vec::new();
 
     loop {
@@ -3602,7 +3624,7 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
     // in initglobal via buildglobal->codestring, not in globalnames).
     let first_local_idx = fs.locals.len();
     for i in 0..nvars {
-        fs.add_local_kind(names[i].as_str(), fs.pc, kinds[i]);
+        fs.add_local_kind(lua_string_as_str(&names[i]), fs.pc, kinds[i]);
     }
 
     // Mark the newly declared variables as inactive
@@ -3826,7 +3848,7 @@ fn globalnames(fs: &mut FuncState, defkind: i32) {
                 fs.free_reg();
             } else {
                 // Key is a Kstr and _ENV is an upvalue: use GETTABUP/SETTABUP
-                checkglobal(fs, names[i].as_str(), init_line);
+                checkglobal(fs, lua_string_as_str(&names[i]), init_line);
                 let val_reg = fs.freereg - 1;
                 code_settabup(fs, 0, var_k_names[i], val_reg);
                 fs.free_reg();
@@ -3858,7 +3880,7 @@ fn globalstat(fs: &mut FuncState) {
 /// C 顺序: buildglobal → body → checkglobal → storevar
 fn globalfunc(fs: &mut FuncState, line: i32) {
     let fname = get_name(fs);
-    fs.add_local_kind(fname.as_str(), fs.pc, GDKREG);
+    fs.add_local_kind(lua_string_as_str(&fname), fs.pc, GDKREG);
     // fname 已是 intern 的 LuaString, 直接复用避免再次 anchor
     let k = fs.string_k_ls(fname.clone());
 
@@ -3897,7 +3919,7 @@ fn globalfunc(fs: &mut FuncState, line: i32) {
         fs.free_reg(); // key_reg
         fs.free_reg(); // table_reg
     } else {
-        checkglobal(fs, fname.as_str(), line);
+        checkglobal(fs, lua_string_as_str(&fname), line);
         code_settabup(fs, 0, k, r);
         fs.free_reg();
     }
@@ -3984,8 +4006,9 @@ fn parse_statement(fs: &mut FuncState) {
             None
         }
         Token::Name(name) => {
+            let name = name.to_value();
             let line = fs.ls().linenumber;
-            let is_global = name == "global" && {
+            let is_global = lua_string_as_str(&name) == "global" && {
                 let l = fs.ls_mut();
                 let lk = l.lookahead_next();
                 matches!(
@@ -4194,7 +4217,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     continue;
                 }
 
-                let is_short_str = field.len() <= crate::strings::LUAI_MAXSHORTLEN
+                let is_short_str = lua_string_len(&field) <= crate::strings::LUAI_MAXSHORTLEN
                     && (k as u32) <= crate::opcodes::MAXINDEXRK;
                 // Check if we can revert a GETUPVAL and use SETTABUP/GETTABUP instead.
                 // Only attempt revert if the last instruction is actually a GETUPVAL
@@ -4396,9 +4419,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 };
                 let (kr, key_is_const, key_is_int) = if ei.exp.kind == ExpKind::Str {
                     let k = fs.get_str_k(&ei.exp);
-                    if let TValue::Str(crate::strings::LuaString::Short(_)) =
-                        fs.proto.constants[k as usize]
-                    {
+                    if let TValue::ShortStr(_) = fs.proto.constants[k as usize] {
                         if (k as u32) <= crate::opcodes::MAXINDEXRK {
                             (k, true, false)
                         } else {
@@ -4583,7 +4604,11 @@ fn parse_assign_or_call(fs: &mut FuncState) {
         for v in vars.iter_mut() {
             if v.is_readonly {
                 if !reported {
-                    let name = v.var_name.as_ref().map(|s| s.as_str()).unwrap_or("?");
+                    let name = v
+                        .var_name
+                        .as_ref()
+                        .map(|s| lua_string_as_str(s))
+                        .unwrap_or("?");
                     fs.error(&format!("attempt to assign to const variable '{}'", name));
                     reported = true;
                 }
@@ -4929,7 +4954,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
 }
 
 /// 将常量表达式转换为常量表索引 (≤255 则返回)
-fn exp_to_k(fs: &mut FuncState, e: &ExpDesc) -> Option<i32> {
+fn exp_to_k<'a, 'b>(fs: &mut FuncState<'a, 'b>, e: &ExpDesc<'b>) -> Option<i32> {
     if e.t != NO_JUMP || e.f != NO_JUMP {
         return None;
     }
@@ -4958,7 +4983,7 @@ fn exp_to_k(fs: &mut FuncState, e: &ExpDesc) -> Option<i32> {
     }
 }
 
-fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
+fn store_expr_to_local<'a, 'b>(fs: &mut FuncState<'a, 'b>, e: &ExpDesc<'b>, dest: i32) {
     match e.kind {
         ExpKind::Void | ExpKind::Nil => {
             if e.t != NO_JUMP || e.f != NO_JUMP {
@@ -5134,9 +5159,9 @@ fn store_expr_to_local(fs: &mut FuncState, e: &ExpDesc, dest: i32) {
 
 /// ANTLR4: functioncall 帮助 — 将函数值加载到寄存器以便调用
 /// 返回 (函数寄存器, 是否需要额外释放基寄存器, 是否已分配寄存器, 方法调用原始源寄存器)
-fn load_func(
-    fs: &mut FuncState,
-    p: &PrefixResult,
+fn load_func<'a, 'b>(
+    fs: &mut FuncState<'a, 'b>,
+    p: &PrefixResult<'b>,
     is_method: bool,
 ) -> (i32, bool, bool, Option<i32>) {
     if let (Some(table_reg), Some(table_key)) = (p.table_reg, p.table_key) {
@@ -5217,7 +5242,7 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
     let line = fs.ls().linenumber;
     if matches!(&fs.ls().token, Token::String(..)) {
         let str_s = match &fs.ls().token {
-            Token::String(s) => s.clone(),
+            Token::String(s) => s.to_value(),
             _ => unreachable!(),
         };
         fs.ls_mut().next();
@@ -5255,7 +5280,7 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
         let src = src_reg.unwrap_or(freg);
         // C++ compiler: luaK_self checks strisshr && luaK_exp2K (constant index <= MAXINDEXRK)
         // 长方法名或常量索引超过 MAXINDEXRK 时不能用 SELF，必须回退到 MOVE+GETTABLE
-        if method.len() <= crate::strings::LUAI_MAXSHORTLEN
+        if lua_string_len(&method) <= crate::strings::LUAI_MAXSHORTLEN
             && (k as u32) <= crate::opcodes::MAXINDEXRK
         {
             fs.code_abc(OpCode::SELF, freg, src, k);
@@ -5280,7 +5305,7 @@ fn parse_func_args(fs: &mut FuncState, freg: i32, src_reg: Option<i32>) -> i32 {
         if matches!(&fs.ls().token, Token::String(..)) {
             // colon call with string argument: obj:method"string"
             let str_s = match &fs.ls().token {
-                Token::String(s) => s.clone(),
+                Token::String(s) => s.to_value(),
                 _ => unreachable!(),
             };
             fs.ls_mut().next();
@@ -5442,8 +5467,8 @@ fn parse_args(fs: &mut FuncState) -> (i32, bool) {
 
 #[cfg_attr(not(size_optimized), derive(Debug))]
 #[derive(Clone)]
-struct PrefixResult {
-    var_name: Option<LuaString>,
+struct PrefixResult<'a> {
+    var_name: Option<TValue<'a>>,
     local_idx: Option<i32>,
     key: Option<i32>,
     reg: Option<i32>,
@@ -5465,7 +5490,7 @@ struct PrefixResult {
 /// 生成通过 _ENV[name] 访问全局变量的 PrefixResult。
 /// 匹配 C 的 buildglobal：_ENV 可以是 local、local const (CTC) 或 upvalue。
 /// 用于具名 global 声明（如 `global a`）、collective `global *` 和隐式全局。
-fn code_global_via_env_prefix(fs: &mut FuncState, name: &str) -> PrefixResult {
+fn code_global_via_env_prefix<'a, 'b>(fs: &mut FuncState<'a, 'b>, name: &str) -> PrefixResult<'b> {
     // 一次性获取缓存的 "_ENV" LuaString，所有查找复用同一指针，走 ArcRc::ptr_eq 快速路径
     let env_ls = fs.ls_mut().env_str_cached();
     // perf: 用 resolve_env 缓存 _ENV 位置, 避免每次全局变量访问都 lookup_local(_ENV) 扫描 locals。
@@ -5688,7 +5713,7 @@ fn code_global_via_env_prefix(fs: &mut FuncState, name: &str) -> PrefixResult {
 
 /// 将 CTC (编译时常量) ExpDesc discharge 到指定寄存器 r。
 /// 提取自 parse_prefix_exp 的 CTC 处理分支, 供 LocalLookup::Ctc 和 UpvalueOrCtc::CtcConst 复用。
-fn discharge_ctc_to_reg(fs: &mut FuncState, ctc: &mut ExpDesc, r: i32) {
+fn discharge_ctc_to_reg<'a, 'b>(fs: &mut FuncState<'a, 'b>, ctc: &mut ExpDesc<'b>, r: i32) {
     match ctc.kind {
         ExpKind::Int => {
             let val = ctc.info;
@@ -5726,14 +5751,14 @@ fn discharge_ctc_to_reg(fs: &mut FuncState, ctc: &mut ExpDesc, r: i32) {
 }
 
 /// ANTLR4: `prefixexp: varOrExp | functioncall | '(' expr ')' ;` 以及 `var: NAME | prefixexp '[' expr ']' | prefixexp '.' NAME ;`
-fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
+fn parse_prefix_exp<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> PrefixResult<'b> {
     let mut result = match &fs.ls().token {
         Token::Name(name) => {
-            let name = name.clone();
+            let name = name.to_value();
             fs.ls_mut().next();
-            let name_str = name.as_str(); // 用于 code_global_via_env_prefix(&str) 等需要 &str 的位置
-                                          // perf: 一次扫描 locals 合并 find_local_ctc + find_local_ex + find_named_global_decl
-                                          // + is_undeclared_global(当前作用域), 消除 3-4 次重复迭代 (parse_prefix_exp 占 4.47% 热点)。
+            let name_str = lua_string_as_str(&name); // 用于 code_global_via_env_prefix(&str) 等需要 &str 的位置
+                                                     // perf: 一次扫描 locals 合并 find_local_ctc + find_local_ex + find_named_global_decl
+                                                     // + is_undeclared_global(当前作用域), 消除 3-4 次重复迭代 (parse_prefix_exp 占 4.47% 热点)。
             let lookup = fs.lookup_local(&name);
             match lookup {
                 LocalLookup::Ctc(mut ctc) => {
@@ -6013,7 +6038,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                     result.table_key_is_int = false;
                     result.key_allocated_reg = false;
                 }
-                let is_short_str = field.len() <= crate::strings::LUAI_MAXSHORTLEN
+                let is_short_str = lua_string_len(&field) <= crate::strings::LUAI_MAXSHORTLEN
                     && (k as u32) <= crate::opcodes::MAXINDEXRK;
                 // Check if we can revert a GETUPVAL and use SETTABUP/GETTABUP instead.
                 // Only attempt revert if the last instruction is actually a GETUPVAL
@@ -6253,9 +6278,7 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
                 };
                 let (kr, key_is_const, key_is_int) = if ei.exp.kind == ExpKind::Str {
                     let k = fs.get_str_k(&ei.exp);
-                    if let TValue::Str(crate::strings::LuaString::Short(_)) =
-                        fs.proto.constants[k as usize]
-                    {
+                    if let TValue::ShortStr(_) = fs.proto.constants[k as usize] {
                         if (k as u32) <= crate::opcodes::MAXINDEXRK {
                             (k, true, false)
                         } else {
@@ -6456,12 +6479,12 @@ fn parse_prefix_exp(fs: &mut FuncState) -> PrefixResult {
 
 #[cfg_attr(not(size_optimized), derive(Debug))]
 #[derive(Clone)]
-struct ExprItem {
-    exp: ExpDesc,
+struct ExprItem<'a> {
+    exp: ExpDesc<'a>,
 }
 
 /// ANTLR4: `expr: simpleExp | expr binop expr | unop expr ;` — 表达式解析入口，调用 Pratt 解析器
-fn parse_expr(fs: &mut FuncState) -> ExprItem {
+fn parse_expr<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> ExprItem<'b> {
     parse_subexpr(fs, 0)
 }
 
@@ -6479,7 +6502,7 @@ const PREC_UNARY: i32 = 12;
 const PREC_POW: i32 = 14;
 
 /// ANTLR4: `expr: expr binop expr ;` — Pratt 递归下降二元表达式解析器
-fn parse_subexpr(fs: &mut FuncState, limit: i32) -> ExprItem {
+fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b> {
     if !fs.enterlevel() {
         return ExprItem {
             exp: ExpDesc::new(ExpKind::Void, 0),
@@ -10287,7 +10310,7 @@ fn fits_sbx(v: i64) -> bool {
 }
 
 /// 将表达式转换为常量表索引 (用于 EQK 等比较指令)
-fn exp_to_const_k(fs: &mut FuncState, e: &ExpDesc) -> Option<i32> {
+fn exp_to_const_k<'a, 'b>(fs: &mut FuncState<'a, 'b>, e: &ExpDesc<'b>) -> Option<i32> {
     let k = match e.kind {
         ExpKind::Str => fs.get_str_k(e),
         ExpKind::Boolean => {
@@ -10327,7 +10350,7 @@ fn exp_to_const_k(fs: &mut FuncState, e: &ExpDesc) -> Option<i32> {
     }
 }
 
-fn exp2rk(fs: &mut FuncState, e: &ExpDesc) -> (i32, bool) {
+fn exp2rk<'a, 'b>(fs: &mut FuncState<'a, 'b>, e: &ExpDesc<'b>) -> (i32, bool) {
     if e.t == NO_JUMP && e.f == NO_JUMP {
         let info = match e.kind {
             ExpKind::Boolean => fs.const_k(if e.info != 0 {
@@ -10370,7 +10393,7 @@ fn check_mulop(fs: &FuncState) -> bool {
 
 /// Code access to a global variable via _ENV: _ENV[name].
 /// Used by parse_simple_exp for both explicit global declarations and implicit globals.
-fn code_global_via_env(fs: &mut FuncState, name: &str) -> ExpDesc {
+fn code_global_via_env<'a, 'b>(fs: &mut FuncState<'a, 'b>, name: &str) -> ExpDesc<'b> {
     // 一次性获取缓存的 "_ENV" LuaString，所有查找复用同一指针，走 ArcRc::ptr_eq 快速路径
     let env_ls = fs.ls_mut().env_str_cached();
     // perf: 用 resolve_env 缓存 _ENV 位置, 避免每次全局变量访问都 lookup_local(_ENV) 扫描 locals。
@@ -10489,7 +10512,7 @@ fn code_global_via_env(fs: &mut FuncState, name: &str) -> ExpDesc {
 /// 3. 查找 upvalue（`global *` 不阻止 upvalue 查找）
 /// 4. 未找到则作为全局变量（`global *` 或隐式全局）通过 _ENV[name] 访问
 #[cfg_attr(not(size_optimized), inline)]
-fn parse_simple_exp_name(fs: &mut FuncState, name: LuaString) -> ExpDesc {
+fn parse_simple_exp_name<'a, 'b>(fs: &mut FuncState<'a, 'b>, name: TValue<'b>) -> ExpDesc<'b> {
     // perf: 一次扫描 locals 合并 find_local_ctc + find_local_ex + find_named_global_decl
     // + is_undeclared_global(当前作用域), 消除 3-4 次重复迭代。
     // 这 4 个函数合计占 api.lua 编译热点 ~18%。
@@ -10503,7 +10526,7 @@ fn parse_simple_exp_name(fs: &mut FuncState, name: LuaString) -> ExpDesc {
             }
         }
         // 具名 global 声明（如 `global a`）: 优先于 upvalue，通过 _ENV[name] 访问
-        LocalLookup::NamedGlobal => code_global_via_env(fs, name.as_str()),
+        LocalLookup::NamedGlobal => code_global_via_env(fs, lua_string_as_str(&name)),
         // collective `global *`: 不阻止 upvalue 查找 (CLAUDE.md 约定)
         // 先查 upvalue, 若失败再走 _ENV[name]
         LocalLookup::GlobalStar => {
@@ -10520,7 +10543,7 @@ fn parse_simple_exp_name(fs: &mut FuncState, name: LuaString) -> ExpDesc {
                     UpvalueOrCtc::CtcConst(ctc) => ctc,
                 }
             } else {
-                code_global_via_env(fs, name.as_str())
+                code_global_via_env(fs, lua_string_as_str(&name))
             }
         }
         // 当前作用域有非匹配 named global 无 global * 覆盖 → 可能 undeclared
@@ -10541,7 +10564,7 @@ fn parse_simple_exp_name(fs: &mut FuncState, name: LuaString) -> ExpDesc {
             } else {
                 // parent 也未覆盖: undeclared
                 fs.error(&format!("variable '{}' not declared", name));
-                code_global_via_env(fs, name.as_str())
+                code_global_via_env(fs, lua_string_as_str(&name))
             }
         }
         // 当前作用域未找到 (无 global 声明): 查 upvalue
@@ -10562,7 +10585,7 @@ fn parse_simple_exp_name(fs: &mut FuncState, name: LuaString) -> ExpDesc {
                     }
                     UpvalueOrCtc::CtcConst(ctc) => ctc,
                 }
-            } else if name == "_ENV" {
+            } else if lua_string_as_str(&name) == "_ENV" {
                 // _ENV 是 upvalue (在 Rust 实现中不是 local)。
                 // 返回 ExpKind::Upval 延迟 GETUPVAL 发射, LBracket/Dot 处理器会在正确时机发射。
                 let env_ls = fs.ls_mut().env_str_cached();
@@ -10585,19 +10608,19 @@ fn parse_simple_exp_name(fs: &mut FuncState, name: LuaString) -> ExpDesc {
                 if fs.is_undeclared_global_parent(&name) {
                     fs.error(&format!("variable '{}' not declared", name));
                 }
-                code_global_via_env(fs, name.as_str())
+                code_global_via_env(fs, lua_string_as_str(&name))
             }
         }
     }
 }
 
 /// ANTLR4: `simpleExp: 'nil' | 'false' | 'true' | NUMBER | STRING | '...' | tableconstructor | 'function' funcbody | prefixexp ;` 以及 `unop expr`
-fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
+fn parse_simple_exp<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> ExprItem<'b> {
     // fast path: Token::String — 用 mem::replace 取出 String, 避免 clone 的堆分配。
     // String 字面量无后缀语法 (不能接 ()/[]/:/.), 可直接 return 跳过后续 loop。
     if matches!(fs.ls().token, Token::String(_)) {
         let s = match std::mem::replace(&mut fs.ls_mut().token, Token::Eof) {
-            Token::String(s) => s,
+            Token::String(s) => s.to_value(),
             _ => unreachable!(),
         };
         fs.ls_mut().next();
@@ -10612,7 +10635,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
     // 注意: Name 需要进入后续 loop 处理 ()/[]/:/. 等后缀, 所以赋值给 e 而非直接 return。
     let mut e = if matches!(fs.ls().token, Token::Name(_)) {
         let name = match std::mem::replace(&mut fs.ls_mut().token, Token::Eof) {
-            Token::Name(s) => s,
+            Token::Name(s) => s.to_value(),
             _ => unreachable!(),
         };
         fs.ls_mut().next();
@@ -10652,7 +10675,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                 };
             }
             Token::String(s) => {
-                let s = s.clone();
+                let s = s.to_value();
                 fs.ls_mut().next();
                 return ExprItem {
                     exp: ExpDesc::new_str(s),
@@ -10685,7 +10708,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
             Token::Name(name) => {
                 // fallback: fast path 已拦截 Token::Name, 此分支理论上不执行。
                 // 保留 clone + parse_simple_exp_name 调用作为防御性 fallback。
-                let name = name.clone();
+                let name = name.to_value();
                 fs.ls_mut().next();
                 parse_simple_exp_name(fs, name)
             }
@@ -10989,9 +11012,7 @@ fn parse_simple_exp(fs: &mut FuncState) -> ExprItem {
                         base_reg
                     };
                     // C++ compiler: isKstr checks ttisshrstring — only short strings can use GETFIELD
-                    let inst_pc = if let TValue::Str(crate::strings::LuaString::Short(_)) =
-                        fs.proto.constants[k as usize]
-                    {
+                    let inst_pc = if let TValue::ShortStr(_) = fs.proto.constants[k as usize] {
                         code_getfield(fs, result_reg, base_reg, k)
                     } else {
                         // Long string: load key into register, use GETTABLE
@@ -11537,7 +11558,7 @@ fn parse_while(fs: &mut FuncState) {
     fs.set_freereg(close_reg);
 
     // Create break label AFTER CLOSE (like C's createlabel after CLOSE in leaveblock)
-    let break_name = fs.ls().state.string_table.intern("break");
+    let break_name = fs.ls().state.string_table.intern_value("break");
     fs.labels.push(LabelDesc {
         name: break_name,
         pc: fs.pc,
@@ -11731,7 +11752,7 @@ fn parse_repeat(fs: &mut FuncState) {
     fs.set_freereg(bl1_close_reg);
 
     // Create break label AFTER CLOSE (like C's createlabel after CLOSE in leaveblock)
-    let break_name = fs.ls().state.string_table.intern("break");
+    let break_name = fs.ls().state.string_table.intern_value("break");
     fs.labels.push(LabelDesc {
         name: break_name,
         pc: fs.pc,
@@ -11843,7 +11864,7 @@ fn parse_for(fs: &mut FuncState) {
         });
 
         // Like C's adjustlocalvars(ls, nvars): activate loop variable INSIDE body block
-        fs.add_local_kind_reg(name.as_str(), fs.pc, RDKCONST, base + 2);
+        fs.add_local_kind_reg(lua_string_as_str(&name), fs.pc, RDKCONST, base + 2);
 
         // parse_block creates the inner block (like C's block() in forbody)
         parse_block(fs);
@@ -11897,7 +11918,7 @@ fn parse_for(fs: &mut FuncState) {
         fs.set_freereg(forstat_close_reg);
 
         // Create break label AFTER forstat CLOSE (like C's createlabel after CLOSE)
-        let break_name = fs.ls().state.string_table.intern("break");
+        let break_name = fs.ls().state.string_table.intern_value("break");
         fs.labels.push(LabelDesc {
             name: break_name,
             pc: fs.pc,
@@ -11960,7 +11981,7 @@ fn parse_for(fs: &mut FuncState) {
             let kind = if i == 0 { RDKCONST } else { VDKREG };
             fs.locals.push(LocalVar {
                 name: var_name.clone(),
-                name_hash: var_name.hash(),
+                name_hash: lua_string_hash(var_name),
                 active: false,
                 is_global_star: false,
                 reg: 0,
@@ -12156,7 +12177,7 @@ fn parse_for(fs: &mut FuncState) {
         fs.set_freereg(forstat_close_reg);
 
         // Create break label AFTER forstat CLOSE (like C's createlabel after CLOSE)
-        let break_name = fs.ls().state.string_table.intern("break");
+        let break_name = fs.ls().state.string_table.intern_value("break");
         fs.labels.push(LabelDesc {
             name: break_name,
             pc: fs.pc,
@@ -12185,7 +12206,7 @@ fn parse_func_stat(fs: &mut FuncState) {
     fs.ls_mut().next();
     let name = get_name(fs);
 
-    let mut chain: Vec<(bool, LuaString)> = vec![(false, name.clone())];
+    let mut chain = vec![(false, name.clone())];
     while check(fs, &Token::Dot) || check(fs, &Token::Colon) {
         let is_colon = check(fs, &Token::Colon);
         fs.ls_mut().next();
@@ -12247,7 +12268,7 @@ fn parse_func_stat(fs: &mut FuncState) {
 
         // name 已是 intern 的 LuaString, 直接复用避免再次 anchor
         let k = fs.string_k_ls(name.clone());
-        let is_short_str = name.len() <= crate::strings::LUAI_MAXSHORTLEN
+        let is_short_str = lua_string_len(name) <= crate::strings::LUAI_MAXSHORTLEN
             && (k as u32) <= crate::opcodes::MAXINDEXRK;
 
         // Like C's funcstat: for non-short-string keys, evaluate table and key
@@ -12358,7 +12379,7 @@ fn parse_func_stat(fs: &mut FuncState) {
             code_gettabup(fs, r, 0, k);
             r
         }
-    } else if let Some(reg) = fs.find_local(first_name.as_str()) {
+    } else if let Some(reg) = fs.find_local(lua_string_as_str(first_name)) {
         // Like C's singlevar for VLOCAL: dischargevars makes it VNONRELOC,
         // then luaK_exp2anyregup returns the register directly.
         // The register will be freed when the first GETFIELD is generated
@@ -12446,12 +12467,12 @@ fn parse_local(fs: &mut FuncState) {
     if check(fs, &Token::Function) {
         fs.ls_mut().next();
         let name = get_name(fs);
-        let reg = fs.add_local(name.as_str(), fs.pc);
+        let reg = fs.add_local(lua_string_as_str(&name), fs.pc);
         parse_body(fs, Some(reg));
     } else {
         let defkind = getvarattribute(fs, VDKREG);
-        let mut names: Vec<LuaString> = Vec::new();
-        let mut kinds: Vec<i32> = Vec::new();
+        let mut names = Vec::new();
+        let mut kinds = Vec::new();
 
         loop {
             let name = get_name(fs);
@@ -12616,7 +12637,12 @@ fn parse_local(fs: &mut FuncState) {
             }
 
             for i in 0..n_reg {
-                fs.add_local_kind_reg(names[i].as_str(), fs.pc, kinds[i], saved_freereg + i as i32);
+                fs.add_local_kind_reg(
+                    lua_string_as_str(&names[i]),
+                    fs.pc,
+                    kinds[i],
+                    saved_freereg + i as i32,
+                );
             }
             if last_is_ctc {
                 let last_e = last_exp.as_ref().unwrap();
@@ -12635,7 +12661,7 @@ fn parse_local(fs: &mut FuncState) {
                 let nactvar = fs.active_nactvar();
                 fs.locals.push(LocalVar {
                     name: names[nvars - 1].clone(),
-                    name_hash: names[nvars - 1].hash(),
+                    name_hash: lua_string_hash(&names[nvars - 1]),
                     active: true,
                     is_global_star: false,
                     reg: 0,
@@ -12657,16 +12683,16 @@ fn parse_local(fs: &mut FuncState) {
         } else {
             // C: luaK_checkstack(fs, needed) in adjust_assign; needed = nvars - 0 = nvars
             fs.checkstack(nvars as i32);
-            let start_reg = fs.add_local_kind(names[0].as_str(), fs.pc, kinds[0]);
+            let start_reg = fs.add_local_kind(lua_string_as_str(&names[0]), fs.pc, kinds[0]);
             for i in 1..nvars {
-                fs.add_local_kind(names[i].as_str(), fs.pc, kinds[i]);
+                fs.add_local_kind(lua_string_as_str(&names[i]), fs.pc, kinds[i]);
             }
             fs.code_nil(start_reg, nvars as i32);
         }
 
         for (i, &kind) in kinds.iter().enumerate() {
             if kind == RDKTOCLOSE {
-                if let Some(reg) = fs.find_local(names[i].as_str()) {
+                if let Some(reg) = fs.find_local(lua_string_as_str(&names[i])) {
                     fs.code_abc(OpCode::TBC, reg, 0, 0);
                     // Like C's marktobeclosed(fs): mark current block as having upvalues
                     // and insidetbc (inhibits tail calls)
@@ -12833,9 +12859,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                 let (v_rk, is_k) = exp2rk(fs, &ev.exp);
                 if let Some(k) = key_k {
                     // C++ compiler: isKstr checks ttisshrstring — only short strings use SETFIELD
-                    if let TValue::Str(crate::strings::LuaString::Short(_)) =
-                        fs.proto.constants[k as usize]
-                    {
+                    if let TValue::ShortStr(_) = fs.proto.constants[k as usize] {
                         code_setfield_k(fs, table_r, k, v_rk, is_k);
                     } else {
                         // Long string: load key into register, use SETTABLE
@@ -12852,7 +12876,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                 fs.freereg = saved_freereg; /* free registers used by recfield */
                 need_hash += 1;
             } else if let Token::Name(s) = &fs.ls().token {
-                let name = s.clone();
+                let name = s.to_value();
                 let next_is_eq = fs.ls_mut().lookahead_next() == &Token::Eq;
                 if next_is_eq {
                     // closelistfield: discharge previous list item
@@ -12875,7 +12899,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                     fs.ls_mut().next();
                     let k = fs.string_k_ls(name.clone());
                     // C++ compiler: isKstr checks ttisshrstring AND k->u.info <= MAXINDEXRK
-                    let key_needs_reg = name.len() > crate::strings::LUAI_MAXSHORTLEN
+                    let key_needs_reg = lua_string_len(&name) > crate::strings::LUAI_MAXSHORTLEN
                         || (k as u32) > crate::opcodes::MAXINDEXRK;
                     let kr = if key_needs_reg {
                         let kr = fs.alloc_reg();
@@ -12984,7 +13008,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     let mut is_vararg = false;
     let mut n_params: u8 = 0;
 
-    let mut param_names: Vec<LuaString> = Vec::new();
+    let mut param_names = Vec::new();
     if ismethod {
         param_names.push(fs.ls_mut().anchor_string("self"));
         n_params = 1;
@@ -12996,7 +13020,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
                 fs.ls_mut().next();
                 // Lua 5.5: ...name syntax for named vararg parameter
                 if let Token::Name(name) = &fs.ls().token {
-                    let name = name.clone();
+                    let name = name.to_value();
                     fs.ls_mut().next();
                     // Add as RDKVAVAR kind local variable (not counted in n_params, like C)
                     param_names.push(name);
@@ -13007,7 +13031,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
                 break;
             }
             if let Token::Name(name) = &fs.ls().token {
-                let name = name.clone();
+                let name = name.to_value();
                 fs.ls_mut().next();
                 n_params += 1;
                 param_names.push(name);
@@ -13052,7 +13076,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     // Add regular parameters (start_pc = current pc, which is 0 before VARARGPREP)
     for name in &param_names {
         let cur_pc = new_fs.pc;
-        new_fs.add_local(name.as_str(), cur_pc);
+        new_fs.add_local(lua_string_as_str(name), cur_pc);
     }
 
     // Generate VARARGPREP (if vararg), like C's setvararg
@@ -13064,7 +13088,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     // Add vararg parameter (start_pc = current pc, which is 1 after VARARGPREP)
     if let Some(name) = vararg_param_name {
         let cur_pc = new_fs.pc;
-        new_fs.add_local_kind(name.as_str(), cur_pc, RDKVAVAR);
+        new_fs.add_local_kind(lua_string_as_str(&name), cur_pc, RDKVAVAR);
     }
 
     for (i, local) in fs.locals.iter().enumerate() {
@@ -13100,7 +13124,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
             let already_exists = new_fs
                 .parent_locals
                 .iter()
-                .any(|p| p.name.as_str() == name.as_str());
+                .any(|p| lua_string_as_str(&p.name) == lua_string_as_str(name));
             if !already_exists {
                 new_fs.parent_locals.push(ParentVar {
                     name: name.clone(),
@@ -13160,8 +13184,8 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
                 // Verify that the local variable at parent_local_idx matches the upvalue name.
                 // In Rust, _ENV is not a local variable, so parent_local_idx=0 may point
                 // to a different variable. If names don't match, treat as !in_stack.
-                let local_name = fs.locals[local_idx].name.as_str();
-                let uv_name = uv.name.as_ref().map(|s| s.as_str()).unwrap_or("");
+                let local_name = lua_string_as_str(&fs.locals[local_idx].name);
+                let uv_name = uv.name.as_ref().map(|s| lua_string_as_str(s)).unwrap_or("");
                 if local_name == uv_name {
                     // Like C's singlevaraux: if the variable is a vararg parameter (VVARGVAR),
                     // call luaK_vapar2local which sets PF_VATAB on the parent function.

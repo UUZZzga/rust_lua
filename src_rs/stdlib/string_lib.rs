@@ -11,7 +11,7 @@
 use crate::execute::{arg_error, VmError};
 use crate::objects::{BuiltinFn, BuiltinFnPtr, LuaType, NilKind, RustClosure, TValue};
 use crate::state::LuaState;
-use crate::strings::LuaString;
+use crate::strings::{lua_string_as_str, lua_string_len, new_lstr_bytes};
 use crate::table::Table;
 use crate::tm::{make_tm_tvalue, Metatable, TagMethod, TM_N};
 use std::cell::RefCell;
@@ -863,7 +863,7 @@ fn get_captures_into<'a>(
         match cap {
             CaptureResult::Str(start, len) => {
                 let bytes = &ms.src[start..start + len];
-                out.push(TValue::Str(table.intern_bytes(bytes)));
+                out.push(new_lstr_bytes(table, bytes));
             }
             CaptureResult::Pos(pos) => {
                 out.push(TValue::Integer(pos as i64));
@@ -999,7 +999,7 @@ pub fn str_match<'a>(
             if caps.is_empty() {
                 // 无捕获时返回整个匹配
                 let matched = &s.as_bytes()[start - 1..end];
-                caps.push(TValue::Str(table.intern_bytes(matched)));
+                caps.push(crate::strings::new_lstr_bytes(&table, &matched));
             }
             Ok(caps)
         }
@@ -1053,8 +1053,9 @@ impl GMatchIterator {
                     };
                     if captures.is_empty() {
                         // 无捕获时返回整个匹配的子串
-                        return Ok(vec![TValue::Str(
-                            table.intern_bytes(&src_bytes[match_start..end]),
+                        return Ok(vec![crate::strings::new_lstr_bytes(
+                            &table,
+                            &src_bytes[match_start..end],
                         )]);
                     }
                     return Ok(captures);
@@ -1254,7 +1255,9 @@ fn add_value_from_repl<'a>(
                         false,
                     ))
                 }
-                TValue::Str(st) => Ok((st.as_str().to_string(), true)),
+                st @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                    Ok((lua_string_as_str(&st).to_string(), true))
+                }
                 TValue::Integer(i) => Ok((crate::float_utils::i64_to_string(i), true)),
                 TValue::Float(f) => Ok((format_float_value(f), true)),
                 other => Err(format!("invalid replacement value (a {})", other.ty())),
@@ -1313,7 +1316,9 @@ fn add_value_from_repl<'a>(
                         false,
                     ))
                 }
-                TValue::Str(st) => Ok((st.as_str().to_string(), true)),
+                st @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                    Ok((lua_string_as_str(&st).to_string(), true))
+                }
                 TValue::Integer(i) => Ok((crate::float_utils::i64_to_string(i), true)),
                 TValue::Float(f) => Ok((format_float_value(f), true)),
                 other => Err(format!("invalid replacement value (a {})", other.ty())),
@@ -1338,7 +1343,7 @@ fn get_capture_as_tvalue<'a>(
         CaptureResult::Str(start, len) => {
             let bytes = &ms.src[start..start + len];
             let str_val = unsafe { String::from_utf8_unchecked(bytes.to_vec()) };
-            Ok(TValue::Str(state.intern_str(&str_val)))
+            Ok(state.intern_str(&str_val))
         }
         CaptureResult::Pos(pos) => Ok(TValue::Integer(pos as i64)),
     }
@@ -2163,7 +2168,9 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                     || alt_form;
                 if has_modifiers {
                     let s = match arg {
-                        TValue::Str(s) => s.as_str().to_string(),
+                        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                            lua_string_as_str(s).to_string()
+                        }
                         TValue::Integer(n) => crate::float_utils::i64_to_string(*n),
                         TValue::Float(f) => {
                             if f.is_nan() {
@@ -2216,7 +2223,9 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                 } else {
                     // 无修饰符: 直接输出，避免 String 分配
                     match arg {
-                        TValue::Str(s) => result.push_str(s.as_str()),
+                        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                            result.push_str(lua_string_as_str(s))
+                        }
                         TValue::Integer(n) => {
                             result.push_str(&crate::float_utils::i64_to_string(*n))
                         }
@@ -2256,10 +2265,10 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                 // nil/boolean:直接输出 "nil"/"true"/"false"
                 // NaN → "(0/0)", inf → "1e9999", -inf → "-1e9999"
                 match arg {
-                    TValue::Str(s) => {
+                    s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                         // 对应 C 的 addquoted: 按字节处理,控制字符根据下一个字符决定格式
                         result.push('"');
-                        let bytes = s.as_str().as_bytes();
+                        let bytes = lua_string_as_str(s).as_bytes();
                         for (idx, &c) in bytes.iter().enumerate() {
                             match c {
                                 b'"' | b'\\' | b'\n' => {
@@ -2331,18 +2340,14 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                     TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_) => {
                         "(null)".to_string()
                     }
-                    TValue::Str(s) => {
-                        match s {
-                            crate::strings::LuaString::Short(arc) => {
-                                // 短字符串：使用 Arc 的指针地址（内部化保证同一内容同一 Arc）
-                                let ptr = crate::strings::ArcRc::as_ptr(arc) as usize;
-                                format!("0x{:x}", ptr)
-                            }
-                            crate::strings::LuaString::Long(ls) => {
-                                // 长字符串：使用 ptr_id（每个实例唯一，克隆保留同一值）
-                                format!("0x{:x}", ls.ptr_id)
-                            }
-                        }
+                    TValue::ShortStr(arc) => {
+                        // 短字符串：使用 Arc 的指针地址（内部化保证同一内容同一 Arc）
+                        let ptr = crate::strings::ArcRc::as_ptr(arc) as usize;
+                        format!("0x{:x}", ptr)
+                    }
+                    TValue::LongStr(ls) => {
+                        // 长字符串：使用 ptr_id（每个实例唯一，克隆保留同一值）
+                        format!("0x{:x}", ls.ptr_id)
                     }
                     TValue::Table(t) => {
                         format!("0x{:x}", t.data.borrow().gc_header.ptr_id)
@@ -2748,7 +2753,7 @@ fn check_number(v: &TValue, arg: usize) -> Result<f64, String> {
 /// 从 TValue 获取字符串字节 (对应 C 的 luaL_checklstring)
 fn check_lstring<'a>(v: &'a TValue, arg: usize) -> Result<&'a [u8], String> {
     match v {
-        TValue::Str(s) => Ok(s.as_str().as_bytes()),
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => Ok(lua_string_as_str(s).as_bytes()),
         _ => Err(format!(
             "bad argument #{} (string expected, got {})",
             arg,
@@ -3052,7 +3057,7 @@ pub fn str_unpack<'a>(
             }
             KOption::Kchar => {
                 let s_bytes = &data[pos..pos + size];
-                results.push(TValue::Str(table.intern_bytes(s_bytes)));
+                results.push(crate::strings::new_lstr_bytes(&table, &s_bytes));
             }
             KOption::Kstring => {
                 let len = unpackint(&data[pos..pos + size], h.islittle, size, false)? as usize;
@@ -3060,7 +3065,7 @@ pub fn str_unpack<'a>(
                     return Err("bad argument #2 to 'unpack' (data string too short)".to_string());
                 }
                 let s_bytes = &data[pos + size..pos + size + len];
-                results.push(TValue::Str(table.intern_bytes(s_bytes)));
+                results.push(new_lstr_bytes(table, s_bytes));
                 pos += len; // 跳过字符串
             }
             KOption::Kzstr => {
@@ -3090,7 +3095,7 @@ pub fn str_unpack<'a>(
                     );
                 }
                 let s_bytes = &data[rel_pos..zero_idx];
-                results.push(TValue::Str(table.intern_bytes(s_bytes)));
+                results.push(new_lstr_bytes(table, s_bytes));
                 pos += len + 1; // 跳过字符串和终止零
             }
             KOption::Kpadding | KOption::Kpaddalign | KOption::Knop => {
@@ -3114,13 +3119,16 @@ fn get_str_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> Result<String,
     }
     let val = &state.exec.stack[stack_idx];
     match val {
-        TValue::Str(s) => Ok(s.as_str().to_string()),
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => Ok(lua_string_as_str(s).to_string()),
         TValue::Integer(n) => Ok(n.to_string()),
         TValue::Float(f) => Ok(crate::float_utils::f64_to_string(*f)),
         _ => Err(arg_error(
             state,
             idx + 1,
-            &format!("string expected, got {}", crate::tm::obj_type_name(val)),
+            &format!(
+                "string expected, got {}",
+                crate::tm::obj_type_name(state, val)
+            ),
         )),
     }
 }
@@ -3130,20 +3138,23 @@ fn get_str_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> Result<String,
 /// get_str_arg 的 to_string() 全量拷贝。number 参数仍转换为字符串
 /// （通过 intern）。
 #[cfg_attr(not(size_optimized), inline)]
-fn get_lstr_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> Result<LuaString, VmError<'a>> {
+fn get_lstr_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> Result<TValue<'a>, VmError<'a>> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.exec.stack.len() {
         return Err(arg_error(state, idx + 1, "string expected, got no value"));
     }
     let val = &state.exec.stack[stack_idx];
     match val {
-        TValue::Str(s) => Ok(s.clone()),
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => Ok(s.clone()),
         TValue::Integer(n) => Ok(state.intern_str(&n.to_string())),
         TValue::Float(f) => Ok(state.intern_str(&crate::float_utils::f64_to_string(*f))),
         _ => Err(arg_error(
             state,
             idx + 1,
-            &format!("string expected, got {}", crate::tm::obj_type_name(val)),
+            &format!(
+                "string expected, got {}",
+                crate::tm::obj_type_name(state, val)
+            ),
         )),
     }
 }
@@ -3171,7 +3182,8 @@ fn get_int_arg<'a>(
                 "number has no integer representation",
             )),
         },
-        TValue::Str(s) => match s.as_str().parse::<i64>() {
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => match lua_string_as_str(s).parse::<i64>()
+        {
             Ok(i) => Ok(i),
             Err(_) => Ok(default),
         },
@@ -3181,7 +3193,7 @@ fn get_int_arg<'a>(
             idx + 1,
             &format!(
                 "number expected, got {}",
-                crate::tm::obj_type_name(&state.exec.stack[stack_idx])
+                crate::tm::obj_type_name(state, &state.exec.stack[stack_idx])
             ),
         )),
     }
@@ -3215,7 +3227,8 @@ fn get_opt_int_arg<'a>(
                 "number has no integer representation",
             )),
         },
-        TValue::Str(s) => match s.as_str().parse::<i64>() {
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => match lua_string_as_str(s).parse::<i64>()
+        {
             Ok(i) => Ok(i),
             Err(_) => Ok(default),
         },
@@ -3224,7 +3237,7 @@ fn get_opt_int_arg<'a>(
             idx + 1,
             &format!(
                 "number expected, got {}",
-                crate::tm::obj_type_name(&state.exec.stack[stack_idx])
+                crate::tm::obj_type_name(state, &state.exec.stack[stack_idx])
             ),
         )),
     }
@@ -3257,7 +3270,7 @@ fn tostring_for_format<'a>(state: &mut LuaState<'a>, val: &TValue<'a>) -> Option
     };
 
     // 查找 __tostring 元方法 (过滤 nil: __tostring = nil 表示无元方法)
-    let tostring_key = TValue::Str(state.intern_str("__tostring"));
+    let tostring_key = state.intern_str("__tostring");
     let meta_fn = {
         let data = table.data.borrow();
         data.metatable
@@ -3274,7 +3287,9 @@ fn tostring_for_format<'a>(state: &mut LuaState<'a>, val: &TValue<'a>) -> Option
         let status = state.pcall(1, 1, 0);
         let result = if status == 0 && base < state.exec.stack.len() {
             match &state.exec.stack[base] {
-                TValue::Str(s) => Some(s.as_str().to_string()),
+                s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                    Some(lua_string_as_str(s).to_string())
+                }
                 _ => None,
             }
         } else {
@@ -3285,14 +3300,16 @@ fn tostring_for_format<'a>(state: &mut LuaState<'a>, val: &TValue<'a>) -> Option
     }
 
     // 无 __tostring: 使用 __name (或默认 "table") + 指针地址
-    let name_key = TValue::Str(state.intern_str("__name"));
+    let name_key = state.intern_str("__name");
     let type_name = {
         let data = table.data.borrow();
         data.metatable
             .as_ref()
             .and_then(|mt| mt.get(&name_key))
             .and_then(|v| match v {
-                TValue::Str(s) => Some(s.as_str().to_string()),
+                s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                    Some(lua_string_as_str(&s).to_string())
+                }
                 _ => None,
             })
             .unwrap_or_else(|| "table".to_string())
@@ -3398,7 +3415,7 @@ pub fn call_gmatch_iter<'a>(
     let (s_val, p_val, pos, pat_start, lastmatch) = {
         let upvals = rc.upvalues.borrow();
         let s_val = match upvals.get(GMATCH_UP_SRC) {
-            Some(TValue::Str(s)) => s.clone(),
+            Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => s.clone(),
             _ => {
                 return Err(VmError::RuntimeError(
                     "gmatch iterator: invalid state (missing subject)".to_string(),
@@ -3406,7 +3423,7 @@ pub fn call_gmatch_iter<'a>(
             }
         };
         let p_val = match upvals.get(GMATCH_UP_PAT) {
-            Some(TValue::Str(s)) => s.clone(),
+            Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => s.clone(),
             _ => {
                 return Err(VmError::RuntimeError(
                     "gmatch iterator: invalid state (missing pattern)".to_string(),
@@ -3435,8 +3452,8 @@ pub fn call_gmatch_iter<'a>(
     // 运行匹配循环 — 对应 C 的 gmatch_aux
     // 借用 LuaString 内部字节作为 src/pattern，零拷贝（LuaString 在 upvalues
     // 中被 RustClosure 持有，借用期间调用栈也持有 rc 引用，生命周期安全）
-    let src_bytes = s_val.as_str().as_bytes();
-    let pat_bytes = p_val.as_str().as_bytes();
+    let src_bytes = lua_string_as_str(&s_val).as_bytes();
+    let pat_bytes = lua_string_as_str(&p_val).as_bytes();
     let len = src_bytes.len();
     let anchor = pat_start > 0; // pat_start=1 即模式以 '^' 开头
     let mut cur_pos = pos;
@@ -3469,10 +3486,9 @@ pub fn call_gmatch_iter<'a>(
                             }
                         };
                         let val = match cap {
-                            CaptureResult::Str(start, caplen) => TValue::Str(
-                                state
-                                    .string_table
-                                    .intern_bytes(&src_bytes[start..start + caplen]),
+                            CaptureResult::Str(start, caplen) => crate::strings::new_lstr_bytes(
+                                &state.string_table,
+                                &src_bytes[start..start + caplen],
                             ),
                             CaptureResult::Pos(pos) => TValue::Integer(pos as i64),
                         };
@@ -3529,12 +3545,7 @@ fn call_str_upper<'a>(
 ) -> Result<(), VmError<'a>> {
     let s = get_str_arg(state, a, 0)?;
     let result = str_upper(&s);
-    push_results(
-        state,
-        a,
-        nresults,
-        vec![TValue::Str(state.intern_str(&result))],
-    );
+    push_results(state, a, nresults, vec![(state.intern_str(&result))]);
     Ok(())
 }
 
@@ -3547,12 +3558,7 @@ fn call_str_lower<'a>(
 ) -> Result<(), VmError<'a>> {
     let s = get_str_arg(state, a, 0)?;
     let result = str_lower(&s);
-    push_results(
-        state,
-        a,
-        nresults,
-        vec![TValue::Str(state.intern_str(&result))],
-    );
+    push_results(state, a, nresults, vec![state.intern_str(&result)]);
     Ok(())
 }
 
@@ -3580,12 +3586,7 @@ fn call_str_sub<'a>(
     let start = get_int_arg(state, a, 1, 1, "sub")?;
     let end = get_opt_int_arg(state, a, nargs, 2, -1, "sub")?;
     let result = str_sub(&s, start, end);
-    push_results(
-        state,
-        a,
-        nresults,
-        vec![TValue::Str(state.intern_str(&result))],
-    );
+    push_results(state, a, nresults, vec![(state.intern_str(&result))]);
     Ok(())
 }
 
@@ -3598,12 +3599,7 @@ fn call_str_reverse<'a>(
 ) -> Result<(), VmError<'a>> {
     let s = get_str_arg(state, a, 0)?;
     let result = str_reverse(&s);
-    push_results(
-        state,
-        a,
-        nresults,
-        vec![TValue::Str(state.intern_str(&result))],
-    );
+    push_results(state, a, nresults, vec![state.intern_str(&result)]);
     Ok(())
 }
 
@@ -3636,12 +3632,7 @@ fn call_str_char<'a>(
     }
     match str_char(&codes) {
         Ok(result) => {
-            push_results(
-                state,
-                a,
-                nresults,
-                vec![TValue::Str(state.intern_str(&result))],
-            );
+            push_results(state, a, nresults, vec![state.intern_str(&result)]);
             Ok(())
         }
         Err(msg) => Err(VmError::RuntimeError(msg)),
@@ -3664,12 +3655,7 @@ fn call_str_rep<'a>(
     };
     match str_rep(&s, n, &sep) {
         Ok(result) => {
-            push_results(
-                state,
-                a,
-                nresults,
-                vec![TValue::Str(state.intern_str(&result))],
-            );
+            push_results(state, a, nresults, vec![state.intern_str(&result)]);
             Ok(())
         }
         Err(msg) => Err(VmError::RuntimeError(msg)),
@@ -3684,10 +3670,10 @@ fn call_str_find<'a>(
     nresults: i32,
 ) -> Result<(), VmError<'a>> {
     let s_val = get_lstr_arg(state, a, 0)?;
-    let s = s_val.as_str();
+    let s = lua_string_as_str(&s_val);
     // perf: pattern 借用 LuaString 避免拷贝
     let p_val = get_lstr_arg(state, a, 1)?;
-    let pattern = p_val.as_str();
+    let pattern = lua_string_as_str(&p_val);
     let init = get_opt_int_arg(state, a, nargs, 2, 1, "find")?;
     let plain = get_bool_arg(state, a, nargs, 3, false);
     // perf: 结果直接写栈顶 + adjust_results_on_stack，
@@ -3753,18 +3739,13 @@ fn call_str_format<'a>(
         for (i, arg) in args.iter_mut().enumerate() {
             if s_indices.contains(&i) {
                 if let Some(s) = tostring_for_format(state, arg) {
-                    *arg = TValue::Str(state.intern_str(&s));
+                    *arg = state.intern_str(&s);
                 }
             }
         }
         match str_format(&fmt, &args) {
             Ok(result) => {
-                push_results(
-                    state,
-                    a,
-                    nresults,
-                    vec![TValue::Str(state.intern_str_owned(result))],
-                );
+                push_results(state, a, nresults, vec![state.intern_str_owned(result)]);
                 Ok(())
             }
             Err(msg) => Err(VmError::RuntimeError(msg)),
@@ -3775,12 +3756,7 @@ fn call_str_format<'a>(
         let result = str_format(&fmt, &state.exec.stack[args_start..args_end]);
         match result {
             Ok(result) => {
-                push_results(
-                    state,
-                    a,
-                    nresults,
-                    vec![TValue::Str(state.intern_str_owned(result))],
-                );
+                push_results(state, a, nresults, vec![state.intern_str_owned(result)]);
                 Ok(())
             }
             Err(msg) => Err(VmError::RuntimeError(msg)),
@@ -3799,12 +3775,7 @@ fn call_str_format<'a>(
             .collect();
         match str_format(&fmt, &args) {
             Ok(result) => {
-                push_results(
-                    state,
-                    a,
-                    nresults,
-                    vec![TValue::Str(state.intern_str_owned(result))],
-                );
+                push_results(state, a, nresults, vec![state.intern_str_owned(result)]);
                 Ok(())
             }
             Err(msg) => Err(VmError::RuntimeError(msg)),
@@ -3822,7 +3793,7 @@ fn call_str_match<'a>(
     // perf: subject 用 LuaString Rc-clone 避免数 KB 长串的 to_string() 拷贝
     // （match/gsub/find 是模式匹配热点，C 直接传指针）
     let s_val = get_lstr_arg(state, a, 0)?;
-    let s = s_val.as_str();
+    let s = lua_string_as_str(&s_val);
     let pattern = get_str_arg(state, a, 1)?;
     let init = get_opt_int_arg(state, a, nargs, 2, 1, "match")?;
     match str_match(&s, &pattern, init, &state.string_table) {
@@ -3842,7 +3813,7 @@ fn call_str_gsub<'a>(
     nresults: i32,
 ) -> Result<(), VmError<'a>> {
     let s_val = get_lstr_arg(state, a, 0)?;
-    let s = s_val.as_str();
+    let s = lua_string_as_str(&s_val);
     let pattern = get_str_arg(state, a, 1)?;
     let max_s = get_opt_int_arg(state, a, nargs, 3, -1, "gsub")?;
     // 原始字符串的 TValue — 对应 C 的 lua_pushvalue(L, 1)
@@ -3872,7 +3843,7 @@ fn call_str_gsub<'a>(
                     let result_val = if !changed {
                         orig_str
                     } else {
-                        TValue::Str(state.intern_str(&result))
+                        state.intern_str(&result)
                     };
                     state.adjust_two_results(a, nresults, result_val, TValue::Integer(n));
                     Ok(())
@@ -3881,7 +3852,7 @@ fn call_str_gsub<'a>(
             }
         }
         // string/number 替换 — 对应 C 的 default 分支 (add_s)
-        TValue::Str(_) | TValue::Integer(_) | TValue::Float(_) => {
+        TValue::LongStr(_) | TValue::ShortStr(_) | TValue::Integer(_) | TValue::Float(_) => {
             let repl = get_str_arg(state, a, 2)?;
             match str_gsub(&s, &pattern, &repl, max_s) {
                 Ok((result, n)) => {
@@ -3889,7 +3860,7 @@ fn call_str_gsub<'a>(
                     let result_val = if n == 0 {
                         orig_str
                     } else {
-                        TValue::Str(state.intern_str(&result))
+                        state.intern_str(&result)
                     };
                     state.adjust_two_results(a, nresults, result_val, TValue::Integer(n));
                     Ok(())
@@ -3923,7 +3894,7 @@ fn call_str_gmatch<'a>(
             .cloned()
             .unwrap_or(TValue::Nil(NilKind::Strict));
         let s_str = match &s_val {
-            TValue::Str(s) => s.clone(),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => s.clone(),
             // 非字符串参数（number 需转换）：走 get_str_arg 报错/转换逻辑
             _ => match get_str_arg(state, a, 0) {
                 Ok(converted) => state.intern_str(&converted),
@@ -3937,7 +3908,7 @@ fn call_str_gmatch<'a>(
             .cloned()
             .unwrap_or(TValue::Nil(NilKind::Strict));
         let p_str = match &p_val {
-            TValue::Str(s) => s.clone(),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => s.clone(),
             _ => match get_str_arg(state, a, 1) {
                 Ok(converted) => state.intern_str(&converted),
                 Err(e) => return Err(e),
@@ -3946,21 +3917,21 @@ fn call_str_gmatch<'a>(
         (s_str, p_str)
     };
     let init = get_opt_int_arg(state, a, nargs, 2, 1, "gmatch")?;
-    let len = s_str.len();
+    let len = lua_string_len(&s_str);
     let init_pos = posrelat_i(init, len).saturating_sub(1);
     // 对应 C: if (init > ls) init = ls + 1;
     // 让 src = s + (ls+1) 超过 src_end = s + ls，循环不执行
     let init_pos = if init_pos > len { len + 1 } else { init_pos };
 
-    let pat_start: usize = if p_str.as_str().as_bytes().first() == Some(&b'^') {
+    let pat_start: usize = if lua_string_as_str(&p_str).as_bytes().first() == Some(&b'^') {
         1
     } else {
         0
     };
     // 构建 RustClosure upvalues（布局见 GMATCH_UP_* 常量）
     let upvalues = vec![
-        TValue::Str(s_str),
-        TValue::Str(p_str),
+        (s_str),
+        (p_str),
         TValue::Integer(init_pos as i64),
         TValue::Integer(pat_start as i64),
         TValue::Integer(-1), // lastmatch: 无上次匹配
@@ -3997,7 +3968,7 @@ fn call_str_pack<'a>(
         Ok(bytes) => {
             // 将字节转换为 LuaString (可能包含非 UTF-8 字节)
             let s = unsafe { String::from_utf8_unchecked(bytes) };
-            push_results(state, a, nresults, vec![TValue::Str(state.intern_str(&s))]);
+            push_results(state, a, nresults, vec![state.intern_str(&s)]);
             Ok(())
         }
         Err(msg) => Err(VmError::RuntimeError(msg)),
@@ -4038,7 +4009,9 @@ fn call_str_unpack<'a>(
             )));
         }
         match &state.exec.stack[stack_idx] {
-            TValue::Str(s) => s.as_str().as_bytes().to_vec(),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                lua_string_as_str(s).as_bytes().to_vec()
+            }
             _ => {
                 return Err(VmError::RuntimeError(format!(
                     "bad argument #2 to 'unpack' (string expected, got {})",
@@ -4097,7 +4070,7 @@ fn call_str_dump<'a>(
                 state,
                 a,
                 nresults,
-                vec![TValue::Str(crate::strings::new_long_bytes(data))],
+                vec![crate::strings::new_lstr_bytes(&state.string_table, &data)],
             );
             Ok(())
         }
@@ -4193,9 +4166,9 @@ pub fn create_string_metatable(state: &mut LuaState) {
 }
 
 /// 设置算术元方法到元表
-fn set_arith_method(
-    mt_table: &mut Table,
-    tmnames: &[LuaString; TM_N],
+fn set_arith_method<'a>(
+    mt_table: &mut Table<'a>,
+    tmnames: &[TValue<'a>; TM_N],
     tm: TagMethod,
     int_op: fn(i64, i64) -> Option<i64>,
     float_op: fn(f64, f64) -> f64,
@@ -4248,7 +4221,7 @@ fn create_string_lib_table<'a>(state: &LuaState<'a>) -> Table<'a> {
 pub fn open_string_lib(state: &mut LuaState) {
     // 创建字符串库函数表并注册为全局变量 string
     let string_lib_table = create_string_lib_table(state);
-    let key = TValue::Str(state.intern_str("string"));
+    let key = state.intern_str("string");
     state.globals.set(key, TValue::Table(string_lib_table));
 
     // 创建字符串元表
@@ -4260,8 +4233,8 @@ fn to_num<'a>(v: &TValue<'a>) -> Option<TValue<'a>> {
     match v {
         TValue::Integer(i) => Some(TValue::Integer(*i)),
         TValue::Float(f) => Some(TValue::Float(*f)),
-        TValue::Str(s) => {
-            let s = s.as_str();
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+            let s = lua_string_as_str(s);
             if let Ok(i) = s.parse::<i64>() {
                 Some(TValue::Integer(i))
             } else if let Some(f) = crate::float_utils::f64_from_str(s) {
@@ -4308,7 +4281,7 @@ fn arith_op<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::objects::LuaType;
+    use crate::{objects::LuaType, strings::lua_string_with_nul};
 
     // ========================================================================
     // 位置辅助函数测试
@@ -4703,7 +4676,9 @@ mod tests {
         let result = str_match("hello world", "world", 1, &tb).unwrap();
         assert_eq!(result.len(), 1);
         match &result[0] {
-            TValue::Str(s) => assert_eq!(s.as_str(), "world"),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                assert_eq!(lua_string_as_str(s), "world")
+            }
             _ => panic!("expected string"),
         }
     }
@@ -4722,7 +4697,9 @@ mod tests {
         let result = str_match("hello", "(h.llo)", 1, &tb).unwrap();
         assert_eq!(result.len(), 1);
         match &result[0] {
-            TValue::Str(s) => assert_eq!(s.as_str(), "hello"),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                assert_eq!(lua_string_as_str(s), "hello")
+            }
             _ => panic!("expected string"),
         }
     }
@@ -4733,7 +4710,9 @@ mod tests {
         let result = str_match("abc123", "(%d+)", 1, &tb).unwrap();
         assert_eq!(result.len(), 1);
         match &result[0] {
-            TValue::Str(s) => assert_eq!(s.as_str(), "123"),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                assert_eq!(lua_string_as_str(s), "123")
+            }
             _ => panic!("expected string"),
         }
     }
@@ -4790,11 +4769,11 @@ mod tests {
 
     #[test]
     fn test_str_format_string() {
-        let args = vec![TValue::Str(crate::strings::LuaString::Short(
-            crate::strings::ArcRc::new(crate::strings::ShortString {
+        let args = vec![TValue::ShortStr(crate::strings::ArcRc::new(
+            crate::strings::ShortString {
                 hash: 0,
-                contents: crate::strings::LuaString::with_nul("world"),
-            }),
+                contents: crate::strings::lua_string_with_nul("world"),
+            },
         ))];
         let result = str_format("hello %s", &args).unwrap();
         assert_eq!(result, "hello world");
@@ -4838,12 +4817,10 @@ mod tests {
     fn test_str_format_multiple() {
         let args = vec![
             TValue::Integer(1),
-            TValue::Str(crate::strings::LuaString::Short(
-                crate::strings::ArcRc::new(crate::strings::ShortString {
-                    hash: 0,
-                    contents: crate::strings::LuaString::with_nul("two"),
-                }),
-            )),
+            TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
+                hash: 0,
+                contents: crate::strings::lua_string_with_nul("two"),
+            })),
             TValue::Float(3.0),
         ];
         let result = str_format("%d %s %f", &args).unwrap();
@@ -4867,11 +4844,11 @@ mod tests {
     #[test]
     fn test_str_format_q_string() {
         // %q 字符串:加引号并转义
-        let args = vec![TValue::Str(crate::strings::LuaString::Short(
-            crate::strings::ArcRc::new(crate::strings::ShortString {
+        let args = vec![TValue::ShortStr(crate::strings::ArcRc::new(
+            crate::strings::ShortString {
                 hash: 0,
-                contents: crate::strings::LuaString::with_nul("hello"),
-            }),
+                contents: crate::strings::lua_string_with_nul("hello"),
+            },
         ))];
         let result = str_format("%q", &args).unwrap();
         assert_eq!(result, "\"hello\"");
@@ -4975,13 +4952,13 @@ mod tests {
     fn test_open_string_lib_registers_global() {
         let mut state = LuaState::default();
         open_string_lib(&mut state);
-        let key = TValue::Str(state.intern_str("string"));
+        let key = state.intern_str("string");
         let string_table = state.globals.get(&key);
         assert!(string_table.is_some(), "string global must be registered");
         match string_table.unwrap() {
             TValue::Table(t) => {
                 // 验证 upper 函数已注册
-                let upper_key = TValue::Str(state.intern_str("upper"));
+                let upper_key = state.intern_str("upper");
                 assert!(t.get(&upper_key).is_some(), "string.upper must exist");
             }
             _ => panic!("string global must be a table"),
@@ -4992,14 +4969,14 @@ mod tests {
     fn test_open_string_lib_has_all_functions() {
         let mut state = LuaState::default();
         open_string_lib(&mut state);
-        let key = TValue::Str(state.intern_str("string"));
+        let key = state.intern_str("string");
         let string_table = state.globals.get(&key).expect("string global must exist");
         if let TValue::Table(t) = string_table {
             for name in &[
                 "upper", "lower", "len", "sub", "reverse", "byte", "char", "rep", "find", "format",
                 "match", "gsub",
             ] {
-                let fn_key = TValue::Str(state.intern_str(name));
+                let fn_key = state.intern_str(name);
                 assert!(t.get(&fn_key).is_some(), "string.{} must exist", name);
             }
         }
@@ -5011,36 +4988,30 @@ mod tests {
 
     #[test]
     fn test_to_num_string_integer() {
-        let v = TValue::Str(crate::strings::LuaString::Short(
-            crate::strings::ArcRc::new(crate::strings::ShortString {
-                hash: 0,
-                contents: crate::strings::LuaString::with_nul("42"),
-            }),
-        ));
+        let v = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
+            hash: 0,
+            contents: crate::strings::lua_string_with_nul("42"),
+        }));
         let result = to_num(&v);
         assert_eq!(result, Some(TValue::Integer(42)));
     }
 
     #[test]
     fn test_to_num_string_float() {
-        let v = TValue::Str(crate::strings::LuaString::Short(
-            crate::strings::ArcRc::new(crate::strings::ShortString {
-                hash: 0,
-                contents: crate::strings::LuaString::with_nul("3.14"),
-            }),
-        ));
+        let v = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
+            hash: 0,
+            contents: crate::strings::lua_string_with_nul("3.14"),
+        }));
         let result = to_num(&v);
         assert!(matches!(result, Some(TValue::Float(f)) if (f - 3.14).abs() < 1e-10));
     }
 
     #[test]
     fn test_to_num_invalid_string() {
-        let v = TValue::Str(crate::strings::LuaString::Short(
-            crate::strings::ArcRc::new(crate::strings::ShortString {
-                hash: 0,
-                contents: crate::strings::LuaString::with_nul("abc"),
-            }),
-        ));
+        let v = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
+            hash: 0,
+            contents: crate::strings::lua_string_with_nul("abc"),
+        }));
         let result = to_num(&v);
         assert_eq!(result, None);
     }
@@ -5056,12 +5027,10 @@ mod tests {
     #[test]
     fn test_arith_op_add_strings() {
         let make_str = |s: &str| {
-            TValue::Str(crate::strings::LuaString::Short(
-                crate::strings::ArcRc::new(crate::strings::ShortString {
-                    hash: 0,
-                    contents: crate::strings::LuaString::with_nul(s),
-                }),
-            ))
+            TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
+                hash: 0,
+                contents: crate::strings::lua_string_with_nul(s),
+            }))
         };
         let v1 = make_str("10");
         let v2 = make_str("20");
@@ -5132,7 +5101,9 @@ mod tests {
         call_str_upper(&mut state, 0, 1, 1).unwrap();
         assert_eq!(state.exec.stack.len(), 1);
         match &state.exec.stack[0] {
-            TValue::Str(s) => assert_eq!(s.as_str(), "HELLO"),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                assert_eq!(lua_string_as_str(s), "HELLO")
+            }
             _ => panic!("expected string result"),
         }
     }
@@ -5142,10 +5113,7 @@ mod tests {
         let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state
-            .exec
-            .stack
-            .push(TValue::Str(state.intern_str("hello")));
+        state.exec.stack.push(state.intern_str("hello"));
         call_str_len(&mut state, 0, 1, 1).unwrap();
         match &state.exec.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 5),
@@ -5158,15 +5126,14 @@ mod tests {
         let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state
-            .exec
-            .stack
-            .push(TValue::Str(state.intern_str("hello")));
+        state.exec.stack.push(state.intern_str("hello"));
         state.exec.stack.push(TValue::Integer(2));
         state.exec.stack.push(TValue::Integer(4));
         call_str_sub(&mut state, 0, 3, 1).unwrap();
         match &state.exec.stack[0] {
-            TValue::Str(s) => assert_eq!(s.as_str(), "ell"),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                assert_eq!(lua_string_as_str(s), "ell")
+            }
             _ => panic!("expected string result"),
         }
     }
@@ -5176,10 +5143,12 @@ mod tests {
         let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(TValue::Str(state.intern_str("abc")));
+        state.exec.stack.push(state.intern_str("abc"));
         call_str_reverse(&mut state, 0, 1, 1).unwrap();
         match &state.exec.stack[0] {
-            TValue::Str(s) => assert_eq!(s.as_str(), "cba"),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                assert_eq!(lua_string_as_str(s), "cba")
+            }
             _ => panic!("expected string result"),
         }
     }
@@ -5189,7 +5158,7 @@ mod tests {
         let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(TValue::Str(state.intern_str("AB")));
+        state.exec.stack.push(state.intern_str("AB"));
         state.exec.stack.push(TValue::Integer(1));
         state.exec.stack.push(TValue::Integer(2));
         call_str_byte(&mut state, 0, 3, -1).unwrap();
@@ -5213,7 +5182,9 @@ mod tests {
         state.exec.stack.push(TValue::Integer(66));
         call_str_char(&mut state, 0, 2, 1).unwrap();
         match &state.exec.stack[0] {
-            TValue::Str(s) => assert_eq!(s.as_str(), "AB"),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                assert_eq!(lua_string_as_str(s), "AB")
+            }
             _ => panic!("expected string result"),
         }
     }
@@ -5223,11 +5194,13 @@ mod tests {
         let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(TValue::Str(state.intern_str("ab")));
+        state.exec.stack.push(state.intern_str("ab"));
         state.exec.stack.push(TValue::Integer(3));
         call_str_rep(&mut state, 0, 2, 1).unwrap();
         match &state.exec.stack[0] {
-            TValue::Str(s) => assert_eq!(s.as_str(), "ababab"),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                assert_eq!(lua_string_as_str(s), "ababab")
+            }
             _ => panic!("expected string result"),
         }
     }
@@ -5237,14 +5210,8 @@ mod tests {
         let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state
-            .exec
-            .stack
-            .push(TValue::Str(state.intern_str("hello world")));
-        state
-            .exec
-            .stack
-            .push(TValue::Str(state.intern_str("world")));
+        state.exec.stack.push(state.intern_str("hello world"));
+        state.exec.stack.push(state.intern_str("world"));
         call_str_find(&mut state, 0, 2, -1).unwrap();
         assert!(state.exec.stack.len() >= 2);
         match &state.exec.stack[0] {
@@ -5262,17 +5229,13 @@ mod tests {
         let mut state = LuaState::default();
         state.exec.stack.clear();
         state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state
-            .exec
-            .stack
-            .push(TValue::Str(state.intern_str("hello %s")));
-        state
-            .exec
-            .stack
-            .push(TValue::Str(state.intern_str("world")));
+        state.exec.stack.push(state.intern_str("hello %s"));
+        state.exec.stack.push(state.intern_str("world"));
         call_str_format(&mut state, 0, 2, 1).unwrap();
         match &state.exec.stack[0] {
-            TValue::Str(s) => assert_eq!(s.as_str(), "hello world"),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                assert_eq!(lua_string_as_str(s), "hello world")
+            }
             _ => panic!("expected string result"),
         }
     }
@@ -5473,11 +5436,11 @@ mod tests {
         // c = 固定长度字符串
         assert_pack_eq(
             "<c3",
-            &[TValue::Str(crate::strings::LuaString::Short(
-                crate::strings::ArcRc::new(crate::strings::ShortString {
+            &[TValue::ShortStr(crate::strings::ArcRc::new(
+                crate::strings::ShortString {
                     hash: 0,
-                    contents: crate::strings::LuaString::with_nul("abc"),
-                }),
+                    contents: lua_string_with_nul("abc"),
+                },
             ))],
             &[b'a', b'b', b'c'],
         );
@@ -5485,11 +5448,11 @@ mod tests {
         // 短字符串补零
         assert_pack_eq(
             "<c5",
-            &[TValue::Str(crate::strings::LuaString::Short(
-                crate::strings::ArcRc::new(crate::strings::ShortString {
+            &[TValue::ShortStr(crate::strings::ArcRc::new(
+                crate::strings::ShortString {
                     hash: 0,
-                    contents: crate::strings::LuaString::with_nul("ab"),
-                }),
+                    contents: lua_string_with_nul("ab"),
+                },
             ))],
             &[b'a', b'b', 0, 0, 0],
         );
@@ -5498,24 +5461,20 @@ mod tests {
     #[test]
     fn test_pack_string_zstr() {
         // z = 零终止字符串
-        let s = TValue::Str(crate::strings::LuaString::Short(
-            crate::strings::ArcRc::new(crate::strings::ShortString {
-                hash: 0,
-                contents: crate::strings::LuaString::with_nul("hello"),
-            }),
-        ));
+        let s = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
+            hash: 0,
+            contents: lua_string_with_nul("hello"),
+        }));
         assert_pack_eq("<z", &[s], &[b'h', b'e', b'l', b'l', b'o', 0]);
     }
 
     #[test]
     fn test_pack_string_s() {
         // s = 带长度前缀的字符串 (默认 size_t = 8 字节)
-        let s = TValue::Str(crate::strings::LuaString::Short(
-            crate::strings::ArcRc::new(crate::strings::ShortString {
-                hash: 0,
-                contents: crate::strings::LuaString::with_nul("hi"),
-            }),
-        ));
+        let s = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
+            hash: 0,
+            contents: lua_string_with_nul("hi"),
+        }));
         let result = str_pack("<s", &[s]).unwrap();
         // 8 字节长度前缀 (小端) + 字符串内容
         assert_eq!(result.len(), 10);
@@ -5526,23 +5485,19 @@ mod tests {
     #[test]
     fn test_pack_string_s1() {
         // s1 = 1 字节长度前缀的字符串
-        let s = TValue::Str(crate::strings::LuaString::Short(
-            crate::strings::ArcRc::new(crate::strings::ShortString {
-                hash: 0,
-                contents: crate::strings::LuaString::with_nul("hi"),
-            }),
-        ));
+        let s = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
+            hash: 0,
+            contents: lua_string_with_nul("hi"),
+        }));
         assert_pack_eq("<s1", &[s], &[2, b'h', b'i']);
     }
 
     #[test]
     fn test_pack_empty_string() {
-        let empty = TValue::Str(crate::strings::LuaString::Short(
-            crate::strings::ArcRc::new(crate::strings::ShortString {
-                hash: 0,
-                contents: crate::strings::LuaString::with_nul(""),
-            }),
-        ));
+        let empty = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
+            hash: 0,
+            contents: lua_string_with_nul(""),
+        }));
 
         // 空字符串 c0
         assert_pack_eq("<c0", &[empty.clone()], &[]);
@@ -5559,22 +5514,18 @@ mod tests {
         // 包含特殊字符的字符串
         let bytes = vec![0u8, 1, 2, 255, 254, 128];
         let s = unsafe { String::from_utf8_unchecked(bytes.clone()) };
-        let sval = TValue::Str(crate::strings::LuaString::Short(
-            crate::strings::ArcRc::new(crate::strings::ShortString {
-                hash: 0,
-                contents: crate::strings::LuaString::with_nul(&s),
-            }),
-        ));
+        let sval = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
+            hash: 0,
+            contents: lua_string_with_nul(&s),
+        }));
         assert_pack_eq("<c6", &[sval.clone()], &bytes);
 
         // z 字符串中不能包含 0 (除了终止符)
         let s2 = unsafe { String::from_utf8_unchecked(vec![1u8, 2, 3]) };
-        let sval2 = TValue::Str(crate::strings::LuaString::Short(
-            crate::strings::ArcRc::new(crate::strings::ShortString {
-                hash: 0,
-                contents: crate::strings::LuaString::with_nul(&s2),
-            }),
-        ));
+        let sval2 = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
+            hash: 0,
+            contents: lua_string_with_nul(&s2),
+        }));
         assert_pack_eq("<z", &[sval2], &[1, 2, 3, 0]);
     }
 
@@ -5752,7 +5703,9 @@ mod tests {
         let (results, _) = str_unpack("<c3", &data, 1, &tb).unwrap();
         assert_eq!(results.len(), 1);
         match &results[0] {
-            TValue::Str(s) => assert_eq!(s.as_str(), "abc"),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                assert_eq!(lua_string_as_str(s), "abc")
+            }
             _ => panic!("expected string"),
         }
 
@@ -5760,7 +5713,9 @@ mod tests {
         let data = vec![b'h', b'i', 0];
         let (results, _) = str_unpack("<z", &data, 1, &tb).unwrap();
         match &results[0] {
-            TValue::Str(s) => assert_eq!(s.as_str(), "hi"),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                assert_eq!(lua_string_as_str(s), "hi")
+            }
             _ => panic!("expected string"),
         }
 
@@ -5768,7 +5723,9 @@ mod tests {
         let data = vec![2, b'h', b'i'];
         let (results, _) = str_unpack("<s1", &data, 1, &tb).unwrap();
         match &results[0] {
-            TValue::Str(s) => assert_eq!(s.as_str(), "hi"),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                assert_eq!(lua_string_as_str(s), "hi")
+            }
             _ => panic!("expected string"),
         }
     }
@@ -5826,12 +5783,10 @@ mod tests {
 
     #[test]
     fn test_pack_string_too_long() {
-        let s = TValue::Str(crate::strings::LuaString::Short(
-            crate::strings::ArcRc::new(crate::strings::ShortString {
-                hash: 0,
-                contents: crate::strings::LuaString::with_nul("hello"),
-            }),
-        ));
+        let s = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
+            hash: 0,
+            contents: lua_string_with_nul("hello"),
+        }));
         // c3 容纳 3 字节, 但字符串有 5 字节
         assert!(str_pack("<c3", &[s]).is_err());
     }
@@ -5850,24 +5805,18 @@ mod tests {
     #[test]
     fn test_pack_complex_format() {
         // 复合格式: i1 + c3 + i2
-        let s = TValue::Str(crate::strings::LuaString::Short(
-            crate::strings::ArcRc::new(crate::strings::ShortString {
-                hash: 0,
-                contents: crate::strings::LuaString::with_nul("abc"),
-            }),
-        ));
+        let s = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
+            hash: 0,
+            contents: lua_string_with_nul("abc"),
+        }));
         let result = str_pack("<i1c3i2", &[TValue::Integer(1), s, TValue::Integer(2)]).unwrap();
         assert_eq!(result, vec![1, b'a', b'b', b'c', 2, 0]);
     }
 
     #[test]
     fn test_pack_unpack_complex_roundtrip() {
-        let s = TValue::Str(crate::strings::LuaString::Short(
-            crate::strings::ArcRc::new(crate::strings::ShortString {
-                hash: 0,
-                contents: crate::strings::LuaString::with_nul("XY"),
-            }),
-        ));
+        let tb = crate::strings::StringTable::new();
+        let s = tb.intern_value("XY");
         let fmt = "<i1c2i2d";
         let args = vec![
             TValue::Integer(42),
@@ -5875,7 +5824,6 @@ mod tests {
             TValue::Integer(1000),
             TValue::Float(3.14),
         ];
-        let tb = crate::strings::StringTable::new();
         let packed = str_pack(fmt, &args).unwrap();
         let (results, _) = str_unpack(fmt, &packed, 1, &tb).unwrap();
         assert_eq!(results.len(), 4);

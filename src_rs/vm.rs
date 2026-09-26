@@ -17,9 +17,9 @@ use std::cmp::Ordering;
 
 use crate::gc::GCState;
 use crate::objects::{NilKind, TValue, UpVal, UpValRef, UpValVec};
-use crate::strings::LuaString;
+use crate::strings::{lua_string_as_c_str_ptr, lua_string_as_str, lua_string_eq, lua_string_len};
 use crate::table::Table;
-use crate::tm::{obj_type_name, TagMethodError};
+use crate::tm::{obj_type_name_, TagMethodError};
 use std::cell::RefCell;
 use std::rc::Rc;
 
@@ -168,11 +168,13 @@ pub fn to_number(obj: &TValue) -> Option<f64> {
     match obj {
         TValue::Float(f) => Some(*f),
         TValue::Integer(i) => Some(*i as f64),
-        TValue::Str(s) => match crate::objects::str2num(s.as_str())? {
-            TValue::Float(f) => Some(f),
-            TValue::Integer(i) => Some(i as f64),
-            _ => None,
-        },
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+            match crate::objects::str2num(lua_string_as_str(s))? {
+                TValue::Float(f) => Some(f),
+                TValue::Integer(i) => Some(i as f64),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -216,11 +218,13 @@ pub fn to_integer(obj: &TValue, mode: F2IMode) -> Option<i64> {
     match obj {
         TValue::Integer(i) => Some(*i),
         TValue::Float(f) => float_to_integer(*f, mode),
-        TValue::Str(s) => match crate::objects::str2num(s.as_str())? {
-            TValue::Integer(i) => Some(i),
-            TValue::Float(f) => float_to_integer(f, mode),
-            _ => None,
-        },
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+            match crate::objects::str2num(lua_string_as_str(s))? {
+                TValue::Integer(i) => Some(i),
+                TValue::Float(f) => float_to_integer(f, mode),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -243,14 +247,14 @@ pub fn to_integer(obj: &TValue, mode: F2IMode) -> Option<i64> {
 /// Given: "abc" 和 "abd"
 /// When: 调用 strcmp
 /// Then: 返回 Ordering::Less
-pub fn strcmp(ts1: &LuaString, ts2: &LuaString) -> Ordering {
+pub fn strcmp<'a>(ts1: &TValue<'a>, ts2: &TValue<'a>) -> Ordering {
     // ShortString 末尾必然有 NUL；LongString 所有构造路径都追加 NUL。
     // as_c_str_ptr 返回的指针始终指向 NUL 终止的字节序列，可直接用于 strcoll。
     // 对应 C 实现 lvm.c:l_strcmp 的逻辑。
-    let mut s1 = ts1.as_c_str_ptr();
-    let mut s2 = ts2.as_c_str_ptr();
-    let mut rl1 = ts1.len(); // 不含末尾 NUL 的长度
-    let mut rl2 = ts2.len();
+    let mut s1 = lua_string_as_c_str_ptr(ts1);
+    let mut s2 = lua_string_as_c_str_ptr(ts2);
+    let mut rl1 = lua_string_len(ts1); // 不含末尾 NUL 的长度
+    let mut rl2 = lua_string_len(ts2);
 
     loop {
         // strcoll 在第一个 NUL 处停止，比较当前段
@@ -451,7 +455,10 @@ pub fn raw_equal<'a>(t1: &TValue<'a>, t2: &TValue<'a>) -> bool {
                 float_to_integer(*a, F2IMode::Eq).map_or(false, |i| i == *b)
             }
         }
-        (TValue::Str(a), TValue::Str(b)) => a.as_str() == b.as_str(),
+        (
+            a @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+            b @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+        ) => lua_string_eq(a, b),
         (TValue::LightUserData(a), TValue::LightUserData(b)) => std::ptr::eq(*a, *b),
         (TValue::Table(a), TValue::Table(b)) => Rc::as_ptr(&a.data) == Rc::as_ptr(&b.data),
         (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
@@ -519,6 +526,7 @@ pub fn idiv(m: i64, n: i64) -> Result<i64, &'static str> {
 /// Given: m = 5, n = 0
 /// When: 调用 modulus(5, 0)
 /// Then: 返回 Err
+#[inline]
 pub fn modulus(m: i64, n: i64) -> Result<i64, &'static str> {
     if n == 0 {
         return Err("attempt to divide by zero");
@@ -526,7 +534,14 @@ pub fn modulus(m: i64, n: i64) -> Result<i64, &'static str> {
     if n == -1 {
         return Ok(0);
     }
-    let r = m % n;
+    // 快速路径：n 是 2 的幂
+    if n > 0 && (n & (n - 1)) == 0 {
+        let mask = n - 1;
+        let r = m & mask;
+        return Ok(if r != 0 && m < 0 { r + n } else { r });
+    }
+
+    let r = m.wrapping_rem(n); // 提示编译器这是纯整数取模
     if r != 0 && (r ^ n) < 0 {
         Ok(r + n)
     } else {
@@ -602,7 +617,9 @@ pub fn shiftr(x: i64, y: i64) -> i64 {
 pub fn objlen_raw<'a>(obj: &TValue<'a>) -> Option<TValue<'a>> {
     match obj {
         TValue::Table(t) => Some(TValue::Integer(t.len())),
-        TValue::Str(s) => Some(TValue::Integer(s.len() as i64)),
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+            Some(TValue::Integer(lua_string_len(s) as i64))
+        }
         _ => None,
     }
 }
@@ -796,7 +813,10 @@ pub fn finish_op<'a>(_interrupted_op: u8, _stack: &mut Vec<TValue<'a>>) -> Resul
 /// Given: 栈上有 "" 和 "abc"
 /// When: 调用 concat(2)
 fn value_is_stringable(v: &TValue) -> bool {
-    matches!(v, TValue::Str(_) | TValue::Integer(_) | TValue::Float(_))
+    matches!(
+        v,
+        TValue::LongStr(_) | TValue::ShortStr(_) | TValue::Integer(_) | TValue::Float(_)
+    )
 }
 
 fn format_float_len(f: f64) -> usize {
@@ -840,18 +860,20 @@ pub fn concat_stack(
         let v_prev = &stack[top - 2];
         let v_top = &stack[top - 1];
 
-        let prev_ok = matches!(v_prev, TValue::Str(_)) || to_number(v_prev).is_some();
-        let top_ok = matches!(v_top, TValue::Str(_)) || to_number(v_top).is_some();
+        let prev_ok = matches!(v_prev, TValue::LongStr(_) | TValue::ShortStr(_))
+            || to_number(v_prev).is_some();
+        let top_ok =
+            matches!(v_top, TValue::LongStr(_) | TValue::ShortStr(_)) || to_number(v_top).is_some();
 
         if !prev_ok || !top_ok {
             // C: luaT_tryconcatTM(L);
             return Err(TagMethodError::ConcatError {
-                left: obj_type_name(v_prev),
-                right: obj_type_name(v_top),
+                left: obj_type_name_(table, v_prev),
+                right: obj_type_name_(table, v_top),
             });
         }
         // C: isemptystr(s2v(top-1)) → 第二个操作数是空串
-        let is_top_empty = matches!(v_top, TValue::Str(ref s) if s.len() == 0);
+        let is_top_empty = matches!(v_top,ref s @(TValue::LongStr(_) | TValue::ShortStr(_)) if lua_string_len(s) == 0);
         if is_top_empty {
             // C: cast_void(tostring(L, s2v(top-2))); → 结果就是第一个操作数
             // 确保 top-2 是字符串形式 (对于数字做转换)
@@ -859,11 +881,11 @@ pub fn concat_stack(
             match &stack[idx] {
                 TValue::Integer(i) => {
                     let i = *i;
-                    stack[idx] = TValue::Str(string_from_int(table, i));
+                    stack[idx] = string_from_int(table, i);
                 }
                 TValue::Float(f) => {
                     let f = *f;
-                    stack[idx] = TValue::Str(string_from_float(table, f));
+                    stack[idx] = string_from_float(table, f);
                 }
                 _ => {}
             }
@@ -872,7 +894,7 @@ pub fn concat_stack(
             continue;
         }
         // C: isemptystr(s2v(top-2)) → 第一个操作数是空串
-        let is_prev_empty = matches!(v_prev, TValue::Str(ref s) if s.len() == 0);
+        let is_prev_empty = matches!(v_prev, ref s@(TValue::LongStr(_) | TValue::ShortStr(_)) if lua_string_len(s) == 0);
         if is_prev_empty {
             // C: setobjs2s(L, top-2, top-1); → 结果就是第二个操作数
             //     cast_void(tostring(L, s2v(top-2))); → 将其转为字符串
@@ -880,8 +902,8 @@ pub fn concat_stack(
             let idx = top - 2;
             // 将数字转为字符串 (与 C 的 tostring 一致)
             let val = match val {
-                TValue::Integer(i) => TValue::Str(string_from_int(table, i)),
-                TValue::Float(f) => TValue::Str(string_from_float(table, f)),
+                TValue::Integer(i) => string_from_int(table, i),
+                TValue::Float(f) => string_from_float(table, f),
                 other => other,
             };
             stack[idx] = val;
@@ -910,34 +932,34 @@ pub fn concat_stack(
         }
         let ls = if result.len() <= crate::strings::LUAI_MAXSHORTLEN {
             // 短字符串: 走 intern 复用
-            table.intern(&result)
+            table.intern_value(&result)
         } else {
             // 长字符串: new_long_str_from_string 内部会追加 NUL 终止符
             crate::strings::new_long_str_from_string(result)
         };
         let target_idx = top - n;
-        stack[target_idx] = TValue::Str(ls);
+        stack[target_idx] = ls;
         stack.truncate(target_idx + 1);
         remaining -= n - 1;
     }
     Ok(())
 }
 
-fn string_from_int(table: &crate::strings::StringTable, i: i64) -> LuaString {
+fn string_from_int<'a>(table: &crate::strings::StringTable, i: i64) -> TValue<'a> {
     let s = crate::float_utils::i64_to_string(i);
     // 对应 C 的 tostringbuff: 短字符串走 intern (luaS_newlstr → internshrstr)
-    table.intern(&s)
+    table.intern_value(&s)
 }
 
-fn string_from_float(table: &crate::strings::StringTable, f: f64) -> LuaString {
+fn string_from_float<'a>(table: &crate::strings::StringTable, f: f64) -> TValue<'a> {
     let s = format_float(f);
     // 对应 C 的 tostringbuff: 短字符串走 intern (luaS_newlstr → internshrstr)
-    table.intern(&s)
+    table.intern_value(&s)
 }
 
 fn value_str_len(v: &TValue) -> usize {
     match v {
-        TValue::Str(s) => s.len(),
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => lua_string_len(s),
         TValue::Integer(i) => crate::float_utils::i64_str_len(*i),
         TValue::Float(f) => format_float_len(*f),
         _ => 0,
@@ -946,7 +968,7 @@ fn value_str_len(v: &TValue) -> usize {
 
 fn append_val_to_string(buf: &mut String, v: &TValue) {
     match v {
-        TValue::Str(s) => buf.push_str(s.as_str()),
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => buf.push_str(lua_string_as_str(s)),
         TValue::Integer(i) => buf.push_str(&crate::float_utils::i64_to_string(*i)),
         TValue::Float(f) => buf.push_str(&format_float(*f)),
         _ => {}
@@ -1274,10 +1296,10 @@ mod tests {
     use super::*;
     use crate::objects::{NilKind, Proto, UpvalDesc};
     use crate::state::LuaState;
-    use crate::strings::{LuaString, StringTable};
+    use crate::strings::StringTable;
     use std::rc::Rc;
 
-    fn make_gc() -> Rc<crate::gc::GCState> {
+    fn make_gc() -> Rc<crate::gc::GCState<'static>> {
         Rc::new(crate::gc::GCState::default_incremental())
     }
 
@@ -1292,7 +1314,11 @@ mod tests {
         if l.is_number() && r.is_number() {
             return Some(lt_num(l, r));
         }
-        if let (TValue::Str(a), TValue::Str(b)) = (l, r) {
+        if let (
+            a @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+            b @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+        ) = (l, r)
+        {
             return Some(strcmp(a, b) == Ordering::Less);
         }
         None
@@ -1305,7 +1331,11 @@ mod tests {
         if l.is_number() && r.is_number() {
             return Some(le_num(l, r));
         }
-        if let (TValue::Str(a), TValue::Str(b)) = (l, r) {
+        if let (
+            a @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+            b @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+        ) = (l, r)
+        {
             return Some(strcmp(a, b) != Ordering::Greater);
         }
         None
@@ -1477,28 +1507,28 @@ mod tests {
     #[test]
     fn test_to_number_str() {
         let tb = StringTable::new();
-        let v = TValue::Str(tb.intern("3.14"));
+        let v = tb.intern_value("3.14");
         assert!((to_number(&v).unwrap() - 3.14).abs() < 1e-10);
     }
 
     #[test]
     fn test_to_number_str_int() {
         let tb = StringTable::new();
-        let v = TValue::Str(tb.intern("42"));
+        let v = tb.intern_value("42");
         assert_eq!(to_number(&v), Some(42.0));
     }
 
     #[test]
     fn test_to_number_str_invalid() {
         let tb = StringTable::new();
-        let v = TValue::Str(tb.intern("abc"));
+        let v = tb.intern_value("abc");
         assert_eq!(to_number(&v), None);
     }
 
     #[test]
     fn test_to_number_str_negative() {
         let tb = StringTable::new();
-        let v = TValue::Str(tb.intern("-3.14"));
+        let v = tb.intern_value("-3.14");
         assert!((to_number(&v).unwrap() + 3.14).abs() < 1e-10);
     }
 
@@ -1527,21 +1557,21 @@ mod tests {
     #[test]
     fn test_to_integer_str() {
         let tb = StringTable::new();
-        let v = TValue::Str(tb.intern("42"));
+        let v = tb.intern_value("42");
         assert_eq!(to_integer(&v, F2IMode::Eq), Some(42));
     }
 
     #[test]
     fn test_to_integer_str_negative() {
         let tb = StringTable::new();
-        let v = TValue::Str(tb.intern("-42"));
+        let v = tb.intern_value("-42");
         assert_eq!(to_integer(&v, F2IMode::Eq), Some(-42));
     }
 
     #[test]
     fn test_to_integer_str_float_floor() {
         let tb = StringTable::new();
-        let v = TValue::Str(tb.intern("3.7"));
+        let v = tb.intern_value("3.7");
         assert_eq!(to_integer(&v, F2IMode::Floor), Some(3));
         assert_eq!(to_integer(&v, F2IMode::Eq), None);
     }
@@ -1550,9 +1580,9 @@ mod tests {
     // strcmp 测试
     // ========================================================================
 
-    fn make_ls(s: &str) -> LuaString {
+    fn make_ls<'a>(s: &str) -> TValue<'a> {
         let tb = StringTable::new();
-        tb.intern(s)
+        tb.intern_value(s)
     }
 
     #[test]
@@ -1586,26 +1616,26 @@ mod tests {
     #[test]
     fn test_strcmp_with_null_bytes_equal() {
         let tb = StringTable::new();
-        let a = tb.intern("hello\0world");
-        let b = tb.intern("hello\0world");
+        let a = tb.intern_value("hello\0world");
+        let b = tb.intern_value("hello\0world");
         assert_eq!(strcmp(&a, &b), Ordering::Equal);
     }
 
     #[test]
     fn test_strcmp_with_null_bytes_less() {
         let tb = StringTable::new();
-        let a = tb.intern("abc\0def");
-        let b = tb.intern("abd\0def");
+        let a = tb.intern_value("abc\0def");
+        let b = tb.intern_value("abd\0def");
         assert_eq!(strcmp(&a, &b), Ordering::Less);
     }
 
     #[test]
     fn test_strcmp_null_vs_normal() {
         let tb = StringTable::new();
-        let a = tb.intern("abc\0xyz");
-        let b = tb.intern("abc");
+        let a = tb.intern_value("abc\0xyz");
+        let b = tb.intern_value("abc");
         assert_eq!(strcmp(&a, &b), Ordering::Greater);
-        let c = tb.intern("abd");
+        let c = tb.intern_value("abd");
         assert_eq!(strcmp(&a, &c), Ordering::Less);
     }
 
@@ -1745,10 +1775,10 @@ mod tests {
     #[test]
     fn test_raw_equal_strings() {
         let tb = StringTable::new();
-        let a = TValue::Str(tb.intern("hello"));
-        let b = TValue::Str(tb.intern("hello"));
+        let a = tb.intern_value("hello");
+        let b = tb.intern_value("hello");
         assert!(raw_equal(&a, &b));
-        let c = TValue::Str(tb.intern("world"));
+        let c = tb.intern_value("world");
         assert!(!raw_equal(&a, &c));
     }
 
@@ -1799,8 +1829,8 @@ mod tests {
     #[test]
     fn test_less_than_strings() {
         let tb = StringTable::new();
-        let a = TValue::Str(tb.intern("abc"));
-        let b = TValue::Str(tb.intern("abd"));
+        let a = tb.intern_value("abc");
+        let b = tb.intern_value("abd");
         assert!(less_than_raw(&a, &b).unwrap());
     }
 
@@ -1819,10 +1849,10 @@ mod tests {
     #[test]
     fn test_less_equal_strings() {
         let tb = StringTable::new();
-        let a = TValue::Str(tb.intern("abc"));
-        let b = TValue::Str(tb.intern("abc"));
+        let a = tb.intern_value("abc");
+        let b = tb.intern_value("abc");
         assert!(less_equal_raw(&a, &b).unwrap());
-        let c = TValue::Str(tb.intern("abd"));
+        let c = tb.intern_value("abd");
         assert!(less_equal_raw(&a, &c).unwrap());
         assert!(!less_equal_raw(&c, &a).unwrap());
     }
@@ -1996,14 +2026,14 @@ mod tests {
     #[test]
     fn test_objlen_string() {
         let tb = StringTable::new();
-        let s = TValue::Str(tb.intern("hello"));
+        let s = tb.intern_value("hello");
         assert_eq!(objlen_raw(&s), Some(TValue::Integer(5)));
     }
 
     #[test]
     fn test_objlen_empty_string() {
         let tb = StringTable::new();
-        let s = TValue::Str(tb.intern(""));
+        let s = tb.intern_value("");
         assert_eq!(objlen_raw(&s), Some(TValue::Integer(0)));
     }
 
@@ -2063,8 +2093,8 @@ mod tests {
     #[test]
     fn test_is_false_strings() {
         let tb = StringTable::new();
-        assert!(!is_false(&TValue::Str(tb.intern(""))));
-        assert!(!is_false(&TValue::Str(tb.intern("false"))));
+        assert!(!is_false(&(tb.intern_value(""))));
+        assert!(!is_false(&(tb.intern_value("false"))));
     }
 
     // ========================================================================
@@ -2177,9 +2207,10 @@ mod tests {
     #[test]
     fn test_finish_get_table_present_key() {
         let t = Table::new();
-        t.set(TValue::Str(make_ls("key")), TValue::Integer(42));
+        let tb = StringTable::new();
+        t.set(tb.intern_value("key"), TValue::Integer(42));
         let tv = TValue::Table(t);
-        let result = finish_get(&TValue::Str(make_ls("key")), &tv, None);
+        let result = finish_get(&tb.intern_value("key"), &tv, None);
         assert_eq!(result.unwrap(), TValue::Integer(42));
     }
 
@@ -2187,7 +2218,7 @@ mod tests {
     fn test_finish_get_table_missing_key() {
         let t = Table::new();
         let tv = TValue::Table(t);
-        let result = finish_get(&TValue::Str(make_ls("missing")), &tv, None);
+        let result = finish_get(&(make_ls("missing")), &tv, None);
         assert_eq!(result.unwrap(), TValue::Nil(NilKind::Strict));
     }
 
@@ -2205,18 +2236,16 @@ mod tests {
     fn test_finish_set_table() {
         let t = Table::new();
         let mut tv = TValue::Table(t);
+        let tb = StringTable::new();
         let result = finish_set(
             &mut tv,
-            TValue::Str(make_ls("a")),
+            tb.intern_value("a"),
             TValue::Integer(100),
             FastAccess::Ok,
         );
         assert!(result.is_ok());
         if let TValue::Table(ref t) = tv {
-            assert_eq!(
-                t.get(&TValue::Str(make_ls("a"))),
-                Some(TValue::Integer(100))
-            );
+            assert_eq!(t.get(&tb.intern_value("a")), Some(TValue::Integer(100)));
         }
     }
 
@@ -2250,15 +2279,12 @@ mod tests {
     #[test]
     fn test_concat_stack_two_strings() {
         let tb = StringTable::new();
-        let mut stack = vec![
-            TValue::Str(tb.intern("hello")),
-            TValue::Str(tb.intern("world")),
-        ];
+        let mut stack = vec![(tb.intern_value("hello")), (tb.intern_value("world"))];
         let len_before = stack.len();
         concat_stack(&tb, &mut stack, 2).unwrap();
         assert_eq!(stack.len(), len_before - 1);
-        if let TValue::Str(ref s) = stack[0] {
-            assert_eq!(s.as_str(), "helloworld");
+        if let ref s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = stack[0] {
+            assert_eq!(lua_string_as_str(s), "helloworld");
         } else {
             panic!("Expected string");
         }
@@ -2267,7 +2293,7 @@ mod tests {
     #[test]
     fn test_concat_stack_single_value() {
         let tb = StringTable::new();
-        let mut stack = vec![TValue::Str(tb.intern("hello"))];
+        let mut stack = vec![(tb.intern_value("hello"))];
         concat_stack(&tb, &mut stack, 1).unwrap();
         assert_eq!(stack.len(), 1);
     }
@@ -2276,14 +2302,14 @@ mod tests {
     fn test_concat_stack_three_strings() {
         let tb = StringTable::new();
         let mut stack = vec![
-            TValue::Str(tb.intern("a")),
-            TValue::Str(tb.intern("b")),
-            TValue::Str(tb.intern("c")),
+            (tb.intern_value("a")),
+            (tb.intern_value("b")),
+            (tb.intern_value("c")),
         ];
         concat_stack(&tb, &mut stack, 3).unwrap();
         assert_eq!(stack.len(), 1);
-        if let TValue::Str(ref s) = stack[0] {
-            assert_eq!(s.as_str(), "abc");
+        if let ref s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = stack[0] {
+            assert_eq!(lua_string_as_str(s), "abc");
         } else {
             panic!("Expected string");
         }
@@ -2292,10 +2318,10 @@ mod tests {
     #[test]
     fn test_concat_stack_with_numbers() {
         let tb = StringTable::new();
-        let mut stack = vec![TValue::Str(tb.intern("x=")), TValue::Integer(42)];
+        let mut stack = vec![(tb.intern_value("x=")), TValue::Integer(42)];
         concat_stack(&tb, &mut stack, 2).unwrap();
-        if let TValue::Str(ref s) = stack[0] {
-            assert_eq!(s.as_str(), "x=42");
+        if let ref s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = stack[0] {
+            assert_eq!(lua_string_as_str(s), "x=42");
         } else {
             panic!("Expected string");
         }
@@ -2304,11 +2330,11 @@ mod tests {
     #[test]
     fn test_concat_stack_empty_first() {
         let tb = StringTable::new();
-        let mut stack = vec![TValue::Str(tb.intern("")), TValue::Str(tb.intern("world"))];
+        let mut stack = vec![(tb.intern_value("")), (tb.intern_value("world"))];
         concat_stack(&tb, &mut stack, 2).unwrap();
         assert_eq!(stack.len(), 1);
-        if let TValue::Str(ref s) = stack[0] {
-            assert_eq!(s.as_str(), "world");
+        if let ref s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = stack[0] {
+            assert_eq!(lua_string_as_str(s), "world");
         } else {
             panic!("Expected string");
         }

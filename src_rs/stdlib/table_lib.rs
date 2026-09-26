@@ -12,6 +12,7 @@
 use crate::execute::{arg_error, VmError};
 use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
+use crate::strings::lua_string_as_str;
 use crate::table::Table;
 use crate::tm::{call_order_tm, obj_type_name, TagMethod};
 use crate::vm::VmExecutor;
@@ -147,7 +148,7 @@ fn table_concat_impl<'a>(
 
     let push_val = |result: &mut String, val: &TValue, idx: i64| -> Result<(), VmError> {
         match val {
-            TValue::Str(s) => result.push_str(s.as_str()),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => result.push_str(lua_string_as_str(s)),
             TValue::Integer(n) => result.push_str(&crate::float_utils::i64_to_string(*n)),
             TValue::Float(f) => result.push_str(&crate::float_utils::f64_to_string(*f)),
             _ => {
@@ -200,7 +201,7 @@ fn call_concat<'a>(
     let sep = if nargs >= 2 {
         let sep_val = get_arg(state, a, 1);
         match &sep_val {
-            TValue::Str(s) => s.as_str().to_string(),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => lua_string_as_str(s).to_string(),
             _ => String::new(),
         }
     } else {
@@ -220,12 +221,7 @@ fn call_concat<'a>(
     };
 
     let result = table_concat_impl(state, &list_val, &sep, i, j)?;
-    push_results(
-        state,
-        a,
-        nresults,
-        vec![TValue::Str(state.intern_str(&result))],
-    );
+    push_results(state, a, nresults, vec![(state.intern_str(&result))]);
     Ok(())
 }
 
@@ -254,20 +250,20 @@ fn call_unpack<'a>(
     } else {
         1
     };
-    let j = if nargs >= 3 {
+    let e = if nargs >= 3 {
         get_opt_int_arg(state, a, 2, default_len)
     } else {
         default_len
     };
 
-    if i > j {
+    if i > e {
         // 空范围: 返回 0 个值 (对应 C 的 return 0)
         push_results(state, a, nresults, vec![]);
         return Ok(());
     }
     // 对应 C Lua 的 lua_checkstack 检查: 元素数量超过 INT_MAX 或栈空间不足时报错
     // C: n = l_castS2U(e) - l_castS2U(i); ++n; (用 unsigned 算术避免溢出)
-    let n_minus_1 = (j as u64).wrapping_sub(i as u64);
+    let n_minus_1 = (e as u64).wrapping_sub(i as u64);
     if n_minus_1 >= i32::MAX as u64 {
         return Err(VmError::RuntimeError(
             "too many results to unpack".to_string(),
@@ -299,52 +295,54 @@ fn call_unpack<'a>(
     // 145ea7 (3.47% get_int 调用) + 145eb4 (5.78% unwrap_or 初始化)。
     // 一次 borrow 同时检查 metatable 和访问 array, 避免每元素重新 borrow。
     // 注意: data 借用 t.data, 与 state.exec.stack 独立, 可同时持有。
-    if let TValue::Table(t) = &list_val {
-        let data = t.data.borrow();
-        if data.metatable.is_none() {
-            // 整个范围 [i, j] 在 array 内: 直接遍历 array, 跳过 get_int/hash_get
-            // 1-based → 0-based: i-1, j-1
-            let array = &data.array;
-            let array_len = array.len();
-            let start_idx = (i - 1) as usize;
-            let end_idx = (j - 1) as usize;
-            if end_idx < array_len {
-                // perf: 直接遍历 array, Empty 槽位转换为 Strict Nil (与 get_int 语义一致)
-                // 已 try_reserve_exact(n), push 不会触发 grow
-                for idx in start_idx..=end_idx {
-                    let val = match &array[idx] {
-                        TValue::Nil(NilKind::Empty) => TValue::Nil(NilKind::Strict),
-                        other => other.clone(),
-                    };
-                    state.exec.stack.push(val);
+    if i > 0 && e > 0 {
+        if let TValue::Table(t) = &list_val {
+            let data = t.data.borrow();
+            if data.metatable.is_none() {
+                // 整个范围 [i, j] 在 array 内: 直接遍历 array, 跳过 get_int/hash_get
+                // 1-based → 0-based: i-1, j-1
+                let array = &data.array;
+                let array_len = array.len();
+                let start_idx = (i - 1) as usize;
+                let end_idx = (e - 1) as usize;
+                if end_idx < array_len {
+                    // perf: 直接遍历 array, Empty 槽位转换为 Strict Nil (与 get_int 语义一致)
+                    // 已 try_reserve_exact(n), push 不会触发 grow
+                    for idx in start_idx..=end_idx {
+                        let val = match &array[idx] {
+                            TValue::Nil(NilKind::Empty) => TValue::Nil(NilKind::Strict),
+                            other => other.clone(),
+                        };
+                        state.exec.stack.push(val);
+                    }
+                    drop(data);
+                    state.adjust_results_on_stack(a, nresults, n, first_result_pos);
+                    return Ok(());
                 }
+                // 部分范围超出 array: 走 get_int 逻辑 (仍借用 data, 但 get_int 会重新 borrow)
+                // drop data 避免双重 borrow
                 drop(data);
+                let mut idx = i;
+                while idx < e {
+                    let val = t.get_int(idx).unwrap_or(TValue::Nil(NilKind::Strict));
+                    state.exec.stack.push(val);
+                    idx += 1;
+                }
+                let val = t.get_int(e).unwrap_or(TValue::Nil(NilKind::Strict));
+                state.exec.stack.push(val);
                 state.adjust_results_on_stack(a, nresults, n, first_result_pos);
                 return Ok(());
             }
-            // 部分范围超出 array: 走 get_int 逻辑 (仍借用 data, 但 get_int 会重新 borrow)
-            // drop data 避免双重 borrow
             drop(data);
-            let mut idx = i;
-            while idx < j {
-                let val = t.get_int(idx).unwrap_or(TValue::Nil(NilKind::Strict));
-                state.exec.stack.push(val);
-                idx += 1;
-            }
-            let val = t.get_int(j).unwrap_or(TValue::Nil(NilKind::Strict));
-            state.exec.stack.push(val);
-            state.adjust_results_on_stack(a, nresults, n, first_result_pos);
-            return Ok(());
         }
-        drop(data);
     }
     let mut idx = i;
-    while idx < j {
+    while idx < e {
         let val = geti_meta(state, &list_val, idx)?;
         state.exec.stack.push(val);
         idx += 1;
     }
-    let val = geti_meta(state, &list_val, j)?;
+    let val = geti_meta(state, &list_val, e)?;
     state.exec.stack.push(val);
 
     state.adjust_results_on_stack(a, nresults, n, first_result_pos);
@@ -363,10 +361,7 @@ fn call_pack<'a>(
         let val = get_arg(state, a, i);
         t.set_int((i + 1) as i64, val);
     }
-    t.set(
-        TValue::Str(state.intern_str("n")),
-        TValue::Integer(nargs as i64),
-    );
+    t.set(state.intern_str("n"), TValue::Integer(nargs as i64));
     push_results(state, a, nresults, vec![TValue::Table(t)]);
     Ok(())
 }
@@ -494,7 +489,11 @@ fn sort_comp<'a>(
     if matches!(comp, TValue::Nil(_)) {
         if a.is_number() && b.is_number() {
             Ok(crate::vm::lt_num(a, b))
-        } else if let (TValue::Str(s1), TValue::Str(s2)) = (a, b) {
+        } else if let (
+            s1 @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+            s2 @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+        ) = (a, b)
+        {
             Ok(crate::vm::strcmp(s1, s2) == std::cmp::Ordering::Less)
         } else {
             call_order_tm(state, a, b, TagMethod::Lt)
@@ -626,7 +625,7 @@ fn call_sort<'a>(
             return Err(arg_error(
                 state,
                 1,
-                &format!("table expected, got {}", obj_type_name(&table_val)),
+                &format!("table expected, got {}", obj_type_name(state, &table_val)),
             ))
         }
     }
@@ -752,7 +751,7 @@ fn call_create<'a>(
     // 估算: array 部分 sizeseq * sizeof(TValue) + hash 部分预留容量 * 节点大小
     let estimated_size = sizeseq as usize * std::mem::size_of::<TValue>()
         + sizerest as usize * (std::mem::size_of::<TValue>() * 2 + 16);
-    let table_id = state.gc.register_object(estimated_size);
+    let table_id = unsafe { state.gc.as_mut().register_object(estimated_size) };
     table.data.borrow().gc_header.set_id(table_id);
     push_results(state, a, nresults, vec![TValue::Table(table)]);
     Ok(())
@@ -993,6 +992,31 @@ pub fn open_table_lib<'a>(state: &mut LuaState<'a>) {
     register(&mut lib, c"move", call_move);
     register(&mut lib, c"create", call_create);
 
-    let key = TValue::Str(state.intern_str("table"));
+    let key = state.intern_str("table");
     state.globals.set(key, TValue::Table(lib));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unpack() {
+        // local minI = math.mininteger
+        // local t = {[minI] = 12.3, [minI + 1] = 23.5}
+        // print(table.unpack(t, minI, minI + 1))
+        let mut state = LuaState::default();
+        let min_i = crate::stdlib::math_lib::MIN_INTEGER;
+        let table = Table::new();
+        table.set(TValue::Integer(min_i), TValue::Float(12.3));
+        table.set(TValue::Integer(min_i + 1), TValue::Float(23.5));
+        state.push_value(TValue::Table(table));
+        state.push_value(TValue::Integer(min_i));
+        state.push_value(TValue::Integer(min_i + 1));
+        call_unpack(&mut state, 0, 3, 2).unwrap();
+        let value1 = state.exec.stack.get(0).unwrap();
+        let value2 = state.exec.stack.get(1).unwrap();
+        assert!(matches!(value1, TValue::Float(num) if *num == 12.3));
+        assert!(matches!(value2, TValue::Float(num) if *num == 23.5));
+    }
 }
