@@ -55,7 +55,6 @@ else ifeq ($(PLATFORM),MSYS)
 	CFLAGS := $(CFLAGS) -DLUA_BUILD_AS_DLL -DLUA_LIB
 	LDLIBS := $(LDLIBS) -lws2_32 -lNtosKrnl -lntdll -luserenv
 else ifeq ($(PLATFORM),LINUX)
-	CFLAGS := $(CFLAGS) -DLUA_BUILD_AS_DLL -DLUA_LIB
 	LDLIBS := $(LDLIBS) -ldl -lpthread
 endif
 

@@ -14,7 +14,6 @@ use std::ffi::{c_int, c_void};
 #[cfg(feature = "cmp_c")]
 use std::ptr;
 use std::rc::Rc;
-use std::sync::atomic::{AtomicU64, AtomicU8};
 
 #[cfg_attr(not(size_optimized), derive(Debug))]
 #[derive(Clone)]
