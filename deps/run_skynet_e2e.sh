@@ -17,6 +17,12 @@ SKYNET_DIR="$SCRIPT_DIR/src/skynet"
 # 服务端用 lua-rs（skynet 二进制已链接 liblua_rs.a）
 # 客户端用 C lua（因 lpeg.so 兼容性问题）
 LUA_C_BIN="$PROJECT_ROOT/build/lua"
+if [[ ! -x "$LUA_C_BIN" ]]; then
+    LUA_C_BIN="$PROJECT_ROOT/build/Release/lua"
+fi
+if [[ ! -x "$LUA_C_BIN" ]]; then
+    LUA_C_BIN="$PROJECT_ROOT/build/Debug/lua"
+fi
 
 cd "$SKYNET_DIR"
 

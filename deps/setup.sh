@@ -55,6 +55,12 @@ run_unlimited() {
     fi
 }
 
+USE_DEBUG=0
+if [[ "${2:-}" == "--debug" ]]; then
+    USE_DEBUG=1
+    ok "使用调试模式"
+fi
+
 # ============================================================================
 # 1. 构建 Rust lua (启用 threaded + skynet feature)
 # ============================================================================
@@ -74,12 +80,16 @@ run_unlimited() {
 #     创建独立 LuaState, 不跨线程共享.
 LUA_BIN="$PROJECT_ROOT/target/release/lua"
 LUA_LIB="$PROJECT_ROOT/target/release/liblua_rs.a"
+if [[ $USE_DEBUG == 1 ]]; then
+    LUA_BIN="$PROJECT_ROOT/target/debug/lua"
+    LUA_LIB="$PROJECT_ROOT/target/debug/liblua_rs.a"
+fi
 
 if [[ -f "$LUA_BIN" && -f "$LUA_LIB" && "${1:-}" != "--rebuild-lua" ]]; then
     ok "Rust lua 已构建: $LUA_BIN"
 else
-    log "构建 Rust lua (cargo build --release --features threaded,skynet)..."
-    run_unlimited cargo build --release --features threaded,skynet
+    log "构建 Rust lua (cargo build --release --features lua_longjmp,threaded,skynet)..."
+    run_unlimited cargo build --release --features lua_longjmp,threaded,skynet
     [[ -f "$LUA_BIN" ]] || die "lua 二进制未生成: $LUA_BIN"
     [[ -f "$LUA_LIB" ]] || die "liblua_rs.a 静态库未生成: $LUA_LIB"
     ok "Rust lua 构建完成"
@@ -456,7 +466,7 @@ apply_skynet_patch
 # ============================================================================
 log "编译 C/C++ 模块 (make all)..."
 # make 不需要绕过内存限制（编译单个 .so 内存占用小）
-make -C "$SCRIPT_DIR" all
+USE_DEBUG=$USE_DEBUG make -C "$SCRIPT_DIR" all
 ok "C/C++ 模块编译完成"
 
 # ============================================================================

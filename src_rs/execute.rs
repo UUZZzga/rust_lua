@@ -13,6 +13,7 @@
 //! 每个公开函数都包含规约注释。
 
 use crate::gc::GCState;
+use crate::helper::JmpBuf;
 use crate::objects::{
     CallFrame, Instruction, LClosure, LuaType, NilKind, Proto, TValue, UpVal, UpValVec, PF_VAHID,
     PF_VATAB,
@@ -5864,14 +5865,10 @@ impl VmExecutor {
             #[cfg(lua_use_longjmp)]
             {
                 // lua_use_longjmp 模式: 用 setjmp/longjmp 替代 catch_unwind
-                let mut jmp_buf: [u8; 512] = [0; 512];
+                let mut jmp_buf = JmpBuf::default();
                 state.error_jmp_bufs.push(jmp_buf.as_mut_ptr());
                 let result = unsafe {
-                    crate::state::lua_rs_pcall_c(
-                        Some(f),
-                        ptr as *mut c_void,
-                        jmp_buf.as_mut_ptr() as *mut c_void,
-                    )
+                    crate::state::lua_rs_pcall_c(Some(f), ptr as *mut c_void, jmp_buf.as_mut_ptr())
                 };
                 state.error_jmp_bufs.pop();
                 if result == -1 {

@@ -165,13 +165,41 @@ fi
 # LUA_LIB/LUA_INC 覆盖为 lua-rs 的 liblua_rs.a 与 src/ 头文件，仅用 skynet
 # 的 C 框架代码 (skynet-src/, service-src/, lualib-src/) 与 Lua 服务脚本。
 SKYNET_REPO="https://github.com/cloudwu/skynet.git"
-if [[ -d "$SRC_DIR/skynet" && -f "$SRC_DIR/skynet/Makefile" ]]; then
-    log "已存在: src/skynet (跳过 clone)"
+SKYNET_COMMIT="b0e8eccb4137435400c82db1b18d5c55812fae5f"
+
+SKYNET_DIR="$SRC_DIR/skynet"
+
+# 检查目录是否是一个有效的 git 仓库
+if [[ -d "$SKYNET_DIR/.git" ]]; then
+    # 已存在 git 仓库：检查当前 HEAD 是否匹配指定 commit
+    current_commit="$(git -C "$SKYNET_DIR" rev-parse HEAD 2>/dev/null || echo "")"
+    if [[ "$current_commit" == "$SKYNET_COMMIT" ]]; then
+        log "已存在且匹配: src/skynet @ ${SKYNET_COMMIT:0:12} (跳过)"
+    else
+        log "src/skynet 当前 @ ${current_commit:0:12}，需要更新到 ${SKYNET_COMMIT:0:12}"
+        # 尝试从 origin fetch 指定 commit 并检出
+        if git -C "$SKYNET_DIR" fetch --depth=1 origin "$SKYNET_COMMIT" 2>/dev/null \
+            && git -C "$SKYNET_DIR" checkout --detach "$SKYNET_COMMIT" 2>/dev/null; then
+            log "完成: 已更新 src/skynet -> ${SKYNET_COMMIT:0:12}"
+        else
+            log "fetch 指定 commit 失败，重新 clone"
+            rm -rf "$SKYNET_DIR"
+            git clone "$SKYNET_REPO" "$SKYNET_DIR" \
+                && git -C "$SKYNET_DIR" checkout --detach "$SKYNET_COMMIT"
+            log "完成: src/skynet @ ${SKYNET_COMMIT:0:12}"
+        fi
+    fi
 else
-    log "git clone: $SKYNET_REPO"
-    rm -rf "$SRC_DIR/skynet"
-    git clone --depth=1 "$SKYNET_REPO" "$SRC_DIR/skynet"
-    log "完成: src/skynet"
+    # 不存在或不完整：清理后重新 clone 并检出指定 commit
+    if [[ -d "$SKYNET_DIR" ]]; then
+        log "src/skynet 存在但非有效 git 仓库，清理后重新 clone"
+        rm -rf "$SKYNET_DIR"
+    fi
+    log "git clone: $SKYNET_REPO @ $SKYNET_COMMIT"
+    rm -rf "$SKYNET_DIR"
+    git clone "$SKYNET_REPO" "$SKYNET_DIR" \
+        && git -C "$SKYNET_DIR" checkout --detach "$SKYNET_COMMIT"
+    log "完成: src/skynet @ ${SKYNET_COMMIT:0:12}"
 fi
 
 log "全部依赖下载完成"

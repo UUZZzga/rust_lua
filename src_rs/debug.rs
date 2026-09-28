@@ -25,10 +25,24 @@ use crate::vm::{to_integer_ns, F2IMode};
 ///
 /// Rust 版本: 由于使用 Result 错误处理，此函数仅记录错误消息。
 /// 实际错误通过 Result 返回给调用者。
-pub fn runerror(_state: &mut LuaState, _msg: &str, _args: &[&TValue]) {
-    // 体积优先: 禁用 eprintln! 避免 stdio::stderr → write_fmt → StringError → Unicode 表
-    #[cfg(not(size_optimized))]
-    eprintln!("lua runtime error: {}", _msg);
+pub fn runerror(_state: &mut LuaState, msg: &str, _args: &[&TValue]) {
+    // TODO
+    unsafe {
+        let msg = b"lua runtime error: ";
+        libc::write(
+            libc::STDERR_FILENO,
+            msg.as_ptr() as *const _,
+            msg.len() as u32,
+        );
+    }
+    unsafe {
+        libc::write(
+            libc::STDERR_FILENO,
+            msg.as_ptr() as *const _,
+            msg.len() as u32,
+        );
+        libc::write(libc::STDERR_FILENO, b"\n".as_ptr() as *const _, 1);
+    }
 }
 
 /// 字符串拼接错误 — 对应 C 的 luaG_concaterror

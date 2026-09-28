@@ -1,6 +1,7 @@
 use crate::debug::runerror;
 use crate::execute::{VmError, VmExecutor, VmResult};
 use crate::gc::{GCObjectHeader, GCState};
+use crate::helper::JmpBuf;
 use crate::objects::FxBuildHasher;
 use crate::objects::{
     BuiltinFn, BuiltinFnPtr, Instruction, LClosure, LuaThread, LuaType, NilKind, Proto, TValue,
@@ -486,7 +487,7 @@ pub struct LuaState<'a> {
     /// C 函数错误处理，替代 catch_unwind。
     /// 每个元素指向调用方栈上的 [u8; 512] 缓冲区 (>= sizeof(jmp_buf))。
     /// 仅在 lua_use_longjmp 模式下使用 (size_optimized 自动启用, 或 --features lua_longjmp)。
-    pub error_jmp_bufs: Vec<*mut u8>,
+    pub error_jmp_bufs: Vec<*mut core::ffi::c_void>,
 
     /// 输入输出缓冲区 — 用于模拟标准输入输出
     pub io: &'a mut dyn crate::mock::io_mock::Io,
@@ -2866,7 +2867,7 @@ impl<'a> LuaState<'a> {
             {
                 // lua_use_longjmp 模式: 用 setjmp/longjmp 替代 catch_unwind
                 // jmp_buf 分配在 Rust 栈上，指针压入 error_jmp_bufs 供 do_lua_error 取用
-                let mut jmp_buf: [u8; 512] = [0; 512]; // >= sizeof(jmp_buf) on all platforms
+                let mut jmp_buf = JmpBuf::default();
                 self.error_jmp_bufs.push(jmp_buf.as_mut_ptr());
                 let result = unsafe {
                     lua_rs_pcall_c(

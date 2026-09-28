@@ -218,8 +218,6 @@ fn tolstring<'a>(state: &'a mut LuaState, idx: c_int) -> Option<&'a str> {
         } else {
             return None;
         }
-    } else {
-        return None;
     }
 
     // 返回 NUL 结尾的 C 字符串指针（LuaString 内部已保证末尾有 NUL）
@@ -367,7 +365,7 @@ pub extern "C" fn lua_newthread(L: *mut lua_State) -> *mut lua_State {
 /// lua_closethread: 关闭线程（coroutine）。
 ///
 /// Lua 5.5 标准 C API。关闭 thread 中的 TBC 变量并重置状态。
-/// 简化实现为空操作，返回 LUA_OK（0）。
+/// TODO 简化实现为空操作，返回 LUA_OK（0）。
 #[no_mangle]
 pub extern "C" fn lua_closethread(_L: *mut lua_State, _from: *mut lua_State) -> c_int {
     0 // LUA_OK
@@ -376,6 +374,10 @@ pub extern "C" fn lua_closethread(_L: *mut lua_State, _from: *mut lua_State) -> 
 /// luaL_newstate —— 兼容 lauxlib.h
 #[no_mangle]
 pub extern "C" fn luaL_newstate() -> *mut lua_State {
+    unsafe {
+        let msg = b"[rust] luaL_newstate reached\n";
+        libc::write(2, msg.as_ptr() as *const _, msg.len() as u32);
+    }
     lua_newstate(
         ptr::null_mut(),
         ptr::null_mut(),
@@ -1215,7 +1217,7 @@ pub struct luaL_Reg {
 ///
 /// C 版本检查 LUA_VERSION_NUM 和 LUAL_NUMSIZES，不匹配则 luaL_error。
 #[no_mangle]
-pub extern "C" fn luaL_checkversion_(L: *mut lua_State, ver: lua_Number, sz: usize) {
+pub extern "C-unwind" fn luaL_checkversion_(L: *mut lua_State, ver: lua_Number, sz: usize) {
     let v = lua_version(L);
     // check numeric types
     let l = unsafe { L.as_mut() };
@@ -1364,7 +1366,7 @@ pub extern "C" fn luaL_unref(L: *mut lua_State, _t: c_int, ref_: c_int) {
 }
 
 #[no_mangle]
-pub extern "C" fn luaL_checkoption(
+pub extern "C-unwind" fn luaL_checkoption(
     L: *mut lua_State,
     arg: c_int,
     def: *const c_char,
@@ -1389,15 +1391,20 @@ pub extern "C" fn luaL_checkoption(
         if lst.is_null() {
             break;
         }
-        let s = unsafe { *lst } as *const c_char;
+        let s = unsafe { *lst.add(i as usize) } as *const c_char;
+        if s.is_null() {
+            break;
+        }
         let s = &unsafe { CStr::from_ptr(s) }.to_string_lossy();
         if s == name {
             return i;
         }
         i += 1;
     }
-    let name = name.to_string();
-    let str = crate::strings::new_lstr(&L.string_table, &format!("invalid option '{}'", name));
+    let str = {
+        let name = name.to_string();
+        crate::strings::new_lstr(&L.string_table, &format!("invalid option '{}'", name))
+    };
     return luaL_argerror(L, arg, lua_string_as_c_str_ptr(&str));
 }
 
@@ -1469,12 +1476,21 @@ unsafe fn do_lua_error(L: *mut lua_State) -> ! {
     #[cfg(lua_use_longjmp)]
     {
         // lua_use_longjmp 模式: 用 longjmp 替代 panic 跳回最近的 setjmp
-        let buf = L
-            .error_jmp_bufs
-            .last()
-            .copied()
-            .expect("lua_error without jmp_buf");
-        crate::state::lua_rs_longjmp(buf as *mut std::ffi::c_void);
+        let Some(&buf) = L.error_jmp_bufs.last() else {
+            // 栈空: 顶层错误, 打印后 exit (对齐 C Lua 行为)
+            let msg = L.exec.stack.last().unwrap().to_string();
+            unsafe {
+                libc::write(libc::STDOUT_FILENO, b"lua ".as_ptr() as *const _, 4);
+                libc::write(
+                    libc::STDOUT_FILENO,
+                    msg.as_ptr() as *const _,
+                    msg.len() as u32,
+                );
+                libc::write(libc::STDOUT_FILENO, b"\n".as_ptr() as *const _, 1);
+            }
+            std::process::exit(1);
+        };
+        unsafe { crate::state::lua_rs_longjmp(buf as *mut std::ffi::c_void) };
     }
 }
 
@@ -2193,7 +2209,7 @@ unsafe extern "C" fn panic_noop(_L: *mut c_void) -> c_int {
 
 #[no_mangle]
 pub extern "C" fn lua_atpanic(_L: *mut lua_State, _panicf: lua_CFunction) -> lua_CFunction {
-    // 简化实现：不存储 panic 处理器，总是返回静态的 no-op 函数
+    // TODO 简化实现：不存储 panic 处理器，总是返回静态的 no-op 函数
     // 这确保 C 模块尝试调用/比较返回的 panic 处理器时不会遇到 null 指针
     default_panic_handler
 }
@@ -2493,7 +2509,7 @@ pub extern "C" fn lua_load(
 /// lua_setwarnf: 设置警告回调（简化实现：忽略）
 #[no_mangle]
 pub extern "C" fn lua_setwarnf(_L: *mut lua_State, _f: lua_WarnFunction, _ud: *mut c_void) {
-    // 简化实现：不存储警告回调
+    // TODO 简化实现：不存储警告回调
 }
 
 /// lua_numbertocstring: 将数字转换为字符串并写入缓冲
@@ -2522,13 +2538,13 @@ pub extern "C" fn lua_numbertocstring(L: *mut lua_State, idx: c_int, buff: *mut 
 /// lua_toclose: 标记栈上值在离开作用域时关闭（简化实现：忽略）
 #[no_mangle]
 pub extern "C" fn lua_toclose(_L: *mut lua_State, _idx: c_int) {
-    // 简化实现：不支持 to-close 变量
+    // TODO 简化实现：不支持 to-close 变量
 }
 
 /// lua_closeslot: 关闭 to-close 槽（简化实现：忽略）
 #[no_mangle]
 pub extern "C" fn lua_closeslot(_L: *mut lua_State, _idx: c_int) {
-    // 简化实现
+    // TODO 简化实现
 }
 
 /// lua_topointer: 返回值的内部指针
@@ -2938,7 +2954,8 @@ pub extern "C" fn luaL_newmetatable(L: *mut lua_State, tname: *const c_char) -> 
     let table = Table::with_capacity(0, 2);
     let name_key = L.intern_str("__name");
     table.set(name_key, tname.clone());
-    L.registry.set(tname, TValue::Table(table));
+    L.registry.set(tname, TValue::Table(table.clone()));
+    L.push_value(TValue::Table(table));
     1
 }
 
@@ -3628,7 +3645,11 @@ pub extern "C" fn luaL_getmetafield(L: *mut lua_State, obj: c_int, event: *const
 /// 否则按类型转换：number→数字字符串，string→副本，boolean→"true"/"false"，
 /// nil→"nil"，其他→"type: 0xptr"。
 #[no_mangle]
-pub extern "C" fn luaL_tolstring(L: *mut lua_State, idx: c_int, len: *mut usize) -> *const c_char {
+pub extern "C-unwind" fn luaL_tolstring(
+    L: *mut lua_State,
+    idx: c_int,
+    len: *mut usize,
+) -> *const c_char {
     let absidx = lua_absindex(L, idx);
     // 尝试 __tostring 元方法（对应 C 的 luaL_callmeta）
     if luaL_getmetafield(L, absidx, c"__tostring".as_ptr()) != LUA_TNIL {
@@ -4040,7 +4061,7 @@ pub extern "C" fn lua_resume(
     nargs: c_int,
     nres: *mut c_int,
 ) -> c_int {
-    LUA_ERRRUN
+    LUA_ERRRUN // TODO
 }
 
 /// lua_yieldk: 让出当前 coroutine。
@@ -4430,6 +4451,7 @@ pub extern "C" fn luaL_loadfilex_(
 /// skynet sharetable: 将 shared table 推到栈顶 (跨 LuaState 共享引用).
 /// lua-rs 未实现跨 LuaState 共享 Table, stub 推 nil.
 /// 调用方: lua-sharetable.c (matrix_from_file 等共享 table 路径).
+/// TODO
 #[cfg(feature = "skynet")]
 #[no_mangle]
 pub extern "C" fn lua_clonetable(L: *mut lua_State, _t: *const c_void) {
@@ -4443,7 +4465,7 @@ pub extern "C" fn lua_clonetable(L: *mut lua_State, _t: *const c_void) {
 #[cfg(feature = "skynet")]
 #[no_mangle]
 pub extern "C" fn lua_sharefunction(_L: *mut lua_State, _index: c_int) {
-    // stub: 不做任何操作. 调用方期望 function 被标记为 shared,
+    // TODO stub: 不做任何操作. 调用方期望 function 被标记为 shared,
     // 但 lua-rs 无共享机制, 后续 lua_clonetable 会推 nil, 调用方应处理 nil 情况.
 }
 
@@ -4453,7 +4475,7 @@ pub extern "C" fn lua_sharefunction(_L: *mut lua_State, _index: c_int) {
 #[cfg(feature = "skynet")]
 #[no_mangle]
 pub extern "C" fn lua_sharestring(_L: *mut lua_State, _index: c_int) {
-    // stub: 不做任何操作.
+    // TODO stub: 不做任何操作.
 }
 
 // ============================================================================

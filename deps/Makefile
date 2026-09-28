@@ -44,18 +44,59 @@ DEPS_BUILD   := $(CURDIR)/build
 DEPS_LIB     := $(CURDIR)/lib/lua/5.5
 
 CC       := gcc
-CFLAGS   := -O2 -fPIC -fexceptions -Wall -Wextra -I$(LUA_INCLUDE)
+CFLAGS   := $(BASE_CFLAGS) -fPIC -fexceptions -Wall -Wextra -I$(LUA_INCLUDE)
+# C++ 编译器用于 sol2 smoke test
+CXX      := g++
+CXXFLAGS := $(BASE_CFLAGS) -std=c++17 -I$(LUA_INCLUDE)
+
 LDFLAGS  := -shared
 LDLIBS   := -lm
 
-ifeq ($(PLATFORM),MINGW)
-	CFLAGS := $(CFLAGS) -DLUA_BUILD_AS_DLL -DLUA_LIB
-	LDLIBS := $(LDLIBS) -lws2_32 -lNtosKrnl -lntdll -luserenv
-else ifeq ($(PLATFORM),MSYS)
+USE_DEBUG ?= 0
+BASE_CFLAGS :=
+TARGET_PATH :=
+EXE_EXT :=
+
+ifeq ($(USE_DEBUG),1)
+	BASE_CFLAGS := -g
+	TARGET_PATH := $(PROJECT_ROOT)/target/debug
+else
+	BASE_CFLAGS := -O2
+	TARGET_PATH := $(PROJECT_ROOT)/target/release
+endif
+
+# Rust lua 静态库（由 cargo build --release 生成）
+LUA_RS_LIB := $(TARGET_PATH)/liblua_rs.a
+LUA_RS_STATIC_LIB := $(TARGET_PATH)/liblua_rs.a
+
+ifneq (,$(filter MINGW MSYS CYGWIN,$(PLATFORM)))
+	EXE_EXT :=.exe
 	CFLAGS := $(CFLAGS) -DLUA_BUILD_AS_DLL -DLUA_LIB
 	LDLIBS := $(LDLIBS) -lws2_32 -lNtosKrnl -lntdll -luserenv
 else ifeq ($(PLATFORM),LINUX)
 	LDLIBS := $(LDLIBS) -ldl -lpthread
+endif
+
+ifneq (,$(filter MINGW MSYS CYGWIN,$(PLATFORM)))
+DLLTOOL  := dlltool
+NM       := nm
+
+LUA_EXE  := $(TARGET_PATH)/lua.exe
+DEF_RAW  := $(TARGET_PATH)/lua_exe.def
+DEF_FILT := $(TARGET_PATH)/lua_exe_filtered.def
+LUA_RS_LIB := $(TARGET_PATH)/liblua_exe.a
+
+# 1. 从 lua.exe 提取导出表 -> 原始 def
+$(DEF_RAW): $(LUA_EXE)
+	$(DLLTOOL) --export-all-symbols $< -z $@
+
+# 2. 只保留 EXPORTS 行与 lua_ 前缀符号
+$(DEF_FILT): $(DEF_RAW)
+	sed -n -E '/^EXPORTS$$/p; /^[[:space:]]+lua/p' $< > $@
+
+# 3. def -> 导入库（lua.exe 名字会被硬编码进导入表）
+$(LUA_RS_LIB): $(DEF_FILT)
+	$(DLLTOOL) -d $< -l $@ -D lua.exe
 endif
 
 
@@ -85,7 +126,7 @@ CJSON_OBJS := $(DEPS_BUILD)/lua_cjson.o $(DEPS_BUILD)/strbuf.o $(DEPS_BUILD)/fpc
 
 $(DEPS_BUILD)/lua_cjson.o: $(CJSON_SRC)/lua_cjson.c
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -c $< -o $@ -D_MSC_VER
 
 $(DEPS_BUILD)/strbuf.o: $(CJSON_SRC)/strbuf.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -93,9 +134,9 @@ $(DEPS_BUILD)/strbuf.o: $(CJSON_SRC)/strbuf.c
 $(DEPS_BUILD)/fpconv.o: $(CJSON_SRC)/fpconv.c
 	$(CC) $(CFLAGS) -c $< -o $@
 
-$(CJSON_TARGET): $(CJSON_OBJS)
+$(CJSON_TARGET): $(CJSON_OBJS) $(LUA_RS_LIB)
 	@mkdir -p $(@D)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LUA_RS_LIB) $(LDLIBS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 cjson: $(CJSON_TARGET)
 
@@ -114,7 +155,6 @@ SOCKET_OBJS := \
 	$(DEPS_BUILD)/except.o \
 	$(DEPS_BUILD)/inet.o \
 	$(DEPS_BUILD)/io.o \
-	$(DEPS_BUILD)/luasocket.o \
 	$(DEPS_BUILD)/options.o \
 	$(DEPS_BUILD)/select.o \
 	$(DEPS_BUILD)/tcp.o \
@@ -123,23 +163,28 @@ SOCKET_OBJS := \
 	$(DEPS_BUILD)/$(SOCK_OBJ) \
 	$(DEPS_BUILD)/compat.o
 
-SOCKET_CFLAGS := $(CFLAGS) -DLUASOCKET_API=extern
+SOCKET_CFLAGS := $(CFLAGS)
+
+ifeq ($(PLATFORM),LINUS)
+	SOCKET_CFLAGS := $(CFLAGS) -DLUASOCKET_API=extern
+endif
+
 
 $(DEPS_BUILD)/%.o: $(LUASOCKET_SRC)/%.c
 	@mkdir -p $(@D)
 	$(CC) $(SOCKET_CFLAGS) -c $< -o $@
 
-$(SOCKET_CORE_TARGET): $(SOCKET_OBJS)
+$(SOCKET_CORE_TARGET): $(SOCKET_OBJS) $(LUA_RS_LIB)
 	@mkdir -p $(@D)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LUA_RS_LIB) $(LDLIBS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 $(DEPS_BUILD)/mime.o: $(LUASOCKET_SRC)/mime.c
 	@mkdir -p $(@D)
 	$(CC) $(SOCKET_CFLAGS) -c $< -o $@
 
-$(MIME_TARGET): $(DEPS_BUILD)/mime.o
+$(MIME_TARGET): $(DEPS_BUILD)/mime.o $(LUA_RS_LIB)
 	@mkdir -p $(@D)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LUA_RS_LIB) $(LDLIBS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 luasocket: $(SOCKET_CORE_TARGET) $(MIME_TARGET)
 	@mkdir -p $(DEPS_LIB)
@@ -170,15 +215,15 @@ LSQLITE3_CFLAGS := $(CFLAGS) -I$(SQLITE3_INC) -DLSQLITE3_AMALGAMATION \
 
 $(DEPS_BUILD)/sqlite3.o: $(SQLITE3_SRC)/sqlite3.c $(SQLITE3_SRC)/sqlite3.h
 	@mkdir -p $(@D)
-	$(CC) -O2 -fPIC -c $< -o $@
+	$(CC) $(CFLAGS) -fPIC -c $< -o $@
 
 $(DEPS_BUILD)/lsqlite3.o: $(DEPS_SRC)/lsqlite3/lsqlite3.c
 	@mkdir -p $(@D)
 	$(CC) $(LSQLITE3_CFLAGS) -c $< -o $@
 
-$(LSQLITE3_TARGET): $(DEPS_BUILD)/lsqlite3.o $(DEPS_BUILD)/sqlite3.o
+$(LSQLITE3_TARGET): $(DEPS_BUILD)/lsqlite3.o $(DEPS_BUILD)/sqlite3.o $(LUA_RS_LIB)
 	@mkdir -p $(@D)
-	$(CC) $(LDFLAGS) -o $@ $^ $(LUA_RS_LIB) $(LDLIBS)
+	$(CC) $(LDFLAGS) -o $@ $^ $(LDLIBS)
 
 lsqlite3: $(LSQLITE3_TARGET)
 ALL_TARGETS += $(LSQLITE3_TARGET)
@@ -190,20 +235,15 @@ endif
 # sol2 是 header-only 库，无需单独构建 .so；测试目标编译一个最小 C++ 程序
 # 链接 Rust lua 静态库 (target/release/liblua_rs.a) 验证 sol2 与 Rust lua 兼容。
 SOL2_INCLUDE := $(DEPS_SRC)/sol2/include
-SOL2_SMOKETEST := $(DEPS_BUILD)/sol2_smoke
-# Rust lua 静态库（由 cargo build --release 生成）
-LUA_RS_LIB := $(PROJECT_ROOT)/target/release/liblua_rs.a
-
-# C++ 编译器用于 sol2 smoke test
-CXX      := g++
-CXXFLAGS := -O2 -std=c++17 -I$(LUA_INCLUDE) -I$(SOL2_INCLUDE)
+SOL2_SMOKETEST := $(DEPS_BUILD)/sol2_smoke$(EXE_EXT)
+SOL2_CXXFLAGS := $(CXXFLAGS) -I$(SOL2_INCLUDE)
 
 # 源码在 deps 目录下（提交进 git 的最小测试程序）
 SOL2_SMOKETEST_SRC := $(CURDIR)/sol2_smoke.cpp
 
-$(SOL2_SMOKETEST): $(SOL2_SMOKETEST_SRC) $(LUA_INCLUDE)/lua.hpp $(LUA_INCLUDE)/lua.h
+$(SOL2_SMOKETEST): $(SOL2_SMOKETEST_SRC) $(LUA_RS_STATIC_LIB)
 	@mkdir -p $(@D)
-	$(CXX) $(CXXFLAGS) $< -o $@ $(LUA_RS_LIB) $(LDLIBS)
+	$(CXX) $(SOL2_CXXFLAGS) $^ -o $@ $(LDLIBS)
 
 sol2: $(SOL2_SMOKETEST)
 	@echo "=== sol2 smoke test built: $< ==="
@@ -242,12 +282,12 @@ else ifeq ($(PLATFORM),MSYS)
                         -DCLOCK_MONOTONIC=1 -DCLOCK_THREAD_CPUTIME_ID=3
 endif
 
-skynet: $(LUA_RS_LIB)
+skynet: $(LUA_RS_STATIC_LIB)
 	@echo "=== Building skynet with lua-rs ==="
 	# LUA_RUST_COMPAT: 跳过 coroutine.resume/wrap 替换 (lua-rs 的 lua_resume 与 skynet timing_resume 不兼容)
 	cd $(SKYNET_SRC) && $(MAKE) $(PLATFORM_LC) \
 		$(SKYNET_MINGW_CC_ARGS) \
-		LUA_LIB=$(LUA_RS_LIB) \
+		LUA_LIB=$(LUA_RS_STATIC_LIB) \
 		LUA_INC=$(LUA_INCLUDE) \
 		MALLOC_STATICLIB="" \
 		MYCFLAGS="-DLUA_RUST_COMPAT $(SKYNET_MINGW_EXTRA_CFLAGS)" \

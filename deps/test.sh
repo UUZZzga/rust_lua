@@ -89,10 +89,10 @@ case "$PLATFORM" in
 esac
 
 case "$PLATFORM" in
-    *WINDOWS*) DEPS_LIB=$(cygpath -w -m "$DEPS_LIB") SCRIPT_DIR=$(cygpath -w -m "$SCRIPT_DIR") ;;
-    *CYGWIN*)  DEPS_LIB=$(cygpath -w -m "$DEPS_LIB") SCRIPT_DIR=$(cygpath -w -m "$SCRIPT_DIR") ;;
-    *MINGW*)   DEPS_LIB=$(cygpath -w -m "$DEPS_LIB") SCRIPT_DIR=$(cygpath -w -m "$SCRIPT_DIR") ;;
-    *MSYS*)    DEPS_LIB=$(cygpath -w -m "$DEPS_LIB") SCRIPT_DIR=$(cygpath -w -m "$SCRIPT_DIR") ;;
+    *WINDOWS*) PROJECT_ROOT=$(cygpath -w -m "$PROJECT_ROOT") DEPS_LIB=$(cygpath -w -m "$DEPS_LIB") SCRIPT_DIR=$(cygpath -w -m "$SCRIPT_DIR") ;;
+    *CYGWIN*)  PROJECT_ROOT=$(cygpath -w -m "$PROJECT_ROOT") DEPS_LIB=$(cygpath -w -m "$DEPS_LIB") SCRIPT_DIR=$(cygpath -w -m "$SCRIPT_DIR") ;;
+    *MINGW*)   PROJECT_ROOT=$(cygpath -w -m "$PROJECT_ROOT") DEPS_LIB=$(cygpath -w -m "$DEPS_LIB") SCRIPT_DIR=$(cygpath -w -m "$SCRIPT_DIR") ;;
+    *MSYS*)    PROJECT_ROOT=$(cygpath -w -m "$PROJECT_ROOT") DEPS_LIB=$(cygpath -w -m "$DEPS_LIB") SCRIPT_DIR=$(cygpath -w -m "$SCRIPT_DIR") ;;
 esac
 
 export LUA_CPATH="$DEPS_LIB/?$DLL_SUFFIX;$DEPS_LIB/?/core$DLL_SUFFIX;;"
@@ -278,7 +278,7 @@ include "config.path"
 thread = 2
 harbor = 0
 bootstrap = "snlua abort"
-cpath = root.."cservice/?$DLL_SUFFIX"
+cpath = root.."cservice/?.so"
 EOF
     log "运行 skynet/abort ..."
     # skynet 启动后会加载 abort.lua 并调用 skynet.abort() 退出
@@ -318,6 +318,12 @@ fi
 # 而 lpeg pattern 编译在 lua-rs 上有 segfault 兼容性问题。
 # 客户端用 C lua 不影响对服务端（lua-rs）的验证，网络协议是跨实现的。
 LUA_C_BIN="$PROJECT_ROOT/build/lua"
+if [[ ! -x "$LUA_C_BIN" ]]; then
+    LUA_C_BIN="$PROJECT_ROOT/build/Release/lua"
+fi
+if [[ ! -x "$LUA_C_BIN" ]]; then
+    LUA_C_BIN="$PROJECT_ROOT/build/Debug/lua"
+fi
 if [[ -x "$SKYNET_BIN" && -x "$LUA_C_BIN" ]]; then
     log "运行 skynet/e2e (完整服务端 + 客户端) ..."
     # 复用 run_skynet_e2e.sh 脚本

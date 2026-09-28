@@ -26,6 +26,22 @@
 #define LUA_RS_NORETURN __attribute__((noreturn))
 #endif
 
+#ifdef __GNUC__
+#define LUA_RS_SETJMP(buf) __builtin_setjmp(buf)
+#define LUA_RS_LONGJMP(buf, val) __builtin_longjmp(buf, val)
+#define LUA_RS_UNREACHABLE() __builtin_unreachable()
+#else
+#ifdef _WIN32
+#define LUA_RS_SETJMP(buf) _setjmp(buf)
+#define LUA_RS_LONGJMP(buf, val) _longjmp(buf, val)
+#define LUA_RS_UNREACHABLE()
+#else
+#define LUA_RS_SETJMP(buf) setjmp(buf)
+#define LUA_RS_LONGJMP(buf, val) longjmp(buf, val)
+#define LUA_RS_UNREACHABLE()
+#endif
+#endif
+
 /* Rust 端 capi.rs 导出的符号 */
 extern const char *lua_pushlstring(void *L, const char *s, size_t len);
 extern const char *lua_pushstring(void *L, const char *s);
@@ -115,15 +131,15 @@ LUA_RS_API double lua_rs_clocks_per_sec(void) {
 #ifdef LUA_USE_LONGJMP
 
 LUA_RS_API int lua_rs_pcall_c(int (*f)(void *), void *L, void *buf) {
-    if (setjmp(*(jmp_buf *)buf) != 0) {
-        return -1;
+    if (LUA_RS_SETJMP(*(jmp_buf *)buf) != 0) {
+      return -1;
     }
     return f(L);
 }
 
 LUA_RS_API LUA_RS_NORETURN void lua_rs_longjmp(void *buf) {
-    longjmp(*(jmp_buf *)buf, 1);
+    LUA_RS_LONGJMP(*(jmp_buf *)buf, 1);
+    LUA_RS_UNREACHABLE();
 }
 
 #endif /* LUA_USE_LONGJMP */
-

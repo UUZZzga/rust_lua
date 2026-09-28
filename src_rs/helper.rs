@@ -1,4 +1,21 @@
-use std::fmt::{self, Write}; // 这里 import 是为了 impl 内部能用 write_str 等方法
+use std::fmt::{self}; // 这里 import 是为了 impl 内部能用 write_str 等方法
+
+#[repr(C, align(16))]
+pub struct JmpBuf {
+    data: [u8; 256],
+}
+
+impl JmpBuf {
+    pub fn as_mut_ptr(&mut self) -> *mut core::ffi::c_void {
+        self.data.as_mut_ptr() as *mut _
+    }
+}
+
+impl Default for JmpBuf {
+    fn default() -> Self {
+        Self { data: [0u8; 256] }
+    }
+}
 
 pub struct SliceWriter<'a> {
     buf: &'a mut [u8],
