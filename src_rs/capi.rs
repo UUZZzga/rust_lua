@@ -374,10 +374,6 @@ pub extern "C" fn lua_closethread(_L: *mut lua_State, _from: *mut lua_State) -> 
 /// luaL_newstate —— 兼容 lauxlib.h
 #[no_mangle]
 pub extern "C" fn luaL_newstate() -> *mut lua_State {
-    unsafe {
-        let msg = b"[rust] luaL_newstate reached\n";
-        libc::write(2, msg.as_ptr() as *const _, msg.len() as u32);
-    }
     lua_newstate(
         ptr::null_mut(),
         ptr::null_mut(),
@@ -1479,15 +1475,9 @@ unsafe fn do_lua_error(L: *mut lua_State) -> ! {
         let Some(&buf) = L.error_jmp_bufs.last() else {
             // 栈空: 顶层错误, 打印后 exit (对齐 C Lua 行为)
             let msg = L.exec.stack.last().unwrap().to_string();
-            unsafe {
-                libc::write(libc::STDOUT_FILENO, b"lua ".as_ptr() as *const _, 4);
-                libc::write(
-                    libc::STDOUT_FILENO,
-                    msg.as_ptr() as *const _,
-                    msg.len() as u32,
-                );
-                libc::write(libc::STDOUT_FILENO, b"\n".as_ptr() as *const _, 1);
-            }
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), b"lua ");
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), msg.as_bytes());
+            let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\n");
             std::process::exit(1);
         };
         unsafe { crate::state::lua_rs_longjmp(buf as *mut std::ffi::c_void) };
