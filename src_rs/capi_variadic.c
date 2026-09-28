@@ -32,8 +32,10 @@
 #define LUA_RS_UNREACHABLE() __builtin_unreachable()
 #else
 #ifdef _WIN32
+/* MSVC: setjmp.h 把 setjmp 映射为 _setjmp, 但 longjmp 声明为 longjmp
+ * (无 _longjmp 符号), 显式 _longjmp 会链接失败 (LNK2019). 用声明名即可. */
 #define LUA_RS_SETJMP(buf) _setjmp(buf)
-#define LUA_RS_LONGJMP(buf, val) _longjmp(buf, val)
+#define LUA_RS_LONGJMP(buf, val) longjmp(buf, val)
 #define LUA_RS_UNREACHABLE()
 #else
 #define LUA_RS_SETJMP(buf) setjmp(buf)
