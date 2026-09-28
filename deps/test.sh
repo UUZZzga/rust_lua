@@ -274,7 +274,7 @@ if [[ -x "$SKYNET_BIN" ]]; then
     # 生成最小 config：单节点模式 (harbor=0)，abort 作为 bootstrap 直接退出
     SKYNET_TEST_CONFIG="$SKYNET_DIR/examples/config.rstest"
     cat > "$SKYNET_TEST_CONFIG" <<'EOF'
-include "config.path"
+include "examples/config.path"
 thread = 2
 harbor = 0
 bootstrap = "snlua abort"

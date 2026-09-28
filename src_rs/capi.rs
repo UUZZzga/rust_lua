@@ -1475,9 +1475,13 @@ unsafe fn do_lua_error(L: *mut lua_State) -> ! {
         let Some(&buf) = L.error_jmp_bufs.last() else {
             // 栈空: 顶层错误, 打印后 exit (对齐 C Lua 行为)
             let msg = L.exec.stack.last().unwrap().to_string();
-            let _ = std::io::Write::write_all(&mut std::io::stdout(), b"lua ");
-            let _ = std::io::Write::write_all(&mut std::io::stdout(), msg.as_bytes());
-            let _ = std::io::Write::write_all(&mut std::io::stdout(), b"\n");
+            // FFI 安全: 同 runerror, staticlib 被 C 主程序链接时 std::io::stdout 不可靠,
+            // 用 libc::write 直写 stdout (fd 字面量 1, count as _ 跨平台).
+            unsafe {
+                libc::write(1, b"lua ".as_ptr() as *const libc::c_void, 4);
+                libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len() as _);
+                libc::write(1, b"\n".as_ptr() as *const libc::c_void, 1);
+            }
             std::process::exit(1);
         };
         unsafe { crate::state::lua_rs_longjmp(buf as *mut std::ffi::c_void) };

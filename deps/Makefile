@@ -86,6 +86,11 @@ DEF_RAW  := $(TARGET_PATH)/lua_exe.def
 DEF_FILT := $(TARGET_PATH)/lua_exe_filtered.def
 LUA_RS_LIB := $(TARGET_PATH)/liblua_exe.a
 
+# lua-cjson 仅 Windows 需要 _MSC_VER 强制 __declspec(dllexport) 导出
+# luaopen_* 符号供 dlopen 加载 (Linux ELF -shared 默认全量导出, 加了反而
+# 在 GCC 上因 __declspec 语法报错, CI #162 实证)。
+CJSON_DEFS := -D_MSC_VER
+
 # 1. 从 lua.exe 提取导出表 -> 原始 def
 $(DEF_RAW): $(LUA_EXE)
 	$(DLLTOOL) --export-all-symbols $< -z $@
@@ -126,7 +131,7 @@ CJSON_OBJS := $(DEPS_BUILD)/lua_cjson.o $(DEPS_BUILD)/strbuf.o $(DEPS_BUILD)/fpc
 
 $(DEPS_BUILD)/lua_cjson.o: $(CJSON_SRC)/lua_cjson.c
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -c $< -o $@ -D_MSC_VER
+	$(CC) $(CFLAGS) -c $< -o $@ $(CJSON_DEFS)
 
 $(DEPS_BUILD)/strbuf.o: $(CJSON_SRC)/strbuf.c
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -165,7 +170,7 @@ SOCKET_OBJS := \
 
 SOCKET_CFLAGS := $(CFLAGS)
 
-ifeq ($(PLATFORM),LINUS)
+ifeq ($(PLATFORM),LINUX)
 	SOCKET_CFLAGS := $(CFLAGS) -DLUASOCKET_API=extern
 endif
 
@@ -282,10 +287,17 @@ else ifeq ($(PLATFORM),MSYS)
                         -DCLOCK_MONOTONIC=1 -DCLOCK_THREAD_CPUTIME_ID=3
 endif
 
+# skynet 的平台目标只有 linux/freebsd/openbsd/macosx/mingw, 没有 msys;
+# MSYS2 的编译器即 MinGW-w64, 归一到 mingw 目标 (mingw.mk)。
+SKYNET_PLAT := $(PLATFORM_LC)
+ifeq ($(PLATFORM),MSYS)
+  SKYNET_PLAT := mingw
+endif
+
 skynet: $(LUA_RS_STATIC_LIB)
 	@echo "=== Building skynet with lua-rs ==="
 	# LUA_RUST_COMPAT: 跳过 coroutine.resume/wrap 替换 (lua-rs 的 lua_resume 与 skynet timing_resume 不兼容)
-	cd $(SKYNET_SRC) && $(MAKE) $(PLATFORM_LC) \
+	cd $(SKYNET_SRC) && $(MAKE) $(SKYNET_PLAT) \
 		$(SKYNET_MINGW_CC_ARGS) \
 		LUA_LIB=$(LUA_RS_STATIC_LIB) \
 		LUA_INC=$(LUA_INCLUDE) \
