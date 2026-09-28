@@ -167,13 +167,19 @@ if [ "$PLATFORM" = "linux" ]; then
         grep '^total time' "$logfile" | sed 's/total time: //'
     }
     C_MAIN=$(run_all_bench "$C_LUA" c)
+    C_ALL_RC=$?
     RS_MAIN=$(run_all_bench "$RS_LUA" rs)
-    if [ -n "$C_MAIN" ] && [ -n "$RS_MAIN" ]; then
-        printf "%-28s %20s %20s\n" "all.lua total time" "C" "Rust"
-        printf "%-28s %20s %20s\n" "耗时 (秒)" "$C_MAIN" "$RS_MAIN"
-    else
-        echo "警告: all.lua 计时未完成 (C='$C_MAIN' Rust='$RS_MAIN'), 跳过对比"
+    RS_ALL_RC=$?
+    # all.lua 是正确性门禁: 任一实现未运行完成 (超时/崩溃/退出码非0/无 total time)
+    # 都说明测试未通过, 整个 bench 步骤必须失败, 而不是跳过对比继续绿。
+    if [ "$C_ALL_RC" -ne 0 ] || [ "$RS_ALL_RC" -ne 0 ] || [ -z "$C_MAIN" ] || [ -z "$RS_MAIN" ]; then
+        echo "错误: all.lua 测试未通过 (C rc=$C_ALL_RC, Rust rc=$RS_ALL_RC)" >&2
+        echo "  all.lua 是正确性门禁: 未运行完成即判定失败, 整个 bench 步骤失败" >&2
+        echo "  完整输出见 logs/ci_bench_all_c.txt 与 logs/ci_bench_all_rs.txt" >&2
+        exit 1
     fi
+    printf "%-28s %20s %20s\n" "all.lua total time" "C" "Rust"
+    printf "%-28s %20s %20s\n" "耗时 (秒)" "$C_MAIN" "$RS_MAIN"
 fi
 echo ""
 echo ">>> 基准完成。结果已保存:"
