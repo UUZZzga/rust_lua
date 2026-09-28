@@ -534,11 +534,11 @@ pub fn modulus(m: i64, n: i64) -> Result<i64, &'static str> {
     if n == -1 {
         return Ok(0);
     }
-    // 快速路径：n 是 2 的幂
+    // 快速路径：n 是 2 的幂。m & (n-1) 直接给出 [0, n-1] 的非负余数,
+    // 对正负 m 都与 Lua 语义 (符号随除数 n>0 → 非负) 一致, 无需再加 n
+    // (旧代码对 m<0 误加 n, 如 -10 % 4 返回 6 而非 2)。
     if n > 0 && (n & (n - 1)) == 0 {
-        let mask = n - 1;
-        let r = m & mask;
-        return Ok(if r != 0 && m < 0 { r + n } else { r });
+        return Ok(m & (n - 1));
     }
 
     let r = m.wrapping_rem(n); // 提示编译器这是纯整数取模
@@ -1933,6 +1933,18 @@ mod tests {
     #[test]
     fn test_mod_negative_operands() {
         assert_eq!(modulus(-5, -3).unwrap(), -2);
+    }
+
+    #[test]
+    fn test_mod_power_of_two_negative() {
+        // 回归: 2 的幂快速路径对负 m 曾误加 n (-10 % 4 = 6)。
+        // m & (n-1) 已给出正确非负余数。
+        assert_eq!(modulus(-10, 4).unwrap(), 2);
+        assert_eq!(modulus(-9, 8).unwrap(), 7);
+        assert_eq!(modulus(-7, 2).unwrap(), 1);
+        assert_eq!(modulus(-1, 4).unwrap(), 3);
+        assert_eq!(modulus(-16, 8).unwrap(), 0); // 整除
+        assert_eq!(modulus(10, 4).unwrap(), 2); // 正 m
     }
 
     #[test]
