@@ -1127,7 +1127,9 @@ impl VmExecutor {
             //  合并后热路径只测试栈局部值, state.exec.hook_mask 的 load 延迟到冷块。)
             // 注意: 必须每指令读 state.exec.hook_mask — VARARGPREP 的 call hook 内可
             // sethook 安装 line hook (db.lua:491 场景), 缓存字节会错过新 mask。
-            #[cfg(debug_assertions)]
+            // 不能 #[cfg(debug_assertions)] 裁掉本检查: release 构建也必须支持
+            // line/count hook (db.lua 在 all.lua 正确性门禁内), 否则 release 下
+            // debug.sethook("l"/"c") 静默失效。C 的 luaG_traceexec 同样每指令判读。
             if trace_level | (state.exec.hook_mask & (4 | 8)) as u8 != 0 && op != OpCode::VARARGPREP
             {
                 state.exec.pc = pc - 1; // sync: 行 hook/trace 需要 state.exec.pc = 当前指令 (C savepc)
