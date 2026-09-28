@@ -272,7 +272,12 @@ SKYNET_DIR="$SCRIPT_DIR/src/skynet"
 SKYNET_BIN="$SKYNET_DIR/skynet"
 if [[ -x "$SKYNET_BIN" ]]; then
     # 生成最小 config：单节点模式 (harbor=0)，abort 作为 bootstrap 直接退出
-    SKYNET_TEST_CONFIG="$SKYNET_DIR/examples/config.rstest"
+    # config 放 skynet 根目录并以无目录形式传入 (config.rstest):
+    # skynet 的 config include 按平台分隔符解析相对路径 (sep=/ 或 \),
+    # 若传入 examples/config.rstest, Linux 会把 current_path 置为 ./examples/
+    # 导致 include "examples/config.path" 双前缀; 根目录传入则 current_path
+    # 两边都保持 ./ , include 相对 examples/ 正确解析。
+    SKYNET_TEST_CONFIG="$SKYNET_DIR/config.rstest"
     cat > "$SKYNET_TEST_CONFIG" <<'EOF'
 include "examples/config.path"
 thread = 2
@@ -283,7 +288,7 @@ EOF
     log "运行 skynet/abort ..."
     # skynet 启动后会加载 abort.lua 并调用 skynet.abort() 退出
     # 用 timeout 30 作为兜底（正常应在 3s 内退出）
-    ( cd "$SKYNET_DIR" && timeout 30 ./skynet examples/config.rstest ) >"$SCRIPT_DIR/.test_$$.log" 2>&1
+    ( cd "$SKYNET_DIR" && timeout 30 ./skynet config.rstest ) >"$SCRIPT_DIR/.test_$$.log" 2>&1
     rc=$?
     if [[ $rc -eq 0 ]]; then
         ok "skynet/abort"
