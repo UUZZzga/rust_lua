@@ -12,7 +12,7 @@
 //! ## 规约驱动开发 (spec-driven-tdd)
 //! 每个公开函数都包含规约注释。
 
-use crate::gc::GCState;
+#[cfg(lua_use_longjmp)]
 use crate::helper::JmpBuf;
 use crate::objects::{
     CallFrame, Instruction, LClosure, LuaType, NilKind, Proto, TValue, UpVal, UpValVec, PF_VAHID,
@@ -1050,12 +1050,15 @@ impl VmExecutor {
         // 调试跟踪：通过环境变量 LUA_VM_TRACE=1 启用
         // LUA_VM_TRACE=2 时额外打印完整栈内容
         // perf: 用 OnceLock 缓存,避免每次 execute_loop 都调用 getenv (1.28% → ~0%)
+        #[cfg(debug_assertions)]
         let trace_level: u8 = *LUA_VM_TRACE_LEVEL.get_or_init(|| {
             std::env::var("LUA_VM_TRACE")
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0)
         });
+        #[cfg(not(debug_assertions))]
+        let trace_level = 0;
 
         // perf: 中断检查 — 不再按指令摊销。信号中断 (SIGINT → laction 设置
         // INTERRUPTED) 的观测点移至所有向后跳转处 (JMP 回跳 / FORLOOP 继续 /
@@ -1072,7 +1075,6 @@ impl VmExecutor {
         // 恢复) 显式 reload; 直线指令段内 state.exec.code 保证不变 — code Rc 全树
         // 写点均为整体替换且伴随帧切换 (#136 审计)。
         let mut code_ptr: *const Instruction = state.exec.code.as_ptr();
-        let mut code_len: usize = state.exec.code.len();
         // perf: constants Vec 数据指针缓存 — K 常量指令 (ADDK/MULK/MODK/GETFIELD/
         // GETTABUP 等) 原每指令 Rc→Vec 双 deref 取常量。与 code_ptr 同点刷新
         // (帧切换 9 点), 帧内 constants Vec 不被整体替换 (与 code 相同的 Rc 写点
@@ -1092,24 +1094,25 @@ impl VmExecutor {
         //             code_ptr/code_len 从 state.exec.code 重载。
         let mut pc: usize = state.exec.pc;
 
+        assert!(match state
+            .exec
+            .code
+            .last()
+            .map(|i: &u32| opcodes::get_opcode(*i))
+        {
+            Some(OpCode::RETURN) => true,
+            Some(OpCode::RETURN0) => true,
+            Some(OpCode::RETURN1) => true,
+            _ => false,
+        });
+
         loop {
-            // SAFETY: code_ptr 指向当前帧 state.exec.code 的 Vec 数据区; 直线指令段内
-            // state.exec.code 不被替换 (见上方缓存 v2 注释)。pc < code_len 已检查。
-            if pc >= code_len {
-                // 直线段兜底中断检查 (无回跳长直线段至此必经; 每函数末尾 RETURN
-                // 之外的最后防线, 64 次摊销)
-                Self::tick_check_interrupted(state, pc)?;
-                state.exec.pc = pc; // sync 供 handle_pc_overflow 弹帧
-                if let Some(ret) = Self::handle_pc_overflow(state)? {
-                    return Ok(ret);
-                }
-                pc = state.exec.pc; // 帧可能已切换, 重载
-                code_ptr = state.exec.code.as_ptr();
-                constants_ptr = state.exec.constants.as_ptr();
-                code_len = state.exec.code.len();
-                constants_len = state.exec.constants.len();
-                continue;
-            }
+            // 越界防御: 仅 debug 生效。release 下依赖编译器保证字节码末尾必有
+            // RETURN/RETURN0/RETURN1 (close_func 必然 return_stat_gen), 与 C 的
+            // luaV_execute 一致 — C 无每指令边界检查, pc 越界是损坏字节码的 UB。
+            // 顶部 assert!(code.last() 是 RETURN) 提供 release 下的损坏字节码防线。
+            debug_assert!(pc < state.exec.code.len());
+
             // perf: constants 缓存切片 — 由常量指针构建, LLVM 可将其 ptr+len
             // 驻留寄存器传递给内联 K-handler (原 state.exec.constants 每指令双 deref)
             let constants_slice: &[TValue] =
@@ -1126,17 +1129,20 @@ impl VmExecutor {
             // (trace_level 是 OnceLock 缓存的栈局部值, hook_mask 是 state 字段,
             //  合并后热路径只测试栈局部值, state.exec.hook_mask 的 load 延迟到冷块。)
             // 注意: 必须每指令读 state.exec.hook_mask — VARARGPREP 的 call hook 内可
-            // sethook 安装 line hook (db.lua:491 场景), 缓存字节会错过新 mask。
+            // sethook 安装 line hook (db.lua:491 场景), 缓存字节会错过新 mask
+            // (#147: CI #91→#92 实证, 本优化不可缓存 trap 位)。
             // 不能 #[cfg(debug_assertions)] 裁掉本检查: release 构建也必须支持
             // line/count hook (db.lua 在 all.lua 正确性门禁内), 否则 release 下
             // debug.sethook("l"/"c") 静默失效。C 的 luaG_traceexec 同样每指令判读。
             if trace_level | (state.exec.hook_mask & (4 | 8)) as u8 != 0 && op != OpCode::VARARGPREP
             {
+                core::hint::cold_path();
                 state.exec.pc = pc - 1; // sync: 行 hook/trace 需要 state.exec.pc = 当前指令 (C savepc)
                                         // 对应 C 的 luaG_traceexec: count hook + line hook
                 if state.exec.hook_mask & (4 | 8) != 0 {
                     Self::traceexec_hooks(state)?;
                 }
+                #[cfg(debug_assertions)]
                 if trace_level >= 1 {
                     Self::trace_exec(state, trace_level);
                 }
@@ -1209,7 +1215,6 @@ impl VmExecutor {
                             pc = state.exec.pc;
                             code_ptr = state.exec.code.as_ptr();
                             constants_ptr = state.exec.constants.as_ptr();
-                            code_len = state.exec.code.len();
                             constants_len = state.exec.constants.len();
                             Ok(())
                         }
@@ -1222,7 +1227,6 @@ impl VmExecutor {
                     pc = state.exec.pc;
                     code_ptr = state.exec.code.as_ptr();
                     constants_ptr = state.exec.constants.as_ptr();
-                    code_len = state.exec.code.len();
                     constants_len = state.exec.constants.len();
                     r
                 }
@@ -1232,8 +1236,8 @@ impl VmExecutor {
                     pc = state.exec.pc;
                     code_ptr = state.exec.code.as_ptr();
                     constants_ptr = state.exec.constants.as_ptr();
-                    code_len = state.exec.code.len();
                     constants_len = state.exec.constants.len();
+                    Self::tick_check_interrupted(state, pc)?;
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
                         Ok(None) => Ok(()),
@@ -1247,8 +1251,8 @@ impl VmExecutor {
                     pc = state.exec.pc;
                     code_ptr = state.exec.code.as_ptr();
                     constants_ptr = state.exec.constants.as_ptr();
-                    code_len = state.exec.code.len();
                     constants_len = state.exec.constants.len();
+                    Self::tick_check_interrupted(state, pc)?;
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
                         Ok(None) => Ok(()),
@@ -1262,8 +1266,8 @@ impl VmExecutor {
                     pc = state.exec.pc;
                     code_ptr = state.exec.code.as_ptr();
                     constants_ptr = state.exec.constants.as_ptr();
-                    code_len = state.exec.code.len();
                     constants_len = state.exec.constants.len();
+                    Self::tick_check_interrupted(state, pc)?;
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
                         Ok(None) => Ok(()),
@@ -1281,7 +1285,6 @@ impl VmExecutor {
                     pc = state.exec.pc;
                     code_ptr = state.exec.code.as_ptr();
                     constants_ptr = state.exec.constants.as_ptr();
-                    code_len = state.exec.code.len();
                     constants_len = state.exec.constants.len();
                     r
                 }
@@ -1344,6 +1347,7 @@ impl VmExecutor {
                 | OpCode::Unused125
                 | OpCode::Unused126
                 | OpCode::Unused127 => {
+                    core::hint::cold_path();
                     state.exec.pc = pc - 1;
                     Err(VmError::IllegalOpcode(op as u8))
                 }
@@ -1353,7 +1357,6 @@ impl VmExecutor {
                     pc = state.exec.pc;
                     code_ptr = state.exec.code.as_ptr();
                     constants_ptr = state.exec.constants.as_ptr();
-                    code_len = state.exec.code.len();
                     constants_len = state.exec.constants.len();
                     r
                 }
@@ -1365,7 +1368,6 @@ impl VmExecutor {
                         pc = state.exec.pc;
                         code_ptr = state.exec.code.as_ptr();
                         constants_ptr = state.exec.constants.as_ptr();
-                        code_len = state.exec.code.len();
                         constants_len = state.exec.constants.len();
                         continue;
                     }
@@ -1706,7 +1708,10 @@ impl VmExecutor {
             // Unused* 填充变体 (85..=127) 与任何未来 opcode — 损坏字节码防御:
             // 对应 C get_opcode 无校验但 switch 编译为跳转表全值域, 非法 opcode
             // 落 default 臂。这里返回 IllegalOpcode 错误而非 panic。
-            _ => Err(VmError::IllegalOpcode(op as u8)),
+            _ => {
+                core::hint::cold_path();
+                Err(VmError::IllegalOpcode(op as u8))
+            }
         }
     }
 
@@ -2060,57 +2065,6 @@ impl VmExecutor {
     #[inline(never)]
     fn write_stack_grow<'a>(state: &mut LuaState, idx: usize) {
         Self::fast_resize_stack_nil(state, idx + 1);
-    }
-
-    /// pc 越界处理 (fallthrough): 字节码末尾无 RETURN 时隐式返回。
-    /// 对应 C Lua 中函数末尾的隐式 return (luaV_execute 的 fallthrough)。
-    /// 返回 Some(VmResult) 表示顶层返回, None 表示继续执行 (恢复调用者帧)。
-    #[cold]
-    #[inline(never)]
-    fn handle_pc_overflow<'a>(
-        state: &mut LuaState<'a>,
-    ) -> Result<Option<VmResult<'a>>, VmError<'a>> {
-        if let Some(frame) = state.exec.call_stack.pop() {
-            state.exec.call_info.pop();
-            state.exec.n_ccalls = state.exec.n_ccalls.saturating_sub(1);
-            let return_base = frame.return_base;
-            let num_results = frame.num_results;
-            state.exec.code = frame.code;
-            state.exec.constants = frame.constants;
-            state.exec.protos = frame.protos;
-            state.exec.base = frame.base;
-            state.exec.pc = frame.return_pc;
-            state.exec.num_params = frame.num_params;
-            state.exec.is_vararg = frame.is_vararg;
-            state.exec.proto_flag = frame.proto_flag;
-            state.exec.nextraargs = frame.nextraargs;
-            state.exec.closure_upvals = frame.closure_upvals;
-            state.exec.tbc_list = frame.tbc_list;
-            state.exec.hook_old_pc = state.exec.pc as i32;
-            // 隐式 return 0 值: 与 op_return0 一致的栈调整
-            // 必须覆写 return_base 位置: 残留函数本身, resize 截断时不清理已有元素
-            if num_results >= 0 {
-                let target_len = return_base + num_results as usize;
-                if state.exec.stack.len() < target_len {
-                    state
-                        .exec
-                        .stack
-                        .resize(target_len, TValue::Nil(NilKind::Strict));
-                }
-                for i in 0..num_results as usize {
-                    state.exec.stack[return_base + i] = TValue::Nil(NilKind::Strict);
-                }
-                state.exec.stack.truncate(target_len);
-            } else {
-                state.exec.stack.truncate(return_base);
-            }
-            state.exec.top = state.exec.stack.len();
-            return Ok(None);
-        }
-        Ok(Some(VmResult::Return {
-            nresults: 0,
-            result_base: state.exec.base,
-        }))
     }
 
     /// 写入栈槽 — VM 字节码路径专用 (idx 保证在范围内, op_call 已 resize 到 fsize)
@@ -4065,12 +4019,16 @@ impl VmExecutor {
                     Err(_) => Err(VmError::ModuloByZero),
                 }
             }
-            _ => match (to_number_ns(v1), v2.and_then(to_number_ns)) {
-                (Some(n1), Some(n2)) => Ok(Some(TValue::Float(modulus_float(n1, n2)))),
-                _ => Ok(None),
-            },
+            _ => {
+                core::hint::cold_path();
+                match (to_number_ns(v1), v2.and_then(to_number_ns)) {
+                    (Some(n1), Some(n2)) => Ok(Some(TValue::Float(modulus_float(n1, n2)))),
+                    _ => Ok(None),
+                }
+            }
         };
         if let Some(result) = result.map_err(|e| {
+            core::hint::cold_path();
             state.exec.pc = cur; // sync (C savepc): ModuloByZero 行号需要当前指令
             e
         })? {
@@ -7572,6 +7530,7 @@ impl VmExecutor {
                     // key 未命中: 仅在有元表时才 clone 元表查 __index (延迟 clone,
                     // 避免命中路径的冗余 Rc incq; all.lua table_get 占 10.67%)
                     if has_mt {
+                        core::hint::cold_path();
                         let mt = t.get_metatable();
                         let tmnames = &state.tmnames;
                         let index_val = mt.and_then(|mt| {
@@ -7626,6 +7585,7 @@ impl VmExecutor {
                     return Ok(TValue::Nil(NilKind::Strict));
                 }
                 other => {
+                    core::hint::cold_path();
                     // 非表/字符串值: 查找 __index 元方法 (基本类型如 number/boolean/nil)
                     // 对应 C Lua 的 luaV_finishget: 对非表值调用 getTMbyobj
                     let index_val = crate::tm::get_tm_by_obj(
@@ -7933,9 +7893,9 @@ fn format_float(f: f64) -> String {
 mod tests {
     use super::*;
     use crate::gc::GCObjectHeader;
-    use crate::objects::NilKind;
     use crate::state::GlobalState;
     use crate::strings::StringTable;
+    use crate::{gc::GCState, objects::NilKind};
     use std::rc::Rc;
 
     pub fn execute<'a>(
@@ -8023,6 +7983,16 @@ mod tests {
         inst
     }
 
+    /// 生成 IsJ 模式跳转指令 (JMP/TEST/TESTSET 等) — 对应编译器 code_sj
+    fn make_sj(op: OpCode, sj: i32, k: i32) -> Instruction {
+        let mut inst = 0u32;
+        inst |= (op as u32) << opcodes::POS_OP;
+        inst |= ((((sj + opcodes::OFFSET_sJ) as u32) & opcodes::mask1(opcodes::SIZE_sJ, 0))
+            << opcodes::POS_SJ);
+        inst |= ((k & 1) as u32) << opcodes::POS_K;
+        inst
+    }
+
     fn make_abc(op: OpCode, a: i32, b: i32, c: i32) -> Instruction {
         let is_vabc = opcodes::get_opmode(op) == opcodes::OpMode::IvABC;
         let mut inst = 0u32;
@@ -8048,7 +8018,10 @@ mod tests {
 
     #[test]
     fn test_execute_loadi() {
-        let code = vec![make_asbx(OpCode::LOADI, 0, 42)];
+        let code = vec![
+            make_asbx(OpCode::LOADI, 0, 42),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         let stack = default_stack(5);
         let result = execute_test(&proto, 0, stack);
@@ -8060,6 +8033,7 @@ mod tests {
         let code = vec![
             make_asbx(OpCode::LOADI, 1, 99),
             make_abc(OpCode::MOVE, 0, 1, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         let stack = default_stack(10);
@@ -8072,6 +8046,8 @@ mod tests {
             make_asbx(OpCode::LOADI, 0, 10),
             make_asbx(OpCode::LOADI, 1, 20),
             make_abc(OpCode::ADD, 2, 0, 1),
+            make_abc(OpCode::MMBIN, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         let stack = default_stack(10);
@@ -8083,6 +8059,7 @@ mod tests {
         let code = vec![
             make_asbx(OpCode::LOADI, 0, 0),
             make_abc(OpCode::NOT, 1, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         let stack = default_stack(10);
@@ -8091,7 +8068,11 @@ mod tests {
 
     #[test]
     fn test_execute_newtable() {
-        let code = vec![make_abc(OpCode::NEWTABLE, 0, 0, 3)];
+        let code = vec![
+            make_abc(OpCode::NEWTABLE, 0, 0, 3),
+            make_abc(OpCode::EXTRAARG, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         let stack = default_stack(10);
         assert!(execute_test(&proto, 0, stack).is_ok());
@@ -8104,6 +8085,7 @@ mod tests {
             make_asbx(OpCode::LOADI, 1, 5),
             make_asbx(OpCode::LOADI, 2, 1),
             make_abc(OpCode::FORPREP, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         let stack = default_stack(20);
@@ -8117,7 +8099,10 @@ mod tests {
         stack[0] = tb.intern_value("hello");
         stack[1] = tb.intern_value("world");
 
-        let code = vec![make_abc(OpCode::CONCAT, 0, 2, 0)];
+        let code = vec![
+            make_abc(OpCode::CONCAT, 0, 2, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, stack).is_ok());
     }
@@ -8167,6 +8152,8 @@ mod tests {
             make_asbx(OpCode::LOADI, 0, 30),
             make_asbx(OpCode::LOADI, 1, 10),
             make_abc(OpCode::SUB, 2, 0, 1),
+            make_abc(OpCode::MMBIN, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8178,6 +8165,8 @@ mod tests {
             make_asbx(OpCode::LOADI, 0, 6),
             make_asbx(OpCode::LOADI, 1, 7),
             make_abc(OpCode::MUL, 2, 0, 1),
+            make_abc(OpCode::MMBIN, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8189,6 +8178,8 @@ mod tests {
             make_asbx(OpCode::LOADI, 0, 10),
             make_asbx(OpCode::LOADI, 1, 3),
             make_abc(OpCode::DIV, 2, 0, 1),
+            make_abc(OpCode::MMBIN, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8200,6 +8191,8 @@ mod tests {
             make_asbx(OpCode::LOADI, 0, 10),
             make_asbx(OpCode::LOADI, 1, 3),
             make_abc(OpCode::IDIV, 2, 0, 1),
+            make_abc(OpCode::MMBIN, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8211,6 +8204,8 @@ mod tests {
             make_asbx(OpCode::LOADI, 0, 10),
             make_asbx(OpCode::LOADI, 1, 3),
             make_abc(OpCode::MOD, 2, 0, 1),
+            make_abc(OpCode::MMBIN, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8222,6 +8217,8 @@ mod tests {
             make_asbx(OpCode::LOADI, 0, 2),
             make_asbx(OpCode::LOADI, 1, 3),
             make_abc(OpCode::POW, 2, 0, 1),
+            make_abc(OpCode::MMBIN, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8236,6 +8233,7 @@ mod tests {
         let code = vec![
             make_asbx(OpCode::LOADI, 0, 42),
             make_abc(OpCode::UNM, 1, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8246,6 +8244,7 @@ mod tests {
         let code = vec![
             make_asbx(OpCode::LOADI, 0, 0),
             make_abc(OpCode::BNOT, 1, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8257,6 +8256,8 @@ mod tests {
             make_asbx(OpCode::LOADI, 0, 0b1100),
             make_asbx(OpCode::LOADI, 1, 0b1010),
             make_abc(OpCode::BAND, 2, 0, 1),
+            make_abc(OpCode::MMBIN, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8268,6 +8269,8 @@ mod tests {
             make_asbx(OpCode::LOADI, 0, 0b1100),
             make_asbx(OpCode::LOADI, 1, 0b0011),
             make_abc(OpCode::BOR, 2, 0, 1),
+            make_abc(OpCode::MMBIN, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8279,6 +8282,8 @@ mod tests {
             make_asbx(OpCode::LOADI, 0, 0b1100),
             make_asbx(OpCode::LOADI, 1, 0b1010),
             make_abc(OpCode::BXOR, 2, 0, 1),
+            make_abc(OpCode::MMBIN, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8290,6 +8295,8 @@ mod tests {
             make_asbx(OpCode::LOADI, 0, 1),
             make_asbx(OpCode::LOADI, 1, 3),
             make_abc(OpCode::SHL, 2, 0, 1),
+            make_abc(OpCode::MMBIN, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8301,6 +8308,8 @@ mod tests {
             make_asbx(OpCode::LOADI, 0, 16),
             make_asbx(OpCode::LOADI, 1, 2),
             make_abc(OpCode::SHR, 2, 0, 1),
+            make_abc(OpCode::MMBIN, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8316,6 +8325,8 @@ mod tests {
         let code = vec![
             make_asbx(OpCode::LOADI, 0, 3),
             make_abck(OpCode::ADDK, 1, 0, 0, 1),
+            make_abc(OpCode::MMBINK, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, constants);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8327,6 +8338,8 @@ mod tests {
         let code = vec![
             make_asbx(OpCode::LOADI, 0, 10),
             make_abck(OpCode::SUBK, 1, 0, 0, 1),
+            make_abc(OpCode::MMBINK, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, constants);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8338,6 +8351,8 @@ mod tests {
         let code = vec![
             make_asbx(OpCode::LOADI, 0, 3),
             make_abck(OpCode::MULK, 1, 0, 0, 0),
+            make_abc(OpCode::MMBINK, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, constants);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8349,6 +8364,8 @@ mod tests {
         let code = vec![
             make_asbx(OpCode::LOADI, 0, 10),
             make_abck(OpCode::DIVK, 1, 0, 0, 0),
+            make_abc(OpCode::MMBINK, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, constants);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8361,14 +8378,20 @@ mod tests {
     #[test]
     fn test_execute_loadk() {
         let constants = vec![TValue::Integer(42)];
-        let code = vec![make_bx(OpCode::LOADK, 0, 0)];
+        let code = vec![
+            make_bx(OpCode::LOADK, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, constants);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
     fn test_execute_loadf() {
-        let code = vec![make_asbx(OpCode::LOADF, 0, 0)];
+        let code = vec![
+            make_asbx(OpCode::LOADF, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
@@ -8378,6 +8401,7 @@ mod tests {
         let code = vec![
             make_asbx(OpCode::LOADI, 0, 10),
             make_asbx(OpCode::ADDI, 0, 5),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8393,6 +8417,8 @@ mod tests {
             make_asbx(OpCode::LOADI, 0, 42),
             make_asbx(OpCode::LOADI, 1, 42),
             make_abc(OpCode::EQ, 0, 0, 1),
+            make_sj(OpCode::JMP, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8404,6 +8430,8 @@ mod tests {
             make_asbx(OpCode::LOADI, 0, 3),
             make_asbx(OpCode::LOADI, 1, 5),
             make_abc(OpCode::LT, 0, 0, 1),
+            make_sj(OpCode::JMP, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8415,6 +8443,8 @@ mod tests {
             make_asbx(OpCode::LOADI, 0, 5),
             make_asbx(OpCode::LOADI, 1, 5),
             make_abc(OpCode::LE, 0, 0, 1),
+            make_sj(OpCode::JMP, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8425,6 +8455,8 @@ mod tests {
         let code = vec![
             make_asbx(OpCode::LOADI, 0, 42),
             make_asbx(OpCode::EQI, 0, 42),
+            make_sj(OpCode::JMP, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8432,28 +8464,48 @@ mod tests {
 
     #[test]
     fn test_execute_lti() {
-        let code = vec![make_asbx(OpCode::LOADI, 0, 3), make_asbx(OpCode::LTI, 0, 5)];
+        let code = vec![
+            make_asbx(OpCode::LOADI, 0, 3),
+            make_asbx(OpCode::LTI, 0, 5),
+            make_sj(OpCode::JMP, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
     fn test_execute_lei() {
-        let code = vec![make_asbx(OpCode::LOADI, 0, 5), make_asbx(OpCode::LEI, 0, 5)];
+        let code = vec![
+            make_asbx(OpCode::LOADI, 0, 5),
+            make_asbx(OpCode::LEI, 0, 5),
+            make_sj(OpCode::JMP, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
     fn test_execute_gti() {
-        let code = vec![make_asbx(OpCode::LOADI, 0, 7), make_asbx(OpCode::GTI, 0, 5)];
+        let code = vec![
+            make_asbx(OpCode::LOADI, 0, 7),
+            make_asbx(OpCode::GTI, 0, 5),
+            make_sj(OpCode::JMP, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
     fn test_execute_gei() {
-        let code = vec![make_asbx(OpCode::LOADI, 0, 5), make_asbx(OpCode::GEI, 0, 5)];
+        let code = vec![
+            make_asbx(OpCode::LOADI, 0, 5),
+            make_asbx(OpCode::GEI, 0, 5),
+            make_sj(OpCode::JMP, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
@@ -8464,7 +8516,11 @@ mod tests {
 
     #[test]
     fn test_execute_jmp() {
-        let code = vec![make_bx(OpCode::JMP, 0, 1), make_bx(OpCode::RETURN0, 0, 0)];
+        let code = vec![
+            make_sj(OpCode::JMP, 1, 0),
+            make_asbx(OpCode::LOADI, 0, 99),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
@@ -8473,8 +8529,9 @@ mod tests {
     fn test_execute_test() {
         let code = vec![
             make_asbx(OpCode::LOADI, 0, 1),
-            make_bx(OpCode::TEST, 0, 1),
-            make_bx(OpCode::RETURN0, 0, 0),
+            make_abc(OpCode::TEST, 0, 0, 0),
+            make_sj(OpCode::JMP, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8485,6 +8542,8 @@ mod tests {
         let code = vec![
             make_asbx(OpCode::LOADI, 0, 42),
             make_abc(OpCode::TESTSET, 1, 0, 0),
+            make_sj(OpCode::JMP, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8498,8 +8557,10 @@ mod tests {
     fn test_execute_gettable() {
         let code = vec![
             make_abc(OpCode::NEWTABLE, 0, 0, 3),
+            make_abc(OpCode::EXTRAARG, 0, 0, 0),
             make_asbx(OpCode::LOADI, 1, 1),
             make_abc(OpCode::GETTABLE, 2, 0, 1),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
@@ -8509,10 +8570,11 @@ mod tests {
     fn test_execute_settable() {
         let code = vec![
             make_abc(OpCode::NEWTABLE, 0, 0, 3),
-            make_asbx(OpCode::LOADI, 0, 0),
+            make_abc(OpCode::EXTRAARG, 0, 0, 0),
             make_asbx(OpCode::LOADI, 1, 1),
             make_asbx(OpCode::LOADI, 2, 42),
             make_abck(OpCode::SETTABLE, 0, 1, 2, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
@@ -8522,7 +8584,9 @@ mod tests {
     fn test_execute_geti() {
         let code = vec![
             make_abc(OpCode::NEWTABLE, 0, 0, 3),
+            make_abc(OpCode::EXTRAARG, 0, 0, 0),
             make_abc(OpCode::GETI, 1, 0, 1),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
@@ -8532,8 +8596,10 @@ mod tests {
     fn test_execute_seti() {
         let code = vec![
             make_abc(OpCode::NEWTABLE, 0, 0, 3),
+            make_abc(OpCode::EXTRAARG, 0, 0, 0),
             make_asbx(OpCode::LOADI, 1, 42),
             make_abck(OpCode::SETI, 0, 1, 1, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
@@ -8544,7 +8610,9 @@ mod tests {
         let constants = vec![TValue::Nil(NilKind::Strict)];
         let code = vec![
             make_abc(OpCode::NEWTABLE, 0, 0, 3),
+            make_abc(OpCode::EXTRAARG, 0, 0, 0),
             make_abc(OpCode::SELF, 1, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, constants);
         assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
@@ -8556,7 +8624,10 @@ mod tests {
         let mut stack = default_stack(10);
         stack[0] = tb.intern_value("hello");
 
-        let code = vec![make_abc(OpCode::LEN, 1, 0, 0)];
+        let code = vec![
+            make_abc(OpCode::LEN, 1, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, stack).is_ok());
     }
@@ -8587,7 +8658,7 @@ mod tests {
 
     #[test]
     fn test_execute_return0() {
-        let code = vec![make_bx(OpCode::RETURN0, 0, 0)];
+        let code = vec![make_abc(OpCode::RETURN0, 0, 0, 0)];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
@@ -8599,7 +8670,7 @@ mod tests {
     #[test]
     fn test_execute_call_lua_closure() {
         // Create an inner proto that just returns 0
-        let inner_proto = make_proto(vec![make_bx(OpCode::RETURN0, 0, 0)], vec![]);
+        let inner_proto = make_proto(vec![make_abc(OpCode::RETURN0, 0, 0, 0)], vec![]);
         let closure = Rc::new(LClosure {
             gc_header: GCObjectHeader::new(),
             proto: Rc::new(inner_proto),
@@ -8609,14 +8680,17 @@ mod tests {
         let mut stack = default_stack(10);
         stack[0] = TValue::LClosure(closure);
 
-        let code = vec![make_abck(OpCode::CALL, 0, 0, 1, 0)];
+        let code = vec![
+            make_abck(OpCode::CALL, 0, 0, 1, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, stack).is_ok());
     }
 
     #[test]
     fn test_execute_tailcall_lua_closure() {
-        let inner_proto = make_proto(vec![make_bx(OpCode::RETURN0, 0, 0)], vec![]);
+        let inner_proto = make_proto(vec![make_abc(OpCode::RETURN0, 0, 0, 0)], vec![]);
         let closure = Rc::new(LClosure {
             gc_header: GCObjectHeader::new(),
             proto: Rc::new(inner_proto),
@@ -8626,7 +8700,10 @@ mod tests {
         let mut stack = default_stack(10);
         stack[0] = TValue::LClosure(closure);
 
-        let code = vec![make_abck(OpCode::TAILCALL, 0, 0, 1, 0)];
+        let code = vec![
+            make_abck(OpCode::TAILCALL, 0, 0, 1, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, stack).is_ok());
     }
@@ -8637,8 +8714,11 @@ mod tests {
 
     #[test]
     fn test_execute_closure() {
-        let inner_proto = make_proto(vec![make_bx(OpCode::RETURN0, 0, 0)], vec![]);
-        let code = vec![make_bx(OpCode::CLOSURE, 0, 0)];
+        let inner_proto = make_proto(vec![make_abc(OpCode::RETURN0, 0, 0, 0)], vec![]);
+        let code = vec![
+            make_bx(OpCode::CLOSURE, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let mut proto = make_proto(code, vec![]);
         proto.protos = Rc::new(vec![Rc::new(inner_proto)]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8652,10 +8732,12 @@ mod tests {
     fn test_execute_setlist() {
         let code = vec![
             make_abc(OpCode::NEWTABLE, 0, 0, 0),
+            make_abc(OpCode::EXTRAARG, 0, 0, 0),
             make_asbx(OpCode::LOADI, 1, 10),
             make_asbx(OpCode::LOADI, 2, 20),
             make_asbx(OpCode::LOADI, 3, 30),
             make_abc(OpCode::SETLIST, 0, 3, 1),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
@@ -8667,21 +8749,30 @@ mod tests {
 
     #[test]
     fn test_execute_loadfalse() {
-        let code = vec![make_abc(OpCode::LOADFALSE, 0, 0, 0)];
+        let code = vec![
+            make_abc(OpCode::LOADFALSE, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(5)).is_ok());
     }
 
     #[test]
     fn test_execute_loadtrue() {
-        let code = vec![make_abc(OpCode::LOADTRUE, 0, 0, 0)];
+        let code = vec![
+            make_abc(OpCode::LOADTRUE, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(5)).is_ok());
     }
 
     #[test]
     fn test_execute_loadnil() {
-        let code = vec![make_abck(OpCode::LOADNIL, 0, 3, 0, 0)];
+        let code = vec![
+            make_abck(OpCode::LOADNIL, 0, 3, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
@@ -8697,6 +8788,7 @@ mod tests {
             make_asbx(OpCode::LOADI, 1, 2),
             make_asbx(OpCode::LOADI, 2, 3),
             make_abc(OpCode::TFORPREP, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
@@ -8709,6 +8801,7 @@ mod tests {
             make_asbx(OpCode::LOADI, 1, 2),
             make_asbx(OpCode::LOADI, 2, 3),
             make_abc(OpCode::TFORCALL, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         let result = execute_test(&proto, 0, default_stack(20));
@@ -8721,6 +8814,7 @@ mod tests {
         let code = vec![
             make_asbx(OpCode::LOADI, 3, 0),
             make_abc(OpCode::TFORLOOP, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
@@ -8732,7 +8826,10 @@ mod tests {
 
     #[test]
     fn test_execute_vararg() {
-        let code = vec![make_abc(OpCode::VARARG, 0, 1, 0)];
+        let code = vec![
+            make_abc(OpCode::VARARG, 0, 1, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
     }
@@ -8743,6 +8840,7 @@ mod tests {
         let code = vec![
             make_abc(OpCode::LOADNIL, 0, 0, 0),
             make_bx(OpCode::ERRNNIL, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8751,6 +8849,7 @@ mod tests {
         let code2 = vec![
             make_asbx(OpCode::LOADI, 0, 42),
             make_bx(OpCode::ERRNNIL, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto2 = make_proto(code2, vec![]);
         assert!(execute_test(&proto2, 0, default_stack(10)).is_err());
@@ -8758,7 +8857,10 @@ mod tests {
 
     #[test]
     fn test_execute_varargprep() {
-        let code = vec![make_abc(OpCode::VARARGPREP, 0, 3, 0)];
+        let code = vec![
+            make_abc(OpCode::VARARGPREP, 0, 3, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(20)).is_ok());
     }
@@ -8770,35 +8872,50 @@ mod tests {
     #[test]
     fn test_execute_mmbin() {
         // C=255 (超出 TagMethod 范围), 使 TM 查找被跳过
-        let code = vec![make_abc(OpCode::MMBIN, 0, 0, 255)];
+        let code = vec![
+            make_abc(OpCode::MMBIN, 0, 0, 255),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
     fn test_execute_mmbini() {
-        let code = vec![make_abc(OpCode::MMBINI, 0, 0, 255)];
+        let code = vec![
+            make_abc(OpCode::MMBINI, 0, 0, 255),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
     fn test_execute_mmbink() {
-        let code = vec![make_abc(OpCode::MMBINK, 0, 0, 255)];
+        let code = vec![
+            make_abc(OpCode::MMBINK, 0, 0, 255),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
     fn test_execute_close() {
-        let code = vec![make_abc(OpCode::CLOSE, 0, 0, 0)];
+        let code = vec![
+            make_abc(OpCode::CLOSE, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
 
     #[test]
     fn test_execute_tbc() {
-        let code = vec![make_abc(OpCode::TBC, 0, 0, 0)];
+        let code = vec![
+            make_abc(OpCode::TBC, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
+        ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
     }
@@ -8811,7 +8928,8 @@ mod tests {
     fn test_execute_lfalseskip() {
         let code = vec![
             make_abc(OpCode::LFALSESKIP, 0, 0, 0),
-            make_bx(OpCode::RETURN0, 0, 0),
+            make_asbx(OpCode::LOADI, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8822,6 +8940,7 @@ mod tests {
         let code = vec![
             make_asbx(OpCode::LOADI, 1, 0),
             make_abc(OpCode::GETVARG, 0, 0, 1),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8862,7 +8981,7 @@ mod tests {
 
     #[test]
     fn test_vm_result_done() {
-        let proto = make_proto(vec![], vec![]);
+        let proto = make_proto(vec![make_abc(OpCode::RETURN0, 0, 0, 0)], vec![]);
         let result = execute_test(&proto, 0, default_stack(10)).unwrap();
         assert!(matches!(result, VmResult::Return { nresults: 0, .. }));
     }
@@ -8877,6 +8996,8 @@ mod tests {
             make_asbx(OpCode::LOADI, 0, -1),
             make_asbx(OpCode::LOADI, 1, 1),
             make_abc(OpCode::ADD, 2, 0, 1),
+            make_abc(OpCode::MMBIN, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(10)).is_ok());
@@ -8889,6 +9010,7 @@ mod tests {
             make_asbx(OpCode::LOADI, 1, 5),
             make_asbx(OpCode::LOADI, 2, 0),
             make_abc(OpCode::FORPREP, 0, 0, 0),
+            make_abc(OpCode::RETURN0, 0, 0, 0),
         ];
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, default_stack(20)).is_err());

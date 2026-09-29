@@ -2649,7 +2649,6 @@ mod tests {
     use crate::strings::{
         lua_string_is_empty, lua_string_len, lua_string_with_nul, LongString, ShortString,
     };
-    use std::sync::atomic::{AtomicU64, AtomicU8};
 
     // ========================================================================
     // TValue 大小检查

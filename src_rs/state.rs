@@ -1,6 +1,7 @@
 use crate::debug::runerror;
 use crate::execute::{VmError, VmExecutor, VmResult};
 use crate::gc::{GCObjectHeader, GCState};
+#[cfg(lua_use_longjmp)]
 use crate::helper::JmpBuf;
 use crate::objects::FxBuildHasher;
 use crate::objects::{
@@ -995,7 +996,7 @@ impl<'a> LuaState<'a> {
         proto: &Proto<'a>,
         base: usize,
         mut stack: Vec<TValue<'a>>,
-        mut global_state: Rc<RefCell<GlobalState<'a>>>,
+        global_state: Rc<RefCell<GlobalState<'a>>>,
     ) -> Self {
         let mut gs = global_state.borrow_mut();
         if base > 0 {

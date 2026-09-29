@@ -1,5 +1,5 @@
 {
-    // 使用 IntelliSense 了解相关属性。 
+    // 使用 IntelliSense 了解相关属性。
     // 悬停以查看现有属性的描述。
     // 欲了解更多信息，请访问: https://go.microsoft.com/fwlink/?linkid=830387
     "version": "0.2.0",
@@ -8,9 +8,53 @@
             "type": "lldb-dap",
             "request": "launch",
             "name": "Launch Rust Lua",
-            "program": "${workspaceFolder}/target/debug/lua",
-            "args": ["tests/all.lua"],
+            "program": "${workspaceFolder}/target/debug/lua.exe",
+            "args": ["all.lua"],
             "cwd": "${workspaceFolder}/tests_lua",
+            "initCommands": [
+                // !! change this path if you placed the script somewhere else !!
+                "command script import ${workspaceFolder}/.vscode/rust_prettifier_for_lldb.py"
+            ],
+        },
+        {
+            "type": "lldb-dap",
+            "request": "launch",
+            "name": "Launch Rust Lua luasocket test",
+            "program": "${workspaceFolder}/target/debug/lua.exe",
+            "args": ["hello.lua"],
+            "cwd": "${workspaceFolder}/deps/src/luasocket/test",
+            "env": [
+               "LUA_CPATH=${workspaceFolder}/deps/lib/lua/5.5/?.dll;${workspaceFolder}/deps/lib/lua/5.5/?/core.dll;;",
+               "LUA_PATH=${workspaceFolder}/deps/lib/lua/5.5/?.lua;${workspaceFolder}/deps/src/lua-cjson/lua/?.lua;${workspaceFolder}/deps/src/luarocks-3.13.0/src/?.lua;${workspaceFolder}/deps/src/lsqlite3/?.lua;;"
+            ],
+            "initCommands": [
+                // !! change this path if you placed the script somewhere else !!
+                "command script import ${workspaceFolder}/.vscode/rust_prettifier_for_lldb.py"
+            ],
+        },
+        {
+            "type": "lldb-dap",
+            "request": "launch",
+            "name": "Launch Rust Lua sol2_smoke test",
+            "program": "${workspaceFolder}/deps/build/sol2_smoke.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}/deps",
+            "initCommands": [
+                // !! change this path if you placed the script somewhere else !!
+                "command script import ${workspaceFolder}/.vscode/rust_prettifier_for_lldb.py"
+            ],
+        },
+        {
+            "type": "lldb-dap",
+            "request": "launch",
+            "name": "Launch Rust Lua skynet test",
+            "program": "${workspaceFolder}/deps/src/skynet/skynet.exe",
+            "args": ["examples/config.rstest"],
+            "cwd": "${workspaceFolder}/deps/src/skynet",
+            "initCommands": [
+                // !! change this path if you placed the script somewhere else !!
+                "command script import ${workspaceFolder}/.vscode/rust_prettifier_for_lldb.py"
+            ],
         },
         {
             "name": "(gdb) 启动",
