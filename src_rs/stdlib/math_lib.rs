@@ -1329,7 +1329,7 @@ pub fn open_math_lib<'a>(state: &mut LuaState<'a>) {
     // (原 state.pure_fns HashSet 查询每次调用 2 个非内联 call:
     // tvalue_fx_hash + RawTable::find)。
     let register =
-        |lib: &Table<'a>, name: &'static std::ffi::CStr, func: crate::objects::BuiltinFnPtr<'a>| {
+        |lib: &Table<'a>, name: &'static std::ffi::CStr, func: crate::objects::BuiltinFnPtr| {
             let key = state.intern(name.to_str().unwrap_or(""));
             let name_ptr = name.as_ptr() as *const u8;
             lib.set(key, BuiltinFn::pure_fn_tvalue(func, name_ptr));

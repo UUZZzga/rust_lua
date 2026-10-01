@@ -3337,7 +3337,7 @@ pub fn open_base_lib<'a>(state: &mut LuaState<'a>) {
     // 导致 print/pcall 等按地址随机被判定为 pure, 丢失 CallInfoEntry 调试信息。
     let register = |state: &mut LuaState<'a>,
                     name: &'static std::ffi::CStr,
-                    func: crate::objects::BuiltinFnPtr<'a>| {
+                    func: crate::objects::BuiltinFnPtr| {
         let key = state.intern(name.to_str().unwrap_or(""));
         let name_ptr = name.as_ptr() as *const u8;
         state.globals.set(
@@ -4191,22 +4191,26 @@ mod tests {
         let mt = Table::new();
         mt.set(st.intern_value("__mode"), st.intern_value("kv"));
         t.set_metatable(Some(mt));
+        #[cfg(miri)]
+        let exp = 14;
+        #[cfg(not(miri))]
+        let exp = 22;
         t.set(
-            new_long_str_from_string(str_rep("a", 2_i64.pow(22), "").unwrap()),
+            new_long_str_from_string(str_rep("a", 2_i64.pow(exp), "").unwrap()),
             TValue::Integer(25),
         );
         t.set(
-            new_long_str_from_string(str_rep("b", 2_i64.pow(22), "").unwrap()),
+            new_long_str_from_string(str_rep("b", 2_i64.pow(exp), "").unwrap()),
             TValue::Table(Table::new()),
         );
         t.set(TValue::Table(Table::new()), TValue::Integer(14));
         let (key, val) = table_next(&t, &TValue::Nil(NilKind::Strict)).unwrap();
         assert!(matches!(key.clone(), Some(s @ TValue::LongStr(_))
-            if s == new_long_str_from_string(str_rep("a", 2_i64.pow(22), "").unwrap())));
+            if s == new_long_str_from_string(str_rep("a", 2_i64.pow(exp), "").unwrap())));
         assert_eq!(val, TValue::Integer(25));
         let (key, val) = table_next(&t, &key.unwrap()).unwrap();
         assert!(matches!(key.clone(), Some(s @ TValue::LongStr(_))
-            if s == new_long_str_from_string(str_rep("b", 2_i64.pow(22), "").unwrap())));
+            if s == new_long_str_from_string(str_rep("b", 2_i64.pow(exp), "").unwrap())));
         assert!(matches!(val.clone(), TValue::Table(_)));
         let (key, val) = table_next(&t, &key.unwrap()).unwrap();
         assert!(matches!(key.clone(), Some(TValue::Table(_))));

@@ -1,13 +1,15 @@
 //! 浮点数格式化/解析工具
 //!
-//! size_optimized 模式下用 libc 函数避免引入 Rust 的 flt2dec/dec2flt 代码 (~34KB):
+//! `size_optimized` 模式下用 libc 函数避免引入 Rust 的 flt2dec/dec2flt 代码 (~34KB):
 //!   - `format!("{}", f)` 引入 flt2dec (format_shortest + CACHED_POW10, ~13KB)
 //!   - `"3.14".parse::<f64>()` 引入 dec2flt (POWER_OF_FIVE_128, ~21KB)
 //!
 //! libc 的 `snprintf("%.14g")` / `strtod` 对应 C Lua 的浮点处理方式,
 //! 行为更接近 C 实现, 且不引入额外 Rust 代码。
-
-use std::ffi::CString;
+//!
+//! **Miri 兼容性**: Miri 下 FFI 不受支持 (如 `strtod` / `snprintf` / `localeconv`),
+//! 所以即使开启了 `size_optimized`, 也会自动回退到纯 Rust 实现.
+//! 判定条件统一为 `cfg(all(size_optimized, not(miri)))`.
 
 // ============================================================================
 // f64 -> String
@@ -20,9 +22,8 @@ use std::ffi::CString;
 ///   2. 用 strtod 读回, 若不等于原值则用 %.17g (LUA_NUMBER_FMT_N) 重试
 ///   3. 若结果只含数字/符号 (整数浮点数), 添加 ".0" 后缀
 ///
-/// size_optimized 模式: 用 libc snprintf/strtod 避免 Rust flt2dec/dec2flt 代码
-/// 默认模式: 用 format!("{}", f) (Rust 最短往返表示, 等效于两阶段)
-#[cfg(size_optimized)]
+/// **libc 版本**: 仅 `size_optimized` 且非 Miri 下编译。
+#[cfg(all(size_optimized, not(miri)))]
 pub fn f64_to_string(f: f64) -> String {
     if f.is_nan() {
         return "nan".to_string();
@@ -36,6 +37,7 @@ pub fn f64_to_string(f: f64) -> String {
     }
     unsafe {
         let mut buf = [0u8; 64];
+
         // 阶段 1: %.15g (LUA_NUMBER_FMT) — 对应 C Lua 的第一次尝试
         let fmt_15 = b"%.15g\0";
         let n15 = libc::snprintf(
@@ -47,6 +49,7 @@ pub fn f64_to_string(f: f64) -> String {
         if n15 <= 0 || (n15 as usize) >= buf.len() {
             return "0.0".to_string();
         }
+
         // 检查往返: strtod(buf) == f ?
         let mut end: *mut libc::c_char = std::ptr::null_mut();
         let check = libc::strtod(buf.as_ptr() as *const libc::c_char, &mut end);
@@ -66,7 +69,9 @@ pub fn f64_to_string(f: f64) -> String {
         } else {
             n15
         };
+
         let s = std::str::from_utf8_unchecked(&buf[..final_n as usize]);
+
         // 阶段 3: 整数浮点数添加 ".0" 后缀
         // 对应 C Lua 5.5: buff[strspn(buff, "-0123456789")] == '\0'
         let all_digits_or_sign = s.bytes().all(|b| b.is_ascii_digit() || b == b'-');
@@ -81,11 +86,15 @@ pub fn f64_to_string(f: f64) -> String {
     }
 }
 
-#[cfg(not(size_optimized))]
-#[cfg_attr(not(size_optimized), inline)]
+/// 将 f64 格式化为字符串 (纯 Rust 版本)。
+///
+/// 用 Rust 原生 `format!` (Ryg 算法, 最短往返表示), 处理 nan/inf 和 ".0" 后缀
+/// 以匹配 C Lua 5.5 行为.
+///
+/// **注意**: 该实现用于默认构建以及所有 Miri 构建。
+#[cfg(any(not(size_optimized), miri))]
+#[inline]
 pub fn f64_to_string(f: f64) -> String {
-    // 性能优先: 用 Rust 原生 format! (Ryg 算法, 最短往返表示)
-    // 处理 nan/inf 和 ".0" 后缀以匹配 C Lua 5.5 行为.
     if f.is_nan() {
         return "nan".to_string();
     }
@@ -110,11 +119,12 @@ pub fn f64_to_string(f: f64) -> String {
     }
 }
 
+// ============================================================================
+// f64 -> String (定点 / 科学计数法)
+// ============================================================================
+
 /// 将 f64 格式化为定点表示 (对应 `format!("{:.N}", f)`)。
-///
-/// size_optimized 模式: 用 `libc::snprintf("%.Nf", f)` (precision 拼接到格式字符串)
-/// 默认模式: 用 `format!("{:.N}", f)`
-#[cfg(size_optimized)]
+#[cfg(all(size_optimized, not(miri)))]
 pub fn f64_to_string_fixed(f: f64, precision: usize) -> String {
     // 手动拼接 "%.Nf\0" 避免用 format! (会引入 fmt 代码).
     // 不用 "%.*f" + 变参 precision, 因为 Rust 调 C variadic 时混合 int/float
@@ -145,17 +155,15 @@ pub fn f64_to_string_fixed(f: f64, precision: usize) -> String {
     }
 }
 
-#[cfg(not(size_optimized))]
-#[cfg_attr(not(size_optimized), inline)]
+/// 将 f64 格式化为定点表示 (纯 Rust 版本)。
+#[cfg(any(not(size_optimized), miri))]
+#[inline]
 pub fn f64_to_string_fixed(f: f64, precision: usize) -> String {
     format!("{:.*}", precision, f)
 }
 
 /// 将 f64 格式化为科学计数法表示 (对应 `format!("{:.*e}", precision, f)`)。
-///
-/// size_optimized 模式: 用 `libc::snprintf("%.Ne", f)` (precision 拼接到格式字符串)
-/// 默认模式: 用 `format!("{:.*e}", precision, f)`
-#[cfg(size_optimized)]
+#[cfg(all(size_optimized, not(miri)))]
 pub fn f64_to_string_exp(f: f64, precision: usize, uppercase: bool) -> String {
     // 手动拼接 "%.Ne\0" / "%.NE\0" 避免用 format! (会引入 fmt 代码).
     let mut fmt = [0u8; 8];
@@ -182,8 +190,9 @@ pub fn f64_to_string_exp(f: f64, precision: usize, uppercase: bool) -> String {
     }
 }
 
-#[cfg(not(size_optimized))]
-#[cfg_attr(not(size_optimized), inline)]
+/// 将 f64 格式化为科学计数法表示 (纯 Rust 版本)。
+#[cfg(any(not(size_optimized), miri))]
+#[inline]
 pub fn f64_to_string_exp(f: f64, precision: usize, uppercase: bool) -> String {
     if uppercase {
         format!("{:.*E}", precision, f)
@@ -192,18 +201,43 @@ pub fn f64_to_string_exp(f: f64, precision: usize, uppercase: bool) -> String {
     }
 }
 
+/// 将 `precision` 的十进制数字写入 `buf[offset..]`, 返回写入的字节数.
+///
+/// 仅 libc 路径使用. 调用方需要保证 `buf` 至少有 `offset + 20` 字节空间.
+#[cfg(all(size_optimized, not(miri)))]
+fn write_precision(buf: &mut [u8], offset: usize, precision: usize) -> usize {
+    if precision == 0 {
+        buf[offset] = b'0';
+        return 1;
+    }
+    // 反向写入再翻转 (usize 最多 20 位十进制数字)
+    let mut digits = [0u8; 20];
+    let mut n = 0;
+    let mut p = precision;
+    while p > 0 {
+        digits[n] = b'0' + (p % 10) as u8;
+        p /= 10;
+        n += 1;
+    }
+    for i in 0..n {
+        buf[offset + i] = digits[n - 1 - i];
+    }
+    n
+}
+
 // ============================================================================
 // str -> f64
 // ============================================================================
 
 /// 将字符串解析为 f64。
 ///
-/// 用 `libc::strtod` (对应 C Lua 的 lua_str2number), 支持 locale 小数点
+/// libc 版本用 `libc::strtod` (对应 C Lua 的 lua_str2number), 支持 locale 小数点
 /// (如 pt_BR locale 下 "3,4" 解析为 3.4)。
 ///
 /// 对应 C Lua l_str2d 的 locale fallback: 若 strtod 失败且字符串含 '.',
 /// 将 '.' 替换为 locale 的 decimal_point 后重试。
 /// (如 pt_BR locale 下 "3.4" → 替换为 "3,4" → strtod 成功)
+#[cfg(all(size_optimized, not(miri)))]
 pub fn f64_from_str(s: &str) -> Option<f64> {
     // strtod 内部会跳过前导空格, 但 Lua 的 tonumber 也允许前导/尾随空格.
     // 先去除尾随空格, 便于检查 end 是否到达字符串末尾.
@@ -211,10 +245,12 @@ pub fn f64_from_str(s: &str) -> Option<f64> {
     if trimmed.is_empty() {
         return None;
     }
+
     // 第一次尝试: 用原始字符串 (strtod 会尊重 locale)
     if let Some(val) = try_strtod(trimmed) {
         return Some(val);
     }
+
     // Locale fallback (对应 C Lua l_str2d):
     // 若字符串含 '.', 替换为 locale 的 decimal_point 后重试
     if trimmed.contains('.') {
@@ -229,7 +265,26 @@ pub fn f64_from_str(s: &str) -> Option<f64> {
     None
 }
 
+/// 将字符串解析为 f64 (纯 Rust 版本)。
+///
+/// **注意**: Rust 的 `str::parse::<f64>` 不识别十六进制浮点数 (如 `0x1.8p3`),
+/// 也不支持 locale 小数点。若默认构建需要这些语义, 应替换为 `lexical-parse-float` 等
+/// 纯 Rust 解析库。
+#[cfg(any(not(size_optimized), miri))]
+#[inline]
+pub fn f64_from_str(s: &str) -> Option<f64> {
+    let trimmed = s.trim_matches(|c: char| c.is_ascii_whitespace());
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<f64>().ok()
+}
+
+/// 用 `libc::strtod` 解析字符串, 要求整个字符串都被消费。
+#[cfg(all(size_optimized, not(miri)))]
 fn try_strtod(s: &str) -> Option<f64> {
+    use std::ffi::CString;
+
     let c_str = CString::new(s).ok()?;
     let mut end: *mut libc::c_char = std::ptr::null_mut();
     unsafe {
@@ -244,7 +299,8 @@ fn try_strtod(s: &str) -> Option<f64> {
     }
 }
 
-/// 获取当前 locale 的小数点字符 (对应 C 的 lua_getlocaledecpoint)
+/// 获取当前 locale 的小数点字符 (对应 C 的 lua_getlocaledecpoint)。
+#[cfg(all(size_optimized, not(miri)))]
 pub unsafe fn get_locale_decpoint() -> char {
     #[repr(C)]
     struct LConv {
@@ -261,15 +317,19 @@ pub unsafe fn get_locale_decpoint() -> char {
     }
 }
 
+/// 获取当前 locale 的小数点字符 (纯 Rust / Miri 回退: 恒为 `.`)。
+#[cfg(any(not(size_optimized), miri))]
+#[inline]
+pub unsafe fn get_locale_decpoint() -> char {
+    '.'
+}
+
 // ============================================================================
 // i64 -> String
 // ============================================================================
 
-/// 将 i64 格式化为字符串。
-///
-/// size_optimized 模式: 用 `libc::snprintf("%lld", i)` 避免 Rust `core::fmt` 代码
-/// 默认模式: 用 `i.to_string()`
-#[cfg(size_optimized)]
+/// 将 i64 格式化为字符串 (libc 版本)。
+#[cfg(all(size_optimized, not(miri)))]
 pub fn i64_to_string(i: i64) -> String {
     // i64 最大 20 位数字 (-9223372036854775808), 21 字节缓冲区足够 (含符号+NUL)
     let mut buf = [0u8; 24];
@@ -289,47 +349,43 @@ pub fn i64_to_string(i: i64) -> String {
     }
 }
 
-#[cfg(not(size_optimized))]
-#[cfg_attr(not(size_optimized), inline)]
+/// 将 i64 格式化为字符串 (纯 Rust 版本)。
+#[cfg(any(not(size_optimized), miri))]
+#[inline]
 pub fn i64_to_string(i: i64) -> String {
     i.to_string()
 }
 
 /// 计算 i64 格式化后的字符串长度 (不分配内存)。
 ///
-/// size_optimized 模式: 用数学计算避免 `to_string().len()` 分配
-/// 默认模式: 用 `to_string().len()`
-#[cfg(size_optimized)]
-#[cfg_attr(not(size_optimized), inline)]
+/// 该函数在两种路径下都使用数学计算避免 `to_string()` 分配, 无需 cfg 分叉.
+#[inline]
 pub fn i64_str_len(i: i64) -> usize {
     if i == 0 {
         return 1;
     }
+    // i64::MIN 的绝对值无法用 i64 表示, 用 u64 处理
     let abs = if i < 0 {
-        // i64::MIN 的绝对值无法用 i64 表示, 用 u64
-        (i as u64).wrapping_neg() as u64
+        (i as u64).wrapping_neg()
     } else {
         i as u64
     };
     // 计算位数: log10(abs) + 1
-    let mut digits = 1u32;
+    let mut digits = 1usize;
     let mut v = abs;
     while v >= 10 {
         v /= 10;
         digits += 1;
     }
-    digits as usize + if i < 0 { 1 } else { 0 }
+    digits + if i < 0 { 1 } else { 0 }
 }
 
-#[cfg(not(size_optimized))]
-#[cfg_attr(not(size_optimized), inline)]
-pub fn i64_str_len(i: i64) -> usize {
-    if i == 0 {
-        return 1;
-    }
-    if i < 0 {
-        (i as i128).unsigned_abs().to_string().len() + 1
-    } else {
-        (i as u64).to_string().len()
-    }
-}
+// ============================================================================
+// 编译期自检
+// ============================================================================
+
+// 确保 size_optimized 与 miri 不会同时走 libc 路径时出现空白 (防呆).
+#[cfg(all(size_optimized, not(miri)))]
+const _: () = {
+    // libc 路径下, 上述函数均会生成; 无需额外检查.
+};

@@ -10,6 +10,9 @@ pub mod bindings;
 // 核心配置（luaconf.h）— 类型定义、常量、路径、数值运算
 pub mod config;
 
+//
+pub mod alloc;
+
 // 安全包装层 —— 操作码（lopcodes.h / lopcodes.cpp）
 pub mod opcodes;
 

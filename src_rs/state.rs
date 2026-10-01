@@ -1678,7 +1678,7 @@ impl<'a> LuaState<'a> {
     /// state.set_builtin("my_add", my_add);
     /// state.do_string("print(my_add(3, 4))");  // 输出 7
     /// ```
-    pub fn set_builtin(&mut self, name: &'static std::ffi::CStr, func: BuiltinFnPtr<'a>) {
+    pub fn set_builtin(&mut self, name: &'static std::ffi::CStr, func: BuiltinFnPtr) {
         let name_str = name.to_str().unwrap_or("");
         let key = str_to_ls(&self.string_table, name_str);
         let name_ptr = name.as_ptr() as *const u8;
@@ -1701,7 +1701,7 @@ impl<'a> LuaState<'a> {
         &self,
         table: &Table<'a>,
         name: &'static std::ffi::CStr,
-        func: BuiltinFnPtr<'a>,
+        func: BuiltinFnPtr,
     ) {
         let name_str = name.to_str().unwrap_or("");
         let key = str_to_ls(&self.string_table, name_str);
@@ -2956,7 +2956,7 @@ impl<'a> LuaState<'a> {
         &mut self,
         func_idx: usize,
         nresults: i32,
-        func: crate::objects::BuiltinFnPtr<'a>,
+        func: crate::objects::BuiltinFnPtr,
         name: &'static str,
     ) -> i32 {
         let nargs = self.exec.stack.len().saturating_sub(func_idx + 1);

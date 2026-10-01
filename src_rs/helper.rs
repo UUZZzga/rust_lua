@@ -1,4 +1,4 @@
-use std::fmt::{self}; // 这里 import 是为了 impl 内部能用 write_str 等方法
+use std::fmt::{self};
 
 #[repr(C, align(16))]
 pub struct JmpBuf {

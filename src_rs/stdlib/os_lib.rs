@@ -983,7 +983,7 @@ pub fn open_os_lib<'a>(state: &mut LuaState<'a>) {
     // 注册所有 OS 函数 (使用 BuiltinFn 函数指针)
     let register = |lib: &mut crate::table::Table<'a>,
                     name: &'static std::ffi::CStr,
-                    func: crate::objects::BuiltinFnPtr<'a>| {
+                    func: crate::objects::BuiltinFnPtr| {
         let key = state.intern(name.to_str().unwrap_or(""));
         let name_ptr = name.as_ptr() as *const u8;
         lib.set(key, BuiltinFn::impure_tvalue(func, name_ptr));

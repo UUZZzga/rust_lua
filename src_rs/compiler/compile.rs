@@ -716,7 +716,7 @@ pub fn compile_chunk<'a, 'b>(ls: &mut LexState<'a, 'b>) -> Result<Proto<'b>, Str
     let source = crate::strings::new_lstr(&ls.state.string_table, &ls.chunk_name);
     let env_name = crate::strings::new_lstr(&ls.state.string_table, "_ENV");
 
-    let mut fs = FuncState::new(ls);
+    let mut fs = FuncState::new(ls as *mut LexState<'a, 'b>);
     fs.proto.num_params = 0;
     fs.proto.flag = PF_VAHID;
 
@@ -764,7 +764,10 @@ pub fn compile_chunk<'a, 'b>(ls: &mut LexState<'a, 'b>) -> Result<Proto<'b>, Str
 }
 
 impl<'a, 'b> FuncState<'a, 'b> {
-    fn new(ls: &mut LexState<'a, 'b>) -> Self {
+    /// `ls` 直接接收裸指针 (而非 `&mut`), 使嵌套 FuncState 共享同一裸指针标签:
+    /// 若每次都从 `&mut` 重新派生, Tree Borrows 下父/子 FuncState 的标签会互相
+    /// 冻结 (foreign reborrow), 导致后续写访问 UB。
+    fn new(ls: *mut LexState<'a, 'b>) -> Self {
         FuncState {
             proto: crate::func::new_proto(),
             prev: std::ptr::null_mut(),
@@ -781,7 +784,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
             lasttarget: 0,
             block_stack: Vec::new(),
             pending_func_block: None,
-            ls: ls as *mut LexState<'a, 'b>,
+            ls,
             // perf: inst_lines 与 proto.code 在 emit 中 1:1 同步 push,
             // proto.code 初始容量 8 (new_proto), inst_lines 初始容量 0 导致
             // 前 8 条指令期间 inst_lines 扩容 2 次 (0→4→8)。
@@ -13047,7 +13050,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
         }
     }
     expect(fs, &Token::RParen);
-    let mut new_fs = FuncState::new(fs.ls_mut());
+    let mut new_fs = FuncState::new(fs.ls);
     new_fs.prev = fs as *mut FuncState; // like C's fs->prev = ls->fs
     new_fs.proto.num_params = n_params;
     new_fs.proto.line_defined = line_defined;

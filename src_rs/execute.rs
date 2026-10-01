@@ -43,7 +43,7 @@ static LUA_VM_TRACE_LEVEL: OnceLock<u8> = OnceLock::new();
 /// GETTABUP/GETFIELD 单次探测特化的命中值 — 借用块内提取 owned,
 /// 块外写栈 (write_stack 需要 &mut state, 与表借用冲突)。
 enum SpecValue<'a> {
-    Builtin(crate::objects::BuiltinFn<'a>),
+    Builtin(crate::objects::BuiltinFn),
     Table(Table<'a>),
     /// trivial 值 (Float/Integer) 直取 — 16B Copy, 免二次哈希与 clone
     Trivial(TValue<'a>),
@@ -5076,7 +5076,7 @@ impl VmExecutor {
     fn fuse_pure_call<'a>(
         state: &mut LuaState<'a>,
         a2: usize,
-        bf: crate::objects::BuiltinFn<'a>,
+        bf: crate::objects::BuiltinFn,
         mv_idx: usize,
     ) -> Result<usize, VmError<'a>> {
         if state.exec.hook_mask != 0 || !bf.is_pure() {
@@ -5248,7 +5248,7 @@ impl VmExecutor {
         a: usize,
         b: usize,
         c: i32,
-        bf: crate::objects::BuiltinFn<'a>,
+        bf: crate::objects::BuiltinFn,
     ) -> Result<(), VmError<'a>> {
         let nargs = if b == 0 {
             state.exec.top.saturating_sub(a + 1)
@@ -5280,7 +5280,7 @@ impl VmExecutor {
     fn pure_builtin_yielded<'a>(
         state: &mut LuaState<'a>,
         a: usize,
-        bf: crate::objects::BuiltinFn<'a>,
+        bf: crate::objects::BuiltinFn,
         values: Vec<TValue<'a>>,
     ) -> VmError<'a> {
         state.exec.call_info.push(crate::state::CallInfoEntry {
@@ -5303,7 +5303,7 @@ impl VmExecutor {
     fn pure_builtin_errored<'a>(
         state: &mut LuaState<'a>,
         a: usize,
-        bf: crate::objects::BuiltinFn<'a>,
+        bf: crate::objects::BuiltinFn,
         e: VmError<'a>,
     ) -> VmError<'a> {
         state.exec.call_info.push(crate::state::CallInfoEntry {

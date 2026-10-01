@@ -3342,13 +3342,12 @@ pub fn create_debug_lib_table<'a>(state: &LuaState<'a>) -> Table<'a> {
     let mut lib = Table::new();
 
     // 注册所有 debug 函数 (使用 BuiltinFn 函数指针)
-    let register = |lib: &mut Table<'a>,
-                    name: &'static std::ffi::CStr,
-                    func: crate::objects::BuiltinFnPtr<'a>| {
-        let key = state.intern(name.to_str().unwrap_or(""));
-        let name_ptr = name.as_ptr() as *const u8;
-        lib.set(key, BuiltinFn::impure_tvalue(func, name_ptr));
-    };
+    let register =
+        |lib: &mut Table<'a>, name: &'static std::ffi::CStr, func: crate::objects::BuiltinFnPtr| {
+            let key = state.intern(name.to_str().unwrap_or(""));
+            let name_ptr = name.as_ptr() as *const u8;
+            lib.set(key, BuiltinFn::impure_tvalue(func, name_ptr));
+        };
 
     register(&mut lib, c"traceback", call_traceback);
     register(&mut lib, c"debug", call_debug);

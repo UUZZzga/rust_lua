@@ -310,8 +310,8 @@ impl fmt::Display for LuaType {
 /// - `Err(other)`: 运行时错误
 ///
 /// 对应 C 的 `lua_CFunction`，但更适合 Rust 用户使用。
-pub type BuiltinFnPtr<'a> =
-    fn(state: &mut LuaState<'a>, a: usize, nargs: usize, nresults: i32) -> Result<(), VmError<'a>>;
+pub type BuiltinFnPtr =
+    for<'a, 's> fn(&'a mut LuaState<'s>, usize, usize, i32) -> Result<(), VmError<'s>>;
 
 /// Rust 原生内置函数
 ///
@@ -340,7 +340,7 @@ pub type BuiltinFnPtr<'a> =
 /// When: 用 `TValue::BuiltinFn(BuiltinFn { func, name })` 注册到表中
 /// Then: Lua 代码调用该函数时，VM 直接通过函数指针调用，无需 tag 派发
 #[derive(Clone, Copy)]
-pub struct BuiltinFn<'a> {
+pub struct BuiltinFn {
     /// 编码后的函数指针 — bit0 = pure 标志 (1: 纯函数), bit1.. = 真实函数地址。
     ///
     /// 函数指针按机器字长对齐 (≥2), bit0 恒 0 可安全借用。pure 标志内嵌
@@ -350,31 +350,33 @@ pub struct BuiltinFn<'a> {
     ///
     /// 任何调用/比较该指针的位置必须经 call_target()/raw_func() 解码。
     /// name 登记表 (builtin_names) 用解码后的原始指针, 与 impure 注册一致。
-    pub func: BuiltinFnPtr<'a>,
+    pub func: BuiltinFnPtr,
 }
 
-impl<'a> BuiltinFn<'a> {
+impl BuiltinFn {
     /// bit0 掩码 — pure 标志位
+    /// (Miri 下不做低位编码, 该常量未被引用)
+    #[cfg_attr(miri, allow(dead_code))]
     const PURE_BIT: usize = 1;
 
     /// 标准 BuiltinFn 构造（impure — 可能回调 Lua / yield）。
     ///
     /// name 不存储在结构体内（为压缩 TValue 到 16 字节）：注册时登记到
     /// 全局 BUILTIN_NAMES 表（func 指针 → NUL 终止名字），traceback 冷路径查表。
-    pub fn impure(func: BuiltinFnPtr<'a>, name: *const u8) -> Self {
+    pub fn impure(func: BuiltinFnPtr, name: *const u8) -> Self {
         builtin_names::register(func, name);
         Self { func }
     }
 
     /// 构造 BuiltinFn 并返回 TValue 包装
-    pub fn impure_tvalue(func: BuiltinFnPtr<'a>, name: *const u8) -> TValue<'a> {
+    pub fn impure_tvalue<'a>(func: BuiltinFnPtr, name: *const u8) -> TValue<'a> {
         TValue::BuiltinFn(Self::impure(func, name))
     }
 
     /// 纯函数 BuiltinFn 构造 — 不回调 Lua / 不 yield / 错误只返回 Err。
     /// 数学库等纯函数注册用此构造; op_call 见 pure 位 (func bit0) 直接走
     /// 零簿记快速路径 (跳过 CallInfoEntry push/pop + name_str strlen)。
-    pub fn pure_fn(func: BuiltinFnPtr<'a>, name: *const u8) -> Self {
+    pub fn pure_fn(func: BuiltinFnPtr, name: *const u8) -> Self {
         builtin_names::register(func, name);
         Self {
             func: Self::encode_pure(func),
@@ -382,33 +384,66 @@ impl<'a> BuiltinFn<'a> {
     }
 
     /// 构造 BuiltinFn 并返回 TValue 包装
-    pub fn pure_fn_tvalue(func: BuiltinFnPtr<'a>, name: *const u8) -> TValue<'a> {
+    pub fn pure_fn_tvalue<'a>(func: BuiltinFnPtr, name: *const u8) -> TValue<'a> {
         TValue::BuiltinFn(Self::pure_fn(func, name))
     }
 
-    /// 编码: 原始函数指针 | PURE_BIT
-    fn encode_pure(func: BuiltinFnPtr<'a>) -> BuiltinFnPtr<'a> {
-        // SAFETY: 函数指针对齐 >= 2, bit0 恒 0, | 1 不改变高位地址
-        unsafe { std::mem::transmute::<usize, BuiltinFnPtr>(func as usize | Self::PURE_BIT) }
+    /// 编码: 原始函数指针 | PURE_BIT，保留 provenance
+    fn encode_pure(func: BuiltinFnPtr) -> BuiltinFnPtr {
+        // Miri 的函数指针地址是合成地址, 低位不保证为 0 — 置 PURE_BIT 后再剥离会
+        // 得到无效指针 (UB)。故 Miri 下不做低位编码: is_pure() 恒 false, 走通用
+        // 调用路径, 语义等价, 仅跳过 pure 快速路径优化。
+        #[cfg(miri)]
+        {
+            func
+        }
+        #[cfg(not(miri))]
+        {
+            // SAFETY: fn ptr 与 *const () 均为 thin pointer, 大小相同;
+            // transmute 在指针类型间保 provenance.
+            let p: *const () = unsafe { std::mem::transmute(func) };
+            // map_addr 保留 provenance, 只改地址数值
+            let p = p.map_addr(|a| a | Self::PURE_BIT);
+            // SAFETY: 同上, 反向 transmute
+            unsafe { std::mem::transmute(p) }
+        }
     }
 
     /// 解码: 剥离 pure 位得到可调用函数指针
     #[inline]
-    pub fn call_target(&self) -> BuiltinFnPtr<'a> {
-        // SAFETY: bit0 是自设标志位, 剥离后恢复原始函数指针
-        unsafe { std::mem::transmute::<usize, BuiltinFnPtr>(self.func as usize & !Self::PURE_BIT) }
+    pub fn call_target(&self) -> BuiltinFnPtr {
+        // Miri 下未编码低位 (见 encode_pure), 直接返回原指针
+        #[cfg(miri)]
+        {
+            self.func
+        }
+        #[cfg(not(miri))]
+        {
+            let p: *const () = unsafe { std::mem::transmute(self.func) };
+            let p = p.map_addr(|a| a & !Self::PURE_BIT);
+            unsafe { std::mem::transmute(p) }
+        }
     }
 
     /// 解码后的原始函数指针 (比较/查表用, 与注册时的指针一致)
     #[inline]
-    pub fn raw_func(&self) -> BuiltinFnPtr<'a> {
+    pub fn raw_func(&self) -> BuiltinFnPtr {
         self.call_target()
     }
 
-    /// 是否为纯函数 (bit0 测试)
+    /// 是否为纯函数
     #[inline]
     pub fn is_pure(&self) -> bool {
-        self.func as usize & Self::PURE_BIT != 0
+        // Miri 下不做低位编码 (见 encode_pure), 恒为非纯函数
+        #[cfg(miri)]
+        {
+            false
+        }
+        #[cfg(not(miri))]
+        {
+            let p: *const () = unsafe { std::mem::transmute(self.func) };
+            p.addr() & Self::PURE_BIT != 0
+        }
     }
 
     /// 获取函数名的 &str（冷路径：traceback / Debug 输出）
@@ -419,11 +454,12 @@ impl<'a> BuiltinFn<'a> {
     }
 }
 
-impl<'a> std::fmt::Debug for BuiltinFn<'a> {
+impl std::fmt::Debug for BuiltinFn {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let p: *const () = unsafe { std::mem::transmute(self.func) };
         f.debug_struct("BuiltinFn")
             .field("name", &self.name_str())
-            .field("func", &(self.func as usize))
+            .field("func", &p.addr())
             .finish()
     }
 }
@@ -441,7 +477,7 @@ mod builtin_names {
     use std::sync::RwLock;
 
     // HashMap 按需扩容 — 注册总量 ~200 (9 个库)
-    static NAMES: RwLock<Option<HashMap<usize, &'static str>>> = RwLock::new(None);
+    static NAMES: RwLock<Option<HashMap<super::BuiltinFnPtr, &'static str>>> = RwLock::new(None);
 
     /// 登记 func → name（重复登记以先注册者为准，语义与 C 静态注册一致）
     pub fn register(func: super::BuiltinFnPtr, name: *const u8) {
@@ -460,7 +496,7 @@ mod builtin_names {
         if let Ok(mut guard) = NAMES.write() {
             guard
                 .get_or_insert_with(HashMap::new)
-                .entry(func as usize)
+                .entry(func)
                 .or_insert(name_str);
         }
     }
@@ -474,7 +510,7 @@ mod builtin_names {
             Err(_) => return "",
         };
         match guard.as_ref() {
-            Some(m) => m.get(&(func as usize)).copied().unwrap_or(""),
+            Some(m) => m.get(&func).copied().unwrap_or(""),
             None => "",
         }
     }
@@ -519,7 +555,7 @@ mod builtin_names {
 #[derive(Clone)]
 pub struct RustClosure<'a> {
     /// 函数指针 — 签名与 BuiltinFnPtr 相同
-    pub func: BuiltinFnPtr<'a>,
+    pub func: BuiltinFnPtr,
     /// 函数名（NUL 终止 C 字符串，用于 traceback）
     pub name: *const u8,
     /// 上值列表 — 可变，存储 coroutine.wrap 的 Thread 或 io.lines 的文件/格式
@@ -622,7 +658,7 @@ pub enum TValue<'a> {
     ///
     /// 用于注册 Rust 实现的内置函数。调用时直接通过函数指针派发，
     /// 无需 tag 范围匹配。详见 `BuiltinFn` 类型文档。
-    BuiltinFn(BuiltinFn<'a>),
+    BuiltinFn(BuiltinFn),
     /// Rust 闭包（函数指针 + 可变 upvalues）
     ///
     /// 用于 coroutine.wrap 和 io.lines 等需要携带状态的内置函数。

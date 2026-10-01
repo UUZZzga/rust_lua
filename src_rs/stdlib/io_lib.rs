@@ -99,11 +99,7 @@ fn c_stdin() -> *mut libc::FILE {
     {
         use std::cell::OnceCell;
         thread_local!(static STDIN: OnceCell<*mut libc::FILE> = OnceCell::new());
-        STDIN.with(|s| {
-            *s.get_or_init(|| unsafe {
-                libc::fdopen(libc::STDIN_FILENO, b"r\0".as_ptr() as *const _)
-            })
-        })
+        STDIN.with(|s| *s.get_or_init(|| unsafe { libc::fdopen(0, b"r\0".as_ptr() as *const _) }))
     }
     #[cfg(all(not(miri), not(target_os = "windows")))]
     {
@@ -120,11 +116,7 @@ fn c_stdout() -> *mut libc::FILE {
     {
         use std::cell::OnceCell;
         thread_local!(static STDOUT: OnceCell<*mut libc::FILE> = OnceCell::new());
-        STDOUT.with(|s| {
-            *s.get_or_init(|| unsafe {
-                libc::fdopen(libc::STDOUT_FILENO, b"w\0".as_ptr() as *const _)
-            })
-        })
+        STDOUT.with(|s| *s.get_or_init(|| unsafe { libc::fdopen(1, b"w\0".as_ptr() as *const _) }))
     }
     #[cfg(all(not(miri), not(target_os = "windows")))]
     {
@@ -141,11 +133,7 @@ fn c_stderr() -> *mut libc::FILE {
     {
         use std::cell::OnceCell;
         thread_local!(static STDERR: OnceCell<*mut libc::FILE> = OnceCell::new());
-        STDERR.with(|s| {
-            *s.get_or_init(|| unsafe {
-                libc::fdopen(libc::STDERR_FILENO, b"w\0".as_ptr() as *const _)
-            })
-        })
+        STDERR.with(|s| *s.get_or_init(|| unsafe { libc::fdopen(2, b"w\0".as_ptr() as *const _) }))
     }
     #[cfg(all(not(miri), not(target_os = "windows")))]
     {
@@ -2265,7 +2253,7 @@ pub fn open_io_lib<'a>(state: &mut LuaState<'a>) {
     let register = |table: &mut crate::table::Table<'a>,
                     state: &LuaState<'a>,
                     name: &'static std::ffi::CStr,
-                    func: crate::objects::BuiltinFnPtr<'a>| {
+                    func: crate::objects::BuiltinFnPtr| {
         let key = state.intern(name.to_str().unwrap_or(""));
         let name_ptr = name.as_ptr() as *const u8;
         table.set(key, BuiltinFn::impure_tvalue(func, name_ptr));

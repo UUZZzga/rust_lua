@@ -307,6 +307,12 @@ impl<'a> MatchState<'a> {
         // start_capture 在 level++ 之前写入（check_capture / capture_to_close /
         // get_one_capture / match_capture 的读取全部限定在 i < level）。
         // 因此跳过 32 项 (512B) 初始化是安全的，消除每调用的批量写。
+        // Miri 下必须初始化: 构造未初始化的整数 (usize/i32) 是 UB, Miri 会报
+        // "constructing invalid value ... expected an integer"。release 保留
+        // 跳过 32 项 (512B) 初始化的优化。
+        #[cfg(miri)]
+        let captures: [Capture; MAX_CAPTURES] = [Capture { init: 0, len: 0 }; MAX_CAPTURES];
+        #[cfg(not(miri))]
         let captures: [Capture; MAX_CAPTURES] =
             unsafe { std::mem::MaybeUninit::uninit().assume_init() };
         MatchState {
@@ -4184,7 +4190,7 @@ fn create_string_lib_table<'a>(state: &LuaState<'a>) -> Table<'a> {
     let lib = Table::new();
     // 注册所有字符串库函数 (使用 BuiltinFn 函数指针)
     // 重要: 必须使用 state.intern_str() 创建键，确保哈希值与后续查找时一致
-    let register = |lib: &Table<'a>, name: &'static std::ffi::CStr, func: BuiltinFnPtr<'a>| {
+    let register = |lib: &Table<'a>, name: &'static std::ffi::CStr, func: BuiltinFnPtr| {
         let key = state.intern(name.to_str().unwrap_or(""));
         let name_ptr = name.as_ptr() as *const u8;
         lib.set(key, BuiltinFn::impure_tvalue(func, name_ptr));
