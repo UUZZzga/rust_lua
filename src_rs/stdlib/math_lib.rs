@@ -1389,10 +1389,10 @@ pub fn open_math_lib<'a>(state: &mut LuaState<'a>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::strings::lua_string_with_nul;
+    use crate::strings::{lua_string_with_nul, ShortString};
 
     fn make_str(s: &str) -> TValue<'_> {
-        TValue::ShortStr(crate::strings::ArcRc::new_msg(
+        TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
             0,
             0,
             &lua_string_with_nul(s).into_bytes(),

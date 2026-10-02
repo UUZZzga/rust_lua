@@ -821,7 +821,7 @@ mod tests {
     #[test]
     fn test_get_string_key() {
         let t = Table::new();
-        let key = TValue::ShortStr(crate::strings::ArcRc::new_msg(
+        let key = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
             0,
             0,
             &lua_string_with_nul("name").into_bytes(),
@@ -912,7 +912,7 @@ mod tests {
     #[test]
     fn test_set_string_key() {
         let t = Table::new();
-        let key = TValue::ShortStr(crate::strings::ArcRc::new_msg(
+        let key = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
             0,
             0,
             &lua_string_with_nul("key").into_bytes(),
@@ -1177,7 +1177,7 @@ mod tests {
     #[test]
     fn test_rehash_preserves_string_keys() {
         let t = Table::new();
-        let key = TValue::ShortStr(crate::strings::ArcRc::new_msg(
+        let key = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
             0,
             0,
             &lua_string_with_nul("mykey").into_bytes(),

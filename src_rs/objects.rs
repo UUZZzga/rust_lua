@@ -24,6 +24,7 @@
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+use crate::alloc::SimpleRc;
 use crate::strings::{
     lua_string_as_str, lua_string_eq, lua_string_hash, ArcRc, LongString, ShortString,
 };
@@ -640,7 +641,7 @@ pub enum TValue<'a> {
     Float(f64),
     /// 字符串（短字符串和长字符串）
     ShortStr(ArcRc<ShortString>),
-    LongStr(Rc<LongString>),
+    LongStr(SimpleRc<LongString>),
     /// 表
     Table(Table<'a>),
     /// Lua 闭包
@@ -2863,8 +2864,11 @@ mod tests {
 
     #[test]
     fn test_luastring_short() {
-        let short =
-            crate::strings::ArcRc::new_msg(0, 0, &lua_string_with_nul("hello").into_bytes());
+        let short = crate::strings::ArcRc::<ShortString>::new_msg(
+            0,
+            0,
+            &lua_string_with_nul("hello").into_bytes(),
+        );
         let ts = TValue::ShortStr(short);
         assert_eq!(lua_string_as_str(&ts), "hello");
         assert_eq!(lua_string_len(&ts), 5);
@@ -2874,20 +2878,22 @@ mod tests {
 
     #[test]
     fn test_luastring_long() {
-        let long = LongString {
-            hash: 0.into(),
-            extra: 0.into(),
-            contents: lua_string_with_nul(&"a".repeat(100)),
-            ptr_id: 0,
-        };
-        let ts = TValue::LongStr(Rc::new(long));
+        let long = crate::alloc::SimpleRc::<LongString>::new_msg(
+            None,
+            &lua_string_with_nul(&"a".repeat(100)).into_bytes(),
+        );
+        let ts = TValue::LongStr(long);
         assert_eq!(lua_string_len(&ts), 100);
         assert!(matches!(ts, TValue::LongStr(_)));
     }
 
     #[test]
     fn test_luastring_empty() {
-        let short = crate::strings::ArcRc::new_msg(0, 0, &lua_string_with_nul("").into_bytes());
+        let short = crate::strings::ArcRc::<ShortString>::new_msg(
+            0,
+            0,
+            &lua_string_with_nul("").into_bytes(),
+        );
         let ts = TValue::ShortStr(short);
         assert!(lua_string_is_empty(&ts));
         assert_eq!(lua_string_len(&ts), 0);
@@ -2896,34 +2902,38 @@ mod tests {
 
     #[test]
     fn test_luastring_eq() {
-        let arc1 = crate::strings::ArcRc::new_msg(0, 0, &lua_string_with_nul("foo").into_bytes());
+        let arc1 = crate::strings::ArcRc::<ShortString>::new_msg(
+            0,
+            0,
+            &lua_string_with_nul("foo").into_bytes(),
+        );
         let arc2 = crate::strings::ArcRc::clone(&arc1);
         let ts1 = TValue::ShortStr(arc1);
         let ts2 = TValue::ShortStr(arc2);
         assert_eq!(ts1, ts2);
 
-        let arc3 = crate::strings::ArcRc::new_msg(0, 0, &lua_string_with_nul("bar").into_bytes());
+        let arc3 = crate::strings::ArcRc::<ShortString>::new_msg(
+            0,
+            0,
+            &lua_string_with_nul("bar").into_bytes(),
+        );
         let ts3 = TValue::ShortStr(arc3);
         assert_ne!(ts1, ts3);
 
-        let long1 = TValue::LongStr(Rc::new(LongString {
-            hash: 0.into(),
-            extra: 0.into(),
-            contents: lua_string_with_nul("test"),
-            ptr_id: 0,
-        }));
-        let long2 = TValue::LongStr(Rc::new(LongString {
-            hash: 0.into(),
-            extra: 0.into(),
-            contents: lua_string_with_nul("test"),
-            ptr_id: 0,
-        }));
+        let long1 = TValue::LongStr(SimpleRc::<LongString>::new_msg(
+            None,
+            &lua_string_with_nul("test").into_bytes(),
+        ));
+        let long2 = TValue::LongStr(SimpleRc::<LongString>::new_msg(
+            None,
+            &lua_string_with_nul("test").into_bytes(),
+        ));
         assert_eq!(long1, long2);
     }
 
     #[test]
     fn test_luastring_as_str() {
-        let short: TValue<'_> = TValue::ShortStr(crate::strings::ArcRc::new_msg(
+        let short: TValue<'_> = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
             0,
             0,
             &lua_string_with_nul("abc").into_bytes(),
@@ -3433,7 +3443,6 @@ mod tests {
         println!("LuaThread: {}", size_of::<LuaThread>());
         println!("Udata: {}", size_of::<Udata>());
         println!("LCFunction: {}", size_of::<LCFunction>());
-        println!("LongString: {}", size_of::<crate::strings::LongString>());
         println!("NilKind: {}", size_of::<NilKind>());
         println!("Instruction: {}", size_of::<Instruction>());
         println!("Proto: {}", size_of::<Proto>());

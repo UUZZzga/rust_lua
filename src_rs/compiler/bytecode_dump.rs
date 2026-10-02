@@ -1,3 +1,4 @@
+use crate::alloc::SimpleRc;
 #[cfg(feature = "cmp_c")]
 use crate::lua_ffi;
 use crate::objects::{LocVar, UpvalDesc};
@@ -1497,12 +1498,10 @@ pub fn dump_proto(f: &Proto, strip: bool) -> Vec<u8> {
 /// 创建长字符串的辅助函数
 /// 使用 with_nul 添加额外 NUL 终止符，与 as_str_inner 的 NUL 剥离机制配合
 fn make_long_string<'a>(s: &str) -> TValue<'a> {
-    TValue::LongStr(Rc::new(LongString {
-        contents: lua_string_with_nul(s),
-        hash: 0.into(),
-        extra: 0.into(),
-        ptr_id: crate::gc::new_ptr_id(),
-    }))
+    TValue::LongStr(SimpleRc::<LongString>::new_msg(
+        None,
+        lua_string_with_nul(s).as_bytes(),
+    ))
 }
 
 /// 将 DumpedFunction 转换为 Proto

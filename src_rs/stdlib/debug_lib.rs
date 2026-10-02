@@ -3382,7 +3382,7 @@ pub fn open_debug_lib(state: &mut LuaState) {
 
 #[cfg(test)]
 mod tests {
-    use crate::objects::UpValVec;
+    use crate::{objects::UpValVec, strings::ShortString};
 
     use super::*;
 
@@ -3529,11 +3529,13 @@ mod tests {
             code: Rc::new(vec![]),
             protos: Rc::new(vec![]),
             upvalues: Rc::new(vec![UpvalDesc {
-                name: Some(TValue::ShortStr(crate::strings::ArcRc::new_msg(
-                    0,
-                    0,
-                    &crate::strings::lua_string_with_nul("x").into_bytes(),
-                ))),
+                name: Some(TValue::ShortStr(
+                    crate::strings::ArcRc::<ShortString>::new_msg(
+                        0,
+                        0,
+                        &crate::strings::lua_string_with_nul("x").into_bytes(),
+                    ),
+                )),
                 in_stack: false,
                 idx: 0,
                 parent_local_idx: 0,
@@ -3725,7 +3727,7 @@ mod tests {
     #[test]
     fn test_short_src() {
         let make_str = |s: &str| -> TValue {
-            TValue::ShortStr(crate::strings::ArcRc::new_msg(
+            TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
                 0,
                 0,
                 &crate::strings::lua_string_with_nul(s).into_bytes(),

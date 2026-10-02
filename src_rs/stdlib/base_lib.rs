@@ -3406,13 +3406,13 @@ pub fn open_base_lib<'a>(state: &mut LuaState<'a>) {
 mod tests {
     use crate::{
         stdlib::string_lib::str_rep,
-        strings::{lua_string_with_nul, new_long_str_from_string},
+        strings::{lua_string_with_nul, new_long_str_from_string, ShortString},
     };
 
     use super::*;
 
     fn make_str(s: &str) -> TValue<'_> {
-        TValue::ShortStr(crate::strings::ArcRc::new_msg(
+        TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
             0,
             0,
             &lua_string_with_nul(s).into_bytes(),

@@ -108,7 +108,7 @@ pub type ArcRcHeader<T> = <ArcRc<T> as IsArcRc>::Header;
 #[cfg(not(size_optimized))]
 use hashbrown::HashTable;
 
-use crate::alloc::{IsArcRc, RcPayload};
+use crate::alloc::{IsArcRc, RcPayload, SimpleRc, SimpleRcHeader};
 use crate::objects::TValue;
 
 // ============================================================================
@@ -185,6 +185,7 @@ unsafe impl RcPayload for ShortString {
 impl ArcRc<ShortString> {
     pub fn new_msg(hash: u64, code: u32, data: &[u8]) -> Self {
         debug_assert!(data.len() <= u32::MAX as usize, "ShortString 长度超 u32");
+        debug_assert!(data.last() == Some(&0));
 
         let tmp: ArcRc<ShortString> = unsafe {
             let align = ShortString::ALIGN;
@@ -229,34 +230,111 @@ impl ArcRc<ShortString> {
 ///
 /// `contents: String` 内含长度信息，无需独立的 `lnglen` 字段。
 /// - `Hash::hash` 首次调用时自动计算并缓存 hash，后续 O(1) 复用
-pub struct LongString {
+/// ShortString 的固定前缀（Sized）
+#[repr(C)]
+pub struct LongStringFixed {
     pub hash: Cell<u64>,
+    pub len: u32,
     pub extra: Cell<u8>,
-    pub contents: String,
-    /// 稳定的唯一标识符，用于 %p 格式输出。
-    /// 克隆时保留同一值（表示同一个字符串实例）。
-    pub ptr_id: u32,
 }
 
-impl Clone for LongString {
-    fn clone(&self) -> Self {
-        LongString {
-            hash: self.hash.clone(),
-            extra: self.extra.clone(),
-            contents: self.contents.clone(),
-            ptr_id: self.ptr_id,
-        }
+#[derive(Debug)]
+#[repr(C)]
+pub struct LongString {
+    pub hash: Cell<u64>,
+    pub len: u32,
+    pub extra: Cell<u8>,
+    pub data: [u8],
+}
+
+impl LongString {
+    pub const FIXED_SIZE: usize = std::mem::size_of::<LongStringFixed>();
+    pub const ALIGN: usize = std::mem::align_of::<LongStringFixed>();
+}
+
+// 编译期断言：前缀布局必须与 ShortString 的固定部分一致
+const _: () = {
+    assert!(
+        LongString::FIXED_SIZE == 16,
+        "LongString 固定部分应为 16 字节"
+    );
+    assert!(LongString::ALIGN == 8, "LongString 应对齐到 8");
+};
+
+unsafe impl RcPayload for LongString {
+    const ALIGN: usize = std::mem::align_of::<u32>();
+
+    unsafe fn as_ref<'a>(payload: *const u8) -> &'a LongString {
+        let len = *(payload.add(std::mem::offset_of!(LongString, len)) as *const u32) as usize;
+        let sp: *const LongString = std::mem::transmute((payload, len));
+        &*sp
+    }
+
+    unsafe fn drop_payload(_: *mut u8) {}
+
+    unsafe fn payload_size(p: *const u8) -> usize {
+        let len = *(p.add(8) as *const u32) as usize;
+        ShortString::FIXED_SIZE + len
     }
 }
 
-impl Debug for LongString {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        f.debug_struct("LongString")
-            .field("hash", &self.hash)
-            .field("extra", &self.extra)
-            .field("len", &self.contents.len())
-            .field("contents", &self.contents)
-            .finish()
+impl SimpleRc<LongString> {
+    pub fn new_msg(hash: Option<u64>, data: &[u8]) -> Self {
+        debug_assert!(data.len() <= u32::MAX as usize, "LongString 长度超 u32");
+        debug_assert!(data.last() == Some(&0));
+
+        let tmp: SimpleRc<LongString> = unsafe {
+            let align = LongString::ALIGN;
+            let fixed = LongString::FIXED_SIZE;
+            let payload_size = fixed + data.len();
+
+            // 1) 一次分配 header + payload
+            let header_offset = payload_offset(align);
+            let layout = block_layout(payload_size, align);
+            let base = alloc(layout);
+            if base.is_null() {
+                handle_alloc_error(layout);
+            }
+
+            // 2) 初始化 header
+            std::ptr::write(base as *mut SimpleRcHeader, SimpleRcHeader::default());
+
+            // 3) 写固定部分（严格按结构体字段顺序）
+            let p = base.add(header_offset);
+            match hash {
+                Some(hash) => {
+                    std::ptr::write(
+                        p.add(std::mem::offset_of!(LongString, hash)) as *mut u64,
+                        hash,
+                    );
+                    std::ptr::write(p.add(std::mem::offset_of!(LongString, extra)) as *mut u8, 1);
+                }
+                None => {
+                    std::ptr::write(p.add(std::mem::offset_of!(LongString, hash)) as *mut u64, 0);
+                    std::ptr::write(p.add(std::mem::offset_of!(LongString, extra)) as *mut u8, 0);
+                }
+            }
+
+            std::ptr::write(
+                p.add(std::mem::offset_of!(LongString, len)) as *mut u32,
+                data.len() as u32,
+            );
+
+            // 4) 写变长部分（紧跟在固定部分后面）
+            if !data.is_empty() {
+                std::ptr::copy_nonoverlapping(
+                    data.as_ptr(),
+                    p.add(std::mem::offset_of!(LongString, extra) + 1),
+                    data.len(),
+                );
+            }
+
+            SimpleRc::from_raw_base(base)
+        };
+
+        debug_assert_eq!(tmp.len, data.len() as u32);
+        debug_assert_eq!(&tmp.data[0..tmp.len as usize], data);
+        tmp
     }
 }
 
@@ -264,7 +342,7 @@ impl Debug for LongString {
 #[derive(Debug, Clone)]
 pub enum LLuaString {
     Short(ArcRc<ShortString>),
-    Long(Rc<LongString>),
+    Long(SimpleRc<LongString>),
 }
 
 impl LLuaString {
@@ -278,7 +356,7 @@ impl LLuaString {
     pub fn get_str(&self) -> &str {
         match self {
             LLuaString::Short(s) => std::str::from_utf8(&s.data[0..s.len as usize]).unwrap(),
-            LLuaString::Long(s) => &s.contents,
+            LLuaString::Long(s) => std::str::from_utf8(&s.data[0..s.len as usize]).unwrap(),
         }
     }
 }
@@ -287,7 +365,7 @@ impl PartialEq for LLuaString {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Short(l0), Self::Short(r0)) => core::ptr::eq(l0, r0),
-            (Self::Long(l0), Self::Long(r0)) => l0 == r0,
+            (Self::Long(l0), Self::Long(r0)) => **l0 == **r0,
             _ => false,
         }
     }
@@ -333,7 +411,10 @@ impl PartialEq for LongString {
                 return false;
             }
         }
-        content_eq(&self.contents, &other.contents)
+        content_eq(
+            std::str::from_utf8(&self.data[0..self.len as usize]).unwrap(),
+            std::str::from_utf8(&other.data[0..other.len as usize]).unwrap(),
+        )
     }
 }
 
@@ -344,15 +425,8 @@ impl PartialEq for LongString {
 /// 比较两个 `LuaString` 的内容是否相同。
 pub fn eq_str<'a>(a: &TValue<'a>, b: &TValue<'a>) -> bool {
     match (a, b) {
-        (TValue::ShortStr(a), TValue::ShortStr(b)) => {
-            ArcRc::ptr_eq(a, b)
-                || (a.hash == b.hash
-                    && content_eq(
-                        std::str::from_utf8(&a.data[0..a.len as usize]).unwrap(),
-                        std::str::from_utf8(&b.data[0..b.len as usize]).unwrap(),
-                    ))
-        }
-        (TValue::LongStr(a), TValue::LongStr(b)) => content_eq(&a.contents, &b.contents),
+        (TValue::ShortStr(a), TValue::ShortStr(b)) => ArcRc::ptr_eq(a, b),
+        (TValue::LongStr(a), TValue::LongStr(b)) => **a == **b,
         _ => false,
     }
 }
@@ -460,7 +534,7 @@ impl StringTable {
         }
 
         // 写路径: 需要插入新字符串
-        let ts = ArcRc::new_msg(h, 0, &lua_string_with_nul(str).into_bytes());
+        let ts = ArcRc::<ShortString>::new_msg(h, 0, &lua_string_with_nul(str).into_bytes());
         // hasher 函数仅在 resize 时调用, 返回预计算 hash
         ht.insert_unique(h, ArcRc::clone(&ts), |ts| ts.hash);
         // SAFETY: 同上, nuse 也是 RefCell 包装, 单线程下安全.
@@ -540,7 +614,7 @@ impl StringTable {
             *buf.as_mut_ptr().add(blen) = 0;
             buf.set_len(blen + 1);
         }
-        let ts = ArcRc::new_msg(
+        let ts = ArcRc::<ShortString>::new_msg(
             h,
             0,
             &unsafe { String::from_utf8_unchecked(buf) }.into_bytes(),
@@ -954,7 +1028,7 @@ pub fn lua_string_gc_mem_size(str: &TValue) -> usize {
         TValue::ShortStr(s) => std::mem::size_of::<ShortStringFixed>() + s.len as usize + 16,
         // Box<LongString> 堆分配 = LongString 自身（Box 无额外头）
         // LongString = { hash: AtomicU64, extra: AtomicU8, contents: String, ptr_id: u32 }
-        TValue::LongStr(s) => std::mem::size_of::<LongString>() + s.contents.capacity() + 8,
+        TValue::LongStr(s) => std::mem::size_of::<LongStringFixed>() + s.len as usize + 16,
         _ => unreachable!("Not a string"),
     }
 }
@@ -975,8 +1049,8 @@ fn lua_string_as_str_inner<'a, 'b>(str: &'b TValue<'a>) -> &'b str {
             unsafe { std::str::from_utf8_unchecked(&s.data[0..s.len as usize - 1]) }
         }
         TValue::LongStr(s) => {
-            debug_assert!(s.contents.ends_with('\0'));
-            &s.contents[..s.contents.len() - 1]
+            debug_assert!(s.data[s.len as usize - 1] == 0);
+            unsafe { std::str::from_utf8_unchecked(&s.data[0..s.len as usize - 1]) }
         }
         _ => unreachable!("Not a string"),
     }
@@ -987,7 +1061,7 @@ fn lua_string_as_str_inner<'a, 'b>(str: &'b TValue<'a>) -> &'b str {
 pub fn lua_string_as_c_str_ptr(str: &TValue) -> *const c_char {
     match str {
         TValue::ShortStr(s) => s.data.as_ptr() as *const c_char,
-        TValue::LongStr(s) => s.contents.as_ptr() as *const c_char,
+        TValue::LongStr(s) => s.data.as_ptr() as *const c_char,
         _ => unreachable!("Not a string"),
     }
 }
@@ -997,7 +1071,7 @@ pub fn lua_string_as_c_str_ptr(str: &TValue) -> *const c_char {
 pub fn lua_string_len(str: &TValue) -> usize {
     match str {
         TValue::ShortStr(s) => s.len as usize - 1,
-        TValue::LongStr(s) => s.contents.len() - 1,
+        TValue::LongStr(s) => s.len as usize - 1,
         _ => unreachable!("Not a string"),
     }
 }
@@ -1025,12 +1099,10 @@ pub fn new_long_str<'a>(str: &str) -> TValue<'a> {
         str.len() > LUAI_MAXSHORTLEN,
         "长字符串长度必须大于 LUAI_MAXSHORTLEN"
     );
-    TValue::LongStr(Rc::new(LongString {
-        hash: 0.into(),
-        extra: 0.into(),
-        contents: lua_string_with_nul(str),
-        ptr_id: crate::gc::new_ptr_id(),
-    }))
+    TValue::LongStr(SimpleRc::<LongString>::new_msg(
+        None,
+        &lua_string_with_nul(str).into_bytes(),
+    ))
 }
 
 /// 创建一个长字符串对象，直接 consume 传入的 String，避免 clone。
@@ -1043,31 +1115,24 @@ pub fn new_long_str_from_string<'a>(mut s: String) -> TValue<'a> {
     );
     s.reserve(1); // 确保 capacity >= len+1，避免 push('\0') 扩容
     s.push('\0');
-    TValue::LongStr(Rc::new(LongString {
-        hash: 0.into(),
-        extra: 0.into(),
-        contents: s,
-        ptr_id: crate::gc::new_ptr_id(),
-    }))
+    TValue::LongStr(SimpleRc::<LongString>::new_msg(None, &s.into_bytes()))
 }
 
 pub fn new_long_bytes<'a>(bytes: Vec<u8>) -> TValue<'a> {
     let mut buf = bytes;
     buf.reserve(1); // 避免 push(0) 扩容
     buf.push(0);
-    TValue::LongStr(Rc::new(LongString {
-        hash: 0.into(),
-        extra: 0.into(),
-        contents: unsafe { String::from_utf8_unchecked(buf) },
-        ptr_id: crate::gc::new_ptr_id(),
-    }))
+    TValue::LongStr(SimpleRc::<LongString>::new_msg(
+        None,
+        &unsafe { String::from_utf8_unchecked(buf) }.into_bytes(),
+    ))
 }
 
 /// 确保长字符串有哈希值（惰性计算）。
 #[inline]
 pub fn ensure_long_hash(ls: &LongString) -> u64 {
     if ls.extra.get() == 0 {
-        let content = &ls.contents[..ls.contents.len() - 1];
+        let content = unsafe { std::str::from_utf8_unchecked(&ls.data[0..ls.len as usize - 1]) };
         let h = rust_hash(content);
         ls.hash.set(h);
         ls.extra.set(1);
@@ -1276,12 +1341,10 @@ mod tests {
     fn test_eq_str_short_vs_long() {
         let tb = StringTable::new();
         let short = tb.intern_value("hello");
-        let long = TValue::LongStr(Rc::new(LongString {
-            hash: 0.into(),
-            extra: 0.into(),
-            contents: "hello".to_string(),
-            ptr_id: 0,
-        }));
+        let long = TValue::LongStr(SimpleRc::<LongString>::new_msg(
+            None,
+            &lua_string_with_nul(&"hello").into_bytes(),
+        ));
         assert!(!eq_str(&short, &long), "不同类型（短 vs 长）必须不等");
     }
 
@@ -1328,12 +1391,8 @@ mod tests {
 
     #[test]
     fn test_ensure_long_hash_computes_on_first_call() {
-        let mut ls = LongString {
-            hash: 123.into(),
-            extra: 0.into(),
-            contents: "a".repeat(50),
-            ptr_id: 0,
-        };
+        let mut ls =
+            SimpleRc::<LongString>::new_msg(None, lua_string_with_nul(&"a".repeat(50)).as_bytes());
         let hash = ensure_long_hash(&mut ls);
         assert_eq!(ls.extra.get(), 1, "extra 应为 1（标记已计算哈希）");
         assert_eq!(hash, ls.hash.get(), "返回的哈希应与存储的一致");
@@ -1341,12 +1400,10 @@ mod tests {
 
     #[test]
     fn test_ensure_long_hash_idempotent() {
-        let mut ls = LongString {
-            hash: 0.into(),
-            extra: 1.into(),
-            contents: "a".repeat(50),
-            ptr_id: 0,
-        };
+        let mut ls = SimpleRc::<LongString>::new_msg(
+            Some(0),
+            lua_string_with_nul(&"a".repeat(50)).as_bytes(),
+        );
         let hash_before = ls.hash.get();
         let hash = ensure_long_hash(&mut ls);
         assert_eq!(hash, hash_before, "已有哈希不应重新计算");
@@ -1545,21 +1602,11 @@ mod tests {
     /// 同内容长字符串：extra=0 和 extra=1 产生相同 Hash
     #[test]
     fn test_hash_mixed_extra_same_content() {
-        let content = lua_string_with_nul(&"a".repeat(LUAI_MAXSHORTLEN + 1));
-        let unhashed = TValue::LongStr(Rc::new(LongString {
-            hash: 0.into(),
-            extra: 0.into(),
-            contents: content.clone(),
-            ptr_id: 0,
-        }));
-        let ls = LongString {
-            hash: 0.into(),
-            extra: 0.into(),
-            contents: content.clone(),
-            ptr_id: 0,
-        };
+        let content = lua_string_with_nul(&"a".repeat(LUAI_MAXSHORTLEN + 1)).into_bytes();
+        let unhashed = TValue::LongStr(SimpleRc::<LongString>::new_msg(None, &content));
+        let ls = SimpleRc::<LongString>::new_msg(None, &content);
         ensure_long_hash(&ls);
-        let hashed = TValue::LongStr(Rc::new(ls));
+        let hashed = TValue::LongStr(ls);
 
         assert_eq!(unhashed, hashed, "同内容的不同 extra 状态应相等");
 
@@ -1582,18 +1629,14 @@ mod tests {
     #[test]
     fn test_hash_same_content_different_hash_field() {
         let h = rust_hash("hello");
-        let ls1 = TValue::LongStr(Rc::new(LongString {
-            hash: 0.into(),
-            extra: 0.into(),
-            contents: lua_string_with_nul("hello"),
-            ptr_id: 0,
-        }));
-        let ls2 = TValue::LongStr(Rc::new(LongString {
-            hash: h.into(),
-            extra: 1.into(),
-            contents: lua_string_with_nul("hello"),
-            ptr_id: 0,
-        }));
+        let ls1 = TValue::LongStr(SimpleRc::<LongString>::new_msg(
+            None,
+            &lua_string_with_nul("hello").into_bytes(),
+        ));
+        let ls2 = TValue::LongStr(SimpleRc::<LongString>::new_msg(
+            Some(h),
+            &lua_string_with_nul("hello").into_bytes(),
+        ));
 
         assert_eq!(
             hash_one(&ls1),
@@ -1643,19 +1686,10 @@ mod tests {
     /// ensure_long_hash 同一内容多次调用，哈希值一致、不重复计算
     #[test]
     fn test_ensure_long_hash_same_content() {
-        let content = "a".repeat(LUAI_MAXSHORTLEN + 1);
-        let mut a = LongString {
-            hash: 0.into(),
-            extra: 0.into(),
-            contents: content.clone(),
-            ptr_id: 0,
-        };
-        let mut b = LongString {
-            hash: 0.into(),
-            extra: 0.into(),
-            contents: content.clone(),
-            ptr_id: 0,
-        };
+        let content = lua_string_with_nul(&"a".repeat(LUAI_MAXSHORTLEN + 1)).into_bytes();
+        let mut a = SimpleRc::<LongString>::new_msg(None, &content);
+        let b = SimpleRc::<LongString>::new_msg(None, &content);
+        let mut b = SimpleRc::<LongString>::new_msg(None, &content);
 
         let h0 = ensure_long_hash(&mut a);
         let h1 = ensure_long_hash(&mut b);
