@@ -3530,11 +3530,7 @@ mod tests {
             protos: Rc::new(vec![]),
             upvalues: Rc::new(vec![UpvalDesc {
                 name: Some(TValue::ShortStr(
-                    crate::strings::ArcRc::<ShortString>::new_msg(
-                        0,
-                        0,
-                        &crate::strings::lua_string_with_nul("x").into_bytes(),
-                    ),
+                    crate::strings::ArcRc::<ShortString>::new_sstr(0, 0, "x".as_bytes()),
                 )),
                 in_stack: false,
                 idx: 0,
@@ -3727,10 +3723,10 @@ mod tests {
     #[test]
     fn test_short_src() {
         let make_str = |s: &str| -> TValue {
-            TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
+            TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
                 0,
                 0,
-                &crate::strings::lua_string_with_nul(s).into_bytes(),
+                s.as_bytes(),
             ))
         };
 

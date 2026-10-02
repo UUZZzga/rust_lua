@@ -3406,16 +3406,16 @@ pub fn open_base_lib<'a>(state: &mut LuaState<'a>) {
 mod tests {
     use crate::{
         stdlib::string_lib::str_rep,
-        strings::{lua_string_with_nul, new_long_str_from_string, ShortString},
+        strings::{new_long_str_from_string, ShortString},
     };
 
     use super::*;
 
     fn make_str(s: &str) -> TValue<'_> {
-        TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
+        TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
             0,
             0,
-            &lua_string_with_nul(s).into_bytes(),
+            s.as_bytes(),
         ))
     }
 
@@ -3767,44 +3767,42 @@ mod tests {
     fn test_open_base_lib_registers_functions() {
         let mut state = LuaState::default();
         open_base_lib(&mut state);
-        drop(state);
-
-        // // 验证所有基础库函数注册为 BuiltinFn
-        // for name in &[
-        //     "print",
-        //     "setmetatable",
-        //     "getmetatable",
-        //     "type",
-        //     "pcall",
-        //     "error",
-        //     "tonumber",
-        //     "tostring",
-        //     "assert",
-        //     "select",
-        //     "rawequal",
-        //     "rawlen",
-        //     "rawget",
-        //     "rawset",
-        //     "next",
-        //     "ipairs",
-        //     "pairs",
-        //     "xpcall",
-        //     "warn",
-        //     "require",
-        //     "load",
-        //     "collectgarbage",
-        //     "dofile",
-        //     "loadfile",
-        // ] {
-        //     let key = state.intern_str(name);
-        //     let val = state.globals.get(&key);
-        //     assert!(val.is_some(), "{} must be registered", name);
-        //     assert!(
-        //         matches!(val, Some(TValue::BuiltinFn(_))),
-        //         "{} must be registered as BuiltinFn",
-        //         name
-        //     );
-        // }
+        // 验证所有基础库函数注册为 BuiltinFn
+        for name in &[
+            "print",
+            "setmetatable",
+            "getmetatable",
+            "type",
+            "pcall",
+            "error",
+            "tonumber",
+            "tostring",
+            "assert",
+            "select",
+            "rawequal",
+            "rawlen",
+            "rawget",
+            "rawset",
+            "next",
+            "ipairs",
+            "pairs",
+            "xpcall",
+            "warn",
+            "require",
+            "load",
+            "collectgarbage",
+            "dofile",
+            "loadfile",
+        ] {
+            let key = state.intern_str(name);
+            let val = state.globals.get(&key);
+            assert!(val.is_some(), "{} must be registered", name);
+            assert!(
+                matches!(val, Some(TValue::BuiltinFn(_))),
+                "{} must be registered as BuiltinFn",
+                name
+            );
+        }
     }
 
     #[test]

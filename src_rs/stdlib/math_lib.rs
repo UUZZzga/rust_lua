@@ -1392,10 +1392,10 @@ mod tests {
     use crate::strings::{lua_string_with_nul, ShortString};
 
     fn make_str(s: &str) -> TValue<'_> {
-        TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
+        TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
             0,
             0,
-            &lua_string_with_nul(s).into_bytes(),
+            s.as_bytes(),
         ))
     }
 

@@ -4791,11 +4791,7 @@ mod tests {
     #[test]
     fn test_str_format_string() {
         let args = vec![TValue::ShortStr(
-            crate::strings::ArcRc::<ShortString>::new_msg(
-                0,
-                0,
-                &lua_string_with_nul("world").into_bytes(),
-            ),
+            crate::strings::ArcRc::<ShortString>::new_sstr(0, 0, "world".as_bytes()),
         )];
         let result = str_format("hello %s", &args).unwrap();
         assert_eq!(result, "hello world");
@@ -4839,10 +4835,10 @@ mod tests {
     fn test_str_format_multiple() {
         let args = vec![
             TValue::Integer(1),
-            TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
+            TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
                 0,
                 0,
-                &lua_string_with_nul("two").into_bytes(),
+                "two".as_bytes(),
             )),
             TValue::Float(3.0),
         ];
@@ -4868,11 +4864,7 @@ mod tests {
     fn test_str_format_q_string() {
         // %q 字符串:加引号并转义特殊字符
         let args = vec![TValue::ShortStr(
-            crate::strings::ArcRc::<ShortString>::new_msg(
-                0,
-                0,
-                &lua_string_with_nul("hello").into_bytes(),
-            ),
+            crate::strings::ArcRc::<ShortString>::new_sstr(0, 0, "hello".as_bytes()),
         )];
         let result = str_format("%q", &args).unwrap();
         assert_eq!(result, "\"hello\"");
@@ -5012,10 +5004,10 @@ mod tests {
 
     #[test]
     fn test_to_num_string_integer() {
-        let v = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
+        let v = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
             0,
             0,
-            &lua_string_with_nul("42").into_bytes(),
+            "42".as_bytes(),
         ));
         let result = to_num(&v);
         assert_eq!(result, Some(TValue::Integer(42)));
@@ -5023,10 +5015,10 @@ mod tests {
 
     #[test]
     fn test_to_num_string_float() {
-        let v = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
+        let v = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
             0,
             0,
-            &lua_string_with_nul("3.14").into_bytes(),
+            "3.14".as_bytes(),
         ));
         let result = to_num(&v);
         assert!(matches!(result, Some(TValue::Float(f)) if (f - 3.14).abs() < 1e-10));
@@ -5034,10 +5026,10 @@ mod tests {
 
     #[test]
     fn test_to_num_invalid_string() {
-        let v = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
+        let v = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
             0,
             0,
-            &lua_string_with_nul("abc").into_bytes(),
+            "abc".as_bytes(),
         ));
         let result = to_num(&v);
         assert_eq!(result, None);
@@ -5054,10 +5046,10 @@ mod tests {
     #[test]
     fn test_arith_op_add_strings() {
         let make_str = |s: &str| {
-            TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
+            TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
                 0,
                 0,
-                &lua_string_with_nul(s).into_bytes(),
+                s.as_bytes(),
             ))
         };
         let v1 = make_str("10");
@@ -5465,11 +5457,7 @@ mod tests {
         assert_pack_eq(
             "<c3",
             &[TValue::ShortStr(
-                crate::strings::ArcRc::<ShortString>::new_msg(
-                    0,
-                    0,
-                    &lua_string_with_nul("abc").into_bytes(),
-                ),
+                crate::strings::ArcRc::<ShortString>::new_sstr(0, 0, "abc".as_bytes()),
             )],
             &[b'a', b'b', b'c'],
         );
@@ -5477,11 +5465,7 @@ mod tests {
         assert_pack_eq(
             "<c5",
             &[TValue::ShortStr(
-                crate::strings::ArcRc::<ShortString>::new_msg(
-                    0,
-                    0,
-                    &lua_string_with_nul("ab").into_bytes(),
-                ),
+                crate::strings::ArcRc::<ShortString>::new_sstr(0, 0, "ab".as_bytes()),
             )],
             &[b'a', b'b', 0, 0, 0],
         );
@@ -5490,10 +5474,10 @@ mod tests {
     #[test]
     fn test_pack_string_zstr() {
         // z = 零终止字符串
-        let s = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
+        let s = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
             0,
             0,
-            &lua_string_with_nul("hello").into_bytes(),
+            "hello".as_bytes(),
         ));
         assert_pack_eq("<z", &[s], &[b'h', b'e', b'l', b'l', b'o', 0]);
     }
@@ -5501,10 +5485,10 @@ mod tests {
     #[test]
     fn test_pack_string_s() {
         // s = 带长度前缀的字符串 (默认 size_t = 8 字节)
-        let s = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
+        let s = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
             0,
             0,
-            &lua_string_with_nul("hi").into_bytes(),
+            "hi".as_bytes(),
         ));
         let result = str_pack("<s", &[s]).unwrap();
         // 8 字节长度前缀 (小端) + 字符串内容
@@ -5516,20 +5500,20 @@ mod tests {
     #[test]
     fn test_pack_string_s1() {
         // s1 = 1 字节长度前缀的字符串
-        let s = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
+        let s = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
             0,
             0,
-            &lua_string_with_nul("hi").into_bytes(),
+            "hi".as_bytes(),
         ));
         assert_pack_eq("<s1", &[s], &[2, b'h', b'i']);
     }
 
     #[test]
     fn test_pack_empty_string() {
-        let empty = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
+        let empty = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
             0,
             0,
-            &lua_string_with_nul("").into_bytes(),
+            "".as_bytes(),
         ));
 
         // 空字符串 c0
@@ -5546,21 +5530,12 @@ mod tests {
     fn test_pack_string_with_special_chars() {
         // 包含特殊字符的字符串
         let bytes = vec![0u8, 1, 2, 255, 254, 128];
-        let s = unsafe { String::from_utf8_unchecked(bytes.clone()) };
-        let sval = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
-            0,
-            0,
-            &lua_string_with_nul(&s).into_bytes(),
-        ));
+        let sval = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(0, 0, &bytes));
         assert_pack_eq("<c6", &[sval.clone()], &bytes);
 
         // z 字符串中不能包含 0 (除了终止符)
-        let s2 = unsafe { String::from_utf8_unchecked(vec![1u8, 2, 3]) };
-        let sval2 = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
-            0,
-            0,
-            &lua_string_with_nul(&s2).into_bytes(),
-        ));
+        let s2 = vec![1u8, 2, 3];
+        let sval2 = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(0, 0, &s2));
         assert_pack_eq("<z", &[sval2], &[1, 2, 3, 0]);
     }
 
@@ -5818,10 +5793,10 @@ mod tests {
 
     #[test]
     fn test_pack_string_too_long() {
-        let s = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
+        let s = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
             0,
             0,
-            &lua_string_with_nul("hello").into_bytes(),
+            "hello".as_bytes(),
         ));
         // c3 容纳 3 字节, 但字符串有 5 字节
         assert!(str_pack("<c3", &[s]).is_err());
@@ -5841,10 +5816,10 @@ mod tests {
     #[test]
     fn test_pack_complex_format() {
         // 复合格式: i1 + c3 + i2
-        let s = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
+        let s = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
             0,
             0,
-            &lua_string_with_nul("abc").into_bytes(),
+            "abc".as_bytes(),
         ));
 
         let result = str_pack("<i1c3i2", &[TValue::Integer(1), s, TValue::Integer(2)]).unwrap();

@@ -821,10 +821,10 @@ mod tests {
     #[test]
     fn test_get_string_key() {
         let t = Table::new();
-        let key = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
+        let key = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
             0,
             0,
-            &lua_string_with_nul("name").into_bytes(),
+            "name".as_bytes(),
         ));
         t.set(key.clone(), TValue::Integer(42));
         let lookup = key;
@@ -912,10 +912,10 @@ mod tests {
     #[test]
     fn test_set_string_key() {
         let t = Table::new();
-        let key = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
+        let key = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
             0,
             0,
-            &lua_string_with_nul("key").into_bytes(),
+            "key".as_bytes(),
         ));
         t.set(key.clone(), TValue::Integer(7));
         assert_eq!(t.hash_size(), 1);
@@ -1177,10 +1177,10 @@ mod tests {
     #[test]
     fn test_rehash_preserves_string_keys() {
         let t = Table::new();
-        let key = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_msg(
+        let key = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
             0,
             0,
-            &lua_string_with_nul("mykey").into_bytes(),
+            "mykey".as_bytes(),
         ));
         t.set(key.clone(), TValue::Integer(77));
         t.set_int(1, TValue::Integer(10));

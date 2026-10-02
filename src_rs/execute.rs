@@ -7990,8 +7990,8 @@ mod tests {
     fn make_sj(op: OpCode, sj: i32, k: i32) -> Instruction {
         let mut inst = 0u32;
         inst |= (op as u32) << opcodes::POS_OP;
-        inst |= ((((sj + opcodes::OFFSET_sJ) as u32) & opcodes::mask1(opcodes::SIZE_sJ, 0))
-            << opcodes::POS_SJ);
+        inst |= (((sj + opcodes::OFFSET_sJ) as u32) & opcodes::mask1(opcodes::SIZE_sJ, 0))
+            << opcodes::POS_SJ;
         inst |= ((k & 1) as u32) << opcodes::POS_K;
         inst
     }

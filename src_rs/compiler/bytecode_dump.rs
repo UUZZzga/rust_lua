@@ -7,7 +7,7 @@ use crate::opcodes::{
     getarg_sj, getarg_vb, getarg_vc, testarg_k, OFFSET_sJ, OpCode, OpMode, OPNAMES, POS_A, POS_B,
     POS_C, POS_K, POS_VB, POS_VC, SIZE_A, SIZE_BX, TM_EVENT_NAMES,
 };
-use crate::strings::{lua_string_as_str, lua_string_with_nul, LongString};
+use crate::strings::{lua_string_as_str, LongString};
 #[cfg(test)]
 use imara_diff::{Algorithm, Diff, InternedInput};
 #[cfg(feature = "cmp_c")]
@@ -1498,10 +1498,7 @@ pub fn dump_proto(f: &Proto, strip: bool) -> Vec<u8> {
 /// 创建长字符串的辅助函数
 /// 使用 with_nul 添加额外 NUL 终止符，与 as_str_inner 的 NUL 剥离机制配合
 fn make_long_string<'a>(s: &str) -> TValue<'a> {
-    TValue::LongStr(SimpleRc::<LongString>::new_msg(
-        None,
-        lua_string_with_nul(s).as_bytes(),
-    ))
+    TValue::LongStr(SimpleRc::<LongString>::new_lstr(None, s.as_bytes()))
 }
 
 /// 将 DumpedFunction 转换为 Proto

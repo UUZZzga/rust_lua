@@ -4735,7 +4735,8 @@ mod tests {
         assert_eq!(chars[2] as u32, 0xed);
     }
 
-    #[cfg_attr(not(miri), test)]
+    #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_load_file_decodes_iso8859_strings() {
         let mut state = LuaState::default();
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests_lua/strings.lua");

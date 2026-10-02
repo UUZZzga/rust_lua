@@ -1,0 +1,4 @@
+# Miri 运行参数(等价于 tools/miri.sh 中导出的 MIRIFLAGS)。
+# 通过 cargo 的 [env] 表设置,使直接运行 `cargo +nightly miri test` 也能生效。
+[env]
+MIRIFLAGS = "-Zmiri-tree-borrows -Zmiri-disable-isolation -Zmiri-ignore-leaks"
