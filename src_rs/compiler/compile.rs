@@ -219,8 +219,7 @@ const GDKCONST: i32 = 6;
 // Expression descriptor
 // ============================================================================
 
-#[cfg_attr(not(size_optimized), derive(Debug))]
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum ExpKind {
     Void,
     Nil,
@@ -240,8 +239,7 @@ pub enum ExpKind {
     Upval,
 }
 
-#[cfg_attr(not(size_optimized), derive(Debug))]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct ExpDesc<'a> {
     pub kind: ExpKind,
     pub info: i64,
@@ -5468,8 +5466,7 @@ fn parse_args(fs: &mut FuncState) -> (i32, bool) {
     (n, last_is_call || last_is_vararg)
 }
 
-#[cfg_attr(not(size_optimized), derive(Debug))]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct PrefixResult<'a> {
     var_name: Option<TValue<'a>>,
     local_idx: Option<i32>,
@@ -6480,8 +6477,7 @@ fn parse_prefix_exp<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> PrefixResult<'b> {
 // Expressions (Pratt)
 // ============================================================================
 
-#[cfg_attr(not(size_optimized), derive(Debug))]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct ExprItem<'a> {
     exp: ExpDesc<'a>,
 }

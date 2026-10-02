@@ -2348,7 +2348,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                     }
                     TValue::ShortStr(arc) => {
                         // 短字符串：使用 Arc 的指针地址（内部化保证同一内容同一 Arc）
-                        let ptr = crate::strings::ArcRc::as_ptr(arc) as usize;
+                        let ptr = crate::strings::ArcRc::as_ptr(arc) as *const u8 as usize;
                         format!("0x{:x}", ptr)
                     }
                     TValue::LongStr(ls) => {
@@ -4289,6 +4289,16 @@ mod tests {
     use super::*;
     use crate::{objects::LuaType, strings::lua_string_with_nul};
 
+    #[test]
+    fn test_open_string_lib() {
+        let mut state = LuaState::default();
+        open_string_lib(&mut state);
+        let key = state.intern_str("string");
+        let val = state.globals.get(&key);
+        assert!(val.is_some(), "string must be registered");
+        assert!(matches!(val, Some(TValue::Table(_))));
+    }
+
     // ========================================================================
     // 位置辅助函数测试
     // ========================================================================
@@ -4775,11 +4785,10 @@ mod tests {
 
     #[test]
     fn test_str_format_string() {
-        let args = vec![TValue::ShortStr(crate::strings::ArcRc::new(
-            crate::strings::ShortString {
-                hash: 0,
-                contents: crate::strings::lua_string_with_nul("world"),
-            },
+        let args = vec![TValue::ShortStr(crate::strings::ArcRc::new_msg(
+            0,
+            0,
+            &lua_string_with_nul("world").into_bytes(),
         ))];
         let result = str_format("hello %s", &args).unwrap();
         assert_eq!(result, "hello world");
@@ -4823,10 +4832,11 @@ mod tests {
     fn test_str_format_multiple() {
         let args = vec![
             TValue::Integer(1),
-            TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
-                hash: 0,
-                contents: crate::strings::lua_string_with_nul("two"),
-            })),
+            TValue::ShortStr(crate::strings::ArcRc::new_msg(
+                0,
+                0,
+                &lua_string_with_nul("two").into_bytes(),
+            )),
             TValue::Float(3.0),
         ];
         let result = str_format("%d %s %f", &args).unwrap();
@@ -4849,12 +4859,11 @@ mod tests {
 
     #[test]
     fn test_str_format_q_string() {
-        // %q 字符串:加引号并转义
-        let args = vec![TValue::ShortStr(crate::strings::ArcRc::new(
-            crate::strings::ShortString {
-                hash: 0,
-                contents: crate::strings::lua_string_with_nul("hello"),
-            },
+        // %q 字符串:加引号并转义特殊字符
+        let args = vec![TValue::ShortStr(crate::strings::ArcRc::new_msg(
+            0,
+            0,
+            &lua_string_with_nul("hello").into_bytes(),
         ))];
         let result = str_format("%q", &args).unwrap();
         assert_eq!(result, "\"hello\"");
@@ -4955,7 +4964,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_open_string_lib_registers_global() {
+    fn test_open_string_liblobal() {
         let mut state = LuaState::default();
         open_string_lib(&mut state);
         let key = state.intern_str("string");
@@ -4994,30 +5003,33 @@ mod tests {
 
     #[test]
     fn test_to_num_string_integer() {
-        let v = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
-            hash: 0,
-            contents: crate::strings::lua_string_with_nul("42"),
-        }));
+        let v = TValue::ShortStr(crate::strings::ArcRc::new_msg(
+            0,
+            0,
+            &lua_string_with_nul("42").into_bytes(),
+        ));
         let result = to_num(&v);
         assert_eq!(result, Some(TValue::Integer(42)));
     }
 
     #[test]
     fn test_to_num_string_float() {
-        let v = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
-            hash: 0,
-            contents: crate::strings::lua_string_with_nul("3.14"),
-        }));
+        let v = TValue::ShortStr(crate::strings::ArcRc::new_msg(
+            0,
+            0,
+            &lua_string_with_nul("3.14").into_bytes(),
+        ));
         let result = to_num(&v);
         assert!(matches!(result, Some(TValue::Float(f)) if (f - 3.14).abs() < 1e-10));
     }
 
     #[test]
     fn test_to_num_invalid_string() {
-        let v = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
-            hash: 0,
-            contents: crate::strings::lua_string_with_nul("abc"),
-        }));
+        let v = TValue::ShortStr(crate::strings::ArcRc::new_msg(
+            0,
+            0,
+            &lua_string_with_nul("abc").into_bytes(),
+        ));
         let result = to_num(&v);
         assert_eq!(result, None);
     }
@@ -5033,10 +5045,11 @@ mod tests {
     #[test]
     fn test_arith_op_add_strings() {
         let make_str = |s: &str| {
-            TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
-                hash: 0,
-                contents: crate::strings::lua_string_with_nul(s),
-            }))
+            TValue::ShortStr(crate::strings::ArcRc::new_msg(
+                0,
+                0,
+                &lua_string_with_nul(s).into_bytes(),
+            ))
         };
         let v1 = make_str("10");
         let v2 = make_str("20");
@@ -5442,23 +5455,20 @@ mod tests {
         // c = 固定长度字符串
         assert_pack_eq(
             "<c3",
-            &[TValue::ShortStr(crate::strings::ArcRc::new(
-                crate::strings::ShortString {
-                    hash: 0,
-                    contents: lua_string_with_nul("abc"),
-                },
+            &[TValue::ShortStr(crate::strings::ArcRc::new_msg(
+                0,
+                0,
+                &lua_string_with_nul("abc").into_bytes(),
             ))],
             &[b'a', b'b', b'c'],
         );
-
         // 短字符串补零
         assert_pack_eq(
             "<c5",
-            &[TValue::ShortStr(crate::strings::ArcRc::new(
-                crate::strings::ShortString {
-                    hash: 0,
-                    contents: lua_string_with_nul("ab"),
-                },
+            &[TValue::ShortStr(crate::strings::ArcRc::new_msg(
+                0,
+                0,
+                &lua_string_with_nul("ab").into_bytes(),
             ))],
             &[b'a', b'b', 0, 0, 0],
         );
@@ -5467,20 +5477,22 @@ mod tests {
     #[test]
     fn test_pack_string_zstr() {
         // z = 零终止字符串
-        let s = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
-            hash: 0,
-            contents: lua_string_with_nul("hello"),
-        }));
+        let s = TValue::ShortStr(crate::strings::ArcRc::new_msg(
+            0,
+            0,
+            &lua_string_with_nul("hello").into_bytes(),
+        ));
         assert_pack_eq("<z", &[s], &[b'h', b'e', b'l', b'l', b'o', 0]);
     }
 
     #[test]
     fn test_pack_string_s() {
         // s = 带长度前缀的字符串 (默认 size_t = 8 字节)
-        let s = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
-            hash: 0,
-            contents: lua_string_with_nul("hi"),
-        }));
+        let s = TValue::ShortStr(crate::strings::ArcRc::new_msg(
+            0,
+            0,
+            &lua_string_with_nul("hi").into_bytes(),
+        ));
         let result = str_pack("<s", &[s]).unwrap();
         // 8 字节长度前缀 (小端) + 字符串内容
         assert_eq!(result.len(), 10);
@@ -5491,19 +5503,21 @@ mod tests {
     #[test]
     fn test_pack_string_s1() {
         // s1 = 1 字节长度前缀的字符串
-        let s = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
-            hash: 0,
-            contents: lua_string_with_nul("hi"),
-        }));
+        let s = TValue::ShortStr(crate::strings::ArcRc::new_msg(
+            0,
+            0,
+            &lua_string_with_nul("hi").into_bytes(),
+        ));
         assert_pack_eq("<s1", &[s], &[2, b'h', b'i']);
     }
 
     #[test]
     fn test_pack_empty_string() {
-        let empty = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
-            hash: 0,
-            contents: lua_string_with_nul(""),
-        }));
+        let empty = TValue::ShortStr(crate::strings::ArcRc::new_msg(
+            0,
+            0,
+            &lua_string_with_nul("").into_bytes(),
+        ));
 
         // 空字符串 c0
         assert_pack_eq("<c0", &[empty.clone()], &[]);
@@ -5520,18 +5534,20 @@ mod tests {
         // 包含特殊字符的字符串
         let bytes = vec![0u8, 1, 2, 255, 254, 128];
         let s = unsafe { String::from_utf8_unchecked(bytes.clone()) };
-        let sval = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
-            hash: 0,
-            contents: lua_string_with_nul(&s),
-        }));
+        let sval = TValue::ShortStr(crate::strings::ArcRc::new_msg(
+            0,
+            0,
+            &lua_string_with_nul(&s).into_bytes(),
+        ));
         assert_pack_eq("<c6", &[sval.clone()], &bytes);
 
         // z 字符串中不能包含 0 (除了终止符)
         let s2 = unsafe { String::from_utf8_unchecked(vec![1u8, 2, 3]) };
-        let sval2 = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
-            hash: 0,
-            contents: lua_string_with_nul(&s2),
-        }));
+        let sval2 = TValue::ShortStr(crate::strings::ArcRc::new_msg(
+            0,
+            0,
+            &lua_string_with_nul(&s2).into_bytes(),
+        ));
         assert_pack_eq("<z", &[sval2], &[1, 2, 3, 0]);
     }
 
@@ -5789,10 +5805,11 @@ mod tests {
 
     #[test]
     fn test_pack_string_too_long() {
-        let s = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
-            hash: 0,
-            contents: lua_string_with_nul("hello"),
-        }));
+        let s = TValue::ShortStr(crate::strings::ArcRc::new_msg(
+            0,
+            0,
+            &lua_string_with_nul("hello").into_bytes(),
+        ));
         // c3 容纳 3 字节, 但字符串有 5 字节
         assert!(str_pack("<c3", &[s]).is_err());
     }
@@ -5811,10 +5828,12 @@ mod tests {
     #[test]
     fn test_pack_complex_format() {
         // 复合格式: i1 + c3 + i2
-        let s = TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
-            hash: 0,
-            contents: lua_string_with_nul("abc"),
-        }));
+        let s = TValue::ShortStr(crate::strings::ArcRc::new_msg(
+            0,
+            0,
+            &lua_string_with_nul("abc").into_bytes(),
+        ));
+
         let result = str_pack("<i1c3i2", &[TValue::Integer(1), s, TValue::Integer(2)]).unwrap();
         assert_eq!(result, vec![1, b'a', b'b', b'c', 2, 0]);
     }

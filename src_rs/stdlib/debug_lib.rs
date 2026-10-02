@@ -3529,11 +3529,10 @@ mod tests {
             code: Rc::new(vec![]),
             protos: Rc::new(vec![]),
             upvalues: Rc::new(vec![UpvalDesc {
-                name: Some(TValue::ShortStr(crate::strings::ArcRc::new(
-                    crate::strings::ShortString {
-                        hash: 0,
-                        contents: crate::strings::lua_string_with_nul("x"),
-                    },
+                name: Some(TValue::ShortStr(crate::strings::ArcRc::new_msg(
+                    0,
+                    0,
+                    &crate::strings::lua_string_with_nul("x").into_bytes(),
                 ))),
                 in_stack: false,
                 idx: 0,
@@ -3726,10 +3725,11 @@ mod tests {
     #[test]
     fn test_short_src() {
         let make_str = |s: &str| -> TValue {
-            TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
-                hash: 0,
-                contents: crate::strings::lua_string_with_nul(s),
-            }))
+            TValue::ShortStr(crate::strings::ArcRc::new_msg(
+                0,
+                0,
+                &crate::strings::lua_string_with_nul(s).into_bytes(),
+            ))
         };
 
         // 等号前缀
@@ -3811,5 +3811,15 @@ mod tests {
         state.exec.stack.clear();
         call_debug(&mut state, 0, 0, 0).unwrap();
         assert_eq!(state.exec.stack.len(), 0);
+    }
+
+    #[test]
+    fn test_open_debug_lib() {
+        let mut state = LuaState::default();
+        open_debug_lib(&mut state);
+        let key = state.intern_str("debug");
+        let val = state.globals.get(&key);
+        assert!(val.is_some(), "debug must be registered");
+        assert!(matches!(val, Some(TValue::Table(_))));
     }
 }

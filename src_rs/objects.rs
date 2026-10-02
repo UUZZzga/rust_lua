@@ -622,8 +622,7 @@ impl<'a> RustClosure<'a> {
 /// Given: 创建各种类型的 TValue
 /// When: 调用 .ty() 方法
 /// Then: 返回正确的 LuaType
-#[derive(Clone)]
-#[cfg_attr(not(size_optimized), derive(Debug))]
+#[derive(Debug, Clone)]
 pub enum TValue<'a> {
     /// nil 值，带子变体（标准 nil / 空槽 / 缺键）
     Nil(NilKind),
@@ -1550,6 +1549,20 @@ impl<'a> std::ops::Deref for UpValVec<'a> {
 impl<'a> std::ops::DerefMut for UpValVec<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         self.as_mut_slice()
+    }
+}
+
+impl<'a> Drop for UpValVec<'a> {
+    fn drop(&mut self) {
+        if self.heap.is_none() {
+            // inline 部分：MaybeUninit 不自动 drop，需手动
+            for i in 0..self.len as usize {
+                // SAFETY: 0..len 的槽位由 push 初始化
+                unsafe {
+                    self.inline[i].assume_init_drop();
+                }
+            }
+        }
     }
 }
 
@@ -2682,8 +2695,11 @@ pub fn twoto(n: u8) -> usize {
 mod tests {
 
     use super::*;
-    use crate::strings::{
-        lua_string_is_empty, lua_string_len, lua_string_with_nul, LongString, ShortString,
+    use crate::{
+        alloc::{SimpleArc, SimpleRc},
+        strings::{
+            lua_string_is_empty, lua_string_len, lua_string_with_nul, LongString, ShortString,
+        },
     };
 
     // ========================================================================
@@ -2692,6 +2708,14 @@ mod tests {
 
     #[test]
     fn test_tvalue_size() {
+        println!(
+            "SimpleRc<ShortString> size: {}",
+            std::mem::size_of::<SimpleRc<ShortString>>()
+        );
+        println!(
+            "SimpleArc<ShortString> size: {}",
+            std::mem::size_of::<SimpleArc<ShortString>>()
+        );
         println!("TValue size: {}", std::mem::size_of::<TValue>());
         println!("TValue align: {}", std::mem::align_of::<TValue>());
         println!("BuiltinFn size: {}", std::mem::size_of::<BuiltinFn>());
@@ -2699,8 +2723,10 @@ mod tests {
         // BuiltinFn 压缩到 8 字节 (name 移入全局表) 后, rustc 把 TValue 的
         // tag 放入 LuaString 变体的 padding — TValue 16 字节 (tag 8 + payload 8)。
         // 这是 C Lua TValue (16 字节) 的同级布局。
-        assert_eq!(std::mem::size_of::<TValue>(), 16);
         assert_eq!(std::mem::size_of::<BuiltinFn>(), 8);
+        assert_eq!(std::mem::size_of::<SimpleRc<ShortString>>(), 8);
+        assert_eq!(std::mem::size_of::<SimpleArc<ShortString>>(), 8);
+        assert_eq!(std::mem::size_of::<TValue>(), 16);
     }
 
     // ========================================================================
@@ -2837,11 +2863,9 @@ mod tests {
 
     #[test]
     fn test_luastring_short() {
-        let short = ShortString {
-            hash: 0,
-            contents: lua_string_with_nul("hello"),
-        };
-        let ts = TValue::ShortStr(crate::strings::ArcRc::new(short));
+        let short =
+            crate::strings::ArcRc::new_msg(0, 0, &lua_string_with_nul("hello").into_bytes());
+        let ts = TValue::ShortStr(short);
         assert_eq!(lua_string_as_str(&ts), "hello");
         assert_eq!(lua_string_len(&ts), 5);
         assert!(matches!(ts, TValue::ShortStr(_)));
@@ -2863,11 +2887,8 @@ mod tests {
 
     #[test]
     fn test_luastring_empty() {
-        let short = ShortString {
-            hash: 0,
-            contents: lua_string_with_nul(""),
-        };
-        let ts = TValue::ShortStr(crate::strings::ArcRc::new(short));
+        let short = crate::strings::ArcRc::new_msg(0, 0, &lua_string_with_nul("").into_bytes());
+        let ts = TValue::ShortStr(short);
         assert!(lua_string_is_empty(&ts));
         assert_eq!(lua_string_len(&ts), 0);
         assert_eq!(lua_string_as_str(&ts), "");
@@ -2875,19 +2896,13 @@ mod tests {
 
     #[test]
     fn test_luastring_eq() {
-        let arc1 = crate::strings::ArcRc::new(ShortString {
-            hash: 0,
-            contents: lua_string_with_nul("foo"),
-        });
+        let arc1 = crate::strings::ArcRc::new_msg(0, 0, &lua_string_with_nul("foo").into_bytes());
         let arc2 = crate::strings::ArcRc::clone(&arc1);
         let ts1 = TValue::ShortStr(arc1);
         let ts2 = TValue::ShortStr(arc2);
         assert_eq!(ts1, ts2);
 
-        let arc3 = crate::strings::ArcRc::new(ShortString {
-            hash: 1,
-            contents: lua_string_with_nul("bar"),
-        });
+        let arc3 = crate::strings::ArcRc::new_msg(0, 0, &lua_string_with_nul("bar").into_bytes());
         let ts3 = TValue::ShortStr(arc3);
         assert_ne!(ts1, ts3);
 
@@ -2908,10 +2923,11 @@ mod tests {
 
     #[test]
     fn test_luastring_as_str() {
-        let short: TValue<'_> = TValue::ShortStr(crate::strings::ArcRc::new(ShortString {
-            hash: 0,
-            contents: lua_string_with_nul("abc"),
-        }));
+        let short: TValue<'_> = TValue::ShortStr(crate::strings::ArcRc::new_msg(
+            0,
+            0,
+            &lua_string_with_nul("abc").into_bytes(),
+        ));
         assert_eq!(lua_string_as_str(&short), "abc");
     }
 
@@ -3417,7 +3433,6 @@ mod tests {
         println!("LuaThread: {}", size_of::<LuaThread>());
         println!("Udata: {}", size_of::<Udata>());
         println!("LCFunction: {}", size_of::<LCFunction>());
-        println!("ShortString: {}", size_of::<crate::strings::ShortString>());
         println!("LongString: {}", size_of::<crate::strings::LongString>());
         println!("NilKind: {}", size_of::<NilKind>());
         println!("Instruction: {}", size_of::<Instruction>());

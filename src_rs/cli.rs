@@ -699,7 +699,8 @@ impl<'io> Interpreter<'io> {
         if args & HAS_I != 0 {
             self.do_repl();
         } else if script < 1 && args & (HAS_E | HAS_V) == 0 {
-            if io::stdin().is_terminal() {
+
+            if self.l.io.stdin_is_terminal() {
                 self.print_version();
                 self.do_repl();
             } else {

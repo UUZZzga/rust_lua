@@ -1001,6 +1001,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_open_table_lib() {
+        let mut state = LuaState::default();
+        open_table_lib(&mut state);
+        let key = state.intern_str("table");
+        let val = state.globals.get(&key);
+        assert!(val.is_some(), "table must be registered");
+        assert!(matches!(val, Some(TValue::Table(_))));
+    }
+
+    #[test]
     fn test_unpack() {
         // local minI = math.mininteger
         // local t = {[minI] = 12.3, [minI + 1] = 23.5}

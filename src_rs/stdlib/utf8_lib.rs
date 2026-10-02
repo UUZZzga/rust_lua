@@ -820,6 +820,16 @@ pub fn open_utf8_lib(state: &mut LuaState) {
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_open_utf8_lib() {
+        let mut state = LuaState::default();
+        open_utf8_lib(&mut state);
+        let key = state.intern_str("utf8");
+        let val = state.globals.get(&key);
+        assert!(val.is_some(), "utf8 must be registered");
+        assert!(matches!(val, Some(TValue::Table(_))));
+    }
+
     // ========================================================================
     // utf8_decode 测试
     // ========================================================================

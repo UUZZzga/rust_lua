@@ -366,6 +366,14 @@ fn test_int_to_float_div() {
 }
 
 #[test]
+fn test_test() {
+    let mut interpreter = Interpreter::default();
+    let mut args_vec: Vec<String> = vec![];
+    args_vec.extend(["lua", "-e", "print(4 / 2)"].iter().map(|s| s.to_string()));
+    interpreter.pmain(&args_vec);
+}
+
+#[test]
 fn test_float_to_int_idiv() {
     let output = run_lua(&["-e", "print(9.9 // 1)"]);
     assert!(output.status.success());

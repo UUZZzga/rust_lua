@@ -15,8 +15,7 @@ use std::ffi::{c_int, c_void};
 use std::ptr;
 use std::rc::Rc;
 
-#[cfg_attr(not(size_optimized), derive(Debug))]
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct DumpInstruction {
     pub opcode: u8,
     pub a: u32,
@@ -26,8 +25,7 @@ pub struct DumpInstruction {
     pub bx: u32,
 }
 
-#[cfg_attr(not(size_optimized), derive(Debug))]
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum DumpConstant {
     Nil,
     Boolean(bool),
@@ -36,7 +34,7 @@ pub enum DumpConstant {
     String(String),
 }
 
-#[cfg_attr(not(size_optimized), derive(Debug))]
+#[derive(Debug)]
 pub struct DumpedFunction {
     pub linedefined: i32,
     pub lastlinedefined: i32,

@@ -45,20 +45,31 @@ fn run_lua(args: &[&str]) -> std::process::Output {
 }
 
 fn run_lua_input(args: &[&str], stdin: &str) -> std::process::Output {
-    use std::process::Stdio;
-    let mut child = Command::new(lua_path())
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to spawn lua binary");
-    {
-        use std::io::Write;
-        let child_stdin = child.stdin.as_mut().unwrap();
-        child_stdin.write_all(stdin.as_bytes()).unwrap();
+    let mut buff = lua_rs::mock::io_mock::BufferIo::new(stdin);
+    let success = {
+        let mut interpreter = Interpreter::new(&mut buff);
+
+        let mut args_vec: Vec<String> = vec!["lua".to_string()];
+        args_vec.extend(args.iter().map(|s| s.to_string()));
+        interpreter.pmain(&args_vec)
+    };
+    let stdout_buf = buff.stdout();
+    let stderr_buf = buff.stderr();
+
+    let stdout_str = String::from_utf8_lossy(&stdout_buf);
+    let stderr_str = String::from_utf8_lossy(&stderr_buf);
+    if !stdout_str.is_empty() {
+        println!("STDOUT:\n{}", stdout_str);
     }
-    child.wait_with_output().expect("failed to wait on lua")
+    if !stderr_str.is_empty() {
+        eprintln!("STDERR:\n{}", stderr_str);
+    }
+
+    std::process::Output {
+        status: std::process::ExitStatus::from_raw(if success { 0 } else { 1 } as _),
+        stdout: stdout_buf.to_vec(),
+        stderr: stderr_buf.to_vec(),
+    }
 }
 
 #[test]
@@ -218,7 +229,7 @@ fn test_stdin_execution() {
     let output = run_lua_input(&[], "print('from_stdin')\n");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("from_stdin"));
+    assert!(stdout.contains("from_stdin"), "stdout: {}", stdout);
 }
 
 #[test]

@@ -55,13 +55,21 @@ fn tvalue_size(v: &TValue) -> usize {
 
 pub fn new_c_closure(state: &mut LuaState, _nupvals: usize) -> usize {
     let idx = state.exec.closure_upvals.borrow().len();
-    state
-        .exec
-        .closure_upvals
-        .borrow_mut()
-        .push(Rc::new(RefCell::new(UpVal::Closed {
-            value: TValue::Nil(NilKind::Strict),
-        })));
+    let upval = Rc::new(RefCell::new(UpVal::Closed {
+        value: TValue::Nil(NilKind::Strict),
+    }));
+    eprintln!(
+        "new_c_closure: raw={:p} strong={} weak={}",
+        Rc::as_ptr(&upval),
+        Rc::strong_count(&upval),
+        Rc::weak_count(&upval),
+    );
+    state.exec.closure_upvals.borrow_mut().push(upval);
+    let v = state.exec.closure_upvals.borrow();
+    if let Some(last) = v.last() {
+        // 假设 UpValVec 暴露 last 或索引
+        eprintln!("after push: strong={}", Rc::strong_count(last),);
+    }
     idx
 }
 

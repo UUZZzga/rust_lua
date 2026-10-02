@@ -212,6 +212,7 @@ pub struct PcallProtection<'a> {
 pub struct GlobalState<'a> {
     pub gcstopem: bool,
     pub gc: GCState<'a>,
+    pub memerrmsg: TValue<'a>,
 }
 
 pub struct LuaFunctionCallInfo {
@@ -648,9 +649,11 @@ impl<'a> LuaState<'a> {
     ///
     /// 验证: gettop() 必须返回 1（函数入口槽）
     pub fn new(io: &'a mut dyn crate::mock::io_mock::Io) -> Self {
+        let string_table = Rc::new(StringTable::new());
         let global_state: Rc<RefCell<GlobalState<'a>>> = Rc::new(RefCell::new(GlobalState {
             gcstopem: false,
             gc: GCState::default_incremental(),
+            memerrmsg: crate::strings::new_lstr(&string_table, crate::strings::MEMERRMSG),
         }));
         let gs = &mut global_state.borrow_mut();
         let globals = {
@@ -670,7 +673,6 @@ impl<'a> LuaState<'a> {
         let stack = Self::init_stack();
         let top = stack.len();
 
-        let string_table = Rc::new(StringTable::new());
         let tmnames = Rc::new(init_tmnames(&string_table));
         LuaState {
             exec: Box::new(ExecState {
@@ -992,11 +994,13 @@ impl<'a> LuaState<'a> {
     ///
     /// 函数帧布局: stack[base-1] = 函数入口, stack[base+0..base+N] = 寄存器/参数
     /// 当 base=0 时，stack[0] 兼作函数入口和寄存器 0（主函数场景）
+    #[cfg(test)]
     pub fn from_proto(
         proto: &Proto<'a>,
         base: usize,
         mut stack: Vec<TValue<'a>>,
         global_state: Rc<RefCell<GlobalState<'a>>>,
+        string_table: Rc<StringTable>,
     ) -> Self {
         let mut gs = global_state.borrow_mut();
         if base > 0 {
@@ -1024,7 +1028,6 @@ impl<'a> LuaState<'a> {
             t
         };
 
-        let string_table = Rc::new(StringTable::new());
         let tmnames = Rc::new(init_tmnames(&string_table));
         LuaState {
             exec: Box::new(ExecState {
@@ -1381,6 +1384,47 @@ impl<'a> LuaState<'a> {
             self.exec.stack.truncate(new_len);
             self.exec.top = self.exec.stack.len();
         }
+    }
+}
+
+impl<'a> Drop for LuaState<'a> {
+    fn drop(&mut self) {
+        // 打破 globals / registry 的 Rc 自引用循环。
+        //
+        // globals 里存了 `_G -> Table(globals_clone)`，globals_clone 的 Rc
+        // 指回 globals 自身的 TableData。Rc 计数永远 ≥ 2，TableData::drop
+        // 从不被调用，导致内部所有 TValue 泄漏（包括所有 intern 字符串）。
+        //
+        // 清空 globals / registry 的槽位后，内部持的那一份 Rc 被 drop，
+        // 计数降到 1，后续 Rust 自动 drop 字段时归零，TableData::drop 正常执行。
+        //
+        // 必须在其他字段 drop 之前做这一步，但 Rust 字段自动 drop 顺序与声明
+        // 顺序一致，globals/registry 在 exec 之后——手动清理它们即可。
+        //
+        // 先打破 package <-> package.loaded 循环引用：open_selected_libs 会把各
+        // 标准库表放进 package.loaded，且 loaded["package"] 指回 package 自身，
+        // 构成 Rc 循环。若不先清空 loaded，则 package 与所有标准库表（含其内部的
+        // intern 字符串）永不被释放。必须在清空 globals 之前查找（之后就拿不到
+        // package 表了）。
+        {
+            let pkg_key = self.intern_str("package");
+            if let Some(TValue::Table(pkg)) = self.globals.get(&pkg_key) {
+                let loaded_key = self.intern_str("loaded");
+                if let Some(TValue::Table(loaded)) = pkg.get(&loaded_key) {
+                    loaded.clear_for_drop();
+                }
+            }
+        }
+        self.globals.clear_for_drop();
+        self.registry.clear_for_drop();
+
+        // 其他可能持有 Table 的字段也逐一处理，视实际需要补
+        self.finobj_list.clear();
+        self.caller_gc_stacks.clear();
+        self.c_safety_keepalive.clear();
+        // weak_tables / ud_finobj_list / main_thread 里的 Table 若有循环也需处理
+
+        self.close_state();
     }
 }
 
@@ -3496,12 +3540,12 @@ impl<'a> LuaState<'a> {
         {
             let tv = TValue::Table(self.globals.clone());
             unsafe { worklist.push(raw_from_tvalue(&tv)) };
-            std::mem::forget(tv); // forget 避免 decq（RawTValue 已拷贝字节，Rc 引用通过 self.globals 保持）
+            drop(tv); // RawTValue 已拷贝字节；此处正常 decq，引用由 self.globals 保持
         }
         {
             let tv = TValue::Table(self.registry.clone());
             unsafe { worklist.push(raw_from_tvalue(&tv)) };
-            std::mem::forget(tv);
+            drop(tv);
         }
 
         // 收集根：closure_upvals
@@ -3546,7 +3590,7 @@ impl<'a> LuaState<'a> {
             if let Some(ref closure) = ci.closure {
                 let tv = TValue::LClosure(closure.clone());
                 unsafe { worklist.push(raw_from_tvalue(&tv)) };
-                std::mem::forget(tv);
+                drop(tv); // RawTValue 不持有引用；正常 decq 避免泄漏（closure 仍由 ci 持有）
             }
         }
 
@@ -3662,9 +3706,8 @@ impl<'a> LuaState<'a> {
             let mut str_extra: usize = 0;
             let mut count: u64 = 0;
             self.string_table.for_each(|ss| {
-                str_extra += std::mem::size_of::<crate::strings::ShortString>()
-                    + ss.contents.capacity()
-                    + 16; // Arc 内部控制结构
+                str_extra +=
+                    std::mem::size_of::<crate::strings::ShortStringFixed>() + ss.len as usize + 16;
                 count += 1;
             });
             extra_size += str_extra;
@@ -3841,7 +3884,7 @@ impl<'a> LuaState<'a> {
                 to_finalize.push(TValue::Table(t.clone()));
                 let tv = TValue::Table(t);
                 unsafe { worklist.push(raw_from_tvalue(&tv)) };
-                std::mem::forget(tv);
+                drop(tv); // to_finalize 已持有 clone，此处正常 decq 避免泄漏
             }
         }
         self.finobj_list = keep;
@@ -3867,7 +3910,7 @@ impl<'a> LuaState<'a> {
                 to_finalize.push(TValue::UserData(Rc::clone(&u)));
                 let tv = TValue::UserData(u);
                 unsafe { worklist.push(raw_from_tvalue(&tv)) };
-                std::mem::forget(tv);
+                drop(tv); // to_finalize 已持有 clone，此处正常 decq 避免泄漏
             }
         }
         self.ud_finobj_list = ud_keep;
@@ -4092,7 +4135,7 @@ impl<'a> LuaState<'a> {
             if let Some(ref closure) = ci.closure {
                 let tv = TValue::LClosure(closure.clone());
                 unsafe { worklist.push(raw_from_tvalue(&tv)) };
-                std::mem::forget(tv);
+                drop(tv); // RawTValue 不持有引用；正常 decq 避免泄漏（closure 仍由 ci 持有）
             }
         }
     }
@@ -4172,7 +4215,7 @@ impl<'a> LuaState<'a> {
                         if !visited.contains(&mt_ptr) {
                             let tv = TValue::Table((**mt).clone());
                             unsafe { worklist.push(raw_from_tvalue(&tv)) };
-                            std::mem::forget(tv);
+                            drop(tv); // metatable 仍由 data 持有；正常 decq 避免泄漏
                         }
                     }
                 }
@@ -4275,7 +4318,7 @@ impl<'a> LuaState<'a> {
                         if !visited.contains(&mt_ptr) {
                             let tv = TValue::Table((**mt).clone());
                             unsafe { worklist.push(raw_from_tvalue(&tv)) };
-                            std::mem::forget(tv);
+                            drop(tv); // metatable 仍由 data 持有；正常 decq 避免泄漏
                         }
                     }
                     for uv in &u.user_values {
@@ -4554,6 +4597,7 @@ mod tests {
 
     #[test]
     fn test_stack_init_from_proto() {
+        let string_table = Rc::new(StringTable::new());
         // 验证 from_proto 的栈初始化: base > 0 时必须保证函数入口槽
         let proto = Proto {
             num_params: 0,
@@ -4580,10 +4624,11 @@ mod tests {
         let gs = Rc::new(RefCell::new(GlobalState {
             gcstopem: false,
             gc: GCState::default_incremental(),
+            memerrmsg: crate::strings::new_lstr(&string_table, crate::strings::MEMERRMSG),
         }));
 
         // case 1: base=0, empty stack → main function scenario
-        let state = LuaState::from_proto(&proto, 0, vec![], Rc::clone(&gs));
+        let state = LuaState::from_proto(&proto, 0, vec![], Rc::clone(&gs), string_table.clone());
         assert_eq!(state.exec.base, 0);
         assert_eq!(
             state.exec.stack.len(),
@@ -4592,7 +4637,7 @@ mod tests {
         );
 
         // case 2: base=1, empty stack → called function scenario
-        let state = LuaState::from_proto(&proto, 1, vec![], Rc::clone(&gs));
+        let state = LuaState::from_proto(&proto, 1, vec![], Rc::clone(&gs), string_table.clone());
         assert_eq!(state.exec.base, 1);
         assert_eq!(
             state.exec.stack.len(),
@@ -4607,6 +4652,7 @@ mod tests {
             1,
             vec![TValue::Nil(NilKind::Strict), TValue::Integer(42)],
             gs.clone(),
+            string_table.clone(),
         );
         assert_eq!(state.exec.base, 1);
         assert_eq!(
@@ -4689,7 +4735,7 @@ mod tests {
         assert_eq!(chars[2] as u32, 0xed);
     }
 
-    #[test]
+    #[cfg_attr(not(miri), test)]
     fn test_load_file_decodes_iso8859_strings() {
         let mut state = LuaState::default();
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests_lua/strings.lua");
@@ -4706,7 +4752,7 @@ mod tests {
         );
     }
 
-    #[test]
+    #[cfg_attr(not(miri), test)]
     fn test_load_file_skips_shebang_all() {
         let mut state = LuaState::default();
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests_lua/all.lua");
@@ -4721,6 +4767,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_load_file_missing() {
         let mut state = LuaState::default();
         let status = state.load_file(Some("/nonexistent/path/file.lua"));

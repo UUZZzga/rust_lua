@@ -1,6 +1,6 @@
 // src/lib.rs
 use std::{
-    io::{self, BufRead, Cursor, Write},
+    io::{self, BufRead, Cursor, IsTerminal, Write},
     ptr::NonNull,
 };
 
@@ -11,6 +11,7 @@ pub trait Io {
 
     fn out_flush(&mut self) -> io::Result<()>;
     fn err_flush(&mut self) -> io::Result<()>;
+    fn stdin_is_terminal(&self) -> bool;
 }
 
 pub struct RealIo;
@@ -105,6 +106,10 @@ impl Io for RealIo {
     fn err_flush(&mut self) -> io::Result<()> {
         io::stderr().lock().flush()
     }
+
+    fn stdin_is_terminal(&self) -> bool {
+        io::stdin().is_terminal()
+    }
 }
 
 // ---------- 测试用 ----------
@@ -154,5 +159,8 @@ impl Io for BufferIo {
     }
     fn err_flush(&mut self) -> io::Result<()> {
         Ok(())
+    }
+    fn stdin_is_terminal(&self) -> bool {
+        true
     }
 }

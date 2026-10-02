@@ -83,6 +83,24 @@ impl<'a> Table<'a> {
         }
     }
 
+    /// 打破引用计数循环：清空表的所有内容，让内部持有的 `Rc` 引用被释放。
+    ///
+    /// 用于 `LuaState::drop`，避免 `_G`（或 registry / metatable）自引用
+    /// 导致 `Rc<RefCell<TableData>>` 计数永不归零，`TableData::drop`
+    /// 从不被调用，进而里面的所有 `TValue`（含 `SimpleRc<ShortString>`）
+    /// 永远不释放。
+    ///
+    /// 用 `try_borrow_mut` 而非 `borrow_mut`：drop 期间若已有活跃 borrow，
+    /// 强行 borrow_mut 会 panic。宁可跳过清理，也不要 abort 进程。
+    pub fn clear_for_drop(&self) {
+        if let Ok(mut data) = self.data.try_borrow_mut() {
+            data.array.clear();
+            data.hash_buckets.clear();
+            data.key_to_bucket = None; // 释放 hashbrown 表的堆内存
+            data.metatable = None; // metatable 也可能形成循环
+        }
+    }
+
     pub fn array_size(&self) -> usize {
         self.data.borrow().array.len()
     }
@@ -803,10 +821,11 @@ mod tests {
     #[test]
     fn test_get_string_key() {
         let t = Table::new();
-        let key = TValue::ShortStr(crate::strings::ArcRc::new(ShortString {
-            hash: 0,
-            contents: lua_string_with_nul("name"),
-        }));
+        let key = TValue::ShortStr(crate::strings::ArcRc::new_msg(
+            0,
+            0,
+            &lua_string_with_nul("name").into_bytes(),
+        ));
         t.set(key.clone(), TValue::Integer(42));
         let lookup = key;
         assert_eq!(t.get(&lookup), Some(TValue::Integer(42)));
@@ -893,10 +912,11 @@ mod tests {
     #[test]
     fn test_set_string_key() {
         let t = Table::new();
-        let key = TValue::ShortStr(crate::strings::ArcRc::new(ShortString {
-            hash: 0,
-            contents: lua_string_with_nul("key"),
-        }));
+        let key = TValue::ShortStr(crate::strings::ArcRc::new_msg(
+            0,
+            0,
+            &lua_string_with_nul("key").into_bytes(),
+        ));
         t.set(key.clone(), TValue::Integer(7));
         assert_eq!(t.hash_size(), 1);
         let lookup = key;
@@ -1157,10 +1177,11 @@ mod tests {
     #[test]
     fn test_rehash_preserves_string_keys() {
         let t = Table::new();
-        let key = TValue::ShortStr(crate::strings::ArcRc::new(ShortString {
-            hash: 0,
-            contents: lua_string_with_nul("mykey"),
-        }));
+        let key = TValue::ShortStr(crate::strings::ArcRc::new_msg(
+            0,
+            0,
+            &lua_string_with_nul("mykey").into_bytes(),
+        ));
         t.set(key.clone(), TValue::Integer(77));
         t.set_int(1, TValue::Integer(10));
 

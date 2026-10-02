@@ -18,6 +18,7 @@
 //! - **多线程安全**：StringTable 使用 `RefCell/RwLock` 保护 HashTable，读可并发、写互斥
 //!   LongString 使用 `AtomicU64`/`AtomicU8` 实现 Sync 内部可变性
 
+use std::alloc::{alloc, handle_alloc_error};
 use std::cell::Cell;
 use std::fmt::{self, Debug, Formatter};
 use std::os::raw::c_char;
@@ -87,15 +88,27 @@ use inner_lock::RwLock;
 // `lock incq` (Arc::clone 的原子 CAS) 占 intern 时间的 14.61%。
 // 改用 Rc 后 `incq` (非原子) 消除 cache line 上的 LOCK 前缀开销。
 #[cfg(not(feature = "threaded"))]
-pub type ArcRc<T> = Rc<T>;
+pub type ArcRc<T> = crate::alloc::SimpleRc<T>;
 #[cfg(feature = "threaded")]
-pub type ArcRc<T> = std::sync::Arc<T>;
+pub type ArcRc<T> = crate::alloc::SimpleArc<T>;
+// 根据 feature 选择偏移 / layout 函数（不要走关联常量，见问题 2）
+#[cfg(feature = "threaded")]
+use crate::alloc::{
+    simple_arc_block_layout as block_layout, simple_arc_payload_offset as payload_offset,
+};
+#[cfg(not(feature = "threaded"))]
+use crate::alloc::{
+    simple_rc_block_layout as block_layout, simple_rc_payload_offset as payload_offset,
+};
+pub type ArcRcBox<T> = <ArcRc<T> as IsArcRc>::Box;
+pub type ArcRcHeader<T> = <ArcRc<T> as IsArcRc>::Header;
 
 // 默认模式 (性能优先): 使用 hashbrown::HashTable 单级哈希表
 // size_optimized: 使用 std::collections::HashMap 两级结构, 减小二进制体积
 #[cfg(not(size_optimized))]
 use hashbrown::HashTable;
 
+use crate::alloc::{IsArcRc, RcPayload};
 use crate::objects::TValue;
 
 // ============================================================================
@@ -106,20 +119,110 @@ use crate::objects::TValue;
 /// 长度 ≤ 40 的字符串会被内部化（interned），相同内容的字符串共享同一个 `ArcRc`。
 pub const LUAI_MAXSHORTLEN: usize = 40;
 
-const MEMERRMSG: &str = "not enough memory";
+pub const MEMERRMSG: &str = "not enough memory";
 
 // ============================================================================
 // 规约：字符串类型定义
 // ============================================================================
 
-/// 短字符串 — 长度 ≤ 40 字节，会被内部化。
-///
-/// `contents: String` 内含长度信息，无需独立的长度字段。
-/// 内部化保证同一内容唯一实例，因此可仅通过 `contents` 比较判等。
-#[derive(Clone, Debug)]
+/// ShortString 的固定前缀（Sized）
+#[repr(C)]
+pub struct ShortStringFixed {
+    pub hash: u64,
+    pub len: u32,
+    pub code: u32,
+}
+
+/// 变长字符串（DST）
+#[derive(Debug)]
+#[repr(C)]
 pub struct ShortString {
     pub hash: u64,
-    pub contents: String,
+    pub len: u32,
+    pub code: u32,
+    pub data: [u8],
+}
+
+impl ShortString {
+    pub const FIXED_SIZE: usize = std::mem::size_of::<ShortStringFixed>(); // 16
+    pub const ALIGN: usize = std::mem::align_of::<ShortStringFixed>(); // 8
+}
+
+// 编译期断言：前缀布局必须与 ShortString 的固定部分一致
+const _: () = {
+    assert!(
+        ShortString::FIXED_SIZE == 16,
+        "ShortString 固定部分应为 16 字节"
+    );
+    assert!(ShortString::ALIGN == 8, "ShortString 应对齐到 8");
+    // [u8] 的对齐是 1，不会抬高整体对齐，所以前缀对齐 == 整体对齐
+};
+
+unsafe impl RcPayload for ShortString {
+    const ALIGN: usize = std::mem::align_of::<u32>();
+
+    unsafe fn as_ref<'a>(payload: *const u8) -> &'a ShortString {
+        // 从偏移 8 读 len（u64 + u32 + u32 + [u8]）
+        let len = *(payload.add(8) as *const u32) as usize;
+
+        // 直接把 (data ptr, metadata) 拼成 *const ShortString。
+        // 不走 &[u8] 中间层，避免 Stacked Borrows 的范围不匹配。
+        let sp: *const ShortString = std::mem::transmute((payload, len));
+
+        // 这一次 retag 的覆盖范围是「整个 ShortString」，
+        // payload 的 provenance 来自 alloc，覆盖 [payload, payload+16+len) 没问题。
+        &*sp
+    }
+
+    unsafe fn drop_payload(_: *mut u8) {}
+
+    unsafe fn payload_size(p: *const u8) -> usize {
+        let len = *(p.add(8) as *const u32) as usize;
+        ShortString::FIXED_SIZE + len
+    }
+}
+
+impl ArcRc<ShortString> {
+    pub fn new_msg(hash: u64, code: u32, data: &[u8]) -> Self {
+        debug_assert!(data.len() <= u32::MAX as usize, "ShortString 长度超 u32");
+
+        let tmp: ArcRc<ShortString> = unsafe {
+            let align = ShortString::ALIGN;
+            let fixed = ShortString::FIXED_SIZE;
+            let payload_size = fixed + data.len();
+
+            // 1) 一次分配 header + payload
+            let header_offset = payload_offset(align);
+            let layout = block_layout(payload_size, align);
+            let base = alloc(layout);
+            if base.is_null() {
+                handle_alloc_error(layout);
+            }
+
+            // 2) 初始化 header
+            std::ptr::write(
+                base as *mut ArcRcHeader<ShortString>,
+                ArcRcHeader::<ShortString>::default(),
+            );
+
+            // 3) 写固定部分（严格按结构体字段顺序）
+            let p = base.add(header_offset);
+            std::ptr::write(p as *mut u64, hash);
+            std::ptr::write(p.add(8) as *mut u32, data.len() as u32);
+            std::ptr::write(p.add(12) as *mut u32, code);
+
+            // 4) 写变长部分（紧跟在固定部分后面）
+            if !data.is_empty() {
+                std::ptr::copy_nonoverlapping(data.as_ptr(), p.add(fixed), data.len());
+            }
+
+            ArcRc::from_raw_base(base)
+        };
+        debug_assert_eq!(tmp.hash, hash);
+        debug_assert_eq!(tmp.len, data.len() as u32);
+        debug_assert_eq!(&tmp.data[0..tmp.len as usize], data);
+        tmp
+    }
 }
 
 /// 长字符串 — 长度 > 40 字节，不进行内部化，支持惰性哈希。
@@ -158,7 +261,7 @@ impl Debug for LongString {
 }
 
 /// 统一字符串类型。
-#[derive(Clone, Debug)]
+#[derive(Debug, Clone)]
 pub enum LLuaString {
     Short(ArcRc<ShortString>),
     Long(Rc<LongString>),
@@ -172,9 +275,9 @@ impl LLuaString {
         }
     }
 
-    pub fn get_string(&self) -> &String {
+    pub fn get_str(&self) -> &str {
         match self {
-            LLuaString::Short(s) => &s.contents,
+            LLuaString::Short(s) => std::str::from_utf8(&s.data[0..s.len as usize]).unwrap(),
             LLuaString::Long(s) => &s.contents,
         }
     }
@@ -242,7 +345,12 @@ impl PartialEq for LongString {
 pub fn eq_str<'a>(a: &TValue<'a>, b: &TValue<'a>) -> bool {
     match (a, b) {
         (TValue::ShortStr(a), TValue::ShortStr(b)) => {
-            ArcRc::ptr_eq(a, b) || (a.hash == b.hash && content_eq(&a.contents, &b.contents))
+            ArcRc::ptr_eq(a, b)
+                || (a.hash == b.hash
+                    && content_eq(
+                        std::str::from_utf8(&a.data[0..a.len as usize]).unwrap(),
+                        std::str::from_utf8(&b.data[0..b.len as usize]).unwrap(),
+                    ))
         }
         (TValue::LongStr(a), TValue::LongStr(b)) => content_eq(&a.contents, &b.contents),
         _ => false,
@@ -342,7 +450,7 @@ impl StringTable {
             if ts.hash != h {
                 return false;
             }
-            let content_bytes = ts.contents.as_bytes();
+            let content_bytes = &ts.data[0..ts.len as usize];
             // 字符串表中所有 ShortString 都通过 lua_string_with_nul 或
             // buf.push(0) 创建, contents 末尾必有 NUL 终止符。
             // 当 content_bytes.len() == str_len + 1 时, NUL 检查冗余 (已去除)。
@@ -352,10 +460,7 @@ impl StringTable {
         }
 
         // 写路径: 需要插入新字符串
-        let ts = ArcRc::new(ShortString {
-            hash: h,
-            contents: lua_string_with_nul(str),
-        });
+        let ts = ArcRc::new_msg(h, 0, &lua_string_with_nul(str).into_bytes());
         // hasher 函数仅在 resize 时调用, 返回预计算 hash
         ht.insert_unique(h, ArcRc::clone(&ts), |ts| ts.hash);
         // SAFETY: 同上, nuse 也是 RefCell 包装, 单线程下安全.
@@ -420,7 +525,7 @@ impl StringTable {
             if ts.hash != h {
                 return false;
             }
-            let content_bytes = ts.contents.as_bytes();
+            let content_bytes = &ts.data[0..ts.len as usize];
             content_bytes.len() == bytes_len + 1 && content_bytes[..bytes_len] == *bytes
         }) {
             return TValue::ShortStr(ArcRc::clone(ts));
@@ -438,10 +543,11 @@ impl StringTable {
             *buf.as_mut_ptr().add(blen) = 0;
             buf.set_len(blen + 1);
         }
-        let ts = ArcRc::new(ShortString {
-            hash: h,
-            contents: unsafe { String::from_utf8_unchecked(buf) },
-        });
+        let ts = ArcRc::new_msg(
+            h,
+            0,
+            &unsafe { String::from_utf8_unchecked(buf) }.into_bytes(),
+        );
         ht.insert_unique(h, ArcRc::clone(&ts), |ts| ts.hash);
         // SAFETY: 同上
         *unsafe { &mut *self.nuse.as_ptr() } += 1;
@@ -531,9 +637,9 @@ impl StringTable {
         let freed = to_remove.len();
         for (hash, ptr) in to_remove {
             // HashTable 没有 remove_entry 方法，改用 find_entry + remove
-            if let Ok(entry) =
-                ht.find_entry(hash, |item: &ArcRc<ShortString>| ArcRc::as_ptr(item) == ptr)
-            {
+            if let Ok(entry) = ht.find_entry(hash, |item: &ArcRc<ShortString>| {
+                std::ptr::addr_eq(ArcRc::as_ptr(item), ptr)
+            }) {
                 entry.remove();
             }
         }
@@ -847,7 +953,7 @@ pub fn lua_string_gc_mem_size(str: &TValue) -> usize {
     match str {
         // ArcRc 分配 = ArcInner<ShortString>（含引用计数 usize）+ ShortString 自身
         // ShortString = { hash: u64, contents: String }，String 堆分配 = capacity
-        TValue::ShortStr(s) => std::mem::size_of::<ShortString>() + s.contents.capacity() + 16,
+        TValue::ShortStr(s) => std::mem::size_of::<ShortStringFixed>() + s.len as usize + 16,
         // Box<LongString> 堆分配 = LongString 自身（Box 无额外头）
         // LongString = { hash: AtomicU64, extra: AtomicU8, contents: String, ptr_id: u32 }
         TValue::LongStr(s) => std::mem::size_of::<LongString>() + s.contents.capacity() + 8,
@@ -867,11 +973,11 @@ pub fn lua_string_as_str<'a, 'b>(str: &'b TValue<'a>) -> &'b str {
 fn lua_string_as_str_inner<'a, 'b>(str: &'b TValue<'a>) -> &'b str {
     match str {
         TValue::ShortStr(s) => {
-            assert!(s.contents.ends_with('\0'));
-            &s.contents[..s.contents.len() - 1]
+            debug_assert!(s.data[s.len as usize - 1] == 0);
+            unsafe { std::str::from_utf8_unchecked(&s.data[0..s.len as usize - 1]) }
         }
         TValue::LongStr(s) => {
-            assert!(s.contents.ends_with('\0'));
+            debug_assert!(s.contents.ends_with('\0'));
             &s.contents[..s.contents.len() - 1]
         }
         _ => unreachable!("Not a string"),
@@ -882,7 +988,7 @@ fn lua_string_as_str_inner<'a, 'b>(str: &'b TValue<'a>) -> &'b str {
 /// 指针在 LuaString 自身存活期间有效。
 pub fn lua_string_as_c_str_ptr(str: &TValue) -> *const c_char {
     match str {
-        TValue::ShortStr(s) => s.contents.as_ptr() as *const c_char,
+        TValue::ShortStr(s) => s.data.as_ptr() as *const c_char,
         TValue::LongStr(s) => s.contents.as_ptr() as *const c_char,
         _ => unreachable!("Not a string"),
     }
@@ -892,7 +998,7 @@ pub fn lua_string_as_c_str_ptr(str: &TValue) -> *const c_char {
 /// ShortString 末尾必然有 NUL, 直接 contents.len()-1 省去 as_str 的 slice 操作。
 pub fn lua_string_len(str: &TValue) -> usize {
     match str {
-        TValue::ShortStr(s) => s.contents.len() - 1,
+        TValue::ShortStr(s) => s.len as usize - 1,
         TValue::LongStr(s) => s.contents.len() - 1,
         _ => unreachable!("Not a string"),
     }

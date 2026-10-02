@@ -48,8 +48,7 @@ thread_local! {
 /// 模式下读到的字节流) 能被词法分析器正确处理。
 pub const EOF_CHAR: char = '\u{10FFFF}';
 
-#[cfg_attr(not(size_optimized), derive(Debug))]
-#[derive(Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum Token {
     // Keywords
     And,

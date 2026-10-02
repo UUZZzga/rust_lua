@@ -1004,3 +1004,18 @@ pub fn open_os_lib<'a>(state: &mut LuaState<'a>) {
     let key = state.intern_str("os");
     state.globals.set(key, TValue::Table(lib));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_open_os_lib() {
+        let mut state = LuaState::default();
+        open_os_lib(&mut state);
+        let key = state.intern_str("os");
+        let val = state.globals.get(&key);
+        assert!(val.is_some(), "os must be registered");
+        assert!(matches!(val, Some(TValue::Table(_))));
+    }
+}

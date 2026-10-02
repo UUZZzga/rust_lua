@@ -1392,10 +1392,11 @@ mod tests {
     use crate::strings::lua_string_with_nul;
 
     fn make_str(s: &str) -> TValue<'_> {
-        TValue::ShortStr(crate::strings::ArcRc::new(crate::strings::ShortString {
-            hash: 0,
-            contents: lua_string_with_nul(s),
-        }))
+        TValue::ShortStr(crate::strings::ArcRc::new_msg(
+            0,
+            0,
+            &lua_string_with_nul(s).into_bytes(),
+        ))
     }
 
     // ========================================================================
@@ -1962,7 +1963,7 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_open_math_lib_registers_global() {
+    fn test_open_math_liblobal() {
         let mut state = LuaState::default();
         open_math_lib(&mut state);
         let key = state.intern_str("math");

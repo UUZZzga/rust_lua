@@ -7903,6 +7903,7 @@ mod tests {
         base: usize,
         stack: Vec<TValue<'a>>,
     ) -> Result<VmResult<'a>, VmError<'a>> {
+        let string_table = Rc::new(StringTable::new());
         let mut state = LuaState::from_proto(
             proto,
             base,
@@ -7910,7 +7911,9 @@ mod tests {
             Rc::new(RefCell::new(GlobalState {
                 gcstopem: false,
                 gc: GCState::default_incremental(),
+                memerrmsg: crate::strings::new_lstr(&string_table, crate::strings::MEMERRMSG),
             })),
+            string_table,
         );
         VmExecutor::execute_loop(&mut state)
     }

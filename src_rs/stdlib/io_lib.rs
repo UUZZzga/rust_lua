@@ -2327,3 +2327,19 @@ pub fn open_io_lib<'a>(state: &mut LuaState<'a>) {
     let key = state.intern_str("io");
     state.globals.set(key, TValue::Table(lib));
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[cfg_attr(miri, ignore)] // Miri 不支持 _fdopen/stdin/stdout 等文件 I/O
+    fn test_open_io_lib() {
+        let mut state = LuaState::default();
+        open_io_lib(&mut state);
+        let key = state.intern_str("io");
+        let val = state.globals.get(&key);
+        assert!(val.is_some(), "io must be registered");
+        assert!(matches!(val, Some(TValue::Table(_))));
+    }
+}
