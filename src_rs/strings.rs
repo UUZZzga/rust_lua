@@ -483,7 +483,7 @@ impl StringTable {
             if ts.hash != h {
                 return false;
             }
-            let content_bytes = ts.contents.as_bytes();
+            let content_bytes = &ts.data[0..ts.len as usize];
             content_bytes.len() == str_len + 1 && content_bytes[..str_len] == *str_bytes
         }) {
             return ArcRc::clone(ts);
@@ -493,10 +493,7 @@ impl StringTable {
         // 写路径: 需要插入新字符串
         // TOCTOU 在单线程执行中安全; 多线程下最多导致重复桶条目(无害)
         let mut ht = self.ht.write();
-        let ts = ArcRc::new(ShortString {
-            hash: h,
-            contents: lua_string_with_nul(str),
-        });
+        let ts = ArcRc::new_msg(h, 0, &lua_string_with_nul(str).into_bytes());
         ht.insert_unique(h, ArcRc::clone(&ts), |ts| ts.hash);
         *self.nuse.write() += 1;
         ts
@@ -570,7 +567,7 @@ impl StringTable {
             if ts.hash != h {
                 return false;
             }
-            let content_bytes = ts.contents.as_bytes();
+            let content_bytes = &ts.data[0..ts.len as usize];
             content_bytes.len() == bytes_len + 1 && content_bytes[..bytes_len] == *bytes
         }) {
             return TValue::ShortStr(ArcRc::clone(ts));
@@ -586,10 +583,11 @@ impl StringTable {
             buf.set_len(blen + 1);
         }
         let mut ht = self.ht.write();
-        let ts = ArcRc::new(ShortString {
-            hash: h,
-            contents: unsafe { String::from_utf8_unchecked(buf) },
-        });
+        let ts = ArcRc::new_msg(
+            h,
+            0,
+            &unsafe { String::from_utf8_unchecked(buf) }.into_bytes(),
+        );
         ht.insert_unique(h, ArcRc::clone(&ts), |ts| ts.hash);
         *self.nuse.write() += 1;
         TValue::ShortStr(ts)
