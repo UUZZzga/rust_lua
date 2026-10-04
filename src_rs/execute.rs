@@ -4601,7 +4601,14 @@ impl VmExecutor {
                 // state.stack 已被 split_off(a) 截断到 a,无需再 truncate
                 state.stack.push(result);
                 state.stack.append(&mut saved_tail);
-                state.top = state.stack.len();
+                // 关键: live 边界只到拼接结果 (对应 C 的 L->top.p = ra + 1)。
+                // 不能设为 stack.len() — a+n 之上的槽位是"死寄存器"，Vec 表示必须保留
+                // 其值（上面 append 回 saved_tail），但 top 必须只标记 live 区域，
+                // 否则后续 vararg 函数调用 (VARARGPREP: totalargs = top - base) 或
+                // B==0 调用会把死寄存器当成实参。
+                // (CI skynet e2e 实证: 拼接后紧跟的 vararg 调用把上一轮 dispatch 的
+                //  session/source/cmd 混进 `...`)
+                state.top = a + 1;
             }
             Err((_, mut vals)) => {
                 // 拼接失败: 尝试 __concat 元方法
@@ -4656,7 +4663,8 @@ impl VmExecutor {
                     state.stack.pop();
                 }
                 state.stack.append(&mut saved_tail);
-                state.top = state.stack.len();
+                // 同成功路径: live 边界只到拼接结果 (对应 C 的 L->top.p = ra + 1)
+                state.top = a + 1;
             }
         }
         // 对应 C 的 luaC_checkGC(L)（在 luaV_concat 结束时调用）
@@ -5299,40 +5307,6 @@ impl VmExecutor {
         } else {
             b.saturating_sub(1)
         };
-        // TEMP-DIAG: MULTRET 实参的 Lua 调用（CI 排查用，只记 skynet）
-        if b == 0 {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static N: AtomicUsize = AtomicUsize::new(0);
-            let src = match &closure.proto.source {
-                Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
-                    crate::strings::lua_string_as_str(s).to_string()
-                }
-                _ => "<none>".to_string(),
-            };
-            let suspicious = state.top != state.stack.len();
-            if (src.contains("skynet") || suspicious) && N.fetch_add(1, Ordering::Relaxed) < 60 {
-                let desc: Vec<String> = (0..nargs.min(14))
-                    .map(|i| match state.stack.get(a + 1 + i) {
-                        Some(TValue::Integer(v)) => format!("{}", v),
-                        Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
-                            format!("{:?}", crate::strings::lua_string_as_str(s))
-                        }
-                        Some(TValue::Nil(_)) => "nil".to_string(),
-                        Some(o) => format!("{:?}", o.ty()),
-                        None => "OOB".to_string(),
-                    })
-                    .collect();
-                eprintln!(
-                    "MULTRET-LUA nargs={} a={} top={} len={} src={} args={:?}",
-                    nargs,
-                    a,
-                    state.top,
-                    state.stack.len(),
-                    src,
-                    desc
-                );
-            }
-        }
         let nresults = c - 1; // -1 表示 MULTRET (对应 C 的 nresults = GETARG_C(i) - 1)
                               // perf: 不再 Rc::clone(&closure.proto) — 直接访问 closure.proto 字段
                               // closure 在下方被 move 进 CallInfoEntry, 移动后需要的值提前缓存
@@ -5493,44 +5467,6 @@ impl VmExecutor {
                     b.saturating_sub(1)
                 };
                 let nresults = c - 1; // -1 表示 MULTRET (对应 C 的 nresults = GETARG_C(i) - 1)
-                                      // TEMP-DIAG: 记录进入 launcher.lua 函数的实参（CI 排查用）
-                {
-                    use std::sync::atomic::{AtomicUsize, Ordering};
-                    static N: AtomicUsize = AtomicUsize::new(0);
-                    let src_is_launcher = match &closure.proto.source {
-                        Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
-                            crate::strings::lua_string_as_str(s).contains("launcher.lua")
-                        }
-                        _ => false,
-                    };
-                    if src_is_launcher && N.fetch_add(1, Ordering::Relaxed) < 20 {
-                        let cnt = if b == 0 {
-                            state.top.saturating_sub(a + 1)
-                        } else {
-                            b.saturating_sub(1)
-                        };
-                        let desc: Vec<String> = (0..cnt.min(14))
-                            .map(|i| match state.stack.get(a + 1 + i) {
-                                Some(TValue::Integer(v)) => format!("{}", v),
-                                Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
-                                    format!("{:?}", crate::strings::lua_string_as_str(s))
-                                }
-                                Some(TValue::Nil(_)) => "nil".to_string(),
-                                Some(o) => format!("{:?}", o.ty()),
-                                None => "OOB".to_string(),
-                            })
-                            .collect();
-                        eprintln!(
-                            "LAUNCHER-CALL b={} a={} nargs={} top={} len={} args={:?}",
-                            b,
-                            a,
-                            cnt,
-                            state.top,
-                            state.stack.len(),
-                            desc
-                        );
-                    }
-                }
                 let fsize = closure.proto.max_stack_size as usize;
                 let nfixparams = closure.proto.num_params as usize;
                 let proto_is_vararg = closure.proto.is_vararg();
@@ -5823,20 +5759,6 @@ impl VmExecutor {
         let arg_end = if b != 0 { a + b } else { state.top }.max(a + 1);
         if state.stack.len() > arg_end {
             state.stack.truncate(arg_end);
-        }
-        // TEMP-DIAG: 仅在 b==0 且 top 与栈长不一致（可疑）时打印（CI 排查用）
-        if b == 0 && state.top != state.stack.len() {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static N: AtomicUsize = AtomicUsize::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 30 {
-                eprintln!(
-                    "MULTRET-C-SUSPECT a={} len={} top={} arg_end={}",
-                    a,
-                    state.stack.len(),
-                    state.top,
-                    arg_end
-                );
-            }
         }
 
         // 预留 capacity，但不 push nil（push 会改变 stack.len()，导致 C 函数中
@@ -7435,6 +7357,18 @@ impl VmExecutor {
         // MULTRET 参数场景 stack.len() > top 会多算 stale 栈元素。
         let totalargs = state.top.saturating_sub(state.base);
         let nextra = totalargs.saturating_sub(nfixparams);
+
+        // 关键：先把 Vec 长度对齐到 live top。smart_clear_stack 为了性能可能只降
+        // state.top 而不截断 Vec（尾部全是 trivial 值时），此时 Vec 里 top 之上
+        // 残留着上一轮的 stale 值。本函数后续用 push 追加（func/固定参数副本、
+        // vararg 表），若不对齐就会把这些副本放到 stale 值之上——帧布局整体偏移，
+        // stale 值落入新帧的变参区，导致 `...` 多出调用者的历史值。
+        // （CI skynet e2e 实证：launcher 的 `table.concat({...}," ")` 把上一次
+        //  dispatch 的 session/source/cmd 一起拼进服务启动参数。）
+        // 对应 C：L->top 本身就是 live 边界，top 之上不属于栈。
+        if state.stack.len() > state.top {
+            state.stack.truncate(state.top);
+        }
 
         if flag & PF_VATAB != 0 {
             // PF_VATAB: 创建 vararg 表
