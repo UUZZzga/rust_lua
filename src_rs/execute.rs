@@ -5299,17 +5299,18 @@ impl VmExecutor {
         } else {
             b.saturating_sub(1)
         };
-        // TEMP-DIAG: MULTRET 实参的 Lua 调用（CI 排查用）
+        // TEMP-DIAG: MULTRET 实参的 Lua 调用（CI 排查用，只记 skynet）
         if b == 0 {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static N: AtomicUsize = AtomicUsize::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 60 {
-                let src = match &closure.proto.source {
-                    Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
-                        crate::strings::lua_string_as_str(s).to_string()
-                    }
-                    _ => "<none>".to_string(),
-                };
+            let src = match &closure.proto.source {
+                Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
+                    crate::strings::lua_string_as_str(s).to_string()
+                }
+                _ => "<none>".to_string(),
+            };
+            let suspicious = state.top != state.stack.len();
+            if (src.contains("skynet") || suspicious) && N.fetch_add(1, Ordering::Relaxed) < 60 {
                 let desc: Vec<String> = (0..nargs.min(14))
                     .map(|i| match state.stack.get(a + 1 + i) {
                         Some(TValue::Integer(v)) => format!("{}", v),
