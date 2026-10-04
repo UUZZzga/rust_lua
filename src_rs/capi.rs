@@ -4544,10 +4544,91 @@ mod tests {
         lua_close(L);
     }
 
-    /// 回归：skynet 的 lcallback 序列（lua_newthread + 在新线程 pushcfunction +
-    /// lua_xmove 回移函数）。新线程必须带 stack[0]=nil 占位，否则 C API 正索引
-    /// 整体错位，`lua_pushvalue(L,2)` 读越界 nil → snlua bootstrap 报
-    /// "attempt to call a nil value"。
+    /// 回归：C 侧对「Lua 层 coroutine.create 出来的协程」调用 lua_resume
+    /// （skynet 用 C 版 luaB_coresume 替换 coroutine.resume 后走的就是这条路）。
+    /// lua_tothread 必须让该线程的栈对 c_api_resume 可见：[_, func] 布局。
+    #[test]
+    fn test_lua_resume_lua_created_coroutine() {
+        let mut st = LuaState::default();
+        st.open_selected_libs(0, 0);
+        let rc = st.load_buffer(
+            "local co = coroutine.create(function() return 42 end); return co",
+            "=t",
+        );
+        assert_eq!(rc, 0, "load_buffer failed");
+        st.call(0, 1);
+        assert!(
+            matches!(st.stack.last(), Some(TValue::Thread(_))),
+            "expected the created thread on top"
+        );
+
+        let L = &mut st as *mut LuaState<'static> as *mut lua_State;
+        let co = lua_tothread(L, -1);
+        assert!(
+            !co.is_null(),
+            "lua_tothread must return the coroutine state"
+        );
+
+        let mut nres: c_int = 0;
+        let r = lua_resume(co, L, 0, &mut nres);
+        assert_eq!(
+            r, LUA_OK,
+            "lua_resume on a Lua-created coroutine must succeed"
+        );
+        assert_eq!(nres, 1, "one result expected");
+        assert_eq!(
+            lua_tointegerx(co, -1, ptr::null_mut()),
+            42,
+            "result must be 42"
+        );
+    }
+
+    /// 回归：完整复刻 skynet auxresume 的形状 —— 带参数 resume、yield、结果
+    /// lua_xmove 回移、再次 resume 至结束。skynet e2e（snlua + skynet.call）走的就是它。
+    #[test]
+    fn test_lua_resume_xmove_roundtrip() {
+        let mut st = LuaState::default();
+        st.open_selected_libs(0, 0);
+        let rc = st.load_buffer(
+            "local co = coroutine.create(function(a)\n\
+             local b = coroutine.yield(a + 1)\n\
+             return b * 2\n\
+             end)\n\
+             return co",
+            "=t",
+        );
+        assert_eq!(rc, 0, "load_buffer failed");
+        st.call(0, 1);
+
+        let L = &mut st as *mut LuaState<'static> as *mut lua_State;
+        let co = lua_tothread(L, -1);
+        assert!(!co.is_null());
+
+        // --- auxresume(L, co, 1): xmove 参数 → lua_resume → 回移 yield 值 ---
+        let base = lua_gettop(L);
+        lua_pushinteger(L, 10);
+        lua_xmove(L, co, 1); // 参数离开 L
+        assert_eq!(lua_gettop(L), base, "arg moved out of L");
+        let mut nres: c_int = 0;
+        let r = lua_resume(co, L, 1, &mut nres);
+        assert_eq!(r, LUA_YIELD, "coroutine must yield");
+        assert_eq!(nres, 1, "yield returns one value");
+        lua_xmove(co, L, nres as c_int);
+        assert_eq!(lua_gettop(L), base + 1, "yielded value must land on L");
+        assert_eq!(lua_tointegerx(L, -1, ptr::null_mut()), 11, "yield result");
+
+        // --- 第二次 auxresume: xmove 新参数 → resume 到结束 ---
+        let base2 = lua_gettop(L);
+        lua_pushinteger(L, 20);
+        lua_xmove(L, co, 1);
+        let r = lua_resume(co, L, 1, &mut nres);
+        assert_eq!(r, LUA_OK, "second resume must finish the coroutine");
+        assert_eq!(nres, 1, "final returns one value");
+        lua_xmove(co, L, nres as c_int);
+        assert_eq!(lua_gettop(L), base2 + 1, "final value must land on L");
+        assert_eq!(lua_tointegerx(L, -1, ptr::null_mut()), 40, "final result");
+    }
+
     #[test]
     fn test_newthread_xmove_index_layout() {
         unsafe extern "C" fn cfn(_: *mut std::ffi::c_void) -> c_int {

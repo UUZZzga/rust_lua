@@ -67,7 +67,7 @@ done
 if [[ $READY -ne 1 ]]; then
     echo "  [ERROR] port 8888 未就绪"
     echo "--- server log ---"
-    tail -30 /tmp/skynet_e2e_server.log
+    tail -120 /tmp/skynet_e2e_server.log
     kill "$SERVER_PID" 2>/dev/null || true
     kill "$SLEEP_PID" 2>/dev/null || true
     rm -f "$STDIN_FIFO"
@@ -113,7 +113,7 @@ echo "--- client log ---"
 cat /tmp/skynet_e2e_client.log
 echo "  client exit code: $CLIENT_RC"
 echo "--- server log after client ---"
-tail -10 /tmp/skynet_e2e_server.log
+tail -60 /tmp/skynet_e2e_server.log
 
 echo "[4/4] 关闭服务端..."
 kill "$SERVER_PID" 2>/dev/null || true
