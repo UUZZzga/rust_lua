@@ -37,8 +37,8 @@ pub struct Interpreter<'io> {
 
 impl<'io> Interpreter<'io> {
     pub fn new(io: &'io mut dyn crate::mock::io_mock::Io) -> Self {
-        let mut l = LuaState::new(io);
-        l.gc_stop();
+        let mut l = LuaState::new_main(io);
+        l.g_mut().gc_stop();
         Interpreter {
             l,
             progname: LUA_PROGNAME.to_string(),
@@ -46,16 +46,16 @@ impl<'io> Interpreter<'io> {
     }
 
     fn writestring(&mut self, s: &str) {
-        let _ = self.l.io.out(s);
+        let _ = self.l.g_mut().io.out(s);
     }
 
     fn writestring_error(&mut self, s: &str) {
-        let _ = self.l.io.err(s);
+        let _ = self.l.g_mut().io.err(s);
     }
 
     fn writeline(&mut self) {
-        let _ = self.l.io.out("\n");
-        let _ = self.l.io.out_flush();
+        let _ = self.l.g_mut().io.out("\n");
+        let _ = self.l.g_mut().io.out_flush();
     }
 
     fn print_version(&mut self) {
@@ -72,6 +72,7 @@ impl<'io> Interpreter<'io> {
             // 避免 io::Write::write_fmt 默认实现引入 StringError + Unicode 表 (~4KB)
             let _ = self
                 .l
+                .g_mut()
                 .io
                 .err(format!("{}: {}\n", self.progname, msg).as_str());
             self.l.pop(1);
@@ -99,9 +100,9 @@ impl<'io> Interpreter<'io> {
                             data.metatable.as_ref().and_then(|mt| mt.get(&tostring_key))
                         };
                         meta_fn.map(|f| {
-                            let base = self.l.exec.stack.len();
-                            self.l.exec.stack.push(f);
-                            self.l.exec.stack.push(errobj.clone().unwrap());
+                            let base = self.l.stack.len();
+                            self.l.stack.push(f);
+                            self.l.stack.push(errobj.clone().unwrap());
                             // 构造 call_info，让 __tostring 中的 debug.getinfo 能看到
                             // 错误发生时的调用栈（对应 C 版中 msghandler 作为 pcall 的
                             // msgh 在错误上下文中被调用）。
@@ -123,7 +124,7 @@ impl<'io> Interpreter<'io> {
                             // 即 main chunk 中 error(m) 的 pc。但 call_info[1] 是 error C 函数帧，
                             // 它的 closure 是 None（C 函数），需要从 call_info[0].closure 获取
                             // main chunk 闭包（debug.getinfo 的 closure 后备机制）。
-                            let saved_ci = std::mem::take(&mut self.l.exec.call_info);
+                            let saved_ci = std::mem::take(&mut self.l.call_info);
                             let mut constructed_ci: Vec<crate::state::CallInfoEntry> = Vec::new();
                             if let Some(ref err_ci) = self.l.last_error_call_info {
                                 // 找到 main chunk 帧（closure 非空的条目）和 error C 函数帧
@@ -166,7 +167,7 @@ impl<'io> Interpreter<'io> {
                                     is_tailcall: false,
                                 });
                             }
-                            self.l.exec.call_info = constructed_ci;
+                            self.l.call_info = constructed_ci;
                             let status = self.l.pcall(1, 1, 0);
                             let result = if status == 0 {
                                 self.l.to_string(-1)
@@ -174,7 +175,7 @@ impl<'io> Interpreter<'io> {
                                 None
                             };
                             // 恢复 call_info
-                            self.l.exec.call_info = saved_ci;
+                            self.l.call_info = saved_ci;
                             self.l.settop(base);
                             result
                         })
@@ -281,7 +282,7 @@ impl<'io> Interpreter<'io> {
     }
 
     fn run_args(&mut self, argv: &[String], n: usize) -> bool {
-        self.l.warning("@off", false);
+        self.l.g_mut().warning("@off", false);
         let mut i = 1;
         while i < n {
             let bytes = argv[i].as_bytes();
@@ -307,7 +308,7 @@ impl<'io> Interpreter<'io> {
                     }
                 }
                 b'W' => {
-                    self.l.warning("@on", false);
+                    self.l.g_mut().warning("@on", false);
                 }
                 _ => {}
             }
@@ -349,18 +350,18 @@ impl<'io> Interpreter<'io> {
     }
 
     fn readline(&mut self, prompt: &str) -> Option<String> {
-        let _ = self.l.io.out(prompt);
-        let _ = self.l.io.out_flush();
+        let _ = self.l.g_mut().io.out(prompt);
+        let _ = self.l.g_mut().io.out_flush();
         let stdin = io::stdin();
         {
             let mut line = String::with_capacity(LUA_MAXINPUT);
-            match self.l.io.read_line(&mut line) {
+            match self.l.g_mut().io.read_line(&mut line) {
                 Ok(0) => None,
                 Ok(_) => {
                     // 非终端时回显输入行（模拟 readline 库在管道/重定向时的行为）
                     if !stdin.is_terminal() {
-                        let _ = self.l.io.out(line.as_str());
-                        let _ = self.l.io.out_flush();
+                        let _ = self.l.g_mut().io.out(line.as_str());
+                        let _ = self.l.g_mut().io.out_flush();
                     }
                     if line.ends_with('\n') {
                         line.pop();
@@ -412,9 +413,9 @@ impl<'io> Interpreter<'io> {
                     data.metatable.as_ref().and_then(|mt| mt.get(&tostring_key))
                 };
                 meta_fn.and_then(|f| {
-                    let base = self.l.exec.stack.len();
-                    self.l.exec.stack.push(f);
-                    self.l.exec.stack.push(TValue::Table(t));
+                    let base = self.l.stack.len();
+                    self.l.stack.push(f);
+                    self.l.stack.push(TValue::Table(t));
                     let status = self.l.pcall(1, 1, 0);
                     if status == 0 {
                         let s = self.l.to_string(-1);
@@ -506,7 +507,7 @@ impl<'io> Interpreter<'io> {
                     .l
                     .to_string(-1)
                     .unwrap_or_else(|| "(error)".to_string());
-                let _ = self.l.io.err(
+                let _ = self.l.g_mut().io.err(
                     format!("{}: error calling 'print' ({})\n", self.progname, err_msg).as_str(),
                 );
             }
@@ -603,22 +604,28 @@ impl<'io> Interpreter<'io> {
     fn print_usage(&mut self, badoption: &str) {
         // 体积优先: 用 write_all + format! 替代 write!/writeln!(self.stderr, ...)
         // 避免 io::Write::write_fmt 默认实现引入 StringError + Unicode 表 (~4KB)
-        let _ = self.l.io.err(format!("{}: ", LUA_PROGNAME).as_str());
+        let _ = self
+            .l
+            .g_mut()
+            .io
+            .err(format!("{}: ", LUA_PROGNAME).as_str());
         match badoption.chars().nth(1) {
             Some('e' | 'l') => {
                 let _ = self
                     .l
+                    .g_mut()
                     .io
                     .err(format!("'{}' needs argument\n", badoption).as_str());
             }
             _ => {
                 let _ = self
                     .l
+                    .g_mut()
                     .io
                     .err(format!("unrecognized option '{}'\n", badoption).as_str());
             }
         }
-        let _ = self.l.io.err(
+        let _ = self.l.g_mut().io.err(
             format!(
                 "usage: {} [options] [script [args]]\n\
              Available options are:\n\
@@ -676,8 +683,8 @@ impl<'io> Interpreter<'io> {
         }
         self.l.set_global("arg");
 
-        self.l.gc_restart();
-        self.l.gc_gen();
+        self.l.g_mut().gc_restart();
+        self.l.g_mut().gc_gen();
 
         if args & HAS_EE == 0 {
             if self.handle_luainit() != 0 {

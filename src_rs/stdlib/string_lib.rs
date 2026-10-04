@@ -11,6 +11,8 @@
 use crate::alloc::SimpleRc;
 use crate::execute::{arg_error, VmError};
 use crate::objects::{BuiltinFn, BuiltinFnPtr, LuaType, NilKind, RustClosure, TValue};
+#[cfg(test)]
+use crate::state::GlobalState;
 use crate::state::LuaState;
 use crate::strings::{lua_string_as_str, lua_string_len, new_lstr_bytes, ArcRc};
 use crate::table::Table;
@@ -1285,19 +1287,19 @@ fn add_value_from_repl<'a>(
             }
 
             // 保存当前栈顶，调用函数后恢复
-            let stack_top = state.exec.stack.len();
+            let stack_top = state.stack.len();
             // push function
-            state.exec.stack.push(repl.clone());
+            state.stack.push(repl.clone());
             // push captures as arguments
             for cap in captures {
-                state.exec.stack.push(cap);
+                state.stack.push(cap);
             }
 
             // gsub 回调通过 lua_call (luaD_callnoyield) 调用，不可 yield
-            let saved_ny = state.exec.n_ny_calls;
-            state.exec.n_ny_calls = state.exec.n_ny_calls.saturating_add(1);
+            let saved_ny = state.n_ny_calls;
+            state.n_ny_calls = state.n_ny_calls.saturating_add(1);
             let status = state.pcall(n, 1, 0);
-            state.exec.n_ny_calls = saved_ny;
+            state.n_ny_calls = saved_ny;
             if status != 0 {
                 let msg = state
                     .to_string(-1)
@@ -1307,11 +1309,7 @@ fn add_value_from_repl<'a>(
             }
 
             // 取出结果
-            let result_val = state
-                .exec
-                .stack
-                .pop()
-                .unwrap_or(TValue::Nil(NilKind::Strict));
+            let result_val = state.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
             state.settop(stack_top);
 
             match result_val {
@@ -3122,10 +3120,10 @@ pub fn str_unpack<'a>(
 /// 从栈中读取字符串参数
 fn get_str_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> Result<String, VmError<'a>> {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.exec.stack.len() {
+    if stack_idx >= state.stack.len() {
         return Err(arg_error(state, idx + 1, "string expected, got no value"));
     }
-    let val = &state.exec.stack[stack_idx];
+    let val = &state.stack[stack_idx];
     match val {
         s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => Ok(lua_string_as_str(s).to_string()),
         TValue::Integer(n) => Ok(n.to_string()),
@@ -3148,10 +3146,10 @@ fn get_str_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> Result<String,
 #[cfg_attr(not(size_optimized), inline)]
 fn get_lstr_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> Result<TValue<'a>, VmError<'a>> {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.exec.stack.len() {
+    if stack_idx >= state.stack.len() {
         return Err(arg_error(state, idx + 1, "string expected, got no value"));
     }
-    let val = &state.exec.stack[stack_idx];
+    let val = &state.stack[stack_idx];
     match val {
         s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => Ok(s.clone()),
         TValue::Integer(n) => Ok(state.intern_str(&n.to_string())),
@@ -3177,10 +3175,10 @@ fn get_int_arg<'a>(
     _funcname: &str,
 ) -> Result<i64, VmError<'a>> {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.exec.stack.len() {
+    if stack_idx >= state.stack.len() {
         return Ok(default);
     }
-    match &state.exec.stack[stack_idx] {
+    match &state.stack[stack_idx] {
         TValue::Integer(n) => Ok(*n),
         TValue::Float(f) => match crate::vm::float_to_integer(*f, crate::vm::F2IMode::Eq) {
             Some(i) => Ok(i),
@@ -3201,7 +3199,7 @@ fn get_int_arg<'a>(
             idx + 1,
             &format!(
                 "number expected, got {}",
-                crate::tm::obj_type_name(state, &state.exec.stack[stack_idx])
+                crate::tm::obj_type_name(state, &state.stack[stack_idx])
             ),
         )),
     }
@@ -3221,10 +3219,10 @@ fn get_opt_int_arg<'a>(
         return Ok(default);
     }
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.exec.stack.len() {
+    if stack_idx >= state.stack.len() {
         return Ok(default);
     }
-    match &state.exec.stack[stack_idx] {
+    match &state.stack[stack_idx] {
         TValue::Nil(_) => Ok(default),
         TValue::Integer(n) => Ok(*n),
         TValue::Float(f) => match crate::vm::float_to_integer(*f, crate::vm::F2IMode::Eq) {
@@ -3245,7 +3243,7 @@ fn get_opt_int_arg<'a>(
             idx + 1,
             &format!(
                 "number expected, got {}",
-                crate::tm::obj_type_name(state, &state.exec.stack[stack_idx])
+                crate::tm::obj_type_name(state, &state.stack[stack_idx])
             ),
         )),
     }
@@ -3257,10 +3255,10 @@ fn get_bool_arg(state: &LuaState, a: usize, nargs: usize, idx: usize, default: b
         return default;
     }
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.exec.stack.len() {
+    if stack_idx >= state.stack.len() {
         return default;
     }
-    !state.exec.stack[stack_idx].is_false()
+    !state.stack[stack_idx].is_false()
 }
 
 /// 将结果压入栈并调整栈顶
@@ -3289,12 +3287,12 @@ fn tostring_for_format<'a>(state: &mut LuaState<'a>, val: &TValue<'a>) -> Option
 
     if let Some(f) = meta_fn {
         // 调用 __tostring(value)
-        let base = state.exec.stack.len();
-        state.exec.stack.push(f);
-        state.exec.stack.push(val.clone());
+        let base = state.stack.len();
+        state.stack.push(f);
+        state.stack.push(val.clone());
         let status = state.pcall(1, 1, 0);
-        let result = if status == 0 && base < state.exec.stack.len() {
-            match &state.exec.stack[base] {
+        let result = if status == 0 && base < state.stack.len() {
+            match &state.stack[base] {
                 s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                     Some(lua_string_as_str(s).to_string())
                 }
@@ -3303,7 +3301,7 @@ fn tostring_for_format<'a>(state: &mut LuaState<'a>, val: &TValue<'a>) -> Option
         } else {
             None
         };
-        state.exec.stack.truncate(base);
+        state.stack.truncate(base);
         return result;
     }
 
@@ -3405,12 +3403,7 @@ pub fn call_gmatch_iter<'a>(
     nresults: i32,
 ) -> Result<(), VmError<'a>> {
     // 从栈位置 a 取出 RustClosure（TFORCALL 传 ra+3，直接调用时传函数位置）
-    let rc = match state
-        .exec
-        .stack
-        .get(a)
-        .or_else(|| state.exec.stack.get(a + 1))
-    {
+    let rc = match state.stack.get(a).or_else(|| state.stack.get(a + 1)) {
         Some(TValue::RustClosure(rc)) => rc.clone(),
         _ => {
             return Err(VmError::RuntimeError(
@@ -3469,7 +3462,7 @@ pub fn call_gmatch_iter<'a>(
     let mut found = false;
     // perf: 结果直接写在栈顶（adjust_results_on_stack 移动到 a），
     // 消除 get_captures 的 Vec 分配 + result_vals 中转 Vec（每 word 一次）。
-    let first_result_pos = state.exec.stack.len();
+    let first_result_pos = state.stack.len();
     let mut n_results_on_stack = 0usize;
 
     // perf: MatchState 在循环外构造一次（对应 C 的 prepstate + reprepstate）
@@ -3489,7 +3482,7 @@ pub fn call_gmatch_iter<'a>(
                         let cap = match get_one_capture(&ms, i, cur_pos, end) {
                             Ok(c) => c,
                             Err(e) => {
-                                state.exec.stack.truncate(first_result_pos);
+                                state.stack.truncate(first_result_pos);
                                 return Err(VmError::RuntimeError(e));
                             }
                         };
@@ -3500,7 +3493,7 @@ pub fn call_gmatch_iter<'a>(
                             ),
                             CaptureResult::Pos(pos) => TValue::Integer(pos as i64),
                         };
-                        state.exec.stack.push(val);
+                        state.stack.push(val);
                         n_results_on_stack += 1;
                     }
                     // 更新 pos 和 lastmatch（对应 C: gm->src = gm->lastmatch = e）
@@ -3519,7 +3512,7 @@ pub fn call_gmatch_iter<'a>(
                 // 未匹配，继续下一个位置
             }
             Err(e) => {
-                state.exec.stack.truncate(first_result_pos);
+                state.stack.truncate(first_result_pos);
                 return Err(VmError::RuntimeError(e));
             }
         }
@@ -3686,7 +3679,7 @@ fn call_str_find<'a>(
     let plain = get_bool_arg(state, a, nargs, 3, false);
     // perf: 结果直接写栈顶 + adjust_results_on_stack，
     // 消除 FindResult.captures + vec![start,end] + extend 的 3 个中转 Vec。
-    let first_result_pos = state.exec.stack.len();
+    let first_result_pos = state.stack.len();
     let mut caps = Vec::new();
     let found = str_find_into(
         &s,
@@ -3701,10 +3694,10 @@ fn call_str_find<'a>(
     match found {
         Some((start, end)) => {
             let n_caps = caps.len();
-            state.exec.stack.push(TValue::Integer(start as i64));
-            state.exec.stack.push(TValue::Integer(end as i64));
+            state.stack.push(TValue::Integer(start as i64));
+            state.stack.push(TValue::Integer(end as i64));
             for cap in caps {
-                state.exec.stack.push(cap);
+                state.stack.push(cap);
             }
             state.adjust_results_on_stack(a, nresults, 2 + n_caps, first_result_pos);
         }
@@ -3727,17 +3720,16 @@ fn call_str_format<'a>(
     // constructs.lua 的 string.format args 都是 string/number, 走快速路径避免 clone。
     let args_start = a + 2;
     let args_end = a + 1 + nargs;
-    let has_table = (args_start..args_end).any(|idx| {
-        idx < state.exec.stack.len() && matches!(state.exec.stack[idx], TValue::Table(_))
-    });
+    let has_table = (args_start..args_end)
+        .any(|idx| idx < state.stack.len() && matches!(state.stack[idx], TValue::Table(_)));
 
     if has_table {
         // 慢速路径: clone args, 转换 table 为 string
         let mut args: Vec<TValue> = (1..nargs)
             .map(|i| {
                 let idx = a + 1 + i;
-                if idx < state.exec.stack.len() {
-                    state.exec.stack[idx].clone()
+                if idx < state.stack.len() {
+                    state.stack[idx].clone()
                 } else {
                     TValue::Nil(NilKind::Strict)
                 }
@@ -3758,10 +3750,10 @@ fn call_str_format<'a>(
             }
             Err(msg) => Err(VmError::RuntimeError(msg)),
         }
-    } else if args_end <= state.exec.stack.len() {
+    } else if args_end <= state.stack.len() {
         // 快速路径: 直接借用 stack 切片, 避免 TValue clone (perf: 省约 4% TValue::clone)
         // str_format 不修改 state (不触发 GC), 借用安全; 借用在 str_format 返回后释放。
-        let result = str_format(&fmt, &state.exec.stack[args_start..args_end]);
+        let result = str_format(&fmt, &state.stack[args_start..args_end]);
         match result {
             Ok(result) => {
                 push_results(state, a, nresults, vec![state.intern_str_owned(result)]);
@@ -3774,8 +3766,8 @@ fn call_str_format<'a>(
         let args: Vec<TValue> = (1..nargs)
             .map(|i| {
                 let idx = a + 1 + i;
-                if idx < state.exec.stack.len() {
-                    state.exec.stack[idx].clone()
+                if idx < state.stack.len() {
+                    state.stack[idx].clone()
                 } else {
                     TValue::Nil(NilKind::Strict)
                 }
@@ -3827,15 +3819,14 @@ fn call_str_gsub<'a>(
     // 原始字符串的 TValue — 对应 C 的 lua_pushvalue(L, 1)
     // 当没有替换发生时，返回原始字符串（保持指针一致性，使 %p 相等）
     let orig_str = state
-        .exec
         .stack
         .get(a + 1)
         .cloned()
         .unwrap_or(TValue::Nil(NilKind::Strict));
     // 检查 repl 参数类型 — 对应 C 的 tr = lua_type(L, 3)
     let repl_idx = a + 3;
-    let repl_val = if repl_idx < state.exec.stack.len() {
-        state.exec.stack[repl_idx].clone()
+    let repl_val = if repl_idx < state.stack.len() {
+        state.stack[repl_idx].clone()
     } else {
         TValue::Nil(NilKind::Strict)
     };
@@ -3896,7 +3887,6 @@ fn call_str_gmatch<'a>(
     // 借用栈上的原始 LuaString（s 与 pattern），避免 get_str_arg 的 String 拷贝
     let (s_str, p_str) = {
         let s_val = state
-            .exec
             .stack
             .get(a + 1)
             .cloned()
@@ -3910,7 +3900,6 @@ fn call_str_gmatch<'a>(
             },
         };
         let p_val = state
-            .exec
             .stack
             .get(a + 2)
             .cloned()
@@ -3965,8 +3954,8 @@ fn call_str_pack<'a>(
     let args: Vec<TValue> = (1..nargs)
         .map(|i| {
             let idx = a + 1 + i;
-            if idx < state.exec.stack.len() {
-                state.exec.stack[idx].clone()
+            if idx < state.stack.len() {
+                state.stack[idx].clone()
             } else {
                 TValue::Nil(NilKind::Strict)
             }
@@ -4011,19 +4000,19 @@ fn call_str_unpack<'a>(
     // 获取数据字符串的字节
     let data_bytes = {
         let stack_idx = a + 1 + 1;
-        if stack_idx >= state.exec.stack.len() {
+        if stack_idx >= state.stack.len() {
             return Err(VmError::RuntimeError(format!(
                 "bad argument #2 to 'unpack' (string expected, got no value)"
             )));
         }
-        match &state.exec.stack[stack_idx] {
+        match &state.stack[stack_idx] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 lua_string_as_str(s).as_bytes().to_vec()
             }
             _ => {
                 return Err(VmError::RuntimeError(format!(
                     "bad argument #2 to 'unpack' (string expected, got {})",
-                    state.exec.stack[stack_idx].ty()
+                    state.stack[stack_idx].ty()
                 )))
             }
         }
@@ -4055,16 +4044,16 @@ fn call_str_dump<'a>(
         ));
     }
     let stack_idx = a + 1;
-    if stack_idx >= state.exec.stack.len() {
+    if stack_idx >= state.stack.len() {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'dump' (function expected, got no value)".to_string(),
         ));
     }
-    let func_val = state.exec.stack[stack_idx].clone();
+    let func_val = state.stack[stack_idx].clone();
     let strip = if nargs >= 2 {
         let strip_idx = a + 2;
-        if strip_idx < state.exec.stack.len() {
-            matches!(&state.exec.stack[strip_idx], TValue::Boolean(true))
+        if strip_idx < state.stack.len() {
+            matches!(&state.stack[strip_idx], TValue::Boolean(true))
         } else {
             false
         }
@@ -4170,7 +4159,7 @@ pub fn create_string_metatable(state: &mut LuaState) {
 
     // 创建 Metatable 并注册到 DefaultMetatables
     let mt = Metatable::new(mt_table);
-    state.dmt.set(LuaType::String, mt);
+    state.g_mut().dmt.set(LuaType::String, mt);
 }
 
 /// 设置算术元方法到元表
@@ -5113,14 +5102,14 @@ mod tests {
     #[test]
     fn test_call_str_upper() {
         let mut state = LuaState::default();
-        // 清空栈 (LuaState::new() 会预置一个 Nil)
-        state.exec.stack.clear();
+        // 清空栈 (LuaState::new_main() 会预置一个 Nil)
+        state.stack.clear();
         // 模拟栈: [func, "hello"] (位置 a=0 是函数占位,参数从 a+1 开始)
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(state.intern("hello"));
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(state.intern("hello"));
         call_str_upper(&mut state, 0, 1, 1).unwrap();
-        assert_eq!(state.exec.stack.len(), 1);
-        match &state.exec.stack[0] {
+        assert_eq!(state.stack.len(), 1);
+        match &state.stack[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 assert_eq!(lua_string_as_str(s), "HELLO")
             }
@@ -5131,11 +5120,11 @@ mod tests {
     #[test]
     fn test_call_str_len() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(state.intern_str("hello"));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(state.intern_str("hello"));
         call_str_len(&mut state, 0, 1, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 5),
             _ => panic!("expected integer result"),
         }
@@ -5144,13 +5133,13 @@ mod tests {
     #[test]
     fn test_call_str_sub() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(state.intern_str("hello"));
-        state.exec.stack.push(TValue::Integer(2));
-        state.exec.stack.push(TValue::Integer(4));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(state.intern_str("hello"));
+        state.stack.push(TValue::Integer(2));
+        state.stack.push(TValue::Integer(4));
         call_str_sub(&mut state, 0, 3, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 assert_eq!(lua_string_as_str(s), "ell")
             }
@@ -5161,11 +5150,11 @@ mod tests {
     #[test]
     fn test_call_str_reverse() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(state.intern_str("abc"));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(state.intern_str("abc"));
         call_str_reverse(&mut state, 0, 1, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 assert_eq!(lua_string_as_str(s), "cba")
             }
@@ -5176,18 +5165,18 @@ mod tests {
     #[test]
     fn test_call_str_byte() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(state.intern_str("AB"));
-        state.exec.stack.push(TValue::Integer(1));
-        state.exec.stack.push(TValue::Integer(2));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(state.intern_str("AB"));
+        state.stack.push(TValue::Integer(1));
+        state.stack.push(TValue::Integer(2));
         call_str_byte(&mut state, 0, 3, -1).unwrap();
-        assert_eq!(state.exec.stack.len(), 2);
-        match &state.exec.stack[0] {
+        assert_eq!(state.stack.len(), 2);
+        match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 65),
             _ => panic!("expected integer"),
         }
-        match &state.exec.stack[1] {
+        match &state.stack[1] {
             TValue::Integer(n) => assert_eq!(*n, 66),
             _ => panic!("expected integer"),
         }
@@ -5196,12 +5185,12 @@ mod tests {
     #[test]
     fn test_call_str_char() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(TValue::Integer(65));
-        state.exec.stack.push(TValue::Integer(66));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(TValue::Integer(65));
+        state.stack.push(TValue::Integer(66));
         call_str_char(&mut state, 0, 2, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 assert_eq!(lua_string_as_str(s), "AB")
             }
@@ -5212,12 +5201,12 @@ mod tests {
     #[test]
     fn test_call_str_rep() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(state.intern_str("ab"));
-        state.exec.stack.push(TValue::Integer(3));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(state.intern_str("ab"));
+        state.stack.push(TValue::Integer(3));
         call_str_rep(&mut state, 0, 2, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 assert_eq!(lua_string_as_str(s), "ababab")
             }
@@ -5228,17 +5217,17 @@ mod tests {
     #[test]
     fn test_call_str_find() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(state.intern_str("hello world"));
-        state.exec.stack.push(state.intern_str("world"));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(state.intern_str("hello world"));
+        state.stack.push(state.intern_str("world"));
         call_str_find(&mut state, 0, 2, -1).unwrap();
-        assert!(state.exec.stack.len() >= 2);
-        match &state.exec.stack[0] {
+        assert!(state.stack.len() >= 2);
+        match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 7),
             _ => panic!("expected integer start"),
         }
-        match &state.exec.stack[1] {
+        match &state.stack[1] {
             TValue::Integer(n) => assert_eq!(*n, 11),
             _ => panic!("expected integer end"),
         }
@@ -5247,12 +5236,12 @@ mod tests {
     #[test]
     fn test_call_str_format() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(state.intern_str("hello %s"));
-        state.exec.stack.push(state.intern_str("world"));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(state.intern_str("hello %s"));
+        state.stack.push(state.intern_str("world"));
         call_str_format(&mut state, 0, 2, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 assert_eq!(lua_string_as_str(s), "hello world")
             }

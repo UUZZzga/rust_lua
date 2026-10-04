@@ -17,6 +17,8 @@ use const_format::formatcp;
 use crate::execute::VmError;
 use crate::gc::GCObjectHeader;
 use crate::objects::{LClosure, NilKind, Proto, TValue, UpVal, UpValVec};
+#[cfg(test)]
+use crate::state::GlobalState;
 use crate::state::LuaState;
 use crate::strings::{lua_string_as_str, lua_string_eq, lua_string_len};
 use crate::table::Table;
@@ -276,8 +278,8 @@ pub fn base_assert<'a>(args: &[TValue<'a>]) -> Result<Vec<TValue<'a>>, String> {
 /// 从栈中读取参数 (0-based 索引, 相对于函数位置 a)
 fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
     let stack_idx = a + 1 + idx;
-    if stack_idx < state.exec.stack.len() {
-        state.exec.stack[stack_idx].clone()
+    if stack_idx < state.stack.len() {
+        state.stack[stack_idx].clone()
     } else {
         TValue::Nil(NilKind::Strict)
     }
@@ -314,10 +316,10 @@ fn call_print<'a>(
     }
     // 体积优先: 用 write_all 替代 writeln! 避免 io::Write::write_fmt 引入 StringError
     s.push('\n');
-    let _ = state.io.out(s.as_str());
-    let _ = state.io.out_flush();
+    let _ = state.g_mut().io.out(s.as_str());
+    let _ = state.g_mut().io.out_flush();
     // print 返回 0 个结果
-    state.exec.stack.truncate(a);
+    state.stack.truncate(a);
     Ok(())
 }
 
@@ -342,7 +344,7 @@ fn call_setmetatable<'a>(
 
     // 原地修改栈上的表 (对应 C 的直接操作栈)
     let result = {
-        let arg1_ref = &mut state.exec.stack[a + 1];
+        let arg1_ref = &mut state.stack[a + 1];
         match arg1_ref {
             TValue::Table(t) => {
                 // 检查是否有 __metatable 元方法 (受保护的元表)
@@ -363,7 +365,7 @@ fn call_setmetatable<'a>(
                     }
                     _ => unreachable!(),
                 }
-                state.exec.stack[a + 1].clone()
+                state.stack[a + 1].clone()
             }
             _ => {
                 return Err(VmError::RuntimeError(
@@ -386,10 +388,10 @@ fn call_setmetatable<'a>(
             }
         };
         if has_mode {
-            state.register_weak_table(t);
+            state.g_mut().register_weak_table(t);
         }
         if has_gc {
-            state.register_finobj(t);
+            state.g_mut().register_finobj(t);
         }
     }
 
@@ -466,38 +468,37 @@ pub(crate) fn call_pcall<'a>(
     // 把 f 和 args 移到 a 位置 (覆盖 pcall 函数本身)
     // 栈布局: [pcall_func | f | arg1 | arg2 | ...]
     // 调整为: [f | arg1 | arg2 | ...]
-    if a + 1 < state.exec.stack.len() {
-        state.exec.stack[a] = func;
-        if a + 1 < state.exec.stack.len() {
-            state.exec.stack.remove(a + 1);
+    if a + 1 < state.stack.len() {
+        state.stack[a] = func;
+        if a + 1 < state.stack.len() {
+            state.stack.remove(a + 1);
         }
     }
 
     // 截断栈到 f + 其参数，确保 state.pcall 通过 stack.len() 计算的 func_idx 指向 f
     // (调用方帧可能有额外寄存器残留在参数之上)
     let new_top = a + pcall_nargs + 1;
-    if state.exec.stack.len() > new_top {
-        state.exec.stack.truncate(new_top);
+    if state.stack.len() > new_top {
+        state.stack.truncate(new_top);
     }
 
     // push pcall 保护状态 — 对应 C Lua 的 CIST_YPCALL
     // yield 穿过 pcall 后，pcall 的 C 函数栈帧被销毁，但保护状态保留。
     // 当 inner_func 后续执行 error/return 时，由 execute_loop 检查并处理。
     state
-        .exec
         .pcall_protection_stack
         .push(crate::state::PcallProtection {
-            saved_code: state.exec.code.clone(),
-            saved_constants: state.exec.constants.clone(),
-            saved_protos: state.exec.protos.clone(),
-            saved_base: state.exec.base,
-            saved_pc: state.exec.pc,
-            saved_num_params: state.exec.num_params,
-            saved_is_vararg: state.exec.is_vararg,
-            saved_proto_flag: state.exec.proto_flag,
-            saved_nextraargs: state.exec.nextraargs,
-            saved_closure_upvals: Rc::clone(&state.exec.closure_upvals),
-            saved_tbc_list: state.exec.tbc_list,
+            saved_code: state.code.clone(),
+            saved_constants: state.constants.clone(),
+            saved_protos: state.protos.clone(),
+            saved_base: state.base,
+            saved_pc: state.pc,
+            saved_num_params: state.num_params,
+            saved_is_vararg: state.is_vararg,
+            saved_proto_flag: state.proto_flag,
+            saved_nextraargs: state.nextraargs,
+            saved_closure_upvals: Rc::clone(&state.closure_upvals),
+            saved_tbc_list: state.tbc_list,
             func_idx: a,
             // 保存 pcall 调用者期望的返回值数 (非 state.pcall 的 -1)，
             // 供 finish_pcall_return continuation 调整栈使用。
@@ -506,18 +507,18 @@ pub(crate) fn call_pcall<'a>(
             saved_filled: false,
             is_metamethod: false,
             metamethod_res: 0,
-            saved_call_stack_len: state.exec.call_stack.len(),
+            saved_call_stack_len: state.call_stack.len(),
             is_close_continuation: false,
             is_pairs_continuation: false,
             saved_call_stack: Vec::new(),
         });
-    let pcall_protection_idx = state.exec.pcall_protection_stack.len() - 1;
+    let pcall_protection_idx = state.pcall_protection_stack.len() - 1;
 
     let status = state.pcall(pcall_nargs, -1, 0);
 
     // 非 yield 返回时 pop pcall 保护状态
     if status != crate::state::LUA_YIELD {
-        state.exec.pcall_protection_stack.pop();
+        state.pcall_protection_stack.pop();
     } else {
         // yield: 更新 pcall 的 PcallProtection 为 saved_filled=true
         // 当 inner_func 是 LClosure 时，state.pcall 的 LClosure 分支已经更新了
@@ -525,7 +526,7 @@ pub(crate) fn call_pcall<'a>(
         // 当 inner_func 是 C 函数时，state.pcall 的 LightUserData 分支不更新 PcallProtection，
         // 所以这里需要手动更新。
         // saved_pc + 1: 跳过调用 pcall 的 CALL 指令（与 LClosure 分支的 saved_pc + 1 一致）。
-        let protection = &mut state.exec.pcall_protection_stack[pcall_protection_idx];
+        let protection = &mut state.pcall_protection_stack[pcall_protection_idx];
         if !protection.saved_filled {
             protection.saved_pc += 1;
             protection.saved_filled = true;
@@ -541,7 +542,7 @@ pub(crate) fn call_pcall<'a>(
     }
 
     // pcall 后: 栈截断到 a, 结果在 a..
-    let nret = state.exec.stack.len().saturating_sub(a);
+    let nret = state.stack.len().saturating_sub(a);
 
     // 收集结果
     let mut results: Vec<TValue> = Vec::new();
@@ -549,13 +550,13 @@ pub(crate) fn call_pcall<'a>(
         // 成功: true, 结果...
         results.push(TValue::Boolean(true));
         for i in 0..nret {
-            results.push(state.exec.stack[a + i].clone());
+            results.push(state.stack[a + i].clone());
         }
     } else {
         // 失败: false, 错误消息
         results.push(TValue::Boolean(false));
         if nret > 0 {
-            results.push(state.exec.stack[a].clone());
+            results.push(state.stack[a].clone());
         } else {
             results.push(TValue::Nil(NilKind::Strict));
         }
@@ -619,17 +620,17 @@ fn get_func_line(proto: &Proto, pc: usize) -> i32 {
 
 /// 返回当前 Lua 函数的位置前缀 "source:line: "（对应 C 的 luaL_where 核心）
 ///
-/// 当前 Lua 函数由 state.exec.base/pc 代表。C 函数不改变 state.exec.base,
-/// 所以在 C 函数中调用时, state.exec.base/pc 仍然是调用该 C 函数的 Lua 函数。
+/// 当前 Lua 函数由 state.base/pc 代表。C 函数不改变 state.base,
+/// 所以在 C 函数中调用时, state.base/pc 仍然是调用该 C 函数的 Lua 函数。
 fn get_current_lua_func_position(state: &LuaState) -> String {
-    if state.exec.base == 0 || state.exec.base > state.exec.stack.len() {
+    if state.base == 0 || state.base > state.stack.len() {
         return String::new();
     }
-    let closure = match &state.exec.stack[state.exec.base - 1] {
+    let closure = match &state.stack[state.base - 1] {
         TValue::LClosure(c) => c,
         _ => return String::new(),
     };
-    let line = get_func_line(&closure.proto, state.exec.pc);
+    let line = get_func_line(&closure.proto, state.pc);
     if line <= 0 {
         return String::new();
     }
@@ -646,7 +647,7 @@ fn get_current_lua_func_position(state: &LuaState) -> String {
 ///
 /// level 语义对应 C 的 lua_getstack: level=0 是当前帧, level=1 是调用者帧。
 /// C 版本中 C 函数（error/assert/pcall）创建 CallInfo, level=1 跳过当前 C 函数帧。
-/// Rust 版本中 C 函数推入 call_info 但不改变 state.exec.base, 需要检查 call_info
+/// Rust 版本中 C 函数推入 call_info 但不改变 state.base, 需要检查 call_info
 /// 来正确模拟 C 的 level 语义。
 fn lua_l_where<'a>(state: &LuaState<'a>, level: usize) -> String {
     if level == 0 {
@@ -660,40 +661,40 @@ fn lua_l_where<'a>(state: &LuaState<'a>, level: usize) -> String {
         // 检查 call_info 最后一个元素是否是 C 函数帧
         // 对应 C 的 lua_getstack(L, 1): 跳过当前帧 (L->ci), 返回 L->ci->previous
         // Rust 版本中, call_info 最后一个元素是当前 C 函数帧 (如果在 C 函数中)
-        if let Some(last_frame) = state.exec.call_info.last() {
+        if let Some(last_frame) = state.call_info.last() {
             if last_frame.is_c {
                 // 当前在 C 函数中 (如 error/assert)
                 // 调用该 C 函数的帧可能是:
                 // 1. call_info[len-2] (如果是 C 函数帧) — 如 pcall -> assert
                 //    C 函数帧 currentline=-1, 返回空字符串
-                // 2. state.exec.base/pc 代表的 Lua 函数 — 如直接调用 assert/error
-                let ci_len = state.exec.call_info.len();
+                // 2. state.base/pc 代表的 Lua 函数 — 如直接调用 assert/error
+                let ci_len = state.call_info.len();
                 if ci_len >= 2 {
-                    let prev_frame = &state.exec.call_info[ci_len - 2];
+                    let prev_frame = &state.call_info[ci_len - 2];
                     if prev_frame.is_c {
                         // 调用者也是 C 函数 (如 pcall -> assert), 返回空字符串
                         return String::new();
                     }
                 }
-                // 调用者是 Lua 函数, 返回 state.exec.base/pc 代表的 Lua 函数位置
+                // 调用者是 Lua 函数, 返回 state.base/pc 代表的 Lua 函数位置
                 return get_current_lua_func_position(state);
             }
         }
-        // 当前不在 C 函数中, 返回 state.exec.base/pc 代表的 Lua 函数位置
+        // 当前不在 C 函数中, 返回 state.base/pc 代表的 Lua 函数位置
         get_current_lua_func_position(state)
     } else {
-        let cs_len = state.exec.call_stack.len();
+        let cs_len = state.call_stack.len();
         // level=k 对应 call_stack[cs_len - (k-1)]
         let frame_idx = if cs_len >= level - 1 {
             cs_len - (level - 1)
         } else {
             return String::new();
         };
-        let frame = &state.exec.call_stack[frame_idx];
-        if frame.base == 0 || frame.base > state.exec.stack.len() {
+        let frame = &state.call_stack[frame_idx];
+        if frame.base == 0 || frame.base > state.stack.len() {
             return String::new();
         }
-        let closure = match &state.exec.stack[frame.base - 1] {
+        let closure = match &state.stack[frame.base - 1] {
             TValue::LClosure(c) => c,
             _ => return String::new(),
         };
@@ -826,14 +827,14 @@ fn call_tostring<'a>(
         };
         if let Some(f) = meta_fn {
             // 调用 __tostring(value)
-            let base = state.exec.stack.len();
-            state.exec.stack.push(f);
-            state.exec.stack.push(arg.clone());
+            let base = state.stack.len();
+            state.stack.push(f);
+            state.stack.push(arg.clone());
             let status = state.pcall(1, 1, 0);
             if status != 0 {
                 // pcall 失败: 传播错误
-                let err = if base < state.exec.stack.len() {
-                    match &state.exec.stack[base] {
+                let err = if base < state.stack.len() {
+                    match &state.stack[base] {
                         s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                             lua_string_as_str(s).to_string()
                         }
@@ -842,12 +843,12 @@ fn call_tostring<'a>(
                 } else {
                     String::new()
                 };
-                state.exec.stack.truncate(base);
+                state.stack.truncate(base);
                 return Err(VmError::RuntimeError(err));
             }
             // 检查返回值是否为字符串
-            let result_str = if base < state.exec.stack.len() {
-                match &state.exec.stack[base] {
+            let result_str = if base < state.stack.len() {
+                match &state.stack[base] {
                     s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                         Some(lua_string_as_str(&s).to_string())
                     }
@@ -856,7 +857,7 @@ fn call_tostring<'a>(
             } else {
                 None
             };
-            state.exec.stack.truncate(base);
+            state.stack.truncate(base);
             return match result_str {
                 Some(s) => {
                     push_single_result(state, a, nresults, state.intern_str(&s));
@@ -873,13 +874,13 @@ fn call_tostring<'a>(
         let tostring_key = state.intern_str("__tostring");
         let meta_fn = u.metatable.as_ref().and_then(|mt| mt.get(&tostring_key));
         if let Some(f) = meta_fn {
-            let base = state.exec.stack.len();
-            state.exec.stack.push(f);
-            state.exec.stack.push(arg.clone());
+            let base = state.stack.len();
+            state.stack.push(f);
+            state.stack.push(arg.clone());
             let status = state.pcall(1, 1, 0);
             if status != 0 {
-                let err = if base < state.exec.stack.len() {
-                    match &state.exec.stack[base] {
+                let err = if base < state.stack.len() {
+                    match &state.stack[base] {
                         s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                             lua_string_as_str(s).to_string()
                         }
@@ -888,11 +889,11 @@ fn call_tostring<'a>(
                 } else {
                     String::new()
                 };
-                state.exec.stack.truncate(base);
+                state.stack.truncate(base);
                 return Err(VmError::RuntimeError(err));
             }
-            let result_str = if base < state.exec.stack.len() {
-                match &state.exec.stack[base] {
+            let result_str = if base < state.stack.len() {
+                match &state.stack[base] {
                     s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                         Some(lua_string_as_str(s).to_string())
                     }
@@ -901,7 +902,7 @@ fn call_tostring<'a>(
             } else {
                 None
             };
-            state.exec.stack.truncate(base);
+            state.stack.truncate(base);
             return match result_str {
                 Some(s) => {
                     push_single_result(state, a, nresults, state.intern_str(&s));
@@ -1112,11 +1113,11 @@ fn call_rawset<'a>(
 
     // 原地修改栈上的表 (对应 C 的直接操作栈)
     let result = {
-        let arg1_ref = &mut state.exec.stack[a + 1];
+        let arg1_ref = &mut state.stack[a + 1];
         match arg1_ref {
             TValue::Table(t) => {
                 t.set(k, v);
-                state.exec.stack[a + 1].clone()
+                state.stack[a + 1].clone()
             }
             _ => {
                 return Err(VmError::RuntimeError(
@@ -1214,35 +1215,34 @@ fn call_pairs<'a>(
     if let Some(pairs_fn) = meta_pairs {
         // 有 __pairs: 调用 __pairs(t), 期望 4 个返回值
         // 栈布局: [pairs(LightUserData) | t] → [pairs_fn | t]
-        state.exec.stack[a] = pairs_fn;
+        state.stack[a] = pairs_fn;
         // 确保栈上有参数 t (a+1)
-        while state.exec.stack.len() <= a + 1 {
-            state.exec.stack.push(TValue::Nil(NilKind::Strict));
+        while state.stack.len() <= a + 1 {
+            state.stack.push(TValue::Nil(NilKind::Strict));
         }
-        state.exec.stack[a + 1] = t.clone();
+        state.stack[a + 1] = t.clone();
         // 截断栈到 a+2 (移除多余参数)
-        state.exec.stack.truncate(a + 2);
-        state.exec.top = state.exec.stack.len();
+        state.stack.truncate(a + 2);
+        state.top = state.stack.len();
 
         // push pairs continuation 保护状态 — 对应 C 的 lua_callk + pairscont
         // __pairs 内部 yield 时，call_pairs 返回 Yield，保护状态保留。
         // resume 时 __pairs 返回，op_return 检查 pcall_protection_stack，
         // 调用 finish_pcall_return 执行 continuation（不 push true 前缀）。
         state
-            .exec
             .pcall_protection_stack
             .push(crate::state::PcallProtection {
-                saved_code: state.exec.code.clone(),
-                saved_constants: state.exec.constants.clone(),
-                saved_protos: state.exec.protos.clone(),
-                saved_base: state.exec.base,
-                saved_pc: state.exec.pc + 1, // 跳过调用 pairs 的 CALL 指令
-                saved_num_params: state.exec.num_params,
-                saved_is_vararg: state.exec.is_vararg,
-                saved_proto_flag: state.exec.proto_flag,
-                saved_nextraargs: state.exec.nextraargs,
-                saved_closure_upvals: Rc::clone(&state.exec.closure_upvals),
-                saved_tbc_list: state.exec.tbc_list,
+                saved_code: state.code.clone(),
+                saved_constants: state.constants.clone(),
+                saved_protos: state.protos.clone(),
+                saved_base: state.base,
+                saved_pc: state.pc + 1, // 跳过调用 pairs 的 CALL 指令
+                saved_num_params: state.num_params,
+                saved_is_vararg: state.is_vararg,
+                saved_proto_flag: state.proto_flag,
+                saved_nextraargs: state.nextraargs,
+                saved_closure_upvals: Rc::clone(&state.closure_upvals),
+                saved_tbc_list: state.tbc_list,
                 func_idx: a,
                 nresults,
                 pcall_kind: crate::state::PcallKind::Pcall,
@@ -1265,13 +1265,12 @@ fn call_pairs<'a>(
         }
 
         // 非 yield: pop 保护状态，取 4 个返回值
-        state.exec.pcall_protection_stack.pop();
+        state.pcall_protection_stack.pop();
 
         // 取 __pairs 的 4 个返回值 (state.pcall 已调整栈到 a..a+4)
         let results: Vec<TValue> = (0..4)
             .map(|i| {
                 state
-                    .exec
                     .stack
                     .get(a + i)
                     .cloned()
@@ -1315,38 +1314,37 @@ pub(crate) fn call_xpcall<'a>(
     // 把 f 和 args 移到 a 位置
     // 栈布局: [xpcall_func | f | err_fn | arg1 | arg2 | ...]
     // 调整为: [f | arg1 | arg2 | ...]
-    if a + 2 < state.exec.stack.len() {
-        state.exec.stack[a] = func;
+    if a + 2 < state.stack.len() {
+        state.stack[a] = func;
         // 移除 f (a+1) 和 err_fn (a+2)
-        state.exec.stack.remove(a + 1);
-        state.exec.stack.remove(a + 1);
+        state.stack.remove(a + 1);
+        state.stack.remove(a + 1);
     }
 
     // 截断栈到 f + 其参数，确保 state.pcall 通过 stack.len() 计算的 func_idx 指向 f
     // (调用方帧可能有额外寄存器残留在参数之上)
     let new_top = a + xpcall_nargs + 1;
-    if state.exec.stack.len() > new_top {
-        state.exec.stack.truncate(new_top);
+    if state.stack.len() > new_top {
+        state.stack.truncate(new_top);
     }
 
     // push pcall 保护状态 — 对应 C Lua 的 CIST_YPCALL
     // yield 穿过 xpcall 后，xpcall 的 C 函数栈帧被销毁，但保护状态保留。
     // 当 inner_func 后续执行 error/return 时，由 execute_loop 检查并处理。
     state
-        .exec
         .pcall_protection_stack
         .push(crate::state::PcallProtection {
-            saved_code: state.exec.code.clone(),
-            saved_constants: state.exec.constants.clone(),
-            saved_protos: state.exec.protos.clone(),
-            saved_base: state.exec.base,
-            saved_pc: state.exec.pc,
-            saved_num_params: state.exec.num_params,
-            saved_is_vararg: state.exec.is_vararg,
-            saved_proto_flag: state.exec.proto_flag,
-            saved_nextraargs: state.exec.nextraargs,
-            saved_closure_upvals: Rc::clone(&state.exec.closure_upvals),
-            saved_tbc_list: state.exec.tbc_list,
+            saved_code: state.code.clone(),
+            saved_constants: state.constants.clone(),
+            saved_protos: state.protos.clone(),
+            saved_base: state.base,
+            saved_pc: state.pc,
+            saved_num_params: state.num_params,
+            saved_is_vararg: state.is_vararg,
+            saved_proto_flag: state.proto_flag,
+            saved_nextraargs: state.nextraargs,
+            saved_closure_upvals: Rc::clone(&state.closure_upvals),
+            saved_tbc_list: state.tbc_list,
             func_idx: a,
             // 保存 xpcall 调用者期望的返回值数 (非 state.pcall 的 -1)，
             // 供 finish_pcall_return continuation 调整栈使用。
@@ -1357,24 +1355,24 @@ pub(crate) fn call_xpcall<'a>(
             saved_filled: false,
             is_metamethod: false,
             metamethod_res: 0,
-            saved_call_stack_len: state.exec.call_stack.len(),
+            saved_call_stack_len: state.call_stack.len(),
             is_close_continuation: false,
             is_pairs_continuation: false,
             saved_call_stack: Vec::new(),
         });
-    let xpcall_protection_idx = state.exec.pcall_protection_stack.len() - 1;
+    let xpcall_protection_idx = state.pcall_protection_stack.len() - 1;
 
     let status = state.pcall(xpcall_nargs, -1, 0);
 
     // 非 yield 返回时 pop pcall 保护状态
     if status != crate::state::LUA_YIELD {
-        state.exec.pcall_protection_stack.pop();
+        state.pcall_protection_stack.pop();
     } else {
         // yield: 更新 xpcall 的 PcallProtection 为 saved_filled=true
         // state.pcall 的 LightUserData 分支（C 函数路径）不更新 PcallProtection，
         // 所以这里需要手动更新。
         // saved_pc + 1: 跳过调用 xpcall 的 CALL 指令（与 LClosure 分支的 saved_pc + 1 一致）。
-        let protection = &mut state.exec.pcall_protection_stack[xpcall_protection_idx];
+        let protection = &mut state.pcall_protection_stack[xpcall_protection_idx];
         if !protection.saved_filled {
             protection.saved_pc += 1;
             protection.saved_filled = true;
@@ -1388,18 +1386,18 @@ pub(crate) fn call_xpcall<'a>(
         return Err(VmError::Yield(yield_values));
     }
 
-    let nret = state.exec.stack.len().saturating_sub(a);
+    let nret = state.stack.len().saturating_sub(a);
     let mut results: Vec<TValue> = Vec::new();
     if status == 0 {
         // 成功: true, 结果...
         results.push(TValue::Boolean(true));
         for i in 0..nret {
-            results.push(state.exec.stack[a + i].clone());
+            results.push(state.stack[a + i].clone());
         }
     } else {
         // 失败: 调用错误处理函数
         let err_msg = if nret > 0 {
-            state.exec.stack[a].clone()
+            state.stack[a].clone()
         } else {
             TValue::Nil(NilKind::Strict)
         };
@@ -1411,8 +1409,8 @@ pub(crate) fn call_xpcall<'a>(
         // 这样 debug.traceback 能看到 __close 帧。
         let saved_call_info = std::mem::take(&mut state.last_error_call_info);
         let original_call_info = if let Some(ref err_ci) = saved_call_info {
-            let orig = std::mem::take(&mut state.exec.call_info);
-            state.exec.call_info = err_ci.clone();
+            let orig = std::mem::take(&mut state.call_info);
+            state.call_info = err_ci.clone();
             Some(orig)
         } else {
             None
@@ -1430,7 +1428,7 @@ pub(crate) fn call_xpcall<'a>(
         // 模拟 C 的 nCcalls = 200 时触发 "C stack overflow"。
         // 当 recursion_count >= LUAI_MAXCCALLS * 11 / 10 时，返回 "error in error handling"，
         // 模拟 C 的 nCcalls >= 220 时触发 "error in error handling"。
-        let saved_handler_n_ccalls = state.exec.n_ccalls;
+        let saved_handler_n_ccalls = state.n_ccalls;
         let mut current_err = err_msg;
         let mut handler_status = crate::state::ERR_RUN;
         let mut recursion_count: u32 = 0;
@@ -1448,16 +1446,16 @@ pub(crate) fn call_xpcall<'a>(
             }
 
             // 设置栈: [err_fn | current_err]
-            state.exec.stack.truncate(a);
-            state.exec.stack.push(err_fn.clone());
-            state.exec.stack.push(current_err.clone());
+            state.stack.truncate(a);
+            state.stack.push(err_fn.clone());
+            state.stack.push(current_err.clone());
 
             // 设置 n_ccalls = LUAI_MAXCCALLS，避免 state.pcall 触发栈溢出
             // 对应 C 中 errfunc 在 luaG_errormsg 中被调用，nCcalls 在 201-219 之间不触发错误
-            state.exec.n_ccalls = crate::state::LUAI_MAXCCALLS;
+            state.n_ccalls = crate::state::LUAI_MAXCCALLS;
 
             handler_status = state.pcall(1, -1, 0);
-            handler_nret = state.exec.stack.len().saturating_sub(a);
+            handler_nret = state.stack.len().saturating_sub(a);
 
             if handler_status == 0 {
                 // handler 成功返回
@@ -1465,8 +1463,8 @@ pub(crate) fn call_xpcall<'a>(
             }
 
             // handler 失败 — 获取错误值
-            current_err = if state.exec.stack.len() > a {
-                state.exec.stack[a].clone()
+            current_err = if state.stack.len() > a {
+                state.stack[a].clone()
             } else {
                 TValue::Nil(NilKind::Strict)
             };
@@ -1475,11 +1473,11 @@ pub(crate) fn call_xpcall<'a>(
             recursion_count = recursion_count.saturating_add(1);
         }
 
-        state.exec.n_ccalls = saved_handler_n_ccalls;
+        state.n_ccalls = saved_handler_n_ccalls;
 
         // 恢复 call_info 到清理后的状态
         if let Some(orig) = original_call_info {
-            state.exec.call_info = orig;
+            state.call_info = orig;
         }
         state.last_error_call_info = None;
 
@@ -1487,7 +1485,7 @@ pub(crate) fn call_xpcall<'a>(
         if handler_status == 0 {
             // 错误处理函数成功: 返回其结果
             for i in 0..handler_nret {
-                results.push(state.exec.stack[a + i].clone());
+                results.push(state.stack[a + i].clone());
             }
         } else {
             // 错误处理函数本身出错 — 对应 C 的 luaD_errerr:
@@ -1519,7 +1517,7 @@ fn call_warn<'a>(
         match &arg {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 let tocont = i + 1 < nargs;
-                state.warning(lua_string_as_str(s), tocont);
+                state.g_mut().warning(lua_string_as_str(s), tocont);
             }
             _ => {
                 return Err(VmError::RuntimeError(format!(
@@ -1529,7 +1527,7 @@ fn call_warn<'a>(
             }
         }
     }
-    state.exec.stack.truncate(a);
+    state.stack.truncate(a);
     Ok(())
 }
 
@@ -1697,10 +1695,10 @@ fn run_loader<'a>(
     loader: TValue<'a>,
     loader_data: &str,
 ) -> Result<(), VmError<'a>> {
-    let saved_len = state.exec.stack.len();
-    state.exec.stack.push(loader);
-    state.exec.stack.push(state.intern_str(modname));
-    state.exec.stack.push(state.intern_str(loader_data));
+    let saved_len = state.stack.len();
+    state.stack.push(loader);
+    state.stack.push(state.intern_str(modname));
+    state.stack.push(state.intern_str(loader_data));
     let status = state.pcall(2, 1, 0);
     if status != 0 {
         let err = state.to_string(-1).unwrap_or_default();
@@ -1708,7 +1706,6 @@ fn run_loader<'a>(
         return Err(VmError::RuntimeError(err));
     }
     let result = state
-        .exec
         .stack
         .get(saved_len)
         .cloned()
@@ -1737,7 +1734,7 @@ fn load_lua_module<'a>(
     modname: &str,
     filepath: &str,
 ) -> Result<(), VmError<'a>> {
-    let saved_len = state.exec.stack.len();
+    let saved_len = state.stack.len();
     let load_status = state.load_file(Some(filepath));
     if load_status != 0 {
         let err = state.to_string(-1).unwrap_or_default();
@@ -1748,8 +1745,8 @@ fn load_lua_module<'a>(
         )));
     }
     // 调用加载的函数：(modname, filepath)
-    state.exec.stack.push(state.intern_str(modname));
-    state.exec.stack.push(state.intern_str(filepath));
+    state.stack.push(state.intern_str(modname));
+    state.stack.push(state.intern_str(filepath));
     let call_status = state.pcall(2, 1, 0);
     if call_status != 0 {
         let err = state.to_string(-1).unwrap_or_default();
@@ -1760,7 +1757,6 @@ fn load_lua_module<'a>(
         )));
     }
     let result = state
-        .exec
         .stack
         .get(saved_len)
         .cloned()
@@ -2172,30 +2168,22 @@ fn call_loadlib<'a>(
         }
         Err(LoadlibError::LibNotFound(msg)) => {
             // 返回 (nil, errmsg, "open")
-            push_results(
-                state,
-                a,
-                nresults,
-                vec![
-                    TValue::Nil(NilKind::Strict),
-                    (state.intern_str(&msg)),
-                    (state.intern_str("open")),
-                ],
-            );
+            let __results = vec![
+                TValue::Nil(NilKind::Strict),
+                (state.intern_str(&msg)),
+                (state.intern_str("open")),
+            ];
+            push_results(state, a, nresults, __results);
             Ok(())
         }
         Err(LoadlibError::FuncNotFound) => {
             let msg = unsafe { sys_dlerror() };
-            push_results(
-                state,
-                a,
-                nresults,
-                vec![
-                    TValue::Nil(NilKind::Strict),
-                    (state.intern_str(&msg)),
-                    (state.intern_str("init")),
-                ],
-            );
+            let __results = vec![
+                TValue::Nil(NilKind::Strict),
+                (state.intern_str(&msg)),
+                (state.intern_str("init")),
+            ];
+            push_results(state, a, nresults, __results);
             Ok(())
         }
     }
@@ -2265,12 +2253,8 @@ fn call_searchpath<'a>(
         err_paths.push(filepath);
     }
     let errmsg = format!("no file '{}'", err_paths.join("'\n\tno file '"));
-    push_results(
-        state,
-        a,
-        nresults,
-        vec![TValue::Nil(NilKind::Strict), (state.intern_str(&errmsg))],
-    );
+    let __results = vec![TValue::Nil(NilKind::Strict), (state.intern_str(&errmsg))];
+    push_results(state, a, nresults, __results);
     Ok(())
 }
 
@@ -2567,12 +2551,12 @@ fn call_load<'a>(
             loop {
                 // 推入 reader function 到栈顶
                 // 对应 C 的 lua_pushvalue(L, 1); lua_call(L, 0, 1);
-                let saved_len = state.exec.stack.len();
-                state.exec.stack.push(chunk_val.clone());
+                let saved_len = state.stack.len();
+                state.stack.push(chunk_val.clone());
                 let status = state.pcall(0, 1, 0);
                 if status != 0 {
-                    let err_msg = if saved_len < state.exec.stack.len() {
-                        match &state.exec.stack[saved_len] {
+                    let err_msg = if saved_len < state.stack.len() {
+                        match &state.stack[saved_len] {
                             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                                 lua_string_as_str(s).to_string()
                             }
@@ -2581,21 +2565,18 @@ fn call_load<'a>(
                     } else {
                         "reader function must return a string".to_string()
                     };
-                    state.exec.stack.truncate(saved_len);
-                    push_results(
-                        state,
-                        a,
-                        nresults,
-                        vec![TValue::Nil(NilKind::Strict), (state.intern_str(&err_msg))],
-                    );
+                    state.stack.truncate(saved_len);
+                    let __results =
+                        vec![TValue::Nil(NilKind::Strict), (state.intern_str(&err_msg))];
+                    push_results(state, a, nresults, __results);
                     return Ok(());
                 }
-                let result = if saved_len < state.exec.stack.len() {
-                    state.exec.stack[saved_len].clone()
+                let result = if saved_len < state.stack.len() {
+                    state.stack[saved_len].clone()
                 } else {
                     TValue::Nil(NilKind::Strict)
                 };
-                state.exec.stack.truncate(saved_len);
+                state.stack.truncate(saved_len);
                 match &result {
                     TValue::Nil(_) => break,
                     s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
@@ -2605,15 +2586,11 @@ fn call_load<'a>(
                         buffer.push_str(lua_string_as_str(s));
                     }
                     _ => {
-                        push_results(
-                            state,
-                            a,
-                            nresults,
-                            vec![
-                                TValue::Nil(NilKind::Strict),
-                                state.intern_str("reader function must return a string"),
-                            ],
-                        );
+                        let __results = vec![
+                            TValue::Nil(NilKind::Strict),
+                            state.intern_str("reader function must return a string"),
+                        ];
+                        push_results(state, a, nresults, __results);
                         return Ok(());
                     }
                 }
@@ -2645,28 +2622,20 @@ fn call_load<'a>(
     };
     if is_binary && !allows_binary {
         // 二进制但 mode 不允许 (mode = "t")
-        push_results(
-            state,
-            a,
-            nresults,
-            vec![
-                TValue::Nil(NilKind::Strict),
-                (state.intern_str("attempt to load a binary chunk (mode is 'text')")),
-            ],
-        );
+        let __results = vec![
+            TValue::Nil(NilKind::Strict),
+            (state.intern_str("attempt to load a binary chunk (mode is 'text')")),
+        ];
+        push_results(state, a, nresults, __results);
         return Ok(());
     }
     if !is_binary && !allows_text {
         // 文本但 mode 不允许 (mode = "b")
-        push_results(
-            state,
-            a,
-            nresults,
-            vec![
-                TValue::Nil(NilKind::Strict),
-                (state.intern_str("attempt to load a text chunk (mode is 'binary')")),
-            ],
-        );
+        let __results = vec![
+            TValue::Nil(NilKind::Strict),
+            (state.intern_str("attempt to load a text chunk (mode is 'binary')")),
+        ];
+        push_results(state, a, nresults, __results);
         return Ok(());
     }
 
@@ -2721,12 +2690,8 @@ fn call_load<'a>(
         }
         Err(err_msg) => {
             // 编译失败: 返回 nil + 错误消息 (对应 C 的 load_aux 失败分支)
-            push_results(
-                state,
-                a,
-                nresults,
-                vec![TValue::Nil(NilKind::Strict), (state.intern_str(&err_msg))],
-            );
+            let __results = vec![TValue::Nil(NilKind::Strict), (state.intern_str(&err_msg))];
+            push_results(state, a, nresults, __results);
             Ok(())
         }
     }
@@ -2769,10 +2734,10 @@ fn call_dofile<'a>(
         None
     };
 
-    state.exec.stack.truncate(a);
+    state.stack.truncate(a);
     // 截断后栈顶即为 a；load_file 将 chunk 压在 a，pcall 后结果/错误也在 a。
     // 因此 saved_len 必须在 truncate 之后捕获（== a），否则旧位置无法读到结果。
-    let saved_len = state.exec.stack.len();
+    let saved_len = state.stack.len();
 
     let load_status = state.load_file(filename.as_deref());
     if load_status != 0 {
@@ -2790,7 +2755,6 @@ fn call_dofile<'a>(
     }
     if call_status != 0 {
         let err_val = state
-            .exec
             .stack
             .get(saved_len)
             .cloned()
@@ -2804,9 +2768,9 @@ fn call_dofile<'a>(
         }
     }
 
-    let n_results = state.exec.stack.len().saturating_sub(saved_len);
+    let n_results = state.stack.len().saturating_sub(saved_len);
     let results: Vec<TValue> = if n_results > 0 {
-        state.exec.stack[saved_len..].to_vec()
+        state.stack[saved_len..].to_vec()
     } else {
         Vec::new()
     };
@@ -2893,14 +2857,13 @@ fn call_loadfile<'a>(
     };
 
     // 保存栈位置，调用 load_filex
-    state.exec.stack.truncate(a);
-    let saved_len = state.exec.stack.len();
+    state.stack.truncate(a);
+    let saved_len = state.stack.len();
 
     let status = state.load_filex(filename.as_deref(), mode.as_deref());
     if status == 0 {
         // 成功: 栈顶是加载的 chunk 函数
         let chunk = state
-            .exec
             .stack
             .get(saved_len)
             .cloned()
@@ -2920,7 +2883,6 @@ fn call_loadfile<'a>(
     } else {
         // 失败: 栈顶是错误消息
         let err_msg = state
-            .exec
             .stack
             .get(saved_len)
             .cloned()
@@ -3204,8 +3166,8 @@ fn call_collectgarbage<'a>(
         "collect" => {
             // GC 正在进行中（finalizer 内重入）或状态关闭中（close_state 内）—
             // 不重入，对应 C 的 lua_gc 返回 -1，collectgarbage 不 push 返回值（返回 nil）
-            if unsafe { state.gc.as_mut().is_gc_running() } || state.gc_closing {
-                state.exec.stack.truncate(a);
+            if unsafe { state.gc_mut().is_gc_running() } || state.gc_closing {
+                state.stack.truncate(a);
                 push_results(state, a, nresults, vec![]);
                 return Ok(());
             } else {
@@ -3218,16 +3180,16 @@ fn call_collectgarbage<'a>(
             }
         }
         "stop" => {
-            state.gc_stop();
+            state.g_mut().gc_stop();
             TValue::Integer(0)
         }
         "restart" => {
-            state.gc_restart();
+            state.g_mut().gc_restart();
             TValue::Integer(0)
         }
         "count" => {
             // 返回内存使用量 (KB) — 基于 GC 估算（含无 gc_header 对象的 extra_estimate）
-            TValue::Float(unsafe { state.gc.as_mut().total_estimate() } as f64 / 1024.0)
+            TValue::Float(unsafe { state.gc_mut().total_estimate() } as f64 / 1024.0)
         }
         "countb" => {
             // 返回内存使用量的小数部分 (字节) — 简化为 0
@@ -3246,9 +3208,9 @@ fn call_collectgarbage<'a>(
             let done = state.step_gc(siz);
             TValue::Boolean(done)
         }
-        "isrunning" => TValue::Boolean(unsafe { state.gc.as_mut().is_running() }),
+        "isrunning" => TValue::Boolean(unsafe { state.gc_mut().is_running() }),
         "generational" => {
-            let old = unsafe { state.gc.as_mut().set_mode(crate::gc::GCMode::Generational) };
+            let old = unsafe { state.gc_mut().set_mode(crate::gc::GCMode::Generational) };
             let prev = if old == crate::gc::GCMode::Generational {
                 "generational"
             } else {
@@ -3257,7 +3219,7 @@ fn call_collectgarbage<'a>(
             state.intern_str(prev)
         }
         "incremental" => {
-            let old = unsafe { state.gc.as_mut().set_mode(crate::gc::GCMode::Incremental) };
+            let old = unsafe { state.gc_mut().set_mode(crate::gc::GCMode::Incremental) };
             let prev = if old == crate::gc::GCMode::Generational {
                 "generational"
             } else {
@@ -3301,10 +3263,10 @@ fn call_collectgarbage<'a>(
                         )))
                     }
                 };
-                let old = unsafe { state.gc.as_mut().swap_gc_param(pidx, val) };
+                let old = unsafe { state.gc_mut().swap_gc_param(pidx, val) };
                 TValue::Integer(old as i64)
             } else {
-                let cur = unsafe { state.gc.as_mut().get_gc_param(pidx) };
+                let cur = unsafe { state.gc_mut().get_gc_param(pidx) };
                 TValue::Integer(cur as i64)
             }
         }
@@ -3842,12 +3804,12 @@ mod tests {
     #[test]
     fn test_call_type() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(TValue::Integer(42));
+        state.stack.clear();
+        state.stack.push(placeholder_builtin());
+        state.stack.push(TValue::Integer(42));
         call_type(&mut state, 0, 1, 1).unwrap();
-        assert_eq!(state.exec.stack.len(), 1);
-        match &state.exec.stack[0] {
+        assert_eq!(state.stack.len(), 1);
+        match &state.stack[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 assert_eq!(lua_string_as_str(s), "number")
             }
@@ -3858,11 +3820,11 @@ mod tests {
     #[test]
     fn test_call_tonumber() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(state.intern_str("42"));
+        state.stack.clear();
+        state.stack.push(placeholder_builtin());
+        state.stack.push(state.intern_str("42"));
         call_tonumber(&mut state, 0, 1, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 42),
             _ => panic!("expected integer result"),
         }
@@ -3871,11 +3833,11 @@ mod tests {
     #[test]
     fn test_call_tostring() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(TValue::Integer(42));
+        state.stack.clear();
+        state.stack.push(placeholder_builtin());
+        state.stack.push(TValue::Integer(42));
         call_tostring(&mut state, 0, 1, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 assert_eq!(lua_string_as_str(s), "42")
             }
@@ -3886,12 +3848,12 @@ mod tests {
     #[test]
     fn test_call_rawequal() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(TValue::Integer(42));
-        state.exec.stack.push(TValue::Integer(42));
+        state.stack.clear();
+        state.stack.push(placeholder_builtin());
+        state.stack.push(TValue::Integer(42));
+        state.stack.push(TValue::Integer(42));
         call_rawequal(&mut state, 0, 2, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             TValue::Boolean(b) => assert!(*b),
             _ => panic!("expected boolean result"),
         }
@@ -3900,11 +3862,11 @@ mod tests {
     #[test]
     fn test_call_rawlen() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(state.intern_str("hello"));
+        state.stack.clear();
+        state.stack.push(placeholder_builtin());
+        state.stack.push(state.intern_str("hello"));
         call_rawlen(&mut state, 0, 1, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 5),
             _ => panic!("expected integer result"),
         }
@@ -3913,14 +3875,14 @@ mod tests {
     #[test]
     fn test_call_rawget() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
+        state.stack.clear();
         let t = Table::new();
         t.set(TValue::Integer(1), TValue::Integer(100));
-        state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(TValue::Table(t));
-        state.exec.stack.push(TValue::Integer(1));
+        state.stack.push(placeholder_builtin());
+        state.stack.push(TValue::Table(t));
+        state.stack.push(TValue::Integer(1));
         call_rawget(&mut state, 0, 2, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 100),
             _ => panic!("expected integer result"),
         }
@@ -3929,14 +3891,14 @@ mod tests {
     #[test]
     fn test_call_rawset() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
+        state.stack.clear();
         let t = Table::new();
-        state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(TValue::Table(t));
-        state.exec.stack.push(TValue::Integer(1));
-        state.exec.stack.push(TValue::Integer(999));
+        state.stack.push(placeholder_builtin());
+        state.stack.push(TValue::Table(t));
+        state.stack.push(TValue::Integer(1));
+        state.stack.push(TValue::Integer(999));
         call_rawset(&mut state, 0, 3, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             TValue::Table(t) => {
                 let val = t.get(&TValue::Integer(1));
                 assert!(matches!(val, Some(TValue::Integer(999))));
@@ -3948,14 +3910,14 @@ mod tests {
     #[test]
     fn test_call_select_hash() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(state.intern_str("#"));
-        state.exec.stack.push(TValue::Integer(1));
-        state.exec.stack.push(TValue::Integer(2));
-        state.exec.stack.push(TValue::Integer(3));
+        state.stack.clear();
+        state.stack.push(placeholder_builtin());
+        state.stack.push(state.intern_str("#"));
+        state.stack.push(TValue::Integer(1));
+        state.stack.push(TValue::Integer(2));
+        state.stack.push(TValue::Integer(3));
         call_select(&mut state, 0, 4, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 3),
             _ => panic!("expected integer result"),
         }
@@ -3964,19 +3926,19 @@ mod tests {
     #[test]
     fn test_call_select_index() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(TValue::Integer(2));
-        state.exec.stack.push(TValue::Integer(10));
-        state.exec.stack.push(TValue::Integer(20));
-        state.exec.stack.push(TValue::Integer(30));
+        state.stack.clear();
+        state.stack.push(placeholder_builtin());
+        state.stack.push(TValue::Integer(2));
+        state.stack.push(TValue::Integer(10));
+        state.stack.push(TValue::Integer(20));
+        state.stack.push(TValue::Integer(30));
         call_select(&mut state, 0, 4, -1).unwrap();
-        assert_eq!(state.exec.stack.len(), 2);
-        match &state.exec.stack[0] {
+        assert_eq!(state.stack.len(), 2);
+        match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 20),
             _ => panic!("expected integer 20"),
         }
-        match &state.exec.stack[1] {
+        match &state.stack[1] {
             TValue::Integer(n) => assert_eq!(*n, 30),
             _ => panic!("expected integer 30"),
         }
@@ -3985,12 +3947,12 @@ mod tests {
     #[test]
     fn test_call_assert_true() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(TValue::Boolean(true));
+        state.stack.clear();
+        state.stack.push(placeholder_builtin());
+        state.stack.push(TValue::Boolean(true));
         call_assert(&mut state, 0, 1, -1).unwrap();
-        assert_eq!(state.exec.stack.len(), 1);
-        match &state.exec.stack[0] {
+        assert_eq!(state.stack.len(), 1);
+        match &state.stack[0] {
             TValue::Boolean(b) => assert!(*b),
             _ => panic!("expected boolean true"),
         }
@@ -3999,9 +3961,9 @@ mod tests {
     #[test]
     fn test_call_assert_false() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(TValue::Boolean(false));
+        state.stack.clear();
+        state.stack.push(placeholder_builtin());
+        state.stack.push(TValue::Boolean(false));
         let result = call_assert(&mut state, 0, 1, -1);
         assert!(result.is_err());
     }
@@ -4009,9 +3971,9 @@ mod tests {
     #[test]
     fn test_call_error() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(state.intern_str("test error"));
+        state.stack.clear();
+        state.stack.push(placeholder_builtin());
+        state.stack.push(state.intern_str("test error"));
         let result = call_error(&mut state, 0, 1, 0);
         assert!(result.is_err());
         match result {
@@ -4023,14 +3985,14 @@ mod tests {
     #[test]
     fn test_call_setmetatable() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
+        state.stack.clear();
         let t = Table::new();
         let mt = Table::new();
-        state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(TValue::Table(t));
-        state.exec.stack.push(TValue::Table(mt));
+        state.stack.push(placeholder_builtin());
+        state.stack.push(TValue::Table(t));
+        state.stack.push(TValue::Table(mt));
         call_setmetatable(&mut state, 0, 2, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             TValue::Table(t) => assert!(t.has_metatable()),
             _ => panic!("expected table result"),
         }
@@ -4039,13 +4001,13 @@ mod tests {
     #[test]
     fn test_call_getmetatable() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
+        state.stack.clear();
         let t = Table::new();
         t.set_metatable(Some(Table::new()));
-        state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(TValue::Table(t));
+        state.stack.push(placeholder_builtin());
+        state.stack.push(TValue::Table(t));
         call_getmetatable(&mut state, 0, 1, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             TValue::Table(_) => {}
             _ => panic!("expected table result"),
         }
@@ -4054,12 +4016,12 @@ mod tests {
     #[test]
     fn test_call_getmetatable_no_mt() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
+        state.stack.clear();
         let t = Table::new();
-        state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(TValue::Table(t));
+        state.stack.push(placeholder_builtin());
+        state.stack.push(TValue::Table(t));
         call_getmetatable(&mut state, 0, 1, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             TValue::Nil(_) => {}
             _ => panic!("expected nil result"),
         }
@@ -4070,16 +4032,16 @@ mod tests {
     #[test]
     fn test_call_ipairs() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
+        state.stack.clear();
         let t = Table::new();
         t.set(TValue::Integer(1), TValue::Integer(10));
         t.set(TValue::Integer(2), TValue::Integer(20));
-        state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(TValue::Table(t));
+        state.stack.push(placeholder_builtin());
+        state.stack.push(TValue::Table(t));
         call_ipairs(&mut state, 0, 1, 3).unwrap();
-        assert_eq!(state.exec.stack.len(), 3);
+        assert_eq!(state.stack.len(), 3);
         // 第一个返回值是迭代器函数 (BuiltinFn, func 指向 call_ipairs_aux)
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             TValue::BuiltinFn(bf) => {
                 assert_eq!(
                     bf.raw_func() as usize,
@@ -4089,9 +4051,9 @@ mod tests {
             _ => panic!("expected BuiltinFn"),
         }
         // 第二个返回值是表
-        assert!(matches!(state.exec.stack[1], TValue::Table(_)));
+        assert!(matches!(state.stack[1], TValue::Table(_)));
         // 第三个返回值是 0
-        match &state.exec.stack[2] {
+        match &state.stack[2] {
             TValue::Integer(n) => assert_eq!(*n, 0),
             _ => panic!("expected integer 0"),
         }
@@ -4102,40 +4064,40 @@ mod tests {
     #[test]
     fn test_call_pairs() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
+        state.stack.clear();
         let t = Table::new();
-        state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(TValue::Table(t));
+        state.stack.push(placeholder_builtin());
+        state.stack.push(TValue::Table(t));
         call_pairs(&mut state, 0, 1, 3).unwrap();
-        assert_eq!(state.exec.stack.len(), 3);
+        assert_eq!(state.stack.len(), 3);
         // 第一个返回值是 next 迭代器 (BuiltinFn, func 指向 call_next_iter)
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             TValue::BuiltinFn(bf) => {
                 assert_eq!(bf.raw_func() as usize, call_next_iter as *const () as usize);
             }
             _ => panic!("expected BuiltinFn"),
         }
-        assert!(matches!(state.exec.stack[1], TValue::Table(_)));
-        assert!(matches!(state.exec.stack[2], TValue::Nil(_)));
+        assert!(matches!(state.stack[1], TValue::Table(_)));
+        assert!(matches!(state.stack[2], TValue::Nil(_)));
     }
 
     #[test]
     fn test_call_ipairs_aux() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
+        state.stack.clear();
         let t = Table::new();
         t.set(TValue::Integer(1), TValue::Integer(10));
         t.set(TValue::Integer(2), TValue::Integer(20));
-        state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(TValue::Table(t));
-        state.exec.stack.push(TValue::Integer(0));
+        state.stack.push(placeholder_builtin());
+        state.stack.push(TValue::Table(t));
+        state.stack.push(TValue::Integer(0));
         call_ipairs_aux(&mut state, 0, 2, -1).unwrap();
-        assert_eq!(state.exec.stack.len(), 2);
-        match &state.exec.stack[0] {
+        assert_eq!(state.stack.len(), 2);
+        match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 1),
             _ => panic!("expected integer 1"),
         }
-        match &state.exec.stack[1] {
+        match &state.stack[1] {
             TValue::Integer(n) => assert_eq!(*n, 10),
             _ => panic!("expected integer 10"),
         }
@@ -4144,14 +4106,14 @@ mod tests {
     #[test]
     fn test_call_ipairs_aux_end() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
+        state.stack.clear();
         let t = Table::new();
-        state.exec.stack.push(placeholder_builtin());
-        state.exec.stack.push(TValue::Table(t));
-        state.exec.stack.push(TValue::Integer(0));
+        state.stack.push(placeholder_builtin());
+        state.stack.push(TValue::Table(t));
+        state.stack.push(TValue::Integer(0));
         call_ipairs_aux(&mut state, 0, 2, 1).unwrap();
-        assert_eq!(state.exec.stack.len(), 1);
-        assert!(matches!(state.exec.stack[0], TValue::Nil(_)));
+        assert_eq!(state.stack.len(), 1);
+        assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
 
     // ========================================================================

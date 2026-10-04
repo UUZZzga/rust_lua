@@ -11,6 +11,8 @@
 
 use crate::execute::{arg_error, VmError};
 use crate::objects::{BuiltinFn, NilKind, TValue};
+#[cfg(test)]
+use crate::state::GlobalState;
 use crate::state::LuaState;
 use crate::strings::lua_string_as_str;
 use crate::table::Table;
@@ -30,19 +32,19 @@ use std::rc::Rc;
 /// 从栈中读取参数
 fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.exec.stack.len() {
+    if stack_idx >= state.stack.len() {
         return TValue::Nil(NilKind::Strict);
     }
-    state.exec.stack[stack_idx].clone()
+    state.stack[stack_idx].clone()
 }
 
 /// 从栈中读取可选整数参数
 fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: i64) -> i64 {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.exec.stack.len() {
+    if stack_idx >= state.stack.len() {
         return default;
     }
-    match &state.exec.stack[stack_idx] {
+    match &state.stack[stack_idx] {
         TValue::Nil(_) => default,
         TValue::Integer(n) => *n,
         TValue::Float(f) => *f as i64,
@@ -55,15 +57,14 @@ fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: i64) -> i64 
 /// 调用 obj_len (会触发 __len 元方法)，然后转为整数。
 /// 如果结果不是整数，报 "object length is not an integer"。
 fn get_obj_len<'a>(state: &mut LuaState<'a>, obj: &TValue<'a>) -> Result<i64, VmError<'a>> {
-    let tmp_ra = state.exec.stack.len();
+    let tmp_ra = state.stack.len();
     crate::tm::obj_len(state, tmp_ra, obj, "")?;
     let result = state
-        .exec
         .stack
         .get(tmp_ra)
         .cloned()
         .unwrap_or(TValue::Nil(NilKind::Strict));
-    state.exec.stack.truncate(tmp_ra);
+    state.stack.truncate(tmp_ra);
     match result {
         TValue::Integer(n) => Ok(n),
         TValue::Float(f) => crate::vm::float_to_integer(f, crate::vm::F2IMode::Eq)
@@ -270,7 +271,7 @@ fn call_unpack<'a>(
         ));
     }
     let n = n_minus_1 as usize + 1;
-    if n >= i32::MAX as usize || state.exec.stack.len().saturating_add(n) > crate::state::MAXSTACK {
+    if n >= i32::MAX as usize || state.stack.len().saturating_add(n) > crate::state::MAXSTACK {
         return Err(VmError::RuntimeError(
             "too many results to unpack".to_string(),
         ));
@@ -281,20 +282,19 @@ fn call_unpack<'a>(
     // 沿用 "too many results to unpack" 消息（与 MAXSTACK 检查一致），让 errors.lua:615 的
     // checkerr("too many results", f) 能匹配。
     state
-        .exec
         .stack
         .try_reserve_exact(n)
         .map_err(|_| VmError::RuntimeError("too many results to unpack".to_string()))?;
 
-    // 直接 push 到 state.exec.stack，不创建中间 Vec
+    // 直接 push 到 state.stack，不创建中间 Vec
     // 对应 C 版 tunpack: while (i < e) { lua_geti(L, 1, i); i++; } lua_geti(L, 1, e);
-    let first_result_pos = state.exec.stack.len();
+    let first_result_pos = state.stack.len();
     // perf: 快速路径 — table 无元表时直接持有 Ref<TableData> 访问 array,
     // 跳过每元素的 Table::get_int (含 RefCell::borrow + Option + unwrap_or 临时对象)。
     // perf3 数据: call_unpack 占 3.01%, 快速路径热点 145e78 (62.43% Vec::push 写入) +
     // 145ea7 (3.47% get_int 调用) + 145eb4 (5.78% unwrap_or 初始化)。
     // 一次 borrow 同时检查 metatable 和访问 array, 避免每元素重新 borrow。
-    // 注意: data 借用 t.data, 与 state.exec.stack 独立, 可同时持有。
+    // 注意: data 借用 t.data, 与 state.stack 独立, 可同时持有。
     if i > 0 && e > 0 {
         if let TValue::Table(t) = &list_val {
             let data = t.data.borrow();
@@ -313,7 +313,7 @@ fn call_unpack<'a>(
                             TValue::Nil(NilKind::Empty) => TValue::Nil(NilKind::Strict),
                             other => other.clone(),
                         };
-                        state.exec.stack.push(val);
+                        state.stack.push(val);
                     }
                     drop(data);
                     state.adjust_results_on_stack(a, nresults, n, first_result_pos);
@@ -325,11 +325,11 @@ fn call_unpack<'a>(
                 let mut idx = i;
                 while idx < e {
                     let val = t.get_int(idx).unwrap_or(TValue::Nil(NilKind::Strict));
-                    state.exec.stack.push(val);
+                    state.stack.push(val);
                     idx += 1;
                 }
                 let val = t.get_int(e).unwrap_or(TValue::Nil(NilKind::Strict));
-                state.exec.stack.push(val);
+                state.stack.push(val);
                 state.adjust_results_on_stack(a, nresults, n, first_result_pos);
                 return Ok(());
             }
@@ -339,11 +339,11 @@ fn call_unpack<'a>(
     let mut idx = i;
     while idx < e {
         let val = geti_meta(state, &list_val, idx)?;
-        state.exec.stack.push(val);
+        state.stack.push(val);
         idx += 1;
     }
     let val = geti_meta(state, &list_val, e)?;
-    state.exec.stack.push(val);
+    state.stack.push(val);
 
     state.adjust_results_on_stack(a, nresults, n, first_result_pos);
     Ok(())
@@ -675,7 +675,7 @@ fn call_create<'a>(
 ) -> Result<(), VmError<'a>> {
     // 参数 1: sizeseq (必需)
     let sizeseq = if nargs >= 1 {
-        match &state.exec.stack[a + 1] {
+        match &state.stack[a + 1] {
             TValue::Integer(n) => *n,
             TValue::Float(f) => {
                 if let Some(i) = crate::vm::float_to_integer(*f, crate::vm::F2IMode::Eq) {
@@ -702,7 +702,7 @@ fn call_create<'a>(
 
     // 参数 2: sizerest (可选, 默认 0)
     let sizerest = if nargs >= 2 {
-        match &state.exec.stack[a + 2] {
+        match &state.stack[a + 2] {
             TValue::Integer(n) => *n,
             TValue::Float(f) => {
                 if let Some(i) = crate::vm::float_to_integer(*f, crate::vm::F2IMode::Eq) {
@@ -751,7 +751,7 @@ fn call_create<'a>(
     // 估算: array 部分 sizeseq * sizeof(TValue) + hash 部分预留容量 * 节点大小
     let estimated_size = sizeseq as usize * std::mem::size_of::<TValue>()
         + sizerest as usize * (std::mem::size_of::<TValue>() * 2 + 16);
-    let table_id = unsafe { state.gc.as_mut().register_object(estimated_size) };
+    let table_id = unsafe { state.gc_mut().register_object(estimated_size) };
     table.data.borrow().gc_header.set_id(table_id);
     push_results(state, a, nresults, vec![TValue::Table(table)]);
     Ok(())
@@ -890,13 +890,13 @@ fn get_int_arg<'a>(
     arg_num: usize,
 ) -> Result<i64, VmError<'a>> {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.exec.stack.len() {
+    if stack_idx >= state.stack.len() {
         return Err(VmError::RuntimeError(format!(
             "bad argument #{} to '{}' (integer expected, got no value)",
             arg_num, fname
         )));
     }
-    match &state.exec.stack[stack_idx] {
+    match &state.stack[stack_idx] {
         TValue::Integer(n) => Ok(*n),
         TValue::Float(f) => {
             if let Some(i) = crate::vm::float_to_integer(*f, crate::vm::F2IMode::Eq) {
@@ -928,32 +928,31 @@ fn call_comp_function<'a>(
     a: &TValue<'a>,
     b: &TValue<'a>,
 ) -> Result<bool, VmError<'a>> {
-    let saved_len = state.exec.stack.len();
+    let saved_len = state.stack.len();
     // 推入: comp, a, b
-    state.exec.stack.push(comp.clone());
-    state.exec.stack.push(a.clone());
-    state.exec.stack.push(b.clone());
+    state.stack.push(comp.clone());
+    state.stack.push(a.clone());
+    state.stack.push(b.clone());
 
     // 递增 n_ny_calls,使比较函数调用不可 yield(对应 C Lua 的 lua_call 行为)
-    state.exec.n_ny_calls += 1;
+    state.n_ny_calls += 1;
     let status = state.pcall(2, 1, 0);
-    state.exec.n_ny_calls = state.exec.n_ny_calls.saturating_sub(1);
+    state.n_ny_calls = state.n_ny_calls.saturating_sub(1);
 
     if status != 0 {
         // 获取原始错误值并传播 (对应 C 的 lua_call 直接传播错误)
         let err_val = state
-            .exec
             .stack
             .last()
             .cloned()
             .unwrap_or_else(|| TValue::Nil(NilKind::Strict));
-        state.exec.stack.truncate(saved_len);
+        state.stack.truncate(saved_len);
         return Err(VmError::RuntimeErrorValue(err_val));
     }
 
     // pcall 后: 栈截断到 saved_len, 推入 1 个结果
-    let result = if saved_len < state.exec.stack.len() {
-        match &state.exec.stack[saved_len] {
+    let result = if saved_len < state.stack.len() {
+        match &state.stack[saved_len] {
             TValue::Boolean(v) => *v,
             _ => false,
         }
@@ -962,7 +961,7 @@ fn call_comp_function<'a>(
     };
 
     // 恢复栈到调用前
-    state.exec.stack.truncate(saved_len);
+    state.stack.truncate(saved_len);
     Ok(result)
 }
 
@@ -1024,8 +1023,8 @@ mod tests {
         state.push_value(TValue::Integer(min_i));
         state.push_value(TValue::Integer(min_i + 1));
         call_unpack(&mut state, 0, 3, 2).unwrap();
-        let value1 = state.exec.stack.get(0).unwrap();
-        let value2 = state.exec.stack.get(1).unwrap();
+        let value1 = state.stack.get(0).unwrap();
+        let value2 = state.stack.get(1).unwrap();
         assert!(matches!(value1, TValue::Float(num) if *num == 12.3));
         assert!(matches!(value2, TValue::Float(num) if *num == 23.5));
     }

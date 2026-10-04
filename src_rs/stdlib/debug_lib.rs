@@ -22,6 +22,8 @@
 
 use crate::execute::VmError;
 use crate::objects::{BuiltinFn, LClosure, NilKind, Proto, TValue, UpVal, UpValRef, PF_VAHID};
+#[cfg(test)]
+use crate::state::GlobalState;
 use crate::state::LuaState;
 use crate::strings::lua_string_as_str;
 use crate::table::Table;
@@ -54,8 +56,8 @@ const HOOKKEY: &str = "_HOOKKEY";
 /// 从栈中读取参数 (0-based 索引, 相对于函数位置 a)
 fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
     let stack_idx = a + 1 + idx;
-    if stack_idx < state.exec.stack.len() {
-        state.exec.stack[stack_idx].clone()
+    if stack_idx < state.stack.len() {
+        state.stack[stack_idx].clone()
     } else {
         TValue::Nil(NilKind::Strict)
     }
@@ -206,16 +208,16 @@ fn get_frame_info<'a>(state: &LuaState<'a>, level: i32) -> Option<FrameInfo<'a>>
     }
     if level == 1 {
         // 当前函数
-        if state.exec.base == 0 || state.exec.base > state.exec.stack.len() {
+        if state.base == 0 || state.base > state.stack.len() {
             return None;
         }
-        let limit = state.exec.stack.len();
-        if let TValue::LClosure(closure) = &state.exec.stack[state.exec.base - 1] {
+        let limit = state.stack.len();
+        if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
             return Some(FrameInfo {
-                base: state.exec.base,
-                pc: state.exec.pc,
-                proto_flag: state.exec.proto_flag,
-                nextraargs: state.exec.nextraargs,
+                base: state.base,
+                pc: state.pc,
+                proto_flag: state.proto_flag,
+                nextraargs: state.nextraargs,
                 closure: Some(closure.clone()),
                 limit,
                 is_c: false,
@@ -223,7 +225,7 @@ fn get_frame_info<'a>(state: &LuaState<'a>, level: i32) -> Option<FrameInfo<'a>>
         }
         // C 函数帧
         return Some(FrameInfo {
-            base: state.exec.base,
+            base: state.base,
             pc: 0,
             proto_flag: 0,
             nextraargs: 0,
@@ -235,30 +237,29 @@ fn get_frame_info<'a>(state: &LuaState<'a>, level: i32) -> Option<FrameInfo<'a>>
     // level >= 2: 从 call_info 获取调用者信息
     // 当最后一个 call_info 条目是 C 函数时，它代表当前正在执行的 C 函数（level 0），
     // 需要跳过它来计算 level >= 2 的索引。
-    let c_func_offset = if state.exec.call_info.last().map(|e| e.is_c).unwrap_or(false) {
+    let c_func_offset = if state.call_info.last().map(|e| e.is_c).unwrap_or(false) {
         1
     } else {
         0
     };
     let idx = state
-        .exec
         .call_info
         .len()
         .checked_sub((level as usize).saturating_sub(1) + c_func_offset)?;
-    let entry = &state.exec.call_info[idx];
-    if entry.base == 0 || entry.base > state.exec.stack.len() {
+    let entry = &state.call_info[idx];
+    if entry.base == 0 || entry.base > state.stack.len() {
         return None;
     }
     // 计算 limit: 对应 C 的 ci->next->func.p
     let limit = if level == 2 {
-        // 被调用者是当前函数 (level 1), func.p = state.exec.base - 1
-        state.exec.base.saturating_sub(1)
+        // 被调用者是当前函数 (level 1), func.p = state.base - 1
+        state.base.saturating_sub(1)
     } else {
         // 被调用者是 level-1, 其 call_info 条目在 idx+1
-        let callee_entry = &state.exec.call_info[idx + 1];
+        let callee_entry = &state.call_info[idx + 1];
         callee_entry.base.saturating_sub(1)
     };
-    if let TValue::LClosure(closure) = &state.exec.stack[entry.base - 1] {
+    if let TValue::LClosure(closure) = &state.stack[entry.base - 1] {
         return Some(FrameInfo {
             base: entry.base,
             pc: entry.saved_pc,
@@ -393,8 +394,8 @@ fn call_setmetatable<'a>(
     match (&arg1, &arg2) {
         (TValue::Table(_), TValue::Table(mt)) => {
             // 修改栈上的表
-            if a + 1 < state.exec.stack.len() {
-                if let TValue::Table(ref mut t) = state.exec.stack[a + 1] {
+            if a + 1 < state.stack.len() {
+                if let TValue::Table(ref mut t) = state.stack[a + 1] {
                     t.set_metatable(Some(mt.clone()));
                 }
             }
@@ -410,13 +411,13 @@ fn call_setmetatable<'a>(
                     }
                 };
                 if has_mode {
-                    state.register_weak_table(t);
+                    state.g_mut().register_weak_table(t);
                 }
             }
         }
         (TValue::Table(_), TValue::Nil(_)) => {
-            if a + 1 < state.exec.stack.len() {
-                if let TValue::Table(ref mut t) = state.exec.stack[a + 1] {
+            if a + 1 < state.stack.len() {
+                if let TValue::Table(ref mut t) = state.stack[a + 1] {
                     t.set_metatable(None);
                 }
             }
@@ -424,11 +425,11 @@ fn call_setmetatable<'a>(
         // 基本类型: 设置全局 mt[type] — 对应 C 的 G(L)->mt[ttype(obj)]
         (_, TValue::Table(mt)) => {
             let ty = arg1.ty();
-            state.dmt.set(ty, Metatable::new(mt.clone()));
+            state.g_mut().dmt.set(ty, Metatable::new(mt.clone()));
         }
         (_, TValue::Nil(_)) => {
             let ty = arg1.ty();
-            state.dmt.clear(ty);
+            state.g_mut().dmt.clear(ty);
         }
         _ => unreachable!(),
     }
@@ -497,8 +498,8 @@ fn call_setuservalue<'a>(
                 TValue::Boolean(false)
             } else {
                 // 修改栈上的 userdata
-                if a + 1 < state.exec.stack.len() {
-                    if let TValue::UserData(ref mut u) = &mut state.exec.stack[a + 1] {
+                if a + 1 < state.stack.len() {
+                    if let TValue::UserData(ref mut u) = &mut state.stack[a + 1] {
                         let u = Rc::make_mut(u);
                         while u.user_values.len() < n {
                             u.user_values.push(TValue::Nil(NilKind::Strict));
@@ -642,7 +643,7 @@ fn call_getinfo<'a>(
             }
             let filled = if let Some(thread) = &co_thread {
                 let ctx = thread.context.borrow();
-                fill_info_from_thread(&ctx, &mut info, level, &what)
+                fill_info_from_thread(&ctx.exec, &mut info, level, &what)
             } else {
                 fill_info_from_level(state, &mut info, level, &what)
             };
@@ -661,7 +662,7 @@ fn call_getinfo<'a>(
         }
         let filled = if let Some(thread) = &co_thread {
             let ctx = thread.context.borrow();
-            fill_info_from_thread(&ctx, &mut info, level, &what)
+            fill_info_from_thread(&ctx.exec, &mut info, level, &what)
         } else {
             fill_info_from_level(state, &mut info, level, &what)
         };
@@ -763,8 +764,8 @@ fn call_getinfo<'a>(
             // 函数参数模式: 从栈上获取原始函数值
             // 对应 C 的 lua_pushvalue(L, arg + 1)
             let func_idx = a + 1 + arg_offset;
-            if func_idx < state.exec.stack.len() {
-                let func_val = state.exec.stack[func_idx].clone();
+            if func_idx < state.stack.len() {
+                let func_val = state.stack[func_idx].clone();
                 result_table.set(state.intern_str("func"), func_val);
             } else {
                 result_table.set(state.intern_str("func"), TValue::Nil(NilKind::Strict));
@@ -879,10 +880,10 @@ fn fill_info_from_level<'a>(
 
     if level == 1 {
         // 当前 Lua 帧
-        if state.exec.base == 0 || state.exec.base > state.exec.stack.len() {
+        if state.base == 0 || state.base > state.stack.len() {
             return false;
         }
-        if let TValue::LClosure(closure) = &state.exec.stack[state.exec.base - 1] {
+        if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
             let proto = &closure.proto;
             info.func = Some(TValue::LClosure(closure.clone()));
             info.closure = Some(closure.clone());
@@ -890,20 +891,18 @@ fn fill_info_from_level<'a>(
             // 从 call_info 获取 name 和 namewhat
             // call_info[last] 记录了当前函数是如何被调用的
             // 当最后一个条目是 C 函数时，跳过它（C 函数条目记录的是 C 函数的调用信息）
-            let name_idx = if state.exec.call_info.last().map(|e| e.is_c).unwrap_or(false)
-                && state.exec.call_info.len() >= 2
+            let name_idx = if state.call_info.last().map(|e| e.is_c).unwrap_or(false)
+                && state.call_info.len() >= 2
             {
-                state.exec.call_info.len() - 2
+                state.call_info.len() - 2
             } else {
-                state.exec.call_info.len().saturating_sub(1)
+                state.call_info.len().saturating_sub(1)
             };
             let (name, namewhat) = state
-                .exec
                 .call_info
                 .get(name_idx)
                 .map(|entry| {
-                    let (_, _, n, nw) =
-                        crate::execute::compute_caller_info(&state.exec.stack, entry);
+                    let (_, _, n, nw) = crate::execute::compute_caller_info(&state.stack, entry);
                     (if n.is_empty() { None } else { Some(n) }, nw)
                 })
                 .unwrap_or((None, String::new()));
@@ -929,9 +928,9 @@ fn fill_info_from_level<'a>(
                 .to_string();
             }
             if what.contains('l') {
-                // state.exec.pc 指向当前正在执行的指令（等价于 C 的 currentpc）
-                // op_call 中 C 函数调用期间 state.exec.pc 仍指向 CALL 指令（递增在调用后）
-                info.currentline = get_proto_line(proto, state.exec.pc);
+                // state.pc 指向当前正在执行的指令（等价于 C 的 currentpc）
+                // op_call 中 C 函数调用期间 state.pc 仍指向 CALL 指令（递增在调用后）
+                info.currentline = get_proto_line(proto, state.pc);
             }
             if what.contains('u') {
                 info.nups = closure.upvals.borrow().len();
@@ -946,24 +945,23 @@ fn fill_info_from_level<'a>(
                 // 从 call_info 读取 is_tailcall — 对应 C 的 ci->callstatus & CIST_TAIL
                 // call_info[last] 是 debug.getinfo 自身（C 函数），需要跳过它
                 // 获取调用 debug.getinfo 的函数（level 1）的 CallInfoEntry
-                let tail_idx = if state.exec.call_info.last().map(|e| e.is_c).unwrap_or(false)
-                    && state.exec.call_info.len() >= 2
+                let tail_idx = if state.call_info.last().map(|e| e.is_c).unwrap_or(false)
+                    && state.call_info.len() >= 2
                 {
-                    state.exec.call_info.len() - 2
+                    state.call_info.len() - 2
                 } else {
-                    state.exec.call_info.len().saturating_sub(1)
+                    state.call_info.len().saturating_sub(1)
                 };
                 let istailcall = state
-                    .exec
                     .call_info
                     .get(tail_idx)
                     .map(|e| e.is_tailcall)
                     .unwrap_or(false);
                 info.istailcall = istailcall;
-                info.extraargs = state.exec.nextraargs;
+                info.extraargs = state.nextraargs;
             }
             if what.contains('r') {
-                if !state.exec.allowhook {
+                if !state.allowhook {
                     info.ftransfer = state.transferinfo_ftransfer;
                     info.ntransfer = state.transferinfo_ntransfer;
                 } else {
@@ -1003,19 +1001,18 @@ fn fill_info_from_level<'a>(
     //   → level n = call_info[len - (n - 1)]
     //
     // 要获取 level n 的函数信息:
-    //   closure = state.exec.stack[entry.base - 1]  (调用者的闭包)
+    //   closure = state.stack[entry.base - 1]  (调用者的闭包)
     //   pc      = entry.saved_pc               (调用者的 pc)
     //   name    = call_info[ci_idx - 1].name   (调用者被调用时的名字，若存在)
 
     // 检查最后一个 call_info 条目是否是 C 函数（当前正在执行的 C 函数）
-    let c_func_offset = if state.exec.call_info.last().map(|e| e.is_c).unwrap_or(false) {
+    let c_func_offset = if state.call_info.last().map(|e| e.is_c).unwrap_or(false) {
         1 // 跳过最后一个 C 函数条目
     } else {
         0
     };
 
     let ci_idx = match state
-        .exec
         .call_info
         .len()
         .checked_sub((level as usize).saturating_sub(1) + c_func_offset)
@@ -1024,15 +1021,15 @@ fn fill_info_from_level<'a>(
         None => return false,
     };
 
-    let entry = &state.exec.call_info[ci_idx];
+    let entry = &state.call_info[ci_idx];
 
     // 调用者的名字来自前一个 entry（调用者被调用时推入的记录）
     // 若 ci_idx == 0，调用者是主函数，没有名字
     // name/namewhat 延迟计算: 通过 compute_caller_info 从 prev + saved_pc 实时获取
-    // (caller_proto 由 get_caller_proto_ref 从 state.exec.stack[base-1] 延迟计算)
+    // (caller_proto 由 get_caller_proto_ref 从 state.stack[base-1] 延迟计算)
     let (caller_name, caller_namewhat) = if ci_idx > 0 {
-        let prev = &state.exec.call_info[ci_idx - 1];
-        let (_, _, n, nw) = crate::execute::compute_caller_info(&state.exec.stack, prev);
+        let prev = &state.call_info[ci_idx - 1];
+        let (_, _, n, nw) = crate::execute::compute_caller_info(&state.stack, prev);
         (if n.is_empty() { None } else { Some(n) }, nw)
     } else {
         (None, String::new())
@@ -1046,8 +1043,8 @@ fn fill_info_from_level<'a>(
     // 特殊情况: hook 场景中，hook 函数的 entry.base 指向被 hook 的 C 函数
     // （如 assert），此时栈上是 C 函数（LightUserData），应该走 C 函数路径
     // 返回该 C 函数的信息，而不是 fallback 到 entry.closure（hook 函数自身）。
-    let stack_val = if entry.base > 0 && entry.base <= state.exec.stack.len() {
-        Some(state.exec.stack[entry.base - 1].clone())
+    let stack_val = if entry.base > 0 && entry.base <= state.stack.len() {
+        Some(state.stack[entry.base - 1].clone())
     } else {
         None
     };
@@ -1120,14 +1117,14 @@ fn fill_info_from_level<'a>(
             // (tail call 重用 entry, 修改 closure 和 is_tailcall, 所以 call_info[ci_idx-1]
             //  在 tail call 后记录的是重用后的函数的 istailcall)
             info.istailcall = if ci_idx > 0 {
-                state.exec.call_info[ci_idx - 1].is_tailcall
+                state.call_info[ci_idx - 1].is_tailcall
             } else {
                 false
             };
             info.extraargs = 0;
         }
         if what.contains('r') {
-            if !state.exec.allowhook {
+            if !state.allowhook {
                 info.ftransfer = state.transferinfo_ftransfer;
                 info.ntransfer = state.transferinfo_ntransfer;
             } else {
@@ -1157,7 +1154,7 @@ fn fill_info_from_level<'a>(
     if what.contains('r') {
         // 在 hook 期间（allowhook==false），从 transferinfo 读取
         // 对应 C 的 ci->callstatus & CIST_HOOKED 检查
-        if !state.exec.allowhook {
+        if !state.allowhook {
             info.ftransfer = state.transferinfo_ftransfer;
             info.ntransfer = state.transferinfo_ntransfer;
         } else {
@@ -1167,8 +1164,8 @@ fn fill_info_from_level<'a>(
     }
     // 'f' 选项: 从栈上读取 C 函数值 (entry.base - 1 = 函数位置)
     if what.contains('f') {
-        if entry.base > 0 && entry.base <= state.exec.stack.len() {
-            info.func = Some(state.exec.stack[entry.base - 1].clone());
+        if entry.base > 0 && entry.base <= state.stack.len() {
+            info.func = Some(state.stack[entry.base - 1].clone());
         }
     }
     true
@@ -1182,7 +1179,7 @@ fn fill_info_from_level<'a>(
 /// - Level c_chain_len: 当前 Lua 帧（saved_base/saved_pc）
 /// - Level c_chain_len+1+: 剩余 call_info 条目
 fn fill_info_from_thread<'a>(
-    ctx: &crate::objects::ThreadContext<'a>,
+    ctx: &crate::state::LuaState<'a>,
     info: &mut DebugInfo<'a>,
     level: i32,
     what: &str,
@@ -1191,7 +1188,7 @@ fn fill_info_from_thread<'a>(
         return false;
     }
 
-    let call_info = &ctx.exec.call_info;
+    let call_info = &ctx.call_info;
     let n = call_info.len();
 
     // 计算 C 函数链长度
@@ -1230,10 +1227,10 @@ fn fill_info_from_thread<'a>(
 
     // Level c_chain_len: 当前 Lua 帧
     if level == lua_level {
-        if ctx.exec.base == 0 || ctx.exec.base > ctx.exec.stack.len() {
+        if ctx.base == 0 || ctx.base > ctx.stack.len() {
             return false;
         }
-        if let TValue::LClosure(closure) = &ctx.exec.stack[ctx.exec.base - 1] {
+        if let TValue::LClosure(closure) = &ctx.stack[ctx.base - 1] {
             let proto = &closure.proto;
             info.func = Some(TValue::LClosure(closure.clone()));
             info.closure = Some(closure.clone());
@@ -1241,8 +1238,7 @@ fn fill_info_from_thread<'a>(
             // 名字来自调用当前帧的 call_info 条目
             let (name, namewhat) = if n > c_chain_len {
                 let name_entry = &call_info[n - 1 - c_chain_len];
-                let (_, _, nm, nw) =
-                    crate::execute::compute_caller_info(&ctx.exec.stack, name_entry);
+                let (_, _, nm, nw) = crate::execute::compute_caller_info(&ctx.stack, name_entry);
                 (if nm.is_empty() { None } else { Some(nm) }, nw)
             } else {
                 (None, String::new())
@@ -1269,8 +1265,8 @@ fn fill_info_from_thread<'a>(
                 .to_string();
             }
             if what.contains('l') {
-                // ctx.exec.pc = state.exec.pc + 1 (等价于 C 的 savedpc)，需要 -1 得到 currentpc
-                info.currentline = get_proto_line(proto, ctx.exec.pc.saturating_sub(1));
+                // ctx.pc = state.pc + 1 (等价于 C 的 savedpc)，需要 -1 得到 currentpc
+                info.currentline = get_proto_line(proto, ctx.pc.saturating_sub(1));
             }
             if what.contains('u') {
                 info.nups = closure.upvals.borrow().len();
@@ -1287,7 +1283,7 @@ fn fill_info_from_thread<'a>(
                 } else {
                     false
                 };
-                info.extraargs = ctx.exec.nextraargs;
+                info.extraargs = ctx.nextraargs;
             }
             if what.contains('r') {
                 info.ftransfer = 0;
@@ -1352,7 +1348,7 @@ fn fill_info_from_thread<'a>(
     let closure_ref = entry
         .closure
         .as_ref()
-        .or_else(|| crate::state::get_closure_from_stack(&ctx.exec.stack, entry));
+        .or_else(|| crate::state::get_closure_from_stack(&ctx.stack, entry));
     if let Some(closure) = closure_ref {
         let proto = &closure.proto;
         info.func = Some(TValue::LClosure(closure.clone()));
@@ -1379,7 +1375,7 @@ fn fill_info_from_thread<'a>(
             .to_string();
         }
         if what.contains('l') {
-            let (_, line, _, _) = crate::execute::compute_caller_info(&ctx.exec.stack, next_entry);
+            let (_, line, _, _) = crate::execute::compute_caller_info(&ctx.stack, next_entry);
             info.currentline = line;
         }
         if what.contains('u') {
@@ -1388,8 +1384,7 @@ fn fill_info_from_thread<'a>(
             info.isvararg = proto.is_vararg();
         }
         if what.contains('n') {
-            let (_, _, name, namewhat) =
-                crate::execute::compute_caller_info(&ctx.exec.stack, entry);
+            let (_, _, name, namewhat) = crate::execute::compute_caller_info(&ctx.stack, entry);
             info.name = if name.is_empty() { None } else { Some(name) };
             info.namewhat = namewhat;
         }
@@ -1487,7 +1482,7 @@ fn fill_active_lines(table: &mut Table, proto: &Proto) {
 ///
 /// 返回 Some((name, value)) 或 None（超出范围）
 fn get_local_from_thread<'a>(
-    ctx: &crate::objects::ThreadContext<'a>,
+    ctx: &crate::state::LuaState<'a>,
     level: i32,
     nvar: i32,
 ) -> Option<(String, TValue<'a>)> {
@@ -1495,13 +1490,13 @@ fn get_local_from_thread<'a>(
         return None;
     }
 
-    let call_info = &ctx.exec.call_info;
+    let call_info = &ctx.call_info;
     let n = call_info.len();
     let c_chain_len = call_info.iter().rev().take_while(|e| e.is_c).count();
 
     let read_stack = |idx: usize| -> TValue {
-        if idx < ctx.exec.stack.len() {
-            ctx.exec.stack[idx].clone()
+        if idx < ctx.stack.len() {
+            ctx.stack[idx].clone()
         } else {
             TValue::Nil(NilKind::Strict)
         }
@@ -1519,7 +1514,7 @@ fn get_local_from_thread<'a>(
             call_info[idx + 1].base.saturating_sub(1)
         } else {
             // 最后一帧（level 0），limit = saved_top
-            ctx.exec.top
+            ctx.top
         };
         let cond = nvar > 0 && limit >= entry.base && (limit - entry.base) >= (nvar as usize);
         if cond {
@@ -1533,19 +1528,19 @@ fn get_local_from_thread<'a>(
 
     // Level c_chain_len: 当前 Lua 帧
     if level == lua_level {
-        if ctx.exec.base == 0 || ctx.exec.base > ctx.exec.stack.len() {
+        if ctx.base == 0 || ctx.base > ctx.stack.len() {
             return None;
         }
-        if let TValue::LClosure(closure) = &ctx.exec.stack[ctx.exec.base - 1] {
+        if let TValue::LClosure(closure) = &ctx.stack[ctx.base - 1] {
             let proto = &closure.proto;
-            let pc = ctx.exec.pc.saturating_sub(1);
+            let pc = ctx.pc.saturating_sub(1);
 
             // 负数索引 (vararg)
             if nvar < 0 {
-                if (ctx.exec.proto_flag & PF_VAHID) != 0 {
-                    let nextra = ctx.exec.nextraargs;
+                if (ctx.proto_flag & PF_VAHID) != 0 {
+                    let nextra = ctx.nextraargs;
                     if nvar >= -nextra {
-                        let pos = (ctx.exec.base as i32) - 1 - nextra - (nvar + 1);
+                        let pos = (ctx.base as i32) - 1 - nextra - (nvar + 1);
                         let pos = pos as usize;
                         return Some(("(vararg)".to_string(), read_stack(pos)));
                     }
@@ -1555,16 +1550,15 @@ fn get_local_from_thread<'a>(
 
             // 正数索引: 局部变量
             if let Some(name_str) = get_local_name(proto, nvar as usize, pc) {
-                let stack_idx = ctx.exec.base + (nvar as usize) - 1;
+                let stack_idx = ctx.base + (nvar as usize) - 1;
                 return Some((name_str, read_stack(stack_idx)));
             }
 
             // 临时变量
-            let limit = ctx.exec.top;
-            let cond =
-                nvar > 0 && limit >= ctx.exec.base && (limit - ctx.exec.base) >= (nvar as usize);
+            let limit = ctx.top;
+            let cond = nvar > 0 && limit >= ctx.base && (limit - ctx.base) >= (nvar as usize);
             if cond {
-                let stack_idx = ctx.exec.base + (nvar as usize) - 1;
+                let stack_idx = ctx.base + (nvar as usize) - 1;
                 return Some(("(temporary)".to_string(), read_stack(stack_idx)));
             }
             return None;
@@ -1612,7 +1606,7 @@ fn get_local_from_thread<'a>(
     let closure_ref = entry
         .closure
         .as_ref()
-        .or_else(|| crate::state::get_closure_from_stack(&ctx.exec.stack, entry));
+        .or_else(|| crate::state::get_closure_from_stack(&ctx.stack, entry));
     if let Some(closure) = closure_ref {
         let proto = &closure.proto;
         let pc = call_info[target_idx + 1].saved_pc;
@@ -1651,7 +1645,7 @@ fn get_local_from_thread<'a>(
 ///
 /// 返回变量名（成功）或 None（超出范围）
 fn set_local_from_thread<'a>(
-    ctx: &mut crate::objects::ThreadContext<'a>,
+    ctx: &mut crate::state::LuaState<'a>,
     level: i32,
     nvar: i32,
     value: TValue<'a>,
@@ -1660,7 +1654,7 @@ fn set_local_from_thread<'a>(
         return None;
     }
 
-    let call_info = ctx.exec.call_info.clone();
+    let call_info = ctx.call_info.clone();
     let n = call_info.len();
     let c_chain_len = call_info.iter().rev().take_while(|e| e.is_c).count();
 
@@ -1680,12 +1674,12 @@ fn set_local_from_thread<'a>(
         let limit = if idx + 1 < n {
             call_info[idx + 1].base.saturating_sub(1)
         } else {
-            ctx.exec.top
+            ctx.top
         };
         let cond = nvar > 0 && limit >= entry.base && (limit - entry.base) >= (nvar as usize);
         if cond {
             let stack_idx = entry.base + (nvar as usize) - 1;
-            write_stack(&mut ctx.exec.stack, stack_idx);
+            write_stack(&mut ctx.stack, stack_idx);
             return Some("(C temporary)".to_string());
         }
         return None;
@@ -1695,21 +1689,21 @@ fn set_local_from_thread<'a>(
 
     // Level c_chain_len: 当前 Lua 帧
     if level == lua_level {
-        if ctx.exec.base == 0 || ctx.exec.base > ctx.exec.stack.len() {
+        if ctx.base == 0 || ctx.base > ctx.stack.len() {
             return None;
         }
-        if let TValue::LClosure(closure) = &ctx.exec.stack[ctx.exec.base - 1].clone() {
+        if let TValue::LClosure(closure) = &ctx.stack[ctx.base - 1].clone() {
             let proto = &closure.proto;
-            let pc = ctx.exec.pc.saturating_sub(1);
+            let pc = ctx.pc.saturating_sub(1);
 
             // 负数索引 (vararg)
             if nvar < 0 {
-                if (ctx.exec.proto_flag & PF_VAHID) != 0 {
-                    let nextra = ctx.exec.nextraargs;
+                if (ctx.proto_flag & PF_VAHID) != 0 {
+                    let nextra = ctx.nextraargs;
                     if nvar >= -nextra {
-                        let pos = (ctx.exec.base as i32) - 1 - nextra - (nvar + 1);
+                        let pos = (ctx.base as i32) - 1 - nextra - (nvar + 1);
                         let pos = pos as usize;
-                        write_stack(&mut ctx.exec.stack, pos);
+                        write_stack(&mut ctx.stack, pos);
                         return Some("(vararg)".to_string());
                     }
                 }
@@ -1718,18 +1712,17 @@ fn set_local_from_thread<'a>(
 
             // 正数索引: 局部变量
             if let Some(name_str) = get_local_name(proto, nvar as usize, pc) {
-                let stack_idx = ctx.exec.base + (nvar as usize) - 1;
-                write_stack(&mut ctx.exec.stack, stack_idx);
+                let stack_idx = ctx.base + (nvar as usize) - 1;
+                write_stack(&mut ctx.stack, stack_idx);
                 return Some(name_str);
             }
 
             // 临时变量
-            let limit = ctx.exec.top;
-            let cond =
-                nvar > 0 && limit >= ctx.exec.base && (limit - ctx.exec.base) >= (nvar as usize);
+            let limit = ctx.top;
+            let cond = nvar > 0 && limit >= ctx.base && (limit - ctx.base) >= (nvar as usize);
             if cond {
-                let stack_idx = ctx.exec.base + (nvar as usize) - 1;
-                write_stack(&mut ctx.exec.stack, stack_idx);
+                let stack_idx = ctx.base + (nvar as usize) - 1;
+                write_stack(&mut ctx.stack, stack_idx);
                 return Some("(temporary)".to_string());
             }
             return None;
@@ -1761,7 +1754,7 @@ fn set_local_from_thread<'a>(
         let cond = nvar > 0 && limit >= entry.base && (limit - entry.base) >= (nvar as usize);
         if cond {
             let stack_idx = entry.base + (nvar as usize) - 1;
-            write_stack(&mut ctx.exec.stack, stack_idx);
+            write_stack(&mut ctx.stack, stack_idx);
             return Some("(C temporary)".to_string());
         }
         return None;
@@ -1772,7 +1765,7 @@ fn set_local_from_thread<'a>(
         .closure
         .as_ref()
         .cloned()
-        .or_else(|| crate::state::get_closure_from_stack(&ctx.exec.stack, &entry).cloned());
+        .or_else(|| crate::state::get_closure_from_stack(&ctx.stack, &entry).cloned());
     if let Some(closure) = closure_owned {
         let proto = &closure.proto;
         let pc = call_info[target_idx + 1].saved_pc;
@@ -1784,7 +1777,7 @@ fn set_local_from_thread<'a>(
                 if nvar >= -nextra {
                     let pos = (entry.base as i32) - 1 - nextra - (nvar + 1);
                     let pos = pos as usize;
-                    write_stack(&mut ctx.exec.stack, pos);
+                    write_stack(&mut ctx.stack, pos);
                     return Some("(vararg)".to_string());
                 }
             }
@@ -1794,7 +1787,7 @@ fn set_local_from_thread<'a>(
         // 正数索引: 局部变量
         if let Some(name_str) = get_local_name(proto, nvar as usize, pc) {
             let stack_idx = entry.base + (nvar as usize) - 1;
-            write_stack(&mut ctx.exec.stack, stack_idx);
+            write_stack(&mut ctx.stack, stack_idx);
             return Some(name_str);
         }
 
@@ -1802,7 +1795,7 @@ fn set_local_from_thread<'a>(
         let cond = nvar > 0 && limit >= entry.base && (limit - entry.base) >= (nvar as usize);
         if cond {
             let stack_idx = entry.base + (nvar as usize) - 1;
-            write_stack(&mut ctx.exec.stack, stack_idx);
+            write_stack(&mut ctx.stack, stack_idx);
             return Some("(temporary)".to_string());
         }
     }
@@ -1868,7 +1861,7 @@ fn call_getlocal<'a>(
     // 协程模式: 从 ThreadContext 获取局部变量
     if let Some(thread) = &co_thread {
         let ctx = thread.context.borrow();
-        match get_local_from_thread(&ctx, level, nvar) {
+        match get_local_from_thread(&ctx.exec, level, nvar) {
             Some((name, val)) => {
                 push_results(state, a, nresults, vec![(state.intern_str(&name)), val]);
             }
@@ -1917,8 +1910,8 @@ fn call_getlocal<'a>(
                     && (frame.limit - frame.base) >= (nvar as usize);
                 if cond {
                     let stack_idx = frame.base + (nvar as usize) - 1;
-                    let val = if stack_idx < state.exec.stack.len() {
-                        state.exec.stack[stack_idx].clone()
+                    let val = if stack_idx < state.stack.len() {
+                        state.stack[stack_idx].clone()
                     } else {
                         TValue::Nil(NilKind::Strict)
                     };
@@ -1945,8 +1938,8 @@ fn call_getlocal<'a>(
                         // ci->func.p = frame.base - 1
                         let pos = (frame.base as i32) - 1 - nextra - (nvar + 1);
                         let pos = pos as usize;
-                        let val = if pos < state.exec.stack.len() {
-                            state.exec.stack[pos].clone()
+                        let val = if pos < state.stack.len() {
+                            state.stack[pos].clone()
                         } else {
                             TValue::Nil(NilKind::Strict)
                         };
@@ -1971,8 +1964,8 @@ fn call_getlocal<'a>(
                 Some(n) => {
                     // 获取栈上的值
                     let stack_idx = frame.base + (nvar as usize) - 1;
-                    let val = if stack_idx < state.exec.stack.len() {
-                        state.exec.stack[stack_idx].clone()
+                    let val = if stack_idx < state.stack.len() {
+                        state.stack[stack_idx].clone()
                     } else {
                         TValue::Nil(NilKind::Strict)
                     };
@@ -1986,8 +1979,8 @@ fn call_getlocal<'a>(
                         && (frame.limit - frame.base) >= (nvar as usize);
                     if cond {
                         let stack_idx = frame.base + (nvar as usize) - 1;
-                        let val = if stack_idx < state.exec.stack.len() {
-                            state.exec.stack[stack_idx].clone()
+                        let val = if stack_idx < state.stack.len() {
+                            state.stack[stack_idx].clone()
                         } else {
                             TValue::Nil(NilKind::Strict)
                         };
@@ -2037,7 +2030,7 @@ fn call_setlocal<'a>(
     // 协程模式: 从 ThreadContext 设置局部变量
     if let Some(thread) = &co_thread {
         let mut ctx = thread.context.borrow_mut();
-        match set_local_from_thread(&mut ctx, level, nvar, value) {
+        match set_local_from_thread(&mut ctx.exec, level, nvar, value) {
             Some(name) => {
                 push_single_result(state, a, nresults, state.intern_str(&name));
             }
@@ -2062,8 +2055,8 @@ fn call_setlocal<'a>(
                     && (frame.limit - frame.base) >= (nvar as usize);
                 if cond {
                     let stack_idx = frame.base + (nvar as usize) - 1;
-                    if stack_idx < state.exec.stack.len() {
-                        state.exec.stack[stack_idx] = value;
+                    if stack_idx < state.stack.len() {
+                        state.stack[stack_idx] = value;
                     }
                     push_single_result(state, a, nresults, state.intern_str("(C temporary)"));
                 } else {
@@ -2082,8 +2075,8 @@ fn call_setlocal<'a>(
                         // pos = ci->func.p - nextra - (n + 1)
                         let pos = (frame.base as i32) - 1 - nextra - (nvar + 1);
                         let pos = pos as usize;
-                        if pos < state.exec.stack.len() {
-                            state.exec.stack[pos] = value;
+                        if pos < state.stack.len() {
+                            state.stack[pos] = value;
                         }
                         push_single_result(state, a, nresults, state.intern_str("(vararg)"));
                     } else {
@@ -2100,8 +2093,8 @@ fn call_setlocal<'a>(
                 Some(n) => {
                     // 设置栈上的值
                     let stack_idx = frame.base + (nvar as usize) - 1;
-                    if stack_idx < state.exec.stack.len() {
-                        state.exec.stack[stack_idx] = value;
+                    if stack_idx < state.stack.len() {
+                        state.stack[stack_idx] = value;
                     }
                     push_single_result(state, a, nresults, state.intern_str(&n));
                 }
@@ -2112,8 +2105,8 @@ fn call_setlocal<'a>(
                         && (frame.limit - frame.base) >= (nvar as usize);
                     if cond {
                         let stack_idx = frame.base + (nvar as usize) - 1;
-                        if stack_idx < state.exec.stack.len() {
-                            state.exec.stack[stack_idx] = value;
+                        if stack_idx < state.stack.len() {
+                            state.stack[stack_idx] = value;
                         }
                         push_single_result(state, a, nresults, state.intern_str("(temporary)"));
                     } else {
@@ -2152,8 +2145,8 @@ fn call_getupvalue<'a>(
                 let val = match &*uv_ref {
                     UpVal::Closed { value } => value.clone(),
                     UpVal::Open { stack_index, .. } => {
-                        if *stack_index < state.exec.stack.len() {
-                            state.exec.stack[*stack_index].clone()
+                        if *stack_index < state.stack.len() {
+                            state.stack[*stack_index].clone()
                         } else {
                             TValue::Nil(NilKind::Strict)
                         }
@@ -2262,8 +2255,8 @@ fn call_setupvalue<'a>(
                 // 设置上值
                 // 由于 upvals 是 Rc<RefCell>, 我们需要可变访问
                 // 但 arg1 是 clone 的, 我们需要修改栈上的原始闭包
-                if a + 1 < state.exec.stack.len() {
-                    if let TValue::LClosure(ref mut cl) = state.exec.stack[a + 1] {
+                if a + 1 < state.stack.len() {
+                    if let TValue::LClosure(ref mut cl) = state.stack[a + 1] {
                         if n <= cl.upvals.borrow().len() {
                             // 先取出 stack_index (如果是 Open), 然后释放 borrow, 再修改 stack
                             let action = {
@@ -2278,8 +2271,8 @@ fn call_setupvalue<'a>(
                                 }
                             };
                             if let Some(idx) = action {
-                                if idx < state.exec.stack.len() {
-                                    state.exec.stack[idx] = value.clone();
+                                if idx < state.stack.len() {
+                                    state.stack[idx] = value.clone();
                                 }
                             }
                         }
@@ -2293,8 +2286,8 @@ fn call_setupvalue<'a>(
         }
         TValue::CClosure(_) => {
             // C 闭包
-            if a + 1 < state.exec.stack.len() {
-                if let TValue::CClosure(ref mut cc) = &mut state.exec.stack[a + 1] {
+            if a + 1 < state.stack.len() {
+                if let TValue::CClosure(ref mut cc) = &mut state.stack[a + 1] {
                     let cc = Rc::make_mut(cc);
                     if n > 0 && n <= cc.upvalue.len() {
                         cc.upvalue[n - 1] = value;
@@ -2434,12 +2427,12 @@ fn call_upvaluejoin<'a>(
     let n2 = get_arg(state, a, 3).as_integer().unwrap_or(0) as usize;
 
     // 检查 f1 是 LClosure，且 n1 在有效范围内
-    if f1_stack_idx >= state.exec.stack.len() {
+    if f1_stack_idx >= state.stack.len() {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'upvaluejoin' (Lua function expected)".to_string(),
         ));
     }
-    let f1_upvals_len = match &state.exec.stack[f1_stack_idx] {
+    let f1_upvals_len = match &state.stack[f1_stack_idx] {
         TValue::LClosure(c1) => c1.upvals.borrow().len(),
         _ => {
             return Err(VmError::RuntimeError(
@@ -2483,7 +2476,7 @@ fn call_upvaluejoin<'a>(
 
     // 将 f1 的第 n1 个上值指向 f2 的第 n2 个上值
     // 通过 borrow_mut 修改共享的 Vec，影响所有共享同一 Rc 的闭包
-    if let TValue::LClosure(ref mut c1) = state.exec.stack[f1_stack_idx] {
+    if let TValue::LClosure(ref mut c1) = state.stack[f1_stack_idx] {
         let mut c1_upvals = c1.upvals.borrow_mut();
         c1_upvals[n1 - 1] = f2_upval;
     }
@@ -2540,7 +2533,7 @@ fn call_sethook<'a>(
         if let Some(thread) = target_thread {
             // 设置到指定协程的 ThreadContext（resume 时恢复到 state）
             // 同时把 hook 函数的 Open upvalue 转为 Closed，
-            // 避免协程执行期间 state.exec.stack 被替换后 upvalue 失效
+            // 避免协程执行期间 state.stack 被替换后 upvalue 失效
             crate::stdlib::coroutine_lib::close_hook_upvals(&hook, state);
             let mut ctx = thread.context.borrow_mut();
             ctx.exec.hook_func = Some(hook);
@@ -2684,10 +2677,10 @@ fn set_hook_in_registry<'a>(
     state.registry.set(hookkey, TValue::Table(hook_table));
 
     // 同时设置 state 的 hook 字段，供 VM 执行循环快速访问
-    state.exec.hook_func = hook;
-    state.exec.hook_mask = mask;
-    state.exec.hook_count = count;
-    state.exec.current_hook_count = count;
+    state.hook_func = hook;
+    state.hook_mask = mask;
+    state.hook_count = count;
+    state.current_hook_count = count;
     // 不修改 hook_old_pc — 对应 C 的 sethook 不修改 oldpc
     // oldpc 只在 luaD_hookcall（函数调用）和 rethook（函数返回）中被修改
 }
@@ -2739,7 +2732,7 @@ fn call_traceback<'a>(
     let traceback = if let Some(thread) = &co_thread {
         // 协程: 从 ThreadContext 构建 traceback
         let ctx = thread.context.borrow();
-        build_traceback_from_thread(&ctx, &msg, level)
+        build_traceback_from_thread(&ctx.exec, &msg, level)
     } else {
         build_traceback(state, &msg, level)
     };
@@ -2755,7 +2748,7 @@ fn call_traceback<'a>(
 /// - Level 2 = 调用 level 1 的函数
 ///
 /// 当 call_info 末尾有 C 函数链时（C 函数调用 C 函数），
-/// state.exec.base 不随 C 函数调用改变，所以需要计算 C 函数链长度来正确映射 level。
+/// state.base 不随 C 函数调用改变，所以需要计算 C 函数链长度来正确映射 level。
 pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> String {
     let mut lines: Vec<String> = Vec::new();
 
@@ -2768,10 +2761,10 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
     // 这些 C 函数条目代表当前正在执行的 C 函数及其 C 函数调用者
     // 最后一个条目是当前函数（level 0），倒数第二个是 level 1，等等
     let c_chain_len = count_c_function_chain(state);
-    let n = state.exec.call_info.len();
+    let n = state.call_info.len();
 
     // Level 1 到 c_chain_len-1: C 函数调用者（call_info[last-1] 到 call_info[last-c_chain_len+1]）
-    // Level c_chain_len: state.exec.base（Lua 函数）
+    // Level c_chain_len: state.base（Lua 函数）
     // Level c_chain_len+1+: 剩余 call_info 条目
 
     // 输出 C 函数调用者（level 1 到 c_chain_len-1）
@@ -2783,7 +2776,7 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
             }
             let idx = n - 1 - i;
             if idx < n {
-                let entry = &state.exec.call_info[idx];
+                let entry = &state.call_info[idx];
                 lines.push(make_traceback_line(
                     "[C]",
                     -1,
@@ -2798,18 +2791,17 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
     }
 
     // 输出当前 Lua 帧（level c_chain_len）
-    // 正常场景: state.exec.base/state.exec.pc 指向当前 Lua 函数
-    // error handler 场景: state.exec.base/state.exec.pc 指向 pcall 调用前状态（main chunk），
+    // 正常场景: state.base/state.pc 指向当前 Lua 函数
+    // error handler 场景: state.base/state.pc 指向 pcall 调用前状态（main chunk），
     //   需从 call_info 的最后一个非 C 条目获取错误发生时的帧信息
     let lua_level = c_chain_len as i32;
     if lua_level >= level {
-        let last_lua_idx = (0..n).rev().find(|&i| !state.exec.call_info[i].is_c);
+        let last_lua_idx = (0..n).rev().find(|&i| !state.call_info[i].is_c);
         let is_error_handler = last_lua_idx.is_some() && {
             let idx = last_lua_idx.unwrap();
             let ci_closure = crate::state::get_closure_for_ci(state, idx);
-            let stack_closure = if state.exec.base > 0 && state.exec.base <= state.exec.stack.len()
-            {
-                if let TValue::LClosure(c) = &state.exec.stack[state.exec.base - 1] {
+            let stack_closure = if state.base > 0 && state.base <= state.stack.len() {
+                if let TValue::LClosure(c) = &state.stack[state.base - 1] {
                     Some(c)
                 } else {
                     None
@@ -2826,7 +2818,7 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
         if is_error_handler {
             // error handler 场景: 从 call_info 的最后一个非 C 条目获取帧信息
             let idx = last_lua_idx.unwrap();
-            let entry = &state.exec.call_info[idx];
+            let entry = &state.call_info[idx];
             if let Some(closure) = crate::state::get_closure_for_ci(state, idx) {
                 let proto = &closure.proto;
                 let src = proto
@@ -2836,41 +2828,33 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
                     .unwrap_or_else(|| "?".to_string());
                 let line = get_proto_line(proto, entry.saved_pc);
                 let is_main = proto.line_defined == 0;
-                let (name, namewhat) =
-                    if state.exec.call_info.last().map(|e| e.is_c).unwrap_or(false) && n >= 2 {
-                        let e = &state.exec.call_info[n - 2];
-                        // e 的 caller_proto 回退到前一个条目的 closure (若有)
-                        let prev_fb = if n >= 3 {
-                            state.exec.call_info[n - 3]
-                                .closure
-                                .as_ref()
-                                .map(|c| &c.proto)
-                        } else {
-                            None
-                        };
-                        let (_, _, nm, nw) = crate::execute::compute_caller_info_with_fallback(
-                            &state.exec.stack,
-                            e,
-                            prev_fb,
-                        );
-                        (nm, nw)
+                let (name, namewhat) = if state.call_info.last().map(|e| e.is_c).unwrap_or(false)
+                    && n >= 2
+                {
+                    let e = &state.call_info[n - 2];
+                    // e 的 caller_proto 回退到前一个条目的 closure (若有)
+                    let prev_fb = if n >= 3 {
+                        state.call_info[n - 3].closure.as_ref().map(|c| &c.proto)
                     } else {
-                        // entry 的 caller_proto 回退到前一个条目的 closure (若有)
-                        let prev_fb = if idx > 0 {
-                            state.exec.call_info[idx - 1]
-                                .closure
-                                .as_ref()
-                                .map(|c| &c.proto)
-                        } else {
-                            None
-                        };
-                        let (_, _, nm, nw) = crate::execute::compute_caller_info_with_fallback(
-                            &state.exec.stack,
-                            entry,
-                            prev_fb,
-                        );
-                        (nm, nw)
+                        None
                     };
+                    let (_, _, nm, nw) =
+                        crate::execute::compute_caller_info_with_fallback(&state.stack, e, prev_fb);
+                    (nm, nw)
+                } else {
+                    // entry 的 caller_proto 回退到前一个条目的 closure (若有)
+                    let prev_fb = if idx > 0 {
+                        state.call_info[idx - 1].closure.as_ref().map(|c| &c.proto)
+                    } else {
+                        None
+                    };
+                    let (_, _, nm, nw) = crate::execute::compute_caller_info_with_fallback(
+                        &state.stack,
+                        entry,
+                        prev_fb,
+                    );
+                    (nm, nw)
+                };
                 lines.push(make_traceback_line(
                     &src,
                     line,
@@ -2882,16 +2866,15 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
                 ));
             }
         } else if let Some((src, line, name, namewhat, is_main)) = get_current_frame_info(state) {
-            let (is_c, linedefined) =
-                if state.exec.base > 0 && state.exec.base <= state.exec.stack.len() {
-                    if let TValue::LClosure(closure) = &state.exec.stack[state.exec.base - 1] {
-                        (false, closure.proto.line_defined)
-                    } else {
-                        (true, 0)
-                    }
+            let (is_c, linedefined) = if state.base > 0 && state.base <= state.stack.len() {
+                if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
+                    (false, closure.proto.line_defined)
                 } else {
                     (true, 0)
-                };
+                }
+            } else {
+                (true, 0)
+            };
             lines.push(make_traceback_line(
                 &src,
                 line,
@@ -2914,8 +2897,8 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
             if current_level < level {
                 continue;
             }
-            let entry = &state.exec.call_info[i]; // 函数/名字/closure
-            let next_entry = &state.exec.call_info[i + 1]; // source/line（调用者的位置）
+            let entry = &state.call_info[i]; // 函数/名字/closure
+            let next_entry = &state.call_info[i + 1]; // source/line（调用者的位置）
             if entry.is_c {
                 lines.push(make_traceback_line(
                     "[C]",
@@ -2931,7 +2914,7 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
                 // 栈截断时回退到 entry.closure.proto (调用者的 proto)
                 let fallback_proto = entry.closure.as_ref().map(|c| &c.proto);
                 let (src_full, line, _, _) = crate::execute::compute_caller_info_with_fallback(
-                    &state.exec.stack,
+                    &state.stack,
                     next_entry,
                     fallback_proto,
                 );
@@ -2943,15 +2926,12 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
                 let linedefined = closure_ref.map(|c| c.proto.line_defined).unwrap_or(0);
                 // entry 的 caller_proto 回退到前一个条目的 closure (若有)
                 let prev_fallback = if i > 0 {
-                    state.exec.call_info[i - 1]
-                        .closure
-                        .as_ref()
-                        .map(|c| &c.proto)
+                    state.call_info[i - 1].closure.as_ref().map(|c| &c.proto)
                 } else {
                     None
                 };
                 let (_, _, name, namewhat) = crate::execute::compute_caller_info_with_fallback(
-                    &state.exec.stack,
+                    &state.stack,
                     entry,
                     prev_fallback,
                 );
@@ -2969,7 +2949,7 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
     }
 
     // 仅主线程末尾加 [C]: in ?（协程入口是 Lua 函数，不需要）
-    if state.exec.current_thread.is_none() {
+    if state.current_thread.is_none() {
         lines.push("[C]: in ?".to_string());
     }
 
@@ -3005,7 +2985,7 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
 /// 从 ThreadContext 构建协程的 traceback — 对应 C 的 luaL_traceback(L, L1, msg, level)
 ///
 /// 协程挂起时，调用栈信息保存在 ThreadContext 中：
-/// - saved_call_info: 调用栈信息（与 state.exec.call_info 结构相同）
+/// - saved_call_info: 调用栈信息（与 state.call_info 结构相同）
 /// - saved_stack/saved_base/saved_pc: 当前 Lua 帧的信息
 ///
 /// Level 映射（与 build_traceback 类似）：
@@ -3016,11 +2996,7 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
 /// 与 build_traceback 的区别：
 /// - 不在最后加 "[C]: in ?"（协程入口是 Lua 函数，不是 C 函数）
 /// - 从 saved_call_info/saved_stack 读取信息，而非 state
-fn build_traceback_from_thread(
-    ctx: &crate::objects::ThreadContext,
-    msg: &str,
-    level: i32,
-) -> String {
+fn build_traceback_from_thread(ctx: &crate::state::LuaState, msg: &str, level: i32) -> String {
     let mut result = String::new();
     if !msg.is_empty() {
         result.push_str(msg);
@@ -3028,7 +3004,7 @@ fn build_traceback_from_thread(
     }
     result.push_str("stack traceback:");
 
-    let call_info = &ctx.exec.call_info;
+    let call_info = &ctx.call_info;
     let n = call_info.len();
     if n == 0 {
         return result;
@@ -3061,20 +3037,20 @@ fn build_traceback_from_thread(
     // 输出当前 Lua 帧（level c_chain_len）
     let lua_level = c_chain_len as i32;
     if lua_level >= level {
-        if ctx.exec.base > 0 && ctx.exec.base <= ctx.exec.stack.len() {
-            if let TValue::LClosure(closure) = &ctx.exec.stack[ctx.exec.base - 1] {
+        if ctx.base > 0 && ctx.base <= ctx.stack.len() {
+            if let TValue::LClosure(closure) = &ctx.stack[ctx.base - 1] {
                 let proto = &closure.proto;
                 let src = proto
                     .source
                     .as_ref()
                     .map(short_src)
                     .unwrap_or_else(|| "?".to_string());
-                let line = get_proto_line(proto, ctx.exec.pc.saturating_sub(1));
+                let line = get_proto_line(proto, ctx.pc.saturating_sub(1));
                 // 名字来自调用当前帧的 call_info 条目
                 let (name, namewhat) = if n > c_chain_len {
                     let name_entry = &call_info[n - 1 - c_chain_len];
                     let (_, _, nm, nw) =
-                        crate::execute::compute_caller_info(&ctx.exec.stack, name_entry);
+                        crate::execute::compute_caller_info(&ctx.stack, name_entry);
                     (nm, nw)
                 } else {
                     (String::new(), String::new())
@@ -3119,18 +3095,17 @@ fn build_traceback_from_thread(
                 );
             } else {
                 let (src_full, line, _, _) =
-                    crate::execute::compute_caller_info(&ctx.exec.stack, next_entry);
+                    crate::execute::compute_caller_info(&ctx.stack, next_entry);
                 let src = short_src_from_source(&src_full);
                 let closure_ref = entry
                     .closure
                     .as_ref()
-                    .or_else(|| crate::state::get_closure_from_stack(&ctx.exec.stack, entry));
+                    .or_else(|| crate::state::get_closure_from_stack(&ctx.stack, entry));
                 let is_main = closure_ref
                     .map(|c| c.proto.line_defined == 0)
                     .unwrap_or(false);
                 let linedefined = closure_ref.map(|c| c.proto.line_defined).unwrap_or(0);
-                let (_, _, name, namewhat) =
-                    crate::execute::compute_caller_info(&ctx.exec.stack, entry);
+                let (_, _, name, namewhat) = crate::execute::compute_caller_info(&ctx.stack, entry);
                 push_traceback_line(
                     &mut result,
                     &src,
@@ -3152,8 +3127,8 @@ fn build_traceback_from_thread(
 /// 返回末尾连续 C 函数条目的数量（包括当前正在执行的 C 函数）
 fn count_c_function_chain(state: &LuaState) -> usize {
     let mut count = 0;
-    for i in (0..state.exec.call_info.len()).rev() {
-        if state.exec.call_info[i].is_c {
+    for i in (0..state.call_info.len()).rev() {
+        if state.call_info[i].is_c {
             count += 1;
         } else {
             break;
@@ -3164,33 +3139,32 @@ fn count_c_function_chain(state: &LuaState) -> usize {
 
 /// 获取当前 Lua 帧的信息 (用于 traceback 的 level 1)
 fn get_current_frame_info(state: &LuaState) -> Option<(String, i32, String, String, bool)> {
-    if state.exec.base == 0 || state.exec.base > state.exec.stack.len() {
+    if state.base == 0 || state.base > state.stack.len() {
         return None;
     }
-    if let TValue::LClosure(closure) = &state.exec.stack[state.exec.base - 1] {
+    if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
         let proto = &closure.proto;
         let src = proto
             .source
             .as_ref()
             .map(short_src)
             .unwrap_or_else(|| "?".to_string());
-        // state.exec.pc 指向当前正在执行的指令（等价于 C 的 currentpc）
-        let line = get_proto_line(proto, state.exec.pc);
+        // state.pc 指向当前正在执行的指令（等价于 C 的 currentpc）
+        let line = get_proto_line(proto, state.pc);
         // 当最后一个 call_info 条目是 C 函数时，跳过它获取 name/namewhat
         // 因为 C 函数条目记录的是 C 函数的调用信息，不是当前 Lua 帧的
-        let (name, namewhat) = if state.exec.call_info.last().map(|e| e.is_c).unwrap_or(false)
-            && state.exec.call_info.len() >= 2
+        let (name, namewhat) = if state.call_info.last().map(|e| e.is_c).unwrap_or(false)
+            && state.call_info.len() >= 2
         {
-            let entry = &state.exec.call_info[state.exec.call_info.len() - 2];
-            let (_, _, nm, nw) = crate::execute::compute_caller_info(&state.exec.stack, entry);
+            let entry = &state.call_info[state.call_info.len() - 2];
+            let (_, _, nm, nw) = crate::execute::compute_caller_info(&state.stack, entry);
             (nm, nw)
         } else {
             state
-                .exec
                 .call_info
                 .last()
                 .map(|e| {
-                    let (_, _, nm, nw) = crate::execute::compute_caller_info(&state.exec.stack, e);
+                    let (_, _, nm, nw) = crate::execute::compute_caller_info(&state.stack, e);
                     (nm, nw)
                 })
                 .unwrap_or((String::new(), String::new()))
@@ -3296,11 +3270,11 @@ fn call_debug<'a>(
 ) -> Result<(), VmError<'a>> {
     let _ = nargs;
     loop {
-        let _ = state.io.err("lua_debug> ");
-        let _ = state.io.err_flush();
+        let _ = state.g_mut().io.err("lua_debug> ");
+        let _ = state.g_mut().io.err_flush();
         let buffer: String = {
             let mut buffer = String::new();
-            match state.io.read_line(&mut buffer) {
+            match state.g_mut().io.read_line(&mut buffer) {
                 Ok(0) => break,
                 Ok(_) => {}
                 Err(_) => break,
@@ -3316,15 +3290,15 @@ fn call_debug<'a>(
             let pcall_status = state.pcall(0, 0, 0);
             if pcall_status != 0 {
                 let msg = state.to_string(-1).unwrap_or_default();
-                let _ = state.io.err(&msg);
-                let _ = state.io.err("\n");
+                let _ = state.g_mut().io.err(&msg);
+                let _ = state.g_mut().io.err("\n");
             }
         } else {
             let msg = state.to_string(-1).unwrap_or_default();
-            let _ = state.io.err(&msg);
-            let _ = state.io.err("\n");
+            let _ = state.g_mut().io.err(&msg);
+            let _ = state.g_mut().io.err("\n");
         }
-        let _ = state.io.err_flush();
+        let _ = state.g_mut().io.err_flush();
         state.settop(a);
     }
     push_results(state, a, nresults, vec![]);
@@ -3451,10 +3425,10 @@ mod tests {
     #[test]
     fn test_call_getregistry() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
+        state.stack.clear();
         call_getregistry(&mut state, 0, 0, 1).unwrap();
-        assert_eq!(state.exec.stack.len(), 1);
-        assert!(matches!(state.exec.stack[0], TValue::Table(_)));
+        assert_eq!(state.stack.len(), 1);
+        assert!(matches!(state.stack[0], TValue::Table(_)));
     }
 
     #[test]
@@ -3462,22 +3436,22 @@ mod tests {
         let mut state = LuaState::default();
         let t = Table::new();
         t.set_metatable(Some(Table::new()));
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(TValue::Table(t));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(TValue::Table(t));
         call_getmetatable(&mut state, 0, 1, 1).unwrap();
-        assert!(matches!(state.exec.stack[0], TValue::Table(_)));
+        assert!(matches!(state.stack[0], TValue::Table(_)));
     }
 
     #[test]
     fn test_call_getmetatable_no_metatable() {
         let mut state = LuaState::default();
         let t = Table::new();
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(TValue::Table(t));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(TValue::Table(t));
         call_getmetatable(&mut state, 0, 1, 1).unwrap();
-        assert!(matches!(state.exec.stack[0], TValue::Nil(_)));
+        assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
 
     #[test]
@@ -3485,12 +3459,12 @@ mod tests {
         let mut state = LuaState::default();
         let t = Table::new();
         let mt = Table::new();
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(TValue::Table(t));
-        state.exec.stack.push(TValue::Table(mt));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(TValue::Table(t));
+        state.stack.push(TValue::Table(mt));
         call_setmetatable(&mut state, 0, 2, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             TValue::Table(t) => assert!(t.has_metatable()),
             _ => panic!("expected table result"),
         }
@@ -3499,11 +3473,11 @@ mod tests {
     #[test]
     fn test_call_getuservalue_non_userdata() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(TValue::Integer(42));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(TValue::Integer(42));
         call_getuservalue(&mut state, 0, 1, 1).unwrap();
-        assert!(matches!(state.exec.stack[0], TValue::Nil(_)));
+        assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
 
     #[test]
@@ -3553,17 +3527,17 @@ mod tests {
             proto: Rc::new(proto),
             upvals,
         });
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(TValue::LClosure(closure));
-        state.exec.stack.push(TValue::Integer(1));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(TValue::LClosure(closure));
+        state.stack.push(TValue::Integer(1));
         call_getupvalue(&mut state, 0, 2, 2).unwrap();
-        assert_eq!(state.exec.stack.len(), 2);
-        match &state.exec.stack[0] {
+        assert_eq!(state.stack.len(), 2);
+        match &state.stack[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => assert_eq!(lua_string_as_str(s), "x"),
             _ => panic!("expected string 'x'"),
         }
-        match &state.exec.stack[1] {
+        match &state.stack[1] {
             TValue::Integer(n) => assert_eq!(*n, 42),
             _ => panic!("expected integer 42"),
         }
@@ -3578,20 +3552,20 @@ mod tests {
             proto: Rc::new(crate::func::new_proto()),
             upvals: Rc::new(RefCell::new(UpValVec::new())),
         });
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(TValue::LClosure(closure));
-        state.exec.stack.push(TValue::Integer(1));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(TValue::LClosure(closure));
+        state.stack.push(TValue::Integer(1));
         call_getupvalue(&mut state, 0, 2, 1).unwrap();
-        assert!(matches!(state.exec.stack[0], TValue::Nil(_)));
+        assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
 
     #[test]
     fn test_call_gethook_no_hook() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
+        state.stack.clear();
         call_gethook(&mut state, 0, 0, 1).unwrap();
-        assert!(matches!(state.exec.stack[0], TValue::Nil(_)));
+        assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
 
     #[test]
@@ -3599,25 +3573,25 @@ mod tests {
         let mut state = LuaState::default();
         // 设置钩子
         let hook_fn = TValue::LightUserData(999 as *mut std::ffi::c_void);
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(hook_fn.clone());
-        state.exec.stack.push(state.intern_str("crl"));
-        state.exec.stack.push(TValue::Integer(0));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(hook_fn.clone());
+        state.stack.push(state.intern_str("crl"));
+        state.stack.push(TValue::Integer(0));
         call_sethook(&mut state, 0, 3, 0).unwrap();
 
         // 获取钩子
-        state.exec.stack.clear();
+        state.stack.clear();
         call_gethook(&mut state, 0, 0, 3).unwrap();
-        assert_eq!(state.exec.stack.len(), 3);
-        assert_eq!(state.exec.stack[0], hook_fn);
-        match &state.exec.stack[1] {
+        assert_eq!(state.stack.len(), 3);
+        assert_eq!(state.stack[0], hook_fn);
+        match &state.stack[1] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 assert_eq!(lua_string_as_str(s), "crl")
             }
             _ => panic!("expected mask string 'crl'"),
         }
-        match &state.exec.stack[2] {
+        match &state.stack[2] {
             TValue::Integer(n) => assert_eq!(*n, 0),
             _ => panic!("expected count 0"),
         }
@@ -3628,30 +3602,30 @@ mod tests {
         let mut state = LuaState::default();
         // 先设置钩子
         let hook_fn = TValue::LightUserData(999 as *mut std::ffi::c_void);
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(hook_fn);
-        state.exec.stack.push(state.intern_str("l"));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(hook_fn);
+        state.stack.push(state.intern_str("l"));
         call_sethook(&mut state, 0, 2, 0).unwrap();
 
         // 用 nil 清除
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(TValue::Nil(NilKind::Strict));
         call_sethook(&mut state, 0, 1, 0).unwrap();
 
         // 验证已清除
-        state.exec.stack.clear();
+        state.stack.clear();
         call_gethook(&mut state, 0, 0, 1).unwrap();
-        assert!(matches!(state.exec.stack[0], TValue::Nil(_)));
+        assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
 
     #[test]
     fn test_call_traceback_empty() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
+        state.stack.clear();
         call_traceback(&mut state, 0, 0, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 assert!(lua_string_as_str(s).starts_with("stack traceback:"))
             }
@@ -3662,11 +3636,11 @@ mod tests {
     #[test]
     fn test_call_traceback_with_message() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(state.intern_str("error message"));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(state.intern_str("error message"));
         call_traceback(&mut state, 0, 1, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 let s = lua_string_as_str(s);
                 assert!(s.starts_with("error message\n"));
@@ -3679,11 +3653,11 @@ mod tests {
     #[test]
     fn test_call_traceback_non_string_msg() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(TValue::Integer(42));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(TValue::Integer(42));
         call_traceback(&mut state, 0, 1, 1).unwrap();
-        match &state.exec.stack[0] {
+        match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 42),
             _ => panic!("expected integer 42 (returned untouched)"),
         }
@@ -3692,30 +3666,30 @@ mod tests {
     #[test]
     fn test_call_getinfo_out_of_range() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(TValue::Integer(1000));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(TValue::Integer(1000));
         call_getinfo(&mut state, 0, 1, 1).unwrap();
-        assert!(matches!(state.exec.stack[0], TValue::Nil(_)));
+        assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
 
     #[test]
     fn test_call_getinfo_negative_level() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(TValue::Integer(-1));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(TValue::Integer(-1));
         call_getinfo(&mut state, 0, 1, 1).unwrap();
-        assert!(matches!(state.exec.stack[0], TValue::Nil(_)));
+        assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
 
     #[test]
     fn test_call_getlocal_out_of_range() {
         let mut state = LuaState::default();
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(TValue::Integer(20));
-        state.exec.stack.push(TValue::Integer(1));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(TValue::Integer(20));
+        state.stack.push(TValue::Integer(1));
         let result = call_getlocal(&mut state, 0, 2, 1);
         assert!(result.is_err());
     }
@@ -3777,12 +3751,12 @@ mod tests {
             proto: Rc::new(crate::func::new_proto()),
             upvals,
         });
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(TValue::LClosure(closure));
-        state.exec.stack.push(TValue::Integer(1));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(TValue::LClosure(closure));
+        state.stack.push(TValue::Integer(1));
         call_upvalueid(&mut state, 0, 2, 1).unwrap();
-        assert!(matches!(state.exec.stack[0], TValue::LightUserData(_)));
+        assert!(matches!(state.stack[0], TValue::LightUserData(_)));
     }
 
     #[test]
@@ -3794,21 +3768,21 @@ mod tests {
             proto: Rc::new(crate::func::new_proto()),
             upvals: Rc::new(RefCell::new(UpValVec::new())),
         });
-        state.exec.stack.clear();
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
-        state.exec.stack.push(TValue::LClosure(closure));
-        state.exec.stack.push(TValue::Integer(1));
+        state.stack.clear();
+        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.stack.push(TValue::LClosure(closure));
+        state.stack.push(TValue::Integer(1));
         call_upvalueid(&mut state, 0, 2, 1).unwrap();
-        assert!(matches!(state.exec.stack[0], TValue::Nil(_)));
+        assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
 
     #[test]
     fn test_call_debug_returns_nothing() {
         let mut buff = crate::mock::io_mock::BufferIo::new("cont\n");
-        let mut state = LuaState::new(&mut buff);
-        state.exec.stack.clear();
+        let mut state = LuaState::new_main(&mut buff);
+        state.stack.clear();
         call_debug(&mut state, 0, 0, 0).unwrap();
-        assert_eq!(state.exec.stack.len(), 0);
+        assert_eq!(state.stack.len(), 0);
     }
 
     #[test]

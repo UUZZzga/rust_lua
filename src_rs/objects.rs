@@ -337,7 +337,7 @@ pub type BuiltinFnPtr =
 /// `.as_ptr()` 得到指向 NUL 终止字节数组的 thin pointer）。
 ///
 /// Scenario: 注册并调用 Rust 原生内置函数
-/// Given: 一个签名为 `fn(&mut LuaState, usize, usize, i32) -> Result<(), VmError>` 的函数
+/// Given: 一个签名为 `fn(&mut GlobalState, usize, usize, i32) -> Result<(), VmError>` 的函数
 /// When: 用 `TValue::BuiltinFn(BuiltinFn { func, name })` 注册到表中
 /// Then: Lua 代码调用该函数时，VM 直接通过函数指针调用，无需 tag 派发
 #[derive(Clone, Copy)]
@@ -346,7 +346,7 @@ pub struct BuiltinFn {
     ///
     /// 函数指针按机器字长对齐 (≥2), bit0 恒 0 可安全借用。pure 标志内嵌
     /// 指针低位使 BuiltinFn 保持 8 字节 (TValue 16B 布局不变), 取代原
-    /// LuaState.pure_fns HashSet 查询 (每次调用 2 个非内联 call:
+    /// GlobalState.pure_fns HashSet 查询 (每次调用 2 个非内联 call:
     /// tvalue_fx_hash + RawTable::find, ~25 cycles) — op_call 现为一条 test。
     ///
     /// 任何调用/比较该指针的位置必须经 call_target()/raw_func() 解码。
@@ -471,7 +471,7 @@ impl std::fmt::Debug for BuiltinFn {
 /// 与查名（name_str，traceback 冷路径）都走此表。
 ///
 /// 并发模型：std::sync::RwLock——注册只在库 open 时发生，查名只在错误路径；
-/// 两者都远离热指令路径，锁开销可忽略。threaded feature 下多 LuaState 并发
+/// 两者都远离热指令路径，锁开销可忽略。threaded feature 下多 GlobalState 并发
 /// open 库时写锁保证安全。
 mod builtin_names {
     use std::collections::HashMap;
@@ -1786,16 +1786,17 @@ pub struct CallFrame<'a> {
 
 /// 协程挂起时保存的 VM 执行上下文
 ///
-/// coroutine.yield 时把当前执行状态 (ExecState) 整体交换到 ThreadContext.exec，
-/// coroutine.resume 时与 LuaState.exec 两个 Box 指针整体交换回来 (O(1))。
+/// 协程的执行态就是 `ThreadContext.exec` 本身（Box 地址稳定）：resume/yield 直接在
+/// 协程自己的 exec 上跑 `execute_loop`，调用者全程不动（无 swap）。协程 exec 通过
+/// `bind_g` 指向共享全局态。
 #[derive(Debug)]
 pub struct ThreadContext<'a> {
     /// 是否已开始执行（首次 resume 后置 true）
     pub started: bool,
     /// 协程当前状态（共享可变，对应 LuaThread.status 的真实来源）
     pub status: ThreadStatus,
-    /// 挂起时保存的 VM 执行上下文 — resume 时与 LuaState.exec 整体交换
-    pub exec: Box<crate::state::ExecState<'a>>,
+    /// 协程的 VM 执行上下文 — 协程自己的 lua_State（运行态驻留于此）
+    pub exec: Box<crate::state::LuaState<'a>>,
     /// 协程错误时保存的错误信息（status=Error 时有效）
     /// coroutine.close 时若协程已 dead 且有错误，应返回该错误
     pub error_msg: Option<TValue<'a>>,
@@ -1821,7 +1822,7 @@ impl<'a> Default for ThreadContext<'a> {
         ThreadContext {
             started: false,
             status: ThreadStatus::Suspended,
-            exec: Box::new(crate::state::ExecState::default()),
+            exec: Box::new(crate::state::LuaState::empty_thread()),
             error_msg: None,
             upval_origins: Vec::new(),
             wrap_creator_thread_ptr: 0,
@@ -1837,13 +1838,13 @@ impl<'a> Default for ThreadContext<'a> {
 /// Scenario: 线程的生命周期
 /// Given: 一个新创建的 Lua 线程
 /// When: 检查其状态
-/// Then: status = ThreadStatus::Suspended, stack 为空
+/// Then: context.status = ThreadStatus::Suspended
+///
+/// 注意：与 C 的 lua_State 一致，线程的「栈」与「状态」只有一份权威来源——
+/// 栈在 `context.exec.stack`（协程 exec 是协程自己的 lua_State，运行/挂起同一份），
+/// 状态在 `context.status`。此结构不再持有影子副本 `stack`/`status`。
 #[derive(Debug, Clone)]
 pub struct LuaThread<'a> {
-    /// 线程栈
-    pub stack: Vec<TValue<'a>>,
-    /// 线程状态
-    pub status: ThreadStatus,
     /// 协程体函数 (coroutine.create 的参数)
     pub function: Option<Box<TValue<'a>>>,
     /// 是否为主线程
@@ -1859,14 +1860,10 @@ pub struct LuaThread<'a> {
 impl<'a> LuaThread<'a> {
     /// 估算 LuaThread 真实堆占用（用于 GC 内存计费）。
     /// LuaThread 不调用 register_object（无 gc_header），由 gc_extra_estimate 跟踪。
-    /// stack 在运行期会扩容，collect_gc 后重算以反映当前容量。
     pub fn gc_mem_size(&self) -> usize {
         // Rc<LuaThread> 堆分配 = LuaThread 自身
-        // stack: Vec<TValue>，堆分配 = capacity * size_of::<TValue>()
-        // context: Rc<RefCell<ThreadContext>>，含 saved_stack 等 Vec（粗略估算 64）
-        std::mem::size_of::<LuaThread>()
-            + self.stack.capacity() * std::mem::size_of::<TValue>()
-            + 64 // ThreadContext + RefCell 分配头估算
+        // context: Rc<RefCell<ThreadContext>>，含 exec.stack 等 Vec（粗略估算 64）
+        std::mem::size_of::<LuaThread>() + 64 // ThreadContext + RefCell 分配头估算
     }
 }
 

@@ -11,6 +11,8 @@
 
 use crate::execute::VmError;
 use crate::objects::{BuiltinFn, NilKind, TValue};
+#[cfg(test)]
+use crate::state::GlobalState;
 use crate::state::LuaState;
 use crate::strings::lua_string_as_str;
 use crate::table::Table;
@@ -101,10 +103,10 @@ mod compat {
 
 fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.exec.stack.len() {
+    if stack_idx >= state.stack.len() {
         return TValue::Nil(NilKind::Strict);
     }
-    state.exec.stack[stack_idx].clone()
+    state.stack[stack_idx].clone()
 }
 
 fn push_single_result<'a>(state: &mut LuaState<'a>, a: usize, nresults: i32, result: TValue<'a>) {
@@ -346,15 +348,12 @@ fn call_remove<'a>(
             let fname = filename_cstr.to_str().unwrap_or("");
             format!("{}: {}", fname, err)
         };
-        state.adjust_results(
-            a,
-            nresults,
-            vec![
-                TValue::Nil(NilKind::Strict),
-                (state.intern_str(&msg)),
-                TValue::Integer(errno as i64),
-            ],
-        );
+        let __results = vec![
+            TValue::Nil(NilKind::Strict),
+            (state.intern_str(&msg)),
+            TValue::Integer(errno as i64),
+        ];
+        state.adjust_results(a, nresults, __results);
     }
     Ok(())
 }
@@ -503,15 +502,12 @@ fn call_rename<'a>(
                 err
             )
         };
-        state.adjust_results(
-            a,
-            nresults,
-            vec![
-                TValue::Nil(NilKind::Strict),
-                (state.intern_str(&msg)),
-                TValue::Integer(errno as i64),
-            ],
-        );
+        let __results = vec![
+            TValue::Nil(NilKind::Strict),
+            (state.intern_str(&msg)),
+            TValue::Integer(errno as i64),
+        ];
+        state.adjust_results(a, nresults, __results);
     }
     Ok(())
 }
@@ -607,10 +603,10 @@ fn call_os_exit<'a>(
         matches!(&v, TValue::Boolean(true))
     };
     if close {
-        if state.gc_closing {
+        if state.g_mut().gc_closing {
             // 已在 close_state 中（finalizer 调用 os.exit）：设置退出请求，
             // close_state 处理完剩余 finalizer 后据此退出
-            state.exit_requested = Some(status);
+            state.g_mut().exit_requested = Some(status);
             // 用 VmError 中断当前 finalizer 的 pcall，让 close_state 继续处理后续对象
             return Err(VmError::RuntimeError("__exit_requested__".to_string()));
         } else {

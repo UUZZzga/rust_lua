@@ -14,6 +14,8 @@
 
 use crate::execute::VmError;
 use crate::objects::{BuiltinFn, NilKind, TValue};
+#[cfg(test)]
+use crate::state::GlobalState;
 use crate::state::LuaState;
 use crate::strings::lua_string_as_str;
 use crate::table::Table;
@@ -589,8 +591,8 @@ pub fn math_randomseed<'a>(
 /// 从栈中读取参数 (0-based 索引, 相对于函数位置 a)
 fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
     let stack_idx = a + 1 + idx;
-    if stack_idx < state.exec.stack.len() {
-        state.exec.stack[stack_idx].clone()
+    if stack_idx < state.stack.len() {
+        state.stack[stack_idx].clone()
     } else {
         TValue::Nil(NilKind::Strict)
     }
@@ -701,8 +703,8 @@ fn call_abs<'a>(
             "bad argument #1 to 'abs' (number expected, got no value)".to_string(),
         ));
     }
-    let arg = &state.exec.stack[a + 1];
-    match arg {
+    let arg = state.stack[a + 1].clone();
+    match &arg {
         TValue::Integer(i) => {
             state.adjust_single_result(a, nresults, TValue::Integer(i.wrapping_abs()));
         }
@@ -773,7 +775,7 @@ fn unary_slow_convert<'a>(
 /// 通用一元浮点函数派发 — 用于 sin/cos/tan/asin/acos/deg/rad/exp/sqrt
 ///
 /// perf: 热路径零分配零冗余匹配 —
-/// - 直接索引 state.exec.stack[a+1] (nargs>=1 时 VM 保证参数在栈上), 不经 get_arg 的
+/// - 直接索引 state.stack[a+1] (nargs>=1 时 VM 保证参数在栈上), 不经 get_arg 的
 ///   clone + 边界分支;
 /// - 单次 match 同时完成 Integer/Float 提取 (原 get_number_arg + to_float 两轮 match);
 /// - adjust_single_result 替代 push_single_result (原 vec![result] 每次调用一次堆分配);
@@ -800,10 +802,10 @@ where
     // 不满足 (多参/非 1-out/非数值参/hook) 落回原通用路径, 语义逐位不变。
     let spec_x: Option<f64> = if nargs == 1
         && nresults == 1
-        && state.exec.stack.len() == a + 2
-        && (state.exec.hook_mask & 2 == 0 || !state.exec.allowhook)
+        && state.stack.len() == a + 2
+        && (state.hook_mask & 2 == 0 || !state.allowhook)
     {
-        match unsafe { state.exec.stack.get_unchecked(a + 1) } {
+        match unsafe { state.stack.get_unchecked(a + 1) } {
             TValue::Float(v) => Some(*v),
             TValue::Integer(v) => Some(*v as f64),
             _ => None,
@@ -814,7 +816,7 @@ where
     if let Some(x) = spec_x {
         let y = f(x);
         unsafe {
-            let slot = state.exec.stack.get_unchecked_mut(a);
+            let slot = state.stack.get_unchecked_mut(a);
             if matches!(
                 slot,
                 TValue::Nil(_)
@@ -828,15 +830,15 @@ where
                 *slot = TValue::Float(y);
             }
             // 唯一尾槽 = 数值参数 (trivially droppable), set_len 免 drop
-            state.exec.stack.set_len(a + 1);
+            state.stack.set_len(a + 1);
         }
-        state.exec.top = a + 1;
+        state.top = a + 1;
         return Ok(());
     }
     if nargs == 0 {
         return Err(unary_no_arg(fname));
     }
-    let arg = &state.exec.stack[a + 1];
+    let arg = &state.stack[a + 1];
     let x = match arg {
         TValue::Float(fl) => *fl,
         TValue::Integer(i) => *i as f64,
@@ -944,13 +946,13 @@ fn call_atan<'a>(
             "bad argument #1 to 'atan' (number expected, got no value)".to_string(),
         ));
     }
-    let y = match &state.exec.stack[a + 1] {
+    let y = match &state.stack[a + 1] {
         TValue::Float(fl) => *fl,
         TValue::Integer(i) => *i as f64,
         other => unary_slow_convert(state, other, "atan")?,
     };
     let x = if nargs >= 2 {
-        match &state.exec.stack[a + 2] {
+        match &state.stack[a + 2] {
             TValue::Float(fl) => Some(*fl),
             TValue::Integer(i) => Some(*i as f64),
             other => Some(unary_slow_convert(state, other, "atan")?),
@@ -977,13 +979,13 @@ fn call_log<'a>(
             "bad argument #1 to 'log' (number expected, got no value)".to_string(),
         ));
     }
-    let x = match &state.exec.stack[a + 1] {
+    let x = match &state.stack[a + 1] {
         TValue::Float(fl) => *fl,
         TValue::Integer(i) => *i as f64,
         other => unary_slow_convert(state, other, "log")?,
     };
     let base = if nargs >= 2 {
-        match &state.exec.stack[a + 2] {
+        match &state.stack[a + 2] {
             TValue::Float(fl) => Some(*fl),
             TValue::Integer(i) => Some(*i as f64),
             other => Some(unary_slow_convert(state, other, "log")?),
@@ -1275,8 +1277,12 @@ fn call_random<'a>(
     nresults: i32,
 ) -> Result<(), VmError<'a>> {
     let args: Vec<TValue> = (0..nargs).map(|i| get_arg(state, a, i)).collect();
-    let rand_state = state.math_random_state.as_mut().unwrap();
-    match math_random(rand_state, &args) {
+    let result = {
+        let mut rs = state.math_random_state.borrow_mut();
+        let rand_state = rs.as_mut().unwrap();
+        math_random(rand_state, &args)
+    };
+    match result {
         Ok(result) => {
             push_single_result(state, a, nresults, result);
             Ok(())
@@ -1293,8 +1299,12 @@ fn call_randomseed<'a>(
     nresults: i32,
 ) -> Result<(), VmError<'a>> {
     let args: Vec<TValue> = (0..nargs).map(|i| get_arg(state, a, i)).collect();
-    let rand_state = state.math_random_state.as_mut().unwrap();
-    match math_randomseed(rand_state, &args) {
+    let result = {
+        let mut rs = state.math_random_state.borrow_mut();
+        let rand_state = rs.as_mut().unwrap();
+        math_randomseed(rand_state, &args)
+    };
+    match result {
         Ok((n1, n2)) => {
             push_results(
                 state,
@@ -1375,11 +1385,13 @@ pub fn open_math_lib<'a>(state: &mut LuaState<'a>) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(1);
-    if state.math_random_state.is_none() {
-        state.math_random_state = Some(Box::new(RandState::new()));
+    {
+        let mut rs = state.math_random_state.borrow_mut();
+        if rs.is_none() {
+            *rs = Some(Box::new(RandState::new()));
+        }
+        rs.as_mut().unwrap().setseed(seed, 0);
     }
-    let rand_state = state.math_random_state.as_mut().unwrap();
-    rand_state.setseed(seed, 0);
 }
 
 // ============================================================================

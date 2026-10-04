@@ -14,6 +14,7 @@
 
 use lua_rs::cli::Interpreter;
 use lua_rs::objects::TValue;
+use lua_rs::state::GlobalState;
 use lua_rs::state::LuaState;
 use lua_rs::stdlib::math_lib;
 #[cfg(unix)]
@@ -289,6 +290,7 @@ fn test_math_sin_zero() {
     assert!(stdout.contains("0"));
 }
 
+#[cfg_attr(miri, ignore)]
 #[test]
 fn test_math_sin_half_pi() {
     let output = run_lua_expr("print(math.sin(math.pi / 2))");
@@ -1254,7 +1256,7 @@ fn test_rust_api_open_math_lib() {
     assert!(state.globals.get(&key).is_some());
 
     // 验证随机状态已初始化
-    assert!(state.math_random_state.is_some());
+    assert!(state.math_random_state.borrow().is_some());
 }
 
 #[test]

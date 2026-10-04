@@ -247,16 +247,11 @@ pub struct LongString {
 }
 
 impl LongString {
-    pub const FIXED_SIZE: usize = std::mem::size_of::<LongStringFixed>();
     pub const ALIGN: usize = std::mem::align_of::<LongStringFixed>();
 }
 
 // 编译期断言：前缀布局必须与 ShortString 的固定部分一致
 const _: () = {
-    assert!(
-        LongString::FIXED_SIZE == 16,
-        "LongString 固定部分应为 16 字节"
-    );
     assert!(LongString::ALIGN == 8, "LongString 应对齐到 8");
 };
 
@@ -273,7 +268,11 @@ unsafe impl RcPayload for LongString {
 
     unsafe fn payload_size(p: *const u8) -> usize {
         let len = *(p.add(8) as *const u32) as usize;
-        ShortString::FIXED_SIZE + len
+        // 必须与 new_lstr 的分配 payload_size 一致（fixed = offset_of!(extra)+1 = 13，
+        // len 字段 = content+1 → 13+len = fixed+content+1 ✓）。旧实现用
+        // ShortString::FIXED_SIZE(16)+len，与分配差 4 — Miri 实证 dealloc layout
+        // 不匹配（104 vs 112, incorrect layout on deallocation）。
+        std::mem::offset_of!(LongString, extra) + 1 + len
     }
 }
 
@@ -283,7 +282,7 @@ impl SimpleRc<LongString> {
 
         let tmp: SimpleRc<LongString> = unsafe {
             let align = LongString::ALIGN;
-            let fixed = LongString::FIXED_SIZE;
+            let fixed = std::mem::offset_of!(LongString, extra) + 1;
             let payload_size = fixed + data.len() + 1;
 
             // 1) 一次分配 header + payload
@@ -319,17 +318,9 @@ impl SimpleRc<LongString> {
             );
 
             // 4) 写变长部分（紧跟在固定部分后面）
-            std::ptr::copy_nonoverlapping(
-                data.as_ptr(),
-                p.add(std::mem::offset_of!(LongString, extra) + 1),
-                data.len(),
-            );
+            std::ptr::copy_nonoverlapping(data.as_ptr(), p.add(fixed), data.len());
             // 5) 写 NUL 终止符
-            std::ptr::write(
-                p.add(std::mem::offset_of!(LongString, extra) + 1)
-                    .add(data.len()),
-                0,
-            );
+            std::ptr::write(p.add(fixed).add(data.len()), 0);
 
             SimpleRc::from_raw_base(base)
         };

@@ -431,28 +431,28 @@ pub(crate) fn call_tm_res<'a>(
     res: usize,
     tm: TagMethod,
 ) -> Result<(), VmError<'a>> {
-    let func_idx = state.exec.stack.len();
+    let func_idx = state.stack.len();
     // 压入函数和两个参数 (对应 C 的 setobj2s)
-    state.exec.stack.push(f.clone());
-    state.exec.stack.push(p1.clone());
-    state.exec.stack.push(p2.clone());
-    state.exec.top = state.exec.stack.len();
+    state.stack.push(f.clone());
+    state.stack.push(p1.clone());
+    state.stack.push(p2.clone());
+    state.top = state.stack.len();
 
     // 推入 CallInfoEntry — 对应 C 的 luaD_callnoyield 推入 CallInfo
     // name = 事件名 (如 "index", "add"), namewhat = "metamethod"
-    let caller_base = state.exec.base;
-    let caller_pc = state.exec.pc;
-    let caller_code = state.exec.code.clone();
-    let caller_constants = state.exec.constants.clone();
-    let caller_protos = state.exec.protos.clone();
-    let caller_num_params = state.exec.num_params;
-    let caller_is_vararg = state.exec.is_vararg;
-    let caller_proto_flag = state.exec.proto_flag;
-    let caller_nextraargs = state.exec.nextraargs;
-    let caller_closure_upvals = Rc::clone(&state.exec.closure_upvals);
-    let caller_tbc_list = state.exec.tbc_list;
-    // perf: caller_proto 延迟计算 (同 op_call), 从 state.exec.stack[base-1] 获取
-    state.exec.call_info.push(crate::state::CallInfoEntry {
+    let caller_base = state.base;
+    let caller_pc = state.pc;
+    let caller_code = state.code.clone();
+    let caller_constants = state.constants.clone();
+    let caller_protos = state.protos.clone();
+    let caller_num_params = state.num_params;
+    let caller_is_vararg = state.is_vararg;
+    let caller_proto_flag = state.proto_flag;
+    let caller_nextraargs = state.nextraargs;
+    let caller_closure_upvals = Rc::clone(&state.closure_upvals);
+    let caller_tbc_list = state.tbc_list;
+    // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[base-1] 获取
+    state.call_info.push(crate::state::CallInfoEntry {
         is_c: false,
         closure: None,
         base: caller_base,
@@ -470,7 +470,6 @@ pub(crate) fn call_tm_res<'a>(
     // saved_pc 保留指向被中断的指令（OP_LE/OP_MMBIN 等），不 +1，
     // 以便 continuation 时读取该指令并完成。
     state
-        .exec
         .pcall_protection_stack
         .push(crate::state::PcallProtection {
             saved_code: caller_code.clone(),
@@ -490,12 +489,12 @@ pub(crate) fn call_tm_res<'a>(
             saved_filled: false,
             is_metamethod: true,
             metamethod_res: res,
-            saved_call_stack_len: state.exec.call_stack.len(),
+            saved_call_stack_len: state.call_stack.len(),
             is_close_continuation: false,
             is_pairs_continuation: false,
             saved_call_stack: Vec::new(),
         });
-    let mm_protection_idx = state.exec.pcall_protection_stack.len() - 1;
+    let mm_protection_idx = state.pcall_protection_stack.len() - 1;
 
     // 调用: 2 个参数, 1 个返回值 (对应 C 的 luaD_callnoyield(L, func, 1))
     let status = state.pcall(2, 1, 0);
@@ -509,7 +508,7 @@ pub(crate) fn call_tm_res<'a>(
     //  CallInfo 栈保留元方法帧，resume 后继续执行元方法。)
     if status == crate::state::LUA_YIELD {
         // C 函数元方法 yield 时，state.pcall 的 LightUserData 分支不更新 PcallProtection
-        let protection = &mut state.exec.pcall_protection_stack[mm_protection_idx];
+        let protection = &mut state.pcall_protection_stack[mm_protection_idx];
         if !protection.saved_filled {
             protection.saved_filled = true;
             protection.func_idx = func_idx;
@@ -520,22 +519,22 @@ pub(crate) fn call_tm_res<'a>(
     }
 
     // 非 yield: pop PcallProtection
-    state.exec.pcall_protection_stack.pop();
+    state.pcall_protection_stack.pop();
 
     // pcall 后: 栈截断到 func_idx，1 个结果(或错误消息)在 func_idx
-    let result = if func_idx < state.exec.stack.len() {
-        state.exec.stack[func_idx].clone()
+    let result = if func_idx < state.stack.len() {
+        state.stack[func_idx].clone()
     } else {
         TValue::Nil(NilKind::Strict)
     };
 
     // 截断栈，移除临时压入的函数/参数/结果
-    state.exec.stack.truncate(func_idx);
+    state.stack.truncate(func_idx);
 
     if status != 0 {
         // 元方法调用失败 — 保留 CallInfoEntry 供 traceback 使用
         // 上层 state.pcall 会保存 call_info 快照（包含此帧），然后截断到正确长度
-        state.exec.top = state.exec.stack.len();
+        state.top = state.stack.len();
         let mm_name = tm.event_name();
         return Err(match &result {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
@@ -552,14 +551,14 @@ pub(crate) fn call_tm_res<'a>(
     }
 
     // 成功: pop CallInfoEntry
-    state.exec.call_info.pop();
+    state.call_info.pop();
 
     // 将结果写入 res 槽位 (对应 C 的 setobjs2s(L, res, ...))
-    while state.exec.stack.len() <= res {
-        state.exec.stack.push(TValue::Nil(NilKind::Strict));
+    while state.stack.len() <= res {
+        state.stack.push(TValue::Nil(NilKind::Strict));
     }
-    state.exec.stack[res] = result;
-    state.exec.top = state.exec.stack.len();
+    state.stack[res] = result;
+    state.top = state.stack.len();
     Ok(())
 }
 
@@ -593,26 +592,26 @@ pub(crate) fn call_tm<'a>(
     p3: &TValue<'a>,
     tm: TagMethod,
 ) -> Result<(), VmError<'a>> {
-    let func_idx = state.exec.stack.len();
-    state.exec.stack.push(f.clone());
-    state.exec.stack.push(p1.clone());
-    state.exec.stack.push(p2.clone());
-    state.exec.stack.push(p3.clone());
-    state.exec.top = state.exec.stack.len();
+    let func_idx = state.stack.len();
+    state.stack.push(f.clone());
+    state.stack.push(p1.clone());
+    state.stack.push(p2.clone());
+    state.stack.push(p3.clone());
+    state.top = state.stack.len();
 
-    let caller_base = state.exec.base;
-    let caller_pc = state.exec.pc;
-    let caller_code = state.exec.code.clone();
-    let caller_constants = state.exec.constants.clone();
-    let caller_protos = state.exec.protos.clone();
-    let caller_num_params = state.exec.num_params;
-    let caller_is_vararg = state.exec.is_vararg;
-    let caller_proto_flag = state.exec.proto_flag;
-    let caller_nextraargs = state.exec.nextraargs;
-    let caller_closure_upvals = Rc::clone(&state.exec.closure_upvals);
-    let caller_tbc_list = state.exec.tbc_list;
-    // perf: caller_proto 延迟计算 (同 op_call), 从 state.exec.stack[base-1] 获取
-    state.exec.call_info.push(crate::state::CallInfoEntry {
+    let caller_base = state.base;
+    let caller_pc = state.pc;
+    let caller_code = state.code.clone();
+    let caller_constants = state.constants.clone();
+    let caller_protos = state.protos.clone();
+    let caller_num_params = state.num_params;
+    let caller_is_vararg = state.is_vararg;
+    let caller_proto_flag = state.proto_flag;
+    let caller_nextraargs = state.nextraargs;
+    let caller_closure_upvals = Rc::clone(&state.closure_upvals);
+    let caller_tbc_list = state.tbc_list;
+    // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[base-1] 获取
+    state.call_info.push(crate::state::CallInfoEntry {
         is_c: false,
         closure: None,
         base: caller_base,
@@ -629,7 +628,6 @@ pub(crate) fn call_tm<'a>(
     // 以便 continuation 时读取该指令并完成。
     // metamethod_res 设为 func_idx (不使用, 因为 0 个返回值)。
     state
-        .exec
         .pcall_protection_stack
         .push(crate::state::PcallProtection {
             saved_code: caller_code.clone(),
@@ -649,19 +647,19 @@ pub(crate) fn call_tm<'a>(
             saved_filled: false,
             is_metamethod: true,
             metamethod_res: func_idx, // 不使用 (0 个返回值)
-            saved_call_stack_len: state.exec.call_stack.len(),
+            saved_call_stack_len: state.call_stack.len(),
             is_close_continuation: false,
             is_pairs_continuation: false,
             saved_call_stack: Vec::new(),
         });
-    let mm_protection_idx = state.exec.pcall_protection_stack.len() - 1;
+    let mm_protection_idx = state.pcall_protection_stack.len() - 1;
 
     // 调用: 3 个参数, 0 个返回值
     let status = state.pcall(3, 0, 0);
 
     // yield: 元方法 yield 时，state.pcall 返回 LUA_YIELD
     if status == crate::state::LUA_YIELD {
-        let protection = &mut state.exec.pcall_protection_stack[mm_protection_idx];
+        let protection = &mut state.pcall_protection_stack[mm_protection_idx];
         if !protection.saved_filled {
             protection.saved_filled = true;
             protection.func_idx = func_idx;
@@ -671,21 +669,21 @@ pub(crate) fn call_tm<'a>(
     }
 
     // 非 yield: pop PcallProtection
-    state.exec.pcall_protection_stack.pop();
+    state.pcall_protection_stack.pop();
 
     // pcall 后: 错误值在 func_idx 位置 (state.pcall 已 truncate 并 push 错误值)
     // 成功: 无返回值 (nresults=0), 栈上无额外值
     if status != 0 {
         // 元方法调用失败 — 保留 CallInfoEntry 供 traceback 使用
         // 上层 state.pcall 会保存 call_info 快照（包含此帧），然后截断到正确长度
-        let result = if func_idx < state.exec.stack.len() {
-            state.exec.stack[func_idx].clone()
+        let result = if func_idx < state.stack.len() {
+            state.stack[func_idx].clone()
         } else {
             TValue::Nil(NilKind::Strict)
         };
         // 截断栈, 移除错误值和临时压入的函数/参数
-        state.exec.stack.truncate(func_idx);
-        state.exec.top = state.exec.stack.len();
+        state.stack.truncate(func_idx);
+        state.top = state.stack.len();
         return Err(match &result {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 VmError::RuntimeError(lua_string_as_str(s).to_string())
@@ -694,9 +692,9 @@ pub(crate) fn call_tm<'a>(
         });
     }
     // 成功: pop CallInfoEntry, 截断栈
-    state.exec.stack.truncate(func_idx);
-    state.exec.top = state.exec.stack.len();
-    state.exec.call_info.pop();
+    state.stack.truncate(func_idx);
+    state.top = state.stack.len();
+    state.call_info.pop();
     Ok(())
 }
 
@@ -766,32 +764,32 @@ pub fn call_close_method<'a>(
         }
     };
 
-    let func_idx = state.exec.stack.len();
+    let func_idx = state.stack.len();
     // 压入函数和参数 (对应 C 的 callclosemethod)
     // C 中 err == NULL 时不传递第二个参数（无错误时只传 1 个参数）
-    state.exec.stack.push(f);
-    state.exec.stack.push(obj.clone());
+    state.stack.push(f);
+    state.stack.push(obj.clone());
     let nargs = if let Some(err_val) = err {
-        state.exec.stack.push(err_val.clone());
+        state.stack.push(err_val.clone());
         2
     } else {
         1
     };
-    state.exec.top = state.exec.stack.len();
+    state.top = state.stack.len();
 
     // 推入 CallInfoEntry — 对应 C 的 luaD_callnoyield 推入 CallInfo
-    let caller_base = state.exec.base;
-    let caller_pc = state.exec.pc;
-    // perf: caller_proto 延迟计算 (同 op_call), 从 state.exec.stack[base-1] 获取
-    state.exec.call_info.push(crate::state::CallInfoEntry {
+    let caller_base = state.base;
+    let caller_pc = state.pc;
+    // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[base-1] 获取
+    state.call_info.push(crate::state::CallInfoEntry {
         is_c: false,
         closure: None,
         base: caller_base,
         saved_pc: caller_pc,
         name: Some("close"),
         namewhat: "metamethod",
-        proto_flag: state.exec.proto_flag,
-        nextraargs: state.exec.nextraargs,
+        proto_flag: state.proto_flag,
+        nextraargs: state.nextraargs,
         is_tailcall: false,
     });
 
@@ -799,7 +797,6 @@ pub fn call_close_method<'a>(
     // yield 穿过 __close 后，resume 时 __close 返回，op_return 检测到 is_close_continuation=true
     // 并执行 continuation（对应 C Lua 的 luaV_finishOp 对 OP_RETURN/OP_CLOSE 的 savedpc-- 机制）
     state
-        .exec
         .pcall_protection_stack
         .push(crate::state::PcallProtection {
             saved_code: Rc::new(Vec::new()),
@@ -819,7 +816,7 @@ pub fn call_close_method<'a>(
             saved_filled: false,
             is_metamethod: false,
             metamethod_res: 0,
-            saved_call_stack_len: state.exec.call_stack.len(),
+            saved_call_stack_len: state.call_stack.len(),
             is_close_continuation: true,
             is_pairs_continuation: false,
             saved_call_stack: Vec::new(),
@@ -827,16 +824,16 @@ pub fn call_close_method<'a>(
 
     // 对应 C 的 callclosemethod: yy=1 用 luaD_call (可 yield), yy=0 用 luaD_callnoyield
     // n_ny_calls > 0 时不可 yield (对应 C 的 nny > 0)
-    let saved_ny = state.exec.n_ny_calls;
+    let saved_ny = state.n_ny_calls;
     if !yy {
-        state.exec.n_ny_calls = state.exec.n_ny_calls.saturating_add(1);
+        state.n_ny_calls = state.n_ny_calls.saturating_add(1);
     }
     // 调用: nargs 个参数, 0 个返回值 (对应 C 的 luaD_call(L, top, 0))
     let status = state.pcall(nargs, 0, 0);
-    state.exec.n_ny_calls = saved_ny;
+    state.n_ny_calls = saved_ny;
 
     // 弹出 CallInfoEntry
-    let close_frame = state.exec.call_info.pop();
+    let close_frame = state.call_info.pop();
 
     if status == crate::state::LUA_YIELD {
         // __close 函数 yield: 不 pop PcallProtection (保留供 resume 时使用)
@@ -846,20 +843,19 @@ pub fn call_close_method<'a>(
     }
 
     // 成功或错误: pop PcallProtection
-    state.exec.pcall_protection_stack.pop();
+    state.pcall_protection_stack.pop();
 
     if status != 0 {
         // 元方法调用失败 — pcall 将错误值推入栈中 func_idx 位置
         // 在截断栈之前读取错误值，保留原始 TValue 类型
         let err_val = state
-            .exec
             .stack
             .get(func_idx)
             .cloned()
             .unwrap_or(TValue::Nil(NilKind::Strict));
         // 截断栈，移除临时压入的函数/参数/错误值
-        state.exec.stack.truncate(func_idx);
-        state.exec.top = state.exec.stack.len();
+        state.stack.truncate(func_idx);
+        state.top = state.stack.len();
         // 保存 __close 的 CallInfoEntry — 对应 C Lua 中 longjmp 跳过 callclosemethod
         // 的弹出代码，CallInfo 节点保留在链表中。state.pcall 保存 call_info 快照时
         // 将此帧追加到快照末尾，让 xpcall 的错误处理函数（如 debug.traceback）能看到
@@ -880,8 +876,8 @@ pub fn call_close_method<'a>(
         );
     }
     // 截断栈，移除临时压入的函数/参数
-    state.exec.stack.truncate(func_idx);
-    state.exec.top = state.exec.stack.len();
+    state.stack.truncate(func_idx);
+    state.top = state.stack.len();
     Ok(true)
 }
 
@@ -1000,10 +996,10 @@ fn string_arith<'a>(
         };
 
         if let Some(r) = result {
-            while state.exec.stack.len() <= res {
-                state.exec.stack.push(TValue::Nil(NilKind::Strict));
+            while state.stack.len() <= res {
+                state.stack.push(TValue::Nil(NilKind::Strict));
             }
-            state.exec.stack[res] = r;
+            state.stack[res] = r;
             return Ok(true);
         }
     }
@@ -1025,10 +1021,10 @@ fn string_arith<'a>(
             _ => return Ok(false),
         };
 
-        while state.exec.stack.len() <= res {
-            state.exec.stack.push(TValue::Nil(NilKind::Strict));
+        while state.stack.len() <= res {
+            state.stack.push(TValue::Nil(NilKind::Strict));
         }
-        state.exec.stack[res] = TValue::Float(result);
+        state.stack[res] = TValue::Float(result);
         return Ok(true);
     }
 
@@ -1193,19 +1189,19 @@ pub fn call_order_tm<'a>(
 ) -> Result<bool, VmError<'a>> {
     debug_assert!(tm == TagMethod::Lt || tm == TagMethod::Le);
     // 使用栈顶作为临时结果槽位
-    let res = state.exec.stack.len();
-    state.exec.stack.push(TValue::Nil(NilKind::Strict));
+    let res = state.stack.len();
+    state.stack.push(TValue::Nil(NilKind::Strict));
 
     let found = callbin_tm(state, p1, p2, res, tm)?;
 
     if found {
-        let result = state.exec.stack[res].clone();
-        state.exec.stack.truncate(res);
-        state.exec.top = state.exec.stack.len();
+        let result = state.stack[res].clone();
+        state.stack.truncate(res);
+        state.top = state.stack.len();
         Ok(!result.is_false())
     } else {
-        state.exec.stack.truncate(res);
-        state.exec.top = state.exec.stack.len();
+        state.stack.truncate(res);
+        state.top = state.stack.len();
         Err(ordererror(state, p1, p2))
     }
 }
@@ -1303,12 +1299,12 @@ pub fn equal_obj<'a>(
     match tm {
         Some(f) => {
             // C: luaT_callTMres(L, tm, t1, t2, L->top.p); return !tagisfalse(tag);
-            let res = state.exec.stack.len();
-            state.exec.stack.push(TValue::Nil(NilKind::Strict));
+            let res = state.stack.len();
+            state.stack.push(TValue::Nil(NilKind::Strict));
             call_tm_res(state, &f, t1, t2, res, TagMethod::Eq)?;
-            let result = state.exec.stack[res].clone();
-            state.exec.stack.truncate(res);
-            state.exec.top = state.exec.stack.len();
+            let result = state.stack[res].clone();
+            state.stack.truncate(res);
+            state.top = state.stack.len();
             Ok(!result.is_false())
         }
         None => Ok(false),
@@ -1364,22 +1360,22 @@ pub fn obj_len<'a>(
             } else {
                 // 无元方法: 返回表长度
                 let len = t.len();
-                while state.exec.stack.len() <= ra {
-                    state.exec.stack.push(TValue::Nil(NilKind::Strict));
+                while state.stack.len() <= ra {
+                    state.stack.push(TValue::Nil(NilKind::Strict));
                 }
-                state.exec.stack[ra] = TValue::Integer(len as i64);
-                state.exec.top = state.exec.stack.len();
+                state.stack[ra] = TValue::Integer(len as i64);
+                state.top = state.stack.len();
                 return Ok(());
             }
         }
         s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
             // 字符串: 返回长度
             let len = lua_string_len(s);
-            while state.exec.stack.len() <= ra {
-                state.exec.stack.push(TValue::Nil(NilKind::Strict));
+            while state.stack.len() <= ra {
+                state.stack.push(TValue::Nil(NilKind::Strict));
             }
-            state.exec.stack[ra] = TValue::Integer(len as i64);
-            state.exec.top = state.exec.stack.len();
+            state.stack[ra] = TValue::Integer(len as i64);
+            state.top = state.stack.len();
             return Ok(());
         }
         _ => {
