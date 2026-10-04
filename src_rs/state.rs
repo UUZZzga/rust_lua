@@ -3882,7 +3882,8 @@ impl<'a> GlobalState<'a> {
     /// 分配 BASIC_STACK_SIZE + EXTRA_STACK 容量，推入函数入口 nil
     /// stack[0] = nil (函数入口, ci->func)
     /// top = stack + 1 (1 个元素在用)
-    fn init_stack() -> Vec<TValue<'a>> {
+    /// pub(crate)：capi 的 lua_newthread 需要为新线程做同样的 stack_init。
+    pub(crate) fn init_stack() -> Vec<TValue<'a>> {
         let mut stack = Vec::with_capacity(BASIC_STACK_SIZE + EXTRA_STACK);
         stack.push(TValue::Nil(NilKind::Strict));
         stack

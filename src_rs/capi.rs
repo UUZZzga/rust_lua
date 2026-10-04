@@ -342,6 +342,12 @@ pub extern "C" fn lua_newthread(L: *mut lua_State) -> *mut lua_State {
     let co_ptr: *mut lua_State = {
         let mut c = context.borrow_mut();
         c.exec.bind_g(l_g);
+        // 对应 C lstate.c::lua_newthread → stack_init：新线程栈的第一个槽是 nil 占位
+        // （后续 cur_ci->func 指向它）。C API 的正索引 idx 映射到 stack[api_func_base+idx]，
+        // 缺少此占位会使 index 1 落到 stack[1]（本应是 stack[0] 之后）整体错位 —— 实测
+        // lua_xmove 后 lua_pushvalue(L,2) 读到越界 nil，报 "attempt to call a nil value"。
+        c.exec.stack = crate::state::GlobalState::init_stack();
+        c.exec.top = c.exec.stack.len();
         // 对应 C lstate.c::lua_newthread：新线程继承 L 的调试钩子设置
         // （hook / hookmask / basehookcount，并 resethookcount）
         let (hook_func, hook_mask, hook_count) =
@@ -4535,6 +4541,67 @@ mod tests {
     fn test_lua_newstate_close() {
         let L = lua_newstate(ptr::null_mut(), ptr::null_mut(), 0);
         assert!(!L.is_null());
+        lua_close(L);
+    }
+
+    /// 回归：skynet 的 lcallback 序列（lua_newthread + 在新线程 pushcfunction +
+    /// lua_xmove 回移函数）。新线程必须带 stack[0]=nil 占位，否则 C API 正索引
+    /// 整体错位，`lua_pushvalue(L,2)` 读越界 nil → snlua bootstrap 报
+    /// "attempt to call a nil value"。
+    #[test]
+    fn test_newthread_xmove_index_layout() {
+        unsafe extern "C" fn cfn(_: *mut std::ffi::c_void) -> c_int {
+            0
+        }
+        let L = luaL_newstate();
+
+        // luaL_checktype(L,1,LUA_TFUNCTION); lua_settop(L,1)
+        lua_pushcfunction(L, cfn);
+        lua_settop(L, 1);
+
+        // lua_newuserdatauv(L, size, 2) → L: [nil, func, ud]
+        let ud = lua_newuserdatauv(L, 16, 2);
+        assert!(!ud.is_null());
+
+        // cb_ctx->L = lua_newthread(L) → L: [nil, func, ud, thread]
+        let co = lua_newthread(L);
+        assert!(!co.is_null());
+        assert_eq!(
+            lua_gettop(co),
+            0,
+            "new thread stack_init leaves only the nil placeholder"
+        );
+
+        // lua_pushcfunction(cb_ctx->L, traceback) → co: [nil, traceback]
+        lua_pushcfunction(co, cfn);
+        assert_eq!(lua_gettop(co), 1);
+        assert_eq!(
+            lua_type(co, 1),
+            LUA_TFUNCTION,
+            "index 1 of a new thread must be the pushed function (nil before the stack_init fix)"
+        );
+
+        // lua_setiuservalue(L, -2, 1): 弹出 thread 存进 ud.uv1 → L: [nil, func, ud]
+        lua_setiuservalue(L, -2, 1);
+        // lua_getfield(REGISTRYINDEX,"callback_context") + setiuservalue(-2,2) + setfield
+        let key = std::ffi::CString::new("callback_context").unwrap();
+        lua_getfield(L, LUA_REGISTRYINDEX, key.as_ptr());
+        lua_setiuservalue(L, -2, 2); // 弹出 prev → L: [nil, func, ud]
+        lua_setfield(L, LUA_REGISTRYINDEX, key.as_ptr()); // 弹出 ud → L: [nil, func]
+
+        // lua_xmove(L, cb_ctx->L, 1): 把函数移入新线程 → co: [nil, traceback, func]
+        lua_xmove(L, co, 1);
+        assert_eq!(lua_gettop(co), 2);
+        assert_eq!(
+            lua_type(co, 2),
+            LUA_TFUNCTION,
+            "index 2 must be the moved function — the slot _cb calls via lua_pushvalue(L,2)"
+        );
+
+        // 复现 _cb 的取值：lua_pushvalue(L, 2) 必须是函数而非 nil
+        lua_pushvalue(co, 2);
+        assert_eq!(lua_type(co, -1), LUA_TFUNCTION);
+
         lua_close(L);
     }
 
