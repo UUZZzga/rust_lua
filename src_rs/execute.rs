@@ -5752,13 +5752,13 @@ impl VmExecutor {
         if state.stack.len() > arg_end {
             state.stack.truncate(arg_end);
         }
-        // TEMP-DIAG: 记录 b==0 的 C 调用的栈边界（CI 排查用，定位后删除）
-        if b == 0 {
+        // TEMP-DIAG: 仅在 b==0 且 top 与栈长不一致（可疑）时打印（CI 排查用）
+        if b == 0 && state.top != state.stack.len() {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static N: AtomicUsize = AtomicUsize::new(0);
-            if N.fetch_add(1, Ordering::Relaxed) < 60 {
+            if N.fetch_add(1, Ordering::Relaxed) < 30 {
                 eprintln!(
-                    "MULTRET-C a={} len={} top={} arg_end={}",
+                    "MULTRET-C-SUSPECT a={} len={} top={} arg_end={}",
                     a,
                     state.stack.len(),
                     state.top,

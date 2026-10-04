@@ -3171,6 +3171,30 @@ pub extern "C" fn lua_xmove(from: *mut lua_State, to: *mut lua_State, n: c_int) 
         0
     };
     let vals: Vec<_> = from.stack.drain(start..).collect();
+    // TEMP-DIAG: 记录搬运中出现的"地址样式"整数（skynet 排查用）
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let hit = vals
+            .iter()
+            .filter(|v| matches!(v, TValue::Integer(i) if (0x1000000..0x1000200).contains(i)))
+            .count();
+        if hit > 0 && N.fetch_add(1, Ordering::Relaxed) < 30 {
+            let desc: Vec<String> = vals
+                .iter()
+                .map(|v| match v {
+                    TValue::Integer(i) => format!("i{}", i),
+                    TValue::LongStr(_) | TValue::ShortStr(_) => "str".to_string(),
+                    TValue::Nil(_) => "nil".to_string(),
+                    other => format!("{:?}", other.ty()),
+                })
+                .collect();
+            eprintln!(
+                "XMOVE-DIAG from={:p} to={:p} n={} vals={:?}",
+                from, to, n, desc
+            );
+        }
+    }
     for v in vals {
         to.stack.push(v);
     }
