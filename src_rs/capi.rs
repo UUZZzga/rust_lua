@@ -4583,8 +4583,56 @@ mod tests {
         );
     }
 
-    /// 回归：完整复刻 skynet auxresume 的形状 —— 带参数 resume、yield、结果
-    /// lua_xmove 回移、再次 resume 至结束。skynet e2e（snlua + skynet.call）走的就是它。
+    /// 回归：C 路径 resume 的协程在 yield 后必须保留自己的栈（局部变量/帧），
+    /// 否则 resume 继续执行时越界读取（CI skynet e2e 实证 read_stack_panic）。
+    /// 对应 C：yield 值留在协程栈顶由 lua_xmove 取走，帧原样保留。
+    #[test]
+    fn test_c_resume_preserves_coroutine_frame_across_yield() {
+        let mut st = LuaState::default();
+        st.open_selected_libs(0, 0);
+        let rc = st.load_buffer(
+            "local co = coroutine.create(function(a, t)\n\
+             t.tag = a * 2\n\
+             local b = coroutine.yield(t.tag)\n\
+             return t.tag + a + b\n\
+             end)\n\
+             return co",
+            "=t",
+        );
+        assert_eq!(rc, 0, "load_buffer failed");
+        st.call(0, 1);
+
+        let L = &mut st as *mut LuaState<'static> as *mut lua_State;
+        let co = lua_tothread(L, -1);
+        assert!(!co.is_null());
+
+        // args: a=3, t={}
+        lua_createtable(L, 0, 0);
+        lua_pushinteger(L, 3);
+        lua_insert(L, -2);
+        lua_xmove(L, co, 2);
+
+        let mut nres: c_int = 0;
+        let r = lua_resume(co, L, 2, &mut nres);
+        assert_eq!(r, LUA_YIELD, "must yield");
+        assert_eq!(nres, 1);
+        lua_xmove(co, L, nres);
+        assert_eq!(lua_tointegerx(L, -1, ptr::null_mut()), 6, "t.tag");
+
+        // 第二次 resume：协程继续执行并读取 yield 之前的局部 a / t
+        lua_pushinteger(L, 100);
+        lua_xmove(L, co, 1);
+        let r = lua_resume(co, L, 1, &mut nres);
+        assert_eq!(r, LUA_OK, "second resume must finish");
+        assert_eq!(nres, 1);
+        lua_xmove(co, L, nres);
+        assert_eq!(
+            lua_tointegerx(L, -1, ptr::null_mut()),
+            109,
+            "pre-yield locals must survive (6 + 3 + 100)"
+        );
+    }
+
     #[test]
     fn test_lua_resume_xmove_roundtrip() {
         let mut st = LuaState::default();

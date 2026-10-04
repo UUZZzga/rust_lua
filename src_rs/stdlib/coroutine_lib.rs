@@ -2237,11 +2237,10 @@ pub fn c_api_resume<'a>(
                 state.pc + 1
             };
             co_context.borrow_mut().status = ThreadStatus::Suspended;
-            // push yield 值到本线程栈: [nil, val1, val2, ...]
-            let mut s = Vec::with_capacity(n + 1);
-            s.push(TValue::Nil(NilKind::Strict));
-            s.extend(values);
-            state.stack = s;
+            // 把 yield 值放在协程栈顶 —— 对应 C：yield 值留在协程栈顶，
+            // 由 resumer 的 lua_xmove 取走；协程自身的帧/局部变量必须原样保留，
+            // 否则下次 resume 继续执行时寄存器丢失（CI skynet e2e 实证 read_stack_panic）。
+            state.stack.extend(values);
             state.top = state.stack.len();
             (crate::capi::LUA_YIELD, n)
         }
