@@ -5459,6 +5459,44 @@ impl VmExecutor {
                     b.saturating_sub(1)
                 };
                 let nresults = c - 1; // -1 表示 MULTRET (对应 C 的 nresults = GETARG_C(i) - 1)
+                                      // TEMP-DIAG: 记录进入 launcher.lua 函数的实参（CI 排查用）
+                {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static N: AtomicUsize = AtomicUsize::new(0);
+                    let src_is_launcher = match &closure.proto.source {
+                        Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
+                            crate::strings::lua_string_as_str(s).contains("launcher.lua")
+                        }
+                        _ => false,
+                    };
+                    if src_is_launcher && N.fetch_add(1, Ordering::Relaxed) < 20 {
+                        let cnt = if b == 0 {
+                            state.top.saturating_sub(a + 1)
+                        } else {
+                            b.saturating_sub(1)
+                        };
+                        let desc: Vec<String> = (0..cnt.min(14))
+                            .map(|i| match state.stack.get(a + 1 + i) {
+                                Some(TValue::Integer(v)) => format!("{}", v),
+                                Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
+                                    format!("{:?}", crate::strings::lua_string_as_str(s))
+                                }
+                                Some(TValue::Nil(_)) => "nil".to_string(),
+                                Some(o) => format!("{:?}", o.ty()),
+                                None => "OOB".to_string(),
+                            })
+                            .collect();
+                        eprintln!(
+                            "LAUNCHER-CALL b={} a={} nargs={} top={} len={} args={:?}",
+                            b,
+                            a,
+                            cnt,
+                            state.top,
+                            state.stack.len(),
+                            desc
+                        );
+                    }
+                }
                 let fsize = closure.proto.max_stack_size as usize;
                 let nfixparams = closure.proto.num_params as usize;
                 let proto_is_vararg = closure.proto.is_vararg();

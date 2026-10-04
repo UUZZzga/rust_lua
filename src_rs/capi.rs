@@ -5022,8 +5022,236 @@ mod tests {
         lua_close(L);
     }
 
-    /// 测试通过 Lua 代码调用 C 函数（LCFn）。
-    /// 验证 op_call 中的 call_c_function 路径。
+    /// 回归：协程池复用路径 —— 协程 yield 后再次 resume，处理器以
+    /// `f(coroutine.yield())`（MULTRET 实参）形式调用，`...` 必须只含新参数，
+    /// 不得混入该协程上一次 dispatch 残留的寄存器。
+    #[test]
+    fn test_c_resume_reused_coroutine_varargs() {
+        let mut st = LuaState::default();
+        st.open_selected_libs(0, 0);
+        let rc = st.load_buffer(
+            "local log = {}\n\
+             local function dispatch(session, source, cmd, ...)\n\
+             local n = select('#', ...)\n\
+             local parts = {}\n\
+             for i = 1, n do parts[i] = tostring((select(i, ...))) end\n\
+             log[#log + 1] = tostring(n) .. ':' .. table.concat(parts, ',')\n\
+             return true\n\
+             end\n\
+             local f\n\
+             local function co_create(fn)\n\
+             local co = coroutine.create(function(...)\n\
+             f(...)\n\
+             while true do\n\
+             f = coroutine.yield('SUSPEND')\n\
+             f(coroutine.yield())\n\
+             end\n\
+             end)\n\
+             f = fn\n\
+             return co\n\
+             end\n\
+             local co = co_create(dispatch)\n\
+             coroutine.resume(co, 4, 16777225, 'LAUNCH', 'snlua', 'debug_console', 8000)\n\
+             coroutine.resume(co, dispatch)\n\
+             coroutine.resume(co, 9, 16777230, 'LAUNCH', 'snlua', 'console')\n\
+             coroutine.resume(co, dispatch)\n\
+             coroutine.resume(co, 11, 16777231, 'LAUNCH', 'snlua', 'main')\n\
+             return table.concat(log, ' ; ')",
+            "=t",
+        );
+        assert_eq!(rc, 0, "load_buffer failed");
+        st.call(0, 1);
+        let s = {
+            let p = lua_tolstring(
+                &mut st as *mut LuaState<'static> as *mut lua_State,
+                -1,
+                ptr::null_mut(),
+            );
+            if p.is_null() {
+                String::new()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(p) }
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        assert_eq!(
+            s, "3:snlua,debug_console,8000 ; 2:snlua,console ; 2:snlua,main",
+            "reused coroutine dispatch varargs must be exact"
+        );
+    }
+
+    /// 回归：B==0（multret 实参）调用点之后仍有活跃寄存器时，callee 的 `...`
+    /// 不得把调用者帧里的残留值当成实参。复刻 skynet dispatch 的真实形状。
+    #[test]
+    fn test_c_resume_multret_args_with_live_registers() {
+        let mut st = LuaState::default();
+        st.open_selected_libs(0, 0);
+        let rc = st.load_buffer(
+            "local function dispatch(session, source, cmd, ...)\n\
+             local n = select('#', ...)\n\
+             local parts = {}\n\
+             for i = 1, n do parts[i] = tostring((select(i, ...))) end\n\
+             return tostring(n) .. '|' .. table.concat(parts, ',')\n\
+             end\n\
+             local function unpacker() return 'LAUNCH', 'snlua', 'debug_console', 8000 end\n\
+             local function caller(session, source, cmd)\n\
+             local co = coroutine.create(function(...) return dispatch(...) end)\n\
+             local ok, r = coroutine.resume(co, session, source, unpacker())\n\
+             local keep_a, keep_b = session, source\n\
+             return r .. '/' .. tostring(keep_a) .. '/' .. tostring(keep_b)\n\
+             end\n\
+             return coroutine.create(function(...) return caller(...) end)",
+            "=t",
+        );
+        assert_eq!(rc, 0, "load_buffer failed");
+        st.call(0, 1);
+
+        let L = &mut st as *mut LuaState<'static> as *mut lua_State;
+        let co = lua_tothread(L, -1);
+        assert!(!co.is_null());
+
+        lua_pushinteger(L, 4);
+        lua_pushinteger(L, 16777225);
+        lua_pushstring(L, c"LAUNCH".as_ptr());
+        lua_xmove(L, co, 3);
+
+        let mut nres: c_int = 0;
+        let r = lua_resume(co, L, 3, &mut nres);
+        if r != LUA_OK {
+            let e = lua_tolstring(co, -1, ptr::null_mut());
+            let es = if e.is_null() {
+                String::new()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(e) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            panic!("resume failed r={} err={}", r, es);
+        }
+        lua_xmove(co, L, nres);
+        let s = {
+            let p = lua_tolstring(L, -1, ptr::null_mut());
+            if p.is_null() {
+                String::new()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(p) }
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        assert_eq!(
+            s, "3|snlua,debug_console,8000/4/16777225",
+            "dispatch varargs must be exactly the multret payload"
+        );
+    }
+
+    /// 回归：skynet co_create 的协程体是 vararg 并转发给固定参数处理器
+    /// （function(...) f(...) end），`...` 在转发的两端都必须精确。
+    #[test]
+    fn test_c_resume_vararg_body_forwarding() {
+        let mut st = LuaState::default();
+        st.open_selected_libs(0, 0);
+        let rc = st.load_buffer(
+            "local function handler(session, address, cmd, ...)\n\
+             local parts = {}\n\
+             for i = 1, select('#', ...) do parts[i] = tostring((select(i, ...))) end\n\
+             return tostring(select('#', ...)) .. ':' .. table.concat(parts, '|')\n\
+             end\n\
+             local body = function(...) return handler(...) end\n\
+             return coroutine.create(body)",
+            "=t",
+        );
+        assert_eq!(rc, 0, "load_buffer failed");
+        st.call(0, 1);
+
+        let L = &mut st as *mut LuaState<'static> as *mut lua_State;
+        let co = lua_tothread(L, -1);
+        assert!(!co.is_null());
+
+        lua_pushinteger(L, 4);
+        lua_pushinteger(L, 16777225);
+        lua_pushstring(L, c"LAUNCH".as_ptr());
+        lua_pushstring(L, c"snlua".as_ptr());
+        lua_pushstring(L, c"debug_console".as_ptr());
+        lua_pushinteger(L, 8000);
+        lua_xmove(L, co, 6);
+
+        let mut nres: c_int = 0;
+        let r = lua_resume(co, L, 6, &mut nres);
+        assert_eq!(r, LUA_OK, "resume must finish");
+        lua_xmove(co, L, nres);
+        let s = {
+            let p = lua_tolstring(L, -1, ptr::null_mut());
+            if p.is_null() {
+                String::new()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(p) }
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        assert_eq!(
+            s, "3:snlua|debug_console|8000",
+            "handler varargs must be exact (no named-param leakage)"
+        );
+    }
+
+    /// 复刻 skynet 的 dispatch 链：resume(co, session, source, ...payload) →
+    /// dispatch(session, address, cmd, ...) → f(address, ...) → g(service, ...)。
+    #[test]
+    fn test_c_resume_nested_vararg_forwarding() {
+        let mut st = LuaState::default();
+        st.open_selected_libs(0, 0);
+        let rc = st.load_buffer(
+            "local function inner(addr, ...)\n\
+             local parts = {}\n\
+             for i = 1, select('#', ...) do parts[i] = tostring((select(i, ...))) end\n\
+             return tostring(select('#', ...)) .. ':' .. table.concat(parts, '|')\n\
+             end\n\
+             local function outer(service, ...) return inner(service, ...) end\n\
+             local co = coroutine.create(function(session, address, cmd, ...)\n\
+             return outer(address, ...)\n\
+             end)\n\
+             return co",
+            "=t",
+        );
+        assert_eq!(rc, 0, "load_buffer failed");
+        st.call(0, 1);
+
+        let L = &mut st as *mut LuaState<'static> as *mut lua_State;
+        let co = lua_tothread(L, -1);
+        assert!(!co.is_null());
+
+        // resume(co, 4, 16777225, "LAUNCH", "snlua", "debug_console", 8000)
+        lua_pushinteger(L, 4);
+        lua_pushinteger(L, 16777225);
+        lua_pushstring(L, c"LAUNCH".as_ptr());
+        lua_pushstring(L, c"snlua".as_ptr());
+        lua_pushstring(L, c"debug_console".as_ptr());
+        lua_pushinteger(L, 8000);
+        lua_xmove(L, co, 6);
+
+        let mut nres: c_int = 0;
+        let r = lua_resume(co, L, 6, &mut nres);
+        assert_eq!(r, LUA_OK, "resume must finish");
+        lua_xmove(co, L, nres);
+        let s = {
+            let p = lua_tolstring(L, -1, ptr::null_mut());
+            if p.is_null() {
+                String::new()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(p) }
+                    .to_string_lossy()
+                    .into_owned()
+            }
+        };
+        assert_eq!(
+            s, "3:snlua|debug_console|8000",
+            "inner(...) must see exactly the forwarded payload"
+        );
+    }
+
     /// 回归：C 函数被 **MULTRET 实参列表**（B==0，最后一个实参是多值表达式）
     /// 调用时，lua_gettop 必须只数真实实参，不能把调用点之后的"死亡"寄存器算进去。
     /// CI skynet e2e 实证：coroutine.resume(co, session, source, decode(msg)) 走 B==0，
