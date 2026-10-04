@@ -5299,6 +5299,39 @@ impl VmExecutor {
         } else {
             b.saturating_sub(1)
         };
+        // TEMP-DIAG: MULTRET 实参的 Lua 调用（CI 排查用）
+        if b == 0 {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 60 {
+                let src = match &closure.proto.source {
+                    Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
+                        crate::strings::lua_string_as_str(s).to_string()
+                    }
+                    _ => "<none>".to_string(),
+                };
+                let desc: Vec<String> = (0..nargs.min(14))
+                    .map(|i| match state.stack.get(a + 1 + i) {
+                        Some(TValue::Integer(v)) => format!("{}", v),
+                        Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
+                            format!("{:?}", crate::strings::lua_string_as_str(s))
+                        }
+                        Some(TValue::Nil(_)) => "nil".to_string(),
+                        Some(o) => format!("{:?}", o.ty()),
+                        None => "OOB".to_string(),
+                    })
+                    .collect();
+                eprintln!(
+                    "MULTRET-LUA nargs={} a={} top={} len={} src={} args={:?}",
+                    nargs,
+                    a,
+                    state.top,
+                    state.stack.len(),
+                    src,
+                    desc
+                );
+            }
+        }
         let nresults = c - 1; // -1 表示 MULTRET (对应 C 的 nresults = GETARG_C(i) - 1)
                               // perf: 不再 Rc::clone(&closure.proto) — 直接访问 closure.proto 字段
                               // closure 在下方被 move 进 CallInfoEntry, 移动后需要的值提前缓存
