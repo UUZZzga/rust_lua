@@ -338,7 +338,7 @@ if [[ -x "$SKYNET_BIN" && -x "$LUA_C_BIN" ]]; then
         grep -E "Request:|RESPONSE|msg|result" "$SCRIPT_DIR/.test_e2e_$$.log" 2>/dev/null | sed 's/^/    /'
     else
         fail "skynet/e2e"
-        tail -30 "$SCRIPT_DIR/.test_e2e_$$.log" 2>/dev/null | sed 's/^/    /'
+        tail -200 "$SCRIPT_DIR/.test_e2e_$$.log" 2>/dev/null | sed 's/^/    /'
         save_fail_log "skynet_e2e" "$SCRIPT_DIR/.test_e2e_$$.log"
     fi
     rm -f "$SCRIPT_DIR/.test_e2e_$$.log"

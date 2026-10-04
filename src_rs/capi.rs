@@ -4629,6 +4629,68 @@ mod tests {
         assert_eq!(lua_tointegerx(L, -1, ptr::null_mut()), 40, "final result");
     }
 
+    /// 集成回归：完全模仿 skynet 的做法——用 C 闭包（带 2 个上值）替换
+    /// coroutine.resume，内部走 lua_tothread + lua_xmove + lua_resume。
+    /// skynet 的 luaB_coresume/timing_resume/auxresume 就是这个形状。
+    #[test]
+    fn test_c_side_resume_replacement() {
+        unsafe extern "C" fn coresume(Lp: *mut std::ffi::c_void) -> c_int {
+            let L = Lp as *mut lua_State;
+            let nargs = lua_gettop(L) - 1;
+            let co = lua_tothread(L, 1);
+            if co.is_null() {
+                lua_pushboolean(L, 0);
+                lua_pushstring(L, c"thread expected".as_ptr());
+                return 2;
+            }
+            // timing_enable 形状：rawget(upvalueindex(1))[co]
+            lua_pushvalue(L, 1);
+            lua_rawget(L, LUA_REGISTRYINDEX - 1);
+            lua_pop(L, 1);
+            // auxresume 形状
+            lua_xmove(L, co, nargs);
+            let mut nres: c_int = 0;
+            let r = lua_resume(co, L, nargs, &mut nres);
+            if r == LUA_OK || r == LUA_YIELD {
+                lua_xmove(co, L, nres);
+                lua_pushboolean(L, 1);
+                lua_insert(L, -(nres + 1));
+                nres + 1
+            } else {
+                lua_xmove(co, L, 1);
+                lua_pushboolean(L, 0);
+                lua_insert(L, -2);
+                2
+            }
+        }
+
+        let mut st = LuaState::default();
+        st.open_selected_libs(0, 0);
+        let L = &mut st as *mut LuaState<'static> as *mut lua_State;
+
+        // 两个上值表 + C 闭包，注册为全局 coresume（= skynet 的 coroutine.resume）
+        lua_createtable(L, 0, 0);
+        lua_createtable(L, 0, 0);
+        lua_pushcclosure(L, coresume, 2);
+        lua_setglobal(L, c"coresume".as_ptr());
+
+        let rc = st.load_buffer(
+            "local co = coroutine.create(function(a)\n\
+             local b = coroutine.yield(a * 3)\n\
+             return b + 1\n\
+             end)\n\
+             local ok, v = coresume(co, 7)\n\
+             assert(ok and v == 21, 'first resume')\n\
+             local ok2, v2 = coresume(co, 5)\n\
+             assert(ok2 and v2 == 6, 'second resume')\n\
+             return 'ok'",
+            "=t",
+        );
+        assert_eq!(rc, 0, "load failed");
+        st.call(0, 1);
+        assert_eq!(st.to_string(-1).as_deref(), Some("ok"));
+    }
+
     #[test]
     fn test_newthread_xmove_index_layout() {
         unsafe extern "C" fn cfn(_: *mut std::ffi::c_void) -> c_int {
