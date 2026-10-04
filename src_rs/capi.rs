@@ -4583,6 +4583,95 @@ mod tests {
         );
     }
 
+    /// 回归：skynet loader.lua → service chunk 的 vararg 传递路径
+    /// （C 路径 resume 的协程内，用 loadfile 得到的 vararg chunk 接收
+    ///  `select(2, table.unpack(args))`）。debug_console 的 arg.n 断言由此保护。
+    #[test]
+    fn test_c_resume_loader_style_varargs() {
+        let mut st = LuaState::default();
+        st.open_selected_libs(0, 0);
+        // 复刻 loader.lua：切词 → loadfile → main(select(2, table.unpack(args)))
+        let rc = st.load_buffer(
+            "local co = coroutine.create(function(svc_args)\n\
+             local args = {}\n\
+             for word in string.gmatch(svc_args, '%S+') do table.insert(args, word) end\n\
+             local chunk = load('local a = table.pack(...) return select(\"#\", ...), a.n, a[1], a[2], a[3]')\n\
+             return chunk(select(2, table.unpack(args)))\n\
+             end)\n\
+             return co",
+            "=t",
+        );
+        assert_eq!(rc, 0, "load_buffer failed");
+        st.call(0, 1);
+
+        let L = &mut st as *mut LuaState<'static> as *mut lua_State;
+        let co = lua_tothread(L, -1);
+        assert!(!co.is_null());
+
+        // 服务参数串 = "debug_console 8000"（skynet launcher 传给 snlua 的形式）
+        lua_pushstring(L, c"debug_console 8000".as_ptr());
+        lua_xmove(L, co, 1);
+
+        let mut nres: c_int = 0;
+        let r = lua_resume(co, L, 1, &mut nres);
+        assert_eq!(r, LUA_OK, "resume must finish");
+        lua_xmove(co, L, nres);
+        assert_eq!(nres, 5, "5 values expected");
+        assert_eq!(
+            lua_tointegerx(L, -5, ptr::null_mut()),
+            1,
+            "select('#', ...)"
+        );
+        assert_eq!(
+            lua_tointegerx(L, -4, ptr::null_mut()),
+            1,
+            "table.pack(...).n"
+        );
+        assert_eq!(lua_tointegerx(L, -3, ptr::null_mut()), 8000, "arg 1");
+        assert_eq!(lua_type(L, -2), LUA_TNIL, "arg 2 must be nil");
+        assert_eq!(lua_type(L, -1), LUA_TNIL, "arg 3 must be nil");
+    }
+
+    /// 回归：C 路径 resume 的协程若是 vararg 函数，`...` 必须精确等于传入的参数个数
+    /// （skynet 的 service chunk 就是 vararg，args 个数错会触发服务内断言）。
+    #[test]
+    fn test_c_resume_vararg_count() {
+        let mut st = LuaState::default();
+        st.open_selected_libs(0, 0);
+        let rc = st.load_buffer(
+            "local co = coroutine.create(function(...)\n\
+             return select('#', ...), (table.pack(...)).n, ...\n\
+             end)\n\
+             return co",
+            "=t",
+        );
+        assert_eq!(rc, 0, "load_buffer failed");
+        st.call(0, 1);
+
+        let L = &mut st as *mut LuaState<'static> as *mut lua_State;
+        let co = lua_tothread(L, -1);
+        assert!(!co.is_null());
+
+        lua_pushinteger(L, 8000);
+        lua_xmove(L, co, 1);
+        let mut nres: c_int = 0;
+        let r = lua_resume(co, L, 1, &mut nres);
+        assert_eq!(r, LUA_OK, "resume must finish");
+        lua_xmove(co, L, nres);
+        assert_eq!(nres, 3, "must return 3 values");
+        assert_eq!(
+            lua_tointegerx(L, -3, ptr::null_mut()),
+            1,
+            "select('#', ...)"
+        );
+        assert_eq!(
+            lua_tointegerx(L, -2, ptr::null_mut()),
+            1,
+            "table.pack(...).n"
+        );
+        assert_eq!(lua_tointegerx(L, -1, ptr::null_mut()), 8000, "first vararg");
+    }
+
     /// 回归：C 路径 resume 的协程在 yield 后必须保留自己的栈（局部变量/帧），
     /// 否则 resume 继续执行时越界读取（CI skynet e2e 实证 read_stack_panic）。
     /// 对应 C：yield 值留在协程栈顶由 lua_xmove 取走，帧原样保留。
@@ -4911,6 +5000,50 @@ mod tests {
 
     /// 测试通过 Lua 代码调用 C 函数（LCFn）。
     /// 验证 op_call 中的 call_c_function 路径。
+    /// 回归：C 函数被 **MULTRET 实参列表**（B==0，最后一个实参是多值表达式）
+    /// 调用时，lua_gettop 必须只数真实实参，不能把调用点之后的"死亡"寄存器算进去。
+    /// CI skynet e2e 实证：coroutine.resume(co, session, source, decode(msg)) 走 B==0，
+    /// gettop 偏大使 lua_xmove 多搬了 session/source，service 收到多余参数。
+    #[test]
+    fn test_c_call_multret_arity() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+        static SEEN: AtomicI32 = AtomicI32::new(-1);
+
+        unsafe extern "C" fn probe(Lp: *mut c_void) -> c_int {
+            let L = Lp as *mut lua_State;
+            SEEN.store(lua_gettop(L), Ordering::SeqCst);
+            lua_pushinteger(L, 0);
+            1
+        }
+
+        let L = luaL_newstate();
+        unsafe {
+            lua_pushcfunction(L, probe);
+            lua_setglobal(L, c"probe".as_ptr());
+
+            // 调用点之后保留活跃局部变量（死寄存器非 nil），并让最后一个实参是多值调用
+            let state = &mut *L;
+            let status = state.load_buffer(
+                "local keep1, keep2, keep3 = 111, 222, 333\n\
+                 local function multi() return 7, 8 end\n\
+                 local r = probe(1, 2, multi())\n\
+                 return r + keep1 + keep2 + keep3",
+                "=test",
+            );
+            assert_eq!(status, 0, "compile failed");
+            let status = state.pcall(0, 1, 0);
+            assert_eq!(status, 0, "execution failed");
+            let result = lua_tointegerx(L, -1, std::ptr::null_mut());
+            assert_eq!(result, 111 + 222 + 333);
+
+            assert_eq!(
+                SEEN.load(Ordering::SeqCst),
+                4,
+                "C function must see exactly 4 args (1, 2, 7, 8), not the caller's dead registers"
+            );
+        }
+    }
+
     #[test]
     fn test_c_function_call_via_lua() {
         // C 函数: add(a, b) = a + b

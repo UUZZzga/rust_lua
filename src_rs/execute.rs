@@ -5739,18 +5739,18 @@ impl VmExecutor {
             is_tailcall: false,
         });
 
-        // 关键修复：truncate 栈到 a + b（参数末尾），使 stack.len() == state.top。
-        // OP_CALL 设置了 state.top = a + b，但 stack.len() 可能更大（包含外层
-        // 函数 a+b 之后的"死亡"寄存器）。lua_gettop 基于 stack.len() 计算，
-        // 如果不 truncate，C 函数会看到错误的参数数量（如 cjson.encode 报
-        // "expected 1 argument"）。
+        // 关键修复：truncate 栈到参数末尾，使 stack.len() == 参数边界。
+        // OP_CALL 设置了 state.top = a + b（b>0 时）；b == 0（MULTRET，实参列表
+        // 以多值表达式结尾）时参数末尾就是 state.top。stack.len() 可能更大（包含
+        // 外层函数在 a+b 之后的"死亡"寄存器）。lua_gettop 基于 stack.len() 计算，
+        // 如果不 truncate，C 函数会看到错误的参数数量：轻则报 "expected N arguments"，
+        // 重则把死寄存器当成实参搬走（skynet 实证：coroutine.resume 的 session/source
+        // 泄漏进协程实参，导致 debug_console 的 arg.n 断言失败）。
         // a+b 之后的寄存器在 CALL 后是"死亡"的（Lua 编译器保证），可安全丢弃。
         // 对应 C Lua 的 L->top.p = ra + b（只设指针，不删内存；Vec 需 truncate）。
-        if b != 0 {
-            let new_top = a + b;
-            if state.stack.len() > new_top {
-                state.stack.truncate(new_top);
-            }
+        let arg_end = if b != 0 { a + b } else { state.top }.max(a + 1);
+        if state.stack.len() > arg_end {
+            state.stack.truncate(arg_end);
         }
 
         // 预留 capacity，但不 push nil（push 会改变 stack.len()，导致 C 函数中
