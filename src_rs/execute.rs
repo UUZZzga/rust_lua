@@ -5752,6 +5752,20 @@ impl VmExecutor {
         if state.stack.len() > arg_end {
             state.stack.truncate(arg_end);
         }
+        // TEMP-DIAG: 记录 b==0 的 C 调用的栈边界（CI 排查用，定位后删除）
+        if b == 0 {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            if N.fetch_add(1, Ordering::Relaxed) < 60 {
+                eprintln!(
+                    "MULTRET-C a={} len={} top={} arg_end={}",
+                    a,
+                    state.stack.len(),
+                    state.top,
+                    arg_end
+                );
+            }
+        }
 
         // 预留 capacity，但不 push nil（push 会改变 stack.len()，导致 C 函数中
         // lua_gettop 返回值偏移）。C 函数需要空间时通过 lua_checkstack 或
