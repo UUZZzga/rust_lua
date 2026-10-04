@@ -2184,7 +2184,16 @@ pub fn c_api_resume<'a>(
         };
         setup_first_resume(state, &temp_thread, &resume_args)
     } else {
-        // 后续 resume: 收集栈顶 nargs 个值作为 resume 参数
+        // 后续 resume: 收集栈顶 nargs 个值作为 resume 参数。
+        // 这些参数是 C 调用方 (auxresume 的 lua_xmove) 已经压到本协程栈上的。
+        // 对应 C 的 lua_resume: firstArg = L->top - n, 然后 luaD_poscall(L, ci,
+        // firstArg, n) **复用**这些已在栈上的值作为 yield 的返回值 —— 不再复制一份。
+        // 因此这里必须先把栈截断到 firstArg，否则 setup_subsequent_resume 的
+        // push 会在原参数之上再放一份副本，使协程的 live top 多出 nargs 个残留值，
+        // 后续任何 vararg 调用 (`f(...)` / `{...}` / `table.concat({...})`) 都会
+        // 把它们当成实参。skynet 的协程池复用正是这条路径:
+        // 上一次 dispatch 的 (session, source, cmd, ...) 会混进下一次 LAUNCH 参数，
+        // 导致 debug_console 的 assert(arg.n <= 2) 失败。
         let stack_len = state.stack.len();
         let start = if stack_len >= nargs {
             stack_len - nargs
@@ -2192,6 +2201,8 @@ pub fn c_api_resume<'a>(
             stack_len
         };
         let resume_args: Vec<TValue> = state.stack[start..].to_vec();
+        state.stack.truncate(start);
+        state.top = start;
         setup_subsequent_resume(state, &co_context, &resume_args)
     };
 

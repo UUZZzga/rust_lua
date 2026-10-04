@@ -4722,6 +4722,90 @@ mod tests {
         );
     }
 
+    /// 回归：C 路径 resume（skynet auxresume 的 lua_xmove + lua_resume）在复用
+    /// 协程时，resume 参数不得被复制一份留在协程栈上。C 的
+    /// `luaD_poscall(L, ci, firstArg, n)` 直接复用已在 firstArg 处的参数值；
+    /// 若实现里再 push 一份副本，协程 live top 会多出 nargs 个残留值，
+    /// 之后任何 vararg 调用 (`f(...)` / `{...}`) 都会把它们当成实参 ——
+    /// skynet 的协程池复用正是如此：上一次 dispatch 的 (session, source, cmd, ...)
+    /// 混进下一次 LAUNCH 参数，debug_console 的 assert(arg.n <= 2) 因此失败。
+    #[test]
+    fn test_c_resume_args_not_duplicated() {
+        let mut st = LuaState::default();
+        st.open_selected_libs(0, 0);
+        let rc = st.load_buffer(
+            "local function handler(session, source, cmd, ...)\n\
+             local n = select('#', ...)\n\
+             local parts = {}\n\
+             for i = 1, n do parts[i] = tostring(select(i, ...)) end\n\
+             return tostring(n) .. ':' .. table.concat(parts, ',')\n\
+             end\n\
+             local co = coroutine.create(function(...)\n\
+             local results = { handler(...) }\n\
+             local f = coroutine.yield('SUSPEND')\n\
+             results[#results + 1] = handler(coroutine.yield())\n\
+             return tostring(f) .. '#' .. table.concat(results, ' ; ')\n\
+             end)\n\
+             return co",
+            "=t",
+        );
+        assert_eq!(rc, 0, "load_buffer failed");
+        st.call(0, 1);
+
+        let L = &mut st as *mut LuaState<'static> as *mut lua_State;
+        let co = lua_tothread(L, -1);
+        assert!(!co.is_null());
+
+        // 第一次 resume: (4, 16777225, 'LAUNCH', 'snlua', 'debug_console', 8000)
+        // 自栈底到栈顶压入（topmost 最后压）
+        lua_pushinteger(L, 4);
+        lua_pushinteger(L, 16777225);
+        lua_pushstring(L, c"LAUNCH".as_ptr());
+        lua_pushstring(L, c"snlua".as_ptr());
+        lua_pushstring(L, c"debug_console".as_ptr());
+        lua_pushinteger(L, 8000);
+        lua_xmove(L, co, 6);
+
+        let mut nres: c_int = 0;
+        let r = lua_resume(co, L, 6, &mut nres);
+        assert_eq!(r, LUA_YIELD, "first resume must yield");
+        assert_eq!(nres, 1);
+        lua_xmove(co, L, nres);
+
+        // resume#2: 传递下一次 dispatch 的处理器（skynet 的 `f = yield "SUSPEND"`），
+        // 本测试中处理器固定，值仅占位
+        lua_pushstring(L, c"dispatch".as_ptr());
+        lua_xmove(L, co, 1);
+        let r = lua_resume(co, L, 1, &mut nres);
+        assert_eq!(r, LUA_YIELD, "second resume yields the next dispatch wait");
+        assert_eq!(nres, 0);
+        lua_xmove(co, L, nres);
+
+        // resume#3: 下一次 dispatch 的参数 (9, 16777230, 'LAUNCH', 'snlua', 'console')
+        // → 由协程体内的 `handler(coroutine.yield())` 以 MULTRET 实参形式接收
+        lua_pushinteger(L, 9);
+        lua_pushinteger(L, 16777230);
+        lua_pushstring(L, c"LAUNCH".as_ptr());
+        lua_pushstring(L, c"snlua".as_ptr());
+        lua_pushstring(L, c"console".as_ptr());
+        lua_xmove(L, co, 5);
+
+        let r = lua_resume(co, L, 5, &mut nres);
+        assert_eq!(r, LUA_OK, "third resume must finish");
+        assert_eq!(nres, 1);
+        lua_xmove(co, L, nres);
+
+        let p = lua_tolstring(L, -1, ptr::null_mut());
+        assert!(!p.is_null());
+        let s = unsafe { std::ffi::CStr::from_ptr(p) }
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            s, "dispatch#3:snlua,debug_console,8000 ; 2:snlua,console",
+            "each resume's varargs must be exact (no leftovers from prior dispatch)"
+        );
+    }
+
     #[test]
     fn test_lua_resume_xmove_roundtrip() {
         let mut st = LuaState::default();
