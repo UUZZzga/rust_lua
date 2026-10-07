@@ -742,7 +742,7 @@ pub(crate) fn float_key_to_int(f: f64) -> Option<i64> {
 mod tests {
     use super::*;
     use crate::objects::{NilKind, TValue};
-    use crate::strings::{lua_string_with_nul, ShortString};
+    use crate::strings::ShortString;
 
     // ------------------------------------------------------------------------
     // 构造 & 容量

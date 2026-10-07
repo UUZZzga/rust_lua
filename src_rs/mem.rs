@@ -13,12 +13,20 @@ use std::alloc::{self, Layout};
 use std::mem::{self, ManuallyDrop};
 use std::ptr::NonNull;
 
-use crate::capi::lua_Alloc;
 use crate::config::LuaMem;
 
 // ============================================================================
 // 自定义分配器 trait
 // ============================================================================
+
+pub type LuaCAlloc = Option<
+    unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+        usize,
+        usize,
+    ) -> *mut std::ffi::c_void,
+>;
 
 pub trait Allocator {
     /// C 风格 realloc 语义：new_size==0 时释放并返回 NULL。
@@ -29,14 +37,14 @@ pub trait Allocator {
 
     /// 若该分配器包装了 C 的 lua_Alloc（如 CapiAllocator），返回 (allocf, ud)
     /// 供 lua_getallocf 取回；纯 Rust 分配器返回 None。
-    fn allocf_parts(&self) -> Option<(lua_Alloc, *mut std::ffi::c_void)> {
+    fn allocf_parts(&self) -> Option<(LuaCAlloc, *mut std::ffi::c_void)> {
         None
     }
 
     /// lua_setallocf 支持：若为 C API 兼容分配器（CapiAllocator）则原地更新
     /// allocf/ud 并返回 true；纯 Rust 分配器返回 false（由调用方整体替换为
     /// CapiAllocator）。
-    fn set_allocf(&mut self, _f: lua_Alloc, _ud: *mut std::ffi::c_void) -> bool {
+    fn set_allocf(&mut self, _f: LuaCAlloc, _ud: *mut std::ffi::c_void) -> bool {
         false
     }
 }
@@ -48,11 +56,11 @@ impl Allocator for Box<dyn Allocator> {
         (**self).alloc(ptr, old_size, new_size, align)
     }
 
-    fn allocf_parts(&self) -> Option<(lua_Alloc, *mut std::ffi::c_void)> {
+    fn allocf_parts(&self) -> Option<(LuaCAlloc, *mut std::ffi::c_void)> {
         (**self).allocf_parts()
     }
 
-    fn set_allocf(&mut self, f: lua_Alloc, ud: *mut std::ffi::c_void) -> bool {
+    fn set_allocf(&mut self, f: LuaCAlloc, ud: *mut std::ffi::c_void) -> bool {
         (**self).set_allocf(f, ud)
     }
 }
@@ -102,7 +110,7 @@ impl Allocator for DefaultAllocator {
 /// 注意：经此分配器分配的内存只能经此释放（C 的 realloc 语义，1 字节对齐），
 /// 不能交给 Box<T>/Vec<T> 的 std drop 路径管理。
 pub struct CapiAllocator {
-    pub allocf: lua_Alloc,
+    pub allocf: LuaCAlloc,
     pub allocf_ud: *mut std::ffi::c_void,
 }
 
@@ -140,11 +148,11 @@ impl Allocator for CapiAllocator {
         }
     }
 
-    fn allocf_parts(&self) -> Option<(lua_Alloc, *mut std::ffi::c_void)> {
+    fn allocf_parts(&self) -> Option<(LuaCAlloc, *mut std::ffi::c_void)> {
         Some((self.allocf, self.allocf_ud))
     }
 
-    fn set_allocf(&mut self, f: lua_Alloc, ud: *mut std::ffi::c_void) -> bool {
+    fn set_allocf(&mut self, f: LuaCAlloc, ud: *mut std::ffi::c_void) -> bool {
         self.allocf = f;
         self.allocf_ud = ud;
         true

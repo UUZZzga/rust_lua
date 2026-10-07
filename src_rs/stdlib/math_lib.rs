@@ -14,8 +14,6 @@
 
 use crate::execute::VmError;
 use crate::objects::{BuiltinFn, NilKind, TValue};
-#[cfg(test)]
-use crate::state::GlobalState;
 use crate::state::LuaState;
 use crate::strings::lua_string_as_str;
 use crate::table::Table;
@@ -1401,7 +1399,7 @@ pub fn open_math_lib<'a>(state: &mut LuaState<'a>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::strings::{lua_string_with_nul, ShortString};
+    use crate::strings::ShortString;
 
     fn make_str(s: &str) -> TValue<'_> {
         TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(

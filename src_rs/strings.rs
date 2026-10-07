@@ -1318,7 +1318,6 @@ mod tests {
 
     #[test]
     fn test_eq_str_long_same_content() {
-        let tb = StringTable::new();
         let long_content = "a".repeat(LUAI_MAXSHORTLEN + 1);
         let a = new_long_str(std::ptr::null(), &long_content);
         let b = new_long_str(std::ptr::null(), &long_content);
@@ -1327,7 +1326,6 @@ mod tests {
 
     #[test]
     fn test_eq_str_long_different() {
-        let tb = StringTable::new();
         let a = new_long_str(std::ptr::null(), &"a".repeat(LUAI_MAXSHORTLEN + 1));
         let b = new_long_str(std::ptr::null(), &"b".repeat(LUAI_MAXSHORTLEN + 1));
         assert!(!eq_str(&a, &b), "不同内容的长字符串必须不等");
@@ -1374,7 +1372,6 @@ mod tests {
 
     #[test]
     fn test_new_long_str_has_hashing_marker() {
-        let tb = StringTable::new();
         let ls = new_long_str(std::ptr::null(), &"a".repeat(LUAI_MAXSHORTLEN + 1));
         assert_eq!(lua_string_len(&ls), LUAI_MAXSHORTLEN + 1);
         match &ls {
@@ -1559,7 +1556,6 @@ mod tests {
     /// LongString: Hash::hash 首次调用自动缓存，后续 O(1) 复用
     #[test]
     fn test_hash_long_string_caches_on_first_call() {
-        let tb = StringTable::new();
         let content = "a".repeat(LUAI_MAXSHORTLEN + 1);
         let ls = new_long_str(std::ptr::null(), &content);
         match &ls {
@@ -1651,7 +1647,6 @@ mod tests {
     /// 大批量长字符串创建时不计算 hash
     #[test]
     fn test_large_long_string_no_eager_hash() {
-        let tb = StringTable::new();
         let content = "a".repeat(LUAI_MAXSHORTLEN + 1);
         for _ in 0..100 {
             let ls = new_long_str(std::ptr::null(), &content);

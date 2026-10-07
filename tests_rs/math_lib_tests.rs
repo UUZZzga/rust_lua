@@ -14,7 +14,6 @@
 
 use lua_rs::cli::Interpreter;
 use lua_rs::objects::TValue;
-use lua_rs::state::GlobalState;
 use lua_rs::state::LuaState;
 use lua_rs::stdlib::math_lib;
 #[cfg(unix)]

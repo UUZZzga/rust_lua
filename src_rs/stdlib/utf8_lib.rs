@@ -12,8 +12,6 @@
 
 use crate::execute::VmError;
 use crate::objects::{BuiltinFn, NilKind, TValue};
-#[cfg(test)]
-use crate::state::GlobalState;
 use crate::state::LuaState;
 use crate::strings::lua_string_as_str;
 use crate::table::Table;

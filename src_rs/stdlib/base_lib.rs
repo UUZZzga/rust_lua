@@ -17,8 +17,6 @@ use const_format::formatcp;
 use crate::execute::VmError;
 use crate::gc::GCObjectHeader;
 use crate::objects::{LClosure, NilKind, Proto, TValue, UpVal, UpValVec};
-#[cfg(test)]
-use crate::state::GlobalState;
 use crate::state::LuaState;
 use crate::strings::{lua_string_as_str, lua_string_eq, lua_string_len};
 use crate::table::Table;

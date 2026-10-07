@@ -524,15 +524,15 @@ pub fn parse_dump(data: &[u8]) -> Result<DumpedFunction, String> {
 pub unsafe fn compile_with_c_lua(source: &[u8]) -> Result<Vec<u8>, String> {
     #[cfg(feature = "cmp_c")]
     {
-        let L = lua_ffi::luaL_newstate();
-        if L.is_null() {
+        let state = lua_ffi::luaL_newstate();
+        if state.is_null() {
             return Err("failed to create lua state".to_string());
         }
-        lua_ffi::luaL_checkversion(L);
-        lua_ffi::luaL_openselectedlibs(L, 0, 0);
+        lua_ffi::luaL_checkversion(state);
+        lua_ffi::luaL_openselectedlibs(state, 0, 0);
 
         let load_result = lua_ffi::luaL_loadbufferx(
-            L,
+            state,
             source.as_ptr() as *const i8,
             source.len(),
             c"=test".as_ptr(),
@@ -540,16 +540,16 @@ pub unsafe fn compile_with_c_lua(source: &[u8]) -> Result<Vec<u8>, String> {
         );
 
         if load_result != lua_ffi::LUA_OK {
-            let err_ptr = lua_ffi::lua_tolstring(L, -1, ptr::null_mut());
+            let err_ptr = lua_ffi::lua_tolstring(state, -1, ptr::null_mut());
             let err = lua_ffi::from_cstr(err_ptr).unwrap_or("unknown error");
-            lua_ffi::lua_close(L);
+            lua_ffi::lua_close(state);
             return Err(format!("C compile error: {}", err));
         }
 
         let dump_data = Box::into_raw(Box::new(Vec::<u8>::new()));
 
         extern "C" fn writer(
-            _L: *mut lua_ffi::lua_State,
+            _state: *mut lua_ffi::lua_State,
             p: *const c_void,
             sz: usize,
             ud: *mut c_void,
@@ -563,17 +563,17 @@ pub unsafe fn compile_with_c_lua(source: &[u8]) -> Result<Vec<u8>, String> {
             0
         }
 
-        let result = lua_ffi::lua_dump(L, writer, dump_data as *mut c_void, 0);
+        let result = lua_ffi::lua_dump(state, writer, dump_data as *mut c_void, 0);
 
         if result != 0 {
             let _ = Box::from_raw(dump_data);
-            lua_ffi::lua_close(L);
+            lua_ffi::lua_close(state);
             return Err("dump failed".to_string());
         }
 
         let result_data = *Box::from_raw(dump_data);
 
-        lua_ffi::lua_close(L);
+        lua_ffi::lua_close(state);
 
         Ok(result_data)
     }

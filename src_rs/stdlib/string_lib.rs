@@ -11,8 +11,6 @@
 use crate::alloc::SimpleRc;
 use crate::execute::{arg_error, VmError};
 use crate::objects::{BuiltinFn, BuiltinFnPtr, LuaType, NilKind, RustClosure, TValue};
-#[cfg(test)]
-use crate::state::GlobalState;
 use crate::state::LuaState;
 use crate::strings::{lua_string_as_str, lua_string_len, new_lstr_bytes, ArcRc};
 use crate::table::Table;
@@ -4293,10 +4291,7 @@ fn arith_op<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{
-        objects::LuaType,
-        strings::{lua_string_with_nul, ShortString},
-    };
+    use crate::{objects::LuaType, strings::ShortString};
 
     #[test]
     fn test_open_string_lib() {

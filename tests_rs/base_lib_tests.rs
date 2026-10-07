@@ -11,7 +11,6 @@
 
 use lua_rs::cli::Interpreter;
 use lua_rs::objects::{NilKind, TValue};
-use lua_rs::state::GlobalState;
 use lua_rs::state::LuaState;
 use lua_rs::stdlib::base_lib;
 use lua_rs::table::Table;

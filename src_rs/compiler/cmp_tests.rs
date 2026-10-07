@@ -3,13 +3,18 @@ mod compiler_compare_tests {
     use crate::compiler::bytecode_dump;
     use crate::opcodes;
 
+    /// 创建与测试进程同生命周期的 state（泄漏）。
+    ///
+    /// 编译产物（`Proto` 及其常量）持有由该 state 的 allocator 分配的长字符串，
+    /// 而 LongString 的释放依赖 allocator 仍存活。对应 C 语义：Proto 不会比
+    /// lua_State 活得久。这里保证 allocator 在所有 Proto 释放之后才失效。
+    fn leaked_state() -> &'static mut crate::state::LuaState<'static> {
+        Box::leak(Box::new(crate::state::LuaState::default()))
+    }
+
     fn compile_rust(source: &str, name: Option<&str>) -> crate::objects::Proto<'static> {
-        crate::compiler::compile(
-            &mut crate::state::LuaState::default(),
-            source,
-            name.unwrap_or("=test"),
-        )
-        .expect("Rust compile failed")
+        crate::compiler::compile(leaked_state(), source, name.unwrap_or("=test"))
+            .expect("Rust compile failed")
     }
 
     unsafe fn compile_c(source: &str) -> bytecode_dump::DumpedFunction {
@@ -1784,11 +1789,8 @@ assert(a == 2)
     }
 
     fn assert_compile_ok(source: &str, name: Option<&str>) {
-        let result = crate::compiler::compile(
-            &mut crate::state::LuaState::default(),
-            source,
-            name.unwrap_or("=test_assert"),
-        );
+        let result =
+            crate::compiler::compile(leaked_state(), source, name.unwrap_or("=test_assert"));
         assert!(result.is_ok(), "Compile failed: {:?}", result.err());
     }
 

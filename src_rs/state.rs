@@ -510,7 +510,7 @@ impl<'a> LuaState<'a> {
         io: &'a mut dyn crate::mock::io_mock::Io,
         allocator: Box<dyn Allocator>,
     ) -> Self {
-        let mut owner = Box::new(GlobalState::new_shared(io, allocator));
+        let owner = Box::new(GlobalState::new_shared(io, allocator));
         let mut s = Self::empty_thread();
         s.stack = GlobalState::init_stack();
         s.top = s.stack.len();

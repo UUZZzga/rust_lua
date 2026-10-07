@@ -1533,8 +1533,7 @@ extern "C-unwind" fn lua_error(L: *mut lua_State) -> c_int {
 /// 由 lua_newstate / lua_setallocf 写入 GlobalState.mem.allocator（CapiAllocator），
 /// lmem 层的 C 风格分配原语经它执行；lua_getallocf 返回给 C 代码
 /// （skynet 用 ud 存 snlua 指针，lua_resumeX 经 lua_getallocf 取回）。
-pub type lua_Alloc =
-    Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize) -> *mut c_void>;
+pub type lua_Alloc = crate::mem::LuaCAlloc;
 
 #[no_mangle]
 pub extern "C" fn lua_getallocf(L: *mut lua_State, ud: *mut *mut c_void) -> lua_Alloc {

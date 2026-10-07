@@ -7876,7 +7876,7 @@ fn format_float(f: f64) -> String {
 mod tests {
     use super::*;
     use crate::gc::GCObjectHeader;
-    use crate::state::{GlobalShared, GlobalState};
+    use crate::state::GlobalShared;
     use crate::strings::StringTable;
     use crate::{gc::GCState, objects::NilKind};
     use std::rc::Rc;

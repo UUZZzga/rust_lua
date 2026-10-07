@@ -2695,9 +2695,7 @@ mod tests {
     use super::*;
     use crate::{
         alloc::{SimpleArc, SimpleRc},
-        strings::{
-            lua_string_is_empty, lua_string_len, lua_string_with_nul, LongString, ShortString,
-        },
+        strings::{lua_string_is_empty, lua_string_len, LongString, ShortString},
     };
 
     // ========================================================================

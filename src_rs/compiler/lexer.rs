@@ -1322,6 +1322,12 @@ impl<'a, 'b> Drop for LexState<'a, 'b> {
     /// 供下一次编译复用。避免 glibc 因频繁分配／释放小对象产生的堆碎片和页缓存膨胀。
     fn drop(&mut self) {
         if let Some(mut boxed) = self._cache.take() {
+            // `scanner_strings` 的值是由本次编译所用 state 的 allocator 分配的
+            // 长字符串。thread_local 缓存比 LuaState 存活更久,若把这些值回收到
+            // 缓存中,它们会在 allocator 释放之后才被 drop(use-after-free)。
+            // 因此这里先清空(保留 HashMap 容量供下次复用),让 LongString 在
+            // state 仍然存活时释放。各调用点返回的是 clone,引用计数不受影响。
+            self.scanner_strings.clear();
             boxed.errors = std::mem::take(&mut self.errors);
             boxed.scanner_strings = std::mem::take(&mut self.scanner_strings);
             boxed.token_text = std::mem::take(&mut self.token_text);
