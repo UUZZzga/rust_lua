@@ -158,6 +158,12 @@ impl OpCode {
             None
         }
     }
+
+    /// 操作码名称（如 "MOVE"、"ADDK"）— 对应 C 的 luaP_opnames
+    #[cfg_attr(not(size_optimized), inline)]
+    pub fn name(self) -> &'static str {
+        OPCODE_NAMES[self as usize]
+    }
 }
 
 // ============================================================================
@@ -478,7 +484,9 @@ pub fn create_vabck(o: OpCode, a: i32, b: i32, c: i32, k: i32) -> Instruction {
         | ((k as u32) << POS_K)
 }
 
-pub static OPNAMES: &[&str] = &[
+/// 操作码名称表 — 对应 C 的 luaP_opnames（lopnames.h）。
+/// 定长数组：若新增 OpCode 变体而漏更此表，将直接编译失败。
+pub static OPCODE_NAMES: [&str; NUM_OPCODES] = [
     "MOVE",
     "LOADI",
     "LOADF",
@@ -630,5 +638,16 @@ mod tests {
         assert_eq!(OpCode::from_u8(0), Some(OpCode::MOVE));
         assert_eq!(OpCode::from_u8(84), Some(OpCode::EXTRAARG));
         assert_eq!(OpCode::from_u8(85), None);
+    }
+
+    #[test]
+    fn test_opcode_names() {
+        for i in 0..NUM_OPCODES as u8 {
+            let op = OpCode::from_u8(i).unwrap();
+            assert_eq!(OPCODE_NAMES[i as usize], op.name());
+        }
+        assert_eq!(OpCode::MOVE.name(), "MOVE");
+        assert_eq!(OpCode::EXTRAARG.name(), "EXTRAARG");
+        assert_eq!(OpCode::CALL.name(), "CALL");
     }
 }

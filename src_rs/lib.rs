@@ -13,11 +13,8 @@ pub mod config;
 //
 pub mod alloc;
 
-// 安全包装层 —— 操作码（lopcodes.h / lopcodes.cpp）
+// 安全包装层 —— 操作码（lopcodes.h / lopcodes.cpp，含 luaP_opnames 名称表）
 pub mod opcodes;
-
-// 安全包装层 —— 操作码名称（lopnames.h）
-pub mod opnames;
 
 // 安全包装层 —— 解析器（lparser.h / lparser.cpp）— 仅 cmp_c feature 时编译
 #[cfg(feature = "cmp_c")]

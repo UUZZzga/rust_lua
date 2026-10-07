@@ -4,8 +4,8 @@ use crate::lua_ffi;
 use crate::objects::{LocVar, UpvalDesc};
 use crate::opcodes::{
     self, get_opcode, get_opmode, getarg, getarg_a, getarg_b, getarg_bx, getarg_c, getarg_sbx,
-    getarg_sj, getarg_vb, getarg_vc, testarg_k, OFFSET_sJ, OpCode, OpMode, OPNAMES, POS_A, POS_B,
-    POS_C, POS_K, POS_VB, POS_VC, SIZE_A, SIZE_BX, TM_EVENT_NAMES,
+    getarg_sj, getarg_vb, getarg_vc, testarg_k, OFFSET_sJ, OpCode, OpMode, POS_A, POS_B, POS_C,
+    POS_K, POS_VB, POS_VC, SIZE_A, SIZE_BX, TM_EVENT_NAMES,
 };
 use crate::strings::{lua_string_as_str, LongString};
 #[cfg(test)]
@@ -900,7 +900,7 @@ fn normalize_instruction(raw: u32) -> String {
     let bx = getarg_bx(raw);
     let sbx = getarg_sbx(raw);
     let sj = getarg_sj(raw);
-    let op_name = OPNAMES[opcode as usize];
+    let op_name = opcode.name();
 
     // Use format_operands to get the correct operand formatting,
     // then replace constant indices with "K".
@@ -1151,7 +1151,7 @@ pub fn format_instruction(raw: u32) -> String {
     let sj = getarg_sj(op);
 
     let opcode = get_opcode(op);
-    let op_name = OPNAMES[opcode as usize];
+    let op_name = opcode.name();
     let operands = format_operands(op, a, b, c, bx, sbx, sj, k);
     format!("{}\t{}", op_name, operands)
 }
@@ -1167,7 +1167,7 @@ pub fn dump_instructions(code: &[u32]) -> String {
 pub fn format_c_instruction(inst: &DumpInstruction, constants: &[DumpConstant]) -> String {
     let raw = dump_inst_to_raw(inst);
     let opcode = get_opcode(raw);
-    let op_name = OPNAMES[opcode as usize];
+    let op_name = opcode.name();
     let a = inst.a as i32;
     let b = inst.b as i32;
     let c = inst.c as i32;
