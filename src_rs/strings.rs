@@ -18,11 +18,23 @@
 //! - **多线程安全**：StringTable 使用 `RefCell/RwLock` 保护 HashTable，读可并发、写互斥
 //!   LongString 使用 `AtomicU64`/`AtomicU8` 实现 Sync 内部可变性
 
-use std::alloc::{alloc, handle_alloc_error};
+use std::alloc::{alloc, dealloc, handle_alloc_error};
 use std::cell::Cell;
 use std::fmt::{self, Debug, Formatter};
 use std::os::raw::c_char;
 
+use crate::mem::Allocator;
+use crate::objects::TValue;
+
+/// LongString 的 allocator 槽指针：指向 `Box<dyn Allocator>` 的稳定地址
+/// （即 `&g.mem.allocator`，GlobalState 被 Box 持有 → 地址稳定；
+/// lua_setallocf 原地替换 Box 内容后自动跟随当前 allocator，
+/// 符合 C Lua「释放走当前 allocf」语义）。null 表示无 allocator
+/// （测试/构造期），回退 std::alloc。
+///
+/// 用 `*const`（而非 `*mut`）以便通过 `&self` 取得槽，避免与
+/// `&self.string_table` 的可变借用冲突（`Allocator::alloc` 已是 `&self`）。
+pub type AllocSlot = *const Box<dyn Allocator>;
 // ============================================================================
 // RwLock 抽象层 — 根据 `threaded` feature 切换实现
 // ============================================================================
@@ -108,7 +120,6 @@ pub type ArcRcHeader<T> = <ArcRc<T> as IsArcRc>::Header;
 use hashbrown::HashTable;
 
 use crate::alloc::{IsArcRc, RcPayload, SimpleRc, SimpleRcHeader};
-use crate::objects::TValue;
 
 // ============================================================================
 // 规约：常量
@@ -227,11 +238,12 @@ impl ArcRc<ShortString> {
 
 /// 长字符串 — 长度 > 40 字节，不进行内部化，支持惰性哈希。
 ///
-/// `contents: String` 内含长度信息，无需独立的 `lnglen` 字段。
+/// `data` 内含长度信息（len 字段），无需独立的 `lnglen` 字段。
 /// - `Hash::hash` 首次调用时自动计算并缓存 hash，后续 O(1) 复用
-/// ShortString 的固定前缀（Sized）
+/// 首字段 `alloc` 为 MemState allocator 槽指针（块由它分配/释放）。
 #[repr(C)]
 pub struct LongStringFixed {
+    pub alloc: AllocSlot,
     pub hash: Cell<u64>,
     pub len: u32,
     pub extra: Cell<u8>,
@@ -240,6 +252,7 @@ pub struct LongStringFixed {
 #[derive(Debug)]
 #[repr(C)]
 pub struct LongString {
+    pub alloc: AllocSlot,
     pub hash: Cell<u64>,
     pub len: u32,
     pub extra: Cell<u8>,
@@ -267,17 +280,30 @@ unsafe impl RcPayload for LongString {
     unsafe fn drop_payload(_: *mut u8) {}
 
     unsafe fn payload_size(p: *const u8) -> usize {
-        let len = *(p.add(8) as *const u32) as usize;
-        // 必须与 new_lstr 的分配 payload_size 一致（fixed = offset_of!(extra)+1 = 13，
-        // len 字段 = content+1 → 13+len = fixed+content+1 ✓）。旧实现用
-        // ShortString::FIXED_SIZE(16)+len，与分配差 4 — Miri 实证 dealloc layout
-        // 不匹配（104 vs 112, incorrect layout on deallocation）。
+        let len = *(p.add(std::mem::offset_of!(LongString, len)) as *const u32) as usize;
+        // 必须与 new_lstr 的分配 payload_size 一致（fixed = offset_of!(extra)+1，
+        // len 字段 = content+1 → fixed+len = fixed+content+1 ✓）。
         std::mem::offset_of!(LongString, extra) + 1 + len
+    }
+
+    /// LongString 块由 MemState allocator 分配（new_lstr），释放同样路由回去。
+    /// 槽为 null（测试/构造期）时回退 std dealloc（与分配路径一致）。
+    unsafe fn free_block(base: *mut u8, payload: *mut u8, layout: std::alloc::Layout) {
+        let slot = *(payload as *const AllocSlot);
+        if slot.is_null() {
+            dealloc(base, layout);
+        } else {
+            let got = (&*slot).alloc(base, layout.size(), 0, layout.align());
+            debug_assert!(got.is_null(), "LongString 释放应返回 NULL");
+        }
     }
 }
 
 impl SimpleRc<LongString> {
-    pub fn new_lstr(hash: Option<u64>, data: &[u8]) -> Self {
+    /// 创建长字符串块。`alloc_slot` 为 MemState allocator 槽（见 [`AllocSlot`]）：
+    /// 非 null 时分配/释放均路由到该 allocator（对应 C Lua 的 allocf）；
+    /// null 时回退 std::alloc。
+    pub fn new_lstr(alloc_slot: AllocSlot, hash: Option<u64>, data: &[u8]) -> Self {
         debug_assert!(data.len() <= u32::MAX as usize, "LongString 长度超 u32");
 
         let tmp: SimpleRc<LongString> = unsafe {
@@ -285,10 +311,14 @@ impl SimpleRc<LongString> {
             let fixed = std::mem::offset_of!(LongString, extra) + 1;
             let payload_size = fixed + data.len() + 1;
 
-            // 1) 一次分配 header + payload
+            // 1) 一次分配 header + payload（经 MemState allocator，与 free_block 对应）
             let header_offset = payload_offset(align);
             let layout = block_layout(payload_size, align);
-            let base = alloc(layout);
+            let base = if alloc_slot.is_null() {
+                alloc(layout)
+            } else {
+                (&*alloc_slot).alloc(std::ptr::null_mut(), 0, layout.size(), align)
+            };
             if base.is_null() {
                 handle_alloc_error(layout);
             }
@@ -298,6 +328,7 @@ impl SimpleRc<LongString> {
 
             // 3) 写固定部分（严格按结构体字段顺序）
             let p = base.add(header_offset);
+            std::ptr::write(p as *mut AllocSlot, alloc_slot);
             match hash {
                 Some(hash) => {
                     std::ptr::write(
@@ -1059,31 +1090,36 @@ pub fn lua_string_hash(str: &TValue) -> u64 {
 // ============================================================================
 
 /// 创建一个长字符串对象，不预先计算哈希（惰性）。
-pub fn new_long_str<'a>(str: &str) -> TValue<'a> {
+/// 长字符串块由 `alloc`（MemState allocator 槽，通常 `state.alloc_slot()`）分配/释放。
+pub fn new_long_str<'a>(alloc: AllocSlot, str: &str) -> TValue<'a> {
     debug_assert!(
         str.len() > LUAI_MAXSHORTLEN,
         "长字符串长度必须大于 LUAI_MAXSHORTLEN"
     );
-    TValue::LongStr(SimpleRc::<LongString>::new_lstr(None, str.as_bytes()))
+    TValue::LongStr(SimpleRc::<LongString>::new_lstr(
+        alloc,
+        None,
+        str.as_bytes(),
+    ))
 }
 
 /// 创建一个长字符串对象，直接 consume 传入的 String，避免 clone。
 /// 用于 str_format 等已知结果为长字符串且不再需要原 String 的场景。
 /// perf: 消除 new_long_str 中 with_nul 的 to_string() clone（constructs.lua 热点）。
-pub fn new_long_str_from_string<'a>(s: String) -> TValue<'a> {
+pub fn new_long_str_from_string<'a>(alloc: AllocSlot, s: String) -> TValue<'a> {
     debug_assert!(
         s.len() > LUAI_MAXSHORTLEN,
         "长字符串长度必须大于 LUAI_MAXSHORTLEN"
     );
-    TValue::LongStr(SimpleRc::<LongString>::new_lstr(None, &s.as_bytes()))
+    TValue::LongStr(SimpleRc::<LongString>::new_lstr(alloc, None, &s.as_bytes()))
 }
 
-pub fn new_long_bytes<'a>(bytes: Vec<u8>) -> TValue<'a> {
+pub fn new_long_bytes<'a>(alloc: AllocSlot, bytes: Vec<u8>) -> TValue<'a> {
     debug_assert!(
         bytes.len() > LUAI_MAXSHORTLEN,
         "长字符串长度必须大于 LUAI_MAXSHORTLEN"
     );
-    TValue::LongStr(SimpleRc::<LongString>::new_lstr(None, &bytes))
+    TValue::LongStr(SimpleRc::<LongString>::new_lstr(alloc, None, &bytes))
 }
 
 /// 确保长字符串有哈希值（惰性计算）。
@@ -1098,33 +1134,33 @@ pub fn ensure_long_hash(ls: &LongString) -> u64 {
     ls.hash.get()
 }
 #[cfg_attr(not(size_optimized), inline)]
-pub fn new_lstr<'a>(table: &StringTable, str: &str) -> TValue<'a> {
+pub fn new_lstr<'a>(alloc: AllocSlot, table: &StringTable, str: &str) -> TValue<'a> {
     if str.len() <= LUAI_MAXSHORTLEN {
         table.intern_value(str)
     } else {
-        new_long_str(str)
+        new_long_str(alloc, str)
     }
 }
 
 /// 从 String 创建 LuaString，长字符串路径直接 consume 避免 clone。
 /// 短字符串仍走 intern（需要查表去重，intern 未命中时内部会 clone，但短串开销小）。
 #[cfg_attr(not(size_optimized), inline)]
-pub fn new_lstr_from_string<'a>(table: &StringTable, s: String) -> TValue<'a> {
+pub fn new_lstr_from_string<'a>(alloc: AllocSlot, table: &StringTable, s: String) -> TValue<'a> {
     if s.len() <= LUAI_MAXSHORTLEN {
         table.intern_value(&s)
     } else {
-        new_long_str_from_string(s)
+        new_long_str_from_string(alloc, s)
     }
 }
 
 /// 从任意字节创建 LuaString（8-bit clean，绕过 UTF-8 验证）。
 /// 用于 C API 的 lua_pushlstring/lua_pushstring 等需要保留原始字节的场景。
 #[cfg_attr(not(size_optimized), inline)]
-pub fn new_lstr_bytes<'a>(table: &StringTable, bytes: &[u8]) -> TValue<'a> {
+pub fn new_lstr_bytes<'a>(alloc: AllocSlot, table: &StringTable, bytes: &[u8]) -> TValue<'a> {
     if bytes.len() <= LUAI_MAXSHORTLEN {
         table.intern_bytes(bytes)
     } else {
-        new_long_bytes(bytes.to_vec())
+        new_long_bytes(alloc, bytes.to_vec())
     }
 }
 
@@ -1282,16 +1318,18 @@ mod tests {
 
     #[test]
     fn test_eq_str_long_same_content() {
+        let tb = StringTable::new();
         let long_content = "a".repeat(LUAI_MAXSHORTLEN + 1);
-        let a = new_long_str(&long_content);
-        let b = new_long_str(&long_content);
+        let a = new_long_str(std::ptr::null(), &long_content);
+        let b = new_long_str(std::ptr::null(), &long_content);
         assert!(eq_str(&a, &b), "相同内容的长字符串必须相等");
     }
 
     #[test]
     fn test_eq_str_long_different() {
-        let a = new_long_str(&"a".repeat(LUAI_MAXSHORTLEN + 1));
-        let b = new_long_str(&"b".repeat(LUAI_MAXSHORTLEN + 1));
+        let tb = StringTable::new();
+        let a = new_long_str(std::ptr::null(), &"a".repeat(LUAI_MAXSHORTLEN + 1));
+        let b = new_long_str(std::ptr::null(), &"b".repeat(LUAI_MAXSHORTLEN + 1));
         assert!(!eq_str(&a, &b), "不同内容的长字符串必须不等");
     }
 
@@ -1299,7 +1337,11 @@ mod tests {
     fn test_eq_str_short_vs_long() {
         let tb = StringTable::new();
         let short = tb.intern_value("hello");
-        let long = TValue::LongStr(SimpleRc::<LongString>::new_lstr(None, "hello".as_bytes()));
+        let long = TValue::LongStr(SimpleRc::<LongString>::new_lstr(
+            std::ptr::null_mut(),
+            None,
+            "hello".as_bytes(),
+        ));
         assert!(!eq_str(&short, &long), "不同类型（短 vs 长）必须不等");
     }
 
@@ -1310,7 +1352,7 @@ mod tests {
     #[test]
     fn test_new_lstr_short() {
         let tb = StringTable::new();
-        let s = new_lstr(&tb, "hello");
+        let s = new_lstr(std::ptr::null(), &tb, "hello");
         assert!(matches!(s, TValue::ShortStr(_)));
         assert_eq!(lua_string_as_str(&s), "hello");
         assert_eq!(lua_string_len(&s), 5);
@@ -1320,7 +1362,7 @@ mod tests {
     fn test_new_lstr_long() {
         let tb = StringTable::new();
         let content = "a".repeat(LUAI_MAXSHORTLEN + 1);
-        let s = new_lstr(&tb, &content);
+        let s = new_lstr(std::ptr::null(), &tb, &content);
         assert!(matches!(s, TValue::LongStr(_)));
         assert_eq!(lua_string_as_str(&s), content);
         assert_eq!(lua_string_len(&s), LUAI_MAXSHORTLEN + 1);
@@ -1332,7 +1374,8 @@ mod tests {
 
     #[test]
     fn test_new_long_str_has_hashing_marker() {
-        let ls = new_long_str(&"a".repeat(LUAI_MAXSHORTLEN + 1));
+        let tb = StringTable::new();
+        let ls = new_long_str(std::ptr::null(), &"a".repeat(LUAI_MAXSHORTLEN + 1));
         assert_eq!(lua_string_len(&ls), LUAI_MAXSHORTLEN + 1);
         match &ls {
             TValue::LongStr(ls) => assert_eq!(ls.extra.get(), 0, "新长字符串 extra 应为 0"),
@@ -1346,7 +1389,8 @@ mod tests {
 
     #[test]
     fn test_ensure_long_hash_computes_on_first_call() {
-        let mut ls = SimpleRc::<LongString>::new_lstr(None, "a".repeat(50).as_bytes());
+        let mut ls =
+            SimpleRc::<LongString>::new_lstr(std::ptr::null(), None, "a".repeat(50).as_bytes());
         let hash = ensure_long_hash(&mut ls);
         assert_eq!(ls.extra.get(), 1, "extra 应为 1（标记已计算哈希）");
         assert_eq!(hash, ls.hash.get(), "返回的哈希应与存储的一致");
@@ -1354,7 +1398,8 @@ mod tests {
 
     #[test]
     fn test_ensure_long_hash_idempotent() {
-        let mut ls = SimpleRc::<LongString>::new_lstr(Some(0), "a".repeat(50).as_bytes());
+        let mut ls =
+            SimpleRc::<LongString>::new_lstr(std::ptr::null(), Some(0), "a".repeat(50).as_bytes());
         let hash_before = ls.hash.get();
         let hash = ensure_long_hash(&mut ls);
         assert_eq!(hash, hash_before, "已有哈希不应重新计算");
@@ -1514,8 +1559,9 @@ mod tests {
     /// LongString: Hash::hash 首次调用自动缓存，后续 O(1) 复用
     #[test]
     fn test_hash_long_string_caches_on_first_call() {
+        let tb = StringTable::new();
         let content = "a".repeat(LUAI_MAXSHORTLEN + 1);
-        let ls = new_long_str(&content);
+        let ls = new_long_str(std::ptr::null(), &content);
         match &ls {
             TValue::LongStr(inner) => {
                 assert_eq!(
@@ -1554,8 +1600,12 @@ mod tests {
     #[test]
     fn test_hash_mixed_extra_same_content() {
         let content = "a".repeat(LUAI_MAXSHORTLEN + 1).into_bytes();
-        let unhashed = TValue::LongStr(SimpleRc::<LongString>::new_lstr(None, &content));
-        let ls = SimpleRc::<LongString>::new_lstr(None, &content);
+        let unhashed = TValue::LongStr(SimpleRc::<LongString>::new_lstr(
+            std::ptr::null_mut(),
+            None,
+            &content,
+        ));
+        let ls = SimpleRc::<LongString>::new_lstr(std::ptr::null(), None, &content);
         ensure_long_hash(&ls);
         let hashed = TValue::LongStr(ls);
 
@@ -1580,8 +1630,13 @@ mod tests {
     #[test]
     fn test_hash_same_content_different_hash_field() {
         let h = rust_hash("hello");
-        let ls1 = TValue::LongStr(SimpleRc::<LongString>::new_lstr(None, "hello".as_bytes()));
+        let ls1 = TValue::LongStr(SimpleRc::<LongString>::new_lstr(
+            std::ptr::null_mut(),
+            None,
+            "hello".as_bytes(),
+        ));
         let ls2 = TValue::LongStr(SimpleRc::<LongString>::new_lstr(
+            std::ptr::null_mut(),
             Some(h),
             "hello".as_bytes(),
         ));
@@ -1596,9 +1651,10 @@ mod tests {
     /// 大批量长字符串创建时不计算 hash
     #[test]
     fn test_large_long_string_no_eager_hash() {
+        let tb = StringTable::new();
         let content = "a".repeat(LUAI_MAXSHORTLEN + 1);
         for _ in 0..100 {
-            let ls = new_long_str(&content);
+            let ls = new_long_str(std::ptr::null(), &content);
             if let TValue::LongStr(inner) = &ls {
                 assert_eq!(inner.hash.get(), 0, "所有长字符串创建时不计算 hash");
                 assert_eq!(inner.extra.get(), 0);
@@ -1614,7 +1670,7 @@ mod tests {
         let short1 = tb.intern_value("key1");
         let short2 = tb.intern_value("key2");
         let long_content = "a".repeat(LUAI_MAXSHORTLEN + 1);
-        let long1 = new_long_str(&long_content);
+        let long1 = new_long_str(std::ptr::null(), &long_content);
 
         let mut map: HashMap<TValue, &str> = HashMap::new();
         map.insert(short1.clone(), "value1");
@@ -1622,7 +1678,7 @@ mod tests {
         map.insert(long1.clone(), "value3");
 
         let short1_lookup = tb.intern_value("key1");
-        let long1_lookup = new_long_str(&long_content);
+        let long1_lookup = new_long_str(std::ptr::null(), &long_content);
 
         assert_eq!(map.get(&short1_lookup), Some(&"value1"));
         assert_eq!(map.get(&long1_lookup), Some(&"value3"));
@@ -1635,8 +1691,8 @@ mod tests {
     #[test]
     fn test_ensure_long_hash_same_content() {
         let content = "a".repeat(LUAI_MAXSHORTLEN + 1).into_bytes();
-        let mut a = SimpleRc::<LongString>::new_lstr(None, &content);
-        let mut b = SimpleRc::<LongString>::new_lstr(None, &content);
+        let mut a = SimpleRc::<LongString>::new_lstr(std::ptr::null(), None, &content);
+        let mut b = SimpleRc::<LongString>::new_lstr(std::ptr::null(), None, &content);
 
         let h0 = ensure_long_hash(&mut a);
         let h1 = ensure_long_hash(&mut b);
@@ -1647,5 +1703,46 @@ mod tests {
 
         let h0_again = ensure_long_hash(&mut a);
         assert_eq!(h0, h0_again, "再次调用不重复计算");
+    }
+
+    /// LongString 块的分配/释放均路由到 MemState allocator（对应 C 的 allocf）
+    #[test]
+    fn test_long_string_routes_through_allocator() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        use crate::mem::{Allocator, DefaultAllocator};
+
+        struct CountingAllocator {
+            n: Rc<Cell<usize>>,
+        }
+        impl Allocator for CountingAllocator {
+            fn alloc(&self, ptr: *mut u8, osize: usize, nsize: usize, align: usize) -> *mut u8 {
+                if nsize > osize {
+                    self.n.set(self.n.get() + 1);
+                }
+                DefaultAllocator.alloc(ptr, osize, nsize, align)
+            }
+        }
+
+        let counter = Rc::new(Cell::new(0usize));
+        let boxed: Box<dyn Allocator> = Box::new(CountingAllocator {
+            n: Rc::clone(&counter),
+        });
+        let slot: AllocSlot = &boxed;
+        let content = "a".repeat(100);
+
+        // 分配走 allocator（nsize > osize: 0 → block_size）
+        let ls = SimpleRc::<LongString>::new_lstr(slot, None, content.as_bytes());
+        assert_eq!(counter.get(), 1);
+
+        // clone 不触发分配
+        let c = ls.clone();
+        assert_eq!(counter.get(), 1);
+        drop(c);
+
+        // 释放走 allocator（nsize == 0 不计数）
+        drop(ls);
+        assert_eq!(counter.get(), 1);
     }
 }

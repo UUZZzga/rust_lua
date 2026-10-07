@@ -422,7 +422,7 @@ impl<'a, 'b> LexState<'a, 'b> {
             if let Some(existing) = self.scanner_strings.get(s).cloned() {
                 return existing.to_value();
             }
-            let ls = crate::strings::new_long_str(s);
+            let ls = crate::strings::new_long_str(self.state.alloc_slot(), s);
             self.scanner_strings.insert(s.to_string(), ls.as_str());
             ls.as_str()
         }

@@ -1300,7 +1300,11 @@ fn g_read<'a>(
     if nargs == 0 {
         // 默认读一行
         match read_line(f, true) {
-            Some(buf) => results.push(crate::strings::new_lstr_bytes(&state.string_table, &buf)),
+            Some(buf) => results.push(crate::strings::new_lstr_bytes(
+                state.alloc_slot(),
+                &state.string_table,
+                &buf,
+            )),
             None => results.push(TValue::Nil(NilKind::Strict)),
         }
         success = !results[0].is_nil();
@@ -1337,6 +1341,7 @@ fn g_read<'a>(
                         match read_chars(f, n as usize) {
                             Some(buf) => {
                                 results.push(crate::strings::new_lstr_bytes(
+                                    state.alloc_slot(),
                                     &state.string_table,
                                     &buf,
                                 ));
@@ -1369,6 +1374,7 @@ fn g_read<'a>(
                         match read_chars(f, n as usize) {
                             Some(buf) => {
                                 results.push(crate::strings::new_lstr_bytes(
+                                    state.alloc_slot(),
                                     &state.string_table,
                                     &buf,
                                 ));
@@ -1399,16 +1405,22 @@ fn g_read<'a>(
                             }
                         },
                         b'l' => match read_line(f, true) {
-                            Some(buf) => results
-                                .push(crate::strings::new_lstr_bytes(&state.string_table, &buf)),
+                            Some(buf) => results.push(crate::strings::new_lstr_bytes(
+                                state.alloc_slot(),
+                                &state.string_table,
+                                &buf,
+                            )),
                             None => {
                                 success = false;
                                 results.push(TValue::Nil(NilKind::Strict));
                             }
                         },
                         b'L' => match read_line(f, false) {
-                            Some(buf) => results
-                                .push(crate::strings::new_lstr_bytes(&state.string_table, &buf)),
+                            Some(buf) => results.push(crate::strings::new_lstr_bytes(
+                                state.alloc_slot(),
+                                &state.string_table,
+                                &buf,
+                            )),
                             None => {
                                 success = false;
                                 results.push(TValue::Nil(NilKind::Strict));
@@ -1416,7 +1428,11 @@ fn g_read<'a>(
                         },
                         b'a' => {
                             let buf = read_all(f);
-                            results.push(crate::strings::new_lstr_bytes(&state.string_table, &buf));
+                            results.push(crate::strings::new_lstr_bytes(
+                                state.alloc_slot(),
+                                &state.string_table,
+                                &buf,
+                            ));
                         }
                         _ => {
                             return Err(VmError::RuntimeError(format!(

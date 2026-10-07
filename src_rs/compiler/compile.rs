@@ -711,8 +711,9 @@ enum EnvResolution<'a> {
 
 /// ANTLR4: `chunk: block ;` — 编译器入口，初始化 FuncState，解析整个脚本块并生成原型
 pub fn compile_chunk<'a, 'b>(ls: &mut LexState<'a, 'b>) -> Result<Proto<'b>, String> {
-    let source = crate::strings::new_lstr(&ls.state.string_table, &ls.chunk_name);
-    let env_name = crate::strings::new_lstr(&ls.state.string_table, "_ENV");
+    let lstr_alloc = ls.state.alloc_slot();
+    let source = crate::strings::new_lstr(lstr_alloc, &ls.state.string_table, &ls.chunk_name);
+    let env_name = crate::strings::new_lstr(lstr_alloc, &ls.state.string_table, "_ENV");
 
     let mut fs = FuncState::new(ls as *mut LexState<'a, 'b>);
     fs.proto.num_params = 0;
@@ -1828,7 +1829,8 @@ impl<'a, 'b> FuncState<'a, 'b> {
                 }
                 let idx = self.proto.upvalues.len() as i32;
                 let ls = crate::strings::new_lstr(
-                    &self.ls_mut().state.string_table,
+                    self.ls().state.alloc_slot(),
+                    &self.ls().state.string_table,
                     lua_string_as_str(name),
                 );
                 Rc::make_mut(&mut self.proto.upvalues).push(crate::objects::UpvalDesc {
@@ -1926,7 +1928,8 @@ impl<'a, 'b> FuncState<'a, 'b> {
                     self.error_limit_at(line_defined, MAXUPVAL as i32, "upvalues");
                 }
                 let ls = crate::strings::new_lstr(
-                    &self.ls_mut().state.string_table,
+                    self.ls().state.alloc_slot(),
+                    &self.ls().state.string_table,
                     lua_string_as_str(&name),
                 );
                 let idx = prev.proto.upvalues.len();
@@ -1958,7 +1961,8 @@ impl<'a, 'b> FuncState<'a, 'b> {
                     self.error_limit_at(line_defined, MAXUPVAL as i32, "upvalues");
                 }
                 let ls = crate::strings::new_lstr(
-                    &self.ls_mut().state.string_table,
+                    self.ls().state.alloc_slot(),
+                    &self.ls().state.string_table,
                     lua_string_as_str(name),
                 );
                 let idx = prev.proto.upvalues.len();
@@ -1998,7 +2002,8 @@ impl<'a, 'b> FuncState<'a, 'b> {
                     self.error_limit_at(line_defined, MAXUPVAL as i32, "upvalues");
                 }
                 let ls = crate::strings::new_lstr(
-                    &self.ls_mut().state.string_table,
+                    self.ls().state.alloc_slot(),
+                    &self.ls().state.string_table,
                     lua_string_as_str(name),
                 );
                 let idx = prev.proto.upvalues.len();
@@ -5506,7 +5511,11 @@ fn code_global_via_env_prefix<'a, 'b>(fs: &mut FuncState<'a, 'b>, name: &str) ->
     }
     let is_env = name == "_ENV";
     // Intern name once; reuse for both string_k and var_name (避免重复 anchor + to_string 分配)
-    let name_ls = crate::strings::new_lstr(&fs.ls().state.string_table, name);
+    let name_ls = crate::strings::new_lstr(
+        fs.ls().state.alloc_slot(),
+        &fs.ls().state.string_table,
+        name,
+    );
     let k = if is_env {
         0
     } else {
@@ -13046,6 +13055,8 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
         }
     }
     expect(fs, &Token::RParen);
+    // 在创建 new_fs 之前取 allocator 槽（之后经 fs.ls_mut() 写入会禁用 new_fs 的别名标签）
+    let lstr_alloc: crate::strings::AllocSlot = fs.ls().state.alloc_slot();
     let mut new_fs = FuncState::new(fs.ls);
     new_fs.prev = fs as *mut FuncState; // like C's fs->prev = ls->fs
     new_fs.proto.num_params = n_params;
@@ -13057,7 +13068,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     // 否则会导致 Tree Borrows aliasing 违规 (new_fs 持有的裸指针标签被 foreign write 禁用)
     let source = {
         let ls_ref = new_fs.ls();
-        crate::strings::new_lstr(&ls_ref.state.string_table, &ls_ref.chunk_name)
+        crate::strings::new_lstr(lstr_alloc, &ls_ref.state.string_table, &ls_ref.chunk_name)
     };
     new_fs.proto.source = Some(source);
     // then generate VARARGPREP, then add vararg parameter (start_pc after VARARGPREP).

@@ -28,6 +28,7 @@ use std::rc::Rc;
 
 use const_format::formatcp;
 
+use crate::mem::{Allocator, CapiAllocator};
 use crate::objects::{
     CClosure, LCFunction, LClosure, LuaThread, LuaType, NilKind, Proto, TValue, Table,
     ThreadContext, ThreadStatus, Udata, UpVal,
@@ -212,7 +213,7 @@ fn tolstring<'a>(state: &'a mut LuaState, idx: c_int) -> Option<&'a str> {
             _ => None,
         };
         if let Some(s) = converted {
-            state.stack[off] = crate::state::str_to_ls(&state.string_table, &s);
+            state.stack[off] = state.intern_str(&s);
         } else {
             return None;
         }
@@ -289,18 +290,26 @@ fn typeerror(state: &LuaState, idx: c_int, tname: &str) -> ([u8; 64], usize) {
 
 /// 创建新的 Lua state。
 ///
-/// 对应 C 的 lua_newstate。
-/// 保存 allocf 的 ud 到 GlobalState.allocf_ud，供 lua_getallocf 取回。
-/// （Rust 用自己的分配器，忽略 f；seed 由 GlobalState::new 内部生成。）
+/// 对应 C 的 lua_newstate。f/ud 包装为 CapiAllocator 注入 GlobalState.mem：
+/// lmem 层（mem.rs）的 C 风格分配原语（realloc/free/malloc）经此分配器执行，
+/// lua_getallocf / lua_setallocf 读写同一份。f 为 None 时由 CapiAllocator
+/// 兜底 DefaultAllocator。
+/// （Rust VM 内部的类型化 Rc/Vec 分配仍走 std::alloc，不受 allocf 影响。）
 /// 返回的指针需要由 lua_close 释放。
 #[no_mangle]
 pub extern "C" fn lua_newstate(
-    _f: *mut c_void,
+    f: lua_Alloc,
     ud: *mut c_void,
     _seed: std::ffi::c_uint,
 ) -> *mut lua_State {
     let mut state = LuaState::default();
-    state.g_mut().allocf_ud = ud;
+    {
+        let g = state.g_mut();
+        g.mem.allocator = Box::new(CapiAllocator {
+            allocf: f,
+            allocf_ud: ud,
+        });
+    }
     let p = Box::into_raw(Box::new(state));
     // 绑定 l_g（规约 R1）：地址稳定后再绑定，之后每次进入执行会重绑定
     unsafe {
@@ -402,7 +411,7 @@ pub extern "C" fn lua_closethread(L: *mut lua_State, from: *mut lua_State) -> c_
 #[no_mangle]
 pub extern "C" fn luaL_newstate() -> *mut lua_State {
     lua_newstate(
-        ptr::null_mut(),
+        Some(luaL_alloc),
         ptr::null_mut(),
         luaL_makeseed(ptr::null_mut()),
     )
@@ -926,7 +935,7 @@ pub extern "C" fn lua_tolstring(L: *mut lua_State, idx: c_int, len: *mut usize) 
             _ => None,
         };
         if let Some(s) = converted {
-            L.stack[off] = crate::state::str_to_ls(&L.string_table, &s);
+            L.stack[off] = L.intern_str(&s);
         } else {
             return ptr::null();
         }
@@ -1061,7 +1070,7 @@ pub extern "C" fn lua_getfield(L: *mut lua_State, idx: c_int, k: *const c_char) 
     } else {
         unsafe { CStr::from_ptr(k) }.to_string_lossy().into_owned()
     };
-    let key_tv = crate::state::str_to_ls(&L.string_table, &key_str);
+    let key_tv = L.intern_str(&key_str);
     if is_registry(idx) {
         let val = L
             .registry
@@ -1097,7 +1106,7 @@ pub extern "C" fn lua_setfield(L: *mut lua_State, idx: c_int, k: *const c_char) 
     } else {
         unsafe { CStr::from_ptr(k) }.to_string_lossy().into_owned()
     };
-    let key_tv = crate::state::str_to_ls(&L.string_table, &key_str);
+    let key_tv = L.intern_str(&key_str);
     if is_registry(idx) {
         let val = L.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
         L.registry.set(key_tv, val);
@@ -1190,7 +1199,7 @@ pub extern "C" fn lua_getglobal(L: *mut lua_State, name: *const c_char) -> c_int
             .to_string_lossy()
             .into_owned()
     };
-    let key_tv = crate::state::str_to_ls(&L.string_table, &name_str);
+    let key_tv = L.intern_str(&name_str);
     let val = L
         .globals
         .get(&key_tv)
@@ -1212,7 +1221,7 @@ pub extern "C" fn lua_setglobal(L: *mut lua_State, name: *const c_char) {
             .to_string_lossy()
             .into_owned()
     };
-    let key = crate::state::str_to_ls(&L.string_table, &name_str);
+    let key = L.intern_str(&name_str);
     L.globals.set(key, val);
 }
 
@@ -1426,7 +1435,8 @@ pub extern "C-unwind" fn luaL_checkoption(
     }
     let str = {
         let name = name.to_string();
-        crate::strings::new_lstr(&L.string_table, &format!("invalid option '{}'", name))
+        let slot = L.alloc_slot();
+        crate::strings::new_lstr(slot, &L.string_table, &format!("invalid option '{}'", name))
     };
     return luaL_argerror(L, arg, lua_string_as_c_str_ptr(&str));
 }
@@ -1519,36 +1529,43 @@ unsafe fn do_lua_error(L: *mut lua_State) -> ! {
 extern "C-unwind" fn lua_error(L: *mut lua_State) -> c_int {
     unsafe { do_lua_error(L) }
 }
-/// ud 设为 NULL（Rust VM 用自己的分配器，C 模块分配的内存由其自行管理）。
+/// allocator 函数指针类型 — 对应 C 的 lua_Alloc。
+/// 由 lua_newstate / lua_setallocf 写入 GlobalState.mem.allocator（CapiAllocator），
+/// lmem 层的 C 风格分配原语经它执行；lua_getallocf 返回给 C 代码
+/// （skynet 用 ud 存 snlua 指针，lua_resumeX 经 lua_getallocf 取回）。
 pub type lua_Alloc =
     Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize) -> *mut c_void>;
-
-/// 默认 C 内存分配器：realloc/free 包装
-unsafe extern "C" fn default_allocf(
-    _ud: *mut c_void,
-    ptr: *mut c_void,
-    _osize: usize,
-    nsize: usize,
-) -> *mut c_void {
-    if nsize == 0 {
-        if !ptr.is_null() {
-            libc::free(ptr);
-        }
-        ptr::null_mut()
-    } else {
-        libc::realloc(ptr, nsize)
-    }
-}
 
 #[no_mangle]
 pub extern "C" fn lua_getallocf(L: *mut lua_State, ud: *mut *mut c_void) -> lua_Alloc {
     let L = unsafe { &*L };
-    if !ud.is_null() {
-        unsafe {
-            *ud = L.allocf_ud;
+    match L.mem.allocator.allocf_parts() {
+        Some((f, allocf_ud)) => {
+            if !ud.is_null() {
+                unsafe {
+                    *ud = allocf_ud;
+                }
+            }
+            f
         }
+        // 纯 Rust 分配器（DefaultAllocator 或自定义）：无 C 侧 allocf/ud
+        None => None,
     }
-    Some(default_allocf)
+}
+
+/// lua_setallocf: 替换 state 的 allocator 函数与 userdata（C Lua 5.5 标准 API）。
+/// CapiAllocator 原地更新 allocf/ud；当前为纯 Rust 分配器时整体替换为
+/// CapiAllocator（此后 lmem 层 C 风格分配原语即经宿主 allocator 执行）。
+#[no_mangle]
+pub extern "C" fn lua_setallocf(L: *mut lua_State, f: lua_Alloc, ud: *mut c_void) {
+    let L = unsafe { &mut *L };
+    let g = L.g_mut();
+    if !g.mem.allocator.set_allocf(f, ud) {
+        g.mem.allocator = Box::new(CapiAllocator {
+            allocf: f,
+            allocf_ud: ud,
+        });
+    }
 }
 
 // ============================================================================
@@ -2367,8 +2384,8 @@ pub extern "C" fn lua_getinfo(L: *mut lua_State, what: *const c_char, ar: *mut l
             } else {
                 // name 需要是持久化的 C 字符串
                 // 使用 LuaString 的内部缓冲区（通过 intern）
-                let name_ls = crate::state::str_to_ls(&L.string_table, &name);
-                let namewhat_ls = crate::state::str_to_ls(&L.string_table, &namewhat);
+                let name_ls = L.intern_str(&name);
+                let namewhat_ls = L.intern_str(&namewhat);
                 unsafe {
                     (*ar).name = lua_string_as_c_str_ptr(&name_ls);
                     (*ar).namewhat = lua_string_as_c_str_ptr(&namewhat_ls);
@@ -2970,7 +2987,7 @@ pub extern "C" fn luaL_getmetatable(L: *mut lua_State, name: *const c_char) -> c
             .to_string_lossy()
             .into_owned()
     };
-    let key = crate::state::str_to_ls(&L.string_table, &name_str);
+    let key = L.intern_str(&name_str);
     let val = L.registry.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
     let ty = lua_type_code(val.ty());
     L.stack.push(val);
@@ -2990,7 +3007,7 @@ pub extern "C" fn luaL_newmetatable(L: *mut lua_State, tname: *const c_char) -> 
             .to_string_lossy()
             .into_owned()
     };
-    let tname = crate::state::str_to_ls(&L.string_table, &tname);
+    let tname = L.intern_str(&tname);
     if !L
         .registry
         .get(&tname)
@@ -3102,10 +3119,10 @@ pub extern "C" fn luaL_requiref(
             .into_owned()
     };
 
-    let mod_key = crate::state::str_to_ls(&L.string_table, &modname_str);
+    let mod_key = L.intern_str(&modname_str);
 
     // 获取 registry["_LOADED"] 表（与 package.loaded 共享同一 Rc 引用）
-    let loaded_key = crate::state::str_to_ls(&L.string_table, "_LOADED");
+    let loaded_key = L.intern_str("_LOADED");
     let loaded_table = match L.registry.get(&loaded_key) {
         Some(TValue::Table(t)) => t,
         _ => {
@@ -3239,7 +3256,7 @@ pub extern "C" fn luaopen_math(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     crate::stdlib::math_lib::open_math_lib(L);
     // push math 表
-    let math_key = crate::state::str_to_ls(&L.string_table, "math");
+    let math_key = L.intern_str("math");
     let math_val = L
         .globals
         .get(&math_key)
@@ -3253,7 +3270,7 @@ pub extern "C" fn luaopen_math(L: *mut lua_State) -> c_int {
 pub extern "C" fn luaopen_string(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     crate::stdlib::string_lib::open_string_lib(L);
-    let key = crate::state::str_to_ls(&L.string_table, "string");
+    let key = L.intern_str("string");
     let val = L.globals.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
     L.stack.push(val);
     1
@@ -3264,7 +3281,7 @@ pub extern "C" fn luaopen_string(L: *mut lua_State) -> c_int {
 pub extern "C" fn luaopen_os(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     crate::stdlib::os_lib::open_os_lib(L);
-    let key = crate::state::str_to_ls(&L.string_table, "os");
+    let key = L.intern_str("os");
     let val = L.globals.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
     L.stack.push(val);
     1
@@ -3275,7 +3292,7 @@ pub extern "C" fn luaopen_os(L: *mut lua_State) -> c_int {
 pub extern "C" fn luaopen_coroutine(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     crate::stdlib::coroutine_lib::open_coroutine_lib(L);
-    let key = crate::state::str_to_ls(&L.string_table, "coroutine");
+    let key = L.intern_str("coroutine");
     let val = L.globals.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
     L.stack.push(val);
     1
@@ -3286,7 +3303,7 @@ pub extern "C" fn luaopen_coroutine(L: *mut lua_State) -> c_int {
 pub extern "C" fn luaopen_table(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     crate::stdlib::table_lib::open_table_lib(L);
-    let key = crate::state::str_to_ls(&L.string_table, "table");
+    let key = L.intern_str("table");
     let val = L.globals.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
     L.stack.push(val);
     1
@@ -3297,7 +3314,7 @@ pub extern "C" fn luaopen_table(L: *mut lua_State) -> c_int {
 pub extern "C" fn luaopen_io(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     crate::stdlib::io_lib::open_io_lib(L);
-    let key = crate::state::str_to_ls(&L.string_table, "io");
+    let key = L.intern_str("io");
     let val = L.globals.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
     L.stack.push(val);
     1
@@ -3308,7 +3325,7 @@ pub extern "C" fn luaopen_io(L: *mut lua_State) -> c_int {
 pub extern "C" fn luaopen_debug(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     crate::stdlib::debug_lib::open_debug_lib(L);
-    let key = crate::state::str_to_ls(&L.string_table, "debug");
+    let key = L.intern_str("debug");
     let val = L.globals.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
     L.stack.push(val);
     1
@@ -3319,7 +3336,7 @@ pub extern "C" fn luaopen_debug(L: *mut lua_State) -> c_int {
 pub extern "C" fn luaopen_utf8(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     crate::stdlib::utf8_lib::open_utf8_lib(L);
-    let key = crate::state::str_to_ls(&L.string_table, "utf8");
+    let key = L.intern_str("utf8");
     let val = L.globals.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
     L.stack.push(val);
     1
@@ -3333,7 +3350,7 @@ pub extern "C" fn luaopen_utf8(L: *mut lua_State) -> c_int {
 pub extern "C" fn luaopen_package(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     // package 表已在 open_base_lib 中初始化
-    let key = crate::state::str_to_ls(&L.string_table, "package");
+    let key = L.intern_str("package");
     let val = L.globals.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
     L.stack.push(val);
     1
@@ -4451,22 +4468,6 @@ pub extern "C" fn lua_upvaluejoin(
     }
 }
 
-// ============================================================================
-// skynet 扩展 API (feature = "skynet")
-// ============================================================================
-// skynet 修改版 Lua 5.5.1 (ejoy/lua skynet55 分支) 在标准 Lua 5.5 基础上添加了
-// 以下扩展 API, 用于 sharetable 共享机制和 codecache. lua-rs 启用 skynet feature
-// 后导出这些符号, 让 dlopen 加载的 luaclib/skynet.so 能正确解析.
-//
-// 当前实现状态:
-//   - luaL_alloc: 真实实现 (realloc/free 包装, 复用 default_allocf)
-//   - luaL_loadfilex_: 转发到 luaL_loadfilex (skynet 版本带 codecache, 但 lua-rs
-//     无 codecache, 直接用标准 loadfilex 替代)
-//   - lua_clonetable / lua_sharefunction / lua_sharestring: stub 实现
-//     (推 nil 到栈顶或返回, 不真正共享). 调用方在 abort 测试路径不会触发这些.
-//     真正的 sharetable 跨 GlobalState 共享 Table/Proto/String 机制未实现.
-
-#[cfg(feature = "skynet")]
 #[no_mangle]
 pub extern "C" fn luaL_alloc(
     _ud: *mut c_void,
@@ -4474,8 +4475,6 @@ pub extern "C" fn luaL_alloc(
     _osize: usize,
     nsize: usize,
 ) -> *mut c_void {
-    // 与 skynet 3rd/lua/lauxlib.c:1062 一致: realloc/free 包装.
-    // 复用 capi.rs:1267 的 default_allocf 逻辑.
     if nsize == 0 {
         if !ptr.is_null() {
             unsafe { libc::free(ptr) };
@@ -4539,7 +4538,7 @@ mod tests {
 
     #[test]
     fn test_lua_newstate_close() {
-        let L = lua_newstate(ptr::null_mut(), ptr::null_mut(), 0);
+        let L = lua_newstate(None, ptr::null_mut(), 0);
         assert!(!L.is_null());
         lua_close(L);
     }

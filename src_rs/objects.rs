@@ -2871,7 +2871,11 @@ mod tests {
 
     #[test]
     fn test_luastring_long() {
-        let long = crate::alloc::SimpleRc::<LongString>::new_lstr(None, "a".repeat(100).as_bytes());
+        let long = crate::alloc::SimpleRc::<LongString>::new_lstr(
+            std::ptr::null(),
+            None,
+            "a".repeat(100).as_bytes(),
+        );
         let ts = TValue::LongStr(long);
         assert_eq!(lua_string_len(&ts), 100);
         assert!(matches!(ts, TValue::LongStr(_)));
@@ -2898,8 +2902,16 @@ mod tests {
         let ts3 = TValue::ShortStr(arc3);
         assert_ne!(ts1, ts3);
 
-        let long1 = TValue::LongStr(SimpleRc::<LongString>::new_lstr(None, "test".as_bytes()));
-        let long2 = TValue::LongStr(SimpleRc::<LongString>::new_lstr(None, "test".as_bytes()));
+        let long1 = TValue::LongStr(SimpleRc::<LongString>::new_lstr(
+            std::ptr::null(),
+            None,
+            "test".as_bytes(),
+        ));
+        let long2 = TValue::LongStr(SimpleRc::<LongString>::new_lstr(
+            std::ptr::null(),
+            None,
+            "test".as_bytes(),
+        ));
         assert_eq!(long1, long2);
     }
 

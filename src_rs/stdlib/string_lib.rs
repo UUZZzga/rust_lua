@@ -859,6 +859,7 @@ enum CaptureResult {
 /// 获取所有捕获的字符串 — 写入调用者提供的缓冲区（复用容量，零分配）。
 /// 热路径（find/match 每次调用一次）：clear + 复用，避免 Vec::with_capacity。
 fn get_captures_into<'a>(
+    alloc: crate::strings::AllocSlot,
     ms: &MatchState<'_>,
     s: usize,
     e: usize,
@@ -872,7 +873,7 @@ fn get_captures_into<'a>(
         match cap {
             CaptureResult::Str(start, len) => {
                 let bytes = &ms.src[start..start + len];
-                out.push(new_lstr_bytes(table, bytes));
+                out.push(new_lstr_bytes(alloc, table, bytes));
             }
             CaptureResult::Pos(pos) => {
                 out.push(TValue::Integer(pos as i64));
@@ -888,6 +889,7 @@ fn get_captures_into<'a>(
 /// captures_out: 匹配成功时写入（复用调用者缓冲区）。
 /// 返回 Some((start, end)) 或 None（未找到）。
 pub fn str_find_into<'a>(
+    alloc: crate::strings::AllocSlot,
     s: &str,
     pattern: &str,
     init: i64,
@@ -951,7 +953,7 @@ pub fn str_find_into<'a>(
                 if find_mode && ms.level == 0 {
                     captures_out.clear();
                 } else {
-                    get_captures_into(&ms, search_pos, end, table, captures_out)?;
+                    get_captures_into(alloc, &ms, search_pos, end, table, captures_out)?;
                 }
                 return Ok(Some((search_pos + 1, end)));
             }
@@ -968,6 +970,7 @@ pub fn str_find_into<'a>(
 /// string.find(s, pattern, [init], [plain]) — 查找模式
 /// 对应 C 的 str_find（兼容包装：结果转 FindResult）
 pub fn str_find<'a>(
+    alloc: crate::strings::AllocSlot,
     s: &str,
     pattern: &str,
     init: i64,
@@ -975,7 +978,7 @@ pub fn str_find<'a>(
     table: &crate::strings::StringTable,
 ) -> Result<FindResult<'a>, String> {
     let mut caps = Vec::new();
-    match str_find_into(s, pattern, init, plain, true, table, &mut caps)? {
+    match str_find_into(alloc, s, pattern, init, plain, true, table, &mut caps)? {
         Some((start, end)) => Ok(FindResult::Found {
             start,
             end,
@@ -997,18 +1000,19 @@ pub enum FindResult<'a> {
 /// string.match(s, pattern, [init]) — 模式匹配
 /// 对应 C 的 str_match
 pub fn str_match<'a>(
+    alloc: crate::strings::AllocSlot,
     s: &str,
     pattern: &str,
     init: i64,
     table: &crate::strings::StringTable,
 ) -> Result<Vec<TValue<'a>>, String> {
     let mut caps = Vec::new();
-    match str_find_into(s, pattern, init, false, false, table, &mut caps)? {
+    match str_find_into(alloc, s, pattern, init, false, false, table, &mut caps)? {
         Some((start, end)) => {
             if caps.is_empty() {
                 // 无捕获时返回整个匹配
                 let matched = &s.as_bytes()[start - 1..end];
-                caps.push(crate::strings::new_lstr_bytes(&table, &matched));
+                caps.push(crate::strings::new_lstr_bytes(alloc, &table, &matched));
             }
             Ok(caps)
         }
@@ -1041,6 +1045,7 @@ impl GMatchIterator {
 
     pub fn next<'a>(
         &mut self,
+        alloc: crate::strings::AllocSlot,
         table: &crate::strings::StringTable,
     ) -> Result<Vec<TValue<'a>>, String> {
         let src_bytes = self.src.as_bytes();
@@ -1053,7 +1058,7 @@ impl GMatchIterator {
             match match_pattern(&mut ms, match_start, self.pat_start)? {
                 Some(end) => {
                     let mut captures = Vec::new();
-                    get_captures_into(&ms, match_start, end, table, &mut captures)?;
+                    get_captures_into(alloc, &ms, match_start, end, table, &mut captures)?;
                     // 推进位置: 如果匹配为空则前进 1 以避免无限循环
                     self.pos = if end > match_start {
                         end
@@ -1063,6 +1068,7 @@ impl GMatchIterator {
                     if captures.is_empty() {
                         // 无捕获时返回整个匹配的子串
                         return Ok(vec![crate::strings::new_lstr_bytes(
+                            alloc,
                             &table,
                             &src_bytes[match_start..end],
                         )]);
@@ -3007,6 +3013,7 @@ pub fn str_packsize(fmt: &str) -> Result<usize, String> {
 /// 对应 C 的 str_unpack
 /// 返回 (解包的值列表, 下一个位置)
 pub fn str_unpack<'a>(
+    alloc: crate::strings::AllocSlot,
     fmt: &str,
     data: &[u8],
     init_pos: i64,
@@ -3063,7 +3070,7 @@ pub fn str_unpack<'a>(
             }
             KOption::Kchar => {
                 let s_bytes = &data[pos..pos + size];
-                results.push(crate::strings::new_lstr_bytes(&table, &s_bytes));
+                results.push(crate::strings::new_lstr_bytes(alloc, &table, &s_bytes));
             }
             KOption::Kstring => {
                 let len = unpackint(&data[pos..pos + size], h.islittle, size, false)? as usize;
@@ -3071,7 +3078,7 @@ pub fn str_unpack<'a>(
                     return Err("bad argument #2 to 'unpack' (data string too short)".to_string());
                 }
                 let s_bytes = &data[pos + size..pos + size + len];
-                results.push(new_lstr_bytes(table, s_bytes));
+                results.push(new_lstr_bytes(alloc, table, s_bytes));
                 pos += len; // 跳过字符串
             }
             KOption::Kzstr => {
@@ -3101,7 +3108,7 @@ pub fn str_unpack<'a>(
                     );
                 }
                 let s_bytes = &data[rel_pos..zero_idx];
-                results.push(new_lstr_bytes(table, s_bytes));
+                results.push(new_lstr_bytes(alloc, table, s_bytes));
                 pos += len + 1; // 跳过字符串和终止零
             }
             KOption::Kpadding | KOption::Kpaddalign | KOption::Knop => {
@@ -3488,6 +3495,7 @@ pub fn call_gmatch_iter<'a>(
                         };
                         let val = match cap {
                             CaptureResult::Str(start, caplen) => crate::strings::new_lstr_bytes(
+                                state.alloc_slot(),
                                 &state.string_table,
                                 &src_bytes[start..start + caplen],
                             ),
@@ -3682,6 +3690,7 @@ fn call_str_find<'a>(
     let first_result_pos = state.stack.len();
     let mut caps = Vec::new();
     let found = str_find_into(
+        state.alloc_slot(),
         &s,
         &pattern,
         init,
@@ -3796,7 +3805,7 @@ fn call_str_match<'a>(
     let s = lua_string_as_str(&s_val);
     let pattern = get_str_arg(state, a, 1)?;
     let init = get_opt_int_arg(state, a, nargs, 2, 1, "match")?;
-    match str_match(&s, &pattern, init, &state.string_table) {
+    match str_match(state.alloc_slot(), &s, &pattern, init, &state.string_table) {
         Ok(results) => {
             push_results(state, a, nresults, results);
             Ok(())
@@ -4018,7 +4027,13 @@ fn call_str_unpack<'a>(
         }
     };
     let pos = get_opt_int_arg(state, a, nargs, 2, 1, "unpack")?;
-    match str_unpack(&fmt, &data_bytes, pos, &state.string_table) {
+    match str_unpack(
+        state.alloc_slot(),
+        &fmt,
+        &data_bytes,
+        pos,
+        &state.string_table,
+    ) {
         Ok((mut values, next_pos)) => {
             // 最后一个返回值是下一个位置
             values.push(TValue::Integer(next_pos as i64));
@@ -4063,12 +4078,12 @@ fn call_str_dump<'a>(
     match &func_val {
         TValue::LClosure(cl) => {
             let data = crate::compiler::bytecode_dump::dump_proto(&cl.proto, strip);
-            push_results(
-                state,
-                a,
-                nresults,
-                vec![crate::strings::new_lstr_bytes(&state.string_table, &data)],
-            );
+            let __hoist = vec![crate::strings::new_lstr_bytes(
+                state.alloc_slot(),
+                &state.string_table,
+                &data,
+            )];
+            push_results(state, a, nresults, __hoist);
             Ok(())
         }
         _ => Err(VmError::RuntimeError(format!(
@@ -4581,7 +4596,7 @@ mod tests {
     #[test]
     fn test_str_find_plain() {
         let tb = crate::strings::StringTable::new();
-        let result = str_find("hello world", "world", 1, true, &tb).unwrap();
+        let result = str_find(std::ptr::null(), "hello world", "world", 1, true, &tb).unwrap();
         match result {
             FindResult::Found {
                 start,
@@ -4599,14 +4614,14 @@ mod tests {
     #[test]
     fn test_str_find_not_found() {
         let tb = crate::strings::StringTable::new();
-        let result = str_find("hello", "xyz", 1, true, &tb).unwrap();
+        let result = str_find(std::ptr::null(), "hello", "xyz", 1, true, &tb).unwrap();
         assert!(matches!(result, FindResult::NotFound));
     }
 
     #[test]
     fn test_str_find_empty_pattern() {
         let tb = crate::strings::StringTable::new();
-        let result = str_find("hello", "", 1, true, &tb).unwrap();
+        let result = str_find(std::ptr::null(), "hello", "", 1, true, &tb).unwrap();
         match result {
             FindResult::Found { start, end, .. } => {
                 assert_eq!(start, 1);
@@ -4619,7 +4634,7 @@ mod tests {
     #[test]
     fn test_str_find_with_init() {
         let tb = crate::strings::StringTable::new();
-        let result = str_find("hello hello", "hello", 2, true, &tb).unwrap();
+        let result = str_find(std::ptr::null(), "hello hello", "hello", 2, true, &tb).unwrap();
         match result {
             FindResult::Found { start, .. } => assert_eq!(start, 7),
             FindResult::NotFound => panic!("should find second 'hello'"),
@@ -4629,7 +4644,7 @@ mod tests {
     #[test]
     fn test_str_find_pattern_dot() {
         let tb = crate::strings::StringTable::new();
-        let result = str_find("hello", "h.llo", 1, false, &tb).unwrap();
+        let result = str_find(std::ptr::null(), "hello", "h.llo", 1, false, &tb).unwrap();
         match result {
             FindResult::Found { start, end, .. } => {
                 assert_eq!(start, 1);
@@ -4642,7 +4657,7 @@ mod tests {
     #[test]
     fn test_str_find_pattern_digit() {
         let tb = crate::strings::StringTable::new();
-        let result = str_find("abc123def", "%d+", 1, false, &tb).unwrap();
+        let result = str_find(std::ptr::null(), "abc123def", "%d+", 1, false, &tb).unwrap();
         match result {
             FindResult::Found { start, end, .. } => {
                 assert_eq!(start, 4);
@@ -4655,7 +4670,7 @@ mod tests {
     #[test]
     fn test_str_find_pattern_capture() {
         let tb = crate::strings::StringTable::new();
-        let result = str_find("hello", "(h(e)llo)", 1, false, &tb).unwrap();
+        let result = str_find(std::ptr::null(), "hello", "(h(e)llo)", 1, false, &tb).unwrap();
         match result {
             FindResult::Found {
                 start,
@@ -4673,17 +4688,17 @@ mod tests {
     #[test]
     fn test_str_find_anchored() {
         let tb = crate::strings::StringTable::new();
-        let result = str_find("hello", "^hello", 1, false, &tb).unwrap();
+        let result = str_find(std::ptr::null(), "hello", "^hello", 1, false, &tb).unwrap();
         assert!(matches!(result, FindResult::Found { .. }));
 
-        let result = str_find("xhello", "^hello", 1, false, &tb).unwrap();
+        let result = str_find(std::ptr::null(), "xhello", "^hello", 1, false, &tb).unwrap();
         assert!(matches!(result, FindResult::NotFound));
     }
 
     #[test]
     fn test_str_match_basic() {
         let tb = crate::strings::StringTable::new();
-        let result = str_match("hello world", "world", 1, &tb).unwrap();
+        let result = str_match(std::ptr::null(), "hello world", "world", 1, &tb).unwrap();
         assert_eq!(result.len(), 1);
         match &result[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
@@ -4696,7 +4711,7 @@ mod tests {
     #[test]
     fn test_str_match_not_found() {
         let tb = crate::strings::StringTable::new();
-        let result = str_match("hello", "xyz", 1, &tb).unwrap();
+        let result = str_match(std::ptr::null(), "hello", "xyz", 1, &tb).unwrap();
         assert_eq!(result.len(), 1);
         assert!(result[0].is_nil());
     }
@@ -4704,7 +4719,7 @@ mod tests {
     #[test]
     fn test_str_match_with_capture() {
         let tb = crate::strings::StringTable::new();
-        let result = str_match("hello", "(h.llo)", 1, &tb).unwrap();
+        let result = str_match(std::ptr::null(), "hello", "(h.llo)", 1, &tb).unwrap();
         assert_eq!(result.len(), 1);
         match &result[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
@@ -4717,7 +4732,7 @@ mod tests {
     #[test]
     fn test_str_match_digit_capture() {
         let tb = crate::strings::StringTable::new();
-        let result = str_match("abc123", "(%d+)", 1, &tb).unwrap();
+        let result = str_match(std::ptr::null(), "abc123", "(%d+)", 1, &tb).unwrap();
         assert_eq!(result.len(), 1);
         match &result[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
@@ -5055,11 +5070,11 @@ mod tests {
     fn test_gmatch_iterator_basic() {
         let tb = crate::strings::StringTable::new();
         let mut iter = GMatchIterator::new("hello world", "%w+");
-        let first = iter.next(&tb).unwrap();
+        let first = iter.next(std::ptr::null(), &tb).unwrap();
         assert_eq!(first.len(), 1);
-        let second = iter.next(&tb).unwrap();
+        let second = iter.next(std::ptr::null(), &tb).unwrap();
         assert_eq!(second.len(), 1);
-        let third = iter.next(&tb).unwrap();
+        let third = iter.next(std::ptr::null(), &tb).unwrap();
         assert_eq!(third.len(), 0); // no more matches
     }
 
@@ -5262,7 +5277,8 @@ mod tests {
     /// 辅助: 比较 unpack 结果
     fn assert_unpack_eq(fmt: &str, data: &[u8], expected: &[TValue]) {
         let tb = crate::strings::StringTable::new();
-        let (results, _) = str_unpack(fmt, data, 1, &tb).expect("unpack should succeed");
+        let (results, _) =
+            str_unpack(std::ptr::null(), fmt, data, 1, &tb).expect("unpack should succeed");
         assert_eq!(
             results.len(),
             expected.len(),
@@ -5660,15 +5676,15 @@ mod tests {
         // 9 字节无符号,最高字节为 1,超出 i64 范围
         let tb = crate::strings::StringTable::new();
         let data = vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
-        assert!(str_unpack("<I9", &data, 1, &tb).is_err());
+        assert!(str_unpack(std::ptr::null(), "<I9", &data, 1, &tb).is_err());
 
         // 9 字节有符号,最高字节为 1,超出 i64 范围
         let data = vec![0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        assert!(str_unpack(">i9", &data, 1, &tb).is_err());
+        assert!(str_unpack(std::ptr::null(), ">i9", &data, 1, &tb).is_err());
 
         // 8 字节无符号 0x8000000000000000 不报错 (转为 i64::MIN)
         let data = vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80];
-        assert!(str_unpack("<I8", &data, 1, &tb).is_ok());
+        assert!(str_unpack(std::ptr::null(), "<I8", &data, 1, &tb).is_ok());
     }
 
     #[test]
@@ -5676,7 +5692,7 @@ mod tests {
         // 多值解包
         let tb = crate::strings::StringTable::new();
         let data = vec![0x01, 0x02, 0x03];
-        let (results, _) = str_unpack("<i1i1i1", &data, 1, &tb).unwrap();
+        let (results, _) = str_unpack(std::ptr::null(), "<i1i1i1", &data, 1, &tb).unwrap();
         assert_eq!(results.len(), 3);
         assert!(crate::vm::raw_equal(&results[0], &TValue::Integer(1)));
         assert!(crate::vm::raw_equal(&results[1], &TValue::Integer(2)));
@@ -5688,7 +5704,7 @@ mod tests {
         // 从指定位置开始解包
         let tb = crate::strings::StringTable::new();
         let data = vec![0xFF, 0x01, 0x02];
-        let (results, next_pos) = str_unpack("<i2", &data, 2, &tb).unwrap();
+        let (results, next_pos) = str_unpack(std::ptr::null(), "<i2", &data, 2, &tb).unwrap();
         assert_eq!(results.len(), 1);
         assert!(crate::vm::raw_equal(&results[0], &TValue::Integer(0x0201)));
         assert_eq!(next_pos, 4); // 1-based, 2 + 2 = 4
@@ -5699,7 +5715,7 @@ mod tests {
         // 解包固定长度字符串
         let tb = crate::strings::StringTable::new();
         let data = vec![b'a', b'b', b'c'];
-        let (results, _) = str_unpack("<c3", &data, 1, &tb).unwrap();
+        let (results, _) = str_unpack(std::ptr::null(), "<c3", &data, 1, &tb).unwrap();
         assert_eq!(results.len(), 1);
         match &results[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
@@ -5710,7 +5726,7 @@ mod tests {
 
         // 解包零终止字符串
         let data = vec![b'h', b'i', 0];
-        let (results, _) = str_unpack("<z", &data, 1, &tb).unwrap();
+        let (results, _) = str_unpack(std::ptr::null(), "<z", &data, 1, &tb).unwrap();
         match &results[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 assert_eq!(lua_string_as_str(s), "hi")
@@ -5720,7 +5736,7 @@ mod tests {
 
         // 解包带长度前缀字符串
         let data = vec![2, b'h', b'i'];
-        let (results, _) = str_unpack("<s1", &data, 1, &tb).unwrap();
+        let (results, _) = str_unpack(std::ptr::null(), "<s1", &data, 1, &tb).unwrap();
         match &results[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 assert_eq!(lua_string_as_str(s), "hi")
@@ -5776,8 +5792,8 @@ mod tests {
     #[test]
     fn test_unpack_data_too_short() {
         let tb = crate::strings::StringTable::new();
-        assert!(str_unpack("<i4", &[0, 0, 0], 1, &tb).is_err());
-        assert!(str_unpack("<c5", &[1, 2, 3], 1, &tb).is_err());
+        assert!(str_unpack(std::ptr::null(), "<i4", &[0, 0, 0], 1, &tb).is_err());
+        assert!(str_unpack(std::ptr::null(), "<c5", &[1, 2, 3], 1, &tb).is_err());
     }
 
     #[test]
@@ -5827,7 +5843,7 @@ mod tests {
             TValue::Float(3.14),
         ];
         let packed = str_pack(fmt, &args).unwrap();
-        let (results, _) = str_unpack(fmt, &packed, 1, &tb).unwrap();
+        let (results, _) = str_unpack(std::ptr::null(), fmt, &packed, 1, &tb).unwrap();
         assert_eq!(results.len(), 4);
         assert!(crate::vm::raw_equal(&results[0], &TValue::Integer(42)));
         assert!(crate::vm::raw_equal(&results[1], &s));
@@ -5862,7 +5878,7 @@ mod tests {
 
             // 验证解包往返
             let unpack_fmt = format!("<i{}", i);
-            let (results, _) = str_unpack(&unpack_fmt, &packed, 1, &tb).unwrap();
+            let (results, _) = str_unpack(std::ptr::null(), &unpack_fmt, &packed, 1, &tb).unwrap();
             assert!(
                 crate::vm::raw_equal(&results[0], &TValue::Integer(n)),
                 "i={} roundtrip mismatch: got {:?}, expected {}",

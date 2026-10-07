@@ -3,6 +3,7 @@ use crate::execute::{VmError, VmExecutor, VmResult};
 use crate::gc::{GCObjectHeader, GCState};
 #[cfg(lua_use_longjmp)]
 use crate::helper::JmpBuf;
+use crate::mem::{Allocator, DefaultAllocator, MemState};
 use crate::objects::FxBuildHasher;
 use crate::objects::{
     BuiltinFn, BuiltinFnPtr, Instruction, LClosure, LuaThread, LuaType, NilKind, Proto, TValue,
@@ -501,8 +502,15 @@ impl<'a> LuaState<'a> {
     ///
     /// 这是**唯一**创建 `GlobalState` 的入口（其它模块无法构造 `GlobalState`）；协程执行态
     /// 一律用 `empty_thread()` + `bind_g()` 共享主人的块。
-    pub fn new_main(io: &'a mut dyn crate::mock::io_mock::Io) -> Self {
-        let owner = Box::new(GlobalState::new_shared(io));
+    ///
+    /// Rust API 入口：`allocator` 由调用方选择 — `Box::new(DefaultAllocator)` 或任意
+    /// 自定义 `Allocator` 实现。C API 路径（lua_newstate）经由 setallocf 语义注入
+    /// `CapiAllocator` 包装宿主的 lua_Alloc。
+    pub fn new_main_with_allocator(
+        io: &'a mut dyn crate::mock::io_mock::Io,
+        allocator: Box<dyn Allocator>,
+    ) -> Self {
+        let mut owner = Box::new(GlobalState::new_shared(io, allocator));
         let mut s = Self::empty_thread();
         s.stack = GlobalState::init_stack();
         s.top = s.stack.len();
@@ -511,16 +519,27 @@ impl<'a> LuaState<'a> {
         s
     }
 
+    /// 同 `new_main_with_allocator`，使用 `DefaultAllocator`。
+    pub fn new_main(io: &'a mut dyn crate::mock::io_mock::Io) -> Self {
+        Self::new_main_with_allocator(io, Box::new(DefaultAllocator))
+    }
+
     /// 进入执行前重绑定（规约 R1）：主线程以自有共享块重绑并登记 `G.main`，
     /// 协程以 `l_g` 指向的共享块重绑。所有进入点（execute/pcall/resume/capi 入口）
     /// 必须先调用本方法；`LuaState` 移动后旧指针失效，靠重新绑定自愈。
     #[inline]
     pub fn bind_exec(&mut self) {
+        // 取裸指针不经 `&mut` 引用：l_g 的 tag 保持 Reserved（interior mutable），
+        // Tree Borrows 下不被主线程经 owner 的 foreign write 禁用。
         let g: *mut GlobalState<'a> = match self.owner.as_mut() {
-            Some(b) => &mut **b as *mut GlobalState<'a>,
-            None => self.l_g,
+            Some(b) => std::ptr::addr_of_mut!(**b),
+            None => return, // 协程：l_g 已由调用方（bind_g）绑定
         };
-        self.bind_g(g);
+        self.l_g = g;
+        // 主线程登记 G.main（对应 C 的 G.mainthread）：GC 需把主线程栈当根。
+        // 经 owner 裸指针直接写（不经 l_g），避免把 l_g 的 tag 提升为 Active。
+        let self_ptr: *mut LuaState<'a> = self;
+        unsafe { (*g).main = self_ptr };
     }
 
     /// GC 根收集：本执行态可达的根值（栈/上值/帧闭包/hook/wrap 调用者栈）。
@@ -661,10 +680,6 @@ impl<'a> LuaState<'a> {
     #[inline]
     pub fn bind_g(&mut self, g: *mut GlobalState<'a>) {
         self.l_g = g;
-        // 主线程登记 G.main（对应 C 的 G.mainthread）：GC 需要把主线程栈当根。
-        if self.owner.is_some() && !g.is_null() {
-            unsafe { (*g).main = self as *mut LuaState<'a> };
-        }
     }
 
     /// 对应 C 的 `G(L)->gc`：取 GC 状态裸指针（不产生借用，便于与栈借用共存）。
@@ -723,6 +738,13 @@ impl<'a> std::ops::Deref for LuaState<'a> {
     }
 }
 
+impl<'a> std::ops::DerefMut for LuaState<'a> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut GlobalState<'a> {
+        self.g_mut()
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 进入点绑定（规约 R1）：pcall / execute 等进入执行前统一 bind_exec，
 // 使方法内的 `G(L)->` 访问有效（构造后移动了共享块，旧指针靠进入时重绑定自愈）。
@@ -733,10 +755,8 @@ impl<'a> LuaState<'a> {
     /// 标准库开库需要每线程执行态（LuaState = C 的 lua_State）。
     pub fn open_selected_libs(&mut self, _mask: i32, _ignored: i32) {
         let arg_table = Table::new();
-        self.globals.set(
-            str_to_ls(&self.string_table, "arg"),
-            TValue::Table(arg_table),
-        );
+        self.globals
+            .set(self.intern_str("arg"), TValue::Table(arg_table));
 
         // 打开基础库 (注册 print, type, pcall, error, setmetatable, getmetatable,
         // tonumber, tostring, assert, select, rawequal, rawlen, rawget, rawset,
@@ -2131,12 +2151,13 @@ impl<'a> LuaState<'a> {
     }
 
     pub fn push_string(&mut self, s: &str) {
-        let ls = str_to_ls(&self.string_table, s);
+        let ls = self.intern_str(s);
         self.stack.push(ls);
     }
 
     pub fn push_lstring(&mut self, s: &[u8]) {
-        let ls = crate::strings::new_lstr_bytes(&self.string_table, s);
+        let slot = self.alloc_slot();
+        let ls = crate::strings::new_lstr_bytes(slot, &self.string_table, s);
         self.stack.push(ls);
     }
 
@@ -2171,7 +2192,7 @@ impl<'a> LuaState<'a> {
     }
 
     pub fn get_global(&mut self, name: &str) -> LuaType {
-        let key = str_to_ls(&self.string_table, name);
+        let key = self.intern_str(name);
         match self.globals.get(&key) {
             Some(val) => {
                 let ty = val.ty();
@@ -2186,7 +2207,7 @@ impl<'a> LuaState<'a> {
     }
 
     pub fn set_global(&mut self, name: &str) {
-        let key = str_to_ls(&self.string_table, name);
+        let key = self.intern_str(name);
         if let Some(val) = self.stack.pop() {
             self.globals.set(key, val);
         }
@@ -2195,7 +2216,7 @@ impl<'a> LuaState<'a> {
     pub fn set_field(&mut self, idx: isize, key_name: &str) {
         let abs = self.abs_index(idx);
         let val = self.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
-        let key = str_to_ls(&self.string_table, key_name);
+        let key = self.intern_str(key_name);
         if abs > 0 && abs <= self.stack.len() {
             let tbl = &mut self.stack[abs - 1];
             if let TValue::Table(ref mut t) = tbl {
@@ -2206,7 +2227,7 @@ impl<'a> LuaState<'a> {
 
     pub fn get_field(&mut self, idx: isize, key_name: &str) -> LuaType {
         let abs = self.abs_index(idx);
-        let key = str_to_ls(&self.string_table, key_name);
+        let key = self.intern_str(key_name);
         if abs > 0 && abs <= self.stack.len() {
             let val = if let TValue::Table(ref t) = &self.stack[abs - 1] {
                 t.get(&key).unwrap_or(TValue::Nil(NilKind::Strict))
@@ -2420,7 +2441,12 @@ impl<'a> LuaState<'a> {
         if is_binary {
             // 二进制 chunk: 使用 undump_to_proto 解析 (对应 C 的 luaU_undump)
             // 传入 rest (跳过 BOM 和注释后的部分，从 LUA_SIGNATURE 开始)
-            return match crate::compiler::bytecode_dump::undump_to_proto(rest) {
+            let slot = self.alloc_slot();
+            return match crate::compiler::bytecode_dump::undump_to_proto(
+                rest,
+                slot,
+                &self.string_table,
+            ) {
                 Ok(mut proto) => {
                     // 驻留化字符串 (LongString → ShortString)
                     crate::stdlib::base_lib::intern_proto_strings(&mut proto, self);
@@ -3649,12 +3675,12 @@ pub struct GlobalState<'a> {
     /// （仅当释放了大量内存时才 trim，避免每次 GC 都做系统调用）
     pub last_gc_estimate: usize,
 
-    /// lua_newstate 时传入的 allocator userdata 指针。
-    /// 对应 C Lua 的 `lstate->ud`，由 lua_getallocf 返回给 C 代码。
-    /// skynet 的 service_snlua.c 用此机制存储 snlua 结构体指针，
-    /// lua_resumeX 通过 lua_getallocf 取回 snlua 指针调用 switchL。
-    /// 不归 GC 管理（外部 C 代码所有），Rust 仅持有裸指针。
-    pub allocf_ud: *mut std::ffi::c_void,
+    /// 内存管理器 — lmem 层（mem.rs），C 风格分配原语经 allocator 动态分发执行。
+    /// Rust API（`LuaState::new_main_with_allocator`）注入自定义 Allocator 或
+    /// DefaultAllocator；C API（lua_newstate / lua_setallocf）注入 CapiAllocator
+    /// 包装宿主的 lua_Alloc（lua_getallocf 经 allocf_parts 取回，skynet 用 ud 存
+    /// snlua 指针）。不归 GC 管理（外部 C 代码所有），Rust 仅持有裸指针。
+    pub mem: MemState<'a, Box<dyn Allocator>>,
 
     /// 输入输出缓冲区 — 用于模拟标准输入输出
     pub io: &'a mut dyn crate::mock::io_mock::Io,
@@ -3805,14 +3831,20 @@ pub fn get_caller_proto_for_ci<'a, 'b>(
 // ============================================================================
 
 impl<'a> GlobalState<'a> {
-    /// 对应 C 的 lua_newstate → global_State 部分（模块私有：只能由 `LuaState::new_main`
-    /// 调用，其他模块无法构造 `GlobalState`）。
-    fn new_shared(io: &'a mut dyn crate::mock::io_mock::Io) -> Self {
+    /// 对应 C 的 lua_newstate → global_State 部分（模块私有：只能由
+    /// `LuaState::new_main_with_allocator` 调用，其他模块无法构造 `GlobalState`）。
+    fn new_shared(io: &'a mut dyn crate::mock::io_mock::Io, allocator: Box<dyn Allocator>) -> Self {
         let string_table = Rc::new(StringTable::new());
         let global_state: Rc<RefCell<GlobalShared<'a>>> = Rc::new(RefCell::new(GlobalShared {
             gcstopem: false,
             gc: GCState::default_incremental(),
-            memerrmsg: crate::strings::new_lstr(&string_table, crate::strings::MEMERRMSG),
+            // 构造期尚无稳定 allocator 槽（owner Box 之后才有），且 MEMERRMSG
+            // 是短字符串走 intern——槽传 null（仅长字符串路径会用到）。
+            memerrmsg: crate::strings::new_lstr(
+                std::ptr::null_mut(),
+                &string_table,
+                crate::strings::MEMERRMSG,
+            ),
         }));
         let gs = &mut global_state.borrow_mut();
         let globals = {
@@ -3873,7 +3905,7 @@ impl<'a> GlobalState<'a> {
             cached_mode_key: std::cell::RefCell::new(None),
             cached_gc_key: std::cell::RefCell::new(None),
             last_gc_estimate: 0,
-            allocf_ud: std::ptr::null_mut(),
+            mem: MemState::new_complete(allocator),
             io: io,
         }
     }
@@ -3973,7 +4005,7 @@ impl<'a> LuaState<'a> {
             cached_mode_key: std::cell::RefCell::new(None),
             cached_gc_key: std::cell::RefCell::new(None),
             last_gc_estimate: 0,
-            allocf_ud: std::ptr::null_mut(),
+            mem: MemState::new_complete(Box::new(DefaultAllocator)),
             io: crate::mock::io_mock::lua_io(),
         });
         let mut s = LuaState::empty_thread();
@@ -4036,8 +4068,8 @@ impl<'a> Drop for GlobalState<'a> {
 // 字符串工具
 // ============================================================================
 
-pub fn str_to_ls<'a>(table: &StringTable, s: &str) -> TValue<'a> {
-    crate::strings::new_lstr(table, s)
+pub fn str_to_ls<'a>(alloc: crate::strings::AllocSlot, table: &StringTable, s: &str) -> TValue<'a> {
+    crate::strings::new_lstr(alloc, table, s)
 }
 
 fn format_float(f: f64) -> String {
@@ -4101,9 +4133,9 @@ impl<'a> GlobalState<'a> {
     /// state.set_builtin("my_add", my_add);
     /// state.do_string("print(my_add(3, 4))");  // 输出 7
     /// ```
-    pub fn set_builtin(&mut self, name: &'static std::ffi::CStr, func: BuiltinFnPtr) {
+    pub fn set_builtin(&self, name: &'static std::ffi::CStr, func: BuiltinFnPtr) {
         let name_str = name.to_str().unwrap_or("");
-        let key = str_to_ls(&self.string_table, name_str);
+        let key = self.intern_str(name_str);
         let name_ptr = name.as_ptr() as *const u8;
         self.globals
             .set(key, TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)));
@@ -4127,7 +4159,7 @@ impl<'a> GlobalState<'a> {
         func: BuiltinFnPtr,
     ) {
         let name_str = name.to_str().unwrap_or("");
-        let key = str_to_ls(&self.string_table, name_str);
+        let key = self.intern_str(name_str);
         let name_ptr = name.as_ptr() as *const u8;
         table.set(key, TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)));
     }
@@ -4233,18 +4265,26 @@ impl<'a> GlobalState<'a> {
 
     // ====== String Helpers ======
 
+    /// LongString 分配器槽：指向 `self.mem.allocator`（`GlobalState` 由 `Box`
+    /// 持有 → 地址稳定；`lua_setallocf` 原地替换 Box 内容后自动跟随）。
+    /// 用 `&self` 取槽以便与 `&self.string_table` 共存（见 [`crate::strings::AllocSlot`]）。
+    #[inline]
+    pub fn alloc_slot(&self) -> crate::strings::AllocSlot {
+        &self.mem.allocator as *const Box<dyn crate::mem::Allocator>
+    }
+
     pub fn intern_str(&self, s: &str) -> TValue<'a> {
-        str_to_ls(&self.string_table, s)
+        str_to_ls(self.alloc_slot(), &self.string_table, s)
     }
 
     pub fn intern(&self, s: &str) -> TValue<'a> {
-        str_to_ls(&self.string_table, s)
+        str_to_ls(self.alloc_slot(), &self.string_table, s)
     }
 
     /// 从 owned String 创建 LuaString，长字符串路径直接 consume 避免 clone。
     /// perf: str_format 等产生临时长 String 的场景，消除 with_nul 的 to_string() clone。
     pub fn intern_str_owned(&self, s: String) -> TValue<'a> {
-        crate::strings::new_lstr_from_string(&self.string_table, s)
+        crate::strings::new_lstr_from_string(self.alloc_slot(), &self.string_table, s)
     }
 
     /// 获取缓存的 "__mode" 字符串键（用于 GC mark_tvalue/process_ephemerons）
@@ -4719,7 +4759,13 @@ mod tests {
         let gs = Rc::new(RefCell::new(GlobalShared {
             gcstopem: false,
             gc: GCState::default_incremental(),
-            memerrmsg: crate::strings::new_lstr(&string_table, crate::strings::MEMERRMSG),
+            // 构造期尚无稳定 allocator 槽（owner Box 之后才有），且 MEMERRMSG
+            // 是短字符串走 intern——槽传 null（仅长字符串路径会用到）。
+            memerrmsg: crate::strings::new_lstr(
+                std::ptr::null_mut(),
+                &string_table,
+                crate::strings::MEMERRMSG,
+            ),
         }));
 
         // case 1: base=0, empty stack → main function scenario

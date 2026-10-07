@@ -846,6 +846,7 @@ fn format_float_len(f: f64) -> usize {
 /// When: 调用 concat_stack(stack, 2, &dmt)
 /// Then: 返回 Err(ConcatError { ... })
 pub fn concat_stack(
+    alloc: crate::strings::AllocSlot,
     table: &crate::strings::StringTable,
     stack: &mut Vec<TValue>,
     total: usize,
@@ -935,7 +936,7 @@ pub fn concat_stack(
             table.intern_value(&result)
         } else {
             // 长字符串: new_long_str_from_string 内部会追加 NUL 终止符
-            crate::strings::new_long_str_from_string(result)
+            crate::strings::new_long_str_from_string(alloc, result)
         };
         let target_idx = top - n;
         stack[target_idx] = ls;
@@ -2293,7 +2294,7 @@ mod tests {
         let tb = StringTable::new();
         let mut stack = vec![(tb.intern_value("hello")), (tb.intern_value("world"))];
         let len_before = stack.len();
-        concat_stack(&tb, &mut stack, 2).unwrap();
+        concat_stack(std::ptr::null(), &tb, &mut stack, 2).unwrap();
         assert_eq!(stack.len(), len_before - 1);
         if let ref s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = stack[0] {
             assert_eq!(lua_string_as_str(s), "helloworld");
@@ -2306,7 +2307,7 @@ mod tests {
     fn test_concat_stack_single_value() {
         let tb = StringTable::new();
         let mut stack = vec![(tb.intern_value("hello"))];
-        concat_stack(&tb, &mut stack, 1).unwrap();
+        concat_stack(std::ptr::null(), &tb, &mut stack, 1).unwrap();
         assert_eq!(stack.len(), 1);
     }
 
@@ -2318,7 +2319,7 @@ mod tests {
             (tb.intern_value("b")),
             (tb.intern_value("c")),
         ];
-        concat_stack(&tb, &mut stack, 3).unwrap();
+        concat_stack(std::ptr::null(), &tb, &mut stack, 3).unwrap();
         assert_eq!(stack.len(), 1);
         if let ref s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = stack[0] {
             assert_eq!(lua_string_as_str(s), "abc");
@@ -2331,7 +2332,7 @@ mod tests {
     fn test_concat_stack_with_numbers() {
         let tb = StringTable::new();
         let mut stack = vec![(tb.intern_value("x=")), TValue::Integer(42)];
-        concat_stack(&tb, &mut stack, 2).unwrap();
+        concat_stack(std::ptr::null(), &tb, &mut stack, 2).unwrap();
         if let ref s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = stack[0] {
             assert_eq!(lua_string_as_str(s), "x=42");
         } else {
@@ -2343,7 +2344,7 @@ mod tests {
     fn test_concat_stack_empty_first() {
         let tb = StringTable::new();
         let mut stack = vec![(tb.intern_value("")), (tb.intern_value("world"))];
-        concat_stack(&tb, &mut stack, 2).unwrap();
+        concat_stack(std::ptr::null(), &tb, &mut stack, 2).unwrap();
         assert_eq!(stack.len(), 1);
         if let ref s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = stack[0] {
             assert_eq!(lua_string_as_str(s), "world");

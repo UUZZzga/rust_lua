@@ -83,6 +83,17 @@ pub unsafe trait RcPayload {
     unsafe fn as_ref<'a>(payload: *const u8) -> &'a Self;
     unsafe fn drop_payload(payload: *mut u8);
     unsafe fn payload_size(payload: *const u8) -> usize;
+
+    /// 释放整个 SimpleRc/SimpleArc 块。默认走 std dealloc；
+    /// 由 MemState allocator 分配的 payload（如 LongString）覆写此方法，
+    /// 从块内读出 allocator 槽指针并走 `Allocator::alloc(ptr, size, 0, align)` 释放。
+    ///
+    /// # Safety
+    /// - `base`/`layout` 必须与分配时完全一致
+    /// - `payload` 指向块内 payload 起点（base + payload_offset）
+    unsafe fn free_block(base: *mut u8, _payload: *mut u8, layout: Layout) {
+        dealloc(base, layout);
+    }
 }
 
 unsafe impl<T: Sized> RcPayload for T {
@@ -982,7 +993,7 @@ impl<T: ?Sized + RcPayload> Drop for SimpleRc<T> {
                 T::drop_payload(payload);
                 let payload_size = T::payload_size(payload as *const u8);
                 let layout = simple_rc_block_layout(payload_size, T::ALIGN);
-                dealloc(base, layout);
+                T::free_block(base, payload, layout);
             }
         }
     }
@@ -1109,7 +1120,7 @@ impl<T: ?Sized + RcPayload> Drop for SimpleArc<T> {
                 T::drop_payload(payload);
                 let payload_size = T::payload_size(payload as *const u8);
                 let layout = simple_arc_block_layout(payload_size, T::ALIGN);
-                dealloc(base, layout);
+                T::free_block(base, payload, layout);
             }
         }
     }

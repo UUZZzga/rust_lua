@@ -2455,7 +2455,12 @@ impl VmExecutor {
                     if total > 1 {
                         // 尝试直接拼接 (对应 luaV_concat 的第一步)
                         let mut vals: Vec<TValue> = state.stack[a..a + total].to_vec();
-                        match concat_stack(&state.string_table, &mut vals, total) {
+                        match concat_stack(
+                            state.alloc_slot(),
+                            &state.string_table,
+                            &mut vals,
+                            total,
+                        ) {
                             Ok(()) => {
                                 for (i, v) in vals.into_iter().enumerate() {
                                     state.stack[a + i] = v;
@@ -2738,7 +2743,12 @@ impl VmExecutor {
                 break;
             }
             let mut vals: Vec<TValue> = state.stack[a..a + remaining].to_vec();
-            match concat_stack(&state.string_table, &mut vals, remaining) {
+            match concat_stack(
+                state.alloc_slot(),
+                &state.string_table,
+                &mut vals,
+                remaining,
+            ) {
                 Ok(()) => {
                     for (i, v) in vals.into_iter().enumerate() {
                         state.stack[a + i] = v;
@@ -4586,7 +4596,7 @@ impl VmExecutor {
         let concat_result = {
             // split_off 移动操作数到独立 Vec,避免 to_vec 的 clone
             let mut vals: Vec<TValue> = state.stack.split_off(a);
-            match concat_stack(&state.string_table, &mut vals, n) {
+            match concat_stack(state.alloc_slot(), &state.string_table, &mut vals, n) {
                 Ok(()) => Ok(vals),
                 Err(e) => Err((e, vals)),
             }
@@ -4638,7 +4648,12 @@ impl VmExecutor {
                     }
                     // split_off 移动 [a..] 到独立 Vec,避免 to_vec 的 clone
                     let mut vals: Vec<TValue> = state.stack.split_off(a);
-                    match concat_stack(&state.string_table, &mut vals, remaining) {
+                    match concat_stack(
+                        state.alloc_slot(),
+                        &state.string_table,
+                        &mut vals,
+                        remaining,
+                    ) {
                         Ok(()) => {
                             // concat_stack 后 vals 长度为 1,append 即可
                             state.stack.append(&mut vals);
@@ -7879,7 +7894,11 @@ mod tests {
             Rc::new(RefCell::new(GlobalShared {
                 gcstopem: false,
                 gc: GCState::default_incremental(),
-                memerrmsg: crate::strings::new_lstr(&string_table, crate::strings::MEMERRMSG),
+                memerrmsg: crate::strings::new_lstr(
+                    std::ptr::null_mut(),
+                    &string_table,
+                    crate::strings::MEMERRMSG,
+                ),
             })),
             string_table,
         );

@@ -2651,8 +2651,12 @@ fn call_load<'a>(
     }
     let proto_result = if is_binary {
         // 二进制格式: 使用 undump
-        crate::compiler::bytecode_dump::undump_to_proto(source.as_bytes())
-            .map_err(|e| format!("bad binary chunk: {}", e))
+        crate::compiler::bytecode_dump::undump_to_proto(
+            source.as_bytes(),
+            state.alloc_slot(),
+            &state.string_table,
+        )
+        .map_err(|e| format!("bad binary chunk: {}", e))
     } else {
         // 文本格式: 编译源代码
         crate::compiler::compile(state, &source, &chunkname)
@@ -4158,21 +4162,21 @@ mod tests {
         #[cfg(not(miri))]
         let exp = 22;
         t.set(
-            new_long_str_from_string(str_rep("a", 2_i64.pow(exp), "").unwrap()),
+            new_long_str_from_string(std::ptr::null(), str_rep("a", 2_i64.pow(exp), "").unwrap()),
             TValue::Integer(25),
         );
         t.set(
-            new_long_str_from_string(str_rep("b", 2_i64.pow(exp), "").unwrap()),
+            new_long_str_from_string(std::ptr::null(), str_rep("b", 2_i64.pow(exp), "").unwrap()),
             TValue::Table(Table::new()),
         );
         t.set(TValue::Table(Table::new()), TValue::Integer(14));
         let (key, val) = table_next(&t, &TValue::Nil(NilKind::Strict)).unwrap();
         assert!(matches!(key.clone(), Some(s @ TValue::LongStr(_))
-            if s == new_long_str_from_string(str_rep("a", 2_i64.pow(exp), "").unwrap())));
+            if s == new_long_str_from_string(std::ptr::null(), str_rep("a", 2_i64.pow(exp), "").unwrap())));
         assert_eq!(val, TValue::Integer(25));
         let (key, val) = table_next(&t, &key.unwrap()).unwrap();
         assert!(matches!(key.clone(), Some(s @ TValue::LongStr(_))
-            if s == new_long_str_from_string(str_rep("b", 2_i64.pow(exp), "").unwrap())));
+            if s == new_long_str_from_string(std::ptr::null(), str_rep("b", 2_i64.pow(exp), "").unwrap())));
         assert!(matches!(val.clone(), TValue::Table(_)));
         let (key, val) = table_next(&t, &key.unwrap()).unwrap();
         assert!(matches!(key.clone(), Some(TValue::Table(_))));

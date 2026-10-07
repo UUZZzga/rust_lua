@@ -851,7 +851,8 @@ fn call_os_date<'a>(
     }
 
     // 返回结果 (可能包含 \0, 用 new_long_bytes 保留原始字节)
-    let result_str = crate::strings::new_lstr_bytes(&state.string_table, &result);
+    let result_str =
+        crate::strings::new_lstr_bytes(state.alloc_slot(), &state.string_table, &result);
     state.adjust_results(a, nresults, vec![(result_str)]);
     Ok(())
 }
