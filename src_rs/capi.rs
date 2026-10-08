@@ -1535,20 +1535,42 @@ extern "C-unwind" fn lua_error(L: *mut lua_State) -> c_int {
 /// （skynet 用 ud 存 snlua 指针，lua_resumeX 经 lua_getallocf 取回）。
 pub type lua_Alloc = crate::mem::LuaCAlloc;
 
+/// 纯 Rust 分配器时 lua_getallocf 的兜底入口，对应 C Lua 的 l_alloc：
+/// C Lua 的 lua_getallocf 永不返回 NULL（tests_lua/libs/lib22.c 等宿主代码
+/// 会直接调用返回值，返回 NULL 直接段错误）。自包含实现，忽略 ud，
+/// 经 DefaultAllocator 走 std::alloc（与 CapiAllocator 的 None 兜底一致），
+/// 避免把 ud 指回 state 内部分配器导致 get→set 回环递归。
+unsafe extern "C" fn l_alloc_shim(
+    _ud: *mut c_void,
+    ptr: *mut c_void,
+    osize: usize,
+    nsize: usize,
+) -> *mut c_void {
+    crate::mem::DefaultAllocator.alloc(ptr as *mut u8, osize, nsize, 1) as *mut c_void
+}
+
 #[no_mangle]
 pub extern "C" fn lua_getallocf(L: *mut lua_State, ud: *mut *mut c_void) -> lua_Alloc {
     let L = unsafe { &*L };
     match L.mem.allocator.allocf_parts() {
-        Some((f, allocf_ud)) => {
+        Some((Some(f), allocf_ud)) => {
             if !ud.is_null() {
                 unsafe {
                     *ud = allocf_ud;
                 }
             }
-            f
+            Some(f)
         }
-        // 纯 Rust 分配器（DefaultAllocator 或自定义）：无 C 侧 allocf/ud
-        None => None,
+        // allocf 为 None 的 CapiAllocator 或纯 Rust 分配器：无 C 侧 allocf/ud，
+        // 返回兜底 shim（对齐 C Lua：永不返回 NULL）
+        _ => {
+            if !ud.is_null() {
+                unsafe {
+                    *ud = std::ptr::null_mut();
+                }
+            }
+            Some(l_alloc_shim)
+        }
     }
 }
 
@@ -4539,6 +4561,31 @@ mod tests {
     fn test_lua_newstate_close() {
         let L = lua_newstate(None, ptr::null_mut(), 0);
         assert!(!L.is_null());
+        lua_close(L);
+    }
+
+    /// 回归：lua_getallocf 永不返回 NULL（对齐 C Lua 的 l_alloc 兜底）。
+    /// tests_lua/libs/lib22.c (lib2-v2) 拿返回值直接调用分配内存，
+    /// 纯 Rust 分配器时返回 NULL 会在 `lua -l lib2-v2` 时段错误。
+    #[test]
+    fn test_lua_getallocf_never_null() {
+        // lua_newstate(None, ...) → CapiAllocator{allocf: None} → 兜底路径
+        let L = lua_newstate(None, ptr::null_mut(), 0);
+        assert!(!L.is_null());
+        let mut ud: *mut c_void = ptr::null_mut();
+        let f = lua_getallocf(L, &mut ud);
+        assert!(f.is_some(), "lua_getallocf must not return NULL");
+
+        // 返回的 allocf 必须可用：分配 / 重分配 / 释放（lib22.c 的用法）
+        let f = f.unwrap();
+        let blk = unsafe { f(ud, ptr::null_mut(), 0, 64) };
+        assert!(!blk.is_null(), "alloc via returned allocf failed");
+        let blk = unsafe { f(ud, blk, 64, 128) };
+        assert!(!blk.is_null(), "realloc via returned allocf failed");
+        unsafe { f(ud, blk, 128, 0) };
+
+        // 经 shim 分配的块可被 state 释放路径回收吗？不 —— shim 块由 shim 释放；
+        // 这里只验证 C 侧自身分配/释放闭环，与 lib22.c 用法一致。
         lua_close(L);
     }
 
