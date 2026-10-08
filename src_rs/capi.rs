@@ -994,7 +994,8 @@ pub extern "C" fn lua_tocfunction(L: *mut lua_State, idx: c_int) -> Option<lua_C
 #[no_mangle]
 pub extern "C" fn lua_createtable(L: *mut lua_State, narr: c_int, nrec: c_int) {
     let L = unsafe { &mut *L };
-    let t = Table::with_capacity(
+    let t = Table::with_capacity_in(
+        L.alloc_slot(),
         if narr > 0 { narr as usize } else { 0 },
         if nrec > 0 { nrec as usize } else { 0 },
     );
@@ -1909,7 +1910,7 @@ pub extern "C" fn lua_rawequal(L: *mut lua_State, idx1: c_int, idx2: c_int) -> c
                     b @ (TValue::LongStr(_) | TValue::ShortStr(_)),
                 ) => (lua_string_eq(a, b)) as c_int,
                 (TValue::Table(a), TValue::Table(b)) => {
-                    (Rc::as_ptr(&a.data) == Rc::as_ptr(&b.data)) as c_int
+                    std::ptr::addr_eq(a.data.as_ptr(), b.data.as_ptr()) as c_int
                 }
                 (TValue::UserData(a), TValue::UserData(b)) => {
                     (a.gc_header.ptr_id == b.gc_header.ptr_id) as c_int
@@ -1962,7 +1963,7 @@ pub extern "C" fn lua_compare(L: *mut lua_State, idx1: c_int, idx2: c_int, op: c
                         b @ (TValue::LongStr(_) | TValue::ShortStr(_)),
                     ) => lua_string_eq(a, b),
                     (TValue::Table(a), TValue::Table(b)) => {
-                        Rc::as_ptr(&a.data) == Rc::as_ptr(&b.data)
+                        std::ptr::addr_eq(a.data.as_ptr(), b.data.as_ptr())
                     }
                     (TValue::LightUserData(a), TValue::LightUserData(b)) => a == b,
                     (TValue::LClosure(a), TValue::LClosure(b)) => {
@@ -3037,7 +3038,7 @@ pub extern "C" fn luaL_newmetatable(L: *mut lua_State, tname: *const c_char) -> 
     {
         return 0;
     }
-    let table = Table::with_capacity(0, 2);
+    let table = Table::with_capacity_in(L.alloc_slot(), 0, 2);
     let name_key = L.intern_str("__name");
     table.set(name_key, tname.clone());
     L.registry.set(tname, TValue::Table(table.clone()));
@@ -3148,7 +3149,7 @@ pub extern "C" fn luaL_requiref(
         Some(TValue::Table(t)) => t,
         _ => {
             // _LOADED 表不存在：创建并注册到 registry
-            let t = Table::new();
+            let t = Table::new_in(L.alloc_slot());
             L.registry.set(loaded_key, TValue::Table(t.clone()));
             t
         }

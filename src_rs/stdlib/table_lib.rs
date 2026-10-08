@@ -16,7 +16,6 @@ use crate::strings::lua_string_as_str;
 use crate::table::Table;
 use crate::tm::{call_order_tm, obj_type_name, TagMethod};
 use crate::vm::VmExecutor;
-use std::rc::Rc;
 
 // ============================================================================
 // 函数标签 (已迁移到 BuiltinFn，不再使用 LightUserData tag)
@@ -821,7 +820,9 @@ fn call_move<'a>(
         // 决定复制方向: 当源和目标重叠时反向复制避免覆盖未读取元素
         // C: t > e || t <= f || (tt != 1 && !lua_compare(L, 1, tt, LUA_OPEQ))
         let src_eq_dst = match (&src_val, &dst_val) {
-            (TValue::Table(s), TValue::Table(d)) => Rc::ptr_eq(&s.data, &d.data),
+            (TValue::Table(s), TValue::Table(d)) => {
+                crate::objects::TableDataRc::ptr_eq(&s.data, &d.data)
+            }
             _ => false,
         };
         let ascending = t > e || t <= f || !src_eq_dst;

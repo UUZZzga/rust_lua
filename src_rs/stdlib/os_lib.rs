@@ -1031,6 +1031,7 @@ mod tests {
         assert!(matches!(val, Some(TValue::Table(_))));
     }
 
+    #[cfg_attr(miri, ignore)]
     #[test]
     fn test_time_date() {
         let nums = [0, 1, 1000, 0x7fffffff, 0x80000000];

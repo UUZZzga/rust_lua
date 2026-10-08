@@ -205,9 +205,7 @@ pub fn base_rawequal<'a>(v1: &TValue<'a>, v2: &TValue<'a>) -> bool {
             b @ (TValue::LongStr(_) | TValue::ShortStr(_)),
         ) => lua_string_eq(a, b),
         (TValue::LightUserData(a), TValue::LightUserData(b)) => std::ptr::eq(*a, *b),
-        (TValue::Table(a), TValue::Table(b)) => {
-            std::rc::Rc::as_ptr(&a.data) == std::rc::Rc::as_ptr(&b.data)
-        }
+        (TValue::Table(a), TValue::Table(b)) => std::ptr::addr_eq(a.data.as_ptr(), b.data.as_ptr()),
         (TValue::UserData(a), TValue::UserData(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
         _ => false,
     }

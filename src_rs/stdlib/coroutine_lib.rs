@@ -352,7 +352,7 @@ fn scan_table_and_close_upvals<'a>(
     visited: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
     visited_tables: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
 ) {
-    let table_ptr = Rc::as_ptr(&table.data) as usize;
+    let table_ptr = table.data.as_raw_ptr() as usize;
     if !visited_tables.insert(table_ptr) {
         return;
     }
@@ -542,7 +542,7 @@ fn scan_table_and_collect_upvals<'a>(
     visited: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
     visited_tables: &mut std::collections::HashSet<usize, crate::objects::FxBuildHasher>,
 ) {
-    let table_ptr = Rc::as_ptr(&table.data) as usize;
+    let table_ptr = table.data.as_raw_ptr() as usize;
     if !visited_tables.insert(table_ptr) {
         return;
     }

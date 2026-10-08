@@ -6,14 +6,12 @@
 //! - 数组部分：`Vec<TValue>`，1-based，空槽存储 `Nil(Empty)`
 //! - 哈希部分：`Vec<(TValue, TValue)>` (hash_buckets) 按插入顺序存储，(key, value) 对
 //! - 用 `key_to_bucket: HashMap<TValue, usize>` 做 O(1) 查找
-//! - 数据通过 `Rc<RefCell<TableData>>` 共享，克隆 Table 共享同一份数据
+//! - 数据通过 `TableDataRc`（Rc 语义，块经 MemState allocator 分配）共享，克隆 Table 共享同一份数据
 //! - `LuaTable` 封装为未来元方法支持预留接口
 
 use crate::gc::GCObjectHeader;
-use crate::objects::{NilKind, TValue, TableData};
+use crate::objects::{NilKind, TValue, TableData, TableDataRc};
 use crate::strings::lua_string_eq;
-use std::cell::RefCell;
-use std::rc::Rc;
 
 pub use crate::objects::Table;
 
@@ -43,43 +41,67 @@ pub(crate) fn hash_get<'a>(td: &TableData<'a>, key: &TValue<'a>) -> Option<TValu
 // ============================================================================
 
 impl<'a> Table<'a> {
+    /// 创建空表 — 无 allocator 槽（测试/构造期），块走 std::alloc。
+    /// 运行态请用 [`Table::new_in`]，让 TableData 块经 MemState allocator 分配。
     pub fn new() -> Self {
+        Self::new_in(std::ptr::null_mut())
+    }
+
+    /// 创建空表 — TableData 块（header + 数据）由 `alloc_slot` 指向的
+    /// MemState allocator 分配/释放（null 回退 std::alloc）。
+    pub fn new_in(alloc_slot: crate::strings::AllocSlot) -> Self {
         Table {
-            data: Rc::new(RefCell::new(TableData {
-                gc_header: GCObjectHeader::new(),
-                array: Vec::new(),
-                hash_buckets: Vec::new(),
-                key_to_bucket: None,
-                metatable: None,
-            })),
+            data: TableDataRc::new_table(
+                alloc_slot,
+                TableData {
+                    gc_header: GCObjectHeader::new(),
+                    array: Vec::new(),
+                    hash_buckets: Vec::new(),
+                    key_to_bucket: None,
+                    metatable: None,
+                },
+            ),
         }
     }
 
     pub fn with_capacity(narray: usize, nhash: usize) -> Self {
+        Self::with_capacity_in(std::ptr::null_mut(), narray, nhash)
+    }
+
+    /// 创建带容量的表 — TableData 块由 `alloc_slot` 指向的 MemState allocator
+    /// 分配/释放（null 回退 std::alloc）。对应 C 的 lua_createtable。
+    pub fn with_capacity_in(
+        alloc_slot: crate::strings::AllocSlot,
+        narray: usize,
+        nhash: usize,
+    ) -> Self {
         Table {
-            data: Rc::new(RefCell::new(TableData {
-                gc_header: GCObjectHeader::new(),
-                array: (0..narray).map(|_| TValue::Nil(NilKind::Empty)).collect(),
-                hash_buckets: Vec::with_capacity(nhash),
-                key_to_bucket: if nhash > 0 {
-                    #[cfg(not(size_optimized))]
-                    {
-                        Some(Box::new(hashbrown::HashTable::with_capacity(nhash)))
-                    }
-                    #[cfg(size_optimized)]
-                    {
-                        Some(Box::new(
-                            crate::objects::TableHashMap::with_capacity_and_hasher(
-                                nhash,
-                                crate::objects::FxBuildHasher::default(),
-                            ),
-                        ))
-                    }
-                } else {
-                    None
+            data: TableDataRc::new_table(
+                alloc_slot,
+                TableData {
+                    gc_header: GCObjectHeader::new(),
+                    array: (0..narray).map(|_| TValue::Nil(NilKind::Empty)).collect(),
+                    hash_buckets: Vec::with_capacity(nhash),
+                    key_to_bucket: if nhash > 0 {
+                        #[cfg(not(size_optimized))]
+                        {
+                            Some(Box::new(hashbrown::HashTable::with_capacity(nhash)))
+                        }
+                        #[cfg(size_optimized)]
+                        {
+                            Some(Box::new(
+                                crate::objects::TableHashMap::with_capacity_and_hasher(
+                                    nhash,
+                                    crate::objects::FxBuildHasher::default(),
+                                ),
+                            ))
+                        }
+                    } else {
+                        None
+                    },
+                    metatable: None,
                 },
-                metatable: None,
-            })),
+            ),
         }
     }
 
@@ -175,7 +197,8 @@ impl<'a> Table<'a> {
     /// 与正常 borrow 等价但省去 borrow flag 读写 (各 1 次依赖加载 + 分支)。
     #[cfg_attr(not(size_optimized), inline(always))]
     pub(crate) fn data_ro(&self) -> &TableData<'a> {
-        unsafe { &*self.data.as_ptr() }
+        // 绕过 borrow 标志直接取 &TableData（仅用于无并发写场景）
+        unsafe { &*(*self.data.as_ptr()).cell.as_ptr() }
     }
 
     /// 一次 borrow 内同时查找值并返回元表 — 消除 metamethod 路径的第二次 borrow。

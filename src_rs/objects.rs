@@ -31,9 +31,11 @@ use crate::strings::{
 use std::cell::RefCell;
 use std::rc::Rc;
 
+use crate::alloc::{rc_block_layout, rc_payload_offset, MyRc, RcHeader, RcPayload, WeakRc};
 use crate::execute::VmError;
 use crate::gc::GCObjectHeader;
 use crate::state::LuaState;
+use crate::strings::AllocSlot;
 
 // ============================================================================
 // FxHash — 用于 Table 哈希部分的快速非加密哈希
@@ -934,7 +936,7 @@ impl<'a> PartialEq for TValue<'a> {
             (TValue::Table(a), TValue::Table(b)) => {
                 // 与 Hash impl 一致: Rc 地址身份比较, 免 RefCell borrow
                 // (borrow_mut 作用域内比较键相等性会 double-borrow panic)
-                Rc::as_ptr(&a.data) == Rc::as_ptr(&b.data)
+                std::ptr::addr_eq(a.data.as_ptr(), b.data.as_ptr())
             }
             (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
             (TValue::CClosure(a), TValue::CClosure(b)) => Rc::ptr_eq(a, b),
@@ -999,7 +1001,7 @@ impl<'a> Hash for TValue<'a> {
                 // Rc 地址与 ptr_id 同为唯一身份: 同一表的所有 clone 共享同一
                 // Rc → 同地址; 活表键持有 Rc 强引用, 地址不会复用。
                 6u8.hash(state);
-                (Rc::as_ptr(&t.data) as usize).hash(state);
+                (t.data.as_raw_ptr() as usize).hash(state);
             }
             TValue::LClosure(c) => {
                 7u8.hash(state);
@@ -1128,9 +1130,9 @@ pub struct LCFunction {
 // 规约：表类型 (用 hashbrown::HashMap 重写)
 // ============================================================================
 
-/// Lua 表的数据部分 —— 被 `Rc<RefCell<TableData>>` 包装以实现共享语义。
+/// Lua 表的数据部分 —— 被 [`TableDataRc`]（Rc 语义 + MemState allocator）包装以实现共享语义。
 ///
-/// 将数据分离到 `TableData` 中，使得 `Table` 的克隆（仅克隆 `Rc`）共享同一份数据。
+/// 将数据分离到 `TableData` 中，使得 `Table` 的克隆（仅克隆 Rc）共享同一份数据。
 /// 这解决了 `_ENV` upvalue 与 `state.globals` 不同步的问题：
 /// 克隆后的 Table 仍然指向同一份数据，修改对两者都可见。
 pub struct TableData<'a> {
@@ -1242,8 +1244,9 @@ impl<'a> Drop for TableData<'a> {
 
         // 迭代释放独占引用的 Table，避免递归 Drop
         while let Some(t) = pending.pop() {
-            if let Ok(ref_cell) = Rc::try_unwrap(t.data) {
-                let mut td = ref_cell.into_inner();
+            if t.data.strong_count() == 1 {
+                // 独占引用：就地清空字段后交给 t.data 的 Drop 释放（字段已空，无递归）
+                let mut td = t.data.borrow_mut();
                 for v in td.array.drain(..) {
                     extract(v, &mut pending);
                 }
@@ -1260,13 +1263,14 @@ impl<'a> Drop for TableData<'a> {
                     pending.push(*mt);
                 }
             }
+            // 共享引用：上面未清空，strong 减计数后由其他持有者负责释放
         }
     }
 }
 
 /// Lua 表 —— 关联数组，包含数组部分和哈希部分。
 ///
-/// 数据字段包装在 `Rc<RefCell<TableData>>` 中，克隆 `Table` 时共享同一份数据，
+/// 数据字段包装在 [`TableDataRc`]（Rc 语义）中，克隆 `Table` 时共享同一份数据，
 /// 而非深拷贝。这保证了 `_ENV` upvalue 与 `state.globals` 始终同步。
 ///
 /// `gc_header` 保留在 `Table` 上（不在 `TableData` 中），因为 `ptr_id` 需要在克隆时保持一致。
@@ -1274,14 +1278,14 @@ impl<'a> Drop for TableData<'a> {
 /// 方法实现见 [crate::table]。
 pub struct Table<'a> {
     /// 共享数据 —— 克隆 Table 时仅增加 Rc 引用计数
-    pub data: Rc<RefCell<TableData<'a>>>,
+    pub data: TableDataRc<'a>,
 }
 
 impl<'a> Clone for Table<'a> {
     /// 克隆 Table：仅克隆 `Rc`（共享数据），并克隆 `gc_header`（保持同一 `ptr_id`）。
     fn clone(&self) -> Self {
         Table {
-            data: Rc::clone(&self.data),
+            data: self.data.clone(),
         }
     }
 }
@@ -1297,13 +1301,127 @@ impl<'a> fmt::Debug for Table<'a> {
 impl<'a> Default for Table<'a> {
     fn default() -> Self {
         Table {
-            data: Rc::new(RefCell::new(TableData {
-                gc_header: GCObjectHeader::new(),
-                array: Vec::new(),
-                hash_buckets: Vec::new(),
-                key_to_bucket: None,
-                metatable: None,
-            })),
+            data: TableDataRc::new_table(
+                std::ptr::null_mut(),
+                TableData {
+                    gc_header: GCObjectHeader::new(),
+                    array: Vec::new(),
+                    hash_buckets: Vec::new(),
+                    key_to_bucket: None,
+                    metatable: None,
+                },
+            ),
+        }
+    }
+}
+
+// ============================================================================
+// TableDataCell — LongString 同款 DST payload，块经 MemState allocator 分配/释放
+// ============================================================================
+
+/// `TableData` 的 allocator 路由包装：首字段存 MemState allocator 槽
+/// （见 [`AllocSlot`]），`free_block` 覆写把整块（RcHeader + payload）的释放
+/// 路由回该 allocator（对应 C Lua 中 Table 头走 global_State 的 allocf）。
+/// 槽为 null（测试/构造期）时回退 std::alloc，分配/释放路径一致。
+///
+/// 末尾 `_tail: [u8]` 恒为空，仅使类型为 DST 以绕开 `RcPayload` 对 Sized
+/// 类型的 blanket impl（从而允许自定义 `free_block`，与 LongString 一致）。
+/// Deref 到 `RefCell<TableData>`，使 `Table.data.borrow()` 等调用点写法
+/// 与原 `Rc<RefCell<TableData>>` 完全一致。
+#[repr(C)]
+pub struct TableDataCell<'a> {
+    /// MemState allocator 槽（[`crate::strings::AllocSlot`]）
+    pub alloc: AllocSlot,
+    pub cell: RefCell<TableData<'a>>,
+    _tail: [u8],
+}
+
+unsafe impl<'a> RcPayload for TableDataCell<'a> {
+    const ALIGN: usize = {
+        let a = std::mem::align_of::<AllocSlot>();
+        let b = std::mem::align_of::<RefCell<TableData<'a>>>();
+        if a > b {
+            a
+        } else {
+            b
+        }
+    };
+
+    unsafe fn as_ref<'b>(payload: *const u8) -> &'b Self {
+        // 尾部 [u8] 长度恒为 0，用 0 元数据重建 DST 胖指针（LongString 同款）
+        let p: *const TableDataCell<'a> = std::mem::transmute((payload, 0usize));
+        &*p
+    }
+
+    unsafe fn drop_payload(payload: *mut u8) {
+        std::ptr::drop_in_place(
+            payload.add(std::mem::offset_of!(TableDataCell, cell)) as *mut RefCell<TableData<'a>>
+        );
+    }
+
+    unsafe fn payload_size(_payload: *const u8) -> usize {
+        // alloc 槽 + cell（_tail 恒空，占 0 字节）；与 new_table 的分配大小一致
+        std::mem::offset_of!(TableDataCell, cell) + std::mem::size_of::<RefCell<TableData<'a>>>()
+    }
+
+    /// 块由 MemState allocator 分配（[`TableDataRc::new_table`]），释放同样路由回去；
+    /// 槽为 null 时回退 std dealloc（与分配路径一致）。
+    unsafe fn free_block(base: *mut u8, payload: *mut u8, layout: std::alloc::Layout) {
+        let slot = *(payload as *const AllocSlot);
+        if slot.is_null() {
+            std::alloc::dealloc(base, layout);
+        } else {
+            let got = (&*slot).alloc(base, layout.size(), 0, layout.align());
+            debug_assert!(got.is_null(), "TableData 释放应返回 NULL");
+        }
+    }
+}
+
+impl<'a> std::ops::Deref for TableDataCell<'a> {
+    type Target = RefCell<TableData<'a>>;
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.cell
+    }
+}
+
+/// Table 数据的共享指针：[`MyRc`]（strong + weak 计数）包装 [`TableDataCell`]。
+/// weak 侧为 [`WeakRc`]（弱表 GC 用，见 `GlobalState::weak_tables`）。
+pub type TableDataRc<'a> = MyRc<TableDataCell<'a>>;
+pub type TableDataWeak<'a> = WeakRc<TableDataCell<'a>>;
+
+impl<'a> TableDataRc<'a> {
+    /// 创建 TableData 共享块。`alloc_slot` 为 MemState allocator 槽：
+    /// 非 null 时分配（以及末位释放，经 `free_block`）路由到该 allocator；
+    /// null 时回退 std::alloc。
+    pub fn new_table(alloc_slot: AllocSlot, td: TableData<'a>) -> Self {
+        unsafe {
+            let align = <TableDataCell<'a> as RcPayload>::ALIGN;
+            let payload_size =
+                std::mem::size_of::<AllocSlot>() + std::mem::size_of::<RefCell<TableData<'a>>>();
+            let header_offset = rc_payload_offset(align);
+            let layout = rc_block_layout(payload_size, align);
+
+            // 1) 一次分配 header + payload（经 MemState allocator，与 free_block 对应）
+            let base = if alloc_slot.is_null() {
+                std::alloc::alloc(layout)
+            } else {
+                (&*alloc_slot).alloc(std::ptr::null_mut(), 0, layout.size(), align)
+            };
+            if base.is_null() {
+                std::alloc::handle_alloc_error(layout);
+            }
+
+            // 2) 初始化 header 与固定字段（严格按结构体字段顺序）
+            std::ptr::write(base as *mut RcHeader, RcHeader::default());
+            let p = base.add(header_offset);
+            std::ptr::write(p as *mut AllocSlot, alloc_slot);
+            std::ptr::write(
+                p.add(std::mem::size_of::<AllocSlot>()) as *mut RefCell<TableData<'a>>,
+                RefCell::new(td),
+            );
+
+            MyRc::from_raw_base(base)
         }
     }
 }

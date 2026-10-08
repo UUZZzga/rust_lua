@@ -3231,7 +3231,7 @@ impl VmExecutor {
                             // 已是期望值, 无需写栈。
                             if a < state.stack.len() {
                                 if let TValue::Table(old) = &state.stack[a] {
-                                    if std::rc::Rc::ptr_eq(&old.data, &t2.data) {
+                                    if crate::objects::TableDataRc::ptr_eq(&old.data, &t2.data) {
                                         Some(SpecValue::Skip)
                                     } else {
                                         Some(SpecValue::Table(t2.clone()))
@@ -3802,7 +3802,8 @@ impl VmExecutor {
         let hash_size = if b > 0 { 1u32 << (b - 1) } else { 0 };
         let array_size = c as usize;
         state.maybe_collect_gc();
-        let table = Table::with_capacity(array_size, hash_size as usize);
+        // TableData 块经 MemState allocator 分配（对应 C 的 luaM_new(L, Table)）
+        let table = Table::with_capacity_in(state.alloc_slot(), array_size, hash_size as usize);
         // 使用 mem_size() 计算实际内存占用（含 Table 结构 + array + hash），
         // 避免 GC 低估内存导致不及时回收（big.lua/verybig.lua 内存分配失败）
         let table_id = unsafe { state.gc_mut().register_object(table.mem_size()) };
@@ -7389,7 +7390,7 @@ impl VmExecutor {
             // PF_VATAB: 创建 vararg 表
             // 变参在 state.base + nfixparams .. state.base + nfixparams + nextra
             let vatab_pos = state.base + nfixparams;
-            let table = Table::new();
+            let table = Table::new_in(state.alloc_slot());
             for i in 0..nextra {
                 let val = state.stack[vatab_pos + i].clone();
                 table.set_int((i + 1) as i64, val);

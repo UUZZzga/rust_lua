@@ -2393,7 +2393,7 @@ fn call_upvalueid<'a>(
                 .unwrap_or(false);
             if is_gmatch_iter && n > 0 && n <= 3 {
                 // gmatch 迭代器有 3 个 upvalue，用表指针 + n 作为唯一标识
-                let ptr = Rc::as_ptr(&t.data) as *mut std::ffi::c_void;
+                let ptr = t.data.as_ptr() as *mut std::ffi::c_void;
                 let id_ptr = (ptr as usize + n) as *mut std::ffi::c_void;
                 push_single_result(state, a, nresults, TValue::LightUserData(id_ptr));
             } else {

@@ -7,7 +7,7 @@ use crate::mem::{Allocator, DefaultAllocator, MemState};
 use crate::objects::FxBuildHasher;
 use crate::objects::{
     BuiltinFn, BuiltinFnPtr, Instruction, LClosure, LuaThread, LuaType, NilKind, Proto, TValue,
-    TableData, ThreadContext, UpVal, UpValRef, UpValVec,
+    ThreadContext, UpVal, UpValRef, UpValVec,
 };
 use crate::strings::{lua_string_as_str, lua_string_len, StringTable};
 use crate::table::Table;
@@ -3647,7 +3647,7 @@ pub struct GlobalState<'a> {
     pub main_thread: LuaThread<'a>,
     /// 弱引用表列表 — setmetatable 设置 __mode 时注册，collectgarbage 时清理
     /// 使用 Weak 引用避免阻止表本身的回收
-    pub weak_tables: Rc<RefCell<Vec<std::rc::Weak<std::cell::RefCell<TableData<'a>>>>>>,
+    pub weak_tables: Rc<RefCell<Vec<crate::objects::TableDataWeak<'a>>>>,
     /// op_concat 的 GC 计数器 — 字符串不注册到 GC metas，用计数器限制
     /// 每 concat_gc_interval 次 op_concat 触发一次 GC（清理弱引用表等）
     pub concat_gc_counter: std::cell::Cell<usize>,
@@ -4314,7 +4314,7 @@ impl<'a> GlobalState<'a> {
     /// 注册弱引用表 — 当 setmetatable 设置包含 __mode 的元表时调用
     /// 使用 Weak 引用避免阻止表本身的回收
     pub fn register_weak_table(&mut self, t: &Table<'a>) {
-        self.weak_tables.borrow_mut().push(Rc::downgrade(&t.data));
+        self.weak_tables.borrow_mut().push(t.data.downgrade());
     }
 
     /// 注册有 __gc 元方法的对象 — 当 setmetatable 设置包含 __gc 的元表时调用
