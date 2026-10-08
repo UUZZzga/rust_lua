@@ -25,7 +25,7 @@ mod compat {
     pub unsafe fn errno_ptr() -> *mut c_int {
         libc::__errno_location()
     }
-    pub use libc::{mkstemp, mktime, strftime};
+    pub use libc::{difftime, mkstemp, mktime, strftime, time};
     pub unsafe fn gmtime_r(timep: *const libc::time_t, result: *mut libc::tm) -> *mut libc::tm {
         libc::gmtime_r(timep, result)
     }
@@ -79,6 +79,9 @@ mod compat {
     }
 
     // strftime 和 mktime: UCRT 提供, libc crate 在 Windows 上未暴露
+    // 注意: 直接链接 `mktime`/`time`/`difftime` 会解析到 32 位 time_t 版本
+    // (_mktime32 等), 2038 年之后的时间会溢出返回 -1。必须显式使用 64 位
+    // 版本 _mktime64/_time64/_difftime64。
     extern "C" {
         pub fn strftime(
             s: *mut c_char,
@@ -86,7 +89,21 @@ mod compat {
             fmt: *const c_char,
             tm: *const libc::tm,
         ) -> usize;
-        pub fn mktime(tm: *mut libc::tm) -> libc::time_t;
+        pub fn _mktime64(tm: *mut libc::tm) -> libc::time_t;
+        pub fn _time64(t: *mut libc::time_t) -> libc::time_t;
+        pub fn _difftime64(t1: libc::time_t, t2: libc::time_t) -> f64;
+    }
+
+    pub unsafe fn mktime(tm: *mut libc::tm) -> libc::time_t {
+        unsafe { _mktime64(tm) }
+    }
+
+    pub unsafe fn time(t: *mut libc::time_t) -> libc::time_t {
+        unsafe { _time64(t) }
+    }
+
+    pub unsafe fn difftime(t1: libc::time_t, t2: libc::time_t) -> f64 {
+        unsafe { _difftime64(t1, t2) }
     }
 }
 
@@ -731,7 +748,7 @@ fn call_os_date<'a>(
     let t: libc::time_t = if nargs >= 2 {
         let v = get_arg(state, a, 1);
         match &v {
-            TValue::Nil(_) => unsafe { libc::time(std::ptr::null_mut()) },
+            TValue::Nil(_) => unsafe { compat::time(std::ptr::null_mut()) },
             _ => match crate::vm::to_integer_ns(&v, crate::vm::F2IMode::Eq) {
                 Some(n) => n as libc::time_t,
                 None => {
@@ -743,7 +760,7 @@ fn call_os_date<'a>(
             },
         }
     } else {
-        unsafe { libc::time(std::ptr::null_mut()) }
+        unsafe { compat::time(std::ptr::null_mut()) }
     };
 
     // 处理 "!" 前缀 (UTC)
@@ -868,7 +885,7 @@ fn call_os_time<'a>(
 ) -> Result<(), VmError<'a>> {
     let result = if nargs < 1 || matches!(get_arg(state, a, 0), TValue::Nil(_)) {
         // 无参数: 返回当前时间
-        let t = unsafe { libc::time(std::ptr::null_mut()) };
+        let t = unsafe { compat::time(std::ptr::null_mut()) };
         if t == -1 as libc::time_t {
             return Err(VmError::RuntimeError(
                 "time result cannot be represented in this installation".to_string(),
@@ -962,7 +979,7 @@ fn call_os_difftime<'a>(
             )))
         }
     };
-    let diff = unsafe { libc::difftime(t1, t2) };
+    let diff = unsafe { compat::difftime(t1, t2) };
     state.adjust_results(a, nresults, vec![TValue::Float(diff)]);
     Ok(())
 }
@@ -1012,5 +1029,27 @@ mod tests {
         let val = state.globals.get(&key);
         assert!(val.is_some(), "os must be registered");
         assert!(matches!(val, Some(TValue::Table(_))));
+    }
+
+    #[test]
+    fn test_time_date() {
+        let nums = [0, 1, 1000, 0x7fffffff, 0x80000000];
+        let mut state = LuaState::default();
+        for n in nums {
+            assert_eq!(1, state.stack.len());
+            state.push_string("*t");
+            state.push_integer(n);
+            let _ = call_os_date(&mut state, 0, 2, 1).unwrap();
+            assert_eq!(1, state.stack.len());
+            let val = state.stack.get(0).unwrap();
+            assert!(val.is_table());
+            state.push_value(val.clone());
+            let _ = call_os_time(&mut state, 0, 1, 1).unwrap();
+            let val = state.stack.get(0).unwrap();
+            let t = val.as_integer().unwrap();
+            assert_eq!(n, t);
+            state.pop(1);
+            state.push_nil();
+        }
     }
 }
