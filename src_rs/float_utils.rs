@@ -267,9 +267,12 @@ pub fn f64_from_str(s: &str) -> Option<f64> {
 
 /// 将字符串解析为 f64 (纯 Rust 版本)。
 ///
+/// 对应 C Lua l_str2d 的语义: 先按 '.' 小数点解析 (覆盖 "C" locale 及
+/// `load` 数字字面量场景); 失败且 locale 小数点不是 '.' 时, 将其替换为
+/// '.' 后重试 (如 pt_BR locale 下 "3,4" → "3.4")。
+///
 /// **注意**: Rust 的 `str::parse::<f64>` 不识别十六进制浮点数 (如 `0x1.8p3`),
-/// 也不支持 locale 小数点。若默认构建需要这些语义, 应替换为 `lexical-parse-float` 等
-/// 纯 Rust 解析库。
+/// hex float 由 `objects::parse_hex_float` 单独处理。
 #[cfg(any(not(size_optimized), miri))]
 #[inline]
 pub fn f64_from_str(s: &str) -> Option<f64> {
@@ -277,7 +280,21 @@ pub fn f64_from_str(s: &str) -> Option<f64> {
     if trimmed.is_empty() {
         return None;
     }
-    trimmed.parse::<f64>().ok()
+    // 第一次尝试: '.' 作为小数点
+    if let Ok(v) = trimmed.parse::<f64>() {
+        return Some(v);
+    }
+    // Locale fallback (对应 C Lua l_str2d): strtod 在 pt_BR 等 locale 下
+    // 接受 locale 小数点 ("3,4"), 这里对称地把 locale 小数点替换为 '.' 后重试。
+    // Miri 下 get_locale_decpoint 恒为 '.', 不会调用 FFI。
+    let dec_point = unsafe { get_locale_decpoint() };
+    if dec_point != '.' {
+        let alt = trimmed.replace(dec_point, ".");
+        if let Ok(v) = alt.parse::<f64>() {
+            return Some(v);
+        }
+    }
+    None
 }
 
 /// 用 `libc::strtod` 解析字符串, 要求整个字符串都被消费。
@@ -300,7 +317,10 @@ fn try_strtod(s: &str) -> Option<f64> {
 }
 
 /// 获取当前 locale 的小数点字符 (对应 C 的 lua_getlocaledecpoint)。
-#[cfg(all(size_optimized, not(miri)))]
+///
+/// 通过 CRT `localeconv()` 查询, `os.setlocale` 设置的 locale (如 pt_BR 的 ',')
+/// 会立即生效。
+#[cfg(not(miri))]
 pub unsafe fn get_locale_decpoint() -> char {
     #[repr(C)]
     struct LConv {
@@ -317,8 +337,8 @@ pub unsafe fn get_locale_decpoint() -> char {
     }
 }
 
-/// 获取当前 locale 的小数点字符 (纯 Rust / Miri 回退: 恒为 `.`)。
-#[cfg(any(not(size_optimized), miri))]
+/// 获取当前 locale 的小数点字符 (Miri 回退: 恒为 `.`)。
+#[cfg(miri)]
 #[inline]
 pub unsafe fn get_locale_decpoint() -> char {
     '.'

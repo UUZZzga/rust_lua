@@ -6,7 +6,7 @@ use crate::opcodes::{
     getarg_sj, getarg_vb, getarg_vc, testarg_k, OFFSET_sJ, OpCode, OpMode, POS_A, POS_B, POS_C,
     POS_K, POS_VB, POS_VC, SIZE_A, SIZE_BX, TM_EVENT_NAMES,
 };
-use crate::strings::{lua_string_as_str, AllocSlot, StringTable};
+use crate::strings::{lua_string_as_str, new_lstr, AllocSlot, StringTable};
 #[cfg(test)]
 use imara_diff::{Algorithm, Diff, InternedInput};
 #[cfg(feature = "cmp_c")]
@@ -1494,13 +1494,6 @@ pub fn dump_proto(f: &Proto, strip: bool) -> Vec<u8> {
 // DumpedFunction → Proto 转换 (用于 load 加载二进制格式)
 // ============================================================================
 
-/// 创建长字符串的辅助函数
-/// 使用 with_nul 添加额外 NUL 终止符，与 as_str_inner 的 NUL 剥离机制配合
-/// 长字符串块经 `table` 的 allocator 槽由 MemState 分配/释放（对应 C luaU_undump）
-fn make_long_string<'a>(alloc: AllocSlot, s: &str) -> TValue<'a> {
-    crate::strings::new_long_str(alloc, s)
-}
-
 /// 将 DumpedFunction 转换为 Proto
 /// 对应 C 的 luaU_undump 后的 Proto 构建
 pub fn dumped_to_proto<'a>(
@@ -1527,7 +1520,7 @@ pub fn dumped_to_proto<'a>(
                 DumpConstant::Boolean(b) => TValue::Boolean(*b),
                 DumpConstant::Integer(i) => TValue::Integer(*i),
                 DumpConstant::Float(f) => TValue::Float(*f),
-                DumpConstant::String(s) => make_long_string(alloc, s),
+                DumpConstant::String(s) => new_lstr(alloc, table, s),
             })
             .collect(),
     );
@@ -1541,7 +1534,7 @@ pub fn dumped_to_proto<'a>(
                 name: df
                     .upvalue_names
                     .get(i)
-                    .and_then(|n| n.as_ref().map(|s| make_long_string(alloc, s))),
+                    .and_then(|n| n.as_ref().map(|s| new_lstr(alloc, table, s))),
                 in_stack: *instack,
                 idx: *idx,
                 parent_local_idx: 0,
@@ -1559,7 +1552,7 @@ pub fn dumped_to_proto<'a>(
     );
 
     // source
-    proto.source = df.source.as_ref().map(|s| make_long_string(alloc, s));
+    proto.source = df.source.as_ref().map(|s| new_lstr(alloc, table, s));
 
     // 调试信息
     proto.line_info = df.line_info.clone();
@@ -1575,7 +1568,7 @@ pub fn dumped_to_proto<'a>(
         .loc_vars
         .iter()
         .map(|(varname, startpc, endpc)| LocVar {
-            varname: varname.as_ref().map(|s| make_long_string(alloc, s)),
+            varname: varname.as_ref().map(|s| new_lstr(alloc, table, s)),
             start_pc: *startpc,
             end_pc: *endpc,
         })
