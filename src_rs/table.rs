@@ -10,7 +10,8 @@
 //! - `LuaTable` 封装为未来元方法支持预留接口
 
 use crate::gc::GCObjectHeader;
-use crate::objects::{NilKind, TValue, TableData, TableDataRc};
+use crate::mem::SlotAlloc;
+use crate::objects::{NilKind, TValue, TableData, TableDataRc, TableVec};
 use crate::strings::lua_string_eq;
 
 pub use crate::objects::Table;
@@ -49,14 +50,16 @@ impl<'a> Table<'a> {
 
     /// 创建空表 — TableData 块（header + 数据）由 `alloc_slot` 指向的
     /// MemState allocator 分配/释放（null 回退 std::alloc）。
+    /// 数组/哈希缓冲区与 key_to_bucket 索引同样经该分配器。
     pub fn new_in(alloc_slot: crate::strings::AllocSlot) -> Self {
+        let alloc = SlotAlloc(alloc_slot);
         Table {
             data: TableDataRc::new_table(
                 alloc_slot,
                 TableData {
                     gc_header: GCObjectHeader::new(),
-                    array: Vec::new(),
-                    hash_buckets: Vec::new(),
+                    array: TableVec::new_in(alloc),
+                    hash_buckets: TableVec::new_in(alloc),
                     key_to_bucket: None,
                     metatable: None,
                 },
@@ -75,17 +78,23 @@ impl<'a> Table<'a> {
         narray: usize,
         nhash: usize,
     ) -> Self {
+        let alloc = SlotAlloc(alloc_slot);
+        let mut array = TableVec::with_capacity_in(narray, alloc);
+        array.resize(narray, TValue::Nil(NilKind::Empty));
         Table {
             data: TableDataRc::new_table(
                 alloc_slot,
                 TableData {
                     gc_header: GCObjectHeader::new(),
-                    array: (0..narray).map(|_| TValue::Nil(NilKind::Empty)).collect(),
-                    hash_buckets: Vec::with_capacity(nhash),
+                    array,
+                    hash_buckets: TableVec::with_capacity_in(nhash, alloc),
                     key_to_bucket: if nhash > 0 {
                         #[cfg(not(size_optimized))]
                         {
-                            Some(Box::new(hashbrown::HashTable::with_capacity(nhash)))
+                            Some(crate::mem::AllocBox::new_in(
+                                hashbrown::HashTable::with_capacity_in(nhash, alloc),
+                                alloc,
+                            ))
                         }
                         #[cfg(size_optimized)]
                         {
@@ -795,6 +804,64 @@ mod tests {
         let t = Table::default();
         assert_eq!(t.array_size(), 0);
         assert_eq!(t.hash_size(), 0);
+    }
+
+    /// 表的三个内部容器（array / hash_buckets / key_to_bucket）都携带并使用
+    /// MemState allocator 槽（对应 C 表经 global_State.allocf 分配）。
+    #[test]
+    fn test_table_inner_containers_use_custom_allocator() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        use crate::mem::{Allocator, DefaultAllocator};
+
+        struct CountingAllocator {
+            n: Rc<Cell<usize>>,
+        }
+        impl Allocator for CountingAllocator {
+            fn alloc(&self, ptr: *mut u8, osize: usize, nsize: usize, align: usize) -> *mut u8 {
+                if nsize > osize {
+                    self.n.set(self.n.get() + 1);
+                }
+                DefaultAllocator.alloc(ptr, osize, nsize, align)
+            }
+        }
+
+        let counter = Rc::new(Cell::new(0usize));
+        let boxed: Box<dyn Allocator> = Box::new(CountingAllocator {
+            n: Rc::clone(&counter),
+        });
+        let slot: crate::strings::AllocSlot = &boxed;
+
+        let t = Table::new_in(slot);
+        {
+            let data = t.data.borrow();
+            // 两个 Vec 直接携带该槽（空表不分配缓冲区）
+            assert!(std::ptr::eq(data.array.allocator().0, slot));
+            assert!(std::ptr::eq(data.hash_buckets.allocator().0, slot));
+        }
+
+        // 写数组元素 → array 缓冲区经自定义分配器扩容
+        let n0 = counter.get();
+        for i in 1..=8i64 {
+            t.set_int(i, TValue::Integer(i));
+        }
+        assert!(counter.get() > n0, "array 缓冲区应经自定义分配器");
+
+        // 写哈希键 → hash_buckets 缓冲区与 key_to_bucket 索引经自定义分配器
+        let n1 = counter.get();
+        t.set(TValue::Boolean(true), TValue::Integer(42));
+        {
+            let data = t.data.borrow();
+            let ktb = data.key_to_bucket.as_ref().unwrap();
+            assert!(std::ptr::eq(ktb.allocator().0, slot));
+        }
+        assert!(
+            counter.get() > n1,
+            "hash_buckets/key_to_bucket 应经自定义分配器"
+        );
+
+        drop(t);
     }
 
     #[test]

@@ -3,6 +3,11 @@
 //! 通过 CMake 将 Rust 源码编译为静态库，再用 C++ 调用。
 //! 逐步替代 Lua 的 C 实现。
 
+// `nightly-allocator`: 允许 allocator-aware 容器使用标准库的 `Box<T, A>` /
+// `Vec<T, A>`（受 unstable `allocator_api` 门控）。stable 下为 no-op，
+// 见 [crate::mem] 的 `AllocBox` / `AllocVec`。
+#![cfg_attr(feature = "nightly-allocator", feature(allocator_api))]
+
 // 原始 FFI 声明（extern "C"）— 仅 cmp_c feature 时编译（引用 C 符号）
 #[cfg(feature = "cmp_c")]
 pub mod bindings;

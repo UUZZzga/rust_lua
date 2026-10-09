@@ -160,6 +160,204 @@ impl Allocator for CapiAllocator {
 }
 
 // ============================================================================
+// Allocator-aware 容器：标准库优先，回退 allocator_api2
+// ============================================================================
+
+#[cfg(not(feature = "nightly-allocator"))]
+pub use allocator_api2::boxed::Box as AllocBox;
+/// 标准库的 `Box<T, A>` / `Vec<T, A>`（自定义分配器）受 unstable `allocator_api`
+/// 特性门控，stable 不可用。因此这里按 crate feature 选择实现：
+///
+/// - 启用 `nightly-allocator`（需 nightly）：直接指向标准库 [`std::boxed::Box`] /
+///   [`std::vec::Vec`]；此时 [`SlotAlloc`] 额外实现 `core::alloc::Allocator`；
+/// - 未启用（stable 默认）：回退到 [`allocator_api2`] 的兼容实现，API 完全一致。
+///
+/// 两种情形下 [`SlotAlloc`] 都实现了容器所需的分配器 trait，容器代码无需区分。
+/// 注意：Cargo 无法按工具链自动开关依赖 feature，nightly 上需显式
+/// `cargo build --features nightly-allocator`（crate 根的 `#![feature(allocator_api)]`
+/// 已由 `cfg_attr` 自动启用）。
+#[cfg(feature = "nightly-allocator")]
+pub use std::boxed::Box as AllocBox;
+
+#[cfg(not(feature = "nightly-allocator"))]
+pub use allocator_api2::vec::Vec as AllocVec;
+#[cfg(feature = "nightly-allocator")]
+pub use std::vec::Vec as AllocVec;
+
+// ============================================================================
+// SlotAlloc — 面向 allocator-aware 容器的适配器，把 Vec/Box/HashTable 的分配
+// 路由到 MemState 的分配器槽（AllocSlot）
+// ============================================================================
+
+/// 把 [`crate::strings::AllocSlot`]（`*const Box<dyn Allocator>`）适配为
+/// allocator-aware 容器的分配器（[`AllocVec`] / [`AllocBox`] /
+/// [`hashbrown::HashTable`]，分别对应 C 的数组部分 / 盒 / Node 数组）：
+/// - [`AllocVec`]（标准库 `Vec<T, A>`，回退 `allocator_api2::vec::Vec`）
+/// - [`AllocBox`]（标准库 `Box<T, A>`，回退 `allocator_api2::boxed::Box`）
+/// - [`hashbrown::HashTable`]（`A = SlotAlloc`，对应 C Lua Node 数组）
+///
+/// 槽非 null 时分配/重分配/释放全部经该分配器（对应 C 的 global_State.allocf）；
+/// 槽为 null（测试/早期构造）回退 std::alloc，与分配路径一致。
+///
+/// `Copy`：仅持有一个指针，容器（Vec/Box/HashTable）要求 `A: Clone` 时零成本复制。
+#[derive(Clone, Copy)]
+pub struct SlotAlloc(pub crate::strings::AllocSlot);
+
+impl Default for SlotAlloc {
+    #[inline]
+    fn default() -> Self {
+        SlotAlloc(std::ptr::null())
+    }
+}
+
+impl SlotAlloc {
+    /// 经槽分配/释放；`new_size == 0` 时释放并返回 null（C realloc 语义）。
+    /// null 槽回退 std::alloc。
+    #[inline]
+    unsafe fn raw_realloc(
+        &self,
+        ptr: *mut u8,
+        old_size: usize,
+        new_size: usize,
+        align: usize,
+    ) -> *mut u8 {
+        if self.0.is_null() {
+            if new_size == 0 {
+                if old_size != 0 && !ptr.is_null() {
+                    let layout = Layout::from_size_align_unchecked(old_size, align);
+                    alloc::dealloc(ptr, layout);
+                }
+                return std::ptr::null_mut();
+            }
+            if ptr.is_null() || old_size == 0 {
+                match Layout::from_size_align(new_size, align) {
+                    Ok(l) => alloc::alloc(l),
+                    Err(_) => std::ptr::null_mut(),
+                }
+            } else {
+                let old_layout = Layout::from_size_align_unchecked(old_size, align);
+                alloc::realloc(ptr, old_layout, new_size)
+            }
+        } else {
+            (&*self.0).alloc(ptr, old_size, new_size, align)
+        }
+    }
+}
+
+// SAFETY: 所有方法都满足 Allocator 契约——返回的块由同一分配器（槽或 std::alloc）
+// 分配，且 deallocate/grow/shrink 使用与分配时相同的 layout。
+unsafe impl allocator_api2::alloc::Allocator for SlotAlloc {
+    #[inline]
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+        let ptr =
+            unsafe { self.raw_realloc(std::ptr::null_mut(), 0, layout.size(), layout.align()) };
+        let nn = NonNull::new(ptr).ok_or(allocator_api2::alloc::AllocError)?;
+        Ok(NonNull::slice_from_raw_parts(nn, layout.size()))
+    }
+
+    #[inline]
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        self.raw_realloc(ptr.as_ptr(), layout.size(), 0, layout.align());
+    }
+
+    #[inline]
+    unsafe fn grow(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+        debug_assert!(new_layout.size() >= old_layout.size());
+        let new_ptr = self.raw_realloc(
+            ptr.as_ptr(),
+            old_layout.size(),
+            new_layout.size(),
+            new_layout.align(),
+        );
+        let nn = NonNull::new(new_ptr).ok_or(allocator_api2::alloc::AllocError)?;
+        Ok(NonNull::slice_from_raw_parts(nn, new_layout.size()))
+    }
+
+    #[inline]
+    unsafe fn shrink(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, allocator_api2::alloc::AllocError> {
+        debug_assert!(new_layout.size() <= old_layout.size());
+        let new_ptr = self.raw_realloc(
+            ptr.as_ptr(),
+            old_layout.size(),
+            new_layout.size(),
+            new_layout.align(),
+        );
+        let nn = NonNull::new(new_ptr).ok_or(allocator_api2::alloc::AllocError)?;
+        Ok(NonNull::slice_from_raw_parts(nn, new_layout.size()))
+    }
+}
+
+// 标准库 `Vec<T, A>` / `Box<T, A>` 所需的分配器契约（`core::alloc::Allocator`，
+// unstable `allocator_api`，仅 `nightly-allocator` 时编译）。
+//
+// 这与上方 `allocator_api2::alloc::Allocator` 是**两个不同的 trait**（后者是
+// stable 下的兼容 shim），各写各的 impl 互不冲突：`AllocBox`/`AllocVec` 走本 impl，
+// `hashbrown::HashTable`（`A = SlotAlloc`）走 shim impl。方法体复用
+// [`SlotAlloc::raw_realloc`]，全部满足 Allocator 契约（同一分配器分配/释放，
+// deallocate/grow/shrink 使用与分配时相同的 layout）。
+#[cfg(feature = "nightly-allocator")]
+unsafe impl core::alloc::Allocator for SlotAlloc {
+    #[inline]
+    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, core::alloc::AllocError> {
+        let ptr =
+            unsafe { self.raw_realloc(std::ptr::null_mut(), 0, layout.size(), layout.align()) };
+        let nn = NonNull::new(ptr).ok_or(core::alloc::AllocError)?;
+        Ok(NonNull::slice_from_raw_parts(nn, layout.size()))
+    }
+
+    #[inline]
+    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+        self.raw_realloc(ptr.as_ptr(), layout.size(), 0, layout.align());
+    }
+
+    #[inline]
+    unsafe fn grow(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, core::alloc::AllocError> {
+        debug_assert!(new_layout.size() >= old_layout.size());
+        let new_ptr = self.raw_realloc(
+            ptr.as_ptr(),
+            old_layout.size(),
+            new_layout.size(),
+            new_layout.align(),
+        );
+        let nn = NonNull::new(new_ptr).ok_or(core::alloc::AllocError)?;
+        Ok(NonNull::slice_from_raw_parts(nn, new_layout.size()))
+    }
+
+    #[inline]
+    unsafe fn shrink(
+        &self,
+        ptr: NonNull<u8>,
+        old_layout: Layout,
+        new_layout: Layout,
+    ) -> Result<NonNull<[u8]>, core::alloc::AllocError> {
+        debug_assert!(new_layout.size() <= old_layout.size());
+        let new_ptr = self.raw_realloc(
+            ptr.as_ptr(),
+            old_layout.size(),
+            new_layout.size(),
+            new_layout.align(),
+        );
+        let nn = NonNull::new(new_ptr).ok_or(core::alloc::AllocError)?;
+        Ok(NonNull::slice_from_raw_parts(nn, new_layout.size()))
+    }
+}
+
+// ============================================================================
 // 内存错误类型
 // ============================================================================
 

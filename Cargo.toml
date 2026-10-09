@@ -61,6 +61,17 @@ skynet = []
 #   - 也可独立启用: cargo build --features lua_longjmp
 # 注意: size_optimized 模式 (OPT_LEVEL=s/z) 自动启用此 feature, 无需手动指定。
 lua_longjmp = []
+# nightly-allocator: 在 nightly 工具链上让 allocator-aware 容器使用标准库实现。
+# 标准库的 `Box<T, A>` / `Vec<T, A>`（自定义分配器）受 unstable allocator_api
+# 特性门控, stable 不可用。启用本 feature 后 (src_rs/mem.rs):
+#   - crate 根经 cfg_attr 启用 #![feature(allocator_api)];
+#   - AllocBox/AllocVec 直接指向标准库 std::boxed::Box / std::vec::Vec;
+#   - SlotAlloc 额外实现 core::alloc::Allocator (与 allocator-api2 的 shim 是两个
+#     不同的 trait, hashbrown::HashTable 仍走 shim, 互不影响)。
+# 未启用 (stable 默认) 时回退 allocator_api2 兼容实现 (API 完全一致)。
+# 注意: Cargo 无法按工具链自动开关, 故 nightly 上需显式指定。
+# 用法: cargo build --features nightly-allocator
+nightly-allocator = []
 # 体积优先模式: 通过 [profile.size-opt] 实现 (opt-level="z" + panic="abort"),
 # build.rs 检测 OPT_LEVEL=s/z 自动设置 cfg(size_optimized) 切换代码层面优化:
 #   - hashbrown::HashMap/HashTable → std::collections::HashMap (减小二进制体积)
@@ -84,6 +95,10 @@ lua_longjmp = []
 [dependencies]
 libc = "0.2"
 hashbrown = "0.15"
+# allocator-api2: 让 Vec/Box/HashTable 等容器携带 MemState 自定义分配器
+# （经 AllocSlot 路由）。hashbrown 0.15 默认已依赖它，此处直接引用其
+# Allocator trait 与 Vec/Box 容器，避免重复造轮子。
+allocator-api2 = "0.2"
 bitflags = "2"
 parking_lot = { version = "0.12", optional = true }
 const_format = "0.2"

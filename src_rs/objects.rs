@@ -161,10 +161,26 @@ pub type TableHashMap<'a, V> = std::collections::HashMap<TValue<'a>, V, FxBuildH
 /// 控制字节 SIMD 组）+ 调用方 eq 闭包探测，eq 直接比较条目内的 key 克隆，
 /// 单跳定位（对应 C Lua Node 的 main position 比较模式），省去 HashMap
 /// 每次 get 的 BuildHasher 调用链与 Result/Eq 适配层。
+/// key→bucket 索引的分配器由 [`crate::mem::SlotAlloc`] 提供（对应 C Lua Node
+/// 数组经 global_State.allocf 分配）；size_optimized 回退 std HashMap（不支持自定义
+/// 分配器，走全局分配器）。
 #[cfg(not(size_optimized))]
-pub type TableHashIndex<'a> = hashbrown::HashTable<(TValue<'a>, usize)>;
+pub type TableHashIndex<'a> = hashbrown::HashTable<(TValue<'a>, usize), crate::mem::SlotAlloc>;
 #[cfg(size_optimized)]
 pub type TableHashIndex<'_> = TableHashMap<usize>;
+
+/// `key_to_bucket` 的堆内盒子 —— not(size_optimized) 经 [`crate::mem::SlotAlloc`]
+/// 分配（内含 HashTable 的缓冲区同样经该分配器）；size_optimized 走 std Box。
+/// 标准库 `Box<T, A>` 受 unstable `allocator_api` 门控，故经 [`crate::mem::AllocBox`]
+/// 在“标准库 / allocator_api2”间选择。
+#[cfg(not(size_optimized))]
+pub type TableKeyBox<'a> = crate::mem::AllocBox<TableHashIndex<'a>, crate::mem::SlotAlloc>;
+#[cfg(size_optimized)]
+pub type TableKeyBox<'a> = Box<TableHashIndex<'a>>;
+
+/// 数组部分 / 哈希部分的分配器感知 Vec（对应 C 的 luaM_growvector 分配路径）。
+/// 经 [`crate::mem::AllocVec`] 在标准库 `Vec<T, A>` / `allocator_api2::vec::Vec` 间选择。
+pub type TableVec<T> = crate::mem::AllocVec<T, crate::mem::SlotAlloc>;
 
 /// 计算 TValue 的 FxHash 哈希 — 与 impl Hash for TValue + FxBuildHasher 一致。
 ///
@@ -1137,15 +1153,16 @@ pub struct LCFunction {
 /// 克隆后的 Table 仍然指向同一份数据，修改对两者都可见。
 pub struct TableData<'a> {
     pub gc_header: GCObjectHeader,
-    /// 数组部分（1-based，索引 0 对应键 1）
-    pub array: Vec<TValue<'a>>,
+    /// 数组部分（1-based，索引 0 对应键 1）—— 缓冲区经 MemState allocator 分配
+    pub array: TableVec<TValue<'a>>,
     /// 哈希部分：(key, value) 对 — 保持插入顺序用于 next() 遍历与 GC 标记
-    pub hash_buckets: Vec<(TValue<'a>, TValue<'a>)>,
+    /// 缓冲区经 MemState allocator 分配
+    pub hash_buckets: TableVec<(TValue<'a>, TValue<'a>)>,
     /// `key → hash_buckets index` 索引 — 让 get / set / next 能 O(1) 定位。
-    /// TableHashIndex = HashTable<(TValue, usize)>: 开放寻址 + 预计算哈希 +
+    /// TableHashIndex = HashTable<(TValue, usize), SlotAlloc>: 开放寻址 + 预计算哈希 +
     /// eq 直接比较条目内 key 克隆，单跳定位（同 C Lua Node main position）。
-    /// Option<Box<…>> 使空表不浪费结构体内存
-    pub key_to_bucket: Option<Box<TableHashIndex<'a>>>,
+    /// Option<Box<…>> 使空表不浪费结构体内存；Box 与表内缓冲区均经 MemState allocator。
+    pub key_to_bucket: Option<TableKeyBox<'a>>,
     /// 元表
     pub metatable: Option<Box<Table<'a>>>,
 }
@@ -1164,10 +1181,16 @@ impl<'a> TableData<'a> {
     #[cfg(not(size_optimized))]
     #[cfg_attr(not(size_optimized), inline)]
     pub fn idx_insert(&mut self, key: &TValue<'a>, idx: usize) {
-        let ktb = self
-            .key_to_bucket
-            .get_or_insert_with(|| Box::new(hashbrown::HashTable::default()));
+        if self.key_to_bucket.is_none() {
+            // 索引盒子与 HashTable 缓冲区都沿用数组部分的 MemState allocator 槽
+            let alloc = *self.array.allocator();
+            self.key_to_bucket = Some(crate::mem::AllocBox::new_in(
+                hashbrown::HashTable::with_capacity_in(0, alloc),
+                alloc,
+            ));
+        }
         let hash = tvalue_fx_hash(key);
+        let ktb = self.key_to_bucket.as_mut().unwrap();
         ktb.insert_unique(hash, (key.clone(), idx), |(k, _)| tvalue_fx_hash(k));
     }
 
@@ -1233,8 +1256,8 @@ impl<'a> Drop for TableData<'a> {
             extract(k, &mut pending);
             extract(v, &mut pending);
         }
-        if let Some(ktb) = self.key_to_bucket.take() {
-            for (k, _) in *ktb {
+        if let Some(mut ktb) = self.key_to_bucket.take() {
+            for (k, _) in ktb.drain() {
                 extract(k, &mut pending);
             }
         }
@@ -1254,8 +1277,8 @@ impl<'a> Drop for TableData<'a> {
                     extract(k, &mut pending);
                     extract(v, &mut pending);
                 }
-                if let Some(ktb) = td.key_to_bucket.take() {
-                    for (k, _) in *ktb {
+                if let Some(mut ktb) = td.key_to_bucket.take() {
+                    for (k, _) in ktb.drain() {
                         extract(k, &mut pending);
                     }
                 }
@@ -1300,13 +1323,14 @@ impl<'a> fmt::Debug for Table<'a> {
 
 impl<'a> Default for Table<'a> {
     fn default() -> Self {
+        let alloc = crate::mem::SlotAlloc::default();
         Table {
             data: TableDataRc::new_table(
                 std::ptr::null_mut(),
                 TableData {
                     gc_header: GCObjectHeader::new(),
-                    array: Vec::new(),
-                    hash_buckets: Vec::new(),
+                    array: TableVec::new_in(alloc),
+                    hash_buckets: TableVec::new_in(alloc),
                     key_to_bucket: None,
                     metatable: None,
                 },
