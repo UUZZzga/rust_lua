@@ -74,8 +74,6 @@ lua_longjmp = []
 nightly-allocator = []
 # 体积优先模式: 通过 [profile.size-opt] 实现 (opt-level="z" + panic="abort"),
 # build.rs 检测 OPT_LEVEL=s/z 自动设置 cfg(size_optimized) 切换代码层面优化:
-#   - hashbrown::HashMap/HashTable → std::collections::HashMap (减小二进制体积)
-#   - 自定义 FxHash → std 默认 SipHash (消除特化方法代码)
 #   - 浮点格式化/解析用 libc snprintf/strtod 替代 Rust flt2dec/dec2flt (~34KB)
 #   - f64_to_string 两阶段格式化匹配 C Lua 5.5 (先 %.15g, 不往返再用 %.17g)
 #   - main.rs 不使用 std::thread::Builder, 减少线程 panic 处理代码

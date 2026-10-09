@@ -46,10 +46,10 @@ use crate::strings::AllocSlot;
 // 不需要 SipHash 的加密强度。FxHash 速度快 5-10 倍，显著降低哈希开销。
 // 对应 C Lua 的 luaH_hashstr 等使用简单哈希的策略。
 //
-// size_optimized 模式下用 std 默认 SipHash (RandomState), 减小二进制体积:
-// FxHasher 的 write_u8/u16/u32/... 等特化方法各生成独立代码。
+// FxHash 体积代价 ~几百字节（全 inline 算术，无调用），不值得为它维护
+// 一份 SipHash 回退分支；std HashMap 的 SipHash/RawTable 代码无论如何都因
+// compiler/state 等模块被链接，切换 hasher 边际节省 ≈ 0。
 
-#[cfg(not(size_optimized))]
 pub(crate) mod fx_hash_impl {
     use std::hash::{BuildHasherDefault, Hasher};
 
@@ -136,20 +136,7 @@ pub(crate) mod fx_hash_impl {
     pub use FxHasher as FxHasherPub;
 }
 
-#[cfg(not(size_optimized))]
 pub use fx_hash_impl::FxBuildHasher;
-
-// size_optimized: 用 std 默认 RandomState (SipHash) 替代 FxHash
-#[cfg(size_optimized)]
-pub type FxBuildHasher = std::collections::hash_map::RandomState;
-
-// ============================================================================
-// Table 哈希表类型别名
-// ============================================================================
-#[cfg(not(size_optimized))]
-pub type TableHashMap<'a, V> = hashbrown::HashMap<TValue<'a>, V, FxBuildHasher>;
-#[cfg(size_optimized)]
-pub type TableHashMap<'a, V> = std::collections::HashMap<TValue<'a>, V, FxBuildHasher>;
 
 // ============================================================================
 // Table 哈希索引 — hashbrown::HashTable<(TValue, usize)>
@@ -162,21 +149,14 @@ pub type TableHashMap<'a, V> = std::collections::HashMap<TValue<'a>, V, FxBuildH
 /// 单跳定位（对应 C Lua Node 的 main position 比较模式），省去 HashMap
 /// 每次 get 的 BuildHasher 调用链与 Result/Eq 适配层。
 /// key→bucket 索引的分配器由 [`crate::mem::SlotAlloc`] 提供（对应 C Lua Node
-/// 数组经 global_State.allocf 分配）；size_optimized 回退 std HashMap（不支持自定义
-/// 分配器，走全局分配器）。
-#[cfg(not(size_optimized))]
+/// 数组经 global_State.allocf 分配）。
 pub type TableHashIndex<'a> = hashbrown::HashTable<(TValue<'a>, usize), crate::mem::SlotAlloc>;
-#[cfg(size_optimized)]
-pub type TableHashIndex<'_> = TableHashMap<usize>;
 
-/// `key_to_bucket` 的堆内盒子 —— not(size_optimized) 经 [`crate::mem::SlotAlloc`]
-/// 分配（内含 HashTable 的缓冲区同样经该分配器）；size_optimized 走 std Box。
+/// `key_to_bucket` 的堆内盒子，经 [`crate::mem::SlotAlloc`]
+/// 分配（内含 HashTable 的缓冲区同样经该分配器）。
 /// 标准库 `Box<T, A>` 受 unstable `allocator_api` 门控，故经 [`crate::mem::AllocBox`]
 /// 在“标准库 / allocator_api2”间选择。
-#[cfg(not(size_optimized))]
 pub type TableKeyBox<'a> = crate::mem::AllocBox<TableHashIndex<'a>, crate::mem::SlotAlloc>;
-#[cfg(size_optimized)]
-pub type TableKeyBox<'a> = Box<TableHashIndex<'a>>;
 
 /// 数组部分 / 哈希部分的分配器感知 Vec（对应 C 的 luaM_growvector 分配路径）。
 /// 经 [`crate::mem::AllocVec`] 在标准库 `Vec<T, A>` / `allocator_api2::vec::Vec` 间选择。
@@ -187,7 +167,6 @@ pub type TableVec<T> = crate::mem::AllocVec<T, crate::mem::SlotAlloc>;
 /// TableHashIndex 以 (hash, eq) 二元组驱动 find/insert，此函数提供 hash 侧。
 /// perf: 直接展开 FxHasher 轮函数 (rotate_left(5) ^ x) * SEED, 热键类型
 /// (Str/Integer) 免泛型 Hash trait 分发。Str 键首轮 5*SEED 为编译期常量。
-#[cfg(not(size_optimized))]
 pub fn tvalue_fx_hash(v: &TValue) -> u64 {
     const SEED: u64 = 0x51_7c_c1_b7_27_22_0a_95;
     match v {
@@ -1143,7 +1122,7 @@ pub struct LCFunction {
 }
 
 // ============================================================================
-// 规约：表类型 (用 hashbrown::HashMap 重写)
+// 规约：表类型 (key→bucket 索引用 hashbrown::HashTable + SlotAlloc 重写)
 // ============================================================================
 
 /// Lua 表的数据部分 —— 被 [`TableDataRc`]（Rc 语义 + MemState allocator）包装以实现共享语义。
@@ -1169,8 +1148,7 @@ pub struct TableData<'a> {
 
 impl<'a> TableData<'a> {
     /// 索引查找 — O(1) 返回 key 所在的 hash_buckets 下标
-    #[cfg(not(size_optimized))]
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     pub fn idx_get(&self, key: &TValue<'a>) -> Option<usize> {
         let ktb = self.key_to_bucket.as_ref()?;
         let hash = tvalue_fx_hash(key);
@@ -1178,8 +1156,7 @@ impl<'a> TableData<'a> {
     }
 
     /// 索引插入 — key 必须不存在（insert_unique 不检查重复）
-    #[cfg(not(size_optimized))]
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     pub fn idx_insert(&mut self, key: &TValue<'a>, idx: usize) {
         if self.key_to_bucket.is_none() {
             // 索引盒子与 HashTable 缓冲区都沿用数组部分的 MemState allocator 槽
@@ -1195,8 +1172,7 @@ impl<'a> TableData<'a> {
     }
 
     /// 索引删除 — 返回被删 key 的 bucket 下标
-    #[cfg(not(size_optimized))]
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     pub fn idx_remove(&mut self, key: &TValue<'a>) -> Option<usize> {
         let ktb = self.key_to_bucket.as_mut()?;
         let hash = tvalue_fx_hash(key);
@@ -1204,28 +1180,6 @@ impl<'a> TableData<'a> {
             let ((_, idx), _) = entry.remove();
             idx
         })
-    }
-
-    // size_optimized 回退: TableHashMap<usize> (std HashMap) — 走其原生 API
-    #[cfg(size_optimized)]
-    pub fn idx_get(&self, key: &TValue<'a>) -> Option<usize> {
-        self.key_to_bucket.as_ref()?.get(key).copied()
-    }
-
-    #[cfg(size_optimized)]
-    pub fn idx_insert(&mut self, key: &TValue<'a>, idx: usize) {
-        self.key_to_bucket
-            .get_or_insert_with(|| {
-                Box::new(crate::objects::TableHashMap::with_hasher(
-                    crate::objects::FxBuildHasher::default(),
-                ))
-            })
-            .insert(key.clone(), idx);
-    }
-
-    #[cfg(size_optimized)]
-    pub fn idx_remove(&mut self, key: &TValue<'a>) -> Option<usize> {
-        self.key_to_bucket.as_mut()?.remove(key)
     }
 }
 

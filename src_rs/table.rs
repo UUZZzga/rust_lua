@@ -89,22 +89,10 @@ impl<'a> Table<'a> {
                     array,
                     hash_buckets: TableVec::with_capacity_in(nhash, alloc),
                     key_to_bucket: if nhash > 0 {
-                        #[cfg(not(size_optimized))]
-                        {
-                            Some(crate::mem::AllocBox::new_in(
-                                hashbrown::HashTable::with_capacity_in(nhash, alloc),
-                                alloc,
-                            ))
-                        }
-                        #[cfg(size_optimized)]
-                        {
-                            Some(Box::new(
-                                crate::objects::TableHashMap::with_capacity_and_hasher(
-                                    nhash,
-                                    crate::objects::FxBuildHasher::default(),
-                                ),
-                            ))
-                        }
+                        Some(crate::mem::AllocBox::new_in(
+                            hashbrown::HashTable::with_capacity_in(nhash, alloc),
+                            alloc,
+                        ))
                     } else {
                         None
                     },
@@ -160,7 +148,6 @@ impl<'a> Table<'a> {
     /// 查找本身用 LuaString 直查公式 (免构造 TValue 键的 Str clone)。
     /// 未命中 (含 nil tombstone / 无元表) 返回 None。
     /// 供 get_tm_by_obj 热路径使用。
-    #[cfg(not(size_optimized))]
     pub fn get_tm_ref(&self, key: &TValue<'a>) -> Option<std::cell::Ref<'_, TValue<'a>>> {
         let guard = self.data.borrow();
         let r = std::cell::Ref::filter_map(guard, |d| {
