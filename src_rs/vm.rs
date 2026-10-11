@@ -15,7 +15,9 @@
 
 use std::cmp::Ordering;
 
+use crate::alloc::MyRc;
 use crate::gc::GCState;
+use crate::mem::SlotAlloc;
 use crate::objects::{NilKind, TValue, UpVal, UpValRef, UpValVec};
 use crate::strings::{lua_string_as_c_str_ptr, lua_string_as_str, lua_string_eq, lua_string_len};
 use crate::table::Table;
@@ -462,7 +464,7 @@ pub fn raw_equal<'a>(t1: &TValue<'a>, t2: &TValue<'a>) -> bool {
         (TValue::LightUserData(a), TValue::LightUserData(b)) => std::ptr::eq(*a, *b),
         (TValue::Table(a), TValue::Table(b)) => std::ptr::addr_eq(a.data.as_ptr(), b.data.as_ptr()),
         (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
-        (TValue::CClosure(a), TValue::CClosure(b)) => Rc::ptr_eq(a, b),
+        (TValue::CClosure(a), TValue::CClosure(b)) => MyRc::ptr_eq(a, b),
         (TValue::LCFn(a), TValue::LCFn(b)) => {
             std::ptr::eq(a.func as *const (), b.func as *const ())
         }
@@ -846,7 +848,7 @@ fn format_float_len(f: f64) -> usize {
 /// When: 调用 concat_stack(stack, 2, &dmt)
 /// Then: 返回 Err(ConcatError { ... })
 pub fn concat_stack(
-    alloc: crate::strings::AllocSlot,
+    alloc: SlotAlloc,
     table: &crate::strings::StringTable,
     stack: &mut Vec<TValue>,
     total: usize,
@@ -1201,6 +1203,7 @@ pub fn push_closure<'a>(
     _base: usize,
     ra: usize,
     gc: &GCState,
+    alloc: SlotAlloc,
 ) {
     let nup = proto.size_upvalues as usize;
     let upvals = Rc::new(RefCell::new(UpValVec::new()));
@@ -1233,11 +1236,14 @@ pub fn push_closure<'a>(
         }
     }
 
-    let closure = Rc::new(crate::objects::LClosure {
-        gc_header: crate::gc::GCObjectHeader::new(),
-        proto: Rc::new(proto.clone()),
-        upvals,
-    });
+    let closure = MyRc::new_in(
+        alloc,
+        crate::objects::LClosure {
+            gc_header: crate::gc::GCObjectHeader::new(),
+            proto: Rc::new(proto.clone()),
+            upvals,
+        },
+    );
     // 用 gc_mem_size() 计费含 upvals 容量，比 size_of::<LClosure>() 更接近真实占用
     let closure_id = gc.register_object(closure.gc_mem_size());
     closure.gc_header.set_id(closure_id);
@@ -1785,18 +1791,18 @@ mod tests {
 
     #[test]
     fn test_raw_equal_different_tables() {
-        let t1 = Table::with_capacity(1, 0);
-        let t2 = Table::with_capacity(1, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t1 = Table::with_capacity_in(alloc.slot(), 1, 0);
+        let t2 = Table::with_capacity_in(alloc.slot(), 1, 0);
         assert!(!raw_equal(&TValue::Table(t1), &TValue::Table(t2)));
     }
-
     #[test]
     fn test_raw_equal_same_table_identity() {
-        let t = Table::with_capacity(1, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 1, 0);
         let tv1 = TValue::Table(t.clone());
         assert!(raw_equal(&tv1, &tv1));
     }
-
     #[test]
     fn test_raw_equal_light_userdata_same() {
         let x: *mut std::ffi::c_void = 0x42 as *mut _;
@@ -2052,14 +2058,14 @@ mod tests {
 
     #[test]
     fn test_objlen_table() {
-        let t = Table::with_capacity(3, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 3, 0);
         t.set_int(1, TValue::Integer(10));
         t.set_int(2, TValue::Integer(20));
         t.set_int(3, TValue::Integer(30));
         let tv = TValue::Table(t);
         assert_eq!(objlen_raw(&tv), Some(TValue::Integer(3)));
     }
-
     #[test]
     fn test_objlen_non_lenable() {
         assert_eq!(objlen_raw(&TValue::Integer(42)), None);
@@ -2067,20 +2073,20 @@ mod tests {
 
     #[test]
     fn test_objlen_table_with_gaps() {
-        let t = Table::with_capacity(5, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 5, 0);
         t.set_int(1, TValue::Integer(10));
         t.set_int(2, TValue::Integer(20));
         t.set_int(4, TValue::Integer(40));
         assert_eq!(objlen_raw(&TValue::Table(t)), Some(TValue::Integer(2)));
     }
-
     #[test]
     fn test_objlen_table_hash_only() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         t.set(TValue::Boolean(true), TValue::Integer(1));
         assert_eq!(objlen_raw(&TValue::Table(t)), Some(TValue::Integer(0)));
     }
-
     // ========================================================================
     // is_false 测试
     // ========================================================================
@@ -2219,22 +2225,22 @@ mod tests {
 
     #[test]
     fn test_finish_get_table_present_key() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         let tb = StringTable::new();
         t.set(tb.intern_value("key"), TValue::Integer(42));
         let tv = TValue::Table(t);
         let result = finish_get(&tb.intern_value("key"), &tv, None);
         assert_eq!(result.unwrap(), TValue::Integer(42));
     }
-
     #[test]
     fn test_finish_get_table_missing_key() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         let tv = TValue::Table(t);
         let result = finish_get(&(make_ls("missing")), &tv, None);
         assert_eq!(result.unwrap(), TValue::Nil(NilKind::Strict));
     }
-
     #[test]
     fn test_finish_get_non_table() {
         let result = finish_get(&TValue::Integer(1), &TValue::Integer(42), None);
@@ -2247,7 +2253,8 @@ mod tests {
 
     #[test]
     fn test_finish_set_table() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         let mut tv = TValue::Table(t);
         let tb = StringTable::new();
         let result = finish_set(
@@ -2261,7 +2268,6 @@ mod tests {
             assert_eq!(t.get(&tb.intern_value("a")), Some(TValue::Integer(100)));
         }
     }
-
     #[test]
     fn test_finish_set_non_table_error() {
         let mut tv = TValue::Integer(42);
@@ -2291,10 +2297,11 @@ mod tests {
 
     #[test]
     fn test_concat_stack_two_strings() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = StringTable::new();
         let mut stack = vec![(tb.intern_value("hello")), (tb.intern_value("world"))];
         let len_before = stack.len();
-        concat_stack(std::ptr::null(), &tb, &mut stack, 2).unwrap();
+        concat_stack(alloc.slot(), &tb, &mut stack, 2).unwrap();
         assert_eq!(stack.len(), len_before - 1);
         if let ref s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = stack[0] {
             assert_eq!(lua_string_as_str(s), "helloworld");
@@ -2302,24 +2309,24 @@ mod tests {
             panic!("Expected string");
         }
     }
-
     #[test]
     fn test_concat_stack_single_value() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = StringTable::new();
         let mut stack = vec![(tb.intern_value("hello"))];
-        concat_stack(std::ptr::null(), &tb, &mut stack, 1).unwrap();
+        concat_stack(alloc.slot(), &tb, &mut stack, 1).unwrap();
         assert_eq!(stack.len(), 1);
     }
-
     #[test]
     fn test_concat_stack_three_strings() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = StringTable::new();
         let mut stack = vec![
             (tb.intern_value("a")),
             (tb.intern_value("b")),
             (tb.intern_value("c")),
         ];
-        concat_stack(std::ptr::null(), &tb, &mut stack, 3).unwrap();
+        concat_stack(alloc.slot(), &tb, &mut stack, 3).unwrap();
         assert_eq!(stack.len(), 1);
         if let ref s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = stack[0] {
             assert_eq!(lua_string_as_str(s), "abc");
@@ -2327,24 +2334,24 @@ mod tests {
             panic!("Expected string");
         }
     }
-
     #[test]
     fn test_concat_stack_with_numbers() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = StringTable::new();
         let mut stack = vec![(tb.intern_value("x=")), TValue::Integer(42)];
-        concat_stack(std::ptr::null(), &tb, &mut stack, 2).unwrap();
+        concat_stack(alloc.slot(), &tb, &mut stack, 2).unwrap();
         if let ref s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = stack[0] {
             assert_eq!(lua_string_as_str(s), "x=42");
         } else {
             panic!("Expected string");
         }
     }
-
     #[test]
     fn test_concat_stack_empty_first() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = StringTable::new();
         let mut stack = vec![(tb.intern_value("")), (tb.intern_value("world"))];
-        concat_stack(std::ptr::null(), &tb, &mut stack, 2).unwrap();
+        concat_stack(alloc.slot(), &tb, &mut stack, 2).unwrap();
         assert_eq!(stack.len(), 1);
         if let ref s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = stack[0] {
             assert_eq!(lua_string_as_str(s), "world");
@@ -2352,7 +2359,6 @@ mod tests {
             panic!("Expected string");
         }
     }
-
     // ========================================================================
     // for_limit 测试
     // ========================================================================
@@ -2464,6 +2470,7 @@ mod tests {
 
     #[test]
     fn test_push_closure_no_upvals() {
+        let alloc = crate::mem::TestAlloc::new();
         let proto = Proto {
             num_params: 0,
             flag: 0,
@@ -2487,15 +2494,15 @@ mod tests {
             source: None,
         };
         let mut stack = vec![TValue::Nil(NilKind::Strict); 5];
-        push_closure(&mut stack, &proto, &[], 0, 0, &make_gc());
+        push_closure(&mut stack, &proto, &[], 0, 0, &make_gc(), alloc.slot());
         match &stack[0] {
             TValue::LClosure(_) => {}
             _ => panic!("Expected LClosure"),
         }
     }
-
     #[test]
     fn test_push_closure_with_upvals() {
+        let alloc = crate::mem::TestAlloc::new();
         let mut stack = vec![
             TValue::Integer(42),
             TValue::Nil(NilKind::Strict),
@@ -2531,7 +2538,7 @@ mod tests {
             loc_vars: vec![],
             source: None,
         };
-        push_closure(&mut stack, &proto, &[], 0, 3, &make_gc());
+        push_closure(&mut stack, &proto, &[], 0, 3, &make_gc(), alloc.slot());
         match &stack[3] {
             TValue::LClosure(c) => {
                 assert_eq!(c.upvals.borrow().len(), 1);
@@ -2539,7 +2546,6 @@ mod tests {
             _ => panic!("Expected LClosure"),
         }
     }
-
     // ========================================================================
     // format_float 测试
     // ========================================================================

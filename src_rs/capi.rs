@@ -20,6 +20,8 @@
 
 #![allow(non_snake_case, non_camel_case_types, unused_imports)]
 
+use crate::alloc::MyRc;
+use crate::mem::SlotAlloc;
 use std::any::{type_name, Any};
 use std::ffi::{c_char, c_int, c_uint, c_void, CStr, CString};
 use std::fmt::Write;
@@ -302,14 +304,16 @@ pub extern "C" fn lua_newstate(
     ud: *mut c_void,
     _seed: std::ffi::c_uint,
 ) -> *mut lua_State {
-    let mut state = LuaState::default();
-    {
-        let g = state.g_mut();
-        g.mem.allocator = Box::new(CapiAllocator {
-            allocf: f,
-            allocf_ud: ud,
-        });
-    }
+    // 以 C 分配器**从首个分配起**构造。C 语义要求 `lua_newstate` 之后所有
+    // 分配（含 state 内部对象：memerrmsg/globals/registry/main_thread）都经
+    // `allocf`。若先以 `DefaultAllocator` 建好内部对象、再把分配器原地换成
+    // `CapiAllocator`，那些早期块会「Rust 堆分配、C 堆释放」——
+    // Miri: `deallocating ..., which is Rust heap memory, using C heap deallocation`。
+    let allocator: Box<dyn crate::mem::Allocator> = Box::new(CapiAllocator {
+        allocf: f,
+        allocf_ud: ud,
+    });
+    let state = LuaState::new_main_with_allocator(crate::mock::io_mock::lua_io(), allocator);
     let p = Box::into_raw(Box::new(state));
     // 绑定 l_g（规约 R1）：地址稳定后再绑定，之后每次进入执行会重绑定
     unsafe {
@@ -376,9 +380,9 @@ pub extern "C" fn lua_newthread(L: *mut lua_State) -> *mut lua_State {
         context: context.clone(),
         c_state: std::cell::Cell::new(co_ptr),
     };
-    let thread_rc = Rc::new(thread);
+    let thread_rc = MyRc::new_in(unsafe { (*L).alloc_slot() }, thread);
     // 设置 thread_ref，让 coroutine.running() 能返回同一对象
-    context.borrow_mut().thread_ref = Rc::downgrade(&thread_rc);
+    context.borrow_mut().thread_ref = Some(thread_rc.downgrade());
 
     // 设置新执行态的 current_thread（让 lua_resume 能找到 ThreadContext）
     unsafe {
@@ -735,10 +739,14 @@ pub extern "C" fn lua_pushcclosure(L: *mut lua_State, f: lua_CFunction, n: c_int
             upvalues.push(val);
         }
         upvalues.reverse();
-        L.stack.push(TValue::CClosure(Rc::new(CClosure {
-            f,
-            upvalue: upvalues,
-        })));
+        let slot = L.alloc_slot();
+        L.stack.push(TValue::CClosure(MyRc::new_in(
+            slot,
+            CClosure {
+                f,
+                upvalue: upvalues,
+            },
+        )));
     }
 }
 
@@ -1583,10 +1591,10 @@ pub extern "C" fn lua_setallocf(L: *mut lua_State, f: lua_Alloc, ud: *mut c_void
     let L = unsafe { &mut *L };
     let g = L.g_mut();
     if !g.mem.allocator.set_allocf(f, ud) {
-        g.mem.allocator = Box::new(CapiAllocator {
+        g.mem.allocator.set(Box::new(CapiAllocator {
             allocf: f,
             allocf_ud: ud,
-        });
+        }));
     }
 }
 
@@ -1626,7 +1634,8 @@ pub extern "C-unwind" fn lua_newuserdatauv(
     let ud_id = unsafe { L.g_mut().gc.as_mut().register_object(udata.gc_mem_size()) };
     udata.gc_header.set_id(ud_id);
     let ptr = udata.data.as_mut_ptr() as *mut c_void;
-    L.stack.push(TValue::UserData(Rc::new(udata)));
+    let slot = L.alloc_slot();
+    L.stack.push(TValue::UserData(MyRc::new_in(slot, udata)));
     ptr
 }
 
@@ -1688,7 +1697,7 @@ pub extern "C" fn lua_setmetatable(L: *mut lua_State, objindex: c_int) -> c_int 
     // 预先 intern __gc 字符串（在持有 stack 借用前完成）
     let gc_key = L.intern_str("__gc");
     // 收集需要注册 __gc 的 userdata（避免在持有 stack 借用时调用 register_ud_finobj）
-    let mut ud_to_register: Option<Rc<Udata>> = None;
+    let mut ud_to_register: Option<MyRc<Udata, SlotAlloc>> = None;
     let result = match &mut L.stack[off] {
         TValue::Table(t) => {
             t.set_metatable(mt.clone());
@@ -1700,14 +1709,14 @@ pub extern "C" fn lua_setmetatable(L: *mut lua_State, objindex: c_int) -> c_int 
             // that doesn't propagate back to other references (like the Lua variable).
             // This breaks the C API semantics where lua_setmetatable modifies
             // the userdata in-place regardless of how many references there are.
-            let ptr = Rc::as_ptr(u) as *mut Udata;
+            let ptr = u.as_raw_ptr() as *mut Udata;
             unsafe {
                 (*ptr).metatable = mt.as_ref().map(|t| Box::new(t.clone()));
             }
             // 检查元表是否含 __gc，若有则收集待注册的 userdata
             if let Some(ref mt_table) = mt {
                 if mt_table.get(&gc_key).is_some() {
-                    ud_to_register = Some(Rc::clone(u));
+                    ud_to_register = Some(u.clone());
                 }
             }
             1
@@ -1773,7 +1782,7 @@ pub extern "C" fn lua_pushthread(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     let (thread_val, is_main) = match &L.current_thread {
         Some(ctx) => {
-            let thread_rc = ctx.borrow().thread_ref.upgrade();
+            let thread_rc = ctx.borrow().thread_ref.clone().and_then(|w| w.upgrade());
             match thread_rc {
                 Some(rc) => (TValue::Thread(rc), false),
                 None => {
@@ -1783,12 +1792,13 @@ pub extern "C" fn lua_pushthread(L: *mut lua_State) -> c_int {
                         context: ctx.clone(),
                         c_state: std::cell::Cell::new(std::ptr::null_mut()),
                     };
-                    (TValue::Thread(Rc::new(thread)), false)
+                    let slot = L.alloc_slot();
+                    (TValue::Thread(MyRc::new_in(slot, thread)), false)
                 }
             }
         }
         // 主线程 — 压入 main_thread 对象
-        None => (TValue::Thread(Rc::new(L.main_thread.clone())), true),
+        None => (TValue::Thread(L.main_thread.clone()), true),
     };
     L.stack.push(thread_val);
     if is_main {
@@ -1919,7 +1929,7 @@ pub extern "C" fn lua_rawequal(L: *mut lua_State, idx1: c_int, idx2: c_int) -> c
                 (TValue::LClosure(a), TValue::LClosure(b)) => {
                     (a.gc_header.ptr_id == b.gc_header.ptr_id) as c_int
                 }
-                (TValue::CClosure(a), TValue::CClosure(b)) => Rc::ptr_eq(a, b) as c_int,
+                (TValue::CClosure(a), TValue::CClosure(b)) => MyRc::ptr_eq(a, b) as c_int,
                 (TValue::Thread(a), TValue::Thread(b)) => {
                     Rc::ptr_eq(&a.context, &b.context) as c_int
                 }
@@ -1969,7 +1979,7 @@ pub extern "C" fn lua_compare(L: *mut lua_State, idx1: c_int, idx2: c_int, op: c
                     (TValue::LClosure(a), TValue::LClosure(b)) => {
                         a.gc_header.ptr_id == b.gc_header.ptr_id
                     }
-                    (TValue::CClosure(a), TValue::CClosure(b)) => Rc::ptr_eq(a, b),
+                    (TValue::CClosure(a), TValue::CClosure(b)) => MyRc::ptr_eq(a, b),
                     (TValue::Thread(a), TValue::Thread(b)) => Rc::ptr_eq(&a.context, &b.context),
                     _ => false,
                 };
@@ -4029,7 +4039,7 @@ pub extern "C" fn lua_setiuservalue(L: *mut lua_State, idx: c_int, n: c_int) {
         let n = n as usize;
         if n >= 1 && n <= u.user_values.len() {
             // 通过裸指针原地修改（与 lua_setmetatable 一致，避免 Rc::make_mut 克隆）
-            let ptr = Rc::as_ptr(u) as *mut Udata;
+            let ptr = u.as_raw_ptr() as *mut Udata;
             unsafe {
                 let udata = &mut *ptr;
                 udata.user_values[n - 1] = val;
@@ -4384,7 +4394,10 @@ pub extern "C" fn lua_setupvalue(L: *mut lua_State, funcindex: c_int, n: c_int) 
     };
     if is_cc {
         if let Some(TValue::CClosure(cc)) = &mut L.stack.get_mut(off) {
-            Rc::make_mut(cc).upvalue[n - 1] = value;
+            let ptr = cc.as_raw_ptr() as *mut CClosure;
+            unsafe {
+                (&mut *ptr).upvalue[n - 1] = value;
+            }
         }
     } else if is_lc {
         if let Some(TValue::LClosure(closure)) = &mut L.stack.get_mut(off) {

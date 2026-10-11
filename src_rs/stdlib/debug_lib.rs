@@ -20,7 +20,9 @@
 //! - 标签 400+: 表库
 //! - 标签 500+: 调试库
 
+use crate::alloc::MyRc;
 use crate::execute::VmError;
+use crate::mem::SlotAlloc;
 use crate::objects::{BuiltinFn, LClosure, NilKind, Proto, TValue, UpVal, UpValRef, PF_VAHID};
 use crate::state::LuaState;
 use crate::strings::lua_string_as_str;
@@ -188,7 +190,7 @@ struct FrameInfo<'a> {
     proto_flag: u8,
     nextraargs: i32,
     /// 指向栈上的 LClosure（已 clone）；C 函数帧为 None
-    closure: Option<Rc<LClosure<'a>>>,
+    closure: Option<MyRc<LClosure<'a>, SlotAlloc>>,
     /// 栈上有效槽位的上限（对应 C 的 limit = ci->next->func.p 或 L->top）
     /// 槽位 n 满足 limit - base >= n && n > 0 时为 "(temporary)" / "(C temporary)"
     limit: usize,
@@ -497,8 +499,8 @@ fn call_setuservalue<'a>(
             } else {
                 // 修改栈上的 userdata
                 if a + 1 < state.stack.len() {
-                    if let TValue::UserData(ref mut u) = &mut state.stack[a + 1] {
-                        let u = Rc::make_mut(u);
+                    if let TValue::UserData(u) = &mut state.stack[a + 1] {
+                        let u = unsafe { &mut *(u.as_raw_ptr() as *mut crate::objects::Udata) };
                         while u.user_values.len() < n {
                             u.user_values.push(TValue::Nil(NilKind::Strict));
                         }
@@ -575,7 +577,7 @@ fn call_getinfo<'a>(
     if matches!(level_or_func, TValue::LClosure(_)) {
         // 函数参数模式
         if let TValue::LClosure(closure) = &level_or_func {
-            fill_info_from_closure(&mut info, closure, &what);
+            fill_info_from_closure(&mut info, closure, &what, state.alloc_slot());
         }
     } else if let TValue::RustClosure(rc) = &level_or_func {
         // Rust 闭包 (string.gmatch 迭代器 / coroutine.wrap / io.lines):
@@ -672,7 +674,7 @@ fn call_getinfo<'a>(
     }
 
     // 构建结果表
-    let result_table = Table::new();
+    let result_table = Table::new_in(state.alloc_slot());
 
     if what.contains('S') {
         result_table.set(state.intern_str("source"), state.intern_str(&info.source));
@@ -742,7 +744,7 @@ fn call_getinfo<'a>(
         // activelines 表 — 对应 C 的 collectvalidlines
         // 对于 C 函数, activelines 为 nil
         if let Some(ref closure) = info.closure {
-            let mut actlines = Table::new();
+            let mut actlines = Table::new_in(state.alloc_slot());
             fill_active_lines(&mut actlines, &closure.proto);
             result_table.set(state.intern_str("activelines"), TValue::Table(actlines));
         } else {
@@ -794,15 +796,20 @@ struct DebugInfo<'a> {
     istailcall: bool,
     extraargs: i32,
     func: Option<TValue<'a>>,
-    closure: Option<Rc<LClosure<'a>>>,
+    closure: Option<MyRc<LClosure<'a>, SlotAlloc>>,
 }
 
 /// 从闭包填充调试信息
-fn fill_info_from_closure<'a>(info: &mut DebugInfo<'a>, closure: &LClosure<'a>, what: &str) {
+fn fill_info_from_closure<'a>(
+    info: &mut DebugInfo<'a>,
+    closure: &LClosure<'a>,
+    what: &str,
+    alloc: SlotAlloc,
+) {
     let proto = &closure.proto;
     // 注意: 不在此设置 info.func, 由 call_getinfo 直接从栈上获取原始值
     // 以确保 b.func == 原始函数 (引用语义)
-    info.closure = Some(Rc::new(closure.clone()));
+    info.closure = Some(MyRc::new_in(alloc, closure.clone()));
 
     if what.contains('S') {
         info.source = proto
@@ -1759,7 +1766,7 @@ fn set_local_from_thread<'a>(
     }
 
     // Lua 函数帧 — 延迟计算 closure 并 clone Rc 以避免与 write_stack 的可变借用冲突
-    let closure_owned: Option<Rc<crate::objects::LClosure>> = entry
+    let closure_owned: Option<MyRc<crate::objects::LClosure, SlotAlloc>> = entry
         .closure
         .as_ref()
         .cloned()
@@ -2285,8 +2292,8 @@ fn call_setupvalue<'a>(
         TValue::CClosure(_) => {
             // C 闭包
             if a + 1 < state.stack.len() {
-                if let TValue::CClosure(ref mut cc) = &mut state.stack[a + 1] {
-                    let cc = Rc::make_mut(cc);
+                if let TValue::CClosure(cc) = &mut state.stack[a + 1] {
+                    let cc = unsafe { &mut *(cc.as_raw_ptr() as *mut crate::objects::CClosure) };
                     if n > 0 && n <= cc.upvalue.len() {
                         cc.upvalue[n - 1] = value;
                         push_single_result(state, a, nresults, state.intern_str(""));
@@ -2366,7 +2373,7 @@ fn call_upvalueid<'a>(
             // 闭包指针 + n 的唯一标识（与 Table 版一致基于指针生成）。
             let upvals = rc.upvalues.borrow();
             if n > 0 && n <= upvals.len() {
-                let ptr = Rc::as_ptr(rc) as *mut std::ffi::c_void;
+                let ptr = rc.as_raw_ptr() as *mut std::ffi::c_void;
                 let id_ptr = (ptr as usize + n) as *mut std::ffi::c_void;
                 push_single_result(state, a, nresults, TValue::LightUserData(id_ptr));
             } else {
@@ -2649,8 +2656,8 @@ fn set_hook_in_registry<'a>(
         Some(TValue::Table(t)) => t.clone(),
         _ => {
             // 创建新表并设置元表 (__mode = "k")
-            let t = Table::new();
-            let mt = Table::new();
+            let t = Table::new_in(state.alloc_slot());
+            let mt = Table::new_in(state.alloc_slot());
             mt.set(state.intern_str("__mode"), state.intern_str("k"));
             t.set_metatable(Some(mt));
             t
@@ -3311,7 +3318,7 @@ fn call_debug<'a>(
 ///
 /// 对应 C 源码 ldblib.cpp 的 luaopen_debug 函数
 pub fn create_debug_lib_table<'a>(state: &LuaState<'a>) -> Table<'a> {
-    let mut lib = Table::new();
+    let mut lib = Table::new_in(state.alloc_slot());
 
     // 注册所有 debug 函数 (使用 BuiltinFn 函数指针)
     let register =
@@ -3431,32 +3438,33 @@ mod tests {
 
     #[test]
     fn test_call_getmetatable_table() {
+        let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
-        let t = Table::new();
-        t.set_metatable(Some(Table::new()));
+        let t = Table::new_in(alloc.slot());
+        t.set_metatable(Some(Table::new_in(alloc.slot())));
         state.stack.clear();
         state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::Table(t));
         call_getmetatable(&mut state, 0, 1, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Table(_)));
     }
-
     #[test]
     fn test_call_getmetatable_no_metatable() {
+        let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
-        let t = Table::new();
+        let t = Table::new_in(alloc.slot());
         state.stack.clear();
         state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::Table(t));
         call_getmetatable(&mut state, 0, 1, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
-
     #[test]
     fn test_call_setmetatable() {
+        let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
-        let t = Table::new();
-        let mt = Table::new();
+        let t = Table::new_in(alloc.slot());
+        let mt = Table::new_in(alloc.slot());
         state.stack.clear();
         state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::Table(t));
@@ -3467,7 +3475,6 @@ mod tests {
             _ => panic!("expected table result"),
         }
     }
-
     #[test]
     fn test_call_getuservalue_non_userdata() {
         let mut state = LuaState::default();
@@ -3480,6 +3487,7 @@ mod tests {
 
     #[test]
     fn test_call_getupvalue_closure() {
+        let alloc = crate::mem::TestAlloc::new();
         use crate::gc::GCObjectHeader;
         use crate::objects::UpvalDesc;
 
@@ -3520,11 +3528,14 @@ mod tests {
             .push(Rc::new(RefCell::new(UpVal::Closed {
                 value: TValue::Integer(42),
             })));
-        let closure = Rc::new(LClosure {
-            gc_header: GCObjectHeader::new(),
-            proto: Rc::new(proto),
-            upvals,
-        });
+        let closure = MyRc::new_in(
+            alloc.slot(),
+            LClosure {
+                gc_header: GCObjectHeader::new(),
+                proto: Rc::new(proto),
+                upvals,
+            },
+        );
         state.stack.clear();
         state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::LClosure(closure));
@@ -3540,16 +3551,19 @@ mod tests {
             _ => panic!("expected integer 42"),
         }
     }
-
     #[test]
     fn test_call_getupvalue_out_of_range() {
+        let alloc = crate::mem::TestAlloc::new();
         use crate::gc::GCObjectHeader;
         let mut state = LuaState::default();
-        let closure = Rc::new(LClosure {
-            gc_header: GCObjectHeader::new(),
-            proto: Rc::new(crate::func::new_proto()),
-            upvals: Rc::new(RefCell::new(UpValVec::new())),
-        });
+        let closure = MyRc::new_in(
+            alloc.slot(),
+            LClosure {
+                gc_header: GCObjectHeader::new(),
+                proto: Rc::new(crate::func::new_proto()),
+                upvals: Rc::new(RefCell::new(UpValVec::new())),
+            },
+        );
         state.stack.clear();
         state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::LClosure(closure));
@@ -3557,7 +3571,6 @@ mod tests {
         call_getupvalue(&mut state, 0, 2, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
-
     #[test]
     fn test_call_gethook_no_hook() {
         let mut state = LuaState::default();
@@ -3736,6 +3749,7 @@ mod tests {
 
     #[test]
     fn test_call_upvalueid_closure() {
+        let alloc = crate::mem::TestAlloc::new();
         use crate::gc::GCObjectHeader;
         let mut state = LuaState::default();
         let upvals = Rc::new(RefCell::new(UpValVec::new()));
@@ -3744,11 +3758,14 @@ mod tests {
             .push(Rc::new(RefCell::new(UpVal::Closed {
                 value: TValue::Integer(42),
             })));
-        let closure = Rc::new(LClosure {
-            gc_header: GCObjectHeader::new(),
-            proto: Rc::new(crate::func::new_proto()),
-            upvals,
-        });
+        let closure = MyRc::new_in(
+            alloc.slot(),
+            LClosure {
+                gc_header: GCObjectHeader::new(),
+                proto: Rc::new(crate::func::new_proto()),
+                upvals,
+            },
+        );
         state.stack.clear();
         state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::LClosure(closure));
@@ -3756,16 +3773,19 @@ mod tests {
         call_upvalueid(&mut state, 0, 2, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::LightUserData(_)));
     }
-
     #[test]
     fn test_call_upvalueid_out_of_range() {
+        let alloc = crate::mem::TestAlloc::new();
         use crate::gc::GCObjectHeader;
         let mut state = LuaState::default();
-        let closure = Rc::new(LClosure {
-            gc_header: GCObjectHeader::new(),
-            proto: Rc::new(crate::func::new_proto()),
-            upvals: Rc::new(RefCell::new(UpValVec::new())),
-        });
+        let closure = MyRc::new_in(
+            alloc.slot(),
+            LClosure {
+                gc_header: GCObjectHeader::new(),
+                proto: Rc::new(crate::func::new_proto()),
+                upvals: Rc::new(RefCell::new(UpValVec::new())),
+            },
+        );
         state.stack.clear();
         state.stack.push(TValue::Nil(NilKind::Strict));
         state.stack.push(TValue::LClosure(closure));
@@ -3773,7 +3793,6 @@ mod tests {
         call_upvalueid(&mut state, 0, 2, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
-
     #[test]
     fn test_call_debug_returns_nothing() {
         let mut buff = crate::mock::io_mock::BufferIo::new("cont\n");

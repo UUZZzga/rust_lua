@@ -2095,7 +2095,7 @@ fn lookforfunc<'a>(
         let clibs = match state.registry.get(&clibs_key) {
             Some(TValue::Table(t)) => t,
             _ => {
-                let new_clibs = Table::new();
+                let new_clibs = Table::new_in(state.alloc_slot());
                 state
                     .registry
                     .set(clibs_key.clone(), TValue::Table(new_clibs.clone()));
@@ -2326,13 +2326,13 @@ fn setpath<'a>(state: &LuaState<'a>, envname: &str, dft: &str) -> String {
 /// 对应 C loadlib.cpp 的 luaopen_package
 fn init_package_table<'a>(state: &mut LuaState<'a>) {
     let package_key = state.intern_str("package");
-    let pkg = Table::new();
-    let loaded = Table::new();
+    let pkg = Table::new_in(state.alloc_slot());
+    let loaded = Table::new_in(state.alloc_slot());
     // registry._LOADED 和 package.loaded 共享同一个 Rc 引用（对应 C luaopen_package）
     let loaded_shared = loaded.clone();
     pkg.set(state.intern_str("loaded"), TValue::Table(loaded));
     // preload 表 — 对应 registry[LUA_PRELOAD_TABLE]
-    let preload = Table::new();
+    let preload = Table::new_in(state.alloc_slot());
     pkg.set(state.intern_str("preload"), TValue::Table(preload));
     let path = setpath(state, "LUA_PATH", "./?.lua;./?/init.lua");
     pkg.set(state.intern_str("path"), state.intern_str(&path));
@@ -2376,7 +2376,7 @@ fn init_package_table<'a>(state: &mut LuaState<'a>) {
             name.as_ptr() as *const u8,
         ))
     };
-    let searchers = Table::new();
+    let searchers = Table::new_in(state.alloc_slot());
     searchers.set(TValue::Integer(1), make_searcher(c"searcher_preload"));
     searchers.set(TValue::Integer(2), make_searcher(c"searcher_Lua"));
     searchers.set(TValue::Integer(3), make_searcher(c"searcher_C"));
@@ -2680,11 +2680,14 @@ fn call_load<'a>(
                         value: TValue::Nil(NilKind::Strict),
                     })));
             }
-            let closure = Rc::new(LClosure {
-                gc_header: GCObjectHeader::new(),
-                proto: Rc::new(proto),
-                upvals,
-            });
+            let closure = crate::alloc::MyRc::new_in(
+                state.alloc_slot(),
+                LClosure {
+                    gc_header: GCObjectHeader::new(),
+                    proto: Rc::new(proto),
+                    upvals,
+                },
+            );
             push_results(state, a, nresults, vec![TValue::LClosure(closure)]);
             Ok(())
         }
@@ -3426,14 +3429,17 @@ mod tests {
 
     #[test]
     fn test_base_type_name() {
+        let alloc = crate::mem::TestAlloc::new();
         assert_eq!(base_type_name(&TValue::Nil(NilKind::Strict)), "nil");
         assert_eq!(base_type_name(&TValue::Boolean(true)), "boolean");
         assert_eq!(base_type_name(&TValue::Integer(42)), "number");
         assert_eq!(base_type_name(&TValue::Float(3.14)), "number");
         assert_eq!(base_type_name(&make_str("hello")), "string");
-        assert_eq!(base_type_name(&TValue::Table(Table::new())), "table");
+        assert_eq!(
+            base_type_name(&TValue::Table(Table::new_in(alloc.slot()))),
+            "table"
+        );
     }
-
     /// 验证 LightUserData 在用户指针范围（超出内置 tag 范围）不被误判为 function
     ///
     /// 所有内置库已迁移到 BuiltinFn，coroutine.wrap 返回 Table，
@@ -3603,12 +3609,12 @@ mod tests {
 
     #[test]
     fn test_base_rawlen_table() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         t.set(TValue::Integer(1), TValue::Integer(10));
         t.set(TValue::Integer(2), TValue::Integer(20));
         assert_eq!(base_rawlen(&TValue::Table(t)).unwrap(), 2);
     }
-
     #[test]
     fn test_base_rawlen_invalid() {
         assert!(base_rawlen(&TValue::Integer(42)).is_err());
@@ -3874,9 +3880,10 @@ mod tests {
 
     #[test]
     fn test_call_rawget() {
+        let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
         state.stack.clear();
-        let t = Table::new();
+        let t = Table::new_in(alloc.slot());
         t.set(TValue::Integer(1), TValue::Integer(100));
         state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
@@ -3887,12 +3894,12 @@ mod tests {
             _ => panic!("expected integer result"),
         }
     }
-
     #[test]
     fn test_call_rawset() {
+        let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
         state.stack.clear();
-        let t = Table::new();
+        let t = Table::new_in(alloc.slot());
         state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
         state.stack.push(TValue::Integer(1));
@@ -3906,7 +3913,6 @@ mod tests {
             _ => panic!("expected table result"),
         }
     }
-
     #[test]
     fn test_call_select_hash() {
         let mut state = LuaState::default();
@@ -3984,10 +3990,11 @@ mod tests {
 
     #[test]
     fn test_call_setmetatable() {
+        let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
         state.stack.clear();
-        let t = Table::new();
-        let mt = Table::new();
+        let t = Table::new_in(alloc.slot());
+        let mt = Table::new_in(alloc.slot());
         state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
         state.stack.push(TValue::Table(mt));
@@ -3997,13 +4004,13 @@ mod tests {
             _ => panic!("expected table result"),
         }
     }
-
     #[test]
     fn test_call_getmetatable() {
+        let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
         state.stack.clear();
-        let t = Table::new();
-        t.set_metatable(Some(Table::new()));
+        let t = Table::new_in(alloc.slot());
+        t.set_metatable(Some(Table::new_in(alloc.slot())));
         state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
         call_getmetatable(&mut state, 0, 1, 1).unwrap();
@@ -4012,12 +4019,12 @@ mod tests {
             _ => panic!("expected table result"),
         }
     }
-
     #[test]
     fn test_call_getmetatable_no_mt() {
+        let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
         state.stack.clear();
-        let t = Table::new();
+        let t = Table::new_in(alloc.slot());
         state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
         call_getmetatable(&mut state, 0, 1, 1).unwrap();
@@ -4026,14 +4033,14 @@ mod tests {
             _ => panic!("expected nil result"),
         }
     }
-
     // Miri 下函数指针地址比较不可靠 (bf.func as usize != fn as usize),跳过
     #[cfg_attr(miri, ignore)]
     #[test]
     fn test_call_ipairs() {
+        let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
         state.stack.clear();
-        let t = Table::new();
+        let t = Table::new_in(alloc.slot());
         t.set(TValue::Integer(1), TValue::Integer(10));
         t.set(TValue::Integer(2), TValue::Integer(20));
         state.stack.push(placeholder_builtin());
@@ -4058,14 +4065,14 @@ mod tests {
             _ => panic!("expected integer 0"),
         }
     }
-
     // Miri 下函数指针地址比较不可靠 (bf.func as usize != fn as usize),跳过
     #[cfg_attr(miri, ignore)]
     #[test]
     fn test_call_pairs() {
+        let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
         state.stack.clear();
-        let t = Table::new();
+        let t = Table::new_in(alloc.slot());
         state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
         call_pairs(&mut state, 0, 1, 3).unwrap();
@@ -4080,12 +4087,12 @@ mod tests {
         assert!(matches!(state.stack[1], TValue::Table(_)));
         assert!(matches!(state.stack[2], TValue::Nil(_)));
     }
-
     #[test]
     fn test_call_ipairs_aux() {
+        let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
         state.stack.clear();
-        let t = Table::new();
+        let t = Table::new_in(alloc.slot());
         t.set(TValue::Integer(1), TValue::Integer(10));
         t.set(TValue::Integer(2), TValue::Integer(20));
         state.stack.push(placeholder_builtin());
@@ -4102,12 +4109,12 @@ mod tests {
             _ => panic!("expected integer 10"),
         }
     }
-
     #[test]
     fn test_call_ipairs_aux_end() {
+        let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
         state.stack.clear();
-        let t = Table::new();
+        let t = Table::new_in(alloc.slot());
         state.stack.push(placeholder_builtin());
         state.stack.push(TValue::Table(t));
         state.stack.push(TValue::Integer(0));
@@ -4115,7 +4122,6 @@ mod tests {
         assert_eq!(state.stack.len(), 1);
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
-
     // ========================================================================
     // call_base_function_unknown_tag 测试已删除（base 库已迁移到 BuiltinFn）
     // ========================================================================
@@ -4126,8 +4132,9 @@ mod tests {
 
     #[test]
     fn test_table_next_array() {
+        let alloc = crate::mem::TestAlloc::new();
         // 使用 with_capacity 预分配数组部分, 确保值存储在数组中 (顺序迭代)
-        let t = Table::with_capacity(2, 0);
+        let t = Table::with_capacity_in(alloc.slot(), 2, 0);
         t.set(TValue::Integer(1), TValue::Integer(10));
         t.set(TValue::Integer(2), TValue::Integer(20));
 
@@ -4145,12 +4152,12 @@ mod tests {
         let (key, _) = table_next(&t, &TValue::Integer(2)).unwrap();
         assert!(key.is_none());
     }
-
     #[test]
     fn test_table_next() {
+        let alloc = crate::mem::TestAlloc::new();
         let st = crate::strings::StringTable::new();
-        let t = Table::new();
-        let mt = Table::new();
+        let t = Table::new_in(alloc.slot());
+        let mt = Table::new_in(alloc.slot());
         mt.set(st.intern_value("__mode"), st.intern_value("kv"));
         t.set_metatable(Some(mt));
         #[cfg(miri)]
@@ -4158,21 +4165,24 @@ mod tests {
         #[cfg(not(miri))]
         let exp = 22;
         t.set(
-            new_long_str_from_string(std::ptr::null(), str_rep("a", 2_i64.pow(exp), "").unwrap()),
+            new_long_str_from_string(alloc.slot(), str_rep("a", 2_i64.pow(exp), "").unwrap()),
             TValue::Integer(25),
         );
         t.set(
-            new_long_str_from_string(std::ptr::null(), str_rep("b", 2_i64.pow(exp), "").unwrap()),
-            TValue::Table(Table::new()),
+            new_long_str_from_string(alloc.slot(), str_rep("b", 2_i64.pow(exp), "").unwrap()),
+            TValue::Table(Table::new_in(alloc.slot())),
         );
-        t.set(TValue::Table(Table::new()), TValue::Integer(14));
+        t.set(
+            TValue::Table(Table::new_in(alloc.slot())),
+            TValue::Integer(14),
+        );
         let (key, val) = table_next(&t, &TValue::Nil(NilKind::Strict)).unwrap();
         assert!(matches!(key.clone(), Some(s @ TValue::LongStr(_))
-            if s == new_long_str_from_string(std::ptr::null(), str_rep("a", 2_i64.pow(exp), "").unwrap())));
+            if s == new_long_str_from_string(alloc.slot(), str_rep("a", 2_i64.pow(exp), "").unwrap())));
         assert_eq!(val, TValue::Integer(25));
         let (key, val) = table_next(&t, &key.unwrap()).unwrap();
         assert!(matches!(key.clone(), Some(s @ TValue::LongStr(_))
-            if s == new_long_str_from_string(std::ptr::null(), str_rep("b", 2_i64.pow(exp), "").unwrap())));
+            if s == new_long_str_from_string(alloc.slot(), str_rep("b", 2_i64.pow(exp), "").unwrap())));
         assert!(matches!(val.clone(), TValue::Table(_)));
         let (key, val) = table_next(&t, &key.unwrap()).unwrap();
         assert!(matches!(key.clone(), Some(TValue::Table(_))));

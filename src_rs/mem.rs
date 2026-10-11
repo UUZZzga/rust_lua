@@ -185,34 +185,143 @@ pub use allocator_api2::vec::Vec as AllocVec;
 pub use std::vec::Vec as AllocVec;
 
 // ============================================================================
-// SlotAlloc — 面向 allocator-aware 容器的适配器，把 Vec/Box/HashTable 的分配
-// 路由到 MemState 的分配器槽（AllocSlot）
+// AllocOwner — 运行期分配器的稳定宿主；SlotAlloc — 面向 allocator-aware 容器
+// （Vec/Box/HashTable）的适配器，把分配路由到分配器槽（AllocSlot）
 // ============================================================================
 
-/// 把 [`crate::strings::AllocSlot`]（`*const Box<dyn Allocator>`）适配为
+/// 运行期分配器宿主：为 `Box<dyn Allocator>` 提供一个稳定地址。
+///
+/// 存在理由：分配器槽（[`crate::strings::AllocSlot`]）指向 `Box<dyn Allocator>`
+/// **值本身**。若该值内联在 `GlobalState::mem` 中，`GlobalState` 构造期还没有
+/// 固定地址，就只能在构造期退化成 null 槽——而 null 槽意味着「类型上带了分配器
+/// 参数、运行时却回退 std::alloc」，与 allocator_api2 的参数化语义自相矛盾。
+///
+/// 本类型把内层 Box 放在独立堆块上：槽自 [`Self::new`] 起即有效，
+/// `GlobalState` 装箱/移动不改变该地址；[`Self::set`] 原地替换内容后，
+/// 已发出的槽自动跟随。
+///
+/// # 为什么持有根裸指针而不是 `Box<Box<dyn Allocator>>`
+///
+/// 若用 `Box` 持有内层值，`slot()` 只能写成 `&*self.inner as *const _` ——
+/// 一条**从共享引用派生**的地址。随后 [`Self::set`] 的原地写入会被 Tree
+/// Borrows 视为 foreign write，把该共享引用派生的标签置为 `Disabled`；
+/// 已发出的槽再被使用（例如析构时释放）即为 UB（Miri:
+/// `reborrow ... is forbidden`，tag `Disabled due to a foreign write`）。
+///
+/// [`Box::into_raw`] 取得的是**根裸指针**，不派生自任何引用：读、写、以及
+/// `set` 原地覆盖都始终合法，且不会因其他访问而失效。所有权仍由本类型持有，
+/// [`Drop`] 负责回收（不是 `Box::leak`，无泄漏）。
+pub struct AllocOwner {
+    /// 指向堆上 `Box<dyn Allocator>` 的根裸指针（始终非 null）。
+    inner: NonNull<Box<dyn Allocator>>,
+}
+
+impl AllocOwner {
+    /// 接管一个分配器（内层 Box 立即获得稳定堆地址）。
+    #[inline]
+    pub fn new(allocator: Box<dyn Allocator>) -> Self {
+        Self {
+            inner: NonNull::new(Box::into_raw(Box::new(allocator)))
+                .expect("Box::into_raw 不得返回 null"),
+        }
+    }
+
+    /// 稳定的分配器槽 —— 构造期即可用，且永不为 null。
+    ///
+    /// 只做指针转换，**不创建对目标值的引用**（见类型级文档）。
+    #[inline]
+    pub fn slot(&self) -> crate::strings::AllocSlot {
+        self.inner.as_ptr() as *const Box<dyn Allocator>
+    }
+
+    /// 原地替换分配器（槽地址不变，已发出的槽自动跟随）。
+    #[inline]
+    pub fn set(&mut self, allocator: Box<dyn Allocator>) {
+        // SAFETY: inner 非 null，且指向本类型独占持有的 Box；覆盖即析构旧值。
+        unsafe { *self.inner.as_ptr() = allocator };
+    }
+
+    /// 当前分配器。
+    #[inline]
+    pub fn get(&self) -> &dyn Allocator {
+        // SAFETY: inner 非 null 且指向存活、已初始化的 Box。
+        unsafe { &**self.inner.as_ptr() }
+    }
+}
+
+impl Drop for AllocOwner {
+    fn drop(&mut self) {
+        // SAFETY: inner 来自 Box::into_raw，本类型独占其所有权，且只回收一次。
+        unsafe { drop(Box::from_raw(self.inner.as_ptr())) };
+    }
+}
+
+impl Allocator for AllocOwner {
+    #[inline]
+    fn alloc(&self, ptr: *mut u8, old_size: usize, new_size: usize, align: usize) -> *mut u8 {
+        // SAFETY: inner 非 null 且指向存活的 Box。
+        unsafe { (**self.inner.as_ptr()).alloc(ptr, old_size, new_size, align) }
+    }
+
+    #[inline]
+    fn allocf_parts(&self) -> Option<(LuaCAlloc, *mut std::ffi::c_void)> {
+        // SAFETY: 同上。
+        unsafe { (**self.inner.as_ptr()).allocf_parts() }
+    }
+
+    #[inline]
+    fn set_allocf(&mut self, f: LuaCAlloc, ud: *mut std::ffi::c_void) -> bool {
+        // SAFETY: 同上；`&mut self` 保证独占。
+        unsafe { (**self.inner.as_ptr()).set_allocf(f, ud) }
+    }
+}
+
+// ============================================================================
+// SlotAlloc — 面向 allocator-aware 容器的适配器（上方注释保留）
+// ============================================================================
+
+/// 把 [`crate::strings::AllocSlot`]（指向 `Box<dyn Allocator>` 的稳定地址）适配为
 /// allocator-aware 容器的分配器（[`AllocVec`] / [`AllocBox`] /
 /// [`hashbrown::HashTable`]，分别对应 C 的数组部分 / 盒 / Node 数组）：
 /// - [`AllocVec`]（标准库 `Vec<T, A>`，回退 `allocator_api2::vec::Vec`）
 /// - [`AllocBox`]（标准库 `Box<T, A>`，回退 `allocator_api2::boxed::Box`）
 /// - [`hashbrown::HashTable`]（`A = SlotAlloc`，对应 C Lua Node 数组）
 ///
-/// 槽非 null 时分配/重分配/释放全部经该分配器（对应 C 的 global_State.allocf）；
-/// 槽为 null（测试/早期构造）回退 std::alloc，与分配路径一致。
+/// 全部分配/重分配/释放都经槽指向的分配器（对应 C 的 `global_State.allocf`）。
+///
+/// 不变量：**槽永不为 null**。只能经 [`SlotAlloc::from_slot`] /
+/// [`SlotAlloc::from_owner`]（运行期，配合 [`AllocOwner`] 或
+/// `LuaState::alloc_slot`）构造；测试用 `TestAlloc`（每实例独立宿主）。
 ///
 /// `Copy`：仅持有一个指针，容器（Vec/Box/HashTable）要求 `A: Clone` 时零成本复制。
 #[derive(Clone, Copy)]
-pub struct SlotAlloc(pub crate::strings::AllocSlot);
-
-impl Default for SlotAlloc {
-    #[inline]
-    fn default() -> Self {
-        SlotAlloc(std::ptr::null())
-    }
-}
+pub struct SlotAlloc(crate::strings::AllocSlot);
 
 impl SlotAlloc {
+    /// 从分配器宿主取槽。
+    #[inline]
+    pub fn from_owner(owner: &AllocOwner) -> Self {
+        Self(owner.slot())
+    }
+
+    /// 从裸槽构造。
+    ///
+    /// # Safety
+    /// `slot` 必须非 null，且其指向的 `Box<dyn Allocator>` 必须在本分配器的
+    /// **全部**使用期内保持有效（由 [`AllocOwner`] 或 `GlobalState::mem` 保证）。
+    #[inline]
+    pub unsafe fn from_slot(slot: crate::strings::AllocSlot) -> Self {
+        debug_assert!(!slot.is_null(), "SlotAlloc 槽不得为 null");
+        Self(slot)
+    }
+
+    /// 底层槽（非 null）。
+    #[inline]
+    pub fn slot(self) -> crate::strings::AllocSlot {
+        self.0
+    }
+
     /// 经槽分配/释放；`new_size == 0` 时释放并返回 null（C realloc 语义）。
-    /// null 槽回退 std::alloc。
     #[inline]
     unsafe fn raw_realloc(
         &self,
@@ -221,26 +330,42 @@ impl SlotAlloc {
         new_size: usize,
         align: usize,
     ) -> *mut u8 {
-        if self.0.is_null() {
-            if new_size == 0 {
-                if old_size != 0 && !ptr.is_null() {
-                    let layout = Layout::from_size_align_unchecked(old_size, align);
-                    alloc::dealloc(ptr, layout);
-                }
-                return std::ptr::null_mut();
-            }
-            if ptr.is_null() || old_size == 0 {
-                match Layout::from_size_align(new_size, align) {
-                    Ok(l) => alloc::alloc(l),
-                    Err(_) => std::ptr::null_mut(),
-                }
-            } else {
-                let old_layout = Layout::from_size_align_unchecked(old_size, align);
-                alloc::realloc(ptr, old_layout, new_size)
-            }
-        } else {
-            (&*self.0).alloc(ptr, old_size, new_size, align)
-        }
+        (*self.0).alloc(ptr, old_size, new_size, align)
+    }
+}
+
+/// 测试用独立分配器：**每个实例自带一份** [`DefaultAllocator`]，实例之间
+/// 互不共享。
+///
+/// 为什么不是「每线程一份」的单例：同一线程可以有多个 `LuaState`，各自挂
+/// 不同的 `allocf`（`lua_newstate` / `lua_setallocf`），它们之间可能还要
+/// 交叉引用对象。把同线程的所有分配钉在同一个分配器上，正是必须避免的假定。
+///
+/// 生命周期：`TestAlloc` 必须**活得比使用它槽的对象更久**。约定用法是在
+/// 测试函数（或测试辅助作用域）开头绑定：
+///
+/// ```ignore
+/// let alloc = TestAlloc::new();
+/// let t = Table::new_in(alloc.slot());
+/// ```
+///
+/// 禁止在「返回表/闭包等持有槽的对象」的函数里局部绑定 `TestAlloc` ——
+/// 函数返回后宿主被析构，槽即成悬垂指针。
+#[cfg(test)]
+pub(crate) struct TestAlloc(AllocOwner);
+
+#[cfg(test)]
+impl TestAlloc {
+    /// 新建一份独立分配器（内层 Box 的地址在 `self` 存活期内稳定）。
+    #[inline]
+    pub(crate) fn new() -> Self {
+        Self(AllocOwner::new(Box::new(DefaultAllocator)))
+    }
+
+    /// 稳定槽 —— 引用者不得比 `self` 活得久。
+    #[inline]
+    pub(crate) fn slot(&self) -> SlotAlloc {
+        SlotAlloc::from_owner(&self.0)
     }
 }
 
@@ -676,6 +801,60 @@ impl Block {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 分配器槽的**非 null 不变量**：`AllocOwner` 与 `SlotAlloc` 的任何构造
+    /// 入口都不得产生 null 槽（null 会让分配静默回退 std::alloc，使
+    /// allocator 参数失去意义）。
+    #[test]
+    fn alloc_slot_is_never_null() {
+        let alloc = crate::mem::TestAlloc::new();
+        let owner = AllocOwner::new(Box::new(DefaultAllocator));
+        assert!(!owner.slot().is_null());
+
+        let slot = SlotAlloc::from_owner(&owner);
+        assert!(!slot.slot().is_null());
+        assert!(!alloc.slot().slot().is_null());
+
+        // 经槽分配/释放可用（证明槽指向真实分配器）
+        unsafe {
+            let boxed: &Box<dyn Allocator> = &*slot.slot();
+            let p = boxed.alloc(std::ptr::null_mut(), 0, 32, 8);
+            assert!(!p.is_null());
+            let _ = boxed.alloc(p, 32, 0, 8);
+        }
+    }
+    /// `AllocOwner::set` 原地替换：槽地址不变（已发出的槽自动跟随新分配器）。
+    #[test]
+    fn alloc_owner_set_keeps_slot_address() {
+        let mut owner = AllocOwner::new(Box::new(DefaultAllocator));
+        let before = owner.slot();
+        owner.set(Box::new(DefaultAllocator));
+        assert_eq!(before, owner.slot(), "替换分配器不得改变槽地址");
+    }
+
+    /// 分配器**逐实例独立**：同一线程内两份宿主必须给出不同槽地址。
+    ///
+    /// 反例（本节禁止）：把同线程的所有分配钉在同一个分配器上 —— 那样
+    /// 同一线程里的多个 `LuaState` 就无法各自使用不同的 `allocf`。
+    #[test]
+    fn allocators_are_per_instance_not_per_thread() {
+        let a = AllocOwner::new(Box::new(DefaultAllocator));
+        let b = AllocOwner::new(Box::new(DefaultAllocator));
+        assert_ne!(a.slot(), b.slot(), "两份 AllocOwner 不得共用槽");
+
+        let ta = TestAlloc::new();
+        let tb = TestAlloc::new();
+        assert_ne!(
+            ta.slot().slot(),
+            tb.slot().slot(),
+            "两份 TestAlloc 不得共用槽"
+        );
+        assert_ne!(
+            ta.slot().slot(),
+            a.slot(),
+            "TestAlloc 槽不得与 AllocOwner 复用"
+        );
+    }
 
     #[test]
     fn test_alloc_free() {

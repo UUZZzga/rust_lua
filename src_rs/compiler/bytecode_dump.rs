@@ -6,7 +6,7 @@ use crate::opcodes::{
     getarg_sj, getarg_vb, getarg_vc, testarg_k, OFFSET_sJ, OpCode, OpMode, POS_A, POS_B, POS_C,
     POS_K, POS_VB, POS_VC, SIZE_A, SIZE_BX, TM_EVENT_NAMES,
 };
-use crate::strings::{lua_string_as_str, new_lstr, AllocSlot, StringTable};
+use crate::strings::{lua_string_as_str, new_lstr, StringTable};
 #[cfg(test)]
 use imara_diff::{Algorithm, Diff, InternedInput};
 #[cfg(feature = "cmp_c")]
@@ -1498,7 +1498,7 @@ pub fn dump_proto(f: &Proto, strip: bool) -> Vec<u8> {
 /// 对应 C 的 luaU_undump 后的 Proto 构建
 pub fn dumped_to_proto<'a>(
     df: &DumpedFunction,
-    alloc: AllocSlot,
+    alloc: crate::mem::SlotAlloc,
     table: &StringTable,
 ) -> Proto<'a> {
     let mut proto = new_proto_internal();
@@ -1616,7 +1616,7 @@ fn new_proto_internal<'a>() -> Proto<'a> {
 /// 对应 C 的 luaU_undump
 pub fn undump_to_proto<'a>(
     data: &[u8],
-    alloc: AllocSlot,
+    alloc: crate::mem::SlotAlloc,
     table: &StringTable,
 ) -> Result<Proto<'a>, String> {
     let df = parse_dump(data)?;

@@ -13056,7 +13056,7 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
     }
     expect(fs, &Token::RParen);
     // 在创建 new_fs 之前取 allocator 槽（之后经 fs.ls_mut() 写入会禁用 new_fs 的别名标签）
-    let lstr_alloc: crate::strings::AllocSlot = fs.ls().state.alloc_slot();
+    let lstr_alloc = fs.ls().state.alloc_slot();
     let mut new_fs = FuncState::new(fs.ls);
     new_fs.prev = fs as *mut FuncState; // like C's fs->prev = ls->fs
     new_fs.proto.num_params = n_params;

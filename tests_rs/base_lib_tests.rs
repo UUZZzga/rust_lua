@@ -10,6 +10,7 @@
 //! 对应 C 源码: lbaselib.cpp
 
 use lua_rs::cli::Interpreter;
+use lua_rs::mem::{AllocOwner, DefaultAllocator, SlotAlloc};
 use lua_rs::objects::{NilKind, TValue};
 use lua_rs::state::LuaState;
 use lua_rs::stdlib::base_lib;
@@ -773,6 +774,9 @@ fn test_unit_b_str2int() {
 
 #[test]
 fn test_unit_base_type_name() {
+    // 独立持有分配器（不使用线程级共享分配器）
+    let owner = AllocOwner::new(Box::new(DefaultAllocator));
+    let slot = SlotAlloc::from_owner(&owner);
     assert_eq!(
         base_lib::base_type_name(&TValue::Nil(NilKind::Strict)),
         "nil"
@@ -782,7 +786,7 @@ fn test_unit_base_type_name() {
     assert_eq!(base_lib::base_type_name(&TValue::Float(3.14)), "number");
     assert_eq!(base_lib::base_type_name(&make_str("hello")), "string");
     assert_eq!(
-        base_lib::base_type_name(&TValue::Table(Table::new())),
+        base_lib::base_type_name(&TValue::Table(Table::new_in(slot))),
         "table"
     );
 }
@@ -845,10 +849,12 @@ fn test_unit_base_rawequal() {
 
 #[test]
 fn test_unit_base_rawlen() {
+    let owner = AllocOwner::new(Box::new(DefaultAllocator));
+    let slot = SlotAlloc::from_owner(&owner);
     assert_eq!(base_lib::base_rawlen(&make_str("hello")).unwrap(), 5);
     assert_eq!(base_lib::base_rawlen(&make_str("")).unwrap(), 0);
 
-    let t = Table::new();
+    let t = Table::new_in(slot);
     t.set(TValue::Integer(1), TValue::Integer(10));
     t.set(TValue::Integer(2), TValue::Integer(20));
     assert_eq!(base_lib::base_rawlen(&TValue::Table(t)).unwrap(), 2);
@@ -941,7 +947,7 @@ fn test_unit_open_base_lib() {
 fn test_unit_call_ipairs_aux() {
     let mut state = LuaState::default();
     state.stack.clear();
-    let t = Table::new();
+    let t = Table::new_in(state.alloc_slot());
     t.set(TValue::Integer(1), TValue::Integer(10));
     t.set(TValue::Integer(2), TValue::Integer(20));
     // base 库已迁移到 BuiltinFn，ipairs 返回的迭代器是 BuiltinFn(call_ipairs_aux)。

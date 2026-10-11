@@ -650,19 +650,19 @@ mod tests {
 
     #[test]
     fn test_new_tbc_upval_creates_tbc_entry() {
+        let alloc = crate::mem::TestAlloc::new();
         let mut state = make_vm_state();
         // 创建带 __close 元方法的 Table
         let close_key = state.intern_str("__close");
-        let mt = Table::new();
+        let mt = Table::new_in(alloc.slot());
         mt.set(close_key, TValue::Integer(0));
-        let obj = Table::new();
+        let obj = Table::new_in(alloc.slot());
         obj.set_metatable(Some(mt));
         state.stack = vec![TValue::Table(obj)];
         let uv = new_tbc_upval(&mut state, 0).expect("closable value should succeed");
         assert!(uv.is_some());
         assert_eq!(state.tbc_list, uv);
     }
-
     #[test]
     fn test_new_tbc_upval_rejects_non_closable() {
         let mut state = make_vm_state();
@@ -682,12 +682,13 @@ mod tests {
 
     #[test]
     fn test_pop_tbc_list_removes_entry() {
+        let alloc = crate::mem::TestAlloc::new();
         let mut state = make_vm_state();
         // 创建带 __close 元方法的 Table
         let close_key = state.intern_str("__close");
-        let mt = Table::new();
+        let mt = Table::new_in(alloc.slot());
         mt.set(close_key, TValue::Integer(0));
-        let obj = Table::new();
+        let obj = Table::new_in(alloc.slot());
         obj.set_metatable(Some(mt));
         state.stack = vec![TValue::Table(obj)];
         let _uv = new_tbc_upval(&mut state, 0).expect("closable value should succeed");

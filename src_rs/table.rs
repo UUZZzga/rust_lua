@@ -42,20 +42,13 @@ pub(crate) fn hash_get<'a>(td: &TableData<'a>, key: &TValue<'a>) -> Option<TValu
 // ============================================================================
 
 impl<'a> Table<'a> {
-    /// 创建空表 — 无 allocator 槽（测试/构造期），块走 std::alloc。
-    /// 运行态请用 [`Table::new_in`]，让 TableData 块经 MemState allocator 分配。
-    pub fn new() -> Self {
-        Self::new_in(std::ptr::null_mut())
-    }
-
     /// 创建空表 — TableData 块（header + 数据）由 `alloc_slot` 指向的
-    /// MemState allocator 分配/释放（null 回退 std::alloc）。
-    /// 数组/哈希缓冲区与 key_to_bucket 索引同样经该分配器。
-    pub fn new_in(alloc_slot: crate::strings::AllocSlot) -> Self {
-        let alloc = SlotAlloc(alloc_slot);
+    /// MemState allocator 分配/释放。数组/哈希缓冲区与 key_to_bucket 索引
+    /// 同样经该分配器。
+    pub fn new_in(alloc: SlotAlloc) -> Self {
         Table {
             data: TableDataRc::new_table(
-                alloc_slot,
+                alloc,
                 TableData {
                     gc_header: GCObjectHeader::new(),
                     array: TableVec::new_in(alloc),
@@ -67,23 +60,14 @@ impl<'a> Table<'a> {
         }
     }
 
-    pub fn with_capacity(narray: usize, nhash: usize) -> Self {
-        Self::with_capacity_in(std::ptr::null_mut(), narray, nhash)
-    }
-
     /// 创建带容量的表 — TableData 块由 `alloc_slot` 指向的 MemState allocator
-    /// 分配/释放（null 回退 std::alloc）。对应 C 的 lua_createtable。
-    pub fn with_capacity_in(
-        alloc_slot: crate::strings::AllocSlot,
-        narray: usize,
-        nhash: usize,
-    ) -> Self {
-        let alloc = SlotAlloc(alloc_slot);
+    /// 分配/释放。对应 C 的 lua_createtable。
+    pub fn with_capacity_in(alloc: SlotAlloc, narray: usize, nhash: usize) -> Self {
         let mut array = TableVec::with_capacity_in(narray, alloc);
         array.resize(narray, TValue::Nil(NilKind::Empty));
         Table {
             data: TableDataRc::new_table(
-                alloc_slot,
+                alloc,
                 TableData {
                     gc_header: GCObjectHeader::new(),
                     array,
@@ -194,7 +178,7 @@ impl<'a> Table<'a> {
     #[cfg_attr(not(size_optimized), inline(always))]
     pub(crate) fn data_ro(&self) -> &TableData<'a> {
         // 绕过 borrow 标志直接取 &TableData（仅用于无并发写场景）
-        unsafe { &*(*self.data.as_ptr()).cell.as_ptr() }
+        unsafe { &*(*self.data.as_ptr()).as_ptr() }
     }
 
     /// 一次 borrow 内同时查找值并返回元表 — 消除 metamethod 路径的第二次 borrow。
@@ -664,15 +648,17 @@ pub struct LuaTable<'a> {
 }
 
 impl<'a> LuaTable<'a> {
-    pub fn new() -> Self {
+    /// 表块由 `alloc` 分配。
+    pub fn new_in(alloc: SlotAlloc) -> Self {
         LuaTable {
-            table: Table::new(),
+            table: Table::new_in(alloc),
         }
     }
 
-    pub fn with_capacity(narray: usize, nhash: usize) -> Self {
+    /// 表块由 `alloc` 分配。
+    pub fn with_capacity_in(alloc: SlotAlloc, narray: usize, nhash: usize) -> Self {
         LuaTable {
-            table: Table::with_capacity(narray, nhash),
+            table: Table::with_capacity_in(alloc, narray, nhash),
         }
     }
 
@@ -717,20 +703,6 @@ impl<'a> LuaTable<'a> {
     }
 }
 
-impl<'a> Default for LuaTable<'a> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-pub fn new_table<'a>() -> Table<'a> {
-    Table::new()
-}
-
-pub fn new_table_with_capacity<'a>(narray: usize, nhsize: usize) -> Table<'a> {
-    Table::with_capacity(narray, nhsize)
-}
-
 /// 浮点数键转换为整数键 — 对应 C 的 `lua_numbertointeger`
 ///
 /// 当浮点数能精确表示为 i64 范围内的整数时返回该整数。
@@ -769,30 +741,30 @@ mod tests {
 
     #[test]
     fn test_table_new() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         assert_eq!(t.array_size(), 0);
         assert_eq!(t.hash_size(), 0);
         assert!(!t.has_metatable());
         assert_eq!(t.len(), 0);
     }
-
     #[test]
     fn test_table_with_capacity() {
-        let t = Table::with_capacity(10, 8);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 10, 8);
         assert!(t.data.borrow().hash_buckets.capacity() >= 8);
         let data = t.data.borrow();
         for v in &data.array {
             assert!(matches!(v, TValue::Nil(NilKind::Empty)));
         }
     }
-
     #[test]
     fn test_table_default() {
-        let t = Table::default();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         assert_eq!(t.array_size(), 0);
         assert_eq!(t.hash_size(), 0);
     }
-
     /// 表的三个内部容器（array / hash_buckets / key_to_bucket）都携带并使用
     /// MemState allocator 槽（对应 C 表经 global_State.allocf 分配）。
     #[test]
@@ -818,14 +790,17 @@ mod tests {
         let boxed: Box<dyn Allocator> = Box::new(CountingAllocator {
             n: Rc::clone(&counter),
         });
-        let slot: crate::strings::AllocSlot = &boxed;
+        let slot = unsafe { SlotAlloc::from_slot(&boxed) };
 
         let t = Table::new_in(slot);
         {
             let data = t.data.borrow();
             // 两个 Vec 直接携带该槽（空表不分配缓冲区）
-            assert!(std::ptr::eq(data.array.allocator().0, slot));
-            assert!(std::ptr::eq(data.hash_buckets.allocator().0, slot));
+            assert!(std::ptr::eq(data.array.allocator().slot(), slot.slot()));
+            assert!(std::ptr::eq(
+                data.hash_buckets.allocator().slot(),
+                slot.slot()
+            ));
         }
 
         // 写数组元素 → array 缓冲区经自定义分配器扩容
@@ -841,7 +816,7 @@ mod tests {
         {
             let data = t.data.borrow();
             let ktb = data.key_to_bucket.as_ref().unwrap();
-            assert!(std::ptr::eq(ktb.allocator().0, slot));
+            assert!(std::ptr::eq(ktb.allocator().slot(), slot.slot()));
         }
         assert!(
             counter.get() > n1,
@@ -853,51 +828,52 @@ mod tests {
 
     #[test]
     fn test_lua_table_new() {
-        let lt = LuaTable::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let lt = LuaTable::new_in(alloc.slot());
         assert_eq!(lt.len(), 0);
     }
-
     // ------------------------------------------------------------------------
     // get / get_int
     // ------------------------------------------------------------------------
 
     #[test]
     fn test_get_int_array_present() {
-        let t = Table::with_capacity(5, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 5, 0);
         t.set_int(1, TValue::Integer(10));
         assert_eq!(t.get_int(1), Some(TValue::Integer(10)));
     }
-
     #[test]
     fn test_get_int_array_empty_slot() {
-        let t = Table::with_capacity(5, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 5, 0);
         assert_eq!(t.get_int(1), None);
     }
-
     #[test]
     fn test_get_int_out_of_array() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         assert_eq!(t.get_int(100), None);
     }
-
     #[test]
     fn test_get_int_hash() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         t.set_int(100, TValue::Integer(42));
         assert_eq!(t.get_int(100), Some(TValue::Integer(42)));
     }
-
     #[test]
     fn test_get_int_zero_or_negative() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         t.set(TValue::Integer(0), TValue::Integer(99));
         assert_eq!(t.get_int(0), Some(TValue::Integer(99)));
         assert_eq!(t.get_int(-1), None);
     }
-
     #[test]
     fn test_get_string_key() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         let key = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
             0,
             0,
@@ -907,66 +883,66 @@ mod tests {
         let lookup = key;
         assert_eq!(t.get(&lookup), Some(TValue::Integer(42)));
     }
-
     #[test]
     fn test_get_float_integral() {
-        let t = Table::with_capacity(5, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 5, 0);
         t.set_int(1, TValue::Integer(10));
         assert_eq!(t.get(&TValue::Float(1.0)), Some(TValue::Integer(10)));
     }
-
     #[test]
     fn test_get_float_non_integral() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         t.set(TValue::Float(3.14), TValue::Integer(42));
         assert_eq!(t.get(&TValue::Float(3.14)), Some(TValue::Integer(42)));
     }
-
     #[test]
     fn test_get_nil_key() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         assert_eq!(t.get(&TValue::Nil(NilKind::Strict)), None);
     }
-
     #[test]
     fn test_get_with_duplicate_keys_float_int() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         t.set(TValue::Integer(42), TValue::Integer(100));
         // Float(42.0) 和 Integer(42) 在 Lua 中等价
         assert_eq!(t.get(&TValue::Float(42.0)), Some(TValue::Integer(100)));
     }
-
     // ------------------------------------------------------------------------
     // set / set_int
     // ------------------------------------------------------------------------
 
     #[test]
     fn test_set_int_array() {
-        let t = Table::with_capacity(5, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 5, 0);
         t.set_int(1, TValue::Integer(10));
         assert_eq!(t.data.borrow().array[0], TValue::Integer(10));
         assert_eq!(t.get_int(1), Some(TValue::Integer(10)));
     }
-
     #[test]
     fn test_set_int_hash() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         t.set_int(100, TValue::Integer(42));
         assert!(t.data.borrow().idx_get(&TValue::Integer(100)).is_some());
         assert_eq!(t.get_int(100), Some(TValue::Integer(42)));
     }
-
     #[test]
     fn test_set_overwrite() {
-        let t = Table::with_capacity(3, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 3, 0);
         t.set_int(1, TValue::Integer(10));
         t.set_int(1, TValue::Integer(99));
         assert_eq!(t.get_int(1), Some(TValue::Integer(99)));
     }
-
     #[test]
     fn test_set_nil_removes() {
-        let t = Table::with_capacity(3, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 3, 0);
         t.set_int(1, TValue::Integer(10));
         assert!(t.get_int(1).is_some());
         t.set_int(1, TValue::Nil(NilKind::Strict));
@@ -976,19 +952,19 @@ mod tests {
             TValue::Nil(NilKind::Empty)
         ));
     }
-
     #[test]
     fn test_set_nil_removes_from_hash() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         t.set_int(100, TValue::Integer(42));
         assert_eq!(t.hash_size(), 1);
         t.set_int(100, TValue::Nil(NilKind::Strict));
         assert_eq!(t.hash_size(), 0);
     }
-
     #[test]
     fn test_set_string_key() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         let key = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
             0,
             0,
@@ -999,20 +975,20 @@ mod tests {
         let lookup = key;
         assert_eq!(t.get(&lookup), Some(TValue::Integer(7)));
     }
-
     #[test]
     fn test_set_bool_key() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         t.set(TValue::Boolean(true), TValue::Integer(1));
         t.set(TValue::Boolean(false), TValue::Integer(0));
         assert_eq!(t.hash_size(), 2);
         assert_eq!(t.get(&TValue::Boolean(true)), Some(TValue::Integer(1)));
         assert_eq!(t.get(&TValue::Boolean(false)), Some(TValue::Integer(0)));
     }
-
     #[test]
     fn test_set_chained_keys() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         for i in 1..=100 {
             t.set_int(i, TValue::Integer(i * 10));
         }
@@ -1022,53 +998,53 @@ mod tests {
         assert_eq!(t.hash_size(), 0);
         assert_eq!(t.get_int(50), Some(TValue::Integer(500)));
     }
-
     // ------------------------------------------------------------------------
     // len (#t)
     // ------------------------------------------------------------------------
 
     #[test]
     fn test_len_dense_array() {
-        let t = Table::with_capacity(5, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 5, 0);
         t.set_int(1, TValue::Integer(10));
         t.set_int(2, TValue::Integer(20));
         t.set_int(3, TValue::Integer(30));
         assert_eq!(t.len(), 3);
     }
-
     #[test]
     fn test_len_hole() {
-        let t = Table::with_capacity(5, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 5, 0);
         t.set_int(1, TValue::Integer(10));
         t.set_int(3, TValue::Integer(30));
         assert_eq!(t.len(), 1);
     }
-
     #[test]
     fn test_len_empty_table() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         assert_eq!(t.len(), 0);
     }
-
     #[test]
     fn test_len_full_array() {
-        let t = Table::with_capacity(4, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 4, 0);
         for i in 1..=4 {
             t.set_int(i, TValue::Integer(i * 10));
         }
         assert_eq!(t.len(), 4);
     }
-
     #[test]
     fn test_len_hash_only() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         t.set(TValue::Boolean(true), TValue::Integer(1));
         assert_eq!(t.len(), 0);
     }
-
     #[test]
     fn test_len_array_then_hash_continuation() {
-        let t = Table::with_capacity(3, 10);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 3, 10);
         t.set_int(1, TValue::Integer(10));
         t.set_int(2, TValue::Integer(20));
         t.set_int(3, TValue::Integer(30));
@@ -1076,14 +1052,14 @@ mod tests {
         t.set(TValue::Integer(5), TValue::Integer(50));
         assert_eq!(t.len(), 5);
     }
-
     // ------------------------------------------------------------------------
     // next
     // ------------------------------------------------------------------------
 
     #[test]
     fn test_next_from_nil() {
-        let t = Table::with_capacity(3, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 3, 0);
         t.set_int(1, TValue::Integer(10));
         t.set_int(2, TValue::Integer(20));
         let first = t.next(None);
@@ -1092,10 +1068,10 @@ mod tests {
         assert_eq!(k, TValue::Integer(1));
         assert_eq!(v, TValue::Integer(10));
     }
-
     #[test]
     fn test_next_array_full_traversal() {
-        let t = Table::with_capacity(3, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 3, 0);
         t.set_int(1, TValue::Integer(10));
         t.set_int(2, TValue::Integer(20));
         t.set_int(3, TValue::Integer(30));
@@ -1111,10 +1087,10 @@ mod tests {
 
         assert_eq!(t.next(Some(&r3.0)), None);
     }
-
     #[test]
     fn test_next_with_hole() {
-        let t = Table::with_capacity(4, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 4, 0);
         t.set_int(1, TValue::Integer(10));
         t.set_int(3, TValue::Integer(30));
 
@@ -1126,10 +1102,10 @@ mod tests {
 
         assert_eq!(t.next(Some(&r2.0)), None);
     }
-
     #[test]
     fn test_next_hash_part() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         let key_a = TValue::Boolean(true);
         t.set(key_a.clone(), TValue::Integer(1));
 
@@ -1137,16 +1113,16 @@ mod tests {
         assert_eq!(r, (key_a.clone(), TValue::Integer(1)));
         assert_eq!(t.next(Some(&r.0)), None);
     }
-
     #[test]
     fn test_next_empty_table() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         assert_eq!(t.next(None), None);
     }
-
     #[test]
     fn test_next_array_then_hash() {
-        let t = Table::with_capacity(2, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 2, 0);
         t.set_int(1, TValue::Integer(10));
         t.set_int(2, TValue::Integer(20));
         t.set(TValue::Boolean(true), TValue::Integer(99));
@@ -1161,10 +1137,10 @@ mod tests {
         assert_eq!(keys_seen[0], TValue::Integer(1));
         assert_eq!(keys_seen[1], TValue::Integer(2));
     }
-
     #[test]
     fn test_next_multiple_hash_keys() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         t.set(TValue::Boolean(true), TValue::Integer(1));
         t.set(TValue::Boolean(false), TValue::Integer(2));
         t.set(TValue::Integer(0), TValue::Integer(3));
@@ -1177,10 +1153,10 @@ mod tests {
         }
         assert_eq!(keys_seen.len(), 3);
     }
-
     #[test]
     fn test_next_after_nil_set() {
-        let t = Table::with_capacity(5, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 5, 0);
         t.set_int(1, TValue::Integer(10));
         t.set_int(2, TValue::Integer(20));
         t.set_int(3, TValue::Integer(30));
@@ -1199,14 +1175,14 @@ mod tests {
         assert!(all.contains(&TValue::Integer(1)));
         assert!(all.contains(&TValue::Integer(3)));
     }
-
     // ------------------------------------------------------------------------
     // rehash
     // ------------------------------------------------------------------------
 
     #[test]
     fn test_rehash_expand_array() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         t.set_int(1, TValue::Integer(10));
         t.set_int(3, TValue::Integer(30));
         // set_int(1) 顺序扩展 array 到 1；set_int(3) 因 idx=2 != array.len()=1 进 hash
@@ -1222,10 +1198,10 @@ mod tests {
             TValue::Nil(NilKind::Empty)
         ));
     }
-
     #[test]
     fn test_rehash_shrink_array() {
-        let t = Table::with_capacity(5, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 5, 0);
         for i in 1..=5 {
             t.set_int(i, TValue::Integer(i * 10));
         }
@@ -1239,10 +1215,10 @@ mod tests {
         assert_eq!(t.get_int(3), Some(TValue::Integer(30)));
         assert_eq!(t.get_int(5), Some(TValue::Integer(50)));
     }
-
     #[test]
     fn test_resize_array() {
-        let t = Table::with_capacity(2, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 2, 0);
         t.set_int(1, TValue::Integer(10));
         t.set_int(2, TValue::Integer(20));
         t.resize_array(4);
@@ -1250,10 +1226,10 @@ mod tests {
         assert_eq!(t.get_int(1), Some(TValue::Integer(10)));
         assert_eq!(t.get_int(2), Some(TValue::Integer(20)));
     }
-
     #[test]
     fn test_rehash_preserves_string_keys() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         let key = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
             0,
             0,
@@ -1267,10 +1243,10 @@ mod tests {
         let lookup = key;
         assert_eq!(t.get(&lookup), Some(TValue::Integer(77)));
     }
-
     #[test]
     fn test_rehash_twice() {
-        let t = Table::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         t.set_int(1, TValue::Integer(10));
         t.set_int(2, TValue::Integer(20));
 
@@ -1283,65 +1259,65 @@ mod tests {
         assert_eq!(t.hash_size(), 2);
         assert_eq!(t.get_int(1), Some(TValue::Integer(10)));
     }
-
     #[test]
     fn test_mem_size() {
-        let t = Table::with_capacity(10, 16);
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::with_capacity_in(alloc.slot(), 10, 16);
         let size = t.mem_size();
         assert!(size > 0);
     }
-
     // ------------------------------------------------------------------------
     // LuaTable 封装
     // ------------------------------------------------------------------------
 
     #[test]
     fn test_lua_table_get_set() {
-        let mut lt = LuaTable::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let mut lt = LuaTable::new_in(alloc.slot());
         lt.set_int(1, TValue::Integer(42));
         assert_eq!(lt.get_int(1), Some(TValue::Integer(42)));
     }
-
     #[test]
     fn test_lua_table_len() {
-        let mut lt = LuaTable::with_capacity(3, 0);
+        let alloc = crate::mem::TestAlloc::new();
+        let mut lt = LuaTable::with_capacity_in(alloc.slot(), 3, 0);
         lt.set_int(1, TValue::Integer(10));
         lt.set_int(2, TValue::Integer(20));
         lt.set_int(3, TValue::Integer(30));
         assert_eq!(lt.len(), 3);
     }
-
     #[test]
     fn test_lua_table_inner_access() {
-        let mut lt = LuaTable::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let mut lt = LuaTable::new_in(alloc.slot());
         lt.set_int(1, TValue::Integer(99));
         assert_eq!(lt.inner().get_int(1), Some(TValue::Integer(99)));
         lt.inner_mut().set_int(2, TValue::Integer(88));
         assert_eq!(lt.get_int(2), Some(TValue::Integer(88)));
     }
-
     #[test]
     fn test_lua_table_next() {
-        let mut lt = LuaTable::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let mut lt = LuaTable::new_in(alloc.slot());
         lt.set_int(1, TValue::Integer(10));
         let r = lt.next(None).unwrap();
         assert_eq!(r, (TValue::Integer(1), TValue::Integer(10)));
     }
-
     #[test]
     fn test_lua_table_rehash() {
-        let mut lt = LuaTable::new();
+        let alloc = crate::mem::TestAlloc::new();
+        let mut lt = LuaTable::new_in(alloc.slot());
         lt.set_int(1, TValue::Integer(10));
         lt.set_int(3, TValue::Integer(30));
         lt.rehash(3, 0);
         assert_eq!(lt.len(), 1);
     }
-
     #[test]
     fn test_new_table_functions() {
-        let t = new_table();
+        let alloc = crate::mem::TestAlloc::new();
+        let t = Table::new_in(alloc.slot());
         assert_eq!(t.array_size(), 0);
-        let t2 = new_table_with_capacity(5, 8);
+        let t2 = Table::with_capacity_in(alloc.slot(), 5, 8);
         assert_eq!(t2.array_size(), 5);
     }
 }

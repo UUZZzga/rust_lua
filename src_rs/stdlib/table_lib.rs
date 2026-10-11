@@ -353,7 +353,7 @@ fn call_pack<'a>(
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError<'a>> {
-    let t = Table::new();
+    let t = Table::new_in(state.alloc_slot());
     for i in 0..nargs {
         let val = get_arg(state, a, i);
         t.set_int((i + 1) as i64, val);
@@ -743,7 +743,7 @@ fn call_create<'a>(
         return Err(VmError::RuntimeError("table overflow".to_string()));
     }
 
-    let table = Table::with_capacity(sizeseq as usize, sizerest as usize);
+    let table = Table::with_capacity_in(state.alloc_slot(), sizeseq as usize, sizerest as usize);
     // 注册到 GC 并估算大小 (对应 C 中 lua_createtable 触发的 GC 跟踪)
     // 估算: array 部分 sizeseq * sizeof(TValue) + hash 部分预留容量 * 节点大小
     let estimated_size = sizeseq as usize * std::mem::size_of::<TValue>()
@@ -970,7 +970,7 @@ fn call_comp_function<'a>(
 
 /// 打开 Table 库并注册到全局变量 table
 pub fn open_table_lib<'a>(state: &mut LuaState<'a>) {
-    let mut lib = Table::new();
+    let mut lib = Table::new_in(state.alloc_slot());
 
     // 注册所有 Table 函数 (使用 BuiltinFn 函数指针)
     let register = |lib: &mut crate::table::Table<'a>,
@@ -1010,12 +1010,13 @@ mod tests {
 
     #[test]
     fn test_unpack() {
+        let alloc = crate::mem::TestAlloc::new();
         // local minI = math.mininteger
         // local t = {[minI] = 12.3, [minI + 1] = 23.5}
         // print(table.unpack(t, minI, minI + 1))
         let mut state = LuaState::default();
         let min_i = crate::stdlib::math_lib::MIN_INTEGER;
-        let table = Table::new();
+        let table = Table::new_in(alloc.slot());
         table.set(TValue::Integer(min_i), TValue::Float(12.3));
         table.set(TValue::Integer(min_i + 1), TValue::Float(23.5));
         state.push_value(TValue::Table(table));

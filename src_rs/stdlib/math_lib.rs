@@ -1327,7 +1327,7 @@ fn call_randomseed<'a>(
 /// 2. 设置常量: pi, huge, maxinteger, mininteger
 /// 3. 初始化随机数生成器状态
 pub fn open_math_lib<'a>(state: &mut LuaState<'a>) {
-    let lib = Table::new();
+    let lib = Table::new_in(state.alloc_slot());
 
     // 注册所有数学库函数 (使用 BuiltinFn 函数指针)
     //

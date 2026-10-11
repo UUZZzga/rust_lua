@@ -8,7 +8,7 @@
 //! - __index 指向字符串库函数表 (string.len, string.sub 等)
 //! - 注册 string 全局表，包含所有字符串库函数
 
-use crate::alloc::SimpleRc;
+use crate::alloc::{MyRc, SimpleRc};
 use crate::execute::{arg_error, VmError};
 use crate::objects::{BuiltinFn, BuiltinFnPtr, LuaType, NilKind, RustClosure, TValue};
 use crate::state::LuaState;
@@ -857,7 +857,7 @@ enum CaptureResult {
 /// 获取所有捕获的字符串 — 写入调用者提供的缓冲区（复用容量，零分配）。
 /// 热路径（find/match 每次调用一次）：clear + 复用，避免 Vec::with_capacity。
 fn get_captures_into<'a>(
-    alloc: crate::strings::AllocSlot,
+    alloc: crate::mem::SlotAlloc,
     ms: &MatchState<'_>,
     s: usize,
     e: usize,
@@ -887,7 +887,7 @@ fn get_captures_into<'a>(
 /// captures_out: 匹配成功时写入（复用调用者缓冲区）。
 /// 返回 Some((start, end)) 或 None（未找到）。
 pub fn str_find_into<'a>(
-    alloc: crate::strings::AllocSlot,
+    alloc: crate::mem::SlotAlloc,
     s: &str,
     pattern: &str,
     init: i64,
@@ -968,7 +968,7 @@ pub fn str_find_into<'a>(
 /// string.find(s, pattern, [init], [plain]) — 查找模式
 /// 对应 C 的 str_find（兼容包装：结果转 FindResult）
 pub fn str_find<'a>(
-    alloc: crate::strings::AllocSlot,
+    alloc: crate::mem::SlotAlloc,
     s: &str,
     pattern: &str,
     init: i64,
@@ -998,7 +998,7 @@ pub enum FindResult<'a> {
 /// string.match(s, pattern, [init]) — 模式匹配
 /// 对应 C 的 str_match
 pub fn str_match<'a>(
-    alloc: crate::strings::AllocSlot,
+    alloc: crate::mem::SlotAlloc,
     s: &str,
     pattern: &str,
     init: i64,
@@ -1043,7 +1043,7 @@ impl GMatchIterator {
 
     pub fn next<'a>(
         &mut self,
-        alloc: crate::strings::AllocSlot,
+        alloc: crate::mem::SlotAlloc,
         table: &crate::strings::StringTable,
     ) -> Result<Vec<TValue<'a>>, String> {
         let src_bytes = self.src.as_bytes();
@@ -2382,7 +2382,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                     }
                     TValue::RustClosure(rc) => {
                         // Rust 闭包：使用 Rc 指针地址
-                        let ptr = Rc::as_ptr(rc) as usize;
+                        let ptr = rc.as_raw_ptr() as usize;
                         format!("0x{:x}", ptr)
                     }
                     TValue::UserData(u) => {
@@ -3011,7 +3011,7 @@ pub fn str_packsize(fmt: &str) -> Result<usize, String> {
 /// 对应 C 的 str_unpack
 /// 返回 (解包的值列表, 下一个位置)
 pub fn str_unpack<'a>(
-    alloc: crate::strings::AllocSlot,
+    alloc: crate::mem::SlotAlloc,
     fmt: &str,
     data: &[u8],
     init_pos: i64,
@@ -3940,11 +3940,14 @@ fn call_str_gmatch<'a>(
         TValue::Integer(pat_start as i64),
         TValue::Integer(-1), // lastmatch: 无上次匹配
     ];
-    let iter = TValue::RustClosure(Rc::new(RustClosure {
-        func: call_gmatch_iter,
-        name: c"gmatch_iter".as_ptr() as *const u8,
-        upvalues: Rc::new(RefCell::new(upvalues)),
-    }));
+    let iter = TValue::RustClosure(MyRc::new_in(
+        state.alloc_slot(),
+        RustClosure {
+            func: call_gmatch_iter,
+            name: c"gmatch_iter".as_ptr() as *const u8,
+            upvalues: Rc::new(RefCell::new(upvalues)),
+        },
+    ));
     push_results(state, a, nresults, vec![iter]);
     Ok(())
 }
@@ -4102,7 +4105,7 @@ fn call_str_dump<'a>(
 /// 2. 设置 __index 指向字符串库
 /// 3. 将元表注册为字符串类型的默认元表
 pub fn create_string_metatable(state: &mut LuaState) {
-    let mut mt_table = Table::new();
+    let mut mt_table = Table::new_in(state.alloc_slot());
 
     // 设置算术元方法 (对应 C 的 stringmetamethods 数组)
     set_arith_method(
@@ -4191,7 +4194,7 @@ fn set_arith_method<'a>(
 
 /// 创建字符串库函数表
 fn create_string_lib_table<'a>(state: &LuaState<'a>) -> Table<'a> {
-    let lib = Table::new();
+    let lib = Table::new_in(state.alloc_slot());
     // 注册所有字符串库函数 (使用 BuiltinFn 函数指针)
     // 重要: 必须使用 state.intern_str() 创建键，确保哈希值与后续查找时一致
     let register = |lib: &Table<'a>, name: &'static std::ffi::CStr, func: BuiltinFnPtr| {
@@ -4590,8 +4593,9 @@ mod tests {
 
     #[test]
     fn test_str_find_plain() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = crate::strings::StringTable::new();
-        let result = str_find(std::ptr::null(), "hello world", "world", 1, true, &tb).unwrap();
+        let result = str_find(alloc.slot(), "hello world", "world", 1, true, &tb).unwrap();
         match result {
             FindResult::Found {
                 start,
@@ -4605,18 +4609,18 @@ mod tests {
             FindResult::NotFound => panic!("should find 'world'"),
         }
     }
-
     #[test]
     fn test_str_find_not_found() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = crate::strings::StringTable::new();
-        let result = str_find(std::ptr::null(), "hello", "xyz", 1, true, &tb).unwrap();
+        let result = str_find(alloc.slot(), "hello", "xyz", 1, true, &tb).unwrap();
         assert!(matches!(result, FindResult::NotFound));
     }
-
     #[test]
     fn test_str_find_empty_pattern() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = crate::strings::StringTable::new();
-        let result = str_find(std::ptr::null(), "hello", "", 1, true, &tb).unwrap();
+        let result = str_find(alloc.slot(), "hello", "", 1, true, &tb).unwrap();
         match result {
             FindResult::Found { start, end, .. } => {
                 assert_eq!(start, 1);
@@ -4625,21 +4629,21 @@ mod tests {
             FindResult::NotFound => panic!("should find empty pattern"),
         }
     }
-
     #[test]
     fn test_str_find_with_init() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = crate::strings::StringTable::new();
-        let result = str_find(std::ptr::null(), "hello hello", "hello", 2, true, &tb).unwrap();
+        let result = str_find(alloc.slot(), "hello hello", "hello", 2, true, &tb).unwrap();
         match result {
             FindResult::Found { start, .. } => assert_eq!(start, 7),
             FindResult::NotFound => panic!("should find second 'hello'"),
         }
     }
-
     #[test]
     fn test_str_find_pattern_dot() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = crate::strings::StringTable::new();
-        let result = str_find(std::ptr::null(), "hello", "h.llo", 1, false, &tb).unwrap();
+        let result = str_find(alloc.slot(), "hello", "h.llo", 1, false, &tb).unwrap();
         match result {
             FindResult::Found { start, end, .. } => {
                 assert_eq!(start, 1);
@@ -4648,11 +4652,11 @@ mod tests {
             FindResult::NotFound => panic!("should match h.llo"),
         }
     }
-
     #[test]
     fn test_str_find_pattern_digit() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = crate::strings::StringTable::new();
-        let result = str_find(std::ptr::null(), "abc123def", "%d+", 1, false, &tb).unwrap();
+        let result = str_find(alloc.slot(), "abc123def", "%d+", 1, false, &tb).unwrap();
         match result {
             FindResult::Found { start, end, .. } => {
                 assert_eq!(start, 4);
@@ -4661,11 +4665,11 @@ mod tests {
             FindResult::NotFound => panic!("should match digits"),
         }
     }
-
     #[test]
     fn test_str_find_pattern_capture() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = crate::strings::StringTable::new();
-        let result = str_find(std::ptr::null(), "hello", "(h(e)llo)", 1, false, &tb).unwrap();
+        let result = str_find(alloc.slot(), "hello", "(h(e)llo)", 1, false, &tb).unwrap();
         match result {
             FindResult::Found {
                 start,
@@ -4679,21 +4683,21 @@ mod tests {
             FindResult::NotFound => panic!("should match with captures"),
         }
     }
-
     #[test]
     fn test_str_find_anchored() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = crate::strings::StringTable::new();
-        let result = str_find(std::ptr::null(), "hello", "^hello", 1, false, &tb).unwrap();
+        let result = str_find(alloc.slot(), "hello", "^hello", 1, false, &tb).unwrap();
         assert!(matches!(result, FindResult::Found { .. }));
 
-        let result = str_find(std::ptr::null(), "xhello", "^hello", 1, false, &tb).unwrap();
+        let result = str_find(alloc.slot(), "xhello", "^hello", 1, false, &tb).unwrap();
         assert!(matches!(result, FindResult::NotFound));
     }
-
     #[test]
     fn test_str_match_basic() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = crate::strings::StringTable::new();
-        let result = str_match(std::ptr::null(), "hello world", "world", 1, &tb).unwrap();
+        let result = str_match(alloc.slot(), "hello world", "world", 1, &tb).unwrap();
         assert_eq!(result.len(), 1);
         match &result[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
@@ -4702,19 +4706,19 @@ mod tests {
             _ => panic!("expected string"),
         }
     }
-
     #[test]
     fn test_str_match_not_found() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = crate::strings::StringTable::new();
-        let result = str_match(std::ptr::null(), "hello", "xyz", 1, &tb).unwrap();
+        let result = str_match(alloc.slot(), "hello", "xyz", 1, &tb).unwrap();
         assert_eq!(result.len(), 1);
         assert!(result[0].is_nil());
     }
-
     #[test]
     fn test_str_match_with_capture() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = crate::strings::StringTable::new();
-        let result = str_match(std::ptr::null(), "hello", "(h.llo)", 1, &tb).unwrap();
+        let result = str_match(alloc.slot(), "hello", "(h.llo)", 1, &tb).unwrap();
         assert_eq!(result.len(), 1);
         match &result[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
@@ -4723,11 +4727,11 @@ mod tests {
             _ => panic!("expected string"),
         }
     }
-
     #[test]
     fn test_str_match_digit_capture() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = crate::strings::StringTable::new();
-        let result = str_match(std::ptr::null(), "abc123", "(%d+)", 1, &tb).unwrap();
+        let result = str_match(alloc.slot(), "abc123", "(%d+)", 1, &tb).unwrap();
         assert_eq!(result.len(), 1);
         match &result[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
@@ -4736,7 +4740,6 @@ mod tests {
             _ => panic!("expected string"),
         }
     }
-
     // ========================================================================
     // gsub 测试
     // ========================================================================
@@ -5063,16 +5066,16 @@ mod tests {
 
     #[test]
     fn test_gmatch_iterator_basic() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = crate::strings::StringTable::new();
         let mut iter = GMatchIterator::new("hello world", "%w+");
-        let first = iter.next(std::ptr::null(), &tb).unwrap();
+        let first = iter.next(alloc.slot(), &tb).unwrap();
         assert_eq!(first.len(), 1);
-        let second = iter.next(std::ptr::null(), &tb).unwrap();
+        let second = iter.next(alloc.slot(), &tb).unwrap();
         assert_eq!(second.len(), 1);
-        let third = iter.next(std::ptr::null(), &tb).unwrap();
+        let third = iter.next(alloc.slot(), &tb).unwrap();
         assert_eq!(third.len(), 0); // no more matches
     }
-
     // ========================================================================
     // match_class 测试
     // ========================================================================
@@ -5272,8 +5275,10 @@ mod tests {
     /// 辅助: 比较 unpack 结果
     fn assert_unpack_eq(fmt: &str, data: &[u8], expected: &[TValue]) {
         let tb = crate::strings::StringTable::new();
+        // 结果只在本函数内比较后即析构，故局部持有分配器是安全的
+        let alloc = crate::mem::TestAlloc::new();
         let (results, _) =
-            str_unpack(std::ptr::null(), fmt, data, 1, &tb).expect("unpack should succeed");
+            str_unpack(alloc.slot(), fmt, data, 1, &tb).expect("unpack should succeed");
         assert_eq!(
             results.len(),
             expected.len(),
@@ -5666,51 +5671,52 @@ mod tests {
 
     #[test]
     fn test_unpack_uint_does_not_fit() {
+        let alloc = crate::mem::TestAlloc::new();
         // 解包无符号整数时,如果值超出 lua_Integer 范围,应报错
         // 仅当 size > SZ_INT 时才检查 (对应 tpack.lua 的溢出测试)
         // 9 字节无符号,最高字节为 1,超出 i64 范围
         let tb = crate::strings::StringTable::new();
         let data = vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01];
-        assert!(str_unpack(std::ptr::null(), "<I9", &data, 1, &tb).is_err());
+        assert!(str_unpack(alloc.slot(), "<I9", &data, 1, &tb).is_err());
 
         // 9 字节有符号,最高字节为 1,超出 i64 范围
         let data = vec![0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        assert!(str_unpack(std::ptr::null(), ">i9", &data, 1, &tb).is_err());
+        assert!(str_unpack(alloc.slot(), ">i9", &data, 1, &tb).is_err());
 
         // 8 字节无符号 0x8000000000000000 不报错 (转为 i64::MIN)
         let data = vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80];
-        assert!(str_unpack(std::ptr::null(), "<I8", &data, 1, &tb).is_ok());
+        assert!(str_unpack(alloc.slot(), "<I8", &data, 1, &tb).is_ok());
     }
-
     #[test]
     fn test_unpack_multiple_values() {
+        let alloc = crate::mem::TestAlloc::new();
         // 多值解包
         let tb = crate::strings::StringTable::new();
         let data = vec![0x01, 0x02, 0x03];
-        let (results, _) = str_unpack(std::ptr::null(), "<i1i1i1", &data, 1, &tb).unwrap();
+        let (results, _) = str_unpack(alloc.slot(), "<i1i1i1", &data, 1, &tb).unwrap();
         assert_eq!(results.len(), 3);
         assert!(crate::vm::raw_equal(&results[0], &TValue::Integer(1)));
         assert!(crate::vm::raw_equal(&results[1], &TValue::Integer(2)));
         assert!(crate::vm::raw_equal(&results[2], &TValue::Integer(3)));
     }
-
     #[test]
     fn test_unpack_with_position() {
+        let alloc = crate::mem::TestAlloc::new();
         // 从指定位置开始解包
         let tb = crate::strings::StringTable::new();
         let data = vec![0xFF, 0x01, 0x02];
-        let (results, next_pos) = str_unpack(std::ptr::null(), "<i2", &data, 2, &tb).unwrap();
+        let (results, next_pos) = str_unpack(alloc.slot(), "<i2", &data, 2, &tb).unwrap();
         assert_eq!(results.len(), 1);
         assert!(crate::vm::raw_equal(&results[0], &TValue::Integer(0x0201)));
         assert_eq!(next_pos, 4); // 1-based, 2 + 2 = 4
     }
-
     #[test]
     fn test_unpack_string() {
+        let alloc = crate::mem::TestAlloc::new();
         // 解包固定长度字符串
         let tb = crate::strings::StringTable::new();
         let data = vec![b'a', b'b', b'c'];
-        let (results, _) = str_unpack(std::ptr::null(), "<c3", &data, 1, &tb).unwrap();
+        let (results, _) = str_unpack(alloc.slot(), "<c3", &data, 1, &tb).unwrap();
         assert_eq!(results.len(), 1);
         match &results[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
@@ -5721,7 +5727,7 @@ mod tests {
 
         // 解包零终止字符串
         let data = vec![b'h', b'i', 0];
-        let (results, _) = str_unpack(std::ptr::null(), "<z", &data, 1, &tb).unwrap();
+        let (results, _) = str_unpack(alloc.slot(), "<z", &data, 1, &tb).unwrap();
         match &results[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 assert_eq!(lua_string_as_str(s), "hi")
@@ -5731,7 +5737,7 @@ mod tests {
 
         // 解包带长度前缀字符串
         let data = vec![2, b'h', b'i'];
-        let (results, _) = str_unpack(std::ptr::null(), "<s1", &data, 1, &tb).unwrap();
+        let (results, _) = str_unpack(alloc.slot(), "<s1", &data, 1, &tb).unwrap();
         match &results[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 assert_eq!(lua_string_as_str(s), "hi")
@@ -5739,7 +5745,6 @@ mod tests {
             _ => panic!("expected string"),
         }
     }
-
     #[test]
     fn test_pack_unpack_roundtrip() {
         // 整数往返
@@ -5786,11 +5791,11 @@ mod tests {
 
     #[test]
     fn test_unpack_data_too_short() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = crate::strings::StringTable::new();
-        assert!(str_unpack(std::ptr::null(), "<i4", &[0, 0, 0], 1, &tb).is_err());
-        assert!(str_unpack(std::ptr::null(), "<c5", &[1, 2, 3], 1, &tb).is_err());
+        assert!(str_unpack(alloc.slot(), "<i4", &[0, 0, 0], 1, &tb).is_err());
+        assert!(str_unpack(alloc.slot(), "<c5", &[1, 2, 3], 1, &tb).is_err());
     }
-
     #[test]
     fn test_pack_string_too_long() {
         let s = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
@@ -5828,6 +5833,7 @@ mod tests {
 
     #[test]
     fn test_pack_unpack_complex_roundtrip() {
+        let alloc = crate::mem::TestAlloc::new();
         let tb = crate::strings::StringTable::new();
         let s = tb.intern_value("XY");
         let fmt = "<i1c2i2d";
@@ -5838,18 +5844,18 @@ mod tests {
             TValue::Float(3.14),
         ];
         let packed = str_pack(fmt, &args).unwrap();
-        let (results, _) = str_unpack(std::ptr::null(), fmt, &packed, 1, &tb).unwrap();
+        let (results, _) = str_unpack(alloc.slot(), fmt, &packed, 1, &tb).unwrap();
         assert_eq!(results.len(), 4);
         assert!(crate::vm::raw_equal(&results[0], &TValue::Integer(42)));
         assert!(crate::vm::raw_equal(&results[1], &s));
         assert!(crate::vm::raw_equal(&results[2], &TValue::Integer(1000)));
         assert!(crate::vm::raw_equal(&results[3], &TValue::Float(3.14)));
     }
-
     // --- tpack.lua 关键测试场景 ---
 
     #[test]
     fn test_tpack_line99_scenario() {
+        let alloc = crate::mem::TestAlloc::new();
         // 模拟 tpack.lua:99 的场景
         // lnum = 0x13121110090807060504030201 (溢出 i64, 使用 wrapping)
         let lnum = 0x0807060504030201i64; // wrapping 后的低 64 位
@@ -5873,7 +5879,7 @@ mod tests {
 
             // 验证解包往返
             let unpack_fmt = format!("<i{}", i);
-            let (results, _) = str_unpack(std::ptr::null(), &unpack_fmt, &packed, 1, &tb).unwrap();
+            let (results, _) = str_unpack(alloc.slot(), &unpack_fmt, &packed, 1, &tb).unwrap();
             assert!(
                 crate::vm::raw_equal(&results[0], &TValue::Integer(n)),
                 "i={} roundtrip mismatch: got {:?}, expected {}",
@@ -5883,7 +5889,6 @@ mod tests {
             );
         }
     }
-
     #[test]
     fn test_tpack_reverse_endian() {
         // 测试 tpack.lua 中的 s:reverse() 场景

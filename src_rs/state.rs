@@ -1,9 +1,11 @@
+use crate::alloc::MyRc;
 use crate::debug::runerror;
 use crate::execute::{VmError, VmExecutor, VmResult};
 use crate::gc::{GCObjectHeader, GCState};
 #[cfg(lua_use_longjmp)]
 use crate::helper::JmpBuf;
-use crate::mem::{Allocator, DefaultAllocator, MemState};
+use crate::mem::SlotAlloc;
+use crate::mem::{AllocOwner, Allocator, DefaultAllocator, MemState};
 use crate::objects::FxBuildHasher;
 use crate::objects::{
     BuiltinFn, BuiltinFnPtr, Instruction, LClosure, LuaThread, LuaType, NilKind, Proto, TValue,
@@ -256,7 +258,7 @@ fn is_marked<'a>(val: &TValue<'a>, reachable: &GcHashSet) -> bool {
             .id()
             .map_or(true, |id| reachable.contains(&(id.0 as usize))),
         TValue::RustClosure(rc) => {
-            let ptr = Rc::as_ptr(rc) as usize;
+            let ptr = rc.as_raw_ptr() as usize;
             reachable.contains(&ptr)
         }
         TValue::Thread(t) => {
@@ -264,7 +266,7 @@ fn is_marked<'a>(val: &TValue<'a>, reachable: &GcHashSet) -> bool {
             reachable.contains(&ptr)
         }
         TValue::CClosure(cc) => {
-            let ptr = Rc::as_ptr(cc) as usize;
+            let ptr = cc.as_raw_ptr() as usize;
             reachable.contains(&ptr)
         }
         _ => true,
@@ -754,7 +756,7 @@ impl<'a> LuaState<'a> {
     /// 打开选定的标准库 — 对应 C 的 `luaL_openselectedlibs(L, load, preload)`。
     /// 标准库开库需要每线程执行态（LuaState = C 的 lua_State）。
     pub fn open_selected_libs(&mut self, _mask: i32, _ignored: i32) {
-        let arg_table = Table::new();
+        let arg_table = Table::new_in(self.alloc_slot());
         self.globals
             .set(self.intern_str("arg"), TValue::Table(arg_table));
 
@@ -2244,12 +2246,12 @@ impl<'a> LuaState<'a> {
     }
 
     pub fn create_table(&mut self, narr: usize, nrec: usize) {
-        let t = Table::with_capacity(narr, nrec);
+        let t = Table::with_capacity_in(self.alloc_slot(), narr, nrec);
         self.stack.push(TValue::Table(t));
     }
 
     pub fn new_table(&mut self) {
-        let t = Table::new();
+        let t = Table::new_in(self.alloc_slot());
         self.stack.push(TValue::Table(t));
     }
 
@@ -2408,11 +2410,14 @@ impl<'a> LuaState<'a> {
                             value: TValue::Nil(NilKind::Strict),
                         })));
                 }
-                let closure = Rc::new(LClosure {
-                    gc_header: GCObjectHeader::new(),
-                    proto: Rc::new(proto),
-                    upvals,
-                });
+                let closure = MyRc::<LClosure, SlotAlloc>::new_in(
+                    self.alloc_slot(),
+                    LClosure {
+                        gc_header: GCObjectHeader::new(),
+                        proto: Rc::new(proto),
+                        upvals,
+                    },
+                );
                 self.stack.push(TValue::LClosure(closure));
                 0
             }
@@ -2464,11 +2469,14 @@ impl<'a> LuaState<'a> {
                                 value: TValue::Nil(NilKind::Strict),
                             })));
                     }
-                    let closure = Rc::new(LClosure {
-                        gc_header: GCObjectHeader::new(),
-                        proto: Rc::new(proto),
-                        upvals,
-                    });
+                    let closure = MyRc::<LClosure, SlotAlloc>::new_in(
+                        self.alloc_slot(),
+                        LClosure {
+                            gc_header: GCObjectHeader::new(),
+                            proto: Rc::new(proto),
+                            upvals,
+                        },
+                    );
                     self.stack.push(TValue::LClosure(closure));
                     0
                 }
@@ -2897,7 +2905,7 @@ impl<'a> LuaState<'a> {
         }
         *self.finobj_list.borrow_mut() = keep;
 
-        let mut ud_keep: Vec<Rc<crate::objects::Udata>> = Vec::new();
+        let mut ud_keep: Vec<MyRc<crate::objects::Udata, SlotAlloc>> = Vec::new();
         for u in self.ud_finobj_list.borrow_mut().drain(..) {
             let is_reachable = u
                 .gc_header
@@ -2915,7 +2923,7 @@ impl<'a> LuaState<'a> {
                 }
             };
             if has_gc {
-                to_finalize.push(TValue::UserData(Rc::clone(&u)));
+                to_finalize.push(TValue::UserData(u.clone()));
                 let tv = TValue::UserData(u);
                 unsafe { worklist.push(raw_from_tvalue(&tv)) };
                 drop(tv); // to_finalize 已持有 clone，此处正常 decq 避免泄漏
@@ -3389,7 +3397,7 @@ impl<'a> LuaState<'a> {
                 // 这对 C 模块（如 lua-cjson）至关重要：config UserData 作为 CClosure
                 // 的 upvalue 存储，若不遍历 CClosure，config 会被误判为不可达，
                 // __gc 释放其内部 buffer 后，后续访问导致 use-after-free。
-                let ptr = Rc::as_ptr(cc) as usize;
+                let ptr = cc.as_raw_ptr() as usize;
                 if visited.insert(ptr) {
                     reachable.insert(ptr);
                     *extra_size += cc.gc_mem_size();
@@ -3411,7 +3419,7 @@ impl<'a> LuaState<'a> {
                 // 协程会被误判为不可达，导致运行中协程被 GC 回收。
                 // reachable 标记让弱表中的 RustClosure 能被正确判断可达性
                 // （coroutine.lua:478 测试 wrap 协程在无外部引用时被 GC 回收）。
-                let ptr = Rc::as_ptr(rc) as usize;
+                let ptr = rc.as_raw_ptr() as usize;
                 if visited.insert(ptr) {
                     reachable.insert(ptr);
                     *extra_size += rc.gc_mem_size();
@@ -3644,7 +3652,9 @@ pub struct GlobalState<'a> {
     /// Rc 共享：同上，对应 C global_State 的 warnf 状态
     pub warn_pending: Rc<std::cell::Cell<bool>>,
     /// 主线程对象（用于 coroutine.running() 在主线程返回 thread）
-    pub main_thread: LuaThread<'a>,
+    /// MyRc 共享：allocator 路由块（`RcPayload::HAS_ALLOC_SLOT`），构造期在 owner
+    /// Box 之前，沿用 globals/registry/MEMERRMSG 先例传 null 槽 → std 分配。
+    pub main_thread: MyRc<LuaThread<'a>, SlotAlloc>,
     /// 弱引用表列表 — setmetatable 设置 __mode 时注册，collectgarbage 时清理
     /// 使用 Weak 引用避免阻止表本身的回收
     pub weak_tables: Rc<RefCell<Vec<crate::objects::TableDataWeak<'a>>>>,
@@ -3659,7 +3669,7 @@ pub struct GlobalState<'a> {
     /// GC 时检查不可达的 UserData，调用其 finalizer（fclose）后释放
     /// 存储 Rc<Udata> 而非 Udata 深拷贝：确保 __gc 在原始 userdata 上调用，
     /// 这样 C 模块（如 lsqlite3）能通过 light userdata 指针正确清理 registry 引用
-    pub ud_finobj_list: Rc<RefCell<Vec<Rc<crate::objects::Udata<'a>>>>>,
+    pub ud_finobj_list: Rc<RefCell<Vec<MyRc<crate::objects::Udata<'a>, SlotAlloc>>>>,
     /// 状态正在关闭 — 对应 C 的 g->gcstp & GCSTPCLS
     /// true 时不再注册新的 finalizer 对象（close 中创建的对象不会被 finalize）
     pub gc_closing: bool,
@@ -3680,7 +3690,7 @@ pub struct GlobalState<'a> {
     /// DefaultAllocator；C API（lua_newstate / lua_setallocf）注入 CapiAllocator
     /// 包装宿主的 lua_Alloc（lua_getallocf 经 allocf_parts 取回，skynet 用 ud 存
     /// snlua 指针）。不归 GC 管理（外部 C 代码所有），Rust 仅持有裸指针。
-    pub mem: MemState<'a, Box<dyn Allocator>>,
+    pub mem: MemState<'a, AllocOwner>,
 
     /// 输入输出缓冲区 — 用于模拟标准输入输出
     pub io: &'a mut dyn crate::mock::io_mock::Io,
@@ -3704,7 +3714,7 @@ extern "C" {
 pub struct CallInfoEntry<'a> {
     pub is_c: bool,
     /// Lua 函数引用（C 函数为 None）
-    pub closure: Option<Rc<crate::objects::LClosure<'a>>>,
+    pub closure: Option<MyRc<crate::objects::LClosure<'a>, SlotAlloc>>,
     /// 栈帧基址（对应 C 的 ci->func + 1）
     /// Lua 函数帧: caller's base (state.exec.base before op_call updates it)
     /// C 函数帧: callee's base (func_idx + 1)
@@ -3737,7 +3747,7 @@ pub struct CallInfoEntry<'a> {
 pub fn get_closure_from_stack<'a, 'b>(
     stack: &'b [TValue<'a>],
     entry: &CallInfoEntry<'a>,
-) -> Option<&'b Rc<LClosure<'a>>> {
+) -> Option<&'b MyRc<LClosure<'a>, SlotAlloc>> {
     if entry.is_c {
         return None;
     }
@@ -3756,7 +3766,7 @@ pub fn get_closure_from_stack<'a, 'b>(
 pub fn get_closure_for_ci<'a, 'b>(
     state: &'b LuaState<'a>,
     ci_idx: usize,
-) -> Option<&'b Rc<LClosure<'a>>> {
+) -> Option<&'b MyRc<LClosure<'a>, SlotAlloc>> {
     let entry = &state.call_info[ci_idx];
     if entry.closure.is_some() {
         return entry.closure.as_ref();
@@ -3834,27 +3844,30 @@ impl<'a> GlobalState<'a> {
     /// 对应 C 的 lua_newstate → global_State 部分（模块私有：只能由
     /// `LuaState::new_main_with_allocator` 调用，其他模块无法构造 `GlobalState`）。
     fn new_shared(io: &'a mut dyn crate::mock::io_mock::Io, allocator: Box<dyn Allocator>) -> Self {
+        // 分配器宿主先建立：槽自此刻起地址稳定且非 null，供本函数内所有早期
+        // 对象（memerrmsg / globals / registry / main_thread）使用——
+        // 这消除了「构造期尚无槽 → 传 null → 退回 std::alloc」的旧兜底。
+        let alloc = crate::mem::AllocOwner::new(allocator);
+        let alloc_slot = SlotAlloc::from_owner(&alloc);
         let string_table = Rc::new(StringTable::new());
         let global_state: Rc<RefCell<GlobalShared<'a>>> = Rc::new(RefCell::new(GlobalShared {
             gcstopem: false,
             gc: GCState::default_incremental(),
-            // 构造期尚无稳定 allocator 槽（owner Box 之后才有），且 MEMERRMSG
-            // 是短字符串走 intern——槽传 null（仅长字符串路径会用到）。
             memerrmsg: crate::strings::new_lstr(
-                std::ptr::null_mut(),
+                alloc_slot,
                 &string_table,
                 crate::strings::MEMERRMSG,
             ),
         }));
         let gs = &mut global_state.borrow_mut();
         let globals = {
-            let t: Table<'a> = Table::new();
+            let t: Table<'a> = Table::new_in(alloc_slot);
             let id = gs.gc.register_object(t.mem_size());
             t.data.borrow().gc_header.set_id(id);
             t
         };
         let registry = {
-            let t: Table<'a> = Table::new();
+            let t: Table<'a> = Table::new_in(alloc_slot);
             let id = gs.gc.register_object(t.mem_size());
             t.data.borrow().gc_header.set_id(id);
             t
@@ -3889,12 +3902,15 @@ impl<'a> GlobalState<'a> {
             math_random_state: Rc::new(RefCell::new(None)),
             warn_on: Rc::new(std::cell::Cell::new(true)),
             warn_pending: Rc::new(std::cell::Cell::new(false)),
-            main_thread: LuaThread {
-                function: None,
-                is_main: true,
-                context: Rc::new(RefCell::new(ThreadContext::default())),
-                c_state: std::cell::Cell::new(std::ptr::null_mut()),
-            },
+            main_thread: MyRc::new_in(
+                alloc_slot,
+                LuaThread {
+                    function: None,
+                    is_main: true,
+                    context: Rc::new(RefCell::new(ThreadContext::default())),
+                    c_state: std::cell::Cell::new(std::ptr::null_mut()),
+                },
+            ),
             weak_tables: Rc::new(RefCell::new(Vec::new())),
             concat_gc_counter: std::cell::Cell::new(0),
             concat_gc_interval: std::cell::Cell::new(32768),
@@ -3905,7 +3921,7 @@ impl<'a> GlobalState<'a> {
             cached_mode_key: std::cell::RefCell::new(None),
             cached_gc_key: std::cell::RefCell::new(None),
             last_gc_estimate: 0,
-            mem: MemState::new_complete(allocator),
+            mem: MemState::new_complete(alloc),
             io: io,
         }
     }
@@ -3935,6 +3951,9 @@ impl<'a> LuaState<'a> {
         global_state: Rc<RefCell<GlobalShared<'a>>>,
         string_table: Rc<StringTable>,
     ) -> LuaState<'a> {
+        // 分配器宿主前置：槽稳定且非 null，供 globals/registry/main_thread 复用。
+        let alloc = crate::mem::AllocOwner::new(Box::new(DefaultAllocator));
+        let alloc_slot = SlotAlloc::from_owner(&alloc);
         let mut gs = global_state.borrow_mut();
         if base > 0 {
             while stack.len() < base {
@@ -3948,14 +3967,14 @@ impl<'a> LuaState<'a> {
         let top = stack.len();
 
         let globals = {
-            let t = Table::new();
+            let t = Table::new_in(alloc_slot);
             let id = gs.gc.register_object(t.mem_size());
             t.data.borrow().gc_header.set_id(id);
             t
         };
 
         let registry = {
-            let t = Table::new();
+            let t = Table::new_in(alloc_slot);
             let id = gs.gc.register_object(t.mem_size());
             t.data.borrow().gc_header.set_id(id);
             t
@@ -3989,12 +4008,15 @@ impl<'a> LuaState<'a> {
             math_random_state: Rc::new(RefCell::new(None)),
             warn_on: Rc::new(std::cell::Cell::new(true)),
             warn_pending: Rc::new(std::cell::Cell::new(false)),
-            main_thread: LuaThread {
-                function: None,
-                is_main: true,
-                context: Rc::new(RefCell::new(ThreadContext::default())),
-                c_state: std::cell::Cell::new(std::ptr::null_mut()),
-            },
+            main_thread: MyRc::new_in(
+                alloc_slot,
+                LuaThread {
+                    function: None,
+                    is_main: true,
+                    context: Rc::new(RefCell::new(ThreadContext::default())),
+                    c_state: std::cell::Cell::new(std::ptr::null_mut()),
+                },
+            ),
             weak_tables: Rc::new(RefCell::new(Vec::new())),
             concat_gc_counter: std::cell::Cell::new(0),
             concat_gc_interval: std::cell::Cell::new(32768),
@@ -4005,7 +4027,7 @@ impl<'a> LuaState<'a> {
             cached_mode_key: std::cell::RefCell::new(None),
             cached_gc_key: std::cell::RefCell::new(None),
             last_gc_estimate: 0,
-            mem: MemState::new_complete(Box::new(DefaultAllocator)),
+            mem: MemState::new_complete(alloc),
             io: crate::mock::io_mock::lua_io(),
         });
         let mut s = LuaState::empty_thread();
@@ -4068,7 +4090,7 @@ impl<'a> Drop for GlobalState<'a> {
 // 字符串工具
 // ============================================================================
 
-pub fn str_to_ls<'a>(alloc: crate::strings::AllocSlot, table: &StringTable, s: &str) -> TValue<'a> {
+pub fn str_to_ls<'a>(alloc: SlotAlloc, table: &StringTable, s: &str) -> TValue<'a> {
     crate::strings::new_lstr(alloc, table, s)
 }
 
@@ -4265,12 +4287,13 @@ impl<'a> GlobalState<'a> {
 
     // ====== String Helpers ======
 
-    /// LongString 分配器槽：指向 `self.mem.allocator`（`GlobalState` 由 `Box`
-    /// 持有 → 地址稳定；`lua_setallocf` 原地替换 Box 内容后自动跟随）。
+    /// 分配器槽：取自 [`AllocOwner`] 中的稳定地址（分配器宿主的内层 Box 位于
+    /// 固定堆块 → 槽自 `GlobalState` 构造期起即有效，且 `GlobalState` 移动/装箱
+    /// 都不影响；`lua_setallocf` 原地替换内层内容后自动跟随）。
     /// 用 `&self` 取槽以便与 `&self.string_table` 共存（见 [`crate::strings::AllocSlot`]）。
     #[inline]
-    pub fn alloc_slot(&self) -> crate::strings::AllocSlot {
-        &self.mem.allocator as *const Box<dyn crate::mem::Allocator>
+    pub fn alloc_slot(&self) -> SlotAlloc {
+        SlotAlloc::from_owner(&self.mem.allocator)
     }
 
     pub fn intern_str(&self, s: &str) -> TValue<'a> {
@@ -4335,7 +4358,7 @@ impl<'a> GlobalState<'a> {
 
     /// 注册有 __gc 元方法的 UserData — FILE* 等通过默认元表设置的 userdata
     /// 存储 Rc<Udata> 引用（而非深拷贝），确保 __gc 在原始 userdata 上调用
-    pub fn register_ud_finobj(&mut self, u: &Rc<crate::objects::Udata<'a>>) {
+    pub fn register_ud_finobj(&mut self, u: &MyRc<crate::objects::Udata<'a>, SlotAlloc>) {
         if self.gc_closing {
             return;
         }
@@ -4346,7 +4369,7 @@ impl<'a> GlobalState<'a> {
             .iter()
             .any(|x| x.gc_header.ptr_id == ptr_id);
         if !already {
-            self.ud_finobj_list.borrow_mut().push(Rc::clone(u));
+            self.ud_finobj_list.borrow_mut().push(u.clone());
         }
     }
 
@@ -4714,6 +4737,32 @@ fn decode_source_bytes(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// 同一线程内的多个 `LuaState` 必须各自持有**不同**的分配器。
+    ///
+    /// 禁止「每线程一个分配器」的假定：C API 下同线程可有多个 state，
+    /// 各自 `lua_newstate(allocf, ud)` / `lua_setallocf` 挂不同的分配器。
+    #[test]
+    fn states_have_independent_allocators() {
+        let mut s1 = LuaState::default();
+        let s2 = LuaState::default();
+        assert_ne!(
+            s1.alloc_slot().slot(),
+            s2.alloc_slot().slot(),
+            "同线程的两个 state 不得共用分配器槽"
+        );
+
+        // 替换 s1 的 allocf 不得影响 s2（槽地址各自独立）
+        let before1 = s1.alloc_slot().slot();
+        let before2 = s2.alloc_slot().slot();
+        s1.g_mut().mem.allocator.set(Box::new(DefaultAllocator));
+        assert_eq!(
+            before1,
+            s1.alloc_slot().slot(),
+            "set 应原地替换，槽地址不变"
+        );
+        assert_eq!(before2, s2.alloc_slot().slot(), "不得影响另一 state");
+    }
+
     #[test]
     fn test_stack_init_matches_cpp() {
         // 验证 stack_init: 参考 lstate.cpp L158-169
@@ -4732,6 +4781,7 @@ mod tests {
 
     #[test]
     fn test_stack_init_from_proto() {
+        let alloc = crate::mem::TestAlloc::new();
         let string_table = Rc::new(StringTable::new());
         // 验证 from_proto 的栈初始化: base > 0 时必须保证函数入口槽
         let proto = Proto {
@@ -4762,7 +4812,7 @@ mod tests {
             // 构造期尚无稳定 allocator 槽（owner Box 之后才有），且 MEMERRMSG
             // 是短字符串走 intern——槽传 null（仅长字符串路径会用到）。
             memerrmsg: crate::strings::new_lstr(
-                std::ptr::null_mut(),
+                alloc.slot(),
                 &string_table,
                 crate::strings::MEMERRMSG,
             ),
@@ -4804,7 +4854,6 @@ mod tests {
         assert!(matches!(state.stack[0], TValue::Nil(NilKind::Strict)));
         assert_eq!(state.stack[1], TValue::Integer(42));
     }
-
     #[test]
     fn test_stack_init_default() {
         let state = LuaState::default();

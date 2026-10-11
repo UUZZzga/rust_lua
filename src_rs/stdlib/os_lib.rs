@@ -786,7 +786,7 @@ fn call_os_date<'a>(
     // 检查是否是 "*t" 模式
     let fmt_rest = &fmt[fmt_start..];
     if fmt_rest == b"*t" {
-        let table = Table::new();
+        let table = Table::new_in(state.alloc_slot());
         set_field(&table, state, "year", tmr.tm_year, 1900);
         set_field(&table, state, "month", tmr.tm_mon, 1);
         set_field(&table, state, "day", tmr.tm_mday, 0);
@@ -990,7 +990,7 @@ fn call_os_difftime<'a>(
 
 /// 打开 OS 库并注册到全局变量 os
 pub fn open_os_lib<'a>(state: &mut LuaState<'a>) {
-    let mut lib = Table::new();
+    let mut lib = Table::new_in(state.alloc_slot());
 
     // 注册所有 OS 函数 (使用 BuiltinFn 函数指针)
     let register = |lib: &mut crate::table::Table<'a>,

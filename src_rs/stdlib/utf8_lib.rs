@@ -778,7 +778,7 @@ fn call_iter<'a>(
 /// 2. 设置 charpattern 字段
 /// 3. 返回库表 (调用者负责注册到全局或 package.loaded)
 pub fn create_utf8_lib_table<'a>(state: &LuaState<'a>) -> crate::table::Table<'a> {
-    let mut lib = Table::new();
+    let mut lib = Table::new_in(state.alloc_slot());
 
     // 注册所有 UTF-8 函数 (使用 BuiltinFn 函数指针)
     let register = |lib: &mut crate::table::Table<'a>,

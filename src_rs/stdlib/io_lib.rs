@@ -14,6 +14,7 @@
 //! - io.lines / file:lines 返回的迭代器使用 RustClosure 携带 upvalues
 //!   (file_ptr_id, to_close, finished, formats...)
 
+use crate::alloc::MyRc;
 use crate::execute::VmError;
 use crate::objects::{BuiltinFn, LuaType, NilKind, RustClosure, TValue};
 use crate::state::LuaState;
@@ -260,7 +261,7 @@ fn new_file_userdata<'a>(
     state.file_handles.borrow_mut().insert(ptr_id, file);
     // 如果元表有 __gc，注册到 ud_finobj_list
     let gc_key = state.intern_str("__gc");
-    let ud_rc = Rc::new(udata);
+    let ud_rc = MyRc::new_in(state.alloc_slot(), udata);
     if file_mt.get(&gc_key).is_some() {
         state.g_mut().register_ud_finobj(&ud_rc);
     }
@@ -450,7 +451,7 @@ fn call_io_open<'a>(
             .get(LuaType::UserData)
             .cloned()
             .unwrap_or_else(|| {
-                let t = Table::new();
+                let t = Table::new_in(state.alloc_slot());
                 t.set(
                     state.intern_str("__name"),
                     state.intern_str(crate::config::FILEHANDLE),
@@ -486,7 +487,7 @@ fn call_io_tmpfile<'a>(
             .get(LuaType::UserData)
             .cloned()
             .unwrap_or_else(|| {
-                let t = Table::new();
+                let t = Table::new_in(state.alloc_slot());
                 t.set(
                     state.intern_str("__name"),
                     state.intern_str(crate::config::FILEHANDLE),
@@ -573,7 +574,7 @@ fn call_io_popen<'a>(
             .get(LuaType::UserData)
             .cloned()
             .unwrap_or_else(|| {
-                let t = Table::new();
+                let t = Table::new_in(state.alloc_slot());
                 t.set(
                     state.intern_str("__name"),
                     state.intern_str(crate::config::FILEHANDLE),
@@ -734,7 +735,7 @@ fn call_io_output<'a>(
                         .get(LuaType::UserData)
                         .cloned()
                         .unwrap_or_else(|| {
-                            let t = Table::new();
+                            let t = Table::new_in(state.alloc_slot());
                             t.set(
                                 state.intern_str("__name"),
                                 state.intern_str(crate::config::FILEHANDLE),
@@ -819,7 +820,7 @@ fn call_io_input<'a>(
                         .get(LuaType::UserData)
                         .cloned()
                         .unwrap_or_else(|| {
-                            let t = Table::new();
+                            let t = Table::new_in(state.alloc_slot());
                             t.set(
                                 state.intern_str("__name"),
                                 state.intern_str(crate::config::FILEHANDLE),
@@ -1796,11 +1797,14 @@ fn new_lines_iterator<'a>(
     for fmt in formats {
         upvalues.push(fmt);
     }
-    TValue::RustClosure(Rc::new(RustClosure {
-        func: call_lines_iterator_fn,
-        name: c"lines iterator".as_ptr() as *const u8,
-        upvalues: Rc::new(RefCell::new(upvalues)),
-    }))
+    TValue::RustClosure(MyRc::new_in(
+        _state.alloc_slot(),
+        RustClosure {
+            func: call_lines_iterator_fn,
+            name: c"lines iterator".as_ptr() as *const u8,
+            upvalues: Rc::new(RefCell::new(upvalues)),
+        },
+    ))
 }
 
 /// io.lines([filename, [fmt1, ...]]) — 创建行迭代器
@@ -1875,7 +1879,7 @@ fn call_io_lines<'a>(
                 .get(LuaType::UserData)
                 .cloned()
                 .unwrap_or_else(|| {
-                    let t = Table::new();
+                    let t = Table::new_in(state.alloc_slot());
                     t.set(
                         state.intern_str("__name"),
                         state.intern_str(crate::config::FILEHANDLE),
@@ -2256,7 +2260,7 @@ fn call_file_tostring<'a>(
 // ============================================================================
 
 pub fn open_io_lib<'a>(state: &mut LuaState<'a>) {
-    let mut lib = Table::new();
+    let mut lib = Table::new_in(state.alloc_slot());
 
     // 注册 BuiltinFn 的辅助闭包：用函数指针 + 名字注册到表
     // (state 作为参数传入，避免闭包捕获 state 导致借用冲突)
@@ -2270,7 +2274,7 @@ pub fn open_io_lib<'a>(state: &mut LuaState<'a>) {
     };
 
     // 创建 FILE* 元表 (对应 C 的 LUA_FILEHANDLE)
-    let mut file_mt = Table::new();
+    let mut file_mt = Table::new_in(state.alloc_slot());
     let name_key = state.intern_str("__name");
     file_mt.set(name_key, state.intern_str(crate::config::FILEHANDLE));
     // FILE* 元方法 (用 BuiltinFn 注册)
@@ -2279,7 +2283,7 @@ pub fn open_io_lib<'a>(state: &mut LuaState<'a>) {
     register(&mut file_mt, state, c"__tostring", call_file_tostring);
 
     // 创建 FILE* 方法表 (用 BuiltinFn 注册)
-    let mut file_methods = Table::new();
+    let mut file_methods = Table::new_in(state.alloc_slot());
     register(&mut file_methods, state, c"close", call_file_close_method);
     register(&mut file_methods, state, c"read", call_file_read);
     register(&mut file_methods, state, c"write", call_file_write);
@@ -2305,7 +2309,7 @@ pub fn open_io_lib<'a>(state: &mut LuaState<'a>) {
         };
         let ptr_id = udata.gc_header.ptr_id;
         state.file_handles.borrow_mut().insert(ptr_id, file);
-        TValue::UserData(Rc::new(udata))
+        TValue::UserData(MyRc::new_in(state.alloc_slot(), udata))
     };
 
     let stdin_val = make_stream(state, c_stdin());

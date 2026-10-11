@@ -25,17 +25,17 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 
 use crate::alloc::SimpleRc;
+use crate::mem::SlotAlloc;
 use crate::strings::{
     lua_string_as_str, lua_string_eq, lua_string_hash, ArcRc, LongString, ShortString,
 };
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use crate::alloc::{rc_block_layout, rc_payload_offset, MyRc, RcHeader, RcPayload, WeakRc};
+use crate::alloc::{MyRc, WeakRc, RC_HEADER_SIZE};
 use crate::execute::VmError;
 use crate::gc::GCObjectHeader;
 use crate::state::LuaState;
-use crate::strings::AllocSlot;
 
 // ============================================================================
 // FxHash — 用于 Table 哈希部分的快速非加密哈希
@@ -548,7 +548,7 @@ mod builtin_names {
 ///
 /// Scenario: 创建并调用 Rust 闭包
 /// Given: 一个 BuiltinFnPtr 函数指针和若干 upvalues
-/// When: 用 `TValue::RustClosure(Rc::new(RustClosure { func, name, upvalues }))` 注册
+/// When: 用 `TValue::RustClosure(MyRc::new_in(slot, RustClosure { func, name, upvalues }))` 注册
 /// Then: Lua 代码调用时，VM 直接通过函数指针调用，从 upvalues 取状态
 #[derive(Clone)]
 pub struct RustClosure<'a> {
@@ -596,12 +596,14 @@ impl<'a> RustClosure<'a> {
     /// 估算 RustClosure 真实堆占用（用于 GC 内存计费）。
     /// RustClosure 不调用 register_object（无 gc_header），由 gc_extra_estimate 跟踪。
     pub fn gc_mem_size(&self) -> usize {
-        // Rc<RustClosure> 堆分配 = RustClosure 自身（Rc 无额外头，引用计数在 RcBox 内）
-        // RustClosure = { func: fn ptr, name: *const u8, upvalues: Rc<RefCell<Vec<TValue>>> }
+        // MyRc<RustClosure> 块 = RcHeader(16) + SlotAlloc(8) + RustClosure 自身
         // upvalues Vec 堆分配 = capacity * size_of::<TValue>()
         let upvals_cap = self.upvalues.borrow().capacity();
-        std::mem::size_of::<RustClosure>() + upvals_cap * std::mem::size_of::<TValue>() + 16
-        // Rc<RefCell<Vec>> 分配头估算
+        RC_HEADER_SIZE
+            + std::mem::size_of::<crate::mem::SlotAlloc>()
+            + std::mem::size_of::<RustClosure>()
+            + upvals_cap * std::mem::size_of::<TValue>()
+            + 16 // Rc<RefCell<Vec>> 分配头估算
     }
 }
 
@@ -638,17 +640,16 @@ pub enum TValue<'a> {
     Float(f64),
     /// 字符串（短字符串和长字符串）
     ShortStr(ArcRc<ShortString>),
-    LongStr(SimpleRc<LongString>),
+    LongStr(SimpleRc<LongString, SlotAlloc>),
     /// 表
     Table(Table<'a>),
     /// Lua 闭包
-    /// 使用 Rc 而非 Box：clone 时仅增加引用计数（O(1)），不触发 malloc/free。
-    /// Box<LClosure> 的 clone 需要 Box::new(LClosure::clone()) 即 malloc+memcpy，
-    /// 在高频栈操作（OP_MOVE/OP_CALL 等）中是性能瓶颈。
-    /// Rc 与 Box 一样支持 niche 优化（NonNull），TValue 大小保持 16 字节不变。
-    LClosure(Rc<LClosure<'a>>),
-    /// C 闭包（同理用 Rc）
-    CClosure(Rc<CClosure<'a>>),
+    /// 使用 MyRc 共享指针而非 Box：clone 时仅增加引用计数（O(1)），不触发 malloc/free。
+    /// 共享指针与 Box 一样支持 niche 优化（NonNull），TValue 大小保持 16 字节不变。
+    /// 块分配/释放路由到 MemState allocator（见各类型 `new_in`）。
+    LClosure(MyRc<LClosure<'a>, SlotAlloc>),
+    /// C 闭包（同理用 allocator 路由的 MyRc）
+    CClosure(MyRc<CClosure<'a>, SlotAlloc>),
     /// 轻量 C 函数
     LCFn(LCFunction),
     /// Rust 原生内置函数（函数指针 + 静态名）
@@ -660,11 +661,11 @@ pub enum TValue<'a> {
     ///
     /// 用于 coroutine.wrap 和 io.lines 等需要携带状态的内置函数。
     /// 详见 `RustClosure` 类型文档。
-    RustClosure(Rc<RustClosure<'a>>),
-    /// 用户数据（同理用 Rc）
-    UserData(Rc<Udata<'a>>),
-    /// 线程/协程（同理用 Rc）
-    Thread(Rc<LuaThread<'a>>),
+    RustClosure(MyRc<RustClosure<'a>, SlotAlloc>),
+    /// 用户数据（同理用 allocator 路由的 MyRc）
+    UserData(MyRc<Udata<'a>, SlotAlloc>),
+    /// 线程/协程（同理用 allocator 路由的 MyRc）
+    Thread(MyRc<LuaThread<'a>, SlotAlloc>),
 }
 
 /// nil 的子变体 —— 用 enum 替代 C 的 variant bit
@@ -934,14 +935,14 @@ impl<'a> PartialEq for TValue<'a> {
                 std::ptr::addr_eq(a.data.as_ptr(), b.data.as_ptr())
             }
             (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
-            (TValue::CClosure(a), TValue::CClosure(b)) => Rc::ptr_eq(a, b),
+            (TValue::CClosure(a), TValue::CClosure(b)) => MyRc::ptr_eq(a, b),
             (TValue::LCFn(a), TValue::LCFn(b)) => {
                 std::ptr::eq(a.func as *const (), b.func as *const ())
             }
             (TValue::BuiltinFn(a), TValue::BuiltinFn(b)) => {
                 std::ptr::eq(a.func as *const (), b.func as *const ())
             }
-            (TValue::RustClosure(a), TValue::RustClosure(b)) => Rc::ptr_eq(a, b),
+            (TValue::RustClosure(a), TValue::RustClosure(b)) => MyRc::ptr_eq(a, b),
             (TValue::UserData(a), TValue::UserData(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
             (TValue::Thread(a), TValue::Thread(b)) => Rc::ptr_eq(&a.context, &b.context),
             _ => false,
@@ -1016,7 +1017,7 @@ impl<'a> Hash for TValue<'a> {
             }
             TValue::RustClosure(rc) => {
                 13u8.hash(state);
-                (Rc::as_ptr(rc) as usize).hash(state);
+                (rc.as_raw_ptr() as usize).hash(state);
             }
             TValue::UserData(u) => {
                 10u8.hash(state);
@@ -1095,13 +1096,13 @@ impl<'a> fmt::Debug for TValue<'a> {
             // 用 Display 而非 Debug 格式化字符串, 避免 str::Debug 引入 unicode 转义表
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => write!(f, "Str({})", s.as_str()),
             TValue::Table(t) => write!(f, "Table({:p})", t),
-            TValue::LClosure(lc) => write!(f, "LClosure({:p})", Rc::as_ptr(lc)),
-            TValue::CClosure(cc) => write!(f, "CClosure({:p})", Rc::as_ptr(cc)),
+            TValue::LClosure(lc) => write!(f, "LClosure({:p})", lc.as_raw_ptr()),
+            TValue::CClosure(cc) => write!(f, "CClosure({:p})", cc.as_raw_ptr()),
             TValue::LCFn(lcf) => write!(f, "LCFn({:x})", lcf.func as usize),
             TValue::BuiltinFn(b) => write!(f, "BuiltinFn({})", b.name_str()),
             TValue::RustClosure(rc) => write!(f, "RustClosure({})", rc.name_str()),
-            TValue::UserData(ud) => write!(f, "UserData({:p})", Rc::as_ptr(ud)),
-            TValue::Thread(t) => write!(f, "Thread({:p})", Rc::as_ptr(t)),
+            TValue::UserData(ud) => write!(f, "UserData({:p})", ud.as_raw_ptr()),
+            TValue::Thread(t) => write!(f, "Thread({:p})", t.as_raw_ptr()),
         }
     }
 }
@@ -1275,132 +1276,23 @@ impl<'a> fmt::Debug for Table<'a> {
     }
 }
 
-impl<'a> Default for Table<'a> {
-    fn default() -> Self {
-        let alloc = crate::mem::SlotAlloc::default();
-        Table {
-            data: TableDataRc::new_table(
-                std::ptr::null_mut(),
-                TableData {
-                    gc_header: GCObjectHeader::new(),
-                    array: TableVec::new_in(alloc),
-                    hash_buckets: TableVec::new_in(alloc),
-                    key_to_bucket: None,
-                    metatable: None,
-                },
-            ),
-        }
-    }
-}
-
 // ============================================================================
-// TableDataCell — LongString 同款 DST payload，块经 MemState allocator 分配/释放
+// TableDataRc — Table 数据共享指针（allocator 路由块）
 // ============================================================================
 
-/// `TableData` 的 allocator 路由包装：首字段存 MemState allocator 槽
-/// （见 [`AllocSlot`]），`free_block` 覆写把整块（RcHeader + payload）的释放
-/// 路由回该 allocator（对应 C Lua 中 Table 头走 global_State 的 allocf）。
-/// 槽为 null（测试/构造期）时回退 std::alloc，分配/释放路径一致。
-///
-/// 末尾 `_tail: [u8]` 恒为空，仅使类型为 DST 以绕开 `RcPayload` 对 Sized
-/// 类型的 blanket impl（从而允许自定义 `free_block`，与 LongString 一致）。
-/// Deref 到 `RefCell<TableData>`，使 `Table.data.borrow()` 等调用点写法
-/// 与原 `Rc<RefCell<TableData>>` 完全一致。
-#[repr(C)]
-pub struct TableDataCell<'a> {
-    /// MemState allocator 槽（[`crate::strings::AllocSlot`]）
-    pub alloc: AllocSlot,
-    pub cell: RefCell<TableData<'a>>,
-    _tail: [u8],
-}
-
-unsafe impl<'a> RcPayload for TableDataCell<'a> {
-    const ALIGN: usize = {
-        let a = std::mem::align_of::<AllocSlot>();
-        let b = std::mem::align_of::<RefCell<TableData<'a>>>();
-        if a > b {
-            a
-        } else {
-            b
-        }
-    };
-
-    unsafe fn as_ref<'b>(payload: *const u8) -> &'b Self {
-        // 尾部 [u8] 长度恒为 0，用 0 元数据重建 DST 胖指针（LongString 同款）
-        let p: *const TableDataCell<'a> = std::mem::transmute((payload, 0usize));
-        &*p
-    }
-
-    unsafe fn drop_payload(payload: *mut u8) {
-        std::ptr::drop_in_place(
-            payload.add(std::mem::offset_of!(TableDataCell, cell)) as *mut RefCell<TableData<'a>>
-        );
-    }
-
-    unsafe fn payload_size(_payload: *const u8) -> usize {
-        // alloc 槽 + cell（_tail 恒空，占 0 字节）；与 new_table 的分配大小一致
-        std::mem::offset_of!(TableDataCell, cell) + std::mem::size_of::<RefCell<TableData<'a>>>()
-    }
-
-    /// 块由 MemState allocator 分配（[`TableDataRc::new_table`]），释放同样路由回去；
-    /// 槽为 null 时回退 std dealloc（与分配路径一致）。
-    unsafe fn free_block(base: *mut u8, payload: *mut u8, layout: std::alloc::Layout) {
-        let slot = *(payload as *const AllocSlot);
-        if slot.is_null() {
-            std::alloc::dealloc(base, layout);
-        } else {
-            let got = (&*slot).alloc(base, layout.size(), 0, layout.align());
-            debug_assert!(got.is_null(), "TableData 释放应返回 NULL");
-        }
-    }
-}
-
-impl<'a> std::ops::Deref for TableDataCell<'a> {
-    type Target = RefCell<TableData<'a>>;
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.cell
-    }
-}
-
-/// Table 数据的共享指针：[`MyRc`]（strong + weak 计数）包装 [`TableDataCell`]。
+/// Table 数据的共享指针：[`MyRc`]（strong + weak 计数）包装 `RefCell<TableData>`。
 /// weak 侧为 [`WeakRc`]（弱表 GC 用，见 `GlobalState::weak_tables`）。
-pub type TableDataRc<'a> = MyRc<TableDataCell<'a>>;
-pub type TableDataWeak<'a> = WeakRc<TableDataCell<'a>>;
+///
+/// 块布局 = RcHeader + 分配器(A) + payload；分配/释放由 `MyRc` 的 Drop 按块内
+/// 槽统一路由（对应 C Lua 中 Table 头走 global_State 的 allocf）。
+pub type TableDataRc<'a> = MyRc<RefCell<TableData<'a>>, SlotAlloc>;
+pub type TableDataWeak<'a> = WeakRc<RefCell<TableData<'a>>, SlotAlloc>;
 
 impl<'a> TableDataRc<'a> {
-    /// 创建 TableData 共享块。`alloc_slot` 为 MemState allocator 槽：
-    /// 非 null 时分配（以及末位释放，经 `free_block`）路由到该 allocator；
-    /// null 时回退 std::alloc。
-    pub fn new_table(alloc_slot: AllocSlot, td: TableData<'a>) -> Self {
-        unsafe {
-            let align = <TableDataCell<'a> as RcPayload>::ALIGN;
-            let payload_size =
-                std::mem::size_of::<AllocSlot>() + std::mem::size_of::<RefCell<TableData<'a>>>();
-            let header_offset = rc_payload_offset(align);
-            let layout = rc_block_layout(payload_size, align);
-
-            // 1) 一次分配 header + payload（经 MemState allocator，与 free_block 对应）
-            let base = if alloc_slot.is_null() {
-                std::alloc::alloc(layout)
-            } else {
-                (&*alloc_slot).alloc(std::ptr::null_mut(), 0, layout.size(), align)
-            };
-            if base.is_null() {
-                std::alloc::handle_alloc_error(layout);
-            }
-
-            // 2) 初始化 header 与固定字段（严格按结构体字段顺序）
-            std::ptr::write(base as *mut RcHeader, RcHeader::default());
-            let p = base.add(header_offset);
-            std::ptr::write(p as *mut AllocSlot, alloc_slot);
-            std::ptr::write(
-                p.add(std::mem::size_of::<AllocSlot>()) as *mut RefCell<TableData<'a>>,
-                RefCell::new(td),
-            );
-
-            MyRc::from_raw_base(base)
-        }
+    /// 创建 TableData 共享块。`alloc` 为 MemState 分配器 [`SlotAlloc`]：
+    /// 分配/释放均路由到该 allocator。
+    pub fn new_table(alloc: SlotAlloc, td: TableData<'a>) -> Self {
+        MyRc::new_in(alloc, RefCell::new(td))
     }
 }
 
@@ -1446,11 +1338,14 @@ impl<'a> LClosure<'a> {
     /// LClosure 通过 register_object 注册，但 size_of::<LClosure>() 不含 upvals 容量。
     /// Proto 由 gc_extra_estimate 单独跟踪（共享，避免重复计费）。
     pub fn gc_mem_size(&self) -> usize {
-        // Rc<LClosure> 堆分配 = LClosure 自身
+        // MyRc<LClosure> 路由块 = RcHeader(16) + SlotAlloc(8) + LClosure 自身
         // upvals: Rc<RefCell<UpValVec>>，Vec 堆分配 = capacity * size_of::<UpValRef>()
         let upvals_cap = self.upvals.borrow().capacity();
-        std::mem::size_of::<LClosure>() + upvals_cap * std::mem::size_of::<UpValRef>() + 16
-        // Rc<RefCell<Vec>> 分配头估算
+        RC_HEADER_SIZE
+            + std::mem::size_of::<crate::mem::SlotAlloc>()
+            + std::mem::size_of::<LClosure>()
+            + upvals_cap * std::mem::size_of::<UpValRef>()
+            + 16 // Rc<RefCell<Vec>> 分配头估算
     }
 }
 
@@ -1458,9 +1353,12 @@ impl<'a> CClosure<'a> {
     /// 估算 CClosure 真实堆占用（用于 GC 内存计费）。
     /// CClosure 不调用 register_object（无 gc_header），由 gc_extra_estimate 跟踪。
     pub fn gc_mem_size(&self) -> usize {
-        // Rc<CClosure> 堆分配 = CClosure 自身
+        // MyRc<CClosure> 路由块 = RcHeader(16) + SlotAlloc(8) + CClosure 自身
         // upvalue: Vec<TValue>，Vec 堆分配 = capacity * size_of::<TValue>()
-        std::mem::size_of::<CClosure>() + self.upvalue.capacity() * std::mem::size_of::<TValue>()
+        RC_HEADER_SIZE
+            + std::mem::size_of::<crate::mem::SlotAlloc>()
+            + std::mem::size_of::<CClosure>()
+            + self.upvalue.capacity() * std::mem::size_of::<TValue>()
     }
 }
 
@@ -1843,10 +1741,12 @@ impl<'a> Udata<'a> {
     /// 估算 Udata 真实堆占用（用于 GC 内存计费）。
     /// Udata 通过 register_object 注册，但 size_of::<Udata>() 不含 data/user_values 容量。
     pub fn gc_mem_size(&self) -> usize {
-        // Rc<Udata> 堆分配 = Udata 自身
+        // MyRc<Udata> 路由块 = RcHeader(16) + SlotAlloc(8) + Udata 自身
         // data: Vec<u64>，堆分配 = capacity * 8
         // user_values: Vec<TValue>，堆分配 = capacity * size_of::<TValue>()
-        std::mem::size_of::<Udata<'a>>()
+        RC_HEADER_SIZE
+            + std::mem::size_of::<crate::mem::SlotAlloc>()
+            + std::mem::size_of::<Udata<'a>>()
             + self.data.capacity() * 8
             + self.user_values.capacity() * std::mem::size_of::<TValue>()
     }
@@ -1909,8 +1809,9 @@ pub struct ThreadContext<'a> {
     /// resume 时把 Closed 值同步回协程栈并恢复 Open
     pub yield_upval_origins: Vec<(UpValRef<'a>, usize)>,
     /// 原始 LuaThread 的弱引用 — 用于 coroutine.running() 返回同一对象
-    /// 避免 sleep_session/wakeup_queue 等 table 查找因对象不一致而失败
-    pub thread_ref: std::rc::Weak<LuaThread<'a>>,
+    /// 避免 sleep_session/wakeup_queue 等 table 查找因对象不一致而失败。
+    /// None 表示尚未绑定（对应原 `Weak::new()`）。
+    pub thread_ref: Option<WeakRc<LuaThread<'a>, SlotAlloc>>,
 }
 
 impl<'a> Default for ThreadContext<'a> {
@@ -1924,7 +1825,7 @@ impl<'a> Default for ThreadContext<'a> {
             wrap_creator_thread_ptr: 0,
             pending_wrap_upvals: Vec::new(),
             yield_upval_origins: Vec::new(),
-            thread_ref: std::rc::Weak::new(),
+            thread_ref: None,
         }
     }
 }
@@ -1957,9 +1858,13 @@ impl<'a> LuaThread<'a> {
     /// 估算 LuaThread 真实堆占用（用于 GC 内存计费）。
     /// LuaThread 不调用 register_object（无 gc_header），由 gc_extra_estimate 跟踪。
     pub fn gc_mem_size(&self) -> usize {
-        // Rc<LuaThread> 堆分配 = LuaThread 自身
+        // MyRc<LuaThread> 路由块 = RcHeader(16) + SlotAlloc(8) + LuaThread 自身
         // context: Rc<RefCell<ThreadContext>>，含 exec.stack 等 Vec（粗略估算 64）
-        std::mem::size_of::<LuaThread>() + 64 // ThreadContext + RefCell 分配头估算
+        RC_HEADER_SIZE
+            + std::mem::size_of::<crate::mem::SlotAlloc>()
+            + std::mem::size_of::<LuaThread>()
+            + 64
+        // ThreadContext + RefCell 分配头估算
     }
 }
 
@@ -2965,8 +2870,9 @@ mod tests {
 
     #[test]
     fn test_luastring_long() {
-        let long = crate::alloc::SimpleRc::<LongString>::new_lstr(
-            std::ptr::null(),
+        let alloc = crate::mem::TestAlloc::new();
+        let long = crate::alloc::SimpleRc::<LongString, SlotAlloc>::new_lstr(
+            alloc.slot(),
             None,
             "a".repeat(100).as_bytes(),
         );
@@ -2974,7 +2880,6 @@ mod tests {
         assert_eq!(lua_string_len(&ts), 100);
         assert!(matches!(ts, TValue::LongStr(_)));
     }
-
     #[test]
     fn test_luastring_empty() {
         let short = crate::strings::ArcRc::<ShortString>::new_sstr(0, 0, "".as_bytes());
@@ -2986,6 +2891,7 @@ mod tests {
 
     #[test]
     fn test_luastring_eq() {
+        let alloc = crate::mem::TestAlloc::new();
         let arc1 = crate::strings::ArcRc::<ShortString>::new_sstr(0, 0, "foo".as_bytes());
         let arc2 = crate::strings::ArcRc::clone(&arc1);
         let ts1 = TValue::ShortStr(arc1);
@@ -2996,19 +2902,18 @@ mod tests {
         let ts3 = TValue::ShortStr(arc3);
         assert_ne!(ts1, ts3);
 
-        let long1 = TValue::LongStr(SimpleRc::<LongString>::new_lstr(
-            std::ptr::null(),
+        let long1 = TValue::LongStr(SimpleRc::<LongString, SlotAlloc>::new_lstr(
+            alloc.slot(),
             None,
             "test".as_bytes(),
         ));
-        let long2 = TValue::LongStr(SimpleRc::<LongString>::new_lstr(
-            std::ptr::null(),
+        let long2 = TValue::LongStr(SimpleRc::<LongString, SlotAlloc>::new_lstr(
+            alloc.slot(),
             None,
             "test".as_bytes(),
         ));
         assert_eq!(long1, long2);
     }
-
     #[test]
     fn test_luastring_as_str() {
         let short: TValue<'_> = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(

@@ -892,9 +892,9 @@ fn call_create<'a>(
         context: context.clone(),
         c_state: std::cell::Cell::new(std::ptr::null_mut()),
     };
-    let thread_rc = Rc::new(thread);
+    let thread_rc = crate::alloc::MyRc::new_in(state.alloc_slot(), thread);
     // 设置 thread_ref，让 coroutine.running() 能返回同一对象
-    context.borrow_mut().thread_ref = Rc::downgrade(&thread_rc);
+    context.borrow_mut().thread_ref = Some(thread_rc.downgrade());
     push_single_result(state, a, nresults, TValue::Thread(thread_rc));
     Ok(())
 }
@@ -1160,7 +1160,7 @@ fn call_running<'a>(
         Some(ctx) => {
             // 在协程中 — 返回该协程的原始 LuaThread 对象（通过 thread_ref）
             // 这样 coroutine.running() 每次返回同一对象，table 查找才能正确工作
-            let thread_rc = ctx.borrow().thread_ref.upgrade();
+            let thread_rc = ctx.borrow().thread_ref.clone().and_then(|w| w.upgrade());
             match thread_rc {
                 Some(rc) => (TValue::Thread(rc), false),
                 None => {
@@ -1171,13 +1171,16 @@ fn call_running<'a>(
                         context: ctx.clone(),
                         c_state: std::cell::Cell::new(std::ptr::null_mut()),
                     };
-                    (TValue::Thread(Rc::new(thread)), false)
+                    (
+                        TValue::Thread(crate::alloc::MyRc::new_in(state.alloc_slot(), thread)),
+                        false,
+                    )
                 }
             }
         }
         None => {
             // 主线程 — 返回 main_thread + true
-            (TValue::Thread(Rc::new(state.main_thread.clone())), true)
+            (TValue::Thread(state.main_thread.clone()), true)
         }
     };
 
@@ -1753,9 +1756,9 @@ fn call_wrap<'a>(
         context: context.clone(),
         c_state: std::cell::Cell::new(std::ptr::null_mut()),
     };
-    let thread_rc = Rc::new(thread);
+    let thread_rc = crate::alloc::MyRc::new_in(state.alloc_slot(), thread);
     // 设置 thread_ref，让 coroutine.running() 能返回同一对象
-    context.borrow_mut().thread_ref = Rc::downgrade(&thread_rc);
+    context.borrow_mut().thread_ref = Some(thread_rc.downgrade());
     // 收集开 upvalue 信息并保存到 ThreadContext（不关闭！）
     // 首次 resume 时根据同栈/跨栈决定用最新值还是 saved_value 关闭
     // 这样支持 `A = coroutine.wrap(function() ... A() ... end)` 的自引用模式
@@ -1783,7 +1786,7 @@ fn call_wrap<'a>(
         state,
         a,
         nresults,
-        TValue::RustClosure(Rc::new(wrap_closure)),
+        TValue::RustClosure(crate::alloc::MyRc::new_in(state.alloc_slot(), wrap_closure)),
     );
     Ok(())
 }
@@ -2406,7 +2409,7 @@ fn push_error(state: &mut LuaState, msg: &str) -> usize {
 // ============================================================================
 
 pub fn open_coroutine_lib<'a>(state: &mut LuaState<'a>) {
-    let mut lib = Table::new();
+    let mut lib = Table::new_in(state.alloc_slot());
 
     // 注册 BuiltinFn 的辅助闭包：用函数指针 + 名字注册到表
     // (state 作为参数传入，避免闭包捕获 state 导致借用冲突)
@@ -2454,9 +2457,12 @@ mod tests {
 
     /// 构造一个挂起协程（走 call_create 的真实路径）。
     /// 栈布局前提: [nil(入口)]，本函数推入 func 槽（a=0 → func 在槽 1）。
-    fn make_coroutine<'a>(state: &mut LuaState<'a>) -> Rc<LuaThread<'a>> {
+    fn make_coroutine<'a>(
+        state: &mut LuaState<'a>,
+    ) -> crate::alloc::MyRc<LuaThread<'a>, crate::mem::SlotAlloc> {
         open_coroutine_lib(state); // 幂等：已开则只重复注册
-        state.stack.push(TValue::Table(Table::new())); // func 槽（Table 可调用）
+        let func = Table::new_in(state.alloc_slot());
+        state.stack.push(TValue::Table(func)); // func 槽（Table 可调用）
         let save_top = state.top;
         state.top = state.stack.len();
         // a=0: func 在槽 1（stack[0] 之后），结果写槽 2

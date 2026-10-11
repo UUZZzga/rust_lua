@@ -196,9 +196,11 @@ impl<'a> Metatable<'a> {
         }
     }
 
-    pub fn empty() -> Self {
+    /// 表块由 `alloc` 分配（运行态请走 `Metatable::new`，其表来自 state）。
+    #[cfg(test)]
+    pub fn empty_in(alloc: crate::mem::SlotAlloc) -> Self {
         Metatable {
-            table: Table::new(),
+            table: Table::new_in(alloc),
             flags: MetatableFlags::empty(),
         }
     }
@@ -1435,8 +1437,14 @@ impl<'a> VarargTable<'a> {
         VarargTable::Hidden { args }
     }
 
-    pub fn from_args(table: &StringTable, args: &[TValue<'a>]) -> Self {
-        let t = Table::new();
+    /// 表块由 `alloc` 分配。
+    #[cfg(test)]
+    pub fn from_args(
+        alloc: crate::mem::SlotAlloc,
+        table: &StringTable,
+        args: &[TValue<'a>],
+    ) -> Self {
+        let t = Table::new_in(alloc);
         let count = args.len();
         for (i, v) in args.iter().enumerate() {
             t.set_int(i as i64 + 1, v.clone());
@@ -1600,8 +1608,9 @@ mod tests {
 
     #[test]
     fn test_metatable_get_tm_and_cache() {
+        let alloc = crate::mem::TestAlloc::new();
         let (_table, tmnames) = make_table_and_tmnames();
-        let mut mt = Metatable::empty();
+        let mut mt = Metatable::empty_in(alloc.slot());
         mt.table.set(
             make_tm_tvalue(&tmnames, TagMethod::Index),
             TValue::Integer(42),
@@ -1610,11 +1619,11 @@ mod tests {
         assert!(mt.get_tm(&tmnames, TagMethod::Len).is_none());
         assert!(mt.flags.contains(MetatableFlags::NO_LEN));
     }
-
     #[test]
     fn test_metatable_cache_hit() {
+        let alloc = crate::mem::TestAlloc::new();
         let (_table, tmnames) = make_table_and_tmnames();
-        let mut mt = Metatable::empty();
+        let mut mt = Metatable::empty_in(alloc.slot());
         mt.flags.insert(MetatableFlags::NO_INDEX);
         mt.table.set(
             make_tm_tvalue(&tmnames, TagMethod::Index),
@@ -1622,7 +1631,6 @@ mod tests {
         );
         assert!(mt.get_tm(&tmnames, TagMethod::Index).is_none());
     }
-
     // ========================================================================
     // type_name / obj_type_name 测试
     // ========================================================================
@@ -1637,10 +1645,13 @@ mod tests {
 
     #[test]
     fn test_obj_type_name_plain_table() {
+        let alloc = crate::mem::TestAlloc::new();
         let state = LuaState::default();
-        assert_eq!(obj_type_name(&state, &TValue::Table(Table::new())), "table");
+        assert_eq!(
+            obj_type_name(&state, &TValue::Table(Table::new_in(alloc.slot()))),
+            "table"
+        );
     }
-
     #[test]
     fn test_obj_type_name_integer() {
         let state = LuaState::default();
@@ -1653,9 +1664,10 @@ mod tests {
 
     #[test]
     fn test_default_metatables_set_and_get() {
+        let alloc = crate::mem::TestAlloc::new();
         let (_table, tmnames) = make_table_and_tmnames();
         let mut dmt = DefaultMetatables::new();
-        let mt_data = Table::new();
+        let mt_data = Table::new_in(alloc.slot());
         mt_data.set(
             make_tm_tvalue(&tmnames, TagMethod::Add),
             TValue::Integer(99),
@@ -1664,7 +1676,6 @@ mod tests {
         dmt.set(LuaType::Number, mt);
         assert!(dmt.get(LuaType::Number).is_some());
     }
-
     // ========================================================================
     // TagMethodError 测试
     // ========================================================================
@@ -1793,6 +1804,7 @@ mod tests {
 
     #[test]
     fn test_vararg_table_from_args() {
+        let alloc = crate::mem::TestAlloc::new();
         let args = vec![
             TValue::Integer(10),
             TValue::Integer(20),
@@ -1800,14 +1812,13 @@ mod tests {
         ];
         let vt = {
             let table = StringTable::new();
-            VarargTable::from_args(&table, &args)
+            VarargTable::from_args(alloc.slot(), &table, &args)
         };
         assert_eq!(vt.count(), 3);
         assert_eq!(vt.get(1), Some(TValue::Integer(10)));
         assert_eq!(vt.get(3), Some(TValue::Integer(30)));
         assert!(vt.get(4).is_none());
     }
-
     #[test]
     fn test_vararg_table_hidden() {
         let args = vec![TValue::Integer(100), TValue::Integer(200)];

@@ -12,8 +12,10 @@
 //! ## 规约驱动开发 (spec-driven-tdd)
 //! 每个公开函数都包含规约注释。
 
+use crate::alloc::MyRc;
 #[cfg(lua_use_longjmp)]
 use crate::helper::JmpBuf;
+use crate::mem::SlotAlloc;
 use crate::objects::{
     CallFrame, Instruction, LClosure, LuaType, NilKind, Proto, TValue, UpVal, UpValVec, PF_VAHID,
     PF_VATAB,
@@ -5211,7 +5213,7 @@ impl VmExecutor {
         let func_at_a = Self::read_stack(state, a);
         match func_at_a {
             TValue::LClosure(closure) => {
-                let closure = Rc::clone(closure);
+                let closure = closure.clone();
                 Self::op_call_lclosure(state, a, b, c, closure).map(|_| CallOutcome::Reload)
             }
             TValue::BuiltinFn(bf) if state.hook_mask & 3 == 0 && bf.is_pure() => {
@@ -5315,7 +5317,7 @@ impl VmExecutor {
         a: usize,
         b: usize,
         c: i32,
-        closure: Rc<LClosure<'a>>,
+        closure: MyRc<LClosure<'a>, SlotAlloc>,
     ) -> Result<(), VmError<'a>> {
         let nargs = if b == 0 {
             // perf: 用 state.top 而非 state.stack.len() — smart_clear_stack 不截断 Vec
@@ -7137,11 +7139,14 @@ impl VmExecutor {
             // GC: 在创建新闭包前检查 GC 阈值，回收不可达的旧闭包。
             // 对应 C Lua 的 luaC_checkGC（OP_CLOSURE 中调用 luaC_checkGC(L)）。
             state.maybe_collect_gc();
-            let closure = Rc::new(LClosure {
-                gc_header: crate::gc::GCObjectHeader::new(),
-                proto,
-                upvals,
-            });
+            let closure = MyRc::new_in(
+                state.alloc_slot(),
+                LClosure {
+                    gc_header: crate::gc::GCObjectHeader::new(),
+                    proto,
+                    upvals,
+                },
+            );
             // 注册到 GC metas，使 gc_estimate 增长，让 maybe_collect_gc 的阈值检查能正常工作
             // 用 gc_mem_size() 计费含 upvals 容量，比 size_of::<LClosure>() 更接近真实占用
             let closure_id = unsafe { state.gc_mut().register_object(closure.gc_mem_size()) };
@@ -7888,6 +7893,9 @@ mod tests {
         stack: Vec<TValue<'a>>,
     ) -> Result<VmResult<'a>, VmError<'a>> {
         let string_table = Rc::new(StringTable::new());
+        // 测试 harness：状态分配器在此之前尚不存在，本函数内独立持有一份
+        // （生命期覆盖随后的 state；比「每线程共享一份」更严格）。
+        let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::from_proto(
             proto,
             base,
@@ -7896,7 +7904,7 @@ mod tests {
                 gcstopem: false,
                 gc: GCState::default_incremental(),
                 memerrmsg: crate::strings::new_lstr(
-                    std::ptr::null_mut(),
+                    alloc.slot(),
                     &string_table,
                     crate::strings::MEMERRMSG,
                 ),
@@ -8660,13 +8668,17 @@ mod tests {
 
     #[test]
     fn test_execute_call_lua_closure() {
+        let alloc = crate::mem::TestAlloc::new();
         // Create an inner proto that just returns 0
         let inner_proto = make_proto(vec![make_abc(OpCode::RETURN0, 0, 0, 0)], vec![]);
-        let closure = Rc::new(LClosure {
-            gc_header: GCObjectHeader::new(),
-            proto: Rc::new(inner_proto),
-            upvals: Rc::new(RefCell::new(UpValVec::new())),
-        });
+        let closure = MyRc::new_in(
+            alloc.slot(),
+            LClosure {
+                gc_header: GCObjectHeader::new(),
+                proto: Rc::new(inner_proto),
+                upvals: Rc::new(RefCell::new(UpValVec::new())),
+            },
+        );
 
         let mut stack = default_stack(10);
         stack[0] = TValue::LClosure(closure);
@@ -8678,15 +8690,18 @@ mod tests {
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, stack).is_ok());
     }
-
     #[test]
     fn test_execute_tailcall_lua_closure() {
+        let alloc = crate::mem::TestAlloc::new();
         let inner_proto = make_proto(vec![make_abc(OpCode::RETURN0, 0, 0, 0)], vec![]);
-        let closure = Rc::new(LClosure {
-            gc_header: GCObjectHeader::new(),
-            proto: Rc::new(inner_proto),
-            upvals: Rc::new(RefCell::new(UpValVec::new())),
-        });
+        let closure = MyRc::new_in(
+            alloc.slot(),
+            LClosure {
+                gc_header: GCObjectHeader::new(),
+                proto: Rc::new(inner_proto),
+                upvals: Rc::new(RefCell::new(UpValVec::new())),
+            },
+        );
 
         let mut stack = default_stack(10);
         stack[0] = TValue::LClosure(closure);
@@ -8698,7 +8713,6 @@ mod tests {
         let proto = make_proto(code, vec![]);
         assert!(execute_test(&proto, 0, stack).is_ok());
     }
-
     // ========================================================================
     // CLOSURE 操作码测试
     // ========================================================================
