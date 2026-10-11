@@ -16,6 +16,7 @@ use crate::strings::{lua_string_as_str, lua_string_len, new_lstr_bytes, ArcRc};
 use crate::table::Table;
 use crate::tm::{make_tm_tvalue, Metatable, TagMethod, TM_N};
 use std::cell::RefCell;
+use std::mem::MaybeUninit;
 use std::rc::Rc;
 
 // 算术运算辅助函数
@@ -298,24 +299,11 @@ struct MatchState<'a> {
     p_end: usize,
     match_depth: i32,
     level: usize,
-    captures: [Capture; MAX_CAPTURES],
+    captures: [MaybeUninit<Capture>; MAX_CAPTURES],
 }
 
 impl<'a> MatchState<'a> {
     fn new(src: &'a [u8], pattern: &'a [u8]) -> Self {
-        // SAFETY: captures 数组与 C 版本 (栈上未初始化的 capture[MAX_CAPTURES])
-        // 语义一致 — 仅 [0..level) 区间被读取，而该区间的每个条目都由
-        // start_capture 在 level++ 之前写入（check_capture / capture_to_close /
-        // get_one_capture / match_capture 的读取全部限定在 i < level）。
-        // 因此跳过 32 项 (512B) 初始化是安全的，消除每调用的批量写。
-        // Miri 下必须初始化: 构造未初始化的整数 (usize/i32) 是 UB, Miri 会报
-        // "constructing invalid value ... expected an integer"。release 保留
-        // 跳过 32 项 (512B) 初始化的优化。
-        #[cfg(miri)]
-        let captures: [Capture; MAX_CAPTURES] = [Capture { init: 0, len: 0 }; MAX_CAPTURES];
-        #[cfg(not(miri))]
-        let captures: [Capture; MAX_CAPTURES] =
-            unsafe { std::mem::MaybeUninit::uninit().assume_init() };
         MatchState {
             src_init: 0,
             src_end: src.len(),
@@ -324,7 +312,7 @@ impl<'a> MatchState<'a> {
             pattern,
             match_depth: MAX_CCALLS,
             level: 0,
-            captures,
+            captures: [const { MaybeUninit::uninit() }; 32],
         }
     }
 
@@ -495,7 +483,10 @@ fn check_capture(ms: &MatchState<'_>, l: u8) -> Result<usize, String> {
     // C: l -= '1'; if (l < 0 || l >= ms->level || ...)
     // 用 i32 避免负数下溢（%0 会得到 -1）
     let l = (l as i32) - (b'1' as i32);
-    if l < 0 || l as usize >= ms.level || ms.captures[l as usize].len == CAP_UNFINISHED {
+    if l < 0
+        || l as usize >= ms.level
+        || unsafe { ms.captures[l as usize].assume_init_ref().len } == CAP_UNFINISHED
+    {
         return Err(format!("invalid capture index %{}", l + 1));
     }
     Ok(l as usize)
@@ -506,7 +497,7 @@ fn capture_to_close(ms: &MatchState<'_>) -> Result<usize, String> {
     let mut level = ms.level;
     while level > 0 {
         level -= 1;
-        if ms.captures[level].len == CAP_UNFINISHED {
+        if unsafe { ms.captures[level].assume_init_ref().len } == CAP_UNFINISHED {
             return Ok(level);
         }
     }
@@ -524,13 +515,13 @@ fn start_capture(
         return Err("too many captures".to_string());
     }
     let level = ms.level;
-    ms.captures[level] = Capture { init: s, len: what };
+    ms.captures[level].write(Capture { init: s, len: what });
     ms.level = level + 1;
     let res = match_pattern(ms, s, p)?;
     if res.is_none() {
         ms.level -= 1;
         // 撤销捕获: 固定数组无需 pop, 仅重置为 CAP_UNFINISHED 保持语义一致
-        ms.captures[level].len = CAP_UNFINISHED;
+        unsafe { ms.captures[level].assume_init_mut().len = CAP_UNFINISHED };
     }
     Ok(res)
 }
@@ -538,10 +529,14 @@ fn start_capture(
 /// 对应 C 的 end_capture
 fn end_capture(ms: &mut MatchState<'_>, s: usize, p: usize) -> Result<Option<usize>, String> {
     let l = capture_to_close(ms)?;
-    ms.captures[l].len = (s - ms.captures[l].init) as i32;
+    {
+        let capture = unsafe { ms.captures[l].assume_init_mut() };
+        capture.len = (s - capture.init) as i32;
+    }
     let res = match_pattern(ms, s, p)?;
     if res.is_none() {
-        ms.captures[l].len = CAP_UNFINISHED;
+        let capture = unsafe { ms.captures[l].assume_init_mut() };
+        capture.len = CAP_UNFINISHED;
     }
     Ok(res)
 }
@@ -550,10 +545,9 @@ fn end_capture(ms: &mut MatchState<'_>, s: usize, p: usize) -> Result<Option<usi
 fn match_capture(ms: &MatchState<'_>, s: usize, l: u8) -> Result<Option<usize>, String> {
     // C: l = check_capture(ms, l);  会抛出错误
     let l = check_capture(ms, l)?;
-    let len = ms.captures[l].len as usize;
-    if s + len <= ms.src_end
-        && ms.src[ms.captures[l].init..ms.captures[l].init + len] == ms.src[s..s + len]
-    {
+    let capture = unsafe { ms.captures[l].assume_init_ref() };
+    let len = capture.len as usize;
+    if s + len <= ms.src_end && ms.src[capture.init..capture.init + len] == ms.src[s..s + len] {
         Ok(Some(s + len))
     } else {
         Ok(None)
@@ -838,14 +832,15 @@ fn get_one_capture<'a>(
         }
         return Ok(CaptureResult::Str(s, e - s));
     }
-    let capl = ms.captures[i].len;
+    let capture = unsafe { ms.captures[i].assume_init_ref() };
+    let capl = capture.len;
     if capl == CAP_UNFINISHED {
         return Err("unfinished capture".to_string());
     }
     if capl == CAP_POSITION {
-        return Ok(CaptureResult::Pos(ms.captures[i].init + 1));
+        return Ok(CaptureResult::Pos(capture.init + 1));
     }
-    Ok(CaptureResult::Str(ms.captures[i].init, capl as usize))
+    Ok(CaptureResult::Str(capture.init, capl as usize))
 }
 
 #[derive(Debug)]

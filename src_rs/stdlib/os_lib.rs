@@ -284,7 +284,7 @@ fn call_tmpname<'a>(
         }
         let cstr = unsafe { CStr::from_ptr(ptr) };
         let s = cstr.to_str().unwrap_or("").to_string();
-        push_single_result(state, a, nresults, (state.intern_str(&s)));
+        push_single_result(state, a, nresults, state.intern_str(&s));
         Ok(())
     }
     #[cfg(target_os = "windows")]

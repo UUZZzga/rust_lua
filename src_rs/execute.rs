@@ -40,6 +40,7 @@ use std::sync::OnceLock;
 // perf: 缓存 LUA_VM_TRACE 环境变量值,避免每次 execute_loop 入口都调用 getenv。
 // perf 数据显示 getenv 占 1.28%,主要来自 all.lua 中大量 pcall/dofile 导致
 // execute_loop 被频繁调用。OnceLock 保证只读取一次环境变量。
+#[cfg(debug_assertions)]
 static LUA_VM_TRACE_LEVEL: OnceLock<u8> = OnceLock::new();
 
 /// GETTABUP/GETFIELD 单次探测特化的命中值 — 借用块内提取 owned,
@@ -1935,22 +1936,15 @@ impl VmExecutor {
     /// 对应原 execute_loop 中 trace_level >= 1 的内联逻辑
     #[cold]
     #[inline(never)]
+    #[cfg(debug_assertions)]
     fn trace_exec<'a>(state: &LuaState, trace_level: u8) {
-        // 体积优先: 移除调试输出, 避免 format!/eprintln! 引入 fmt 代码
-        #[cfg(not(size_optimized))]
-        {
-            let use_color = std::env::var("TERM")
-                .ok()
-                .map(|t| t != "dumb")
-                .unwrap_or(false);
-            eprint!("{}", Self::dump_code_with_pc(state, state.pc, use_color));
-            if trace_level >= 2 {
-                eprint!("{}", Self::dump_stack(state));
-            }
-        }
-        #[cfg(size_optimized)]
-        {
-            let _ = (state, trace_level);
+        let use_color = std::env::var("TERM")
+            .ok()
+            .map(|t| t != "dumb")
+            .unwrap_or(false);
+        eprint!("{}", Self::dump_code_with_pc(state, state.pc, use_color));
+        if trace_level >= 2 {
+            eprint!("{}", Self::dump_stack(state));
         }
     }
 
