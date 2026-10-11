@@ -35,6 +35,7 @@ use crate::vm::{
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(debug_assertions)]
 use std::sync::OnceLock;
 
 // perf: 缓存 LUA_VM_TRACE 环境变量值,避免每次 execute_loop 入口都调用 getenv。

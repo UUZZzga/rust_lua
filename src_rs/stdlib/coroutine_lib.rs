@@ -2398,6 +2398,7 @@ pub fn c_api_reset_thread<'a>(state: &mut LuaState<'a>) -> i32 {
 }
 
 /// 把错误消息 push 到 state.stack，返回 nresults (1)
+#[cfg(not(feature = "cmp_c"))]
 fn push_error(state: &mut LuaState, msg: &str) -> usize {
     state.stack = vec![TValue::Nil(NilKind::Strict), (state.intern_str(msg))];
     state.top = 2;

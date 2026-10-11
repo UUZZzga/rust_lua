@@ -3696,9 +3696,9 @@ pub struct GlobalState<'a> {
     pub io: &'a mut dyn crate::mock::io_mock::Io,
 }
 
-/// C 辅助函数: setjmp/longjmp 包装 (capi_variadic.c)
-/// 用于 lua_use_longjmp 模式下替代 catch_unwind (对应 C 的 LUA_USE_LONGJMP)。
-/// 启用条件: size_optimized (panic=abort) 或显式 --features lua_longjmp。
+// C 辅助函数: setjmp/longjmp 包装 (capi_variadic.c)
+// 用于 lua_use_longjmp 模式下替代 catch_unwind (对应 C 的 LUA_USE_LONGJMP)。
+// 启用条件: size_optimized (panic=abort) 或显式 --features lua_longjmp。
 #[cfg(lua_use_longjmp)]
 extern "C" {
     pub(crate) fn lua_rs_pcall_c(
