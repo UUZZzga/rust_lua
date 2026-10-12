@@ -1710,7 +1710,22 @@ impl<'a> LuaState<'a> {
 
     /// 收集本执行态可达的根值（栈/上值/帧闭包/hook/wrap 调用者栈）。
     pub(crate) fn collect_roots_into(&self, worklist: &mut Vec<RawTValue<'a>>) {
-        let stack_top = self.top.min(self.stack.len());
+        // 根扫描范围（务必按 C 帧活跃与否区分）：
+        // - 外部 C 帧活跃时（CClosure/LCFn，见 LuaState::c_frame_depth）：C 代码只经 C API
+        //   压栈 —— `lua_pushxxx` 只增长 `stack.len()`，不推进 `state.top`，因此 [top, len)
+        //   是 C 代码刚压入的**活值**（如 lua_cjson_new 在 C 函数内建到一半的模块表）。
+        //   若只扫到 top，C 调用期间触发的 GC（lua_createtable / lua_pushcclosure 内的
+        //   maybe_collect_gc）会把这些值当垃圾清扫（sweep 对死表 clear_for_drop），
+        //   随后 lua_getfield 读到 nil —— CI 上 lua-cjson `cjson.safe` 上值变 nil、
+        //   skynet e2e 失败即此。
+        // - 其余场合用 VM 的 top：VM 会刻意把可回收的旧值留在 top 之上
+        //   （execute.rs::smart_clear_stack，仅保证 trivial 值），扫上去会让本应回收的
+        //   对象继续存活（tests_lua/gc.lua 弱表断言即依赖此精度）。
+        let stack_top = if self.c_frame_depth > 0 {
+            self.stack.len()
+        } else {
+            self.top.min(self.stack.len())
+        };
         for val in &self.stack[..stack_top] {
             if needs_gc_mark(val) {
                 unsafe { worklist.push(raw_from_tvalue(val)) };

@@ -240,6 +240,14 @@ pub struct LuaState<'a> {
     pub force_noyield_close: bool,
     /// C 函数调用嵌套计数（对应 C 的 L->nCcalls），用于检测 C 栈溢出
     pub n_ccalls: u32,
+    /// 外部 C 帧（CClosure/LCFn，即 dlopen 加载的 C 模块或宿主 C 函数）的嵌套深度。
+    ///
+    /// C 代码只经 C API 压栈 —— `lua_pushxxx` 只增长 `stack.len()`，**不推进 `state.top`**
+    /// （C 函数内 `top` 停在参数末尾）。因此只要该深度 > 0，GC 根扫描就必须覆盖到
+    /// `stack.len()`，否则 C 调用期间触发的 GC 会把 C 代码刚压入的活值（如 lua_cjson_new
+    /// 建到一半的模块表）当作垃圾清扫 —— CI 上 lua-cjson `cjson.safe` 上值变 nil、
+    /// skynet e2e 失败即此。
+    pub c_frame_depth: u32,
     /// 非可 yield 调用计数（对应 C 的 nCcalls 高 16 位 / incnny）
     pub n_ny_calls: u32,
     /// yield 调用的 nresults（恢复时用于调整 resume 参数数量）
@@ -368,6 +376,7 @@ impl<'a> LuaState<'a> {
             close_error_status: None,
             force_noyield_close: false,
             n_ccalls: 0,
+            c_frame_depth: 0,
             n_ny_calls: 0,
             saved_yield_nresults: 0,
             api_func_base: 0,
@@ -1607,6 +1616,8 @@ impl<'a> LuaState<'a> {
         let saved_api_base = self.api_func_base;
         self.api_func_base = func_idx;
         self.n_ccalls = self.n_ccalls.saturating_add(1);
+        // 外部 C 帧开始：C 代码只经 C API 压栈（不推进 top），GC 根须覆盖到 stack.len()
+        self.c_frame_depth = self.c_frame_depth.saturating_add(1);
 
         // 保存 call_info 长度，用于调用后清理（同 pcall_rust_fn 的处理）。
         // C 函数内部可能推入额外 call_info 条目（如元方法条目），
@@ -1692,6 +1703,7 @@ impl<'a> LuaState<'a> {
         // 恢复 api_func_base 和 n_ccalls（无论成功失败）
         self.api_func_base = saved_api_base;
         self.n_ccalls = self.n_ccalls.saturating_sub(1);
+        self.c_frame_depth = self.c_frame_depth.saturating_sub(1);
 
         // 清理 call_info: 截断到调用前的长度（同 pcall_rust_fn 的处理）。
         // yield 路径: 不截断（保留 call_info 供 resume 使用）。

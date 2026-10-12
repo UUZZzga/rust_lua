@@ -5595,6 +5595,52 @@ mod tests {
                 .into_owned();
             assert_eq!(got, "42", "[{}] safe_call pattern broken", label);
         }
+
         // 注意: st 是栈上 LuaState, 不可 lua_close（那会析构非堆分配的 state）
+    }
+
+    /// C 代码在 C 函数内压入的值必须在 GC 中存活。
+    ///
+    /// 回归（CI 上 lua-cjson `cjson.safe` 全挂、skynet e2e 失败）：
+    /// C API 压栈只增长 `stack.len()`，不推进 `state.top`（C 函数内 top 停在参数末尾），
+    /// 而 GC 根只扫描 `stack[..top]` —— 于是 C 调用期间触发的 GC 会把 C 代码刚建好的
+    /// 模块表/上值当作垃圾清扫（sweep 会 clear 表内容），后续 lua_getfield 得到 nil。
+    #[test]
+    fn test_c_pushed_values_survive_gc_during_c_call() {
+        unsafe extern "C" fn build_with_gc(l: *mut c_void) -> c_int {
+            let L = l as *mut lua_State;
+            // 模拟 lua_cjson_new: 建模块表并塞入字段（此时仅 C 栈持有它）
+            lua_createtable(L, 0, 2);
+            lua_pushinteger(L, 42);
+            lua_setfield(L, -2, c"encode".as_ptr());
+            // 在 C 函数内触发一次 full GC
+            lua_getglobal(L, c"collectgarbage".as_ptr());
+            lua_pushstring(L, c"collect".as_ptr());
+            lua_callk(L, 1, 0, 0, None);
+            // GC 后字段必须仍在
+            lua_getfield(L, -1, c"encode".as_ptr());
+            1
+        }
+
+        let mut st = LuaState::default();
+        st.open_selected_libs(0, 0);
+        let L = &mut st as *mut LuaState<'static> as *mut lua_State;
+        unsafe {
+            lua_pushcfunction(L, build_with_gc);
+            lua_setglobal(L, c"build_with_gc".as_ptr());
+        }
+        let state = unsafe { &mut *L };
+        let status = state.load_buffer("collectgarbage(); return build_with_gc()", "=probe");
+        assert_eq!(status, 0, "compile failed");
+        let status = state.pcall(0, 1, 0);
+        assert_eq!(status, 0, "run failed");
+        let mut isnum: c_int = 0;
+        let got = unsafe { lua_tointegerx(L, -1, &mut isnum) };
+        eprintln!("[c-pushed-gc] got={} isnum={}", got, isnum);
+        assert_eq!(
+            (got, isnum),
+            (42, 1),
+            "C 压入的表在 C 调用期间的 GC 中被清扫了"
+        );
     }
 }

@@ -5733,6 +5733,8 @@ impl VmExecutor {
         let saved_api_base = state.api_func_base;
         state.api_func_base = a;
         state.n_ccalls = state.n_ccalls.saturating_add(1);
+        // 外部 C 帧开始：C 代码只经 C API 压栈（不推进 top），GC 根须覆盖到 stack.len()
+        state.c_frame_depth = state.c_frame_depth.saturating_add(1);
 
         // 推入 CallInfoEntry — 对应 C 的 luaD_precall 创建新 CallInfo
         // 外部 C 函数（通过 dlopen 加载的 .so）也需要 call_info 条目，
@@ -5819,6 +5821,7 @@ impl VmExecutor {
                 // lua_error 被调用：恢复状态并返回错误
                 state.api_func_base = saved_api_base;
                 state.n_ccalls = state.n_ccalls.saturating_sub(1);
+                state.c_frame_depth = state.c_frame_depth.saturating_sub(1);
                 state.call_info.pop();
                 let err_msg = match state.pending_error.take() {
                     Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
@@ -5843,6 +5846,7 @@ impl VmExecutor {
             // 不处理结果（不移动、不截断栈）— 栈保留 yield 时的状态
             state.api_func_base = saved_api_base;
             state.n_ccalls = state.n_ccalls.saturating_sub(1);
+            state.c_frame_depth = state.c_frame_depth.saturating_sub(1);
             state.call_info.pop();
             return Err(VmError::Yield(values));
         }
@@ -5855,6 +5859,7 @@ impl VmExecutor {
         // 恢复 api_func_base 和 n_ccalls
         state.api_func_base = saved_api_base;
         state.n_ccalls = state.n_ccalls.saturating_sub(1);
+        state.c_frame_depth = state.c_frame_depth.saturating_sub(1);
         state.call_info.pop();
 
         // 移动结果到 a 位置（对应 C 的 moveresults）
