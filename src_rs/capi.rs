@@ -388,7 +388,7 @@ pub extern "C" fn lua_newthread(L: *mut lua_State) -> *mut lua_State {
 
     // 设置新执行态的 current_thread（让 lua_resume 能找到 ThreadContext）
     unsafe {
-        (*co_ptr).current_thread = Some(context);
+        (*co_ptr).current_thread = Some(Rc::downgrade(&context));
     }
 
     // push TValue::Thread 到 L 的栈上（对应 C 中 lua_newthread 留下 thread 对象的语义）
@@ -1797,7 +1797,7 @@ pub extern "C" fn lua_pcallk(
 #[no_mangle]
 pub extern "C" fn lua_pushthread(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
-    let (thread_val, is_main) = match &L.current_thread {
+    let (thread_val, is_main) = match L.current_thread_ctx() {
         Some(ctx) => {
             let thread_rc = ctx.borrow().thread_ref.clone().and_then(|w| w.upgrade());
             match thread_rc {
@@ -4213,7 +4213,7 @@ pub extern "C" fn lua_yieldk(
 #[no_mangle]
 pub extern "C" fn lua_status(L: *mut lua_State) -> c_int {
     let L = unsafe { &*L };
-    if let Some(ref ctx) = L.current_thread {
+    if let Some(ctx) = L.current_thread_ctx() {
         let status = ctx.borrow().status;
         match status {
             crate::objects::ThreadStatus::OK => LUA_OK,
@@ -4255,7 +4255,7 @@ pub extern "C" fn lua_tothread(L: *mut lua_State, idx: c_int) -> *mut lua_State 
     {
         let mut c = thread_rc.context.borrow_mut();
         c.exec.bind_g(l_g);
-        c.exec.current_thread = Some(thread_rc.context.clone());
+        c.exec.current_thread = Some(Rc::downgrade(&thread_rc.context));
         // 如果 LuaThread 有 function（首次 resume 前），push 到栈底
         // 这样 lua_resume 的 c_api_resume 能从栈底取函数执行
         if let Some(ref func) = thread_rc.function {

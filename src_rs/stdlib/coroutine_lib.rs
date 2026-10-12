@@ -886,6 +886,8 @@ fn call_create<'a>(
     let thread_rc = crate::alloc::MyRc::new_in(state.alloc_slot(), thread);
     // 设置 thread_ref，让 coroutine.running() 能返回同一对象
     context.borrow_mut().thread_ref = Some(thread_rc.downgrade());
+    // 登记到 GC 线程表：不可达协程的执行态由 clear_dead_threads 回收
+    unsafe { state.gc_mut().register_thread(&thread_rc) };
     push_single_result(state, a, nresults, TValue::Thread(thread_rc));
     Ok(())
 }
@@ -914,10 +916,8 @@ fn call_status<'a>(
             } else {
                 // 检查是否为当前正在运行的协程
                 let is_current = state
-                    .current_thread
-                    .as_ref()
-                    .map(|ctx| Rc::ptr_eq(ctx, &t.context))
-                    .unwrap_or(false);
+                    .current_thread_ctx()
+                    .map_or(false, |ctx| Rc::ptr_eq(&ctx, &t.context));
                 if is_current {
                     "running"
                 } else {
@@ -997,10 +997,8 @@ fn call_close<'a>(
             // 返回 (true, nil)（对应 C 的 lua_closethread(co, co) close itself）；
             // 否则报错
             let is_current = state
-                .current_thread
-                .as_ref()
-                .map(|ct| Rc::ptr_eq(ct, &thread.context))
-                .unwrap_or(false);
+                .current_thread_ctx()
+                .map_or(false, |ct| Rc::ptr_eq(&ct, &thread.context));
             if is_current {
                 push_resume_results(state, a, nresults, true, Vec::new());
                 return Ok(());
@@ -1055,7 +1053,7 @@ fn close_suspended_coroutine<'a>(
     unsafe { (*co_ptr).bind_g(state.l_g) };
 
     // 设置 current_thread 和状态
-    unsafe { (*co_ptr).current_thread = Some(co_context.clone()) };
+    unsafe { (*co_ptr).current_thread = Some(Rc::downgrade(&co_context)) };
     co_context.borrow_mut().status = ThreadStatus::Normal;
 
     // 清空协程侧的 last_error_msg（用于检测 __close 是否出错）
@@ -1147,7 +1145,7 @@ fn call_running<'a>(
     _nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError<'a>> {
-    let (thread_val, ismain) = match &state.current_thread {
+    let (thread_val, ismain) = match state.current_thread_ctx() {
         Some(ctx) => {
             // 在协程中 — 返回该协程的原始 LuaThread 对象（通过 thread_ref）
             // 这样 coroutine.running() 每次返回同一对象，table 查找才能正确工作
@@ -1289,7 +1287,7 @@ fn call_resume<'a>(
             return push_resume_error(state, a, nresults, "C stack overflow");
         }
         // 设置 current_thread（协程内 coroutine.running()/status 依赖）
-        co.current_thread = Some(co_context.clone());
+        co.current_thread = Some(Rc::downgrade(&co_context));
     }
     co_context.borrow_mut().status = ThreadStatus::Normal;
 
@@ -1750,6 +1748,8 @@ fn call_wrap<'a>(
     let thread_rc = crate::alloc::MyRc::new_in(state.alloc_slot(), thread);
     // 设置 thread_ref，让 coroutine.running() 能返回同一对象
     context.borrow_mut().thread_ref = Some(thread_rc.downgrade());
+    // 登记到 GC 线程表：不可达协程的执行态由 clear_dead_threads 回收
+    unsafe { state.gc_mut().register_thread(&thread_rc) };
     // 收集开 upvalue 信息并保存到 ThreadContext（不关闭！）
     // 首次 resume 时根据同栈/跨栈决定用最新值还是 saved_value 关闭
     // 这样支持 `A = coroutine.wrap(function() ... A() ... end)` 的自引用模式
@@ -1758,7 +1758,7 @@ fn call_wrap<'a>(
     let creator_ptr = state
         .current_thread
         .as_ref()
-        .map(|c| Rc::as_ptr(c) as usize)
+        .map(|c| c.as_ptr() as usize)
         .unwrap_or(0);
     {
         let mut ctx = thread_rc.context.borrow_mut();
@@ -1853,7 +1853,7 @@ fn call_wrap_fn<'a>(
         let caller_ptr = state
             .current_thread
             .as_ref()
-            .map(|c| Rc::as_ptr(c) as usize)
+            .map(|c| c.as_ptr() as usize)
             .unwrap_or(0);
         same_stack = creator_ptr == caller_ptr;
         let mut open_upvals = Vec::new();
@@ -1925,7 +1925,7 @@ fn call_wrap_fn<'a>(
             return Err(VmError::RuntimeError("C stack overflow".to_string()));
         }
         // 设置 current_thread（协程内 coroutine.running()/status 依赖）
-        co.current_thread = Some(co_context.clone());
+        co.current_thread = Some(Rc::downgrade(&co_context));
     }
     co_context.borrow_mut().status = ThreadStatus::Normal;
 
@@ -2124,7 +2124,7 @@ pub fn c_api_resume<'a>(
     state: &mut LuaState<'a>,
     nargs: usize,
 ) -> Result<(i32, usize), VmError<'a>> {
-    let co_context = match state.current_thread.clone() {
+    let co_context = match state.current_thread_ctx() {
         Some(ctx) => ctx,
         None => {
             return Err(VmError::RuntimeError(
@@ -2221,7 +2221,7 @@ pub fn c_api_resume<'a>(
     }
 
     // 设置 current_thread 和状态为 Normal
-    state.current_thread = Some(co_context.clone());
+    state.current_thread = Some(Rc::downgrade(&co_context));
     co_context.borrow_mut().status = ThreadStatus::Normal;
 
     // 执行（运行中的线程 = state 自身）
@@ -2348,7 +2348,7 @@ pub fn c_api_resume<'a>(
 /// 返回 LUA_OK，或 __close 出错时的 LUA_ERRRUN。
 #[cfg(not(feature = "cmp_c"))]
 pub fn c_api_reset_thread<'a>(state: &mut LuaState<'a>) -> i32 {
-    let co_context = state.current_thread.clone();
+    let co_context = state.current_thread_ctx();
     let mut status = crate::capi::LUA_OK;
     if let Some(ctx) = co_context {
         let (started, co_status) = {
@@ -2357,7 +2357,7 @@ pub fn c_api_reset_thread<'a>(state: &mut LuaState<'a>) -> i32 {
         };
         // 挂起中的协程：在本线程执行态上运行 __close（关闭 TBC 变量）
         if started && co_status == ThreadStatus::Suspended {
-            state.current_thread = Some(ctx.clone());
+            state.current_thread = Some(Rc::downgrade(&ctx));
             ctx.borrow_mut().status = ThreadStatus::Normal;
             state.last_error_msg.clear();
             let close_base = state.base;
@@ -2369,7 +2369,7 @@ pub fn c_api_reset_thread<'a>(state: &mut LuaState<'a>) -> i32 {
         // 重置为干净的死状态（保留 l_g）
         ctx.borrow_mut().status = ThreadStatus::OK;
         ctx.borrow_mut().error_msg = None;
-        state.current_thread = Some(ctx);
+        state.current_thread = Some(Rc::downgrade(&ctx));
     }
     // 对外可见的线程栈重置为初始状态（resetCI + top = stack + 1）
     state.stack = vec![TValue::Nil(NilKind::Strict)];

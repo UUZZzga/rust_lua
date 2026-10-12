@@ -10,7 +10,7 @@
 //! 对应 C 源码: lbaselib.cpp
 
 use lua_rs::cli::Interpreter;
-use lua_rs::mem::{AllocOwner, DefaultAllocator, SlotAlloc};
+use lua_rs::mem::{AllocOwner, Allocator, DefaultAllocator, SlotAlloc};
 use lua_rs::objects::{NilKind, TValue};
 use lua_rs::state::LuaState;
 use lua_rs::stdlib::base_lib;
@@ -417,6 +417,96 @@ fn test_pcall_error_frame_values_released() {
         stdout.trim(),
         "true\ttrue",
         "pcall 失败帧的局部对象应被释放并可回收"
+    );
+}
+
+// ============================================================================
+// 不可达协程的内存回收 (回归)
+// ============================================================================
+
+/// 计数分配器：统计状态存活期间未释放的字节数。
+/// 包装 [`DefaultAllocator`]，按 C realloc 语义累计 `new_size - old_size`。
+struct CountingAlloc {
+    inner: DefaultAllocator,
+    live: std::rc::Rc<std::cell::Cell<isize>>,
+}
+
+impl Allocator for CountingAlloc {
+    fn alloc(&self, ptr: *mut u8, old_size: usize, new_size: usize, align: usize) -> *mut u8 {
+        let out = self.inner.alloc(ptr, old_size, new_size, align);
+        let after_free = self.live.get() - old_size as isize;
+        self.live.set(if out.is_null() {
+            after_free
+        } else {
+            after_free + new_size as isize
+        });
+        out
+    }
+}
+
+/// 运行 `src`（新状态 + 计数分配器），状态析构后返回仍未释放的字节数。
+fn leaked_bytes(src: &str) -> isize {
+    let live = std::rc::Rc::new(std::cell::Cell::new(0isize));
+    let mut buff = lua_rs::mock::io_mock::BufferIo::new("");
+    {
+        let mut state = LuaState::new_main_with_allocator(
+            &mut buff,
+            Box::new(CountingAlloc {
+                inner: DefaultAllocator,
+                live: live.clone(),
+            }),
+        );
+        state.open_selected_libs(0, 0);
+        assert_eq!(
+            state.load_buffer(src, "=leak"),
+            0,
+            "chunk 应编译成功: {src}"
+        );
+        assert_eq!(state.pcall(0, 0, 0), 0, "chunk 应执行成功: {src}");
+    } // state 析构：Drop for LuaState → close_state + GlobalState::drop 断环
+    live.get()
+}
+
+/// 回归：不可达协程的整个执行态必须被释放。
+///
+/// 修复前有两处 Rc 自引用环，使任何 resume 过的协程永久泄漏其执行态
+/// （协程自己的 `Box<LuaState>` 与协程栈上的对象）：
+///   1) `ThreadContext.exec`（持有协程 lua_State）与 `LuaState.current_thread`
+///      互持**强**引用 —— 协程结束或挂起后该环依然自持；
+///   2) 线程对象不进 GC 对象表（只用 `aux_marked` 判活，没有可清扫的入口），
+///      `resume(co, co)` 这类协程栈自引用环无法被 sweep 打断。
+/// 该泄漏对 Lua 层不可见（`collectgarbage("count")` 不含执行态内部的 Vec），
+/// 故直接用计数分配器度量「状态析构后仍持有的字节」，以最小脚本为基线。
+/// 修复前本用例泄漏 wrap≈33KB / suspend≈23KB / selfref≈49KB（ASan 口径每协程约 1KB）。
+#[test]
+fn test_unreachable_coroutines_are_reclaimed() {
+    let base = leaked_bytes("local t = {} t = nil");
+    let wrap = leaked_bytes(
+        "for i = 1, 300 do\n\
+           local c = coroutine.wrap(function(x) coroutine.yield(x) end)\n\
+           c(1)\n\
+           c(2)\n\
+         end",
+    );
+    let suspend = leaked_bytes(
+        "for i = 1, 200 do\n\
+           local c = coroutine.create(function(x) coroutine.yield(x) end)\n\
+           coroutine.resume(c, 1)\n\
+         end",
+    );
+    let selfref = leaked_bytes(
+        "for i = 1, 200 do\n\
+           local c = coroutine.create(function(self)\n\
+             local x = {}\n\
+             coroutine.yield()\n\
+           end)\n\
+           coroutine.resume(c, c)\n\
+         end",
+    );
+    assert!(
+        wrap - base < 8192 && suspend - base < 8192 && selfref - base < 8192,
+        "不可达协程执行态应被释放（修复前 wrap≈33KB / suspend≈23KB / selfref≈49KB）: \
+         base={base} wrap={wrap} suspend={suspend} selfref={selfref}"
     );
 }
 

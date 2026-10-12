@@ -17,7 +17,7 @@ use crate::tm::{init_tmnames, TM_N};
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::ptr::NonNull;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 // ============================================================================
 // GC 相关代码已全部迁移至 gc.rs
@@ -228,8 +228,19 @@ pub struct LuaState<'a> {
     pub current_hook_count: i32,
     /// 是否允许调用 hook — 对应 C 的 L->allowhook
     pub allowhook: bool,
-    /// 当前活动协程的上下文 — None 表示主线程执行中
-    pub current_thread: Option<Rc<RefCell<ThreadContext<'a>>>>,
+    /// 当前活动协程的上下文 — None 表示主线程执行中。
+    ///
+    /// **必须是 `Weak`（非 `Rc`）**：本执行态（协程的 `lua_State`）由
+    /// `ThreadContext.exec` 内联持有，若此处反向持强引用即构成自引用环
+    /// `ThreadContext --(exec)--> LuaState --(current_thread)--> ThreadContext`，
+    /// 引用计数永不归零 —— 任何 resume 过的协程（无论从此结束还是挂起、
+    /// 之后是否仍可达）都会永久泄漏整个执行态及其栈/upvalue 引用的对象图。
+    ///
+    /// 读取一律走 [`LuaState::current_thread_ctx`]（`upgrade`）。执行期间
+    /// ThreadContext 必被强引用（`LuaThread.context` 持有，而线程对象由调用方栈 /
+    /// wrap RustClosure upvalue / C 侧句柄强持有），故 upgrade 必定成功；
+    /// 空闲期 upgrade 失败只发生在该执行态已随 ThreadContext 一起析构的场合。
+    pub current_thread: Option<Weak<RefCell<ThreadContext<'a>>>>,
     /// 调用栈 — 保存 caller 的 VM 执行上下文（原 execute_loop 局部变量，提升为字段以支持协程挂起）
     pub call_info: Vec<CallInfoEntry<'a>>,
     /// pcall 保护栈 — 对应 C Lua 的 CIST_YPCALL CallInfo 链
@@ -511,6 +522,14 @@ impl<'a> LuaState<'a> {
     #[inline]
     pub fn bind_g(&mut self, g: *mut GlobalState<'a>) {
         self.l_g = g;
+    }
+
+    /// 当前活动协程的上下文（`current_thread` 的 upgrade 形式）。
+    ///
+    /// 执行期间必定返回 `Some`（见字段文档）；空闲期若协程已随线程对象析构则返回 `None`。
+    #[inline]
+    pub fn current_thread_ctx(&self) -> Option<Rc<RefCell<ThreadContext<'a>>>> {
+        self.current_thread.as_ref().and_then(|w| w.upgrade())
     }
 
     /// 对应 C 的 `G(L)->gc`：取 GC 状态裸指针（不产生借用，便于与栈借用共存）。
@@ -2357,6 +2376,13 @@ impl<'a> LuaState<'a> {
         if self.gc_closing {
             return;
         }
+        // 关闭同样是「执行入口」：下面要跑 `__close` / finalizer（可能回到 Lua 代码），
+        // 收尾的完整回收还要读 `G(L)->main`，按规约 R1 必须先重绑 `l_g` / `G.main`。
+        // 经 `Drop for LuaState` 进来的调用方已经绑过，但 `cli::main` 的显式
+        // `close_state()` 之前没有 —— 那时 `G.main` 仍指向 `new_main*` 里已返回的
+        // 局部栈帧（`LuaState` 被移动后旧地址失效），收尾 GC 会栈越界
+        // （ASan: stack-use-after-return，`lua -v` 无脚本路径必崩）。
+        self.bind_exec();
         self.g_mut().gc_closing = true;
         let _ = crate::func::close(self, 1, 0, 0);
         let mut to_finalize: Vec<TValue> = Vec::new();
@@ -2367,6 +2393,12 @@ impl<'a> LuaState<'a> {
             to_finalize.push(TValue::UserData(u));
         }
         self.call_finalizers(to_finalize);
+        // 关闭前做一次完整回收：`func::close` 关上值、finalizer 运行都可能**新造出**
+        // 不可达的 Rc 自引用环（闭包↔上值、协程↔执行态、表自引用），这些环只能靠
+        // GC 打断（sweep 清空死对象的引用），之后就交给 Rc 归零释放。
+        // 不做这一步，这类环会一直留到进程退出（LSan 报泄漏）。
+        // 对应 C 的 lua_close → luaC_freeallobjects 的「关闭即释放全部」语义。
+        self.collect_gc();
         if let Some(code) = self.exit_requested {
             std::process::exit(code);
         }

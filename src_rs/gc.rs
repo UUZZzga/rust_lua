@@ -25,7 +25,7 @@
 //! `clear_weak_tables` / `mark_tvalue` 等）。`state.rs` 只保留数据结构、栈操作、
 //! 调用/错误保护、C API 桥接。
 
-use crate::alloc::MyRc;
+use crate::alloc::{MyRc, WeakRc};
 use crate::mem::SlotAlloc;
 use crate::objects::{
     FxBuildHasher, LuaThread, NilKind, TValue, ThreadContext, UpVal, UpValVec, WeakValue,
@@ -599,6 +599,17 @@ pub struct GCState<'a> {
     pub step_accum: Cell<usize>,
     /// GC 是否正在运行（collect_gc 进行中）— 用于阻止 finalizer 中重入
     pub gc_running: Cell<bool>,
+    /// 所有 Lua 协程对象的弱引用 —— 对应 C 的 `g->allgc` 里 thread 链路。
+    ///
+    /// 线程没有 `gc_header`（无 GCObjectId），可达性由 `aux_marked` 记录，
+    /// 键是 `Rc::as_ptr(&thread.context)`（见 `mark_tvalue` 的 Thread 分支）。
+    /// 因为线程进不了 register_object/sweep 通道，必须在每次回收末尾用
+    /// [`GCState::clear_dead_threads`] 单独清理：不可达线程的 `context` 换回
+    /// 默认值 —— 这会 drop 协程的执行态（`Box<LuaState>` 及其栈/upvalue），
+    /// 从而打断「Thread -> context.exec -> stack/upvalue -> Thread」自引用环。
+    /// 否则该环由 Rc 计数自持，永不回收（C Lua 的 trace GC 能直接回收线程）。
+    /// 主线程与一次性临时线程不登记。
+    threads: RefCell<Vec<WeakRc<LuaThread<'a>, SlotAlloc>>>,
 }
 
 impl<'a> GCState<'a> {
@@ -633,6 +644,7 @@ impl<'a> GCState<'a> {
             next_collect_threshold: Cell::new(200000),
             step_accum: Cell::new(0),
             gc_running: Cell::new(false),
+            threads: RefCell::new(Vec::new()),
         }
     }
 
@@ -864,6 +876,36 @@ impl<'a> GCState<'a> {
     #[inline]
     pub(crate) fn aux_is_marked(&self, ptr: usize) -> bool {
         self.aux_marked.borrow().contains(&ptr)
+    }
+
+    /// 登记新建的 Lua 协程对象（Lua 层 `coroutine.create` / `coroutine.wrap`）。
+    ///
+    /// 见 [`GCState::threads`] 字段说明：线程靠 `aux_marked` 判活，
+    /// 必须登记才能被 [`GCState::clear_dead_threads`] 清理。
+    pub fn register_thread(&self, thread: &MyRc<LuaThread<'a>, SlotAlloc>) {
+        self.threads.borrow_mut().push(thread.downgrade());
+    }
+
+    /// 清理不可达协程的执行态 —— 打断「Thread -> context.exec -> ... -> Thread」自引用环。
+    ///
+    /// 必须在标记阶段结束后的同一周期内调用：`aux_marked` 中不含该线程的
+    /// `context` 指针即为不可达（判定口径与 `mark_tvalue` 的 Thread 分支一致）。
+    /// 不可达线程把 `context` 换回默认值，drop 掉其执行态与栈上对象；
+    /// 环内的强引用随后归零，线程对象由 Rc 释放。
+    pub(crate) fn clear_dead_threads(&self) {
+        let mut list = self.threads.borrow_mut();
+        list.retain(|weak| {
+            let thread = match weak.upgrade() {
+                Some(t) => t,
+                None => return false, // 线程已释放：移除登记
+            };
+            if self.aux_is_marked(Rc::as_ptr(&thread.context) as usize) {
+                true
+            } else {
+                thread.context.replace(ThreadContext::default());
+                false
+            }
+        });
     }
 
     // ------------------------------------------------------------------------
@@ -1613,6 +1655,9 @@ impl<'a> LuaState<'a> {
 
         // 执行 finalizer
         self.call_finalizers(to_finalize);
+
+        // 清理不可达协程的执行态（自引用环；须在标记之后、同一周期内）
+        unsafe { self.gc_mut().clear_dead_threads() };
 
         // 清扫（无参，读颜色）
         unsafe { self.gc_mut().sweep_unreachable() };
