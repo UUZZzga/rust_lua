@@ -18,7 +18,7 @@ use std::cmp::Ordering;
 use crate::alloc::MyRc;
 use crate::gc::GCState;
 use crate::mem::SlotAlloc;
-use crate::objects::{NilKind, TValue, UpVal, UpValRef, UpValVec};
+use crate::objects::{NilKind, TValue, UpVal, UpValRef, UpValVec, WeakValue};
 use crate::strings::{lua_string_as_c_str_ptr, lua_string_as_str, lua_string_eq, lua_string_len};
 use crate::table::Table;
 use crate::tm::{obj_type_name_, TagMethodError};
@@ -1202,7 +1202,7 @@ pub fn push_closure<'a>(
     _enc_upvals: &[UpValRef<'a>],
     _base: usize,
     ra: usize,
-    gc: &GCState,
+    gc: &GCState<'a>,
     alloc: SlotAlloc,
 ) {
     let nup = proto.size_upvalues as usize;
@@ -1245,7 +1245,10 @@ pub fn push_closure<'a>(
         },
     );
     // 用 gc_mem_size() 计费含 upvals 容量，比 size_of::<LClosure>() 更接近真实占用
-    let closure_id = gc.register_object(closure.gc_mem_size());
+    let closure_id = gc.register_object(
+        closure.gc_mem_size(),
+        WeakValue::LClosure(closure.downgrade()),
+    );
     closure.gc_header.set_id(closure_id);
 
     // GC barrier (luaC_objbarrier): for each upvalue, if closure is black
@@ -1306,7 +1309,7 @@ mod tests {
     use crate::strings::StringTable;
     use std::rc::Rc;
 
-    fn make_gc() -> Rc<crate::gc::GCState<'static>> {
+    fn make_gc<'a>() -> Rc<crate::gc::GCState<'a>> {
         Rc::new(crate::gc::GCState::default_incremental())
     }
 

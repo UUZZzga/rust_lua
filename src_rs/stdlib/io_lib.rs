@@ -16,7 +16,7 @@
 
 use crate::alloc::MyRc;
 use crate::execute::VmError;
-use crate::objects::{BuiltinFn, LuaType, NilKind, RustClosure, TValue};
+use crate::objects::{BuiltinFn, NilKind, RustClosure, TValue, WeakValue};
 use crate::state::LuaState;
 use crate::strings::lua_string_as_str;
 use crate::table::Table;
@@ -204,7 +204,7 @@ fn check_file_arg<'a>(
     match &arg {
         TValue::UserData(u) => {
             // 检查元表 __name == "FILE*"
-            let is_file = u.metatable.as_ref().map_or(false, |mt| {
+            let is_file = u.metatable.borrow().as_ref().map_or(false, |mt| {
                 let name_key = state.intern_str("__name");
                 mt.get(&name_key) == Some(state.intern_str(crate::config::FILEHANDLE))
             });
@@ -228,7 +228,10 @@ fn check_file_arg<'a>(
 
 /// 从 UserData ptr_id 获取 FILE* — 不检查是否已关闭
 fn get_file_ptr(state: &LuaState, ptr_id: u32) -> Option<*mut libc::FILE> {
-    state.file_handles.borrow().get(&ptr_id).copied()
+    match state.file_handles.borrow().get(&ptr_id) {
+        Some(TValue::UserData(u)) => Some(u.data[0] as *mut libc::FILE),
+        _ => None,
+    }
 }
 
 /// 判断文件是否已关闭 (file_handles 中无对应 ptr_id)
@@ -249,23 +252,31 @@ fn new_file_userdata<'a>(
         gc_header: crate::gc::GCObjectHeader::new(),
         nuvalue: 0,
         len: 0,
-        metatable: Some(Box::new(file_mt.clone())),
+        metatable: Some(Box::new(file_mt.clone())).into(),
         user_values: vec![],
-        data: vec![],
+        data: vec![file as u64],
     };
-    // 注册到 GC 并设置 id（使 mark_tvalue 能正确标记 reachable）
-    // 用 gc_mem_size() 计费含 data/user_values 容量，比 size_of::<Udata>() 更接近真实占用
-    let ud_id = unsafe { state.gc_mut().register_object(udata.gc_mem_size()) };
-    udata.gc_header.set_id(ud_id);
-    let ptr_id = udata.gc_header.ptr_id;
-    state.file_handles.borrow_mut().insert(ptr_id, file);
     // 如果元表有 __gc，注册到 ud_finobj_list
     let gc_key = state.intern_str("__gc");
     let ud_rc = MyRc::new_in(state.alloc_slot(), udata);
     if file_mt.get(&gc_key).is_some() {
         state.g_mut().register_ud_finobj(&ud_rc);
     }
-    TValue::UserData(ud_rc)
+    // 注册到 GC 并设置 id（使 mark_tvalue 能正确标记 reachable）
+    // 用 gc_mem_size() 计费含 data/user_values 容量，比 size_of::<Udata>() 更接近真实占用
+    let ud_id = unsafe {
+        state
+            .gc_mut()
+            .register_object(ud_rc.gc_mem_size(), WeakValue::UserData(ud_rc.downgrade()))
+    };
+    ud_rc.gc_header.set_id(ud_id);
+    let ptr_id = ud_rc.gc_header.ptr_id;
+    let value = TValue::UserData(ud_rc);
+    state
+        .file_handles
+        .borrow_mut()
+        .insert(ptr_id, value.clone());
+    value
 }
 
 /// 检查文件模式是否合法 — 对应 C 的 l_checkmode
@@ -445,20 +456,17 @@ fn call_io_open<'a>(
     if f.is_null() {
         file_result(state, &mut results, false, Some(filename.as_str()));
     } else {
-        // 获取 FILE* 元表 (从 dmt[UserData])
         let file_mt = state
-            .dmt
-            .get(LuaType::UserData)
-            .cloned()
-            .unwrap_or_else(|| {
-                let t = Table::new_in(state.alloc_slot());
-                t.set(
-                    state.intern_str("__name"),
-                    state.intern_str(crate::config::FILEHANDLE),
-                );
-                t
-            });
-        results.push(new_file_userdata(state, f, &file_mt));
+            .registry
+            .get(&state.intern_str(crate::config::FILEHANDLE));
+        if let Some(TValue::Table(file_mt)) = file_mt {
+            results.push(new_file_userdata(state, f, &file_mt));
+        } else {
+            return Err(VmError::RuntimeError(format!(
+                "{}: not a FILE* userdata",
+                filename
+            )));
+        }
     }
     state.adjust_results(a, nresults, results);
     Ok(())
@@ -483,18 +491,15 @@ fn call_io_tmpfile<'a>(
         file_result(state, &mut results, false, None);
     } else {
         let file_mt = state
-            .dmt
-            .get(LuaType::UserData)
-            .cloned()
-            .unwrap_or_else(|| {
-                let t = Table::new_in(state.alloc_slot());
-                t.set(
-                    state.intern_str("__name"),
-                    state.intern_str(crate::config::FILEHANDLE),
-                );
-                t
-            });
-        results.push(new_file_userdata(state, f, &file_mt));
+            .registry
+            .get(&state.intern_str(crate::config::FILEHANDLE));
+        if let Some(TValue::Table(file_mt)) = file_mt {
+            results.push(new_file_userdata(state, f, &file_mt));
+        } else {
+            return Err(VmError::RuntimeError(format!(
+                "tmpfile: not a FILE* userdata",
+            )));
+        }
     }
     state.adjust_results(a, nresults, results);
     Ok(())
@@ -570,23 +575,20 @@ fn call_io_popen<'a>(
         file_result(state, &mut results, false, Some(prog.as_str()));
     } else {
         let file_mt = state
-            .dmt
-            .get(LuaType::UserData)
-            .cloned()
-            .unwrap_or_else(|| {
-                let t = Table::new_in(state.alloc_slot());
-                t.set(
-                    state.intern_str("__name"),
-                    state.intern_str(crate::config::FILEHANDLE),
-                );
-                t
-            });
-        let ud = new_file_userdata(state, f, &file_mt);
-        // 标记为 popen 文件，关闭时用 pclose
-        if let TValue::UserData(ref u) = ud {
-            state.popen_handles.borrow_mut().insert(u.gc_header.ptr_id);
+            .registry
+            .get(&state.intern_str(crate::config::FILEHANDLE));
+        if let Some(TValue::Table(file_mt)) = file_mt {
+            let ud = new_file_userdata(state, f, &file_mt);
+            // 标记为 popen 文件，关闭时用 pclose
+            if let TValue::UserData(ref u) = ud {
+                state.popen_handles.borrow_mut().insert(u.gc_header.ptr_id);
+            }
+            results.push(ud);
+        } else {
+            return Err(VmError::RuntimeError(format!(
+                "popen: not a FILE* userdata",
+            )));
         }
-        results.push(ud);
     }
     state.adjust_results(a, nresults, results);
     Ok(())
@@ -697,7 +699,7 @@ fn call_io_output<'a>(
             match &arg {
                 TValue::UserData(u) => {
                     // 校验是 FILE* userdata
-                    let is_file = u.metatable.as_ref().map_or(false, |mt| {
+                    let is_file = u.metatable.borrow().as_ref().map_or(false, |mt| {
                         let name_key = state.intern_str("__name");
                         mt.get(&name_key) == Some(state.intern_str(crate::config::FILEHANDLE))
                     });
@@ -731,26 +733,24 @@ fn call_io_output<'a>(
                         return Err(VmError::RuntimeError(format!("{}: {}", filename, msg)));
                     }
                     let file_mt = state
-                        .dmt
-                        .get(LuaType::UserData)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            let t = Table::new_in(state.alloc_slot());
-                            t.set(
-                                state.intern_str("__name"),
-                                state.intern_str(crate::config::FILEHANDLE),
-                            );
-                            t
-                        });
-                    let udata = new_file_userdata(state, f, &file_mt);
-                    if let TValue::UserData(ref u) = udata {
-                        state.io_output_handle.set(Some(u.gc_header.ptr_id));
-                    }
-                    *state.io_output.borrow_mut() = None;
-                    // 保存到 io 表的 _current_output 字段
-                    let io_key = state.intern_str("io");
-                    if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
-                        io_table.set(state.intern_str("_current_output"), udata.clone());
+                        .registry
+                        .get(&state.intern_str(crate::config::FILEHANDLE));
+                    if let Some(TValue::Table(file_mt)) = file_mt {
+                        let udata = new_file_userdata(state, f, &file_mt);
+                        if let TValue::UserData(ref u) = udata {
+                            state.io_output_handle.set(Some(u.gc_header.ptr_id));
+                        }
+                        *state.io_output.borrow_mut() = None;
+                        // 保存到 io 表的 _current_output 字段
+                        let io_key = state.intern_str("io");
+                        if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
+                            io_table.set(state.intern_str("_current_output"), udata.clone());
+                        }
+                    } else {
+                        return Err(VmError::RuntimeError(format!(
+                            "{}: not a FILE* userdata",
+                            filename
+                        )));
                     }
                 }
                 _ => {
@@ -784,7 +784,7 @@ fn call_io_input<'a>(
         if !arg.is_nil() {
             match &arg {
                 TValue::UserData(u) => {
-                    let is_file = u.metatable.as_ref().map_or(false, |mt| {
+                    let is_file = u.metatable.borrow().as_ref().map_or(false, |mt| {
                         let name_key = state.intern_str("__name");
                         mt.get(&name_key) == Some(state.intern_str(crate::config::FILEHANDLE))
                     });
@@ -794,11 +794,6 @@ fn call_io_input<'a>(
                         )));
                     }
                     state.io_input_handle.set(Some(u.gc_header.ptr_id));
-                    // 保存到 io 表的 _current_input 字段
-                    let io_key = state.intern_str("io");
-                    if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
-                        io_table.set(state.intern_str("_current_input"), arg.clone());
-                    }
                 }
                 s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                     let filename = lua_string_as_str(s).to_string();
@@ -816,25 +811,18 @@ fn call_io_input<'a>(
                         return Err(VmError::RuntimeError(format!("{}: {}", filename, msg)));
                     }
                     let file_mt = state
-                        .dmt
-                        .get(LuaType::UserData)
-                        .cloned()
-                        .unwrap_or_else(|| {
-                            let t = Table::new_in(state.alloc_slot());
-                            t.set(
-                                state.intern_str("__name"),
-                                state.intern_str(crate::config::FILEHANDLE),
-                            );
-                            t
-                        });
-                    let udata = new_file_userdata(state, f, &file_mt);
-                    if let TValue::UserData(ref u) = udata {
-                        state.io_input_handle.set(Some(u.gc_header.ptr_id));
-                    }
-                    // 保存到 io 表的 _current_input 字段
-                    let io_key = state.intern_str("io");
-                    if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
-                        io_table.set(state.intern_str("_current_input"), udata.clone());
+                        .registry
+                        .get(&state.intern_str(crate::config::FILEHANDLE));
+                    if let Some(TValue::Table(file_mt)) = file_mt {
+                        let udata = new_file_userdata(state, f, &file_mt);
+                        if let TValue::UserData(ref u) = udata {
+                            state.io_input_handle.set(Some(u.gc_header.ptr_id));
+                        }
+                    } else {
+                        return Err(VmError::RuntimeError(format!(
+                            "{}: not a FILE* userdata",
+                            filename
+                        )));
                     }
                 }
                 _ => {
@@ -890,8 +878,9 @@ fn call_io_close<'a>(
                 state.adjust_results(a, nresults, __results);
                 return Ok(());
             }
-            let f_opt = state.file_handles.borrow().get(&pid).copied();
-            if let Some(f) = f_opt {
+            let f_value_opt = state.file_handles.borrow().get(&pid).cloned();
+            if let Some(TValue::UserData(u)) = f_value_opt {
+                let f = u.data[0] as *mut libc::FILE;
                 let is_popen = state.popen_handles.borrow_mut().remove(&pid);
                 unsafe {
                     *compat::errno_ptr() = 0;
@@ -971,23 +960,31 @@ fn close_file_handle<'a>(
     }
 
     // 关闭文件
-    let f = state.file_handles.borrow_mut().remove(&ptr_id).unwrap();
-    let is_popen = state.popen_handles.borrow_mut().remove(&ptr_id);
-    unsafe {
-        *compat::errno_ptr() = 0;
+    let f_value = state.file_handles.borrow_mut().remove(&ptr_id).unwrap();
+    match f_value {
+        TValue::UserData(u) => {
+            let f = u.data[0] as *mut libc::FILE;
+            let is_popen = state.popen_handles.borrow_mut().remove(&ptr_id);
+            unsafe {
+                *compat::errno_ptr() = 0;
+            }
+            let mut results = Vec::new();
+            if is_popen {
+                // popen 文件: 用 pclose 关闭, 返回 exec_result (true/nil, "exit"/"signal", code)
+                // 对应 C 的 io_pclose -> luaL_execresult(L, l_pclose(L, p->f))
+                let stat = unsafe { libc::pclose(f) };
+                exec_result(state, &mut results, stat);
+            } else {
+                let res = unsafe { libc::fclose(f) };
+                file_result(state, &mut results, res == 0, None);
+            }
+            state.adjust_results(a, nresults, results);
+            Ok(())
+        }
+        _ => Err(VmError::RuntimeError(
+            "attempt to use a closed file".to_string(),
+        )),
     }
-    let mut results = Vec::new();
-    if is_popen {
-        // popen 文件: 用 pclose 关闭, 返回 exec_result (true/nil, "exit"/"signal", code)
-        // 对应 C 的 io_pclose -> luaL_execresult(L, l_pclose(L, p->f))
-        let stat = unsafe { libc::pclose(f) };
-        exec_result(state, &mut results, stat);
-    } else {
-        let res = unsafe { libc::fclose(f) };
-        file_result(state, &mut results, res == 0, None);
-    }
-    state.adjust_results(a, nresults, results);
-    Ok(())
 }
 
 // ============================================================================
@@ -1008,7 +1005,7 @@ fn call_io_type<'a>(
     let arg = get_arg(state, a, 0);
     let result = match &arg {
         TValue::UserData(u) => {
-            let is_file = u.metatable.as_ref().map_or(false, |mt| {
+            let is_file = u.metatable.borrow().as_ref().map_or(false, |mt| {
                 let name_key = state.intern_str("__name");
                 mt.get(&name_key) == Some(state.intern_str(crate::config::FILEHANDLE))
             });
@@ -1875,18 +1872,17 @@ fn call_io_lines<'a>(
                 return Err(VmError::RuntimeError(format!("{}: {}", filename, msg)));
             }
             let file_mt = state
-                .dmt
-                .get(LuaType::UserData)
-                .cloned()
-                .unwrap_or_else(|| {
-                    let t = Table::new_in(state.alloc_slot());
-                    t.set(
-                        state.intern_str("__name"),
-                        state.intern_str(crate::config::FILEHANDLE),
-                    );
-                    t
-                });
-            let udata = new_file_userdata(state, f, &file_mt);
+                .registry
+                .get(&state.intern_str(crate::config::FILEHANDLE));
+            let udata = if let Some(TValue::Table(file_mt)) = file_mt {
+                new_file_userdata(state, f, &file_mt)
+            } else {
+                return Err(VmError::RuntimeError(format!(
+                    "{}: not a FILE* userdata",
+                    filename
+                )));
+            };
+
             let ptr_id = if let TValue::UserData(ref u) = udata {
                 u.gc_header.ptr_id
             } else {
@@ -1995,7 +1991,7 @@ fn call_lines_iterator_fn<'a>(
     }
 
     // 检查文件是否已关闭
-    let f_opt = state.file_handles.borrow().get(&file_ptr_id).copied();
+    let f_opt = get_file_ptr(state, file_ptr_id);
     let f = match f_opt {
         Some(f) => f,
         None => {
@@ -2026,9 +2022,11 @@ fn call_lines_iterator_fn<'a>(
             };
             // 关闭文件（如果需要）
             if to_close {
-                if let Some(f) = state.file_handles.borrow_mut().remove(&file_ptr_id) {
+                if let Some(TValue::UserData(u)) =
+                    state.file_handles.borrow_mut().remove(&file_ptr_id)
+                {
                     unsafe {
-                        libc::fclose(f);
+                        libc::fclose(u.data[0] as *mut libc::FILE);
                     }
                 }
             }
@@ -2037,9 +2035,10 @@ fn call_lines_iterator_fn<'a>(
         }
         // EOF: 关闭文件
         if to_close {
-            if let Some(f) = state.file_handles.borrow_mut().remove(&file_ptr_id) {
+            if let Some(TValue::UserData(u)) = state.file_handles.borrow_mut().remove(&file_ptr_id)
+            {
                 unsafe {
-                    libc::fclose(f);
+                    libc::fclose(u.data[0] as *mut libc::FILE);
                 }
             }
         }
@@ -2072,7 +2071,7 @@ fn mark_lines_finished<'a>(state: &mut LuaState<'a>, a: usize) {
 fn get_default_output<'a>(state: &mut LuaState<'a>) -> Result<*mut libc::FILE, VmError<'a>> {
     // 优先检查 io_output_handle
     if let Some(pid) = state.io_output_handle.get() {
-        if let Some(f) = state.file_handles.borrow().get(&pid).copied() {
+        if let Some(f) = get_file_ptr(state, pid) {
             return Ok(f);
         }
         return Err(VmError::RuntimeError(
@@ -2096,7 +2095,7 @@ fn get_default_output<'a>(state: &mut LuaState<'a>) -> Result<*mut libc::FILE, V
 /// 获取默认输入流的 FILE* — 对应 C 的 getiofile(L, IO_INPUT)
 fn get_default_input<'a>(state: &mut LuaState<'a>) -> Result<*mut libc::FILE, VmError<'a>> {
     if let Some(pid) = state.io_input_handle.get() {
-        if let Some(f) = state.file_handles.borrow().get(&pid).copied() {
+        if let Some(f) = get_file_ptr(state, pid) {
             return Ok(f);
         }
         return Err(VmError::RuntimeError(" input file is closed".to_string()));
@@ -2141,27 +2140,16 @@ fn get_current_output_userdata<'a>(state: &mut LuaState<'a>) -> TValue<'a> {
 
 /// 获取当前输入流的 UserData (用于 io.input() 返回值)
 fn get_current_input_userdata<'a>(state: &mut LuaState<'a>) -> TValue<'a> {
+    if let Some(pid) = state.io_input_handle.get() {
+        return state
+            .file_handles
+            .borrow()
+            .get(&pid)
+            .cloned()
+            .unwrap_or(TValue::Nil(NilKind::Strict));
+    }
     let io_key = state.intern_str("io");
     if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
-        if let Some(pid) = state.io_input_handle.get() {
-            // 先检查 _current_input 字段
-            let cur_key = state.intern_str("_current_input");
-            if let Some(TValue::UserData(u)) = io_table.get(&cur_key) {
-                if u.gc_header.ptr_id == pid {
-                    return TValue::UserData(u);
-                }
-            }
-            // 再检查 stdin
-            let stdin_key = state.intern_str("stdin");
-            if let Some(stdin_val) = io_table.get(&stdin_key) {
-                if let TValue::UserData(u) = &stdin_val {
-                    if u.gc_header.ptr_id == pid {
-                        return stdin_val;
-                    }
-                }
-            }
-            return TValue::Nil(NilKind::Strict);
-        }
         // 默认返回 io.stdin
         let stdin_key = state.intern_str("stdin");
         if let Some(stdin_val) = io_table.get(&stdin_key) {
@@ -2194,7 +2182,7 @@ fn call_file_gc<'a>(
     nresults: i32,
 ) -> Result<(), VmError<'a>> {
     let ptr_id = check_file_arg(state, a, nargs, "__gc")?;
-    let f_opt = state.file_handles.borrow().get(&ptr_id).copied();
+    let f_opt = get_file_ptr(state, ptr_id);
     if let Some(f) = f_opt {
         // 检查是否是标准文件
         let io_key = state.intern_str("io");
@@ -2276,7 +2264,8 @@ pub fn open_io_lib<'a>(state: &mut LuaState<'a>) {
     // 创建 FILE* 元表 (对应 C 的 LUA_FILEHANDLE)
     let mut file_mt = Table::new_in(state.alloc_slot());
     let name_key = state.intern_str("__name");
-    file_mt.set(name_key, state.intern_str(crate::config::FILEHANDLE));
+    let key = state.intern_str(crate::config::FILEHANDLE);
+    file_mt.set(name_key, key.clone());
     // FILE* 元方法 (用 BuiltinFn 注册)
     register(&mut file_mt, state, c"__gc", call_file_gc);
     register(&mut file_mt, state, c"__close", call_file_close);
@@ -2291,25 +2280,33 @@ pub fn open_io_lib<'a>(state: &mut LuaState<'a>) {
     register(&mut file_methods, state, c"lines", call_file_lines);
     register(&mut file_methods, state, c"flush", call_file_flush);
     register(&mut file_methods, state, c"setvbuf", call_file_setvbuf);
+    unsafe { state.gc_mut().register_table(&file_methods) };
     file_mt.set(state.intern_str("__index"), TValue::Table(file_methods));
 
-    // 注册为 UserData 的默认元表
-    let mt = crate::tm::Metatable::new(file_mt.clone());
-    state.g_mut().dmt.set(LuaType::UserData, mt);
+    unsafe { state.gc_mut().register_table(&file_mt) };
+    state.registry.set(key, TValue::Table(file_mt.clone()));
 
     // 注册标准流作为 FullUserData
-    let make_stream = |state: &mut LuaState, file: *mut libc::FILE| -> TValue {
+    let make_stream = |state: &mut LuaState<'a>, file: *mut libc::FILE| -> TValue {
         let udata = crate::objects::Udata {
             gc_header: crate::gc::GCObjectHeader::new(),
             nuvalue: 0,
             len: 0,
-            metatable: Some(Box::new(file_mt.clone())),
+            metatable: Some(Box::new(file_mt.clone())).into(),
             user_values: vec![],
-            data: vec![],
+            data: vec![file as u64],
         };
-        let ptr_id = udata.gc_header.ptr_id;
-        state.file_handles.borrow_mut().insert(ptr_id, file);
-        TValue::UserData(MyRc::new_in(state.alloc_slot(), udata))
+        let ud = MyRc::new_in(state.alloc_slot(), udata);
+        let ud_id = unsafe {
+            state
+                .gc_mut()
+                .register_object(ud.gc_mem_size(), WeakValue::UserData(ud.downgrade()))
+        };
+        ud.gc_header.set_id(ud_id);
+        let ptr_id = ud.gc_header.ptr_id;
+        let val = TValue::UserData(ud);
+        state.file_handles.borrow_mut().insert(ptr_id, val.clone());
+        val
     };
 
     let stdin_val = make_stream(state, c_stdin());
@@ -2338,6 +2335,7 @@ pub fn open_io_lib<'a>(state: &mut LuaState<'a>) {
     register(&mut lib, state, c"tmpfile", call_io_tmpfile);
     register(&mut lib, state, c"popen", call_io_popen);
 
+    unsafe { state.gc_mut().register_table(&lib) };
     let key = state.intern_str("io");
     state.globals.set(key, TValue::Table(lib));
 }

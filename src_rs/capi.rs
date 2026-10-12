@@ -33,7 +33,7 @@ use const_format::formatcp;
 use crate::mem::{Allocator, CapiAllocator};
 use crate::objects::{
     CClosure, LCFunction, LClosure, LuaThread, LuaType, NilKind, Proto, TValue, Table,
-    ThreadContext, ThreadStatus, Udata, UpVal,
+    ThreadContext, ThreadStatus, Udata, UpVal, WeakValue,
 };
 use crate::state::{GlobalState, LuaState};
 use crate::strings::{lua_string_as_c_str_ptr, lua_string_as_str, lua_string_eq, lua_string_len};
@@ -129,8 +129,8 @@ fn index2offset(L: &LuaState, idx: c_int) -> Option<usize> {
     }
 }
 
-/// 获取栈上 idx 处的 TValue 引用（只读）。
-fn index2val<'a, 'b>(L: &'a LuaState<'b>, idx: c_int) -> Option<&'a TValue<'b>> {
+/// 获取栈上 idx 处的 TValue。
+fn index2val<'a>(L: &LuaState<'a>, idx: c_int) -> Option<TValue<'a>> {
     // 伪索引：registry
     if idx == LUA_REGISTRYINDEX {
         // registry 是一个 table，存放在 GlobalState.registry
@@ -145,15 +145,16 @@ fn index2val<'a, 'b>(L: &'a LuaState<'b>, idx: c_int) -> Option<&'a TValue<'b>> 
         let up_idx = (LUA_REGISTRYINDEX - idx) as usize; // 1-based
         if L.api_func_base < L.stack.len() {
             if let TValue::CClosure(cc) = &L.stack[L.api_func_base] {
-                if up_idx >= 1 && up_idx <= cc.upvalue.len() {
-                    return Some(&cc.upvalue[up_idx - 1]);
+                let upvalue = cc.upvalue.borrow();
+                if up_idx >= 1 && up_idx <= upvalue.len() {
+                    return Some(upvalue[up_idx - 1].clone());
                 }
             }
         }
         return None;
     }
     let off = index2offset(L, idx)?;
-    Some(&L.stack[off])
+    Some(L.stack[off].clone())
 }
 
 /// 判断 idx 是否是 registry 伪索引
@@ -255,8 +256,9 @@ fn getmeta<'a>(state: &LuaState<'a>, idx: c_int) -> Option<Table<'a>> {
         TValue::Table(t) => t.get_metatable(),
         TValue::UserData(u) => u
             .metatable
+            .borrow()
             .as_ref()
-            .map_or(None, |t| Some(t.as_ref().clone())),
+            .map_or(None, |t| Some(*t.clone())),
         _ => None,
     }
 }
@@ -508,11 +510,19 @@ pub extern "C" fn lua_pushvalue(L: *mut lua_State, idx: c_int) {
     if idx < LUA_REGISTRYINDEX {
         let up_idx = (LUA_REGISTRYINDEX - idx) as usize; // 1-based
         if L.api_func_base < L.stack.len() {
-            if let TValue::CClosure(cc) = &L.stack[L.api_func_base] {
-                if up_idx >= 1 && up_idx <= cc.upvalue.len() {
-                    L.stack.push(cc.upvalue[up_idx - 1].clone());
-                    return;
+            let val = if let TValue::CClosure(cc) = &L.stack[L.api_func_base] {
+                let upvalue = cc.upvalue.borrow();
+                if up_idx >= 1 && up_idx <= upvalue.len() {
+                    let val = upvalue[up_idx - 1].clone();
+                    Some(val);
                 }
+                None
+            } else {
+                None
+            };
+            if let Some(val) = val {
+                L.stack.push(val);
+                return;
             }
         }
         L.stack.push(TValue::Nil(NilKind::Strict));
@@ -744,7 +754,7 @@ pub extern "C" fn lua_pushcclosure(L: *mut lua_State, f: lua_CFunction, n: c_int
             slot,
             CClosure {
                 f,
-                upvalue: upvalues,
+                upvalue: upvalues.into(),
             },
         )));
     }
@@ -797,10 +807,10 @@ pub extern "C" fn lua_isnumber(L: *mut lua_State, idx: c_int) -> c_int {
     match index2val(L, idx) {
         Some(TValue::Integer(_)) | Some(TValue::Float(_)) => 1,
         Some(s @ TValue::LongStr(_)) => {
-            crate::float_utils::f64_from_str(lua_string_as_str(s)).is_some() as c_int
+            crate::float_utils::f64_from_str(lua_string_as_str(&s)).is_some() as c_int
         }
         Some(s @ TValue::ShortStr(_)) => {
-            crate::float_utils::f64_from_str(lua_string_as_str(s)).is_some() as c_int
+            crate::float_utils::f64_from_str(lua_string_as_str(&s)).is_some() as c_int
         }
         _ => 0,
     }
@@ -864,11 +874,11 @@ pub extern "C" fn lua_toboolean(L: *mut lua_State, idx: c_int) -> c_int {
 pub extern "C" fn lua_tointegerx(L: *mut lua_State, idx: c_int, isnum: *mut c_int) -> lua_Integer {
     let L = unsafe { &*L };
     let result = match index2val(L, idx) {
-        Some(TValue::Integer(i)) => Some(*i),
-        Some(TValue::Float(f)) => crate::vm::float_to_integer(*f, F2IMode::Eq),
+        Some(TValue::Integer(i)) => Some(i),
+        Some(TValue::Float(f)) => crate::vm::float_to_integer(f, F2IMode::Eq),
         Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
-            lua_string_as_str(s).parse::<i64>().ok().or_else(|| {
-                crate::float_utils::f64_from_str(lua_string_as_str(s))
+            lua_string_as_str(&s).parse::<i64>().ok().or_else(|| {
+                crate::float_utils::f64_from_str(lua_string_as_str(&s))
                     .and_then(|f| crate::vm::float_to_integer(f, F2IMode::Eq))
             })
         }
@@ -895,8 +905,8 @@ pub extern "C" fn lua_tointegerx(L: *mut lua_State, idx: c_int, isnum: *mut c_in
 pub extern "C" fn lua_tonumberx(L: *mut lua_State, idx: c_int, isnum: *mut c_int) -> lua_Number {
     let L = unsafe { &*L };
     let result = match index2val(L, idx) {
-        Some(TValue::Integer(i)) => Some(*i as f64),
-        Some(TValue::Float(f)) => Some(*f),
+        Some(TValue::Integer(i)) => Some(i as f64),
+        Some(TValue::Float(f)) => Some(f),
         Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
             crate::float_utils::f64_from_str(lua_string_as_str(&s))
         }
@@ -965,7 +975,7 @@ pub extern "C" fn lua_tolstring(L: *mut lua_State, idx: c_int, len: *mut usize) 
 pub extern "C" fn lua_touserdata(L: *mut lua_State, idx: c_int) -> *mut c_void {
     let L = unsafe { &*L };
     match index2val(L, idx) {
-        Some(TValue::LightUserData(p)) => *p,
+        Some(TValue::LightUserData(p)) => p,
         Some(TValue::UserData(ud)) => ud.data.as_ptr() as *mut c_void,
         _ => ptr::null_mut(),
     }
@@ -976,7 +986,7 @@ pub extern "C" fn lua_touserdata(L: *mut lua_State, idx: c_int) -> *mut c_void {
 pub extern "C" fn lua_rawlen(L: *mut lua_State, idx: c_int) -> lua_Unsigned {
     let L = unsafe { &*L };
     match index2val(L, idx) {
-        Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => lua_string_len(s) as lua_Unsigned,
+        Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => lua_string_len(&s) as lua_Unsigned,
         Some(TValue::Table(t)) => t.len() as lua_Unsigned,
         Some(TValue::UserData(u)) => u.len as lua_Unsigned,
         _ => 0,
@@ -1002,12 +1012,7 @@ pub extern "C" fn lua_tocfunction(L: *mut lua_State, idx: c_int) -> Option<lua_C
 #[no_mangle]
 pub extern "C" fn lua_createtable(L: *mut lua_State, narr: c_int, nrec: c_int) {
     let L = unsafe { &mut *L };
-    let t = Table::with_capacity_in(
-        L.alloc_slot(),
-        if narr > 0 { narr as usize } else { 0 },
-        if nrec > 0 { nrec as usize } else { 0 },
-    );
-    L.stack.push(TValue::Table(t));
+    L.create_table(narr.min(0) as usize, nrec.min(0) as usize);
 }
 
 /// lua_gettable: t[k]，k 从栈顶弹出，结果压栈。返回值的类型。
@@ -1625,17 +1630,23 @@ pub extern "C-unwind" fn lua_newuserdatauv(
         gc_header: crate::gc::GCObjectHeader::new(),
         nuvalue: nuv as u16,
         len: sz,
-        metatable: None,
+        metatable: None.into(),
         user_values: (0..nuv).map(|_| TValue::Nil(NilKind::Strict)).collect(),
         data: vec![0u64; n_u64],
     };
-    // 注册到 GC 并设置 id（使 mark_tvalue 能正确标记 reachable）
-    // 用 gc_mem_size() 计费含 data/user_values 容量，比 size_of::<Udata>() 更接近真实占用
-    let ud_id = unsafe { L.g_mut().gc.as_mut().register_object(udata.gc_mem_size()) };
-    udata.gc_header.set_id(ud_id);
     let ptr = udata.data.as_mut_ptr() as *mut c_void;
     let slot = L.alloc_slot();
-    L.stack.push(TValue::UserData(MyRc::new_in(slot, udata)));
+    let ud = MyRc::new_in(slot, udata);
+    // 注册到 GC 并设置 id（使 mark_tvalue 能正确标记 reachable）
+    // 用 gc_mem_size() 计费含 data/user_values 容量，比 size_of::<Udata>() 更接近真实占用
+    let ud_id = unsafe {
+        L.g_mut()
+            .gc
+            .as_mut()
+            .register_object(ud.gc_mem_size(), WeakValue::UserData(ud.downgrade()))
+    };
+    ud.gc_header.set_id(ud_id);
+    L.stack.push(TValue::UserData(ud));
     ptr
 }
 
@@ -1654,7 +1665,7 @@ pub extern "C" fn lua_getmetatable(L: *mut lua_State, objindex: c_int) -> c_int 
         None => return 0,
     };
     let mt = match &L.stack[off] {
-        TValue::UserData(u) => u.metatable.as_ref().map(|b| (**b).clone()),
+        TValue::UserData(u) => u.metatable.borrow().as_ref().map(|b| (**b).clone()),
         TValue::Table(t) => t.get_metatable(),
         _ => None,
     };
@@ -1711,7 +1722,7 @@ pub extern "C" fn lua_setmetatable(L: *mut lua_State, objindex: c_int) -> c_int 
             // the userdata in-place regardless of how many references there are.
             let ptr = u.as_raw_ptr() as *mut Udata;
             unsafe {
-                (*ptr).metatable = mt.as_ref().map(|t| Box::new(t.clone()));
+                (*ptr).metatable = mt.as_ref().map(|t| Box::new(t.clone())).into();
             }
             // 检查元表是否含 __gc，若有则收集待注册的 userdata
             if let Some(ref mt_table) = mt {
@@ -1912,24 +1923,24 @@ pub extern "C" fn lua_rawequal(L: *mut lua_State, idx1: c_int, idx2: c_int) -> c
             }
             match (v1, v2) {
                 (TValue::Nil(_), TValue::Nil(_)) => 1,
-                (TValue::Boolean(a), TValue::Boolean(b)) => (*a == *b) as c_int,
-                (TValue::Integer(a), TValue::Integer(b)) => (*a == *b) as c_int,
-                (TValue::Float(a), TValue::Float(b)) => (*a == *b) as c_int,
+                (TValue::Boolean(a), TValue::Boolean(b)) => (a == b) as c_int,
+                (TValue::Integer(a), TValue::Integer(b)) => (a == b) as c_int,
+                (TValue::Float(a), TValue::Float(b)) => (a == b) as c_int,
                 (
                     a @ (TValue::LongStr(_) | TValue::ShortStr(_)),
                     b @ (TValue::LongStr(_) | TValue::ShortStr(_)),
-                ) => (lua_string_eq(a, b)) as c_int,
+                ) => (lua_string_eq(&a, &b)) as c_int,
                 (TValue::Table(a), TValue::Table(b)) => {
                     std::ptr::addr_eq(a.data.as_ptr(), b.data.as_ptr()) as c_int
                 }
                 (TValue::UserData(a), TValue::UserData(b)) => {
                     (a.gc_header.ptr_id == b.gc_header.ptr_id) as c_int
                 }
-                (TValue::LightUserData(a), TValue::LightUserData(b)) => (*a == *b) as c_int,
+                (TValue::LightUserData(a), TValue::LightUserData(b)) => (a == b) as c_int,
                 (TValue::LClosure(a), TValue::LClosure(b)) => {
                     (a.gc_header.ptr_id == b.gc_header.ptr_id) as c_int
                 }
-                (TValue::CClosure(a), TValue::CClosure(b)) => MyRc::ptr_eq(a, b) as c_int,
+                (TValue::CClosure(a), TValue::CClosure(b)) => MyRc::ptr_eq(&a, &b) as c_int,
                 (TValue::Thread(a), TValue::Thread(b)) => {
                     Rc::ptr_eq(&a.context, &b.context) as c_int
                 }
@@ -1966,12 +1977,12 @@ pub extern "C" fn lua_compare(L: *mut lua_State, idx1: c_int, idx2: c_int, op: c
                     (TValue::Boolean(a), TValue::Boolean(b)) => a == b,
                     (TValue::Integer(a), TValue::Integer(b)) => a == b,
                     (TValue::Float(a), TValue::Float(b)) => a == b,
-                    (TValue::Integer(a), TValue::Float(b)) => *a as f64 == *b,
-                    (TValue::Float(a), TValue::Integer(b)) => *a == *b as f64,
+                    (TValue::Integer(a), TValue::Float(b)) => a as f64 == b,
+                    (TValue::Float(a), TValue::Integer(b)) => a == b as f64,
                     (
                         a @ (TValue::LongStr(_) | TValue::ShortStr(_)),
                         b @ (TValue::LongStr(_) | TValue::ShortStr(_)),
-                    ) => lua_string_eq(a, b),
+                    ) => lua_string_eq(&a, &b),
                     (TValue::Table(a), TValue::Table(b)) => {
                         std::ptr::addr_eq(a.data.as_ptr(), b.data.as_ptr())
                     }
@@ -1979,7 +1990,7 @@ pub extern "C" fn lua_compare(L: *mut lua_State, idx1: c_int, idx2: c_int, op: c
                     (TValue::LClosure(a), TValue::LClosure(b)) => {
                         a.gc_header.ptr_id == b.gc_header.ptr_id
                     }
-                    (TValue::CClosure(a), TValue::CClosure(b)) => MyRc::ptr_eq(a, b),
+                    (TValue::CClosure(a), TValue::CClosure(b)) => MyRc::ptr_eq(&a, &b),
                     (TValue::Thread(a), TValue::Thread(b)) => Rc::ptr_eq(&a.context, &b.context),
                     _ => false,
                 };
@@ -1991,28 +2002,28 @@ pub extern "C" fn lua_compare(L: *mut lua_State, idx1: c_int, idx2: c_int, op: c
         1 => {
             // LUA_OPLT: less than
             match (v1, v2) {
-                (TValue::Integer(a), TValue::Integer(b)) => (*a < *b) as c_int,
-                (TValue::Float(a), TValue::Float(b)) => (*a < *b) as c_int,
-                (TValue::Integer(a), TValue::Float(b)) => ((*a as f64) < (*b)) as c_int,
-                (TValue::Float(a), TValue::Integer(b)) => ((*a) < (*b as f64)) as c_int,
+                (TValue::Integer(a), TValue::Integer(b)) => (a < b) as c_int,
+                (TValue::Float(a), TValue::Float(b)) => (a < b) as c_int,
+                (TValue::Integer(a), TValue::Float(b)) => ((a as f64) < (b)) as c_int,
+                (TValue::Float(a), TValue::Integer(b)) => ((a) < (b as f64)) as c_int,
                 (
                     a @ (TValue::LongStr(_) | TValue::ShortStr(_)),
                     b @ (TValue::LongStr(_) | TValue::ShortStr(_)),
-                ) => (lua_string_as_str(a) < lua_string_as_str(b)) as c_int,
+                ) => (lua_string_as_str(&a) < lua_string_as_str(&b)) as c_int,
                 _ => 0,
             }
         }
         2 => {
             // LUA_OPLE: less or equal
             match (v1, v2) {
-                (TValue::Integer(a), TValue::Integer(b)) => (*a <= *b) as c_int,
-                (TValue::Float(a), TValue::Float(b)) => (*a <= *b) as c_int,
-                (TValue::Integer(a), TValue::Float(b)) => ((*a as f64) <= (*b)) as c_int,
-                (TValue::Float(a), TValue::Integer(b)) => ((*a) <= (*b as f64)) as c_int,
+                (TValue::Integer(a), TValue::Integer(b)) => (a <= b) as c_int,
+                (TValue::Float(a), TValue::Float(b)) => (a <= b) as c_int,
+                (TValue::Integer(a), TValue::Float(b)) => ((a as f64) <= (b)) as c_int,
+                (TValue::Float(a), TValue::Integer(b)) => ((a) <= (b as f64)) as c_int,
                 (
                     a @ (TValue::LongStr(_) | TValue::ShortStr(_)),
                     b @ (TValue::LongStr(_) | TValue::ShortStr(_)),
-                ) => (lua_string_as_str(a) <= lua_string_as_str(b)) as c_int,
+                ) => (lua_string_as_str(&a) <= lua_string_as_str(&b)) as c_int,
                 _ => 0,
             }
         }
@@ -3049,6 +3060,7 @@ pub extern "C" fn luaL_newmetatable(L: *mut lua_State, tname: *const c_char) -> 
         return 0;
     }
     let table = Table::with_capacity_in(L.alloc_slot(), 0, 2);
+    unsafe { L.gc_mut().register_table(&table) };
     let name_key = L.intern_str("__name");
     table.set(name_key, tname.clone());
     L.registry.set(tname, TValue::Table(table.clone()));
@@ -3160,6 +3172,7 @@ pub extern "C" fn luaL_requiref(
         _ => {
             // _LOADED 表不存在：创建并注册到 registry
             let t = Table::new_in(L.alloc_slot());
+            unsafe { L.gc_mut().register_table(&t) };
             L.registry.set(loaded_key, TValue::Table(t.clone()));
             t
         }
@@ -4303,9 +4316,10 @@ pub extern "C" fn lua_getupvalue(L: *mut lua_State, funcindex: c_int, n: c_int) 
     // 先提取值和名称 (raw pointer 不受借用检查约束), 再 push
     let (value, name_ptr) = match &L.stack.get(off) {
         Some(TValue::CClosure(cc)) => {
-            if n <= cc.upvalue.len() {
+            let upvalue = cc.upvalue.borrow();
+            if n <= upvalue.len() {
                 (
-                    Some(cc.upvalue[n - 1].clone()),
+                    Some(upvalue[n - 1].clone()),
                     b"\0".as_ptr() as *const c_char,
                 )
             } else {
@@ -4368,7 +4382,7 @@ pub extern "C" fn lua_setupvalue(L: *mut lua_State, funcindex: c_int, n: c_int) 
         Some(TValue::CClosure(cc)) => (
             true,
             false,
-            cc.upvalue.len(),
+            cc.upvalue.borrow().len(),
             b"\0".as_ptr() as *const c_char,
         ),
         Some(TValue::LClosure(closure)) => {
@@ -4396,7 +4410,7 @@ pub extern "C" fn lua_setupvalue(L: *mut lua_State, funcindex: c_int, n: c_int) 
         if let Some(TValue::CClosure(cc)) = &mut L.stack.get_mut(off) {
             let ptr = cc.as_raw_ptr() as *mut CClosure;
             unsafe {
-                (&mut *ptr).upvalue[n - 1] = value;
+                (&mut *ptr).upvalue.borrow_mut()[n - 1] = value;
             }
         }
     } else if is_lc {
@@ -4439,8 +4453,9 @@ pub extern "C" fn lua_upvalueid(L: *mut lua_State, fidx: c_int, n: c_int) -> *mu
     };
     match &L.stack.get(off) {
         Some(TValue::CClosure(cc)) => {
-            if n <= cc.upvalue.len() {
-                &cc.upvalue[n - 1] as *const TValue as *mut c_void
+            let upvalue = cc.upvalue.borrow();
+            if n <= upvalue.len() {
+                &upvalue[n - 1] as *const TValue as *mut c_void
             } else {
                 std::ptr::null_mut()
             }

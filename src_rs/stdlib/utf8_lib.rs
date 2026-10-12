@@ -801,7 +801,7 @@ pub fn create_utf8_lib_table<'a>(state: &LuaState<'a>) -> crate::table::Table<'a
         state.intern_str("charpattern"),
         state.intern_str(&pattern_str),
     );
-
+    unsafe { state.gc_mut().register_table(&lib) };
     lib
 }
 

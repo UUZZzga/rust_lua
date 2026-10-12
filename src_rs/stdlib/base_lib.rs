@@ -417,6 +417,14 @@ fn call_getmetatable<'a>(
                 TValue::Nil(NilKind::Strict)
             }
         }
+        TValue::UserData(ud) => {
+            let mt = ud.metatable.borrow().clone();
+            if let Some(mt) = mt {
+                TValue::Table(*mt)
+            } else {
+                TValue::Nil(NilKind::Strict)
+            }
+        }
         // 基本类型: 从全局 G(L)->mt[type] 读取 (不检查 __metatable)
         _ => match state.dmt.get(arg.ty()) {
             Some(mt) => TValue::Table(mt.clone()),
@@ -868,7 +876,11 @@ fn call_tostring<'a>(
     // UserData: 查找元表的 __tostring 元方法 (对应 C 的 luaL_tolstring)
     if let TValue::UserData(u) = &arg {
         let tostring_key = state.intern_str("__tostring");
-        let meta_fn = u.metatable.as_ref().and_then(|mt| mt.get(&tostring_key));
+        let meta_fn = u
+            .metatable
+            .borrow()
+            .as_ref()
+            .and_then(|mt| mt.get(&tostring_key));
         if let Some(f) = meta_fn {
             let base = state.stack.len();
             state.stack.push(f);
@@ -2096,6 +2108,7 @@ fn lookforfunc<'a>(
             Some(TValue::Table(t)) => t,
             _ => {
                 let new_clibs = Table::new_in(state.alloc_slot());
+                unsafe { state.gc_mut().register_table(&new_clibs) };
                 state
                     .registry
                     .set(clibs_key.clone(), TValue::Table(new_clibs.clone()));
@@ -2330,9 +2343,11 @@ fn init_package_table<'a>(state: &mut LuaState<'a>) {
     let loaded = Table::new_in(state.alloc_slot());
     // registry._LOADED 和 package.loaded 共享同一个 Rc 引用（对应 C luaopen_package）
     let loaded_shared = loaded.clone();
+    unsafe { state.gc_mut().register_table(&loaded) };
     pkg.set(state.intern_str("loaded"), TValue::Table(loaded));
     // preload 表 — 对应 registry[LUA_PRELOAD_TABLE]
     let preload = Table::new_in(state.alloc_slot());
+    unsafe { state.gc_mut().register_table(&preload) };
     pkg.set(state.intern_str("preload"), TValue::Table(preload));
     let path = setpath(state, "LUA_PATH", "./?.lua;./?/init.lua");
     pkg.set(state.intern_str("path"), state.intern_str(&path));
@@ -2381,7 +2396,9 @@ fn init_package_table<'a>(state: &mut LuaState<'a>) {
     searchers.set(TValue::Integer(2), make_searcher(c"searcher_Lua"));
     searchers.set(TValue::Integer(3), make_searcher(c"searcher_C"));
     searchers.set(TValue::Integer(4), make_searcher(c"searcher_Croot"));
+    unsafe { state.gc_mut().register_table(&searchers) };
     pkg.set(state.intern_str("searchers"), TValue::Table(searchers));
+    unsafe { state.gc_mut().register_table(&pkg) };
     state
         .globals
         .set(package_key.clone(), TValue::Table(pkg.clone()));
@@ -2393,6 +2410,7 @@ fn init_package_table<'a>(state: &mut LuaState<'a>) {
     // registry._LOADED = package.loaded (同一个 Rc 引用，对应 C luaopen_package)
     // C 代码 (如 lauxlib.cpp pushglobalfuncname) 通过 lua_getfield(LUA_REGISTRYINDEX, "_LOADED")
     // 访问 loaded 表，必须在 registry 中建立 _LOADED -> loaded 的映射。
+    unsafe { state.gc_mut().register_table(&loaded_shared) };
     let loaded_key = state.intern_str("_LOADED");
     state.registry.set(loaded_key, TValue::Table(loaded_shared));
 }
@@ -2642,7 +2660,7 @@ fn call_load<'a>(
     // For large source (>=64KB), force full GC before compilation to avoid
     // OOM during the allocation-heavy compilation process.
     if source.len() >= 65536 {
-        crate::state::gc_trigger_explicit();
+        crate::gc::gc_trigger_explicit();
         state.collect_gc();
     }
     let proto_result = if is_binary {
@@ -3177,7 +3195,7 @@ fn call_collectgarbage<'a>(
                 // 协程可达性由 RustClosure 的 upvalues[0] (Thread) 跟踪，
                 // collect_gc 会通过 mark_tvalue 遍历 RustClosure，自动回收不可达的协程。
                 // collect_gc 内部会清理弱引用表中的死条目
-                crate::state::gc_trigger_explicit();
+                crate::gc::gc_trigger_explicit();
                 state.collect_gc();
                 TValue::Integer(0)
             }

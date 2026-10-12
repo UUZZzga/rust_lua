@@ -1433,6 +1433,11 @@ assert(a == 2)
         assert_inst_match_file("verybig.lua");
     }
 
+    #[test]
+    fn test_testfile_lua() {
+        assert_inst_match_file("testfile.lua");
+    }
+
     // ===== Int 取负溢出（wrapping_neg）测试 =====
     // -0x8000000000000000 即 -i64::MIN 会溢出，应使用 wrapping_neg 折叠为常量
     // 而非 panic（debug 模式）或生成 UNM 指令

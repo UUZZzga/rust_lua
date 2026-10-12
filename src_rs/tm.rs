@@ -264,6 +264,16 @@ impl<'a> DefaultMetatables<'a> {
         let idx = ty as usize;
         self.tables.get_mut(idx)?.as_mut()
     }
+
+    /// 遍历所有已设置的基本类型元表 — 对应 C 的 `markmt` 遍历 `g->mt[]`。
+    /// GC 必须把它们当根：这些表只被 `dmt` 强引用，若不可达会被 sweep
+    /// clear_for_drop 清空（字符串算术元方法、io 的 FILE 元表都会失效）。
+    pub fn iter_tables(&self) -> impl Iterator<Item = &Table<'a>> {
+        self.tables
+            .iter()
+            .filter_map(|m| m.as_ref())
+            .map(|m| &m.table)
+    }
 }
 
 impl<'a> Default for DefaultMetatables<'a> {
@@ -303,7 +313,7 @@ pub fn obj_type_name_<'a>(table: &StringTable, obj: &TValue<'a>) -> String {
     // 获取元表（Table 通过 get_metatable() 共享 Rc；UserData 直接克隆）
     let meta: Option<Table> = match obj {
         TValue::Table(t) => t.get_metatable(),
-        TValue::UserData(u) => u.metatable.as_ref().map(|b| (**b).clone()),
+        TValue::UserData(u) => u.metatable.borrow().as_ref().map(|b| (**b).clone()),
         _ => None,
     };
     if let Some(mt) = meta {
@@ -339,7 +349,8 @@ pub fn get_tm_by_obj<'a>(
             Some(v.clone())
         }
         TValue::UserData(u) => {
-            let mt: &Table = u.metatable.as_ref()?;
+            let guard = u.metatable.borrow();
+            let mt: &Table = guard.as_ref()?;
             let v = mt.get_tm_ref(key)?;
             Some(v.clone())
         }

@@ -29,7 +29,7 @@ use crate::mem::SlotAlloc;
 use crate::strings::{
     lua_string_as_str, lua_string_eq, lua_string_hash, ArcRc, LongString, ShortString,
 };
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
 use crate::alloc::{MyRc, WeakRc, RC_HEADER_SIZE};
@@ -668,6 +668,45 @@ pub enum TValue<'a> {
     Thread(MyRc<LuaThread<'a>, SlotAlloc>),
 }
 
+#[derive(Debug, Clone)]
+pub enum WeakValue<'a> {
+    /// nil 值，带子变体（标准 nil / 空槽 / 缺键）
+    Nil(NilKind),
+    /// 布尔值
+    Boolean(bool),
+    /// 轻量用户数据（裸指针）
+    LightUserData(*mut std::ffi::c_void),
+    /// 数值 —— 整数子变体
+    Integer(i64),
+    /// 数值 —— 浮点子变体
+    Float(f64),
+    /// 字符串（短字符串和长字符串）
+    ShortStr(ArcRc<ShortString>),
+    LongStr(SimpleRc<LongString, SlotAlloc>),
+    /// 表
+    Table(WeakTable<'a>),
+    /// Lua 闭包
+    LClosure(WeakRc<LClosure<'a>, SlotAlloc>),
+    /// C 闭包（同理用 allocator 路由的 WeakRc）
+    CClosure(WeakRc<CClosure<'a>, SlotAlloc>),
+    /// 轻量 C 函数
+    LCFn(LCFunction),
+    /// Rust 原生内置函数（函数指针 + 静态名）
+    ///
+    /// 用于注册 Rust 实现的内置函数。调用时直接通过函数指针派发，
+    /// 无需 tag 范围匹配。详见 `BuiltinFn` 类型文档。
+    BuiltinFn(BuiltinFn),
+    /// Rust 闭包（函数指针 + 可变 upvalues）
+    ///
+    /// 用于 coroutine.wrap 和 io.lines 等需要携带状态的内置函数。
+    /// 详见 `RustClosure` 类型文档。
+    RustClosure(WeakRc<RustClosure<'a>, SlotAlloc>),
+    /// 用户数据（同理用 allocator 路由的 WeakRc）
+    UserData(WeakRc<Udata<'a>, SlotAlloc>),
+    /// 线程/协程（同理用 allocator 路由的 WeakRc）
+    Thread(WeakRc<LuaThread<'a>, SlotAlloc>),
+}
+
 /// nil 的子变体 —— 用 enum 替代 C 的 variant bit
 ///
 /// Scenario: nil 的语义区分
@@ -1276,6 +1315,32 @@ impl<'a> fmt::Debug for Table<'a> {
     }
 }
 
+pub struct WeakTable<'a> {
+    /// 共享数据 —— 克隆 Table 时仅增加 Rc 引用计数
+    pub data: TableDataWeak<'a>,
+}
+
+impl<'a> Clone for WeakTable<'a> {
+    /// 克隆 Table：仅克隆 `Rc`（共享数据），并克隆 `gc_header`（保持同一 `ptr_id`）。
+    fn clone(&self) -> Self {
+        WeakTable {
+            data: self.data.clone(),
+        }
+    }
+}
+
+impl<'a> fmt::Debug for WeakTable<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WeakTable").finish_non_exhaustive()
+    }
+}
+
+impl<'a> WeakTable<'a> {
+    pub fn upgrade(&self) -> Option<Table<'a>> {
+        self.data.upgrade().map(|td| Table { data: td })
+    }
+}
+
 // ============================================================================
 // TableDataRc — Table 数据共享指针（allocator 路由块）
 // ============================================================================
@@ -1330,7 +1395,7 @@ pub struct CClosure<'a> {
     /// C 函数指针
     pub f: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32,
     /// 上值列表
-    pub upvalue: Vec<TValue<'a>>,
+    pub upvalue: RefCell<Vec<TValue<'a>>>,
 }
 
 impl<'a> LClosure<'a> {
@@ -1358,7 +1423,7 @@ impl<'a> CClosure<'a> {
         RC_HEADER_SIZE
             + std::mem::size_of::<crate::mem::SlotAlloc>()
             + std::mem::size_of::<CClosure>()
-            + self.upvalue.capacity() * std::mem::size_of::<TValue>()
+            + self.upvalue.borrow().capacity() * std::mem::size_of::<TValue>()
     }
 }
 
@@ -1728,7 +1793,7 @@ pub struct Udata<'a> {
     /// 数据长度
     pub len: usize,
     /// 元表
-    pub metatable: Option<Box<Table<'a>>>,
+    pub metatable: RefCell<Option<Box<Table<'a>>>>,
     /// 用户值列表
     pub user_values: Vec<TValue<'a>>,
     /// 原始数据 — 使用 Vec<u64> 保证 8 字节对齐
@@ -1851,7 +1916,7 @@ pub struct LuaThread<'a> {
     /// C API 关联的 lua_State 指针（lua_newthread 创建时设置）
     /// 用于 lua_tothread 从 TValue::Thread 反查关联的 lua_State。
     /// 主线程和 Lua 层 coroutine.create 创建的协程此字段为 null。
-    pub c_state: std::cell::Cell<*mut LuaState<'a>>,
+    pub c_state: Cell<*mut LuaState<'a>>,
 }
 
 impl<'a> LuaThread<'a> {

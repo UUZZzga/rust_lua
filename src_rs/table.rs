@@ -11,7 +11,7 @@
 
 use crate::gc::GCObjectHeader;
 use crate::mem::SlotAlloc;
-use crate::objects::{NilKind, TValue, TableData, TableDataRc, TableVec};
+use crate::objects::{NilKind, TValue, TableData, TableDataRc, TableVec, WeakTable};
 use crate::strings::lua_string_eq;
 
 pub use crate::objects::Table;
@@ -83,6 +83,13 @@ impl<'a> Table<'a> {
                     metatable: None,
                 },
             ),
+        }
+    }
+
+    /// 转换为弱引用，用于 GC 收集。
+    pub fn downgrade(&self) -> WeakTable<'a> {
+        WeakTable {
+            data: self.data.downgrade(),
         }
     }
 
@@ -643,66 +650,6 @@ impl<'a> Table<'a> {
     }
 }
 
-pub struct LuaTable<'a> {
-    table: Table<'a>,
-}
-
-impl<'a> LuaTable<'a> {
-    /// 表块由 `alloc` 分配。
-    pub fn new_in(alloc: SlotAlloc) -> Self {
-        LuaTable {
-            table: Table::new_in(alloc),
-        }
-    }
-
-    /// 表块由 `alloc` 分配。
-    pub fn with_capacity_in(alloc: SlotAlloc, narray: usize, nhash: usize) -> Self {
-        LuaTable {
-            table: Table::with_capacity_in(alloc, narray, nhash),
-        }
-    }
-
-    pub fn inner(&self) -> &Table<'a> {
-        &self.table
-    }
-
-    pub fn inner_mut(&mut self) -> &mut Table<'a> {
-        &mut self.table
-    }
-
-    pub fn get(&self, key: &TValue<'a>) -> Option<TValue<'a>> {
-        self.table.get(key)
-    }
-
-    pub fn get_int(&self, key: i64) -> Option<TValue<'a>> {
-        self.table.get_int(key)
-    }
-
-    pub fn set(&mut self, key: TValue<'a>, value: TValue<'a>) {
-        self.table.set(key, value);
-    }
-
-    pub fn set_int(&mut self, key: i64, value: TValue<'a>) {
-        self.table.set_int(key, value);
-    }
-
-    pub fn len(&self) -> i64 {
-        self.table.len()
-    }
-
-    pub fn next(&self, prev_key: Option<&TValue<'a>>) -> Option<(TValue<'a>, TValue<'a>)> {
-        self.table.next(prev_key)
-    }
-
-    pub fn rehash(&mut self, nasize: usize, nhsize: usize) {
-        self.table.rehash(nasize, nhsize);
-    }
-
-    pub fn resize_array(&mut self, nasize: usize) {
-        self.table.resize_array(nasize);
-    }
-}
-
 /// 浮点数键转换为整数键 — 对应 C 的 `lua_numbertointeger`
 ///
 /// 当浮点数能精确表示为 i64 范围内的整数时返回该整数。
@@ -826,12 +773,6 @@ mod tests {
         drop(t);
     }
 
-    #[test]
-    fn test_lua_table_new() {
-        let alloc = crate::mem::TestAlloc::new();
-        let lt = LuaTable::new_in(alloc.slot());
-        assert_eq!(lt.len(), 0);
-    }
     // ------------------------------------------------------------------------
     // get / get_int
     // ------------------------------------------------------------------------
@@ -1265,52 +1206,6 @@ mod tests {
         let t = Table::with_capacity_in(alloc.slot(), 10, 16);
         let size = t.mem_size();
         assert!(size > 0);
-    }
-    // ------------------------------------------------------------------------
-    // LuaTable 封装
-    // ------------------------------------------------------------------------
-
-    #[test]
-    fn test_lua_table_get_set() {
-        let alloc = crate::mem::TestAlloc::new();
-        let mut lt = LuaTable::new_in(alloc.slot());
-        lt.set_int(1, TValue::Integer(42));
-        assert_eq!(lt.get_int(1), Some(TValue::Integer(42)));
-    }
-    #[test]
-    fn test_lua_table_len() {
-        let alloc = crate::mem::TestAlloc::new();
-        let mut lt = LuaTable::with_capacity_in(alloc.slot(), 3, 0);
-        lt.set_int(1, TValue::Integer(10));
-        lt.set_int(2, TValue::Integer(20));
-        lt.set_int(3, TValue::Integer(30));
-        assert_eq!(lt.len(), 3);
-    }
-    #[test]
-    fn test_lua_table_inner_access() {
-        let alloc = crate::mem::TestAlloc::new();
-        let mut lt = LuaTable::new_in(alloc.slot());
-        lt.set_int(1, TValue::Integer(99));
-        assert_eq!(lt.inner().get_int(1), Some(TValue::Integer(99)));
-        lt.inner_mut().set_int(2, TValue::Integer(88));
-        assert_eq!(lt.get_int(2), Some(TValue::Integer(88)));
-    }
-    #[test]
-    fn test_lua_table_next() {
-        let alloc = crate::mem::TestAlloc::new();
-        let mut lt = LuaTable::new_in(alloc.slot());
-        lt.set_int(1, TValue::Integer(10));
-        let r = lt.next(None).unwrap();
-        assert_eq!(r, (TValue::Integer(1), TValue::Integer(10)));
-    }
-    #[test]
-    fn test_lua_table_rehash() {
-        let alloc = crate::mem::TestAlloc::new();
-        let mut lt = LuaTable::new_in(alloc.slot());
-        lt.set_int(1, TValue::Integer(10));
-        lt.set_int(3, TValue::Integer(30));
-        lt.rehash(3, 0);
-        assert_eq!(lt.len(), 1);
     }
     #[test]
     fn test_new_table_functions() {

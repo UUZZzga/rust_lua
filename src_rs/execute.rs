@@ -17,8 +17,8 @@ use crate::alloc::MyRc;
 use crate::helper::JmpBuf;
 use crate::mem::SlotAlloc;
 use crate::objects::{
-    CallFrame, Instruction, LClosure, LuaType, NilKind, Proto, TValue, UpVal, UpValVec, PF_VAHID,
-    PF_VATAB,
+    CallFrame, Instruction, LClosure, LuaType, NilKind, Proto, TValue, UpVal, UpValVec, WeakValue,
+    PF_VAHID, PF_VATAB,
 };
 use crate::opcodes::{self, OpCode};
 use crate::state::{LuaState, LUAI_MAXCCALLS, LUA_MINSTACK, MAX_CALL_CHAIN};
@@ -2086,11 +2086,7 @@ impl VmExecutor {
                         | TValue::Thread(_)
                 ) {
                     // 1) 按位读出旧值，把所有权 "搬" 出来，不调用 Drop
-                    let old = std::ptr::read(slot);
-
-                    // 2) 交给延迟队列
-                    let gc = state.gc_mut();
-                    gc.deferred_drop.push(old);
+                    let _ = std::ptr::replace(slot, TValue::Nil(NilKind::Strict));
                 }
                 std::ptr::write(slot, val);
             }
@@ -3801,10 +3797,7 @@ impl VmExecutor {
         state.maybe_collect_gc();
         // TableData 块经 MemState allocator 分配（对应 C 的 luaM_new(L, Table)）
         let table = Table::with_capacity_in(state.alloc_slot(), array_size, hash_size as usize);
-        // 使用 mem_size() 计算实际内存占用（含 Table 结构 + array + hash），
-        // 避免 GC 低估内存导致不及时回收（big.lua/verybig.lua 内存分配失败）
-        let table_id = unsafe { state.gc_mut().register_object(table.mem_size()) };
-        table.data.borrow().gc_header.set_id(table_id);
+        unsafe { state.gc_mut().register_table(&table) };
         Self::write_stack(state, a, TValue::Table(table));
         state.pc += 1;
         Ok(())
@@ -6629,7 +6622,6 @@ impl VmExecutor {
                     match (s, i2) {
                         (TValue::Integer(s), TValue::Integer(i2)) => (*s, *i2),
                         _ => {
-                            unsafe { state.gc_mut().deferred_drop.clear() };
                             return Ok(()); // pc 已 = cur+1 (循环头覆盖)
                         }
                     }
@@ -6650,14 +6642,12 @@ impl VmExecutor {
                 let step = match Self::read_stack(state, ra + 1) {
                     TValue::Float(s) => *s,
                     _ => {
-                        unsafe { state.gc_mut().deferred_drop.clear() };
                         return Ok(());
                     }
                 };
                 let idx = match Self::read_stack(state, ra + 2) {
                     TValue::Float(f) => *f,
                     _ => {
-                        unsafe { state.gc_mut().deferred_drop.clear() };
                         return Ok(());
                     }
                 };
@@ -6678,7 +6668,6 @@ impl VmExecutor {
             }
             _ => {}
         }
-        unsafe { state.gc_mut().deferred_drop.clear() };
         Ok(())
     }
 
@@ -7144,7 +7133,12 @@ impl VmExecutor {
             );
             // 注册到 GC metas，使 gc_estimate 增长，让 maybe_collect_gc 的阈值检查能正常工作
             // 用 gc_mem_size() 计费含 upvals 容量，比 size_of::<LClosure>() 更接近真实占用
-            let closure_id = unsafe { state.gc_mut().register_object(closure.gc_mem_size()) };
+            let closure_id = unsafe {
+                state.gc_mut().register_object(
+                    closure.gc_mem_size(),
+                    WeakValue::LClosure(closure.downgrade()),
+                )
+            };
             closure.gc_header.set_id(closure_id);
             Self::write_stack(state, ra, TValue::LClosure(closure));
         }
@@ -7390,7 +7384,7 @@ impl VmExecutor {
             // PF_VATAB: 创建 vararg 表
             // 变参在 state.base + nfixparams .. state.base + nfixparams + nextra
             let vatab_pos = state.base + nfixparams;
-            let table = Table::new_in(state.alloc_slot());
+            let table = Table::with_capacity_in(state.alloc_slot(), nextra, 1);
             for i in 0..nextra {
                 let val = state.stack[vatab_pos + i].clone();
                 table.set_int((i + 1) as i64, val);
@@ -7398,6 +7392,7 @@ impl VmExecutor {
             // t.n = nextra
             let key_n = state.string_table.intern_value("n");
             table.set(key_n, TValue::Integer(nextra as i64));
+            unsafe { state.gc_mut().register_table(&table) };
             // 把表放到 vatab_pos 位置，截断后续
             // nextra=0 时 vatab_pos 可能等于 stack_len，需要先扩展栈
             while state.stack.len() <= vatab_pos {
@@ -7550,6 +7545,49 @@ impl VmExecutor {
                         }
                     }
                     return Ok(TValue::Nil(NilKind::Strict));
+                }
+                TValue::UserData(ud) => {
+                    let mt = ud.metatable.borrow().clone();
+                    let tmnames = &state.tmnames;
+                    let index_val = mt.and_then(|mt| {
+                        let index_key =
+                            crate::tm::make_tm_tvalue(tmnames, crate::tm::TagMethod::Index);
+                        mt.get(&index_key)
+                    });
+                    if let Some(index_val) = index_val {
+                        match &index_val {
+                            TValue::Table(_) => {
+                                current = Some(index_val);
+                                continue;
+                            }
+                            TValue::LClosure(_)
+                            | TValue::LCFn(_)
+                            | TValue::CClosure(_)
+                            | TValue::BuiltinFn(_)
+                            | TValue::RustClosure(_)
+                            | TValue::LightUserData(_) => {
+                                return Self::call_index_metamethod(
+                                    state,
+                                    index_val,
+                                    curr.clone(),
+                                    key.clone(),
+                                );
+                            }
+                            _ => {
+                                current = Some(index_val);
+                                continue;
+                            }
+                        }
+                    } else {
+                        let type_name = state.typename(curr.ty());
+                        let info = index_varinfo(state, table_source);
+                        return Err(VmError::RuntimeError(format!(
+                            "attempt to index a {} value{} with metatable {}",
+                            type_name,
+                            info,
+                            crate::tm::obj_type_name(state, curr)
+                        )));
+                    }
                 }
                 TValue::LongStr(_) | TValue::ShortStr(_) => {
                     // 字符串类型: 查找字符串元表的 __index
@@ -7877,9 +7915,9 @@ fn format_float(f: f64) -> String {
 mod tests {
     use super::*;
     use crate::gc::GCObjectHeader;
+    use crate::objects::NilKind;
     use crate::state::GlobalShared;
     use crate::strings::StringTable;
-    use crate::{gc::GCState, objects::NilKind};
     use std::rc::Rc;
 
     pub fn execute<'a>(
@@ -7888,22 +7926,16 @@ mod tests {
         stack: Vec<TValue<'a>>,
     ) -> Result<VmResult<'a>, VmError<'a>> {
         let string_table = Rc::new(StringTable::new());
-        // 测试 harness：状态分配器在此之前尚不存在，本函数内独立持有一份
-        // （生命期覆盖随后的 state；比「每线程共享一份」更严格）。
-        let alloc = crate::mem::TestAlloc::new();
+        // 测试 harness：状态分配器由共享块自持（`GlobalShared::new` 建立后同时
+        // 交给执行态的 mem 路由），块内 GC 对象与宿主同生共死。
         let mut state = LuaState::from_proto(
             proto,
             base,
             stack,
-            Rc::new(RefCell::new(GlobalShared {
-                gcstopem: false,
-                gc: GCState::default_incremental(),
-                memerrmsg: crate::strings::new_lstr(
-                    alloc.slot(),
-                    &string_table,
-                    crate::strings::MEMERRMSG,
-                ),
-            })),
+            Rc::new(RefCell::new(GlobalShared::new(
+                crate::mem::AllocOwner::new(Box::new(crate::mem::DefaultAllocator)),
+                &string_table,
+            ))),
             string_table,
         );
         VmExecutor::execute_loop(&mut state)

@@ -796,6 +796,7 @@ fn call_os_date<'a>(
         set_field(&table, state, "yday", tmr.tm_yday, 1);
         set_field(&table, state, "wday", tmr.tm_wday, 1);
         set_boolfield(&table, state, "isdst", tmr.tm_isdst);
+        unsafe { state.gc_mut().register_table(&table) };
         state.adjust_results(a, nresults, vec![TValue::Table(table)]);
         return Ok(());
     }
@@ -1013,6 +1014,7 @@ pub fn open_os_lib<'a>(state: &mut LuaState<'a>) {
     register(&mut lib, c"time", call_os_time);
     register(&mut lib, c"difftime", call_os_difftime);
 
+    unsafe { state.gc_mut().register_table(&lib) };
     let key = state.intern_str("os");
     state.globals.set(key, TValue::Table(lib));
 }

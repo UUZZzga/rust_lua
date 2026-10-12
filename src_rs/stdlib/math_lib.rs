@@ -1375,6 +1375,7 @@ pub fn open_math_lib<'a>(state: &mut LuaState<'a>) {
     lib.set(state.intern_str("mininteger"), TValue::Integer(MIN_INTEGER));
 
     // 注册为全局变量 math
+    unsafe { state.gc_mut().register_table(&lib) };
     let key = state.intern_str("math");
     state.globals.set(key, TValue::Table(lib));
     // 初始化随机数生成器状态 (对应 C 的 setrandfunc)

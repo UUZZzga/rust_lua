@@ -12,6 +12,7 @@
 use std::alloc::{self, Layout};
 use std::mem::{self, ManuallyDrop};
 use std::ptr::NonNull;
+use std::rc::Rc;
 
 use crate::config::LuaMem;
 
@@ -200,6 +201,23 @@ pub use std::vec::Vec as AllocVec;
 /// `GlobalState` 装箱/移动不改变该地址；[`Self::set`] 原地替换内容后，
 /// 已发出的槽自动跟随。
 ///
+/// # 为什么宿主是共享的（`Rc`）而不是各持一份
+///
+/// 槽的**有效性**绑定宿主的**存活期**：对象把槽内联在引用计数块里，块的释放
+/// 就发生在槽指向的内层 Box 上。同一份宿主有两类持有者 ——
+/// `GlobalState::mem`（lmem 路由）与 [`crate::state::GlobalShared`]（GC 对象
+/// 存储：`GcObjects` 里的 `WeakRc`/`WeakValue` 引用，其析构正是经槽回到这里）。
+/// 若宿主只挂在 `GlobalState` 上，则当共享块句柄比 `GlobalState` 活得久
+/// （`Rc<RefCell<GlobalShared>>` 被外部持有，或同块被多个执行态共享注册对象）
+/// 时，GC 存储中的弱引用会按**已析构**的宿主释放块 = use-after-free
+/// （Miri: `constructing invalid value of type &Box<dyn Allocator>`）。
+///
+/// 共享同一宿主后，宿主至少活到**最后一个**持有者；`GlobalShared` 自身持有
+/// 一份（声明在 `gc`/`memerrmsg` 之后 ⇒ 晚于块内对象析构），于是
+/// 「对象存储晚于其释放宿主析构」成为结构性不变量，与 `GlobalState` 无关。
+/// [`Self::set`] 原地替换内层值，所有持有者与已发出的槽一起跟随，语义与
+/// C 的 `g->frealloc` 一致。
+///
 /// # 为什么持有根裸指针而不是 `Box<Box<dyn Allocator>>`
 ///
 /// 若用 `Box` 持有内层值，`slot()` 只能写成 `&*self.inner as *const _` ——
@@ -209,11 +227,25 @@ pub use std::vec::Vec as AllocVec;
 /// `reborrow ... is forbidden`，tag `Disabled due to a foreign write`）。
 ///
 /// [`Box::into_raw`] 取得的是**根裸指针**，不派生自任何引用：读、写、以及
-/// `set` 原地覆盖都始终合法，且不会因其他访问而失效。所有权仍由本类型持有，
-/// [`Drop`] 负责回收（不是 `Box::leak`，无泄漏）。
+/// `set` 原地覆盖都始终合法，且不会因其他访问而失效。所有权仍由宿主持有
+/// （[`AllocInner`] 的 `Drop`），内层值只回收一次（不是 `Box::leak`，无泄漏）。
+#[derive(Clone)]
 pub struct AllocOwner {
+    /// 共享宿主内部（`Rc` 自身用 std 分配，不参与 Lua allocf 路由）。
+    inner: Rc<AllocInner>,
+}
+
+/// 宿主内部：内层分配器 Box 的根裸指针 + 唯一回收点。
+struct AllocInner {
     /// 指向堆上 `Box<dyn Allocator>` 的根裸指针（始终非 null）。
-    inner: NonNull<Box<dyn Allocator>>,
+    ptr: NonNull<Box<dyn Allocator>>,
+}
+
+impl Drop for AllocInner {
+    fn drop(&mut self) {
+        // SAFETY: ptr 来自 Box::into_raw，是内层值的唯一所有权点，只回收一次。
+        unsafe { drop(Box::from_raw(self.ptr.as_ptr())) };
+    }
 }
 
 impl AllocOwner {
@@ -221,8 +253,10 @@ impl AllocOwner {
     #[inline]
     pub fn new(allocator: Box<dyn Allocator>) -> Self {
         Self {
-            inner: NonNull::new(Box::into_raw(Box::new(allocator)))
-                .expect("Box::into_raw 不得返回 null"),
+            inner: Rc::new(AllocInner {
+                ptr: NonNull::new(Box::into_raw(Box::new(allocator)))
+                    .expect("Box::into_raw 不得返回 null"),
+            }),
         }
     }
 
@@ -231,48 +265,41 @@ impl AllocOwner {
     /// 只做指针转换，**不创建对目标值的引用**（见类型级文档）。
     #[inline]
     pub fn slot(&self) -> crate::strings::AllocSlot {
-        self.inner.as_ptr() as *const Box<dyn Allocator>
+        self.inner.ptr.as_ptr() as *const Box<dyn Allocator>
     }
 
-    /// 原地替换分配器（槽地址不变，已发出的槽自动跟随）。
+    /// 原地替换分配器（槽地址不变，所有共享持有者与已发出的槽自动跟随）。
     #[inline]
     pub fn set(&mut self, allocator: Box<dyn Allocator>) {
-        // SAFETY: inner 非 null，且指向本类型独占持有的 Box；覆盖即析构旧值。
-        unsafe { *self.inner.as_ptr() = allocator };
+        // SAFETY: 根裸指针非 null，且指向内层值的唯一所有权点；覆盖即析构旧值。
+        unsafe { *self.inner.ptr.as_ptr() = allocator };
     }
 
     /// 当前分配器。
     #[inline]
     pub fn get(&self) -> &dyn Allocator {
-        // SAFETY: inner 非 null 且指向存活、已初始化的 Box。
-        unsafe { &**self.inner.as_ptr() }
-    }
-}
-
-impl Drop for AllocOwner {
-    fn drop(&mut self) {
-        // SAFETY: inner 来自 Box::into_raw，本类型独占其所有权，且只回收一次。
-        unsafe { drop(Box::from_raw(self.inner.as_ptr())) };
+        // SAFETY: 根裸指针非 null 且指向存活、已初始化的 Box。
+        unsafe { &**self.inner.ptr.as_ptr() }
     }
 }
 
 impl Allocator for AllocOwner {
     #[inline]
     fn alloc(&self, ptr: *mut u8, old_size: usize, new_size: usize, align: usize) -> *mut u8 {
-        // SAFETY: inner 非 null 且指向存活的 Box。
-        unsafe { (**self.inner.as_ptr()).alloc(ptr, old_size, new_size, align) }
+        // SAFETY: 根裸指针非 null 且指向存活的 Box。
+        unsafe { (**self.inner.ptr.as_ptr()).alloc(ptr, old_size, new_size, align) }
     }
 
     #[inline]
     fn allocf_parts(&self) -> Option<(LuaCAlloc, *mut std::ffi::c_void)> {
         // SAFETY: 同上。
-        unsafe { (**self.inner.as_ptr()).allocf_parts() }
+        unsafe { (**self.inner.ptr.as_ptr()).allocf_parts() }
     }
 
     #[inline]
     fn set_allocf(&mut self, f: LuaCAlloc, ud: *mut std::ffi::c_void) -> bool {
-        // SAFETY: 同上；`&mut self` 保证独占。
-        unsafe { (**self.inner.as_ptr()).set_allocf(f, ud) }
+        // SAFETY: 同上；`&mut self` 保证与 [`Self::set`] 互斥。
+        unsafe { (**self.inner.ptr.as_ptr()).set_allocf(f, ud) }
     }
 }
 

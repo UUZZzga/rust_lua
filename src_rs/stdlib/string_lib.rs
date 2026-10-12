@@ -4169,6 +4169,7 @@ pub fn create_string_metatable(state: &mut LuaState) {
     );
 
     // 创建 Metatable 并注册到 DefaultMetatables
+    unsafe { state.gc_mut().register_table(&mt_table) };
     let mt = Metatable::new(mt_table);
     state.g_mut().dmt.set(LuaType::String, mt);
 }
@@ -4214,6 +4215,7 @@ fn create_string_lib_table<'a>(state: &LuaState<'a>) -> Table<'a> {
     register(&lib, c"packsize", call_str_packsize);
     register(&lib, c"unpack", call_str_unpack);
     register(&lib, c"dump", call_str_dump);
+    unsafe { state.gc_mut().register_table(&lib) };
     lib
 }
 

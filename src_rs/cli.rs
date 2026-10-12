@@ -795,7 +795,7 @@ pub fn main() {
     let result = interpreter.pmain(&args);
     interpreter.l.close_state();
     // GC 时间统计汇总（LUA_GC_STATS=1 时输出）
-    crate::state::print_gc_time_summary();
+    crate::gc::print_gc_time_summary();
     if !result {
         std::process::exit(1);
     }

@@ -2432,6 +2432,7 @@ pub fn open_coroutine_lib<'a>(state: &mut LuaState<'a>) {
     register(&mut lib, state, c"yield", call_yield);
     register(&mut lib, state, c"close", call_close);
 
+    unsafe { state.gc_mut().register_table(&lib) };
     let key = state.intern_str("coroutine");
     state.globals.set(key, TValue::Table(lib));
 }
@@ -2463,6 +2464,7 @@ mod tests {
     ) -> crate::alloc::MyRc<LuaThread<'a>, crate::mem::SlotAlloc> {
         open_coroutine_lib(state); // 幂等：已开则只重复注册
         let func = Table::new_in(state.alloc_slot());
+        unsafe { state.gc_mut().register_table(&func) };
         state.stack.push(TValue::Table(func)); // func 槽（Table 可调用）
         let save_top = state.top;
         state.top = state.stack.len();

@@ -6,115 +6,29 @@ use crate::gc::{GCObjectHeader, GCState};
 use crate::helper::JmpBuf;
 use crate::mem::SlotAlloc;
 use crate::mem::{AllocOwner, Allocator, DefaultAllocator, MemState};
-use crate::objects::FxBuildHasher;
 use crate::objects::{
     BuiltinFn, BuiltinFnPtr, Instruction, LClosure, LuaThread, LuaType, NilKind, Proto, TValue,
-    ThreadContext, UpVal, UpValRef, UpValVec,
+    ThreadContext, UpVal, UpValRef, UpValVec, WeakValue,
 };
 use crate::strings::{lua_string_as_str, lua_string_len, StringTable};
 use crate::table::Table;
 use crate::tm::DefaultMetatables;
 use crate::tm::{init_tmnames, TM_N};
 use std::cell::RefCell;
-use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::ptr::NonNull;
 use std::rc::Rc;
 
-/// GC 标记阶段使用的集合类型 — 用 FxHash 替代默认 SipHash，
-/// 因为 key 是 usize（对象 ID/指针），用 SipHash 是浪费（perf 显示占 ~4%）。
-type GcHashSet = HashSet<usize, FxBuildHasher>;
-
-/// GC worklist 的原始值项 — TValue 的字节拷贝，不做引用计数。
-/// GC 期间所有对象有效（sweep 在 mark 完成后），所以 push/pop 无需 incq/decq。
-/// 消除 worklist 的 TValue clone (3.11%) + drop_glue (4.26%) 开销。
-/// 用 MaybeUninit<TValue> 保证大小和对齐与 TValue 完全一致。
-type RawTValue<'a> = std::mem::MaybeUninit<TValue<'a>>;
-
-/// 从 &TValue 拷贝原始字节到 RawTValue（不 incq Rc）
-#[cfg_attr(not(size_optimized), inline(always))]
-unsafe fn raw_from_tvalue<'a>(val: &TValue<'a>) -> RawTValue<'a> {
-    std::mem::MaybeUninit::new(std::ptr::read(val as *const TValue))
-}
-
-/// 将 RawTValue 重建为 &TValue 引用
-#[cfg_attr(not(size_optimized), inline(always))]
-unsafe fn raw_as_tvalue<'a, 'b>(raw: &'b RawTValue<'a>) -> &'b TValue<'a> {
-    raw.assume_init_ref()
-}
-
 // ============================================================================
-// GC 统计 — 由环境变量 LUA_GC_STATS=1 启用，用于分析循环引用对象占比
+// GC 相关代码已全部迁移至 gc.rs
+// - GCState、三色标记、sweep、弱表清理、finalizer、GC 统计、时间统计
+// - impl LuaState 的 GC 入口方法（collect_gc / maybe_collect_gc / step_gc /
+//   concat_gc_check / collect_gc_inner / mark_tvalue / process_ephemerons /
+//   collect_finalizers / call_finalizers / collect_roots_into / collect_thread_roots）
+// - impl GlobalState 的 GC 辅助方法（clear_weak_tables / register_weak_table /
+//   register_finobj / register_ud_finobj / mode_key_cached / gc_key_cached）
+// 通过 crate::gc 模块导出使用。
 // ============================================================================
-
-#[derive(Default, Clone, Copy)]
-struct GcTypeStats {
-    table: u64,
-    /// 有 metatable 的 Table（潜在循环引用源）
-    table_with_mt: u64,
-    lclosure: u64,
-    /// 有 upvalues 的 LClosure
-    lclosure_with_upvals: u64,
-    cclosure: u64,
-    rust_closure: u64,
-    thread: u64,
-    userdata: u64,
-    /// Proto（被 LClosure 引用，单向，不形成循环）
-    proto: u64,
-    /// 短串（叶子对象，不引用 GC 对象）
-    short_string: u64,
-    /// GC 调用次数
-    gc_cycles: u64,
-    /// 本次 GC 标记的可达对象总数（含所有类型）
-    reachable_total: u64,
-    /// 本次 GC 时的活跃对象总数（含不可达）
-    active_total: u64,
-}
-
-impl GcTypeStats {
-    const ZERO: Self = GcTypeStats {
-        table: 0,
-        table_with_mt: 0,
-        lclosure: 0,
-        lclosure_with_upvals: 0,
-        cclosure: 0,
-        rust_closure: 0,
-        thread: 0,
-        userdata: 0,
-        proto: 0,
-        short_string: 0,
-        gc_cycles: 0,
-        reachable_total: 0,
-        active_total: 0,
-    };
-}
-
-thread_local! {
-    static GC_STATS: std::cell::Cell<GcTypeStats> = const { std::cell::Cell::new(GcTypeStats::ZERO) };
-}
-
-/// 是否启用 GC 统计（读取环境变量 LUA_GC_STATS，首次调用后缓存）
-fn gc_stats_enabled() -> bool {
-    use std::sync::OnceLock;
-    static FLAG: OnceLock<bool> = OnceLock::new();
-    *FLAG.get_or_init(|| {
-        std::env::var("LUA_GC_STATS")
-            .map(|v| v == "1" || v == "true")
-            .unwrap_or(false)
-    })
-}
-
-/// 累加统计到 thread_local（仅在 gc_stats_enabled() 时调用）
-fn gc_stats_inc<F: FnOnce(&mut GcTypeStats)>(f: F) {
-    if !gc_stats_enabled() {
-        return;
-    }
-    GC_STATS.with(|cell| {
-        let mut s = cell.get();
-        f(&mut s);
-        cell.set(s);
-    });
-}
 
 pub const LUA_YIELD: i32 = 1;
 pub const ERR_RUN: i32 = 2;
@@ -138,8 +52,7 @@ pub const STACKERRSPACE: usize = 200;
 /// 对应 src/lstate.h 中的 MAX_CCMT 定义。当 __call 链超过 15 层时报
 /// "'__call' chain too long" 错误。
 pub const MAX_CALL_CHAIN: usize = 15;
-pub const MAXSTACK_BYSIZET: usize =
-    (usize::max_value() / std::mem::size_of::<TValue>()) - STACKERRSPACE;
+pub const MAXSTACK_BYSIZET: usize = (usize::MAX / std::mem::size_of::<TValue>()) - STACKERRSPACE;
 pub const MAXSTACK: usize = if LUAI_MAXSTACK < MAXSTACK_BYSIZET {
     LUAI_MAXSTACK
 } else {
@@ -216,6 +129,35 @@ pub struct GlobalShared<'a> {
     pub gcstopem: bool,
     pub gc: GCState<'a>,
     pub memerrmsg: TValue<'a>,
+    /// 分配器宿主 —— 本块内所有经槽分配的对象（`gc` 存储里的弱引用、`memerrmsg`）
+    /// 析构时都要经它释放。**声明在最后** ⇒ 宿主晚于 `gc`/`memerrmsg` 析构；
+    /// 与 `GlobalState::mem.allocator` 共享同一宿主（同一 `Rc`），故共享块句柄
+    /// 即便比 `GlobalState` 活得久也不会出现悬垂槽（见 [`AllocOwner`]）。
+    alloc: AllocOwner,
+}
+
+impl<'a> GlobalShared<'a> {
+    /// 新建共享全局块：自持分配器宿主，`memerrmsg` 与后续注册的 GC 对象共用其槽。
+    ///
+    /// `owner` 由调用方（`GlobalState::new_shared` / 测试 harness）建立并**同时**
+    /// 交给 `GlobalState::mem`，两处共享同一宿主。
+    pub fn new(owner: AllocOwner, string_table: &StringTable) -> Self {
+        let slot = SlotAlloc::from_owner(&owner);
+        Self {
+            gcstopem: false,
+            gc: GCState::default_incremental(),
+            memerrmsg: crate::strings::new_lstr(slot, string_table, crate::strings::MEMERRMSG),
+            alloc: owner,
+        }
+    }
+
+    /// 本块的分配器槽（构造期在拿到共享块句柄前分配对象用）。
+    ///
+    /// 槽有效性由 `alloc` 字段保证：它在 `gc` 之后析构，故块内对象释放时宿主必然存活。
+    #[inline]
+    pub fn alloc_slot(&self) -> SlotAlloc {
+        SlotAlloc::from_owner(&self.alloc)
+    }
 }
 
 pub struct LuaFunctionCallInfo {
@@ -234,61 +176,6 @@ pub struct CallInfo {
     pub top: usize,
     pub func: usize,
     pub u: CallInfoU,
-}
-
-// GC 根判定辅助（无状态，两种视角共用）
-/// 判断值是否被 GC 标记为存活（在 reachable 集合中）
-/// 非 GC 对象（字符串、数字、布尔、nil）总是视为存活
-/// RustClosure/Thread/CClosure 无 gc_header，用 Rc 指针地址判断可达性
-/// （指针地址 > 2^32，与 gc_header.id() 的 u32 空间不冲突）
-fn is_marked<'a>(val: &TValue<'a>, reachable: &GcHashSet) -> bool {
-    match val {
-        TValue::Table(t) => t
-            .data
-            .borrow()
-            .gc_header
-            .id()
-            .map_or(true, |id| reachable.contains(&(id.0 as usize))),
-        TValue::LClosure(c) => c
-            .gc_header
-            .id()
-            .map_or(true, |id| reachable.contains(&(id.0 as usize))),
-        TValue::UserData(u) => u
-            .gc_header
-            .id()
-            .map_or(true, |id| reachable.contains(&(id.0 as usize))),
-        TValue::RustClosure(rc) => {
-            let ptr = rc.as_raw_ptr() as usize;
-            reachable.contains(&ptr)
-        }
-        TValue::Thread(t) => {
-            let ptr = Rc::as_ptr(&t.context) as usize;
-            reachable.contains(&ptr)
-        }
-        TValue::CClosure(cc) => {
-            let ptr = cc.as_raw_ptr() as usize;
-            reachable.contains(&ptr)
-        }
-        _ => true,
-    }
-}
-
-/// 标记 TValue 可达，并将子对象加入工作列表
-///
-/// 只处理 Table/LClosure/UserData/Thread（mark_tvalue 的 match 分支）。
-/// 其他类型（Nil/Boolean/Integer/Float/Str 等）不需要 GC 标记，
-/// 过滤掉可避免大量无意义的 clone（perf 显示 TValue::clone 占 7.75%）。
-#[cfg_attr(not(size_optimized), inline)]
-fn needs_gc_mark<'a>(val: &TValue<'a>) -> bool {
-    matches!(
-        val,
-        TValue::Table(_)
-            | TValue::LClosure(_)
-            | TValue::CClosure(_)
-            | TValue::UserData(_)
-            | TValue::Thread(_)
-            | TValue::RustClosure(_)
-    )
 }
 
 // ============================================================================
@@ -543,90 +430,8 @@ impl<'a> LuaState<'a> {
         let self_ptr: *mut LuaState<'a> = self;
         unsafe { (*g).main = self_ptr };
     }
-
-    /// GC 根收集：本执行态可达的根值（栈/上值/帧闭包/hook/wrap 调用者栈）。
-    /// 对应 C 的 `traversethread` 对单个线程的标记；共享根（globals/registry）由
-    /// `collect_gc_inner` 单独收集。
-    fn collect_roots_into(&self, worklist: &mut Vec<RawTValue<'a>>) {
-        // 栈 — 遍历到 self.top（对应 C Lua 的 traversethread: o < th->top）
-        // self.top 在 OP_CALL 中被设为 ra + b（函数+参数末尾），
-        // 在 OP_RETURN 中被设为返回值末尾。超出 self.top 的栈槽是"死亡"的。
-        let stack_top = self.top.min(self.stack.len());
-        for val in &self.stack[..stack_top] {
-            if needs_gc_mark(val) {
-                unsafe { worklist.push(raw_from_tvalue(val)) };
-            }
-        }
-
-        // closure_upvals
-        for uv_ref in self.closure_upvals.borrow().iter() {
-            let uv = uv_ref.borrow();
-            match &*uv {
-                UpVal::Closed { value } => {
-                    if needs_gc_mark(value) {
-                        unsafe { worklist.push(raw_from_tvalue(value)) };
-                    }
-                }
-                UpVal::Open { stack_index, .. } => {
-                    if *stack_index < self.stack.len() {
-                        let val = &self.stack[*stack_index];
-                        if needs_gc_mark(val) {
-                            unsafe { worklist.push(raw_from_tvalue(val)) };
-                        }
-                    }
-                }
-            }
-        }
-
-        // call_stack 中的 constants 和 closure_upvals
-        for frame in &self.call_stack {
-            for val in &frame.constants[..] {
-                if needs_gc_mark(val) {
-                    unsafe { worklist.push(raw_from_tvalue(val)) };
-                }
-            }
-            for uv_ref in frame.closure_upvals.borrow().iter() {
-                let uv = uv_ref.borrow();
-                if let UpVal::Closed { value } = &*uv {
-                    if needs_gc_mark(value) {
-                        unsafe { worklist.push(raw_from_tvalue(value)) };
-                    }
-                }
-            }
-        }
-
-        // call_info 中的 closures
-        for ci in &self.call_info {
-            if let Some(closure) = &ci.closure {
-                let tv = TValue::LClosure(closure.clone());
-                unsafe { worklist.push(raw_from_tvalue(&tv)) };
-                drop(tv); // RawTValue 不持有引用；正常 decq 避免泄漏（closure 仍由 ci 持有）
-            }
-        }
-
-        // hook_func
-        if let Some(hook) = &self.hook_func {
-            if needs_gc_mark(hook) {
-                unsafe { worklist.push(raw_from_tvalue(hook)) };
-            }
-        }
-
-        // call_wrap_fn 期间的调用者栈
-        // 嵌套 wrap 调用时，外层协程的栈（含活跃的 wrap RustClosure 引用）暂存于此，
-        // 否则 GC 看不到内层协程引用，会误判为不可达。
-        for stack in &self.caller_gc_stacks {
-            for val in stack {
-                if needs_gc_mark(val) {
-                    unsafe { worklist.push(raw_from_tvalue(val)) };
-                }
-            }
-        }
-    }
 }
 
-/// 主线程释放（对应 C 的 `lua_close`）：清空 C 安全区并关闭所有待关闭变量；
-/// 断链由 `GlobalState::drop` 完成（`owner` 字段最后析构）。协程执行态无自有共享块，
-/// 直接随 `ThreadContext` 释放。
 impl<'a> Drop for LuaState<'a> {
     fn drop(&mut self) {
         if self.owner.is_some() {
@@ -757,6 +562,7 @@ impl<'a> LuaState<'a> {
     /// 标准库开库需要每线程执行态（LuaState = C 的 lua_State）。
     pub fn open_selected_libs(&mut self, _mask: i32, _ignored: i32) {
         let arg_table = Table::new_in(self.alloc_slot());
+        unsafe { self.gc_mut().register_table(&arg_table) };
         self.globals
             .set(self.intern_str("arg"), TValue::Table(arg_table));
 
@@ -848,10 +654,6 @@ impl<'a> LuaState<'a> {
         if size > MAXSTACK {
             // 栈已超过最大值，线程正在使用为错误保留的额外空间
             debug_assert_eq!(size, ERRORSTACKSIZE);
-            if raiseerror {
-                // 对应 C 的 luaD_errerr (栈错误发生在消息处理器内)
-                // 简化: 直接返回 StackError
-            }
             return Err(VmError::StackError);
         } else if n < MAXSTACK {
             let mut newsize = size + (size >> 1); /* tentative new size (size * 1.5) */
@@ -891,6 +693,10 @@ impl<'a> LuaState<'a> {
         Ok(())
     }
 }
+
+// ============================================================================
+// LuaState — adjust_results 等
+// ============================================================================
 
 impl<'a> LuaState<'a> {
     /// 调整 C 函数返回值到栈上 — 对应 C 的 luaD_poscall 中的栈调整
@@ -1178,7 +984,7 @@ impl<'a> LuaState<'a> {
     pub fn call_no_yield(&mut self, nargs: usize, nresults: i32) {
         // nyci = 0x10000 | 1 (C: lstate.h)
         let nyci: u32 = 0x10000 | 1;
-        self.ccall(nargs, nresults, nyci)
+        self.ccall(nargs, nresults, nyci);
     }
 
     pub fn pcall(&mut self, nargs: usize, nresults: i32, _errfunc: isize) -> i32 {
@@ -2247,11 +2053,15 @@ impl<'a> LuaState<'a> {
 
     pub fn create_table(&mut self, narr: usize, nrec: usize) {
         let t = Table::with_capacity_in(self.alloc_slot(), narr, nrec);
+        let gcs = unsafe { self.gc.as_mut() };
+        gcs.register_table(&t);
         self.stack.push(TValue::Table(t));
     }
 
     pub fn new_table(&mut self) {
         let t = Table::new_in(self.alloc_slot());
+        let gcs = unsafe { self.gc.as_mut() };
+        gcs.register_table(&t);
         self.stack.push(TValue::Table(t));
     }
 
@@ -2418,6 +2228,15 @@ impl<'a> LuaState<'a> {
                         upvals,
                     },
                 );
+                {
+                    let id = unsafe {
+                        self.gc.as_mut().register_object(
+                            std::mem::size_of::<LClosure>() + /* upvals 尺寸估算 */ 0,
+                            WeakValue::LClosure(closure.downgrade()),
+                        )
+                    };
+                    closure.gc_header.set_id(id);
+                }
                 self.stack.push(TValue::LClosure(closure));
                 0
             }
@@ -2500,198 +2319,58 @@ impl<'a> LuaState<'a> {
         self.load_buffer(&source, chunk_name)
     }
 
-    /// 完整的 mark-sweep GC：从根集合开始标记所有可达对象，然后清扫不可达对象。
-    /// 对应 C 的 luaC_fullgc。
-    pub fn collect_gc(&mut self) {
-        // GC 时间统计（LUA_GC_STATS=1 时启用）
-        let gc_start = if gc_stats_enabled() {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        // 设置 GC 正在运行标志 — 阻止 finalizer 中重入 collectgarbage("collect")
-        unsafe { self.g_mut().gc.as_mut().gc_running.set(true) };
-        // 临时禁用 hook — GC 期间的 finalizer 调用不应触发用户的 hook
-        // （对应 C 的 luaD_rawrunprotected 中 L->allowhook = 0 语义）
-        let saved_allowhook = self.allowhook;
-        self.allowhook = false;
-
-        let prev_estimate = unsafe { self.g_mut().gc.as_mut().total_estimate() };
-        let result = self.collect_gc_inner();
-
-        // 恢复 hook 状态
-        self.allowhook = saved_allowhook;
-        // 清除标志
-        unsafe { self.g_mut().gc.as_mut().gc_running.set(false) };
-        // GC 回收对象后，Rust 分配器（glibc malloc）可能仍持有释放的内存不归还操作系统。
-        // malloc_trim(0) 是系统调用，开销较大（perf 显示 ~1.5%）。
-        // 仅当释放了大量内存（>1MB）时才调用，避免在小 GC 中浪费。
-        // 注意: malloc_trim 是 glibc 专属函数, Windows/musl 无此函数。
-        let cur_estimate = unsafe { self.g_mut().gc.as_mut().total_estimate() };
-        if prev_estimate > cur_estimate + 1024 * 1024 {
-            #[cfg(target_os = "linux")]
-            unsafe {
-                libc::malloc_trim(0);
-            }
+    pub fn close_state(&mut self) {
+        if self.gc_closing {
+            return;
         }
-        self.g_mut().last_gc_estimate = cur_estimate;
-        // 累计 GC 时间
-        if let Some(start) = gc_start {
-            let elapsed = start.elapsed();
-            GC_TIME_STATS.with(|cell| {
-                let mut s = cell.get();
-                s.total_us += elapsed.as_micros() as u64;
-                s.count += 1;
-                let this_us = elapsed.as_micros() as u64;
-                if this_us > s.max_us {
-                    s.max_us = this_us;
-                }
-                cell.set(s);
-            });
+        self.g_mut().gc_closing = true;
+        let _ = crate::func::close(self, 1, 0, 0);
+        let mut to_finalize: Vec<TValue> = Vec::new();
+        for t in self.finobj_list.borrow_mut().drain(..).rev() {
+            to_finalize.push(TValue::Table(t));
         }
-        result
+        for u in self.ud_finobj_list.borrow_mut().drain(..).rev() {
+            to_finalize.push(TValue::UserData(u));
+        }
+        self.call_finalizers(to_finalize);
+        if let Some(code) = self.exit_requested {
+            std::process::exit(code);
+        }
     }
 
-    /// 调用 finalizer — 对 to_finalize 列表中的每个对象重新检查 __gc 并调用
-    /// 在 clear_weak_tables 之后调用：弱值表中的 __gc 函数若不可达已被清除，
-    /// 此时再检查 __gc 是否存在，存在才调用（对应 C Lua tryfinalizer 的语义）。
-    /// finalizer 调用后同步 closed upvalue 值回主线程栈：协程首次 resume 时
-    /// open upvalue 被关闭，finalizer 修改 closed upvalue 的值不会自动同步回
-    /// 主线程栈上的原始位置，需要在此手动同步（通过协程的 upval_origins 记录）。
-    fn call_finalizers(&mut self, to_finalize: Vec<TValue<'a>>) {
-        let gc_key = self.gc_key_cached();
+    pub fn traceback(&mut self, msg: &str, _level: usize) {
+        let trace = format!("stack traceback:\n\t...\n{}", msg);
+        self.push_string(&trace);
+    }
 
-        // 构建 upval_origins 映射：UpVal Rc 指针 -> original_stack_index
-        // 遍历主线程栈上的所有协程，收集它们的 upval_origins（首次 resume 时记录）
-        let mut upval_origins_map: std::collections::HashMap<
-            usize,
-            usize,
-            crate::objects::FxBuildHasher,
-        > = std::collections::HashMap::with_hasher(crate::objects::FxBuildHasher::default());
-        for val in self.stack.iter() {
-            if let TValue::Thread(t) = val {
-                let origins = t.context.borrow().upval_origins.clone();
-                for (uv_ref, stack_index) in origins {
-                    let ptr = Rc::as_ptr(&uv_ref) as usize;
-                    upval_origins_map.insert(ptr, stack_index);
+    pub fn push_rust_fn(&mut self, _f: fn(&mut GlobalState) -> i32, tag: usize) {
+        self.push_light_userdata(tag as *mut std::ffi::c_void);
+    }
+
+    pub fn load_filex(&mut self, filename: Option<&str>, mode: Option<&str>) -> i32 {
+        let chunk_name = filename
+            .map(|f| format!("@{}", f))
+            .unwrap_or_else(|| "=stdin".to_string());
+
+        let mut bytes = match filename {
+            Some(name) => match std::fs::read(name) {
+                Ok(b) => b,
+                Err(err) => {
+                    self.push_fstring(&format!("cannot open {}: {}", name, err));
+                    return ERR_FILE;
                 }
+            },
+            None => {
+                let mut buf = Vec::new();
+                if let Err(err) = std::io::stdin().read_to_end(&mut buf) {
+                    self.push_fstring(&format!("cannot read stdin: {}", err));
+                    return ERR_FILE;
+                }
+                buf
             }
-        }
+        };
 
-        for obj_val in to_finalize {
-            let gc_func = match &obj_val {
-                TValue::Table(t) => {
-                    let data = t.data.borrow();
-                    if let Some(ref mt) = data.metatable {
-                        mt.get(&gc_key)
-                    } else {
-                        None
-                    }
-                }
-                TValue::UserData(u) => {
-                    if let Some(ref mt) = u.metatable {
-                        mt.get(&gc_key)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-            let gc_func = match gc_func {
-                Some(f) => f,
-                None => continue,
-            };
-
-            // 收集 finalizer 函数的 upvalue 的 Rc 指针，用于后续同步
-            let finalizer_uv_ptrs: Vec<usize> = if let TValue::LClosure(c) = &gc_func {
-                c.upvals
-                    .borrow()
-                    .iter()
-                    .map(|uv_ref| Rc::as_ptr(uv_ref) as usize)
-                    .collect()
-            } else {
-                Vec::new()
-            };
-
-            let stack_base = self.stack.len();
-            let saved_base = self.base;
-            let saved_pc = self.pc;
-            let saved_closure_upvals = Rc::clone(&self.closure_upvals);
-            let saved_proto_flag = self.proto_flag;
-            let saved_nextraargs = self.nextraargs;
-            self.stack.push(gc_func);
-            self.stack.push(obj_val);
-            self.top = self.stack.len();
-
-            self.call_info.push(CallInfoEntry {
-                is_c: false,
-                closure: None,
-                base: self.base,
-                saved_pc: self.pc,
-                name: Some("__gc"),
-                namewhat: "metamethod",
-                proto_flag: self.proto_flag,
-                nextraargs: self.nextraargs,
-                is_tailcall: false,
-            });
-
-            let status = self.pcall(1, 0, 0);
-            // finalizer 中 error 时生成 warning（对应 C 的 luaE_warnerror(L, "__gc")）
-            // os.exit(code, true) 在 finalizer 中设置 exit_requested 并用
-            // "__exit_requested__" 错误中断 pcall，这是正常退出流程，不生成 warning
-            if status != 0 && self.exit_requested.is_none() {
-                let msg = match self.stack.last() {
-                    Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
-                        lua_string_as_str(s).to_string()
-                    }
-                    _ => "error object is not a string".to_string(),
-                };
-                self.g_mut().warning("error in ", true);
-                self.g_mut().warning("__gc", true);
-                self.g_mut().warning(" (", true);
-                self.g_mut().warning(&msg, true);
-                self.g_mut().warning(")", false);
-            }
-
-            self.stack.truncate(stack_base);
-            self.call_info.pop();
-            self.top = stack_base;
-            self.base = saved_base;
-            self.pc = saved_pc;
-            self.closure_upvals = saved_closure_upvals;
-            self.proto_flag = saved_proto_flag;
-            self.nextraargs = saved_nextraargs;
-
-            // 同步 finalizer 函数的 closed upvalue 值回主线程栈
-            // finalizer 可能修改了 closed upvalue 的值（如 collected = true），
-            // 需要同步回主线程栈上的原始位置（upval_origins 记录的 stack_index）
-            for uv_ptr in &finalizer_uv_ptrs {
-                if let Some(&stack_index) = upval_origins_map.get(uv_ptr) {
-                    // 通过 Rc 指针找到对应的 upvalue，读取当前值
-                    // 遍历栈上的协程找到该 upvalue 的 Rc 引用
-                    let mut found_val = None;
-                    'outer: for val in self.stack.iter() {
-                        if let TValue::Thread(t) = val {
-                            let origins = t.context.borrow().upval_origins.clone();
-                            for (uv_ref, _idx) in &origins {
-                                if Rc::as_ptr(uv_ref) as usize == *uv_ptr {
-                                    let uv = uv_ref.borrow();
-                                    if let UpVal::Closed { value } = &*uv {
-                                        found_val = Some(value.clone());
-                                    }
-                                    break 'outer;
-                                }
-                            }
-                        }
-                    }
-                    if let Some(val) = found_val {
-                        if stack_index < self.stack.len() {
-                            self.stack[stack_index] = val;
-                        }
-                    }
-                }
-            }
-        }
+        self.load_bytes(&mut bytes, &chunk_name, mode)
     }
 }
 
@@ -2762,213 +2441,6 @@ impl<'a> LuaState<'a> {
         }
     }
 
-    /// 关闭状态：调用所有注册了 __gc 的对象的 finalizer（不检查可达性）。
-    /// 对应 C 的 close_state → luaC_freeallobjects → separatetobefnz(1) + callallpendingfinalizers。
-    /// finobj_list 末尾是后创建的对象，按逆序调用（后创建先调用）。
-    pub fn close_state(&mut self) {
-        // 已在关闭中：finalizer 中调用 os.exit(close=true) 重入，不再处理
-        if self.gc_closing {
-            return;
-        }
-        self.g_mut().gc_closing = true;
-        // 关闭所有 to-be-closed 变量（对应 C 的 luaD_closeprotected(L, 1, LUA_OK)）
-        // C 版 close_state 调用 luaD_closeprotected(L, 1, LUA_OK) 关闭从栈位置 1 开始的
-        // 所有 upvalues，触发 TBC 变量的 __close 元方法。忽略错误继续关闭。
-        let _ = crate::func::close(self, 1, 0, 0);
-        // 按创建逆序调用 finalizer（后创建的先调用）
-        let mut to_finalize: Vec<TValue> = Vec::new();
-        for t in self.finobj_list.borrow_mut().drain(..).rev() {
-            to_finalize.push(TValue::Table(t));
-        }
-        for u in self.ud_finobj_list.borrow_mut().drain(..).rev() {
-            to_finalize.push(TValue::UserData(u));
-        }
-        self.call_finalizers(to_finalize);
-        // finalizer 中可能调用 os.exit(code, true) 设置 exit_requested
-        if let Some(code) = self.exit_requested {
-            std::process::exit(code);
-        }
-    }
-
-    pub fn traceback(&mut self, msg: &str, _level: usize) {
-        let trace = format!("stack traceback:\n\t...\n{}", msg);
-        self.push_string(&trace);
-    }
-
-    pub fn push_rust_fn(&mut self, _f: fn(&mut GlobalState) -> i32, tag: usize) {
-        self.push_light_userdata(tag as *mut std::ffi::c_void);
-    }
-
-    /// 对应 C 的 `luaL_loadfilex`：从文件或 stdin 加载 Lua 代码。
-    ///
-    /// - `filename` 为 `Some(path)` 时读取文件；为 `None` 时读取 stdin。
-    /// - `mode` 用于控制是否允许文本/二进制块（当前仅文本块可实际加载）。
-    ///
-    /// 成功时返回 0，并将主闭包压入栈顶；失败时压入错误信息并返回错误码。
-    pub fn load_filex(&mut self, filename: Option<&str>, mode: Option<&str>) -> i32 {
-        let chunk_name = filename
-            .map(|f| format!("@{}", f))
-            .unwrap_or_else(|| "=stdin".to_string());
-
-        let mut bytes = match filename {
-            Some(name) => match std::fs::read(name) {
-                Ok(b) => b,
-                Err(err) => {
-                    self.push_fstring(&format!("cannot open {}: {}", name, err));
-                    return ERR_FILE;
-                }
-            },
-            None => {
-                let mut buf = Vec::new();
-                if let Err(err) = std::io::stdin().read_to_end(&mut buf) {
-                    self.push_fstring(&format!("cannot read stdin: {}", err));
-                    return ERR_FILE;
-                }
-                buf
-            }
-        };
-
-        self.load_bytes(&mut bytes, &chunk_name, mode)
-    }
-
-    /// 增量 GC 步进
-    /// - siz=0: 无参数 collectgarbage("step")，C Lua 强制执行一步基本 GC。
-    ///   generational 模式下一步 = minor collection（清除弱表等）。
-    ///   本实现未实现 minor collection，故做 full collection 保证语义正确
-    ///   （gengc.lua:122 依赖 step 清除弱表）。
-    /// - siz>0: 带参数 collectgarbage("step", N)，增量累积 N 字节工作量，
-    ///   达到 active_count 阈值才触发完整 GC。大多数 step 只累积不触发，P95 接近 0。
-    pub fn step_gc(&mut self, siz: usize) -> bool {
-        if siz == 0 {
-            gc_trigger_inc(GcTrigger::Step);
-            self.collect_gc();
-            unsafe { self.g_mut().gc.as_mut().step_accum.set(0) };
-            true
-        } else {
-            let acc = unsafe { self.g_mut().gc.as_mut().step_accum.get() } + siz;
-            let threshold = unsafe { self.g_mut().gc.as_mut().active_count().max(1) };
-            if acc >= threshold {
-                gc_trigger_inc(GcTrigger::Step);
-                self.collect_gc();
-                unsafe { self.g_mut().gc.as_mut().step_accum.set(0) };
-                true
-            } else {
-                unsafe { self.g_mut().gc.as_mut().step_accum.set(acc) };
-                false
-            }
-        }
-    }
-
-    /// 收集需要 finalize 的对象并"复活"它们 — 在 clear_weak_tables 之前调用
-    /// 找到 finobj_list 中不可达且有 __gc 的对象，标记它们为可达（"复活"），
-    /// 并把它们的引用对象加入工作列表。返回 to_finalize 列表供 call_finalizers 调用。
-    /// 对应 C Lua 的 finalizer 对象"复活"语义：finalizer 执行时对象仍可达。
-    /// 注意：此处不保存 __gc 函数引用，因为 clear_weak_tables 可能清除弱值表中的
-    /// __gc 函数（当函数本身不可达时）。call_finalizers 会重新检查 __gc 是否存在。
-    fn collect_finalizers(
-        &mut self,
-        reachable: &mut GcHashSet,
-        visited: &mut GcHashSet,
-        worklist: &mut Vec<RawTValue<'a>>,
-        extra_size: &mut usize,
-    ) -> Vec<TValue<'a>> {
-        let gc_key = self.gc_key_cached();
-        let mut to_finalize: Vec<TValue> = Vec::new();
-        let mut keep: Vec<Table> = Vec::new();
-
-        for t in self.finobj_list.borrow_mut().drain(..) {
-            let is_reachable = t
-                .data
-                .borrow()
-                .gc_header
-                .id()
-                .map_or(false, |id| reachable.contains(&(id.0 as usize)));
-            if is_reachable {
-                keep.push(t);
-                continue;
-            }
-            let has_gc = {
-                let data = t.data.borrow();
-                if let Some(ref mt) = data.metatable {
-                    mt.get(&gc_key).is_some()
-                } else {
-                    false
-                }
-            };
-            if has_gc {
-                // to_finalize 持有 owned TValue（需 incq），worklist 用 RawTValue（无 incq）
-                to_finalize.push(TValue::Table(t.clone()));
-                let tv = TValue::Table(t);
-                unsafe { worklist.push(raw_from_tvalue(&tv)) };
-                drop(tv); // to_finalize 已持有 clone，此处正常 decq 避免泄漏
-            }
-        }
-        *self.finobj_list.borrow_mut() = keep;
-
-        let mut ud_keep: Vec<MyRc<crate::objects::Udata, SlotAlloc>> = Vec::new();
-        for u in self.ud_finobj_list.borrow_mut().drain(..) {
-            let is_reachable = u
-                .gc_header
-                .id()
-                .map_or(false, |id| reachable.contains(&(id.0 as usize)));
-            if is_reachable {
-                ud_keep.push(u);
-                continue;
-            }
-            let has_gc = {
-                if let Some(ref mt) = u.metatable {
-                    mt.get(&gc_key).is_some()
-                } else {
-                    false
-                }
-            };
-            if has_gc {
-                to_finalize.push(TValue::UserData(u.clone()));
-                let tv = TValue::UserData(u);
-                unsafe { worklist.push(raw_from_tvalue(&tv)) };
-                drop(tv); // to_finalize 已持有 clone，此处正常 decq 避免泄漏
-            }
-        }
-        *self.ud_finobj_list.borrow_mut() = ud_keep;
-
-        while let Some(raw) = worklist.pop() {
-            let val = unsafe { raw_as_tvalue(&raw) };
-            self.mark_tvalue(val, reachable, visited, worklist, extra_size);
-        }
-
-        to_finalize
-    }
-
-    /// 当 metas 大小超过动态阈值时自动触发 GC
-    /// 使用 total_estimate（含无 gc_header 对象的 extra_estimate）判断阈值，
-    /// 使 GC 触发更准确反映真实内存占用
-    pub fn maybe_collect_gc(&mut self) {
-        if unsafe { self.g_mut().gc.as_mut().is_running() }
-            && unsafe { self.g_mut().gc.as_mut().total_estimate() }
-                > unsafe { self.g_mut().gc.as_mut().collect_threshold() }
-        {
-            gc_trigger_inc(GcTrigger::Maybe);
-            self.collect_gc();
-        }
-    }
-
-    /// 字符串拼接的 GC 检查：字符串不注册到 GC metas，metas_len 无法反映
-    /// 拼接产生的分配压力，因此用计数器限制：每 concat_gc_interval 次 op_concat
-    /// 触发一次 collect_gc，清理弱引用表中的死条目。
-    pub fn concat_gc_check(&mut self) {
-        let cnt = self.concat_gc_counter.get() + 1;
-        if cnt >= self.concat_gc_interval.get() {
-            gc_trigger_inc(GcTrigger::Concat);
-            self.collect_gc();
-            self.concat_gc_counter.set(0);
-        } else {
-            self.concat_gc_counter.set(cnt);
-        }
-    }
-}
-
-impl<'a> LuaState<'a> {
-    /// 返回指定栈位置值的类型名 — 对应 C 的 luaL_typename
     pub fn typename_at(&self, idx: isize) -> &'static str {
         self.typename(self.get_type(idx))
     }
@@ -2977,584 +2449,6 @@ impl<'a> LuaState<'a> {
         self.load_filex(fname, None)
     }
 }
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {}
-
-impl<'a> LuaState<'a> {
-    fn collect_gc_inner(&mut self) {
-        let active = unsafe { self.g_mut().gc.as_mut().active_count() };
-        // GC 统计：重置类型计数（保留 gc_cycles 累计），记录本次 GC 的类型分布
-        if gc_stats_enabled() {
-            GC_STATS.with(|cell| {
-                let mut s = cell.get();
-                s.table = 0;
-                s.table_with_mt = 0;
-                s.lclosure = 0;
-                s.lclosure_with_upvals = 0;
-                s.cclosure = 0;
-                s.rust_closure = 0;
-                s.thread = 0;
-                s.userdata = 0;
-                s.proto = 0;
-                s.short_string = 0;
-                cell.set(s);
-            });
-        }
-        // 预分配可达集容量 — 估计可达对象约为活跃对象的 60%（其余是垃圾）
-        // 过大预分配会增加内存压力（500K 对象 * 8B = 4MB/集），反而变慢
-        let est_reachable = (active * 3 / 5).max(64);
-        let mut reachable: GcHashSet =
-            GcHashSet::with_capacity_and_hasher(est_reachable, FxBuildHasher::default());
-        let mut visited: GcHashSet =
-            GcHashSet::with_capacity_and_hasher(est_reachable, FxBuildHasher::default());
-        // worklist 预分配为估计可达对象的 2 倍（根 + 一层引用）
-        // perf: 用 RawTValue（16字节值拷贝）替代 TValue clone，消除 push/pop 的 Rc incq/decq。
-        // GC 期间所有对象有效（sweep 在 mark 完成后），无需调整引用计数。
-        let mut worklist: Vec<RawTValue> = Vec::with_capacity(est_reachable * 2);
-
-        // 收集根：本线程（栈/上值/帧闭包/hook/wrap 调用者栈）
-        self.collect_roots_into(&mut worklist);
-
-        // 收集根：全局表、registry
-        // 这两处仍需 clone（创建临时 TValue），但只有 2 个调用，非热点
-        {
-            let tv = TValue::Table(self.globals.clone());
-            unsafe { worklist.push(raw_from_tvalue(&tv)) };
-            drop(tv); // RawTValue 已拷贝字节；此处正常 decq，引用由 self.globals 保持
-        }
-        {
-            let tv = TValue::Table(self.registry.clone());
-            unsafe { worklist.push(raw_from_tvalue(&tv)) };
-            drop(tv);
-        }
-
-        // 收集根：主线程执行态（对应 C 的 G.mainthread —— C 中主线程始终是 GC 根）。
-        // 协程运行时主线程挂起，其栈仍必须标记（协程对象本身挂在主线程栈上，
-        // 由主线程栈可达性传递到各协程）。
-        let main_ptr = match self.owner.as_ref() {
-            Some(b) => (*b).main,
-            None => unsafe { (*self.l_g).main },
-        };
-        if !main_ptr.is_null() && main_ptr != (self as *const LuaState<'a> as *mut LuaState<'a>) {
-            unsafe { (*main_ptr).collect_roots_into(&mut worklist) };
-        }
-        // 主线程对象自身的 function（capi 线程可能带 function）
-        self.collect_thread_roots(&self.main_thread, &mut worklist);
-
-        // extra_size: 累加无 gc_header 的可达对象（Proto/CClosure/RustClosure/Thread）的
-        // gc_mem_size()，用于 collect_gc 后重算 gc_extra_estimate。
-        // 长串不在此累加（用 ptr_id 去重困难），短串在 sweep 后遍历 string_table 累加。
-        let mut extra_size: usize = 0;
-
-        // 处理工作列表
-        // perf: pop RawTValue（无 drop），unsafe 重建 &TValue 引用
-        while let Some(raw) = worklist.pop() {
-            let val = unsafe { raw_as_tvalue(&raw) };
-            self.mark_tvalue(
-                val,
-                &mut reachable,
-                &mut visited,
-                &mut worklist,
-                &mut extra_size,
-            );
-        }
-
-        // ephemeron 表传递性处理：对于弱键表，如果值可达，则保留键。
-        // 对应 C Lua 的 traverseephemeron + convergeephemerons。
-        // 迭代直到收敛：值可达 → 标记键 → 键引用的对象可达 → 可能导致其他值可达...
-        self.process_ephemerons(&mut reachable, &mut visited, &mut worklist, &mut extra_size);
-
-        // 收集需要 finalize 的对象并"复活"它们 — 在 clear_weak_tables 之前调用。
-        // 对应 C Lua 的 finalizer 对象"复活"语义：finalizer 执行时对象仍可达，
-        // 其引用的对象也应被标记，然后才能清除弱表（避免误清除 finalizer 引用的弱表条目）。
-        let to_finalize =
-            self.collect_finalizers(&mut reachable, &mut visited, &mut worklist, &mut extra_size);
-
-        // 复活后可能引入新的 ephemeron 关系，再次处理 ephemeron 直到收敛
-        self.process_ephemerons(&mut reachable, &mut visited, &mut worklist, &mut extra_size);
-
-        // 清理弱引用表：基于标记结果清除死亡的弱引用键/值
-        self.g_mut().clear_weak_tables(&reachable);
-
-        // 调用 finalizer — 复活的对象已标记，此处执行 __gc 元方法
-        // call_finalizers 内部会在 finalizer 调用后同步 closed upvalue 值回主线程栈
-        self.call_finalizers(to_finalize);
-
-        // 清扫（sweep_unreachable 会自动减少 gc_estimate）
-        unsafe { self.g_mut().gc.as_mut().sweep_unreachable(&reachable) };
-
-        // 协程回收：RustClosure 的 upvalues[0] 持有 Thread，由 mark_tvalue 遍历。
-        // 协程可达性完全由 RustClosure 引用决定，无需额外清理（与原 wrap_coros 机制不同）。
-        // 当 RustClosure 不可达时，upvalues[0] 的 Thread 自动被回收。
-
-        // 清理字符串表：移除只有字符串表持有的死字符串
-        // 对应 C Lua 的 sweepstrings；字符串不注册到 GC metas，需单独清理
-        let str_sweep_start = if gc_stats_enabled() {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        self.string_table.sweep();
-        if let Some(start) = str_sweep_start {
-            let elapsed = start.elapsed().as_micros() as u64;
-            GC_TIME_STATS.with(|cell| {
-                let mut s = cell.get();
-                s.str_sweep_us += elapsed;
-                cell.set(s);
-            });
-        }
-
-        // 累加 string_table 中存活短串的 gc_mem_size() 到 extra_size。
-        // 短串由 string_table 管理（无 gc_header），需在此遍历计费。
-        // 长串由 Arc 引用计数管理（Box<LongString> 每次 clone 独立内存），
-        //   不在此累加（ptr_id 去重困难且长串通常数量少），偏差可容忍。
-        //
-        // 优化：缓存 (string_table_ptr, nuse, str_extra_size)。
-        //   nuse 没变时（没有新短串 intern，也没有死短串释放），短串总占用不变，跳过遍历。
-        //   1589 次 GC 中，大部分 GC 间 nuse 不变（稳定状态），可省 19% GC 时间。
-        let str_for_each_start = if gc_stats_enabled() {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let nuse = self.string_table.count();
-        let table_ptr = &self.string_table as *const _ as usize;
-        let cached = STR_EXTRA_CACHE.with(|c| c.get());
-        let short_string_count: u64;
-        if cached.0 == table_ptr && cached.1 == nuse {
-            // nuse 没变，复用缓存的 str_extra
-            extra_size += cached.2;
-            short_string_count = nuse as u64;
-        } else {
-            // nuse 变了或首次，重新遍历
-            let mut str_extra: usize = 0;
-            let mut count: u64 = 0;
-            self.string_table.for_each(|ss| {
-                str_extra +=
-                    std::mem::size_of::<crate::strings::ShortStringFixed>() + ss.len as usize + 16;
-                count += 1;
-            });
-            extra_size += str_extra;
-            STR_EXTRA_CACHE.with(|c| c.set((table_ptr, nuse, str_extra)));
-            short_string_count = count;
-        }
-        if let Some(start) = str_for_each_start {
-            let elapsed = start.elapsed().as_micros() as u64;
-            GC_TIME_STATS.with(|cell| {
-                let mut s = cell.get();
-                s.str_for_each_us += elapsed;
-                cell.set(s);
-            });
-        }
-        gc_stats_inc(|s| {
-            s.short_string += short_string_count;
-        });
-
-        // 重算 extra_estimate：反映当前可达的无 gc_header 对象的内存占用
-        unsafe { self.g_mut().gc.as_mut().set_extra_estimate(extra_size) };
-
-        // 自适应 GC 阈值：根据本次 GC 的回收效率动态调整阈值倍数
-        // all.lua 实测 76% 的 GC freed=0（对象都在使用，纯浪费），此优化大幅减少无效 GC。
-        // freed_ratio = 释放对象数 / GC 前活跃对象数
-        //   < 5%   : 几乎没回收 → pause * 2（阈值 = estimate * 4，推迟下次 GC）
-        //   < 20%  : 回收少     → pause * 3/2（阈值 = estimate * 3）
-        //   >= 20% : 正常回收   → pause（阈值 = estimate * 2，默认）
-        // 限制：effective_pause 上限 1000（避免阈值过高导致内存暴涨）
-        let pause = unsafe {
-            self.g_mut()
-                .gc
-                .as_mut()
-                .get_gc_param(GCState::PARAM_PAUSE)
-                .max(1)
-        } as usize;
-        let active_after = unsafe { self.g_mut().gc.as_mut().active_count() };
-        let freed = active.saturating_sub(active_after);
-        let freed_ratio = if active > 0 {
-            freed as f64 / active as f64
-        } else {
-            1.0 // 无活跃对象视为正常
-        };
-        let effective_pause = if freed_ratio < 0.05 {
-            (pause * 2).min(1000)
-        } else if freed_ratio < 0.20 {
-            (pause * 3 / 2).min(1000)
-        } else {
-            pause
-        };
-        let new_threshold =
-            unsafe { self.g_mut().gc.as_mut().total_estimate() } * effective_pause / 100;
-        unsafe {
-            self.g_mut()
-                .gc
-                .as_mut()
-                .set_collect_threshold(new_threshold)
-        };
-        unsafe { self.g_mut().gc.as_mut().set_debt(100) };
-        unsafe { self.g_mut().gc.as_mut().step_accum.set(0) };
-
-        // GC 统计输出：累计统计 + 本次 GC 的可达/活跃对象数
-        if gc_stats_enabled() {
-            let reachable_count = reachable.len() as u64;
-            let active_count = active as u64;
-            gc_stats_inc(|s| {
-                s.gc_cycles += 1;
-                s.reachable_total = reachable_count;
-                s.active_total = active_count;
-            });
-            GC_STATS.with(|cell| {
-                let s = cell.get();
-                // 可能循环引用的对象 = Table + LClosure + CClosure + RustClosure + Thread + UserData
-                // （这些对象持有 GC 对象引用，可能形成 Rc 循环）
-                let cyclic =
-                    s.table + s.lclosure + s.cclosure + s.rust_closure + s.thread + s.userdata;
-                // 非循环对象 = Proto + ShortString（叶子或单向引用）
-                let non_cyclic = s.proto + s.short_string;
-                let total = cyclic + non_cyclic;
-                eprintln!(
-                    "[GC stats] cycle={} reachable={} active={} freed={} | \
-                     Table={} (with_mt={}) LClosure={} (with_upvals={}) CClosure={} RustClosure={} \
-                     Thread={} UserData={} | cyclic={} non_cyclic={} | Proto={} ShortString={}",
-                    s.gc_cycles,
-                    s.reachable_total,
-                    s.active_total,
-                    s.active_total.saturating_sub(s.reachable_total),
-                    s.table,
-                    s.table_with_mt,
-                    s.lclosure,
-                    s.lclosure_with_upvals,
-                    s.cclosure,
-                    s.rust_closure,
-                    s.thread,
-                    s.userdata,
-                    cyclic,
-                    non_cyclic,
-                    s.proto,
-                    s.short_string,
-                );
-                let pct = if total > 0 {
-                    cyclic as f64 * 100.0 / total as f64
-                } else {
-                    0.0
-                };
-                eprintln!(
-                    "[GC stats] cyclic_ratio={:.2}% (cyclic={} / total={})",
-                    pct, cyclic, total
-                );
-                // 输出 GC 触发源统计
-                GC_TRIGGER_STATS.with(|cell| {
-                    let t = cell.get();
-                    eprintln!(
-                        "[GC stats] triggers: maybe={} concat={} step={} explicit={}",
-                        t.maybe, t.concat, t.step, t.explicit
-                    );
-                });
-            });
-        }
-    }
-
-    fn mark_tvalue(
-        &self,
-        val: &TValue<'a>,
-        reachable: &mut GcHashSet,
-        visited: &mut GcHashSet,
-        worklist: &mut Vec<RawTValue<'a>>,
-        extra_size: &mut usize,
-    ) {
-        match val {
-            TValue::Table(t) => {
-                if let Some(id) = t.data.borrow().gc_header.id() {
-                    reachable.insert(id.0 as usize);
-                }
-                let ptr_id = t.data.borrow().gc_header.ptr_id;
-                if visited.insert(ptr_id as usize) {
-                    let data = t.data.borrow();
-                    let (weak_k, weak_v) = match &data.metatable {
-                        Some(mt) => {
-                            let mode_key = self.mode_key_cached();
-                            match mt.get(&mode_key) {
-                                Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
-                                    let mode = lua_string_as_str(&s);
-                                    (mode.contains('k'), mode.contains('v'))
-                                }
-                                _ => (false, false),
-                            }
-                        }
-                        None => (false, false),
-                    };
-                    // GC 统计：Table + 有 metatable 的 Table
-                    let has_mt = data.metatable.is_some();
-                    gc_stats_inc(|s| {
-                        s.table += 1;
-                        if has_mt {
-                            s.table_with_mt += 1;
-                        }
-                    });
-                    for v in data.array.iter() {
-                        if !weak_v && needs_gc_mark(v) {
-                            unsafe { worklist.push(raw_from_tvalue(v)) };
-                        }
-                    }
-                    for (k, v) in data.hash_buckets.iter() {
-                        if !weak_k && needs_gc_mark(k) {
-                            unsafe { worklist.push(raw_from_tvalue(k)) };
-                        }
-                        if !weak_k && !weak_v && needs_gc_mark(v) {
-                            unsafe { worklist.push(raw_from_tvalue(v)) };
-                        }
-                    }
-                    if let Some(ref mt) = data.metatable {
-                        // 提前检查 visited，避免已访问的 metatable 被 push/pop
-                        // （多表共享同一 metatable 时显著减少 worklist 操作）
-                        let mt_ptr = mt.data.borrow().gc_header.ptr_id as usize;
-                        if !visited.contains(&mt_ptr) {
-                            let tv = TValue::Table((**mt).clone());
-                            unsafe { worklist.push(raw_from_tvalue(&tv)) };
-                            drop(tv); // metatable 仍由 data 持有；正常 decq 避免泄漏
-                        }
-                    }
-                }
-            }
-            TValue::LClosure(c) => {
-                if let Some(id) = c.gc_header.id() {
-                    reachable.insert(id.0 as usize);
-                }
-                let ptr_id = c.gc_header.ptr_id;
-                if visited.insert(ptr_id as usize) {
-                    // Proto 无 gc_header，通过 LClosure.proto 的 Rc 引用管理生命周期。
-                    // 累加 proto.gc_mem_size() 到 extra_size，使 GC estimate 含 Proto 内存。
-                    *extra_size += c.proto.gc_mem_size();
-                    let upvals = c.upvals.borrow();
-                    // GC 统计：LClosure + Proto + 有 upvalues 的 LClosure
-                    let upvals_len = upvals.len();
-                    gc_stats_inc(|s| {
-                        s.lclosure += 1;
-                        s.proto += 1;
-                        if upvals_len > 0 {
-                            s.lclosure_with_upvals += 1;
-                        }
-                    });
-                    for uv_ref in upvals.iter() {
-                        let uv = uv_ref.borrow();
-                        match &*uv {
-                            UpVal::Closed { value } => {
-                                if needs_gc_mark(value) {
-                                    unsafe { worklist.push(raw_from_tvalue(value)) };
-                                }
-                            }
-                            UpVal::Open { stack_index, .. } => {
-                                if *stack_index < self.stack.len() {
-                                    let val = &self.stack[*stack_index];
-                                    if needs_gc_mark(val) {
-                                        unsafe { worklist.push(raw_from_tvalue(val)) };
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            TValue::CClosure(cc) => {
-                // CClosure 没有 gc_header，用 Rc 指针地址做 visited 去重 + reachable 标记。
-                // 遍历 upvalue 列表，标记其中需要 GC 的对象（如 UserData）。
-                // 这对 C 模块（如 lua-cjson）至关重要：config UserData 作为 CClosure
-                // 的 upvalue 存储，若不遍历 CClosure，config 会被误判为不可达，
-                // __gc 释放其内部 buffer 后，后续访问导致 use-after-free。
-                let ptr = cc.as_raw_ptr() as usize;
-                if visited.insert(ptr) {
-                    reachable.insert(ptr);
-                    *extra_size += cc.gc_mem_size();
-                    // GC 统计：CClosure
-                    gc_stats_inc(|s| {
-                        s.cclosure += 1;
-                    });
-                    for uv in &cc.upvalue {
-                        if needs_gc_mark(uv) {
-                            unsafe { worklist.push(raw_from_tvalue(uv)) };
-                        }
-                    }
-                }
-            }
-            TValue::RustClosure(rc) => {
-                // RustClosure 没有 gc_header，用 Rc 指针地址做 visited 去重 + reachable 标记。
-                // 遍历 upvalues，标记其中需要 GC 的对象（如 Thread、Table）。
-                // 对 coroutine.wrap 至关重要：upvalues[0] 是 Thread，若不遍历，
-                // 协程会被误判为不可达，导致运行中协程被 GC 回收。
-                // reachable 标记让弱表中的 RustClosure 能被正确判断可达性
-                // （coroutine.lua:478 测试 wrap 协程在无外部引用时被 GC 回收）。
-                let ptr = rc.as_raw_ptr() as usize;
-                if visited.insert(ptr) {
-                    reachable.insert(ptr);
-                    *extra_size += rc.gc_mem_size();
-                    // GC 统计：RustClosure
-                    gc_stats_inc(|s| {
-                        s.rust_closure += 1;
-                    });
-                    let upvals = rc.upvalues.borrow();
-                    for uv in upvals.iter() {
-                        if needs_gc_mark(uv) {
-                            unsafe { worklist.push(raw_from_tvalue(uv)) };
-                        }
-                    }
-                }
-            }
-            TValue::UserData(u) => {
-                if let Some(id) = u.gc_header.id() {
-                    reachable.insert(id.0 as usize);
-                }
-                let ptr_id = u.gc_header.ptr_id;
-                if visited.insert(ptr_id as usize) {
-                    // GC 统计：UserData
-                    gc_stats_inc(|s| {
-                        s.userdata += 1;
-                    });
-                    if let Some(ref mt) = u.metatable {
-                        let mt_ptr = mt.data.borrow().gc_header.ptr_id as usize;
-                        if !visited.contains(&mt_ptr) {
-                            let tv = TValue::Table((**mt).clone());
-                            unsafe { worklist.push(raw_from_tvalue(&tv)) };
-                            drop(tv); // metatable 仍由 data 持有；正常 decq 避免泄漏
-                        }
-                    }
-                    for uv in &u.user_values {
-                        if needs_gc_mark(uv) {
-                            unsafe { worklist.push(raw_from_tvalue(uv)) };
-                        }
-                    }
-                }
-            }
-            TValue::Thread(t) => {
-                let ptr = Rc::as_ptr(&t.context) as usize;
-                if visited.insert(ptr) {
-                    reachable.insert(ptr);
-                    *extra_size += t.gc_mem_size();
-                    // GC 统计：Thread（总是可能循环：栈引用闭包，闭包 upvalue 引用回 Thread）
-                    gc_stats_inc(|s| {
-                        s.thread += 1;
-                    });
-                    self.collect_thread_roots(t, worklist);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    /// ephemeron 表传递性处理 — 在标记阶段后、清理弱表前调用。
-    /// 对应 C Lua 的 traverseephemeron + convergeephemerons。
-    /// 对于纯弱键表（__mode = "k"）：
-    ///   - 值可达 → 保留键（标记键引用的对象）
-    ///   - 键可达 → 标记值（值引用的对象变为可达）
-    /// 迭代直到收敛。
-    /// 注意：弱键值表（__mode = "kv"）不参与 ephemeron 传递性，其键和值都按弱引用独立判断。
-    fn process_ephemerons(
-        &self,
-        reachable: &mut GcHashSet,
-        visited: &mut GcHashSet,
-        worklist: &mut Vec<RawTValue<'a>>,
-        extra_size: &mut usize,
-    ) {
-        let mode_key = self.mode_key_cached();
-        let mut changed = true;
-        while changed {
-            changed = false;
-            for weak_rc in self.weak_tables.borrow().iter() {
-                let data_rc = match weak_rc.upgrade() {
-                    None => continue,
-                    Some(rc) => rc,
-                };
-                let (weak_k, weak_v) = {
-                    let data = data_rc.borrow();
-                    match &data.metatable {
-                        Some(mt) => match mt.get(&mode_key) {
-                            Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
-                                let mode = lua_string_as_str(&s);
-                                (mode.contains('k'), mode.contains('v'))
-                            }
-                            _ => (false, false),
-                        },
-                        None => (false, false),
-                    }
-                };
-                // 只处理纯弱键表（ephemeron 表）：weak_k && !weak_v
-                // 弱键值表的键和值都按弱引用独立判断，不参与 ephemeron 传递性
-                if !(weak_k && !weak_v) {
-                    continue;
-                }
-                let data = data_rc.borrow();
-                for (k, v) in data.hash_buckets.iter() {
-                    let k_reachable = is_marked(k, reachable);
-                    let v_reachable = is_marked(v, reachable);
-                    if v_reachable && !k_reachable {
-                        let v_is_gc = matches!(
-                            v,
-                            TValue::Table(_) | TValue::LClosure(_) | TValue::UserData(_)
-                        );
-                        if v_is_gc {
-                            let k_id = match k {
-                                TValue::Table(t) => t.data.borrow().gc_header.id(),
-                                TValue::LClosure(c) => c.gc_header.id(),
-                                TValue::UserData(u) => u.gc_header.id(),
-                                _ => None,
-                            };
-                            if let Some(id) = k_id {
-                                reachable.insert(id.0 as usize);
-                            }
-                            unsafe { worklist.push(raw_from_tvalue(k)) };
-                            changed = true;
-                        }
-                    }
-                    if k_reachable && !v_reachable {
-                        unsafe { worklist.push(raw_from_tvalue(v)) };
-                        changed = true;
-                    }
-                }
-            }
-            while let Some(raw) = worklist.pop() {
-                let val = unsafe { raw_as_tvalue(&raw) };
-                self.mark_tvalue(val, reachable, visited, worklist, extra_size);
-            }
-        }
-    }
-}
-
-impl<'a> LuaState<'a> {}
 
 // ============================================================================
 // GlobalState — 共享(跨协程)全局字段（= C 的 global_State）
@@ -3625,7 +2519,7 @@ pub struct GlobalState<'a> {
     /// 对应 C 的 luaL_Stream 中存储的 FILE*。UserData 本身不存数据，通过此 map 关联。
     /// Rc 共享：所有 thread 共享同一份句柄表（对应 C 中 FILE* 存于 userdata/registry）
     pub file_handles:
-        Rc<RefCell<std::collections::HashMap<u32, *mut libc::FILE, crate::objects::FxBuildHasher>>>,
+        Rc<RefCell<std::collections::HashMap<u32, TValue<'a>, crate::objects::FxBuildHasher>>>,
     /// 标记哪些文件句柄是 io.popen 创建的（关闭时用 pclose 而非 fclose）
     /// 对应 C 的 LStream.closef = &io_pclose
     /// Rc 共享：同 file_handles
@@ -3847,29 +2741,24 @@ impl<'a> GlobalState<'a> {
         // 分配器宿主先建立：槽自此刻起地址稳定且非 null，供本函数内所有早期
         // 对象（memerrmsg / globals / registry / main_thread）使用——
         // 这消除了「构造期尚无槽 → 传 null → 退回 std::alloc」的旧兜底。
+        // 宿主为共享句柄：`GlobalShared` 持一份（GC 存储与其释放宿主同生共死），
+        // `mem` 持一份（lmem 路由），二者指向同一内层分配器。
         let alloc = crate::mem::AllocOwner::new(allocator);
         let alloc_slot = SlotAlloc::from_owner(&alloc);
         let string_table = Rc::new(StringTable::new());
-        let global_state: Rc<RefCell<GlobalShared<'a>>> = Rc::new(RefCell::new(GlobalShared {
-            gcstopem: false,
-            gc: GCState::default_incremental(),
-            memerrmsg: crate::strings::new_lstr(
-                alloc_slot,
-                &string_table,
-                crate::strings::MEMERRMSG,
-            ),
-        }));
+        let global_state: Rc<RefCell<GlobalShared<'a>>> = Rc::new(RefCell::new(GlobalShared::new(
+            alloc.clone(),
+            &string_table,
+        )));
         let gs = &mut global_state.borrow_mut();
         let globals = {
             let t: Table<'a> = Table::new_in(alloc_slot);
-            let id = gs.gc.register_object(t.mem_size());
-            t.data.borrow().gc_header.set_id(id);
+            gs.gc.register_table(&t);
             t
         };
         let registry = {
             let t: Table<'a> = Table::new_in(alloc_slot);
-            let id = gs.gc.register_object(t.mem_size());
-            t.data.borrow().gc_header.set_id(id);
+            gs.gc.register_table(&t);
             t
         };
         registry.set(TValue::Integer(2), TValue::Table(globals.clone()));
@@ -3951,9 +2840,15 @@ impl<'a> LuaState<'a> {
         global_state: Rc<RefCell<GlobalShared<'a>>>,
         string_table: Rc<StringTable>,
     ) -> LuaState<'a> {
-        // 分配器宿主前置：槽稳定且非 null，供 globals/registry/main_thread 复用。
-        let alloc = crate::mem::AllocOwner::new(Box::new(DefaultAllocator));
-        let alloc_slot = SlotAlloc::from_owner(&alloc);
+        // 分配器宿主取自共享块本身：本函数把 globals/registry 注册进 `gs.gc`，
+        // 它们必须由**该块自己的**宿主释放（槽内联在引用计数块里，释放发生在
+        // 宿主的内层 Box 上）。若此处临时新建宿主并随 `GlobalState` 一起析构，
+        // 共享块句柄一旦比执行态活得久，GC 存储里的弱引用就会按已析构宿主释放
+        // = use-after-free。共享宿主后，块与执行态各自持一份，先析构谁都不会悬垂。
+        let (alloc, alloc_slot) = {
+            let shared = global_state.borrow();
+            (shared.alloc.clone(), shared.alloc_slot())
+        };
         let mut gs = global_state.borrow_mut();
         if base > 0 {
             while stack.len() < base {
@@ -3968,15 +2863,13 @@ impl<'a> LuaState<'a> {
 
         let globals = {
             let t = Table::new_in(alloc_slot);
-            let id = gs.gc.register_object(t.mem_size());
-            t.data.borrow().gc_header.set_id(id);
+            gs.gc.register_table(&t);
             t
         };
 
         let registry = {
             let t = Table::new_in(alloc_slot);
-            let id = gs.gc.register_object(t.mem_size());
-            t.data.borrow().gc_header.set_id(id);
+            gs.gc.register_table(&t);
             t
         };
 
@@ -4099,16 +2992,10 @@ fn format_float(f: f64) -> String {
 }
 
 // ============================================================================
-// 高层 API 方法（原 GlobalState）
+// GlobalState — 高层 API
 // ============================================================================
 
 impl<'a> GlobalState<'a> {
-    // ====== Stack ======
-
-    // ====== Push ======
-
-    // ====== Access / Type ======
-
     pub fn typename(&self, tp: LuaType) -> &'static str {
         match tp {
             LuaType::Nil => "nil",
@@ -4186,13 +3073,7 @@ impl<'a> GlobalState<'a> {
         table.set(key, TValue::BuiltinFn(BuiltinFn::impure(func, name_ptr)));
     }
 
-    // ====== Table ======
-
-    // ====== Len ======
-
-    // ====== Check stack ======
-
-    // ====== Garbage Collection ======
+    // ====== GC 控制 ======
 
     pub fn gc_stop(&mut self) {
         unsafe { self.gc.as_mut().gc_stop.set(1) };
@@ -4309,336 +3190,6 @@ impl<'a> GlobalState<'a> {
     pub fn intern_str_owned(&self, s: String) -> TValue<'a> {
         crate::strings::new_lstr_from_string(self.alloc_slot(), &self.string_table, s)
     }
-
-    /// 获取缓存的 "__mode" 字符串键（用于 GC mark_tvalue/process_ephemerons）
-    /// 第一次调用时 intern 并缓存，后续直接返回缓存值。
-    /// 避免每次 mark_tvalue 都做 hash+查找（perf: 节省 ~2%）
-    fn mode_key_cached(&self) -> TValue<'a> {
-        if let Some(ref k) = *self.cached_mode_key.borrow() {
-            return k.clone();
-        }
-        let k = self.intern_str("__mode");
-        *self.cached_mode_key.borrow_mut() = Some(k.clone());
-        k
-    }
-
-    /// 获取缓存的 "__gc" 字符串键（用于 GC collect_finalizers/call_finalizers）
-    fn gc_key_cached(&self) -> TValue<'a> {
-        if let Some(ref k) = *self.cached_gc_key.borrow() {
-            return k.clone();
-        }
-        let k = self.intern_str("__gc");
-        *self.cached_gc_key.borrow_mut() = Some(k.clone());
-        k
-    }
-
-    // ====== 弱引用表管理 ======
-
-    /// 注册弱引用表 — 当 setmetatable 设置包含 __mode 的元表时调用
-    /// 使用 Weak 引用避免阻止表本身的回收
-    pub fn register_weak_table(&mut self, t: &Table<'a>) {
-        self.weak_tables.borrow_mut().push(t.data.downgrade());
-    }
-
-    /// 注册有 __gc 元方法的对象 — 当 setmetatable 设置包含 __gc 的元表时调用
-    pub fn register_finobj(&mut self, t: &Table<'a>) {
-        if self.gc_closing {
-            return;
-        }
-        let ptr_id = t.data.borrow().gc_header.ptr_id;
-        let already = self
-            .finobj_list
-            .borrow()
-            .iter()
-            .any(|x| x.data.borrow().gc_header.ptr_id == ptr_id);
-        if !already {
-            self.finobj_list.borrow_mut().push(t.clone());
-        }
-    }
-
-    /// 注册有 __gc 元方法的 UserData — FILE* 等通过默认元表设置的 userdata
-    /// 存储 Rc<Udata> 引用（而非深拷贝），确保 __gc 在原始 userdata 上调用
-    pub fn register_ud_finobj(&mut self, u: &MyRc<crate::objects::Udata<'a>, SlotAlloc>) {
-        if self.gc_closing {
-            return;
-        }
-        let ptr_id = u.gc_header.ptr_id;
-        let already = self
-            .ud_finobj_list
-            .borrow()
-            .iter()
-            .any(|x| x.gc_header.ptr_id == ptr_id);
-        if !already {
-            self.ud_finobj_list.borrow_mut().push(u.clone());
-        }
-    }
-
-    /// 清理弱引用表 — 在 collect_gc 标记完成后、sweep 之前调用
-    /// 基于 GC reachable 集合判断键/值是否死亡，清除死亡的弱引用条目
-    fn clear_weak_tables(&mut self, reachable: &GcHashSet) {
-        let mode_key = self.mode_key_cached();
-        let mut tables = std::mem::take(&mut *self.weak_tables.borrow_mut());
-        let mut i = 0;
-        while i < tables.len() {
-            match tables[i].upgrade() {
-                None => {
-                    tables.swap_remove(i);
-                }
-                Some(data_rc) => {
-                    let (weak_k, weak_v) = {
-                        let data = data_rc.borrow();
-                        match &data.metatable {
-                            Some(mt) => match mt.get(&mode_key) {
-                                Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
-                                    let mode = lua_string_as_str(&s);
-                                    (mode.contains('k'), mode.contains('v'))
-                                }
-                                _ => (false, false),
-                            },
-                            None => (false, false),
-                        }
-                    };
-                    if weak_k || weak_v {
-                        let mut to_clear_array: Vec<usize> = Vec::new();
-                        let mut to_clear_hash: Vec<TValue> = Vec::new();
-                        {
-                            let data = data_rc.borrow();
-                            if weak_v {
-                                for (idx, val) in data.array.iter().enumerate() {
-                                    if matches!(val, TValue::Nil(NilKind::Empty)) {
-                                        continue;
-                                    }
-                                    let marked = is_marked(val, reachable);
-                                    if !marked {
-                                        to_clear_array.push(idx);
-                                    }
-                                }
-                            }
-                            for (k, v) in data.hash_buckets.iter() {
-                                let k_dead = weak_k && !is_marked(k, reachable);
-                                let v_dead = weak_v && !is_marked(v, reachable);
-                                let remove = if weak_k && weak_v {
-                                    k_dead || v_dead
-                                } else if weak_k {
-                                    k_dead
-                                } else {
-                                    v_dead
-                                };
-                                if remove {
-                                    to_clear_hash.push(k.clone());
-                                }
-                            }
-                        }
-                        if !to_clear_array.is_empty() || !to_clear_hash.is_empty() {
-                            let mut data = data_rc.borrow_mut();
-                            for idx in to_clear_array {
-                                data.array[idx] = TValue::Nil(NilKind::Empty);
-                            }
-                            for k in to_clear_hash {
-                                if let Some(i) = data.idx_remove(&k) {
-                                    let last_idx = data.hash_buckets.len() - 1;
-                                    if i != last_idx {
-                                        // 把最后一个条目移到空隙，保持连续性
-                                        let key = data.hash_buckets.last().unwrap().0.clone();
-                                        data.hash_buckets.swap_remove(i);
-                                        data.idx_remove(&key);
-                                        data.idx_insert(&key, i);
-                                    } else {
-                                        data.hash_buckets.pop();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    i += 1;
-                }
-            }
-        }
-        *self.weak_tables.borrow_mut() = tables;
-    }
-
-    // ========================================================================
-    // Mark-Sweep GC — 从根集合标记所有可达对象，然后清扫不可达对象
-    // ========================================================================
-
-    /// 收集协程的根对象
-    fn collect_thread_roots(&self, thread: &LuaThread<'a>, worklist: &mut Vec<RawTValue<'a>>) {
-        if let Some(ref func) = thread.function {
-            if needs_gc_mark(func) {
-                unsafe { worklist.push(raw_from_tvalue(func)) };
-            }
-        }
-        let ctx = thread.context.borrow();
-        let ctx = &*ctx.exec;
-        for val in &ctx.stack {
-            if needs_gc_mark(val) {
-                unsafe { worklist.push(raw_from_tvalue(val)) };
-            }
-        }
-        for val in &ctx.constants[..] {
-            if needs_gc_mark(val) {
-                unsafe { worklist.push(raw_from_tvalue(val)) };
-            }
-        }
-        for uv_ref in ctx.closure_upvals.borrow().iter() {
-            let uv = uv_ref.borrow();
-            match &*uv {
-                UpVal::Closed { value } => {
-                    if needs_gc_mark(value) {
-                        unsafe { worklist.push(raw_from_tvalue(value)) };
-                    }
-                }
-                UpVal::Open { stack_index, .. } => {
-                    if *stack_index < ctx.stack.len() {
-                        let val = &ctx.stack[*stack_index];
-                        if needs_gc_mark(val) {
-                            unsafe { worklist.push(raw_from_tvalue(val)) };
-                        }
-                    }
-                }
-            }
-        }
-        for frame in &ctx.call_stack {
-            for val in &frame.constants[..] {
-                if needs_gc_mark(val) {
-                    unsafe { worklist.push(raw_from_tvalue(val)) };
-                }
-            }
-            for uv_ref in frame.closure_upvals.borrow().iter() {
-                let uv = uv_ref.borrow();
-                if let UpVal::Closed { value } = &*uv {
-                    if needs_gc_mark(value) {
-                        unsafe { worklist.push(raw_from_tvalue(value)) };
-                    }
-                }
-            }
-        }
-        if let Some(ref hook) = ctx.hook_func {
-            if needs_gc_mark(hook) {
-                unsafe { worklist.push(raw_from_tvalue(hook)) };
-            }
-        }
-        // 注: error_msg 是 ThreadContext 的字段（协程错误信息），不是 LuaState 的；
-        // LuaState 侧错误状态经栈/闭包可达性覆盖。
-        for ci in &ctx.call_info {
-            if let Some(ref closure) = ci.closure {
-                let tv = TValue::LClosure(closure.clone());
-                unsafe { worklist.push(raw_from_tvalue(&tv)) };
-                drop(tv); // RawTValue 不持有引用；正常 decq 避免泄漏（closure 仍由 ci 持有）
-            }
-        }
-    }
-}
-
-// GC 触发源统计（LUA_GC_STATS=1 时启用）
-#[derive(Default, Clone, Copy)]
-struct GcTriggerStats {
-    maybe: u64,
-    concat: u64,
-    step: u64,
-    explicit: u64,
-}
-
-#[derive(Clone, Copy)]
-enum GcTrigger {
-    Maybe,
-    Concat,
-    Step,
-    Explicit,
-}
-
-thread_local! {
-    static GC_TRIGGER_STATS: std::cell::Cell<GcTriggerStats> = const { std::cell::Cell::new(GcTriggerStats::ZERO) };
-}
-
-impl GcTriggerStats {
-    const ZERO: Self = GcTriggerStats {
-        maybe: 0,
-        concat: 0,
-        step: 0,
-        explicit: 0,
-    };
-}
-
-fn gc_trigger_inc(trigger: GcTrigger) {
-    if !gc_stats_enabled() {
-        return;
-    }
-    GC_TRIGGER_STATS.with(|cell| {
-        let mut s = cell.get();
-        match trigger {
-            GcTrigger::Maybe => s.maybe += 1,
-            GcTrigger::Concat => s.concat += 1,
-            GcTrigger::Step => s.step += 1,
-            GcTrigger::Explicit => s.explicit += 1,
-        }
-        cell.set(s);
-    });
-}
-
-/// 标记显式 GC 触发（collectgarbage("collect") 等）— 供外部模块调用
-pub(crate) fn gc_trigger_explicit() {
-    gc_trigger_inc(GcTrigger::Explicit);
-}
-
-// GC 时间统计（LUA_GC_STATS=1 时启用）
-#[derive(Default, Clone, Copy)]
-struct GcTimeStats {
-    total_us: u64,
-    count: u64,
-    max_us: u64,
-    /// string_table.sweep 累计耗时
-    str_sweep_us: u64,
-    /// string_table.for_each（计费遍历）累计耗时
-    str_for_each_us: u64,
-}
-
-impl GcTimeStats {
-    const ZERO: Self = GcTimeStats {
-        total_us: 0,
-        count: 0,
-        max_us: 0,
-        str_sweep_us: 0,
-        str_for_each_us: 0,
-    };
-}
-
-thread_local! {
-    static GC_TIME_STATS: std::cell::Cell<GcTimeStats> = const { std::cell::Cell::new(GcTimeStats::ZERO) };
-}
-
-// 字符串表 extra_size 缓存：(string_table_ptr, nuse, str_extra_size)
-// 当 nuse 没变时（稳定状态），跳过 for_each 遍历，直接复用缓存的 str_extra_size。
-thread_local! {
-    static STR_EXTRA_CACHE: std::cell::Cell<(usize, usize, usize)> = const { std::cell::Cell::new((0, 0, 0)) };
-}
-
-/// 输出 GC 时间统计汇总（在进程退出时调用）
-pub fn print_gc_time_summary() {
-    if !gc_stats_enabled() {
-        return;
-    }
-    GC_TIME_STATS.with(|cell| {
-        let s = cell.get();
-        if s.count == 0 {
-            return;
-        }
-        let avg_us = s.total_us / s.count;
-        eprintln!(
-            "[GC time] count={} total={:.3}s avg={:.3}ms max={:.3}ms | \
-             str_sweep={:.3}s str_for_each={:.3}s mark_other={:.3}s",
-            s.count,
-            s.total_us as f64 / 1_000_000.0,
-            avg_us as f64 / 1000.0,
-            s.max_us as f64 / 1000.0,
-            s.str_sweep_us as f64 / 1_000_000.0,
-            s.str_for_each_us as f64 / 1_000_000.0,
-            (s.total_us
-                .saturating_sub(s.str_sweep_us)
-                .saturating_sub(s.str_for_each_us)) as f64
-                / 1_000_000.0,
-        );
-    });
 }
 
 // ============================================================================
@@ -4779,9 +3330,12 @@ mod tests {
         assert_eq!(state.stack.capacity(), BASIC_STACK_SIZE + EXTRA_STACK);
     }
 
+    /// 共享块的 GC 存储比执行态活得久（本用例自己持有 `gs` 句柄，且三个执行态
+    /// 各自析构）——因此本用例必须在 Miri（Tree Borrows）下干净：块内对象的释放
+    /// 只能走**块自己的**分配器宿主。若宿主随某个执行态提前析构，末次弱引用释放
+    /// 会按悬垂槽释放块（`constructing invalid value of type &Box<dyn Allocator>`）。
     #[test]
     fn test_stack_init_from_proto() {
-        let alloc = crate::mem::TestAlloc::new();
         let string_table = Rc::new(StringTable::new());
         // 验证 from_proto 的栈初始化: base > 0 时必须保证函数入口槽
         let proto = Proto {
@@ -4806,17 +3360,10 @@ mod tests {
             loc_vars: vec![],
             source: None,
         };
-        let gs = Rc::new(RefCell::new(GlobalShared {
-            gcstopem: false,
-            gc: GCState::default_incremental(),
-            // 构造期尚无稳定 allocator 槽（owner Box 之后才有），且 MEMERRMSG
-            // 是短字符串走 intern——槽传 null（仅长字符串路径会用到）。
-            memerrmsg: crate::strings::new_lstr(
-                alloc.slot(),
-                &string_table,
-                crate::strings::MEMERRMSG,
-            ),
-        }));
+        let gs = Rc::new(RefCell::new(GlobalShared::new(
+            AllocOwner::new(Box::new(DefaultAllocator)),
+            &string_table,
+        )));
 
         // case 1: base=0, empty stack → main function scenario
         let state = LuaState::from_proto(&proto, 0, vec![], Rc::clone(&gs), string_table.clone());
@@ -4943,7 +3490,8 @@ mod tests {
         );
     }
 
-    #[cfg_attr(not(miri), test)]
+    #[test]
+    #[cfg_attr(miri, ignore)]
     fn test_load_file_skips_shebang_all() {
         let mut state = LuaState::default();
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests_lua/all.lua");

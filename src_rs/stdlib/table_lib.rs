@@ -359,6 +359,7 @@ fn call_pack<'a>(
         t.set_int((i + 1) as i64, val);
     }
     t.set(state.intern_str("n"), TValue::Integer(nargs as i64));
+    unsafe { state.gc_mut().register_table(&t) };
     push_results(state, a, nresults, vec![TValue::Table(t)]);
     Ok(())
 }
@@ -744,12 +745,7 @@ fn call_create<'a>(
     }
 
     let table = Table::with_capacity_in(state.alloc_slot(), sizeseq as usize, sizerest as usize);
-    // 注册到 GC 并估算大小 (对应 C 中 lua_createtable 触发的 GC 跟踪)
-    // 估算: array 部分 sizeseq * sizeof(TValue) + hash 部分预留容量 * 节点大小
-    let estimated_size = sizeseq as usize * std::mem::size_of::<TValue>()
-        + sizerest as usize * (std::mem::size_of::<TValue>() * 2 + 16);
-    let table_id = unsafe { state.gc_mut().register_object(estimated_size) };
-    table.data.borrow().gc_header.set_id(table_id);
+    unsafe { state.gc_mut().register_table(&table) };
     push_results(state, a, nresults, vec![TValue::Table(table)]);
     Ok(())
 }
@@ -990,6 +986,7 @@ pub fn open_table_lib<'a>(state: &mut LuaState<'a>) {
     register(&mut lib, c"move", call_move);
     register(&mut lib, c"create", call_create);
 
+    unsafe { state.gc_mut().register_table(&lib) };
     let key = state.intern_str("table");
     state.globals.set(key, TValue::Table(lib));
 }

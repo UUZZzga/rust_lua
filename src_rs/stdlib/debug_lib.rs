@@ -355,7 +355,7 @@ fn call_getmetatable<'a>(
             }
         }
         TValue::UserData(u) => {
-            if let Some(ref mt) = u.metatable {
+            if let Some(ref mt) = *u.metatable.borrow() {
                 TValue::Table(mt.as_ref().clone())
             } else {
                 TValue::Nil(NilKind::Strict)
@@ -746,6 +746,7 @@ fn call_getinfo<'a>(
         if let Some(ref closure) = info.closure {
             let mut actlines = Table::new_in(state.alloc_slot());
             fill_active_lines(&mut actlines, &closure.proto);
+            unsafe { state.gc_mut().register_table(&actlines) };
             result_table.set(state.intern_str("activelines"), TValue::Table(actlines));
         } else {
             // C 函数: activelines = nil
@@ -772,7 +773,7 @@ fn call_getinfo<'a>(
             }
         }
     }
-
+    unsafe { state.gc_mut().register_table(&result_table) };
     push_single_result(state, a, nresults, TValue::Table(result_table));
     Ok(())
 }
@@ -2173,12 +2174,13 @@ fn call_getupvalue<'a>(
         }
         TValue::CClosure(cc) => {
             // C 闭包的上值名始终为空字符串
-            if n > 0 && n <= cc.upvalue.len() {
+            let upvalue = cc.upvalue.borrow();
+            if n <= upvalue.len() {
                 push_results(
                     state,
                     a,
                     nresults,
-                    vec![(state.intern_str("")), cc.upvalue[n - 1].clone()],
+                    vec![(state.intern_str("")), upvalue[n - 1].clone()],
                 );
             } else {
                 push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
@@ -2294,8 +2296,9 @@ fn call_setupvalue<'a>(
             if a + 1 < state.stack.len() {
                 if let TValue::CClosure(cc) = &mut state.stack[a + 1] {
                     let cc = unsafe { &mut *(cc.as_raw_ptr() as *mut crate::objects::CClosure) };
-                    if n > 0 && n <= cc.upvalue.len() {
-                        cc.upvalue[n - 1] = value;
+                    let mut upvalue = cc.upvalue.borrow_mut();
+                    if n <= upvalue.len() {
+                        upvalue[n - 1] = value;
                         push_single_result(state, a, nresults, state.intern_str(""));
                         return Ok(());
                     }
@@ -2358,9 +2361,10 @@ fn call_upvalueid<'a>(
             Ok(())
         }
         TValue::CClosure(cc) => {
-            if n > 0 && n <= cc.upvalue.len() {
+            let upvalue = cc.upvalue.borrow();
+            if n <= upvalue.len() {
                 // 使用 upvalue 的引用地址
-                let ptr = &cc.upvalue[n - 1] as *const TValue as *mut std::ffi::c_void;
+                let ptr = &upvalue[n - 1] as *const TValue as *mut std::ffi::c_void;
                 push_single_result(state, a, nresults, TValue::LightUserData(ptr));
             } else {
                 push_single_result(state, a, nresults, TValue::Nil(NilKind::Strict));
@@ -2657,9 +2661,11 @@ fn set_hook_in_registry<'a>(
         _ => {
             // 创建新表并设置元表 (__mode = "k")
             let t = Table::new_in(state.alloc_slot());
-            let mt = Table::new_in(state.alloc_slot());
+            let mt = Table::with_capacity_in(state.alloc_slot(), 0, 1);
             mt.set(state.intern_str("__mode"), state.intern_str("k"));
+            unsafe { state.gc_mut().register_table(&mt) };
             t.set_metatable(Some(mt));
+            unsafe { state.gc_mut().register_table(&t) };
             t
         }
     };
@@ -3345,6 +3351,7 @@ pub fn create_debug_lib_table<'a>(state: &LuaState<'a>) -> Table<'a> {
     register(&mut lib, c"setmetatable", call_setmetatable);
     register(&mut lib, c"setupvalue", call_setupvalue);
 
+    unsafe { state.gc_mut().register_table(&lib) };
     lib
 }
 
