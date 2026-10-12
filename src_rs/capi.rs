@@ -514,9 +514,10 @@ pub extern "C" fn lua_pushvalue(L: *mut lua_State, idx: c_int) {
                 let upvalue = cc.upvalue.borrow();
                 if up_idx >= 1 && up_idx <= upvalue.len() {
                     let val = upvalue[up_idx - 1].clone();
-                    Some(val);
+                    Some(val)
+                } else {
+                    None
                 }
-                None
             } else {
                 None
             };
@@ -5505,5 +5506,95 @@ mod tests {
             assert_eq!(isnum, 1);
         }
         lua_close(L);
+    }
+
+    /// lua-cjson `cjson.safe` 的核心模式：CClosure 以「被保护函数」为上值，
+    /// 在 C 函数体内把该上值 push 到参数位，再用 `lua_pcall` 调用它
+    /// （对应 lua_cjson.c 的 `json_protect_conversion`）。
+    ///
+    /// 覆盖两种上值形态（无上值的 C 函数、自身带 1 个上值的 CClosure），
+    /// 并在 full GC 前后各调用一次 —— 上值解析依赖 `stack[api_func_base]`，
+    /// 若嵌套 C 调用或 GC 破坏该槽位，`lua_upvalueindex(1)` 会退化为 nil，
+    /// `lua_pcall` 即报 "attempt to call a nil value"，cjson.safe.encode/decode 全线失败。
+    #[test]
+    fn test_cclosure_upvalue_invoked_via_pcall() {
+        unsafe extern "C" fn ret42(_L: *mut c_void) -> c_int {
+            let L = _L as *mut lua_State;
+            lua_pushinteger(L, 42);
+            1
+        }
+        // 内层被保护函数本身也是带 1 个上值的 CClosure（对应 cjson.encode 的 config 上值）
+        unsafe extern "C" fn plus1(l: *mut c_void) -> c_int {
+            let L = l as *mut lua_State;
+            lua_pushvalue(L, lua_upvalueindex(1));
+            let mut isnum: c_int = 0;
+            let base = lua_tointegerx(L, -1, &mut isnum);
+            lua_pop(L, 1);
+            if isnum == 0 {
+                // 上值未解析：把标记值返回给测试端
+                lua_pushinteger(L, -1);
+                lua_pushinteger(L, lua_type(L, lua_upvalueindex(1)) as lua_Integer);
+                return 2;
+            }
+            lua_pushinteger(L, base + 1);
+            1
+        }
+        // 对应 lua-cjson 的 json_protect_conversion（原样）
+        unsafe extern "C" fn protect(l: *mut c_void) -> c_int {
+            let L = l as *mut lua_State;
+            if lua_gettop(L) != 1 {
+                lua_pushnil(L);
+                return 1;
+            }
+            lua_pushvalue(L, lua_upvalueindex(1));
+            lua_insert(L, 1);
+            let err = lua_pcallk(L, 1, 1, 0, 0, ptr::null());
+            if err != 0 {
+                lua_pushnil(L);
+                lua_insert(L, -2);
+                return 2;
+            }
+            1
+        }
+
+        let mut st = LuaState::default();
+        st.open_selected_libs(0, 0);
+        let L = &mut st as *mut LuaState<'static> as *mut lua_State;
+        unsafe {
+            // safe_call: 上值 = 无上值的 C 函数
+            lua_pushcfunction(L, ret42);
+            lua_pushcclosure(L, protect, 1);
+            lua_setglobal(L, c"safe_call".as_ptr());
+            // safe_call_uv: 上值 = 自身带 1 个上值(41) 的 CClosure（对应 cjson.encode）
+            lua_pushinteger(L, 41);
+            lua_pushcclosure(L, plus1, 1);
+            lua_pushcclosure(L, protect, 1);
+            lua_setglobal(L, c"safe_call_uv".as_ptr());
+        }
+
+        for (label, code) in [
+            ("no GC", "return tostring(safe_call(0))"),
+            (
+                "after full GC",
+                "collectgarbage('collect'); collectgarbage('collect'); return tostring(safe_call(0))",
+            ),
+            ("nested upvalue", "return tostring(safe_call_uv(0))"),
+            (
+                "nested upvalue after GC",
+                "collectgarbage('collect'); collectgarbage('collect'); return tostring(safe_call_uv(0))",
+            ),
+        ] {
+            let state = unsafe { &mut *L };
+            let status = state.load_buffer(code, "=probe");
+            assert_eq!(status, 0, "[{}] compile failed", label);
+            let status = state.pcall(0, 1, 0);
+            assert_eq!(status, 0, "[{}] execution failed", label);
+            let got = unsafe { lua_tolstring(L, -1, ptr::null_mut()) };
+            let got = unsafe { std::ffi::CStr::from_ptr(got) }
+                .to_string_lossy()
+                .into_owned();
+            assert_eq!(got, "42", "[{}] safe_call pattern broken", label);
+        }
+        // 注意: st 是栈上 LuaState, 不可 lua_close（那会析构非堆分配的 state）
     }
 }
