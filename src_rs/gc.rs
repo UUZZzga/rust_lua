@@ -1432,6 +1432,14 @@ pub fn gc_check_gc(gc: &mut GCState) {
 impl<'a> LuaState<'a> {
     /// 完整 GC —— 对应 C 的 `luaC_fullgc`。
     pub fn collect_gc(&mut self) {
+        // 不可重入：finalizer 运行期间（call_finalizers -> pcall -> 用户代码）的分配
+        // 可能经 maybe_collect_gc / concat_gc_check / step_gc 再次进入。
+        // 重入会再次翻转 white 并清空标记队列（enter_cycle），使外层周期已完成的标记
+        // 全部作废 —— 外层随后的 clear_weak_tables / sweep_unreachable 将基于被破坏的
+        // 颜色状态，可能误清活对象。收集中的分配由本次 GC 收尾时的阈值重设覆盖。
+        if unsafe { self.gc_mut().is_gc_running() } {
+            return;
+        }
         let gc_start = if gc_stats_enabled() {
             Some(std::time::Instant::now())
         } else {
@@ -1763,6 +1771,14 @@ impl<'a> LuaState<'a> {
                 if needs_gc_mark(val) {
                     unsafe { worklist.push(raw_from_tvalue(val)) };
                 }
+            }
+        }
+
+        // C 安全 keepalive 区: 对应 C Lua 中失败 pcall 后仍留在栈数组里的值 ——
+        // C 代码可能通过裸指针访问其数据区，故必须视为可达（否则标记阶段会清空其内容）。
+        for val in &self.c_safety_keepalive {
+            if needs_gc_mark(val) {
+                unsafe { worklist.push(raw_from_tvalue(val)) };
             }
         }
     }

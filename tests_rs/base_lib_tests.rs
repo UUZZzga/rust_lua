@@ -391,6 +391,35 @@ fn test_pcall_error_non_string() {
     assert!(stdout.contains("false"));
 }
 
+/// 失败 pcall 的帧内对象必须立即可回收（对应 C Lua: 错误后栈值不再被引用）。
+///
+/// 回归：曾把所有 pcall 错误路径截断的值移入 C 安全 keepalive 区，纯 Lua 调用方
+/// 永不清空该区，导致失败帧的局部对象（及其 Rc 引用）无界滞留 —— __gc 不运行、
+/// 弱表不清空，且进程内存随 pcall 失败次数持续增长。只有 C API（lua_pcallk）发起的
+/// pcall 才需要延迟释放。
+#[test]
+fn test_pcall_error_frame_values_released() {
+    let output = run_lua_expr(
+        "local fin = false\n\
+         local weak = setmetatable({}, {__mode = 'v'})\n\
+         pcall(function()\n\
+           local obj = setmetatable({}, {__gc = function() fin = true end})\n\
+           weak[1] = obj\n\
+           error('boom')\n\
+         end)\n\
+         collectgarbage()\n\
+         collectgarbage()\n\
+         print(fin, weak[1] == nil)",
+    );
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "true\ttrue",
+        "pcall 失败帧的局部对象应被释放并可回收"
+    );
+}
+
 // ============================================================================
 // error 测试 (对应 C 的 luaB_error)
 // ============================================================================

@@ -205,8 +205,14 @@ pub struct LuaState<'a> {
     pub nextraargs: i32,
     pub closure_upvals: Rc<RefCell<UpValVec<'a>>>,
     /// 全局 open upvalue 存储 — 不随函数调用/返回保存/恢复（对应 C 的 L->openupval 链表节点存储）
-    /// open_upval 链表索引此 vec，tbc_list 也索引此 vec
-    pub open_upvals: Vec<UpValRef<'a>>,
+    /// open_upval 链表索引此 vec，tbc_list 也索引此 vec。
+    ///
+    /// 槽位在 upvalue 关闭（`func::close_upval`）时被释放为 `None` 并回收进 `free_upvals`，
+    /// 使已关闭的 upvalue 不再被 arena 强引用（否则其内存与其 Closed 值会永久泄漏）。
+    /// 索引在 upvalue 存活期间保持稳定 —— 未被释放的槽位永远不会被改写。
+    pub open_upvals: Vec<Option<UpValRef<'a>>>,
+    /// `open_upvals` 的空闲槽位索引（后进先出复用以保持局部性）。
+    pub free_upvals: Vec<usize>,
     pub open_upval: Option<usize>,
     pub tbc_list: Option<usize>,
     pub call_stack: Vec<crate::objects::CallFrame<'a>>,
@@ -301,7 +307,14 @@ pub struct LuaState<'a> {
     /// userdata 在 GC 前保持有效。Rust 用 Vec<TValue>，truncate 立即 drop，
     /// Rc 引用计数为 0 时 userdata 内存被释放，导致悬空指针。
     /// 此字段模拟 C Lua 的 GC 延迟释放行为。
+    ///
+    /// 仅 `lua_pcallk` 入口（`c_pcall_stash` 为 true）暂存；Lua 层 `pcall`/`xpcall`
+    /// 等纯 Lua 调用方不持有 C 指针，直接截断，避免暂存区无界增长（泄漏）。
     pub c_safety_keepalive: Vec<TValue<'a>>,
+
+    /// 当前 `LuaState::pcall` 是否由 C API（`lua_pcallk`）发起。
+    /// 只有 C 发起时错误路径才把被截断的值移入 `c_safety_keepalive`。
+    pub c_pcall_stash: bool,
 
     /// setjmp/longjmp 缓冲区栈 — 用于 lua_use_longjmp 模式下
     /// C 函数错误处理，替代 catch_unwind。
@@ -338,6 +351,7 @@ impl<'a> LuaState<'a> {
             nextraargs: 0,
             closure_upvals: Rc::new(RefCell::new(UpValVec::new())),
             open_upvals: Vec::new(),
+            free_upvals: Vec::new(),
             open_upval: None,
             tbc_list: None,
             call_stack: Vec::new(),
@@ -370,6 +384,7 @@ impl<'a> LuaState<'a> {
             last_error_call_info: None,
             last_close_frame: None,
             c_safety_keepalive: Vec::new(),
+            c_pcall_stash: false,
             error_jmp_bufs: Vec::new(),
             l_g: std::ptr::null_mut(),
             owner: None,
@@ -1522,9 +1537,16 @@ impl<'a> LuaState<'a> {
                             // truncate 只移动 top 指针，userdata 在 GC 前保持有效。
                             // Rust 用 Vec<TValue>，truncate 立即 drop，Rc 引用计数为 0 时
                             // userdata 内存被释放，导致悬空指针。此 keepalive 模拟 C Lua 行为。
+                            //
+                            // 仅对 C 发起的 pcall 暂存：Lua 层调用方不持有裸指针，直接截断，
+                            // 否则暂存区会随每次 Lua 层 pcall 失败无界增长（且这些值不再被释放）。
                             if self.stack.len() > func_idx {
-                                let drained = self.stack.split_off(func_idx);
-                                self.c_safety_keepalive.extend(drained);
+                                if self.c_pcall_stash {
+                                    let drained = self.stack.split_off(func_idx);
+                                    self.c_safety_keepalive.extend(drained);
+                                } else {
+                                    self.stack.truncate(func_idx);
+                                }
                             }
                             // close 后 last_error_value 包含最终错误值（可能是原始错误或 __close 错误）
                             // 保留原始 TValue 类型（如数字 43），pcall 返回 (false, err_value)

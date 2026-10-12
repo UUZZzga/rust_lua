@@ -2506,10 +2506,10 @@ impl VmExecutor {
             Some(idx) => idx,
             None => return false,
         };
-        if uv_idx >= state.open_upvals.len() {
-            return false;
-        }
-        let uv_ref = state.open_upvals[uv_idx].borrow();
+        let uv_ref = match crate::func::upval_slot(state, uv_idx) {
+            Some(slot) => slot.borrow(),
+            None => return false,
+        };
         match &*uv_ref {
             UpVal::Open { stack_index, .. } => *stack_index >= level,
             UpVal::Closed { .. } => false,
@@ -7095,7 +7095,10 @@ impl VmExecutor {
                         // 对应 C: upv[i] = luaF_findupval(L, base + p->upvalues[i].idx);
                         let stack_idx = state.base + desc.idx as usize;
                         let uv_idx = crate::func::find_upval(state, stack_idx);
-                        upvals.borrow_mut().push(state.open_upvals[uv_idx].clone());
+                        let uv_ref = crate::func::upval_slot(state, uv_idx)
+                            .expect("find_upval returns a live slot")
+                            .clone();
+                        upvals.borrow_mut().push(uv_ref);
                     } else {
                         // 上值来自外层闭包: 共享同一个 Rc<RefCell<UpVal>>
                         // 对应 C: upv[i] = cl->upvals[p->upvalues[i].idx];

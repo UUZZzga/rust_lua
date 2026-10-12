@@ -1778,7 +1778,12 @@ pub extern "C" fn lua_pcallk(
     // 清空 c_safety_keepalive: 上次 pcall 错误路径暂存的值现在可以安全释放。
     // C 代码在两次 pcall 之间不应持有 userdata 指针（C Lua 中 GC 可能已回收）。
     L.c_safety_keepalive.clear();
-    L.pcall(nargs as usize, nresults, _errfunc as isize)
+    // 仅本次 C 发起的 pcall 会启用暂存；嵌套的 Lua 层 pcall 不受影响。
+    let saved_stash = L.c_pcall_stash;
+    L.c_pcall_stash = true;
+    let status = L.pcall(nargs as usize, nresults, _errfunc as isize);
+    L.c_pcall_stash = saved_stash;
+    status
 }
 
 /// lua_pushthread: 将当前线程对象压栈，并返回当前线程是否为主线程。

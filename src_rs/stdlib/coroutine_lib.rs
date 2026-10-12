@@ -265,14 +265,8 @@ fn close_upval_by_ref<'a>(
     uv_ref: &Rc<RefCell<UpVal<'a>>>,
     val: TValue<'a>,
 ) {
-    let ptr = Rc::as_ptr(uv_ref) as usize;
-    if let Some(uv_idx) = state
-        .open_upvals
-        .iter()
-        .position(|r| Rc::as_ptr(r) as usize == ptr)
-    {
-        crate::func::unlink_upval(state, uv_idx);
-    }
+    let uv_idx = crate::func::register_upval_slot(state, uv_ref);
+    crate::func::unlink_upval(state, uv_idx);
     *uv_ref.borrow_mut() = UpVal::Closed { value: val };
 }
 
@@ -640,14 +634,8 @@ fn sync_upvals_back<'a>(
                 }
             };
             if need_relink {
-                let ptr = Rc::as_ptr(&info.uv_ref) as usize;
-                if let Some(uv_idx) = state
-                    .open_upvals
-                    .iter()
-                    .position(|r| Rc::as_ptr(r) as usize == ptr)
-                {
-                    relink_upval(state, uv_idx);
-                }
+                let uv_idx = crate::func::register_upval_slot(state, &info.uv_ref);
+                relink_upval(state, uv_idx);
             }
         }
     }
@@ -708,10 +696,10 @@ fn close_yield_upvals<'a>(
     let mut to_close: Vec<(usize, usize)> = Vec::new(); // (uv_idx, stack_index)
     let mut current = state.open_upval;
     while let Some(uv_idx) = current {
-        if uv_idx >= state.open_upvals.len() {
-            break;
-        }
-        let uv_ref = state.open_upvals[uv_idx].clone();
+        let uv_ref = match crate::func::upval_slot(state, uv_idx) {
+            Some(r) => r.clone(),
+            None => break,
+        };
         let (stack_index, next, is_open, is_tbc) = {
             let uv = uv_ref.borrow();
             match &*uv {
@@ -738,7 +726,9 @@ fn close_yield_upvals<'a>(
             .get(stack_index)
             .cloned()
             .unwrap_or(TValue::Nil(NilKind::Strict));
-        let uv_ref = state.open_upvals[uv_idx].clone();
+        let uv_ref = crate::func::upval_slot(state, uv_idx)
+            .expect("to_close 中的槽位在本函数内保持存活")
+            .clone();
         crate::func::unlink_upval(state, uv_idx);
         *uv_ref.borrow_mut() = UpVal::Closed { value: val };
         result_info.push(OpenUpvalInfo {
@@ -757,7 +747,11 @@ fn close_yield_upvals<'a>(
 /// 否则后续 close_yield_upvals 遍历链表时找不到该 upvalue
 fn relink_upval<'a>(state: &mut LuaState<'a>, uv_idx: usize) {
     let stack_index = {
-        let uv = state.open_upvals[uv_idx].borrow();
+        let slot = match crate::func::upval_slot(state, uv_idx) {
+            Some(s) => s,
+            None => return,
+        };
+        let uv = slot.borrow();
         match &*uv {
             UpVal::Open { stack_index, .. } => *stack_index,
             _ => return,
@@ -769,14 +763,14 @@ fn relink_upval<'a>(state: &mut LuaState<'a>, uv_idx: usize) {
         if idx == uv_idx {
             return; // 已在链表中
         }
-        let (cur_level, next) = {
-            let uv = state.open_upvals[idx].borrow();
-            match &*uv {
+        let (cur_level, next) = match crate::func::upval_slot(state, idx) {
+            Some(slot) => match &*slot.borrow() {
                 UpVal::Open {
                     stack_index, next, ..
                 } => (*stack_index, *next),
                 _ => break,
-            }
+            },
+            None => break,
         };
         if cur_level < stack_index {
             break;
@@ -786,7 +780,10 @@ fn relink_upval<'a>(state: &mut LuaState<'a>, uv_idx: usize) {
     }
     let next_node = current;
     {
-        let mut uv = state.open_upvals[uv_idx].borrow_mut();
+        let slot = crate::func::upval_slot(state, uv_idx)
+            .expect("relink 目标槽位必须存活")
+            .clone();
+        let mut uv = slot.borrow_mut();
         if let UpVal::Open {
             ref mut previous,
             ref mut next,
@@ -799,8 +796,8 @@ fn relink_upval<'a>(state: &mut LuaState<'a>, uv_idx: usize) {
     }
     match prev {
         Some(p_idx) => {
-            let mut p = state.open_upvals[p_idx].borrow_mut();
-            if let UpVal::Open { ref mut next, .. } = &mut *p {
+            let slot = crate::func::upval_slot(state, p_idx).expect("prev 槽位必须存活");
+            if let UpVal::Open { ref mut next, .. } = &mut *slot.borrow_mut() {
                 *next = Some(uv_idx);
             }
         }
@@ -809,10 +806,10 @@ fn relink_upval<'a>(state: &mut LuaState<'a>, uv_idx: usize) {
         }
     }
     if let Some(n_idx) = next_node {
-        let mut n = state.open_upvals[n_idx].borrow_mut();
+        let slot = crate::func::upval_slot(state, n_idx).expect("next 槽位必须存活");
         if let UpVal::Open {
             ref mut previous, ..
-        } = &mut *n
+        } = &mut *slot.borrow_mut()
         {
             *previous = Some(uv_idx);
         }
@@ -841,15 +838,9 @@ fn sync_yield_upvals_back<'a>(state: &mut LuaState<'a>, origins: &[(UpValRef<'a>
             previous: None,
             tbc: false,
         };
-        // 重新加入 open_upval 链表
-        let ptr = Rc::as_ptr(uv_ref) as usize;
-        if let Some(uv_idx) = state
-            .open_upvals
-            .iter()
-            .position(|r| Rc::as_ptr(r) as usize == ptr)
-        {
-            relink_upval(state, uv_idx);
-        }
+        // 重新加入 open_upval 链表（槽位若已被回收则重新登记）
+        let uv_idx = crate::func::register_upval_slot(state, uv_ref);
+        relink_upval(state, uv_idx);
     }
 }
 
@@ -2389,6 +2380,7 @@ pub fn c_api_reset_thread<'a>(state: &mut LuaState<'a>) -> i32 {
     state.call_stack.clear();
     state.pcall_protection_stack.clear();
     state.open_upvals.clear();
+    state.free_upvals.clear();
     state.open_upval = None;
     state.tbc_list = None;
     state.constants = std::rc::Rc::new(Vec::new());

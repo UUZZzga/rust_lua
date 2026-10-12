@@ -58,18 +58,7 @@ pub fn new_c_closure(state: &mut LuaState, _nupvals: usize) -> usize {
     let upval = Rc::new(RefCell::new(UpVal::Closed {
         value: TValue::Nil(NilKind::Strict),
     }));
-    eprintln!(
-        "new_c_closure: raw={:p} strong={} weak={}",
-        Rc::as_ptr(&upval),
-        Rc::strong_count(&upval),
-        Rc::weak_count(&upval),
-    );
     state.closure_upvals.borrow_mut().push(upval);
-    let v = state.closure_upvals.borrow();
-    if let Some(last) = v.last() {
-        // 假设 UpValVec 暴露 last 或索引
-        eprintln!("after push: strong={}", Rc::strong_count(last),);
-    }
     idx
 }
 
@@ -88,6 +77,46 @@ pub fn new_l_closure(state: &mut LuaState, nupvals: usize) -> usize {
 
 pub fn init_upvals(_state: &mut LuaState, _closure_start: usize, _proto: &Proto) {}
 
+/// 取槽位中的 upvalue 引用；槽位空闲（未分配，或已因 upvalue 关闭而回收）时返回 None。
+#[inline]
+pub fn upval_slot<'s, 'a>(state: &'s LuaState<'a>, uv_idx: usize) -> Option<&'s UpValRef<'a>> {
+    state.open_upvals.get(uv_idx).and_then(|slot| slot.as_ref())
+}
+
+/// 按 Rc 指针查找 arena 中的槽位索引。
+pub fn find_upval_slot<'a>(state: &LuaState<'a>, uv_ref: &UpValRef<'a>) -> Option<usize> {
+    let ptr = Rc::as_ptr(uv_ref) as usize;
+    state
+        .open_upvals
+        .iter()
+        .position(|r| r.as_ref().map_or(false, |x| Rc::as_ptr(x) as usize == ptr))
+}
+
+/// 把 upvalue 引用登记进 arena，返回其槽位索引（已登记则直接返回既有索引）。
+///
+/// 协程 yield/resume 会重新打开此前关闭的 upvalue，而其槽位可能已被关闭路径回收；
+/// 此时必须重新分配槽位，否则该 upvalue 会变成「Open 但不在 arena / 不在 open_upval 链表」，
+/// 后续 close 遍历将漏掉它。
+pub fn register_upval_slot<'a>(state: &mut LuaState<'a>, uv_ref: &UpValRef<'a>) -> usize {
+    if let Some(idx) = find_upval_slot(state, uv_ref) {
+        return idx;
+    }
+    let idx = match state.free_upvals.pop() {
+        Some(i) => i,
+        None => state.open_upvals.len(),
+    };
+    if idx < state.open_upvals.len() {
+        debug_assert!(
+            state.open_upvals[idx].is_none(),
+            "reused upvalue slot must be free"
+        );
+        state.open_upvals[idx] = Some(uv_ref.clone());
+    } else {
+        state.open_upvals.push(Some(uv_ref.clone()));
+    }
+    idx
+}
+
 pub fn find_upval(state: &mut LuaState, level: usize) -> usize {
     if !state.is_in_twups {
         state.g_mut().twups_linked = true;
@@ -95,25 +124,23 @@ pub fn find_upval(state: &mut LuaState, level: usize) -> usize {
     let mut prev: Option<usize> = None;
     let mut current = state.open_upval;
     while let Some(uv_idx) = current {
-        let uv_level = {
-            let uv_ref = state.open_upvals[uv_idx].borrow();
-            match &*uv_ref {
-                UpVal::Open { stack_index, .. } => Some(*stack_index),
-                UpVal::Closed { .. } => None,
+        let (uv_level, next) = match upval_slot(state, uv_idx) {
+            Some(uv_ref) => match &*uv_ref.borrow() {
+                UpVal::Open {
+                    stack_index, next, ..
+                } => (Some(*stack_index), *next),
+                UpVal::Closed { .. } => (None, None),
+            },
+            None => (None, None),
+        };
+        let uv_level = match uv_level {
+            Some(l) => l,
+            None => {
+                // Closed 或已回收槽位不应出现在链表里；防御性终止
+                current = next;
+                continue;
             }
         };
-        if uv_level.is_none() {
-            // Closed upvalue: skip (shouldn't be in open list, but be safe)
-            current = {
-                let uv_ref = state.open_upvals[uv_idx].borrow();
-                match &*uv_ref {
-                    UpVal::Open { next, .. } => *next,
-                    _ => None,
-                }
-            };
-            continue;
-        }
-        let uv_level = uv_level.unwrap();
         if uv_level < level {
             break;
         }
@@ -121,31 +148,30 @@ pub fn find_upval(state: &mut LuaState, level: usize) -> usize {
             return uv_idx;
         }
         prev = Some(uv_idx);
-        current = {
-            let uv_ref = state.open_upvals[uv_idx].borrow();
-            match &*uv_ref {
-                UpVal::Open { next, .. } => *next,
-                _ => None,
-            }
-        };
+        current = next;
     }
     new_upval(state, level, prev)
 }
 
 fn new_upval(state: &mut LuaState, level: usize, prev: Option<usize>) -> usize {
-    let uv_idx = state.open_upvals.len();
+    // 优先复用已回收槽位（closed upvalue 关闭时归还），否则追加。
+    // 复用安全：被释放的槽位不再出现在 open_upval 链表中。
+    let uv_idx = match state.free_upvals.pop() {
+        Some(idx) => idx,
+        None => state.open_upvals.len(),
+    };
     let mut next: Option<usize> = None;
     match prev {
         Some(p_idx) => {
             {
-                let p_ref = state.open_upvals[p_idx].borrow();
-                if let UpVal::Open { next: p_next, .. } = &*p_ref {
+                let p_ref = upval_slot(state, p_idx).expect("prev upvalue slot must be live");
+                if let UpVal::Open { next: p_next, .. } = &*p_ref.borrow() {
                     next = *p_next;
                 }
             }
             {
-                let mut p_ref = state.open_upvals[p_idx].borrow_mut();
-                if let UpVal::Open { ref mut next, .. } = &mut *p_ref {
+                let p_ref = upval_slot(state, p_idx).expect("prev upvalue slot must be live");
+                if let UpVal::Open { ref mut next, .. } = &mut *p_ref.borrow_mut() {
                     *next = Some(uv_idx);
                 }
             }
@@ -156,27 +182,41 @@ fn new_upval(state: &mut LuaState, level: usize, prev: Option<usize>) -> usize {
         }
     }
     if let Some(n_idx) = next {
-        let mut n_ref = state.open_upvals[n_idx].borrow_mut();
+        let n_ref = upval_slot(state, n_idx).expect("next upvalue slot must be live");
         if let UpVal::Open {
             ref mut previous, ..
-        } = &mut *n_ref
+        } = &mut *n_ref.borrow_mut()
         {
             *previous = Some(uv_idx);
         }
     }
-    state.open_upvals.push(Rc::new(RefCell::new(UpVal::Open {
+    let new_slot = Rc::new(RefCell::new(UpVal::Open {
         stack_index: level,
         next,
         previous: prev,
         tbc: false,
-    })));
+    }));
+    if uv_idx < state.open_upvals.len() {
+        debug_assert!(
+            state.open_upvals[uv_idx].is_none(),
+            "reused upvalue slot must be free"
+        );
+        state.open_upvals[uv_idx] = Some(new_slot);
+    } else {
+        state.open_upvals.push(Some(new_slot));
+    }
     uv_idx
 }
 
 pub fn close_upval(state: &mut LuaState, uv_idx: usize) {
     unsafe { state.gc_mut().cond_gc() };
+    // 槽位空闲（重复关闭 / 陈旧索引）→ 无操作
+    let uv_ref = match upval_slot(state, uv_idx) {
+        Some(r) => r.clone(),
+        None => return,
+    };
     let val = {
-        let uv_ref = state.open_upvals[uv_idx].borrow();
+        let uv_ref = uv_ref.borrow();
         match &*uv_ref {
             UpVal::Open { stack_index, .. } => state
                 .stack
@@ -191,22 +231,31 @@ pub fn close_upval(state: &mut LuaState, uv_idx: usize) {
         unsafe { state.gc_mut().mark_object(gc_id) };
     }
     unlink_upval(state, uv_idx);
-    *state.open_upvals[uv_idx].borrow_mut() = UpVal::Closed { value: val };
+    // 关闭值写入共享 cell：持有该 upvalue 的闭包可见 Closed 值
+    *uv_ref.borrow_mut() = UpVal::Closed { value: val };
+    // 归还 arena 强引用与槽位 —— 关闭后的 upvalue 仅由引用它的闭包维持存活。
+    // 对应 C 的 luaF_close：closed upvalue 不再是 openupval 链表节点，内存由 GC 回收。
+    state.open_upvals[uv_idx] = None;
+    state.free_upvals.push(uv_idx);
 }
 
 pub fn unlink_upval<'a>(state: &mut LuaState<'a>, uv_idx: usize) {
     let (prev, nxt) = {
-        let uv_ref = state.open_upvals[uv_idx].borrow();
-        match &*uv_ref {
+        let uv_ref = match upval_slot(state, uv_idx) {
+            Some(r) => r,
+            None => return,
+        };
+        match &*uv_ref.borrow() {
             UpVal::Open { previous, next, .. } => (*previous, *next),
             _ => return,
         }
     };
     match prev {
         Some(p_idx) => {
-            let mut p_ref = state.open_upvals[p_idx].borrow_mut();
-            if let UpVal::Open { ref mut next, .. } = &mut *p_ref {
-                *next = nxt;
+            if let Some(p_ref) = upval_slot(state, p_idx) {
+                if let UpVal::Open { ref mut next, .. } = &mut *p_ref.borrow_mut() {
+                    *next = nxt;
+                }
             }
         }
         None => {
@@ -214,12 +263,13 @@ pub fn unlink_upval<'a>(state: &mut LuaState<'a>, uv_idx: usize) {
         }
     }
     if let Some(n_idx) = nxt {
-        let mut n_ref = state.open_upvals[n_idx].borrow_mut();
-        if let UpVal::Open {
-            ref mut previous, ..
-        } = &mut *n_ref
-        {
-            *previous = prev;
+        if let Some(n_ref) = upval_slot(state, n_idx) {
+            if let UpVal::Open {
+                ref mut previous, ..
+            } = &mut *n_ref.borrow_mut()
+            {
+                *previous = prev;
+            }
         }
     }
 }
@@ -243,20 +293,20 @@ pub fn close<'a>(
     let mut current = state.open_upval;
     let mut found_tbc = false;
     while let Some(uv_idx) = current {
-        if uv_idx >= state.open_upvals.len() {
-            break;
-        }
-        let (should_close, next, is_tbc) = {
-            let uv_ref = state.open_upvals[uv_idx].borrow();
-            match &*uv_ref {
-                UpVal::Open {
-                    stack_index,
-                    next,
-                    tbc,
-                    ..
-                } => (*stack_index >= level, *next, *tbc),
-                UpVal::Closed { .. } => (false, None, false),
+        let (should_close, next, is_tbc) = match upval_slot(state, uv_idx) {
+            Some(uv_ref) => {
+                let uv_ref = uv_ref.borrow();
+                match &*uv_ref {
+                    UpVal::Open {
+                        stack_index,
+                        next,
+                        tbc,
+                        ..
+                    } => (*stack_index >= level, *next, *tbc),
+                    UpVal::Closed { .. } => (false, None, false),
+                }
             }
+            None => (false, None, false),
         };
         if should_close && is_tbc {
             found_tbc = true;
@@ -268,17 +318,17 @@ pub fn close<'a>(
         // 无 TBC: 第二趟就地关闭 (对应 C 的 luaF_close 从链表头摘取关闭)
         let mut current = state.open_upval;
         while let Some(uv_idx) = current {
-            if uv_idx >= state.open_upvals.len() {
-                break;
-            }
-            let (should_close, next) = {
-                let uv_ref = state.open_upvals[uv_idx].borrow();
-                match &*uv_ref {
-                    UpVal::Open {
-                        stack_index, next, ..
-                    } => (*stack_index >= level, *next),
-                    UpVal::Closed { .. } => (false, None),
+            let (should_close, next) = match upval_slot(state, uv_idx) {
+                Some(uv_ref) => {
+                    let uv_ref = uv_ref.borrow();
+                    match &*uv_ref {
+                        UpVal::Open {
+                            stack_index, next, ..
+                        } => (*stack_index >= level, *next),
+                        UpVal::Closed { .. } => (false, None),
+                    }
                 }
+                None => (false, None),
             };
             if should_close {
                 close_upval(state, uv_idx);
@@ -296,17 +346,17 @@ pub fn close<'a>(
     let mut to_close: Vec<usize> = Vec::new();
     let mut current = state.open_upval;
     while let Some(uv_idx) = current {
-        if uv_idx >= state.open_upvals.len() {
-            break;
-        }
-        let (should_close, next, _stack_idx) = {
-            let uv_ref = state.open_upvals[uv_idx].borrow();
-            match &*uv_ref {
-                UpVal::Open {
-                    stack_index, next, ..
-                } => (*stack_index >= level, *next, *stack_index),
-                UpVal::Closed { .. } => (false, None, 0),
+        let (should_close, next, _stack_idx) = match upval_slot(state, uv_idx) {
+            Some(uv_ref) => {
+                let uv_ref = uv_ref.borrow();
+                match &*uv_ref {
+                    UpVal::Open {
+                        stack_index, next, ..
+                    } => (*stack_index >= level, *next, *stack_index),
+                    UpVal::Closed { .. } => (false, None, 0),
+                }
             }
+            None => (false, None, 0),
         };
         if should_close {
             to_close.push(uv_idx);
@@ -334,23 +384,26 @@ pub fn close<'a>(
     let mut has_error = status != 0;
 
     for uv_idx in to_close {
-        let is_tbc = {
-            let uv_ref = state.open_upvals[uv_idx].borrow();
-            matches!(&*uv_ref, UpVal::Open { tbc: true, .. })
+        let is_tbc = match upval_slot(state, uv_idx) {
+            Some(uv_ref) => matches!(&*uv_ref.borrow(), UpVal::Open { tbc: true, .. }),
+            None => false,
         };
         if is_tbc {
             // TBC upvalue: 读取栈上的值（在 close_upval 之前，因为 close_upval 会改为 Closed）
-            let val = {
-                let uv_ref = state.open_upvals[uv_idx].borrow();
-                if let UpVal::Open { stack_index, .. } = &*uv_ref {
-                    state
-                        .stack
-                        .get(*stack_index)
-                        .cloned()
-                        .unwrap_or(TValue::Nil(NilKind::Strict))
-                } else {
-                    TValue::Nil(NilKind::Strict)
+            let val = match upval_slot(state, uv_idx) {
+                Some(uv_ref) => {
+                    let uv_ref = uv_ref.borrow();
+                    if let UpVal::Open { stack_index, .. } = &*uv_ref {
+                        state
+                            .stack
+                            .get(*stack_index)
+                            .cloned()
+                            .unwrap_or(TValue::Nil(NilKind::Strict))
+                    } else {
+                        TValue::Nil(NilKind::Strict)
+                    }
                 }
+                None => TValue::Nil(NilKind::Strict),
             };
             // 先 close_upval（从 open 链表移除），再调用 __close
             // 对应 C Lua 的 luaF_close: unlinkupval 先于 callclosemethod
@@ -451,9 +504,8 @@ pub fn new_tbc_upval<'a>(
     }
     // TBC upvalue 复用 open_upval 链表（通过 find_upval 加入），用 tbc 字段标记
     let uv_idx = find_upval(state, level);
-    {
-        let mut uv_ref = state.open_upvals[uv_idx].borrow_mut();
-        if let UpVal::Open { ref mut tbc, .. } = &mut *uv_ref {
+    if let Some(uv_ref) = upval_slot(state, uv_idx) {
+        if let UpVal::Open { ref mut tbc, .. } = &mut *uv_ref.borrow_mut() {
             *tbc = true;
         }
     }
@@ -499,21 +551,22 @@ pub fn pop_tbc_list(state: &mut LuaState, level: usize) {
         Some(h) => h,
         None => return,
     };
-    let should_pop = {
-        let head_ref = state.open_upvals[head].borrow();
-        if let UpVal::Open { stack_index, .. } = &*head_ref {
-            *stack_index >= level
-        } else {
-            false
+    let should_pop = match upval_slot(state, head) {
+        Some(head_ref) => {
+            if let UpVal::Open { stack_index, .. } = &*head_ref.borrow() {
+                *stack_index >= level
+            } else {
+                false
+            }
         }
+        None => false,
     };
     if !should_pop {
         return;
     }
     // 清除 tbc 标志
-    {
-        let mut head_ref = state.open_upvals[head].borrow_mut();
-        if let UpVal::Open { ref mut tbc, .. } = &mut *head_ref {
+    if let Some(head_ref) = upval_slot(state, head) {
+        if let UpVal::Open { ref mut tbc, .. } = &mut *head_ref.borrow_mut() {
             *tbc = false;
         }
     }
@@ -612,12 +665,36 @@ mod tests {
         let mut state = make_vm_state();
         state.stack = vec![TValue::Integer(42)];
         let uv = find_upval(&mut state, 0);
-        assert!(state.open_upvals[uv].borrow().is_open());
+        let uv_ref = state.open_upvals[uv].clone().expect("slot holds upvalue");
+        assert!(uv_ref.borrow().is_open());
         close_upval(&mut state, uv);
-        let uv_ref = state.open_upvals[uv].borrow();
-        match &*uv_ref {
+        // 关闭后的值写入共享 cell，闭包侧可见
+        match &*uv_ref.borrow() {
             UpVal::Closed { value } => assert_eq!(*value, TValue::Integer(42)),
             _ => panic!("expected Closed"),
+        }
+        // arena 不再强引用已关闭的 upvalue：槽位被回收
+        assert!(state.open_upvals[uv].is_none());
+        assert_eq!(state.free_upvals, vec![uv]);
+    }
+
+    /// 回归：反复创建并关闭 upvalue 不得使 arena 无界增长
+    /// （此前 closed upvalue 永久驻留 `open_upvals`，其内存与 Closed 值从不释放）
+    #[test]
+    fn test_closed_upvals_do_not_grow_arena() {
+        let mut state = make_vm_state();
+        state.stack = vec![TValue::Integer(0)];
+        for round in 0..100 {
+            state.stack[0] = TValue::Integer(round);
+            let uv = find_upval(&mut state, 0);
+            let _ = close(&mut state, 0, 0, 0);
+            assert!(
+                state.open_upvals.len() <= 1,
+                "arena grew to {} slots at round {}",
+                state.open_upvals.len(),
+                round
+            );
+            assert!(state.open_upvals[uv].is_none());
         }
     }
 
