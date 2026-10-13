@@ -182,6 +182,8 @@ impl<'a> Table<'a> {
     /// 期间不可能发生 borrow_mut (VM 单线程, 无重入点)。
     /// Miri Tree Borrows 验证: as_ptr + 只读访问 + 立即结束生命周期,
     /// 与正常 borrow 等价但省去 borrow flag 读写 (各 1 次依赖加载 + 分支)。
+    /// fast_unsafe 关闭时不存在调用点 (改用 borrow 守卫), 故整体不编译。
+    #[cfg(feature = "fast_unsafe")]
     #[cfg_attr(not(size_optimized), inline(always))]
     pub(crate) fn data_ro(&self) -> &TableData<'a> {
         // 绕过 borrow 标志直接取 &TableData（仅用于无并发写场景）
@@ -191,7 +193,12 @@ impl<'a> Table<'a> {
     /// 一次 borrow 内同时查找值并返回元表 — 消除 metamethod 路径的第二次 borrow。
     /// 返回 (查找结果, 元表)。元表为 Some 时调用方无需再次 borrow 获取 __index。
     pub fn get_and_metatable(&self, key: &TValue<'a>) -> (Option<TValue<'a>>, bool) {
+        #[cfg(feature = "fast_unsafe")]
         let data = self.data_ro();
+        #[cfg(not(feature = "fast_unsafe"))]
+        let data_guard = self.data.borrow();
+        #[cfg(not(feature = "fast_unsafe"))]
+        let data: &TableData<'a> = &data_guard;
         // perf: 只返回是否有元表的标志, 不 clone 元表 (Table 是 Rc, clone 需 incq)。
         // table_get 在 key 命中时直接返回, 无需元表; 仅 key 未命中时才调用 get_metatable()
         // 获取元表查 __index。命中路径省去一次冗余的 Rc incq/drop (all.lua table_get 占 10.65%)。
@@ -240,6 +247,10 @@ impl<'a> Table<'a> {
     /// (GETTABUP(math) 会 miss 一次 BuiltinFn 再 hit Table, 两次探测)。
     ///
     /// 元表存在时返回 None (__index 可能拦截, 不能绕过)。
+    ///
+    /// fast_unsafe: 读路径经 data_ro() 绕过 RefCell borrow, 返回命中槽引用
+    /// (调用方决定 clone/位拷贝)。
+    #[cfg(feature = "fast_unsafe")]
     #[cfg_attr(not(size_optimized), inline(always))]
     pub fn find_str_ref<'b>(&'b self, key: &TValue<'a>) -> Option<&'b TValue<'a>> {
         let data = self.data_ro();
@@ -264,6 +275,35 @@ impl<'a> Table<'a> {
             return None; // tombstone 视为未命中
         }
         Some(v)
+    }
+
+    /// 安全版 (fast_unsafe 关闭) — 同 fast 版查找语义, 但持 borrow 守卫
+    /// (guard 随函数返回释放), 命中值 clone 一份返回 owned。
+    #[cfg(not(feature = "fast_unsafe"))]
+    #[cfg_attr(not(size_optimized), inline)]
+    pub fn find_str_ref(&self, key: &TValue<'a>) -> Option<TValue<'a>> {
+        let data = self.data.borrow();
+        if data.metatable.is_some() {
+            return None;
+        }
+        let ktb = data.key_to_bucket.as_ref()?;
+        match key {
+            TValue::ShortStr(_) => {}
+            _ => return None, // 只特化 interned 短字符串键
+        }
+        let hash = crate::objects::tvalue_fx_hash(key);
+        let entry = ktb.find(hash, |(k, _)| match (k, key) {
+            (
+                a @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+                b @ (TValue::LongStr(_) | TValue::ShortStr(_)),
+            ) => lua_string_eq(a, b),
+            _ => false,
+        })?;
+        let v = &data.hash_buckets[entry.1].1;
+        if matches!(v, TValue::Nil(NilKind::Empty)) {
+            return None; // tombstone 视为未命中
+        }
+        Some(v.clone())
     }
 
     pub fn get(&self, key: &TValue<'a>) -> Option<TValue<'a>> {

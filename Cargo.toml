@@ -41,6 +41,17 @@ name = "math_lib_tests"
 path = "tests_rs/math_lib_tests.rs"
 
 [features]
+default = ["fast_unsafe"]
+# VM 热路径 unsafe 优化开关 (默认启用)。
+# 启用时: 指令/常量流用裸指针缓存 (免每指令 Rc→Vec 双 deref + 边界检查),
+#   栈读写用 as_mut_ptr/get_unchecked 跳过边界检查, 并跳过 trivially-droppable
+#   旧值的 drop_glue; upvalue/表读路径用 as_ptr/RefCell::as_ptr 绕过 borrow 计数。
+# 关闭时 (--no-default-features): 全部改为安全等价实现 (Rc 句柄 + 边界检查 +
+#   常规 drop + borrow 守卫), 语义不变, 用于量化这些优化带来的性能差距。
+# 不属于本开关的范围: FFI/C ABI (capi/io/os)、自定义分配器 (alloc/mem)、
+#   GC 裸指针 (gc.rs)、TString 指针表示 (strings.rs)、枚举 transmute (opcodes)。
+# 用法: cargo build --release --no-default-features
+fast_unsafe = []
 # 链接 C 实现的 liblua 作为参考基准, 用于编译器比对测试 (compiler::cmp_tests)。
 # 启用时: bindings.rs / parser.rs / lua_ffi.rs 模块生效, capi.rs 模块禁用以避免符号冲突。
 # 用法: cargo test --features cmp_c -- compiler::cmp_tests::compiler_compare_tests

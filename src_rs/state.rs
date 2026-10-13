@@ -824,39 +824,52 @@ impl<'a> LuaState<'a> {
             }
         } else if (nresults as usize) == 1 {
             if self.stack.len() > a {
-                // perf: 槽位平凡值检查 — 槽 a 现值多为 BuiltinFn (函数槽,
-                // Copy 无 drop) 或 trivial; 平凡/Copy 槽用 ptr::write 跳过
-                // drop_in_place 调用 (非内联 call, adjust 热路径实证)。
-                // 非平凡 (Rc/Table 等) 保守走原赋值 (正常 drop)。
-                // 检查用判别范围: BuiltinFn 及其他 Copy 变体由 matches 显式列出。
-                let slot = unsafe { self.stack.get_unchecked_mut(a) };
-                if matches!(
-                    slot,
-                    TValue::Nil(_)
-                        | TValue::Boolean(_)
-                        | TValue::Integer(_)
-                        | TValue::Float(_)
-                        | TValue::BuiltinFn(_)
-                ) {
-                    // SAFETY: 槽现值无 drop glue (Copy 变体), ptr::write 覆盖安全
-                    unsafe { std::ptr::write(slot, result) };
-                } else {
-                    *slot = result;
+                // fast_unsafe: 槽位平凡值检查 + 尾部 set_len (免 drop_glue)
+                #[cfg(feature = "fast_unsafe")]
+                {
+                    // perf: 槽位平凡值检查 — 槽 a 现值多为 BuiltinFn (函数槽,
+                    // Copy 无 drop) 或 trivial; 平凡/Copy 槽用 ptr::write 跳过
+                    // drop_in_place 调用 (非内联 call, adjust 热路径实证)。
+                    // 非平凡 (Rc/Table 等) 保守走原赋值 (正常 drop)。
+                    // 检查用判别范围: BuiltinFn 及其他 Copy 变体由 matches 显式列出。
+                    let slot = unsafe { self.stack.get_unchecked_mut(a) };
+                    if matches!(
+                        slot,
+                        TValue::Nil(_)
+                            | TValue::Boolean(_)
+                            | TValue::Integer(_)
+                            | TValue::Float(_)
+                            | TValue::BuiltinFn(_)
+                    ) {
+                        // SAFETY: 槽现值无 drop glue (Copy 变体), ptr::write 覆盖安全
+                        unsafe { std::ptr::write(slot, result) };
+                    } else {
+                        *slot = result;
+                    }
+                    // perf: 被截断区 (a+1..len) 是 CALL 的参数槽, 常为 trivial (Float/
+                    // Integer)。全部 trivial 时用 set_len 跳过 Vec::truncate 的逐槽
+                    // drop glue (非内联调用); 有 Rc 变体则回退 truncate 正常 drop。
+                    let tail_all_trivial = self.stack[a + 1..].iter().all(|v| {
+                        matches!(
+                            v,
+                            TValue::Nil(_)
+                                | TValue::Boolean(_)
+                                | TValue::Integer(_)
+                                | TValue::Float(_)
+                        )
+                    });
+                    if tail_all_trivial {
+                        // SAFETY: 尾部全 trivially-droppable, set_len 略过 drop 安全;
+                        // 槽位保留给后续 write_stack 复用 (与 smart_clear_stack 同策略)。
+                        unsafe { self.stack.set_len(a + 1) };
+                    } else {
+                        self.stack.truncate(a + 1);
+                    }
                 }
-                // perf: 被截断区 (a+1..len) 是 CALL 的参数槽, 常为 trivial (Float/
-                // Integer)。全部 trivial 时用 set_len 跳过 Vec::truncate 的逐槽
-                // drop glue (非内联调用); 有 Rc 变体则回退 truncate 正常 drop。
-                let tail_all_trivial = self.stack[a + 1..].iter().all(|v| {
-                    matches!(
-                        v,
-                        TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)
-                    )
-                });
-                if tail_all_trivial {
-                    // SAFETY: 尾部全 trivially-droppable, set_len 略过 drop 安全;
-                    // 槽位保留给后续 write_stack 复用 (与 smart_clear_stack 同策略)。
-                    unsafe { self.stack.set_len(a + 1) };
-                } else {
+                // 安全版: 常规赋值 + truncate (旧值走 drop_glue)
+                #[cfg(not(feature = "fast_unsafe"))]
+                {
+                    self.stack[a] = result;
                     self.stack.truncate(a + 1);
                 }
             } else {

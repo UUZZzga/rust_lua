@@ -91,6 +91,18 @@ steps:
   - bash tools/build_release_opt.sh
   - bash tools/ci_bench.sh --skip-build full
 
+- name: bench-fast-unsafe
+  image: lua-ci:latest
+  pull: if-not-exists
+  environment:
+    CARGO_HOME: /drone/src/.cargo
+    CARGO_TERM_COLOR: always
+  commands:
+  # fast_unsafe feature (默认 on) 的 on/off 性能差距: off = --no-default-features,
+  # VM 热路径 unsafe 优化全部换成安全等价实现。两侧都用普通 release 构建 (不带
+  # PGO), 比值只反映 fast_unsafe 本身; 交错采样取各指标最小值, 结果写 logs/。
+  - bash tools/bench_fast_unsafe.sh quick 3
+
 - name: save-cache
   # 缓存写回纯属加速优化, 与构建/测试结果无关。CI #114 实证宿主 /tmp/drone-cache
   # 分区写满 (rsync code 11 "No space left on device") 会把这个步骤变红并连带

@@ -803,7 +803,12 @@ where
         && state.stack.len() == a + 2
         && (state.hook_mask & 2 == 0 || !state.allowhook)
     {
-        match unsafe { state.stack.get_unchecked(a + 1) } {
+        // fast_unsafe: 长度已在上方校验 (a+2), 跳过边界检查
+        #[cfg(feature = "fast_unsafe")]
+        let arg = unsafe { state.stack.get_unchecked(a + 1) };
+        #[cfg(not(feature = "fast_unsafe"))]
+        let arg = &state.stack[a + 1];
+        match arg {
             TValue::Float(v) => Some(*v),
             TValue::Integer(v) => Some(*v as f64),
             _ => None,
@@ -813,6 +818,7 @@ where
     };
     if let Some(x) = spec_x {
         let y = f(x);
+        #[cfg(feature = "fast_unsafe")]
         unsafe {
             let slot = state.stack.get_unchecked_mut(a);
             if matches!(
@@ -829,6 +835,12 @@ where
             }
             // 唯一尾槽 = 数值参数 (trivially droppable), set_len 免 drop
             state.stack.set_len(a + 1);
+        }
+        // 安全版: 常规赋值 + truncate (旧值走 drop_glue)
+        #[cfg(not(feature = "fast_unsafe"))]
+        {
+            state.stack[a] = TValue::Float(y);
+            state.stack.truncate(a + 1);
         }
         state.top = a + 1;
         return Ok(());

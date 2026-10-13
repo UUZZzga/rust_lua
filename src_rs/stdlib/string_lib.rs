@@ -319,15 +319,29 @@ impl<'a> MatchState<'a> {
     /// 获取源字符串字节 — 所有调用点已确保 idx < src_end <= src.len()
     #[cfg_attr(not(size_optimized), inline(always))]
     fn src_byte(&self, idx: usize) -> u8 {
-        // 安全性：调用点已在访问前检查 idx < src_end
-        unsafe { *self.src.get_unchecked(idx) }
+        // fast_unsafe: 调用点已在访问前检查 idx < src_end, 跳过边界检查
+        #[cfg(feature = "fast_unsafe")]
+        {
+            unsafe { *self.src.get_unchecked(idx) }
+        }
+        #[cfg(not(feature = "fast_unsafe"))]
+        {
+            self.src[idx]
+        }
     }
 
     /// 获取模式字符串字节 — 所有调用点已确保 idx < p_end <= pattern.len()
     #[cfg_attr(not(size_optimized), inline(always))]
     fn pat_byte(&self, idx: usize) -> u8 {
-        // 安全性：调用点已在访问前检查 idx < p_end
-        unsafe { *self.pattern.get_unchecked(idx) }
+        // fast_unsafe: 调用点已在访问前检查 idx < p_end, 跳过边界检查
+        #[cfg(feature = "fast_unsafe")]
+        {
+            unsafe { *self.pattern.get_unchecked(idx) }
+        }
+        #[cfg(not(feature = "fast_unsafe"))]
+        {
+            self.pattern[idx]
+        }
     }
 }
 
@@ -361,6 +375,7 @@ fn match_bracket_class(c: u8, p: &[u8], ec: usize) -> bool {
     let mut idx = 0;
     // 安全性：p 来自 ms.pattern[p_start..ep]，长度 >= ec
     // 所有索引访问都在 idx < ec 的条件下进行
+    #[cfg(feature = "fast_unsafe")]
     unsafe {
         if p.len() > 1 && *p.get_unchecked(1) == b'^' {
             sig = false;
@@ -379,6 +394,31 @@ fn match_bracket_class(c: u8, p: &[u8], ec: usize) -> bool {
                 }
                 idx += 2;
             } else if *p.get_unchecked(idx) == c {
+                return sig;
+            }
+            idx += 1;
+        }
+    }
+    // 安全版: 边界检查索引 (语义等价)
+    #[cfg(not(feature = "fast_unsafe"))]
+    {
+        if p.len() > 1 && p[1] == b'^' {
+            sig = false;
+            idx = 1; // skip the '^'
+        }
+        idx += 1;
+        while idx < ec {
+            if p[idx] == b'%' {
+                idx += 1;
+                if idx < ec && match_class(c, p[idx]) {
+                    return sig;
+                }
+            } else if idx + 2 < ec && p[idx + 1] == b'-' {
+                if p[idx] <= c && c <= p[idx + 2] {
+                    return sig;
+                }
+                idx += 2;
+            } else if p[idx] == c {
                 return sig;
             }
             idx += 1;
@@ -442,10 +482,16 @@ fn single_match(ms: &MatchState<'_>, s: usize, p: usize, ep: usize) -> bool {
             }
         }
         // 安全性：p < ep <= p_end <= pattern.len()（class_end 保证）
+        #[cfg(feature = "fast_unsafe")]
         b'[' => unsafe {
             let slice = ms.pattern.get_unchecked(p..ep);
             match_bracket_class(c, slice, ep - p - 1)
         },
+        #[cfg(not(feature = "fast_unsafe"))]
+        b'[' => {
+            let slice = &ms.pattern[p..ep];
+            match_bracket_class(c, slice, ep - p - 1)
+        }
         _ => ms.pat_byte(p) == c,
     }
 }

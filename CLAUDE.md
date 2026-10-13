@@ -20,7 +20,7 @@
 | `deps/` | 第三方依赖库（lua-cjson / luasocket / lsqlite3 / luarocks / sol2），仅 `Makefile` / `fetch.sh` / `setup.sh` / `test.sh` / `sol2_smoke.cpp` 入库 |
 | `doc/` | Lua 官方文档 |
 | `bench/` | CI 性能基准目录（`harness.lua` 公共驱动 + `bench_*.lua` 按测试项拆分，每项一个文件） |
-| `tools/` | 工具脚本（`verify.sh` / `check_memory.sh` / `gc_bench_run.sh` / `ci_bench.sh` / `build_pgo.sh` / `build_release_opt.sh` / `ci_bench_win.ps1`） |
+|`tools/`|工具脚本（`verify.sh` / `check_memory.sh` / `gc_bench_run.sh` / `ci_bench.sh` / `bench_fast_unsafe.sh` / `build_pgo.sh` / `build_release_opt.sh` / `ci_bench_win.ps1`）|
 | `logs/` | 测试与构建日志输出目录（由 `verify.sh` 等自动创建，已 gitignore） |
 
 ## 构建系统
@@ -31,6 +31,9 @@
 
 ## Feature Flags
 
+- `fast_unsafe`（**默认启用**）：VM 热路径 unsafe 优化总开关。启用时使用：指令/常量流裸指针缓存（`execute.rs` 主循环的 `code_ptr`/`constants_ptr`，免每指令 `Rc→Vec` 双 deref 与边界检查）、栈读写 `as_mut_ptr` + `get_unchecked`（跳过边界检查）与 `ptr::write`/`set_len`（跳过 trivially-droppable 旧值的 drop_glue）、upvalue 访问 `RefCell::as_ptr`（跳过 borrow 计数）、表读路径 `Table::data_ro`（跳过 `RefCell::borrow`）、`string` 模式匹配 `get_unchecked`、`math` 单参纯函数 `get_unchecked`。关闭时（`cargo build --release --no-default-features`）以上全部改为安全等价实现（Rc 句柄 + 边界检查 + 常规 drop + borrow 守卫 + clone-owned），语义逐位不变，用于量化性能代价 / 安全审查。
+  - 量化脚本：`bash tools/bench_fast_unsafe.sh [quick|full] [轮数]` — 构建 on/off 两个二进制后交错采样，输出每指标 on/off 最小耗时比值与几何平均（结果写 `logs/fast_unsafe_ab/`）。
+  - 不在开关范围内（这些 unsafe 属架构/FFI 必需，不是性能技巧）：FFI/C ABI（`capi.rs` / `io_lib` / `os_lib` / `base_lib` dlopen）、自定义分配器（`alloc.rs` / `mem.rs`）、GC 裸指针与 `RawTValue`（`gc.rs`）、`TString` 指针表示与外部字符串（`strings.rs`）、`MaybeUninit` 捕获数组（`string_lib.rs`）、枚举 `transmute`（`opcodes.rs`，已由范围检查保证）、`lua_State` 裸指针协程（`coroutine_lib.rs`）、`from_utf8_unchecked`（Lua 字节串语义，换成校验会改变行为）。
 - `cmp_c`（默认关闭）：启用时链接 C 实现的 `liblua`，`bindings.rs` / `parser.rs` / `lua_ffi.rs` 模块生效，`capi.rs` 模块禁用以避免符号冲突。用于编译器比对测试（`cargo test --features cmp_c -- compiler::cmp_tests::compiler_compare_tests`）。
 - 默认（非 `cmp_c`）：Rust 实现自给自足，`capi.rs` 导出 C API 符号。
 
@@ -134,10 +137,11 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
 
 `.github/workflows/ci.yml` 仅手动触发（workflow_dispatch），依次执行：构建 Rust lua → 构建 C lua → `deps/setup.sh` → `deps/test.sh` → `tools/verify.sh` → `tools/gc_bench_run.sh --diff` → `tools/ci_bench.sh --skip-build full`。失败时上传 `logs/` 与 bench 输出作为 artifact。
 
-`.drone.yml` 定义 Drone CI 双流水线：`rust-linux`（docker，镜像 `lua-ci:latest`，见 `ci/Dockerfile`）执行 `cargo build/test` → CMP 编译器比对测试（`cargo test --features cmp_c -- compiler::cmp_tests::compiler_compare_tests`）→ deps 依赖库测试（构建 C lua 后运行 `deps/setup.sh` + `deps/test.sh`，含 skynet e2e）→ bench 性能基准（`bash tools/build_release_opt.sh` 构建 bench 二进制后 `bash tools/ci_bench.sh --skip-build full`）；`rust-windows`（exec）执行 `cargo build/test` → bench 性能基准（经 `tools/ci_bench_win.ps1` 包装：初始化 VS DevShell 提供 cmake，剥离 VS 环境变量后调 Git Bash 运行 `tools/ci_bench.sh full`，脚本内自建 C lua 与 Rust 二进制）。bench 构建策略全部内聚在 `tools/build_release_opt.sh`：默认 PGO（`build_pgo.sh` 三步：instrumented → tests_lua+bench quick 通用负载训练 → profile-use 重建）+ `-Cpanic=abort` + `lua_longjmp` feature（C 模块错误边界用 setjmp/longjmp 替代 catch_unwind）；`BENCH_PGO=0` / `BENCH_ABORT=0` 显式退档；任一步失败自动回退普通构建（`PGO_FALLBACK` 日志标记）。drone 命令行必须保持单条无内联逻辑（Windows exec runner 对全部 pipeline commands 做启动期 bash 解析，内联 `VAR=x` 前缀会泄漏成 cargo 参数）。ci_bench.sh 采用 C/Rust **交错采样**（每轮先 C 后 Rust，指标级取全部轮次最小值；linux full 5 轮、windows/quick 3 轮），比值噪声 ~±1-2%——低于 ~1.5% 的改动不可判定，判定性能改动必须看 CI 比值多轮均值而非本地 plain build（本地收益在 PGO 下常归零甚至反号）。`save-cache` 步骤 `failure: ignore`（宿主缓存盘写满不连累流水线）。镜像需在 Drone 宿主机预构建（`docker build -t lua-ci:latest -f ci/Dockerfile .`），修改 `ci/Dockerfile` 后需重建镜像。
+`.drone.yml` 定义 Drone CI 双流水线：`rust-linux`（docker，镜像 `lua-ci:latest`，见 `ci/Dockerfile`）执行 `cargo build/test` → CMP 编译器比对测试（`cargo test --features cmp_c -- compiler::cmp_tests::compiler_compare_tests`）→ deps 依赖库测试（构建 C lua 后运行 `deps/setup.sh` + `deps/test.sh`，含 skynet e2e）→ bench 性能基准（`bash tools/build_release_opt.sh` 构建 bench 二进制后 `bash tools/ci_bench.sh --skip-build full`）→ `fast_unsafe` on/off 性能差距（`bash tools/bench_fast_unsafe.sh quick 3`，普通 release 构建两变体交错采样，不干扰上一步的 PGO 产物）；`rust-windows`（exec）执行 `cargo build/test` → bench 性能基准（经 `tools/ci_bench_win.ps1` 包装：初始化 VS DevShell 提供 cmake，剥离 VS 环境变量后调 Git Bash 运行 `tools/ci_bench.sh full`，脚本内自建 C lua 与 Rust 二进制）。bench 构建策略全部内聚在 `tools/build_release_opt.sh`：默认 PGO（`build_pgo.sh` 三步：instrumented → tests_lua+bench quick 通用负载训练 → profile-use 重建）+ `-Cpanic=abort` + `lua_longjmp` feature（C 模块错误边界用 setjmp/longjmp 替代 catch_unwind）；`BENCH_PGO=0` / `BENCH_ABORT=0` 显式退档；任一步失败自动回退普通构建（`PGO_FALLBACK` 日志标记）。drone 命令行必须保持单条无内联逻辑（Windows exec runner 对全部 pipeline commands 做启动期 bash 解析，内联 `VAR=x` 前缀会泄漏成 cargo 参数）。ci_bench.sh 采用 C/Rust **交错采样**（每轮先 C 后 Rust，指标级取全部轮次最小值；linux full 5 轮、windows/quick 3 轮），比值噪声 ~±1-2%——低于 ~1.5% 的改动不可判定，判定性能改动必须看 CI 比值多轮均值而非本地 plain build（本地收益在 PGO 下常归零甚至反号）。`save-cache` 步骤 `failure: ignore`（宿主缓存盘写满不连累流水线）。镜像需在 Drone 宿主机预构建（`docker build -t lua-ci:latest -f ci/Dockerfile .`），修改 `ci/Dockerfile` 后需重建镜像。
 
 ## 关键编码约定
 
+- **fast_unsafe 开关完整性**：新增的 VM 热路径 unsafe 优化（跳过边界检查 / 跳过 drop_glue / 绕过 RefCell borrow / 裸指针缓存）必须用 `#[cfg(feature = "fast_unsafe")]` 包住，并同时给出 `#[cfg(not(feature = "fast_unsafe"))]` 的安全等价实现（语义逐位一致：Rc 句柄 + 边界检查 + 常规 drop + borrow 守卫）。架构/FFI 必需的 unsafe（见 Feature Flags 一节的不在开关范围清单）不需要包。
 - **Rc 共享避免深拷贝**：`Proto.code` / `constants` / `upvalues` 字段使用 `Rc<Vec<...>>`，避免 `op_call` / `op_tailcall` 中的 O(n) 深拷贝。
 - **NUL 终止字符串**：`ShortString` / `LongString` 从字节数据构造时必须使用 `new_short_bytes()` / `new_long_bytes()`，确保正确处理 NUL 终止。
 - **TValue 布局**：`TValue` 包含 `BuiltinFn`（函数指针 + NUL 终止字符串，24 字节）与 `RustClosure`（`Rc<RustClosure>`，函数指针 + upvalues）变体，用于有状态内置函数（如 `coroutine.wrap`）。`is_callable()` 统一处理 `LightUserData` 内置 tag。

@@ -1075,13 +1075,41 @@ impl VmExecutor {
         // 现改由帧切换点 (CALL/TAILCALL/RETURN*/FORPREP/冷分发/pc 溢出/错误
         // 恢复) 显式 reload; 直线指令段内 state.code 保证不变 — code Rc 全树
         // 写点均为整体替换且伴随帧切换 (#136 审计)。
+        // fast_unsafe 关闭时改用 Rc 句柄 + 边界检查索引 (安全等价, 每指令多一次
+        // 边界检查与 Rc→Vec deref)。
+        #[cfg(feature = "fast_unsafe")]
         let mut code_ptr: *const Instruction = state.code.as_ptr();
+        #[cfg(not(feature = "fast_unsafe"))]
+        let mut code_rc: Rc<Vec<Instruction>> = Rc::clone(&state.code);
         // perf: constants Vec 数据指针缓存 — K 常量指令 (ADDK/MULK/MODK/GETFIELD/
         // GETTABUP 等) 原每指令 Rc→Vec 双 deref 取常量。与 code_ptr 同点刷新
         // (帧切换 9 点), 帧内 constants Vec 不被整体替换 (与 code 相同的 Rc 写点
         // 审计结论)。K 越界由 len 检查兜底 (constants_len)。
+        #[cfg(feature = "fast_unsafe")]
         let mut constants_ptr: *const TValue = state.constants.as_ptr();
+        #[cfg(feature = "fast_unsafe")]
         let mut constants_len: usize = state.constants.len();
+        #[cfg(not(feature = "fast_unsafe"))]
+        let mut constants_rc: Rc<Vec<TValue<'a>>> = Rc::clone(&state.constants);
+
+        // 帧切换后刷新指令流缓存 (fast_unsafe: 裸指针四件套, 免每指令 deref;
+        // 安全版: Rc 句柄, 索引时边界检查)。调用点: CALL/TAILCALL/RETURN*/
+        // FORPREP/冷分发/错误恢复。
+        macro_rules! reload_istream {
+            ($st:expr) => {
+                #[cfg(feature = "fast_unsafe")]
+                {
+                    code_ptr = $st.code.as_ptr();
+                    constants_ptr = $st.constants.as_ptr();
+                    constants_len = $st.constants.len();
+                }
+                #[cfg(not(feature = "fast_unsafe"))]
+                {
+                    code_rc = Rc::clone(&$st.code);
+                    constants_rc = Rc::clone(&$st.constants);
+                }
+            };
+        }
 
         // C 形状 pc 寄存器化 — 对应 C luaV_execute 的局部 pc (vmfetch: i = *(pc++))。
         // 主循环仅在帧切换点 (CALL/TAILCALL/RETURN*/cold dispatch/FORPREP 后) 从
@@ -1113,11 +1141,17 @@ impl VmExecutor {
 
             // perf: constants 缓存切片 — 由常量指针构建, LLVM 可将其 ptr+len
             // 驻留寄存器传递给内联 K-handler (原 state.constants 每指令双 deref)
+            #[cfg(feature = "fast_unsafe")]
             let constants_slice: &[TValue] =
                 unsafe { std::slice::from_raw_parts(constants_ptr, constants_len) };
+            #[cfg(not(feature = "fast_unsafe"))]
+            let constants_slice: &[TValue] = &constants_rc[..];
 
             // perf: get_unchecked 跳过边界检查 (上方已检查 pc < code_len)
+            #[cfg(feature = "fast_unsafe")]
             let inst = unsafe { *code_ptr.add(pc) };
+            #[cfg(not(feature = "fast_unsafe"))]
+            let inst = code_rc[pc];
             pc += 1; // 寄存器自增 (对应 C 的 *(pc++)); 当前指令索引 = pc - 1
             let op = opcodes::get_opcode(inst);
 
@@ -1210,9 +1244,7 @@ impl VmExecutor {
                         // 缓存与 pc 均有效 (state.pc 已 +1 = 局部 pc), 跳过重载
                         Ok(CallOutcome::Reload) => {
                             pc = state.pc;
-                            code_ptr = state.code.as_ptr();
-                            constants_ptr = state.constants.as_ptr();
-                            constants_len = state.constants.len();
+                            reload_istream!(state);
                             Ok(())
                         }
                         Err(e) => Err(e),
@@ -1222,18 +1254,14 @@ impl VmExecutor {
                     state.pc = pc - 1;
                     let r = Self::op_tailcall(state, inst);
                     pc = state.pc;
-                    code_ptr = state.code.as_ptr();
-                    constants_ptr = state.constants.as_ptr();
-                    constants_len = state.constants.len();
+                    reload_istream!(state);
                     r
                 }
                 OpCode::RETURN => {
                     state.pc = pc - 1;
                     let r = Self::op_return(state, inst);
                     pc = state.pc;
-                    code_ptr = state.code.as_ptr();
-                    constants_ptr = state.constants.as_ptr();
-                    constants_len = state.constants.len();
+                    reload_istream!(state);
                     Self::tick_check_interrupted(state, pc)?;
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
@@ -1246,9 +1274,7 @@ impl VmExecutor {
                     state.pc = pc - 1;
                     let r = Self::op_return0(state, inst);
                     pc = state.pc;
-                    code_ptr = state.code.as_ptr();
-                    constants_ptr = state.constants.as_ptr();
-                    constants_len = state.constants.len();
+                    reload_istream!(state);
                     Self::tick_check_interrupted(state, pc)?;
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
@@ -1261,9 +1287,7 @@ impl VmExecutor {
                     state.pc = pc - 1;
                     let r = Self::op_return1(state, inst);
                     pc = state.pc;
-                    code_ptr = state.code.as_ptr();
-                    constants_ptr = state.constants.as_ptr();
-                    constants_len = state.constants.len();
+                    reload_istream!(state);
                     Self::tick_check_interrupted(state, pc)?;
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
@@ -1280,9 +1304,7 @@ impl VmExecutor {
                     state.pc = pc - 1;
                     let r = Self::op_forprep(state, inst);
                     pc = state.pc;
-                    code_ptr = state.code.as_ptr();
-                    constants_ptr = state.constants.as_ptr();
-                    constants_len = state.constants.len();
+                    reload_istream!(state);
                     r
                 }
                 // === SETUPVAL: 写 upvalue (deleted) ===
@@ -1352,9 +1374,7 @@ impl VmExecutor {
                     state.pc = pc - 1;
                     let r = Self::dispatch_cold_opcodes(state, op, inst);
                     pc = state.pc;
-                    code_ptr = state.code.as_ptr();
-                    constants_ptr = state.constants.as_ptr();
-                    constants_len = state.constants.len();
+                    reload_istream!(state);
                     r
                 }
             };
@@ -1363,9 +1383,7 @@ impl VmExecutor {
                 Err(e) => match Self::handle_instruction_error(state, e)? {
                     ErrOutcome::Continue => {
                         pc = state.pc;
-                        code_ptr = state.code.as_ptr();
-                        constants_ptr = state.constants.as_ptr();
-                        constants_len = state.constants.len();
+                        reload_istream!(state);
                         continue;
                     }
                     ErrOutcome::Return(r) => return Ok(r),
@@ -2068,6 +2086,7 @@ impl VmExecutor {
         // 用 unsafe 索引跳过边界检查
         let top = state.top;
         if idx < state.stack.len() {
+            #[cfg(feature = "fast_unsafe")]
             unsafe {
                 // 用裸指针访问槽位: 与 G(L)->gc 访问不冲突 (C 中 g 是独立指针)
                 let slot: *mut TValue<'a> = state.stack.as_mut_ptr().add(idx);
@@ -2090,6 +2109,11 @@ impl VmExecutor {
                 }
                 std::ptr::write(slot, val);
             }
+            // 安全等价实现: 常规赋值 (旧值走 drop_glue)
+            #[cfg(not(feature = "fast_unsafe"))]
+            {
+                state.stack[idx] = val;
+            }
         } else {
             Self::write_stack_grow(state, idx);
             state.stack[idx] = val;
@@ -2104,7 +2128,14 @@ impl VmExecutor {
     #[cfg_attr(not(size_optimized), inline(always))]
     fn read_stack<'a, 'b>(state: &'b LuaState<'a>, idx: usize) -> &'b TValue<'a> {
         if idx < state.stack.len() {
-            unsafe { state.stack.get_unchecked(idx) }
+            #[cfg(feature = "fast_unsafe")]
+            {
+                unsafe { state.stack.get_unchecked(idx) }
+            }
+            #[cfg(not(feature = "fast_unsafe"))]
+            {
+                &state.stack[idx]
+            }
         } else {
             Self::read_stack_panic(state, idx)
         }
@@ -2126,23 +2157,27 @@ impl VmExecutor {
             state.top = keep_len;
             return;
         }
-        // 检查待清除区域是否全部为 trivially-droppable 类型
-        let all_trivial = state.stack[keep_len..].iter().all(|v| {
+        // fast_unsafe: 待清除区全为 trivially-droppable 时不截断 Vec, 仅设置
+        // state.top (保留槽位供调用者 write_stack 复用, 免 write_stack_grow)。
+        // GC 不扫描 beyond top, stale 值不持 Rc 引用, 无泄漏风险。
+        // fast_unsafe 关闭: 不做该检查, 一律 truncate (语义等价, 少一项性能收益)。
+        #[cfg(not(feature = "fast_unsafe"))]
+        {
+            state.stack.truncate(keep_len);
+        }
+        #[cfg(feature = "fast_unsafe")]
+        if state.stack[keep_len..].iter().all(|v| {
             matches!(
                 v,
                 TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)
             )
-        });
-        if all_trivial {
-            // 全部 trivially-droppable: 不截断 Vec, 仅设置 state.top
-            // stale 值不持有 Rc 引用, GC 不扫描 beyond top, 无泄漏风险
-            // 调用者帧仍可写 (write_stack 不触发 write_stack_grow)
-            state.top = keep_len;
+        }) {
+            // 全部 trivially-droppable: 不截断 Vec
         } else {
             // 有非 trivial 值: 截断以 drop 它们 (避免 Rc 泄漏)
             state.stack.truncate(keep_len);
-            state.top = keep_len;
         }
+        state.top = keep_len;
     }
 
     /// 快速栈扩展 — 用 Nil 填充新槽位, 替代 Vec::resize。
@@ -2155,27 +2190,37 @@ impl VmExecutor {
     /// fast_truncate_stack 的 set_len 跳过 drop, 或被 Vec::truncate 已 drop).
     #[cfg_attr(not(size_optimized), inline(always))]
     fn fast_resize_stack_nil<'a>(state: &mut LuaState, new_len: usize) {
-        let stack = &mut state.stack;
-        let old_len = stack.len();
-        if new_len <= old_len {
-            return;
-        }
-        if stack.capacity() < new_len {
-            stack.reserve(new_len - old_len);
-        }
-        // SAFETY: capacity >= new_len, old_len..new_len 范围内的内存已分配。
-        // 用 ptr::write 而非 slice::fill: slice::fill 的 clone_from 会 drop 旧值,
-        // 但此处的旧值可能已被 fast_truncate_stack 跳过 drop (set_len),
-        // 或被 Vec::truncate 已 drop (double-drop = UB).
-        // ptr::write 不读旧值, 直接覆盖, 安全用于未初始化或已 drop 的内存。
-        unsafe {
-            let ptr = stack.as_mut_ptr().add(old_len);
-            let nil_val = TValue::Nil(NilKind::Strict);
-            let count = new_len - old_len;
-            for i in 0..count {
-                std::ptr::write(ptr.add(i), nil_val.clone());
+        // fast_unsafe 关闭: 直接 Vec::resize (语义等价, 慢在泛型 iter + clone)
+        #[cfg(not(feature = "fast_unsafe"))]
+        {
+            if new_len > state.stack.len() {
+                state.stack.resize(new_len, TValue::Nil(NilKind::Strict));
             }
-            stack.set_len(new_len);
+        }
+        #[cfg(feature = "fast_unsafe")]
+        {
+            let stack = &mut state.stack;
+            let old_len = stack.len();
+            if new_len <= old_len {
+                return;
+            }
+            if stack.capacity() < new_len {
+                stack.reserve(new_len - old_len);
+            }
+            // SAFETY: capacity >= new_len, old_len..new_len 范围内的内存已分配。
+            // 用 ptr::write 而非 slice::fill: slice::fill 的 clone_from 会 drop 旧值,
+            // 但此处的旧值可能已被 fast_truncate_stack 跳过 drop (set_len),
+            // 或被 Vec::truncate 已 drop (double-drop = UB).
+            // ptr::write 不读旧值, 直接覆盖, 安全用于未初始化或已 drop 的内存。
+            unsafe {
+                let ptr = stack.as_mut_ptr().add(old_len);
+                let nil_val = TValue::Nil(NilKind::Strict);
+                let count = new_len - old_len;
+                for i in 0..count {
+                    std::ptr::write(ptr.add(i), nil_val.clone());
+                }
+                stack.set_len(new_len);
+            }
         }
     }
 
@@ -3015,7 +3060,10 @@ impl VmExecutor {
             match src {
                 TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_) => {
                     // trivially-droppable: 无 Rc 字段, 16B 位模式拷贝即语义 clone
+                    #[cfg(feature = "fast_unsafe")]
                     let copy = unsafe { std::ptr::read(src) };
+                    #[cfg(not(feature = "fast_unsafe"))]
+                    let copy = src.clone();
                     Self::write_stack(state, a, copy);
                 }
                 _ => {
@@ -3109,9 +3157,22 @@ impl VmExecutor {
         // 每次 borrow ~3-5 cycles (is_written 检查 + counter inc/dec), 2 次 borrow = ~6-10 cycles
         // 安全性: VM 单线程, &mut state 保证无并发借用, GETUPVAL 期间 upvals Vec 不会变
         let val_opt: Option<TValue> = {
-            let upvals = unsafe { &*state.closure_upvals.as_ptr() };
+            // fast_unsafe: as_ptr 跳过 Rc deref + RefCell borrow/unborrow 开销
+            // (VM 单线程, &mut state 保证无并发借用, GETUPVAL 期间 upvals Vec 不变);
+            // 安全版改走 borrow 守卫 (语义等价)。
+            #[cfg(feature = "fast_unsafe")]
+            let upvals: &UpValVec<'a> = unsafe { &*state.closure_upvals.as_ptr() };
+            #[cfg(not(feature = "fast_unsafe"))]
+            let upvals_guard = state.closure_upvals.borrow();
+            #[cfg(not(feature = "fast_unsafe"))]
+            let upvals: &UpValVec<'a> = &upvals_guard;
             if b < upvals.len() {
-                let uv = unsafe { &*upvals[b].as_ptr() };
+                #[cfg(feature = "fast_unsafe")]
+                let uv: &UpVal<'a> = unsafe { &*upvals[b].as_ptr() };
+                #[cfg(not(feature = "fast_unsafe"))]
+                let uv_guard = upvals[b].borrow();
+                #[cfg(not(feature = "fast_unsafe"))]
+                let uv: &UpVal<'a> = &uv_guard;
                 Some(match uv {
                     UpVal::Closed { value } => value.clone(),
                     UpVal::Open { stack_index, .. } => state
@@ -3135,45 +3196,79 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as usize;
         let val = Self::read_stack(state, a).clone();
-        // perf: 用 as_ptr() 跳过 RefCell borrow_mut/unborrow 开销
+        // fast_unsafe: 用 as_ptr() 跳过 RefCell borrow_mut/unborrow 开销
         // 安全性: VM 单线程, &mut state 保证无并发借用
-        let upvals = unsafe { &*state.closure_upvals.as_ptr() };
-        if b < upvals.len() {
-            let uv = unsafe { &mut *upvals[b].as_ptr() };
-            match uv {
-                UpVal::Closed { value } => {
-                    unsafe {
-                        state.gc_mut().cond_gc();
-                    }
-                    // perf: 跳过 trivially-droppable 旧值的 drop_glue
-                    // (与 write_stack 同理, upvalue 常持有 number 值)
-                    if matches!(
-                        *value,
-                        TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)
-                    ) {
+        #[cfg(feature = "fast_unsafe")]
+        {
+            let upvals = unsafe { &*state.closure_upvals.as_ptr() };
+            if b < upvals.len() {
+                let uv = unsafe { &mut *upvals[b].as_ptr() };
+                match uv {
+                    UpVal::Closed { value } => {
                         unsafe {
-                            std::ptr::write(value, val);
+                            state.gc_mut().cond_gc();
                         }
-                    } else {
-                        *value = val;
-                    }
-                }
-                UpVal::Open { stack_index, .. } => {
-                    if *stack_index < state.stack.len() {
-                        // perf: 同上, 跳过 trivially-droppable 旧值的 drop_glue
-                        let slot = &mut state.stack[*stack_index];
+                        // perf: 跳过 trivially-droppable 旧值的 drop_glue
+                        // (与 write_stack 同理, upvalue 常持有 number 值)
                         if matches!(
-                            slot,
+                            *value,
                             TValue::Nil(_)
                                 | TValue::Boolean(_)
                                 | TValue::Integer(_)
                                 | TValue::Float(_)
                         ) {
                             unsafe {
-                                std::ptr::write(slot, val);
+                                std::ptr::write(value, val);
                             }
                         } else {
-                            *slot = val;
+                            *value = val;
+                        }
+                    }
+                    UpVal::Open { stack_index, .. } => {
+                        if *stack_index < state.stack.len() {
+                            // perf: 同上, 跳过 trivially-droppable 旧值的 drop_glue
+                            let slot = &mut state.stack[*stack_index];
+                            if matches!(
+                                slot,
+                                TValue::Nil(_)
+                                    | TValue::Boolean(_)
+                                    | TValue::Integer(_)
+                                    | TValue::Float(_)
+                            ) {
+                                unsafe {
+                                    std::ptr::write(slot, val);
+                                }
+                            } else {
+                                *slot = val;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // 安全版: borrow 守卫 (语义等价)。cond_gc 必须先于 borrow_mut 执行 —
+        // GC 标记路径会对同一 RefCell 调 borrow() (gc.rs collect_roots_into),
+        // 与守卫重叠会让 RefCell 双借用 panic。
+        #[cfg(not(feature = "fast_unsafe"))]
+        {
+            let needs_barrier =
+                matches!(state.closure_upvals.borrow().get(b), Some(u) if !u.borrow().is_open());
+            if needs_barrier {
+                unsafe {
+                    state.gc_mut().cond_gc();
+                }
+            }
+            let upvals = state.closure_upvals.borrow_mut();
+            if b < upvals.len() {
+                let mut uv = upvals[b].borrow_mut();
+                match &mut *uv {
+                    UpVal::Closed { value } => {
+                        *value = val;
+                    }
+                    UpVal::Open { stack_index, .. } => {
+                        let idx = *stack_index;
+                        if idx < state.stack.len() {
+                            state.stack[idx] = val;
                         }
                     }
                 }
@@ -3205,9 +3300,19 @@ impl VmExecutor {
         let spec: Option<SpecValue<'a>> = {
             let constants = &state.constants;
             let key_opt = constants.get(kb_idx);
+            #[cfg(feature = "fast_unsafe")]
             let upvals: &UpValVec<'a> = unsafe { &*state.closure_upvals.as_ptr() };
+            #[cfg(not(feature = "fast_unsafe"))]
+            let upvals_guard = state.closure_upvals.borrow();
+            #[cfg(not(feature = "fast_unsafe"))]
+            let upvals: &UpValVec<'a> = &upvals_guard;
             if b < upvals.len() {
+                #[cfg(feature = "fast_unsafe")]
                 let uv: &UpVal<'a> = unsafe { &*upvals[b].as_ptr() };
+                #[cfg(not(feature = "fast_unsafe"))]
+                let uv_guard = upvals[b].borrow();
+                #[cfg(not(feature = "fast_unsafe"))]
+                let uv: &UpVal<'a> = &uv_guard;
                 let table_ref: Option<&TValue<'a>> = match uv {
                     UpVal::Closed { value } => Some(value as &TValue<'a>),
                     UpVal::Open { stack_index, .. } => {
@@ -3215,6 +3320,8 @@ impl VmExecutor {
                     }
                 };
                 match (key_opt, table_ref) {
+                    // fast_unsafe: 命中槽引用 + 位拷贝/免 clone 提取
+                    #[cfg(feature = "fast_unsafe")]
                     (Some(key), Some(TValue::Table(t))) => match t.find_str_ref(key) {
                         Some(TValue::BuiltinFn(bf)) => Some(SpecValue::Builtin(*bf)),
                         Some(TValue::Table(t2)) => {
@@ -3240,6 +3347,31 @@ impl VmExecutor {
                             // perf: trivial 值直取 — 同 GETFIELD 特化
                             let copy = unsafe { std::ptr::read(v) };
                             Some(SpecValue::Trivial(copy))
+                        }
+                        _ => None,
+                    },
+                    // 安全版: borrow 守卫内查找, 命中值 owned 返回
+                    #[cfg(not(feature = "fast_unsafe"))]
+                    (Some(key), Some(TValue::Table(t))) => match t.find_str_ref(key) {
+                        Some(TValue::BuiltinFn(bf)) => Some(SpecValue::Builtin(bf)),
+                        Some(TValue::Table(t2)) => {
+                            // 目标槽若已持同一表 → 跳过覆写 (Rc 计数无扰动)
+                            if a < state.stack.len() {
+                                if let TValue::Table(old) = &state.stack[a] {
+                                    if crate::objects::TableDataRc::ptr_eq(&old.data, &t2.data) {
+                                        Some(SpecValue::Skip)
+                                    } else {
+                                        Some(SpecValue::Table(t2))
+                                    }
+                                } else {
+                                    Some(SpecValue::Table(t2))
+                                }
+                            } else {
+                                Some(SpecValue::Table(t2))
+                            }
+                        }
+                        Some(v @ (TValue::Float(_) | TValue::Integer(_))) => {
+                            Some(SpecValue::Trivial(v))
                         }
                         _ => None,
                     },
@@ -3496,17 +3628,31 @@ impl VmExecutor {
             let key_opt = state.constants.get(c_key);
             let table_val = Self::read_stack(state, b);
             if let (Some(key), TValue::Table(t)) = (key_opt, table_val) {
-                match t.find_str_ref(key) {
-                    Some(TValue::BuiltinFn(bf)) => Some(SpecValue::Builtin(*bf)),
-                    Some(TValue::Table(t2)) => Some(SpecValue::Table(t2.clone())),
-                    // perf: trivial 值 (number) 直取 — 免二次哈希查找 (get_and_metatable)
-                    // 与 owned clone。字段持浮点/整数的表读 (d_field 基准) 大量命中。
-                    Some(v @ (TValue::Float(_) | TValue::Integer(_))) => {
-                        // trivially-droppable: 16B 位模式拷贝免 clone (同 op_move)
-                        let copy = unsafe { std::ptr::read(v) };
-                        Some(SpecValue::Trivial(copy))
+                #[cfg(feature = "fast_unsafe")]
+                {
+                    match t.find_str_ref(key) {
+                        Some(TValue::BuiltinFn(bf)) => Some(SpecValue::Builtin(*bf)),
+                        Some(TValue::Table(t2)) => Some(SpecValue::Table(t2.clone())),
+                        // perf: trivial 值 (number) 直取 — 免二次哈希查找 (get_and_metatable)
+                        // 与 owned clone。字段持浮点/整数的表读 (d_field 基准) 大量命中。
+                        Some(v @ (TValue::Float(_) | TValue::Integer(_))) => {
+                            // trivially-droppable: 16B 位模式拷贝免 clone (同 op_move)
+                            let copy = unsafe { std::ptr::read(v) };
+                            Some(SpecValue::Trivial(copy))
+                        }
+                        _ => None,
                     }
-                    _ => None,
+                }
+                #[cfg(not(feature = "fast_unsafe"))]
+                {
+                    match t.find_str_ref(key) {
+                        Some(TValue::BuiltinFn(bf)) => Some(SpecValue::Builtin(bf)),
+                        Some(TValue::Table(t2)) => Some(SpecValue::Table(t2)),
+                        Some(v @ (TValue::Float(_) | TValue::Integer(_))) => {
+                            Some(SpecValue::Trivial(v))
+                        }
+                        _ => None,
+                    }
                 }
             } else {
                 None
@@ -5165,13 +5311,24 @@ impl VmExecutor {
         }
         let c_key = opcodes::getarg_c(next) as usize;
         let key = state.constants.get(c_key)?;
-        match t.find_str_ref(key) {
-            Some(TValue::BuiltinFn(bf)) => Some(TValue::BuiltinFn(*bf)),
-            Some(v @ (TValue::Float(_) | TValue::Integer(_))) => {
-                let copy = unsafe { std::ptr::read(v) };
-                Some(copy)
+        #[cfg(feature = "fast_unsafe")]
+        {
+            match t.find_str_ref(key) {
+                Some(TValue::BuiltinFn(bf)) => Some(TValue::BuiltinFn(*bf)),
+                Some(v @ (TValue::Float(_) | TValue::Integer(_))) => {
+                    let copy = unsafe { std::ptr::read(v) };
+                    Some(copy)
+                }
+                _ => None, // Table/其他: 交还原 GETFIELD (clone 语义/元表检查)
             }
-            _ => None, // Table/其他: 交还原 GETFIELD (clone 语义/元表检查)
+        }
+        #[cfg(not(feature = "fast_unsafe"))]
+        {
+            match t.find_str_ref(key) {
+                Some(TValue::BuiltinFn(bf)) => Some(TValue::BuiltinFn(bf)),
+                Some(v @ (TValue::Float(_) | TValue::Integer(_))) => Some(v),
+                _ => None, // Table/其他: 交还原 GETFIELD (clone 语义/元表检查)
+            }
         }
     }
 
