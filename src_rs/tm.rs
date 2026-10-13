@@ -1295,7 +1295,10 @@ pub fn equal_obj<'a>(
         return Ok(crate::vm::raw_equal(t1, t2));
     }
     if std::mem::discriminant(t1) != std::mem::discriminant(t2) {
-        return Ok(false);
+        // 变体不同：数字（已在上方处理）与字符串（短/长/外部字符串按内容，
+        // 对应 C luaV_equalobj 的混合变体分支）之外一律不等。
+        // raw_equal 对其余组合恒为 false。
+        return Ok(crate::vm::raw_equal(t1, t2));
     }
     // raw_equal 处理值类型和引用类型（同对象）的相等
     if crate::vm::raw_equal(t1, t2) {

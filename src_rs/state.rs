@@ -2545,24 +2545,6 @@ impl<'a> std::fmt::Debug for GlobalState<'a> {
     }
 }
 
-/// `lua_pushexternalstring` 登记的外部缓冲区（所有权已交给 Lua）。
-/// 字段语义同 C 的 `TString.falloc/ud/contents/u.lnglen`。
-pub struct ExtStringBuffer {
-    /// 缓冲区首地址（C 契约：`s[len] == '\0'`，可 free 长度为 len+1）。
-    pub ptr: *mut std::ffi::c_void,
-    /// 释放回调（对应 C 的 `lua_Alloc falloc`）。
-    pub falloc: unsafe extern "C" fn(
-        *mut std::ffi::c_void,
-        *mut std::ffi::c_void,
-        usize,
-        usize,
-    ) -> *mut std::ffi::c_void,
-    /// 回调参数（对应 C 的 `TString.ud`）。
-    pub ud: *mut std::ffi::c_void,
-    /// 字符串长度（释放长度为 len+1）。
-    pub len: usize,
-}
-
 pub struct GlobalState<'a> {
     // === 主线程登记（对应 C 的 G.mainthread）===
     /// 主线程执行态指针 —— 对应 C 的 `global_State.mainthread`。
@@ -2653,18 +2635,6 @@ pub struct GlobalState<'a> {
     /// 存储 Rc<Udata> 而非 Udata 深拷贝：确保 __gc 在原始 userdata 上调用，
     /// 这样 C 模块（如 lsqlite3）能通过 light userdata 指针正确清理 registry 引用
     pub ud_finobj_list: Rc<RefCell<Vec<MyRc<crate::objects::Udata<'a>, SlotAlloc>>>>,
-    /// 外部字符串（`lua_pushexternalstring`）待释放的调用方缓冲区。
-    ///
-    /// Lua 5.5 的 `lua_pushexternalstring` 把缓冲区所有权交给 Lua：字符串被回收时
-    /// 调用 `falloc(ud, s, len+1, 0)`。本实现把内容拷贝进普通 LuaString（新增
-    /// TValue 字符串变体要改 ~700 处匹配，收益不抵风险），因此把释放推迟到 state
-    /// 关闭时统一执行（`break_close_refs`）。
-    ///
-    /// 语义偏差仅「释放时机推后」：调用方已把所有权交出，任何时刻释放都不影响其
-    /// 可见行为；且返回给 C 的指针在整个 state 生命周期内保持有效（不会悬垂——
-    /// 若改成拷贝后立即释放，C 侧继续使用返回指针就会 use-after-free）。
-    /// `falloc == NULL` 表示调用方保留内存（C 的 LSTRFIX），不登记。
-    pub ext_string_buffers: Rc<RefCell<Vec<crate::state::ExtStringBuffer>>>,
     /// 状态正在关闭 — 对应 C 的 g->gcstp & GCSTPCLS
     /// true 时不再注册新的 finalizer 对象（close 中创建的对象不会被 finalize）
     pub gc_closing: bool,
@@ -2906,7 +2876,6 @@ impl<'a> GlobalState<'a> {
             concat_gc_interval: std::cell::Cell::new(32768),
             finobj_list: Rc::new(RefCell::new(Vec::new())),
             ud_finobj_list: Rc::new(RefCell::new(Vec::new())),
-            ext_string_buffers: Rc::new(RefCell::new(Vec::new())),
             gc_closing: false,
             exit_requested: None,
             cached_mode_key: std::cell::RefCell::new(None),
@@ -3017,7 +2986,6 @@ impl<'a> LuaState<'a> {
             concat_gc_interval: std::cell::Cell::new(32768),
             finobj_list: Rc::new(RefCell::new(Vec::new())),
             ud_finobj_list: Rc::new(RefCell::new(Vec::new())),
-            ext_string_buffers: Rc::new(RefCell::new(Vec::new())),
             gc_closing: false,
             exit_requested: None,
             cached_mode_key: std::cell::RefCell::new(None),
@@ -3091,16 +3059,11 @@ impl<'a> GlobalState<'a> {
         // 其他可能持有 Table 的字段也逐一处理，视实际需要补。
         self.finobj_list.borrow_mut().clear();
         // weak_tables / ud_finobj_list / main_thread 里的 Table 由后续 collect_gc 清扫。
-
-        // 外部字符串缓冲区：调用方已把所有权交出，关闭时按 C 的约定
-        // `falloc(ud, s, len+1, 0)` 释放（否则 C 模块经 lua_pushexternalstring
-        // 分配的缓冲永不回收 —— ASan 报 13 块 / 2541 字节 direct leak）。
-        let pending: Vec<ExtStringBuffer> =
-            self.ext_string_buffers.borrow_mut().drain(..).collect();
-        for b in pending {
-            // SAFETY: 缓冲区由 falloc 分配、长度 len+1（C 契约），此处只释放一次。
-            unsafe { (b.falloc)(b.ud, b.ptr, b.len + 1, 0) };
-        }
+        // 外部字符串（lua_pushexternalstring）的调用方缓冲区不在此释放：其所有权
+        // 挂在字符串对象上，字符串不可达（引用计数归零）时由
+        // `strings::LongString` 的 drop_payload 调用 falloc 释放 —— 对应 C 的
+        // `luaC_freeobj` 对 LSTRMEM 的处理（此处清空 globals/registry/栈即可
+        // 让这些字符串随之析构）。
     }
 }
 

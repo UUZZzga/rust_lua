@@ -4733,12 +4733,24 @@ impl VmExecutor {
             let v2 = Self::read_stack(state, b);
             if v1.is_number() && v2.is_number() {
                 Some(raw_equal(v1, v2))
-            } else if std::mem::discriminant(v1) != std::mem::discriminant(v2) {
-                Some(false)
-            } else if raw_equal(v1, v2) {
-                Some(true)
+            } else if std::mem::discriminant(v1) == std::mem::discriminant(v2) {
+                if raw_equal(v1, v2) {
+                    Some(true)
+                } else {
+                    None // 需元方法（仅 table/userdata）
+                }
+            } else if matches!(
+                (v1, v2),
+                (
+                    TValue::LongStr(_) | TValue::ShortStr(_),
+                    TValue::LongStr(_) | TValue::ShortStr(_)
+                )
+            ) {
+                // 短 vs 长变体不同仍可按内容相等（外部字符串可短）——
+                // 对应 C luaV_equalobj 的混合变体分支 → luaS_eqstr
+                Some(raw_equal(v1, v2))
             } else {
-                None // 需元方法（仅 table/userdata）
+                Some(false)
             }
         };
         let cond = match fast {

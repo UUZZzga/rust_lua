@@ -2926,9 +2926,11 @@ fn call_loadfile<'a>(
 
 /// 递归地将 proto 及其子 proto 中的字符串常量驻留化
 ///
-/// 二进制 dump/undump 后, 所有字符串都是 LongString。但全局表的键是 ShortString
-/// (通过 StringTable::intern 创建)。由于 LuaString 的 PartialEq/Hash 实现中
-/// Short vs Long 返回 false, 导致 GETTABUP 无法在全局表中找到键。
+/// 二进制 dump/undump 后, 所有字符串都是 LongString, 而全局表的键是
+/// ShortString (通过 StringTable::intern 创建) —— 对应 C `luaU_undump`
+/// 后 `luaS_newlstr` 驻留化的语义。跨变体比较虽已按内容相等
+/// (`lua_string_eq`, 对应 C `luaS_eqstr`), 但驻留化仍必要: 保证 dump/undump
+/// 前后字符串身份不变 (短字符串指针相等的热路径、`rawequal` 快路径)。
 /// 此函数将短字符串 (<= 40 字节) 转换为驻留的 ShortString。
 pub fn intern_proto_strings<'a>(proto: &mut Proto<'a>, state: &LuaState<'a>) {
     // 驻留化常量池中的字符串

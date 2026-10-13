@@ -250,7 +250,8 @@ pub fn to_integer(obj: &TValue, mode: F2IMode) -> Option<i64> {
 /// When: 调用 strcmp
 /// Then: 返回 Ordering::Less
 pub fn strcmp<'a>(ts1: &TValue<'a>, ts2: &TValue<'a>) -> Ordering {
-    // ShortString 末尾必然有 NUL；LongString 所有构造路径都追加 NUL。
+    // ShortString 末尾必然有 NUL；LongString 常规路径内联写入 NUL，外部字符串
+    // 由 lua_pushexternalstring 的 `s[len] == '\0'` 契约保证。
     // as_c_str_ptr 返回的指针始终指向 NUL 终止的字节序列，可直接用于 strcoll。
     // 对应 C 实现 lvm.c:l_strcmp 的逻辑。
     let mut s1 = lua_string_as_c_str_ptr(ts1);

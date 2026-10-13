@@ -21,7 +21,7 @@
 use std::alloc::{alloc, handle_alloc_error};
 use std::cell::Cell;
 use std::fmt::{self, Debug, Formatter};
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_void};
 
 use crate::mem::Allocator;
 use crate::objects::TValue;
@@ -159,6 +159,17 @@ pub struct ShortString {
 impl ShortString {
     pub const FIXED_SIZE: usize = std::mem::size_of::<ShortStringFixed>(); // 16
     pub const ALIGN: usize = std::mem::align_of::<ShortStringFixed>(); // 8
+
+    /// 内容起始指针 — 对应 C 的 `rawgetshrstr(ts)` = `&ts->contents`。
+    ///
+    /// C 的 TString 中短字符串内容起始于 `contents` 字段本身（该字段既当
+    /// "内容指针"又当内容首字节），故不额外存储指针。Rust 侧 DST 的 `data`
+    /// 字段占据同一位置，因此这里返回 `data` 的首地址 —— 与 C 同为
+    /// 「对象后起始指针」，但无 8 字节/串的指针存储开销。
+    #[inline]
+    pub fn contents(&self) -> *const u8 {
+        self.data.as_ptr()
+    }
 }
 
 // 编译期断言：前缀布局必须与 ShortString 的固定部分一致
@@ -239,17 +250,49 @@ impl ArcRc<ShortString> {
     }
 }
 
-/// 长字符串 — 长度 > 40 字节，不进行内部化，支持惰性哈希。
+/// 长字符串种类 — 对应 C `TString.shrlen` 的负值编码（`LSTRREG`/`LSTRFIX`/`LSTRMEM`）。
+/// 常规长字符串（`LSTRREG`）内容内联在对象尾部；外部字符串（`LSTRFIX`/`LSTRMEM`）
+/// 的 `contents` 直接指向调用方缓冲区，内容不拷贝。
+pub const LSTRREG: i8 = -1;
+/// 固定外部长字符串：缓冲区由调用方持有，Lua 不释放（对应 C 的 LSTRFIX）。
+pub const LSTRFIX: i8 = -2;
+/// 带释放回调的外部长字符串（对应 C 的 LSTRMEM）。
+pub const LSTRMEM: i8 = -3;
+
+/// 外部字符串缓冲区的释放回调 — 对应 C 的 `lua_Alloc`（`TString.falloc`）。
 ///
-/// `data` 内含长度信息（len 字段），无需独立的 `lnglen` 字段。
-/// - `Hash::hash` 首次调用时自动计算并缓存 hash，后续 O(1) 复用
+/// 调用约定与 C 相同：`falloc(ud, contents, len + 1, 0)`。
+pub type Falloc = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize) -> *mut c_void;
+
+/// 长字符串 — 长度 > 40 字节的常规长字符串，或任意长度的外部字符串。
+///
+/// 布局仿 C 的 `TString`（`lobject.h`）：
+/// - `contents` — 内容起始指针，对应 C 的 `getstr(ts)`。常规长字符串指向
+///   对象尾部的内联内容（C: `cast_charp(ts) + offsetof(TString, falloc)`）；
+///   外部字符串指向调用方缓冲区（C 的 `luaS_newextlstr`：`ts->contents =
+///   cast_charp(s)`）。
+/// - `kind` — `shrlen` 的负值编码：`LSTRREG` / `LSTRFIX` / `LSTRMEM`。
+/// - `falloc` / `ud` — 外部字符串（`LSTRMEM`）的释放回调与参数；本块（引用
+///   计数归零、即字符串不再可达）回收时调用一次，对应 C `luaC_freeobj`：
+///   `(*ts->falloc)(ts->ud, ts->contents, ts->u.lnglen + 1, 0)`。
+/// - `len` — 内容长度 + 1（含末尾 NUL，与 C `u.lnglen + 1` 同口径）。
+/// - `extra` — 0/1 惰性哈希标记（`Hash` 首次计算后置 1，后续 O(1) 复用）。
+///
 /// 块布局 = SimpleRcHeader + AllocSlot + payload（allocator 路由块，
-/// 见 `RcPayload::HAS_ALLOC_SLOT`；槽在 Rc 块内，不在本结构体中）。
+/// 见 `RcPayload`；槽在 Rc 块内，不在本结构体中）。
+///
+/// **DST 元数据 = 内联内容字节数**（常规 = `len`；外部 = 0，因为外部字符串
+/// 没有内联内容）。因此所有内容访问必须经 `contents` 指针（[`long_content`]），
+/// 不能直接切 `data`（外部字符串的 `data` 是空切片）。
 #[repr(C)]
 pub struct LongStringFixed {
     pub hash: Cell<u64>,
     pub len: u32,
     pub extra: Cell<u8>,
+    pub kind: Cell<i8>,
+    pub contents: Cell<*const u8>,
+    pub falloc: Cell<Option<Falloc>>,
+    pub ud: Cell<*mut c_void>,
 }
 
 #[derive(Debug)]
@@ -258,34 +301,125 @@ pub struct LongString {
     pub hash: Cell<u64>,
     pub len: u32,
     pub extra: Cell<u8>,
+    pub kind: Cell<i8>,
+    pub contents: Cell<*const u8>,
+    pub falloc: Cell<Option<Falloc>>,
+    pub ud: Cell<*mut c_void>,
     pub data: [u8],
 }
 
 impl LongString {
     pub const ALIGN: usize = std::mem::align_of::<LongStringFixed>();
+    /// 固定部分大小 = 内联内容起始偏移（对应 C 的 `offsetof(TString, falloc)`）。
+    /// 取 `LongStringFixed`（Sized）的大小：`data: [u8]` 对齐为 1 且为唯一尾字段，
+    /// 故二者相等（`offset_of!` 不支持 DST 的末字段）。
+    pub const FIXED_SIZE: usize = std::mem::size_of::<LongStringFixed>();
+
+    /// 内容起始指针 — 对应 C 的 `getstr(ts)`（短/长/外部统一入口）。
+    #[inline]
+    pub fn contents(&self) -> *const u8 {
+        self.contents.get()
+    }
+
+    /// 是否为外部字符串（内容在 Lua 管理的内存之外）。
+    #[inline]
+    pub fn is_external(&self) -> bool {
+        self.kind.get() != LSTRREG
+    }
 }
 
 // 编译期断言：前缀布局必须与 ShortString 的固定部分一致
 const _: () = {
     assert!(LongString::ALIGN == 8, "LongString 应对齐到 8");
+    // 固定部分含指针字段，必须保持 8 对齐（DST `data` 才能紧随其后无填充）
+    assert!(
+        LongString::FIXED_SIZE % LongString::ALIGN == 0,
+        "LongString 固定部分应为指针宽度整数倍"
+    );
 };
 
+/// 长字符串内容（不含末尾 NUL）——对应 C 的 `getlngstr(ts)` + `tsslen(ts)`。
+///
+/// 统一走 `contents` 指针：外部字符串的内容不在对象尾部（`data` 为空切片），
+/// 只有常规长字符串的内联内容才能直接切 `data`。
+#[inline]
+pub fn long_content(ls: &LongString) -> &[u8] {
+    // SAFETY: contents 指向 len-1 字节内容 + 末尾 NUL。常规长字符串指向对象
+    // 内联区（分配范围内）；外部字符串由 lua_pushexternalstring 契约保证
+    // contents[len] == '\0' 且 len+1 字节可读（C 的 api_check 同款前提）。
+    unsafe { std::slice::from_raw_parts(ls.contents(), ls.len as usize - 1) }
+}
+
+/// 短字符串内容（不含末尾 NUL）。
+#[inline]
+fn short_content(s: &ShortString) -> &[u8] {
+    // SAFETY: 短字符串所有创建路径都写入末尾 NUL，data 长度恒为 len。
+    unsafe { std::slice::from_raw_parts(s.contents(), s.len as usize - 1) }
+}
+
 unsafe impl RcPayload for LongString {
-    const ALIGN: usize = std::mem::align_of::<u32>();
+    const ALIGN: usize = std::mem::align_of::<LongStringFixed>();
 
     unsafe fn as_ref<'a>(payload: *const u8) -> &'a LongString {
-        let len = *(payload.add(std::mem::offset_of!(LongString, len)) as *const u32) as usize;
-        let sp: *const LongString = std::mem::transmute((payload, len));
+        // DST 元数据 = 内联内容长度：常规长字符串 = len 字段（内容 + 末尾 NUL）；
+        // 外部字符串没有内联内容（contents 指向调用方缓冲区）→ 0。若照着 len
+        // 拼元数据，引用会覆盖分配之外的地址（UB）。
+        let kind = *payload
+            .add(std::mem::offset_of!(LongString, kind))
+            .cast::<i8>();
+        let dlen = if kind == LSTRREG {
+            *payload
+                .add(std::mem::offset_of!(LongString, len))
+                .cast::<u32>() as usize
+        } else {
+            0
+        };
+        let sp: *const LongString = std::mem::transmute((payload, dlen));
         &*sp
     }
 
-    unsafe fn drop_payload(_: *mut u8) {}
+    unsafe fn drop_payload(payload: *mut u8) {
+        // 外部字符串（LSTRMEM）：内容由调用方缓冲区持有，本块回收（引用计数归零，
+        // 即字符串不再可达）时通知调用方释放 —— 对应 C luaC_freeobj:
+        //   (*ts->falloc)(ts->ud, ts->contents, ts->u.lnglen + 1, 0)。
+        // LSTRFIX（falloc == None）与常规长字符串不释放任何东西。
+        let kind = *payload
+            .add(std::mem::offset_of!(LongString, kind))
+            .cast::<i8>();
+        if kind != LSTRMEM {
+            return;
+        }
+        let contents = (*payload
+            .add(std::mem::offset_of!(LongString, contents))
+            .cast::<Cell<*const u8>>())
+        .get();
+        let falloc = (*payload
+            .add(std::mem::offset_of!(LongString, falloc))
+            .cast::<Cell<Option<Falloc>>>())
+        .get();
+        let ud = (*payload
+            .add(std::mem::offset_of!(LongString, ud))
+            .cast::<Cell<*mut c_void>>())
+        .get();
+        // len 字段 = 内容长度 + 1（C 传入 lnglen + 1）
+        let blen = *payload
+            .add(std::mem::offset_of!(LongString, len))
+            .cast::<u32>() as usize;
+        if let Some(f) = falloc {
+            f(ud, contents as *mut c_void, blen, 0);
+        }
+    }
 
     unsafe fn payload_size(p: *const u8) -> usize {
-        let len = *(p.add(std::mem::offset_of!(LongString, len)) as *const u32) as usize;
-        // 必须与 new_lstr 的分配 payload_size 一致（fixed = offset_of!(extra)+1，
-        // len 字段 = content+1 → fixed+len = fixed+content+1 ✓）。
-        std::mem::offset_of!(LongString, extra) + 1 + len
+        // 必须与创建时的 payload_size 一致（见 new_lstr_in / new_ext_lstr_in）：
+        // 常规 = fixed + len（len 含末尾 NUL），外部 = fixed（无内联内容）。
+        let kind = *p.add(std::mem::offset_of!(LongString, kind)).cast::<i8>();
+        if kind == LSTRREG {
+            let len = *p.add(std::mem::offset_of!(LongString, len)).cast::<u32>() as usize;
+            LongString::FIXED_SIZE + len
+        } else {
+            LongString::FIXED_SIZE
+        }
     }
 }
 
@@ -296,6 +430,21 @@ impl SimpleRc<LongString, SlotAlloc> {
     #[inline]
     pub fn new_lstr(alloc: SlotAlloc, hash: Option<u64>, data: &[u8]) -> Self {
         Self::new_lstr_in(alloc, hash, data)
+    }
+
+    /// 创建外部字符串块 —— 内容不拷贝，`contents` 指向调用方缓冲区。
+    ///
+    /// # Safety
+    /// 见 [`Self::new_ext_lstr_in`]。
+    #[inline]
+    pub unsafe fn new_ext_lstr(
+        alloc: SlotAlloc,
+        contents: *const u8,
+        len: usize,
+        falloc: Option<Falloc>,
+        ud: *mut c_void,
+    ) -> Self {
+        Self::new_ext_lstr_in(alloc, contents, len, falloc, ud)
     }
 }
 
@@ -309,7 +458,7 @@ impl<A: crate::alloc::Allocator> SimpleRc<LongString, A> {
         debug_assert!(data.len() <= u32::MAX as usize, "LongString 长度超 u32");
 
         unsafe {
-            let fixed = std::mem::offset_of!(LongString, extra) + 1;
+            let fixed = LongString::FIXED_SIZE;
             let payload_size = fixed + data.len() + 1;
 
             // 1) 一次分配 header + A + payload（与 SimpleRc::drop 的释放路径对应）
@@ -344,6 +493,23 @@ impl<A: crate::alloc::Allocator> SimpleRc<LongString, A> {
                 p.add(std::mem::offset_of!(LongString, len)) as *mut u32,
                 data.len() as u32 + 1,
             );
+            std::ptr::write(
+                p.add(std::mem::offset_of!(LongString, kind)) as *mut i8,
+                LSTRREG,
+            );
+            // contents 指向对象尾部的内联内容（对应 C: cast_charp(ts) + offsetof(TString, falloc)）
+            std::ptr::write(
+                p.add(std::mem::offset_of!(LongString, contents)) as *mut *const u8,
+                p.add(fixed) as *const u8,
+            );
+            std::ptr::write(
+                p.add(std::mem::offset_of!(LongString, falloc)) as *mut Option<Falloc>,
+                None,
+            );
+            std::ptr::write(
+                p.add(std::mem::offset_of!(LongString, ud)) as *mut *mut c_void,
+                std::ptr::null_mut(),
+            );
 
             // 4) 写变长部分（紧跟在固定部分后面）
             std::ptr::copy_nonoverlapping(data.as_ptr(), p.add(fixed), data.len());
@@ -352,9 +518,73 @@ impl<A: crate::alloc::Allocator> SimpleRc<LongString, A> {
 
             let out = SimpleRc::<LongString, A>::from_raw_base(base);
             debug_assert_eq!(out.len, data.len() as u32 + 1);
-            debug_assert_eq!(&out.data[0..out.len as usize - 1], data);
+            debug_assert_eq!(out.kind.get(), LSTRREG);
+            debug_assert_eq!(out.contents(), p.add(fixed));
+            debug_assert_eq!(long_content(&out), data);
             out
         }
+    }
+
+    /// 创建外部字符串块（`lua_pushexternalstring`）——内容**不拷贝**，
+    /// `contents` 直接指向调用方缓冲区（对应 C 的 `luaS_newextlstr`）。
+    ///
+    /// `falloc` 为 `Some` 时类型为 [`LSTRMEM`]，本块（字符串不再可达）回收时
+    /// 调用 `falloc(ud, contents, len + 1, 0)` 释放缓冲区；为 `None` 时类型为
+    /// [`LSTRFIX`]（缓冲区由调用方持有，对应 C 的 `loadlib.c` 字面量用法）。
+    ///
+    /// # Safety
+    /// - `contents` 非 null，且至少 `len + 1` 字节可读、`contents[len] == 0`
+    ///   （C 的 `api_check(L, s[len] == '\0')` 契约）。
+    /// - `falloc`/`ud` 必须能安全地在字符串回收时调用（C 侧缓冲区通常在
+    ///   state 关闭前释放完）。
+    pub unsafe fn new_ext_lstr_in(
+        alloc: A,
+        contents: *const u8,
+        len: usize,
+        falloc: Option<Falloc>,
+        ud: *mut c_void,
+    ) -> Self {
+        debug_assert!(len <= u32::MAX as usize, "LongString 长度超 u32");
+        debug_assert!(!contents.is_null(), "外部字符串缓冲区不得为 null");
+
+        let fixed = LongString::FIXED_SIZE;
+        let payload_size = fixed; // 外部字符串无内联内容
+
+        let layout = simple_layout::<A, LongString>(payload_size);
+        let base = alloc
+            .allocate(layout)
+            .unwrap_or_else(|_| handle_alloc_error(layout))
+            .cast::<u8>()
+            .as_ptr();
+
+        std::ptr::write(base as *mut SimpleRcHeader, SimpleRcHeader::default());
+        std::ptr::write(base.add(simple_alloc_off::<A>()) as *mut A, alloc);
+
+        let p = base.add(simple_data_off::<A, LongString>());
+        std::ptr::write(p.add(std::mem::offset_of!(LongString, hash)) as *mut u64, 0);
+        std::ptr::write(p.add(std::mem::offset_of!(LongString, extra)) as *mut u8, 0);
+        std::ptr::write(
+            p.add(std::mem::offset_of!(LongString, len)) as *mut u32,
+            len as u32 + 1,
+        );
+        std::ptr::write(
+            p.add(std::mem::offset_of!(LongString, kind)) as *mut i8,
+            if falloc.is_some() { LSTRMEM } else { LSTRFIX },
+        );
+        std::ptr::write(
+            p.add(std::mem::offset_of!(LongString, contents)) as *mut *const u8,
+            contents,
+        );
+        std::ptr::write(
+            p.add(std::mem::offset_of!(LongString, falloc)) as *mut Option<Falloc>,
+            falloc,
+        );
+        std::ptr::write(
+            p.add(std::mem::offset_of!(LongString, ud)) as *mut *mut c_void,
+            ud,
+        );
+
+        SimpleRc::<LongString, A>::from_raw_base(base)
     }
 }
 
@@ -373,10 +603,11 @@ impl LLuaString {
         }
     }
 
-    pub fn get_str(&self) -> &str {
+    /// 字符串内容（不含末尾 NUL）。
+    pub fn content(&self) -> &[u8] {
         match self {
-            LLuaString::Short(s) => std::str::from_utf8(&s.data[0..s.len as usize]).unwrap(),
-            LLuaString::Long(s) => std::str::from_utf8(&s.data[0..s.len as usize]).unwrap(),
+            LLuaString::Short(s) => short_content(s),
+            LLuaString::Long(s) => long_content(s),
         }
     }
 }
@@ -386,7 +617,8 @@ impl PartialEq for LLuaString {
         match (self, other) {
             (Self::Short(l0), Self::Short(r0)) => core::ptr::eq(l0, r0),
             (Self::Long(l0), Self::Long(r0)) => **l0 == **r0,
-            _ => false,
+            // 混合变体：只有外部字符串可能与短字符串内容相同（对应 C 的 luaS_eqstr）
+            _ => self.content() == other.content(),
         }
     }
 }
@@ -402,28 +634,11 @@ impl<'a> TValue<'a> {
 }
 
 // ============================================================================
-// 规约：内容比较辅助函数（兼容 NUL 和非 NUL 末尾的字符串）
+// 规约：内容比较辅助函数
 // ============================================================================
 
-/// 比较两个字符串的内容是否相同，忽略任一侧末尾可能的 NUL 字节。
-#[cfg_attr(not(size_optimized), inline)]
-fn content_eq(a: &str, b: &str) -> bool {
-    let ab = a.as_bytes();
-    let bb = b.as_bytes();
-    let ab = if ab.last() == Some(&0) {
-        &ab[..ab.len() - 1]
-    } else {
-        ab
-    };
-    let bb = if bb.last() == Some(&0) {
-        &bb[..bb.len() - 1]
-    } else {
-        bb
-    };
-    ab == bb
-}
-
 /// 长字符串相等性：若双方均已哈希 → 先比 hash（快速淘汰），否则直接比内容。
+/// 内容一律经 `contents` 指针取（外部字符串无内联内容）。
 impl PartialEq for LongString {
     fn eq(&self, other: &Self) -> bool {
         if self.extra.get() == 1 && other.extra.get() == 1 {
@@ -431,23 +646,7 @@ impl PartialEq for LongString {
                 return false;
             }
         }
-        content_eq(
-            std::str::from_utf8(&self.data[0..self.len as usize]).unwrap(),
-            std::str::from_utf8(&other.data[0..other.len as usize]).unwrap(),
-        )
-    }
-}
-
-// ============================================================================
-// 规约：eq_str 辅助函数
-// ============================================================================
-
-/// 比较两个 `LuaString` 的内容是否相同。
-pub fn eq_str<'a>(a: &TValue<'a>, b: &TValue<'a>) -> bool {
-    match (a, b) {
-        (TValue::ShortStr(a), TValue::ShortStr(b)) => ArcRc::ptr_eq(a, b),
-        (TValue::LongStr(a), TValue::LongStr(b)) => **a == **b,
-        _ => false,
+        long_content(self) == long_content(other)
     }
 }
 
@@ -535,9 +734,8 @@ impl StringTable {
                 return false;
             }
             let content_bytes = &ts.data[0..ts.len as usize];
-            // 字符串表中所有 ShortString 都通过 lua_string_with_nul 或
-            // buf.push(0) 创建, contents 末尾必有 NUL 终止符。
-            // 当 content_bytes.len() == str_len + 1 时, NUL 检查冗余 (已去除)。
+            // 短字符串各行创建路径都写入末尾 NUL（new_sstr），contents 末尾必有
+            // NUL 终止符。当 content_bytes.len() == str_len + 1 时, NUL 检查冗余 (已去除)。
             content_bytes.len() == str_len + 1 && content_bytes[..str_len] == *str_bytes
         }) {
             return ArcRc::clone(ts);
@@ -748,49 +946,34 @@ pub fn rust_hash(str: &str) -> u64 {
 // 规约：字符串方法
 // ============================================================================
 
+/// 字符串内容相等 — 对应 C 的 `luaS_eqstr`：短字符串按指针（内部化保证唯一），
+/// 长字符串（含外部字符串）按内容；短 vs 长混合变体也按内容比较
+/// （对应 C `luaV_equalobj` 的混合变体分支 —— 常规长串 > LUAI_MAXSHORTLEN
+/// 必与短串等长直接判否，只有外部字符串可能相等）。
 pub fn lua_string_eq(s1: &TValue, s2: &TValue) -> bool {
     match (s1, s2) {
-        (TValue::LongStr(_), TValue::LongStr(_)) => {
-            lua_string_hash(s1) == lua_string_hash(s2)
-                && lua_string_as_str(s1) == lua_string_as_str(s2)
-        }
-        (TValue::ShortStr(s1), TValue::ShortStr(s2)) => ArcRc::ptr_eq(s1, s2),
+        (TValue::ShortStr(a), TValue::ShortStr(b)) => ArcRc::ptr_eq(a, b),
+        (TValue::LongStr(a), TValue::LongStr(b)) => **a == **b,
+        (TValue::ShortStr(a), TValue::LongStr(b)) => short_content(a) == long_content(b),
+        (TValue::LongStr(a), TValue::ShortStr(b)) => long_content(a) == short_content(b),
         _ => false,
     }
 }
 
-/// 新建时自动追加 NUL 字节，确保作为 *const c_char 返回时安全。
-/// 预分配 str.len()+1 容量，避免 push('\0') 触发扩容。
-/// perf: with_nul 在 intern 未命中路径上调用，每次分配一个新 String。
-/// 用 unsafe 直接 copy_nonoverlapping + set_len 替代 push_str + push,
-/// 消除两次容量检查和两次长度更新 (push_str 和 push 各检查一次容量)。
-/// SAFETY: with_capacity(len+1) 保证至少 len+1 字节可用;
-///         copy_nonoverlapping 复制 len 字节; 写 0 在 [len] 位置 (≤ capacity);
-///         set_len(len+1) 不超过已分配容量; from_utf8_unchecked 安全因为
-///         源数据来自 &str (已验证 UTF-8) + NUL (合法 UTF-8 单字节)。
-pub fn lua_string_with_nul(str: &str) -> String {
-    let len = str.len();
-    let mut buf = Vec::with_capacity(len + 1);
-    unsafe {
-        std::ptr::copy_nonoverlapping(str.as_ptr(), buf.as_mut_ptr(), len);
-        *buf.as_mut_ptr().add(len) = 0;
-        buf.set_len(len + 1);
-    }
-    unsafe { String::from_utf8_unchecked(buf) }
-}
-
 /// 估算字符串真实堆占用（用于 GC 内存计费）。
-/// 短串: ArcRc 分配头 + ShortString 结构 + contents 堆分配
-/// 长串: Box 指针 + LongString 结构 + contents 堆分配
+/// 短串: ArcRc 分配头 + ShortString 结构 + 内联内容
+/// 长串: Rc 分配头 + 分配器槽 + LongString 固定部分 + 内联内容（外部字符串无内联内容）
 /// 字符串不调用 register_object（无 gc_header），由 gc_extra_estimate 跟踪。
 pub fn lua_string_gc_mem_size(str: &TValue) -> usize {
     match str {
-        // ArcRc 分配 = ArcInner<ShortString>（含引用计数 usize）+ ShortString 自身
-        // ShortString = { hash: u64, contents: String }，String 堆分配 = capacity
-        TValue::ShortStr(s) => std::mem::size_of::<ShortStringFixed>() + s.len as usize + 16,
-        // Box<LongString> 堆分配 = LongString 自身（Box 无额外头）
-        // LongString = { hash: AtomicU64, extra: AtomicU8, contents: String, ptr_id: u32 }
-        TValue::LongStr(s) => std::mem::size_of::<LongStringFixed>() + s.len as usize + 16,
+        // ArcRc 分配 = 引用计数头 + ShortString（固定部分 + 内联内容）
+        TValue::ShortStr(s) => ShortString::FIXED_SIZE + s.len as usize + 16,
+        // Rc 分配 = 引用计数头 + 分配器槽 + LongString（固定部分 + 内联内容）；
+        // 外部字符串的内容在调用方缓冲区（不由 Lua 分配），不计入
+        TValue::LongStr(s) => {
+            let inline = if s.is_external() { 0 } else { s.len as usize };
+            LongString::FIXED_SIZE + inline + 16
+        }
         _ => unreachable!("Not a string"),
     }
 }
@@ -800,36 +983,32 @@ pub fn lua_string_as_str<'a, 'b>(str: &'b TValue<'a>) -> &'b str {
     lua_string_as_str_inner(str)
 }
 
-/// 内部实现：返回 (str, has_nul)
-/// ShortString 的 contents 末尾必然有 NUL 终止符 (所有创建路径都保证)，
-/// 因此 Short 分支直接 slice 去掉末尾 NUL，无需 last() 检查。
-/// LongString 的 contents 可能没有 NUL (从 String 直接构造)，需保留检查。
+/// 内部实现：内容一律经 `contents` 指针取（外部字符串无内联内容），
+/// 末尾 NUL 由所有构造路径保证（外部字符串由 lua_pushexternalstring 的
+/// `s[len] == '\0'` 契约保证）。
 fn lua_string_as_str_inner<'a, 'b>(str: &'b TValue<'a>) -> &'b str {
     match str {
-        TValue::ShortStr(s) => {
-            debug_assert!(s.data[s.len as usize - 1] == 0);
-            unsafe { std::str::from_utf8_unchecked(&s.data[0..s.len as usize - 1]) }
-        }
-        TValue::LongStr(s) => {
-            debug_assert!(s.data[s.len as usize - 1] == 0);
-            unsafe { std::str::from_utf8_unchecked(&s.data[0..s.len as usize - 1]) }
-        }
+        TValue::ShortStr(s) => unsafe { std::str::from_utf8_unchecked(short_content(s)) },
+        TValue::LongStr(s) => unsafe { std::str::from_utf8_unchecked(long_content(s)) },
         _ => unreachable!("Not a string"),
     }
 }
 
-/// 返回一个 NUL 结尾的 C 字符串指针（供 C API 使用）。
+/// 返回一个 NUL 结尾的 C 字符串指针（供 C API 使用）——对应 C 的 `getstr(ts)`。
+///
+/// 常规短/长字符串指向对象尾部内联内容；外部字符串直接返回调用方缓冲区指针
+/// （与 C 一致：`lua_pushexternalstring` 的返回值即该指针）。
 /// 指针在 LuaString 自身存活期间有效。
 pub fn lua_string_as_c_str_ptr(str: &TValue) -> *const c_char {
     match str {
-        TValue::ShortStr(s) => s.data.as_ptr() as *const c_char,
-        TValue::LongStr(s) => s.data.as_ptr() as *const c_char,
+        TValue::ShortStr(s) => s.contents() as *const c_char,
+        TValue::LongStr(s) => s.contents() as *const c_char,
         _ => unreachable!("Not a string"),
     }
 }
 
 /// 返回字符串长度（O(1)，不含末尾 NUL）。
-/// ShortString 末尾必然有 NUL, 直接 contents.len()-1 省去 as_str 的 slice 操作。
+/// `len` 字段恒为内容长度 + 1（含末尾 NUL），直接减 1 省去 slice 操作。
 pub fn lua_string_len(str: &TValue) -> usize {
     match str {
         TValue::ShortStr(s) => s.len as usize - 1,
@@ -894,16 +1073,37 @@ pub fn new_long_bytes<'a>(alloc: SlotAlloc, bytes: Vec<u8>) -> TValue<'a> {
     ))
 }
 
-/// 确保长字符串有哈希值（惰性计算）。
+/// 确保长字符串有哈希值（惰性计算）。内容经 `contents` 指针取
+/// （外部字符串无内联内容）。
 #[inline]
 pub fn ensure_long_hash(ls: &LongString) -> u64 {
     if ls.extra.get() == 0 {
-        let content = unsafe { std::str::from_utf8_unchecked(&ls.data[0..ls.len as usize - 1]) };
-        let h = rust_hash(content);
+        let h = rust_hash_bytes(long_content(ls));
         ls.hash.set(h);
         ls.extra.set(1);
     }
     ls.hash.get()
+}
+
+/// 创建外部字符串（`lua_pushexternalstring`）——对应 C 的 `luaS_newextlstr`。
+///
+/// 内容**不拷贝**：字符串对象只带固定头部，`contents` 直接指向调用方缓冲区
+/// `s`（C 返回的 `getstr(ts)` 即该指针）。`falloc` 为 `Some` 时缓冲区所有权
+/// 交给 Lua —— 字符串不再可达（引用计数归零）时调用 `falloc(ud, s, len + 1, 0)`
+/// 释放，对应 C `luaC_freeobj` 对 `LSTRMEM` 的处理。
+///
+/// # Safety
+/// `s` 非 null，至少 `len + 1` 字节可读且 `s[len] == '\0'`（C API 契约）。
+pub unsafe fn new_ext_str<'a>(
+    alloc: SlotAlloc,
+    s: *const u8,
+    len: usize,
+    falloc: Option<Falloc>,
+    ud: *mut c_void,
+) -> TValue<'a> {
+    TValue::LongStr(SimpleRc::<LongString, SlotAlloc>::new_ext_lstr_in(
+        alloc, s, len, falloc, ud,
+    ))
 }
 #[cfg_attr(not(size_optimized), inline)]
 pub fn new_lstr<'a>(alloc: SlotAlloc, table: &StringTable, str: &str) -> TValue<'a> {
@@ -999,7 +1199,7 @@ mod tests {
         let s1 = tb.intern_value("hello");
         let s2 = tb.intern_value("hello");
         assert_eq!(s1, s2, "相同内容应返回同一个实例");
-        assert!(eq_str(&s1, &s2), "通过 eq_str 比较也应相等");
+        assert!(lua_string_eq(&s1, &s2), "通过 lua_string_eq 比较也应相等");
         assert_eq!(tb.count(), 1, "内部化后 nuse 仍应为 1");
     }
 
@@ -1069,51 +1269,161 @@ mod tests {
     }
 
     // ------------------------------------------------------------------------
-    // eq_str 测试
+    // 字符串相等性测试（对应 C 的 luaS_eqstr / luaV_equalobj）
     // ------------------------------------------------------------------------
 
     #[test]
-    fn test_eq_str_short_same_pointer() {
+    fn test_eq_short_same_pointer() {
         let tb = StringTable::new();
         let a = tb.intern_value("foo");
         let b = tb.intern_value("foo");
-        assert!(eq_str(&a, &b), "相同短字符串必须相等");
+        assert!(lua_string_eq(&a, &b), "相同短字符串必须相等");
     }
 
     #[test]
-    fn test_eq_str_short_different() {
+    fn test_eq_short_different() {
         let tb = StringTable::new();
         let a = tb.intern_value("foo");
         let b = tb.intern_value("bar");
-        assert!(!eq_str(&a, &b), "不同短字符串必须不等");
+        assert!(!lua_string_eq(&a, &b), "不同短字符串必须不等");
     }
 
     #[test]
-    fn test_eq_str_long_same_content() {
+    fn test_eq_long_same_content() {
         let alloc = crate::mem::TestAlloc::new();
         let long_content = "a".repeat(LUAI_MAXSHORTLEN + 1);
         let a = new_long_str(alloc.slot(), &long_content);
         let b = new_long_str(alloc.slot(), &long_content);
-        assert!(eq_str(&a, &b), "相同内容的长字符串必须相等");
+        assert!(lua_string_eq(&a, &b), "相同内容的长字符串必须相等");
     }
     #[test]
-    fn test_eq_str_long_different() {
+    fn test_eq_long_different() {
         let alloc = crate::mem::TestAlloc::new();
         let a = new_long_str(alloc.slot(), &"a".repeat(LUAI_MAXSHORTLEN + 1));
         let b = new_long_str(alloc.slot(), &"b".repeat(LUAI_MAXSHORTLEN + 1));
-        assert!(!eq_str(&a, &b), "不同内容的长字符串必须不等");
+        assert!(!lua_string_eq(&a, &b), "不同内容的长字符串必须不等");
     }
+    /// 混合变体按内容比较（对应 C `luaV_equalobj`：短 vs 长走 `luaS_eqstr`）。
+    /// 常规长串长度 > LUAI_MAXSHORTLEN 必与短串等长，只有外部字符串（内容
+    /// 可短）会真正命中相等。
     #[test]
-    fn test_eq_str_short_vs_long() {
+    fn test_eq_short_vs_long_by_content() {
         let alloc = crate::mem::TestAlloc::new();
         let tb = StringTable::new();
         let short = tb.intern_value("hello");
-        let long = TValue::LongStr(SimpleRc::<LongString, SlotAlloc>::new_lstr(
+        let same = TValue::LongStr(SimpleRc::<LongString, SlotAlloc>::new_lstr(
             alloc.slot(),
             None,
             "hello".as_bytes(),
         ));
-        assert!(!eq_str(&short, &long), "不同类型（短 vs 长）必须不等");
+        let other = TValue::LongStr(SimpleRc::<LongString, SlotAlloc>::new_lstr(
+            alloc.slot(),
+            None,
+            "world".as_bytes(),
+        ));
+        assert!(lua_string_eq(&short, &same), "同内容短/长必须相等");
+        assert!(lua_string_eq(&same, &short), "同内容长/短必须相等");
+        assert!(!lua_string_eq(&short, &other), "不同内容短/长必须不等");
+    }
+    /// 外部字符串（内容不拷贝，contents 指向调用方缓冲区）与内部化短字符串
+    /// 同内容时必须相等（对应 C 的 luaS_eqstr 跨变体比较）。
+    #[test]
+    fn test_eq_external_vs_short_and_long() {
+        let alloc = crate::mem::TestAlloc::new();
+        let tb = StringTable::new();
+
+        // 短内容外部字符串 vs 内部化短字符串（缓冲区须比字符串活得久）
+        {
+            let buf = b"hello\0".to_vec();
+            let ext =
+                unsafe { new_ext_str(alloc.slot(), buf.as_ptr(), 5, None, std::ptr::null_mut()) };
+            let short = tb.intern_value("hello");
+            assert!(lua_string_eq(&ext, &short));
+            assert!(lua_string_eq(&short, &ext));
+            assert_eq!(lua_string_as_str(&ext), "hello");
+            assert_eq!(lua_string_len(&ext), 5);
+            assert_eq!(lua_string_as_c_str_ptr(&ext), buf.as_ptr() as *const c_char);
+            match &ext {
+                TValue::LongStr(ls) => {
+                    assert_eq!(ls.kind.get(), LSTRFIX, "falloc == NULL → LSTRFIX");
+                    assert!(ls.is_external());
+                    assert_eq!(ls.contents(), buf.as_ptr());
+                }
+                _ => panic!("外部字符串应为 LongStr"),
+            }
+        }
+
+        // 长内容外部字符串 vs 常规长字符串
+        {
+            let long_text = "a".repeat(LUAI_MAXSHORTLEN + 1);
+            let mut buf = long_text.clone().into_bytes();
+            buf.push(0);
+            let ext_long = unsafe {
+                new_ext_str(
+                    alloc.slot(),
+                    buf.as_ptr(),
+                    long_text.len(),
+                    None,
+                    std::ptr::null_mut(),
+                )
+            };
+            let long = new_long_str(alloc.slot(), &long_text);
+            assert!(lua_string_eq(&ext_long, &long));
+            assert_eq!(lua_string_hash(&ext_long), lua_string_hash(&long));
+            assert_eq!(lua_string_as_str(&ext_long), long_text);
+        }
+    }
+
+    /// 外部字符串缓冲区在字符串回收（引用计数归零）时经 falloc 释放一次；
+    /// LSTRFIX（falloc == NULL）与常规长字符串不释放任何东西。
+    #[test]
+    fn test_external_string_frees_buffer_on_last_ref() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static FREED: AtomicUsize = AtomicUsize::new(0);
+        static LAST_LEN: AtomicUsize = AtomicUsize::new(0);
+
+        unsafe extern "C" fn falloc(
+            _ud: *mut c_void,
+            _ptr: *mut c_void,
+            osize: usize,
+            nsize: usize,
+        ) -> *mut c_void {
+            // C 契约：释放时 osize == len + 1、nsize == 0
+            assert_eq!(nsize, 0);
+            FREED.fetch_add(1, Ordering::SeqCst);
+            LAST_LEN.store(osize, Ordering::SeqCst);
+            std::ptr::null_mut()
+        }
+
+        let alloc = crate::mem::TestAlloc::new();
+        let buf = b"external-data\0".to_vec();
+        {
+            let ext = unsafe {
+                new_ext_str(
+                    alloc.slot(),
+                    buf.as_ptr(),
+                    13,
+                    Some(falloc),
+                    std::ptr::null_mut(),
+                )
+            };
+            match &ext {
+                TValue::LongStr(ls) => assert_eq!(ls.kind.get(), LSTRMEM),
+                _ => panic!("应为 LongStr"),
+            }
+            let clone = ext.clone();
+            drop(ext);
+            assert_eq!(FREED.load(Ordering::SeqCst), 0, "仍有强引用，不得释放");
+            assert_eq!(lua_string_as_str(&clone), "external-data");
+            drop(clone);
+        }
+        assert_eq!(
+            FREED.load(Ordering::SeqCst),
+            1,
+            "最后一次引用释放时回调一次"
+        );
+        assert_eq!(LAST_LEN.load(Ordering::SeqCst), 14, "osize = len + 1");
     }
     // ------------------------------------------------------------------------
     // new_lstr 测试

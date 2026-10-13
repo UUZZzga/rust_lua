@@ -2689,42 +2689,36 @@ pub extern "C" fn lua_topointer(L: *mut lua_State, idx: c_int) -> *const c_void 
 
 /// lua_pushexternalstring: 创建外部字符串并压栈
 ///
-/// 对应 C 5.5 的 lua_pushexternalstring。
-/// s 是外部缓冲区，len 是长度，dealloc 是释放回调，ud 是回调参数。
+/// 对应 C 5.5 的 lua_pushexternalstring（`lapi.c` → `luaS_newextlstr`）。
+/// `s` 是外部缓冲区，`len` 是长度，`dealloc` 是释放回调，`ud` 是回调参数。
 ///
-/// 实现说明：内容被拷贝进普通 LuaString（新增 TValue 字符串变体需改 ~700 处匹配，
-/// 收益不抵风险），缓冲区所有权经 `GlobalState::ext_string_buffers` 登记，state
-/// 关闭时按 C 契约 `dealloc(ud, s, len+1, 0)` 释放 —— 不泄漏、返回指针也不悬垂。
-/// `dealloc == NULL` 表示调用方保留内存（C 的 LSTRFIX），不登记。
+/// 语义与 C 一致：**内容不拷贝**，字符串对象的 `contents` 直接指向 `s`，
+/// 返回值即 `s`（C 的 `getstr(ts)`）；`dealloc` 非 NULL 时缓冲区所有权交给
+/// Lua，字符串不再可达（引用计数归零）时按 C 契约 `dealloc(ud, s, len+1, 0)`
+/// 释放一次。`dealloc == NULL` 表示调用方保留内存（C 的 LSTRFIX），永不释放。
+///
+/// # Safety
+/// 调用方须保证 `s` 至少 `len + 1` 字节可读、`s[len] == '\0'`，且缓冲区在
+/// Lua 调用 `dealloc` 之前保持有效（C API 契约）。
 #[no_mangle]
 pub extern "C" fn lua_pushexternalstring(
     L: *mut lua_State,
     s: *const c_char,
     len: usize,
-    dealloc: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize) -> *mut c_void>,
+    dealloc: Option<crate::strings::Falloc>,
     ud: *mut c_void,
 ) -> *const c_char {
     let L = unsafe { &mut *L };
-    if s.is_null() || len == 0 {
+    if s.is_null() {
+        // C 的 api_check 要求 s[len] == '\0'（隐含 s 非 null）；空指针容错退化为驻留空串
         L.push_string("");
-    } else {
-        let bytes = unsafe { std::slice::from_raw_parts(s as *const u8, len) };
-        L.push_lstring(bytes);
+        return s;
     }
-    if let Some(dealloc) = dealloc {
-        if !s.is_null() {
-            L.g()
-                .ext_string_buffers
-                .borrow_mut()
-                .push(crate::state::ExtStringBuffer {
-                    ptr: s as *mut c_void,
-                    falloc: dealloc,
-                    ud,
-                    len,
-                });
-        }
-    }
-    s
+    let tv =
+        unsafe { crate::strings::new_ext_str(L.alloc_slot(), s as *const u8, len, dealloc, ud) };
+    let ptr = crate::strings::lua_string_as_c_str_ptr(&tv);
+    L.push_value(tv);
+    ptr
 }
 
 // ============================================================================
@@ -5149,6 +5143,132 @@ mod tests {
             assert_eq!(s, b"hello world");
         }
         lua_close(L);
+    }
+
+    /// 回归：`lua_pushexternalstring` 对齐 C 5.5 语义（lapi.c → luaS_newextlstr）。
+    ///
+    /// 覆盖 tests_lua/attrib.lua 的 lib2-v2 外部字符串块（CI 的 all.lua 会执行：
+    /// 该块构造 lib22.c:newstr 的外部字符串，做相等/表键/next 断言）与
+    /// tests_lua/strings.lua 的 external strings 块（Rust 侧 T == nil，Lua 层被跳过）。
+    /// 要点：
+    /// 1. 内容不拷贝 —— 返回值与 `lua_tolstring` 都指向调用方缓冲区；
+    /// 2. 外部短字符串与同内容驻留短字符串相等（跨变体 luaS_eqstr）；
+    /// 3. 外部字符串做表键时驻留短字符串键可命中同一 entry；
+    /// 4. 字符串不可达（引用计数归零）时按 C 契约 `falloc(ud, s, len+1, 0)`
+    ///    恰好释放一次 —— 不再推迟到 lua_close。
+    #[test]
+    fn test_lua_pushexternalstring_matches_c_semantics() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        static FREED: AtomicUsize = AtomicUsize::new(0);
+        type AllocF = unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize) -> *mut c_void;
+
+        // 缓冲区前缀 16 字节存 (ud, allocf)，对应 lib22.c 的 struct STR。
+        const HDR: usize = 16;
+
+        // 对应 lib22.c 的 t_freestr：从缓冲区前缀取回宿主分配器并整块释放。
+        unsafe extern "C" fn t_freestr(
+            _ud: *mut c_void,
+            ptr: *mut c_void,
+            osize: usize,
+            nsize: usize,
+        ) -> *mut c_void {
+            assert_eq!(nsize, 0, "释放调用必须传 nsize = 0（C 的 lua_Alloc 契约）");
+            FREED.fetch_add(1, Ordering::SeqCst);
+            let base = (ptr as *mut u8).sub(HDR);
+            let ud = std::ptr::read(base as *const *mut c_void);
+            let allocf = std::ptr::read(base.add(8) as *const AllocF);
+            allocf(ud, base as *mut c_void, HDR + osize, 0);
+            std::ptr::null_mut()
+        }
+
+        // 对应 lib22.c 的 newstr：用 lua_getallocf 的分配器建缓冲区，内容拷入后
+        // 把所有权交给 Lua（dealloc 非 NULL → LSTRMEM）。
+        unsafe extern "C" fn newstr(L: *mut c_void) -> c_int {
+            let L = L as *mut lua_State;
+            let mut len = 0usize;
+            let s = luaL_checklstring(L, 1, &mut len);
+            let mut ud: *mut c_void = ptr::null_mut();
+            let allocf = lua_getallocf(L, &mut ud).expect("lua_getallocf 不得返回 NULL");
+            let base = allocf(ud, ptr::null_mut(), 0, len + 1 + HDR) as *mut u8;
+            assert!(!base.is_null());
+            std::ptr::write(base as *mut *mut c_void, ud);
+            std::ptr::write(base.add(8) as *mut AllocF, allocf);
+            std::ptr::copy_nonoverlapping(s, base.add(HDR) as *mut c_char, len + 1);
+            lua_pushexternalstring(
+                L,
+                base.add(HDR) as *const c_char,
+                len,
+                Some(t_freestr),
+                L as *mut c_void,
+            );
+            1
+        }
+
+        let L = luaL_newstate();
+        unsafe {
+            // 标准库（assert/string/ipairs 等）——luaL_newstate 不自动开库，
+            // 对应 C 的 luaL_openlibs(L) = luaL_openselectedlibs(L, ~0, 0)。
+            luaL_openselectedlibs(L, -1, 0);
+            lua_pushcfunction(L, newstr);
+            lua_setglobal(L, c"newstr".as_ptr());
+
+            // 不拷贝 + 指针同一（dealloc == NULL → LSTRFIX，调用方保留内存）
+            let buf = b"pointer-identity\0".to_vec();
+            let ret = lua_pushexternalstring(
+                L,
+                buf.as_ptr() as *const c_char,
+                buf.len() - 1,
+                None,
+                ptr::null_mut(),
+            );
+            assert_eq!(ret as *const u8, buf.as_ptr(), "返回值必须即调用方缓冲区");
+            let mut len = 0usize;
+            let p = lua_tolstring(L, -1, &mut len);
+            assert_eq!(p as *const u8, buf.as_ptr(), "lua_tolstring 不得返回副本");
+            assert_eq!(len, buf.len() - 1);
+            lua_settop(L, 0);
+
+            // Lua 层断言 —— attrib.lua 外部字符串块的等价物（含空串与 40/41 边界）
+            let src = c"
+                local function check(len)
+                  local str = string.rep('a', len)
+                  local str1 = newstr(str)
+                  assert(str == str1)
+                  local t = {}
+                  t[str1] = 20; assert(t[str] == 20 and t[str1] == 20)
+                  t[str] = 10; assert(t[str1] == 10)
+                  local tt = {[str1] = str1}
+                  assert(next(tt) == str1 and next(tt, str1) == nil)
+                  assert(tt[str] == str)
+                  local str2 = newstr(str1)
+                  assert(str == str2 and t[str2] == 10 and tt[str2] == str)
+                end
+                for _, len in ipairs{0, 10, 39, 40, 41, 1000} do check(len) end
+                return 'ok'
+            ";
+            assert_eq!(luaL_loadstring(L, src.as_ptr()), 0, "loadstring 失败");
+            let st = lua_pcallk(L, 0, 0, 0, 0, ptr::null());
+            if st != 0 {
+                let msg = lua_tolstring(L, -1, ptr::null_mut());
+                let m = if msg.is_null() {
+                    "?".to_string()
+                } else {
+                    std::ffi::CStr::from_ptr(msg).to_string_lossy().into_owned()
+                };
+                panic!("外部字符串 Lua 断言失败: {m}");
+            }
+            lua_settop(L, 0);
+            // 6 种长度 × 每次 2 个外部字符串（str1/str2）= 12 个缓冲区
+            lua_gc(L, 2 /* LUA_GCCOLLECT */, 0);
+            assert_eq!(
+                FREED.load(Ordering::SeqCst),
+                12,
+                "每个外部字符串缓冲区必须恰好释放一次（不可达即释放，不等到 lua_close）"
+            );
+            lua_close(L);
+            assert_eq!(FREED.load(Ordering::SeqCst), 12, "关闭后不得重复释放");
+        }
     }
 
     #[test]
