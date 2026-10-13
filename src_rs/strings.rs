@@ -1425,6 +1425,89 @@ mod tests {
         );
         assert_eq!(LAST_LEN.load(Ordering::SeqCst), 14, "osize = len + 1");
     }
+
+    /// 分配与释放的块大小必须一致：`RcPayload::payload_size` 对常规长字符串返回
+    /// `FIXED_SIZE + len`（含内联内容 + 末尾 NUL），对外部字符串只返回 `FIXED_SIZE`
+    /// （无内联内容）。二者不一致会让 `SimpleRc::drop` 用错误的 layout 调 allocator
+    /// （std::alloc 的 dealloc layout 不匹配 = UB），且外部字符串会白白占用内联空间。
+    #[test]
+    fn test_long_string_alloc_dealloc_size_matches() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        use crate::mem::{Allocator, DefaultAllocator};
+
+        #[derive(Default)]
+        struct Sizes {
+            alloc: Option<usize>,
+            free: Option<usize>,
+        }
+
+        struct RecordingAllocator {
+            sizes: Rc<RefCell<Sizes>>,
+        }
+        impl Allocator for RecordingAllocator {
+            fn alloc(&self, ptr: *mut u8, osize: usize, nsize: usize, align: usize) -> *mut u8 {
+                let out = DefaultAllocator.alloc(ptr, osize, nsize, align);
+                if osize == 0 && nsize > 0 {
+                    self.sizes.borrow_mut().alloc = Some(nsize);
+                } else if nsize == 0 && osize > 0 {
+                    self.sizes.borrow_mut().free = Some(osize);
+                }
+                out
+            }
+        }
+
+        let sizes = Rc::new(RefCell::new(Sizes::default()));
+        let boxed: Box<dyn Allocator> = Box::new(RecordingAllocator {
+            sizes: Rc::clone(&sizes),
+        });
+        let slot = unsafe { SlotAlloc::from_slot(&boxed) };
+
+        // 常规长字符串：块 = 固定头 + 内容 + NUL
+        let content = "a".repeat(100);
+        let reg = SimpleRc::<LongString, SlotAlloc>::new_lstr(slot, None, content.as_bytes());
+        let reg_alloc = sizes.borrow().alloc.expect("应有分配");
+        assert_eq!(
+            reg_alloc,
+            crate::alloc::simple_layout::<SlotAlloc, LongString>(
+                LongString::FIXED_SIZE + content.len() + 1
+            )
+            .size()
+        );
+        drop(reg);
+        assert_eq!(
+            sizes.borrow().free,
+            Some(reg_alloc),
+            "释放 layout 必须与分配一致"
+        );
+
+        // 外部字符串：块 = 固定头（内容在调用方缓冲区）
+        let buf = b"external\0".to_vec();
+        let ext = unsafe {
+            SimpleRc::<LongString, SlotAlloc>::new_ext_lstr(
+                slot,
+                buf.as_ptr(),
+                8,
+                None,
+                std::ptr::null_mut(),
+            )
+        };
+        let ext_alloc = sizes.borrow().alloc.expect("应有分配");
+        assert_eq!(
+            ext_alloc,
+            crate::alloc::simple_layout::<SlotAlloc, LongString>(LongString::FIXED_SIZE).size(),
+            "外部字符串不得分配内联空间"
+        );
+        assert!(ext_alloc < reg_alloc);
+        assert_eq!(long_content(&ext), b"external");
+        drop(ext);
+        assert_eq!(
+            sizes.borrow().free,
+            Some(ext_alloc),
+            "释放 layout 必须与分配一致"
+        );
+    }
     // ------------------------------------------------------------------------
     // new_lstr 测试
     // ------------------------------------------------------------------------
