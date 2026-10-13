@@ -36,6 +36,8 @@ steps:
   commands:
   - cargo build --release
   - cargo test --release
+  # fast_unsafe 关闭配置 (安全等价实现) 的回归覆盖: 与默认配置同一套测试
+  - cargo test --release --no-default-features
   - ./target/release/lua -v
 
 - name: cmp-tests
