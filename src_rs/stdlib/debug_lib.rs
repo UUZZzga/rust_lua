@@ -356,7 +356,7 @@ fn call_getmetatable<'a>(
         }
         TValue::UserData(u) => {
             if let Some(ref mt) = *u.metatable.borrow() {
-                TValue::Table(mt.as_ref().clone())
+                TValue::Table(mt.clone())
             } else {
                 TValue::Nil(NilKind::Strict)
             }

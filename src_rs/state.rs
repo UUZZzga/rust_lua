@@ -2393,6 +2393,11 @@ impl<'a> LuaState<'a> {
             to_finalize.push(TValue::UserData(u));
         }
         self.call_finalizers(to_finalize);
+        // 断环必须发生在最后一次完整回收**之前**：此时 globals / registry / package.loaded
+        // 仍是 GC 根，环内对象（如 `M.rrotate` 上值捕获模块表 M、metatable ↔ __gc 闭包）
+        // 会被判为可达而逃过清扫；若等 Drop for GlobalState 再断，外部引用释放后已无
+        // 第二次回收，纯 Rc 环永久存活（ASan 报 indirect leak）。
+        self.g().break_close_refs();
         // 关闭前做一次完整回收：`func::close` 关上值、finalizer 运行都可能**新造出**
         // 不可达的 Rc 自引用环（闭包↔上值、协程↔执行态、表自引用），这些环只能靠
         // GC 打断（sweep 清空死对象的引用），之后就交给 Rc 归零释放。
@@ -2540,6 +2545,24 @@ impl<'a> std::fmt::Debug for GlobalState<'a> {
     }
 }
 
+/// `lua_pushexternalstring` 登记的外部缓冲区（所有权已交给 Lua）。
+/// 字段语义同 C 的 `TString.falloc/ud/contents/u.lnglen`。
+pub struct ExtStringBuffer {
+    /// 缓冲区首地址（C 契约：`s[len] == '\0'`，可 free 长度为 len+1）。
+    pub ptr: *mut std::ffi::c_void,
+    /// 释放回调（对应 C 的 `lua_Alloc falloc`）。
+    pub falloc: unsafe extern "C" fn(
+        *mut std::ffi::c_void,
+        *mut std::ffi::c_void,
+        usize,
+        usize,
+    ) -> *mut std::ffi::c_void,
+    /// 回调参数（对应 C 的 `TString.ud`）。
+    pub ud: *mut std::ffi::c_void,
+    /// 字符串长度（释放长度为 len+1）。
+    pub len: usize,
+}
+
 pub struct GlobalState<'a> {
     // === 主线程登记（对应 C 的 G.mainthread）===
     /// 主线程执行态指针 —— 对应 C 的 `global_State.mainthread`。
@@ -2630,6 +2653,18 @@ pub struct GlobalState<'a> {
     /// 存储 Rc<Udata> 而非 Udata 深拷贝：确保 __gc 在原始 userdata 上调用，
     /// 这样 C 模块（如 lsqlite3）能通过 light userdata 指针正确清理 registry 引用
     pub ud_finobj_list: Rc<RefCell<Vec<MyRc<crate::objects::Udata<'a>, SlotAlloc>>>>,
+    /// 外部字符串（`lua_pushexternalstring`）待释放的调用方缓冲区。
+    ///
+    /// Lua 5.5 的 `lua_pushexternalstring` 把缓冲区所有权交给 Lua：字符串被回收时
+    /// 调用 `falloc(ud, s, len+1, 0)`。本实现把内容拷贝进普通 LuaString（新增
+    /// TValue 字符串变体要改 ~700 处匹配，收益不抵风险），因此把释放推迟到 state
+    /// 关闭时统一执行（`break_close_refs`）。
+    ///
+    /// 语义偏差仅「释放时机推后」：调用方已把所有权交出，任何时刻释放都不影响其
+    /// 可见行为；且返回给 C 的指针在整个 state 生命周期内保持有效（不会悬垂——
+    /// 若改成拷贝后立即释放，C 侧继续使用返回指针就会 use-after-free）。
+    /// `falloc == NULL` 表示调用方保留内存（C 的 LSTRFIX），不登记。
+    pub ext_string_buffers: Rc<RefCell<Vec<crate::state::ExtStringBuffer>>>,
     /// 状态正在关闭 — 对应 C 的 g->gcstp & GCSTPCLS
     /// true 时不再注册新的 finalizer 对象（close 中创建的对象不会被 finalize）
     pub gc_closing: bool,
@@ -2871,6 +2906,7 @@ impl<'a> GlobalState<'a> {
             concat_gc_interval: std::cell::Cell::new(32768),
             finobj_list: Rc::new(RefCell::new(Vec::new())),
             ud_finobj_list: Rc::new(RefCell::new(Vec::new())),
+            ext_string_buffers: Rc::new(RefCell::new(Vec::new())),
             gc_closing: false,
             exit_requested: None,
             cached_mode_key: std::cell::RefCell::new(None),
@@ -2981,6 +3017,7 @@ impl<'a> LuaState<'a> {
             concat_gc_interval: std::cell::Cell::new(32768),
             finobj_list: Rc::new(RefCell::new(Vec::new())),
             ud_finobj_list: Rc::new(RefCell::new(Vec::new())),
+            ext_string_buffers: Rc::new(RefCell::new(Vec::new())),
             gc_closing: false,
             exit_requested: None,
             cached_mode_key: std::cell::RefCell::new(None),
@@ -3006,42 +3043,71 @@ impl<'a> LuaState<'a> {
     }
 }
 
-impl<'a> Drop for GlobalState<'a> {
-    fn drop(&mut self) {
-        // 打破 globals / registry 的 Rc 自引用循环。
+impl<'a> GlobalState<'a> {
+    /// 关闭期断环 —— 断开仅靠 Rc 自引用环存活的对象的外部引用。
+    ///
+    /// globals 里存了 `_G -> Table(globals_clone)`，globals_clone 的 Rc 指回
+    /// globals 自身的 TableData；Rc 计数永远 ≥ 2，`TableData::drop` 从不被调用，
+    /// 内部所有 TValue（含 intern 字符串）都不释放。同理 package <-> package.loaded
+    /// （open_selected_libs 把标准库表放进 loaded，loaded["package"] 指回 package）
+    /// 与 registry 里的 `_LOADED` / `_PACKAGE` / `_G` 等回指。
+    ///
+    /// 清空这些表的槽位后，环内对象的外部长引用被释放；**紧随其后必须再跑一次
+    /// 完整 GC**（`LuaState::close_state` 中调用顺序：先断环、后 collect_gc），
+    /// 由 mark/sweep 把剩下的不可达对象（表/metatable/闭包/proto）清空并释放，
+    /// 否则「表↔闭包」这类纯 Rc 环（如 `M.rrotate` 上值捕获 M、metatable ↔ __gc 闭包）
+    /// 会在 globals/registry 仍作为 GC 根时被判为可达而逃过清扫，之后 drop 阶段
+    /// 释放外部引用时已无第二次回收，环永久存活（ASan 报 indirect leak）。
+    /// 对应 C 的 `lua_close` → `luaC_freeallobjects`「关闭即释放全部」语义。
+    pub fn break_close_refs(&self) {
+        // 先打破 package <-> package.loaded：open_selected_libs 会把各标准库表
+        // 放进 package.loaded，且 loaded["package"] 指回 package 自身，构成 Rc 循环。
+        // 若不先清空 loaded，则 package 与所有标准库表（含其内部的 intern 字符串）
+        // 连同所有 require 过的模块都不会被释放。必须在清空 globals 之前查找。
         //
-        // globals 里存了 `_G -> Table(globals_clone)`，globals_clone 的 Rc
-        // 指回 globals 自身的 TableData。Rc 计数永远 ≥ 2，TableData::drop
-        // 从不被调用，导致内部所有 TValue 泄漏（包括所有 intern 字符串）。
-        //
-        // 清空 globals / registry 的槽位后，内部持的那一份 Rc 被 drop，
-        // 计数降到 1，后续 Rust 自动 drop 字段时归零，TableData::drop 正常执行。
-        //
-        // 必须在其他字段 drop 之前做这一步；globals/registry 字段顺序在 main 之后，
-        // 手动清理它们即可。
-        //
-        // 先打破 package <-> package.loaded 循环引用：open_selected_libs 会把各
-        // 标准库表放进 package.loaded，且 loaded["package"] 指回 package 自身，
-        // 构成 Rc 循环。若不先清空 loaded，则 package 与所有标准库表（含其内部的
-        // intern 字符串）永不被释放。必须在清空 globals 之前查找（之后就拿不到
-        // package 表了）。
-        {
-            let pkg_key = self.intern_str("package");
-            if let Some(TValue::Table(pkg)) = self.globals.get(&pkg_key) {
-                let loaded_key = self.intern_str("loaded");
-                if let Some(TValue::Table(loaded)) = pkg.get(&loaded_key) {
-                    loaded.clear_for_drop();
+        // 查 package 表必须与 `base_lib::get_package_table` 一致走 registry["_PACKAGE"]：
+        // Lua 脚本可以删除/覆盖全局 `package`（all.lua 结尾会把所有全局变量擦成 undef），
+        // 只查 globals 会漏掉这条循环（实测泄漏 188 块 / 26.5KB）。
+        let pkg_key = self.intern_str("_PACKAGE");
+        let pkg = match self.registry.get(&pkg_key) {
+            Some(TValue::Table(t)) => Some(t),
+            _ => {
+                let g_key = self.intern_str("package");
+                match self.globals.get(&g_key) {
+                    Some(TValue::Table(t)) => Some(t),
+                    _ => None,
                 }
+            }
+        };
+        if let Some(pkg) = pkg {
+            let loaded_key = self.intern_str("loaded");
+            if let Some(TValue::Table(loaded)) = pkg.get(&loaded_key) {
+                loaded.clear_for_drop();
             }
         }
         self.globals.clear_for_drop();
         self.registry.clear_for_drop();
 
-        // 其他可能持有 Table 的字段也逐一处理，视实际需要补
+        // 其他可能持有 Table 的字段也逐一处理，视实际需要补。
         self.finobj_list.borrow_mut().clear();
-        // weak_tables / ud_finobj_list / main_thread 里的 Table 若有循环也需处理
-        // 执行态侧清理（caller_gc_stacks/c_safety_keepalive/close_state）在
-        // Drop for LuaState 中完成（owner 字段最后析构，此处 globals 断链先做）。
+        // weak_tables / ud_finobj_list / main_thread 里的 Table 由后续 collect_gc 清扫。
+
+        // 外部字符串缓冲区：调用方已把所有权交出，关闭时按 C 的约定
+        // `falloc(ud, s, len+1, 0)` 释放（否则 C 模块经 lua_pushexternalstring
+        // 分配的缓冲永不回收 —— ASan 报 13 块 / 2541 字节 direct leak）。
+        let pending: Vec<ExtStringBuffer> =
+            self.ext_string_buffers.borrow_mut().drain(..).collect();
+        for b in pending {
+            // SAFETY: 缓冲区由 falloc 分配、长度 len+1（C 契约），此处只释放一次。
+            unsafe { (b.falloc)(b.ud, b.ptr, b.len + 1, 0) };
+        }
+    }
+}
+
+impl<'a> Drop for GlobalState<'a> {
+    fn drop(&mut self) {
+        // 兜底：close_state 已断过环（幂等），此处覆盖未走 close_state 的析构路径。
+        self.break_close_refs();
     }
 }
 

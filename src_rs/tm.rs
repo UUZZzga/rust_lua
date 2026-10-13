@@ -313,7 +313,7 @@ pub fn obj_type_name_<'a>(table: &StringTable, obj: &TValue<'a>) -> String {
     // 获取元表（Table 通过 get_metatable() 共享 Rc；UserData 直接克隆）
     let meta: Option<Table> = match obj {
         TValue::Table(t) => t.get_metatable(),
-        TValue::UserData(u) => u.metatable.borrow().as_ref().map(|b| (**b).clone()),
+        TValue::UserData(u) => u.metatable.borrow().as_ref().map(|b| (*b).clone()),
         _ => None,
     };
     if let Some(mt) = meta {

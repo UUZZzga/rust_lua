@@ -258,7 +258,7 @@ fn getmeta<'a>(state: &LuaState<'a>, idx: c_int) -> Option<Table<'a>> {
             .metatable
             .borrow()
             .as_ref()
-            .map_or(None, |t| Some(*t.clone())),
+            .map_or(None, |t| Some(t.clone())),
         _ => None,
     }
 }
@@ -1666,7 +1666,7 @@ pub extern "C" fn lua_getmetatable(L: *mut lua_State, objindex: c_int) -> c_int 
         None => return 0,
     };
     let mt = match &L.stack[off] {
-        TValue::UserData(u) => u.metatable.borrow().as_ref().map(|b| (**b).clone()),
+        TValue::UserData(u) => u.metatable.borrow().as_ref().map(|b| (*b).clone()),
         TValue::Table(t) => t.get_metatable(),
         _ => None,
     };
@@ -1723,7 +1723,7 @@ pub extern "C" fn lua_setmetatable(L: *mut lua_State, objindex: c_int) -> c_int 
             // the userdata in-place regardless of how many references there are.
             let ptr = u.as_raw_ptr() as *mut Udata;
             unsafe {
-                (*ptr).metatable = mt.as_ref().map(|t| Box::new(t.clone())).into();
+                (*ptr).metatable = mt.as_ref().map(|t| t.clone()).into();
             }
             // 检查元表是否含 __gc，若有则收集待注册的 userdata
             if let Some(ref mt_table) = mt {
@@ -2692,16 +2692,17 @@ pub extern "C" fn lua_topointer(L: *mut lua_State, idx: c_int) -> *const c_void 
 /// 对应 C 5.5 的 lua_pushexternalstring。
 /// s 是外部缓冲区，len 是长度，dealloc 是释放回调，ud 是回调参数。
 ///
-/// 简化实现：拷贝 s 内容到普通 LuaString，不实际调用 dealloc
-/// （.so 的 dlclose 由进程退出时 OS 回收，对测试运行无影响）。
-/// 这避免了修改 GC 机制以支持外部字符串的复杂度。
+/// 实现说明：内容被拷贝进普通 LuaString（新增 TValue 字符串变体需改 ~700 处匹配，
+/// 收益不抵风险），缓冲区所有权经 `GlobalState::ext_string_buffers` 登记，state
+/// 关闭时按 C 契约 `dealloc(ud, s, len+1, 0)` 释放 —— 不泄漏、返回指针也不悬垂。
+/// `dealloc == NULL` 表示调用方保留内存（C 的 LSTRFIX），不登记。
 #[no_mangle]
 pub extern "C" fn lua_pushexternalstring(
     L: *mut lua_State,
     s: *const c_char,
     len: usize,
-    _dealloc: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize) -> *mut c_void>,
-    _ud: *mut c_void,
+    dealloc: Option<unsafe extern "C" fn(*mut c_void, *mut c_void, usize, usize) -> *mut c_void>,
+    ud: *mut c_void,
 ) -> *const c_char {
     let L = unsafe { &mut *L };
     if s.is_null() || len == 0 {
@@ -2709,6 +2710,19 @@ pub extern "C" fn lua_pushexternalstring(
     } else {
         let bytes = unsafe { std::slice::from_raw_parts(s as *const u8, len) };
         L.push_lstring(bytes);
+    }
+    if let Some(dealloc) = dealloc {
+        if !s.is_null() {
+            L.g()
+                .ext_string_buffers
+                .borrow_mut()
+                .push(crate::state::ExtStringBuffer {
+                    ptr: s as *mut c_void,
+                    falloc: dealloc,
+                    ud,
+                    len,
+                });
+        }
     }
     s
 }

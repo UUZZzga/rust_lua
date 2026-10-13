@@ -2060,7 +2060,7 @@ impl<'a> LuaState<'a> {
                     s.userdata += 1;
                 });
                 if let Some(ref mt) = &*u.metatable.borrow() {
-                    let tv = TValue::Table((**mt).clone());
+                    let tv = TValue::Table((*mt).clone());
                     unsafe { worklist.push(raw_from_tvalue(&tv)) };
                     drop(tv);
                 }

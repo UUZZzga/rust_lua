@@ -420,7 +420,7 @@ fn call_getmetatable<'a>(
         TValue::UserData(ud) => {
             let mt = ud.metatable.borrow().clone();
             if let Some(mt) = mt {
-                TValue::Table(*mt)
+                TValue::Table(mt)
             } else {
                 TValue::Nil(NilKind::Strict)
             }

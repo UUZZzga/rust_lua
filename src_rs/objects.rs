@@ -1793,7 +1793,7 @@ pub struct Udata<'a> {
     /// 数据长度
     pub len: usize,
     /// 元表
-    pub metatable: RefCell<Option<Box<Table<'a>>>>,
+    pub metatable: RefCell<Option<Table<'a>>>,
     /// 用户值列表
     pub user_values: Vec<TValue<'a>>,
     /// 原始数据 — 使用 Vec<u64> 保证 8 字节对齐

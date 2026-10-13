@@ -252,7 +252,7 @@ fn new_file_userdata<'a>(
         gc_header: crate::gc::GCObjectHeader::new(),
         nuvalue: 0,
         len: 0,
-        metatable: Some(Box::new(file_mt.clone())).into(),
+        metatable: Some(file_mt.clone()).into(),
         user_values: vec![],
         data: vec![file as u64],
     };
@@ -2292,7 +2292,7 @@ pub fn open_io_lib<'a>(state: &mut LuaState<'a>) {
             gc_header: crate::gc::GCObjectHeader::new(),
             nuvalue: 0,
             len: 0,
-            metatable: Some(Box::new(file_mt.clone())).into(),
+            metatable: Some(file_mt.clone()).into(),
             user_values: vec![],
             data: vec![file as u64],
         };
