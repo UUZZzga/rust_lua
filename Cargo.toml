@@ -99,7 +99,9 @@ lua_longjmp = []
 # 注意: Cargo 无法按工具链自动开关, 故 nightly 上需显式指定。
 # 用法: cargo build --features nightly-allocator
 nightly-allocator = []
-# 临时: write_stack 越界探测 (仅诊断用, 不入库)
+# write_stack scratch 不变量诊断 (见 CLAUDE.md「栈 scratch 不变量」):
+# 打开后扫描每次寄存器写, 报告越过 max(len, scratch_end) 或超出 capacity 的次数
+# (WSOOB / WSCAP)。tests_lua 全套应为零输出。
 probe_wstack = []
 # 体积优先模式: 通过 [profile.size-opt] 实现 (opt-level="z" + panic="abort"),
 # build.rs 检测 OPT_LEVEL=s/z 自动设置 cfg(size_optimized) 切换代码层面优化:

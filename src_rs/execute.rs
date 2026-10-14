@@ -2072,18 +2072,23 @@ impl VmExecutor {
         // 由 LuaState::pad_frame_scratch (帧入口/截断后补齐) 与 truncate_live
         // (语义截断不把 len 收缩到写边界以下) 共同维护, 见 state.rs
         // 「帧寄存器 scratch」小节。越界写 = 不变量被破坏, debug 下断言暴露。
+        // 可写的槽位上界 = max(Vec 逻辑长度, 帧 scratch 上界)。两者都是「已初始化内存」:
+        // [0, len) 由 Vec 管理, [len, scratch_end) 由 pad_frame_scratch 填 Nil (见 state.rs
+        // 「帧寄存器 scratch」小节)。下面两条路径都只需要这一次取上界:
+        //   * probe_wstack (诊断构建): 计数越界写 (WSOOB) 与超出 capacity 的写 (WSCAP);
+        //   * fast_unsafe (正常构建): 恒定不跳转的安全网 —— 不变量破例时退化为按需补齐,
+        //     而不是 UB。
+        let write_limit = if state.stack.len() > state.scratch_end {
+            state.stack.len()
+        } else {
+            state.scratch_end
+        };
         #[cfg(feature = "probe_wstack")]
         {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static OOB: AtomicUsize = AtomicUsize::new(0);
-            let limit = if state.stack.len() > state.scratch_end {
-                state.stack.len()
-            } else {
-                state.scratch_end
-            };
             if idx >= state.stack.capacity() {
-                use std::sync::atomic::AtomicUsize as AU;
-                static OV: AU = AU::new(0);
+                static OV: AtomicUsize = AtomicUsize::new(0);
                 let n = OV.fetch_add(1, Ordering::Relaxed);
                 if n < 10 {
                     eprintln!(
@@ -2094,7 +2099,7 @@ impl VmExecutor {
                     );
                 }
             }
-            if idx >= limit {
+            if idx >= write_limit {
                 let n = OOB.fetch_add(1, Ordering::Relaxed);
                 if n < 10 {
                     eprintln!(
@@ -2108,24 +2113,12 @@ impl VmExecutor {
                 }
             }
         }
-        // 无分支写。安全性前提 (见 state.rs「帧寄存器 scratch」小节):
-        //   idx < len  (槽在 Vec 逻辑区内), 或 idx < scratch_end (槽是已初始化的 Nil scratch)。
-        // 两者都由 pad_frame_scratch 在帧入口/恢复点保证; debug 下断言暴露破例。
-        // 安全网 (不变量的守卫, 非热路径): idx 落在「Vec 逻辑区 + 帧 scratch」之外时
-        // 走补齐路径 (填 Nil 到 idx+1 再写)。正常执行中 scratch 由 pad_frame_scratch
-        // 维护, 该分支恒定不跳转 (预测 ~100%, 代价 ~0); 一旦某个不变量维护点遗漏,
-        // 它把「未定义行为」降级为「按需补齐」—— 语义等价、可继续运行。
         #[cfg(all(feature = "fast_unsafe", not(feature = "probe_wstack")))]
-        {
-            let limit = if state.stack.len() > state.scratch_end {
-                state.stack.len()
-            } else {
-                state.scratch_end
-            };
-            if idx >= limit {
-                Self::write_stack_grow(state, idx);
-            }
+        if idx >= write_limit {
+            Self::write_stack_grow(state, idx);
         }
+        // 无分支写: 唯一保留的分支是「旧值是否需要 drop」(Rc 释放, 跳过即泄漏, 实测
+        // 预测命中率 ~100%); len 与 top 都用 max 更新 (cmov)。
         #[cfg(feature = "fast_unsafe")]
         unsafe {
             let slot: *mut TValue<'a> = state.stack.as_mut_ptr().add(idx);
@@ -2137,8 +2130,6 @@ impl VmExecutor {
                 state.scratch_end,
                 state.base
             );
-            // 旧值非 trivial 时必须先释放 (Rc/表等) —— 该分支必须保留 (跳过 = 泄漏),
-            // 实测预测命中率 ~100% (寄存器旧值几乎总是 number)。
             if matches!(
                 &*slot,
                 TValue::LongStr(_)
@@ -2153,14 +2144,11 @@ impl VmExecutor {
                 let _ = std::ptr::replace(slot, TValue::Nil(NilKind::Strict));
             }
             std::ptr::write(slot, val);
-            // 逻辑长度覆盖写入槽 (cmov): Vec 才能正确 drop 该值; scratch 区已初始化,
-            // 故 set_len 不会暴露未初始化内存。
             let len = state.stack.len();
             if idx >= len {
                 state.stack.set_len(idx + 1);
             }
         }
-        // 安全等价实现
         #[cfg(not(feature = "fast_unsafe"))]
         {
             if idx >= state.stack.len() {

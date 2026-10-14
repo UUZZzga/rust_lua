@@ -661,10 +661,13 @@ impl<'a> LuaState<'a> {
 //   * `top` 是唯一语义 live top: 寄存器写把它抬到 idx+1 (值在 [..top) 内才算根),
 //     语义截断把它降到目标位并释放被移出者的非 trivial 值。
 //
-// `len` 只在两种情况下被抬高: 帧入口/截断后补齐 (pad_frame_scratch), 以及越过边界的
-// 写。**语义截断一律经 truncate_live —— 不再用 Vec::truncate 把 len 收缩到帧写边界
-// 以下**, 因此 `len` 会与语义 live top 脱钩: 凡是进入「把 stack.len() 当 live top 读」
-// 的边界 (builtin / 元方法 / <close> / C API / 协程 resume), 必须先 deflate_to_top()。
+// `len` 的语义恒定不变 —— 它仍是精确的 live top, C 侧与所有位置读取者继续直接使用它;
+// scratch 只体现在 `scratch_end` 的额外承诺上, 对 `len` 的读取者完全不可见。
+// **语义截断一律经 truncate_live / truncate_live_vec** (就地释放非 trivial 值 + 收缩
+// 长度, 槽位保持为已初始化的 Nil); 任何把手头值移出栈的操作 (pop / remove / split_off /
+// drain / 协程栈交换) 都必须把腾出的槽位复位为 Nil (pop_slot / remove_slot + 重置
+// scratch_end 后重新补齐), 否则之后落在该槽的写会在「旧值是否需 drop」检查里读到副本而
+// 二次减引用。
 // ============================================================================
 
 impl<'a> LuaState<'a> {
