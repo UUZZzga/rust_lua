@@ -99,6 +99,8 @@ lua_longjmp = []
 # 注意: Cargo 无法按工具链自动开关, 故 nightly 上需显式指定。
 # 用法: cargo build --features nightly-allocator
 nightly-allocator = []
+# 临时: write_stack 越界探测 (仅诊断用, 不入库)
+probe_wstack = []
 # 体积优先模式: 通过 [profile.size-opt] 实现 (opt-level="z" + panic="abort"),
 # build.rs 检测 OPT_LEVEL=s/z 自动设置 cfg(size_optimized) 切换代码层面优化:
 #   - 浮点格式化/解析用 libc snprintf/strtod 替代 Rust flt2dec/dec2flt (~34KB)

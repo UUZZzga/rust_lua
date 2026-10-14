@@ -494,13 +494,13 @@ pub(crate) fn call_tm_res<'a>(
         TValue::Nil(NilKind::Strict)
     };
 
-    // 截断栈，移除临时压入的函数/参数/结果
-    state.stack.truncate(func_idx);
+    // 截断栈，移除临时压入的函数/参数/结果 (释放其中非 trivial 值, 保留帧 scratch)
+    state.truncate_live(func_idx);
 
     if status != 0 {
         // 元方法调用失败 — 保留 CallInfoEntry 供 traceback 使用
         // 上层 state.pcall 会保存 call_info 快照（包含此帧），然后截断到正确长度
-        state.top = state.stack.len();
+        state.top = func_idx;
         let mm_name = tm.event_name();
         return Err(match &result {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
@@ -524,7 +524,9 @@ pub(crate) fn call_tm_res<'a>(
         state.stack.push(TValue::Nil(NilKind::Strict));
     }
     state.stack[res] = result;
-    state.top = state.stack.len();
+    state.top = func_idx.max(res + 1);
+    // 恢复帧寄存器 scratch (write_stack 无分支写前提)
+    state.pad_frame_scratch();
     Ok(())
 }
 
@@ -647,8 +649,8 @@ pub(crate) fn call_tm<'a>(
             TValue::Nil(NilKind::Strict)
         };
         // 截断栈, 移除错误值和临时压入的函数/参数
-        state.stack.truncate(func_idx);
-        state.top = state.stack.len();
+        state.truncate_live(func_idx);
+        state.top = func_idx;
         return Err(match &result {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 VmError::RuntimeError(lua_string_as_str(s).to_string())
@@ -657,9 +659,10 @@ pub(crate) fn call_tm<'a>(
         });
     }
     // 成功: pop CallInfoEntry, 截断栈
-    state.stack.truncate(func_idx);
-    state.top = state.stack.len();
+    state.truncate_live(func_idx);
+    state.top = func_idx;
     state.call_info.pop();
+    state.pad_frame_scratch();
     Ok(())
 }
 
@@ -818,8 +821,8 @@ pub fn call_close_method<'a>(
             .cloned()
             .unwrap_or(TValue::Nil(NilKind::Strict));
         // 截断栈，移除临时压入的函数/参数/错误值
-        state.stack.truncate(func_idx);
-        state.top = state.stack.len();
+        state.truncate_live(func_idx);
+        state.top = func_idx;
         // 保存 __close 的 CallInfoEntry — 对应 C Lua 中 longjmp 跳过 callclosemethod
         // 的弹出代码，CallInfo 节点保留在链表中。state.pcall 保存 call_info 快照时
         // 将此帧追加到快照末尾，让 xpcall 的错误处理函数（如 debug.traceback）能看到
@@ -840,8 +843,9 @@ pub fn call_close_method<'a>(
         );
     }
     // 截断栈，移除临时压入的函数/参数
-    state.stack.truncate(func_idx);
-    state.top = state.stack.len();
+    state.truncate_live(func_idx);
+    state.top = func_idx;
+    state.pad_frame_scratch();
     Ok(true)
 }
 
@@ -1160,12 +1164,12 @@ pub fn call_order_tm<'a>(
 
     if found {
         let result = state.stack[res].clone();
-        state.stack.truncate(res);
-        state.top = state.stack.len();
+        state.truncate_live(res);
+        state.pad_frame_scratch();
         Ok(!result.is_false())
     } else {
-        state.stack.truncate(res);
-        state.top = state.stack.len();
+        state.truncate_live(res);
+        state.pad_frame_scratch();
         Err(ordererror(state, p1, p2))
     }
 }
@@ -1270,8 +1274,8 @@ pub fn equal_obj<'a>(
             state.stack.push(TValue::Nil(NilKind::Strict));
             call_tm_res(state, &f, t1, t2, res, TagMethod::Eq)?;
             let result = state.stack[res].clone();
-            state.stack.truncate(res);
-            state.top = state.stack.len();
+            state.truncate_live(res);
+            state.pad_frame_scratch();
             Ok(!result.is_false())
         }
         None => Ok(false),
@@ -1327,22 +1331,18 @@ pub fn obj_len<'a>(
             } else {
                 // 无元方法: 返回表长度
                 let len = t.len();
-                while state.stack.len() <= ra {
-                    state.stack.push(TValue::Nil(NilKind::Strict));
-                }
-                state.stack[ra] = TValue::Integer(len as LuaInteger);
-                state.top = state.stack.len();
+                crate::execute::VmExecutor::write_stack(
+                    state,
+                    ra,
+                    TValue::Integer(len as LuaInteger),
+                );
                 return Ok(());
             }
         }
         s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
             // 字符串: 返回长度
             let len = lua_string_len(s);
-            while state.stack.len() <= ra {
-                state.stack.push(TValue::Nil(NilKind::Strict));
-            }
-            state.stack[ra] = TValue::Integer(len as LuaInteger);
-            state.top = state.stack.len();
+            crate::execute::VmExecutor::write_stack(state, ra, TValue::Integer(len as LuaInteger));
             return Ok(());
         }
         _ => {

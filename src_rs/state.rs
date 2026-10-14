@@ -190,6 +190,13 @@ pub struct LuaState<'a> {
     pub tbc_list: Option<usize>,
     pub call_stack: Vec<crate::objects::CallFrame<'a>>,
     pub stack: Vec<TValue<'a>>,
+
+    /// 已初始化 scratch 槽上界 (exclusive): `[stack.len(), scratch_end)` 是已分配且
+    /// 已写入 Nil 的内存, 供 write_stack 无分支写复用 (当前帧寄存器区), 恒 >= 该帧
+    /// 写边界 frame_floor()。**len 仍是精确的 live top 上界 (所有读取者不受影响)**;
+    /// scratch 只由 pad_frame_scratch 抬高、由 truncate_live 就地清零 (保持已初始化),
+    /// 内容恒为 trivially-droppable 值 (Nil), 故 Vinec 不会 drop 到它、也无 Rc 保活。
+    pub scratch_end: usize,
     pub hook_old_pc: i32,
     /// debug hook 函数 — 对应 C 的 L->hook
     pub hook_func: Option<TValue<'a>>,
@@ -331,6 +338,7 @@ impl<'a> LuaState<'a> {
     /// 独立字段全默认，不持有共享块；`l_g` 由调用方 `bind_g` 绑定。
     pub fn empty_thread() -> Self {
         LuaState {
+            scratch_end: 0,
             constants: Rc::new(Vec::new()),
             code: Rc::new(Vec::new()),
             protos: Rc::new(Vec::new()),
@@ -642,6 +650,208 @@ impl<'a> LuaState<'a> {
 }
 
 // ============================================================================
+// LuaState — 帧寄存器 scratch (栈地板)
+//
+// write_stack 无分支写的前提是「当前帧寄存器区恒在 stack.len() 之内」:
+//
+//   * `len` (Vec 长度) = 物理已初始化长度, 恒 >= frame_floor() (当前帧寄存器写边界);
+//   * 帧寄存器区之上的 `[top, len)` 称为 scratch, **恒只含 trivially-droppable 值**
+//     (Nil/Boolean/Integer/Float) —— 既保证 GC 根扫描 [..top) 的精确性 (不额外保活),
+//     也意味着丢弃 scratch 不需要 drop;
+//   * `top` 是唯一语义 live top: 寄存器写把它抬到 idx+1 (值在 [..top) 内才算根),
+//     语义截断把它降到目标位并释放被移出者的非 trivial 值。
+//
+// `len` 只在两种情况下被抬高: 帧入口/截断后补齐 (pad_frame_scratch), 以及越过边界的
+// 写。**语义截断一律经 truncate_live —— 不再用 Vec::truncate 把 len 收缩到帧写边界
+// 以下**, 因此 `len` 会与语义 live top 脱钩: 凡是进入「把 stack.len() 当 live top 读」
+// 的边界 (builtin / 元方法 / <close> / C API / 协程 resume), 必须先 deflate_to_top()。
+// ============================================================================
+
+impl<'a> LuaState<'a> {
+    /// 当前帧寄存器写边界 (exclusive) = base + fsize —— 对应 C 的 `ci->top = func + 1 + fsize`。
+    /// vararg 帧的 base 高于函数槽 (base-1 不是闭包, 实测会取到实参), 退回寄存器上界。
+    #[inline(always)]
+    pub fn frame_floor(&self) -> usize {
+        let base = self.base;
+        if base == 0 || base > self.stack.len() {
+            return 0;
+        }
+        // vararg 帧: 变参前导/展开会写到 proto.max_stack_size 之外 (实测 fsize 低估),
+        // 用寄存器上界保守覆盖。
+        if self.is_vararg {
+            return base + crate::opcodes::MAX_FSTACK as usize + 1;
+        }
+        #[cfg(feature = "fast_unsafe")]
+        let slot = unsafe { self.stack.get_unchecked(base - 1) };
+        #[cfg(not(feature = "fast_unsafe"))]
+        let slot = &self.stack[base - 1];
+        match slot {
+            TValue::LClosure(cl) => base + cl.proto.max_stack_size as usize + 1,
+            _ => base + crate::opcodes::MAX_FSTACK as usize + 1,
+        }
+    }
+
+    /// 保证 scratch 至少覆盖到当前帧写边界: 把 `[max(len, scratch_end), floor)` 填 Nil
+    /// (不改变 Vector 逻辑长度 —— `len` 语义恒为精确 live top)。
+    #[inline(always)]
+    pub fn pad_frame_scratch(&mut self) {
+        let floor = self.frame_floor();
+        let have = if self.stack.len() > self.scratch_end {
+            self.stack.len()
+        } else {
+            self.scratch_end
+        };
+        if have < floor {
+            self.pad_frame_scratch_slow(floor);
+        }
+    }
+
+    /// 把 scratch 至少覆盖到 `end` (exclusive) —— 供动态长度写入使用
+    /// (如 vararg 展开按实参个数写寄存器)。
+    #[inline(always)]
+    pub fn ensure_scratch_to(&mut self, end: usize) {
+        let have = if self.stack.len() > self.scratch_end {
+            self.stack.len()
+        } else {
+            self.scratch_end
+        };
+        if have < end {
+            self.pad_frame_scratch_slow(end);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn pad_frame_scratch_slow(&mut self, floor: usize) {
+        // 必须从 len 开始填: [len, have) 之间可能是从未初始化过的空洞
+        // (have 是「已知已初始化」的上界, 只用于判定是否需要填, 不能当填充起点)。
+        let start = self.stack.len();
+        if floor > start {
+            self.stack.reserve(floor - start);
+            unsafe {
+                let ptr = self.stack.as_mut_ptr().add(start);
+                let nil = TValue::Nil(NilKind::Strict);
+                for i in 0..(floor - start) {
+                    std::ptr::write(ptr.add(i), nil.clone());
+                }
+            }
+        }
+        if self.scratch_end < floor {
+            self.scratch_end = floor;
+        }
+    }
+
+    /// `[from, to)` 是否全为 trivially-droppable 值 (scratch 不变量)。
+    #[inline(always)]
+    pub(crate) fn range_all_trivial(&self, from: usize, to: usize) -> bool {
+        let to = to.min(self.stack.len());
+        if from >= to {
+            return true;
+        }
+        self.stack[from..to].iter().all(|v| {
+            matches!(
+                v,
+                TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)
+            )
+        })
+    }
+
+    /// 把 `[from, to)` 中非 trivial 的槽位替换为 Nil, 释放其持有的 Rc/表等引用。
+    #[inline(never)]
+    pub(crate) fn clear_nontrivial_range(&mut self, from: usize, to: usize) {
+        let to = to.min(self.stack.len());
+        for i in from..to {
+            let slot = unsafe { self.stack.get_unchecked_mut(i) };
+            if !matches!(
+                slot,
+                TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)
+            ) {
+                // 必须走 drop (赋值) 而非 ptr::write: 这里的旧值是 live 的 (Rc/表/外部
+                // 字符串等), 覆盖式写入会泄漏其引用 (外部字符串的 falloc 不会触发)。
+                *slot = TValue::Nil(NilKind::Strict);
+            }
+        }
+    }
+
+    /// 弹出栈顶 —— 与 `Vec::pop` 的唯一差别: 把腾出的槽位复位为 Nil。
+    ///
+    /// `Vec::pop` 把元素移走 (返回给调用方) 但**把位模式留在已分配内存里**; 由于
+    /// `[len, scratch_end)` 是 `write_stack` 无分支写可复用的 scratch, 之后落到该槽的
+    /// 写会先做「旧值是否需 drop」的检查 —— 读到那份副本会二次减引用 (Rc 计数错乱)。
+    /// 故凡是从 Lua 栈弹值都必须走本函数。
+    #[inline(always)]
+    pub fn pop_slot(&mut self) -> Option<TValue<'a>> {
+        let v = self.stack.pop();
+        if self.stack.len() < self.scratch_end {
+            unsafe {
+                std::ptr::write(
+                    self.stack.as_mut_ptr().add(self.stack.len()),
+                    TValue::Nil(NilKind::Strict),
+                )
+            };
+        }
+        v
+    }
+
+    /// 移除指定槽位 (对应 `Vec::remove`) —— 同样把腾出的尾槽复位为 Nil
+    /// (`Vec::remove` 会把尾部整体左移, 在逻辑长度之外留下一个 bitwise 重复值)。
+    #[inline(always)]
+    pub fn remove_slot(&mut self, i: usize) -> TValue<'a> {
+        let v = self.stack.remove(i);
+        if self.stack.len() < self.scratch_end {
+            unsafe {
+                std::ptr::write(
+                    self.stack.as_mut_ptr().add(self.stack.len()),
+                    TValue::Nil(NilKind::Strict),
+                )
+            };
+        }
+        v
+    }
+
+    /// 语义截断 —— 原 `Vec::truncate(n)` 的替代: 释放 `[n, len)` 中非 trivial 的值,
+    /// 但**不把槽位留成未初始化内存** (原地置 Nil 后仅收缩逻辑长度), 因此这批槽位可以
+    /// 继续作为 scratch 供 write_stack 无分支写复用。
+    /// (直接 `Vec::truncate` 会让这些槽变成未初始化: 后续原地写 + Vec drop = 二次释放。)
+    /// top 不受影响 —— 与原 truncate 一致, 由调用方按需设置。
+    #[inline(always)]
+    pub fn truncate_live(&mut self, n: usize) {
+        truncate_live_vec(&mut self.stack, n);
+    }
+}
+
+/// `Vec<TValue>` 上的「语义截断」—— 就地释放 `[n, len)` 中非 trivial 的值并收缩逻辑
+/// 长度, 但保持这批槽位**已初始化** (置 Nil), 使它们可以继续作为 scratch 供
+/// `write_stack` 无分支写复用。直接 `Vec::truncate` 会把它们留成未初始化内存,
+/// 之后的原地写会与 Vec drop 冲突 (二次释放)。
+/// 供不持有 `LuaState` 的裸 `&mut Vec<TValue>` 调用点使用。
+pub fn truncate_live_vec<'a>(stack: &mut Vec<TValue<'a>>, n: usize) {
+    let len = stack.len();
+    if n >= len {
+        return;
+    }
+    let needs_clear = stack[n..len].iter().any(|v| {
+        !matches!(
+            v,
+            TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)
+        )
+    });
+    if needs_clear {
+        for i in n..len {
+            let slot = unsafe { stack.get_unchecked_mut(i) };
+            if !matches!(
+                slot,
+                TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)
+            ) {
+                // 同上: 旧值是 live 的, 必须 drop。
+                *slot = TValue::Nil(NilKind::Strict);
+            }
+        }
+    }
+    unsafe { stack.set_len(n) };
+}
+
+// ============================================================================
 // LuaState — adjust_results 等
 // ============================================================================
 
@@ -672,7 +882,9 @@ impl<'a> LuaState<'a> {
             }
         }
 
-        self.stack.truncate(a);
+        // 语义截断到 a (释放参数槽), 再压到 a 以便结果落位; scratch 稍后补齐
+        self.truncate_live(a);
+        unsafe { self.stack.set_len(a) };
         let n = if nresults < 0 {
             results.len()
         } else {
@@ -692,6 +904,8 @@ impl<'a> LuaState<'a> {
         // 关键: 更新 state.exec.top — 后续 MULTRET CALL (b=0) 用 state.exec.top 计算 nargs,
         // 若不更新, state.exec.top 保留 CALL 设置的 a+b (过大), 导致 nargs 计算错误
         self.top = self.stack.len();
+        // 恢复帧寄存器 scratch (write_stack 无分支写的前提)
+        self.pad_frame_scratch();
     }
 
     /// adjust_results 的单值版本 — 消除 vec![value] 的堆分配。
@@ -715,14 +929,14 @@ impl<'a> LuaState<'a> {
         // 对应 C 的 setobj2s(L, func_slot, result); L->top = func+2。
         if nresults <= 0 {
             if nresults == 0 {
-                self.stack.truncate(a);
+                self.truncate_live(a);
             } else {
                 // MULTRET (nresults < 0): 单值即全部结果
                 if self.stack.len() > a {
                     self.stack[a] = result;
-                    self.stack.truncate(a + 1);
+                    self.truncate_live(a + 1);
                 } else {
-                    self.stack.truncate(a);
+                    crate::execute::VmExecutor::fast_resize_stack_nil(self, a);
                     self.stack.push(result);
                 }
             }
@@ -762,31 +976,30 @@ impl<'a> LuaState<'a> {
                                 | TValue::Float(_)
                         )
                     });
-                    if tail_all_trivial {
-                        // SAFETY: 尾部全 trivially-droppable, set_len 略过 drop 安全;
-                        // 槽位保留给后续 write_stack 复用 (与 smart_clear_stack 同策略)。
-                        unsafe { self.stack.set_len(a + 1) };
-                    } else {
-                        self.stack.truncate(a + 1);
-                    }
+                    // 尾部全 trivially-droppable 时 truncate_live 只降 top (保留
+                    // scratch 槽位给后续 write_stack 复用); 否则就地释放非 trivial 值。
+                    let _ = tail_all_trivial;
+                    self.truncate_live(a + 1);
                 }
                 // 安全版: 常规赋值 + truncate (旧值走 drop_glue)
                 #[cfg(not(feature = "fast_unsafe"))]
                 {
                     self.stack[a] = result;
-                    self.stack.truncate(a + 1);
+                    self.truncate_live(a + 1);
                 }
             } else {
                 self.stack.push(result);
             }
         } else {
-            self.stack.truncate(a);
+            self.truncate_live(a);
+            unsafe { self.stack.set_len(a) };
             self.stack.push(result);
             for _ in 1..nresults {
                 self.stack.push(TValue::Nil(NilKind::Strict));
             }
         }
         self.top = self.stack.len();
+        self.pad_frame_scratch();
     }
 
     /// adjust_results 的双值版本 — 消除 vec![v1, v2] 堆分配（gsub 返回 热点）。
@@ -803,9 +1016,10 @@ impl<'a> LuaState<'a> {
             }
         }
         if nresults == 0 {
-            self.stack.truncate(a);
+            self.truncate_live(a);
         } else {
-            self.stack.truncate(a);
+            self.truncate_live(a);
+            unsafe { self.stack.set_len(a) };
             self.stack.push(v1);
             if nresults == 1 {
                 self.top = self.stack.len();
@@ -819,6 +1033,7 @@ impl<'a> LuaState<'a> {
             }
         }
         self.top = self.stack.len();
+        self.pad_frame_scratch();
     }
 
     /// 与 adjust_results 类似，但结果已在栈上 [first_result_pos..first_result_pos+n_actual)。
@@ -866,14 +1081,16 @@ impl<'a> LuaState<'a> {
                     }
                 } else {
                     // 栈不够长: 先截断到 a+n_actual，再 resize 到 a+nr
-                    self.stack.truncate(a + n_actual);
+                    self.truncate_live(a + n_actual);
+                    unsafe { self.stack.set_len(a + n_actual) };
                     self.stack.resize(target, TValue::Nil(NilKind::Strict));
                 }
             }
             a + nr
         };
-        self.stack.truncate(new_len);
-        self.top = self.stack.len();
+        self.truncate_live(new_len);
+        self.top = new_len;
+        self.pad_frame_scratch();
     }
 
     /// 执行待定的返回值调整 — 由 op_call 在 return hook 后调用
@@ -897,14 +1114,14 @@ impl<'a> LuaState<'a> {
             } else {
                 let nr = nresults as usize;
                 if nr > n_actual {
-                    self.stack.truncate(a + n_actual);
+                    self.truncate_live(a + n_actual);
                     for _ in n_actual..nr {
                         self.stack.push(TValue::Nil(NilKind::Strict));
                     }
                 }
                 a + nr
             };
-            self.stack.truncate(new_len);
+            self.truncate_live(new_len);
             self.top = self.stack.len();
         }
     }
@@ -951,7 +1168,7 @@ impl<'a> LuaState<'a> {
                     // 对应 C: for (p = L->top.p; p > func; p--) setobjs2s(L, p, p-1);
                     self.stack.insert(func_idx, call_fn.clone());
                     if chain_len >= MAX_CALL_CHAIN {
-                        self.stack.truncate(func_idx);
+                        self.truncate_live(func_idx);
                         self.push_string("'__call' chain too long");
                         return ERR_RUN;
                     }
@@ -959,7 +1176,7 @@ impl<'a> LuaState<'a> {
                     continue; // 对应 goto retry
                 }
                 // 表无 __call 元方法,报 "attempt to call a table value"
-                self.stack.truncate(func_idx);
+                self.truncate_live(func_idx);
                 let ty = self.typename(cur_val.ty());
                 self.push_string(&format!("attempt to call a {} value", ty));
                 return ERR_RUN;
@@ -982,7 +1199,7 @@ impl<'a> LuaState<'a> {
                 // cc 在 (MAXCCALLS, MAXCCALLS*1.1) 之间 → 不触发错误（error handler 中的调用）
                 if cc == LUAI_MAXCCALLS || cc >= LUAI_MAXCCALLS * 11 / 10 {
                     self.n_ccalls = self.n_ccalls.saturating_sub(1);
-                    self.stack.truncate(func_idx);
+                    self.truncate_live(func_idx);
                     if cc >= LUAI_MAXCCALLS * 11 / 10 {
                         self.push_string("error in error handling");
                     } else {
@@ -1076,6 +1293,7 @@ impl<'a> LuaState<'a> {
                 self.constants = Rc::clone(&proto.constants);
                 self.protos = proto.protos.clone();
                 self.base = func_idx + 1;
+                self.pad_frame_scratch();
                 self.pc = 0;
                 self.num_params = proto.num_params;
                 self.is_vararg = proto.is_vararg();
@@ -1090,7 +1308,7 @@ impl<'a> LuaState<'a> {
 
                 if proto_is_vararg {
                     // vararg 函数: 截断栈到实际参数末尾，VARARGPREP 会处理
-                    self.stack.truncate(func_idx + 1 + nargs_actual);
+                    self.truncate_live(func_idx + 1 + nargs_actual);
                     for i in nargs_actual..nfixparams {
                         let idx = func_idx + 1 + i;
                         while self.stack.len() <= idx {
@@ -1417,7 +1635,7 @@ impl<'a> LuaState<'a> {
                                 tmp_results.push(TValue::Nil(NilKind::Strict));
                             }
                         }
-                        self.stack.truncate(func_idx);
+                        self.truncate_live(func_idx);
                         for i in 0..expected {
                             if i < tmp_results.len() {
                                 self.stack.push(std::mem::take(&mut tmp_results[i]));
@@ -1455,7 +1673,7 @@ impl<'a> LuaState<'a> {
                                     let drained = self.stack.split_off(func_idx);
                                     self.c_safety_keepalive.extend(drained);
                                 } else {
-                                    self.stack.truncate(func_idx);
+                                    self.truncate_live(func_idx);
                                 }
                             }
                             // close 后 last_error_value 包含最终错误值（可能是原始错误或 __close 错误）
@@ -1492,7 +1710,7 @@ impl<'a> LuaState<'a> {
                 Self::pcall_rust_fn(self, func_idx, nresults, rc.func, rc.name_str())
             }
             _ => {
-                self.stack.truncate(func_idx);
+                self.truncate_live(func_idx);
                 let ty = self.typename(func_val.ty());
                 self.push_string(&format!("attempt to call a {} value", ty));
                 ERR_RUN
@@ -1624,7 +1842,7 @@ impl<'a> LuaState<'a> {
         // 错误路径：lua_error 触发 (longjmp 或 panic) + pending_error
         if let Err(()) = call_result {
             if let Some(err_val) = self.pending_error.take() {
-                self.stack.truncate(func_idx);
+                self.truncate_live(func_idx);
                 self.stack.push(err_val);
                 return ERR_RUN;
             }
@@ -1653,7 +1871,7 @@ impl<'a> LuaState<'a> {
             .collect();
 
         // 截断到 func_idx，然后推入 expected 个结果
-        self.stack.truncate(func_idx);
+        self.truncate_live(func_idx);
         for i in 0..expected {
             if i < results.len() {
                 self.stack.push(results[i].clone());
@@ -1747,20 +1965,20 @@ impl<'a> LuaState<'a> {
                 LUA_YIELD
             }
             Err(crate::execute::VmError::RuntimeError(msg)) => {
-                self.stack.truncate(func_idx);
+                self.truncate_live(func_idx);
                 self.push_string(&msg);
                 ERR_RUN
             }
             Err(crate::execute::VmError::RuntimeErrorValue(val)) => {
                 // 非字符串错误值（如 error(foo)）：保留原始 TValue 放到栈上，
                 // 供 pcall 返回 (false, original_value) 而非 (false, string)
-                self.stack.truncate(func_idx);
+                self.truncate_live(func_idx);
                 self.stack.push(val);
                 self.top = self.stack.len();
                 ERR_RUN
             }
             Err(e) => {
-                self.stack.truncate(func_idx);
+                self.truncate_live(func_idx);
                 self.push_string(&format!("{}", e));
                 ERR_RUN
             }
@@ -1779,7 +1997,7 @@ impl<'a> LuaState<'a> {
 
     pub fn settop(&mut self, idx: usize) {
         if idx < self.stack.len() {
-            self.stack.truncate(idx);
+            self.truncate_live(idx);
         } else {
             self.stack.resize(idx, TValue::Nil(NilKind::Strict));
         }
@@ -1787,7 +2005,7 @@ impl<'a> LuaState<'a> {
 
     pub fn pop(&mut self, n: usize) {
         let new_len = self.stack.len().saturating_sub(n);
-        self.stack.truncate(new_len);
+        self.truncate_live(new_len);
     }
 
     /// 对应 C 的 lua_absindex:
@@ -1814,13 +2032,13 @@ impl<'a> LuaState<'a> {
         }
         if n > 0 {
             for _ in 0..n {
-                let val = self.stack.pop().unwrap();
+                let val = self.pop_slot().unwrap();
                 self.stack.insert(abs - 1, val);
             }
         } else {
             let count = (-n) as usize;
             for _ in 0..count {
-                let val = self.stack.remove(abs - 1);
+                let val = self.remove_slot(abs - 1);
                 self.stack.push(val);
             }
         }
@@ -1871,7 +2089,7 @@ impl<'a> LuaState<'a> {
 
     pub fn set_global(&mut self, name: &str) {
         let key = self.intern_str(name);
-        if let Some(val) = self.stack.pop() {
+        if let Some(val) = self.pop_slot() {
             self.globals.set(key, val);
         }
     }
@@ -1903,7 +2121,7 @@ impl<'a> LuaState<'a> {
 
     pub fn raw_set_i(&mut self, idx: isize, i: LuaInteger) {
         let abs = self.abs_index(idx);
-        let val = self.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+        let val = self.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
         if abs > 0 && abs <= self.stack.len() {
             if let TValue::Table(ref mut t) = self.stack[abs - 1] {
                 t.set_int(i, val);

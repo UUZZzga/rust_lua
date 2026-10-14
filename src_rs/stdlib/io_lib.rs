@@ -1990,13 +1990,13 @@ fn call_lines_iterator_fn<'a>(
 
     // 把 formats 推入临时栈, 调用 g_read
     let saved_stack_len = state.stack.len();
-    state.stack.truncate(a + 1);
+    state.truncate_live(a + 1);
     for fmt in &formats {
         state.stack.push(fmt.clone());
     }
     let n_formats = formats.len();
     let results = g_read(state, a, n_formats, f, a + 1)?;
-    state.stack.truncate(saved_stack_len);
+    state.truncate_live(saved_stack_len);
 
     if results.is_empty() || results[0].is_nil() {
         // EOF 或错误

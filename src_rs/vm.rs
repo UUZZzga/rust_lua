@@ -766,7 +766,7 @@ pub fn concat_stack(
         };
         let target_idx = top - n;
         stack[target_idx] = ls;
-        stack.truncate(target_idx + 1);
+        crate::state::truncate_live_vec(stack, target_idx + 1);
         remaining -= n - 1;
     }
     Ok(())

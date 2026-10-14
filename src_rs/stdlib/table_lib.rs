@@ -63,7 +63,7 @@ fn get_obj_len<'a>(state: &mut LuaState<'a>, obj: &TValue<'a>) -> Result<LuaInte
         .get(tmp_ra)
         .cloned()
         .unwrap_or(TValue::Nil(NilKind::Strict));
-    state.stack.truncate(tmp_ra);
+    state.truncate_live(tmp_ra);
     match result {
         TValue::Integer(n) => Ok(n),
         TValue::Float(f) => crate::vm::float_to_integer(f, crate::vm::F2IMode::Eq)
@@ -943,7 +943,7 @@ fn call_comp_function<'a>(
             .last()
             .cloned()
             .unwrap_or_else(|| TValue::Nil(NilKind::Strict));
-        state.stack.truncate(saved_len);
+        state.truncate_live(saved_len);
         return Err(VmError::RuntimeErrorValue(err_val));
     }
 
@@ -958,7 +958,7 @@ fn call_comp_function<'a>(
     };
 
     // 恢复栈到调用前
-    state.stack.truncate(saved_len);
+    state.truncate_live(saved_len);
     Ok(result)
 }
 

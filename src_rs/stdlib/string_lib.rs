@@ -1273,7 +1273,7 @@ fn add_value_from_repl<'a>(
             }
 
             // 取出结果
-            let result_val = state.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+            let result_val = state.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
             state.settop(stack_top);
 
             match result_val {
@@ -3352,7 +3352,7 @@ fn tostring_for_format<'a>(state: &mut LuaState<'a>, val: &TValue<'a>) -> Option
         } else {
             None
         };
-        state.stack.truncate(base);
+        state.truncate_live(base);
         return result;
     }
 
@@ -3533,7 +3533,7 @@ pub fn call_gmatch_iter<'a>(
                         let cap = match get_one_capture(&ms, i, cur_pos, end) {
                             Ok(c) => c,
                             Err(e) => {
-                                state.stack.truncate(first_result_pos);
+                                state.truncate_live(first_result_pos);
                                 return Err(VmError::RuntimeError(e));
                             }
                         };
@@ -3564,7 +3564,7 @@ pub fn call_gmatch_iter<'a>(
                 // 未匹配，继续下一个位置
             }
             Err(e) => {
-                state.stack.truncate(first_result_pos);
+                state.truncate_live(first_result_pos);
                 return Err(VmError::RuntimeError(e));
             }
         }

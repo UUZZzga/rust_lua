@@ -194,6 +194,11 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
 - **searchpath / findfile**：不能跳过空模板；`findfile` 应返回列出所有尝试路径的完整错误消息（`no file 'X'\n\tno file 'Y'`）。
 - **concat_gc_interval**：保持 4096，设置为 100 会因 GC 触发过于频繁导致 `constructs.lua` 性能下降。
 - **窄 superblock 融合前提**：`fuse_pure_call`（MOVE+CALL / MODK+MMBINK+CALL 并入 GETTABUP/GETFIELD 处理器）与 GETFIELD 融合共享 gate：`hook_mask == 0`（line/count hook 要求逐指令观察，#147）、函数 `is_pure`、CALL 固定 B=2/C=2 非 k；出错路径先 `state.pc = CALL 索引` 再传播（traceback 行号 = 原 CALL 行）。前向 peek 类融合只在命中率 ≥50% 的形态划算（arith_chain 低命中被证伪；call 后尾部算术 form-C 被 PGO 吃掉，Linux +0.5% 已 revert）。
+- **栈 scratch 不变量（write_stack 无分支写的前提）**：`LuaState.stack`（`Vec<TValue>`）的 `len` 恒为**精确的语义 live top 上界**——C 侧 `lua_gettop` 等所有位置读取者一律读 `len`，不得改变其含义；帧寄存器区另用 `LuaState.scratch_end` 跟踪：`[len, scratch_end)` 是**已写入 Nil 的已初始化内存**，供 `write_stack` 无分支写复用（对应 C 的 `L2->top = ci->top` 免边界检查写）。维护规则：
+  - `pad_frame_scratch()` 在每个 Lua 帧入口/恢复点调用；`frame_floor() = base + fsize + 1`（`fsize = proto.max_stack_size`），**vararg 帧回退 `base + MAX_FSTACK + 1`**（实测 vararg 前导/展开会写到 `max_stack_size` 之外）。它只填 Nil，不动 `len`/`top`；动态长度写入（`op_vararg` 展开）另有 `ensure_scratch_to(end)`。
+  - 语义截断一律经 `truncate_live` / `truncate_live_vec`（= 就地释放 `[n, len)` 的非 trivial 值 + `set_len`），**禁止直接 `Vec::truncate`**——它会把槽位留成未初始化内存，之后 `write_stack` 的原地写 + Vec drop 会造成二次释放。
+  - **任何换掉 `stack` 向量或把尾部移出的操作**（协程 save/restore、`mem::take(&mut state.stack)`、`split_off`、`drain`）必须紧跟 `scratch_end = 0` + `pad_frame_scratch()`：被移出/丢弃的槽位不再是「已初始化」，否则写路径的旧值 drop 检查会读到 moved-out 值而二次减引用（实测崩溃：`op_concat` 的 `split_off` 路径先前会让 `nextvar.lua`/`tpack.lua` 静默崩溃）。
+  - 诊断与验收：`--features probe_wstack` 输出 `WSOOB`（越过 `max(len, scratch_end)`）/`WSCAP`（越过 capacity）计数，全套 tests_lua 零输出即不变量成立。release 下 `write_stack` 保留一个恒定不跳转的安全网分支（不变量破例 → 按需补齐而非 UB），热路径无人为可预测分支：只剩「旧值是否需 drop」（Rc 释放，必须保留）与永不跳转的守卫。
 - **TableData.probe_cache 禁令**：`find_str_ref`/`data_ro` 读路径上不得引入 Cell 内部状态写回（Linux OOO 隐藏探测延迟无收益，Windows MSVC+PGO 实测 +35% 回归，#118 证伪）。
 
 ## .gitignore 关键排除项

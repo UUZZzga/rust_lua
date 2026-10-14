@@ -1999,7 +1999,7 @@ impl<'a> LuaState<'a> {
                 self.g_mut().warning(")", false);
             }
 
-            self.stack.truncate(stack_base);
+            self.truncate_live(stack_base);
             self.call_info.pop();
             self.top = stack_base;
             self.base = saved_base;

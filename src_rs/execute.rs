@@ -1037,6 +1037,8 @@ impl VmExecutor {
 
     pub fn execute_loop<'a>(state: &mut LuaState<'a>) -> Result<VmResult<'a>, VmError<'a>> {
         // call_stack 已提升为 state.call_stack 字段，以支持协程挂起/恢复
+        // 补齐帧寄存器 scratch (write_stack 无分支写的前提)
+        state.pad_frame_scratch();
 
         // 调试跟踪：通过环境变量 LUA_VM_TRACE=1 启用
         // LUA_VM_TRACE=2 时额外打印完整栈内容
@@ -1433,7 +1435,7 @@ impl VmExecutor {
                 state.closure_upvals = pp.saved_closure_upvals;
                 state.tbc_list = pp.saved_tbc_list;
                 // 截断栈，移除 __close 函数的帧
-                state.stack.truncate(pp.func_idx);
+                state.truncate_live(pp.func_idx);
                 state.top = state.stack.len();
                 // 保存 error 值到 close_error_status（供 func::close 和后续传播使用）
                 // 保留 last_error_value，让 func::close 读取它作为 current_err
@@ -1576,7 +1578,7 @@ impl VmExecutor {
                         match protection.pcall_kind {
                             crate::state::PcallKind::Pcall => {
                                 // pcall: 返回 (false, error_val)
-                                state.stack.truncate(protection.func_idx);
+                                state.truncate_live(protection.func_idx);
                                 state.stack.push(TValue::Boolean(false));
                                 state.stack.push(current_results[0].clone());
                                 state.top = protection.func_idx + 2;
@@ -1587,7 +1589,7 @@ impl VmExecutor {
                             }
                             crate::state::PcallKind::Xpcall { handler } => {
                                 // xpcall: 调用 handler(error_val)，返回 (false, handler_result)
-                                state.stack.truncate(protection.func_idx);
+                                state.truncate_live(protection.func_idx);
                                 state.stack.push(handler);
                                 state.stack.push(current_results[0].clone());
                                 state.top = protection.func_idx + 2;
@@ -1604,7 +1606,7 @@ impl VmExecutor {
                                     vec![(state.intern_str("error in error handling"))]
                                 };
                                 // xpcall 返回 (false, handler_result...)
-                                state.stack.truncate(protection.func_idx);
+                                state.truncate_live(protection.func_idx);
                                 state.stack.push(TValue::Boolean(false));
                                 for r in &handler_result {
                                     state.stack.push(r.clone());
@@ -1622,7 +1624,7 @@ impl VmExecutor {
                         // 处理成功返回值：pcall/xpcall 返回 (true, results...)
                         // 先获取当前栈上的 current_results（在恢复 saved_* 状态后，
                         // current_results 可能已在栈上，但这里用 Vec 传递）
-                        state.stack.truncate(protection.func_idx);
+                        state.truncate_live(protection.func_idx);
                         state.stack.push(TValue::Boolean(true));
                         for r in &current_results {
                             state.stack.push(r.clone());
@@ -2064,43 +2066,110 @@ impl VmExecutor {
     /// 算术循环中旧值几乎总是 number, 分支预测器命中率 ~100%, 成本 ~1 cycle,
     /// 节省的 drop_glue match 开销 ~3-5 cycles/次。
     #[cfg_attr(not(size_optimized), inline(always))]
-    fn write_stack<'a>(state: &mut LuaState<'a>, idx: usize, val: TValue<'a>) {
+    pub(crate) fn write_stack<'a>(state: &mut LuaState<'a>, idx: usize, val: TValue<'a>) {
         let top = state.top;
-        if idx < state.stack.len() {
-            #[cfg(feature = "fast_unsafe")]
-            unsafe {
-                // 用裸指针访问槽位: 与 G(L)->gc 访问不冲突 (C 中 g 是独立指针)
-                let slot: *mut TValue<'a> = state.stack.as_mut_ptr().add(idx);
-                // 检查旧值是否为 trivially-droppable 类型 (无 Rc/Table 等需 decq 的字段)
-                // 用 discriminant 范围检查: Nil=0, Boolean=1, Integer=4, Float=5
-                // (编译器优化为 2 次 cmp+jcc, 比完整 match 更快)
-                if matches!(
-                    &*slot,
-                    TValue::LongStr(_)
-                        | TValue::ShortStr(_)
-                        | TValue::Table(_)
-                        | TValue::LClosure(_)
-                        | TValue::CClosure(_)
-                        | TValue::RustClosure(_)
-                        | TValue::UserData(_)
-                        | TValue::Thread(_)
-                ) {
-                    // 1) 按位读出旧值，把所有权 "搬" 出来，不调用 Drop
-                    let _ = std::ptr::replace(slot, TValue::Nil(NilKind::Strict));
+        // 无分支写 (fast_unsafe): 前提是「当前帧寄存器区恒在 stack.len() 之内」,
+        // 由 LuaState::pad_frame_scratch (帧入口/截断后补齐) 与 truncate_live
+        // (语义截断不把 len 收缩到写边界以下) 共同维护, 见 state.rs
+        // 「帧寄存器 scratch」小节。越界写 = 不变量被破坏, debug 下断言暴露。
+        #[cfg(feature = "probe_wstack")]
+        {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static OOB: AtomicUsize = AtomicUsize::new(0);
+            let limit = if state.stack.len() > state.scratch_end {
+                state.stack.len()
+            } else {
+                state.scratch_end
+            };
+            if idx >= state.stack.capacity() {
+                use std::sync::atomic::AtomicUsize as AU;
+                static OV: AU = AU::new(0);
+                let n = OV.fetch_add(1, Ordering::Relaxed);
+                if n < 10 {
+                    eprintln!(
+                        "[WSCAP #{n}] idx={idx} 超出 capacity={} len={} base={}",
+                        state.stack.capacity(),
+                        state.stack.len(),
+                        state.base
+                    );
                 }
-                std::ptr::write(slot, val);
             }
-            // 安全等价实现: 常规赋值 (旧值走 drop_glue)
-            #[cfg(not(feature = "fast_unsafe"))]
-            {
-                state.stack[idx] = val;
+            if idx >= limit {
+                let n = OOB.fetch_add(1, Ordering::Relaxed);
+                if n < 10 {
+                    eprintln!(
+                        "[WSOOB #{n}] idx={idx} len={} scratch_end={} base={} top={} pc={}",
+                        state.stack.len(),
+                        state.scratch_end,
+                        state.base,
+                        state.top,
+                        state.pc
+                    );
+                }
             }
-        } else if idx == state.stack.len() {
-            // 末尾追加: 槽位在 live 区之外, 无旧值需 drop, 直接 push
-            state.stack.push(val);
-        } else {
-            // 跨槽扩展 (idx 越过末尾, 中间需填 Nil): 稀有路径
-            Self::write_stack_grow(state, idx);
+        }
+        // 无分支写。安全性前提 (见 state.rs「帧寄存器 scratch」小节):
+        //   idx < len  (槽在 Vec 逻辑区内), 或 idx < scratch_end (槽是已初始化的 Nil scratch)。
+        // 两者都由 pad_frame_scratch 在帧入口/恢复点保证; debug 下断言暴露破例。
+        // 安全网 (不变量的守卫, 非热路径): idx 落在「Vec 逻辑区 + 帧 scratch」之外时
+        // 走补齐路径 (填 Nil 到 idx+1 再写)。正常执行中 scratch 由 pad_frame_scratch
+        // 维护, 该分支恒定不跳转 (预测 ~100%, 代价 ~0); 一旦某个不变量维护点遗漏,
+        // 它把「未定义行为」降级为「按需补齐」—— 语义等价、可继续运行。
+        #[cfg(all(feature = "fast_unsafe", not(feature = "probe_wstack")))]
+        {
+            let limit = if state.stack.len() > state.scratch_end {
+                state.stack.len()
+            } else {
+                state.scratch_end
+            };
+            if idx >= limit {
+                Self::write_stack_grow(state, idx);
+            }
+        }
+        #[cfg(feature = "fast_unsafe")]
+        unsafe {
+            let slot: *mut TValue<'a> = state.stack.as_mut_ptr().add(idx);
+            debug_assert!(
+                idx < state.stack.len() || idx < state.scratch_end,
+                "write_stack 越界: idx={} len={} scratch_end={} base={}",
+                idx,
+                state.stack.len(),
+                state.scratch_end,
+                state.base
+            );
+            // 旧值非 trivial 时必须先释放 (Rc/表等) —— 该分支必须保留 (跳过 = 泄漏),
+            // 实测预测命中率 ~100% (寄存器旧值几乎总是 number)。
+            if matches!(
+                &*slot,
+                TValue::LongStr(_)
+                    | TValue::ShortStr(_)
+                    | TValue::Table(_)
+                    | TValue::LClosure(_)
+                    | TValue::CClosure(_)
+                    | TValue::RustClosure(_)
+                    | TValue::UserData(_)
+                    | TValue::Thread(_)
+            ) {
+                let _ = std::ptr::replace(slot, TValue::Nil(NilKind::Strict));
+            }
+            std::ptr::write(slot, val);
+            // 逻辑长度覆盖写入槽 (cmov): Vec 才能正确 drop 该值; scratch 区已初始化,
+            // 故 set_len 不会暴露未初始化内存。
+            let len = state.stack.len();
+            if idx >= len {
+                state.stack.set_len(idx + 1);
+            }
+        }
+        // 安全等价实现
+        #[cfg(not(feature = "fast_unsafe"))]
+        {
+            if idx >= state.stack.len() {
+                if idx >= state.scratch_end {
+                    Self::write_stack_grow(state, idx);
+                } else {
+                    unsafe { state.stack.set_len(idx + 1) };
+                }
+            }
             state.stack[idx] = val;
         }
         if idx >= top {
@@ -2142,25 +2211,18 @@ impl VmExecutor {
             state.top = keep_len;
             return;
         }
-        // fast_unsafe: 待清除区全为 trivially-droppable 时不截断 Vec, 仅设置
-        // state.top (保留槽位供调用者 write_stack 复用, 免 write_stack_grow)。
-        // GC 不扫描 beyond top, stale 值不持 Rc 引用, 无泄漏风险。
-        // fast_unsafe 关闭: 不做该检查, 一律 truncate (语义等价, 少一项性能收益)。
+        // 不收缩 len: 保留帧寄存器 scratch 供 write_stack 无分支写复用 (见
+        // state.rs「帧寄存器 scratch」小节)。被移出者中的非 trivial 值就地释放,
+        // scratch 区按不变量恒为 trivial, 无需处理。
+        // fast_unsafe 关闭: 一律 truncate 到 keep_len (语义等价, 少一项性能收益)。
         #[cfg(not(feature = "fast_unsafe"))]
         {
-            state.stack.truncate(keep_len);
+            state.truncate_live(keep_len);
         }
         #[cfg(feature = "fast_unsafe")]
-        if state.stack[keep_len..].iter().all(|v| {
-            matches!(
-                v,
-                TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_)
-            )
-        }) {
-            // 全部 trivially-droppable: 不截断 Vec
-        } else {
-            // 有非 trivial 值: 截断以 drop 它们 (避免 Rc 泄漏)
-            state.stack.truncate(keep_len);
+        if !state.range_all_trivial(keep_len, stack_len) {
+            // 有非 trivial 值: 就地释放 (避免 Rc 泄漏)
+            state.clear_nontrivial_range(keep_len, stack_len);
         }
         state.top = keep_len;
     }
@@ -2174,7 +2236,7 @@ impl VmExecutor {
     /// 此函数用 ptr::write 直接写入 Nil(Strict), 不调用旧值的 drop (旧值可能已被
     /// fast_truncate_stack 的 set_len 跳过 drop, 或被 Vec::truncate 已 drop).
     #[cfg_attr(not(size_optimized), inline(always))]
-    fn fast_resize_stack_nil<'a>(state: &mut LuaState, new_len: usize) {
+    pub(crate) fn fast_resize_stack_nil<'a>(state: &mut LuaState, new_len: usize) {
         // fast_unsafe 关闭: 直接 Vec::resize (语义等价, 慢在泛型 iter + clone)
         #[cfg(not(feature = "fast_unsafe"))]
         {
@@ -2389,7 +2451,7 @@ impl VmExecutor {
         // open_upval is now global, not saved/restored per-function
 
         // 截断栈，移除元方法的帧
-        state.stack.truncate(protection.func_idx);
+        state.truncate_live(protection.func_idx);
 
         // 读取被中断的指令 (对应 C 的 luaV_finishOp)
         let inst_opt = if state.pc < state.code.len() {
@@ -2442,7 +2504,7 @@ impl VmExecutor {
                     // 即将栈顶结果 (临时位置) 移到 RA 位置
                     let ra = state.base + opcodes::getarg_a(inst) as usize;
                     // 结果在栈顶 (metamethod_res 位置)
-                    let result = state.stack.pop().unwrap_or(TValue::Nil(NilKind::Strict));
+                    let result = state.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
                     while state.stack.len() <= ra {
                         state.stack.push(TValue::Nil(NilKind::Strict));
                     }
@@ -2471,7 +2533,7 @@ impl VmExecutor {
                     let func_idx = protection.func_idx;
                     // 栈状态: [a, a+1, ..., result, p2] (长度 = func_idx)
                     // 截断到 func_idx - 1, 移除 p2 (对应 L->top.p = top - 1)
-                    state.stack.truncate(func_idx - 1);
+                    state.truncate_live(func_idx - 1);
                     state.top = state.stack.len();
                     // 还需拼接的元素数量 (对应 total = top - 1 - (base + a))
                     let total = func_idx - 1 - a;
@@ -2488,14 +2550,14 @@ impl VmExecutor {
                                 for (i, v) in vals.into_iter().enumerate() {
                                     state.stack[a + i] = v;
                                 }
-                                state.stack.truncate(a + 1);
+                                state.truncate_live(a + 1);
                                 state.top = state.stack.len();
                             }
                             Err(crate::tm::TagMethodError::ConcatError { .. }) => {
                                 // 直接拼接失败,调用 __concat 元方法 (可能 yield)
                                 // concat_stack 可能已拼接栈顶的 string 序列(在 vals 中),
                                 // 必须写回 state.stack 以反映已拼接的结果
-                                state.stack.truncate(a);
+                                state.truncate_live(a);
                                 state.stack.extend_from_slice(&vals);
                                 state.top = state.stack.len();
                                 Self::finish_concat_loop(state, a)?;
@@ -2504,7 +2566,7 @@ impl VmExecutor {
                     }
                     // 清除剩余槽位
                     while state.stack.len() > a + 1 {
-                        state.stack.pop();
+                        state.pop_slot();
                     }
                     state.top = state.stack.len();
                     state.pc += 1;
@@ -2598,7 +2660,7 @@ impl VmExecutor {
         // open_upval is now global, not saved/restored per-function
 
         // 截断栈，移除 __close 函数的帧
-        state.stack.truncate(protection.func_idx);
+        state.truncate_live(protection.func_idx);
         state.top = state.stack.len();
 
         // 检查 close_error_status — 对应 C Lua 的 CIST_RECST 保存的错误状态
@@ -2704,7 +2766,7 @@ impl VmExecutor {
         }
 
         // 截断栈到 func_idx (移除被保护函数的栈帧)
-        state.stack.truncate(protection.func_idx);
+        state.truncate_live(protection.func_idx);
 
         // 恢复 pcall 调用者的执行上下文
         state.code = protection.saved_code;
@@ -2773,7 +2835,7 @@ impl VmExecutor {
                     for (i, v) in vals.into_iter().enumerate() {
                         state.stack[a + i] = v;
                     }
-                    state.stack.truncate(a + 1);
+                    state.truncate_live(a + 1);
                     state.top = state.stack.len();
                     break;
                 }
@@ -2782,7 +2844,7 @@ impl VmExecutor {
                     // concat_stack 可能已拼接栈顶的 string 序列(在 vals 中),
                     // 必须写回 state.stack 以反映已拼接的结果,
                     // 否则会错误地对两个 string 调用 __concat 元方法
-                    state.stack.truncate(a);
+                    state.truncate_live(a);
                     state.stack.extend_from_slice(&vals);
                     state.top = state.stack.len();
                     let top = state.stack.len();
@@ -2794,7 +2856,7 @@ impl VmExecutor {
                     // try_concat_tm 将结果写入 res (top-2),可能 yield
                     try_concat_tm(state, &p1, &p2, top - 2)?;
                     // 移除 top-1 (p2)
-                    state.stack.truncate(top - 1);
+                    state.truncate_live(top - 1);
                     state.top = state.stack.len();
                     // 继续循环尝试直接拼接
                     continue;
@@ -3003,7 +3065,7 @@ impl VmExecutor {
         // - state.top 恢复 MULTRET 结果的栈顶指针
         //   (hook 函数执行期间 state.top 被 pcall/op_call 修改为 hook 帧大小,
         //    若不恢复, 后续 SETLIST 用 state.top 计算 n_actual 时越界)
-        state.stack.truncate(saved_stack_len);
+        state.truncate_live(saved_stack_len);
         state.top = saved_state_top;
 
         // 对应 C 的 L->allowhook = 1 (恢复 hook)
@@ -4704,6 +4766,9 @@ impl VmExecutor {
         // 用 split_off 替代 to_vec+truncate:移动尾部到独立 Vec,避免每个 TValue 的 Rc::clone (atomic inc)
         // (perf: op_concat 是热路径,to_vec 的 clone 占显著开销;split_off 是 O(剩余长度) 的 memcpy,零 clone)
         let mut saved_tail: Vec<TValue> = state.stack.split_off(a + n);
+        // split_off 会把 [at,..) 移出 (源槽位成为 moved-out, 不可再被 drop-check 读)
+        state.scratch_end = 0;
+        state.pad_frame_scratch();
 
         // 尝试直接拼接 (对应 C 的 luaV_concat)
         // concat_stack 在栈上操作，失败时返回 ConcatError
@@ -4712,6 +4777,9 @@ impl VmExecutor {
         let concat_result = {
             // split_off 移动操作数到独立 Vec,避免 to_vec 的 clone
             let mut vals: Vec<TValue> = state.stack.split_off(a);
+            // split_off 会把 [at,..) 移出 (源槽位成为 moved-out, 不可再被 drop-check 读)
+            state.scratch_end = 0;
+            state.pad_frame_scratch();
             match concat_stack(state.alloc_slot(), &state.string_table, &mut vals, n) {
                 Ok(()) => Ok(vals),
                 Err(e) => Err((e, vals)),
@@ -4755,7 +4823,7 @@ impl VmExecutor {
                     // try_concat_tm 将结果写入 res (top-2)
                     try_concat_tm(state, &p1, &p2, top - 2)?;
                     // 移除 top-1
-                    state.stack.truncate(top - 1);
+                    state.truncate_live(top - 1);
                     state.top = state.stack.len();
                     // 尝试再次直接拼接剩余值
                     let remaining = state.stack.len() - a;
@@ -4764,6 +4832,9 @@ impl VmExecutor {
                     }
                     // split_off 移动 [a..] 到独立 Vec,避免 to_vec 的 clone
                     let mut vals: Vec<TValue> = state.stack.split_off(a);
+                    // split_off 会把 [at,..) 移出 (源槽位成为 moved-out, 不可再被 drop-check 读)
+                    state.scratch_end = 0;
+                    state.pad_frame_scratch();
                     match concat_stack(
                         state.alloc_slot(),
                         &state.string_table,
@@ -4788,7 +4859,7 @@ impl VmExecutor {
                 // 结果在 stack[a]
                 // 清除剩余槽位，恢复 saved_tail
                 while state.stack.len() > a + 1 {
-                    state.stack.pop();
+                    state.pop_slot();
                 }
                 state.stack.append(&mut saved_tail);
                 // 同成功路径: live 边界只到拼接结果 (对应 C 的 L->top.p = ra + 1)
@@ -5537,7 +5608,7 @@ impl VmExecutor {
         state.hook_old_pc = 0;
 
         if proto_is_vararg {
-            state.stack.truncate(a + 1 + nargs);
+            state.truncate_live(a + 1 + nargs);
             if nargs < nfixparams {
                 Self::fast_resize_stack_nil(state, a + 1 + nfixparams);
             }
@@ -5557,6 +5628,8 @@ impl VmExecutor {
                 Self::call_hook(state, "call", -1, None, 1, nfixparams as i32)?;
             }
         }
+        // 补齐帧寄存器 scratch: base-1 处已是被调闭包, frame_floor 能取到 fsize
+        state.pad_frame_scratch();
         Ok(())
     }
 
@@ -5688,6 +5761,7 @@ impl VmExecutor {
                 });
 
                 state.base = a + 1;
+                state.pad_frame_scratch();
                 state.pc = 0;
                 state.num_params = proto.num_params;
                 state.is_vararg = proto.is_vararg();
@@ -5703,7 +5777,7 @@ impl VmExecutor {
                 if proto_is_vararg {
                     // vararg 函数: 截断栈到实际参数末尾，VARARGPREP 会处理变参并扩展栈
                     // 对应 C 的 L->top = ra + b (OP_CALL 中设置)
-                    state.stack.truncate(a + 1 + nargs);
+                    state.truncate_live(a + 1 + nargs);
                     // 填充不足的固定参数为 nil
                     // perf: resize 自动填 Nil(Strict), 代替循环赋值
                     // 必须 resize: truncate 后栈长 a+1+nargs, 直接索引 a+1+nargs 会越界
@@ -5911,7 +5985,7 @@ impl VmExecutor {
         // 对应 C Lua 的 L->top.p = ra + b（只设指针，不删内存；Vec 需 truncate）。
         let arg_end = if b != 0 { a + b } else { state.top }.max(a + 1);
         if state.stack.len() > arg_end {
-            state.stack.truncate(arg_end);
+            state.truncate_live(arg_end);
         }
 
         // 预留 capacity，但不 push nil（push 会改变 stack.len()，导致 C 函数中
@@ -6028,7 +6102,7 @@ impl VmExecutor {
             for i in copy_count..nresults {
                 state.stack[a + i] = TValue::Nil(NilKind::Strict);
             }
-            state.stack.truncate(a + nresults);
+            state.truncate_live(a + nresults);
         } else {
             // MULTRET: 保留所有 n 个结果
             while state.stack.len() < a + n {
@@ -6041,7 +6115,7 @@ impl VmExecutor {
                 );
                 state.stack[a + i] = val;
             }
-            state.stack.truncate(a + n);
+            state.truncate_live(a + n);
         }
 
         // 同步 state.top：poscall 后栈顶 = 结果末尾
@@ -6217,7 +6291,7 @@ impl VmExecutor {
 
                 if proto_is_vararg {
                     // vararg 函数: 截断栈到实际参数末尾，VARARGPREP 会处理
-                    state.stack.truncate(func_slot + 1 + nargs);
+                    state.truncate_live(func_slot + 1 + nargs);
                     for i in nargs..nfixparams {
                         Self::write_stack(state, func_slot + 1 + i, TValue::Nil(NilKind::Strict));
                     }
@@ -6230,7 +6304,7 @@ impl VmExecutor {
                     // 截断栈到帧末尾,丢弃尾调用遗留的额外元素
                     // (如 __call 链产生的中间表),防止栈无限增长导致 O(n^2) 卡死
                     if state.stack.len() > frame_end {
-                        state.stack.truncate(frame_end);
+                        state.truncate_live(frame_end);
                     }
                     while state.stack.len() < frame_end {
                         state.stack.push(TValue::Nil(NilKind::Strict));
@@ -6439,6 +6513,7 @@ impl VmExecutor {
             state.constants = frame.constants;
             state.protos = frame.protos;
             state.base = frame.base;
+            state.pad_frame_scratch();
             state.pc = frame.return_pc;
             state.num_params = frame.num_params;
             state.is_vararg = frame.is_vararg;
@@ -6568,6 +6643,7 @@ impl VmExecutor {
             state.constants = frame.constants;
             state.protos = frame.protos;
             state.base = frame.base;
+            state.pad_frame_scratch();
             state.pc = frame.return_pc;
             state.num_params = frame.num_params;
             state.is_vararg = frame.is_vararg;
@@ -6690,6 +6766,7 @@ impl VmExecutor {
             state.constants = frame.constants;
             state.protos = frame.protos;
             state.base = frame.base;
+            state.pad_frame_scratch();
             state.pc = frame.return_pc;
             state.num_params = frame.num_params;
             state.is_vararg = frame.is_vararg;
@@ -7073,6 +7150,7 @@ impl VmExecutor {
                 });
 
                 state.base = ra + 4;
+                state.pad_frame_scratch();
                 state.pc = 0;
                 state.num_params = proto_num_params;
                 state.is_vararg = proto_is_vararg;
@@ -7084,7 +7162,7 @@ impl VmExecutor {
 
                 if proto_is_vararg {
                     // vararg 函数: truncate 到实际参数末尾 (对应 op_call 的 vararg 分支)
-                    state.stack.truncate(ra + 4 + nargs);
+                    state.truncate_live(ra + 4 + nargs);
                     for i in nargs..nfixparams {
                         Self::write_stack(state, ra + 4 + i, TValue::Nil(NilKind::Strict));
                     }
@@ -7360,6 +7438,7 @@ impl VmExecutor {
                 (wanted as usize).saturating_sub(touse)
             };
 
+            state.ensure_scratch_to(ra + touse + need_fill + 1);
             for i in 0..touse {
                 let val = if let TValue::Table(ref t) = table_val {
                     t.get_int((i + 1) as LuaInteger)
@@ -7374,7 +7453,7 @@ impl VmExecutor {
             }
             if wanted < 0 {
                 // MULTRET: 设置 top = ra + nargs
-                state.stack.truncate(ra + touse);
+                state.truncate_live(ra + touse);
                 state.top = state.stack.len();
             }
         } else {
@@ -7393,6 +7472,7 @@ impl VmExecutor {
                 (wanted as usize).saturating_sub(touse)
             };
 
+            state.ensure_scratch_to(ra + touse + need_fill + 1);
             for i in 0..touse {
                 let val = state.stack[vararg_start + i].clone();
                 Self::write_stack(state, ra + i, val);
@@ -7402,7 +7482,7 @@ impl VmExecutor {
             }
             if wanted < 0 {
                 // MULTRET: 设置 top = ra + nextra
-                state.stack.truncate(ra + touse);
+                state.truncate_live(ra + touse);
                 state.top = state.stack.len();
             }
         }
@@ -7533,7 +7613,7 @@ impl VmExecutor {
         //  dispatch 的 session/source/cmd 一起拼进服务启动参数。）
         // 对应 C：L->top 本身就是 live 边界，top 之上不属于栈。
         if state.stack.len() > state.top {
-            state.stack.truncate(state.top);
+            state.truncate_live(state.top);
         }
 
         if flag & PF_VATAB != 0 {
@@ -7555,7 +7635,7 @@ impl VmExecutor {
                 state.stack.push(TValue::Nil(NilKind::Strict));
             }
             state.stack[vatab_pos] = TValue::Table(table);
-            state.stack.truncate(vatab_pos + 1);
+            state.truncate_live(vatab_pos + 1);
         } else {
             // PF_VAHID: 隐藏变参 (buildhiddenargs)
             state.nextraargs = nextra as i32;
@@ -7627,6 +7707,8 @@ impl VmExecutor {
             state.hook_old_pc = 1;
         }
 
+        // vararg 序言可能把参数搬到更高的寄存器位 → 补齐 scratch
+        state.pad_frame_scratch();
         Ok(())
     }
 
@@ -7842,7 +7924,7 @@ impl VmExecutor {
         // 成功: 结果在 res 位置，栈长度为 res+1
         let result = state.stack[res].clone();
         // 截断栈，移除临时结果
-        state.stack.truncate(res);
+        state.truncate_live(res);
         state.top = state.stack.len();
         Ok(result)
     }

@@ -294,7 +294,7 @@ fn call_print<'a>(
     let _ = state.g_mut().io.out(s.as_str());
     let _ = state.g_mut().io.out_flush();
     // print 返回 0 个结果
-    state.stack.truncate(a);
+    state.truncate_live(a);
     Ok(())
 }
 
@@ -454,7 +454,7 @@ pub(crate) fn call_pcall<'a>(
     if a + 1 < state.stack.len() {
         state.stack[a] = func;
         if a + 1 < state.stack.len() {
-            state.stack.remove(a + 1);
+            state.remove_slot(a + 1);
         }
     }
 
@@ -462,7 +462,7 @@ pub(crate) fn call_pcall<'a>(
     // (调用方帧可能有额外寄存器残留在参数之上)
     let new_top = a + pcall_nargs + 1;
     if state.stack.len() > new_top {
-        state.stack.truncate(new_top);
+        state.truncate_live(new_top);
     }
 
     // push pcall 保护状态 — 对应 C Lua 的 CIST_YPCALL
@@ -826,7 +826,7 @@ fn call_tostring<'a>(
                 } else {
                     String::new()
                 };
-                state.stack.truncate(base);
+                state.truncate_live(base);
                 return Err(VmError::RuntimeError(err));
             }
             // 检查返回值是否为字符串
@@ -840,7 +840,7 @@ fn call_tostring<'a>(
             } else {
                 None
             };
-            state.stack.truncate(base);
+            state.truncate_live(base);
             return match result_str {
                 Some(s) => {
                     push_single_result(state, a, nresults, state.intern_str(&s));
@@ -876,7 +876,7 @@ fn call_tostring<'a>(
                 } else {
                     String::new()
                 };
-                state.stack.truncate(base);
+                state.truncate_live(base);
                 return Err(VmError::RuntimeError(err));
             }
             let result_str = if base < state.stack.len() {
@@ -889,7 +889,7 @@ fn call_tostring<'a>(
             } else {
                 None
             };
-            state.stack.truncate(base);
+            state.truncate_live(base);
             return match result_str {
                 Some(s) => {
                     push_single_result(state, a, nresults, state.intern_str(&s));
@@ -1210,7 +1210,7 @@ fn call_pairs<'a>(
         }
         state.stack[a + 1] = t.clone();
         // 截断栈到 a+2 (移除多余参数)
-        state.stack.truncate(a + 2);
+        state.truncate_live(a + 2);
         state.top = state.stack.len();
 
         // push pairs continuation 保护状态 — 对应 C 的 lua_callk + pairscont
@@ -1304,15 +1304,15 @@ pub(crate) fn call_xpcall<'a>(
     if a + 2 < state.stack.len() {
         state.stack[a] = func;
         // 移除 f (a+1) 和 err_fn (a+2)
-        state.stack.remove(a + 1);
-        state.stack.remove(a + 1);
+        state.remove_slot(a + 1);
+        state.remove_slot(a + 1);
     }
 
     // 截断栈到 f + 其参数，确保 state.pcall 通过 stack.len() 计算的 func_idx 指向 f
     // (调用方帧可能有额外寄存器残留在参数之上)
     let new_top = a + xpcall_nargs + 1;
     if state.stack.len() > new_top {
-        state.stack.truncate(new_top);
+        state.truncate_live(new_top);
     }
 
     // push pcall 保护状态 — 对应 C Lua 的 CIST_YPCALL
@@ -1432,7 +1432,7 @@ pub(crate) fn call_xpcall<'a>(
             }
 
             // 设置栈: [err_fn | current_err]
-            state.stack.truncate(a);
+            state.truncate_live(a);
             state.stack.push(err_fn.clone());
             state.stack.push(current_err.clone());
 
@@ -1513,7 +1513,7 @@ fn call_warn<'a>(
             }
         }
     }
-    state.stack.truncate(a);
+    state.truncate_live(a);
     Ok(())
 }
 
@@ -2557,7 +2557,7 @@ fn call_load<'a>(
                     } else {
                         "reader function must return a string".to_string()
                     };
-                    state.stack.truncate(saved_len);
+                    state.truncate_live(saved_len);
                     let __results =
                         vec![TValue::Nil(NilKind::Strict), (state.intern_str(&err_msg))];
                     push_results(state, a, nresults, __results);
@@ -2568,7 +2568,7 @@ fn call_load<'a>(
                 } else {
                     TValue::Nil(NilKind::Strict)
                 };
-                state.stack.truncate(saved_len);
+                state.truncate_live(saved_len);
                 match &result {
                     TValue::Nil(_) => break,
                     s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
@@ -2733,7 +2733,7 @@ fn call_dofile<'a>(
         None
     };
 
-    state.stack.truncate(a);
+    state.truncate_live(a);
     // 截断后栈顶即为 a；load_file 将 chunk 压在 a，pcall 后结果/错误也在 a。
     // 因此 saved_len 必须在 truncate 之后捕获（== a），否则旧位置无法读到结果。
     let saved_len = state.stack.len();
@@ -2856,7 +2856,7 @@ fn call_loadfile<'a>(
     };
 
     // 保存栈位置，调用 load_filex
-    state.stack.truncate(a);
+    state.truncate_live(a);
     let saved_len = state.stack.len();
 
     let status = state.load_filex(filename.as_deref(), mode.as_deref());
@@ -3172,7 +3172,7 @@ fn call_collectgarbage<'a>(
             // GC 正在进行中（finalizer 内重入）或状态关闭中（close_state 内）—
             // 不重入，对应 C 的 lua_gc 返回 -1，collectgarbage 不 push 返回值（返回 nil）
             if unsafe { state.gc_mut().is_gc_running() } || state.gc_closing {
-                state.stack.truncate(a);
+                state.truncate_live(a);
                 push_results(state, a, nresults, vec![]);
                 return Ok(());
             } else {

@@ -46,7 +46,7 @@ fn push_resume_results<'a>(
     success: bool,
     values: Vec<TValue<'a>>,
 ) {
-    state.stack.truncate(a);
+    state.truncate_live(a);
     if nresults == 0 {
         return;
     }
@@ -57,7 +57,7 @@ fn push_resume_results<'a>(
     if nresults > 0 {
         let current = state.stack.len() - a;
         if current > nresults as usize {
-            state.stack.truncate(a + nresults as usize);
+            state.truncate_live(a + nresults as usize);
         } else {
             while (state.stack.len() - a) < nresults as usize {
                 state.stack.push(TValue::Nil(NilKind::Strict));
@@ -78,7 +78,7 @@ fn push_resume_results_from_stack<'a>(
     result_base: usize,
     n: usize,
 ) {
-    state.stack.truncate(a);
+    state.truncate_live(a);
     if nresults == 0 {
         return;
     }
@@ -1173,7 +1173,7 @@ fn call_running<'a>(
         }
     };
 
-    state.stack.truncate(a);
+    state.truncate_live(a);
     if nresults >= 1 {
         state.stack.push(thread_val);
         if nresults >= 2 {
@@ -1341,6 +1341,8 @@ fn call_resume<'a>(
             let co_stack = {
                 let co = unsafe { &mut *co_ptr };
                 let s = std::mem::take(&mut co.stack);
+                co.scratch_end = 0;
+                co.pad_frame_scratch();
                 // 协程结束，清空 call_info（对应 C 中协程 dead 后 ci 链为空）
                 co.call_info.clear();
                 s
@@ -1422,7 +1424,10 @@ fn call_resume<'a>(
                     let co = unsafe { &mut *co_ptr };
                     co.call_info = err_call_info;
                     co.stack = err_stack;
+                    co.scratch_end = 0;
+                    co.pad_frame_scratch();
                     co.base = err_base;
+                    co.pad_frame_scratch();
                     co.pc = err_pc;
                     let mut ctx = co_context.borrow_mut();
                     ctx.status = ThreadStatus::OK;
@@ -1435,7 +1440,10 @@ fn call_resume<'a>(
                     let co = unsafe { &mut *co_ptr };
                     co.call_info = err_call_info;
                     co.stack = err_stack;
+                    co.scratch_end = 0;
+                    co.pad_frame_scratch();
                     co.base = err_base;
+                    co.pad_frame_scratch();
                     co.pc = err_pc;
                     let mut ctx = co_context.borrow_mut();
                     ctx.status = ThreadStatus::Error;
@@ -1517,6 +1525,7 @@ fn setup_first_resume<'a>(
         co.constants = Rc::clone(&closure.proto.constants);
         co.protos = closure.proto.protos.clone();
         co.base = 1; // closure 在 stack[0]，寄存器从 stack[1] 开始
+        co.pad_frame_scratch();
         co.pc = 0;
         co.num_params = closure.proto.num_params;
         co.is_vararg = closure.proto.is_vararg();
@@ -1530,6 +1539,8 @@ fn setup_first_resume<'a>(
 
         // 设置栈: stack[0] = closure, stack[1..1+nargs] = resume_args
         co.stack = Vec::new();
+        co.scratch_end = 0;
+        co.pad_frame_scratch();
         co.stack.push(TValue::LClosure(closure.clone()));
         for arg in resume_args {
             co.stack.push(arg.clone());
@@ -1540,7 +1551,7 @@ fn setup_first_resume<'a>(
 
         if closure.proto.is_vararg() {
             // vararg 函数: 截断到实际参数末尾，VARARGPREP 会处理变参
-            co.stack.truncate(1 + nargs);
+            co.truncate_live(1 + nargs);
             // 填充不足的固定参数为 nil
             for i in nargs..nfixparams {
                 while co.stack.len() <= 1 + i {
@@ -1586,6 +1597,7 @@ fn setup_first_resume<'a>(
         co.constants = Rc::new(Vec::new());
         co.protos = Rc::new(Vec::new());
         co.base = 1;
+        co.pad_frame_scratch();
         co.pc = 0;
         co.num_params = nargs as u8;
         co.is_vararg = false;
@@ -1600,6 +1612,8 @@ fn setup_first_resume<'a>(
 
         // 设置栈: stack[0] = func, stack[1] = func (寄存器 0), stack[2..] = args
         co.stack = Vec::new();
+        co.scratch_end = 0;
+        co.pad_frame_scratch();
         co.stack.push(func.clone()); // stack[0] = func (base-1)
         co.stack.push(func.clone()); // stack[1] = func (寄存器 0)
         for arg in resume_args {
@@ -1652,7 +1666,7 @@ fn setup_subsequent_resume<'a>(
         while (co.stack.len() - stack_base) < yield_nresults as usize {
             co.stack.push(TValue::Nil(NilKind::Strict));
         }
-        co.stack.truncate(stack_base + yield_nresults as usize);
+        co.truncate_live(stack_base + yield_nresults as usize);
     }
     // nresults < 0 (MULTRET): 保留所有参数
     co.top = co.stack.len();
@@ -1695,7 +1709,7 @@ fn call_yield<'a>(
         })
         .collect();
     // 截断栈到 `a`（移除 yield 函数和参数）
-    state.stack.truncate(a);
+    state.truncate_live(a);
     state.top = a;
 
     // 保存 yield 的 nresults 到协程 exec（恢复时用于调整 resume 参数，
@@ -1879,6 +1893,8 @@ fn call_wrap_fn<'a>(
     // 暂存调用者栈到 state.caller_gc_stacks — 协程执行期间 GC 需要看到调用者栈
     // 中的 wrap table 引用，否则内层协程会被误判为不可达（big.lua 嵌套 wrap 场景）
     let caller_stack = std::mem::take(&mut state.stack);
+    state.scratch_end = 0;
+    state.pad_frame_scratch();
     state.caller_gc_stacks.push(caller_stack);
 
     // 设置协程上下文
@@ -1898,6 +1914,8 @@ fn call_wrap_fn<'a>(
     if let Err(e) = setup_result {
         // setup 失败（仅首次 resume 的"body 不是函数"路径）：恢复调用者栈
         state.stack = state.caller_gc_stacks.pop().unwrap_or_default();
+        state.scratch_end = 0;
+        state.pad_frame_scratch();
         return Err(e);
     }
 
@@ -1914,6 +1932,8 @@ fn call_wrap_fn<'a>(
         init_coroutine_guards(co, saved_n_ccalls);
         if co.n_ccalls >= crate::state::LUAI_MAXCCALLS {
             state.stack = state.caller_gc_stacks.pop().unwrap_or_default();
+            state.scratch_end = 0;
+            state.pad_frame_scratch();
             return Err(VmError::RuntimeError("C stack overflow".to_string()));
         }
         // 设置 current_thread（协程内 coroutine.running()/status 依赖）
@@ -2017,7 +2037,10 @@ fn call_wrap_fn<'a>(
                 let co = unsafe { &mut *co_ptr };
                 co.call_info = err_call_info;
                 co.stack = err_stack;
+                co.scratch_end = 0;
                 co.base = err_base;
+                co.scratch_end = 0;
+                co.pad_frame_scratch();
                 co.pc = err_pc;
                 let mut ctx = co_context.borrow_mut();
                 ctx.status = ThreadStatus::Error;
@@ -2038,6 +2061,8 @@ fn call_wrap_fn<'a>(
 
     // 各分支已完成 swap 交换回调用者 exec；恢复调用者栈
     state.stack = state.caller_gc_stacks.pop().unwrap_or_default();
+    state.scratch_end = 0;
+    state.pad_frame_scratch();
 
     // 把 Closed upvalue 值同步回父栈，协程结束则恢复 Open
     // 同栈时写回 state.stack（原始父栈）；跨栈时跳过写回（父栈不可访问），仅恢复 Open
@@ -2069,7 +2094,7 @@ fn call_wrap_fn<'a>(
     }
 
     // 推送结果（无 success flag）
-    state.stack.truncate(a);
+    state.truncate_live(a);
     if nresults != 0 {
         for v in result_values {
             state.stack.push(v);
@@ -2077,7 +2102,7 @@ fn call_wrap_fn<'a>(
         if nresults > 0 {
             let current = state.stack.len() - a;
             if current > nresults as usize {
-                state.stack.truncate(a + nresults as usize);
+                state.truncate_live(a + nresults as usize);
             } else {
                 while (state.stack.len() - a) < nresults as usize {
                     state.stack.push(TValue::Nil(NilKind::Strict));
@@ -2183,7 +2208,7 @@ pub fn c_api_resume<'a>(
             stack_len
         };
         let resume_args: Vec<TValue> = state.stack[start..].to_vec();
-        state.stack.truncate(start);
+        state.truncate_live(start);
         state.top = start;
         setup_subsequent_resume(state, &co_context, &resume_args)
     };
@@ -2243,6 +2268,8 @@ pub fn c_api_resume<'a>(
         }) => {
             // 协程返回 — 取出返回值，重新设置栈
             let co_stack = std::mem::take(&mut state.stack);
+            state.scratch_end = 0;
+            state.pad_frame_scratch();
             state.call_info.clear();
             {
                 let mut ctx = co_context.borrow_mut();
@@ -2261,6 +2288,8 @@ pub fn c_api_resume<'a>(
                 s.push(val);
             }
             state.stack = s;
+            state.scratch_end = 0;
+            state.pad_frame_scratch();
             state.top = state.stack.len();
             (crate::capi::LUA_OK, ret_n)
         }
@@ -2295,7 +2324,10 @@ pub fn c_api_resume<'a>(
             });
             state.call_info = err_call_info;
             state.stack = err_stack;
+            state.scratch_end = 0;
+            state.pad_frame_scratch();
             state.base = err_base;
+            state.pad_frame_scratch();
             state.pc = err_pc;
             {
                 let mut ctx = co_context.borrow_mut();
@@ -2304,6 +2336,8 @@ pub fn c_api_resume<'a>(
             }
             // push 错误消息: [nil, err_msg]
             state.stack = vec![TValue::Nil(NilKind::Strict), err_val];
+            state.scratch_end = 0;
+            state.pad_frame_scratch();
             state.top = 2;
             (crate::capi::LUA_ERRRUN, 1)
         }
@@ -2350,6 +2384,8 @@ pub fn c_api_reset_thread<'a>(state: &mut LuaState<'a>) -> i32 {
     }
     // 对外可见的线程栈重置为初始状态（resetCI + top = stack + 1）
     state.stack = vec![TValue::Nil(NilKind::Strict)];
+    state.scratch_end = 0;
+    state.pad_frame_scratch();
     state.top = 1;
     state.base = 0;
     state.pc = 0;
@@ -2370,6 +2406,8 @@ pub fn c_api_reset_thread<'a>(state: &mut LuaState<'a>) -> i32 {
 #[cfg(not(feature = "cmp_c"))]
 fn push_error(state: &mut LuaState, msg: &str) -> usize {
     state.stack = vec![TValue::Nil(NilKind::Strict), (state.intern_str(msg))];
+    state.scratch_end = 0;
+    state.pad_frame_scratch();
     state.top = 2;
     1
 }

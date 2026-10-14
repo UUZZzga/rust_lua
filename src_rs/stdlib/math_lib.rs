@@ -914,7 +914,7 @@ where
         #[cfg(not(feature = "fast_unsafe"))]
         {
             state.stack[a] = TValue::Float(y);
-            state.stack.truncate(a + 1);
+            state.truncate_live(a + 1);
         }
         state.top = a + 1;
         return Ok(());
