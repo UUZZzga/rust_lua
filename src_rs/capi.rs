@@ -51,10 +51,12 @@ pub type lua_State = LuaState<'static>;
 /// C 函数类型（与 objects.rs 的 LCFunction.func / CClosure.f 类型一致）
 pub type lua_CFunction = unsafe extern "C" fn(L: *mut c_void) -> c_int;
 
-/// Lua 数值类型
-pub type lua_Number = f64;
-pub type lua_Integer = i64;
-pub type lua_Unsigned = u64;
+/// Lua 数值类型 — 直接绑定 config.rs 的可配置别名（对应 C 的
+/// `typedef LUA_NUMBER lua_Number; typedef LUA_INTEGER lua_Integer;`）。
+/// 注意: 变更数值类型配置会改变这些 C ABI 类型的宽度（与 C 的 luaconf.h 一致）。
+pub type lua_Number = crate::config::LuaNumber;
+pub type lua_Integer = crate::config::LuaInteger;
+pub type lua_Unsigned = crate::config::LuaUnsigned;
 
 // ============================================================================
 // 常量（与 lua.h 对齐）
@@ -65,13 +67,8 @@ pub const LUAL_NUMSIZES: usize =
 pub const LUA_OK: c_int = 0;
 pub const LUA_YIELD: c_int = 1;
 pub const LUA_ERRRUN: c_int = 2;
-pub const LUA_ERRSYNTAX: c_int = 3;
-pub const LUA_ERRMEM: c_int = 4;
-pub const LUA_ERRERR: c_int = 5;
 
-pub const LUA_MULTRET: c_int = -1;
 pub const LUA_REGISTRYINDEX: c_int = -(c_int::MAX / 2 + 1000);
-pub const LUA_MINSTACK: c_int = 20;
 
 pub const LUA_TNONE: c_int = -1;
 pub const LUA_TNIL: c_int = 0;
@@ -83,9 +80,6 @@ pub const LUA_TTABLE: c_int = 5;
 pub const LUA_TFUNCTION: c_int = 6;
 pub const LUA_TUSERDATA: c_int = 7;
 pub const LUA_TTHREAD: c_int = 8;
-pub const LUA_NUMTYPES: c_int = 9;
-
-pub const LUA_RIDX_GLOBALS: c_int = 2;
 
 const LUA_IDENT_STR: &str = formatcp!(
     "$LuaVersion: {0} $$LuaAuthors: {1} $\0",
@@ -168,14 +162,6 @@ fn lua_type_code(t: LuaType) -> c_int {
     t as c_int
 }
 
-/// lua_upvalueindex: 返回第 i 个上值的伪索引。
-///
-/// 对应 C 的 `#define lua_upvalueindex(i) (LUA_REGISTRYINDEX - (i))`
-#[cfg_attr(not(size_optimized), inline)]
-pub fn lua_upvalueindex(i: c_int) -> c_int {
-    LUA_REGISTRYINDEX - i
-}
-
 const fn str_as_array<const N: usize>(s: &str) -> [u8; N] {
     let src = s.as_bytes();
     let mut arr = [0u8; N];
@@ -211,7 +197,7 @@ fn tolstring<'a>(state: &'a mut LuaState, idx: c_int) -> Option<&'a str> {
     let need_convert = !matches!(state.stack[off], TValue::LongStr(_) | TValue::ShortStr(_));
     if need_convert {
         let converted = match &state.stack[off] {
-            TValue::Integer(i) => Some(i.to_string()),
+            TValue::Integer(i) => Some(crate::float_utils::i64_to_string(*i)),
             TValue::Float(f) => Some(format_float(*f)),
             _ => None,
         };
@@ -878,10 +864,14 @@ pub extern "C" fn lua_tointegerx(L: *mut lua_State, idx: c_int, isnum: *mut c_in
         Some(TValue::Integer(i)) => Some(i),
         Some(TValue::Float(f)) => crate::vm::float_to_integer(f, F2IMode::Eq),
         Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
-            lua_string_as_str(&s).parse::<i64>().ok().or_else(|| {
-                crate::float_utils::f64_from_str(lua_string_as_str(&s))
-                    .and_then(|f| crate::vm::float_to_integer(f, F2IMode::Eq))
-            })
+            // 十进制整数解析用 lua_Integer 宽度（溢出时回落到浮点 —— luaO_str2num 语义）
+            lua_string_as_str(&s)
+                .parse::<lua_Integer>()
+                .ok()
+                .or_else(|| {
+                    crate::float_utils::f64_from_str(lua_string_as_str(&s))
+                        .and_then(|f| crate::vm::float_to_integer(f, F2IMode::Eq))
+                })
         }
         _ => None,
     };
@@ -906,7 +896,7 @@ pub extern "C" fn lua_tointegerx(L: *mut lua_State, idx: c_int, isnum: *mut c_in
 pub extern "C" fn lua_tonumberx(L: *mut lua_State, idx: c_int, isnum: *mut c_int) -> lua_Number {
     let L = unsafe { &*L };
     let result = match index2val(L, idx) {
-        Some(TValue::Integer(i)) => Some(i as f64),
+        Some(TValue::Integer(i)) => Some(i as lua_Number),
         Some(TValue::Float(f)) => Some(f),
         Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
             crate::float_utils::f64_from_str(lua_string_as_str(&s))
@@ -949,7 +939,7 @@ pub extern "C" fn lua_tolstring(L: *mut lua_State, idx: c_int, len: *mut usize) 
     let need_convert = !matches!(L.stack[off], TValue::LongStr(_) | TValue::ShortStr(_));
     if need_convert {
         let converted = match &L.stack[off] {
-            TValue::Integer(i) => Some(i.to_string()),
+            TValue::Integer(i) => Some(crate::float_utils::i64_to_string(*i)),
             TValue::Float(f) => Some(format_float(*f)),
             _ => None,
         };
@@ -1245,7 +1235,7 @@ pub extern "C" fn lua_setglobal(L: *mut lua_State, name: *const c_char) {
 // ============================================================================
 
 /// 浮点数格式化（与 vm.rs 保持一致）
-fn format_float(f: f64) -> String {
+fn format_float(f: lua_Number) -> String {
     crate::float_utils::f64_to_string(f)
 }
 
@@ -1409,7 +1399,10 @@ pub extern "C" fn luaL_unref(L: *mut lua_State, _t: c_int, ref_: c_int) {
         return; // LUA_REFNIL 或 LUA_NOREF
     }
     let registry = L.registry.clone();
-    registry.set(TValue::Integer(ref_ as i64), TValue::Nil(NilKind::Strict));
+    registry.set(
+        TValue::Integer(ref_ as lua_Integer),
+        TValue::Nil(NilKind::Strict),
+    );
 }
 
 #[no_mangle]
@@ -1883,7 +1876,7 @@ pub extern "C" fn lua_next(L: *mut lua_State, idx: c_int) -> c_int {
 pub extern "C" fn lua_len(L: *mut lua_State, idx: c_int) {
     let L = unsafe { &mut *L };
     let len = L.len(idx as isize);
-    L.stack.push(TValue::Integer(len as i64));
+    L.stack.push(TValue::Integer(len as lua_Integer));
 }
 
 /// lua_concat: 字符串连接。
@@ -1983,8 +1976,8 @@ pub extern "C" fn lua_compare(L: *mut lua_State, idx1: c_int, idx2: c_int, op: c
                     (TValue::Boolean(a), TValue::Boolean(b)) => a == b,
                     (TValue::Integer(a), TValue::Integer(b)) => a == b,
                     (TValue::Float(a), TValue::Float(b)) => a == b,
-                    (TValue::Integer(a), TValue::Float(b)) => a as f64 == b,
-                    (TValue::Float(a), TValue::Integer(b)) => a == b as f64,
+                    (TValue::Integer(a), TValue::Float(b)) => a as lua_Number == b,
+                    (TValue::Float(a), TValue::Integer(b)) => a == b as lua_Number,
                     (
                         a @ (TValue::LongStr(_) | TValue::ShortStr(_)),
                         b @ (TValue::LongStr(_) | TValue::ShortStr(_)),
@@ -2010,8 +2003,8 @@ pub extern "C" fn lua_compare(L: *mut lua_State, idx1: c_int, idx2: c_int, op: c
             match (v1, v2) {
                 (TValue::Integer(a), TValue::Integer(b)) => (a < b) as c_int,
                 (TValue::Float(a), TValue::Float(b)) => (a < b) as c_int,
-                (TValue::Integer(a), TValue::Float(b)) => ((a as f64) < (b)) as c_int,
-                (TValue::Float(a), TValue::Integer(b)) => ((a) < (b as f64)) as c_int,
+                (TValue::Integer(a), TValue::Float(b)) => ((a as lua_Number) < (b)) as c_int,
+                (TValue::Float(a), TValue::Integer(b)) => ((a) < (b as lua_Number)) as c_int,
                 (
                     a @ (TValue::LongStr(_) | TValue::ShortStr(_)),
                     b @ (TValue::LongStr(_) | TValue::ShortStr(_)),
@@ -2024,8 +2017,8 @@ pub extern "C" fn lua_compare(L: *mut lua_State, idx1: c_int, idx2: c_int, op: c
             match (v1, v2) {
                 (TValue::Integer(a), TValue::Integer(b)) => (a <= b) as c_int,
                 (TValue::Float(a), TValue::Float(b)) => (a <= b) as c_int,
-                (TValue::Integer(a), TValue::Float(b)) => ((a as f64) <= (b)) as c_int,
-                (TValue::Float(a), TValue::Integer(b)) => ((a) <= (b as f64)) as c_int,
+                (TValue::Integer(a), TValue::Float(b)) => ((a as lua_Number) <= (b)) as c_int,
+                (TValue::Float(a), TValue::Integer(b)) => ((a) <= (b as lua_Number)) as c_int,
                 (
                     a @ (TValue::LongStr(_) | TValue::ShortStr(_)),
                     b @ (TValue::LongStr(_) | TValue::ShortStr(_)),
@@ -2192,7 +2185,8 @@ pub extern "C" fn lua_arith(L: *mut lua_State, op: c_int) {
 /// lua_version: 返回 Lua 版本号。
 #[no_mangle]
 pub extern "C" fn lua_version(_L: *mut lua_State) -> lua_Number {
-    crate::config::VERSION_NUM.into()
+    // 对应 C 的 `return cast_num(LUA_VERSION_NUM);`
+    crate::config::VERSION_NUM as lua_Number
 }
 
 // ============================================================================
@@ -2719,149 +2713,6 @@ pub extern "C" fn lua_pushexternalstring(
     let ptr = crate::strings::lua_string_as_c_str_ptr(&tv);
     L.push_value(tv);
     ptr
-}
-
-// ============================================================================
-// package.loadlib 支持函数 — 供 base_lib.rs 调用
-// ============================================================================
-
-/// 内部函数：加载动态库，返回库句柄
-///
-/// 对应 C loadlib.cpp 的 lsys_load。seeglb=true 时用 RTLD_GLOBAL。
-#[cfg(not(target_os = "windows"))]
-pub unsafe fn sys_load(path: &str, seeglb: bool) -> *mut c_void {
-    let cpath = match CString::new(path) {
-        Ok(c) => c,
-        Err(_) => return ptr::null_mut(),
-    };
-    let flags = if seeglb {
-        libc::RTLD_NOW | libc::RTLD_GLOBAL
-    } else {
-        libc::RTLD_NOW | libc::RTLD_LOCAL
-    };
-    unsafe { libc::dlopen(cpath.as_ptr(), flags) }
-}
-
-#[cfg(target_os = "windows")]
-pub unsafe fn sys_load(path: &str, _seeglb: bool) -> *mut c_void {
-    // Windows: LoadLibraryA, seeglb 无对应概念 (Windows 不支持 RTLD_GLOBAL)
-    let cpath = match CString::new(path) {
-        Ok(c) => c,
-        Err(_) => return ptr::null_mut(),
-    };
-    unsafe { win32::LoadLibraryA(cpath.as_ptr() as *const u8) as *mut c_void }
-}
-
-/// 内部函数：查找符号，返回函数指针
-///
-/// 对应 C loadlib.cpp 的 lsys_sym。
-#[cfg(not(target_os = "windows"))]
-pub unsafe fn sys_sym(lib: *mut c_void, sym: &str) -> Option<lua_CFunction> {
-    let csym = CString::new(sym).ok()?;
-    let ptr = unsafe { libc::dlsym(lib, csym.as_ptr()) };
-    if ptr.is_null() {
-        None
-    } else {
-        Some(unsafe { std::mem::transmute::<*mut c_void, lua_CFunction>(ptr) })
-    }
-}
-
-#[cfg(target_os = "windows")]
-pub unsafe fn sys_sym(lib: *mut c_void, sym: &str) -> Option<lua_CFunction> {
-    let csym = CString::new(sym).ok()?;
-    let ptr = unsafe { win32::GetProcAddress(lib, csym.as_ptr() as *const u8) };
-    if ptr.is_null() {
-        None
-    } else {
-        Some(unsafe { std::mem::transmute::<*mut c_void, lua_CFunction>(ptr) })
-    }
-}
-
-#[cfg(not(target_os = "windows"))]
-pub unsafe fn sys_unload(lib: *mut c_void) {
-    if !lib.is_null() {
-        unsafe {
-            libc::dlclose(lib);
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
-pub unsafe fn sys_unload(lib: *mut c_void) {
-    if !lib.is_null() {
-        unsafe {
-            win32::FreeLibrary(lib);
-        }
-    }
-}
-
-/// 内部函数：获取错误消息
-#[cfg(not(target_os = "windows"))]
-pub unsafe fn sys_dlerror() -> String {
-    let ptr = unsafe { libc::dlerror() };
-    if ptr.is_null() {
-        String::new()
-    } else {
-        unsafe { CStr::from_ptr(ptr) }
-            .to_string_lossy()
-            .into_owned()
-    }
-}
-
-#[cfg(target_os = "windows")]
-pub unsafe fn sys_dlerror() -> String {
-    unsafe { win32::last_error_message() }
-}
-
-// Windows 动态库加载 FFI (kernel32)
-#[cfg(target_os = "windows")]
-mod win32 {
-    use std::ffi::c_void;
-
-    const FORMAT_MESSAGE_FROM_SYSTEM: u32 = 0x0000_1000;
-    const FORMAT_MESSAGE_IGNORE_INSERTS: u32 = 0x0000_0200;
-
-    #[link(name = "kernel32")]
-    extern "system" {
-        pub fn LoadLibraryA(name: *const u8) -> *mut c_void;
-        pub fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
-        pub fn FreeLibrary(module: *mut c_void) -> i32;
-        fn GetLastError() -> u32;
-        fn FormatMessageA(
-            flags: u32,
-            source: *const c_void,
-            msg_id: u32,
-            lang_id: u32,
-            buf: *mut u8,
-            size: u32,
-            args: *const c_void,
-        ) -> u32;
-    }
-
-    pub unsafe fn last_error_message() -> String {
-        let err = unsafe { GetLastError() };
-        if err == 0 {
-            return String::new();
-        }
-        let mut buf = [0u8; 512];
-        let len = unsafe {
-            FormatMessageA(
-                FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
-                std::ptr::null(),
-                err,
-                0,
-                buf.as_mut_ptr(),
-                buf.len() as u32,
-                std::ptr::null(),
-            )
-        };
-        if len == 0 {
-            format!("error code {}", err)
-        } else {
-            let msg = std::str::from_utf8(&buf[..len as usize]).unwrap_or("unknown error");
-            msg.trim_end().to_string()
-        }
-    }
 }
 
 // ============================================================================
@@ -4644,7 +4495,7 @@ mod tests {
             "=t",
         );
         assert_eq!(rc, 0, "load_buffer failed");
-        st.call(0, 1);
+        st.pcall(0, 1, 0);
         assert!(
             matches!(st.stack.last(), Some(TValue::Thread(_))),
             "expected the created thread on top"
@@ -4690,7 +4541,7 @@ mod tests {
             "=t",
         );
         assert_eq!(rc, 0, "load_buffer failed");
-        st.call(0, 1);
+        st.pcall(0, 1, 0);
 
         let L = &mut st as *mut LuaState<'static> as *mut lua_State;
         let co = lua_tothread(L, -1);
@@ -4734,7 +4585,7 @@ mod tests {
             "=t",
         );
         assert_eq!(rc, 0, "load_buffer failed");
-        st.call(0, 1);
+        st.pcall(0, 1, 0);
 
         let L = &mut st as *mut LuaState<'static> as *mut lua_State;
         let co = lua_tothread(L, -1);
@@ -4777,7 +4628,7 @@ mod tests {
             "=t",
         );
         assert_eq!(rc, 0, "load_buffer failed");
-        st.call(0, 1);
+        st.pcall(0, 1, 0);
 
         let L = &mut st as *mut LuaState<'static> as *mut lua_State;
         let co = lua_tothread(L, -1);
@@ -4838,7 +4689,7 @@ mod tests {
             "=t",
         );
         assert_eq!(rc, 0, "load_buffer failed");
-        st.call(0, 1);
+        st.pcall(0, 1, 0);
 
         let L = &mut st as *mut LuaState<'static> as *mut lua_State;
         let co = lua_tothread(L, -1);
@@ -4907,7 +4758,7 @@ mod tests {
             "=t",
         );
         assert_eq!(rc, 0, "load_buffer failed");
-        st.call(0, 1);
+        st.pcall(0, 1, 0);
 
         let L = &mut st as *mut LuaState<'static> as *mut lua_State;
         let co = lua_tothread(L, -1);
@@ -4996,7 +4847,7 @@ mod tests {
             "=t",
         );
         assert_eq!(rc, 0, "load failed");
-        st.call(0, 1);
+        st.pcall(0, 1, 0);
         assert_eq!(st.to_string(-1).as_deref(), Some("ok"));
     }
 
@@ -5334,7 +5185,7 @@ mod tests {
             "=t",
         );
         assert_eq!(rc, 0, "load_buffer failed");
-        st.call(0, 1);
+        st.pcall(0, 1, 0);
         let s = {
             let p = lua_tolstring(
                 &mut st as *mut LuaState<'static> as *mut lua_State,
@@ -5379,7 +5230,7 @@ mod tests {
             "=t",
         );
         assert_eq!(rc, 0, "load_buffer failed");
-        st.call(0, 1);
+        st.pcall(0, 1, 0);
 
         let L = &mut st as *mut LuaState<'static> as *mut lua_State;
         let co = lua_tothread(L, -1);
@@ -5437,7 +5288,7 @@ mod tests {
             "=t",
         );
         assert_eq!(rc, 0, "load_buffer failed");
-        st.call(0, 1);
+        st.pcall(0, 1, 0);
 
         let L = &mut st as *mut LuaState<'static> as *mut lua_State;
         let co = lua_tothread(L, -1);
@@ -5491,7 +5342,7 @@ mod tests {
             "=t",
         );
         assert_eq!(rc, 0, "load_buffer failed");
-        st.call(0, 1);
+        st.pcall(0, 1, 0);
 
         let L = &mut st as *mut LuaState<'static> as *mut lua_State;
         let co = lua_tothread(L, -1);
@@ -5612,7 +5463,7 @@ mod tests {
         // C 闭包: 返回 上值 + 第一个参数
         unsafe extern "C" fn adder(L: *mut c_void) -> c_int {
             let L = L as *mut lua_State;
-            let upv = lua_tointegerx(L, lua_upvalueindex(1), std::ptr::null_mut());
+            let upv = lua_tointegerx(L, LUA_REGISTRYINDEX - 1, std::ptr::null_mut());
             let arg = lua_tointegerx(L, 1, std::ptr::null_mut());
             lua_pushinteger(L, upv + arg);
             1
@@ -5648,7 +5499,7 @@ mod tests {
     ///
     /// 覆盖两种上值形态（无上值的 C 函数、自身带 1 个上值的 CClosure），
     /// 并在 full GC 前后各调用一次 —— 上值解析依赖 `stack[api_func_base]`，
-    /// 若嵌套 C 调用或 GC 破坏该槽位，`lua_upvalueindex(1)` 会退化为 nil，
+    /// 若嵌套 C 调用或 GC 破坏该槽位，`LUA_REGISTRYINDEX - 1` 会退化为 nil，
     /// `lua_pcall` 即报 "attempt to call a nil value"，cjson.safe.encode/decode 全线失败。
     #[test]
     fn test_cclosure_upvalue_invoked_via_pcall() {
@@ -5660,14 +5511,14 @@ mod tests {
         // 内层被保护函数本身也是带 1 个上值的 CClosure（对应 cjson.encode 的 config 上值）
         unsafe extern "C" fn plus1(l: *mut c_void) -> c_int {
             let L = l as *mut lua_State;
-            lua_pushvalue(L, lua_upvalueindex(1));
+            lua_pushvalue(L, LUA_REGISTRYINDEX - 1);
             let mut isnum: c_int = 0;
             let base = lua_tointegerx(L, -1, &mut isnum);
             lua_pop(L, 1);
             if isnum == 0 {
                 // 上值未解析：把标记值返回给测试端
                 lua_pushinteger(L, -1);
-                lua_pushinteger(L, lua_type(L, lua_upvalueindex(1)) as lua_Integer);
+                lua_pushinteger(L, lua_type(L, LUA_REGISTRYINDEX - 1) as lua_Integer);
                 return 2;
             }
             lua_pushinteger(L, base + 1);
@@ -5680,7 +5531,7 @@ mod tests {
                 lua_pushnil(L);
                 return 1;
             }
-            lua_pushvalue(L, lua_upvalueindex(1));
+            lua_pushvalue(L, LUA_REGISTRYINDEX - 1);
             lua_insert(L, 1);
             let err = lua_pcallk(L, 1, 1, 0, 0, ptr::null());
             if err != 0 {

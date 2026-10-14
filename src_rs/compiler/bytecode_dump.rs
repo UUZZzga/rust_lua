@@ -1,3 +1,4 @@
+use crate::config::{LuaInteger, LuaNumber, LuaUnsigned};
 #[cfg(feature = "cmp_c")]
 use crate::lua_ffi;
 use crate::objects::{LocVar, UpvalDesc};
@@ -29,8 +30,10 @@ pub struct DumpInstruction {
 pub enum DumpConstant {
     Nil,
     Boolean(bool),
-    Integer(i64),
-    Float(f64),
+    /// 对应 C 的 `LUA_VNUMINT` 常量 (`lua_Integer`)。
+    Integer(LuaInteger),
+    /// 对应 C 的 `LUA_VNUMFLT` 常量 (`lua_Number`)。
+    Float(LuaNumber),
     String(String),
 }
 
@@ -129,23 +132,24 @@ impl<'a> BytecodeReader<'a> {
         self.read_varint() as usize
     }
 
-    fn read_integer(&mut self) -> i64 {
+    fn read_integer(&mut self) -> LuaInteger {
         let cx = self.read_varint();
+        // 位容器边界: 变长整数按 64 位容器读取, 再按 LuaInteger 宽度重解释
         if cx & 1 == 0 {
-            (cx >> 1) as i64
+            (cx >> 1) as LuaInteger
         } else {
-            -((cx >> 1) as i64) - 1
+            -((cx >> 1) as LuaInteger) - 1
         }
     }
 
-    fn read_float(&mut self) -> f64 {
-        let bytes = self.read_bytes(8);
-        if bytes.len() < 8 {
+    fn read_float(&mut self) -> LuaNumber {
+        let bytes = self.read_bytes(std::mem::size_of::<LuaNumber>());
+        if bytes.len() < std::mem::size_of::<LuaNumber>() {
             return 0.0;
         }
-        let mut arr = [0u8; 8];
+        let mut arr = [0u8; std::mem::size_of::<LuaNumber>()];
         arr.copy_from_slice(bytes);
-        f64::from_le_bytes(arr)
+        LuaNumber::from_le_bytes(arr)
     }
 
     fn align(&mut self, align: usize) {
@@ -472,38 +476,29 @@ pub fn parse_dump(data: &[u8]) -> Result<DumpedFunction, String> {
         return Err("instruction format mismatch".to_string());
     }
 
-    // 校验 lua_Integer: size=8, value=-0x5678 (i64) — 对应 C 的 checknum(lua_Integer, LUAC_INT)
+    // 校验 lua_Integer: size=sizeof(LuaInteger), value=-0x5678 — 对应 C 的 checknum(lua_Integer, LUAC_INT)
     let integer_size = reader.read_byte();
     reader.check()?;
-    if integer_size as usize != std::mem::size_of::<i64>() {
+    if integer_size as usize != std::mem::size_of::<LuaInteger>() {
         return Err("Lua integer size mismatch".to_string());
     }
-    let integer_val_bytes: [u8; 8] = if let Ok(bytes) = reader.read_bytes(8).try_into() {
-        bytes
-    } else {
-        reader.check()?;
-        unreachable!("Lua integer size mismatch");
+    let integer_val_bytes = reader.read_bytes(integer_size as usize).to_vec();
+    reader.check()?;
+    let integer_val: LuaInteger = {
+        let mut arr = [0u8; std::mem::size_of::<LuaInteger>()];
+        arr.copy_from_slice(&integer_val_bytes);
+        LuaInteger::from_ne_bytes(arr)
     };
-    let integer_val = i64::from_ne_bytes([
-        integer_val_bytes[0],
-        integer_val_bytes[1],
-        integer_val_bytes[2],
-        integer_val_bytes[3],
-        integer_val_bytes[4],
-        integer_val_bytes[5],
-        integer_val_bytes[6],
-        integer_val_bytes[7],
-    ]);
     if integer_val != -0x5678 {
         return Err("Lua integer format mismatch".to_string());
     }
 
-    // 校验 lua_Number: size=8, value=-370.5 (f64) — 对应 C 的 checknum(lua_Number, LUAC_NUM)
+    // 校验 lua_Number: size=sizeof(LuaNumber), value=-370.5 — 对应 C 的 checknum(lua_Number, LUAC_NUM)
     // 注意: 浮点数的内部表示可能有 padding（long double 情况），所以只校验 size
     // 对应 calls.lua:524: headlen = headlen - string.packsize("n")  -- remove float check
     let number_size = reader.read_byte();
     reader.check()?;
-    if number_size as usize != std::mem::size_of::<f64>() {
+    if number_size as usize != std::mem::size_of::<LuaNumber>() {
         return Err("Lua number size mismatch".to_string());
     }
     // 读取但不严格校验 value（对应 C 中 long double padding 的容忍）
@@ -591,6 +586,7 @@ fn format_constant(constants: &[DumpConstant], idx: usize) -> String {
     match &constants[idx] {
         DumpConstant::Nil => "nil".to_string(),
         DumpConstant::Boolean(b) => if *b { "true" } else { "false" }.to_string(),
+        // 十进制有符号输出, 与 C 的 `printf(LUA_INTEGER_FMT)` 一致 (Rust `{}` 即 "%lld"/"%d" 的十进制语义)
         DumpConstant::Integer(i) => format!("{}", i),
         DumpConstant::Float(f) => {
             let s = crate::float_utils::f64_to_string(*f);
@@ -1203,12 +1199,12 @@ const LUAC_VERSION: u8 = 85;
 const LUAC_FORMAT: u8 = 0;
 /// LUAC_DATA = "\x19\x93\r\n\x1a\n"
 const LUAC_DATA: &[u8] = b"\x19\x93\r\n\x1a\n";
-/// LUAC_INT (int 和 lua_Integer 共用)
+/// LUAC_INT (= -0x5678) — `int` / `lua_Integer` 共用同一数值
 const LUAC_INT: i32 = -0x5678;
 /// LUAC_INST
 const LUAC_INST: u32 = 0x12345678;
-/// LUAC_NUM
-const LUAC_NUM: f64 = -370.5;
+/// LUAC_NUM (cast_num(-370.5)) — 按 `LuaNumber` 宽度
+const LUAC_NUM: LuaNumber = -370.5;
 
 /// 类型标签常量 (对应 C 的 lobject.h)
 const LUA_VNIL: u8 = 0;
@@ -1280,18 +1276,22 @@ impl BytecodeWriter {
         self.dump_varint(x as u64);
     }
 
-    fn dump_number(&mut self, x: f64) {
+    fn dump_number(&mut self, x: LuaNumber) {
         self.dump_block(&x.to_le_bytes());
     }
 
     /// 有符号整数编码: 非负 x 编码为 2x; 负 x 编码为 -2x-1
-    fn dump_integer(&mut self, x: i64) {
-        let cx: u64 = if x >= 0 {
-            2u64.wrapping_mul(x as u64)
+    /// 对应 C 的 `dumpInteger`: 运算经 `lua_Unsigned` (l_castS2U)。
+    fn dump_integer(&mut self, x: LuaInteger) {
+        let cx: LuaUnsigned = if x >= 0 {
+            (2 as LuaUnsigned).wrapping_mul(x as LuaUnsigned)
         } else {
-            2u64.wrapping_mul(!(x as u64)).wrapping_add(1)
+            (2 as LuaUnsigned)
+                .wrapping_mul(!(x as LuaUnsigned))
+                .wrapping_add(1)
         };
-        self.dump_varint(cx);
+        // 字节布局边界: 变长整数编码用 64 位容器承载位模式
+        self.dump_varint(cx as u64);
     }
 
     /// 序列化字符串 (带去重)
@@ -1332,13 +1332,13 @@ impl BytecodeWriter {
         self.dump_block(&value.to_le_bytes());
     }
 
-    fn dump_num_info_integer(&mut self, value: i64) {
-        self.dump_byte(std::mem::size_of::<i64>() as u8);
+    fn dump_num_info_integer(&mut self, value: LuaInteger) {
+        self.dump_byte(std::mem::size_of::<LuaInteger>() as u8);
         self.dump_block(&value.to_le_bytes());
     }
 
-    fn dump_num_info_number(&mut self, value: f64) {
-        self.dump_byte(std::mem::size_of::<f64>() as u8);
+    fn dump_num_info_number(&mut self, value: LuaNumber) {
+        self.dump_byte(std::mem::size_of::<LuaNumber>() as u8);
         self.dump_block(&value.to_le_bytes());
     }
 
@@ -1349,7 +1349,7 @@ impl BytecodeWriter {
         self.dump_block(LUAC_DATA);
         self.dump_num_info_int(LUAC_INT);
         self.dump_num_info_inst(LUAC_INST);
-        self.dump_num_info_integer(LUAC_INT as i64);
+        self.dump_num_info_integer(LUAC_INT as LuaInteger);
         self.dump_num_info_number(LUAC_NUM);
     }
 

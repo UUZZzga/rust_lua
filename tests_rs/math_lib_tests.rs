@@ -63,8 +63,10 @@ fn test_math_pi() {
     let output = run_lua_expr("print(math.pi)");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
+    // math.pi 是 LuaNumber 常量: f64 → 3.141592653589793, f32 → 3.1415927
+    let pi: f64 = stdout.trim().parse().expect("math.pi must print a number");
     assert!(
-        stdout.trim().contains("3.14159265358979"),
+        (pi - std::f64::consts::PI).abs() < 1e-6,
         "expected PI value, got: {}",
         stdout
     );
@@ -83,9 +85,10 @@ fn test_math_maxinteger() {
     let output = run_lua_expr("print(math.maxinteger)");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // i64::MAX = 9223372036854775807
-    assert!(
-        stdout.trim().contains("9223372036854775807"),
+    // 期望值随数值类型配置变化 (C: LUA_MAXINTEGER)
+    assert_eq!(
+        stdout.trim(),
+        lua_rs::config::MAX_INTEGER.to_string(),
         "expected maxinteger, got: {}",
         stdout
     );
@@ -96,9 +99,10 @@ fn test_math_mininteger() {
     let output = run_lua_expr("print(math.mininteger)");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // i64::MIN = -9223372036854775808
-    assert!(
-        stdout.trim().contains("-9223372036854775808"),
+    // 期望值随数值类型配置变化 (C: LUA_MININTEGER)
+    assert_eq!(
+        stdout.trim(),
+        lua_rs::config::MIN_INTEGER.to_string(),
         "expected mininteger, got: {}",
         stdout
     );
@@ -237,14 +241,15 @@ fn test_math_log_natural() {
     assert!(stdout.contains("0"));
 }
 
-// Miri 下 math.log(math.exp(1)) 精度不足,输出可能不含 "1"
+// Miri 下精度不足; f32 配置下结果为 0.99999994 —— 按近似断言
 #[cfg_attr(miri, ignore)]
 #[test]
 fn test_math_log_e() {
     let output = run_lua_expr("print(math.log(math.exp(1)))");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("1"));
+    let v: f64 = stdout.trim().parse().expect("must print a number");
+    assert!((v - 1.0).abs() < 1e-6, "log(exp(1)) ≈ 1, got: {}", stdout);
 }
 
 // Miri 下 log2(8) 精度不足,可能输出 2.9999999999999987 而非 3.0
@@ -423,8 +428,9 @@ fn test_math_deg_rad_roundtrip() {
     let output = run_lua_expr("print(math.rad(math.deg(1.0)))");
     assert!(output.status.success());
     let stdout = String::from_utf8_lossy(&output.stdout);
-    // rad(deg(1.0)) 应该 ≈ 1.0
-    assert!(stdout.contains("1"));
+    // rad(deg(1.0)) 应该 ≈ 1.0 (f32 配置下 0.99999994)
+    let v: f64 = stdout.trim().parse().expect("must print a number");
+    assert!((v - 1.0).abs() < 1e-6, "rad(deg(1.0)) ≈ 1, got: {}", stdout);
 }
 
 // ============================================================================
@@ -1171,13 +1177,19 @@ fn test_rust_api_math_ult() {
 
 #[test]
 fn test_rust_api_math_modf() {
+    // 容差随 LuaNumber 宽度 (f64 1e-15 / f32 1e-6)
+    #[cfg(not(feature = "num-f32"))]
+    const TOL: f64 = 1e-15;
+    #[cfg(feature = "num-f32")]
+    const TOL: f64 = 1e-6;
+
     let (int, frac) = math_lib::math_modf(&TValue::Float(3.14)).unwrap();
     assert_eq!(int, TValue::Integer(3));
-    assert!(matches!(frac, TValue::Float(f) if (f - 0.14).abs() < 1e-15));
+    assert!(matches!(frac, TValue::Float(f) if (f as f64 - 0.14).abs() < TOL));
 
     let (int, frac) = math_lib::math_modf(&TValue::Float(-3.14)).unwrap();
     assert_eq!(int, TValue::Integer(-3));
-    assert!(matches!(frac, TValue::Float(f) if (f - (-0.14)).abs() < 1e-15));
+    assert!(matches!(frac, TValue::Float(f) if (f as f64 - (-0.14)).abs() < TOL));
 }
 
 #[test]
@@ -1260,8 +1272,13 @@ fn test_rust_api_open_math_lib() {
 
 #[test]
 fn test_rust_api_constants() {
+    // PI/HUGE 是 LuaNumber 常量（宽度随数值类型配置变化）
+    #[cfg(not(feature = "num-f32"))]
     assert!((math_lib::PI - std::f64::consts::PI).abs() < 1e-15);
+    #[cfg(feature = "num-f32")]
+    assert!((math_lib::PI as f64 - std::f64::consts::PI).abs() < 1e-6);
     assert!(math_lib::HUGE.is_infinite() && math_lib::HUGE > 0.0);
-    assert_eq!(math_lib::MAX_INTEGER, i64::MAX);
-    assert_eq!(math_lib::MIN_INTEGER, i64::MIN);
+    // math.maxinteger/mininteger 必须就是 config 的 LuaInteger 极值（C: LUA_MAXINTEGER）
+    assert_eq!(math_lib::MAX_INTEGER, lua_rs::config::MAX_INTEGER);
+    assert_eq!(math_lib::MIN_INTEGER, lua_rs::config::MIN_INTEGER);
 }

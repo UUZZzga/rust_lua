@@ -16,22 +16,18 @@
 use std::cmp::Ordering;
 
 use crate::alloc::MyRc;
-use crate::gc::GCState;
+use crate::config::{
+    int_fits_float, number_to_integer, LuaInteger, LuaNumber, LuaUnsigned, INTEGER_BITS,
+};
 use crate::mem::SlotAlloc;
-use crate::objects::{NilKind, TValue, UpVal, UpValRef, UpValVec, WeakValue};
+use crate::objects::TValue;
 use crate::strings::{lua_string_as_c_str_ptr, lua_string_as_str, lua_string_eq, lua_string_len};
-use crate::table::Table;
 use crate::tm::{obj_type_name_, TagMethodError};
-use std::cell::RefCell;
 use std::rc::Rc;
 
 // ============================================================================
 // 虚拟机主解释器循环 (原 lvm.cpp 中的 luaV_execute)
 // ============================================================================
-
-pub use crate::execute::VmError;
-pub use crate::execute::VmExecutor;
-pub use crate::execute::VmResult;
 
 // ============================================================================
 // F2IMode: 浮点数到整数的转换模式
@@ -99,36 +95,22 @@ impl Default for F2IMode {
 /// Then: 返回 None
 ///
 /// Scenario: NaN / Inf
-/// Given: n = f64::NAN
+/// Given: n = NaN (LuaNumber::NAN)
 /// When: 调用 float_to_integer(NaN, 任意模式)
 /// Then: 返回 None
-pub fn float_to_integer(n: f64, mode: F2IMode) -> Option<i64> {
-    if n.is_nan() || n.is_infinite() {
-        return None;
-    }
-    let floor = n.floor();
-    if n != floor {
+pub fn float_to_integer(n: LuaNumber, mode: F2IMode) -> Option<LuaInteger> {
+    // 对应 C 的 luaV_flttointeger: 先 l_floor, 非整数值时按 mode 处理
+    // (Eq 失败 / Floor 取 floor / Ceil 把 floor 补 1 成 ceil),
+    // 再由 lua_numbertointeger 做范围判定 (NaN/Inf 由比较自然排除)。
+    let mut f = n.floor();
+    if n != f {
         match mode {
             F2IMode::Eq => return None,
             F2IMode::Floor => {}
-            F2IMode::Ceil => {
-                let ceil = n.ceil();
-                // 注意: i64::MAX as f64 = 2^63 (向上舍入), 所以用 >= 排除 2^63 及以上
-                // (2^63 超出 i64 范围, 但 Rust 饱和转换会错误地返回 i64::MAX)
-                if ceil >= i64::MAX as f64 || ceil < i64::MIN as f64 {
-                    return None;
-                }
-                return Some(ceil as i64);
-            }
+            F2IMode::Ceil => f += 1.0, // n != floor 时 floor+1 == ceil
         }
     }
-    // 范围检查: floor 必须在 [i64::MIN, i64::MAX) 内
-    // i64::MIN as f64 = -2^63 (精确), i64::MAX as f64 = 2^63 (向上舍入)
-    // 用 >= 排除 2^63, 用 >= 包含 -2^63
-    if floor >= i64::MAX as f64 || floor < i64::MIN as f64 {
-        return None;
-    }
-    Some(floor as i64)
+    number_to_integer(f)
 }
 
 /// 尝试将 TValue 转换为浮点数（不含字符串强制转换）。
@@ -142,10 +124,10 @@ pub fn float_to_integer(n: f64, mode: F2IMode) -> Option<i64> {
 /// Given: TValue::Boolean(true)
 /// When: 调用 to_number_ns
 /// Then: 返回 None
-pub fn to_number_ns(obj: &TValue) -> Option<f64> {
+pub fn to_number_ns(obj: &TValue) -> Option<LuaNumber> {
     match obj {
         TValue::Float(f) => Some(*f),
-        TValue::Integer(i) => Some(*i as f64),
+        TValue::Integer(i) => Some(*i as LuaNumber),
         _ => None,
     }
 }
@@ -166,14 +148,14 @@ pub fn to_number_ns(obj: &TValue) -> Option<f64> {
 /// Given: TValue::Str("abc")
 /// When: 调用 to_number
 /// Then: 返回 None
-pub fn to_number(obj: &TValue) -> Option<f64> {
+pub fn to_number(obj: &TValue) -> Option<LuaNumber> {
     match obj {
         TValue::Float(f) => Some(*f),
-        TValue::Integer(i) => Some(*i as f64),
+        TValue::Integer(i) => Some(*i as LuaNumber),
         s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
             match crate::objects::str2num(lua_string_as_str(s))? {
                 TValue::Float(f) => Some(f),
-                TValue::Integer(i) => Some(i as f64),
+                TValue::Integer(i) => Some(i as LuaNumber),
                 _ => None,
             }
         }
@@ -197,7 +179,7 @@ pub fn to_number(obj: &TValue) -> Option<f64> {
 /// Given: TValue::Boolean(true)
 /// When: 调用 to_integer_ns
 /// Then: 返回 None
-pub fn to_integer_ns(obj: &TValue, mode: F2IMode) -> Option<i64> {
+pub fn to_integer_ns(obj: &TValue, mode: F2IMode) -> Option<LuaInteger> {
     match obj {
         TValue::Integer(i) => Some(*i),
         TValue::Float(f) => float_to_integer(*f, mode),
@@ -216,7 +198,7 @@ pub fn to_integer_ns(obj: &TValue, mode: F2IMode) -> Option<i64> {
 /// Given: TValue::Str(" 10 ")
 /// When: 调用 to_integer(obj, Eq)
 /// Then: 返回 Some(10)
-pub fn to_integer(obj: &TValue, mode: F2IMode) -> Option<i64> {
+pub fn to_integer(obj: &TValue, mode: F2IMode) -> Option<LuaInteger> {
     match obj {
         TValue::Integer(i) => Some(*i),
         TValue::Float(f) => float_to_integer(*f, mode),
@@ -316,20 +298,14 @@ fn strcoll_ptrs(s1: *const std::os::raw::c_char, s2: *const std::os::raw::c_char
 // 混合整数/浮点数比较辅助函数
 // ============================================================================
 
-fn int_fits_float(i: i64) -> bool {
-    // f64 有 53 位尾数精度，能精确表示 [-2^53, 2^53] 范围内的整数。
-    // 对应 C 的 l_intfitsf (NBM = DBL_MANT_DIG = 53)。
-    // 不能用 `i as f64` 再转回比较，因为饱和转换会让 i64::MAX 误判为可精确表示。
-    const MAX_INT_FITS_F: i64 = 1 << 53;
-    -MAX_INT_FITS_F <= i && i <= MAX_INT_FITS_F
-}
+// int_fits_float 由 crate::config 提供 (对应 C 的 l_intfitsf)。
 
-fn lt_int_float(i: i64, f: f64) -> bool {
+fn lt_int_float(i: LuaInteger, f: LuaNumber) -> bool {
     if f.is_nan() {
         return false;
     }
     if int_fits_float(i) {
-        (i as f64) < f
+        (i as LuaNumber) < f
     } else if let Some(fi) = float_to_integer(f, F2IMode::Ceil) {
         i < fi
     } else {
@@ -337,12 +313,12 @@ fn lt_int_float(i: i64, f: f64) -> bool {
     }
 }
 
-fn le_int_float(i: i64, f: f64) -> bool {
+fn le_int_float(i: LuaInteger, f: LuaNumber) -> bool {
     if f.is_nan() {
         return false;
     }
     if int_fits_float(i) {
-        (i as f64) <= f
+        (i as LuaNumber) <= f
     } else if let Some(fi) = float_to_integer(f, F2IMode::Floor) {
         i <= fi
     } else {
@@ -350,12 +326,12 @@ fn le_int_float(i: i64, f: f64) -> bool {
     }
 }
 
-fn lt_float_int(f: f64, i: i64) -> bool {
+fn lt_float_int(f: LuaNumber, i: LuaInteger) -> bool {
     if f.is_nan() {
         return false;
     }
     if int_fits_float(i) {
-        f < (i as f64)
+        f < (i as LuaNumber)
     } else if let Some(fi) = float_to_integer(f, F2IMode::Floor) {
         fi < i
     } else {
@@ -363,12 +339,12 @@ fn lt_float_int(f: f64, i: i64) -> bool {
     }
 }
 
-fn le_float_int(f: f64, i: i64) -> bool {
+fn le_float_int(f: LuaNumber, i: LuaInteger) -> bool {
     if f.is_nan() {
         return false;
     }
     if int_fits_float(i) {
-        f <= (i as f64)
+        f <= (i as LuaNumber)
     } else if let Some(fi) = float_to_integer(f, F2IMode::Ceil) {
         fi <= i
     } else {
@@ -498,7 +474,7 @@ pub fn raw_equal<'a>(t1: &TValue<'a>, t2: &TValue<'a>) -> bool {
 /// Given: m = 5, n = 0
 /// When: 调用 idiv(5, 0)
 /// Then: 返回 Err
-pub fn idiv(m: i64, n: i64) -> Result<i64, &'static str> {
+pub fn idiv(m: LuaInteger, n: LuaInteger) -> Result<LuaInteger, &'static str> {
     if n == 0 {
         return Err("attempt to divide by zero");
     }
@@ -530,7 +506,7 @@ pub fn idiv(m: i64, n: i64) -> Result<i64, &'static str> {
 /// When: 调用 modulus(5, 0)
 /// Then: 返回 Err
 #[inline]
-pub fn modulus(m: i64, n: i64) -> Result<i64, &'static str> {
+pub fn modulus(m: LuaInteger, n: LuaInteger) -> Result<LuaInteger, &'static str> {
     if n == 0 {
         return Err("attempt to divide by zero");
     }
@@ -558,7 +534,7 @@ pub fn modulus(m: i64, n: i64) -> Result<i64, &'static str> {
 /// Given: m = 10.5, n = 3.0
 /// When: 调用 modulus_float(10.5, 3.0)
 /// Then: 返回 1.5
-pub fn modulus_float(m: f64, n: f64) -> f64 {
+pub fn modulus_float(m: LuaNumber, n: LuaNumber) -> LuaNumber {
     let r = m % n;
     if (r > 0.0) == (n < 0.0) && r != 0.0 {
         r + n
@@ -583,18 +559,23 @@ pub fn modulus_float(m: f64, n: f64) -> f64 {
 /// Given: x = 1, y = 100
 /// When: 调用 shiftl(1, 100)
 /// Then: 返回 0
-pub fn shiftl(x: i64, y: i64) -> i64 {
-    const NBITS: i64 = 64;
+pub fn shiftl(x: LuaInteger, y: LuaInteger) -> LuaInteger {
+    // 对应 C 的 luaV_shiftl: 位宽由 INTEGER_BITS 决定, 负数位移改方向。
+    let nbits = INTEGER_BITS as LuaInteger;
     if y < 0 {
-        if y <= -NBITS {
-            return 0;
+        // 右移: y <= -NBITS 时结果 0 (先判上界, 避免 -y 溢出)
+        if y <= -nbits {
+            0
+        } else {
+            ((x as LuaUnsigned) >> ((-y) as u32)) as LuaInteger
         }
-        ((x as u64) >> (-y as u32)) as i64
     } else {
-        if y >= NBITS {
-            return 0;
+        // 左移: y >= NBITS 时结果 0
+        if y >= nbits {
+            0
+        } else {
+            ((x as LuaUnsigned) << (y as u32)) as LuaInteger
         }
-        ((x as u64) << (y as u32)) as i64
     }
 }
 
@@ -604,27 +585,8 @@ pub fn shiftl(x: i64, y: i64) -> i64 {
 /// Given: x = 16, y = 2
 /// When: 调用 shiftr(16, 2)
 /// Then: 返回 4
-pub fn shiftr(x: i64, y: i64) -> i64 {
+pub fn shiftr(x: LuaInteger, y: LuaInteger) -> LuaInteger {
     shiftl(x, y.wrapping_neg())
-}
-
-// ============================================================================
-// objlen_raw: # 操作符的原始长度 (不含元方法 — 元方法在 tm.rs 的 obj_len 中处理)
-// ============================================================================
-
-/// 计算值的原始长度（# 操作符，不含元方法）。
-/// 对应 C 的 luaV_objlen 中的快速路径 (非元方法部分)。
-/// - Table: 返回表长度
-/// - String: 返回字符串长度
-/// - 其他: 返回 None (需要调用 __len 元方法)
-pub fn objlen_raw<'a>(obj: &TValue<'a>) -> Option<TValue<'a>> {
-    match obj {
-        TValue::Table(t) => Some(TValue::Integer(t.len())),
-        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
-            Some(TValue::Integer(lua_string_len(s) as i64))
-        }
-        _ => None,
-    }
 }
 
 // ============================================================================
@@ -656,145 +618,6 @@ pub fn is_false(v: &TValue) -> bool {
 }
 
 // ============================================================================
-// 表快速访问结果标签
-// ============================================================================
-
-/// 表快速 get/set 的结果类型。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FastAccess {
-    Ok,
-    NotTable,
-    Empty,
-}
-
-// ============================================================================
-// finish_get: 完成表读操作（含元方法链）
-// ============================================================================
-
-const MAX_TAG_LOOP: i32 = 2000;
-
-/// 完成表取值操作 `val = t[key]`，处理元方法回溯。
-///
-/// 当快速路径无法直接获取值时，此函数查找 __index 元方法链。
-///
-/// Scenario: 表有 __index 元方法
-/// Given: 一个设置了 __index 元方法的表
-/// When: 键不存在于表中时调用 finish_get
-/// Then: 遍历 __index 链查找值，找到则返回
-///
-/// Scenario: 非表类型有 __index 元方法
-/// Given: 一个 non-table 值（如 userdata）
-/// When: 访问其字段时
-/// Then: 查找其 __index 元方法
-///
-/// Scenario: 无穷循环保护
-/// Given: __index 链形成循环
-/// When: 遍历超过 MAXTAGLOOP 次
-/// Then: 返回 RuntimeError
-pub fn finish_get<'a>(
-    key: &TValue<'a>,
-    t: &TValue<'a>,
-    _metatable: Option<&Table<'a>>,
-) -> Result<TValue<'a>, VmError<'a>> {
-    let current = t.clone();
-    let current_key = key.clone();
-
-    for _loop_count in 0..MAX_TAG_LOOP {
-        match &current {
-            TValue::Table(table) => {
-                // 通过 get_metatable() 获取元表（共享 Rc，开销极小）
-                if let Some(mt) = table.get_metatable() {
-                    return Ok(table.get(&current_key).unwrap_or_else(|| {
-                        mt.get(&current_key).unwrap_or(TValue::Nil(NilKind::Strict))
-                    }));
-                } else {
-                    return Ok(table
-                        .get(&current_key)
-                        .unwrap_or(TValue::Nil(NilKind::Strict)));
-                }
-            }
-            _ => {
-                return Ok(TValue::Nil(NilKind::Strict));
-            }
-        }
-    }
-    Err(VmError::RuntimeError(
-        "'__index' chain too long; possible loop".into(),
-    ))
-}
-
-// ============================================================================
-// finish_set: 完成表写操作（含元方法链）
-// ============================================================================
-
-/// 完成表赋值操作 `t[key] = val`，处理元方法回溯。
-///
-/// 当快速路径无法直接设置值时，此函数查找 __newindex 元方法链。
-///
-/// Scenario: 表无 __newindex 元方法
-/// Given: 一个没有 __newindex 的表
-/// When: 设置键值对
-/// Then: 直接完成赋值
-///
-/// Scenario: 表有 __newindex 元方法
-/// Given: 一个设置了 __newindex 元方法的表
-/// When: 设置键值对
-/// Then: 通过元方法链完成
-///
-/// Scenario: 非表类型有 __newindex 元方法
-/// Given: 一个 non-table 值（如 userdata）
-/// When: 设置其字段时
-/// Then: 查找其 __newindex 元方法
-///
-/// Scenario: 无穷循环保护
-/// Given: __newindex 链形成循环
-/// When: 遍历超过 MAXTAGLOOP 次
-/// Then: 返回 RuntimeError
-pub fn finish_set<'a>(
-    t: &mut TValue<'a>,
-    key: TValue<'a>,
-    val: TValue<'a>,
-    _hres: FastAccess,
-) -> Result<(), VmError<'a>> {
-    for _loop_count in 0..MAX_TAG_LOOP {
-        match t {
-            TValue::Table(table) => {
-                table.set(key, val);
-                return Ok(());
-            }
-            _ => {
-                return Err(VmError::TypeError(
-                    "attempt to index a non-table value".into(),
-                ));
-            }
-        }
-    }
-    Err(VmError::RuntimeError(
-        "'__newindex' chain too long; possible loop".into(),
-    ))
-}
-
-// ============================================================================
-// finish_op: 恢复被 yield 中断的操作码
-// ============================================================================
-
-/// 恢复被 yield 中断的操作码执行。
-///
-/// 在 C 实现中，当一个操作码执行到一半时发生了 yield（如元方法调用），
-/// 此函数负责完成操作码的剩余工作。
-///
-/// 目前为存根实现，等待完整的协程/元方法支持。
-///
-/// Scenario: yield 后在 OP_CONCAT 中恢复
-/// Given: 中断前的栈状态，其中元方法结果已放置
-/// When: 调用 finish_op
-/// Then: 完成剩余字符串拼接
-pub fn finish_op<'a>(_interrupted_op: u8, _stack: &mut Vec<TValue<'a>>) -> Result<(), VmError<'a>> {
-    // 占位实现 — 在实际系统中有完整的元方法调用和 yield 支持时填充
-    Ok(())
-}
-
-// ============================================================================
 // concat: 字符串拼接 (luaV_concat)
 // ============================================================================
 
@@ -822,7 +645,7 @@ fn value_is_stringable(v: &TValue) -> bool {
     )
 }
 
-fn format_float_len(f: f64) -> usize {
+fn format_float_len(f: LuaNumber) -> usize {
     if f.is_nan() {
         return 3;
     }
@@ -949,13 +772,13 @@ pub fn concat_stack(
     Ok(())
 }
 
-fn string_from_int<'a>(table: &crate::strings::StringTable, i: i64) -> TValue<'a> {
+fn string_from_int<'a>(table: &crate::strings::StringTable, i: LuaInteger) -> TValue<'a> {
     let s = crate::float_utils::i64_to_string(i);
     // 对应 C 的 tostringbuff: 短字符串走 intern (luaS_newlstr → internshrstr)
     table.intern_value(&s)
 }
 
-fn string_from_float<'a>(table: &crate::strings::StringTable, f: f64) -> TValue<'a> {
+fn string_from_float<'a>(table: &crate::strings::StringTable, f: LuaNumber) -> TValue<'a> {
     let s = format_float(f);
     // 对应 C 的 tostringbuff: 短字符串走 intern (luaS_newlstr → internshrstr)
     table.intern_value(&s)
@@ -979,308 +802,6 @@ fn append_val_to_string(buf: &mut String, v: &TValue) {
     }
 }
 
-// ============================================================================
-// for_limit: for 循环边界计算
-// ============================================================================
-
-/// 计算数值 for 循环的整数边界。
-///
-/// 将 limit 转换为整数边界值，保留循环语义。
-///
-/// Scenario: 整数 limit
-/// Given: limit 是整数 10, step > 0
-/// When: 调用 for_limit
-/// Then: p = 10, 返回 false（不跳过循环）
-///
-/// Scenario: limit 超出整数范围（正向步长）
-/// Given: limit 是一个极大正浮点数
-/// When: 调用 for_limit
-/// Then: p = i64::MAX, 返回 false
-///
-/// Scenario: limit 超出整数范围（负向步长）
-/// Given: limit 是一个极大负浮点数, step < 0
-/// When: 调用 for_limit
-/// Then: p = i64::MIN, 返回 false
-///
-/// Scenario: step > 0 且 init > limit
-/// Given: init = 5, limit = 3, step = 1
-/// When: 调用 for_limit
-/// Then: 返回 true（跳过循环）
-///
-/// Scenario: step < 0 且 init < limit
-/// Given: init = 3, limit = 5, step = -1
-/// When: 调用 for_limit
-/// Then: 返回 true（跳过循环）
-pub fn for_limit<'a>(
-    init: i64,
-    limit_val: &TValue<'a>,
-    step: i64,
-) -> Result<(i64, bool), VmError<'a>> {
-    let mode = if step < 0 {
-        F2IMode::Ceil
-    } else {
-        F2IMode::Floor
-    };
-
-    if let Some(limit) = to_integer(limit_val, mode) {
-        let skip = if step > 0 { init > limit } else { init < limit };
-        return Ok((limit, skip));
-    }
-
-    let flim = match to_number_ns(limit_val) {
-        Some(n) => n,
-        None => {
-            return Err(VmError::RuntimeError(
-                "bad 'for' limit (number expected, got value)".into(),
-            ))
-        }
-    };
-
-    if flim > 0.0 {
-        if step < 0 {
-            return Ok((0, true));
-        }
-        return Ok((i64::MAX, false));
-    } else {
-        if step > 0 {
-            return Ok((0, true));
-        }
-        return Ok((i64::MIN, false));
-    }
-}
-
-// ============================================================================
-// for_prep: for 循环准备
-// ============================================================================
-
-/// 准备数值 for 循环：将初始值、边界、步长转换为循环内部使用的形式。
-///
-/// Scenario: 正向整数循环
-/// Given: init=1, limit=5, step=1
-/// When: 调用 for_prep
-/// Then: 设置计数器和控制变量，返回 false（不跳过）
-///
-/// Scenario: 降序循环
-/// Given: init=5, limit=1, step=-1
-/// When: 调用 for_prep
-/// Then: 设置计数器和控制变量，返回 false
-///
-/// Scenario: step == 0
-/// Given: step=0
-/// When: 调用 for_prep
-/// Then: 返回 RuntimeError
-///
-/// Scenario: 跳过循环
-/// Given: init=5, limit=3, step=1
-/// When: 调用 for_prep
-/// Then: 返回 true（跳过）
-pub fn for_prep<'a>(stack: &mut Vec<TValue<'a>>, ra: usize) -> Result<bool, VmError<'a>> {
-    let init = stack[ra].clone();
-    let limit = stack[ra + 1].clone();
-    let step = stack[ra + 2].clone();
-
-    match (&init, &step) {
-        (TValue::Integer(init_i), TValue::Integer(step_i)) => {
-            if *step_i == 0 {
-                return Err(VmError::RuntimeError("'for' step is zero".into()));
-            }
-            let (limit_i, skip) = for_limit(*init_i, &limit, *step_i)?;
-            if skip {
-                return Ok(true);
-            }
-            let count: u64 = if *step_i > 0 {
-                let diff = (limit_i as u64).wrapping_sub(*init_i as u64);
-                let s = *step_i as u64;
-                if s == 1 {
-                    diff
-                } else {
-                    diff / s
-                }
-            } else {
-                let diff = (*init_i as u64).wrapping_sub(limit_i as u64);
-                let s = ((-(*step_i + 1)) as u64).wrapping_add(1);
-                diff / s
-            };
-            stack[ra] = TValue::Integer(count as i64);
-            stack[ra + 1] = TValue::Integer(*step_i);
-            stack[ra + 2] = TValue::Integer(*init_i);
-            Ok(false)
-        }
-        _ => {
-            let init_f = to_number(&init)
-                .ok_or_else(|| VmError::RuntimeError("bad 'for' initial value".into()))?;
-            let limit_f =
-                to_number(&limit).ok_or_else(|| VmError::RuntimeError("bad 'for' limit".into()))?;
-            let step_f =
-                to_number(&step).ok_or_else(|| VmError::RuntimeError("bad 'for' step".into()))?;
-            if step_f == 0.0 {
-                return Err(VmError::RuntimeError("'for' step is zero".into()));
-            }
-            let skip = if step_f > 0.0 {
-                limit_f < init_f
-            } else {
-                init_f < limit_f
-            };
-            if skip {
-                return Ok(true);
-            }
-            stack[ra] = TValue::Float(limit_f);
-            stack[ra + 1] = TValue::Float(step_f);
-            stack[ra + 2] = TValue::Float(init_f);
-            Ok(false)
-        }
-    }
-}
-
-// ============================================================================
-// float_for_loop: 浮点数 for 循环单步执行
-// ============================================================================
-
-/// 执行浮点数 for 循环的一个步骤。
-///
-/// Scenario: 继续循环
-/// Given: step=1, limit=5, idx=3
-/// When: 调用 float_for_loop
-/// Then: 更新 idx 为 4，返回 true
-///
-/// Scenario: 循环结束
-/// Given: step=1, limit=5, idx=5
-/// When: 调用 float_for_loop
-/// Then: idx 不被修改，返回 false
-///
-/// Scenario: 降序循环继续
-/// Given: step=-1, limit=1, idx=3
-/// When: 调用 float_for_loop
-/// Then: 更新 idx 为 2，返回 true
-pub fn float_for_loop(stack: &mut Vec<TValue>, ra: usize) -> bool {
-    let step = match &stack[ra + 1] {
-        TValue::Float(f) => *f,
-        TValue::Integer(i) => *i as f64,
-        _ => return false,
-    };
-    let limit = match &stack[ra] {
-        TValue::Float(f) => *f,
-        TValue::Integer(i) => *i as f64,
-        _ => return false,
-    };
-    let idx = match &stack[ra + 2] {
-        TValue::Float(f) => *f,
-        TValue::Integer(i) => *i as f64,
-        _ => return false,
-    };
-    let new_idx = idx + step;
-    let should_continue = if step > 0.0 {
-        new_idx <= limit
-    } else {
-        new_idx >= limit
-    };
-    if should_continue {
-        stack[ra + 2] = TValue::Float(new_idx);
-        true
-    } else {
-        false
-    }
-}
-
-// ============================================================================
-// push_closure: 创建 Lua 闭包并放入栈
-// ============================================================================
-
-/// 创建 Lua 闭包并初始化其上值。
-///
-/// Scenario: 无上值的闭包
-/// Given: 一个 proto 无上值
-/// When: 调用 push_closure
-/// Then: 创建闭包，栈上 ra 位置被设为 LClosure
-///
-/// Scenario: 有栈上值的闭包
-/// Given: 一个 proto 有一个上值，instack=true
-/// When: 调用 push_closure
-/// Then: 创建闭包，上值指向栈上对应位置
-pub fn push_closure<'a>(
-    stack: &mut Vec<TValue<'a>>,
-    proto: &crate::objects::Proto<'a>,
-    _enc_upvals: &[UpValRef<'a>],
-    _base: usize,
-    ra: usize,
-    gc: &GCState<'a>,
-    alloc: SlotAlloc,
-) {
-    let nup = proto.size_upvalues as usize;
-    let upvals = Rc::new(RefCell::new(UpValVec::new()));
-
-    for i in 0..nup {
-        if i < proto.upvalues.len() && proto.upvalues[i].in_stack {
-            let idx = _base + proto.upvalues[i].idx as usize;
-            if idx < stack.len() {
-                upvals.borrow_mut().push(Rc::new(RefCell::new(UpVal::Open {
-                    stack_index: idx,
-                    next: None,
-                    previous: None,
-                    tbc: false,
-                })));
-            } else {
-                upvals
-                    .borrow_mut()
-                    .push(Rc::new(RefCell::new(UpVal::Closed {
-                        value: TValue::Nil(NilKind::Strict),
-                    })));
-            }
-        } else if i < _enc_upvals.len() {
-            upvals.borrow_mut().push(_enc_upvals[i].clone());
-        } else {
-            upvals
-                .borrow_mut()
-                .push(Rc::new(RefCell::new(UpVal::Closed {
-                    value: TValue::Nil(NilKind::Strict),
-                })));
-        }
-    }
-
-    let closure = MyRc::new_in(
-        alloc,
-        crate::objects::LClosure {
-            gc_header: crate::gc::GCObjectHeader::new(),
-            proto: Rc::new(proto.clone()),
-            upvals,
-        },
-    );
-    // 用 gc_mem_size() 计费含 upvals 容量，比 size_of::<LClosure>() 更接近真实占用
-    let closure_id = gc.register_object(
-        closure.gc_mem_size(),
-        WeakValue::LClosure(closure.downgrade()),
-    );
-    closure.gc_header.set_id(closure_id);
-
-    // GC barrier (luaC_objbarrier): for each upvalue, if closure is black
-    // and upvalue value is a white GC object, make it gray
-    for uv in closure.upvals.borrow().iter() {
-        let uv_ref = uv.borrow();
-        match &*uv_ref {
-            UpVal::Closed { value } => {
-                if let Some(val_gc_id) = gc_id_of_tvalue(value) {
-                    gc.obj_barrier(closure_id, val_gc_id);
-                }
-            }
-            UpVal::Open { stack_index, .. } => {
-                if *stack_index < stack.len() {
-                    let val = &stack[*stack_index];
-                    if let Some(val_gc_id) = gc_id_of_tvalue(val) {
-                        gc.obj_barrier(closure_id, val_gc_id);
-                    }
-                }
-            }
-        }
-    }
-
-    if ra < stack.len() {
-        stack[ra] = TValue::LClosure(closure);
-    } else {
-        stack.resize(ra + 1, TValue::Nil(NilKind::Strict));
-        stack[ra] = TValue::LClosure(closure);
-    }
-}
-
 /// 从 TValue 中提取 GCObjectId（如果值是 GC 对象）
 pub fn gc_id_of_tvalue(val: &TValue) -> Option<crate::gc::GCObjectId> {
     match val {
@@ -1294,7 +815,7 @@ pub fn gc_id_of_tvalue(val: &TValue) -> Option<crate::gc::GCObjectId> {
 // format_float（与 execute.rs 中保持一致的辅助函数）
 // ============================================================================
 
-fn format_float(f: f64) -> String {
+fn format_float(f: LuaNumber) -> String {
     crate::float_utils::f64_to_string(f)
 }
 
@@ -1305,14 +826,11 @@ fn format_float(f: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::objects::{NilKind, Proto, UpvalDesc};
+    use crate::execute::{VmError, VmResult};
+    use crate::objects::NilKind;
     use crate::state::LuaState;
     use crate::strings::StringTable;
-    use std::rc::Rc;
-
-    fn make_gc<'a>() -> Rc<crate::gc::GCState<'a>> {
-        Rc::new(crate::gc::GCState::default_incremental())
-    }
+    use crate::table::Table;
 
     // ============================================================================
     // 小于比较 (原始比较，不含元方法 — 元方法在 tm.rs 的 call_order_tm 中处理)
@@ -1424,30 +942,36 @@ mod tests {
 
     #[test]
     fn test_float_to_integer_nan() {
-        assert_eq!(float_to_integer(f64::NAN, F2IMode::Eq), None);
-        assert_eq!(float_to_integer(f64::NAN, F2IMode::Floor), None);
-        assert_eq!(float_to_integer(f64::NAN, F2IMode::Ceil), None);
+        assert_eq!(float_to_integer(LuaNumber::NAN, F2IMode::Eq), None);
+        assert_eq!(float_to_integer(LuaNumber::NAN, F2IMode::Floor), None);
+        assert_eq!(float_to_integer(LuaNumber::NAN, F2IMode::Ceil), None);
     }
 
     #[test]
     fn test_float_to_integer_infinity() {
-        assert_eq!(float_to_integer(f64::INFINITY, F2IMode::Floor), None);
-        assert_eq!(float_to_integer(f64::NEG_INFINITY, F2IMode::Floor), None);
+        assert_eq!(float_to_integer(LuaNumber::INFINITY, F2IMode::Floor), None);
+        assert_eq!(
+            float_to_integer(LuaNumber::NEG_INFINITY, F2IMode::Floor),
+            None
+        );
     }
 
+    // 2^53 精确表示只在 i64 整数 + f64 浮点组合下有跨精度意义。
+    #[cfg(all(not(feature = "num-i32"), not(feature = "num-f32")))]
     #[test]
     fn test_float_to_integer_large() {
-        let large: f64 = (1i64 << 53) as f64;
+        let large: LuaNumber = (1i64 << 53) as LuaNumber;
         assert_eq!(float_to_integer(large, F2IMode::Eq), Some(1i64 << 53));
     }
 
+    #[cfg(all(not(feature = "num-i32"), not(feature = "num-f32")))]
     #[test]
     fn test_float_to_integer_i64_max_edge() {
         // i64::MAX as f64 实际是 2^63 (向上舍入), 超出 i64 范围, 应返回 None
         // 对应 C 的 lua_numbertointeger: (lua_Integer)(2^63) 是 UB/截断, 转回不等于 2^63
         let max_f = i64::MAX as f64;
         assert_eq!(float_to_integer(max_f, F2IMode::Eq), None);
-        assert!(float_to_integer(f64::INFINITY, F2IMode::Eq).is_none());
+        assert!(float_to_integer(LuaNumber::INFINITY, F2IMode::Eq).is_none());
         // f64 能精确表示的最大 i64: 2^63 - 1024 = i64::MAX - 1023
         let largest_fit = i64::MAX - 1023;
         assert_eq!(
@@ -1456,6 +980,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(not(feature = "num-i32"), not(feature = "num-f32")))]
     #[test]
     fn test_float_to_integer_overflow() {
         assert_eq!(
@@ -1464,6 +989,7 @@ mod tests {
         );
     }
 
+    #[cfg(all(not(feature = "num-i32"), not(feature = "num-f32")))]
     #[test]
     fn test_float_to_integer_i64_min_edge() {
         assert_eq!(
@@ -1681,17 +1207,22 @@ mod tests {
 
     #[test]
     fn test_lt_num_nan() {
-        assert!(!lt_num(&TValue::Float(f64::NAN), &TValue::Integer(1)));
-        assert!(!lt_num(&TValue::Integer(1), &TValue::Float(f64::NAN)));
+        assert!(!lt_num(&TValue::Float(LuaNumber::NAN), &TValue::Integer(1)));
+        assert!(!lt_num(&TValue::Integer(1), &TValue::Float(LuaNumber::NAN)));
     }
 
     #[test]
     fn test_lt_num_float_nan_self() {
-        assert!(!lt_num(&TValue::Float(f64::NAN), &TValue::Float(1.0)));
-        assert!(!lt_num(&TValue::Float(1.0), &TValue::Float(f64::NAN)));
-        assert!(!lt_num(&TValue::Float(f64::NAN), &TValue::Float(f64::NAN)));
+        assert!(!lt_num(&TValue::Float(LuaNumber::NAN), &TValue::Float(1.0)));
+        assert!(!lt_num(&TValue::Float(1.0), &TValue::Float(LuaNumber::NAN)));
+        assert!(!lt_num(
+            &TValue::Float(LuaNumber::NAN),
+            &TValue::Float(LuaNumber::NAN)
+        ));
     }
 
+    // 2^54 超 i32 范围, 且 f32 无法区分 2^54 与 2^54+8 —— 仅 i64+f64 组合可断言。
+    #[cfg(all(not(feature = "num-i32"), not(feature = "num-f32")))]
     #[test]
     fn test_lt_num_large_int_vs_float() {
         let large = 2i64.pow(54);
@@ -1723,8 +1254,8 @@ mod tests {
 
     #[test]
     fn test_le_num_nan() {
-        assert!(!le_num(&TValue::Float(f64::NAN), &TValue::Float(1.0)));
-        assert!(!le_num(&TValue::Float(1.0), &TValue::Float(f64::NAN)));
+        assert!(!le_num(&TValue::Float(LuaNumber::NAN), &TValue::Float(1.0)));
+        assert!(!le_num(&TValue::Float(1.0), &TValue::Float(LuaNumber::NAN)));
     }
 
     // ========================================================================
@@ -1778,8 +1309,8 @@ mod tests {
     #[test]
     fn test_raw_equal_nan() {
         assert!(!raw_equal(
-            &TValue::Float(f64::NAN),
-            &TValue::Float(f64::NAN)
+            &TValue::Float(LuaNumber::NAN),
+            &TValue::Float(LuaNumber::NAN)
         ));
     }
 
@@ -1893,7 +1424,7 @@ mod tests {
 
     #[test]
     fn test_idiv_min_by_neg_one() {
-        let m = i64::MIN;
+        let m = LuaInteger::MIN;
         assert_eq!(idiv(m, -1).unwrap(), m.wrapping_neg());
     }
 
@@ -1960,7 +1491,7 @@ mod tests {
 
     #[test]
     fn test_mod_min_by_neg_one() {
-        assert_eq!(modulus(i64::MIN, -1).unwrap(), 0);
+        assert_eq!(modulus(LuaInteger::MIN, -1).unwrap(), 0);
     }
 
     // ========================================================================
@@ -2043,55 +1574,6 @@ mod tests {
     }
 
     // ========================================================================
-    // objlen_raw 测试
-    // ========================================================================
-
-    #[test]
-    fn test_objlen_string() {
-        let tb = StringTable::new();
-        let s = tb.intern_value("hello");
-        assert_eq!(objlen_raw(&s), Some(TValue::Integer(5)));
-    }
-
-    #[test]
-    fn test_objlen_empty_string() {
-        let tb = StringTable::new();
-        let s = tb.intern_value("");
-        assert_eq!(objlen_raw(&s), Some(TValue::Integer(0)));
-    }
-
-    #[test]
-    fn test_objlen_table() {
-        let alloc = crate::mem::TestAlloc::new();
-        let t = Table::with_capacity_in(alloc.slot(), 3, 0);
-        t.set_int(1, TValue::Integer(10));
-        t.set_int(2, TValue::Integer(20));
-        t.set_int(3, TValue::Integer(30));
-        let tv = TValue::Table(t);
-        assert_eq!(objlen_raw(&tv), Some(TValue::Integer(3)));
-    }
-    #[test]
-    fn test_objlen_non_lenable() {
-        assert_eq!(objlen_raw(&TValue::Integer(42)), None);
-    }
-
-    #[test]
-    fn test_objlen_table_with_gaps() {
-        let alloc = crate::mem::TestAlloc::new();
-        let t = Table::with_capacity_in(alloc.slot(), 5, 0);
-        t.set_int(1, TValue::Integer(10));
-        t.set_int(2, TValue::Integer(20));
-        t.set_int(4, TValue::Integer(40));
-        assert_eq!(objlen_raw(&TValue::Table(t)), Some(TValue::Integer(2)));
-    }
-    #[test]
-    fn test_objlen_table_hash_only() {
-        let alloc = crate::mem::TestAlloc::new();
-        let t = Table::new_in(alloc.slot());
-        t.set(TValue::Boolean(true), TValue::Integer(1));
-        assert_eq!(objlen_raw(&TValue::Table(t)), Some(TValue::Integer(0)));
-    }
-    // ========================================================================
     // is_false 测试
     // ========================================================================
 
@@ -2140,11 +1622,22 @@ mod tests {
         assert!(int_fits_float(-100));
     }
 
+    // 2^53/2^54 断言只在完整 64 位整数 + 双精度组合下成立。
+    #[cfg(all(not(feature = "num-i32"), not(feature = "num-f32")))]
     #[test]
     fn test_int_fits_float_large() {
         assert!(!int_fits_float(2i64.pow(53) + 1));
         assert!(int_fits_float(2i64.pow(53)));
         assert!(!int_fits_float(2i64.pow(54)));
+    }
+
+    // i32 整数 + f64 浮点: MAX_INTEGER 位数不超过尾数位数, int_fits_float 恒真。
+    #[cfg(all(feature = "num-i32", not(feature = "num-f32")))]
+    #[test]
+    fn test_int_fits_float_always_true() {
+        assert!(int_fits_float(LuaInteger::MAX));
+        assert!(int_fits_float(LuaInteger::MIN));
+        assert!(int_fits_float(1 << 20));
     }
 
     // ========================================================================
@@ -2159,7 +1652,7 @@ mod tests {
 
     #[test]
     fn test_lt_int_float_nan() {
-        assert!(!lt_int_float(1, f64::NAN));
+        assert!(!lt_int_float(1, LuaNumber::NAN));
     }
 
     #[test]
@@ -2182,6 +1675,7 @@ mod tests {
         assert!(!le_float_int(5.0, 3));
     }
 
+    #[cfg(all(not(feature = "num-i32"), not(feature = "num-f32")))]
     #[test]
     fn test_lt_int_float_large_int() {
         let large = 2i64.pow(54);
@@ -2189,6 +1683,7 @@ mod tests {
         assert!(lt_int_float(large, large as f64 + 8.0));
     }
 
+    #[cfg(all(not(feature = "num-i32"), not(feature = "num-f32")))]
     #[test]
     fn test_lt_float_int_large_int() {
         let large = 2i64.pow(54);
@@ -2198,12 +1693,12 @@ mod tests {
 
     #[test]
     fn test_le_int_float_nan() {
-        assert!(!le_int_float(1, f64::NAN));
+        assert!(!le_int_float(1, LuaNumber::NAN));
     }
 
     #[test]
     fn test_le_float_int_nan() {
-        assert!(!le_float_int(f64::NAN, 1));
+        assert!(!le_float_int(LuaNumber::NAN, 1));
     }
 
     // ========================================================================
@@ -2221,78 +1716,6 @@ mod tests {
     fn test_f2i_mode_clone() {
         let m = F2IMode::Floor;
         assert_eq!(m, m.clone());
-    }
-
-    // ========================================================================
-    // finish_get 测试
-    // ========================================================================
-
-    #[test]
-    fn test_finish_get_table_present_key() {
-        let alloc = crate::mem::TestAlloc::new();
-        let t = Table::new_in(alloc.slot());
-        let tb = StringTable::new();
-        t.set(tb.intern_value("key"), TValue::Integer(42));
-        let tv = TValue::Table(t);
-        let result = finish_get(&tb.intern_value("key"), &tv, None);
-        assert_eq!(result.unwrap(), TValue::Integer(42));
-    }
-    #[test]
-    fn test_finish_get_table_missing_key() {
-        let alloc = crate::mem::TestAlloc::new();
-        let t = Table::new_in(alloc.slot());
-        let tv = TValue::Table(t);
-        let result = finish_get(&(make_ls("missing")), &tv, None);
-        assert_eq!(result.unwrap(), TValue::Nil(NilKind::Strict));
-    }
-    #[test]
-    fn test_finish_get_non_table() {
-        let result = finish_get(&TValue::Integer(1), &TValue::Integer(42), None);
-        assert_eq!(result.unwrap(), TValue::Nil(NilKind::Strict));
-    }
-
-    // ========================================================================
-    // finish_set 测试
-    // ========================================================================
-
-    #[test]
-    fn test_finish_set_table() {
-        let alloc = crate::mem::TestAlloc::new();
-        let t = Table::new_in(alloc.slot());
-        let mut tv = TValue::Table(t);
-        let tb = StringTable::new();
-        let result = finish_set(
-            &mut tv,
-            tb.intern_value("a"),
-            TValue::Integer(100),
-            FastAccess::Ok,
-        );
-        assert!(result.is_ok());
-        if let TValue::Table(ref t) = tv {
-            assert_eq!(t.get(&tb.intern_value("a")), Some(TValue::Integer(100)));
-        }
-    }
-    #[test]
-    fn test_finish_set_non_table_error() {
-        let mut tv = TValue::Integer(42);
-        let result = finish_set(
-            &mut tv,
-            TValue::Integer(1),
-            TValue::Integer(100),
-            FastAccess::Ok,
-        );
-        assert!(result.is_err());
-    }
-
-    // ========================================================================
-    // finish_op 测试
-    // ========================================================================
-
-    #[test]
-    fn test_finish_op_placeholder() {
-        let mut stack = Vec::new();
-        let result = finish_op(0, &mut stack);
-        assert!(result.is_ok());
     }
 
     // ========================================================================
@@ -2364,205 +1787,18 @@ mod tests {
         }
     }
     // ========================================================================
-    // for_limit 测试
-    // ========================================================================
-
-    #[test]
-    fn test_for_limit_int_limit_ascending() {
-        let limit_val = TValue::Integer(10);
-        let (limit, skip) = for_limit(1, &limit_val, 1).unwrap();
-        assert_eq!(limit, 10);
-        assert!(!skip);
-    }
-
-    #[test]
-    fn test_for_limit_skip_ascending() {
-        let limit_val = TValue::Integer(3);
-        let (_limit, skip) = for_limit(5, &limit_val, 1).unwrap();
-        assert!(skip);
-    }
-
-    #[test]
-    fn test_for_limit_float_limit_ascending() {
-        let limit_val = TValue::Float(10.5);
-        let (limit, skip) = for_limit(1, &limit_val, 1).unwrap();
-        assert_eq!(limit, 10);
-        assert!(!skip);
-    }
-
-    #[test]
-    fn test_for_limit_descending() {
-        let limit_val = TValue::Integer(1);
-        let (limit, skip) = for_limit(5, &limit_val, -1).unwrap();
-        assert_eq!(limit, 1);
-        assert!(!skip);
-    }
-
-    #[test]
-    fn test_for_limit_skip_descending() {
-        let limit_val = TValue::Integer(10);
-        let (_limit, skip) = for_limit(5, &limit_val, -1).unwrap();
-        assert!(skip);
-    }
-
-    // ========================================================================
-    // for_prep 测试
-    // ========================================================================
-
-    #[test]
-    fn test_for_prep_integer_ascending() {
-        let mut stack = vec![TValue::Integer(1), TValue::Integer(5), TValue::Integer(1)];
-        let skip = for_prep(&mut stack, 0).unwrap();
-        assert!(!skip);
-    }
-
-    #[test]
-    fn test_for_prep_integer_descending() {
-        let mut stack = vec![TValue::Integer(5), TValue::Integer(1), TValue::Integer(-1)];
-        let skip = for_prep(&mut stack, 0).unwrap();
-        assert!(!skip);
-    }
-
-    #[test]
-    fn test_for_prep_skip_when_init_exceeds_limit() {
-        let mut stack = vec![TValue::Integer(10), TValue::Integer(5), TValue::Integer(1)];
-        let skip = for_prep(&mut stack, 0).unwrap();
-        assert!(skip);
-    }
-
-    #[test]
-    fn test_for_prep_step_zero_error() {
-        let mut stack = vec![TValue::Integer(1), TValue::Integer(5), TValue::Integer(0)];
-        let result = for_prep(&mut stack, 0);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_for_prep_float() {
-        let mut stack = vec![TValue::Float(1.0), TValue::Float(5.0), TValue::Float(1.0)];
-        let skip = for_prep(&mut stack, 0).unwrap();
-        assert!(!skip);
-    }
-
-    // ========================================================================
-    // float_for_loop 测试
-    // ========================================================================
-
-    #[test]
-    fn test_float_for_loop_continue() {
-        let mut stack = vec![TValue::Float(5.0), TValue::Float(1.0), TValue::Float(3.0)];
-        assert!(float_for_loop(&mut stack, 0));
-        assert_eq!(stack[2], TValue::Float(4.0));
-    }
-
-    #[test]
-    fn test_float_for_loop_end() {
-        let mut stack = vec![TValue::Float(5.0), TValue::Float(1.0), TValue::Float(5.0)];
-        assert!(!float_for_loop(&mut stack, 0));
-    }
-
-    #[test]
-    fn test_float_for_loop_descending_continue() {
-        let mut stack = vec![TValue::Float(1.0), TValue::Float(-1.0), TValue::Float(3.0)];
-        assert!(float_for_loop(&mut stack, 0));
-        assert_eq!(stack[2], TValue::Float(2.0));
-    }
-
-    // ========================================================================
-    // push_closure 测试
-    // ========================================================================
-
-    #[test]
-    fn test_push_closure_no_upvals() {
-        let alloc = crate::mem::TestAlloc::new();
-        let proto = Proto {
-            num_params: 0,
-            flag: 0,
-            max_stack_size: 10,
-            size_upvalues: 0,
-            size_k: 0,
-            size_code: 0,
-            size_line_info: 0,
-            size_p: 0,
-            size_loc_vars: 0,
-            size_abs_line_info: 0,
-            line_defined: 0,
-            last_line_defined: 0,
-            constants: Rc::new(vec![]),
-            code: Rc::new(vec![]),
-            protos: Rc::new(vec![]),
-            upvalues: Rc::new(vec![]),
-            line_info: vec![],
-            abs_line_info: vec![],
-            loc_vars: vec![],
-            source: None,
-        };
-        let mut stack = vec![TValue::Nil(NilKind::Strict); 5];
-        push_closure(&mut stack, &proto, &[], 0, 0, &make_gc(), alloc.slot());
-        match &stack[0] {
-            TValue::LClosure(_) => {}
-            _ => panic!("Expected LClosure"),
-        }
-    }
-    #[test]
-    fn test_push_closure_with_upvals() {
-        let alloc = crate::mem::TestAlloc::new();
-        let mut stack = vec![
-            TValue::Integer(42),
-            TValue::Nil(NilKind::Strict),
-            TValue::Nil(NilKind::Strict),
-            TValue::Nil(NilKind::Strict),
-            TValue::Nil(NilKind::Strict),
-        ];
-        let proto = Proto {
-            num_params: 0,
-            flag: 0,
-            max_stack_size: 10,
-            size_upvalues: 1,
-            size_k: 0,
-            size_code: 0,
-            size_line_info: 0,
-            size_p: 0,
-            size_loc_vars: 0,
-            size_abs_line_info: 0,
-            line_defined: 0,
-            last_line_defined: 0,
-            constants: Rc::new(vec![]),
-            code: Rc::new(vec![]),
-            protos: Rc::new(vec![]),
-            upvalues: Rc::new(vec![UpvalDesc {
-                in_stack: true,
-                idx: 0,
-                name: None,
-                parent_local_idx: 0,
-                kind: 0,
-            }]),
-            line_info: vec![],
-            abs_line_info: vec![],
-            loc_vars: vec![],
-            source: None,
-        };
-        push_closure(&mut stack, &proto, &[], 0, 3, &make_gc(), alloc.slot());
-        match &stack[3] {
-            TValue::LClosure(c) => {
-                assert_eq!(c.upvals.borrow().len(), 1);
-            }
-            _ => panic!("Expected LClosure"),
-        }
-    }
-    // ========================================================================
     // format_float 测试
     // ========================================================================
 
     #[test]
     fn test_format_float_nan() {
-        assert_eq!(super::format_float(f64::NAN), "nan");
+        assert_eq!(super::format_float(LuaNumber::NAN), "nan");
     }
 
     #[test]
     fn test_format_float_inf() {
-        assert_eq!(super::format_float(f64::INFINITY), "inf");
-        assert_eq!(super::format_float(f64::NEG_INFINITY), "-inf");
+        assert_eq!(super::format_float(LuaNumber::INFINITY), "inf");
+        assert_eq!(super::format_float(LuaNumber::NEG_INFINITY), "-inf");
     }
 
     #[test]
@@ -2577,6 +1813,7 @@ mod tests {
         assert_eq!(super::format_float(3.5), "3.5");
     }
 
+    #[cfg(not(feature = "num-f32"))]
     #[test]
     fn test_format_float_precision() {
         // size_optimized: %.15g/%.17g 两阶段, 输出 "0.33333333333333331" (17 位有效数字)
@@ -2585,23 +1822,5 @@ mod tests {
         assert_eq!(super::format_float(1.0 / 3.0), "0.33333333333333331");
         #[cfg(not(size_optimized))]
         assert_eq!(super::format_float(1.0 / 3.0), "0.3333333333333333");
-    }
-
-    // ========================================================================
-    // FastAccess 测试
-    // ========================================================================
-
-    #[test]
-    fn test_fast_access_equality() {
-        assert_eq!(FastAccess::Ok, FastAccess::Ok);
-        assert_ne!(FastAccess::Ok, FastAccess::NotTable);
-        assert_eq!(FastAccess::Empty, FastAccess::Empty);
-    }
-
-    #[test]
-    fn test_fast_access_debug() {
-        assert_eq!(format!("{:?}", FastAccess::Ok), "Ok");
-        assert_eq!(format!("{:?}", FastAccess::NotTable), "NotTable");
-        assert_eq!(format!("{:?}", FastAccess::Empty), "Empty");
     }
 }

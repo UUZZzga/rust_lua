@@ -111,8 +111,6 @@ unsafe impl<T: Sized> RcPayload for T {
 
 pub const RC_HEADER_SIZE: usize = std::mem::size_of::<RcHeader>();
 pub const ARC_HEADER_SIZE: usize = std::mem::size_of::<ArcHeader>();
-pub const STRONG_OFFSET: usize = 0;
-pub const WEAK_OFFSET: usize = std::mem::size_of::<usize>();
 pub const SIMPLE_RC_HEADER_SIZE: usize = std::mem::size_of::<SimpleRcHeader>();
 pub const SIMPLE_ARC_HEADER_SIZE: usize = std::mem::size_of::<SimpleArcHeader>();
 
@@ -121,12 +119,6 @@ pub const SIMPLE_ARC_HEADER_SIZE: usize = std::mem::size_of::<SimpleArcHeader>()
 #[repr(C)]
 pub struct RcBox<T: ?Sized> {
     pub header: RcHeader,
-    pub value: T,
-}
-
-#[repr(C)]
-pub struct ArcBox<T: ?Sized> {
-    pub header: ArcHeader,
     pub value: T,
 }
 
@@ -197,7 +189,7 @@ pub fn simple_arc_block_layout(payload_size: usize, payload_align: usize) -> Lay
 }
 
 // ---------- 旧「allocator 路由块」辅助函数已并入智能指针的泛型布局 ----------
-// 见本文件后段 `rc_alloc_off` / `rc_data_off` / `rc_layout`（`MyRc`/`MyArc`）
+// 见本文件后段 `rc_alloc_off` / `rc_data_off` / `rc_layout`（`MyRc`）
 // 与 `simple_alloc_off` / `simple_data_off` / `simple_layout`（`SimpleRc`/`SimpleArc`）：
 // 分配器类型参数 `A` 的字段偏移取代了原先硬编码的 AllocSlot 槽偏移。
 
@@ -495,17 +487,17 @@ fn align_up(x: usize, a: usize) -> usize {
     (x + a - 1) & !(a - 1)
 }
 
-/// `MyRc`/`MyArc` 块内分配器字段的偏移（紧随 header）。
+/// `MyRc` 块内分配器字段的偏移（紧随 header）。
 #[inline(always)]
 fn rc_alloc_off<A>() -> usize {
     align_up(RC_HEADER_SIZE, std::mem::align_of::<A>())
 }
-/// `MyRc`/`MyArc` 块内业务 payload 的偏移。
+/// `MyRc` 块内业务 payload 的偏移。
 #[inline(always)]
 fn rc_data_off<A, T: ?Sized + RcPayload>() -> usize {
     align_up(rc_alloc_off::<A>() + std::mem::size_of::<A>(), T::ALIGN)
 }
-/// `MyRc`/`MyArc` 整块布局。
+/// `MyRc` 整块布局。
 #[inline(always)]
 fn rc_layout<A, T: ?Sized + RcPayload>(payload_size: usize) -> Layout {
     let align = T::ALIGN
@@ -779,250 +771,6 @@ impl<T: ?Sized + RcPayload, A: Allocator> Clone for WeakRc<T, A> {
 impl<T: ?Sized + RcPayload, A: Allocator> Debug for WeakRc<T, A> {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WeakRc").field("ptr", &self.ptr).finish()
-    }
-}
-
-// ---------- MyArc ----------
-
-pub struct MyArc<T: ?Sized + RcPayload, A: Allocator = Global> {
-    ptr: NonNull<u8>,
-    _p: PhantomData<(A, T)>,
-}
-
-unsafe impl<T: ?Sized + RcPayload + Send + Sync, A: Allocator + Send + Sync> Send for MyArc<T, A> {}
-unsafe impl<T: ?Sized + RcPayload + Send + Sync, A: Allocator + Send + Sync> Sync for MyArc<T, A> {}
-
-impl<T: ?Sized + RcPayload, A: Allocator> MyArc<T, A> {
-    #[inline]
-    pub fn as_raw_ptr(&self) -> *mut u8 {
-        unsafe { self.ptr.as_ptr().add(rc_data_off::<A, T>()) }
-    }
-
-    pub fn clone(&self) -> Self {
-        unsafe {
-            (*self.ptr.as_ptr().cast::<ArcHeader>())
-                .strong
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        MyArc {
-            ptr: self.ptr,
-            _p: PhantomData,
-        }
-    }
-
-    #[inline]
-    pub fn as_ptr(&self) -> *const T {
-        unsafe { T::as_ref(self.as_raw_ptr()) as *const T }
-    }
-    #[inline]
-    pub fn as_ref(&self) -> &T {
-        unsafe { T::as_ref(self.as_raw_ptr()) }
-    }
-    pub fn downgrade(&self) -> WeakArc<T, A> {
-        unsafe {
-            (*self.ptr.as_ptr().cast::<ArcHeader>())
-                .weak
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        WeakArc {
-            ptr: self.ptr,
-            _p: PhantomData,
-        }
-    }
-    /// # Safety
-    /// - `payload` 必须是 [`rc_layout`] 分配块中的 payload 起点
-    pub unsafe fn from_raw(payload: *mut u8) -> Self {
-        let base = payload.sub(rc_data_off::<A, T>());
-        MyArc {
-            ptr: NonNull::new_unchecked(base),
-            _p: PhantomData,
-        }
-    }
-    #[inline]
-    pub fn strong_count(&self) -> usize {
-        unsafe {
-            (*self.ptr.as_ptr().cast::<ArcHeader>())
-                .strong
-                .load(Ordering::Relaxed)
-        }
-    }
-    #[inline]
-    pub fn weak_count(&self) -> usize {
-        unsafe {
-            (*self.ptr.as_ptr().cast::<ArcHeader>())
-                .weak
-                .load(Ordering::Relaxed)
-        }
-    }
-    #[inline]
-    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
-        std::ptr::addr_eq(this.ptr.as_ptr(), other.ptr.as_ptr())
-    }
-}
-
-impl<T: RcPayload, A: Allocator> MyArc<T, A> {
-    pub fn new_in(alloc: A, value: T) -> Self {
-        unsafe {
-            let layout = rc_layout::<A, T>(std::mem::size_of::<T>());
-            let base = alloc
-                .allocate(layout)
-                .unwrap_or_else(|_| handle_alloc_error(layout))
-                .cast::<u8>()
-                .as_ptr();
-            std::ptr::write(base as *mut ArcHeader, ArcHeader::default());
-            std::ptr::write(base.add(rc_alloc_off::<A>()) as *mut A, alloc);
-            std::ptr::write(base.add(rc_data_off::<A, T>()) as *mut T, value);
-            MyArc {
-                ptr: NonNull::new_unchecked(base),
-                _p: PhantomData,
-            }
-        }
-    }
-}
-
-impl<T: RcPayload> MyArc<T, Global> {
-    pub fn new(value: T) -> Self {
-        Self::new_in(Global, value)
-    }
-}
-
-impl<T: ?Sized + RcPayload, A: Allocator> Drop for MyArc<T, A> {
-    fn drop(&mut self) {
-        unsafe {
-            let base = self.ptr.as_ptr();
-            let hdr = &*(base.cast::<ArcHeader>());
-            if hdr.strong.fetch_sub(1, Ordering::Release) == 1 {
-                fence(Ordering::Acquire);
-                let payload = base.add(rc_data_off::<A, T>());
-                T::drop_payload(payload);
-                let payload_size = T::payload_size(payload);
-
-                if hdr.weak.fetch_sub(1, Ordering::Release) == 1 {
-                    fence(Ordering::Acquire);
-                    let layout = rc_layout::<A, T>(payload_size);
-                    let alloc = std::ptr::read(base.add(rc_alloc_off::<A>()) as *const A);
-                    alloc.deallocate(NonNull::new_unchecked(base), layout);
-                    drop(alloc);
-                }
-            }
-        }
-    }
-}
-
-impl<T: ?Sized + RcPayload, A: Allocator> Clone for MyArc<T, A> {
-    #[inline]
-    fn clone(&self) -> Self {
-        MyArc::clone(self)
-    }
-}
-impl<T: ?Sized + RcPayload, A: Allocator> Deref for MyArc<T, A> {
-    type Target = T;
-    fn deref(&self) -> &T {
-        self.as_ref()
-    }
-}
-impl<T: ?Sized + RcPayload, A: Allocator> Debug for MyArc<T, A> {
-    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("MyArc").field("ptr", &self.ptr).finish()
-    }
-}
-impl<T: ?Sized + RcPayload, A: Allocator> IsArcRc for MyArc<T, A> {
-    type Box = ArcBox<T>;
-    type Header = ArcHeader;
-}
-
-// ---------- WeakArc ----------
-
-pub struct WeakArc<T: ?Sized + RcPayload, A: Allocator = Global> {
-    ptr: NonNull<u8>,
-    _p: PhantomData<(A, T)>,
-}
-
-unsafe impl<T: ?Sized + RcPayload + Send + Sync, A: Allocator + Send + Sync> Send
-    for WeakArc<T, A>
-{
-}
-unsafe impl<T: ?Sized + RcPayload + Send + Sync, A: Allocator + Send + Sync> Sync
-    for WeakArc<T, A>
-{
-}
-
-impl<T: ?Sized + RcPayload, A: Allocator> WeakArc<T, A> {
-    pub fn clone(&self) -> Self {
-        unsafe {
-            (*self.ptr.as_ptr().cast::<ArcHeader>())
-                .weak
-                .fetch_add(1, Ordering::Relaxed);
-        }
-        WeakArc {
-            ptr: self.ptr,
-            _p: PhantomData,
-        }
-    }
-    pub fn upgrade(&self) -> Option<MyArc<T, A>> {
-        unsafe {
-            let hdr = &*self.ptr.as_ptr().cast::<ArcHeader>();
-            let mut cur = hdr.strong.load(Ordering::Relaxed);
-            loop {
-                if cur == 0 {
-                    return None;
-                }
-                match hdr.strong.compare_exchange_weak(
-                    cur,
-                    cur + 1,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                ) {
-                    Ok(_) => {
-                        return Some(MyArc {
-                            ptr: self.ptr,
-                            _p: PhantomData,
-                        })
-                    }
-                    Err(actual) => cur = actual,
-                }
-            }
-        }
-    }
-    #[inline]
-    pub fn strong_count(&self) -> usize {
-        unsafe {
-            (*self.ptr.as_ptr().cast::<ArcHeader>())
-                .strong
-                .load(Ordering::Relaxed)
-        }
-    }
-    #[inline]
-    pub fn weak_count(&self) -> usize {
-        unsafe {
-            (*self.ptr.as_ptr().cast::<ArcHeader>())
-                .weak
-                .load(Ordering::Relaxed)
-        }
-    }
-}
-
-impl<T: ?Sized + RcPayload, A: Allocator> Drop for WeakArc<T, A> {
-    fn drop(&mut self) {
-        unsafe {
-            let base = self.ptr.as_ptr();
-            let hdr = &*base.cast::<ArcHeader>();
-            if hdr.weak.fetch_sub(1, Ordering::Release) == 1 {
-                fence(Ordering::Acquire);
-                let payload_size = T::payload_size(base.add(rc_data_off::<A, T>()));
-                let layout = rc_layout::<A, T>(payload_size);
-                let alloc = std::ptr::read(base.add(rc_alloc_off::<A>()) as *const A);
-                alloc.deallocate(NonNull::new_unchecked(base), layout);
-                drop(alloc);
-            }
-        }
-    }
-}
-
-impl<T: ?Sized + RcPayload, A: Allocator> Clone for WeakArc<T, A> {
-    #[inline]
-    fn clone(&self) -> Self {
-        WeakArc::clone(self)
     }
 }
 
@@ -1452,7 +1200,6 @@ mod layout_tests {
         assert_eq!(std::mem::size_of::<MyRc<u64, SlotAlloc>>(), 8);
         assert_eq!(std::mem::size_of::<WeakRc<u64, SlotAlloc>>(), 8);
         assert_eq!(std::mem::size_of::<SimpleRc<u64, SlotAlloc>>(), 8);
-        assert_eq!(std::mem::size_of::<MyArc<u64, SlotAlloc>>(), 8);
         assert_eq!(std::mem::size_of::<SimpleArc<u64, SlotAlloc>>(), 8);
 
         // 句柄必须保持 thin 的最终目的：TValue 总宽 16 字节
@@ -1848,34 +1595,6 @@ mod arc_thread_tests {
         const N: usize = 8;
         let (probe, counter) = DropProbe::new();
         let a = SimpleArc::new(probe);
-
-        let barrier = Arc::new(Barrier::new(N));
-        let handles: Vec<_> = (0..N)
-            .map(|_| {
-                let a = a.clone();
-                let b = barrier.clone();
-                thread::spawn(move || {
-                    b.wait();
-                    let clones: Vec<_> = (0..100).map(|_| a.clone()).collect();
-                    drop(clones);
-                    drop(a);
-                })
-            })
-            .collect();
-
-        for h in handles {
-            h.join().unwrap();
-        }
-        assert_eq!(counter.load(Ordering::SeqCst), 0);
-        drop(a);
-        assert_eq!(counter.load(Ordering::SeqCst), 1);
-    }
-
-    #[test]
-    fn myarc_concurrent_clone_drop() {
-        const N: usize = 8;
-        let (probe, counter) = DropProbe::new();
-        let a = MyArc::new(probe);
 
         let barrier = Arc::new(Barrier::new(N));
         let handles: Vec<_> = (0..N)

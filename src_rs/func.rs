@@ -30,53 +30,6 @@ pub fn new_proto<'a>() -> Proto<'a> {
     }
 }
 
-pub fn proto_size(p: &Proto) -> usize {
-    let mut size = std::mem::size_of::<Proto>();
-    size += p.code.len() * std::mem::size_of::<Instruction>();
-    for c in &p.constants[..] {
-        size += tvalue_size(c);
-    }
-    for sub in p.protos.iter() {
-        size += proto_size(sub);
-    }
-    size += p.upvalues.len() * std::mem::size_of::<UpvalDesc>();
-    size += p.line_info.len() * std::mem::size_of::<i8>();
-    size += p.abs_line_info.len() * std::mem::size_of::<AbsLineInfo>();
-    size += p.loc_vars.len() * std::mem::size_of::<LocVar>();
-    size
-}
-
-fn tvalue_size(v: &TValue) -> usize {
-    match v {
-        TValue::LongStr(_) | TValue::ShortStr(_) => std::mem::size_of_val(v),
-        _ => std::mem::size_of_val(v),
-    }
-}
-
-pub fn new_c_closure(state: &mut LuaState, _nupvals: usize) -> usize {
-    let idx = state.closure_upvals.borrow().len();
-    let upval = Rc::new(RefCell::new(UpVal::Closed {
-        value: TValue::Nil(NilKind::Strict),
-    }));
-    state.closure_upvals.borrow_mut().push(upval);
-    idx
-}
-
-pub fn new_l_closure(state: &mut LuaState, nupvals: usize) -> usize {
-    let idx = state.closure_upvals.borrow().len();
-    for _ in 0..nupvals {
-        state
-            .closure_upvals
-            .borrow_mut()
-            .push(Rc::new(RefCell::new(UpVal::Closed {
-                value: TValue::Nil(NilKind::Strict),
-            })));
-    }
-    idx
-}
-
-pub fn init_upvals(_state: &mut LuaState, _closure_start: usize, _proto: &Proto) {}
-
 /// 取槽位中的 upvalue 引用；槽位空闲（未分配，或已因 upvalue 关闭而回收）时返回 None。
 #[inline]
 pub fn upval_slot<'s, 'a>(state: &'s LuaState<'a>, uv_idx: usize) -> Option<&'s UpValRef<'a>> {
@@ -509,7 +462,7 @@ pub fn new_tbc_upval<'a>(
             *tbc = true;
         }
     }
-    // 更新 tbc_list 指向最新的 TBC upvalue（用于 pop_tbc_list 等检查）
+    // 更新 tbc_list 指向最新的 TBC upvalue
     state.tbc_list = Some(uv_idx);
     Ok(Some(uv_idx))
 }
@@ -545,42 +498,6 @@ fn get_var_name_at(state: &LuaState, reg: usize) -> Option<String> {
     None
 }
 
-pub fn pop_tbc_list(state: &mut LuaState, level: usize) {
-    // 简化: tbc_list 不再是链表，只清除 head 的 tbc 标志（如果 stack_index >= level）
-    let head = match state.tbc_list {
-        Some(h) => h,
-        None => return,
-    };
-    let should_pop = match upval_slot(state, head) {
-        Some(head_ref) => {
-            if let UpVal::Open { stack_index, .. } = &*head_ref.borrow() {
-                *stack_index >= level
-            } else {
-                false
-            }
-        }
-        None => false,
-    };
-    if !should_pop {
-        return;
-    }
-    // 清除 tbc 标志
-    if let Some(head_ref) = upval_slot(state, head) {
-        if let UpVal::Open { ref mut tbc, .. } = &mut *head_ref.borrow_mut() {
-            *tbc = false;
-        }
-    }
-    state.tbc_list = None;
-}
-
-pub fn get_local_name<'a, 'b>(
-    _proto: &'b Proto<'a>,
-    _local_number: usize,
-    _pc: usize,
-) -> Option<&'b str> {
-    None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -605,39 +522,6 @@ mod tests {
         assert!(p.loc_vars.is_empty());
         assert_eq!(p.line_defined, 0);
         assert_eq!(p.last_line_defined, 0);
-    }
-
-    #[test]
-    fn test_proto_size_of_empty_proto() {
-        let p = new_proto();
-        let size = proto_size(&p);
-        let base = std::mem::size_of::<Proto>();
-        assert!(size >= base);
-    }
-
-    #[test]
-    fn test_proto_size_includes_code_and_constants() {
-        let mut p = new_proto();
-        p.code = Rc::new(vec![1, 2, 3]);
-        p.constants = Rc::new(vec![TValue::Integer(42)]);
-        let empty_size = proto_size(&new_proto());
-        let filled_size = proto_size(&p);
-        assert!(filled_size > empty_size);
-    }
-
-    #[test]
-    fn test_new_c_closure_creates_closure() {
-        let mut state = make_vm_state();
-        let _idx = new_c_closure(&mut state, 2);
-        assert!(state.closure_upvals.borrow().len() > 0);
-    }
-
-    #[test]
-    fn test_new_l_closure_creates_closure_with_upvals() {
-        let mut state = make_vm_state();
-        let idx = new_l_closure(&mut state, 3);
-        let end = state.closure_upvals.borrow().len();
-        assert!(idx < end);
     }
 
     #[test]
@@ -755,21 +639,5 @@ mod tests {
         // false/nil 不需要关闭，应返回 Ok(None)
         let uv = new_tbc_upval(&mut state, 0).expect("false should succeed");
         assert!(uv.is_none());
-    }
-
-    #[test]
-    fn test_pop_tbc_list_removes_entry() {
-        let alloc = crate::mem::TestAlloc::new();
-        let mut state = make_vm_state();
-        // 创建带 __close 元方法的 Table
-        let close_key = state.intern_str("__close");
-        let mt = Table::new_in(alloc.slot());
-        mt.set(close_key, TValue::Integer(0));
-        let obj = Table::new_in(alloc.slot());
-        obj.set_metatable(Some(mt));
-        state.stack = vec![TValue::Table(obj)];
-        let _uv = new_tbc_upval(&mut state, 0).expect("closable value should succeed");
-        pop_tbc_list(&mut state, 0);
-        assert_eq!(state.tbc_list, None);
     }
 }

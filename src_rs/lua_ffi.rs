@@ -3,8 +3,10 @@
 use std::ffi::{c_char, c_int, c_void, CStr};
 
 pub type lua_State = c_void;
-pub type lua_Number = f64;
-pub type lua_Integer = i64;
+// 与 C 一致: lua_Number/lua_Integer 跟随 luaconf.h 的 LUA_NUMBER/LUA_INTEGER
+// (此处绑定 config.rs 的别名, 见 capi.rs 同名字段)。
+pub type lua_Number = crate::config::LuaNumber;
+pub type lua_Integer = crate::config::LuaInteger;
 pub type lua_Writer =
     unsafe extern "C" fn(L: *mut lua_State, p: *const c_void, sz: usize, ud: *mut c_void) -> c_int;
 
@@ -42,7 +44,7 @@ pub unsafe fn from_cstr<'a>(ptr: *const c_char) -> Option<&'a str> {
 pub unsafe fn luaL_checkversion(L: *mut lua_State) {
     luaL_checkversion_(
         L,
-        crate::config::VERSION_NUM.into(),
+        crate::config::VERSION_NUM as lua_Number,
         std::mem::size_of::<lua_Integer>() * 16 + std::mem::size_of::<lua_Number>(),
     );
 }

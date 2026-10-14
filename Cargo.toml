@@ -42,6 +42,22 @@ path = "tests_rs/math_lib_tests.rs"
 
 [features]
 default = ["fast_unsafe"]
+# ---- 数值类型配置 (对应 luaconf.h 的 LUA_INT_TYPE / LUA_FLOAT_TYPE) ----
+# 默认 (不启用下列 feature) = C 的默认配置: 64 位整数 (long long) + double。
+# 启用后 LuaInteger/LuaNumber/LuaUnsigned 及其派生常量 (MAX_INTEGER / INTEGER_FMT /
+# NUMBER_FMT ...) 全部切换，C API 的 lua_Integer/lua_Number (capi.rs) 随之改变。
+# 注意 (与 C 的 luaconf.h 一致): 任何与 Lua 连接的外部 C 代码必须使用同一配置。
+# 用法:
+#   cargo build --release --features embedded     # ≈ C 的 LUA_32BITS (i32 + f32)
+#   cargo build --release --features num-i32      # 仅 32 位整数 (对应 LUA_INT_INT)
+#   cargo build --release --features num-f32      # 仅 32 位浮点 (对应 LUA_FLOAT_FLOAT)
+# 不支持的组合: long double (Rust stable 无 f80/f128)。
+# LuaInteger = i32 (对应 LUA_INT_TYPE = LUA_INT_INT)
+num-i32 = []
+# LuaNumber = f32 (对应 LUA_FLOAT_TYPE = LUA_FLOAT_FLOAT)
+num-f32 = []
+# 嵌入式32位配置: 32 位整数 + 32 位浮点 (对应 C 的 LUA_32BITS)
+embedded = ["num-i32", "num-f32"]
 # VM 热路径 unsafe 优化开关 (默认启用)。
 # 启用时: 指令/常量流用裸指针缓存 (免每指令 Rc→Vec 双 deref + 边界检查),
 #   栈读写用 as_mut_ptr/get_unchecked 跳过边界检查, 并跳过 trivially-droppable

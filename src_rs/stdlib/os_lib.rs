@@ -9,6 +9,7 @@
 //! ## 迁移说明
 //! - 已从 LightUserData(tag) 迁移到 BuiltinFn 函数指针方案
 
+use crate::config::{LuaInteger, LuaNumber};
 use crate::execute::VmError;
 use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
@@ -249,7 +250,8 @@ fn call_clock<'a>(
 ) -> Result<(), VmError<'a>> {
     let ticks = unsafe { clock() };
     let cps = unsafe { lua_rs_clocks_per_sec() };
-    let seconds = ticks as f64 / cps;
+    // 对应 C 的 (lua_Number)clock() / (lua_Number)CLOCKS_PER_SEC
+    let seconds = ticks as LuaNumber / cps as LuaNumber;
     push_single_result(state, a, nresults, TValue::Float(seconds));
     Ok(())
 }
@@ -366,7 +368,7 @@ fn call_remove<'a>(
         let __results = vec![
             TValue::Nil(NilKind::Strict),
             (state.intern_str(&msg)),
-            TValue::Integer(errno as i64),
+            TValue::Integer(errno as LuaInteger),
         ];
         state.adjust_results(a, nresults, __results);
     }
@@ -520,7 +522,7 @@ fn call_rename<'a>(
         let __results = vec![
             TValue::Nil(NilKind::Strict),
             (state.intern_str(&msg)),
-            TValue::Integer(errno as i64),
+            TValue::Integer(errno as LuaInteger),
         ];
         state.adjust_results(a, nresults, __results);
     }
@@ -668,9 +670,9 @@ fn get_field<'a>(
                 Some(res) => {
                     // 越界检查 — 对应 C: if (!(res >= 0 ? res - delta <= INT_MAX : INT_MIN + delta <= res))
                     let in_bounds = if res >= 0 {
-                        res - delta as i64 <= i32::MAX as i64
+                        res - delta as LuaInteger <= i32::MAX as LuaInteger
                     } else {
-                        i32::MIN as i64 + delta as i64 <= res
+                        i32::MIN as LuaInteger + delta as LuaInteger <= res
                     };
                     if !in_bounds {
                         return Err(VmError::RuntimeError(format!(
@@ -678,7 +680,8 @@ fn get_field<'a>(
                             key
                         )));
                     }
-                    Ok((res - delta as i64) as i32)
+                    // 转换到 tm 的 c_int 字段（对应 C 的隐式 int 窄化）
+                    Ok((res - delta as LuaInteger) as i32)
                 }
                 None => {
                     // 非数字或不可转换的 Float
@@ -701,7 +704,10 @@ fn set_field<'a>(
     delta: i32,
 ) {
     let k = state.intern_str(key);
-    table.set(k, TValue::Integer((value as i64) + delta as i64));
+    table.set(
+        k,
+        TValue::Integer(value as LuaInteger + delta as LuaInteger),
+    );
 }
 
 /// 设置表布尔字段 — 对应 C 的 setboolfield (value < 0 时不设置)
@@ -745,6 +751,7 @@ fn call_os_date<'a>(
     };
 
     // 获取时间 (默认当前时间) — 对应 C 的 l_checktime (luaL_checkinteger, 接受可转换的 Float)
+    // Lua 整数 → time_t（对应 C 的 l_checktime: (time_t)t == t）
     let t: libc::time_t = if nargs >= 2 {
         let v = get_arg(state, a, 1);
         match &v {
@@ -892,7 +899,8 @@ fn call_os_time<'a>(
                 "time result cannot be represented in this installation".to_string(),
             ));
         }
-        TValue::Integer(t as i64)
+        // time_t → Lua 整数（对应 C 的 lua_pushinteger(L, (lua_Integer)t)）
+        TValue::Integer(t as LuaInteger)
     } else {
         // 表参数: 从表读取字段
         let v = get_arg(state, a, 0);
@@ -940,7 +948,8 @@ fn call_os_time<'a>(
         set_field(&table, state, "yday", ts.tm_yday, 1);
         set_field(&table, state, "wday", ts.tm_wday, 1);
         set_boolfield(&table, state, "isdst", ts.tm_isdst);
-        TValue::Integer(t as i64)
+        // time_t → Lua 整数（对应 C 的 lua_pushinteger(L, (lua_Integer)t)）
+        TValue::Integer(t as LuaInteger)
     };
     state.adjust_results(a, nresults, vec![result]);
     Ok(())
@@ -960,6 +969,7 @@ fn call_os_difftime<'a>(
             "bad argument to 'difftime' (two numbers expected)".to_string(),
         ));
     }
+    // Lua 整数 → time_t（对应 C 的 l_checktime: (time_t)t == t）
     let v1 = get_arg(state, a, 0);
     let t1 = match crate::vm::to_integer_ns(&v1, crate::vm::F2IMode::Eq) {
         Some(n) => n as libc::time_t,
@@ -981,7 +991,8 @@ fn call_os_difftime<'a>(
         }
     };
     let diff = unsafe { compat::difftime(t1, t2) };
-    state.adjust_results(a, nresults, vec![TValue::Float(diff)]);
+    // 对应 C 的 lua_pushnumber(L, (lua_Number)difftime(...))
+    state.adjust_results(a, nresults, vec![TValue::Float(diff as LuaNumber)]);
     Ok(())
 }
 
@@ -1036,16 +1047,20 @@ mod tests {
     #[cfg_attr(miri, ignore)]
     #[test]
     fn test_time_date() {
-        let nums = [0, 1, 1000, 0x7fffffff, 0x80000000];
+        // 0x80000000 (2^31) 需要 64 位 LuaInteger；i32 配置下不可表示
+        #[cfg(not(feature = "num-i32"))]
+        let nums: [LuaInteger; 5] = [0, 1, 1000, 0x7fff_ffff, 0x8000_0000];
+        #[cfg(feature = "num-i32")]
+        let nums: [LuaInteger; 4] = [0, 1, 1000, 0x7fff_ffff];
         let mut state = LuaState::default();
         for n in nums {
             assert_eq!(1, state.stack.len());
             state.push_string("*t");
-            state.push_integer(n);
+            state.push_value(TValue::Integer(n));
             let _ = call_os_date(&mut state, 0, 2, 1).unwrap();
             assert_eq!(1, state.stack.len());
             let val = state.stack.get(0).unwrap();
-            assert!(val.is_table());
+            assert!(matches!(val, TValue::Table(_)));
             state.push_value(val.clone());
             let _ = call_os_time(&mut state, 0, 1, 1).unwrap();
             let val = state.stack.get(0).unwrap();

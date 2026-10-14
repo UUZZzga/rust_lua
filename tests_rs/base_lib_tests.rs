@@ -932,19 +932,6 @@ fn test_unit_base_tonumber() {
 }
 
 #[test]
-fn test_unit_base_tostring() {
-    assert_eq!(
-        base_lib::base_tostring(&TValue::Nil(NilKind::Strict)),
-        "nil"
-    );
-    assert_eq!(base_lib::base_tostring(&TValue::Boolean(true)), "true");
-    assert_eq!(base_lib::base_tostring(&TValue::Integer(42)), "42");
-    assert_eq!(base_lib::base_tostring(&make_str("hello")), "hello");
-    assert_eq!(base_lib::base_tostring(&TValue::Float(3.0)), "3.0");
-    assert_eq!(base_lib::base_tostring(&TValue::Float(3.14)), "3.14");
-}
-
-#[test]
 fn test_unit_base_rawequal() {
     assert!(base_lib::base_rawequal(
         &TValue::Nil(NilKind::Strict),
@@ -979,20 +966,6 @@ fn test_unit_base_rawlen() {
     assert_eq!(base_lib::base_rawlen(&TValue::Table(t)).unwrap(), 2);
 
     assert!(base_lib::base_rawlen(&TValue::Integer(42)).is_err());
-}
-
-#[test]
-fn test_unit_base_select() {
-    let args = vec![TValue::Integer(1), TValue::Integer(2), TValue::Integer(3)];
-
-    let result = base_lib::base_select(2, &args).unwrap();
-    assert_eq!(result.len(), 2);
-
-    let result = base_lib::base_select(-1, &args).unwrap();
-    assert_eq!(result.len(), 1);
-    assert_eq!(result[0], TValue::Integer(3));
-
-    assert!(base_lib::base_select(0, &args).is_err());
 }
 
 #[test]

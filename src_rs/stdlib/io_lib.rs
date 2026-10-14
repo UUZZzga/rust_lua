@@ -15,6 +15,7 @@
 //!   (file_ptr_id, to_close, finished, formats...)
 
 use crate::alloc::MyRc;
+use crate::config::{LuaInteger, LuaNumber, LuaUnsigned};
 use crate::execute::VmError;
 use crate::objects::{BuiltinFn, NilKind, RustClosure, TValue, WeakValue};
 use crate::state::LuaState;
@@ -144,22 +145,6 @@ fn c_stderr() -> *mut libc::FILE {
     {
         unsafe { __acrt_iob_func(2) }
     }
-}
-
-// ============================================================================
-// 占位符标签 (LightUserData 值，非函数)
-// ============================================================================
-
-/// io.stdin 的标签 — 用于标识标准输入流
-pub const IO_STDIN: usize = 700;
-/// io.stdout 的标签 — 用于标识标准输出流
-pub const IO_STDOUT: usize = 701;
-/// io.stderr 的标签 — 用于标识标准错误流
-pub const IO_STDERR: usize = 702;
-
-/// I/O 占位符标签范围: [700, 710)
-pub fn is_io_tag(tag: usize) -> bool {
-    (700..710).contains(&tag)
 }
 
 // ============================================================================
@@ -335,7 +320,7 @@ fn file_result<'a>(
             msg
         };
         results.push(state.intern_str(&full_msg));
-        results.push(TValue::Integer(en as i64));
+        results.push(TValue::Integer(en as LuaInteger));
         3
     }
 }
@@ -368,7 +353,7 @@ pub fn exec_result<'a>(
             .into_owned();
         results.push(TValue::Nil(NilKind::Strict));
         results.push(state.intern_str(&msg));
-        results.push(TValue::Integer(en as i64));
+        results.push(TValue::Integer(en as LuaInteger));
         return 3;
     }
     // 解析 wait status — 对应 C 的 l_inspectstat
@@ -386,7 +371,7 @@ pub fn exec_result<'a>(
         results.push(TValue::Nil(NilKind::Strict));
     }
     results.push(state.intern_str(what));
-    results.push(TValue::Integer(code as i64));
+    results.push(TValue::Integer(code as LuaInteger));
     3
 }
 
@@ -650,8 +635,8 @@ fn g_write<'a>(
             return Ok(vec![
                 TValue::Nil(NilKind::Strict),
                 (state.intern_str(&msg)),
-                TValue::Integer(en as i64),
-                TValue::Integer(total_bytes as i64),
+                TValue::Integer(en as LuaInteger),
+                TValue::Integer(total_bytes as LuaInteger),
             ]);
         }
     }
@@ -1130,7 +1115,7 @@ fn read_number<'a>(f: *mut libc::FILE) -> Option<TValue<'a>> {
     }
     let s = String::from_utf8_lossy(&buf).into_owned();
     // 先尝试解析为十进制整数
-    if let Ok(n) = s.parse::<i64>() {
+    if let Ok(n) = s.parse::<LuaInteger>() {
         return Some(TValue::Integer(n));
     }
     // hex 解析必须在 f64_from_str 之前: strtod 会把 hex 整数解析为 Float,
@@ -1162,13 +1147,14 @@ fn read_number<'a>(f: *mut libc::FILE) -> Option<TValue<'a>> {
                 } else {
                     (format!("{}{}", int_part, frac_part), 0)
                 };
-                if let Ok(int_val) = u64::from_str_radix(&mantissa_str, 16) {
+                if let Ok(int_val) = LuaUnsigned::from_str_radix(&mantissa_str, 16) {
                     let frac_len = if let Some(p_pos) = hex_part.find('p') {
                         hex_part[dot_pos + 1..p_pos].len()
                     } else {
                         hex_part[dot_pos + 1..].len()
                     };
-                    let val = int_val as f64 / (16f64).powi(frac_len as i32) * (2f64).powi(exp);
+                    let val = int_val as LuaNumber / (16 as LuaNumber).powi(frac_len as i32)
+                        * (2 as LuaNumber).powi(exp);
                     return Some(TValue::Float(if neg { -val } else { val }));
                 }
             } else if let Some(p_pos) = hex_part.find('p') {
@@ -1176,20 +1162,20 @@ fn read_number<'a>(f: *mut libc::FILE) -> Option<TValue<'a>> {
                 let mantissa = &hex_part[..p_pos];
                 let exp_str = &hex_part[p_pos + 1..];
                 let e = exp_str.parse::<i32>().unwrap_or(0);
-                if let Ok(int_val) = u64::from_str_radix(mantissa, 16) {
-                    let val = (int_val as f64) * (2f64).powi(e);
+                if let Ok(int_val) = LuaUnsigned::from_str_radix(mantissa, 16) {
+                    let val = (int_val as LuaNumber) * (2 as LuaNumber).powi(e);
                     return Some(TValue::Float(if neg { -val } else { val }));
                 }
             } else {
-                // 纯十六进制整数: 直接 u64 as i64 (对应 C 的 l_str2int + l_castU2S)
-                if let Ok(int_val) = u64::from_str_radix(hex_part, 16) {
+                // 纯十六进制整数: 对应 C 的 l_str2int + l_castU2S
+                if let Ok(int_val) = LuaUnsigned::from_str_radix(hex_part, 16) {
                     // C: *result = l_castU2S(neg ? 0u - a : a)
                     let i = if neg {
-                        (0u64).wrapping_sub(int_val) as i64
+                        (0 as LuaUnsigned).wrapping_sub(int_val)
                     } else {
-                        int_val as i64
+                        int_val
                     };
-                    return Some(TValue::Integer(i));
+                    return Some(TValue::Integer(i as LuaInteger));
                 }
             }
         }
@@ -1461,7 +1447,7 @@ fn g_read<'a>(
         return Ok(vec![
             TValue::Nil(NilKind::Strict),
             (state.intern_str(&msg)),
-            TValue::Integer(en as i64),
+            TValue::Integer(en as LuaInteger),
         ]);
     }
 
@@ -1602,7 +1588,7 @@ fn call_file_seek<'a>(
                         "bad argument #3 to 'seek' (not an integer in proper range)".to_string(),
                     ));
                 }
-                *fl as i64
+                *fl as LuaInteger
             }
             TValue::Nil(_) => 0,
             _ => {
@@ -1632,13 +1618,14 @@ fn call_file_seek<'a>(
         let __results = vec![
             TValue::Nil(NilKind::Strict),
             (state.intern_str(&msg)),
-            TValue::Integer(en as i64),
+            TValue::Integer(en as LuaInteger),
         ];
         state.adjust_results(a, nresults, __results);
         return Ok(());
     }
     let pos = unsafe { libc::ftell(f) };
-    state.adjust_results(a, nresults, vec![TValue::Integer(pos as i64)]);
+    // off_t → Lua 整数（对应 C 的 lua_pushinteger(L, l_ftell(f))）
+    state.adjust_results(a, nresults, vec![TValue::Integer(pos as LuaInteger)]);
     Ok(())
 }
 
@@ -1788,7 +1775,7 @@ fn new_lines_iterator<'a>(
     formats: Vec<TValue<'a>>,
 ) -> TValue<'a> {
     let mut upvalues = Vec::with_capacity(LINES_UP_FORMATS_BASE + formats.len());
-    upvalues.push(TValue::Integer(file_ptr_id as i64));
+    upvalues.push(TValue::Integer(file_ptr_id as LuaInteger));
     upvalues.push(TValue::Boolean(to_close));
     upvalues.push(TValue::Boolean(false)); // finished = false
     for fmt in formats {

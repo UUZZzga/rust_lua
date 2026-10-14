@@ -9,13 +9,14 @@
 //! ## 迁移说明
 //! - 已从 LightUserData(tag) 迁移到 BuiltinFn 函数指针方案
 
+use crate::config::{LuaInteger, LuaUnsigned, MAX_INTEGER};
+use crate::execute::VmExecutor;
 use crate::execute::{arg_error, VmError};
 use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
 use crate::strings::lua_string_as_str;
 use crate::table::Table;
 use crate::tm::{call_order_tm, obj_type_name, TagMethod};
-use crate::vm::VmExecutor;
 
 // ============================================================================
 // 函数标签 (已迁移到 BuiltinFn，不再使用 LightUserData tag)
@@ -36,7 +37,7 @@ fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
 }
 
 /// 从栈中读取可选整数参数
-fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: i64) -> i64 {
+fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: LuaInteger) -> LuaInteger {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.stack.len() {
         return default;
@@ -44,7 +45,8 @@ fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: i64) -> i64 
     match &state.stack[stack_idx] {
         TValue::Nil(_) => default,
         TValue::Integer(n) => *n,
-        TValue::Float(f) => *f as i64,
+        // 保持既有语义（对应 C 的 luaL_optinteger 取值）
+        TValue::Float(f) => *f as LuaInteger,
         _ => default,
     }
 }
@@ -53,7 +55,7 @@ fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: i64) -> i64 
 ///
 /// 调用 obj_len (会触发 __len 元方法)，然后转为整数。
 /// 如果结果不是整数，报 "object length is not an integer"。
-fn get_obj_len<'a>(state: &mut LuaState<'a>, obj: &TValue<'a>) -> Result<i64, VmError<'a>> {
+fn get_obj_len<'a>(state: &mut LuaState<'a>, obj: &TValue<'a>) -> Result<LuaInteger, VmError<'a>> {
     let tmp_ra = state.stack.len();
     crate::tm::obj_len(state, tmp_ra, obj, "")?;
     let result = state
@@ -78,7 +80,7 @@ fn get_obj_len<'a>(state: &mut LuaState<'a>, obj: &TValue<'a>) -> Result<i64, Vm
 fn geti_meta<'a>(
     state: &mut LuaState<'a>,
     table_val: &TValue<'a>,
-    i: i64,
+    i: LuaInteger,
 ) -> Result<TValue<'a>, VmError<'a>> {
     VmExecutor::table_get(
         state,
@@ -93,7 +95,7 @@ fn geti_meta<'a>(
 fn seti_meta<'a>(
     state: &mut LuaState<'a>,
     table_val: &TValue<'a>,
-    i: i64,
+    i: LuaInteger,
     val: TValue<'a>,
 ) -> Result<(), VmError<'a>> {
     VmExecutor::table_set(
@@ -109,7 +111,7 @@ fn seti_meta<'a>(
 fn seti_meta_<'a>(
     state: &mut LuaState<'a>,
     table_val: TValue<'a>,
-    i: i64,
+    i: LuaInteger,
     val: TValue<'a>,
 ) -> Result<(), VmError<'a>> {
     VmExecutor::table_set(
@@ -137,14 +139,14 @@ fn table_concat_impl<'a>(
     state: &mut LuaState<'a>,
     table_val: &TValue<'a>,
     sep: &str,
-    i: i64,
-    j: i64,
+    i: LuaInteger,
+    j: LuaInteger,
 ) -> Result<String, VmError<'a>> {
     if i > j {
         return Ok(String::new());
     }
 
-    let push_val = |result: &mut String, val: &TValue, idx: i64| -> Result<(), VmError> {
+    let push_val = |result: &mut String, val: &TValue, idx: LuaInteger| -> Result<(), VmError> {
         match val {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => result.push_str(lua_string_as_str(s)),
             TValue::Integer(n) => result.push_str(&crate::float_utils::i64_to_string(*n)),
@@ -261,8 +263,8 @@ fn call_unpack<'a>(
     }
     // 对应 C Lua 的 lua_checkstack 检查: 元素数量超过 INT_MAX 或栈空间不足时报错
     // C: n = l_castS2U(e) - l_castS2U(i); ++n; (用 unsigned 算术避免溢出)
-    let n_minus_1 = (e as u64).wrapping_sub(i as u64);
-    if n_minus_1 >= i32::MAX as u64 {
+    let n_minus_1 = (e as LuaUnsigned).wrapping_sub(i as LuaUnsigned);
+    if n_minus_1 >= i32::MAX as LuaUnsigned {
         return Err(VmError::RuntimeError(
             "too many results to unpack".to_string(),
         ));
@@ -356,9 +358,9 @@ fn call_pack<'a>(
     let t = Table::new_in(state.alloc_slot());
     for i in 0..nargs {
         let val = get_arg(state, a, i);
-        t.set_int((i + 1) as i64, val);
+        t.set_int((i + 1) as LuaInteger, val);
     }
-    t.set(state.intern_str("n"), TValue::Integer(nargs as i64));
+    t.set(state.intern_str("n"), TValue::Integer(nargs as LuaInteger));
     unsafe { state.gc_mut().register_table(&t) };
     push_results(state, a, nresults, vec![TValue::Table(t)]);
     Ok(())
@@ -393,7 +395,7 @@ fn call_insert<'a>(
         // insert at position
         let pos = get_opt_int_arg(state, a, 1, 0);
         // C: luaL_argcheck(L, (lua_Unsigned)pos - 1u < (lua_Unsigned)e, ...) → pos ∈ [1, e]
-        if (pos as u64).wrapping_sub(1) >= (e as u64) {
+        if (pos as LuaUnsigned).wrapping_sub(1) >= (e as LuaUnsigned) {
             return Err(VmError::RuntimeError(
                 "bad argument #2 to 'insert' (position out of bounds)".to_string(),
             ));
@@ -447,8 +449,8 @@ fn call_remove<'a>(
         len
     };
     if pos != len {
-        let pos_u = pos as u64;
-        if pos_u.wrapping_sub(1) > (len as u64) {
+        let pos_u = pos as LuaUnsigned;
+        if pos_u.wrapping_sub(1) > (len as LuaUnsigned) {
             return Err(VmError::RuntimeError(
                 "bad argument #2 to 'remove' (position out of bounds)".to_string(),
             ));
@@ -504,10 +506,10 @@ fn sort_comp<'a>(
 fn partition<'a>(
     state: &mut LuaState<'a>,
     elems: &mut [TValue<'a>],
-    lo: i64,
-    up: i64,
+    lo: LuaInteger,
+    up: LuaInteger,
     comp: &TValue<'a>,
-) -> Result<i64, VmError<'a>> {
+) -> Result<LuaInteger, VmError<'a>> {
     let pivot = elems[(up - 1) as usize].clone();
     let mut i = lo;
     let mut j = up - 1;
@@ -549,8 +551,8 @@ fn partition<'a>(
 fn auxsort<'a>(
     state: &mut LuaState<'a>,
     elems: &mut [TValue<'a>],
-    lo: i64,
-    up: i64,
+    lo: LuaInteger,
+    up: LuaInteger,
     rnd: u32,
     comp: &TValue<'a>,
 ) -> Result<(), VmError<'a>> {
@@ -558,8 +560,8 @@ fn auxsort<'a>(
     let mut up = up;
     let mut rnd = rnd;
     while lo < up {
-        let p: i64;
-        let n: i64;
+        let p: LuaInteger;
+        let n: LuaInteger;
         if sort_comp(state, comp, &elems[up as usize], &elems[lo as usize])? {
             elems.swap(lo as usize, up as usize);
         }
@@ -570,7 +572,7 @@ fn auxsort<'a>(
             p = (lo + up) / 2;
         } else {
             let r4 = (up - lo) / 4;
-            let rnd_i = rnd as i64;
+            let rnd_i = rnd as LuaInteger;
             p = ((rnd_i ^ lo ^ up) % (r4 * 2)) + lo + r4;
         }
         if sort_comp(state, comp, &elems[p as usize], &elems[lo as usize])? {
@@ -635,7 +637,7 @@ fn call_sort<'a>(
         push_results(state, a, nresults, vec![]);
         return Ok(());
     }
-    if n >= i32::MAX as i64 {
+    if n >= i32::MAX as LuaInteger {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'sort' (array too big)".to_string(),
         ));
@@ -652,7 +654,7 @@ fn call_sort<'a>(
 
     // 写回 table — 通过 __newindex 元方法 (对应 C lua_seti)
     for (i, val) in elems.iter().enumerate() {
-        seti_meta(state, &table_val, i as i64 + 1, val.clone())?;
+        seti_meta(state, &table_val, i as LuaInteger + 1, val.clone())?;
     }
 
     push_results(state, a, nresults, vec![]);
@@ -725,13 +727,13 @@ fn call_create<'a>(
     };
 
     // argcheck: sizeseq <= INT_MAX (对应 C 的 luaL_argcheck)
-    if sizeseq < 0 || sizeseq > i32::MAX as i64 {
+    if sizeseq < 0 || sizeseq > i32::MAX as LuaInteger {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'create' (value out of range)".to_string(),
         ));
     }
     // argcheck: sizerest <= INT_MAX
-    if sizerest < 0 || sizerest > i32::MAX as i64 {
+    if sizerest < 0 || sizerest > i32::MAX as LuaInteger {
         return Err(VmError::RuntimeError(
             "bad argument #2 to 'create' (value out of range)".to_string(),
         ));
@@ -739,7 +741,7 @@ fn call_create<'a>(
     // 检查哈希大小是否溢出 (对应 C 的 setnodevector 检查)
     // C: lsize = ceil(log2(size)); if lsize > MAXHBITS(30) || (1<<lsize) > MAXHSIZE → "table overflow"
     // MAXHBITS = 30, 即 sizerest > 2^30 = 1073741824 时报错
-    const MAXHSIZE: i64 = 1 << 30;
+    const MAXHSIZE: LuaInteger = 1 << 30;
     if sizerest > MAXHSIZE {
         return Err(VmError::RuntimeError("table overflow".to_string()));
     }
@@ -807,7 +809,7 @@ fn call_move<'a>(
 
         // "destination wrap around": t + n - 1 不能超过 MAXINT
         // C: luaL_argcheck(L, t <= LUA_MAXINTEGER - n + 1, 4, "destination wrap around")
-        if t > i64::MAX - n + 1 {
+        if t > MAX_INTEGER - n + 1 {
             return Err(VmError::RuntimeError(
                 "bad argument #4 to 'move' (destination wrap around)".to_string(),
             ));
@@ -827,7 +829,7 @@ fn call_move<'a>(
         // 注意: 不预分配 Vec,因为 n 可能非常大 (如 maxI),
         // 元方法可能在第一次访问时就抛出错误 (对应 C 的循环行为)
         if ascending {
-            let mut i: i64 = 0;
+            let mut i: LuaInteger = 0;
             while i < n {
                 let src_key = TValue::Integer(f.wrapping_add(i));
                 let dst_key = TValue::Integer(t.wrapping_add(i));
@@ -847,7 +849,7 @@ fn call_move<'a>(
                 i += 1;
             }
         } else {
-            let mut i: i64 = n - 1;
+            let mut i: LuaInteger = n - 1;
             loop {
                 let src_key = TValue::Integer(f.wrapping_add(i));
                 let dst_key = TValue::Integer(t.wrapping_add(i));
@@ -883,7 +885,7 @@ fn get_int_arg<'a>(
     idx: usize,
     fname: &str,
     arg_num: usize,
-) -> Result<i64, VmError<'a>> {
+) -> Result<LuaInteger, VmError<'a>> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.stack.len() {
         return Err(VmError::RuntimeError(format!(

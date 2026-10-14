@@ -25,6 +25,7 @@ use std::fmt;
 use std::hash::{Hash, Hasher};
 
 use crate::alloc::SimpleRc;
+use crate::config::{LuaInteger, LuaNumber, LuaUnsigned};
 use crate::mem::SlotAlloc;
 use crate::strings::{
     lua_string_as_str, lua_string_eq, lua_string_hash, ArcRc, LongString, ShortString,
@@ -177,6 +178,9 @@ pub fn tvalue_fx_hash(v: &TValue) -> u64 {
         }
         TValue::Integer(i) => {
             let h1 = 3u64.wrapping_mul(SEED);
+            // 整数按位哈希: 与 `impl Hash for TValue` 的 `LuaInteger::hash` 一致 ——
+            // FxHasher 的 write_i32/write_i64 都是 `i as u64` (符号扩展), 故此处
+            // 直接 `*i as u64` 在 i32/i64 两种宽度下都逐位等价 (hash 边界宽类型转换)。
             (h1.rotate_left(5) ^ (*i as u64)).wrapping_mul(SEED)
         }
         TValue::Boolean(b) => {
@@ -190,8 +194,6 @@ pub fn tvalue_fx_hash(v: &TValue) -> u64 {
             let kind_u8 = match kind {
                 NilKind::Strict => 0u64,
                 NilKind::Empty => 1u64,
-                NilKind::AbsentKey => 2u64,
-                NilKind::NotTable => 3u64,
             };
             let h2 = (0u64.rotate_left(5) ^ kind_u8).wrapping_mul(SEED);
             (h2.rotate_left(5) ^ 0u64).wrapping_mul(SEED)
@@ -244,32 +246,6 @@ pub enum LuaType {
     UserData = 7,
     /// thread 类型 (LUA_TTHREAD = 8)
     Thread = 8,
-}
-
-impl LuaType {
-    /// 从整数值构造 LuaType
-    ///
-    /// Scenario: 从整数构造类型标签
-    /// Given: 有效整数 0..=8
-    /// When: 调用 LuaType::from_u8(n)
-    /// Then: 返回 Some(LuaType)
-    /// Given: 无效整数 >= 9
-    /// When: 调用 LuaType::from_u8(n)
-    /// Then: 返回 None
-    pub fn from_u8(n: u8) -> Option<Self> {
-        match n {
-            0 => Some(LuaType::Nil),
-            1 => Some(LuaType::Boolean),
-            2 => Some(LuaType::LightUserData),
-            3 => Some(LuaType::Number),
-            4 => Some(LuaType::String),
-            5 => Some(LuaType::Table),
-            6 => Some(LuaType::Function),
-            7 => Some(LuaType::UserData),
-            8 => Some(LuaType::Thread),
-            _ => None,
-        }
-    }
 }
 
 impl fmt::Display for LuaType {
@@ -635,9 +611,9 @@ pub enum TValue<'a> {
     /// 进行派发，避免用户指针被误判为内置函数。
     LightUserData(*mut std::ffi::c_void),
     /// 数值 —— 整数子变体
-    Integer(i64),
+    Integer(LuaInteger),
     /// 数值 —— 浮点子变体
-    Float(f64),
+    Float(LuaNumber),
     /// 字符串（短字符串和长字符串）
     ShortStr(ArcRc<ShortString>),
     LongStr(SimpleRc<LongString, SlotAlloc>),
@@ -677,9 +653,9 @@ pub enum WeakValue<'a> {
     /// 轻量用户数据（裸指针）
     LightUserData(*mut std::ffi::c_void),
     /// 数值 —— 整数子变体
-    Integer(i64),
+    Integer(LuaInteger),
     /// 数值 —— 浮点子变体
-    Float(f64),
+    Float(LuaNumber),
     /// 字符串（短字符串和长字符串）
     ShortStr(ArcRc<ShortString>),
     LongStr(SimpleRc<LongString, SlotAlloc>),
@@ -712,17 +688,13 @@ pub enum WeakValue<'a> {
 /// Scenario: nil 的语义区分
 /// Given: 一个值为 nil
 /// When: 检查其 NilKind
-/// Then: 可区分为标准 nil、空槽、缺键、非表哨兵
+/// Then: 可区分为标准 nil、空槽
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum NilKind {
     /// 标准 nil (LUA_VNIL)
     Strict,
     /// 空槽位 (LUA_VEMPTY)
     Empty,
-    /// 表中不存在的键 (LUA_VABSTKEY)
-    AbsentKey,
-    /// 快速访问非表时的哨兵 (LUA_VNOTABLE)
-    NotTable,
 }
 
 impl<'a> TValue<'a> {
@@ -766,19 +738,6 @@ impl<'a> TValue<'a> {
         matches!(self, TValue::Nil(_))
     }
 
-    /// 是否为严格 nil（只有 NilKind::Strict）
-    ///
-    /// Scenario: 判断严格 nil
-    /// Given: TValue::Nil(Strict)
-    /// When: 调用 .is_strict_nil()
-    /// Then: 返回 true
-    /// Given: TValue::Nil(Empty)
-    /// When: 调用 .is_strict_nil()
-    /// Then: 返回 false
-    pub fn is_strict_nil(&self) -> bool {
-        matches!(self, TValue::Nil(NilKind::Strict))
-    }
-
     /// 是否为布尔 false 或 nil（Lua 中的 "假" 值）
     ///
     /// Scenario: Lua 假值判断
@@ -795,29 +754,6 @@ impl<'a> TValue<'a> {
         matches!(self, TValue::Boolean(false)) || self.is_nil()
     }
 
-    /// Given: TValue::Integer(42)
-    /// When: 调用 .is_integer()
-    /// Then: 返回 true
-    /// Given: TValue::Float(3.14)
-    /// When: 调用 .is_integer()
-    /// Then: 返回 false
-    pub fn is_integer(&self) -> bool {
-        matches!(self, TValue::Integer(_))
-    }
-
-    /// 是否为浮点数
-    ///
-    /// Scenario: 判断浮点类型
-    /// Given: TValue::Float(1.5)
-    /// When: 调用 .is_float()
-    /// Then: 返回 true
-    /// Given: TValue::Integer(1)
-    /// When: 调用 .is_float()
-    /// Then: 返回 false
-    pub fn is_float(&self) -> bool {
-        matches!(self, TValue::Float(_))
-    }
-
     /// 是否为数字（整数或浮点数）
     ///
     /// Scenario: 判断数字类型
@@ -832,26 +768,6 @@ impl<'a> TValue<'a> {
     /// Then: 返回 false
     pub fn is_number(&self) -> bool {
         matches!(self, TValue::Integer(_) | TValue::Float(_))
-    }
-
-    /// 是否为字符串
-    ///
-    /// Scenario: 判断字符串类型
-    /// Given: TValue::StrS(_)
-    /// When: 调用 .is_string()
-    /// Then: 返回 true
-    pub fn is_string(&self) -> bool {
-        matches!(self, TValue::LongStr(_) | TValue::ShortStr(_))
-    }
-
-    /// 是否为表
-    ///
-    /// Scenario: 判断表类型
-    /// Given: TValue::Table(_)
-    /// When: 调用 .is_table()
-    /// Then: 返回 true
-    pub fn is_table(&self) -> bool {
-        matches!(self, TValue::Table(_))
     }
 
     /// 是否为函数（任何类型）
@@ -903,12 +819,12 @@ impl<'a> TValue<'a> {
     /// Given: TValue::Float(1.5)
     /// When: 调用 .as_integer()
     /// Then: 返回 None
-    pub fn as_integer(&self) -> Option<i64> {
+    pub fn as_integer(&self) -> Option<LuaInteger> {
         match self {
             TValue::Integer(i) => Some(*i),
             TValue::Float(f) => {
-                let i = *f as i64;
-                if (i as f64) == *f {
+                let i = *f as LuaInteger;
+                if (i as LuaNumber) == *f {
                     Some(i)
                 } else {
                     None
@@ -927,10 +843,10 @@ impl<'a> TValue<'a> {
     /// Given: TValue::Integer(42)
     /// When: 调用 .as_float()
     /// Then: 返回 Some(42.0)
-    pub fn as_float(&self) -> Option<f64> {
+    pub fn as_float(&self) -> Option<LuaNumber> {
         match self {
             TValue::Float(f) => Some(*f),
-            TValue::Integer(i) => Some(*i as f64),
+            TValue::Integer(i) => Some(*i as LuaNumber),
             _ => None,
         }
     }
@@ -954,14 +870,14 @@ impl<'a> PartialEq for TValue<'a> {
                 if b.is_nan() {
                     false
                 } else {
-                    (*a as f64) == *b
+                    (*a as LuaNumber) == *b
                 }
             }
             (TValue::Float(a), TValue::Integer(b)) => {
                 if a.is_nan() {
                     false
                 } else {
-                    *a == (*b as f64)
+                    *a == (*b as LuaNumber)
                 }
             }
             (
@@ -1015,8 +931,8 @@ impl<'a> Hash for TValue<'a> {
                     4u8.hash(state);
                     0u64.hash(state);
                 } else {
-                    let i = *f as i64;
-                    if (i as f64).to_bits() == f.to_bits() && *f != -0.0 {
+                    let i = *f as LuaInteger;
+                    if (i as LuaNumber).to_bits() == f.to_bits() && *f != -0.0 {
                         3u8.hash(state);
                         i.hash(state);
                     } else {
@@ -1076,8 +992,6 @@ impl<'a> fmt::Display for TValue<'a> {
         match self {
             TValue::Nil(NilKind::Strict) => write!(f, "nil"),
             TValue::Nil(NilKind::Empty) => write!(f, "(empty)"),
-            TValue::Nil(NilKind::AbsentKey) => write!(f, "(absent key)"),
-            TValue::Nil(NilKind::NotTable) => write!(f, "(not a table)"),
             TValue::Boolean(b) => {
                 // 体积优先: 避免 write!(f,"{}",b) 引入 core::fmt::num
                 #[cfg(size_optimized)]
@@ -1687,7 +1601,7 @@ pub struct AbsLineInfo {
 pub struct Proto<'a> {
     /// 固定参数数量
     pub num_params: u8,
-    /// 标志位 (PF_VAHID, PF_VATAB, PF_FIXED)
+    /// 标志位 (PF_VAHID, PF_VATAB)
     pub flag: u8,
     /// 最大栈大小
     pub max_stack_size: u8,
@@ -1740,16 +1654,6 @@ impl<'a> Proto<'a> {
         (self.flag & (PF_VAHID | PF_VATAB)) != 0
     }
 
-    /// 标记需要 vararg 表
-    ///
-    /// Scenario: 标记为需要 vararg 表
-    /// Given: flag 初始为 0
-    /// When: 调用 .need_vararg_table()
-    /// Then: flag 设置了 PF_VATAB 位
-    pub fn need_vararg_table(&mut self) {
-        self.flag |= PF_VATAB;
-    }
-
     /// 估算 Proto 真实堆占用（用于 GC 内存计费）。
     /// Proto 不调用 register_object（无 gc_header），由 gc_extra_estimate 跟踪。
     /// Proto 创建后字段不再扩容，故用 capacity 精确计费。
@@ -1772,7 +1676,6 @@ impl<'a> Proto<'a> {
 /// 原型标志位
 pub const PF_VAHID: u8 = 1;
 pub const PF_VATAB: u8 = 2;
-pub const PF_FIXED: u8 = 4;
 
 // ============================================================================
 // 规约：用户数据 (UserData)
@@ -1949,24 +1852,6 @@ impl Default for ThreadStatus {
 }
 
 // ============================================================================
-// 规约：栈条目 (StackValue)
-// ============================================================================
-
-/// 栈条目 —— 用于 to-be-closed 变量追踪
-///
-/// Scenario: 栈条目的结构
-/// Given: 一个 TValue 和一个 delta 值
-/// When: 构造 StackValue
-/// Then: val 包含该 TValue, tbc_delta 包含该 delta
-#[derive(Debug, Clone)]
-pub struct StackValue<'a> {
-    /// 栈上的值
-    pub val: TValue<'a>,
-    /// to-be-closed 变量的距离 delta
-    pub tbc_delta: u16,
-}
-
-// ============================================================================
 // 规约：ceil_log2 — 计算 ceil(log2(x))
 // ============================================================================
 
@@ -2020,92 +1905,6 @@ pub fn ceil_log2(x: u32) -> u8 {
         8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
     ];
     l + log_2[v as usize]
-}
-
-// ============================================================================
-// 规约：codeparam — 将百分比编码为浮点字节
-// ============================================================================
-
-/// 将百分比 p（0..=100）编码为 1 字节浮点表示 (eeee xxxx)。
-///
-/// 格式: 真实值 = (1xxxx) * 2^(eeee - 7 - 1)（eeee != 0）
-///             = (xxxx)  * 2^(-7)           （eeee == 0，次正规数）
-///
-/// Scenario: 编码 0%
-/// Given: p = 0
-/// When: 调用 codeparam(0)
-/// Then: 返回 0x00 (mantissa=0, exponent=0 → 0%)
-///
-/// Scenario: 编码 100%
-/// Given: p = 100
-/// When: 调用 codeparam(100)
-/// Then: 返回表示 100% 的字节
-///
-/// Scenario: 编码溢出
-/// Given: p 超过最大可表示值
-/// When: 调用 codeparam(p)
-/// Then: 返回 0xFF (最大值)
-pub fn codeparam(p: u32) -> u8 {
-    if p >= ((0x1Fu32) << (0xF - 7 - 1)) * 100 {
-        return 0xFF;
-    }
-    let p_val = ((p as u64) * 128).div_ceil(100);
-    if p_val < 0x10 {
-        return p_val as u8;
-    }
-    let p_val = p_val as u32;
-    let log = ceil_log2(p_val + 1) as u32 - 5;
-    (((p_val >> log) - 0x10) | ((log + 1) << 4)) as u8
-}
-
-// ============================================================================
-// 规约：applyparam — 浮点字节 × x
-// ============================================================================
-
-/// 将浮点字节 p 应用于值 x，计算 p/100 * x。
-///
-/// Scenario: 应用 0% 参数
-/// Given: p = 0x00 (0%), x = 1024
-/// When: 调用 applyparam(0x00, 1024)
-/// Then: 返回 0
-///
-/// Scenario: 应用参数到小值
-/// Given: p 编码 50%, x = 100
-/// When: 调用 applyparam(p, 100)
-/// Then: 返回 ≈ 50
-///
-/// Scenario: 溢出保护
-/// Given: p 和 x 的组合超出 MAX_LMEM
-/// When: 调用 applyparam(p, x)
-/// Then: 返回 MAX_LMEM (不会 panic)
-pub fn applyparam(p: u8, x: usize) -> usize {
-    // 规约: 待实现
-    let m = (p & 0xF) as usize;
-    let mut e = (p >> 4) as i32;
-    if e > 0 {
-        e -= 1;
-    }
-    let m = m + if p >> 4 > 0 { 0x10 } else { 0 };
-    e -= 7;
-    if e >= 0 {
-        let shift = e as u32;
-        match (x as u128)
-            .checked_mul(m as u128)
-            .and_then(|v| v.checked_shl(shift))
-        {
-            Some(v) if v <= usize::MAX as u128 => v as usize,
-            _ => usize::MAX,
-        }
-    } else {
-        let shift = (-e) as u32;
-        match (x as u128).checked_mul(m as u128) {
-            Some(v) => (v >> shift) as usize,
-            None => match (x >> shift).checked_mul(m) {
-                Some(v) => v,
-                None => usize::MAX,
-            },
-        }
-    }
 }
 
 // ============================================================================
@@ -2224,7 +2023,8 @@ pub fn str2num<'a>(s: &str) -> Option<TValue<'a>> {
         }
         return parse_hex_int(rest).map(|v| {
             TValue::Integer(if neg {
-                (v as u64).wrapping_neg() as i64
+                // C: l_castU2S(0u - a) —— 在 LuaUnsigned 域取负后按位重解释 (两补数环绕)
+                (v as LuaUnsigned).wrapping_neg() as LuaInteger
             } else {
                 v
             })
@@ -2252,18 +2052,18 @@ pub fn str2num<'a>(s: &str) -> Option<TValue<'a>> {
     None
 }
 
-fn parse_dec_int(s: &str) -> Option<i64> {
-    s.parse::<i64>().ok()
+fn parse_dec_int(s: &str) -> Option<LuaInteger> {
+    s.parse::<LuaInteger>().ok()
 }
 
-fn parse_hex_int(s: &str) -> Option<i64> {
+fn parse_hex_int(s: &str) -> Option<LuaInteger> {
     // C 的 l_str2int: 只读取十六进制数字，然后检查剩余是否全为空格
-    let mut result: u64 = 0;
+    let mut result: LuaUnsigned = 0;
     let mut empty = true;
     let bytes = s.as_bytes();
     let mut pos = 0;
     while pos < bytes.len() && bytes[pos].is_ascii_hexdigit() {
-        let digit = hexavalue(bytes[pos]) as u64;
+        let digit = hexavalue(bytes[pos]) as LuaUnsigned;
         result = result.wrapping_mul(16).wrapping_add(digit);
         empty = false;
         pos += 1;
@@ -2279,22 +2079,30 @@ fn parse_hex_int(s: &str) -> Option<i64> {
     {
         return None;
     }
-    Some(result as i64)
+    // C: l_castU2S(a) —— 无符号位模式重解释为 LuaInteger (两补数)
+    Some(result as LuaInteger)
 }
+
+/// `LuaNumber` 的位模式类型 — 对应 `f64::to_bits`/`from_bits`(u64) 或 `f32::`(u32)。
+/// 用于按 `LuaNumber` 宽度构造 2^e (ldexp)。
+#[cfg(not(feature = "num-f32"))]
+type FloatBits = u64;
+#[cfg(feature = "num-f32")]
+type FloatBits = u32;
 
 /// 解析十六进制浮点数 (对应 C 的 lua_strx2number)
 ///
 /// 输入格式: <int_part>[.<frac_part>][p<exp>]
 /// 例如: "1.999999999999ap-4" → 0.1
 ///
-/// 按照 C 的实现，用 f64 直接累积所有数字（最多 MAXSIGDIG 位），
+/// 按照 C 的实现，用 `LuaNumber` 直接累积所有数字（最多 MAXSIGDIG 位），
 /// 让 IEEE 754 自动处理舍入，最后用 ldexp(r, e) 调整指数。
-pub fn parse_hex_float(s: &str) -> Option<f64> {
+pub fn parse_hex_float(s: &str) -> Option<LuaNumber> {
     const MAXSIGDIG: usize = 30;
 
     let chars: Vec<char> = s.chars().collect();
     let mut i = 0;
-    let mut r: f64 = 0.0;
+    let mut r: LuaNumber = 0.0;
     let mut sigdig: usize = 0;
     let mut nosigdig: usize = 0;
     let mut e: i32 = 0;
@@ -2315,7 +2123,7 @@ pub fn parse_hex_float(s: &str) -> Option<f64> {
             } else {
                 sigdig += 1;
                 if sigdig <= MAXSIGDIG {
-                    r = r * 16.0 + d as f64;
+                    r = r * 16.0 + d as LuaNumber;
                 } else {
                     e += 1;
                 }
@@ -2368,387 +2176,29 @@ pub fn parse_hex_float(s: &str) -> Option<f64> {
     }
 
     // ldexp(r, e) = r * 2^e
-    // 用位操作构造精确的 2^e，避免 powi 的精度问题
+    // 用位操作构造精确的 2^e, 避免 powi 的精度问题。
+    // 各常数按 `LuaNumber` 的指数/尾数宽度参数化 (对应 C 的 l_mathop(ldexp),
+    // libm 侧按 LUA_NUMBER 宽度选择 ldexpf/ldexp)。
+    const BIAS: i32 = LuaNumber::MAX_EXP - 1; // f64: 1023, f32: 127
+    const SIG_BITS: u32 = LuaNumber::MANTISSA_DIGITS - 1; // f64: 52, f32: 23
+                                                          // 最小次正规数 2^(-(BIAS+SIG_BITS-1)) 的位模式偏移量
+    const SUB_OFFSET: i32 = BIAS + SIG_BITS as i32 - 1; // f64: 1074, f32: 149
     let result = if r == 0.0 || !r.is_finite() {
         r
-    } else if e >= 1023 {
-        f64::INFINITY * r.signum()
-    } else if e <= -1075 {
-        0.0_f64.copysign(r)
+    } else if e >= BIAS {
+        LuaNumber::INFINITY * r.signum()
+    } else if e < -SUB_OFFSET {
+        LuaNumber::copysign(0.0, r)
     } else {
-        let pow2 = if e >= -1022 {
-            f64::from_bits(((e + 1023) as u64) << 52)
+        let bits: FloatBits = if e >= -(BIAS - 1) {
+            ((e + BIAS) as FloatBits) << SIG_BITS
         } else {
-            f64::from_bits(1u64 << (e + 1074))
+            (1 as FloatBits) << (e + SUB_OFFSET)
         };
-        r * pow2
+        r * LuaNumber::from_bits(bits)
     };
 
     Some(result)
-}
-
-// ============================================================================
-// 规约：utf8esc — UTC-8 编码
-// ============================================================================
-
-/// 将 Unicode 码点编码为 UTF-8 字节序列。
-///
-/// 缓冲区至少需要 UTF8_BUFFSZ = 8 字节。
-/// 返回写入的字节数，UTF-8 数据放在 buffer 末尾。
-///
-/// Scenario: ASCII 字符
-/// Given: x = 0x41 ('A')
-/// When: 调用 utf8esc(buffer, 0x41)
-/// Then: 返回 1, buffer[UTF8_BUFFSZ-1] = 0x41
-///
-/// Scenario: 2 字节序列
-/// Given: x = 0xA2 (¢)
-/// When: 调用 utf8esc(buffer, 0xA2)
-/// Then: 返回 2, 正确编码为 UTF-8 双字节
-///
-/// Scenario: 3 字节序列 (中文)
-/// Given: x = 0x4E2D ('中')
-/// When: 调用 utf8esc(buffer, 0x4E2D)
-/// Then: 返回 3, 正确编码为 UTF-8 三字节
-///
-/// Scenario: 最大码点
-/// Given: x = 0x7FFFFFFF
-/// When: 调用 utf8esc(buffer, 0x7FFFFFFF)
-/// Then: 返回正确的多字节编码
-pub const UTF8_BUFFSZ: usize = 8;
-
-pub fn utf8esc(buffer: &mut [u8], x: u32) -> usize {
-    // 规约: 待实现
-    assert!(x <= 0x7FFFFFFF);
-    if x < 0x80 {
-        buffer[UTF8_BUFFSZ - 1] = x as u8;
-        return 1;
-    }
-    let mut n = 1;
-    let mut remaining = x;
-    let mut mfb: u32 = 0x3f;
-    loop {
-        buffer[UTF8_BUFFSZ - n] = 0x80 | ((remaining & 0x3f) as u8);
-        n += 1;
-        remaining >>= 6;
-        mfb >>= 1;
-        if remaining <= mfb {
-            break;
-        }
-    }
-    buffer[UTF8_BUFFSZ - n] = ((!mfb << 1) | remaining) as u8;
-    n
-}
-
-// ============================================================================
-// 规约：tostringbuff — 数字转字符串到缓冲区
-// ============================================================================
-
-/// 将 TValue 中的数字转换为字符串写入缓冲区。
-/// 返回写入的字节数（不含 '\0'）。
-///
-/// Scenario: 整数转字符串
-/// Given: TValue::Integer(42)
-/// When: 调用 tostringbuff(tv, buffer)
-/// Then: buffer 包含 "42", 返回 2
-///
-/// Scenario: 负整数转字符串
-/// Given: TValue::Integer(-7)
-/// When: 调用 tostringbuff(tv, buffer)
-/// Then: buffer 包含 "-7", 返回 2
-///
-/// Scenario: 浮点数转字符串
-/// Given: TValue::Float(3.14)
-/// When: 调用 tostringbuff(tv, buffer)
-/// Then: buffer 包含 "3.14", 返回 4
-///
-/// Scenario: 输入不是数字
-/// Given: TValue::Nil
-/// When: 调用 tostringbuff(tv, buffer)
-/// Then: panic (debug) 或未定义行为
-pub fn tostringbuff(obj: &TValue, buffer: &mut [u8]) -> usize {
-    // 规约: 待实现
-    match obj {
-        TValue::Integer(i) => {
-            let s = crate::float_utils::i64_to_string(*i);
-            let len = s.len();
-            buffer[..len].copy_from_slice(s.as_bytes());
-            len
-        }
-        TValue::Float(f) => {
-            // 用足够精度格式化
-            let s = crate::float_utils::f64_to_string_fixed(*f, 15);
-            // 去掉尾部多余的零（保留至少一位小数，如果看起来像整数加 ".0"）
-            let trimmed = trim_float_str(&s);
-            let len = trimmed.len();
-            buffer[..len].copy_from_slice(trimmed.as_bytes());
-            len
-        }
-        _ => panic!("tostringbuff: value is not a number"),
-    }
-}
-
-fn trim_float_str(s: &str) -> String {
-    // 如果看起来像整数，添加 ".0"
-    // 体积优先: 手动拼接避免 format! 引入 fmt 代码
-    if s.bytes().all(|b| b == b'-' || b.is_ascii_digit()) {
-        let mut tmp = String::with_capacity(s.len() + 2);
-        tmp.push_str(s);
-        tmp.push_str(".0");
-        return tmp;
-    }
-    s.to_string()
-}
-
-// ============================================================================
-// 规约：chunkid — 生成 chunk 标识符
-// ============================================================================
-
-/// 生成 chunk 标识符字符串。
-///
-/// Scenario: 字面量源 (以 '=' 开头)
-/// Given: source = "=hello", srclen = 6
-/// When: 调用 chunkid(out, source, srclen)
-/// Then: out 包含 "hello"
-///
-/// Scenario: 文件名源 (以 '@' 开头)
-/// Given: source = "@/path/to/file.lua", srclen = 19
-/// When: 调用 chunkid(out, source, srclen)
-/// Then: out 包含 "path/to/file.lua" (去掉 @)
-///
-/// Scenario: 字符串源
-/// Given: source = "print('hello')", srclen = 15
-/// When: 调用 chunkid(out, source, srclen)
-/// Then: out 包含 '[string "print('hel..."]' 格式
-pub fn chunkid(out: &mut [u8], source: &[u8], srclen: usize) {
-    // 规约: 待实现
-    let bufflen = out.len();
-    let src = &source[..srclen];
-    if src.first() == Some(&b'=') {
-        let content = &src[1..];
-        if content.len() <= bufflen {
-            let dst = &mut out[..content.len()];
-            dst.copy_from_slice(content);
-            if content.len() < bufflen {
-                out[content.len()] = 0;
-            }
-        } else {
-            let dst = &mut out[..bufflen - 1];
-            dst.copy_from_slice(&content[..bufflen - 1]);
-            out[bufflen - 1] = 0;
-        }
-    } else if src.first() == Some(&b'@') {
-        let content = &src[1..];
-        if content.len() <= bufflen {
-            let dst = &mut out[..content.len()];
-            dst.copy_from_slice(content);
-        } else {
-            let rets = b"...";
-            let rets_len = rets.len();
-            let dst0 = &mut out[..rets_len];
-            dst0.copy_from_slice(rets);
-            let remaining = bufflen - rets_len;
-            let start = content.len() - remaining;
-            let dst1 = &mut out[rets_len..rets_len + remaining];
-            dst1.copy_from_slice(&content[start..]);
-        }
-    } else {
-        let pre = b"[string \"";
-        let pos = b"\"]";
-        let pre_len = pre.len();
-        let pos_len = pos.len();
-        let total_overhead = pre_len + pos_len;
-        if total_overhead >= bufflen {
-            return;
-        }
-        out[..pre_len].copy_from_slice(pre);
-        let usable = bufflen - total_overhead;
-        let nl = src.iter().position(|&b| b == b'\n');
-        let src_len = nl.map(|p| p.min(usable)).unwrap_or(if src.len() < usable {
-            src.len()
-        } else {
-            usable
-        });
-        out[pre_len..pre_len + src_len].copy_from_slice(&src[..src_len]);
-        if nl.is_some() || src.len() > usable {
-            let rets = b"...";
-            let rets_len = rets.len();
-            out[pre_len + src_len..pre_len + src_len + rets_len].copy_from_slice(rets);
-            out[pre_len + src_len + rets_len..pre_len + src_len + rets_len + pos_len]
-                .copy_from_slice(pos);
-        } else {
-            out[pre_len + src_len..pre_len + src_len + pos_len].copy_from_slice(pos);
-        }
-    }
-}
-
-// ============================================================================
-// 规约：rawarith — 原始算术运算
-// ============================================================================
-
-/// 算术运算操作码
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ArithOp {
-    Add,
-    Sub,
-    Mul,
-    Div,
-    IDiv,
-    Mod,
-    Pow,
-    BAnd,
-    BOr,
-    BXor,
-    Shl,
-    Shr,
-    Unm,
-    BNot,
-}
-
-/// 对两个 TValue 执行原始算术运算，结果写入 res。
-/// 返回 true 表示成功，false 表示操作数类型不匹配。
-///
-/// Scenario: 整数加法
-/// Given: p1 = Integer(3), p2 = Integer(5), op = Add
-/// When: 调用 rawarith(op, p1, p2, &mut res)
-/// Then: res = Integer(8), 返回 true
-///
-/// Scenario: 整数与浮点混合加法
-/// Given: p1 = Integer(3), p2 = Float(2.5), op = Add
-/// When: 调用 rawarith(op, p1, p2, &mut res)
-/// Then: res = Float(5.5), 返回 true
-///
-/// Scenario: 位运算只能用于整数
-/// Given: p1 = Float(3.0), p2 = Integer(5), op = BAnd
-/// When: 调用 rawarith(op, p1, p2, &mut res)
-/// Then: 返回 false (浮点数不能做位运算)
-///
-/// Scenario: 除零
-/// Given: p1 = Integer(10), p2 = Integer(0), op = Div
-/// When: 调用 rawarith(op, p1, p2, &mut res)
-/// Then: res = Float(inf), 返回 true (IEEE 754 行为)
-pub fn rawarith(op: ArithOp, p1: &TValue, p2: &TValue, res: &mut TValue) -> bool {
-    // 规约: 待实现
-    match op {
-        ArithOp::BAnd
-        | ArithOp::BOr
-        | ArithOp::BXor
-        | ArithOp::Shl
-        | ArithOp::Shr
-        | ArithOp::BNot => {
-            if !p1.is_integer() || !p2.is_integer() {
-                return false;
-            }
-            let i1 = p1.as_integer();
-            let i2 = p2.as_integer();
-            match (i1, i2) {
-                (Some(a), Some(b)) => {
-                    *res = match op {
-                        ArithOp::BAnd => TValue::Integer(a & b),
-                        ArithOp::BOr => TValue::Integer(a | b),
-                        ArithOp::BXor => TValue::Integer(a ^ b),
-                        ArithOp::Shl => TValue::Integer(a.wrapping_shl(b as u32)),
-                        ArithOp::Shr => TValue::Integer(a.wrapping_shr(b as u32)),
-                        ArithOp::BNot => TValue::Integer(!a),
-                        _ => unreachable!(),
-                    };
-                    true
-                }
-                _ => false,
-            }
-        }
-        ArithOp::Div | ArithOp::Pow => {
-            let n1 = p1.as_float();
-            let n2 = p2.as_float();
-            match (n1, n2) {
-                (Some(a), Some(b)) => {
-                    *res = TValue::Float(match op {
-                        ArithOp::Div => a / b,
-                        ArithOp::Pow => crate::config::float_pow(a, b),
-                        _ => unreachable!(),
-                    });
-                    true
-                }
-                _ => false,
-            }
-        }
-        _ => {
-            if p1.is_integer() && p2.is_integer() {
-                if let (Some(a), Some(b)) = (p1.as_integer(), p2.as_integer()) {
-                    *res = match op {
-                        ArithOp::Add => TValue::Integer(a.wrapping_add(b)),
-                        ArithOp::Sub => TValue::Integer(a.wrapping_sub(b)),
-                        ArithOp::Mul => TValue::Integer(a.wrapping_mul(b)),
-                        ArithOp::IDiv => TValue::Integer(if b == 0 {
-                            0
-                        } else {
-                            float_idiv(a as f64, b as f64) as i64
-                        }),
-                        ArithOp::Mod => TValue::Integer(if b == 0 { 0 } else { a % b }),
-                        ArithOp::Unm => TValue::Integer(a.wrapping_neg()),
-                        _ => unreachable!(),
-                    };
-                    return true;
-                }
-            }
-            let n1 = p1.as_float();
-            let n2 = p2.as_float();
-            match (n1, n2) {
-                (Some(a), Some(b)) => {
-                    *res = TValue::Float(match op {
-                        ArithOp::Add => a + b,
-                        ArithOp::Sub => a - b,
-                        ArithOp::Mul => a * b,
-                        ArithOp::IDiv => float_idiv(a, b),
-                        ArithOp::Mod => float_mod(a, b),
-                        ArithOp::Unm => -a,
-                        _ => unreachable!(),
-                    });
-                    true
-                }
-                _ => false,
-            }
-        }
-    }
-}
-
-fn float_idiv(a: f64, b: f64) -> f64 {
-    (a / b).floor()
-}
-
-fn float_mod(a: f64, b: f64) -> f64 {
-    let m = a % b;
-    if (m > 0.0) == (b < 0.0) && m != 0.0 {
-        m + b
-    } else {
-        m
-    }
-}
-
-// ============================================================================
-// 规约：arith — 算术运算（含元方法回退）
-// ============================================================================
-
-/// 执行算术运算。如果原始运算失败（操作数类型不匹配），尝试元方法。
-/// 当前版本仅实现原始运算，元方法回退预留扩展。
-///
-/// Scenario: 同 rawarith，但失败时不立即返回
-/// Given: 操作数类型匹配
-/// When: 调用 arith(op, p1, p2, res)
-/// Then: 同 rawarith 的行为
-///
-/// Scenario: 操作数类型不匹配
-/// Given: 操作数类型不匹配且无法转换
-/// When: 调用 arith(op, p1, p2, res)
-/// Then: 返回 false (元方法回退预留)
-pub fn arith(_op: ArithOp, _p1: &TValue, _p2: &TValue, _res: &mut TValue) -> bool {
-    // 简化实现：直接返回 false（元方法回退预留）
-    false
-}
-
-/// 计算 2^n
-pub fn twoto(n: u8) -> usize {
-    1usize << n
 }
 
 // ============================================================================
@@ -2761,7 +2211,7 @@ mod tests {
     use super::*;
     use crate::{
         alloc::{SimpleArc, SimpleRc},
-        strings::{lua_string_is_empty, lua_string_len, LongString, ShortString},
+        strings::{lua_string_len, LongString, ShortString},
     };
 
     // ========================================================================
@@ -2796,20 +2246,6 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_lua_type_from_u8_valid() {
-        assert_eq!(LuaType::from_u8(0), Some(LuaType::Nil));
-        assert_eq!(LuaType::from_u8(1), Some(LuaType::Boolean));
-        assert_eq!(LuaType::from_u8(3), Some(LuaType::Number));
-        assert_eq!(LuaType::from_u8(8), Some(LuaType::Thread));
-    }
-
-    #[test]
-    fn test_lua_type_from_u8_invalid() {
-        assert_eq!(LuaType::from_u8(9), None);
-        assert_eq!(LuaType::from_u8(255), None);
-    }
-
-    #[test]
     fn test_lua_type_display() {
         assert_eq!(format!("{}", LuaType::Nil), "nil");
         assert_eq!(format!("{}", LuaType::Boolean), "boolean");
@@ -2825,7 +2261,6 @@ mod tests {
     fn test_tvalue_nil() {
         let v = TValue::Nil(NilKind::Strict);
         assert!(v.is_nil());
-        assert!(v.is_strict_nil());
         assert_eq!(v.ty(), LuaType::Nil);
     }
 
@@ -2833,7 +2268,6 @@ mod tests {
     fn test_tvalue_nil_empty() {
         let v = TValue::Nil(NilKind::Empty);
         assert!(v.is_nil());
-        assert!(!v.is_strict_nil());
     }
 
     #[test]
@@ -2849,9 +2283,7 @@ mod tests {
     #[test]
     fn test_tvalue_integer() {
         let v = TValue::Integer(42);
-        assert!(v.is_integer());
         assert!(v.is_number());
-        assert!(!v.is_float());
         assert_eq!(v.as_integer(), Some(42));
         assert_eq!(v.as_float(), Some(42.0));
     }
@@ -2859,9 +2291,7 @@ mod tests {
     #[test]
     fn test_tvalue_float() {
         let v = TValue::Float(3.14);
-        assert!(v.is_float());
         assert!(v.is_number());
-        assert!(!v.is_integer());
         assert_eq!(v.as_float(), Some(3.14));
         assert_eq!(v.as_integer(), None);
     }
@@ -2912,13 +2342,6 @@ mod tests {
         assert!(!TValue::Integer(0).is_false());
     }
 
-    #[test]
-    fn test_tvalue_is_string() {
-        // 需要创建一个 TString 来测试，这里仅测试非字符串情况
-        assert!(!TValue::Nil(NilKind::Strict).is_string());
-        assert!(!TValue::Integer(1).is_string());
-    }
-
     // ========================================================================
     // LuaString 测试
     // ========================================================================
@@ -2930,7 +2353,6 @@ mod tests {
         assert_eq!(lua_string_as_str(&ts), "hello");
         assert_eq!(lua_string_len(&ts), 5);
         assert!(matches!(ts, TValue::ShortStr(_)));
-        assert!(!lua_string_is_empty(&ts));
     }
 
     #[test]
@@ -2949,7 +2371,6 @@ mod tests {
     fn test_luastring_empty() {
         let short = crate::strings::ArcRc::<ShortString>::new_sstr(0, 0, "".as_bytes());
         let ts = TValue::ShortStr(short);
-        assert!(lua_string_is_empty(&ts));
         assert_eq!(lua_string_len(&ts), 0);
         assert_eq!(lua_string_as_str(&ts), "");
     }
@@ -2995,7 +2416,7 @@ mod tests {
 
     #[test]
     fn test_proto_vararg() {
-        let mut p = Proto {
+        let p = Proto {
             num_params: 0,
             flag: 0,
             max_stack_size: 2,
@@ -3018,8 +2439,6 @@ mod tests {
             source: None,
         };
         assert!(!p.is_vararg());
-        p.need_vararg_table();
-        assert!(p.is_vararg());
     }
 
     // ========================================================================
@@ -3111,274 +2530,6 @@ mod tests {
     }
 
     // ========================================================================
-    // utf8esc 测试
-    // ========================================================================
-
-    #[test]
-    fn test_utf8esc_ascii() {
-        let mut buf = [0u8; UTF8_BUFFSZ];
-        let n = utf8esc(&mut buf, 0x41);
-        assert_eq!(n, 1);
-        assert_eq!(buf[UTF8_BUFFSZ - 1], 0x41);
-    }
-
-    #[test]
-    fn test_utf8esc_2bytes() {
-        let mut buf = [0u8; UTF8_BUFFSZ];
-        let n = utf8esc(&mut buf, 0xA2);
-        assert_eq!(n, 2);
-        assert_eq!(buf[UTF8_BUFFSZ - 2], 0xC2);
-        assert_eq!(buf[UTF8_BUFFSZ - 1], 0xA2);
-    }
-
-    #[test]
-    fn test_utf8esc_3bytes() {
-        let mut buf = [0u8; UTF8_BUFFSZ];
-        let n = utf8esc(&mut buf, 0x4E2D); // '中'
-        assert_eq!(n, 3);
-        assert_eq!(buf[UTF8_BUFFSZ - 3], 0xE4);
-        assert_eq!(buf[UTF8_BUFFSZ - 2], 0xB8);
-        assert_eq!(buf[UTF8_BUFFSZ - 1], 0xAD);
-    }
-
-    // ========================================================================
-    // tostringbuff 测试
-    // ========================================================================
-
-    #[test]
-    fn test_tostringbuff_integer() {
-        let mut buf = [0u8; 64];
-        let tv = TValue::Integer(42);
-        let len = tostringbuff(&tv, &mut buf);
-        assert_eq!(&buf[..len], b"42");
-    }
-
-    #[test]
-    fn test_tostringbuff_negative_integer() {
-        let mut buf = [0u8; 64];
-        let tv = TValue::Integer(-7);
-        let len = tostringbuff(&tv, &mut buf);
-        assert_eq!(&buf[..len], b"-7");
-    }
-
-    #[test]
-    fn test_tostringbuff_float() {
-        let mut buf = [0u8; 64];
-        let tv = TValue::Float(3.5);
-        let len = tostringbuff(&tv, &mut buf);
-        let s = std::str::from_utf8(&buf[..len]).unwrap();
-        assert!(s.starts_with("3.5"));
-    }
-
-    #[test]
-    #[should_panic]
-    fn test_tostringbuff_not_number() {
-        let mut buf = [0u8; 64];
-        let tv = TValue::Nil(NilKind::Strict);
-        tostringbuff(&tv, &mut buf);
-    }
-
-    // ========================================================================
-    // chunkid 测试
-    // ========================================================================
-
-    #[test]
-    fn test_chunkid_literal_short() {
-        let mut out = [0u8; 60];
-        chunkid(&mut out, b"=hello", 6);
-        assert_eq!(&out[..5], b"hello");
-    }
-
-    #[test]
-    fn test_chunkid_file_short() {
-        let mut out = [0u8; 60];
-        chunkid(&mut out, b"@test.lua", 9);
-        // 去掉 @ 后为 "test.lua"
-        assert_eq!(&out[..8], b"test.lua");
-    }
-
-    #[test]
-    fn test_chunkid_string_chunk() {
-        let mut out = [0u8; 60];
-        let src = b"print('hello')";
-        chunkid(&mut out, src, src.len());
-        let result = std::str::from_utf8(&out).unwrap_or("");
-        assert!(result.starts_with("[string \""));
-        assert!(result.contains("print"));
-    }
-
-    // ========================================================================
-    // rawarith / arith 测试
-    // ========================================================================
-
-    #[test]
-    fn test_rawarith_int_add() {
-        let p1 = TValue::Integer(3);
-        let p2 = TValue::Integer(5);
-        let mut res = TValue::default();
-        assert!(rawarith(ArithOp::Add, &p1, &p2, &mut res));
-        assert_eq!(res, TValue::Integer(8));
-    }
-
-    #[test]
-    fn test_rawarith_int_sub() {
-        let p1 = TValue::Integer(10);
-        let p2 = TValue::Integer(3);
-        let mut res = TValue::default();
-        assert!(rawarith(ArithOp::Sub, &p1, &p2, &mut res));
-        assert_eq!(res, TValue::Integer(7));
-    }
-
-    #[test]
-    fn test_rawarith_int_mul() {
-        let p1 = TValue::Integer(4);
-        let p2 = TValue::Integer(5);
-        let mut res = TValue::default();
-        assert!(rawarith(ArithOp::Mul, &p1, &p2, &mut res));
-        assert_eq!(res, TValue::Integer(20));
-    }
-
-    #[test]
-    fn test_rawarith_float_add() {
-        let p1 = TValue::Float(2.5);
-        let p2 = TValue::Float(1.5);
-        let mut res = TValue::default();
-        assert!(rawarith(ArithOp::Add, &p1, &p2, &mut res));
-        if let TValue::Float(f) = res {
-            assert!((f - 4.0).abs() < 1e-10);
-        } else {
-            panic!("expected float");
-        }
-    }
-
-    #[test]
-    fn test_rawarith_mixed_int_float() {
-        let p1 = TValue::Integer(3);
-        let p2 = TValue::Float(2.5);
-        let mut res = TValue::default();
-        assert!(rawarith(ArithOp::Add, &p1, &p2, &mut res));
-        if let TValue::Float(f) = res {
-            assert!((f - 5.5).abs() < 1e-10);
-        } else {
-            panic!("expected float");
-        }
-    }
-
-    #[test]
-    fn test_rawarith_bitwise_rejects_float() {
-        let p1 = TValue::Float(3.0);
-        let p2 = TValue::Integer(5);
-        let mut res = TValue::default();
-        assert!(!rawarith(ArithOp::BAnd, &p1, &p2, &mut res));
-    }
-
-    #[test]
-    fn test_rawarith_band() {
-        let p1 = TValue::Integer(0b1100);
-        let p2 = TValue::Integer(0b1010);
-        let mut res = TValue::default();
-        assert!(rawarith(ArithOp::BAnd, &p1, &p2, &mut res));
-        assert_eq!(res, TValue::Integer(0b1000)); // 8
-    }
-
-    #[test]
-    fn test_rawarith_bor() {
-        let p1 = TValue::Integer(0b1100);
-        let p2 = TValue::Integer(0b1010);
-        let mut res = TValue::default();
-        assert!(rawarith(ArithOp::BOr, &p1, &p2, &mut res));
-        assert_eq!(res, TValue::Integer(0b1110)); // 14
-    }
-
-    #[test]
-    fn test_rawarith_bxor() {
-        let p1 = TValue::Integer(0b1100);
-        let p2 = TValue::Integer(0b1010);
-        let mut res = TValue::default();
-        assert!(rawarith(ArithOp::BXor, &p1, &p2, &mut res));
-        assert_eq!(res, TValue::Integer(0b0110)); // 6
-    }
-
-    #[test]
-    fn test_rawarith_shl() {
-        let p1 = TValue::Integer(1);
-        let p2 = TValue::Integer(3);
-        let mut res = TValue::default();
-        assert!(rawarith(ArithOp::Shl, &p1, &p2, &mut res));
-        assert_eq!(res, TValue::Integer(8));
-    }
-
-    #[test]
-    fn test_rawarith_shr() {
-        let p1 = TValue::Integer(16);
-        let p2 = TValue::Integer(2);
-        let mut res = TValue::default();
-        assert!(rawarith(ArithOp::Shr, &p1, &p2, &mut res));
-        assert_eq!(res, TValue::Integer(4));
-    }
-
-    #[test]
-    fn test_rawarith_div() {
-        let p1 = TValue::Float(10.0);
-        let p2 = TValue::Float(3.0);
-        let mut res = TValue::default();
-        assert!(rawarith(ArithOp::Div, &p1, &p2, &mut res));
-        if let TValue::Float(f) = res {
-            assert!((f - 10.0 / 3.0).abs() < 1e-10);
-        } else {
-            panic!("expected float");
-        }
-    }
-
-    // ========================================================================
-    // codeparam / applyparam 测试
-    // ========================================================================
-
-    #[test]
-    fn test_codeparam_zero() {
-        let p = codeparam(0);
-        assert_eq!(p, 0x00);
-    }
-
-    #[test]
-    fn test_codeparam_100() {
-        let p = codeparam(100);
-        // 100% 应返回某个合理的字节
-        assert!(p > 0);
-    }
-
-    #[test]
-    fn test_applyparam_zero() {
-        let result = applyparam(0x00, 1024);
-        assert_eq!(result, 0);
-    }
-
-    #[test]
-    fn test_applyparam_and_codeparam_roundtrip() {
-        // 测试 50% 的编码/解码精度（近似）
-        let code = codeparam(50);
-        let result = applyparam(code, 1000);
-        // 期望约 500，允许 ±10% 误差
-        assert!(
-            result > 400 && result < 600,
-            "50% of 1000 should be ~500, got {}",
-            result
-        );
-    }
-
-    // ========================================================================
-    // twoto 测试
-    // ========================================================================
-
-    #[test]
-    fn test_twoto() {
-        assert_eq!(twoto(0), 1);
-        assert_eq!(twoto(1), 2);
-        assert_eq!(twoto(3), 8);
-        assert_eq!(twoto(8), 256);
-    }
-
-    // ========================================================================
     // UpVal 测试
     // ========================================================================
 
@@ -3461,7 +2612,6 @@ mod tests {
     fn test_nil_kind_eq() {
         assert_eq!(NilKind::Strict, NilKind::Strict);
         assert_ne!(NilKind::Strict, NilKind::Empty);
-        assert_eq!(NilKind::AbsentKey, NilKind::AbsentKey);
     }
 
     #[test]

@@ -13,6 +13,7 @@
 //! 每个公开函数都包含规约注释。
 
 use crate::alloc::MyRc;
+use crate::config::{LuaInteger, LuaNumber, LuaUnsigned, MAX_INTEGER, MIN_INTEGER};
 #[cfg(lua_use_longjmp)]
 use crate::helper::JmpBuf;
 use crate::mem::SlotAlloc;
@@ -104,7 +105,6 @@ pub enum VmResult<'a> {
     Yield {
         values: Vec<TValue<'a>>,
     },
-    Done,
 }
 /// op_call / op_tailcall 结果 — perf: pure BuiltinFn 成功不切帧, 主循环据此
 /// 跳过 code_ptr/constants_ptr/code_len/constants_len 四件套重载 (每快速 CALL
@@ -133,15 +133,11 @@ enum ErrOutcome<'a> {
 pub enum VmError<'a> {
     DivisionByZero,
     ModuloByZero,
-    TypeError(String),
-    StackOverflow,
-    StackError,
     IllegalOpcode(u8),
     RuntimeError(String),
     /// 非字符串错误值 — error() 传入非字符串参数时使用，保留原始 TValue
     /// 对应 C Lua 中 errfunc 为非字符串时的行为
     RuntimeErrorValue(TValue<'a>),
-    MetaMethodNotImplemented(String),
     /// 协程 yield 信号 — 携带 yield 的值（非真实错误，由 execute_loop 转换为 VmResult::Yield）
     Yield(Vec<TValue<'a>>),
 }
@@ -151,15 +147,9 @@ impl<'a> std::fmt::Display for VmError<'a> {
         match self {
             VmError::DivisionByZero => write!(f, "attempt to divide by zero"),
             VmError::ModuloByZero => write!(f, "attempt to perform 'n%0'"),
-            VmError::TypeError(msg) => write!(f, "type error: {}", msg),
-            VmError::StackOverflow => write!(f, "stack overflow"),
-            VmError::StackError => write!(f, "stack error"),
             VmError::IllegalOpcode(op) => write!(f, "illegal opcode: {}", op),
             VmError::RuntimeError(msg) => write!(f, "runtime error: {}", msg),
             VmError::RuntimeErrorValue(_) => write!(f, "runtime error (non-string value)"),
-            VmError::MetaMethodNotImplemented(name) => {
-                write!(f, "metamethod '{}' not implemented", name)
-            }
             VmError::Yield(_) => write!(f, "yield"),
         }
     }
@@ -1887,17 +1877,6 @@ impl VmExecutor {
         state.last_traceback = trace;
     }
 
-    /// 格式化单条指令为 bytecode_dump 格式
-    /// 格式: "{pc}\t[-]\t{OP_NAME}\t{operands}"
-    pub fn format_instruction(_state: &LuaState, inst: Instruction, pc: usize) -> String {
-        // 使用 bytecode_dump 的格式: pc [-] instruction
-        format!(
-            "{}\t[-]\t{}",
-            pc + 1,
-            crate::compiler::bytecode_dump::format_instruction(inst)
-        )
-    }
-
     /// 执行 count hook 和 line hook — 从 execute_loop 主循环提取的 cold 路径。
     ///
     /// 调用前提: `state.hook_mask & (4 | 8) != 0` 且当前 op != VARARGPREP。
@@ -2515,9 +2494,6 @@ impl VmExecutor {
                                 state.top = state.stack.len();
                                 Self::finish_concat_loop(state, a)?;
                             }
-                            Err(_) => {
-                                return Err(VmError::RuntimeError("concat error".into()));
-                            }
                         }
                     }
                     // 清除剩余槽位
@@ -2817,9 +2793,6 @@ impl VmExecutor {
                     // 继续循环尝试直接拼接
                     continue;
                 }
-                Err(_) => {
-                    return Err(VmError::RuntimeError("concat error".into()));
-                }
             }
         }
         Ok(())
@@ -2959,7 +2932,7 @@ impl VmExecutor {
         let event_str = state.intern_str(event);
         state.stack.push(event_str);
         if line >= 0 {
-            state.stack.push(TValue::Integer(line as i64));
+            state.stack.push(TValue::Integer(line as LuaInteger));
         } else {
             state.stack.push(TValue::Nil(NilKind::Strict));
         }
@@ -3078,7 +3051,7 @@ impl VmExecutor {
     #[cfg_attr(not(size_optimized), inline)]
     fn op_loadi<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
-        let val = opcodes::getarg_sbx(inst) as i64;
+        let val = opcodes::getarg_sbx(inst) as LuaInteger;
         Self::write_stack(state, a, TValue::Integer(val));
         Ok(())
     }
@@ -3086,7 +3059,7 @@ impl VmExecutor {
     #[cfg_attr(not(size_optimized), inline)]
     fn op_loadf<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
-        let val = opcodes::getarg_sbx(inst) as f64;
+        let val = opcodes::getarg_sbx(inst) as LuaNumber;
         Self::write_stack(state, a, TValue::Float(val));
         Ok(())
     }
@@ -3569,7 +3542,7 @@ impl VmExecutor {
     ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
-        let c = opcodes::getarg_c(inst) as i64;
+        let c = opcodes::getarg_c(inst) as LuaInteger;
         let key = TValue::Integer(c);
         // perf 快速路径: table 无元表时直接用 get_and_metatable, 跳过 table_get 包装层
         // (current.take/unwrap_or/match Table/MAXTAGLOOP 循环 + table_val clone)。
@@ -3830,7 +3803,7 @@ impl VmExecutor {
         cur: usize,
     ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
-        let b = opcodes::getarg_b(inst) as i64;
+        let b = opcodes::getarg_b(inst) as LuaInteger;
         let c = opcodes::getarg_c(inst);
         let mut val_opt = Some(Self::resolve_val(state, inst, c));
         // perf 快速路径: table 无元表时直接用 Table::set + GC barrier, 跳过 table_set 包装层
@@ -4011,12 +3984,12 @@ impl VmExecutor {
     ) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
-        let imm = opcodes::getarg_sc(inst) as i64;
+        let imm = opcodes::getarg_sc(inst) as LuaInteger;
         let (has_imm_result, result) = {
             let val = Self::read_stack(state, b);
             match val {
                 TValue::Integer(iv) => (true, TValue::Integer(iv.wrapping_add(imm))),
-                TValue::Float(fv) => (true, TValue::Float(fv + imm as f64)),
+                TValue::Float(fv) => (true, TValue::Float(fv + imm as LuaNumber)),
                 _ => (false, TValue::Nil(NilKind::Strict)),
             }
         };
@@ -4291,7 +4264,7 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         // C 使用 GETARG_sC (有符号常量), 与 C 版本一致
-        let ic = opcodes::getarg_sc(inst) as i64;
+        let ic = opcodes::getarg_sc(inst) as LuaInteger;
         let v = Self::read_stack(state, b).clone();
         if let Some(ib) = to_integer_ns(&v, F2IMode::Eq) {
             Self::write_stack(state, a, TValue::Integer(shiftl(ic, ib)));
@@ -4307,7 +4280,7 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         // C 使用 GETARG_sC (有符号常量), 与 C 版本一致
-        let ic = opcodes::getarg_sc(inst) as i64;
+        let ic = opcodes::getarg_sc(inst) as LuaInteger;
         let v = Self::read_stack(state, b).clone();
         if let Some(ib) = to_integer_ns(&v, F2IMode::Eq) {
             Self::write_stack(state, a, TValue::Integer(shiftr(ib, ic)));
@@ -4598,7 +4571,7 @@ impl VmExecutor {
             let result = Self::ra(state, pi);
             state.pc = cur; // sync (C savepc): 先同步, varinfo 回扫需要当前指令
             let p1_info = varinfo_str(state, opcodes::getarg_a(inst) as usize);
-            try_bini_tm(state, &p1, imm as i64, flip, result, tm, p1_info)?;
+            try_bini_tm(state, &p1, imm as LuaInteger, flip, result, tm, p1_info)?;
         }
         Ok(())
     }
@@ -4803,9 +4776,6 @@ impl VmExecutor {
                             state.stack.append(&mut vals);
                             state.top = state.stack.len();
                             continue;
-                        }
-                        Err(_) => {
-                            return Err(VmError::RuntimeError("concat error".into()));
                         }
                     }
                 }
@@ -5019,11 +4989,11 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         // EQI 是 IABC 模式,使用 sB 参数 (有符号 B, 8 位)
         // 对应 C: int im = GETARG_sB(i);
-        let im = opcodes::getarg_sb(inst) as i64;
+        let im = opcodes::getarg_sb(inst) as LuaInteger;
         let v = Self::read_stack(state, a);
         let cond = match v {
             TValue::Integer(i) => *i == im,
-            TValue::Float(f) => (*f - im as f64).abs() < f64::EPSILON,
+            TValue::Float(f) => (*f - im as LuaNumber).abs() < LuaNumber::EPSILON,
             _ => false,
         };
         *pc = Self::do_conditional_jump(state, inst, cond, cur)?;
@@ -5041,14 +5011,14 @@ impl VmExecutor {
         // flip = 0, event = LT → __lt(a, im)
         // C 字段 (isfloat): 原常量是否为浮点数（如 5.0）
         let a = Self::ra(state, inst);
-        let im = opcodes::getarg_sb(inst) as i64;
+        let im = opcodes::getarg_sb(inst) as LuaInteger;
         let isfloat = opcodes::getarg_c(inst) != 0;
         // 快速路径：number 直接比较，借用 state.stack 避免 TValue clone
         let cond = {
             let v = Self::read_stack(state, a);
             match v {
                 TValue::Integer(i) => Some(*i < im),
-                TValue::Float(f) => Some(*f < (im as f64)),
+                TValue::Float(f) => Some(*f < (im as LuaNumber)),
                 _ => None,
             }
         };
@@ -5075,13 +5045,13 @@ impl VmExecutor {
         // C: op_orderI(L, l_lei, luai_numle, 0, TM_LE)
         // flip = 0, event = LE → __le(a, im)
         let a = Self::ra(state, inst);
-        let im = opcodes::getarg_sb(inst) as i64;
+        let im = opcodes::getarg_sb(inst) as LuaInteger;
         let isfloat = opcodes::getarg_c(inst) != 0;
         let cond = {
             let v = Self::read_stack(state, a);
             match v {
                 TValue::Integer(i) => Some(*i <= im),
-                TValue::Float(f) => Some(*f <= (im as f64)),
+                TValue::Float(f) => Some(*f <= (im as LuaNumber)),
                 _ => None,
             }
         };
@@ -5107,13 +5077,13 @@ impl VmExecutor {
         // C: op_orderI(L, l_gti, luai_numgt, 1, TM_LT)
         // flip = 1, event = LT → __lt(im, a)  (a > im 等价于 im < a)
         let a = Self::ra(state, inst);
-        let im = opcodes::getarg_sb(inst) as i64;
+        let im = opcodes::getarg_sb(inst) as LuaInteger;
         let isfloat = opcodes::getarg_c(inst) != 0;
         let cond = {
             let v = Self::read_stack(state, a);
             match v {
                 TValue::Integer(i) => Some(*i > im),
-                TValue::Float(f) => Some(*f > (im as f64)),
+                TValue::Float(f) => Some(*f > (im as LuaNumber)),
                 _ => None,
             }
         };
@@ -5139,13 +5109,13 @@ impl VmExecutor {
         // C: op_orderI(L, l_gei, luai_numge, 1, TM_LE)
         // flip = 1, event = LE → __le(im, a)  (a >= im 等价于 im <= a)
         let a = Self::ra(state, inst);
-        let im = opcodes::getarg_sb(inst) as i64;
+        let im = opcodes::getarg_sb(inst) as LuaInteger;
         let isfloat = opcodes::getarg_c(inst) != 0;
         let cond = {
             let v = Self::read_stack(state, a);
             match v {
                 TValue::Integer(i) => Some(*i >= im),
-                TValue::Float(f) => Some(*f >= (im as f64)),
+                TValue::Float(f) => Some(*f >= (im as LuaNumber)),
                 _ => None,
             }
         };
@@ -6788,7 +6758,7 @@ impl VmExecutor {
         let count_val = Self::read_stack(state, ra);
         match count_val {
             TValue::Integer(i) => {
-                let count = *i as u64;
+                let count = *i as LuaUnsigned;
                 let (step, idx) = {
                     // ra+1, ra+2 相邻槽; FORPREP 保证三槽均为 Integer
                     let s = Self::read_stack(state, ra + 1);
@@ -6802,8 +6772,9 @@ impl VmExecutor {
                 };
 
                 if count > 0 {
-                    Self::write_stack(state, ra, TValue::Integer((count - 1) as i64));
-                    let new_idx = (idx as u64).wrapping_add(step as u64) as i64;
+                    Self::write_stack(state, ra, TValue::Integer((count - 1) as LuaInteger));
+                    let new_idx =
+                        (idx as LuaUnsigned).wrapping_add(step as LuaUnsigned) as LuaInteger;
                     Self::write_stack(state, ra + 2, TValue::Integer(new_idx));
                     let bx = opcodes::getarg_bx(inst);
                     // 回跳: pc 已 = cur+1, 目标 = cur+1-bx (对应 C 的 pc -= bx)
@@ -6888,22 +6859,23 @@ impl VmExecutor {
                     state.pc = ((state.pc as i32) + bx + 2) as usize;
                     return Ok(());
                 }
-                let count: u64 = if *step_i > 0 {
-                    let diff = (limit_i as u64).wrapping_sub(*init_i as u64);
-                    let step_u = *step_i as u64;
+                let count: LuaUnsigned = if *step_i > 0 {
+                    let diff = (limit_i as LuaUnsigned).wrapping_sub(*init_i as LuaUnsigned);
+                    let step_u = *step_i as LuaUnsigned;
                     if step_u == 1 {
                         diff
                     } else {
                         diff / step_u
                     }
                 } else {
-                    let diff = (*init_i as u64).wrapping_sub(limit_i as u64);
-                    let step_u = ((-(*step_i + 1)) as u64).wrapping_add(1);
+                    let diff = (*init_i as LuaUnsigned).wrapping_sub(limit_i as LuaUnsigned);
+                    // 'step + 1' 避免对 MIN_INTEGER 取负 (C: l_castS2U(-(step + 1)) + 1u)
+                    let step_u = ((-(*step_i + 1)) as LuaUnsigned).wrapping_add(1);
                     diff / step_u
                 };
                 let saved_init = *init_i;
                 let saved_step = *step_i;
-                Self::write_stack(state, ra, TValue::Integer(count as i64));
+                Self::write_stack(state, ra, TValue::Integer(count as LuaInteger));
                 Self::write_stack(state, ra + 1, TValue::Integer(saved_step));
                 Self::write_stack(state, ra + 2, TValue::Integer(saved_init));
             }
@@ -6962,7 +6934,7 @@ impl VmExecutor {
 
     /// 对应 C 的 forlimit: 将 limit 转为整数 (整数循环分支用)
     /// 返回 Ok(Some(i)) = 转换成功, Ok(None) = 超范围需跳过循环, Err(()) = tonumber 失败
-    fn forlimit<'a>(lim: &TValue<'a>, step: i64) -> Result<Option<i64>, ()> {
+    fn forlimit<'a>(lim: &TValue<'a>, step: LuaInteger) -> Result<Option<LuaInteger>, ()> {
         let mode = if step < 0 {
             F2IMode::Ceil
         } else {
@@ -6983,13 +6955,13 @@ impl VmExecutor {
             if step < 0 {
                 Ok(None)
             } else {
-                Ok(Some(i64::MAX))
+                Ok(Some(MAX_INTEGER))
             }
         } else {
             if step > 0 {
                 Ok(None)
             } else {
-                Ok(Some(i64::MIN))
+                Ok(Some(MIN_INTEGER))
             }
         }
     }
@@ -7229,7 +7201,7 @@ impl VmExecutor {
             for i in 0..n_actual {
                 let val = Self::read_stack(state, ra + 1 + i).clone();
                 let pos = last - n_actual + i;
-                t.set_int((pos + 1) as i64, val);
+                t.set_int((pos + 1) as LuaInteger, val);
             }
             // 表可能已增长（array.push / hash.insert），更新 GC 估算大小
             if let Some(id) = t.data.borrow().gc_header.id() {
@@ -7352,7 +7324,8 @@ impl VmExecutor {
             let nargs = if let TValue::Table(ref t) = table_val {
                 match t.get(&(state.string_table.intern_value("n"))) {
                     Some(TValue::Integer(n)) => {
-                        if n < 0 || (n as u64) > (i32::MAX as u64) / 2 {
+                        // 对应 C getnumargs: l_castS2U(n) > cast_uint(INT_MAX/2) 报错
+                        if (n as LuaUnsigned) > (i32::MAX as LuaUnsigned) / 2 {
                             state.pc = cur; // sync (C savepc): 错误行号需要当前指令
                             return Err(VmError::RuntimeError(
                                 "vararg table has no proper 'n'".to_string(),
@@ -7383,7 +7356,7 @@ impl VmExecutor {
 
             for i in 0..touse {
                 let val = if let TValue::Table(ref t) = table_val {
-                    t.get_int((i + 1) as i64)
+                    t.get_int((i + 1) as LuaInteger)
                         .unwrap_or(TValue::Nil(NilKind::Strict))
                 } else {
                     TValue::Nil(NilKind::Strict)
@@ -7466,7 +7439,7 @@ impl VmExecutor {
             }
         } else if let s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = &key {
             if lua_string_as_str(s) == "n" {
-                TValue::Integer(nextra as i64)
+                TValue::Integer(nextra as LuaInteger)
             } else {
                 TValue::Nil(NilKind::Strict)
             }
@@ -7564,11 +7537,11 @@ impl VmExecutor {
             let table = Table::with_capacity_in(state.alloc_slot(), nextra, 1);
             for i in 0..nextra {
                 let val = state.stack[vatab_pos + i].clone();
-                table.set_int((i + 1) as i64, val);
+                table.set_int((i + 1) as LuaInteger, val);
             }
             // t.n = nextra
             let key_n = state.string_table.intern_value("n");
-            table.set(key_n, TValue::Integer(nextra as i64));
+            table.set(key_n, TValue::Integer(nextra as LuaInteger));
             unsafe { state.gc_mut().register_table(&table) };
             // 把表放到 vatab_pos 位置，截断后续
             // nextra=0 时 vatab_pos 可能等于 stack_len，需要先扩展栈
@@ -8080,7 +8053,7 @@ impl VmExecutor {
 }
 
 #[cfg(test)]
-fn format_float(f: f64) -> String {
+fn format_float(f: LuaNumber) -> String {
     crate::float_utils::f64_to_string(f)
 }
 
@@ -8111,7 +8084,6 @@ mod tests {
             stack,
             Rc::new(RefCell::new(GlobalShared::new(
                 crate::mem::AllocOwner::new(Box::new(crate::mem::DefaultAllocator)),
-                &string_table,
             ))),
             string_table,
         );
@@ -8328,9 +8300,9 @@ mod tests {
 
     #[test]
     fn test_format_float() {
-        assert_eq!(format_float(f64::NAN), "nan");
-        assert_eq!(format_float(f64::INFINITY), "inf");
-        assert_eq!(format_float(f64::NEG_INFINITY), "-inf");
+        assert_eq!(format_float(LuaNumber::NAN), "nan");
+        assert_eq!(format_float(LuaNumber::INFINITY), "inf");
+        assert_eq!(format_float(LuaNumber::NEG_INFINITY), "-inf");
     }
 
     #[test]
@@ -9162,11 +9134,6 @@ mod tests {
     #[test]
     fn test_vm_error_all_displays() {
         assert_eq!(
-            format!("{}", VmError::TypeError("bad type".into())),
-            "type error: bad type"
-        );
-        assert_eq!(format!("{}", VmError::StackOverflow), "stack overflow");
-        assert_eq!(
             format!("{}", VmError::IllegalOpcode(99)),
             "illegal opcode: 99"
         );
@@ -9180,8 +9147,6 @@ mod tests {
     fn test_vm_error_debug() {
         let e = VmError::DivisionByZero;
         assert_eq!(format!("{:?}", e), "DivisionByZero");
-        let e = VmError::StackOverflow;
-        assert_eq!(format!("{:?}", e), "StackOverflow");
     }
 
     // ========================================================================

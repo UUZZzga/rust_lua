@@ -9,6 +9,7 @@
 //! - 数据通过 `TableDataRc`（Rc 语义，块经 MemState allocator 分配）共享，克隆 Table 共享同一份数据
 //! - `LuaTable` 封装为未来元方法支持预留接口
 
+use crate::config::{LuaInteger, LuaNumber, LuaUnsigned};
 use crate::gc::GCObjectHeader;
 use crate::mem::SlotAlloc;
 use crate::objects::{NilKind, TValue, TableData, TableDataRc, TableVec, WeakTable};
@@ -19,7 +20,7 @@ pub use crate::objects::Table;
 /// ceil(log2(x)) — 对应 C 的 luaO_ceillog2
 ///
 /// x=0→0, x=1→0, x=2→1, x=3→2, x=4→2, x=5→3 ...
-fn ceillog2(x: u64) -> u32 {
+fn ceillog2(x: LuaUnsigned) -> u32 {
     if x <= 1 {
         return 0;
     }
@@ -109,18 +110,6 @@ impl<'a> Table<'a> {
             data.key_to_bucket = None; // 释放 hashbrown 表的堆内存
             data.metatable = None; // metatable 也可能形成循环
         }
-    }
-
-    pub fn array_size(&self) -> usize {
-        self.data.borrow().array.len()
-    }
-    pub fn hash_size(&self) -> usize {
-        self.data
-            .borrow()
-            .hash_buckets
-            .iter()
-            .filter(|(_, v)| !matches!(v, TValue::Nil(NilKind::Empty)))
-            .count()
     }
 
     // ========================================================================
@@ -338,7 +327,7 @@ impl<'a> Table<'a> {
             _ => hash_get(&data, key),
         }
     }
-    pub fn get_int(&self, key: i64) -> Option<TValue<'a>> {
+    pub fn get_int(&self, key: LuaInteger) -> Option<TValue<'a>> {
         let data = self.data.borrow();
         if key > 0 {
             let idx = (key - 1) as usize;
@@ -403,7 +392,7 @@ impl<'a> Table<'a> {
         Self::hash_set(&mut data, &key, value, is_nil);
     }
 
-    pub fn set_int(&self, key: i64, value: TValue<'a>) {
+    pub fn set_int(&self, key: LuaInteger, value: TValue<'a>) {
         let is_nil = matches!(&value, TValue::Nil(NilKind::Strict));
         let mut data = self.data.borrow_mut();
         if key > 0 {
@@ -453,17 +442,17 @@ impl<'a> Table<'a> {
     }
     // ========================================================================
 
-    pub fn len(&self) -> i64 {
+    pub fn len(&self) -> LuaInteger {
         self.compute_len()
     }
 
-    fn compute_len(&self) -> i64 {
+    fn compute_len(&self) -> LuaInteger {
         let data = self.data.borrow();
         let asize = data.array.len();
         if asize == 0 {
             return match data.key_to_bucket.as_ref() {
-                Some(_) => Self::hash_boundary_impl(&data, asize as i64, 1u32),
-                None => asize as i64,
+                Some(_) => Self::hash_boundary_impl(&data, asize as LuaInteger, 1u32),
+                None => asize as LuaInteger,
             };
         }
 
@@ -481,11 +470,11 @@ impl<'a> Table<'a> {
                 }
                 limit += 1;
                 if !present_at(limit) {
-                    return limit as i64 - 1;
+                    return limit as LuaInteger - 1;
                 }
             }
             if !present_at(asize) {
-                return Self::bin_search_array(&data.array, limit, asize) as i64;
+                return Self::bin_search_array(&data.array, limit, asize) as LuaInteger;
             }
         } else {
             let mut limit = hint;
@@ -495,15 +484,15 @@ impl<'a> Table<'a> {
                 }
                 limit -= 1;
                 if present_at(limit) {
-                    return limit as i64;
+                    return limit as LuaInteger;
                 }
             }
-            return Self::bin_search_array(&data.array, 0, limit) as i64;
+            return Self::bin_search_array(&data.array, 0, limit) as LuaInteger;
         }
 
         match data.key_to_bucket.as_ref() {
-            Some(_) => Self::hash_boundary_impl(&data, asize as i64, 1u32),
-            None => asize as i64,
+            Some(_) => Self::hash_boundary_impl(&data, asize as LuaInteger, 1u32),
+            None => asize as LuaInteger,
         }
     }
 
@@ -528,43 +517,48 @@ impl<'a> Table<'a> {
     /// - 不存在：asize 即边界
     /// - 存在：进入指数增长 + 二分查找
     /// 使用 key_to_bucket 索引做 O(1) 存在性检查。
-    fn hash_boundary_impl(data: &TableData<'a>, asize: i64, seed: u32) -> i64 {
+    fn hash_boundary_impl(data: &TableData<'a>, asize: LuaInteger, seed: u32) -> LuaInteger {
         use TValue::Integer;
         let contains = |k: &TValue<'a>| data.idx_get(k).is_some();
         if !contains(&Integer(asize + 1)) {
             return asize;
         }
-        let max_int = i64::MAX as u64;
-        let mut i: u64 = (asize + 1) as u64;
+        // 对应 C: l_castS2U(LUA_MAXINTEGER) —— 边界搜索全程在 LuaUnsigned 域
+        let max_int = crate::config::MAX_INTEGER as LuaUnsigned;
+        let mut i: LuaUnsigned = (asize + 1) as LuaUnsigned;
         let mut rnd: u32 = seed;
-        let n = if asize > 0 { ceillog2(asize as u64) } else { 0 };
+        let n = if asize > 0 {
+            ceillog2(asize as LuaUnsigned)
+        } else {
+            0
+        };
         let mask: u32 = if n >= 32 { u32::MAX } else { (1u32 << n) - 1 };
-        let incr: u64 = (rnd & mask) as u64 + 1;
-        let mut j: u64 = if incr <= max_int - i { i + incr } else { i + 1 };
+        let incr: LuaUnsigned = (rnd & mask) as LuaUnsigned + 1;
+        let mut j: LuaUnsigned = if incr <= max_int - i { i + incr } else { i + 1 };
         rnd >>= n;
-        while contains(&Integer(j as i64)) {
+        while contains(&Integer(j as LuaInteger)) {
             i = j;
             if j <= max_int / 2 - 1 {
-                j = j * 2 + (rnd & 1) as u64;
+                j = j * 2 + (rnd & 1) as LuaUnsigned;
                 rnd >>= 1;
             } else {
                 j = max_int;
-                if !contains(&Integer(j as i64)) {
+                if !contains(&Integer(j as LuaInteger)) {
                     break;
                 } else {
-                    return j as i64;
+                    return j as LuaInteger;
                 }
             }
         }
         while j - i > 1 {
             let m = (i + j) / 2;
-            if contains(&Integer(m as i64)) {
+            if contains(&Integer(m as LuaInteger)) {
                 i = m;
             } else {
                 j = m;
             }
         }
-        i as i64
+        i as LuaInteger
     }
 
     // ========================================================================
@@ -577,7 +571,7 @@ impl<'a> Table<'a> {
             None => {
                 for (i, v) in data.array.iter().enumerate() {
                     if !matches!(v, TValue::Nil(NilKind::Empty)) {
-                        return Some((TValue::Integer(i as i64 + 1), v.clone()));
+                        return Some((TValue::Integer(i as LuaInteger + 1), v.clone()));
                     }
                 }
                 for (k, v) in &data.hash_buckets {
@@ -593,7 +587,7 @@ impl<'a> Table<'a> {
                     for j in idx..data.array.len() {
                         let v = &data.array[j];
                         if !matches!(v, TValue::Nil(NilKind::Empty)) {
-                            return Some((TValue::Integer(j as i64 + 1), v.clone()));
+                            return Some((TValue::Integer(j as LuaInteger + 1), v.clone()));
                         }
                     }
                     for (k, v) in &data.hash_buckets {
@@ -619,62 +613,6 @@ impl<'a> Table<'a> {
         }
     }
 
-    // ========================================================================
-    // rehash
-    // ========================================================================
-
-    pub fn rehash(&self, nasize: usize, nhsize: usize) {
-        let mut data = self.data.borrow_mut();
-        let mut all_entries: Vec<(TValue, TValue)> = Vec::new();
-
-        for (i, v) in data.array.iter().enumerate() {
-            if !matches!(v, TValue::Nil(NilKind::Empty)) {
-                all_entries.push((TValue::Integer(i as i64 + 1), v.clone()));
-            }
-        }
-        for (k, v) in data.hash_buckets.drain(..) {
-            if matches!(v, TValue::Nil(NilKind::Empty)) {
-                continue;
-            }
-            all_entries.push((k, v));
-        }
-
-        let old_asize = data.array.len();
-        if nasize > old_asize {
-            data.array.resize(nasize, TValue::Nil(NilKind::Empty));
-        } else {
-            data.array.truncate(nasize);
-        }
-        data.hash_buckets.clear();
-        data.hash_buckets.reserve(nhsize);
-        // 不再预设 key_to_bucket: 让下面的插入循环按需创建
-        data.key_to_bucket = None;
-        for (k, v) in all_entries {
-            match &k {
-                TValue::Integer(i) if *i > 0 => {
-                    let idx = (*i - 1) as usize;
-                    if idx < nasize {
-                        data.array[idx] = v;
-                    } else {
-                        let bidx = data.hash_buckets.len();
-                        data.hash_buckets.push((k.clone(), v));
-                        data.idx_insert(&k, bidx);
-                    }
-                }
-                _ => {
-                    let bidx = data.hash_buckets.len();
-                    data.hash_buckets.push((k.clone(), v));
-                    data.idx_insert(&k, bidx);
-                }
-            }
-        }
-    }
-
-    pub fn resize_array(&self, nasize: usize) {
-        let nhsize = self.data.borrow().hash_buckets.len();
-        self.rehash(nasize, nhsize);
-    }
-
     pub fn mem_size(&self) -> usize {
         let data = self.data.borrow();
         let mut size = std::mem::size_of::<Table>()
@@ -690,26 +628,27 @@ impl<'a> Table<'a> {
     }
 }
 
-/// 浮点数键转换为整数键 — 对应 C 的 `lua_numbertointeger`
+/// 浮点数键转换为整数键 — 对应 C 的 `lua_numbertointeger` (F2Ieq 模式)
 ///
-/// 当浮点数能精确表示为 i64 范围内的整数时返回该整数。
-/// 包括 `-0.0 → 0`；排除 NaN、Inf 和超出 i64 范围的值。
+/// 当浮点数能精确表示为 `LuaInteger` 范围内的整数时返回该整数。
+/// 包括 `-0.0 → 0`；排除 NaN、Inf 和超出范围的值。
 ///
 /// 对应 C 实现:
 /// ```c
 /// #define lua_numbertointeger(n,p) \
 ///   ((*(p) = (lua_Integer)(n)), (lua_Number)(*(p)) == (n))
 /// ```
-pub(crate) fn float_key_to_int(f: f64) -> Option<i64> {
-    // 范围检查：i64::MAX as f64 实际是 2^63（向上舍入），所以 < i64::MAX as f64
-    // 能正确排除 2^63 及以上的值；NaN 与任何数比较都是 false，会被排除
-    if f >= i64::MIN as f64 && f < i64::MAX as f64 {
-        let i = f as i64;
-        if (i as f64) == f {
-            return Some(i);
-        }
+pub(crate) fn float_key_to_int(f: LuaNumber) -> Option<LuaInteger> {
+    // 范围检查走 config::number_to_integer (C 的 lua_numbertointeger:
+    // 上界为 -(LuaNumber)MIN_INTEGER 开区间, 故 2^63 及以上被排除;
+    // NaN 与任何数比较都是 false, 同样被排除)。
+    // 随后用往返比较保证「精确整数值」(对应 C 的 luaV_flttointeger 的 F2Ieq)。
+    let i = crate::config::number_to_integer(f)?;
+    if (i as LuaNumber) == f {
+        Some(i)
+    } else {
+        None
     }
-    None
 }
 
 // ============================================================================
@@ -730,8 +669,6 @@ mod tests {
     fn test_table_new() {
         let alloc = crate::mem::TestAlloc::new();
         let t = Table::new_in(alloc.slot());
-        assert_eq!(t.array_size(), 0);
-        assert_eq!(t.hash_size(), 0);
         assert!(!t.has_metatable());
         assert_eq!(t.len(), 0);
     }
@@ -744,13 +681,6 @@ mod tests {
         for v in &data.array {
             assert!(matches!(v, TValue::Nil(NilKind::Empty)));
         }
-    }
-    #[test]
-    fn test_table_default() {
-        let alloc = crate::mem::TestAlloc::new();
-        let t = Table::new_in(alloc.slot());
-        assert_eq!(t.array_size(), 0);
-        assert_eq!(t.hash_size(), 0);
     }
     /// 表的三个内部容器（array / hash_buckets / key_to_bucket）都携带并使用
     /// MemState allocator 槽（对应 C 表经 global_State.allocf 分配）。
@@ -792,7 +722,7 @@ mod tests {
 
         // 写数组元素 → array 缓冲区经自定义分配器扩容
         let n0 = counter.get();
-        for i in 1..=8i64 {
+        for i in 1..=8 {
             t.set_int(i, TValue::Integer(i));
         }
         assert!(counter.get() > n0, "array 缓冲区应经自定义分配器");
@@ -934,15 +864,6 @@ mod tests {
         ));
     }
     #[test]
-    fn test_set_nil_removes_from_hash() {
-        let alloc = crate::mem::TestAlloc::new();
-        let t = Table::new_in(alloc.slot());
-        t.set_int(100, TValue::Integer(42));
-        assert_eq!(t.hash_size(), 1);
-        t.set_int(100, TValue::Nil(NilKind::Strict));
-        assert_eq!(t.hash_size(), 0);
-    }
-    #[test]
     fn test_set_string_key() {
         let alloc = crate::mem::TestAlloc::new();
         let t = Table::new_in(alloc.slot());
@@ -952,7 +873,6 @@ mod tests {
             "key".as_bytes(),
         ));
         t.set(key.clone(), TValue::Integer(7));
-        assert_eq!(t.hash_size(), 1);
         let lookup = key;
         assert_eq!(t.get(&lookup), Some(TValue::Integer(7)));
     }
@@ -962,7 +882,6 @@ mod tests {
         let t = Table::new_in(alloc.slot());
         t.set(TValue::Boolean(true), TValue::Integer(1));
         t.set(TValue::Boolean(false), TValue::Integer(0));
-        assert_eq!(t.hash_size(), 2);
         assert_eq!(t.get(&TValue::Boolean(true)), Some(TValue::Integer(1)));
         assert_eq!(t.get(&TValue::Boolean(false)), Some(TValue::Integer(0)));
     }
@@ -975,8 +894,6 @@ mod tests {
         }
         // 顺序插入 1..100：set_int 的 array 扩展逻辑让连续正整数键进 array
         assert_eq!(t.len(), 100);
-        assert_eq!(t.array_size(), 100);
-        assert_eq!(t.hash_size(), 0);
         assert_eq!(t.get_int(50), Some(TValue::Integer(500)));
     }
     // ------------------------------------------------------------------------
@@ -1156,103 +1073,11 @@ mod tests {
         assert!(all.contains(&TValue::Integer(1)));
         assert!(all.contains(&TValue::Integer(3)));
     }
-    // ------------------------------------------------------------------------
-    // rehash
-    // ------------------------------------------------------------------------
-
-    #[test]
-    fn test_rehash_expand_array() {
-        let alloc = crate::mem::TestAlloc::new();
-        let t = Table::new_in(alloc.slot());
-        t.set_int(1, TValue::Integer(10));
-        t.set_int(3, TValue::Integer(30));
-        // set_int(1) 顺序扩展 array 到 1；set_int(3) 因 idx=2 != array.len()=1 进 hash
-        assert_eq!(t.array_size(), 1);
-        assert_eq!(t.hash_size(), 1);
-
-        t.rehash(3, 0);
-        assert_eq!(t.array_size(), 3);
-        assert_eq!(t.get_int(1), Some(TValue::Integer(10)));
-        assert_eq!(t.get_int(3), Some(TValue::Integer(30)));
-        assert!(matches!(
-            &t.data.borrow().array[1],
-            TValue::Nil(NilKind::Empty)
-        ));
-    }
-    #[test]
-    fn test_rehash_shrink_array() {
-        let alloc = crate::mem::TestAlloc::new();
-        let t = Table::with_capacity_in(alloc.slot(), 5, 0);
-        for i in 1..=5 {
-            t.set_int(i, TValue::Integer(i * 10));
-        }
-        assert_eq!(t.array_size(), 5);
-
-        t.rehash(2, 0);
-        assert_eq!(t.array_size(), 2);
-        assert_eq!(t.get_int(1), Some(TValue::Integer(10)));
-        assert_eq!(t.get_int(2), Some(TValue::Integer(20)));
-        assert_eq!(t.hash_size(), 3);
-        assert_eq!(t.get_int(3), Some(TValue::Integer(30)));
-        assert_eq!(t.get_int(5), Some(TValue::Integer(50)));
-    }
-    #[test]
-    fn test_resize_array() {
-        let alloc = crate::mem::TestAlloc::new();
-        let t = Table::with_capacity_in(alloc.slot(), 2, 0);
-        t.set_int(1, TValue::Integer(10));
-        t.set_int(2, TValue::Integer(20));
-        t.resize_array(4);
-        assert_eq!(t.array_size(), 4);
-        assert_eq!(t.get_int(1), Some(TValue::Integer(10)));
-        assert_eq!(t.get_int(2), Some(TValue::Integer(20)));
-    }
-    #[test]
-    fn test_rehash_preserves_string_keys() {
-        let alloc = crate::mem::TestAlloc::new();
-        let t = Table::new_in(alloc.slot());
-        let key = TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
-            0,
-            0,
-            "mykey".as_bytes(),
-        ));
-        t.set(key.clone(), TValue::Integer(77));
-        t.set_int(1, TValue::Integer(10));
-
-        t.rehash(5, 10);
-        assert_eq!(t.get_int(1), Some(TValue::Integer(10)));
-        let lookup = key;
-        assert_eq!(t.get(&lookup), Some(TValue::Integer(77)));
-    }
-    #[test]
-    fn test_rehash_twice() {
-        let alloc = crate::mem::TestAlloc::new();
-        let t = Table::new_in(alloc.slot());
-        t.set_int(1, TValue::Integer(10));
-        t.set_int(2, TValue::Integer(20));
-
-        t.rehash(5, 0);
-        assert_eq!(t.array_size(), 5);
-        assert_eq!(t.len(), 2);
-
-        t.rehash(0, 10);
-        assert_eq!(t.array_size(), 0);
-        assert_eq!(t.hash_size(), 2);
-        assert_eq!(t.get_int(1), Some(TValue::Integer(10)));
-    }
     #[test]
     fn test_mem_size() {
         let alloc = crate::mem::TestAlloc::new();
         let t = Table::with_capacity_in(alloc.slot(), 10, 16);
         let size = t.mem_size();
         assert!(size > 0);
-    }
-    #[test]
-    fn test_new_table_functions() {
-        let alloc = crate::mem::TestAlloc::new();
-        let t = Table::new_in(alloc.slot());
-        assert_eq!(t.array_size(), 0);
-        let t2 = Table::with_capacity_in(alloc.slot(), 5, 8);
-        assert_eq!(t2.array_size(), 5);
     }
 }

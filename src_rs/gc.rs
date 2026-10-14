@@ -85,21 +85,10 @@ impl GCColor {
 pub enum GCAge {
     New = 0,
     Survival = 1,
-    Old0 = 2,
     Old1 = 3,
     Old = 4,
     Touched1 = 5,
     Touched2 = 6,
-}
-
-impl GCAge {
-    pub fn is_young(&self) -> bool {
-        matches!(self, GCAge::New | GCAge::Survival)
-    }
-
-    pub fn is_old(&self) -> bool {
-        *self > GCAge::Survival
-    }
 }
 
 impl Default for GCAge {
@@ -118,20 +107,8 @@ pub enum GCPhase {
     EnterAtomic = 1,
     Atomic = 2,
     SweepAllGC = 3,
-    SweepFinObj = 4,
-    SweepToBeFnz = 5,
     SweepEnd = 6,
-    CallFin = 7,
     Pause = 8,
-}
-
-impl GCPhase {
-    pub fn is_sweep_phase(&self) -> bool {
-        matches!(
-            self,
-            GCPhase::SweepAllGC | GCPhase::SweepFinObj | GCPhase::SweepToBeFnz | GCPhase::SweepEnd
-        )
-    }
 }
 
 // ============================================================================
@@ -174,15 +151,6 @@ impl<'a> GCObjectMeta<'a> {
 }
 
 // ============================================================================
-// GCObject — GC 可追踪对象 trait
-// ============================================================================
-
-pub trait GCObject {
-    fn gc_id(&self) -> GCObjectId;
-    fn traverse(&self, gc: &GCState);
-}
-
-// ============================================================================
 // GCObjectHeader — 可嵌入的 GC 对象头部
 // ============================================================================
 
@@ -217,10 +185,6 @@ impl GCObjectHeader {
 
     pub fn set_id(&self, id: GCObjectId) {
         self.id.set(Some(NonZeroU32::new(id.0).unwrap()));
-    }
-
-    pub fn clear_id(&self) {
-        self.id.set(None);
     }
 }
 
@@ -590,11 +554,10 @@ pub struct GCState<'a> {
     pub gc_estimate: Cell<usize>,
     /// 无 gc_header 对象（String/Proto/CClosure/RustClosure/LuaThread）的估算占用。
     /// 这些对象不调用 register_object，无法通过 gc_estimate 跟踪。
-    /// 创建时通过 charge_extra 增加（触发 GC），collect_gc 后通过 set_extra_estimate 重算（精确）。
+    /// 创建后由 collect_gc 通过 set_extra_estimate 重算（精确）。
     pub gc_extra_estimate: Cell<usize>,
     pub gc_stop: Cell<u8>,
     pub gc_params: [Cell<i32>; 6],
-    pub in_minor: Cell<bool>,
     next_collect_threshold: Cell<usize>,
     pub step_accum: Cell<usize>,
     /// GC 是否正在运行（collect_gc 进行中）— 用于阻止 finalizer 中重入
@@ -640,7 +603,6 @@ impl<'a> GCState<'a> {
                 Cell::new(0),
                 Cell::new(0),
             ],
-            in_minor: Cell::new(false),
             next_collect_threshold: Cell::new(200000),
             step_accum: Cell::new(0),
             gc_running: Cell::new(false),
@@ -656,14 +618,6 @@ impl<'a> GCState<'a> {
         gc
     }
 
-    pub fn default_generational() -> Self {
-        let gc = GCState::new(GCMode::Generational);
-        gc.set_gc_param(Self::PARAM_MINORMUL, 20);
-        gc.set_gc_param(Self::PARAM_MAJORMINOR, 50);
-        gc.set_gc_param(Self::PARAM_MINORMAJOR, 70);
-        gc
-    }
-
     /// GC 参数索引（与 C 的 LUA_GCP* 一致）
     pub const PARAM_MINORMUL: usize = 0;
     pub const PARAM_MAJORMINOR: usize = 1;
@@ -671,11 +625,6 @@ impl<'a> GCState<'a> {
     pub const PARAM_PAUSE: usize = 3;
     pub const PARAM_STEPMUL: usize = 4;
     pub const PARAM_STEPSIZE: usize = 5;
-
-    /// 返回当前 GC 模式
-    pub fn current_mode(&self) -> GCMode {
-        self.mode.get()
-    }
 
     /// 切换 GC 模式，返回之前的模式
     pub fn set_mode(&self, mode: GCMode) -> GCMode {
@@ -763,24 +712,6 @@ impl<'a> GCState<'a> {
         t.data.borrow().gc_header.set_id(id);
     }
 
-    pub fn unregister_object(&self, id: GCObjectId) {
-        let mut objs = self.objects.borrow_mut();
-        if (id.0 as usize) < objs.metas.len() {
-            if let Some(meta) = &objs.metas[id.0 as usize] {
-                let charged = meta.size.max(32);
-                let estimate = self.gc_estimate.get();
-                self.gc_estimate.set(estimate.saturating_sub(charged));
-            }
-            objs.metas[id.0 as usize] = None;
-            // 收集释放的 ID 供 register_object 重用
-            objs.free_ids.push(id.0);
-            // 从 all_objects 移除（swap_remove O(1)，顺序不影响正确性）
-            if let Some(pos) = objs.all_objects.iter().position(|&x| x == id.0) {
-                objs.all_objects.swap_remove(pos);
-            }
-        }
-    }
-
     pub(crate) fn meta(&self, id: GCObjectId) -> Option<std::cell::Ref<'_, GCObjectMeta<'a>>> {
         let objs = self.objects.borrow();
         if (id.0 as usize) < objs.metas.len() && objs.metas[id.0 as usize].is_some() {
@@ -806,24 +737,9 @@ impl<'a> GCState<'a> {
         }
     }
 
-    pub fn is_registered(&self, id: GCObjectId) -> bool {
-        let objs = self.objects.borrow();
-        (id.0 as usize) < objs.metas.len() && objs.metas[id.0 as usize].is_some()
-    }
-
-    /// 返回已注册对象数量（含已释放但未复用的 ID 槽位）
-    pub fn metas_len(&self) -> usize {
-        self.objects.borrow().metas.len()
-    }
-
     /// 返回实际存活（非 None）的对象数 — O(1) 直接读 all_objects 长度
     pub fn active_count(&self) -> usize {
         self.objects.borrow().all_objects.len()
-    }
-
-    /// 返回 free_ids 长度
-    pub fn free_ids_count(&self) -> usize {
-        self.objects.borrow().free_ids.len()
     }
 
     /// 返回当前 GC 触发阈值
@@ -840,19 +756,9 @@ impl<'a> GCState<'a> {
     // 无 gc_header 对象的计费
     // ------------------------------------------------------------------------
 
-    pub fn charge_extra(&self, size: usize) {
-        let cur = self.gc_extra_estimate.get();
-        self.gc_extra_estimate.set(cur + size);
-    }
-
     /// 设置 extra estimate（collect_gc 后重算使用）。
     pub fn set_extra_estimate(&self, size: usize) {
         self.gc_extra_estimate.set(size);
-    }
-
-    /// 返回 extra estimate（无 gc_header 对象的估算占用）。
-    pub fn extra_estimate(&self) -> usize {
-        self.gc_extra_estimate.get()
     }
 
     /// 返回总估算占用 = gc_estimate（已注册对象）+ gc_extra_estimate（无 gc_header 对象）。
@@ -985,10 +891,6 @@ impl<'a> GCState<'a> {
     // 颜色操作
     // ========================================================================
 
-    pub fn color(&self, id: GCObjectId) -> Option<GCColor> {
-        self.meta(id).map(|m| m.color)
-    }
-
     pub fn set_color(&self, id: GCObjectId, color: GCColor) {
         if let Some(mut meta) = self.meta_mut(id) {
             meta.color = color;
@@ -1002,28 +904,6 @@ impl<'a> GCState<'a> {
 
     pub fn is_black(&self, id: GCObjectId) -> bool {
         self.meta(id).map(|m| m.color.is_black()).unwrap_or(false)
-    }
-
-    pub fn is_gray(&self, id: GCObjectId) -> bool {
-        self.meta(id).map(|m| m.color.is_gray()).unwrap_or(false)
-    }
-
-    pub fn nw2black(&self, id: GCObjectId) {
-        if let Some(mut meta) = self.meta_mut(id) {
-            let cw = self.current_white.get();
-            debug_assert!(!meta.color.is_white(cw), "nw2black: object is white");
-            meta.color = GCColor::Black;
-        }
-    }
-
-    pub fn change_white(&self, id: GCObjectId) {
-        if let Some(mut meta) = self.meta_mut(id) {
-            meta.color = match meta.color {
-                GCColor::White0 => GCColor::White1,
-                GCColor::White1 => GCColor::White0,
-                other => other,
-            };
-        }
     }
 
     // ========================================================================
@@ -1056,88 +936,9 @@ impl<'a> GCState<'a> {
         self.gray.borrow().is_empty()
     }
 
-    pub fn gray_again_is_empty(&self) -> bool {
-        self.gray_again.borrow().is_empty()
-    }
-
-    pub fn push_weak(&self, id: GCObjectId) {
-        self.weak.borrow_mut().push_back(id);
-    }
-
-    pub fn push_all_weak(&self, id: GCObjectId) {
-        self.all_weak.borrow_mut().push_back(id);
-    }
-
-    pub fn push_ephemeron(&self, id: GCObjectId) {
-        self.ephemeron.borrow_mut().push_back(id);
-    }
-
-    // ========================================================================
-    // 年龄操作 (分代模式)
-    // ========================================================================
-
-    pub fn age(&self, id: GCObjectId) -> Option<GCAge> {
-        self.meta(id).map(|m| m.age)
-    }
-
-    pub fn set_age(&self, id: GCObjectId, age: GCAge) {
-        if let Some(mut meta) = self.meta_mut(id) {
-            meta.age = age;
-        }
-    }
-
-    pub fn is_young(&self, id: GCObjectId) -> bool {
-        self.meta(id).map(|m| m.age.is_young()).unwrap_or(false)
-    }
-
-    pub fn is_old(&self, id: GCObjectId) -> bool {
-        self.meta(id).map(|m| m.age.is_old()).unwrap_or(false)
-    }
-
-    pub fn promote_age(&self, id: GCObjectId) {
-        if let Some(mut meta) = self.meta_mut(id) {
-            match meta.age {
-                GCAge::New => meta.age = GCAge::Survival,
-                GCAge::Survival => meta.age = GCAge::Old1,
-                GCAge::Old0 => meta.age = GCAge::Old1,
-                GCAge::Old1 => meta.age = GCAge::Old,
-                GCAge::Touched1 => meta.age = GCAge::Touched2,
-                GCAge::Touched2 => meta.age = GCAge::Old,
-                GCAge::Old => {}
-            }
-        }
-    }
-
     // ========================================================================
     // 写屏障 (Write Barriers)
     // ========================================================================
-
-    pub fn obj_barrier(&self, p: GCObjectId, o: GCObjectId) {
-        if self.is_black(p) && self.is_white(o) {
-            self.make_gray(o);
-        }
-    }
-
-    /// 值写屏障: 当 p 被赋值为可 GC 类型的 v 时调用
-    pub fn barrier_value(&self, p: GCObjectId, v: &crate::objects::TValue) {
-        if !self.is_black(p) {
-            return;
-        }
-        match v {
-            TValue::Table(_)
-            | TValue::LClosure(_)
-            | TValue::CClosure(_)
-            | TValue::Thread(_)
-            | TValue::UserData(_)
-            | TValue::LongStr(_)
-            | TValue::ShortStr(_) => {
-                // 这些是 GC 对象类型，需要从 TValue 中提取 GCObjectId
-                // 当前 TValue 变体持有具体类型值，不包含 ID。
-                // 在完整集成时，需要将 TValue 改为持有 GCObjectId + Ref。
-            }
-            _ => {}
-        }
-    }
 
     /// 后向写屏障 (luaC_barrierback_)
     /// 当黑色对象 p 被写入时，将其加入 grayagain 队列
@@ -1165,10 +966,6 @@ impl<'a> GCState<'a> {
     // GC 不变式
     // ========================================================================
 
-    pub fn keep_invariant(&self) -> bool {
-        (self.phase.get() as u8) <= (GCPhase::Atomic as u8)
-    }
-
     pub fn is_running(&self) -> bool {
         self.gc_stop.get() == 0
     }
@@ -1176,10 +973,6 @@ impl<'a> GCState<'a> {
     /// GC 是否正在执行 collect_gc（用于阻止 finalizer 中重入）
     pub fn is_gc_running(&self) -> bool {
         self.gc_running.get()
-    }
-
-    pub fn is_sweep_phase(&self) -> bool {
-        self.phase.get().is_sweep_phase()
     }
 
     // ========================================================================
@@ -1190,15 +983,6 @@ impl<'a> GCState<'a> {
         // 增量 step 机器无根标记 (enter_cycle 不标记根, sweep 为空), 实际回收由
         // maybe_collect_gc (阈值触发 full collect_gc) 完成。这里仅在确有 gray 工作
         // 或机器处于周期中途时推进, 避免每次分配都空转 phase 机器 (~130ns/次)。
-        if self.gc_debt.get() <= 0 {
-            let phase = self.phase.get();
-            if phase != GCPhase::Pause || !self.gray_is_empty() {
-                self.step();
-            }
-        }
-    }
-
-    pub fn check_gc(&mut self) {
         if self.gc_debt.get() <= 0 {
             let phase = self.phase.get();
             if phase != GCPhase::Pause || !self.gray_is_empty() {
@@ -1221,31 +1005,8 @@ impl<'a> GCState<'a> {
             }
             GCPhase::Atomic => self.enter_sweep(),
             GCPhase::SweepAllGC => self.sweep_step(),
-            GCPhase::SweepFinObj => self.sweep_step(),
-            GCPhase::SweepToBeFnz => self.sweep_step(),
             GCPhase::SweepEnd => self.end_cycle(),
-            GCPhase::CallFin => self.phase.set(GCPhase::Pause),
         }
-    }
-
-    /// 执行最多 n 步 GC 工作，返回是否完成一个完整周期（phase 回到 Pause）
-    pub fn step_n(&mut self, n: usize) -> bool {
-        if !self.is_running() {
-            return self.phase.get() == GCPhase::Pause;
-        }
-        let iters = n.max(1);
-        for _ in 0..iters {
-            self.step();
-            if self.phase.get() == GCPhase::Pause {
-                return true;
-            }
-        }
-        false
-    }
-
-    /// 当前是否处于 Pause 阶段（即一个周期已完成）
-    pub fn is_paused(&self) -> bool {
-        self.phase.get() == GCPhase::Pause
     }
 
     // ========================================================================
@@ -1342,7 +1103,6 @@ impl<'a> GCState<'a> {
                 match meta.age {
                     GCAge::New => meta.age = GCAge::Survival,
                     GCAge::Survival => meta.age = GCAge::Old1,
-                    GCAge::Old0 => meta.age = GCAge::Old1,
                     GCAge::Old1 => meta.age = GCAge::Old,
                     GCAge::Touched1 => meta.age = GCAge::Touched2,
                     GCAge::Touched2 => meta.age = GCAge::Old,
@@ -1365,45 +1125,13 @@ impl<'a> GCState<'a> {
         self.gc_debt.set(step_size);
     }
 
-    pub fn debt(&self) -> isize {
-        self.gc_debt.get()
-    }
-
     pub fn set_debt(&self, debt: isize) {
         self.gc_debt.set(debt);
     }
 
     // ========================================================================
-    // 完整 GC (luaC_fullgc)
-    // ========================================================================
-
-    pub fn full_gc(&mut self) {
-        if !self.is_running() {
-            return;
-        }
-
-        self.enter_cycle();
-
-        while !self.gray_is_empty() {
-            while let Some(id) = self.pop_gray() {
-                self.set_color(id, GCColor::Black);
-            }
-        }
-
-        self.phase.set(GCPhase::EnterAtomic);
-        self.enter_atomic();
-        self.enter_sweep();
-        self.sweep_step();
-        self.end_cycle();
-    }
-
-    // ========================================================================
     // 对象大小
     // ========================================================================
-
-    pub fn obj_size(&self, id: GCObjectId) -> Option<usize> {
-        self.meta(id).map(|m| m.size)
-    }
 
     pub fn set_obj_size(&self, id: GCObjectId, size: usize) {
         if let Some(mut meta) = self.meta_mut(id) {
@@ -1421,48 +1149,11 @@ impl<'a> GCState<'a> {
     // 标记
     // ========================================================================
 
-    pub fn mark_value(&self, _value: &crate::objects::TValue) {}
-
     pub fn mark_object(&self, id: GCObjectId) {
         if self.is_white(id) {
             self.make_gray(id);
         }
     }
-
-    pub fn fix(&self, id: GCObjectId) {
-        if self.is_white(id) {
-            self.make_gray(id);
-            self.set_color(id, GCColor::Black);
-        }
-    }
-
-    pub fn register_root(&self, id: GCObjectId) {
-        self.fix(id);
-    }
-}
-
-// ============================================================================
-// 便捷的写屏障函数
-// ============================================================================
-
-pub fn gc_obj_barrier(gc: &GCState, p_id: GCObjectId, o_id: GCObjectId) {
-    gc.obj_barrier(p_id, o_id);
-}
-
-pub fn gc_barrier_back(gc: &GCState, p_id: GCObjectId) {
-    gc.barrier_back(p_id);
-}
-
-pub fn gc_obj_barrier_back(gc: &GCState, p_id: GCObjectId, o_id: GCObjectId) {
-    gc.obj_barrier_back(p_id, o_id);
-}
-
-pub fn gc_cond_gc(gc: &mut GCState) {
-    gc.cond_gc();
-}
-
-pub fn gc_check_gc(gc: &mut GCState) {
-    gc.check_gc();
 }
 
 // ============================================================================
@@ -2547,54 +2238,11 @@ mod tests {
     }
 
     #[test]
-    fn test_gc_age_is_young() {
-        assert!(GCAge::New.is_young());
-        assert!(GCAge::Survival.is_young());
-        assert!(!GCAge::Old0.is_young());
-        assert!(!GCAge::Old.is_young());
-    }
-
-    #[test]
-    fn test_gc_age_is_old() {
-        assert!(!GCAge::New.is_old());
-        assert!(!GCAge::Survival.is_old());
-        assert!(GCAge::Old0.is_old());
-        assert!(GCAge::Old1.is_old());
-        assert!(GCAge::Old.is_old());
-        assert!(GCAge::Touched1.is_old());
-        assert!(GCAge::Touched2.is_old());
-    }
-
-    #[test]
-    fn test_gc_phase_sweep_detection() {
-        assert!(GCPhase::SweepAllGC.is_sweep_phase());
-        assert!(GCPhase::SweepFinObj.is_sweep_phase());
-        assert!(GCPhase::SweepToBeFnz.is_sweep_phase());
-        assert!(GCPhase::SweepEnd.is_sweep_phase());
-        assert!(!GCPhase::Propagate.is_sweep_phase());
-        assert!(!GCPhase::Pause.is_sweep_phase());
-    }
-
-    #[test]
     fn test_gc_state_creation() {
         let gc = GCState::default_incremental();
         assert_eq!(gc.phase.get(), GCPhase::Pause);
         assert!(gc.gray_is_empty());
         assert!(gc.is_running());
-    }
-
-    #[test]
-    fn test_gc_state_generational() {
-        let gc = GCState::default_generational();
-        assert_eq!(gc.mode.get(), GCMode::Generational);
-    }
-
-    #[test]
-    fn test_register_object() {
-        let gc = GCState::default_incremental();
-        let id = gc.register_object(64, WeakValue::Nil(NilKind::Strict));
-        assert!(gc.is_registered(id));
-        assert!(gc.is_white(id));
     }
 
     #[test]
@@ -2606,57 +2254,11 @@ mod tests {
     }
 
     #[test]
-    fn test_unregister_object() {
-        let gc = GCState::default_incremental();
-        let id = gc.register_object(256, WeakValue::Nil(NilKind::Strict));
-        assert!(gc.is_registered(id));
-        gc.unregister_object(id);
-        assert!(!gc.is_registered(id));
-    }
-
-    #[test]
-    fn test_register_object_debt() {
-        let gc = GCState::default_incremental();
-        let initial_debt = gc.debt();
-        let _id = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        assert!(gc.debt() < initial_debt);
-    }
-
-    #[test]
     fn test_register_object_estimate() {
         let gc = GCState::default_incremental();
         let initial_estimate = gc.gc_estimate.get();
         let _id = gc.register_object(500, WeakValue::Nil(NilKind::Strict));
         assert!(gc.gc_estimate.get() >= initial_estimate + 500);
-    }
-
-    #[test]
-    fn test_set_color_and_query() {
-        let gc = GCState::default_incremental();
-        let id = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        assert!(gc.is_white(id));
-        gc.set_color(id, GCColor::Gray);
-        assert!(gc.is_gray(id));
-        gc.set_color(id, GCColor::Black);
-        assert!(gc.is_black(id));
-    }
-
-    #[test]
-    fn test_nw2black() {
-        let gc = GCState::default_incremental();
-        let id = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        gc.set_color(id, GCColor::Gray);
-        gc.nw2black(id);
-        assert!(gc.is_black(id));
-    }
-
-    #[test]
-    fn test_change_white() {
-        let gc = GCState::default_incremental();
-        let id = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        gc.set_color(id, GCColor::White0);
-        gc.change_white(id);
-        assert_eq!(gc.color(id), Some(GCColor::White1));
     }
 
     #[test]
@@ -2682,64 +2284,6 @@ mod tests {
     }
 
     #[test]
-    fn test_gray_again_queue() {
-        let gc = GCState::default_incremental();
-        let id = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        gc.make_gray_again(id);
-        assert!(!gc.gray_again_is_empty());
-        assert_eq!(gc.pop_gray_again(), Some(id));
-        assert!(gc.gray_again_is_empty());
-    }
-
-    #[test]
-    fn test_promote_age() {
-        let gc = GCState::default_generational();
-        let id = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        assert!(gc.is_young(id));
-        gc.promote_age(id);
-        assert_eq!(gc.age(id), Some(GCAge::Survival));
-        gc.promote_age(id);
-        assert_eq!(gc.age(id), Some(GCAge::Old1));
-        gc.promote_age(id);
-        assert_eq!(gc.age(id), Some(GCAge::Old));
-        gc.promote_age(id);
-        assert_eq!(gc.age(id), Some(GCAge::Old));
-    }
-
-    #[test]
-    fn test_obj_barrier_black_points_to_white() {
-        let gc = GCState::default_incremental();
-        let p = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        let o = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        gc.set_color(p, GCColor::Black);
-        gc.set_color(o, GCColor::White0);
-        gc.obj_barrier(p, o);
-        assert!(gc.is_gray(o));
-    }
-
-    #[test]
-    fn test_obj_barrier_no_effect_when_not_black() {
-        let gc = GCState::default_incremental();
-        let p = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        let o = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        gc.set_color(p, GCColor::White0);
-        gc.set_color(o, GCColor::White0);
-        gc.obj_barrier(p, o);
-        assert!(gc.is_white(o));
-    }
-
-    #[test]
-    fn test_obj_barrier_no_effect_when_o_not_white() {
-        let gc = GCState::default_incremental();
-        let p = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        let o = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        gc.set_color(p, GCColor::Black);
-        gc.set_color(o, GCColor::Gray);
-        gc.obj_barrier(p, o);
-        assert!(gc.is_gray(o));
-    }
-
-    #[test]
     fn test_barrier_back() {
         let gc = GCState::default_incremental();
         let p = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
@@ -2754,18 +2298,7 @@ mod tests {
         let p = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
         gc.set_color(p, GCColor::Gray);
         gc.barrier_back(p);
-        assert!(gc.gray_again_is_empty());
-    }
-
-    #[test]
-    fn test_obj_barrier_back() {
-        let gc = GCState::default_incremental();
-        let p = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        let o = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        gc.set_color(p, GCColor::Black);
-        gc.set_color(o, GCColor::White0);
-        gc.obj_barrier_back(p, o);
-        assert_eq!(gc.pop_gray_again(), Some(p));
+        assert_eq!(gc.pop_gray_again(), None);
     }
 
     #[test]
@@ -2779,41 +2312,11 @@ mod tests {
     }
 
     #[test]
-    fn test_full_gc() {
-        let mut gc = GCState::default_incremental();
-        let _id1 = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        let id2 = gc.register_object(200, WeakValue::Nil(NilKind::Strict));
-        gc.fix(id2);
-        gc.full_gc();
-        assert_eq!(gc.phase.get(), GCPhase::Pause);
-    }
-
-    #[test]
-    fn test_fix_object() {
-        let gc = GCState::default_incremental();
-        let id = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        assert!(gc.is_white(id));
-        gc.fix(id);
-        assert!(gc.is_black(id));
-    }
-
-    #[test]
     fn test_gc_stop_and_running() {
         let gc = GCState::default_incremental();
         assert!(gc.is_running());
         gc.gc_stop.set(1);
         assert!(!gc.is_running());
-    }
-
-    #[test]
-    fn test_keep_invariant() {
-        let gc = GCState::default_incremental();
-        gc.phase.set(GCPhase::Propagate);
-        assert!(gc.keep_invariant());
-        gc.phase.set(GCPhase::Atomic);
-        assert!(gc.keep_invariant());
-        gc.phase.set(GCPhase::SweepAllGC);
-        assert!(!gc.keep_invariant());
     }
 
     #[test]
@@ -2827,89 +2330,6 @@ mod tests {
         let header = GCObjectHeader::new();
         header.set_id(GCObjectId(42));
         assert_eq!(header.id(), Some(GCObjectId(42)));
-    }
-
-    #[test]
-    fn test_gc_object_header_clear() {
-        let header = GCObjectHeader::new();
-        header.set_id(GCObjectId(100));
-        header.clear_id();
-        assert!(header.id().is_none());
-    }
-
-    #[test]
-    fn test_gc_obj_barrier_convenience() {
-        let gc = GCState::default_incremental();
-        let p = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        let o = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        gc.set_color(p, GCColor::Black);
-        gc.set_color(o, GCColor::White0);
-        gc_obj_barrier(&gc, p, o);
-        assert!(gc.is_gray(o));
-    }
-
-    #[test]
-    fn test_gc_barrier_back_convenience() {
-        let gc = GCState::default_incremental();
-        let p = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        gc.set_color(p, GCColor::Black);
-        gc_barrier_back(&gc, p);
-        assert_eq!(gc.pop_gray_again(), Some(p));
-    }
-
-    #[test]
-    fn test_weak_queues() {
-        let gc = GCState::default_incremental();
-        let id = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        gc.push_weak(id);
-        gc.push_all_weak(id);
-        gc.push_ephemeron(id);
-    }
-
-    #[test]
-    fn test_obj_size() {
-        let gc = GCState::default_incremental();
-        let id = gc.register_object(256, WeakValue::Nil(NilKind::Strict));
-        assert_eq!(gc.obj_size(id), Some(256));
-        gc.set_obj_size(id, 512);
-        assert_eq!(gc.obj_size(id), Some(512));
-    }
-
-    #[test]
-    fn test_debt_update() {
-        let gc = GCState::default_incremental();
-        gc.set_debt(100);
-        assert_eq!(gc.debt(), 100);
-    }
-
-    #[test]
-    fn test_register_root() {
-        let gc = GCState::default_incremental();
-        let id = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        gc.register_root(id);
-        assert!(gc.is_black(id));
-    }
-
-    #[test]
-    fn test_unregistered_object_queries() {
-        let gc = GCState::default_incremental();
-        let fake_id = GCObjectId(999);
-        assert!(!gc.is_registered(fake_id));
-        assert!(!gc.is_white(fake_id));
-        assert!(!gc.is_black(fake_id));
-        assert!(!gc.is_gray(fake_id));
-    }
-
-    #[test]
-    fn test_many_objects() {
-        let gc = GCState::default_incremental();
-        let ids: Vec<GCObjectId> = (0..100)
-            .map(|_| gc.register_object(10, WeakValue::Nil(NilKind::Strict)))
-            .collect();
-        for &id in &ids {
-            assert!(gc.is_registered(id));
-            assert!(gc.is_white(id));
-        }
     }
 
     #[test]
@@ -2931,8 +2351,8 @@ mod tests {
         gc.set_color(id_keep, GCColor::Black);
         // id_free 保持白色
         gc.sweep_unreachable();
-        assert!(gc.is_registered(id_keep));
-        assert!(!gc.is_registered(id_free));
+        assert!(gc.meta(id_keep).is_some());
+        assert!(gc.meta(id_free).is_none());
         assert_eq!(gc.active_count(), 1);
     }
 }

@@ -37,6 +37,31 @@
 - `cmp_c`（默认关闭）：启用时链接 C 实现的 `liblua`，`bindings.rs` / `parser.rs` / `lua_ffi.rs` 模块生效，`capi.rs` 模块禁用以避免符号冲突。用于编译器比对测试（`cargo test --features cmp_c -- compiler::cmp_tests::compiler_compare_tests`）。
 - 默认（非 `cmp_c`）：Rust 实现自给自足，`capi.rs` 导出 C API 符号。
 
+## 数值类型配置（对应 luaconf.h 的 LUA_INT_TYPE / LUA_FLOAT_TYPE）
+
+`src_rs/config.rs` 的 `LuaInteger` / `LuaUnsigned` / `LuaNumber` 是全局唯一的数值类型来源，默认等于 C 的默认配置（`long long` + `double`），可通过 cargo feature 切换到嵌入式32位配置：
+
+| feature | `LuaInteger` / `LuaUnsigned` / `LuaNumber` | C 对应 |
+|---|---|---|
+| （无，默认） | `i64` / `u64` / `f64` | `LUA_INT_LONGLONG` + `LUA_FLOAT_DOUBLE` |
+| `num-i32` | `i32` / `u32` / `f64` | `LUA_INT_TYPE = LUA_INT_INT` |
+| `num-f32` | `i64` / `u64` / `f32` | `LUA_FLOAT_TYPE = LUA_FLOAT_FLOAT` |
+| `embedded` | `i32` / `u32` / `f32` | `LUA_32BITS` |
+
+用法：`cargo build --release --features embedded`（可与默认 feature 叠加）。不支持 long double（Rust stable 无 f80/f128）。
+
+**约束（与 C 的 luaconf.h 一致）**：任何与 Lua 连接的外部 C 代码必须使用同一配置 —— `capi.rs` / `lua_ffi.rs` 的 `lua_Integer` / `lua_Number` / `lua_Unsigned` 直接绑定上述别名（对应 `typedef LUA_INTEGER lua_Integer;`），变更配置即变更这些 C ABI 类型的宽度。
+
+唯一来源的配套常量/函数（`config.rs`，**禁止在别处硬编码宽度**）：`MAX_INTEGER` / `MIN_INTEGER` / `MAX_UNSIGNED` / `INTEGER_BITS` / `INTEGER_FMT` / `NUMBER_FMT` / `NUMBER_FMT_N` / `number_to_integer`（C `lua_numbertointeger`）/ `int_fits_float`（C `l_intfitsf`）。
+
+编码约定：
+- **值位置用别名**：流入/流出 `TValue::Integer`/`Float`、C API 数值函数、或构成 Lua 可见结果的量一律用 `LuaInteger`/`LuaNumber`/`LuaUnsigned`；纯内部偏移/下标/长度（`usize`、pc、文件偏移、`c_long`）保持原类型。
+- **宽度假设必须参数化**：`i64::MAX`/`i64::MIN`/`u64::MAX` → `MAX_INTEGER`/`MIN_INTEGER`/`MAX_UNSIGNED`；`1u64 << n` → `LuaUnsigned`；移位位数 `63`/`64` → `INTEGER_BITS`；`%lld` → `INTEGER_FMT`；`%.15g`/`%.17g` → `NUMBER_FMT`/`NUMBER_FMT_N`。
+- **位运算/移位/取模/整除一律经 `LuaUnsigned`**（C 的 `luaV_shiftl` / `luaV_mod` / `luaV_idiv`）；`MAXSIZE` 类上限按 C 定义 `size_of::<usize>() < size_of::<LuaInteger>() ? usize::MAX : MAX_INTEGER as usize`。
+- 浮点库函数用 `LuaNumber` 的固有方法（`floor`/`ceil`/`fmod`/`powf`…），不要写 `f64::` 限定路径（C 的 `l_mathop` 对应「按类型选函数」）。
+- **假设 64 位/双精度的测试**必须用 `#[cfg(not(feature = "num-i32"))]` / `#[cfg(not(feature = "num-f32"))]` 门控，不得为编译而删除测试。
+- 验证入口：`bash tools/verify_num_types.sh`（4 种配置各自 release 构建 → 跑 `tests_lua/num_types_smoke.lua`（断言与位宽无关）→ 测试目标编译检查；`--full` 追加 `cargo test`）。
+
 ## 内存限制规则
 
 测试时 `systemd-run --user --wait --collect --pipe --property=LimitAS=204800`（200MB），构建时用 `systemd-run --user --wait --collect --pipe --property=LimitAS=infinity` 绕过限制。
@@ -69,6 +94,7 @@
 - `tools/gc_bench_run.sh`：C 与 Rust 实现的 GC 性能对比测试。
 - `tools/ci_bench.sh`：C 与 Rust 实现的通用性能基准（12 项解释器热点，bench/ 按项拆分），Drone 两条流水线 + GitHub Actions Linux job 均执行，日志 `logs/ci_bench_*`。
 - `tools/miri.sh`：Miri UB 检测（本地工具，需 nightly 工具链）。检测 `tests_rs/` 与 `src_rs/` 单元测试中的未定义行为（越界访问、未初始化内存、Tree Borrows 违规等）。日志输出到 `logs/miri_test.log`。
+- `tools/verify_num_types.sh`：数值类型配置验证（默认 / `num-i32` / `num-f32` / `embedded` 各构建 release 并跑 `tests_lua/num_types_smoke.lua` + 测试目标编译检查，`--full` 追加 `cargo test`）。详见"数值类型配置"章节。
 
 ### 测试分类
 1. **编译器比对测试**：`src_rs/compiler/cmp_tests.rs`，确保 Rust 编译器输出与 C 实现一致。
@@ -122,7 +148,7 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
 
 ### 已修复的 UB
 - **编译器 aliasing 违规**（已修复）：`src_rs/compiler/compile.rs` 中 `FuncState` 通过 `ls: *mut LexState` 裸指针持有 `LexState` 引用。在 `compile_chunk` 和 `parse_func_body` 中，`FuncState::new(ls)` 后仍直接使用 `ls`（如 `ls.next()`），这是 foreign write，导致 `FuncState` 持有的 Tree Borrows 标签变为 Disabled。修复方案：把 `FuncState::new` 后所有直接使用 `ls` 的地方改为通过 `fs.ls()` / `fs.ls_mut()` 访问，用临时变量分离借用范围避免与 `fs.proto` 冲突。
-- **内存分配对齐不匹配**（已修复）：`src_rs/mem.rs` 中 `DefaultAllocator` 用 `Layout::from_size_align(new_size, 1)` 即 1 字节对齐分配内存，但 `new_vec<T>` / `grow_vec<T>` / `shrink_vec<T>` 返回的 `Vec<T>` 在 drop 时用 `std::alloc::Global` 以 `T` 的对齐（如 `i32` 为 4 字节）释放，导致对齐不匹配 UB。修复方案：`new_vec` / `grow_vec` / `shrink_vec` / `new_box` 直接用 `std::alloc` API 并通过 `Layout::array::<T>(n)` 传入 `T` 的正确对齐，确保分配与释放的对齐一致；同时移除 `grow_vec` 中泄漏的"探测分配"（`safe_realloc(null, 0, new_size_bytes)` 分配后未释放）。
+- **内存分配对齐不匹配**（已修复）：早期 `src_rs/mem.rs` 的类型化分配辅助（`new_vec<T>` / `grow_vec<T>` / `shrink_vec<T>` / `new_box<T>`，已作为死代码删除）用 `Layout::from_size_align(new_size, 1)` 硬编码 1 字节对齐分配，而返回的 `Vec<T>` / `Box<T>` 在 drop 时按 `T` 的对齐（如 `i32` 为 4 字节）释放，导致对齐不匹配 UB。修复方案：类型化容器（`AllocBox` / `AllocVec`）统一经 `Allocator` trait 的 `alloc(ptr, old, new, align)` 路由（`DefaultAllocator` / `SlotAlloc`），`align` 由容器自身的 `Layout` 提供，分配与释放对齐天然一致。例外：`CapiAllocator` 走宿主 `lua_Alloc` 的 1 字节对齐 realloc 语义，只管理 C 侧内存，不得交给 `Box<T>` / `Vec<T>` 的 std drop 路径。
 
 ## Hook 机制
 
@@ -159,7 +185,7 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
 - **close_state 末尾必须做一次完整回收，且断环必须在这之前**：`func::close` 关上值、finalizer 运行都可能新造出不可达环（闭包↔上值、协程↔执行态、表自引用），只有 GC 的 sweep 能打断它们，之后 Rc 才能归零。不回收则这些环留到进程退出（LSan 报泄漏）——对应 C 的 `lua_close` → `luaC_freeallobjects`「关闭即释放全部」语义。**顺序关键**：`GlobalState::break_close_refs`（清空 globals / registry / `package.loaded`，后者必须与 `base_lib::get_package_table` 一致走 `registry["_PACKAGE"]`——Lua 脚本可能删掉全局 `package`，all.lua 结尾就会擦除所有全局变量）必须在这次 `collect_gc` **之前**调用：globals/registry 是 GC 根，若先回收后断环，环内对象（如 `M.rrotate` 上值捕获模块表 M、metatable ↔ `__gc` 闭包、`registry._LOADED` 里的模块）会被判为可达而逃过清扫，而 drop 阶段释放外部引用后再无第二次回收 → 纯 Rc 环永久存活（实测泄漏 561 块 / 57.9KB → 断环前置后 0 泄漏）。
 - **外部字符串（lua_pushexternalstring）按 C 的 TString 语义实现**：`LongString` 仿 `lobject.h` 的 `TString`，固定头 = `hash/len/extra/kind/contents/falloc/ud`（`kind` 为 C `shrlen` 的负值编码 `LSTRREG`/`LSTRFIX`/`LSTRMEM`）。**内容一律经 `contents` 指针访问（`strings::long_content`），不得直接切 `data`**：常规长字符串（`LSTRREG`）`contents` 指向对象尾部内联内容且 DST 元数据 = `len`；外部字符串（`LSTRFIX`/`LSTRMEM`）`contents` 指向调用方缓冲区、DST 元数据 = 0（无内联内容，写 `len` 会让引用覆盖分配外地址 → UB）。`lua_pushexternalstring` **不拷贝内容**，返回值与 `lua_tolstring` 均为调用方缓冲区指针（C 的 `getstr(ts)`）；`falloc != NULL` 时缓冲区所有权交给 Lua，字符串不可达（引用计数归零）时由 `LongString::drop_payload` 调 `falloc(ud, contents, len+1, 0)` 释放一次 —— 对应 C `luaC_freeobj` 的 LSTRMEM 分支（`GlobalState::ext_string_buffers` 与关闭期集中释放已删除）。`falloc == NULL`（C 的 LSTRFIX）永不释放。注意 tests_lua 的 Lua 层外部字符串测试（strings.lua:530 / attrib.lua:334 块）在 Rust 侧因 `T == nil` 被跳过，回归由 `capi.rs::tests::test_lua_pushexternalstring_matches_c_semantics`（镜像 lib22.c:newstr + attrib.lua 断言，含 falloc 恰释放一次）与 `strings.rs` 的 `test_external_string_frees_buffer_on_last_ref` 覆盖。
 - **字符串跨变体相等按内容**（对应 C `luaS_eqstr` / `luaV_equalobj` 混合变体分支）：`lua_string_eq` 同时处理短 vs 长（常规长串 > `LUAI_MAXSHORTLEN` 必与短串等长,实际只有外部字符串可能命中）；`execute.rs::op_eq` 的 `mem::discriminant` 快路径与 `tm.rs::equal_obj` 也必须把「两个字符串变体」当同一等价类放行，否则外部短字符串与驻留短字符串 `==` 会假阴性（tests_lua/attrib.lua 的 lib2-v2 外部字符串块实测）。表键不驻留化（C 的 `luaS_normstr` 只在 `luaH_newkey` 上做）：哈希与相等都按内容，Lua 层语义等价，差异仅为外部字符串作为键时缓冲区寿命随该键。
-- **长字符串开销**：`LongString` 固定头 40 字节（常规长串 = 40 + 内容 + 1），比 C 的 `offsetof(TString, falloc)=32` 多 8 字节（Rust 侧无法对 `LSTRREG` 省略 `falloc`/`ud`）。`lua_string_gc_mem_size` 对 `LSTRREG` 计 `FIXED_SIZE + len`，外部字符串只计固定头（内容在 Lua 管理内存之外）。
+- **长字符串开销**：`LongString` 固定头 40 字节（常规长串 = 40 + 内容 + 1），比 C 的 `offsetof(TString, falloc)=32` 多 8 字节（Rust 侧无法对 `LSTRREG` 省略 `falloc`/`ud`）。外部字符串只计固定头（内容在 Lua 管理内存之外）。
 - **GC 根扫描范围与 C 帧**：C API 压栈只增长 `stack.len()`，不推进 `state.top`（C 函数内 `top` 停在参数末尾），故 C 代码压入的活值位于 `[top, len)`。外部 C 帧活跃时（`LuaState.c_frame_depth > 0`，在 `call_c_function` / `pcall_c_function` 内增减）`collect_roots_into` 必须扫到 `stack.len()`，否则 C 调用期间触发的 GC（`lua_createtable` / `lua_pushcclosure` / 表增长内的 `maybe_collect_gc`）会把 C 刚建的对象当垃圾清扫（sweep 对死表 `clear_for_drop`）—— lua-cjson 的 `cjson.safe` 上值变 nil、skynet e2e 失败即由此而来。其余场合保持 `stack[..top]`：VM 刻意把可回收旧值留在 `top` 之上（`execute.rs::smart_clear_stack`，仅保证 trivial 值），全栈扫描会让应回收对象继续存活（`gc.lua` 弱表断言失败）。
 - **close_yield_upvals**：必须关闭所有非 TBC 开放上值（通过 `state.open_upval` 链），不仅限于 yield 值可达的；TBC 上值必须跳过（`sync_yield_upvals_back` 会重置 `tbc=false`，否则 `func::close` 会跳过 `__close` 元方法）。
 - **step_gc 生成模式**：生成模式下 `step_gc` 必须直接做完整回收（未实现 minor collection），否则 `collectgarbage("step")` 无法清理弱表。

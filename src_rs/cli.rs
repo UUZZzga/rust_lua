@@ -4,12 +4,10 @@
 
 use const_format::concatcp;
 
+use crate::config::LuaInteger;
 use crate::mem::SlotAlloc;
 use crate::objects::{LuaType, TValue};
 use crate::state::{LuaState, ERR_RUN, ERR_SYNTAX, MIN_STACK, MULT_RET};
-
-#[cfg(size_optimized)]
-use crate::state::LuaStderr;
 use crate::strings::lua_string_as_str;
 
 use std::io::{self, IsTerminal};
@@ -323,7 +321,7 @@ impl<'io> Interpreter<'io> {
         let n = self.l.len(-1);
         self.l.check_stack(n + 3);
         for i in 1..=n {
-            self.l.raw_get_i(-(i as isize), i as i64);
+            self.l.raw_get_i(-(i as isize), i as LuaInteger);
         }
         self.l.rotate(-((n + 1) as isize), -1);
         self.l.pop(1);
@@ -681,7 +679,7 @@ impl<'io> Interpreter<'io> {
         self.l.create_table(narg as usize, (script + 1) as usize);
         for (i, arg) in argv.iter().enumerate() {
             self.l.push_string(arg);
-            self.l.raw_set_i(-2, i as i64 - script as i64);
+            self.l.raw_set_i(-2, i as LuaInteger - script as LuaInteger);
         }
         self.l.set_global("arg");
 

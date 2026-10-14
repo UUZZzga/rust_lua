@@ -64,30 +64,6 @@ impl Write for LuaStderr {
     }
 }
 
-pub fn lua_stdin() -> Box<dyn BufRead> {
-    Box::new(std::io::stdin().lock())
-}
-
-#[cfg(size_optimized)]
-pub fn lua_stdout() -> Box<dyn Write> {
-    Box::new(LuaStdout(std::io::stdout()))
-}
-
-#[cfg(not(size_optimized))]
-pub fn lua_stdout() -> Box<dyn Write> {
-    Box::new(std::io::stdout())
-}
-
-#[cfg(size_optimized)]
-pub fn lua_stderr() -> Box<dyn Write> {
-    Box::new(LuaStdout(std::io::stderr()))
-}
-
-#[cfg(not(size_optimized))]
-pub fn lua_stderr() -> Box<dyn Write> {
-    Box::new(std::io::stderr())
-}
-
 impl Io for RealIo {
     fn read_line(&mut self, buf: &mut String) -> io::Result<usize> {
         io::stdin().lock().read_line(buf)

@@ -212,8 +212,6 @@ pub const MAX_FSTACK: u8 = NO_REG;
 pub const MAXARG_B: u32 = (1u32 << SIZE_B) - 1;
 pub const MAXINDEXRK: u32 = MAXARG_B;
 pub const MAXARG_BX: u32 = (1u32 << SIZE_BX) - 1;
-#[allow(non_upper_case_globals)]
-pub const MAXARG_Ax: u32 = (1u32 << SIZE_Ax) - 1;
 
 // ============================================================================
 // 位操作
@@ -413,10 +411,6 @@ static OP_MODES: [u8; NUM_OPCODES] = [
     opmode_entry(0, 0, 0, 0, 0, OpMode::IAx),   // EXTRAARG
 ];
 
-pub fn opmodes() -> &'static [u8] {
-    &OP_MODES
-}
-
 #[cfg_attr(not(size_optimized), inline)]
 pub fn get_opmode(op: OpCode) -> OpMode {
     let raw = OP_MODES[op as usize] & 7;
@@ -424,38 +418,8 @@ pub fn get_opmode(op: OpCode) -> OpMode {
 }
 
 #[cfg_attr(not(size_optimized), inline)]
-pub fn is_ot(i: Instruction) -> bool {
-    let op = get_opcode(i);
-    match op {
-        OpCode::TAILCALL => true,
-        _ => test_ot_mode(op) && getarg_c(i) == 0,
-    }
-}
-
-#[cfg_attr(not(size_optimized), inline)]
-pub fn is_it(i: Instruction) -> bool {
-    let op = get_opcode(i);
-    match op {
-        OpCode::SETLIST => test_it_mode(op) && getarg_vb(i) == 0,
-        _ => test_it_mode(op) && getarg_b(i) == 0,
-    }
-}
-
-#[cfg_attr(not(size_optimized), inline)]
 pub fn test_a_mode(op: OpCode) -> bool {
     OP_MODES[op as usize] & (1 << 3) != 0
-}
-#[cfg_attr(not(size_optimized), inline)]
-pub fn test_t_mode(op: OpCode) -> bool {
-    OP_MODES[op as usize] & (1 << 4) != 0
-}
-#[cfg_attr(not(size_optimized), inline)]
-pub fn test_it_mode(op: OpCode) -> bool {
-    OP_MODES[op as usize] & (1 << 5) != 0
-}
-#[cfg_attr(not(size_optimized), inline)]
-pub fn test_ot_mode(op: OpCode) -> bool {
-    OP_MODES[op as usize] & (1 << 6) != 0
 }
 #[cfg_attr(not(size_optimized), inline)]
 pub fn test_mm_mode(op: OpCode) -> bool {
@@ -609,29 +573,6 @@ pub static TM_EVENT_NAMES: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_opmodes_from_c() {
-        let modes = opmodes();
-        assert_eq!(modes.len(), NUM_OPCODES);
-        assert_eq!(get_opmode(OpCode::MOVE), OpMode::IABC);
-        assert_eq!(get_opmode(OpCode::JMP), OpMode::IsJ);
-        assert_eq!(get_opmode(OpCode::LOADI), OpMode::IAsBx);
-    }
-
-    #[test]
-    fn test_is_ot_from_c() {
-        let call = create_abck(OpCode::CALL, 0, 1, 0, 0);
-        assert!(is_ot(call));
-        let add = create_abck(OpCode::ADD, 0, 1, 2, 0);
-        assert!(!is_ot(add));
-    }
-
-    #[test]
-    fn test_is_it_from_c() {
-        let call = create_abck(OpCode::CALL, 0, 0, 1, 0);
-        assert!(is_it(call));
-    }
 
     #[test]
     fn test_opcode_from_u8() {

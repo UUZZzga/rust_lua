@@ -17,22 +17,12 @@ use std::rc::Rc;
 
 use bitflags::bitflags;
 
+use crate::config::{LuaInteger, LuaNumber};
 use crate::debug::{concaterror, opinterror, ordererror, tointerror};
 use crate::execute::VmError;
-use crate::objects::{Instruction, LuaType, NilKind, TValue, Table, UpValVec};
+use crate::objects::{LuaType, NilKind, TValue, Table, UpValVec};
 use crate::state::LuaState;
 use crate::strings::{lua_string_as_str, lua_string_len, StringTable};
-
-// ============================================================================
-// get_mmbin_tm — 从 MM 系列指令中提取元方法事件索引
-// ============================================================================
-
-/// 从 MMBIN/MMBINI/MMBINK 指令中提取元方法事件索引。
-/// C 对应: GETARG_C(i) → 取指令的 C 字段 (bits 24-31)
-#[cfg_attr(not(size_optimized), inline)]
-pub fn get_mmbin_tm(inst: Instruction) -> u8 {
-    ((inst >> 24) & 0xFF) as u8
-}
 
 // ============================================================================
 // TagMethod — 元方法枚举
@@ -104,10 +94,6 @@ impl TagMethod {
     /// 返回事件名（不含 "__" 前缀）— 对应 C 的 tmname[tm] + 2
     pub fn event_name(self) -> &'static str {
         &self.name()[2..]
-    }
-
-    pub fn is_fast_access(self) -> bool {
-        (self as u8) <= (TagMethod::Eq as u8)
     }
 
     pub fn from_u8(n: u8) -> Option<Self> {
@@ -260,11 +246,6 @@ impl<'a> DefaultMetatables<'a> {
         }
     }
 
-    pub fn get_mut(&mut self, ty: LuaType) -> Option<&mut Metatable<'a>> {
-        let idx = ty as usize;
-        self.tables.get_mut(idx)?.as_mut()
-    }
-
     /// 遍历所有已设置的基本类型元表 — 对应 C 的 `markmt` 遍历 `g->mt[]`。
     /// GC 必须把它们当根：这些表只被 `dmt` 强引用，若不可达会被 sweep
     /// clear_for_drop 清空（字符串算术元方法、io 的 FILE 元表都会失效）。
@@ -368,41 +349,14 @@ pub fn get_tm_by_obj<'a>(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TagMethodError {
-    NoMetamethod(TagMethod),
-    TypeError {
-        expected: String,
-        got: String,
-    },
-    OrderError {
-        left: String,
-        right: String,
-    },
-    ConcatError {
-        left: String,
-        right: String,
-    },
-    OpError {
-        op: String,
-        left: String,
-        right: String,
-    },
+    ConcatError { left: String, right: String },
 }
 
 impl fmt::Display for TagMethodError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TagMethodError::NoMetamethod(tm) => write!(f, "no metamethod '{}' found", tm.name()),
-            TagMethodError::TypeError { expected, got } => {
-                write!(f, "type error: expected {}, got {}", expected, got)
-            }
-            TagMethodError::OrderError { left, right } => {
-                write!(f, "attempt to compare {} with {}", left, right)
-            }
             TagMethodError::ConcatError { left, right } => {
                 write!(f, "attempt to concatenate {} with {}", left, right)
-            }
-            TagMethodError::OpError { op, left, right } => {
-                write!(f, "attempt to {} {} and {}", op, left, right)
             }
         }
     }
@@ -502,7 +456,6 @@ pub(crate) fn call_tm_res<'a>(
             saved_filled: false,
             is_metamethod: true,
             metamethod_res: res,
-            saved_call_stack_len: state.call_stack.len(),
             is_close_continuation: false,
             is_pairs_continuation: false,
             saved_call_stack: Vec::new(),
@@ -660,7 +613,6 @@ pub(crate) fn call_tm<'a>(
             saved_filled: false,
             is_metamethod: true,
             metamethod_res: func_idx, // 不使用 (0 个返回值)
-            saved_call_stack_len: state.call_stack.len(),
             is_close_continuation: false,
             is_pairs_continuation: false,
             saved_call_stack: Vec::new(),
@@ -829,7 +781,6 @@ pub fn call_close_method<'a>(
             saved_filled: false,
             is_metamethod: false,
             metamethod_res: 0,
-            saved_call_stack_len: state.call_stack.len(),
             is_close_continuation: true,
             is_pairs_continuation: false,
             saved_call_stack: Vec::new(),
@@ -1147,7 +1098,7 @@ pub fn try_bin_assoc_tm<'a>(
 pub fn try_bini_tm<'a>(
     state: &mut LuaState<'a>,
     p1: &TValue<'a>,
-    i2: i64,
+    i2: LuaInteger,
     flip: bool,
     res: usize,
     tm: TagMethod,
@@ -1242,13 +1193,13 @@ pub fn call_order_tm<'a>(
 pub fn call_orderi_tm<'a>(
     state: &mut LuaState<'a>,
     p1: &TValue<'a>,
-    v2: i64,
+    v2: LuaInteger,
     flip: bool,
     isfloat: bool,
     tm: TagMethod,
 ) -> Result<bool, VmError<'a>> {
     let aux = if isfloat {
-        TValue::Float(v2 as f64)
+        TValue::Float(v2 as LuaNumber)
     } else {
         TValue::Integer(v2)
     };
@@ -1379,7 +1330,7 @@ pub fn obj_len<'a>(
                 while state.stack.len() <= ra {
                     state.stack.push(TValue::Nil(NilKind::Strict));
                 }
-                state.stack[ra] = TValue::Integer(len as i64);
+                state.stack[ra] = TValue::Integer(len as LuaInteger);
                 state.top = state.stack.len();
                 return Ok(());
             }
@@ -1390,7 +1341,7 @@ pub fn obj_len<'a>(
             while state.stack.len() <= ra {
                 state.stack.push(TValue::Nil(NilKind::Strict));
             }
-            state.stack[ra] = TValue::Integer(len as i64);
+            state.stack[ra] = TValue::Integer(len as LuaInteger);
             state.top = state.stack.len();
             return Ok(());
         }
@@ -1410,120 +1361,6 @@ pub fn obj_len<'a>(
             obj_type_name(state, rb),
             varinfo
         ))),
-    }
-}
-
-// ============================================================================
-// VarargInfo / VarargTable (ltm.c 变参处理 → Rust 惯用)
-// ============================================================================
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VarargInfo {
-    pub total_args: usize,
-    pub num_fixed_params: usize,
-    pub has_vararg_table: bool,
-    pub has_hidden_varargs: bool,
-}
-
-impl VarargInfo {
-    pub fn is_vararg(&self) -> bool {
-        self.has_vararg_table || self.has_hidden_varargs
-    }
-
-    pub fn num_extra(&self) -> usize {
-        let extra = self.total_args.saturating_sub(self.num_fixed_params);
-        if self.is_vararg() {
-            extra
-        } else {
-            0
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum VarargTable<'a> {
-    Table { table: Table<'a>, count: usize },
-    Hidden { args: Vec<TValue<'a>> },
-}
-
-impl<'a> VarargTable<'a> {
-    pub fn from_hidden(args: Vec<TValue<'a>>) -> Self {
-        VarargTable::Hidden { args }
-    }
-
-    /// 表块由 `alloc` 分配。
-    #[cfg(test)]
-    pub fn from_args(
-        alloc: crate::mem::SlotAlloc,
-        table: &StringTable,
-        args: &[TValue<'a>],
-    ) -> Self {
-        let t = Table::new_in(alloc);
-        let count = args.len();
-        for (i, v) in args.iter().enumerate() {
-            t.set_int(i as i64 + 1, v.clone());
-        }
-        t.set(table.intern_value("n"), TValue::Integer(count as i64));
-        VarargTable::Table { table: t, count }
-    }
-
-    pub fn count(&self) -> usize {
-        match self {
-            VarargTable::Table { count, .. } => *count,
-            VarargTable::Hidden { args } => args.len(),
-        }
-    }
-
-    pub fn get(&self, idx: usize) -> Option<TValue<'a>> {
-        if idx < 1 {
-            return None;
-        }
-        let i = idx - 1;
-        match self {
-            VarargTable::Table { ref table, count } => {
-                if i >= *count {
-                    return None;
-                }
-                table.get_int(i as i64 + 1)
-            }
-            VarargTable::Hidden { args } => args.get(i).cloned(),
-        }
-    }
-
-    pub fn get_vararg(&self, key: &TValue) -> Option<TValue<'a>> {
-        match key {
-            TValue::Integer(i) => self.get(*i as usize),
-            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) if lua_string_as_str(s) == "n" => {
-                Some(TValue::Integer(self.count() as i64))
-            }
-            _ => None,
-        }
-    }
-
-    pub fn get_varargs(&self, wanted: isize) -> Vec<TValue<'a>> {
-        let n = self.count();
-        let take = if wanted < 0 {
-            n
-        } else {
-            let w = wanted as usize;
-            if w > n {
-                n
-            } else {
-                w
-            }
-        };
-        let total = if wanted < 0 { n } else { wanted as usize };
-        let mut result = Vec::with_capacity(total);
-        for i in 0..take {
-            result.push(
-                self.get(i + 1)
-                    .unwrap_or_else(|| TValue::Nil(NilKind::Strict)),
-            );
-        }
-        for _ in take..total {
-            result.push(TValue::Nil(NilKind::Strict));
-        }
-        result
     }
 }
 
@@ -1580,14 +1417,6 @@ mod tests {
             assert!(!tm.name().is_empty());
             assert!(tm.name().starts_with("__"));
         }
-    }
-
-    #[test]
-    fn test_tag_method_is_fast_access() {
-        assert!(TagMethod::Index.is_fast_access());
-        assert!(TagMethod::Eq.is_fast_access());
-        assert!(!TagMethod::Add.is_fast_access());
-        assert!(!TagMethod::Call.is_fast_access());
     }
 
     #[test]
@@ -1695,12 +1524,6 @@ mod tests {
     // ========================================================================
 
     #[test]
-    fn test_tag_method_error_display() {
-        let err = TagMethodError::NoMetamethod(TagMethod::Add);
-        assert!(format!("{}", err).contains("__add"));
-    }
-
-    #[test]
     fn test_tag_method_error_is_trait() {
         fn assert_error<T: std::error::Error>() {}
         assert_error::<TagMethodError>();
@@ -1786,91 +1609,6 @@ mod tests {
         let p1 = TValue::Nil(NilKind::Strict);
         let result = call_orderi_tm(&mut state, &p1, 3, false, false, TagMethod::Lt);
         assert!(result.is_err());
-    }
-
-    // ========================================================================
-    // VarargInfo / VarargTable 测试
-    // ========================================================================
-
-    #[test]
-    fn test_vararg_info_fixed() {
-        let info = VarargInfo {
-            total_args: 3,
-            num_fixed_params: 3,
-            has_vararg_table: false,
-            has_hidden_varargs: false,
-        };
-        assert!(!info.is_vararg());
-        assert_eq!(info.num_extra(), 0);
-    }
-
-    #[test]
-    fn test_vararg_info_vararg() {
-        let info = VarargInfo {
-            total_args: 5,
-            num_fixed_params: 2,
-            has_vararg_table: false,
-            has_hidden_varargs: true,
-        };
-        assert!(info.is_vararg());
-        assert_eq!(info.num_extra(), 3);
-    }
-
-    #[test]
-    fn test_vararg_table_from_args() {
-        let alloc = crate::mem::TestAlloc::new();
-        let args = vec![
-            TValue::Integer(10),
-            TValue::Integer(20),
-            TValue::Integer(30),
-        ];
-        let vt = {
-            let table = StringTable::new();
-            VarargTable::from_args(alloc.slot(), &table, &args)
-        };
-        assert_eq!(vt.count(), 3);
-        assert_eq!(vt.get(1), Some(TValue::Integer(10)));
-        assert_eq!(vt.get(3), Some(TValue::Integer(30)));
-        assert!(vt.get(4).is_none());
-    }
-    #[test]
-    fn test_vararg_table_hidden() {
-        let args = vec![TValue::Integer(100), TValue::Integer(200)];
-        let vt = VarargTable::from_hidden(args);
-        assert_eq!(vt.count(), 2);
-        assert_eq!(vt.get(1), Some(TValue::Integer(100)));
-    }
-
-    #[test]
-    fn test_vararg_table_get_varargs_less() {
-        let args = vec![TValue::Integer(1), TValue::Integer(2), TValue::Integer(3)];
-        let vt = VarargTable::from_hidden(args);
-        let result = vt.get_varargs(2);
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0], TValue::Integer(1));
-    }
-
-    #[test]
-    fn test_vararg_table_get_varargs_more() {
-        let args = vec![TValue::Integer(1)];
-        let vt = VarargTable::from_hidden(args);
-        let result = vt.get_varargs(3);
-        assert_eq!(result.len(), 3);
-        assert_eq!(result[0], TValue::Integer(1));
-        assert!(result[1].is_nil());
-        assert!(result[2].is_nil());
-    }
-
-    #[test]
-    fn test_vararg_table_get_varargs_all() {
-        let args = vec![
-            TValue::Integer(10),
-            TValue::Integer(20),
-            TValue::Integer(30),
-        ];
-        let vt = VarargTable::from_hidden(args);
-        let result = vt.get_varargs(-1);
-        assert_eq!(result.len(), 3);
     }
 
     fn _make_tm_tvalue_local<'a>(tm: TagMethod) -> TValue<'a> {

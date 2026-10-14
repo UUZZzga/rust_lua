@@ -1,4 +1,6 @@
 use super::lexer::{LexState, Token};
+use crate::config::{LuaInteger, LuaNumber, LuaNumberBits, LuaUnsigned};
+use crate::config::{INTEGER_BITS, MIN_INTEGER};
 use crate::objects::PF_VAHID;
 use crate::objects::*;
 use crate::opcodes::*;
@@ -233,16 +235,28 @@ pub enum ExpKind {
     Vararg,
     VJMP,
     VVARGVAR,
-    VVARGIND,
     /// Upvalue not yet loaded into a register (like C's VUPVAL).
     /// info = upvalue index. GETUPVAL is emitted when the value is needed.
     Upval,
 }
 
+/// `ExpDesc::info` 的位容器 — 对应 C 的 `expdesc.u` 联合体。
+///
+/// 联合体必须同时容纳 `LuaInteger` 的值与 `LuaNumber` 的位模式, 故取两者中较宽者:
+/// 只有「i32 整数 + f64 浮点」这一组合下联合体为 8 字节（C 中同理）。
+/// 该组合下整数值/寄存器号写入时加宽 (`info_from_int`), 读取时经 `info_int` 窄化。
+#[cfg(all(feature = "num-i32", not(feature = "num-f32")))]
+pub type InfoBits = i64;
+/// 见上；其余组合下 `LuaInteger` 已是较宽者。
+#[cfg(not(all(feature = "num-i32", not(feature = "num-f32"))))]
+pub type InfoBits = LuaInteger;
+
 #[derive(Debug, Clone)]
 pub struct ExpDesc<'a> {
     pub kind: ExpKind,
-    pub info: i64,
+    /// 对应 C 的 `expdesc.u` 联合体: 依 `kind` 存放整数常量 (`LuaInteger`)、
+    /// 浮点常量的位模式 (`LuaNumber::to_bits` 的宽度)、寄存器号 / pc / 常量表下标。
+    pub info: InfoBits,
     pub info2: i32,
     pub t: i32,
     pub f: i32,
@@ -253,10 +267,10 @@ pub struct ExpDesc<'a> {
 }
 
 impl<'a> ExpDesc<'a> {
-    pub fn new(kind: ExpKind, info: i64) -> Self {
+    pub fn new(kind: ExpKind, info: impl Into<InfoBits>) -> Self {
         ExpDesc {
             kind,
-            info,
+            info: info.into(),
             info2: -1,
             t: NO_JUMP,
             f: NO_JUMP,
@@ -275,10 +289,10 @@ impl<'a> ExpDesc<'a> {
         }
     }
 
-    pub fn new_reloc_with_pc(info: i64, pc: i32) -> Self {
+    pub fn new_reloc_with_pc(info: LuaInteger, pc: i32) -> Self {
         ExpDesc {
             kind: ExpKind::Relocable,
-            info,
+            info: info_from_int(info as LuaInteger),
             info2: pc,
             t: NO_JUMP,
             f: NO_JUMP,
@@ -286,20 +300,43 @@ impl<'a> ExpDesc<'a> {
         }
     }
 
-    pub fn into_reloc_with_pc(self, info: i64, pc: i32) -> Self {
-        ExpDesc {
-            kind: ExpKind::Relocable,
-            info,
-            info2: pc,
-            t: self.t,
-            f: self.f,
-            str_val: None,
-        }
-    }
-
     fn has_jumps(&self) -> bool {
         self.t != self.f
     }
+}
+
+/// 从 `ExpDesc::info` 读整数值（联合体成员读取; 宽联合体组合下为窄化重解释,
+/// 值由构造处保证在 `LuaInteger` 范围内）。
+#[inline]
+fn info_int(v: InfoBits) -> LuaInteger {
+    v as LuaInteger
+}
+
+/// 把 `LuaInteger` 值/下标写入 `ExpDesc::info`（联合体成员写入）。
+#[inline]
+fn info_from_int(v: LuaInteger) -> InfoBits {
+    v as InfoBits
+}
+
+/// 把 `LuaNumber` 的位模式装入 `ExpDesc::info`（对应 C 联合体的 `u.nval` 位存储）。
+/// `as` 是位容器重解释（f64→u64→i64 / f32→u32→i32），不是数值转换。
+#[inline]
+fn float_to_info(f: LuaNumber) -> InfoBits {
+    f.to_bits() as InfoBits
+}
+
+/// 从 `ExpDesc::info` 取回 `LuaNumber`（`float_to_info` 的逆操作）。
+#[cfg(not(feature = "num-f32"))]
+#[inline]
+fn float_from_info(bits: InfoBits) -> LuaNumber {
+    f64::from_bits(bits as u64)
+}
+
+/// 见上；32 位浮点配置下位模式为 32 位。
+#[cfg(feature = "num-f32")]
+#[inline]
+fn float_from_info(bits: InfoBits) -> LuaNumber {
+    f32::from_bits(bits as u32)
 }
 
 // ============================================================================
@@ -317,7 +354,7 @@ struct ParentVar<'a> {
     is_vararg: bool, // true = RDKVAVAR variable (named vararg parameter, needs PF_VATAB)
     kind: i32,       // variable kind (VDKREG/RDKCONST/RDKCTC/GDKREG/GDKCONST etc.)
     ctc_kind: Option<ExpKind>, // constant kind (for is_ctc)
-    ctc_info: Option<i64>, // constant info (for is_ctc)
+    ctc_info: Option<InfoBits>, // constant info (for is_ctc; ExpDesc::info 的位容器)
     ctc_str: Option<TValue<'a>>, // constant string value (for is_ctc Str)
     // is_local=true:
     reg: i32,         // register in direct parent
@@ -344,7 +381,7 @@ struct LocalVar<'a> {
     reg: i32,
     kind: i32,
     ctc_kind: Option<ExpKind>,
-    ctc_info: Option<i64>,
+    ctc_info: Option<InfoBits>,
     ctc_str: Option<TValue<'a>>,
     nactvar: i32, // compact active variable count at declaration time (like C's fs->nactvar)
     pidx: i32,    // index into proto.locvars (-1 if no debug info, like C's vd.pidx)
@@ -586,8 +623,8 @@ impl Hasher for FixedSipHasher13 {
 enum ConstKey<'a> {
     Nil,
     Boolean(bool),
-    Integer(i64),
-    Float(u64), // f64::to_bits
+    Integer(LuaInteger),
+    Float(LuaNumberBits), // LuaNumber::to_bits (位模式, 需区分 -0.0 / 0.0)
     Str(TValue<'a>),
 }
 
@@ -617,10 +654,12 @@ impl<'a> Hash for ConstKey<'a> {
             ConstKey::Nil => 0u64,
             ConstKey::Boolean(b) => 0x100 | (*b as u64),
             ConstKey::Integer(i) => {
+                // hash 边界: 显式加宽到 u64 混合容器 (与数值配置无关)
                 let v = *i as u64;
                 0x200 ^ v.wrapping_mul(0x9E3779B97F4A7C15)
             }
-            ConstKey::Float(f) => 0x300 ^ (*f).wrapping_mul(0x9E3779B97F4A7C15),
+            // hash 边界: 位模式加宽到 u64 混合容器 (与数值配置无关)
+            ConstKey::Float(f) => 0x300 ^ (*f as u64).wrapping_mul(0x9E3779B97F4A7C15),
             ConstKey::Str(s) => {
                 // 短字符串已有预计算的 hash (rust_hash, 分布良好)
                 0x400 ^ lua_string_hash(s)
@@ -635,7 +674,7 @@ fn to_const_key<'a>(v: &TValue<'a>) -> ConstKey<'a> {
         TValue::Nil(_) => ConstKey::Nil,
         TValue::Boolean(b) => ConstKey::Boolean(*b),
         TValue::Integer(i) => ConstKey::Integer(*i),
-        TValue::Float(f) => ConstKey::Float(f.to_bits()),
+        TValue::Float(f) => ConstKey::Float(f.to_bits() as LuaNumberBits),
         s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => ConstKey::Str(s.clone()),
         _ => ConstKey::Nil,
     }
@@ -1048,6 +1087,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
             OpMode::IABC => {
                 if testarg_k(*i) {
                     let sbx = dest - pc - 1;
+                    // 指令字 (32 位) 的 sBx 字段位运算 — 与 Lua 数值配置无关, 保持 i64 容器
                     let masked = ((getarg_sbx(*i) as i64) & !0x1FFFF) | ((sbx as i64) & 0x1FFFF);
                     setarg(i, masked as i32, POS_BX, SIZE_BX);
                 } else {
@@ -1206,7 +1246,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
     fn discharge_str(&mut self, e: &mut ExpDesc<'b>) -> i32 {
         if let Some(s) = e.str_val.take() {
             let k = self.string_k_ls(s);
-            e.info = k as i64;
+            e.info = info_from_int(k as LuaInteger);
             k
         } else {
             e.info as i32
@@ -1224,7 +1264,7 @@ impl<'a, 'b> FuncState<'a, 'b> {
     }
 
     /// 创建整型常量并添加到常量表
-    fn int_k(&mut self, i: i64) -> i32 {
+    fn int_k(&mut self, i: LuaInteger) -> i32 {
         self.const_k(TValue::Integer(i))
     }
 
@@ -1232,17 +1272,18 @@ impl<'a, 'b> FuncState<'a, 'b> {
     ///
     /// 模拟 C 版本 `luaK_numberK` 的去重逻辑：
     /// - 对于 `r == 0`，正常去重（C 版本使用 FuncState 指针作为 key，不会碰撞）
-    /// - 对于其他值，计算 `k = r * (1 + 2^-52)` 作为 key
-    /// - 如果 `k` 是整数值（即 `r >= 2^53` 或 `r` 是 `2^53` 的倍数），不去重，
+    /// - 对于其他值，计算 `k = r * (1 + 2^(1-MANT_DIG))` 作为 key
+    ///   （C: `q = ldexp(1.0, -l_floatatt(MANT_DIG) + 1)`；double 为 2^-52，float 为 2^-23）
+    /// - 如果 `k` 是整数值（即 `r >= 2^MANT_DIG` 或 `r` 是 `2^MANT_DIG` 的倍数），不去重，
     ///   直接添加新常量。这是因为整数值的 key 会与整数常量的 key 碰撞。
     /// - 否则，正常去重
-    fn float_k(&mut self, f: f64) -> i32 {
+    fn float_k(&mut self, f: LuaNumber) -> i32 {
         if f == 0.0 {
             // 零：正常去重（C 版本使用 FuncState 指针作为 key，不会碰撞）
             self.const_k(TValue::Float(f))
         } else {
-            // 计算 key：k = r * (1 + 2^-52)，等价于 C 版本的 r * (1 + q)
-            let q = 2f64.powi(-52);
+            // 计算 key：k = r * (1 + q)，q = 2^(1 - MANT_DIG)，等价于 C 版本的 l_floatatt(MANT_DIG)
+            let q = (2 as LuaNumber).powi(-(LuaNumber::MANTISSA_DIGITS as i32) + 1);
             let k = f * (1.0 + q);
             // 检查 k 是否为整数值（等价于 C 版本 luaV_flttointeger(k, &ik, F2Ieq)）
             if float_is_integer(k) {
@@ -2229,13 +2270,6 @@ impl<'a, 'b> FuncState<'a, 'b> {
                     dst
                 }
             }
-            ExpKind::VVARGIND => {
-                // VVARGIND should not reach here in current implementation;
-                // it's handled directly in parse_prefix_exp/parse_assign_or_call
-                self.proto.flag |= PF_VATAB;
-                let r = e.info as i32;
-                r
-            }
             ExpKind::Void | ExpKind::Nil => {
                 let r = self.alloc_reg();
                 self.code_nil(r, 1);
@@ -2253,19 +2287,19 @@ impl<'a, 'b> FuncState<'a, 'b> {
             ExpKind::Int => {
                 let r = self.alloc_reg();
                 let val = e.info;
-                if fits_sbx(val) {
+                if fits_sbx(info_int(val)) {
                     self.code_asbx(OpCode::LOADI, r, val as i32);
                 } else {
-                    let k = self.int_k(val);
+                    let k = self.int_k(info_int(val));
                     self.code_loadk(r, k);
                 }
                 r
             }
             ExpKind::Float => {
                 let r = self.alloc_reg();
-                let f = f64::from_bits(e.info as u64);
-                let fi = f as i64;
-                if (fi as f64) == f && fits_sbx(fi) {
+                let f = float_from_info(e.info);
+                let fi = f as LuaInteger;
+                if (fi as LuaNumber) == f && fits_sbx(fi) {
                     self.code_asbx(OpCode::LOADF, r, fi as i32);
                 } else {
                     let k = self.float_k(f);
@@ -2414,17 +2448,17 @@ impl<'a, 'b> FuncState<'a, 'b> {
             }
             ExpKind::Int => {
                 let val = e.info;
-                if fits_sbx(val) {
+                if fits_sbx(info_int(val)) {
                     self.code_asbx(OpCode::LOADI, reg, val as i32);
                 } else {
-                    let k = self.int_k(val);
+                    let k = self.int_k(info_int(val));
                     self.code_loadk(reg, k);
                 }
             }
             ExpKind::Float => {
-                let f = f64::from_bits(e.info as u64);
-                let fi = f as i64;
-                if (fi as f64) == f && fits_sbx(fi) {
+                let f = float_from_info(e.info);
+                let fi = f as LuaInteger;
+                if (fi as LuaNumber) == f && fits_sbx(fi) {
                     self.code_asbx(OpCode::LOADF, reg, fi as i32);
                 } else {
                     let k = self.float_k(f);
@@ -4453,7 +4487,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                     }
                 } else if ei.exp.kind == ExpKind::Int
                     && ei.exp.info >= 0
-                    && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
+                    && ei.exp.info <= ((1u32 << SIZE_C) - 1) as InfoBits
                 {
                     (ei.exp.info as i32, true, true)
                 } else if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc)
@@ -4673,7 +4707,7 @@ fn parse_assign_or_call(fs: &mut FuncState) {
                 } else {
                     fs.exp_to_reg(&ei.exp)
                 };
-                exps.push(ExpDesc::new(ExpKind::NonReloc, r as i64));
+                exps.push(ExpDesc::new(ExpKind::NonReloc, r as LuaInteger));
                 fs.ls_mut().next();
             } else {
                 exps.push(ei.exp);
@@ -4965,9 +4999,9 @@ fn exp_to_k<'a, 'b>(fs: &mut FuncState<'a, 'b>, e: &ExpDesc<'b>) -> Option<i32> 
         return None;
     }
     let info = match e.kind {
-        ExpKind::Int => fs.int_k(e.info),
+        ExpKind::Int => fs.int_k(info_int(e.info)),
         ExpKind::Float => {
-            let f = f64::from_bits(e.info as u64);
+            let f = float_from_info(e.info);
             fs.float_k(f)
         }
         ExpKind::Str => fs.get_str_k(e),
@@ -5018,28 +5052,28 @@ fn store_expr_to_local<'a, 'b>(fs: &mut FuncState<'a, 'b>, e: &ExpDesc<'b>, dest
         ExpKind::Int => {
             if e.t != NO_JUMP || e.f != NO_JUMP {
                 let v = e.info;
-                if fits_sbx(v) {
+                if fits_sbx(info_int(v)) {
                     fs.code_asbx(OpCode::LOADI, dest, v as i32);
                 } else {
-                    let k = fs.int_k(v);
+                    let k = fs.int_k(info_int(v));
                     fs.code_loadk(dest, k);
                 }
                 fs.resolve_jumps(e, dest);
                 return;
             }
             let v = e.info;
-            if fits_sbx(v) {
+            if fits_sbx(info_int(v)) {
                 fs.code_asbx(OpCode::LOADI, dest, v as i32);
             } else {
-                let k = fs.int_k(v);
+                let k = fs.int_k(info_int(v));
                 fs.code_loadk(dest, k);
             }
         }
         ExpKind::Float => {
             if e.t != NO_JUMP || e.f != NO_JUMP {
-                let f = f64::from_bits(e.info as u64);
-                let fi = f as i64;
-                if (fi as f64) == f && fits_sbx(fi) {
+                let f = float_from_info(e.info);
+                let fi = f as LuaInteger;
+                if (fi as LuaNumber) == f && fits_sbx(fi) {
                     fs.code_asbx(OpCode::LOADF, dest, fi as i32);
                 } else {
                     let k = fs.float_k(f);
@@ -5048,9 +5082,9 @@ fn store_expr_to_local<'a, 'b>(fs: &mut FuncState<'a, 'b>, e: &ExpDesc<'b>, dest
                 fs.resolve_jumps(e, dest);
                 return;
             }
-            let f = f64::from_bits(e.info as u64);
-            let fi = f as i64;
-            if (fi as f64) == f && fits_sbx(fi) {
+            let f = float_from_info(e.info);
+            let fi = f as LuaInteger;
+            if (fi as LuaNumber) == f && fits_sbx(fi) {
                 fs.code_asbx(OpCode::LOADF, dest, fi as i32);
             } else {
                 let k = fs.float_k(f);
@@ -5726,15 +5760,15 @@ fn discharge_ctc_to_reg<'a, 'b>(fs: &mut FuncState<'a, 'b>, ctc: &mut ExpDesc<'b
     match ctc.kind {
         ExpKind::Int => {
             let val = ctc.info;
-            if fits_sbx(val) {
+            if fits_sbx(info_int(val)) {
                 fs.code_asbx(OpCode::LOADI, r, val as i32);
             } else {
-                let k = fs.int_k(val);
+                let k = fs.int_k(info_int(val));
                 fs.code_loadk(r, k);
             }
         }
         ExpKind::Float => {
-            let f = f64::from_bits(ctc.info as u64);
+            let f = float_from_info(ctc.info);
             let k = fs.float_k(f);
             fs.code_loadk(r, k);
         }
@@ -6315,7 +6349,7 @@ fn parse_prefix_exp<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> PrefixResult<'b> {
                     }
                 } else if ei.exp.kind == ExpKind::Int
                     && ei.exp.info >= 0
-                    && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
+                    && ei.exp.info <= ((1u32 << SIZE_C) - 1) as InfoBits
                 {
                     (ei.exp.info as i32, true, true)
                 } else if matches!(ei.exp.kind, ExpKind::Relocable | ExpKind::NonReloc)
@@ -6528,7 +6562,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
             let mut e_left = std::mem::replace(&mut e.exp, ExpDesc::new(ExpKind::Void, 0));
             fs.ls_mut().next();
 
-            if e_left.kind == ExpKind::VJMP && e_left.info != NO_JUMP as i64 {
+            if e_left.kind == ExpKind::VJMP && e_left.info != NO_JUMP as InfoBits {
                 let saved_jmp = e_left.info as i32;
                 fs.negate_condition(saved_jmp);
                 fs.concat_jump(&mut e_left.f, saved_jmp);
@@ -6601,7 +6635,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
             let mut e_left = std::mem::replace(&mut e.exp, ExpDesc::new(ExpKind::Void, 0));
             fs.ls_mut().next();
 
-            if e_left.kind == ExpKind::VJMP && e_left.info != NO_JUMP as i64 {
+            if e_left.kind == ExpKind::VJMP && e_left.info != NO_JUMP as InfoBits {
                 let saved_jmp = e_left.info as i32;
                 fs.concat_jump(&mut e_left.t, saved_jmp);
                 let here = fs.pc;
@@ -6699,14 +6733,14 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         let r = fs.alloc_reg();
                         fs.set_a(pc, r);
                         ec.kind = ExpKind::NonReloc;
-                        ec.info = r as i64;
+                        ec.info = info_from_int(r as LuaInteger);
                         ec.info2 = -1;
                         ec.t = NO_JUMP;
                         ec.f = NO_JUMP;
                     } else {
                         let r = fs.exp_to_reg(&ec);
                         ec.kind = ExpKind::NonReloc;
-                        ec.info = r as i64;
+                        ec.info = info_from_int(r as LuaInteger);
                         ec.info2 = -1;
                         ec.t = NO_JUMP;
                         ec.f = NO_JUMP;
@@ -6728,14 +6762,14 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         let r = fs.alloc_reg();
                         fs.set_a(pc, r);
                         ec.kind = ExpKind::NonReloc;
-                        ec.info = r as i64;
+                        ec.info = info_from_int(r as LuaInteger);
                         ec.info2 = -1;
                         ec.t = NO_JUMP;
                         ec.f = NO_JUMP;
                     } else {
                         let r = fs.exp_to_reg(&ec);
                         ec.kind = ExpKind::NonReloc;
-                        ec.info = r as i64;
+                        ec.info = info_from_int(r as LuaInteger);
                         ec.info2 = -1;
                         ec.t = NO_JUMP;
                         ec.f = NO_JUMP;
@@ -6826,7 +6860,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                     fs.free_reg();
                 }
                 e = ExprItem {
-                    exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64),
+                    exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as LuaInteger),
                 };
             } else if is_gt {
                 if let Some((sc_val, isfloat)) = is_sc_number(&e2.exp) {
@@ -6859,7 +6893,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         fs.free_reg();
                     }
                     e = ExprItem {
-                        exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64),
+                        exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as LuaInteger),
                     };
                 } else {
                     let r_alloc =
@@ -6922,7 +6956,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         fs.free_reg();
                     }
                     e = ExprItem {
-                        exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64),
+                        exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as LuaInteger),
                     };
                 }
             } else {
@@ -6974,7 +7008,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                             fs.free_reg();
                         }
                         e = ExprItem {
-                            exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64),
+                            exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as LuaInteger),
                         };
                     } else {
                         let r_alloc =
@@ -7008,7 +7042,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                 fs.free_reg();
                             }
                             e = ExprItem {
-                                exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64),
+                                exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as LuaInteger),
                             };
                         } else {
                             let const_k = exp_to_const_k(fs, &e2.exp);
@@ -7024,7 +7058,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                     fs.free_reg();
                                 }
                                 e = ExprItem {
-                                    exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64),
+                                    exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as LuaInteger),
                                 };
                             } else {
                                 let r2_alloc = !matches!(
@@ -7075,7 +7109,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                     fs.free_reg();
                                 }
                                 e = ExprItem {
-                                    exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64),
+                                    exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as LuaInteger),
                                 };
                             }
                         }
@@ -7121,7 +7155,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                             fs.free_reg();
                         }
                         e = ExprItem {
-                            exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64),
+                            exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as LuaInteger),
                         };
                     } else {
                         let r_alloc =
@@ -7186,7 +7220,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                             fs.free_reg();
                         }
                         e = ExprItem {
-                            exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as i64),
+                            exp: ExpDesc::new(ExpKind::VJMP, jmp_pc as LuaInteger),
                         };
                     }
                 }
@@ -7210,7 +7244,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                 let r = fs.exp_to_reg(&ec);
                 ec.t = NO_JUMP;
                 ec.f = NO_JUMP;
-                ec.info = r as i64;
+                ec.info = info_from_int(r as LuaInteger);
                 ec.kind = ExpKind::NonReloc; // Mark as already in register
             }
             let mut e2 = parse_subexpr(fs, PREC_BOR + 1);
@@ -7232,7 +7266,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                 let k_idx = if !e2.exp.has_jumps() {
                     match &e2.exp.kind {
                         ExpKind::Int => {
-                            let k = fs.int_k(e2.exp.info);
+                            let k = fs.int_k(info_int(e2.exp.info));
                             if k <= 255 {
                                 Some(k)
                             } else {
@@ -7251,7 +7285,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         let r = fs.exp_to_reg(&ec);
                         ec.t = NO_JUMP;
                         ec.f = NO_JUMP;
-                        ec.info = r as i64;
+                        ec.info = info_from_int(r as LuaInteger);
                         r
                     } else if matches!(ec.kind, ExpKind::NonReloc) {
                         ec.info as i32
@@ -7346,7 +7380,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                 let r = fs.exp_to_reg(&ec);
                 ec.t = NO_JUMP;
                 ec.f = NO_JUMP;
-                ec.info = r as i64;
+                ec.info = info_from_int(r as LuaInteger);
                 ec.kind = ExpKind::NonReloc; // Mark as already in register
             }
             let mut e2 = parse_subexpr(fs, PREC_BXOR + 1);
@@ -7368,7 +7402,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                 let k_idx = if !e2.exp.has_jumps() {
                     match &e2.exp.kind {
                         ExpKind::Int => {
-                            let k = fs.int_k(e2.exp.info);
+                            let k = fs.int_k(info_int(e2.exp.info));
                             if k <= 255 {
                                 Some(k)
                             } else {
@@ -7387,7 +7421,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         let r = fs.exp_to_reg(&ec);
                         ec.t = NO_JUMP;
                         ec.f = NO_JUMP;
-                        ec.info = r as i64;
+                        ec.info = info_from_int(r as LuaInteger);
                         r
                     } else if matches!(ec.kind, ExpKind::NonReloc) {
                         ec.info as i32
@@ -7482,7 +7516,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                 let r = fs.exp_to_reg(&ec);
                 ec.t = NO_JUMP;
                 ec.f = NO_JUMP;
-                ec.info = r as i64;
+                ec.info = info_from_int(r as LuaInteger);
                 ec.kind = ExpKind::NonReloc; // Mark as already in register
             }
             let mut e2 = parse_subexpr(fs, PREC_BAND + 1);
@@ -7504,7 +7538,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                 let k_idx = if !e2.exp.has_jumps() {
                     match &e2.exp.kind {
                         ExpKind::Int => {
-                            let k = fs.int_k(e2.exp.info);
+                            let k = fs.int_k(info_int(e2.exp.info));
                             if k <= 255 {
                                 Some(k)
                             } else {
@@ -7523,7 +7557,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         let r = fs.exp_to_reg(&ec);
                         ec.t = NO_JUMP;
                         ec.f = NO_JUMP;
-                        ec.info = r as i64;
+                        ec.info = info_from_int(r as LuaInteger);
                         r
                     } else if matches!(ec.kind, ExpKind::NonReloc) {
                         ec.info as i32
@@ -7623,7 +7657,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                 let r = fs.exp_to_reg(&ec);
                 ec.t = NO_JUMP;
                 ec.f = NO_JUMP;
-                ec.info = r as i64;
+                ec.info = info_from_int(r as LuaInteger);
                 ec.kind = ExpKind::NonReloc; // Mark as already in register
             }
             let e2 = parse_subexpr(fs, PREC_SHL + 1);
@@ -7634,14 +7668,17 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                 // Match C's luaV_shiftl: if shift >= NBITS or <= -NBITS, result is 0
                 let v1 = v1_opt.unwrap();
                 let shift = shift_opt.unwrap();
-                let val = if shift >= 64 || shift <= -64 {
-                    0i64
+                // C 的 luaV_shiftl: 移位量超出位宽则结果为 0, 位运算经 LuaUnsigned
+                let val = if shift >= INTEGER_BITS as LuaInteger
+                    || shift <= -(INTEGER_BITS as LuaInteger)
+                {
+                    0
                 } else if shift < 0 {
                     // Right shift (unsigned/logical)
-                    ((v1 as u64) >> (-shift as u32)) as i64
+                    ((v1 as LuaUnsigned) >> ((-shift) as u32)) as LuaInteger
                 } else {
                     // Left shift (unsigned)
-                    ((v1 as u64) << (shift as u32)) as i64
+                    ((v1 as LuaUnsigned) << (shift as u32)) as LuaInteger
                 };
                 e = ExprItem {
                     exp: ExpDesc::new(ExpKind::Int, val),
@@ -7659,7 +7696,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                     } else {
                         fs.exp_to_reg(&e2.exp)
                     };
-                    let sc = int_to_sc(ec.info);
+                    let sc = int_to_sc(info_int(ec.info));
                     let pc = fs.code_abc(OpCode::SHLI, 0, v2, sc);
                     // Free v2 if it's a temp - like C's freeexps
                     if v2 >= fs.nvarstack() && v2 == fs.freereg - 1 {
@@ -7672,7 +7709,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                     };
                 } else if matches!(e2.exp.kind, ExpKind::Int)
                     && fits_sc(&e2.exp)
-                    && fits_sc_neg(e2.exp.info)
+                    && fits_sc_neg(info_int(e2.exp.info))
                     && !e2.exp.has_jumps()
                 {
                     // SHRI (for SHL): right operand is small constant, like C's finishbinexpneg
@@ -7680,7 +7717,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         let r = fs.exp_to_reg(&ec);
                         ec.t = NO_JUMP;
                         ec.f = NO_JUMP;
-                        ec.info = r as i64;
+                        ec.info = info_from_int(r as LuaInteger);
                         r
                     } else if matches!(ec.kind, ExpKind::NonReloc) {
                         ec.info as i32
@@ -7689,7 +7726,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                     } else {
                         fs.exp_to_reg(&ec)
                     };
-                    let v = e2.exp.info;
+                    let v = info_int(e2.exp.info);
                     let sc_neg = int_to_sc(-v);
                     let sc_pos = int_to_sc(v);
                     let pc = fs.code_abc(OpCode::SHRI, 0, v1, sc_neg);
@@ -7721,7 +7758,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         let r = fs.exp_to_reg(&ec);
                         ec.t = NO_JUMP;
                         ec.f = NO_JUMP;
-                        ec.info = r as i64;
+                        ec.info = info_from_int(r as LuaInteger);
                         r
                     } else if matches!(ec.kind, ExpKind::NonReloc) {
                         ec.info as i32
@@ -7772,7 +7809,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                 let r = fs.exp_to_reg(&ec);
                 ec.t = NO_JUMP;
                 ec.f = NO_JUMP;
-                ec.info = r as i64;
+                ec.info = info_from_int(r as LuaInteger);
                 ec.kind = ExpKind::NonReloc; // Mark as already in register
             }
             let e2 = parse_subexpr(fs, PREC_SHL + 1);
@@ -7784,14 +7821,18 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                 // If shift >= NBITS or <= -NBITS, result is 0
                 let v1 = v1_opt.unwrap();
                 let shift = shift_opt.unwrap();
-                let val = if shift >= 64 || shift <= -64 {
-                    0i64
+                // C 的 luaV_shiftr = luaV_shiftl(x, -y)
+                // If shift >= NBITS or <= -NBITS, result is 0
+                let val = if shift >= INTEGER_BITS as LuaInteger
+                    || shift <= -(INTEGER_BITS as LuaInteger)
+                {
+                    0
                 } else if shift < 0 {
                     // Negative right shift = left shift
-                    ((v1 as u64) << (-shift as u32)) as i64
+                    ((v1 as LuaUnsigned) << ((-shift) as u32)) as LuaInteger
                 } else {
                     // Unsigned (logical) right shift
-                    ((v1 as u64) >> (shift as u32)) as i64
+                    ((v1 as LuaUnsigned) >> (shift as u32)) as LuaInteger
                 };
                 e = ExprItem {
                     exp: ExpDesc::new(ExpKind::Int, val),
@@ -7804,7 +7845,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         let r = fs.exp_to_reg(&ec);
                         ec.t = NO_JUMP;
                         ec.f = NO_JUMP;
-                        ec.info = r as i64;
+                        ec.info = info_from_int(r as LuaInteger);
                         r
                     } else if matches!(ec.kind, ExpKind::NonReloc) {
                         ec.info as i32
@@ -7813,7 +7854,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                     } else {
                         fs.exp_to_reg(&ec)
                     };
-                    let v = e2.exp.info;
+                    let v = info_int(e2.exp.info);
                     let sc = int_to_sc(v);
                     let pc = fs.code_abc(OpCode::SHRI, 0, v1, sc);
                     // Free v1 if it's a temp - like C's freeexps
@@ -7844,7 +7885,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         let r = fs.exp_to_reg(&ec);
                         ec.t = NO_JUMP;
                         ec.f = NO_JUMP;
-                        ec.info = r as i64;
+                        ec.info = info_from_int(r as LuaInteger);
                         r
                     } else if matches!(ec.kind, ExpKind::NonReloc) {
                         ec.info as i32
@@ -7963,7 +8004,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                 fs.code_abc(OpCode::CONCAT, r, 2, 0);
             }
             e = ExprItem {
-                exp: ExpDesc::new(ExpKind::Relocable, r as i64),
+                exp: ExpDesc::new(ExpKind::Relocable, r as LuaInteger),
             };
             matched = true;
         }
@@ -7987,7 +8028,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
             // and then falls through to luaK_exp2nextreg since VKINT != VNONRELOC.
             if !matches!(ec.kind, ExpKind::Int | ExpKind::Float) || ec.has_jumps() {
                 let r = fs.exp_to_reg(&ec);
-                ec = ExpDesc::new(ExpKind::NonReloc, r as i64);
+                ec = ExpDesc::new(ExpKind::NonReloc, r as LuaInteger);
             }
             let e2 = parse_subexpr(fs, PREC_ADD + 1);
             let pc_before = fs.pc;
@@ -8003,25 +8044,25 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                     };
                 }
                 (ExpKind::Float, ExpKind::Int) if !ec.has_jumps() && !e2.exp.has_jumps() => {
-                    let f = f64::from_bits(ec.info as u64);
+                    let f = float_from_info(ec.info);
                     let val = if is_add {
-                        f + (e2.exp.info as f64)
+                        f + (info_int(e2.exp.info) as LuaNumber)
                     } else {
-                        f - (e2.exp.info as f64)
+                        f - (info_int(e2.exp.info) as LuaNumber)
                     };
                     if !val.is_nan() && val != 0.0 {
                         e = ExprItem {
-                            exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64),
+                            exp: ExpDesc::new(ExpKind::Float, float_to_info(val)),
                         };
                     } else {
                         let r = fs.exp_to_reg(&ec);
-                        let k = fs.int_k(e2.exp.info);
+                        let k = fs.int_k(info_int(e2.exp.info));
                         if k <= 255 {
                             let op = if is_add { OpCode::ADDK } else { OpCode::SUBK };
                             let pc = fs.code_abc(op, r, r, k);
                             fs.code_abc(OpCode::MMBINK, r, k, if is_add { 6 } else { 7 });
                             e = ExprItem {
-                                exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                             };
                         } else {
                             let r2 = fs.exp_to_reg(&e2.exp);
@@ -8029,21 +8070,21 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                             let pc = fs.code_abc(op, r, r, r2);
                             fs.code_abc(OpCode::MMBIN, r, r2, if is_add { 6 } else { 7 });
                             e = ExprItem {
-                                exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                             };
                         }
                     }
                 }
                 (ExpKind::Int, ExpKind::Float) if !ec.has_jumps() && !e2.exp.has_jumps() => {
-                    let f = f64::from_bits(e2.exp.info as u64);
+                    let f = float_from_info(e2.exp.info);
                     let val = if is_add {
-                        (ec.info as f64) + f
+                        (info_int(ec.info) as LuaNumber) + f
                     } else {
-                        (ec.info as f64) - f
+                        (info_int(ec.info) as LuaNumber) - f
                     };
                     if !val.is_nan() && val != 0.0 {
                         e = ExprItem {
-                            exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64),
+                            exp: ExpDesc::new(ExpKind::Float, float_to_info(val)),
                         };
                     } else {
                         let r = fs.exp_to_reg(&ec);
@@ -8053,7 +8094,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                             let pc = fs.code_abc(op, r, r, k);
                             fs.code_abc(OpCode::MMBINK, r, k, if is_add { 6 } else { 7 });
                             e = ExprItem {
-                                exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                             };
                         } else {
                             let r2 = fs.exp_to_reg(&e2.exp);
@@ -8061,18 +8102,18 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                             let pc = fs.code_abc(op, r, r, r2);
                             fs.code_abc(OpCode::MMBIN, r, r2, if is_add { 6 } else { 7 });
                             e = ExprItem {
-                                exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                             };
                         }
                     }
                 }
                 (ExpKind::Float, ExpKind::Float) if !ec.has_jumps() && !e2.exp.has_jumps() => {
-                    let f1 = f64::from_bits(ec.info as u64);
-                    let f2 = f64::from_bits(e2.exp.info as u64);
+                    let f1 = float_from_info(ec.info);
+                    let f2 = float_from_info(e2.exp.info);
                     let val = if is_add { f1 + f2 } else { f1 - f2 };
                     if !val.is_nan() && val != 0.0 {
                         e = ExprItem {
-                            exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64),
+                            exp: ExpDesc::new(ExpKind::Float, float_to_info(val)),
                         };
                     } else {
                         let r = fs.exp_to_reg(&ec);
@@ -8082,7 +8123,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                             let pc = fs.code_abc(op, r, r, k);
                             fs.code_abc(OpCode::MMBINK, r, k, if is_add { 6 } else { 7 });
                             e = ExprItem {
-                                exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                             };
                         } else {
                             let r2 = fs.exp_to_reg(&e2.exp);
@@ -8090,7 +8131,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                             let pc = fs.code_abc(op, r, r, r2);
                             fs.code_abc(OpCode::MMBIN, r, r2, if is_add { 6 } else { 7 });
                             e = ExprItem {
-                                exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                             };
                         }
                     }
@@ -8113,7 +8154,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                             fs.exp_to_reg(&e2.exp)
                         };
                         if fits_sc(&ec) {
-                            let sc = int_to_sc(ec.info);
+                            let sc = int_to_sc(info_int(ec.info));
                             // Like C's finishbinexpval: generate ADDI with A=0,
                             // free e2's register, then VRELOC (no result register).
                             let pc = fs.code_abc(OpCode::ADDI, 0, r2, sc);
@@ -8127,7 +8168,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                 exp: ExpDesc::new_reloc_with_pc(0, pc),
                             };
                         } else {
-                            let k = fs.int_k(ec.info);
+                            let k = fs.int_k(info_int(ec.info));
                             if k <= 255 {
                                 // Like C's finishbinexpval: generate ADDK with A=0,
                                 // free e2's register, then VRELOC (no result register).
@@ -8234,7 +8275,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         } else {
                             fs.exp_to_reg(&e2.exp)
                         };
-                        let f = f64::from_bits(ec.info as u64);
+                        let f = float_from_info(ec.info);
                         let k = fs.float_k(f);
                         if k <= 255 {
                             // Like C's finishbinexpval: generate ADDK with A=0,
@@ -8325,7 +8366,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                     if !is_add
                         && matches!(e2.exp.kind, ExpKind::Int)
                         && fits_sc(&e2.exp)
-                        && fits_sc_neg(e2.exp.info)
+                        && fits_sc_neg(info_int(e2.exp.info))
                         && !e2.exp.has_jumps()
                     {
                         // SUB with small negative Int: use ADDI
@@ -8348,7 +8389,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         } else {
                             fs.exp_to_reg(&ec)
                         };
-                        let v = e2.exp.info;
+                        let v = info_int(e2.exp.info);
                         let sc_neg = int_to_sc(-v);
                         let sc_pos = int_to_sc(v);
                         let pc = fs.code_abc(OpCode::ADDI, 0, v1, sc_neg);
@@ -8386,7 +8427,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         } else {
                             fs.exp_to_reg(&ec)
                         };
-                        let v = e2.exp.info;
+                        let v = info_int(e2.exp.info);
                         let sc = int_to_sc(v);
                         let pc = fs.code_abc(OpCode::ADDI, 0, v1, sc);
                         // Free v1 if it's a temp - like C's freeexps
@@ -8400,7 +8441,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         };
                     } else if is_add && matches!(e2.exp.kind, ExpKind::Int) && !e2.exp.has_jumps() {
                         // Int constant doesn't fit SC, try ADDK (like C's codearith → codebinK)
-                        let k = fs.int_k(e2.exp.info);
+                        let k = fs.int_k(info_int(e2.exp.info));
                         if k <= 255 {
                             let v1 = if ec.has_jumps() {
                                 let r = fs.exp_to_reg(&ec);
@@ -8492,7 +8533,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                     } else if !is_add && matches!(e2.exp.kind, ExpKind::Int) && !e2.exp.has_jumps()
                     {
                         // Int constant doesn't fit SC, try SUBK (like C's codearith → codebinK)
-                        let k = fs.int_k(e2.exp.info);
+                        let k = fs.int_k(info_int(e2.exp.info));
                         if k <= 255 {
                             let v1 = if ec.has_jumps() {
                                 let r = fs.exp_to_reg(&ec);
@@ -8583,7 +8624,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         }
                     } else if is_add && matches!(e2.exp.kind, ExpKind::Float) && !e2.exp.has_jumps()
                     {
-                        let f = f64::from_bits(e2.exp.info as u64);
+                        let f = float_from_info(e2.exp.info);
                         let k = fs.float_k(f);
                         if k <= 255 {
                             let v1 = if ec.has_jumps() {
@@ -8680,7 +8721,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         && matches!(e2.exp.kind, ExpKind::Float)
                         && !e2.exp.has_jumps()
                     {
-                        let f = f64::from_bits(e2.exp.info as u64);
+                        let f = float_from_info(e2.exp.info);
                         let k = fs.float_k(f);
                         if k <= 255 {
                             let v1 = if ec.has_jumps() {
@@ -8863,7 +8904,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
             // Like C's luaK_infix: if e1 is not a numeral, put it in a register
             if !matches!(ec.kind, ExpKind::Int | ExpKind::Float) {
                 let r = fs.exp_to_reg(&ec);
-                ec = ExpDesc::new(ExpKind::NonReloc, r as i64);
+                ec = ExpDesc::new(ExpKind::NonReloc, r as LuaInteger);
             }
             let mut e2 = parse_subexpr(fs, PREC_MUL + 1);
             let pc_before = fs.pc;
@@ -8883,7 +8924,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                             };
                         } else {
                             let r = fs.exp_to_reg(&ec);
-                            let k = fs.int_k(e2.exp.info);
+                            let k = fs.int_k(info_int(e2.exp.info));
                             if k <= 255 {
                                 let pc = fs.code_abc(OpCode::IDIVK, r, r, k);
                                 // Free e1's register if it's a temp - like C's freeexps
@@ -8892,26 +8933,27 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                 }
                                 fs.code_abc(OpCode::MMBINK, r, k, 12);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             } else {
                                 let r2 = fs.exp_to_reg(&e2.exp);
                                 let pc = fs.code_abc(OpCode::IDIV, r, r, r2);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             }
                         }
                     } else if is_div {
                         if e2.exp.info != 0 {
-                            let val = ec.info as f64 / e2.exp.info as f64;
+                            let val =
+                                info_int(ec.info) as LuaNumber / info_int(e2.exp.info) as LuaNumber;
                             if !val.is_nan() && val != 0.0 {
                                 e = ExprItem {
-                                    exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64),
+                                    exp: ExpDesc::new(ExpKind::Float, float_to_info(val)),
                                 };
                             } else {
                                 let r = fs.exp_to_reg(&ec);
-                                let k = fs.int_k(e2.exp.info);
+                                let k = fs.int_k(info_int(e2.exp.info));
                                 let pc = fs.code_abc(OpCode::DIVK, r, r, k);
                                 // Free e1's register if it's a temp - like C's freeexps
                                 if r >= fs.nvarstack() && r == fs.freereg - 1 {
@@ -8919,12 +8961,12 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                 }
                                 fs.code_abc(OpCode::MMBINK, r, k, 11);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             }
                         } else {
                             let r = fs.exp_to_reg(&ec);
-                            let k = fs.int_k(e2.exp.info);
+                            let k = fs.int_k(info_int(e2.exp.info));
                             let pc = fs.code_abc(OpCode::DIVK, r, r, k);
                             // Free e1's register if it's a temp - like C's freeexps
                             if r >= fs.nvarstack() && r == fs.freereg - 1 {
@@ -8932,7 +8974,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                             }
                             fs.code_abc(OpCode::MMBINK, r, k, 11);
                             e = ExprItem {
-                                exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                             };
                         }
                     } else if is_mul {
@@ -8951,7 +8993,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                             };
                         } else {
                             let r = fs.exp_to_reg(&ec);
-                            let k = fs.int_k(e2.exp.info);
+                            let k = fs.int_k(info_int(e2.exp.info));
                             if k <= 255 {
                                 let pc = fs.code_abc(OpCode::MODK, r, r, k);
                                 // Free e1's register if it's a temp - like C's freeexps
@@ -8960,29 +9002,29 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                 }
                                 fs.code_abc(OpCode::MMBINK, r, k, 9);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             } else {
                                 let r2 = fs.exp_to_reg(&e2.exp);
                                 let pc = fs.code_abc(OpCode::MOD, r, r, r2);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             }
                         }
                     }
                 }
                 (ExpKind::Float, ExpKind::Int) if !ec.has_jumps() && !e2.exp.has_jumps() => {
-                    let f = f64::from_bits(ec.info as u64);
+                    let f = float_from_info(ec.info);
                     if is_mul {
-                        let val = f * (e2.exp.info as f64);
+                        let val = f * (info_int(e2.exp.info) as LuaNumber);
                         if !val.is_nan() && val != 0.0 {
                             e = ExprItem {
-                                exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64),
+                                exp: ExpDesc::new(ExpKind::Float, float_to_info(val)),
                             };
                         } else {
                             let r = fs.exp_to_reg(&ec);
-                            let k = fs.int_k(e2.exp.info);
+                            let k = fs.int_k(info_int(e2.exp.info));
                             if k <= 255 {
                                 let pc = fs.code_abc(OpCode::MULK, r, r, k);
                                 // Free e1's register if it's a temp - like C's freeexps
@@ -8991,27 +9033,27 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                 }
                                 fs.code_abc(OpCode::MMBINK, r, k, 8);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             } else {
                                 let r2 = fs.exp_to_reg(&e2.exp);
                                 let pc = fs.code_abc(OpCode::MUL, r, r, r2);
                                 fs.code_abc(OpCode::MMBIN, r, r2, 8);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             }
                         }
                     } else if is_div {
                         if e2.exp.info != 0 {
-                            let val = f / (e2.exp.info as f64);
+                            let val = f / (info_int(e2.exp.info) as LuaNumber);
                             if !val.is_nan() && val != 0.0 {
                                 e = ExprItem {
-                                    exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64),
+                                    exp: ExpDesc::new(ExpKind::Float, float_to_info(val)),
                                 };
                             } else {
                                 let r = fs.exp_to_reg(&ec);
-                                let k = fs.int_k(e2.exp.info);
+                                let k = fs.int_k(info_int(e2.exp.info));
                                 if k <= 255 {
                                     let pc = fs.code_abc(OpCode::DIVK, r, r, k);
                                     // Free e1's register if it's a temp - like C's freeexps
@@ -9020,20 +9062,20 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                     }
                                     fs.code_abc(OpCode::MMBINK, r, k, 11);
                                     e = ExprItem {
-                                        exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                        exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                     };
                                 } else {
                                     let r2 = fs.exp_to_reg(&e2.exp);
                                     let pc = fs.code_abc(OpCode::DIV, r, r, r2);
                                     fs.code_abc(OpCode::MMBIN, r, r2, 11);
                                     e = ExprItem {
-                                        exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                        exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                     };
                                 }
                             }
                         } else {
                             let r = fs.exp_to_reg(&ec);
-                            let k = fs.int_k(e2.exp.info);
+                            let k = fs.int_k(info_int(e2.exp.info));
                             let pc = fs.code_abc(OpCode::DIVK, r, r, k);
                             // Free e1's register if it's a temp - like C's freeexps
                             if r >= fs.nvarstack() && r == fs.freereg - 1 {
@@ -9041,20 +9083,20 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                             }
                             fs.code_abc(OpCode::MMBINK, r, k, 11);
                             e = ExprItem {
-                                exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                             };
                         }
                     } else if is_idiv {
-                        let denom = e2.exp.info as f64;
+                        let denom = info_int(e2.exp.info) as LuaNumber;
                         if denom != 0.0 {
                             let val = (f / denom).floor();
                             if val != 0.0 && !val.is_nan() {
                                 e = ExprItem {
-                                    exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64),
+                                    exp: ExpDesc::new(ExpKind::Float, float_to_info(val)),
                                 };
                             } else {
                                 let r = fs.exp_to_reg(&ec);
-                                let k = fs.int_k(e2.exp.info);
+                                let k = fs.int_k(info_int(e2.exp.info));
                                 if k <= 255 {
                                     let pc = fs.code_abc(OpCode::IDIVK, r, r, k);
                                     // Free e1's register if it's a temp - like C's freeexps
@@ -9063,19 +9105,19 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                     }
                                     fs.code_abc(OpCode::MMBINK, r, k, 12);
                                     e = ExprItem {
-                                        exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                        exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                     };
                                 } else {
                                     let r2 = fs.exp_to_reg(&e2.exp);
                                     let pc = fs.code_abc(OpCode::IDIV, r, r, r2);
                                     e = ExprItem {
-                                        exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                        exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                     };
                                 }
                             }
                         } else {
                             let r = fs.exp_to_reg(&ec);
-                            let k = fs.int_k(e2.exp.info);
+                            let k = fs.int_k(info_int(e2.exp.info));
                             if k <= 255 {
                                 let pc = fs.code_abc(OpCode::IDIVK, r, r, k);
                                 // Free e1's register if it's a temp - like C's freeexps
@@ -9084,13 +9126,13 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                 }
                                 fs.code_abc(OpCode::MMBINK, r, k, 12);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             } else {
                                 let r2 = fs.exp_to_reg(&e2.exp);
                                 let pc = fs.code_abc(OpCode::IDIV, r, r, r2);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             }
                         }
@@ -9098,21 +9140,24 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         // MOD: Like C's constfolding, fold Float % Int when valid
                         let n = e2.exp.info;
                         if n != 0 {
-                            let val = f % (n as f64);
+                            let val = f % (info_int(n) as LuaNumber);
                             // C's luaV_modf sign correction
-                            let val = if val != 0.0 && (f.signum() as i64 * n.signum() as i64) < 0 {
-                                val + n as f64
+                            let val = if val != 0.0
+                                && (f.signum() as LuaInteger * info_int(n).signum() as LuaInteger)
+                                    < 0
+                            {
+                                val + info_int(n) as LuaNumber
                             } else {
                                 val
                             };
                             if !val.is_nan() && val != 0.0 {
                                 e = ExprItem {
-                                    exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64),
+                                    exp: ExpDesc::new(ExpKind::Float, float_to_info(val)),
                                 };
                             } else {
                                 // Can't fold (result is NaN or 0.0), generate MODK/MOD
                                 let r = fs.exp_to_reg(&ec);
-                                let k = fs.int_k(n);
+                                let k = fs.int_k(info_int(n));
                                 if k <= 255 {
                                     let pc = fs.code_abc(OpCode::MODK, 0, r, k);
                                     if r >= fs.nvarstack() && r == fs.freereg - 1 {
@@ -9149,7 +9194,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         } else {
                             // Divisor is 0, generate MODK/MOD (runtime error)
                             let r = fs.exp_to_reg(&ec);
-                            let k = fs.int_k(n);
+                            let k = fs.int_k(info_int(n));
                             if k <= 255 {
                                 let pc = fs.code_abc(OpCode::MODK, 0, r, k);
                                 if r >= fs.nvarstack() && r == fs.freereg - 1 {
@@ -9186,12 +9231,12 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                     }
                 }
                 (ExpKind::Int, ExpKind::Float) if !ec.has_jumps() && !e2.exp.has_jumps() => {
-                    let f = f64::from_bits(e2.exp.info as u64);
+                    let f = float_from_info(e2.exp.info);
                     if is_mul {
-                        let val = (ec.info as f64) * f;
+                        let val = (info_int(ec.info) as LuaNumber) * f;
                         if !val.is_nan() && val != 0.0 {
                             e = ExprItem {
-                                exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64),
+                                exp: ExpDesc::new(ExpKind::Float, float_to_info(val)),
                             };
                         } else {
                             let r = fs.exp_to_reg(&ec);
@@ -9204,23 +9249,23 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                 }
                                 fs.code_abc(OpCode::MMBINK, r, k, 8);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             } else {
                                 let r2 = fs.exp_to_reg(&e2.exp);
                                 let pc = fs.code_abc(OpCode::MUL, r, r, r2);
                                 fs.code_abc(OpCode::MMBIN, r, r2, 8);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             }
                         }
                     } else if is_div {
                         if f != 0.0 {
-                            let val = (ec.info as f64) / f;
+                            let val = (info_int(ec.info) as LuaNumber) / f;
                             if !val.is_nan() && val != 0.0 {
                                 e = ExprItem {
-                                    exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64),
+                                    exp: ExpDesc::new(ExpKind::Float, float_to_info(val)),
                                 };
                             } else {
                                 let r = fs.exp_to_reg(&ec);
@@ -9233,14 +9278,14 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                     }
                                     fs.code_abc(OpCode::MMBINK, r, k, 11);
                                     e = ExprItem {
-                                        exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                        exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                     };
                                 } else {
                                     let r2 = fs.exp_to_reg(&e2.exp);
                                     let pc = fs.code_abc(OpCode::DIV, r, r, r2);
                                     fs.code_abc(OpCode::MMBIN, r, r2, 11);
                                     e = ExprItem {
-                                        exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                        exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                     };
                                 }
                             }
@@ -9255,24 +9300,24 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                 }
                                 fs.code_abc(OpCode::MMBINK, r, k, 11);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             } else {
                                 let r2 = fs.exp_to_reg(&e2.exp);
                                 let pc = fs.code_abc(OpCode::DIV, r, r, r2);
                                 fs.code_abc(OpCode::MMBIN, r, r2, 11);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             }
                         }
                     } else if is_idiv {
                         if f != 0.0 {
-                            let n = ec.info as f64;
+                            let n = info_int(ec.info) as LuaNumber;
                             let val = (n / f).floor();
                             if val != 0.0 && !val.is_nan() {
                                 e = ExprItem {
-                                    exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64),
+                                    exp: ExpDesc::new(ExpKind::Float, float_to_info(val)),
                                 };
                             } else {
                                 let r = fs.exp_to_reg(&ec);
@@ -9285,13 +9330,13 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                     }
                                     fs.code_abc(OpCode::MMBINK, r, k, 12);
                                     e = ExprItem {
-                                        exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                        exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                     };
                                 } else {
                                     let r2 = fs.exp_to_reg(&e2.exp);
                                     let pc = fs.code_abc(OpCode::IDIV, r, r, r2);
                                     e = ExprItem {
-                                        exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                        exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                     };
                                 }
                             }
@@ -9306,30 +9351,32 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                 }
                                 fs.code_abc(OpCode::MMBINK, r, k, 12);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             } else {
                                 let r2 = fs.exp_to_reg(&e2.exp);
                                 let pc = fs.code_abc(OpCode::IDIV, r, r, r2);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             }
                         }
                     } else {
                         // MOD: Like C's constfolding, fold Int % Float when valid
                         if f != 0.0 {
-                            let m = ec.info as f64;
+                            let m = info_int(ec.info) as LuaNumber;
                             let val = m % f;
                             // C's luaV_modf sign correction
-                            let val = if val != 0.0 && (m.signum() as i64 * f.signum() as i64) < 0 {
+                            let val = if val != 0.0
+                                && (m.signum() as LuaInteger * f.signum() as LuaInteger) < 0
+                            {
                                 val + f
                             } else {
                                 val
                             };
                             if !val.is_nan() && val != 0.0 {
                                 e = ExprItem {
-                                    exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64),
+                                    exp: ExpDesc::new(ExpKind::Float, float_to_info(val)),
                                 };
                             } else {
                                 // Can't fold (result is NaN or 0.0), generate MODK/MOD
@@ -9408,13 +9455,13 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                     }
                 }
                 (ExpKind::Float, ExpKind::Float) if !ec.has_jumps() && !e2.exp.has_jumps() => {
-                    let f1 = f64::from_bits(ec.info as u64);
-                    let f2 = f64::from_bits(e2.exp.info as u64);
+                    let f1 = float_from_info(ec.info);
+                    let f2 = float_from_info(e2.exp.info);
                     if is_mul {
                         let val = f1 * f2;
                         if !val.is_nan() && val != 0.0 {
                             e = ExprItem {
-                                exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64),
+                                exp: ExpDesc::new(ExpKind::Float, float_to_info(val)),
                             };
                         } else {
                             let r = fs.exp_to_reg(&ec);
@@ -9427,14 +9474,14 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                 }
                                 fs.code_abc(OpCode::MMBINK, r, k, 8);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             } else {
                                 let r2 = fs.exp_to_reg(&e2.exp);
                                 let pc = fs.code_abc(OpCode::MUL, r, r, r2);
                                 fs.code_abc(OpCode::MMBIN, r, r2, 8);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             }
                         }
@@ -9443,7 +9490,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                             let val = f1 / f2;
                             if !val.is_nan() && val != 0.0 {
                                 e = ExprItem {
-                                    exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64),
+                                    exp: ExpDesc::new(ExpKind::Float, float_to_info(val)),
                                 };
                             } else {
                                 let r = fs.exp_to_reg(&ec);
@@ -9456,14 +9503,14 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                     }
                                     fs.code_abc(OpCode::MMBINK, r, k, 11);
                                     e = ExprItem {
-                                        exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                        exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                     };
                                 } else {
                                     let r2 = fs.exp_to_reg(&e2.exp);
                                     let pc = fs.code_abc(OpCode::DIV, r, r, r2);
                                     fs.code_abc(OpCode::MMBIN, r, r2, 11);
                                     e = ExprItem {
-                                        exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                        exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                     };
                                 }
                             }
@@ -9478,14 +9525,14 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                 }
                                 fs.code_abc(OpCode::MMBINK, r, k, 11);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             } else {
                                 let r2 = fs.exp_to_reg(&e2.exp);
                                 let pc = fs.code_abc(OpCode::DIV, r, r, r2);
                                 fs.code_abc(OpCode::MMBIN, r, r2, 11);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             }
                         }
@@ -9494,7 +9541,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                             let val = (f1 / f2).floor();
                             if val != 0.0 && !val.is_nan() {
                                 e = ExprItem {
-                                    exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64),
+                                    exp: ExpDesc::new(ExpKind::Float, float_to_info(val)),
                                 };
                             } else {
                                 let r = fs.exp_to_reg(&ec);
@@ -9507,13 +9554,13 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                     }
                                     fs.code_abc(OpCode::MMBINK, r, k, 12);
                                     e = ExprItem {
-                                        exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                        exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                     };
                                 } else {
                                     let r2 = fs.exp_to_reg(&e2.exp);
                                     let pc = fs.code_abc(OpCode::IDIV, r, r, r2);
                                     e = ExprItem {
-                                        exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                        exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                     };
                                 }
                             }
@@ -9528,13 +9575,13 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                 }
                                 fs.code_abc(OpCode::MMBINK, r, k, 12);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             } else {
                                 let r2 = fs.exp_to_reg(&e2.exp);
                                 let pc = fs.code_abc(OpCode::IDIV, r, r, r2);
                                 e = ExprItem {
-                                    exp: ExpDesc::new_reloc_with_pc(r as i64, pc),
+                                    exp: ExpDesc::new_reloc_with_pc(r as LuaInteger, pc),
                                 };
                             }
                         }
@@ -9543,7 +9590,8 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                         if f2 != 0.0 {
                             let val = f1 % f2;
                             // C's luaV_modf sign correction
-                            let val = if val != 0.0 && (f1.signum() as i64 * f2.signum() as i64) < 0
+                            let val = if val != 0.0
+                                && (f1.signum() as LuaInteger * f2.signum() as LuaInteger) < 0
                             {
                                 val + f2
                             } else {
@@ -9551,7 +9599,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                             };
                             if !val.is_nan() && val != 0.0 {
                                 e = ExprItem {
-                                    exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64),
+                                    exp: ExpDesc::new(ExpKind::Float, float_to_info(val)),
                                 };
                             } else {
                                 // Can't fold (result is NaN or 0.0), generate MODK/MOD
@@ -9644,11 +9692,11 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                     } else {
                         let r = fs.exp_to_reg(&e2.exp);
                         e2.exp.kind = ExpKind::NonReloc;
-                        e2.exp.info = r as i64;
+                        e2.exp.info = info_from_int(r as LuaInteger);
                         e2.exp.info2 = -1;
                         r
                     };
-                    let k = fs.int_k(ec.info);
+                    let k = fs.int_k(info_int(ec.info));
                     if k <= 255 {
                         // Like C's finishbinexpval: generate MULK with A=0,
                         // free e2's register, allocate result register, set A.
@@ -9717,11 +9765,11 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                     } else {
                         let r = fs.exp_to_reg(&e2.exp);
                         e2.exp.kind = ExpKind::NonReloc;
-                        e2.exp.info = r as i64;
+                        e2.exp.info = info_from_int(r as LuaInteger);
                         e2.exp.info2 = -1;
                         r
                     };
-                    let f = f64::from_bits(ec.info as u64);
+                    let f = float_from_info(ec.info);
                     let k = fs.float_k(f);
                     if k <= 255 {
                         // Like C's finishbinexpval: generate MULK with A=0,
@@ -9792,7 +9840,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                     let k_idx = if !e2.exp.has_jumps() {
                         match &e2.exp.kind {
                             ExpKind::Int => {
-                                let k = fs.int_k(e2.exp.info);
+                                let k = fs.int_k(info_int(e2.exp.info));
                                 if k <= 255 {
                                     Some(k)
                                 } else {
@@ -9800,7 +9848,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                                 }
                             }
                             ExpKind::Float => {
-                                let f = f64::from_bits(e2.exp.info as u64);
+                                let f = float_from_info(e2.exp.info);
                                 let k = fs.float_k(f);
                                 if k <= 255 {
                                     Some(k)
@@ -10049,7 +10097,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
             // Like C's luaK_infix: if e1 is not a numeral, put it in a register
             if !matches!(ec.kind, ExpKind::Int | ExpKind::Float) {
                 let r = fs.exp_to_reg(&ec);
-                ec = ExpDesc::new(ExpKind::NonReloc, r as i64);
+                ec = ExpDesc::new(ExpKind::NonReloc, r as LuaInteger);
             }
             let e2 = parse_subexpr(fs, PREC_POW);
             let pc_before = fs.pc;
@@ -10063,20 +10111,20 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                 && !e2.exp.has_jumps();
             if foldable {
                 let base = match ec.kind {
-                    ExpKind::Int => ec.info as f64,
-                    ExpKind::Float => f64::from_bits(ec.info as u64),
+                    ExpKind::Int => info_int(ec.info) as LuaNumber,
+                    ExpKind::Float => float_from_info(ec.info),
                     _ => unreachable!(),
                 };
                 let exp = match e2.exp.kind {
-                    ExpKind::Int => e2.exp.info as f64,
-                    ExpKind::Float => f64::from_bits(e2.exp.info as u64),
+                    ExpKind::Int => info_int(e2.exp.info) as LuaNumber,
+                    ExpKind::Float => float_from_info(e2.exp.info),
                     _ => unreachable!(),
                 };
                 let result = crate::config::float_pow(base, exp);
                 // Like C's constfolding: don't fold if result is NaN or 0.0
                 if !result.is_nan() && result != 0.0 {
                     e = ExprItem {
-                        exp: ExpDesc::new(ExpKind::Float, result.to_bits() as i64),
+                        exp: ExpDesc::new(ExpKind::Float, float_to_info(result)),
                     };
                 } else {
                     pow_no_fold = true;
@@ -10089,7 +10137,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                 let k_idx = if !e2.exp.has_jumps() {
                     match &e2.exp.kind {
                         ExpKind::Int => {
-                            let k = fs.int_k(e2.exp.info);
+                            let k = fs.int_k(info_int(e2.exp.info));
                             if k <= 255 {
                                 Some(k)
                             } else {
@@ -10097,7 +10145,7 @@ fn parse_subexpr<'a, 'b>(fs: &mut FuncState<'a, 'b>, limit: i32) -> ExprItem<'b>
                             }
                         }
                         ExpKind::Float => {
-                            let f = f64::from_bits(e2.exp.info as u64);
+                            let f = float_from_info(e2.exp.info);
                             let k = fs.float_k(f);
                             if k <= 255 {
                                 Some(k)
@@ -10233,28 +10281,28 @@ fn check_compare(fs: &FuncState) -> bool {
 
 /// Try to convert an expression to an integer constant value.
 /// Like C's tonumeral + luaV_tointegerns with LUA_FLOORN2I.
-fn to_int_const(e: &ExpDesc) -> Option<i64> {
+fn to_int_const(e: &ExpDesc) -> Option<LuaInteger> {
     if e.has_jumps() {
         return None;
     }
     match e.kind {
-        ExpKind::Int => Some(e.info),
+        ExpKind::Int => Some(info_int(e.info)),
         ExpKind::Float => {
-            let f = f64::from_bits(e.info as u64);
+            let f = float_from_info(e.info);
             // Must match C's luaV_flttointeger (F2Ieq) + lua_numbertointeger range check.
-            // Rust's `f as i64` saturates, wrongly converting 2^63 to i64::MAX.
+            // Rust's `f as LuaInteger` saturates, wrongly converting 2^(NBITS-1) to MAX_INTEGER.
             crate::vm::float_to_integer(f, crate::vm::F2IMode::Eq)
         }
         _ => None,
     }
 }
 
-const OFFSET_SC: i64 = 127;
+const OFFSET_SC: LuaInteger = 127;
 
 /// 判断整型常量是否适合 SC 参数编码 (i8 范围内)
 fn fits_sc(desc: &ExpDesc) -> bool {
     if let ExpKind::Int = desc.kind {
-        let v = desc.info;
+        let v = info_int(desc.info);
         // C's fitsC: range -127 to 128
         v >= -127 && v <= 128
     } else {
@@ -10263,27 +10311,27 @@ fn fits_sc(desc: &ExpDesc) -> bool {
 }
 
 /// 判断整型常量取负后是否适合 SC 编码
-fn fits_sc_neg(v: i64) -> bool {
+fn fits_sc_neg(v: LuaInteger) -> bool {
     // C's fitsC: range -127 to 128, and -v must also fit
     v >= -127 && v <= 128 && -v >= -127 && -v <= 128
 }
 
 /// 将整型常量转换为 SC 参数编码 (加 OFFSET_SC 偏移)
-fn int_to_sc(v: i64) -> i32 {
-    ((v as u64).wrapping_add(OFFSET_SC as u64)) as i32
+fn int_to_sc(v: LuaInteger) -> i32 {
+    ((v as LuaUnsigned).wrapping_add(OFFSET_SC as LuaUnsigned)) as i32
 }
 
 /// 获取表达式的 SC 整数值 (C 的 isSCnumber 对应)
 /// 返回 Some((整数值, isfloat))；isfloat=true 表示原常量是浮点数（如 5.0）。
 /// C Lua 在 LTI/LEI/GTI/GEI/EQI 指令的 C 字段中存储此标志，
 /// 元方法调用时需还原为 float 类型（见 luaT_callorderiTM）。
-fn is_sc_number(desc: &ExpDesc) -> Option<(i64, bool)> {
+fn is_sc_number(desc: &ExpDesc) -> Option<(LuaInteger, bool)> {
     if desc.has_jumps() {
         return None;
     }
     match desc.kind {
         ExpKind::Int => {
-            let v = desc.info;
+            let v = info_int(desc.info);
             // C's fitsC: (unsigned)i + OFFSET_sC <= MAXARG_C, where OFFSET_sC=127, MAXARG_C=255
             // So range is -127 to 128
             if v >= -127 && v <= 128 {
@@ -10293,11 +10341,11 @@ fn is_sc_number(desc: &ExpDesc) -> Option<(i64, bool)> {
             }
         }
         ExpKind::Float => {
-            let f = f64::from_bits(desc.info as u64);
+            let f = float_from_info(desc.info);
             // Like C's luaV_flttointeger with F2Ieq: floor(f) == f (exact equality)
             let fl = f.floor();
             if fl == f {
-                let i = fl as i64;
+                let i = fl as LuaInteger;
                 // C's fitsC: range -127 to 128
                 if i >= -127 && i <= 128 {
                     Some((i, true))
@@ -10313,8 +10361,8 @@ fn is_sc_number(desc: &ExpDesc) -> Option<(i64, bool)> {
 }
 
 /// 判断整型值是否适合 AsBx 模式的有符号偏移量
-fn fits_sbx(v: i64) -> bool {
-    v >= -(OFFSET_SBX as i64) && v <= (OFFSET_SBX as i64) + 1
+fn fits_sbx(v: LuaInteger) -> bool {
+    v >= -(OFFSET_SBX as LuaInteger) && v <= (OFFSET_SBX as LuaInteger) + 1
 }
 
 /// 将表达式转换为常量表索引 (用于 EQK 等比较指令)
@@ -10331,12 +10379,12 @@ fn exp_to_const_k<'a, 'b>(fs: &mut FuncState<'a, 'b>, e: &ExpDesc<'b>) -> Option
         }
         ExpKind::Nil => fs.const_k(TValue::Nil(NilKind::Strict)),
         ExpKind::Float => {
-            let f = f64::from_bits(e.info as u64);
+            let f = float_from_info(e.info);
             // Like C's isSCnumber: if float can be exactly converted to integer in sC range,
             // it's an SC number (use EQI), not a K constant
             let fl = f.floor();
             if fl == f {
-                let i = fl as i64;
+                let i = fl as LuaInteger;
                 if i >= -127 && i <= 128 {
                     return None; // It's an SC number, not a K constant
                 }
@@ -10347,7 +10395,7 @@ fn exp_to_const_k<'a, 'b>(fs: &mut FuncState<'a, 'b>, e: &ExpDesc<'b>) -> Option
             if fits_sc(e) {
                 return None;
             }
-            fs.int_k(e.info)
+            fs.int_k(info_int(e.info))
         }
         _ => return None,
     };
@@ -10367,9 +10415,9 @@ fn exp2rk<'a, 'b>(fs: &mut FuncState<'a, 'b>, e: &ExpDesc<'b>) -> (i32, bool) {
                 TValue::Boolean(false)
             }),
             ExpKind::Nil => fs.const_k(TValue::Nil(NilKind::Strict)),
-            ExpKind::Int => fs.int_k(e.info),
+            ExpKind::Int => fs.int_k(info_int(e.info)),
             ExpKind::Float => {
-                let f = f64::from_bits(e.info as u64);
+                let f = float_from_info(e.info);
                 fs.float_k(f)
             }
             ExpKind::Str => fs.get_str_k(e),
@@ -10430,7 +10478,7 @@ fn code_global_via_env<'a, 'b>(fs: &mut FuncState<'a, 'b>, name: &str) -> ExpDes
                     fs.free_reg();
                 }
                 let pc = fs.code_abc(OpCode::GETVARG, 0, env_reg, kr);
-                return ExpDesc::new_reloc_with_pc(kr as i64, pc);
+                return ExpDesc::new_reloc_with_pc(kr as LuaInteger, pc);
             } else if is_short_str {
                 let r = fs.alloc_reg();
                 let pc = code_getfield(fs, r, env_reg, k);
@@ -10502,7 +10550,7 @@ fn code_global_via_env<'a, 'b>(fs: &mut FuncState<'a, 'b>, name: &str) -> ExpDes
     };
     ExpDesc {
         kind: ExpKind::NonReloc,
-        info: r as i64,
+        info: info_from_int(r as LuaInteger),
         info2: pc,
         t: NO_JUMP,
         f: NO_JUMP,
@@ -10528,9 +10576,9 @@ fn parse_simple_exp_name<'a, 'b>(fs: &mut FuncState<'a, 'b>, name: TValue<'b>) -
         LocalLookup::Ctc(ctc) => ctc,
         LocalLookup::Local { reg, kind } => {
             if kind == RDKVAVAR {
-                ExpDesc::new(ExpKind::VVARGVAR, reg as i64)
+                ExpDesc::new(ExpKind::VVARGVAR, reg as LuaInteger)
             } else {
-                ExpDesc::new(ExpKind::NonReloc, reg as i64)
+                ExpDesc::new(ExpKind::NonReloc, reg as LuaInteger)
             }
         }
         // 具名 global 声明（如 `global a`）: 优先于 upvalue，通过 _ENV[name] 访问
@@ -10542,7 +10590,7 @@ fn parse_simple_exp_name<'a, 'b>(fs: &mut FuncState<'a, 'b>, name: TValue<'b>) -
                 match result {
                     UpvalueOrCtc::Upvalue(upval_idx) => ExpDesc {
                         kind: ExpKind::Upval,
-                        info: upval_idx as i64,
+                        info: info_from_int(upval_idx as LuaInteger),
                         info2: 0,
                         t: NO_JUMP,
                         f: NO_JUMP,
@@ -10561,7 +10609,7 @@ fn parse_simple_exp_name<'a, 'b>(fs: &mut FuncState<'a, 'b>, name: TValue<'b>) -
                 match result {
                     UpvalueOrCtc::Upvalue(upval_idx) => ExpDesc {
                         kind: ExpKind::Upval,
-                        info: upval_idx as i64,
+                        info: info_from_int(upval_idx as LuaInteger),
                         info2: 0,
                         t: NO_JUMP,
                         f: NO_JUMP,
@@ -10584,7 +10632,7 @@ fn parse_simple_exp_name<'a, 'b>(fs: &mut FuncState<'a, 'b>, name: TValue<'b>) -
                         // GETUPVAL is emitted when the value is needed (e.g., in expr_to_reg).
                         ExpDesc {
                             kind: ExpKind::Upval,
-                            info: upval_idx as i64,
+                            info: info_from_int(upval_idx as LuaInteger),
                             info2: 0,
                             t: NO_JUMP,
                             f: NO_JUMP,
@@ -10603,7 +10651,7 @@ fn parse_simple_exp_name<'a, 'b>(fs: &mut FuncState<'a, 'b>, name: TValue<'b>) -
                 };
                 ExpDesc {
                     kind: ExpKind::Upval,
-                    info: env_idx as i64,
+                    info: info_from_int(env_idx as LuaInteger),
                     info2: 0,
                     t: NO_JUMP,
                     f: NO_JUMP,
@@ -10679,7 +10727,7 @@ fn parse_simple_exp<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> ExprItem<'b> {
                 let val = *v;
                 fs.ls_mut().next();
                 return ExprItem {
-                    exp: ExpDesc::new(ExpKind::Float, val.to_bits() as i64),
+                    exp: ExpDesc::new(ExpKind::Float, float_to_info(val)),
                 };
             }
             Token::String(s) => {
@@ -10700,7 +10748,7 @@ fn parse_simple_exp<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> ExprItem<'b> {
                 // info stores PC (like C's u.info), info2 also stores PC for set_c
                 ExpDesc {
                     kind: ExpKind::Vararg,
-                    info: pc as i64,
+                    info: info_from_int(pc as LuaInteger),
                     info2: pc,
                     t: NO_JUMP,
                     f: NO_JUMP,
@@ -10710,7 +10758,7 @@ fn parse_simple_exp<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> ExprItem<'b> {
             Token::LBrace => {
                 let (r, _n) = parse_constructor(fs);
                 return ExprItem {
-                    exp: ExpDesc::new(ExpKind::NonReloc, r as i64),
+                    exp: ExpDesc::new(ExpKind::NonReloc, r as LuaInteger),
                 };
             }
             Token::Name(name) => {
@@ -10826,32 +10874,38 @@ fn parse_simple_exp<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> ExprItem<'b> {
                             let r = fs.exp_to_reg(&ei_exp);
                             let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
                             fs.fixline(op_line);
-                            fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
-                            ExpDesc::new_reloc_with_pc(r as i64, pc)
+                            fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as LuaInteger));
+                            ExpDesc::new_reloc_with_pc(r as LuaInteger, pc)
                         } else {
                             match ei_exp.kind {
                                 ExpKind::Int => {
                                     ExpDesc::new(ExpKind::Int, ei_exp.info.wrapping_neg())
                                 }
                                 ExpKind::Float => {
-                                    let f = f64::from_bits(ei_exp.info as u64);
+                                    let f = float_from_info(ei_exp.info);
                                     let result = -f;
                                     if result.is_nan() || result == 0.0 {
                                         let r = fs.exp_to_reg(&ei_exp);
                                         let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
                                         fs.fixline(op_line);
-                                        fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
-                                        ExpDesc::new_reloc_with_pc(r as i64, pc)
+                                        fs.free_exp_reg(&ExpDesc::new(
+                                            ExpKind::NonReloc,
+                                            r as LuaInteger,
+                                        ));
+                                        ExpDesc::new_reloc_with_pc(r as LuaInteger, pc)
                                     } else {
-                                        ExpDesc::new(ExpKind::Float, result.to_bits() as i64)
+                                        ExpDesc::new(ExpKind::Float, float_to_info(result))
                                     }
                                 }
                                 _ => {
                                     let r = fs.exp_to_reg(&ei_exp);
                                     let pc = fs.code_abc(OpCode::UNM, 0, r, 0);
                                     fs.fixline(op_line);
-                                    fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
-                                    ExpDesc::new_reloc_with_pc(r as i64, pc)
+                                    fs.free_exp_reg(&ExpDesc::new(
+                                        ExpKind::NonReloc,
+                                        r as LuaInteger,
+                                    ));
+                                    ExpDesc::new_reloc_with_pc(r as LuaInteger, pc)
                                 }
                             }
                         }
@@ -10859,18 +10913,18 @@ fn parse_simple_exp<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> ExprItem<'b> {
                     Token::Hash => {
                         // Like C's codeunexpval: exp2anyreg + freeexp + codeABC(A=0) + VRELOC
                         let r = fs.exp_to_reg(&ei_exp);
-                        fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
+                        fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as LuaInteger));
                         let pc = fs.code_abc(OpCode::LEN, 0, r, 0);
                         fs.fixline(op_line);
-                        ExpDesc::new_reloc_with_pc(r as i64, pc)
+                        ExpDesc::new_reloc_with_pc(r as LuaInteger, pc)
                     }
                     Token::Tilde => {
                         if ei_exp.has_jumps() {
                             let r = fs.exp_to_reg(&ei_exp);
                             let pc = fs.code_abc(OpCode::BNOT, 0, r, 0);
                             fs.fixline(op_line);
-                            fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
-                            ExpDesc::new_reloc_with_pc(r as i64, pc)
+                            fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as LuaInteger));
+                            ExpDesc::new_reloc_with_pc(r as LuaInteger, pc)
                         } else {
                             match ei_exp.kind {
                                 ExpKind::Int => ExpDesc::new(ExpKind::Int, !(ei_exp.info)),
@@ -10882,30 +10936,36 @@ fn parse_simple_exp<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> ExprItem<'b> {
                                         let r = fs.exp_to_reg(&ei_exp);
                                         let pc = fs.code_abc(OpCode::BNOT, 0, r, 0);
                                         fs.fixline(op_line);
-                                        fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
-                                        ExpDesc::new_reloc_with_pc(r as i64, pc)
+                                        fs.free_exp_reg(&ExpDesc::new(
+                                            ExpKind::NonReloc,
+                                            r as LuaInteger,
+                                        ));
+                                        ExpDesc::new_reloc_with_pc(r as LuaInteger, pc)
                                     }
                                 }
                                 _ => {
                                     let r = fs.exp_to_reg(&ei_exp);
                                     let pc = fs.code_abc(OpCode::BNOT, 0, r, 0);
                                     fs.fixline(op_line);
-                                    fs.free_exp_reg(&ExpDesc::new(ExpKind::NonReloc, r as i64));
-                                    ExpDesc::new_reloc_with_pc(r as i64, pc)
+                                    fs.free_exp_reg(&ExpDesc::new(
+                                        ExpKind::NonReloc,
+                                        r as LuaInteger,
+                                    ));
+                                    ExpDesc::new_reloc_with_pc(r as LuaInteger, pc)
                                 }
                             }
                         }
                     }
                     _ => {
                         let r = fs.exp_to_reg(&ei_exp);
-                        ExpDesc::new(ExpKind::Relocable, r as i64)
+                        ExpDesc::new(ExpKind::Relocable, r as LuaInteger)
                     }
                 }
             }
             Token::Function => {
                 fs.ls_mut().next();
                 let r = parse_body(fs, None);
-                ExpDesc::new(ExpKind::Relocable, r as i64)
+                ExpDesc::new(ExpKind::Relocable, r as LuaInteger)
             }
             _ => {
                 fs.error(&format!(
@@ -10945,14 +11005,14 @@ fn parse_simple_exp<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> ExprItem<'b> {
                 e = if call_pc >= 0 {
                     ExpDesc {
                         kind: ExpKind::Call,
-                        info: freg as i64,
+                        info: info_from_int(freg as LuaInteger),
                         info2: call_pc,
                         t: NO_JUMP,
                         f: NO_JUMP,
                         str_val: None,
                     }
                 } else {
-                    ExpDesc::new(ExpKind::Relocable, freg as i64)
+                    ExpDesc::new(ExpKind::Relocable, freg as LuaInteger)
                 };
             }
             Token::Dot => {
@@ -10971,7 +11031,7 @@ fn parse_simple_exp<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> ExprItem<'b> {
                     }
                     // Generate GETVARG with A=0 (relocatable), like C compiler
                     let pc = fs.code_abc(OpCode::GETVARG, 0, base_reg, kr);
-                    e = ExpDesc::new_reloc_with_pc(kr as i64, pc);
+                    e = ExpDesc::new_reloc_with_pc(kr as LuaInteger, pc);
                     continue;
                 }
                 let base_reg = fs.exp_to_reg(&e);
@@ -11005,7 +11065,7 @@ fn parse_simple_exp<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> ExprItem<'b> {
                     fs.free_reg(); // kr
                     e = ExpDesc {
                         kind: ExpKind::NonReloc,
-                        info: base_reg as i64,
+                        info: info_from_int(base_reg as LuaInteger),
                         info2: inst_pc,
                         t: NO_JUMP,
                         f: NO_JUMP,
@@ -11029,7 +11089,7 @@ fn parse_simple_exp<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> ExprItem<'b> {
                     };
                     e = ExpDesc {
                         kind: ExpKind::NonReloc,
-                        info: result_reg as i64,
+                        info: info_from_int(result_reg as LuaInteger),
                         info2: inst_pc,
                         t: NO_JUMP,
                         f: NO_JUMP,
@@ -11058,7 +11118,7 @@ fn parse_simple_exp<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> ExprItem<'b> {
                     }
                     // Generate GETVARG with A=0 (relocatable), like C compiler
                     let pc = fs.code_abc(OpCode::GETVARG, 0, base_reg, key_reg);
-                    e = ExpDesc::new_reloc_with_pc(key_reg as i64, pc);
+                    e = ExpDesc::new_reloc_with_pc(key_reg as LuaInteger, pc);
                     continue;
                 }
                 // Check if table is an upvalue (like C's VUPVAL in luaK_indexed)
@@ -11160,14 +11220,14 @@ fn parse_simple_exp<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> ExprItem<'b> {
                     // Handle key based on type
                     if ei.exp.kind == ExpKind::Int
                         && ei.exp.info >= 0
-                        && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
+                        && ei.exp.info <= ((1u32 << SIZE_C) - 1) as InfoBits
                     {
                         // Int key: GETI (result in base_reg, like C)
                         let inst_pc =
                             fs.code_abc(OpCode::GETI, base_reg, base_reg, ei.exp.info as i32);
                         e = ExpDesc {
                             kind: ExpKind::NonReloc,
-                            info: base_reg as i64,
+                            info: info_from_int(base_reg as LuaInteger),
                             info2: inst_pc,
                             t: NO_JUMP,
                             f: NO_JUMP,
@@ -11241,7 +11301,7 @@ fn parse_simple_exp<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> ExprItem<'b> {
                     if ei.exp.kind == ExpKind::Int
                         && !ei.exp.has_jumps()
                         && ei.exp.info >= 0
-                        && ei.exp.info <= ((1u32 << SIZE_C) - 1) as i64
+                        && ei.exp.info <= ((1u32 << SIZE_C) - 1) as InfoBits
                     {
                         result_reg = if base_is_nonreloc_local {
                             fs.alloc_reg()
@@ -11315,7 +11375,7 @@ fn parse_simple_exp<'a, 'b>(fs: &mut FuncState<'a, 'b>) -> ExprItem<'b> {
                     }
                     e = ExpDesc {
                         kind: ExpKind::NonReloc,
-                        info: result_reg as i64,
+                        info: info_from_int(result_reg as LuaInteger),
                         info2: inst_pc,
                         t: NO_JUMP,
                         f: NO_JUMP,
@@ -12534,7 +12594,7 @@ fn parse_local(fs: &mut FuncState) {
                             fs.resolve_jumps(&ei.exp, target);
                         }
                         fs.set_freereg(target + 1);
-                        last_exp = Some(ExpDesc::new(ExpKind::NonReloc, target as i64));
+                        last_exp = Some(ExpDesc::new(ExpKind::NonReloc, target as LuaInteger));
                     }
                     ExpKind::Relocable => {
                         if ei.exp.info2 >= 0 {
@@ -12543,7 +12603,7 @@ fn parse_local(fs: &mut FuncState) {
                                 fs.resolve_jumps(&ei.exp, target);
                             }
                             fs.set_freereg(target + 1);
-                            last_exp = Some(ExpDesc::new(ExpKind::NonReloc, target as i64));
+                            last_exp = Some(ExpDesc::new(ExpKind::NonReloc, target as LuaInteger));
                         } else {
                             let r = ei.exp.info as i32;
                             if r != target {
@@ -12553,7 +12613,7 @@ fn parse_local(fs: &mut FuncState) {
                                 fs.resolve_jumps(&ei.exp, target);
                             }
                             fs.set_freereg(target + 1);
-                            last_exp = Some(ExpDesc::new(ExpKind::Relocable, target as i64));
+                            last_exp = Some(ExpDesc::new(ExpKind::Relocable, target as LuaInteger));
                         }
                     }
                     _ => {
@@ -12855,7 +12915,7 @@ fn parse_constructor(fs: &mut FuncState) -> (i32, i32) {
                 };
                 let is_seti = ek.exp.kind == ExpKind::Int
                     && ek.exp.info >= 0
-                    && ek.exp.info <= ((1u32 << SIZE_C) - 1) as i64;
+                    && ek.exp.info <= ((1u32 << SIZE_C) - 1) as InfoBits;
                 // For SETTABLE, discharge key to register before parsing value,
                 // so key's register is at freereg-1 when discharged
                 let k_r = if key_k.is_none() && !is_seti {
@@ -13249,13 +13309,13 @@ fn parse_body_ex(fs: &mut FuncState, ismethod: bool, target: Option<i32>) -> i32
 // Value comparison for constant dedup
 // ============================================================================
 
-/// 检查 float 值是否为整数值且在 i64 范围内。
+/// 检查 float 值是否为整数值且在 `LuaInteger` 范围内。
 ///
 /// 等价于 C 版本 `luaV_flttointeger(n, p, F2Ieq)` 的判断逻辑：
 /// 1. n 必须是有限值
 /// 2. n 必须是整数值（n == floor(n)）
-/// 3. n 必须在 i64 范围内（i64::MIN <= n < 2^63）
-fn float_is_integer(k: f64) -> bool {
+/// 3. n 必须在 `LuaInteger` 范围内（MIN_INTEGER <= n < 2^(NBITS-1)）
+fn float_is_integer(k: LuaNumber) -> bool {
     if !k.is_finite() {
         return false;
     }
@@ -13263,9 +13323,8 @@ fn float_is_integer(k: f64) -> bool {
     if k.trunc() != k {
         return false;
     }
-    // 检查是否在 i64 范围内
-    // LUA_MININTEGER = i64::MIN = -2^63，可精确表示为 f64
-    // -LUA_MININTEGER = 2^63，可精确表示为 f64
-    // 条件：k >= i64::MIN && k < 2^63
-    k >= (i64::MIN as f64) && k < (1u64 << 63) as f64
+    // 检查是否在 LuaInteger 范围内
+    // LUA_MININTEGER = -2^(NBITS-1)，可精确表示为浮点
+    // -LUA_MININTEGER = 2^(NBITS-1)，可精确表示为浮点
+    k >= (MIN_INTEGER as LuaNumber) && k < ((1 as LuaUnsigned) << (INTEGER_BITS - 1)) as LuaNumber
 }

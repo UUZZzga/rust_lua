@@ -1,10 +1,8 @@
 //! Lua 5.5 解析器 FFI 绑定（lparser.h）
 //!
-//! 通过 bindings.rs 直接调用 C 的 luaY_nvarstack / luaY_checklimit。
 //! FuncState 作为不透明指针传递。
 
 use crate::bindings;
-use std::ffi::CString;
 
 /// FuncState 不透明句柄（内部持有 C 的 FuncState*）
 pub struct FuncState {
@@ -24,27 +22,6 @@ impl FuncState {
     pub fn as_ptr(&self) -> *mut bindings::FuncState {
         self.raw
     }
-}
-
-// ============================================================================
-// FFI 调用 — 直接调用 C 的 luaY_nvarstack / luaY_checklimit
-// ============================================================================
-
-/// 返回函数寄存器栈中变量数（调用 C 的 luaY_nvarstack）
-///
-/// # Safety
-/// `fs` 必须指向有效的 FuncState。
-pub unsafe fn nvarstack(fs: &FuncState) -> u8 {
-    bindings::luaY_nvarstack(fs.raw)
-}
-
-/// 检查限制（调用 C 的 luaY_checklimit）
-///
-/// # Safety
-/// `fs` 必须指向有效的 FuncState。
-pub unsafe fn checklimit(fs: &FuncState, v: i32, l: i32, what: &str) {
-    let c_what = CString::new(what).expect("CString::new failed");
-    bindings::luaY_checklimit(fs.raw, v, l, c_what.as_ptr());
 }
 
 // ============================================================================
@@ -76,17 +53,5 @@ mod tests {
             assert!(!fs.raw.is_null());
             free_fs(fs);
         }
-    }
-
-    #[test]
-    fn test_nvarstack_c_api_exists() {
-        // 仅验证 FFI 符号存在且可链接
-        // nvarstack 访问 fs 内部，需要完整初始化的 FuncState
-        // 此测试仅验证编译链接
-    }
-
-    #[test]
-    fn test_checklimit_c_api_exists() {
-        // 仅验证 FFI 符号存在且可链接
     }
 }

@@ -10,6 +10,7 @@
 //! ## 迁移说明
 //! - 已从 LightUserData(tag) 迁移到 BuiltinFn 函数指针方案
 
+use crate::config::{LuaInteger, LuaUnsigned};
 use crate::execute::VmError;
 use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
@@ -67,7 +68,7 @@ fn iscontp(s: &[u8], idx: usize) -> bool {
 /// - pos >= 0: 返回 pos
 /// - pos < 0 且 |pos| > len: 返回 0
 /// - pos < 0 且 |pos| <= len: 返回 len + pos + 1
-fn u_posrelat(pos: i64, len: usize) -> i64 {
+fn u_posrelat(pos: LuaInteger, len: usize) -> LuaInteger {
     if pos >= 0 {
         pos
     } else {
@@ -75,7 +76,7 @@ fn u_posrelat(pos: i64, len: usize) -> i64 {
         if abs_pos > len {
             0
         } else {
-            len as i64 + pos + 1
+            len as LuaInteger + pos + 1
         }
     }
 }
@@ -228,7 +229,7 @@ fn get_str_bytes<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> Result<Vec<u
 }
 
 /// 从栈中读取可选整数参数
-fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: i64) -> i64 {
+fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: LuaInteger) -> LuaInteger {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.stack.len() {
         return default;
@@ -236,10 +237,10 @@ fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: i64) -> i64 
     match &state.stack[stack_idx] {
         TValue::Nil(_) => default,
         TValue::Integer(n) => *n,
-        TValue::Float(f) => *f as i64,
-        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
-            lua_string_as_str(s).parse::<i64>().unwrap_or(default)
-        }
+        TValue::Float(f) => *f as LuaInteger,
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => lua_string_as_str(s)
+            .parse::<LuaInteger>()
+            .unwrap_or(default),
         _ => default,
     }
 }
@@ -259,7 +260,7 @@ fn get_required_int_arg<'a>(
     a: usize,
     idx: usize,
     fname: &str,
-) -> Result<i64, VmError<'a>> {
+) -> Result<LuaInteger, VmError<'a>> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.stack.len() {
         return Err(VmError::RuntimeError(format!(
@@ -270,9 +271,9 @@ fn get_required_int_arg<'a>(
     }
     match &state.stack[stack_idx] {
         TValue::Integer(n) => Ok(*n),
-        TValue::Float(f) => Ok(*f as i64),
+        TValue::Float(f) => Ok(*f as LuaInteger),
         s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
-            lua_string_as_str(s).parse::<i64>().map_err(|_| {
+            lua_string_as_str(s).parse::<LuaInteger>().map_err(|_| {
                 VmError::RuntimeError(format!(
                     "bad argument #{} to '{}' (number expected, got string)",
                     idx + 1,
@@ -305,7 +306,12 @@ fn bytes_to_lua_str<'a>(state: &LuaState<'a>, bytes: &[u8]) -> TValue<'a> {
 // ============================================================================
 
 /// utf8.codepoint(s, [i, [j [, lax]]]) — 对应 C 的 codepoint
-fn utf8_codepoint_impl(s: &[u8], posi: i64, pose: i64, lax: bool) -> Result<Vec<u32>, String> {
+fn utf8_codepoint_impl(
+    s: &[u8],
+    posi: LuaInteger,
+    pose: LuaInteger,
+    lax: bool,
+) -> Result<Vec<u32>, String> {
     let len = s.len();
     let posi = u_posrelat(posi, len);
     let pose = u_posrelat(pose, len);
@@ -313,7 +319,7 @@ fn utf8_codepoint_impl(s: &[u8], posi: i64, pose: i64, lax: bool) -> Result<Vec<
     if posi < 1 {
         return Err("out of bounds".to_string());
     }
-    if pose > len as i64 {
+    if pose > len as LuaInteger {
         return Err("out of bounds".to_string());
     }
     if posi > pose {
@@ -338,14 +344,16 @@ fn utf8_codepoint_impl(s: &[u8], posi: i64, pose: i64, lax: bool) -> Result<Vec<
 }
 
 /// utf8.char(n1, n2, ...) — 对应 C 的 utfchar
-fn utf8_char_impl(codes: &[i64]) -> Result<Vec<u8>, String> {
+fn utf8_char_impl(codes: &[LuaInteger]) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     for &c in codes {
-        let code = c as u32;
-        if code > MAXUTF {
+        // 对应 C 的 lua_Unsigned code = (lua_Unsigned)luaL_checkinteger(L, i)
+        let code = c as LuaUnsigned;
+        if code > MAXUTF as LuaUnsigned {
             return Err("value out of range".to_string());
         }
-        bytes.extend_from_slice(&utf8_encode(code));
+        // 范围已由 MAXUTF 保证（对应 C 的 utf8esc(unsigned) 窄化）
+        bytes.extend_from_slice(&utf8_encode(code as u32));
     }
     Ok(bytes)
 }
@@ -354,15 +362,19 @@ fn utf8_char_impl(codes: &[i64]) -> Result<Vec<u8>, String> {
 ///
 /// 返回第 n 个字符（从位置 i 开始计数）的起始和结束字节位置
 /// n=0 表示位置 i 处的当前字符
-fn utf8_offset_impl(s: &[u8], n: i64, posi_arg: i64) -> Result<Option<(i64, i64)>, String> {
+fn utf8_offset_impl(
+    s: &[u8],
+    n: LuaInteger,
+    posi_arg: LuaInteger,
+) -> Result<Option<(LuaInteger, LuaInteger)>, String> {
     let len = s.len();
 
     // 默认位置: n >= 0 时为 1, n < 0 时为 len + 1
-    let _default_posi = if n >= 0 { 1 } else { len as i64 + 1 };
+    let _default_posi = if n >= 0 { 1 } else { len as LuaInteger + 1 };
     let posi = u_posrelat(posi_arg, len);
 
     // 边界检查: 1 <= posi <= len + 1
-    if !(1 <= posi && posi <= len as i64 + 1) {
+    if !(1 <= posi && posi <= len as LuaInteger + 1) {
         return Err("position out of bounds".to_string());
     }
     let mut posi = (posi - 1) as usize; // 转为 0-based
@@ -427,7 +439,7 @@ fn utf8_offset_impl(s: &[u8], n: i64, posi_arg: i64) -> Result<Option<(i64, i64)
     // 单字节字符: 结束位置 = 初始位置
 
     let final_pos = posi + 1; // 1-based
-    Ok(Some((init_pos as i64, final_pos as i64)))
+    Ok(Some((init_pos as LuaInteger, final_pos as LuaInteger)))
 }
 
 /// utf8 迭代器辅助函数 — 对应 C 的 iter_aux
@@ -435,7 +447,7 @@ fn utf8_offset_impl(s: &[u8], n: i64, posi_arg: i64) -> Result<Option<(i64, i64)
 /// 参数: s (字符串), n (当前位置, 0-based)
 /// 返回: (next_position, codepoint) 或空 Vec (结束)
 #[cfg(test)]
-fn utf8_iter_aux_impl(s: &[u8], n_arg: i64, strict: bool) -> Vec<TValue<'_>> {
+fn utf8_iter_aux_impl(s: &[u8], n_arg: LuaInteger, strict: bool) -> Vec<TValue<'_>> {
     let len = s.len();
     // 将 n 视为无符号 (对应 C 的 lua_Unsigned)
     let n = if n_arg < 0 {
@@ -459,8 +471,8 @@ fn utf8_iter_aux_impl(s: &[u8], n_arg: i64, strict: bool) -> Vec<TValue<'_>> {
     match utf8_decode(&s[n..], strict) {
         Some((_, code)) => {
             vec![
-                TValue::Integer((n + 1) as i64), // 1-based 位置
-                TValue::Integer(code as i64),
+                TValue::Integer((n + 1) as LuaInteger), // 1-based 位置
+                TValue::Integer(code as LuaInteger),
             ]
         }
         None => {
@@ -484,7 +496,7 @@ fn call_offset<'a>(
 ) -> Result<(), VmError<'a>> {
     let s = get_str_bytes(state, a, 0)?;
     let n = get_required_int_arg(state, a, 1, "offset")?;
-    let default_posi = if n >= 0 { 1 } else { s.len() as i64 + 1 };
+    let default_posi = if n >= 0 { 1 } else { s.len() as LuaInteger + 1 };
     let posi = if nargs >= 3 {
         get_opt_int_arg(state, a, 2, default_posi)
     } else {
@@ -534,7 +546,7 @@ fn call_codepoint<'a>(
         Ok(codes) => {
             let results: Vec<TValue> = codes
                 .into_iter()
-                .map(|c| TValue::Integer(c as i64))
+                .map(|c| TValue::Integer(c as LuaInteger))
                 .collect();
             push_results(state, a, nresults, results);
             Ok(())
@@ -591,13 +603,13 @@ fn call_len<'a>(
     // C: 1 <= posi && --posi <= len  (posi 先转 0-based)
     // C: --posj < len  (posj 先转 0-based)
     let posi_rel = u_posrelat(posi, len);
-    if !(1 <= posi_rel && posi_rel - 1 <= len as i64) {
+    if !(1 <= posi_rel && posi_rel - 1 <= len as LuaInteger) {
         return Err(VmError::RuntimeError(
             "initial position out of bounds".to_string(),
         ));
     }
     let posj_rel = u_posrelat(posj, len);
-    if !(posj_rel - 1 < len as i64) {
+    if !(posj_rel - 1 < len as LuaInteger) {
         return Err(VmError::RuntimeError(
             "final position out of bounds".to_string(),
         ));
@@ -607,7 +619,7 @@ fn call_len<'a>(
     // 使用 i64 避免空字符串时 posj_rel=0 导致 usize 下溢
     let mut i = posi_rel - 1;
     let j = posj_rel - 1;
-    let mut n: i64 = 0;
+    let mut n: LuaInteger = 0;
 
     while i <= j {
         if i < 0 || i as usize >= len {
@@ -615,7 +627,7 @@ fn call_len<'a>(
         }
         match utf8_decode(&s[i as usize..], !lax) {
             Some((consumed, _)) => {
-                i += consumed as i64;
+                i += consumed as LuaInteger;
                 n += 1;
             }
             None => {
@@ -713,9 +725,9 @@ fn call_iter<'a>(
             ))
         }
     };
-    let n: i64 = match &n_val {
+    let n: LuaInteger = match &n_val {
         TValue::Integer(n) => *n,
-        TValue::Float(f) => *f as i64,
+        TValue::Float(f) => *f as LuaInteger,
         _ => {
             return Err(VmError::RuntimeError(
                 "bad argument #2 to 'iter' (number expected)".to_string(),
@@ -757,8 +769,8 @@ fn call_iter<'a>(
                 a,
                 nresults,
                 vec![
-                    TValue::Integer((pos + 1) as i64), // 1-based 位置
-                    TValue::Integer(code as i64),
+                    TValue::Integer((pos + 1) as LuaInteger), // 1-based 位置
+                    TValue::Integer(code as LuaInteger),
                 ],
             );
             Ok(())

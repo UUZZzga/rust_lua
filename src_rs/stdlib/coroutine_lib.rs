@@ -1352,14 +1352,6 @@ fn call_resume<'a>(
             }
             (true, Vec::new(), Some((co_stack, result_base, ret_n)))
         }
-        Ok(_) => {
-            {
-                let co = unsafe { &mut *co_ptr };
-                co.call_info.clear();
-            }
-            co_context.borrow_mut().status = ThreadStatus::OK;
-            (true, Vec::new(), None)
-        }
         Err(e) => {
             // 保存 error 状态快照（pre-close 的调用栈，供 debug.traceback(co) 使用）。
             // 必须在 TBC 关闭之前保存（TBC 关闭会修改 stack[base-1]）。
@@ -1986,10 +1978,6 @@ fn call_wrap_fn<'a>(
             }
             (return_values, true, None)
         }
-        Ok(_) => {
-            co_context.borrow_mut().status = ThreadStatus::OK;
-            (Vec::new(), true, None)
-        }
         Err(e) => {
             // 保存 error 状态到 ctx（必须在 TBC 关闭之前保存）
             let (err_call_info, err_stack, err_base, err_pc) = {
@@ -2275,17 +2263,6 @@ pub fn c_api_resume<'a>(
             state.stack = s;
             state.top = state.stack.len();
             (crate::capi::LUA_OK, ret_n)
-        }
-        Ok(_) => {
-            state.call_info.clear();
-            {
-                let mut ctx = co_context.borrow_mut();
-                ctx.status = ThreadStatus::OK;
-                ctx.started = true;
-            }
-            state.stack = vec![TValue::Nil(NilKind::Strict)];
-            state.top = 1;
-            (crate::capi::LUA_OK, 0)
         }
         Err(e) => {
             // 错误: 保存错误状态（pre-close 快照），关闭 TBC 变量

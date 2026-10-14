@@ -11,6 +11,30 @@
 //! 所以即使开启了 `size_optimized`, 也会自动回退到纯 Rust 实现.
 //! 判定条件统一为 `cfg(all(size_optimized, not(miri)))`.
 
+use crate::config::{LuaInteger, LuaNumber};
+#[cfg(all(size_optimized, not(miri)))]
+use crate::config::{INTEGER_FMT, NUMBER_FMT, NUMBER_FMT_N};
+#[cfg(all(size_optimized, not(miri)))]
+use const_format::concatcp;
+
+/// `NUMBER_FMT` / `NUMBER_FMT_N` 的 NUL 终止 C 字符串形式 (供 snprintf 使用)。
+/// 对应 C 的 `luaO_num2buf` 使用的 `LUA_NUMBER_FMT` / `LUA_NUMBER_FMT_N`。
+#[cfg(all(size_optimized, not(miri)))]
+const NUMBER_FMT_C: &str = concatcp!(NUMBER_FMT, "\0");
+#[cfg(all(size_optimized, not(miri)))]
+const NUMBER_FMT_N_C: &str = concatcp!(NUMBER_FMT_N, "\0");
+/// `INTEGER_FMT` 的 NUL 终止 C 字符串形式 (对应 C 的 `LUA_INTEGER_FMT`, `%lld` / `%d`)。
+#[cfg(all(size_optimized, not(miri)))]
+const INTEGER_FMT_C: &str = concatcp!(INTEGER_FMT, "\0");
+
+/// `INTEGER_FMT` 对应的 libc 变参实参类型: `%lld` 读 `long long`, `%d` 读 `int`。
+/// 传错宽度是 UB, 故按 `LuaInteger` 的实际宽度选择 (C 的 `LUA_INTEGER_FMT` 与
+/// `lua_Integer` 总是配对出现)。
+#[cfg(all(size_optimized, not(miri), not(feature = "num-i32")))]
+type LibcIntArg = libc::c_longlong;
+#[cfg(all(size_optimized, not(miri), feature = "num-i32"))]
+type LibcIntArg = libc::c_int;
+
 // ============================================================================
 // f64 -> String
 // ============================================================================
@@ -24,7 +48,7 @@
 ///
 /// **libc 版本**: 仅 `size_optimized` 且非 Miri 下编译。
 #[cfg(all(size_optimized, not(miri)))]
-pub fn f64_to_string(f: f64) -> String {
+pub fn f64_to_string(f: LuaNumber) -> String {
     if f.is_nan() {
         return "nan".to_string();
     }
@@ -35,31 +59,34 @@ pub fn f64_to_string(f: f64) -> String {
             "-inf".to_string()
         };
     }
+    // C 变参默认实参提升 float → double (C 的 LUAI_UACNUMBER): snprintf 的 %g
+    // 从 va_list 读 double, 必须传提升后的值。
+    let f = f as f64;
     unsafe {
         let mut buf = [0u8; 64];
 
-        // 阶段 1: %.15g (LUA_NUMBER_FMT) — 对应 C Lua 的第一次尝试
-        let fmt_15 = b"%.15g\0";
+        // 阶段 1: NUMBER_FMT (LUA_NUMBER_FMT) — 对应 C Lua 的第一次尝试
         let n15 = libc::snprintf(
             buf.as_mut_ptr() as *mut libc::c_char,
             buf.len(),
-            fmt_15.as_ptr() as *const libc::c_char,
+            NUMBER_FMT_C.as_ptr() as *const libc::c_char,
             f,
         );
         if n15 <= 0 || (n15 as usize) >= buf.len() {
             return "0.0".to_string();
         }
 
-        // 检查往返: strtod(buf) == f ?
-        let mut end: *mut libc::c_char = std::ptr::null_mut();
-        let check = libc::strtod(buf.as_ptr() as *const libc::c_char, &mut end);
-        let final_n = if check != f {
-            // 阶段 2: %.17g (LUA_NUMBER_FMT_N) — 精度不足, 用更多数字
-            let fmt_17 = b"%.17g\0";
+        // 检查往返: C 的 lua_str2number 读回 (strtod / strtof) == f ?
+        #[cfg(not(feature = "num-f32"))]
+        let check = libc::strtod(buf.as_ptr() as *const libc::c_char, std::ptr::null_mut());
+        #[cfg(feature = "num-f32")]
+        let check = libc::strtof(buf.as_ptr() as *const libc::c_char, std::ptr::null_mut());
+        let final_n = if check as f64 != f {
+            // 阶段 2: NUMBER_FMT_N (LUA_NUMBER_FMT_N) — 精度不足, 用更多数字
             let n17 = libc::snprintf(
                 buf.as_mut_ptr() as *mut libc::c_char,
                 buf.len(),
-                fmt_17.as_ptr() as *const libc::c_char,
+                NUMBER_FMT_N_C.as_ptr() as *const libc::c_char,
                 f,
             );
             if n17 <= 0 || (n17 as usize) >= buf.len() {
@@ -94,7 +121,7 @@ pub fn f64_to_string(f: f64) -> String {
 /// **注意**: 该实现用于默认构建以及所有 Miri 构建。
 #[cfg(any(not(size_optimized), miri))]
 #[inline]
-pub fn f64_to_string(f: f64) -> String {
+pub fn f64_to_string(f: LuaNumber) -> String {
     if f.is_nan() {
         return "nan".to_string();
     }
@@ -125,7 +152,7 @@ pub fn f64_to_string(f: f64) -> String {
 
 /// 将 f64 格式化为定点表示 (对应 `format!("{:.N}", f)`)。
 #[cfg(all(size_optimized, not(miri)))]
-pub fn f64_to_string_fixed(f: f64, precision: usize) -> String {
+pub fn f64_to_string_fixed(f: LuaNumber, precision: usize) -> String {
     // 手动拼接 "%.Nf\0" 避免用 format! (会引入 fmt 代码).
     // 不用 "%.*f" + 变参 precision, 因为 Rust 调 C variadic 时混合 int/float
     // 参数传递在某些情况下可能出错 (实测 string.format("%.2f", 3.14) 输出 0.00).
@@ -136,6 +163,8 @@ pub fn f64_to_string_fixed(f: f64, precision: usize) -> String {
     fmt[2 + plen] = b'f';
     fmt[2 + plen + 1] = 0; // NUL 终止
 
+    // C 变参默认实参提升 float → double (C 的 LUAI_UACNUMBER).
+    let f = f as f64;
     unsafe {
         // 缓冲区需足够大: %.99f 对 1e308 输出可达 309+1+99+1=410 字符.
         // 用 512 字节确保安全.
@@ -158,13 +187,13 @@ pub fn f64_to_string_fixed(f: f64, precision: usize) -> String {
 /// 将 f64 格式化为定点表示 (纯 Rust 版本)。
 #[cfg(any(not(size_optimized), miri))]
 #[inline]
-pub fn f64_to_string_fixed(f: f64, precision: usize) -> String {
+pub fn f64_to_string_fixed(f: LuaNumber, precision: usize) -> String {
     format!("{:.*}", precision, f)
 }
 
 /// 将 f64 格式化为科学计数法表示 (对应 `format!("{:.*e}", precision, f)`)。
 #[cfg(all(size_optimized, not(miri)))]
-pub fn f64_to_string_exp(f: f64, precision: usize, uppercase: bool) -> String {
+pub fn f64_to_string_exp(f: LuaNumber, precision: usize, uppercase: bool) -> String {
     // 手动拼接 "%.Ne\0" / "%.NE\0" 避免用 format! (会引入 fmt 代码).
     let mut fmt = [0u8; 8];
     fmt[0] = b'%';
@@ -173,6 +202,8 @@ pub fn f64_to_string_exp(f: f64, precision: usize, uppercase: bool) -> String {
     fmt[2 + plen] = if uppercase { b'E' } else { b'e' };
     fmt[2 + plen + 1] = 0; // NUL 终止
 
+    // C 变参默认实参提升 float → double (C 的 LUAI_UACNUMBER).
+    let f = f as f64;
     unsafe {
         // 缓冲区: %.99e 输出约 1+1+99+5=106 字符, 128 字节足够.
         let mut buf = [0u8; 128];
@@ -193,7 +224,7 @@ pub fn f64_to_string_exp(f: f64, precision: usize, uppercase: bool) -> String {
 /// 将 f64 格式化为科学计数法表示 (纯 Rust 版本)。
 #[cfg(any(not(size_optimized), miri))]
 #[inline]
-pub fn f64_to_string_exp(f: f64, precision: usize, uppercase: bool) -> String {
+pub fn f64_to_string_exp(f: LuaNumber, precision: usize, uppercase: bool) -> String {
     if uppercase {
         format!("{:.*E}", precision, f)
     } else {
@@ -238,7 +269,7 @@ fn write_precision(buf: &mut [u8], offset: usize, precision: usize) -> usize {
 /// 将 '.' 替换为 locale 的 decimal_point 后重试。
 /// (如 pt_BR locale 下 "3.4" → 替换为 "3,4" → strtod 成功)
 #[cfg(all(size_optimized, not(miri)))]
-pub fn f64_from_str(s: &str) -> Option<f64> {
+pub fn f64_from_str(s: &str) -> Option<LuaNumber> {
     // strtod 内部会跳过前导空格, 但 Lua 的 tonumber 也允许前导/尾随空格.
     // 先去除尾随空格, 便于检查 end 是否到达字符串末尾.
     let trimmed = s.trim_matches(|c: char| c.is_ascii_whitespace());
@@ -275,13 +306,13 @@ pub fn f64_from_str(s: &str) -> Option<f64> {
 /// hex float 由 `objects::parse_hex_float` 单独处理。
 #[cfg(any(not(size_optimized), miri))]
 #[inline]
-pub fn f64_from_str(s: &str) -> Option<f64> {
+pub fn f64_from_str(s: &str) -> Option<LuaNumber> {
     let trimmed = s.trim_matches(|c: char| c.is_ascii_whitespace());
     if trimmed.is_empty() {
         return None;
     }
     // 第一次尝试: '.' 作为小数点
-    if let Ok(v) = trimmed.parse::<f64>() {
+    if let Ok(v) = trimmed.parse::<LuaNumber>() {
         return Some(v);
     }
     // Locale fallback (对应 C Lua l_str2d): strtod 在 pt_BR 等 locale 下
@@ -290,22 +321,27 @@ pub fn f64_from_str(s: &str) -> Option<f64> {
     let dec_point = unsafe { get_locale_decpoint() };
     if dec_point != '.' {
         let alt = trimmed.replace(dec_point, ".");
-        if let Ok(v) = alt.parse::<f64>() {
+        if let Ok(v) = alt.parse::<LuaNumber>() {
             return Some(v);
         }
     }
     None
 }
 
-/// 用 `libc::strtod` 解析字符串, 要求整个字符串都被消费。
+/// 用 libc 的 `<stdlib.h>` 解析函数解析字符串, 要求整个字符串都被消费。
+///
+/// 按 `LuaNumber` 选择 `strtod` / `strtof` (对应 C 的 `lua_str2number`)。
 #[cfg(all(size_optimized, not(miri)))]
-fn try_strtod(s: &str) -> Option<f64> {
+fn try_strtod(s: &str) -> Option<LuaNumber> {
     use std::ffi::CString;
 
     let c_str = CString::new(s).ok()?;
     let mut end: *mut libc::c_char = std::ptr::null_mut();
     unsafe {
+        #[cfg(not(feature = "num-f32"))]
         let val = libc::strtod(c_str.as_ptr(), &mut end);
+        #[cfg(feature = "num-f32")]
+        let val = libc::strtof(c_str.as_ptr(), &mut end);
         if end as *const libc::c_char == c_str.as_ptr() {
             return None;
         }
@@ -348,18 +384,21 @@ pub unsafe fn get_locale_decpoint() -> char {
 // i64 -> String
 // ============================================================================
 
-/// 将 i64 格式化为字符串 (libc 版本)。
+/// 将 `LuaInteger` 格式化为字符串 (libc 版本)。
+///
+/// 对应 C 的 `lua_integer2str` / `luaO_num2buf` 的整数分支 (`LUA_INTEGER_FMT`)。
 #[cfg(all(size_optimized, not(miri)))]
-pub fn i64_to_string(i: i64) -> String {
+pub fn i64_to_string(i: LuaInteger) -> String {
     // i64 最大 20 位数字 (-9223372036854775808), 21 字节缓冲区足够 (含符号+NUL)
     let mut buf = [0u8; 24];
-    let fmt = b"%lld\0";
     unsafe {
+        // 变参实参宽度必须与 INTEGER_FMT 匹配 (i64 → %lld 读 long long,
+        // i32 → %d 读 int); 见 LibcIntArg。
         let n = libc::snprintf(
             buf.as_mut_ptr() as *mut libc::c_char,
             buf.len(),
-            fmt.as_ptr() as *const libc::c_char,
-            i,
+            INTEGER_FMT_C.as_ptr() as *const libc::c_char,
+            i as LibcIntArg,
         );
         if n > 0 && (n as usize) < buf.len() {
             std::str::from_utf8_unchecked(&buf[..n as usize]).to_string()
@@ -369,26 +408,27 @@ pub fn i64_to_string(i: i64) -> String {
     }
 }
 
-/// 将 i64 格式化为字符串 (纯 Rust 版本)。
+/// 将 `LuaInteger` 格式化为字符串 (纯 Rust 版本)。
 #[cfg(any(not(size_optimized), miri))]
 #[inline]
-pub fn i64_to_string(i: i64) -> String {
+pub fn i64_to_string(i: LuaInteger) -> String {
     i.to_string()
 }
 
-/// 计算 i64 格式化后的字符串长度 (不分配内存)。
+/// 计算 `LuaInteger` 格式化后的字符串长度 (不分配内存)。
 ///
 /// 该函数在两种路径下都使用数学计算避免 `to_string()` 分配, 无需 cfg 分叉.
 #[inline]
-pub fn i64_str_len(i: i64) -> usize {
+pub fn i64_str_len(i: LuaInteger) -> usize {
     if i == 0 {
         return 1;
     }
-    // i64::MIN 的绝对值无法用 i64 表示, 用 u64 处理
-    let abs = if i < 0 {
-        (i as u64).wrapping_neg()
+    // MIN_INTEGER 的绝对值无法用有符号类型表示, 用无符号别名处理
+    // (对应 C 的 l_castS2U 后取负)。
+    let abs: crate::config::LuaUnsigned = if i < 0 {
+        i.unsigned_abs()
     } else {
-        i as u64
+        i as crate::config::LuaUnsigned
     };
     // 计算位数: log10(abs) + 1
     let mut digits = 1usize;

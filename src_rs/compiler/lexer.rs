@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use crate::config::{LuaInteger, LuaNumber, LuaUnsigned};
 use crate::objects::{FxBuildHasher, TValue};
 use crate::state::LuaState;
 use crate::strings::{lua_string_as_str, LLuaString};
@@ -78,8 +79,10 @@ pub enum Token {
     // Name/String 直接保存已 intern 的 LuaString (Rc 引用),
     // 避免每次 lex 都 malloc 新 String。clone 时只增加 refcount, 零分配。
     Name(LLuaString),
-    Int(i64),
-    Float(f64),
+    /// 整数字面量 — 对应 C 的 `SemInfo.i` (`lua_Integer`)。
+    Int(LuaInteger),
+    /// 浮点字面量 — 对应 C 的 `SemInfo.r` (`lua_Number`)。
+    Float(LuaNumber),
     String(LLuaString),
 
     // Symbols
@@ -1028,22 +1031,24 @@ impl<'a, 'b> LexState<'a, 'b> {
                 }
             }
         } else {
-            match i64::from_str_radix(s, if is_hex { 16 } else { 10 }) {
+            match LuaInteger::from_str_radix(s, if is_hex { 16 } else { 10 }) {
                 Ok(v) => self.token = Token::Int(v),
                 Err(_) if is_hex => {
-                    // Hex integers that overflow i64 may fit in u64 (e.g., 0xFFFFFFFFFFFFFFFF = -1)
-                    match u64::from_str_radix(s, 16) {
-                        Ok(v) => self.token = Token::Int(v as i64),
+                    // Hex integers that overflow LuaInteger may fit in LuaUnsigned
+                    // (e.g., 0xFFFFFFFFFFFFFFFF = -1)
+                    match LuaUnsigned::from_str_radix(s, 16) {
+                        // l_castU2S: 位模式保持的无符号 -> 有符号重解释
+                        Ok(v) => self.token = Token::Int(v as LuaInteger),
                         Err(_) => {
-                            // Hex integers that overflow u64: use wrapping arithmetic
+                            // Hex integers that overflow LuaUnsigned: use wrapping arithmetic
                             // (与 C 版本的 l_str2int 一致,对十六进制数不做溢出检查)
-                            let mut a: u64 = 0;
+                            let mut a: LuaUnsigned = 0;
                             for c in s.chars() {
                                 if let Some(d) = c.to_digit(16) {
-                                    a = a.wrapping_mul(16).wrapping_add(d as u64);
+                                    a = a.wrapping_mul(16).wrapping_add(d as LuaUnsigned);
                                 }
                             }
-                            self.token = Token::Int(a as i64);
+                            self.token = Token::Int(a as LuaInteger);
                         }
                     }
                 }
@@ -1297,24 +1302,6 @@ impl<'a, 'b> LexState<'a, 'b> {
         let ls = self.anchor_string(&s);
         self.token = Token::String(ls.as_str());
     }
-
-    pub fn check(&self, tok: &Token) -> bool {
-        std::mem::discriminant(&self.token) == std::mem::discriminant(tok)
-    }
-
-    pub fn check_next(&mut self, tok: &Token) -> bool {
-        let next_tok = self.lookahead_next().clone();
-        std::mem::discriminant(&next_tok) == std::mem::discriminant(tok)
-    }
-
-    pub fn test_next(&mut self, tok: &Token) -> bool {
-        if self.check_next(tok) {
-            self.next();
-            true
-        } else {
-            false
-        }
-    }
 }
 
 impl<'a, 'b> Drop for LexState<'a, 'b> {
@@ -1336,7 +1323,11 @@ impl<'a, 'b> Drop for LexState<'a, 'b> {
     }
 }
 
-fn parse_hex_float(s: &str) -> Option<f64> {
+/// 解析十六进制浮点字面量 (不含 `0x` 前缀) — 对应 C 的 `lua_strx2number`。
+///
+/// 累加器按配置宽度 (`LuaNumber`) 运算，因此 `--features num-f32` 下
+/// 与 C 的 `LUA_NUMBER=float` 一致地以单精度累加。
+fn parse_hex_float(s: &str) -> Option<LuaNumber> {
     // Parse hex float format: HH[.HHH][p[+/-]DD]
     // s does not include "0x" prefix
     let (mantissa_str, exponent_str) = match s.find(|c| c == 'p' || c == 'P') {
@@ -1353,18 +1344,19 @@ fn parse_hex_float(s: &str) -> Option<f64> {
         return None;
     }
 
+    // 尾数用 u64 作解析暂存容器（与配置无关的字节/位数容器），再转成 LuaNumber。
     let int_part = if int_str.is_empty() {
         0.0
     } else {
-        u64::from_str_radix(int_str, 16).ok()? as f64
+        u64::from_str_radix(int_str, 16).ok()? as LuaNumber
     };
 
     let frac_part = if let Some(frac) = frac_str {
         if frac.is_empty() {
             0.0
         } else {
-            let frac_val = u64::from_str_radix(frac, 16).ok()? as f64;
-            frac_val / 16f64.powi(frac.len() as i32)
+            let frac_val = u64::from_str_radix(frac, 16).ok()? as LuaNumber;
+            frac_val / (16 as LuaNumber).powi(frac.len() as i32)
         }
     } else {
         0.0
@@ -1379,7 +1371,7 @@ fn parse_hex_float(s: &str) -> Option<f64> {
         0
     };
 
-    Some((int_part + frac_part) * 2f64.powi(exponent))
+    Some((int_part + frac_part) * (2 as LuaNumber).powi(exponent))
 }
 
 /// UTF-8 编码：等价于 C 版本的 `luaO_utf8esc`，支持 1-6 字节序列。

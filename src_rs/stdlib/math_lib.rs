@@ -12,6 +12,7 @@
 //! - 提供伪随机数生成器 (xoshiro256** 算法): random, randomseed
 //! - 提供常量: pi, huge, maxinteger, mininteger
 
+use crate::config::{LuaInteger, LuaNumber, LuaUnsigned};
 use crate::execute::VmError;
 use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
@@ -22,17 +23,16 @@ use crate::table::Table;
 // 常量
 // ============================================================================
 
-/// 圆周率 PI — 对应 C 的 PI 宏
-pub const PI: f64 = 3.141592653589793238462643383279502884;
+/// 圆周率 PI — 对应 C 的 PI 宏 (`l_mathop(3.14159...)`, 随 `LuaNumber` 宽度取整)
+pub const PI: LuaNumber = 3.141592653589793238462643383279502884;
 
 /// 浮点数最大值 — 对应 C 的 HUGE_VAL
-pub const HUGE: f64 = f64::INFINITY;
+pub const HUGE: LuaNumber = LuaNumber::INFINITY;
 
-/// 最大整数 — 对应 C 的 LUA_MAXINTEGER
-pub const MAX_INTEGER: i64 = i64::MAX;
-
-/// 最小整数 — 对应 C 的 LUA_MININTEGER
-pub const MIN_INTEGER: i64 = i64::MIN;
+/// 最大整数 — 对应 C 的 LUA_MAXINTEGER (`math.maxinteger` 的注册值)
+pub use crate::config::MAX_INTEGER;
+/// 最小整数 — 对应 C 的 LUA_MININTEGER (`math.mininteger` 的注册值)
+pub use crate::config::MIN_INTEGER;
 
 // ============================================================================
 // 函数标签 (LightUserData 占位符值)
@@ -64,27 +64,27 @@ pub fn math_abs<'a>(v: &TValue<'a>) -> Result<TValue<'a>, String> {
 }
 
 /// math.sin(x) — 正弦函数 (对应 C 的 math_sin)
-pub fn math_sin(x: f64) -> f64 {
+pub fn math_sin(x: LuaNumber) -> LuaNumber {
     x.sin()
 }
 
 /// math.cos(x) — 余弦函数 (对应 C 的 math_cos)
-pub fn math_cos(x: f64) -> f64 {
+pub fn math_cos(x: LuaNumber) -> LuaNumber {
     x.cos()
 }
 
 /// math.tan(x) — 正切函数 (对应 C 的 math_tan)
-pub fn math_tan(x: f64) -> f64 {
+pub fn math_tan(x: LuaNumber) -> LuaNumber {
     x.tan()
 }
 
 /// math.asin(x) — 反正弦函数 (对应 C 的 math_asin)
-pub fn math_asin(x: f64) -> f64 {
+pub fn math_asin(x: LuaNumber) -> LuaNumber {
     x.asin()
 }
 
 /// math.acos(x) — 反余弦函数 (对应 C 的 math_acos)
-pub fn math_acos(x: f64) -> f64 {
+pub fn math_acos(x: LuaNumber) -> LuaNumber {
     x.acos()
 }
 
@@ -92,7 +92,7 @@ pub fn math_acos(x: f64) -> f64 {
 ///
 /// 单参数: atan(y)
 /// 双参数: atan2(y, x)
-pub fn math_atan(y: f64, x: Option<f64>) -> f64 {
+pub fn math_atan(y: LuaNumber, x: Option<LuaNumber>) -> LuaNumber {
     match x {
         None => y.atan(),
         Some(x) => y.atan2(x),
@@ -102,7 +102,7 @@ pub fn math_atan(y: f64, x: Option<f64>) -> f64 {
 /// math.tointeger(v) — 转换为整数 (对应 C 的 math_toint)
 ///
 /// 返回 Some(整数) 表示成功, None 表示不可转换。
-pub fn math_tointeger(v: &TValue) -> Option<i64> {
+pub fn math_tointeger(v: &TValue) -> Option<LuaInteger> {
     match v {
         TValue::Integer(n) => Some(*n),
         TValue::Float(f) => crate::vm::float_to_integer(*f, crate::vm::F2IMode::Eq),
@@ -119,16 +119,11 @@ pub fn math_tointeger(v: &TValue) -> Option<i64> {
 }
 
 /// 将浮点数转为整数 (如果可以无损转换), 否则保持浮点
-/// 对应 C 的 pushnumint
-fn push_num_int<'a>(d: f64) -> TValue<'a> {
-    // C 的 lua_numbertointeger: d >= MININTEGER && d < -MININTEGER
-    // -MININTEGER = 2^63 (可精确表示为 f64)
-    let min_int_f = i64::MIN as f64;
-    let max_int_f = -min_int_f;
-    if d >= min_int_f && d < max_int_f {
-        TValue::Integer(d as i64)
-    } else {
-        TValue::Float(d)
+/// 对应 C 的 pushnumint (lmathlib.c): `lua_numbertointeger`
+fn push_num_int<'a>(d: LuaNumber) -> TValue<'a> {
+    match crate::config::number_to_integer(d) {
+        Some(n) => TValue::Integer(n),
+        None => TValue::Float(d),
     }
 }
 
@@ -167,6 +162,7 @@ pub fn math_ceil<'a>(v: &TValue<'a>) -> Result<TValue<'a>, String> {
 pub fn math_fmod<'a>(v1: &TValue<'a>, v2: &TValue<'a>) -> Result<TValue<'a>, String> {
     match (v1, v2) {
         (TValue::Integer(a), TValue::Integer(b)) => {
+            // 对应 C: if ((lua_Unsigned)d + 1u <= 1u) → d 为 0 或 -1
             if *b == 0 {
                 return Err("bad argument #2 to 'fmod' (zero)".to_string());
             }
@@ -212,15 +208,16 @@ pub fn math_modf<'a>(v: &TValue<'a>) -> Result<(TValue<'a>, TValue<'a>), String>
 }
 
 /// math.sqrt(x) — 平方根 (对应 C 的 math_sqrt)
-pub fn math_sqrt(x: f64) -> f64 {
+pub fn math_sqrt(x: LuaNumber) -> LuaNumber {
     x.sqrt()
 }
 
 /// math.ult(a, b) — 无符号小于比较 (对应 C 的 math_ult)
 ///
 /// 将两个整数转为无符号后比较 a < b。
-pub fn math_ult(a: i64, b: i64) -> bool {
-    (a as u64) < (b as u64)
+pub fn math_ult(a: LuaInteger, b: LuaInteger) -> bool {
+    // 对应 C: (lua_Unsigned)a < (lua_Unsigned)b
+    (a as LuaUnsigned) < (b as LuaUnsigned)
 }
 
 /// math.log(x [, base]) — 对数 (对应 C 的 math_log)
@@ -229,7 +226,7 @@ pub fn math_ult(a: i64, b: i64) -> bool {
 /// base == 2: log2(x)
 /// base == 10: log10(x)
 /// 其他: ln(x) / ln(base)
-pub fn math_log(x: f64, base: Option<f64>) -> f64 {
+pub fn math_log(x: LuaNumber, base: Option<LuaNumber>) -> LuaNumber {
     match base {
         None => x.ln(),
         Some(b) => {
@@ -245,61 +242,123 @@ pub fn math_log(x: f64, base: Option<f64>) -> f64 {
 }
 
 /// math.exp(x) — 指数函数 e^x (对应 C 的 math_exp)
-pub fn math_exp(x: f64) -> f64 {
+pub fn math_exp(x: LuaNumber) -> LuaNumber {
     x.exp()
 }
 
 /// math.deg(x) — 弧度转角度 (对应 C 的 math_deg)
-pub fn math_deg(x: f64) -> f64 {
+pub fn math_deg(x: LuaNumber) -> LuaNumber {
     x * (180.0 / PI)
 }
 
 /// math.rad(x) — 角度转弧度 (对应 C 的 math_rad)
-pub fn math_rad(x: f64) -> f64 {
+pub fn math_rad(x: LuaNumber) -> LuaNumber {
     x * (PI / 180.0)
+}
+
+/// `LuaNumber` 的浮点位布局 — frexp/ldexp 的位操作实现依赖它。
+///
+/// C 直接用 libm 的 `l_mathop(frexp)` / `l_mathop(ldexp)`; 这里保留既有位操作
+/// 实现, 仅把符号位/指数域/尾数域的宽度按 `LUA_NUMBER` 类型 (float/double) 取参数。
+#[cfg(not(feature = "num-f32"))]
+mod fbits {
+    use super::{LuaInteger, LuaNumber};
+
+    /// 符号位掩码
+    pub const SIGN: u64 = 0x8000_0000_0000_0000;
+    /// 尾数域掩码 (不含隐含前导位)
+    pub const FRAC: u64 = 0x000f_ffff_ffff_ffff;
+    /// 指数域在位模式中的偏移
+    pub const EXP_SHIFT: u32 = 52;
+    /// 指数域掩码
+    pub const EXP_FIELD: u64 = 0x7ff;
+    /// frexp 指数基准 = 指数偏置 - 1
+    pub const EXP_BIAS_M1: LuaInteger = 1022;
+    /// 全 1 指数 (inf/nan) 的指数域值
+    pub const EXP_INF: LuaInteger = 0x7ff;
+    /// frexp 尾数的指数域 (指数 = 偏置 - 1)
+    pub const MANT_EXP: u64 = 0x3fe0_0000_0000_0000;
+    /// +inf 的位模式
+    pub const INF: u64 = 0x7ff0_0000_0000_0000;
+
+    #[inline(always)]
+    pub fn to_bits(x: LuaNumber) -> u64 {
+        x.to_bits()
+    }
+    #[inline(always)]
+    pub fn from_bits(b: u64) -> LuaNumber {
+        LuaNumber::from_bits(b)
+    }
+}
+
+/// 见上; `LuaNumber = f32` 的布局 (8 位指数 / 23 位尾数)。
+#[cfg(feature = "num-f32")]
+mod fbits {
+    use super::{LuaInteger, LuaNumber};
+
+    pub const SIGN: u64 = 0x8000_0000;
+    pub const FRAC: u64 = 0x007f_ffff;
+    pub const EXP_SHIFT: u32 = 23;
+    pub const EXP_FIELD: u64 = 0xff;
+    pub const EXP_BIAS_M1: LuaInteger = 126;
+    pub const EXP_INF: LuaInteger = 0xff;
+    pub const MANT_EXP: u64 = 0x3f00_0000;
+    pub const INF: u64 = 0x7f80_0000;
+
+    #[inline(always)]
+    pub fn to_bits(x: LuaNumber) -> u64 {
+        x.to_bits() as u64
+    }
+    #[inline(always)]
+    pub fn from_bits(b: u64) -> LuaNumber {
+        LuaNumber::from_bits(b as u32)
+    }
 }
 
 /// math.frexp(x) — 分离尾数和指数 (对应 C 的 math_frexp)
 ///
 /// 返回 (尾数 m, 指数 e), 使得 x = m * 2^e, 其中 0.5 <= |m| < 1 或 m == 0。
-pub fn math_frexp(x: f64) -> (f64, i64) {
+pub fn math_frexp(x: LuaNumber) -> (LuaNumber, LuaInteger) {
     if x == 0.0 {
         return (0.0, 0);
     }
-    let bits = x.to_bits();
-    let exp = ((bits >> 52) & 0x7ff) as i64 - 1022;
-    let mantissa_bits = (bits & 0x800f_ffff_ffff_ffff) | 0x3fe0_0000_0000_0000;
-    let m = f64::from_bits(mantissa_bits);
-    (m, exp)
+    let bits = fbits::to_bits(x);
+    // 指数域提取 (位模式, 非 Lua 值)
+    let exp = ((bits >> fbits::EXP_SHIFT) & fbits::EXP_FIELD) as LuaInteger - fbits::EXP_BIAS_M1;
+    let mantissa_bits = (bits & (fbits::SIGN | fbits::FRAC)) | fbits::MANT_EXP;
+    (fbits::from_bits(mantissa_bits), exp)
 }
 
 /// math.ldexp(x, e) — x * 2^e (对应 C 的 math_ldexp)
 /// 用位操作直接修改指数位,保证精确 (避免 powf/powi 的浮点精度问题)
-pub fn math_ldexp(x: f64, e: i64) -> f64 {
+pub fn math_ldexp(x: LuaNumber, e: LuaInteger) -> LuaNumber {
     if x == 0.0 || x.is_nan() || x.is_infinite() {
         return x;
     }
-    let bits = x.to_bits();
-    let sign = bits & 0x8000_0000_0000_0000;
-    let exp = ((bits >> 52) & 0x7ff) as i64;
-    let mantissa = bits & 0x000f_ffff_ffff_ffff;
+    let bits = fbits::to_bits(x);
+    let sign = bits & fbits::SIGN;
+    let exp = ((bits >> fbits::EXP_SHIFT) & fbits::EXP_FIELD) as LuaInteger;
+    let mantissa = bits & fbits::FRAC;
 
     // 非规格化数:先规格化再计算
     if exp == 0 {
         // 简化处理:用乘法 (非规格化数在测试中不涉及)
-        return x * (2.0_f64).powi(e as i32);
+        // 对应 C 的 `l_mathop(ldexp)(x, (int)ep)` — 指数按 C 收窄为 int
+        let two: LuaNumber = 2.0;
+        return x * two.powi(e as i32);
     }
 
     let new_exp = exp + e;
-    if new_exp >= 0x7ff {
+    if new_exp >= fbits::EXP_INF {
         // 溢出到无穷
-        return f64::from_bits(sign | 0x7ff0_0000_0000_0000);
+        return fbits::from_bits(sign | fbits::INF);
     }
     if new_exp <= 0 {
         // 下溢到 0 (简化处理,不处理非规格化数)
-        return f64::from_bits(sign);
+        return fbits::from_bits(sign);
     }
-    f64::from_bits(sign | ((new_exp as u64) << 52) | mantissa)
+    // 位模式域一律在 u64 中运算 (与 LuaInteger/LuaUnsigned 宽度无关)
+    fbits::from_bits(sign | ((new_exp as u64) << fbits::EXP_SHIFT) | mantissa)
 }
 
 /// math.min(...) — 最小值 (对应 C 的 math_min)
@@ -349,9 +408,10 @@ pub fn math_type(v: &TValue) -> Option<&'static str> {
 // ============================================================================
 
 /// 将 TValue 转为浮点数 (对应 C 的 luaL_checknumber)
-fn to_float(v: &TValue) -> Result<f64, String> {
+fn to_float(v: &TValue) -> Result<LuaNumber, String> {
     match v {
-        TValue::Integer(n) => Ok(*n as f64),
+        // 对应 C 的 cast_num (`(lua_Number)i`)
+        TValue::Integer(n) => Ok(*n as LuaNumber),
         TValue::Float(f) => Ok(*f),
         s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
             let s = lua_string_as_str(s);
@@ -363,20 +423,17 @@ fn to_float(v: &TValue) -> Result<f64, String> {
 }
 
 /// 将 TValue 转为整数 (对应 C 的 luaL_checkinteger)
-fn to_integer(v: &TValue) -> Result<i64, String> {
+fn to_integer(v: &TValue) -> Result<LuaInteger, String> {
     match v {
         TValue::Integer(n) => Ok(*n),
         TValue::Float(f) => {
-            let i = *f as i64;
-            if (i as f64) == *f {
-                Ok(i)
-            } else {
+            crate::vm::float_to_integer(*f, crate::vm::F2IMode::Eq).ok_or_else(|| {
                 // 用 float_utils 而非 format!("{}", f), 避免 size_optimized 模式引入 flt2dec 代码.
-                Err(format!(
+                format!(
                     "bad argument (integer expected, got float {})",
                     crate::float_utils::f64_to_string(*f)
-                ))
-            }
+                )
+            })
         }
         _ => Err(format!("bad argument (integer expected, got {})", v.ty())),
     }
@@ -390,8 +447,9 @@ fn lua_lt(a: &TValue, b: &TValue) -> Result<bool, String> {
     match (a, b) {
         (TValue::Integer(x), TValue::Integer(y)) => Ok(x < y),
         (TValue::Float(x), TValue::Float(y)) => Ok(x < y),
-        (TValue::Integer(x), TValue::Float(y)) => Ok((*x as f64) < *y),
-        (TValue::Float(x), TValue::Integer(y)) => Ok(*x < (*y as f64)),
+        // 对应 C 的 cast_num: 混合比较按 LuaNumber 进行
+        (TValue::Integer(x), TValue::Float(y)) => Ok((*x as LuaNumber) < *y),
+        (TValue::Float(x), TValue::Integer(y)) => Ok(*x < (*y as LuaNumber)),
         (
             x @ (TValue::LongStr(_) | TValue::ShortStr(_)),
             y @ (TValue::LongStr(_) | TValue::ShortStr(_)),
@@ -406,11 +464,20 @@ fn lua_lt(a: &TValue, b: &TValue) -> Result<bool, String> {
 // ============================================================================
 
 /// 随机数生成器状态 — 对应 C 的 RanState
+///
+/// `s` 是 C 的 `Rand64` (恒为 64 位, 与 `LUA_INTEGER` 宽度无关)。
 #[derive(Debug, Clone)]
 pub struct RandState {
     /// 4 个 64 位状态字 (对应 C 的 Rand64 s[4])
     pub s: [u64; 4],
 }
+
+/// 尾数位数 — 对应 C 的 `FIGS = l_floatatt(MANT_DIG)` (double 53 / float 24)。
+const FIGS: u32 = LuaNumber::MANTISSA_DIGITS;
+/// 对应 C 的 `shift64_FIG = 64 - FIGS`, 即丢弃的额外随机位数。
+const SHIFT64_FIG: u32 = 64 - FIGS;
+/// 对应 C 的 `scaleFIG = 0.5 / (1 << (FIGS - 1))` = 2^(-FIGS)。
+const SCALE_FIG: LuaNumber = 0.5 / (1u64 << (FIGS - 1)) as LuaNumber;
 
 impl RandState {
     /// 创建新的随机状态 (全零, 需要设置种子)
@@ -442,13 +509,12 @@ impl RandState {
 
     /// 将随机整数转为 [0, 1) 范围的浮点数 — 对应 C 的 I2d
     ///
-    /// 取高 53 位 (f64 的尾数位数), 转为浮点数。
-    fn i2d(x: u64) -> f64 {
-        // 对应 C: 取高 FIGS 位 (53 for double), 乘以 2^(-53)
-        // shift64_FIG = 64 - 53 = 11
-        // scaleFIG = 0.5 / (1 << 52) = 2^(-53)
-        let sx = (x >> 11) as i64;
-        let mut res = (sx as f64) * (1.0 / (1u64 << 53) as f64);
+    /// 取高 FIGS 位, 转为 `LuaNumber`。
+    fn i2d(x: u64) -> LuaNumber {
+        // 对应 C: SRand64 sx = (SRand64)(trim64(x) >> shift64_FIG);
+        // res = (lua_Number)sx * scaleFIG; sx < 0 时修正两补数。
+        let sx = (x >> SHIFT64_FIG) as i64;
+        let mut res = (sx as LuaNumber) * SCALE_FIG;
         if sx < 0 {
             // 修正负数的二进制补码
             res += 1.0;
@@ -458,15 +524,15 @@ impl RandState {
 
     /// 将随机整数投影到 [0, n] 区间 — 对应 C 的 project
     ///
-    /// 使用拒绝采样确保均匀分布。
-    fn project(&mut self, mut ran: u64, n: u64) -> u64 {
-        if n == u64::MAX {
+    /// 使用拒绝采样确保均匀分布。`ran`/`n` 为 `LuaUnsigned` (对应 C 的 lua_Unsigned)。
+    fn project(&mut self, mut ran: LuaUnsigned, n: LuaUnsigned) -> LuaUnsigned {
+        if n == crate::config::MAX_UNSIGNED {
             return ran;
         }
         // 计算 >= n 的最小 Mersenne 数 (2^k - 1)
         let mut lim = n;
-        let mut sh = 1u32;
-        while (lim & (lim.wrapping_add(1))) != 0 {
+        let mut sh: u32 = 1;
+        while (lim & lim.wrapping_add(1)) != 0 {
             lim |= lim >> sh;
             sh *= 2;
         }
@@ -476,17 +542,19 @@ impl RandState {
             if ran <= n {
                 return ran;
             }
-            ran = self.nextrand();
+            // 对应 C 的 I2UInt(nextrand(state->s)) — 截断回 lua_Unsigned 宽度
+            ran = self.nextrand() as LuaUnsigned;
         }
     }
 
-    /// 设置种子 — 对应 C 的 setseed
+    /// 设置种子 — 对应 C 的 setseed (参数为 `lua_Unsigned`)
     ///
-    /// 使用两个 64 位种子初始化状态, 然后丢弃前 16 个随机数以扩散种子。
-    pub fn setseed(&mut self, n1: u64, n2: u64) {
-        self.s[0] = n1;
+    /// 使用两个种子初始化状态, 然后丢弃前 16 个随机数以扩散种子。
+    pub fn setseed(&mut self, n1: LuaUnsigned, n2: LuaUnsigned) {
+        // 对应 C 的 Int2I: (Rand64)n
+        self.s[0] = n1 as u64;
         self.s[1] = 0xff; // 避免全零状态
-        self.s[2] = n2;
+        self.s[2] = n2 as u64;
         self.s[3] = 0;
         // 丢弃前 16 个值以扩散种子
         for _ in 0..16 {
@@ -521,15 +589,19 @@ pub fn math_random<'a>(state: &mut RandState, args: &[TValue<'a>]) -> Result<TVa
             let up = to_integer(&args[0])?;
             if up == 0 {
                 // 单个 0: 返回全范围随机整数
-                Ok(TValue::Integer(rv as i64))
+                // 对应 C 的 l_castU2S(I2UInt(rv)): 截断到 LuaUnsigned 宽度后按位重解释
+                Ok(TValue::Integer(rv as LuaUnsigned as LuaInteger))
             } else {
-                let low = 1i64;
+                let low: LuaInteger = 1;
                 if low > up {
                     return Err("bad argument #1 to 'random' (interval is empty)".to_string());
                 }
-                // 投影到 [0, up - low] 然后加 low
-                let p = state.project(rv, (up as u64).wrapping_sub(low as u64));
-                Ok(TValue::Integer(p.wrapping_add(low as u64) as i64))
+                // 投影到 [0, up - low] 然后加 low (对应 C 的 l_castS2U)
+                let n = (up as LuaUnsigned).wrapping_sub(low as LuaUnsigned);
+                let p = state.project(rv as LuaUnsigned, n);
+                Ok(TValue::Integer(
+                    p.wrapping_add(low as LuaUnsigned) as LuaInteger
+                ))
             }
         }
         2 => {
@@ -538,8 +610,11 @@ pub fn math_random<'a>(state: &mut RandState, args: &[TValue<'a>]) -> Result<TVa
             if low > up {
                 return Err("bad argument #1 to 'random' (interval is empty)".to_string());
             }
-            let p = state.project(rv, (up as u64).wrapping_sub(low as u64));
-            Ok(TValue::Integer(p.wrapping_add(low as u64) as i64))
+            let n = (up as LuaUnsigned).wrapping_sub(low as LuaUnsigned);
+            let p = state.project(rv as LuaUnsigned, n);
+            Ok(TValue::Integer(
+                p.wrapping_add(low as LuaUnsigned) as LuaInteger
+            ))
         }
         _ => Err("wrong number of arguments to 'random'".to_string()),
     }
@@ -555,31 +630,33 @@ pub fn math_random<'a>(state: &mut RandState, args: &[TValue<'a>]) -> Result<TVa
 pub fn math_randomseed<'a>(
     state: &mut RandState,
     args: &[TValue<'a>],
-) -> Result<(i64, i64), String> {
+) -> Result<(LuaInteger, LuaInteger), String> {
     let (n1, n2) = match args.len() {
         0 => {
             // 使用当前时间作为种子 (对应 C 的 luaL_makeseed)
             let seed = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos() as u64)
+                .map(|d| d.as_nanos() as LuaUnsigned)
                 .unwrap_or(0);
-            // 如果时间种子不够随机, 用 nextrand 补充
-            let n2 = state.nextrand();
+            // 如果时间种子不够随机, 用 nextrand 补充 (对应 C 的 I2UInt(nextrand(...)))
+            let n2 = state.nextrand() as LuaUnsigned;
             (seed, n2)
         }
         1 => {
-            let n1 = to_integer(&args[0])? as u64;
+            // 对应 C 的 l_castS2U
+            let n1 = to_integer(&args[0])? as LuaUnsigned;
             (n1, 0)
         }
         2 => {
-            let n1 = to_integer(&args[0])? as u64;
-            let n2 = to_integer(&args[1])? as u64;
+            let n1 = to_integer(&args[0])? as LuaUnsigned;
+            let n2 = to_integer(&args[1])? as LuaUnsigned;
             (n1, n2)
         }
         _ => return Err("wrong number of arguments to 'randomseed'".to_string()),
     };
     state.setseed(n1, n2);
-    Ok((n1 as i64, n2 as i64))
+    // 对应 C 的 l_castU2S
+    Ok((n1 as LuaInteger, n2 as LuaInteger))
 }
 
 // ============================================================================
@@ -623,7 +700,7 @@ fn get_number_arg<'a>(
         s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
             // 尝试解析字符串为数字
             let s = lua_string_as_str(s);
-            if let Ok(i) = s.parse::<i64>() {
+            if let Ok(i) = s.parse::<LuaInteger>() {
                 Ok(TValue::Integer(i))
             } else if let Some(f) = crate::float_utils::f64_from_str(s) {
                 Ok(TValue::Float(f))
@@ -656,23 +733,20 @@ fn get_int_arg<'a>(
     a: usize,
     idx: usize,
     fname: &str,
-) -> Result<i64, VmError<'a>> {
+) -> Result<LuaInteger, VmError<'a>> {
     let v = get_arg(state, a, idx);
     match &v {
         TValue::Integer(n) => Ok(*n),
         TValue::Float(f) => {
-            let i = *f as i64;
-            if (i as f64) == *f {
-                Ok(i)
-            } else {
+            crate::vm::float_to_integer(*f, crate::vm::F2IMode::Eq).ok_or_else(|| {
                 // 用 float_utils 而非 format!("{}", f), 避免 size_optimized 模式引入 flt2dec 代码.
-                Err(VmError::RuntimeError(format!(
+                VmError::RuntimeError(format!(
                     "bad argument #{} to '{}' (integer expected, got float {})",
                     idx + 1,
                     fname,
                     crate::float_utils::f64_to_string(*f)
-                )))
-            }
+                ))
+            })
         }
         _ => Err(VmError::RuntimeError(format!(
             "bad argument #{} to '{}' (integer expected, got {})",
@@ -715,7 +789,7 @@ fn call_abs<'a>(
             let v = match other {
                 s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                     let s = lua_string_as_str(s);
-                    if let Ok(i) = s.parse::<i64>() {
+                    if let Ok(i) = s.parse::<LuaInteger>() {
                         TValue::Integer(i)
                     } else if let Some(f) = crate::float_utils::f64_from_str(s) {
                         TValue::Float(f)
@@ -749,12 +823,12 @@ fn unary_slow_convert<'a>(
     state: &LuaState<'a>,
     v: &TValue<'a>,
     fname: &str,
-) -> Result<f64, VmError<'a>> {
+) -> Result<LuaNumber, VmError<'a>> {
     match v {
         s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
             let s = lua_string_as_str(s);
             crate::float_utils::f64_from_str(s)
-                .or_else(|| s.parse::<i64>().ok().map(|i| i as f64))
+                .or_else(|| s.parse::<LuaInteger>().ok().map(|i| i as LuaNumber))
                 .ok_or_else(|| {
                     VmError::RuntimeError(format!(
                         "bad argument #1 to '{}' (number expected, got string)",
@@ -787,7 +861,7 @@ fn call_simple_unary<'a, F>(
     fname: &str,
 ) -> Result<(), VmError<'a>>
 where
-    F: Fn(f64) -> f64,
+    F: Fn(LuaNumber) -> LuaNumber,
 {
     // perf: 泛型替代 fn 指针 — 每个注册点单态化后 f(x) 直接内联
     // (sqrt→sqrtd 单指令, sin/cos→内联 libm 序列), 消除一次间接 call。
@@ -798,7 +872,7 @@ where
     // adjust 的 nresults==1 直线段, 省掉: 二次参数判别、尾部逐槽扫描循环 (唯一
     // 尾槽即本参数, 已确认数值 trivial)、stack.len() 回读 (top = a+1 常数)。
     // 不满足 (多参/非 1-out/非数值参/hook) 落回原通用路径, 语义逐位不变。
-    let spec_x: Option<f64> = if nargs == 1
+    let spec_x: Option<LuaNumber> = if nargs == 1
         && nresults == 1
         && state.stack.len() == a + 2
         && (state.hook_mask & 2 == 0 || !state.allowhook)
@@ -810,7 +884,7 @@ where
         let arg = &state.stack[a + 1];
         match arg {
             TValue::Float(v) => Some(*v),
-            TValue::Integer(v) => Some(*v as f64),
+            TValue::Integer(v) => Some(*v as LuaNumber),
             _ => None,
         }
     } else {
@@ -851,7 +925,7 @@ where
     let arg = &state.stack[a + 1];
     let x = match arg {
         TValue::Float(fl) => *fl,
-        TValue::Integer(i) => *i as f64,
+        TValue::Integer(i) => *i as LuaNumber,
         other => unary_slow_convert(state, other, fname)?,
     };
     state.adjust_single_result(a, nresults, TValue::Float(f(x)));
@@ -958,13 +1032,13 @@ fn call_atan<'a>(
     }
     let y = match &state.stack[a + 1] {
         TValue::Float(fl) => *fl,
-        TValue::Integer(i) => *i as f64,
+        TValue::Integer(i) => *i as LuaNumber,
         other => unary_slow_convert(state, other, "atan")?,
     };
     let x = if nargs >= 2 {
         match &state.stack[a + 2] {
             TValue::Float(fl) => Some(*fl),
-            TValue::Integer(i) => Some(*i as f64),
+            TValue::Integer(i) => Some(*i as LuaNumber),
             other => Some(unary_slow_convert(state, other, "atan")?),
         }
     } else {
@@ -991,13 +1065,13 @@ fn call_log<'a>(
     }
     let x = match &state.stack[a + 1] {
         TValue::Float(fl) => *fl,
-        TValue::Integer(i) => *i as f64,
+        TValue::Integer(i) => *i as LuaNumber,
         other => unary_slow_convert(state, other, "log")?,
     };
     let base = if nargs >= 2 {
         match &state.stack[a + 2] {
             TValue::Float(fl) => Some(*fl),
-            TValue::Integer(i) => Some(*i as f64),
+            TValue::Integer(i) => Some(*i as LuaNumber),
             other => Some(unary_slow_convert(state, other, "log")?),
         }
     } else {
@@ -1394,7 +1468,7 @@ pub fn open_math_lib<'a>(state: &mut LuaState<'a>) {
     // 使用时间种子初始化
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
+        .map(|d| d.as_nanos() as LuaUnsigned)
         .unwrap_or(1);
     {
         let mut rs = state.math_random_state.borrow_mut();
@@ -1414,6 +1488,17 @@ mod tests {
     use super::*;
     use crate::strings::ShortString;
 
+    // 与 `LuaNumber` 同宽度的数学常量及断言容差 (避免测试硬编码 f64 精度)。
+    #[cfg(feature = "num-f32")]
+    use std::f32::consts::{E, PI as PI_C, SQRT_2};
+    #[cfg(not(feature = "num-f32"))]
+    use std::f64::consts::{E, PI as PI_C, SQRT_2};
+    /// 浮点断言基础容差 (单精度下 ULP 大得多)。
+    #[cfg(not(feature = "num-f32"))]
+    const EPS: LuaNumber = 1e-15;
+    #[cfg(feature = "num-f32")]
+    const EPS: LuaNumber = 1e-6;
+
     fn make_str(s: &str) -> TValue<'_> {
         TValue::ShortStr(crate::strings::ArcRc::<ShortString>::new_sstr(
             0,
@@ -1428,10 +1513,19 @@ mod tests {
 
     #[test]
     fn test_constants() {
-        assert!((PI - std::f64::consts::PI).abs() < 1e-15);
+        // PI / MAX_INTEGER / MIN_INTEGER 随配置取整, 断言其对应该配置的常量。
+        assert!((PI - PI_C).abs() < EPS);
         assert!(HUGE.is_infinite() && HUGE > 0.0);
-        assert_eq!(MAX_INTEGER, i64::MAX);
-        assert_eq!(MIN_INTEGER, i64::MIN);
+        #[cfg(not(feature = "num-i32"))]
+        {
+            assert_eq!(MAX_INTEGER, i64::MAX);
+            assert_eq!(MIN_INTEGER, i64::MIN);
+        }
+        #[cfg(feature = "num-i32")]
+        {
+            assert_eq!(MAX_INTEGER, i32::MAX);
+            assert_eq!(MIN_INTEGER, i32::MIN);
+        }
     }
 
     // ========================================================================
@@ -1470,34 +1564,34 @@ mod tests {
 
     #[test]
     fn test_math_sin() {
-        assert!((math_sin(0.0) - 0.0).abs() < 1e-15);
-        assert!((math_sin(PI / 2.0) - 1.0).abs() < 1e-15);
-        assert!((math_sin(PI) - 0.0).abs() < 1e-15);
+        assert!((math_sin(0.0) - 0.0).abs() < EPS);
+        assert!((math_sin(PI / 2.0) - 1.0).abs() < EPS);
+        assert!((math_sin(PI) - 0.0).abs() < EPS);
     }
 
     #[test]
     fn test_math_cos() {
-        assert!((math_cos(0.0) - 1.0).abs() < 1e-15);
-        assert!((math_cos(PI / 2.0) - 0.0).abs() < 1e-15);
-        assert!((math_cos(PI) - (-1.0)).abs() < 1e-15);
+        assert!((math_cos(0.0) - 1.0).abs() < EPS);
+        assert!((math_cos(PI / 2.0) - 0.0).abs() < EPS);
+        assert!((math_cos(PI) - (-1.0)).abs() < EPS);
     }
 
     #[test]
     fn test_math_tan() {
-        assert!((math_tan(0.0) - 0.0).abs() < 1e-15);
-        assert!((math_tan(PI / 4.0) - 1.0).abs() < 1e-15);
+        assert!((math_tan(0.0) - 0.0).abs() < EPS);
+        assert!((math_tan(PI / 4.0) - 1.0).abs() < EPS);
     }
 
     #[test]
     fn test_math_asin() {
-        assert!((math_asin(0.0) - 0.0).abs() < 1e-15);
-        assert!((math_asin(1.0) - PI / 2.0).abs() < 1e-15);
+        assert!((math_asin(0.0) - 0.0).abs() < EPS);
+        assert!((math_asin(1.0) - PI / 2.0).abs() < EPS);
     }
 
     #[test]
     fn test_math_acos() {
         // Miri 下 acos 精度略低,用 1e-10 容差
-        let tol = if cfg!(miri) { 1e-10 } else { 1e-15 };
+        let tol = if cfg!(miri) { 1e-10 } else { EPS };
         assert!((math_acos(0.0) - PI / 2.0).abs() < tol);
         assert!((math_acos(1.0) - 0.0).abs() < tol);
         assert!((math_acos(-1.0) - PI).abs() < tol);
@@ -1505,12 +1599,12 @@ mod tests {
 
     #[test]
     fn test_math_atan() {
-        assert!((math_atan(0.0, None) - 0.0).abs() < 1e-15);
-        assert!((math_atan(1.0, None) - PI / 4.0).abs() < 1e-15);
+        assert!((math_atan(0.0, None) - 0.0).abs() < EPS);
+        assert!((math_atan(1.0, None) - PI / 4.0).abs() < EPS);
         // atan2(1, 1) = PI/4
-        assert!((math_atan(1.0, Some(1.0)) - PI / 4.0).abs() < 1e-15);
+        assert!((math_atan(1.0, Some(1.0)) - PI / 4.0).abs() < EPS);
         // atan2(1, 0) = PI/2
-        assert!((math_atan(1.0, Some(0.0)) - PI / 2.0).abs() < 1e-15);
+        assert!((math_atan(1.0, Some(0.0)) - PI / 2.0).abs() < EPS);
     }
 
     // ========================================================================
@@ -1596,7 +1690,7 @@ mod tests {
     fn test_math_fmod_integer_neg_one() {
         // 除以 -1 时返回 0 (避免溢出)
         assert_eq!(
-            math_fmod(&TValue::Integer(i64::MIN), &TValue::Integer(-1)).unwrap(),
+            math_fmod(&TValue::Integer(MIN_INTEGER), &TValue::Integer(-1)).unwrap(),
             TValue::Integer(0)
         );
     }
@@ -1604,13 +1698,13 @@ mod tests {
     #[test]
     fn test_math_fmod_float() {
         let result = math_fmod(&TValue::Float(10.5), &TValue::Float(3.0)).unwrap();
-        assert!(matches!(result, TValue::Float(f) if (f - 1.5).abs() < 1e-15));
+        assert!(matches!(result, TValue::Float(f) if (f - 1.5).abs() < EPS));
     }
 
     #[test]
     fn test_math_fmod_mixed() {
         let result = math_fmod(&TValue::Integer(10), &TValue::Float(3.0)).unwrap();
-        assert!(matches!(result, TValue::Float(f) if (f - 1.0).abs() < 1e-15));
+        assert!(matches!(result, TValue::Float(f) if (f - 1.0).abs() < EPS));
     }
 
     // ========================================================================
@@ -1628,14 +1722,14 @@ mod tests {
     fn test_math_modf_float_positive() {
         let (int, frac) = math_modf(&TValue::Float(3.14)).unwrap();
         assert_eq!(int, TValue::Integer(3));
-        assert!(matches!(frac, TValue::Float(f) if (f - 0.14).abs() < 1e-15));
+        assert!(matches!(frac, TValue::Float(f) if (f - 0.14).abs() < EPS));
     }
 
     #[test]
     fn test_math_modf_float_negative() {
         let (int, frac) = math_modf(&TValue::Float(-3.14)).unwrap();
         assert_eq!(int, TValue::Integer(-3));
-        assert!(matches!(frac, TValue::Float(f) if (f - (-0.14)).abs() < 1e-15));
+        assert!(matches!(frac, TValue::Float(f) if (f - (-0.14)).abs() < EPS));
     }
 
     #[test]
@@ -1651,29 +1745,29 @@ mod tests {
 
     #[test]
     fn test_math_sqrt() {
-        assert!((math_sqrt(4.0) - 2.0).abs() < 1e-15);
-        assert!((math_sqrt(2.0) - std::f64::consts::SQRT_2).abs() < 1e-15);
+        assert!((math_sqrt(4.0) - 2.0).abs() < EPS);
+        assert!((math_sqrt(2.0) - SQRT_2).abs() < EPS);
         assert!(math_sqrt(-1.0).is_nan());
     }
 
     #[test]
     fn test_math_exp() {
-        // Miri 下 exp 精度略低,用 1e-10 容差
-        let tol = if cfg!(miri) { 1e-10 } else { 1e-15 };
+        // Miri 下 exp 精度略低,用更宽的容差
+        let tol = if cfg!(miri) { 1e-10 } else { EPS };
         assert!((math_exp(0.0) - 1.0).abs() < tol);
-        assert!((math_exp(1.0) - std::f64::consts::E).abs() < tol);
+        assert!((math_exp(1.0) - E).abs() < tol);
     }
 
     #[test]
     fn test_math_log_natural() {
-        assert!((math_log(1.0, None) - 0.0).abs() < 1e-15);
-        assert!((math_log(std::f64::consts::E, None) - 1.0).abs() < 1e-15);
+        assert!((math_log(1.0, None) - 0.0).abs() < EPS);
+        assert!((math_log(E, None) - 1.0).abs() < EPS);
     }
 
     #[test]
     fn test_math_log_base() {
         // Miri 下 log2/log10 精度略低,用 1e-10 容差
-        let tol = if cfg!(miri) { 1e-10 } else { 1e-15 };
+        let tol = if cfg!(miri) { 1e-10 } else { EPS };
         assert!((math_log(8.0, Some(2.0)) - 3.0).abs() < tol);
         assert!((math_log(100.0, Some(10.0)) - 2.0).abs() < tol);
         assert!((math_log(1000.0, Some(10.0)) - 3.0).abs() < tol);
@@ -1685,16 +1779,16 @@ mod tests {
 
     #[test]
     fn test_math_deg() {
-        assert!((math_deg(PI) - 180.0).abs() < 1e-15);
-        assert!((math_deg(PI / 2.0) - 90.0).abs() < 1e-15);
-        assert!((math_deg(0.0) - 0.0).abs() < 1e-15);
+        assert!((math_deg(PI) - 180.0).abs() < EPS);
+        assert!((math_deg(PI / 2.0) - 90.0).abs() < EPS);
+        assert!((math_deg(0.0) - 0.0).abs() < EPS);
     }
 
     #[test]
     fn test_math_rad() {
-        assert!((math_rad(180.0) - PI).abs() < 1e-15);
-        assert!((math_rad(90.0) - PI / 2.0).abs() < 1e-15);
-        assert!((math_rad(0.0) - 0.0).abs() < 1e-15);
+        assert!((math_rad(180.0) - PI).abs() < EPS);
+        assert!((math_rad(90.0) - PI / 2.0).abs() < EPS);
+        assert!((math_rad(0.0) - 0.0).abs() < EPS);
     }
 
     // ========================================================================
@@ -1715,7 +1809,7 @@ mod tests {
         assert!(math_ult(1, 2));
         assert!(!math_ult(2, 1));
         assert!(!math_ult(1, 1));
-        // 无符号比较: -1 作为无符号是 u64::MAX, 大于 1
+        // 无符号比较: -1 作为无符号是 MAX_UNSIGNED, 大于 1
         assert!(!math_ult(-1, 1));
         assert!(math_ult(1, -1));
     }
@@ -1731,20 +1825,20 @@ mod tests {
         assert_eq!(e, 0);
 
         let (m, e) = math_frexp(1.0);
-        assert!((m - 0.5).abs() < 1e-15);
+        assert!((m - 0.5).abs() < EPS);
         assert_eq!(e, 1);
 
         let (m, e) = math_frexp(4.0);
-        assert!((m - 0.5).abs() < 1e-15);
+        assert!((m - 0.5).abs() < EPS);
         assert_eq!(e, 3);
     }
 
     #[test]
     fn test_math_ldexp() {
-        assert!((math_ldexp(0.5, 1) - 1.0).abs() < 1e-15);
-        assert!((math_ldexp(0.5, 3) - 4.0).abs() < 1e-15);
-        assert!((math_ldexp(1.0, 0) - 1.0).abs() < 1e-15);
-        assert!((math_ldexp(1.0, 10) - 1024.0).abs() < 1e-15);
+        assert!((math_ldexp(0.5, 1) - 1.0).abs() < EPS);
+        assert!((math_ldexp(0.5, 3) - 4.0).abs() < EPS);
+        assert!((math_ldexp(1.0, 0) - 1.0).abs() < EPS);
+        assert!((math_ldexp(1.0, 10) - 1024.0).abs() < EPS);
     }
 
     #[test]
@@ -1752,7 +1846,7 @@ mod tests {
         let x = 3.14;
         let (m, e) = math_frexp(x);
         let restored = math_ldexp(m, e);
-        assert!((restored - x).abs() < 1e-15);
+        assert!((restored - x).abs() < EPS);
     }
 
     // ========================================================================
@@ -1879,7 +1973,8 @@ mod tests {
         let mut state = RandState::new();
         state.setseed(42, 0);
         for _ in 0..100 {
-            let ran = state.nextrand();
+            // 对应内部用法 I2UInt(nextrand(...)) — 截断到 LuaUnsigned 宽度
+            let ran = state.nextrand() as LuaUnsigned;
             let p = state.project(ran, 10);
             assert!(p <= 10, "project returned {} which is > 10", p);
         }
@@ -2058,7 +2153,7 @@ mod tests {
         // 验证常量
         let pi_key = state.intern_str("pi");
         match math_table.get(&pi_key) {
-            Some(TValue::Float(f)) => assert!((f - PI).abs() < 1e-15),
+            Some(TValue::Float(f)) => assert!((f - PI).abs() < EPS),
             _ => panic!("math.pi not found or wrong type"),
         }
 
@@ -2070,13 +2165,13 @@ mod tests {
 
         let maxint_key = state.intern_str("maxinteger");
         match math_table.get(&maxint_key) {
-            Some(TValue::Integer(n)) => assert_eq!(n, i64::MAX),
+            Some(TValue::Integer(n)) => assert_eq!(n, MAX_INTEGER),
             _ => panic!("math.maxinteger not found or wrong type"),
         }
 
         let minint_key = state.intern_str("mininteger");
         match math_table.get(&minint_key) {
-            Some(TValue::Integer(n)) => assert_eq!(n, i64::MIN),
+            Some(TValue::Integer(n)) => assert_eq!(n, MIN_INTEGER),
             _ => panic!("math.mininteger not found or wrong type"),
         }
     }

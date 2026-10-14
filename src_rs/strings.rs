@@ -111,7 +111,6 @@ use crate::alloc::{
 use crate::alloc::{
     simple_rc_block_layout as block_layout, simple_rc_payload_offset as payload_offset,
 };
-pub type ArcRcBox<T> = <ArcRc<T> as IsArcRc>::Box;
 pub type ArcRcHeader<T> = <ArcRc<T> as IsArcRc>::Header;
 
 // 默认模式 (性能优先): 使用 hashbrown::HashTable 单级哈希表
@@ -131,8 +130,6 @@ use crate::mem::SlotAlloc;
 /// 短字符串的最大长度（字节数）。
 /// 长度 ≤ 40 的字符串会被内部化（interned），相同内容的字符串共享同一个 `ArcRc`。
 pub const LUAI_MAXSHORTLEN: usize = 40;
-
-pub const MEMERRMSG: &str = "not enough memory";
 
 // ============================================================================
 // 规约：字符串类型定义
@@ -320,12 +317,6 @@ impl LongString {
     pub fn contents(&self) -> *const u8 {
         self.contents.get()
     }
-
-    /// 是否为外部字符串（内容在 Lua 管理的内存之外）。
-    #[inline]
-    pub fn is_external(&self) -> bool {
-        self.kind.get() != LSTRREG
-    }
 }
 
 // 编译期断言：前缀布局必须与 ShortString 的固定部分一致
@@ -430,21 +421,6 @@ impl SimpleRc<LongString, SlotAlloc> {
     #[inline]
     pub fn new_lstr(alloc: SlotAlloc, hash: Option<u64>, data: &[u8]) -> Self {
         Self::new_lstr_in(alloc, hash, data)
-    }
-
-    /// 创建外部字符串块 —— 内容不拷贝，`contents` 指向调用方缓冲区。
-    ///
-    /// # Safety
-    /// 见 [`Self::new_ext_lstr_in`]。
-    #[inline]
-    pub unsafe fn new_ext_lstr(
-        alloc: SlotAlloc,
-        contents: *const u8,
-        len: usize,
-        falloc: Option<Falloc>,
-        ud: *mut c_void,
-    ) -> Self {
-        Self::new_ext_lstr_in(alloc, contents, len, falloc, ud)
     }
 }
 
@@ -687,12 +663,6 @@ impl StringTable {
             nuse: RwLock::new(0),
         }
     }
-    /// 内部化一个短字符串。
-    #[cfg_attr(not(size_optimized), inline)]
-    pub fn intern(&self, str: &str) -> ArcRc<ShortString> {
-        self.intern_with_hash(str, rust_hash(str))
-    }
-
     #[inline]
     pub fn intern_value<'a>(&self, str: &str) -> TValue<'a> {
         TValue::ShortStr(self.intern_with_hash(str, rust_hash(str)))
@@ -851,21 +821,6 @@ impl StringTable {
         *self.nuse.read()
     }
 
-    pub fn remove(&self, ts: &ShortString) {
-        let h = ts.hash;
-        let ptr = ts as *const ShortString;
-        let mut ht = self.ht.write();
-        // 用指针相等性匹配要删除的条目
-        // HashTable 没有 remove_entry 方法，改用 find_entry + remove
-        if let Ok(entry) = ht.find_entry(h, |item: &ArcRc<ShortString>| {
-            std::ptr::eq(item.as_ref(), ptr)
-        }) {
-            entry.remove();
-        }
-        let mut nuse = self.nuse.write();
-        *nuse = nuse.saturating_sub(1);
-    }
-
     pub fn for_each<F: FnMut(&ShortString)>(&self, mut f: F) {
         let ht = self.ht.read();
         for ts in ht.iter() {
@@ -960,24 +915,6 @@ pub fn lua_string_eq(s1: &TValue, s2: &TValue) -> bool {
     }
 }
 
-/// 估算字符串真实堆占用（用于 GC 内存计费）。
-/// 短串: ArcRc 分配头 + ShortString 结构 + 内联内容
-/// 长串: Rc 分配头 + 分配器槽 + LongString 固定部分 + 内联内容（外部字符串无内联内容）
-/// 字符串不调用 register_object（无 gc_header），由 gc_extra_estimate 跟踪。
-pub fn lua_string_gc_mem_size(str: &TValue) -> usize {
-    match str {
-        // ArcRc 分配 = 引用计数头 + ShortString（固定部分 + 内联内容）
-        TValue::ShortStr(s) => ShortString::FIXED_SIZE + s.len as usize + 16,
-        // Rc 分配 = 引用计数头 + 分配器槽 + LongString（固定部分 + 内联内容）；
-        // 外部字符串的内容在调用方缓冲区（不由 Lua 分配），不计入
-        TValue::LongStr(s) => {
-            let inline = if s.is_external() { 0 } else { s.len as usize };
-            LongString::FIXED_SIZE + inline + 16
-        }
-        _ => unreachable!("Not a string"),
-    }
-}
-
 #[cfg_attr(not(size_optimized), inline)]
 pub fn lua_string_as_str<'a, 'b>(str: &'b TValue<'a>) -> &'b str {
     lua_string_as_str_inner(str)
@@ -1015,10 +952,6 @@ pub fn lua_string_len(str: &TValue) -> usize {
         TValue::LongStr(s) => s.len as usize - 1,
         _ => unreachable!("Not a string"),
     }
-}
-
-pub fn lua_string_is_empty(str: &TValue) -> bool {
-    lua_string_len(str) == 0
 }
 
 /// 返回预计算的哈希值（短字符串始终有效；长字符串 extra==0 时为 0）。
@@ -1224,7 +1157,6 @@ mod tests {
         let s = tb.intern_value("");
         assert_eq!(lua_string_as_str(&s), "");
         assert_eq!(lua_string_len(&s), 0);
-        assert!(lua_string_is_empty(&s));
         assert_eq!(tb.count(), 1);
     }
 
@@ -1242,30 +1174,9 @@ mod tests {
         let tb = StringTable::new();
         for i in 0..256 {
             let content = format!("key_{}", i);
-            tb.intern(&content);
+            tb.intern_value(&content);
         }
         assert_eq!(tb.count(), 256, "所有字符串应该都被插入");
-    }
-
-    // ------------------------------------------------------------------------
-    // StringTable::remove 测试
-    // ------------------------------------------------------------------------
-
-    #[test]
-    fn test_remove_short_string() {
-        let tb = StringTable::new();
-        let s1 = tb.intern_value("hello");
-        let s2 = tb.intern_value("world");
-        assert_eq!(tb.count(), 2);
-
-        if let TValue::ShortStr(ref ts) = s1 {
-            tb.remove(ts);
-        }
-        assert_eq!(tb.count(), 1, "移除后 nuse 应为 1");
-
-        let s2_again = tb.intern_value("world");
-        assert_eq!(s2, s2_again);
-        assert_eq!(tb.count(), 1, "重新查找 world 不应增加 nuse");
     }
 
     // ------------------------------------------------------------------------
@@ -1346,7 +1257,6 @@ mod tests {
             match &ext {
                 TValue::LongStr(ls) => {
                     assert_eq!(ls.kind.get(), LSTRFIX, "falloc == NULL → LSTRFIX");
-                    assert!(ls.is_external());
                     assert_eq!(ls.contents(), buf.as_ptr());
                 }
                 _ => panic!("外部字符串应为 LongStr"),
@@ -1485,7 +1395,7 @@ mod tests {
         // 外部字符串：块 = 固定头（内容在调用方缓冲区）
         let buf = b"external\0".to_vec();
         let ext = unsafe {
-            SimpleRc::<LongString, SlotAlloc>::new_ext_lstr(
+            SimpleRc::<LongString, SlotAlloc>::new_ext_lstr_in(
                 slot,
                 buf.as_ptr(),
                 8,
@@ -1584,16 +1494,6 @@ mod tests {
         let s = tb.intern_value("hello");
         let h = rust_hash("hello");
         assert_eq!(lua_string_hash(&s), h);
-    }
-
-    #[test]
-    fn test_lua_string_len_and_is_empty() {
-        let tb = StringTable::new();
-        let empty = tb.intern_value("");
-        let non_empty = tb.intern_value("x");
-        assert!(lua_string_is_empty(&empty));
-        assert!(!lua_string_is_empty(&non_empty));
-        assert_eq!(lua_string_len(&non_empty), 1);
     }
 
     #[test]

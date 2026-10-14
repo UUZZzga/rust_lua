@@ -21,6 +21,7 @@
 //! - 标签 500+: 调试库
 
 use crate::alloc::MyRc;
+use crate::config::LuaInteger;
 use crate::execute::VmError;
 use crate::mem::SlotAlloc;
 use crate::objects::{BuiltinFn, LClosure, NilKind, Proto, TValue, UpVal, UpValRef, PF_VAHID};
@@ -684,25 +685,28 @@ fn call_getinfo<'a>(
         );
         result_table.set(
             state.intern_str("linedefined"),
-            TValue::Integer(info.linedefined as i64),
+            TValue::Integer(info.linedefined as LuaInteger),
         );
         result_table.set(
             state.intern_str("lastlinedefined"),
-            TValue::Integer(info.lastlinedefined as i64),
+            TValue::Integer(info.lastlinedefined as LuaInteger),
         );
         result_table.set(state.intern_str("what"), state.intern_str(&info.what));
     }
     if what.contains('l') {
         result_table.set(
             state.intern_str("currentline"),
-            TValue::Integer(info.currentline as i64),
+            TValue::Integer(info.currentline as LuaInteger),
         );
     }
     if what.contains('u') {
-        result_table.set(state.intern_str("nups"), TValue::Integer(info.nups as i64));
+        result_table.set(
+            state.intern_str("nups"),
+            TValue::Integer(info.nups as LuaInteger),
+        );
         result_table.set(
             state.intern_str("nparams"),
-            TValue::Integer(info.nparams as i64),
+            TValue::Integer(info.nparams as LuaInteger),
         );
         result_table.set(state.intern_str("isvararg"), TValue::Boolean(info.isvararg));
     }
@@ -723,11 +727,11 @@ fn call_getinfo<'a>(
     if what.contains('r') {
         result_table.set(
             state.intern_str("ftransfer"),
-            TValue::Integer(info.ftransfer as i64),
+            TValue::Integer(info.ftransfer as LuaInteger),
         );
         result_table.set(
             state.intern_str("ntransfer"),
-            TValue::Integer(info.ntransfer as i64),
+            TValue::Integer(info.ntransfer as LuaInteger),
         );
     }
     if what.contains('t') {
@@ -737,7 +741,7 @@ fn call_getinfo<'a>(
         );
         result_table.set(
             state.intern_str("extraargs"),
-            TValue::Integer(info.extraargs as i64),
+            TValue::Integer(info.extraargs as LuaInteger),
         );
     }
     if what.contains('L') {
@@ -1479,7 +1483,7 @@ fn fill_active_lines(table: &mut Table, proto: &Proto) {
     for i in start..proto.line_info.len() {
         currentline = next_line(proto, currentline, i);
         if currentline > 0 {
-            table.set_int(currentline as i64, TValue::Boolean(true));
+            table.set_int(currentline as LuaInteger, TValue::Boolean(true));
         }
     }
 }
@@ -2588,7 +2592,7 @@ fn call_gethook<'a>(
                     vec![
                         f.clone(),
                         (state.intern_str(&mask_str)),
-                        TValue::Integer(ctx.exec.hook_count as i64),
+                        TValue::Integer(ctx.exec.hook_count as LuaInteger),
                     ],
                 );
             }
@@ -2635,7 +2639,7 @@ fn call_gethook<'a>(
                 vec![
                     f.clone(),
                     (state.intern_str(&mask_str)),
-                    TValue::Integer(count as i64),
+                    TValue::Integer(count as LuaInteger),
                 ],
             );
         }
@@ -2682,8 +2686,14 @@ fn set_hook_in_registry<'a>(
     }
 
     // 存储掩码和计数
-    hook_table.set(state.intern_str("_mask"), TValue::Integer(mask as i64));
-    hook_table.set(state.intern_str("_count"), TValue::Integer(count as i64));
+    hook_table.set(
+        state.intern_str("_mask"),
+        TValue::Integer(mask as LuaInteger),
+    );
+    hook_table.set(
+        state.intern_str("_count"),
+        TValue::Integer(count as LuaInteger),
+    );
 
     state.registry.set(hookkey, TValue::Table(hook_table));
 
@@ -2720,7 +2730,7 @@ fn call_traceback<'a>(
     let level = if nargs > arg_offset + 1 {
         get_arg(state, a, arg_offset + 1)
             .as_integer()
-            .unwrap_or(default_level as i64) as i32
+            .unwrap_or(default_level as LuaInteger) as i32
     } else {
         default_level
     };

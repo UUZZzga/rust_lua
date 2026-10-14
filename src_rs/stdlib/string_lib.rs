@@ -9,6 +9,7 @@
 //! - 注册 string 全局表，包含所有字符串库函数
 
 use crate::alloc::{MyRc, SimpleRc};
+use crate::config::{LuaInteger, LuaNumber, LuaUnsigned, MAX_INTEGER, MIN_INTEGER};
 use crate::execute::{arg_error, VmError};
 use crate::objects::{BuiltinFn, BuiltinFnPtr, LuaType, NilKind, RustClosure, TValue};
 use crate::state::LuaState;
@@ -19,24 +20,24 @@ use std::cell::RefCell;
 use std::mem::MaybeUninit;
 use std::rc::Rc;
 
-// 算术运算辅助函数
-fn add_int(a: i64, b: i64) -> Option<i64> {
+// 算术运算辅助函数 (均为 Lua 数值运算 → 用 config 别名)
+fn add_int(a: LuaInteger, b: LuaInteger) -> Option<LuaInteger> {
     Some(a.wrapping_add(b))
 }
-fn sub_int(a: i64, b: i64) -> Option<i64> {
+fn sub_int(a: LuaInteger, b: LuaInteger) -> Option<LuaInteger> {
     Some(a.wrapping_sub(b))
 }
-fn mul_int(a: i64, b: i64) -> Option<i64> {
+fn mul_int(a: LuaInteger, b: LuaInteger) -> Option<LuaInteger> {
     Some(a.wrapping_mul(b))
 }
-fn idiv_int(a: i64, b: i64) -> Option<i64> {
+fn idiv_int(a: LuaInteger, b: LuaInteger) -> Option<LuaInteger> {
     if b == 0 {
         None
     } else {
         Some(a.div_euclid(b))
     }
 }
-fn mod_int(a: i64, b: i64) -> Option<i64> {
+fn mod_int(a: LuaInteger, b: LuaInteger) -> Option<LuaInteger> {
     if b == 0 {
         None
     } else {
@@ -44,35 +45,35 @@ fn mod_int(a: i64, b: i64) -> Option<i64> {
     }
 }
 
-fn add_f(a: f64, b: f64) -> f64 {
+fn add_f(a: LuaNumber, b: LuaNumber) -> LuaNumber {
     a + b
 }
-fn sub_f(a: f64, b: f64) -> f64 {
+fn sub_f(a: LuaNumber, b: LuaNumber) -> LuaNumber {
     a - b
 }
-fn mul_f(a: f64, b: f64) -> f64 {
+fn mul_f(a: LuaNumber, b: LuaNumber) -> LuaNumber {
     a * b
 }
-fn div_f(a: f64, b: f64) -> f64 {
+fn div_f(a: LuaNumber, b: LuaNumber) -> LuaNumber {
     a / b
 }
-fn idiv_f(a: f64, b: f64) -> f64 {
+fn idiv_f(a: LuaNumber, b: LuaNumber) -> LuaNumber {
     (a / b).floor()
 }
-fn mod_f(a: f64, b: f64) -> f64 {
+fn mod_f(a: LuaNumber, b: LuaNumber) -> LuaNumber {
     if b == 0.0 {
-        f64::NAN
+        LuaNumber::NAN
     } else {
         a - (a / b).floor() * b
     }
 }
-fn pow_f(a: f64, b: f64) -> f64 {
+fn pow_f(a: LuaNumber, b: LuaNumber) -> LuaNumber {
     crate::config::float_pow(a, b)
 }
-fn unm_f(a: f64, _b: f64) -> f64 {
+fn unm_f(a: LuaNumber, _b: LuaNumber) -> LuaNumber {
     -a
 }
-fn unm_int(a: i64, _b: i64) -> Option<i64> {
+fn unm_int(a: LuaInteger, _b: LuaInteger) -> Option<LuaInteger> {
     Some(a.wrapping_neg())
 }
 
@@ -86,15 +87,16 @@ fn unm_int(a: i64, _b: i64) -> Option<i64> {
 /// - pos == 0: 返回 1
 /// - pos < -len: 返回 1
 /// - 否则: 返回 len + pos + 1
-fn posrelat_i(pos: i64, len: usize) -> usize {
+fn posrelat_i(pos: LuaInteger, len: usize) -> usize {
     if pos > 0 {
         pos as usize
     } else if pos == 0 {
         1
-    } else if pos < -(len as i64) {
+    } else if pos < -(len as LuaInteger) {
         1
     } else {
-        (len as i64 + pos + 1) as usize
+        // 长度/下标 → LuaInteger 是 C 里同样存在的显式转换 (posrelatI 的 (lua_Integer)len)
+        (len as LuaInteger + pos + 1) as usize
     }
 }
 
@@ -107,15 +109,16 @@ fn posrelat_i(pos: i64, len: usize) -> usize {
 ///
 /// 与 C 版本一致,默认值(def)由调用方通过 get_opt_int_arg 处理,
 /// 此函数不再承担默认值替换职责。
-fn get_end_pos(pos: i64, len: usize) -> usize {
-    if pos > len as i64 {
+fn get_end_pos(pos: LuaInteger, len: usize) -> usize {
+    if pos > len as LuaInteger {
         len
     } else if pos >= 0 {
         pos as usize
-    } else if pos < -(len as i64) {
+    } else if pos < -(len as LuaInteger) {
         0
     } else {
-        (len as i64 + pos + 1) as usize
+        // 长度/下标 → LuaInteger 是 C 里同样存在的显式转换 (getendpos 的 (lua_Integer)len)
+        (len as LuaInteger + pos + 1) as usize
     }
 }
 
@@ -153,8 +156,8 @@ pub fn str_lower(s: &str) -> String {
 
 /// string.len(s) — 返回字符串长度
 /// 对应 C 的 str_len
-pub fn str_len(s: &str) -> i64 {
-    s.len() as i64
+pub fn str_len(s: &str) -> LuaInteger {
+    s.len() as LuaInteger
 }
 
 /// string.sub(s, start, end) — 返回子串
@@ -165,7 +168,7 @@ pub fn str_len(s: &str) -> i64 {
 /// - end 由 get_end_pos 转为 0-based 包含结束位置 (in [0, len])
 /// - 当 start <= end 时,返回 s[start-1..end]
 /// - 否则返回空字符串
-pub fn str_sub(s: &str, start: i64, end: i64) -> String {
+pub fn str_sub(s: &str, start: LuaInteger, end: LuaInteger) -> String {
     let len = s.len();
     let start_pos = posrelat_i(start, len);
     let end_pos = get_end_pos(end, len);
@@ -202,7 +205,7 @@ pub fn str_reverse(s: &str) -> String {
 /// - pose = get_end_pos(j, len) (0-based, in [0, len])
 /// - 当 posi <= pose 时,返回 s[posi-1..pose] 中各字节
 /// - 否则返回空
-pub fn str_byte(s: &str, i: i64, j: i64) -> Vec<i64> {
+pub fn str_byte(s: &str, i: LuaInteger, j: LuaInteger) -> Vec<LuaInteger> {
     let len = s.len();
     let posi = posrelat_i(i, len);
     let pose = get_end_pos(j, len);
@@ -212,7 +215,7 @@ pub fn str_byte(s: &str, i: i64, j: i64) -> Vec<i64> {
         // pose <= len (由 get_end_pos 保证)
         // 当 posi <= pose 时, posi <= len, 切片合法
         for &b in &s.as_bytes()[posi - 1..pose] {
-            result.push(b as i64);
+            result.push(b as LuaInteger);
         }
     }
     result
@@ -220,7 +223,7 @@ pub fn str_byte(s: &str, i: i64, j: i64) -> Vec<i64> {
 
 /// string.char(...) — 从字节值构建字符串
 /// 对应 C 的 str_char
-pub fn str_char(codes: &[i64]) -> Result<String, String> {
+pub fn str_char(codes: &[LuaInteger]) -> Result<String, String> {
     let mut bytes = Vec::with_capacity(codes.len());
     for &c in codes {
         if c < 0 || c > 255 {
@@ -240,7 +243,7 @@ pub fn str_char(codes: &[i64]) -> Result<String, String> {
 /// 对应 C 的 str_rep
 ///
 /// 与 C 版本一致,在结果字符串过大时返回错误 "resulting string too large"。
-pub fn str_rep(s: &str, n: i64, sep: &str) -> Result<String, String> {
+pub fn str_rep(s: &str, n: LuaInteger, sep: &str) -> Result<String, String> {
     if n <= 0 {
         return Ok(String::new());
     }
@@ -248,8 +251,7 @@ pub fn str_rep(s: &str, n: i64, sep: &str) -> Result<String, String> {
     let lsep = sep.len();
     let n = n as usize;
     // 对应 C: len > MAX_SIZE - lsep || (len + lsep) > MAX_SIZE / n
-    // MAX_SIZE 使用 isize::MAX (Rust 分配器上限)
-    let max_size = isize::MAX as usize;
+    let max_size = MAX_SIZE;
     if len > max_size - lsep || (len + lsep) > max_size / n {
         return Err("resulting string too large".to_string());
     }
@@ -915,7 +917,7 @@ fn get_captures_into<'a>(
                 out.push(new_lstr_bytes(alloc, table, bytes));
             }
             CaptureResult::Pos(pos) => {
-                out.push(TValue::Integer(pos as i64));
+                out.push(TValue::Integer(pos as LuaInteger));
             }
         }
     }
@@ -931,7 +933,7 @@ pub fn str_find_into<'a>(
     alloc: crate::mem::SlotAlloc,
     s: &str,
     pattern: &str,
-    init: i64,
+    init: LuaInteger,
     plain: bool,
     find_mode: bool,
     table: &crate::strings::StringTable,
@@ -1006,43 +1008,13 @@ pub fn str_find_into<'a>(
     Ok(None)
 }
 
-/// string.find(s, pattern, [init], [plain]) — 查找模式
-/// 对应 C 的 str_find（兼容包装：结果转 FindResult）
-pub fn str_find<'a>(
-    alloc: crate::mem::SlotAlloc,
-    s: &str,
-    pattern: &str,
-    init: i64,
-    plain: bool,
-    table: &crate::strings::StringTable,
-) -> Result<FindResult<'a>, String> {
-    let mut caps = Vec::new();
-    match str_find_into(alloc, s, pattern, init, plain, true, table, &mut caps)? {
-        Some((start, end)) => Ok(FindResult::Found {
-            start,
-            end,
-            captures: caps,
-        }),
-        None => Ok(FindResult::NotFound),
-    }
-}
-
-pub enum FindResult<'a> {
-    Found {
-        start: usize,
-        end: usize,
-        captures: Vec<TValue<'a>>,
-    },
-    NotFound,
-}
-
 /// string.match(s, pattern, [init]) — 模式匹配
 /// 对应 C 的 str_match
 pub fn str_match<'a>(
     alloc: crate::mem::SlotAlloc,
     s: &str,
     pattern: &str,
-    init: i64,
+    init: LuaInteger,
     table: &crate::strings::StringTable,
 ) -> Result<Vec<TValue<'a>>, String> {
     let mut caps = Vec::new();
@@ -1059,78 +1031,21 @@ pub fn str_match<'a>(
     }
 }
 
-/// string.gmatch(s, pattern) — 全局模式匹配迭代器
-/// 对应 C 的 gmatch
-pub struct GMatchIterator {
-    src: String,
-    pattern: String,
-    pos: usize,
-    anchor: bool,
-    pat_start: usize,
-}
-
-impl GMatchIterator {
-    pub fn new(s: &str, pattern: &str) -> Self {
-        let anchor = pattern.starts_with('^');
-        let pat_start = if anchor { 1 } else { 0 };
-        GMatchIterator {
-            src: s.to_string(),
-            pattern: pattern.to_string(),
-            pos: 0,
-            anchor,
-            pat_start,
-        }
-    }
-
-    pub fn next<'a>(
-        &mut self,
-        alloc: crate::mem::SlotAlloc,
-        table: &crate::strings::StringTable,
-    ) -> Result<Vec<TValue<'a>>, String> {
-        let src_bytes = self.src.as_bytes();
-        let len = src_bytes.len();
-        while self.pos <= len {
-            let mut ms = MatchState::new(self.src.as_bytes(), self.pattern.as_bytes());
-            ms.level = 0;
-            ms.match_depth = MAX_CCALLS;
-            let match_start = self.pos;
-            match match_pattern(&mut ms, match_start, self.pat_start)? {
-                Some(end) => {
-                    let mut captures = Vec::new();
-                    get_captures_into(alloc, &ms, match_start, end, table, &mut captures)?;
-                    // 推进位置: 如果匹配为空则前进 1 以避免无限循环
-                    self.pos = if end > match_start {
-                        end
-                    } else {
-                        match_start + 1
-                    };
-                    if captures.is_empty() {
-                        // 无捕获时返回整个匹配的子串
-                        return Ok(vec![crate::strings::new_lstr_bytes(
-                            alloc,
-                            &table,
-                            &src_bytes[match_start..end],
-                        )]);
-                    }
-                    return Ok(captures);
-                }
-                None => {}
-            }
-            if self.anchor {
-                break;
-            }
-            self.pos += 1;
-        }
-        Ok(Vec::new())
-    }
-}
-
 /// string.gsub(s, pattern, repl, [n]) — 全局替换
 /// 对应 C 的 str_gsub
-pub fn str_gsub(s: &str, pattern: &str, repl: &str, max_s: i64) -> Result<(String, i64), String> {
+pub fn str_gsub(
+    s: &str,
+    pattern: &str,
+    repl: &str,
+    max_s: LuaInteger,
+) -> Result<(String, LuaInteger), String> {
     let src_bytes = s.as_bytes();
     let len = src_bytes.len();
-    let max_s = if max_s < 0 { len as i64 + 1 } else { max_s };
+    let max_s = if max_s < 0 {
+        len as LuaInteger + 1
+    } else {
+        max_s
+    };
     let anchor = pattern.starts_with('^');
     let pat_start = if anchor { 1 } else { 0 };
 
@@ -1142,7 +1057,7 @@ pub fn str_gsub(s: &str, pattern: &str, repl: &str, max_s: i64) -> Result<(Strin
     let repl_bytes = repl.as_bytes();
     let repl_has_esc = repl_bytes.contains(&b'%');
     let mut src_pos = 0;
-    let mut n = 0i64;
+    let mut n = 0 as LuaInteger;
     let mut last_match_end: Option<usize> = None;
 
     // perf: MatchState 在循环外构造一次（对应 C 的 prepstate + reprepstate），
@@ -1211,17 +1126,21 @@ fn str_gsub_with_repl<'a>(
     s: &str,
     pattern: &str,
     repl: &TValue<'a>,
-    max_s: i64,
-) -> Result<(String, i64, bool), String> {
+    max_s: LuaInteger,
+) -> Result<(String, LuaInteger, bool), String> {
     let src_bytes = s.as_bytes();
     let len = src_bytes.len();
-    let max_s = if max_s < 0 { len as i64 + 1 } else { max_s };
+    let max_s = if max_s < 0 {
+        len as LuaInteger + 1
+    } else {
+        max_s
+    };
     let anchor = pattern.starts_with('^');
     let pat_start = if anchor { 1 } else { 0 };
 
     let mut result: Vec<u8> = Vec::new();
     let mut src_pos = 0;
-    let mut n = 0i64;
+    let mut n = 0 as LuaInteger;
     let mut changed = false;
     let mut last_match_end: Option<usize> = None;
 
@@ -1395,13 +1314,13 @@ fn get_capture_as_tvalue<'a>(
             let str_val = unsafe { String::from_utf8_unchecked(bytes.to_vec()) };
             Ok(state.intern_str(&str_val))
         }
-        CaptureResult::Pos(pos) => Ok(TValue::Integer(pos as i64)),
+        CaptureResult::Pos(pos) => Ok(TValue::Integer(pos as LuaInteger)),
     }
 }
 
 /// 格式化浮点数为字符串 — 与 Lua 的 tostring 行为一致
 /// f64_to_string 已处理 nan/inf 和 ".0" 后缀, 直接委托.
-fn format_float_value(f: f64) -> String {
+fn format_float_value(f: LuaNumber) -> String {
     crate::float_utils::f64_to_string(f)
 }
 
@@ -1437,7 +1356,7 @@ fn apply_replacement(
                     }
                     CaptureResult::Pos(pos) => {
                         result.extend_from_slice(
-                            crate::float_utils::i64_to_string(pos as i64).as_bytes(),
+                            crate::float_utils::i64_to_string(pos as LuaInteger).as_bytes(),
                         );
                     }
                 }
@@ -1541,93 +1460,169 @@ fn format_exponent_c(s: String) -> String {
     }
 }
 
-/// 格式化十六进制浮点数 (对应 C printf 的 %a/%A)
-///
-/// 格式: [-]0x<int>.<frac>p<sign><exp>
-/// - 零: 0x0p+0
-/// - 正常: 1.<mantissa_hex>p<exp>
-/// - 无穷: inf/INF
-/// - NaN: nan/NAN
-fn format_hex_float(n: f64, precision: Option<usize>, upper: bool) -> String {
-    let hex_digits = if upper {
-        "0123456789ABCDEF"
+/// 对应 C 的 `l_mathop(frexp)`: 返回 (m, e) 使 |x| = m * 2^e 且 m ∈ [0.5, 1)。
+/// 调用方保证 x 非零且有限；用位提取实现（不依赖 libm）。
+fn lua_frexp(x: LuaNumber) -> (LuaNumber, i32) {
+    // 位布局常量 (f64: 1+11+52, f32: 1+8+23)
+    const TOTAL_BITS: u32 = (std::mem::size_of::<LuaNumber>() * 8) as u32;
+    const MANTISSA_BITS: u32 = LuaNumber::MANTISSA_DIGITS - 1;
+    const EXP_BITS: u32 = TOTAL_BITS - 1 - MANTISSA_BITS;
+    const EXP_BIAS: i32 = LuaNumber::MAX_EXP - 1;
+    const MANT_MASK: u64 = (1u64 << MANTISSA_BITS) - 1;
+    const EXP_MASK: u64 = (1u64 << EXP_BITS) - 1;
+
+    // 位布局运算 (非数值语义): f32 配置下 u32 位模式零扩展为 u64 以便统一提取;
+    // 符号位被掩掉, 结果恒为非负数
+    let bits = x.to_bits() as u64;
+    let e_field = ((bits >> MANTISSA_BITS) & EXP_MASK) as i32;
+    let mant = bits & MANT_MASK;
+    // 把指数域设为 EXP_BIAS-1 即得 [0.5, 1) 的尾数
+    let one_half_exp = ((EXP_BIAS - 1) as u64) << MANTISSA_BITS;
+    if e_field != 0 {
+        // 规格化数: x = 1.mant * 2^(e_field - EXP_BIAS) → m = 1.mant / 2
+        let m_bits = mant | one_half_exp;
+        // from_bits 的参数类型随 LuaNumber 变 (f64: u64 / f32: u32)
+        (LuaNumber::from_bits(m_bits as _), e_field - EXP_BIAS + 1)
     } else {
-        "0123456789abcdef"
-    };
-    let prefix = if upper { "0X" } else { "0x" };
-    let p_char = if upper { 'P' } else { 'p' };
+        // 非规格化数: x = mant * 2^(MIN_EXP - 1 - MANTISSA_BITS)
+        // 去掉最高有效位后左移到尾数域顶端, 得到 m = mant / 2^(k+1)
+        let k = 63 - mant.leading_zeros(); // 最高有效位下标 (mant != 0)
+        let m_bits = ((mant - (1u64 << k)) << (MANTISSA_BITS - k)) | one_half_exp;
+        (
+            LuaNumber::from_bits(m_bits as _),
+            (LuaNumber::MIN_EXP - 1 - MANTISSA_BITS as i32) + k as i32 + 1,
+        )
+    }
+}
+
+/// 格式化十六进制浮点数 (对应 C 的 num2straux + lua_number2strx)
+///
+/// C 的做法 (lstrlib.c): `num2straux` 一律生成**小写**形式, `%A` 再对整个缓冲区
+/// 逐字符 `toupper` —— 因此 `0x8p-3` → `0X8P-3`、`inf` → `INF`、`nan` → `NAN`。
+fn format_hex_float(n: LuaNumber, precision: Option<usize>, upper: bool) -> String {
+    let s = format_hex_float_lower(n, precision); // 对应 C 的 num2straux
+    if upper {
+        // 对应 C 的 lua_number2strx: 对整个结果做 toupper (输出仅含 ASCII)
+        s.chars().map(|c| c.to_ascii_uppercase()).collect()
+    } else {
+        s
+    }
+}
+
+/// `num2straux` 的等价实现 (全部输出小写)
+///
+/// - 零: [-]0x0p+0 (对应 C 的 LUA_NUMBER_FMT "x0p+0")
+/// - 无穷: inf, NaN: nan
+/// - 无修饰符: 首位十六进制数字占 `L_NBFD` 位 (f64 = 1 → "0x1p+0"; f32 = 4 → "0x8p-3"),
+///   之后每 4 位一个数字直到余数为 0
+/// - 带精度/宽度修饰符: 归一到 1.<尾数>p<exp> 的形式 (C 对带修饰符的 %a 直接报错,
+///   官方 strings.lua 对两种行为都接受)
+///
+/// 位布局常量随 `LuaNumber` 变 (f64: 1/11/52, f32: 1/8/23)。
+fn format_hex_float_lower(n: LuaNumber, precision: Option<usize>) -> String {
+    // 总位数 (f64 = 64, f32 = 32); f32::BITS/f64::BITS 关联常量仍是 unstable
+    const TOTAL_BITS: u32 = (std::mem::size_of::<LuaNumber>() * 8) as u32;
+    // 尾数位数 (不含隐含位): f64 = 52, f32 = 23
+    const MANTISSA_BITS: u32 = LuaNumber::MANTISSA_DIGITS - 1;
+    // 指数域位数: f64 = 11, f32 = 8
+    const EXP_BITS: u32 = TOTAL_BITS - 1 - MANTISSA_BITS;
+    // 指数偏置: f64 = 1023, f32 = 127
+    const EXP_BIAS: i32 = LuaNumber::MAX_EXP - 1;
+    // 非规格化数的最小指数: f64 = -1022, f32 = -126
+    const MIN_SUB_EXP: i32 = LuaNumber::MIN_EXP - 1;
+    // 首位十六进制数字占的位数 (C 的 L_NBFD): f64 = 1, f32 = 4
+    const L_NBFD: u32 = (LuaNumber::MANTISSA_DIGITS - 1) % 4 + 1;
+
+    const HEX_DIGITS: &str = "0123456789abcdef";
 
     if n.is_nan() {
-        return if upper { "nan" } else { "nan" }.to_string();
+        return "nan".to_string();
     }
     if n.is_infinite() {
-        let inf = if upper { "INF" } else { "inf" };
         return if n > 0.0 {
-            inf.to_string()
+            "inf".to_string()
         } else {
-            format!("-{}", inf)
+            "-inf".to_string()
         };
     }
 
-    let bits = n.to_bits();
-    let sign_bit = bits >> 63;
-    let exponent = ((bits >> 52) & 0x7FF) as i32;
-    let mantissa = bits & 0xFFFFFFFFFFFFF; // 52 bits
+    // 位布局运算 (非数值语义): f32 配置下 u32 位模式零扩展为 u64 以便统一提取
+    let bits = n.to_bits() as u64;
+    let sign_bit = bits >> (TOTAL_BITS - 1);
+    let exponent = ((bits >> MANTISSA_BITS) & ((1u64 << EXP_BITS) - 1)) as i32;
+    let mantissa = bits & ((1u64 << MANTISSA_BITS) - 1);
 
     let sign_str = if sign_bit != 0 { "-" } else { "" };
 
     if exponent == 0 && mantissa == 0 {
-        // 零
-        return format!("{}{}0{}+0", sign_str, prefix, p_char);
+        // 零 (含 -0)
+        return format!("{}0x0p+0", sign_str);
     }
 
-    let (int_digit, frac_bits, exp_val) = if exponent == 0 {
-        // 非规格化数: 0.mantissa * 2^(-1022)
-        (0u64, mantissa, -1022i32)
-    } else {
-        // 正常数: 1.mantissa * 2^(exponent - 1023)
-        (1u64, mantissa, exponent - 1023)
-    };
-
-    // 默认精度: 13 个十六进制数字 (52 bits / 4 = 13)
-    let default_prec = 13usize;
-    let prec = precision.unwrap_or(default_prec);
-
-    // 将 52 位尾数格式化为十六进制字符串
-    // 尾数位 0-51, 最高 4 位 (48-51) 是第一个十六进制数字
-    let mut frac_str = String::new();
-    for i in 0..prec {
-        let shift = 52i32 - 4 * (i as i32 + 1);
-        let digit = if shift >= 0 {
-            ((frac_bits >> (shift as usize)) & 0xF) as usize
-        } else {
-            // 超出尾数精度, 补 0
-            0
-        };
-        frac_str.push(hex_digits.as_bytes()[digit] as char);
-    }
-
-    // 无显式精度时, 去除尾随零
-    if precision.is_none() {
-        while frac_str.ends_with('0') {
-            frac_str.pop();
+    match precision {
+        // 无修饰符 — 对应 C 的 num2straux
+        None => {
+            let (mut m, mut e) = lua_frexp(if sign_bit != 0 { -n } else { n });
+            // C: m * (1 << L_NBFD) — (1 << L_NBFD) 是 int, 隐式转 lua_Number
+            let first_scale = (1u32 << L_NBFD) as LuaNumber;
+            let mut s = String::new();
+            s.push_str(sign_str);
+            s.push_str("0x");
+            // 首位数字: floor(m * 2^L_NBFD)
+            let dd = (m * first_scale).floor();
+            s.push(HEX_DIGITS.as_bytes()[dd as usize] as char);
+            m = m * first_scale - dd;
+            e -= L_NBFD as i32; // 该数字在小数点之前
+            if m > 0.0 {
+                s.push('.');
+                while m > 0.0 {
+                    let v = m * 16.0;
+                    let dd = v.floor();
+                    s.push(HEX_DIGITS.as_bytes()[dd as usize] as char);
+                    m = v - dd;
+                }
+            }
+            // C: "p%+d"
+            s.push_str(&format!("p{}{}", if e >= 0 { '+' } else { '-' }, e.abs()));
+            s
         }
-    }
+        // 带修饰符 — 保留归一到 1.<尾数>p<exp> 的实现
+        Some(prec) => {
+            let (int_digit, frac_bits, exp_val) = if exponent == 0 {
+                // 非规格化数: 0.mantissa * 2^(MIN_SUB_EXP)
+                (0u64, mantissa, MIN_SUB_EXP)
+            } else {
+                // 正常数: 1.mantissa * 2^(exponent - EXP_BIAS)
+                (1u64, mantissa, exponent - EXP_BIAS)
+            };
 
-    // 格式化指数
-    let exp_sign = if exp_val >= 0 { "+" } else { "-" };
-    let exp_abs = exp_val.abs();
+            // 将尾数格式化为十六进制字符串
+            // 尾数最高 4 位是第一个十六进制数字
+            let mut frac_str = String::new();
+            for i in 0..prec {
+                let shift = MANTISSA_BITS as i32 - 4 * (i as i32 + 1);
+                let digit = if shift >= 0 {
+                    ((frac_bits >> (shift as usize)) & 0xF) as usize
+                } else {
+                    // 超出尾数精度, 补 0
+                    0
+                };
+                frac_str.push(HEX_DIGITS.as_bytes()[digit] as char);
+            }
 
-    if frac_str.is_empty() {
-        format!(
-            "{}{}{}{}{}{}",
-            sign_str, prefix, int_digit, p_char, exp_sign, exp_abs
-        )
-    } else {
-        format!(
-            "{}{}{}.{}{}{}{}",
-            sign_str, prefix, int_digit, frac_str, p_char, exp_sign, exp_abs
-        )
+            // 格式化指数
+            let exp_sign = if exp_val >= 0 { "+" } else { "-" };
+            let exp_abs = exp_val.abs();
+
+            if frac_str.is_empty() {
+                format!("{}0x{}{}{}{}", sign_str, int_digit, 'p', exp_sign, exp_abs)
+            } else {
+                format!(
+                    "{}0x{}.{}{}{}{}",
+                    sign_str, int_digit, frac_str, 'p', exp_sign, exp_abs
+                )
+            }
+        }
     }
 }
 
@@ -1774,11 +1769,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                 })?;
                 // 处理符号
                 let neg = n < 0;
-                let abs_n: u64 = if neg {
-                    ((n as i128).unsigned_abs()) as u64
-                } else {
-                    n as u64
-                };
+                let abs_n: LuaUnsigned = n.unsigned_abs();
                 let mut digits = abs_n.to_string();
                 // 处理精度: 精度表示至少输出的数字位数
                 if let Some(p) = precision {
@@ -1830,7 +1821,8 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                         arg.ty()
                     )
                 })?;
-                let mut digits = (n as u64).to_string();
+                // 对应 C: (LUAI_UACINT)n 配 'u' → 按无符号解释
+                let mut digits = (n as LuaUnsigned).to_string();
                 // 处理精度
                 if let Some(p) = precision {
                     if p == 0 && n == 0 {
@@ -1865,7 +1857,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                         arg.ty()
                     )
                 })?;
-                let mut digits = format!("{:o}", n as u64);
+                let mut digits = format!("{:o}", n as LuaUnsigned);
                 // 处理精度 (默认精度为 1)
                 let prec = precision.unwrap_or(1);
                 if prec == 0 && n == 0 {
@@ -1903,7 +1895,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                         arg.ty()
                     )
                 })?;
-                let mut digits = format!("{:x}", n as u64);
+                let mut digits = format!("{:x}", n as LuaUnsigned);
                 // 处理精度 (默认精度为 1)
                 let prec = precision.unwrap_or(1);
                 if prec == 0 && n == 0 {
@@ -1944,7 +1936,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                         arg.ty()
                     )
                 })?;
-                let mut digits = format!("{:X}", n as u64);
+                let mut digits = format!("{:X}", n as LuaUnsigned);
                 // 处理精度 (默认精度为 1)
                 let prec = precision.unwrap_or(1);
                 if prec == 0 && n == 0 {
@@ -2349,8 +2341,8 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                     }
                     TValue::Integer(n) => {
                         // 对应 C: LUA_MININTEGER 用十六进制,否则用十进制
-                        if *n == i64::MIN {
-                            result.push_str(&format!("0x{:x}", *n as u64));
+                        if *n == MIN_INTEGER {
+                            result.push_str(&format!("0x{:x}", *n as LuaUnsigned));
                         } else {
                             result.push_str(&crate::float_utils::i64_to_string(*n));
                         }
@@ -2461,15 +2453,15 @@ const PACK_PAD_BYTE: u8 = 0x00;
 const MAX_INT_SIZE: usize = 16;
 
 /// lua_Integer 的字节数 (对应 C 的 SZINT = sizeof(lua_Integer))
-const SZ_INT: usize = std::mem::size_of::<i64>();
+const SZ_INT: usize = std::mem::size_of::<LuaInteger>();
 
 /// 最大分配大小 (对应 C 的 MAX_SIZE)
 /// C: sizeof(size_t) < sizeof(lua_Integer) ? MAX_SIZET : cast_sizet(LUA_MAXINTEGER)
-/// 在 64 位平台上 sizeof(size_t) == sizeof(lua_Integer) == 8,所以 MAX_SIZE = LUA_MAXINTEGER
-const MAX_SIZE: usize = if std::mem::size_of::<usize>() < std::mem::size_of::<i64>() {
+const MAX_SIZE: usize = if std::mem::size_of::<usize>() < std::mem::size_of::<LuaInteger>() {
     usize::MAX
 } else {
-    i64::MAX as usize
+    // (size_t)(LUA_MAXINTEGER) — C 里同样是显式宽度转换
+    MAX_INTEGER as usize
 };
 
 /// 原生字节序是否为小端 (对应 C 的 nativeendian.little)
@@ -2478,7 +2470,8 @@ fn native_is_little() -> bool {
 }
 
 /// 最大对齐 (对应 C 的 offsetof(struct cD, u),即 LUAI_MAXALIGN 联合体的对齐)
-/// 在 64 位平台上通常为 8
+/// C 的 cD 联合体成员含**无条件的** `double`(与 LUA_FLOAT_TYPE 无关),故这里同样
+/// 用 f64/i64 而非 LuaNumber/LuaInteger —— 结论不随数值配置变(64 位平台上为 8)。
 const fn max_align() -> usize {
     let a = std::mem::align_of::<f64>();
     let b = std::mem::align_of::<*const u8>();
@@ -2607,7 +2600,7 @@ fn getoption(h: &mut PackHeader, fmt: &[u8], pos: &mut usize) -> Result<(KOption
             KOption::Kfloat
         }
         b'n' => {
-            size = std::mem::size_of::<f64>();
+            size = std::mem::size_of::<LuaNumber>();
             KOption::Knumber
         }
         b'd' => {
@@ -2708,10 +2701,10 @@ fn getdetails(
 }
 
 /// 打包整数 (对应 C 的 packint)
-fn packint(buf: &mut Vec<u8>, n: u64, islittle: bool, size: usize, neg: bool) {
+fn packint(buf: &mut Vec<u8>, n: LuaUnsigned, islittle: bool, size: usize, neg: bool) {
     let start = buf.len();
     buf.resize(start + size, 0);
-    let mask = 0xFFu64;
+    let mask = 0xFF as LuaUnsigned;
     // 写入第一个字节
     let first_idx = if islittle { 0 } else { size - 1 };
     buf[start + first_idx] = (n & mask) as u8;
@@ -2743,23 +2736,28 @@ fn copy_with_endian(dest: &mut [u8], src: &[u8], islittle: bool) {
 }
 
 /// 解包整数 (对应 C 的 unpackint)
-fn unpackint(data: &[u8], islittle: bool, size: usize, issigned: bool) -> Result<i64, String> {
-    let mut res: u64 = 0;
+fn unpackint(
+    data: &[u8],
+    islittle: bool,
+    size: usize,
+    issigned: bool,
+) -> Result<LuaInteger, String> {
+    let mut res: LuaUnsigned = 0;
     let limit = if size <= SZ_INT { size } else { SZ_INT };
     for i in (0..limit).rev() {
         res <<= 8;
         let idx = if islittle { i } else { size - 1 - i };
-        res |= data[idx] as u64;
+        res |= data[idx] as LuaUnsigned;
     }
     if size < SZ_INT {
         if issigned {
             // 符号扩展
-            let mask = 1u64 << (size * 8 - 1);
+            let mask = (1 as LuaUnsigned) << (size * 8 - 1);
             res = (res ^ mask).wrapping_sub(mask);
         }
     } else if size > SZ_INT {
         // 检查未读字节
-        let mask: u8 = if !issigned || (res as i64) >= 0 {
+        let mask: u8 = if !issigned || (res as LuaInteger) >= 0 {
             0
         } else {
             0xFF
@@ -2774,11 +2772,12 @@ fn unpackint(data: &[u8], islittle: bool, size: usize, issigned: bool) -> Result
             }
         }
     }
-    Ok(res as i64)
+    // 两补数下 l_castU2S: 与 C 的 (lua_Integer)res 一致
+    Ok(res as LuaInteger)
 }
 
 /// 从 TValue 获取整数值 (对应 C 的 luaL_checkinteger)
-fn check_integer(v: &TValue, arg: usize) -> Result<i64, String> {
+fn check_integer(v: &TValue, arg: usize) -> Result<LuaInteger, String> {
     match v.as_integer() {
         Some(i) => Ok(i),
         None => Err(format!(
@@ -2790,7 +2789,7 @@ fn check_integer(v: &TValue, arg: usize) -> Result<i64, String> {
 }
 
 /// 从 TValue 获取浮点值 (对应 C 的 luaL_checknumber)
-fn check_number(v: &TValue, arg: usize) -> Result<f64, String> {
+fn check_number(v: &TValue, arg: usize) -> Result<LuaNumber, String> {
     match v.as_float() {
         Some(f) => Ok(f),
         None => Err(format!(
@@ -2858,7 +2857,7 @@ pub fn str_pack(fmt: &str, args: &[TValue]) -> Result<Vec<u8>, String> {
                 }
                 let n = check_integer(&args[arg - 1], arg + 1)?;
                 if size < SZ_INT {
-                    let lim = 1i64 << (size * 8 - 1);
+                    let lim = (1 as LuaInteger) << (size * 8 - 1);
                     if n < -lim || n >= lim {
                         return Err(format!(
                             "bad argument #{} to 'pack' (integer overflow)",
@@ -2866,7 +2865,7 @@ pub fn str_pack(fmt: &str, args: &[TValue]) -> Result<Vec<u8>, String> {
                         ));
                     }
                 }
-                packint(&mut buf, n as u64, h.islittle, size, n < 0);
+                packint(&mut buf, n as LuaUnsigned, h.islittle, size, n < 0);
             }
             KOption::Kuint => {
                 if arg > args.len() {
@@ -2877,15 +2876,15 @@ pub fn str_pack(fmt: &str, args: &[TValue]) -> Result<Vec<u8>, String> {
                 }
                 let n = check_integer(&args[arg - 1], arg + 1)?;
                 if size < SZ_INT {
-                    let max = 1u64 << (size * 8);
-                    if (n as u64) >= max {
+                    let max = (1 as LuaUnsigned) << (size * 8);
+                    if (n as LuaUnsigned) >= max {
                         return Err(format!(
                             "bad argument #{} to 'pack' (unsigned overflow)",
                             arg + 1
                         ));
                     }
                 }
-                packint(&mut buf, n as u64, h.islittle, size, false);
+                packint(&mut buf, n as LuaUnsigned, h.islittle, size, false);
             }
             KOption::Kfloat => {
                 if arg > args.len() {
@@ -2894,6 +2893,7 @@ pub fn str_pack(fmt: &str, args: &[TValue]) -> Result<Vec<u8>, String> {
                         arg + 1
                     ));
                 }
+                // 对应 C: float f = (float)luaL_checknumber(...) — 有损窄化, 仅此处允许 as f32
                 let f = check_number(&args[arg - 1], arg + 1)? as f32;
                 let bytes = f.to_le_bytes();
                 let start = buf.len();
@@ -2933,7 +2933,8 @@ pub fn str_pack(fmt: &str, args: &[TValue]) -> Result<Vec<u8>, String> {
                         arg + 1
                     ));
                 }
-                let f = check_number(&args[arg - 1], arg + 1)?;
+                // 对应 C: double d = (double)luaL_checknumber(...)
+                let f = f64::from(check_number(&args[arg - 1], arg + 1)?);
                 let bytes = f.to_le_bytes();
                 let start = buf.len();
                 buf.resize(start + size, 0);
@@ -2985,8 +2986,8 @@ pub fn str_pack(fmt: &str, args: &[TValue]) -> Result<Vec<u8>, String> {
                         ));
                     }
                 }
-                // 打包长度
-                packint(&mut buf, len as u64, h.islittle, size, false);
+                // 打包长度 (对应 C 的 (lua_Unsigned)len)
+                packint(&mut buf, len as LuaUnsigned, h.islittle, size, false);
                 buf.extend_from_slice(s);
                 totalsize += len;
             }
@@ -3055,7 +3056,7 @@ pub fn str_unpack<'a>(
     alloc: crate::mem::SlotAlloc,
     fmt: &str,
     data: &[u8],
-    init_pos: i64,
+    init_pos: LuaInteger,
     table: &crate::strings::StringTable,
 ) -> Result<(Vec<TValue<'a>>, usize), String> {
     let fmt_bytes = fmt.as_bytes();
@@ -3093,19 +3094,21 @@ pub fn str_unpack<'a>(
                 let mut f_bytes = [0u8; 4];
                 copy_with_endian(&mut f_bytes, &data[pos..pos + 4], h.islittle);
                 let f = f32::from_le_bytes(f_bytes);
-                results.push(TValue::Float(f as f64));
+                // 对应 C: lua_pushnumber(L, (lua_Number)f)
+                results.push(TValue::Float(LuaNumber::from(f)));
             }
             KOption::Knumber => {
-                let mut f_bytes = [0u8; 8];
-                copy_with_endian(&mut f_bytes, &data[pos..pos + 8], h.islittle);
-                let f = f64::from_le_bytes(f_bytes);
+                let mut f_bytes = [0u8; std::mem::size_of::<LuaNumber>()];
+                copy_with_endian(&mut f_bytes, &data[pos..pos + size], h.islittle);
+                let f = LuaNumber::from_le_bytes(f_bytes);
                 results.push(TValue::Float(f));
             }
             KOption::Kdouble => {
                 let mut f_bytes = [0u8; 8];
                 copy_with_endian(&mut f_bytes, &data[pos..pos + 8], h.islittle);
                 let f = f64::from_le_bytes(f_bytes);
-                results.push(TValue::Float(f));
+                // 对应 C: lua_pushnumber(L, (lua_Number)d) — 有损窄化, 仅此处允许 as LuaNumber
+                results.push(TValue::Float(f as LuaNumber));
             }
             KOption::Kchar => {
                 let s_bytes = &data[pos..pos + size];
@@ -3217,9 +3220,9 @@ fn get_int_arg<'a>(
     state: &LuaState<'a>,
     a: usize,
     idx: usize,
-    default: i64,
+    default: LuaInteger,
     _funcname: &str,
-) -> Result<i64, VmError<'a>> {
+) -> Result<LuaInteger, VmError<'a>> {
     let stack_idx = a + 1 + idx;
     if stack_idx >= state.stack.len() {
         return Ok(default);
@@ -3234,11 +3237,12 @@ fn get_int_arg<'a>(
                 "number has no integer representation",
             )),
         },
-        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => match lua_string_as_str(s).parse::<i64>()
-        {
-            Ok(i) => Ok(i),
-            Err(_) => Ok(default),
-        },
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+            match lua_string_as_str(s).parse::<LuaInteger>() {
+                Ok(i) => Ok(i),
+                Err(_) => Ok(default),
+            }
+        }
         TValue::Nil(_) => Ok(default),
         _ => Err(arg_error(
             state,
@@ -3258,9 +3262,9 @@ fn get_opt_int_arg<'a>(
     a: usize,
     nargs: usize,
     idx: usize,
-    default: i64,
+    default: LuaInteger,
     _funcname: &str,
-) -> Result<i64, VmError<'a>> {
+) -> Result<LuaInteger, VmError<'a>> {
     if idx >= nargs {
         return Ok(default);
     }
@@ -3279,11 +3283,12 @@ fn get_opt_int_arg<'a>(
                 "number has no integer representation",
             )),
         },
-        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => match lua_string_as_str(s).parse::<i64>()
-        {
-            Ok(i) => Ok(i),
-            Err(_) => Ok(default),
-        },
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+            match lua_string_as_str(s).parse::<LuaInteger>() {
+                Ok(i) => Ok(i),
+                Err(_) => Ok(default),
+            }
+        }
         _ => Err(arg_error(
             state,
             idx + 1,
@@ -3521,7 +3526,7 @@ pub fn call_gmatch_iter<'a>(
             Ok(Some(end)) => {
                 // 对应 C: e != gm->lastmatch
                 // 跳过结束位置与上次匹配相同的匹配（处理空匹配的重复）
-                if end as i64 != lastmatch {
+                if end as LuaInteger != lastmatch {
                     // 找到匹配 — 对应 C 的 push_captures 直接写栈
                     let nlevels = if ms.level == 0 { 1 } else { ms.level };
                     for i in 0..nlevels {
@@ -3538,7 +3543,7 @@ pub fn call_gmatch_iter<'a>(
                                 &state.string_table,
                                 &src_bytes[start..start + caplen],
                             ),
-                            CaptureResult::Pos(pos) => TValue::Integer(pos as i64),
+                            CaptureResult::Pos(pos) => TValue::Integer(pos as LuaInteger),
                         };
                         state.stack.push(val);
                         n_results_on_stack += 1;
@@ -3546,8 +3551,8 @@ pub fn call_gmatch_iter<'a>(
                     // 更新 pos 和 lastmatch（对应 C: gm->src = gm->lastmatch = e）
                     {
                         let mut upvals = rc.upvalues.borrow_mut();
-                        upvals[GMATCH_UP_POS] = TValue::Integer(end as i64);
-                        upvals[GMATCH_UP_LAST] = TValue::Integer(end as i64);
+                        upvals[GMATCH_UP_POS] = TValue::Integer(end as LuaInteger);
+                        upvals[GMATCH_UP_LAST] = TValue::Integer(end as LuaInteger);
                     }
 
                     found = true;
@@ -3742,8 +3747,8 @@ fn call_str_find<'a>(
     match found {
         Some((start, end)) => {
             let n_caps = caps.len();
-            state.stack.push(TValue::Integer(start as i64));
-            state.stack.push(TValue::Integer(end as i64));
+            state.stack.push(TValue::Integer(start as LuaInteger));
+            state.stack.push(TValue::Integer(end as LuaInteger));
             for cap in caps {
                 state.stack.push(cap);
             }
@@ -3977,8 +3982,8 @@ fn call_str_gmatch<'a>(
     let upvalues = vec![
         (s_str),
         (p_str),
-        TValue::Integer(init_pos as i64),
-        TValue::Integer(pat_start as i64),
+        TValue::Integer(init_pos as LuaInteger),
+        TValue::Integer(pat_start as LuaInteger),
         TValue::Integer(-1), // lastmatch: 无上次匹配
     ];
     let iter = TValue::RustClosure(MyRc::new_in(
@@ -4033,7 +4038,13 @@ fn call_str_packsize<'a>(
     let fmt = get_str_arg(state, a, 0)?;
     match str_packsize(&fmt) {
         Ok(size) => {
-            push_results(state, a, nresults, vec![TValue::Integer(size as i64)]);
+            // 长度 → LuaInteger 是 C 里同样存在的显式转换 (lua_pushinteger(L, (lua_Integer)size))
+            push_results(
+                state,
+                a,
+                nresults,
+                vec![TValue::Integer(size as LuaInteger)],
+            );
             Ok(())
         }
         Err(msg) => Err(VmError::RuntimeError(msg)),
@@ -4078,7 +4089,7 @@ fn call_str_unpack<'a>(
     ) {
         Ok((mut values, next_pos)) => {
             // 最后一个返回值是下一个位置
-            values.push(TValue::Integer(next_pos as i64));
+            values.push(TValue::Integer(next_pos as LuaInteger));
             push_results(state, a, nresults, values);
             Ok(())
         }
@@ -4225,8 +4236,8 @@ fn set_arith_method<'a>(
     mt_table: &mut Table<'a>,
     tmnames: &[TValue<'a>; TM_N],
     tm: TagMethod,
-    int_op: fn(i64, i64) -> Option<i64>,
-    float_op: fn(f64, f64) -> f64,
+    int_op: fn(LuaInteger, LuaInteger) -> Option<LuaInteger>,
+    float_op: fn(LuaNumber, LuaNumber) -> LuaNumber,
 ) {
     // 元方法值: 使用一个标记值 (这里用 Integer 0 作为占位符)
     // 实际算术运算由 call_fn 回调处理
@@ -4291,7 +4302,7 @@ fn to_num<'a>(v: &TValue<'a>) -> Option<TValue<'a>> {
         TValue::Float(f) => Some(TValue::Float(*f)),
         s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
             let s = lua_string_as_str(s);
-            if let Ok(i) = s.parse::<i64>() {
+            if let Ok(i) = s.parse::<LuaInteger>() {
                 Some(TValue::Integer(i))
             } else if let Some(f) = crate::float_utils::f64_from_str(s) {
                 Some(TValue::Float(f))
@@ -4307,21 +4318,22 @@ fn to_num<'a>(v: &TValue<'a>) -> Option<TValue<'a>> {
 fn arith_op<'a>(
     v1: &TValue<'a>,
     v2: &TValue<'a>,
-    int_op: fn(i64, i64) -> Option<i64>,
-    float_op: fn(f64, f64) -> f64,
+    int_op: fn(LuaInteger, LuaInteger) -> Option<LuaInteger>,
+    float_op: fn(LuaNumber, LuaNumber) -> LuaNumber,
 ) -> Option<TValue<'a>> {
     let n1 = to_num(v1)?;
     let n2 = to_num(v2)?;
     match (&n1, &n2) {
         (TValue::Integer(i1), TValue::Integer(i2)) => int_op(*i1, *i2).map(TValue::Integer),
         _ => {
+            // 整数 → 浮点是 C 里同样存在的转换 (cast_num)
             let f1 = match &n1 {
-                TValue::Integer(i) => *i as f64,
+                TValue::Integer(i) => *i as LuaNumber,
                 TValue::Float(f) => *f,
                 _ => return None,
             };
             let f2 = match &n2 {
-                TValue::Integer(i) => *i as f64,
+                TValue::Integer(i) => *i as LuaNumber,
                 TValue::Float(f) => *f,
                 _ => return None,
             };
@@ -4480,8 +4492,8 @@ mod tests {
     #[test]
     fn test_str_sub_extreme_integers() {
         let s = "123456789";
-        let mini = i64::MIN;
-        let maxi = i64::MAX;
+        let mini = MIN_INTEGER;
+        let maxi = MAX_INTEGER;
         assert_eq!(str_sub(s, mini, -4), "123456");
         assert_eq!(str_sub(s, mini, maxi), "123456789");
         assert_eq!(str_sub(s, mini, mini), "");
@@ -4500,23 +4512,23 @@ mod tests {
     #[test]
     fn test_str_byte_end_zero() {
         // string.byte("ABC", 1, 0) → end=0 < posi=1, 返回空
-        assert_eq!(str_byte("ABC", 1, 0), Vec::<i64>::new());
+        assert_eq!(str_byte("ABC", 1, 0), Vec::<LuaInteger>::new());
         // string.byte("ABC", 0, 0) → posi=1, pose=0, 返回空
-        assert_eq!(str_byte("ABC", 0, 0), Vec::<i64>::new());
+        assert_eq!(str_byte("ABC", 0, 0), Vec::<LuaInteger>::new());
     }
 
     /// str_byte 的边界用例: 超出范围的索引
     #[test]
     fn test_str_byte_out_of_range() {
-        assert_eq!(str_byte("ABC", 10, 20), Vec::<i64>::new());
-        assert_eq!(str_byte("ABC", -10, -20), Vec::<i64>::new());
+        assert_eq!(str_byte("ABC", 10, 20), Vec::<LuaInteger>::new());
+        assert_eq!(str_byte("ABC", -10, -20), Vec::<LuaInteger>::new());
     }
 
     /// str_byte 的边界用例: 空字符串
     #[test]
     fn test_str_byte_empty_string() {
-        assert_eq!(str_byte("", 1, 1), Vec::<i64>::new());
-        assert_eq!(str_byte("", 0, 0), Vec::<i64>::new());
+        assert_eq!(str_byte("", 1, 1), Vec::<LuaInteger>::new());
+        assert_eq!(str_byte("", 0, 0), Vec::<LuaInteger>::new());
     }
 
     /// str_byte 的边界用例: 包含 null 字节
@@ -4626,116 +4638,14 @@ mod tests {
     #[test]
     fn test_str_rep_too_large() {
         // 对应 strings.lua line 114-115: 结果字符串过大时应返回错误
-        assert!(str_rep("aa", i64::MAX, "").is_err());
-        assert!(str_rep("a", i64::MAX, ",").is_err());
+        assert!(str_rep("aa", MAX_INTEGER, "").is_err());
+        assert!(str_rep("a", MAX_INTEGER, ",").is_err());
     }
 
     // ========================================================================
     // 模式匹配测试
     // ========================================================================
 
-    #[test]
-    fn test_str_find_plain() {
-        let alloc = crate::mem::TestAlloc::new();
-        let tb = crate::strings::StringTable::new();
-        let result = str_find(alloc.slot(), "hello world", "world", 1, true, &tb).unwrap();
-        match result {
-            FindResult::Found {
-                start,
-                end,
-                captures,
-            } => {
-                assert_eq!(start, 7);
-                assert_eq!(end, 11);
-                assert!(captures.is_empty());
-            }
-            FindResult::NotFound => panic!("should find 'world'"),
-        }
-    }
-    #[test]
-    fn test_str_find_not_found() {
-        let alloc = crate::mem::TestAlloc::new();
-        let tb = crate::strings::StringTable::new();
-        let result = str_find(alloc.slot(), "hello", "xyz", 1, true, &tb).unwrap();
-        assert!(matches!(result, FindResult::NotFound));
-    }
-    #[test]
-    fn test_str_find_empty_pattern() {
-        let alloc = crate::mem::TestAlloc::new();
-        let tb = crate::strings::StringTable::new();
-        let result = str_find(alloc.slot(), "hello", "", 1, true, &tb).unwrap();
-        match result {
-            FindResult::Found { start, end, .. } => {
-                assert_eq!(start, 1);
-                assert_eq!(end, 0);
-            }
-            FindResult::NotFound => panic!("should find empty pattern"),
-        }
-    }
-    #[test]
-    fn test_str_find_with_init() {
-        let alloc = crate::mem::TestAlloc::new();
-        let tb = crate::strings::StringTable::new();
-        let result = str_find(alloc.slot(), "hello hello", "hello", 2, true, &tb).unwrap();
-        match result {
-            FindResult::Found { start, .. } => assert_eq!(start, 7),
-            FindResult::NotFound => panic!("should find second 'hello'"),
-        }
-    }
-    #[test]
-    fn test_str_find_pattern_dot() {
-        let alloc = crate::mem::TestAlloc::new();
-        let tb = crate::strings::StringTable::new();
-        let result = str_find(alloc.slot(), "hello", "h.llo", 1, false, &tb).unwrap();
-        match result {
-            FindResult::Found { start, end, .. } => {
-                assert_eq!(start, 1);
-                assert_eq!(end, 5);
-            }
-            FindResult::NotFound => panic!("should match h.llo"),
-        }
-    }
-    #[test]
-    fn test_str_find_pattern_digit() {
-        let alloc = crate::mem::TestAlloc::new();
-        let tb = crate::strings::StringTable::new();
-        let result = str_find(alloc.slot(), "abc123def", "%d+", 1, false, &tb).unwrap();
-        match result {
-            FindResult::Found { start, end, .. } => {
-                assert_eq!(start, 4);
-                assert_eq!(end, 6);
-            }
-            FindResult::NotFound => panic!("should match digits"),
-        }
-    }
-    #[test]
-    fn test_str_find_pattern_capture() {
-        let alloc = crate::mem::TestAlloc::new();
-        let tb = crate::strings::StringTable::new();
-        let result = str_find(alloc.slot(), "hello", "(h(e)llo)", 1, false, &tb).unwrap();
-        match result {
-            FindResult::Found {
-                start,
-                end,
-                captures,
-            } => {
-                assert_eq!(start, 1);
-                assert_eq!(end, 5);
-                assert_eq!(captures.len(), 2);
-            }
-            FindResult::NotFound => panic!("should match with captures"),
-        }
-    }
-    #[test]
-    fn test_str_find_anchored() {
-        let alloc = crate::mem::TestAlloc::new();
-        let tb = crate::strings::StringTable::new();
-        let result = str_find(alloc.slot(), "hello", "^hello", 1, false, &tb).unwrap();
-        assert!(matches!(result, FindResult::Found { .. }));
-
-        let result = str_find(alloc.slot(), "xhello", "^hello", 1, false, &tb).unwrap();
-        assert!(matches!(result, FindResult::NotFound));
-    }
     #[test]
     fn test_str_match_basic() {
         let alloc = crate::mem::TestAlloc::new();
@@ -4937,11 +4847,11 @@ mod tests {
     #[test]
     fn test_str_format_q_nan_inf() {
         // %q NaN → "(0/0)", inf → "1e9999", -inf → "-1e9999"
-        let args = vec![TValue::Float(f64::NAN)];
+        let args = vec![TValue::Float(LuaNumber::NAN)];
         assert_eq!(str_format("%q", &args).unwrap(), "(0/0)");
-        let args = vec![TValue::Float(f64::INFINITY)];
+        let args = vec![TValue::Float(LuaNumber::INFINITY)];
         assert_eq!(str_format("%q", &args).unwrap(), "1e9999");
-        let args = vec![TValue::Float(f64::NEG_INFINITY)];
+        let args = vec![TValue::Float(LuaNumber::NEG_INFINITY)];
         assert_eq!(str_format("%q", &args).unwrap(), "-1e9999");
     }
 
@@ -5103,22 +5013,6 @@ mod tests {
         assert_eq!(result, Some(TValue::Integer(30)));
     }
 
-    // ========================================================================
-    // GMatchIterator 测试
-    // ========================================================================
-
-    #[test]
-    fn test_gmatch_iterator_basic() {
-        let alloc = crate::mem::TestAlloc::new();
-        let tb = crate::strings::StringTable::new();
-        let mut iter = GMatchIterator::new("hello world", "%w+");
-        let first = iter.next(alloc.slot(), &tb).unwrap();
-        assert_eq!(first.len(), 1);
-        let second = iter.next(alloc.slot(), &tb).unwrap();
-        assert_eq!(second.len(), 1);
-        let third = iter.next(alloc.slot(), &tb).unwrap();
-        assert_eq!(third.len(), 0); // no more matches
-    }
     // ========================================================================
     // match_class 测试
     // ========================================================================
@@ -5397,6 +5291,7 @@ mod tests {
     // --- Lua Integer (j/J) ---
 
     #[test]
+    #[cfg(not(feature = "num-i32"))]
     fn test_pack_lua_integer() {
         // j = lua_Integer (8 字节有符号)
         let val = 0x0807060504030201i64;
@@ -5416,16 +5311,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "num-i32"))]
     fn test_pack_max_min_integer() {
         // 最大/最小整数
         assert_pack_eq(
             "<j",
-            &[TValue::Integer(i64::MAX)],
+            &[TValue::Integer(MAX_INTEGER)],
             &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F],
         );
         assert_pack_eq(
             "<j",
-            &[TValue::Integer(i64::MIN)],
+            &[TValue::Integer(MIN_INTEGER)],
             &[0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x80],
         );
     }
@@ -5444,6 +5340,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "num-f32"))]
     fn test_pack_double() {
         // d = double (8 字节)
         let d = 3.14f64;
@@ -5455,6 +5352,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "num-f32"))]
     fn test_pack_number() {
         // n = lua_Number (8 字节, double)
         let d = 2.718f64;
@@ -5468,30 +5366,31 @@ mod tests {
         assert_pack_eq("<f", &[TValue::Float(0.0)], &[0u8; 4]);
         assert_pack_eq("<d", &[TValue::Float(0.0)], &[0u8; 8]);
 
-        // 无穷大
+        // 无穷大 (d = double; Lua 值经 (lua_Number) 转换后打包)
         let inf = f64::INFINITY;
         let bytes = inf.to_le_bytes();
-        assert_pack_eq("<d", &[TValue::Float(inf)], &bytes);
+        assert_pack_eq("<d", &[TValue::Float(inf as LuaNumber)], &bytes);
 
         // 负无穷
         let neg_inf = f64::NEG_INFINITY;
         let bytes = neg_inf.to_le_bytes();
-        assert_pack_eq("<d", &[TValue::Float(neg_inf)], &bytes);
+        assert_pack_eq("<d", &[TValue::Float(neg_inf as LuaNumber)], &bytes);
     }
 
     #[test]
     fn test_pack_unpack_float_roundtrip() {
-        for &n in &[
+        let cases: [LuaNumber; 9] = [
             0.0,
             -1.1,
             1.9,
-            f64::INFINITY,
-            f64::NEG_INFINITY,
+            LuaNumber::INFINITY,
+            LuaNumber::NEG_INFINITY,
             1e20,
             -1e20,
             0.1,
             2000.7,
-        ] {
+        ];
+        for &n in &cases {
             let packed = str_pack("<n", &[TValue::Float(n)]).unwrap();
             assert_unpack_eq("<n", &packed, &[TValue::Float(n)]);
         }
@@ -5592,7 +5491,7 @@ mod tests {
     #[test]
     fn test_pack_endian_consistency() {
         // 大端和小端互为反转
-        let val = 0x12345678i64;
+        let val: LuaInteger = 0x12345678;
         let le = str_pack("<i4", &[TValue::Integer(val)]).unwrap();
         let be = str_pack(">i4", &[TValue::Integer(val)]).unwrap();
         assert_eq!(le, be.iter().rev().copied().collect::<Vec<_>>());
@@ -5601,7 +5500,7 @@ mod tests {
     #[test]
     fn test_pack_native_endian() {
         // = 前缀表示原生字节序
-        let val = 1i64;
+        let val: LuaInteger = 1;
         let native = str_pack("=i2", &[TValue::Integer(val)]).unwrap();
         if cfg!(target_endian = "little") {
             assert_eq!(native, vec![1, 0]);
@@ -5650,10 +5549,17 @@ mod tests {
         assert_eq!(str_packsize("<i2").unwrap(), 2);
         assert_eq!(str_packsize("<i4").unwrap(), 4);
         assert_eq!(str_packsize("<i8").unwrap(), 8);
+        // j = lua_Integer, n = lua_Number: 宽度随配置变
+        #[cfg(not(feature = "num-i32"))]
         assert_eq!(str_packsize("<j").unwrap(), 8);
+        #[cfg(feature = "num-i32")]
+        assert_eq!(str_packsize("<j").unwrap(), 4);
         assert_eq!(str_packsize("<f").unwrap(), 4);
         assert_eq!(str_packsize("<d").unwrap(), 8);
+        #[cfg(not(feature = "num-f32"))]
         assert_eq!(str_packsize("<n").unwrap(), 8);
+        #[cfg(feature = "num-f32")]
+        assert_eq!(str_packsize("<n").unwrap(), 4);
     }
 
     #[test]
@@ -5713,6 +5619,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "num-i32"))]
     fn test_unpack_uint_does_not_fit() {
         let alloc = crate::mem::TestAlloc::new();
         // 解包无符号整数时,如果值超出 lua_Integer 范围,应报错
@@ -5791,7 +5698,7 @@ mod tests {
     #[test]
     fn test_pack_unpack_roundtrip() {
         // 整数往返
-        for &val in &[0i64, 1, -1, 127, -128, 32767, -32768, 255, 65535] {
+        for &val in &[0 as LuaInteger, 1, -1, 127, -128, 32767, -32768, 255, 65535] {
             let packed = str_pack("<i4", &[TValue::Integer(val)]).unwrap();
             assert_unpack_eq("<i4", &packed, &[TValue::Integer(val)]);
         }
@@ -5806,7 +5713,7 @@ mod tests {
     #[test]
     fn test_pack_unpack_roundtrip_endian() {
         // 大端往返
-        let val = 0x12345678i64;
+        let val: LuaInteger = 0x12345678;
         for fmt in &["<i4", ">i4", "<j", ">j"] {
             let packed = str_pack(fmt, &[TValue::Integer(val)]).unwrap();
             assert_unpack_eq(fmt, &packed, &[TValue::Integer(val)]);
@@ -5897,6 +5804,7 @@ mod tests {
     // --- tpack.lua 关键测试场景 ---
 
     #[test]
+    #[cfg(not(feature = "num-i32"))]
     fn test_tpack_line99_scenario() {
         let alloc = crate::mem::TestAlloc::new();
         // 模拟 tpack.lua:99 的场景
@@ -5935,7 +5843,7 @@ mod tests {
     #[test]
     fn test_tpack_reverse_endian() {
         // 测试 tpack.lua 中的 s:reverse() 场景
-        let val = 0xAAi64;
+        let val: LuaInteger = 0xAA;
         for i in 1..=8usize {
             let le_fmt = format!("<I{}", i);
             let be_fmt = format!(">I{}", i);
@@ -6172,8 +6080,9 @@ mod tests {
 
     #[test]
     fn test_format_hex_uppercase() {
+        // 0xFFFFFFFF 超出 i32 时按两补数包裹 (与 C 的 (lua_Unsigned) 语义一致)
         assert_eq!(
-            str_format("%08X", &[TValue::Integer(0xFFFFFFFF)]).unwrap(),
+            str_format("%08X", &[TValue::Integer(0xFFFF_FFFFu32 as LuaInteger)]).unwrap(),
             "FFFFFFFF"
         );
     }
@@ -6182,6 +6091,56 @@ mod tests {
     fn test_format_hex_float() {
         // 0.0 应该输出 "0"
         assert_eq!(str_format("%x", &[TValue::Float(0.0)]).unwrap(), "0");
+    }
+
+    /// `%a`/`%A` 必须与 C 的 num2straux/lua_number2strx 逐字节一致
+    /// (f64 参考值取自本仓库 C 实现实测输出)
+    #[test]
+    #[cfg(not(feature = "num-f32"))]
+    fn test_format_hexa_matches_c_f64() {
+        let f = |x: f64| str_format("%a", &[TValue::Float(x)]).unwrap();
+        assert_eq!(f(1.0), "0x1p+0");
+        assert_eq!(f(2.0), "0x1p+1");
+        assert_eq!(f(0.1), "0x1.999999999999ap-4");
+        assert_eq!(f(-4.5), "-0x1.2p+2");
+        assert_eq!(f(1.0 / 3.0), "0x1.5555555555555p-2");
+        assert_eq!(f(f64::MIN_POSITIVE), "0x1p-1022");
+        assert_eq!(f(f64::from_bits(1)), "0x1p-1074"); // 最小子规格化数
+        assert_eq!(f(f64::MAX), "0x1.fffffffffffffp+1023");
+        // 零/无穷/NaN
+        assert_eq!(f(0.0), "0x0p+0");
+        assert_eq!(f(-0.0), "-0x0p+0");
+        assert_eq!(f(f64::INFINITY), "inf");
+        assert_eq!(f(f64::NEG_INFINITY), "-inf");
+        assert_eq!(f(f64::NAN), "nan");
+        // %A: 对整体做 toupper (0x→0X, hex→大写, p→P)
+        let fa = |x: f64| str_format("%A", &[TValue::Float(x)]).unwrap();
+        assert_eq!(fa(1.0), "0X1P+0");
+        assert_eq!(fa(0.1), "0X1.999999999999AP-4");
+        assert_eq!(fa(0.0), "0X0P+0");
+        assert_eq!(fa(-0.0), "-0X0P+0");
+        assert_eq!(fa(f64::INFINITY), "INF");
+        assert_eq!(fa(f64::NEG_INFINITY), "-INF");
+        assert_eq!(fa(f64::NAN), "NAN");
+    }
+
+    /// f32 配置下 `%a` 的首位数字占 4 位 (C 的 L_NBFD = 4), 参考值取自 C 的 LUA_32BITS 构建
+    #[test]
+    #[cfg(feature = "num-f32")]
+    fn test_format_hexa_matches_c_f32() {
+        let f = |x: LuaNumber| str_format("%a", &[TValue::Float(x)]).unwrap();
+        assert_eq!(f(1.0), "0x8p-3");
+        assert_eq!(f(2.0), "0x8p-2");
+        assert_eq!(f(0.1), "0xc.ccccdp-7");
+        assert_eq!(f(-1.0), "-0x8p-3");
+        assert_eq!(f(0.0), "0x0p+0");
+        assert_eq!(f(-0.0), "-0x0p+0");
+        assert_eq!(f(LuaNumber::INFINITY), "inf");
+        assert_eq!(f(LuaNumber::NEG_INFINITY), "-inf");
+        let fa = |x: LuaNumber| str_format("%A", &[TValue::Float(x)]).unwrap();
+        assert_eq!(fa(1.0), "0X8P-3");
+        assert_eq!(fa(0.1), "0XC.CCCCDP-7");
+        assert_eq!(fa(LuaNumber::NEG_INFINITY), "-INF");
     }
 
     #[test]

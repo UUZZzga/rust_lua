@@ -14,6 +14,7 @@
 
 use const_format::formatcp;
 
+use crate::config::{LuaInteger, LuaNumber, LuaUnsigned};
 use crate::execute::VmError;
 use crate::gc::GCObjectHeader;
 use crate::objects::{LClosure, NilKind, Proto, TValue, UpVal, UpValVec};
@@ -64,7 +65,7 @@ pub fn lua_value_to_string<'a>(v: &TValue<'a>) -> String {
 }
 
 /// 格式化浮点数 (对应 C 的 tostringbuffFloat)
-fn format_float(f: f64) -> String {
+fn format_float(f: LuaNumber) -> String {
     crate::float_utils::f64_to_string(f)
 }
 
@@ -78,7 +79,7 @@ const SPACECHARS: &[u8] = b" \x0c\n\r\t\x0b";
 ///
 /// 返回 Some(整数) 表示转换成功, None 表示失败。
 /// 允许前导/尾随空格, 可选正负号。
-pub fn b_str2int(s: &str, base: u32) -> Option<i64> {
+pub fn b_str2int(s: &str, base: u32) -> Option<LuaInteger> {
     let bytes = s.as_bytes();
     let mut pos = 0;
 
@@ -103,7 +104,8 @@ pub fn b_str2int(s: &str, base: u32) -> Option<i64> {
         return None;
     }
 
-    let mut n: u64 = 0;
+    // 累加器用 LuaUnsigned（对应 C 的 lua_Unsigned n）
+    let mut n: LuaUnsigned = 0;
     while pos < bytes.len() && bytes[pos].is_ascii_alphanumeric() {
         let c = bytes[pos];
         let digit = if c.is_ascii_digit() {
@@ -114,7 +116,9 @@ pub fn b_str2int(s: &str, base: u32) -> Option<i64> {
         if digit >= base {
             return None;
         }
-        n = n.checked_mul(base as u64)?.checked_add(digit as u64)?;
+        n = n
+            .checked_mul(base as LuaUnsigned)?
+            .checked_add(digit as LuaUnsigned)?;
         pos += 1;
     }
 
@@ -128,7 +132,9 @@ pub fn b_str2int(s: &str, base: u32) -> Option<i64> {
         return None;
     }
 
-    Some(if neg { -(n as i64) } else { n as i64 })
+    // 对应 C 的 `(lua_Integer)((neg) ? (0u - n) : n)`：无符号取负再转为有符号
+    let signed = if neg { n.wrapping_neg() } else { n };
+    Some(signed as LuaInteger)
 }
 
 // ============================================================================
@@ -158,7 +164,7 @@ pub fn base_type_name<'a>(v: &TValue<'a>) -> &'static str {
 ///
 /// 无 base 参数时: 标准转换 (数字直接返回, 字符串解析为整数或浮点)
 /// 有 base 参数时: 按进制解析字符串为整数
-pub fn base_tonumber<'a>(v: &TValue<'a>, base: Option<i64>) -> Option<TValue<'a>> {
+pub fn base_tonumber<'a>(v: &TValue<'a>, base: Option<LuaInteger>) -> Option<TValue<'a>> {
     match base {
         None => {
             // 标准转换
@@ -177,17 +183,13 @@ pub fn base_tonumber<'a>(v: &TValue<'a>, base: Option<i64>) -> Option<TValue<'a>
             }
             match v {
                 s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
+                    // base 已在 2..=36 校验（对应 C 的 cast_uint(base)）
                     b_str2int(lua_string_as_str(s), b as u32).map(TValue::Integer)
                 }
                 _ => None,
             }
         }
     }
-}
-
-/// tostring(v) — 转换为字符串 (对应 C 的 luaB_tostring)
-pub fn base_tostring<'a>(v: &TValue<'a>) -> String {
-    lua_value_to_string(v)
 }
 
 /// rawequal(v1, v2) — 原始相等比较 (对应 C 的 luaB_rawequal)
@@ -198,7 +200,8 @@ pub fn base_rawequal<'a>(v1: &TValue<'a>, v2: &TValue<'a>) -> bool {
         (TValue::Integer(a), TValue::Integer(b)) => a == b,
         (TValue::Float(a), TValue::Float(b)) => a == b,
         (TValue::Integer(a), TValue::Float(b)) | (TValue::Float(b), TValue::Integer(a)) => {
-            (*a as f64) == *b
+            // 对应 C 的 luai_numeq((lua_Number)i, f)
+            (*a as LuaNumber) == *b
         }
         (
             a @ (TValue::LongStr(_) | TValue::ShortStr(_)),
@@ -212,38 +215,14 @@ pub fn base_rawequal<'a>(v1: &TValue<'a>, v2: &TValue<'a>) -> bool {
 }
 
 /// rawlen(v) — 原始长度 (对应 C 的 luaB_rawlen)
-pub fn base_rawlen<'a>(v: &TValue<'a>) -> Result<i64, String> {
+pub fn base_rawlen<'a>(v: &TValue<'a>) -> Result<LuaInteger, String> {
     match v {
         TValue::Table(t) => Ok(t.len()),
-        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => Ok(lua_string_len(s) as i64),
+        s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => Ok(lua_string_len(s) as LuaInteger),
         _ => Err(format!(
             "table or string expected, got {}",
             base_type_name(v)
         )),
-    }
-}
-
-/// select(n, ...) — 选择参数 (对应 C 的 luaB_select)
-///
-/// n == "#": 返回参数总数
-/// n > 0: 返回第 n 个及之后的参数
-/// n < 0: 从末尾计数
-pub fn base_select<'a>(n: i64, args: &[TValue<'a>]) -> Result<Vec<TValue<'a>>, String> {
-    if n < 0 {
-        let idx = (args.len() as i64 + n) as i64;
-        if idx < 0 {
-            return Err("bad argument #1 to 'select' (index out of range)".to_string());
-        }
-        Ok(args[idx as usize..].to_vec())
-    } else if n == 0 {
-        Err("bad argument #1 to 'select' (index out of range)".to_string())
-    } else {
-        let idx = (n - 1) as usize;
-        if idx >= args.len() {
-            Ok(vec![])
-        } else {
-            Ok(args[idx..].to_vec())
-        }
     }
 }
 
@@ -511,7 +490,6 @@ pub(crate) fn call_pcall<'a>(
             saved_filled: false,
             is_metamethod: false,
             metamethod_res: 0,
-            saved_call_stack_len: state.call_stack.len(),
             is_close_continuation: false,
             is_pairs_continuation: false,
             saved_call_stack: Vec::new(),
@@ -788,7 +766,8 @@ fn call_tonumber<'a>(
         // 按进制转换
         let base = match &base_arg {
             TValue::Integer(b) => Some(*b),
-            TValue::Float(f) => Some(*f as i64),
+            // 保持既有语义（对应 C 的 luaL_checkinteger 取值）
+            TValue::Float(f) => Some(*f as LuaInteger),
             _ => None,
         };
         match base {
@@ -997,7 +976,7 @@ fn call_select<'a>(
     // 特殊情况: "#"
     if let s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = &first {
         if lua_string_as_str(s) == "#" {
-            let count = nargs.saturating_sub(1) as i64;
+            let count = nargs.saturating_sub(1) as LuaInteger;
             push_single_result(state, a, nresults, TValue::Integer(count));
             return Ok(());
         }
@@ -1006,7 +985,8 @@ fn call_select<'a>(
     // 数字索引
     let n = match &first {
         TValue::Integer(n) => *n,
-        TValue::Float(f) => *f as i64,
+        // 保持既有语义（对应 C 的 luaL_checkinteger 取值）
+        TValue::Float(f) => *f as LuaInteger,
         _ => {
             return Err(VmError::RuntimeError(
                 "bad argument #1 to 'select' (number expected)".to_string(),
@@ -1016,7 +996,7 @@ fn call_select<'a>(
 
     let nargs_after = nargs.saturating_sub(1); // 排除 first 参数后的实际参数数
     let src_idx: usize = if n < 0 {
-        let idx = nargs_after as i64 + n;
+        let idx = nargs_after as LuaInteger + n;
         if idx < 0 {
             return Err(VmError::RuntimeError(
                 "bad argument #1 to 'select' (index out of range)".to_string(),
@@ -1257,7 +1237,6 @@ fn call_pairs<'a>(
                 saved_filled: false,
                 is_metamethod: false,
                 metamethod_res: 0,
-                saved_call_stack_len: 0,
                 is_close_continuation: false,
                 is_pairs_continuation: true,
                 saved_call_stack: Vec::new(),
@@ -1363,7 +1342,6 @@ pub(crate) fn call_xpcall<'a>(
             saved_filled: false,
             is_metamethod: false,
             metamethod_res: 0,
-            saved_call_stack_len: state.call_stack.len(),
             is_close_continuation: false,
             is_pairs_continuation: false,
             saved_call_stack: Vec::new(),
@@ -3036,7 +3014,10 @@ pub fn table_next<'a>(
                 if next_idx < data.array.len() {
                     let next_val = &data.array[next_idx];
                     if !matches!(next_val, TValue::Nil(NilKind::Empty)) {
-                        return Ok((Some(TValue::Integer(next_idx as i64 + 1)), next_val.clone()));
+                        return Ok((
+                            Some(TValue::Integer(next_idx as LuaInteger + 1)),
+                            next_val.clone(),
+                        ));
                     }
                 }
                 // 数组部分结束, 转到哈希部分
@@ -3056,7 +3037,7 @@ fn find_first<'a>(table: &crate::table::Table<'a>) -> (Option<TValue<'a>>, TValu
     let data = table.data.borrow();
     for (i, v) in data.array.iter().enumerate() {
         if !matches!(v, TValue::Nil(NilKind::Empty)) {
-            return (Some(TValue::Integer(i as i64 + 1)), v.clone());
+            return (Some(TValue::Integer(i as LuaInteger + 1)), v.clone());
         }
     }
     drop(data); // 释放 borrow
@@ -3112,7 +3093,8 @@ pub fn call_ipairs_aux<'a>(
     let i = get_arg(state, a, 1);
     let i = match &i {
         TValue::Integer(n) => *n,
-        TValue::Float(f) => *f as i64,
+        // 保持既有语义（对应 C 的 luaL_checkinteger 取值）
+        TValue::Float(f) => *f as LuaInteger,
         _ => {
             return Err(VmError::RuntimeError(
                 "bad argument #2 to 'ipairs' iterator (number expected)".to_string(),
@@ -3121,7 +3103,7 @@ pub fn call_ipairs_aux<'a>(
     };
     // 对应 C 的 luaL_intop(+, i, 1): unsigned 算术 wrap-around
     // 在 i == math.maxinteger 时，next_i 会环绕到 math.mininteger
-    let next_i = (i as u64).wrapping_add(1) as i64;
+    let next_i = (i as LuaUnsigned).wrapping_add(1) as LuaInteger;
 
     // 对应 C 的 lua_geti → luaV_finishget: 支持 __index 元方法 (包括非 table 类型的元表)
     // ipairs 可用于非 table 值 (如带 __index 元方法的 userdata), 所以不限定 Table 类型
@@ -3212,7 +3194,7 @@ fn call_collectgarbage<'a>(
         }
         "count" => {
             // 返回内存使用量 (KB) — 基于 GC 估算（含无 gc_header 对象的 extra_estimate）
-            TValue::Float(unsafe { state.gc_mut().total_estimate() } as f64 / 1024.0)
+            TValue::Float(unsafe { state.gc_mut().total_estimate() } as LuaNumber / 1024.0)
         }
         "countb" => {
             // 返回内存使用量的小数部分 (字节) — 简化为 0
@@ -3221,8 +3203,8 @@ fn call_collectgarbage<'a>(
         "step" => {
             let siz: usize = if nargs >= 2 {
                 match get_arg(state, a, 1) {
-                    TValue::Integer(i) => (i as i64).max(0) as usize,
-                    TValue::Float(f) => (f as i64).max(0) as usize,
+                    TValue::Integer(i) => i.max(0) as usize,
+                    TValue::Float(f) => (f as LuaInteger).max(0) as usize,
                     _ => 0,
                 }
             } else {
@@ -3287,10 +3269,10 @@ fn call_collectgarbage<'a>(
                     }
                 };
                 let old = unsafe { state.gc_mut().swap_gc_param(pidx, val) };
-                TValue::Integer(old as i64)
+                TValue::Integer(old as LuaInteger)
             } else {
                 let cur = unsafe { state.gc_mut().get_gc_param(pidx) };
-                TValue::Integer(cur as i64)
+                TValue::Integer(cur as LuaInteger)
             }
         }
         _ => {
@@ -3570,28 +3552,6 @@ mod tests {
     }
 
     // ========================================================================
-    // base_tostring 测试
-    // ========================================================================
-
-    #[test]
-    fn test_base_tostring() {
-        assert_eq!(base_tostring(&TValue::Nil(NilKind::Strict)), "nil");
-        assert_eq!(base_tostring(&TValue::Boolean(true)), "true");
-        assert_eq!(base_tostring(&TValue::Boolean(false)), "false");
-        assert_eq!(base_tostring(&TValue::Integer(42)), "42");
-        assert_eq!(base_tostring(&make_str("hello")), "hello");
-    }
-
-    #[test]
-    fn test_base_tostring_float() {
-        assert_eq!(base_tostring(&TValue::Float(3.14)), "3.14");
-        assert_eq!(base_tostring(&TValue::Float(3.0)), "3.0");
-        assert_eq!(base_tostring(&TValue::Float(f64::NAN)), "nan");
-        assert_eq!(base_tostring(&TValue::Float(f64::INFINITY)), "inf");
-        assert_eq!(base_tostring(&TValue::Float(f64::NEG_INFINITY)), "-inf");
-    }
-
-    // ========================================================================
     // base_rawequal 测试
     // ========================================================================
 
@@ -3639,40 +3599,6 @@ mod tests {
     fn test_base_rawlen_invalid() {
         assert!(base_rawlen(&TValue::Integer(42)).is_err());
         assert!(base_rawlen(&TValue::Boolean(true)).is_err());
-    }
-
-    // ========================================================================
-    // base_select 测试
-    // ========================================================================
-
-    #[test]
-    fn test_base_select_positive() {
-        let args = vec![TValue::Integer(1), TValue::Integer(2), TValue::Integer(3)];
-        let result = base_select(2, &args).unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(result[0], TValue::Integer(2));
-        assert_eq!(result[1], TValue::Integer(3));
-    }
-
-    #[test]
-    fn test_base_select_negative() {
-        let args = vec![TValue::Integer(1), TValue::Integer(2), TValue::Integer(3)];
-        let result = base_select(-1, &args).unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0], TValue::Integer(3));
-    }
-
-    #[test]
-    fn test_base_select_out_of_range() {
-        let args = vec![TValue::Integer(1)];
-        let result = base_select(5, &args).unwrap();
-        assert_eq!(result.len(), 0);
-    }
-
-    #[test]
-    fn test_base_select_zero_error() {
-        let args = vec![TValue::Integer(1)];
-        assert!(base_select(0, &args).is_err());
     }
 
     // ========================================================================
@@ -3725,7 +3651,7 @@ mod tests {
     fn test_lua_value_to_string_float() {
         assert_eq!(lua_value_to_string(&TValue::Float(3.14)), "3.14");
         assert_eq!(lua_value_to_string(&TValue::Float(3.0)), "3.0");
-        assert_eq!(lua_value_to_string(&TValue::Float(f64::NAN)), "nan");
+        assert_eq!(lua_value_to_string(&TValue::Float(LuaNumber::NAN)), "nan");
     }
 
     // ========================================================================
@@ -3738,9 +3664,9 @@ mod tests {
         assert_eq!(format_float(3.0), "3.0");
         assert_eq!(format_float(-3.0), "-3.0");
         assert_eq!(format_float(0.0), "0.0");
-        assert_eq!(format_float(f64::NAN), "nan");
-        assert_eq!(format_float(f64::INFINITY), "inf");
-        assert_eq!(format_float(f64::NEG_INFINITY), "-inf");
+        assert_eq!(format_float(LuaNumber::NAN), "nan");
+        assert_eq!(format_float(LuaNumber::INFINITY), "inf");
+        assert_eq!(format_float(LuaNumber::NEG_INFINITY), "-inf");
     }
 
     // ========================================================================
@@ -4185,11 +4111,17 @@ mod tests {
         #[cfg(not(miri))]
         let exp = 22;
         t.set(
-            new_long_str_from_string(alloc.slot(), str_rep("a", 2_i64.pow(exp), "").unwrap()),
+            new_long_str_from_string(
+                alloc.slot(),
+                str_rep("a", (2 as LuaInteger).pow(exp), "").unwrap(),
+            ),
             TValue::Integer(25),
         );
         t.set(
-            new_long_str_from_string(alloc.slot(), str_rep("b", 2_i64.pow(exp), "").unwrap()),
+            new_long_str_from_string(
+                alloc.slot(),
+                str_rep("b", (2 as LuaInteger).pow(exp), "").unwrap(),
+            ),
             TValue::Table(Table::new_in(alloc.slot())),
         );
         t.set(
@@ -4198,11 +4130,11 @@ mod tests {
         );
         let (key, val) = table_next(&t, &TValue::Nil(NilKind::Strict)).unwrap();
         assert!(matches!(key.clone(), Some(s @ TValue::LongStr(_))
-            if s == new_long_str_from_string(alloc.slot(), str_rep("a", 2_i64.pow(exp), "").unwrap())));
+            if s == new_long_str_from_string(alloc.slot(), str_rep("a", (2 as LuaInteger).pow(exp), "").unwrap())));
         assert_eq!(val, TValue::Integer(25));
         let (key, val) = table_next(&t, &key.unwrap()).unwrap();
         assert!(matches!(key.clone(), Some(s @ TValue::LongStr(_))
-            if s == new_long_str_from_string(alloc.slot(), str_rep("b", 2_i64.pow(exp), "").unwrap())));
+            if s == new_long_str_from_string(alloc.slot(), str_rep("b", (2 as LuaInteger).pow(exp), "").unwrap())));
         assert!(matches!(val.clone(), TValue::Table(_)));
         let (key, val) = table_next(&t, &key.unwrap()).unwrap();
         assert!(matches!(key.clone(), Some(TValue::Table(_))));
