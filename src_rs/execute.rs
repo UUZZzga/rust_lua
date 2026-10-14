@@ -2049,9 +2049,13 @@ impl VmExecutor {
         Self::fast_resize_stack_nil(state, idx + 1);
     }
 
-    /// 写入栈槽 — VM 字节码路径专用 (idx 保证在范围内, op_call 已 resize 到 fsize)
-    /// perf: unsafe get_unchecked 跳过边界检查, 减少 execute_loop 主循环开销
-    /// (算术基准 read_stack+write_stack 边界检查占 execute_loop ~15%)
+    /// 写入栈槽 — VM 字节码路径专用
+    ///
+    /// perf: 末尾追加 (idx == stack.len(), 热路径主导形态) 走 `Vec::push` 的内联
+    /// 快路径 (容量检查 + ptr::write + len 自增), 不再调用 `#[cold]` 的
+    /// `write_stack_grow` (函数调用 + `fast_resize_stack_nil` 的逐槽 Nil 填充,
+    /// 而该槽随即被覆盖 —— 纯浪费)。调用基准实测每个迭代约 6 次该形态的写。
+    /// 跨槽扩展 (idx 越过末尾, 需要填中间空洞) 仍走 cold 路径。
     ///
     /// perf: 跳过 trivially-droppable 旧值的 drop_glue (drop_glue TValue 占 8.28%)
     /// `*ptr = val` 会为旧值生成 drop_glue: match 判别式 → 对 Rc 变体 decq 引用计数。
@@ -2061,8 +2065,6 @@ impl VmExecutor {
     /// 节省的 drop_glue match 开销 ~3-5 cycles/次。
     #[cfg_attr(not(size_optimized), inline(always))]
     fn write_stack<'a>(state: &mut LuaState<'a>, idx: usize, val: TValue<'a>) {
-        // 热路径: idx 在范围内 (VM 保证, 编译器生成的寄存器索引总是有效)
-        // 用 unsafe 索引跳过边界检查
         let top = state.top;
         if idx < state.stack.len() {
             #[cfg(feature = "fast_unsafe")]
@@ -2093,7 +2095,11 @@ impl VmExecutor {
             {
                 state.stack[idx] = val;
             }
+        } else if idx == state.stack.len() {
+            // 末尾追加: 槽位在 live 区之外, 无旧值需 drop, 直接 push
+            state.stack.push(val);
         } else {
+            // 跨槽扩展 (idx 越过末尾, 中间需填 Nil): 稀有路径
             Self::write_stack_grow(state, idx);
             state.stack[idx] = val;
         }
