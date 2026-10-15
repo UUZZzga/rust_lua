@@ -2045,12 +2045,6 @@ impl VmExecutor {
         state.base + opcodes::getarg_c(inst) as usize
     }
 
-    #[cold]
-    #[inline(never)]
-    fn write_stack_grow<'a>(state: &mut LuaState, idx: usize) {
-        Self::fast_resize_stack_nil(state, idx + 1);
-    }
-
     /// 旧槽值是否持有引用计数 (持有则必须先释放再覆盖写)。
     ///
     /// 依赖 `objects::TValue` 的**变体顺序不变式**: 8 个持有引用的变体连续位于 tag
@@ -2085,6 +2079,45 @@ impl VmExecutor {
         let _ = std::ptr::replace(slot, TValue::Nil(NilKind::Strict));
     }
 
+    /// `probe_wstack` 探针: 写目标必须落在「已初始化」范围内
+    /// (上界 = `max(len, scratch_end)`, 见 [`Self::write_stack`] 的不变量说明)。
+    /// 越界写意味着某个补齐点漏了 —— release 下会静默踩未初始化内存, 故诊断构建必须拦下。
+    #[cfg(feature = "probe_wstack")]
+    fn probe_write_slot(state: &LuaState, idx: usize) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static OOB: AtomicUsize = AtomicUsize::new(0);
+        let limit = if state.stack.len() > state.scratch_end {
+            state.stack.len()
+        } else {
+            state.scratch_end
+        };
+        if idx >= state.stack.capacity() {
+            static OV: AtomicUsize = AtomicUsize::new(0);
+            let n = OV.fetch_add(1, Ordering::Relaxed);
+            if n < 10 {
+                eprintln!(
+                    "[WSCAP #{n}] idx={idx} 超出 capacity={} len={} base={}",
+                    state.stack.capacity(),
+                    state.stack.len(),
+                    state.base
+                );
+            }
+        }
+        if idx >= limit {
+            let n = OOB.fetch_add(1, Ordering::Relaxed);
+            if n < 10 {
+                eprintln!(
+                    "[WSOOB #{n}] idx={idx} len={} scratch_end={} base={} top={} pc={}",
+                    state.stack.len(),
+                    state.scratch_end,
+                    state.base,
+                    state.top,
+                    state.pc
+                );
+            }
+        }
+    }
+
     /// 写入栈槽 — VM 字节码路径专用
     ///
     /// **无边界判定、无按需增长**: 对应 C 的 `setobj2s(L, ra, v)` —— 直接写 `ci->top`
@@ -2116,42 +2149,7 @@ impl VmExecutor {
         // 只有持有引用的变体需要释放 —— 见 `old_slot_holds_ref` (单次比较, 见其文档)。
         // [0, len) 由 Vec 管理, [len, scratch_end) 由 pad_frame_scratch 填 Nil。
         #[cfg(feature = "probe_wstack")]
-        {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static OOB: AtomicUsize = AtomicUsize::new(0);
-            // 探针构建: 不变量「写目标恒已初始化」的写目标上界 = max(len, scratch_end)。
-            // 任何越界写都说明某个维护点漏了 (且 release 下会踩到未初始化内存)。
-            let limit = if state.stack.len() > state.scratch_end {
-                state.stack.len()
-            } else {
-                state.scratch_end
-            };
-            if idx >= state.stack.capacity() {
-                static OV: AtomicUsize = AtomicUsize::new(0);
-                let n = OV.fetch_add(1, Ordering::Relaxed);
-                if n < 10 {
-                    eprintln!(
-                        "[WSCAP #{n}] idx={idx} 超出 capacity={} len={} base={}",
-                        state.stack.capacity(),
-                        state.stack.len(),
-                        state.base
-                    );
-                }
-            }
-            if idx >= limit {
-                let n = OOB.fetch_add(1, Ordering::Relaxed);
-                if n < 10 {
-                    eprintln!(
-                        "[WSOOB #{n}] idx={idx} len={} scratch_end={} base={} top={} pc={}",
-                        state.stack.len(),
-                        state.scratch_end,
-                        state.base,
-                        state.top,
-                        state.pc
-                    );
-                }
-            }
-        }
+        Self::probe_write_slot(state, idx);
         // 无分支写: 不变量保证 idx < max(len, scratch_end), 槽位已初始化。
         // len 与 top 一律用 max 更新 (编译为 cmov, 无分支); 唯一分支是「旧值是否
         // 持有引用计数」(跳过着会泄漏, 必须释放) —— 见 `old_slot_holds_ref`:
@@ -2178,13 +2176,71 @@ impl VmExecutor {
         {
             // 安全等价实现: 不变量破例时按需补齐后写 (无性能要求)。
             if idx >= state.scratch_end {
-                Self::write_stack_grow(state, idx);
+                Self::fast_resize_stack_nil(state, idx + 1);
             } else if idx >= state.stack.len() {
                 unsafe { state.stack.set_len(idx + 1) };
             }
             state.stack[idx] = val;
         }
         state.top = top.max(idx + 1);
+    }
+
+    /// 槽间拷贝 (MOVE) — 对应 C 的 `setobjs2s(L, ra, RB(i))`, 热路径无分支。
+    ///
+    /// C 的 `TValue` 不持有所有权, 覆盖写天然没有引用计数操作, 故 `OP_MOVE` 在 C 侧就是
+    /// 一次 16B 结构体赋值、零分支。Rust 侧必须补两件事 —— 新值 inc、旧槽 release ——
+    /// 这里把两个判定都化为**单条 tag 比较**并整段出线到冷路径, 使热路径与 C 同形
+    /// (零 call、零 taken branch)。`cargo rustc --profile perf` 实测 `execute_loop` 内联处:
+    /// ```text
+    /// movzbl (src),%eax; cmpl $6,%eax; ja cold   ; 源持有引用? (tag > 6)
+    /// cmpb  $6,(dst);    ja cold                 ; 旧槽持有引用?
+    /// movupd (src),%xmm0; movupd %xmm0,(dst)     ; 16B 覆盖写 = C 的 setobjs2s
+    /// cmpq/cmovaq ...                            ; len/top = max(len, idx+1) (无分支)
+    /// ```
+    /// 判定依据 = `objects::TValue` 的变体顺序不变式: 「持有引用」恰是 tag >= 7 的连续尾段,
+    /// 于是单个 `tag <= 6` 比较就覆盖**全部 7 个不持引用的变体** (Nil/Boolean/LightUserData/
+    /// Integer/Float/LCFn/BuiltinFn), 见 [`Self::old_slot_holds_ref`] 的反面。旧实现逐值
+    /// `match src` 只列了 Nil|Boolean|Integer|Float —— 「不持引用」集合在该处非连续, 实测编译成
+    /// `cmpl $4; ja cold` + `cmpl $2; je cold` 两条比较, 且 LightUserData/LCFn/BuiltinFn 会落到
+    /// `else` 走 `TValue::clone` 调用; 再加上 `write_stack` 里的旧值判定, 热路径共 3 条比较,
+    /// 16B 值还经一次栈临时 (movaps 溢出 + 重载)。现在两次比较都是「不命中即落空」的
+    /// 前向跳转, 直接 movupd 存取。
+    ///
+    /// 合并两个槽的判定是安全的: 快路径要求**源与旧槽都不持引用** (任一持引用 → 冷路径),
+    /// 因此既不需要 inc 新值, 也没有旧值可 release。
+    ///
+    /// 冷路径 (源或旧槽持有引用): `clone` (正确的 inc) + `write_stack` (旧值释放的单次比较
+    /// 在彼处完成)。安全构建 (`--no-default-features`) 直接走该路径, 语义逐位一致。
+    #[cfg_attr(not(size_optimized), inline(always))]
+    pub(crate) fn copy_stack_slot<'a>(state: &mut LuaState<'a>, dst_idx: usize, src_idx: usize) {
+        #[cfg(feature = "fast_unsafe")]
+        unsafe {
+            // 只从一次 `as_mut_ptr` 派生两个指针: 分别用 as_ptr + as_mut_ptr 时, 后创建的
+            // `&mut` 会让先创建的只读裸指针失效 (Stacked/Tree Borrows)。写入在 set_len 之前,
+            // 之后两指针均不再使用。
+            let base: *mut TValue<'a> = state.stack.as_mut_ptr();
+            let src: *const TValue<'a> = base.add(src_idx);
+            let dst: *mut TValue<'a> = base.add(dst_idx);
+            if !(Self::old_slot_holds_ref(&*src) | Self::old_slot_holds_ref(&*dst)) {
+                #[cfg(feature = "probe_wstack")]
+                Self::probe_write_slot(state, dst_idx);
+                debug_assert!(
+                    dst_idx < state.stack.len() || dst_idx < state.scratch_end,
+                    "copy_stack_slot 越界: dst={} len={} scratch_end={} base={}",
+                    dst_idx,
+                    state.stack.len(),
+                    state.scratch_end,
+                    state.base
+                );
+                std::ptr::write(dst, std::ptr::read(src));
+                state.stack.set_len(state.stack.len().max(dst_idx + 1));
+                state.top = state.top.max(dst_idx + 1);
+                return;
+            }
+        }
+        // 冷路径 / 安全等价实现: 源持有引用 (或旧槽持有引用) → 常规 clone + write_stack。
+        let val = Self::read_stack(state, src_idx).clone();
+        Self::write_stack(state, dst_idx, val);
     }
 
     /// 读取栈槽 — VM 字节码路径专用 (idx 保证在范围内)
@@ -3116,28 +3172,9 @@ impl VmExecutor {
     fn op_move<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
-        // perf: 免 TValue::clone 函数调用 — 源槽 trivial (number/bool/nil) 时
-        // 16B 原样拷贝 (discriminant + payload), 与 C 的 setobj 宏等价;
-        // 含 Rc 变体才走 clone (inc 计数)。
-        // 汇编证据: 原实现每次 MOVE 都 call <TValue as Clone>::clone,
-        // 在栈上临时构造再 movdqu 写回, 两趟内存 + call 开销。
-        {
-            let src = Self::read_stack(state, b);
-            match src {
-                TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_) => {
-                    // trivially-droppable: 无 Rc 字段, 16B 位模式拷贝即语义 clone
-                    #[cfg(feature = "fast_unsafe")]
-                    let copy = unsafe { std::ptr::read(src) };
-                    #[cfg(not(feature = "fast_unsafe"))]
-                    let copy = src.clone();
-                    Self::write_stack(state, a, copy);
-                }
-                _ => {
-                    let val = src.clone();
-                    Self::write_stack(state, a, val);
-                }
-            }
-        }
+        // 对应 C 的 `setobjs2s(L, ra, RB(i))`: 无条件 16B 覆盖写, 引用计数修正
+        // (新值 inc / 旧值 release) 合并为单次判定并出线到冷路径 —— 见 copy_stack_slot。
+        Self::copy_stack_slot(state, a, b);
         Ok(())
     }
 
