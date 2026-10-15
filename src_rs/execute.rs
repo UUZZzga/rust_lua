@@ -3275,37 +3275,26 @@ impl VmExecutor {
                             state.gc_mut().cond_gc();
                         }
                         // perf: 跳过 trivially-droppable 旧值的 drop_glue
-                        // (与 write_stack 同理, upvalue 常持有 number 值)
-                        if matches!(
-                            *value,
-                            TValue::Nil(_)
-                                | TValue::Boolean(_)
-                                | TValue::Integer(_)
-                                | TValue::Float(_)
-                        ) {
+                        // (与 write_stack 同理, upvalue 常持有 number 值; 判定见
+                        //  `old_slot_holds_ref` —— 单次比较)
+                        if Self::old_slot_holds_ref(value) {
+                            *value = val;
+                        } else {
                             unsafe {
                                 std::ptr::write(value, val);
                             }
-                        } else {
-                            *value = val;
                         }
                     }
                     UpVal::Open { stack_index, .. } => {
                         if *stack_index < state.stack.len() {
                             // perf: 同上, 跳过 trivially-droppable 旧值的 drop_glue
                             let slot = &mut state.stack[*stack_index];
-                            if matches!(
-                                slot,
-                                TValue::Nil(_)
-                                    | TValue::Boolean(_)
-                                    | TValue::Integer(_)
-                                    | TValue::Float(_)
-                            ) {
+                            if Self::old_slot_holds_ref(slot) {
+                                *slot = val;
+                            } else {
                                 unsafe {
                                     std::ptr::write(slot, val);
                                 }
-                            } else {
-                                *slot = val;
                             }
                         }
                     }
