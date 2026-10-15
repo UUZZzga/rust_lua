@@ -892,7 +892,7 @@ pub fn rust_hash_bytes(bytes: &[u8]) -> u64 {
     h
 }
 
-#[cfg_attr(not(size_optimized), inline)]
+#[inline]
 pub fn rust_hash(str: &str) -> u64 {
     rust_hash_bytes(str.as_bytes())
 }
@@ -915,7 +915,7 @@ pub fn lua_string_eq(s1: &TValue, s2: &TValue) -> bool {
     }
 }
 
-#[cfg_attr(not(size_optimized), inline)]
+#[inline]
 pub fn lua_string_as_str<'a, 'b>(str: &'b TValue<'a>) -> &'b str {
     lua_string_as_str_inner(str)
 }

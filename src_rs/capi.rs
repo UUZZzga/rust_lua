@@ -152,12 +152,13 @@ fn index2val<'a>(L: &LuaState<'a>, idx: c_int) -> Option<TValue<'a>> {
 }
 
 /// 判断 idx 是否是 registry 伪索引
-#[cfg_attr(not(size_optimized), inline)]
+#[inline]
 fn is_registry(idx: c_int) -> bool {
     idx == LUA_REGISTRYINDEX
 }
 
 /// 从 LuaType 获取 C 类型码
+#[inline]
 fn lua_type_code(t: LuaType) -> c_int {
     t as c_int
 }
@@ -173,6 +174,7 @@ const fn str_as_array<const N: usize>(s: &str) -> [u8; N] {
     arr
 }
 
+#[inline]
 fn isnoneornil(state: &LuaState, idx: c_int) -> bool {
     if is_registry(idx) {
         return false;

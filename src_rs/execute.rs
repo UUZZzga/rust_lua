@@ -2459,7 +2459,7 @@ impl VmExecutor {
     /// 回边中断观测 — 跳转目标向后 (回跳) 时调用。tick 是 state 上的 Cell,
     /// 增量在调用点内联 (inc [rsi+off] 单指令), 64 边界才原子读 INTERRUPTED。
     /// 中断错误行号 = cur (回跳指令自身, 对应循环头旧方案的 state.pc = pc)。
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn backedge_tick<'a>(state: &mut LuaState<'a>, cur: usize) -> Result<(), VmError<'a>> {
         let t = state.tick.get().wrapping_add(1);
         state.tick.set(t);
@@ -2472,7 +2472,7 @@ impl VmExecutor {
     }
 
     /// 直线段兜底中断检查 (pc 越界路径) — 与 backedge_tick 同摊销计数器。
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn tick_check_interrupted<'a>(state: &mut LuaState<'a>, pc: usize) -> Result<(), VmError<'a>> {
         let t = state.tick.get().wrapping_add(1);
         state.tick.set(t);
@@ -3171,7 +3171,7 @@ impl VmExecutor {
     // 操作码实现
     // ========================================================================
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_move<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -3181,7 +3181,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_loadi<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let val = opcodes::getarg_sbx(inst) as LuaInteger;
@@ -3189,7 +3189,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_loadf<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let val = opcodes::getarg_sbx(inst) as LuaNumber;
@@ -3197,7 +3197,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_loadk<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let idx = opcodes::getarg_bx(inst) as usize;
@@ -3206,7 +3206,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_loadkx<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         state.pc += 1;
@@ -3218,14 +3218,14 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_loadfalse<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         Self::write_stack(state, a, TValue::Boolean(false));
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_lfalseskip<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -3238,14 +3238,14 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_loadtrue<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         Self::write_stack(state, a, TValue::Boolean(true));
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_loadnil<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst);
@@ -3255,7 +3255,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_getupval<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as usize;
@@ -3297,7 +3297,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_setupval<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as usize;
@@ -3372,7 +3372,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_gettabup<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -3607,7 +3607,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_gettable<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -3656,7 +3656,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_geti<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -3700,7 +3700,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_getfield<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -3918,7 +3918,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_seti<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -3967,7 +3967,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_setfield<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4044,7 +4044,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_self<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -4098,7 +4098,7 @@ impl VmExecutor {
 
     // ---- 算术运算 (param-pc: 成功 *pc += 1 跳过 MMBIN, 对应 C 宏内 pc++) ----
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_addi<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4152,7 +4152,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_subk<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4181,7 +4181,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_mulk<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4210,7 +4210,7 @@ impl VmExecutor {
         }
         Ok(())
     }
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_modk<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4250,7 +4250,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_powk<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4272,7 +4272,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_divk<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4294,7 +4294,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_idivk<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4321,7 +4321,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_bandk<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -4341,7 +4341,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_bork<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -4361,7 +4361,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_bxork<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -4381,7 +4381,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_shli<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -4397,7 +4397,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_shri<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -4413,7 +4413,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_add<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4434,7 +4434,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_sub<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4453,7 +4453,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_mul<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4472,7 +4472,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_mod<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4495,7 +4495,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_pow<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4513,7 +4513,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_div<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4531,7 +4531,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_idiv<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4554,7 +4554,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_band<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -4573,7 +4573,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_bor<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -4592,7 +4592,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_bxor<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -4611,7 +4611,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_shl<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -4630,7 +4630,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_shr<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -4726,7 +4726,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_unm<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         // C: ra = RA(i), rb = vRB(i)
         // C: if integer: setivalue(s2v(ra), -ib)
@@ -4756,7 +4756,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_bnot<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         // C: ra = RA(i), rb = vRB(i)
         // C: if tointegerns(rb, &ib): setivalue(s2v(ra), ~ib)
@@ -4781,7 +4781,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_not<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
@@ -4795,7 +4795,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_len<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         // C: StkId ra = RA(i); Protect(luaV_objlen(L, ra, vRB(i)));
         let a = Self::ra(state, inst);
@@ -4942,7 +4942,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_jmp<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4961,7 +4961,7 @@ impl VmExecutor {
 
     // ---- 比较运算 ----
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_eq<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -5014,7 +5014,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_lt<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -5054,7 +5054,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_le<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -5094,7 +5094,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_eqk<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -5110,7 +5110,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_eqi<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -5131,7 +5131,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_lti<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -5166,7 +5166,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_lei<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -5198,7 +5198,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_gti<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -5230,7 +5230,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_gei<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -5262,7 +5262,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_test<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -5275,7 +5275,7 @@ impl VmExecutor {
         Ok(())
     }
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_testset<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -5489,7 +5489,7 @@ impl VmExecutor {
     /// CallInfoEntry 补推 (大体积: name_str + 结构体构造) 提取到 #[cold]
     /// 恢复函数。相比整函数 #[inline] (体积 +7%, CI 已证无益), 这里错误
     /// 路径体积被剥离, 内联膨胀仅剩 ~15 条指令的成功路径。
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn call_pure_builtin<'a>(
         state: &mut LuaState<'a>,
         a: usize,
@@ -6882,7 +6882,7 @@ impl VmExecutor {
 
     // ---- 循环 ----
 
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     fn op_forloop<'a>(
         state: &mut LuaState<'a>,
         inst: Instruction,

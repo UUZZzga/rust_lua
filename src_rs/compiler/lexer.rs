@@ -387,7 +387,7 @@ impl<'a, 'b> LexState<'a, 'b> {
 
     /// 获取缓存的 "_ENV" LuaString。第一次调用时 intern 并缓存，
     /// 后续直接 clone（refcount++），避免每次 code_global_via_env* 都做 hash+查找。
-    #[cfg_attr(not(size_optimized), inline)]
+    #[inline]
     pub fn env_str_cached(&mut self) -> TValue<'b> {
         if let Some(ref k) = self.cached_env {
             return k.to_value();

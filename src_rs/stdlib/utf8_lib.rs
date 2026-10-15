@@ -51,13 +51,13 @@ const UTF8PATT_BYTES: &[u8] = &[
 // ============================================================================
 
 /// 检查字节是否为续字节 — 对应 C 的 iscont 宏
-#[cfg_attr(not(size_optimized), inline)]
+#[inline]
 fn iscont(c: u8) -> bool {
     (c & 0xC0) == 0x80
 }
 
 /// 检查指针位置的字节是否为续字节 — 对应 C 的 iscontp 宏
-#[cfg_attr(not(size_optimized), inline)]
+#[inline]
 fn iscontp(s: &[u8], idx: usize) -> bool {
     idx < s.len() && iscont(s[idx])
 }

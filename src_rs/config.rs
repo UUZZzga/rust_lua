@@ -165,7 +165,7 @@ pub const FILEHANDLE: &str = "FILE*";
 // 辅助函数
 // ============================================================================
 
-#[cfg_attr(not(size_optimized), inline)]
+#[inline]
 pub fn float_pow(a: LuaNumber, b: LuaNumber) -> LuaNumber {
     if b == 2.0 {
         a * a

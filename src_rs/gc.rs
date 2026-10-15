@@ -462,18 +462,18 @@ pub fn print_gc_time_summary() {
 /// 消除 worklist 的 TValue clone + drop_glue 开销。
 pub(crate) type RawTValue<'a> = std::mem::MaybeUninit<TValue<'a>>;
 
-#[cfg_attr(not(size_optimized), inline(always))]
+#[inline(always)]
 pub(crate) unsafe fn raw_from_tvalue<'a>(val: &TValue<'a>) -> RawTValue<'a> {
     std::mem::MaybeUninit::new(std::ptr::read(val as *const TValue))
 }
 
-#[cfg_attr(not(size_optimized), inline(always))]
+#[inline(always)]
 pub(crate) unsafe fn raw_as_tvalue<'a, 'b>(raw: &'b RawTValue<'a>) -> &'b TValue<'a> {
     raw.assume_init_ref()
 }
 
 /// 只处理需要 GC 标记的类型（Table/LClosure/CClosure/UserData/Thread/RustClosure）。
-#[cfg_attr(not(size_optimized), inline)]
+#[inline]
 fn needs_gc_mark<'a>(val: &TValue<'a>) -> bool {
     matches!(
         val,

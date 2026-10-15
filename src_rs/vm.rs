@@ -274,7 +274,7 @@ pub fn strcmp<'a>(ts1: &TValue<'a>, ts2: &TValue<'a>) -> Ordering {
 
 /// 通过裸指针调用 strcoll，避免 CString 堆分配。
 /// 调用者必须保证两个指针都指向 NUL 终止的字符串。
-#[cfg_attr(not(size_optimized), inline)]
+#[inline]
 fn strcoll_ptrs(s1: *const std::os::raw::c_char, s2: *const std::os::raw::c_char) -> Ordering {
     // Miri 不支持 libc::strcoll,用字节比较代替
     // (默认 "C" locale 下 strcoll 等同于字节比较)

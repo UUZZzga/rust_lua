@@ -76,7 +76,7 @@ fn get_obj_len<'a>(state: &mut LuaState<'a>, obj: &TValue<'a>) -> Result<LuaInte
 
 /// 获取 t[i]，支持 __index 元方法 (对应 C lua_geti → luaV_finishget)
 /// 用于 table 库函数对表元素访问时透明地调用元方法（如 proxy 表）
-#[cfg_attr(not(size_optimized), inline)]
+#[inline]
 fn geti_meta<'a>(
     state: &mut LuaState<'a>,
     table_val: &TValue<'a>,
@@ -91,7 +91,7 @@ fn geti_meta<'a>(
 }
 
 /// 设置 t[i] = v，支持 __newindex 元方法 (对应 C lua_seti → luaV_finishset)
-#[cfg_attr(not(size_optimized), inline)]
+#[inline]
 fn seti_meta<'a>(
     state: &mut LuaState<'a>,
     table_val: &TValue<'a>,
@@ -107,7 +107,7 @@ fn seti_meta<'a>(
     )
 }
 
-#[cfg_attr(not(size_optimized), inline)]
+#[inline]
 fn seti_meta_<'a>(
     state: &mut LuaState<'a>,
     table_val: TValue<'a>,
@@ -124,7 +124,7 @@ fn seti_meta_<'a>(
 }
 
 /// 将结果压入栈并调整栈顶
-#[cfg_attr(not(size_optimized), inline)]
+#[inline]
 fn push_results<'a>(state: &mut LuaState<'a>, a: usize, nresults: i32, results: Vec<TValue<'a>>) {
     state.adjust_results(a, nresults, results);
 }

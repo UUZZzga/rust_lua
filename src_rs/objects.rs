@@ -65,7 +65,7 @@ pub(crate) mod fx_hash_impl {
     }
 
     impl FxHasher {
-        #[cfg_attr(not(size_optimized), inline)]
+        #[inline]
         fn add_to_hash(&mut self, i: u64) {
             self.hash = (self.hash.rotate_left(5) ^ i).wrapping_mul(FX_HASH_SEED);
         }
@@ -90,43 +90,43 @@ pub(crate) mod fx_hash_impl {
             }
         }
 
-        #[cfg_attr(not(size_optimized), inline)]
+        #[inline]
         fn write_u8(&mut self, i: u8) {
             self.add_to_hash(i as u64);
         }
-        #[cfg_attr(not(size_optimized), inline)]
+        #[inline]
         fn write_u16(&mut self, i: u16) {
             self.add_to_hash(i as u64);
         }
-        #[cfg_attr(not(size_optimized), inline)]
+        #[inline]
         fn write_u32(&mut self, i: u32) {
             self.add_to_hash(i as u64);
         }
-        #[cfg_attr(not(size_optimized), inline)]
+        #[inline]
         fn write_u64(&mut self, i: u64) {
             self.add_to_hash(i);
         }
-        #[cfg_attr(not(size_optimized), inline)]
+        #[inline]
         fn write_i8(&mut self, i: i8) {
             self.add_to_hash(i as u64);
         }
-        #[cfg_attr(not(size_optimized), inline)]
+        #[inline]
         fn write_i16(&mut self, i: i16) {
             self.add_to_hash(i as u64);
         }
-        #[cfg_attr(not(size_optimized), inline)]
+        #[inline]
         fn write_i32(&mut self, i: i32) {
             self.add_to_hash(i as u64);
         }
-        #[cfg_attr(not(size_optimized), inline)]
+        #[inline]
         fn write_i64(&mut self, i: i64) {
             self.add_to_hash(i as u64);
         }
-        #[cfg_attr(not(size_optimized), inline)]
+        #[inline]
         fn write_usize(&mut self, i: usize) {
             self.add_to_hash(i as u64);
         }
-        #[cfg_attr(not(size_optimized), inline)]
+        #[inline]
         fn write_isize(&mut self, i: isize) {
             self.add_to_hash(i as u64);
         }

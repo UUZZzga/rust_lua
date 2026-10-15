@@ -6,7 +6,7 @@ pub mod lexer;
 mod cmp_tests;
 
 use crate::{objects::Proto, state::LuaState};
-#[cfg_attr(not(size_optimized), inline)]
+#[inline]
 pub fn compile<'a>(
     state: &mut LuaState<'a>,
     source: &str,
