@@ -749,6 +749,9 @@ impl<'a> LuaState<'a> {
     }
 
     /// `[from, to)` 是否全为 trivially-droppable 值 (scratch 不变量)。
+    /// 仅 `smart_clear_stack` 的 fast_unsafe 路径使用 —— 安全构建走 `truncate_live`，
+    /// 故用 cfg 收口避免 dead_code 警告。
+    #[cfg(feature = "fast_unsafe")]
     #[inline(always)]
     pub(crate) fn range_all_trivial(&self, from: usize, to: usize) -> bool {
         let to = to.min(self.stack.len());
@@ -764,6 +767,8 @@ impl<'a> LuaState<'a> {
     }
 
     /// 把 `[from, to)` 中非 trivial 的槽位替换为 Nil, 释放其持有的 Rc/表等引用。
+    /// 同 `range_all_trivial`: 仅 fast_unsafe 路径使用。
+    #[cfg(feature = "fast_unsafe")]
     #[inline(never)]
     pub(crate) fn clear_nontrivial_range(&mut self, from: usize, to: usize) {
         let to = to.min(self.stack.len());

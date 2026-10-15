@@ -2352,6 +2352,9 @@ impl VmExecutor {
         }
     }
 
+    /// 仅诊断构建（`probe_wstack`）与安全构建（`not(fast_unsafe)`）可达 —— 默认构建下
+    /// `read_stack` 直接 `get_unchecked`，此处用 cfg 收口避免 dead_code 警告。
+    #[cfg(any(feature = "probe_wstack", not(feature = "fast_unsafe")))]
     #[cold]
     #[inline(never)]
     fn read_stack_panic<'a>(state: &LuaState, idx: usize) -> ! {
