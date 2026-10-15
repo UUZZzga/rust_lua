@@ -594,6 +594,16 @@ impl<'a> RustClosure<'a> {
 ///
 /// Rust 版本使用 enum + struct，类型安全且无位操作。
 ///
+/// **变体顺序不变式（性能关键，改动前先读这段）**：持有引用计数的变体（`ShortStr`
+/// 起的连续 8 个）必须排在 tag 尾部，无引用计数的变体（`Nil` / `Boolean` /
+/// `LightUserData` / `Integer` / `Float` / `LCFn` / `BuiltinFn`）必须全部排在它们
+/// 之前。tag 值按声明顺序分配（实测判别式位掩码 `0x73e0` = 旧顺序下的 5..9 + 12..14），
+/// 因此本顺序把「旧值是否需要释放引用计数」变成单次 `cmp tag, 7; jae`：
+/// `write_stack` 的 `matches!` 落在连续 tag 区间上，LLVM 只发一条比较；不连续时
+/// LLVM 退化为「范围保护 `ja` + 位掩码 `bt`/`jae`」两条分支（每个寄存器写多
+/// ~4 uops，见 execute.rs `write_stack` 文档）。`impl Hash for TValue` 用的是手工
+/// 数值 tag（与本顺序无关），故重排不改变哈希值、表迭代顺序或任何可观察行为。
+///
 /// Scenario: TValue 的构造与类型查询
 /// Given: 创建各种类型的 TValue
 /// When: 调用 .ty() 方法
@@ -614,6 +624,14 @@ pub enum TValue<'a> {
     Integer(LuaInteger),
     /// 数值 —— 浮点子变体
     Float(LuaNumber),
+    /// 轻量 C 函数
+    LCFn(LCFunction),
+    /// Rust 原生内置函数（函数指针 + 静态名）
+    ///
+    /// 用于注册 Rust 实现的内置函数。调用时直接通过函数指针派发，
+    /// 无需 tag 范围匹配。详见 `BuiltinFn` 类型文档。
+    BuiltinFn(BuiltinFn),
+    // ---- 以下 8 个变体持有引用计数 (tag 7..=14), 顺序不变式: 必须连续且位于尾部 ----
     /// 字符串（短字符串和长字符串）
     ShortStr(ArcRc<ShortString>),
     LongStr(SimpleRc<LongString, SlotAlloc>),
@@ -626,13 +644,6 @@ pub enum TValue<'a> {
     LClosure(MyRc<LClosure<'a>, SlotAlloc>),
     /// C 闭包（同理用 allocator 路由的 MyRc）
     CClosure(MyRc<CClosure<'a>, SlotAlloc>),
-    /// 轻量 C 函数
-    LCFn(LCFunction),
-    /// Rust 原生内置函数（函数指针 + 静态名）
-    ///
-    /// 用于注册 Rust 实现的内置函数。调用时直接通过函数指针派发，
-    /// 无需 tag 范围匹配。详见 `BuiltinFn` 类型文档。
-    BuiltinFn(BuiltinFn),
     /// Rust 闭包（函数指针 + 可变 upvalues）
     ///
     /// 用于 coroutine.wrap 和 io.lines 等需要携带状态的内置函数。

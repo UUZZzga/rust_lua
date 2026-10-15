@@ -2051,6 +2051,40 @@ impl VmExecutor {
         Self::fast_resize_stack_nil(state, idx + 1);
     }
 
+    /// 旧槽值是否持有引用计数 (持有则必须先释放再覆盖写)。
+    ///
+    /// 依赖 `objects::TValue` 的**变体顺序不变式**: 8 个持有引用的变体连续位于 tag
+    /// 尾部 (ShortStr..=Thread)。落在连续 tag 区间上的 `matches!` 只发一条比较
+    /// (`cmpb $7, (slot); jae`) —— 重排该 enum 的变体顺序会让 LLVM 退化为
+    /// 「范围保护 `ja` + 位掩码 `bt`/`jae`」的两分支形式 (每个寄存器写多 ~4 uops)。
+    /// 实测汇编见 execute.rs 的 write_stack 文档与 CLAUDE.md「TValue 变体顺序」。
+    #[cfg(feature = "fast_unsafe")]
+    #[cfg_attr(not(size_optimized), inline(always))]
+    fn old_slot_holds_ref(old: &TValue<'_>) -> bool {
+        matches!(
+            old,
+            TValue::ShortStr(_)
+                | TValue::LongStr(_)
+                | TValue::Table(_)
+                | TValue::LClosure(_)
+                | TValue::CClosure(_)
+                | TValue::RustClosure(_)
+                | TValue::UserData(_)
+                | TValue::Thread(_)
+        )
+    }
+
+    /// 释放旧槽值持有的引用 (先置 Nil 再让 drop 走 drop_glue) —— 冷路径。
+    ///
+    /// `#[cold]` + `#[inline(never)]`: 让热路径 (直接覆盖写) 保持直线, 冷路径出线,
+    /// 热路径只剩一次不被命中的条件跳转。
+    #[cfg(feature = "fast_unsafe")]
+    #[cold]
+    #[inline(never)]
+    unsafe fn release_old_slot(slot: *mut TValue<'_>) {
+        let _ = std::ptr::replace(slot, TValue::Nil(NilKind::Strict));
+    }
+
     /// 写入栈槽 — VM 字节码路径专用
     ///
     /// **无边界判定、无按需增长**: 对应 C 的 `setobj2s(L, ra, v)` —— 直接写 `ci->top`
@@ -2062,17 +2096,24 @@ impl VmExecutor {
     /// 不变量校验 (零 release 成本): `probe_wstack` 构建统计越界写 (WSOOB/WSCAP);
     /// `debug_assert` 在 debug 构建下直接暴露破例点。
     ///
-    /// perf: 跳过 trivially-droppable 旧值的 drop_glue (drop_glue TValue 占 8.28%)
-    /// `*ptr = val` 会为旧值生成 drop_glue: match 判别式 → 对 Rc 变体 decq 引用计数。
-    /// 即使旧值是 Integer/Float/Boolean/Nil (drop 为 no-op), 仍执行 match 判别式检查。
-    /// 此函数先检查旧值是否为 trivially-droppable 类型, 若是则用 ptr::write 跳过 drop_glue。
-    /// 算术循环中旧值几乎总是 number, 分支预测器命中率 ~100%, 成本 ~1 cycle,
-    /// 节省的 drop_glue match 开销 ~3-5 cycles/次。
+    /// perf (旧值释放): `*ptr = val` 会为旧值生成 drop_glue (match 判别式 → 对 Rc 变体
+    /// decq 引用计数); 即使旧值是 number 也要白跑一遍 match。这里改成「单条比较判定 +
+    /// 冷路径出线」(实测汇编):
+    /// ```text
+    /// cmpb  $0x7, (%rax,%rcx)   ; 变体顺序不变式 → 持有引用的 8 个变体 tag 连续 (7..=14)
+    /// jae   release_old_slot    ; 算术循环里旧值恒为 number (tag 3/4) → 恒不跳
+    /// movups (%r8), %xmm0       ; 16B 覆盖写
+    /// movups %xmm0, (%r14)
+    /// cmpq/cmovaq/cmovbeq       ; len 与 top 用 max 更新 (无分支)
+    /// ```
+    /// 对比 C: `setobj2s` 连这一次比较都没有 (C 的 TValue 不持有所有权, 覆盖写无需释放);
+    /// Rust 侧引用计数必须释放, 跳过即泄漏 (回归: tests_lua/rc_release_test.lua)。
+    /// 因此本函数的分支预算已经到底: 一次恒不命中的条件跳转。
     #[cfg_attr(not(size_optimized), inline(always))]
     pub(crate) fn write_stack<'a>(state: &mut LuaState<'a>, idx: usize, val: TValue<'a>) {
         let top = state.top;
         // scratch 槽 (idx >= len) 恒为 Nil (已初始化且无需 drop), live 槽 (idx < len) 的旧值
-        // 只有 Rc 变体需要释放 —— 这是本函数唯一保留的分支 (预测命中率接近 100%)。
+        // 只有持有引用的变体需要释放 —— 见 `old_slot_holds_ref` (单次比较, 见其文档)。
         // [0, len) 由 Vec 管理, [len, scratch_end) 由 pad_frame_scratch 填 Nil。
         #[cfg(feature = "probe_wstack")]
         {
@@ -2112,8 +2153,9 @@ impl VmExecutor {
             }
         }
         // 无分支写: 不变量保证 idx < max(len, scratch_end), 槽位已初始化。
-        // len 与 top 一律用 max 更新 (编译为 cmov, 无分支); 唯一保留的分支是上面那句
-        // 「旧值是否持有引用计数」(跳过着会泄漏, 必须释放)。
+        // len 与 top 一律用 max 更新 (编译为 cmov, 无分支); 唯一分支是「旧值是否
+        // 持有引用计数」(跳过着会泄漏, 必须释放) —— 见 `old_slot_holds_ref`:
+        // 单条 `cmpb $7, (slot); jae`, 算术循环里旧值恒为 number, 命中率 100%。
         #[cfg(feature = "fast_unsafe")]
         unsafe {
             let slot: *mut TValue<'a> = state.stack.as_mut_ptr().add(idx);
@@ -2125,18 +2167,8 @@ impl VmExecutor {
                 state.scratch_end,
                 state.base
             );
-            if matches!(
-                &*slot,
-                TValue::LongStr(_)
-                    | TValue::ShortStr(_)
-                    | TValue::Table(_)
-                    | TValue::LClosure(_)
-                    | TValue::CClosure(_)
-                    | TValue::RustClosure(_)
-                    | TValue::UserData(_)
-                    | TValue::Thread(_)
-            ) {
-                let _ = std::ptr::replace(slot, TValue::Nil(NilKind::Strict));
+            if Self::old_slot_holds_ref(&*slot) {
+                Self::release_old_slot(slot);
             }
             std::ptr::write(slot, val);
             // [len, idx+1) 已由 pad_frame_scratch 初始化为 Nil → set_len 安全且无分支。
