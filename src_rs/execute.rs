@@ -2053,11 +2053,14 @@ impl VmExecutor {
 
     /// 写入栈槽 — VM 字节码路径专用
     ///
-    /// perf: 末尾追加 (idx == stack.len(), 热路径主导形态) 走 `Vec::push` 的内联
-    /// 快路径 (容量检查 + ptr::write + len 自增), 不再调用 `#[cold]` 的
-    /// `write_stack_grow` (函数调用 + `fast_resize_stack_nil` 的逐槽 Nil 填充,
-    /// 而该槽随即被覆盖 —— 纯浪费)。调用基准实测每个迭代约 6 次该形态的写。
-    /// 跨槽扩展 (idx 越过末尾, 需要填中间空洞) 仍走 cold 路径。
+    /// **无边界判定、无按需增长**: 对应 C 的 `setobj2s(L, ra, v)` —— 直接写 `ci->top`
+    /// 以内的槽位, 从不检查、从不扩容。不变量「当前帧寄存器区恒已初始化」由
+    /// `LuaState::pad_frame_scratch` (帧入口) / `ensure_scratch_to` / `truncate_live`
+    /// 共同维护 (见 state.rs「帧寄存器 scratch」小节), 因此这里既没有上界比较,
+    /// 也不调用 `write_stack_grow`。
+    ///
+    /// 不变量校验 (零 release 成本): `probe_wstack` 构建统计越界写 (WSOOB/WSCAP);
+    /// `debug_assert` 在 debug 构建下直接暴露破例点。
     ///
     /// perf: 跳过 trivially-droppable 旧值的 drop_glue (drop_glue TValue 占 8.28%)
     /// `*ptr = val` 会为旧值生成 drop_glue: match 判别式 → 对 Rc 变体 decq 引用计数。
@@ -2068,25 +2071,20 @@ impl VmExecutor {
     #[cfg_attr(not(size_optimized), inline(always))]
     pub(crate) fn write_stack<'a>(state: &mut LuaState<'a>, idx: usize, val: TValue<'a>) {
         let top = state.top;
-        // 无分支写 (fast_unsafe): 前提是「当前帧寄存器区恒在 stack.len() 之内」,
-        // 由 LuaState::pad_frame_scratch (帧入口/截断后补齐) 与 truncate_live
-        // (语义截断不把 len 收缩到写边界以下) 共同维护, 见 state.rs
-        // 「帧寄存器 scratch」小节。越界写 = 不变量被破坏, debug 下断言暴露。
-        // 可写的槽位上界 = max(Vec 逻辑长度, 帧 scratch 上界)。两者都是「已初始化内存」:
-        // [0, len) 由 Vec 管理, [len, scratch_end) 由 pad_frame_scratch 填 Nil (见 state.rs
-        // 「帧寄存器 scratch」小节)。下面两条路径都只需要这一次取上界:
-        //   * probe_wstack (诊断构建): 计数越界写 (WSOOB) 与超出 capacity 的写 (WSCAP);
-        //   * fast_unsafe (正常构建): 恒定不跳转的安全网 —— 不变量破例时退化为按需补齐,
-        //     而不是 UB。
-        let write_limit = if state.stack.len() > state.scratch_end {
-            state.stack.len()
-        } else {
-            state.scratch_end
-        };
+        // scratch 槽 (idx >= len) 恒为 Nil (已初始化且无需 drop), live 槽 (idx < len) 的旧值
+        // 只有 Rc 变体需要释放 —— 这是本函数唯一保留的分支 (预测命中率接近 100%)。
+        // [0, len) 由 Vec 管理, [len, scratch_end) 由 pad_frame_scratch 填 Nil。
         #[cfg(feature = "probe_wstack")]
         {
             use std::sync::atomic::{AtomicUsize, Ordering};
             static OOB: AtomicUsize = AtomicUsize::new(0);
+            // 探针构建: 不变量「写目标恒已初始化」的写目标上界 = max(len, scratch_end)。
+            // 任何越界写都说明某个维护点漏了 (且 release 下会踩到未初始化内存)。
+            let limit = if state.stack.len() > state.scratch_end {
+                state.stack.len()
+            } else {
+                state.scratch_end
+            };
             if idx >= state.stack.capacity() {
                 static OV: AtomicUsize = AtomicUsize::new(0);
                 let n = OV.fetch_add(1, Ordering::Relaxed);
@@ -2099,7 +2097,7 @@ impl VmExecutor {
                     );
                 }
             }
-            if idx >= write_limit {
+            if idx >= limit {
                 let n = OOB.fetch_add(1, Ordering::Relaxed);
                 if n < 10 {
                     eprintln!(
@@ -2113,12 +2111,9 @@ impl VmExecutor {
                 }
             }
         }
-        #[cfg(all(feature = "fast_unsafe", not(feature = "probe_wstack")))]
-        if idx >= write_limit {
-            Self::write_stack_grow(state, idx);
-        }
-        // 无分支写: 唯一保留的分支是「旧值是否需要 drop」(Rc 释放, 跳过即泄漏, 实测
-        // 预测命中率 ~100%); len 与 top 都用 max 更新 (cmov)。
+        // 无分支写: 不变量保证 idx < max(len, scratch_end), 槽位已初始化。
+        // len 与 top 一律用 max 更新 (编译为 cmov, 无分支); 唯一保留的分支是上面那句
+        // 「旧值是否持有引用计数」(跳过着会泄漏, 必须释放)。
         #[cfg(feature = "fast_unsafe")]
         unsafe {
             let slot: *mut TValue<'a> = state.stack.as_mut_ptr().add(idx);
@@ -2144,42 +2139,52 @@ impl VmExecutor {
                 let _ = std::ptr::replace(slot, TValue::Nil(NilKind::Strict));
             }
             std::ptr::write(slot, val);
-            let len = state.stack.len();
-            if idx >= len {
-                state.stack.set_len(idx + 1);
-            }
+            // [len, idx+1) 已由 pad_frame_scratch 初始化为 Nil → set_len 安全且无分支。
+            state.stack.set_len(state.stack.len().max(idx + 1));
         }
         #[cfg(not(feature = "fast_unsafe"))]
         {
-            if idx >= state.stack.len() {
-                if idx >= state.scratch_end {
-                    Self::write_stack_grow(state, idx);
-                } else {
-                    unsafe { state.stack.set_len(idx + 1) };
-                }
+            // 安全等价实现: 不变量破例时按需补齐后写 (无性能要求)。
+            if idx >= state.scratch_end {
+                Self::write_stack_grow(state, idx);
+            } else if idx >= state.stack.len() {
+                unsafe { state.stack.set_len(idx + 1) };
             }
             state.stack[idx] = val;
         }
-        if idx >= top {
-            state.top = idx + 1;
-        }
+        state.top = top.max(idx + 1);
     }
 
     /// 读取栈槽 — VM 字节码路径专用 (idx 保证在范围内)
     /// perf: unsafe get_unchecked 跳过边界检查
     #[cfg_attr(not(size_optimized), inline(always))]
     fn read_stack<'a, 'b>(state: &'b LuaState<'a>, idx: usize) -> &'b TValue<'a> {
-        if idx < state.stack.len() {
-            #[cfg(feature = "fast_unsafe")]
-            {
-                unsafe { state.stack.get_unchecked(idx) }
+        // 与 write_stack 共用同一不变量: 当前帧寄存器区恒已初始化 —— [0, len) 由 Vec 管理,
+        // [len, scratch_end) 由 pad_frame_scratch 填 Nil。因此读也无边界判定, 对应 C 的
+        // `s2v(ra)` 直接取 ci->top 以内的槽位 (帧内未赋值的寄存器本就读作 nil)。
+        // 不变量校验: probe_wstack 构建下越界读立即带现场暴露; debug_assert 见 write_stack。
+        #[cfg(feature = "probe_wstack")]
+        {
+            let limit = if state.stack.len() > state.scratch_end {
+                state.stack.len()
+            } else {
+                state.scratch_end
+            };
+            if idx >= limit {
+                Self::read_stack_panic(state, idx);
             }
-            #[cfg(not(feature = "fast_unsafe"))]
-            {
+        }
+        #[cfg(feature = "fast_unsafe")]
+        {
+            unsafe { state.stack.get_unchecked(idx) }
+        }
+        #[cfg(not(feature = "fast_unsafe"))]
+        {
+            if idx < state.stack.len() {
                 &state.stack[idx]
+            } else {
+                Self::read_stack_panic(state, idx)
             }
-        } else {
-            Self::read_stack_panic(state, idx)
         }
     }
 
@@ -4755,7 +4760,7 @@ impl VmExecutor {
         // (perf: op_concat 是热路径,to_vec 的 clone 占显著开销;split_off 是 O(剩余长度) 的 memcpy,零 clone)
         let mut saved_tail: Vec<TValue> = state.stack.split_off(a + n);
         // split_off 会把 [at,..) 移出 (源槽位成为 moved-out, 不可再被 drop-check 读)
-        state.scratch_end = 0;
+        state.reset_scratch();
         state.pad_frame_scratch();
 
         // 尝试直接拼接 (对应 C 的 luaV_concat)
@@ -4766,7 +4771,7 @@ impl VmExecutor {
             // split_off 移动操作数到独立 Vec,避免 to_vec 的 clone
             let mut vals: Vec<TValue> = state.stack.split_off(a);
             // split_off 会把 [at,..) 移出 (源槽位成为 moved-out, 不可再被 drop-check 读)
-            state.scratch_end = 0;
+            state.reset_scratch();
             state.pad_frame_scratch();
             match concat_stack(state.alloc_slot(), &state.string_table, &mut vals, n) {
                 Ok(()) => Ok(vals),
@@ -4821,7 +4826,7 @@ impl VmExecutor {
                     // split_off 移动 [a..] 到独立 Vec,避免 to_vec 的 clone
                     let mut vals: Vec<TValue> = state.stack.split_off(a);
                     // split_off 会把 [at,..) 移出 (源槽位成为 moved-out, 不可再被 drop-check 读)
-                    state.scratch_end = 0;
+                    state.reset_scratch();
                     state.pad_frame_scratch();
                     match concat_stack(
                         state.alloc_slot(),

@@ -348,7 +348,7 @@ pub extern "C" fn lua_newthread(L: *mut lua_State) -> *mut lua_State {
         // 缺少此占位会使 index 1 落到 stack[1]（本应是 stack[0] 之后）整体错位 —— 实测
         // lua_xmove 后 lua_pushvalue(L,2) 读到越界 nil，报 "attempt to call a nil value"。
         c.exec.stack = crate::state::GlobalState::init_stack();
-        c.exec.scratch_end = 0;
+        c.exec.reset_scratch();
         c.exec.top = c.exec.stack.len();
         // 对应 C lstate.c::lua_newthread：新线程继承 L 的调试钩子设置
         // （hook / hookmask / basehookcount，并 resethookcount）
@@ -563,7 +563,7 @@ pub extern "C" fn lua_rotate(L: *mut lua_State, idx: c_int, n: c_int) {
     // 旋转: [abs..top] 向上移 n
     // 切片旋转
     let mut slice: Vec<TValue> = L.stack.drain(abs..top).collect();
-    L.scratch_end = 0;
+    L.reset_scratch();
     slice.rotate_right(n);
     // 重新放回
     L.stack.extend(slice);
@@ -3100,7 +3100,7 @@ pub extern "C" fn lua_xmove(from: *mut lua_State, to: *mut lua_State, n: c_int) 
         0
     };
     let vals: Vec<_> = from.stack.drain(start..).collect();
-    from.scratch_end = 0;
+    from.reset_scratch();
     for v in vals {
         to.stack.push(v);
     }
@@ -4064,7 +4064,7 @@ pub extern "C" fn lua_yieldk(
         0
     };
     let yield_vals: Vec<TValue> = L.stack.drain(start..).collect();
-    L.scratch_end = 0;
+    L.reset_scratch();
     L.pending_yield = Some(yield_vals);
     LUA_YIELD
 }

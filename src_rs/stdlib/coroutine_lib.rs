@@ -1341,7 +1341,7 @@ fn call_resume<'a>(
             let co_stack = {
                 let co = unsafe { &mut *co_ptr };
                 let s = std::mem::take(&mut co.stack);
-                co.scratch_end = 0;
+                co.reset_scratch();
                 co.pad_frame_scratch();
                 // 协程结束，清空 call_info（对应 C 中协程 dead 后 ci 链为空）
                 co.call_info.clear();
@@ -1424,7 +1424,7 @@ fn call_resume<'a>(
                     let co = unsafe { &mut *co_ptr };
                     co.call_info = err_call_info;
                     co.stack = err_stack;
-                    co.scratch_end = 0;
+                    co.reset_scratch();
                     co.pad_frame_scratch();
                     co.base = err_base;
                     co.pad_frame_scratch();
@@ -1440,7 +1440,7 @@ fn call_resume<'a>(
                     let co = unsafe { &mut *co_ptr };
                     co.call_info = err_call_info;
                     co.stack = err_stack;
-                    co.scratch_end = 0;
+                    co.reset_scratch();
                     co.pad_frame_scratch();
                     co.base = err_base;
                     co.pad_frame_scratch();
@@ -1539,7 +1539,7 @@ fn setup_first_resume<'a>(
 
         // 设置栈: stack[0] = closure, stack[1..1+nargs] = resume_args
         co.stack = Vec::new();
-        co.scratch_end = 0;
+        co.reset_scratch();
         co.pad_frame_scratch();
         co.stack.push(TValue::LClosure(closure.clone()));
         for arg in resume_args {
@@ -1612,7 +1612,7 @@ fn setup_first_resume<'a>(
 
         // 设置栈: stack[0] = func, stack[1] = func (寄存器 0), stack[2..] = args
         co.stack = Vec::new();
-        co.scratch_end = 0;
+        co.reset_scratch();
         co.pad_frame_scratch();
         co.stack.push(func.clone()); // stack[0] = func (base-1)
         co.stack.push(func.clone()); // stack[1] = func (寄存器 0)
@@ -1893,7 +1893,7 @@ fn call_wrap_fn<'a>(
     // 暂存调用者栈到 state.caller_gc_stacks — 协程执行期间 GC 需要看到调用者栈
     // 中的 wrap table 引用，否则内层协程会被误判为不可达（big.lua 嵌套 wrap 场景）
     let caller_stack = std::mem::take(&mut state.stack);
-    state.scratch_end = 0;
+    state.reset_scratch();
     state.pad_frame_scratch();
     state.caller_gc_stacks.push(caller_stack);
 
@@ -1914,7 +1914,7 @@ fn call_wrap_fn<'a>(
     if let Err(e) = setup_result {
         // setup 失败（仅首次 resume 的"body 不是函数"路径）：恢复调用者栈
         state.stack = state.caller_gc_stacks.pop().unwrap_or_default();
-        state.scratch_end = 0;
+        state.reset_scratch();
         state.pad_frame_scratch();
         return Err(e);
     }
@@ -1932,7 +1932,7 @@ fn call_wrap_fn<'a>(
         init_coroutine_guards(co, saved_n_ccalls);
         if co.n_ccalls >= crate::state::LUAI_MAXCCALLS {
             state.stack = state.caller_gc_stacks.pop().unwrap_or_default();
-            state.scratch_end = 0;
+            state.reset_scratch();
             state.pad_frame_scratch();
             return Err(VmError::RuntimeError("C stack overflow".to_string()));
         }
@@ -2037,9 +2037,9 @@ fn call_wrap_fn<'a>(
                 let co = unsafe { &mut *co_ptr };
                 co.call_info = err_call_info;
                 co.stack = err_stack;
-                co.scratch_end = 0;
+                co.reset_scratch();
                 co.base = err_base;
-                co.scratch_end = 0;
+                co.reset_scratch();
                 co.pad_frame_scratch();
                 co.pc = err_pc;
                 let mut ctx = co_context.borrow_mut();
@@ -2061,7 +2061,7 @@ fn call_wrap_fn<'a>(
 
     // 各分支已完成 swap 交换回调用者 exec；恢复调用者栈
     state.stack = state.caller_gc_stacks.pop().unwrap_or_default();
-    state.scratch_end = 0;
+    state.reset_scratch();
     state.pad_frame_scratch();
 
     // 把 Closed upvalue 值同步回父栈，协程结束则恢复 Open
@@ -2268,7 +2268,7 @@ pub fn c_api_resume<'a>(
         }) => {
             // 协程返回 — 取出返回值，重新设置栈
             let co_stack = std::mem::take(&mut state.stack);
-            state.scratch_end = 0;
+            state.reset_scratch();
             state.pad_frame_scratch();
             state.call_info.clear();
             {
@@ -2288,7 +2288,7 @@ pub fn c_api_resume<'a>(
                 s.push(val);
             }
             state.stack = s;
-            state.scratch_end = 0;
+            state.reset_scratch();
             state.pad_frame_scratch();
             state.top = state.stack.len();
             (crate::capi::LUA_OK, ret_n)
@@ -2324,7 +2324,7 @@ pub fn c_api_resume<'a>(
             });
             state.call_info = err_call_info;
             state.stack = err_stack;
-            state.scratch_end = 0;
+            state.reset_scratch();
             state.pad_frame_scratch();
             state.base = err_base;
             state.pad_frame_scratch();
@@ -2336,7 +2336,7 @@ pub fn c_api_resume<'a>(
             }
             // push 错误消息: [nil, err_msg]
             state.stack = vec![TValue::Nil(NilKind::Strict), err_val];
-            state.scratch_end = 0;
+            state.reset_scratch();
             state.pad_frame_scratch();
             state.top = 2;
             (crate::capi::LUA_ERRRUN, 1)
@@ -2384,7 +2384,7 @@ pub fn c_api_reset_thread<'a>(state: &mut LuaState<'a>) -> i32 {
     }
     // 对外可见的线程栈重置为初始状态（resetCI + top = stack + 1）
     state.stack = vec![TValue::Nil(NilKind::Strict)];
-    state.scratch_end = 0;
+    state.reset_scratch();
     state.pad_frame_scratch();
     state.top = 1;
     state.base = 0;
@@ -2406,7 +2406,7 @@ pub fn c_api_reset_thread<'a>(state: &mut LuaState<'a>) -> i32 {
 #[cfg(not(feature = "cmp_c"))]
 fn push_error(state: &mut LuaState, msg: &str) -> usize {
     state.stack = vec![TValue::Nil(NilKind::Strict), (state.intern_str(msg))];
-    state.scratch_end = 0;
+    state.reset_scratch();
     state.pad_frame_scratch();
     state.top = 2;
     1

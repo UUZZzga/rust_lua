@@ -671,27 +671,31 @@ impl<'a> LuaState<'a> {
 // ============================================================================
 
 impl<'a> LuaState<'a> {
-    /// 当前帧寄存器写边界 (exclusive) = base + fsize —— 对应 C 的 `ci->top = func + 1 + fsize`。
-    /// vararg 帧的 base 高于函数槽 (base-1 不是闭包, 实测会取到实参), 退回寄存器上界。
+    /// 当前帧寄存器写边界 (exclusive) —— 保守取 `anchor + MAX_FSTACK + 1`。
+    ///
+    /// anchor = 帧基址 (base 有效时) 否则栈长: 保证覆盖「base + 寄存器号」形式的写
+    /// (寄存器号上界 = MAX_FSTACK) 与「栈顶追加」形式的写 (idx == len)。取寄存器上界
+    /// 而非 proto.max_stack_size 是**刻意保守**: 变参前导/展开、C 侧构造的帧都可能写到
+    /// proto 声明的寄存器区之外 (实测 fsize 低估), 少填一次就是越界写 UB。
+    /// 多填的开销被 high-water 摊销 (scratch_end 单调, 只在栈首次达到新深度时补齐)。
     #[inline(always)]
     pub fn frame_floor(&self) -> usize {
         let base = self.base;
-        if base == 0 || base > self.stack.len() {
-            return 0;
-        }
-        // vararg 帧: 变参前导/展开会写到 proto.max_stack_size 之外 (实测 fsize 低估),
-        // 用寄存器上界保守覆盖。
-        if self.is_vararg {
-            return base + crate::opcodes::MAX_FSTACK as usize + 1;
-        }
-        #[cfg(feature = "fast_unsafe")]
-        let slot = unsafe { self.stack.get_unchecked(base - 1) };
-        #[cfg(not(feature = "fast_unsafe"))]
-        let slot = &self.stack[base - 1];
-        match slot {
-            TValue::LClosure(cl) => base + cl.proto.max_stack_size as usize + 1,
-            _ => base + crate::opcodes::MAX_FSTACK as usize + 1,
-        }
+        let anchor = if base == 0 || base > self.stack.len() {
+            self.stack.len()
+        } else {
+            base
+        };
+        anchor + crate::opcodes::MAX_FSTACK as usize + 1
+    }
+
+    /// 丢弃 scratch 承诺 (栈被整体替换 / 值被移出栈) 并立即按当前帧重建 ——
+    /// 任何 `scratch_end = 0` 都必须紧跟一次重建, 否则之后落在「已回收但未重新初始化」
+    /// 槽位的写会踩到未初始化内存 (release) 或被 debug_assert 拦下。
+    #[inline(always)]
+    pub fn reset_scratch(&mut self) {
+        self.scratch_end = 0;
+        self.pad_frame_scratch();
     }
 
     /// 保证 scratch 至少覆盖到当前帧写边界: 把 `[max(len, scratch_end), floor)` 填 Nil

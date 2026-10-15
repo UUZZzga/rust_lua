@@ -1319,6 +1319,9 @@ pub fn obj_len<'a>(
     rb: &TValue<'a>,
     varinfo: &str,
 ) -> Result<(), VmError<'a>> {
+    // 本函数按 ra 写调用者寄存器 (write_stack 无分支写的前提: 目标槽已初始化)。
+    // VM 路径的帧入口已补齐; 直接调用路径 (C API / 库函数直接调用) 在此兜底。
+    state.pad_frame_scratch();
     let tm: Option<TValue<'a>> = match rb {
         TValue::Table(t) => {
             // 先查表自身元表的 __len
