@@ -8,14 +8,14 @@
 //! - __index 指向字符串库函数表 (string.len, string.sub 等)
 //! - 注册 string 全局表，包含所有字符串库函数
 
-use crate::alloc::{MyRc, SimpleRc};
+use crate::alloc::SimpleRc;
 use crate::config::{LuaInteger, LuaNumber, LuaUnsigned, MAX_INTEGER, MIN_INTEGER};
 use crate::execute::{arg_error, VmError};
 use crate::objects::{BuiltinFn, BuiltinFnPtr, LuaType, NilKind, RustClosure, TValue};
 use crate::state::LuaState;
 use crate::strings::{lua_string_as_str, lua_string_len, new_lstr_bytes, ArcRc};
 use crate::table::Table;
-use crate::tm::{make_tm_tvalue, Metatable, TagMethod, TM_N};
+use crate::tm::{make_tm_tvalue, Metatable, TagMethod};
 use std::cell::RefCell;
 use std::mem::MaybeUninit;
 use std::rc::Rc;
@@ -3986,14 +3986,11 @@ fn call_str_gmatch<'a>(
         TValue::Integer(pat_start as LuaInteger),
         TValue::Integer(-1), // lastmatch: 无上次匹配
     ];
-    let iter = TValue::RustClosure(MyRc::new_in(
-        state.alloc_slot(),
-        RustClosure {
-            func: call_gmatch_iter,
-            name: c"gmatch_iter".as_ptr() as *const u8,
-            upvalues: Rc::new(RefCell::new(upvalues)),
-        },
-    ));
+    let iter = TValue::RustClosure(state.new_object(RustClosure {
+        func: call_gmatch_iter,
+        name: c"gmatch_iter".as_ptr() as *const u8,
+        upvalues: Rc::new(RefCell::new(upvalues)),
+    })?);
     push_results(state, a, nresults, vec![iter]);
     Ok(())
 }
@@ -4156,124 +4153,80 @@ fn call_str_dump<'a>(
 /// 1. 创建元表，设置算术元方法
 /// 2. 设置 __index 指向字符串库
 /// 3. 将元表注册为字符串类型的默认元表
-pub fn create_string_metatable(state: &mut LuaState) {
-    let mut mt_table = Table::new_in(state.alloc_slot());
+pub fn create_string_metatable<'a>(state: &mut LuaState<'a>) -> Result<(), VmError<'a>> {
+    let mut mt_table = state.new_table()?;
 
     // 设置算术元方法 (对应 C 的 stringmetamethods 数组)
-    set_arith_method(
-        &mut mt_table,
-        &state.tmnames,
-        TagMethod::Add,
-        add_int,
-        add_f,
-    );
-    set_arith_method(
-        &mut mt_table,
-        &state.tmnames,
-        TagMethod::Sub,
-        sub_int,
-        sub_f,
-    );
-    set_arith_method(
-        &mut mt_table,
-        &state.tmnames,
-        TagMethod::Mul,
-        mul_int,
-        mul_f,
-    );
-    set_arith_method(
-        &mut mt_table,
-        &state.tmnames,
-        TagMethod::Mod,
-        mod_int,
-        mod_f,
-    );
-    set_arith_method(
-        &mut mt_table,
-        &state.tmnames,
-        TagMethod::Pow,
-        |_, _| None,
-        pow_f,
-    );
-    set_arith_method(
-        &mut mt_table,
-        &state.tmnames,
-        TagMethod::Div,
-        |_, _| None,
-        div_f,
-    );
-    set_arith_method(
-        &mut mt_table,
-        &state.tmnames,
-        TagMethod::IDiv,
-        idiv_int,
-        idiv_f,
-    );
-    set_arith_method(
-        &mut mt_table,
-        &state.tmnames,
-        TagMethod::Unm,
-        unm_int,
-        unm_f,
-    );
+    set_arith_method(state, &mut mt_table, TagMethod::Add, add_int, add_f)?;
+    set_arith_method(state, &mut mt_table, TagMethod::Sub, sub_int, sub_f)?;
+    set_arith_method(state, &mut mt_table, TagMethod::Mul, mul_int, mul_f)?;
+    set_arith_method(state, &mut mt_table, TagMethod::Mod, mod_int, mod_f)?;
+    set_arith_method(state, &mut mt_table, TagMethod::Pow, |_, _| None, pow_f)?;
+    set_arith_method(state, &mut mt_table, TagMethod::Div, |_, _| None, div_f)?;
+    set_arith_method(state, &mut mt_table, TagMethod::IDiv, idiv_int, idiv_f)?;
+    set_arith_method(state, &mut mt_table, TagMethod::Unm, unm_int, unm_f)?;
 
     // __index 指向字符串库表
     // 对应 C: lua_pushvalue(L, -2); lua_setfield(L, -2, "__index");
-    let string_lib_table = create_string_lib_table(state);
-    mt_table.set(
-        make_tm_tvalue(&state.tmnames, TagMethod::Index),
-        TValue::Table(string_lib_table),
-    );
+    let string_lib_table = create_string_lib_table(state)?;
+    let index_key = make_tm_tvalue(&state.tmnames, TagMethod::Index);
+    state.table_set(&mt_table, index_key, TValue::Table(string_lib_table))?;
 
     // 创建 Metatable 并注册到 DefaultMetatables
-    unsafe { state.gc_mut().register_table(&mt_table) };
+    state.register_table(&mt_table)?;
     let mt = Metatable::new(mt_table);
     state.g_mut().dmt.set(LuaType::String, mt);
+    Ok(())
 }
 
 /// 设置算术元方法到元表
 fn set_arith_method<'a>(
+    state: &mut LuaState<'a>,
     mt_table: &mut Table<'a>,
-    tmnames: &[TValue<'a>; TM_N],
     tm: TagMethod,
     int_op: fn(LuaInteger, LuaInteger) -> Option<LuaInteger>,
     float_op: fn(LuaNumber, LuaNumber) -> LuaNumber,
-) {
+) -> Result<(), VmError<'a>> {
     // 元方法值: 使用一个标记值 (这里用 Integer 0 作为占位符)
     // 实际算术运算由 call_fn 回调处理
     let _ = (int_op, float_op); // 暂时未使用，保留接口
-    mt_table.set(make_tm_tvalue(tmnames, tm), TValue::Integer(0));
+    let key = make_tm_tvalue(&state.tmnames, tm);
+    state.table_set(mt_table, key, TValue::Integer(0))
 }
 
 /// 创建字符串库函数表
-fn create_string_lib_table<'a>(state: &LuaState<'a>) -> Table<'a> {
-    let lib = Table::new_in(state.alloc_slot());
+fn create_string_lib_table<'a>(state: &mut LuaState<'a>) -> Result<Table<'a>, VmError<'a>> {
+    let mut lib = state.new_table()?;
     // 注册所有字符串库函数 (使用 BuiltinFn 函数指针)
     // 重要: 必须使用 state.intern_str() 创建键，确保哈希值与后续查找时一致
-    let register = |lib: &Table<'a>, name: &'static std::ffi::CStr, func: BuiltinFnPtr| {
+    let register = |lib: &mut Table<'a>,
+                    state: &mut LuaState<'a>,
+                    name: &'static std::ffi::CStr,
+                    func: BuiltinFnPtr|
+     -> Result<(), VmError<'a>> {
         let key = state.intern(name.to_str().unwrap_or(""));
         let name_ptr = name.as_ptr() as *const u8;
-        lib.set(key, BuiltinFn::impure_tvalue(func, name_ptr));
+        state.table_set(lib, key, BuiltinFn::impure_tvalue(func, name_ptr))
     };
-    register(&lib, c"upper", call_str_upper);
-    register(&lib, c"lower", call_str_lower);
-    register(&lib, c"len", call_str_len);
-    register(&lib, c"sub", call_str_sub);
-    register(&lib, c"reverse", call_str_reverse);
-    register(&lib, c"byte", call_str_byte);
-    register(&lib, c"char", call_str_char);
-    register(&lib, c"rep", call_str_rep);
-    register(&lib, c"find", call_str_find);
-    register(&lib, c"format", call_str_format);
-    register(&lib, c"match", call_str_match);
-    register(&lib, c"gmatch", call_str_gmatch);
-    register(&lib, c"gsub", call_str_gsub);
-    register(&lib, c"pack", call_str_pack);
-    register(&lib, c"packsize", call_str_packsize);
-    register(&lib, c"unpack", call_str_unpack);
-    register(&lib, c"dump", call_str_dump);
-    unsafe { state.gc_mut().register_table(&lib) };
-    lib
+    register(&mut lib, state, c"upper", call_str_upper)?;
+    register(&mut lib, state, c"lower", call_str_lower)?;
+    register(&mut lib, state, c"len", call_str_len)?;
+    register(&mut lib, state, c"sub", call_str_sub)?;
+    register(&mut lib, state, c"reverse", call_str_reverse)?;
+    register(&mut lib, state, c"byte", call_str_byte)?;
+    register(&mut lib, state, c"char", call_str_char)?;
+    register(&mut lib, state, c"rep", call_str_rep)?;
+    register(&mut lib, state, c"find", call_str_find)?;
+    register(&mut lib, state, c"format", call_str_format)?;
+    register(&mut lib, state, c"match", call_str_match)?;
+    register(&mut lib, state, c"gmatch", call_str_gmatch)?;
+    register(&mut lib, state, c"gsub", call_str_gsub)?;
+    register(&mut lib, state, c"pack", call_str_pack)?;
+    register(&mut lib, state, c"packsize", call_str_packsize)?;
+    register(&mut lib, state, c"unpack", call_str_unpack)?;
+    register(&mut lib, state, c"dump", call_str_dump)?;
+    state.register_table(&lib)?;
+    Ok(lib)
 }
 
 // ============================================================================
@@ -4285,14 +4238,16 @@ fn create_string_lib_table<'a>(state: &LuaState<'a>) -> Table<'a> {
 /// 对应 C 源码 lstrlib.cpp 的 luaopen_string 函数:
 /// 1. 创建字符串库函数表并注册为全局变量 string
 /// 2. 创建字符串元表
-pub fn open_string_lib(state: &mut LuaState) {
+pub fn open_string_lib<'a>(state: &mut LuaState<'a>) -> Result<(), VmError<'a>> {
     // 创建字符串库函数表并注册为全局变量 string
-    let string_lib_table = create_string_lib_table(state);
+    let string_lib_table = create_string_lib_table(state)?;
     let key = state.intern_str("string");
-    state.globals.set(key, TValue::Table(string_lib_table));
+    let globals = state.globals.clone();
+    state.table_set(&globals, key, TValue::Table(string_lib_table))?;
 
     // 创建字符串元表
-    create_string_metatable(state);
+    create_string_metatable(state)?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -4354,7 +4309,7 @@ mod tests {
     #[test]
     fn test_open_string_lib() {
         let mut state = LuaState::default();
-        open_string_lib(&mut state);
+        open_string_lib(&mut state).expect("打开 string 库失败");
         let key = state.intern_str("string");
         let val = state.globals.get(&key);
         assert!(val.is_some(), "string must be registered");
@@ -4876,14 +4831,14 @@ mod tests {
     fn test_create_string_metatable() {
         let mut state = LuaState::default();
         assert!(state.dmt.get(LuaType::String).is_none());
-        create_string_metatable(&mut state);
+        create_string_metatable(&mut state).expect("创建 string 元表失败");
         assert!(state.dmt.get(LuaType::String).is_some());
     }
 
     #[test]
     fn test_string_metatable_has_arith_methods() {
         let mut state = LuaState::default();
-        create_string_metatable(&mut state);
+        create_string_metatable(&mut state).expect("创建 string 元表失败");
         let mt = state
             .dmt
             .get(LuaType::String)
@@ -4906,7 +4861,7 @@ mod tests {
     #[test]
     fn test_string_metatable_has_index() {
         let mut state = LuaState::default();
-        create_string_metatable(&mut state);
+        create_string_metatable(&mut state).expect("创建 string 元表失败");
         let mt = state
             .dmt
             .get(LuaType::String)
@@ -4922,7 +4877,7 @@ mod tests {
     #[test]
     fn test_open_string_liblobal() {
         let mut state = LuaState::default();
-        open_string_lib(&mut state);
+        open_string_lib(&mut state).expect("打开 string 库失败");
         let key = state.intern_str("string");
         let string_table = state.globals.get(&key);
         assert!(string_table.is_some(), "string global must be registered");
@@ -4939,7 +4894,7 @@ mod tests {
     #[test]
     fn test_open_string_lib_has_all_functions() {
         let mut state = LuaState::default();
-        open_string_lib(&mut state);
+        open_string_lib(&mut state).expect("打开 string 库失败");
         let key = state.intern_str("string");
         let string_table = state.globals.get(&key).expect("string global must exist");
         if let TValue::Table(t) = string_table {

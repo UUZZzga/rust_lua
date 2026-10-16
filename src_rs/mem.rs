@@ -5,6 +5,8 @@
 //! 核心职责:
 //! - 封装所有内存分配/释放/重分配操作
 
+use crate::execute::VmError;
+use crate::objects::TValue;
 use std::alloc::{self, Layout};
 use std::ptr::NonNull;
 use std::rc::Rc;
@@ -484,6 +486,201 @@ unsafe impl core::alloc::Allocator for SlotAlloc {
         );
         let nn = NonNull::new(new_ptr).ok_or(core::alloc::AllocError)?;
         Ok(NonNull::slice_from_raw_parts(nn, new_layout.size()))
+    }
+}
+
+// ============================================================================
+// 分配失败重试漏斗 — 对应 C lmem.c 的 `luaM_realloc_` / `tryagain` / `luaM_error`
+// ============================================================================
+
+/// 分配失败标记 —— 对应 C lmem.c 中分配原语返回 `NULL` 的失败分支
+/// （`luaM_realloc_` 的 `newblock == NULL && nsize > 0`）。
+///
+/// 只作内部控制流信号；对 Lua 可见的错误是 [`VmError::MemoryError`]
+/// （消息 "not enough memory"，与 C 的 `MEMERRMSG` 一致）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AllocFailed;
+
+/// 内存错误抛出的 panic 载荷 —— 供**没有错误通道**的分配点使用
+/// （对应 C 中 `luaM_error` 直接触发 `luaD_throw(L, LUA_ERRMEM)`）。
+///
+/// 由 `LuaState::raise_memory_error` 抛出，在保护点（`pcall_c_function` 的
+/// catch_unwind / longjmp、`LuaState::pcall` 的 catch）转换回
+/// [`crate::execute::VmError::MemoryError`]。错误对象是**预注册**的
+/// `G(L)->memerrmsg`，抛出与转换全程不分配内存。
+#[derive(Debug)]
+pub struct MemoryErrorPanic;
+
+impl<'a> crate::state::LuaState<'a> {
+    /// 对应的 C 判定 `cantryagain(g)`（lmem.c）：
+    /// `completestate(g) && !g->gcstopem`
+    /// —— 状态尚未建好（`lua_newstate` 的 `f_luaopen` 之前）或 GC 正在运行时
+    /// 都不能做紧急回收（收集器可能还没初始化 / 已经处于收集中）。
+    #[inline]
+    pub fn can_retry_alloc(&self) -> bool {
+        self.g().mem.complete_state && !unsafe { self.gc_mut().is_gc_running() }
+    }
+
+    /// C lmem.c: `luaM_realloc_` + `tryagain` —— 通用分配漏斗。
+    ///
+    /// 首次尝试 →（可重试时）紧急全量 GC（`luaC_fullgc(L, 1)`）→ 重试 →
+    /// 仍失败则返回 [`VmError::MemoryError`]（对应 `luaM_error(L)` = `luaD_throw(L, LUA_ERRMEM)`）。
+    ///
+    /// `op` 必须**可重复执行**且失败时不得留下部分写入：C 的分配原语失败时
+    /// 解释器状态与调用前一致（`luaM_saferealloc_` 只在成功后才更新 `*psize`），
+    /// 这里同样要求「先扩容再写入」（见 `Table::try_reserve_for` + `set_unchecked`）。
+    pub fn retry_alloc<T>(
+        &mut self,
+        mut op: impl FnMut() -> Result<T, AllocFailed>,
+    ) -> Result<T, VmError<'a>> {
+        if let Ok(v) = op() {
+            return Ok(v);
+        }
+        core::hint::cold_path();
+        if self.can_retry_alloc() {
+            self.emergency_gc();
+            if let Ok(v) = op() {
+                return Ok(v);
+            }
+            core::hint::cold_path();
+        }
+        Err(VmError::MemoryError)
+    }
+
+    /// `MyRc` 对象块分配漏斗（对应 C 的 `luaM_newobject`）：
+    /// 失败 → 紧急 GC → 重试 → 内存错误。
+    ///
+    /// `value` 在两次尝试之间交还给分配器（失败分支由 [`crate::alloc::MyRc::try_new_in`]
+    /// 原样归还），因此没有额外克隆/构造开销。
+    pub fn new_object<T: crate::alloc::RcPayload>(
+        &mut self,
+        value: T,
+    ) -> Result<crate::alloc::MyRc<T, SlotAlloc>, VmError<'a>> {
+        let slot = self.alloc_slot();
+        let mut pending = Some(value);
+        self.retry_alloc(move || {
+            let v = pending.take().ok_or(AllocFailed)?;
+            match crate::alloc::MyRc::try_new_in(slot, v) {
+                Ok(rc) => Ok(rc),
+                Err(v) => {
+                    pending = Some(v);
+                    Err(AllocFailed)
+                }
+            }
+        })
+    }
+
+    /// 建空表漏斗 —— 对应 C 的 `luaH_new`（块经 `luaM_newobject`）。
+    pub fn new_table(&mut self) -> Result<crate::table::Table<'a>, VmError<'a>> {
+        let slot = self.alloc_slot();
+        self.retry_alloc(move || crate::table::Table::try_new_in(slot))
+    }
+
+    /// 带容量建表漏斗 —— 对应 C 的 `lua_createtable`（先分配数组/哈希容量）。
+    pub fn new_table_with_capacity(
+        &mut self,
+        narray: usize,
+        nhash: usize,
+    ) -> Result<crate::table::Table<'a>, VmError<'a>> {
+        let slot = self.alloc_slot();
+        self.retry_alloc(move || crate::table::Table::try_with_capacity_in(slot, narray, nhash))
+    }
+
+    /// 表写入漏斗 —— 对应 C 的 `luaH_set`（先扩容再写；失败 → 紧急 GC → 重试 → 内存错误）。
+    pub fn table_set(
+        &mut self,
+        t: &crate::table::Table<'a>,
+        key: TValue<'a>,
+        value: TValue<'a>,
+    ) -> Result<(), VmError<'a>> {
+        let is_nil = matches!(&value, TValue::Nil(crate::objects::NilKind::Strict));
+        self.retry_alloc(|| t.try_reserve_for(&key, is_nil))?;
+        t.set_unchecked(key, value);
+        Ok(())
+    }
+
+    /// 整型键表写入漏斗（见 [`LuaState::table_set`]）。
+    pub fn table_set_int(
+        &mut self,
+        t: &crate::table::Table<'a>,
+        key: crate::config::LuaInteger,
+        value: TValue<'a>,
+    ) -> Result<(), VmError<'a>> {
+        let is_nil = matches!(&value, TValue::Nil(crate::objects::NilKind::Strict));
+        self.retry_alloc(|| t.try_reserve_for_int(key, is_nil))?;
+        t.set_int_unchecked(key, value);
+        Ok(())
+    }
+
+    /// 通用漏斗（闭包可取 `&mut self`）—— 用于需要同时改自身状态的分配点，
+    /// 例如栈扩容（`luaD_growstack` → `luaM_reallocvector`）。
+    pub fn retry_alloc_mut<T>(
+        &mut self,
+        mut op: impl FnMut(&mut crate::state::LuaState<'a>) -> Result<T, AllocFailed>,
+    ) -> Result<T, VmError<'a>> {
+        if let Ok(v) = op(self) {
+            return Ok(v);
+        }
+        if self.can_retry_alloc() {
+            self.emergency_gc();
+            if let Ok(v) = op(self) {
+                return Ok(v);
+            }
+        }
+        Err(VmError::MemoryError)
+    }
+
+    /// 栈容量预留漏斗 —— 对应 C 的 `luaD_growstack`（栈数组经 `luaM_reallocvector`，
+    /// 失败先紧急 GC 再重试，仍失败即内存错误）。
+    pub fn reserve_stack(&mut self, additional: usize) -> Result<(), VmError<'a>> {
+        self.retry_alloc_mut(|st| st.stack.try_reserve(additional).map_err(|_| AllocFailed))
+    }
+
+    /// 抛出内存错误 —— 对应 C 的 `luaM_error(L)` = `luaD_throw(L, LUA_ERRMEM)`。
+    ///
+    /// 供**没有错误通道**（返回 `()`，无法向上传递 `Result`）的分配点使用，例如帧入口
+    /// 的栈扩容与表增长辅助函数。机制与 `capi::raise_mem_error` / `do_lua_error` 完全一致：
+    /// 先把预注册的 `memerrmsg` 放进 `pending_error`（**不分配内存**），再按构建模式
+    /// panic（unwind 构建）或 longjmp（`panic=abort` 的 bench 构建）跳到最近保护点。
+    /// 保护点把 `pending_error` 变回 [`VmError::MemoryError`]。
+    #[cold]
+    #[inline(never)]
+    pub fn raise_memory_error(&mut self) -> ! {
+        let msg = self.memerrmsg_value();
+        self.last_error_value = Some(msg.clone());
+        self.last_error_is_memerr.set(true);
+        self.set_memerrmsg_text();
+        self.pending_error = Some(msg);
+        #[cfg(not(lua_use_longjmp))]
+        {
+            std::panic::panic_any(MemoryErrorPanic);
+        }
+        #[cfg(lua_use_longjmp)]
+        {
+            let Some(&buf) = self.error_jmp_bufs.last() else {
+                // 栈空: 顶层错误, 打印后退出 (对齐 C Lua 行为)
+                let msg = self.last_error_msg.clone();
+                unsafe {
+                    libc::write(1, b"lua ".as_ptr() as *const libc::c_void, 4);
+                    libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len() as _);
+                    libc::write(1, b"\n".as_ptr() as *const libc::c_void, 1);
+                }
+                std::process::exit(1);
+            };
+            unsafe { crate::state::lua_rs_longjmp(buf) }
+        }
+    }
+
+    /// 栈扩容或抛内存错误 —— 对应 C 的 `luaD_growstack`（`luaM_reallocvector` 失败即
+    /// `luaM_error`）。容量已够时直接返回，不分配。
+    #[inline]
+    pub fn grow_stack_or_throw(&mut self, additional: usize) {
+        if self.stack.capacity() >= self.stack.len() + additional {
+            return;
+        }
+        if self.reserve_stack(additional).is_err() {
+            self.raise_memory_error();
+        }
     }
 }
 

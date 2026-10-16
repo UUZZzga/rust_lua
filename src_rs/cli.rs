@@ -7,7 +7,7 @@ use const_format::concatcp;
 use crate::config::LuaInteger;
 use crate::mem::SlotAlloc;
 use crate::objects::{LuaType, TValue};
-use crate::state::{LuaState, ERR_RUN, ERR_SYNTAX, MIN_STACK, MULT_RET};
+use crate::state::{LuaState, ERR_MEM, ERR_RUN, ERR_SYNTAX, MIN_STACK, MULT_RET};
 use crate::strings::lua_string_as_str;
 
 use std::io::{self, IsTerminal};
@@ -34,13 +34,25 @@ pub struct Interpreter<'io> {
 }
 
 impl<'io> Interpreter<'io> {
-    pub fn new(io: &'io mut dyn crate::mock::io_mock::Io) -> Self {
-        let mut l = LuaState::new_main(io);
+    pub fn new(io: &'io mut dyn crate::mock::io_mock::Io) -> Result<Self, crate::mem::AllocFailed> {
+        let mut l = LuaState::new_main(io)?;
         l.g_mut().gc_stop();
-        Interpreter {
+        Ok(Interpreter {
             l,
             progname: LUA_PROGNAME.to_string(),
-        }
+        })
+    }
+
+    /// 内存耗尽（创建 state / 表 / 写全局变量等失败）—— 对应 C 中
+    /// `lua_pcall` 收到 `LUA_ERRMEM` 后的行为：打印预注册消息、以失败返回
+    /// （`main` 退出码 1），进程不中断。
+    fn mem_error(&mut self) -> bool {
+        let _ = self.l.g_mut().io.err(self.progname.as_str());
+        let _ = self.l.g_mut().io.err(": ");
+        let _ = self.l.g_mut().io.err(crate::strings::MEMERRMSG);
+        let _ = self.l.g_mut().io.err("\n");
+        let _ = self.l.g_mut().io.err_flush();
+        false
     }
 
     fn writestring(&mut self, s: &str) {
@@ -255,7 +267,12 @@ impl<'io> Interpreter<'io> {
             } else {
                 glob_part
             };
-            self.l.set_global(global_name);
+            if self.l.set_global(global_name).is_err() {
+                // 对应 C 的 lua_setglobal 抛 LUA_ERRMEM：错误对象 = 预注册 memerrmsg
+                let mm = self.l.memerrmsg_value();
+                self.l.push_value(mm);
+                return self.report(ERR_MEM);
+            }
         }
         self.report(status)
     }
@@ -670,18 +687,41 @@ impl<'io> Interpreter<'io> {
 
         if args & HAS_EE != 0 {
             let key = self.l.intern_str("LUA_NOENV");
-            self.l.registry.set(key, TValue::Boolean(true));
+            let registry = self.l.registry.clone();
+            if self
+                .l
+                .table_set(&registry, key, TValue::Boolean(true))
+                .is_err()
+            {
+                return self.mem_error();
+            }
         }
 
-        self.l.open_selected_libs(-1, 0);
+        if self.l.open_selected_libs(-1, 0).is_err() {
+            return self.mem_error();
+        }
 
         let narg = argc as isize - (script + 1);
-        self.l.create_table(narg as usize, (script + 1) as usize);
+        if self
+            .l
+            .create_table(narg as usize, (script + 1) as usize)
+            .is_err()
+        {
+            return self.mem_error();
+        }
         for (i, arg) in argv.iter().enumerate() {
             self.l.push_string(arg);
-            self.l.raw_set_i(-2, i as LuaInteger - script as LuaInteger);
+            if self
+                .l
+                .raw_set_i(-2, i as LuaInteger - script as LuaInteger)
+                .is_err()
+            {
+                return self.mem_error();
+            }
         }
-        self.l.set_global("arg");
+        if self.l.set_global("arg").is_err() {
+            return self.mem_error();
+        }
 
         self.l.g_mut().gc_restart();
         self.l.g_mut().gc_gen();
@@ -715,12 +755,6 @@ impl<'io> Interpreter<'io> {
         }
 
         true
-    }
-}
-
-impl Default for Interpreter<'static> {
-    fn default() -> Self {
-        Self::new(crate::mock::io_mock::lua_io())
     }
 }
 
@@ -788,7 +822,20 @@ pub fn main() {
     }
     let args: Vec<String> = std::env::args().collect();
 
-    let mut interpreter = Interpreter::default();
+    // 对应 C 的 lua.c：luaL_newstate 返回 NULL（内存不足）即打印并退出 1
+    let mut interpreter = match Interpreter::new(crate::mock::io_mock::lua_io()) {
+        Ok(i) => i,
+        Err(_) => {
+            // RealIo 是 ZST，取第二份引用无别名问题（见 lua_io 的 SAFETY 说明）
+            let io: &mut dyn crate::mock::io_mock::Io = crate::mock::io_mock::lua_io();
+            let _ = io.err(LUA_PROGNAME);
+            let _ = io.err(": cannot create state: ");
+            let _ = io.err(crate::strings::MEMERRMSG);
+            let _ = io.err("\n");
+            let _ = io.err_flush();
+            std::process::exit(1);
+        }
+    };
 
     let result = interpreter.pmain(&args);
     interpreter.l.close_state();

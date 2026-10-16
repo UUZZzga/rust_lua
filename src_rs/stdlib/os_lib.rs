@@ -14,7 +14,6 @@ use crate::execute::VmError;
 use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
 use crate::strings::lua_string_as_str;
-use crate::table::Table;
 use std::ffi::{CStr, CString};
 
 // ============================================================================
@@ -698,25 +697,31 @@ fn get_field<'a>(
 /// 设置表整数字段 — 对应 C 的 setfield
 fn set_field<'a>(
     table: &crate::table::Table<'a>,
-    state: &LuaState<'a>,
+    state: &mut LuaState<'a>,
     key: &str,
     value: i32,
     delta: i32,
-) {
+) -> Result<(), VmError<'a>> {
     let k = state.intern_str(key);
-    table.set(
+    state.table_set(
+        table,
         k,
         TValue::Integer(value as LuaInteger + delta as LuaInteger),
-    );
+    )
 }
 
 /// 设置表布尔字段 — 对应 C 的 setboolfield (value < 0 时不设置)
-fn set_boolfield<'a>(table: &crate::table::Table<'a>, state: &LuaState<'a>, key: &str, value: i32) {
+fn set_boolfield<'a>(
+    table: &crate::table::Table<'a>,
+    state: &mut LuaState<'a>,
+    key: &str,
+    value: i32,
+) -> Result<(), VmError<'a>> {
     if value < 0 {
-        return;
+        return Ok(());
     }
     let k = state.intern_str(key);
-    table.set(k, TValue::Boolean(value != 0));
+    state.table_set(table, k, TValue::Boolean(value != 0))
 }
 
 /// os.date([format [, time]]) — 格式化日期/时间
@@ -793,17 +798,17 @@ fn call_os_date<'a>(
     // 检查是否是 "*t" 模式
     let fmt_rest = &fmt[fmt_start..];
     if fmt_rest == b"*t" {
-        let table = Table::new_in(state.alloc_slot());
-        set_field(&table, state, "year", tmr.tm_year, 1900);
-        set_field(&table, state, "month", tmr.tm_mon, 1);
-        set_field(&table, state, "day", tmr.tm_mday, 0);
-        set_field(&table, state, "hour", tmr.tm_hour, 0);
-        set_field(&table, state, "min", tmr.tm_min, 0);
-        set_field(&table, state, "sec", tmr.tm_sec, 0);
-        set_field(&table, state, "yday", tmr.tm_yday, 1);
-        set_field(&table, state, "wday", tmr.tm_wday, 1);
-        set_boolfield(&table, state, "isdst", tmr.tm_isdst);
-        unsafe { state.gc_mut().register_table(&table) };
+        let table = state.new_table()?;
+        set_field(&table, state, "year", tmr.tm_year, 1900)?;
+        set_field(&table, state, "month", tmr.tm_mon, 1)?;
+        set_field(&table, state, "day", tmr.tm_mday, 0)?;
+        set_field(&table, state, "hour", tmr.tm_hour, 0)?;
+        set_field(&table, state, "min", tmr.tm_min, 0)?;
+        set_field(&table, state, "sec", tmr.tm_sec, 0)?;
+        set_field(&table, state, "yday", tmr.tm_yday, 1)?;
+        set_field(&table, state, "wday", tmr.tm_wday, 1)?;
+        set_boolfield(&table, state, "isdst", tmr.tm_isdst)?;
+        state.register_table(&table)?;
         state.adjust_results(a, nresults, vec![TValue::Table(table)]);
         return Ok(());
     }
@@ -939,15 +944,15 @@ fn call_os_time<'a>(
             ));
         }
         // 更新表的字段为规范化值 — 对应 C 的 setallfields
-        set_field(&table, state, "year", ts.tm_year, 1900);
-        set_field(&table, state, "month", ts.tm_mon, 1);
-        set_field(&table, state, "day", ts.tm_mday, 0);
-        set_field(&table, state, "hour", ts.tm_hour, 0);
-        set_field(&table, state, "min", ts.tm_min, 0);
-        set_field(&table, state, "sec", ts.tm_sec, 0);
-        set_field(&table, state, "yday", ts.tm_yday, 1);
-        set_field(&table, state, "wday", ts.tm_wday, 1);
-        set_boolfield(&table, state, "isdst", ts.tm_isdst);
+        set_field(&table, state, "year", ts.tm_year, 1900)?;
+        set_field(&table, state, "month", ts.tm_mon, 1)?;
+        set_field(&table, state, "day", ts.tm_mday, 0)?;
+        set_field(&table, state, "hour", ts.tm_hour, 0)?;
+        set_field(&table, state, "min", ts.tm_min, 0)?;
+        set_field(&table, state, "sec", ts.tm_sec, 0)?;
+        set_field(&table, state, "yday", ts.tm_yday, 1)?;
+        set_field(&table, state, "wday", ts.tm_wday, 1)?;
+        set_boolfield(&table, state, "isdst", ts.tm_isdst)?;
         // time_t → Lua 整数（对应 C 的 lua_pushinteger(L, (lua_Integer)t)）
         TValue::Integer(t as LuaInteger)
     };
@@ -1001,33 +1006,36 @@ fn call_os_difftime<'a>(
 // ============================================================================
 
 /// 打开 OS 库并注册到全局变量 os
-pub fn open_os_lib<'a>(state: &mut LuaState<'a>) {
-    let mut lib = Table::new_in(state.alloc_slot());
+pub fn open_os_lib<'a>(state: &mut LuaState<'a>) -> Result<(), VmError<'a>> {
+    let mut lib = state.new_table()?;
 
     // 注册所有 OS 函数 (使用 BuiltinFn 函数指针)
-    let register = |lib: &mut crate::table::Table<'a>,
-                    name: &'static std::ffi::CStr,
-                    func: crate::objects::BuiltinFnPtr| {
+    let mut register = |lib: &mut crate::table::Table<'a>,
+                        name: &'static std::ffi::CStr,
+                        func: crate::objects::BuiltinFnPtr|
+     -> Result<(), VmError<'a>> {
         let key = state.intern(name.to_str().unwrap_or(""));
         let name_ptr = name.as_ptr() as *const u8;
-        lib.set(key, BuiltinFn::impure_tvalue(func, name_ptr));
+        state.table_set(lib, key, BuiltinFn::impure_tvalue(func, name_ptr))
     };
 
-    register(&mut lib, c"setlocale", call_setlocale);
-    register(&mut lib, c"clock", call_clock);
-    register(&mut lib, c"tmpname", call_tmpname);
-    register(&mut lib, c"remove", call_remove);
-    register(&mut lib, c"getenv", call_getenv);
-    register(&mut lib, c"rename", call_rename);
-    register(&mut lib, c"execute", call_os_execute);
-    register(&mut lib, c"exit", call_os_exit);
-    register(&mut lib, c"date", call_os_date);
-    register(&mut lib, c"time", call_os_time);
-    register(&mut lib, c"difftime", call_os_difftime);
+    register(&mut lib, c"setlocale", call_setlocale)?;
+    register(&mut lib, c"clock", call_clock)?;
+    register(&mut lib, c"tmpname", call_tmpname)?;
+    register(&mut lib, c"remove", call_remove)?;
+    register(&mut lib, c"getenv", call_getenv)?;
+    register(&mut lib, c"rename", call_rename)?;
+    register(&mut lib, c"execute", call_os_execute)?;
+    register(&mut lib, c"exit", call_os_exit)?;
+    register(&mut lib, c"date", call_os_date)?;
+    register(&mut lib, c"time", call_os_time)?;
+    register(&mut lib, c"difftime", call_os_difftime)?;
 
-    unsafe { state.gc_mut().register_table(&lib) };
+    state.register_table(&lib)?;
     let key = state.intern_str("os");
-    state.globals.set(key, TValue::Table(lib));
+    let globals = state.globals.clone();
+    state.table_set(&globals, key, TValue::Table(lib))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1037,7 +1045,7 @@ mod tests {
     #[test]
     fn test_open_os_lib() {
         let mut state = LuaState::default();
-        open_os_lib(&mut state);
+        open_os_lib(&mut state).expect("打开 os 库失败");
         let key = state.intern_str("os");
         let val = state.globals.get(&key);
         assert!(val.is_some(), "os must be registered");

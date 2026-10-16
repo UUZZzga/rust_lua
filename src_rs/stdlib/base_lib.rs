@@ -20,6 +20,9 @@ use crate::gc::GCObjectHeader;
 use crate::objects::{LClosure, NilKind, Proto, TValue, UpVal, UpValVec};
 use crate::state::LuaState;
 use crate::strings::{lua_string_as_str, lua_string_eq, lua_string_len};
+// 生产路径一律经 `LuaState::new_table` / `LuaState::table_set`；裸 `Table` 名仅剩测试模块使用
+// （测试经 `use super::*` 取用）。
+#[cfg(test)]
 use crate::table::Table;
 use std::rc::Rc;
 
@@ -1100,20 +1103,16 @@ fn call_rawset<'a>(
     }
 
     // 原地修改栈上的表 (对应 C 的直接操作栈)
-    let result = {
-        let arg1_ref = &mut state.stack[a + 1];
-        match arg1_ref {
-            TValue::Table(t) => {
-                t.set(k, v);
-                state.stack[a + 1].clone()
-            }
-            _ => {
-                return Err(VmError::RuntimeError(
-                    "bad argument #1 to 'rawset' (table expected)".to_string(),
-                ));
-            }
+    let table = match &state.stack[a + 1] {
+        TValue::Table(t) => t.clone(),
+        _ => {
+            return Err(VmError::RuntimeError(
+                "bad argument #1 to 'rawset' (table expected)".to_string(),
+            ));
         }
     };
+    state.table_set(&table, k, v)?;
+    let result = state.stack[a + 1].clone();
 
     push_single_result(state, a, nresults, result);
     Ok(())
@@ -1643,7 +1642,7 @@ fn call_require<'a>(
     let global_key = state.intern_str(&modname);
     if let Some(val) = state.globals.get(&global_key) {
         if !matches!(val, TValue::Nil(_)) {
-            cache_module_loaded(state, &modname, val.clone());
+            cache_module_loaded(state, &modname, val.clone())?;
             push_results(state, a, nresults, vec![val]);
             return Ok(());
         }
@@ -1702,7 +1701,7 @@ fn run_loader<'a>(
     } else {
         result
     };
-    cache_module_loaded(state, modname, result.clone());
+    cache_module_loaded(state, modname, result.clone())?;
     push_results(
         state,
         a,
@@ -1773,11 +1772,11 @@ fn load_lua_module<'a>(
         }
     } else {
         // loader 返回非 nil — 缓存到 package.loaded
-        cache_module_loaded(state, modname, result.clone());
+        cache_module_loaded(state, modname, result.clone())?;
         result
     };
     // 确保最终结果也缓存
-    cache_module_loaded(state, modname, result.clone());
+    cache_module_loaded(state, modname, result.clone())?;
     push_results(
         state,
         a,
@@ -2085,15 +2084,28 @@ fn lookforfunc<'a>(
         let clibs = match state.registry.get(&clibs_key) {
             Some(TValue::Table(t)) => t,
             _ => {
-                let new_clibs = Table::new_in(state.alloc_slot());
-                unsafe { state.gc_mut().register_table(&new_clibs) };
+                // 分配/写入失败 → 紧急 GC 重试 → 内存错误；映射为模块加载错误
+                // （C 侧 `luaM_error` 直接抛出 LUA_ERRMEM，此处保留可传播的错误串）。
+                let new_clibs = state
+                    .new_table()
+                    .map_err(|e| LoadlibError::LibNotFound(e.to_string()))?;
                 state
-                    .registry
-                    .set(clibs_key.clone(), TValue::Table(new_clibs.clone()));
+                    .register_table(&new_clibs)
+                    .map_err(|e| LoadlibError::LibNotFound(e.to_string()))?;
+                let registry = state.registry.clone();
+                state
+                    .table_set(
+                        &registry,
+                        clibs_key.clone(),
+                        TValue::Table(new_clibs.clone()),
+                    )
+                    .map_err(|e| LoadlibError::LibNotFound(e.to_string()))?;
                 new_clibs
             }
         };
-        clibs.set(path_key, TValue::LightUserData(lib_handle));
+        state
+            .table_set(&clibs, path_key, TValue::LightUserData(lib_handle))
+            .map_err(|e| LoadlibError::LibNotFound(e.to_string()))?;
     }
 
     // sym == "*" 仅加载库
@@ -2262,15 +2274,20 @@ fn call_searcher_placeholder<'a>(
 }
 
 /// 缓存模块到 package.loaded[modname]
-fn cache_module_loaded<'a>(state: &mut LuaState<'a>, modname: &str, val: TValue<'a>) {
+fn cache_module_loaded<'a>(
+    state: &mut LuaState<'a>,
+    modname: &str,
+    val: TValue<'a>,
+) -> Result<(), VmError<'a>> {
     let loaded_key = state.intern_str("loaded");
     let mod_key = state.intern_str(modname);
     if let Some(package_table) = get_package_table(state) {
         if let Some(TValue::Table(loaded_table)) = package_table.get(&loaded_key) {
             // Table 共享数据 (Rc<RefCell>),直接 set 即可同步到 package.loaded
-            loaded_table.set(mod_key, val);
+            state.table_set(&loaded_table, mod_key, val)?;
         }
     }
+    Ok(())
 }
 
 /// 读取路径环境变量 — 对应 C loadlib.cpp 的 setpath
@@ -2315,22 +2332,22 @@ fn setpath<'a>(state: &LuaState<'a>, envname: &str, dft: &str) -> String {
 
 /// 初始化 package 表:设置 path/cpath/loaded/preload/loadlib/searchpath/searchers/config
 /// 对应 C loadlib.cpp 的 luaopen_package
-fn init_package_table<'a>(state: &mut LuaState<'a>) {
+fn init_package_table<'a>(state: &mut LuaState<'a>) -> Result<(), VmError<'a>> {
     let package_key = state.intern_str("package");
-    let pkg = Table::new_in(state.alloc_slot());
-    let loaded = Table::new_in(state.alloc_slot());
+    let pkg = state.new_table()?;
+    let loaded = state.new_table()?;
     // registry._LOADED 和 package.loaded 共享同一个 Rc 引用（对应 C luaopen_package）
     let loaded_shared = loaded.clone();
-    unsafe { state.gc_mut().register_table(&loaded) };
-    pkg.set(state.intern_str("loaded"), TValue::Table(loaded));
+    state.register_table(&loaded)?;
+    state.table_set(&pkg, state.intern_str("loaded"), TValue::Table(loaded))?;
     // preload 表 — 对应 registry[LUA_PRELOAD_TABLE]
-    let preload = Table::new_in(state.alloc_slot());
-    unsafe { state.gc_mut().register_table(&preload) };
-    pkg.set(state.intern_str("preload"), TValue::Table(preload));
+    let preload = state.new_table()?;
+    state.register_table(&preload)?;
+    state.table_set(&pkg, state.intern_str("preload"), TValue::Table(preload))?;
     let path = setpath(state, "LUA_PATH", "./?.lua;./?/init.lua");
-    pkg.set(state.intern_str("path"), state.intern_str(&path));
+    state.table_set(&pkg, state.intern_str("path"), state.intern_str(&path))?;
     let cpath = setpath(state, "LUA_CPATH", crate::config::CPATH_DEFAULT);
-    pkg.set(state.intern_str("cpath"), state.intern_str(&cpath));
+    state.table_set(&pkg, state.intern_str("cpath"), state.intern_str(&cpath))?;
     // config 字段 — 对应 C 的 package.config: DIRSEP \n PATH_SEP \n PATH_MARK \n EXEC_DIR \n IGMARK \n
     // Windows 用 \ 作目录分隔符 (对应 LUA_USE_WINDOWS 的 LUA_DIRSEP)
     let config = formatcp!(
@@ -2341,23 +2358,25 @@ fn init_package_table<'a>(state: &mut LuaState<'a>) {
         crate::config::EXEC_DIR,
         crate::config::IG_MARK
     );
-    pkg.set(state.intern_str("config"), state.intern_str(config));
+    state.table_set(&pkg, state.intern_str("config"), state.intern_str(config))?;
     // loadlib 函数 — BuiltinFn 注册
-    pkg.set(
+    state.table_set(
+        &pkg,
         state.intern_str("loadlib"),
         TValue::BuiltinFn(crate::objects::BuiltinFn::impure(
             call_loadlib,
             c"loadlib".as_ptr() as *const u8,
         )),
-    );
+    )?;
     // searchpath 函数 — BuiltinFn 注册
-    pkg.set(
+    state.table_set(
+        &pkg,
         state.intern_str("searchpath"),
         TValue::BuiltinFn(crate::objects::BuiltinFn::impure(
             call_searchpath,
             c"searchpath".as_ptr() as *const u8,
         )),
-    );
+    )?;
     // searchers 表 — 对应 C createsearcherstable (loadlib.cpp:703)
     // 包含 4 个 searcher 占位函数 (preload/Lua/C/Croot)
     // 当前 call_require 硬编码搜索逻辑,不遍历 package.searchers 表;
@@ -2369,28 +2388,45 @@ fn init_package_table<'a>(state: &mut LuaState<'a>) {
             name.as_ptr() as *const u8,
         ))
     };
-    let searchers = Table::new_in(state.alloc_slot());
-    searchers.set(TValue::Integer(1), make_searcher(c"searcher_preload"));
-    searchers.set(TValue::Integer(2), make_searcher(c"searcher_Lua"));
-    searchers.set(TValue::Integer(3), make_searcher(c"searcher_C"));
-    searchers.set(TValue::Integer(4), make_searcher(c"searcher_Croot"));
-    unsafe { state.gc_mut().register_table(&searchers) };
-    pkg.set(state.intern_str("searchers"), TValue::Table(searchers));
-    unsafe { state.gc_mut().register_table(&pkg) };
-    state
-        .globals
-        .set(package_key.clone(), TValue::Table(pkg.clone()));
+    let searchers = state.new_table()?;
+    state.table_set(
+        &searchers,
+        TValue::Integer(1),
+        make_searcher(c"searcher_preload"),
+    )?;
+    state.table_set(
+        &searchers,
+        TValue::Integer(2),
+        make_searcher(c"searcher_Lua"),
+    )?;
+    state.table_set(&searchers, TValue::Integer(3), make_searcher(c"searcher_C"))?;
+    state.table_set(
+        &searchers,
+        TValue::Integer(4),
+        make_searcher(c"searcher_Croot"),
+    )?;
+    state.register_table(&searchers)?;
+    state.table_set(
+        &pkg,
+        state.intern_str("searchers"),
+        TValue::Table(searchers),
+    )?;
+    state.register_table(&pkg)?;
+    let globals = state.globals.clone();
+    state.table_set(&globals, package_key.clone(), TValue::Table(pkg.clone()))?;
     // 同时在 registry 中保存 package 表引用 — 对应 C 版 ll_require 通过
     // upvalue 访问 package 表。这样 Lua 代码 `package = {}` 重置全局变量后，
     // require 仍能访问注册时的 package 表（含 loaded/preload/searchers）。
     let registry_pkg_key = state.intern_str("_PACKAGE");
-    state.registry.set(registry_pkg_key, TValue::Table(pkg));
+    let registry = state.registry.clone();
+    state.table_set(&registry, registry_pkg_key, TValue::Table(pkg))?;
     // registry._LOADED = package.loaded (同一个 Rc 引用，对应 C luaopen_package)
     // C 代码 (如 lauxlib.cpp pushglobalfuncname) 通过 lua_getfield(LUA_REGISTRYINDEX, "_LOADED")
     // 访问 loaded 表，必须在 registry 中建立 _LOADED -> loaded 的映射。
-    unsafe { state.gc_mut().register_table(&loaded_shared) };
+    state.register_table(&loaded_shared)?;
     let loaded_key = state.intern_str("_LOADED");
-    state.registry.set(loaded_key, TValue::Table(loaded_shared));
+    state.table_set(&registry, loaded_key, TValue::Table(loaded_shared))?;
+    Ok(())
 }
 
 /// 从 registry 读取注册时的 package 表 — 对应 C 版 require 函数的 upvalue(1)
@@ -2676,14 +2712,11 @@ fn call_load<'a>(
                         value: TValue::Nil(NilKind::Strict),
                     })));
             }
-            let closure = crate::alloc::MyRc::new_in(
-                state.alloc_slot(),
-                LClosure {
-                    gc_header: GCObjectHeader::new(),
-                    proto: Rc::new(proto),
-                    upvals,
-                },
-            );
+            let closure = state.new_object(LClosure {
+                gc_header: GCObjectHeader::new(),
+                proto: Rc::new(proto),
+                upvals,
+            })?;
             push_results(state, a, nresults, vec![TValue::LClosure(closure)]);
             Ok(())
         }
@@ -3296,7 +3329,7 @@ fn call_collectgarbage<'a>(
 /// 对应 C 源码 lbaselib.cpp 的 luaopen_base 函数:
 /// 1. 注册所有基础函数到全局表 (使用 BuiltinFn 函数指针)
 /// 2. 设置 _G 和 _VERSION
-pub fn open_base_lib<'a>(state: &mut LuaState<'a>) {
+pub fn open_base_lib<'a>(state: &mut LuaState<'a>) -> Result<(), VmError<'a>> {
     // 注册所有基础库函数 (使用 BuiltinFn 函数指针)
     //
     // 安全: 必须经 BuiltinFn::impure 构造 — 原始字面量会把 CStr 打包地址的
@@ -3304,65 +3337,70 @@ pub fn open_base_lib<'a>(state: &mut LuaState<'a>) {
     // 导致 print/pcall 等按地址随机被判定为 pure, 丢失 CallInfoEntry 调试信息。
     let register = |state: &mut LuaState<'a>,
                     name: &'static std::ffi::CStr,
-                    func: crate::objects::BuiltinFnPtr| {
+                    func: crate::objects::BuiltinFnPtr|
+     -> Result<(), VmError<'a>> {
         let key = state.intern(name.to_str().unwrap_or(""));
         let name_ptr = name.as_ptr() as *const u8;
-        state.globals.set(
+        let globals = state.globals.clone();
+        state.table_set(
+            &globals,
             key,
             crate::objects::BuiltinFn::impure_tvalue(func, name_ptr),
-        );
+        )
     };
 
     // 基础库函数
-    register(state, c"print", call_print);
-    register(state, c"setmetatable", call_setmetatable);
-    register(state, c"getmetatable", call_getmetatable);
-    register(state, c"type", call_type);
-    register(state, c"pcall", call_pcall);
-    register(state, c"error", call_error);
-    register(state, c"tonumber", call_tonumber);
-    register(state, c"tostring", call_tostring);
-    register(state, c"assert", call_assert);
+    register(state, c"print", call_print)?;
+    register(state, c"setmetatable", call_setmetatable)?;
+    register(state, c"getmetatable", call_getmetatable)?;
+    register(state, c"type", call_type)?;
+    register(state, c"pcall", call_pcall)?;
+    register(state, c"error", call_error)?;
+    register(state, c"tonumber", call_tonumber)?;
+    register(state, c"tostring", call_tostring)?;
+    register(state, c"assert", call_assert)?;
     // perf: select 登记为 pure — 不回调 Lua / 不 yield / 参数错误返回 Err,
     // op_call 走零簿记快速路径 (vararg 调用 select('#', ...) / select(n, ...) 热路径)。
     // pure 标志内嵌 BuiltinFn.pure 字段 (原 state.pure_fns HashSet 查询每次
     // 调用 2 个非内联 call)。
     {
         let key = state.intern_str("select");
-        state.globals.set(
+        let globals = state.globals.clone();
+        state.table_set(
+            &globals,
             key,
             TValue::BuiltinFn(crate::objects::BuiltinFn::pure_fn(
                 call_select,
                 c"select".as_ptr() as *const u8,
             )),
-        );
+        )?;
     }
-    register(state, c"rawequal", call_rawequal);
-    register(state, c"rawlen", call_rawlen);
-    register(state, c"rawget", call_rawget);
-    register(state, c"rawset", call_rawset);
-    register(state, c"next", call_next);
-    register(state, c"ipairs", call_ipairs);
-    register(state, c"pairs", call_pairs);
-    register(state, c"xpcall", call_xpcall);
-    register(state, c"warn", call_warn);
-    register(state, c"require", call_require);
-    register(state, c"load", call_load);
-    register(state, c"collectgarbage", call_collectgarbage);
-    register(state, c"dofile", call_dofile);
-    register(state, c"loadfile", call_loadfile);
+    register(state, c"rawequal", call_rawequal)?;
+    register(state, c"rawlen", call_rawlen)?;
+    register(state, c"rawget", call_rawget)?;
+    register(state, c"rawset", call_rawset)?;
+    register(state, c"next", call_next)?;
+    register(state, c"ipairs", call_ipairs)?;
+    register(state, c"pairs", call_pairs)?;
+    register(state, c"xpcall", call_xpcall)?;
+    register(state, c"warn", call_warn)?;
+    register(state, c"require", call_require)?;
+    register(state, c"load", call_load)?;
+    register(state, c"collectgarbage", call_collectgarbage)?;
+    register(state, c"dofile", call_dofile)?;
+    register(state, c"loadfile", call_loadfile)?;
 
     // 设置 _G 全局变量 (指向全局表自身)
     let globals_clone = state.globals.clone();
     let g_key = state.intern_str("_G");
-    state.globals.set(g_key, TValue::Table(globals_clone));
+    state.table_set(&globals_clone, g_key, TValue::Table(globals_clone.clone()))?;
 
     // 设置 _VERSION 全局变量
     let version_key = state.intern_str("_VERSION");
-    state.globals.set(version_key, state.intern_str("Lua 5.5"));
+    state.table_set(&globals_clone, version_key, state.intern_str("Lua 5.5"))?;
 
     // 初始化 package 表 (path + loaded),支持 require 从文件加载模块
-    init_package_table(state);
+    init_package_table(state)
 }
 
 // ============================================================================
@@ -3680,7 +3718,7 @@ mod tests {
     #[test]
     fn test_open_base_lib_registers_functions() {
         let mut state = LuaState::default();
-        open_base_lib(&mut state);
+        open_base_lib(&mut state).expect("打开 base 库失败");
         // 验证所有基础库函数注册为 BuiltinFn
         for name in &[
             "print",
@@ -3722,7 +3760,7 @@ mod tests {
     #[test]
     fn test_open_base_lib_registers_version() {
         let mut state = LuaState::default();
-        open_base_lib(&mut state);
+        open_base_lib(&mut state).expect("打开 base 库失败");
         let key = state.intern_str("_VERSION");
         let val = state.globals.get(&key);
         assert!(val.is_some(), "_VERSION must be registered");
@@ -3734,7 +3772,7 @@ mod tests {
     #[test]
     fn test_open_base_lib_registers_g() {
         let mut state = LuaState::default();
-        open_base_lib(&mut state);
+        open_base_lib(&mut state).expect("打开 base 库失败");
         let key = state.intern_str("_G");
         let val = state.globals.get(&key);
         assert!(val.is_some(), "_G must be registered");

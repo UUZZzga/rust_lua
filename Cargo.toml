@@ -40,7 +40,12 @@ path = "tests_rs/base_lib_tests.rs"
 name = "math_lib_tests"
 path = "tests_rs/math_lib_tests.rs"
 
+[[test]]
+name = "alloc_failure_tests"
+path = "tests_rs/alloc_failure_tests.rs"
+
 [features]
+# 【临时诊断】大额分配跟踪（定位内存耗尽时仍 abort 的分配点，用完即删）
 default = ["fast_unsafe"]
 # ---- 数值类型配置 (对应 luaconf.h 的 LUA_INT_TYPE / LUA_FLOAT_TYPE) ----
 # 默认 (不启用下列 feature) = C 的默认配置: 64 位整数 (long long) + double。

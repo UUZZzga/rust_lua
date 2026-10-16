@@ -138,6 +138,13 @@ pub enum VmError<'a> {
     /// 非字符串错误值 — error() 传入非字符串参数时使用，保留原始 TValue
     /// 对应 C Lua 中 errfunc 为非字符串时的行为
     RuntimeErrorValue(TValue<'a>),
+    /// 内存分配失败 — 对应 C 的 `LUA_ERRMEM`（`luaM_error(L)` = `luaD_throw(L, LUA_ERRMEM)`）。
+    ///
+    /// **无负载**：错误对象用 `GlobalState.memerrmsg`（状态创建时预分配的字符串，
+    /// 对应 C 的 `G(L)->memerrmsg`，见 lstring.c `luaS_newliteral(L, MEMERRMSG)`），
+    /// 因为构造/传播这条错误时内存已经耗尽可能再次失败（C 的 `luaD_seterrorobj`
+    /// 对 LUA_ERRMEM 同样复用预注册的消息，不做任何分配）。
+    MemoryError,
     /// 协程 yield 信号 — 携带 yield 的值（非真实错误，由 execute_loop 转换为 VmResult::Yield）
     Yield(Vec<TValue<'a>>),
 }
@@ -150,6 +157,8 @@ impl<'a> std::fmt::Display for VmError<'a> {
             VmError::IllegalOpcode(op) => write!(f, "illegal opcode: {}", op),
             VmError::RuntimeError(msg) => write!(f, "runtime error: {}", msg),
             VmError::RuntimeErrorValue(_) => write!(f, "runtime error (non-string value)"),
+            // 与 C 的 MEMERRMSG（lstring.h）逐字一致 —— Lua 脚本据此匹配
+            VmError::MemoryError => write!(f, "{}", crate::strings::MEMERRMSG),
             VmError::Yield(_) => write!(f, "yield"),
         }
     }
@@ -1731,6 +1740,17 @@ impl VmExecutor {
         const LEVELS1: usize = 10;
         const LEVELS2: usize = 11;
 
+        // 内存错误：消息是预注册的固定文本（C 的 luaD_seterrorobj 对 LUA_ERRMEM
+        // 直接复用 G(L)->memerrmsg，不加 source:line 前缀），且此处**不做任何分配** ——
+        // 报内存错误时再分配就可能再次失败（traceback 也一并不构建）。
+        if matches!(error, VmError::MemoryError) {
+            state.last_error_is_memerr.set(true);
+            state.set_memerrmsg_text();
+            state.last_traceback.clear();
+            return;
+        }
+        state.last_error_is_memerr.set(false);
+
         let mut trace = String::from("stack traceback:");
 
         // 获取当前帧的源、行号和闭包
@@ -2327,14 +2347,17 @@ impl VmExecutor {
         }
         #[cfg(feature = "fast_unsafe")]
         {
-            let stack = &mut state.stack;
-            let old_len = stack.len();
+            let old_len = state.stack.len();
             if new_len <= old_len {
                 return;
             }
-            if stack.capacity() < new_len {
-                stack.reserve(new_len - old_len);
+            // 栈扩容经漏斗: 失败 → 紧急全量 GC → 重试 → 内存错误 (对应 C 的
+            // luaD_growstack → luaM_reallocvector → luaM_error)。本函数无错误通道,
+            // 故用 raise_memory_error (panic / longjmp) 把错误交给最近保护点。
+            if state.stack.capacity() < new_len {
+                state.grow_stack_or_throw(new_len - old_len);
             }
+            let stack = &mut state.stack;
             // SAFETY: capacity >= new_len, old_len..new_len 范围内的内存已分配。
             // 用 ptr::write 而非 slice::fill: slice::fill 的 clone_from 会 drop 旧值,
             // 但此处的旧值可能已被 fast_truncate_stack 跳过 drop (set_len),
@@ -3867,38 +3890,41 @@ impl VmExecutor {
         // perf 快速路径: table 无元表且 key 非 nil/NaN 时直接用 Table::set + GC barrier,
         // 跳过 table_set 包装层 (t.get(&key) 预检查 + 元方法查找 + MAXTAGLOOP 循环)。
         // nil/NaN key 必须走慢速路径以返回 "table index is nil/NaN" 错误 (attrib.lua:438)。
-        let fast_done = {
+        // 取出表句柄（Rc 计数 +1）：随后的写入漏斗需要 `&mut LuaState`，
+        // 不能再持有 `&state.stack` 的借用。
+        let fast_t = {
             let stack = &state.stack;
             if a < stack.len() && b < stack.len() {
-                if let TValue::Table(t) = &stack[a] {
-                    if !t.has_metatable() {
-                        // nil/NaN key 走慢速路径报错 (attrib.lua:438)
-                        // 用单个 match 一次读取 discriminant, 比两个独立 matches! 更高效
-                        let key = &stack[b];
-                        let key_ok = match key {
-                            TValue::Nil(_) => false,
-                            TValue::Float(f) => !f.is_nan(),
-                            _ => true,
-                        };
-                        if key_ok {
-                            t.set(stack[b].clone(), val_opt.take().unwrap());
-                            // GC barrier — 与 table_set 的 key_exists 路径一致
-                            if let Some(tid) = t.data.borrow().gc_header.id() {
-                                unsafe { state.gc_mut().barrier_back(tid) };
-                            }
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
+                match &stack[a] {
+                    TValue::Table(t) if !t.has_metatable() => Some(t.clone()),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+        };
+        let fast_done = match fast_t {
+            Some(t) => {
+                // nil/NaN key 走慢速路径报错 (attrib.lua:438)
+                // 用单个 match 一次读取 discriminant, 比两个独立 matches! 更高效
+                let key_ok = match &state.stack[b] {
+                    TValue::Nil(_) => false,
+                    TValue::Float(f) => !f.is_nan(),
+                    _ => true,
+                };
+                if key_ok {
+                    let key = state.stack[b].clone();
+                    state.table_set(&t, key, val_opt.take().unwrap())?;
+                    // GC barrier — 与 table_set 的 key_exists 路径一致
+                    if let Some(tid) = t.data.borrow().gc_header.id() {
+                        unsafe { state.gc_mut().barrier_back(tid) };
                     }
+                    true
                 } else {
                     false
                 }
-            } else {
-                false
             }
+            None => false,
         };
         if fast_done {
             return Ok(());
@@ -3930,25 +3956,26 @@ impl VmExecutor {
         let mut val_opt = Some(Self::resolve_val(state, inst, c));
         // perf 快速路径: table 无元表时直接用 Table::set + GC barrier, 跳过 table_set 包装层
         // (t.get(&key) 预检查 + 元方法查找 + MAXTAGLOOP 循环)。
-        let fast_done = {
+        let fast_t = {
             let stack = &state.stack;
             if a < stack.len() {
-                if let TValue::Table(t) = &stack[a] {
-                    if !t.has_metatable() {
-                        t.set(TValue::Integer(b), val_opt.take().unwrap());
-                        if let Some(tid) = t.data.borrow().gc_header.id() {
-                            unsafe { state.gc_mut().barrier_back(tid) };
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
+                match &stack[a] {
+                    TValue::Table(t) if !t.has_metatable() => Some(t.clone()),
+                    _ => None,
                 }
             } else {
-                false
+                None
             }
+        };
+        let fast_done = match fast_t {
+            Some(t) => {
+                state.table_set_int(&t, b, val_opt.take().unwrap())?;
+                if let Some(tid) = t.data.borrow().gc_header.id() {
+                    unsafe { state.gc_mut().barrier_back(tid) };
+                }
+                true
+            }
+            None => false,
         };
         if fast_done {
             return Ok(());
@@ -3985,25 +4012,26 @@ impl VmExecutor {
                 .unwrap_or(TValue::Nil(NilKind::Strict)),
         );
         // perf 快速路径: table 无元表时直接用 Table::set + GC barrier
-        let fast_done = {
+        let fast_t = {
             let stack = &state.stack;
             if a < stack.len() {
-                if let TValue::Table(t) = &stack[a] {
-                    if !t.has_metatable() {
-                        t.set(key_opt.take().unwrap(), val_opt.take().unwrap());
-                        if let Some(tid) = t.data.borrow().gc_header.id() {
-                            unsafe { state.gc_mut().barrier_back(tid) };
-                        }
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    false
+                match &stack[a] {
+                    TValue::Table(t) if !t.has_metatable() => Some(t.clone()),
+                    _ => None,
                 }
             } else {
-                false
+                None
             }
+        };
+        let fast_done = match fast_t {
+            Some(t) => {
+                state.table_set(&t, key_opt.take().unwrap(), val_opt.take().unwrap())?;
+                if let Some(tid) = t.data.borrow().gc_header.id() {
+                    unsafe { state.gc_mut().barrier_back(tid) };
+                }
+                true
+            }
+            None => false,
         };
         if fast_done {
             return Ok(());
@@ -4037,8 +4065,8 @@ impl VmExecutor {
         let array_size = c as usize;
         state.maybe_collect_gc();
         // TableData 块经 MemState allocator 分配（对应 C 的 luaM_new(L, Table)）
-        let table = Table::with_capacity_in(state.alloc_slot(), array_size, hash_size as usize);
-        unsafe { state.gc_mut().register_table(&table) };
+        let table = state.new_table_with_capacity(array_size, hash_size as usize)?;
+        state.register_table(&table)?;
         Self::write_stack(state, a, TValue::Table(table));
         state.pc += 1;
         Ok(())
@@ -6046,7 +6074,7 @@ impl VmExecutor {
         // lua_gettop 返回值偏移）。C 函数需要空间时通过 lua_checkstack 或
         // lua_pushxxx 自动扩展栈。
         if state.stack.capacity() < state.stack.len() + LUA_MINSTACK {
-            state.stack.reserve(LUA_MINSTACK);
+            state.grow_stack_or_throw(LUA_MINSTACK);
         }
         // 调用 C 函数: n = f(L)
         // 捕获 lua_error 抛出的错误:
@@ -7339,7 +7367,7 @@ impl VmExecutor {
             for i in 0..n_actual {
                 let val = Self::read_stack(state, ra + 1 + i).clone();
                 let pos = last - n_actual + i;
-                t.set_int((pos + 1) as LuaInteger, val);
+                state.table_set_int(&t, (pos + 1) as LuaInteger, val)?;
             }
             // 表可能已增长（array.push / hash.insert），更新 GC 估算大小
             if let Some(id) = t.data.borrow().gc_header.id() {
@@ -7410,22 +7438,17 @@ impl VmExecutor {
             // GC: 在创建新闭包前检查 GC 阈值，回收不可达的旧闭包。
             // 对应 C Lua 的 luaC_checkGC（OP_CLOSURE 中调用 luaC_checkGC(L)）。
             state.maybe_collect_gc();
-            let closure = MyRc::new_in(
-                state.alloc_slot(),
-                LClosure {
-                    gc_header: crate::gc::GCObjectHeader::new(),
-                    proto,
-                    upvals,
-                },
-            );
+            let closure = state.new_object(LClosure {
+                gc_header: crate::gc::GCObjectHeader::new(),
+                proto,
+                upvals,
+            })?;
             // 注册到 GC metas，使 gc_estimate 增长，让 maybe_collect_gc 的阈值检查能正常工作
             // 用 gc_mem_size() 计费含 upvals 容量，比 size_of::<LClosure>() 更接近真实占用
-            let closure_id = unsafe {
-                state.gc_mut().register_object(
-                    closure.gc_mem_size(),
-                    WeakValue::LClosure(closure.downgrade()),
-                )
-            };
+            let closure_id = state.register_object(
+                closure.gc_mem_size(),
+                WeakValue::LClosure(closure.downgrade()),
+            )?;
             closure.gc_header.set_id(closure_id);
             Self::write_stack(state, ra, TValue::LClosure(closure));
         }
@@ -7674,15 +7697,15 @@ impl VmExecutor {
             // PF_VATAB: 创建 vararg 表
             // 变参在 state.base + nfixparams .. state.base + nfixparams + nextra
             let vatab_pos = state.base + nfixparams;
-            let table = Table::with_capacity_in(state.alloc_slot(), nextra, 1);
+            let table = state.new_table_with_capacity(nextra, 1)?;
             for i in 0..nextra {
                 let val = state.stack[vatab_pos + i].clone();
-                table.set_int((i + 1) as LuaInteger, val);
+                state.table_set_int(&table, (i + 1) as LuaInteger, val)?;
             }
             // t.n = nextra
             let key_n = state.string_table.intern_value("n");
-            table.set(key_n, TValue::Integer(nextra as LuaInteger));
-            unsafe { state.gc_mut().register_table(&table) };
+            state.table_set(&table, key_n, TValue::Integer(nextra as LuaInteger))?;
+            state.register_table(&table)?;
             // 把表放到 vatab_pos 位置，截断后续
             // nextra=0 时 vatab_pos 可能等于 stack_len，需要先扩展栈
             while state.stack.len() <= vatab_pos {
@@ -8010,8 +8033,8 @@ impl VmExecutor {
                         .map_or(false, |v| !matches!(v, TValue::Nil(_)));
 
                     if key_exists {
-                        // key 已存在: 直接设置
-                        t.set(key, val);
+                        // key 已存在: 直接设置（漏斗：扩容失败先紧急 GC 再重试）
+                        state.table_set(t, key, val)?;
                         // GC barrier
                         let tid = t.data.borrow().gc_header.id();
                         if let Some(tid) = tid {
@@ -8072,8 +8095,8 @@ impl VmExecutor {
                         _ => {}
                     }
 
-                    // 没有 __newindex 元方法: 直接设置
-                    t.set(key, val);
+                    // 没有 __newindex 元方法: 直接设置（漏斗：扩容失败先紧急 GC 再重试）
+                    state.table_set(t, key, val)?;
                     let tid = t.data.borrow().gc_header.id();
                     if let Some(tid) = tid {
                         unsafe {
@@ -8228,7 +8251,8 @@ mod tests {
                 crate::mem::AllocOwner::new(Box::new(crate::mem::DefaultAllocator)),
             ))),
             string_table,
-        );
+        )
+        .expect("测试: 构建 state 失败");
         VmExecutor::execute_loop(&mut state)
     }
 

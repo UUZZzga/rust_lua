@@ -14,7 +14,6 @@
 //! - io.lines / file:lines 返回的迭代器使用 RustClosure 携带 upvalues
 //!   (file_ptr_id, to_close, finished, formats...)
 
-use crate::alloc::MyRc;
 use crate::config::{LuaInteger, LuaNumber, LuaUnsigned};
 use crate::execute::VmError;
 use crate::objects::{BuiltinFn, NilKind, RustClosure, TValue, WeakValue};
@@ -232,7 +231,7 @@ fn new_file_userdata<'a>(
     state: &mut LuaState<'a>,
     file: *mut libc::FILE,
     file_mt: &Table<'a>,
-) -> TValue<'a> {
+) -> Result<TValue<'a>, VmError<'a>> {
     let udata = crate::objects::Udata {
         gc_header: crate::gc::GCObjectHeader::new(),
         nuvalue: 0,
@@ -243,17 +242,14 @@ fn new_file_userdata<'a>(
     };
     // 如果元表有 __gc，注册到 ud_finobj_list
     let gc_key = state.intern_str("__gc");
-    let ud_rc = MyRc::new_in(state.alloc_slot(), udata);
+    let ud_rc = state.new_object(udata)?;
     if file_mt.get(&gc_key).is_some() {
         state.g_mut().register_ud_finobj(&ud_rc);
     }
     // 注册到 GC 并设置 id（使 mark_tvalue 能正确标记 reachable）
     // 用 gc_mem_size() 计费含 data/user_values 容量，比 size_of::<Udata>() 更接近真实占用
-    let ud_id = unsafe {
-        state
-            .gc_mut()
-            .register_object(ud_rc.gc_mem_size(), WeakValue::UserData(ud_rc.downgrade()))
-    };
+    let ud_id =
+        state.register_object(ud_rc.gc_mem_size(), WeakValue::UserData(ud_rc.downgrade()))?;
     ud_rc.gc_header.set_id(ud_id);
     let ptr_id = ud_rc.gc_header.ptr_id;
     let value = TValue::UserData(ud_rc);
@@ -261,7 +257,7 @@ fn new_file_userdata<'a>(
         .file_handles
         .borrow_mut()
         .insert(ptr_id, value.clone());
-    value
+    Ok(value)
 }
 
 /// 检查文件模式是否合法 — 对应 C 的 l_checkmode
@@ -445,7 +441,7 @@ fn call_io_open<'a>(
             .registry
             .get(&state.intern_str(crate::config::FILEHANDLE));
         if let Some(TValue::Table(file_mt)) = file_mt {
-            results.push(new_file_userdata(state, f, &file_mt));
+            results.push(new_file_userdata(state, f, &file_mt)?);
         } else {
             return Err(VmError::RuntimeError(format!(
                 "{}: not a FILE* userdata",
@@ -479,7 +475,7 @@ fn call_io_tmpfile<'a>(
             .registry
             .get(&state.intern_str(crate::config::FILEHANDLE));
         if let Some(TValue::Table(file_mt)) = file_mt {
-            results.push(new_file_userdata(state, f, &file_mt));
+            results.push(new_file_userdata(state, f, &file_mt)?);
         } else {
             return Err(VmError::RuntimeError(format!(
                 "tmpfile: not a FILE* userdata",
@@ -563,7 +559,7 @@ fn call_io_popen<'a>(
             .registry
             .get(&state.intern_str(crate::config::FILEHANDLE));
         if let Some(TValue::Table(file_mt)) = file_mt {
-            let ud = new_file_userdata(state, f, &file_mt);
+            let ud = new_file_userdata(state, f, &file_mt)?;
             // 标记为 popen 文件，关闭时用 pclose
             if let TValue::UserData(ref u) = ud {
                 state.popen_handles.borrow_mut().insert(u.gc_header.ptr_id);
@@ -698,7 +694,11 @@ fn call_io_output<'a>(
                                                           // 保存到 io 表的 _current_output 字段
                     let io_key = state.intern_str("io");
                     if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
-                        io_table.set(state.intern_str("_current_output"), arg.clone());
+                        state.table_set(
+                            &io_table,
+                            state.intern_str("_current_output"),
+                            arg.clone(),
+                        )?;
                     }
                 }
                 s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
@@ -721,7 +721,7 @@ fn call_io_output<'a>(
                         .registry
                         .get(&state.intern_str(crate::config::FILEHANDLE));
                     if let Some(TValue::Table(file_mt)) = file_mt {
-                        let udata = new_file_userdata(state, f, &file_mt);
+                        let udata = new_file_userdata(state, f, &file_mt)?;
                         if let TValue::UserData(ref u) = udata {
                             state.io_output_handle.set(Some(u.gc_header.ptr_id));
                         }
@@ -729,7 +729,11 @@ fn call_io_output<'a>(
                         // 保存到 io 表的 _current_output 字段
                         let io_key = state.intern_str("io");
                         if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
-                            io_table.set(state.intern_str("_current_output"), udata.clone());
+                            state.table_set(
+                                &io_table,
+                                state.intern_str("_current_output"),
+                                udata.clone(),
+                            )?;
                         }
                     } else {
                         return Err(VmError::RuntimeError(format!(
@@ -799,7 +803,7 @@ fn call_io_input<'a>(
                         .registry
                         .get(&state.intern_str(crate::config::FILEHANDLE));
                     if let Some(TValue::Table(file_mt)) = file_mt {
-                        let udata = new_file_userdata(state, f, &file_mt);
+                        let udata = new_file_userdata(state, f, &file_mt)?;
                         if let TValue::UserData(ref u) = udata {
                             state.io_input_handle.set(Some(u.gc_header.ptr_id));
                         }
@@ -1769,11 +1773,11 @@ const LINES_UP_FORMATS_BASE: usize = 3;
 
 /// 构造 lines 迭代器的 RustClosure
 fn new_lines_iterator<'a>(
-    _state: &LuaState<'a>,
+    state: &mut LuaState<'a>,
     file_ptr_id: u32,
     to_close: bool,
     formats: Vec<TValue<'a>>,
-) -> TValue<'a> {
+) -> Result<TValue<'a>, VmError<'a>> {
     let mut upvalues = Vec::with_capacity(LINES_UP_FORMATS_BASE + formats.len());
     upvalues.push(TValue::Integer(file_ptr_id as LuaInteger));
     upvalues.push(TValue::Boolean(to_close));
@@ -1781,14 +1785,11 @@ fn new_lines_iterator<'a>(
     for fmt in formats {
         upvalues.push(fmt);
     }
-    TValue::RustClosure(MyRc::new_in(
-        _state.alloc_slot(),
-        RustClosure {
-            func: call_lines_iterator_fn,
-            name: c"lines iterator".as_ptr() as *const u8,
-            upvalues: Rc::new(RefCell::new(upvalues)),
-        },
-    ))
+    Ok(TValue::RustClosure(state.new_object(RustClosure {
+        func: call_lines_iterator_fn,
+        name: c"lines iterator".as_ptr() as *const u8,
+        upvalues: Rc::new(RefCell::new(upvalues)),
+    })?))
 }
 
 /// io.lines([filename, [fmt1, ...]]) — 创建行迭代器
@@ -1819,7 +1820,7 @@ fn call_io_lines<'a>(
         });
         // io.lines() 默认格式 "l"
         let formats = vec![(state.intern_str("l"))];
-        results.push(new_lines_iterator(state, ptr_id, false, formats));
+        results.push(new_lines_iterator(state, ptr_id, false, formats)?);
         state.adjust_results(a, nresults, results);
         return Ok(());
     }
@@ -1836,7 +1837,7 @@ fn call_io_lines<'a>(
         } else {
             vec![(state.intern_str("l"))]
         };
-        results.push(new_lines_iterator(state, ptr_id, false, formats));
+        results.push(new_lines_iterator(state, ptr_id, false, formats)?);
         state.adjust_results(a, nresults, results);
         return Ok(());
     }
@@ -1862,7 +1863,7 @@ fn call_io_lines<'a>(
                 .registry
                 .get(&state.intern_str(crate::config::FILEHANDLE));
             let udata = if let Some(TValue::Table(file_mt)) = file_mt {
-                new_file_userdata(state, f, &file_mt)
+                new_file_userdata(state, f, &file_mt)?
             } else {
                 return Err(VmError::RuntimeError(format!(
                     "{}: not a FILE* userdata",
@@ -1881,7 +1882,7 @@ fn call_io_lines<'a>(
             } else {
                 vec![(state.intern_str("l"))]
             };
-            let iter = new_lines_iterator(state, ptr_id, true, formats);
+            let iter = new_lines_iterator(state, ptr_id, true, formats)?;
             // toclose=1: 返回 4 个值 (迭代器, nil state, nil control, file to-be-closed)
             // 对应 C 的 io_lines: lua_pushnil(state); lua_pushnil(control);
             // lua_pushvalue(file); return 4;
@@ -1922,7 +1923,7 @@ fn call_file_lines<'a>(
     } else {
         vec![(state.intern_str("l"))]
     };
-    let result = new_lines_iterator(state, ptr_id, false, formats);
+    let result = new_lines_iterator(state, ptr_id, false, formats)?;
     state.adjust_results(a, nresults, vec![result]);
     Ok(())
 }
@@ -2234,47 +2235,56 @@ fn call_file_tostring<'a>(
 // 打开 I/O 库 — 对应 C 的 luaopen_io
 // ============================================================================
 
-pub fn open_io_lib<'a>(state: &mut LuaState<'a>) {
-    let mut lib = Table::new_in(state.alloc_slot());
+pub fn open_io_lib<'a>(state: &mut LuaState<'a>) -> Result<(), VmError<'a>> {
+    let mut lib = state.new_table()?;
 
     // 注册 BuiltinFn 的辅助闭包：用函数指针 + 名字注册到表
     // (state 作为参数传入，避免闭包捕获 state 导致借用冲突)
     let register = |table: &mut crate::table::Table<'a>,
-                    state: &LuaState<'a>,
+                    state: &mut LuaState<'a>,
                     name: &'static std::ffi::CStr,
-                    func: crate::objects::BuiltinFnPtr| {
+                    func: crate::objects::BuiltinFnPtr|
+     -> Result<(), VmError<'a>> {
         let key = state.intern(name.to_str().unwrap_or(""));
         let name_ptr = name.as_ptr() as *const u8;
-        table.set(key, BuiltinFn::impure_tvalue(func, name_ptr));
+        state.table_set(table, key, BuiltinFn::impure_tvalue(func, name_ptr))?;
+        Ok(())
     };
 
     // 创建 FILE* 元表 (对应 C 的 LUA_FILEHANDLE)
-    let mut file_mt = Table::new_in(state.alloc_slot());
+    let mut file_mt = state.new_table()?;
     let name_key = state.intern_str("__name");
     let key = state.intern_str(crate::config::FILEHANDLE);
-    file_mt.set(name_key, key.clone());
+    state.table_set(&file_mt, name_key, key.clone())?;
     // FILE* 元方法 (用 BuiltinFn 注册)
-    register(&mut file_mt, state, c"__gc", call_file_gc);
-    register(&mut file_mt, state, c"__close", call_file_close);
-    register(&mut file_mt, state, c"__tostring", call_file_tostring);
+    register(&mut file_mt, state, c"__gc", call_file_gc)?;
+    register(&mut file_mt, state, c"__close", call_file_close)?;
+    register(&mut file_mt, state, c"__tostring", call_file_tostring)?;
 
     // 创建 FILE* 方法表 (用 BuiltinFn 注册)
-    let mut file_methods = Table::new_in(state.alloc_slot());
-    register(&mut file_methods, state, c"close", call_file_close_method);
-    register(&mut file_methods, state, c"read", call_file_read);
-    register(&mut file_methods, state, c"write", call_file_write);
-    register(&mut file_methods, state, c"seek", call_file_seek);
-    register(&mut file_methods, state, c"lines", call_file_lines);
-    register(&mut file_methods, state, c"flush", call_file_flush);
-    register(&mut file_methods, state, c"setvbuf", call_file_setvbuf);
-    unsafe { state.gc_mut().register_table(&file_methods) };
-    file_mt.set(state.intern_str("__index"), TValue::Table(file_methods));
+    let mut file_methods = state.new_table()?;
+    register(&mut file_methods, state, c"close", call_file_close_method)?;
+    register(&mut file_methods, state, c"read", call_file_read)?;
+    register(&mut file_methods, state, c"write", call_file_write)?;
+    register(&mut file_methods, state, c"seek", call_file_seek)?;
+    register(&mut file_methods, state, c"lines", call_file_lines)?;
+    register(&mut file_methods, state, c"flush", call_file_flush)?;
+    register(&mut file_methods, state, c"setvbuf", call_file_setvbuf)?;
+    state.register_table(&file_methods)?;
+    state.table_set(
+        &file_mt,
+        state.intern_str("__index"),
+        TValue::Table(file_methods),
+    )?;
 
-    unsafe { state.gc_mut().register_table(&file_mt) };
-    state.registry.set(key, TValue::Table(file_mt.clone()));
+    state.register_table(&file_mt)?;
+    let reg = state.registry.clone();
+    state.table_set(&reg, key, TValue::Table(file_mt.clone()))?;
 
     // 注册标准流作为 FullUserData
-    let make_stream = |state: &mut LuaState<'a>, file: *mut libc::FILE| -> TValue {
+    let make_stream = |state: &mut LuaState<'a>,
+                       file: *mut libc::FILE|
+     -> Result<TValue<'a>, VmError<'a>> {
         let udata = crate::objects::Udata {
             gc_header: crate::gc::GCObjectHeader::new(),
             nuvalue: 0,
@@ -2283,48 +2293,46 @@ pub fn open_io_lib<'a>(state: &mut LuaState<'a>) {
             user_values: vec![],
             data: vec![file as u64],
         };
-        let ud = MyRc::new_in(state.alloc_slot(), udata);
-        let ud_id = unsafe {
-            state
-                .gc_mut()
-                .register_object(ud.gc_mem_size(), WeakValue::UserData(ud.downgrade()))
-        };
+        let ud = state.new_object(udata)?;
+        let ud_id = state.register_object(ud.gc_mem_size(), WeakValue::UserData(ud.downgrade()))?;
         ud.gc_header.set_id(ud_id);
         let ptr_id = ud.gc_header.ptr_id;
         let val = TValue::UserData(ud);
         state.file_handles.borrow_mut().insert(ptr_id, val.clone());
-        val
+        Ok(val)
     };
 
-    let stdin_val = make_stream(state, c_stdin());
-    let stdout_val = make_stream(state, c_stdout());
-    let stderr_val = make_stream(state, c_stderr());
+    let stdin_val = make_stream(state, c_stdin())?;
+    let stdout_val = make_stream(state, c_stdout())?;
+    let stderr_val = make_stream(state, c_stderr())?;
 
     let stdin_key = state.intern_str("stdin");
-    lib.set(stdin_key, stdin_val);
+    state.table_set(&lib, stdin_key, stdin_val)?;
 
     let stdout_key = state.intern_str("stdout");
-    lib.set(stdout_key, stdout_val);
+    state.table_set(&lib, stdout_key, stdout_val)?;
 
     let stderr_key = state.intern_str("stderr");
-    lib.set(stderr_key, stderr_val);
+    state.table_set(&lib, stderr_key, stderr_val)?;
 
     // 注册 io 库函数 (用 BuiltinFn 注册)
-    register(&mut lib, state, c"write", call_io_write);
-    register(&mut lib, state, c"output", call_io_output);
-    register(&mut lib, state, c"close", call_io_close);
-    register(&mut lib, state, c"input", call_io_input);
-    register(&mut lib, state, c"type", call_io_type);
-    register(&mut lib, state, c"open", call_io_open);
-    register(&mut lib, state, c"read", call_io_read);
-    register(&mut lib, state, c"lines", call_io_lines);
-    register(&mut lib, state, c"flush", call_io_flush);
-    register(&mut lib, state, c"tmpfile", call_io_tmpfile);
-    register(&mut lib, state, c"popen", call_io_popen);
+    register(&mut lib, state, c"write", call_io_write)?;
+    register(&mut lib, state, c"output", call_io_output)?;
+    register(&mut lib, state, c"close", call_io_close)?;
+    register(&mut lib, state, c"input", call_io_input)?;
+    register(&mut lib, state, c"type", call_io_type)?;
+    register(&mut lib, state, c"open", call_io_open)?;
+    register(&mut lib, state, c"read", call_io_read)?;
+    register(&mut lib, state, c"lines", call_io_lines)?;
+    register(&mut lib, state, c"flush", call_io_flush)?;
+    register(&mut lib, state, c"tmpfile", call_io_tmpfile)?;
+    register(&mut lib, state, c"popen", call_io_popen)?;
 
-    unsafe { state.gc_mut().register_table(&lib) };
+    state.register_table(&lib)?;
     let key = state.intern_str("io");
-    state.globals.set(key, TValue::Table(lib));
+    let g = state.globals.clone();
+    state.table_set(&g, key, TValue::Table(lib))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2335,7 +2343,7 @@ mod tests {
     #[cfg_attr(miri, ignore)] // Miri 不支持 _fdopen/stdin/stdout 等文件 I/O
     fn test_open_io_lib() {
         let mut state = LuaState::default();
-        open_io_lib(&mut state);
+        open_io_lib(&mut state).expect("打开 io 库失败");
         let key = state.intern_str("io");
         let val = state.globals.get(&key);
         assert!(val.is_some(), "io must be registered");

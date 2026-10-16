@@ -1120,19 +1120,44 @@ impl<'a> TableData<'a> {
         ktb.find(hash, |(k, _)| k == key).map(|(_, idx)| *idx)
     }
 
-    /// 索引插入 — key 必须不存在（insert_unique 不检查重复）
+    /// 索引写入前的容量预留 —— 保证 `key_to_bucket` 存在且还能容纳 1 个条目
+    /// （对应 C 的 `luaH_newkey` 里先 `rehash` 再写 Node 的纪律）。
+    ///
+    /// 分配失败返回 [`crate::mem::AllocFailed`]，表内容不变。
+    pub fn try_reserve_index(&mut self, _key: &TValue<'a>) -> Result<(), crate::mem::AllocFailed> {
+        match self.key_to_bucket.as_mut() {
+            Some(ktb) => ktb
+                .try_reserve(1, |(k, _)| tvalue_fx_hash(k))
+                .map_err(|_| crate::mem::AllocFailed),
+            None => {
+                // 索引盒子与 HashTable 缓冲区都沿用数组部分的 MemState allocator 槽
+                let alloc = *self.array.allocator();
+                let mut ktb = hashbrown::HashTable::with_capacity_in(0, alloc);
+                ktb.try_reserve(1, |(k, _)| tvalue_fx_hash(k))
+                    .map_err(|_| crate::mem::AllocFailed)?;
+                self.key_to_bucket = Some(
+                    crate::mem::AllocBox::try_new_in(ktb, alloc)
+                        .map_err(|_| crate::mem::AllocFailed)?,
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// 索引插入 — key 必须不存在（insert_unique 不检查重复）。
+    ///
+    /// 前置条件：`key_to_bucket` 已存在且能容纳新条目（[`TableData::try_reserve_index`]
+    /// 已成功）—— 即调用点不得在此处分配（否则内存耗尽时会 abort）。
     #[inline]
     pub fn idx_insert(&mut self, key: &TValue<'a>, idx: usize) {
-        if self.key_to_bucket.is_none() {
-            // 索引盒子与 HashTable 缓冲区都沿用数组部分的 MemState allocator 槽
-            let alloc = *self.array.allocator();
-            self.key_to_bucket = Some(crate::mem::AllocBox::new_in(
-                hashbrown::HashTable::with_capacity_in(0, alloc),
-                alloc,
-            ));
-        }
         let hash = tvalue_fx_hash(key);
-        let ktb = self.key_to_bucket.as_mut().unwrap();
+        let Some(ktb) = self.key_to_bucket.as_mut() else {
+            debug_assert!(
+                false,
+                "idx_insert: key_to_bucket 未就绪（缺少 try_reserve_index）"
+            );
+            return;
+        };
         ktb.insert_unique(hash, (key.clone(), idx), |(k, _)| tvalue_fx_hash(k));
     }
 
@@ -1281,8 +1306,19 @@ pub type TableDataWeak<'a> = WeakRc<RefCell<TableData<'a>>, SlotAlloc>;
 impl<'a> TableDataRc<'a> {
     /// 创建 TableData 共享块。`alloc` 为 MemState 分配器 [`SlotAlloc`]：
     /// 分配/释放均路由到该 allocator。
+    pub fn try_new_table(
+        alloc: SlotAlloc,
+        td: TableData<'a>,
+    ) -> Result<Self, crate::mem::AllocFailed> {
+        MyRc::try_new_in(alloc, RefCell::new(td)).map_err(|_| crate::mem::AllocFailed)
+    }
+
+    /// 【测试专用】分配失败即 panic 的便捷构造。
+    #[cfg(test)]
     pub fn new_table(alloc: SlotAlloc, td: TableData<'a>) -> Self {
-        MyRc::new_in(alloc, RefCell::new(td))
+        Self::try_new_table(alloc, td)
+            .ok()
+            .expect("TableDataRc::new_table: 测试分配失败")
     }
 }
 

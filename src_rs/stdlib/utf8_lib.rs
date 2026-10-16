@@ -15,7 +15,6 @@ use crate::execute::VmError;
 use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
 use crate::strings::lua_string_as_str;
-use crate::table::Table;
 
 // ============================================================================
 // 常量 (对应 C 源码的宏定义)
@@ -789,39 +788,46 @@ fn call_iter<'a>(
 /// 1. 创建 utf8 库函数表
 /// 2. 设置 charpattern 字段
 /// 3. 返回库表 (调用者负责注册到全局或 package.loaded)
-pub fn create_utf8_lib_table<'a>(state: &LuaState<'a>) -> crate::table::Table<'a> {
-    let mut lib = Table::new_in(state.alloc_slot());
+pub fn create_utf8_lib_table<'a>(
+    state: &mut LuaState<'a>,
+) -> Result<crate::table::Table<'a>, VmError<'a>> {
+    let mut lib = state.new_table()?;
 
     // 注册所有 UTF-8 函数 (使用 BuiltinFn 函数指针)
     let register = |lib: &mut crate::table::Table<'a>,
+                    state: &mut LuaState<'a>,
                     name: &'static std::ffi::CStr,
-                    func: crate::objects::BuiltinFnPtr| {
+                    func: crate::objects::BuiltinFnPtr|
+     -> Result<(), VmError<'a>> {
         let key = state.intern(name.to_str().unwrap_or(""));
         let name_ptr = name.as_ptr() as *const u8;
-        lib.set(key, BuiltinFn::impure_tvalue(func, name_ptr));
+        state.table_set(lib, key, BuiltinFn::impure_tvalue(func, name_ptr))
     };
 
-    register(&mut lib, c"offset", call_offset);
-    register(&mut lib, c"codepoint", call_codepoint);
-    register(&mut lib, c"char", call_char);
-    register(&mut lib, c"len", call_len);
-    register(&mut lib, c"codes", call_codes);
+    register(&mut lib, state, c"offset", call_offset)?;
+    register(&mut lib, state, c"codepoint", call_codepoint)?;
+    register(&mut lib, state, c"char", call_char)?;
+    register(&mut lib, state, c"len", call_len)?;
+    register(&mut lib, state, c"codes", call_codes)?;
 
     // 设置 charpattern 字段
     let pattern_str = unsafe { String::from_utf8_unchecked(UTF8PATT_BYTES.to_vec()) };
-    lib.set(
+    state.table_set(
+        &lib,
         state.intern_str("charpattern"),
         state.intern_str(&pattern_str),
-    );
-    unsafe { state.gc_mut().register_table(&lib) };
-    lib
+    )?;
+    state.register_table(&lib)?;
+    Ok(lib)
 }
 
 /// 打开 UTF-8 库并注册到全局变量 utf8
-pub fn open_utf8_lib(state: &mut LuaState) {
-    let lib = create_utf8_lib_table(state);
+pub fn open_utf8_lib<'a>(state: &mut LuaState<'a>) -> Result<(), VmError<'a>> {
+    let lib = create_utf8_lib_table(state)?;
     let key = state.intern_str("utf8");
-    state.globals.set(key, TValue::Table(lib));
+    let globals = state.globals.clone();
+    state.table_set(&globals, key, TValue::Table(lib))?;
+    Ok(())
 }
 
 // ============================================================================
@@ -835,7 +841,7 @@ mod tests {
     #[test]
     fn test_open_utf8_lib() {
         let mut state = LuaState::default();
-        open_utf8_lib(&mut state);
+        open_utf8_lib(&mut state).expect("打开 utf8 库失败");
         let key = state.intern_str("utf8");
         let val = state.globals.get(&key);
         assert!(val.is_some(), "utf8 must be registered");

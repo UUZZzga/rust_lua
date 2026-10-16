@@ -24,7 +24,7 @@ use std::os::windows::process::ExitStatusExt;
 fn run_lua(args: &[&str]) -> std::process::Output {
     let mut buff = lua_rs::mock::io_mock::BufferIo::new("");
     let success = {
-        let mut interpreter = Interpreter::new(&mut buff);
+        let mut interpreter = Interpreter::new(&mut buff).expect("创建 state 失败");
         let mut args_vec: Vec<String> = vec!["lua".to_string()];
         args_vec.extend(args.iter().map(|s| s.to_string()));
         interpreter.pmain(&args_vec)
@@ -455,8 +455,9 @@ fn leaked_bytes(src: &str) -> isize {
                 inner: DefaultAllocator,
                 live: live.clone(),
             }),
-        );
-        state.open_selected_libs(0, 0);
+        )
+        .expect("创建 state 失败");
+        state.open_selected_libs(0, 0).expect("打开标准库失败");
         assert_eq!(
             state.load_buffer(src, "=leak"),
             0,
@@ -876,7 +877,7 @@ fn test_version_contains_lua() {
 // ============================================================================
 
 fn make_str(s: &str) -> TValue<'static> {
-    let state = LuaState::default();
+    let state = LuaState::new_main(lua_rs::mock::io_mock::lua_io()).expect("创建 state 失败");
     state.intern_str(s)
 }
 
@@ -905,7 +906,7 @@ fn test_unit_base_type_name() {
     assert_eq!(base_lib::base_type_name(&TValue::Float(3.14)), "number");
     assert_eq!(base_lib::base_type_name(&make_str("hello")), "string");
     assert_eq!(
-        base_lib::base_type_name(&TValue::Table(Table::new_in(slot))),
+        base_lib::base_type_name(&TValue::Table(Table::try_new_in(slot).expect("分配表失败"))),
         "table"
     );
 }
@@ -960,9 +961,13 @@ fn test_unit_base_rawlen() {
     assert_eq!(base_lib::base_rawlen(&make_str("hello")).unwrap(), 5);
     assert_eq!(base_lib::base_rawlen(&make_str("")).unwrap(), 0);
 
-    let t = Table::new_in(slot);
-    t.set(TValue::Integer(1), TValue::Integer(10));
-    t.set(TValue::Integer(2), TValue::Integer(20));
+    let t = Table::try_new_in(slot).expect("分配表失败");
+    t.try_reserve_for(&TValue::Integer(1), false)
+        .expect("扩容失败");
+    t.set_unchecked(TValue::Integer(1), TValue::Integer(10));
+    t.try_reserve_for(&TValue::Integer(2), false)
+        .expect("扩容失败");
+    t.set_unchecked(TValue::Integer(2), TValue::Integer(20));
     assert_eq!(base_lib::base_rawlen(&TValue::Table(t)).unwrap(), 2);
 
     assert!(base_lib::base_rawlen(&TValue::Integer(42)).is_err());
@@ -987,8 +992,8 @@ fn test_unit_base_assert() {
 
 #[test]
 fn test_unit_open_base_lib() {
-    let mut state = LuaState::default();
-    base_lib::open_base_lib(&mut state);
+    let mut state = LuaState::new_main(lua_rs::mock::io_mock::lua_io()).expect("创建 state 失败");
+    base_lib::open_base_lib(&mut state).expect("打开 base 库失败");
 
     // 验证原有函数
     for name in &[
@@ -1037,11 +1042,15 @@ fn test_unit_open_base_lib() {
 
 #[test]
 fn test_unit_call_ipairs_aux() {
-    let mut state = LuaState::default();
+    let mut state = LuaState::new_main(lua_rs::mock::io_mock::lua_io()).expect("创建 state 失败");
     state.stack.clear();
-    let t = Table::new_in(state.alloc_slot());
-    t.set(TValue::Integer(1), TValue::Integer(10));
-    t.set(TValue::Integer(2), TValue::Integer(20));
+    let t = state.new_table().expect("分配表失败");
+    state
+        .table_set(&t, TValue::Integer(1), TValue::Integer(10))
+        .expect("写入失败");
+    state
+        .table_set(&t, TValue::Integer(2), TValue::Integer(20))
+        .expect("写入失败");
     // base 库已迁移到 BuiltinFn，ipairs 返回的迭代器是 BuiltinFn(call_ipairs_aux)。
     // call_ipairs_aux 不读取函数槽 (position a)，此处用 BuiltinFn 占位以模拟真实场景。
     state

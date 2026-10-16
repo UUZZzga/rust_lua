@@ -303,7 +303,12 @@ pub extern "C" fn lua_newstate(
         allocf: f,
         allocf_ud: ud,
     });
-    let state = LuaState::new_main_with_allocator(crate::mock::io_mock::lua_io(), allocator);
+    // 分配失败返回 NULL（对应 C 的 lua_newstate 语义）；启动期尚无 Lua 调用者
+    // 可报错，因此不做紧急回收（C: cantryagain 为假）。
+    let state = match LuaState::new_main_with_allocator(crate::mock::io_mock::lua_io(), allocator) {
+        Ok(s) => s,
+        Err(_) => return std::ptr::null_mut(),
+    };
     let p = Box::into_raw(Box::new(state));
     // 绑定 l_g（规约 R1）：地址稳定后再绑定，之后每次进入执行会重绑定
     unsafe {
@@ -371,7 +376,10 @@ pub extern "C" fn lua_newthread(L: *mut lua_State) -> *mut lua_State {
         context: context.clone(),
         c_state: std::cell::Cell::new(co_ptr),
     };
-    let thread_rc = MyRc::new_in(unsafe { (*L).alloc_slot() }, thread);
+    let thread_rc = match unsafe { (*L).new_object(thread) } {
+        Ok(rc) => rc,
+        Err(e) => raise_mem_error(L, e),
+    };
     // 设置 thread_ref，让 coroutine.running() 能返回同一对象
     context.borrow_mut().thread_ref = Some(thread_rc.downgrade());
 
@@ -473,6 +481,8 @@ pub extern "C" fn lua_settop(L: *mut lua_State, idx: c_int) {
         if new_top < L.stack.len() {
             L.truncate_live(new_top);
         } else {
+            // 扩容失败抛内存错误 (对应 C 的 lua_settop → luaD_growstack → luaM_error)
+            L.grow_stack_or_throw(new_top - L.stack.len());
             L.stack.resize(new_top, TValue::Nil(NilKind::Strict));
         }
     } else {
@@ -593,6 +603,7 @@ pub extern "C" fn lua_copy(L: *mut lua_State, fromidx: c_int, toidx: c_int) {
         // toidx 超出当前栈，扩展
         let to = L.api_func_base + toidx as usize;
         if to > L.stack.len() {
+            L.grow_stack_or_throw(to - L.stack.len());
             L.stack.resize(to, TValue::Nil(NilKind::Strict));
         }
         if to == L.stack.len() {
@@ -612,7 +623,8 @@ pub extern "C" fn lua_checkstack(L: *mut lua_State, extra: c_int) -> c_int {
     }
     let needed = L.stack.len() + extra as usize;
     if needed > L.stack.capacity() {
-        L.stack.reserve(extra as usize);
+        // 扩容失败抛内存错误 (对应 C 的 lua_checkstack → luaD_growstack → luaM_error)
+        L.grow_stack_or_throw(extra as usize);
     }
     1
 }
@@ -740,14 +752,15 @@ pub extern "C" fn lua_pushcclosure(L: *mut lua_State, f: lua_CFunction, n: c_int
             upvalues.push(val);
         }
         upvalues.reverse();
-        let slot = L.alloc_slot();
-        L.stack.push(TValue::CClosure(MyRc::new_in(
-            slot,
-            CClosure {
-                f,
-                upvalue: upvalues.into(),
-            },
-        )));
+        let closure = CClosure {
+            f,
+            upvalue: upvalues.into(),
+        };
+        let cc = match L.new_object(closure) {
+            Ok(rc) => rc,
+            Err(e) => raise_mem_error(L, e),
+        };
+        L.stack.push(TValue::CClosure(cc));
     }
 }
 
@@ -1007,7 +1020,9 @@ pub extern "C" fn lua_tocfunction(L: *mut lua_State, idx: c_int) -> Option<lua_C
 #[no_mangle]
 pub extern "C" fn lua_createtable(L: *mut lua_State, narr: c_int, nrec: c_int) {
     let L = unsafe { &mut *L };
-    L.create_table(narr.min(0) as usize, nrec.min(0) as usize);
+    if let Err(e) = L.create_table(narr.min(0) as usize, nrec.min(0) as usize) {
+        raise_mem_error(L, e);
+    }
 }
 
 /// lua_gettable: t[k]，k 从栈顶弹出，结果压栈。返回值的类型。
@@ -1052,7 +1067,10 @@ pub extern "C" fn lua_settable(L: *mut lua_State, idx: c_int) {
     if is_registry(idx) {
         let val = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
         let key = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
-        L.registry.set(key, val);
+        let registry = L.registry.clone();
+        if let Err(e) = L.table_set(&registry, key, val) {
+            raise_mem_error(L, e);
+        }
         return;
     }
     let off = match index2offset(L, idx) {
@@ -1065,8 +1083,14 @@ pub extern "C" fn lua_settable(L: *mut lua_State, idx: c_int) {
     };
     let val = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
     let key = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
-    if let TValue::Table(ref mut t) = L.stack[off] {
-        t.set(key, val);
+    let t = match &L.stack[off] {
+        TValue::Table(t) => Some(t.clone()),
+        _ => None,
+    };
+    if let Some(t) = t {
+        if let Err(e) = L.table_set(&t, key, val) {
+            raise_mem_error(L, e);
+        }
     }
 }
 
@@ -1118,7 +1142,10 @@ pub extern "C" fn lua_setfield(L: *mut lua_State, idx: c_int, k: *const c_char) 
     let key_tv = L.intern_str(&key_str);
     if is_registry(idx) {
         let val = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
-        L.registry.set(key_tv, val);
+        let registry = L.registry.clone();
+        if let Err(e) = L.table_set(&registry, key_tv, val) {
+            raise_mem_error(L, e);
+        }
         return;
     }
     let off = match index2offset(L, idx) {
@@ -1129,8 +1156,14 @@ pub extern "C" fn lua_setfield(L: *mut lua_State, idx: c_int, k: *const c_char) 
         }
     };
     let val = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
-    if let TValue::Table(ref mut t) = L.stack[off] {
-        t.set(key_tv, val);
+    let t = match &L.stack[off] {
+        TValue::Table(t) => Some(t.clone()),
+        _ => None,
+    };
+    if let Some(t) = t {
+        if let Err(e) = L.table_set(&t, key_tv, val) {
+            raise_mem_error(L, e);
+        }
     }
 }
 /// lua_rawget: t[k]，k 从栈顶弹出（不走元方法）。
@@ -1177,7 +1210,10 @@ pub extern "C" fn lua_rawseti(L: *mut lua_State, idx: c_int, n: lua_Integer) {
     // 先基于当前 top（包含 val）定位 table，再 pop
     if is_registry(idx) {
         let val = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
-        L.registry.set(TValue::Integer(n), val);
+        let registry = L.registry.clone();
+        if let Err(e) = L.table_set(&registry, TValue::Integer(n), val) {
+            raise_mem_error(L, e);
+        }
         return;
     }
     let off = match index2offset(L, idx) {
@@ -1188,8 +1224,14 @@ pub extern "C" fn lua_rawseti(L: *mut lua_State, idx: c_int, n: lua_Integer) {
         }
     };
     let val = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
-    if let TValue::Table(ref mut t) = L.stack[off] {
-        t.set_int(n, val);
+    let t = match &L.stack[off] {
+        TValue::Table(t) => Some(t.clone()),
+        _ => None,
+    };
+    if let Some(t) = t {
+        if let Err(e) = L.table_set_int(&t, n, val) {
+            raise_mem_error(L, e);
+        }
     }
 }
 
@@ -1231,7 +1273,10 @@ pub extern "C" fn lua_setglobal(L: *mut lua_State, name: *const c_char) {
             .into_owned()
     };
     let key = L.intern_str(&name_str);
-    L.globals.set(key, val);
+    let globals = L.globals.clone();
+    if let Err(e) = L.table_set(&globals, key, val) {
+        raise_mem_error(L, e);
+    }
 }
 
 // ============================================================================
@@ -1390,8 +1435,12 @@ pub extern "C" fn luaL_ref(L: *mut lua_State, _t: c_int) -> c_int {
         Some(TValue::Integer(n)) => n + 1,
         _ => 1,
     };
-    registry.set(next_ref_key, TValue::Integer(next_ref));
-    registry.set(TValue::Integer(next_ref), val);
+    if let Err(e) = L.table_set(&registry, next_ref_key, TValue::Integer(next_ref)) {
+        raise_mem_error(L, e);
+    }
+    if let Err(e) = L.table_set(&registry, TValue::Integer(next_ref), val) {
+        raise_mem_error(L, e);
+    }
     next_ref as c_int
 }
 
@@ -1403,10 +1452,13 @@ pub extern "C" fn luaL_unref(L: *mut lua_State, _t: c_int, ref_: c_int) {
         return; // LUA_REFNIL 或 LUA_NOREF
     }
     let registry = L.registry.clone();
-    registry.set(
+    if let Err(e) = L.table_set(
+        &registry,
         TValue::Integer(ref_ as lua_Integer),
         TValue::Nil(NilKind::Strict),
-    );
+    ) {
+        raise_mem_error(L, e);
+    }
 }
 
 #[no_mangle]
@@ -1541,6 +1593,49 @@ unsafe fn do_lua_error(L: *mut lua_State) -> ! {
 extern "C-unwind" fn lua_error(L: *mut lua_State) -> c_int {
     unsafe { do_lua_error(L) }
 }
+
+/// 分配漏斗失败时 C API 的抛出 —— 对应 C 的 `luaM_error` → `luaD_throw(L, LUA_ERRMEM)`。
+///
+/// `lua_*` / `luaL_*` 是 `extern "C"`，签名不允许返回错误，只能像 C 一样抛出。
+/// 这里与 [`do_lua_error`] 走完全相同的机制（设置 `pending_error` 后
+/// panic / `lua_rs_longjmp` 跳到最近的保护点），错误对象取自漏斗返回的 `VmError`：
+/// `MemoryError` → 状态创建时预注册的 "not enough memory" 消息（`memerrmsg_value()`，
+/// **不分配内存** —— 此时内存已经耗尽可能再次失败，对应 C 的
+/// `luaD_seterrorobj` 的 LUA_ERRMEM 分支）。
+///
+/// `L` 必须是有效的 `lua_State*`（与所有 capi 入口同一前提）；`e` 必须是
+/// 跑在本 state 上的漏斗返回的 `VmError`（其生命周期与 `L` 一致）。
+#[inline(never)]
+#[cold]
+fn raise_mem_error<'a>(L: *mut LuaState<'a>, e: crate::execute::VmError<'a>) -> ! {
+    let L = unsafe { &mut *L };
+    let err = match &e {
+        crate::execute::VmError::MemoryError => L.memerrmsg_value(),
+        other => L.error_object_from(other),
+    };
+    L.pending_error = Some(err);
+    #[cfg(not(lua_use_longjmp))]
+    {
+        panic!("not enough memory");
+    }
+    #[cfg(lua_use_longjmp)]
+    {
+        // lua_use_longjmp 模式: 用 longjmp 替代 panic 跳回最近的 setjmp
+        let Some(&buf) = L.error_jmp_bufs.last() else {
+            // 栈空: 顶层错误, 打印后 exit (对齐 C Lua 行为)
+            let msg = e.to_string();
+            // FFI 安全: 同 do_lua_error, staticlib 被 C 主程序链接时 std::io::stdout 不可靠,
+            // 用 libc::write 直写 stdout (fd 字面量 1, count as _ 跨平台).
+            unsafe {
+                libc::write(1, b"lua ".as_ptr() as *const libc::c_void, 4);
+                libc::write(1, msg.as_ptr() as *const libc::c_void, msg.len() as _);
+                libc::write(1, b"\n".as_ptr() as *const libc::c_void, 1);
+            }
+            std::process::exit(1);
+        };
+        unsafe { crate::state::lua_rs_longjmp(buf as *mut std::ffi::c_void) };
+    }
+}
 /// allocator 函数指针类型 — 对应 C 的 lua_Alloc。
 /// 由 lua_newstate / lua_setallocf 写入 GlobalState.mem.allocator（CapiAllocator），
 /// lmem 层的 C 风格分配原语经它执行；lua_getallocf 返回给 C 代码
@@ -1633,15 +1728,15 @@ pub extern "C-unwind" fn lua_newuserdatauv(
         data: vec![0u64; n_u64],
     };
     let ptr = udata.data.as_mut_ptr() as *mut c_void;
-    let slot = L.alloc_slot();
-    let ud = MyRc::new_in(slot, udata);
+    let ud = match L.new_object(udata) {
+        Ok(ud) => ud,
+        Err(e) => raise_mem_error(L, e),
+    };
     // 注册到 GC 并设置 id（使 mark_tvalue 能正确标记 reachable）
     // 用 gc_mem_size() 计费含 data/user_values 容量，比 size_of::<Udata>() 更接近真实占用
-    let ud_id = unsafe {
-        L.g_mut()
-            .gc
-            .as_mut()
-            .register_object(ud.gc_mem_size(), WeakValue::UserData(ud.downgrade()))
+    let ud_id = match L.register_object(ud.gc_mem_size(), WeakValue::UserData(ud.downgrade())) {
+        Ok(id) => id,
+        Err(e) => raise_mem_error(L, e),
     };
     ud.gc_header.set_id(ud_id);
     L.stack.push(TValue::UserData(ud));
@@ -1806,8 +1901,11 @@ pub extern "C" fn lua_pushthread(L: *mut lua_State) -> c_int {
                         context: ctx.clone(),
                         c_state: std::cell::Cell::new(std::ptr::null_mut()),
                     };
-                    let slot = L.alloc_slot();
-                    (TValue::Thread(MyRc::new_in(slot, thread)), false)
+                    let rc = match L.new_object(thread) {
+                        Ok(rc) => rc,
+                        Err(e) => raise_mem_error(L, e),
+                    };
+                    (TValue::Thread(rc), false)
                 }
             }
         }
@@ -2289,7 +2387,10 @@ pub extern "C" fn lua_seti(L: *mut lua_State, idx: c_int, n: lua_Integer) {
     let L = unsafe { &mut *L };
     if is_registry(idx) {
         let val = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
-        L.registry.set(TValue::Integer(n), val);
+        let registry = L.registry.clone();
+        if let Err(e) = L.table_set(&registry, TValue::Integer(n), val) {
+            raise_mem_error(L, e);
+        }
         return;
     }
     let off = match index2offset(L, idx) {
@@ -2300,8 +2401,14 @@ pub extern "C" fn lua_seti(L: *mut lua_State, idx: c_int, n: lua_Integer) {
         }
     };
     let val = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
-    if let TValue::Table(ref mut t) = L.stack[off] {
-        t.set(TValue::Integer(n), val);
+    let t = match &L.stack[off] {
+        TValue::Table(t) => Some(t.clone()),
+        _ => None,
+    };
+    if let Some(t) = t {
+        if let Err(e) = L.table_set(&t, TValue::Integer(n), val) {
+            raise_mem_error(L, e);
+        }
     }
 }
 
@@ -2928,11 +3035,21 @@ pub extern "C" fn luaL_newmetatable(L: *mut lua_State, tname: *const c_char) -> 
     {
         return 0;
     }
-    let table = Table::with_capacity_in(L.alloc_slot(), 0, 2);
-    unsafe { L.gc_mut().register_table(&table) };
+    let table = match L.new_table_with_capacity(0, 2) {
+        Ok(t) => t,
+        Err(e) => raise_mem_error(L, e),
+    };
+    if let Err(e) = L.register_table(&table) {
+        raise_mem_error(L, e);
+    }
     let name_key = L.intern_str("__name");
-    table.set(name_key, tname.clone());
-    L.registry.set(tname, TValue::Table(table.clone()));
+    if let Err(e) = L.table_set(&table, name_key, tname.clone()) {
+        raise_mem_error(L, e);
+    }
+    let registry = L.registry.clone();
+    if let Err(e) = L.table_set(&registry, tname, TValue::Table(table.clone())) {
+        raise_mem_error(L, e);
+    }
     L.push_value(TValue::Table(table));
     1
 }
@@ -3040,9 +3157,17 @@ pub extern "C" fn luaL_requiref(
         Some(TValue::Table(t)) => t,
         _ => {
             // _LOADED 表不存在：创建并注册到 registry
-            let t = Table::new_in(L.alloc_slot());
-            unsafe { L.gc_mut().register_table(&t) };
-            L.registry.set(loaded_key, TValue::Table(t.clone()));
+            let t = match L.new_table() {
+                Ok(t) => t,
+                Err(e) => raise_mem_error(L, e),
+            };
+            if let Err(e) = L.register_table(&t) {
+                raise_mem_error(L, e);
+            }
+            let registry = L.registry.clone();
+            if let Err(e) = L.table_set(&registry, loaded_key, TValue::Table(t.clone())) {
+                raise_mem_error(L, e);
+            }
             t
         }
     };
@@ -3067,9 +3192,10 @@ pub extern "C" fn luaL_requiref(
         }
 
         // 注册到 package.loaded[modname] = result
-        if let Some(val) = L.stack.last() {
-            let val = val.clone();
-            loaded_table.set(mod_key.clone(), val);
+        if let Some(val) = L.stack.last().cloned() {
+            if let Err(e) = L.table_set(&loaded_table, mod_key.clone(), val) {
+                raise_mem_error(L, e);
+            }
         }
 
         // 如果 glb，设置全局变量
@@ -3079,7 +3205,10 @@ pub extern "C" fn luaL_requiref(
                 .last()
                 .cloned()
                 .unwrap_or(TValue::Nil(NilKind::Strict));
-            L.globals.set(mod_key, val);
+            let globals = L.globals.clone();
+            if let Err(e) = L.table_set(&globals, mod_key, val) {
+                raise_mem_error(L, e);
+            }
         }
     }
 }
@@ -3152,14 +3281,18 @@ pub extern "C" fn luaL_traceback(
 #[no_mangle]
 pub extern "C" fn luaL_openselectedlibs(L: *mut lua_State, _load: c_int, _preload: c_int) {
     let L = unsafe { &mut *L };
-    L.open_selected_libs(-1, 0);
+    if let Err(e) = L.open_selected_libs(-1, 0) {
+        raise_mem_error(L, e);
+    }
 }
 
 /// luaopen_base: 打开基础库
 #[no_mangle]
 pub extern "C" fn luaopen_base(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
-    crate::stdlib::base_lib::open_base_lib(L);
+    if let Err(e) = crate::stdlib::base_lib::open_base_lib(L) {
+        raise_mem_error(L, e);
+    }
     // push 全局表作为返回值
     L.stack.push(TValue::Table(L.globals.clone()));
     1
@@ -3169,7 +3302,9 @@ pub extern "C" fn luaopen_base(L: *mut lua_State) -> c_int {
 #[no_mangle]
 pub extern "C" fn luaopen_math(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
-    crate::stdlib::math_lib::open_math_lib(L);
+    if let Err(e) = crate::stdlib::math_lib::open_math_lib(L) {
+        raise_mem_error(L, e);
+    }
     // push math 表
     let math_key = L.intern_str("math");
     let math_val = L
@@ -3184,7 +3319,9 @@ pub extern "C" fn luaopen_math(L: *mut lua_State) -> c_int {
 #[no_mangle]
 pub extern "C" fn luaopen_string(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
-    crate::stdlib::string_lib::open_string_lib(L);
+    if let Err(e) = crate::stdlib::string_lib::open_string_lib(L) {
+        raise_mem_error(L, e);
+    }
     let key = L.intern_str("string");
     let val = L.globals.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
     L.stack.push(val);
@@ -3195,7 +3332,9 @@ pub extern "C" fn luaopen_string(L: *mut lua_State) -> c_int {
 #[no_mangle]
 pub extern "C" fn luaopen_os(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
-    crate::stdlib::os_lib::open_os_lib(L);
+    if let Err(e) = crate::stdlib::os_lib::open_os_lib(L) {
+        raise_mem_error(L, e);
+    }
     let key = L.intern_str("os");
     let val = L.globals.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
     L.stack.push(val);
@@ -3206,7 +3345,9 @@ pub extern "C" fn luaopen_os(L: *mut lua_State) -> c_int {
 #[no_mangle]
 pub extern "C" fn luaopen_coroutine(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
-    crate::stdlib::coroutine_lib::open_coroutine_lib(L);
+    if let Err(e) = crate::stdlib::coroutine_lib::open_coroutine_lib(L) {
+        raise_mem_error(L, e);
+    }
     let key = L.intern_str("coroutine");
     let val = L.globals.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
     L.stack.push(val);
@@ -3217,7 +3358,9 @@ pub extern "C" fn luaopen_coroutine(L: *mut lua_State) -> c_int {
 #[no_mangle]
 pub extern "C" fn luaopen_table(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
-    crate::stdlib::table_lib::open_table_lib(L);
+    if let Err(e) = crate::stdlib::table_lib::open_table_lib(L) {
+        raise_mem_error(L, e);
+    }
     let key = L.intern_str("table");
     let val = L.globals.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
     L.stack.push(val);
@@ -3228,7 +3371,9 @@ pub extern "C" fn luaopen_table(L: *mut lua_State) -> c_int {
 #[no_mangle]
 pub extern "C" fn luaopen_io(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
-    crate::stdlib::io_lib::open_io_lib(L);
+    if let Err(e) = crate::stdlib::io_lib::open_io_lib(L) {
+        raise_mem_error(L, e);
+    }
     let key = L.intern_str("io");
     let val = L.globals.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
     L.stack.push(val);
@@ -3239,7 +3384,9 @@ pub extern "C" fn luaopen_io(L: *mut lua_State) -> c_int {
 #[no_mangle]
 pub extern "C" fn luaopen_debug(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
-    crate::stdlib::debug_lib::open_debug_lib(L);
+    if let Err(e) = crate::stdlib::debug_lib::open_debug_lib(L) {
+        raise_mem_error(L, e);
+    }
     let key = L.intern_str("debug");
     let val = L.globals.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
     L.stack.push(val);
@@ -3250,7 +3397,9 @@ pub extern "C" fn luaopen_debug(L: *mut lua_State) -> c_int {
 #[no_mangle]
 pub extern "C" fn luaopen_utf8(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
-    crate::stdlib::utf8_lib::open_utf8_lib(L);
+    if let Err(e) = crate::stdlib::utf8_lib::open_utf8_lib(L) {
+        raise_mem_error(L, e);
+    }
     let key = L.intern_str("utf8");
     let val = L.globals.get(&key).unwrap_or(TValue::Nil(NilKind::Strict));
     L.stack.push(val);
@@ -3974,7 +4123,10 @@ pub extern "C" fn lua_rawsetp(L: *mut lua_State, idx: c_int, p: *const c_void) {
     let key = TValue::LightUserData(p as *mut c_void);
     if is_registry(idx) {
         let val = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
-        L.registry.set(key, val);
+        let registry = L.registry.clone();
+        if let Err(e) = L.table_set(&registry, key, val) {
+            raise_mem_error(L, e);
+        }
         return;
     }
     let off = match index2offset(L, idx) {
@@ -3985,8 +4137,14 @@ pub extern "C" fn lua_rawsetp(L: *mut lua_State, idx: c_int, p: *const c_void) {
         }
     };
     let val = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
-    if let TValue::Table(ref mut t) = L.stack[off] {
-        t.set(key, val);
+    let t = match &L.stack[off] {
+        TValue::Table(t) => Some(t.clone()),
+        _ => None,
+    };
+    if let Some(t) = t {
+        if let Err(e) = L.table_set(&t, key, val) {
+            raise_mem_error(L, e);
+        }
     }
 }
 
@@ -4495,7 +4653,7 @@ mod tests {
     #[test]
     fn test_lua_resume_lua_created_coroutine() {
         let mut st = LuaState::default();
-        st.open_selected_libs(0, 0);
+        st.open_selected_libs(0, 0).expect("打开标准库失败");
         let rc = st.load_buffer(
             "local co = coroutine.create(function() return 42 end); return co",
             "=t",
@@ -4534,7 +4692,7 @@ mod tests {
     #[test]
     fn test_c_resume_loader_style_varargs() {
         let mut st = LuaState::default();
-        st.open_selected_libs(0, 0);
+        st.open_selected_libs(0, 0).expect("打开标准库失败");
         // 复刻 loader.lua：切词 → loadfile → main(select(2, table.unpack(args)))
         let rc = st.load_buffer(
             "local co = coroutine.create(function(svc_args)\n\
@@ -4582,7 +4740,7 @@ mod tests {
     #[test]
     fn test_c_resume_vararg_count() {
         let mut st = LuaState::default();
-        st.open_selected_libs(0, 0);
+        st.open_selected_libs(0, 0).expect("打开标准库失败");
         let rc = st.load_buffer(
             "local co = coroutine.create(function(...)\n\
              return select('#', ...), (table.pack(...)).n, ...\n\
@@ -4623,7 +4781,7 @@ mod tests {
     #[test]
     fn test_c_resume_preserves_coroutine_frame_across_yield() {
         let mut st = LuaState::default();
-        st.open_selected_libs(0, 0);
+        st.open_selected_libs(0, 0).expect("打开标准库失败");
         let rc = st.load_buffer(
             "local co = coroutine.create(function(a, t)\n\
              t.tag = a * 2\n\
@@ -4677,7 +4835,7 @@ mod tests {
     #[test]
     fn test_c_resume_args_not_duplicated() {
         let mut st = LuaState::default();
-        st.open_selected_libs(0, 0);
+        st.open_selected_libs(0, 0).expect("打开标准库失败");
         let rc = st.load_buffer(
             "local function handler(session, source, cmd, ...)\n\
              local n = select('#', ...)\n\
@@ -4754,7 +4912,7 @@ mod tests {
     #[test]
     fn test_lua_resume_xmove_roundtrip() {
         let mut st = LuaState::default();
-        st.open_selected_libs(0, 0);
+        st.open_selected_libs(0, 0).expect("打开标准库失败");
         let rc = st.load_buffer(
             "local co = coroutine.create(function(a)\n\
              local b = coroutine.yield(a + 1)\n\
@@ -4831,7 +4989,7 @@ mod tests {
         }
 
         let mut st = LuaState::default();
-        st.open_selected_libs(0, 0);
+        st.open_selected_libs(0, 0).expect("打开标准库失败");
         let L = &mut st as *mut LuaState<'static> as *mut lua_State;
 
         // 两个上值表 + C 闭包，注册为全局 coresume（= skynet 的 coroutine.resume）
@@ -5159,7 +5317,7 @@ mod tests {
     #[test]
     fn test_c_resume_reused_coroutine_varargs() {
         let mut st = LuaState::default();
-        st.open_selected_libs(0, 0);
+        st.open_selected_libs(0, 0).expect("打开标准库失败");
         let rc = st.load_buffer(
             "local log = {}\n\
              local function dispatch(session, source, cmd, ...)\n\
@@ -5217,7 +5375,7 @@ mod tests {
     #[test]
     fn test_c_resume_multret_args_with_live_registers() {
         let mut st = LuaState::default();
-        st.open_selected_libs(0, 0);
+        st.open_selected_libs(0, 0).expect("打开标准库失败");
         let rc = st.load_buffer(
             "local function dispatch(session, source, cmd, ...)\n\
              local n = select('#', ...)\n\
@@ -5282,7 +5440,7 @@ mod tests {
     #[test]
     fn test_c_resume_vararg_body_forwarding() {
         let mut st = LuaState::default();
-        st.open_selected_libs(0, 0);
+        st.open_selected_libs(0, 0).expect("打开标准库失败");
         let rc = st.load_buffer(
             "local function handler(session, address, cmd, ...)\n\
              local parts = {}\n\
@@ -5333,7 +5491,7 @@ mod tests {
     #[test]
     fn test_c_resume_nested_vararg_forwarding() {
         let mut st = LuaState::default();
-        st.open_selected_libs(0, 0);
+        st.open_selected_libs(0, 0).expect("打开标准库失败");
         let rc = st.load_buffer(
             "local function inner(addr, ...)\n\
              local parts = {}\n\
@@ -5549,7 +5707,7 @@ mod tests {
         }
 
         let mut st = LuaState::default();
-        st.open_selected_libs(0, 0);
+        st.open_selected_libs(0, 0).expect("打开标准库失败");
         let L = &mut st as *mut LuaState<'static> as *mut lua_State;
         unsafe {
             // safe_call: 上值 = 无上值的 C 函数
@@ -5614,7 +5772,7 @@ mod tests {
         }
 
         let mut st = LuaState::default();
-        st.open_selected_libs(0, 0);
+        st.open_selected_libs(0, 0).expect("打开标准库失败");
         let L = &mut st as *mut LuaState<'static> as *mut lua_State;
         unsafe {
             lua_pushcfunction(L, build_with_gc);

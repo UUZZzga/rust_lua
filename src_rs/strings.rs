@@ -113,6 +113,14 @@ use crate::alloc::{
 };
 pub type ArcRcHeader<T> = <ArcRc<T> as IsArcRc>::Header;
 
+/// 内存分配失败的固定消息 —— 对应 C 的 `lstring.h::MEMERRMSG`。
+///
+/// 状态创建时预注册为 `GlobalState.memerrmsg`（C: `lstring.c` 的
+/// `g->memerrmsg = luaS_newliteral(L, MEMERRMSG)`），内存错误传播时直接复用它
+/// （C: `ldo.c::luaD_seterrorobj` 的 LUA_ERRMEM 分支），**不做任何分配** ——
+/// 报内存错误时再分配就是再次失败。
+pub const MEMERRMSG: &str = "not enough memory";
+
 // 默认模式 (性能优先): 使用 hashbrown::HashTable 单级哈希表
 // size_optimized: 使用 std::collections::HashMap 两级结构, 减小二进制体积
 #[cfg(not(size_optimized))]

@@ -11,8 +11,10 @@
 
 use crate::config::{LuaInteger, LuaNumber, LuaUnsigned};
 use crate::gc::GCObjectHeader;
-use crate::mem::SlotAlloc;
-use crate::objects::{NilKind, TValue, TableData, TableDataRc, TableVec, WeakTable};
+use crate::mem::{AllocFailed, SlotAlloc};
+use crate::objects::{
+    tvalue_fx_hash, NilKind, TValue, TableData, TableDataRc, TableVec, WeakTable,
+};
 use crate::strings::lua_string_eq;
 
 pub use crate::objects::Table;
@@ -39,6 +41,49 @@ pub(crate) fn hash_get<'a>(td: &TableData<'a>, key: &TValue<'a>) -> Option<TValu
     None
 }
 // ============================================================================
+// 写入路径的容量预留（对应 C 的 luaH_growarrays / rehash 先行纪律）
+// ============================================================================
+
+/// 数组部分预留：下标落在数组内（或正好是末尾且写非 nil）时返回 `true`；
+/// 需要走哈希路径时返回 `false`。
+fn reserve_array_slot<'a>(
+    data: &mut TableData<'a>,
+    idx: usize,
+    is_nil: bool,
+) -> Result<bool, AllocFailed> {
+    let len = data.array.len();
+    if idx < len {
+        return Ok(true);
+    }
+    if idx == len && !is_nil {
+        // 顺序插入：数组末尾追加一个槽位
+        if let Err(_e) = data.array.try_reserve(1) {
+            return Err(AllocFailed);
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// 哈希部分预留：key 已存在或写入 nil（C 语义：不创建 node）时无需扩容。
+fn reserve_hash_slot<'a>(
+    data: &mut TableData<'a>,
+    key: &TValue<'a>,
+    is_nil: bool,
+) -> Result<(), AllocFailed> {
+    if is_nil || data.idx_get(key).is_some() {
+        return Ok(());
+    }
+    if data.hash_buckets.try_reserve(1).is_err() {
+        return Err(AllocFailed);
+    }
+    if data.try_reserve_index(key).is_err() {
+        return Err(AllocFailed);
+    }
+    Ok(())
+}
+
+// ============================================================================
 // Table 方法实现
 // ============================================================================
 
@@ -46,45 +91,76 @@ impl<'a> Table<'a> {
     /// 创建空表 — TableData 块（header + 数据）由 `alloc_slot` 指向的
     /// MemState allocator 分配/释放。数组/哈希缓冲区与 key_to_bucket 索引
     /// 同样经该分配器。
+    ///
+    /// 分配失败返回 [`AllocFailed`]：生产路径用 `LuaState::new_table`
+    /// （失败 → 紧急 GC → 重试 → 内存错误），无状态上下文（引导/测试）自行决定。
+    pub fn try_new_in(alloc: SlotAlloc) -> Result<Self, AllocFailed> {
+        let data = TableDataRc::try_new_table(
+            alloc,
+            TableData {
+                gc_header: GCObjectHeader::new(),
+                array: TableVec::new_in(alloc),
+                hash_buckets: TableVec::new_in(alloc),
+                key_to_bucket: None,
+                metatable: None,
+            },
+        )?;
+        Ok(Table { data })
+    }
+
+    /// 【测试专用】分配失败即 panic 的便捷构造（生产路径走 `LuaState::new_table`）。
+    #[cfg(test)]
     pub fn new_in(alloc: SlotAlloc) -> Self {
-        Table {
-            data: TableDataRc::new_table(
-                alloc,
-                TableData {
-                    gc_header: GCObjectHeader::new(),
-                    array: TableVec::new_in(alloc),
-                    hash_buckets: TableVec::new_in(alloc),
-                    key_to_bucket: None,
-                    metatable: None,
-                },
-            ),
-        }
+        Self::try_new_in(alloc)
+            .ok()
+            .expect("Table::new_in: 测试分配失败")
     }
 
     /// 创建带容量的表 — TableData 块由 `alloc_slot` 指向的 MemState allocator
-    /// 分配/释放。对应 C 的 lua_createtable。
-    pub fn with_capacity_in(alloc: SlotAlloc, narray: usize, nhash: usize) -> Self {
-        let mut array = TableVec::with_capacity_in(narray, alloc);
+    /// 分配/释放。对应 C 的 `lua_createtable`（预分配数组/哈希容量）。
+    pub fn try_with_capacity_in(
+        alloc: SlotAlloc,
+        narray: usize,
+        nhash: usize,
+    ) -> Result<Self, AllocFailed> {
+        // 对照 C 的 `luaH_resize`：先扩容（可失败，表仍为空表），再初始化槽位。
+        let mut array = TableVec::new_in(alloc);
+        array.try_reserve_exact(narray).map_err(|_| AllocFailed)?;
         array.resize(narray, TValue::Nil(NilKind::Empty));
-        Table {
-            data: TableDataRc::new_table(
-                alloc,
-                TableData {
-                    gc_header: GCObjectHeader::new(),
-                    array,
-                    hash_buckets: TableVec::with_capacity_in(nhash, alloc),
-                    key_to_bucket: if nhash > 0 {
-                        Some(crate::mem::AllocBox::new_in(
-                            hashbrown::HashTable::with_capacity_in(nhash, alloc),
-                            alloc,
-                        ))
-                    } else {
-                        None
-                    },
-                    metatable: None,
-                },
-            ),
-        }
+
+        let mut hash_buckets = TableVec::new_in(alloc);
+        hash_buckets
+            .try_reserve_exact(nhash)
+            .map_err(|_| AllocFailed)?;
+
+        let key_to_bucket = if nhash > 0 {
+            let mut ht = hashbrown::HashTable::with_capacity_in(0, alloc);
+            ht.try_reserve(nhash, |(k, _)| tvalue_fx_hash(k))
+                .map_err(|_| AllocFailed)?;
+            Some(crate::mem::AllocBox::try_new_in(ht, alloc).map_err(|_| AllocFailed)?)
+        } else {
+            None
+        };
+
+        let data = TableDataRc::try_new_table(
+            alloc,
+            TableData {
+                gc_header: GCObjectHeader::new(),
+                array,
+                hash_buckets,
+                key_to_bucket,
+                metatable: None,
+            },
+        )?;
+        Ok(Table { data })
+    }
+
+    /// 【测试专用】分配失败即 panic 的便捷构造。
+    #[cfg(test)]
+    pub fn with_capacity_in(alloc: SlotAlloc, narray: usize, nhash: usize) -> Self {
+        Self::try_with_capacity_in(alloc, narray, nhash)
+            .ok()
+            .expect("Table::with_capacity_in: 测试分配失败")
     }
 
     /// 转换为弱引用，用于 GC 收集。
@@ -345,7 +421,64 @@ impl<'a> Table<'a> {
     // set / set_int —— 使用 borrow_mut 实现内部可变性
     // ========================================================================
 
+    /// 写入前的容量预留 —— 对应 C 的 `luaH_growarrays` / `rehash` **先行** 纪律：
+    /// 先扩容（可失败），再写入（不可失败）。
+    ///
+    /// 成功返回后，紧跟的 [`Table::set_unchecked`] / [`Table::set_int_unchecked`]
+    /// 对**同一 key/value** 的写入不会再触发任何分配。失败时表内容不变（只做过容量
+    /// 预留），因此调用方可以安全地「紧急 GC 后整体重试」（见 `LuaState::retry_alloc`）。
+    pub fn try_reserve_for(&self, key: &TValue<'a>, is_nil: bool) -> Result<(), AllocFailed> {
+        let mut data = self.data.borrow_mut();
+        match key {
+            TValue::Integer(i) if *i > 0 => {
+                if reserve_array_slot(&mut data, (*i - 1) as usize, is_nil)? {
+                    return Ok(());
+                }
+            }
+            TValue::Float(f) => {
+                // 对应 C: luaH_set — 浮点能精确转换为整数时按整数键插入
+                if let Some(i) = float_key_to_int(*f) {
+                    if i > 0 && reserve_array_slot(&mut data, (i - 1) as usize, is_nil)? {
+                        return Ok(());
+                    }
+                    return reserve_hash_slot(&mut data, &TValue::Integer(i), is_nil);
+                }
+            }
+            _ => {}
+        }
+        reserve_hash_slot(&mut data, key, is_nil)
+    }
+
+    /// 写入整型键前的容量预留（见 [`Table::try_reserve_for`]）。
+    pub fn try_reserve_for_int(&self, key: LuaInteger, is_nil: bool) -> Result<(), AllocFailed> {
+        self.try_reserve_for(&TValue::Integer(key), is_nil)
+    }
+
+    /// 【测试专用】无扩容失败的写入便捷入口（生产路径必须走
+    /// `LuaState::table_set` / `LuaState::table_set_int`）。
+    #[cfg(test)]
     pub fn set(&self, key: TValue<'a>, value: TValue<'a>) {
+        let is_nil = matches!(&value, TValue::Nil(NilKind::Strict));
+        self.try_reserve_for(&key, is_nil)
+            .ok()
+            .expect("Table::set: 测试分配失败");
+        self.set_unchecked(key, value);
+    }
+
+    /// 【测试专用】见 [`Table::set`]。
+    #[cfg(test)]
+    pub fn set_int(&self, key: LuaInteger, value: TValue<'a>) {
+        let is_nil = matches!(&value, TValue::Nil(NilKind::Strict));
+        self.try_reserve_for_int(key, is_nil)
+            .ok()
+            .expect("Table::set_int: 测试分配失败");
+        self.set_int_unchecked(key, value);
+    }
+
+    /// 无分配写入（前置条件：对同一 key/value 调用过 [`Table::try_reserve_for`] 且成功）。
+    ///
+    /// 与 C 的 `luaH_finishset` 等价：容量已就绪时写入不再可能失败。
+    pub fn set_unchecked(&self, key: TValue<'a>, value: TValue<'a>) {
         let is_nil = matches!(&value, TValue::Nil(NilKind::Strict));
         let mut data = self.data.borrow_mut();
         match &key {
@@ -383,16 +516,17 @@ impl<'a> Table<'a> {
                             return;
                         }
                     }
-                    Self::hash_set(&mut data, &TValue::Integer(i), value, is_nil);
+                    Self::hash_set_unchecked(&mut data, &TValue::Integer(i), value, is_nil);
                     return;
                 }
             }
             _ => {}
         }
-        Self::hash_set(&mut data, &key, value, is_nil);
+        Self::hash_set_unchecked(&mut data, &key, value, is_nil);
     }
 
-    pub fn set_int(&self, key: LuaInteger, value: TValue<'a>) {
+    /// 无分配写入整型键（前置条件同 [`Table::set_unchecked`]）。
+    pub fn set_int_unchecked(&self, key: LuaInteger, value: TValue<'a>) {
         let is_nil = matches!(&value, TValue::Nil(NilKind::Strict));
         let mut data = self.data.borrow_mut();
         if key > 0 {
@@ -412,7 +546,7 @@ impl<'a> Table<'a> {
             }
         }
         let k = TValue::Integer(key);
-        Self::hash_set(&mut data, &k, value, is_nil);
+        Self::hash_set_unchecked(&mut data, &k, value, is_nil);
     }
 
     /// 哈希部分写入 — 维护 `hash_buckets`/`key_to_bucket` 并遵循 C 语义
@@ -422,7 +556,12 @@ impl<'a> Table<'a> {
     ///   避免无意义 tombstone 累积
     /// - 若 key 不存在且写入非 nil，追加到 hash_buckets + 记录 key_to_bucket
     /// - 若 key 存在 (含 tombstone)，覆盖值 (nil 写为 Nil(Empty) tombstone)
-    fn hash_set(data: &mut TableData<'a>, key: &TValue<'a>, value: TValue<'a>, is_nil: bool) {
+    fn hash_set_unchecked(
+        data: &mut TableData<'a>,
+        key: &TValue<'a>,
+        value: TValue<'a>,
+        is_nil: bool,
+    ) {
         let val = if is_nil {
             TValue::Nil(NilKind::Empty)
         } else {

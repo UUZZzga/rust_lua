@@ -883,7 +883,7 @@ fn call_create<'a>(
         context: context.clone(),
         c_state: std::cell::Cell::new(std::ptr::null_mut()),
     };
-    let thread_rc = crate::alloc::MyRc::new_in(state.alloc_slot(), thread);
+    let thread_rc = state.new_object(thread)?;
     // 设置 thread_ref，让 coroutine.running() 能返回同一对象
     context.borrow_mut().thread_ref = Some(thread_rc.downgrade());
     // 登记到 GC 线程表：不可达协程的执行态由 clear_dead_threads 回收
@@ -1160,10 +1160,7 @@ fn call_running<'a>(
                         context: ctx.clone(),
                         c_state: std::cell::Cell::new(std::ptr::null_mut()),
                     };
-                    (
-                        TValue::Thread(crate::alloc::MyRc::new_in(state.alloc_slot(), thread)),
-                        false,
-                    )
+                    (TValue::Thread(state.new_object(thread)?), false)
                 }
             }
         }
@@ -1751,7 +1748,7 @@ fn call_wrap<'a>(
         context: context.clone(),
         c_state: std::cell::Cell::new(std::ptr::null_mut()),
     };
-    let thread_rc = crate::alloc::MyRc::new_in(state.alloc_slot(), thread);
+    let thread_rc = state.new_object(thread)?;
     // 设置 thread_ref，让 coroutine.running() 能返回同一对象
     context.borrow_mut().thread_ref = Some(thread_rc.downgrade());
     // 登记到 GC 线程表：不可达协程的执行态由 clear_dead_threads 回收
@@ -1779,12 +1776,8 @@ fn call_wrap<'a>(
         name: c"wrap".as_ptr() as *const u8,
         upvalues: Rc::new(RefCell::new(vec![TValue::Thread(thread_rc)])),
     };
-    push_single_result(
-        state,
-        a,
-        nresults,
-        TValue::RustClosure(crate::alloc::MyRc::new_in(state.alloc_slot(), wrap_closure)),
-    );
+    let wrap_rc = state.new_object(wrap_closure)?;
+    push_single_result(state, a, nresults, TValue::RustClosure(wrap_rc));
     Ok(())
 }
 
@@ -2416,32 +2409,35 @@ fn push_error(state: &mut LuaState, msg: &str) -> usize {
 // 打开 Coroutine 库 — 对应 C 的 luaopen_coroutine
 // ============================================================================
 
-pub fn open_coroutine_lib<'a>(state: &mut LuaState<'a>) {
-    let mut lib = Table::new_in(state.alloc_slot());
+pub fn open_coroutine_lib<'a>(state: &mut LuaState<'a>) -> Result<(), VmError<'a>> {
+    let mut lib = state.new_table()?;
 
     // 注册 BuiltinFn 的辅助闭包：用函数指针 + 名字注册到表
     // (state 作为参数传入，避免闭包捕获 state 导致借用冲突)
     let register = |lib: &mut crate::table::Table<'a>,
-                    state: &LuaState<'a>,
+                    state: &mut LuaState<'a>,
                     name: &'static std::ffi::CStr,
-                    func: crate::objects::BuiltinFnPtr| {
+                    func: crate::objects::BuiltinFnPtr|
+     -> Result<(), VmError<'a>> {
         let key = state.intern(name.to_str().unwrap_or(""));
         let name_ptr = name.as_ptr() as *const u8;
-        lib.set(key, BuiltinFn::impure_tvalue(func, name_ptr));
+        state.table_set(lib, key, BuiltinFn::impure_tvalue(func, name_ptr))
     };
 
-    register(&mut lib, state, c"create", call_create);
-    register(&mut lib, state, c"isyieldable", call_isyieldable);
-    register(&mut lib, state, c"resume", call_resume);
-    register(&mut lib, state, c"running", call_running);
-    register(&mut lib, state, c"status", call_status);
-    register(&mut lib, state, c"wrap", call_wrap);
-    register(&mut lib, state, c"yield", call_yield);
-    register(&mut lib, state, c"close", call_close);
+    register(&mut lib, state, c"create", call_create)?;
+    register(&mut lib, state, c"isyieldable", call_isyieldable)?;
+    register(&mut lib, state, c"resume", call_resume)?;
+    register(&mut lib, state, c"running", call_running)?;
+    register(&mut lib, state, c"status", call_status)?;
+    register(&mut lib, state, c"wrap", call_wrap)?;
+    register(&mut lib, state, c"yield", call_yield)?;
+    register(&mut lib, state, c"close", call_close)?;
 
-    unsafe { state.gc_mut().register_table(&lib) };
+    state.register_table(&lib)?;
     let key = state.intern_str("coroutine");
-    state.globals.set(key, TValue::Table(lib));
+    let globals = state.globals.clone();
+    state.table_set(&globals, key, TValue::Table(lib))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2452,7 +2448,7 @@ mod tests {
     #[test]
     fn test_open_coroutine_lib() {
         let mut state = LuaState::default();
-        open_coroutine_lib(&mut state);
+        open_coroutine_lib(&mut state).expect("打开 coroutine 库失败");
         let key = state.intern_str("coroutine");
         let val = state.globals.get(&key);
         assert!(val.is_some(), "coroutine must be registered");
@@ -2469,9 +2465,9 @@ mod tests {
     fn make_coroutine<'a>(
         state: &mut LuaState<'a>,
     ) -> crate::alloc::MyRc<LuaThread<'a>, crate::mem::SlotAlloc> {
-        open_coroutine_lib(state); // 幂等：已开则只重复注册
+        open_coroutine_lib(state).expect("打开 coroutine 库失败"); // 幂等：已开则只重复注册
         let func = Table::new_in(state.alloc_slot());
-        unsafe { state.gc_mut().register_table(&func) };
+        state.register_table(&func).expect("登记表失败");
         state.stack.push(TValue::Table(func)); // func 槽（Table 可调用）
         let save_top = state.top;
         state.top = state.stack.len();
@@ -2531,7 +2527,7 @@ mod tests {
     #[test]
     fn test_coroutine_global_write_visible_to_main() {
         let mut state = LuaState::default();
-        open_base_lib(&mut state);
+        open_base_lib(&mut state).expect("打开 base 库失败");
 
         let co1 = make_coroutine(&mut state);
         let co2 = make_coroutine(&mut state);

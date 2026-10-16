@@ -25,7 +25,7 @@ use std::os::windows::process::ExitStatusExt;
 fn run_lua(args: &[&str]) -> std::process::Output {
     let mut buff = lua_rs::mock::io_mock::BufferIo::new("");
     let success = {
-        let mut interpreter = Interpreter::new(&mut buff);
+        let mut interpreter = Interpreter::new(&mut buff).expect("创建 state 失败");
 
         let mut args_vec: Vec<String> = vec!["lua".to_string()];
         args_vec.extend(args.iter().map(|s| s.to_string()));
@@ -367,7 +367,8 @@ fn test_int_to_float_div() {
 
 #[test]
 fn test_test() {
-    let mut interpreter = Interpreter::default();
+    let mut interpreter =
+        Interpreter::new(lua_rs::mock::io_mock::lua_io()).expect("创建 state 失败");
     let mut args_vec: Vec<String> = vec![];
     args_vec.extend(["lua", "-e", "print(4 / 2)"].iter().map(|s| s.to_string()));
     interpreter.pmain(&args_vec);

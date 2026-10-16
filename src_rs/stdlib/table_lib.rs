@@ -15,6 +15,9 @@ use crate::execute::{arg_error, VmError};
 use crate::objects::{BuiltinFn, NilKind, TValue};
 use crate::state::LuaState;
 use crate::strings::lua_string_as_str;
+// 生产路径一律经 `LuaState::new_table` / `LuaState::table_set`；裸 `Table` 名仅剩测试模块使用
+// （测试经 `use super::*` 取用）。
+#[cfg(test)]
 use crate::table::Table;
 use crate::tm::{call_order_tm, obj_type_name, TagMethod};
 
@@ -355,13 +358,17 @@ fn call_pack<'a>(
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError<'a>> {
-    let t = Table::new_in(state.alloc_slot());
+    let t = state.new_table()?;
     for i in 0..nargs {
         let val = get_arg(state, a, i);
-        t.set_int((i + 1) as LuaInteger, val);
+        state.table_set_int(&t, (i + 1) as LuaInteger, val)?;
     }
-    t.set(state.intern_str("n"), TValue::Integer(nargs as LuaInteger));
-    unsafe { state.gc_mut().register_table(&t) };
+    state.table_set(
+        &t,
+        state.intern_str("n"),
+        TValue::Integer(nargs as LuaInteger),
+    )?;
+    state.register_table(&t)?;
     push_results(state, a, nresults, vec![TValue::Table(t)]);
     Ok(())
 }
@@ -746,8 +753,8 @@ fn call_create<'a>(
         return Err(VmError::RuntimeError("table overflow".to_string()));
     }
 
-    let table = Table::with_capacity_in(state.alloc_slot(), sizeseq as usize, sizerest as usize);
-    unsafe { state.gc_mut().register_table(&table) };
+    let table = state.new_table_with_capacity(sizeseq as usize, sizerest as usize)?;
+    state.register_table(&table)?;
     push_results(state, a, nresults, vec![TValue::Table(table)]);
     Ok(())
 }
@@ -967,30 +974,33 @@ fn call_comp_function<'a>(
 // ============================================================================
 
 /// 打开 Table 库并注册到全局变量 table
-pub fn open_table_lib<'a>(state: &mut LuaState<'a>) {
-    let mut lib = Table::new_in(state.alloc_slot());
+pub fn open_table_lib<'a>(state: &mut LuaState<'a>) -> Result<(), VmError<'a>> {
+    let mut lib = state.new_table()?;
 
     // 注册所有 Table 函数 (使用 BuiltinFn 函数指针)
-    let register = |lib: &mut crate::table::Table<'a>,
-                    name: &'static std::ffi::CStr,
-                    func: crate::objects::BuiltinFnPtr| {
+    let mut register = |lib: &mut crate::table::Table<'a>,
+                        name: &'static std::ffi::CStr,
+                        func: crate::objects::BuiltinFnPtr|
+     -> Result<(), VmError<'a>> {
         let key = state.intern(name.to_str().unwrap_or(""));
         let name_ptr = name.as_ptr() as *const u8;
-        lib.set(key, BuiltinFn::impure_tvalue(func, name_ptr));
+        state.table_set(lib, key, BuiltinFn::impure_tvalue(func, name_ptr))
     };
 
-    register(&mut lib, c"concat", call_concat);
-    register(&mut lib, c"unpack", call_unpack);
-    register(&mut lib, c"pack", call_pack);
-    register(&mut lib, c"insert", call_insert);
-    register(&mut lib, c"remove", call_remove);
-    register(&mut lib, c"sort", call_sort);
-    register(&mut lib, c"move", call_move);
-    register(&mut lib, c"create", call_create);
+    register(&mut lib, c"concat", call_concat)?;
+    register(&mut lib, c"unpack", call_unpack)?;
+    register(&mut lib, c"pack", call_pack)?;
+    register(&mut lib, c"insert", call_insert)?;
+    register(&mut lib, c"remove", call_remove)?;
+    register(&mut lib, c"sort", call_sort)?;
+    register(&mut lib, c"move", call_move)?;
+    register(&mut lib, c"create", call_create)?;
 
-    unsafe { state.gc_mut().register_table(&lib) };
+    state.register_table(&lib)?;
     let key = state.intern_str("table");
-    state.globals.set(key, TValue::Table(lib));
+    let globals = state.globals.clone();
+    state.table_set(&globals, key, TValue::Table(lib))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1000,7 +1010,7 @@ mod tests {
     #[test]
     fn test_open_table_lib() {
         let mut state = LuaState::default();
-        open_table_lib(&mut state);
+        open_table_lib(&mut state).expect("打开 table 库失败");
         let key = state.intern_str("table");
         let val = state.globals.get(&key);
         assert!(val.is_some(), "table must be registered");

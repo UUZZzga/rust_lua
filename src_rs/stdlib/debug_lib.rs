@@ -578,7 +578,7 @@ fn call_getinfo<'a>(
     if matches!(level_or_func, TValue::LClosure(_)) {
         // 函数参数模式
         if let TValue::LClosure(closure) = &level_or_func {
-            fill_info_from_closure(&mut info, closure, &what, state.alloc_slot());
+            fill_info_from_closure(state, &mut info, closure, &what)?;
         }
     } else if let TValue::RustClosure(rc) = &level_or_func {
         // Rust 闭包 (string.gmatch 迭代器 / coroutine.wrap / io.lines):
@@ -675,109 +675,149 @@ fn call_getinfo<'a>(
     }
 
     // 构建结果表
-    let result_table = Table::new_in(state.alloc_slot());
+    let result_table = state.new_table()?;
 
     if what.contains('S') {
-        result_table.set(state.intern_str("source"), state.intern_str(&info.source));
-        result_table.set(
+        state.table_set(
+            &result_table,
+            state.intern_str("source"),
+            state.intern_str(&info.source),
+        )?;
+        state.table_set(
+            &result_table,
             state.intern_str("short_src"),
             state.intern_str(&info.short_src),
-        );
-        result_table.set(
+        )?;
+        state.table_set(
+            &result_table,
             state.intern_str("linedefined"),
             TValue::Integer(info.linedefined as LuaInteger),
-        );
-        result_table.set(
+        )?;
+        state.table_set(
+            &result_table,
             state.intern_str("lastlinedefined"),
             TValue::Integer(info.lastlinedefined as LuaInteger),
-        );
-        result_table.set(state.intern_str("what"), state.intern_str(&info.what));
+        )?;
+        state.table_set(
+            &result_table,
+            state.intern_str("what"),
+            state.intern_str(&info.what),
+        )?;
     }
     if what.contains('l') {
-        result_table.set(
+        state.table_set(
+            &result_table,
             state.intern_str("currentline"),
             TValue::Integer(info.currentline as LuaInteger),
-        );
+        )?;
     }
     if what.contains('u') {
-        result_table.set(
+        state.table_set(
+            &result_table,
             state.intern_str("nups"),
             TValue::Integer(info.nups as LuaInteger),
-        );
-        result_table.set(
+        )?;
+        state.table_set(
+            &result_table,
             state.intern_str("nparams"),
             TValue::Integer(info.nparams as LuaInteger),
-        );
-        result_table.set(state.intern_str("isvararg"), TValue::Boolean(info.isvararg));
+        )?;
+        state.table_set(
+            &result_table,
+            state.intern_str("isvararg"),
+            TValue::Boolean(info.isvararg),
+        )?;
     }
     if what.contains('n') {
         match &info.name {
             Some(name) => {
-                result_table.set(state.intern_str("name"), state.intern_str(name));
+                state.table_set(
+                    &result_table,
+                    state.intern_str("name"),
+                    state.intern_str(name),
+                )?;
             }
             None => {
-                result_table.set(state.intern_str("name"), TValue::Nil(NilKind::Strict));
+                state.table_set(
+                    &result_table,
+                    state.intern_str("name"),
+                    TValue::Nil(NilKind::Strict),
+                )?;
             }
         }
-        result_table.set(
+        state.table_set(
+            &result_table,
             state.intern_str("namewhat"),
             state.intern_str(&info.namewhat),
-        );
+        )?;
     }
     if what.contains('r') {
-        result_table.set(
+        state.table_set(
+            &result_table,
             state.intern_str("ftransfer"),
             TValue::Integer(info.ftransfer as LuaInteger),
-        );
-        result_table.set(
+        )?;
+        state.table_set(
+            &result_table,
             state.intern_str("ntransfer"),
             TValue::Integer(info.ntransfer as LuaInteger),
-        );
+        )?;
     }
     if what.contains('t') {
-        result_table.set(
+        state.table_set(
+            &result_table,
             state.intern_str("istailcall"),
             TValue::Boolean(info.istailcall),
-        );
-        result_table.set(
+        )?;
+        state.table_set(
+            &result_table,
             state.intern_str("extraargs"),
             TValue::Integer(info.extraargs as LuaInteger),
-        );
+        )?;
     }
     if what.contains('L') {
         // activelines 表 — 对应 C 的 collectvalidlines
         // 对于 C 函数, activelines 为 nil
-        if let Some(ref closure) = info.closure {
-            let mut actlines = Table::new_in(state.alloc_slot());
-            fill_active_lines(&mut actlines, &closure.proto);
-            unsafe { state.gc_mut().register_table(&actlines) };
-            result_table.set(state.intern_str("activelines"), TValue::Table(actlines));
+        if let Some(closure) = &info.closure {
+            let mut actlines = state.new_table()?;
+            fill_active_lines(state, &mut actlines, &closure.proto)?;
+            state.register_table(&actlines)?;
+            state.table_set(
+                &result_table,
+                state.intern_str("activelines"),
+                TValue::Table(actlines),
+            )?;
         } else {
             // C 函数: activelines = nil
-            result_table.set(
+            state.table_set(
+                &result_table,
                 state.intern_str("activelines"),
                 TValue::Nil(NilKind::Strict),
-            );
+            )?;
         }
     }
     if what.contains('f') {
         // level 模式下使用 info.func (由 fill_info_from_level 设置)
         // 函数参数模式下从栈上获取原始函数值 (保持引用语义)
         if let Some(func_val) = info.func.take() {
-            result_table.set(state.intern_str("func"), func_val);
+            state.table_set(&result_table, state.intern_str("func"), func_val)?;
         } else {
             // 函数参数模式: 从栈上获取原始函数值
             // 对应 C 的 lua_pushvalue(L, arg + 1)
             let func_idx = a + 1 + arg_offset;
             if func_idx < state.stack.len() {
                 let func_val = state.stack[func_idx].clone();
-                result_table.set(state.intern_str("func"), func_val);
+                state.table_set(&result_table, state.intern_str("func"), func_val)?;
             } else {
-                result_table.set(state.intern_str("func"), TValue::Nil(NilKind::Strict));
+                state.table_set(
+                    &result_table,
+                    state.intern_str("func"),
+                    TValue::Nil(NilKind::Strict),
+                )?;
             }
         }
     }
-    unsafe { state.gc_mut().register_table(&result_table) };
+    state.register_table(&result_table)?;
     push_single_result(state, a, nresults, TValue::Table(result_table));
     Ok(())
 }
@@ -806,15 +846,15 @@ struct DebugInfo<'a> {
 
 /// 从闭包填充调试信息
 fn fill_info_from_closure<'a>(
+    state: &mut LuaState<'a>,
     info: &mut DebugInfo<'a>,
     closure: &LClosure<'a>,
     what: &str,
-    alloc: SlotAlloc,
-) {
+) -> Result<(), VmError<'a>> {
     let proto = &closure.proto;
     // 注意: 不在此设置 info.func, 由 call_getinfo 直接从栈上获取原始值
     // 以确保 b.func == 原始函数 (引用语义)
-    info.closure = Some(MyRc::new_in(alloc, closure.clone()));
+    info.closure = Some(state.new_object(closure.clone())?);
 
     if what.contains('S') {
         info.source = proto
@@ -858,6 +898,7 @@ fn fill_info_from_closure<'a>(
         info.ftransfer = 0;
         info.ntransfer = 0;
     }
+    Ok(())
 }
 
 /// 从栈级别填充调试信息
@@ -1418,9 +1459,13 @@ fn fill_info_from_thread<'a>(
 /// 1. 从 linedefined 开始
 /// 2. 对每条指令, 计算其行号 (nextline)
 /// 3. 将该行标记为 true
-fn fill_active_lines(table: &mut Table, proto: &Proto) {
+fn fill_active_lines<'a>(
+    state: &mut LuaState<'a>,
+    table: &mut Table<'a>,
+    proto: &Proto,
+) -> Result<(), VmError<'a>> {
     if proto.line_info.is_empty() {
-        return;
+        return Ok(());
     }
 
     const ABSLINEINFO: i8 = -0x80;
@@ -1483,9 +1528,10 @@ fn fill_active_lines(table: &mut Table, proto: &Proto) {
     for i in start..proto.line_info.len() {
         currentline = next_line(proto, currentline, i);
         if currentline > 0 {
-            table.set_int(currentline as LuaInteger, TValue::Boolean(true));
+            state.table_set_int(table, currentline as LuaInteger, TValue::Boolean(true))?;
         }
     }
+    Ok(())
 }
 
 /// 从 ThreadContext 获取局部变量名和值 — 用于 debug.getlocal(co, level, nvar)
@@ -2530,7 +2576,7 @@ fn call_sethook<'a>(
             ctx.exec.current_hook_count = 0;
             ctx.exec.allowhook = true;
         } else {
-            set_hook_in_registry(state, None, 0, 0);
+            set_hook_in_registry(state, None, 0, 0)?;
         }
     } else {
         let mask_str = match &get_arg(state, a, arg_offset + 1) {
@@ -2555,7 +2601,7 @@ fn call_sethook<'a>(
             ctx.exec.current_hook_count = count;
             ctx.exec.allowhook = true;
         } else {
-            set_hook_in_registry(state, Some(hook), mask, count);
+            set_hook_in_registry(state, Some(hook), mask, count)?;
         }
     }
 
@@ -2656,7 +2702,7 @@ fn set_hook_in_registry<'a>(
     hook: Option<TValue<'a>>,
     mask: i32,
     count: i32,
-) {
+) -> Result<(), VmError<'a>> {
     let hookkey = state.intern_str(HOOKKEY);
 
     // 获取或创建 hook 表
@@ -2664,12 +2710,12 @@ fn set_hook_in_registry<'a>(
         Some(TValue::Table(t)) => t.clone(),
         _ => {
             // 创建新表并设置元表 (__mode = "k")
-            let t = Table::new_in(state.alloc_slot());
-            let mt = Table::with_capacity_in(state.alloc_slot(), 0, 1);
-            mt.set(state.intern_str("__mode"), state.intern_str("k"));
-            unsafe { state.gc_mut().register_table(&mt) };
+            let t = state.new_table()?;
+            let mt = state.new_table_with_capacity(0, 1)?;
+            state.table_set(&mt, state.intern_str("__mode"), state.intern_str("k"))?;
+            state.register_table(&mt)?;
             t.set_metatable(Some(mt));
-            unsafe { state.gc_mut().register_table(&t) };
+            state.register_table(&t)?;
             t
         }
     };
@@ -2678,24 +2724,27 @@ fn set_hook_in_registry<'a>(
     let thread_key = TValue::Integer(1);
     match &hook {
         Some(f) => {
-            hook_table.set(thread_key, f.clone());
+            state.table_set(&hook_table, thread_key, f.clone())?;
         }
         None => {
-            hook_table.set(thread_key, TValue::Nil(NilKind::Strict));
+            state.table_set(&hook_table, thread_key, TValue::Nil(NilKind::Strict))?;
         }
     }
 
     // 存储掩码和计数
-    hook_table.set(
+    state.table_set(
+        &hook_table,
         state.intern_str("_mask"),
         TValue::Integer(mask as LuaInteger),
-    );
-    hook_table.set(
+    )?;
+    state.table_set(
+        &hook_table,
         state.intern_str("_count"),
         TValue::Integer(count as LuaInteger),
-    );
+    )?;
 
-    state.registry.set(hookkey, TValue::Table(hook_table));
+    let reg = state.registry.clone();
+    state.table_set(&reg, hookkey, TValue::Table(hook_table))?;
 
     // 同时设置 state 的 hook 字段，供 VM 执行循环快速访问
     state.hook_func = hook;
@@ -2704,6 +2753,7 @@ fn set_hook_in_registry<'a>(
     state.current_hook_count = count;
     // 不修改 hook_old_pc — 对应 C 的 sethook 不修改 oldpc
     // oldpc 只在 luaD_hookcall（函数调用）和 rethook（函数返回）中被修改
+    Ok(())
 }
 
 /// debug.traceback([thread,] [message [, level]]) — 对应 C 的 db_traceback
@@ -3333,43 +3383,49 @@ fn call_debug<'a>(
 /// 创建调试库表
 ///
 /// 对应 C 源码 ldblib.cpp 的 luaopen_debug 函数
-pub fn create_debug_lib_table<'a>(state: &LuaState<'a>) -> Table<'a> {
-    let mut lib = Table::new_in(state.alloc_slot());
+pub fn create_debug_lib_table<'a>(state: &mut LuaState<'a>) -> Result<Table<'a>, VmError<'a>> {
+    let mut lib = state.new_table()?;
 
     // 注册所有 debug 函数 (使用 BuiltinFn 函数指针)
-    let register =
-        |lib: &mut Table<'a>, name: &'static std::ffi::CStr, func: crate::objects::BuiltinFnPtr| {
-            let key = state.intern(name.to_str().unwrap_or(""));
-            let name_ptr = name.as_ptr() as *const u8;
-            lib.set(key, BuiltinFn::impure_tvalue(func, name_ptr));
-        };
+    let register = |lib: &mut Table<'a>,
+                    state: &mut LuaState<'a>,
+                    name: &'static std::ffi::CStr,
+                    func: crate::objects::BuiltinFnPtr|
+     -> Result<(), VmError<'a>> {
+        let key = state.intern(name.to_str().unwrap_or(""));
+        let name_ptr = name.as_ptr() as *const u8;
+        state.table_set(lib, key, BuiltinFn::impure_tvalue(func, name_ptr))?;
+        Ok(())
+    };
 
-    register(&mut lib, c"traceback", call_traceback);
-    register(&mut lib, c"debug", call_debug);
-    register(&mut lib, c"getuservalue", call_getuservalue);
-    register(&mut lib, c"gethook", call_gethook);
-    register(&mut lib, c"getinfo", call_getinfo);
-    register(&mut lib, c"getlocal", call_getlocal);
-    register(&mut lib, c"getregistry", call_getregistry);
-    register(&mut lib, c"getmetatable", call_getmetatable);
-    register(&mut lib, c"getupvalue", call_getupvalue);
-    register(&mut lib, c"upvaluejoin", call_upvaluejoin);
-    register(&mut lib, c"upvalueid", call_upvalueid);
-    register(&mut lib, c"setuservalue", call_setuservalue);
-    register(&mut lib, c"sethook", call_sethook);
-    register(&mut lib, c"setlocal", call_setlocal);
-    register(&mut lib, c"setmetatable", call_setmetatable);
-    register(&mut lib, c"setupvalue", call_setupvalue);
+    register(&mut lib, state, c"traceback", call_traceback)?;
+    register(&mut lib, state, c"debug", call_debug)?;
+    register(&mut lib, state, c"getuservalue", call_getuservalue)?;
+    register(&mut lib, state, c"gethook", call_gethook)?;
+    register(&mut lib, state, c"getinfo", call_getinfo)?;
+    register(&mut lib, state, c"getlocal", call_getlocal)?;
+    register(&mut lib, state, c"getregistry", call_getregistry)?;
+    register(&mut lib, state, c"getmetatable", call_getmetatable)?;
+    register(&mut lib, state, c"getupvalue", call_getupvalue)?;
+    register(&mut lib, state, c"upvaluejoin", call_upvaluejoin)?;
+    register(&mut lib, state, c"upvalueid", call_upvalueid)?;
+    register(&mut lib, state, c"setuservalue", call_setuservalue)?;
+    register(&mut lib, state, c"sethook", call_sethook)?;
+    register(&mut lib, state, c"setlocal", call_setlocal)?;
+    register(&mut lib, state, c"setmetatable", call_setmetatable)?;
+    register(&mut lib, state, c"setupvalue", call_setupvalue)?;
 
-    unsafe { state.gc_mut().register_table(&lib) };
-    lib
+    state.register_table(&lib)?;
+    Ok(lib)
 }
 
 /// 打开调试库并注册到全局变量 debug
-pub fn open_debug_lib(state: &mut LuaState) {
-    let lib = create_debug_lib_table(state);
+pub fn open_debug_lib<'a>(state: &mut LuaState<'a>) -> Result<(), VmError<'a>> {
+    let lib = create_debug_lib_table(state)?;
     let key = state.intern_str("debug");
-    state.globals.set(key, TValue::Table(lib));
+    let g = state.globals.clone();
+    state.table_set(&g, key, TValue::Table(lib))?;
+    Ok(())
 }
 
 // ============================================================================
@@ -3411,7 +3467,7 @@ mod tests {
     #[test]
     fn test_open_debug_lib_registers_table() {
         let mut state = LuaState::default();
-        open_debug_lib(&mut state);
+        open_debug_lib(&mut state).expect("打开 debug 库失败");
 
         let key = state.intern_str("debug");
         let val = state.globals.get(&key);
@@ -3813,7 +3869,7 @@ mod tests {
     #[test]
     fn test_call_debug_returns_nothing() {
         let mut buff = crate::mock::io_mock::BufferIo::new("cont\n");
-        let mut state = LuaState::new_main(&mut buff);
+        let mut state = LuaState::new_main(&mut buff).expect("创建 state 失败");
         state.stack.clear();
         call_debug(&mut state, 0, 0, 0).unwrap();
         assert_eq!(state.stack.len(), 0);
@@ -3822,7 +3878,7 @@ mod tests {
     #[test]
     fn test_open_debug_lib() {
         let mut state = LuaState::default();
-        open_debug_lib(&mut state);
+        open_debug_lib(&mut state).expect("打开 debug 库失败");
         let key = state.intern_str("debug");
         let val = state.globals.get(&key);
         assert!(val.is_some(), "debug must be registered");

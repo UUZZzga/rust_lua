@@ -10,7 +10,7 @@ use crate::objects::{
     Instruction, LClosure, LuaThread, LuaType, NilKind, Proto, TValue, ThreadContext, UpVal,
     UpValRef, UpValVec, WeakValue,
 };
-use crate::strings::{lua_string_as_str, lua_string_len, StringTable};
+use crate::strings::{lua_string_as_str, lua_string_len, StringTable, MEMERRMSG};
 use crate::table::Table;
 use crate::tm::DefaultMetatables;
 use crate::tm::{init_tmnames, TM_N};
@@ -33,6 +33,8 @@ use std::rc::{Rc, Weak};
 pub const LUA_YIELD: i32 = 1;
 pub const ERR_RUN: i32 = 2;
 pub const ERR_SYNTAX: i32 = 3;
+/// 内存不足 —— 对应 C 的 `LUA_ERRMEM`（`lua_load` 等按状态码返回的入口用它报分配失败）
+pub const ERR_MEM: i32 = 4;
 pub const ERR_FILE: i32 = 6; // LUA_ERRERR + 1, used by luaL_loadfilex
 pub const MULT_RET: i32 = -1;
 
@@ -191,6 +193,16 @@ pub struct LuaState<'a> {
     pub call_stack: Vec<crate::objects::CallFrame<'a>>,
     pub stack: Vec<TValue<'a>>,
 
+    /// GC 标记工作栈 —— 跨 GC 周期复用（`collect_gc` 取用后放回）。
+    ///
+    /// 复用有两个目的：
+    /// 1. 省掉每周期一次大 `malloc`（1.2M 活跃对象时需要 ~19MB 的 worklist）；
+    /// 2. **让紧急回收不依赖新分配**：分配失败触发的回收若再为新 worklist 申请
+    ///    内存（并因此 abort），内存错误就永远报不出来（实测 200MB 限制下正是
+    ///    这一条先崩）。拿不到容量时 [`LuaState::collect_gc`] 直接跳过本次回收，
+    ///    把失败留给调用方（漏斗会转成 `VmError::MemoryError`）。
+    pub gc_worklist: Vec<crate::gc::RawTValue<'a>>,
+
     /// 已初始化 scratch 槽上界 (exclusive): `[stack.len(), scratch_end)` 是已分配且
     /// 已写入 Nil 的内存, 供 write_stack 无分支写复用 (当前帧寄存器区), 恒 >= 该帧
     /// 写边界 frame_floor()。**len 仍是精确的 live top 上界 (所有读取者不受影响)**;
@@ -251,6 +263,14 @@ pub struct LuaState<'a> {
 
     /// 最后一次错误的格式化消息（含 source:line 前缀）
     pub last_error_msg: String,
+
+    /// 最后一次错误是否为内存错误（`VmError::MemoryError`）。
+    ///
+    /// 内存错误的对象复用预注册的 `memerrmsg`（C 的 `luaD_seterrorobj` 语义），
+    /// 不加 source:line 前缀、也不再做任何分配 —— 本标志供 pcall 的错误值构造
+    /// 判断是否需要跳过「用 `last_error_msg` 替换错误字符串」这一步。
+    /// 由 [`crate::execute::VmExecutor::build_traceback`] 在每次错误时刷新。
+    pub last_error_is_memerr: std::cell::Cell<bool>,
 
     /// 最后一次错误的原始值（保留原始 TValue 类型，如 error(100) 的数字 100）
     /// coroutine.close 需要返回此原始值
@@ -374,6 +394,8 @@ impl<'a> LuaState<'a> {
             api_func_base: 0,
             last_traceback: String::new(),
             last_error_msg: String::new(),
+            last_error_is_memerr: std::cell::Cell::new(false),
+            gc_worklist: Vec::new(),
             last_error_value: None,
             pending_error: None,
             error_no_prefix: false,
@@ -395,9 +417,15 @@ impl<'a> LuaState<'a> {
 
 /// 主线程构造（对应 C 的 `lua_newstate`）：创建并持有共享全局块。
 /// 使用默认 IO（`lua_io()`）；自定义 IO 用 `LuaState::new_main`。
+///
+/// 【测试专用】`Default` 无法返回错误，故只在测试构建提供；
+/// 生产路径用 `LuaState::new_main`（`Result`，对应 C 的 `lua_newstate` 返回 NULL）。
+#[cfg(test)]
 impl Default for LuaState<'static> {
     fn default() -> Self {
         Self::new_main(crate::mock::io_mock::lua_io())
+            .ok()
+            .expect("LuaState::default: 测试创建 state 失败")
     }
 }
 
@@ -414,18 +442,20 @@ impl<'a> LuaState<'a> {
     pub fn new_main_with_allocator(
         io: &'a mut dyn crate::mock::io_mock::Io,
         allocator: Box<dyn Allocator>,
-    ) -> Self {
-        let owner = Box::new(GlobalState::new_shared(io, allocator));
+    ) -> Result<Self, crate::mem::AllocFailed> {
+        let owner = Box::new(GlobalState::new_shared(io, allocator)?);
         let mut s = Self::empty_thread();
         s.stack = GlobalState::init_stack();
         s.top = s.stack.len();
         s.owner = Some(owner);
         s.bind_exec();
-        s
+        Ok(s)
     }
 
     /// 同 `new_main_with_allocator`，使用 `DefaultAllocator`。
-    pub fn new_main(io: &'a mut dyn crate::mock::io_mock::Io) -> Self {
+    pub fn new_main(
+        io: &'a mut dyn crate::mock::io_mock::Io,
+    ) -> Result<Self, crate::mem::AllocFailed> {
         Self::new_main_with_allocator(io, Box::new(DefaultAllocator))
     }
 
@@ -522,10 +552,7 @@ impl<'a> LuaState<'a> {
     /// 同 `g()`/`g_mut()` 的修法）；协程（无 owner）才走 `l_g`。
     #[inline]
     pub unsafe fn gc_ptr(&self) -> *mut GCState<'a> {
-        match self.owner.as_ref() {
-            Some(b) => (*b).gc.as_ptr(),
-            None => (*self.l_g).gc.as_ptr(),
-        }
+        (*self.l_g).gc.as_ptr()
     }
 
     /// 对应 C 的 `G(L)->gc`：GC 状态可变访问（C 语义的内部可变，仅借 `&self`）。
@@ -584,43 +611,48 @@ impl<'a> std::ops::DerefMut for LuaState<'a> {
 impl<'a> LuaState<'a> {
     /// 打开选定的标准库 — 对应 C 的 `luaL_openselectedlibs(L, load, preload)`。
     /// 标准库开库需要每线程执行态（LuaState = C 的 lua_State）。
-    pub fn open_selected_libs(&mut self, _mask: i32, _ignored: i32) {
-        let arg_table = Table::new_in(self.alloc_slot());
-        unsafe { self.gc_mut().register_table(&arg_table) };
-        self.globals
-            .set(self.intern_str("arg"), TValue::Table(arg_table));
+    pub fn open_selected_libs(
+        &mut self,
+        _mask: i32,
+        _ignored: i32,
+    ) -> Result<(), crate::execute::VmError<'a>> {
+        let arg_table = self.new_table()?;
+        self.register_table(&arg_table)?;
+        let globals = self.globals.clone();
+        let arg_key = self.intern_str("arg");
+        self.table_set(&globals, arg_key, TValue::Table(arg_table))?;
 
         // 打开基础库 (注册 print, type, pcall, error, setmetatable, getmetatable,
         // tonumber, tostring, assert, select, rawequal, rawlen, rawget, rawset,
         // next, ipairs, pairs, xpcall, warn, _G, _VERSION 等全局函数)
-        crate::stdlib::base_lib::open_base_lib(self);
+        crate::stdlib::base_lib::open_base_lib(self)?;
 
         // 打开字符串库 (创建字符串元表)
-        crate::stdlib::string_lib::open_string_lib(self);
+        crate::stdlib::string_lib::open_string_lib(self)?;
 
         // 打开数学库 (注册 math 全局表, 包含 abs/sin/cos/random 等)
-        crate::stdlib::math_lib::open_math_lib(self);
+        crate::stdlib::math_lib::open_math_lib(self)?;
 
         // 打开 UTF-8 库 (注册 utf8 全局表, 包含 offset/codepoint/char/len/codes 等)
-        crate::stdlib::utf8_lib::open_utf8_lib(self);
+        crate::stdlib::utf8_lib::open_utf8_lib(self)?;
 
         // 打开 Table 库 (注册 table 全局表, 包含 concat/unpack/pack/insert/remove 等)
-        crate::stdlib::table_lib::open_table_lib(self);
+        crate::stdlib::table_lib::open_table_lib(self)?;
 
         // 打开 Debug 库 (注册 debug 全局表, 包含 getinfo/getlocal/setupvalue/traceback/sethook 等)
-        crate::stdlib::debug_lib::open_debug_lib(self);
+        crate::stdlib::debug_lib::open_debug_lib(self)?;
 
         // 打开 OS 库 (注册 os 全局表, 包含 setlocale 等)
-        crate::stdlib::os_lib::open_os_lib(self);
+        crate::stdlib::os_lib::open_os_lib(self)?;
 
         // 打开 Coroutine 库 (注册 coroutine 全局表, 包含 create/resume/yield/status 等)
-        crate::stdlib::coroutine_lib::open_coroutine_lib(self);
+        crate::stdlib::coroutine_lib::open_coroutine_lib(self)?;
 
         // 打开 I/O 库 (注册 io 全局表, 包含 stdin/stdout/stderr)
         // Miri 不支持 extern static stdin/stdout/stderr 与 fdopen,跳过 io 库初始化
         // (print 用 state.stdout 而非 io.stdout,基础测试不受影响)
         #[cfg(not(miri))]
-        crate::stdlib::io_lib::open_io_lib(self);
+        crate::stdlib::io_lib::open_io_lib(self)?;
 
         // 把标准库注册到 package.loaded（对应 C 的 luaL_requiref），
         // 防止 nextvar.lua 清理全局表时把标准库当作未加载模块删除
@@ -641,11 +673,12 @@ impl<'a> LuaState<'a> {
                 if let Some(TValue::Table(pkg)) = self.globals.get(&package_key) {
                     let loaded_key = self.intern_str("loaded");
                     if let Some(TValue::Table(loaded)) = pkg.get(&loaded_key) {
-                        loaded.set(name_val, lib);
+                        self.table_set(&loaded, name_val, lib)?;
                     }
                 }
             }
         }
+        Ok(())
     }
 }
 
@@ -734,7 +767,11 @@ impl<'a> LuaState<'a> {
         // (have 是「已知已初始化」的上界, 只用于判定是否需要填, 不能当填充起点)。
         let start = self.stack.len();
         if floor > start {
-            self.stack.reserve(floor - start);
+            // 容量不足时按需扩容。**注意**：这里必须能失败而不是 abort ——
+            // 但该函数是热路径入口（71 处 pad_frame_scratch 调用点）且无错误通道，
+            // 因此扩容由「帧入口预预留」承担（见 reserve_stack 的调用点）：
+            // 正常路径下 capacity 已由帧入口备足，此处的 reserve 只是兜底。
+            self.grow_stack_or_throw(floor - start);
             unsafe {
                 let ptr = self.stack.as_mut_ptr().add(start);
                 let nil = TValue::Nil(NilKind::Strict);
@@ -1095,6 +1132,7 @@ impl<'a> LuaState<'a> {
                     // 栈不够长: 先截断到 a+n_actual，再 resize 到 a+nr
                     self.truncate_live(a + n_actual);
                     unsafe { self.stack.set_len(a + n_actual) };
+                    self.grow_stack_or_throw(target - self.stack.len());
                     self.stack.resize(target, TValue::Nil(NilKind::Strict));
                 }
             }
@@ -1343,6 +1381,14 @@ impl<'a> LuaState<'a> {
                     self.top = frame_end;
                 }
 
+                // 帧增长经漏斗（对应 C 的 luaD_growstack → luaM_reallocvector 失败即
+                // luaM_error）：先备足到帧末尾 + 余量，使下文的 push 不再触发分配
+                // （plain Vec::push 在分配失败时只会 abort，没有错误通道）。
+                let frame_need = func_idx + 1 + fsize + crate::state::LUA_MINSTACK;
+                if frame_need > self.stack.len() {
+                    self.grow_stack_or_throw(frame_need - self.stack.len());
+                }
+
                 // Shield 机制: 防止内层 pcall 的 error 被外层 PcallProtection 错误捕获
                 // 当顶部 PcallProtection 有 saved_filled=true（即 yield 穿过外层 pcall）时，
                 // push 一个 shield（saved_filled=false）。execute_loop 的 error 处理只处理
@@ -1390,7 +1436,42 @@ impl<'a> LuaState<'a> {
                 // 可能已 push call_info 供 debug.getinfo 使用。
                 let saved_call_stack_frames = std::mem::take(&mut self.call_stack);
 
-                let result = VmExecutor::execute_loop(self);
+                // 执行受保护函数体。这里同时是**内存错误的保护边界**:
+                // 没有错误通道的分配点(帧入口栈扩容等)以 panic/longjmp 抛出
+                // MemoryErrorPanic(对应 C 的 luaD_throw(L, LUA_ERRMEM)),
+                // 在此转换回 VmError::MemoryError —— 错误对象取自预注册的
+                // memerrmsg, 转换过程零分配。
+                let result = {
+                    #[cfg(not(lua_use_longjmp))]
+                    {
+                        let state_ptr: *mut LuaState = self;
+                        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
+                            VmExecutor::execute_loop(&mut *state_ptr)
+                        })) {
+                            Ok(r) => r,
+                            Err(payload) => {
+                                if payload
+                                    .downcast_ref::<crate::mem::MemoryErrorPanic>()
+                                    .is_some()
+                                {
+                                    self.last_error_value = Some(self.memerrmsg_value());
+                                    self.last_error_is_memerr.set(true);
+                                    self.set_memerrmsg_text();
+                                    Err(crate::execute::VmError::MemoryError)
+                                } else {
+                                    std::panic::resume_unwind(payload)
+                                }
+                            }
+                        }
+                    }
+                    #[cfg(lua_use_longjmp)]
+                    {
+                        // panic=abort 构建 (bench profile): catch_unwind 不可用。此处不新设
+                        // 保护点 —— raise_memory_error 的 longjmp 直接落到最近的外层 setjmp
+                        // (通常是 capi lua_pcallk), 与 C 在 pcall 外层保护的语义一致。
+                        VmExecutor::execute_loop(self)
+                    }
+                };
 
                 // 恢复 call_stack（execute_loop 可能修改了它）
                 // 非 yield 路径: execute_loop 中的 op_return 应该走 else 分支（call_stack 为空），
@@ -1521,6 +1602,11 @@ impl<'a> LuaState<'a> {
                             let err_from_e = match e {
                                 VmError::RuntimeErrorValue(val) => val.clone(),
                                 VmError::RuntimeError(s) => self.intern_str(s.as_str()),
+                                // 内存错误: 复用预注册消息, 不分配 (对应 C 的 luaD_seterrorobj)
+                                VmError::MemoryError => {
+                                    self.last_error_is_memerr.set(true);
+                                    self.memerrmsg_value()
+                                }
                                 other => self.intern_str(&format!("{}", other)),
                             };
                             self.last_error_value = Some(err_from_e);
@@ -1682,8 +1768,23 @@ impl<'a> LuaState<'a> {
                             // 否则暂存区会随每次 Lua 层 pcall 失败无界增长（且这些值不再被释放）。
                             if self.stack.len() > func_idx {
                                 if self.c_pcall_stash {
-                                    let drained = self.stack.split_off(func_idx);
-                                    self.c_safety_keepalive.extend(drained);
+                                    // 暂存需要把值搬进 keepalive 区 —— 搬运动作会分配
+                                    // (split_off 建新 Vec + extend 增长)。内存耗尽时该分配
+                                    // 同样会失败, 因此先经漏斗**可失败地**预留容量;
+                                    // 预留失败则退化为 truncate_live (与 Lua 层 pcall 一致),
+                                    // 绝不 abort (C 在这里不需要分配: 它的栈是数组, 值原地留存)。
+                                    let pending = self.stack.len() - func_idx;
+                                    match self
+                                        .c_safety_keepalive
+                                        .try_reserve(pending)
+                                        .map_err(|_| crate::mem::AllocFailed)
+                                    {
+                                        Ok(()) => {
+                                            let drained = self.stack.split_off(func_idx);
+                                            self.c_safety_keepalive.extend(drained);
+                                        }
+                                        Err(_) => self.truncate_live(func_idx),
+                                    }
                                 } else {
                                     self.truncate_live(func_idx);
                                 }
@@ -1697,6 +1798,7 @@ impl<'a> LuaState<'a> {
                             let err_val =
                                 if matches!(err_val, TValue::LongStr(_) | TValue::ShortStr(_))
                                     && !self.last_error_msg.is_empty()
+                                    && !self.last_error_is_memerr.get()
                                 {
                                     let msg = self.last_error_msg.clone();
                                     self.g_mut().intern_str(&msg)
@@ -1708,7 +1810,12 @@ impl<'a> LuaState<'a> {
                             // (对应 C Lua 的 longjmp 后错误状态不跨 pcall 保留)
                             self.last_error_value = None;
                             self.stack.push(err_val);
-                            ERR_RUN
+                            // 内存错误按 LUA_ERRMEM 上报（对应 C 的 lua_pcall 返回 LUA_ERRMEM）
+                            if self.last_error_is_memerr.get() {
+                                ERR_MEM
+                            } else {
+                                ERR_RUN
+                            }
                         }
                     }
                 }
@@ -1776,7 +1883,7 @@ impl<'a> LuaState<'a> {
         // lua_pushxxx 自动扩展栈。
         let needed_cap = self.stack.len() + MIN_STACK;
         if self.stack.capacity() < needed_cap {
-            self.stack.reserve(MIN_STACK);
+            self.grow_stack_or_throw(MIN_STACK);
         }
 
         // 清空 pending_error，捕获 C 函数中 lua_error 触发的错误
@@ -2099,18 +2206,25 @@ impl<'a> LuaState<'a> {
         }
     }
 
-    pub fn set_global(&mut self, name: &str) {
+    pub fn set_global(&mut self, name: &str) -> Result<(), crate::execute::VmError<'a>> {
         let key = self.intern_str(name);
         if let Some(val) = self.pop_slot() {
-            self.globals.set(key, val);
+            let globals = self.globals.clone();
+            self.table_set(&globals, key, val)?;
         }
+        Ok(())
     }
 
-    pub fn create_table(&mut self, narr: usize, nrec: usize) {
-        let t = Table::with_capacity_in(self.alloc_slot(), narr, nrec);
-        let gcs = unsafe { self.gc.as_mut() };
-        gcs.register_table(&t);
+    pub fn create_table(
+        &mut self,
+        narr: usize,
+        nrec: usize,
+    ) -> Result<(), crate::execute::VmError<'a>> {
+        let t = self.new_table_with_capacity(narr, nrec)?;
+        self.register_table(&t)?;
+        self.reserve_stack(1)?;
         self.stack.push(TValue::Table(t));
+        Ok(())
     }
 
     pub fn raw_get_i(&mut self, idx: isize, i: LuaInteger) -> LuaType {
@@ -2131,14 +2245,24 @@ impl<'a> LuaState<'a> {
         }
     }
 
-    pub fn raw_set_i(&mut self, idx: isize, i: LuaInteger) {
+    pub fn raw_set_i(
+        &mut self,
+        idx: isize,
+        i: LuaInteger,
+    ) -> Result<(), crate::execute::VmError<'a>> {
         let abs = self.abs_index(idx);
         let val = self.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
         if abs > 0 && abs <= self.stack.len() {
-            if let TValue::Table(ref mut t) = self.stack[abs - 1] {
-                t.set_int(i, val);
+            // 先取出表句柄（Rc 计数 +1），否则与 `&mut self` 的漏斗调用冲突
+            let t = match &self.stack[abs - 1] {
+                TValue::Table(t) => Some(t.clone()),
+                _ => None,
+            };
+            if let Some(t) = t {
+                self.table_set_int(&t, i, val)?;
             }
         }
+        Ok(())
     }
 
     pub fn len(&self, idx: isize) -> usize {
@@ -2185,20 +2309,32 @@ impl<'a> LuaState<'a> {
                             value: TValue::Nil(NilKind::Strict),
                         })));
                 }
-                let closure = MyRc::<LClosure, SlotAlloc>::new_in(
-                    self.alloc_slot(),
-                    LClosure {
-                        gc_header: GCObjectHeader::new(),
-                        proto: Rc::new(proto),
-                        upvals,
-                    },
-                );
+                let closure = match self.new_object(LClosure {
+                    gc_header: GCObjectHeader::new(),
+                    proto: Rc::new(proto),
+                    upvals,
+                }) {
+                    Ok(c) => c,
+                    Err(_) => {
+                        // 对应 C 的 lua_load：分配失败返回 LUA_ERRMEM，
+                        // 预注册的 memerrmsg 作为错误对象留在栈上
+                        let mm = self.memerrmsg_value();
+                        self.stack.push(mm);
+                        return ERR_MEM;
+                    }
+                };
                 {
-                    let id = unsafe {
-                        self.gc.as_mut().register_object(
-                            std::mem::size_of::<LClosure>() + /* upvals 尺寸估算 */ 0,
-                            WeakValue::LClosure(closure.downgrade()),
-                        )
+                    // 对象表登记失败同样按内存错误上报（对应 lua_load 的 LUA_ERRMEM）
+                    let id = match self.register_object(
+                        std::mem::size_of::<LClosure>() + /* upvals 尺寸估算 */ 0,
+                        WeakValue::LClosure(closure.downgrade()),
+                    ) {
+                        Ok(id) => id,
+                        Err(_) => {
+                            let mm = self.memerrmsg_value();
+                            self.stack.push(mm);
+                            return ERR_MEM;
+                        }
                     };
                     closure.gc_header.set_id(id);
                 }
@@ -2253,14 +2389,19 @@ impl<'a> LuaState<'a> {
                                 value: TValue::Nil(NilKind::Strict),
                             })));
                     }
-                    let closure = MyRc::<LClosure, SlotAlloc>::new_in(
-                        self.alloc_slot(),
-                        LClosure {
-                            gc_header: GCObjectHeader::new(),
-                            proto: Rc::new(proto),
-                            upvals,
-                        },
-                    );
+                    let closure = match self.new_object(LClosure {
+                        gc_header: GCObjectHeader::new(),
+                        proto: Rc::new(proto),
+                        upvals,
+                    }) {
+                        Ok(c) => c,
+                        Err(_) => {
+                            // 见 load_buffer：LUA_ERRMEM 语义
+                            let mm = self.memerrmsg_value();
+                            self.stack.push(mm);
+                            return ERR_MEM;
+                        }
+                    };
                     self.stack.push(TValue::LClosure(closure));
                     0
                 }
@@ -2504,6 +2645,13 @@ pub struct GlobalState<'a> {
     /// （仅当释放了大量内存时才 trim，避免每次 GC 都做系统调用）
     pub last_gc_estimate: usize,
 
+    /// 内存错误消息对象 —— 对应 C 的 `global_State.memerrmsg`
+    /// （`lstring.c` 在 `f_luaopen` 里 `g->memerrmsg = luaS_newliteral(L, MEMERRMSG)`）。
+    ///
+    /// 内存错误传播一律复用它（C: `ldo.c::luaD_seterrorobj` 的 LUA_ERRMEM 分支），
+    /// 因为此时再分配字符串本身就可能失败。启动时创建，之后只读。
+    pub memerrmsg: Option<TValue<'a>>,
+
     /// 内存管理器 — lmem 层（mem.rs），C 风格分配原语经 allocator 动态分发执行。
     /// Rust API（`LuaState::new_main_with_allocator`）注入自定义 Allocator 或
     /// DefaultAllocator；C API（lua_newstate / lua_setallocf）注入 CapiAllocator
@@ -2662,7 +2810,10 @@ pub fn get_caller_proto_for_ci<'a, 'b>(
 impl<'a> GlobalState<'a> {
     /// 对应 C 的 lua_newstate → global_State 部分（模块私有：只能由
     /// `LuaState::new_main_with_allocator` 调用，其他模块无法构造 `GlobalState`）。
-    fn new_shared(io: &'a mut dyn crate::mock::io_mock::Io, allocator: Box<dyn Allocator>) -> Self {
+    fn new_shared(
+        io: &'a mut dyn crate::mock::io_mock::Io,
+        allocator: Box<dyn Allocator>,
+    ) -> Result<Self, crate::mem::AllocFailed> {
         // 分配器宿主先建立：槽自此刻起地址稳定且非 null，供本函数内所有早期
         // 对象（globals / registry / main_thread）使用——
         // 这消除了「构造期尚无槽 → 传 null → 退回 std::alloc」的旧兜底。
@@ -2674,20 +2825,30 @@ impl<'a> GlobalState<'a> {
         let global_state: Rc<RefCell<GlobalShared<'a>>> =
             Rc::new(RefCell::new(GlobalShared::new(alloc.clone())));
         let gs = &mut global_state.borrow_mut();
+        // 引导期（尚无 lua_State）：失败即返回 AllocFailed，由调用方决定
+        // （对应 C 的 lua_newstate 在分配失败时返回 NULL，不做紧急回收）。
         let globals = {
-            let t: Table<'a> = Table::new_in(alloc_slot);
-            gs.gc.register_table(&t);
+            let t: Table<'a> = Table::try_new_in(alloc_slot)?;
+            gs.gc
+                .try_register_table(&t)
+                .map_err(|_| crate::mem::AllocFailed)?;
             t
         };
         let registry = {
-            let t: Table<'a> = Table::new_in(alloc_slot);
-            gs.gc.register_table(&t);
+            let t: Table<'a> = Table::try_new_in(alloc_slot)?;
+            gs.gc
+                .try_register_table(&t)
+                .map_err(|_| crate::mem::AllocFailed)?;
             t
         };
-        registry.set(TValue::Integer(2), TValue::Table(globals.clone()));
+        registry.try_reserve_for(&TValue::Integer(2), false)?;
+        registry.set_unchecked(TValue::Integer(2), TValue::Table(globals.clone()));
 
         let tmnames = Rc::new(init_tmnames(&string_table));
-        GlobalState {
+        // 预注册内存错误消息（C: lstring.c `g->memerrmsg = luaS_newliteral(L, MEMERRMSG)`）。
+        // 此时内存充裕；此后内存错误路径直接复用该对象，不再分配。
+        let memerrmsg = Some(str_to_ls(alloc_slot, &string_table, MEMERRMSG));
+        Ok(GlobalState {
             main: std::ptr::null_mut(),
             tick: std::cell::Cell::new(0),
             twups_linked: false,
@@ -2712,7 +2873,7 @@ impl<'a> GlobalState<'a> {
             math_random_state: Rc::new(RefCell::new(None)),
             warn_on: Rc::new(std::cell::Cell::new(true)),
             warn_pending: Rc::new(std::cell::Cell::new(false)),
-            main_thread: MyRc::new_in(
+            main_thread: MyRc::try_new_in(
                 alloc_slot,
                 LuaThread {
                     function: None,
@@ -2720,7 +2881,8 @@ impl<'a> GlobalState<'a> {
                     context: Rc::new(RefCell::new(ThreadContext::default())),
                     c_state: std::cell::Cell::new(std::ptr::null_mut()),
                 },
-            ),
+            )
+            .map_err(|_| crate::mem::AllocFailed)?,
             weak_tables: Rc::new(RefCell::new(Vec::new())),
             concat_gc_counter: std::cell::Cell::new(0),
             concat_gc_interval: std::cell::Cell::new(32768),
@@ -2731,9 +2893,10 @@ impl<'a> GlobalState<'a> {
             cached_mode_key: std::cell::RefCell::new(None),
             cached_gc_key: std::cell::RefCell::new(None),
             last_gc_estimate: 0,
+            memerrmsg,
             mem: MemState::new_complete(alloc),
             io: io,
-        }
+        })
     }
 
     /// 初始化栈: 对应 C 的 stack_init
@@ -2760,7 +2923,7 @@ impl<'a> LuaState<'a> {
         mut stack: Vec<TValue<'a>>,
         global_state: Rc<RefCell<GlobalShared<'a>>>,
         string_table: Rc<StringTable>,
-    ) -> LuaState<'a> {
+    ) -> Result<LuaState<'a>, crate::mem::AllocFailed> {
         // 分配器宿主取自共享块本身：本函数把 globals/registry 注册进 `gs.gc`，
         // 它们必须由**该块自己的**宿主释放（槽内联在引用计数块里，释放发生在
         // 宿主的内层 Box 上）。若此处临时新建宿主并随 `GlobalState` 一起析构，
@@ -2783,18 +2946,24 @@ impl<'a> LuaState<'a> {
         let top = stack.len();
 
         let globals = {
-            let t = Table::new_in(alloc_slot);
-            gs.gc.register_table(&t);
+            let t = Table::try_new_in(alloc_slot)?;
+            gs.gc
+                .try_register_table(&t)
+                .map_err(|_| crate::mem::AllocFailed)?;
             t
         };
 
         let registry = {
-            let t = Table::new_in(alloc_slot);
-            gs.gc.register_table(&t);
+            let t = Table::try_new_in(alloc_slot)?;
+            gs.gc
+                .try_register_table(&t)
+                .map_err(|_| crate::mem::AllocFailed)?;
             t
         };
 
         let tmnames = Rc::new(init_tmnames(&string_table));
+        // 预注册内存错误消息（见 `new_shared`）。
+        let memerrmsg = Some(str_to_ls(alloc_slot, &string_table, MEMERRMSG));
         let owner = Box::new(GlobalState {
             main: std::ptr::null_mut(),
             tick: std::cell::Cell::new(0),
@@ -2839,6 +3008,7 @@ impl<'a> LuaState<'a> {
             cached_mode_key: std::cell::RefCell::new(None),
             cached_gc_key: std::cell::RefCell::new(None),
             last_gc_estimate: 0,
+            memerrmsg,
             mem: MemState::new_complete(alloc),
             io: crate::mock::io_mock::lua_io(),
         });
@@ -2855,7 +3025,7 @@ impl<'a> LuaState<'a> {
         s.proto_flag = proto.flag;
         s.owner = Some(owner);
         s.bind_exec();
-        s
+        Ok(s)
     }
 }
 
@@ -3047,6 +3217,41 @@ impl<'a> GlobalState<'a> {
         str_to_ls(self.alloc_slot(), &self.string_table, s)
     }
 
+    /// 内存错误对象 —— 复用状态创建时预注册的消息（对应 C 的 `G(L)->memerrmsg`
+    /// 与 `ldo.c::luaD_seterrorobj` 的 LUA_ERRMEM 分支），**不分配内存**。
+    #[inline]
+    pub fn memerrmsg_value(&self) -> TValue<'a> {
+        self.memerrmsg
+            .clone()
+            .unwrap_or(TValue::Nil(NilKind::Strict))
+    }
+
+    /// `VmError` → Lua 错误对象。`MemoryError` 走预注册消息（不分配）；
+    /// 其余变体沿用原有「字符串内部化 / 原样保留」语义。
+    pub fn error_object_from(&self, e: &crate::execute::VmError<'a>) -> TValue<'a> {
+        match e {
+            crate::execute::VmError::RuntimeErrorValue(v) => v.clone(),
+            crate::execute::VmError::RuntimeError(s) => self.intern_str(s),
+            crate::execute::VmError::MemoryError => self.memerrmsg_value(),
+            other => self.intern_str(&format!("{}", other)),
+        }
+    }
+}
+
+impl<'a> LuaState<'a> {
+    /// `last_error_msg` 的**不分配**写法：内存错误用静态 `MEMERRMSG`。
+    ///
+    /// `try_reserve` 失败时留空（消费者回退到错误对象，见 CLI 的 `report`）——
+    /// 绝不能在这条路径上触发第二次分配失败。
+    pub fn set_memerrmsg_text(&mut self) {
+        self.last_error_msg.clear();
+        if self.last_error_msg.try_reserve(MEMERRMSG.len()).is_ok() {
+            self.last_error_msg.push_str(MEMERRMSG);
+        }
+    }
+}
+
+impl<'a> GlobalState<'a> {
     pub fn intern(&self, s: &str) -> TValue<'a> {
         str_to_ls(self.alloc_slot(), &self.string_table, s)
     }
@@ -3230,7 +3435,8 @@ mod tests {
         )))));
 
         // case 1: base=0, empty stack → main function scenario
-        let state = LuaState::from_proto(&proto, 0, vec![], Rc::clone(&gs), string_table.clone());
+        let state = LuaState::from_proto(&proto, 0, vec![], Rc::clone(&gs), string_table.clone())
+            .expect("测试: 构建 state 失败");
         assert_eq!(state.base, 0);
         assert_eq!(
             state.stack.len(),
@@ -3239,7 +3445,8 @@ mod tests {
         );
 
         // case 2: base=1, empty stack → called function scenario
-        let state = LuaState::from_proto(&proto, 1, vec![], Rc::clone(&gs), string_table.clone());
+        let state = LuaState::from_proto(&proto, 1, vec![], Rc::clone(&gs), string_table.clone())
+            .expect("测试: 构建 state 失败");
         assert_eq!(state.base, 1);
         assert_eq!(
             state.stack.len(),
@@ -3255,7 +3462,8 @@ mod tests {
             vec![TValue::Nil(NilKind::Strict), TValue::Integer(42)],
             gs.clone(),
             string_table.clone(),
-        );
+        )
+        .expect("测试: 构建 state 失败");
         assert_eq!(state.base, 1);
         assert_eq!(
             state.stack.len(),

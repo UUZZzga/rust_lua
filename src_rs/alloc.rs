@@ -1,7 +1,7 @@
 #[cfg(test)]
 use std::sync::Arc;
 use std::{
-    alloc::{alloc, dealloc, handle_alloc_error, Layout},
+    alloc::{alloc, dealloc, Layout},
     cell::Cell,
     fmt::{Debug, Formatter},
     marker::PhantomData,
@@ -202,7 +202,9 @@ pub unsafe extern "C" fn myrc_alloc(payload_size: usize, payload_align: usize) -
     let layout = rc_block_layout(payload_size, payload_align);
     let base = alloc(layout);
     if base.is_null() {
-        handle_alloc_error(layout);
+        // 分配原语返回 NULL（C 的 `realloc` 语义）—— 调用方负责重试/报错，
+        // 不在此处 abort（内存耗尽时的重试漏斗见 `LuaState::retry_alloc`）。
+        return std::ptr::null_mut();
     }
     std::ptr::write(
         base as *mut RcHeader,
@@ -299,7 +301,7 @@ pub unsafe extern "C" fn myarc_alloc(payload_size: usize, payload_align: usize) 
     let layout = arc_block_layout(payload_size, payload_align);
     let base = alloc(layout);
     if base.is_null() {
-        handle_alloc_error(layout);
+        return std::ptr::null_mut(); // 见 myrc_alloc：失败返回 NULL，不 abort
     }
     std::ptr::write(
         base as *mut ArcHeader,
@@ -377,7 +379,7 @@ pub unsafe extern "C" fn simple_rc_alloc(payload_size: usize, payload_align: usi
     let layout = simple_rc_block_layout(payload_size, payload_align);
     let base = alloc(layout);
     if base.is_null() {
-        handle_alloc_error(layout);
+        return std::ptr::null_mut(); // 见 myrc_alloc：失败返回 NULL，不 abort
     }
     std::ptr::write(
         base as *mut SimpleRcHeader,
@@ -423,7 +425,7 @@ pub unsafe extern "C" fn simple_arc_alloc(payload_size: usize, payload_align: us
     let layout = simple_arc_block_layout(payload_size, payload_align);
     let base = alloc(layout);
     if base.is_null() {
-        handle_alloc_error(layout);
+        return std::ptr::null_mut(); // 见 myrc_alloc：失败返回 NULL，不 abort
     }
     std::ptr::write(
         base as *mut SimpleArcHeader,
@@ -609,28 +611,40 @@ impl<T: ?Sized + RcPayload, A: Allocator> MyRc<T, A> {
 }
 
 impl<T: RcPayload, A: Allocator> MyRc<T, A> {
-    /// 用分配器 `alloc` 创建共享块。
-    pub fn new_in(alloc: A, value: T) -> Self {
+    /// 分配失败时**原样交还 payload**（对应 C 分配原语返回 `NULL`：是重试
+    /// （紧急 GC 后再试）还是抛内存错误，由调用方决定 —— 见
+    /// [`crate::mem::AllocFailed`] 与 `LuaState::retry_alloc` / `LuaState::new_object`）。
+    pub fn try_new_in(alloc: A, value: T) -> Result<Self, T> {
         unsafe {
             let layout = rc_layout::<A, T>(std::mem::size_of::<T>());
-            let base = alloc
-                .allocate(layout)
-                .unwrap_or_else(|_| handle_alloc_error(layout))
-                .cast::<u8>()
-                .as_ptr();
+            let base = match alloc.allocate(layout) {
+                Ok(p) => p.cast::<u8>().as_ptr(),
+                Err(_) => return Err(value),
+            };
             std::ptr::write(base as *mut RcHeader, RcHeader::default());
             std::ptr::write(base.add(rc_alloc_off::<A>()) as *mut A, alloc);
             std::ptr::write(base.add(rc_data_off::<A, T>()) as *mut T, value);
-            MyRc {
+            Ok(MyRc {
                 ptr: NonNull::new_unchecked(base),
                 _p: PhantomData,
-            }
+            })
         }
+    }
+
+    /// 【测试专用】分配失败即 panic 的便捷构造（生产路径必须走
+    /// `LuaState::new_object`，让失败可重试、可报为 Lua 内存错误）。
+    #[cfg(test)]
+    pub fn new_in(alloc: A, value: T) -> Self {
+        Self::try_new_in(alloc, value)
+            .ok()
+            .expect("MyRc::new_in: 测试分配失败")
     }
 }
 
 impl<T: RcPayload> MyRc<T, Global> {
-    /// 用全局分配器创建共享块。
+    /// 【测试专用】用全局分配器创建共享块（生产路径必须走带 `Allocator` 槽的
+    /// `LuaState` 漏斗，以保证分配失败可重试/可报错）。
+    #[cfg(test)]
     pub fn new(value: T) -> Self {
         Self::new_in(Global, value)
     }
@@ -839,27 +853,37 @@ impl<T: ?Sized + RcPayload, A: Allocator> SimpleRc<T, A> {
 }
 
 impl<T: RcPayload, A: Allocator> SimpleRc<T, A> {
-    /// 用分配器 `alloc` 创建薄共享块。
-    pub fn new_in(alloc: A, value: T) -> Self {
+    /// 分配失败时原样交还 payload（见 [`MyRc::try_new_in`]）。
+    pub fn try_new_in(alloc: A, value: T) -> Result<Self, T> {
         unsafe {
             let layout = simple_layout::<A, T>(std::mem::size_of::<T>());
-            let base = alloc
-                .allocate(layout)
-                .unwrap_or_else(|_| handle_alloc_error(layout))
-                .cast::<u8>()
-                .as_ptr();
+            let base = match alloc.allocate(layout) {
+                Ok(p) => p.cast::<u8>().as_ptr(),
+                Err(_) => return Err(value),
+            };
             std::ptr::write(base as *mut SimpleRcHeader, SimpleRcHeader::default());
             std::ptr::write(base.add(simple_alloc_off::<A>()) as *mut A, alloc);
             std::ptr::write(base.add(simple_data_off::<A, T>()) as *mut T, value);
-            SimpleRc {
+            Ok(SimpleRc {
                 ptr: NonNull::new_unchecked(base),
                 _p: PhantomData,
-            }
+            })
         }
+    }
+
+    /// 【测试专用】分配失败即 panic 的便捷构造（生产路径走 `LuaState::retry_alloc` 漏斗）。
+    #[cfg(test)]
+    pub fn new_in(alloc: A, value: T) -> Self {
+        Self::try_new_in(alloc, value)
+            .ok()
+            .expect("SimpleRc::new_in: 测试分配失败")
     }
 }
 
 impl<T: RcPayload> SimpleRc<T, Global> {
+    /// 【测试专用】用全局分配器创建共享块（生产路径必须走带 `Allocator` 槽的
+    /// `LuaState` 漏斗，以保证分配失败可重试/可报错）。
+    #[cfg(test)]
     pub fn new(value: T) -> Self {
         Self::new_in(Global, value)
     }
@@ -977,26 +1001,37 @@ impl<T: ?Sized + RcPayload, A: Allocator> SimpleArc<T, A> {
 }
 
 impl<T: RcPayload, A: Allocator> SimpleArc<T, A> {
-    pub fn new_in(alloc: A, value: T) -> Self {
+    /// 分配失败时原样交还 payload（见 [`MyRc::try_new_in`]）。
+    pub fn try_new_in(alloc: A, value: T) -> Result<Self, T> {
         unsafe {
             let layout = simple_layout::<A, T>(std::mem::size_of::<T>());
-            let base = alloc
-                .allocate(layout)
-                .unwrap_or_else(|_| handle_alloc_error(layout))
-                .cast::<u8>()
-                .as_ptr();
+            let base = match alloc.allocate(layout) {
+                Ok(p) => p.cast::<u8>().as_ptr(),
+                Err(_) => return Err(value),
+            };
             std::ptr::write(base as *mut SimpleArcHeader, SimpleArcHeader::default());
             std::ptr::write(base.add(simple_alloc_off::<A>()) as *mut A, alloc);
             std::ptr::write(base.add(simple_data_off::<A, T>()) as *mut T, value);
-            SimpleArc {
+            Ok(SimpleArc {
                 ptr: NonNull::new_unchecked(base),
                 _p: PhantomData,
-            }
+            })
         }
+    }
+
+    /// 【测试专用】分配失败即 panic 的便捷构造。
+    #[cfg(test)]
+    pub fn new_in(alloc: A, value: T) -> Self {
+        Self::try_new_in(alloc, value)
+            .ok()
+            .expect("SimpleArc::new_in: 测试分配失败")
     }
 }
 
 impl<T: RcPayload> SimpleArc<T, Global> {
+    /// 【测试专用】用全局分配器创建共享块（生产路径必须走带 `Allocator` 槽的
+    /// `LuaState` 漏斗，以保证分配失败可重试/可报错）。
+    #[cfg(test)]
     pub fn new(value: T) -> Self {
         Self::new_in(Global, value)
     }

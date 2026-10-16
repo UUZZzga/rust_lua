@@ -1412,8 +1412,8 @@ fn call_randomseed<'a>(
 /// 1. 创建数学库函数表并注册为全局变量 math
 /// 2. 设置常量: pi, huge, maxinteger, mininteger
 /// 3. 初始化随机数生成器状态
-pub fn open_math_lib<'a>(state: &mut LuaState<'a>) {
-    let lib = Table::new_in(state.alloc_slot());
+pub fn open_math_lib<'a>(state: &mut LuaState<'a>) -> Result<(), VmError<'a>> {
+    let lib = state.new_table()?;
 
     // 注册所有数学库函数 (使用 BuiltinFn 函数指针)
     //
@@ -1422,48 +1422,60 @@ pub fn open_math_lib<'a>(state: &mut LuaState<'a>) {
     // CallInfoEntry push/pop。pure 标志内嵌 BuiltinFn.pure 字段
     // (原 state.pure_fns HashSet 查询每次调用 2 个非内联 call:
     // tvalue_fx_hash + RawTable::find)。
-    let register =
-        |lib: &Table<'a>, name: &'static std::ffi::CStr, func: crate::objects::BuiltinFnPtr| {
-            let key = state.intern(name.to_str().unwrap_or(""));
-            let name_ptr = name.as_ptr() as *const u8;
-            lib.set(key, BuiltinFn::pure_fn_tvalue(func, name_ptr));
-        };
+    let register = |lib: &Table<'a>,
+                    state: &mut LuaState<'a>,
+                    name: &'static std::ffi::CStr,
+                    func: crate::objects::BuiltinFnPtr|
+     -> Result<(), VmError<'a>> {
+        let key = state.intern(name.to_str().unwrap_or(""));
+        let name_ptr = name.as_ptr() as *const u8;
+        state.table_set(lib, key, BuiltinFn::pure_fn_tvalue(func, name_ptr))
+    };
 
-    register(&lib, c"abs", call_abs);
-    register(&lib, c"acos", call_acos);
-    register(&lib, c"asin", call_asin);
-    register(&lib, c"atan", call_atan);
-    register(&lib, c"ceil", call_ceil);
-    register(&lib, c"cos", call_cos);
-    register(&lib, c"deg", call_deg);
-    register(&lib, c"exp", call_exp);
-    register(&lib, c"tointeger", call_tointeger);
-    register(&lib, c"floor", call_floor);
-    register(&lib, c"fmod", call_fmod);
-    register(&lib, c"frexp", call_frexp);
-    register(&lib, c"ult", call_ult);
-    register(&lib, c"ldexp", call_ldexp);
-    register(&lib, c"log", call_log);
-    register(&lib, c"max", call_max);
-    register(&lib, c"min", call_min);
-    register(&lib, c"modf", call_modf);
-    register(&lib, c"rad", call_rad);
-    register(&lib, c"sin", call_sin);
-    register(&lib, c"sqrt", call_sqrt);
-    register(&lib, c"tan", call_tan);
-    register(&lib, c"type", call_type);
-    register(&lib, c"random", call_random);
-    register(&lib, c"randomseed", call_randomseed);
+    register(&lib, state, c"abs", call_abs)?;
+    register(&lib, state, c"acos", call_acos)?;
+    register(&lib, state, c"asin", call_asin)?;
+    register(&lib, state, c"atan", call_atan)?;
+    register(&lib, state, c"ceil", call_ceil)?;
+    register(&lib, state, c"cos", call_cos)?;
+    register(&lib, state, c"deg", call_deg)?;
+    register(&lib, state, c"exp", call_exp)?;
+    register(&lib, state, c"tointeger", call_tointeger)?;
+    register(&lib, state, c"floor", call_floor)?;
+    register(&lib, state, c"fmod", call_fmod)?;
+    register(&lib, state, c"frexp", call_frexp)?;
+    register(&lib, state, c"ult", call_ult)?;
+    register(&lib, state, c"ldexp", call_ldexp)?;
+    register(&lib, state, c"log", call_log)?;
+    register(&lib, state, c"max", call_max)?;
+    register(&lib, state, c"min", call_min)?;
+    register(&lib, state, c"modf", call_modf)?;
+    register(&lib, state, c"rad", call_rad)?;
+    register(&lib, state, c"sin", call_sin)?;
+    register(&lib, state, c"sqrt", call_sqrt)?;
+    register(&lib, state, c"tan", call_tan)?;
+    register(&lib, state, c"type", call_type)?;
+    register(&lib, state, c"random", call_random)?;
+    register(&lib, state, c"randomseed", call_randomseed)?;
     // 设置常量 (对应 C 的 lua_pushnumber/lua_pushinteger + lua_setfield)
-    lib.set(state.intern_str("pi"), TValue::Float(PI));
-    lib.set(state.intern_str("huge"), TValue::Float(HUGE));
-    lib.set(state.intern_str("maxinteger"), TValue::Integer(MAX_INTEGER));
-    lib.set(state.intern_str("mininteger"), TValue::Integer(MIN_INTEGER));
+    state.table_set(&lib, state.intern_str("pi"), TValue::Float(PI))?;
+    state.table_set(&lib, state.intern_str("huge"), TValue::Float(HUGE))?;
+    state.table_set(
+        &lib,
+        state.intern_str("maxinteger"),
+        TValue::Integer(MAX_INTEGER),
+    )?;
+    state.table_set(
+        &lib,
+        state.intern_str("mininteger"),
+        TValue::Integer(MIN_INTEGER),
+    )?;
 
     // 注册为全局变量 math
-    unsafe { state.gc_mut().register_table(&lib) };
+    state.register_table(&lib)?;
     let key = state.intern_str("math");
-    state.globals.set(key, TValue::Table(lib));
+    let globals = state.globals.clone();
+    state.table_set(&globals, key, TValue::Table(lib))?;
     // 初始化随机数生成器状态 (对应 C 的 setrandfunc)
     // 使用时间种子初始化
     let seed = std::time::SystemTime::now()
@@ -1477,6 +1489,7 @@ pub fn open_math_lib<'a>(state: &mut LuaState<'a>) {
         }
         rs.as_mut().unwrap().setseed(seed, 0);
     }
+    Ok(())
 }
 
 // ============================================================================
@@ -2083,7 +2096,7 @@ mod tests {
     #[test]
     fn test_open_math_liblobal() {
         let mut state = LuaState::default();
-        open_math_lib(&mut state);
+        open_math_lib(&mut state).expect("打开 math 库失败");
         let key = state.intern_str("math");
         let val = state.globals.get(&key);
         assert!(val.is_some(), "math global must be registered");
@@ -2093,7 +2106,7 @@ mod tests {
     #[test]
     fn test_open_math_lib_has_all_functions() {
         let mut state = LuaState::default();
-        open_math_lib(&mut state);
+        open_math_lib(&mut state).expect("打开 math 库失败");
 
         // 获取 math 表
         let math_key = state.intern_str("math");
@@ -2142,7 +2155,7 @@ mod tests {
     #[test]
     fn test_open_math_lib_has_constants() {
         let mut state = LuaState::default();
-        open_math_lib(&mut state);
+        open_math_lib(&mut state).expect("打开 math 库失败");
 
         let math_key = state.intern_str("math");
         let math_table = match state.globals.get(&math_key) {

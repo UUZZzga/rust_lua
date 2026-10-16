@@ -95,6 +95,7 @@
 - `tools/ci_bench.sh`：C 与 Rust 实现的通用性能基准（12 项解释器热点，bench/ 按项拆分），Drone 两条流水线 + GitHub Actions Linux job 均执行，日志 `logs/ci_bench_*`。
 - `tools/miri.sh`：Miri UB 检测（本地工具，需 nightly 工具链）。检测 `tests_rs/` 与 `src_rs/` 单元测试中的未定义行为（越界访问、未初始化内存、Tree Borrows 违规等）。日志输出到 `logs/miri_test.log`。
 - `tools/verify_num_types.sh`：数值类型配置验证（默认 / `num-i32` / `num-f32` / `embedded` 各构建 release 并跑 `tests_lua/num_types_smoke.lua` + 测试目标编译检查，`--full` 追加 `cargo test`）。详见"数值类型配置"章节。
+- `tools/verify_alloc_fail.sh`：内存分配失败处理测试（`tests_lua/alloc_fail.lua`），**主动**给进程加 200MB 地址空间上限（`systemd-run --property=LimitAS=204800`，退化 `ulimit -v 204800`；两者都不可用时跳过而不是无限运行）。`tools/verify.sh` 已调用它，本地单独运行：`bash tools/verify_alloc_fail.sh`。日志 `logs/alloc_fail*.log`。详见"内存分配失败处理"章节。
 
 ### 测试分类
 1. **编译器比对测试**：`src_rs/compiler/cmp_tests.rs`，确保 Rust 编译器输出与 C 实现一致。
@@ -165,6 +166,73 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
 
 `.drone.yml` 定义 Drone CI 双流水线：`rust-linux`（docker，镜像 `lua-ci:latest`，见 `ci/Dockerfile`）执行 `cargo build/test` → CMP 编译器比对测试（`cargo test --features cmp_c -- compiler::cmp_tests::compiler_compare_tests`）→ deps 依赖库测试（构建 C lua 后运行 `deps/setup.sh` + `deps/test.sh`，含 skynet e2e）→ bench 性能基准（`bash tools/build_release_opt.sh` 构建 bench 二进制后 `bash tools/ci_bench.sh --skip-build full`）→ `fast_unsafe` on/off 性能差距（`bash tools/bench_fast_unsafe.sh quick 3`，普通 release 构建两变体交错采样，不干扰上一步的 PGO 产物）；`rust-windows`（exec）执行 `cargo build/test` → bench 性能基准（经 `tools/ci_bench_win.ps1` 包装：初始化 VS DevShell 提供 cmake，剥离 VS 环境变量后调 Git Bash 运行 `tools/ci_bench.sh full`，脚本内自建 C lua 与 Rust 二进制）。bench 构建策略全部内聚在 `tools/build_release_opt.sh`：默认 PGO（`build_pgo.sh` 三步：instrumented → tests_lua+bench quick 通用负载训练 → profile-use 重建）+ `-Cpanic=abort` + `lua_longjmp` feature（C 模块错误边界用 setjmp/longjmp 替代 catch_unwind）；`BENCH_PGO=0` / `BENCH_ABORT=0` 显式退档；任一步失败自动回退普通构建（`PGO_FALLBACK` 日志标记）。drone 命令行必须保持单条无内联逻辑（Windows exec runner 对全部 pipeline commands 做启动期 bash 解析，内联 `VAR=x` 前缀会泄漏成 cargo 参数）。ci_bench.sh 采用 C/Rust **交错采样**（每轮先 C 后 Rust，指标级取全部轮次最小值；linux full 5 轮、windows/quick 3 轮），比值噪声 ~±1-2%——低于 ~1.5% 的改动不可判定，判定性能改动必须看 CI 比值多轮均值而非本地 plain build（本地收益在 PGO 下常归零甚至反号）。`save-cache` 步骤 `failure: ignore`（宿主缓存盘写满不连累流水线）。镜像需在 Drone 宿主机预构建（`docker build -t lua-ci:latest -f ci/Dockerfile .`），修改 `ci/Dockerfile` 后需重建镜像。
 
+## 内存分配失败处理（alloc_error）
+
+对应 C 的 `lmem.c`（`luaM_realloc_` / `tryagain` / `luaM_error`）与 `ldo.c` 的 `LUA_ERRMEM` 语义：**分配失败不中止进程**，而是「先紧急 GC、再重试分配」，重试仍失败才抛**可捕获**的内存错误。
+
+### 机制
+
+| 概念 | Rust 实现 | C 对应 |
+|---|---|---|
+| 分配失败信号 | `mem::AllocFailed`（内部控制流，不直接对 Lua 可见） | `luaM_realloc_` 返回 NULL |
+| 重试漏斗 | `LuaState::retry_alloc` / `retry_alloc_mut`：尝试 → 紧急全量 GC → 重试 → `VmError::MemoryError` | `luaM_realloc_` + `tryagain` |
+| 紧急回收 | `LuaState::emergency_gc`（置 `GCState.gcemergency` 后跑完整回收） | `luaC_fullgc(L, 1)` |
+| 紧急模式语义 | 不运行 finalizer（不可达的待 finalize 对象**标活并保留**到下次常规回收）、不缩栈、不回调 Lua | `gcemergency` 下不执行 finalizer / 不 `luaD_shrinkstack` |
+| 可否重试 | `LuaState::can_retry_alloc` = `mem.complete_state && !gc_running` | `cantryagain(g)` |
+| 内存错误 | `VmError::MemoryError`（无负载，`Display` = `strings::MEMERRMSG`） | `LUA_ERRMEM` |
+| 错误对象 | `GlobalState.memerrmsg`（状态创建时预注册的字符串） | `G(L)->memerrmsg` + `luaD_seterrorobj` 的 LUA_ERRMEM 分支 |
+| 按状态码返回的入口 | `load_buffer` / `load_bytes` 返回 `ERR_MEM`（= `LUA_ERRMEM` = 4），错误对象留在栈上 | `lua_load` 返回 `LUA_ERRMEM` |
+
+内存错误的传播路径**全程零分配**：错误对象直接复用 `memerrmsg`（不重新 intern），不加 `source:line` 前缀（`build_traceback` 对内存错误短路，连 traceback 字符串都不构造），`last_error_msg` 用 `try_reserve` 写静态文本（容量不足则留空，消费者回退到错误对象）。
+
+### 编码约定（新增分配点必须遵守）
+
+- 生产路径一律走漏斗入口，禁止再用会 abort 的构造：`MyRc/SimpleRc/SimpleArc::try_new_in`（失败时**原样交还 payload**）→ `LuaState::new_object`；`Table::try_new_in` / `try_with_capacity_in` → `LuaState::new_table` / `new_table_with_capacity`；表写入 `LuaState::table_set` / `table_set_int`；栈扩容 `LuaState::reserve_stack`。`#[cfg(test)]` 下的 `new_in` / `Table::new_in` / `Table::set` 等只是**测试专用**便捷包装（失败即 panic），生产代码不得使用。
+- **先扩容再写入**：失败必须不留半写状态（对应 C 的 `luaM_saferealloc_` 只在成功后更新 `*psize`）。表写入即按此拆成 `Table::try_reserve_for`（可失败，只做容量预留）+ `Table::set_unchecked` / `set_int_unchecked`（无分配写入）；`try_reserve_for` 失败时表内容不变，因此漏斗可以安全地「紧急 GC 后整体重试」。`TableData::idx_insert` 同样要求调用点先用 `try_reserve_index` 备好容量。
+- 漏斗闭包必须**可重复执行**：失败时不得留下部分写入，且要把数据交还出来供重试继续（`MyRc::try_new_in` 的 `Err(payload)` 形态、`Some(value).take()` 形态）。
+- C API（`capi.rs`）没有返回错误的通道：失败必须**抛错**（`raise_mem_error`，复用与 `lua_error` 相同的 panic/longjmp 机制），对应 C 的 `luaM_error` → `luaD_throw`。
+- `lua_newstate` 语义：状态创建期分配失败返回 NULL（此时还无法做紧急回收，对应 C 的 `cantryagain` 为假）。
+
+### 测试
+
+- `tests_rs/alloc_failure_tests.rs`：可编程分配器（`FlakyAlloc`，对应 C 测试库 ltests 的 `T.alloccount`）**精确**制造失败（不依赖真实内存耗尽、不 flaky），覆盖「一次性失败被紧急 GC + 重试抹平且垃圾确实被回收」「不可恢复失败抛出可捕获的 `not enough memory`」「错误后解释器 / GC / 弱表仍正常」。
+- `tests_lua/alloc_fail.lua` + `tools/verify_alloc_fail.sh`：在 200MB 地址空间上限下**真实耗尽**内存（对应 C 的 `memerr.lua`，但不需要 ltests），验证真耗尽时不崩溃、错误可捕获、错误后仍可用；并额外验证**顶层**（未被 `pcall` 捕获）内存错误以消息 + 非零退出码结束，而不是被信号杀死。
+
+### 尚未纳入漏斗的分配路径（后续迁移，当前仍会 abort）
+
+**实测结论**（200MB 地址空间真实耗尽，`tools/verify_alloc_fail.sh`）：耗尽时仍会 abort，
+最后失败的是 **align=8 / 16384 字节的 realloc**（= `Vec<TValue>` 一类 16 字节元素容器的扩容）。
+定位手段（本机已用、勿重复造）：零分配的全局分配器探针（`WriteFile` 直写 stderr +
+`RtlCaptureStackBackTrace` 取调用栈，**不能**用 `eprintln!`/`format!` —— 它们在分配器内递归，
+表现为 "has overflowed its stack"），再用 `llvm-symbolizer --obj=target/perf/lua.exe
+--inlines 0x140000000+<RVA>` 离线符号化（MSVC 用 PDB，偏移要加 preferred base `0x140000000`）。
+探针栈显示失败点在 `LuaState::pcall` 的错误路径（`truncate_live` / 错误值入栈一段）内。
+
+已知未迁移的类别：
+
+- **错误路径自身的分配**：`pcall` 错误路径把栈值搬进 `c_safety_keepalive`（`split_off` 建新
+  Vec + `extend` 增长，已改为**可失败预留**，失败退化为 `truncate_live`）；`call_info.clone()`
+  快照、错误消息 `.to_string()`/`format!` 仍会分配。对应 C 在此不需要分配：它的栈是数组、
+  值原地留存（`L->top = ci->func` 不释放），错误对象复用 `G(L)->memerrmsg`。
+- **帧入口栈扩容**：`execute.rs::fast_resize_stack_nil` 与 `state.rs::pad_frame_scratch_slow`、
+  `pcall` 帧预置、`capi` 的 `lua_settop`/`lua_checkstack` 已接漏斗（失败→紧急 GC→重试），
+  **但失败后的上报走 `LuaState::raise_memory_error`（panic / longjmp）**：panic 载荷与展开
+  本身要分配，在真耗尽时可能再次失败并 abort —— 因此这条路径只能算「尽力」，根治需要把它们
+  全部改成**返回 `Result` 的错误通道**（约 50 处调用点的签名扩散），或改用真正无分配的
+  setjmp/longjmp 抛出（`lua_longjmp` 构建已有该机制，默认构建没有）。
+- **字符串创建与内部化**：`str_to_ls` / `ArcRc::<ShortString>::new_sstr` / `StringTable` 的
+  hashbrown `HashTable` 增长（`insert_unique` 不可失败）。`intern_bytes(&self)` 无 `&mut`/错误
+  通道，需先改签名。
+- **编译器与解析器的 `Vec`**（编译期内存不足仍中止）。
+
+### 测试与 CI 现状（勿误读）
+
+- `tests_rs/alloc_failure_tests.rs`（6 个用例，可编程分配器精确制造失败）**已由 CI 的
+  `cargo test` 覆盖**，全绿：一次性失败被「紧急 GC + 重试」抹平且垃圾确实被回收、不可恢复
+  失败抛出可捕获的 `not enough memory`、错误后解释器/GC/弱表仍正常、紧急 GC 延迟 finalizer。
+- `tests_lua/alloc_fail.lua` + `tools/verify_alloc_fail.sh`（**主动** 200MB 上限）**未接入
+  `tools/verify.sh`/CI**：真实耗尽路径仍会 abort（见上），接入会让流水线常红。补齐错误通道后
+  应接回 `verify.sh`。
 ## 关键编码约定
 
 - **fast_unsafe 开关完整性**：新增的 VM 热路径 unsafe 优化（跳过边界检查 / 跳过 drop_glue / 绕过 RefCell borrow / 裸指针缓存）必须用 `#[cfg(feature = "fast_unsafe")]` 包住，并同时给出 `#[cfg(not(feature = "fast_unsafe"))]` 的安全等价实现（语义逐位一致：Rc 句柄 + 边界检查 + 常规 drop + borrow 守卫）。架构/FFI 必需的 unsafe（见 Feature Flags 一节的不在开关范围清单）不需要包。

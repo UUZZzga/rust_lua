@@ -26,6 +26,7 @@
 //! 调用/错误保护、C API 桥接。
 
 use crate::alloc::{MyRc, WeakRc};
+use crate::execute::VmError;
 use crate::mem::SlotAlloc;
 use crate::objects::{
     FxBuildHasher, LuaThread, NilKind, TValue, ThreadContext, UpVal, UpValVec, WeakValue,
@@ -562,6 +563,12 @@ pub struct GCState<'a> {
     pub step_accum: Cell<usize>,
     /// GC 是否正在运行（collect_gc 进行中）— 用于阻止 finalizer 中重入
     pub gc_running: Cell<bool>,
+    /// 紧急回收模式 —— 对应 C 的 `global_State.gcemergency`（lgc.c::luaC_fullgc
+    /// 的 `isemergency` 参数）：内存分配失败后的回收必须**避免改变解释器状态**，
+    /// 即不运行 finalizer（可能执行任意 Lua 代码并再次分配）、不缩栈。
+    /// 该模式下需要 finalize 的对象仍会被标活（避免被扫掉），但延后到下一次
+    /// 常规回收，与 C 中「紧急模式不把对象移入 tobefnz」一致。
+    pub gcemergency: Cell<bool>,
     /// 所有 Lua 协程对象的弱引用 —— 对应 C 的 `g->allgc` 里 thread 链路。
     ///
     /// 线程没有 `gc_header`（无 GCObjectId），可达性由 `aux_marked` 记录，
@@ -606,6 +613,7 @@ impl<'a> GCState<'a> {
             next_collect_threshold: Cell::new(200000),
             step_accum: Cell::new(0),
             gc_running: Cell::new(false),
+            gcemergency: Cell::new(false),
             threads: RefCell::new(Vec::new()),
         }
     }
@@ -663,20 +671,36 @@ impl<'a> GCState<'a> {
     // 对象注册/注销
     // ========================================================================
 
-    pub fn register_object(&self, size: usize, weak_value: WeakValue<'a>) -> GCObjectId {
-        let cw = self.current_white.get();
-        let color = if cw & 1 != 0 {
-            GCColor::White0
-        } else {
-            GCColor::White1
-        };
-
+    /// 登记一个 GC 对象 —— **可失败**（对象表/活跃表扩容失败时返回 `None`，
+    /// 由调用方走「紧急 GC + 重试 → 内存错误」漏斗）。
+    ///
+    /// 为什么必须可失败：对象表（`metas` / `all_objects`）随注册按几何增长，
+    /// 活跃对象上百万时需要几十 MB 的重新分配；此处若直接 abort（`Vec::push` 默认
+    /// 行为），内存耗尽时就再也报不出内存错误 —— 200MB 限制下实测正是这一条先崩。
+    /// 对应 C：C 的 GC 不随对象数分配内存（对象自带 allgc 链表），故无此问题。
+    pub fn try_register_object(
+        &self,
+        size: usize,
+        weak_value: WeakValue<'a>,
+    ) -> Result<GCObjectId, WeakValue<'a>> {
         let mut meta = GCObjectMeta::new(size);
-        meta.color = color;
+        meta.color = Self::new_object_color(self.current_white.get());
         meta.age = GCAge::New;
         meta.weak_value = weak_value;
 
         let mut objs = self.objects.borrow_mut();
+        // 先备容量、再写入：失败时对象表保持原样（不留下半个条目）
+        if objs.metas.len() + 1 > objs.metas.capacity() {
+            if objs.metas.try_reserve(1).is_err() {
+                return Err(meta.weak_value);
+            }
+        }
+        if objs.all_objects.len() + 1 > objs.all_objects.capacity() {
+            if objs.all_objects.try_reserve(1).is_err() {
+                return Err(meta.weak_value);
+            }
+        }
+
         // 优先重用已释放的 ID 槽位，避免 metas 数组无限增长
         let id = if let Some(free_id) = objs.free_ids.pop() {
             GCObjectId(free_id)
@@ -697,19 +721,33 @@ impl<'a> GCState<'a> {
         let estimate = self.gc_estimate.get();
         self.gc_estimate.set(estimate + charged as usize);
 
-        id
+        Ok(id)
     }
 
-    pub fn register_table(&self, t: &Table<'a>) {
+    /// 新建对象的初始颜色（与 `try_register_object` 共用）。
+    #[inline]
+    fn new_object_color(cw: u8) -> GCColor {
+        if cw & 1 != 0 {
+            GCColor::White0
+        } else {
+            GCColor::White1
+        }
+    }
+
+    /// 登记一张表 —— 可失败（见 [`GCState::try_register_object`]）。
+    pub fn try_register_table(&self, t: &Table<'a>) -> Result<(), crate::mem::AllocFailed> {
         // 幂等：同一张表（同一 TableData）只能注册一次。
         // 重复注册会给同一数据分配第二个 ID，旧 ID 永远保持白色 ——
         // mark 只把新 ID 染灰，sweep 见到旧 ID 白色就 clear_for_drop 这张
         // 仍然可达的表（package.loaded 曾被 registry._LOADED 二次注册清空）。
         if t.data.borrow().gc_header.id().is_some() {
-            return;
+            return Ok(());
         }
-        let id = self.register_object(t.mem_size(), WeakValue::Table(t.downgrade()));
+        let id = self
+            .try_register_object(t.mem_size(), WeakValue::Table(t.downgrade()))
+            .map_err(|_| crate::mem::AllocFailed)?;
         t.data.borrow().gc_header.set_id(id);
+        Ok(())
     }
 
     pub(crate) fn meta(&self, id: GCObjectId) -> Option<std::cell::Ref<'_, GCObjectMeta<'a>>> {
@@ -875,7 +913,13 @@ impl<'a> GCState<'a> {
                     }
                 }
                 objs.metas[i] = None;
-                objs.free_ids.push(id);
+                // 记录空闲槽位（可失败）：容量不足时放弃记录 —— 该槽位保持 None
+                // 且不可达，仅失去复用机会，不会泄漏用户内存，更不能因此 abort。
+                if objs.free_ids.len() + 1 <= objs.free_ids.capacity()
+                    || objs.free_ids.try_reserve(1).is_ok()
+                {
+                    objs.free_ids.push(id);
+                }
             } else {
                 objs.all_objects[write] = id;
                 write += 1;
@@ -952,6 +996,10 @@ impl<'a> GCState<'a> {
                 }
             }
             self.make_gray_again(p);
+            // 去重 (等效 C 的 grayagain 语义): 置灰后 is_black 为假, 同一对象不会被
+            // 重复入队 —— 否则 gray_again 长度只受 write barrier 次数限制 (无界),
+            // 其预留会失效并在增长时经全局分配器 abort。
+            self.set_color(p, GCColor::Gray);
         }
     }
 
@@ -1016,6 +1064,25 @@ impl<'a> GCState<'a> {
     /// 进入新周期：翻转 white、清空所有工作队列（含 aux_marked）。
     ///
     /// `pub(crate)`：供 `LuaState::collect_gc_inner` 手动进入完整 GC 周期。
+    /// GC 内部队列容量预留（见 `LuaState::prepare_gc_queues`）；任一失败即返回 false。
+    pub(crate) fn reserve_queues(&self, active: usize) -> bool {
+        let plan: [(&RefCell<VecDeque<GCObjectId>>, usize); 5] = [
+            (&self.gray, active),
+            (&self.gray_again, active / 4 + 64),
+            (&self.weak, active / 8 + 64),
+            (&self.all_weak, active / 8 + 64),
+            (&self.ephemeron, active / 8 + 64),
+        ];
+        for (q, want) in plan {
+            let mut q = q.borrow_mut();
+            let need = want.saturating_sub(q.len());
+            if q.capacity() < q.len() + need && q.try_reserve(need).is_err() {
+                return false;
+            }
+        }
+        true
+    }
+
     pub(crate) fn enter_cycle(&self) {
         let cw = self.current_white.get();
         let new_cw = cw ^ 0x3;
@@ -1163,6 +1230,60 @@ impl<'a> GCState<'a> {
 // 全部 GC 逻辑集中在 gc.rs，state.rs 不保留任何 GC 实现。
 
 impl<'a> LuaState<'a> {
+    /// 紧急全量回收 —— 对应 C lmem.c `tryagain` 里的 `luaC_fullgc(L, 1)`。
+    ///
+    /// 分配失败（且 `cantryagain(g)`）时由 [`LuaState::retry_alloc`] 调用：
+    /// 尽力释放内存，让调用方重试分配。紧急模式（`gcemergency`）下
+    /// 不运行 finalizer、不改变解释器状态（见 [`GCState::gcemergency`]）。
+    pub fn emergency_gc(&mut self) {
+        // 状态未建好 / GC 进行中 / 已处于紧急模式时不做（C: cantryagain）。
+        if !self.can_retry_alloc() || unsafe { self.gc_mut().gcemergency.get() } {
+            return;
+        }
+        unsafe { self.gc_mut().gcemergency.set(true) };
+        self.collect_gc();
+        unsafe { self.gc_mut().gcemergency.set(false) };
+    }
+
+    /// 登记 GC 对象漏斗 —— 对象表扩容失败先紧急 GC 再重试，仍失败即内存错误。
+    ///
+    /// 对象创建路径必须用它（对应 C 的 `luaC_newobj` 不失败；Rust 侧对象表要增长，
+    /// 故与其它分配点一样走「先 GC 再重试」漏斗，绝不 abort）。
+    pub fn register_object(
+        &mut self,
+        size: usize,
+        weak_value: crate::gc::WeakValue<'a>,
+    ) -> Result<crate::gc::GCObjectId, VmError<'a>> {
+        match unsafe { self.gc_mut() }.try_register_object(size, weak_value) {
+            Ok(id) => Ok(id),
+            Err(wv) => {
+                if self.can_retry_alloc() {
+                    self.emergency_gc();
+                    if let Ok(id) = unsafe { self.gc_mut() }.try_register_object(size, wv) {
+                        return Ok(id);
+                    }
+                }
+                Err(VmError::MemoryError)
+            }
+        }
+    }
+
+    /// 登记表漏斗（见 [`LuaState::register_object`]）。
+    pub fn register_table(&mut self, t: &crate::table::Table<'a>) -> Result<(), VmError<'a>> {
+        match unsafe { self.gc_mut() }.try_register_table(t) {
+            Ok(()) => Ok(()),
+            Err(_) => {
+                if self.can_retry_alloc() {
+                    self.emergency_gc();
+                    if unsafe { self.gc_mut() }.try_register_table(t).is_ok() {
+                        return Ok(());
+                    }
+                }
+                Err(VmError::MemoryError)
+            }
+        }
+    }
+
     /// 完整 GC —— 对应 C 的 `luaC_fullgc`。
     pub fn collect_gc(&mut self) {
         // 不可重入：finalizer 运行期间（call_finalizers -> pcall -> 用户代码）的分配
@@ -1184,8 +1305,28 @@ impl<'a> LuaState<'a> {
         let saved_allowhook = self.allowhook;
         self.allowhook = false;
 
+        // 先备好 GC 内部队列（**可失败**）：拿不到就跳过本次回收。
+        if !self.prepare_gc_queues() {
+            unsafe { self.gc_mut().gc_running.set(false) };
+            self.allowhook = saved_allowhook;
+            return;
+        }
+
+        // 先备好标记工作栈（**可失败**）：拿不到就跳过本次回收。
+        // 绝不在此 abort —— 紧急回收路径正是内存耗尽时被调用的，若它自己再失败
+        // 就会崩溃而不是把内存错误交给调用方（对应 C 的回收不需要新分配）。
+        if !self.prepare_gc_worklist() {
+            unsafe { self.gc_mut().gc_running.set(false) };
+            self.allowhook = saved_allowhook;
+            return;
+        }
+
         let prev_estimate = unsafe { self.gc_mut().total_estimate() };
-        let result = self.collect_gc_inner();
+        let mut worklist = std::mem::take(&mut self.gc_worklist);
+        worklist.clear();
+        let result = self.collect_gc_inner(&mut worklist);
+        worklist.clear();
+        self.gc_worklist = worklist;
 
         self.allowhook = saved_allowhook;
         unsafe { self.gc_mut().gc_running.set(false) };
@@ -1202,6 +1343,33 @@ impl<'a> LuaState<'a> {
             record_gc_time(start.elapsed());
         }
         result
+    }
+
+    /// 备好本周期需要的 GC 内部队列容量（**进入周期前**调用）。
+    ///
+    /// 标记过程中队列的 `push_back` 会按几何增长 —— 内存耗尽时那就是 abort。
+    /// 与 worklist 同理：先在安全点（进入周期前）把容量谈妥，谈不妥就跳过本次回收。
+    /// 上界：gray ⊆ 可达对象数；其余队列远小于该上界（取 1/4、1/8 留裕量）。
+    fn prepare_gc_queues(&mut self) -> bool {
+        let active = unsafe { self.gc_mut().active_count() };
+        unsafe { self.gc_mut() }.reserve_queues(active)
+    }
+
+    /// 备好本周期需要的 worklist 容量（跨周期复用，容量不足时 `try_reserve`）。
+    ///
+    /// 返回 false 表示容量不足且无法分配 —— 调用方跳过本次回收（内存耗尽时的
+    /// 紧急回收会因此把「内存错误」留给调用方，而不是 abort 进程）。
+    fn prepare_gc_worklist(&mut self) -> bool {
+        let active = unsafe { self.gc_mut().active_count() };
+        // 与旧的 `Vec::with_capacity((active*3/5).max(64) * 2)` 取同一上界
+        let need = (active * 3 / 5).max(64) * 2;
+        let have = self.gc_worklist.capacity();
+        if have >= need {
+            return true;
+        }
+        let r = self.gc_worklist.try_reserve(need - have).is_ok();
+        if !r {}
+        r
     }
 
     /// 阈值触发 GC（对应原 `maybe_collect_gc`）。
@@ -1251,7 +1419,7 @@ impl<'a> LuaState<'a> {
     }
 
     /// 完整 GC 实现 —— 标记、ephemeron 收敛、finalizer、弱表清理、sweep。
-    fn collect_gc_inner(&mut self) {
+    fn collect_gc_inner(&mut self, worklist: &mut Vec<RawTValue<'a>>) {
         let active = unsafe { self.gc_mut().active_count() };
         if gc_stats_enabled() {
             reset_gc_type_stats();
@@ -1260,13 +1428,10 @@ impl<'a> LuaState<'a> {
         // 进入新周期：翻转 white、清空所有队列（含 aux_marked）
         unsafe { self.gc_mut().enter_cycle() };
 
-        // worklist 预分配
-        let est = (active * 3 / 5).max(64);
-        let mut worklist: Vec<RawTValue> = Vec::with_capacity(est * 2);
         let mut extra_size: usize = 0;
 
         // 根：本线程
-        self.collect_roots_into(&mut worklist);
+        self.collect_roots_into(worklist);
 
         // 根：globals / registry
         {
@@ -1278,6 +1443,13 @@ impl<'a> LuaState<'a> {
             let tv = TValue::Table(self.registry.clone());
             unsafe { worklist.push(raw_from_tvalue(&tv)) };
             drop(tv);
+        }
+        // 根：内存错误消息（C 的 G(L)->memerrmsg 同样是 GC 根 —— 否则长字符串
+        // 形态的消息会被回收，内存错误路径再取到悬垂/已清对象）
+        if let Some(mm) = self.g().memerrmsg.as_ref() {
+            if needs_gc_mark(mm) {
+                unsafe { worklist.push(raw_from_tvalue(mm)) };
+            }
         }
         {
             let file_handles = self.file_handles.borrow();
@@ -1320,32 +1492,43 @@ impl<'a> LuaState<'a> {
         let main_ptr = self.g().main;
         let self_ptr = self as *const LuaState<'a> as *mut LuaState<'a>;
         if !main_ptr.is_null() && main_ptr != self_ptr {
-            unsafe { (*main_ptr).collect_roots_into(&mut worklist) };
+            unsafe { (*main_ptr).collect_roots_into(worklist) };
         }
         // 主线程对象自身的 function
         let main_thread = self.main_thread.clone();
-        self.collect_thread_roots(&main_thread, &mut worklist);
+        self.collect_thread_roots(&main_thread, worklist);
 
         // 标记阶段
         while let Some(raw) = worklist.pop() {
             let val = unsafe { raw_as_tvalue(&raw) };
-            self.mark_tvalue(val, &mut worklist, &mut extra_size);
+            self.mark_tvalue(val, worklist, &mut extra_size);
         }
 
         // ephemeron 传递性
-        self.process_ephemerons(&mut worklist, &mut extra_size);
+        self.process_ephemerons(worklist, &mut extra_size);
+
+        // 紧急回收（内存耗尽后的重试）：不运行 finalizer —— 它会执行任意 Lua 代码
+        // 并可能再次分配（C 同样在 gcemergency 下跳过 finalizer 的分离与执行）。
+        let emergency = unsafe { self.gc_mut().gcemergency.get() };
 
         // finalizer 复活
-        let to_finalize = self.collect_finalizers(&mut worklist, &mut extra_size);
+        let to_finalize = if emergency {
+            self.collect_finalizers_deferred(worklist, &mut extra_size);
+            Vec::new()
+        } else {
+            self.collect_finalizers(worklist, &mut extra_size)
+        };
 
         // 复活后可能引入新 ephemeron 关系
-        self.process_ephemerons(&mut worklist, &mut extra_size);
+        self.process_ephemerons(worklist, &mut extra_size);
 
         // 弱表清理
         self.g_mut().clear_weak_tables();
 
-        // 执行 finalizer
-        self.call_finalizers(to_finalize);
+        // 执行 finalizer（紧急模式下 to_finalize 为空 → 跳过，避免无谓分配）
+        if !to_finalize.is_empty() {
+            self.call_finalizers(to_finalize);
+        }
 
         // 清理不可达协程的执行态（自引用环；须在标记之后、同一周期内）
         unsafe { self.gc_mut().clear_dead_threads() };
@@ -1604,9 +1787,29 @@ impl<'a> LuaState<'a> {
         }
     }
 
+    /// 子值入队（**带认领去重**）—— 对应 C 里 `markvalue` 的「已灰就不再入 gray 链」。
+    ///
+    /// 未去重的入队会让 worklist 峰值等于「可达值的**总数**」（一张百万元素表就
+    /// 几百万条），内存耗尽时 `Vec::push` 只能 abort —— 200MB 限制下实测正是
+    /// 标记中途的 worklist 扩容先崩。认领后峰值 ≤ 存活**对象**数，与 C 的 gray
+    /// 链同级；顺带减少重复出队，标记更快。
+    ///
+    /// 认领键与各变体的判定口径一致（见 `mark_tvalue` / `mark_tvalue` 的 aux 键）：
+    /// 表/闭包/userdata 用 `ptr_id`，CClosure/RustClosure 用自身块地址，
+    /// Thread 用 `Rc::as_ptr(&context)`。
+    fn push_mark(&self, _gc: &GCState, val: &TValue<'a>, worklist: &mut Vec<RawTValue<'a>>) {
+        // 只做「值得标记」的过滤并入队；**去重仍由 mark_tvalue 内的 aux_mark 负责**
+        // （aux_marked 同时是 is_marked 的可达性判定依据，两处必须是同一标记集）。
+        if needs_gc_mark(val) {
+            unsafe { worklist.push(raw_from_tvalue(val)) };
+        }
+    }
+
     /// 标记一个 TValue —— 有 ID 写颜色，无 ID 走 aux_mark。
     ///
-    /// 幂等：已灰/黑的对象会立即 return。
+    /// 由 worklist 出队调用：入队时已认领（见 [`Self::push_mark`]），故这里**不做
+    /// 早退** —— 认领只表示「已排定遍历」，真正的遍历必须发生，否则子对象漏标会被
+    /// sweep 误判为垃圾。可达对象因此保证被遍历（重复入队的根会重复遍历，无害）。
     fn mark_tvalue(
         &self,
         val: &TValue<'a>,
@@ -1617,7 +1820,7 @@ impl<'a> LuaState<'a> {
         match val {
             TValue::Table(t) => {
                 let ptr_id = t.data.borrow().gc_header.ptr_id as usize;
-                // 无论是否注册，都用 ptr_id 做去重 —— 未注册对象只能靠这个
+                // 去重: 已标记对象不再重复遍历 (aux_marked 同时是 is_marked 的判定集)
                 if !gc.aux_mark(ptr_id) {
                     return;
                 }
@@ -1649,23 +1852,23 @@ impl<'a> LuaState<'a> {
                     }
                 });
                 for v in data.array.iter() {
-                    if !weak_v && needs_gc_mark(v) {
-                        unsafe { worklist.push(raw_from_tvalue(v)) };
+                    if !weak_v {
+                        self.push_mark(gc, v, worklist);
                     }
                 }
                 for (k, v) in data.hash_buckets.iter() {
-                    if !weak_k && needs_gc_mark(k) {
-                        unsafe { worklist.push(raw_from_tvalue(k)) };
+                    if !weak_k {
+                        self.push_mark(gc, k, worklist);
                     }
-                    if !weak_k && !weak_v && needs_gc_mark(v) {
-                        unsafe { worklist.push(raw_from_tvalue(v)) };
+                    if !weak_k && !weak_v {
+                        self.push_mark(gc, v, worklist);
                     }
                 }
                 if let Some(ref mt) = data.metatable {
                     let mt_ptr = mt.data.borrow().gc_header.ptr_id as usize;
                     let _ = mt_ptr;
                     let tv = TValue::Table((**mt).clone());
-                    unsafe { worklist.push(raw_from_tvalue(&tv)) };
+                    self.push_mark(gc, &tv, worklist);
                     drop(tv);
                 }
             }
@@ -1692,16 +1895,12 @@ impl<'a> LuaState<'a> {
                     let uv = uv_ref.borrow();
                     match &*uv {
                         UpVal::Closed { value } => {
-                            if needs_gc_mark(value) {
-                                unsafe { worklist.push(raw_from_tvalue(value)) };
-                            }
+                            self.push_mark(gc, value, worklist);
                         }
                         UpVal::Open { stack_index, .. } => {
                             if *stack_index < self.stack.len() {
                                 let val = &self.stack[*stack_index];
-                                if needs_gc_mark(val) {
-                                    unsafe { worklist.push(raw_from_tvalue(val)) };
-                                }
+                                self.push_mark(gc, val, worklist);
                             }
                         }
                     }
@@ -1718,9 +1917,7 @@ impl<'a> LuaState<'a> {
                 });
                 let upvalue = cc.upvalue.borrow();
                 for uv in upvalue.iter() {
-                    if needs_gc_mark(uv) {
-                        unsafe { worklist.push(raw_from_tvalue(uv)) };
-                    }
+                    self.push_mark(gc, uv, worklist);
                 }
             }
             TValue::RustClosure(rc) => {
@@ -1734,9 +1931,7 @@ impl<'a> LuaState<'a> {
                 });
                 let upvals = rc.upvalues.borrow();
                 for uv in upvals.iter() {
-                    if needs_gc_mark(uv) {
-                        unsafe { worklist.push(raw_from_tvalue(uv)) };
-                    }
+                    self.push_mark(gc, uv, worklist);
                 }
             }
             TValue::UserData(u) => {
@@ -1752,13 +1947,11 @@ impl<'a> LuaState<'a> {
                 });
                 if let Some(ref mt) = &*u.metatable.borrow() {
                     let tv = TValue::Table((*mt).clone());
-                    unsafe { worklist.push(raw_from_tvalue(&tv)) };
+                    self.push_mark(gc, &tv, worklist);
                     drop(tv);
                 }
                 for uv in &u.user_values {
-                    if needs_gc_mark(uv) {
-                        unsafe { worklist.push(raw_from_tvalue(uv)) };
-                    }
+                    self.push_mark(gc, uv, worklist);
                 }
             }
             TValue::Thread(t) => {
@@ -1846,6 +2039,26 @@ impl<'a> LuaState<'a> {
         worklist: &mut Vec<RawTValue<'a>>,
         extra_size: &mut usize,
     ) -> Vec<TValue<'a>> {
+        self.collect_finalizers_impl(worklist, extra_size, false)
+    }
+
+    /// 紧急模式下的 finalizer 处理 —— 对应 C 在 `gcemergency` 下「不把对象移入
+    /// tobefnz」：只把不可达的待 finalize 对象**标活并保留在列表中**（否则紧接着的
+    /// sweep 会把它们释放，finalizer 永远丢失），真正的分离/执行推迟到下次常规回收。
+    fn collect_finalizers_deferred(
+        &mut self,
+        worklist: &mut Vec<RawTValue<'a>>,
+        extra_size: &mut usize,
+    ) {
+        let _ = self.collect_finalizers_impl(worklist, extra_size, true);
+    }
+
+    fn collect_finalizers_impl(
+        &mut self,
+        worklist: &mut Vec<RawTValue<'a>>,
+        extra_size: &mut usize,
+        deferred: bool,
+    ) -> Vec<TValue<'a>> {
         let gc: &GCState = unsafe { &*self.gc_ptr() };
         let gc_key = self.gc_key_cached();
         let mut to_finalize: Vec<TValue> = Vec::new();
@@ -1871,10 +2084,18 @@ impl<'a> LuaState<'a> {
                 }
             };
             if has_gc {
-                to_finalize.push(TValue::Table(t.clone()));
-                let tv = TValue::Table(t);
-                unsafe { worklist.push(raw_from_tvalue(&tv)) };
-                drop(tv);
+                if deferred {
+                    // 标活 + 保留：对象仍持有强引用（`keep`），故 worklist 里的原始指针有效
+                    let tv = TValue::Table(t.clone());
+                    unsafe { worklist.push(raw_from_tvalue(&tv)) };
+                    drop(tv);
+                    keep.push(t);
+                } else {
+                    to_finalize.push(TValue::Table(t.clone()));
+                    let tv = TValue::Table(t);
+                    unsafe { worklist.push(raw_from_tvalue(&tv)) };
+                    drop(tv);
+                }
             }
         }
         *self.finobj_list.borrow_mut() = keep;
@@ -1894,10 +2115,17 @@ impl<'a> LuaState<'a> {
                 }
             };
             if has_gc {
-                to_finalize.push(TValue::UserData(u.clone()));
-                let tv = TValue::UserData(u);
-                unsafe { worklist.push(raw_from_tvalue(&tv)) };
-                drop(tv);
+                if deferred {
+                    let tv = TValue::UserData(u.clone());
+                    unsafe { worklist.push(raw_from_tvalue(&tv)) };
+                    drop(tv);
+                    ud_keep.push(u);
+                } else {
+                    to_finalize.push(TValue::UserData(u.clone()));
+                    let tv = TValue::UserData(u);
+                    unsafe { worklist.push(raw_from_tvalue(&tv)) };
+                    drop(tv);
+                }
             }
         }
         *self.ud_finobj_list.borrow_mut() = ud_keep;
@@ -2196,8 +2424,14 @@ mod tests {
     #[test]
     fn test_gc_object_id_unique() {
         let gc = GCState::default_incremental();
-        let id1 = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        let id2 = gc.register_object(200, WeakValue::Nil(NilKind::Strict));
+        let id1 = gc
+            .try_register_object(100, WeakValue::Nil(NilKind::Strict))
+            .ok()
+            .expect("测试: 登记 GC 对象失败");
+        let id2 = gc
+            .try_register_object(200, WeakValue::Nil(NilKind::Strict))
+            .ok()
+            .expect("测试: 登记 GC 对象失败");
         assert_ne!(id1, id2);
         assert!(id1.0 > 0);
         assert!(id2.0 > id1.0);
@@ -2248,7 +2482,10 @@ mod tests {
     #[test]
     fn test_register_object_color() {
         let gc = GCState::default_incremental();
-        let id = gc.register_object(128, WeakValue::Nil(NilKind::Strict));
+        let id = gc
+            .try_register_object(128, WeakValue::Nil(NilKind::Strict))
+            .ok()
+            .expect("测试: 登记 GC 对象失败");
         assert!(gc.is_white(id));
         assert!(!gc.is_black(id));
     }
@@ -2257,15 +2494,24 @@ mod tests {
     fn test_register_object_estimate() {
         let gc = GCState::default_incremental();
         let initial_estimate = gc.gc_estimate.get();
-        let _id = gc.register_object(500, WeakValue::Nil(NilKind::Strict));
+        let _id = gc
+            .try_register_object(500, WeakValue::Nil(NilKind::Strict))
+            .ok()
+            .expect("测试: 登记 GC 对象失败");
         assert!(gc.gc_estimate.get() >= initial_estimate + 500);
     }
 
     #[test]
     fn test_make_gray_and_pop() {
         let gc = GCState::default_incremental();
-        let id1 = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        let id2 = gc.register_object(200, WeakValue::Nil(NilKind::Strict));
+        let id1 = gc
+            .try_register_object(100, WeakValue::Nil(NilKind::Strict))
+            .ok()
+            .expect("测试: 登记 GC 对象失败");
+        let id2 = gc
+            .try_register_object(200, WeakValue::Nil(NilKind::Strict))
+            .ok()
+            .expect("测试: 登记 GC 对象失败");
         gc.make_gray(id1);
         gc.make_gray(id2);
         assert_eq!(gc.pop_gray(), Some(id1));
@@ -2276,7 +2522,10 @@ mod tests {
     #[test]
     fn test_make_gray_idempotent() {
         let gc = GCState::default_incremental();
-        let id = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
+        let id = gc
+            .try_register_object(100, WeakValue::Nil(NilKind::Strict))
+            .ok()
+            .expect("测试: 登记 GC 对象失败");
         gc.make_gray(id);
         gc.make_gray(id);
         assert_eq!(gc.pop_gray(), Some(id));
@@ -2286,7 +2535,10 @@ mod tests {
     #[test]
     fn test_barrier_back() {
         let gc = GCState::default_incremental();
-        let p = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
+        let p = gc
+            .try_register_object(100, WeakValue::Nil(NilKind::Strict))
+            .ok()
+            .expect("测试: 登记 GC 对象失败");
         gc.set_color(p, GCColor::Black);
         gc.barrier_back(p);
         assert_eq!(gc.pop_gray_again(), Some(p));
@@ -2295,7 +2547,10 @@ mod tests {
     #[test]
     fn test_barrier_back_not_black() {
         let gc = GCState::default_incremental();
-        let p = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
+        let p = gc
+            .try_register_object(100, WeakValue::Nil(NilKind::Strict))
+            .ok()
+            .expect("测试: 登记 GC 对象失败");
         gc.set_color(p, GCColor::Gray);
         gc.barrier_back(p);
         assert_eq!(gc.pop_gray_again(), None);
@@ -2345,8 +2600,14 @@ mod tests {
     #[test]
     fn test_sweep_unreachable_by_color() {
         let gc = GCState::default_incremental();
-        let id_keep = gc.register_object(100, WeakValue::Nil(NilKind::Strict));
-        let id_free = gc.register_object(200, WeakValue::Nil(NilKind::Strict));
+        let id_keep = gc
+            .try_register_object(100, WeakValue::Nil(NilKind::Strict))
+            .ok()
+            .expect("测试: 登记 GC 对象失败");
+        let id_free = gc
+            .try_register_object(200, WeakValue::Nil(NilKind::Strict))
+            .ok()
+            .expect("测试: 登记 GC 对象失败");
         // 标记 id_keep 为可达（染黑）
         gc.set_color(id_keep, GCColor::Black);
         // id_free 保持白色

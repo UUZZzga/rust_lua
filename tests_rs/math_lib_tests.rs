@@ -25,7 +25,7 @@ use std::os::windows::process::ExitStatusExt;
 fn run_lua(args: &[&str]) -> std::process::Output {
     let mut buff = lua_rs::mock::io_mock::BufferIo::new("");
     let success = {
-        let mut interpreter = Interpreter::new(&mut buff);
+        let mut interpreter = Interpreter::new(&mut buff).expect("创建 state 失败");
         let mut args_vec: Vec<String> = vec!["lua".to_string()];
         args_vec.extend(args.iter().map(|s| s.to_string()));
         interpreter.pmain(&args_vec)
@@ -1259,8 +1259,8 @@ fn test_rust_api_math_random_reproducible() {
 
 #[test]
 fn test_rust_api_open_math_lib() {
-    let mut state = LuaState::default();
-    math_lib::open_math_lib(&mut state);
+    let mut state = LuaState::new_main(lua_rs::mock::io_mock::lua_io()).expect("创建 state 失败");
+    math_lib::open_math_lib(&mut state).expect("打开 math 库失败");
 
     // 验证 math 全局表已注册
     let key = state.intern_str("math");
