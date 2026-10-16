@@ -8,6 +8,7 @@
 use crate::execute::VmError;
 use crate::objects::TValue;
 use std::alloc::{self, Layout};
+use std::cell::RefCell;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
@@ -610,6 +611,40 @@ impl<'a> crate::state::LuaState<'a> {
         self.retry_alloc(|| t.try_reserve_for_int(key, is_nil))?;
         t.set_int_unchecked(key, value);
         Ok(())
+    }
+
+    /// 建 userdata 漏斗 —— 一次完成「构造 + 对象块分配 + GC 登记 + id 写回」。
+    ///
+    /// 对应 C 的 `luaS_newudata`（`luaC_newobj` 建对象并立即 `setgclist`）。
+    /// `register_object` 失败与其它分配点同走「紧急 GC → 重试 → 内存错误」漏斗。
+    ///
+    /// `data` 必须以 `Vec<u64>` 传入以保证 8 字节对齐（C 代码可能在数据区放指针数组）；
+    /// `len` 是给 C 侧看的逻辑字节长度（`data` 通常按 8 字节向上取整）。
+    pub fn new_udata(
+        &mut self,
+        nuvalue: usize,
+        len: usize,
+        data: Vec<u64>,
+        metatable: Option<crate::table::Table<'a>>,
+    ) -> Result<crate::alloc::MyRc<crate::objects::Udata<'a>, SlotAlloc>, VmError<'a>> {
+        let udata = crate::objects::Udata {
+            gc_header: crate::gc::GCObjectHeader::new(),
+            nuvalue: nuvalue as u16,
+            len,
+            metatable: RefCell::new(metatable),
+            user_values: (0..nuvalue)
+                .map(|_| TValue::Nil(crate::objects::NilKind::Strict))
+                .collect(),
+            data,
+        };
+        let ud = self.new_object(udata)?;
+        // 用 gc_mem_size() 计费含 data/user_values 容量，比 size_of::<Udata>() 更接近真实占用
+        let id = self.register_object(
+            ud.gc_mem_size(),
+            crate::objects::WeakValue::UserData(ud.downgrade()),
+        )?;
+        ud.gc_header.set_id(id);
+        Ok(ud)
     }
 
     /// 通用漏斗（闭包可取 `&mut self`）—— 用于需要同时改自身状态的分配点，

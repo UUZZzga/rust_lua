@@ -33,7 +33,7 @@ use const_format::formatcp;
 use crate::mem::{Allocator, CapiAllocator};
 use crate::objects::{
     CClosure, LCFunction, LClosure, LuaThread, LuaType, NilKind, Proto, TValue, Table,
-    ThreadContext, ThreadStatus, Udata, UpVal, WeakValue,
+    ThreadContext, ThreadStatus, Udata, UpVal,
 };
 use crate::state::{GlobalState, LuaState};
 use crate::strings::{lua_string_as_c_str_ptr, lua_string_as_str, lua_string_eq, lua_string_len};
@@ -1719,26 +1719,14 @@ pub extern "C-unwind" fn lua_newuserdatauv(
     // 用 Vec<u64> 分配内存，保证 8 字节对齐
     // C 代码（如 skynet netpack 的 struct queue）可能包含指针数组，需要正确对齐
     let n_u64 = (sz + 7) / 8; // 向上取整到 8 字节
-    let mut udata = crate::objects::Udata {
-        gc_header: crate::gc::GCObjectHeader::new(),
-        nuvalue: nuv as u16,
-        len: sz,
-        metatable: None.into(),
-        user_values: (0..nuv).map(|_| TValue::Nil(NilKind::Strict)).collect(),
-        data: vec![0u64; n_u64],
-    };
-    let ptr = udata.data.as_mut_ptr() as *mut c_void;
-    let ud = match L.new_object(udata) {
+    let mut data = vec![0u64; n_u64];
+    let ptr = data.as_mut_ptr() as *mut c_void;
+    // new_udata 完成「构造 + 对象块分配 + GC 登记 + id 写回」（id 使 mark_tvalue 能正确
+    // 标记 reachable：没有 id 的 userdata 会被 collect_finalizers 误判为不可达）
+    let ud = match L.new_udata(nuv, sz, data, None) {
         Ok(ud) => ud,
         Err(e) => raise_mem_error(L, e),
     };
-    // 注册到 GC 并设置 id（使 mark_tvalue 能正确标记 reachable）
-    // 用 gc_mem_size() 计费含 data/user_values 容量，比 size_of::<Udata>() 更接近真实占用
-    let ud_id = match L.register_object(ud.gc_mem_size(), WeakValue::UserData(ud.downgrade())) {
-        Ok(id) => id,
-        Err(e) => raise_mem_error(L, e),
-    };
-    ud.gc_header.set_id(ud_id);
     L.stack.push(TValue::UserData(ud));
     ptr
 }

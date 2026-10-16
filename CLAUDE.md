@@ -187,7 +187,7 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
 
 ### 编码约定（新增分配点必须遵守）
 
-- 生产路径一律走漏斗入口，禁止再用会 abort 的构造：`MyRc/SimpleRc/SimpleArc::try_new_in`（失败时**原样交还 payload**）→ `LuaState::new_object`；`Table::try_new_in` / `try_with_capacity_in` → `LuaState::new_table` / `new_table_with_capacity`；表写入 `LuaState::table_set` / `table_set_int`；栈扩容 `LuaState::reserve_stack`。`#[cfg(test)]` 下的 `new_in` / `Table::new_in` / `Table::set` 等只是**测试专用**便捷包装（失败即 panic），生产代码不得使用。
+- 生产路径一律走漏斗入口，禁止再用会 abort 的构造：`MyRc/SimpleRc/SimpleArc::try_new_in`（失败时**原样交还 payload**）→ `LuaState::new_object`；`Table::try_new_in` / `try_with_capacity_in` → `LuaState::new_table` / `new_table_with_capacity`；userdata 一律经 `LuaState::new_udata`（构造 + 对象块分配 + GC 登记 + id 写回一体，不得在调用点手写 `new_object` + `register_object` + `set_id` 三连）；表写入 `LuaState::table_set` / `table_set_int`；栈扩容 `LuaState::reserve_stack`。`#[cfg(test)]` 下的 `new_in` / `Table::new_in` / `Table::set` 等只是**测试专用**便捷包装（失败即 panic），生产代码不得使用。
 - **先扩容再写入**：失败必须不留半写状态（对应 C 的 `luaM_saferealloc_` 只在成功后更新 `*psize`）。表写入即按此拆成 `Table::try_reserve_for`（可失败，只做容量预留）+ `Table::set_unchecked` / `set_int_unchecked`（无分配写入）；`try_reserve_for` 失败时表内容不变，因此漏斗可以安全地「紧急 GC 后整体重试」。`TableData::idx_insert` 同样要求调用点先用 `try_reserve_index` 备好容量。
 - 漏斗闭包必须**可重复执行**：失败时不得留下部分写入，且要把数据交还出来供重试继续（`MyRc::try_new_in` 的 `Err(payload)` 形态、`Some(value).take()` 形态）。
 - C API（`capi.rs`）没有返回错误的通道：失败必须**抛错**（`raise_mem_error`，复用与 `lua_error` 相同的 panic/longjmp 机制），对应 C 的 `luaM_error` → `luaD_throw`。

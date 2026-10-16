@@ -16,7 +16,7 @@
 
 use crate::config::{LuaInteger, LuaNumber, LuaUnsigned};
 use crate::execute::VmError;
-use crate::objects::{BuiltinFn, NilKind, RustClosure, TValue, WeakValue};
+use crate::objects::{BuiltinFn, NilKind, RustClosure, TValue};
 use crate::state::LuaState;
 use crate::strings::lua_string_as_str;
 use crate::table::Table;
@@ -232,25 +232,13 @@ fn new_file_userdata<'a>(
     file: *mut libc::FILE,
     file_mt: &Table<'a>,
 ) -> Result<TValue<'a>, VmError<'a>> {
-    let udata = crate::objects::Udata {
-        gc_header: crate::gc::GCObjectHeader::new(),
-        nuvalue: 0,
-        len: 0,
-        metatable: Some(file_mt.clone()).into(),
-        user_values: vec![],
-        data: vec![file as u64],
-    };
     // 如果元表有 __gc，注册到 ud_finobj_list
     let gc_key = state.intern_str("__gc");
-    let ud_rc = state.new_object(udata)?;
-    if file_mt.get(&gc_key).is_some() {
+    let has_gc = file_mt.get(&gc_key).is_some();
+    let ud_rc = state.new_udata(0, 0, vec![file as u64], Some(file_mt.clone()))?;
+    if has_gc {
         state.g_mut().register_ud_finobj(&ud_rc);
     }
-    // 注册到 GC 并设置 id（使 mark_tvalue 能正确标记 reachable）
-    // 用 gc_mem_size() 计费含 data/user_values 容量，比 size_of::<Udata>() 更接近真实占用
-    let ud_id =
-        state.register_object(ud_rc.gc_mem_size(), WeakValue::UserData(ud_rc.downgrade()))?;
-    ud_rc.gc_header.set_id(ud_id);
     let ptr_id = ud_rc.gc_header.ptr_id;
     let value = TValue::UserData(ud_rc);
     state
@@ -2285,17 +2273,7 @@ pub fn open_io_lib<'a>(state: &mut LuaState<'a>) -> Result<(), VmError<'a>> {
     let make_stream = |state: &mut LuaState<'a>,
                        file: *mut libc::FILE|
      -> Result<TValue<'a>, VmError<'a>> {
-        let udata = crate::objects::Udata {
-            gc_header: crate::gc::GCObjectHeader::new(),
-            nuvalue: 0,
-            len: 0,
-            metatable: Some(file_mt.clone()).into(),
-            user_values: vec![],
-            data: vec![file as u64],
-        };
-        let ud = state.new_object(udata)?;
-        let ud_id = state.register_object(ud.gc_mem_size(), WeakValue::UserData(ud.downgrade()))?;
-        ud.gc_header.set_id(ud_id);
+        let ud = state.new_udata(0, 0, vec![file as u64], Some(file_mt.clone()))?;
         let ptr_id = ud.gc_header.ptr_id;
         let val = TValue::UserData(ud);
         state.file_handles.borrow_mut().insert(ptr_id, val.clone());
