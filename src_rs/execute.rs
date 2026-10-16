@@ -18,8 +18,8 @@ use crate::config::{LuaInteger, LuaNumber, LuaUnsigned, MAX_INTEGER, MIN_INTEGER
 use crate::helper::JmpBuf;
 use crate::mem::SlotAlloc;
 use crate::objects::{
-    CallFrame, Instruction, LClosure, LuaType, NilKind, Proto, TValue, UpVal, UpValVec, WeakValue,
-    PF_VAHID, PF_VATAB,
+    CallFrame, Instruction, LClosure, LuaType, NilKind, Proto, TValue, UpVal, UpValVec, PF_VAHID,
+    PF_VATAB,
 };
 use crate::opcodes::{self, OpCode};
 use crate::state::{LuaState, LUAI_MAXCCALLS, LUA_MINSTACK, MAX_CALL_CHAIN};
@@ -7438,18 +7438,9 @@ impl VmExecutor {
             // GC: 在创建新闭包前检查 GC 阈值，回收不可达的旧闭包。
             // 对应 C Lua 的 luaC_checkGC（OP_CLOSURE 中调用 luaC_checkGC(L)）。
             state.maybe_collect_gc();
-            let closure = state.new_object(LClosure {
-                gc_header: crate::gc::GCObjectHeader::new(),
-                proto,
-                upvals,
-            })?;
-            // 注册到 GC metas，使 gc_estimate 增长，让 maybe_collect_gc 的阈值检查能正常工作
-            // 用 gc_mem_size() 计费含 upvals 容量，比 size_of::<LClosure>() 更接近真实占用
-            let closure_id = state.register_object(
-                closure.gc_mem_size(),
-                WeakValue::LClosure(closure.downgrade()),
-            )?;
-            closure.gc_header.set_id(closure_id);
+            // new_closure 完成「构造 + 对象块分配 + GC 登记 + id 写回」，
+            // 登记使 gc_estimate 增长，让 maybe_collect_gc 的阈值检查能正常工作
+            let closure = state.new_closure(proto, upvals)?;
             Self::write_stack(state, ra, TValue::LClosure(closure));
         }
         state.pc += 1;

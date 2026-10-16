@@ -647,6 +647,29 @@ impl<'a> crate::state::LuaState<'a> {
         Ok(ud)
     }
 
+    /// 建 Lua 闭包漏斗 —— 一次完成「构造 + 对象块分配 + GC 登记 + id 写回」。
+    ///
+    /// 对应 C 的 `luaF_newLclosure`（`luaC_newobj` 建对象）。登记使 `gc_estimate`
+    /// 增长（`maybe_collect_gc` 阈值检查依赖它），并让 sweep 能回收不可达闭包。
+    pub fn new_closure(
+        &mut self,
+        proto: Rc<crate::objects::Proto<'a>>,
+        upvals: Rc<RefCell<crate::objects::UpValVec<'a>>>,
+    ) -> Result<crate::alloc::MyRc<crate::objects::LClosure<'a>, SlotAlloc>, VmError<'a>> {
+        let closure = self.new_object(crate::objects::LClosure {
+            gc_header: crate::gc::GCObjectHeader::new(),
+            proto,
+            upvals,
+        })?;
+        // 用 gc_mem_size() 计费含 upvals 容量，比 size_of::<LClosure>() 更接近真实占用
+        let id = self.register_object(
+            closure.gc_mem_size(),
+            crate::objects::WeakValue::LClosure(closure.downgrade()),
+        )?;
+        closure.gc_header.set_id(id);
+        Ok(closure)
+    }
+
     /// 通用漏斗（闭包可取 `&mut self`）—— 用于需要同时改自身状态的分配点，
     /// 例如栈扩容（`luaD_growstack` → `luaM_reallocvector`）。
     pub fn retry_alloc_mut<T>(

@@ -2290,6 +2290,12 @@ pub extern "C" fn lua_version(_L: *mut lua_State) -> lua_Number {
 #[no_mangle]
 pub unsafe extern "C" fn lua_gc(L: *mut lua_State, what: c_int, _arg: c_int) -> c_int {
     let L = unsafe { &mut *L };
+    // 规约 R1：capi 入口先重绑 `l_g` / `G.main`。宿主从 Rust 侧持有 `LuaState`
+    // 局部变量（`let mut st = LuaState::default()`）时，构造点地址在移动后失效 ——
+    // `G.main` 里仍是旧地址。C 对宿主没有「必须先进入执行」的约束，顶层直接
+    // `lua_gc(L, LUA_GCCOLLECT, 0)` 是合法用法，故这里必须自愈（否则 collect_gc
+    // 会经悬垂的 `G.main` 解引用，实测 0xC0000005）。
+    L.bind_exec();
     match what {
         0 => {
             // LUA_GCSTOP
@@ -4153,11 +4159,17 @@ pub extern "C" fn lua_rawsetp(L: *mut lua_State, idx: c_int, p: *const c_void) {
 #[cfg(not(feature = "cmp_c"))]
 pub extern "C" fn lua_resume(
     L: *mut lua_State,
-    _from: *mut lua_State,
+    from: *mut lua_State,
     nargs: c_int,
     nres: *mut c_int,
 ) -> c_int {
     let L = unsafe { &mut *L };
+    // 规约 R1：`from` 是发起 resume 的主线程（C 允许 NULL）—— 它是本次执行链的
+    // 入口点，必须在此重绑 `G.main`：否则协程内触发的 GC 会经「主线程栈当根」
+    // 读到宿主移动前的旧地址（见 gc.rs::collect_gc_inner 的主线程分支注释）。
+    if !from.is_null() {
+        unsafe { (*from).bind_exec() };
+    }
     let nargs = nargs as usize;
     let r = crate::stdlib::coroutine_lib::c_api_resume(L, nargs);
     match r {
@@ -5779,5 +5791,53 @@ mod tests {
             (42, 1),
             "C 压入的表在 C 调用期间的 GC 中被清扫了"
         );
+    }
+
+    /// 回归：从 Rust 侧顶层调用 `lua_gc(L, LUA_GCCOLLECT, 0)` 不得崩溃。
+    ///
+    /// 实测 0xC0000005 的成因：宿主从 Rust 侧持有 `LuaState` 局部变量时，
+    /// 构造点地址在移动后失效，而 `G(L)->main` 里登记的仍是旧地址（规约 R1：
+    /// 只在进入点重绑）。此前 `lua_gc` 不重绑、`collect_gc_inner` 又无条件按
+    /// `G.main` 扫主线程根 → 解引用悬垂指针（`main=0x...fe2d0` vs `self=0x...ff0d0`）。
+    #[test]
+    fn test_lua_gc_collect_toplevel_from_rust() {
+        // (1) 从未进入过执行的状态 —— 最易暴露陈旧的 `G.main`
+        let mut st = LuaState::default();
+        let L = &mut st as *mut LuaState<'static> as *mut lua_State;
+        unsafe { lua_gc(L, 2, 0) };
+        unsafe { lua_gc(L, 2, 0) };
+
+        // (2) 打开标准库后（状态内有表/字符串/userdata，GC 有实际清扫工作）
+        st.open_selected_libs(0, 0).expect("打开标准库失败");
+        unsafe { lua_gc(L, 2, 0) };
+
+        // (3) 执行过一段 Lua 代码后再从 Rust 侧收集
+        let state = unsafe { &mut *L };
+        assert_eq!(state.load_buffer("local t = {1, 2}", "=probe"), 0);
+        assert_eq!(state.pcall(0, 0, 0), 0);
+        unsafe { lua_gc(L, 2, 0) };
+
+        // (4) 由 Lua 调用的 C 函数内部收集（历史可用的路径，防回归）
+        unsafe extern "C" fn in_cfunc(l: *mut c_void) -> c_int {
+            let L = l as *mut lua_State;
+            lua_gc(L, 2, 0);
+            lua_gc(L, 2, 0);
+            0
+        }
+        unsafe {
+            lua_pushcfunction(L, in_cfunc);
+            lua_setglobal(L, c"gc_probe".as_ptr());
+        }
+        let state = unsafe { &mut *L };
+        assert_eq!(state.load_buffer("gc_probe()", "=probe"), 0);
+        assert_eq!(state.pcall(0, 0, 0), 0);
+
+        // (5) GC 后状态仍可用：分配到新对象 + 载入并执行新 chunk
+        let state = unsafe { &mut *L };
+        assert_eq!(state.load_buffer("return 7 * 6", "=probe"), 0);
+        assert_eq!(state.pcall(0, 1, 0), 0);
+        let mut isnum: c_int = 0;
+        assert_eq!(unsafe { lua_tointegerx(L, -1, &mut isnum) }, 42);
+        assert_eq!(isnum, 1);
     }
 }

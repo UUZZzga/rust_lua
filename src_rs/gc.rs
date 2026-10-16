@@ -1488,11 +1488,22 @@ impl<'a> LuaState<'a> {
             drop(tv);
         }
 
-        // 根：主线程
-        let main_ptr = self.g().main;
-        let self_ptr = self as *const LuaState<'a> as *mut LuaState<'a>;
-        if !main_ptr.is_null() && main_ptr != self_ptr {
-            unsafe { (*main_ptr).collect_roots_into(worklist) };
+        // 根：主线程 —— **仅当 self 不是主线程时才需要**。
+        //
+        // self 是主线程（`is_main_thread()`）时其根已由上面的 `collect_roots_into(self)`
+        // 扫过，此时**绝不能**解引用 `G(L)->main`：主线程的 `LuaState` 由调用方持有，
+        // Rust 侧 `let mut st = LuaState::default();` 之后 st 与构造点不同地址，
+        // `G.main` 里登记的仍是移动前的旧地址（规约 R1：只在进入点重绑）——
+        // 解引用即悬垂指针，实测 `lua_gc(L, LUA_GCCOLLECT, 0)` 从顶层调用时
+        // 0xC0000005（`main=0x...fe2d0` vs `self=0x...ff0d0`）。
+        // self 是协程时：主线程此刻挂起但栈仍活，必须把它的栈当根，而 `G.main`
+        // 此刻必为有效地址 —— 主线程是在某个进入点（pcall / execute / lua_gc /
+        // lua_resume 的 from）里 bind_exec 之后才可能放行协程的。
+        if !self.is_main_thread() {
+            let main_ptr = self.g().main;
+            if !main_ptr.is_null() {
+                unsafe { (*main_ptr).collect_roots_into(worklist) };
+            }
         }
         // 主线程对象自身的 function
         let main_thread = self.main_thread.clone();

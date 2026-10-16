@@ -1,14 +1,14 @@
 use crate::alloc::MyRc;
 use crate::config::{LuaInteger, LuaNumber};
 use crate::execute::{VmError, VmExecutor, VmResult};
-use crate::gc::{GCObjectHeader, GCState};
+use crate::gc::GCState;
 #[cfg(lua_use_longjmp)]
 use crate::helper::JmpBuf;
 use crate::mem::SlotAlloc;
 use crate::mem::{AllocOwner, Allocator, DefaultAllocator, MemState};
 use crate::objects::{
     Instruction, LClosure, LuaThread, LuaType, NilKind, Proto, TValue, ThreadContext, UpVal,
-    UpValRef, UpValVec, WeakValue,
+    UpValRef, UpValVec,
 };
 use crate::strings::{lua_string_as_str, lua_string_len, StringTable, MEMERRMSG};
 use crate::table::Table;
@@ -450,6 +450,16 @@ impl<'a> LuaState<'a> {
         s.owner = Some(owner);
         s.bind_exec();
         Ok(s)
+    }
+
+    /// 本执行态是否为主线程（对应 C 的 `lua_State` 是否为 `lua_newstate` 建的那个）。
+    ///
+    /// 判据是「持有共享全局块」：只有主执行态有 `owner`，协程一律 `None`（`l_g`
+    /// 指向主人的块）。GC 据此区分两种情形 —— 「自己就是主线程，自己的根已扫」
+    /// 与「自己是协程，主线程挂起但其栈仍须当根」（见 `gc.rs::collect_gc_inner`）。
+    #[inline]
+    pub fn is_main_thread(&self) -> bool {
+        self.owner.is_some()
     }
 
     /// 同 `new_main_with_allocator`，使用 `DefaultAllocator`。
@@ -2309,35 +2319,17 @@ impl<'a> LuaState<'a> {
                             value: TValue::Nil(NilKind::Strict),
                         })));
                 }
-                let closure = match self.new_object(LClosure {
-                    gc_header: GCObjectHeader::new(),
-                    proto: Rc::new(proto),
-                    upvals,
-                }) {
+                // new_closure 完成「构造 + 对象块分配 + GC 登记 + id 写回」；
+                // 失败同样按内存错误上报（对应 C 的 lua_load：返回 LUA_ERRMEM，
+                // 预注册的 memerrmsg 作为错误对象留在栈上）
+                let closure = match self.new_closure(Rc::new(proto), upvals) {
                     Ok(c) => c,
                     Err(_) => {
-                        // 对应 C 的 lua_load：分配失败返回 LUA_ERRMEM，
-                        // 预注册的 memerrmsg 作为错误对象留在栈上
                         let mm = self.memerrmsg_value();
                         self.stack.push(mm);
                         return ERR_MEM;
                     }
                 };
-                {
-                    // 对象表登记失败同样按内存错误上报（对应 lua_load 的 LUA_ERRMEM）
-                    let id = match self.register_object(
-                        std::mem::size_of::<LClosure>() + /* upvals 尺寸估算 */ 0,
-                        WeakValue::LClosure(closure.downgrade()),
-                    ) {
-                        Ok(id) => id,
-                        Err(_) => {
-                            let mm = self.memerrmsg_value();
-                            self.stack.push(mm);
-                            return ERR_MEM;
-                        }
-                    };
-                    closure.gc_header.set_id(id);
-                }
                 self.stack.push(TValue::LClosure(closure));
                 0
             }
@@ -2389,14 +2381,10 @@ impl<'a> LuaState<'a> {
                                 value: TValue::Nil(NilKind::Strict),
                             })));
                     }
-                    let closure = match self.new_object(LClosure {
-                        gc_header: GCObjectHeader::new(),
-                        proto: Rc::new(proto),
-                        upvals,
-                    }) {
+                    // 见 load_buffer：new_closure 含 GC 登记，失败走 LUA_ERRMEM 语义
+                    let closure = match self.new_closure(Rc::new(proto), upvals) {
                         Ok(c) => c,
                         Err(_) => {
-                            // 见 load_buffer：LUA_ERRMEM 语义
                             let mm = self.memerrmsg_value();
                             self.stack.push(mm);
                             return ERR_MEM;

@@ -2270,15 +2270,14 @@ pub fn open_io_lib<'a>(state: &mut LuaState<'a>) -> Result<(), VmError<'a>> {
     state.table_set(&reg, key, TValue::Table(file_mt.clone()))?;
 
     // 注册标准流作为 FullUserData
-    let make_stream = |state: &mut LuaState<'a>,
-                       file: *mut libc::FILE|
-     -> Result<TValue<'a>, VmError<'a>> {
-        let ud = state.new_udata(0, 0, vec![file as u64], Some(file_mt.clone()))?;
-        let ptr_id = ud.gc_header.ptr_id;
-        let val = TValue::UserData(ud);
-        state.file_handles.borrow_mut().insert(ptr_id, val.clone());
-        Ok(val)
-    };
+    let make_stream =
+        |state: &mut LuaState<'a>, file: *mut libc::FILE| -> Result<TValue<'a>, VmError<'a>> {
+            let ud = state.new_udata(0, 0, vec![file as u64], Some(file_mt.clone()))?;
+            let ptr_id = ud.gc_header.ptr_id;
+            let val = TValue::UserData(ud);
+            state.file_handles.borrow_mut().insert(ptr_id, val.clone());
+            Ok(val)
+        };
 
     let stdin_val = make_stream(state, c_stdin())?;
     let stdout_val = make_stream(state, c_stdout())?;

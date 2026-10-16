@@ -16,8 +16,7 @@ use const_format::formatcp;
 
 use crate::config::{LuaInteger, LuaNumber, LuaUnsigned};
 use crate::execute::VmError;
-use crate::gc::GCObjectHeader;
-use crate::objects::{LClosure, NilKind, Proto, TValue, UpVal, UpValVec};
+use crate::objects::{NilKind, Proto, TValue, UpVal, UpValVec};
 use crate::state::LuaState;
 use crate::strings::{lua_string_as_str, lua_string_eq, lua_string_len};
 // 生产路径一律经 `LuaState::new_table` / `LuaState::table_set`；裸 `Table` 名仅剩测试模块使用
@@ -2712,11 +2711,11 @@ fn call_load<'a>(
                         value: TValue::Nil(NilKind::Strict),
                     })));
             }
-            let closure = state.new_object(LClosure {
-                gc_header: GCObjectHeader::new(),
-                proto: Rc::new(proto),
-                upvals,
-            })?;
+            // new_closure 完成「构造 + 对象块分配 + GC 登记 + id 写回」。
+            // 此前该路径未登记：闭包不计入 `gc_estimate`（GC 阈值/`collectgarbage("count")`
+            // 都看不到它），也不进 sweep 的回收通道 —— 只能靠 Rc 归零释放，
+            // 一旦与 upvalue 构成环就永久存活。
+            let closure = state.new_closure(Rc::new(proto), upvals)?;
             push_results(state, a, nresults, vec![TValue::LClosure(closure)]);
             Ok(())
         }
