@@ -4,7 +4,8 @@
 # 流程:
 #   1. 构建 Rust lua (target/release/lua + liblua_rs.a)
 #   2. 下载依赖库源码 (deps/fetch.sh)
-#   3. 编译所有 C 模块 (deps/Makefile)
+#   3. 编译所有 C 模块 (deps/Makefile); Windows 下额外构建 lua_rs.dll
+#      (deps/lua_dll 的 cdylib, skynet 的宿主 Lua) 并给 skynet 的 mingw.mk 打补丁
 #
 # 用法: ./setup.sh
 #
@@ -61,6 +62,13 @@ if [[ "${2:-}" == "--debug" ]]; then
     ok "使用调试模式"
 fi
 
+# Windows (MinGW/MSYS) 与 POSIX 的分叉: lua_rs.dll 与 skynet 的 mingw.mk 补丁只在
+# Windows 需要 (Linux 的 skynet 直接链 liblua_rs.a)
+IS_WINDOWS=0
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) IS_WINDOWS=1 ;;
+esac
+
 # ============================================================================
 # 1. 构建 Rust lua (启用 threaded + skynet feature)
 # ============================================================================
@@ -84,6 +92,15 @@ if [[ $USE_DEBUG == 1 ]]; then
     LUA_BIN="$PROJECT_ROOT/target/debug/lua"
     LUA_LIB="$PROJECT_ROOT/target/debug/liblua_rs.a"
 fi
+# Windows: 可执行文件带 .exe, Rust 的 staticlib 叫 lua_rs.lib (MSVC 命名);
+# MinGW 侧 skynet 实际链接的是 deps/Makefile 用 dlltool 从导出清单生成的导入库
+# (liblua_exe.a / liblua_rs_dll.a), 不直接用 staticlib。
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        LUA_BIN="${LUA_BIN}.exe"
+        LUA_LIB="${LUA_LIB%/*}/lua_rs.lib"
+        ;;
+esac
 
 if [[ -f "$LUA_BIN" && -f "$LUA_LIB" && "${1:-}" != "--rebuild-lua" ]]; then
     ok "Rust lua 已构建: $LUA_BIN"
@@ -91,8 +108,17 @@ else
     log "构建 Rust lua (cargo build --release --features lua_longjmp,threaded,skynet)..."
     run_unlimited cargo build --release --features lua_longjmp,threaded,skynet
     [[ -f "$LUA_BIN" ]] || die "lua 二进制未生成: $LUA_BIN"
-    [[ -f "$LUA_LIB" ]] || die "liblua_rs.a 静态库未生成: $LUA_LIB"
+    [[ -f "$LUA_LIB" ]] || die "静态库未生成: $LUA_LIB"
     ok "Rust lua 构建完成"
+fi
+
+# C 模块 (含 skynet) 的宿主导入库清单, 由 build.rs 生成 —— 缺了就重新构建 lua-rs
+# (仅 Windows 用; Linux 由 skynet 直接链 liblua_rs.a)
+if [[ $IS_WINDOWS == 1 ]]; then
+    for def in lua_exe_import.def lua_rs_dll_import.def; do
+        diff_def="$PROJECT_ROOT/target/release/$def"
+        [[ -f "$diff_def" ]] || die "缺少导出清单 $diff_def (build.rs 未生成; 用 setup.sh --rebuild-lua 重建)"
+    done
 fi
 
 # ============================================================================
@@ -264,202 +290,157 @@ LUAEOF
 patch_lunit_compat
 
 # ============================================================================
-# 4c. 应用 skynet Lua-rs 兼容补丁
+# 4c. skynet: 宿主 Lua 一律用 lua-rs
 # ============================================================================
-# skynet 自带修改版 Lua 5.5.1 (ejoy/lua skynet55 分支)，包含 skynet 扩展 API。
-# 用 lua-rs (官方 Lua 5.5.0 ABI) 替换 skynet 自带 Lua 时，需处理三处不兼容：
-#   a) service_snlua.c: luaL_makeseed → time(NULL)（硬依赖，无兜底）
-#   b) service_snlua.c: coroutine.resume/wrap 替换跳过（LUA_RUST_COMPAT 宏，
-#      lua-rs 的 lua_resume 不支持恢复挂起协程）
-#   c) lua-skynet.c: callback 机制改用 luaL_ref 存 registry（lua-rs 的
-#      lua_newthread 返回主 L，无法提供独立栈）
-#   d) lua-sharetable.c: #include "lgc.h" 移到 #ifdef makeshared 内
-# a/b/c 通过一个 patch 文件应用，d 通过 sed 应用。
+# skynet 自带修改版 Lua 5.5.1 (ejoy/lua skynet55 分支, 3rd/lua: 扩了
+# lua_sharefunction/lua_sharestring/lua_clonetable/luaL_loadfilex_/luaL_makeseed,
+# lgc.h 里加了 makeshared/isshared, 另有 onelua.c 单文件构建), 本项目不用它:
+#   - 头文件: src/ (官方 Lua 5.5.0, 即 lua-rs 遵循的 C API)
+#   - Linux: skynet 直接链接 liblua_rs.a, 用 -Wl,-E 把符号导出给 dlopen 的 .so
+#   - MinGW: 用 lua_rs.dll 作宿主 Lua (deps/lua_dll 的 cdylib, 见下面 cargo 步骤);
+#     deps/Makefile 用 dlltool 把 build.rs 生成的导出清单转成导入库
+# 因此 skynet 源码无需任何补丁:
+#   - luaL_makeseed 是官方 API (src/lauxlib.h 声明, src/lauxlib.c 实现)
+#   - lua_newthread / lua_resume 已由 lua-rs 实现 (无 .so 需要 registry 版 callback)
+#   - lua-sharetable.c 的主体在 #ifdef makeshared 内, 用官方头文件时整体编译掉
+#     (src/lgc.h 无 makeshared 宏), 不依赖 skynet 的 Lua 内部结构
+# 唯一要改的是 skynet 的 MinGW 构建脚本 mingw.mk: 它硬编码了 3rd/lua 的头文件
+# 目录、lua54.dll 与 vendored Lua 的构建规则 (见下面的补丁)。
 SKYNET_SRC_DIR="$SCRIPT_DIR/src/skynet"
-apply_skynet_patch() {
-    return 0  # 已在 lua-rs 中实现 luaL_makeseed/lua_newthread/lua_resume，无需修改 skynet 源码
-    # 以下为历史补丁逻辑，保留备查但不执行
-    local snlua_c="$SKYNET_SRC_DIR/service-src/service_snlua.c"
-    local skynet_c="$SKYNET_SRC_DIR/lualib-src/lua-skynet.c"
-    local sharetable_c="$SKYNET_SRC_DIR/lualib-src/lua-sharetable.c"
+SKYNET_MINGW_MK="$SKYNET_SRC_DIR/mingw.mk"
 
-    if [[ ! -f "$snlua_c" ]]; then
+# lua_rs.dll: skynet 的宿主 Lua 动态库 (仅 Windows 需要)。
+# 不能拿 lua-rs 自己的 lua.exe 顶替 —— LoadLibrary 一个 EXE 会以 mainCRTStartup
+# 当 DllMain 调用, Rust 运行期不初始化, 实测 lua_newstate 即崩。
+if [[ $IS_WINDOWS == 1 ]]; then
+    log "构建 lua_rs.dll (skynet 宿主 Lua, deps/lua_dll)..."
+    run_unlimited cargo build --release --manifest-path "$SCRIPT_DIR/lua_dll/Cargo.toml" \
+        --target-dir "$PROJECT_ROOT/target"
+    [[ -f "$PROJECT_ROOT/target/release/lua_rs.dll" ]] || die "lua_rs.dll 未生成"
+    ok "lua_rs.dll 构建完成"
+fi
+
+# mingw.mk: 去掉 3rd/lua (vendored 修改版 Lua) 的头文件/库/构建规则, 换成 lua-rs
+patch_skynet_mingw_mk() {
+    [[ -f "$SKYNET_MINGW_MK" ]] || die "skynet mingw.mk 不存在: $SKYNET_MINGW_MK (先运行 fetch.sh)"
+    if grep -q "LUA_RS_DLL" "$SKYNET_MINGW_MK"; then
+        ok "skynet mingw.mk lua-rs 补丁已存在（跳过）"
         return 0
     fi
-
-    # 检查是否已打补丁（lua-skynet.c 中是否有 traceback_ref）
-    if grep -q "traceback_ref" "$skynet_c" 2>/dev/null; then
-        ok "skynet 补丁已存在（跳过）"
-        return 0
-    fi
-
-    log "应用 skynet Lua-rs 兼容补丁..."
-
-    # a/b/c) 应用 lua-skynet.c + service_snlua.c 补丁
+    log "应用 skynet mingw.mk lua-rs 补丁..."
     local patch_file
-    patch_file=$(mktemp /tmp/skynet-lua-rs-XXXXXX.patch)
+    patch_file=$(mktemp /tmp/skynet-mingw-lua-rs-XXXXXX.patch)
     cat > "$patch_file" <<'PATCH_EOF'
-diff --git a/lualib-src/lua-skynet.c b/lualib-src/lua-skynet.c
---- a/lualib-src/lua-skynet.c
-+++ b/lualib-src/lua-skynet.c
-@@ -10,6 +10,7 @@
- #include <lauxlib.h>
- #include <stdlib.h>
- #include <string.h>
-+#include <stdio.h>
- #include <assert.h>
- #include <inttypes.h>
-
-@@ -48,6 +49,8 @@ traceback (lua_State *L) {
-
- struct callback_context {
- 	lua_State *L;
-+	int traceback_ref;
-+	int dispatch_ref;
- };
-
- static int
-@@ -56,7 +59,12 @@ _cb(struct skynet_context * context, void * ud, int type, int session, uint32_t
- 	lua_State *L = cb_ctx->L;
- 	int trace = 1;
- 	int r;
--	lua_pushvalue(L,2);
-+	lua_rawgeti(L, LUA_REGISTRYINDEX, cb_ctx->traceback_ref);
-+	lua_rawgeti(L, LUA_REGISTRYINDEX, cb_ctx->dispatch_ref);
-
- 	lua_pushinteger(L, type);
- 	lua_pushlightuserdata(L, (void *)msg);
-@@ -66,6 +74,9 @@ _cb(struct skynet_context * context, void * ud, int type, int session, uint32_t
-
- 	r = lua_pcall(L, 5, 0 , trace);
-
-+	lua_settop(L, 0);
+diff --git a/mingw.mk b/mingw.mk
+--- a/mingw.mk
++++ b/mingw.mk
+@@ -8,15 +8,23 @@ CSERVICE_PATH ?= cservice
+ SKYNET_BUILD_PATH ?= .
+ COMPAT_MINGW_DIR = 3rd/compat-mingw
+ 
+-LUA_DIR = 3rd/lua
+-LUA_CFLAGS = -g -O2 -Wall -I. -std=gnu99 -I../../skynet-src
+-LUA_STATICLIB := 3rd/lua/liblua.a
+-LUA_DLL ?= 3rd/lua/lua54.dll
++# 宿主 Lua 使用 lua-rs（不再构建/使用 skynet 自带的修改版 Lua: 3rd/lua）:
++#   LUA_RS_SRC         官方 Lua 5.5 头文件目录（lua-rs 遵循的 C API，src/）
++#   LUA_RS_DLL         lua-rs 的 C ABI 动态库 lua_rs.dll（deps/lua_dll 构建；
++#                      构建后被拷到本目录，运行时提供 lua_* 符号）
++#   LUA_RS_IMPORT_LIB  lua_rs.dll 的 MinGW 导入库（deps/Makefile 用 dlltool 生成）
++LUA_RS_ROOT ?= ../../..
++LUA_RS_SRC ?= $(LUA_RS_ROOT)/src
++LUA_RS_DLL ?= $(LUA_RS_ROOT)/target/release/lua_rs.dll
++LUA_RS_IMPORT_LIB ?= $(LUA_RS_ROOT)/target/release/liblua_rs_dll.a
 +
- 	if (r == LUA_OK) {
- 		return 0;
- 	}
-@@ -95,28 +106,40 @@ forward_cb(struct skynet_context * context, void * ud, int type, int session, ui
- }
-
- static void
--clear_last_context(lua_State *L) {
-+release_last_context(lua_State *L) {
- 	if (lua_getfield(L, LUA_REGISTRYINDEX, "callback_context") == LUA_TUSERDATA) {
--		lua_pushnil(L);
--		lua_setiuservalue(L, -2, 2);
-+		struct callback_context *old = (struct callback_context *)lua_touserdata(L, -1);
-+		if (old && old->traceback_ref != LUA_NOREF) {
-+			luaL_unref(L, LUA_REGISTRYINDEX, old->traceback_ref);
-+			luaL_unref(L, LUA_REGISTRYINDEX, old->dispatch_ref);
-+			old->traceback_ref = LUA_NOREF;
-+			old->dispatch_ref = LUA_NOREF;
-+		}
- 	}
- 	lua_pop(L, 1);
- }
-
- static int
- _cb_pre(struct skynet_context * context, void * ud, int type, int session, uint32_t source, const void * msg, size_t sz) {
--	struct callback_context *cb_ctx = (struct callback_context *)ud;
--	clear_last_context(cb_ctx->L);
-+	release_last_context(((struct callback_context *)ud)->L);
- 	skynet_callback(context, ud, _cb);
--	return _cb(context, cb_ctx, type, session, source, msg, sz);
-+	return _cb(context, ud, type, session, source, msg, sz);
- }
-
- static int
- _forward_pre(struct skynet_context *context, void *ud, int type, int session, uint32_t source, const void *msg, size_t sz) {
--	struct callback_context *cb_ctx = (struct callback_context *)ud;
--	clear_last_context(cb_ctx->L);
-+	release_last_context(((struct callback_context *)ud)->L);
- 	skynet_callback(context, ud, forward_cb);
--	return forward_cb(context, cb_ctx, type, session, source, msg, sz);
-+	return forward_cb(context, ud, type, session, source, msg, sz);
- }
-
- static int
-@@ -124,15 +147,31 @@ lcallback(lua_State *L) {
- 	struct skynet_context * context = lua_touserdata(L, lua_upvalueindex(1));
- 	int forward = lua_toboolean(L, 2);
- 	luaL_checktype(L,1,LUA_TFUNCTION);
--	lua_settop(L,1);
--	struct callback_context * cb_ctx = (struct callback_context *)lua_newuserdatauv(L, sizeof(*cb_ctx), 2);
--	cb_ctx->L = lua_newthread(L);
--	lua_pushcfunction(cb_ctx->L, traceback);
--	lua_setiuservalue(L, -2, 1);
--	lua_getfield(L, LUA_REGISTRYINDEX, "callback_context");
--	lua_setiuservalue(L, -2, 2);
-+	lua_settop(L,1);
-+	release_last_context(L);
-+	struct callback_context * cb_ctx = (struct callback_context *)lua_newuserdatauv(L, sizeof(*cb_ctx), 0);
-+	cb_ctx->L = L;
-+	cb_ctx->traceback_ref = LUA_NOREF;
-+	cb_ctx->dispatch_ref = LUA_NOREF;
-+	lua_pushcfunction(L, traceback);
-+	cb_ctx->traceback_ref = luaL_ref(L, LUA_REGISTRYINDEX);
-+	lua_pushvalue(L, 1);
-+	cb_ctx->dispatch_ref = luaL_ref(L, LUA_REGISTRYINDEX);
- 	lua_setfield(L, LUA_REGISTRYINDEX, "callback_context");
--	lua_xmove(L, cb_ctx->L, 1);
-
- 	skynet_callback(context, cb_ctx, (forward)?(_forward_pre):(_cb_pre));
- 	return 0;
-diff --git a/service-src/service_snlua.c b/service-src/service_snlua.c
---- a/service-src/service_snlua.c
-+++ b/service-src/service_snlua.c
-@@ -391,14 +391,22 @@ init_cb(struct snlua *l, struct skynet_context *ctx, const char * args, size_t s
- 	luaL_requiref(L, "skynet.profile", init_profile, 0);
-
- 	int profile_lib = lua_gettop(L);
--	// replace coroutine.resume / coroutine.wrap
-+	// lua-rs compat: skip coroutine.resume/wrap replacement
-+#ifndef LUA_RUST_COMPAT
- 	lua_getglobal(L, "coroutine");
- 	lua_getfield(L, profile_lib, "resume");
- 	lua_setfield(L, -2, "resume");
- 	lua_getfield(L, profile_lib, "wrap");
- 	lua_setfield(L, -2, "wrap");
++LUA_STATICLIB := $(LUA_RS_IMPORT_LIB)
++LUA_DLL ?= $(LUA_RS_DLL)
+ SKYNET_DLL ?= $(SKYNET_BUILD_PATH)/skynet.dll
+-LUA_INC ?= $(LUA_DIR)
++LUA_INC ?= $(LUA_RS_SRC)
+ 
+ # Lua linking options
+-LUA_LIBS = -L$(LUA_DIR) -llua54
++LUA_LIBS = $(LUA_RS_IMPORT_LIB)
+ LUA_STATIC_LIBS = $(LUA_STATICLIB)
+ 
+ # Skynet linking and include options
+@@ -26,7 +34,7 @@ SHARED_BUILD = $(CC) $(CFLAGS) $(SHARED)
+ 
+ # Compiler flags
+ CFLAGS = -g -O2 -Wall -std=gnu99 -I$(LUA_INC) $(MYCFLAGS)
+-CFLAGS += -I3rd/lua -Iskynet-src -I$(COMPAT_MINGW_DIR)
++CFLAGS += -Iskynet-src -I$(COMPAT_MINGW_DIR)
+ CFLAGS += -include $(COMPAT_MINGW_DIR)/compat.h
+ CFLAGS += -Wno-int-conversion -Wno-incompatible-pointer-types -Wno-pointer-sign -Wno-unused-function
+ 
+@@ -64,27 +72,6 @@ SKYNET_SRC = skynet_main.c skynet_handle.c skynet_module.c skynet_mq.c \
+   skynet_harbor.c skynet_env.c skynet_monitor.c skynet_socket.c socket_server.c \
+   mem_info.c malloc_hook.c skynet_daemon.c skynet_log.c
+ 
+-$(LUA_STATICLIB): 
+-	@echo "Building Lua static library..."
+-	cd $(LUA_DIR) && $(CC) $(LUA_CFLAGS) -DMAKE_LIB -c onelua.c -o onelua.o
+-	cd $(LUA_DIR) && $(AR) rcs liblua.a onelua.o
 -
- 	lua_settop(L, profile_lib-1);
-+#else
-+	lua_settop(L, profile_lib-1);
-+#endif
-
- 	lua_pushlightuserdata(L, ctx);
- 	lua_setfield(L, LUA_REGISTRYINDEX, "skynet_context");
-@@ -504,7 +512,7 @@ global_seed() {
- 	static ATOM_INT seed = 0;
- 	unsigned ret = ATOM_LOAD(&seed);
- 	while (ret == 0) {
--		unsigned t = luaL_makeseed(NULL);
-+		unsigned t = (unsigned)time(NULL);
- 		if (t == 0)
- 			t = 1;
- 		ATOM_CAS(&seed, 0, t);
+-$(LUA_DLL) : $(LUA_STATICLIB)
+-	@echo "Building Lua DLL..."
+-	cd $(LUA_DIR) && $(CC) -shared -o lua54.dll onelua.o -Wl,--export-all-symbols,--out-implib,liblua54.a $(SKYNET_LIBS)
+-	@echo "Lua DLL and import library created successfully"
+-
+-$(LUA_DIR)/lua.exe : $(LUA_DLL) $(LUA_STATICLIB)
+-	@echo "Building Lua interpreter..."
+-	cd $(LUA_DIR) && $(CC) $(LUA_CFLAGS) -c lua.c -o lua.o
+-	cd $(LUA_DIR) && $(CC) $(LUA_CFLAGS) -o lua.exe lua.o -L. -llua54 $(SKYNET_LIBS)
+-	cp $(LUA_DLL) $(SKYNET_BUILD_PATH)/
+-
+-$(LUA_DIR)/luac.exe : $(LUA_DLL) $(LUA_STATICLIB)
+-	@echo "Building Lua compiler..."
+-	cd $(LUA_DIR) && $(CC) $(LUA_CFLAGS) -DMAKE_LUAC -c onelua.c -o luac.o
+-	cd $(LUA_DIR) && $(CC) $(LUA_CFLAGS) -o luac.exe luac.o liblua.a $(SKYNET_LIBS)
+-
+ $(COMPAT_LIB): $(COMPAT_MINGW_DIR)/compat.c
+ 	@echo "Building compatibility library..."
+ 	$(CC) $(CFLAGS) -c $(COMPAT_MINGW_DIR)/compat.c -o $(COMPAT_MINGW_DIR)/compat.o
+@@ -100,7 +87,7 @@ core_libs: $(LUA_STATICLIB) $(LUA_DLL) $(SKYNET_DLL)
+ 
+ modules: core_libs $(foreach v, $(CSERVICE), $(CSERVICE_PATH)/$(v).so) $(foreach v, $(LUA_CLIB), $(LUA_CLIB_PATH)/$(v).so)
+ 
+-tools: core_libs $(LUA_DIR)/lua.exe $(LUA_DIR)/luac.exe $(SKYNET_BUILD_PATH)/skynet.exe
++tools: core_libs $(SKYNET_BUILD_PATH)/skynet.exe
+ 
+ 
+ SKYNET_LIB_SRC = $(filter-out skynet_main.c, $(SKYNET_SRC))
+@@ -154,8 +141,5 @@ clean :
+ 	rm -f $(SKYNET_BUILD_PATH)/*.exe $(SKYNET_BUILD_PATH)/*.dll $(SKYNET_BUILD_PATH)/*.a
+ 	rm -f $(COMPAT_LIB) $(COMPAT_MINGW_DIR)/*.o
+ 	rm -f $(CSERVICE_PATH)/*.so $(LUA_CLIB_PATH)/*.so
+-	rm -f $(LUA_DIR)/*.a
+ 
+ cleanall: clean
+-	rm -f $(LUA_STATICLIB)
+-	rm -f $(LUA_DIR)/*.exe $(LUA_DIR)/*.dll $(LUA_DIR)/*.a $(LUA_DIR)/*.o
 PATCH_EOF
 
-    # 应用补丁（在 skynet 源码目录内执行 patch -p1）
-    ( cd "$SKYNET_SRC_DIR" && patch -p1 < "$patch_file" ) || {
+    # git checkout 在 core.autocrlf=true 下写出 CRLF, patch 的上下文就不匹配了
+    sed -i 's/\r$//' "$SKYNET_MINGW_MK"
+    if ! ( cd "$SKYNET_SRC_DIR" && patch -p1 --no-backup-if-mismatch < "$patch_file" ); then
         rm -f "$patch_file"
-        die "skynet 补丁应用失败"
-    }
+        die "skynet mingw.mk 补丁应用失败"
+    fi
     rm -f "$patch_file"
 
-    # d) lua-sharetable.c: 把 #include "lgc.h" 移到 #ifdef makeshared 内
-    if grep -q '^#include "lgc.h"$' "$sharetable_c" 2>/dev/null; then
-        sed -i '/^#include "lgc.h"$/d' "$sharetable_c"
-        sed -i '/^#ifdef makeshared$/a #include "lgc.h"' "$sharetable_c"
+    grep -q "LUA_RS_DLL" "$SKYNET_MINGW_MK" || die "mingw.mk 补丁未生效"
+    # 注意匹配到 3rd/lua 这个目录本身 (3rd/lua-md5 是 lpeg/md5 的源码目录, 无需改)
+    if grep -qE -- '(^|[[:space:]])-I3rd/lua([[:space:]]|$)' "$SKYNET_MINGW_MK"; then
+        die "mingw.mk 仍包含 -I3rd/lua (vendored 头文件目录)"
     fi
-
-    # 验证
-    grep -q "traceback_ref" "$skynet_c" || die "lua-skynet.c 补丁未生效"
-    grep -q "LUA_RUST_COMPAT" "$snlua_c" || die "service_snlua.c LUA_RUST_COMPAT 补丁未生效"
-    grep -q "time(NULL)" "$snlua_c" || die "service_snlua.c time(NULL) 替换未生效"
-
-    ok "skynet 补丁已应用"
+    ok "skynet mingw.mk 已切换到 lua-rs"
 }
-apply_skynet_patch
+# mingw.mk 只有 Windows 构建会用到
+if [[ $IS_WINDOWS == 1 ]]; then
+    need patch
+    patch_skynet_mingw_mk
+fi
 
 # ============================================================================
 # 5. 编译 C 模块 (cjson, luasocket, lsqlite3, sol2 smoke test, skynet)

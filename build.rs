@@ -128,7 +128,16 @@ fn main() {
                 println!("cargo:rustc-link-arg=-Wl,--undefined=lua_sharestring");
             }
         }
-        build_test_c_libs(&manifest_dir, &lua_src_dir, is_windows);
+        // Windows: 让宿主 (lua.exe / lua_rs.dll) 导出完整 C API —— deps/ 下的 C
+        // 模块靠它解析 lua_xxx (deps/Makefile 用 dlltool 把导出清单转成导入库)。
+        // MSVC 默认不导出任何 #[no_mangle] 符号; size_optimized (体积测量) 下维持
+        // 原有最小导出集, 不引入这份清单。
+        let win_api_syms = if is_windows && !size_optimized {
+            no_mangle_api_symbols(&rs_src_dir)
+        } else {
+            BTreeSet::new()
+        };
+        build_test_c_libs(&manifest_dir, &lua_src_dir, is_windows, &win_api_syms);
         return;
     }
 
@@ -251,7 +260,12 @@ fn main() {
 ///
 /// 任何步骤失败都只发 warning 并跳过, 不中断构建 (attrib.lua 在 loadlib
 /// 失败时会自行跳过对应的 C 模块测试)。
-fn build_test_c_libs(manifest_dir: &Path, lua_src_dir: &Path, is_windows: bool) {
+fn build_test_c_libs(
+    manifest_dir: &Path,
+    lua_src_dir: &Path,
+    is_windows: bool,
+    api_syms: &BTreeSet<String>,
+) {
     // (源文件, 输出文件名去掉扩展名的部分) —— 对应 tests_lua/libs/makefile 的 5 个目标
     const LIBS: [(&str, &str); 5] = [
         ("lib1.c", "lib1"),
@@ -262,18 +276,27 @@ fn build_test_c_libs(manifest_dir: &Path, lua_src_dir: &Path, is_windows: bool) 
     ];
 
     let libs_dir = manifest_dir.join("tests_lua").join("libs");
-    if !libs_dir.is_dir() {
-        return;
-    }
     // 只监视源文件: 产物 (.so/.dll) 也写在该目录, 监视整个目录会让 build.rs 每次都重跑。
-    for (src, _) in LIBS {
-        println!("cargo:rerun-if-changed={}", libs_dir.join(src).display());
+    // (目录不存在时不注册监视: 监视不存在的路径会让 cargo 每次都重跑 build.rs。)
+    if libs_dir.is_dir() {
+        for (src, _) in LIBS {
+            println!("cargo:rerun-if-changed={}", libs_dir.join(src).display());
+        }
     }
 
     let out_dir = match env::var("OUT_DIR") {
         Ok(v) => PathBuf::from(v),
         Err(_) => return,
     };
+
+    if !libs_dir.is_dir() {
+        // 没有测试 C 模块时仍要给宿主 (lua.exe / lua_rs.dll) 生成 C API 导出表,
+        // deps/ 下的 C 模块依赖它解析 lua_xxx。
+        if let Err(e) = write_windows_exe_exports(&out_dir, api_syms, &[]) {
+            println!("cargo:warning=生成宿主导出表失败, 已跳过: {e}");
+        }
+        return;
+    }
 
     let mut probe = cc::Build::new();
     probe.include(lua_src_dir);
@@ -291,6 +314,7 @@ fn build_test_c_libs(manifest_dir: &Path, lua_src_dir: &Path, is_windows: bool) 
             &LIBS,
             "dll",
             &host_symbols,
+            api_syms,
         )
     } else {
         build_test_c_libs_unix(&tool, &libs_dir, &LIBS, "so")
@@ -344,6 +368,205 @@ fn collect_lua_identifiers(text: &str, set: &mut BTreeSet<String>) {
     }
 }
 
+/// Windows 专用: 生成宿主的 C API 导出表。
+///
+/// MSVC 不会自动导出 `#[no_mangle] extern "C"` 符号 (GNU 目标则用
+/// `--export-all-symbols` 全量导出), 而 deps/ 下的 C 模块要在运行时解析 lua_xxx:
+///   - 由 lua-rs 的 lua.exe 加载的模块 (cjson/luasocket/lsqlite3) 导入表写 lua.exe,
+///     加载器直接从进程主模块的导出表解析;
+///   - 外部 C 宿主 (skynet) 与 C++ 程序 (sol2_smoke) 用 lua_rs.dll (deps/lua_dll)。
+/// 因此这里把 crate 的完整 C API (`no_mangle_api_symbols`) 连同 `extra`
+/// (测试模块实际引用的宿主符号) 与 capi_variadic.c 的 dllexport 符号写成 .def:
+/// 交给 MSVC (`/DEF`) 导出, 并落盘到 <target>/<profile>/ 供 deps/Makefile 用
+/// dlltool 转成 MinGW 导入库 —— dlltool 读不了 MSVC 链接出的 PE 导出表。
+/// 对应 Linux 的 `-Wl,--export-dynamic`。
+///
+/// 注意: .def 中的符号必须在 lua.exe / lua_rs.dll 里真实存在, 否则 MSVC 以
+/// LNK2001 硬失败 —— 所以只传实际实现 (未被 cfg 排除) 的符号名。
+fn write_windows_exe_exports(
+    out_dir: &Path,
+    api_syms: &BTreeSet<String>,
+    extra: &[String],
+) -> Result<(), String> {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+        return Ok(());
+    }
+    let mut exe_syms: BTreeSet<String> = api_syms.clone();
+    exe_syms.extend(extra.iter().cloned());
+    exe_syms.extend(variadic_c_symbols().iter().map(|s| (*s).to_string()));
+    if exe_syms.is_empty() {
+        return Ok(());
+    }
+    let exe_list: Vec<String> = exe_syms.into_iter().collect();
+    // 链接 lua.exe 用的 .def (Rust 侧符号; 其中与 capi_variadic.c 的
+    // __declspec(dllexport) 重名的项由链接器去重, 不会报错)。
+    let def = out_dir.join("lua_exe_exports.def");
+    write_def(&def, None, &exe_list)?;
+    if env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+        println!("cargo:rustc-link-arg-bins=/DEF:{}", def.display());
+    } else {
+        // MinGW 的 ld 不支持 --export-dynamic, PE 目标用 --export-all-symbols。
+        println!("cargo:rustc-link-arg-bins=-Wl,--export-all-symbols");
+    }
+    // 供 deps/Makefile 生成 C 模块导入库的 .def: dlltool 只能读 COFF 符号表,
+    // 读不到 MSVC 链接出的 PE 导出表, 所以这里把导出清单落到 <target>/<profile>/ 下
+    // (与 tests_lua/libs 的 .dll 一样, 属于给构建脚本消费的产物)。
+    // OUT_DIR = <target>/<profile>/build/<crate>-<hash>/out → 上溯三级。
+    if let Some(profile_dir) = out_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+    {
+        // lua.exe 作为宿主 (deps 的 cjson/luasocket 等由 lua-rs 的 lua.exe 加载)。
+        write_def(
+            &profile_dir.join("lua_exe_import.def"),
+            Some("lua.exe"),
+            &exe_list,
+        )?;
+        // lua_rs.dll 作为宿主 (deps/lua_dll 的 cdylib; skynet 用): 它的导出表就是
+        // crate 的 #[no_mangle] 符号 + capi_variadic.c 的 dllexport 符号, 不含
+        // tests_lua/libs 额外引入的宿主符号。
+        let mut dll_syms: BTreeSet<String> = api_syms.clone();
+        dll_syms.extend(variadic_c_symbols().iter().map(|s| (*s).to_string()));
+        let dll_list: Vec<String> = dll_syms.into_iter().collect();
+        write_def(
+            &profile_dir.join("lua_rs_dll_import.def"),
+            Some("lua_rs.dll"),
+            &dll_list,
+        )?;
+    }
+    Ok(())
+}
+
+/// capi_variadic.c 中 `__declspec(dllexport)` 定义的 C API 符号 (Windows 下
+/// MSVC 自动导出, 但导出清单要给 deps/Makefile 生成导入库, 所以必须列出)。
+/// lua_rs_pcall_c / lua_rs_longjmp 只在 LUA_USE_LONGJMP 下编译
+/// (见 build.rs 的 lua_use_longjmp); 调用方保证不在 size_optimized 下调用。
+fn variadic_c_symbols() -> Vec<&'static str> {
+    let mut syms = vec![
+        "lua_pushfstring",
+        "lua_pushvfstring",
+        "luaL_error",
+        "lua_rs_clocks_per_sec",
+    ];
+    if env::var("CARGO_FEATURE_LUA_LONGJMP").is_ok() {
+        syms.push("lua_rs_pcall_c");
+        syms.push("lua_rs_longjmp");
+    }
+    syms
+}
+
+/// 收集 `src_rs/*.rs` 中实际编译进本次构建的 `#[no_mangle]` 项 (函数 / 静态量) 名字 ——
+/// 即 crate 对外的 C ABI 面 (capi.rs / alloc.rs / lib.rs), 需要出现在 lua.exe 导出表中。
+///
+/// 属性块带 `cfg` 的项按 feature 开关判定是否生效; 出现无法判定的 `cfg`
+/// (target_os / test / any(...) 等) 时保守跳过 —— 导出表里多写一个不存在的名字
+/// 会让 MSVC 链接硬失败。
+fn no_mangle_api_symbols(rs_src_dir: &Path) -> BTreeSet<String> {
+    let mut set = BTreeSet::new();
+    let mut files: Vec<PathBuf> = match fs::read_dir(rs_src_dir) {
+        Ok(entries) => entries.filter_map(|e| e.ok()).map(|e| e.path()).collect(),
+        Err(_) => return set,
+    };
+    files.retain(|p| p.extension().map(|e| e == "rs").unwrap_or(false));
+    files.sort();
+    for file in files {
+        // 导出表内容依赖这些源文件, 改了要重跑本脚本 (build.rs 默认只监视部分输入)。
+        println!("cargo:rerun-if-changed={}", file.display());
+        if let Ok(text) = fs::read_to_string(&file) {
+            collect_no_mangle_items(&text, &mut set);
+        }
+    }
+    set
+}
+
+/// 扫描单个 Rust 源文件里的 `#[no_mangle]` 函数/静态量名字。
+fn collect_no_mangle_items(text: &str, out: &mut BTreeSet<String>) {
+    let mut attrs: Vec<&str> = Vec::new();
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with("//") {
+            // 文档/普通注释夹在属性与项之间是常见写法, 不影响属性块。
+            continue;
+        }
+        if trimmed.starts_with("#[") {
+            attrs.push(trimmed);
+            continue;
+        }
+        if attrs.iter().any(|a| a.contains("no_mangle")) && cfg_gates_satisfied(&attrs) {
+            if let Some(name) = decl_name(trimmed) {
+                out.insert(name);
+            }
+        }
+        attrs.clear();
+    }
+}
+
+/// 从一行声明里取 `fn` / `static` 的名字 (要求关键字两侧是标识符边界)。
+fn decl_name(line: &str) -> Option<String> {
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    for kw in ["fn", "static"] {
+        let bytes = line.as_bytes();
+        let mut from = 0;
+        while let Some(pos) = line[from..].find(kw) {
+            let start = from + pos;
+            let end = start + kw.len();
+            let before_ok = start == 0 || !is_ident(bytes[start - 1]);
+            let after_ok = end >= bytes.len() || !is_ident(bytes[end]);
+            if before_ok && after_ok {
+                let rest = line[end..].trim_start();
+                let name_end = rest
+                    .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .unwrap_or(rest.len());
+                let name = &rest[..name_end];
+                return if name.is_empty() {
+                    None
+                } else {
+                    Some(name.to_string())
+                };
+            }
+            from = end;
+        }
+    }
+    None
+}
+
+/// 判定属性块中的所有 `cfg` 门在当前构建下是否成立。
+fn cfg_gates_satisfied(attrs: &[&str]) -> bool {
+    attrs
+        .iter()
+        .filter(|a| a.contains("cfg"))
+        .all(|a| cfg_attr_satisfied(a))
+}
+
+/// 只解析 `#[cfg(feature = "x")]` 与 `#[cfg(not(feature = "x"))]` 两种形式;
+/// 其余形式 (target_os / test / any(...) / all(...)) 一律保守返回 false。
+fn cfg_attr_satisfied(attr: &str) -> bool {
+    let inner = match attr.find("cfg(") {
+        Some(i) => attr[i + 4..].trim_end_matches(']'),
+        None => return true, // 不是 cfg 属性 (例如 #[no_mangle])
+    };
+    let inner = inner.trim().trim_end_matches(')').trim();
+    let (neg, inner) = match inner.strip_prefix("not(") {
+        Some(rest) => (true, rest.trim_end_matches(')').trim()),
+        None => (false, inner),
+    };
+    let rest = match inner.strip_prefix("feature") {
+        Some(r) => r,
+        None => return false,
+    };
+    let name = rest
+        .trim_start()
+        .trim_start_matches('=')
+        .trim()
+        .trim_matches('"');
+    if name.is_empty() {
+        return false;
+    }
+    let key = format!("CARGO_FEATURE_{}", name.replace('-', "_").to_uppercase());
+    env::var(key).is_ok() != neg
+}
+
 /// Unix: 直接 `cc -shared -fPIC` 生成 .so, 未定义符号交由主程序在 dlopen 时解析。
 fn build_test_c_libs_unix(
     tool: &cc::Tool,
@@ -373,6 +596,7 @@ fn build_test_c_libs_windows(
     libs: &[(&str, &str)],
     ext: &str,
     host_symbols: &BTreeSet<String>,
+    api_syms: &BTreeSet<String>,
 ) -> Result<(), String> {
     let is_msvc = tool.is_like_msvc();
     let arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
@@ -425,10 +649,11 @@ fn build_test_c_libs_windows(
     // 4. 先让 lua.exe 导出这些符号 —— 与后面 .dll 的链接解耦, 保证一定生效。
     //    exe.def 只能有 EXPORTS (MSVC 下带 LIBRARY 会把输出变成 DLL);
     //    imp.def 带 LIBRARY lua.exe, 让 .dll 的导入表指向宿主进程。
-    let host_exe_def = out_dir.join("lua_test_host_exe.def");
+    //    导出集合 = 测试模块引用的宿主符号 ∪ crate 完整 C API (no_mangle_api_symbols):
+    //    lua.exe 同时要满足 tests_lua/libs 与 deps/ 下 C 模块 (cjson/luasocket/skynet)
+    //    的需要, 后者由 deps/Makefile 用 dlltool 从 lua.exe 导出表生成导入库。
     let host_imp_def = out_dir.join("lua_test_host_imp.def");
     let host_syms: Vec<String> = host_used.into_iter().collect();
-    write_def(&host_exe_def, None, &host_syms)?;
     write_def(&host_imp_def, Some("lua.exe"), &host_syms)?;
     let host_lib = if host_syms.is_empty() {
         None
@@ -439,14 +664,9 @@ fn build_test_c_libs_windows(
             "lua_test_host_imp.a"
         });
         make_import_lib(tool, is_msvc, &host_imp_def, &lib)?;
-        if is_msvc {
-            println!("cargo:rustc-link-arg-bins=/DEF:{}", host_exe_def.display());
-        } else {
-            // MinGW 的 ld 不支持 --export-dynamic, PE 目标需用 --export-all-symbols。
-            println!("cargo:rustc-link-arg-bins=-Wl,--export-all-symbols");
-        }
         Some(lib)
     };
+    write_windows_exe_exports(out_dir, api_syms, &host_syms)?;
 
     // 5. 按依赖顺序构建 (lib11 需要 lib1_export, lib21 需要 luaopen_lib2)。
     let mut pending: Vec<String> = libs.iter().map(|(_, n)| (*n).to_string()).collect();

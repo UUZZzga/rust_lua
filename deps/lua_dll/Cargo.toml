@@ -1,0 +1,35 @@
+# lua-rs 的 C ABI 动态库 (lua_rs.dll) —— 供 deps 下的 skynet 使用。
+#
+# skynet 是 C 框架: 主程序 skynet.exe、服务容器 cservice/snlua.so、C 模块
+# luaclib/*.so 都要访问同一个 Lua 实现, 所以需要一个真正的 DLL 提供 lua_* 符号
+# (对应官方 skynet 用的 lua54.dll)。
+#
+# 为什么不直接把 lua.exe 当 DLL 用: LoadLibrary 一个 EXE 会把它当 DllMain 调用
+# (入口点是 mainCRTStartup), Rust 运行期初始化不会发生 —— 实测调用 lua_newstate
+# 即崩溃。为什么不在 lua-rs 自身加 cdylib: 那样每个平台/每个 profile 都要多编译
+# 一份 (release + LTO 约 +60s), 而只有 Windows 的 deps skynet 用得上。
+#
+# 本 crate 只 re-export capi 的 `#[no_mangle]` C API: rustc 构建 cdylib 时会把这些
+# 符号 (含 capi_variadic.c 里 __declspec(dllexport) 的 C 函数) 写进 DLL 导出表。
+# 符号清单由 lua-rs 的 build.rs 落到 target/<profile>/lua_rs_dll_import.def,
+# deps/Makefile 用 dlltool 据此生成 MinGW 导入库 liblua_rs_dll.a。
+[package]
+name = "lua-rs-capi-dll"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# 根 Cargo.toml 没有 [workspace] 段, 这里显式声明空 workspace 避免歧义
+# (同时让 cargo 只在本目录找成员)。
+[workspace]
+
+[lib]
+name = "lua_rs"
+crate-type = ["cdylib"]
+
+[dependencies]
+# feature 组合与 deps/setup.sh 构建 lua.exe 时一致:
+#   lua_longjmp —— C 模块的 lua_error 需要 setjmp/longjmp 错误边界
+#   threaded    —— StringTable/ArcRc 线程安全路径 (skynet 多 worker)
+#   skynet      —— skynet 修改版 Lua 的扩展 API (luaL_makeseed / lua_clonetable 等)
+lua-rs = { path = "../..", features = ["lua_longjmp", "threaded", "skynet"] }

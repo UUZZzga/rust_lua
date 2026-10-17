@@ -63,6 +63,10 @@ LUA_BIN="$PROJECT_ROOT/target/release/lua"
 LUA_LIB="$PROJECT_ROOT/target/release/liblua_rs.a"
 DEPS_LIB="$SCRIPT_DIR/lib/lua/5.5"
 SOL2_SMOKE="$SCRIPT_DIR/build/sol2_smoke"
+# Windows: MinGW 产物带 .exe (链接 lua_rs.dll, 与该目录下的 lua_rs.dll 配套)
+if [[ ! -x "$SOL2_SMOKE" && -x "$SCRIPT_DIR/build/sol2_smoke.exe" ]]; then
+    SOL2_SMOKE="$SCRIPT_DIR/build/sol2_smoke.exe"
+fi
 
 if [[ ! -x "$LUA_BIN" ]]; then
     echo -e "${RED}[error]${NC} Rust lua 未构建: $LUA_BIN"
@@ -270,6 +274,10 @@ fi
 # 依赖独立 thread 栈的 callback 机制，会卡在 harbor 启动阶段。
 SKYNET_DIR="$SCRIPT_DIR/src/skynet"
 SKYNET_BIN="$SKYNET_DIR/skynet"
+# Windows: mingw.mk 的产物是 skynet.exe (宿主 Lua 为同目录的 lua_rs.dll)
+if [[ ! -x "$SKYNET_BIN" && -x "$SKYNET_DIR/skynet.exe" ]]; then
+    SKYNET_BIN="$SKYNET_DIR/skynet.exe"
+fi
 if [[ -x "$SKYNET_BIN" ]]; then
     # 生成最小 config：单节点模式 (harbor=0)，abort 作为 bootstrap 直接退出
     # config 放 skynet 根目录并以无目录形式传入 (config.rstest):
@@ -288,7 +296,7 @@ EOF
     log "运行 skynet/abort ..."
     # skynet 启动后会加载 abort.lua 并调用 skynet.abort() 退出
     # 用 timeout 30 作为兜底（正常应在 3s 内退出）
-    ( cd "$SKYNET_DIR" && timeout 30 ./skynet config.rstest ) >"$SCRIPT_DIR/.test_$$.log" 2>&1
+    ( cd "$SKYNET_DIR" && timeout 30 "./$(basename "$SKYNET_BIN")" config.rstest ) >"$SCRIPT_DIR/.test_$$.log" 2>&1
     rc=$?
     if [[ $rc -eq 0 ]]; then
         ok "skynet/abort"
@@ -322,6 +330,14 @@ fi
 # 客户端使用 C lua (build/lua)，因为 client.lua 依赖 lpeg.so 进行 sproto 解析，
 # 而 lpeg pattern 编译在 lua-rs 上有 segfault 兼容性问题。
 # 客户端用 C lua 不影响对服务端（lua-rs）的验证，网络协议是跨实现的。
+#
+# Windows 上不跑 e2e: run_skynet_e2e.sh 用 mkfifo/pkill/timeout 与 `./skynet`
+# 等 POSIX 假设, 且客户端依赖 C lua 的 CMake 产物; Windows 侧只跑上面的
+# skynet/abort 冒烟 (已覆盖 lua-rs C ABI 链接与 snlua 服务初始化)。
+IS_POSIX=1
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) IS_POSIX=0 ;;
+esac
 LUA_C_BIN="$PROJECT_ROOT/build/lua"
 if [[ ! -x "$LUA_C_BIN" ]]; then
     LUA_C_BIN="$PROJECT_ROOT/build/Release/lua"
@@ -329,7 +345,7 @@ fi
 if [[ ! -x "$LUA_C_BIN" ]]; then
     LUA_C_BIN="$PROJECT_ROOT/build/Debug/lua"
 fi
-if [[ -x "$SKYNET_BIN" && -x "$LUA_C_BIN" ]]; then
+if [[ $IS_POSIX == 1 && -x "$SKYNET_BIN" && -x "$LUA_C_BIN" ]]; then
     log "运行 skynet/e2e (完整服务端 + 客户端) ..."
     # 复用 run_skynet_e2e.sh 脚本
     if bash "$SCRIPT_DIR/run_skynet_e2e.sh" >"$SCRIPT_DIR/.test_e2e_$$.log" 2>&1; then
@@ -342,6 +358,10 @@ if [[ -x "$SKYNET_BIN" && -x "$LUA_C_BIN" ]]; then
         save_fail_log "skynet_e2e" "$SCRIPT_DIR/.test_e2e_$$.log"
     fi
     rm -f "$SCRIPT_DIR/.test_e2e_$$.log"
+elif [[ $IS_POSIX == 0 ]]; then
+    # Windows: run_skynet_e2e.sh 依赖 mkfifo/pkill/timeout 与 C lua 的客户端产物;
+    # 服务端能力由上面的 skynet/abort 覆盖 (同一 lua_rs.dll 宿主)。
+    echo -e "${YELLOW}[SKIP]${NC} skynet/e2e (仅 POSIX 运行)"
 else
     fail "skynet/e2e (二进制未构建: $SKYNET_BIN 或 $LUA_C_BIN)"
 fi

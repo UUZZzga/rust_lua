@@ -14,6 +14,10 @@
 
 SHELL := /bin/bash
 
+# 失败的目标 (如 dlltool 中断留下的空导入库) 直接删除, 否则下次 make 会把残缺产物
+# 当成最新而跳过重建。
+.DELETE_ON_ERROR:
+
 ifndef PLATFORM
   UNAME_S := $(shell uname -s 2>/dev/null)
 
@@ -34,7 +38,7 @@ ifndef PLATFORM
   endif
 endif
 
-PLATFORM_LC := $(shell echo $(PLATFORM) | sed 's/.*/\L&/')
+PLATFORM_LC := $(shell echo $(PLATFORM) | tr 'A-Z' 'a-z')
 
 # --- Paths ----------------------------------------------------------------
 PROJECT_ROOT := $(realpath $(CURDIR)/..)
@@ -77,31 +81,52 @@ else ifeq ($(PLATFORM),LINUX)
 	LDLIBS := $(LDLIBS) -ldl -lpthread
 endif
 
+# Rust lua 可执行文件（MinGW 下同时充当 C 模块的宿主导入库来源）
+LUA_EXE := $(TARGET_PATH)/lua$(EXE_EXT)
+
 ifneq (,$(filter MINGW MSYS CYGWIN,$(PLATFORM)))
 DLLTOOL  := dlltool
-NM       := nm
-
-LUA_EXE  := $(TARGET_PATH)/lua.exe
-DEF_RAW  := $(TARGET_PATH)/lua_exe.def
-DEF_FILT := $(TARGET_PATH)/lua_exe_filtered.def
 LUA_RS_LIB := $(TARGET_PATH)/liblua_exe.a
+
+# 原生工具 (gcc/dlltool) 的临时目录: 它们不认 POSIX 路径 (/d/...), 会回退到
+# C:\Windows 创建临时文件而失败; 这里用 cygpath 转成 Windows 形式 (D:/...) 并导出
+# 给所有子进程 (deps/build 现建, 保证存在)。
+NATIVE_TMP := $(shell mkdir -p '$(DEPS_BUILD)' 2>/dev/null; cygpath -m '$(DEPS_BUILD)' 2>/dev/null || echo '$(DEPS_BUILD)')
+export TMP := $(NATIVE_TMP)
+export TEMP := $(NATIVE_TMP)
+
+# lua.exe 的 C API 导出清单（build.rs 生成, 见下）→ 导入库。
+# lua-rs 自己的 lua.exe 加载 C 模块时 (deps 的 cjson/luasocket/lsqlite3/sol2),
+# 模块从 lua.exe 的导出表解析 lua_* 符号（对应官方 C lua 用 lua54.dll）。
+LUA_EXE_DEF := $(TARGET_PATH)/lua_exe_import.def
+
+# skynet 的宿主 Lua: lua_rs.dll (true DLL, 由 deps/lua_dll 的 cdylib 构建)。
+# 不能拿 lua.exe 顶替 —— LoadLibrary 一个 EXE 会以 mainCRTStartup 当 DllMain
+# 调用, Rust 运行期不初始化, 实测 lua_newstate 即崩。
+LUA_RS_DLL := $(TARGET_PATH)/lua_rs.dll
+LUA_RS_DLL_DEF := $(TARGET_PATH)/lua_rs_dll_import.def
+LUA_RS_DLL_IMPORT_LIB := $(TARGET_PATH)/liblua_rs_dll.a
 
 # lua-cjson 仅 Windows 需要 _MSC_VER 强制 __declspec(dllexport) 导出
 # luaopen_* 符号供 dlopen 加载 (Linux ELF -shared 默认全量导出, 加了反而
 # 在 GCC 上因 __declspec 语法报错, CI #162 实证)。
 CJSON_DEFS := -D_MSC_VER
 
-# 1. 从 lua.exe 提取导出表 -> 原始 def
-$(DEF_RAW): $(LUA_EXE)
-	$(DLLTOOL) --export-all-symbols $< -z $@
+# lua_rs.dll (deps/lua_dll 的 cdylib) 与两个 .def 都是 lua-rs 的构建产物, 由
+# deps/setup.sh 里的 cargo 步骤生成; deps/Makefile 只把它们转成 MinGW 导入库。
+$(LUA_RS_DLL) $(LUA_EXE_DEF) $(LUA_RS_DLL_DEF):
+	@echo "缺少 $@：请先运行 bash deps/setup.sh (构建 lua-rs 与 lua_rs.dll)"
+	@exit 1
 
-# 2. 只保留 EXPORTS 行与 lua_ 前缀符号
-$(DEF_FILT): $(DEF_RAW)
-	sed -n -E '/^EXPORTS$$/p; /^[[:space:]]+lua/p' $< > $@
+# lua.exe 导出表 → MinGW 导入库
+$(LUA_RS_LIB): $(LUA_EXE_DEF)
+	@mkdir -p $(@D)
+	$(DLLTOOL) -d $< -l $@
 
-# 3. def -> 导入库（lua.exe 名字会被硬编码进导入表）
-$(LUA_RS_LIB): $(DEF_FILT)
-	$(DLLTOOL) -d $< -l $@ -D lua.exe
+# lua_rs.dll 导出清单 → MinGW 导入库 (skynet 的宿主 Lua)
+$(LUA_RS_DLL_IMPORT_LIB): $(LUA_RS_DLL) $(LUA_RS_DLL_DEF)
+	@mkdir -p $(@D)
+	$(DLLTOOL) -d $(LUA_RS_DLL_DEF) -l $@
 endif
 
 
@@ -246,16 +271,35 @@ SOL2_CXXFLAGS := $(CXXFLAGS) -I$(SOL2_INCLUDE)
 # 源码在 deps 目录下（提交进 git 的最小测试程序）
 SOL2_SMOKETEST_SRC := $(CURDIR)/sol2_smoke.cpp
 
-$(SOL2_SMOKETEST): $(SOL2_SMOKETEST_SRC) $(LUA_RS_STATIC_LIB)
+# 链接目标: Linux/其它平台直接用 Rust 静态库 (liblua_rs.a); MinGW 下 Rust 的
+# staticlib 是 MSVC 目标文件 (lua_rs.lib), g++ 无法链接, 而 lua.exe 又不能当 DLL
+# 用, 故链接 lua_rs.dll (deps/lua_dll) 的导入库, 运行时需同目录有 lua_rs.dll。
+SOL2_LINK_LIB := $(LUA_RS_STATIC_LIB)
+# 注意用递归展开 (=): 命令里的 $(@D) 是自动变量, 必须在 recipe 执行时才展开。
+SOL2_POST_LINK = :
+ifneq (,$(filter MINGW MSYS CYGWIN,$(PLATFORM)))
+  SOL2_LINK_LIB := $(LUA_RS_DLL_IMPORT_LIB)
+  SOL2_POST_LINK = cp -f $(LUA_RS_DLL) $(@D)/
+endif
+
+$(SOL2_SMOKETEST): $(SOL2_SMOKETEST_SRC) $(SOL2_LINK_LIB)
 	@mkdir -p $(@D)
 	$(CXX) $(SOL2_CXXFLAGS) $^ -o $@ $(LDLIBS)
+	$(SOL2_POST_LINK)
 
 sol2: $(SOL2_SMOKETEST)
 	@echo "=== sol2 smoke test built: $< ==="
 
-# --- skynet (链接 lua-rs 静态库，禁用 jemalloc) ----------------------------
-# skynet 自带修改版 Lua 5.5.1，本项目通过 LUA_LIB/LUA_INC 覆盖为 lua-rs 的
-# liblua_rs.a 与 src/ 头文件。setup.sh 已应用补丁去除 luaL_makeseed 硬依赖。
+# --- skynet (宿主 Lua 一律用 lua-rs，禁用 jemalloc) -------------------------
+# skynet 自带修改版 Lua 5.5.1 (ejoy/lua skynet55 分支: 3rd/lua)，本项目完全不用它:
+#   - 头文件: src/ (官方 Lua 5.5.0 头文件 = lua-rs 遵循的 C API)
+#   - Linux: LUA_LIB=liblua_rs.a + -Wl,-E 导出符号供 dlopen 的 .so 解析
+#   - MinGW: 由 mingw.mk 的 lua-rs 变量接入 lua_rs.dll (setup.sh 的补丁);
+#     deps 侧用 dlltool 把 build.rs 生成的导出清单转成导入库 liblua_rs_dll.a,
+#     运行时由 skynet.exe 同目录的 lua_rs.dll 提供 lua_xxx 符号
+#     (对应官方 skynet 用 lua54.dll 的角色)。
+# skynet 自带的修改版 Lua 头文件不得进入 include 路径 (mingw.mk 里的 -I3rd/lua
+# 已由 setup.sh 的补丁移除)。
 # 禁用 jemalloc (MALLOC_STATICLIB="") 避免构建 jemalloc 子模块；
 # NOUSE_JEMALLOC 让 skynet 使用系统 malloc。
 #
@@ -265,7 +309,7 @@ sol2: $(SOL2_SMOKETEST)
 # 从归档中被拉取；-Wl,-E 导出符号供 dlopen 加载的 .so 使用。
 # --undefined 作为 fail-fast 安全网：若符号未被拉取，链接阶段即报错而非运行时。
 SKYNET_SRC := $(DEPS_SRC)/skynet
-SKYNET_BIN := $(SKYNET_SRC)/skynet
+SKYNET_BIN := $(SKYNET_SRC)/skynet$(EXE_EXT)
 
 # 强制保留 capi_variadic.c 的 variadic 符号（供 .so 模块运行时解析）
 SKYNET_EXPORT := -Wl,-E \
@@ -276,6 +320,7 @@ SKYNET_EXPORT := -Wl,-E \
 
 SKYNET_MINGW_CC_ARGS  :=
 SKYNET_MINGW_EXTRA_CFLAGS :=
+SKYNET_RS_ARGS :=
 
 ifeq ($(PLATFORM),MINGW)
   SKYNET_MINGW_CC_ARGS      := CC=gcc AR=ar RANLIB=ranlib
@@ -287,6 +332,19 @@ else ifeq ($(PLATFORM),MSYS)
                         -DCLOCK_MONOTONIC=1 -DCLOCK_THREAD_CPUTIME_ID=3
 endif
 
+ifneq (,$(filter MINGW MSYS CYGWIN,$(PLATFORM)))
+  # mingw.mk 的 lua-rs 接入点 (由 setup.sh 的补丁定义)
+  SKYNET_RS_ARGS := \
+	LUA_RS_ROOT=$(PROJECT_ROOT) \
+	LUA_RS_SRC=$(LUA_INCLUDE) \
+	LUA_RS_DLL=$(LUA_RS_DLL) \
+	LUA_RS_IMPORT_LIB=$(LUA_RS_DLL_IMPORT_LIB)
+  SKYNET_HOST_LUA := $(LUA_RS_DLL_IMPORT_LIB) $(LUA_RS_DLL)
+else
+  # Linux: 直接链接 liblua_rs.a, 靠 -Wl,-E 把符号导出给 dlopen 的 .so
+  SKYNET_HOST_LUA := $(LUA_RS_STATIC_LIB)
+endif
+
 # skynet 的平台目标只有 linux/freebsd/openbsd/macosx/mingw, 没有 msys;
 # MSYS2 的编译器即 MinGW-w64, 归一到 mingw 目标 (mingw.mk)。
 SKYNET_PLAT := $(PLATFORM_LC)
@@ -294,15 +352,15 @@ ifeq ($(PLATFORM),MSYS)
   SKYNET_PLAT := mingw
 endif
 
-skynet: $(LUA_RS_STATIC_LIB)
+skynet: $(SKYNET_HOST_LUA)
 	@echo "=== Building skynet with lua-rs ==="
-	# LUA_RUST_COMPAT: 跳过 coroutine.resume/wrap 替换 (lua-rs 的 lua_resume 与 skynet timing_resume 不兼容)
 	cd $(SKYNET_SRC) && $(MAKE) $(SKYNET_PLAT) \
 		$(SKYNET_MINGW_CC_ARGS) \
+		$(SKYNET_RS_ARGS) \
 		LUA_LIB=$(LUA_RS_STATIC_LIB) \
 		LUA_INC=$(LUA_INCLUDE) \
 		MALLOC_STATICLIB="" \
-		MYCFLAGS="-DLUA_RUST_COMPAT $(SKYNET_MINGW_EXTRA_CFLAGS)" \
+		MYCFLAGS="$(SKYNET_MINGW_EXTRA_CFLAGS)" \
 		EXPORT="$(SKYNET_EXPORT)" \
 		SKYNET_DEFINES="-DNOUSE_JEMALLOC"
 	@echo "=== skynet built: $(SKYNET_BIN) ==="

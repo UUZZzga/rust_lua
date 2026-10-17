@@ -36,5 +36,7 @@ tests_lua/time.txt
 /deps/*.tar.gz
 /deps/*.zip
 /deps/.test_*.log
+# deps/lua_dll（lua-rs 的 cdylib 壳）的本地构建产物；正常流程用共享 target/ 目录
+/deps/lua_dll/target/
 # PGO 构建中间产物 (tools/build_pgo.sh)
 pgo/

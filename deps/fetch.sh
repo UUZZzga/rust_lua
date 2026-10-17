@@ -161,9 +161,12 @@ fi
 # ============================================================================
 # 7. skynet (cloudwu/skynet, master)
 # ============================================================================
-# skynet 自带修改版 Lua 5.5.1 (ejoy/lua skynet55 分支)，但本项目通过
-# LUA_LIB/LUA_INC 覆盖为 lua-rs 的 liblua_rs.a 与 src/ 头文件，仅用 skynet
-# 的 C 框架代码 (skynet-src/, service-src/, lualib-src/) 与 Lua 服务脚本。
+# skynet 自带修改版 Lua 5.5.1 (ejoy/lua skynet55 分支: 3rd/lua)，本项目完全不用它:
+#   - 头文件用 src/ (官方 Lua 5.5.0, lua-rs 遵循的 C API)
+#   - Linux 下 skynet 直接链接 liblua_rs.a (-Wl,-E 导出符号给 dlopen 的 .so)
+#   - Windows 下用 lua_rs.dll (deps/lua_dll 的 cdylib), setup.sh 的补丁把
+#     mingw.mk 里 3rd/lua 的头文件目录/lua54.dll/vendored Lua 构建规则换成它
+# 只用 skynet 的 C 框架代码 (skynet-src/, service-src/, lualib-src/) 与 Lua 服务脚本。
 SKYNET_REPO="https://github.com/cloudwu/skynet.git"
 SKYNET_COMMIT="b0e8eccb4137435400c82db1b18d5c55812fae5f"
 

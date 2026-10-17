@@ -17,7 +17,7 @@
 | `build/` | Lua C 实现的构建目录，如果需要重新构建，也只能使用该目录 |
 | `target/` | Lua Rust 实现的构建目录，如果需要重新构建，也只能使用该目录 |
 | `target_perf/` | Lua Rust 实现的性能测试目录，如果需要重新构建，也只能使用该目录 |
-| `deps/` | 第三方依赖库（lua-cjson / luasocket / lsqlite3 / luarocks / sol2），仅 `Makefile` / `fetch.sh` / `setup.sh` / `test.sh` / `sol2_smoke.cpp` 入库 |
+| `deps/` | 第三方依赖库（lua-cjson / luasocket / lsqlite3 / luarocks / sol2 / skynet），入库内容：`Makefile` / `fetch.sh` / `setup.sh` / `test.sh` / `run_skynet_e2e.sh` / `sol2_smoke.cpp` / `lua_dll/`（Windows 用 lua_rs.dll 的 cdylib 壳） |
 | `doc/` | Lua 官方文档 |
 | `bench/` | CI 性能基准目录（`harness.lua` 公共驱动 + `bench_*.lua` 按测试项拆分，每项一个文件） |
 |`tools/`|工具脚本（`verify.sh` / `check_memory.sh` / `gc_bench_run.sh` / `ci_bench.sh` / `bench_fast_unsafe.sh` / `build_pgo.sh` / `build_release_opt.sh` / `ci_bench_win.ps1`）|
@@ -90,7 +90,7 @@
 
 ### 一键测试入口
 - `tools/verify.sh`：编译器比对 → `cargo test` → `cargo build --release` → 运行 `tests_lua/` 全套 Lua 测试（含 `all.lua`）。日志输出到 `logs/` 目录。
-- `deps/test.sh`：第三方依赖库（lua-cjson / luasocket / lsqlite3 / luarocks / sol2）测试。
+- `deps/test.sh`：第三方依赖库（lua-cjson / luasocket / lsqlite3 / luarocks / sol2 / skynet abort）测试；`skynet/e2e` 仅 POSIX（Windows 跳过，服务端能力由 abort 覆盖）。
 - `tools/gc_bench_run.sh`：C 与 Rust 实现的 GC 性能对比测试。
 - `tools/ci_bench.sh`：C 与 Rust 实现的通用性能基准（12 项解释器热点，bench/ 按项拆分），Drone 两条流水线 + GitHub Actions Linux job 均执行，日志 `logs/ci_bench_*`。
 - `tools/miri.sh`：Miri UB 检测（本地工具，需 nightly 工具链）。检测 `tests_rs/` 与 `src_rs/` 单元测试中的未定义行为（越界访问、未初始化内存、Tree Borrows 违规等）。日志输出到 `logs/miri_test.log`。
@@ -271,6 +271,7 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
   - 诊断与验收：`--features probe_wstack` 输出 `WSOOB`（越过 `max(len, scratch_end)`）/`WSCAP`（越过 capacity）计数与越界读时的 `STACK UNDERFLOW` 现场，全套 tests_lua 零输出即不变量成立；`debug_assert` 在 debug 构建（`cargo test`）下直接暴露破例点。**release 下 `write_stack` 与 `read_stack` 均无边界判定、无扩容调用** —— `write_stack` 只剩「旧值是否需 drop」（Rc 释放, 必须保留, 预测命中率≈100%）, `read_stack` 直接 `get_unchecked`；`len`/`top` 用 `max` 更新（cmov）。安全构建（`--no-default-features`）保留按需补齐分支作为等价实现。同类消费者：`copy_stack_slot`（`OP_MOVE`）的无分支快路径同样按此不变量越界写 —— 它只读 tag 判持有引用、再 16B 覆盖写，`top` 仍是 `max(top, idx+1)`。
   - 补齐点（不变量维护的完整清单）：帧入口（`execute_loop` / `op_call*` / `op_varargprep`）、被移动或截断之后的恢复点（`truncate_live` 尾部、各 `reset_scratch()`）、以及 `tm::obj_len` 这类「按寄存器号写调用者帧、且可能不经 VM 入口」的辅助函数（直接调用路径的兜底）。
 - **TableData.probe_cache 禁令**：`find_str_ref`/`data_ro` 读路径上不得引入 Cell 内部状态写回（Linux OOO 隐藏探测延迟无收益，Windows MSVC+PGO 实测 +35% 回归，#118 证伪）。
+- **Windows C 模块的宿主符号导出**：MSVC 不会自动导出 `#[no_mangle] extern "C"` 符号（GNU 目标用 `--export-all-symbols`），而 `deps/` 下的 C 模块要在运行时解析 `lua_xxx`。机制：`build.rs` 扫描 `src_rs/*.rs` 的 `#[no_mangle]` 项（按 feature 判定 cfg，无法判定的 cfg 保守跳过）→ 写 `target/<profile>/lua_exe_import.def` 与 `lua_rs_dll_import.def`（后者 `LIBRARY lua_rs.dll`）→ `deps/Makefile` 用 `dlltool` 转成 MinGW 导入库（`liblua_exe.a` / `liblua_rs_dll.a`）。两个宿主分工：`lua.exe`（lua-rs 解释器自身加载 cjson/luasocket/lsqlite3 —— 模块导入表写 `lua.exe`，因为该 EXE 就是主模块，加载器直接解析自身导出）+ `lua_rs.dll`（`deps/lua_dll` 的 cdylib，供 skynet 这类外部宿主 + `sol2_smoke`；**不能拿 `lua.exe` 顶替**：`LoadLibrary` 一个 EXE 会把 `mainCRTStartup` 当 DllMain 调用，Rust 运行期不初始化，实测 `lua_newstate` 即崩）。`.def` 里多写一个不存在的符号会让 MSVC 以 LNK2001 硬失败，故只列真实实现的符号；`dlltool` 读不了 MSVC 链接出的 PE 导出表（只能读 COFF 符号表），所以清单必须由 `build.rs` 落盘而不是从 `lua.exe` 反读。deps 侧用 `dlltool` 时需要 `TMP/TEMP` 为 Windows 形式路径（POSIX `/d/...` 会让它回退到 `C:\Windows` 失败），`deps/Makefile` 用 `cygpath -m` 导出。
 
 ## .gitignore 关键排除项
 
