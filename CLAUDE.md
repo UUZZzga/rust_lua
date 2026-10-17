@@ -90,7 +90,7 @@
 
 ### 一键测试入口
 - `tools/verify.sh`：编译器比对 → `cargo test` → `cargo build --release` → 运行 `tests_lua/` 全套 Lua 测试（含 `all.lua`）。日志输出到 `logs/` 目录。
-- `deps/test.sh`：第三方依赖库（lua-cjson / luasocket / lsqlite3 / luarocks / sol2 / skynet abort）测试；`skynet/e2e` 仅 POSIX（Windows 跳过，服务端能力由 abort 覆盖）。
+- `deps/test.sh`：第三方依赖库（lua-cjson / luasocket / lsqlite3 / luarocks / sol2 / skynet abort）测试；`skynet/e2e` 仅 POSIX（Windows 跳过，服务端能力由 abort 覆盖）。注意 **CI 只在 Linux 跑 deps**（Drone Windows 流水线只有 build+bench，无 MinGW 工具链），Windows 侧的 `deps/Makefile` 导入库规则 / `lua_rs.dll` / mingw.mk 补丁只能靠本地 `bash deps/setup.sh` + `bash deps/test.sh` 验证（实测 10 通过 0 失败 + skynet/e2e 跳过）。
 - `tools/gc_bench_run.sh`：C 与 Rust 实现的 GC 性能对比测试。
 - `tools/ci_bench.sh`：C 与 Rust 实现的通用性能基准（12 项解释器热点，bench/ 按项拆分），Drone 两条流水线 + GitHub Actions Linux job 均执行，日志 `logs/ci_bench_*`。
 - `tools/miri.sh`：Miri UB 检测（本地工具，需 nightly 工具链）。检测 `tests_rs/` 与 `src_rs/` 单元测试中的未定义行为（越界访问、未初始化内存、Tree Borrows 违规等）。日志输出到 `logs/miri_test.log`。
