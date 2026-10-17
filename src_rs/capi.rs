@@ -378,7 +378,12 @@ pub extern "C" fn lua_newthread(L: *mut lua_State) -> *mut lua_State {
     };
     let thread_rc = match unsafe { (*L).new_object(thread) } {
         Ok(rc) => rc,
-        Err(e) => raise_mem_error(L, e),
+        Err(e) => {
+            // longjmp 会跳过本帧的 Drop: 先释放局部持有的 ThreadContext Rc
+            // (否则新协程的整个执行态永久泄漏)
+            drop(context);
+            raise_mem_error(L, e)
+        }
     };
     // 设置 thread_ref，让 coroutine.running() 能返回同一对象
     context.borrow_mut().thread_ref = Some(thread_rc.downgrade());
@@ -585,11 +590,14 @@ pub extern "C" fn lua_rotate(L: *mut lua_State, idx: c_int, n: c_int) {
 #[no_mangle]
 pub extern "C" fn lua_copy(L: *mut lua_State, fromidx: c_int, toidx: c_int) {
     let L = unsafe { &mut *L };
+    // 源/目标先解析成绝对下标（负索引必须在扩容前解析，否则语义漂移），
+    // **但不取值** —— 扩容点可能抛内存错误 (longjmp 会跳过本帧的 Drop),
+    // 因此取值必须放在扩容之后，避免在 raise 点持有 TValue (Rc 引用)。
     let from = if is_registry(fromidx) {
-        TValue::Table(L.registry.clone())
+        None // registry 不是栈上的值，下面单独取
     } else {
         match index2offset(L, fromidx) {
-            Some(o) => L.stack[o].clone(),
+            Some(o) => Some(o),
             None => return,
         }
     };
@@ -597,20 +605,26 @@ pub extern "C" fn lua_copy(L: *mut lua_State, fromidx: c_int, toidx: c_int) {
         // 不能直接写 registry（它是独立字段）
         return;
     }
-    if let Some(to) = index2offset(L, toidx) {
+    let to = match index2offset(L, toidx) {
+        Some(o) => o,
+        None => {
+            // toidx 超出当前栈，扩展
+            let to = L.api_func_base + toidx as usize;
+            if to > L.stack.len() {
+                L.grow_stack_or_throw(to - L.stack.len());
+                L.stack.resize(to, TValue::Nil(NilKind::Strict));
+            }
+            to
+        }
+    };
+    let from = match from {
+        Some(o) => L.stack[o].clone(),
+        None => TValue::Table(L.registry.clone()),
+    };
+    if to == L.stack.len() {
+        L.stack.push(from);
+    } else if to < L.stack.len() {
         L.stack[to] = from;
-    } else {
-        // toidx 超出当前栈，扩展
-        let to = L.api_func_base + toidx as usize;
-        if to > L.stack.len() {
-            L.grow_stack_or_throw(to - L.stack.len());
-            L.stack.resize(to, TValue::Nil(NilKind::Strict));
-        }
-        if to == L.stack.len() {
-            L.stack.push(from);
-        } else if to < L.stack.len() {
-            L.stack[to] = from;
-        }
     }
 }
 
@@ -1069,6 +1083,8 @@ pub extern "C" fn lua_settable(L: *mut lua_State, idx: c_int) {
         let key = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
         let registry = L.registry.clone();
         if let Err(e) = L.table_set(&registry, key, val) {
+            // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表引用
+            drop(registry);
             raise_mem_error(L, e);
         }
         return;
@@ -1089,6 +1105,8 @@ pub extern "C" fn lua_settable(L: *mut lua_State, idx: c_int) {
     };
     if let Some(t) = t {
         if let Err(e) = L.table_set(&t, key, val) {
+            // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表引用
+            drop(t);
             raise_mem_error(L, e);
         }
     }
@@ -1144,6 +1162,9 @@ pub extern "C" fn lua_setfield(L: *mut lua_State, idx: c_int, k: *const c_char) 
         let val = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
         let registry = L.registry.clone();
         if let Err(e) = L.table_set(&registry, key_tv, val) {
+            // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表引用与键字符串
+            drop(registry);
+            drop(key_str);
             raise_mem_error(L, e);
         }
         return;
@@ -1162,6 +1183,9 @@ pub extern "C" fn lua_setfield(L: *mut lua_State, idx: c_int, k: *const c_char) 
     };
     if let Some(t) = t {
         if let Err(e) = L.table_set(&t, key_tv, val) {
+            // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表引用与键字符串
+            drop(t);
+            drop(key_str);
             raise_mem_error(L, e);
         }
     }
@@ -1212,6 +1236,8 @@ pub extern "C" fn lua_rawseti(L: *mut lua_State, idx: c_int, n: lua_Integer) {
         let val = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
         let registry = L.registry.clone();
         if let Err(e) = L.table_set(&registry, TValue::Integer(n), val) {
+            // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表引用
+            drop(registry);
             raise_mem_error(L, e);
         }
         return;
@@ -1230,6 +1256,8 @@ pub extern "C" fn lua_rawseti(L: *mut lua_State, idx: c_int, n: lua_Integer) {
     };
     if let Some(t) = t {
         if let Err(e) = L.table_set_int(&t, n, val) {
+            // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表引用
+            drop(t);
             raise_mem_error(L, e);
         }
     }
@@ -1275,6 +1303,9 @@ pub extern "C" fn lua_setglobal(L: *mut lua_State, name: *const c_char) {
     let key = L.intern_str(&name_str);
     let globals = L.globals.clone();
     if let Err(e) = L.table_set(&globals, key, val) {
+        // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表引用与名字字符串
+        drop(globals);
+        drop(name_str);
         raise_mem_error(L, e);
     }
 }
@@ -1373,9 +1404,12 @@ pub extern "C-unwind" fn luaL_checklstring(
     // 用 lua_tolstring 获取字符串指针
     let ptr = lua_tolstring(L, arg, l);
     if ptr.is_null() {
-        // 类型错误：简化处理，调用 lua_error 抛错
-        let msg = CString::new(format!("bad argument #{} (string expected)", arg)).unwrap();
-        lua_pushstring(L, msg.as_ptr());
+        // 类型错误：先构造消息并压栈，再在**不持有 Rust 局部**的帧里抛错 ——
+        // lua_error 的 longjmp 会跳过本帧的 Drop，持有 CString 就是每次类型错误都泄漏。
+        {
+            let msg = CString::new(format!("bad argument #{} (string expected)", arg)).unwrap();
+            lua_pushstring(L, msg.as_ptr());
+        }
         lua_error(L);
     }
     ptr
@@ -1436,9 +1470,14 @@ pub extern "C" fn luaL_ref(L: *mut lua_State, _t: c_int) -> c_int {
         _ => 1,
     };
     if let Err(e) = L.table_set(&registry, next_ref_key, TValue::Integer(next_ref)) {
+        // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表引用与被引用值
+        drop(registry);
+        drop(val);
         raise_mem_error(L, e);
     }
     if let Err(e) = L.table_set(&registry, TValue::Integer(next_ref), val) {
+        // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表引用
+        drop(registry);
         raise_mem_error(L, e);
     }
     next_ref as c_int
@@ -1457,6 +1496,8 @@ pub extern "C" fn luaL_unref(L: *mut lua_State, _t: c_int, ref_: c_int) {
         TValue::Integer(ref_ as lua_Integer),
         TValue::Nil(NilKind::Strict),
     ) {
+        // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表引用
+        drop(registry);
         raise_mem_error(L, e);
     }
 }
@@ -1621,6 +1662,10 @@ fn raise_mem_error<'a>(L: *mut LuaState<'a>, e: crate::execute::VmError<'a>) -> 
     #[cfg(lua_use_longjmp)]
     {
         // lua_use_longjmp 模式: 用 longjmp 替代 panic 跳回最近的 setjmp
+        //
+        // **Drop 安全**: longjmp 会跳过本帧（以及发起 raise 的全部 Rust 帧）的析构，
+        // 因此本帧在跳转点不得持有任何需要 Drop 的值 —— `e` 可能携带 String/TValue
+        // (Rc 引用)，必须在跳转前显式释放。
         let Some(&buf) = L.error_jmp_bufs.last() else {
             // 栈空: 顶层错误, 打印后 exit (对齐 C Lua 行为)
             let msg = e.to_string();
@@ -1633,6 +1678,7 @@ fn raise_mem_error<'a>(L: *mut LuaState<'a>, e: crate::execute::VmError<'a>) -> 
             }
             std::process::exit(1);
         };
+        drop(e);
         unsafe { crate::state::lua_rs_longjmp(buf as *mut std::ffi::c_void) };
     }
 }
@@ -1891,7 +1937,11 @@ pub extern "C" fn lua_pushthread(L: *mut lua_State) -> c_int {
                     };
                     let rc = match L.new_object(thread) {
                         Ok(rc) => rc,
-                        Err(e) => raise_mem_error(L, e),
+                        Err(e) => {
+                            // longjmp 会跳过本帧的 Drop: 先释放局部持有的 ThreadContext Rc
+                            drop(ctx);
+                            raise_mem_error(L, e)
+                        }
                     };
                     (TValue::Thread(rc), false)
                 }
@@ -2383,6 +2433,8 @@ pub extern "C" fn lua_seti(L: *mut lua_State, idx: c_int, n: lua_Integer) {
         let val = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
         let registry = L.registry.clone();
         if let Err(e) = L.table_set(&registry, TValue::Integer(n), val) {
+            // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表引用
+            drop(registry);
             raise_mem_error(L, e);
         }
         return;
@@ -2401,6 +2453,8 @@ pub extern "C" fn lua_seti(L: *mut lua_State, idx: c_int, n: lua_Integer) {
     };
     if let Some(t) = t {
         if let Err(e) = L.table_set(&t, TValue::Integer(n), val) {
+            // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表引用
+            drop(t);
             raise_mem_error(L, e);
         }
     }
@@ -3031,17 +3085,30 @@ pub extern "C" fn luaL_newmetatable(L: *mut lua_State, tname: *const c_char) -> 
     }
     let table = match L.new_table_with_capacity(0, 2) {
         Ok(t) => t,
-        Err(e) => raise_mem_error(L, e),
+        Err(e) => {
+            // longjmp 会跳过本帧的 Drop: 显式释放局部持有的键值
+            drop(tname);
+            raise_mem_error(L, e)
+        }
     };
     if let Err(e) = L.register_table(&table) {
+        // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表引用与键值
+        drop(table);
+        drop(tname);
         raise_mem_error(L, e);
     }
     let name_key = L.intern_str("__name");
     if let Err(e) = L.table_set(&table, name_key, tname.clone()) {
+        // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表引用与键值
+        drop(table);
+        drop(tname);
         raise_mem_error(L, e);
     }
     let registry = L.registry.clone();
     if let Err(e) = L.table_set(&registry, tname, TValue::Table(table.clone())) {
+        // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表引用
+        drop(registry);
+        drop(table);
         raise_mem_error(L, e);
     }
     L.push_value(TValue::Table(table));
@@ -3081,15 +3148,20 @@ pub extern "C" fn luaL_getsubtable(L: *mut lua_State, idx: c_int, fname: *const 
 #[no_mangle]
 pub extern "C-unwind" fn luaL_checkstack(L: *mut lua_State, space: c_int, msg: *const c_char) {
     if lua_checkstack(L, space) == 0 {
-        // 栈溢出：构造错误消息并抛出
-        let errmsg = if !msg.is_null() {
-            let cstr = unsafe { CStr::from_ptr(msg) };
-            format!("stack overflow ({})", cstr.to_string_lossy())
-        } else {
-            "stack overflow".to_string()
-        };
+        // 栈溢出：构造错误消息并抛出。
+        // 消息必须在块内释放（lua_checkstack/grow 失败已抛错；这里 lua_error 的
+        // longjmp 会跳过本帧的 Drop，留下 String 就是每次栈溢出都泄漏）。
+        {
+            let errmsg = if !msg.is_null() {
+                let cstr = unsafe { CStr::from_ptr(msg) };
+                format!("stack overflow ({})", cstr.to_string_lossy())
+            } else {
+                "stack overflow".to_string()
+            };
+            let L = unsafe { &mut *L };
+            L.push_string(&errmsg);
+        }
         let L = unsafe { &mut *L };
-        L.push_string(&errmsg);
         lua_error(L);
     }
 }
@@ -3153,13 +3225,29 @@ pub extern "C" fn luaL_requiref(
             // _LOADED 表不存在：创建并注册到 registry
             let t = match L.new_table() {
                 Ok(t) => t,
-                Err(e) => raise_mem_error(L, e),
+                Err(e) => {
+                    // longjmp 会跳过本帧的 Drop: 显式释放局部持有的字符串与键值
+                    drop(modname_str);
+                    drop(mod_key);
+                    drop(loaded_key);
+                    raise_mem_error(L, e)
+                }
             };
             if let Err(e) = L.register_table(&t) {
+                // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表/字符串/键值
+                drop(t);
+                drop(modname_str);
+                drop(mod_key);
+                drop(loaded_key);
                 raise_mem_error(L, e);
             }
             let registry = L.registry.clone();
             if let Err(e) = L.table_set(&registry, loaded_key, TValue::Table(t.clone())) {
+                // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表/字符串/键值
+                drop(registry);
+                drop(t);
+                drop(modname_str);
+                drop(mod_key);
                 raise_mem_error(L, e);
             }
             t
@@ -3188,6 +3276,10 @@ pub extern "C" fn luaL_requiref(
         // 注册到 package.loaded[modname] = result
         if let Some(val) = L.stack.last().cloned() {
             if let Err(e) = L.table_set(&loaded_table, mod_key.clone(), val) {
+                // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表/字符串/键值
+                drop(loaded_table);
+                drop(modname_str);
+                drop(mod_key);
                 raise_mem_error(L, e);
             }
         }
@@ -3201,6 +3293,10 @@ pub extern "C" fn luaL_requiref(
                 .unwrap_or(TValue::Nil(NilKind::Strict));
             let globals = L.globals.clone();
             if let Err(e) = L.table_set(&globals, mod_key, val) {
+                // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表/字符串
+                drop(globals);
+                drop(loaded_table);
+                drop(modname_str);
                 raise_mem_error(L, e);
             }
         }
@@ -3491,8 +3587,8 @@ pub extern "C-unwind" fn luaL_checktype(L: *mut lua_State, arg: c_int, t: c_int)
 #[no_mangle]
 pub extern "C-unwind" fn luaL_checkany(L: *mut lua_State, arg: c_int) {
     if lua_type(L, arg) == LUA_TNONE {
-        let msg = CString::new("value expected").unwrap();
-        luaL_argerror(L, arg, msg.as_ptr());
+        // 消息是字面量：直接用静态 C 字符串，避免在 raise 点持有 CString
+        luaL_argerror(L, arg, c"value expected".as_ptr());
     }
 }
 
@@ -3641,34 +3737,41 @@ pub extern "C-unwind" fn luaL_typeerror(
     arg: c_int,
     tname: *const c_char,
 ) -> c_int {
-    let tname_str = if tname.is_null() {
-        String::new()
-    } else {
-        unsafe { CStr::from_ptr(tname) }
-            .to_string_lossy()
-            .into_owned()
-    };
-    // 获取实际参数的类型名
-    let typearg = {
-        let L_ref = unsafe { &*L };
-        match index2val(L_ref, arg) {
-            // 轻量 userdata 特殊处理（与 C 一致）
-            Some(TValue::LightUserData(_)) => "light userdata".to_string(),
-            // 其他类型用 lua_typename
-            Some(v) => {
-                let tn = lua_typename(L, lua_type_code(v.ty()));
-                if tn.is_null() {
-                    "no value".to_string()
-                } else {
-                    unsafe { CStr::from_ptr(tn) }.to_string_lossy().into_owned()
+    // 消息先压入 Lua 栈（Lua 侧副本），只把**栈上字符串的指针**交给 luaL_argerror ——
+    // 对应 C 的 luaL_typeerror（lua_pushfstring 后传指针）。这样本帧在 luaL_argerror
+    // 抛错点（longjmp 会跳过本帧的 Drop）不持有任何需要 Drop 的 Rust 局部；
+    // 否则每次类型错误都会泄漏这几个 String/CString。
+    let msg_ptr = {
+        let tname_str = if tname.is_null() {
+            String::new()
+        } else {
+            unsafe { CStr::from_ptr(tname) }
+                .to_string_lossy()
+                .into_owned()
+        };
+        // 获取实际参数的类型名
+        let typearg = {
+            let L_ref = unsafe { &*L };
+            match index2val(L_ref, arg) {
+                // 轻量 userdata 特殊处理（与 C 一致）
+                Some(TValue::LightUserData(_)) => "light userdata".to_string(),
+                // 其他类型用 lua_typename
+                Some(v) => {
+                    let tn = lua_typename(L, lua_type_code(v.ty()));
+                    if tn.is_null() {
+                        "no value".to_string()
+                    } else {
+                        unsafe { CStr::from_ptr(tn) }.to_string_lossy().into_owned()
+                    }
                 }
+                None => "no value".to_string(),
             }
-            None => "no value".to_string(),
-        }
+        };
+        let msg = format!("{} expected, got {}", tname_str, typearg);
+        push_str_to_stack(L, &msg);
+        lua_tolstring(L, -1, std::ptr::null_mut())
     };
-    let msg = format!("{} expected, got {}", tname_str, typearg);
-    let cmsg = CString::new(msg).unwrap();
-    luaL_argerror(L, arg, cmsg.as_ptr())
+    luaL_argerror(L, arg, msg_ptr)
 }
 
 #[no_mangle]
@@ -3724,16 +3827,11 @@ pub extern "C-unwind" fn luaL_checkudata(
             lua_pop(L, 2);
         }
     }
-    // 不匹配或非 userdata：抛出类型错误
-    let tname_str = if tname.is_null() {
-        String::new()
-    } else {
-        unsafe { CStr::from_ptr(tname) }
-            .to_string_lossy()
-            .into_owned()
-    };
-    let cmsg = CString::new(tname_str).unwrap_or_else(|_| CString::new("").unwrap());
-    luaL_typeerror(L, ud, cmsg.as_ptr());
+    // 不匹配或非 userdata：抛出类型错误。
+    // 直接把调用方的 tname 传下去（与 C 的 luaL_checkudata 一致）—— 本帧不得持有
+    // 需要 Drop 的 Rust 局部（String/CString），否则 luaL_typeerror 的 longjmp 会跳过
+    // 本帧的 Drop 造成每次类型错误都泄漏。
+    luaL_typeerror(L, ud, tname);
     std::ptr::null_mut()
 }
 
@@ -3781,8 +3879,12 @@ pub extern "C-unwind" fn luaL_tolstring(
         lua_callk(L, 1, 1, 0, None);
         // 检查返回值是否为字符串
         if lua_isstring(L, -1) == 0 {
-            let msg = CString::new("'__tostring' must return a string").unwrap();
-            push_str_to_stack(L, &msg.to_string_lossy());
+            // 消息压栈后必须先在块内释放 Rust 局部，再抛错
+            // (lua_error 的 longjmp 会跳过本帧的 Drop)
+            {
+                let msg = CString::new("'__tostring' must return a string").unwrap();
+                push_str_to_stack(L, &msg.to_string_lossy());
+            }
             lua_error(L);
         }
     } else {
@@ -4119,6 +4221,8 @@ pub extern "C" fn lua_rawsetp(L: *mut lua_State, idx: c_int, p: *const c_void) {
         let val = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
         let registry = L.registry.clone();
         if let Err(e) = L.table_set(&registry, key, val) {
+            // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表引用
+            drop(registry);
             raise_mem_error(L, e);
         }
         return;
@@ -4137,6 +4241,8 @@ pub extern "C" fn lua_rawsetp(L: *mut lua_State, idx: c_int, p: *const c_void) {
     };
     if let Some(t) = t {
         if let Err(e) = L.table_set(&t, key, val) {
+            // longjmp 会跳过本帧的 Drop: 显式释放局部持有的表引用
+            drop(t);
             raise_mem_error(L, e);
         }
     }

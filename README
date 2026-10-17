@@ -58,3 +58,17 @@ Feature: lua_longjmp — C 函数错误处理机制开关
   - `state.rs` / `execute.rs` / `capi.rs` 用 `#[cfg(lua_use_longjmp)]` 切换
     catch_unwind 与 setjmp/longjmp 两条错误处理路径
   - `error_jmp_bufs` 字段始终存在 (空 Vec 开销极小), 仅 longjmp 模式使用
+  - 每个 Lua 层 `pcall` 都是一个保护点 (对应 C 的 `luaD_pcall`/`luaD_rawrunprotected`):
+    `LuaState::pcall` 用 `ProtectedExec` + `protected_exec_trampoline` 建立 setjmp 边界,
+    使 VM 内的内存错误 (栈扩容失败) 可被 `pcall` 捕获为 `not enough memory`
+  - 帧入口/栈扩容的容量预留走漏斗并在「任何 state 变更之前」完成 (失败按
+    `LUA_ERRMEM` 返回), 避免 longjmp 跳过本帧导致 VM 寄存器停在半切换状态
+
+契约 (改动 capi / 状态机时必须遵守, 详见 CLAUDE.md「longjmp 模式的 Drop 安全契约」):
+  - raise 点不得持有需要 Drop 的 Rust 值 (Rc/Vec/String/RefCell 守卫): POSIX 的
+    `longjmp` 不执行析构 → 否则永久泄漏; Windows/MSVC 的 `longjmp` 经 `RtlUnwind`
+    会执行清理 (但展开跨过 Rust `extern "C"` 帧会 abort → 被跨过的帧须用 `C-unwind`)
+
+测试:
+    cargo test --features lua_longjmp --test longjmp_tests
+    cargo test --features lua_longjmp --test alloc_failure_tests

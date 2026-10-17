@@ -233,6 +233,56 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
 - `tests_lua/alloc_fail.lua` + `tools/verify_alloc_fail.sh`（**主动** 200MB 上限）**未接入
   `tools/verify.sh`/CI**：真实耗尽路径仍会 abort（见上），接入会让流水线常红。补齐错误通道后
   应接回 `verify.sh`。
+
+## longjmp 模式的 Drop 安全契约（`lua_use_longjmp`）
+
+`lua_use_longjmp`（bench 构建默认：`tools/build_release_opt.sh` 的 PGO + `panic=abort` + `lua_longjmp`；C 模块路径：`deps/setup.sh` 的 `--features lua_longjmp,threaded,skynet`）下，C 侧用
+`setjmp` / `longjmp`（`capi_variadic.c` 的 `lua_rs_pcall_c` / `lua_rs_longjmp`）替代 `catch_unwind`。
+**longjmp 不执行被跳过帧的析构**，因此实现必须满足以下四条（改动 capi / 状态机时逐条对照）：
+
+1. **raise 点不得持有需要 Drop 的值**。`lua_error` / `luaL_argerror` / `luaL_typeerror` /
+   `luaL_checklstring` / `luaL_checkstack` / `capi::raise_mem_error` 的抛出点必须只持有裸指针
+   与已 move 进 `pending_error` 的值 —— 局部 `Rc`/`Vec`/`String`/`CString`/`RefCell` 守卫一律在
+   抛错前显式 `drop(..)` 或用块作用域收掉（`raise_mem_error` 自己也要先 `drop(e)`）。
+   日常错误路径的消息先压栈、再在不持有 Rust 局部的帧里抛（`luaL_typeerror` 即按 C 的
+   `luaPushfString` 形态：把消息压成 Lua 字符串后传栈上指针）。
+2. **每个 Lua 层 pcall 都是保护点**（对应 C 的 `luaD_pcall` / `luaD_rawrunprotected`）。
+   `LuaState::pcall` 在 longjmp 模式下用 `ProtectedExec` + `protected_exec_trampoline`
+   （`state.rs`）建立 setjmp 边界；没有它，`raise_memory_error` 会 longjmp 到外层 C 边界，
+   无边界时直接 `exit(1)`，并且会跳过 pcall 帧保存的 VM 寄存器（`code`/`constants`/`base`/`pc`/
+   `closure_upvals`/`tbc_list`/`call_stack`）导致随后按错误函数的字节码继续执行。
+3. **帧入口的容量预留必须先做、且走漏斗**。`LuaState::pcall`、`pcall_c_function`、
+   `execute.rs::call_c_function` 的栈预留都在任何 state 变更**之前**，失败按 `ERR_MEM` /
+   `VmError::MemoryError` 返回（对应 `luaD_precall` 先 ensurestack；C 的 `luaD_pcall` 也保护
+   帧入口的 `luaD_growstack`）。VM 内**没有错误通道**的扩容点（`fast_resize_stack_nil`、
+   `pad_frame_scratch_slow`、`adjust_results_on_stack`）仍是 raise，但必须落在保护边界之内。
+4. **被 longjmp 跨过的 Rust 帧必须是 `C-unwind`**。POSIX 的 `longjmp` 不跑析构（值会泄漏）；
+   Windows/MSVC 的 `longjmp` 经 `RtlUnwind` 实现，会真正执行被跨过帧的清理，但展开经过任何
+   Rust `extern "C"`（nounwind）帧都会把进程 abort（`panic_cannot_unwind`）——
+   `protected_exec_trampoline` 因此声明为 `extern "C-unwind"` 并 transmute 成 C 函数指针；
+   日常错误入口（`lua_error` / `luaL_check*` / `lua_callk` 等）本来就是 `extern "C-unwind"`。
+   平台差异意味着：**同一份代码在 Windows 上不泄漏、在 POSIX 上泄漏**，所以第 1 条按 POSIX 标准写。
+
+**未覆盖的残留（诚实记录，勿误读为"已完全安全"）**：
+
+- VM 帧内的 Rust 局部（op handler 手里的 `Rc` 克隆等）在 POSIX raise 时仍会泄漏 —— 只是泄漏，
+  状态本身由保护点恢复；根治需要把热路径扩容点全部改成 `Result` 通道（约 50 处签名扩散，周级）。
+- 真 OOM（200MB 地址空间耗尽）下错误路径自身的分配仍可能 abort，见上面"内存分配失败处理"一节的
+  未迁移清单；`lua_use_longjmp` 只是替换了抛出/捕获机制，不改变这条。
+- Windows 上从 **plain `extern "C"` 的 capi 入口**（`lua_settable` / `lua_setfield` / `luaL_requiref`
+  一类 OOM 才 raise 的 setter/creator）抛内存错误时，nounwind 展开会 abort；这些入口的 raise 只
+  发生在分配失败时（日常错误路径已是 C-unwind），如需彻底对齐应把它们的声明也改成 `C-unwind`
+  （注意 `luaopen_*` 会被当作 `lua_CFunction` 值传递，改 ABI 需同步 transmute）。
+
+**回归测试**：`tests_rs/longjmp_tests.rs`（`cargo test --features lua_longjmp --test longjmp_tests`，
+同时建议带上 `--test alloc_failure_tests`）：
+
+- 计数全局分配器量化 Rust 堆存活字节：反复触发 capi 各条错误路径后必须回到基线（POSIX 上才有
+  检出能力，Windows 因清理会运行而恒为 0）；
+- 大额分配（≥4 KiB）失败注入：把 6 层 × 190 局部的嵌套函数推过初始栈容量 → VM 内栈扩容失败
+  （`raise_memory_error`）必须被 Lua 层 `pcall` 捕获为预注册的 `not enough memory`，而不是
+  穿透外层或 `exit(1)`（去掉第 2 条边界后本测试会打印 `lua not enough memory` 并退出进程）。
+
 ## 关键编码约定
 
 - **fast_unsafe 开关完整性**：新增的 VM 热路径 unsafe 优化（跳过边界检查 / 跳过 drop_glue / 绕过 RefCell borrow / 裸指针缓存）必须用 `#[cfg(feature = "fast_unsafe")]` 包住，并同时给出 `#[cfg(not(feature = "fast_unsafe"))]` 的安全等价实现（语义逐位一致：Rc 句柄 + 边界检查 + 常规 drop + borrow 守卫）。架构/FFI 必需的 unsafe（见 Feature Flags 一节的不在开关范围清单）不需要包。

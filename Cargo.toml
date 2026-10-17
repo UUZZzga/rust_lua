@@ -44,6 +44,11 @@ path = "tests_rs/math_lib_tests.rs"
 name = "alloc_failure_tests"
 path = "tests_rs/alloc_failure_tests.rs"
 
+# longjmp 模式的错误路径安全性测试（仅 --features lua_longjmp 下有意义, 见文件头）
+[[test]]
+name = "longjmp_tests"
+path = "tests_rs/longjmp_tests.rs"
+
 [features]
 # 【临时诊断】大额分配跟踪（定位内存耗尽时仍 abort 的分配点，用完即删）
 default = ["fast_unsafe"]

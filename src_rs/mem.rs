@@ -509,6 +509,10 @@ pub struct AllocFailed;
 /// catch_unwind / longjmp、`LuaState::pcall` 的 catch）转换回
 /// [`crate::execute::VmError::MemoryError`]。错误对象是**预注册**的
 /// `G(L)->memerrmsg`，抛出与转换全程不分配内存。
+///
+/// longjmp 模式下 `LuaState::pcall` 的保护点是 `ProtectedExec` + `protected_exec_trampoline`
+/// 建立的 setjmp 边界（`state.rs`，对应 C 的 `luaD_pcall`）；而帧入口/栈扩容的容量预留
+/// 不抛错 —— 它们在任何 state 变更之前走漏斗，失败直接返回 `ERR_MEM` / `MemoryError`。
 #[derive(Debug)]
 pub struct MemoryErrorPanic;
 

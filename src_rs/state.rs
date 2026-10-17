@@ -1247,6 +1247,25 @@ impl<'a> LuaState<'a> {
         let func_val = self.stack[func_idx].clone();
         match func_val {
             TValue::LClosure(closure) => {
+                // 帧寄存器容量必须在**任何 state 变更之前**备足 —— 与 C 的
+                // luaD_precall 一致 (先 ensurestack 再创建 ci)。这里走**漏斗**而不是
+                // raise: 此刻本帧还没改任何 state, 分配失败可以直接按 LUA_ERRMEM 返回
+                // (错误对象是预注册的 memerrmsg, 零分配), 既不必 longjmp 跳过本帧,
+                // 也不依赖外层保护点是否存在。
+                // 下界同时取 frame_floor() 的保守上界 (base + MAX_FSTACK + 1),
+                // 使下文的 pad_frame_scratch / push / frame_need 检查都不再分配 ——
+                // 那些点位于保护边界之外, 一旦在那里抛内存错误就会跳过本帧。
+                let fsize = closure.proto.max_stack_size as usize;
+                let need = (func_idx + 1 + fsize + LUA_MINSTACK)
+                    .max(func_idx + 1 + crate::opcodes::MAX_FSTACK as usize + 1);
+                if need > self.stack.len() && self.reserve_stack(need - self.stack.len()).is_err() {
+                    self.last_error_value = Some(self.memerrmsg_value());
+                    self.last_error_is_memerr.set(true);
+                    self.truncate_live(func_idx);
+                    self.stack.push(self.memerrmsg_value());
+                    return ERR_MEM;
+                }
+
                 // 检查 C 调用深度 (对应 C 的 luaE_incCstack / luaE_checkcstack)
                 // 每次 Lua 闭包调用递增 n_ccalls,达到 LUAI_MAXCCALLS(200) 时
                 // 抛出可被 pcall 捕获的 "C stack overflow",防止 Rust 原生栈溢出。
@@ -1273,7 +1292,6 @@ impl<'a> LuaState<'a> {
                 let saved_n_ccalls = self.n_ccalls.saturating_sub(1);
 
                 let nargs_actual = self.stack.len().saturating_sub(func_idx + 1);
-                let fsize = closure.proto.max_stack_size as usize;
                 let nfixparams = closure.proto.num_params as usize;
                 let proto_is_vararg = closure.proto.is_vararg();
 
@@ -1476,10 +1494,55 @@ impl<'a> LuaState<'a> {
                     }
                     #[cfg(lua_use_longjmp)]
                     {
-                        // panic=abort 构建 (bench profile): catch_unwind 不可用。此处不新设
-                        // 保护点 —— raise_memory_error 的 longjmp 直接落到最近的外层 setjmp
-                        // (通常是 capi lua_pcallk), 与 C 在 pcall 外层保护的语义一致。
-                        VmExecutor::execute_loop(self)
+                        // panic=abort 构建 (bench profile): catch_unwind 不可用, 改用
+                        // setjmp/longjmp 建立**与 C 的 luaD_pcall 等价的保护点** ——
+                        // 每个 Lua 层 pcall 都是一层保护 (C: luaD_rawrunprotected)。
+                        //
+                        // 必须在此设边界 (longjmp 会跳过被跳过帧的全部析构与恢复代码):
+                        //   1. 没有边界时 raise_memory_error 会 longjmp 到**外层 C 边界**,
+                        //      甚至 error_jmp_bufs 为空时直接 exit —— Lua 层 pcall 既捕获
+                        //      不到内存错误 (与 C 返回 LUA_ERRMEM 的语义不符), 也会跳过本帧;
+                        //   2. 本帧保存着 VM 寄存器状态 (saved_code/constants/protos/base/pc、
+                        //      closure_upvals、tbc_list、call_stack), 被跳过即悬空
+                        //      (之后按错误函数的字节码继续执行) + Rc 泄漏。
+                        // 边界之下不再做任何 state 变更 (帧预留已在分支入口完成、载入
+                        // 亦已完成), 因此 longjmp 回到此处后, 本帧的恢复代码能把状态完整复原。
+                        //
+                        // 顺序要求: jmp_buf 入栈必须在取 state 裸指针**之前**
+                        // (裸指针派生出来之后不得再经 &mut self 访问 state)。
+                        let mut jmp_buf = JmpBuf::default();
+                        self.error_jmp_bufs.push(jmp_buf.as_mut_ptr());
+                        let mut outcome: Option<Result<VmResult<'a>, VmError<'a>>> = None;
+                        let mut payload = ProtectedExec {
+                            state: self as *mut LuaState<'a>,
+                            out: &mut outcome,
+                        };
+                        // SAFETY: C 与 C-unwind 的 ABI 一致, 只差「允许展开穿过」的语义;
+                        // 这里正是需要允许 longjmp 穿过本帧 (见 trampoline 的 ABI 说明)。
+                        let unwind_trampoline: unsafe extern "C-unwind" fn(
+                            *mut std::ffi::c_void,
+                        )
+                            -> i32 = protected_exec_trampoline;
+                        let trampoline: unsafe extern "C" fn(*mut std::ffi::c_void) -> i32 =
+                            unsafe { std::mem::transmute(unwind_trampoline) };
+                        let rc = unsafe {
+                            lua_rs_pcall_c(
+                                Some(trampoline),
+                                &mut payload as *mut ProtectedExec<'a> as *mut std::ffi::c_void,
+                                jmp_buf.as_mut_ptr(),
+                            )
+                        };
+                        self.error_jmp_bufs.pop();
+                        match outcome {
+                            Some(r) => r,
+                            None => {
+                                // 被 raise 接管 (longjmp 跳过了 trampoline):
+                                // 错误对象由保护点从 pending_error 取回 (预注册的
+                                // memerrmsg, 传播全程零分配)。
+                                debug_assert_eq!(rc, -1, "longjmp 必须带回 -1");
+                                Err(VmError::MemoryError)
+                            }
+                        }
                     }
                 };
 
@@ -1860,6 +1923,21 @@ impl<'a> LuaState<'a> {
     ) -> i32 {
         use std::ffi::c_void;
 
+        // 栈空间必须先备足再改本帧状态 (对应 C 的 luaD_precall: 先 ensurestack 再创建 ci)。
+        // 走漏斗而非 raise: 此刻本帧尚未改任何 state, 分配失败可以直接按 LUA_ERRMEM
+        // 返回, 不必 longjmp 跳过本帧 (也不依赖外层保护点是否存在)。
+        // 预留 capacity，但不 push nil（push 会改变 stack.len()，导致 C 函数中
+        // lua_gettop 返回值偏移）。C 函数需要空间时通过 lua_checkstack 或
+        // lua_pushxxx 自动扩展栈。
+        let needed_cap = self.stack.len() + MIN_STACK;
+        if self.stack.capacity() < needed_cap && self.reserve_stack(MIN_STACK).is_err() {
+            self.last_error_value = Some(self.memerrmsg_value());
+            self.last_error_is_memerr.set(true);
+            self.truncate_live(func_idx);
+            self.stack.push(self.memerrmsg_value());
+            return ERR_MEM;
+        }
+
         // precallC: 设置 api_func_base，确保栈 capacity（不改变 len，避免干扰 lua_gettop）
         let saved_api_base = self.api_func_base;
         self.api_func_base = func_idx;
@@ -1888,18 +1966,9 @@ impl<'a> LuaState<'a> {
             is_tailcall: false,
         });
 
-        // 预留 capacity，但不 push nil（push 会改变 stack.len()，导致 C 函数中
-        // lua_gettop 返回值偏移）。C 函数需要空间时通过 lua_checkstack 或
-        // lua_pushxxx 自动扩展栈。
-        let needed_cap = self.stack.len() + MIN_STACK;
-        if self.stack.capacity() < needed_cap {
-            self.grow_stack_or_throw(MIN_STACK);
-        }
-
         // 清空 pending_error，捕获 C 函数中 lua_error 触发的错误
         // 对应 C 的 longjmp 跨 C 函数抛错到 pcall 的 setjmp
         self.pending_error = None;
-        let ptr: *mut LuaState = self as *mut LuaState;
 
         // 调用 C 函数并捕获错误:
         // - 非 lua_use_longjmp: 用 catch_unwind 捕获 panic (lua_error → panic)
@@ -1912,6 +1981,7 @@ impl<'a> LuaState<'a> {
                 // （C 模块编译时加 -fexceptions，GCC 生成 unwind 表使 Rust panic 能通过）
                 let f_unwind: unsafe extern "C-unwind" fn(*mut c_void) -> i32 =
                     unsafe { std::mem::transmute(f) };
+                let ptr: *mut LuaState = self as *mut LuaState;
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
                     f_unwind(ptr as *mut c_void)
                 })) {
@@ -1929,9 +1999,12 @@ impl<'a> LuaState<'a> {
             #[cfg(lua_use_longjmp)]
             {
                 // lua_use_longjmp 模式: 用 setjmp/longjmp 替代 catch_unwind
-                // jmp_buf 分配在 Rust 栈上，指针压入 error_jmp_bufs 供 do_lua_error 取用
+                // jmp_buf 分配在 Rust 栈上，指针压入 error_jmp_bufs 供 do_lua_error 取用。
+                // 取 state 裸指针必须在最后一次 &mut self 访问**之后** —— 之后一律经
+                // ptr 访问, 否则裸指针会被 &mut 的重用作废 (Stacked/Tree Borrows)。
                 let mut jmp_buf = JmpBuf::default();
                 self.error_jmp_bufs.push(jmp_buf.as_mut_ptr());
+                let ptr: *mut LuaState = self as *mut LuaState;
                 let result = unsafe {
                     lua_rs_pcall_c(
                         Some(f),
@@ -2662,6 +2735,36 @@ extern "C" {
         buf: *mut std::ffi::c_void,
     ) -> i32;
     pub(crate) fn lua_rs_longjmp(buf: *mut std::ffi::c_void) -> !;
+}
+
+/// `lua_use_longjmp` 模式下受保护执行的载荷 —— 供 [`lua_rs_pcall_c`] 的 C 边界
+/// trampoline 写入执行结果。
+///
+/// 生命周期参数在 trampoline 内被擦成 `'static`：指针始终指向调用方栈上的真实值，
+/// 构造、执行与读回都发生在同一次 `lua_rs_pcall_c` 调用内。
+#[cfg(lua_use_longjmp)]
+struct ProtectedExec<'a> {
+    state: *mut LuaState<'a>,
+    out: *mut Option<Result<VmResult<'a>, VmError<'a>>>,
+}
+
+/// C 边界 trampoline（`lua_rs_pcall_c` 的 `f`）：执行 `execute_loop` 并把结果写入载荷。
+///
+/// 执行期间发生 raise 时（longjmp 跳过本函数，载荷 `out` 保持 `None`），调用方据此
+/// 把 `pending_error` 变回 `VmError::MemoryError`。
+///
+/// **ABI 必须用 `C-unwind`**：longjmp 会跨过本帧（raise 发生在 `execute_loop` 之下）。
+/// Windows/MSVC 的 `longjmp` 经 `RtlUnwind` 实现，若本帧是 `extern "C"`（nounwind），
+/// 展开经过时会把整个进程 abort（`panic_cannot_unwind`）；`C-unwind` 允许其通过。
+/// （传出给 C 侧需要一次 fn 指针 transmute，因为 `lua_rs_pcall_c` 的形参是 C 类型。）
+#[cfg(lua_use_longjmp)]
+unsafe extern "C-unwind" fn protected_exec_trampoline(p: *mut std::ffi::c_void) -> i32 {
+    // SAFETY: p 由 LuaState::pcall 构造, 指向同一次调用内有效的 ProtectedExec<'a>;
+    // 'static 只是生命周期擦除的占位（实际生命周期与 LuaState<'a> 一致）。
+    let payload = unsafe { &mut *(p as *mut ProtectedExec<'static>) };
+    let result = VmExecutor::execute_loop(unsafe { &mut *payload.state });
+    unsafe { *payload.out = Some(result) };
+    0
 }
 
 /// 调用栈条目 — 用于堆栈回溯和 debug.getinfo

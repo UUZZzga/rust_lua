@@ -6030,6 +6030,39 @@ impl VmExecutor {
         // nresults: -1 = MULTRET, >=0 = 固定结果数
         let nresults: i32 = if c == 0 { -1 } else { c - 1 };
 
+        // 关键修复：truncate 栈到参数末尾，使 stack.len() == 参数边界。
+        // OP_CALL 设置了 state.top = a + b（b>0 时）；b == 0（MULTRET，实参列表
+        // 以多值表达式结尾）时参数末尾就是 state.top。stack.len() 可能更大（包含
+        // 外层函数在 a+b 之后的"死亡"寄存器）。lua_gettop 基于 stack.len() 计算，
+        // 如果不 truncate，C 函数会看到错误的参数数量：轻则报 "expected N arguments"，
+        // 重则把死寄存器当成实参搬走（skynet 实证：coroutine.resume 的 session/source
+        // 泄漏进协程实参，导致 debug_console 的 arg.n 断言失败）。
+        // a+b 之后的寄存器在 CALL 后是"死亡"的（Lua 编译器保证），可安全丢弃。
+        // 对应 C Lua 的 L->top.p = ra + b（只设指针，不删内存；Vec 需 truncate）。
+        //
+        // 这段与下面的容量预留都必须发生在**任何 state 变更之前**: 扩容点会经
+        // raise_memory_error 抛内存错误 (longjmp 跳过本帧), 若此时已设置
+        // api_func_base / 递增 n_ccalls|c_frame_depth / push call_info, 跳过后这些
+        // 状态就停在半切换处 (对应 C 的 luaD_precall: 先 ensurestack 再创建 ci)。
+        let arg_end = if b != 0 { a + b } else { state.top }.max(a + 1);
+        if state.stack.len() > arg_end {
+            state.truncate_live(arg_end);
+        }
+
+        // 预留 capacity，但不 push nil（push 会改变 stack.len()，导致 C 函数中
+        // lua_gettop 返回值偏移）。C 函数需要空间时通过 lua_checkstack 或
+        // lua_pushxxx 自动扩展栈。
+        //
+        // 走漏斗而非 raise: 此刻本帧尚未改任何 state（api_func_base / n_ccalls /
+        // c_frame_depth / call_info 都在下面才动），分配失败直接作为
+        // VmError::MemoryError 向上返回（对应 C 的 luaM_error → luaD_throw(ERRMEM),
+        // 一样落到最近保护点，但不必 longjmp 跳过本帧）。
+        if state.stack.capacity() < state.stack.len() + LUA_MINSTACK
+            && state.reserve_stack(LUA_MINSTACK).is_err()
+        {
+            return Err(VmError::MemoryError);
+        }
+
         // precallC: 设置 api_func_base，确保栈 capacity
         let saved_api_base = state.api_func_base;
         state.api_func_base = a;
@@ -6056,33 +6089,12 @@ impl VmExecutor {
             is_tailcall: false,
         });
 
-        // 关键修复：truncate 栈到参数末尾，使 stack.len() == 参数边界。
-        // OP_CALL 设置了 state.top = a + b（b>0 时）；b == 0（MULTRET，实参列表
-        // 以多值表达式结尾）时参数末尾就是 state.top。stack.len() 可能更大（包含
-        // 外层函数在 a+b 之后的"死亡"寄存器）。lua_gettop 基于 stack.len() 计算，
-        // 如果不 truncate，C 函数会看到错误的参数数量：轻则报 "expected N arguments"，
-        // 重则把死寄存器当成实参搬走（skynet 实证：coroutine.resume 的 session/source
-        // 泄漏进协程实参，导致 debug_console 的 arg.n 断言失败）。
-        // a+b 之后的寄存器在 CALL 后是"死亡"的（Lua 编译器保证），可安全丢弃。
-        // 对应 C Lua 的 L->top.p = ra + b（只设指针，不删内存；Vec 需 truncate）。
-        let arg_end = if b != 0 { a + b } else { state.top }.max(a + 1);
-        if state.stack.len() > arg_end {
-            state.truncate_live(arg_end);
-        }
-
-        // 预留 capacity，但不 push nil（push 会改变 stack.len()，导致 C 函数中
-        // lua_gettop 返回值偏移）。C 函数需要空间时通过 lua_checkstack 或
-        // lua_pushxxx 自动扩展栈。
-        if state.stack.capacity() < state.stack.len() + LUA_MINSTACK {
-            state.grow_stack_or_throw(LUA_MINSTACK);
-        }
         // 调用 C 函数: n = f(L)
         // 捕获 lua_error 抛出的错误:
         // - 非 lua_use_longjmp: 用 catch_unwind 捕获 panic (lua_error → panic)
         // - lua_use_longjmp: 用 setjmp/longjmp (panic=abort 下 catch_unwind 不工作)
         // 返回 Ok(n) 表示成功, Err(()) 表示 lua_error (pending_error 已设置)
         state.pending_error = None;
-        let ptr: *mut LuaState = state as *mut LuaState;
 
         let call_result: Result<i32, ()> = {
             #[cfg(not(lua_use_longjmp))]
@@ -6092,6 +6104,7 @@ impl VmExecutor {
                 // （与 state.rs::pcall_c_function 保持一致，否则 panic 跨 extern "C" 边界会 abort）
                 let f_unwind: unsafe extern "C-unwind" fn(*mut c_void) -> i32 =
                     unsafe { std::mem::transmute(f) };
+                let ptr: *mut LuaState = state as *mut LuaState;
                 match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| unsafe {
                     f_unwind(ptr as *mut c_void)
                 })) {
@@ -6101,9 +6114,12 @@ impl VmExecutor {
             }
             #[cfg(lua_use_longjmp)]
             {
-                // lua_use_longjmp 模式: 用 setjmp/longjmp 替代 catch_unwind
+                // lua_use_longjmp 模式: 用 setjmp/longjmp 替代 catch_unwind。
+                // 取 state 裸指针必须在最后一次 &mut state 访问**之后** —— 之后一律
+                // 经 ptr 访问, 否则裸指针会被 &mut 的重用作废 (Stacked/Tree Borrows)。
                 let mut jmp_buf = JmpBuf::default();
                 state.error_jmp_bufs.push(jmp_buf.as_mut_ptr());
+                let ptr: *mut LuaState = state as *mut LuaState;
                 let result = unsafe {
                     crate::state::lua_rs_pcall_c(Some(f), ptr as *mut c_void, jmp_buf.as_mut_ptr())
                 };
