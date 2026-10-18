@@ -608,6 +608,40 @@ impl<T: ?Sized + RcPayload, A: Allocator> MyRc<T, A> {
             _p: PhantomData,
         }
     }
+
+    /// 单块分配的字节数（含 `RcHeader` / 分配器槽 / 尾部对齐填充）—— 供 GC 计费。
+    #[inline]
+    pub fn block_size(payload_size: usize) -> usize {
+        rc_layout::<A, T>(payload_size).size()
+    }
+
+    /// 变长（DST）payload 的分配 + 初始化。
+    ///
+    /// 按 `payload_size` 分配整块，写 header/分配器槽后调用 `init(payload_ptr)`
+    /// 写入 payload 的全部字段（含 `T::as_ref` 重建胖指针所需的元数据字段）。
+    ///
+    /// 分配失败时 `init` **不会**被调用，且分配器原样交还（`Err(alloc)`）——
+    /// 供 [`crate::mem::LuaState::retry_alloc`] 漏斗重试。
+    pub fn try_new_unsized_in(
+        alloc: A,
+        payload_size: usize,
+        init: impl FnOnce(*mut u8),
+    ) -> Result<Self, A> {
+        unsafe {
+            let layout = rc_layout::<A, T>(payload_size);
+            let base = match alloc.allocate(layout) {
+                Ok(p) => p.cast::<u8>().as_ptr(),
+                Err(_) => return Err(alloc),
+            };
+            std::ptr::write(base as *mut RcHeader, RcHeader::default());
+            std::ptr::write(base.add(rc_alloc_off::<A>()) as *mut A, alloc);
+            init(base.add(rc_data_off::<A, T>()));
+            Ok(MyRc {
+                ptr: NonNull::new_unchecked(base),
+                _p: PhantomData,
+            })
+        }
+    }
 }
 
 impl<T: RcPayload, A: Allocator> MyRc<T, A> {

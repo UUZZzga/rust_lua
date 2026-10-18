@@ -617,32 +617,47 @@ impl<'a> crate::state::LuaState<'a> {
         Ok(())
     }
 
-    /// 建 userdata 漏斗 —— 一次完成「构造 + 对象块分配 + GC 登记 + id 写回」。
+    /// 建 userdata 漏斗 —— 一次完成「变长块分配 + 初始化 + GC 登记 + id 写回」。
     ///
-    /// 对应 C 的 `luaS_newudata`（`luaC_newobj` 建对象并立即 `setgclist`）。
-    /// `register_object` 失败与其它分配点同走「紧急 GC → 重试 → 内存错误」漏斗。
+    /// 对应 C 的 `luaS_newudata`（`luaC_newobj` 建 `sizeudata(nuvalue, len)` 大小的
+    /// 单块对象并立即 `setgclist`）：userdata 是**变长对象**，固定头 / 用户值 /
+    /// 原始数据同处一块（见 [`crate::objects::Udata`]），没有独立堆分配。
+    /// 分配失败与其它分配点同走「紧急 GC → 重试 → 内存错误」漏斗。
     ///
-    /// `data` 必须以 `Vec<u64>` 传入以保证 8 字节对齐（C 代码可能在数据区放指针数组）；
-    /// `len` 是给 C 侧看的逻辑字节长度（`data` 通常按 8 字节向上取整）。
+    /// `len` 是给 C 侧看的逻辑字节长度（`lua_rawlen`），数据区按 8 字节向上取整
+    /// （C 代码可能在数据区放指针数组，需 8 字节对齐）。
+    /// 数据区初始化为 0，用户值初始化为 nil；元表在分配成功后写入。
     pub fn new_udata(
         &mut self,
         nuvalue: usize,
         len: usize,
-        data: Vec<u64>,
         metatable: Option<crate::table::Table<'a>>,
     ) -> Result<crate::alloc::MyRc<crate::objects::Udata<'a>, SlotAlloc>, VmError<'a>> {
-        let udata = crate::objects::Udata {
-            gc_header: crate::gc::GCObjectHeader::new(),
-            nuvalue: nuvalue as u16,
-            len,
-            metatable: RefCell::new(metatable),
-            user_values: (0..nuvalue)
-                .map(|_| TValue::Nil(crate::objects::NilKind::Strict))
-                .collect(),
-            data,
+        use crate::objects::Udata;
+        // 头部 `nuvalue` 字段是 u16（对应 C 的 `cast(unsigned short, nuvalue)`，C 侧
+        // 另有 api_check 拒绝 >= SHRT_MAX）。这里一次夹紧，使「payload 大小 /
+        // 头部字段 / 用户值初始化循环」三者恒一致 —— 否则 `as_ref` 由头部算出的
+        // DST 元数据会与分配大小不符，释放时用错 layout。
+        let nuvalue = nuvalue.min(u16::MAX as usize);
+        let slot = self.alloc_slot();
+        // 大小上限（对应 C 的 `luaS_newudata` → `luaM_toobig`：块过大时报
+        // "memory allocation error: block too big"，是**常规**运行时错误而非 OOM）。
+        let Some(payload_size) = Udata::checked_payload_size(nuvalue, len) else {
+            return Err(VmError::RuntimeError(
+                "memory allocation error: block too big".to_string(),
+            ));
         };
-        let ud = self.new_object(udata)?;
-        // 用 gc_mem_size() 计费含 data/user_values 容量，比 size_of::<Udata>() 更接近真实占用
+        let ud = self.retry_alloc(move || {
+            crate::alloc::MyRc::<Udata<'a>, SlotAlloc>::try_new_unsized_in(
+                slot,
+                payload_size,
+                |p| unsafe { Udata::init_payload(p, nuvalue, len) },
+            )
+            .map_err(|_| AllocFailed)
+        })?;
+        // 元表在分配成功后写入（失败路径不会消耗它）
+        unsafe { Udata::metatable_of(ud.as_raw_ptr()).replace(metatable) };
+        // 用整块大小计费（含 header / 分配器槽 / 用户值 / 数据区）
         let id = self.register_object(
             ud.gc_mem_size(),
             crate::objects::WeakValue::UserData(ud.downgrade()),

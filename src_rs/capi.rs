@@ -1010,7 +1010,7 @@ pub extern "C-unwind" fn lua_touserdata(L: *mut lua_State, idx: c_int) -> *mut c
     let L = unsafe { &*L };
     match index2val(L, idx) {
         Some(TValue::LightUserData(p)) => p,
-        Some(TValue::UserData(ud)) => ud.data.as_ptr() as *mut c_void,
+        Some(TValue::UserData(ud)) => ud.data_ptr() as *mut c_void,
         _ => ptr::null_mut(),
     }
 }
@@ -1774,17 +1774,16 @@ pub extern "C-unwind" fn lua_newuserdatauv(
 ) -> *mut c_void {
     let L = unsafe { &mut *L };
     let nuv = if nuvalue >= 0 { nuvalue as usize } else { 0 };
-    // 用 Vec<u64> 分配内存，保证 8 字节对齐
-    // C 代码（如 skynet netpack 的 struct queue）可能包含指针数组，需要正确对齐
-    let n_u64 = (sz + 7) / 8; // 向上取整到 8 字节
-    let mut data = vec![0u64; n_u64];
-    let ptr = data.as_mut_ptr() as *mut c_void;
-    // new_udata 完成「构造 + 对象块分配 + GC 登记 + id 写回」（id 使 mark_tvalue 能正确
-    // 标记 reachable：没有 id 的 userdata 会被 collect_finalizers 误判为不可达）
-    let ud = match L.new_udata(nuv, sz, data, None) {
+    // new_udata 完成「变长块分配（固定头 + 用户值 + 数据区）+ 初始化 + GC 登记 +
+    // id 写回」（id 使 mark_tvalue 能正确标记 reachable：没有 id 的 userdata 会被
+    // collect_finalizers 误判为不可达）。数据区在块内、按 8 字节对齐（C 代码如
+    // skynet netpack 的 struct queue 可能含指针数组），已初始化为 0。
+    let ud = match L.new_udata(nuv, sz, None) {
         Ok(ud) => ud,
         Err(e) => raise_mem_error(L, e),
     };
+    // 返回块内数据区指针（对应 C 的 getudatamem）；块在堆上，指针在对象生命周期内稳定。
+    let ptr = ud.data_ptr() as *mut c_void;
     L.stack.push(TValue::UserData(ud));
     ptr
 }
@@ -1859,9 +1858,12 @@ pub extern "C-unwind" fn lua_setmetatable(L: *mut lua_State, objindex: c_int) ->
             // that doesn't propagate back to other references (like the Lua variable).
             // This breaks the C API semantics where lua_setmetatable modifies
             // the userdata in-place regardless of how many references there are.
-            let ptr = u.as_raw_ptr() as *mut Udata;
+            //
+            // Udata 是变长对象：不能把 payload 薄指针直接 `as *mut Udata`（胖指针），
+            // 需经 `from_payload` 重建。
             unsafe {
-                (*ptr).metatable = mt.as_ref().map(|t| t.clone()).into();
+                let ptr = Udata::from_payload(u.as_raw_ptr());
+                (*ptr).metatable.replace(mt.as_ref().map(|t| t.clone()));
             }
             // 检查元表是否含 __gc，若有则收集待注册的 userdata
             if let Some(ref mt_table) = mt {
@@ -4171,8 +4173,8 @@ pub extern "C-unwind" fn lua_getiuservalue(L: *mut lua_State, idx: c_int, n: c_i
     let val = match &L.stack[off] {
         TValue::UserData(u) => {
             let n = n as usize;
-            if n >= 1 && n <= u.user_values.len() {
-                u.user_values[n - 1].clone()
+            if n >= 1 && n <= u.nuvalue as usize {
+                u.user_values()[n - 1].clone()
             } else {
                 TValue::Nil(NilKind::Strict)
             }
@@ -4202,12 +4204,11 @@ pub extern "C-unwind" fn lua_setiuservalue(L: *mut lua_State, idx: c_int, n: c_i
     let val = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
     if let TValue::UserData(ref u) = L.stack[off] {
         let n = n as usize;
-        if n >= 1 && n <= u.user_values.len() {
-            // 通过裸指针原地修改（与 lua_setmetatable 一致，避免 Rc::make_mut 克隆）
-            let ptr = u.as_raw_ptr() as *mut Udata;
+        if n >= 1 && n <= u.nuvalue as usize {
+            // 通过 payload 裸指针原地修改（与 lua_setmetatable 一致，避免 Rc::make_mut 克隆）。
+            // 用户值区在变长块内、容量恒为 nuvalue，越界分支已被上面的范围检查排除。
             unsafe {
-                let udata = &mut *ptr;
-                udata.user_values[n - 1] = val;
+                Udata::set_user_value(u.as_raw_ptr(), n, val);
             }
         }
     }
@@ -4765,6 +4766,28 @@ pub extern "C-unwind" fn lua_sharestring(_L: *mut lua_State, _index: c_int) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::execute::VmError;
+
+    /// 回归：超限块必须报 C 的 `luaM_toobig` 语义（"block too big"），
+    /// 而不是让 `payload_size` 回绕后分配一块远小于声明的内存（堆破坏）。
+    /// 对应 `mem.rs::new_udata` 的 `checked_payload_size` 守卫。
+    #[test]
+    fn test_new_udata_too_big() {
+        let L = lua_newstate(None, ptr::null_mut(), 0);
+        assert!(!L.is_null());
+        {
+            let st = unsafe { &mut *L };
+            let err = st.new_udata(0, usize::MAX, None).unwrap_err();
+            assert!(
+                matches!(err, VmError::RuntimeError(ref m)
+                    if m == "memory allocation error: block too big"),
+                "超限块必须报 block too big，实际: {err:?}"
+            );
+            // 正常大小仍然可用
+            assert!(st.new_udata(2, 24, None).is_ok());
+        }
+        lua_close(L);
+    }
 
     #[test]
     fn test_lua_newstate_close() {

@@ -456,8 +456,8 @@ fn call_getuservalue<'a>(
 
     let result = match &arg {
         TValue::UserData(u) => {
-            if n > 0 && n <= u.user_values.len() {
-                u.user_values[n - 1].clone()
+            if n > 0 && n <= u.nuvalue as usize {
+                u.user_values()[n - 1].clone()
             } else {
                 TValue::Nil(NilKind::Strict)
             }
@@ -498,14 +498,13 @@ fn call_setuservalue<'a>(
             if n < 1 || n > nuvalue as usize {
                 TValue::Boolean(false)
             } else {
-                // 修改栈上的 userdata
+                // 修改栈上的 userdata：用户值区在变长块内、容量恒为 nuvalue，
+                // `n <= nuvalue` 已保证槽位存在（对应 C 的 setuservalue 就地写）。
                 if a + 1 < state.stack.len() {
-                    if let TValue::UserData(u) = &mut state.stack[a + 1] {
-                        let u = unsafe { &mut *(u.as_raw_ptr() as *mut crate::objects::Udata) };
-                        while u.user_values.len() < n {
-                            u.user_values.push(TValue::Nil(NilKind::Strict));
+                    if let TValue::UserData(u) = &state.stack[a + 1] {
+                        unsafe {
+                            crate::objects::Udata::set_user_value(u.as_raw_ptr(), n, arg2.clone());
                         }
-                        u.user_values[n - 1] = arg2.clone();
                     }
                 }
                 arg1.clone()

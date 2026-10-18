@@ -1961,7 +1961,7 @@ impl<'a> LuaState<'a> {
                     self.push_mark(gc, &tv, worklist);
                     drop(tv);
                 }
-                for uv in &u.user_values {
+                for uv in u.user_values() {
                     self.push_mark(gc, uv, worklist);
                 }
             }

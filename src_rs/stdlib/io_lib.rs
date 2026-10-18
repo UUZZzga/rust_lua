@@ -210,10 +210,20 @@ fn check_file_arg<'a>(
     }
 }
 
+/// 读取 userdata 数据区中存放的 FILE*（io 库把 FILE* 存在数据区第一个 8 字节单元；
+/// 对应 C 的 `luaL_Stream::f`）。
+#[inline]
+fn ud_stream<'a>(
+    u: &crate::alloc::MyRc<crate::objects::Udata<'a>, crate::mem::SlotAlloc>,
+) -> *mut libc::FILE {
+    // 只读访问，可直接经 &self 派生指针
+    unsafe { *(u.data_ptr() as *const u64) as *mut libc::FILE }
+}
+
 /// 从 UserData ptr_id 获取 FILE* — 不检查是否已关闭
 fn get_file_ptr(state: &LuaState, ptr_id: u32) -> Option<*mut libc::FILE> {
     match state.file_handles.borrow().get(&ptr_id) {
-        Some(TValue::UserData(u)) => Some(u.data[0] as *mut libc::FILE),
+        Some(TValue::UserData(u)) => Some(ud_stream(u)),
         _ => None,
     }
 }
@@ -235,7 +245,12 @@ fn new_file_userdata<'a>(
     // 如果元表有 __gc，注册到 ud_finobj_list
     let gc_key = state.intern_str("__gc");
     let has_gc = file_mt.get(&gc_key).is_some();
-    let ud_rc = state.new_udata(0, 0, vec![file as u64], Some(file_mt.clone()))?;
+    // 数据区 8 字节（一个 FILE* 单元；C 侧 luaL_Stream 为 16 字节，Rust io 库只存流指针）
+    let ud_rc = state.new_udata(0, 8, Some(file_mt.clone()))?;
+    unsafe {
+        // 经 payload 指针写入（不能经 &self 派生指针写：Tree Borrows 下共享引用不可写）
+        *(crate::objects::Udata::data_ptr_of(ud_rc.as_raw_ptr()) as *mut u64) = file as u64;
+    }
     if has_gc {
         state.g_mut().register_ud_finobj(&ud_rc);
     }
@@ -857,7 +872,7 @@ fn call_io_close<'a>(
             }
             let f_value_opt = state.file_handles.borrow().get(&pid).cloned();
             if let Some(TValue::UserData(u)) = f_value_opt {
-                let f = u.data[0] as *mut libc::FILE;
+                let f = ud_stream(&u);
                 let is_popen = state.popen_handles.borrow_mut().remove(&pid);
                 unsafe {
                     *compat::errno_ptr() = 0;
@@ -940,7 +955,7 @@ fn close_file_handle<'a>(
     let f_value = state.file_handles.borrow_mut().remove(&ptr_id).unwrap();
     match f_value {
         TValue::UserData(u) => {
-            let f = u.data[0] as *mut libc::FILE;
+            let f = ud_stream(&u);
             let is_popen = state.popen_handles.borrow_mut().remove(&ptr_id);
             unsafe {
                 *compat::errno_ptr() = 0;
@@ -2002,7 +2017,7 @@ fn call_lines_iterator_fn<'a>(
                     state.file_handles.borrow_mut().remove(&file_ptr_id)
                 {
                     unsafe {
-                        libc::fclose(u.data[0] as *mut libc::FILE);
+                        libc::fclose(ud_stream(&u));
                     }
                 }
             }
@@ -2014,7 +2029,7 @@ fn call_lines_iterator_fn<'a>(
             if let Some(TValue::UserData(u)) = state.file_handles.borrow_mut().remove(&file_ptr_id)
             {
                 unsafe {
-                    libc::fclose(u.data[0] as *mut libc::FILE);
+                    libc::fclose(ud_stream(&u));
                 }
             }
         }
@@ -2272,7 +2287,11 @@ pub fn open_io_lib<'a>(state: &mut LuaState<'a>) -> Result<(), VmError<'a>> {
     // 注册标准流作为 FullUserData
     let make_stream =
         |state: &mut LuaState<'a>, file: *mut libc::FILE| -> Result<TValue<'a>, VmError<'a>> {
-            let ud = state.new_udata(0, 0, vec![file as u64], Some(file_mt.clone()))?;
+            // 数据区 8 字节 = 一个 FILE* 单元（与 new_file_userdata 一致）
+            let ud = state.new_udata(0, 8, Some(file_mt.clone()))?;
+            unsafe {
+                *(crate::objects::Udata::data_ptr_of(ud.as_raw_ptr()) as *mut u64) = file as u64;
+            }
             let ptr_id = ud.gc_header.ptr_id;
             let val = TValue::UserData(ud);
             state.file_handles.borrow_mut().insert(ptr_id, val.clone());

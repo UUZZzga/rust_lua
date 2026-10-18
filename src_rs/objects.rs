@@ -1728,42 +1728,236 @@ pub const PF_VATAB: u8 = 2;
 // 规约：用户数据 (UserData)
 // ============================================================================
 
-/// 用户数据 —— 存储任意 C 数据
+/// 用户数据 —— **变长对象**（单块分配），对应 C 的 `Udata`（`lobject.h`）。
 ///
-/// Scenario: 创建用户数据
-/// Given: 数据长度 64 字节，无用户值
-/// When: 构造 Udata
-/// Then: len = 64, nuvalue = 0, data 指向 64 字节内存
-#[derive(Debug, Clone)]
+/// 布局：`固定头 | uv[nuvalue] | data[ceil(len/8) * 8]`，全部在同一分配块内，
+/// 对应 C 的 `sizeudata(nuv, nb) = udatamemoffset(nuv) + nb`。
+/// 用户值区与数据区都在固定头之后，均按 8 字节对齐（C 的 `LUAI_MAXALIGN`
+/// 在默认配置下即 8；C 用 `UValue` 联合保证，这里用 `[u64]` 尾数组保证）。
+///
+/// 与 C 的差异：字段偏移不同（C 把 `len`/`nuvalue` 放在 `gclist` 之前），
+/// 但 C 侧只通过 `getudatamem`（= [`Udata::data_ptr`]）、`lua_rawlen`（`len`）
+/// 与 `lua_get/setiuservalue`（用户值）观察 userdata，故不构成 ABI 差异。
+#[repr(C)]
 pub struct Udata<'a> {
     /// GC 对象头 — ptr_id 在克隆时保持一致，用于哈希和相等性比较
     pub gc_header: GCObjectHeader,
-    /// 用户值数量
+    /// 用户值数量（对应 C `Udata.nuvalue`）
     pub nuvalue: u16,
-    /// 数据长度
+    /// 数据长度（对应 C `Udata.len`，`lua_rawlen` 返回值）
     pub len: usize,
     /// 元表
     pub metatable: RefCell<Option<Table<'a>>>,
-    /// 用户值列表
-    pub user_values: Vec<TValue<'a>>,
-    /// 原始数据 — 使用 Vec<u64> 保证 8 字节对齐
-    /// C 代码（如 skynet netpack 的 struct queue）可能包含指针数组，
-    /// 需要正确对齐，否则未对齐访问导致数据损坏。
-    pub data: Vec<u64>,
+    /// 变长区：前 `nuvalue * UV_WORDS` 个字是用户值（`TValue`），
+    /// 随后 `ceil(len/8)` 个字是原始数据区。
+    pub tail: [u64],
 }
 
+/// `Udata` 的固定头（Sized）—— 用于取字段偏移与固定部分大小。
+///
+/// 字段与 `Udata` 的固定前缀逐位一致（同为 `#[repr(C)]`），
+/// 故 `offset_of!(UdataFixed, X) == offset_of!(Udata, X)` 且
+/// `size_of::<UdataFixed>() == offset_of!(Udata, tail)`。
+#[repr(C)]
+pub struct UdataFixed<'a> {
+    pub gc_header: GCObjectHeader,
+    pub nuvalue: u16,
+    pub len: usize,
+    pub metatable: RefCell<Option<Table<'a>>>,
+}
+
+/// 每个用户值占的 u64 字数（`TValue` = 16 字节）。
+const _: () = {
+    assert!(std::mem::size_of::<TValue<'static>>() == 16);
+    assert!(std::mem::align_of::<TValue<'static>>() == 8);
+};
+
+/// 最大分配大小（对应 C 的 `MAX_SIZE`：`sizeof(size_t) < sizeof(lua_Integer) ?
+/// MAX_SIZET : cast_sizet(LUA_MAXINTEGER)`，与 `stdlib/string_lib.rs` 同式）。
+pub const MAX_SIZE: usize =
+    if std::mem::size_of::<usize>() < std::mem::size_of::<crate::config::LuaInteger>() {
+        usize::MAX
+    } else {
+        crate::config::MAX_INTEGER as usize
+    };
+
 impl<'a> Udata<'a> {
+    /// 固定头大小 = 变长区起始偏移（对应 C 的 `offsetof(Udata, uv)` 之下的部分）。
+    pub const FIXED_SIZE: usize = std::mem::size_of::<UdataFixed<'a>>();
+    /// 每个用户值占的 u64 字数。
+    pub const UV_WORDS: usize = std::mem::size_of::<TValue<'a>>() / 8;
+    /// 数据区 u64 字数 = `ceil(len / 8)`。
+    const LEN_OFF: usize = std::mem::offset_of!(UdataFixed<'a>, len);
+    const NV_OFF: usize = std::mem::offset_of!(UdataFixed<'a>, nuvalue);
+    const MT_OFF: usize = std::mem::offset_of!(UdataFixed<'a>, metatable);
+
+    /// 数据区 u64 字数。
+    #[inline]
+    pub fn data_words(len: usize) -> usize {
+        len.div_ceil(8)
+    }
+
+    /// 变长区 u64 字数。
+    #[inline]
+    fn tail_words(nuvalue: usize, len: usize) -> usize {
+        nuvalue * Self::UV_WORDS + Self::data_words(len)
+    }
+
+    /// payload（不含 `RcHeader` / 分配器槽）的字节数。
+    #[inline]
+    pub fn payload_size(nuvalue: usize, len: usize) -> usize {
+        Self::FIXED_SIZE + Self::tail_words(nuvalue, len) * 8
+    }
+
+    /// 上述大小的带检查版本：超出 C 的 `MAX_SIZE` 或算术溢出时返回 `None`
+    /// （对应 C `luaS_newudata` 的 `sizeudata` 溢出检查 → `luaM_toobig`）。
+    /// 创建路径必须用它 —— 否则 `payload_size` 回绕会分配一块远小于声明大小的内存。
+    #[inline]
+    pub fn checked_payload_size(nuvalue: usize, len: usize) -> Option<usize> {
+        let uv_bytes = nuvalue.checked_mul(std::mem::size_of::<TValue<'a>>())?;
+        let offset = Self::FIXED_SIZE.checked_add(uv_bytes)?; // = udatamemoffset(nuv)
+                                                              // C: `if (s > MAX_SIZE - udatamemoffset(nuvalue)) luaM_toobig(L);`
+        if len > MAX_SIZE.saturating_sub(offset) {
+            return None;
+        }
+        offset.checked_add(Self::data_words(len) * 8)
+    }
+
+    /// 用户值切片（长度恒为 `nuvalue`）。
+    #[inline]
+    pub fn user_values(&self) -> &[TValue<'a>] {
+        // SAFETY: 变长区前 nuvalue 个 TValue 由 init_payload 全部写入（16B / 8 对齐）。
+        unsafe {
+            std::slice::from_raw_parts(
+                self.tail.as_ptr() as *const TValue<'a>,
+                self.nuvalue as usize,
+            )
+        }
+    }
+
+    /// 数据区起始指针（对应 C 的 `getudatamem(u)`，`lua_touserdata` 返回值）。
+    #[inline]
+    pub fn data_ptr(&self) -> *mut u8 {
+        unsafe {
+            self.tail
+                .as_ptr()
+                .add(self.nuvalue as usize * Self::UV_WORDS) as *mut u8
+        }
+    }
+
+    // ---- 以下为基于 payload 薄指针（`MyRc::as_raw_ptr()`）的访问器 ----
+    // 写操作**不能**经 `&self` 派生指针（Tree Borrows 下共享引用不可写），
+    // 必须从块基址（payload 指针）重新派生。
+
+    /// 由 payload 薄指针重建胖指针。
+    ///
+    /// # Safety
+    /// `payload` 必须是本类型 payload 的起点（`MyRc::as_raw_ptr()`）。
+    #[inline]
+    pub unsafe fn from_payload(payload: *mut u8) -> *mut Udata<'a> {
+        let nuvalue = *(payload.add(Self::NV_OFF) as *const u16) as usize;
+        let len = *(payload.add(Self::LEN_OFF) as *const usize);
+        // 胖指针 = (数据地址, DST 元数据)，与 `(ptr, len)` 同布局
+        // （与 strings.rs 的 `LongString::as_ref` 同一手法；`ptr_metadata` 仍是 unstable）。
+        std::mem::transmute((payload as *mut (), Self::tail_words(nuvalue, len)))
+    }
+
+    /// payload 中数据区起始指针。
+    ///
+    /// # Safety
+    /// `payload` 必须是本类型 payload 的起点。
+    #[inline]
+    pub unsafe fn data_ptr_of(payload: *mut u8) -> *mut u8 {
+        let nuvalue = *(payload.add(Self::NV_OFF) as *const u16) as usize;
+        payload.add(Self::FIXED_SIZE + nuvalue * std::mem::size_of::<TValue<'a>>())
+    }
+
+    /// payload 中元表槽（`RefCell`，可经共享引用修改）。
+    ///
+    /// # Safety
+    /// `payload` 必须是本类型 payload 的起点。
+    #[inline]
+    pub unsafe fn metatable_of<'b>(payload: *mut u8) -> &'b RefCell<Option<Table<'a>>> {
+        &*(payload.add(Self::MT_OFF) as *const RefCell<Option<Table<'a>>>)
+    }
+
+    /// 就地写第 `n` 个用户值（1-based），对应 C 的 `setuservalue`。
+    ///
+    /// # Safety
+    /// `payload` 必须是本类型 payload 的起点，且 `1 <= n <= nuvalue`。
+    #[inline]
+    pub unsafe fn set_user_value(payload: *mut u8, n: usize, val: TValue<'a>) {
+        let slot = payload.add(Self::FIXED_SIZE + (n - 1) * std::mem::size_of::<TValue<'a>>())
+            as *mut TValue<'a>;
+        std::ptr::drop_in_place(slot);
+        std::ptr::write(slot, val);
+    }
+
+    /// 初始化整块 payload（固定头 + 用户值 = nil + 数据区 = 0）。
+    ///
+    /// 元表由调用方在分配成功后经 [`Udata::metatable_of`] 写入（初始化成 `None`）。
+    ///
+    /// # Safety
+    /// `payload` 必须是按 [`Udata::payload_size`] 分配、尚未初始化的 payload 起点。
+    pub unsafe fn init_payload(payload: *mut u8, nuvalue: usize, len: usize) {
+        debug_assert!(nuvalue <= u16::MAX as usize, "nuvalue 必须已夹紧到 u16");
+        let nuv = nuvalue as u16;
+        std::ptr::write(
+            payload.add(std::mem::offset_of!(UdataFixed<'a>, gc_header)) as *mut GCObjectHeader,
+            GCObjectHeader::new(),
+        );
+        std::ptr::write(payload.add(Self::NV_OFF) as *mut u16, nuv);
+        std::ptr::write(payload.add(Self::LEN_OFF) as *mut usize, len);
+        std::ptr::write(
+            payload.add(Self::MT_OFF) as *mut RefCell<Option<Table<'a>>>,
+            RefCell::new(None),
+        );
+        let uv = payload.add(Self::FIXED_SIZE) as *mut TValue<'a>;
+        for i in 0..nuvalue {
+            std::ptr::write(uv.add(i), TValue::Nil(crate::objects::NilKind::Strict));
+        }
+        let data = payload.add(Self::FIXED_SIZE + nuvalue * std::mem::size_of::<TValue<'a>>());
+        std::ptr::write_bytes(data, 0, Self::data_words(len) * 8);
+    }
+
     /// 估算 Udata 真实堆占用（用于 GC 内存计费）。
-    /// Udata 通过 register_object 注册，但 size_of::<Udata>() 不含 data/user_values 容量。
+    ///
+    /// 整块分配 = `RcHeader` + 分配器槽 + payload（固定头 + 用户值 + 数据区），
+    /// 由 [`crate::alloc::MyRc::block_size`] 精确给出（含尾部对齐填充）。
     pub fn gc_mem_size(&self) -> usize {
-        // MyRc<Udata> 路由块 = RcHeader(16) + SlotAlloc(8) + Udata 自身
-        // data: Vec<u64>，堆分配 = capacity * 8
-        // user_values: Vec<TValue>，堆分配 = capacity * size_of::<TValue>()
-        RC_HEADER_SIZE
-            + std::mem::size_of::<crate::mem::SlotAlloc>()
-            + std::mem::size_of::<Udata<'a>>()
-            + self.data.capacity() * 8
-            + self.user_values.capacity() * std::mem::size_of::<TValue>()
+        crate::alloc::MyRc::<Udata<'a>, SlotAlloc>::block_size(Self::payload_size(
+            self.nuvalue as usize,
+            self.len,
+        ))
+    }
+}
+
+unsafe impl<'a> crate::alloc::RcPayload for Udata<'a> {
+    const ALIGN: usize = std::mem::align_of::<u64>();
+
+    unsafe fn as_ref<'b>(payload: *const u8) -> &'b Udata<'a> {
+        let nuvalue = *(payload.add(Self::NV_OFF) as *const u16) as usize;
+        let len = *(payload.add(Self::LEN_OFF) as *const usize);
+        // 胖指针 = (数据地址, DST 元数据)，与 `(ptr, len)` 同布局
+        let p: *const Udata<'a> = std::mem::transmute((payload, Self::tail_words(nuvalue, len)));
+        &*p
+    }
+
+    unsafe fn drop_payload(payload: *mut u8) {
+        // 固定头（GCObjectHeader / nuvalue / len 无析构）+ 元表 + 各用户值。
+        // 数据区（u64）无析构。
+        std::ptr::drop_in_place(payload.add(Self::MT_OFF) as *mut RefCell<Option<Table<'a>>>);
+        let nuvalue = *(payload.add(Self::NV_OFF) as *const u16) as usize;
+        let uv = payload.add(Self::FIXED_SIZE) as *mut TValue<'a>;
+        for i in 0..nuvalue {
+            std::ptr::drop_in_place(uv.add(i));
+        }
+    }
+
+    unsafe fn payload_size(payload: *const u8) -> usize {
+        let nuvalue = *(payload.add(Self::NV_OFF) as *const u16) as usize;
+        let len = *(payload.add(Self::LEN_OFF) as *const usize);
+        Self::FIXED_SIZE + Self::tail_words(nuvalue, len) * 8
     }
 }
 
@@ -2686,7 +2880,7 @@ mod tests {
         println!("LClosure: {}", size_of::<LClosure>());
         println!("CClosure: {}", size_of::<CClosure>());
         println!("LuaThread: {}", size_of::<LuaThread>());
-        println!("Udata: {}", size_of::<Udata>());
+        println!("Udata: 变长对象，固定头 {}", Udata::FIXED_SIZE);
         println!("LCFunction: {}", size_of::<LCFunction>());
         println!("NilKind: {}", size_of::<NilKind>());
         println!("Instruction: {}", size_of::<Instruction>());
@@ -2696,5 +2890,61 @@ mod tests {
         println!("LocVar: {}", size_of::<LocVar>());
         println!("AbsLineInfo: {}", size_of::<AbsLineInfo>());
         println!("UpVal: {}", size_of::<UpVal>());
+    }
+
+    /// Udata 是变长对象（单块分配）：固定头 + 用户值区 + 数据区。
+    /// 验证布局常量、块内偏移、用户值读写与整块析构。
+    #[test]
+    fn test_udata_variable_length_layout() {
+        use crate::alloc::{Global, MyRc};
+
+        // 句柄仍是 8 字节 thin 指针（TValue 总宽 16 字节的前提）
+        assert_eq!(size_of::<TValue>(), 16);
+        assert_eq!(size_of::<MyRc<Udata>>(), 8);
+
+        // 固定头 8 字节对齐（用户值 / 数据区都靠它对齐）
+        assert_eq!(Udata::FIXED_SIZE % 8, 0);
+        assert_eq!(
+            Udata::FIXED_SIZE,
+            std::mem::offset_of!(UdataFixed, metatable) + size_of::<RefCell<Option<Table>>>()
+        );
+
+        // payload 大小 = 固定头 + nuvalue * 16 + ceil(len/8) * 8
+        assert_eq!(Udata::payload_size(0, 0), Udata::FIXED_SIZE);
+        assert_eq!(Udata::payload_size(2, 0), Udata::FIXED_SIZE + 32);
+        assert_eq!(Udata::payload_size(0, 9), Udata::FIXED_SIZE + 16);
+        assert_eq!(Udata::payload_size(2, 8), Udata::FIXED_SIZE + 32 + 8);
+
+        // 真正构造一个（nuvalue = 2, len = 8）：数据区在块内、紧跟用户值区
+        let size = Udata::payload_size(2, 8);
+        let ud = match MyRc::<Udata, Global>::try_new_unsized_in(Global, size, |p| unsafe {
+            Udata::init_payload(p, 2, 8)
+        }) {
+            Ok(u) => u,
+            Err(_) => panic!("分配失败"),
+        };
+        assert_eq!(ud.nuvalue, 2);
+        assert_eq!(ud.len, 8);
+        assert_eq!(ud.user_values().len(), 2);
+        assert!(ud.user_values()[0].is_nil() && ud.user_values()[1].is_nil());
+
+        let payload = ud.as_raw_ptr() as usize;
+        assert_eq!(ud.data_ptr() as usize, payload + Udata::FIXED_SIZE + 32);
+        // 数据区初始为 0，且可写（供 C 模块存放自己的结构体）
+        assert_eq!(unsafe { *(ud.data_ptr() as *const u64) }, 0);
+        unsafe { *(Udata::data_ptr_of(ud.as_raw_ptr()) as *mut u64) = 0xdead_beef };
+        assert_eq!(unsafe { *(ud.data_ptr() as *const u64) }, 0xdead_beef);
+
+        // 用户值就地写（对应 lua_setiuservalue）
+        unsafe { Udata::set_user_value(ud.as_raw_ptr(), 2, TValue::Integer(7)) };
+        assert_eq!(ud.user_values()[1].as_integer(), Some(7));
+        assert!(ud.user_values()[0].is_nil());
+
+        // 整块析构：用户值里持有引用的对象必须被释放（这里验证 clone/drop 平衡——
+        // 2 份句柄 drop 后块回收，无双重释放/泄漏，由 Miri/ASan 检出）
+        let ud2 = ud.clone();
+        assert_eq!(ud.strong_count(), 2);
+        drop(ud);
+        assert_eq!(ud2.strong_count(), 1);
     }
 }
