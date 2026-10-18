@@ -5913,6 +5913,11 @@ impl VmExecutor {
                     TValue::RustClosure(rc) => (rc.func, rc.name_str()),
                     _ => unreachable!(),
                 };
+                // 安全: 提前释放函数值克隆 —— RustClosure 是 Rc 变体, 而被调函数内部
+                // 可能抛错 (`lua_error` / capi 分配失败 → longjmp / panic 跳过本帧)，
+                // 持有这份克隆即泄漏。name_str() 返回 &'static str 不借用闭包; 被调
+                // 函数经栈槽 a 读取自己的 upvalues, 同样不依赖本帧。
+                drop(func_val);
 
                 // 推入 CallInfoEntry（对应 C 的 luaD_precall -> inc_ci）
                 // name 直接从函数取，无需调用 get_func_name
@@ -5997,7 +6002,12 @@ impl VmExecutor {
                 Ok(())
             }
             TValue::CClosure(cc) => {
-                Self::call_c_function(state, a, b, c, cc.f)?;
+                // perf/安全: 先取出函数指针并**释放闭包引用** —— C 函数内部抛错
+                // （`lua_error` / capi 分配失败 → longjmp / panic）会跳过本帧的 Drop，
+                // 持有 Rc 即泄漏（函数值本身仍在栈槽 a 上，C 侧不依赖本帧这份克隆）。
+                let f = cc.f;
+                drop(cc);
+                Self::call_c_function(state, a, b, c, f)?;
                 Ok(())
             }
             other => {
@@ -6427,7 +6437,11 @@ impl VmExecutor {
                 Ok(())
             }
             TValue::CClosure(cc) => {
-                Self::call_c_function(state, a, b, 0, cc.f)?;
+                // 安全: 同 op_call_generic —— 调用前释放闭包引用 (被调 C 函数内的
+                // raise 会跳过本帧, 持有 Rc 即泄漏)。
+                let f = cc.f;
+                drop(cc);
+                Self::call_c_function(state, a, b, 0, f)?;
                 Ok(())
             }
             TValue::BuiltinFn(_) | TValue::RustClosure(_) => {
@@ -6448,6 +6462,9 @@ impl VmExecutor {
                     TValue::RustClosure(rc) => (rc.func, rc.name_str()),
                     _ => unreachable!(),
                 };
+                // 安全: 同 op_call_generic —— 被调函数内的 raise 会跳过本帧, 持有
+                // RustClosure 的 Rc 克隆即泄漏 (被调函数经栈槽 a 读自己的 upvalues)。
+                drop(func_val);
                 // 推入 CallInfoEntry（与 op_call 一致，但 nresults=-1 表示 MULTRET，
                 // 由后续 RETURN 指令根据返回值数量调整）
                 let c_name = name;
@@ -7323,7 +7340,12 @@ impl VmExecutor {
                 // 和 call_info 自管理，与 op_call 的 CClosure 分支一致。
                 // 注意：call_c_function 内部已执行 state.pc += 1（指向 TFORLOOP），
                 // 此处不再重复递增 PC，否则会跳过 TFORLOOP 导致循环体不执行。
-                Self::call_c_function(state, ra + 3, 3, (c + 1) as i32, cc.f)?;
+                // 安全: 调用前释放函数值 (本处 match 的 scrutinee 是 &func_val, 借用
+                // 使 func_val 活到函数末尾; 被调 C 函数内的 raise 会跳过本帧 → 泄漏)。
+                let fp = cc.f;
+                let owned = std::mem::replace(&mut func_val, TValue::Nil(NilKind::Strict));
+                drop(owned);
+                Self::call_c_function(state, ra + 3, 3, (c + 1) as i32, fp)?;
                 state.finish_pending_adjust();
                 Ok(())
             }
@@ -7488,8 +7510,10 @@ impl VmExecutor {
             // PF_VATAB: 从 vararg 表取值
             // 表在 state.base + vatab（对应 C 的 ci->func.p + vatab + 1，因为 state.base = func + 1）
             let table_pos = state.base + vatab;
-            let table_val = Self::read_stack(state, table_pos).clone();
-            let nargs = if let TValue::Table(ref t) = table_val {
+            // 只**借用**栈槽读标量 n: `ensure_scratch_to` 是扩容点, 失败会 raise
+            // (longjmp / panic 跳过本帧) —— 此处持有 Table 的 Rc 克隆即泄漏。
+            // 表的克隆推迟到扩容之后取 (元素读取期间目的寄存器可能覆盖该槽)。
+            let nargs = if let TValue::Table(t) = &state.stack[table_pos] {
                 match t.get(&(state.string_table.intern_value("n"))) {
                     Some(TValue::Integer(n)) => {
                         // 对应 C getnumargs: l_castS2U(n) > cast_uint(INT_MAX/2) 报错
@@ -7523,8 +7547,10 @@ impl VmExecutor {
             };
 
             state.ensure_scratch_to(ra + touse + need_fill + 1);
+            // 扩容点已过: 取表克隆供元素读取 (此时再取, 即使 raise 也不再持有它)
+            let table_val = state.stack[table_pos].clone();
             for i in 0..touse {
-                let val = if let TValue::Table(ref t) = table_val {
+                let val = if let TValue::Table(t) = &table_val {
                     t.get_int((i + 1) as LuaInteger)
                         .unwrap_or(TValue::Nil(NilKind::Strict))
                 } else {

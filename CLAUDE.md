@@ -256,32 +256,52 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
    `VmError::MemoryError` 返回（对应 `luaD_precall` 先 ensurestack；C 的 `luaD_pcall` 也保护
    帧入口的 `luaD_growstack`）。VM 内**没有错误通道**的扩容点（`fast_resize_stack_nil`、
    `pad_frame_scratch_slow`、`adjust_results_on_stack`）仍是 raise，但必须落在保护边界之内。
-4. **被 longjmp 跨过的 Rust 帧必须是 `C-unwind`**。POSIX 的 `longjmp` 不跑析构（值会泄漏）；
+4. **被 longjmp / panic 跨过的 Rust 帧必须是 `C-unwind`**。POSIX 的 `longjmp` 不跑析构（值会泄漏）；
    Windows/MSVC 的 `longjmp` 经 `RtlUnwind` 实现，会真正执行被跨过帧的清理，但展开经过任何
-   Rust `extern "C"`（nounwind）帧都会把进程 abort（`panic_cannot_unwind`）——
-   `protected_exec_trampoline` 因此声明为 `extern "C-unwind"` 并 transmute 成 C 函数指针；
-   日常错误入口（`lua_error` / `luaL_check*` / `lua_callk` 等）本来就是 `extern "C-unwind"`。
+   Rust `extern "C"`（nounwind）帧都会把进程 abort（编译器插入的 `panic_cannot_unwind` 落地垫，
+   实测 `exit code 0xc0000409`）—— `protected_exec_trampoline` 因此声明为 `extern "C-unwind"`
+   并 transmute 成 C 函数指针。**同一根因也存在于默认（非 longjmp）构建**：那里 `raise_mem_error`
+   是 `panic!`，panic 从 nounwind 的 capi 入口向外展开同样 abort（与平台无关）。
+   因此规约是：**`capi.rs` 的 `#[no_mangle] pub` 导出入口一律 `pub [unsafe] extern "C-unwind" fn`**
+   （149 个入口里的 148 个；C ABI 逐位不变，只多「允许展开穿过」的语义）。唯一例外：`luaL_alloc`
+   —— 它作为 `lua_Alloc` 值传给 `lua_newstate`，必须保持 `extern "C"` 才能与 `lua_Alloc`
+   类型匹配；它自身永不抛错（分配原语失败只是返回 NULL），不会被 raise 穿过。
+   被跨过帧还包含 C 模块自己的帧（`deps/Makefile` 加 `-fexceptions` / `-EHsc` 保证可展开）。
    平台差异意味着：**同一份代码在 Windows 上不泄漏、在 POSIX 上泄漏**，所以第 1 条按 POSIX 标准写。
 
 **未覆盖的残留（诚实记录，勿误读为"已完全安全"）**：
 
-- VM 帧内的 Rust 局部（op handler 手里的 `Rc` 克隆等）在 POSIX raise 时仍会泄漏 —— 只是泄漏，
-  状态本身由保护点恢复；根治需要把热路径扩容点全部改成 `Result` 通道（约 50 处签名扩散，周级）。
+- **VM 派发帧持有的函数值**（POSIX raise 泄漏）：已按所有权纪律修掉 —— `op_call_generic` /
+  `op_tailcall` 在调用前显式 `drop(func_val)`（`match func_val` 的 `_` 臂不移动它，
+  `RustClosure` 的 Rc 会活到函数末尾），`op_call_generic` / `op_tailcall` / `op_tforcall`
+  的 `CClosure` 臂在 `call_c_function` 前取出 `cc.f` 并释放闭包引用（`op_tforcall` 的
+  scrutinee 是 `&func_val`，须 `mem::replace` 取走），`op_vararg` 的 PF_VATAB 分支把
+  vararg 表的克隆推迟到 `ensure_scratch_to` **之后**（扩容点前只借用栈槽读标量 `n`）。
+  被调函数经栈槽读自己的 upvalues，不依赖这些克隆；回归 `longjmp_tests::c_closure_error_paths_do_not_leak`。
+  仍然残留：协程恢复/结束路径的 `co.pad_frame_scratch()`（栈被 `mem::take` / 换成克隆快照后
+  再补齐，失败时 `co` 自己没有 jmp_buf → 打印后 `exit(1)`）；非 `fast_unsafe` 构建里
+  `execute_loop` 的 `code_rc` / `constants_rc` 与 `write_stack` 的 `val` 也会被 raise 跨过
+  （该配置不参与 longjmp 回归，属已知缺口）。
 - 真 OOM（200MB 地址空间耗尽）下错误路径自身的分配仍可能 abort，见上面"内存分配失败处理"一节的
-  未迁移清单；`lua_use_longjmp` 只是替换了抛出/捕获机制，不改变这条。
-- Windows 上从 **plain `extern "C"` 的 capi 入口**（`lua_settable` / `lua_setfield` / `luaL_requiref`
-  一类 OOM 才 raise 的 setter/creator）抛内存错误时，nounwind 展开会 abort；这些入口的 raise 只
-  发生在分配失败时（日常错误路径已是 C-unwind），如需彻底对齐应把它们的声明也改成 `C-unwind`
-  （注意 `luaopen_*` 会被当作 `lua_CFunction` 值传递，改 ABI 需同步 transmute）。
+  未迁移清单（字符串内部化 / `push_*` 增长 / 解析器 Vec 等没有错误通道的分配点，仍走
+  `raise_memory_error` 之外的原生 abort 路径）；`lua_use_longjmp` 只替换了抛出/捕获机制，不改变这条。
+- 热路径扩容点尚未全部改成 `Result` 通道（约 50 处签名扩散），所以 `pad_frame_scratch` /
+  `fast_resize_stack_nil` / `adjust_results_on_stack` 在 VM 内仍是 raise；当前靠「帧入口预预留
+  + 上限有界」保证这些点通常不真正扩容（帧 floor = `base + MAX_FSTACK + 1` 在入口已被预留）。
 
-**回归测试**：`tests_rs/longjmp_tests.rs`（`cargo test --features lua_longjmp --test longjmp_tests`，
-同时建议带上 `--test alloc_failure_tests`）：
+**回归测试**（`cargo test --features lua_longjmp --test longjmp_tests`，同时建议带上
+`--test alloc_failure_tests`；enumerated 入口的展开安全性另有 `tests_rs/capi_oom_unwind_tests.rs`，
+它**不依赖 lua_longjmp**、在默认构建下就能检出）：
 
-- 计数全局分配器量化 Rust 堆存活字节：反复触发 capi 各条错误路径后必须回到基线（POSIX 上才有
-  检出能力，Windows 因清理会运行而恒为 0）；
+- 计数全局分配器量化 Rust 堆存活字节：反复触发 capi 各条错误路径、C 闭包抛错路径后必须回到
+  基线（POSIX 上才有检出能力，Windows 因清理会运行而恒为 0）；
 - 大额分配（≥4 KiB）失败注入：把 6 层 × 190 局部的嵌套函数推过初始栈容量 → VM 内栈扩容失败
   （`raise_memory_error`）必须被 Lua 层 `pcall` 捕获为预注册的 `not enough memory`，而不是
-  穿透外层或 `exit(1)`（去掉第 2 条边界后本测试会打印 `lua not enough memory` 并退出进程）。
+  穿透外层或 `exit(1)`（去掉第 2 条边界后本测试会打印 `lua not enough memory` 并退出进程）；
+- `lua_settable` 内部注入分配失败 → 展开穿它自己的帧 + 替身 C 帧，必须被捕获为 `not enough
+  memory` 而不是 abort（`capi_setter_oom_raise_does_not_abort` 守 longjmp 模式、
+  `capi_oom_unwind_tests::settable_oom_raise_is_catchable_not_abort` 守默认 panic 模式；
+  两者都已实测「修复前 abort / 修复后通过」）。
 
 ## 关键编码约定
 

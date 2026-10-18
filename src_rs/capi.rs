@@ -289,7 +289,7 @@ fn typeerror(state: &LuaState, idx: c_int, tname: &str) -> ([u8; 64], usize) {
 /// （Rust VM 内部的类型化 Rc/Vec 分配仍走 std::alloc，不受 allocf 影响。）
 /// 返回的指针需要由 lua_close 释放。
 #[no_mangle]
-pub extern "C" fn lua_newstate(
+pub extern "C-unwind" fn lua_newstate(
     f: lua_Alloc,
     ud: *mut c_void,
     _seed: std::ffi::c_uint,
@@ -319,7 +319,7 @@ pub extern "C" fn lua_newstate(
 
 /// 关闭 Lua state，释放资源。
 #[no_mangle]
-pub extern "C" fn lua_close(L: *mut lua_State) {
+pub extern "C-unwind" fn lua_close(L: *mut lua_State) {
     if !L.is_null() {
         unsafe {
             drop(Box::from_raw(L));
@@ -340,7 +340,7 @@ pub extern "C" fn lua_close(L: *mut lua_State) {
 /// 返回的指针需要由调用方持有（通常存在 userdata 的 uservalue 中），
 /// 不可通过 lua_close 关闭（关闭主 L 时会一并释放所有 thread）。
 #[no_mangle]
-pub extern "C" fn lua_newthread(L: *mut lua_State) -> *mut lua_State {
+pub extern "C-unwind" fn lua_newthread(L: *mut lua_State) -> *mut lua_State {
     if L.is_null() {
         return ptr::null_mut();
     }
@@ -405,7 +405,7 @@ pub extern "C" fn lua_newthread(L: *mut lua_State) -> *mut lua_State {
 /// （stack=[nil]、ci 清空、status=LUA_OK），并返回恢复后的状态。
 /// `L->nCcalls = from ? getCcalls(from) : 0` 与 C 一致。
 #[no_mangle]
-pub extern "C" fn lua_closethread(L: *mut lua_State, from: *mut lua_State) -> c_int {
+pub extern "C-unwind" fn lua_closethread(L: *mut lua_State, from: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     L.n_ccalls = if from.is_null() {
         0
@@ -417,7 +417,7 @@ pub extern "C" fn lua_closethread(L: *mut lua_State, from: *mut lua_State) -> c_
 
 /// luaL_newstate —— 兼容 lauxlib.h
 #[no_mangle]
-pub extern "C" fn luaL_newstate() -> *mut lua_State {
+pub extern "C-unwind" fn luaL_newstate() -> *mut lua_State {
     lua_newstate(
         Some(luaL_alloc),
         ptr::null_mut(),
@@ -431,7 +431,7 @@ pub extern "C" fn luaL_newstate() -> *mut lua_State {
 /// 供 luaL_newstate → lua_newstate 创建 Lua state 时使用。
 /// 简化实现：用 time + 局部变量地址混合，与 C 的 luai_makeseed 等价。
 #[no_mangle]
-pub extern "C" fn luaL_makeseed(_L: *mut lua_State) -> c_uint {
+pub extern "C-unwind" fn luaL_makeseed(_L: *mut lua_State) -> c_uint {
     // 对应 C 的 luai_makeseed: time(NULL) + 局部变量地址
     let t = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -450,7 +450,7 @@ pub extern "C" fn luaL_makeseed(_L: *mut lua_State) -> c_uint {
 
 /// lua_absindex: 将索引转为绝对（正）索引。
 #[no_mangle]
-pub extern "C" fn lua_absindex(L: *mut lua_State, idx: c_int) -> c_int {
+pub extern "C-unwind" fn lua_absindex(L: *mut lua_State, idx: c_int) -> c_int {
     let L = unsafe { &*L };
     if idx > 0 || is_registry(idx) {
         idx
@@ -464,7 +464,7 @@ pub extern "C" fn lua_absindex(L: *mut lua_State, idx: c_int) -> c_int {
 
 /// lua_gettop: 返回栈顶索引（相对于当前帧，不包括函数槽）。
 #[no_mangle]
-pub extern "C" fn lua_gettop(L: *mut lua_State) -> c_int {
+pub extern "C-unwind" fn lua_gettop(L: *mut lua_State) -> c_int {
     let L = unsafe { &*L };
     // C: cast_int(L->top - (L->ci->func + 1))
     // top 是 stack.len()，func 是 api_func_base
@@ -478,7 +478,7 @@ pub extern "C" fn lua_gettop(L: *mut lua_State) -> c_int {
 /// - idx >= 0: new top = func + 1 + idx
 /// - idx < 0:  new top = top + idx + 1
 #[no_mangle]
-pub extern "C" fn lua_settop(L: *mut lua_State, idx: c_int) {
+pub extern "C-unwind" fn lua_settop(L: *mut lua_State, idx: c_int) {
     let L = unsafe { &mut *L };
     if idx >= 0 {
         // new top = func + 1 + idx → stack.len() = api_func_base + 1 + idx
@@ -501,7 +501,7 @@ pub extern "C" fn lua_settop(L: *mut lua_State, idx: c_int) {
 
 /// lua_pushvalue: 将 idx 处的值压栈。
 #[no_mangle]
-pub extern "C" fn lua_pushvalue(L: *mut lua_State, idx: c_int) {
+pub extern "C-unwind" fn lua_pushvalue(L: *mut lua_State, idx: c_int) {
     let L = unsafe { &mut *L };
     if is_registry(idx) {
         // registry 是一个 table
@@ -545,7 +545,7 @@ pub extern "C" fn lua_pushvalue(L: *mut lua_State, idx: c_int) {
 ///
 /// 将 idx 到 top 的元素旋转 n 个位置（n>0 向 top 方向，n<0 向 idx 方向）。
 #[no_mangle]
-pub extern "C" fn lua_rotate(L: *mut lua_State, idx: c_int, n: c_int) {
+pub extern "C-unwind" fn lua_rotate(L: *mut lua_State, idx: c_int, n: c_int) {
     let L = unsafe { &mut *L };
     let abs = if is_registry(idx) {
         return; // registry 不可旋转
@@ -588,7 +588,7 @@ pub extern "C" fn lua_rotate(L: *mut lua_State, idx: c_int, n: c_int) {
 
 /// lua_copy: 从 fromidx 复制值到 toidx。
 #[no_mangle]
-pub extern "C" fn lua_copy(L: *mut lua_State, fromidx: c_int, toidx: c_int) {
+pub extern "C-unwind" fn lua_copy(L: *mut lua_State, fromidx: c_int, toidx: c_int) {
     let L = unsafe { &mut *L };
     // 源/目标先解析成绝对下标（负索引必须在扩容前解析，否则语义漂移），
     // **但不取值** —— 扩容点可能抛内存错误 (longjmp 会跳过本帧的 Drop),
@@ -630,7 +630,7 @@ pub extern "C" fn lua_copy(L: *mut lua_State, fromidx: c_int, toidx: c_int) {
 
 /// lua_checkstack: 确保栈有 extra 个额外空间。
 #[no_mangle]
-pub extern "C" fn lua_checkstack(L: *mut lua_State, extra: c_int) -> c_int {
+pub extern "C-unwind" fn lua_checkstack(L: *mut lua_State, extra: c_int) -> c_int {
     let L = unsafe { &mut *L };
     if extra < 0 {
         return 0;
@@ -645,28 +645,28 @@ pub extern "C" fn lua_checkstack(L: *mut lua_State, extra: c_int) -> c_int {
 
 /// lua_pop: 弹出 n 个元素（宏，但导出为函数方便 C 调用）。
 #[no_mangle]
-pub extern "C" fn lua_pop(L: *mut lua_State, n: c_int) {
+pub extern "C-unwind" fn lua_pop(L: *mut lua_State, n: c_int) {
     lua_settop(L, -(n) - 1);
 }
 
 /// lua_insert: 把栈顶元素插入到 idx 位置，元素上移。
 /// 等同于 lua_rotate(L, idx, 1)。
 #[no_mangle]
-pub extern "C" fn lua_insert(L: *mut lua_State, idx: c_int) {
+pub extern "C-unwind" fn lua_insert(L: *mut lua_State, idx: c_int) {
     lua_rotate(L, idx, 1);
 }
 
 /// lua_remove: 移除 idx 处的元素，元素下移。
 /// 等同于 lua_rotate(L, idx, -1) 后 pop。
 #[no_mangle]
-pub extern "C" fn lua_remove(L: *mut lua_State, idx: c_int) {
+pub extern "C-unwind" fn lua_remove(L: *mut lua_State, idx: c_int) {
     lua_rotate(L, idx, -1);
     lua_pop(L, 1);
 }
 
 /// lua_replace: 宏，等价于 lua_copy(L, -1, idx) + pop
 #[no_mangle]
-pub extern "C" fn lua_replace(L: *mut lua_State, idx: c_int) {
+pub extern "C-unwind" fn lua_replace(L: *mut lua_State, idx: c_int) {
     lua_copy(L, -1, idx);
     lua_pop(L, 1);
 }
@@ -676,19 +676,19 @@ pub extern "C" fn lua_replace(L: *mut lua_State, idx: c_int) {
 // ============================================================================
 
 #[no_mangle]
-pub extern "C" fn lua_pushnil(L: *mut lua_State) {
+pub extern "C-unwind" fn lua_pushnil(L: *mut lua_State) {
     let L = unsafe { &mut *L };
     L.stack.push(TValue::Nil(NilKind::Strict));
 }
 
 #[no_mangle]
-pub extern "C" fn lua_pushnumber(L: *mut lua_State, n: lua_Number) {
+pub extern "C-unwind" fn lua_pushnumber(L: *mut lua_State, n: lua_Number) {
     let L = unsafe { &mut *L };
     L.stack.push(TValue::Float(n));
 }
 
 #[no_mangle]
-pub extern "C" fn lua_pushinteger(L: *mut lua_State, n: lua_Integer) {
+pub extern "C-unwind" fn lua_pushinteger(L: *mut lua_State, n: lua_Integer) {
     let L = unsafe { &mut *L };
     L.stack.push(TValue::Integer(n));
 }
@@ -697,7 +697,7 @@ pub extern "C" fn lua_pushinteger(L: *mut lua_State, n: lua_Integer) {
 ///
 /// 返回指向内部字符串缓冲区的指针（C 语义）。
 #[no_mangle]
-pub extern "C" fn lua_pushlstring(
+pub extern "C-unwind" fn lua_pushlstring(
     L: *mut lua_State,
     s: *const c_char,
     len: usize,
@@ -722,7 +722,7 @@ pub extern "C" fn lua_pushlstring(
 
 /// lua_pushstring: 压入以 \0 结尾的字符串。
 #[no_mangle]
-pub extern "C" fn lua_pushstring(L: *mut lua_State, s: *const c_char) -> *const c_char {
+pub extern "C-unwind" fn lua_pushstring(L: *mut lua_State, s: *const c_char) -> *const c_char {
     let L = unsafe { &mut *L };
     if s.is_null() {
         L.stack.push(TValue::Nil(NilKind::Strict));
@@ -735,13 +735,13 @@ pub extern "C" fn lua_pushstring(L: *mut lua_State, s: *const c_char) -> *const 
 }
 
 #[no_mangle]
-pub extern "C" fn lua_pushboolean(L: *mut lua_State, b: c_int) {
+pub extern "C-unwind" fn lua_pushboolean(L: *mut lua_State, b: c_int) {
     let L = unsafe { &mut *L };
     L.stack.push(TValue::Boolean(b != 0));
 }
 
 #[no_mangle]
-pub extern "C" fn lua_pushlightuserdata(L: *mut lua_State, p: *mut c_void) {
+pub extern "C-unwind" fn lua_pushlightuserdata(L: *mut lua_State, p: *mut c_void) {
     let L = unsafe { &mut *L };
     L.stack.push(TValue::LightUserData(p));
 }
@@ -751,7 +751,7 @@ pub extern "C" fn lua_pushlightuserdata(L: *mut lua_State, p: *mut c_void) {
 /// n 为上值数量：从栈顶弹出 n 个值作为上值。
 /// n == 0 时创建轻量 C 函数（LCFn）。
 #[no_mangle]
-pub extern "C" fn lua_pushcclosure(L: *mut lua_State, f: lua_CFunction, n: c_int) {
+pub extern "C-unwind" fn lua_pushcclosure(L: *mut lua_State, f: lua_CFunction, n: c_int) {
     let L = unsafe { &mut *L };
     let n = n as usize;
     if n == 0 {
@@ -780,7 +780,7 @@ pub extern "C" fn lua_pushcclosure(L: *mut lua_State, f: lua_CFunction, n: c_int
 
 /// lua_pushcfunction: 宏，等价于 lua_pushcclosure(L, f, 0)
 #[no_mangle]
-pub extern "C" fn lua_pushcfunction(L: *mut lua_State, f: lua_CFunction) {
+pub extern "C-unwind" fn lua_pushcfunction(L: *mut lua_State, f: lua_CFunction) {
     lua_pushcclosure(L, f, 0);
 }
 
@@ -789,7 +789,7 @@ pub extern "C" fn lua_pushcfunction(L: *mut lua_State, f: lua_CFunction) {
 // ============================================================================
 
 #[no_mangle]
-pub extern "C" fn lua_type(L: *mut lua_State, idx: c_int) -> c_int {
+pub extern "C-unwind" fn lua_type(L: *mut lua_State, idx: c_int) -> c_int {
     let L = unsafe { &*L };
     if is_registry(idx) {
         return LUA_TTABLE;
@@ -801,7 +801,7 @@ pub extern "C" fn lua_type(L: *mut lua_State, idx: c_int) -> c_int {
 }
 
 #[no_mangle]
-pub extern "C" fn lua_typename(L: *mut lua_State, tp: c_int) -> *const c_char {
+pub extern "C-unwind" fn lua_typename(L: *mut lua_State, tp: c_int) -> *const c_char {
     let _ = L;
     // 返回静态 C 字符串。各分支数组长度不同，统一取 as_ptr() 使类型一致。
     let name: &[u8] = match tp {
@@ -820,7 +820,7 @@ pub extern "C" fn lua_typename(L: *mut lua_State, tp: c_int) -> *const c_char {
 }
 
 #[no_mangle]
-pub extern "C" fn lua_isnumber(L: *mut lua_State, idx: c_int) -> c_int {
+pub extern "C-unwind" fn lua_isnumber(L: *mut lua_State, idx: c_int) -> c_int {
     let L = unsafe { &*L };
     match index2val(L, idx) {
         Some(TValue::Integer(_)) | Some(TValue::Float(_)) => 1,
@@ -835,7 +835,7 @@ pub extern "C" fn lua_isnumber(L: *mut lua_State, idx: c_int) -> c_int {
 }
 
 #[no_mangle]
-pub extern "C" fn lua_isstring(L: *mut lua_State, idx: c_int) -> c_int {
+pub extern "C-unwind" fn lua_isstring(L: *mut lua_State, idx: c_int) -> c_int {
     let L = unsafe { &*L };
     match index2val(L, idx) {
         Some(TValue::LongStr(_))
@@ -847,7 +847,7 @@ pub extern "C" fn lua_isstring(L: *mut lua_State, idx: c_int) -> c_int {
 }
 
 #[no_mangle]
-pub extern "C" fn lua_iscfunction(L: *mut lua_State, idx: c_int) -> c_int {
+pub extern "C-unwind" fn lua_iscfunction(L: *mut lua_State, idx: c_int) -> c_int {
     let L = unsafe { &*L };
     match index2val(L, idx) {
         Some(TValue::LCFn(_)) | Some(TValue::CClosure(_)) => 1,
@@ -856,7 +856,7 @@ pub extern "C" fn lua_iscfunction(L: *mut lua_State, idx: c_int) -> c_int {
 }
 
 #[no_mangle]
-pub extern "C" fn lua_isinteger(L: *mut lua_State, idx: c_int) -> c_int {
+pub extern "C-unwind" fn lua_isinteger(L: *mut lua_State, idx: c_int) -> c_int {
     let L = unsafe { &*L };
     match index2val(L, idx) {
         Some(TValue::Integer(_)) => 1,
@@ -865,7 +865,7 @@ pub extern "C" fn lua_isinteger(L: *mut lua_State, idx: c_int) -> c_int {
 }
 
 #[no_mangle]
-pub extern "C" fn lua_isuserdata(L: *mut lua_State, idx: c_int) -> c_int {
+pub extern "C-unwind" fn lua_isuserdata(L: *mut lua_State, idx: c_int) -> c_int {
     let L = unsafe { &*L };
     match index2val(L, idx) {
         Some(TValue::LightUserData(_)) | Some(TValue::UserData(_)) => 1,
@@ -878,7 +878,7 @@ pub extern "C" fn lua_isuserdata(L: *mut lua_State, idx: c_int) -> c_int {
 // ============================================================================
 
 #[no_mangle]
-pub extern "C" fn lua_toboolean(L: *mut lua_State, idx: c_int) -> c_int {
+pub extern "C-unwind" fn lua_toboolean(L: *mut lua_State, idx: c_int) -> c_int {
     let L = unsafe { &*L };
     match index2val(L, idx) {
         Some(TValue::Nil(_)) => 0,
@@ -889,7 +889,11 @@ pub extern "C" fn lua_toboolean(L: *mut lua_State, idx: c_int) -> c_int {
 
 /// lua_tointegerx: 转为整数，isnum 输出是否转换成功。
 #[no_mangle]
-pub extern "C" fn lua_tointegerx(L: *mut lua_State, idx: c_int, isnum: *mut c_int) -> lua_Integer {
+pub extern "C-unwind" fn lua_tointegerx(
+    L: *mut lua_State,
+    idx: c_int,
+    isnum: *mut c_int,
+) -> lua_Integer {
     let L = unsafe { &*L };
     let result = match index2val(L, idx) {
         Some(TValue::Integer(i)) => Some(i),
@@ -924,7 +928,11 @@ pub extern "C" fn lua_tointegerx(L: *mut lua_State, idx: c_int, isnum: *mut c_in
 
 /// lua_tonumberx: 转为浮点数。
 #[no_mangle]
-pub extern "C" fn lua_tonumberx(L: *mut lua_State, idx: c_int, isnum: *mut c_int) -> lua_Number {
+pub extern "C-unwind" fn lua_tonumberx(
+    L: *mut lua_State,
+    idx: c_int,
+    isnum: *mut c_int,
+) -> lua_Number {
     let L = unsafe { &*L };
     let result = match index2val(L, idx) {
         Some(TValue::Integer(i)) => Some(i as lua_Number),
@@ -955,7 +963,11 @@ pub extern "C" fn lua_tonumberx(L: *mut lua_State, idx: c_int, isnum: *mut c_int
 /// 注意：返回的指针指向内部缓冲区，在下次 Lua 调用后可能失效。
 /// 当前实现：对于字符串值直接返回内部指针；对于数字先转换为字符串再压栈。
 #[no_mangle]
-pub extern "C" fn lua_tolstring(L: *mut lua_State, idx: c_int, len: *mut usize) -> *const c_char {
+pub extern "C-unwind" fn lua_tolstring(
+    L: *mut lua_State,
+    idx: c_int,
+    len: *mut usize,
+) -> *const c_char {
     let L = unsafe { &mut *L };
     let off = if is_registry(idx) {
         return ptr::null(); // registry 不是字符串
@@ -994,7 +1006,7 @@ pub extern "C" fn lua_tolstring(L: *mut lua_State, idx: c_int, len: *mut usize) 
 }
 
 #[no_mangle]
-pub extern "C" fn lua_touserdata(L: *mut lua_State, idx: c_int) -> *mut c_void {
+pub extern "C-unwind" fn lua_touserdata(L: *mut lua_State, idx: c_int) -> *mut c_void {
     let L = unsafe { &*L };
     match index2val(L, idx) {
         Some(TValue::LightUserData(p)) => p,
@@ -1005,7 +1017,7 @@ pub extern "C" fn lua_touserdata(L: *mut lua_State, idx: c_int) -> *mut c_void {
 
 /// lua_rawlen: 返回值的原始长度。
 #[no_mangle]
-pub extern "C" fn lua_rawlen(L: *mut lua_State, idx: c_int) -> lua_Unsigned {
+pub extern "C-unwind" fn lua_rawlen(L: *mut lua_State, idx: c_int) -> lua_Unsigned {
     let L = unsafe { &*L };
     match index2val(L, idx) {
         Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => lua_string_len(&s) as lua_Unsigned,
@@ -1017,7 +1029,7 @@ pub extern "C" fn lua_rawlen(L: *mut lua_State, idx: c_int) -> lua_Unsigned {
 
 /// lua_tocfunction: 返回 C 函数指针。
 #[no_mangle]
-pub extern "C" fn lua_tocfunction(L: *mut lua_State, idx: c_int) -> Option<lua_CFunction> {
+pub extern "C-unwind" fn lua_tocfunction(L: *mut lua_State, idx: c_int) -> Option<lua_CFunction> {
     let L = unsafe { &*L };
     match index2val(L, idx) {
         Some(TValue::LCFn(f)) => Some(f.func),
@@ -1032,7 +1044,7 @@ pub extern "C" fn lua_tocfunction(L: *mut lua_State, idx: c_int) -> Option<lua_C
 
 /// lua_createtable: 创建新表并压栈。
 #[no_mangle]
-pub extern "C" fn lua_createtable(L: *mut lua_State, narr: c_int, nrec: c_int) {
+pub extern "C-unwind" fn lua_createtable(L: *mut lua_State, narr: c_int, nrec: c_int) {
     let L = unsafe { &mut *L };
     if let Err(e) = L.create_table(narr.min(0) as usize, nrec.min(0) as usize) {
         raise_mem_error(L, e);
@@ -1041,7 +1053,7 @@ pub extern "C" fn lua_createtable(L: *mut lua_State, narr: c_int, nrec: c_int) {
 
 /// lua_gettable: t[k]，k 从栈顶弹出，结果压栈。返回值的类型。
 #[no_mangle]
-pub extern "C" fn lua_gettable(L: *mut lua_State, idx: c_int) -> c_int {
+pub extern "C-unwind" fn lua_gettable(L: *mut lua_State, idx: c_int) -> c_int {
     let L = unsafe { &mut *L };
     // IMPORTANT: resolve offset BEFORE popping, because idx might be negative
     // and popping changes relative positions
@@ -1075,7 +1087,7 @@ pub extern "C" fn lua_gettable(L: *mut lua_State, idx: c_int) -> c_int {
 
 /// lua_settable: t[k] = v，k 和 v 从栈顶弹出。
 #[no_mangle]
-pub extern "C" fn lua_settable(L: *mut lua_State, idx: c_int) {
+pub extern "C-unwind" fn lua_settable(L: *mut lua_State, idx: c_int) {
     let L = unsafe { &mut *L };
     // 先基于当前 top（包含 key 和 val）定位 table，再 pop
     if is_registry(idx) {
@@ -1114,7 +1126,7 @@ pub extern "C" fn lua_settable(L: *mut lua_State, idx: c_int) {
 
 /// lua_getfield: t[k]，结果压栈。
 #[no_mangle]
-pub extern "C" fn lua_getfield(L: *mut lua_State, idx: c_int, k: *const c_char) -> c_int {
+pub extern "C-unwind" fn lua_getfield(L: *mut lua_State, idx: c_int, k: *const c_char) -> c_int {
     let L = unsafe { &mut *L };
     let key_str = if k.is_null() {
         String::new()
@@ -1149,7 +1161,7 @@ pub extern "C" fn lua_getfield(L: *mut lua_State, idx: c_int, k: *const c_char) 
 
 /// lua_setfield: t[k] = v，v 从栈顶弹出。
 #[no_mangle]
-pub extern "C" fn lua_setfield(L: *mut lua_State, idx: c_int, k: *const c_char) {
+pub extern "C-unwind" fn lua_setfield(L: *mut lua_State, idx: c_int, k: *const c_char) {
     let L = unsafe { &mut *L };
     // 先基于当前 top（包含 val）定位 table，再 pop val
     let key_str = if k.is_null() {
@@ -1192,17 +1204,17 @@ pub extern "C" fn lua_setfield(L: *mut lua_State, idx: c_int, k: *const c_char) 
 }
 /// lua_rawget: t[k]，k 从栈顶弹出（不走元方法）。
 #[no_mangle]
-pub extern "C" fn lua_rawget(L: *mut lua_State, idx: c_int) -> c_int {
+pub extern "C-unwind" fn lua_rawget(L: *mut lua_State, idx: c_int) -> c_int {
     lua_gettable(L, idx)
 }
 /// lua_rawset: t[k] = v，k 和 v 从栈顶弹出（不走元方法）。
 #[no_mangle]
-pub extern "C" fn lua_rawset(L: *mut lua_State, idx: c_int) {
+pub extern "C-unwind" fn lua_rawset(L: *mut lua_State, idx: c_int) {
     lua_settable(L, idx);
 }
 /// lua_rawgeti: t[n]，结果压栈。
 #[no_mangle]
-pub extern "C" fn lua_rawgeti(L: *mut lua_State, idx: c_int, n: lua_Integer) -> c_int {
+pub extern "C-unwind" fn lua_rawgeti(L: *mut lua_State, idx: c_int, n: lua_Integer) -> c_int {
     let L = unsafe { &mut *L };
     let key = TValue::Integer(n);
     if is_registry(idx) {
@@ -1229,7 +1241,7 @@ pub extern "C" fn lua_rawgeti(L: *mut lua_State, idx: c_int, n: lua_Integer) -> 
 
 /// lua_rawseti: t[n] = v，v 从栈顶弹出。
 #[no_mangle]
-pub extern "C" fn lua_rawseti(L: *mut lua_State, idx: c_int, n: lua_Integer) {
+pub extern "C-unwind" fn lua_rawseti(L: *mut lua_State, idx: c_int, n: lua_Integer) {
     let L = unsafe { &mut *L };
     // 先基于当前 top（包含 val）定位 table，再 pop
     if is_registry(idx) {
@@ -1269,7 +1281,7 @@ pub extern "C" fn lua_rawseti(L: *mut lua_State, idx: c_int, n: lua_Integer) {
 
 /// lua_getglobal: 读取全局变量，结果压栈。
 #[no_mangle]
-pub extern "C" fn lua_getglobal(L: *mut lua_State, name: *const c_char) -> c_int {
+pub extern "C-unwind" fn lua_getglobal(L: *mut lua_State, name: *const c_char) -> c_int {
     let L = unsafe { &mut *L };
     let name_str = if name.is_null() {
         String::new()
@@ -1290,7 +1302,7 @@ pub extern "C" fn lua_getglobal(L: *mut lua_State, name: *const c_char) -> c_int
 
 /// lua_setglobal: 设置全局变量，值从栈顶弹出。
 #[no_mangle]
-pub extern "C" fn lua_setglobal(L: *mut lua_State, name: *const c_char) {
+pub extern "C-unwind" fn lua_setglobal(L: *mut lua_State, name: *const c_char) {
     let L = unsafe { &mut *L };
     let val = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
     let name_str = if name.is_null() {
@@ -1360,7 +1372,7 @@ pub extern "C-unwind" fn luaL_checkversion_(L: *mut lua_State, ver: lua_Number, 
 /// nup = N，table 在 -(nup+1) 位置
 /// 调用后: [... | table]（弹出所有 upvalue）
 #[no_mangle]
-pub extern "C" fn luaL_setfuncs(L: *mut lua_State, l: *const luaL_Reg, nup: c_int) {
+pub extern "C-unwind" fn luaL_setfuncs(L: *mut lua_State, l: *const luaL_Reg, nup: c_int) {
     if l.is_null() {
         return;
     }
@@ -1446,7 +1458,7 @@ pub extern "C-unwind" fn luaL_optlstring(
 /// - 栈顶值是 nil → 弹出，返回 LUA_REFNIL
 /// - 否则 → t[n] = value，n++，弹出 value，返回 n-1
 #[no_mangle]
-pub extern "C" fn luaL_ref(L: *mut lua_State, _t: c_int) -> c_int {
+pub extern "C-unwind" fn luaL_ref(L: *mut lua_State, _t: c_int) -> c_int {
     const LUA_REFNIL: c_int = -1;
     const LUA_NOREF: c_int = -2;
 
@@ -1485,7 +1497,7 @@ pub extern "C" fn luaL_ref(L: *mut lua_State, _t: c_int) -> c_int {
 
 /// luaL_unref: 释放引用（简化实现，不回收）
 #[no_mangle]
-pub extern "C" fn luaL_unref(L: *mut lua_State, _t: c_int, ref_: c_int) {
+pub extern "C-unwind" fn luaL_unref(L: *mut lua_State, _t: c_int, ref_: c_int) {
     let L = unsafe { &mut *L };
     if ref_ == -1 || ref_ == -2 {
         return; // LUA_REFNIL 或 LUA_NOREF
@@ -1703,7 +1715,7 @@ unsafe extern "C" fn l_alloc_shim(
 }
 
 #[no_mangle]
-pub extern "C" fn lua_getallocf(L: *mut lua_State, ud: *mut *mut c_void) -> lua_Alloc {
+pub extern "C-unwind" fn lua_getallocf(L: *mut lua_State, ud: *mut *mut c_void) -> lua_Alloc {
     let L = unsafe { &*L };
     match L.mem.allocator.allocf_parts() {
         Some((Some(f), allocf_ud)) => {
@@ -1731,7 +1743,7 @@ pub extern "C" fn lua_getallocf(L: *mut lua_State, ud: *mut *mut c_void) -> lua_
 /// CapiAllocator 原地更新 allocf/ud；当前为纯 Rust 分配器时整体替换为
 /// CapiAllocator（此后 lmem 层 C 风格分配原语即经宿主 allocator 执行）。
 #[no_mangle]
-pub extern "C" fn lua_setallocf(L: *mut lua_State, f: lua_Alloc, ud: *mut c_void) {
+pub extern "C-unwind" fn lua_setallocf(L: *mut lua_State, f: lua_Alloc, ud: *mut c_void) {
     let L = unsafe { &mut *L };
     let g = L.g_mut();
     if !g.mem.allocator.set_allocf(f, ud) {
@@ -1781,7 +1793,7 @@ pub extern "C-unwind" fn lua_newuserdatauv(
 ///
 /// 将 idx 处对象的元表（若有）压栈，返回 1；否则压 nil 返回 0。
 #[no_mangle]
-pub extern "C" fn lua_getmetatable(L: *mut lua_State, objindex: c_int) -> c_int {
+pub extern "C-unwind" fn lua_getmetatable(L: *mut lua_State, objindex: c_int) -> c_int {
     if is_registry(objindex) {
         // registry 没有元表，不 push 任何东西（对应 C Lua 语义）
         return 0;
@@ -1814,7 +1826,7 @@ pub extern "C" fn lua_getmetatable(L: *mut lua_State, objindex: c_int) -> c_int 
 /// 这对 C 模块（如 lsqlite3）至关重要：__gc 会在 Rc drop 前被调用，
 /// 让模块有机会清理 registry 中的 light userdata 引用，避免悬空指针。
 #[no_mangle]
-pub extern "C" fn lua_setmetatable(L: *mut lua_State, objindex: c_int) -> c_int {
+pub extern "C-unwind" fn lua_setmetatable(L: *mut lua_State, objindex: c_int) -> c_int {
     let L = unsafe { &mut *L };
     // IMPORTANT: resolve object offset BEFORE popping metatable,
     // because the metatable is at stack top and objindex is relative
@@ -1893,7 +1905,7 @@ pub extern "C" fn lua_setmetatable(L: *mut lua_State, objindex: c_int) -> c_int 
 /// 对应 C 的 lua_pcallk。以保护模式调用函数。
 /// 简化实现：不支持 continuation（k 参数被忽略）。
 #[no_mangle]
-pub extern "C" fn lua_pcallk(
+pub extern "C-unwind" fn lua_pcallk(
     L: *mut lua_State,
     nargs: c_int,
     nresults: c_int,
@@ -1921,7 +1933,7 @@ pub extern "C" fn lua_pcallk(
 /// 即压入线程对象本身（不是布尔值），主线程返回 1，协程返回 0。
 /// 当前协程对象通过 ThreadContext.thread_ref 取得（与 coroutine.running 一致）。
 #[no_mangle]
-pub extern "C" fn lua_pushthread(L: *mut lua_State) -> c_int {
+pub extern "C-unwind" fn lua_pushthread(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     let (thread_val, is_main) = match L.current_thread_ctx() {
         Some(ctx) => {
@@ -1977,7 +1989,7 @@ pub extern "C" fn lua_pushthread(L: *mut lua_State) -> c_int {
 /// 例如栈 [..., table, key]，idx=-2 指向 table；如果先 pop key，
 /// idx=-2 会指向 table 下面的元素。
 #[no_mangle]
-pub extern "C" fn lua_next(L: *mut lua_State, idx: c_int) -> c_int {
+pub extern "C-unwind" fn lua_next(L: *mut lua_State, idx: c_int) -> c_int {
     let L = unsafe { &mut *L };
     // 先用 idx 定位 table（key 还在栈上），再 pop key
     let off = match index2offset(L, idx) {
@@ -2013,7 +2025,7 @@ pub extern "C" fn lua_next(L: *mut lua_State, idx: c_int) -> c_int {
 ///
 /// 计算 idx 处值的长度，结果压栈。
 #[no_mangle]
-pub extern "C" fn lua_len(L: *mut lua_State, idx: c_int) {
+pub extern "C-unwind" fn lua_len(L: *mut lua_State, idx: c_int) {
     let L = unsafe { &mut *L };
     let len = L.len(idx as isize);
     L.stack.push(TValue::Integer(len as lua_Integer));
@@ -2023,7 +2035,7 @@ pub extern "C" fn lua_len(L: *mut lua_State, idx: c_int) {
 ///
 /// 连接栈顶 n 个值，结果压栈。
 #[no_mangle]
-pub extern "C" fn lua_concat(L: *mut lua_State, n: c_int) {
+pub extern "C-unwind" fn lua_concat(L: *mut lua_State, n: c_int) {
     let L = unsafe { &mut *L };
     if n <= 0 {
         L.stack.push(L.intern_str(""));
@@ -2053,7 +2065,7 @@ pub extern "C" fn lua_concat(L: *mut lua_State, n: c_int) {
 ///
 /// 比较 idx1 和 idx2 处的值，相等返回 1，否则 0。
 #[no_mangle]
-pub extern "C" fn lua_rawequal(L: *mut lua_State, idx1: c_int, idx2: c_int) -> c_int {
+pub extern "C-unwind" fn lua_rawequal(L: *mut lua_State, idx1: c_int, idx2: c_int) -> c_int {
     let L = unsafe { &*L };
     match (index2val(L, idx1), index2val(L, idx2)) {
         (Some(v1), Some(v2)) => {
@@ -2094,7 +2106,12 @@ pub extern "C" fn lua_rawequal(L: *mut lua_State, idx1: c_int, idx2: c_int) -> c
 ///
 /// op: 0=EQ, 1=LT, 2=LE
 #[no_mangle]
-pub extern "C" fn lua_compare(L: *mut lua_State, idx1: c_int, idx2: c_int, op: c_int) -> c_int {
+pub extern "C-unwind" fn lua_compare(
+    L: *mut lua_State,
+    idx1: c_int,
+    idx2: c_int,
+    op: c_int,
+) -> c_int {
     let L = unsafe { &*L };
     let v1 = match index2val(L, idx1) {
         Some(v) => v,
@@ -2177,7 +2194,7 @@ pub extern "C" fn lua_compare(L: *mut lua_State, idx1: c_int, idx2: c_int, op: c
 ///     OPUNM=12, OPBNOT=13
 /// 从栈顶操作，结果压栈（弹出操作数，压入结果）。
 #[no_mangle]
-pub extern "C" fn lua_arith(L: *mut lua_State, op: c_int) {
+pub extern "C-unwind" fn lua_arith(L: *mut lua_State, op: c_int) {
     let L = unsafe { &mut *L };
     let rb = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
     let ra = if op != 12 && op != 13 {
@@ -2324,7 +2341,7 @@ pub extern "C" fn lua_arith(L: *mut lua_State, op: c_int) {
 
 /// lua_version: 返回 Lua 版本号。
 #[no_mangle]
-pub extern "C" fn lua_version(_L: *mut lua_State) -> lua_Number {
+pub extern "C-unwind" fn lua_version(_L: *mut lua_State) -> lua_Number {
     // 对应 C 的 `return cast_num(LUA_VERSION_NUM);`
     crate::config::VERSION_NUM as lua_Number
 }
@@ -2338,7 +2355,7 @@ pub extern "C" fn lua_version(_L: *mut lua_State) -> lua_Number {
 /// what: LUA_GCSTOP=0, LUA_GCRESTART=1, LUA_GCCOLLECT=2,
 ///       LUA_GCCOUNT=3, LUA_GCSTEP=5, LUA_GCSETPAUSE=6,
 #[no_mangle]
-pub unsafe extern "C" fn lua_gc(L: *mut lua_State, what: c_int, _arg: c_int) -> c_int {
+pub unsafe extern "C-unwind" fn lua_gc(L: *mut lua_State, what: c_int, _arg: c_int) -> c_int {
     let L = unsafe { &mut *L };
     // 规约 R1：capi 入口先重绑 `l_g` / `G.main`。宿主从 Rust 侧持有 `LuaState`
     // 局部变量（`let mut st = LuaState::default()`）时，构造点地址在移动后失效 ——
@@ -2400,7 +2417,7 @@ pub unsafe extern "C" fn lua_gc(L: *mut lua_State, what: c_int, _arg: c_int) -> 
 
 /// lua_geti: t[n]，结果压栈。
 #[no_mangle]
-pub extern "C" fn lua_geti(L: *mut lua_State, idx: c_int, n: lua_Integer) -> c_int {
+pub extern "C-unwind" fn lua_geti(L: *mut lua_State, idx: c_int, n: lua_Integer) -> c_int {
     let L = unsafe { &mut *L };
     let key = TValue::Integer(n);
     if is_registry(idx) {
@@ -2427,7 +2444,7 @@ pub extern "C" fn lua_geti(L: *mut lua_State, idx: c_int, n: lua_Integer) -> c_i
 
 /// lua_seti: t[n] = v，v 从栈顶弹出。
 #[no_mangle]
-pub extern "C" fn lua_seti(L: *mut lua_State, idx: c_int, n: lua_Integer) {
+pub extern "C-unwind" fn lua_seti(L: *mut lua_State, idx: c_int, n: lua_Integer) {
     let L = unsafe { &mut *L };
     if is_registry(idx) {
         let val = L.pop_slot().unwrap_or(TValue::Nil(NilKind::Strict));
@@ -2475,7 +2492,7 @@ unsafe extern "C" fn panic_noop(_L: *mut c_void) -> c_int {
 }
 
 #[no_mangle]
-pub extern "C" fn lua_atpanic(_L: *mut lua_State, _panicf: lua_CFunction) -> lua_CFunction {
+pub extern "C-unwind" fn lua_atpanic(_L: *mut lua_State, _panicf: lua_CFunction) -> lua_CFunction {
     // TODO 简化实现：不存储 panic 处理器，总是返回静态的 no-op 函数
     // 这确保 C 模块尝试调用/比较返回的 panic 处理器时不会遇到 null 指针
     default_panic_handler
@@ -2523,7 +2540,11 @@ pub type lua_WarnFunction = extern "C" fn(ud: *mut c_void, msg: *const c_char, t
 ///   ...
 /// 将 call_info 索引存储在 ar.i_ci 中供 lua_getinfo 使用。
 #[no_mangle]
-pub extern "C" fn lua_getstack(L: *mut lua_State, level: c_int, ar: *mut lua_Debug) -> c_int {
+pub extern "C-unwind" fn lua_getstack(
+    L: *mut lua_State,
+    level: c_int,
+    ar: *mut lua_Debug,
+) -> c_int {
     if level < 0 || ar.is_null() {
         return 0;
     }
@@ -2553,7 +2574,11 @@ pub extern "C" fn lua_getstack(L: *mut lua_State, level: c_int, ar: *mut lua_Deb
 ///   'l' - currentline
 ///   'u' - nups, nparams, isvararg
 #[no_mangle]
-pub extern "C" fn lua_getinfo(L: *mut lua_State, what: *const c_char, ar: *mut lua_Debug) -> c_int {
+pub extern "C-unwind" fn lua_getinfo(
+    L: *mut lua_State,
+    what: *const c_char,
+    ar: *mut lua_Debug,
+) -> c_int {
     if ar.is_null() || what.is_null() {
         return 0;
     }
@@ -2743,7 +2768,7 @@ pub extern "C" fn lua_getinfo(L: *mut lua_State, what: *const c_char, ar: *mut l
 /// reader 是读取回调，data 是回调参数，chunkname 是代码块名称，mode 是编译模式。
 /// 加载成功返回 0，失败返回错误码。
 #[no_mangle]
-pub extern "C" fn lua_load(
+pub extern "C-unwind" fn lua_load(
     L: *mut lua_State,
     reader: lua_Reader,
     data: *mut c_void,
@@ -2775,7 +2800,7 @@ pub extern "C" fn lua_load(
 }
 /// lua_setwarnf: 设置警告回调（简化实现：忽略）
 #[no_mangle]
-pub extern "C" fn lua_setwarnf(_L: *mut lua_State, _f: lua_WarnFunction, _ud: *mut c_void) {
+pub extern "C-unwind" fn lua_setwarnf(_L: *mut lua_State, _f: lua_WarnFunction, _ud: *mut c_void) {
     // TODO 简化实现：不存储警告回调
 }
 
@@ -2783,7 +2808,11 @@ pub extern "C" fn lua_setwarnf(_L: *mut lua_State, _f: lua_WarnFunction, _ud: *m
 ///
 /// 返回写入的字节数（不含终止 null）。
 #[no_mangle]
-pub extern "C" fn lua_numbertocstring(L: *mut lua_State, idx: c_int, buff: *mut c_char) -> u32 {
+pub extern "C-unwind" fn lua_numbertocstring(
+    L: *mut lua_State,
+    idx: c_int,
+    buff: *mut c_char,
+) -> u32 {
     let state = unsafe { &mut *L };
     let off = match index2offset(state, idx) {
         Some(o) => o,
@@ -2804,19 +2833,19 @@ pub extern "C" fn lua_numbertocstring(L: *mut lua_State, idx: c_int, buff: *mut 
 
 /// lua_toclose: 标记栈上值在离开作用域时关闭（简化实现：忽略）
 #[no_mangle]
-pub extern "C" fn lua_toclose(_L: *mut lua_State, _idx: c_int) {
+pub extern "C-unwind" fn lua_toclose(_L: *mut lua_State, _idx: c_int) {
     // TODO 简化实现：不支持 to-close 变量
 }
 
 /// lua_closeslot: 关闭 to-close 槽（简化实现：忽略）
 #[no_mangle]
-pub extern "C" fn lua_closeslot(_L: *mut lua_State, _idx: c_int) {
+pub extern "C-unwind" fn lua_closeslot(_L: *mut lua_State, _idx: c_int) {
     // TODO 简化实现
 }
 
 /// lua_topointer: 返回值的内部指针
 #[no_mangle]
-pub extern "C" fn lua_topointer(L: *mut lua_State, idx: c_int) -> *const c_void {
+pub extern "C-unwind" fn lua_topointer(L: *mut lua_State, idx: c_int) -> *const c_void {
     let state = unsafe { &mut *L };
     let off = match index2offset(state, idx) {
         Some(o) => o,
@@ -2854,7 +2883,7 @@ pub extern "C" fn lua_topointer(L: *mut lua_State, idx: c_int) -> *const c_void 
 /// 调用方须保证 `s` 至少 `len + 1` 字节可读、`s[len] == '\0'`，且缓冲区在
 /// Lua 调用 `dealloc` 之前保持有效（C API 契约）。
 #[no_mangle]
-pub extern "C" fn lua_pushexternalstring(
+pub extern "C-unwind" fn lua_pushexternalstring(
     L: *mut lua_State,
     s: *const c_char,
     len: usize,
@@ -2886,7 +2915,7 @@ pub extern "C" fn lua_pushexternalstring(
 /// 对应 C lauxlib.cpp 的 luaL_loadbufferx。
 /// 用 lua_load + reader 回调实现。
 #[no_mangle]
-pub extern "C" fn luaL_loadbufferx(
+pub extern "C-unwind" fn luaL_loadbufferx(
     L: *mut lua_State,
     buff: *const c_char,
     size: usize,
@@ -2932,7 +2961,7 @@ pub extern "C" fn luaL_loadbufferx(
 
 /// luaL_loadbuffer: 兼容宏（luaL_loadbufferx with mode=NULL）
 #[no_mangle]
-pub extern "C" fn luaL_loadbuffer(
+pub extern "C-unwind" fn luaL_loadbuffer(
     L: *mut lua_State,
     buff: *const c_char,
     size: usize,
@@ -2947,7 +2976,7 @@ pub extern "C" fn luaL_loadbuffer(
 /// `luaL_loadbufferx` 加载。`filename` 为 NULL 时从 stdin 读取。
 /// `mode` 为 "b"（仅字节码）、"t"（仅文本）、"bt"（两者皆可）或 NULL。
 #[no_mangle]
-pub extern "C" fn luaL_loadfilex(
+pub extern "C-unwind" fn luaL_loadfilex(
     L: *mut lua_State,
     filename: *const c_char,
     mode: *const c_char,
@@ -3032,7 +3061,7 @@ pub extern "C" fn luaL_loadfilex(
 
 /// luaL_loadstring: 加载字符串
 #[no_mangle]
-pub extern "C" fn luaL_loadstring(L: *mut lua_State, s: *const c_char) -> c_int {
+pub extern "C-unwind" fn luaL_loadstring(L: *mut lua_State, s: *const c_char) -> c_int {
     if s.is_null() {
         return 3; // LUA_ERRSYNTAX
     }
@@ -3045,7 +3074,7 @@ pub extern "C" fn luaL_loadstring(L: *mut lua_State, s: *const c_char) -> c_int 
 ///
 /// 返回值的类型（LUA_TNIL 如果不存在）。
 #[no_mangle]
-pub extern "C" fn luaL_getmetatable(L: *mut lua_State, name: *const c_char) -> c_int {
+pub extern "C-unwind" fn luaL_getmetatable(L: *mut lua_State, name: *const c_char) -> c_int {
     let L = unsafe { &mut *L };
     let name_str = if name.is_null() {
         String::new()
@@ -3065,7 +3094,7 @@ pub extern "C" fn luaL_getmetatable(L: *mut lua_State, name: *const c_char) -> c
 ///
 /// 如果已存在返回 0（不创建），否则创建并返回 1。
 #[no_mangle]
-pub extern "C" fn luaL_newmetatable(L: *mut lua_State, tname: *const c_char) -> c_int {
+pub extern "C-unwind" fn luaL_newmetatable(L: *mut lua_State, tname: *const c_char) -> c_int {
     let L = unsafe { &mut *L };
     let tname = if tname.is_null() {
         String::new()
@@ -3119,7 +3148,11 @@ pub extern "C" fn luaL_newmetatable(L: *mut lua_State, tname: *const c_char) -> 
 ///
 /// 如果不存在则创建。成功返回 1，失败返回 0。
 #[no_mangle]
-pub extern "C" fn luaL_getsubtable(L: *mut lua_State, idx: c_int, fname: *const c_char) -> c_int {
+pub extern "C-unwind" fn luaL_getsubtable(
+    L: *mut lua_State,
+    idx: c_int,
+    fname: *const c_char,
+) -> c_int {
     // 获取 t[idx]
     lua_getfield(L, idx, fname);
     let L = unsafe { &mut *L };
@@ -3170,7 +3203,7 @@ pub extern "C-unwind" fn luaL_checkstack(L: *mut lua_State, space: c_int, msg: *
 ///
 /// push "chunkname:line: " 到栈顶。
 #[no_mangle]
-pub extern "C" fn luaL_where(L: *mut lua_State, _level: c_int) {
+pub extern "C-unwind" fn luaL_where(L: *mut lua_State, _level: c_int) {
     // 简化实现：push 空字符串（Rust 实现的调试信息结构与 C 不同）
     let L = unsafe { &mut *L };
     L.push_string("");
@@ -3196,7 +3229,7 @@ extern "C-unwind" fn luaL_error_rust(L: *mut lua_State, fmt: *const c_char) -> c
 ///
 /// 调用 openf 打开模块，注册到 package.loaded，可选注册到全局表。
 #[no_mangle]
-pub extern "C" fn luaL_requiref(
+pub extern "C-unwind" fn luaL_requiref(
     L: *mut lua_State,
     modname: *const c_char,
     openf: lua_CFunction,
@@ -3308,7 +3341,7 @@ pub extern "C" fn luaL_requiref(
 /// 对应 C lapi.cpp 的 lua_xmove。
 /// 从 from 栈顶弹出 n 个值，push 到 to 栈顶。
 #[no_mangle]
-pub extern "C" fn lua_xmove(from: *mut lua_State, to: *mut lua_State, n: c_int) {
+pub extern "C-unwind" fn lua_xmove(from: *mut lua_State, to: *mut lua_State, n: c_int) {
     if from == to || n <= 0 {
         return;
     }
@@ -3329,7 +3362,7 @@ pub extern "C" fn lua_xmove(from: *mut lua_State, to: *mut lua_State, n: c_int) 
 
 /// lua_pushglobaltable: push 全局表到栈顶
 #[no_mangle]
-pub extern "C" fn lua_pushglobaltable(L: *mut lua_State) {
+pub extern "C-unwind" fn lua_pushglobaltable(L: *mut lua_State) {
     let L = unsafe { &mut *L };
     L.stack.push(TValue::Table(L.globals.clone()));
 }
@@ -3339,7 +3372,7 @@ pub extern "C" fn lua_pushglobaltable(L: *mut lua_State) {
 /// 简化实现：只 push msg（如果非空），不生成完整栈回溯。
 /// Rust lua 的调试信息结构与 C 不同，完整实现需要 lua_getstack/lua_getinfo。
 #[no_mangle]
-pub extern "C" fn luaL_traceback(
+pub extern "C-unwind" fn luaL_traceback(
     L: *mut lua_State,
     _L1: *mut lua_State,
     msg: *const c_char,
@@ -3369,7 +3402,7 @@ pub extern "C" fn luaL_traceback(
 /// 在 lualib.h 中定义为 `luaL_openselectedlibs(L, ~0, 0)`，skynet 等第三方 C
 /// 代码会调用 `luaL_openlibs`，此函数确保标准库被正确初始化。
 #[no_mangle]
-pub extern "C" fn luaL_openselectedlibs(L: *mut lua_State, _load: c_int, _preload: c_int) {
+pub extern "C-unwind" fn luaL_openselectedlibs(L: *mut lua_State, _load: c_int, _preload: c_int) {
     let L = unsafe { &mut *L };
     if let Err(e) = L.open_selected_libs(-1, 0) {
         raise_mem_error(L, e);
@@ -3378,7 +3411,7 @@ pub extern "C" fn luaL_openselectedlibs(L: *mut lua_State, _load: c_int, _preloa
 
 /// luaopen_base: 打开基础库
 #[no_mangle]
-pub extern "C" fn luaopen_base(L: *mut lua_State) -> c_int {
+pub extern "C-unwind" fn luaopen_base(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     if let Err(e) = crate::stdlib::base_lib::open_base_lib(L) {
         raise_mem_error(L, e);
@@ -3390,7 +3423,7 @@ pub extern "C" fn luaopen_base(L: *mut lua_State) -> c_int {
 
 /// luaopen_math: 打开数学库
 #[no_mangle]
-pub extern "C" fn luaopen_math(L: *mut lua_State) -> c_int {
+pub extern "C-unwind" fn luaopen_math(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     if let Err(e) = crate::stdlib::math_lib::open_math_lib(L) {
         raise_mem_error(L, e);
@@ -3407,7 +3440,7 @@ pub extern "C" fn luaopen_math(L: *mut lua_State) -> c_int {
 
 /// luaopen_string: 打开字符串库
 #[no_mangle]
-pub extern "C" fn luaopen_string(L: *mut lua_State) -> c_int {
+pub extern "C-unwind" fn luaopen_string(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     if let Err(e) = crate::stdlib::string_lib::open_string_lib(L) {
         raise_mem_error(L, e);
@@ -3420,7 +3453,7 @@ pub extern "C" fn luaopen_string(L: *mut lua_State) -> c_int {
 
 /// luaopen_os: 打开 OS 库
 #[no_mangle]
-pub extern "C" fn luaopen_os(L: *mut lua_State) -> c_int {
+pub extern "C-unwind" fn luaopen_os(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     if let Err(e) = crate::stdlib::os_lib::open_os_lib(L) {
         raise_mem_error(L, e);
@@ -3433,7 +3466,7 @@ pub extern "C" fn luaopen_os(L: *mut lua_State) -> c_int {
 
 /// luaopen_coroutine: 打开协程库
 #[no_mangle]
-pub extern "C" fn luaopen_coroutine(L: *mut lua_State) -> c_int {
+pub extern "C-unwind" fn luaopen_coroutine(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     if let Err(e) = crate::stdlib::coroutine_lib::open_coroutine_lib(L) {
         raise_mem_error(L, e);
@@ -3446,7 +3479,7 @@ pub extern "C" fn luaopen_coroutine(L: *mut lua_State) -> c_int {
 
 /// luaopen_table: 打开 table 库
 #[no_mangle]
-pub extern "C" fn luaopen_table(L: *mut lua_State) -> c_int {
+pub extern "C-unwind" fn luaopen_table(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     if let Err(e) = crate::stdlib::table_lib::open_table_lib(L) {
         raise_mem_error(L, e);
@@ -3459,7 +3492,7 @@ pub extern "C" fn luaopen_table(L: *mut lua_State) -> c_int {
 
 /// luaopen_io: 打开 IO 库
 #[no_mangle]
-pub extern "C" fn luaopen_io(L: *mut lua_State) -> c_int {
+pub extern "C-unwind" fn luaopen_io(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     if let Err(e) = crate::stdlib::io_lib::open_io_lib(L) {
         raise_mem_error(L, e);
@@ -3472,7 +3505,7 @@ pub extern "C" fn luaopen_io(L: *mut lua_State) -> c_int {
 
 /// luaopen_debug: 打开 debug 库
 #[no_mangle]
-pub extern "C" fn luaopen_debug(L: *mut lua_State) -> c_int {
+pub extern "C-unwind" fn luaopen_debug(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     if let Err(e) = crate::stdlib::debug_lib::open_debug_lib(L) {
         raise_mem_error(L, e);
@@ -3485,7 +3518,7 @@ pub extern "C" fn luaopen_debug(L: *mut lua_State) -> c_int {
 
 /// luaopen_utf8: 打开 utf8 库
 #[no_mangle]
-pub extern "C" fn luaopen_utf8(L: *mut lua_State) -> c_int {
+pub extern "C-unwind" fn luaopen_utf8(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     if let Err(e) = crate::stdlib::utf8_lib::open_utf8_lib(L) {
         raise_mem_error(L, e);
@@ -3501,7 +3534,7 @@ pub extern "C" fn luaopen_utf8(L: *mut lua_State) -> c_int {
 /// Rust 实现中 package 表由 open_base_lib 初始化，
 /// 这里直接返回 package 表。
 #[no_mangle]
-pub extern "C" fn luaopen_package(L: *mut lua_State) -> c_int {
+pub extern "C-unwind" fn luaopen_package(L: *mut lua_State) -> c_int {
     let L = unsafe { &mut *L };
     // package 表已在 open_base_lib 中初始化
     let key = L.intern_str("package");
@@ -3840,7 +3873,11 @@ pub extern "C-unwind" fn luaL_checkudata(
 /// 对应 C lauxlib.cpp::luaL_getmetafield。先 lua_getmetatable 获取元表，
 /// 然后 lua_rawget 查找字段；nil 时弹出元表和字段，返回 LUA_TNIL。
 #[no_mangle]
-pub extern "C" fn luaL_getmetafield(L: *mut lua_State, obj: c_int, event: *const c_char) -> c_int {
+pub extern "C-unwind" fn luaL_getmetafield(
+    L: *mut lua_State,
+    obj: c_int,
+    event: *const c_char,
+) -> c_int {
     // 没有元表：返回 LUA_TNIL（不压栈）
     if lua_getmetatable(L, obj) == 0 {
         return LUA_TNIL;
@@ -3957,7 +3994,7 @@ pub extern "C-unwind" fn luaL_tolstring(
 /// 简化点：C 版本会 push 一个 light userdata 占位符到栈顶（供 addvalue 的
 /// prepbuffsize 错误路径使用），此简化版不 push 占位符，buffer 期间栈深度不变。
 #[no_mangle]
-pub extern "C" fn luaL_buffinit(L: *mut lua_State, B: *mut luaL_Buffer) {
+pub extern "C-unwind" fn luaL_buffinit(L: *mut lua_State, B: *mut luaL_Buffer) {
     if B.is_null() {
         return;
     }
@@ -3975,7 +4012,7 @@ pub extern "C" fn luaL_buffinit(L: *mut lua_State, B: *mut luaL_Buffer) {
 /// - 若当前用的是 init 内联缓冲区，malloc 新内存并拷贝
 /// - 若当前用的是堆内存，realloc 扩容
 #[no_mangle]
-pub extern "C" fn luaL_prepbuffsize(B: *mut luaL_Buffer, sz: usize) -> *mut c_char {
+pub extern "C-unwind" fn luaL_prepbuffsize(B: *mut luaL_Buffer, sz: usize) -> *mut c_char {
     if B.is_null() {
         return ptr::null_mut();
     }
@@ -4011,7 +4048,7 @@ pub extern "C" fn luaL_prepbuffsize(B: *mut luaL_Buffer, sz: usize) -> *mut c_ch
 ///
 /// 对应 C lauxlib.cpp::luaL_addlstring。l=0 时不操作（避免 NULL 解引用）。
 #[no_mangle]
-pub extern "C" fn luaL_addlstring(B: *mut luaL_Buffer, s: *const c_char, l: usize) {
+pub extern "C-unwind" fn luaL_addlstring(B: *mut luaL_Buffer, s: *const c_char, l: usize) {
     if B.is_null() || s.is_null() || l == 0 {
         return;
     }
@@ -4030,7 +4067,7 @@ pub extern "C" fn luaL_addlstring(B: *mut luaL_Buffer, s: *const c_char, l: usiz
 /// 对应 C lauxlib.cpp::luaL_addvalue。用 lua_tolstring 获取栈顶字符串，
 /// 调用 luaL_addlstring 追加，然后 lua_pop 弹出栈顶值。
 #[no_mangle]
-pub extern "C" fn luaL_addvalue(B: *mut luaL_Buffer) {
+pub extern "C-unwind" fn luaL_addvalue(B: *mut luaL_Buffer) {
     if B.is_null() {
         return;
     }
@@ -4051,7 +4088,7 @@ pub extern "C" fn luaL_addvalue(B: *mut luaL_Buffer) {
 /// 对应 C lauxlib.cpp::luaL_pushresult。用 lua_pushlstring 把 buffer 内容
 /// 压栈，然后释放堆分配的缓冲区（若已扩容）。
 #[no_mangle]
-pub extern "C" fn luaL_pushresult(B: *mut luaL_Buffer) {
+pub extern "C-unwind" fn luaL_pushresult(B: *mut luaL_Buffer) {
     if B.is_null() {
         return;
     }
@@ -4076,7 +4113,7 @@ pub extern "C" fn luaL_pushresult(B: *mut luaL_Buffer) {
 /// 对应 C lauxlib.cpp::luaL_pushresultsize。先 `luaL_addsize(B, sz)`（即
 /// `B->n += sz`，对应 C 中的宏），再调用 `luaL_pushresult` 把结果压栈。
 #[no_mangle]
-pub extern "C" fn luaL_pushresultsize(B: *mut luaL_Buffer, sz: usize) {
+pub extern "C-unwind" fn luaL_pushresultsize(B: *mut luaL_Buffer, sz: usize) {
     if B.is_null() {
         return;
     }
@@ -4091,7 +4128,7 @@ pub extern "C" fn luaL_pushresultsize(B: *mut luaL_Buffer, sz: usize) {
 /// 对应 C lauxlib.cpp::luaL_addstring。内部用 `strlen(s)` 计算长度后调用
 /// `luaL_addlstring`。
 #[no_mangle]
-pub extern "C" fn luaL_addstring(B: *mut luaL_Buffer, s: *const c_char) {
+pub extern "C-unwind" fn luaL_addstring(B: *mut luaL_Buffer, s: *const c_char) {
     if B.is_null() || s.is_null() {
         return;
     }
@@ -4104,7 +4141,7 @@ pub extern "C" fn luaL_addstring(B: *mut luaL_Buffer, s: *const c_char) {
 /// 对应 C lauxlib.cpp::luaL_buffinitsize。先 luaL_buffinit，再 luaL_prepbuffsize。
 /// 返回可用空间起始指针。
 #[no_mangle]
-pub extern "C" fn luaL_buffinitsize(
+pub extern "C-unwind" fn luaL_buffinitsize(
     L: *mut lua_State,
     B: *mut luaL_Buffer,
     sz: usize,
@@ -4122,7 +4159,7 @@ pub extern "C" fn luaL_buffinitsize(
 /// 对应 C lapi.cpp::lua_getiuservalue。n 超出 [1, nuvalue] 范围时压 nil
 /// 返回 LUA_TNONE。
 #[no_mangle]
-pub extern "C" fn lua_getiuservalue(L: *mut lua_State, idx: c_int, n: c_int) -> c_int {
+pub extern "C-unwind" fn lua_getiuservalue(L: *mut lua_State, idx: c_int, n: c_int) -> c_int {
     let L = unsafe { &mut *L };
     let off = match index2offset(L, idx) {
         Some(o) => o,
@@ -4152,7 +4189,7 @@ pub extern "C" fn lua_getiuservalue(L: *mut lua_State, idx: c_int, n: c_int) -> 
 /// 对应 C lapi.cpp::lua_setiuservalue。n 超出范围时不设置（仍弹出值）。
 /// 返回 1 成功，0 失败（C 版本返回 int，此处省略返回值以匹配签名）。
 #[no_mangle]
-pub extern "C" fn lua_setiuservalue(L: *mut lua_State, idx: c_int, n: c_int) {
+pub extern "C-unwind" fn lua_setiuservalue(L: *mut lua_State, idx: c_int, n: c_int) {
     let L = unsafe { &mut *L };
     // 先基于当前 top（包含 val）定位 userdata，再 pop val
     let off = match index2offset(L, idx) {
@@ -4184,7 +4221,7 @@ pub extern "C" fn lua_setiuservalue(L: *mut lua_State, idx: c_int, n: c_int) {
 ///
 /// 对应 C lapi.cpp::lua_rawgetp。用 light userdata p 作为 key 查表。
 #[no_mangle]
-pub extern "C" fn lua_rawgetp(L: *mut lua_State, idx: c_int, p: *const c_void) -> c_int {
+pub extern "C-unwind" fn lua_rawgetp(L: *mut lua_State, idx: c_int, p: *const c_void) -> c_int {
     let L = unsafe { &mut *L };
     let key = TValue::LightUserData(p as *mut c_void);
     if is_registry(idx) {
@@ -4213,7 +4250,7 @@ pub extern "C" fn lua_rawgetp(L: *mut lua_State, idx: c_int, p: *const c_void) -
 ///
 /// 对应 C lapi.cpp::lua_rawsetp。用 light userdata p 作为 key 设置值。
 #[no_mangle]
-pub extern "C" fn lua_rawsetp(L: *mut lua_State, idx: c_int, p: *const c_void) {
+pub extern "C-unwind" fn lua_rawsetp(L: *mut lua_State, idx: c_int, p: *const c_void) {
     let L = unsafe { &mut *L };
     // 先基于当前 top（包含 val）定位 table，再 pop
     let key = TValue::LightUserData(p as *mut c_void);
@@ -4263,7 +4300,7 @@ pub extern "C" fn lua_rawsetp(L: *mut lua_State, idx: c_int, p: *const c_void) {
 /// 结果布局: [nil, result1, ..., resultM]，nres = M
 #[no_mangle]
 #[cfg(not(feature = "cmp_c"))]
-pub extern "C" fn lua_resume(
+pub extern "C-unwind" fn lua_resume(
     L: *mut lua_State,
     from: *mut lua_State,
     nargs: c_int,
@@ -4298,7 +4335,7 @@ pub extern "C" fn lua_resume(
 
 #[no_mangle]
 #[cfg(feature = "cmp_c")]
-pub extern "C" fn lua_resume(
+pub extern "C-unwind" fn lua_resume(
     L: *mut lua_State,
     _from: *mut lua_State,
     nargs: c_int,
@@ -4314,7 +4351,7 @@ pub extern "C" fn lua_resume(
 /// 此实现设置 pending_yield 暂存 yield 值并返回 LUA_YIELD。
 /// 若在非协程上下文调用（pending_yield 被忽略），调用方需自行处理。
 #[no_mangle]
-pub extern "C" fn lua_yieldk(
+pub extern "C-unwind" fn lua_yieldk(
     L: *mut lua_State,
     nresults: c_int,
     _ctx: lua_KContext,
@@ -4340,7 +4377,7 @@ pub extern "C" fn lua_yieldk(
 /// 对应 C lapi.cpp::lua_status。主线程返回 LUA_OK。
 /// 若 current_thread 存在（协程执行中），返回协程的 status 映射值。
 #[no_mangle]
-pub extern "C" fn lua_status(L: *mut lua_State) -> c_int {
+pub extern "C-unwind" fn lua_status(L: *mut lua_State) -> c_int {
     let L = unsafe { &*L };
     if let Some(ctx) = L.current_thread_ctx() {
         let status = ctx.borrow().status;
@@ -4368,7 +4405,7 @@ pub extern "C" fn lua_status(L: *mut lua_State) -> c_int {
 /// 惰性创建关联的 GlobalState：共享当前 L 的全局状态，设置 current_thread，
 /// 并把 LuaThread.function push 到新 state 栈底（供 lua_resume 首次执行）。
 #[no_mangle]
-pub extern "C" fn lua_tothread(L: *mut lua_State, idx: c_int) -> *mut lua_State {
+pub extern "C-unwind" fn lua_tothread(L: *mut lua_State, idx: c_int) -> *mut lua_State {
     let L_ref = unsafe { &mut *L };
     let thread_rc = match index2val(L_ref, idx) {
         Some(TValue::Thread(t)) => t.clone(),
@@ -4403,7 +4440,7 @@ pub extern "C" fn lua_tothread(L: *mut lua_State, idx: c_int) -> *mut lua_State 
 /// 因此钩子掩码被正确设置，但钩子不会实际触发。
 /// func=NULL 或 mask=0 时清除所有钩子。
 #[no_mangle]
-pub extern "C" fn lua_sethook(
+pub extern "C-unwind" fn lua_sethook(
     L: *mut lua_State,
     func: Option<lua_Hook>,
     mask: c_int,
@@ -4438,7 +4475,11 @@ pub extern "C" fn lua_sethook(
 /// 返回 NULL 表示 n 超出范围或不是闭包. C 闭包返回 "" (空字符串),
 /// Lua 闭包返回上值名 (无名称时返回 "(no name)").
 #[no_mangle]
-pub extern "C" fn lua_getupvalue(L: *mut lua_State, funcindex: c_int, n: c_int) -> *const c_char {
+pub extern "C-unwind" fn lua_getupvalue(
+    L: *mut lua_State,
+    funcindex: c_int,
+    n: c_int,
+) -> *const c_char {
     let L = unsafe { &mut *L };
     let n = n as usize;
     if n == 0 {
@@ -4501,7 +4542,11 @@ pub extern "C" fn lua_getupvalue(L: *mut lua_State, funcindex: c_int, n: c_int) 
 
 /// lua_setupvalue: 设置函数的第 n 个上值为栈顶值, 弹出并返回名称.
 #[no_mangle]
-pub extern "C" fn lua_setupvalue(L: *mut lua_State, funcindex: c_int, n: c_int) -> *const c_char {
+pub extern "C-unwind" fn lua_setupvalue(
+    L: *mut lua_State,
+    funcindex: c_int,
+    n: c_int,
+) -> *const c_char {
     let L = unsafe { &mut *L };
     let n = n as usize;
     if n == 0 {
@@ -4576,7 +4621,7 @@ pub extern "C" fn lua_setupvalue(L: *mut lua_State, funcindex: c_int, n: c_int) 
 /// Lua 闭包返回 UpVal 的 Rc 指针, C 闭包返回 upvalue TValue 的地址.
 /// 轻量 C 函数返回 NULL.
 #[no_mangle]
-pub extern "C" fn lua_upvalueid(L: *mut lua_State, fidx: c_int, n: c_int) -> *mut c_void {
+pub extern "C-unwind" fn lua_upvalueid(L: *mut lua_State, fidx: c_int, n: c_int) -> *mut c_void {
     let L = unsafe { &*L };
     let n = n as usize;
     if n == 0 {
@@ -4611,7 +4656,7 @@ pub extern "C" fn lua_upvalueid(L: *mut lua_State, fidx: c_int, n: c_int) -> *mu
 ///
 /// 仅支持 Lua 闭包 (LClosure). 对应 C 的 lua_upvaluejoin.
 #[no_mangle]
-pub extern "C" fn lua_upvaluejoin(
+pub extern "C-unwind" fn lua_upvaluejoin(
     L: *mut lua_State,
     fidx1: c_int,
     n1: c_int,
@@ -4675,7 +4720,7 @@ pub extern "C" fn luaL_alloc(
 /// 调用方: lua-sharetable.c:177 (matrix_from_file), skynet codecache 内部.
 #[cfg(feature = "skynet")]
 #[no_mangle]
-pub extern "C" fn luaL_loadfilex_(
+pub extern "C-unwind" fn luaL_loadfilex_(
     L: *mut lua_State,
     filename: *const c_char,
     mode: *const c_char,
@@ -4689,7 +4734,7 @@ pub extern "C" fn luaL_loadfilex_(
 /// TODO
 #[cfg(feature = "skynet")]
 #[no_mangle]
-pub extern "C" fn lua_clonetable(L: *mut lua_State, _t: *const c_void) {
+pub extern "C-unwind" fn lua_clonetable(L: *mut lua_State, _t: *const c_void) {
     let L = unsafe { &mut *L };
     L.push_nil();
 }
@@ -4699,7 +4744,7 @@ pub extern "C" fn lua_clonetable(L: *mut lua_State, _t: *const c_void) {
 /// 调用方: lua-sharetable.c (sharefunction 路径).
 #[cfg(feature = "skynet")]
 #[no_mangle]
-pub extern "C" fn lua_sharefunction(_L: *mut lua_State, _index: c_int) {
+pub extern "C-unwind" fn lua_sharefunction(_L: *mut lua_State, _index: c_int) {
     // TODO stub: 不做任何操作. 调用方期望 function 被标记为 shared,
     // 但 lua-rs 无共享机制, 后续 lua_clonetable 会推 nil, 调用方应处理 nil 情况.
 }
@@ -4709,7 +4754,7 @@ pub extern "C" fn lua_sharefunction(_L: *mut lua_State, _index: c_int) {
 /// 调用方: lua-sharetable.c (sharestring 路径).
 #[cfg(feature = "skynet")]
 #[no_mangle]
-pub extern "C" fn lua_sharestring(_L: *mut lua_State, _index: c_int) {
+pub extern "C-unwind" fn lua_sharestring(_L: *mut lua_State, _index: c_int) {
     // TODO stub: 不做任何操作.
 }
 

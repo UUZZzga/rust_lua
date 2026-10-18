@@ -25,8 +25,9 @@
 //!   帧必须是 `C-unwind`（本文件的替身 C 函数一律如此声明后 transmute）。
 
 use lua_rs::capi::{
-    luaL_argerror, luaL_checklstring, luaL_checkstack, luaL_typeerror, lua_State,
-    lua_pushcfunction, lua_setglobal,
+    luaL_argerror, luaL_checklstring, luaL_checkstack, luaL_typeerror, lua_State, lua_createtable,
+    lua_getglobal, lua_pushcclosure, lua_pushcfunction, lua_pushinteger, lua_setglobal,
+    lua_settable,
 };
 use lua_rs::state::LuaState;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -298,4 +299,148 @@ fn deep_stack_growth_failure_is_caught_by_lua_pcall() {
         "编译后置检查失败"
     );
     assert_eq!(st.pcall(0, 0, 0), 0, "内存错误之后解释器应可继续工作");
+}
+
+// ============================================================================
+// 测试 3：plain `extern "C"` 的 capi 入口抛内存错误不得 abort (Windows 展开代价)
+// ============================================================================
+
+/// 从一个 `extern "C"`（nounwind）capi 入口**内部**抛内存错误。
+///
+/// `lua_settable` 的表增长分配失败 → `raise_mem_error` → longjmp 跳到最近的保护点，
+/// 展开必须穿过 `lua_settable` 自己的 Rust 帧。
+/// - POSIX：longjmp 不展开，最多泄漏（本测试在 Linux 上恒过）；
+/// - Windows/MSVC：longjmp 经 `RtlUnwind`，穿过 nounwind（`extern "C"`）帧会 abort
+///   （`panic_cannot_unwind`）—— 因此凡是**可能抛错**的 capi 入口都必须声明
+///   `C-unwind`（本测试即为此而设；修复前本测试会让测试进程直接死掉）。
+///
+/// 触发点选 `lua_settable`：表插入走 `try_reserve_for` → 漏斗 → 失败即
+/// `raise_mem_error`。400 次整数键插入必然出现一次 ≥ `FAIL_LARGE_MIN` 的哈希区扩容。
+unsafe extern "C-unwind" fn err_settable_oom(L: *mut c_void) -> c_int {
+    let L = L as *mut lua_State;
+    lua_createtable(L, 0, 0);
+    FAIL_LARGE_ARMED.store(1, Ordering::Relaxed);
+    let mut k: i64 = 0;
+    while k < 400 {
+        lua_pushinteger(L, k as _);
+        lua_pushinteger(L, k as _);
+        lua_settable(L, -3);
+        k += 1;
+    }
+    // 抛错时到不了这里: 由测试主体在 pcall 返回后解除注入
+    FAIL_LARGE_ARMED.store(0, Ordering::Relaxed);
+    0
+}
+
+#[test]
+fn capi_setter_oom_raise_does_not_abort() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut st = new_state();
+
+    let L = &mut st as *mut LuaState as *mut lua_State;
+    lua_pushcfunction(L, as_c_function(err_settable_oom));
+    lua_setglobal(L, c"err_settable_oom".as_ptr());
+
+    let hits_before = FAIL_LARGE_HITS.load(Ordering::Relaxed);
+    let probe = "local ok, err = pcall(err_settable_oom)\n\
+         assert(ok == false, 'capi setter 应当在分配失败时抛错')\n\
+         assert(err == 'not enough memory', '错误对象应为预注册 MEMERRMSG, 实为 ' .. tostring(err))\n\
+         return 'caught'\n";
+    assert_eq!(st.load_buffer(probe, "=oom_setter"), 0, "编译探针失败");
+    let status = st.pcall(0, 1, 0);
+    FAIL_LARGE_ARMED.store(0, Ordering::Relaxed);
+    let hits = FAIL_LARGE_HITS.load(Ordering::Relaxed) - hits_before;
+
+    assert_eq!(
+        status,
+        0,
+        "capi OOM 应被 Lua 层 pcall 捕获（status={status}, 错误={}）",
+        error_object(&st)
+    );
+    assert!(
+        hits >= 1,
+        "必须真的命中过大额分配失败（hits={hits}）, 否则本测试退化为空转"
+    );
+
+    assert_eq!(
+        st.load_buffer("assert(1 + 1 == 2); assert(#'abc' == 3)", "=oom_after"),
+        0,
+        "编译后置检查失败"
+    );
+    assert_eq!(st.pcall(0, 0, 0), 0, "OOM 之后解释器应可继续工作");
+}
+
+// ============================================================================
+// 测试 4：C 闭包抛错不得泄漏 VM 派发帧持有的函数值
+// ============================================================================
+
+/// 抛错替身（注册为带 upvalue 的 C 闭包）。
+unsafe extern "C-unwind" fn err_cclosure(L: *mut c_void) -> c_int {
+    let L = L as *mut lua_State;
+    luaL_argerror(L, 1, c"closure boom".as_ptr())
+}
+
+/// C 闭包（`TValue::CClosure`，持有 Rc）反复抛错：raise 会跳过 VM 派发帧
+/// （`op_call_generic` / `op_tailcall` / `op_tforcall`），那里若还持有函数值的
+/// 克隆，POSIX 上每次泄漏一整个闭包对象（连带其 upvalue）。
+///
+/// upvalue 故意用**Lua 闭包**：它持有 `Rc<Proto>` / `Rc<Vec<..>>`（全局堆分配），
+/// 泄漏时能被计数分配器看到（纯 arena 对象的内存不会归还全局分配器，观测不到）。
+/// 两条路径各测一遍：普通 CALL 与 TAILCALL（`return f()`）。
+#[test]
+fn c_closure_error_paths_do_not_leak() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let mut st = new_state();
+
+    assert_eq!(
+        st.load_buffer(
+            "inner = function() return 'payload' end\n\
+             function wrap_tail() return err_cclosure() end\n",
+            "=cclosure_defs"
+        ),
+        0,
+        "定义 upvalue 失败"
+    );
+    assert_eq!(st.pcall(0, 0, 0), 0, "定义执行失败");
+
+    let L = &mut st as *mut LuaState as *mut lua_State;
+    lua_getglobal(L, c"inner".as_ptr());
+    lua_pushcclosure(L, as_c_function(err_cclosure), 1);
+    lua_setglobal(L, c"err_cclosure".as_ptr());
+
+    let run = |st: &mut LuaState, src: &str| {
+        assert_eq!(st.load_buffer(src, "=longjmp"), 0, "编译失败: {src}");
+        assert_eq!(st.pcall(0, 0, 0), 0, "执行失败: {src}");
+    };
+
+    // 先确认两条路径真的会抛错（否则下面的测量可能只是空转）
+    run(
+        &mut st,
+        "local ok, err = pcall(err_cclosure)\n\
+         assert(ok == false and type(err) == 'string')\n\
+         local ok2 = pcall(wrap_tail)\n\
+         assert(ok2 == false)\n",
+    );
+    run(
+        &mut st,
+        "collectgarbage('collect'); collectgarbage('collect')",
+    );
+    let before = live_bytes();
+
+    let loop_src = "for i = 1, 400 do\n\
+           assert(pcall(err_cclosure) == false)\n\
+           assert(pcall(wrap_tail) == false)\n\
+         end\n";
+    run(&mut st, loop_src);
+    run(
+        &mut st,
+        "collectgarbage('collect'); collectgarbage('collect')",
+    );
+    let after = live_bytes();
+
+    let growth = after - before;
+    assert!(
+        growth <= 4096,
+        "C 闭包抛错路径泄漏了 {growth} 字节 (before={before}, after={after})"
+    );
 }

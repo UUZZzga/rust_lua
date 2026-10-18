@@ -49,6 +49,11 @@ path = "tests_rs/alloc_failure_tests.rs"
 name = "longjmp_tests"
 path = "tests_rs/longjmp_tests.rs"
 
+# capi 入口抛内存错误时的展开安全性（默认构建 = panic 路径, 与 longjmp 模式同一根因）
+[[test]]
+name = "capi_oom_unwind_tests"
+path = "tests_rs/capi_oom_unwind_tests.rs"
+
 [features]
 # 【临时诊断】大额分配跟踪（定位内存耗尽时仍 abort 的分配点，用完即删）
 default = ["fast_unsafe"]
