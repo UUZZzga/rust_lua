@@ -660,6 +660,27 @@ impl Debug for StringTable {
     }
 }
 
+/// 在内部化表中查找与 `bytes` 同内容的短字符串 (threaded 模式专用)。
+///
+/// 单级查找: 先比较完整 hash 快速淘汰 tag 匹配但完整 hash 不匹配的桶,
+/// 再做长度 + 内容比较 (见非 threaded 版本注释)。
+#[cfg(feature = "threaded")]
+fn find_interned(
+    ht: &HashTable<ArcRc<ShortString>>,
+    h: u64,
+    bytes: &[u8],
+) -> Option<ArcRc<ShortString>> {
+    let len = bytes.len();
+    ht.find(h, |ts| {
+        if ts.hash != h {
+            return false;
+        }
+        let content_bytes = &ts.data[0..ts.len as usize];
+        content_bytes.len() == len + 1 && content_bytes[..len] == *bytes
+    })
+    .cloned()
+}
+
 impl StringTable {
     pub fn new() -> Self {
         // 初始容量 256: perf 显示 intern 是 finish_grow 的主要 caller (12 次),
@@ -735,24 +756,19 @@ impl StringTable {
         debug_assert!(str.len() <= LUAI_MAXSHORTLEN, "intern 只用于短字符串");
 
         let str_bytes = str.as_bytes();
-        let str_len = str_bytes.len();
 
-        // 单级查找 (见非 threaded 版本注释), 先比较完整 hash 快速淘汰
-        let ht_reader = self.ht.read();
-        if let Some(ts) = ht_reader.find(h, |ts| {
-            if ts.hash != h {
-                return false;
-            }
-            let content_bytes = &ts.data[0..ts.len as usize];
-            content_bytes.len() == str_len + 1 && content_bytes[..str_len] == *str_bytes
-        }) {
-            return ArcRc::clone(ts);
+        // 无竞争快路径: 读锁下命中即返回 (与 C 的 luaS_newlstr 单线程语义等价)。
+        if let Some(ts) = find_interned(&self.ht.read(), h, str_bytes) {
+            return ts;
         }
-        drop(ht_reader);
 
-        // 写路径: 需要插入新字符串
-        // TOCTOU 在单线程执行中安全; 多线程下最多导致重复桶条目(无害)
+        // 写路径: 持写锁后必须重新查找 —— 快路径释放读锁与取得写锁之间可能有
+        // 其他线程插入了同内容的字符串。不重查会插入重复条目 (insert_unique 不去重),
+        // 使同一内容返回两个不同 ArcRc (破坏字符串身份与 `count`, 并发测试实证)。
         let mut ht = self.ht.write();
+        if let Some(ts) = find_interned(&ht, h, str_bytes) {
+            return ts;
+        }
         let ts = ArcRc::new_sstr(h, 0, str.as_bytes());
         ht.insert_unique(h, ArcRc::clone(&ts), |ts| ts.hash);
         *self.nuse.write() += 1;
@@ -804,21 +820,17 @@ impl StringTable {
             "intern_bytes 只用于短字符串"
         );
         let h = rust_hash_bytes(bytes);
-        let bytes_len = bytes.len();
 
-        let ht_reader = self.ht.read();
-        if let Some(ts) = ht_reader.find(h, |ts| {
-            if ts.hash != h {
-                return false;
-            }
-            let content_bytes = &ts.data[0..ts.len as usize];
-            content_bytes.len() == bytes_len + 1 && content_bytes[..bytes_len] == *bytes
-        }) {
-            return TValue::ShortStr(ArcRc::clone(ts));
+        // 无竞争快路径 (同 intern_with_hash)。
+        if let Some(ts) = find_interned(&self.ht.read(), h, bytes) {
+            return TValue::ShortStr(ts);
         }
-        drop(ht_reader);
 
+        // 写路径: 持写锁后重查 (同 intern_with_hash — 否则并发插入同内容会留下重复条目)。
         let mut ht = self.ht.write();
+        if let Some(ts) = find_interned(&ht, h, bytes) {
+            return TValue::ShortStr(ts);
+        }
         let ts = ArcRc::new_sstr(h, 0, bytes);
         ht.insert_unique(h, ArcRc::clone(&ts), |ts| ts.hash);
         *self.nuse.write() += 1;
@@ -1543,15 +1555,28 @@ mod tests {
             "repeat", "until", "break", "nil", "true", "false", "and", "or", "not", "in",
         ];
         let count = strings.len();
+        let num_threads = 4;
+
+        // Barrier: 让所有线程同时进入 intern, 最大化「全部未命中 → 全部尝试插入」
+        // 的竞态窗口。写锁内不重查时同一内容会被插入多次 → 返回不同实例、
+        // `count` 超过去重数 (回归: 修复前的读锁快路径 + 写锁直接 insert_unique)。
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(num_threads));
+        // 记录 barrier 的释放者数量: 恰为 1 证明所有线程都真的在 barrier 处会合。
+        let leaders = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let mut handles = Vec::new();
-        for _ in 0..4 {
+        for _ in 0..num_threads {
             let table = ArcRc::clone(&table);
             let strings = strings.clone();
+            let barrier = std::sync::Arc::clone(&barrier);
+            let leaders = std::sync::Arc::clone(&leaders);
             handles.push(std::thread::spawn(move || {
                 let mut results: Vec<ArcRc<ShortString>> = Vec::new();
+                if barrier.wait().is_leader() {
+                    leaders.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
                 for s in &strings {
-                    let ls = table.intern(s);
+                    let ls = table.intern_with_hash(s, rust_hash(s));
                     results.push(ls);
                 }
                 results
@@ -1563,7 +1588,7 @@ mod tests {
 
         for i in 0..count {
             let first = &all_results[0][i];
-            for t in 1..4 {
+            for t in 1..num_threads {
                 assert!(
                     ArcRc::ptr_eq(first, &all_results[t][i]),
                     "线程间同一字符串应返回相同 Arc 实例: '{}'",
@@ -1572,6 +1597,11 @@ mod tests {
             }
         }
 
+        assert_eq!(
+            leaders.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "4 个线程都应参与同一次 barrier 会合"
+        );
         assert_eq!(table.count(), count, "count 应为去重后的字符串数");
     }
 
@@ -1588,7 +1618,7 @@ mod tests {
             handles.push(std::thread::spawn(move || {
                 for i in 0..per_thread {
                     let content = format!("thread_{}_key_{}", t, i);
-                    let _ = table.intern(&content);
+                    let _ = table.intern_with_hash(&content, rust_hash(&content));
                 }
             }));
         }

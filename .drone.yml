@@ -43,6 +43,10 @@ steps:
   # 需要 Drop 的值 — POSIX 的 longjmp 不执行被跳过帧的析构。见 CLAUDE.md
   # "longjmp 模式的 Drop 安全契约" 与 tests_rs/longjmp_tests.rs。
   - cargo test --release --features lua_longjmp --test longjmp_tests --test alloc_failure_tests
+  # threaded 模式 (deps/setup.sh 构建 skynet 版 lua 用的配置): StringTable 走
+  # parking_lot RwLock + SimpleArc, 并发 intern 必须保持字符串身份 (同一内容
+  # 跨线程返回同一 Arc) 与去重计数 — 见 strings.rs 的 test_concurrent_intern_*。
+  - cargo test --release --features lua_longjmp,threaded
   - ./target/release/lua -v
 
 - name: cmp-tests
@@ -152,6 +156,8 @@ steps:
   # longjmp 模式: MSVC 的 longjmp 经 RtlUnwind 实现 (会执行清理), 但展开跨过
   # Rust extern "C" (nounwind) 帧会 abort — 被跨过的帧必须是 C-unwind。
   - cargo test --release --features lua_longjmp --test longjmp_tests --test alloc_failure_tests
+  # threaded 模式: 并发 intern 的字符串身份/去重计数回归 (见 strings.rs)。
+  - cargo test --release --features lua_longjmp,threaded
   - .\target\release\lua.exe -v
 
 - name: bench

@@ -37,8 +37,9 @@ fi
 echo "Compiler compare tests passed."
 
 # 2. 执行所有 cargo test (默认 features)
-# threaded/skynet feature 仅在 deps 测试 (deps/setup.sh) 中启用,
-# verify.sh 的 cargo test 和 Lua 测试用例不需要多线程/skynet 扩展 API.
+# threaded 模式 (deps/setup.sh 构建 skynet 版 lua 的配置) 单独跑一遍全套:
+# 它切换 StringTable 的锁实现 (parking_lot RwLock + SimpleArc), 默认配置下
+# 编译不到那些代码分支.
 echo "Running all cargo tests..."
 run_build cargo test --release > logs/cargo_test.log 2>&1 < /dev/null
 TEST_EXIT=$?
@@ -52,6 +53,22 @@ fi
 if grep -q "test result: FAILED" logs/cargo_test.log 2>/dev/null; then
     echo "ERROR: Cargo tests failed!"
     echo "Check logs/cargo_test.log for details"
+    exit 2
+fi
+
+echo "Running cargo tests (lua_longjmp + threaded)..."
+run_build cargo test --release --features lua_longjmp,threaded > logs/cargo_test_threaded.log 2>&1 < /dev/null
+TEST_T_EXIT=$?
+
+if [ $TEST_T_EXIT -ne 0 ]; then
+    echo "ERROR: Cargo tests (threaded) failed (exit code $TEST_T_EXIT)!"
+    echo "Check logs/cargo_test_threaded.log for details"
+    exit 2
+fi
+
+if grep -q "test result: FAILED" logs/cargo_test_threaded.log 2>/dev/null; then
+    echo "ERROR: Cargo tests (threaded) failed!"
+    echo "Check logs/cargo_test_threaded.log for details"
     exit 2
 fi
 
