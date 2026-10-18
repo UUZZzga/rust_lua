@@ -279,9 +279,14 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
   vararg 表的克隆推迟到 `ensure_scratch_to` **之后**（扩容点前只借用栈槽读标量 `n`）。
   被调函数经栈槽读自己的 upvalues，不依赖这些克隆；回归 `longjmp_tests::c_closure_error_paths_do_not_leak`。
   仍然残留：协程恢复/结束路径的 `co.pad_frame_scratch()`（栈被 `mem::take` / 换成克隆快照后
-  再补齐，失败时 `co` 自己没有 jmp_buf → 打印后 `exit(1)`）；非 `fast_unsafe` 构建里
-  `execute_loop` 的 `code_rc` / `constants_rc` 与 `write_stack` 的 `val` 也会被 raise 跨过
-  （该配置不参与 longjmp 回归，属已知缺口）。
+  再补齐，失败时 `co` 自己没有 jmp_buf → 打印后 `exit(1)`）。
+  另一处是 `--no-default-features`（安全版）+ `lua_longjmp` 的组合：安全版的 `execute_loop` 用
+  **循环级** Rc 句柄 `code_rc` / `constants_rc` 代替裸指针缓存（安全版不能像 fast 版那样靠裸指针
+  绕借用），longjmp 跨过主循环帧时会各泄漏一次克隆；默认 panic 构建下 Rust 展开会正常析构，
+  故只有该组合受影响，而该组合当前无人使用（bench / C 模块构建都开 `fast_unsafe`）。
+  `write_stack` 的 `val` **不在**泄漏之列（赋值即 move，赋值前没有 raise 点）。
+  Linux 侧回归证据（CI #230）：`--features lua_longjmp --test longjmp_tests` 4 个用例全过且
+  **零泄漏字节输出**（POSIX 是唯一能检出泄漏的平台；Windows 因清理会运行而恒为 0）。
 - 真 OOM（200MB 地址空间耗尽）下错误路径自身的分配仍可能 abort，见上面"内存分配失败处理"一节的
   未迁移清单（字符串内部化 / `push_*` 增长 / 解析器 Vec 等没有错误通道的分配点，仍走
   `raise_memory_error` 之外的原生 abort 路径）；`lua_use_longjmp` 只替换了抛出/捕获机制，不改变这条。
