@@ -313,6 +313,17 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
   memory` 而不是 abort（`capi_setter_oom_raise_does_not_abort` 守 longjmp 模式、
   `capi_oom_unwind_tests::settable_oom_raise_is_catchable_not_abort` 守默认 panic 模式；
   两者都已实测「修复前 abort / 修复后通过」）。
+- **失败注入方式有硬约束（CI #228/#229 实证）**：capi 抛错用例必须用**项目自己的分配器**
+  （`LuaState::new_main_with_allocator` + `Allocator` trait，见 `tests_rs/capi_oom_unwind_tests.rs`；
+  只走这条路的分配才「一律经漏斗」），并加 ≥4 KiB 阈值过滤；**不要**用全局分配器按大小过滤
+  （`longjmp_tests` 里给栈扩容用的那种 `FAIL_LARGE_ARMED`）。原因：panic 运行时、`state.stack`
+  这类普通 `Vec`、以及错误路径里尚未迁移的**不可失败**分配（`pcall` 错误路径的
+  `stack.split_off`（6144 B = 384×16）、字符串创建（120 B））都走全局分配器或项目侧不可失败路径，
+  一起打掉就命中 `handle_alloc_error`（打印 `memory allocation of N bytes failed` 后挂死/abort）
+  —— 实测把 Drone Linux 整条流水线拖到 60 分钟超时（build #228/#229 的 step 3 被 kill，
+  cmp-tests / deps-tests / bench 全部 skipped；Windows 因清理会运行而不受影响）。
+  同理：**武装期间 Lua 侧不得做任何字符串构造**（`..` / `tostring` 会分配）——错误对象比对
+  一律放 Rust 侧（`obj_at(-1)` + `lua_string_as_str`），chunk 只用常量比较 + `return err`。
 
 ## 关键编码约定
 

@@ -54,6 +54,46 @@ const FAIL_LARGE_MIN: usize = 4096;
 /// 全局分配器状态是进程级的：两个测试必须串行（测量窗口不得与失败注入重叠）。
 static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+// ============================================================================
+// 项目级可编程分配器（capi 抛错用例专用）
+// ============================================================================
+
+/// 与全局分配器注入不同：这里只拦**项目自己**的分配（全部经漏斗），
+/// panic 运行时 / `state.stack` 这类普通 `Vec` / 错误路径里尚未迁移的不可失败
+/// 分配都走全局分配器 → 不会被饿死（否则 `handle_alloc_error` 会挂死进程，实测
+/// 在 Drone Linux 上拖到 60 分钟超时）。阈值过滤再兜一层：小额分配即便落在
+/// 尚未迁移的不可失败路径上（典型是字符串创建）也放行。
+static PROJ_FAIL_ARMED: AtomicIsize = AtomicIsize::new(0);
+static PROJ_FAIL_HITS: AtomicIsize = AtomicIsize::new(0);
+
+struct FlakyProjectAlloc {
+    inner: lua_rs::mem::DefaultAllocator,
+}
+
+impl lua_rs::mem::Allocator for FlakyProjectAlloc {
+    fn alloc(&self, ptr: *mut u8, old_size: usize, new_size: usize, align: usize) -> *mut u8 {
+        if new_size >= FAIL_LARGE_MIN && PROJ_FAIL_ARMED.load(Ordering::Relaxed) != 0 {
+            PROJ_FAIL_HITS.fetch_add(1, Ordering::Relaxed);
+            return std::ptr::null_mut();
+        }
+        self.inner.alloc(ptr, old_size, new_size, align)
+    }
+}
+
+/// 用项目级可编程分配器建 state（其余同 `new_state`）。
+fn new_state_with_project_flaky() -> LuaState<'static> {
+    let mut st = LuaState::new_main_with_allocator(
+        lua_rs::mock::io_mock::lua_io(),
+        Box::new(FlakyProjectAlloc {
+            inner: lua_rs::mem::DefaultAllocator,
+        }),
+    )
+    .expect("创建 state 失败");
+    st.open_selected_libs(0, 0).expect("打开标准库失败");
+    register(&mut st);
+    st
+}
+
 unsafe impl GlobalAlloc for CountingAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if layout.size() >= FAIL_LARGE_MIN && FAIL_LARGE_ARMED.load(Ordering::Relaxed) != 0 {
@@ -344,8 +384,8 @@ fn deep_stack_growth_failure_is_caught_by_lua_pcall() {
 /// `raise_mem_error`。400 次整数键插入必然出现一次 ≥ `FAIL_LARGE_MIN` 的哈希区扩容。
 unsafe extern "C-unwind" fn err_settable_oom(L: *mut c_void) -> c_int {
     let L = L as *mut lua_State;
-    lua_createtable(L, 0, 0);
-    FAIL_LARGE_ARMED.store(1, Ordering::Relaxed);
+    lua_createtable(L, 0, 0); // 建表在武装之前, 不注入
+    PROJ_FAIL_ARMED.store(1, Ordering::Relaxed);
     let mut k: i64 = 0;
     while k < 400 {
         lua_pushinteger(L, k as _);
@@ -354,28 +394,31 @@ unsafe extern "C-unwind" fn err_settable_oom(L: *mut c_void) -> c_int {
         k += 1;
     }
     // 抛错时到不了这里: 由测试主体在 pcall 返回后解除注入
-    FAIL_LARGE_ARMED.store(0, Ordering::Relaxed);
+    PROJ_FAIL_ARMED.store(0, Ordering::Relaxed);
     0
 }
 
 #[test]
 fn capi_setter_oom_raise_does_not_abort() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let mut st = new_state();
+    let mut st = new_state_with_project_flaky();
 
     let L = &mut st as *mut LuaState as *mut lua_State;
     lua_pushcfunction(L, as_c_function(err_settable_oom));
     lua_setglobal(L, c"err_settable_oom".as_ptr());
 
-    let hits_before = FAIL_LARGE_HITS.load(Ordering::Relaxed);
+    // 观察本身必须零分配（武装期间 Lua 侧的 `..` / `tostring` 会落在尚未迁移的
+    // 不可失败字符串分配上 → handle_alloc_error）：比对放在 Rust 侧。
     let probe = "local ok, err = pcall(err_settable_oom)\n\
-         assert(ok == false, 'capi setter 应当在分配失败时抛错')\n\
-         assert(err == 'not enough memory', '错误对象应为预注册 MEMERRMSG, 实为 ' .. tostring(err))\n\
-         return 'caught'\n";
+         assert(ok == false)\n\
+         return err\n";
     assert_eq!(st.load_buffer(probe, "=oom_setter"), 0, "编译探针失败");
+    st.top = st.stack.len(); // Rust 侧压栈不推进 top, 而 GC 只把 [..top] 当根
+
+    let hits_before = PROJ_FAIL_HITS.load(Ordering::Relaxed);
     let status = st.pcall(0, 1, 0);
-    FAIL_LARGE_ARMED.store(0, Ordering::Relaxed);
-    let hits = FAIL_LARGE_HITS.load(Ordering::Relaxed) - hits_before;
+    PROJ_FAIL_ARMED.store(0, Ordering::Relaxed); // 抛错路径不会自行解除
+    let hits = PROJ_FAIL_HITS.load(Ordering::Relaxed) - hits_before;
 
     assert_eq!(
         status,
@@ -385,7 +428,13 @@ fn capi_setter_oom_raise_does_not_abort() {
     );
     assert!(
         hits >= 1,
-        "必须真的命中过大额分配失败（hits={hits}）, 否则本测试退化为空转"
+        "必须真的命中过项目分配失败（hits={hits}）, 否则本测试退化为空转"
+    );
+    let err = st.obj_at(-1).expect("缺少 pcall 的返回值").clone();
+    assert_eq!(
+        lua_rs::strings::lua_string_as_str(&err),
+        "not enough memory",
+        "错误对象应为预注册 MEMERRMSG"
     );
 
     assert_eq!(
@@ -393,6 +442,7 @@ fn capi_setter_oom_raise_does_not_abort() {
         0,
         "编译后置检查失败"
     );
+    st.top = st.stack.len();
     assert_eq!(st.pcall(0, 0, 0), 0, "OOM 之后解释器应可继续工作");
 }
 
