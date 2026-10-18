@@ -5806,10 +5806,20 @@ impl VmExecutor {
                 // perf: 用 mem::replace 代替 mem::take + 后续赋值
                 // mem::take 会创建 4 个空 Rc::new(Vec::new()) 堆分配, 赋值时又立即 drop
                 // mem::replace 直接交换指针, 零堆分配
-                let saved_code = std::mem::replace(&mut state.code, Rc::clone(&proto.code));
-                let saved_constants =
-                    std::mem::replace(&mut state.constants, Rc::clone(&proto.constants));
-                let saved_protos = std::mem::replace(&mut state.protos, proto.protos.clone());
+                //
+                // 安全: 取完 proto 的 Copy 标量与三个 Rc 字段后立即 drop(proto) ——
+                // 下面的 `pad_frame_scratch` / `fast_resize_stack_nil` 是扩容点, 失败会
+                // raise (longjmp / panic 跳过本帧), 那时仍被持有的 Rc 克隆即泄漏。
+                let proto_code = Rc::clone(&proto.code);
+                let proto_constants = Rc::clone(&proto.constants);
+                let proto_protos = proto.protos.clone();
+                let callee_num_params = proto.num_params;
+                let callee_is_vararg = proto.is_vararg();
+                let callee_flag = proto.flag;
+                drop(proto);
+                let saved_code = std::mem::replace(&mut state.code, proto_code);
+                let saved_constants = std::mem::replace(&mut state.constants, proto_constants);
+                let saved_protos = std::mem::replace(&mut state.protos, proto_protos);
 
                 state.call_stack.push(CallFrame {
                     code: saved_code,
@@ -5843,14 +5853,15 @@ impl VmExecutor {
                 });
 
                 state.base = a + 1;
+                // 安全: 上值同样在扩容点之前交给 state (move, 不再留克隆) —— 失败时
+                // 本帧不持有它; 出错由最近的 pcall 保护点按 saved_closure_upvals 复原。
+                state.closure_upvals = upvals;
                 state.pad_frame_scratch();
                 state.pc = 0;
-                state.num_params = proto.num_params;
-                state.is_vararg = proto.is_vararg();
-                state.proto_flag = proto.flag;
+                state.num_params = callee_num_params;
+                state.is_vararg = callee_is_vararg;
+                state.proto_flag = callee_flag;
                 state.nextraargs = 0;
-                // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
-                state.closure_upvals = Rc::clone(&upvals);
                 state.tbc_list = None;
                 // 对应 C 的 luaD_hookcall: L->oldpc = 0
                 // 新函数的 oldpc 设为 0，第一条指令会触发 hook（因为 0 不是有效 pc）
@@ -6383,7 +6394,10 @@ impl VmExecutor {
                 state.proto_flag = proto.flag;
                 state.nextraargs = 0;
                 // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
-                state.closure_upvals = Rc::clone(&upvals);
+                // 安全: proto / upvals 在此之后立即释放 —— 本臂尾部的 call hook 等
+                // 可能 raise 的路径不得再持有 Rc 克隆 (longjmp / panic 跳过本帧即泄漏)。
+                state.closure_upvals = upvals;
+                drop(proto);
                 state.tbc_list = None;
 
                 // 对应 C 的 ci->callstatus |= CIST_TAIL

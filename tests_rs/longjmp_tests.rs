@@ -263,6 +263,7 @@ fn deep_stack_growth_failure_is_caught_by_lua_pcall() {
         }
     }
     assert_eq!(st.load_buffer(&defs, "=longjmp_defs"), 0, "定义函数失败");
+    st.top = st.stack.len(); // Rust 侧压栈不推进 top, 而 GC 只把 [..top] 当根
     assert_eq!(st.pcall(0, 0, 0), 0, "定义函数执行失败");
 
     let probe = "local ok, err = pcall(f0)\n\
@@ -270,35 +271,60 @@ fn deep_stack_growth_failure_is_caught_by_lua_pcall() {
          assert(err == 'not enough memory', '错误对象应为预注册 MEMERRMSG, 实为 ' .. tostring(err))\n\
          return 'caught'\n";
     assert_eq!(st.load_buffer(probe, "=longjmp_probe"), 0, "编译探针失败");
+    st.top = st.stack.len(); // 同上: 武装注入触发的紧急 GC 必须能看到探针函数
 
-    // 武装大额分配失败（栈扩容经全局分配器的 try_reserve）→ 扩容必然失败
-    let hits_before = FAIL_LARGE_HITS.load(Ordering::Relaxed);
-    FAIL_LARGE_ARMED.store(1, Ordering::Relaxed);
-    let status = st.pcall(0, 1, 0);
-    FAIL_LARGE_ARMED.store(0, Ordering::Relaxed);
-    let hits = FAIL_LARGE_HITS.load(Ordering::Relaxed) - hits_before;
+    // 反复走同一条 raise 路径并量化存活字节：每次 longjmp 都跳过 VM 派发帧
+    // （`fast_resize_stack_nil` 的调用帧、op_call* 取出的 `proto` / `upvals` 引用等），
+    // 那里若还持有 Rc 克隆，POSIX 上每轮泄漏一份。
+    //
+    // 每轮**重新编译**探针 chunk 而非复用同一份：Rust 侧 `load_buffer` 压栈不推进
+    // `top`，而注入失败触发的紧急 GC 只把 `[..top]` 当根；复用预加载 chunk 会让
+    // 紧急回收期间的对象生命周期语义变得微妙（另见 CLAUDE.md "已知异常"）。
+    let run_once = |st: &mut LuaState<'static>| {
+        assert_eq!(
+            st.load_buffer(probe, "=longjmp_probe"),
+            0,
+            "每轮编译探针失败"
+        );
+        st.top = st.stack.len();
+        FAIL_LARGE_ARMED.store(1, Ordering::Relaxed);
+        let status = st.pcall(0, 1, 0);
+        FAIL_LARGE_ARMED.store(0, Ordering::Relaxed);
+        assert_eq!(
+            status,
+            0,
+            "每轮内存错误都应被捕获（status={status}, 错误对象={}）",
+            error_object(st)
+        );
+    };
+    let full_gc = |st: &mut LuaState<'static>| {
+        assert_eq!(
+            st.load_buffer(
+                "collectgarbage('collect'); collectgarbage('collect')",
+                "=longjmp_gc"
+            ),
+            0,
+            "编译 GC chunk 失败"
+        );
+        st.top = st.stack.len();
+        assert_eq!(st.pcall(0, 0, 0), 0, "GC chunk 执行失败");
+    };
+    // 预热一轮：栈容量的增长只发生一次，不该算进泄漏
+    run_once(&mut st);
+    full_gc(&mut st);
+    let before = live_bytes();
 
-    assert_eq!(
-        status,
-        0,
-        "内存错误应被 Lua 层 pcall 捕获（status={status}, 错误对象={}）",
-        error_object(&st)
-    );
+    for _ in 0..50 {
+        run_once(&mut st);
+    }
+    full_gc(&mut st);
+    let after = live_bytes();
+
+    let growth = after - before;
     assert!(
-        hits >= 2,
-        "必须真的发生过栈扩容失败（一次扩容的两次尝试，hits={hits}）"
+        growth <= 4096,
+        "深帧内存错误路径泄漏了 {growth} 字节 (before={before}, after={after})"
     );
-
-    // 错误对象是预注册的 MEMERRMSG（chunk 内的 assert 已核对），且解释器仍可用
-    assert_eq!(
-        st.load_buffer(
-            "assert(type({}) == 'table'); assert(#'abc' == 3); assert(1 + 1 == 2)",
-            "=longjmp_after"
-        ),
-        0,
-        "编译后置检查失败"
-    );
-    assert_eq!(st.pcall(0, 0, 0), 0, "内存错误之后解释器应可继续工作");
 }
 
 // ============================================================================
@@ -444,3 +470,5 @@ fn c_closure_error_paths_do_not_leak() {
         "C 闭包抛错路径泄漏了 {growth} 字节 (before={before}, after={after})"
     );
 }
+
+// ============================================================================

@@ -285,6 +285,17 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
 - 真 OOM（200MB 地址空间耗尽）下错误路径自身的分配仍可能 abort，见上面"内存分配失败处理"一节的
   未迁移清单（字符串内部化 / `push_*` 增长 / 解析器 Vec 等没有错误通道的分配点，仍走
   `raise_memory_error` 之外的原生 abort 路径）；`lua_use_longjmp` 只替换了抛出/捕获机制，不改变这条。
+- **既有异常（本轮诊断中发现，未修）**：深帧内存错误被捕获后**复用同一份预先加载的 chunk**
+  再执行，会得到 `attempt to index a nil value (upvalue '_ENV')` —— 该 chunk 闭包的上值本身完好
+  （`LClosure.upvals` 仍是 `{Table(globals)}`），但执行期读到的 `_ENV` 为 nil；同一时刻
+  `LuaState::pcall` 错误返回后 `state.top` 可能停在大于 `stack.len()` 的旧值（实测 top=12 /
+  len=4）。触发条件：Rust 侧用 `load_buffer` / `push_value` 压栈（**不推进 `top`**）之后，注入
+  大额分配失败 → 紧急 GC 与错误恢复路径交错。**每轮重新编译 chunk 则不触发**（`longjmp_tests`
+  的深帧泄漏测量即按此写法）。已在 `790a226`（本次修复之前的 `execute.rs`）上复现 → 与本次
+  改动无关，属错误恢复路径的既有问题，待单独定位。待查线索（假设，未证实）：`op_closure` 在
+  `parent_idx >= state.closure_upvals.len()` 时补的是 Nil 闭包（`execute.rs` 7470 附近），
+  若某帧执行期 `state.closure_upvals` 恰好是 `pcall` 装上的临时空表（`state.rs` 1313），新建
+  闭包的 `_ENV` 就是 Nil。
 - 热路径扩容点尚未全部改成 `Result` 通道（约 50 处签名扩散），所以 `pad_frame_scratch` /
   `fast_resize_stack_nil` / `adjust_results_on_stack` 在 VM 内仍是 raise；当前靠「帧入口预预留
   + 上限有界」保证这些点通常不真正扩容（帧 floor = `base + MAX_FSTACK + 1` 在入口已被预留）。
