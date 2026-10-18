@@ -1735,7 +1735,9 @@ pub const PF_VATAB: u8 = 2;
 /// 用户值区与数据区都在固定头之后，均按 8 字节对齐（C 的 `LUAI_MAXALIGN`
 /// 在默认配置下即 8；C 用 `UValue` 联合保证，这里用 `[u64]` 尾数组保证）。
 ///
-/// 与 C 的差异：字段偏移不同（C 把 `len`/`nuvalue` 放在 `gclist` 之前），
+/// 与 C 的差异：GC 头的宽度与字段构成不同（C 的 `CommonHeader` 是
+/// `GCObject *next; lu_byte tt; lu_byte marked` = 16 字节，另加 `gclist`；
+/// 这里是 8 字节的 `GCObjectHeader`），故固定头之后的偏移与 C 不同。
 /// 但 C 侧只通过 `getudatamem`（= [`Udata::data_ptr`]）、`lua_rawlen`（`len`）
 /// 与 `lua_get/setiuservalue`（用户值）观察 userdata，故不构成 ABI 差异。
 #[repr(C)]
