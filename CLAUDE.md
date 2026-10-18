@@ -158,7 +158,7 @@ bash tools/miri.sh --no-log       # 不写日志，直接输出到终端
 - **PreToolUse / Bash**：
   - `tools/check_memory.sh`：扫描命令（包括脚本内容）是否符合内存限制规则。构建命令必须用 `systemd-run --property=LimitAS=infinity`；测试命令必须用 `systemd-run --property=LimitAS=204800` 并加 `timeout`。
   - `tools/check_sleep_pipe.sh`：拦截 `sleep N | exe` 形式的命令。详见"命令执行规则"章节。
-- **Stop**：`tools/verify.sh`，每次 Agent 停止时自动运行编译器比对、cargo test、构建与 Lua 测试。失败时查看 `logs/compiler_test.log` / `logs/cargo_test.log` / `logs/build.log` / `logs/*_run.log`。
+- **Stop**：`tools/verify.sh`，每次 Agent 停止时自动运行编译器比对、cargo test、构建与 Lua 测试。失败时查看 `logs/compiler_test.log` / `logs/cargo_test.log` / `logs/cargo_test_threaded.log` / `logs/build.log` / `logs/*_run.log`。
 
 ## CI 流程
 
