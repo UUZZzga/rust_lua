@@ -5449,11 +5449,6 @@ mod tests {
             }
             lua_settop(L, 0);
             // 6 种长度 × 每次 2 个外部字符串（str1/str2）= 12 个缓冲区
-            //
-            // 先跑一次 GC 再断言: 栈上被覆盖掉的旧值由 VM 延迟释放（`execute::push_drop`
-            // 入队 `LuaState.drop_queue`, 上界 `DROP_QUEUE_LIMIT`）, 队列在 `collect_gc`
-            // 入口无条件排空 —— 因此「不可达即释放、不等到 lua_close」这句话的准确含义是
-            // 「至迟在下一次 GC 时释放」。少这一次 lua_gc 就会读到 12 之前的部分值。
             lua_gc(L, 2 /* LUA_GCCOLLECT */, 0);
             assert_eq!(
                 FREED.load(Ordering::SeqCst),
