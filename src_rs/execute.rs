@@ -2174,11 +2174,11 @@ impl VmExecutor {
                 state.scratch_end,
                 state.base
             );
-            // 先判断旧值 tag，避免为“非 GC 值”读整个 TValue
+            // 旧值持有引用 → 出线到 push_drop (延迟释放); 否则直接覆盖写 (trivial 值)。
             if Self::old_slot_holds_ref(&*slot) {
                 let old = std::ptr::read(slot);
                 std::ptr::write(slot, val);
-                Self::push_drop(state, old); // cold
+                Self::push_drop(state, old);
             } else {
                 std::ptr::write(slot, val);
             }

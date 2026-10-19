@@ -1,6 +1,9 @@
 //! 延迟释放队列的不变量测试 —— `write_stack` 把旧槽值的 `Rc` 释放出线到
 //! `VmExecutor::push_drop`，入队 `LuaState::drop_queue`，批量排空时才算引用计数减一。
 //!
+//! 队列只存在于 `fast_unsafe` 构建（安全构建的 `write_stack` 直接 `state.stack[idx] = val`
+//! 就地释放），故整个测试目标按该 feature 门控。
+//!
 //! 该机制引入两条必须成立的性质（两条都从 Rust 侧直接观测队列长度）：
 //!
 //! 1. **有界**：队列长度恒 ≤ `DROP_QUEUE_LIMIT`。入队是唯一写入点，若上界失效，
@@ -12,6 +15,8 @@
 //!    依赖这一点。
 //!
 //! 触发方式：局部变量被同一个表反复覆盖 —— 旧值持有引用，每次写都走 `push_drop`。
+
+#![cfg(feature = "fast_unsafe")]
 
 use lua_rs::mock::io_mock::lua_io;
 use lua_rs::state::{LuaState, DROP_QUEUE_LIMIT};
