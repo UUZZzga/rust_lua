@@ -2088,17 +2088,6 @@ impl VmExecutor {
         )
     }
 
-    /// 释放旧槽值持有的引用 (先置 Nil 再让 drop 走 drop_glue) —— 冷路径。
-    ///
-    /// `#[cold]` + `#[inline(never)]`: 让热路径 (直接覆盖写) 保持直线, 冷路径出线,
-    /// 热路径只剩一次不被命中的条件跳转。
-    #[cfg(feature = "fast_unsafe")]
-    #[cold]
-    #[inline(never)]
-    unsafe fn release_old_slot(slot: *mut TValue<'_>) {
-        let _ = std::ptr::replace(slot, TValue::Nil(NilKind::Strict));
-    }
-
     /// `probe_wstack` 探针: 写目标必须落在「已初始化」范围内
     /// (上界 = `max(len, scratch_end)`, 见 [`Self::write_stack`] 的不变量说明)。
     /// 越界写意味着某个补齐点漏了 —— release 下会静默踩未初始化内存, 故诊断构建必须拦下。
@@ -2186,7 +2175,7 @@ impl VmExecutor {
                 state.base
             );
             if Self::old_slot_holds_ref(&*slot) {
-                Self::release_old_slot(slot);
+                std::ptr::drop_in_place(slot);
             }
             std::ptr::write(slot, val);
             // [len, idx+1) 已由 pad_frame_scratch 初始化为 Nil → set_len 安全且无分支。
