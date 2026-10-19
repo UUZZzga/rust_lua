@@ -2174,10 +2174,14 @@ impl VmExecutor {
                 state.scratch_end,
                 state.base
             );
+            // 先判断旧值 tag，避免为“非 GC 值”读整个 TValue
             if Self::old_slot_holds_ref(&*slot) {
-                std::ptr::drop_in_place(slot);
+                let old = std::ptr::read(slot);
+                std::ptr::write(slot, val);
+                Self::push_drop(state, old); // cold
+            } else {
+                std::ptr::write(slot, val);
             }
-            std::ptr::write(slot, val);
             // [len, idx+1) 已由 pad_frame_scratch 初始化为 Nil → set_len 安全且无分支。
             state.stack.set_len(state.stack.len().max(idx + 1));
         }
@@ -2192,6 +2196,33 @@ impl VmExecutor {
             state.stack[idx] = val;
         }
         state.top = top.max(idx + 1);
+    }
+
+    /// 延迟释放: 把旧槽值挂到 `drop_queue`, 真正的 `Rc::drop` 推迟到队列排空时。
+    ///
+    /// 为什么延迟: `write_stack` 是每指令路径, `TValue::drop` 的 drop glue (判别式分支 +
+    /// 可能的 `Rc` 释放/析构) 内联进去会把热循环撑大; 出线成冷调用后热路径只剩
+    /// `cmpb`+前向跳转+16B 覆盖写。批量释放还有局部性收益 (连续 dealloc 同一批小对象)。
+    /// 代价: 值最多多存活 `DROP_QUEUE_LIMIT` 次写入。
+    ///
+    /// 队列上界由这里保证 (唯一写入点, 每次至多加 1 个 → 恒 ≤ `DROP_QUEUE_LIMIT`),
+    /// 因此不需要在 CALL/RETURN 等热路径上额外检查; `Vec` 容量固定且永不再增长
+    /// (`drain(..)` 保留容量), 即热路径无分配 —— 保持 `write_stack` 原有的
+    /// 「分配失败漏斗之外」属性 (真 OOM 下这里不会 abort)。
+    ///
+    /// 语义: 队列持有的是已被覆盖的**死值**, 仅是引用计数延迟递减 —— 对象的可达性
+    /// 判定不受影响。`collect_gc` 入口会无条件排空, 保证 GC 标记阶段之前死对象已
+    /// 归还 (`lua_gc` 后外部字符串缓冲区的 `falloc` 必须已恰好调用一次)。
+    ///
+    /// 仅 `fast_unsafe` 构建调用 (安全构建走 `state.stack[idx] = val`, 就地释放)。
+    #[cfg(feature = "fast_unsafe")]
+    #[cold]
+    #[inline(never)]
+    fn push_drop<'a>(state: &mut LuaState<'a>, old: TValue<'a>) {
+        if state.drop_queue.len() >= crate::state::DROP_QUEUE_LIMIT {
+            state.drain_drop_queue();
+        }
+        state.drop_queue.push(old);
     }
 
     /// 槽间拷贝 (MOVE) — 对应 C 的 `setobjs2s(L, ra, RB(i))`, 热路径无分支。

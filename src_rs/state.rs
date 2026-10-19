@@ -351,7 +351,21 @@ pub struct LuaState<'a> {
     /// `Box` 保证 `l_g` 指向的地址不随 `LuaState` 自身移动而失效；
     /// 模块私有（`GlobalState` 的构造与所有权均不外泄，其他模块只能用 `LuaState`）。
     owner: Option<Box<GlobalState<'a>>>,
+
+    /// 待释放值队列 (延迟 `Rc::drop`) —— 由 `VmExecutor` 的 `push_drop` 入队。
+    ///
+    /// 语义与不变量见 `execute.rs` 的 `push_drop` 与 [`LuaState::drain_drop_queue`]:
+    /// 队列只装**已从栈上覆盖掉的死值**, 因此延迟的是引用计数递减、不是可达性;
+    /// 上界由入队侧保证 ([`DROP_QUEUE_LIMIT`]), GC 入口无条件排空, 保证标记阶段前
+    /// 死对象已归还 (外部字符串 `falloc` 的「不可达即释放」语义依赖这一点)。
+    pub drop_queue: Vec<TValue<'a>>,
 }
+
+/// `drop_queue` 的长度上界 (`execute.rs` 的 `push_drop` 维护)。
+///
+/// 容量按上界一次性预留 → 热路径入队永不触发 `Vec` 增长 (无分配); 队列长度决定
+/// 死值多活的最长窗口。64 = 一次批量释放的局部性收益与延迟窗口的折中。
+pub const DROP_QUEUE_LIMIT: usize = 64;
 
 impl<'a> LuaState<'a> {
     /// 协程/新线程的执行态骨架（对应 C 中为新线程分配的 `lua_State`）：
@@ -411,6 +425,18 @@ impl<'a> LuaState<'a> {
             error_jmp_bufs: Vec::new(),
             l_g: std::ptr::null_mut(),
             owner: None,
+            drop_queue: Vec::with_capacity(DROP_QUEUE_LIMIT),
+        }
+    }
+
+    /// 排空延迟释放队列 —— 真正执行 `Rc::drop`。
+    ///
+    /// 调用点只有两处: 队列满 (`execute::VmExecutor::push_drop`) 与 GC 入口
+    /// (`gc::collect_gc`)。`drain(..)` 保留容量, 故排空后不会重新分配。
+    #[inline]
+    pub fn drain_drop_queue(&mut self) {
+        for v in self.drop_queue.drain(..) {
+            drop(v); // 这里才真正 Rc::drop，批量、非热路径
         }
     }
 }
