@@ -454,6 +454,14 @@ impl<'a> LuaState<'a> {
             self.drain_drop_queue();
         }
     }
+
+    #[cold]
+    #[inline(never)]
+    pub fn drain_drop_queue_if_full_cold(&mut self) {
+        if self.drop_queue.len() >= DROP_QUEUE_LIMIT {
+            self.drain_drop_queue();
+        }
+    }
 }
 
 /// 主线程构造（对应 C 的 `lua_newstate`）：创建并持有共享全局块。

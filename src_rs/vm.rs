@@ -124,6 +124,7 @@ pub fn float_to_integer(n: LuaNumber, mode: F2IMode) -> Option<LuaInteger> {
 /// Given: TValue::Boolean(true)
 /// When: 调用 to_number_ns
 /// Then: 返回 None
+#[inline]
 pub fn to_number_ns(obj: &TValue) -> Option<LuaNumber> {
     match obj {
         TValue::Float(f) => Some(*f),

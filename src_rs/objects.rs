@@ -715,6 +715,7 @@ impl<'a> TValue<'a> {
     /// Given: 任意 TValue
     /// When: 调用 .ty()
     /// Then: 返回对应的 LuaType
+    #[inline]
     pub fn ty(&self) -> LuaType {
         match self {
             TValue::Nil(_) => LuaType::Nil,
@@ -745,6 +746,7 @@ impl<'a> TValue<'a> {
     /// Given: 一个 TValue::Boolean(true)
     /// When: 调用 .is_nil()
     /// Then: 返回 false
+    #[inline]
     pub fn is_nil(&self) -> bool {
         matches!(self, TValue::Nil(_))
     }
@@ -761,6 +763,7 @@ impl<'a> TValue<'a> {
     /// Given: TValue::Boolean(true)
     /// When: 调用 .is_false()
     /// Then: 返回 false
+    #[inline]
     pub fn is_false(&self) -> bool {
         matches!(self, TValue::Boolean(false)) || self.is_nil()
     }
@@ -777,6 +780,7 @@ impl<'a> TValue<'a> {
     /// Given: TValue::Nil(_)
     /// When: 调用 .is_number()
     /// Then: 返回 false
+    #[inline]
     pub fn is_number(&self) -> bool {
         matches!(self, TValue::Integer(_) | TValue::Float(_))
     }
@@ -799,6 +803,7 @@ impl<'a> TValue<'a> {
     /// Given: TValue::LightUserData(_)  // 真正的 light userdata，非内置函数
     /// When: 调用 .is_function()
     /// Then: 返回 false
+    #[inline]
     pub fn is_function(&self) -> bool {
         matches!(
             self,
@@ -814,6 +819,7 @@ impl<'a> TValue<'a> {
     ///
     /// 所有内置库已迁移到 BuiltinFn/RustClosure，coroutine.wrap 和 io.lines
     /// 返回 RustClosure。LightUserData 不再承担派发职责，回归本职。
+    #[inline]
     pub fn is_callable(&self) -> bool {
         self.is_function()
     }

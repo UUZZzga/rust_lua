@@ -2520,7 +2520,7 @@ impl VmExecutor {
         let t = state.tick.get().wrapping_add(1);
         state.tick.set(t);
         if t & 63 == 0 {
-            state.drain_drop_queue_if_full();
+            state.drain_drop_queue_if_full_cold();
             if INTERRUPTED.load(Ordering::Relaxed) {
                 INTERRUPTED.store(false, Ordering::Release);
                 state.pc = cur; // savepc: 中断错误行号
@@ -4195,23 +4195,12 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        // perf: K 常量免 clone — 引用展开; constants 是主循环缓存切片
-        // (帧切换点刷新), 免每指令 Rc→Vec 双 deref。
         let v1 = Self::read_stack(state, b);
-        let v2 = constants.get(c_key);
-        let result: Option<TValue> = match (v1, v2) {
-            (TValue::Float(f1), Some(TValue::Float(f2))) => Some(TValue::Float(f1 + f2)),
-            (TValue::Integer(i1), Some(TValue::Integer(i2))) => {
-                Some(TValue::Integer(i1.wrapping_add(*i2)))
-            }
-            _ => match (to_number_ns(v1), v2.and_then(to_number_ns)) {
-                (Some(n1), Some(n2)) => Some(TValue::Float(n1 + n2)),
-                _ => None,
-            },
-        };
-        if let Some(result) = result {
+        let v2 = unsafe { constants.get_unchecked(c_key) };
+        if v1.is_number() && v2.is_number() {
+            let result = arith_bin!(v1, v2, +, wrapping_add);
             Self::write_stack(state, a, result);
-            *pc += 1; // skip MMBINK
+            *pc += 1; // skip MMBIN (pc 已 = cur+1, 循环头覆盖 fall-through 的 +1)
         }
         Ok(())
     }
@@ -4225,22 +4214,12 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        // perf: K 常量免 clone — 引用展开 (同 op_mulk)
         let v1 = Self::read_stack(state, b);
-        let v2 = state.constants.get(c_key);
-        let result: Option<TValue> = match (v1, v2) {
-            (TValue::Float(f1), Some(TValue::Float(f2))) => Some(TValue::Float(f1 - f2)),
-            (TValue::Integer(i1), Some(TValue::Integer(i2))) => {
-                Some(TValue::Integer(i1.wrapping_sub(*i2)))
-            }
-            _ => match (to_number_ns(v1), v2.and_then(to_number_ns)) {
-                (Some(n1), Some(n2)) => Some(TValue::Float(n1 - n2)),
-                _ => None,
-            },
-        };
-        if let Some(result) = result {
+        let v2 = unsafe { state.constants.get_unchecked(c_key) };
+        if v1.is_number() && v2.is_number() {
+            let result = arith_bin!(v1, v2, -, wrapping_sub);
             Self::write_stack(state, a, result);
-            *pc += 1; // skip MMBINK
+            *pc += 1; // skip MMBIN
         }
         Ok(())
     }
@@ -4254,23 +4233,12 @@ impl VmExecutor {
         let a = Self::ra(state, inst);
         let b = Self::rb(state, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        // perf: K 常量免 clone — 直接引用展开 (常量池不可变, 借用与 read_stack 兼容)。
-        // 语义对齐 arith_bin!: number*number 直接算 (含 int*int → int), 否则 Nil 走 MMBINK。
         let v1 = Self::read_stack(state, b);
-        let v2 = state.constants.get(c_key);
-        let result: Option<TValue> = match (v1, v2) {
-            (TValue::Float(f1), Some(TValue::Float(f2))) => Some(TValue::Float(f1 * f2)),
-            (TValue::Integer(i1), Some(TValue::Integer(i2))) => {
-                Some(TValue::Integer(i1.wrapping_mul(*i2)))
-            }
-            _ => match (to_number_ns(v1), v2.and_then(to_number_ns)) {
-                (Some(n1), Some(n2)) => Some(TValue::Float(n1 * n2)),
-                _ => None,
-            },
-        };
-        if let Some(result) = result {
+        let v2 = unsafe { state.constants.get_unchecked(c_key) };
+        if v1.is_number() && v2.is_number() {
+            let result = arith_bin!(v1, v2, *, wrapping_mul);
             Self::write_stack(state, a, result);
-            *pc += 1; // skip MMBINK
+            *pc += 1; // skip MMBIN
         }
         Ok(())
     }
@@ -8265,7 +8233,7 @@ impl VmExecutor {
         }
     }
 
-    #[cfg_attr(not(size_optimized), inline(always))]
+    #[inline(always)]
     fn arith_mod<'a>(v1: &TValue<'a>, v2: &TValue<'a>) -> Result<TValue<'a>, VmError<'a>> {
         match (v1, v2) {
             (TValue::Integer(i1), TValue::Integer(i2)) => {
@@ -8282,7 +8250,7 @@ impl VmExecutor {
         }
     }
 
-    #[cfg_attr(not(size_optimized), inline(always))]
+    #[inline(always)]
     fn arith_idiv<'a>(v1: &TValue<'a>, v2: &TValue<'a>) -> Result<TValue<'a>, VmError<'a>> {
         match (v1, v2) {
             (TValue::Integer(i1), TValue::Integer(i2)) => {
