@@ -475,6 +475,7 @@ pub fn raw_equal<'a>(t1: &TValue<'a>, t2: &TValue<'a>) -> bool {
 /// Given: m = 5, n = 0
 /// When: 调用 idiv(5, 0)
 /// Then: 返回 Err
+#[inline]
 pub fn idiv(m: LuaInteger, n: LuaInteger) -> Result<LuaInteger, &'static str> {
     if n == 0 {
         return Err("attempt to divide by zero");
@@ -610,6 +611,7 @@ pub fn shiftr(x: LuaInteger, y: LuaInteger) -> LuaInteger {
 /// Given: TValue::Integer(0)
 /// When: 调用 is_false
 /// Then: 返回 false
+#[inline]
 pub fn is_false(v: &TValue) -> bool {
     match v {
         TValue::Nil(_) => true,

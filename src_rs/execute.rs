@@ -65,26 +65,21 @@ use std::ffi::c_void;
 // ============================================================================
 // 算术二元运算宏
 // ----------------------------------------------------------------------------
-// 替代原 arith_binary(v1, v2, float_op: fn, int_op: fn) —— 函数指针参数会
-// 阻碍 LLVM 内联特化，生成间接 call（perf annotate 中可见 `call rbp`/`call r15`
-// 等间接调用）。宏用 token 拼接（$op / $int_method）直接展开为 `add`/`sub`/
-// `imul` 等原生指令，消除函数指针间接调用。
-//
-// 用法: arith_bin!(v1, v2, +, wrapping_add)  →  Integer: i1.wrapping_add(i2)
+// 用法: arith_bin!(state, a, pc, v1, v2, +, wrapping_add)  →  Integer: i1.wrapping_add(i2)
 //                                                Float:    n1 + n2
 // 整数运算用方法形式（wrapping_add 等），浮点用运算符（+/ -/ *）。
 // ============================================================================
 macro_rules! arith_bin {
-    ($v1:expr, $v2:expr, $op:tt, $int_method:ident) => {{
+    ($state:expr, $a:expr, $pc:expr, $v1:expr, $v2:expr, $op:tt, $int_method:ident) => {{
         match ($v1, $v2) {
             (TValue::Integer(i1), TValue::Integer(i2)) => {
-                TValue::Integer((*i1).$int_method(*i2))
+                Self::write_stack($state, $a, TValue::Integer((*i1).$int_method(*i2)));
+                *$pc += 1; // skip MMBIN
             }
             _ => {
                 if let (Some(n1), Some(n2)) = (to_number_ns($v1), to_number_ns($v2)) {
-                    TValue::Float(n1 $op n2)
-                } else {
-                    TValue::Nil(NilKind::Strict)
+                    Self::write_stack($state, $a, TValue::Float(n1 $op n2));
+                    *$pc += 1; // skip MMBIN
                 }
             }
         }
@@ -3318,41 +3313,28 @@ impl VmExecutor {
     fn op_getupval<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as usize;
-        // perf: 用 as_ptr() 跳过双重 RefCell borrow/unborrow 开销
-        // 每次 borrow ~3-5 cycles (is_written 检查 + counter inc/dec), 2 次 borrow = ~6-10 cycles
-        // 安全性: VM 单线程, &mut state 保证无并发借用, GETUPVAL 期间 upvals Vec 不会变
-        let val_opt: Option<TValue> = {
-            // fast_unsafe: as_ptr 跳过 Rc deref + RefCell borrow/unborrow 开销
-            // (VM 单线程, &mut state 保证无并发借用, GETUPVAL 期间 upvals Vec 不变);
-            // 安全版改走 borrow 守卫 (语义等价)。
-            #[cfg(feature = "fast_unsafe")]
-            let upvals: &UpValVec<'a> = unsafe { &*state.closure_upvals.as_ptr() };
-            #[cfg(not(feature = "fast_unsafe"))]
-            let upvals_guard = state.closure_upvals.borrow();
-            #[cfg(not(feature = "fast_unsafe"))]
-            let upvals: &UpValVec<'a> = &upvals_guard;
-            if b < upvals.len() {
-                #[cfg(feature = "fast_unsafe")]
-                let uv: &UpVal<'a> = unsafe { &*upvals[b].as_ptr() };
-                #[cfg(not(feature = "fast_unsafe"))]
-                let uv_guard = upvals[b].borrow();
-                #[cfg(not(feature = "fast_unsafe"))]
-                let uv: &UpVal<'a> = &uv_guard;
-                Some(match uv {
-                    UpVal::Closed { value } => value.clone(),
-                    UpVal::Open { stack_index, .. } => state
-                        .stack
-                        .get(*stack_index)
-                        .cloned()
-                        .unwrap_or(TValue::Nil(NilKind::Strict)),
-                })
-            } else {
-                None
-            }
+        #[cfg(feature = "fast_unsafe")]
+        let upvals: &UpValVec<'a> = unsafe { &*state.closure_upvals.as_ptr() };
+        #[cfg(not(feature = "fast_unsafe"))]
+        let upvals_guard = state.closure_upvals.borrow();
+        #[cfg(not(feature = "fast_unsafe"))]
+        let upvals: &UpValVec<'a> = &upvals_guard;
+        debug_assert!(b < upvals.len());
+        #[cfg(feature = "fast_unsafe")]
+        let uv: &UpVal<'a> = unsafe { &*upvals[b].as_ptr() };
+        #[cfg(not(feature = "fast_unsafe"))]
+        let uv_guard = upvals[b].borrow();
+        #[cfg(not(feature = "fast_unsafe"))]
+        let uv: &UpVal<'a> = &uv_guard;
+        let val = match uv {
+            UpVal::Closed { value } => value.clone(),
+            UpVal::Open { stack_index, .. } => state
+                .stack
+                .get(*stack_index)
+                .cloned()
+                .unwrap_or(TValue::Nil(NilKind::Strict)),
         };
-        if let Some(val) = val_opt {
-            Self::write_stack(state, a, val);
-        }
+        Self::write_stack(state, a, val);
         Ok(())
     }
 
@@ -4197,11 +4179,7 @@ impl VmExecutor {
         let c_key = opcodes::getarg_c(inst) as usize;
         let v1 = Self::read_stack(state, b);
         let v2 = unsafe { constants.get_unchecked(c_key) };
-        if v1.is_number() && v2.is_number() {
-            let result = arith_bin!(v1, v2, +, wrapping_add);
-            Self::write_stack(state, a, result);
-            *pc += 1; // skip MMBIN (pc 已 = cur+1, 循环头覆盖 fall-through 的 +1)
-        }
+        arith_bin!(state, a, pc, v1, v2, +, wrapping_add);
         Ok(())
     }
 
@@ -4216,11 +4194,7 @@ impl VmExecutor {
         let c_key = opcodes::getarg_c(inst) as usize;
         let v1 = Self::read_stack(state, b);
         let v2 = unsafe { state.constants.get_unchecked(c_key) };
-        if v1.is_number() && v2.is_number() {
-            let result = arith_bin!(v1, v2, -, wrapping_sub);
-            Self::write_stack(state, a, result);
-            *pc += 1; // skip MMBIN
-        }
+        arith_bin!(state, a, pc, v1, v2, -, wrapping_sub);
         Ok(())
     }
 
@@ -4235,11 +4209,7 @@ impl VmExecutor {
         let c_key = opcodes::getarg_c(inst) as usize;
         let v1 = Self::read_stack(state, b);
         let v2 = unsafe { state.constants.get_unchecked(c_key) };
-        if v1.is_number() && v2.is_number() {
-            let result = arith_bin!(v1, v2, *, wrapping_mul);
-            Self::write_stack(state, a, result);
-            *pc += 1; // skip MMBIN
-        }
+        arith_bin!(state, a, pc, v1, v2, *, wrapping_mul);
         Ok(())
     }
     #[inline]
@@ -4342,15 +4312,21 @@ impl VmExecutor {
             .cloned()
             .unwrap_or(TValue::Nil(NilKind::Strict));
         let v1 = Self::read_stack(state, b);
-        if v1.is_number() && v2.is_number() {
-            let result = Self::arith_idiv(&v1, &v2).map_err(|e| {
+        match Self::arith_idiv(&v1, &v2) {
+            Ok(result) => {
+                Self::write_stack(state, a, result);
+                *pc += 1; // skip MMBINK
+                Ok(())
+            }
+            Err(VmError::DivisionByZero) => {
                 state.pc = cur; // sync (C savepc): 整数除零行号需要当前指令
-                e
-            })?;
-            Self::write_stack(state, a, result);
-            *pc += 1; // skip MMBINK
+                Err(VmError::DivisionByZero)
+            }
+            Err(_) => {
+                // use MMBINK
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     #[inline]
@@ -4457,12 +4433,7 @@ impl VmExecutor {
         let c = Self::rc(state, inst);
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
-        if v1.is_number() && v2.is_number() {
-            // 用宏替代 arith_binary —— 消除 fn 指针间接 call，运算直接内联为 add/imul
-            let result = arith_bin!(v1, v2, +, wrapping_add);
-            Self::write_stack(state, a, result);
-            *pc += 1; // skip MMBIN (pc 已 = cur+1, 循环头覆盖 fall-through 的 +1)
-        }
+        arith_bin!(state, a, pc, v1, v2, +, wrapping_add);
         Ok(())
     }
 
@@ -4477,11 +4448,7 @@ impl VmExecutor {
         let c = Self::rc(state, inst);
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
-        if v1.is_number() && v2.is_number() {
-            let result = arith_bin!(v1, v2, -, wrapping_sub);
-            Self::write_stack(state, a, result);
-            *pc += 1; // skip MMBIN
-        }
+        arith_bin!(state, a, pc, v1, v2, -, wrapping_sub);
         Ok(())
     }
 
@@ -4496,11 +4463,7 @@ impl VmExecutor {
         let c = Self::rc(state, inst);
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
-        if v1.is_number() && v2.is_number() {
-            let result = arith_bin!(v1, v2, *, wrapping_mul);
-            Self::write_stack(state, a, result);
-            *pc += 1; // skip MMBIN
-        }
+        arith_bin!(state, a, pc, v1, v2, *, wrapping_mul);
         Ok(())
     }
 
@@ -4575,15 +4538,21 @@ impl VmExecutor {
         let c = Self::rc(state, inst);
         let v1 = Self::read_stack(state, b);
         let v2 = Self::read_stack(state, c);
-        if v1.is_number() && v2.is_number() {
-            let result = Self::arith_idiv(&v1, &v2).map_err(|e| {
+        match Self::arith_idiv(&v1, &v2) {
+            Ok(result) => {
+                Self::write_stack(state, a, result);
+                *pc += 1; // skip MMBINK
+                Ok(())
+            }
+            Err(VmError::DivisionByZero) => {
                 state.pc = cur; // sync (C savepc): 整数除零行号需要当前指令
-                e
-            })?;
-            Self::write_stack(state, a, result);
-            *pc += 1; // skip MMBIN
+                Err(VmError::DivisionByZero)
+            }
+            Err(_) => {
+                // use MMBINK
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     #[inline]
@@ -8250,20 +8219,23 @@ impl VmExecutor {
         }
     }
 
-    #[inline(always)]
+    #[inline] // 不要 inline(always)
     fn arith_idiv<'a>(v1: &TValue<'a>, v2: &TValue<'a>) -> Result<TValue<'a>, VmError<'a>> {
         match (v1, v2) {
-            (TValue::Integer(i1), TValue::Integer(i2)) => {
-                let r = idiv(*i1, *i2).map_err(|_| VmError::DivisionByZero)?;
-                Ok(TValue::Integer(r))
+            // 整数-整数：整数除法，除零走 cold
+            (TValue::Integer(i1), TValue::Integer(i2)) => match idiv(*i1, *i2) {
+                Ok(r) => Ok(TValue::Integer(r)),
+                Err(_) => Err(VmError::DivisionByZero),
+            },
+            // 热路径：Float-Float 直接除，不经过 to_number_ns / Option
+            (TValue::Float(f1), TValue::Float(f2)) => Ok(TValue::Float((*f1 / *f2).floor())),
+            (TValue::Integer(i1), TValue::Float(f2)) => {
+                Ok(TValue::Float((*i1 as f64 / *f2).floor()))
             }
-            _ => {
-                if let (Some(n1), Some(n2)) = (to_number_ns(v1), to_number_ns(v2)) {
-                    Ok(TValue::Float((n1 / n2).floor()))
-                } else {
-                    Ok(TValue::Nil(NilKind::Strict))
-                }
+            (TValue::Float(f1), TValue::Integer(i2)) => {
+                Ok(TValue::Float((*f1 / *i2 as f64).floor()))
             }
+            _ => Err(VmError::RuntimeErrorValue(TValue::Nil(NilKind::Strict))),
         }
     }
 }
