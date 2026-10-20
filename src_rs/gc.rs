@@ -1301,6 +1301,15 @@ impl<'a> LuaState<'a> {
         };
         // 标记 GC 正在运行 —— 阻止 finalizer 中重入 collectgarbage("collect")
         unsafe { self.gc_mut().gc_running.set(true) };
+
+        // 无条件排空延迟释放队列 —— 必须早于标记阶段: 队列里装的是**已死**的值
+        // (仅引用计数未减), 排空后它们才真正归还。否则 GC 会看到「不可达但引用计数
+        // 非零」的对象 (sweep 清空其内容后再由队列 drop —— 语义上多余且危险),
+        // 且 `lua_gc(COLLECT)` 之后外部字符串缓冲区的 `falloc` 尚未调用
+        // (capi::tests::test_lua_pushexternalstring_matches_c_semantics 断言)。
+        // 本处是冷路径, 无需任何长度判定。
+        self.drain_drop_queue();
+
         // 临时禁用 hook
         let saved_allowhook = self.allowhook;
         self.allowhook = false;

@@ -54,6 +54,11 @@ path = "tests_rs/longjmp_tests.rs"
 name = "capi_oom_unwind_tests"
 path = "tests_rs/capi_oom_unwind_tests.rs"
 
+# 延迟释放队列（write_stack 的旧值 Rc 释放出线到 push_drop）的有界性与排空语义
+[[test]]
+name = "drop_queue_tests"
+path = "tests_rs/drop_queue_tests.rs"
+
 [features]
 # 【临时诊断】大额分配跟踪（定位内存耗尽时仍 abort 的分配点，用完即删）
 default = ["fast_unsafe"]
