@@ -92,7 +92,8 @@ steps:
     # 表插入 +28% 回归 (CI #133)。保持通用画像; 重试在下方加
     # PGO_FOCUS: "bench/bench_X.lua:full ..." 即可 (钩子留在脚本)。
   commands:
-  # 性能基准: C vs Rust。构建决策 (PGO + panic=abort/lua_longjmp 平台默认)
+  # 性能基准: C vs Rust。构建决策 (panic=abort/lua_longjmp 平台默认, PGO 默认
+  # 关闭; 需要 PGO 时给本步骤加 environment: BENCH_PGO: 1)
   # 全部内聚在 tools/build_release_opt.sh, 本行是无内联逻辑的单条 bash 调用 —
   # Windows exec runner 对 commands 做启动期 bash 解析且内联 VAR=x 前缀在
   # #120 实证会泄漏为 cargo 参数, 命令行保持极简 (记忆 #148/#97)。
