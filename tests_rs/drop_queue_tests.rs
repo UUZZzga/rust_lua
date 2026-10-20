@@ -60,8 +60,9 @@ fn drop_queue_peak_is_bounded() {
     );
     assert!(
         st.drop_queue.capacity() <= 4096,
-        "队列容量涨到 {} —— 无调用循环里死值随迭代线性累积，回边兜底排空失效",
-        st.drop_queue.capacity()
+        "队列容量涨到 {} —— 无调用循环里死值随迭代线性累积，回边兜底排空失效（上界 {}）",
+        st.drop_queue.capacity(),
+        DROP_QUEUE_LIMIT
     );
 }
 
