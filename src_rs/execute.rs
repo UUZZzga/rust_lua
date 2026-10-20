@@ -3313,26 +3313,28 @@ impl VmExecutor {
     fn op_getupval<'a>(state: &mut LuaState<'a>, inst: Instruction) -> Result<(), VmError<'a>> {
         let a = Self::ra(state, inst);
         let b = opcodes::getarg_b(inst) as usize;
-        #[cfg(feature = "fast_unsafe")]
-        let upvals: &UpValVec<'a> = unsafe { &*state.closure_upvals.as_ptr() };
-        #[cfg(not(feature = "fast_unsafe"))]
-        let upvals_guard = state.closure_upvals.borrow();
-        #[cfg(not(feature = "fast_unsafe"))]
-        let upvals: &UpValVec<'a> = &upvals_guard;
-        debug_assert!(b < upvals.len());
-        #[cfg(feature = "fast_unsafe")]
-        let uv: &UpVal<'a> = unsafe { &*upvals[b].as_ptr() };
-        #[cfg(not(feature = "fast_unsafe"))]
-        let uv_guard = upvals[b].borrow();
-        #[cfg(not(feature = "fast_unsafe"))]
-        let uv: &UpVal<'a> = &uv_guard;
-        let val = match uv {
-            UpVal::Closed { value } => value.clone(),
-            UpVal::Open { stack_index, .. } => state
-                .stack
-                .get(*stack_index)
-                .cloned()
-                .unwrap_or(TValue::Nil(NilKind::Strict)),
+        let val = {
+            #[cfg(feature = "fast_unsafe")]
+            let upvals: &UpValVec<'a> = unsafe { &*state.closure_upvals.as_ptr() };
+            #[cfg(not(feature = "fast_unsafe"))]
+            let upvals_guard = state.closure_upvals.borrow();
+            #[cfg(not(feature = "fast_unsafe"))]
+            let upvals: &UpValVec<'a> = &upvals_guard;
+            debug_assert!(b < upvals.len());
+            #[cfg(feature = "fast_unsafe")]
+            let uv: &UpVal<'a> = unsafe { &*upvals[b].as_ptr() };
+            #[cfg(not(feature = "fast_unsafe"))]
+            let uv_guard = upvals[b].borrow();
+            #[cfg(not(feature = "fast_unsafe"))]
+            let uv: &UpVal<'a> = &uv_guard;
+            match uv {
+                UpVal::Closed { value } => value.clone(),
+                UpVal::Open { stack_index, .. } => state
+                    .stack
+                    .get(*stack_index)
+                    .cloned()
+                    .unwrap_or(TValue::Nil(NilKind::Strict)),
+            }
         };
         Self::write_stack(state, a, val);
         Ok(())
