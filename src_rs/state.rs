@@ -439,6 +439,21 @@ impl<'a> LuaState<'a> {
             drop(v); // 这里才真正 Rc::drop，批量、非热路径
         }
     }
+
+    /// 帧边界排空入口：判满才排空（`CALL` / `TAILCALL` / `RETURN` / `RETURN0` / `RETURN1`
+    /// 各调用一次，`backedge_tick` 的 64 次回边分支也调用一次兜峰值）。
+    ///
+    /// 判定放在**帧边界而不是入队侧**（`execute.rs::push_drop` 是 push-only）是性能形状的
+    /// 一部分：槽位覆盖路径只剩「push 16 B」。代价是每个真正离开/切换帧的 opcode 都必须
+    /// 调用一次 —— 早期版本把这三行散写在各 opcode 的每个 match 分支里（`CALL` 三臂、
+    /// `RETURN` 四臂…），结果漏掉了 `RETURN0` / `RETURN1`。现在每个 opcode 在 match **之前**
+    /// 调用一次（判定与 match 结果无关），新增分支不可能再漏。
+    #[inline]
+    pub fn drain_drop_queue_if_full(&mut self) {
+        if self.drop_queue.len() >= DROP_QUEUE_LIMIT {
+            self.drain_drop_queue();
+        }
+    }
 }
 
 /// 主线程构造（对应 C 的 `lua_newstate`）：创建并持有共享全局块。

@@ -1240,28 +1240,18 @@ impl VmExecutor {
                 // === 热门 opcode: 调用/返回 (flow 类: sync → handler → 重载) ===
                 OpCode::CALL => {
                     state.pc = pc - 1;
-                    match Self::op_call(state, inst) {
-                        Ok(CallOutcome::Fast) => {
-                            if state.drop_queue.len() >= crate::state::DROP_QUEUE_LIMIT {
-                                state.drain_drop_queue();
-                            }
-                            Ok(())
-                        } // pure builtin: 帧未切,
+                    let r = Self::op_call(state, inst);
+                    // 帧边界排空（判定与 match 结果无关 → 提到 match 之前，分支漏不掉）
+                    state.drain_drop_queue_if_full();
+                    match r {
+                        Ok(CallOutcome::Fast) => Ok(()), // pure builtin: 帧未切,
                         // 缓存与 pc 均有效 (state.pc 已 +1 = 局部 pc), 跳过重载
                         Ok(CallOutcome::Reload) => {
                             pc = state.pc;
                             reload_istream!(state);
-                            if state.drop_queue.len() >= crate::state::DROP_QUEUE_LIMIT {
-                                state.drain_drop_queue();
-                            }
                             Ok(())
                         }
-                        Err(e) => {
-                            if state.drop_queue.len() >= crate::state::DROP_QUEUE_LIMIT {
-                                state.drain_drop_queue();
-                            }
-                            Err(e)
-                        }
+                        Err(e) => Err(e),
                     }
                 }
                 OpCode::TAILCALL => {
@@ -1269,9 +1259,7 @@ impl VmExecutor {
                     let r = Self::op_tailcall(state, inst);
                     pc = state.pc;
                     reload_istream!(state);
-                    if state.drop_queue.len() >= crate::state::DROP_QUEUE_LIMIT {
-                        state.drain_drop_queue();
-                    }
+                    state.drain_drop_queue_if_full();
                     r
                 }
                 OpCode::RETURN => {
@@ -1280,31 +1268,12 @@ impl VmExecutor {
                     pc = state.pc;
                     reload_istream!(state);
                     Self::tick_check_interrupted(state, pc)?;
+                    state.drain_drop_queue_if_full();
                     match r {
-                        Ok(Some(vr)) => {
-                            if state.drop_queue.len() >= crate::state::DROP_QUEUE_LIMIT {
-                                state.drain_drop_queue();
-                            }
-                            return Ok(vr);
-                        }
-                        Ok(None) => {
-                            if state.drop_queue.len() >= crate::state::DROP_QUEUE_LIMIT {
-                                state.drain_drop_queue();
-                            }
-                            Ok(())
-                        }
-                        Err(VmError::Yield(values)) => {
-                            if state.drop_queue.len() >= crate::state::DROP_QUEUE_LIMIT {
-                                state.drain_drop_queue();
-                            }
-                            return Ok(VmResult::Yield { values });
-                        }
-                        Err(e) => {
-                            if state.drop_queue.len() >= crate::state::DROP_QUEUE_LIMIT {
-                                state.drain_drop_queue();
-                            }
-                            Err(e)
-                        }
+                        Ok(Some(vr)) => return Ok(vr),
+                        Ok(None) => Ok(()),
+                        Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
+                        Err(e) => Err(e),
                     }
                 }
                 OpCode::RETURN0 => {
@@ -1313,6 +1282,7 @@ impl VmExecutor {
                     pc = state.pc;
                     reload_istream!(state);
                     Self::tick_check_interrupted(state, pc)?;
+                    state.drain_drop_queue_if_full();
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
                         Ok(None) => Ok(()),
@@ -1326,6 +1296,7 @@ impl VmExecutor {
                     pc = state.pc;
                     reload_istream!(state);
                     Self::tick_check_interrupted(state, pc)?;
+                    state.drain_drop_queue_if_full();
                     match r {
                         Ok(Some(vr)) => return Ok(vr),
                         Ok(None) => Ok(()),
@@ -2239,11 +2210,12 @@ impl VmExecutor {
     /// 为什么延迟: `write_stack` 是每指令路径, `TValue::drop` 的 drop glue (判别式分支 +
     /// 可能的 `Rc` 释放/析构) 内联进去会把热循环撑大; 出线成冷调用后热路径只剩
     /// `cmpb`+前向跳转+16B 覆盖写。批量释放还有局部性收益 (连续 dealloc 同一批小对象)。
-    /// 代价: 值最多多存活 `DROP_QUEUE_LIMIT` 次写入。
     ///
-    /// 队列上界由这里保证 (唯一写入点, 每次至多加 1 个 → 恒 ≤ `DROP_QUEUE_LIMIT`),
-    /// 因此不需要在 CALL/RETURN 等热路径上额外检查; `Vec` 容量固定且永不再增长
-    /// (`drain(..)` 保留容量), 即热路径无分配 —— 保持 `write_stack` 原有的
+    /// 本函数是 **push-only** —— 写路径不带任何长度判定, 这正是性能形状的来源。队列的
+    /// 上界因此由调用点守: 帧边界 (`CALL` / `TAILCALL` / `RETURN` / `RETURN0` / `RETURN1`)
+    /// 各调一次 `LuaState::drain_drop_queue_if_full`, `backedge_tick` 的 64 次回边分支再兜
+    /// 一次峰值 (无调用循环里帧边界排空不生效, 见该处注释)。`Vec` 容量一次性预留且
+    /// `drain(..)` 保留容量, 故正常路径入队永不触发 `Vec` 增长 —— 保持 `write_stack` 原有的
     /// 「分配失败漏斗之外」属性 (真 OOM 下这里不会 abort)。
     ///
     /// 语义: 队列持有的是已被覆盖的**死值**, 仅是引用计数延迟递减 —— 对象的可达性
@@ -2535,14 +2507,25 @@ impl VmExecutor {
     /// 回边中断观测 — 跳转目标向后 (回跳) 时调用。tick 是 state 上的 Cell,
     /// 增量在调用点内联 (inc [rsi+off] 单指令), 64 边界才原子读 INTERRUPTED。
     /// 中断错误行号 = cur (回跳指令自身, 对应循环头旧方案的 state.pc = pc)。
+    ///
+    /// 同一个 64 边界也用来兜住延迟释放队列的**峰值** (见 `push_drop`): 队列只在帧边界
+    /// (CALL/TAILCALL/RETURN/RETURN0/RETURN1) 与 GC 入口排空, 所以一段不调用任何东西的循环
+    /// 会让死值随迭代线性累积 (`for i = 1, 100000 do x = a end` 实测队列容量从预留的 256
+    /// 涨到 131072, 每项 16 B + 一个未减的 `Rc`)。在这里判一次把峰值压到「上界 + 单次迭代
+    /// 写入数」, 代价落在**已经存在**的 64 边界分支内 (热路径每 64 次回边多一条 ld+cmp,
+    /// `write_stack` 完全无感知 —— 性能形状不被破坏)。回边之外没有别的无界累积途径:
+    /// 调用/递归走帧边界排空, 单次直线段受函数代码长度限制。
     #[inline]
     fn backedge_tick<'a>(state: &mut LuaState<'a>, cur: usize) -> Result<(), VmError<'a>> {
         let t = state.tick.get().wrapping_add(1);
         state.tick.set(t);
-        if t & 63 == 0 && INTERRUPTED.load(Ordering::Relaxed) {
-            INTERRUPTED.store(false, Ordering::Release);
-            state.pc = cur; // savepc: 中断错误行号
-            return Err(VmError::RuntimeError("interrupted!".to_string()));
+        if t & 63 == 0 {
+            state.drain_drop_queue_if_full();
+            if INTERRUPTED.load(Ordering::Relaxed) {
+                INTERRUPTED.store(false, Ordering::Release);
+                state.pc = cur; // savepc: 中断错误行号
+                return Err(VmError::RuntimeError("interrupted!".to_string()));
+            }
         }
         Ok(())
     }
