@@ -255,7 +255,7 @@ pub fn base_assert<'a>(args: &[TValue<'a>]) -> Result<Vec<TValue<'a>>, String> {
 /// 从栈中读取参数 (0-based 索引, 相对于函数位置 a)
 fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
     let stack_idx = a + 1 + idx;
-    if stack_idx < state.stack.len() {
+    if stack_idx < state.top {
         state.stack[stack_idx].clone()
     } else {
         TValue::Nil(NilKind::Strict)
@@ -453,9 +453,9 @@ pub(crate) fn call_pcall<'a>(
     // 把 f 和 args 移到 a 位置 (覆盖 pcall 函数本身)
     // 栈布局: [pcall_func | f | arg1 | arg2 | ...]
     // 调整为: [f | arg1 | arg2 | ...]
-    if a + 1 < state.stack.len() {
+    if a + 1 < state.top {
         state.stack[a] = func;
-        if a + 1 < state.stack.len() {
+        if a + 1 < state.top {
             state.remove_slot(a + 1);
         }
     }
@@ -463,7 +463,7 @@ pub(crate) fn call_pcall<'a>(
     // 截断栈到 f + 其参数，确保 state.pcall 通过 stack.len() 计算的 func_idx 指向 f
     // (调用方帧可能有额外寄存器残留在参数之上)
     let new_top = a + pcall_nargs + 1;
-    if state.stack.len() > new_top {
+    if state.top > new_top {
         state.truncate_live(new_top);
     }
 
@@ -526,7 +526,7 @@ pub(crate) fn call_pcall<'a>(
     }
 
     // pcall 后: 栈截断到 a, 结果在 a..
-    let nret = state.stack.len().saturating_sub(a);
+    let nret = state.top.saturating_sub(a);
 
     // 收集结果
     let mut results: Vec<TValue> = Vec::new();
@@ -607,7 +607,7 @@ fn get_func_line(proto: &Proto, pc: usize) -> i32 {
 /// 当前 Lua 函数由 state.base/pc 代表。C 函数不改变 state.base,
 /// 所以在 C 函数中调用时, state.base/pc 仍然是调用该 C 函数的 Lua 函数。
 fn get_current_lua_func_position(state: &LuaState) -> String {
-    if state.base == 0 || state.base > state.stack.len() {
+    if state.base == 0 || state.base > state.top {
         return String::new();
     }
     let closure = match &state.stack[state.base - 1] {
@@ -675,7 +675,7 @@ fn lua_l_where<'a>(state: &LuaState<'a>, level: usize) -> String {
             return String::new();
         };
         let frame = &state.call_stack[frame_idx];
-        if frame.base == 0 || frame.base > state.stack.len() {
+        if frame.base == 0 || frame.base > state.top {
             return String::new();
         }
         let closure = match &state.stack[frame.base - 1] {
@@ -812,13 +812,13 @@ fn call_tostring<'a>(
         };
         if let Some(f) = meta_fn {
             // 调用 __tostring(value)
-            let base = state.stack.len();
-            state.stack.push(f);
-            state.stack.push(arg.clone());
+            let base = state.top;
+            state.push_value(f);
+            state.push_value(arg.clone());
             let status = state.pcall(1, 1, 0);
             if status != 0 {
                 // pcall 失败: 传播错误
-                let err = if base < state.stack.len() {
+                let err = if base < state.top {
                     match &state.stack[base] {
                         s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                             lua_string_as_str(s).to_string()
@@ -832,7 +832,7 @@ fn call_tostring<'a>(
                 return Err(VmError::RuntimeError(err));
             }
             // 检查返回值是否为字符串
-            let result_str = if base < state.stack.len() {
+            let result_str = if base < state.top {
                 match &state.stack[base] {
                     s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                         Some(lua_string_as_str(&s).to_string())
@@ -863,12 +863,12 @@ fn call_tostring<'a>(
             .as_ref()
             .and_then(|mt| mt.get(&tostring_key));
         if let Some(f) = meta_fn {
-            let base = state.stack.len();
-            state.stack.push(f);
-            state.stack.push(arg.clone());
+            let base = state.top;
+            state.push_value(f);
+            state.push_value(arg.clone());
             let status = state.pcall(1, 1, 0);
             if status != 0 {
-                let err = if base < state.stack.len() {
+                let err = if base < state.top {
                     match &state.stack[base] {
                         s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                             lua_string_as_str(s).to_string()
@@ -881,7 +881,7 @@ fn call_tostring<'a>(
                 state.truncate_live(base);
                 return Err(VmError::RuntimeError(err));
             }
-            let result_str = if base < state.stack.len() {
+            let result_str = if base < state.top {
                 match &state.stack[base] {
                     s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                         Some(lua_string_as_str(s).to_string())
@@ -1203,13 +1203,12 @@ fn call_pairs<'a>(
         // 栈布局: [pairs(LightUserData) | t] → [pairs_fn | t]
         state.stack[a] = pairs_fn;
         // 确保栈上有参数 t (a+1)
-        while state.stack.len() <= a + 1 {
-            state.stack.push(TValue::Nil(NilKind::Strict));
+        while state.top <= a + 1 {
+            state.push_nil();
         }
         state.stack[a + 1] = t.clone();
         // 截断栈到 a+2 (移除多余参数)
         state.truncate_live(a + 2);
-        state.top = state.stack.len();
 
         // push pairs continuation 保护状态 — 对应 C 的 lua_callk + pairscont
         // __pairs 内部 yield 时，call_pairs 返回 Yield，保护状态保留。
@@ -1299,7 +1298,7 @@ pub(crate) fn call_xpcall<'a>(
     // 把 f 和 args 移到 a 位置
     // 栈布局: [xpcall_func | f | err_fn | arg1 | arg2 | ...]
     // 调整为: [f | arg1 | arg2 | ...]
-    if a + 2 < state.stack.len() {
+    if a + 2 < state.top {
         state.stack[a] = func;
         // 移除 f (a+1) 和 err_fn (a+2)
         state.remove_slot(a + 1);
@@ -1309,7 +1308,7 @@ pub(crate) fn call_xpcall<'a>(
     // 截断栈到 f + 其参数，确保 state.pcall 通过 stack.len() 计算的 func_idx 指向 f
     // (调用方帧可能有额外寄存器残留在参数之上)
     let new_top = a + xpcall_nargs + 1;
-    if state.stack.len() > new_top {
+    if state.top > new_top {
         state.truncate_live(new_top);
     }
 
@@ -1370,7 +1369,7 @@ pub(crate) fn call_xpcall<'a>(
         return Err(VmError::Yield(yield_values));
     }
 
-    let nret = state.stack.len().saturating_sub(a);
+    let nret = state.top.saturating_sub(a);
     let mut results: Vec<TValue> = Vec::new();
     if status == 0 {
         // 成功: true, 结果...
@@ -1431,15 +1430,15 @@ pub(crate) fn call_xpcall<'a>(
 
             // 设置栈: [err_fn | current_err]
             state.truncate_live(a);
-            state.stack.push(err_fn.clone());
-            state.stack.push(current_err.clone());
+            state.push_value(err_fn.clone());
+            state.push_value(current_err.clone());
 
             // 设置 n_ccalls = LUAI_MAXCCALLS，避免 state.pcall 触发栈溢出
             // 对应 C 中 errfunc 在 luaG_errormsg 中被调用，nCcalls 在 201-219 之间不触发错误
             state.n_ccalls = crate::state::LUAI_MAXCCALLS;
 
             handler_status = state.pcall(1, -1, 0);
-            handler_nret = state.stack.len().saturating_sub(a);
+            handler_nret = state.top.saturating_sub(a);
 
             if handler_status == 0 {
                 // handler 成功返回
@@ -1447,7 +1446,7 @@ pub(crate) fn call_xpcall<'a>(
             }
 
             // handler 失败 — 获取错误值
-            current_err = if state.stack.len() > a {
+            current_err = if state.top > a {
                 state.stack[a].clone()
             } else {
                 TValue::Nil(NilKind::Strict)
@@ -1679,10 +1678,10 @@ fn run_loader<'a>(
     loader: TValue<'a>,
     loader_data: &str,
 ) -> Result<(), VmError<'a>> {
-    let saved_len = state.stack.len();
-    state.stack.push(loader);
-    state.stack.push(state.intern_str(modname));
-    state.stack.push(state.intern_str(loader_data));
+    let saved_len = state.top;
+    state.push_value(loader);
+    state.push_value(state.intern_str(modname));
+    state.push_value(state.intern_str(loader_data));
     let status = state.pcall(2, 1, 0);
     if status != 0 {
         let err = state.to_string(-1).unwrap_or_default();
@@ -1718,7 +1717,7 @@ fn load_lua_module<'a>(
     modname: &str,
     filepath: &str,
 ) -> Result<(), VmError<'a>> {
-    let saved_len = state.stack.len();
+    let saved_len = state.top;
     let load_status = state.load_file(Some(filepath));
     if load_status != 0 {
         let err = state.to_string(-1).unwrap_or_default();
@@ -1729,8 +1728,8 @@ fn load_lua_module<'a>(
         )));
     }
     // 调用加载的函数：(modname, filepath)
-    state.stack.push(state.intern_str(modname));
-    state.stack.push(state.intern_str(filepath));
+    state.push_value(state.intern_str(modname));
+    state.push_value(state.intern_str(filepath));
     let call_status = state.pcall(2, 1, 0);
     if call_status != 0 {
         let err = state.to_string(-1).unwrap_or_default();
@@ -2578,11 +2577,11 @@ fn call_load<'a>(
             loop {
                 // 推入 reader function 到栈顶
                 // 对应 C 的 lua_pushvalue(L, 1); lua_call(L, 0, 1);
-                let saved_len = state.stack.len();
-                state.stack.push(chunk_val.clone());
+                let saved_len = state.top;
+                state.push_value(chunk_val.clone());
                 let status = state.pcall(0, 1, 0);
                 if status != 0 {
-                    let err_msg = if saved_len < state.stack.len() {
+                    let err_msg = if saved_len < state.top {
                         match &state.stack[saved_len] {
                             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                                 lua_string_as_str(s).to_string()
@@ -2598,7 +2597,7 @@ fn call_load<'a>(
                     push_results(state, a, nresults, __results);
                     return Ok(());
                 }
-                let result = if saved_len < state.stack.len() {
+                let result = if saved_len < state.top {
                     state.stack[saved_len].clone()
                 } else {
                     TValue::Nil(NilKind::Strict)
@@ -2768,7 +2767,7 @@ fn call_dofile<'a>(
     state.truncate_live(a);
     // 截断后栈顶即为 a；load_file 将 chunk 压在 a，pcall 后结果/错误也在 a。
     // 因此 saved_len 必须在 truncate 之后捕获（== a），否则旧位置无法读到结果。
-    let saved_len = state.stack.len();
+    let saved_len = state.top;
 
     let load_status = state.load_file(filename.as_deref());
     if load_status != 0 {
@@ -2799,7 +2798,7 @@ fn call_dofile<'a>(
         }
     }
 
-    let n_results = state.stack.len().saturating_sub(saved_len);
+    let n_results = state.top.saturating_sub(saved_len);
     let results: Vec<TValue> = if n_results > 0 {
         state.stack[saved_len..].to_vec()
     } else {
@@ -2889,7 +2888,7 @@ fn call_loadfile<'a>(
 
     // 保存栈位置，调用 load_filex
     state.truncate_live(a);
-    let saved_len = state.stack.len();
+    let saved_len = state.top;
 
     let status = state.load_filex(filename.as_deref(), mode.as_deref());
     if status == 0 {
@@ -3793,11 +3792,11 @@ mod tests {
     #[test]
     fn test_call_type() {
         let mut state = LuaState::default();
-        state.stack.clear();
-        state.stack.push(placeholder_builtin());
-        state.stack.push(TValue::Integer(42));
+        state.top = 0;
+        state.push_value(placeholder_builtin());
+        state.push_value(TValue::Integer(42));
         call_type(&mut state, 0, 1, 1).unwrap();
-        assert_eq!(state.stack.len(), 1);
+        assert_eq!(state.top, 1);
         match &state.stack[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                 assert_eq!(lua_string_as_str(s), "number")
@@ -3809,9 +3808,9 @@ mod tests {
     #[test]
     fn test_call_tonumber() {
         let mut state = LuaState::default();
-        state.stack.clear();
-        state.stack.push(placeholder_builtin());
-        state.stack.push(state.intern_str("42"));
+        state.top = 0;
+        state.push_value(placeholder_builtin());
+        state.push_value(state.intern_str("42"));
         call_tonumber(&mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 42),
@@ -3822,9 +3821,9 @@ mod tests {
     #[test]
     fn test_call_tostring() {
         let mut state = LuaState::default();
-        state.stack.clear();
-        state.stack.push(placeholder_builtin());
-        state.stack.push(TValue::Integer(42));
+        state.top = 0;
+        state.push_value(placeholder_builtin());
+        state.push_value(TValue::Integer(42));
         call_tostring(&mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
@@ -3837,10 +3836,10 @@ mod tests {
     #[test]
     fn test_call_rawequal() {
         let mut state = LuaState::default();
-        state.stack.clear();
-        state.stack.push(placeholder_builtin());
-        state.stack.push(TValue::Integer(42));
-        state.stack.push(TValue::Integer(42));
+        state.top = 0;
+        state.push_value(placeholder_builtin());
+        state.push_value(TValue::Integer(42));
+        state.push_value(TValue::Integer(42));
         call_rawequal(&mut state, 0, 2, 1).unwrap();
         match &state.stack[0] {
             TValue::Boolean(b) => assert!(*b),
@@ -3851,9 +3850,9 @@ mod tests {
     #[test]
     fn test_call_rawlen() {
         let mut state = LuaState::default();
-        state.stack.clear();
-        state.stack.push(placeholder_builtin());
-        state.stack.push(state.intern_str("hello"));
+        state.top = 0;
+        state.push_value(placeholder_builtin());
+        state.push_value(state.intern_str("hello"));
         call_rawlen(&mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 5),
@@ -3865,12 +3864,12 @@ mod tests {
     fn test_call_rawget() {
         let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
-        state.stack.clear();
+        state.top = 0;
         let t = Table::new_in(alloc.slot());
         t.set(TValue::Integer(1), TValue::Integer(100));
-        state.stack.push(placeholder_builtin());
-        state.stack.push(TValue::Table(t));
-        state.stack.push(TValue::Integer(1));
+        state.push_value(placeholder_builtin());
+        state.push_value(TValue::Table(t));
+        state.push_value(TValue::Integer(1));
         call_rawget(&mut state, 0, 2, 1).unwrap();
         match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 100),
@@ -3881,12 +3880,12 @@ mod tests {
     fn test_call_rawset() {
         let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
-        state.stack.clear();
+        state.top = 0;
         let t = Table::new_in(alloc.slot());
-        state.stack.push(placeholder_builtin());
-        state.stack.push(TValue::Table(t));
-        state.stack.push(TValue::Integer(1));
-        state.stack.push(TValue::Integer(999));
+        state.push_value(placeholder_builtin());
+        state.push_value(TValue::Table(t));
+        state.push_value(TValue::Integer(1));
+        state.push_value(TValue::Integer(999));
         call_rawset(&mut state, 0, 3, 1).unwrap();
         match &state.stack[0] {
             TValue::Table(t) => {
@@ -3899,12 +3898,12 @@ mod tests {
     #[test]
     fn test_call_select_hash() {
         let mut state = LuaState::default();
-        state.stack.clear();
-        state.stack.push(placeholder_builtin());
-        state.stack.push(state.intern_str("#"));
-        state.stack.push(TValue::Integer(1));
-        state.stack.push(TValue::Integer(2));
-        state.stack.push(TValue::Integer(3));
+        state.top = 0;
+        state.push_value(placeholder_builtin());
+        state.push_value(state.intern_str("#"));
+        state.push_value(TValue::Integer(1));
+        state.push_value(TValue::Integer(2));
+        state.push_value(TValue::Integer(3));
         call_select(&mut state, 0, 4, 1).unwrap();
         match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 3),
@@ -3915,14 +3914,14 @@ mod tests {
     #[test]
     fn test_call_select_index() {
         let mut state = LuaState::default();
-        state.stack.clear();
-        state.stack.push(placeholder_builtin());
-        state.stack.push(TValue::Integer(2));
-        state.stack.push(TValue::Integer(10));
-        state.stack.push(TValue::Integer(20));
-        state.stack.push(TValue::Integer(30));
+        state.top = 0;
+        state.push_value(placeholder_builtin());
+        state.push_value(TValue::Integer(2));
+        state.push_value(TValue::Integer(10));
+        state.push_value(TValue::Integer(20));
+        state.push_value(TValue::Integer(30));
         call_select(&mut state, 0, 4, -1).unwrap();
-        assert_eq!(state.stack.len(), 2);
+        assert_eq!(state.top, 2);
         match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 20),
             _ => panic!("expected integer 20"),
@@ -3936,11 +3935,11 @@ mod tests {
     #[test]
     fn test_call_assert_true() {
         let mut state = LuaState::default();
-        state.stack.clear();
-        state.stack.push(placeholder_builtin());
-        state.stack.push(TValue::Boolean(true));
+        state.top = 0;
+        state.push_value(placeholder_builtin());
+        state.push_value(TValue::Boolean(true));
         call_assert(&mut state, 0, 1, -1).unwrap();
-        assert_eq!(state.stack.len(), 1);
+        assert_eq!(state.top, 1);
         match &state.stack[0] {
             TValue::Boolean(b) => assert!(*b),
             _ => panic!("expected boolean true"),
@@ -3950,9 +3949,9 @@ mod tests {
     #[test]
     fn test_call_assert_false() {
         let mut state = LuaState::default();
-        state.stack.clear();
-        state.stack.push(placeholder_builtin());
-        state.stack.push(TValue::Boolean(false));
+        state.top = 0;
+        state.push_value(placeholder_builtin());
+        state.push_value(TValue::Boolean(false));
         let result = call_assert(&mut state, 0, 1, -1);
         assert!(result.is_err());
     }
@@ -3960,9 +3959,9 @@ mod tests {
     #[test]
     fn test_call_error() {
         let mut state = LuaState::default();
-        state.stack.clear();
-        state.stack.push(placeholder_builtin());
-        state.stack.push(state.intern_str("test error"));
+        state.top = 0;
+        state.push_value(placeholder_builtin());
+        state.push_value(state.intern_str("test error"));
         let result = call_error(&mut state, 0, 1, 0);
         assert!(result.is_err());
         match result {
@@ -3975,12 +3974,12 @@ mod tests {
     fn test_call_setmetatable() {
         let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
-        state.stack.clear();
+        state.top = 0;
         let t = Table::new_in(alloc.slot());
         let mt = Table::new_in(alloc.slot());
-        state.stack.push(placeholder_builtin());
-        state.stack.push(TValue::Table(t));
-        state.stack.push(TValue::Table(mt));
+        state.push_value(placeholder_builtin());
+        state.push_value(TValue::Table(t));
+        state.push_value(TValue::Table(mt));
         call_setmetatable(&mut state, 0, 2, 1).unwrap();
         match &state.stack[0] {
             TValue::Table(t) => assert!(t.has_metatable()),
@@ -3991,11 +3990,11 @@ mod tests {
     fn test_call_getmetatable() {
         let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
-        state.stack.clear();
+        state.top = 0;
         let t = Table::new_in(alloc.slot());
         t.set_metatable(Some(Table::new_in(alloc.slot())));
-        state.stack.push(placeholder_builtin());
-        state.stack.push(TValue::Table(t));
+        state.push_value(placeholder_builtin());
+        state.push_value(TValue::Table(t));
         call_getmetatable(&mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
             TValue::Table(_) => {}
@@ -4006,10 +4005,10 @@ mod tests {
     fn test_call_getmetatable_no_mt() {
         let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
-        state.stack.clear();
+        state.top = 0;
         let t = Table::new_in(alloc.slot());
-        state.stack.push(placeholder_builtin());
-        state.stack.push(TValue::Table(t));
+        state.push_value(placeholder_builtin());
+        state.push_value(TValue::Table(t));
         call_getmetatable(&mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
             TValue::Nil(_) => {}
@@ -4022,14 +4021,14 @@ mod tests {
     fn test_call_ipairs() {
         let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
-        state.stack.clear();
+        state.top = 0;
         let t = Table::new_in(alloc.slot());
         t.set(TValue::Integer(1), TValue::Integer(10));
         t.set(TValue::Integer(2), TValue::Integer(20));
-        state.stack.push(placeholder_builtin());
-        state.stack.push(TValue::Table(t));
+        state.push_value(placeholder_builtin());
+        state.push_value(TValue::Table(t));
         call_ipairs(&mut state, 0, 1, 3).unwrap();
-        assert_eq!(state.stack.len(), 3);
+        assert_eq!(state.top, 3);
         // 第一个返回值是迭代器函数 (BuiltinFn, func 指向 call_ipairs_aux)
         match &state.stack[0] {
             TValue::BuiltinFn(bf) => {
@@ -4054,12 +4053,12 @@ mod tests {
     fn test_call_pairs() {
         let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
-        state.stack.clear();
+        state.top = 0;
         let t = Table::new_in(alloc.slot());
-        state.stack.push(placeholder_builtin());
-        state.stack.push(TValue::Table(t));
+        state.push_value(placeholder_builtin());
+        state.push_value(TValue::Table(t));
         call_pairs(&mut state, 0, 1, 3).unwrap();
-        assert_eq!(state.stack.len(), 3);
+        assert_eq!(state.top, 3);
         // 第一个返回值是 next 迭代器 (BuiltinFn, func 指向 call_next_iter)
         match &state.stack[0] {
             TValue::BuiltinFn(bf) => {
@@ -4074,15 +4073,15 @@ mod tests {
     fn test_call_ipairs_aux() {
         let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
-        state.stack.clear();
+        state.top = 0;
         let t = Table::new_in(alloc.slot());
         t.set(TValue::Integer(1), TValue::Integer(10));
         t.set(TValue::Integer(2), TValue::Integer(20));
-        state.stack.push(placeholder_builtin());
-        state.stack.push(TValue::Table(t));
-        state.stack.push(TValue::Integer(0));
+        state.push_value(placeholder_builtin());
+        state.push_value(TValue::Table(t));
+        state.push_value(TValue::Integer(0));
         call_ipairs_aux(&mut state, 0, 2, -1).unwrap();
-        assert_eq!(state.stack.len(), 2);
+        assert_eq!(state.top, 2);
         match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 1),
             _ => panic!("expected integer 1"),
@@ -4096,13 +4095,13 @@ mod tests {
     fn test_call_ipairs_aux_end() {
         let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
-        state.stack.clear();
+        state.top = 0;
         let t = Table::new_in(alloc.slot());
-        state.stack.push(placeholder_builtin());
-        state.stack.push(TValue::Table(t));
-        state.stack.push(TValue::Integer(0));
+        state.push_value(placeholder_builtin());
+        state.push_value(TValue::Table(t));
+        state.push_value(TValue::Integer(0));
         call_ipairs_aux(&mut state, 0, 2, 1).unwrap();
-        assert_eq!(state.stack.len(), 1);
+        assert_eq!(state.top, 1);
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
     // ========================================================================

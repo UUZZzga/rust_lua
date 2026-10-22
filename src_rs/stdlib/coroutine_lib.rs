@@ -28,7 +28,7 @@ use std::rc::Rc;
 
 fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.stack.len() {
+    if stack_idx >= state.top {
         return TValue::Nil(NilKind::Strict);
     }
     state.stack[stack_idx].clone()
@@ -50,21 +50,20 @@ fn push_resume_results<'a>(
     if nresults == 0 {
         return;
     }
-    state.stack.push(TValue::Boolean(success));
+    state.push_value(TValue::Boolean(success));
     for v in values {
-        state.stack.push(v);
+        state.push_value(v);
     }
     if nresults > 0 {
-        let current = state.stack.len() - a;
+        let current = state.top - a;
         if current > nresults as usize {
             state.truncate_live(a + nresults as usize);
         } else {
-            while (state.stack.len() - a) < nresults as usize {
-                state.stack.push(TValue::Nil(NilKind::Strict));
+            while (state.top - a) < nresults as usize {
+                state.push_nil();
             }
         }
     }
-    state.top = state.stack.len();
 }
 
 /// 推送 resume 结果(从协程栈中直接读取返回值，避免创建中间 Vec)
@@ -82,7 +81,7 @@ fn push_resume_results_from_stack<'a>(
     if nresults == 0 {
         return;
     }
-    state.stack.push(TValue::Boolean(success));
+    state.push_value(TValue::Boolean(success));
     if nresults > 0 {
         // 固定结果数: 只需 nresults-1 个返回值，避免 push 全部 n 个值导致 OOM
         let nvals = (nresults as usize).saturating_sub(1);
@@ -92,11 +91,11 @@ fn push_resume_results_from_stack<'a>(
             } else {
                 TValue::Nil(NilKind::Strict)
             };
-            state.stack.push(val);
+            state.push_value(val);
         }
         // 不足则补 nil
-        while (state.stack.len() - a) < nresults as usize {
-            state.stack.push(TValue::Nil(NilKind::Strict));
+        while (state.top - a) < nresults as usize {
+            state.push_nil();
         }
     } else {
         // LUA_MULTRET: push 全部返回值
@@ -106,11 +105,10 @@ fn push_resume_results_from_stack<'a>(
             } else {
                 TValue::Nil(NilKind::Strict)
             };
-            state.stack.push(val);
+            state.push_value(val);
         }
     }
     // co_stack 在此 drop，释放协程栈内存
-    state.top = state.stack.len();
 }
 
 /// 推送 resume 错误结果: false + error message
@@ -157,10 +155,31 @@ fn init_coroutine_guards(state: &mut LuaState, saved_n_ccalls: u32) {
 // ============================================================================
 // 协程使用独立栈执行，但闭包的开 upvalue 的 stack_index 指向父栈。
 // 切换到协程栈后，Open upvalue 的 stack_index 失效。
-// 方案：协程首次 resume 前，把开 upvalue 转为 Closed（值的副本）。
+// 方案：协程每次 resume 前，把开 upvalue 转为 Closed（值的副本）。
 // 协程执行期间，SETUPVAL 修改 Closed 值。
-// 协程退出时（yield/return/error），把 Closed 值同步回父栈原位置。
-// 协程完全结束后（return/error），把 Closed 恢复为 Open（指向父栈）。
+// 协程每次退出时（yield/return/error），把 Closed 值同步回父栈原位置，
+// 并把 upvalue 恢复为 Open（指向父栈），使父线程侧的读写（含 GC finalizer）
+// 直接落在父栈槽位；下次 resume 前再重新关闭。
+
+/// 后续 resume 前：把上次 yield 时恢复为 Open 的父栈 upvalue 重新关闭。
+///
+/// yield 后父线程重新成为执行线程，这些 upvalue 必须指回父栈（外部闭包 /
+/// finalizer 写入才能被父线程看到）；再次进入协程前又必须转成 Closed 副本，
+/// 否则 `UpVal::Open` 的 stack_index 会被按协程栈解释而错位。
+/// 值取父栈当前内容（父线程可能在挂起期间修改过变量）。
+fn reclose_parent_upvals<'a>(state: &mut LuaState<'a>, origins: &[(UpValRef<'a>, usize)]) {
+    for (uv_ref, idx) in origins {
+        let is_open = matches!(&*uv_ref.borrow(), UpVal::Open { .. });
+        if is_open {
+            let val = state
+                .stack
+                .get(*idx)
+                .cloned()
+                .unwrap_or(TValue::Nil(NilKind::Strict));
+            close_upval_by_ref(state, uv_ref, val);
+        }
+    }
+}
 
 /// 开 upvalue 信息（首次 resume 时收集）
 struct OpenUpvalInfo<'a> {
@@ -614,7 +633,7 @@ fn sync_upvals_back<'a>(
             }
         };
         // 写入父栈原位置（跨栈时跳过：state.stack 不是原始父栈）
-        if write_back && info.original_stack_index < state.stack.len() {
+        if write_back && info.original_stack_index < state.top {
             state.stack[info.original_stack_index] = latest_val.clone();
         }
         // 协程已结束: 恢复为 Open（指向父栈原位置）并重新加入链表
@@ -828,7 +847,7 @@ fn sync_yield_upvals_back<'a>(state: &mut LuaState<'a>, origins: &[(UpValRef<'a>
             }
         };
         // 写回协程栈
-        if *stack_index < state.stack.len() {
+        if *stack_index < state.top {
             state.stack[*stack_index] = val;
         }
         // 恢复为 Open（指向协程栈）
@@ -1059,6 +1078,15 @@ fn close_suspended_coroutine<'a>(
     // 清空协程侧的 last_error_msg（用于检测 __close 是否出错）
     unsafe { (*co_ptr).last_error_msg.clear() };
 
+    // 挂起期间父栈侧的开 upvalue 已被恢复为 Open（指向调用者栈），
+    // 而即将运行 __close 的是协程自己的执行态：GETUPVAL/SETUPVAL 会按
+    // 协程栈解释 stack_index。必须先转回 Closed 副本（值取调用者栈当前内容），
+    // 否则 __close 读到的是协程栈同下标的无关值。
+    {
+        let origins = co_context.borrow().upval_origins.clone();
+        reclose_parent_upvals(state, &origins);
+    }
+
     // 调用 close 关闭所有 TBC upvalue（运行 __close metamethod）
     // close 函数内部对 TBC upvalue 调用 call_close_method，使用 pcall 处理错误
     // status=0 表示正常关闭（err 参数为 nil）
@@ -1172,20 +1200,19 @@ fn call_running<'a>(
 
     state.truncate_live(a);
     if nresults >= 1 {
-        state.stack.push(thread_val);
+        state.push_value(thread_val);
         if nresults >= 2 {
-            state.stack.push(TValue::Boolean(ismain));
+            state.push_value(TValue::Boolean(ismain));
         }
-        let current = state.stack.len() - a;
+        let current = state.top - a;
         for _ in current..nresults as usize {
-            state.stack.push(TValue::Nil(NilKind::Strict));
+            state.push_nil();
         }
     } else if nresults < 0 {
         // MULTRET
-        state.stack.push(thread_val);
-        state.stack.push(TValue::Boolean(ismain));
+        state.push_value(thread_val);
+        state.push_value(TValue::Boolean(ismain));
     }
-    state.top = state.stack.len();
     Ok(())
 }
 
@@ -1244,7 +1271,16 @@ fn call_resume<'a>(
     };
 
     // 收集开 upvalue 信息（在 save_caller_context 之前，state.stack 仍是父栈）
-    let open_upvals = close_open_upvals(&thread, state);
+    // 首次 resume：把可达的开 upvalue 转成 Closed 副本；
+    // 后续 resume：上次 yield 时它们已恢复为 Open（指向父栈），需重新关闭。
+    let is_first_resume = !thread.context.borrow().started;
+    let open_upvals = if is_first_resume {
+        close_open_upvals(&thread, state)
+    } else {
+        let origins = thread.context.borrow().upval_origins.clone();
+        reclose_parent_upvals(state, &origins);
+        Vec::new()
+    };
 
     // 保存调用者的 C 栈保护计数（协程执行期间可能修改；协程 exec 与调用者 exec
     // 相互独立，退出时调用者原值不受影响，无需显式还原）
@@ -1252,7 +1288,6 @@ fn call_resume<'a>(
 
     // 设置协程上下文
     let co_context = thread.context.clone();
-    let is_first_resume = !co_context.borrow().started;
     // 协程持久执行态（Box 地址稳定）；借用立即释放，执行期不得持有 RefCell 借用
     let co_ptr = co_exec_ptr(&co_context);
     // 共享调用者的全局块（对应 C 的 co->l_G = from->l_G）
@@ -1338,6 +1373,8 @@ fn call_resume<'a>(
             let co_stack = {
                 let co = unsafe { &mut *co_ptr };
                 let s = std::mem::take(&mut co.stack);
+                co.top = 0;
+                co.base = 0;
                 co.reset_scratch();
                 co.pad_frame_scratch();
                 // 协程结束，清空 call_info（对应 C 中协程 dead 后 ci 链为空）
@@ -1356,12 +1393,13 @@ fn call_resume<'a>(
             // 必须在 TBC 关闭之前保存（TBC 关闭会修改 stack[base-1]）。
             // 只克隆到 base 的部分栈（build_traceback_from_thread 只需要
             // co.stack[co.base-1] 处的 LClosure），避免克隆整个栈导致 OOM。
-            let (err_call_info, err_stack, err_base, err_pc) = {
+            let (err_call_info, err_stack, err_stack_len, err_base, err_pc) = {
                 let co = unsafe { &mut *co_ptr };
-                let save_end = co.base.min(co.stack.len());
+                let save_end = co.base.min(co.top);
                 (
                     std::mem::take(&mut co.call_info),
                     co.stack[..save_end].to_vec(),
+                    save_end,
                     co.base,
                     co.pc.wrapping_add(1),
                 )
@@ -1372,7 +1410,7 @@ fn call_resume<'a>(
             let close_level = err_base;
             {
                 let co = unsafe { &mut *co_ptr };
-                if close_level > 0 && close_level <= co.stack.len() {
+                if close_level > 0 && close_level <= co.top {
                     // 设为 nil 让 debug.getinfo 返回 "C"（对应 pcall 的 C 函数帧）
                     co.stack[close_level - 1] = TValue::Nil(NilKind::Strict);
                 }
@@ -1421,8 +1459,10 @@ fn call_resume<'a>(
                     let co = unsafe { &mut *co_ptr };
                     co.call_info = err_call_info;
                     co.stack = err_stack;
+                    // err_stack 只保留到错误层级（len = min(base, top)），
+                    // top 必须随之回落，否则 reset_scratch 会断言 top <= len
+                    co.top = err_stack_len;
                     co.reset_scratch();
-                    co.pad_frame_scratch();
                     co.base = err_base;
                     co.pad_frame_scratch();
                     co.pc = err_pc;
@@ -1437,8 +1477,9 @@ fn call_resume<'a>(
                     let co = unsafe { &mut *co_ptr };
                     co.call_info = err_call_info;
                     co.stack = err_stack;
+                    // err_stack 只保留到错误层级，top 亦须回落到同一位置
+                    co.top = err_stack_len;
                     co.reset_scratch();
-                    co.pad_frame_scratch();
                     co.base = err_base;
                     co.pad_frame_scratch();
                     co.pc = err_pc;
@@ -1462,21 +1503,19 @@ fn call_resume<'a>(
         }
     };
 
-    // 判断协程是否已结束（return/error）
-    let co_finished = matches!(
-        co_context.borrow().status,
-        ThreadStatus::OK | ThreadStatus::Error
-    );
-
     // 调用者的 n_ccalls/n_ny_calls/force_noyield_close/pcall_protection_stack 全程未动
     // （协程与调用者执行态完全独立，不再有 swap 带来的隐式恢复）。
 
-    // 把 Closed upvalue 值同步回父栈，协程结束则恢复 Open
+    // 把 Closed upvalue 值同步回父栈，并恢复为 Open（指向父栈原位置）。
+    //
+    // 挂起（yield）时同样必须恢复 Open：父线程重新执行后，外部闭包与 GC
+    // finalizer 对该变量的读写都必须落到父栈槽位，而不是协程侧的 Closed 副本
+    // （gc.lua 的 __gc 回调写主 chunk 局部变量即依赖此语义）。再次 resume 前
+    // 由 `reclose_parent_upvals` 重新转成 Closed。
     if is_first_resume {
-        sync_upvals_back(state, &open_upvals, co_finished, true);
+        sync_upvals_back(state, &open_upvals, true, true);
     } else {
-        // 后续 resume：从 upval_origins 恢复 open_upvals 信息，
-        // yield 时同步 Closed 值回父栈（保持 Closed）；结束时恢复 Open。
+        // 后续 resume：从 upval_origins 恢复 open_upvals 信息
         let origins = co_context.borrow().upval_origins.clone();
         let dead_upvals: Vec<OpenUpvalInfo> = origins
             .into_iter()
@@ -1485,7 +1524,7 @@ fn call_resume<'a>(
                 original_stack_index: idx,
             })
             .collect();
-        sync_upvals_back(state, &dead_upvals, co_finished, true);
+        sync_upvals_back(state, &dead_upvals, true, true);
     }
 
     // 推送结果
@@ -1521,8 +1560,6 @@ fn setup_first_resume<'a>(
         co.code = Rc::clone(&closure.proto.code);
         co.constants = Rc::clone(&closure.proto.constants);
         co.protos = closure.proto.protos.clone();
-        co.base = 1; // closure 在 stack[0]，寄存器从 stack[1] 开始
-        co.pad_frame_scratch();
         co.pc = 0;
         co.num_params = closure.proto.num_params;
         co.is_vararg = closure.proto.is_vararg();
@@ -1536,11 +1573,13 @@ fn setup_first_resume<'a>(
 
         // 设置栈: stack[0] = closure, stack[1..1+nargs] = resume_args
         co.stack = Vec::new();
+        co.top = 0;
+        co.base = 0;
         co.reset_scratch();
-        co.pad_frame_scratch();
-        co.stack.push(TValue::LClosure(closure.clone()));
+        co.push_value(TValue::LClosure(closure.clone()));
+        co.base = 1; // closure 在 stack[0]，寄存器从 stack[1] 开始
         for arg in resume_args {
-            co.stack.push(arg.clone());
+            co.push_value(arg.clone());
         }
 
         let nfixparams = closure.proto.num_params as usize;
@@ -1551,16 +1590,16 @@ fn setup_first_resume<'a>(
             co.truncate_live(1 + nargs);
             // 填充不足的固定参数为 nil
             for i in nargs..nfixparams {
-                while co.stack.len() <= 1 + i {
-                    co.stack.push(TValue::Nil(NilKind::Strict));
+                while co.top <= 1 + i {
+                    co.push_nil();
                 }
                 co.stack[1 + i] = TValue::Nil(NilKind::Strict);
             }
         } else {
             // 非 vararg 函数: 扩展到 fsize
             let frame_end = 1 + fsize;
-            while co.stack.len() < frame_end {
-                co.stack.push(TValue::Nil(NilKind::Strict));
+            while co.top < frame_end {
+                co.push_nil();
             }
             for i in nargs..nfixparams {
                 co.stack[1 + i] = TValue::Nil(NilKind::Strict);
@@ -1593,8 +1632,6 @@ fn setup_first_resume<'a>(
         co.code = Rc::new(vec![call_inst, return_inst]);
         co.constants = Rc::new(Vec::new());
         co.protos = Rc::new(Vec::new());
-        co.base = 1;
-        co.pad_frame_scratch();
         co.pc = 0;
         co.num_params = nargs as u8;
         co.is_vararg = false;
@@ -1609,19 +1646,20 @@ fn setup_first_resume<'a>(
 
         // 设置栈: stack[0] = func, stack[1] = func (寄存器 0), stack[2..] = args
         co.stack = Vec::new();
+        co.top = 0;
+        co.base = 0;
         co.reset_scratch();
-        co.pad_frame_scratch();
-        co.stack.push(func.clone()); // stack[0] = func (base-1)
-        co.stack.push(func.clone()); // stack[1] = func (寄存器 0)
+        co.push_value(func.clone()); // stack[0] = func (base-1)
+        co.push_value(func.clone()); // stack[1] = func (寄存器 0)
+        co.base = 1;
         for arg in resume_args {
-            co.stack.push(arg.clone());
+            co.push_value(arg.clone());
         }
     } else {
         return Err(VmError::RuntimeError(
             "coroutine body must be a function".to_string(),
         ));
     }
-    co.top = co.stack.len();
 
     // 说明: hook 字段不在此重置 —— 协程的 exec 就是 ThreadContext.exec 本身，
     // debug.sethook(co, ...) 在首次 resume 前设置的 pre-hook 天然保留。
@@ -1653,20 +1691,19 @@ fn setup_subsequent_resume<'a>(
 
     // 推送 resume 参数作为 yield 的"返回值"
     // co.stack 已被 call_yield 截断到 `a`，所以 stack.len() = a
-    let stack_base = co.stack.len();
+    let stack_base = co.top;
     for arg in resume_args {
-        co.stack.push(arg.clone());
+        co.push_value(arg.clone());
     }
     // 根据 yield 的 nresults 调整
     if yield_nresults >= 0 {
         // 固定数量: 填充 nil 或截断
-        while (co.stack.len() - stack_base) < yield_nresults as usize {
-            co.stack.push(TValue::Nil(NilKind::Strict));
+        while (co.top - stack_base) < yield_nresults as usize {
+            co.push_nil();
         }
         co.truncate_live(stack_base + yield_nresults as usize);
     }
     // nresults < 0 (MULTRET): 保留所有参数
-    co.top = co.stack.len();
 
     Ok(())
 }
@@ -1698,7 +1735,7 @@ fn call_yield<'a>(
     let yield_values: Vec<TValue> = (0..nargs)
         .map(|i| {
             let idx = a + 1 + i;
-            if idx < state.stack.len() {
+            if idx < state.top {
                 state.stack[idx].clone()
             } else {
                 TValue::Nil(NilKind::Strict)
@@ -1878,6 +1915,10 @@ fn call_wrap_fn<'a>(
         open_upvals
     } else {
         same_stack = true;
+        // 后续 resume：上次 yield 后 upvalue 已恢复为 Open（指回父栈），
+        // 重新进入协程前必须再关闭（值取父栈当前内容）。
+        let origins = thread.context.borrow().upval_origins.clone();
+        reclose_parent_upvals(state, &origins);
         Vec::new()
     };
 
@@ -1885,9 +1926,13 @@ fn call_wrap_fn<'a>(
     let saved_n_ccalls = state.n_ccalls;
     // 暂存调用者栈到 state.caller_gc_stacks — 协程执行期间 GC 需要看到调用者栈
     // 中的 wrap table 引用，否则内层协程会被误判为不可达（big.lua 嵌套 wrap 场景）
+    let saved_top = state.top;
+    let saved_base = state.base;
     let caller_stack = std::mem::take(&mut state.stack);
-    state.reset_scratch();
-    state.pad_frame_scratch();
+    // 栈已整体移出：此时空的 Vec 与旧 top 不再匹配，清零以维持
+    // 「top <= len」并保证 GC 根扫描不越界；恢复时再写回。
+    state.top = 0;
+    state.base = 0;
     state.caller_gc_stacks.push(caller_stack);
 
     // 设置协程上下文
@@ -1907,8 +1952,9 @@ fn call_wrap_fn<'a>(
     if let Err(e) = setup_result {
         // setup 失败（仅首次 resume 的"body 不是函数"路径）：恢复调用者栈
         state.stack = state.caller_gc_stacks.pop().unwrap_or_default();
+        state.top = saved_top;
+        state.base = saved_base;
         state.reset_scratch();
-        state.pad_frame_scratch();
         return Err(e);
     }
 
@@ -1925,8 +1971,9 @@ fn call_wrap_fn<'a>(
         init_coroutine_guards(co, saved_n_ccalls);
         if co.n_ccalls >= crate::state::LUAI_MAXCCALLS {
             state.stack = state.caller_gc_stacks.pop().unwrap_or_default();
+            state.top = saved_top;
+            state.base = saved_base;
             state.reset_scratch();
-            state.pad_frame_scratch();
             return Err(VmError::RuntimeError("C stack overflow".to_string()));
         }
         // 设置 current_thread（协程内 coroutine.running()/status 依赖）
@@ -1938,7 +1985,13 @@ fn call_wrap_fn<'a>(
     if is_first_resume {
         let co = unsafe { &mut *co_ptr };
         if co.hook_mask & 1 != 0 && co.hook_func.is_some() {
-            VmExecutor::call_hook(co, "call", -1, None, 0, 0)?;
+            if let Err(e) = VmExecutor::call_hook(co, "call", -1, None, 0, 0) {
+                state.stack = state.caller_gc_stacks.pop().unwrap_or_default();
+                state.top = saved_top;
+                state.base = saved_base;
+                state.reset_scratch();
+                return Err(e);
+            }
         }
     }
 
@@ -1976,7 +2029,7 @@ fn call_wrap_fn<'a>(
                 let co = unsafe { &mut *co_ptr };
                 (0..ret_n)
                     .map(|i| {
-                        if result_base + i < co.stack.len() {
+                        if result_base + i < co.top {
                             co.stack[result_base + i].clone()
                         } else {
                             TValue::Nil(NilKind::Strict)
@@ -1993,12 +2046,13 @@ fn call_wrap_fn<'a>(
         }
         Err(e) => {
             // 保存 error 状态到 ctx（必须在 TBC 关闭之前保存）
-            let (err_call_info, err_stack, err_base, err_pc) = {
+            let (err_call_info, err_stack, err_stack_len, err_base, err_pc) = {
                 let co = unsafe { &mut *co_ptr };
-                let save_end = co.base.min(co.stack.len());
+                let save_end = co.base.min(co.top);
                 (
                     std::mem::take(&mut co.call_info),
                     co.stack[..save_end].to_vec(),
+                    save_end,
                     co.base,
                     co.pc.wrapping_add(1),
                 )
@@ -2007,7 +2061,7 @@ fn call_wrap_fn<'a>(
             let close_level = err_base;
             {
                 let co = unsafe { &mut *co_ptr };
-                if close_level > 0 && close_level <= co.stack.len() {
+                if close_level > 0 && close_level <= co.top {
                     co.stack[close_level - 1] = TValue::Nil(NilKind::Strict);
                 }
             }
@@ -2030,6 +2084,8 @@ fn call_wrap_fn<'a>(
                 let co = unsafe { &mut *co_ptr };
                 co.call_info = err_call_info;
                 co.stack = err_stack;
+                // err_stack 只保留到错误层级，top 亦须回落到同一位置
+                co.top = err_stack_len;
                 co.reset_scratch();
                 co.base = err_base;
                 co.reset_scratch();
@@ -2054,16 +2110,17 @@ fn call_wrap_fn<'a>(
 
     // 各分支已完成 swap 交换回调用者 exec；恢复调用者栈
     state.stack = state.caller_gc_stacks.pop().unwrap_or_default();
+    state.top = saved_top;
+    state.base = saved_base;
     state.reset_scratch();
-    state.pad_frame_scratch();
 
-    // 把 Closed upvalue 值同步回父栈，协程结束则恢复 Open
-    // 同栈时写回 state.stack（原始父栈）；跨栈时跳过写回（父栈不可访问），仅恢复 Open
+    // 把 Closed upvalue 值同步回父栈；同栈时恢复 Open（父线程重新执行后，
+    // 外部闭包 / finalizer 的读写必须落到父栈槽位）。跨栈时父栈不可访问，
+    // 仅保留 Closed 副本。
     if is_first_resume {
-        sync_upvals_back(state, &open_upvals, is_dead, same_stack);
+        sync_upvals_back(state, &open_upvals, is_dead || same_stack, same_stack);
     } else {
-        // 后续 resume：从 upval_origins 恢复 open_upvals 信息，
-        // yield 时同步 Closed 值回父栈（保持 Closed）；结束时恢复 Open。
+        // 后续 resume：从 upval_origins 恢复 open_upvals 信息
         let origins = co_context.borrow().upval_origins.clone();
         let dead_upvals: Vec<OpenUpvalInfo> = origins
             .into_iter()
@@ -2072,7 +2129,7 @@ fn call_wrap_fn<'a>(
                 original_stack_index: idx,
             })
             .collect();
-        sync_upvals_back(state, &dead_upvals, is_dead, same_stack);
+        sync_upvals_back(state, &dead_upvals, is_dead || same_stack, same_stack);
     }
 
     // 出错时抛出错误（wrap 语义：不返回 false+err，而是直接抛错）
@@ -2090,20 +2147,19 @@ fn call_wrap_fn<'a>(
     state.truncate_live(a);
     if nresults != 0 {
         for v in result_values {
-            state.stack.push(v);
+            state.push_value(v);
         }
         if nresults > 0 {
-            let current = state.stack.len() - a;
+            let current = state.top - a;
             if current > nresults as usize {
                 state.truncate_live(a + nresults as usize);
             } else {
-                while (state.stack.len() - a) < nresults as usize {
-                    state.stack.push(TValue::Nil(NilKind::Strict));
+                while (state.top - a) < nresults as usize {
+                    state.push_nil();
                 }
             }
         }
     }
-    state.top = state.stack.len();
 
     Ok(())
 }
@@ -2165,7 +2221,7 @@ pub fn c_api_resume<'a>(
     let setup_result = if is_first_resume {
         // 首次 resume: 从本线程栈取函数和参数
         // 栈布局: [nil, func, arg1, ..., argN]
-        let stack_len = state.stack.len();
+        let stack_len = state.top;
         if stack_len < nargs + 1 {
             return Err(VmError::RuntimeError(
                 "lua_resume: not enough values on stack".to_string(),
@@ -2173,7 +2229,7 @@ pub fn c_api_resume<'a>(
         }
         let func_idx = stack_len - nargs - 1;
         let func = state.stack[func_idx].clone();
-        let resume_args: Vec<TValue> = state.stack[func_idx + 1..].to_vec();
+        let resume_args: Vec<TValue> = state.stack[func_idx + 1..state.top].to_vec();
 
         // 创建临时 LuaThread（共享 context），让 setup_first_resume 能取到 function
         let temp_thread = LuaThread {
@@ -2194,13 +2250,13 @@ pub fn c_api_resume<'a>(
         // 把它们当成实参。skynet 的协程池复用正是这条路径:
         // 上一次 dispatch 的 (session, source, cmd, ...) 会混进下一次 LAUNCH 参数，
         // 导致 debug_console 的 assert(arg.n <= 2) 失败。
-        let stack_len = state.stack.len();
+        let stack_len = state.top;
         let start = if stack_len >= nargs {
             stack_len - nargs
         } else {
             stack_len
         };
-        let resume_args: Vec<TValue> = state.stack[start..].to_vec();
+        let resume_args: Vec<TValue> = state.stack[start..state.top].to_vec();
         state.truncate_live(start);
         state.top = start;
         setup_subsequent_resume(state, &co_context, &resume_args)
@@ -2235,7 +2291,7 @@ pub fn c_api_resume<'a>(
 
     // 处理结果
     let (status, nresults) = match exec_result {
-        Ok(VmResult::Yield { values }) => {
+        Ok(VmResult::Yield { mut values }) => {
             // yield: 协程执行态原地保留（pc/call_stack/pcall 保护），状态置 Suspended
             let n = values.len();
             // C 函数 __close yield 时 pc 不应 +1（见 call_resume 同处说明）
@@ -2251,8 +2307,9 @@ pub fn c_api_resume<'a>(
             // 把 yield 值放在协程栈顶 —— 对应 C：yield 值留在协程栈顶，
             // 由 resumer 的 lua_xmove 取走；协程自身的帧/局部变量必须原样保留，
             // 否则下次 resume 继续执行时寄存器丢失（CI skynet e2e 实证 read_stack_panic）。
-            state.stack.extend(values);
-            state.top = state.stack.len();
+            for val in values.drain(..) {
+                state.push_value(val);
+            }
             (crate::capi::LUA_YIELD, n)
         }
         Ok(VmResult::Return {
@@ -2261,8 +2318,9 @@ pub fn c_api_resume<'a>(
         }) => {
             // 协程返回 — 取出返回值，重新设置栈
             let co_stack = std::mem::take(&mut state.stack);
+            state.top = 0;
+            state.base = 0;
             state.reset_scratch();
-            state.pad_frame_scratch();
             state.call_info.clear();
             {
                 let mut ctx = co_context.borrow_mut();
@@ -2281,25 +2339,25 @@ pub fn c_api_resume<'a>(
                 s.push(val);
             }
             state.stack = s;
+            state.top = ret_n + 1;
             state.reset_scratch();
-            state.pad_frame_scratch();
-            state.top = state.stack.len();
             (crate::capi::LUA_OK, ret_n)
         }
         Err(e) => {
             // 错误: 保存错误状态（pre-close 快照），关闭 TBC 变量
-            let (err_call_info, err_stack, err_base, err_pc) = {
-                let save_end = state.base.min(state.stack.len());
+            let (err_call_info, err_stack, err_base, err_pc, save_end) = {
+                let save_end = state.base.min(state.top);
                 (
                     std::mem::take(&mut state.call_info),
                     state.stack[..save_end].to_vec(),
                     state.base,
                     state.pc.wrapping_add(1),
+                    save_end,
                 )
             };
             // 关闭 TBC 变量
             let close_level = state.base;
-            if close_level > 0 && close_level <= state.stack.len() {
+            if close_level > 0 && close_level <= state.top {
                 state.stack[close_level - 1] = TValue::Nil(NilKind::Strict);
             }
             let _ = crate::func::close(state, close_level, 1, 0);
@@ -2317,8 +2375,9 @@ pub fn c_api_resume<'a>(
             });
             state.call_info = err_call_info;
             state.stack = err_stack;
+            state.top = save_end;
+            state.base = 0;
             state.reset_scratch();
-            state.pad_frame_scratch();
             state.base = err_base;
             state.pad_frame_scratch();
             state.pc = err_pc;
@@ -2329,9 +2388,9 @@ pub fn c_api_resume<'a>(
             }
             // push 错误消息: [nil, err_msg]
             state.stack = vec![TValue::Nil(NilKind::Strict), err_val];
-            state.reset_scratch();
-            state.pad_frame_scratch();
             state.top = 2;
+            state.base = 0;
+            state.reset_scratch();
             (crate::capi::LUA_ERRRUN, 1)
         }
     };
@@ -2377,10 +2436,9 @@ pub fn c_api_reset_thread<'a>(state: &mut LuaState<'a>) -> i32 {
     }
     // 对外可见的线程栈重置为初始状态（resetCI + top = stack + 1）
     state.stack = vec![TValue::Nil(NilKind::Strict)];
-    state.reset_scratch();
-    state.pad_frame_scratch();
     state.top = 1;
     state.base = 0;
+    state.reset_scratch();
     state.pc = 0;
     state.call_info.clear();
     state.call_stack.clear();
@@ -2399,9 +2457,9 @@ pub fn c_api_reset_thread<'a>(state: &mut LuaState<'a>) -> i32 {
 #[cfg(not(feature = "cmp_c"))]
 fn push_error(state: &mut LuaState, msg: &str) -> usize {
     state.stack = vec![TValue::Nil(NilKind::Strict), (state.intern_str(msg))];
-    state.reset_scratch();
-    state.pad_frame_scratch();
     state.top = 2;
+    state.base = 0;
+    state.reset_scratch();
     1
 }
 
@@ -2468,13 +2526,10 @@ mod tests {
         open_coroutine_lib(state).expect("打开 coroutine 库失败"); // 幂等：已开则只重复注册
         let func = Table::new_in(state.alloc_slot());
         state.register_table(&func).expect("登记表失败");
-        state.stack.push(TValue::Table(func)); // func 槽（Table 可调用）
-        let save_top = state.top;
-        state.top = state.stack.len();
-        // a=0: func 在槽 1（stack[0] 之后），结果写槽 2
+        state.push_value(TValue::Table(func)); // func 槽（Table 可调用）
+                                               // a=0: func 在槽 1（stack[0] 之后），结果写槽 2
         call_create(state, 0, 1, 1).expect("create must succeed");
-        state.top = save_top;
-        let slot = state.stack.len() - 1;
+        let slot = state.top - 1;
         match state.stack[slot].clone() {
             TValue::Thread(t) => t,
             other => panic!("expected thread, got {:?}", other.ty()),

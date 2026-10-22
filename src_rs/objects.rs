@@ -24,7 +24,9 @@
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
-use crate::alloc::SimpleRc;
+#[cfg(feature = "threaded")]
+use crate::alloc::simple_arc_clone;
+use crate::alloc::{myrc_clone, simple_rc_clone, SimpleRc};
 use crate::config::{LuaInteger, LuaNumber, LuaUnsigned};
 use crate::mem::SlotAlloc;
 use crate::strings::{
@@ -608,7 +610,6 @@ impl<'a> RustClosure<'a> {
 /// Given: 创建各种类型的 TValue
 /// When: 调用 .ty() 方法
 /// Then: 返回正确的 LuaType
-#[derive(Debug, Clone)]
 pub enum TValue<'a> {
     /// nil 值，带子变体（标准 nil / 空槽 / 缺键）
     Nil(NilKind),
@@ -867,11 +868,102 @@ impl<'a> TValue<'a> {
             _ => None,
         }
     }
+
+    /// 判断是否为GC对象
+    #[inline]
+    pub fn is_gc(&self) -> bool {
+        matches!(
+            self,
+            TValue::ShortStr(_)
+                | TValue::LongStr(_)
+                | TValue::Table(_)
+                | TValue::LClosure(_)
+                | TValue::CClosure(_)
+                | TValue::RustClosure(_)
+                | TValue::UserData(_)
+                | TValue::Thread(_)
+        )
+    }
+
+    #[inline(always)]
+    pub unsafe fn inc_ref_unchecked(&self) {
+        let (raw_ptr, payload_align) = match self {
+            TValue::ShortStr(rc) => {
+                #[cfg(not(feature = "threaded"))]
+                simple_rc_clone(rc.as_raw_ptr(), rc.data_off());
+                #[cfg(feature = "threaded")]
+                simple_arc_clone(rc.as_raw_ptr(), rc.data_off());
+                return;
+            }
+            TValue::LongStr(rc) => {
+                simple_rc_clone(rc.as_raw_ptr(), rc.data_off());
+                return;
+            }
+            TValue::Table(rc) => (rc.data.as_raw_ptr(), rc.data.data_off()),
+            TValue::LClosure(rc) => (rc.as_raw_ptr(), rc.data_off()),
+            TValue::CClosure(rc) => (rc.as_raw_ptr(), rc.data_off()),
+            TValue::RustClosure(rc) => (rc.as_raw_ptr(), rc.data_off()),
+            TValue::UserData(rc) => (rc.as_raw_ptr(), rc.data_off()),
+            TValue::Thread(rc) => (rc.as_raw_ptr(), rc.data_off()),
+            _ => unreachable!(),
+        };
+        unsafe { myrc_clone(raw_ptr, payload_align) };
+    }
+
+    fn fmt_impl(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TValue::Nil(NilKind::Strict) => write!(f, "nil"),
+            TValue::Nil(NilKind::Empty) => write!(f, "(empty)"),
+            TValue::Boolean(b) => {
+                // 体积优先: 避免 write!(f,"{}",b) 引入 core::fmt::num
+                #[cfg(size_optimized)]
+                {
+                    f.write_str(if *b { "true" } else { "false" })
+                }
+                #[cfg(not(size_optimized))]
+                {
+                    write!(f, "{}", b)
+                }
+            }
+            TValue::Integer(i) => {
+                // 体积优先: 用 i64_to_string 避免 write!(f,"{}",i) 引入 core::fmt::num
+                #[cfg(size_optimized)]
+                {
+                    f.write_str(&crate::float_utils::i64_to_string(*i))
+                }
+                #[cfg(not(size_optimized))]
+                {
+                    write!(f, "{}", i)
+                }
+            }
+            TValue::Float(n) => write!(f, "{}", crate::float_utils::f64_to_string(*n)),
+            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => write!(f, "{}", lua_string_as_str(s)),
+            TValue::LightUserData(p) => write!(f, "lightuserdata({:p})", p),
+            TValue::Table(_) => write!(f, "table"),
+            TValue::LClosure(_) => write!(f, "function"),
+            TValue::CClosure(_) => write!(f, "function"),
+            TValue::LCFn(_) => write!(f, "function"),
+            TValue::BuiltinFn(b) => write!(f, "function: {}", b.name_str()),
+            TValue::RustClosure(rc) => write!(f, "function: {}", rc.name_str()),
+            TValue::UserData(_) => write!(f, "userdata"),
+            TValue::Thread(_) => write!(f, "thread"),
+        }
+    }
 }
 
 impl<'a> Default for TValue<'a> {
     fn default() -> Self {
         TValue::Nil(NilKind::Strict)
+    }
+}
+
+impl<'a> Clone for TValue<'a> {
+    #[inline]
+    fn clone(&self) -> Self {
+        if self.is_gc() {
+            unsafe { self.inc_ref_unchecked() }
+        }
+        unsafe { std::ptr::read(self) }
     }
 }
 
@@ -1006,43 +1098,13 @@ impl<'a> Hash for TValue<'a> {
 // TValue 的 Display 实现用于调试输出
 impl<'a> fmt::Display for TValue<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            TValue::Nil(NilKind::Strict) => write!(f, "nil"),
-            TValue::Nil(NilKind::Empty) => write!(f, "(empty)"),
-            TValue::Boolean(b) => {
-                // 体积优先: 避免 write!(f,"{}",b) 引入 core::fmt::num
-                #[cfg(size_optimized)]
-                {
-                    f.write_str(if *b { "true" } else { "false" })
-                }
-                #[cfg(not(size_optimized))]
-                {
-                    write!(f, "{}", b)
-                }
-            }
-            TValue::Integer(i) => {
-                // 体积优先: 用 i64_to_string 避免 write!(f,"{}",i) 引入 core::fmt::num
-                #[cfg(size_optimized)]
-                {
-                    f.write_str(&crate::float_utils::i64_to_string(*i))
-                }
-                #[cfg(not(size_optimized))]
-                {
-                    write!(f, "{}", i)
-                }
-            }
-            TValue::Float(n) => write!(f, "{}", crate::float_utils::f64_to_string(*n)),
-            s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => write!(f, "{}", lua_string_as_str(s)),
-            TValue::LightUserData(p) => write!(f, "lightuserdata({:p})", p),
-            TValue::Table(_) => write!(f, "table"),
-            TValue::LClosure(_) => write!(f, "function"),
-            TValue::CClosure(_) => write!(f, "function"),
-            TValue::LCFn(_) => write!(f, "function"),
-            TValue::BuiltinFn(b) => write!(f, "function: {}", b.name_str()),
-            TValue::RustClosure(rc) => write!(f, "function: {}", rc.name_str()),
-            TValue::UserData(_) => write!(f, "userdata"),
-            TValue::Thread(_) => write!(f, "thread"),
-        }
+        self.fmt_impl(f)
+    }
+}
+
+impl<'a> fmt::Debug for TValue<'a> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.fmt_impl(f)
     }
 }
 

@@ -470,7 +470,7 @@ pub fn new_tbc_upval<'a>(
 /// 获取指定栈位置对应的局部变量名 — 对应 C 的 luaG_findlocal + luaG_getlocalname
 /// `reg` 是绝对栈位置 (对应 C 的 StkId level)，需要转换为相对于函数的局部变量编号
 fn get_var_name_at(state: &LuaState, reg: usize) -> Option<String> {
-    if state.base == 0 || state.base > state.stack.len() {
+    if state.base == 0 || state.base > state.top {
         return None;
     }
     if let TValue::LClosure(closure) = &state.stack[state.base - 1] {

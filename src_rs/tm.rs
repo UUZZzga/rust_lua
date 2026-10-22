@@ -398,12 +398,12 @@ pub(crate) fn call_tm_res<'a>(
     res: usize,
     tm: TagMethod,
 ) -> Result<(), VmError<'a>> {
-    let func_idx = state.stack.len();
+    debug_assert_eq!(state.stack.capacity(), state.stack.len());
+    let func_idx = state.top;
     // 压入函数和两个参数 (对应 C 的 setobj2s)
-    state.stack.push(f.clone());
-    state.stack.push(p1.clone());
-    state.stack.push(p2.clone());
-    state.top = state.stack.len();
+    state.push_value(f.clone());
+    state.push_value(p1.clone());
+    state.push_value(p2.clone());
 
     // 推入 CallInfoEntry — 对应 C 的 luaD_callnoyield 推入 CallInfo
     // name = 事件名 (如 "index", "add"), namewhat = "metamethod"
@@ -488,7 +488,7 @@ pub(crate) fn call_tm_res<'a>(
     state.pcall_protection_stack.pop();
 
     // pcall 后: 栈截断到 func_idx，1 个结果(或错误消息)在 func_idx
-    let result = if func_idx < state.stack.len() {
+    let result = if func_idx < state.top {
         state.stack[func_idx].clone()
     } else {
         TValue::Nil(NilKind::Strict)
@@ -520,8 +520,11 @@ pub(crate) fn call_tm_res<'a>(
     state.call_info.pop();
 
     // 将结果写入 res 槽位 (对应 C 的 setobjs2s(L, res, ...))
-    while state.stack.len() <= res {
-        state.stack.push(TValue::Nil(NilKind::Strict));
+    if state.stack.len() <= res {
+        state.stack.resize(res + 1, TValue::Nil(NilKind::Empty));
+        state
+            .stack
+            .resize(state.stack.capacity(), TValue::Nil(NilKind::Empty));
     }
     state.stack[res] = result;
     state.top = func_idx.max(res + 1);
@@ -560,12 +563,11 @@ pub(crate) fn call_tm<'a>(
     p3: &TValue<'a>,
     tm: TagMethod,
 ) -> Result<(), VmError<'a>> {
-    let func_idx = state.stack.len();
-    state.stack.push(f.clone());
-    state.stack.push(p1.clone());
-    state.stack.push(p2.clone());
-    state.stack.push(p3.clone());
-    state.top = state.stack.len();
+    let func_idx = state.top;
+    state.push_value(f.clone());
+    state.push_value(p1.clone());
+    state.push_value(p2.clone());
+    state.push_value(p3.clone());
 
     let caller_base = state.base;
     let caller_pc = state.pc;
@@ -643,7 +645,7 @@ pub(crate) fn call_tm<'a>(
     if status != 0 {
         // 元方法调用失败 — 保留 CallInfoEntry 供 traceback 使用
         // 上层 state.pcall 会保存 call_info 快照（包含此帧），然后截断到正确长度
-        let result = if func_idx < state.stack.len() {
+        let result = if func_idx < state.top {
             state.stack[func_idx].clone()
         } else {
             TValue::Nil(NilKind::Strict)
@@ -732,18 +734,17 @@ pub fn call_close_method<'a>(
         }
     };
 
-    let func_idx = state.stack.len();
+    let func_idx = state.top;
     // 压入函数和参数 (对应 C 的 callclosemethod)
     // C 中 err == NULL 时不传递第二个参数（无错误时只传 1 个参数）
-    state.stack.push(f);
-    state.stack.push(obj.clone());
+    state.push_value(f);
+    state.push_value(obj.clone());
     let nargs = if let Some(err_val) = err {
-        state.stack.push(err_val.clone());
+        state.push_value(err_val.clone());
         2
     } else {
         1
     };
-    state.top = state.stack.len();
 
     // 推入 CallInfoEntry — 对应 C 的 luaD_callnoyield 推入 CallInfo
     let caller_base = state.base;
@@ -895,8 +896,8 @@ fn callbin_tm<'a>(
                 // p2 没有元方法或也是字符串，报错
                 // 对应 C: luaL_error("attempt to %s a '%s' with a '%s'", ...)
                 let opname = tm.event_name();
-                let t1 = obj_type_name(state, p1);
-                let t2 = obj_type_name(state, p2);
+                let t1 = obj_type_name_(&state.string_table, p1);
+                let t2 = obj_type_name_(&state.string_table, p2);
                 return Err(VmError::RuntimeError(format!(
                     "attempt to {} a '{}' with a '{}'",
                     opname, t1, t2
@@ -964,8 +965,8 @@ fn string_arith<'a>(
         };
 
         if let Some(r) = result {
-            while state.stack.len() <= res {
-                state.stack.push(TValue::Nil(NilKind::Strict));
+            while state.top <= res {
+                state.push_nil();
             }
             state.stack[res] = r;
             return Ok(true);
@@ -989,8 +990,8 @@ fn string_arith<'a>(
             _ => return Ok(false),
         };
 
-        while state.stack.len() <= res {
-            state.stack.push(TValue::Nil(NilKind::Strict));
+        while state.top <= res {
+            state.push_nil();
         }
         state.stack[res] = TValue::Float(result);
         return Ok(true);
@@ -1025,14 +1026,14 @@ fn string_arith<'a>(
 /// 找到元方法时调用它并将结果写入 res 槽位；未找到时返回 VmError。
 pub fn try_bin_tm<'a>(
     state: &mut LuaState<'a>,
-    p1: &TValue<'a>,
-    p2: &TValue<'a>,
+    p1: TValue<'a>,
+    p2: TValue<'a>,
     res: usize,
     tm: TagMethod,
     p1_info: String,
     p2_info: String,
 ) -> Result<(), VmError<'a>> {
-    if !callbin_tm(state, p1, p2, res, tm)? {
+    if !callbin_tm(state, &p1, &p2, res, tm)? {
         // 未找到元方法 — 根据事件类型报错
         return Err(match tm {
             TagMethod::BAnd
@@ -1042,19 +1043,26 @@ pub fn try_bin_tm<'a>(
             | TagMethod::Shr
             | TagMethod::BNot => {
                 if p1.is_number() && p2.is_number() {
-                    tointerror(p1, p2, &p1_info, &p2_info)
+                    tointerror(&p1, &p2, &p1_info, &p2_info)
                 } else {
                     opinterror(
-                        state,
-                        p1,
-                        p2,
+                        &state.string_table,
+                        &p1,
+                        &p2,
                         "perform bitwise operation on",
                         &p1_info,
                         &p2_info,
                     )
                 }
             }
-            _ => opinterror(state, p1, p2, "perform arithmetic on", &p1_info, &p2_info),
+            _ => opinterror(
+                &state.string_table,
+                &p1,
+                &p2,
+                "perform arithmetic on",
+                &p1_info,
+                &p2_info,
+            ),
         });
     }
     Ok(())
@@ -1072,8 +1080,8 @@ pub fn try_bin_tm<'a>(
 /// ```
 pub fn try_bin_assoc_tm<'a>(
     state: &mut LuaState<'a>,
-    p1: &TValue<'a>,
-    p2: &TValue<'a>,
+    p1: TValue<'a>,
+    p2: TValue<'a>,
     flip: bool,
     res: usize,
     tm: TagMethod,
@@ -1101,7 +1109,7 @@ pub fn try_bin_assoc_tm<'a>(
 /// ```
 pub fn try_bini_tm<'a>(
     state: &mut LuaState<'a>,
-    p1: &TValue<'a>,
+    p1: TValue<'a>,
     i2: LuaInteger,
     flip: bool,
     res: usize,
@@ -1110,7 +1118,7 @@ pub fn try_bini_tm<'a>(
 ) -> Result<(), VmError<'a>> {
     let aux = TValue::Integer(i2);
     // i2 是立即数，没有寄存器位置，info 为空
-    try_bin_assoc_tm(state, p1, &aux, flip, res, tm, p1_info, String::new())
+    try_bin_assoc_tm(state, p1, aux, flip, res, tm, p1_info, String::new())
 }
 
 /// 尝试字符串拼接元方法 — 对应 C 的 luaT_tryconcatTM
@@ -1157,8 +1165,8 @@ pub fn call_order_tm<'a>(
 ) -> Result<bool, VmError<'a>> {
     debug_assert!(tm == TagMethod::Lt || tm == TagMethod::Le);
     // 使用栈顶作为临时结果槽位
-    let res = state.stack.len();
-    state.stack.push(TValue::Nil(NilKind::Strict));
+    let res = state.top;
+    state.push_nil();
 
     let found = callbin_tm(state, p1, p2, res, tm)?;
 
@@ -1270,8 +1278,8 @@ pub fn equal_obj<'a>(
     match tm {
         Some(f) => {
             // C: luaT_callTMres(L, tm, t1, t2, L->top.p); return !tagisfalse(tag);
-            let res = state.stack.len();
-            state.stack.push(TValue::Nil(NilKind::Strict));
+            let res = state.top;
+            state.push_nil();
             call_tm_res(state, &f, t1, t2, res, TagMethod::Eq)?;
             let result = state.stack[res].clone();
             state.truncate_live(res);
@@ -1334,7 +1342,7 @@ pub fn obj_len<'a>(
             } else {
                 // 无元方法: 返回表长度
                 let len = t.len();
-                crate::execute::VmExecutor::write_stack(
+                crate::execute::VmExecutor::write_stack_state(
                     state,
                     ra,
                     TValue::Integer(len as LuaInteger),
@@ -1345,7 +1353,11 @@ pub fn obj_len<'a>(
         s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
             // 字符串: 返回长度
             let len = lua_string_len(s);
-            crate::execute::VmExecutor::write_stack(state, ra, TValue::Integer(len as LuaInteger));
+            crate::execute::VmExecutor::write_stack_state(
+                state,
+                ra,
+                TValue::Integer(len as LuaInteger),
+            );
             return Ok(());
         }
         _ => {
@@ -1544,8 +1556,8 @@ mod tests {
         // 整数没有 __add 元方法，应返回 RuntimeError
         let result = try_bin_tm(
             &mut state,
-            &p1,
-            &p2,
+            p1,
+            p2,
             0,
             TagMethod::Add,
             String::new(),
@@ -1564,8 +1576,8 @@ mod tests {
         let p2 = TValue::Integer(1);
         let result = try_bin_tm(
             &mut state,
-            &p1,
-            &p2,
+            p1,
+            p2,
             0,
             TagMethod::Add,
             String::new(),

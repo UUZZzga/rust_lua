@@ -6,7 +6,7 @@
 //! - 封装所有内存分配/释放/重分配操作
 
 use crate::execute::VmError;
-use crate::objects::TValue;
+use crate::objects::{NilKind, TValue};
 use std::alloc::{self, Layout};
 use std::cell::RefCell;
 use std::ptr::NonNull;
@@ -710,7 +710,13 @@ impl<'a> crate::state::LuaState<'a> {
     /// 栈容量预留漏斗 —— 对应 C 的 `luaD_growstack`（栈数组经 `luaM_reallocvector`，
     /// 失败先紧急 GC 再重试，仍失败即内存错误）。
     pub fn reserve_stack(&mut self, additional: usize) -> Result<(), VmError<'a>> {
-        self.retry_alloc_mut(|st| st.stack.try_reserve(additional).map_err(|_| AllocFailed))
+        let res =
+            self.retry_alloc_mut(|st| st.stack.try_reserve(additional).map_err(|_| AllocFailed));
+        if res.is_ok() {
+            self.stack
+                .resize(self.stack.capacity(), TValue::Nil(NilKind::Empty));
+        }
+        res
     }
 
     /// 抛出内存错误 —— 对应 C 的 `luaM_error(L)` = `luaD_throw(L, LUA_ERRMEM)`。
@@ -752,12 +758,16 @@ impl<'a> crate::state::LuaState<'a> {
     /// `luaM_error`）。容量已够时直接返回，不分配。
     #[inline]
     pub fn grow_stack_or_throw(&mut self, additional: usize) {
+        debug_assert_eq!(self.stack.capacity(), self.stack.len());
+
         if self.stack.capacity() >= self.stack.len() + additional {
             return;
         }
         if self.reserve_stack(additional).is_err() {
             self.raise_memory_error();
         }
+        self.stack
+            .resize(self.stack.capacity(), TValue::Nil(NilKind::Empty));
     }
 }
 

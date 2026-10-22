@@ -10,7 +10,8 @@
 use crate::execute::VmError;
 use crate::objects::TValue;
 use crate::state::LuaState;
-use crate::tm::obj_type_name;
+use crate::strings::StringTable;
+use crate::tm::{obj_type_name, obj_type_name_};
 use crate::vm::{to_integer_ns, F2IMode};
 
 /// 字符串拼接错误 — 对应 C 的 luaG_concaterror
@@ -53,7 +54,7 @@ pub fn ordererror<'a>(state: &LuaState<'a>, p1: &TValue<'a>, p2: &TValue<'a>) ->
 /// }
 /// ```
 pub fn opinterror<'a>(
-    state: &LuaState<'a>,
+    table: &StringTable,
     p1: &TValue<'a>,
     p2: &TValue<'a>,
     op: &str,
@@ -66,7 +67,7 @@ pub fn opinterror<'a>(
     } else {
         (p2, p2_info)
     };
-    let tname = obj_type_name(state, err_obj);
+    let tname = obj_type_name_(table, err_obj);
     VmError::RuntimeError(format!("attempt to {} a {} value{}", op, tname, info))
 }
 

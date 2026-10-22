@@ -29,7 +29,6 @@ fn new_state() -> LuaState<'static> {
 
 fn run(st: &mut LuaState<'static>, src: &str) {
     assert_eq!(st.load_buffer(src, "=drop_queue"), 0, "编译失败: {src}");
-    st.top = st.stack.len(); // Rust 侧压栈不推进 top（GC 只把 [..top] 当根）
     assert_eq!(st.pcall(0, 0, 0), 0, "执行失败: {src}");
 }
 

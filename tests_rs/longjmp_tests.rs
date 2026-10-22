@@ -303,7 +303,6 @@ fn deep_stack_growth_failure_is_caught_by_lua_pcall() {
         }
     }
     assert_eq!(st.load_buffer(&defs, "=longjmp_defs"), 0, "定义函数失败");
-    st.top = st.stack.len(); // Rust 侧压栈不推进 top, 而 GC 只把 [..top] 当根
     assert_eq!(st.pcall(0, 0, 0), 0, "定义函数执行失败");
 
     let probe = "local ok, err = pcall(f0)\n\
@@ -311,7 +310,6 @@ fn deep_stack_growth_failure_is_caught_by_lua_pcall() {
          assert(err == 'not enough memory', '错误对象应为预注册 MEMERRMSG, 实为 ' .. tostring(err))\n\
          return 'caught'\n";
     assert_eq!(st.load_buffer(probe, "=longjmp_probe"), 0, "编译探针失败");
-    st.top = st.stack.len(); // 同上: 武装注入触发的紧急 GC 必须能看到探针函数
 
     // 反复走同一条 raise 路径并量化存活字节：每次 longjmp 都跳过 VM 派发帧
     // （`fast_resize_stack_nil` 的调用帧、op_call* 取出的 `proto` / `upvals` 引用等），
@@ -326,7 +324,6 @@ fn deep_stack_growth_failure_is_caught_by_lua_pcall() {
             0,
             "每轮编译探针失败"
         );
-        st.top = st.stack.len();
         FAIL_LARGE_ARMED.store(1, Ordering::Relaxed);
         let status = st.pcall(0, 1, 0);
         FAIL_LARGE_ARMED.store(0, Ordering::Relaxed);
@@ -346,7 +343,6 @@ fn deep_stack_growth_failure_is_caught_by_lua_pcall() {
             0,
             "编译 GC chunk 失败"
         );
-        st.top = st.stack.len();
         assert_eq!(st.pcall(0, 0, 0), 0, "GC chunk 执行失败");
     };
     // 预热一轮：栈容量的增长只发生一次，不该算进泄漏
@@ -413,7 +409,6 @@ fn capi_setter_oom_raise_does_not_abort() {
          assert(ok == false)\n\
          return err\n";
     assert_eq!(st.load_buffer(probe, "=oom_setter"), 0, "编译探针失败");
-    st.top = st.stack.len(); // Rust 侧压栈不推进 top, 而 GC 只把 [..top] 当根
 
     let hits_before = PROJ_FAIL_HITS.load(Ordering::Relaxed);
     let status = st.pcall(0, 1, 0);
@@ -442,7 +437,6 @@ fn capi_setter_oom_raise_does_not_abort() {
         0,
         "编译后置检查失败"
     );
-    st.top = st.stack.len();
     assert_eq!(st.pcall(0, 0, 0), 0, "OOM 之后解释器应可继续工作");
 }
 

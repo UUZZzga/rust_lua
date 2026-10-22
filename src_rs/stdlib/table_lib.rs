@@ -33,7 +33,7 @@ use crate::tm::{call_order_tm, obj_type_name, TagMethod};
 /// 从栈中读取参数
 fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.stack.len() {
+    if stack_idx >= state.top {
         return TValue::Nil(NilKind::Strict);
     }
     state.stack[stack_idx].clone()
@@ -42,7 +42,7 @@ fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
 /// 从栈中读取可选整数参数
 fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: LuaInteger) -> LuaInteger {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.stack.len() {
+    if stack_idx >= state.top {
         return default;
     }
     match &state.stack[stack_idx] {
@@ -59,7 +59,8 @@ fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: LuaInteger) 
 /// 调用 obj_len (会触发 __len 元方法)，然后转为整数。
 /// 如果结果不是整数，报 "object length is not an integer"。
 fn get_obj_len<'a>(state: &mut LuaState<'a>, obj: &TValue<'a>) -> Result<LuaInteger, VmError<'a>> {
-    let tmp_ra = state.stack.len();
+    let tmp_ra = state.top;
+    state.push_nil();
     crate::tm::obj_len(state, tmp_ra, obj, "")?;
     let result = state
         .stack
@@ -273,7 +274,7 @@ fn call_unpack<'a>(
         ));
     }
     let n = n_minus_1 as usize + 1;
-    if n >= i32::MAX as usize || state.stack.len().saturating_add(n) > crate::state::MAXSTACK {
+    if n >= i32::MAX as usize || state.top.saturating_add(n) > crate::state::MAXSTACK {
         return Err(VmError::RuntimeError(
             "too many results to unpack".to_string(),
         ));
@@ -283,14 +284,19 @@ fn call_unpack<'a>(
     // 用 try_reserve_exact 避免 panic，将 OOM 转为可被 pcall/resume 捕获的运行时错误。
     // 沿用 "too many results to unpack" 消息（与 MAXSTACK 检查一致），让 errors.lua:615 的
     // checkerr("too many results", f) 能匹配。
-    state
-        .stack
-        .try_reserve_exact(n)
-        .map_err(|_| VmError::RuntimeError("too many results to unpack".to_string()))?;
+    if n >= state.stack.len() - state.top {
+        state
+            .stack
+            .try_reserve_exact(n)
+            .map_err(|_| VmError::RuntimeError("too many results to unpack".to_string()))?;
+        state
+            .stack
+            .resize(state.stack.capacity(), TValue::Nil(NilKind::Empty));
+    }
 
     // 直接 push 到 state.stack，不创建中间 Vec
     // 对应 C 版 tunpack: while (i < e) { lua_geti(L, 1, i); i++; } lua_geti(L, 1, e);
-    let first_result_pos = state.stack.len();
+    let first_result_pos = state.top;
     // perf: 快速路径 — table 无元表时直接持有 Ref<TableData> 访问 array,
     // 跳过每元素的 Table::get_int (含 RefCell::borrow + Option + unwrap_or 临时对象)。
     // perf3 数据: call_unpack 占 3.01%, 快速路径热点 145e78 (62.43% Vec::push 写入) +
@@ -315,7 +321,7 @@ fn call_unpack<'a>(
                             TValue::Nil(NilKind::Empty) => TValue::Nil(NilKind::Strict),
                             other => other.clone(),
                         };
-                        state.stack.push(val);
+                        state.push_value(val);
                     }
                     drop(data);
                     state.adjust_results_on_stack(a, nresults, n, first_result_pos);
@@ -327,11 +333,11 @@ fn call_unpack<'a>(
                 let mut idx = i;
                 while idx < e {
                     let val = t.get_int(idx).unwrap_or(TValue::Nil(NilKind::Strict));
-                    state.stack.push(val);
+                    state.push_value(val);
                     idx += 1;
                 }
                 let val = t.get_int(e).unwrap_or(TValue::Nil(NilKind::Strict));
-                state.stack.push(val);
+                state.push_value(val);
                 state.adjust_results_on_stack(a, nresults, n, first_result_pos);
                 return Ok(());
             }
@@ -341,11 +347,11 @@ fn call_unpack<'a>(
     let mut idx = i;
     while idx < e {
         let val = geti_meta(state, &list_val, idx)?;
-        state.stack.push(val);
+        state.push_value(val);
         idx += 1;
     }
     let val = geti_meta(state, &list_val, e)?;
-    state.stack.push(val);
+    state.push_value(val);
 
     state.adjust_results_on_stack(a, nresults, n, first_result_pos);
     Ok(())
@@ -894,7 +900,7 @@ fn get_int_arg<'a>(
     arg_num: usize,
 ) -> Result<LuaInteger, VmError<'a>> {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.stack.len() {
+    if stack_idx >= state.top {
         return Err(VmError::RuntimeError(format!(
             "bad argument #{} to '{}' (integer expected, got no value)",
             arg_num, fname
@@ -932,11 +938,11 @@ fn call_comp_function<'a>(
     a: &TValue<'a>,
     b: &TValue<'a>,
 ) -> Result<bool, VmError<'a>> {
-    let saved_len = state.stack.len();
+    let saved_len = state.top;
     // 推入: comp, a, b
-    state.stack.push(comp.clone());
-    state.stack.push(a.clone());
-    state.stack.push(b.clone());
+    state.push_value(comp.clone());
+    state.push_value(a.clone());
+    state.push_value(b.clone());
 
     // 递增 n_ny_calls,使比较函数调用不可 yield(对应 C Lua 的 lua_call 行为)
     state.n_ny_calls += 1;
@@ -945,9 +951,12 @@ fn call_comp_function<'a>(
 
     if status != 0 {
         // 获取原始错误值并传播 (对应 C 的 lua_call 直接传播错误)
+        // pcall 失败时错误对象位于 func_idx (= saved_len)，top = saved_len + 1。
+        // 注意不能用 stack.last(): 栈的 len == capacity，末槽是 Nil scratch。
         let err_val = state
             .stack
-            .last()
+            .get(saved_len)
+            .filter(|_| saved_len < state.top)
             .cloned()
             .unwrap_or_else(|| TValue::Nil(NilKind::Strict));
         state.truncate_live(saved_len);
@@ -955,7 +964,7 @@ fn call_comp_function<'a>(
     }
 
     // pcall 后: 栈截断到 saved_len, 推入 1 个结果
-    let result = if saved_len < state.stack.len() {
+    let result = if saved_len < state.top {
         match &state.stack[saved_len] {
             TValue::Boolean(v) => *v,
             _ => false,

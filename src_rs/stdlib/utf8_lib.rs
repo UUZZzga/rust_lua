@@ -197,7 +197,7 @@ fn utf8_encode(code: u32) -> Vec<u8> {
 /// 从栈中读取字符串参数（返回字节切片）
 fn get_str_bytes<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> Result<Vec<u8>, VmError<'a>> {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.stack.len() {
+    if stack_idx >= state.top {
         return Err(VmError::RuntimeError(format!(
             "bad argument #{} (string expected, got no value)",
             idx + 1
@@ -230,7 +230,7 @@ fn get_str_bytes<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> Result<Vec<u
 /// 从栈中读取可选整数参数
 fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: LuaInteger) -> LuaInteger {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.stack.len() {
+    if stack_idx >= state.top {
         return default;
     }
     match &state.stack[stack_idx] {
@@ -247,7 +247,7 @@ fn get_opt_int_arg(state: &LuaState, a: usize, idx: usize, default: LuaInteger) 
 /// 从栈中读取布尔参数
 fn get_bool_arg(state: &LuaState, a: usize, idx: usize, default: bool) -> bool {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.stack.len() {
+    if stack_idx >= state.top {
         return default;
     }
     !state.stack[stack_idx].is_false()
@@ -261,7 +261,7 @@ fn get_required_int_arg<'a>(
     fname: &str,
 ) -> Result<LuaInteger, VmError<'a>> {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.stack.len() {
+    if stack_idx >= state.top {
         return Err(VmError::RuntimeError(format!(
             "bad argument #{} to '{}' (number expected, got no value)",
             idx + 1,
@@ -705,12 +705,12 @@ fn call_iter<'a>(
     nresults: i32,
     strict: bool,
 ) -> Result<(), VmError<'a>> {
-    let s_val = if a + 1 < state.stack.len() {
+    let s_val = if a + 1 < state.top {
         state.stack[a + 1].clone()
     } else {
         TValue::Nil(NilKind::Strict)
     };
-    let n_val = if a + 2 < state.stack.len() {
+    let n_val = if a + 2 < state.top {
         state.stack[a + 2].clone()
     } else {
         TValue::Nil(NilKind::Strict)

@@ -195,30 +195,53 @@ pub fn simple_arc_block_layout(payload_size: usize, payload_align: usize) -> Lay
 
 // ==================== JIT 运行时（extern "C"） ====================
 
+// ==================== JIT 运行时（extern "C"） ====================
+//
+// 这些函数由 JIT 生成代码调用，操作的是 Rust 智能指针（`MyRc` / `SimpleRc` /
+// `SimpleArc`，以及仅供 C 侧的 `MyArc`）使用的块。
+//
+// 布局必须与 Rust 智能指针的**带分配器槽**布局严格一致：
+//     block = header | [A] | payload
+// 其中 `A` 的偏移/尺寸由 `rc_alloc_off::<A>` / `size_of::<A>()` 决定。
+// JIT 不知道 `A` 的具体类型，因此：
+//   - `*_alloc` 接收 `block_size` / `block_align` / `payload_off`，
+//     均由 Rust 端（或 JIT 编译期对已知 `T`、`A` 的常量折叠）用
+//     [`rc_layout`] / [`rc_data_off`]（或 [`simple_layout`] / [`simple_data_off`]）
+//     预先算好；
+//   - `*_clone` / `*_downgrade` / `*_weak_clone` / `*_weak_upgrade` 只接收
+//     `payload_off`；
+//   - `*_drop` / `*_weak_drop` 接收 `payload_off` 以及 `block_size` /
+//     `block_align`，用于重建 `Layout` 完成 `dealloc`。
+
+#[inline]
+fn jit_layout_unchecked(size: usize, align: usize) -> Layout {
+    debug_assert!(align.is_power_of_two());
+    debug_assert!(size % align == 0);
+    unsafe { Layout::from_size_align_unchecked(size, align) }
+}
+
 // ---------- MyRc ----------
 
 #[no_mangle]
-pub unsafe extern "C" fn myrc_alloc(payload_size: usize, payload_align: usize) -> *mut u8 {
-    let layout = rc_block_layout(payload_size, payload_align);
+pub unsafe extern "C" fn myrc_alloc(
+    block_size: usize,
+    block_align: usize,
+    payload_off: usize,
+) -> *mut u8 {
+    let layout = jit_layout_unchecked(block_size, block_align);
     let base = alloc(layout);
     if base.is_null() {
         // 分配原语返回 NULL（C 的 `realloc` 语义）—— 调用方负责重试/报错，
         // 不在此处 abort（内存耗尽时的重试漏斗见 `LuaState::retry_alloc`）。
         return std::ptr::null_mut();
     }
-    std::ptr::write(
-        base as *mut RcHeader,
-        RcHeader {
-            strong: Cell::new(1),
-            weak: Cell::new(1),
-        },
-    );
-    base.add(rc_payload_offset(payload_align))
+    std::ptr::write(base as *mut RcHeader, RcHeader::default());
+    base.add(payload_off)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn myrc_clone(payload: *mut u8, payload_align: usize) -> *mut u8 {
-    let hdr = payload.sub(rc_payload_offset(payload_align)) as *mut RcHeader;
+pub unsafe extern "C" fn myrc_clone(payload: *mut u8, payload_off: usize) -> *mut u8 {
+    let hdr = payload.sub(payload_off) as *mut RcHeader;
     (*hdr).strong.set((*hdr).strong.get() + 1);
     payload
 }
@@ -226,12 +249,12 @@ pub unsafe extern "C" fn myrc_clone(payload: *mut u8, payload_align: usize) -> *
 #[no_mangle]
 pub unsafe extern "C" fn myrc_drop(
     payload: *mut u8,
-    payload_size: usize,
-    payload_align: usize,
+    payload_off: usize,
+    block_size: usize,
+    block_align: usize,
     drop_fn: Option<unsafe extern "C" fn(*mut u8)>,
 ) {
-    let offset = rc_payload_offset(payload_align);
-    let base = payload.sub(offset);
+    let base = payload.sub(payload_off);
     let hdr = base as *mut RcHeader;
     let c = (*hdr).strong.get();
 
@@ -246,7 +269,7 @@ pub unsafe extern "C" fn myrc_drop(
         (*hdr).weak.set(w - 1);
 
         if w == 1 {
-            dealloc(base, rc_block_layout(payload_size, payload_align));
+            dealloc(base, jit_layout_unchecked(block_size, block_align));
         }
     } else {
         (*hdr).strong.set(c - 1);
@@ -254,15 +277,15 @@ pub unsafe extern "C" fn myrc_drop(
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn myrc_downgrade(payload: *mut u8, payload_align: usize) -> *mut u8 {
-    let hdr = payload.sub(rc_payload_offset(payload_align)) as *mut RcHeader;
+pub unsafe extern "C" fn myrc_downgrade(payload: *mut u8, payload_off: usize) -> *mut u8 {
+    let hdr = payload.sub(payload_off) as *mut RcHeader;
     (*hdr).weak.set((*hdr).weak.get() + 1);
     payload
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn myrc_weak_clone(payload: *mut u8, payload_align: usize) -> *mut u8 {
-    let hdr = payload.sub(rc_payload_offset(payload_align)) as *mut RcHeader;
+pub unsafe extern "C" fn myrc_weak_clone(payload: *mut u8, payload_off: usize) -> *mut u8 {
+    let hdr = payload.sub(payload_off) as *mut RcHeader;
     (*hdr).weak.set((*hdr).weak.get() + 1);
     payload
 }
@@ -270,22 +293,22 @@ pub unsafe extern "C" fn myrc_weak_clone(payload: *mut u8, payload_align: usize)
 #[no_mangle]
 pub unsafe extern "C" fn myrc_weak_drop(
     payload: *mut u8,
-    payload_size: usize,
-    payload_align: usize,
+    payload_off: usize,
+    block_size: usize,
+    block_align: usize,
 ) {
-    let offset = rc_payload_offset(payload_align);
-    let base = payload.sub(offset);
+    let base = payload.sub(payload_off);
     let hdr = base as *mut RcHeader;
     let w = (*hdr).weak.get();
     (*hdr).weak.set(w - 1);
     if w == 1 {
-        dealloc(base, rc_block_layout(payload_size, payload_align));
+        dealloc(base, jit_layout_unchecked(block_size, block_align));
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn myrc_weak_upgrade(payload: *mut u8, payload_align: usize) -> *mut u8 {
-    let hdr = payload.sub(rc_payload_offset(payload_align)) as *mut RcHeader;
+pub unsafe extern "C" fn myrc_weak_upgrade(payload: *mut u8, payload_off: usize) -> *mut u8 {
+    let hdr = payload.sub(payload_off) as *mut RcHeader;
     let s = (*hdr).strong.get();
     if s == 0 {
         return std::ptr::null_mut();
@@ -294,28 +317,26 @@ pub unsafe extern "C" fn myrc_weak_upgrade(payload: *mut u8, payload_align: usiz
     payload
 }
 
-// ---------- MyArc ----------
+// ---------- MyArc（Rust 侧未暴露 `MyArc` 类型，仅供 C 侧使用） ----------
 
 #[no_mangle]
-pub unsafe extern "C" fn myarc_alloc(payload_size: usize, payload_align: usize) -> *mut u8 {
-    let layout = arc_block_layout(payload_size, payload_align);
+pub unsafe extern "C" fn myarc_alloc(
+    block_size: usize,
+    block_align: usize,
+    payload_off: usize,
+) -> *mut u8 {
+    let layout = jit_layout_unchecked(block_size, block_align);
     let base = alloc(layout);
     if base.is_null() {
-        return std::ptr::null_mut(); // 见 myrc_alloc：失败返回 NULL，不 abort
+        return std::ptr::null_mut();
     }
-    std::ptr::write(
-        base as *mut ArcHeader,
-        ArcHeader {
-            strong: AtomicUsize::new(1),
-            weak: AtomicUsize::new(1),
-        },
-    );
-    base.add(arc_payload_offset(payload_align))
+    std::ptr::write(base as *mut ArcHeader, ArcHeader::default());
+    base.add(payload_off)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn myarc_clone(payload: *mut u8, payload_align: usize) -> *mut u8 {
-    let hdr = payload.sub(arc_payload_offset(payload_align)) as *mut ArcHeader;
+pub unsafe extern "C" fn myarc_clone(payload: *mut u8, payload_off: usize) -> *mut u8 {
+    let hdr = payload.sub(payload_off) as *mut ArcHeader;
     (*hdr).strong.fetch_add(1, Ordering::Relaxed);
     payload
 }
@@ -323,12 +344,12 @@ pub unsafe extern "C" fn myarc_clone(payload: *mut u8, payload_align: usize) -> 
 #[no_mangle]
 pub unsafe extern "C" fn myarc_drop(
     payload: *mut u8,
-    payload_size: usize,
-    payload_align: usize,
+    payload_off: usize,
+    block_size: usize,
+    block_align: usize,
     drop_fn: Option<unsafe extern "C" fn(*mut u8)>,
 ) {
-    let offset = arc_payload_offset(payload_align);
-    let base = payload.sub(offset);
+    let base = payload.sub(payload_off);
     let hdr = base as *mut ArcHeader;
 
     if (*hdr).strong.fetch_sub(1, Ordering::Release) == 1 {
@@ -338,21 +359,21 @@ pub unsafe extern "C" fn myarc_drop(
         }
         if (*hdr).weak.fetch_sub(1, Ordering::Release) == 1 {
             fence(Ordering::Acquire);
-            dealloc(base, arc_block_layout(payload_size, payload_align));
+            dealloc(base, jit_layout_unchecked(block_size, block_align));
         }
     }
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn myarc_downgrade(payload: *mut u8, payload_align: usize) -> *mut u8 {
-    let hdr = payload.sub(arc_payload_offset(payload_align)) as *mut ArcHeader;
+pub unsafe extern "C" fn myarc_downgrade(payload: *mut u8, payload_off: usize) -> *mut u8 {
+    let hdr = payload.sub(payload_off) as *mut ArcHeader;
     (*hdr).weak.fetch_add(1, Ordering::Relaxed);
     payload
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn myarc_weak_clone(payload: *mut u8, payload_align: usize) -> *mut u8 {
-    let hdr = payload.sub(arc_payload_offset(payload_align)) as *mut ArcHeader;
+pub unsafe extern "C" fn myarc_weak_clone(payload: *mut u8, payload_off: usize) -> *mut u8 {
+    let hdr = payload.sub(payload_off) as *mut ArcHeader;
     (*hdr).weak.fetch_add(1, Ordering::Relaxed);
     payload
 }
@@ -360,39 +381,57 @@ pub unsafe extern "C" fn myarc_weak_clone(payload: *mut u8, payload_align: usize
 #[no_mangle]
 pub unsafe extern "C" fn myarc_weak_drop(
     payload: *mut u8,
-    payload_size: usize,
-    payload_align: usize,
+    payload_off: usize,
+    block_size: usize,
+    block_align: usize,
 ) {
-    let offset = arc_payload_offset(payload_align);
-    let base = payload.sub(offset);
+    let base = payload.sub(payload_off);
     let hdr = base as *mut ArcHeader;
     if (*hdr).weak.fetch_sub(1, Ordering::Release) == 1 {
         fence(Ordering::Acquire);
-        dealloc(base, arc_block_layout(payload_size, payload_align));
+        dealloc(base, jit_layout_unchecked(block_size, block_align));
+    }
+}
+
+/// 之前缺失的 `myarc_weak_upgrade`，与 `myrc_weak_upgrade` 语义对齐。
+#[no_mangle]
+pub unsafe extern "C" fn myarc_weak_upgrade(payload: *mut u8, payload_off: usize) -> *mut u8 {
+    let hdr = payload.sub(payload_off) as *mut ArcHeader;
+    loop {
+        let s = (*hdr).strong.load(Ordering::Relaxed);
+        if s == 0 {
+            return std::ptr::null_mut();
+        }
+        if (*hdr)
+            .strong
+            .compare_exchange_weak(s, s + 1, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            return payload;
+        }
     }
 }
 
 // ---------- SimpleRc ----------
 
 #[no_mangle]
-pub unsafe extern "C" fn simple_rc_alloc(payload_size: usize, payload_align: usize) -> *mut u8 {
-    let layout = simple_rc_block_layout(payload_size, payload_align);
+pub unsafe extern "C" fn simple_rc_alloc(
+    block_size: usize,
+    block_align: usize,
+    payload_off: usize,
+) -> *mut u8 {
+    let layout = jit_layout_unchecked(block_size, block_align);
     let base = alloc(layout);
     if base.is_null() {
-        return std::ptr::null_mut(); // 见 myrc_alloc：失败返回 NULL，不 abort
+        return std::ptr::null_mut();
     }
-    std::ptr::write(
-        base as *mut SimpleRcHeader,
-        SimpleRcHeader {
-            strong: Cell::new(1),
-        },
-    );
-    base.add(simple_rc_payload_offset(payload_align))
+    std::ptr::write(base as *mut SimpleRcHeader, SimpleRcHeader::default());
+    base.add(payload_off)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn simple_rc_clone(payload: *mut u8, payload_align: usize) -> *mut u8 {
-    let hdr = payload.sub(simple_rc_payload_offset(payload_align)) as *mut SimpleRcHeader;
+pub unsafe extern "C" fn simple_rc_clone(payload: *mut u8, payload_off: usize) -> *mut u8 {
+    let hdr = payload.sub(payload_off) as *mut SimpleRcHeader;
     (*hdr).strong.set((*hdr).strong.get() + 1);
     payload
 }
@@ -400,19 +439,19 @@ pub unsafe extern "C" fn simple_rc_clone(payload: *mut u8, payload_align: usize)
 #[no_mangle]
 pub unsafe extern "C" fn simple_rc_drop(
     payload: *mut u8,
-    payload_size: usize,
-    payload_align: usize,
+    payload_off: usize,
+    block_size: usize,
+    block_align: usize,
     drop_fn: Option<unsafe extern "C" fn(*mut u8)>,
 ) {
-    let offset = simple_rc_payload_offset(payload_align);
-    let base = payload.sub(offset);
+    let base = payload.sub(payload_off);
     let hdr = base as *mut SimpleRcHeader;
     let c = (*hdr).strong.get();
     if c == 1 {
         if let Some(f) = drop_fn {
             f(payload);
         }
-        dealloc(base, simple_rc_block_layout(payload_size, payload_align));
+        dealloc(base, jit_layout_unchecked(block_size, block_align));
     } else {
         (*hdr).strong.set(c - 1);
     }
@@ -421,24 +460,23 @@ pub unsafe extern "C" fn simple_rc_drop(
 // ---------- SimpleArc ----------
 
 #[no_mangle]
-pub unsafe extern "C" fn simple_arc_alloc(payload_size: usize, payload_align: usize) -> *mut u8 {
-    let layout = simple_arc_block_layout(payload_size, payload_align);
+pub unsafe extern "C" fn simple_arc_alloc(
+    block_size: usize,
+    block_align: usize,
+    payload_off: usize,
+) -> *mut u8 {
+    let layout = jit_layout_unchecked(block_size, block_align);
     let base = alloc(layout);
     if base.is_null() {
-        return std::ptr::null_mut(); // 见 myrc_alloc：失败返回 NULL，不 abort
+        return std::ptr::null_mut();
     }
-    std::ptr::write(
-        base as *mut SimpleArcHeader,
-        SimpleArcHeader {
-            strong: AtomicUsize::new(1),
-        },
-    );
-    base.add(simple_arc_payload_offset(payload_align))
+    std::ptr::write(base as *mut SimpleArcHeader, SimpleArcHeader::default());
+    base.add(payload_off)
 }
 
 #[no_mangle]
-pub unsafe extern "C" fn simple_arc_clone(payload: *mut u8, payload_align: usize) -> *mut u8 {
-    let hdr = payload.sub(simple_arc_payload_offset(payload_align)) as *mut SimpleArcHeader;
+pub unsafe extern "C" fn simple_arc_clone(payload: *mut u8, payload_off: usize) -> *mut u8 {
+    let hdr = payload.sub(payload_off) as *mut SimpleArcHeader;
     (*hdr).strong.fetch_add(1, Ordering::Relaxed);
     payload
 }
@@ -446,19 +484,19 @@ pub unsafe extern "C" fn simple_arc_clone(payload: *mut u8, payload_align: usize
 #[no_mangle]
 pub unsafe extern "C" fn simple_arc_drop(
     payload: *mut u8,
-    payload_size: usize,
-    payload_align: usize,
+    payload_off: usize,
+    block_size: usize,
+    block_align: usize,
     drop_fn: Option<unsafe extern "C" fn(*mut u8)>,
 ) {
-    let offset = simple_arc_payload_offset(payload_align);
-    let base = payload.sub(offset);
+    let base = payload.sub(payload_off);
     let hdr = base as *mut SimpleArcHeader;
     if (*hdr).strong.fetch_sub(1, Ordering::Release) == 1 {
         fence(Ordering::Acquire);
         if let Some(f) = drop_fn {
             f(payload);
         }
-        dealloc(base, simple_arc_block_layout(payload_size, payload_align));
+        dealloc(base, jit_layout_unchecked(block_size, block_align));
     }
 }
 
@@ -553,6 +591,11 @@ pub struct MyRc<T: ?Sized + RcPayload, A: Allocator = Global> {
 }
 
 impl<T: ?Sized + RcPayload, A: Allocator> MyRc<T, A> {
+    #[inline]
+    pub fn data_off(&self) -> usize {
+        rc_data_off::<A, T>()
+    }
+
     #[inline]
     pub fn as_raw_ptr(&self) -> *mut u8 {
         unsafe { self.ptr.as_ptr().add(rc_data_off::<A, T>()) }
@@ -786,6 +829,10 @@ impl<T: ?Sized + RcPayload, A: Allocator> WeakRc<T, A> {
     pub fn weak_count(&self) -> usize {
         unsafe { (*(self.ptr.as_ptr() as *const RcHeader)).weak.get() }
     }
+    #[inline]
+    pub fn data_off(&self) -> usize {
+        rc_data_off::<A, T>()
+    }
 }
 
 impl<T: ?Sized + RcPayload, A: Allocator> Drop for WeakRc<T, A> {
@@ -830,6 +877,10 @@ pub struct SimpleRc<T: ?Sized + RcPayload, A: Allocator = Global> {
 }
 
 impl<T: ?Sized + RcPayload, A: Allocator> SimpleRc<T, A> {
+    #[inline]
+    pub fn data_off(&self) -> usize {
+        simple_data_off::<A, T>()
+    }
     #[inline]
     pub fn as_raw_ptr(&self) -> *mut u8 {
         unsafe { self.ptr.as_ptr().add(simple_data_off::<A, T>()) }
@@ -987,6 +1038,10 @@ unsafe impl<T: ?Sized + RcPayload + Send + Sync, A: Allocator + Send + Sync> Syn
 }
 
 impl<T: ?Sized + RcPayload, A: Allocator> SimpleArc<T, A> {
+    #[inline]
+    pub fn data_off(&self) -> usize {
+        simple_data_off::<A, T>()
+    }
     #[inline]
     pub fn as_raw_ptr(&self) -> *mut u8 {
         unsafe { self.ptr.as_ptr().add(simple_data_off::<A, T>()) }
@@ -1350,10 +1405,13 @@ mod simple_rc_tests {
     #[test]
     fn jit_style_alloc_clone_drop() {
         unsafe {
-            let payload = simple_rc_alloc(4, 4);
+            // T = u32, A = Global
+            let l = simple_layout::<Global, u32>(4);
+            let off = simple_data_off::<Global, u32>();
+            let payload = simple_rc_alloc(l.size(), l.align(), off);
             *(payload as *mut u32) = 0xDEAD_BEEF;
 
-            let p2 = simple_rc_clone(payload, 4);
+            let p2 = simple_rc_clone(payload, off);
             assert_eq!(p2, payload);
 
             extern "C" fn dtor(p: *mut u8) {
@@ -1362,17 +1420,20 @@ mod simple_rc_tests {
                 }
             }
 
-            simple_rc_drop(payload, 4, 4, Some(dtor));
-            simple_rc_drop(p2, 4, 4, None);
+            simple_rc_drop(payload, off, l.size(), l.align(), Some(dtor));
+            simple_rc_drop(p2, off, l.size(), l.align(), None);
         }
     }
 
     #[test]
     fn jit_alloc_zero_size_payload() {
         unsafe {
-            let p = simple_rc_alloc(0, 1);
+            // payload_size = 0, align = 1
+            let l = simple_layout::<Global, u8>(0);
+            let off = simple_data_off::<Global, u8>();
+            let p = simple_rc_alloc(l.size(), l.align(), off);
             assert!(!p.is_null());
-            simple_rc_drop(p, 0, 1, None);
+            simple_rc_drop(p, off, l.size(), l.align(), None);
         }
     }
 
@@ -1523,50 +1584,60 @@ mod weak_rc_tests {
     #[test]
     fn jit_downgrade_clone_upgrade_drop() {
         unsafe {
-            let p = myrc_alloc(4, 4);
+            let l = rc_layout::<Global, u32>(4);
+            let off = rc_data_off::<Global, u32>();
+
+            let p = myrc_alloc(l.size(), l.align(), off);
             *(p as *mut u32) = 99;
 
-            let w = myrc_downgrade(p, 4);
-            let w2 = myrc_weak_clone(w, 4);
+            let w = myrc_downgrade(p, off);
+            let w2 = myrc_weak_clone(w, off);
 
-            let up = myrc_weak_upgrade(w, 4);
+            let up = myrc_weak_upgrade(w, off);
             assert!(!up.is_null());
             assert_eq!(up, p);
             assert_eq!(*(up as *const u32), 99);
 
-            myrc_drop(up, 4, 4, None);
-            myrc_drop(p, 4, 4, None);
+            myrc_drop(up, off, l.size(), l.align(), None);
+            myrc_drop(p, off, l.size(), l.align(), None);
 
-            myrc_weak_drop(w2, 4, 4);
-            myrc_weak_drop(w, 4, 4);
+            myrc_weak_drop(w2, off, l.size(), l.align());
+            myrc_weak_drop(w, off, l.size(), l.align());
         }
     }
 
     #[test]
     fn jit_upgrade_fails_after_strong_gone() {
         unsafe {
-            let p = myrc_alloc(4, 4);
+            let l = rc_layout::<Global, u32>(4);
+            let off = rc_data_off::<Global, u32>();
+
+            let p = myrc_alloc(l.size(), l.align(), off);
             *(p as *mut u32) = 5;
 
-            let w = myrc_downgrade(p, 4);
-            myrc_drop(p, 4, 4, None);
+            let w = myrc_downgrade(p, off);
+            myrc_drop(p, off, l.size(), l.align(), None);
 
-            let up = myrc_weak_upgrade(w, 4);
+            let up = myrc_weak_upgrade(w, off);
             assert!(up.is_null());
 
-            myrc_weak_drop(w, 4, 4);
+            myrc_weak_drop(w, off, l.size(), l.align());
         }
     }
 
     #[test]
     fn jit_weak_zero_releases_memory() {
         unsafe {
-            let p = myrc_alloc(16, 8);
-            let w1 = myrc_downgrade(p, 8);
-            let w2 = myrc_weak_clone(p, 8);
-            myrc_drop(p, 16, 8, None);
-            myrc_weak_drop(w1, 16, 8);
-            myrc_weak_drop(w2, 16, 8);
+            // 原测试 payload = 16 字节、align 8 → 用 [u64; 2]
+            let l = rc_layout::<Global, [u64; 2]>(16);
+            let off = rc_data_off::<Global, [u64; 2]>();
+
+            let p = myrc_alloc(l.size(), l.align(), off);
+            let w1 = myrc_downgrade(p, off);
+            let w2 = myrc_weak_clone(p, off);
+            myrc_drop(p, off, l.size(), l.align(), None);
+            myrc_weak_drop(w1, off, l.size(), l.align());
+            myrc_weak_drop(w2, off, l.size(), l.align());
         }
     }
 }
@@ -1608,14 +1679,17 @@ mod myrc_tests {
     #[test]
     fn jit_roundtrip() {
         unsafe {
-            let p = myrc_alloc(8, 8);
+            let l = rc_layout::<Global, u64>(8);
+            let off = rc_data_off::<Global, u64>();
+
+            let p = myrc_alloc(l.size(), l.align(), off);
             *(p as *mut u64) = 0x1234_5678_9ABC_DEF0;
 
-            let p2 = myrc_clone(p, 8);
+            let p2 = myrc_clone(p, off);
             assert_eq!(p, p2);
 
-            myrc_drop(p, 8, 8, None);
-            myrc_drop(p2, 8, 8, None);
+            myrc_drop(p, off, l.size(), l.align(), None);
+            myrc_drop(p2, off, l.size(), l.align(), None);
         }
     }
 }
@@ -1641,15 +1715,19 @@ mod simple_arc_single_thread {
     #[test]
     fn jit_roundtrip() {
         unsafe {
-            let p = simple_arc_alloc(16, 8);
+            // payload = 16 字节 (两个 u64)，align 8
+            let l = simple_layout::<Global, [u64; 2]>(16);
+            let off = simple_data_off::<Global, [u64; 2]>();
+
+            let p = simple_arc_alloc(l.size(), l.align(), off);
             *(p as *mut u64) = 11;
             *(p.add(8) as *mut u64) = 22;
 
-            let p2 = simple_arc_clone(p, 8);
+            let p2 = simple_arc_clone(p, off);
             assert_eq!(p, p2);
 
-            simple_arc_drop(p2, 16, 8, None);
-            simple_arc_drop(p, 16, 8, None);
+            simple_arc_drop(p2, off, l.size(), l.align(), None);
+            simple_arc_drop(p, off, l.size(), l.align(), None);
         }
     }
 }
@@ -1693,21 +1771,21 @@ mod arc_thread_tests {
         let a = SimpleArc::new(probe);
         let p_addr = a.as_raw_ptr() as usize;
 
+        // 布局在进入线程前算好（Layout 是 Copy + Send + Sync）
+        let l = simple_layout::<Global, DropProbe>(std::mem::size_of::<DropProbe>());
+        let off = simple_data_off::<Global, DropProbe>();
+        let (block_size, block_align) = (l.size(), l.align());
+
         let h = thread::spawn(move || {
             let p = p_addr as *mut u8;
             unsafe {
-                let p2 = simple_arc_clone(p, std::mem::align_of::<DropProbe>());
+                let p2 = simple_arc_clone(p, off);
                 extern "C" fn dtor(ptr: *mut u8) {
                     unsafe {
                         std::ptr::drop_in_place(ptr as *mut DropProbe);
                     }
                 }
-                simple_arc_drop(
-                    p2,
-                    std::mem::size_of::<DropProbe>(),
-                    std::mem::align_of::<DropProbe>(),
-                    Some(dtor),
-                );
+                simple_arc_drop(p2, off, block_size, block_align, Some(dtor));
             }
         });
         h.join().unwrap();
@@ -1726,12 +1804,16 @@ mod interop_tests {
         let r = SimpleRc::new(99u32);
         let p = r.as_raw_ptr();
 
-        let p2 = unsafe { simple_rc_clone(p, 4) };
+        // 关键点：JIT 侧的 payload_off / 布局必须与 Rust 智能指针完全一致
+        let l = simple_layout::<Global, u32>(4);
+        let off = simple_data_off::<Global, u32>();
+
+        let p2 = unsafe { simple_rc_clone(p, off) };
         assert_eq!(p, p2);
 
         unsafe {
             assert_eq!(*(p2 as *const u32), 99);
-            simple_rc_drop(p2, 4, 4, None);
+            simple_rc_drop(p2, off, l.size(), l.align(), None);
         }
         drop(r);
     }
@@ -1743,5 +1825,101 @@ mod interop_tests {
         let r2 = r.clone();
         assert_eq!(r.as_raw_ptr(), p);
         assert_eq!(r2.as_raw_ptr(), p);
+    }
+}
+#[cfg(test)]
+mod jit_capi_layout_consistency {
+    use super::*;
+    use crate::mem::SlotAlloc;
+
+    /// JIT C API 用 Rust 算出的布局参数，必须与 `MyRc<T, A>` 的块布局严格一致。
+    #[test]
+    fn myrc_capi_matches_rust_layout_for_all_allocators() {
+        // A = Global
+        let l = rc_layout::<Global, u64>(8);
+        let off = rc_data_off::<Global, u64>();
+        assert_eq!(off, 16);
+        assert_eq!(l.size(), 24);
+        assert_eq!(l.align(), 8);
+
+        unsafe {
+            let p = myrc_alloc(l.size(), l.align(), off);
+            assert!(!p.is_null());
+            *(p as *mut u64) = 0x1234_5678_9ABC_DEF0;
+            let p2 = myrc_clone(p, off);
+            assert_eq!(p, p2);
+            myrc_drop(p2, off, l.size(), l.align(), None);
+            myrc_drop(p, off, l.size(), l.align(), None);
+        }
+
+        // A = SlotAlloc
+        let l = rc_layout::<SlotAlloc, u64>(8);
+        let off = rc_data_off::<SlotAlloc, u64>();
+        assert_eq!(off, 24);
+        assert_eq!(l.size(), 32);
+        assert_eq!(l.align(), 8);
+
+        unsafe {
+            let p = myrc_alloc(l.size(), l.align(), off);
+            assert!(!p.is_null());
+            *(p as *mut u64) = 0xDEAD_BEEF_CAFE_1234;
+            let p2 = myrc_clone(p, off);
+            assert_eq!(p, p2);
+            myrc_drop(p2, off, l.size(), l.align(), None);
+            myrc_drop(p, off, l.size(), l.align(), None);
+        }
+    }
+
+    #[test]
+    fn simple_rc_capi_matches_rust_layout_for_slot_alloc() {
+        let l = simple_layout::<SlotAlloc, u64>(8);
+        let off = simple_data_off::<SlotAlloc, u64>();
+        assert_eq!(off, 16);
+        assert_eq!(l.size(), 24);
+
+        unsafe {
+            let p = simple_rc_alloc(l.size(), l.align(), off);
+            assert!(!p.is_null());
+            *(p as *mut u64) = 7;
+            let p2 = simple_rc_clone(p, off);
+            assert_eq!(*(p2 as *const u64), 7);
+            simple_rc_drop(p2, off, l.size(), l.align(), None);
+            simple_rc_drop(p, off, l.size(), l.align(), None);
+        }
+    }
+
+    #[test]
+    fn simple_arc_capi_matches_rust_layout_for_slot_alloc() {
+        let l = simple_layout::<SlotAlloc, u64>(8);
+        let off = simple_data_off::<SlotAlloc, u64>();
+
+        unsafe {
+            let p = simple_arc_alloc(l.size(), l.align(), off);
+            assert!(!p.is_null());
+            *(p as *mut u64) = 11;
+            let p2 = simple_arc_clone(p, off);
+            assert_eq!(*(p2 as *const u64), 11);
+            simple_arc_drop(p2, off, l.size(), l.align(), None);
+            simple_arc_drop(p, off, l.size(), l.align(), None);
+        }
+    }
+
+    /// 验证 `myarc_weak_upgrade` 补齐后行为与 `myrc_weak_upgrade` 一致。
+    #[test]
+    fn myarc_weak_upgrade_roundtrip() {
+        let l = rc_layout::<Global, u64>(8);
+        let off = rc_data_off::<Global, u64>();
+
+        unsafe {
+            let p = myarc_alloc(l.size(), l.align(), off);
+            *(p as *mut u64) = 42;
+            let w = myarc_downgrade(p, off);
+            let up = myarc_weak_upgrade(w, off);
+            assert!(!up.is_null());
+            assert_eq!(*(up as *const u64), 42);
+            myarc_drop(up, off, l.size(), l.align(), None);
+            myarc_drop(p, off, l.size(), l.align(), None);
+            myarc_weak_drop(w, off, l.size(), l.align());
+        }
     }
 }

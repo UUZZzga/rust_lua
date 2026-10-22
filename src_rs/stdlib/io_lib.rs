@@ -160,7 +160,7 @@ const MAXARGLINE: usize = 250;
 
 fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.stack.len() {
+    if stack_idx >= state.top {
         return TValue::Nil(NilKind::Strict);
     }
     state.stack[stack_idx].clone()
@@ -598,7 +598,7 @@ fn g_write<'a>(
     }
     for i in 0..nargs {
         let arg_idx = first_arg + i;
-        let val = if arg_idx < state.stack.len() {
+        let val = if arg_idx < state.top {
             state.stack[arg_idx].clone()
         } else {
             TValue::Nil(NilKind::Strict)
@@ -1300,7 +1300,7 @@ fn g_read<'a>(
     } else {
         for i in 0..nargs {
             let arg_idx = first_arg + i;
-            let val = if arg_idx < state.stack.len() {
+            let val = if arg_idx < state.top {
                 state.stack[arg_idx].clone()
             } else {
                 TValue::Nil(NilKind::Strict)
@@ -1993,10 +1993,10 @@ fn call_lines_iterator_fn<'a>(
     };
 
     // 把 formats 推入临时栈, 调用 g_read
-    let saved_stack_len = state.stack.len();
+    let saved_stack_len = state.top;
     state.truncate_live(a + 1);
     for fmt in &formats {
-        state.stack.push(fmt.clone());
+        state.push_value(fmt.clone());
     }
     let n_formats = formats.len();
     let results = g_read(state, a, n_formats, f, a + 1)?;

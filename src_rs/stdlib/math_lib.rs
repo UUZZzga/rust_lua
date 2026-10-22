@@ -666,7 +666,7 @@ pub fn math_randomseed<'a>(
 /// 从栈中读取参数 (0-based 索引, 相对于函数位置 a)
 fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
     let stack_idx = a + 1 + idx;
-    if stack_idx < state.stack.len() {
+    if stack_idx < state.top {
         state.stack[stack_idx].clone()
     } else {
         TValue::Nil(NilKind::Strict)
@@ -874,7 +874,7 @@ where
     // 不满足 (多参/非 1-out/非数值参/hook) 落回原通用路径, 语义逐位不变。
     let spec_x: Option<LuaNumber> = if nargs == 1
         && nresults == 1
-        && state.stack.len() == a + 2
+        && state.top == a + 2
         && (state.hook_mask & 2 == 0 || !state.allowhook)
     {
         // fast_unsafe: 长度已在上方校验 (a+2), 跳过边界检查
@@ -907,8 +907,8 @@ where
             } else {
                 *slot = TValue::Float(y);
             }
-            // 唯一尾槽 = 数值参数 (trivially droppable), set_len 免 drop
-            state.stack.set_len(a + 1);
+            // 截断逻辑长度 (同时释放尾部非 trivial 值); Vec 物理长度保持不变
+            state.truncate_live(a + 1);
         }
         // 安全版: 常规赋值 + truncate (旧值走 drop_glue)
         #[cfg(not(feature = "fast_unsafe"))]

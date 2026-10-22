@@ -1660,11 +1660,7 @@ impl<'a> LuaState<'a> {
         // - 其余场合用 VM 的 top：VM 会刻意把可回收的旧值留在 top 之上
         //   （execute.rs::smart_clear_stack，仅保证 trivial 值），扫上去会让本应回收的
         //   对象继续存活（tests_lua/gc.lua 弱表断言即依赖此精度）。
-        let stack_top = if self.c_frame_depth > 0 {
-            self.stack.len()
-        } else {
-            self.top.min(self.stack.len())
-        };
+        let stack_top = self.top;
         for val in &self.stack[..stack_top] {
             if needs_gc_mark(val) {
                 unsafe { worklist.push(raw_from_tvalue(val)) };
@@ -1680,7 +1676,7 @@ impl<'a> LuaState<'a> {
                     }
                 }
                 UpVal::Open { stack_index, .. } => {
-                    if *stack_index < self.stack.len() {
+                    if *stack_index < self.top {
                         let val = &self.stack[*stack_index];
                         if needs_gc_mark(val) {
                             unsafe { worklist.push(raw_from_tvalue(val)) };
@@ -1769,7 +1765,7 @@ impl<'a> LuaState<'a> {
                     }
                 }
                 UpVal::Open { stack_index, .. } => {
-                    if *stack_index < exec.stack.len() {
+                    if *stack_index < exec.top {
                         let val = &exec.stack[*stack_index];
                         if needs_gc_mark(val) {
                             unsafe { worklist.push(raw_from_tvalue(val)) };
@@ -1918,7 +1914,7 @@ impl<'a> LuaState<'a> {
                             self.push_mark(gc, value, worklist);
                         }
                         UpVal::Open { stack_index, .. } => {
-                            if *stack_index < self.stack.len() {
+                            if *stack_index < self.top {
                                 let val = &self.stack[*stack_index];
                                 self.push_mark(gc, val, worklist);
                             }
@@ -2165,7 +2161,7 @@ impl<'a> LuaState<'a> {
         // 构建 upval_origins 映射
         let mut upval_origins_map: std::collections::HashMap<usize, usize, FxBuildHasher> =
             std::collections::HashMap::with_hasher(FxBuildHasher::default());
-        for val in self.stack.iter() {
+        for val in &self.stack[..self.top] {
             if let TValue::Thread(t) = val {
                 let origins = t.context.borrow().upval_origins.clone();
                 for (uv_ref, stack_index) in origins {
@@ -2210,15 +2206,14 @@ impl<'a> LuaState<'a> {
                 Vec::new()
             };
 
-            let stack_base = self.stack.len();
+            let stack_base = self.top;
             let saved_base = self.base;
             let saved_pc = self.pc;
             let saved_closure_upvals = Rc::clone(&self.closure_upvals);
             let saved_proto_flag = self.proto_flag;
             let saved_nextraargs = self.nextraargs;
-            self.stack.push(gc_func);
-            self.stack.push(obj_val);
-            self.top = self.stack.len();
+            self.push_value(gc_func);
+            self.push_value(obj_val);
 
             self.call_info.push(CallInfoEntry {
                 is_c: false,
@@ -2234,7 +2229,7 @@ impl<'a> LuaState<'a> {
 
             let status = self.pcall(1, 0, 0);
             if status != 0 && self.exit_requested.is_none() {
-                let msg = match self.stack.last() {
+                let msg = match self.stack.get(self.top - 1) {
                     Some(s @ (TValue::LongStr(_) | TValue::ShortStr(_))) => {
                         lua_string_as_str(s).to_string()
                     }
@@ -2260,7 +2255,7 @@ impl<'a> LuaState<'a> {
             for uv_ptr in &finalizer_uv_ptrs {
                 if let Some(&stack_index) = upval_origins_map.get(uv_ptr) {
                     let mut found_val = None;
-                    'outer: for val in self.stack.iter() {
+                    'outer: for val in &self.stack[..self.top] {
                         if let TValue::Thread(t) = val {
                             let origins = t.context.borrow().upval_origins.clone();
                             for (uv_ref, _idx) in &origins {
@@ -2275,7 +2270,7 @@ impl<'a> LuaState<'a> {
                         }
                     }
                     if let Some(val) = found_val {
-                        if stack_index < self.stack.len() {
+                        if stack_index < self.top {
                             self.stack[stack_index] = val;
                         }
                     }

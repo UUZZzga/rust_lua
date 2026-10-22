@@ -57,7 +57,7 @@ const HOOKKEY: &str = "_HOOKKEY";
 /// 从栈中读取参数 (0-based 索引, 相对于函数位置 a)
 fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
     let stack_idx = a + 1 + idx;
-    if stack_idx < state.stack.len() {
+    if stack_idx < state.top {
         state.stack[stack_idx].clone()
     } else {
         TValue::Nil(NilKind::Strict)
@@ -209,10 +209,10 @@ fn get_frame_info<'a>(state: &LuaState<'a>, level: i32) -> Option<FrameInfo<'a>>
     }
     if level == 1 {
         // 当前函数
-        if state.base == 0 || state.base > state.stack.len() {
+        if state.base == 0 || state.base > state.top {
             return None;
         }
-        let limit = state.stack.len();
+        let limit = state.top;
         if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
             return Some(FrameInfo {
                 base: state.base,
@@ -248,7 +248,7 @@ fn get_frame_info<'a>(state: &LuaState<'a>, level: i32) -> Option<FrameInfo<'a>>
         .len()
         .checked_sub((level as usize).saturating_sub(1) + c_func_offset)?;
     let entry = &state.call_info[idx];
-    if entry.base == 0 || entry.base > state.stack.len() {
+    if entry.base == 0 || entry.base > state.top {
         return None;
     }
     // 计算 limit: 对应 C 的 ci->next->func.p
@@ -395,7 +395,7 @@ fn call_setmetatable<'a>(
     match (&arg1, &arg2) {
         (TValue::Table(_), TValue::Table(mt)) => {
             // 修改栈上的表
-            if a + 1 < state.stack.len() {
+            if a + 1 < state.top {
                 if let TValue::Table(ref mut t) = state.stack[a + 1] {
                     t.set_metatable(Some(mt.clone()));
                 }
@@ -417,7 +417,7 @@ fn call_setmetatable<'a>(
             }
         }
         (TValue::Table(_), TValue::Nil(_)) => {
-            if a + 1 < state.stack.len() {
+            if a + 1 < state.top {
                 if let TValue::Table(ref mut t) = state.stack[a + 1] {
                     t.set_metatable(None);
                 }
@@ -500,7 +500,7 @@ fn call_setuservalue<'a>(
             } else {
                 // 修改栈上的 userdata：用户值区在变长块内、容量恒为 nuvalue，
                 // `n <= nuvalue` 已保证槽位存在（对应 C 的 setuservalue 就地写）。
-                if a + 1 < state.stack.len() {
+                if a + 1 < state.top {
                     if let TValue::UserData(u) = &state.stack[a + 1] {
                         unsafe {
                             crate::objects::Udata::set_user_value(u.as_raw_ptr(), n, arg2.clone());
@@ -804,7 +804,7 @@ fn call_getinfo<'a>(
             // 函数参数模式: 从栈上获取原始函数值
             // 对应 C 的 lua_pushvalue(L, arg + 1)
             let func_idx = a + 1 + arg_offset;
-            if func_idx < state.stack.len() {
+            if func_idx < state.top {
                 let func_val = state.stack[func_idx].clone();
                 state.table_set(&result_table, state.intern_str("func"), func_val)?;
             } else {
@@ -930,7 +930,7 @@ fn fill_info_from_level<'a>(
 
     if level == 1 {
         // 当前 Lua 帧
-        if state.base == 0 || state.base > state.stack.len() {
+        if state.base == 0 || state.base > state.top {
             return false;
         }
         if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
@@ -1093,7 +1093,7 @@ fn fill_info_from_level<'a>(
     // 特殊情况: hook 场景中，hook 函数的 entry.base 指向被 hook 的 C 函数
     // （如 assert），此时栈上是 C 函数（LightUserData），应该走 C 函数路径
     // 返回该 C 函数的信息，而不是 fallback 到 entry.closure（hook 函数自身）。
-    let stack_val = if entry.base > 0 && entry.base <= state.stack.len() {
+    let stack_val = if entry.base > 0 && entry.base <= state.top {
         Some(state.stack[entry.base - 1].clone())
     } else {
         None
@@ -1214,7 +1214,7 @@ fn fill_info_from_level<'a>(
     }
     // 'f' 选项: 从栈上读取 C 函数值 (entry.base - 1 = 函数位置)
     if what.contains('f') {
-        if entry.base > 0 && entry.base <= state.stack.len() {
+        if entry.base > 0 && entry.base <= state.top {
             info.func = Some(state.stack[entry.base - 1].clone());
         }
     }
@@ -1277,7 +1277,7 @@ fn fill_info_from_thread<'a>(
 
     // Level c_chain_len: 当前 Lua 帧
     if level == lua_level {
-        if ctx.base == 0 || ctx.base > ctx.stack.len() {
+        if ctx.base == 0 || ctx.base > ctx.top {
             return false;
         }
         if let TValue::LClosure(closure) = &ctx.stack[ctx.base - 1] {
@@ -1550,7 +1550,7 @@ fn get_local_from_thread<'a>(
     let c_chain_len = call_info.iter().rev().take_while(|e| e.is_c).count();
 
     let read_stack = |idx: usize| -> TValue {
-        if idx < ctx.stack.len() {
+        if idx < ctx.top {
             ctx.stack[idx].clone()
         } else {
             TValue::Nil(NilKind::Strict)
@@ -1583,7 +1583,7 @@ fn get_local_from_thread<'a>(
 
     // Level c_chain_len: 当前 Lua 帧
     if level == lua_level {
-        if ctx.base == 0 || ctx.base > ctx.stack.len() {
+        if ctx.base == 0 || ctx.base > ctx.top {
             return None;
         }
         if let TValue::LClosure(closure) = &ctx.stack[ctx.base - 1] {
@@ -1744,7 +1744,7 @@ fn set_local_from_thread<'a>(
 
     // Level c_chain_len: 当前 Lua 帧
     if level == lua_level {
-        if ctx.base == 0 || ctx.base > ctx.stack.len() {
+        if ctx.base == 0 || ctx.base > ctx.top {
             return None;
         }
         if let TValue::LClosure(closure) = &ctx.stack[ctx.base - 1].clone() {
@@ -1965,7 +1965,7 @@ fn call_getlocal<'a>(
                     && (frame.limit - frame.base) >= (nvar as usize);
                 if cond {
                     let stack_idx = frame.base + (nvar as usize) - 1;
-                    let val = if stack_idx < state.stack.len() {
+                    let val = if stack_idx < state.top {
                         state.stack[stack_idx].clone()
                     } else {
                         TValue::Nil(NilKind::Strict)
@@ -1993,7 +1993,7 @@ fn call_getlocal<'a>(
                         // ci->func.p = frame.base - 1
                         let pos = (frame.base as i32) - 1 - nextra - (nvar + 1);
                         let pos = pos as usize;
-                        let val = if pos < state.stack.len() {
+                        let val = if pos < state.top {
                             state.stack[pos].clone()
                         } else {
                             TValue::Nil(NilKind::Strict)
@@ -2019,7 +2019,7 @@ fn call_getlocal<'a>(
                 Some(n) => {
                     // 获取栈上的值
                     let stack_idx = frame.base + (nvar as usize) - 1;
-                    let val = if stack_idx < state.stack.len() {
+                    let val = if stack_idx < state.top {
                         state.stack[stack_idx].clone()
                     } else {
                         TValue::Nil(NilKind::Strict)
@@ -2034,7 +2034,7 @@ fn call_getlocal<'a>(
                         && (frame.limit - frame.base) >= (nvar as usize);
                     if cond {
                         let stack_idx = frame.base + (nvar as usize) - 1;
-                        let val = if stack_idx < state.stack.len() {
+                        let val = if stack_idx < state.top {
                             state.stack[stack_idx].clone()
                         } else {
                             TValue::Nil(NilKind::Strict)
@@ -2110,7 +2110,7 @@ fn call_setlocal<'a>(
                     && (frame.limit - frame.base) >= (nvar as usize);
                 if cond {
                     let stack_idx = frame.base + (nvar as usize) - 1;
-                    if stack_idx < state.stack.len() {
+                    if stack_idx < state.top {
                         state.stack[stack_idx] = value;
                     }
                     push_single_result(state, a, nresults, state.intern_str("(C temporary)"));
@@ -2130,7 +2130,7 @@ fn call_setlocal<'a>(
                         // pos = ci->func.p - nextra - (n + 1)
                         let pos = (frame.base as i32) - 1 - nextra - (nvar + 1);
                         let pos = pos as usize;
-                        if pos < state.stack.len() {
+                        if pos < state.top {
                             state.stack[pos] = value;
                         }
                         push_single_result(state, a, nresults, state.intern_str("(vararg)"));
@@ -2148,7 +2148,7 @@ fn call_setlocal<'a>(
                 Some(n) => {
                     // 设置栈上的值
                     let stack_idx = frame.base + (nvar as usize) - 1;
-                    if stack_idx < state.stack.len() {
+                    if stack_idx < state.top {
                         state.stack[stack_idx] = value;
                     }
                     push_single_result(state, a, nresults, state.intern_str(&n));
@@ -2160,7 +2160,7 @@ fn call_setlocal<'a>(
                         && (frame.limit - frame.base) >= (nvar as usize);
                     if cond {
                         let stack_idx = frame.base + (nvar as usize) - 1;
-                        if stack_idx < state.stack.len() {
+                        if stack_idx < state.top {
                             state.stack[stack_idx] = value;
                         }
                         push_single_result(state, a, nresults, state.intern_str("(temporary)"));
@@ -2200,7 +2200,7 @@ fn call_getupvalue<'a>(
                 let val = match &*uv_ref {
                     UpVal::Closed { value } => value.clone(),
                     UpVal::Open { stack_index, .. } => {
-                        if *stack_index < state.stack.len() {
+                        if *stack_index < state.top {
                             state.stack[*stack_index].clone()
                         } else {
                             TValue::Nil(NilKind::Strict)
@@ -2311,7 +2311,7 @@ fn call_setupvalue<'a>(
                 // 设置上值
                 // 由于 upvals 是 Rc<RefCell>, 我们需要可变访问
                 // 但 arg1 是 clone 的, 我们需要修改栈上的原始闭包
-                if a + 1 < state.stack.len() {
+                if a + 1 < state.top {
                     if let TValue::LClosure(ref mut cl) = state.stack[a + 1] {
                         if n <= cl.upvals.borrow().len() {
                             // 先取出 stack_index (如果是 Open), 然后释放 borrow, 再修改 stack
@@ -2327,7 +2327,7 @@ fn call_setupvalue<'a>(
                                 }
                             };
                             if let Some(idx) = action {
-                                if idx < state.stack.len() {
+                                if idx < state.top {
                                     state.stack[idx] = value.clone();
                                 }
                             }
@@ -2342,7 +2342,7 @@ fn call_setupvalue<'a>(
         }
         TValue::CClosure(_) => {
             // C 闭包
-            if a + 1 < state.stack.len() {
+            if a + 1 < state.top {
                 if let TValue::CClosure(cc) = &mut state.stack[a + 1] {
                     let cc = unsafe { &mut *(cc.as_raw_ptr() as *mut crate::objects::CClosure) };
                     let mut upvalue = cc.upvalue.borrow_mut();
@@ -2485,7 +2485,7 @@ fn call_upvaluejoin<'a>(
     let n2 = get_arg(state, a, 3).as_integer().unwrap_or(0) as usize;
 
     // 检查 f1 是 LClosure，且 n1 在有效范围内
-    if f1_stack_idx >= state.stack.len() {
+    if f1_stack_idx >= state.top {
         return Err(VmError::RuntimeError(
             "bad argument #1 to 'upvaluejoin' (Lua function expected)".to_string(),
         ));
@@ -2870,7 +2870,7 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
         let is_error_handler = last_lua_idx.is_some() && {
             let idx = last_lua_idx.unwrap();
             let ci_closure = crate::state::get_closure_for_ci(state, idx);
-            let stack_closure = if state.base > 0 && state.base <= state.stack.len() {
+            let stack_closure = if state.base > 0 && state.base <= state.top {
                 if let TValue::LClosure(c) = &state.stack[state.base - 1] {
                     Some(c)
                 } else {
@@ -2936,7 +2936,7 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
                 ));
             }
         } else if let Some((src, line, name, namewhat, is_main)) = get_current_frame_info(state) {
-            let (is_c, linedefined) = if state.base > 0 && state.base <= state.stack.len() {
+            let (is_c, linedefined) = if state.base > 0 && state.base <= state.top {
                 if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
                     (false, closure.proto.line_defined)
                 } else {
@@ -3107,7 +3107,7 @@ fn build_traceback_from_thread(ctx: &crate::state::LuaState, msg: &str, level: i
     // 输出当前 Lua 帧（level c_chain_len）
     let lua_level = c_chain_len as i32;
     if lua_level >= level {
-        if ctx.base > 0 && ctx.base <= ctx.stack.len() {
+        if ctx.base > 0 && ctx.base <= ctx.top {
             if let TValue::LClosure(closure) = &ctx.stack[ctx.base - 1] {
                 let proto = &closure.proto;
                 let src = proto
@@ -3209,7 +3209,7 @@ fn count_c_function_chain(state: &LuaState) -> usize {
 
 /// 获取当前 Lua 帧的信息 (用于 traceback 的 level 1)
 fn get_current_frame_info(state: &LuaState) -> Option<(String, i32, String, String, bool)> {
-    if state.base == 0 || state.base > state.stack.len() {
+    if state.base == 0 || state.base > state.top {
         return None;
     }
     if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
@@ -3502,9 +3502,9 @@ mod tests {
     #[test]
     fn test_call_getregistry() {
         let mut state = LuaState::default();
-        state.stack.clear();
+        state.top = 0;
         call_getregistry(&mut state, 0, 0, 1).unwrap();
-        assert_eq!(state.stack.len(), 1);
+        assert_eq!(state.top, 1);
         assert!(matches!(state.stack[0], TValue::Table(_)));
     }
 
@@ -3514,9 +3514,9 @@ mod tests {
         let mut state = LuaState::default();
         let t = Table::new_in(alloc.slot());
         t.set_metatable(Some(Table::new_in(alloc.slot())));
-        state.stack.clear();
-        state.stack.push(TValue::Nil(NilKind::Strict));
-        state.stack.push(TValue::Table(t));
+        state.top = 0;
+        state.push_nil();
+        state.push_value(TValue::Table(t));
         call_getmetatable(&mut state, 0, 1, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Table(_)));
     }
@@ -3525,9 +3525,9 @@ mod tests {
         let alloc = crate::mem::TestAlloc::new();
         let mut state = LuaState::default();
         let t = Table::new_in(alloc.slot());
-        state.stack.clear();
-        state.stack.push(TValue::Nil(NilKind::Strict));
-        state.stack.push(TValue::Table(t));
+        state.top = 0;
+        state.push_nil();
+        state.push_value(TValue::Table(t));
         call_getmetatable(&mut state, 0, 1, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
@@ -3537,10 +3537,10 @@ mod tests {
         let mut state = LuaState::default();
         let t = Table::new_in(alloc.slot());
         let mt = Table::new_in(alloc.slot());
-        state.stack.clear();
-        state.stack.push(TValue::Nil(NilKind::Strict));
-        state.stack.push(TValue::Table(t));
-        state.stack.push(TValue::Table(mt));
+        state.top = 0;
+        state.push_nil();
+        state.push_value(TValue::Table(t));
+        state.push_value(TValue::Table(mt));
         call_setmetatable(&mut state, 0, 2, 1).unwrap();
         match &state.stack[0] {
             TValue::Table(t) => assert!(t.has_metatable()),
@@ -3550,9 +3550,9 @@ mod tests {
     #[test]
     fn test_call_getuservalue_non_userdata() {
         let mut state = LuaState::default();
-        state.stack.clear();
-        state.stack.push(TValue::Nil(NilKind::Strict));
-        state.stack.push(TValue::Integer(42));
+        state.top = 0;
+        state.push_nil();
+        state.push_value(TValue::Integer(42));
         call_getuservalue(&mut state, 0, 1, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
@@ -3608,12 +3608,12 @@ mod tests {
                 upvals,
             },
         );
-        state.stack.clear();
-        state.stack.push(TValue::Nil(NilKind::Strict));
-        state.stack.push(TValue::LClosure(closure));
-        state.stack.push(TValue::Integer(1));
+        state.top = 0;
+        state.push_nil();
+        state.push_value(TValue::LClosure(closure));
+        state.push_value(TValue::Integer(1));
         call_getupvalue(&mut state, 0, 2, 2).unwrap();
-        assert_eq!(state.stack.len(), 2);
+        assert_eq!(state.top, 2);
         match &state.stack[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => assert_eq!(lua_string_as_str(s), "x"),
             _ => panic!("expected string 'x'"),
@@ -3636,17 +3636,17 @@ mod tests {
                 upvals: Rc::new(RefCell::new(UpValVec::new())),
             },
         );
-        state.stack.clear();
-        state.stack.push(TValue::Nil(NilKind::Strict));
-        state.stack.push(TValue::LClosure(closure));
-        state.stack.push(TValue::Integer(1));
+        state.top = 0;
+        state.push_nil();
+        state.push_value(TValue::LClosure(closure));
+        state.push_value(TValue::Integer(1));
         call_getupvalue(&mut state, 0, 2, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
     #[test]
     fn test_call_gethook_no_hook() {
         let mut state = LuaState::default();
-        state.stack.clear();
+        state.top = 0;
         call_gethook(&mut state, 0, 0, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
@@ -3656,17 +3656,17 @@ mod tests {
         let mut state = LuaState::default();
         // 设置钩子
         let hook_fn = TValue::LightUserData(999 as *mut std::ffi::c_void);
-        state.stack.clear();
-        state.stack.push(TValue::Nil(NilKind::Strict));
-        state.stack.push(hook_fn.clone());
-        state.stack.push(state.intern_str("crl"));
-        state.stack.push(TValue::Integer(0));
+        state.top = 0;
+        state.push_nil();
+        state.push_value(hook_fn.clone());
+        state.push_value(state.intern_str("crl"));
+        state.push_value(TValue::Integer(0));
         call_sethook(&mut state, 0, 3, 0).unwrap();
 
         // 获取钩子
-        state.stack.clear();
+        state.top = 0;
         call_gethook(&mut state, 0, 0, 3).unwrap();
-        assert_eq!(state.stack.len(), 3);
+        assert_eq!(state.top, 3);
         assert_eq!(state.stack[0], hook_fn);
         match &state.stack[1] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
@@ -3685,20 +3685,20 @@ mod tests {
         let mut state = LuaState::default();
         // 先设置钩子
         let hook_fn = TValue::LightUserData(999 as *mut std::ffi::c_void);
-        state.stack.clear();
-        state.stack.push(TValue::Nil(NilKind::Strict));
-        state.stack.push(hook_fn);
-        state.stack.push(state.intern_str("l"));
+        state.top = 0;
+        state.push_nil();
+        state.push_value(hook_fn);
+        state.push_value(state.intern_str("l"));
         call_sethook(&mut state, 0, 2, 0).unwrap();
 
         // 用 nil 清除
-        state.stack.clear();
-        state.stack.push(TValue::Nil(NilKind::Strict));
-        state.stack.push(TValue::Nil(NilKind::Strict));
+        state.top = 0;
+        state.push_nil();
+        state.push_nil();
         call_sethook(&mut state, 0, 1, 0).unwrap();
 
         // 验证已清除
-        state.stack.clear();
+        state.top = 0;
         call_gethook(&mut state, 0, 0, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
@@ -3706,7 +3706,7 @@ mod tests {
     #[test]
     fn test_call_traceback_empty() {
         let mut state = LuaState::default();
-        state.stack.clear();
+        state.top = 0;
         call_traceback(&mut state, 0, 0, 1).unwrap();
         match &state.stack[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
@@ -3719,9 +3719,9 @@ mod tests {
     #[test]
     fn test_call_traceback_with_message() {
         let mut state = LuaState::default();
-        state.stack.clear();
-        state.stack.push(TValue::Nil(NilKind::Strict));
-        state.stack.push(state.intern_str("error message"));
+        state.top = 0;
+        state.push_nil();
+        state.push_value(state.intern_str("error message"));
         call_traceback(&mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
             s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
@@ -3736,9 +3736,9 @@ mod tests {
     #[test]
     fn test_call_traceback_non_string_msg() {
         let mut state = LuaState::default();
-        state.stack.clear();
-        state.stack.push(TValue::Nil(NilKind::Strict));
-        state.stack.push(TValue::Integer(42));
+        state.top = 0;
+        state.push_nil();
+        state.push_value(TValue::Integer(42));
         call_traceback(&mut state, 0, 1, 1).unwrap();
         match &state.stack[0] {
             TValue::Integer(n) => assert_eq!(*n, 42),
@@ -3749,9 +3749,9 @@ mod tests {
     #[test]
     fn test_call_getinfo_out_of_range() {
         let mut state = LuaState::default();
-        state.stack.clear();
-        state.stack.push(TValue::Nil(NilKind::Strict));
-        state.stack.push(TValue::Integer(1000));
+        state.top = 0;
+        state.push_nil();
+        state.push_value(TValue::Integer(1000));
         call_getinfo(&mut state, 0, 1, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
@@ -3759,9 +3759,9 @@ mod tests {
     #[test]
     fn test_call_getinfo_negative_level() {
         let mut state = LuaState::default();
-        state.stack.clear();
-        state.stack.push(TValue::Nil(NilKind::Strict));
-        state.stack.push(TValue::Integer(-1));
+        state.top = 0;
+        state.push_nil();
+        state.push_value(TValue::Integer(-1));
         call_getinfo(&mut state, 0, 1, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
@@ -3769,10 +3769,10 @@ mod tests {
     #[test]
     fn test_call_getlocal_out_of_range() {
         let mut state = LuaState::default();
-        state.stack.clear();
-        state.stack.push(TValue::Nil(NilKind::Strict));
-        state.stack.push(TValue::Integer(20));
-        state.stack.push(TValue::Integer(1));
+        state.top = 0;
+        state.push_nil();
+        state.push_value(TValue::Integer(20));
+        state.push_value(TValue::Integer(1));
         let result = call_getlocal(&mut state, 0, 2, 1);
         assert!(result.is_err());
     }
@@ -3838,10 +3838,10 @@ mod tests {
                 upvals,
             },
         );
-        state.stack.clear();
-        state.stack.push(TValue::Nil(NilKind::Strict));
-        state.stack.push(TValue::LClosure(closure));
-        state.stack.push(TValue::Integer(1));
+        state.top = 0;
+        state.push_nil();
+        state.push_value(TValue::LClosure(closure));
+        state.push_value(TValue::Integer(1));
         call_upvalueid(&mut state, 0, 2, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::LightUserData(_)));
     }
@@ -3858,10 +3858,10 @@ mod tests {
                 upvals: Rc::new(RefCell::new(UpValVec::new())),
             },
         );
-        state.stack.clear();
-        state.stack.push(TValue::Nil(NilKind::Strict));
-        state.stack.push(TValue::LClosure(closure));
-        state.stack.push(TValue::Integer(1));
+        state.top = 0;
+        state.push_nil();
+        state.push_value(TValue::LClosure(closure));
+        state.push_value(TValue::Integer(1));
         call_upvalueid(&mut state, 0, 2, 1).unwrap();
         assert!(matches!(state.stack[0], TValue::Nil(_)));
     }
@@ -3869,9 +3869,9 @@ mod tests {
     fn test_call_debug_returns_nothing() {
         let mut buff = crate::mock::io_mock::BufferIo::new("cont\n");
         let mut state = LuaState::new_main(&mut buff).expect("创建 state 失败");
-        state.stack.clear();
+        state.top = 0;
         call_debug(&mut state, 0, 0, 0).unwrap();
-        assert_eq!(state.stack.len(), 0);
+        assert_eq!(state.top, 0);
     }
 
     #[test]

@@ -678,15 +678,18 @@ pub fn concat_stack(
     alloc: SlotAlloc,
     table: &crate::strings::StringTable,
     stack: &mut Vec<TValue>,
+    top: usize,
     total: usize,
 ) -> Result<(), TagMethodError> {
     if total <= 1 {
         return Ok(());
     }
+    // top 参数是进入时的 live 长度 (调用方 splice 出的操作数 Vec 的 len);
+    // 循环内会 pop 缩短 Vec, 因此每轮都以当前 len 为逻辑栈顶.
+    debug_assert_eq!(top, stack.len());
     let mut remaining = total;
     while remaining > 1 {
         let top = stack.len();
-        // C: if (!ttisstring(s2v(top-2)) || !cvt2str(s2v(top-2))) || !tostring(L, s2v(top-1))
         let v_prev = &stack[top - 2];
         let v_top = &stack[top - 1];
 
@@ -769,7 +772,8 @@ pub fn concat_stack(
         };
         let target_idx = top - n;
         stack[target_idx] = ls;
-        crate::state::truncate_live_vec(stack, target_idx + 1);
+        crate::state::truncate_live_vec(stack, top, target_idx + 1);
+        unsafe { stack.set_len(target_idx + 1) };
         remaining -= n - 1;
     }
     Ok(())
@@ -1731,7 +1735,7 @@ mod tests {
         let tb = StringTable::new();
         let mut stack = vec![(tb.intern_value("hello")), (tb.intern_value("world"))];
         let len_before = stack.len();
-        concat_stack(alloc.slot(), &tb, &mut stack, 2).unwrap();
+        concat_stack(alloc.slot(), &tb, &mut stack, len_before, 2).unwrap();
         assert_eq!(stack.len(), len_before - 1);
         if let ref s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = stack[0] {
             assert_eq!(lua_string_as_str(s), "helloworld");
@@ -1744,7 +1748,8 @@ mod tests {
         let alloc = crate::mem::TestAlloc::new();
         let tb = StringTable::new();
         let mut stack = vec![(tb.intern_value("hello"))];
-        concat_stack(alloc.slot(), &tb, &mut stack, 1).unwrap();
+        let top = stack.len();
+        concat_stack(alloc.slot(), &tb, &mut stack, top, 1).unwrap();
         assert_eq!(stack.len(), 1);
     }
     #[test]
@@ -1756,7 +1761,8 @@ mod tests {
             (tb.intern_value("b")),
             (tb.intern_value("c")),
         ];
-        concat_stack(alloc.slot(), &tb, &mut stack, 3).unwrap();
+        let top = stack.len();
+        concat_stack(alloc.slot(), &tb, &mut stack, top, 3).unwrap();
         assert_eq!(stack.len(), 1);
         if let ref s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = stack[0] {
             assert_eq!(lua_string_as_str(s), "abc");
@@ -1769,7 +1775,8 @@ mod tests {
         let alloc = crate::mem::TestAlloc::new();
         let tb = StringTable::new();
         let mut stack = vec![(tb.intern_value("x=")), TValue::Integer(42)];
-        concat_stack(alloc.slot(), &tb, &mut stack, 2).unwrap();
+        let top = stack.len();
+        concat_stack(alloc.slot(), &tb, &mut stack, top, 2).unwrap();
         if let ref s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = stack[0] {
             assert_eq!(lua_string_as_str(s), "x=42");
         } else {
@@ -1781,7 +1788,8 @@ mod tests {
         let alloc = crate::mem::TestAlloc::new();
         let tb = StringTable::new();
         let mut stack = vec![(tb.intern_value("")), (tb.intern_value("world"))];
-        concat_stack(alloc.slot(), &tb, &mut stack, 2).unwrap();
+        let top = stack.len();
+        concat_stack(alloc.slot(), &tb, &mut stack, top, 2).unwrap();
         assert_eq!(stack.len(), 1);
         if let ref s @ (TValue::LongStr(_) | TValue::ShortStr(_)) = stack[0] {
             assert_eq!(lua_string_as_str(s), "world");

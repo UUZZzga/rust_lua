@@ -110,9 +110,9 @@ impl<'io> Interpreter<'io> {
                             data.metatable.as_ref().and_then(|mt| mt.get(&tostring_key))
                         };
                         meta_fn.map(|f| {
-                            let base = self.l.stack.len();
-                            self.l.stack.push(f);
-                            self.l.stack.push(errobj.clone().unwrap());
+                            let base = self.l.top;
+                            self.l.push_value(f);
+                            self.l.push_value(errobj.clone().unwrap());
                             // 构造 call_info，让 __tostring 中的 debug.getinfo 能看到
                             // 错误发生时的调用栈（对应 C 版中 msghandler 作为 pcall 的
                             // msgh 在错误上下文中被调用）。
@@ -430,9 +430,9 @@ impl<'io> Interpreter<'io> {
                     data.metatable.as_ref().and_then(|mt| mt.get(&tostring_key))
                 };
                 meta_fn.and_then(|f| {
-                    let base = self.l.stack.len();
-                    self.l.stack.push(f);
-                    self.l.stack.push(TValue::Table(t));
+                    let base = self.l.top;
+                    self.l.push_value(f);
+                    self.l.push_value(TValue::Table(t));
                     let status = self.l.pcall(1, 1, 0);
                     if status == 0 {
                         let s = self.l.to_string(-1);

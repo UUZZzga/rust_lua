@@ -118,7 +118,7 @@ mod compat {
 
 fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
     let stack_idx = a + 1 + idx;
-    if stack_idx >= state.stack.len() {
+    if stack_idx >= state.top {
         return TValue::Nil(NilKind::Strict);
     }
     state.stack[stack_idx].clone()
@@ -1062,11 +1062,11 @@ mod tests {
         let nums: [LuaInteger; 4] = [0, 1, 1000, 0x7fff_ffff];
         let mut state = LuaState::default();
         for n in nums {
-            assert_eq!(1, state.stack.len());
+            assert_eq!(1, state.top);
             state.push_string("*t");
             state.push_value(TValue::Integer(n));
             let _ = call_os_date(&mut state, 0, 2, 1).unwrap();
-            assert_eq!(1, state.stack.len());
+            assert_eq!(1, state.top);
             let val = state.stack.get(0).unwrap();
             assert!(matches!(val, TValue::Table(_)));
             state.push_value(val.clone());
