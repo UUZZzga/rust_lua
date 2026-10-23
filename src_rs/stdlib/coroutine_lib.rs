@@ -1735,6 +1735,11 @@ fn setup_subsequent_resume<'a>(
         co.truncate_live(stack_base + yield_nresults as usize);
     }
     // nresults < 0 (MULTRET): 保留所有参数
+    // 记录产出末尾: 协程恢复后紧跟的 `SETLIST c==0` / `OP_CALL b==0` 按它取个数
+    // (对应 C 的 `L->top` —— 恢复的 yield 调用在这里"返回"这些值)。
+    // 漏记会让 `{coroutine.yield(...)}` 之类的构造读到陈旧值
+    // (locals.lua:901 / coroutine.lua:25/62)。
+    co.set_mret_end(co.top);
 
     Ok(())
 }

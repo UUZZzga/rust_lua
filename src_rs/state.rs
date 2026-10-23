@@ -1202,9 +1202,11 @@ impl<'a> LuaState<'a> {
         // 的 b==0 与 OP_SETLIST 的 c==0 读取), 然后把 live top 复原到 **Lua 帧**的寄存器
         // 上界 (C 帧内联调用时为 Lua 调用者的上界; 见 `lua_frame_ceiling`)。
         self.set_mret_end(self.top);
-        if self.top < self.lua_frame_ceiling {
-            self.top = self.lua_frame_ceiling;
-        }
+        // 注意: **不**把 top 抬到 Lua 帧上界 —— 调用结束后 top 就是精确的结果末尾
+        // (C 的 `L->top = res + nres`)。在 C 帧内联调用时(如 gsub 的替换函数),
+        // 抬高会让 C 代码的 lua_gettop / pop_slot 读到结果之上的陈旧槽
+        // (实测 pm.lua:199 的替换结果变成 156)。Lua 帧的寄存器上界由 VM 循环头
+        // 在指令边界统一抬高 (见 execute.rs 的 live_bound), 那里不涉及 C 帧。
         self.pad_frame_scratch();
     }
 
@@ -1291,9 +1293,11 @@ impl<'a> LuaState<'a> {
         }
         // 多返回值交接 + live top 复原到 Lua 帧上界 (见 adjust_results)
         self.set_mret_end(self.top);
-        if self.top < self.lua_frame_ceiling {
-            self.top = self.lua_frame_ceiling;
-        }
+        // 注意: **不**把 top 抬到 Lua 帧上界 —— 调用结束后 top 就是精确的结果末尾
+        // (C 的 `L->top = res + nres`)。在 C 帧内联调用时(如 gsub 的替换函数),
+        // 抬高会让 C 代码的 lua_gettop / pop_slot 读到结果之上的陈旧槽
+        // (实测 pm.lua:199 的替换结果变成 156)。Lua 帧的寄存器上界由 VM 循环头
+        // 在指令边界统一抬高 (见 execute.rs 的 live_bound), 那里不涉及 C 帧。
         self.pad_frame_scratch();
     }
 
@@ -1326,9 +1330,11 @@ impl<'a> LuaState<'a> {
         }
         // 多返回值交接 + live top 复位到帧上界 (见 adjust_results)
         self.set_mret_end(self.top);
-        if self.top < self.lua_frame_ceiling {
-            self.top = self.lua_frame_ceiling;
-        }
+        // 注意: **不**把 top 抬到 Lua 帧上界 —— 调用结束后 top 就是精确的结果末尾
+        // (C 的 `L->top = res + nres`)。在 C 帧内联调用时(如 gsub 的替换函数),
+        // 抬高会让 C 代码的 lua_gettop / pop_slot 读到结果之上的陈旧槽
+        // (实测 pm.lua:199 的替换结果变成 156)。Lua 帧的寄存器上界由 VM 循环头
+        // 在指令边界统一抬高 (见 execute.rs 的 live_bound), 那里不涉及 C 帧。
         self.pad_frame_scratch();
     }
 
@@ -1387,9 +1393,11 @@ impl<'a> LuaState<'a> {
         self.top = new_len;
         // 多返回值交接 + live top 复原到 Lua 帧上界 (见 adjust_results)
         self.set_mret_end(self.top);
-        if self.top < self.lua_frame_ceiling {
-            self.top = self.lua_frame_ceiling;
-        }
+        // 注意: **不**把 top 抬到 Lua 帧上界 —— 调用结束后 top 就是精确的结果末尾
+        // (C 的 `L->top = res + nres`)。在 C 帧内联调用时(如 gsub 的替换函数),
+        // 抬高会让 C 代码的 lua_gettop / pop_slot 读到结果之上的陈旧槽
+        // (实测 pm.lua:199 的替换结果变成 156)。Lua 帧的寄存器上界由 VM 循环头
+        // 在指令边界统一抬高 (见 execute.rs 的 live_bound), 那里不涉及 C 帧。
         self.pad_frame_scratch();
     }
 
@@ -1426,9 +1434,7 @@ impl<'a> LuaState<'a> {
             // 到 Lua 帧上界 (推迟路径绕过 adjust_results_on_stack, 原先漏了这两步 ——
             // db.lua/events.lua 等 hook 密集用例的实参个数因此读到陈旧的 mret_end)。
             self.set_mret_end(new_len);
-            if self.top < self.lua_frame_ceiling {
-                self.top = self.lua_frame_ceiling;
-            }
+            // 同样不抬高 top (C: `L->top = res + nres`); Lua 帧上界由 VM 循环头统一抬高
             self.pad_frame_scratch();
         }
     }

@@ -1117,7 +1117,6 @@ impl VmExecutor {
         // 进入 VM 时刷新最内层 Lua 帧上界 (覆盖所有进入路径: CLI docall / capi lua_call /
         // 协程 resume / 元方法 pcall; C 帧保持原值)
         state.recompute_lua_frame_ceiling();
-        state.reset_mret(); // 进入 (新) Lua 帧执行: 产出末尾清零 (C: precall 重设 L->top)
 
         // 帧切换后刷新指令流缓存 (fast_unsafe: 裸指针四件套, 免每指令 deref;
         // 安全版: Rc 句柄, 索引时边界检查)。调用点: CALL/TAILCALL/RETURN*/
@@ -6495,14 +6494,23 @@ impl VmExecutor {
                         Some(TValue::Integer(v)) => format!("int({})", v),
                         Some(TValue::Nil(_)) => "nil".to_string(),
                         Some(TValue::ShortStr(_)) | Some(TValue::LongStr(_)) => {
-                            format!("str({})", crate::strings::lua_string_as_str(&state.stack[i]))
+                            format!(
+                                "str({})",
+                                crate::strings::lua_string_as_str(&state.stack[i])
+                            )
                         }
                         Some(o) => format!("other({})", o.ty()),
                         None => "OOB".to_string(),
                     };
                     eprintln!(
                         "UPPER-CALL a={} nargs={} nresults={} top={} slots=[{}|{}|{}]",
-                        a, nargs, nresults, state.top, dump(a), dump(a + 1), dump(a + 2)
+                        a,
+                        nargs,
+                        nresults,
+                        state.top,
+                        dump(a),
+                        dump(a + 1),
+                        dump(a + 2)
                     );
                 }
 
