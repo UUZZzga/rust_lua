@@ -69,22 +69,6 @@ use std::ffi::c_void;
 //                                                Float:    n1 + n2
 // 整数运算用方法形式（wrapping_add 等），浮点用运算符（+/ -/ *）。
 // ============================================================================
-macro_rules! arith_bin {
-    ($state:expr, $a:expr, $pc:expr, $v1:expr, $v2:expr, $op:tt, $int_method:ident) => {{
-        match ($v1, $v2) {
-            (TValue::Integer(i1), TValue::Integer(i2)) => {
-                Self::write_stack_state($state, $a, TValue::Integer((*i1).$int_method(*i2)));
-                *$pc += 1; // skip MMBIN
-            }
-            _ => {
-                if let (Some(n1), Some(n2)) = (to_number_ns($v1), to_number_ns($v2)) {
-                    Self::write_stack_state($state, $a, TValue::Float(n1 $op n2));
-                    *$pc += 1; // skip MMBIN
-                }
-            }
-        }
-    }};
-}
 macro_rules! arith_bin2 {
     ($drop_queue:expr, $stack:expr, $top:expr, $pc:expr, $a:expr, $v1:expr, $v2:expr, $op:tt, $int_method:ident) => {{
         match ($v1, $v2) {
@@ -1266,64 +1250,94 @@ impl VmExecutor {
                 OpCode::SETFIELD => Self::op_setfield(base, state, inst, pc - 1),
                 // === 热门 opcode: 算术运算 (param-pc: 成功 *pc += 1 跳过 MMBIN) ===
                 OpCode::ADDI => Self::op_addi(base, state, inst, &mut pc),
-                OpCode::ADDK => Self::op_addk(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    constants_slice,
-                    base,
-                    state.top,
-                    inst,
-                    &mut pc,
-                ),
-                OpCode::SUBK => Self::op_subk(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    constants_slice,
-                    base,
-                    state.top,
-                    inst,
-                    &mut pc,
-                ),
-                OpCode::MULK => Self::op_mulk(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    constants_slice,
-                    base,
-                    state.top,
-                    inst,
-                    &mut pc,
-                ),
+                OpCode::ADDK => {
+                    let r = Self::op_addk(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        constants_slice,
+                        base,
+                        state.top,
+                        inst,
+                        &mut pc,
+                    );
+                    // 同上: op_addk 也走 arith_bin2! 原地写
+                    Self::raise_reg_top(state, Self::ra(base, inst));
+                    r
+                }
+                OpCode::SUBK => {
+                    let r = Self::op_subk(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        constants_slice,
+                        base,
+                        state.top,
+                        inst,
+                        &mut pc,
+                    );
+                    // 同上: op_subk 也走 arith_bin2! 原地写
+                    Self::raise_reg_top(state, Self::ra(base, inst));
+                    r
+                }
+                OpCode::MULK => {
+                    let r = Self::op_mulk(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        constants_slice,
+                        base,
+                        state.top,
+                        inst,
+                        &mut pc,
+                    );
+                    // 同上: op_mulk 也走 arith_bin2! 原地写
+                    Self::raise_reg_top(state, Self::ra(base, inst));
+                    r
+                }
                 OpCode::MODK => Self::op_modk(base, state, inst, pc - 1, &mut pc),
                 OpCode::POWK => Self::op_powk(base, state, inst, &mut pc),
                 OpCode::DIVK => Self::op_divk(base, state, inst, &mut pc),
                 OpCode::IDIVK => Self::op_idivk(base, state, inst, pc - 1, &mut pc),
-                OpCode::ADD => Self::op_add(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    constants_slice,
-                    base,
-                    state.top,
-                    inst,
-                    &mut pc,
-                ),
-                OpCode::SUB => Self::op_sub(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    constants_slice,
-                    base,
-                    state.top,
-                    inst,
-                    &mut pc,
-                ),
-                OpCode::MUL => Self::op_mul(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    constants_slice,
-                    base,
-                    state.top,
-                    inst,
-                    &mut pc,
-                ),
+                OpCode::ADD => {
+                    let r = Self::op_add(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        constants_slice,
+                        base,
+                        state.top,
+                        inst,
+                        &mut pc,
+                    );
+                    // 快路径原地写结果寄存器 (切片签名无法更新 top): 补抬 live top
+                    Self::raise_reg_top(state, Self::ra(base, inst));
+                    r
+                }
+                OpCode::SUB => {
+                    let r = Self::op_sub(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        constants_slice,
+                        base,
+                        state.top,
+                        inst,
+                        &mut pc,
+                    );
+                    // 快路径原地写结果寄存器 (切片签名无法更新 top): 补抬 live top
+                    Self::raise_reg_top(state, Self::ra(base, inst));
+                    r
+                }
+                OpCode::MUL => {
+                    let r = Self::op_mul(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        constants_slice,
+                        base,
+                        state.top,
+                        inst,
+                        &mut pc,
+                    );
+                    // 快路径原地写结果寄存器 (切片签名无法更新 top): 补抬 live top
+                    Self::raise_reg_top(state, Self::ra(base, inst));
+                    r
+                }
                 OpCode::MOD => Self::op_mod(base, state, inst, pc - 1, &mut pc),
                 OpCode::POW => Self::op_pow(base, state, inst, &mut pc),
                 OpCode::DIV => Self::op_div(base, state, inst, &mut pc),
@@ -2215,40 +2229,23 @@ impl VmExecutor {
     }
 
     /// `probe_wstack` 探针: 写目标必须落在「已初始化」范围内
-    /// (上界 = `max(len, scratch_end)`, 见 [`Self::write_stack`] 的不变量说明)。
+    /// (上界 = `max(len, top)`, 见 [`Self::write_stack`] 的不变量说明)。
     /// 越界写意味着某个补齐点漏了 —— release 下会静默踩未初始化内存, 故诊断构建必须拦下。
     #[cfg(feature = "probe_wstack")]
-    fn probe_write_slot(state: &LuaState, idx: usize) {
+    fn probe_write_slot(limit: usize, idx: usize, len: usize, top: usize, base: usize) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static OOB: AtomicUsize = AtomicUsize::new(0);
-        let limit = if state.stack.len() > state.top {
-            state.stack.len()
-        } else {
-            state.top
-        };
-        if idx >= state.stack.capacity() {
+        if idx >= len {
             static OV: AtomicUsize = AtomicUsize::new(0);
             let n = OV.fetch_add(1, Ordering::Relaxed);
             if n < 10 {
-                eprintln!(
-                    "[WSCAP #{n}] idx={idx} 超出 capacity={} len={} base={}",
-                    state.stack.capacity(),
-                    state.stack.len(),
-                    state.base
-                );
+                eprintln!("[WSCAP #{n}] idx={idx} 超出已初始化长度 len={len} base={base}");
             }
         }
         if idx >= limit {
             let n = OOB.fetch_add(1, Ordering::Relaxed);
             if n < 10 {
-                eprintln!(
-                    "[WSOOB #{n}] idx={idx} len={} scratch_end={} base={} top={} pc={}",
-                    state.stack.len(),
-                    state.scratch_end,
-                    state.base,
-                    state.top,
-                    state.pc
-                );
+                eprintln!("[WSOOB #{n}] idx={idx} limit={limit} len={len} base={base} top={top}");
             }
         }
     }
@@ -2279,20 +2276,28 @@ impl VmExecutor {
     /// 因此本函数的分支预算已经到底: 一次恒不命中的条件跳转。
     #[inline(always)]
     pub(crate) fn write_stack<'a>(
-        drop_queue: &mut Vec<TValue<'a>>,
+        #[cfg_attr(not(feature = "fast_unsafe"), allow(unused_variables))] drop_queue: &mut Vec<
+            TValue<'a>,
+        >,
         stack: &mut [TValue<'a>],
-        top: usize,
+        #[cfg_attr(not(feature = "fast_unsafe"), allow(unused_variables))] top: usize,
         idx: usize,
         val: TValue<'a>,
     ) {
-        #[cfg(feature = "probe_wstack")]
-        Self::probe_write_slot(state, idx);
         // 无分支写: 不变量保证 idx < max(len, scratch_end), 槽位已初始化。
         // len 与 top 一律用 max 更新 (编译为 cmov, 无分支); 唯一分支是「旧值是否
         // 持有引用计数」(跳过着会泄漏, 必须释放) —— 见 `old_slot_holds_ref`:
         // 单条 `cmpb $7, (slot); jae`, 算术循环里旧值恒为 number, 命中率 100%。
         #[cfg(feature = "fast_unsafe")]
         unsafe {
+            #[cfg(feature = "probe_wstack")]
+            Self::probe_write_slot(
+                if stack.len() > top { stack.len() } else { top },
+                idx,
+                stack.len(),
+                top,
+                0,
+            );
             let slot: *mut TValue<'a> = stack.as_mut_ptr().add(idx);
             debug_assert!(
                 idx < stack.len() || idx < top,
@@ -2313,6 +2318,18 @@ impl VmExecutor {
         {
             // 安全等价实现: 不变量破例时按需补齐后写 (无性能要求)。
             stack[idx] = val;
+        }
+    }
+
+    /// 算术快路径专用: 切片签名（`arith_bin2!`）原地写寄存器 `a` 后, 由调用点补上
+    /// 「寄存器写抬高 live top」这条不变量（与 [`Self::write_stack_state`] 一致）。
+    /// 不补的话, 落在 `top` 之上的结果寄存器会被紧随的元方法 / C API scratch 覆盖,
+    /// 且不在 GC 根范围内 —— 安全构建（`--no-default-features`）的 `read_stack`
+    /// 边界检查会直接以 `read_stack 越界` 暴露（capi::tests::test_c_call_multret_arity）。
+    #[inline(always)]
+    fn raise_reg_top(state: &mut LuaState, idx: usize) {
+        if idx >= state.top {
+            state.top = idx + 1;
         }
     }
 
@@ -2386,7 +2403,7 @@ impl VmExecutor {
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
         top: usize,
-        base: usize,
+        #[cfg_attr(not(feature = "fast_unsafe"), allow(unused_variables))] base: usize,
         dst_idx: usize,
         src_idx: usize,
     ) {
@@ -2400,7 +2417,7 @@ impl VmExecutor {
             let dst: *mut TValue<'a> = stack_ptr.add(dst_idx);
             if !(Self::old_slot_holds_ref(&*src) | Self::old_slot_holds_ref(&*dst)) {
                 #[cfg(feature = "probe_wstack")]
-                Self::probe_write_slot(state, dst_idx);
+                Self::probe_write_slot(stack.len(), dst_idx, stack.len(), top, 0);
                 debug_assert!(
                     dst_idx < stack.len() || dst_idx < top,
                     "copy_stack_slot 越界: dst={} len={} top={} base={}",
@@ -2568,7 +2585,7 @@ impl VmExecutor {
 
     /// 仅诊断构建（`probe_wstack`）与安全构建（`not(fast_unsafe)`）可达 —— 默认构建下
     /// `read_stack` 直接 `get_unchecked`，此处用 cfg 收口避免 dead_code 警告。
-    #[cfg(any(feature = "probe_wstack", not(feature = "fast_unsafe")))]
+    #[cfg(feature = "probe_wstack")]
     #[cold]
     #[inline(never)]
     fn read_stack_panic<'a>(state: &LuaState, idx: usize) -> ! {
@@ -8128,7 +8145,7 @@ impl VmExecutor {
                 //   定数:    后续 read_stack(ra+i) 索引越界 panic。
                 let end = ra + touse + need_fill;
                 if end > state.stack.len() {
-                    unsafe { state.stack.set_len(end) };
+                    state.stack.set_len(end);
                 }
             }
             for i in 0..need_fill {

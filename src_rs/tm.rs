@@ -935,7 +935,6 @@ fn string_arith<'a>(
     res: usize,
     tm: TagMethod,
 ) -> Result<bool, VmError<'a>> {
-    use crate::objects::NilKind;
     use crate::vm::{to_integer, to_number, F2IMode};
 
     // 尝试整数运算 (对应 C 的 ttisinteger 检查)
