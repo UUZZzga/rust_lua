@@ -66,6 +66,9 @@ thread_local! {
     /// 诊断用 (仅 safe 构建): 最近一次分发前的 (top, base, pc, opcode)。
     pub(crate) static DISPATCH_CTX: std::cell::Cell<(usize, usize, usize, Option<OpCode>, usize)> =
         const { std::cell::Cell::new((0, 0, 0, None, 0)) };
+    /// 诊断: 上一条已派发指令 (op, pc, inst) —— 用于定位「多返回值生产者没登记」。
+    pub(crate) static PREV_DISPATCH: std::cell::Cell<(Option<OpCode>, usize, u32)> =
+        const { std::cell::Cell::new((None, 0, 0)) };
 }
 use std::ffi::c_void;
 
@@ -1250,6 +1253,9 @@ impl VmExecutor {
             // `L->top` 的含义: `ci->top` 覆盖帧内寄存器, 而多返回值 (OP_CALL/OP_VARARG
             // 的结果) 可能落在 `ci->top` 之上 (C 用 `L->top` 携带该位置, 其寄存器读
             // 不做边界检查; 本实现把它显式化)。
+            #[cfg(not(feature = "fast_unsafe"))]
+            PREV_DISPATCH.with(|c| c.set((Some(op), pc, inst)));
+
             let live_bound = if state.mret_end > state.lua_frame_ceiling {
                 state.mret_end
             } else {
@@ -2352,6 +2358,27 @@ impl VmExecutor {
             // 安全等价实现: 不变量破例时按需补齐后写 (无性能要求)。
             stack[idx] = val;
         }
+    }
+
+    /// 诊断 (safe 构建): 多返回值实参个数为 0 时打印现场 —— 用于定位「多返回值生产者
+    /// 没有登记 mret_end」的调用点。
+    #[cfg(not(feature = "fast_unsafe"))]
+    #[inline(always)]
+    fn diag_nargs(a: usize, b: usize, n: usize) -> usize {
+        if n == 0 {
+            let prev = PREV_DISPATCH.with(|c| c.get());
+            eprintln!(
+                "MULT-RET-EMPTY a={} b={} prev=({:?},pc={},inst={:#x})",
+                a, b, prev.0, prev.1, prev.2
+            );
+        }
+        n
+    }
+
+    #[cfg(feature = "fast_unsafe")]
+    #[inline(always)]
+    fn diag_nargs(_a: usize, _b: usize, n: usize) -> usize {
+        n
     }
 
     /// 寄存器写 —— **不维护 live top** (对齐 C: `s2v(ra) = ...` 只管写槽位)。
@@ -5994,7 +6021,16 @@ impl VmExecutor {
         bf: crate::objects::BuiltinFn,
     ) -> Result<(), VmError<'a>> {
         let nargs = if b == 0 {
-            state.mret_end.saturating_sub(a + 1)
+            let n = Self::diag_nargs(a, b, state.mret_end.saturating_sub(a + 1));
+            #[cfg(not(feature = "fast_unsafe"))]
+            if n == 0 {
+                let prev = PREV_DISPATCH.with(|c| c.get());
+                eprintln!(
+                    "MULT-RET-EMPTY a={} mret_end={} top={} ceiling={} prev=({:?},pc={},inst={:#x})",
+                    a, state.mret_end, state.top, state.lua_frame_ceiling, prev.0, prev.1, prev.2
+                );
+            }
+            n
         } else {
             b.saturating_sub(1)
         };
@@ -6080,7 +6116,7 @@ impl VmExecutor {
     ) -> Result<(), VmError<'a>> {
         let nargs = if b == 0 {
             // perf: 用 state.top 而非 state.stack.len() — smart_clear_stack 不截断 Vec
-            state.mret_end.saturating_sub(a + 1)
+            Self::diag_nargs(a, b, state.mret_end.saturating_sub(a + 1))
         } else {
             b.saturating_sub(1)
         };
@@ -6255,7 +6291,7 @@ impl VmExecutor {
         match func_val {
             TValue::LClosure(closure) => {
                 let nargs = if b == 0 {
-                    state.mret_end.saturating_sub(a + 1)
+                    Self::diag_nargs(a, b, state.mret_end.saturating_sub(a + 1))
                 } else {
                     b.saturating_sub(1)
                 };
@@ -6409,7 +6445,7 @@ impl VmExecutor {
                 // 与 name_str() strlen。错误时在慢路径补推 entry, traceback 语义不变。
                 // impure 函数 (可能回调 Lua/yield) 仍走原完整路径。
                 let nargs = if b == 0 {
-                    state.mret_end.saturating_sub(a + 1)
+                    Self::diag_nargs(a, b, state.mret_end.saturating_sub(a + 1))
                 } else {
                     b.saturating_sub(1)
                 };
@@ -6552,7 +6588,7 @@ impl VmExecutor {
         // `lua_push*` 都以此为准。本实现 live top 在指令边界被抬到帧上界, 调用前必须
         // 压回精确的实参末尾 (否则 C 函数的返回值会落在帧上界之上, 调用者看不到)。
         let nargs_c = if b == 0 {
-            state.mret_end.saturating_sub(a + 1)
+            Self::diag_nargs(a, b, state.mret_end.saturating_sub(a + 1))
         } else {
             b.saturating_sub(1)
         };
@@ -6810,7 +6846,7 @@ impl VmExecutor {
         };
         if let Some(bf) = pure_bf {
             let nargs = if b == 0 {
-                state.mret_end.saturating_sub(a + 1)
+                Self::diag_nargs(a, b, state.mret_end.saturating_sub(a + 1))
             } else {
                 b.saturating_sub(1)
             };
@@ -7009,7 +7045,7 @@ impl VmExecutor {
                 // TAILCALL Rust 原生函数: 调用后结果放在 a 位置，后续 RETURN 处理返回
                 // 对应 C 的 luaD_callnoyield + precallC + poscall（nresults=-1 由 RETURN 调整）
                 let nargs = if b == 0 {
-                    state.mret_end.saturating_sub(a + 1)
+                    Self::diag_nargs(a, b, state.mret_end.saturating_sub(a + 1))
                 } else {
                     b.saturating_sub(1)
                 };
