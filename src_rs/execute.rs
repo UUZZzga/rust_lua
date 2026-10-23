@@ -6153,12 +6153,14 @@ impl VmExecutor {
                     state.stack[a..state.top + 1].rotate_right(1);
                     state.stack[a] = call_fn.clone();
                     state.top += 1;
-                    // b 增加 1 以反映额外的 self 参数 (MULTRET 时 b=0 不变,
-                    // 但 state.top 需同步增加以包含插入的 __call 函数)
+                    // 对应 C 的 luaT_tryfuncTM: 只 `L->top.p++` 一次 (插入 __call 占位),
+                    // 固定参数个数时再 `narg1++` 反映多出来的 self。
+                    // MULTRET (b == 0) 时**不能**再抬一次 top: 调用方按 top 数实参,
+                    // 多抬一次会把参数区下面的一条陈旧栈值算成实参 —— 实测 `obj()`
+                    // 经 __call 后 `select("#", ...)` 多出 1 个值 (luarocks 的 argparse
+                    // 正是被这个值喂成 boolean, 报 bad property 'name')。
                     if b > 0 {
                         b += 1;
-                    } else {
-                        state.top += 1;
                     }
                     // 对应 C: if ((status & MAX_CCMT) == MAX_CCMT) luaG_runerror(...)
                     if chain_len >= MAX_CALL_CHAIN {
