@@ -1211,6 +1211,27 @@ impl VmExecutor {
                 state.call_stack.last().map(|f| (f.func, f.base, f.top))
             );
 
+            // live top 恒不低于当前帧的寄存器上界 (在 hook 之前完成!): 帧内寄存器写在 top
+            // 之下, 所有寄存器读以 top 为上界; 且 hook 帧/元方法帧都从 top 起压入 —— 若
+            // hook 在抬高之前运行, 它的帧会盖住上一条指令的多返回值 (实测 db.lua/events.lua
+            // 的 `{f(table.unpack(...))}` 丢元素)。
+            let mret_live = if state.mret_frame == state.base {
+                state.mret_end
+            } else {
+                0
+            };
+            let live_bound = if mret_live > state.lua_frame_ceiling {
+                mret_live
+            } else {
+                state.lua_frame_ceiling
+            };
+            // 例外: `VARARGPREP` 必须看到帧入口设定的「实参末尾」top (C 的 `L->top = ra + b`,
+            // 变参重排按它搬运 func 副本/固定参数) —— 此时把 top 抬到帧上界会让重排写到
+            // 错误位置 (实测 vararg.lua 首个参数变 nil)。
+            if op != OpCode::VARARGPREP && state.top < live_bound {
+                state.top = live_bound;
+            }
+
             // perf: hook 检查与调试跟踪合并为单次位测试。trace_or_hook 为 0 时
             // (bench/生产常态) 一条 cmp+jcc 同时跳过两个路径; 非 0 时进入冷块
             // 分别处理 — 语义不变, 每指令省一次独立 load+test。
@@ -1251,22 +1272,6 @@ impl VmExecutor {
             // `L->top` 的含义: `ci->top` 覆盖帧内寄存器, 而多返回值 (OP_CALL/OP_VARARG
             // 的结果) 可能落在 `ci->top` 之上 (C 用 `L->top` 携带该位置, 其寄存器读
             // 不做边界检查; 本实现把它显式化)。
-            let mret_live = if state.mret_frame == state.base {
-                state.mret_end
-            } else {
-                0
-            };
-            let live_bound = if mret_live > state.lua_frame_ceiling {
-                mret_live
-            } else {
-                state.lua_frame_ceiling
-            };
-            // 例外: `VARARGPREP` 必须看到帧入口设定的「实参末尾」top (C 的 `L->top = ra + b`,
-            // 变参重排按它搬运 func 副本/固定参数) —— 此时把 top 抬到帧上界会让重排写到
-            // 错误位置 (实测 vararg.lua 首个参数变 nil)。
-            if op != OpCode::VARARGPREP && state.top < live_bound {
-                state.top = live_bound;
-            }
 
             // 主分发: 热门 opcode 内联处理, 冷门 opcode 路由到 #[cold] 函数
             // 提取冷门 opcode 改善 icache 密度 — 主循环代码体积减少约 40%
@@ -3424,6 +3429,20 @@ impl VmExecutor {
         //    若不恢复, state.top > stack.len() 导致后续 SETLIST 越界)
         let saved_stack_len = state.stack.len();
         let saved_state_top = state.top;
+        #[cfg(not(feature = "fast_unsafe"))]
+        {
+            let payload = if state.mret_frame == state.base {
+                state.mret_end
+            } else {
+                0
+            };
+            if saved_stack_len < payload || saved_stack_len < state.top {
+                eprintln!(
+                    "HOOK-TRUNC-BELOW-LIVE saved_len={} top={} mret={} mframe={} base={} event={}",
+                    saved_stack_len, state.top, state.mret_end, state.mret_frame, state.base, event
+                );
+            }
+        }
         // 多返回值交接字段同样要保存: hook 里执行的 Lua 代码会更新它, 而 hook 结束后
         // 调用点可能仍处于「上一条指令产出多返回值」的位置 (如 SETLIST 的 c==0)。
         let saved_mret_end = state.mret_end;
