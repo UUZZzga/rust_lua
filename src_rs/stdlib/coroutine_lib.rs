@@ -48,6 +48,13 @@ fn push_resume_results<'a>(
 ) {
     state.truncate_live(a);
     if nresults == 0 {
+        // 记录多返回值产出末尾 + 复原 live top 到 Lua 帧上界 (与 adjust_* 一致;
+        // OP_CALL b==0 会用 mret_end 取实参个数, 漏记会让实参个数变 0)
+        state.set_mret_end(state.top);
+        if state.top < state.lua_frame_ceiling {
+            state.top = state.lua_frame_ceiling;
+        }
+        state.pad_frame_scratch();
         return;
     }
     state.push_value(TValue::Boolean(success));
@@ -64,6 +71,13 @@ fn push_resume_results<'a>(
             }
         }
     }
+    // 记录多返回值产出末尾 + 复原 live top 到 Lua 帧上界 (与 adjust_* 一致;
+    // OP_CALL b==0 会用 mret_end 取实参个数, 漏记会让实参个数变 0)
+    state.set_mret_end(state.top);
+    if state.top < state.lua_frame_ceiling {
+        state.top = state.lua_frame_ceiling;
+    }
+    state.pad_frame_scratch();
 }
 
 /// 推送 resume 结果(从协程栈中直接读取返回值，避免创建中间 Vec)
@@ -79,6 +93,13 @@ fn push_resume_results_from_stack<'a>(
 ) {
     state.truncate_live(a);
     if nresults == 0 {
+        // 记录多返回值产出末尾 + 复原 live top 到 Lua 帧上界 (与 adjust_* 一致;
+        // OP_CALL b==0 会用 mret_end 取实参个数, 漏记会让实参个数变 0)
+        state.set_mret_end(state.top);
+        if state.top < state.lua_frame_ceiling {
+            state.top = state.lua_frame_ceiling;
+        }
+        state.pad_frame_scratch();
         return;
     }
     state.push_value(TValue::Boolean(success));
@@ -109,6 +130,13 @@ fn push_resume_results_from_stack<'a>(
         }
     }
     // co_stack 在此 drop，释放协程栈内存
+    // 记录多返回值产出末尾 + 复原 live top 到 Lua 帧上界 (与 adjust_* 一致;
+    // OP_CALL b==0 会用 mret_end 取实参个数, 漏记会让实参个数变 0)
+    state.set_mret_end(state.top);
+    if state.top < state.lua_frame_ceiling {
+        state.top = state.lua_frame_ceiling;
+    }
+    state.pad_frame_scratch();
 }
 
 /// 推送 resume 错误结果: false + error message

@@ -178,6 +178,11 @@ pub struct LuaState<'a> {
     /// OP_CALL/OP_TAILCALL/OP_RETURN 的 `b == 0` 与 OP_SETLIST 的 `c == 0` 读它。
     /// 生产者 (adjust_* / op_return*_finish / op_vararg) 在结果落位后更新。
     pub mret_end: usize,
+    /// 产出 `mret_end` 时的帧 base —— 只有与当前 `base` 相同才可信。
+    /// C 的 `L->top` 在每个帧切换点都被重设(`precall` = `ci->top`, `poscall` = 结果末尾),
+    /// 因此旧帧遗留的「上一指令产出末尾」必须在进入新帧后失效, 否则本帧 `OP_CALL` 的
+    /// b==0 会把它当成实参末尾(实测: 多算/少算实参, 见 db.lua/events.lua)。
+    pub mret_frame: usize,
     /// 最内层 **Lua 帧** 的寄存器上界 (`ci->top`); 0 = 当前在 C 帧里 (C API 自管 live top)。
     ///
     /// 为什么要独立字段: 帧上界无法每处现算 —— 内联的 C 函数 (BuiltinFn / CClosure)
@@ -391,6 +396,7 @@ impl<'a> LuaState<'a> {
             protos: Rc::new(Vec::new()),
             top: 0,
             mret_end: 0,
+            mret_frame: 0,
             lua_frame_ceiling: 0,
             base: 0,
             pc: 0,
@@ -1118,6 +1124,24 @@ impl<'a> LuaState<'a> {
     /// 当 return hook 启用时，不立即 adjust，而是把结果放到栈顶之上，
     /// 设置 pending_return_adjust，由 op_call 在 return hook 后执行 adjust。
     /// 这样 return hook 中的 debug.getlocal 能从栈上读到返回值。
+    /// 记录「多返回值产出末尾」(本帧内有效) —— 对应 C 在各产出点设置的 `L->top`。
+    #[inline(always)]
+    pub fn set_mret_end(&mut self, end: usize) {
+        self.mret_end = end;
+        self.mret_frame = self.base;
+    }
+
+    /// 本帧最近一次产出的末尾 —— 对应 C 的 `L->top`(OP_CALL b==0 读它取实参个数)。
+    /// 帧不匹配时视为「无产出」(返回 `a + 1` 表示 0 个实参)。
+    #[inline(always)]
+    pub fn mret_payload_end(&self, a: usize) -> usize {
+        if self.mret_frame == self.base {
+            self.mret_end
+        } else {
+            a + 1
+        }
+    }
+
     pub fn adjust_results(&mut self, a: usize, nresults: i32, mut results: Vec<TValue<'a>>) {
         debug_assert!(self.stack.len() <= self.stack.capacity());
         // 已准备水位由本函数/调用点推进, 此处只能断言物理容量 (见 CLAUDE.md 栈布局不变量)
@@ -1180,7 +1204,7 @@ impl<'a> LuaState<'a> {
         // 多返回值交接: 此时 top 恰为结果末尾 —— 记入 mret_end (供后续 OP_CALL/OP_RETURN
         // 的 b==0 与 OP_SETLIST 的 c==0 读取), 然后把 live top 复原到 **Lua 帧**的寄存器
         // 上界 (C 帧内联调用时为 Lua 调用者的上界; 见 `lua_frame_ceiling`)。
-        self.mret_end = self.top;
+        self.set_mret_end(self.top);
         if self.top < self.lua_frame_ceiling {
             self.top = self.lua_frame_ceiling;
         }
@@ -1269,7 +1293,7 @@ impl<'a> LuaState<'a> {
             self.top += nresults as usize;
         }
         // 多返回值交接 + live top 复原到 Lua 帧上界 (见 adjust_results)
-        self.mret_end = self.top;
+        self.set_mret_end(self.top);
         if self.top < self.lua_frame_ceiling {
             self.top = self.lua_frame_ceiling;
         }
@@ -1304,7 +1328,7 @@ impl<'a> LuaState<'a> {
             }
         }
         // 多返回值交接 + live top 复位到帧上界 (见 adjust_results)
-        self.mret_end = self.top;
+        self.set_mret_end(self.top);
         if self.top < self.lua_frame_ceiling {
             self.top = self.lua_frame_ceiling;
         }
@@ -1365,7 +1389,7 @@ impl<'a> LuaState<'a> {
         self.truncate_live(new_len);
         self.top = new_len;
         // 多返回值交接 + live top 复原到 Lua 帧上界 (见 adjust_results)
-        self.mret_end = self.top;
+        self.set_mret_end(self.top);
         if self.top < self.lua_frame_ceiling {
             self.top = self.lua_frame_ceiling;
         }
@@ -1401,6 +1425,14 @@ impl<'a> LuaState<'a> {
                 a + nr
             };
             self.truncate_live(new_len);
+            // 结果落位等价于 adjust_* 的非推迟路径: 记录多返回值交接 + 复原 live top
+            // 到 Lua 帧上界 (推迟路径绕过 adjust_results_on_stack, 原先漏了这两步 ——
+            // db.lua/events.lua 等 hook 密集用例的实参个数因此读到陈旧的 mret_end)。
+            self.set_mret_end(new_len);
+            if self.top < self.lua_frame_ceiling {
+                self.top = self.lua_frame_ceiling;
+            }
+            self.pad_frame_scratch();
         }
     }
 }
