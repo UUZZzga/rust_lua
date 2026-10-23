@@ -178,6 +178,14 @@ pub struct LuaState<'a> {
     /// OP_CALL/OP_TAILCALL/OP_RETURN 的 `b == 0` 与 OP_SETLIST 的 `c == 0` 读它。
     /// 生产者 (adjust_* / op_return*_finish / op_vararg) 在结果落位后更新。
     pub mret_end: usize,
+    /// 最内层 **Lua 帧** 的寄存器上界 (`ci->top`); 0 = 当前在 C 帧里 (C API 自管 live top)。
+    ///
+    /// 为什么要独立字段: 帧上界无法每处现算 —— 内联的 C 函数 (BuiltinFn / CClosure)
+    /// 调用期间 `state.base` 指向 C 函数自己的帧, 此时 `stack[base-1]` 不是 LClosure,
+    /// 现算只能退回 live top; 而 `adjust_*` / `op_return*` 在 C 帧内代表 Lua 调用者
+    /// 收尾时, 必须把 live top 复原到 **Lua 调用者**的帧上界 (否则留在结果末尾,
+    /// 后续寄存器读越界 / GC 根范围错误)。
+    pub lua_frame_ceiling: usize,
     pub base: usize,
     pub pc: usize,
     pub num_params: u8,
@@ -383,6 +391,7 @@ impl<'a> LuaState<'a> {
             protos: Rc::new(Vec::new()),
             top: 0,
             mret_end: 0,
+            lua_frame_ceiling: 0,
             base: 0,
             pc: 0,
             num_params: 0,
@@ -782,6 +791,35 @@ impl<'a> LuaState<'a> {
         }
     }
 
+    /// 当前**执行**帧的 ci 记录 (只读) —— 以帧身份 `func = base - 1` 定位。
+    ///
+    /// 不能用 `call_stack.last()`: `state.pcall` 不为被保护函数压 CallFrame (只压
+    /// CallInfoEntry), 此时 `last()` 是**外层**帧, 会污染外层的 `func`/`top`。
+    #[inline(always)]
+    pub fn current_frame_ci(&self) -> Option<&crate::objects::CallFrame<'a>> {
+        if self.base == 0 {
+            return None;
+        }
+        let func = self.base - 1;
+        match self.call_stack.last() {
+            Some(ci) if ci.func == func => Some(ci),
+            _ => None,
+        }
+    }
+
+    /// 当前执行帧的 ci 记录 (可变) —— 见 [`Self::current_frame_ci`]。
+    #[inline(always)]
+    pub fn current_frame_ci_mut(&mut self) -> Option<&mut crate::objects::CallFrame<'a>> {
+        if self.base == 0 {
+            return None;
+        }
+        let func = self.base - 1;
+        match self.call_stack.last_mut() {
+            Some(ci) if ci.func == func => Some(ci),
+            _ => None,
+        }
+    }
+
     /// 当前帧寄存器写边界 (exclusive) —— 保守取 `anchor + MAX_FSTACK + 1`。
     ///
     /// anchor = 帧基址 (base 有效时) 否则栈长: 保证覆盖「base + 寄存器号」形式的写
@@ -816,15 +854,19 @@ impl<'a> LuaState<'a> {
     ///      live top 会破坏 `lua_gettop` 等 C API 语义。
     #[inline(always)]
     pub fn frame_top(&self) -> usize {
-        let func = self.cur_func();
-        // 只有「确实存在一个正在执行的帧」时才谈帧上界: `base == func + 1` 是帧存在的
-        // 判据 —— C API 从 Rust 侧压值但尚未调用 (base == 0 或指向别处) 时, 抬高 live
-        // top 会破坏 `lua_gettop` 等 API 语义; C 帧 (函数槽不是 LClosure) 同理。
-        if self.base == 0 || self.base != func + 1 {
+        // 当前执行帧的函数槽恒为 `base - 1`: `state.base` 在每条进入帧的路径上都被设成
+        // 该帧的 `func + 1` (`op_call` / `OP_TAILCALL` / `VARARGPREP` / `state.pcall` /
+        // 协程 resume)。**不能用 [`Self::cur_func`]** —— 它取 `call_stack.last().func`,
+        // 而 `state.pcall` 不为被保护函数压 CallFrame (只压 CallInfoEntry), 此时
+        // `call_stack.last()` 是**外层**帧, 会算出错误的帧上界, 于是越界读检查与
+        // scratch 落点都错 (实测 `closure.lua` 在 idx=3/top=3 处 panic)。
+        if self.base == 0 {
             return self.top;
         }
+        let func = self.base - 1;
         match self.stack.get(func) {
             Some(TValue::LClosure(closure)) => {
+                // 同一帧的 ci 记录 (op_call / tailcall / VARARGPREP 维护 `ci.func`/`ci.top`)
                 if let Some(ci) = self.call_stack.last() {
                     if ci.func == func && ci.top != 0 {
                         return ci.top;
@@ -832,8 +874,34 @@ impl<'a> LuaState<'a> {
                 }
                 func + 1 + closure.proto.max_stack_size as usize
             }
+            // C 帧 (CClosure / LCFn / BuiltinFn / LightUserData) 或尚未进入帧:
+            // C 帧的栈窗口天然在调用者活寄存器之上, 抬高 live top 会破坏
+            // `lua_gettop` 等 C API 语义 —— 原值返回 (no-op)。
             _ => self.top,
         }
+    }
+
+    /// 按当前 `base` 现算并写入 [`Self::lua_frame_ceiling`] (C 帧/无帧 → 0)。
+    ///
+    /// 用在帧切换之后: 返回落到调用者帧、协程恢复、C 帧返回 Lua 帧等。
+    #[inline]
+    pub fn recompute_lua_frame_ceiling(&mut self) {
+        let base = self.base;
+        self.lua_frame_ceiling = if base == 0 {
+            0
+        } else {
+            let func = base - 1;
+            match self.stack.get(func) {
+                Some(TValue::LClosure(c)) => {
+                    let fsize = func + 1 + c.proto.max_stack_size as usize;
+                    match self.call_stack.last() {
+                        Some(ci) if ci.func == func && ci.top != 0 => ci.top,
+                        _ => fsize,
+                    }
+                }
+                _ => 0,
+            }
+        };
     }
 
     /// 对应 C 的 `savestate(L, ci)` / `Protect`: 把 live top 抬到当前帧的栈上界
@@ -1111,10 +1179,12 @@ impl<'a> LuaState<'a> {
             }
         }
         // 多返回值交接: 此时 top 恰为结果末尾 —— 记入 mret_end (供后续 OP_CALL/OP_RETURN
-        // 的 b==0 与 OP_SETLIST 的 c==0 读取), 然后把 live top 复位到本帧寄存器上界
-        // (`ci->top`): 帧内寄存器写在 top 之下, 且任何寄存器读都以 top 为上界。
+        // 的 b==0 与 OP_SETLIST 的 c==0 读取), 然后把 live top 复原到 **Lua 帧**的寄存器
+        // 上界 (C 帧内联调用时为 Lua 调用者的上界; 见 `lua_frame_ceiling`)。
         self.mret_end = self.top;
-        self.top = self.frame_top();
+        if self.top < self.lua_frame_ceiling {
+            self.top = self.lua_frame_ceiling;
+        }
         self.pad_frame_scratch();
     }
 
@@ -1199,9 +1269,11 @@ impl<'a> LuaState<'a> {
             }
             self.top += nresults as usize;
         }
-        // 多返回值交接 + live top 复位到帧上界 (见 adjust_results)
+        // 多返回值交接 + live top 复原到 Lua 帧上界 (见 adjust_results)
         self.mret_end = self.top;
-        self.top = self.frame_top();
+        if self.top < self.lua_frame_ceiling {
+            self.top = self.lua_frame_ceiling;
+        }
         self.pad_frame_scratch();
     }
 
@@ -1234,7 +1306,9 @@ impl<'a> LuaState<'a> {
         }
         // 多返回值交接 + live top 复位到帧上界 (见 adjust_results)
         self.mret_end = self.top;
-        self.top = self.frame_top();
+        if self.top < self.lua_frame_ceiling {
+            self.top = self.lua_frame_ceiling;
+        }
         self.pad_frame_scratch();
     }
 
@@ -1291,9 +1365,11 @@ impl<'a> LuaState<'a> {
         };
         self.truncate_live(new_len);
         self.top = new_len;
-        // 多返回值交接 + live top 复位到帧上界 (见 adjust_results)
+        // 多返回值交接 + live top 复原到 Lua 帧上界 (见 adjust_results)
         self.mret_end = self.top;
-        self.top = self.frame_top();
+        if self.top < self.lua_frame_ceiling {
+            self.top = self.lua_frame_ceiling;
+        }
         self.pad_frame_scratch();
     }
 
@@ -1401,6 +1477,9 @@ impl<'a> LuaState<'a> {
                 // 使下文的 pad_frame_scratch / push / frame_need 检查都不再分配 ——
                 // 那些点位于保护边界之外, 一旦在那里抛内存错误就会跳过本帧。
                 let fsize = closure.proto.max_stack_size as usize;
+                // Lua 帧上界 (C 的 ci->top = func + 1 + p->maxstacksize) —— VARARGPREP
+                // 会在重排后自行更新。
+                self.lua_frame_ceiling = func_idx + 1 + fsize;
                 let need = func_idx + 1 + fsize + LUA_MINSTACK;
                 if need > self.stack.len() && self.reserve_stack(need - self.stack.len()).is_err() {
                     self.last_error_value = Some(self.memerrmsg_value());

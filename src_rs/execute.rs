@@ -60,6 +60,13 @@ enum SpecValue<'a> {
 /// 信号处理器 (cli.rs::laction) 设置此标志，VM 循环在每条指令前检查，
 /// 若设置则抛出 "interrupted!" 错误（可被 pcall 捕获）。
 pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(not(feature = "fast_unsafe"))]
+thread_local! {
+    /// 诊断用 (仅 safe 构建): 最近一次分发前的 (top, base, pc, opcode)。
+    pub(crate) static DISPATCH_CTX: std::cell::Cell<(usize, usize, usize, Option<OpCode>, usize)> =
+        const { std::cell::Cell::new((0, 0, 0, None, 0)) };
+}
 use std::ffi::c_void;
 
 // ============================================================================
@@ -1222,6 +1229,30 @@ impl VmExecutor {
                 }
             }
 
+            #[cfg(not(feature = "fast_unsafe"))]
+            let _fs = match state.stack.get(state.base.saturating_sub(1)) {
+                Some(TValue::LClosure(c2)) => c2.proto.max_stack_size as usize,
+                _ => usize::MAX,
+            };
+            DISPATCH_CTX.with(|c| c.set((state.top, state.base, pc, Some(op), _fs)));
+
+            // live top 恒不低于当前帧的寄存器上界: 帧内寄存器写在 top 之下, 且所有寄存器
+            // 读以 top 为上界 (safe 构建 read_stack 的断言). 个别指令会把 top 临时收到
+            // 「本次调用的结果末尾」(对齐 C 的 `L->top = res + nres`), 在指令边界统一复原
+            // —— 语义仍是 C 的 `ci->top`, 不是逐写维护 (写路径完全不碰 top).
+            // 读边界 = max(帧寄存器上界, 最近一次多返回值产出的末尾) —— 正是 C 里
+            // `L->top` 的含义: `ci->top` 覆盖帧内寄存器, 而多返回值 (OP_CALL/OP_VARARG
+            // 的结果) 可能落在 `ci->top` 之上 (C 用 `L->top` 携带该位置, 其寄存器读
+            // 不做边界检查; 本实现把它显式化)。
+            let live_bound = if state.mret_end > state.lua_frame_ceiling {
+                state.mret_end
+            } else {
+                state.lua_frame_ceiling
+            };
+            if state.top < live_bound {
+                state.top = live_bound;
+            }
+
             // 主分发: 热门 opcode 内联处理, 冷门 opcode 路由到 #[cold] 函数
             // 提取冷门 opcode 改善 icache 密度 — 主循环代码体积减少约 40%
             // (perf 显示 execute_loop 占 10.65%, 主循环本身是 icache 敏感的热点)
@@ -1696,6 +1727,7 @@ impl VmExecutor {
                     state.constants = protection.saved_constants;
                     state.protos = protection.saved_protos;
                     state.base = protection.saved_base;
+                    state.recompute_lua_frame_ceiling();
                     state.pc = protection.saved_pc;
                     state.num_params = protection.saved_num_params;
                     state.is_vararg = protection.saved_is_vararg;
@@ -2444,7 +2476,11 @@ impl VmExecutor {
             if idx < top {
                 &stack[idx]
             } else {
-                unreachable!("read_stack 越界: idx={} top={}", idx, top)
+                let ctx = DISPATCH_CTX.with(|c| c.get());
+                unreachable!(
+                    "read_stack 越界: idx={} top={} ctx=(top,base,pc,op,fsize)=({},{},{},{:?},{})",
+                    idx, top, ctx.0, ctx.1, ctx.2, ctx.3, ctx.4
+                )
             }
         }
     }
@@ -2464,6 +2500,26 @@ impl VmExecutor {
             };
             if idx >= limit {
                 Self::read_stack_panic(state, idx);
+            }
+        }
+        #[cfg(not(feature = "fast_unsafe"))]
+        {
+            if idx >= state.top {
+                let ftsize = match state.stack.get(state.base.saturating_sub(1)) {
+                    Some(TValue::LClosure(c)) => c.proto.max_stack_size as usize,
+                    _ => usize::MAX,
+                };
+                eprintln!(
+                    "OOBREAD idx={} top={} base={} frame_top={} fsize={} cistack={:?} ci_info={:?} pc={}",
+                    idx,
+                    state.top,
+                    state.base,
+                    state.frame_top(),
+                    ftsize,
+                    state.call_stack.last().map(|c| (c.func, c.top)),
+                    state.call_info.last().map(|c| (c.base, c.is_c, c.saved_pc)),
+                    state.pc
+                );
             }
         }
         Self::read_stack(&state.stack, state.top, idx)
@@ -2738,6 +2794,7 @@ impl VmExecutor {
         state.constants = protection.saved_constants;
         state.protos = protection.saved_protos;
         state.base = protection.saved_base;
+        state.recompute_lua_frame_ceiling();
         state.pc = protection.saved_pc; // 指向被中断的指令
         state.num_params = protection.saved_num_params;
         state.is_vararg = protection.saved_is_vararg;
@@ -3000,6 +3057,7 @@ impl VmExecutor {
         state.constants = protection.saved_constants;
         state.protos = protection.saved_protos;
         state.base = protection.saved_base;
+        state.recompute_lua_frame_ceiling();
         state.pc = protection.saved_pc; // 指向 OP_RETURN/OP_CLOSE (不 +1, 重新执行)
         state.num_params = protection.saved_num_params;
         state.is_vararg = protection.saved_is_vararg;
@@ -3127,6 +3185,7 @@ impl VmExecutor {
         state.constants = protection.saved_constants;
         state.protos = protection.saved_protos;
         state.base = protection.saved_base;
+        state.recompute_lua_frame_ceiling();
         state.pc = protection.saved_pc; // 指向 CALL pcall 指令之后
         state.num_params = protection.saved_num_params;
         state.is_vararg = protection.saved_is_vararg;
@@ -6861,6 +6920,7 @@ impl VmExecutor {
                 if let Some(ci) = state.call_stack.last_mut() {
                     ci.top = func_slot + 1 + fsize;
                 }
+                state.lua_frame_ceiling = func_slot + 1 + fsize;
 
                 if proto_is_vararg {
                     // vararg 函数: 截断栈到实际参数末尾，VARARGPREP 会处理
@@ -6892,6 +6952,7 @@ impl VmExecutor {
                     }
                     // 设置 state.top 为帧末尾 (对应 C 的 L->top = ci->top)
                     state.top = frame_end;
+                    state.lua_frame_ceiling = frame_end;
                     // 对应 C 的 startfunc -> luaG_tracecall -> luaD_hookcall:
                     // 非 vararg 尾调用触发 "tail call" hook (CIST_TAIL 已设置)
                     if state.hook_mask & 1 != 0 {
@@ -7105,6 +7166,7 @@ impl VmExecutor {
             state.constants = frame.constants;
             state.protos = frame.protos;
             state.base = frame.base;
+            state.recompute_lua_frame_ceiling();
             state.pad_frame_scratch();
             state.pc = frame.return_pc;
             state.num_params = frame.num_params;
@@ -7236,6 +7298,7 @@ impl VmExecutor {
             state.constants = frame.constants;
             state.protos = frame.protos;
             state.base = frame.base;
+            state.recompute_lua_frame_ceiling();
             state.pad_frame_scratch();
             state.pc = frame.return_pc;
             state.num_params = frame.num_params;
@@ -7359,6 +7422,7 @@ impl VmExecutor {
             state.constants = frame.constants;
             state.protos = frame.protos;
             state.base = frame.base;
+            state.recompute_lua_frame_ceiling();
             state.pad_frame_scratch();
             state.pc = frame.return_pc;
             state.num_params = frame.num_params;
@@ -8310,10 +8374,12 @@ impl VmExecutor {
             // `func`/`top` 一起上移（二者之差不变）; state.base 同步 —— 本帧唯一的
             // 非帧切换 base 写点。变参留在原位（新 func 之前），数量记在 state.nextraargs。
             // （`CallFrame.base` 是**调用者**的基址快照，不受本帧位移影响，不要一起加。）
-            if let Some(ci) = state.call_stack.last_mut() {
+            let _top_now = state.top;
+            let _stack_len = state.stack.len();
+            if let Some(ci) = state.current_frame_ci_mut() {
                 ci.func += totalargs + 1;
                 ci.top += totalargs + 1;
-                debug_assert!(state.top <= ci.top && ci.top < state.stack.len());
+                debug_assert!(_top_now <= ci.top && ci.top < _stack_len);
             }
             state.base += totalargs + 1;
 
@@ -8340,11 +8406,14 @@ impl VmExecutor {
         // （[`Self::call_hook`] 在 L->top 之上压 hook 帧）都依赖它。
         // 本帧 ci 记录的 `top` 就是 ci->top（VARARGPREP 已随 func 一起上移）；
         // 入口帧没有 ci 记录，按其函数槽的 proto 现算。
-        let proto_frame_end = match state.stack.get(state.cur_func()) {
-            Some(TValue::LClosure(c)) => state.cur_func() + 1 + c.proto.max_stack_size as usize,
+        // 帧身份用 `base - 1` (见 LuaState::current_frame_ci): 变参重排已把 func/base
+        // 一起上移, 故 `base - 1` 指向新的 func 副本。
+        let frame_func = state.base - 1;
+        let proto_frame_end = match state.stack.get(frame_func) {
+            Some(TValue::LClosure(c)) => frame_func + 1 + c.proto.max_stack_size as usize,
             _ => 0,
         };
-        let frame_end = match state.call_stack.last() {
+        let frame_end = match state.current_frame_ci() {
             Some(ci) => {
                 debug_assert_eq!(
                     ci.top, proto_frame_end,
@@ -8357,9 +8426,25 @@ impl VmExecutor {
         if state.stack.len() < frame_end {
             Self::fast_resize_stack_nil(state, frame_end);
         }
+        state.lua_frame_ceiling = frame_end;
         // 变参序言把参数搬到更高的寄存器位, 帧上界随之变化 (C: `ci->top.p += totalargs + 1`,
         // 随后 `Protect` 复位 L->top) —— 这里按新的帧上界复位 live top。
         state.savestate();
+        #[cfg(not(feature = "fast_unsafe"))]
+        {
+            use std::sync::atomic::{AtomicUsize, Ordering};
+            static VAPN2: AtomicUsize = AtomicUsize::new(0);
+            if VAPN2.fetch_add(1, Ordering::Relaxed) < 4 {
+                eprintln!(
+                    "VAPREP-END base={} top={} ceiling={} ftop={} cistack={:?}",
+                    state.base,
+                    state.top,
+                    state.lua_frame_ceiling,
+                    state.frame_top(),
+                    state.call_stack.last().map(|c| (c.func, c.top))
+                );
+            }
+        }
 
         // 对应 C 的 OP_VARARGPREP -> luaD_hookcall: vararg 函数在 VARARGPREP 后触发 call hook
         // luaD_hookcall 检查 CIST_TAIL 决定事件类型: 尾调用触发 "tail call", 否则 "call"
