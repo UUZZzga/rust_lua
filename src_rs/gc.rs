@@ -2219,6 +2219,7 @@ impl<'a> LuaState<'a> {
                 is_c: false,
                 closure: None,
                 base: self.base,
+                func: (self.base).saturating_sub(1),
                 saved_pc: self.pc,
                 name: Some("__gc"),
                 namewhat: "metamethod",

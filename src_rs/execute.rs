@@ -349,7 +349,7 @@ pub fn get_func_name<'a>(state: &LuaState, call_pc: usize) -> (String, String) {
     if state.base == 0 || state.base > state.top {
         return (String::new(), String::new());
     }
-    let proto = match &state.stack[state.base - 1] {
+    let proto = match &state.stack[state.cur_func()] {
         TValue::LClosure(c) => &c.proto,
         _ => return (String::new(), String::new()),
     };
@@ -514,7 +514,7 @@ pub fn push_global_func_name<'a>(state: &LuaState) -> Option<String> {
     // 获取当前函数
     let func_val = state.call_info.last().and_then(|ci| {
         if ci.base > 0 {
-            state.stack.get(ci.base - 1).cloned()
+            state.stack.get(ci.func).cloned()
         } else {
             None
         }
@@ -982,12 +982,9 @@ fn is_env_register(proto: &Proto, pc: usize, reg: usize) -> bool {
 ///
 /// Rust 版本直接接收寄存器编号（调用方已知），通过 get_obj_name 获取
 /// kind 和 name，返回 " (kind 'name')" 或空字符串。
-fn varinfo_str<'a>(stack: &[TValue<'a>], base: usize, top: usize, pc: usize, reg: usize) -> String {
-    if base == 0 || base > top {
-        return String::new();
-    }
-    let proto = match &stack[base - 1] {
-        TValue::LClosure(c) => &c.proto,
+fn varinfo_str<'a>(stack: &[TValue<'a>], func: usize, pc: usize, reg: usize) -> String {
+    let proto = match stack.get(func) {
+        Some(TValue::LClosure(c)) => &c.proto,
         _ => return String::new(),
     };
     let (name, kind) = get_obj_name(proto, pc, reg);
@@ -999,7 +996,11 @@ fn varinfo_str<'a>(stack: &[TValue<'a>], base: usize, top: usize, pc: usize, reg
 }
 
 fn varinfo_str_state<'a>(state: &LuaState<'a>, reg: usize) -> String {
-    varinfo_str(&state.stack, state.base, state.top, state.pc, reg)
+    // 帧有效性: base 为 0 或越界表示当前无 Lua 帧 (对应 C 的 isLua(L->ci) 检查)
+    if state.base == 0 || state.base > state.top {
+        return String::new();
+    }
+    varinfo_str(&state.stack, state.cur_func(), state.pc, reg)
 }
 
 /// 变量来源：用于索引错误时附加变量名信息
@@ -1021,7 +1022,7 @@ fn index_varinfo<'a>(state: &LuaState, source: VarSource) -> String {
             if state.base == 0 || state.base > state.top {
                 return String::new();
             }
-            let proto = match &state.stack[state.base - 1] {
+            let proto = match &state.stack[state.cur_func()] {
                 TValue::LClosure(c) => &c.proto,
                 _ => return String::new(),
             };
@@ -1197,6 +1198,20 @@ impl VmExecutor {
                 pc - 1,
                 base,
                 state.base
+            );
+            // ci/base 一致性断言: 当前帧记录 (call_stack 栈顶, C 的 L->ci) 的
+            // `func` 必须与 state.base 同步 —— `func + 1 == base`（VARARGPREP 位移
+            // 二者一体调整）。入口帧（pcall / 协程体）没有记录 → 栈为空。
+            debug_assert!(
+                state
+                    .call_stack
+                    .last()
+                    .map_or(true, |f| f.func + 1 == state.base),
+                "ci/base diverged: op={:?} pc={} base={} ci={:?}",
+                op,
+                pc - 1,
+                state.base,
+                state.call_stack.last().map(|f| (f.func, f.base, f.top))
             );
 
             // perf: hook 检查与调试跟踪合并为单次位测试。trace_or_hook 为 0 时
@@ -1419,8 +1434,8 @@ impl VmExecutor {
                 OpCode::VARARGPREP => {
                     let r = Self::op_varargprep(state, inst, pc - 1);
                     if r.is_ok() {
-                        // perf: VARARGPREP 调整 state.base (变参区下沉, func 上移
-                        // state.base += totalargs + 1) — 唯一不经帧切换的 base 写点,
+                        // perf: VARARGPREP 调整 state.base/ci.func/ci.top (变参区下沉,
+                        // func 上移 `totalargs + 1`) — 唯一不经帧切换的 base 写点,
                         // 返回后同步缓存 (单次 load; code/constants 不变, 免整 reload)。
                         base = state.base;
                     }
@@ -1864,7 +1879,7 @@ impl VmExecutor {
         //   (string.dump(f, true) 去除调试信息后 source 为 None)
         let (cur_source, cur_line, cur_closure, has_no_debug_info) =
             if state.base > 0 && state.base <= state.top {
-                if let TValue::LClosure(closure) = &state.stack[state.base - 1].clone() {
+                if let TValue::LClosure(closure) = &state.stack[state.cur_func()].clone() {
                     let no_debug = closure.proto.source.is_none();
                     let src = closure
                         .proto
@@ -2184,7 +2199,6 @@ impl VmExecutor {
     /// (`cmpb $7, (slot); jae`) —— 重排该 enum 的变体顺序会让 LLVM 退化为
     /// 「范围保护 `ja` + 位掩码 `bt`/`jae`」的两分支形式 (每个寄存器写多 ~4 uops)。
     /// 实测汇编见 execute.rs 的 write_stack 文档与 CLAUDE.md「TValue 变体顺序」。
-    #[cfg(feature = "fast_unsafe")]
     #[inline(always)]
     fn old_slot_holds_ref(old: &TValue<'_>) -> bool {
         matches!(
@@ -2298,7 +2312,7 @@ impl VmExecutor {
         #[cfg(not(feature = "fast_unsafe"))]
         {
             // 安全等价实现: 不变量破例时按需补齐后写 (无性能要求)。
-            state.stack[idx] = val;
+            stack[idx] = val;
         }
     }
 
@@ -2418,6 +2432,16 @@ impl VmExecutor {
             dst_idx,
             src_idx,
         );
+        // 寄存器写必须抬高 live top —— 同 write_stack_state。两个后果都依赖它:
+        // 元方法调用 / C API 压栈把 `top` 当作压入起点 (对应 C 的 Protect/savestate
+        // 把 L->top 复位到 ci->top)，GC 根扫描只覆盖 `[..top)`。旧实现里这条在
+        // `copy_stack_slot` 内 (`state.top = state.top.max(dst_idx + 1)`)，1a87f95 把
+        // 该函数签名改成裸切片 `&mut [TValue]` 时漏了它 —— 于是 `MOVE` 到 top 之上的
+        // 寄存器后 top 不动，紧随的元方法调用按 top 取 scratch 直接覆盖该寄存器
+        // (实测: main chunk 里 `print("D", g(o + 1))` 的 g 被元方法结果覆盖)。
+        if dst_idx >= state.top {
+            state.top = dst_idx + 1;
+        }
     }
 
     /// 读取栈槽 — VM 字节码路径专用 (idx 保证在范围内)
@@ -3217,7 +3241,7 @@ impl VmExecutor {
         if state.base == 0 || state.base > state.top {
             return -1;
         }
-        if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
+        if let TValue::LClosure(closure) = &state.stack[state.cur_func()] {
             let proto = &closure.proto;
             if proto.line_info.is_empty() || state.pc >= proto.line_info.len() {
                 return -1;
@@ -3252,7 +3276,7 @@ impl VmExecutor {
         if state.base == 0 || state.base > state.top {
             return false;
         }
-        if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
+        if let TValue::LClosure(closure) = &state.stack[state.cur_func()] {
             let proto = &closure.proto;
             if proto.line_info.is_empty() {
                 return false;
@@ -3363,6 +3387,7 @@ impl VmExecutor {
             is_c: false,
             closure: hook_closure,
             base: hook_base,
+            func: (hook_base).saturating_sub(1),
             saved_pc: state.pc,
             name: Some("?"),
             namewhat: "hook",
@@ -5937,6 +5962,7 @@ impl VmExecutor {
             is_c: true,
             closure: None,
             base: a + 1,
+            func: (a + 1).saturating_sub(1),
             saved_pc: state.pc,
             name: Some(bf.name_str()),
             namewhat: "function",
@@ -5960,6 +5986,7 @@ impl VmExecutor {
             is_c: true,
             closure: None,
             base: a + 1,
+            func: (a + 1).saturating_sub(1),
             saved_pc: state.pc,
             name: Some(bf.name_str()),
             namewhat: "function",
@@ -6028,9 +6055,12 @@ impl VmExecutor {
             code: saved_code,
             constants: saved_constants,
             protos: saved_protos,
+            // 被调帧身份 (func/top = C 的 ci->func.p / ci->top.p) + 调用者快照
+            func: a,
             base: state.base,
-            return_pc: state.pc + 1,
+            top: a + 1 + fsize,
             return_base: a,
+            return_pc: state.pc + 1,
             num_results: nresults,
             num_params: state.num_params,
             is_vararg: state.is_vararg,
@@ -6046,6 +6076,7 @@ impl VmExecutor {
             is_c: false,
             closure: Some(closure),
             base: state.base,
+            func: (state.base).saturating_sub(1),
             saved_pc: state.pc,
             name: None,
             namewhat: "",
@@ -6208,9 +6239,12 @@ impl VmExecutor {
                     code: saved_code,
                     constants: saved_constants,
                     protos: saved_protos,
+                    // 被调帧身份 (func/top = C 的 ci->func.p / ci->top.p) + 调用者快照
+                    func: a,
                     base: state.base,
-                    return_pc: state.pc + 1,
+                    top: a + 1 + fsize,
                     return_base: a,
+                    return_pc: state.pc + 1,
                     num_results: nresults,
                     num_params: state.num_params,
                     is_vararg: state.is_vararg,
@@ -6227,6 +6261,7 @@ impl VmExecutor {
                     is_c: false,
                     closure: Some(closure),
                     base: state.base,
+                    func: (state.base).saturating_sub(1),
                     saved_pc: state.pc,
                     name: None,
                     namewhat: "",
@@ -6326,6 +6361,7 @@ impl VmExecutor {
                     is_c: true,
                     closure: None,
                     base: a + 1,
+                    func: (a + 1).saturating_sub(1),
                     saved_pc: state.pc,
                     name: Some(c_name),
                     namewhat: c_namewhat,
@@ -6363,6 +6399,7 @@ impl VmExecutor {
                         is_c: true,
                         closure: None,
                         base: a + 1,
+                        func: (a + 1).saturating_sub(1),
                         saved_pc: state.pc,
                         name: Some(c_name),
                         namewhat: c_namewhat,
@@ -6492,6 +6529,7 @@ impl VmExecutor {
             is_c: true,
             closure: None,
             base: a + 1,
+            func: (a + 1).saturating_sub(1),
             saved_pc: state.pc,
             name: None,
             namewhat: "",
@@ -6703,6 +6741,7 @@ impl VmExecutor {
                         is_c: true,
                         closure: None,
                         base: a + 1,
+                        func: (a + 1).saturating_sub(1),
                         saved_pc: state.pc,
                         name: Some(bf.name_str()),
                         namewhat: "function",
@@ -6718,6 +6757,7 @@ impl VmExecutor {
                         is_c: true,
                         closure: None,
                         base: a + 1,
+                        func: (a + 1).saturating_sub(1),
                         saved_pc: state.pc,
                         name: Some(bf.name_str()),
                         namewhat: "function",
@@ -6775,7 +6815,8 @@ impl VmExecutor {
                 let fsize = closure.proto.max_stack_size as usize;
                 let nfixparams = closure.proto.num_params as usize;
                 let nargs = nargs_total.saturating_sub(1);
-                let func_slot = state.base.saturating_sub(1);
+                // 本帧函数槽（被调函数下移到此处，复用当前帧的 ci）
+                let func_slot = state.cur_func();
                 let proto_is_vararg = closure.proto.is_vararg();
                 // 提前提取 proto 和 upvals 的 Rc 引用，使后续可以 move closure（而非 clone）
                 // perf: 消除 CallInfoEntry.closure 的 Box 堆分配
@@ -6899,6 +6940,7 @@ impl VmExecutor {
                     is_c: true,
                     closure: None,
                     base: a + 1,
+                    func: (a + 1).saturating_sub(1),
                     saved_pc: state.pc,
                     name: Some(c_name),
                     namewhat: c_namewhat,
@@ -6934,6 +6976,7 @@ impl VmExecutor {
                         is_c: true,
                         closure: None,
                         base: a + 1,
+                        func: (a + 1).saturating_sub(1),
                         saved_pc: state.pc,
                         name: Some(c_name),
                         namewhat: c_namewhat,
@@ -7041,6 +7084,7 @@ impl VmExecutor {
         if let Some(frame) = state.call_stack.pop() {
             // 递减 C 调用深度 (对应 op_call 中递增的 n_ccalls)
             state.n_ccalls = state.n_ccalls.saturating_sub(1);
+            // 结果落点 = 调用者槽位（C 的 `ci->func.p - delta`，变参帧下 ≠ `ci->func.p`）
             let return_base = frame.return_base;
             let num_results = frame.num_results;
             // 对应 C 的 rethook: 触发 return hook (在 close 之后, 弹出 call_info 之前)
@@ -7176,6 +7220,7 @@ impl VmExecutor {
         if let Some(frame) = state.call_stack.pop() {
             // 递减 C 调用深度 (对应 op_call 中递增的 n_ccalls)
             state.n_ccalls = state.n_ccalls.saturating_sub(1);
+            // 结果落点 = 调用者槽位（C 的 `ci->func.p - delta`，变参帧下 ≠ `ci->func.p`）
             let return_base = frame.return_base;
             let num_results = frame.num_results;
             // 对应 C 的 rethook: 触发 return hook (在 close 之后, 弹出 call_info 之前)
@@ -7297,6 +7342,7 @@ impl VmExecutor {
         if let Some(frame) = state.call_stack.pop() {
             // 递减 C 调用深度 (对应 op_call 中递增的 n_ccalls)
             state.n_ccalls = state.n_ccalls.saturating_sub(1);
+            // 结果落点 = 调用者槽位（C 的 `ci->func.p - delta`，变参帧下 ≠ `ci->func.p`）
             let return_base = frame.return_base;
             let num_results = frame.num_results;
             // 对应 C 的 rethook: 触发 return hook (在 close 之后, 弹出 call_info 之前)
@@ -7355,8 +7401,8 @@ impl VmExecutor {
                 let ftransfer = (a as i32) - (state.base as i32) + 1;
                 Self::call_hook(state, "return", -1, None, ftransfer, 1)?;
             }
-            // 把返回值放到 base-1（func 位置）
-            let result_base = state.base.saturating_sub(1);
+            // 把返回值放到本帧函数槽（入口帧没有 ci 记录，此时 = base - 1）
+            let result_base = state.cur_func();
             if state.base > 0 && result_base < state.top {
                 state.stack[result_base] = val;
             }
@@ -7667,9 +7713,12 @@ impl VmExecutor {
                     code: saved_code,
                     constants: saved_constants,
                     protos: saved_protos,
+                    // 被调迭代器帧身份：函数值被复制到 ra+3
+                    func: ra + 3,
                     base: state.base,
-                    return_pc: state.pc + 1,
+                    top: ra + 4 + fsize,
                     return_base: ra + 3,
+                    return_pc: state.pc + 1,
                     num_results: nresults,
                     num_params: state.num_params,
                     is_vararg: state.is_vararg,
@@ -7685,6 +7734,7 @@ impl VmExecutor {
                     is_c: false,
                     closure: Some(closure.clone()),
                     base: state.base,
+                    func: (state.base).saturating_sub(1),
                     saved_pc: state.pc,
                     name: None,
                     namewhat: "",
@@ -7744,6 +7794,7 @@ impl VmExecutor {
                     is_c: true,
                     closure: None,
                     base: ra + 4,
+                    func: (ra + 4).saturating_sub(1),
                     saved_pc: state.pc,
                     name: Some("for iterator"),
                     namewhat: "for iterator",
@@ -8010,10 +8061,12 @@ impl VmExecutor {
         } else {
             // PF_VAHID: 从隐藏变参取值
             let nextra = state.nextraargs as usize;
-            // 上游不变式：变参区在 base 之下
-            debug_assert!(state.base >= 1 + nextra);
-            // 变参在 state.base - 1 - nextra .. state.base - 2
-            let vararg_start = state.base - (1 + nextra);
+            // 本帧函数槽（C 的 ci->func.p）
+            let func = state.cur_func();
+            // 上游不变式：变参区在本帧函数槽之下
+            debug_assert!(func >= nextra);
+            // 变参在 func - nextra .. func - 1
+            let vararg_start = func - nextra;
             let is_multret = wanted < 0;
             let (touse, need_fill) = if is_multret {
                 (nextra, 0) // MULTRET
@@ -8176,46 +8229,39 @@ impl VmExecutor {
 
     /// VARARGPREP: 调整变参函数的栈布局（对应 C 的 luaT_adjustvarargs）
     ///
-    /// 两种模式:
-    /// - PF_VAHID: 隐藏变参。把 func 和固定参数复制到变参之后，调整 base。
-    ///   变参留在原位，通过 state.nextraargs 记录数量。
-    /// - PF_VATAB: 建表模式。把变参打包成表，放到固定参数之后的位置。
+    /// 两种模式（`state.proto_flag`）:
+    /// - PF_VAHID: 隐藏变参（C 的 `buildhiddenargs`）。把 func 与固定参数复制到
+    ///   变参之后，再把本帧 ci 的 `func` / `top` 一起上移 `totalargs + 1`
+    ///   （C 的 `ci->func.p += actual + 1; ci->top.p += actual + 1`，`state.base`
+    ///   同步；`CallFrame.base` 是调用者基址快照，不参与位移）。变参留在原位，
+    ///   数量记在 `state.nextraargs`。
+    /// - PF_VATAB: 建表模式。把变参打包成表放到固定参数之后（本帧 ci 不动）。
     ///
-    /// 调用前栈布局 (state.base = a + 1, func 在 state.base - 1):
+    /// 入口栈布局（本帧函数槽，`state.base` = func + 1）:
     ///   [func][arg1..argNfix][extra1..extraK]
-    ///   ^state.base-1        ^state.base     ^state.base+nfixparams
+    ///   ^func     ^state.base  ^state.base+nfixparams
     ///
-    /// totalargs = stack.len() - state.base (即 func 之后的所有参数)
+    /// totalargs = `state.top - func - 1`（C 的 `L->top.p - ci->func.p - 1`）
     fn op_varargprep<'a>(
         state: &mut LuaState<'a>,
         _inst: Instruction,
         cur: usize,
     ) -> Result<(), VmError<'a>> {
+        // 本帧函数槽经 cur_func 读（有 ci 记录时读 ci.func，入口帧按定义 = base - 1）
+        let ci_func = state.cur_func();
         let flag = state.proto_flag;
+        // 编译器只为变参函数生成 VARARGPREP（对应 C 的 luaT_adjustvarargs 只处理
+        // 变参 proto），非变参帧（手写/测试字节码）直接放行。
         if flag & (PF_VAHID | PF_VATAB) == 0 {
-            // 非变参函数，无需调整 (pc 已 = cur+1, 循环头覆盖)
             return Ok(());
         }
 
         let nfixparams = state.num_params as usize;
         // 对应 C: totalargs = cast_int(L->top.p - ci->func.p) - 1
-        // = state.top - (state.base - 1) - 1 = state.top - state.base
-        // 用 state.top 而非 stack.len(): smart_clear_stack 可能不截断 Vec,
-        // MULTRET 参数场景 stack.len() > top 会多算 stale 栈元素。
-        let totalargs = state.top.saturating_sub(state.base);
+        // 用 state.top 而非 stack.len(): 本栈实现里 stack.len() 恒 = capacity
+        // （物理已初始化区），逻辑上界只有 state.top 知道。
+        let totalargs = state.top - ci_func - 1;
         let nextra = totalargs.saturating_sub(nfixparams);
-
-        // 关键：先把 Vec 长度对齐到 live top。smart_clear_stack 为了性能可能只降
-        // state.top 而不截断 Vec（尾部全是 trivial 值时），此时 Vec 里 top 之上
-        // 残留着上一轮的 stale 值。本函数后续用 push 追加（func/固定参数副本、
-        // vararg 表），若不对齐就会把这些副本放到 stale 值之上——帧布局整体偏移，
-        // stale 值落入新帧的变参区，导致 `...` 多出调用者的历史值。
-        // （CI skynet e2e 实证：launcher 的 `table.concat({...}," ")` 把上一次
-        //  dispatch 的 session/source/cmd 一起拼进服务启动参数。）
-        // 对应 C：L->top 本身就是 live 边界，top 之上不属于栈。
-        if state.stack.len() > state.top {
-            state.truncate_live(state.top);
-        }
 
         if flag & PF_VATAB != 0 {
             // PF_VATAB: 创建 vararg 表
@@ -8240,7 +8286,7 @@ impl VmExecutor {
         } else {
             // PF_VAHID: 隐藏变参 (buildhiddenargs)
             state.nextraargs = nextra as i32;
-            let func_pos = state.base - 1;
+            let func_pos = ci_func;
             // 把 func 副本复制到栈顶（变参之后）
             let func_val = state.stack[func_pos].clone();
             state.push_value(func_val);
@@ -8252,34 +8298,47 @@ impl VmExecutor {
                 );
                 state.push_value(val);
             }
-            // 调整 base: ci->func.p += totalargs + 1 → state.base += totalargs + 1
-            // 新的 func 在变参之后，变参在新 func 之前
+            // 调整当前帧 ci（对应 C 的 luaT_adjustvarargs）:
+            //   ci->func.p += actual + 1;  ci->top.p += actual + 1;
+            // `func`/`top` 一起上移（二者之差不变）; state.base 同步 —— 本帧唯一的
+            // 非帧切换 base 写点。变参留在原位（新 func 之前），数量记在 state.nextraargs。
+            // （`CallFrame.base` 是**调用者**的基址快照，不受本帧位移影响，不要一起加。）
+            if let Some(ci) = state.call_stack.last_mut() {
+                ci.func += totalargs + 1;
+                ci.top += totalargs + 1;
+                debug_assert!(state.top <= ci.top && ci.top < state.stack.len());
+            }
             state.base += totalargs + 1;
-            // vararg 参数位置（原固定参数之后）设为 nil
-            // 对应 C 的 setnilvalue(s2v(ci->func.p + nfixparams + 1))
-            // 此时 state.base 已调整，新 func 在 state.base - 1
-            // 原来的 vararg 位置 = 新 func - nextra - 1 = state.base - 1 - nextra - 1
-            // 但 C 是在调整前设置 nil，位置是 ci->func.p + nfixparams + 1（旧 func）
-            // 旧 func + nfixparams + 1 = 旧 base + nfixparams = 变参起始位置
-            // 这个位置在 buildhiddenargs 后已经是变参区域的一部分，不需要设 nil
-            // C 代码是在 buildhiddenargs 之后执行 setnilvalue(ci->func.p + nfixparams + 1)
-            // 但此时 ci->func.p 已调整，ci->func.p + nfixparams + 1 指向新区域的 vararg 槽
-            // 实际上这个 nil 是为了标记 vararg 参数槽为空（供 GC）
-            // 在 Rust 中我们不需要 GC 标记，跳过此步
+
+            // 对应 C 的 `setnilvalue(s2v(ci->func.p + nfixparams + 1))`:
+            // 变参表槽（新帧寄存器号 = nfixparams）必须显式置 nil。该槽在 proto.locvars
+            // 里就是 "(vararg table)" 变量（`compile.rs` 的 param_names），
+            // `debug.getlocal` 会按名字读到它 —— 不写就是上一条指令留下的陈旧栈值
+            // （实测 db.lua「return hook 里访问局部变量」用例：读到 1 / 函数值）。
+            // 与 C 一致地**不推进 L->top**（写的是 L->top 之上、ci->top 之内的槽）。
+            let vatab_slot = state.base + nfixparams;
+            VmExecutor::write_stack(
+                &mut state.drop_queue,
+                &mut state.stack,
+                state.top,
+                vatab_slot,
+                TValue::Nil(NilKind::Strict),
+            );
         }
 
-        // 扩展栈到 base + max_stack_size (对应 C 的 ci->top = ci->func.p + 1 + fsize)
-        // vararg 函数在 VARARGPREP 完成变参重排后，需要扩展栈以容纳所有寄存器
-        if state.base > 0 && state.base <= state.top {
-            if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
-                let fsize = closure.proto.max_stack_size as usize;
-                let frame_end = state.base + fsize;
-                while state.top < frame_end {
-                    state.push_nil();
-                }
-                // 对应 C 的 ci->top = func + 1 + fsize
-                // GC 遍历栈时需要覆盖整个函数帧，包含所有局部变量和临时寄存器
-            }
+        // 扩展 L->top 到帧上界（对应 C 的 `L->top.p = ci->top.p`，ci->top = func+1+fsize）:
+        // 变参帧在重排后 L->top 可能停在实参/变参表处，而后继消费者要求
+        // 「帧上界之上才是空闲区」—— 调试接口（`debug.getlocal` 的 limit 取
+        // 「下一帧 func 槽」，即帧内寄存器都算合法槽位）、元方法 scratch 起点
+        // （[`Self::call_hook`] 在 L->top 之上压 hook 帧）都依赖它。
+        // 帧上界由本帧函数槽的 proto 直接算，不依赖 ci.top 是否已同步。
+        let frame_end = match state.stack.get(state.cur_func()) {
+            Some(TValue::LClosure(c)) => state.cur_func() + 1 + c.proto.max_stack_size as usize,
+            _ => 0,
+        };
+        if frame_end > state.top {
+            Self::fast_resize_stack_nil(state, frame_end);
+            state.top = frame_end;
         }
 
         // 对应 C 的 OP_VARARGPREP -> luaD_hookcall: vararg 函数在 VARARGPREP 后触发 call hook

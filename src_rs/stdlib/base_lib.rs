@@ -610,7 +610,7 @@ fn get_current_lua_func_position(state: &LuaState) -> String {
     if state.base == 0 || state.base > state.top {
         return String::new();
     }
-    let closure = match &state.stack[state.base - 1] {
+    let closure = match &state.stack[state.cur_func()] {
         TValue::LClosure(c) => c,
         _ => return String::new(),
     };
@@ -668,25 +668,30 @@ fn lua_l_where<'a>(state: &LuaState<'a>, level: usize) -> String {
         get_current_lua_func_position(state)
     } else {
         let cs_len = state.call_stack.len();
-        // level=k 对应 call_stack[cs_len - (k-1)]
-        let frame_idx = if cs_len >= level - 1 {
-            cs_len - (level - 1)
-        } else {
-            return String::new();
+        // 第 k 层帧 (k >= 2) 的**身份**在 call_stack[cs_len - k] —— 进入该帧时压入的
+        // 记录里的 `func`（C 的 ci->func.p）；它**当前所在位置**则在更内一层记录的
+        // `return_pc` 里（该帧调用下一层处的下一条 pc，C 的 ci->u.l.savedpc）。
+        // 最外层记录之上的调用者没有自己的记录，用它快照里的调用者基址反推 func。
+        let (func_slot, call_pc) = match cs_len.checked_sub(level) {
+            Some(i) => (
+                state.call_stack[i].func,
+                state
+                    .call_stack
+                    .get(i + 1)
+                    .map_or(0, |f| f.return_pc.saturating_sub(1)),
+            ),
+            None if level == cs_len + 1 => {
+                let r0 = match state.call_stack.first() {
+                    Some(f) => f,
+                    None => return String::new(),
+                };
+                (r0.base.saturating_sub(1), r0.return_pc.saturating_sub(1))
+            }
+            None => return String::new(),
         };
-        let frame = &state.call_stack[frame_idx];
-        if frame.base == 0 || frame.base > state.top {
-            return String::new();
-        }
-        let closure = match &state.stack[frame.base - 1] {
-            TValue::LClosure(c) => c,
+        let closure = match state.stack.get(func_slot) {
+            Some(TValue::LClosure(c)) => c,
             _ => return String::new(),
-        };
-        // return_pc - 1 是调用当前函数的 OP_CALL 指令的 PC
-        let call_pc = if frame.return_pc > 0 {
-            frame.return_pc - 1
-        } else {
-            0
         };
         let line = get_func_line(&closure.proto, call_pc);
         if line <= 0 {

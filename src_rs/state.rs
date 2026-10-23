@@ -748,6 +748,31 @@ impl<'a> LuaState<'a> {
 // ============================================================================
 
 impl<'a> LuaState<'a> {
+    /// 当前执行帧的 ci 记录 —— `call_stack` 栈顶，对应 C 的 `L->ci`。
+    ///
+    /// `op_call` / `op_tforcall` 进入被调帧时压入一条记录，该帧返回时弹出，
+    /// 故执行中 `last()` 即当前帧（`func`/`top` 描述它）。**入口帧**（`state.pcall`
+    /// 调用的函数、协程体）不压记录 —— 与 C 不同，本实现的 `call_stack` 只保存
+    /// 「调用点现场」，栈空即表示当前是入口帧。
+    #[inline(always)]
+    pub fn current_ci(&self) -> Option<&crate::objects::CallFrame<'a>> {
+        self.call_stack.last()
+    }
+
+    /// 当前帧的函数槽（C 的 `ci->func.p`）。
+    ///
+    /// 取「本帧的函数」一律经此读取，**不要写 `state.base - 1`**: 有 ci 记录时
+    /// `func` 是该帧身份的权威来源（`VARARGPREP` 位移 `func` 与 `state.base` 一体
+    /// 调整，见 `luaT_adjustvarargs`）；入口帧没有记录，其函数槽按定义 = `base - 1`
+    /// （入口帧由 Rust 侧设定 base，无独立 ci）。
+    #[inline(always)]
+    pub fn cur_func(&self) -> usize {
+        match self.call_stack.last() {
+            Some(f) => f.func,
+            None => self.base.saturating_sub(1),
+        }
+    }
+
     /// 当前帧寄存器写边界 (exclusive) —— 保守取 `anchor + MAX_FSTACK + 1`。
     ///
     /// anchor = 帧基址 (base 有效时) 否则栈长: 保证覆盖「base + 寄存器号」形式的写
@@ -1297,8 +1322,7 @@ impl<'a> LuaState<'a> {
                 // 使下文的 pad_frame_scratch / push / frame_need 检查都不再分配 ——
                 // 那些点位于保护边界之外, 一旦在那里抛内存错误就会跳过本帧。
                 let fsize = closure.proto.max_stack_size as usize;
-                let need = (func_idx + 1 + fsize + LUA_MINSTACK)
-                    .max(func_idx + 1 + crate::opcodes::MAX_FSTACK as usize + 1);
+                let need = func_idx + 1 + fsize + LUA_MINSTACK;
                 if need > self.stack.len() && self.reserve_stack(need - self.stack.len()).is_err() {
                     self.last_error_value = Some(self.memerrmsg_value());
                     self.last_error_is_memerr.set(true);
@@ -1374,7 +1398,7 @@ impl<'a> LuaState<'a> {
                 let saved_call_info_len = self.call_info.len();
                 let caller_is_lua = self.base > 0
                     && self.base <= self.top
-                    && matches!(&self.stack[self.base - 1], TValue::LClosure(_));
+                    && matches!(&self.stack[self.cur_func()], TValue::LClosure(_));
                 let already_has_entry = self.call_info.last().map_or(false, |e| {
                     e.closure
                         .as_ref()
@@ -1396,6 +1420,7 @@ impl<'a> LuaState<'a> {
                         // move closure 避免 clone + Box 堆分配
                         closure: Some(closure),
                         base: caller_base,
+                        func: (caller_base).saturating_sub(1),
                         saved_pc: caller_pc,
                         name: None,
                         namewhat: "",
@@ -1425,25 +1450,21 @@ impl<'a> LuaState<'a> {
                 // 不清空 state.exec.open_upval: 全局链表机制下，open_upval 不随函数调用/返回保存/恢复
                 // (对应 C 的 L->openupval 全局链表，luaD_precall 不修改它)
 
-                if proto_is_vararg {
-                    // vararg 函数: 截断栈到实际参数末尾，VARARGPREP 会处理
-                    self.truncate_live(func_idx + 1 + nargs_actual);
-                    for i in nargs_actual..nfixparams {
-                        let idx = func_idx + 1 + i;
-                        self.stack[idx] = TValue::Nil(NilKind::Strict);
-                    }
-                    // 设置 state.exec.top 供 VARARGPREP 计算 totalargs
-                    // (对应 C 的 L->top = ci->func + 1 + nargs)
-                    self.top = func_idx + 1 + nargs;
-                } else {
-                    let frame_end = func_idx + 1 + fsize;
+                // L->top 的入口值（对应 C 的 luaD_precall）:
+                // - 变参函数: 停在实参末尾 —— 缺失的固定参数补 nil 且计入 L->top，
+                //   故 top = func + 1 + max(nargs, nfixparams)。VARARGPREP 用
+                //   `state.top - ci.func - 1` 算 totalargs，这里多一分都是错的。
+                // - 定参函数: top = ci->top = func + 1 + fsize。
+                if nargs_actual < nfixparams {
                     for i in nargs_actual..nfixparams {
                         self.stack[func_idx + 1 + i] = TValue::Nil(NilKind::Strict);
                     }
-                    // 设置 state.exec.top 为帧末尾 (对应 C 的 L->top = ci->top)
-                    self.top = frame_end;
                 }
-
+                self.top = if proto_is_vararg {
+                    func_idx + 1 + nargs_actual.max(nfixparams)
+                } else {
+                    func_idx + 1 + fsize
+                };
                 // 帧增长经漏斗（对应 C 的 luaD_growstack → luaM_reallocvector 失败即
                 // luaM_error）：先备足到帧末尾 + 余量，使下文的 push 不再触发分配
                 // （plain Vec::push 在分配失败时只会 abort，没有错误通道）。
@@ -1494,6 +1515,8 @@ impl<'a> LuaState<'a> {
                 // state.pcall 的 LClosure 分支不 push call_stack（不像 op_call），
                 // 所以 call_stack 中的帧是外层调用的，不应被内层函数的 op_return 使用。
                 // 对应 C Lua 中 state.pcall 创建新的 CallInfo，与外层 CallInfo 链隔离。
+                // 入口帧本身没有 ci 记录：它的身份由 state.base 决定
+                // （「当前帧函数槽」见 `LuaState::cur_func`）。
                 // 注意: 不清空 call_info，因为 op_return 只在 call_stack.pop() 成功时
                 // 才 pop call_info（call_stack 为空时不会 pop），且调用者（如 call_hook）
                 // 可能已 push call_info 供 debug.getinfo 使用。
@@ -1995,6 +2018,7 @@ impl<'a> LuaState<'a> {
             is_c: true,
             closure: None,
             base: func_idx + 1,
+            func: (func_idx + 1).saturating_sub(1),
             saved_pc: 0,
             name: None,
             namewhat: "",
@@ -2145,6 +2169,7 @@ impl<'a> LuaState<'a> {
             is_c: true,
             closure: None,
             base: func_idx + 1,
+            func: (func_idx + 1).saturating_sub(1),
             saved_pc: 0,
             name: Some(name),
             namewhat: "function",
@@ -2822,6 +2847,15 @@ pub struct CallInfoEntry<'a> {
     /// C 函数帧: callee's base (func_idx + 1)
     /// perf: 用于从 state.exec.stack[base - 1] 延迟计算 caller_proto, 避免 op_call 中 Rc::clone
     pub base: usize,
+    /// 本条目隐含的函数槽 = `base - 1`（`base == 0` 的无效条目为 0）。
+    ///
+    /// 取「这一条目的函数槽」一律读此字段，**不要再写 `entry.base - 1`** ——
+    /// 与 `base` 一样按条目类型统一：
+    /// - Lua 帧条目（`op_call` / `call_hook` / 元方法 / 宏 pcall 压入）: 值是
+    ///   **触发该调用/事件的帧**的函数槽（与同一深度的 `base`/`saved_pc` 同源，
+    ///   而 `closure` 记的是被调闭包）；
+    /// - C 函数帧条目: 值是**该 C 函数自身**的槽位（`base` 亦为自身 base）。
+    pub func: usize,
     /// 调用时的 PC（用于计算 currentline）
     pub saved_pc: usize,
     /// 函数名（C 函数帧/hook/metamethod 预设置；Lua 函数帧默认 None，traceback 时实时计算）
@@ -2854,7 +2888,7 @@ pub fn get_closure_from_stack<'a, 'b>(
         return None;
     }
     if entry.base > 0 && entry.base <= stack.len() {
-        if let TValue::LClosure(c) = &stack[entry.base - 1] {
+        if let TValue::LClosure(c) = &stack[entry.func] {
             return Some(c);
         }
     }
@@ -2889,7 +2923,7 @@ pub fn get_caller_proto_from_stack<'a, 'b>(
         return None;
     }
     if entry.base > 0 && entry.base <= stack.len() {
-        if let TValue::LClosure(c) = &stack[entry.base - 1] {
+        if let TValue::LClosure(c) = &stack[entry.func] {
             return Some(&c.proto);
         }
     }

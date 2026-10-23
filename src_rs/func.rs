@@ -473,12 +473,11 @@ fn get_var_name_at(state: &LuaState, reg: usize) -> Option<String> {
     if state.base == 0 || state.base > state.top {
         return None;
     }
-    if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
+    if let TValue::LClosure(closure) = &state.stack[state.cur_func()] {
         let proto = &closure.proto;
         let pc = state.pc;
-        // C: idx = level - ci->func.p; Rust: func 在 state.base - 1
-        // 所以 local_number = reg - (state.base - 1) = reg - state.base + 1
-        let local_number = reg.wrapping_sub(state.base - 1);
+        // C: idx = level - ci->func.p —— 本帧函数槽经 ci 读（入口帧 = base - 1）
+        let local_number = reg.wrapping_sub(state.cur_func());
         if local_number == 0 {
             return None;
         }

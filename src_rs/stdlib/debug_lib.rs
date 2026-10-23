@@ -187,6 +187,9 @@ fn get_local_name(proto: &Proto, local_number: usize, pc: usize) -> Option<Strin
 /// 栈帧信息 — 用于 debug.getlocal/setlocal 的 level > 1 支持
 struct FrameInfo<'a> {
     base: usize,
+    /// 该帧函数槽（C 的 ci->func.p）—— level 1 取当前帧 ci（入口帧 = base - 1），
+    /// level > 1 取 call_info 条目的 `func`
+    func: usize,
     pc: usize,
     proto_flag: u8,
     nextraargs: i32,
@@ -213,9 +216,10 @@ fn get_frame_info<'a>(state: &LuaState<'a>, level: i32) -> Option<FrameInfo<'a>>
             return None;
         }
         let limit = state.top;
-        if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
+        if let TValue::LClosure(closure) = &state.stack[state.cur_func()] {
             return Some(FrameInfo {
                 base: state.base,
+                func: state.cur_func(),
                 pc: state.pc,
                 proto_flag: state.proto_flag,
                 nextraargs: state.nextraargs,
@@ -227,6 +231,7 @@ fn get_frame_info<'a>(state: &LuaState<'a>, level: i32) -> Option<FrameInfo<'a>>
         // C 函数帧
         return Some(FrameInfo {
             base: state.base,
+            func: state.cur_func(),
             pc: 0,
             proto_flag: 0,
             nextraargs: 0,
@@ -254,15 +259,16 @@ fn get_frame_info<'a>(state: &LuaState<'a>, level: i32) -> Option<FrameInfo<'a>>
     // 计算 limit: 对应 C 的 ci->next->func.p
     let limit = if level == 2 {
         // 被调用者是当前函数 (level 1), func.p = state.base - 1
-        state.base.saturating_sub(1)
+        state.cur_func()
     } else {
         // 被调用者是 level-1, 其 call_info 条目在 idx+1
         let callee_entry = &state.call_info[idx + 1];
-        callee_entry.base.saturating_sub(1)
+        callee_entry.func
     };
-    if let TValue::LClosure(closure) = &state.stack[entry.base - 1] {
+    if let TValue::LClosure(closure) = &state.stack[entry.func] {
         return Some(FrameInfo {
             base: entry.base,
+            func: entry.func,
             pc: entry.saved_pc,
             proto_flag: entry.proto_flag,
             nextraargs: entry.nextraargs,
@@ -274,6 +280,7 @@ fn get_frame_info<'a>(state: &LuaState<'a>, level: i32) -> Option<FrameInfo<'a>>
     // C 函数帧 — 对应 C 的 CIST_C
     Some(FrameInfo {
         base: entry.base,
+        func: entry.func,
         pc: entry.saved_pc,
         proto_flag: entry.proto_flag,
         nextraargs: entry.nextraargs,
@@ -933,7 +940,7 @@ fn fill_info_from_level<'a>(
         if state.base == 0 || state.base > state.top {
             return false;
         }
-        if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
+        if let TValue::LClosure(closure) = &state.stack[state.cur_func()] {
             let proto = &closure.proto;
             info.func = Some(TValue::LClosure(closure.clone()));
             info.closure = Some(closure.clone());
@@ -1094,7 +1101,7 @@ fn fill_info_from_level<'a>(
     // （如 assert），此时栈上是 C 函数（LightUserData），应该走 C 函数路径
     // 返回该 C 函数的信息，而不是 fallback 到 entry.closure（hook 函数自身）。
     let stack_val = if entry.base > 0 && entry.base <= state.top {
-        Some(state.stack[entry.base - 1].clone())
+        Some(state.stack[entry.func].clone())
     } else {
         None
     };
@@ -1215,7 +1222,7 @@ fn fill_info_from_level<'a>(
     // 'f' 选项: 从栈上读取 C 函数值 (entry.base - 1 = 函数位置)
     if what.contains('f') {
         if entry.base > 0 && entry.base <= state.top {
-            info.func = Some(state.stack[entry.base - 1].clone());
+            info.func = Some(state.stack[entry.func].clone());
         }
     }
     true
@@ -1280,7 +1287,7 @@ fn fill_info_from_thread<'a>(
         if ctx.base == 0 || ctx.base > ctx.top {
             return false;
         }
-        if let TValue::LClosure(closure) = &ctx.stack[ctx.base - 1] {
+        if let TValue::LClosure(closure) = &ctx.stack[ctx.cur_func()] {
             let proto = &closure.proto;
             info.func = Some(TValue::LClosure(closure.clone()));
             info.closure = Some(closure.clone());
@@ -1566,7 +1573,7 @@ fn get_local_from_thread<'a>(
         }
         // limit: 对于 C 函数链中的帧，limit = 下一帧的 base - 1
         let limit = if idx + 1 < n {
-            call_info[idx + 1].base.saturating_sub(1)
+            call_info[idx + 1].func
         } else {
             // 最后一帧（level 0），limit = saved_top
             ctx.top
@@ -1586,7 +1593,7 @@ fn get_local_from_thread<'a>(
         if ctx.base == 0 || ctx.base > ctx.top {
             return None;
         }
-        if let TValue::LClosure(closure) = &ctx.stack[ctx.base - 1] {
+        if let TValue::LClosure(closure) = &ctx.stack[ctx.cur_func()] {
             let proto = &closure.proto;
             let pc = ctx.pc.saturating_sub(1);
 
@@ -1595,7 +1602,7 @@ fn get_local_from_thread<'a>(
                 if (ctx.proto_flag & PF_VAHID) != 0 {
                     let nextra = ctx.nextraargs;
                     if nvar >= -nextra {
-                        let pos = (ctx.base as i32) - 1 - nextra - (nvar + 1);
+                        let pos = (ctx.cur_func() as i32) - nextra - (nvar + 1);
                         let pos = pos as usize;
                         return Some(("(vararg)".to_string(), read_stack(pos)));
                     }
@@ -1643,7 +1650,7 @@ fn get_local_from_thread<'a>(
     let entry = &call_info[target_idx];
 
     // limit: 下一帧的 base - 1
-    let limit = call_info[target_idx + 1].base.saturating_sub(1);
+    let limit = call_info[target_idx + 1].func;
 
     if entry.is_c {
         if nvar <= 0 {
@@ -1671,7 +1678,7 @@ fn get_local_from_thread<'a>(
             if (entry.proto_flag & PF_VAHID) != 0 {
                 let nextra = entry.nextraargs;
                 if nvar >= -nextra {
-                    let pos = (entry.base as i32) - 1 - nextra - (nvar + 1);
+                    let pos = (entry.func as i32) - nextra - (nvar + 1);
                     let pos = pos as usize;
                     return Some(("(vararg)".to_string(), read_stack(pos)));
                 }
@@ -1727,7 +1734,7 @@ fn set_local_from_thread<'a>(
             return None;
         }
         let limit = if idx + 1 < n {
-            call_info[idx + 1].base.saturating_sub(1)
+            call_info[idx + 1].func
         } else {
             ctx.top
         };
@@ -1747,7 +1754,7 @@ fn set_local_from_thread<'a>(
         if ctx.base == 0 || ctx.base > ctx.top {
             return None;
         }
-        if let TValue::LClosure(closure) = &ctx.stack[ctx.base - 1].clone() {
+        if let TValue::LClosure(closure) = &ctx.stack[ctx.cur_func()].clone() {
             let proto = &closure.proto;
             let pc = ctx.pc.saturating_sub(1);
 
@@ -1756,7 +1763,7 @@ fn set_local_from_thread<'a>(
                 if (ctx.proto_flag & PF_VAHID) != 0 {
                     let nextra = ctx.nextraargs;
                     if nvar >= -nextra {
-                        let pos = (ctx.base as i32) - 1 - nextra - (nvar + 1);
+                        let pos = (ctx.cur_func() as i32) - nextra - (nvar + 1);
                         let pos = pos as usize;
                         write_stack(&mut ctx.stack, pos);
                         return Some("(vararg)".to_string());
@@ -1800,7 +1807,7 @@ fn set_local_from_thread<'a>(
     let target_idx = offset;
     let entry = call_info[target_idx].clone();
 
-    let limit = call_info[target_idx + 1].base.saturating_sub(1);
+    let limit = call_info[target_idx + 1].func;
 
     if entry.is_c {
         if nvar <= 0 {
@@ -1830,7 +1837,7 @@ fn set_local_from_thread<'a>(
             if (entry.proto_flag & PF_VAHID) != 0 {
                 let nextra = entry.nextraargs;
                 if nvar >= -nextra {
-                    let pos = (entry.base as i32) - 1 - nextra - (nvar + 1);
+                    let pos = (entry.func as i32) - nextra - (nvar + 1);
                     let pos = pos as usize;
                     write_stack(&mut ctx.stack, pos);
                     return Some("(vararg)".to_string());
@@ -1991,7 +1998,7 @@ fn call_getlocal<'a>(
                     if nvar >= -nextra {
                         // pos = ci->func.p - nextra - (n + 1)
                         // ci->func.p = frame.base - 1
-                        let pos = (frame.base as i32) - 1 - nextra - (nvar + 1);
+                        let pos = (frame.func as i32) - nextra - (nvar + 1);
                         let pos = pos as usize;
                         let val = if pos < state.top {
                             state.stack[pos].clone()
@@ -2128,7 +2135,7 @@ fn call_setlocal<'a>(
                     let nextra = frame.nextraargs;
                     if nvar >= -nextra {
                         // pos = ci->func.p - nextra - (n + 1)
-                        let pos = (frame.base as i32) - 1 - nextra - (nvar + 1);
+                        let pos = (frame.func as i32) - nextra - (nvar + 1);
                         let pos = pos as usize;
                         if pos < state.top {
                             state.stack[pos] = value;
@@ -2871,7 +2878,7 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
             let idx = last_lua_idx.unwrap();
             let ci_closure = crate::state::get_closure_for_ci(state, idx);
             let stack_closure = if state.base > 0 && state.base <= state.top {
-                if let TValue::LClosure(c) = &state.stack[state.base - 1] {
+                if let TValue::LClosure(c) = &state.stack[state.cur_func()] {
                     Some(c)
                 } else {
                     None
@@ -2937,7 +2944,7 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
             }
         } else if let Some((src, line, name, namewhat, is_main)) = get_current_frame_info(state) {
             let (is_c, linedefined) = if state.base > 0 && state.base <= state.top {
-                if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
+                if let TValue::LClosure(closure) = &state.stack[state.cur_func()] {
                     (false, closure.proto.line_defined)
                 } else {
                     (true, 0)
@@ -3108,7 +3115,7 @@ fn build_traceback_from_thread(ctx: &crate::state::LuaState, msg: &str, level: i
     let lua_level = c_chain_len as i32;
     if lua_level >= level {
         if ctx.base > 0 && ctx.base <= ctx.top {
-            if let TValue::LClosure(closure) = &ctx.stack[ctx.base - 1] {
+            if let TValue::LClosure(closure) = &ctx.stack[ctx.cur_func()] {
                 let proto = &closure.proto;
                 let src = proto
                     .source
@@ -3212,7 +3219,7 @@ fn get_current_frame_info(state: &LuaState) -> Option<(String, i32, String, Stri
     if state.base == 0 || state.base > state.top {
         return None;
     }
-    if let TValue::LClosure(closure) = &state.stack[state.base - 1] {
+    if let TValue::LClosure(closure) = &state.stack[state.cur_func()] {
         let proto = &closure.proto;
         let src = proto
             .source

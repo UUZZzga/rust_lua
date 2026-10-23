@@ -158,6 +158,7 @@ impl<'io> Interpreter<'io> {
                                         is_c: true, // C 调用者
                                         closure: Some(mc.clone()),
                                         base: 0,
+                                        func: 0,
                                         saved_pc: error_pc, // error(m) 的 pc
                                         name: None,
                                         namewhat: "",
@@ -171,6 +172,7 @@ impl<'io> Interpreter<'io> {
                                     is_c: true,
                                     closure: None,
                                     base: 0,
+                                    func: 0,
                                     saved_pc: 0,
                                     name: Some("msghandler"),
                                     namewhat: "",

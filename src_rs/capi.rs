@@ -2637,9 +2637,9 @@ pub extern "C-unwind" fn lua_getinfo(
     }
 
     if what_str.contains('f') {
-        // 将函数压入栈顶: 函数在 stack[ci.base - 1]
+        // 将函数压入栈顶: 函数在该条目的 `func` 槽（= base - 1）
         if ci.base > 0 && ci.base <= L.top {
-            let func_val = L.stack[ci.base - 1].clone();
+            let func_val = L.stack[ci.func].clone();
             L.push_value(func_val);
         } else {
             L.push_nil();

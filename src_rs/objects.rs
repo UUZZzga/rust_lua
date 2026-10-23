@@ -2035,19 +2035,47 @@ unsafe impl<'a> crate::alloc::RcPayload for Udata<'a> {
 // 规约：线程/协程
 // ============================================================================
 
-/// 调用帧 — 保存 caller 的 VM 执行上下文（对应 C 的 CallInfo 中 Lua 部分）
+/// 调用帧 — 被调帧的 ci 标识 + 调用者寄存器快照
 ///
-/// 当 op_call 调用一个 LClosure 时，把当前 code/base/pc 等保存到 CallFrame，
-/// 切换到被调用函数的原型；op_return 时从 CallFrame 恢复。
+/// 每进入一个新的 Lua 帧（`op_call` / `op_tforcall`）压入一条，该帧
+/// `op_return*` 时弹出。字段分两组：
+///
+/// **被调帧的 ci 标识**（对应 C 的 ci 自身字段）—— 「这一帧的函数是谁」一律读
+/// `func`，**不要再用 `state.base - 1` 推算**（`base` 属于上一组，见下）:
+/// - `func`: 本帧函数值所在栈槽（C 的 `ci->func.p`）；`VARARGPREP` 的
+///   `luaT_adjustvarargs` 会把它（与 `top`、`state.base`）一起上移
+///   `totalargs + 1`，故它不能由别处的 `base` 反推；
+/// - `top`: 本帧 `ci->top.p`（= `func + 1 + fsize`，变参帧经 VARARGPREP 调整）。
+///   当前仅供 ci 一致性与调试断言使用（栈边界另由 `frame_floor()` 保守覆盖）。
+///
+/// **调用者寄存器快照** —— 返回时原样写回 `state`:
+/// - `base`: 调用者的基址（返回时写回 `state.base`；**不是**本帧的 `func + 1`）；
+/// - `code`/`constants`/`protos`/`return_pc`（调用者被中断处的下一条 pc，
+///   对应 C 的 `ci->u.l.savedpc`）/`num_params`/`is_vararg`/`proto_flag`/
+///   `nextraargs`/`closure_upvals`/`tbc_list`；
+/// - `return_base`: 返回值落点 = 调用者寄存器空间里本次调用的函数槽（op_call 的
+///   `a`）。定参帧 = `func`；**变参帧 ≠ `func`**（`func` 被上移，调用者槽位不动；
+///   C 用 `ci->func.p - delta` 现算，`delta = nextraargs + numparams + 1`）。
+///
+/// 注意: `state.call_stack.last()` = **当前帧**（进入它时压入的记录，`func`/`top`
+/// 描述它），与 C 的 `L->ci` 对应；入口帧（`state.pcall` / 协程体）没有记录，
+/// 此时「当前帧的函数槽」按定义 = `state.base - 1`（见 `LuaState::cur_func`）。
 #[derive(Debug, Clone)]
 pub struct CallFrame<'a> {
     pub code: Rc<Vec<Instruction>>,
     pub constants: Rc<Vec<TValue<'a>>>,
     /// 子原型列表 — Rc 共享，op_call 保存调用现场时 O(1) 引用计数（perf: 消除 Vec 分配）
     pub protos: Rc<Vec<Rc<Proto<'a>>>>,
+    /// 被调帧函数槽（C 的 `ci->func.p`；VARARGPREP 会调整）
+    pub func: usize,
+    /// 调用者基址（返回时写回 `state.base`）—— 不是本帧的 `func + 1`
     pub base: usize,
-    pub return_pc: usize,
+    /// 被调帧栈顶（C 的 `ci->top.p`；VARARGPREP 会调整）
+    pub top: usize,
+    /// 返回值落点（调用者寄存器空间里本次调用的函数槽，见上）
     pub return_base: usize,
+    /// 调用者被中断处的下一条 pc（返回后写回 `state.pc`）
+    pub return_pc: usize,
     pub num_results: i32,
     pub num_params: u8,
     pub is_vararg: bool,

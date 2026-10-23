@@ -1568,7 +1568,9 @@ fn setup_first_resume<'a>(
         co.closure_upvals = Rc::clone(&closure.upvals);
         co.open_upval = None;
         co.tbc_list = None;
-        co.call_stack = Vec::new();
+        // 入口帧（协程体）没有 ci 记录：其身份由 co.base 决定
+        // （「当前帧函数槽」见 `LuaState::cur_func`）。
+        co.call_stack.clear();
         co.hook_old_pc = 0;
 
         // 设置栈: stack[0] = closure, stack[1..1+nargs] = resume_args
@@ -1613,6 +1615,7 @@ fn setup_first_resume<'a>(
             is_c: false,
             closure: Some(closure.clone()),
             base: 1,
+            func: 0, // 体函数在 stack[0]（base = 1），故函数槽 = 0
             saved_pc: 0,
             name: None,
             namewhat: "",
