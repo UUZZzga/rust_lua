@@ -258,7 +258,7 @@ fn get_frame_info<'a>(state: &LuaState<'a>, level: i32) -> Option<FrameInfo<'a>>
     }
     // 计算 limit: 对应 C 的 ci->next->func.p
     let limit = if level == 2 {
-        // 被调用者是当前函数 (level 1), func.p = state.base - 1
+        // 被调用者是当前函数 (level 1), 其函数槽 = state.cur_func()
         state.cur_func()
     } else {
         // 被调用者是 level-1, 其 call_info 条目在 idx+1
@@ -1058,7 +1058,7 @@ fn fill_info_from_level<'a>(
     //   → level n = call_info[len - (n - 1)]
     //
     // 要获取 level n 的函数信息:
-    //   closure = state.stack[entry.base - 1]  (调用者的闭包)
+    //   closure = state.stack[entry.func]  (调用者的闭包)
     //   pc      = entry.saved_pc               (调用者的 pc)
     //   name    = call_info[ci_idx - 1].name   (调用者被调用时的名字，若存在)
 
@@ -1083,7 +1083,7 @@ fn fill_info_from_level<'a>(
     // 调用者的名字来自前一个 entry（调用者被调用时推入的记录）
     // 若 ci_idx == 0，调用者是主函数，没有名字
     // name/namewhat 延迟计算: 通过 compute_caller_info 从 prev + saved_pc 实时获取
-    // (caller_proto 由 get_caller_proto_ref 从 state.stack[base-1] 延迟计算)
+    // (caller_proto 由 get_caller_proto_ref 从 state.stack[entry.func] 延迟计算)
     let (caller_name, caller_namewhat) = if ci_idx > 0 {
         let prev = &state.call_info[ci_idx - 1];
         let (_, _, n, nw) = crate::execute::compute_caller_info(&state.stack, prev);
@@ -1219,7 +1219,7 @@ fn fill_info_from_level<'a>(
             info.ntransfer = 0;
         }
     }
-    // 'f' 选项: 从栈上读取 C 函数值 (entry.base - 1 = 函数位置)
+    // 'f' 选项: 从栈上读取 C 函数值 (entry.func = 函数位置)
     if what.contains('f') {
         if entry.base > 0 && entry.base <= state.top {
             info.func = Some(state.stack[entry.func].clone());
@@ -1571,7 +1571,7 @@ fn get_local_from_thread<'a>(
         if nvar <= 0 {
             return None;
         }
-        // limit: 对于 C 函数链中的帧，limit = 下一帧的 base - 1
+        // limit: 对于 C 函数链中的帧，limit = 下一帧的函数槽 (call_info[...].func)
         let limit = if idx + 1 < n {
             call_info[idx + 1].func
         } else {
@@ -1649,7 +1649,7 @@ fn get_local_from_thread<'a>(
     let target_idx = offset;
     let entry = &call_info[target_idx];
 
-    // limit: 下一帧的 base - 1
+    // limit: 下一帧的函数槽 (call_info[...].func)
     let limit = call_info[target_idx + 1].func;
 
     if entry.is_c {
@@ -1997,7 +1997,7 @@ fn call_getlocal<'a>(
                     let nextra = frame.nextraargs;
                     if nvar >= -nextra {
                         // pos = ci->func.p - nextra - (n + 1)
-                        // ci->func.p = frame.base - 1
+                        // ci->func.p = frame.func
                         let pos = (frame.func as i32) - nextra - (nvar + 1);
                         let pos = pos as usize;
                         let val = if pos < state.top {
@@ -2987,7 +2987,7 @@ pub fn build_traceback<'a>(state: &LuaState<'a>, msg: &str, level: i32) -> Strin
                     0,
                 ));
             } else {
-                // next_entry.base = entry 的 base, stack[next_entry.base - 1] 应是 entry 的闭包
+                // next_entry 的函数槽 = entry 的闭包所在槽 (stack[next_entry.func])
                 // 栈截断时回退到 entry.closure.proto (调用者的 proto)
                 let fallback_proto = entry.closure.as_ref().map(|c| &c.proto);
                 let (src_full, line, _, _) = crate::execute::compute_caller_info_with_fallback(

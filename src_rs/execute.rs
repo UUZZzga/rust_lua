@@ -381,7 +381,7 @@ pub fn get_func_name<'a>(state: &LuaState, call_pc: usize) -> (String, String) {
 /// 对于 hook/metamethod 帧 (namewhat 非空): source/line 从 caller_proto 计算, name/namewhat 使用预设置值
 /// 对于普通 Lua 函数帧: 全部从 caller_proto + saved_pc 实时计算
 ///
-/// perf: caller_proto 从 stack[entry.base - 1] 延迟计算, 避免 op_call 中 Rc::clone
+/// perf: caller_proto 从 stack[entry.func] 延迟计算, 避免 op_call 中 Rc::clone
 /// 参数为 stack 切片而非 &LuaState, 支持 ThreadContext.saved_stack 场景
 pub fn compute_caller_info<'a>(
     stack: &[TValue<'a>],
@@ -397,7 +397,7 @@ pub fn compute_caller_info<'a>(
     }
 
     // Lua 函数帧
-    // caller_proto = stack[entry.base - 1].proto (调用者的 proto)
+    // caller_proto = stack[entry.func].proto (调用者的 proto)
     // 注意: entry.closure 是被调用者的闭包, 不能用作 caller_proto 的回退
     if let Some(caller_proto) = crate::state::get_caller_proto_from_stack(stack, entry) {
         let source = caller_proto
@@ -434,7 +434,7 @@ pub fn compute_caller_info<'a>(
 
 /// 带 caller_proto 回退的 compute_caller_info — 用于 traceback
 ///
-/// 当 stack[entry.base - 1] 因栈截断失效时, 用 fallback_proto (前一个 call_info 条目的 closure.proto)
+/// 当 stack[entry.func] 因栈截断失效时, 用 fallback_proto (前一个 call_info 条目的 closure.proto)
 /// 这解决了 compute_caller_info 中 entry.closure 是被调用者闭包而非调用者闭包的问题
 pub fn compute_caller_info_with_fallback<'a>(
     stack: &[TValue<'a>],
@@ -506,7 +506,7 @@ pub fn compute_name_from_proto(caller_proto: &Proto, saved_pc: usize) -> (String
 /// 在 loaded 表中递归查找函数的全限定名 (对应 C 的 pushglobalfuncname + findfield)
 ///
 /// 核心逻辑:
-/// 1. 获取当前函数 (从 call_info.last().base - 1)
+/// 1. 获取当前函数 (从 call_info.last().func)
 /// 2. 获取 loaded 表 (package.loaded)
 /// 3. 在 loaded 表中递归查找函数 (2 层深度)
 /// 4. 去掉 "_G." 前缀
@@ -3379,7 +3379,7 @@ impl VmExecutor {
         };
 
         // hook_entry 的 base 指向触发 hook 的帧的 base
-        // 这样 debug.getinfo(2) 能通过 state.stack[entry.base - 1] 获取触发帧的闭包
+        // 这样 debug.getinfo(2) 能通过 state.stack[entry.func] 获取触发帧的闭包
         // perf: caller_proto 延迟计算 (同 op_call), 避免 hook 路径中 Rc::clone
         let hook_base = frame_base.unwrap_or(state.base);
 
@@ -6026,7 +6026,7 @@ impl VmExecutor {
         let proto_flag = closure.proto.flag;
 
         // perf: caller_proto 不再在 op_call 中 Rc::clone, 改为 traceback/getinfo 时
-        // 从 state.stack[entry.base - 1] 延迟计算 (见 state::get_caller_proto_ref)
+        // 从 state.stack[entry.func] 延迟计算 (见 state::get_caller_proto_ref)
 
         // 检查 C 调用深度 (对应 C 的 luaE_incCstack / luaE_checkcstack)
         state.n_ccalls = state.n_ccalls.saturating_add(1);
@@ -6122,7 +6122,7 @@ impl VmExecutor {
                 Self::call_hook(state, "call", -1, None, 1, nfixparams as i32)?;
             }
         }
-        // 补齐帧寄存器 scratch: base-1 处已是被调闭包, frame_floor 能取到 fsize
+        // 补齐帧寄存器 scratch: 帧函数槽处已是被调闭包 (有 ci 时 ci.func, 入口帧 base - 1)
         state.pad_frame_scratch();
         Ok(())
     }
@@ -6196,7 +6196,7 @@ impl VmExecutor {
                 let proto = Rc::clone(&closure.proto);
                 let upvals = Rc::clone(&closure.upvals);
 
-                // perf: caller_proto 延迟计算 (同 fast path), 从 state.stack[base-1] 获取
+                // perf: caller_proto 延迟计算 (同 fast path), 从 state.stack[entry.func] 获取
 
                 // 检查 C 调用深度 (对应 C 的 luaE_incCstack / luaE_checkcstack)
                 // 每次 Lua 闭包调用递增 n_ccalls,达到 LUAI_MAXCCALLS(200) 时
@@ -6523,7 +6523,7 @@ impl VmExecutor {
         // 否则 lua_getstack/lua_getinfo 返回 0，导致 luaL_argerror 无法获取
         // 函数名（如 cjson.encode_max_depth 错误消息缺少 "to 'xxx'" 部分）。
         // perf: caller_proto 延迟计算 (get_caller_proto_for_ci 从前一个 call_info
-        // 条目的 closure 获取), 不能从 state.stack[state.base - 1] 读取, 因为元方法
+        // 条目的 closure 获取), 不能从栈上的帧函数槽读取, 因为元方法
         // 调用路径 (__index/__newindex) 在调用 call_c_function 前已更新 state.base。
         state.call_info.push(crate::state::CallInfoEntry {
             is_c: true,
@@ -7696,7 +7696,7 @@ impl VmExecutor {
                 let proto_flag = closure.proto.flag;
                 let proto_max_stack = closure.proto.max_stack_size;
 
-                // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[base-1] 获取
+                // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[entry.func] 获取
                 // "for iterator" name 由 compute_caller_info 从 TFORCALL opcode 检测
                 // TFORCALL 的 C 操作数 = 实际结果数（与 OP_CALL 的 C = nresults+1 不同）
                 let nresults = c as i32;

@@ -2845,7 +2845,7 @@ pub struct CallInfoEntry<'a> {
     /// 栈帧基址（对应 C 的 ci->func + 1）
     /// Lua 函数帧: caller's base (state.exec.base before op_call updates it)
     /// C 函数帧: callee's base (func_idx + 1)
-    /// perf: 用于从 state.exec.stack[base - 1] 延迟计算 caller_proto, 避免 op_call 中 Rc::clone
+    /// perf: 用于从 state.exec.stack[func] 延迟计算 caller_proto, 避免 op_call 中 Rc::clone
     pub base: usize,
     /// 本条目隐含的函数槽 = `base - 1`（`base == 0` 的无效条目为 0）。
     ///
@@ -2875,7 +2875,7 @@ pub struct CallInfoEntry<'a> {
 
 /// 从栈切片延迟计算 closure 引用 — 核心逻辑
 ///
-/// 对于 Lua 函数帧: closure = stack[entry.base - 1] (若为 LClosure)
+/// 对于 Lua 函数帧: closure = stack[entry.func] (若为 LClosure)
 /// 对于 C 函数帧: 返回 None
 /// 对于 base=0 或 stack 越界: 返回 None
 ///
@@ -2898,7 +2898,7 @@ pub fn get_closure_from_stack<'a, 'b>(
 /// 从 CallInfoEntry 延迟计算 closure 引用 — 避免 op_call 热路径中 Rc::clone
 ///
 /// 优先返回 entry.closure (若已设置, 如 hook/metamethod 路径);
-/// 否则从 state.exec.stack[entry.base - 1] 延迟计算 (op_call 快速路径)
+/// 否则从 state.exec.stack[entry.func] 延迟计算 (op_call 快速路径)
 pub fn get_closure_for_ci<'a, 'b>(
     state: &'b LuaState<'a>,
     ci_idx: usize,
@@ -2912,7 +2912,7 @@ pub fn get_closure_for_ci<'a, 'b>(
 
 /// 从栈切片延迟计算 caller_proto 引用 — 核心逻辑
 ///
-/// 对于 Lua 函数帧: caller_proto = stack[entry.base - 1].proto (若为 LClosure)
+/// 对于 Lua 函数帧: caller_proto = stack[entry.func].proto (若为 LClosure)
 /// 对于 C 函数帧: 返回 None
 /// 对于 base=0 或 stack 越界: 返回 None
 pub fn get_caller_proto_from_stack<'a, 'b>(
@@ -2932,7 +2932,7 @@ pub fn get_caller_proto_from_stack<'a, 'b>(
 
 /// 从 CallInfoEntry 延迟计算 caller_proto 引用 — 避免在 op_call 热路径中 Rc::clone
 ///
-/// 对于 Lua 函数帧: caller_proto = state.exec.stack[entry.base - 1].proto (若为 LClosure)
+/// 对于 Lua 函数帧: caller_proto = state.exec.stack[entry.func].proto (若为 LClosure)
 /// 对于 C 函数帧: 返回 None (由 get_caller_proto_for_ci 处理 C 帧的特殊路径)
 /// 对于 base=0 或 stack 越界: 返回 None
 ///
@@ -2946,7 +2946,7 @@ pub fn get_caller_proto_ref<'a, 'b>(
 
 /// 从 call_info 索引延迟计算 caller_proto 引用 (用于 lua_getinfo / traceback)
 ///
-/// 对于 Lua 函数帧: 从 state.exec.stack[entry.base - 1] 获取 (同 get_caller_proto_ref)
+/// 对于 Lua 函数帧: 从 state.exec.stack[entry.func] 获取 (同 get_caller_proto_ref)
 /// 对于 C 函数帧 (无预设置 name, 即 call_c_function 外部 C 函数):
 ///   从前一个 call_info 条目的 closure 获取 (对应原 call_c_function 的计算逻辑)
 /// 对于 C 函数帧 (有预设置 name, 如 BuiltinFn/RustClosure): 返回 None

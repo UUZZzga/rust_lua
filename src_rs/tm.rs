@@ -418,7 +418,7 @@ pub(crate) fn call_tm_res<'a>(
     let caller_nextraargs = state.nextraargs;
     let caller_closure_upvals = Rc::clone(&state.closure_upvals);
     let caller_tbc_list = state.tbc_list;
-    // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[base-1] 获取
+    // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[entry.func] 获取
     state.call_info.push(crate::state::CallInfoEntry {
         is_c: false,
         closure: None,
@@ -581,7 +581,7 @@ pub(crate) fn call_tm<'a>(
     let caller_nextraargs = state.nextraargs;
     let caller_closure_upvals = Rc::clone(&state.closure_upvals);
     let caller_tbc_list = state.tbc_list;
-    // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[base-1] 获取
+    // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[entry.func] 获取
     state.call_info.push(crate::state::CallInfoEntry {
         is_c: false,
         closure: None,
@@ -751,7 +751,7 @@ pub fn call_close_method<'a>(
     // 推入 CallInfoEntry — 对应 C 的 luaD_callnoyield 推入 CallInfo
     let caller_base = state.base;
     let caller_pc = state.pc;
-    // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[base-1] 获取
+    // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[entry.func] 获取
     state.call_info.push(crate::state::CallInfoEntry {
         is_c: false,
         closure: None,
