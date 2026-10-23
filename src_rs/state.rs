@@ -887,21 +887,20 @@ impl<'a> LuaState<'a> {
     #[inline]
     pub fn recompute_lua_frame_ceiling(&mut self) {
         let base = self.base;
-        self.lua_frame_ceiling = if base == 0 {
-            0
-        } else {
-            let func = base - 1;
-            match self.stack.get(func) {
-                Some(TValue::LClosure(c)) => {
-                    let fsize = func + 1 + c.proto.max_stack_size as usize;
-                    match self.call_stack.last() {
-                        Some(ci) if ci.func == func && ci.top != 0 => ci.top,
-                        _ => fsize,
-                    }
-                }
-                _ => 0,
-            }
-        };
+        if base == 0 {
+            return;
+        }
+        let func = base - 1;
+        // 只在当前帧**是 Lua 帧**时更新: C 帧 (BuiltinFn / CClosure 内联调用) 期间
+        // 字段必须保持「最内层 Lua 帧」的上界 —— `adjust_*` / `op_return*` 正是在
+        // C 帧里替 Lua 调用者收尾, 需要靠它复原 live top。
+        if let Some(TValue::LClosure(c)) = self.stack.get(func) {
+            let fsize = func + 1 + c.proto.max_stack_size as usize;
+            self.lua_frame_ceiling = match self.call_stack.last() {
+                Some(ci) if ci.func == func && ci.top != 0 => ci.top,
+                _ => fsize,
+            };
+        }
     }
 
     /// 对应 C 的 `savestate(L, ci)` / `Protect`: 把 live top 抬到当前帧的栈上界

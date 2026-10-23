@@ -1114,12 +1114,18 @@ impl VmExecutor {
         // 从 state.base 重载; CALL 的 Fast 分支 (pure builtin, 帧未切) 跳过
         // 重载, 与 code/constants 缓存的前提一致。
         let mut base: usize = state.base;
+        // 进入 VM 时刷新最内层 Lua 帧上界 (覆盖所有进入路径: CLI docall / capi lua_call /
+        // 协程 resume / 元方法 pcall; C 帧保持原值)
+        state.recompute_lua_frame_ceiling();
 
         // 帧切换后刷新指令流缓存 (fast_unsafe: 裸指针四件套, 免每指令 deref;
         // 安全版: Rc 句柄, 索引时边界检查)。调用点: CALL/TAILCALL/RETURN*/
         // FORPREP/冷分发/错误恢复。base 同步刷新 (见上方 base 寄存器化注释)。
         macro_rules! reload_istream {
             ($st:expr) => {
+                // 帧切换点: 刷新「最内层 Lua 帧上界」(C 帧保持原值, 见
+                // LuaState::recompute_lua_frame_ceiling)
+                $st.recompute_lua_frame_ceiling();
                 #[cfg(feature = "fast_unsafe")]
                 {
                     code_ptr = $st.code.as_ptr();
@@ -1249,7 +1255,10 @@ impl VmExecutor {
             } else {
                 state.lua_frame_ceiling
             };
-            if state.top < live_bound {
+            // 例外: `VARARGPREP` 必须看到帧入口设定的「实参末尾」top (C 的 `L->top = ra + b`,
+            // 变参重排按它搬运 func 副本/固定参数) —— 此时把 top 抬到帧上界会让重排写到
+            // 错误位置 (实测 vararg.lua 首个参数变 nil)。
+            if op != OpCode::VARARGPREP && state.top < live_bound {
                 state.top = live_bound;
             }
 
@@ -1746,6 +1755,7 @@ impl VmExecutor {
                                 state.push_value(TValue::Boolean(false));
                                 state.push_value(current_results[0].clone());
                                 state.top = protection.func_idx + 2;
+                                state.mret_end = state.top;
                                 current_results =
                                     vec![TValue::Boolean(false), current_results[0].clone()];
                                 // pcall 已捕获 error，后续 PcallProtection 处理成功返回值
@@ -1757,6 +1767,7 @@ impl VmExecutor {
                                 state.push_value(handler);
                                 state.push_value(current_results[0].clone());
                                 state.top = protection.func_idx + 2;
+                                state.mret_end = state.top;
                                 let handler_status = state.pcall(1, -1, 0);
                                 let handler_nret = state.top.saturating_sub(protection.func_idx);
                                 let handler_result: Vec<TValue> = if handler_status == 0 {
@@ -1775,6 +1786,7 @@ impl VmExecutor {
                                     state.push_value(r.clone());
                                 }
                                 state.top = protection.func_idx + 1 + handler_result.len();
+                                state.mret_end = state.top;
                                 current_results = {
                                     let mut v = vec![TValue::Boolean(false)];
                                     v.extend(handler_result);
@@ -1793,6 +1805,7 @@ impl VmExecutor {
                             state.push_value(r.clone());
                         }
                         state.top = protection.func_idx + 1 + current_results.len();
+                        state.mret_end = state.top;
                         // current_results 更新为 (true, results...)
                         current_results = {
                             let mut v = vec![TValue::Boolean(true)];
@@ -2510,11 +2523,13 @@ impl VmExecutor {
                     _ => usize::MAX,
                 };
                 eprintln!(
-                    "OOBREAD idx={} top={} base={} frame_top={} fsize={} cistack={:?} ci_info={:?} pc={}",
+                    "OOBREAD idx={} top={} base={} frame_top={} ceiling={} mret={} fsize={} cistack={:?} ci_info={:?} pc={}",
                     idx,
                     state.top,
                     state.base,
                     state.frame_top(),
+                    state.lua_frame_ceiling,
+                    state.mret_end,
                     ftsize,
                     state.call_stack.last().map(|c| (c.func, c.top)),
                     state.call_info.last().map(|c| (c.base, c.is_c, c.saved_pc)),
@@ -5984,6 +5999,9 @@ impl VmExecutor {
             b.saturating_sub(1)
         };
         let nresults = if c == 0 { -1 } else { c - 1 };
+        // 对应 C 的 `L->top.p = ra + b`: C 函数从实参末尾开始压栈 (`lua_gettop` 也按它算)。
+        // 本实现 live top 在指令边界被抬到帧上界, 必须在调用前压回精确的实参末尾。
+        state.top = a + 1 + nargs;
         match (bf.call_target())(state, a, nargs, nresults) {
             Ok(()) => {
                 // perf: 不写 state.pc — 主循环 CALL Fast 臂保持循环局部 pc 有效,
@@ -6530,6 +6548,17 @@ impl VmExecutor {
     ) -> Result<(), VmError<'a>> {
         // nresults: -1 = MULTRET, >=0 = 固定结果数
         let nresults: i32 = if c == 0 { -1 } else { c - 1 };
+        // 对应 C 的 `L->top.p = ra + b`: C 函数从实参末尾开始压栈 —— `lua_gettop`、
+        // `lua_push*` 都以此为准。本实现 live top 在指令边界被抬到帧上界, 调用前必须
+        // 压回精确的实参末尾 (否则 C 函数的返回值会落在帧上界之上, 调用者看不到)。
+        let nargs_c = if b == 0 {
+            state.mret_end.saturating_sub(a + 1)
+        } else {
+            b.saturating_sub(1)
+        };
+        if state.top != a + 1 + nargs_c {
+            state.top = a + 1 + nargs_c;
+        }
 
         // 关键修复：truncate 栈到参数末尾，使 stack.len() == 参数边界。
         // OP_CALL 设置了 state.top = a + b（b>0 时）；b == 0（MULTRET，实参列表
@@ -6785,6 +6814,7 @@ impl VmExecutor {
             } else {
                 b.saturating_sub(1)
             };
+            state.top = a + 1 + nargs; // 见 BuiltinFn 臂: 调用前压回实参末尾
             match (bf.call_target())(state, a, nargs, -1) {
                 Ok(()) => {
                     state.pc += 1;
@@ -8124,8 +8154,9 @@ impl VmExecutor {
                 Self::write_stack_state(state, ra + touse + i, TValue::Nil(NilKind::Strict));
             }
             if wanted < 0 {
-                // MULTRET: 设置 top = ra + nargs
-                state.truncate_live(ra + touse);
+                // MULTRET (对应 C 的 `L->top = ra + nargs`): 记录给随后的
+                // OP_CALL/OP_RETURN (b==0) / OP_SETLIST (c==0) 用 (见 mret_end)
+                state.mret_end = ra + touse;
             }
         } else {
             // PF_VAHID: 从隐藏变参取值
