@@ -6489,6 +6489,22 @@ impl VmExecutor {
 
                 // 直接调用函数指针 — 无 tag 派发层
                 let dispatch_result = func(state, a, nargs, nresults);
+                #[cfg(not(feature = "fast_unsafe"))]
+                if c_name == "upper" {
+                    let dump = |i: usize| match state.stack.get(i) {
+                        Some(TValue::Integer(v)) => format!("int({})", v),
+                        Some(TValue::Nil(_)) => "nil".to_string(),
+                        Some(TValue::ShortStr(_)) | Some(TValue::LongStr(_)) => {
+                            format!("str({})", crate::strings::lua_string_as_str(&state.stack[i]))
+                        }
+                        Some(o) => format!("other({})", o.ty()),
+                        None => "OOB".to_string(),
+                    };
+                    eprintln!(
+                        "UPPER-CALL a={} nargs={} nresults={} top={} slots=[{}|{}|{}]",
+                        a, nargs, nresults, state.top, dump(a), dump(a + 1), dump(a + 2)
+                    );
+                }
 
                 let is_yield = matches!(&dispatch_result, Err(VmError::Yield(_)));
                 let is_error = dispatch_result.is_err();
