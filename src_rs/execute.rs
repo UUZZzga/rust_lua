@@ -6859,6 +6859,13 @@ impl VmExecutor {
                 // 新函数的 oldpc 设为 0，第一条指令会触发 line hook
                 state.hook_old_pc = 0;
 
+                // 对应 C 的 luaD_pretailcall: `ci->top.p = func + 1 + fsize`
+                // 本帧复用（`ci.func` 即 func_slot 不变，只有 top 随新函数重算），
+                // VARARGPREP 之后再按 totalargs 上移。
+                if let Some(ci) = state.call_stack.last_mut() {
+                    ci.top = func_slot + 1 + fsize;
+                }
+
                 if proto_is_vararg {
                     // vararg 函数: 截断栈到实际参数末尾，VARARGPREP 会处理
                     state.truncate_live(func_slot + 1 + nargs);
@@ -8331,10 +8338,21 @@ impl VmExecutor {
         // 「帧上界之上才是空闲区」—— 调试接口（`debug.getlocal` 的 limit 取
         // 「下一帧 func 槽」，即帧内寄存器都算合法槽位）、元方法 scratch 起点
         // （[`Self::call_hook`] 在 L->top 之上压 hook 帧）都依赖它。
-        // 帧上界由本帧函数槽的 proto 直接算，不依赖 ci.top 是否已同步。
-        let frame_end = match state.stack.get(state.cur_func()) {
+        // 本帧 ci 记录的 `top` 就是 ci->top（VARARGPREP 已随 func 一起上移）；
+        // 入口帧没有 ci 记录，按其函数槽的 proto 现算。
+        let proto_frame_end = match state.stack.get(state.cur_func()) {
             Some(TValue::LClosure(c)) => state.cur_func() + 1 + c.proto.max_stack_size as usize,
             _ => 0,
+        };
+        let frame_end = match state.call_stack.last() {
+            Some(ci) => {
+                debug_assert_eq!(
+                    ci.top, proto_frame_end,
+                    "ci.top 与帧函数 proto 声明的帧上界不一致"
+                );
+                ci.top
+            }
+            None => proto_frame_end,
         };
         if frame_end > state.top {
             Self::fast_resize_stack_nil(state, frame_end);
