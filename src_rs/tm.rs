@@ -399,6 +399,8 @@ pub(crate) fn call_tm_res<'a>(
     tm: TagMethod,
 ) -> Result<(), VmError<'a>> {
     debug_assert!(state.stack.len() <= state.stack.capacity());
+    // 压 scratch 前抬高 live top 到帧上界 (对应 C 的 `Protect(luaT_callTMres)`)
+    state.savestate();
     let func_idx = state.top;
     // 压入函数和两个参数 (对应 C 的 setobj2s)
     state.push_value(f.clone());
@@ -561,6 +563,8 @@ pub(crate) fn call_tm<'a>(
     p3: &TValue<'a>,
     tm: TagMethod,
 ) -> Result<(), VmError<'a>> {
+    // 压 scratch 前抬高 live top 到帧上界 (对应 C 的 `Protect(luaT_callTM)`)
+    state.savestate();
     let func_idx = state.top;
     state.push_value(f.clone());
     state.push_value(p1.clone());
@@ -733,6 +737,8 @@ pub fn call_close_method<'a>(
         }
     };
 
+    // 压 scratch 前抬高 live top 到帧上界 (对应 C 的 callclosemethod 前的 Protect)
+    state.savestate();
     let func_idx = state.top;
     // 压入函数和参数 (对应 C 的 callclosemethod)
     // C 中 err == NULL 时不传递第二个参数（无错误时只传 1 个参数）
@@ -871,6 +877,8 @@ fn callbin_tm<'a>(
     res: usize,
     tm: TagMethod,
 ) -> Result<bool, VmError<'a>> {
+    // 压 scratch / 走字符串算术快速路径前抬高 live top (对应 C 调用点的 `Protect(p1, p2)`)
+    state.savestate();
     // 先从 p1 查找元方法，再从 p2 查找 — 对应 C 的 callbinTM
     let tm_val = get_tm_by_obj(p1, tm, &state.dmt, &state.tmnames)
         .or_else(|| get_tm_by_obj(p2, tm, &state.dmt, &state.tmnames));
@@ -1163,6 +1171,8 @@ pub fn call_order_tm<'a>(
     tm: TagMethod,
 ) -> Result<bool, VmError<'a>> {
     debug_assert!(tm == TagMethod::Lt || tm == TagMethod::Le);
+    // 临时结果槽位取帧上界之上 (对应 C 的 `Protect(luaT_callorderTM)`)
+    state.savestate();
     // 使用栈顶作为临时结果槽位
     let res = state.top;
     state.push_nil();
@@ -1277,6 +1287,8 @@ pub fn equal_obj<'a>(
     match tm {
         Some(f) => {
             // C: luaT_callTMres(L, tm, t1, t2, L->top.p); return !tagisfalse(tag);
+            // 临时结果槽位取帧上界之上 (对应 C 调用点的 Protect)
+            state.savestate();
             let res = state.top;
             state.push_nil();
             call_tm_res(state, &f, t1, t2, res, TagMethod::Eq)?;

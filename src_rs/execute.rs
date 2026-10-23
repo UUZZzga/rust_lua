@@ -74,13 +74,11 @@ macro_rules! arith_bin2 {
         match ($v1, $v2) {
             (TValue::Integer(i1), TValue::Integer(i2)) => {
                 Self::write_stack($drop_queue, $stack, *$top, $a, TValue::Integer((*i1).$int_method(*i2)));
-                Self::note_reg_write($top, $a);
                 *$pc += 1; // skip MMBIN
             }
             _ => {
                 if let (Some(n1), Some(n2)) = (to_number_ns($v1), to_number_ns($v2)) {
                     Self::write_stack($drop_queue, $stack, *$top, $a, TValue::Float(n1 $op n2));
-                    Self::note_reg_write($top, $a);
                     *$pc += 1; // skip MMBIN
                 }
             }
@@ -2311,27 +2309,16 @@ impl VmExecutor {
         }
     }
 
-    /// 寄存器写抬高 live top —— 不变量: `state.top` 恒为「已写入寄存器上界 + 1」,
-    /// 因此 ① 以 top 为起点的 scratch 压入 (元方法临时帧 / hook / C API 压栈) 不会覆盖
-    /// 本帧仍有效的寄存器, ② GC 根扫描 `[..top)` 覆盖它们。
+    /// 寄存器写 —— **不维护 live top** (对齐 C: `s2v(ra) = ...` 只管写槽位)。
     ///
-    /// 对应 C 里 `Protect`/`savestate` 在「可能抛错 / 回收 / 重入」前把 `L->top` 复位到
-    /// `ci->top` 的作用 —— 本实现的栈是单字段 (len == capacity, 物理全初始化), 于是把
-    /// 这条不变量收敛在**写入口** (本函数 + [`Self::write_stack_state`] +
-    /// [`Self::copy_stack_slot_state`] + `arith_bin2!`) 里, 调用点不需要任何手动修正。
-    #[inline(always)]
-    fn note_reg_write(top: &mut usize, idx: usize) {
-        if idx >= *top {
-            *top = idx + 1;
-        }
-    }
-
+    /// 寄存器写在 `[base, ci->top)` 之内, 而所有会压 scratch / 可能回收 / 可能重入的
+    /// 入口都先经 [`LuaState::savestate`] 把 live top 抬到 `ci->top` (对应 C 的
+    /// `Protect`) —— 故写路径不需要任何 top 修正。
     #[inline(always)]
     pub(crate) fn write_stack_state<'a>(state: &mut LuaState<'a>, idx: usize, val: TValue<'a>) {
         debug_assert!(state.stack.len() <= state.stack.capacity());
         debug_assert!(idx < state.stack.len());
         Self::write_stack(&mut state.drop_queue, &mut state.stack, state.top, idx, val);
-        Self::note_reg_write(&mut state.top, idx);
         debug_assert!(state.top <= state.stack.capacity());
     }
 
@@ -2437,7 +2424,6 @@ impl VmExecutor {
             dst_idx,
             src_idx,
         );
-        Self::note_reg_write(&mut state.top, dst_idx);
     }
 
     /// 读取栈槽 — VM 字节码路径专用 (idx 保证在范围内)
@@ -2451,6 +2437,10 @@ impl VmExecutor {
         }
         #[cfg(not(feature = "fast_unsafe"))]
         {
+            // 不变量: 任何被读取的寄存器都小于 live top —— 帧入口把 top 置为 `ci->top`,
+            // 之后只有「调用完成」把 top 收到返回值末尾 (此时后面的寄存器尚未被定义),
+            // 而定义新寄存器的指令又都在自己的 handler 里把 top 推到该寄存器之后。
+            // 破坏这条不变量就是模型错误, 所以这里用 top 而不是物理长度做边界。
             if idx < top {
                 &stack[idx]
             } else {
@@ -2508,7 +2498,10 @@ impl VmExecutor {
             // 有非 trivial 值: 就地释放 (避免 Rc 泄漏)
             state.clear_nontrivial_range(keep_len, stack_len);
         }
-        state.top = keep_len;
+        // keep_len = 结果末尾 (C 的 `L->top = res + nres`): 记入多返回值交接字段,
+        // 随后把 live top 复位到当前 (返回后即调用者) 帧的寄存器上界。
+        state.mret_end = keep_len;
+        state.top = state.frame_top();
     }
 
     /// 快速栈扩展 — 用 Nil 填充新槽位, 替代 Vec::resize。
@@ -3351,6 +3344,11 @@ impl VmExecutor {
         //    若不恢复, state.top > stack.len() 导致后续 SETLIST 越界)
         let saved_stack_len = state.stack.len();
         let saved_state_top = state.top;
+        // 多返回值交接字段同样要保存: hook 里执行的 Lua 代码会更新它, 而 hook 结束后
+        // 调用点可能仍处于「上一条指令产出多返回值」的位置 (如 SETLIST 的 c==0)。
+        let saved_mret_end = state.mret_end;
+        // scratch (hook 帧) 压在帧上界之上 (对应 C 的 luaD_hook 前 `savestate`)
+        state.savestate();
 
         // 对应 C 的 L->allowhook = 0 (防止递归)
         state.allowhook = false;
@@ -3429,6 +3427,7 @@ impl VmExecutor {
         //    若不恢复, 后续 SETLIST 用 state.top 计算 n_actual 时越界)
         state.truncate_live(saved_stack_len);
         state.top = saved_state_top;
+        state.mret_end = saved_mret_end;
 
         // 对应 C 的 L->allowhook = 1 (恢复 hook)
         state.allowhook = true;
@@ -5921,7 +5920,7 @@ impl VmExecutor {
         bf: crate::objects::BuiltinFn,
     ) -> Result<(), VmError<'a>> {
         let nargs = if b == 0 {
-            state.top.saturating_sub(a + 1)
+            state.mret_end.saturating_sub(a + 1)
         } else {
             b.saturating_sub(1)
         };
@@ -6004,7 +6003,7 @@ impl VmExecutor {
     ) -> Result<(), VmError<'a>> {
         let nargs = if b == 0 {
             // perf: 用 state.top 而非 state.stack.len() — smart_clear_stack 不截断 Vec
-            state.top.saturating_sub(a + 1)
+            state.mret_end.saturating_sub(a + 1)
         } else {
             b.saturating_sub(1)
         };
@@ -6179,7 +6178,7 @@ impl VmExecutor {
         match func_val {
             TValue::LClosure(closure) => {
                 let nargs = if b == 0 {
-                    state.top.saturating_sub(a + 1)
+                    state.mret_end.saturating_sub(a + 1)
                 } else {
                     b.saturating_sub(1)
                 };
@@ -6333,7 +6332,7 @@ impl VmExecutor {
                 // 与 name_str() strlen。错误时在慢路径补推 entry, traceback 语义不变。
                 // impure 函数 (可能回调 Lua/yield) 仍走原完整路径。
                 let nargs = if b == 0 {
-                    state.top.saturating_sub(a + 1)
+                    state.mret_end.saturating_sub(a + 1)
                 } else {
                     b.saturating_sub(1)
                 };
@@ -6689,7 +6688,7 @@ impl VmExecutor {
         if b != 0 {
             state.top = a + b;
         } else {
-            b = state.top.saturating_sub(a);
+            b = state.mret_end.saturating_sub(a);
         }
         // 对应 C 的 OP_TAILCALL: if (TESTARG_k(i)) luaF_closeupval(L, base);
         // K 标志位表示可能有 open upvalues,必须在移动栈数据之前关闭,
@@ -6723,7 +6722,7 @@ impl VmExecutor {
         };
         if let Some(bf) = pure_bf {
             let nargs = if b == 0 {
-                state.top.saturating_sub(a + 1)
+                state.mret_end.saturating_sub(a + 1)
             } else {
                 b.saturating_sub(1)
             };
@@ -6919,7 +6918,7 @@ impl VmExecutor {
                 // TAILCALL Rust 原生函数: 调用后结果放在 a 位置，后续 RETURN 处理返回
                 // 对应 C 的 luaD_callnoyield + precallC + poscall（nresults=-1 由 RETURN 调整）
                 let nargs = if b == 0 {
-                    state.top.saturating_sub(a + 1)
+                    state.mret_end.saturating_sub(a + 1)
                 } else {
                     b.saturating_sub(1)
                 };
@@ -7024,14 +7023,13 @@ impl VmExecutor {
         let nresults = if n < 0 {
             // perf: 用 state.top 而非 state.stack.len() — smart_clear_stack 不截断 Vec 时
             // stack.len() > top, 用 top 才能正确计算 MULTRET 返回值数
-            state.top.saturating_sub(a)
+            state.mret_end.saturating_sub(a)
         } else {
             n as usize
         };
-        // 对应 C 的 OP_RETURN: 固定结果数时 L->top = ra + n (multret 保留调用者设定的 top)
-        if n >= 0 {
-            state.top = a + nresults;
-        }
+        // 注: C 在固定结果数时把 `L->top = ra + n` (仅供其后的 rethook 与 poscall);
+        // 本实现的 hook 直接用局部 `nresults`, 且 live top 恒为该帧寄存器上界
+        // (寄存器读以 top 为上界), 故此处不改 top。
 
         // perf: 快速路径 — 无 pcall 保护且无 open upvalue 时跳过 3 个 continuation 检查
         // (is_metamethod_return / finish_close_continuation / try_finish_pcall_return 各做
@@ -7414,6 +7412,9 @@ impl VmExecutor {
             if Self::finish_pcall_return(state, 1, result_base)? {
                 return Ok(None); // pcall continuation 已处理，继续循环
             }
+            // 多返回值交接: 结果末尾 = result_base + 1 (live top 保持调用者帧上界)
+            state.mret_end = result_base + 1;
+            state.top = state.frame_top();
             Ok(Some(VmResult::Return {
                 nresults: 1,
                 result_base,
@@ -7885,7 +7886,7 @@ impl VmExecutor {
         // 可能不截断 Vec (待清除区域全是 trivial 类型时仅设 top), stack.len() > top,
         // 用 stack.len() 会多读 stale 栈元素 (如 packvalue 的局部变量 id)。
         let n_actual = if n == 0 {
-            state.top.saturating_sub(ra + 1)
+            state.mret_end.saturating_sub(ra + 1)
         } else {
             n
         };
@@ -8132,8 +8133,10 @@ impl VmExecutor {
                 Self::write_stack_state(state, ra + touse + i, TValue::Nil(NilKind::Strict));
             }
             if is_multret {
-                // MULTRET: 设置 top = ra + nextra
-                state.truncate_live(ra + touse);
+                // MULTRET (对应 C 的 `L->top = ra + nextra`): 记录给随后的
+                // OP_CALL/OP_RETURN (b==0) / OP_SETLIST (c==0) 用 —— live top 保持
+                // 在本帧寄存器上界, 不做多返回值交接的载体。
+                state.mret_end = ra + touse;
             }
         }
         Ok(())
@@ -8588,7 +8591,8 @@ impl VmExecutor {
         table: TValue<'a>,
         key: TValue<'a>,
     ) -> Result<TValue<'a>, VmError<'a>> {
-        // res 设为当前栈顶 (call_tm_res 会 push func/p1/p2 在这之后)
+        // res 设为帧上界之上 (call_tm_res 会 push func/p1/p2 在这之后)
+        state.savestate();
         let res = state.top;
         // 调用 call_tm_res (支持 yield)
         crate::tm::call_tm_res(

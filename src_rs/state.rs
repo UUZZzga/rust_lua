@@ -170,6 +170,14 @@ pub struct LuaState<'a> {
     /// 当前执行函数的子原型列表 — Rc 共享，op_call 切换 proto 时 O(1) 引用计数
     pub protos: Rc<Vec<Rc<Proto<'a>>>>,
     pub top: usize,
+    /// 最近一次「多返回值产出」的末尾位置 (对应 C 的 `L->top` 在 OP_CALL b==0
+    /// 语义下携带的信息: "else previous instruction set top")。
+    ///
+    /// live `top` 在帧执行期间恒为该帧的寄存器上界 (`ci->top`), 寄存器写不维护它
+    /// (对齐 C: `s2v(ra) = ...`), 故多返回值的交接必须走独立字段:
+    /// OP_CALL/OP_TAILCALL/OP_RETURN 的 `b == 0` 与 OP_SETLIST 的 `c == 0` 读它。
+    /// 生产者 (adjust_* / op_return*_finish / op_vararg) 在结果落位后更新。
+    pub mret_end: usize,
     pub base: usize,
     pub pc: usize,
     pub num_params: u8,
@@ -374,6 +382,7 @@ impl<'a> LuaState<'a> {
             code: Rc::new(Vec::new()),
             protos: Rc::new(Vec::new()),
             top: 0,
+            mret_end: 0,
             base: 0,
             pc: 0,
             num_params: 0,
@@ -796,20 +805,54 @@ impl<'a> LuaState<'a> {
         anchor + crate::opcodes::MAX_FSTACK as usize + 1
     }
 
-    /// 对应 C 的 `savestate(L, ci)` / `Protect`: 把 live top 抬到当前帧的寄存器上界
-    /// (`ci->top.p`; 本实现取保守上界 [`Self::frame_floor`])。
+    /// 当前帧的栈上界 (C 的 `ci->top.p`) —— [`Self::savestate`] 的落点。
     ///
-    /// C 的用法是「可能抛错 / 可能回收 / 可能重入的代码前调用一次」(op_arith 的元方法
-    /// 分支走 `Protect(luaT_trybinTM)`; `luaD_hook` / `luaD_pcall` / `checkGC` 各有对应
+    /// 取法按 C 的 `ci->top = ci->func.p + 1 + p->maxstacksize`:
+    ///   1. 函数槽是 `LClosure` 且存在**同一帧**的 ci 记录 (`ci.func == func`) 时取
+    ///      `ci.top` —— `VARARGPREP` / 尾调用会把它随 `func` 一起位移, 不能现算;
+    ///   2. 否则按函数槽里闭包的 proto 现算 (入口帧 / Rust 侧构造的帧 / ci 缺失);
+    ///   3. 函数槽不是 `LClosure` (C 帧: CClosure / LCFn / BuiltinFn / LightUserData)
+    ///      时返回 live top (no-op): C 帧的栈窗口天然在调用者活寄存器之上, 抬高
+    ///      live top 会破坏 `lua_gettop` 等 C API 语义。
+    #[inline(always)]
+    pub fn frame_top(&self) -> usize {
+        let func = self.cur_func();
+        // 只有「确实存在一个正在执行的帧」时才谈帧上界: `base == func + 1` 是帧存在的
+        // 判据 —— C API 从 Rust 侧压值但尚未调用 (base == 0 或指向别处) 时, 抬高 live
+        // top 会破坏 `lua_gettop` 等 API 语义; C 帧 (函数槽不是 LClosure) 同理。
+        if self.base == 0 || self.base != func + 1 {
+            return self.top;
+        }
+        match self.stack.get(func) {
+            Some(TValue::LClosure(closure)) => {
+                if let Some(ci) = self.call_stack.last() {
+                    if ci.func == func && ci.top != 0 {
+                        return ci.top;
+                    }
+                }
+                func + 1 + closure.proto.max_stack_size as usize
+            }
+            _ => self.top,
+        }
+    }
+
+    /// 对应 C 的 `savestate(L, ci)` / `Protect`: 把 live top 抬到当前帧的栈上界
+    /// [`Self::frame_top`] (= `ci->top.p`, **精确值而非保守上界**)。
+    ///
+    /// C 的用法是「可能抛错 / 可能回收 / 可能重入 / 要压 scratch 的代码前调用一次」
+    /// (`luaT_trybinTM` 等元方法入口的 `Protect`; `luaD_hook` / `checkGC` 各有对应
     /// 形式)。**有了它, 寄存器写 (`s2v(ra) = ...`, OP_ADD / OP_MOVE) 不需要任何 top
-    /// 维护** —— 随后的元方法临时帧 / hook / C API 压栈都从帧上界之上开始, 不会覆盖
-    /// 本帧仍有效的寄存器, 也不会落在 GC 根扫描范围之外。
+    /// 维护** —— 随后的元方法临时帧 / hook 帧都从帧上界之上开始, 不会覆盖本帧仍有效
+    /// 的寄存器, 而 GC 根扫描 `[..top)` 也覆盖整个帧。
+    /// 额外备足 `EXTRA_STACK` 槽位 (对应 C 的 `#define EXTRA_STACK`，本实现取 64):
+    /// scratch 压入余量, 保证随后的 `push_value` 落在已初始化内存上。
     #[inline(always)]
     pub fn savestate(&mut self) {
         debug_assert!(self.stack.len() <= self.stack.capacity());
-        let floor = self.frame_floor();
-        if self.top < floor {
-            self.top = floor;
+        let top = self.frame_top();
+        if self.top < top {
+            self.top = top;
+            self.ensure_scratch_to(top + EXTRA_STACK);
         }
     }
 
@@ -1067,9 +1110,11 @@ impl<'a> LuaState<'a> {
                 self.push_nil();
             }
         }
-        // 关键: 更新 state.exec.top — 后续 MULTRET CALL (b=0) 用 state.exec.top 计算 nargs,
-        // 若不更新, state.exec.top 保留 CALL 设置的 a+b (过大), 导致 nargs 计算错误
-        // 恢复帧寄存器 scratch (write_stack 无分支写的前提)
+        // 多返回值交接: 此时 top 恰为结果末尾 —— 记入 mret_end (供后续 OP_CALL/OP_RETURN
+        // 的 b==0 与 OP_SETLIST 的 c==0 读取), 然后把 live top 复位到本帧寄存器上界
+        // (`ci->top`): 帧内寄存器写在 top 之下, 且任何寄存器读都以 top 为上界。
+        self.mret_end = self.top;
+        self.top = self.frame_top();
         self.pad_frame_scratch();
     }
 
@@ -1154,6 +1199,9 @@ impl<'a> LuaState<'a> {
             }
             self.top += nresults as usize;
         }
+        // 多返回值交接 + live top 复位到帧上界 (见 adjust_results)
+        self.mret_end = self.top;
+        self.top = self.frame_top();
         self.pad_frame_scratch();
     }
 
@@ -1184,6 +1232,9 @@ impl<'a> LuaState<'a> {
                 }
             }
         }
+        // 多返回值交接 + live top 复位到帧上界 (见 adjust_results)
+        self.mret_end = self.top;
+        self.top = self.frame_top();
         self.pad_frame_scratch();
     }
 
@@ -1240,6 +1291,9 @@ impl<'a> LuaState<'a> {
         };
         self.truncate_live(new_len);
         self.top = new_len;
+        // 多返回值交接 + live top 复位到帧上界 (见 adjust_results)
+        self.mret_end = self.top;
+        self.top = self.frame_top();
         self.pad_frame_scratch();
     }
 

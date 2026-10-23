@@ -1294,6 +1294,12 @@ impl<'a> LuaState<'a> {
         if unsafe { self.gc_mut().is_gc_running() } {
             return;
         }
+        // 注意: 这里**不**把 top 抬到帧上界。对应 C 的 GC 点纪律 —— 解释器里只有
+        // OP_NEWTABLE / OP_CLOSURE / OP_CONCAT 三处在分配前把 `L->top` 置成「活值上界」
+        // (`checkGC(L, ra+1)` / `L->top.p = ra + n`), 元方法/钩子路径由 `Protect` 的
+        // `savestate` 负责。若无条件抬到 `ci->top`, 帧内**已死**寄存器(上次调用后未再
+        // 使用的临时槽)上的对象会被当成根 —— 实测 gc.lua 弱表段因此不被回收。
+
         let gc_start = if gc_stats_enabled() {
             Some(std::time::Instant::now())
         } else {
