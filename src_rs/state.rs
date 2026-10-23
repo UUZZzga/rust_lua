@@ -178,11 +178,6 @@ pub struct LuaState<'a> {
     /// OP_CALL/OP_TAILCALL/OP_RETURN 的 `b == 0` 与 OP_SETLIST 的 `c == 0` 读它。
     /// 生产者 (adjust_* / op_return*_finish / op_vararg) 在结果落位后更新。
     pub mret_end: usize,
-    /// 产出 `mret_end` 时的帧 base —— 只有与当前 `base` 相同才可信。
-    /// C 的 `L->top` 在每个帧切换点都被重设(`precall` = `ci->top`, `poscall` = 结果末尾),
-    /// 因此旧帧遗留的「上一指令产出末尾」必须在进入新帧后失效, 否则本帧 `OP_CALL` 的
-    /// b==0 会把它当成实参末尾(实测: 多算/少算实参, 见 db.lua/events.lua)。
-    pub mret_frame: usize,
     /// 最内层 **Lua 帧** 的寄存器上界 (`ci->top`); 0 = 当前在 C 帧里 (C API 自管 live top)。
     ///
     /// 为什么要独立字段: 帧上界无法每处现算 —— 内联的 C 函数 (BuiltinFn / CClosure)
@@ -396,7 +391,6 @@ impl<'a> LuaState<'a> {
             protos: Rc::new(Vec::new()),
             top: 0,
             mret_end: 0,
-            mret_frame: 0,
             lua_frame_ceiling: 0,
             base: 0,
             pc: 0,
@@ -1128,18 +1122,21 @@ impl<'a> LuaState<'a> {
     #[inline(always)]
     pub fn set_mret_end(&mut self, end: usize) {
         self.mret_end = end;
-        self.mret_frame = self.base;
     }
 
-    /// 本帧最近一次产出的末尾 —— 对应 C 的 `L->top`(OP_CALL b==0 读它取实参个数)。
-    /// 帧不匹配时视为「无产出」(返回 `a + 1` 表示 0 个实参)。
+    /// 最近一次产出的末尾 —— 对应 C 的 `L->top` (`OP_CALL` b==0 读它取实参个数)。
+    /// 语义与 C 一致: 它是**单一**字段, 在每个帧切换点被重设(帧入口清 0, 返回/调用
+    /// 结束时写成结果末尾), 因此不存在「跨帧残留」问题 —— 帧入口的 `reset_mret()` 负责。
     #[inline(always)]
     pub fn mret_payload_end(&self, a: usize) -> usize {
-        if self.mret_frame == self.base {
-            self.mret_end
-        } else {
-            a + 1
-        }
+        let _ = a;
+        self.mret_end
+    }
+
+    /// 进入新的 Lua 帧: 清掉上一帧遗留的产出末尾 (对应 C 的 `luaD_precall` 重设 `L->top`)。
+    #[inline(always)]
+    pub fn reset_mret(&mut self) {
+        self.mret_end = 0;
     }
 
     pub fn adjust_results(&mut self, a: usize, nresults: i32, mut results: Vec<TValue<'a>>) {

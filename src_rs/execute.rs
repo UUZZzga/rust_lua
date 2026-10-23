@@ -1117,6 +1117,7 @@ impl VmExecutor {
         // 进入 VM 时刷新最内层 Lua 帧上界 (覆盖所有进入路径: CLI docall / capi lua_call /
         // 协程 resume / 元方法 pcall; C 帧保持原值)
         state.recompute_lua_frame_ceiling();
+        state.reset_mret(); // 进入 (新) Lua 帧执行: 产出末尾清零 (C: precall 重设 L->top)
 
         // 帧切换后刷新指令流缓存 (fast_unsafe: 裸指针四件套, 免每指令 deref;
         // 安全版: Rc 句柄, 索引时边界检查)。调用点: CALL/TAILCALL/RETURN*/
@@ -1215,11 +1216,7 @@ impl VmExecutor {
             // 之下, 所有寄存器读以 top 为上界; 且 hook 帧/元方法帧都从 top 起压入 —— 若
             // hook 在抬高之前运行, 它的帧会盖住上一条指令的多返回值 (实测 db.lua/events.lua
             // 的 `{f(table.unpack(...))}` 丢元素)。
-            let mret_live = if state.mret_frame == state.base {
-                state.mret_end
-            } else {
-                0
-            };
+            let mret_live = state.mret_end;
             let live_bound = if mret_live > state.lua_frame_ceiling {
                 mret_live
             } else {
@@ -3429,24 +3426,9 @@ impl VmExecutor {
         //    若不恢复, state.top > stack.len() 导致后续 SETLIST 越界)
         let saved_stack_len = state.stack.len();
         let saved_state_top = state.top;
-        #[cfg(not(feature = "fast_unsafe"))]
-        {
-            let payload = if state.mret_frame == state.base {
-                state.mret_end
-            } else {
-                0
-            };
-            if saved_stack_len < payload || saved_stack_len < state.top {
-                eprintln!(
-                    "HOOK-TRUNC-BELOW-LIVE saved_len={} top={} mret={} mframe={} base={} event={}",
-                    saved_stack_len, state.top, state.mret_end, state.mret_frame, state.base, event
-                );
-            }
-        }
         // 多返回值交接字段同样要保存: hook 里执行的 Lua 代码会更新它, 而 hook 结束后
         // 调用点可能仍处于「上一条指令产出多返回值」的位置 (如 SETLIST 的 c==0)。
         let saved_mret_end = state.mret_end;
-        let saved_mret_frame = state.mret_frame;
         // scratch (hook 帧) 压在帧上界之上 (对应 C 的 luaD_hook 前 `savestate`)
         state.savestate();
 
@@ -3528,7 +3510,8 @@ impl VmExecutor {
         state.truncate_live(saved_stack_len);
         state.top = saved_state_top;
         state.mret_end = saved_mret_end;
-        state.mret_frame = saved_mret_frame;
+        state.reset_mret();
+        state.mret_end = saved_mret_end;
 
         // 对应 C 的 L->allowhook = 1 (恢复 hook)
         state.allowhook = true;
@@ -6216,6 +6199,7 @@ impl VmExecutor {
             // (对应 C 的 luaD_precall: 缺失的固定参数补 nil 并计入 L->top,
             //  故 top = func + 1 + max(nargs, nfixparams))
             state.top = a + 1 + nargs.max(nfixparams);
+            state.reset_mret(); // 新帧: 丢弃上一帧遗留的产出末尾 (C: precall 重设 L->top)
         } else {
             let frame_end = a + 1 + fsize;
             if state.stack.len() < frame_end {
@@ -6262,9 +6246,26 @@ impl VmExecutor {
                     // 对应 C: for (st = L->top; st > func; st--) setobj(st, st-1);
                     // 在位置 a 插入 __call 函数,原 table 和所有参数右移 1 位
                     // 调用变为 __call(original_value, original_args...)
-                    state.stack[a..state.top + 1].rotate_right(1);
+                    // 右移范围止于**实参末尾** (C 的 L->top), 不能用 state.top —— 新模型下
+                    // state.top 是帧寄存器上界(远大于实参末尾), 会把死寄存器一并搬动。
+                    // 实参末尾: b==0 取多返回值产出末尾, 否则 a+b。
+                    let args_end = if b == 0 {
+                        state.mret_payload_end(a)
+                    } else {
+                        a + b
+                    };
+                    if args_end + 1 > state.stack.len() {
+                        state.ensure_scratch_to(args_end + 1);
+                    }
+                    state.stack[a..args_end + 1].rotate_right(1);
                     state.stack[a] = call_fn.clone();
-                    state.top += 1;
+                    if b == 0 {
+                        // 插入的 self 使实参末尾右移一位 (对应 C 的 `L->top.p++`); 只动
+                        // 产出末尾, 不动 state.top —— 后者是 C 帧内 lua_gettop 的依据。
+                        state.set_mret_end(args_end + 1);
+                    } else {
+                        state.top = args_end + 1;
+                    }
                     // 对应 C 的 luaT_tryfuncTM: 只 `L->top.p++` 一次 (插入 __call 占位),
                     // 固定参数个数时再 `narg1++` 反映多出来的 self。
                     // MULTRET (b == 0) 时**不能**再抬一次 top: 调用方按 top 数实参,
@@ -6411,8 +6412,9 @@ impl VmExecutor {
                     // 设置 state.top 供 VARARGPREP 计算 totalargs
                     // (缺失固定参数已补 nil 并计入 live top, 与 C luaD_precall 一致)
                     state.top = a + 1 + nargs.max(nfixparams);
-                    // VARARGPREP 会扩展栈到 fsize 并更新 self.top
-                    // call hook 对 vararg 函数在 VARARGPREP 中触发
+                    state.reset_mret(); // 新帧 (C: precall 重设 L->top)
+                                        // VARARGPREP 会扩展栈到 fsize 并更新 self.top
+                                        // call hook 对 vararg 函数在 VARARGPREP 中触发
                 } else {
                     // 非 vararg 函数: 直接扩展到 fsize
                     // perf: fast_resize_stack_nil 用 slice::fill 填充 Nil, 比 Vec::resize 更轻量
@@ -6907,9 +6909,26 @@ impl VmExecutor {
                 if let Some(call_fn) = call_fn {
                     // 对应 C 的 luaT_tryfuncTM: 在 a 处插入 __call, 原有值及参数右移一位
                     state.ensure_scratch_to(state.top + 1);
-                    state.stack[a..state.top + 1].rotate_right(1);
+                    // 右移范围止于**实参末尾** (C 的 L->top), 不能用 state.top —— 新模型下
+                    // state.top 是帧寄存器上界(远大于实参末尾), 会把死寄存器一并搬动。
+                    // 实参末尾: b==0 取多返回值产出末尾, 否则 a+b。
+                    let args_end = if b == 0 {
+                        state.mret_payload_end(a)
+                    } else {
+                        a + b
+                    };
+                    if args_end + 1 > state.stack.len() {
+                        state.ensure_scratch_to(args_end + 1);
+                    }
+                    state.stack[a..args_end + 1].rotate_right(1);
                     state.stack[a] = call_fn.clone();
-                    state.top += 1;
+                    if b == 0 {
+                        // 插入的 self 使实参末尾右移一位 (对应 C 的 `L->top.p++`); 只动
+                        // 产出末尾, 不动 state.top —— 后者是 C 帧内 lua_gettop 的依据。
+                        state.set_mret_end(args_end + 1);
+                    } else {
+                        state.top = args_end + 1;
+                    }
                     if b > 0 {
                         b += 1;
                     }
@@ -7001,7 +7020,8 @@ impl VmExecutor {
                     // 设置 state.top 供 VARARGPREP 计算 totalargs (对应 C 的 L->top = ra + b)
                     // 缺失固定参数已补 nil 并计入 live top, 与 C luaD_precall 一致
                     state.top = func_slot + 1 + nargs.max(nfixparams);
-                    // call hook 对 vararg 函数在 VARARGPREP 中触发 (tail call 事件)
+                    state.reset_mret(); // 新帧 (尾调用, C: precall 重设 L->top)
+                                        // call hook 对 vararg 函数在 VARARGPREP 中触发 (tail call 事件)
                 } else {
                     let frame_end = func_slot + 1 + fsize;
                     // 对应 C 的 ci->top = ci->func.p + 1 + p->maxstacksize
@@ -8016,16 +8036,6 @@ impl VmExecutor {
         // 可能不截断 Vec (待清除区域全是 trivial 类型时仅设 top), stack.len() > top,
         // 用 stack.len() 会多读 stale 栈元素 (如 packvalue 的局部变量 id)。
         let n_actual = if n == 0 {
-            eprintln!(
-                "SETLIST n==0 ra={} base={} mret={} mframe={} ceil={} top={} payload={}",
-                ra,
-                state.base,
-                state.mret_end,
-                state.mret_frame,
-                state.lua_frame_ceiling,
-                state.top,
-                state.mret_payload_end(ra)
-            );
             state.mret_payload_end(ra).saturating_sub(ra + 1)
         } else {
             n

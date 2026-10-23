@@ -2191,6 +2191,10 @@ fn call_wrap_fn<'a>(
             }
         }
     }
+    // 记录产出末尾: 调用点的 `OP_CALL b==0` / `OP_SETLIST c==0` 按它取个数
+    // (对应 C 的 `L->top = res + nres`)。漏记会让 `{co()}` / `select("#", co())`
+    // 看到 0 个值 (locals.lua:901, coroutine.lua:25/62)。
+    state.set_mret_end(state.top);
 
     Ok(())
 }
