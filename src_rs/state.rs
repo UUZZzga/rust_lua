@@ -782,8 +782,9 @@ impl<'a> LuaState<'a> {
     /// 多填的开销被 high-water 摊销 (scratch_end 单调, 只在栈首次达到新深度时补齐)。
     #[inline(always)]
     pub fn frame_floor(&self) -> usize {
-        debug_assert_eq!(self.stack.len(), self.stack.capacity());
-        debug_assert!(self.top <= self.stack.len());
+        debug_assert!(self.stack.len() <= self.stack.capacity());
+        // 已准备水位由本函数/调用点推进, 此处只能断言物理容量 (见 CLAUDE.md 栈布局不变量)
+        debug_assert!(self.top <= self.stack.capacity());
         debug_assert!(self.base <= self.top);
 
         let base = self.base;
@@ -793,6 +794,23 @@ impl<'a> LuaState<'a> {
             base
         };
         anchor + crate::opcodes::MAX_FSTACK as usize + 1
+    }
+
+    /// 对应 C 的 `savestate(L, ci)` / `Protect`: 把 live top 抬到当前帧的寄存器上界
+    /// (`ci->top.p`; 本实现取保守上界 [`Self::frame_floor`])。
+    ///
+    /// C 的用法是「可能抛错 / 可能回收 / 可能重入的代码前调用一次」(op_arith 的元方法
+    /// 分支走 `Protect(luaT_trybinTM)`; `luaD_hook` / `luaD_pcall` / `checkGC` 各有对应
+    /// 形式)。**有了它, 寄存器写 (`s2v(ra) = ...`, OP_ADD / OP_MOVE) 不需要任何 top
+    /// 维护** —— 随后的元方法临时帧 / hook / C API 压栈都从帧上界之上开始, 不会覆盖
+    /// 本帧仍有效的寄存器, 也不会落在 GC 根扫描范围之外。
+    #[inline(always)]
+    pub fn savestate(&mut self) {
+        debug_assert!(self.stack.len() <= self.stack.capacity());
+        let floor = self.frame_floor();
+        if self.top < floor {
+            self.top = floor;
+        }
     }
 
     /// 丢弃 scratch 承诺 (栈被整体替换 / 值被移出栈) 并立即按当前帧重建 ——
@@ -807,10 +825,15 @@ impl<'a> LuaState<'a> {
     /// (不改变 Vector 逻辑长度 —— `len` 语义恒为精确 live top)。
     #[inline(always)]
     pub fn pad_frame_scratch(&mut self) {
-        debug_assert_eq!(self.stack.len(), self.stack.capacity());
-        debug_assert!(self.top <= self.stack.len());
+        debug_assert!(self.stack.len() <= self.stack.capacity());
+        // 已准备水位由本函数/调用点推进, 此处只能断言物理容量 (见 CLAUDE.md 栈布局不变量)
+        debug_assert!(self.top <= self.stack.capacity());
         debug_assert!(self.base <= self.top);
-        let floor = self.frame_floor();
+        // 已准备水位必须同时覆盖 (a) 帧寄存器窗口 (frame_floor) 与 (b) 当前 live top
+        // —— 后者不能省: 协程 restore / C API 构造的栈可能让 top 高于 frame_floor
+        // (实测 `state.top = saved_top` 后 top=259 > floor=257, 于是 `truncate_live_vec`
+        // 的 `stack[n..top]` 越界 panic)。
+        let floor = self.frame_floor().max(self.top);
         self.pad_frame_scratch_slow(floor);
     }
 
@@ -818,7 +841,7 @@ impl<'a> LuaState<'a> {
     /// (如 vararg 展开按实参个数写寄存器)。
     #[inline(always)]
     pub fn ensure_scratch_to(&mut self, end: usize) {
-        debug_assert_eq!(self.stack.len(), self.stack.capacity());
+        debug_assert!(self.stack.len() <= self.stack.capacity());
         let have = if self.stack.len() > self.top {
             self.stack.len()
         } else {
@@ -832,8 +855,9 @@ impl<'a> LuaState<'a> {
     #[cold]
     #[inline(never)]
     fn pad_frame_scratch_slow(&mut self, floor: usize) {
-        debug_assert_eq!(self.stack.len(), self.stack.capacity());
-        debug_assert!(self.top <= self.stack.len());
+        debug_assert!(self.stack.len() <= self.stack.capacity());
+        // 已准备水位由本函数/调用点推进, 此处只能断言物理容量 (见 CLAUDE.md 栈布局不变量)
+        debug_assert!(self.top <= self.stack.capacity());
         debug_assert!(self.base <= self.top);
 
         // 必须从 len 开始填: [len, have) 之间可能是从未初始化过的空洞
@@ -893,7 +917,7 @@ impl<'a> LuaState<'a> {
     /// 故凡是从 Lua 栈弹值都必须走本函数。
     #[inline(always)]
     pub fn pop_slot(&mut self) -> Option<TValue<'a>> {
-        debug_assert_eq!(self.stack.len(), self.stack.capacity());
+        debug_assert!(self.stack.len() <= self.stack.capacity());
         if self.top == 0 {
             return None;
         }
@@ -907,7 +931,7 @@ impl<'a> LuaState<'a> {
     /// (`Vec::remove` 会把尾部整体左移, 在逻辑长度之外留下一个 bitwise 重复值)。
     #[inline(always)]
     pub fn remove_slot(&mut self, i: usize) -> TValue<'a> {
-        debug_assert_eq!(self.stack.capacity(), self.stack.len());
+        debug_assert!(self.stack.len() <= self.stack.capacity());
         debug_assert!(i < self.top);
         let v = self.stack.remove(i);
         // Vec::remove 让 len 比 capacity 少 1; 在尾部补回一个已初始化的 Nil 槽,
@@ -925,9 +949,9 @@ impl<'a> LuaState<'a> {
     /// top 不受影响 —— 与原 truncate 一致, 由调用方按需设置。
     #[inline(always)]
     pub fn truncate_live(&mut self, n: usize) {
-        debug_assert_eq!(self.stack.capacity(), self.stack.len());
+        debug_assert!(self.stack.len() <= self.stack.capacity());
         truncate_live_vec(&mut self.stack, self.top, n);
-        debug_assert_eq!(self.stack.capacity(), self.stack.len());
+        debug_assert!(self.stack.len() <= self.stack.capacity());
         self.top = n;
     }
 }
@@ -985,8 +1009,9 @@ impl<'a> LuaState<'a> {
     /// 设置 pending_return_adjust，由 op_call 在 return hook 后执行 adjust。
     /// 这样 return hook 中的 debug.getlocal 能从栈上读到返回值。
     pub fn adjust_results(&mut self, a: usize, nresults: i32, mut results: Vec<TValue<'a>>) {
-        debug_assert_eq!(self.stack.capacity(), self.stack.len());
-        debug_assert!(self.top <= self.stack.len());
+        debug_assert!(self.stack.len() <= self.stack.capacity());
+        // 已准备水位由本函数/调用点推进, 此处只能断言物理容量 (见 CLAUDE.md 栈布局不变量)
+        debug_assert!(self.top <= self.stack.capacity());
         debug_assert!(self.base <= self.top);
 
         // 如果 return hook 启用且允许调用 hook，先把 results 放到栈顶之上（不 truncate），
@@ -1420,7 +1445,7 @@ impl<'a> LuaState<'a> {
                         // move closure 避免 clone + Box 堆分配
                         closure: Some(closure),
                         base: caller_base,
-                        func: (caller_base).saturating_sub(1),
+                        func: self.cur_func(),
                         saved_pc: caller_pc,
                         name: None,
                         namewhat: "",
@@ -2018,7 +2043,7 @@ impl<'a> LuaState<'a> {
             is_c: true,
             closure: None,
             base: func_idx + 1,
-            func: (func_idx + 1).saturating_sub(1),
+            func: func_idx,
             saved_pc: 0,
             name: None,
             namewhat: "",
@@ -2169,7 +2194,7 @@ impl<'a> LuaState<'a> {
             is_c: true,
             closure: None,
             base: func_idx + 1,
-            func: (func_idx + 1).saturating_sub(1),
+            func: func_idx,
             saved_pc: 0,
             name: Some(name),
             namewhat: "function",
@@ -2259,7 +2284,7 @@ impl<'a> LuaState<'a> {
     }
 
     pub fn settop(&mut self, idx: usize) {
-        debug_assert_eq!(self.stack.len(), self.stack.capacity());
+        debug_assert!(self.stack.len() <= self.stack.capacity());
         debug_assert!(idx <= self.stack.len());
         self.top = idx;
     }
@@ -2273,7 +2298,7 @@ impl<'a> LuaState<'a> {
     ///   return (idx > 0 || is_pseudo(idx)) ? idx : cast_int(L->top - L->ci->func) + idx + 1
     /// 其中 L->top - L->ci->func 等价于 stack.len()（函数帧内有效元素数）
     pub fn abs_index(&self, idx: isize) -> usize {
-        debug_assert_eq!(self.stack.len(), self.stack.capacity());
+        debug_assert!(self.stack.len() <= self.stack.capacity());
         let len = self.top as isize;
         if idx > 0 {
             idx as usize
@@ -2288,7 +2313,7 @@ impl<'a> LuaState<'a> {
     }
 
     pub fn rotate(&mut self, idx: isize, n: isize) {
-        debug_assert_eq!(self.stack.len(), self.stack.capacity());
+        debug_assert!(self.stack.len() <= self.stack.capacity());
         let abs = self.abs_index(idx);
         if abs == 0 || abs > self.top {
             return;
@@ -2321,13 +2346,13 @@ impl<'a> LuaState<'a> {
 
     #[inline]
     pub fn push_value(&mut self, val: TValue<'a>) {
-        debug_assert_eq!(self.stack.len(), self.stack.capacity());
+        debug_assert!(self.stack.len() <= self.stack.capacity());
         if self.top < self.stack.len() {
             self.stack[self.top] = val;
         } else {
+            // push 会按摊还策略扩容 capacity; 这里**不**把 len 顶到 capacity
+            // (否则下一次 push/reserve 必翻倍 —— 见 MemState::prepare_slots)。
             self.stack.push(val);
-            self.stack
-                .resize(self.stack.capacity(), TValue::Nil(NilKind::Empty));
         }
         self.top += 1;
     }
@@ -2433,9 +2458,8 @@ impl<'a> LuaState<'a> {
         let needed = self.stack.len() + extra;
         if needed > self.stack.capacity() {
             self.stack.reserve(extra);
-            self.stack
-                .resize(self.stack.capacity(), TValue::Nil(NilKind::Empty));
         }
+        self.prepare_slots(needed);
         true
     }
 
@@ -3075,7 +3099,7 @@ impl<'a> GlobalState<'a> {
     /// pub(crate)：capi 的 lua_newthread 需要为新线程做同样的 stack_init。
     pub(crate) fn init_stack() -> Vec<TValue<'a>> {
         let mut stack = Vec::with_capacity(BASIC_STACK_SIZE + EXTRA_STACK);
-        stack.resize(stack.capacity(), TValue::Nil(NilKind::Strict));
+        stack.resize(BASIC_STACK_SIZE + EXTRA_STACK, TValue::Nil(NilKind::Strict));
         stack
     }
 }

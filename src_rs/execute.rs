@@ -73,12 +73,14 @@ macro_rules! arith_bin2 {
     ($drop_queue:expr, $stack:expr, $top:expr, $pc:expr, $a:expr, $v1:expr, $v2:expr, $op:tt, $int_method:ident) => {{
         match ($v1, $v2) {
             (TValue::Integer(i1), TValue::Integer(i2)) => {
-                Self::write_stack($drop_queue, $stack, $top, $a, TValue::Integer((*i1).$int_method(*i2)));
+                Self::write_stack($drop_queue, $stack, *$top, $a, TValue::Integer((*i1).$int_method(*i2)));
+                Self::note_reg_write($top, $a);
                 *$pc += 1; // skip MMBIN
             }
             _ => {
                 if let (Some(n1), Some(n2)) = (to_number_ns($v1), to_number_ns($v2)) {
-                    Self::write_stack($drop_queue, $stack, $top, $a, TValue::Float(n1 $op n2));
+                    Self::write_stack($drop_queue, $stack, *$top, $a, TValue::Float(n1 $op n2));
+                    Self::note_reg_write($top, $a);
                     *$pc += 1; // skip MMBIN
                 }
             }
@@ -1256,12 +1258,10 @@ impl VmExecutor {
                         &mut state.stack,
                         constants_slice,
                         base,
-                        state.top,
+                        &mut state.top,
                         inst,
                         &mut pc,
                     );
-                    // 同上: op_addk 也走 arith_bin2! 原地写
-                    Self::raise_reg_top(state, Self::ra(base, inst));
                     r
                 }
                 OpCode::SUBK => {
@@ -1270,12 +1270,10 @@ impl VmExecutor {
                         &mut state.stack,
                         constants_slice,
                         base,
-                        state.top,
+                        &mut state.top,
                         inst,
                         &mut pc,
                     );
-                    // 同上: op_subk 也走 arith_bin2! 原地写
-                    Self::raise_reg_top(state, Self::ra(base, inst));
                     r
                 }
                 OpCode::MULK => {
@@ -1284,12 +1282,10 @@ impl VmExecutor {
                         &mut state.stack,
                         constants_slice,
                         base,
-                        state.top,
+                        &mut state.top,
                         inst,
                         &mut pc,
                     );
-                    // 同上: op_mulk 也走 arith_bin2! 原地写
-                    Self::raise_reg_top(state, Self::ra(base, inst));
                     r
                 }
                 OpCode::MODK => Self::op_modk(base, state, inst, pc - 1, &mut pc),
@@ -1302,12 +1298,10 @@ impl VmExecutor {
                         &mut state.stack,
                         constants_slice,
                         base,
-                        state.top,
+                        &mut state.top,
                         inst,
                         &mut pc,
                     );
-                    // 快路径原地写结果寄存器 (切片签名无法更新 top): 补抬 live top
-                    Self::raise_reg_top(state, Self::ra(base, inst));
                     r
                 }
                 OpCode::SUB => {
@@ -1316,12 +1310,10 @@ impl VmExecutor {
                         &mut state.stack,
                         constants_slice,
                         base,
-                        state.top,
+                        &mut state.top,
                         inst,
                         &mut pc,
                     );
-                    // 快路径原地写结果寄存器 (切片签名无法更新 top): 补抬 live top
-                    Self::raise_reg_top(state, Self::ra(base, inst));
                     r
                 }
                 OpCode::MUL => {
@@ -1330,12 +1322,10 @@ impl VmExecutor {
                         &mut state.stack,
                         constants_slice,
                         base,
-                        state.top,
+                        &mut state.top,
                         inst,
                         &mut pc,
                     );
-                    // 快路径原地写结果寄存器 (切片签名无法更新 top): 补抬 live top
-                    Self::raise_reg_top(state, Self::ra(base, inst));
                     r
                 }
                 OpCode::MOD => Self::op_mod(base, state, inst, pc - 1, &mut pc),
@@ -2321,30 +2311,28 @@ impl VmExecutor {
         }
     }
 
-    /// 算术快路径专用: 切片签名（`arith_bin2!`）原地写寄存器 `a` 后, 由调用点补上
-    /// 「寄存器写抬高 live top」这条不变量（与 [`Self::write_stack_state`] 一致）。
-    /// 不补的话, 落在 `top` 之上的结果寄存器会被紧随的元方法 / C API scratch 覆盖,
-    /// 且不在 GC 根范围内 —— 安全构建（`--no-default-features`）的 `read_stack`
-    /// 边界检查会直接以 `read_stack 越界` 暴露（capi::tests::test_c_call_multret_arity）。
+    /// 寄存器写抬高 live top —— 不变量: `state.top` 恒为「已写入寄存器上界 + 1」,
+    /// 因此 ① 以 top 为起点的 scratch 压入 (元方法临时帧 / hook / C API 压栈) 不会覆盖
+    /// 本帧仍有效的寄存器, ② GC 根扫描 `[..top)` 覆盖它们。
+    ///
+    /// 对应 C 里 `Protect`/`savestate` 在「可能抛错 / 回收 / 重入」前把 `L->top` 复位到
+    /// `ci->top` 的作用 —— 本实现的栈是单字段 (len == capacity, 物理全初始化), 于是把
+    /// 这条不变量收敛在**写入口** (本函数 + [`Self::write_stack_state`] +
+    /// [`Self::copy_stack_slot_state`] + `arith_bin2!`) 里, 调用点不需要任何手动修正。
     #[inline(always)]
-    fn raise_reg_top(state: &mut LuaState, idx: usize) {
-        if idx >= state.top {
-            state.top = idx + 1;
+    fn note_reg_write(top: &mut usize, idx: usize) {
+        if idx >= *top {
+            *top = idx + 1;
         }
     }
 
     #[inline(always)]
     pub(crate) fn write_stack_state<'a>(state: &mut LuaState<'a>, idx: usize, val: TValue<'a>) {
-        debug_assert_eq!(state.stack.len(), state.stack.capacity());
+        debug_assert!(state.stack.len() <= state.stack.capacity());
         debug_assert!(idx < state.stack.len());
         Self::write_stack(&mut state.drop_queue, &mut state.stack, state.top, idx, val);
-        // 寄存器写抬高 live top (idx 之上仍为已初始化的帧 scratch)。元方法调用 /
-        // C API 压栈等以 `top` 为 scratch 起点的路径因此不会覆盖仍有效的寄存器
-        // (C 里由 Protect/savestate 把 L->top 复位到 ci->top, 这里用高水位等价实现)。
-        if idx >= state.top {
-            state.top = idx + 1;
-        }
-        debug_assert!(state.top <= state.stack.len());
+        Self::note_reg_write(&mut state.top, idx);
+        debug_assert!(state.top <= state.stack.capacity());
     }
 
     /// 延迟释放: 把旧槽值挂到 `drop_queue`, 真正的 `Rc::drop` 推迟到队列排空时。
@@ -2449,16 +2437,7 @@ impl VmExecutor {
             dst_idx,
             src_idx,
         );
-        // 寄存器写必须抬高 live top —— 同 write_stack_state。两个后果都依赖它:
-        // 元方法调用 / C API 压栈把 `top` 当作压入起点 (对应 C 的 Protect/savestate
-        // 把 L->top 复位到 ci->top)，GC 根扫描只覆盖 `[..top)`。旧实现里这条在
-        // `copy_stack_slot` 内 (`state.top = state.top.max(dst_idx + 1)`)，1a87f95 把
-        // 该函数签名改成裸切片 `&mut [TValue]` 时漏了它 —— 于是 `MOVE` 到 top 之上的
-        // 寄存器后 top 不动，紧随的元方法调用按 top 取 scratch 直接覆盖该寄存器
-        // (实测: main chunk 里 `print("D", g(o + 1))` 的 g 被元方法结果覆盖)。
-        if dst_idx >= state.top {
-            state.top = dst_idx + 1;
-        }
+        Self::note_reg_write(&mut state.top, dst_idx);
     }
 
     /// 读取栈槽 — VM 字节码路径专用 (idx 保证在范围内)
@@ -2542,15 +2521,12 @@ impl VmExecutor {
     /// fast_truncate_stack 的 set_len 跳过 drop, 或被 Vec::truncate 已 drop).
     #[cfg_attr(not(size_optimized), inline(always))]
     pub(crate) fn fast_resize_stack_nil<'a>(state: &mut LuaState, new_len: usize) {
-        debug_assert_eq!(state.stack.capacity(), state.stack.len());
+        debug_assert!(state.stack.len() <= state.stack.capacity());
         // fast_unsafe 关闭: 直接 Vec::resize (语义等价, 慢在泛型 iter + clone)
         #[cfg(not(feature = "fast_unsafe"))]
         {
             if new_len > state.stack.len() {
                 state.stack.resize(new_len, TValue::Nil(NilKind::Strict));
-                state
-                    .stack
-                    .resize(state.stack.capacity(), TValue::Nil(NilKind::Strict));
             }
         }
         #[cfg(feature = "fast_unsafe")]
@@ -2574,11 +2550,13 @@ impl VmExecutor {
             unsafe {
                 let ptr = stack.as_mut_ptr().add(old_len);
                 let nil_val = TValue::Nil(NilKind::Strict);
-                let count = stack.capacity() - old_len;
+                // 只填到 new_len —— 顶到 capacity 会让下一次 reserve 必翻倍 (见
+                // MemState::prepare_slots)。
+                let count = new_len - old_len;
                 for i in 0..count {
                     std::ptr::write(ptr.add(i), nil_val.clone());
                 }
-                stack.set_len(stack.capacity());
+                stack.set_len(new_len);
             }
         }
     }
@@ -3404,7 +3382,7 @@ impl VmExecutor {
             is_c: false,
             closure: hook_closure,
             base: hook_base,
-            func: (hook_base).saturating_sub(1),
+            func: hook_base.saturating_sub(1),
             saved_pc: state.pc,
             name: Some("?"),
             namewhat: "hook",
@@ -4479,14 +4457,14 @@ impl VmExecutor {
         stack: &mut [TValue<'a>],
         constants: &[TValue<'a>],
         base: usize,
-        top: usize,
+        top: &mut usize,
         inst: Instruction,
         pc: &mut usize,
     ) -> Result<(), VmError<'a>> {
         let a = Self::ra(base, inst);
         let b = Self::rb(base, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        let v1 = Self::read_stack(stack, top, b);
+        let v1 = Self::read_stack(stack, *top, b);
         let v2 = unsafe { constants.get_unchecked(c_key) };
         arith_bin2!(drop_queue,stack,top, pc, a, v1, v2, +, wrapping_add);
         Ok(())
@@ -4498,14 +4476,14 @@ impl VmExecutor {
         stack: &mut [TValue<'a>],
         constants: &[TValue<'a>],
         base: usize,
-        top: usize,
+        top: &mut usize,
         inst: Instruction,
         pc: &mut usize,
     ) -> Result<(), VmError<'a>> {
         let a = Self::ra(base, inst);
         let b = Self::rb(base, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        let v1 = Self::read_stack(stack, top, b);
+        let v1 = Self::read_stack(stack, *top, b);
         let v2 = unsafe { constants.get_unchecked(c_key) };
         arith_bin2!(drop_queue,stack,top, pc, a, v1, v2, -, wrapping_sub);
         Ok(())
@@ -4517,14 +4495,14 @@ impl VmExecutor {
         stack: &mut [TValue<'a>],
         constants: &[TValue<'a>],
         base: usize,
-        top: usize,
+        top: &mut usize,
         inst: Instruction,
         pc: &mut usize,
     ) -> Result<(), VmError<'a>> {
         let a = Self::ra(base, inst);
         let b = Self::rb(base, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        let v1 = Self::read_stack(stack, top, b);
+        let v1 = Self::read_stack(stack, *top, b);
         let v2 = unsafe { constants.get_unchecked(c_key) };
         arith_bin2!(drop_queue,stack,top, pc, a, v1, v2, *, wrapping_mul);
         Ok(())
@@ -4754,7 +4732,7 @@ impl VmExecutor {
         stack: &mut [TValue<'a>],
         _constants: &[TValue<'a>],
         base: usize,
-        top: usize,
+        top: &mut usize,
         inst: Instruction,
         pc: &mut usize,
     ) -> Result<(), VmError<'a>> {
@@ -4762,8 +4740,8 @@ impl VmExecutor {
         let a = Self::ra(base, inst);
         let b = Self::rb(base, inst);
         let c = Self::rc(base, inst);
-        let v1 = Self::read_stack(stack, top, b);
-        let v2 = Self::read_stack(stack, top, c);
+        let v1 = Self::read_stack(stack, *top, b);
+        let v2 = Self::read_stack(stack, *top, c);
         arith_bin2!(drop_queue,stack,top, pc, a, v1, v2, +, wrapping_add);
         Ok(())
     }
@@ -4774,15 +4752,15 @@ impl VmExecutor {
         stack: &mut [TValue<'a>],
         _constants: &[TValue<'a>],
         base: usize,
-        top: usize,
+        top: &mut usize,
         inst: Instruction,
         pc: &mut usize,
     ) -> Result<(), VmError<'a>> {
         let a = Self::ra(base, inst);
         let b = Self::rb(base, inst);
         let c = Self::rc(base, inst);
-        let v1 = Self::read_stack(stack, top, b);
-        let v2 = Self::read_stack(stack, top, c);
+        let v1 = Self::read_stack(stack, *top, b);
+        let v2 = Self::read_stack(stack, *top, c);
         arith_bin2!(drop_queue,stack,top, pc, a, v1, v2, -, wrapping_sub);
         Ok(())
     }
@@ -4793,15 +4771,15 @@ impl VmExecutor {
         stack: &mut [TValue<'a>],
         _constants: &[TValue<'a>],
         base: usize,
-        top: usize,
+        top: &mut usize,
         inst: Instruction,
         pc: &mut usize,
     ) -> Result<(), VmError<'a>> {
         let a = Self::ra(base, inst);
         let b = Self::rb(base, inst);
         let c = Self::rc(base, inst);
-        let v1 = Self::read_stack(stack, top, b);
-        let v2 = Self::read_stack(stack, top, c);
+        let v1 = Self::read_stack(stack, *top, b);
+        let v2 = Self::read_stack(stack, *top, c);
         arith_bin2!(drop_queue,stack,top, pc, a, v1, v2, *, wrapping_mul);
         Ok(())
     }
@@ -5979,7 +5957,7 @@ impl VmExecutor {
             is_c: true,
             closure: None,
             base: a + 1,
-            func: (a + 1).saturating_sub(1),
+            func: a,
             saved_pc: state.pc,
             name: Some(bf.name_str()),
             namewhat: "function",
@@ -6003,7 +5981,7 @@ impl VmExecutor {
             is_c: true,
             closure: None,
             base: a + 1,
-            func: (a + 1).saturating_sub(1),
+            func: a,
             saved_pc: state.pc,
             name: Some(bf.name_str()),
             namewhat: "function",
@@ -6093,7 +6071,7 @@ impl VmExecutor {
             is_c: false,
             closure: Some(closure),
             base: state.base,
-            func: (state.base).saturating_sub(1),
+            func: state.base.saturating_sub(1),
             saved_pc: state.pc,
             name: None,
             namewhat: "",
@@ -6278,7 +6256,7 @@ impl VmExecutor {
                     is_c: false,
                     closure: Some(closure),
                     base: state.base,
-                    func: (state.base).saturating_sub(1),
+                    func: state.base.saturating_sub(1),
                     saved_pc: state.pc,
                     name: None,
                     namewhat: "",
@@ -6378,7 +6356,7 @@ impl VmExecutor {
                     is_c: true,
                     closure: None,
                     base: a + 1,
-                    func: (a + 1).saturating_sub(1),
+                    func: a,
                     saved_pc: state.pc,
                     name: Some(c_name),
                     namewhat: c_namewhat,
@@ -6416,7 +6394,7 @@ impl VmExecutor {
                         is_c: true,
                         closure: None,
                         base: a + 1,
-                        func: (a + 1).saturating_sub(1),
+                        func: a,
                         saved_pc: state.pc,
                         name: Some(c_name),
                         namewhat: c_namewhat,
@@ -6546,7 +6524,7 @@ impl VmExecutor {
             is_c: true,
             closure: None,
             base: a + 1,
-            func: (a + 1).saturating_sub(1),
+            func: a,
             saved_pc: state.pc,
             name: None,
             namewhat: "",
@@ -6758,7 +6736,7 @@ impl VmExecutor {
                         is_c: true,
                         closure: None,
                         base: a + 1,
-                        func: (a + 1).saturating_sub(1),
+                        func: a,
                         saved_pc: state.pc,
                         name: Some(bf.name_str()),
                         namewhat: "function",
@@ -6774,7 +6752,7 @@ impl VmExecutor {
                         is_c: true,
                         closure: None,
                         base: a + 1,
-                        func: (a + 1).saturating_sub(1),
+                        func: a,
                         saved_pc: state.pc,
                         name: Some(bf.name_str()),
                         namewhat: "function",
@@ -6964,7 +6942,7 @@ impl VmExecutor {
                     is_c: true,
                     closure: None,
                     base: a + 1,
-                    func: (a + 1).saturating_sub(1),
+                    func: a,
                     saved_pc: state.pc,
                     name: Some(c_name),
                     namewhat: c_namewhat,
@@ -7000,7 +6978,7 @@ impl VmExecutor {
                         is_c: true,
                         closure: None,
                         base: a + 1,
-                        func: (a + 1).saturating_sub(1),
+                        func: a,
                         saved_pc: state.pc,
                         name: Some(c_name),
                         namewhat: c_namewhat,
@@ -7758,7 +7736,7 @@ impl VmExecutor {
                     is_c: false,
                     closure: Some(closure.clone()),
                     base: state.base,
-                    func: (state.base).saturating_sub(1),
+                    func: state.base.saturating_sub(1),
                     saved_pc: state.pc,
                     name: None,
                     namewhat: "",
@@ -7818,7 +7796,7 @@ impl VmExecutor {
                     is_c: true,
                     closure: None,
                     base: ra + 4,
-                    func: (ra + 4).saturating_sub(1),
+                    func: ra + 3,
                     saved_pc: state.pc,
                     name: Some("for iterator"),
                     namewhat: "for iterator",
@@ -8371,10 +8349,12 @@ impl VmExecutor {
             }
             None => proto_frame_end,
         };
-        if frame_end > state.top {
+        if state.stack.len() < frame_end {
             Self::fast_resize_stack_nil(state, frame_end);
-            state.top = frame_end;
         }
+        // 变参序言把参数搬到更高的寄存器位, 帧上界随之变化 (C: `ci->top.p += totalargs + 1`,
+        // 随后 `Protect` 复位 L->top) —— 这里按新的帧上界复位 live top。
+        state.savestate();
 
         // 对应 C 的 OP_VARARGPREP -> luaD_hookcall: vararg 函数在 VARARGPREP 后触发 call hook
         // luaD_hookcall 检查 CIST_TAIL 决定事件类型: 尾调用触发 "tail call", 否则 "call"

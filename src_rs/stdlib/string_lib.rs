@@ -3596,7 +3596,7 @@ fn call_str_upper<'a>(
     _nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError<'a>> {
-    debug_assert_eq!(state.stack.capacity(), state.stack.len());
+    debug_assert!(state.stack.len() <= state.stack.capacity());
     let s = get_str_arg(state, a, 0)?;
     let result = str_upper(&s);
     push_results(state, a, nresults, vec![(state.intern_str(&result))]);

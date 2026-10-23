@@ -289,9 +289,7 @@ fn call_unpack<'a>(
             .stack
             .try_reserve_exact(n)
             .map_err(|_| VmError::RuntimeError("too many results to unpack".to_string()))?;
-        state
-            .stack
-            .resize(state.stack.capacity(), TValue::Nil(NilKind::Empty));
+        state.prepare_slots(state.stack.len() + n);
     }
 
     // 直接 push 到 state.stack，不创建中间 Vec

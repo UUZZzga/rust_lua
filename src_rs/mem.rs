@@ -710,13 +710,31 @@ impl<'a> crate::state::LuaState<'a> {
     /// 栈容量预留漏斗 —— 对应 C 的 `luaD_growstack`（栈数组经 `luaM_reallocvector`，
     /// 失败先紧急 GC 再重试，仍失败即内存错误）。
     pub fn reserve_stack(&mut self, additional: usize) -> Result<(), VmError<'a>> {
+        let need = self.stack.len() + additional;
         let res =
             self.retry_alloc_mut(|st| st.stack.try_reserve(additional).map_err(|_| AllocFailed));
         if res.is_ok() {
-            self.stack
-                .resize(self.stack.capacity(), TValue::Nil(NilKind::Empty));
+            self.prepare_slots(need);
         }
         res
+    }
+
+    /// 把「已准备（已初始化）区」推进到 `need` —— 只前进, **不填满 capacity**。
+    ///
+    /// 不变量（修正版）: `stack.len()` = 已初始化水位, 必须覆盖任何可能被写入的槽位
+    /// （`write_stack` 的无分支写 + 旧值 drop 判定依赖它）; `stack.capacity()` 是分配量,
+    /// 两者之间的余量是**空闲储备**。
+    ///
+    /// 绝不能把 `len` 顶到 `capacity`: 那样下一次 `try_reserve(1)` 会因「无余量」触发
+    /// Vec 的摊还翻倍, 于是**每次 reserve 都把栈翻倍** —— 实测每个 `lua_createtable`
+    /// 都让 len 1280→2560→5120→…→327680, deps 测试（cjson 等 C 模块）因此 OOM/挂死。
+    /// 对应 C 的 `luaD_growstack`: 只保证**需要的那部分**可用, 栈数组本身按几何增长,
+    /// 但 `L->top` 不会被顶到数组末尾。
+    #[inline]
+    pub fn prepare_slots(&mut self, need: usize) {
+        if need > self.stack.len() {
+            self.stack.resize(need, TValue::Nil(NilKind::Empty));
+        }
     }
 
     /// 抛出内存错误 —— 对应 C 的 `luaM_error(L)` = `luaD_throw(L, LUA_ERRMEM)`。
@@ -758,16 +776,14 @@ impl<'a> crate::state::LuaState<'a> {
     /// `luaM_error`）。容量已够时直接返回，不分配。
     #[inline]
     pub fn grow_stack_or_throw(&mut self, additional: usize) {
-        debug_assert_eq!(self.stack.capacity(), self.stack.len());
-
-        if self.stack.capacity() >= self.stack.len() + additional {
-            return;
+        debug_assert!(self.stack.len() <= self.stack.capacity());
+        let need = self.stack.len() + additional;
+        if self.stack.capacity() < need {
+            if self.reserve_stack(additional).is_err() {
+                self.raise_memory_error();
+            }
         }
-        if self.reserve_stack(additional).is_err() {
-            self.raise_memory_error();
-        }
-        self.stack
-            .resize(self.stack.capacity(), TValue::Nil(NilKind::Empty));
+        self.prepare_slots(need);
     }
 }
 

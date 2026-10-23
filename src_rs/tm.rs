@@ -398,7 +398,7 @@ pub(crate) fn call_tm_res<'a>(
     res: usize,
     tm: TagMethod,
 ) -> Result<(), VmError<'a>> {
-    debug_assert_eq!(state.stack.capacity(), state.stack.len());
+    debug_assert!(state.stack.len() <= state.stack.capacity());
     let func_idx = state.top;
     // 压入函数和两个参数 (对应 C 的 setobj2s)
     state.push_value(f.clone());
@@ -423,7 +423,7 @@ pub(crate) fn call_tm_res<'a>(
         is_c: false,
         closure: None,
         base: caller_base,
-        func: (caller_base).saturating_sub(1),
+        func: state.cur_func(),
         saved_pc: caller_pc,
         name: Some(tm.event_name()),
         namewhat: "metamethod",
@@ -523,9 +523,6 @@ pub(crate) fn call_tm_res<'a>(
     // 将结果写入 res 槽位 (对应 C 的 setobjs2s(L, res, ...))
     if state.stack.len() <= res {
         state.stack.resize(res + 1, TValue::Nil(NilKind::Empty));
-        state
-            .stack
-            .resize(state.stack.capacity(), TValue::Nil(NilKind::Empty));
     }
     state.stack[res] = result;
     state.top = func_idx.max(res + 1);
@@ -586,7 +583,7 @@ pub(crate) fn call_tm<'a>(
         is_c: false,
         closure: None,
         base: caller_base,
-        func: (caller_base).saturating_sub(1),
+        func: state.cur_func(),
         saved_pc: caller_pc,
         name: Some(tm.event_name()),
         namewhat: "metamethod",
@@ -756,7 +753,7 @@ pub fn call_close_method<'a>(
         is_c: false,
         closure: None,
         base: caller_base,
-        func: (caller_base).saturating_sub(1),
+        func: state.cur_func(),
         saved_pc: caller_pc,
         name: Some("close"),
         namewhat: "metamethod",

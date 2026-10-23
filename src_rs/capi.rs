@@ -1047,7 +1047,11 @@ pub extern "C-unwind" fn lua_tocfunction(L: *mut lua_State, idx: c_int) -> Optio
 #[no_mangle]
 pub extern "C-unwind" fn lua_createtable(L: *mut lua_State, narr: c_int, nrec: c_int) {
     let L = unsafe { &mut *L };
-    if let Err(e) = L.create_table(narr.min(0) as usize, nrec.min(0) as usize) {
+    // 对应 C 的 lua_createtable: `if (narray > 0 || nrec > 0) luaH_resize(L, t, narray, nrec);`
+    // —— 负数/0 视为「不预分配」。此处必须 clamp 到 0 的下界: `min(0)` 会把负的
+    // narr/nrec 原样交给 `as usize`, 变成天文数字容量 (实测 cjson 解码嵌套数组时
+    // narr = -1 → 巨额预分配/长循环, deps 测试表现为挂死与 OOM)。
+    if let Err(e) = L.create_table(narr.max(0) as usize, nrec.max(0) as usize) {
         raise_mem_error(L, e);
     }
 }
