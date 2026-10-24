@@ -6027,6 +6027,12 @@ impl VmExecutor {
         state.top = a + 1 + nargs;
         match (bf.call_target())(state, a, nargs, nresults) {
             Ok(()) => {
+                // 记录产出末尾 (C 的 `L->top = res + nres`): 紧跟的 OP_CALL b==0 /
+                // OP_SETLIST c==0 按它取个数。内建函数自己只 push 结果 (不写 mret_end),
+                // 漏记时 MULTRET 产出的多返回值对调用者不可见 —— 实测
+                // `select("#", coroutine.running())` 得到 0 个实参 (CI all.lua 的
+                // strings.lua:176 `string.format("%p", coroutine.running())` 即此)。
+                state.set_mret_end(state.top);
                 // perf: 不写 state.pc — 主循环 CALL Fast 臂保持循环局部 pc 有效,
                 // 不回载 pc = state.pc。state.pc 在纯调用后停留在 CALL 指令索引
                 // (call_pure_builtin 前主循环已 state.pc = pc - 1)。这与所有
@@ -6539,6 +6545,8 @@ impl VmExecutor {
                 // 执行待定的返回值调整
                 if !is_yield {
                     state.finish_pending_adjust();
+                    // 记录产出末尾 (C 的 `L->top = res + nres`); 见 call_pure_builtin 处的说明
+                    state.set_mret_end(state.top);
                 }
 
                 dispatch_result?;
@@ -7160,6 +7168,8 @@ impl VmExecutor {
                 // 执行待定的返回值调整
                 if !is_yield {
                     state.finish_pending_adjust();
+                    // 记录产出末尾 (C 的 `L->top = res + nres`); 见 call_pure_builtin 处的说明
+                    state.set_mret_end(state.top);
                 }
 
                 dispatch_result?;
