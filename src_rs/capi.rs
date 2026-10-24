@@ -899,7 +899,6 @@ pub extern "C-unwind" fn lua_tointegerx(
         let st = unsafe { &*L };
         if idx == -1 {
             eprintln!(
-                "TOINT -1: top={} len={} slot={:?}",
                 st.top,
                 st.stack.len(),
                 st.stack.get(st.top.wrapping_sub(1)).map(|v| v.ty())
