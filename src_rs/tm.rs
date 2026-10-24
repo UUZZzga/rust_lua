@@ -399,6 +399,13 @@ pub(crate) fn call_tm_res<'a>(
     tm: TagMethod,
 ) -> Result<(), VmError<'a>> {
     debug_assert!(state.stack.len() <= state.stack.capacity());
+    // C 的 `luaT_callTMres` 把元方法帧压在 `L->top` (= 调用者按 opcode 设好的**逻辑**栈顶,
+    // 如 OP_CONCAT 的 `ra+n`) 之上; continuation (`luaV_finishOp`) 的算式全部以这个 `L->top`
+    // 为锚点 (`top = L->top-1`, `total = top-1-(base+a)`, `setobjs2s(top-2, top)`)。
+    // 本实现的 live top 在指令边界是帧上界, 故必须**先**记下逻辑栈顶再抬高压栈 ——
+    // 否则 `func_idx` = 帧上界, CONCAT continuation 会算错列表范围 (实测
+    // coroutine.lua 的 `a..b..c..a` 把已消费的操作数重复并入)。
+    let logical_top = state.top;
     // 压 scratch 前抬高 live top 到帧上界 (对应 C 的 `Protect(luaT_callTMres)`)
     state.savestate();
     let func_idx = state.top;
@@ -454,6 +461,7 @@ pub(crate) fn call_tm_res<'a>(
             saved_closure_upvals: Rc::clone(&caller_closure_upvals),
             saved_tbc_list: caller_tbc_list,
             func_idx: func_idx,
+            logical_top: logical_top,
             nresults: 1,
             pcall_kind: crate::state::PcallKind::Pcall,
             saved_filled: false,
@@ -563,6 +571,9 @@ pub(crate) fn call_tm<'a>(
     p3: &TValue<'a>,
     tm: TagMethod,
 ) -> Result<(), VmError<'a>> {
+    // 同 call_tm_res: continuation 锚点是 C 的 `L->top` (= 压栈前的逻辑栈顶),
+    // 必须在 savestate 抬高之前取。
+    let logical_top = state.top;
     // 压 scratch 前抬高 live top 到帧上界 (对应 C 的 `Protect(luaT_callTM)`)
     state.savestate();
     let func_idx = state.top;
@@ -615,6 +626,7 @@ pub(crate) fn call_tm<'a>(
             saved_closure_upvals: Rc::clone(&caller_closure_upvals),
             saved_tbc_list: caller_tbc_list,
             func_idx: func_idx,
+            logical_top: logical_top,
             nresults: 0,
             pcall_kind: crate::state::PcallKind::Pcall,
             saved_filled: false,
@@ -786,6 +798,7 @@ pub fn call_close_method<'a>(
             saved_closure_upvals: Rc::new(RefCell::new(UpValVec::new())),
             saved_tbc_list: None,
             func_idx: 0,
+            logical_top: 0,
             nresults: 0,
             pcall_kind: crate::state::PcallKind::Pcall,
             saved_filled: false,

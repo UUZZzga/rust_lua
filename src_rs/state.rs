@@ -93,6 +93,11 @@ pub struct PcallProtection<'a> {
     pub saved_tbc_list: Option<usize>,
     /// pcall 的 func 位置（栈索引）— 用于截断栈和放置返回值
     pub func_idx: usize,
+    /// 元方法调用时的**逻辑**栈顶 (C 的 `L->top`, 即调用者按 opcode 设好的栈顶,
+    /// 如 OP_CONCAT 的 `ra+n`) —— `luaV_finishOp` 的 continuation 算式以此为准。
+    /// 与 `func_idx` 的区别: `func_idx` 是本实现实际压帧的位置 (帧上界, 供 truncate 用),
+    /// `logical_top` 才是 C 语义里被中断指令的 `L->top`。
+    pub logical_top: usize,
     /// pcall 期望的返回值数量（-1 = MULTRET）
     pub nresults: i32,
     /// pcall 类型 — 区分 pcall 和 xpcall 的 error/return 处理
@@ -1691,6 +1696,7 @@ impl<'a> LuaState<'a> {
                             saved_closure_upvals: Rc::new(RefCell::new(UpValVec::new())),
                             saved_tbc_list: None,
                             func_idx: 0,
+                            logical_top: 0,
                             nresults: 0,
                             pcall_kind: crate::state::PcallKind::Pcall,
                             saved_filled: false,

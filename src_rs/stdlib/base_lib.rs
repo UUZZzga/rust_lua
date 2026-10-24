@@ -485,6 +485,7 @@ pub(crate) fn call_pcall<'a>(
             saved_closure_upvals: Rc::clone(&state.closure_upvals),
             saved_tbc_list: state.tbc_list,
             func_idx: a,
+            logical_top: a,
             // 保存 pcall 调用者期望的返回值数 (非 state.pcall 的 -1)，
             // 供 finish_pcall_return continuation 调整栈使用。
             nresults,
@@ -1234,6 +1235,7 @@ fn call_pairs<'a>(
                 saved_closure_upvals: Rc::clone(&state.closure_upvals),
                 saved_tbc_list: state.tbc_list,
                 func_idx: a,
+            logical_top: a,
                 nresults,
                 pcall_kind: crate::state::PcallKind::Pcall,
                 saved_filled: false,
@@ -1335,6 +1337,7 @@ pub(crate) fn call_xpcall<'a>(
             saved_closure_upvals: Rc::clone(&state.closure_upvals),
             saved_tbc_list: state.tbc_list,
             func_idx: a,
+            logical_top: a,
             // 保存 xpcall 调用者期望的返回值数 (非 state.pcall 的 -1)，
             // 供 finish_pcall_return continuation 调整栈使用。
             nresults,

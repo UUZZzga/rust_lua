@@ -2904,12 +2904,18 @@ impl VmExecutor {
                     // 现在需要: 移除 p2 (L->top.p = top - 1)，然后拼接剩余元素
                     // 注意: a 必须加上 state.base 得到绝对栈位置 (对应 C 的 base + GETARG_A)
                     let a = state.base + opcodes::getarg_a(inst) as usize;
-                    let func_idx = protection.func_idx;
-                    // 栈状态: [a, a+1, ..., result, p2] (长度 = func_idx)
-                    // 截断到 func_idx - 1, 移除 p2 (对应 L->top.p = top - 1)
-                    state.truncate_live(func_idx - 1);
-                    // 还需拼接的元素数量 (对应 total = top - 1 - (base + a))
-                    let total = func_idx - 1 - a;
+                    // 锚点用**逻辑**栈顶 (C 的 `L->top`, = OP_CONCAT 的 ra+n), 不是压帧位置:
+                    // C: top = L->top - 1; total = top - 1 - (base+a); setobjs2s(top-2, top);
+                    //    L->top = top - 1; luaV_concat(total)
+                    // 锚点 = C 的 `L->top`(被中断指令的栈顶)。C 的 `luaT_callTMres` 用
+                    // `res = L->top - 2`, 故 `top = metamethod_res + 2` —— 这对**每一轮**都成立,
+                    // 含元方法内部再触发 concat 的嵌套轮(那里外层指令的 ra+n 不是内层调用的
+                    // `L->top`, 所以不能用 logical_top)。
+                    let top = protection.metamethod_res + 2;
+                    // 结果已由 try_finish_metamethod 写到 metamethod_res (= C 的 top-2, 对应
+                    // `setobjs2s(L, top-2, top)`), 此处不重复写。
+                    state.truncate_live(top - 1);
+                    let total = (top - 1).saturating_sub(a);
                     if total > 1 {
                         // 尝试直接拼接 (对应 luaV_concat 的第一步)
                         let mut vals: Vec<TValue> = state.stack[a..a + total].to_vec();
