@@ -2360,6 +2360,11 @@ impl<'a> LuaState<'a> {
         name: &'static str,
     ) -> i32 {
         let nargs = self.top.saturating_sub(func_idx + 1);
+        // 对应 C 的 `luaD_callnoyield`: 调用前把 `L->top` 设为精确的实参末尾
+        // (`func + nargs`), 而不是让被调函数看到调用者的帧上界 —— 否则内建函数
+        // 的参数访问 (以 `top` 为上界) 会读到实参之上的陈旧寄存器
+        // (实测 all.lua 里 `pcall(string.format)` 读到陈旧字符串后切片 panic)。
+        self.top = func_idx + 1 + nargs;
 
         // 保存 call_info 长度，用于调用后清理。
         // 函数指针内部可能推入额外 call_info 条目（如元方法条目），
