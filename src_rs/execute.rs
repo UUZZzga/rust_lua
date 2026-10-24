@@ -3288,8 +3288,7 @@ impl VmExecutor {
                         break;
                     }
                     let p1 = state.stack[top - 2].clone();
-                    let p2 = state.stack[top - 1].clone();
-                    // try_concat_tm 将结果写入 res (top-2),可能 yield
+                    let p2 = state.stack[top - 1].clone();                    // try_concat_tm 将结果写入 res (top-2),可能 yield
                     try_concat_tm(state, &p1, &p2, top - 2)?;
                     // 移除 top-1 (p2)
                     state.truncate_live(top - 1);
@@ -5321,8 +5320,13 @@ impl VmExecutor {
                     .unwrap_or_else(|| state.string_table.intern_value(""));
                 // state.stack 已被 split_off(a) 截断到 a,无需再 truncate
                 state.push_value(result);
-                for val in saved_tail.drain(..) {
-                    state.push_value(val);
+                // saved_tail 必须写回**原位置** `a + n`（C 从不移动帧内其它寄存器 ——
+                // 它只是把 `L->top` 提到 ra+n 让元方法帧在其上临时使用）。原先用
+                // push_value 紧跟结果写回（= a+1），把帧内更高编号的寄存器整体下移
+                // n-1 格，实测 coroutine.lua 的 `a..b..c..a`（__concat yield）随后读到 nil。
+                let tail_pos = a + n;
+                for (i, val) in saved_tail.drain(..).enumerate() {
+                    Self::write_stack_state(state, tail_pos + i, val);
                 }
                 // 关键: live 边界只到拼接结果 (对应 C 的 L->top.p = ra + 1)。
                 // 不能设为 stack.len() — a+n 之上的槽位是"死寄存器"，Vec 表示必须保留
@@ -5349,8 +5353,7 @@ impl VmExecutor {
                         break;
                     }
                     let p1 = state.stack[top - 2].clone();
-                    let p2 = state.stack[top - 1].clone();
-                    // try_concat_tm 将结果写入 res (top-2)
+                    let p2 = state.stack[top - 1].clone();                    // try_concat_tm 将结果写入 res (top-2)
                     try_concat_tm(state, &p1, &p2, top - 2)?;
                     // 移除 top-1
                     state.truncate_live(top - 1);
@@ -5397,10 +5400,12 @@ impl VmExecutor {
                 while state.top > a + 1 {
                     state.pop_slot();
                 }
-                for val in saved_tail.drain(..) {
-                    state.push_value(val);
+                // 同成功路径: saved_tail 写回原位置 a + n (不动帧内其它寄存器)
+                let tail_pos = a + n;
+                for (i, val) in saved_tail.drain(..).enumerate() {
+                    Self::write_stack_state(state, tail_pos + i, val);
                 }
-                // 同成功路径: live 边界只到拼接结果 (对应 C 的 L->top.p = ra + 1)
+                // live 边界只到拼接结果 (对应 C 的 L->top.p = ra + 1)
                 state.top = a + 1;
             }
         }
