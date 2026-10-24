@@ -4839,8 +4839,13 @@ mod tests {
         );
         assert_eq!(rc, 0, "load_buffer failed");
         st.pcall(0, 1, 0);
+        // 注意: 用 top(而非 stack.last()) —— live top 之外的槽位是已初始化的 scratch,
+        // `stack.len()` 可能大于 top (见 CLAUDE.md「栈布局不变量」)。
         assert!(
-            matches!(st.stack.last(), Some(TValue::Thread(_))),
+            matches!(
+                st.stack.get(st.top.wrapping_sub(1)),
+                Some(TValue::Thread(_))
+            ),
             "expected the created thread on top"
         );
 
