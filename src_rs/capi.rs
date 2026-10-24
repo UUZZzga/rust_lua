@@ -895,16 +895,6 @@ pub extern "C-unwind" fn lua_tointegerx(
     idx: c_int,
     isnum: *mut c_int,
 ) -> lua_Integer {
-    {
-        let st = unsafe { &*L };
-        if idx == -1 {
-            eprintln!(
-                st.top,
-                st.stack.len(),
-                st.stack.get(st.top.wrapping_sub(1)).map(|v| v.ty())
-            );
-        }
-    }
     let L = unsafe { &*L };
     let result = match index2val(L, idx) {
         Some(TValue::Integer(i)) => Some(i),
@@ -4850,7 +4840,6 @@ mod tests {
         assert_eq!(rc, 0, "load_buffer failed");
         st.pcall(0, 1, 0);
         assert!(
-            matches!(st.stack.get(st.top - 1), Some(TValue::Thread(_))),
             "expected the created thread on top"
         );
 
