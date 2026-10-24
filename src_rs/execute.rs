@@ -6170,6 +6170,9 @@ impl VmExecutor {
             is_c: false,
             closure: Some(closure),
             base: state.base,
+            // 触发帧自己的函数槽: 用 base - 1 而**不是** cur_func() —— 此时被调帧
+            // 的 CallFrame 可能已压入, call_stack.last() 会指向被调帧 (见
+            // LuaState::current_frame_ci 的说明)。
             func: state.base.saturating_sub(1),
             saved_pc: state.pc,
             name: None,
@@ -6375,6 +6378,7 @@ impl VmExecutor {
                     is_c: false,
                     closure: Some(closure),
                     base: state.base,
+                    // 同上: 触发帧自己的函数槽 = base - 1
                     func: state.base.saturating_sub(1),
                     saved_pc: state.pc,
                     name: None,
@@ -7906,6 +7910,7 @@ impl VmExecutor {
                     is_c: false,
                     closure: Some(closure.clone()),
                     base: state.base,
+                    // 同上: 触发帧自己的函数槽 = base - 1
                     func: state.base.saturating_sub(1),
                     saved_pc: state.pc,
                     name: None,
