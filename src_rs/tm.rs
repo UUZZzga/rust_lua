@@ -454,6 +454,7 @@ pub(crate) fn call_tm_res<'a>(
             saved_protos: caller_protos.clone(),
             saved_base: caller_base,
             saved_pc: caller_pc,
+            saved_mret_end: state.mret_end,
             saved_num_params: caller_num_params,
             saved_is_vararg: caller_is_vararg,
             saved_proto_flag: caller_proto_flag,
@@ -619,6 +620,7 @@ pub(crate) fn call_tm<'a>(
             saved_protos: caller_protos.clone(),
             saved_base: caller_base,
             saved_pc: caller_pc,
+            saved_mret_end: state.mret_end,
             saved_num_params: caller_num_params,
             saved_is_vararg: caller_is_vararg,
             saved_proto_flag: caller_proto_flag,
@@ -791,6 +793,9 @@ pub fn call_close_method<'a>(
             saved_protos: Rc::new(Vec::new()),
             saved_base: 0,
             saved_pc: 0,
+            // C 的 `ci->u2.nres`: __close 从 OP_RETURN/OP_CLOSE 被调起, 被中断帧的
+            // MULTRET 计数必须在此刻捕获 —— continuation 重新执行 OP_RETURN 时用。
+            saved_mret_end: state.mret_end,
             saved_num_params: 0,
             saved_is_vararg: false,
             saved_proto_flag: 0,

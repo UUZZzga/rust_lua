@@ -3087,6 +3087,9 @@ impl VmExecutor {
         state.base = protection.saved_base;
         state.recompute_lua_frame_ceiling();
         state.pc = protection.saved_pc; // 指向 OP_RETURN/OP_CLOSE (不 +1, 重新执行)
+                                        // 多返回值产出末尾也要恢复 (C 的 `ci->u2.nres`): 重新执行的 OP_RETURN 若是 MULTRET
+                                        // (`table.pack(co())` 场景), 计数只能来自被中断帧当时的 L->top。
+        state.mret_end = protection.saved_mret_end;
         state.num_params = protection.saved_num_params;
         state.is_vararg = protection.saved_is_vararg;
         state.proto_flag = protection.saved_proto_flag;

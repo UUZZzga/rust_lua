@@ -85,6 +85,10 @@ pub struct PcallProtection<'a> {
     pub saved_protos: Rc<Vec<Rc<Proto<'a>>>>,
     pub saved_base: usize,
     pub saved_pc: usize,
+    /// 被中断帧的「多返回值产出末尾」(C 的 `L->top` / `ci->u2.nres`)。close / 元方法 /
+    /// pcall continuation 恢复帧时必须一并恢复, 否则后续的 MULTRET `OP_RETURN` 会按
+    /// 别的帧残留的末尾计数 (实测 locals.lua 的 `table.pack(co())` 得到 256 个值)。
+    pub saved_mret_end: usize,
     pub saved_num_params: u8,
     pub saved_is_vararg: bool,
     pub saved_proto_flag: u8,
@@ -1689,6 +1693,7 @@ impl<'a> LuaState<'a> {
                             saved_protos: Rc::new(Vec::new()),
                             saved_base: 0,
                             saved_pc: 0,
+                            saved_mret_end: 0,
                             saved_num_params: 0,
                             saved_is_vararg: false,
                             saved_proto_flag: 0,
