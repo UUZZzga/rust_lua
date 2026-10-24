@@ -6485,6 +6485,11 @@ impl VmExecutor {
                     is_tailcall: false,
                 });
 
+                // 对应 C 的 `L->top.p = ra + b`: 内建/C 函数的参数访问与 lua_gettop
+                // 都以精确的实参末尾为上界。缺这一步时函数会读到实参之上的陈旧寄存器
+                // (实测 all.lua: `string.format` 无参调用读到陈旧字符串后切片 panic)。
+                state.top = a + 1 + nargs;
+
                 // 对应 C 的 luaG_tracecall -> luaD_hookcall: 触发 call hook
                 if state.hook_mask & 1 != 0 {
                     // LUA_MASKCALL
