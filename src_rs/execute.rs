@@ -7178,9 +7178,12 @@ impl VmExecutor {
         } else {
             n as usize
         };
-        // 注: C 在固定结果数时把 `L->top = ra + n` (仅供其后的 rethook 与 poscall);
-        // 本实现的 hook 直接用局部 `nresults`, 且 live top 恒为该帧寄存器上界
-        // (寄存器读以 top 为上界), 故此处不改 top。
+        // C 在 OP_RETURN 里把 `L->top = ra + n` (isIT 时 = 解析出的实际个数) —— 这是
+        // 该帧的「返回栈顶」, 关闭 to-be-closed / return hook / poscall 都按它算。本实现
+        // 用 `mret_end` 承载这个语义, 且**必须在此刻写入**: 随后触发的 __close 若 yield,
+        // continuation 重新执行本指令时要靠它取回正确的 MULTRET 个数 (实测 locals.lua 的
+        // `table.pack(co())` 在 close-yield 后返回 0 个值 —— 捕获到的是别的指令残留值)。
+        state.set_mret_end(a + nresults);
 
         // perf: 快速路径 — 无 pcall 保护且无 open upvalue 时跳过 3 个 continuation 检查
         // (is_metamethod_return / finish_close_continuation / try_finish_pcall_return 各做
