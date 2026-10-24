@@ -3288,7 +3288,7 @@ impl VmExecutor {
                         break;
                     }
                     let p1 = state.stack[top - 2].clone();
-                    let p2 = state.stack[top - 1].clone();                    // try_concat_tm 将结果写入 res (top-2),可能 yield
+                    let p2 = state.stack[top - 1].clone(); // try_concat_tm 将结果写入 res (top-2),可能 yield
                     try_concat_tm(state, &p1, &p2, top - 2)?;
                     // 移除 top-1 (p2)
                     state.truncate_live(top - 1);
@@ -5353,7 +5353,7 @@ impl VmExecutor {
                         break;
                     }
                     let p1 = state.stack[top - 2].clone();
-                    let p2 = state.stack[top - 1].clone();                    // try_concat_tm 将结果写入 res (top-2)
+                    let p2 = state.stack[top - 1].clone(); // try_concat_tm 将结果写入 res (top-2)
                     try_concat_tm(state, &p1, &p2, top - 2)?;
                     // 移除 top-1
                     state.truncate_live(top - 1);
