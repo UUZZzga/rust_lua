@@ -4839,9 +4839,7 @@ mod tests {
         );
         assert_eq!(rc, 0, "load_buffer failed");
         st.pcall(0, 1, 0);
-        assert!(
-            "expected the created thread on top"
-        );
+        assert!("expected the created thread on top");
 
         let L = &mut st as *mut LuaState<'static> as *mut lua_State;
         let co = lua_tothread(L, -1);

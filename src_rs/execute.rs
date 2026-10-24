@@ -8531,21 +8531,6 @@ impl VmExecutor {
         // 变参序言把参数搬到更高的寄存器位, 帧上界随之变化 (C: `ci->top.p += totalargs + 1`,
         // 随后 `Protect` 复位 L->top) —— 这里按新的帧上界复位 live top。
         state.savestate();
-        #[cfg(not(feature = "fast_unsafe"))]
-        {
-            use std::sync::atomic::{AtomicUsize, Ordering};
-            static VAPN2: AtomicUsize = AtomicUsize::new(0);
-            if VAPN2.fetch_add(1, Ordering::Relaxed) < 4 {
-                eprintln!(
-                    "VAPREP-END base={} top={} ceiling={} ftop={} cistack={:?}",
-                    state.base,
-                    state.top,
-                    state.lua_frame_ceiling,
-                    state.frame_top(),
-                    state.call_stack.last().map(|c| (c.func, c.top))
-                );
-            }
-        }
 
         // 对应 C 的 OP_VARARGPREP -> luaD_hookcall: vararg 函数在 VARARGPREP 后触发 call hook
         // luaD_hookcall 检查 CIST_TAIL 决定事件类型: 尾调用触发 "tail call", 否则 "call"
