@@ -6016,15 +6016,6 @@ impl VmExecutor {
         // 对应 C 的 `L->top.p = ra + b`: C 函数从实参末尾开始压栈 (`lua_gettop` 也按它算)。
         // 本实现 live top 在指令边界被抬到帧上界, 必须在调用前压回精确的实参末尾。
         state.top = a + 1 + nargs;
-        #[cfg(not(feature = "fast_unsafe"))]
-        {
-            if (28..=36).contains(&a) {
-                eprintln!(
-                    "BF-CALL a={} b={} c={} nargs={} top={} mret_end={}",
-                    a, b, c, nargs, state.top, state.mret_end
-                );
-            }
-        }
         match (bf.call_target())(state, a, nargs, nresults) {
             Ok(()) => {
                 // perf: 不写 state.pc — 主循环 CALL Fast 臂保持循环局部 pc 有效,
@@ -6493,31 +6484,6 @@ impl VmExecutor {
 
                 // 直接调用函数指针 — 无 tag 派发层
                 let dispatch_result = func(state, a, nargs, nresults);
-                #[cfg(not(feature = "fast_unsafe"))]
-                if c_name == "upper" {
-                    let dump = |i: usize| match state.stack.get(i) {
-                        Some(TValue::Integer(v)) => format!("int({})", v),
-                        Some(TValue::Nil(_)) => "nil".to_string(),
-                        Some(TValue::ShortStr(_)) | Some(TValue::LongStr(_)) => {
-                            format!(
-                                "str({})",
-                                crate::strings::lua_string_as_str(&state.stack[i])
-                            )
-                        }
-                        Some(o) => format!("other({})", o.ty()),
-                        None => "OOB".to_string(),
-                    };
-                    eprintln!(
-                        "UPPER-CALL a={} nargs={} nresults={} top={} slots=[{}|{}|{}]",
-                        a,
-                        nargs,
-                        nresults,
-                        state.top,
-                        dump(a),
-                        dump(a + 1),
-                        dump(a + 2)
-                    );
-                }
 
                 let is_yield = matches!(&dispatch_result, Err(VmError::Yield(_)));
                 let is_error = dispatch_result.is_err();
