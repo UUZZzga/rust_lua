@@ -6781,6 +6781,10 @@ impl VmExecutor {
                 state.stack[a + i] = TValue::Nil(NilKind::Strict);
             }
             state.truncate_live(a + nresults);
+            // 记录产出末尾 (C 的 `L->top = res + nres`): 紧随的 OP_CALL b==0 /
+            // OP_SETLIST c==0 按它取个数。漏记时多返回值会变成 0 个
+            // (实测 deps/lua-cjson test124: `cjson.encode_sparse_array()` 的 3 个返回值丢失)。
+            state.set_mret_end(a + nresults);
         } else {
             // MULTRET: 保留所有 n 个结果
             while state.top < a + n {
@@ -6794,6 +6798,7 @@ impl VmExecutor {
                 state.stack[a + i] = val;
             }
             state.truncate_live(a + n);
+            state.set_mret_end(a + n);
         }
 
         // 同步 state.top：poscall 后栈顶 = 结果末尾
