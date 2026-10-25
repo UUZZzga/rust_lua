@@ -417,7 +417,7 @@ pub fn le_num<'a>(l: &TValue<'a>, r: &TValue<'a>) -> bool {
 /// Then: 返回 false
 pub fn raw_equal<'a>(t1: &TValue<'a>, t2: &TValue<'a>) -> bool {
     match (t1, t2) {
-        (TValue::Nil(a), TValue::Nil(b)) => a == b,
+        (TValue::Nil(_), TValue::Nil(_)) => true,
         (TValue::Boolean(a), TValue::Boolean(b)) => a == b,
         (TValue::Integer(a), TValue::Integer(b)) => a == b,
         (TValue::Float(a), TValue::Float(b)) => a == b,
@@ -1287,7 +1287,7 @@ mod tests {
 
     #[test]
     fn test_raw_equal_diff_nil_variant() {
-        assert!(!raw_equal(
+        assert!(raw_equal(
             &TValue::Nil(NilKind::Strict),
             &TValue::Nil(NilKind::Empty)
         ));

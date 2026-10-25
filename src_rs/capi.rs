@@ -5538,7 +5538,8 @@ mod tests {
             "=t",
         );
         assert_eq!(rc, 0, "load_buffer failed");
-        st.pcall(0, 1, 0);
+        let rc = st.pcall(0, 1, 0);
+        assert_eq!(rc, 0, "pcall failed");
         let s = {
             let p = lua_tolstring(
                 &mut st as *mut LuaState<'static> as *mut lua_State,

@@ -339,6 +339,37 @@ fn test_int_mod_zero_error() {
     );
 }
 
+/// 整数除零/取模除零的错误行号 = 触发指令所在行。
+///
+/// 对应 C 的 `savestate(L, ci)`(OP_MOD/OP_IDIV/OP_MODK/OP_IDIVK 的
+/// `/* in case of division by 0 */`): savedpc 指向下一条指令, `currentpc` =
+/// `savedpc - code - 1` = 当前指令索引 —— 报的是触发指令那一行的行号。
+///
+/// 回归: VM 重构让算术 handler 不再持有 `state`(只拿 drop_queue/stack/pc), 错误
+/// 分支只回退局部 pc、未同步 `state.pc` 时, `build_traceback` 读到陈旧值(函数入口
+/// 的 pc=0) → 行号退化成 "1:"。此用例对寄存器版与 K 常量版各覆盖 MOD/IDIV 四个
+/// opcode(期望 3/3/2/2 行)。
+#[test]
+fn test_int_arith_error_reports_instruction_line() {
+    let program = "local function check (s)\n\
+        local ok, msg = pcall(load(s))\n\
+        print(string.match(msg, \":(%d+):\") .. \" \" .. tostring(ok))\n\
+        end\n\
+        check('local a = 0\\nlocal b = 1\\nlocal c = b % a')\n\
+        check('local a = 0\\nlocal b = 1\\nlocal c = b // a')\n\
+        check('local b = 1\\nlocal c = b % 0')\n\
+        check('local b = 1\\nlocal c = b // 0')\n";
+    let output = run_lua(&["-e", program]);
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.trim(),
+        "3 false\n3 false\n2 false\n2 false",
+        "整数除零/取模除零的错误行号应与 C 一致(触发指令所在行), got: {}",
+        stdout
+    );
+}
+
 #[test]
 fn test_float_div_zero_inf() {
     let output = run_lua(&[

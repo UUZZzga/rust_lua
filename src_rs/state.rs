@@ -1133,6 +1133,38 @@ impl<'a> LuaState<'a> {
         self.mret_end = end;
     }
 
+    /// 把 live top 抬回**指令边界上界** = `max(产出末尾, 当前 Lua 帧上界)` (单调, 只升不降)。
+    ///
+    /// 这是旧实现在 `execute_loop` 循环头对**每条指令**做的那次抬升 (`max` + 条件写),
+    /// 现在只在真正改变了 top / 上界的地方做一次 —— 对应 C 在具体产出点显式设置
+    /// `L->top` 的做法 (`luaD_hook` 的 "correct top for Lua frames"、`checkGC(L, c)` 的
+    /// `L->top.p = c`、`Protect` 前的 `L->top.p = ci->top.p`)。
+    ///
+    /// 调用点必须是**指令边界**(某条指令的收尾处, 下一条指令开始前):
+    ///   - 会降低 live top 的指令收尾: C 函数调用 (CALL 臂 Reload / `call_pure_builtin`
+    ///     与融合调用形态) / 尾调用 / 帧切换返回 (`OP_RETURN*`) / 冷门 opcode
+    ///     (`OP_CONCAT` / `OP_TFORCALL` / `OP_SETLIST` …) / 错误恢复后继续执行;
+    ///   - 会抬高上界的指令收尾: `OP_VARARG` / `OP_VARARGPREP`、`execute_loop` 入口。
+    /// 与旧循环头抬升的关系: 旧写法是「每条指令开始时 `if top < bound`」, 新写法是
+    /// 「每条会让 `top < bound` 的指令结束时抬一次」—— 在所有正常路径上取值相同;
+    /// 唯一差异是旧写法也会把**嵌套 VM 遗留的陈旧字段**抬进 top (hook / 元方法 / C
+    /// 回调结束时 `lua_frame_ceiling`、`mret_end` 停在嵌套帧的坐标上), 新写法只在
+    /// 真正的产出点/帧上界上抬 —— always ≥ 帧真实上界, 方向安全 (实测 `table.sort`
+    /// 的比较器、`debug.sethook` 场景由旧写法的过量抬升掩盖)。
+    /// 例外: 帧入口把 top 压成「实参末尾」等 `OP_VARARGPREP` 消费的场合不抬升
+    /// (见 `execute_loop` 入口 / CALL / TAILCALL / 冷分发臂的 VARARGPREP 判定)。
+    #[inline(always)]
+    pub fn sync_live_top(&mut self) {
+        let bound = if self.mret_end > self.lua_frame_ceiling {
+            self.mret_end
+        } else {
+            self.lua_frame_ceiling
+        };
+        if self.top < bound {
+            self.top = bound;
+        }
+    }
+
     /// 最近一次产出的末尾 —— 对应 C 的 `L->top` (`OP_CALL` b==0 读它取实参个数)。
     /// 语义与 C 一致: 它是**单一**字段, 在每个帧切换点被重设(帧入口清 0, 返回/调用
     /// 结束时写成结果末尾), 因此不存在「跨帧残留」问题 —— 帧入口的 `reset_mret()` 负责。
