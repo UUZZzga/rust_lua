@@ -108,6 +108,10 @@ skynet = []
 #   - 也可独立启用: cargo build --features lua_longjmp
 # 注意: size_optimized 模式 (OPT_LEVEL=s/z) 自动启用此 feature, 无需手动指定。
 lua_longjmp = []
+# live top 边界不变量诊断 (见 CLAUDE.md「live top 模型」): 打开后检查每条指令开始时
+# 的 live top 是否已抬回当前 Lua 帧的真实上界 (帧内寄存器读 / GC 根扫描 / hook 帧
+# 起点都依赖它)。tests_lua 全套应为零输出 (LIVETOP 行)。
+probe_livetop = []
 # nightly-allocator: 在 nightly 工具链上让 allocator-aware 容器使用标准库实现。
 # 标准库的 `Box<T, A>` / `Vec<T, A>`（自定义分配器）受 unstable allocator_api
 # 特性门控, stable 不可用。启用本 feature 后 (src_rs/mem.rs):

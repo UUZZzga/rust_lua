@@ -1210,6 +1210,8 @@ impl VmExecutor {
         // 从 state.base 重载; CALL 的 Fast 分支 (pure builtin, 帧未切) 跳过
         // 重载, 与 code/constants 缓存的前提一致。
         let mut base: usize = state.base;
+        let mut trap: i32 = state.hook_mask;
+
         // 进入 VM 时刷新最内层 Lua 帧上界 (覆盖所有进入路径: CLI docall / capi lua_call /
         // 协程 resume / 元方法 pcall; C 帧保持原值)
         state.recompute_lua_frame_ceiling();
@@ -1241,6 +1243,7 @@ impl VmExecutor {
                     constants_rc = Rc::clone(&$st.constants);
                 }
                 base = $st.base;
+                trap = $st.hook_mask;
             };
         }
 
@@ -1372,23 +1375,37 @@ impl VmExecutor {
                 }
             }
 
-            // perf: hook 检查与调试跟踪合并为单次位测试。trace_or_hook 为 0 时
-            // (bench/生产常态) 一条 cmp+jcc 同时跳过两个路径; 非 0 时进入冷块
-            // 分别处理 — 语义不变, 每指令省一次独立 load+test。
-            // (trace_level 是 OnceLock 缓存的栈局部值, hook_mask 是 state 字段,
-            //  合并后热路径只测试栈局部值, state.hook_mask 的 load 延迟到冷块。)
-            // 注意: 必须每指令读 state.hook_mask — VARARGPREP 的 call hook 内可
-            // sethook 安装 line hook (db.lua:491 场景), 缓存字节会错过新 mask
-            // (#147: CI #91→#92 实证, 本优化不可缓存 trap 位)。
+            // perf: hook 检查与调试跟踪合并为单次位测试, 且被测值是 `trap`
+            // (state.hook_mask 的**循环局部寄存器缓存**)。`trace_level | trap` 为 0
+            // 时 (bench/生产常态) 一条 or+jcc 跳过两个路径, 且循环头不再 load
+            // state.hook_mask —— 该 load 变成 SSA phi: 只在「可能改变 hook_mask 的
+            // 指令」收尾处重新读 (直线指令上被 GVN 折叠掉)。
+            //
+            // `trap` 刷新不变量 (取代 #147 的「必须每指令读 state.hook_mask」):
+            //   ① 循环入口与 reload_istream!(帧切换点: CALL/TAILCALL/RETURN*/
+            //      FORPREP/冷分发/错误恢复);
+            //   ② 每条**可能回调 Lua/C 代码或分配**的指令收尾处: GET* 冷路径、
+            //      SET* 两个分支 (漏斗分配 → 可能 GC → finalizer 里 sethook)、
+            //      算术 MMBIN*、比较/排序的元方法冷路径、TEST/TESTSET、VARARG*、
+            //      冷分发 (CONCAT/CLOSE/TFORCALL/NEWTABLE/SETLIST…, 经 reload)。
+            //   只有这些点能执行 debug.sethook / lua_sethook, 漏一处 = 新装的
+            //   line/count hook 在该指令边界不触发 (db.lua:491 的 VARARGPREP 场景
+            //   即由 VARARGPREP 臂的刷新覆盖)。直线指令 (MOVE/LOAD*/GETUPVAL/NOT/
+            //   FORLOOP/SETUPVAL…) 无从改变 hook_mask, 故不刷新。
+            //
+            // 测试整个低字节 (而非先 `& (4|8)`): 省一条 and; 代价是只装了
+            // call/return hook 时也会进冷块 —— 块内 `trap & (4|8) == 0` 立即落出,
+            // 与 C 的 luaG_traceexec 早退同义 (指令边界只可能触发 line/count hook)。
             // 不能 #[cfg(debug_assertions)] 裁掉本检查: release 构建也必须支持
             // line/count hook (db.lua 在 all.lua 正确性门禁内), 否则 release 下
             // debug.sethook("l"/"c") 静默失效。C 的 luaG_traceexec 同样每指令判读。
-            if trace_level | (state.hook_mask & (4 | 8)) as u8 != 0 && op != OpCode::VARARGPREP {
+            if trace_level | trap as u8 != 0 && op != OpCode::VARARGPREP {
                 core::hint::cold_path();
                 state.pc = pc - 1; // sync: 行 hook/trace 需要 state.pc = 当前指令 (C savepc)
                                    // 对应 C 的 luaG_traceexec: count hook + line hook
-                if state.hook_mask & (4 | 8) != 0 {
+                if trap & (4 | 8) != 0 {
                     Self::traceexec_hooks(state)?;
+                    trap = state.hook_mask;
                 }
                 #[cfg(debug_assertions)]
                 if trace_level >= 1 {
@@ -1488,16 +1505,91 @@ impl VmExecutor {
                 ),
                 // === 热门 opcode: 表读 (GETTABUP/GETTABLE/GETI/GETFIELD 为 param-cur:
                 //     慢路径 sync state.pc = cur, 对应 C 的 savepc) ===
-                OpCode::GETUPVAL => Self::op_getupval(base, state, inst),
-                OpCode::GETTABUP => Self::op_gettabup(base, state, inst, &mut pc),
-                OpCode::GETTABLE => Self::op_gettable(base, state, inst, pc),
-                OpCode::GETI => Self::op_geti(base, state, inst, pc),
-                OpCode::GETFIELD => Self::op_getfield(base, state, inst, &mut pc),
+                OpCode::GETUPVAL => {
+                    let r = Self::op_getupval(base, state, inst);
+                    trap = state.hook_mask;
+                    r
+                }
+                // 表读族一律热/冷分离: 快路径 (无元表 Table) 在 handler 内写完返回
+                // Ok(true) —— 它不回调 Lua、不分配, 故**不刷新** `trap` (hook_mask
+                // 缓存, 见循环头注释); 未命中交 `#[cold]` 版本, 那里可能跑 __index /
+                // 报错, 返回后刷新。
+                OpCode::GETTABUP => match Self::op_gettabup(base, state, inst, &mut pc) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        let r = Self::op_gettabup_cold(base, state, inst, pc);
+                        trap = state.hook_mask;
+                        r
+                    }
+                    Err(err) => Err(err),
+                },
+                OpCode::GETTABLE => match Self::op_gettable(base, state, inst) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        let r = Self::op_gettable_cold(base, state, inst, pc);
+                        trap = state.hook_mask;
+                        r
+                    }
+                    Err(err) => Err(err),
+                },
+                OpCode::GETI => match Self::op_geti(base, state, inst) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        let r = Self::op_geti_cold(base, state, inst, pc);
+                        trap = state.hook_mask;
+                        r
+                    }
+                    Err(err) => Err(err),
+                },
+                OpCode::GETFIELD => match Self::op_getfield(base, state, inst, &mut pc) {
+                    Ok(true) => Ok(()),
+                    Ok(false) => {
+                        let r = Self::op_getfield_cold(base, state, inst, pc);
+                        trap = state.hook_mask;
+                        r
+                    }
+                    Err(err) => Err(err),
+                },
                 // === 热门 opcode: 表写 (param-cur) ===
-                OpCode::SETTABUP => Self::op_settabup(base, state, inst, pc),
-                OpCode::SETTABLE => Self::op_settable(base, state, inst, pc),
-                OpCode::SETI => Self::op_seti(base, state, inst, pc),
-                OpCode::SETFIELD => Self::op_setfield(base, state, inst, pc),
+                // 表写族同样热/冷分离, 但刷新 `trap` 必须**无条件**做: 快路径也会
+                // 经 table_set 漏斗分配 (可能触发 GC → finalizer 里 sethook),
+                // 慢路径还要跑 __newindex。
+                OpCode::SETTABUP => {
+                    let r = Self::op_settabup(base, state, inst);
+                    trap = state.hook_mask;
+                    match r {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Self::op_settabup_cold(base, state, inst, pc),
+                        Err(err) => Err(err),
+                    }
+                }
+                OpCode::SETTABLE => {
+                    let r = Self::op_settable(base, state, inst);
+                    trap = state.hook_mask;
+                    match r {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Self::op_settable_cold(base, state, inst, pc),
+                        Err(err) => Err(err),
+                    }
+                }
+                OpCode::SETI => {
+                    let r = Self::op_seti(base, state, inst);
+                    trap = state.hook_mask;
+                    match r {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Self::op_seti_cold(base, state, inst, pc),
+                        Err(err) => Err(err),
+                    }
+                }
+                OpCode::SETFIELD => {
+                    let r = Self::op_setfield(base, state, inst);
+                    trap = state.hook_mask;
+                    match r {
+                        Ok(true) => Ok(()),
+                        Ok(false) => Self::op_setfield_cold(base, state, inst, pc),
+                        Err(err) => Err(err),
+                    }
+                }
                 // === 热门 opcode: 算术运算 (param-pc: 成功 *pc += 1 跳过 MMBIN) ===
                 OpCode::ADDI => match Self::op_addi(
                     &mut state.drop_queue,
@@ -1510,10 +1602,12 @@ impl VmExecutor {
                     Ok(usize::MAX) => Ok(()),
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => {
                         state.pc = pc - 1;
+                        trap = state.hook_mask;
                         Err(err)
                     }
                 },
@@ -1529,10 +1623,12 @@ impl VmExecutor {
                     Ok(usize::MAX) => Ok(()),
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => {
                         state.pc = pc - 1;
+                        trap = state.hook_mask;
                         Err(err)
                     }
                 },
@@ -1548,10 +1644,12 @@ impl VmExecutor {
                     Ok(usize::MAX) => Ok(()),
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => {
                         state.pc = pc - 1;
+                        trap = state.hook_mask;
                         Err(err)
                     }
                 },
@@ -1567,10 +1665,12 @@ impl VmExecutor {
                     Ok(usize::MAX) => Ok(()),
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => {
                         state.pc = pc - 1;
+                        trap = state.hook_mask;
                         Err(err)
                     }
                 },
@@ -1586,10 +1686,12 @@ impl VmExecutor {
                     Ok(usize::MAX) => Ok(()),
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => {
                         state.pc = pc - 1;
+                        trap = state.hook_mask;
                         Err(err)
                     }
                 },
@@ -1605,10 +1707,12 @@ impl VmExecutor {
                     Ok(usize::MAX) => Ok(()),
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => {
                         state.pc = pc - 1;
+                        trap = state.hook_mask;
                         Err(err)
                     }
                 },
@@ -1624,10 +1728,12 @@ impl VmExecutor {
                     Ok(usize::MAX) => Ok(()),
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => {
                         state.pc = pc - 1;
+                        trap = state.hook_mask;
                         Err(err)
                     }
                 },
@@ -1643,10 +1749,12 @@ impl VmExecutor {
                     Ok(usize::MAX) => Ok(()),
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => {
                         state.pc = pc - 1;
+                        trap = state.hook_mask;
                         Err(err)
                     }
                 },
@@ -1661,10 +1769,12 @@ impl VmExecutor {
                     Ok(usize::MAX) => Ok(()),
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => {
                         state.pc = pc - 1;
+                        trap = state.hook_mask;
                         Err(err)
                     }
                 },
@@ -1679,10 +1789,12 @@ impl VmExecutor {
                     Ok(usize::MAX) => Ok(()),
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => {
                         state.pc = pc - 1;
+                        trap = state.hook_mask;
                         Err(err)
                     }
                 },
@@ -1697,10 +1809,12 @@ impl VmExecutor {
                     Ok(usize::MAX) => Ok(()),
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => {
                         state.pc = pc - 1;
+                        trap = state.hook_mask;
                         Err(err)
                     }
                 },
@@ -1715,10 +1829,12 @@ impl VmExecutor {
                     Ok(usize::MAX) => Ok(()),
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => {
                         state.pc = pc - 1;
+                        trap = state.hook_mask;
                         Err(err)
                     }
                 },
@@ -1733,10 +1849,12 @@ impl VmExecutor {
                     Ok(usize::MAX) => Ok(()),
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => {
                         state.pc = pc - 1;
+                        trap = state.hook_mask;
                         Err(err)
                     }
                 },
@@ -1751,10 +1869,12 @@ impl VmExecutor {
                     Ok(usize::MAX) => Ok(()),
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => {
                         state.pc = pc - 1;
+                        trap = state.hook_mask;
                         Err(err)
                     }
                 },
@@ -1769,10 +1889,12 @@ impl VmExecutor {
                     Ok(usize::MAX) => Ok(()),
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => {
                         state.pc = pc - 1;
+                        trap = state.hook_mask;
                         Err(err)
                     }
                 },
@@ -1788,34 +1910,46 @@ impl VmExecutor {
                 OpCode::JMP => match Self::op_jmp(state, inst, pc) {
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => Err(err),
                 },
                 OpCode::EQ => match Self::op_eq(base, state, inst, pc) {
-                    Ok(usize::MAX) => Self::equal_jump_cold(state, base, inst, &mut pc),
+                    Ok(usize::MAX) => {
+                        let r = Self::equal_jump_cold(state, base, inst, &mut pc);
+                        trap = state.hook_mask;
+                        r
+                    }
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => Err(err),
                 },
                 OpCode::LT => match Self::op_lt(base, state, inst, pc) {
                     Ok(usize::MAX) => {
-                        Self::order_jump_cold(state, base, inst, &mut pc, TagMethod::Lt)
+                        let r = Self::order_jump_cold(state, base, inst, &mut pc, TagMethod::Lt);
+                        trap = state.hook_mask;
+                        r
                     }
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => Err(err),
                 },
                 OpCode::LE => match Self::op_le(base, state, inst, pc) {
                     Ok(usize::MAX) => {
-                        Self::order_jump_cold(state, base, inst, &mut pc, TagMethod::Le)
+                        let r = Self::order_jump_cold(state, base, inst, &mut pc, TagMethod::Le);
+                        trap = state.hook_mask;
+                        r
                     }
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => Err(err),
@@ -1823,6 +1957,7 @@ impl VmExecutor {
                 OpCode::EQK => match Self::op_eqk(base, state, inst, pc) {
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => Err(err),
@@ -1830,46 +1965,87 @@ impl VmExecutor {
                 OpCode::EQI => match Self::op_eqi(base, state, inst, pc) {
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => Err(err),
                 },
                 OpCode::LTI => match Self::op_lti(base, state, inst, pc) {
                     Ok(usize::MAX) => {
-                        Self::order_int_jump_cold(state, base, inst, &mut pc, false, TagMethod::Lt)
+                        let r = Self::order_int_jump_cold(
+                            state,
+                            base,
+                            inst,
+                            &mut pc,
+                            false,
+                            TagMethod::Lt,
+                        );
+                        trap = state.hook_mask;
+                        r
                     }
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => Err(err),
                 },
                 OpCode::LEI => match Self::op_lei(base, state, inst, pc) {
                     Ok(usize::MAX) => {
-                        Self::order_int_jump_cold(state, base, inst, &mut pc, false, TagMethod::Le)
+                        let r = Self::order_int_jump_cold(
+                            state,
+                            base,
+                            inst,
+                            &mut pc,
+                            false,
+                            TagMethod::Le,
+                        );
+                        trap = state.hook_mask;
+                        r
                     }
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => Err(err),
                 },
                 OpCode::GTI => match Self::op_gti(base, state, inst, pc) {
                     Ok(usize::MAX) => {
-                        Self::order_int_jump_cold(state, base, inst, &mut pc, true, TagMethod::Lt)
+                        let r = Self::order_int_jump_cold(
+                            state,
+                            base,
+                            inst,
+                            &mut pc,
+                            true,
+                            TagMethod::Lt,
+                        );
+                        trap = state.hook_mask;
+                        r
                     }
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => Err(err),
                 },
                 OpCode::GEI => match Self::op_gei(base, state, inst, pc) {
                     Ok(usize::MAX) => {
-                        Self::order_int_jump_cold(state, base, inst, &mut pc, true, TagMethod::Le)
+                        let r = Self::order_int_jump_cold(
+                            state,
+                            base,
+                            inst,
+                            &mut pc,
+                            true,
+                            TagMethod::Le,
+                        );
+                        trap = state.hook_mask;
+                        r
                     }
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => Err(err),
@@ -1878,6 +2054,7 @@ impl VmExecutor {
                     match Self::op_test(&mut state.stack, &state.code, base, state.top, inst, pc) {
                         Ok(new_pc) => {
                             pc = new_pc;
+                            trap = state.hook_mask;
                             Ok(())
                         }
                         Err(err) => Err(err),
@@ -1894,6 +2071,7 @@ impl VmExecutor {
                 ) {
                     Ok(new_pc) => {
                         pc = new_pc;
+                        trap = state.hook_mask;
                         Ok(())
                     }
                     Err(err) => Err(err),
@@ -1904,6 +2082,7 @@ impl VmExecutor {
                     let r = Self::op_call(base, state, inst);
                     // 帧边界排空（判定与 match 结果无关 → 提到 match 之前，分支漏不掉）
                     state.drain_drop_queue_if_full();
+                    trap = state.hook_mask;
                     match r {
                         // pure builtin: 帧未切, 缓存与 pc 均有效 (state.pc 已 +1 = 局部 pc),
                         // 跳过重载 (显式抬升在 call_pure_builtin 收尾处, 那里帧上界未变)。
@@ -2035,9 +2214,21 @@ impl VmExecutor {
                 OpCode::SETUPVAL => Self::op_setupval(base, state, inst),
                 // === MMBIN/MMBINI/MMBINK: 元方法占位 (param-cur: pi = code[cur-1],
                 //     try_*_tm 前 sync state.pc = cur) ===
-                OpCode::MMBIN => Self::op_mmbin(state, base, inst, pc),
-                OpCode::MMBINI => Self::op_mmbini(state, base, inst, pc),
-                OpCode::MMBINK => Self::op_mmbink(state, base, inst, pc),
+                OpCode::MMBIN => {
+                    let r = Self::op_mmbin(state, base, inst, pc);
+                    trap = state.hook_mask;
+                    r
+                }
+                OpCode::MMBINI => {
+                    let r = Self::op_mmbini(state, base, inst, pc);
+                    trap = state.hook_mask;
+                    r
+                }
+                OpCode::MMBINK => {
+                    let r = Self::op_mmbink(state, base, inst, pc);
+                    trap = state.hook_mask;
+                    r
+                }
                 // === VARARG/VARARGPREP: vararg 调用热路径 (pass(...) 每次调用都
                 //     执行 VARARGPREP + VARARG), 从 cold dispatch 移入 (param-cur) ===
                 OpCode::VARARG => {
@@ -2048,6 +2239,7 @@ impl VmExecutor {
                         // OP_CALL/OP_RETURN b==0 与 OP_SETLIST c==0 按 mret_end 取个数。
                         state.sync_live_top();
                     }
+                    trap = state.hook_mask;
                     r
                 }
                 OpCode::VARARGPREP => {
@@ -2061,6 +2253,7 @@ impl VmExecutor {
                         // 上界 (抬升不能放在本指令之前 —— 见 VARARGPREP 例外的说明)。
                         state.sync_live_top();
                     }
+                    trap = state.hook_mask;
                     r
                 }
                 _ => {
@@ -4342,7 +4535,7 @@ impl VmExecutor {
         state: &mut LuaState<'a>,
         inst: Instruction,
         pc: &mut usize,
-    ) -> Result<(), VmError<'a>> {
+    ) -> Result<bool, VmError<'a>> {
         let a = Self::ra(base, inst);
         let b = opcodes::getarg_b(inst) as usize;
         let kb_idx = opcodes::getarg_c(inst) as usize;
@@ -4452,7 +4645,7 @@ impl VmExecutor {
                 // GETFIELD 位 (cur+1); 命中返回 2 → 跳过 MOVE+CALL。
                 let n = Self::fuse_pure_call(base, state, a, bf, *pc)?;
                 *pc += n;
-                return Ok(());
+                return Ok(true);
             }
             Some(SpecValue::Table(t)) => {
                 // perf: 融合紧随的 GETFIELD (B == A) — `_ENV.math.sin` 连读是
@@ -4495,15 +4688,15 @@ impl VmExecutor {
                 } else {
                     Self::write_stack_state(state, a, TValue::Table(t));
                 }
-                return Ok(());
+                return Ok(true);
             }
             Some(SpecValue::Trivial(v)) => {
                 Self::write_stack_state(state, a, v);
-                return Ok(());
+                return Ok(true);
             }
             Some(SpecValue::Skip) => {
                 // 目标槽已持同对象: 槽内容即期望值, 只推进 pc (循环头已覆盖)
-                return Ok(());
+                return Ok(true);
             }
             None => {} // fall through
         }
@@ -4533,10 +4726,24 @@ impl VmExecutor {
         if let Some(get_result) = fast_result {
             let val = get_result.unwrap_or(TValue::Nil(NilKind::Strict));
             Self::write_stack_state(state, a, val);
-            return Ok(());
+            return Ok(true);
         }
+        Ok(false)
+    }
+
+    /// GETTABUP 冷路径: 有元表或非 Table 类型, 需要走 table_get 查 __index。
+    #[cold]
+    fn op_gettabup_cold<'a>(
+        base: usize,
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        pc: usize,
+    ) -> Result<(), VmError<'a>> {
+        let a = Self::ra(base, inst);
+        let b = opcodes::getarg_b(inst) as usize;
+        let kb_idx = opcodes::getarg_c(inst) as usize;
         // 慢速路径: 有元表或非 Table 类型 — 此处才 clone
-        let key = key.clone();
+        let key = unsafe { state.constants.get_unchecked(kb_idx) }.clone();
         let upval_val = if b < state.closure_upvals.borrow().len() {
             let upvals = state.closure_upvals.borrow();
             let uv_ref = upvals[b].borrow();
@@ -4548,19 +4755,23 @@ impl VmExecutor {
         } else {
             TValue::Nil(NilKind::Strict)
         };
-        state.pc = *pc - 1; // sync (C savepc): 慢路径元方法/错误需要当前指令
+        state.pc = pc - 1; // sync (C savepc): 慢路径元方法/错误需要当前指令
         let result = Self::table_get(state, &upval_val, &key, VarSource::Upval(b))?;
         Self::write_stack_state(state, a, result);
         Ok(())
     }
 
+    /// GETTABLE 热路径 (同 [`Self::op_geti`]): 只做「无元表 Table」的直查,
+    /// 命中即写槽并返回 `Ok(true)`; 有元表 / 非 Table 返回 `Ok(false)`, 由
+    /// [`Self::op_gettable_cold`] 走 `__index` / 报错。分离的收益: 主循环内联体
+    /// 只剩快路径 (慢路径的 clone / `state.pc` sync / 元方法调用全部移出),
+    /// 且快路径不可能回调 Lua ⇒ 分发表无需在此刷新 `trap` (hook_mask 缓存)。
     #[inline]
     fn op_gettable<'a>(
         base: usize,
         state: &mut LuaState<'a>,
         inst: Instruction,
-        pc: usize,
-    ) -> Result<(), VmError<'a>> {
+    ) -> Result<bool, VmError<'a>> {
         let a = Self::ra(base, inst);
         let b = Self::rb(base, inst);
         let c = Self::rc(base, inst);
@@ -4580,14 +4791,29 @@ impl VmExecutor {
                 None
             }
         };
-        if let Some(get_result) = fast_result {
-            let val = get_result.unwrap_or(TValue::Nil(NilKind::Strict));
-            Self::write_stack_state(state, a, val);
-            return Ok(());
+        match fast_result {
+            Some(get_result) => {
+                let val = get_result.unwrap_or(TValue::Nil(NilKind::Strict));
+                Self::write_stack_state(state, a, val);
+                Ok(true)
+            }
+            None => Ok(false),
         }
-        // 慢速路径: 有元表或非 Table 类型, 需要走 table_get 查 __index
-        let table_val = table_val.clone();
-        let key = key.clone();
+    }
+
+    /// GETTABLE 冷路径: 有元表或非 Table 类型, 需要走 table_get 查 __index。
+    #[cold]
+    fn op_gettable_cold<'a>(
+        base: usize,
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        pc: usize,
+    ) -> Result<(), VmError<'a>> {
+        let a = Self::ra(base, inst);
+        let b = Self::rb(base, inst);
+        let c = Self::rc(base, inst);
+        let table_val = Self::read_stack_state(state, b).clone();
+        let key = Self::read_stack_state(state, c).clone();
         state.pc = pc - 1; // sync (C savepc): 慢路径元方法/错误需要当前指令
         let result = Self::table_get(
             state,
@@ -4604,8 +4830,7 @@ impl VmExecutor {
         base: usize,
         state: &mut LuaState<'a>,
         inst: Instruction,
-        pc: usize,
-    ) -> Result<(), VmError<'a>> {
+    ) -> Result<bool, VmError<'a>> {
         let a = Self::ra(base, inst);
         let b = Self::rb(base, inst);
         let c = opcodes::getarg_c(inst) as LuaInteger;
@@ -4629,8 +4854,24 @@ impl VmExecutor {
         if let Some(get_result) = fast_result {
             let val = get_result.unwrap_or(TValue::Nil(NilKind::Strict));
             Self::write_stack_state(state, a, val);
-            return Ok(());
+            return Ok(true);
         }
+        Ok(false)
+    }
+
+    /// GETI 冷路径: 有元表或非 Table 类型, 需要走 table_get 查 __index。
+    #[cold]
+    fn op_geti_cold<'a>(
+        base: usize,
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        pc: usize,
+    ) -> Result<(), VmError<'a>> {
+        let a = Self::ra(base, inst);
+        let b = Self::rb(base, inst);
+        let c = opcodes::getarg_c(inst) as LuaInteger;
+        let table_val = Self::read_stack_state(state, b);
+        let key = TValue::Integer(c);
         // 慢速路径: 有元表或非 Table 类型, 需要走 table_get 查 __index
         let table_val = table_val.clone();
         state.pc = pc - 1; // sync (C savepc): 慢路径元方法/错误需要当前指令
@@ -4650,7 +4891,7 @@ impl VmExecutor {
         state: &mut LuaState<'a>,
         inst: Instruction,
         pc: &mut usize,
-    ) -> Result<(), VmError<'a>> {
+    ) -> Result<bool, VmError<'a>> {
         let a = Self::ra(base, inst);
         let b = Self::rb(base, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -4707,19 +4948,19 @@ impl VmExecutor {
                 // 任意表字段 pure 函数后接 MOVE+CALL → 省 2 次 dispatch。
                 let n = Self::fuse_pure_call(base, state, a, bf, *pc)?;
                 *pc += n;
-                return Ok(());
+                return Ok(true);
             }
             Some(SpecValue::Table(t)) => {
                 Self::write_stack_state(state, a, TValue::Table(t));
-                return Ok(());
+                return Ok(true);
             }
             Some(SpecValue::Trivial(v)) => {
                 Self::write_stack_state(state, a, v);
-                return Ok(());
+                return Ok(true);
             }
             Some(SpecValue::Skip) => {
                 // 目标槽已持同对象: 槽内容即期望值, 只推进 pc (循环头已覆盖)
-                return Ok(());
+                return Ok(true);
             }
             None => {} // fall through
         }
@@ -4738,12 +4979,26 @@ impl VmExecutor {
         if let Some(get_result) = fast_result {
             let val = get_result.unwrap_or(TValue::Nil(NilKind::Strict));
             Self::write_stack_state(state, a, val);
-            return Ok(());
+            return Ok(true);
         }
+        Ok(false)
+    }
+
+    /// GETFIELD 冷路径: 有元表或非 Table 类型, 需要走 table_get 查 __index。
+    #[cold]
+    fn op_getfield_cold<'a>(
+        base: usize,
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+        pc: usize,
+    ) -> Result<(), VmError<'a>> {
+        let a = Self::ra(base, inst);
+        let b = Self::rb(base, inst);
+        let c_key = opcodes::getarg_c(inst) as usize;
         // 慢速路径: 有元表或非 Table 类型 — 此处才 clone key
-        let key = key.clone();
-        let table_val = table_val.clone();
-        state.pc = *pc - 1; // sync (C savepc): 慢路径元方法/错误需要当前指令
+        let key = unsafe { state.constants.get_unchecked(c_key) }.clone();
+        let table_val = Self::read_stack_state(state, b).clone();
+        state.pc = pc - 1; // sync (C savepc): 慢路径元方法/错误需要当前指令
         let result = Self::table_get(
             state,
             &table_val,
@@ -4754,7 +5009,65 @@ impl VmExecutor {
         Ok(())
     }
 
+    /// SETTABUP 热路径 (`_ENV.x = v` / `upval[k] = v`): upvalue 持「无元表 Table」
+    /// 且 key 非 nil/NaN 时直接写并返回 `Ok(true)`; 有元表 / 非 Table / 非法 key
+    /// 返回 `Ok(false)` 交 [`Self::op_settabup_cold`]。与 SETTABLE 同理, 本路径会
+    /// 分配 (可能 GC → finalizer sethook) ⇒ 分发表两个分支后都要刷新 `trap`。
+    #[inline]
     fn op_settabup<'a>(
+        base: usize,
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+    ) -> Result<bool, VmError<'a>> {
+        let a = opcodes::getarg_a(inst) as usize;
+        let b_key = opcodes::getarg_b(inst) as usize;
+        let c = opcodes::getarg_c(inst);
+        // 热路径不 clone 常量键 / upvalue 表: 命中才取表句柄 (Rc +1) 与解析值。
+        let fast_t = {
+            let upvals = state.closure_upvals.borrow();
+            if a < upvals.len() {
+                let uv_ref = upvals[a].borrow();
+                match &*uv_ref {
+                    UpVal::Closed { value } => match value {
+                        TValue::Table(t) if !t.has_metatable() => Some(t.clone()),
+                        _ => None,
+                    },
+                    UpVal::Open { stack_index, .. } => {
+                        match Self::read_stack_state(state, *stack_index) {
+                            TValue::Table(t) if !t.has_metatable() => Some(t.clone()),
+                            _ => None,
+                        }
+                    }
+                }
+            } else {
+                None
+            }
+        };
+        if let Some(t) = fast_t {
+            // nil/NaN key 走慢速路径报错 (常量键同样可能是 nil/NaN, 同 SETTABLE)
+            let key_ref = unsafe { state.constants.get_unchecked(b_key) };
+            let key_ok = match key_ref {
+                TValue::Nil(_) => false,
+                TValue::Float(f) => !f.is_nan(),
+                _ => true,
+            };
+            if key_ok {
+                let key = key_ref.clone();
+                let val = Self::resolve_val(base, state, inst, c);
+                state.table_set(&t, key, val)?;
+                // GC barrier — 与 table_set 的 key_exists 路径一致
+                if let Some(tid) = t.data.borrow().gc_header.id() {
+                    unsafe { state.gc_mut().barrier_back(tid) };
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// SETTABUP 冷路径: 有元表 / 非 Table / nil-NaN key。
+    #[cold]
+    fn op_settabup_cold<'a>(
         base: usize,
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4784,7 +5097,57 @@ impl VmExecutor {
         Ok(())
     }
 
+    /// SETTABLE 热路径 (与 [`Self::op_gettable`] 同形): 「无元表 Table + 合法 key」
+    /// 直接写并返回 `Ok(true)`; 有元表 / 非 Table / nil-NaN key 返回 `Ok(false)`,
+    /// 由 [`Self::op_settable_cold`] 走 `__newindex` / 报错。
+    /// 热路径不 clone 操作数 (命中才取表句柄 + 解析值), 慢路径的 `state.pc` sync 与
+    /// 元方法调用全部移出主循环内联体。
+    /// 注意: 与 GET* 不同, 本路径**会分配** (table_set 漏斗可能触发 GC, finalizer
+    /// 可能 `debug.sethook`), 故分发表在两个分支后都要刷新 `trap` (hook_mask 缓存)。
+    #[inline]
     fn op_settable<'a>(
+        base: usize,
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+    ) -> Result<bool, VmError<'a>> {
+        let a = Self::ra(base, inst);
+        let b = Self::rb(base, inst);
+        let c = opcodes::getarg_c(inst);
+        // perf 快速路径: table 无元表且 key 非 nil/NaN 时直接用 Table::set + GC barrier,
+        // 跳过 table_set 包装层 (t.get(&key) 预检查 + 元方法查找 + MAXTAGLOOP 循环)。
+        // nil/NaN key 必须走慢速路径以返回 "table index is nil/NaN" 错误 (attrib.lua:438)。
+        // 取出表句柄（Rc 计数 +1）：随后的写入漏斗需要 `&mut LuaState`，
+        // 不能再持有 `&state.stack` 的借用。
+        let fast_t = match Self::read_stack_state(state, a) {
+            TValue::Table(t) if !t.has_metatable() => Some(t.clone()),
+            _ => None,
+        };
+        if let Some(t) = fast_t {
+            // nil/NaN key 走慢速路径报错 (attrib.lua:438)
+            // 用单个 match 一次读取 discriminant, 比两个独立 matches! 更高效
+            let key_ref = Self::read_stack_state(state, b);
+            let key_ok = match key_ref {
+                TValue::Nil(_) => false,
+                TValue::Float(f) => !f.is_nan(),
+                _ => true,
+            };
+            if key_ok {
+                let key = key_ref.clone();
+                let val = Self::resolve_val(base, state, inst, c);
+                state.table_set(&t, key, val)?;
+                // GC barrier — 与 table_set 的 key_exists 路径一致
+                if let Some(tid) = t.data.borrow().gc_header.id() {
+                    unsafe { state.gc_mut().barrier_back(tid) };
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// SETTABLE 冷路径: 有元表 / 非 Table / nil-NaN key。
+    #[cold]
+    fn op_settable_cold<'a>(
         base: usize,
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4796,37 +5159,6 @@ impl VmExecutor {
         let table_val = Self::read_stack_state(state, a).clone();
         let key = Self::read_stack_state(state, b).clone();
         let val = Self::resolve_val(base, state, inst, c);
-        // perf 快速路径: table 无元表且 key 非 nil/NaN 时直接用 Table::set + GC barrier,
-        // 跳过 table_set 包装层 (t.get(&key) 预检查 + 元方法查找 + MAXTAGLOOP 循环)。
-        // nil/NaN key 必须走慢速路径以返回 "table index is nil/NaN" 错误 (attrib.lua:438)。
-        // 取出表句柄（Rc 计数 +1）：随后的写入漏斗需要 `&mut LuaState`，
-        // 不能再持有 `&state.stack` 的借用。
-        let fast_t = {
-            match &table_val {
-                TValue::Table(t) if !t.has_metatable() => Some(t.clone()),
-                _ => None,
-            }
-        };
-        match fast_t {
-            Some(t) => {
-                // nil/NaN key 走慢速路径报错 (attrib.lua:438)
-                // 用单个 match 一次读取 discriminant, 比两个独立 matches! 更高效
-                let key_ok = match &state.stack[b] {
-                    TValue::Nil(_) => false,
-                    TValue::Float(f) => !f.is_nan(),
-                    _ => true,
-                };
-                if key_ok {
-                    state.table_set(&t, key, val)?;
-                    // GC barrier — 与 table_set 的 key_exists 路径一致
-                    if let Some(tid) = t.data.borrow().gc_header.id() {
-                        unsafe { state.gc_mut().barrier_back(tid) };
-                    }
-                    return Ok(());
-                }
-            }
-            None => {}
-        };
         // 慢速路径: 有元表或非 Table 类型
         state.pc = pc - 1; // sync (C savepc): 元方法/错误需要当前指令
         Self::table_set(
@@ -4839,8 +5171,39 @@ impl VmExecutor {
         Ok(())
     }
 
+    /// SETI 热路径 (与 [`Self::op_gettable`] 同形): 「无元表 Table」直接写整数键并
+    /// 返回 `Ok(true)`; 有元表 / 非 Table 返回 `Ok(false)` 交 [`Self::op_seti_cold`]。
+    /// 热路径不 clone 表操作数 (命中才取表句柄 + 解析值)。与 SETTABLE 同理, 本路径
+    /// 会分配 (可能 GC → finalizer sethook) ⇒ 分发表两个分支后都要刷新 `trap`。
     #[inline]
     fn op_seti<'a>(
+        base: usize,
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+    ) -> Result<bool, VmError<'a>> {
+        let a = Self::ra(base, inst);
+        let b = opcodes::getarg_b(inst) as LuaInteger;
+        let c = opcodes::getarg_c(inst);
+        // perf 快速路径: table 无元表时直接用 Table::set + GC barrier, 跳过 table_set 包装层
+        // (t.get(&key) 预检查 + 元方法查找 + MAXTAGLOOP 循环)。
+        let fast_t = match Self::read_stack_state(state, a) {
+            TValue::Table(t) if !t.has_metatable() => Some(t.clone()),
+            _ => None,
+        };
+        if let Some(t) = fast_t {
+            let val = Self::resolve_val(base, state, inst, c);
+            state.table_set_int(&t, b, val)?;
+            if let Some(tid) = t.data.borrow().gc_header.id() {
+                unsafe { state.gc_mut().barrier_back(tid) };
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// SETI 冷路径: 有元表 / 非 Table。
+    #[cold]
+    fn op_seti_cold<'a>(
         base: usize,
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4849,26 +5212,8 @@ impl VmExecutor {
         let a = Self::ra(base, inst);
         let b = opcodes::getarg_b(inst) as LuaInteger;
         let c = opcodes::getarg_c(inst);
-        let val = Self::resolve_val(base, state, inst, c);
-        // perf 快速路径: table 无元表时直接用 Table::set + GC barrier, 跳过 table_set 包装层
-        // (t.get(&key) 预检查 + 元方法查找 + MAXTAGLOOP 循环)。
         let table_val = Self::read_stack_state(state, a).clone();
-        let fast_t = {
-            match &table_val {
-                TValue::Table(t) if !t.has_metatable() => Some(t.clone()),
-                _ => None,
-            }
-        };
-        match fast_t {
-            Some(t) => {
-                state.table_set_int(&t, b, val)?;
-                if let Some(tid) = t.data.borrow().gc_header.id() {
-                    unsafe { state.gc_mut().barrier_back(tid) };
-                }
-                return Ok(());
-            }
-            None => {}
-        };
+        let val = Self::resolve_val(base, state, inst, c);
         // 慢速路径: 有元表或非 Table 类型
         state.pc = pc - 1; // sync (C savepc): 元方法/错误需要当前指令
         Self::table_set(
@@ -4881,8 +5226,40 @@ impl VmExecutor {
         Ok(())
     }
 
+    /// SETFIELD 热路径 (与 [`Self::op_gettable`] 同形): 「无元表 Table」直接写字段并
+    /// 返回 `Ok(true)`; 有元表 / 非 Table 返回 `Ok(false)` 交
+    /// [`Self::op_setfield_cold`]。热路径不 clone 表操作数 / 常量键 (命中才取)。
+    /// 与 SETTABLE 同理, 本路径会分配 (可能 GC → finalizer sethook) ⇒ 分发表两个
+    /// 分支后都要刷新 `trap`。
     #[inline]
     fn op_setfield<'a>(
+        base: usize,
+        state: &mut LuaState<'a>,
+        inst: Instruction,
+    ) -> Result<bool, VmError<'a>> {
+        let a = Self::ra(base, inst);
+        let b_key = opcodes::getarg_b(inst) as usize;
+        let c = opcodes::getarg_c(inst);
+        // perf 快速路径: table 无元表时直接用 Table::set + GC barrier
+        let fast_t = match Self::read_stack_state(state, a) {
+            TValue::Table(t) if !t.has_metatable() => Some(t.clone()),
+            _ => None,
+        };
+        if let Some(t) = fast_t {
+            let key = unsafe { state.constants.get_unchecked(b_key) }.clone();
+            let val = Self::resolve_val(base, state, inst, c);
+            state.table_set(&t, key, val)?;
+            if let Some(tid) = t.data.borrow().gc_header.id() {
+                unsafe { state.gc_mut().barrier_back(tid) };
+            }
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// SETFIELD 冷路径: 有元表 / 非 Table。
+    #[cold]
+    fn op_setfield_cold<'a>(
         base: usize,
         state: &mut LuaState<'a>,
         inst: Instruction,
@@ -4893,24 +5270,6 @@ impl VmExecutor {
         let c = opcodes::getarg_c(inst);
         let key = unsafe { state.constants.get_unchecked(b_key) }.clone();
         let val = Self::resolve_val(base, state, inst, c);
-        // perf 快速路径: table 无元表时直接用 Table::set + GC barrier
-        let table_val = Self::read_stack_state(state, a).clone();
-        let fast_t = {
-            match &table_val {
-                TValue::Table(t) if !t.has_metatable() => Some(t.clone()),
-                _ => None,
-            }
-        };
-        match fast_t {
-            Some(t) => {
-                state.table_set(&t, key, val)?;
-                if let Some(tid) = t.data.borrow().gc_header.id() {
-                    unsafe { state.gc_mut().barrier_back(tid) };
-                }
-                return Ok(());
-            }
-            None => {}
-        };
         // 慢速路径: 有元表或非 Table 类型
         let table_val = Self::read_stack_state(state, a).clone();
         state.pc = pc - 1; // sync (C savepc): 元方法/错误需要当前指令
