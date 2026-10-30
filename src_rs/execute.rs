@@ -1174,1016 +1174,1022 @@ impl VmExecutor {
         });
         #[cfg(not(debug_assertions))]
         let trace_level = 0;
+        'outer: loop {
+            // perf: 中断检查 — 不再按指令摊销。信号中断 (SIGINT → laction 设置
+            // INTERRUPTED) 的观测点移至所有向后跳转处 (JMP 回跳 / FORLOOP 继续 /
+            // 条件跳回), 无限循环必然每迭代过一次回跳; 直线代码段由 pc 越界
+            // 兜底 (同样带检查)。热循环指令前缀省去 tick 自增 + test + je。
+            // 计数器在 state.tick (Cell): 回跳 handler 内增量 + 64 边界原子读。
+            // (CI #90 实证: &mut tick 引用穿透 handler → FORLOOP 每次回跳内存
+            // 往返, 整数 bench +27%; Cell 方案增量编译为 inc [rsi+off] 单指令。)
 
-        // perf: 中断检查 — 不再按指令摊销。信号中断 (SIGINT → laction 设置
-        // INTERRUPTED) 的观测点移至所有向后跳转处 (JMP 回跳 / FORLOOP 继续 /
-        // 条件跳回), 无限循环必然每迭代过一次回跳; 直线代码段由 pc 越界
-        // 兜底 (同样带检查)。热循环指令前缀省去 tick 自增 + test + je。
-        // 计数器在 state.tick (Cell): 回跳 handler 内增量 + 64 边界原子读。
-        // (CI #90 实证: &mut tick 引用穿透 handler → FORLOOP 每次回跳内存
-        // 往返, 整数 bench +27%; Cell 方案增量编译为 inc [rsi+off] 单指令。)
-
-        // perf: code Vec 缓存 v2 — ptr+len 直接驻留主循环局部, 每指令零内存
-        // 解引用。原 code_vec+ptr::eq 方案被 LLVM 识别 ptr::eq 为恒真, 编译回
-        // 每指令 Rc→Vec 双 deref (汇编实证: movq 776(%rbp); movq (%rax))。
-        // 现改由帧切换点 (CALL/TAILCALL/RETURN*/FORPREP/冷分发/pc 溢出/错误
-        // 恢复) 显式 reload; 直线指令段内 state.code 保证不变 — code Rc 全树
-        // 写点均为整体替换且伴随帧切换 (#136 审计)。
-        // fast_unsafe 关闭时改用 Rc 句柄 + 边界检查索引 (安全等价, 每指令多一次
-        // 边界检查与 Rc→Vec deref)。
-        #[cfg(feature = "fast_unsafe")]
-        let mut code_ptr: *const Instruction = state.code.as_ptr();
-        #[cfg(not(feature = "fast_unsafe"))]
-        let mut code_rc: Rc<Vec<Instruction>> = Rc::clone(&state.code);
-        // perf: constants Vec 数据指针缓存 — K 常量指令 (ADDK/MULK/MODK/GETFIELD/
-        // GETTABUP 等) 原每指令 Rc→Vec 双 deref 取常量。与 code_ptr 同点刷新
-        // (帧切换 9 点), 帧内 constants Vec 不被整体替换 (与 code 相同的 Rc 写点
-        // 审计结论)。K 越界由 len 检查兜底 (constants_len)。
-        #[cfg(feature = "fast_unsafe")]
-        let mut constants_ptr: *const TValue = state.constants.as_ptr();
-        #[cfg(feature = "fast_unsafe")]
-        let mut constants_len: usize = state.constants.len();
-        #[cfg(not(feature = "fast_unsafe"))]
-        let mut constants_rc: Rc<Vec<TValue<'a>>> = Rc::clone(&state.constants);
-
-        // perf: base 寄存器化 — 与 pc 同帧不变式。帧切换点经 reload_istream!
-        // 从 state.base 重载; CALL 的 Fast 分支 (pure builtin, 帧未切) 跳过
-        // 重载, 与 code/constants 缓存的前提一致。
-        let mut base: usize = state.base;
-        let mut trap: i32 = state.hook_mask;
-
-        // 进入 VM 时刷新最内层 Lua 帧上界 (覆盖所有进入路径: CLI docall / capi lua_call /
-        // 协程 resume / 元方法 pcall; C 帧保持原值)
-        state.recompute_lua_frame_ceiling();
-        // 进入 VM 时把 live top 抬回指令边界上界: 恢复点 (pcall / 协程 resume / 元方法
-        // continuation) 进入时 top 可能停在上次产出末尾, 而进入后的第一条指令要求
-        // 「边界 top ≥ 帧上界」(寄存器读上界 / GC 根范围 / hook 帧起点)。
-        // 例外: 入口指令是 `VARARGPREP` 时保持帧入口压好的「实参末尾」(见其处理器)。
-        if !Self::next_is_varargprep(state) {
-            state.sync_live_top();
-        }
-
-        // 帧切换后刷新指令流缓存 (fast_unsafe: 裸指针四件套, 免每指令 deref;
-        // 安全版: Rc 句柄, 索引时边界检查)。调用点: CALL/TAILCALL/RETURN*/
-        // FORPREP/冷分发/错误恢复。base 同步刷新 (见上方 base 寄存器化注释)。
-        macro_rules! reload_istream {
-            ($st:expr) => {
-                // 帧切换点: 刷新「最内层 Lua 帧上界」(C 帧保持原值, 见
-                // LuaState::recompute_lua_frame_ceiling)
-                $st.recompute_lua_frame_ceiling();
-                #[cfg(feature = "fast_unsafe")]
-                {
-                    code_ptr = $st.code.as_ptr();
-                    constants_ptr = $st.constants.as_ptr();
-                    constants_len = $st.constants.len();
-                }
-                #[cfg(not(feature = "fast_unsafe"))]
-                {
-                    code_rc = Rc::clone(&$st.code);
-                    constants_rc = Rc::clone(&$st.constants);
-                }
-                base = $st.base;
-                trap = $st.hook_mask;
-            };
-        }
-
-        // 下一条要执行的指令是否为 `VARARGPREP` —— 从**已缓存**的指令流读 (与循环头
-        // fetch 同一来源), 供热臂 (CALL/TAILCALL) 免去 `state.code` 的 Rc→Vec deref。
-        // 参数 `$pc` 必须是已同步的「下一条指令索引」(CALL 的 Reload 臂 / TAILCALL 臂
-        // 都在 reload_istream 之后, 即被调帧的入口 pc)。
-        macro_rules! next_is_varargprep_at {
-            ($pc:expr) => {{
-                #[cfg(feature = "fast_unsafe")]
-                let __inst: Instruction = unsafe { *code_ptr.add($pc) };
-                #[cfg(not(feature = "fast_unsafe"))]
-                let __inst: Instruction = code_rc[$pc];
-                opcodes::get_opcode(__inst) == OpCode::VARARGPREP
-            }};
-        }
-
-        // C 形状 pc 寄存器化 — 对应 C luaV_execute 的局部 pc (vmfetch: i = *(pc++))。
-        // 主循环仅在帧切换点 (CALL/TAILCALL/RETURN*/cold dispatch/FORPREP 后) 从
-        // state.pc 重载; 直线指令零 pc 内存往返 (HEAD: 每指令 1 load + 1 store)。
-        // 慢路径 (元方法/错误) 进入前 sync state.pc = cur, 对应 C 的 savepc。
-        // handler 三类:
-        //   deleted — 直线指令, 删尾部 state.pc += 1, 循环头 pc += 1 已覆盖;
-        //   param   — 算术 (&mut pc, 成功 *pc += 1 跳过 MMBIN) / 跳转 (&mut pc) /
-        //             慢路径 sync (cur 参数, 慢路径内 state.pc = cur);
-        //   flow    — 帧切换/冷分发: state.pc = cur → handler → pc = state.pc +
-        //             code_ptr/code_len 从 state.code 重载。
-        let mut pc: usize = state.pc;
-
-        assert!(
-            match state.code.last().map(|i: &u32| opcodes::get_opcode(*i)) {
-                Some(OpCode::RETURN) => true,
-                Some(OpCode::RETURN0) => true,
-                Some(OpCode::RETURN1) => true,
-                _ => false,
-            }
-        );
-
-        loop {
-            // 越界防御: 仅 debug 生效。release 下依赖编译器保证字节码末尾必有
-            // RETURN/RETURN0/RETURN1 (close_func 必然 return_stat_gen)，与 C 的
-            // luaV_execute 一致 — C 无每指令边界检查，pc 越界是损坏字节码的 UB。
-            // 顶部 assert!(code.last() 是 RETURN) 提供 release 下的损坏字节码防线。
-            debug_assert!(pc < state.code.len());
-
-            // perf: constants 缓存切片 — 由常量指针构建, LLVM 可将其 ptr+len
-            // 驻留寄存器传递给内联 K-handler (原 state.constants 每指令双 deref)
+            // perf: code Vec 缓存 v2 — ptr+len 直接驻留主循环局部, 每指令零内存
+            // 解引用。原 code_vec+ptr::eq 方案被 LLVM 识别 ptr::eq 为恒真, 编译回
+            // 每指令 Rc→Vec 双 deref (汇编实证: movq 776(%rbp); movq (%rax))。
+            // 现改由帧切换点 (CALL/TAILCALL/RETURN*/FORPREP/冷分发/pc 溢出/错误
+            // 恢复) 显式 reload; 直线指令段内 state.code 保证不变 — code Rc 全树
+            // 写点均为整体替换且伴随帧切换 (#136 审计)。
+            // fast_unsafe 关闭时改用 Rc 句柄 + 边界检查索引 (安全等价, 每指令多一次
+            // 边界检查与 Rc→Vec deref)。
             #[cfg(feature = "fast_unsafe")]
-            let constants_slice: &[TValue] =
-                unsafe { std::slice::from_raw_parts(constants_ptr, constants_len) };
+            let mut code_ptr: *const Instruction = state.code.as_ptr();
             #[cfg(not(feature = "fast_unsafe"))]
-            let constants_slice: &[TValue] = &constants_rc[..];
-
-            // perf: get_unchecked 跳过边界检查 (上方已检查 pc < code_len)
+            let mut code_rc: Rc<Vec<Instruction>> = Rc::clone(&state.code);
+            // perf: constants Vec 数据指针缓存 — K 常量指令 (ADDK/MULK/MODK/GETFIELD/
+            // GETTABUP 等) 原每指令 Rc→Vec 双 deref 取常量。与 code_ptr 同点刷新
+            // (帧切换 9 点), 帧内 constants Vec 不被整体替换 (与 code 相同的 Rc 写点
+            // 审计结论)。K 越界由 len 检查兜底 (constants_len)。
             #[cfg(feature = "fast_unsafe")]
-            let inst = unsafe { *code_ptr.add(pc) };
+            let mut constants_ptr: *const TValue = state.constants.as_ptr();
+            #[cfg(feature = "fast_unsafe")]
+            let mut constants_len: usize = state.constants.len();
             #[cfg(not(feature = "fast_unsafe"))]
-            let inst = code_rc[pc];
-            pc += 1; // 寄存器自增 (对应 C 的 *(pc++)); 当前指令索引 = pc - 1
-            let op = opcodes::get_opcode(inst);
+            let mut constants_rc: Rc<Vec<TValue<'a>>> = Rc::clone(&state.constants);
 
-            // base 寄存器化调试断言: 任何 handler 修改 state.base 必须经过
-            // reload_istream 刷新点, 否则此处立即失败并指出 opcode。
-            debug_assert_eq!(
-                base,
-                state.base,
-                "base cache diverged: op={:?} pc={} local={} state={}",
-                op,
-                pc - 1,
-                base,
-                state.base
-            );
-            // ci/base 一致性断言: 当前帧记录 (call_stack 栈顶, C 的 L->ci) 的
-            // `func` 必须与 state.base 同步 —— `func + 1 == base`（VARARGPREP 位移
-            // 二者一体调整）。入口帧（pcall / 协程体）没有记录 → 栈为空。
-            debug_assert!(
-                state
-                    .call_stack
-                    .last()
-                    .map_or(true, |f| f.func + 1 == state.base),
-                "ci/base diverged: op={:?} pc={} base={} ci={:?}",
-                op,
-                pc - 1,
-                state.base,
-                state.call_stack.last().map(|f| (f.func, f.base, f.top))
-            );
+            // perf: base 寄存器化 — 与 pc 同帧不变式。帧切换点经 reload_istream!
+            // 从 state.base 重载; CALL 的 Fast 分支 (pure builtin, 帧未切) 跳过
+            // 重载, 与 code/constants 缓存的前提一致。
+            let mut base: usize = state.base;
+            let mut trap: i32 = state.hook_mask;
 
-            // live top 恒不低于当前帧的寄存器上界 (在 hook 之前完成!): 帧内寄存器写在 top
-            // 之下, 所有寄存器读以 top 为上界; 且 hook 帧/元方法帧都从 top 起压入 —— 若
-            // hook 在抬高之前运行, 它的帧会盖住上一条指令的多返回值 (实测 db.lua/events.lua
-            // 的 `{f(table.unpack(...))}` 丢元素)。
-            //
-            // perf: 抬升不再在此处**每条指令**做一次 (`max(产出末尾, 帧上界)` = 2 次字段读
-            // + 比较 + 条件写), 改由「改变了 live top / 上界的那条指令」在收尾处调用
-            // [`LuaState::sync_live_top`] 精确抬回 (与旧写法逐点等价, 见该函数文档)。
-            //
-            // 安全构建 (`--no-default-features`) 保留此处抬升: 它的 `read_stack` 以 top
-            // 为寄存器读上界 (该函数的不变量说明), 需要「指令边界的 top ≥ 帧上界」。
-            #[cfg(not(feature = "fast_unsafe"))]
-            if op != OpCode::VARARGPREP {
+            // 进入 VM 时刷新最内层 Lua 帧上界 (覆盖所有进入路径: CLI docall / capi lua_call /
+            // 协程 resume / 元方法 pcall; C 帧保持原值)
+            state.recompute_lua_frame_ceiling();
+            // 进入 VM 时把 live top 抬回指令边界上界: 恢复点 (pcall / 协程 resume / 元方法
+            // continuation) 进入时 top 可能停在上次产出末尾, 而进入后的第一条指令要求
+            // 「边界 top ≥ 帧上界」(寄存器读上界 / GC 根范围 / hook 帧起点)。
+            // 例外: 入口指令是 `VARARGPREP` 时保持帧入口压好的「实参末尾」(见其处理器)。
+            if !Self::next_is_varargprep(state) {
                 state.sync_live_top();
             }
-            // 边界不变量守卫: 抬升由改变了 top / 上界的指令在收尾处完成 (见
-            // `LuaState::sync_live_top`), 漏一处即在此暴露 —— debug 构建直接断言
-            // (与 base 缓存断言同类), `probe_livetop` 构建在 release 下报告。
-            // 检查对象是**当前帧的真实上界**而非 `lua_frame_ceiling` 字段: 后者可能
-            // 被嵌套 VM (hook / 元方法 / C 回调) 遗留的帧上界覆盖 (见 true_live_ceiling)。
-            // 该守卫在普通 release 构建下**完全编译掉** (零每指令开销): 只在 debug
-            // 构建 (cargo test) 或 probe_livetop 构建下存在。
-            #[cfg(all(
-                feature = "fast_unsafe",
-                any(debug_assertions, feature = "probe_livetop")
-            ))]
-            if op != OpCode::VARARGPREP {
-                let boundary_bound = Self::true_live_ceiling(state);
-                debug_assert!(
-                    state.top >= boundary_bound,
-                    "边界 top 低于帧上界: op={:?} pc={} top={} bound={} ceiling={} mret={}",
+
+            // 帧切换后刷新指令流缓存 (fast_unsafe: 裸指针四件套, 免每指令 deref;
+            // 安全版: Rc 句柄, 索引时边界检查)。调用点: CALL/TAILCALL/RETURN*/
+            // FORPREP/冷分发/错误恢复。base 同步刷新 (见上方 base 寄存器化注释)。
+            macro_rules! reload_istream {
+                ($st:expr) => {
+                    // 帧切换点: 刷新「最内层 Lua 帧上界」(C 帧保持原值, 见
+                    // LuaState::recompute_lua_frame_ceiling)
+                    $st.recompute_lua_frame_ceiling();
+                    #[cfg(feature = "fast_unsafe")]
+                    {
+                        code_ptr = $st.code.as_ptr();
+                        constants_ptr = $st.constants.as_ptr();
+                        constants_len = $st.constants.len();
+                    }
+                    #[cfg(not(feature = "fast_unsafe"))]
+                    {
+                        code_rc = Rc::clone(&$st.code);
+                        constants_rc = Rc::clone(&$st.constants);
+                    }
+                    base = $st.base;
+                    trap = $st.hook_mask;
+                };
+            }
+
+            // C 形状 pc 寄存器化 — 对应 C luaV_execute 的局部 pc (vmfetch: i = *(pc++))。
+            // 主循环仅在帧切换点 (CALL/TAILCALL/RETURN*/cold dispatch/FORPREP 后) 从
+            // state.pc 重载; 直线指令零 pc 内存往返 (HEAD: 每指令 1 load + 1 store)。
+            // 慢路径 (元方法/错误) 进入前 sync state.pc = cur, 对应 C 的 savepc。
+            // handler 三类:
+            //   deleted — 直线指令, 删尾部 state.pc += 1, 循环头 pc += 1 已覆盖;
+            //   param   — 算术 (&mut pc, 成功 *pc += 1 跳过 MMBIN) / 跳转 (&mut pc) /
+            //             慢路径 sync (cur 参数, 慢路径内 state.pc = cur);
+            //   flow    — 帧切换/冷分发: state.pc = cur → handler → pc = state.pc +
+            //             code_ptr/code_len 从 state.code 重载。
+            let mut pc: usize = state.pc;
+
+            assert!(
+                match state.code.last().map(|i: &u32| opcodes::get_opcode(*i)) {
+                    Some(OpCode::RETURN) => true,
+                    Some(OpCode::RETURN0) => true,
+                    Some(OpCode::RETURN1) => true,
+                    _ => false,
+                }
+            );
+
+            'inner: loop {
+                macro_rules! try_inst {
+                    ($expr:expr) => {
+                        match $expr {
+                            Ok(v) => v,
+                            Err(e) => {
+                                core::hint::cold_path();
+                                match Self::handle_instruction_error(state, e)? {
+                                    ErrOutcome::Continue => {
+                                        pc = state.pc;
+                                        reload_istream!(state);
+                                        if !Self::next_is_varargprep(state) {
+                                            state.sync_live_top();
+                                        }
+                                        continue 'inner;
+                                    }
+                                    ErrOutcome::Return(r) => return Ok(r),
+                                }
+                            }
+                        }
+                    };
+                }
+
+                // 越界防御: 仅 debug 生效。release 下依赖编译器保证字节码末尾必有
+                // RETURN/RETURN0/RETURN1 (close_func 必然 return_stat_gen)，与 C 的
+                // luaV_execute 一致 — C 无每指令边界检查，pc 越界是损坏字节码的 UB。
+                // 顶部 assert!(code.last() 是 RETURN) 提供 release 下的损坏字节码防线。
+                debug_assert!(pc < state.code.len());
+
+                // perf: constants 缓存切片 — 由常量指针构建, LLVM 可将其 ptr+len
+                // 驻留寄存器传递给内联 K-handler (原 state.constants 每指令双 deref)
+                #[cfg(feature = "fast_unsafe")]
+                let constants_slice: &[TValue] =
+                    unsafe { std::slice::from_raw_parts(constants_ptr, constants_len) };
+                #[cfg(not(feature = "fast_unsafe"))]
+                let constants_slice: &[TValue] = &constants_rc[..];
+
+                // perf: get_unchecked 跳过边界检查 (上方已检查 pc < code_len)
+                #[cfg(feature = "fast_unsafe")]
+                let inst = unsafe { *code_ptr.add(pc) };
+                #[cfg(not(feature = "fast_unsafe"))]
+                let inst = code_rc[pc];
+                pc += 1; // 寄存器自增 (对应 C 的 *(pc++)); 当前指令索引 = pc - 1
+                let op = opcodes::get_opcode(inst);
+
+                // base 寄存器化调试断言: 任何 handler 修改 state.base 必须经过
+                // reload_istream 刷新点, 否则此处立即失败并指出 opcode。
+                debug_assert_eq!(
+                    base,
+                    state.base,
+                    "base cache diverged: op={:?} pc={} local={} state={}",
                     op,
                     pc - 1,
-                    state.top,
-                    boundary_bound,
-                    state.lua_frame_ceiling,
-                    state.mret_end
+                    base,
+                    state.base
                 );
-                #[cfg(feature = "probe_livetop")]
-                if state.top < boundary_bound {
-                    Self::report_livetop(state, op, pc - 1, boundary_bound);
-                }
-            }
+                // ci/base 一致性断言: 当前帧记录 (call_stack 栈顶, C 的 L->ci) 的
+                // `func` 必须与 state.base 同步 —— `func + 1 == base`（VARARGPREP 位移
+                // 二者一体调整）。入口帧（pcall / 协程体）没有记录 → 栈为空。
+                debug_assert!(
+                    state
+                        .call_stack
+                        .last()
+                        .map_or(true, |f| f.func + 1 == state.base),
+                    "ci/base diverged: op={:?} pc={} base={} ci={:?}",
+                    op,
+                    pc - 1,
+                    state.base,
+                    state.call_stack.last().map(|f| (f.func, f.base, f.top))
+                );
 
-            // perf: hook 检查与调试跟踪合并为单次位测试, 且被测值是 `trap`
-            // (state.hook_mask 的**循环局部寄存器缓存**)。`trace_level | trap` 为 0
-            // 时 (bench/生产常态) 一条 or+jcc 跳过两个路径, 且循环头不再 load
-            // state.hook_mask —— 该 load 变成 SSA phi: 只在「可能改变 hook_mask 的
-            // 指令」收尾处重新读 (直线指令上被 GVN 折叠掉)。
-            //
-            // `trap` 刷新不变量 (取代 #147 的「必须每指令读 state.hook_mask」):
-            //   ① 循环入口与 reload_istream!(帧切换点: CALL/TAILCALL/RETURN*/
-            //      FORPREP/冷分发/错误恢复);
-            //   ② 每条**可能回调 Lua/C 代码或分配**的指令收尾处: GET* 冷路径、
-            //      SET* 两个分支 (漏斗分配 → 可能 GC → finalizer 里 sethook)、
-            //      算术 MMBIN*、比较/排序的元方法冷路径、TEST/TESTSET、VARARG*、
-            //      冷分发 (CONCAT/CLOSE/TFORCALL/NEWTABLE/SETLIST…, 经 reload)。
-            //   只有这些点能执行 debug.sethook / lua_sethook, 漏一处 = 新装的
-            //   line/count hook 在该指令边界不触发 (db.lua:491 的 VARARGPREP 场景
-            //   即由 VARARGPREP 臂的刷新覆盖)。直线指令 (MOVE/LOAD*/GETUPVAL/NOT/
-            //   FORLOOP/SETUPVAL…) 无从改变 hook_mask, 故不刷新。
-            //
-            // 测试整个低字节 (而非先 `& (4|8)`): 省一条 and; 代价是只装了
-            // call/return hook 时也会进冷块 —— 块内 `trap & (4|8) == 0` 立即落出,
-            // 与 C 的 luaG_traceexec 早退同义 (指令边界只可能触发 line/count hook)。
-            // 不能 #[cfg(debug_assertions)] 裁掉本检查: release 构建也必须支持
-            // line/count hook (db.lua 在 all.lua 正确性门禁内), 否则 release 下
-            // debug.sethook("l"/"c") 静默失效。C 的 luaG_traceexec 同样每指令判读。
-            if trace_level | trap as u8 != 0 && op != OpCode::VARARGPREP {
-                core::hint::cold_path();
-                state.pc = pc - 1; // sync: 行 hook/trace 需要 state.pc = 当前指令 (C savepc)
-                                   // 对应 C 的 luaG_traceexec: count hook + line hook
-                if trap & (4 | 8) != 0 {
-                    Self::traceexec_hooks(state)?;
-                    trap = state.hook_mask;
+                // live top 恒不低于当前帧的寄存器上界 (在 hook 之前完成!): 帧内寄存器写在 top
+                // 之下, 所有寄存器读以 top 为上界; 且 hook 帧/元方法帧都从 top 起压入 —— 若
+                // hook 在抬高之前运行, 它的帧会盖住上一条指令的多返回值 (实测 db.lua/events.lua
+                // 的 `{f(table.unpack(...))}` 丢元素)。
+                //
+                // perf: 抬升不再在此处**每条指令**做一次 (`max(产出末尾, 帧上界)` = 2 次字段读
+                // + 比较 + 条件写), 改由「改变了 live top / 上界的那条指令」在收尾处调用
+                // [`LuaState::sync_live_top`] 精确抬回 (与旧写法逐点等价, 见该函数文档)。
+                //
+                // 安全构建 (`--no-default-features`) 保留此处抬升: 它的 `read_stack` 以 top
+                // 为寄存器读上界 (该函数的不变量说明), 需要「指令边界的 top ≥ 帧上界」。
+                #[cfg(not(feature = "fast_unsafe"))]
+                if op != OpCode::VARARGPREP {
+                    state.sync_live_top();
                 }
-                #[cfg(debug_assertions)]
-                if trace_level >= 1 {
-                    Self::trace_exec(state, trace_level);
+                // 边界不变量守卫: 抬升由改变了 top / 上界的指令在收尾处完成 (见
+                // `LuaState::sync_live_top`), 漏一处即在此暴露 —— debug 构建直接断言
+                // (与 base 缓存断言同类), `probe_livetop` 构建在 release 下报告。
+                // 检查对象是**当前帧的真实上界**而非 `lua_frame_ceiling` 字段: 后者可能
+                // 被嵌套 VM (hook / 元方法 / C 回调) 遗留的帧上界覆盖 (见 true_live_ceiling)。
+                // 该守卫在普通 release 构建下**完全编译掉** (零每指令开销): 只在 debug
+                // 构建 (cargo test) 或 probe_livetop 构建下存在。
+                #[cfg(all(
+                    feature = "fast_unsafe",
+                    any(debug_assertions, feature = "probe_livetop")
+                ))]
+                if op != OpCode::VARARGPREP {
+                    let boundary_bound = Self::true_live_ceiling(state);
+                    debug_assert!(
+                        state.top >= boundary_bound,
+                        "边界 top 低于帧上界: op={:?} pc={} top={} bound={} ceiling={} mret={}",
+                        op,
+                        pc - 1,
+                        state.top,
+                        boundary_bound,
+                        state.lua_frame_ceiling,
+                        state.mret_end
+                    );
+                    #[cfg(feature = "probe_livetop")]
+                    if state.top < boundary_bound {
+                        Self::report_livetop(state, op, pc - 1, boundary_bound);
+                    }
                 }
-            }
 
-            #[cfg(not(feature = "fast_unsafe"))]
-            let _fs = match state.stack.get(state.base.saturating_sub(1)) {
-                Some(TValue::LClosure(c2)) => c2.proto.max_stack_size as usize,
-                _ => usize::MAX,
-            };
-            #[cfg(not(feature = "fast_unsafe"))]
-            DISPATCH_CTX.with(|c| c.set((state.top, state.base, pc, Some(op), _fs)));
+                // perf: hook 检查与调试跟踪合并为单次位测试, 且被测值是 `trap`
+                // (state.hook_mask 的**循环局部寄存器缓存**)。`trace_level | trap` 为 0
+                // 时 (bench/生产常态) 一条 or+jcc 跳过两个路径, 且循环头不再 load
+                // state.hook_mask —— 该 load 变成 SSA phi: 只在「可能改变 hook_mask 的
+                // 指令」收尾处重新读 (直线指令上被 GVN 折叠掉)。
+                //
+                // `trap` 刷新不变量 (取代 #147 的「必须每指令读 state.hook_mask」):
+                //   ① 循环入口与 reload_istream!(帧切换点: CALL/TAILCALL/RETURN*/
+                //      FORPREP/冷分发/错误恢复);
+                //   ② 每条**可能回调 Lua/C 代码或分配**的指令收尾处: GET* 冷路径、
+                //      SET* 两个分支 (漏斗分配 → 可能 GC → finalizer 里 sethook)、
+                //      算术 MMBIN*、比较/排序的元方法冷路径、TEST/TESTSET、VARARG*、
+                //      冷分发 (CONCAT/CLOSE/TFORCALL/NEWTABLE/SETLIST…, 经 reload)。
+                //   只有这些点能执行 debug.sethook / lua_sethook, 漏一处 = 新装的
+                //   line/count hook 在该指令边界不触发 (db.lua:491 的 VARARGPREP 场景
+                //   即由 VARARGPREP 臂的刷新覆盖)。直线指令 (MOVE/LOAD*/GETUPVAL/NOT/
+                //   FORLOOP/SETUPVAL…) 无从改变 hook_mask, 故不刷新。
+                //
+                // 测试整个低字节 (而非先 `& (4|8)`): 省一条 and; 代价是只装了
+                // call/return hook 时也会进冷块 —— 块内 `trap & (4|8) == 0` 立即落出,
+                // 与 C 的 luaG_traceexec 早退同义 (指令边界只可能触发 line/count hook)。
+                // 不能 #[cfg(debug_assertions)] 裁掉本检查: release 构建也必须支持
+                // line/count hook (db.lua 在 all.lua 正确性门禁内), 否则 release 下
+                // debug.sethook("l"/"c") 静默失效。C 的 luaG_traceexec 同样每指令判读。
+                if trace_level | trap as u8 != 0 && op != OpCode::VARARGPREP {
+                    core::hint::cold_path();
+                    state.pc = pc - 1; // sync: 行 hook/trace 需要 state.pc = 当前指令 (C savepc)
+                                       // 对应 C 的 luaG_traceexec: count hook + line hook
+                    if trap & (4 | 8) != 0 {
+                        Self::traceexec_hooks(state)?;
+                        trap = state.hook_mask;
+                    }
+                    #[cfg(debug_assertions)]
+                    if trace_level >= 1 {
+                        Self::trace_exec(state, trace_level);
+                    }
+                }
 
-            // live top 恒不低于当前帧的寄存器上界: 帧内寄存器写在 top 之下, 且所有寄存器
-            // 读以 top 为上界 (safe 构建 read_stack 的断言). 个别指令会把 top 临时收到
-            // 「本次调用的结果末尾」(对齐 C 的 `L->top = res + nres`), 在指令边界统一复原
-            // —— 语义仍是 C 的 `ci->top`, 不是逐写维护 (写路径完全不碰 top).
-            // 读边界 = max(帧寄存器上界, 最近一次多返回值产出的末尾) —— 正是 C 里
-            // `L->top` 的含义: `ci->top` 覆盖帧内寄存器, 而多返回值 (OP_CALL/OP_VARARG
-            // 的结果) 可能落在 `ci->top` 之上 (C 用 `L->top` 携带该位置, 其寄存器读
-            // 不做边界检查; 本实现把它显式化)。
+                #[cfg(not(feature = "fast_unsafe"))]
+                let _fs = match state.stack.get(state.base.saturating_sub(1)) {
+                    Some(TValue::LClosure(c2)) => c2.proto.max_stack_size as usize,
+                    _ => usize::MAX,
+                };
+                #[cfg(not(feature = "fast_unsafe"))]
+                DISPATCH_CTX.with(|c| c.set((state.top, state.base, pc, Some(op), _fs)));
 
-            // 主分发: 热门 opcode 内联处理, 冷门 opcode 路由到 #[cold] 函数
-            // 提取冷门 opcode 改善 icache 密度 — 主循环代码体积减少约 40%
-            // (perf 显示 execute_loop 占 10.65%, 主循环本身是 icache 敏感的热点)
-            let result = match op {
-                // === deleted 类: 直线指令 — 零 pc 内存操作 (循环头 pc+=1 覆盖推进) ===
-                // 数据移动/加载
-                OpCode::MOVE => Self::op_move(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    base,
-                    state.top,
-                    inst,
-                ),
-                OpCode::LOADI => Self::op_loadi(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    base,
-                    state.top,
-                    inst,
-                ),
-                OpCode::LOADF => Self::op_loadf(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    base,
-                    state.top,
-                    inst,
-                ),
-                OpCode::LOADK => Self::op_loadk(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    constants_slice,
-                    base,
-                    state.top,
-                    inst,
-                ),
-                OpCode::LOADFALSE => Self::op_loadfalse(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    base,
-                    state.top,
-                    inst,
-                ),
-                OpCode::LFALSESKIP => match Self::op_lfalseskip(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    base,
-                    state.top,
-                    inst,
-                    pc,
-                ) {
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        state.pc = pc - 1;
-                        Err(err)
-                    }
-                },
-                OpCode::LOADTRUE => Self::op_loadtrue(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    base,
-                    state.top,
-                    inst,
-                ),
-                OpCode::LOADNIL => Self::op_loadnil(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    base,
-                    state.top,
-                    inst,
-                ),
-                // === 热门 opcode: 表读 (GETTABUP/GETTABLE/GETI/GETFIELD 为 param-cur:
-                //     慢路径 sync state.pc = cur, 对应 C 的 savepc) ===
-                OpCode::GETUPVAL => {
-                    let r = Self::op_getupval(base, state, inst);
-                    trap = state.hook_mask;
-                    r
-                }
-                // 表读族一律热/冷分离: 快路径 (无元表 Table) 在 handler 内写完返回
-                // Ok(true) —— 它不回调 Lua、不分配, 故**不刷新** `trap` (hook_mask
-                // 缓存, 见循环头注释); 未命中交 `#[cold]` 版本, 那里可能跑 __index /
-                // 报错, 返回后刷新。
-                OpCode::GETTABUP => match Self::op_gettabup(base, state, inst, &mut pc) {
-                    Ok(true) => Ok(()),
-                    Ok(false) => {
-                        let r = Self::op_gettabup_cold(base, state, inst, pc);
+                // live top 恒不低于当前帧的寄存器上界: 帧内寄存器写在 top 之下, 且所有寄存器
+                // 读以 top 为上界 (safe 构建 read_stack 的断言). 个别指令会把 top 临时收到
+                // 「本次调用的结果末尾」(对齐 C 的 `L->top = res + nres`), 在指令边界统一复原
+                // —— 语义仍是 C 的 `ci->top`, 不是逐写维护 (写路径完全不碰 top).
+                // 读边界 = max(帧寄存器上界, 最近一次多返回值产出的末尾) —— 正是 C 里
+                // `L->top` 的含义: `ci->top` 覆盖帧内寄存器, 而多返回值 (OP_CALL/OP_VARARG
+                // 的结果) 可能落在 `ci->top` 之上 (C 用 `L->top` 携带该位置, 其寄存器读
+                // 不做边界检查; 本实现把它显式化)。
+
+                // 主分发: 热门 opcode 内联处理, 冷门 opcode 路由到 #[cold] 函数
+                // 提取冷门 opcode 改善 icache 密度 — 主循环代码体积减少约 40%
+                // (perf 显示 execute_loop 占 10.65%, 主循环本身是 icache 敏感的热点)
+                match op {
+                    // === deleted 类: 直线指令 — 零 pc 内存操作 (循环头 pc+=1 覆盖推进) ===
+                    // 数据移动/加载
+                    OpCode::MOVE => try_inst!(Self::op_move(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        base,
+                        state.top,
+                        inst,
+                    )),
+                    OpCode::LOADI => try_inst!(Self::op_loadi(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        base,
+                        state.top,
+                        inst,
+                    )),
+                    OpCode::LOADF => try_inst!(Self::op_loadf(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        base,
+                        state.top,
+                        inst,
+                    )),
+                    OpCode::LOADK => try_inst!(Self::op_loadk(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        constants_slice,
+                        base,
+                        state.top,
+                        inst,
+                    )),
+                    OpCode::LOADFALSE => try_inst!(Self::op_loadfalse(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        base,
+                        state.top,
+                        inst,
+                    )),
+                    OpCode::LFALSESKIP => try_inst!(match Self::op_lfalseskip(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        base,
+                        state.top,
+                        inst,
+                        pc,
+                    ) {
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            Ok(())
+                        }
+                        Err(err) => {
+                            state.pc = pc - 1;
+                            Err(err)
+                        }
+                    }),
+                    OpCode::LOADTRUE => try_inst!(Self::op_loadtrue(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        base,
+                        state.top,
+                        inst,
+                    )),
+                    OpCode::LOADNIL => try_inst!(Self::op_loadnil(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        base,
+                        state.top,
+                        inst,
+                    )),
+                    // === 热门 opcode: 表读 (GETTABUP/GETTABLE/GETI/GETFIELD 为 param-cur:
+                    //     慢路径 sync state.pc = cur, 对应 C 的 savepc) ===
+                    OpCode::GETUPVAL => try_inst!({
+                        let r = Self::op_getupval(base, state, inst);
                         trap = state.hook_mask;
                         r
+                    }),
+                    // 表读族一律热/冷分离: 快路径 (无元表 Table) 在 handler 内写完返回
+                    // Ok(true) —— 它不回调 Lua、不分配, 故**不刷新** `trap` (hook_mask
+                    // 缓存, 见循环头注释); 未命中交 `#[cold]` 版本, 那里可能跑 __index /
+                    // 报错, 返回后刷新。
+                    OpCode::GETTABUP => {
+                        try_inst!(match Self::op_gettabup(base, state, inst, &mut pc) {
+                            Ok(true) => Ok(()),
+                            Ok(false) => {
+                                let r = Self::op_gettabup_cold(base, state, inst, pc);
+                                trap = state.hook_mask;
+                                r
+                            }
+                            Err(err) => Err(err),
+                        })
                     }
-                    Err(err) => Err(err),
-                },
-                OpCode::GETTABLE => match Self::op_gettable(base, state, inst) {
-                    Ok(true) => Ok(()),
-                    Ok(false) => {
-                        let r = Self::op_gettable_cold(base, state, inst, pc);
-                        trap = state.hook_mask;
-                        r
-                    }
-                    Err(err) => Err(err),
-                },
-                OpCode::GETI => match Self::op_geti(base, state, inst) {
-                    Ok(true) => Ok(()),
-                    Ok(false) => {
-                        let r = Self::op_geti_cold(base, state, inst, pc);
-                        trap = state.hook_mask;
-                        r
-                    }
-                    Err(err) => Err(err),
-                },
-                OpCode::GETFIELD => match Self::op_getfield(base, state, inst, &mut pc) {
-                    Ok(true) => Ok(()),
-                    Ok(false) => {
-                        let r = Self::op_getfield_cold(base, state, inst, pc);
-                        trap = state.hook_mask;
-                        r
-                    }
-                    Err(err) => Err(err),
-                },
-                // === 热门 opcode: 表写 (param-cur) ===
-                // 表写族同样热/冷分离, 但刷新 `trap` 必须**无条件**做: 快路径也会
-                // 经 table_set 漏斗分配 (可能触发 GC → finalizer 里 sethook),
-                // 慢路径还要跑 __newindex。
-                OpCode::SETTABUP => {
-                    let r = Self::op_settabup(base, state, inst);
-                    trap = state.hook_mask;
-                    match r {
+                    OpCode::GETTABLE => try_inst!(match Self::op_gettable(base, state, inst) {
                         Ok(true) => Ok(()),
-                        Ok(false) => Self::op_settabup_cold(base, state, inst, pc),
+                        Ok(false) => {
+                            let r = Self::op_gettable_cold(base, state, inst, pc);
+                            trap = state.hook_mask;
+                            r
+                        }
                         Err(err) => Err(err),
-                    }
-                }
-                OpCode::SETTABLE => {
-                    let r = Self::op_settable(base, state, inst);
-                    trap = state.hook_mask;
-                    match r {
+                    }),
+                    OpCode::GETI => try_inst!(match Self::op_geti(base, state, inst) {
                         Ok(true) => Ok(()),
-                        Ok(false) => Self::op_settable_cold(base, state, inst, pc),
+                        Ok(false) => {
+                            let r = Self::op_geti_cold(base, state, inst, pc);
+                            trap = state.hook_mask;
+                            r
+                        }
                         Err(err) => Err(err),
+                    }),
+                    OpCode::GETFIELD => {
+                        try_inst!(match Self::op_getfield(base, state, inst, &mut pc) {
+                            Ok(true) => Ok(()),
+                            Ok(false) => {
+                                let r = Self::op_getfield_cold(base, state, inst, pc);
+                                trap = state.hook_mask;
+                                r
+                            }
+                            Err(err) => Err(err),
+                        })
                     }
-                }
-                OpCode::SETI => {
-                    let r = Self::op_seti(base, state, inst);
-                    trap = state.hook_mask;
-                    match r {
-                        Ok(true) => Ok(()),
-                        Ok(false) => Self::op_seti_cold(base, state, inst, pc),
-                        Err(err) => Err(err),
-                    }
-                }
-                OpCode::SETFIELD => {
-                    let r = Self::op_setfield(base, state, inst);
-                    trap = state.hook_mask;
-                    match r {
-                        Ok(true) => Ok(()),
-                        Ok(false) => Self::op_setfield_cold(base, state, inst, pc),
-                        Err(err) => Err(err),
-                    }
-                }
-                // === 热门 opcode: 算术运算 (param-pc: 成功 *pc += 1 跳过 MMBIN) ===
-                OpCode::ADDI => match Self::op_addi(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    base,
-                    state.top,
-                    inst,
-                    pc,
-                ) {
-                    Ok(usize::MAX) => Ok(()),
-                    Ok(new_pc) => {
-                        pc = new_pc;
+                    // === 热门 opcode: 表写 (param-cur) ===
+                    // 表写族同样热/冷分离, 但刷新 `trap` 必须**无条件**做: 快路径也会
+                    // 经 table_set 漏斗分配 (可能触发 GC → finalizer 里 sethook),
+                    // 慢路径还要跑 __newindex。
+                    OpCode::SETTABUP => try_inst!({
+                        let r = Self::op_settabup(base, state, inst);
                         trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        state.pc = pc - 1;
+                        match r {
+                            Ok(true) => Ok(()),
+                            Ok(false) => Self::op_settabup_cold(base, state, inst, pc),
+                            Err(err) => Err(err),
+                        }
+                    }),
+                    OpCode::SETTABLE => try_inst!({
+                        let r = Self::op_settable(base, state, inst);
                         trap = state.hook_mask;
-                        Err(err)
-                    }
-                },
-                OpCode::ADDK => match Self::op_addk(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    constants_slice,
-                    base,
-                    state.top,
-                    inst,
-                    pc,
-                ) {
-                    Ok(usize::MAX) => Ok(()),
-                    Ok(new_pc) => {
-                        pc = new_pc;
+                        match r {
+                            Ok(true) => Ok(()),
+                            Ok(false) => Self::op_settable_cold(base, state, inst, pc),
+                            Err(err) => Err(err),
+                        }
+                    }),
+                    OpCode::SETI => try_inst!({
+                        let r = Self::op_seti(base, state, inst);
                         trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        state.pc = pc - 1;
+                        match r {
+                            Ok(true) => Ok(()),
+                            Ok(false) => Self::op_seti_cold(base, state, inst, pc),
+                            Err(err) => Err(err),
+                        }
+                    }),
+                    OpCode::SETFIELD => try_inst!({
+                        let r = Self::op_setfield(base, state, inst);
                         trap = state.hook_mask;
-                        Err(err)
-                    }
-                },
-                OpCode::SUBK => match Self::op_subk(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    constants_slice,
-                    base,
-                    state.top,
-                    inst,
-                    pc,
-                ) {
-                    Ok(usize::MAX) => Ok(()),
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        state.pc = pc - 1;
-                        trap = state.hook_mask;
-                        Err(err)
-                    }
-                },
-                OpCode::MULK => match Self::op_mulk(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    constants_slice,
-                    base,
-                    state.top,
-                    inst,
-                    pc,
-                ) {
-                    Ok(usize::MAX) => Ok(()),
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        state.pc = pc - 1;
-                        trap = state.hook_mask;
-                        Err(err)
-                    }
-                },
-                OpCode::MODK => match Self::op_modk(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    constants_slice,
-                    base,
-                    state.top,
-                    inst,
-                    pc,
-                ) {
-                    Ok(usize::MAX) => Ok(()),
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        state.pc = pc - 1;
-                        trap = state.hook_mask;
-                        Err(err)
-                    }
-                },
-                OpCode::POWK => match Self::op_powk(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    constants_slice,
-                    base,
-                    state.top,
-                    inst,
-                    pc,
-                ) {
-                    Ok(usize::MAX) => Ok(()),
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        state.pc = pc - 1;
-                        trap = state.hook_mask;
-                        Err(err)
-                    }
-                },
-                OpCode::DIVK => match Self::op_divk(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    constants_slice,
-                    base,
-                    state.top,
-                    inst,
-                    pc,
-                ) {
-                    Ok(usize::MAX) => Ok(()),
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        state.pc = pc - 1;
-                        trap = state.hook_mask;
-                        Err(err)
-                    }
-                },
-                OpCode::IDIVK => match Self::op_idivk(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    constants_slice,
-                    base,
-                    state.top,
-                    inst,
-                    pc,
-                ) {
-                    Ok(usize::MAX) => Ok(()),
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        state.pc = pc - 1;
-                        trap = state.hook_mask;
-                        Err(err)
-                    }
-                },
-                OpCode::ADD => match Self::op_add(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    base,
-                    state.top,
-                    inst,
-                    pc,
-                ) {
-                    Ok(usize::MAX) => Ok(()),
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        state.pc = pc - 1;
-                        trap = state.hook_mask;
-                        Err(err)
-                    }
-                },
-                OpCode::SUB => match Self::op_sub(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    base,
-                    state.top,
-                    inst,
-                    pc,
-                ) {
-                    Ok(usize::MAX) => Ok(()),
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        state.pc = pc - 1;
-                        trap = state.hook_mask;
-                        Err(err)
-                    }
-                },
-                OpCode::MUL => match Self::op_mul(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    base,
-                    state.top,
-                    inst,
-                    pc,
-                ) {
-                    Ok(usize::MAX) => Ok(()),
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        state.pc = pc - 1;
-                        trap = state.hook_mask;
-                        Err(err)
-                    }
-                },
-                OpCode::MOD => match Self::op_mod(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    base,
-                    state.top,
-                    inst,
-                    pc,
-                ) {
-                    Ok(usize::MAX) => Ok(()),
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        state.pc = pc - 1;
-                        trap = state.hook_mask;
-                        Err(err)
-                    }
-                },
-                OpCode::POW => match Self::op_pow(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    base,
-                    state.top,
-                    inst,
-                    pc,
-                ) {
-                    Ok(usize::MAX) => Ok(()),
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        state.pc = pc - 1;
-                        trap = state.hook_mask;
-                        Err(err)
-                    }
-                },
-                OpCode::DIV => match Self::op_div(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    base,
-                    state.top,
-                    inst,
-                    pc,
-                ) {
-                    Ok(usize::MAX) => Ok(()),
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        state.pc = pc - 1;
-                        trap = state.hook_mask;
-                        Err(err)
-                    }
-                },
-                OpCode::IDIV => match Self::op_idiv(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    base,
-                    state.top,
-                    inst,
-                    pc,
-                ) {
-                    Ok(usize::MAX) => Ok(()),
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => {
-                        state.pc = pc - 1;
-                        trap = state.hook_mask;
-                        Err(err)
-                    }
-                },
-                // === 热门 opcode: 逻辑非 (deleted) ===
-                OpCode::NOT => Self::op_not(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    base,
-                    state.top,
-                    inst,
-                ),
-                // === 热门 opcode: 跳转/比较 (param-pc; 比较冷路径带 cur sync) ===
-                OpCode::JMP => match Self::op_jmp(state, inst, pc) {
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => Err(err),
-                },
-                OpCode::EQ => match Self::op_eq(base, state, inst, pc) {
-                    Ok(usize::MAX) => {
-                        let r = Self::equal_jump_cold(state, base, inst, &mut pc);
-                        trap = state.hook_mask;
-                        r
-                    }
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => Err(err),
-                },
-                OpCode::LT => match Self::op_lt(base, state, inst, pc) {
-                    Ok(usize::MAX) => {
-                        let r = Self::order_jump_cold(state, base, inst, &mut pc, TagMethod::Lt);
-                        trap = state.hook_mask;
-                        r
-                    }
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => Err(err),
-                },
-                OpCode::LE => match Self::op_le(base, state, inst, pc) {
-                    Ok(usize::MAX) => {
-                        let r = Self::order_jump_cold(state, base, inst, &mut pc, TagMethod::Le);
-                        trap = state.hook_mask;
-                        r
-                    }
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => Err(err),
-                },
-                OpCode::EQK => match Self::op_eqk(base, state, inst, pc) {
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => Err(err),
-                },
-                OpCode::EQI => match Self::op_eqi(base, state, inst, pc) {
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => Err(err),
-                },
-                OpCode::LTI => match Self::op_lti(base, state, inst, pc) {
-                    Ok(usize::MAX) => {
-                        let r = Self::order_int_jump_cold(
-                            state,
-                            base,
-                            inst,
-                            &mut pc,
-                            false,
-                            TagMethod::Lt,
-                        );
-                        trap = state.hook_mask;
-                        r
-                    }
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => Err(err),
-                },
-                OpCode::LEI => match Self::op_lei(base, state, inst, pc) {
-                    Ok(usize::MAX) => {
-                        let r = Self::order_int_jump_cold(
-                            state,
-                            base,
-                            inst,
-                            &mut pc,
-                            false,
-                            TagMethod::Le,
-                        );
-                        trap = state.hook_mask;
-                        r
-                    }
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => Err(err),
-                },
-                OpCode::GTI => match Self::op_gti(base, state, inst, pc) {
-                    Ok(usize::MAX) => {
-                        let r = Self::order_int_jump_cold(
-                            state,
-                            base,
-                            inst,
-                            &mut pc,
-                            true,
-                            TagMethod::Lt,
-                        );
-                        trap = state.hook_mask;
-                        r
-                    }
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => Err(err),
-                },
-                OpCode::GEI => match Self::op_gei(base, state, inst, pc) {
-                    Ok(usize::MAX) => {
-                        let r = Self::order_int_jump_cold(
-                            state,
-                            base,
-                            inst,
-                            &mut pc,
-                            true,
-                            TagMethod::Le,
-                        );
-                        trap = state.hook_mask;
-                        r
-                    }
-                    Ok(new_pc) => {
-                        pc = new_pc;
-                        trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => Err(err),
-                },
-                OpCode::TEST => {
-                    match Self::op_test(&mut state.stack, &state.code, base, state.top, inst, pc) {
+                        match r {
+                            Ok(true) => Ok(()),
+                            Ok(false) => Self::op_setfield_cold(base, state, inst, pc),
+                            Err(err) => Err(err),
+                        }
+                    }),
+                    // === 热门 opcode: 算术运算 (param-pc: 成功 *pc += 1 跳过 MMBIN) ===
+                    OpCode::ADDI => try_inst!(match Self::op_addi(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        base,
+                        state.top,
+                        inst,
+                        pc,
+                    ) {
+                        Ok(usize::MAX) => Ok(()),
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => {
+                            state.pc = pc - 1;
+                            trap = state.hook_mask;
+                            Err(err)
+                        }
+                    }),
+                    OpCode::ADDK => try_inst!(match Self::op_addk(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        constants_slice,
+                        base,
+                        state.top,
+                        inst,
+                        pc,
+                    ) {
+                        Ok(usize::MAX) => Ok(()),
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => {
+                            state.pc = pc - 1;
+                            trap = state.hook_mask;
+                            Err(err)
+                        }
+                    }),
+                    OpCode::SUBK => try_inst!(match Self::op_subk(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        constants_slice,
+                        base,
+                        state.top,
+                        inst,
+                        pc,
+                    ) {
+                        Ok(usize::MAX) => Ok(()),
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => {
+                            state.pc = pc - 1;
+                            trap = state.hook_mask;
+                            Err(err)
+                        }
+                    }),
+                    OpCode::MULK => try_inst!(match Self::op_mulk(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        constants_slice,
+                        base,
+                        state.top,
+                        inst,
+                        pc,
+                    ) {
+                        Ok(usize::MAX) => Ok(()),
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => {
+                            state.pc = pc - 1;
+                            trap = state.hook_mask;
+                            Err(err)
+                        }
+                    }),
+                    OpCode::MODK => try_inst!(match Self::op_modk(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        constants_slice,
+                        base,
+                        state.top,
+                        inst,
+                        pc,
+                    ) {
+                        Ok(usize::MAX) => Ok(()),
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => {
+                            state.pc = pc - 1;
+                            trap = state.hook_mask;
+                            Err(err)
+                        }
+                    }),
+                    OpCode::POWK => try_inst!(match Self::op_powk(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        constants_slice,
+                        base,
+                        state.top,
+                        inst,
+                        pc,
+                    ) {
+                        Ok(usize::MAX) => Ok(()),
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => {
+                            state.pc = pc - 1;
+                            trap = state.hook_mask;
+                            Err(err)
+                        }
+                    }),
+                    OpCode::DIVK => try_inst!(match Self::op_divk(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        constants_slice,
+                        base,
+                        state.top,
+                        inst,
+                        pc,
+                    ) {
+                        Ok(usize::MAX) => Ok(()),
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => {
+                            state.pc = pc - 1;
+                            trap = state.hook_mask;
+                            Err(err)
+                        }
+                    }),
+                    OpCode::IDIVK => try_inst!(match Self::op_idivk(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        constants_slice,
+                        base,
+                        state.top,
+                        inst,
+                        pc,
+                    ) {
+                        Ok(usize::MAX) => Ok(()),
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => {
+                            state.pc = pc - 1;
+                            trap = state.hook_mask;
+                            Err(err)
+                        }
+                    }),
+                    OpCode::ADD => try_inst!(match Self::op_add(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        base,
+                        state.top,
+                        inst,
+                        pc,
+                    ) {
+                        Ok(usize::MAX) => Ok(()),
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => {
+                            state.pc = pc - 1;
+                            trap = state.hook_mask;
+                            Err(err)
+                        }
+                    }),
+                    OpCode::SUB => try_inst!(match Self::op_sub(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        base,
+                        state.top,
+                        inst,
+                        pc,
+                    ) {
+                        Ok(usize::MAX) => Ok(()),
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => {
+                            state.pc = pc - 1;
+                            trap = state.hook_mask;
+                            Err(err)
+                        }
+                    }),
+                    OpCode::MUL => try_inst!(match Self::op_mul(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        base,
+                        state.top,
+                        inst,
+                        pc,
+                    ) {
+                        Ok(usize::MAX) => Ok(()),
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => {
+                            state.pc = pc - 1;
+                            trap = state.hook_mask;
+                            Err(err)
+                        }
+                    }),
+                    OpCode::MOD => try_inst!(match Self::op_mod(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        base,
+                        state.top,
+                        inst,
+                        pc,
+                    ) {
+                        Ok(usize::MAX) => Ok(()),
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => {
+                            state.pc = pc - 1;
+                            trap = state.hook_mask;
+                            Err(err)
+                        }
+                    }),
+                    OpCode::POW => try_inst!(match Self::op_pow(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        base,
+                        state.top,
+                        inst,
+                        pc,
+                    ) {
+                        Ok(usize::MAX) => Ok(()),
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => {
+                            state.pc = pc - 1;
+                            trap = state.hook_mask;
+                            Err(err)
+                        }
+                    }),
+                    OpCode::DIV => try_inst!(match Self::op_div(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        base,
+                        state.top,
+                        inst,
+                        pc,
+                    ) {
+                        Ok(usize::MAX) => Ok(()),
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => {
+                            state.pc = pc - 1;
+                            trap = state.hook_mask;
+                            Err(err)
+                        }
+                    }),
+                    OpCode::IDIV => try_inst!(match Self::op_idiv(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        base,
+                        state.top,
+                        inst,
+                        pc,
+                    ) {
+                        Ok(usize::MAX) => Ok(()),
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => {
+                            state.pc = pc - 1;
+                            trap = state.hook_mask;
+                            Err(err)
+                        }
+                    }),
+                    // === 热门 opcode: 逻辑非 (deleted) ===
+                    OpCode::NOT => try_inst!(Self::op_not(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        base,
+                        state.top,
+                        inst,
+                    )),
+                    // === 热门 opcode: 跳转/比较 (param-pc; 比较冷路径带 cur sync) ===
+                    OpCode::JMP => try_inst!(match Self::op_jmp(state, inst, pc) {
                         Ok(new_pc) => {
                             pc = new_pc;
                             trap = state.hook_mask;
                             Ok(())
                         }
                         Err(err) => Err(err),
-                    }
-                }
-                OpCode::TESTSET => match Self::op_testset(
-                    &mut state.drop_queue,
-                    &mut state.stack,
-                    &state.code,
-                    base,
-                    state.top,
-                    inst,
-                    pc,
-                ) {
-                    Ok(new_pc) => {
-                        pc = new_pc;
+                    }),
+                    OpCode::EQ => try_inst!(match Self::op_eq(base, state, inst, pc) {
+                        Ok(usize::MAX) => {
+                            let r = Self::equal_jump_cold(state, base, inst, &mut pc);
+                            trap = state.hook_mask;
+                            r
+                        }
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    }),
+                    OpCode::LT => try_inst!(match Self::op_lt(base, state, inst, pc) {
+                        Ok(usize::MAX) => {
+                            let r =
+                                Self::order_jump_cold(state, base, inst, &mut pc, TagMethod::Lt);
+                            trap = state.hook_mask;
+                            r
+                        }
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    }),
+                    OpCode::LE => try_inst!(match Self::op_le(base, state, inst, pc) {
+                        Ok(usize::MAX) => {
+                            let r =
+                                Self::order_jump_cold(state, base, inst, &mut pc, TagMethod::Le);
+                            trap = state.hook_mask;
+                            r
+                        }
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    }),
+                    OpCode::EQK => try_inst!(match Self::op_eqk(base, state, inst, pc) {
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    }),
+                    OpCode::EQI => try_inst!(match Self::op_eqi(base, state, inst, pc) {
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    }),
+                    OpCode::LTI => try_inst!(match Self::op_lti(base, state, inst, pc) {
+                        Ok(usize::MAX) => {
+                            let r = Self::order_int_jump_cold(
+                                state,
+                                base,
+                                inst,
+                                &mut pc,
+                                false,
+                                TagMethod::Lt,
+                            );
+                            trap = state.hook_mask;
+                            r
+                        }
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    }),
+                    OpCode::LEI => try_inst!(match Self::op_lei(base, state, inst, pc) {
+                        Ok(usize::MAX) => {
+                            let r = Self::order_int_jump_cold(
+                                state,
+                                base,
+                                inst,
+                                &mut pc,
+                                false,
+                                TagMethod::Le,
+                            );
+                            trap = state.hook_mask;
+                            r
+                        }
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    }),
+                    OpCode::GTI => try_inst!(match Self::op_gti(base, state, inst, pc) {
+                        Ok(usize::MAX) => {
+                            let r = Self::order_int_jump_cold(
+                                state,
+                                base,
+                                inst,
+                                &mut pc,
+                                true,
+                                TagMethod::Lt,
+                            );
+                            trap = state.hook_mask;
+                            r
+                        }
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    }),
+                    OpCode::GEI => try_inst!(match Self::op_gei(base, state, inst, pc) {
+                        Ok(usize::MAX) => {
+                            let r = Self::order_int_jump_cold(
+                                state,
+                                base,
+                                inst,
+                                &mut pc,
+                                true,
+                                TagMethod::Le,
+                            );
+                            trap = state.hook_mask;
+                            r
+                        }
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    }),
+                    OpCode::TEST => try_inst!(match Self::op_test(
+                        &mut state.stack,
+                        &state.code,
+                        base,
+                        state.top,
+                        inst,
+                        pc,
+                    ) {
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    }),
+                    OpCode::TESTSET => try_inst!(match Self::op_testset(
+                        &mut state.drop_queue,
+                        &mut state.stack,
+                        &state.code,
+                        base,
+                        state.top,
+                        inst,
+                        pc,
+                    ) {
+                        Ok(new_pc) => {
+                            pc = new_pc;
+                            trap = state.hook_mask;
+                            Ok(())
+                        }
+                        Err(err) => Err(err),
+                    }),
+                    // === 热门 opcode: 调用/返回 (flow 类: sync → handler → 重载) ===
+                    OpCode::CALL => try_inst!({
+                        state.pc = pc - 1;
+                        let r = Self::op_call(base, state, inst);
+                        // 帧边界排空（判定与 match 结果无关 → 提到 match 之前，分支漏不掉）
+                        state.drain_drop_queue_if_full();
                         trap = state.hook_mask;
-                        Ok(())
-                    }
-                    Err(err) => Err(err),
-                },
-                // === 热门 opcode: 调用/返回 (flow 类: sync → handler → 重载) ===
-                OpCode::CALL => {
-                    state.pc = pc - 1;
-                    let r = Self::op_call(base, state, inst);
-                    // 帧边界排空（判定与 match 结果无关 → 提到 match 之前，分支漏不掉）
-                    state.drain_drop_queue_if_full();
-                    trap = state.hook_mask;
-                    match r {
-                        // pure builtin: 帧未切, 缓存与 pc 均有效 (state.pc 已 +1 = 局部 pc),
-                        // 跳过重载 (显式抬升在 call_pure_builtin 收尾处, 那里帧上界未变)。
-                        Ok(CallOutcome::Fast) => Ok(()),
-                        Ok(CallOutcome::Reload) => {
-                            pc = state.pc;
-                            reload_istream!(state);
-                            // 调用收尾: live top 停在实参末尾/结果末尾, 抬回指令边界上界
-                            // (见 LuaState::sync_live_top)。必须在 reload_istream **之后**:
-                            // C 函数 (pcall / coroutine.resume) 内部跑过嵌套 VM 后,
-                            // lua_frame_ceiling 还是嵌套帧的陈旧值, reload 处的
-                            // recompute 才换回本帧上界。
-                            // 例外: 被调帧是 Lua 变参函数时下一条是 VARARGPREP, 它要看到
-                            // 帧入口压好的「实参末尾」(见 next_is_varargprep)。
-                            if !next_is_varargprep_at!(pc) {
-                                state.sync_live_top();
+                        match r {
+                            // pure builtin: 帧未切, 缓存与 pc 均有效 (state.pc 已 +1 = 局部 pc),
+                            // 跳过重载 (显式抬升在 call_pure_builtin 收尾处, 那里帧上界未变)。
+                            Ok(CallOutcome::Fast) => Ok(()),
+                            Ok(CallOutcome::Reload) => {
+                                // 调用收尾的 live-top 抬升统一交给 `'outer` 循环入口:
+                                // 那里先 `recompute_lua_frame_ceiling()`（换回**当前**帧的
+                                // 上界），再在「下一条指令不是 VARARGPREP」时 sync_live_top。
+                                // 不能在这里用调用前的 `lua_frame_ceiling` 抬升 —— 帧已切换
+                                // （被调 Lua 帧）或嵌套 VM（pcall / coroutine.resume）遗留旧
+                                // 上界，都会把 top 抬过头。实测 db.lua「multiple values x
+                                // hooks」`{f(table.unpack(...))}`: 这里按**调用者**帧上界把
+                                // 实参末尾抬高，紧跟的 VARARGPREP 按 top 算出多余的实参个数，
+                                // 于是返回整栈垃圾（#t = 96 而非 31）。
+                                continue 'outer;
                             }
-                            Ok(())
+                            Err(e) => Err(e),
                         }
-                        Err(e) => Err(e),
-                    }
-                }
-                OpCode::TAILCALL => {
-                    state.pc = pc - 1;
-                    let r = Self::op_tailcall(base, state, inst);
-                    pc = state.pc;
-                    reload_istream!(state);
-                    state.drain_drop_queue_if_full();
-                    // 尾调用收尾: C 目标把 top 压到实参/结果末尾、Lua 目标建立新帧
-                    // (非变参时 top 已 = 帧上界, 抬升是空操作) —— 统一抬回边界上界,
-                    // 变参目标例外 (下一条 VARARGPREP 要「实参末尾」)。
-                    if r.is_ok() && !next_is_varargprep_at!(pc) {
-                        state.sync_live_top();
-                    }
-                    r
-                }
-                OpCode::RETURN => {
-                    state.pc = pc - 1;
-                    let r = Self::op_return(base, state, inst);
-                    pc = state.pc;
-                    reload_istream!(state);
-                    Self::tick_check_interrupted(state, pc)?;
-                    state.drain_drop_queue_if_full();
-                    match r {
-                        Ok(Some(vr)) => return Ok(vr),
-                        Ok(None) => {
-                            // 帧切换收尾 (close continuation / pcall 恢复继续): live top
-                            // 已被 op_return* 复位为调用者帧上界或产出末尾, 抬回边界
-                            // (见 LuaState::sync_live_top)
-                            state.sync_live_top();
-                            Ok(())
+                    }),
+                    OpCode::TAILCALL => try_inst!({
+                        state.pc = pc - 1;
+                        let r = Self::op_tailcall(base, state, inst);
+                        if r.is_ok() {
+                            state.drain_drop_queue_if_full();
+                            continue 'outer;
                         }
-                        Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
-                        Err(e) => Err(e),
-                    }
-                }
-                OpCode::RETURN0 => {
-                    state.pc = pc - 1;
-                    let r = Self::op_return0(state, inst);
-                    pc = state.pc;
-                    reload_istream!(state);
-                    Self::tick_check_interrupted(state, pc)?;
-                    state.drain_drop_queue_if_full();
-                    match r {
-                        Ok(Some(vr)) => return Ok(vr),
-                        Ok(None) => {
-                            // 帧切换收尾 (close continuation / pcall 恢复继续): live top
-                            // 已被 op_return* 复位为调用者帧上界或产出末尾, 抬回边界
-                            // (见 LuaState::sync_live_top)
-                            state.sync_live_top();
-                            Ok(())
+                        r
+                    }),
+                    OpCode::RETURN => try_inst!({
+                        state.pc = pc - 1;
+                        let r = Self::op_return(base, state, inst);
+                        pc = state.pc;
+                        Self::tick_check_interrupted(state, pc)?;
+                        state.drain_drop_queue_if_full();
+                        match r {
+                            Ok(Some(vr)) => return Ok(vr),
+                            Ok(None) => {
+                                // 帧切换收尾 (close continuation / pcall 恢复继续): live top
+                                // 已被 op_return* 复位为调用者帧上界或产出末尾, 抬回边界
+                                // (见 LuaState::sync_live_top)
+                                state.sync_live_top();
+                                continue 'outer;
+                            }
+                            Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
+                            Err(e) => Err(e),
                         }
-                        Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
-                        Err(e) => Err(e),
-                    }
-                }
-                OpCode::RETURN1 => {
-                    state.pc = pc - 1;
-                    let r = Self::op_return1(base, state, inst);
-                    pc = state.pc;
-                    reload_istream!(state);
-                    Self::tick_check_interrupted(state, pc)?;
-                    state.drain_drop_queue_if_full();
-                    match r {
-                        Ok(Some(vr)) => return Ok(vr),
-                        Ok(None) => {
-                            // 帧切换收尾 (close continuation / pcall 恢复继续): live top
-                            // 已被 op_return* 复位为调用者帧上界或产出末尾, 抬回边界
-                            // (见 LuaState::sync_live_top)
-                            state.sync_live_top();
-                            Ok(())
+                    }),
+                    OpCode::RETURN0 => try_inst!({
+                        state.pc = pc - 1;
+                        let r = Self::op_return0(state, inst);
+                        pc = state.pc;
+                        Self::tick_check_interrupted(state, pc)?;
+                        state.drain_drop_queue_if_full();
+                        match r {
+                            Ok(Some(vr)) => return Ok(vr),
+                            Ok(None) => {
+                                // 帧切换收尾 (close continuation / pcall 恢复继续): live top
+                                // 已被 op_return* 复位为调用者帧上界或产出末尾, 抬回边界
+                                // (见 LuaState::sync_live_top)
+                                state.sync_live_top();
+                                continue 'outer;
+                            }
+                            Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
+                            Err(e) => Err(e),
                         }
-                        Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
-                        Err(e) => Err(e),
-                    }
-                }
-                // === 热门 opcode: numeric for 循环 ===
-                // FORLOOP 每迭代执行 (param-pc); FORPREP 每循环一次 (flow-lite:
-                // sync/reload, 内部错误路径天然持有正确 state.pc, 零内部改动)
-                OpCode::FORLOOP => {
-                    match Self::op_forloop(
+                    }),
+                    OpCode::RETURN1 => try_inst!({
+                        state.pc = pc - 1;
+                        let r = Self::op_return1(base, state, inst);
+                        Self::tick_check_interrupted(state, pc)?;
+                        state.drain_drop_queue_if_full();
+                        match r {
+                            Ok(Some(vr)) => return Ok(vr),
+                            Ok(None) => {
+                                // 帧切换收尾 (close continuation / pcall 恢复继续): live top
+                                // 已被 op_return* 复位为调用者帧上界或产出末尾, 抬回边界
+                                // (见 LuaState::sync_live_top)
+                                state.sync_live_top();
+                                continue 'outer;
+                            }
+                            Err(VmError::Yield(values)) => return Ok(VmResult::Yield { values }),
+                            Err(e) => Err(e),
+                        }
+                    }),
+                    // === 热门 opcode: numeric for 循环 ===
+                    // FORLOOP 每迭代执行 (param-pc); FORPREP 每循环一次 (flow-lite:
+                    // sync/reload, 内部错误路径天然持有正确 state.pc, 零内部改动)
+                    OpCode::FORLOOP => try_inst!(match Self::op_forloop(
                         &mut state.drop_queue,
                         &mut state.stack,
                         base,
@@ -2201,94 +2207,101 @@ impl VmExecutor {
                             pc = new_pc;
                             Self::backedge_tick(state, new_pc)
                         }
-                    }
-                }
-                OpCode::FORPREP => {
-                    state.pc = pc - 1;
-                    let r = Self::op_forprep(state, base, inst);
-                    pc = state.pc;
-                    reload_istream!(state);
-                    r
-                }
-                // === SETUPVAL: 写 upvalue (deleted) ===
-                OpCode::SETUPVAL => Self::op_setupval(base, state, inst),
-                // === MMBIN/MMBINI/MMBINK: 元方法占位 (param-cur: pi = code[cur-1],
-                //     try_*_tm 前 sync state.pc = cur) ===
-                OpCode::MMBIN => {
-                    let r = Self::op_mmbin(state, base, inst, pc);
-                    trap = state.hook_mask;
-                    r
-                }
-                OpCode::MMBINI => {
-                    let r = Self::op_mmbini(state, base, inst, pc);
-                    trap = state.hook_mask;
-                    r
-                }
-                OpCode::MMBINK => {
-                    let r = Self::op_mmbink(state, base, inst, pc);
-                    trap = state.hook_mask;
-                    r
-                }
-                // === VARARG/VARARGPREP: vararg 调用热路径 (pass(...) 每次调用都
-                //     执行 VARARGPREP + VARARG), 从 cold dispatch 移入 (param-cur) ===
-                OpCode::VARARG => {
-                    let r = Self::op_vararg(state, base, inst, pc);
-                    if r.is_ok() {
-                        // OP_VARARG 只写 mret_end (MULTRET 展开末尾), 可能高于 live top —
-                        // 收尾处抬回边界 (见 LuaState::sync_live_top); 紧跟的
-                        // OP_CALL/OP_RETURN b==0 与 OP_SETLIST c==0 按 mret_end 取个数。
-                        state.sync_live_top();
-                    }
-                    trap = state.hook_mask;
-                    r
-                }
-                OpCode::VARARGPREP => {
-                    let r = Self::op_varargprep(state, inst, pc);
-                    if r.is_ok() {
-                        // perf: VARARGPREP 调整 state.base/ci.func/ci.top (变参区下沉,
-                        // func 上移 `totalargs + 1`) — 唯一不经帧切换的 base 写点,
-                        // 返回后同步缓存 (单次 load; code/constants 不变, 免整 reload)。
-                        base = state.base;
-                        // 帧入口把 live top 压成「实参末尾」供本指令消费; 之后恢复边界
-                        // 上界 (抬升不能放在本指令之前 —— 见 VARARGPREP 例外的说明)。
-                        state.sync_live_top();
-                    }
-                    trap = state.hook_mask;
-                    r
-                }
-                _ => {
-                    state.pc = pc - 1;
-                    let r = Self::dispatch_cold_opcodes(base, state, op, inst);
-                    pc = state.pc;
-                    reload_istream!(state);
-                    if r.is_ok() && !Self::next_is_varargprep(state) {
-                        // 冷门 opcode 收尾: OP_CONCAT / OP_TFORCALL / OP_SETLIST / OP_CLOSE
-                        // 等都可能把 live top 压到结果末尾或只写 mret_end; 抬回边界
-                        // (见 LuaState::sync_live_top)。例外: 帧入口 (TFORCALL 的 Lua
-                        // 迭代器) 把 top 压成实参末尾等 OP_VARARGPREP 消费时不抬。
-                        state.sync_live_top();
-                    }
-                    r
-                }
-            };
-            match result {
-                Ok(()) => {}
-                Err(e) => {
-                    core::hint::cold_path();
-                    match Self::handle_instruction_error(state, e)? {
-                        ErrOutcome::Continue => {
-                            pc = state.pc;
-                            reload_istream!(state);
-                            // 错误恢复 (pcall 保护 / 元方法 continuation) 后继续执行:
-                            // 恢复点把 top 置为产出末尾, 抬回指令边界上界 (见
-                            // LuaState::sync_live_top); VARARGPREP 例外同上。
-                            if !Self::next_is_varargprep(state) {
-                                state.sync_live_top();
-                            }
-                            continue;
+                    }),
+                    OpCode::FORPREP => try_inst!({
+                        state.pc = pc - 1;
+                        let r = Self::op_forprep(state, base, inst);
+                        if r.is_ok() {
+                            continue 'outer;
                         }
-                        ErrOutcome::Return(r) => return Ok(r),
-                    }
+                        r
+                    }),
+                    // === SETUPVAL: 写 upvalue (deleted) ===
+                    OpCode::SETUPVAL => try_inst!(Self::op_setupval(base, state, inst)),
+                    // === MMBIN/MMBINI/MMBINK: 元方法占位 (param-cur: pi = code[cur-1],
+                    //     try_*_tm 前 sync state.pc = cur) ===
+                    OpCode::MMBIN => try_inst!({
+                        let r = Self::op_mmbin(state, base, inst, pc);
+                        trap = state.hook_mask;
+                        r
+                    }),
+                    OpCode::MMBINI => try_inst!({
+                        let r = Self::op_mmbini(state, base, inst, pc);
+                        trap = state.hook_mask;
+                        r
+                    }),
+                    OpCode::MMBINK => try_inst!({
+                        let r = Self::op_mmbink(state, base, inst, pc);
+                        trap = state.hook_mask;
+                        r
+                    }),
+                    // === VARARG/VARARGPREP: vararg 调用热路径 (pass(...) 每次调用都
+                    //     执行 VARARGPREP + VARARG), 从 cold dispatch 移入 (param-cur) ===
+                    OpCode::VARARG => try_inst!({
+                        let r = Self::op_vararg(state, base, inst, pc);
+                        if r.is_ok() {
+                            // OP_VARARG 只写 mret_end (MULTRET 展开末尾), 可能高于 live top —
+                            // 收尾处抬回边界 (见 LuaState::sync_live_top); 紧跟的
+                            // OP_CALL/OP_RETURN b==0 与 OP_SETLIST c==0 按 mret_end 取个数。
+                            state.sync_live_top();
+                        }
+                        trap = state.hook_mask;
+                        r
+                    }),
+                    OpCode::VARARGPREP => try_inst!({
+                        let r = Self::op_varargprep(state, inst, pc);
+                        if r.is_ok() {
+                            // perf: VARARGPREP 调整 state.base/ci.func/ci.top (变参区下沉,
+                            // func 上移 `totalargs + 1`) — 唯一不经帧切换的 base 写点,
+                            // 返回后同步缓存 (单次 load; code/constants 不变, 免整 reload)。
+                            base = state.base;
+                            // 帧入口把 live top 压成「实参末尾」供本指令消费; 之后恢复边界
+                            // 上界 (抬升不能放在本指令之前 —— 见 VARARGPREP 例外的说明)。
+                            state.sync_live_top();
+                        }
+                        trap = state.hook_mask;
+                        r
+                    }),
+                    OpCode::LOADKX
+                    | OpCode::NEWTABLE
+                    | OpCode::SELF
+                    | OpCode::BANDK
+                    | OpCode::BORK
+                    | OpCode::BXORK
+                    | OpCode::SHLI
+                    | OpCode::SHRI
+                    | OpCode::BAND
+                    | OpCode::BOR
+                    | OpCode::BXOR
+                    | OpCode::SHL
+                    | OpCode::SHR
+                    | OpCode::UNM
+                    | OpCode::BNOT
+                    | OpCode::LEN
+                    | OpCode::CONCAT
+                    | OpCode::CLOSE
+                    | OpCode::TBC
+                    | OpCode::TFORPREP
+                    | OpCode::TFORCALL
+                    | OpCode::TFORLOOP
+                    | OpCode::SETLIST
+                    | OpCode::CLOSURE
+                    | OpCode::GETVARG
+                    | OpCode::ERRNNIL
+                    | OpCode::EXTRAARG => try_inst!({
+                        state.pc = pc - 1;
+                        let r = Self::dispatch_cold_opcodes(base, state, op, inst);
+                        pc = state.pc;
+                        reload_istream!(state);
+                        if r.is_ok() && !Self::next_is_varargprep(state) {
+                            // 冷门 opcode 收尾: OP_CONCAT / OP_TFORCALL / OP_SETLIST / OP_CLOSE
+                            // 等都可能把 live top 压到结果末尾或只写 mret_end; 抬回边界
+                            // (见 LuaState::sync_live_top)。例外: 帧入口 (TFORCALL 的 Lua
+                            // 迭代器) 把 top 压成实参末尾等 OP_VARARGPREP 消费时不抬。
+                            state.sync_live_top();
+                        }
+                        r
+                    }),
                 }
             }
         }

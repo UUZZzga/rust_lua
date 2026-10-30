@@ -28,8 +28,12 @@ fn main() {
     }
     #[cfg(not(size_optimized))]
     {
+        // 16MB: debug 构建下 execute_loop 的单帧很大 (~43KB), 而 LUAI_MAXCCALLS(200)
+        // 允许 200 层 C→Lua 嵌套 (calls.lua 的 "C-stack overflow while handling
+        // C-stack overflow" 用例会一直递归到该上限)。8MB 只够约 190 层, 会在达到
+        // 上限前原生栈溢出; 16MB 留出约 1.8 倍余量。release 构建帧更小, 余量更大。
         let child = std::thread::Builder::new()
-            .stack_size(8 * 1024 * 1024)
+            .stack_size(16 * 1024 * 1024)
             .spawn(lua_rs::cli::main)
             .unwrap();
         child.join().unwrap();
