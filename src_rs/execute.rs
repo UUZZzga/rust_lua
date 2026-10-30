@@ -1093,17 +1093,6 @@ impl VmExecutor {
         Self::execute_loop(state)
     }
 
-    /// 下一条要执行的指令是否为 `VARARGPREP` —— 帧入口把 live top 压成「实参末尾」
-    /// 供它计算 `totalargs` / 搬运固定参数, 此时抬升 top 会写到错误位置
-    /// (实测 vararg.lua 首个参数变 nil)。
-    #[inline(always)]
-    fn next_is_varargprep(state: &LuaState) -> bool {
-        matches!(
-            state.code.get(state.pc).map(|i| opcodes::get_opcode(*i)),
-            Some(OpCode::VARARGPREP)
-        )
-    }
-
     /// 当前帧的**真实**栈上界 (C 的 `ci->top`), 只读版
     /// [`LuaState::recompute_lua_frame_ceiling`] —— 不写回字段。
     ///
@@ -1212,14 +1201,41 @@ impl VmExecutor {
             let mut base: usize = state.base;
             let mut trap: i32 = state.hook_mask;
 
+            // C 形状 pc 寄存器化 — 对应 C luaV_execute 的局部 pc (vmfetch: i = *(pc++))。
+            // 主循环仅在帧切换点 (CALL/TAILCALL/RETURN*/cold dispatch/FORPREP 后) 从
+            // state.pc 重载; 直线指令零 pc 内存往返 (HEAD: 每指令 1 load + 1 store)。
+            // 慢路径 (元方法/错误) 进入前 sync state.pc = cur, 对应 C 的 savepc。
+            // handler 三类:
+            //   deleted — 直线指令, 删尾部 state.pc += 1, 循环头 pc += 1 已覆盖;
+            //   param   — 算术 (&mut pc, 成功 *pc += 1 跳过 MMBIN) / 跳转 (&mut pc) /
+            //             慢路径 sync (cur 参数, 慢路径内 state.pc = cur);
+            //   flow    — 帧切换/冷分发: state.pc = cur → handler → pc = state.pc +
+            //             code_ptr/code_len 从 state.code 重载。
+            let mut pc: usize = state.pc;
+
+            // 下一条要执行的指令是否为 `VARARGPREP` —— 从**已缓存**的指令流读 (与循环头
+            // fetch 同一来源), 供热臂 (CALL/TAILCALL) 免去 `state.code` 的 Rc→Vec deref。
+            // 参数 `$pc` 必须是已同步的「下一条指令索引」(CALL 的 Reload 臂 / TAILCALL 臂
+            // 都在 reload_istream 之后, 即被调帧的入口 pc)。
+            macro_rules! next_is_varargprep_at {
+                ($pc:expr) => {{
+                    #[cfg(feature = "fast_unsafe")]
+                    let __inst: Instruction = unsafe { *code_ptr.add($pc) };
+                    #[cfg(not(feature = "fast_unsafe"))]
+                    let __inst: Instruction = code_rc[$pc];
+                    opcodes::get_opcode(__inst) == OpCode::VARARGPREP
+                }};
+            }
+
             // 进入 VM 时刷新最内层 Lua 帧上界 (覆盖所有进入路径: CLI docall / capi lua_call /
             // 协程 resume / 元方法 pcall; C 帧保持原值)
             state.recompute_lua_frame_ceiling();
+
             // 进入 VM 时把 live top 抬回指令边界上界: 恢复点 (pcall / 协程 resume / 元方法
             // continuation) 进入时 top 可能停在上次产出末尾, 而进入后的第一条指令要求
             // 「边界 top ≥ 帧上界」(寄存器读上界 / GC 根范围 / hook 帧起点)。
             // 例外: 入口指令是 `VARARGPREP` 时保持帧入口压好的「实参末尾」(见其处理器)。
-            if !Self::next_is_varargprep(state) {
+            if !next_is_varargprep_at!(pc) {
                 state.sync_live_top();
             }
 
@@ -1247,18 +1263,6 @@ impl VmExecutor {
                 };
             }
 
-            // C 形状 pc 寄存器化 — 对应 C luaV_execute 的局部 pc (vmfetch: i = *(pc++))。
-            // 主循环仅在帧切换点 (CALL/TAILCALL/RETURN*/cold dispatch/FORPREP 后) 从
-            // state.pc 重载; 直线指令零 pc 内存往返 (HEAD: 每指令 1 load + 1 store)。
-            // 慢路径 (元方法/错误) 进入前 sync state.pc = cur, 对应 C 的 savepc。
-            // handler 三类:
-            //   deleted — 直线指令, 删尾部 state.pc += 1, 循环头 pc += 1 已覆盖;
-            //   param   — 算术 (&mut pc, 成功 *pc += 1 跳过 MMBIN) / 跳转 (&mut pc) /
-            //             慢路径 sync (cur 参数, 慢路径内 state.pc = cur);
-            //   flow    — 帧切换/冷分发: state.pc = cur → handler → pc = state.pc +
-            //             code_ptr/code_len 从 state.code 重载。
-            let mut pc: usize = state.pc;
-
             assert!(
                 match state.code.last().map(|i: &u32| opcodes::get_opcode(*i)) {
                     Some(OpCode::RETURN) => true,
@@ -1279,10 +1283,10 @@ impl VmExecutor {
                                     ErrOutcome::Continue => {
                                         pc = state.pc;
                                         reload_istream!(state);
-                                        if !Self::next_is_varargprep(state) {
+                                        if !next_is_varargprep_at!(pc) {
                                             state.sync_live_top();
                                         }
-                                        continue 'inner;
+                                        continue 'outer;
                                     }
                                     ErrOutcome::Return(r) => return Ok(r),
                                 }
@@ -2293,7 +2297,7 @@ impl VmExecutor {
                         let r = Self::dispatch_cold_opcodes(base, state, op, inst);
                         pc = state.pc;
                         reload_istream!(state);
-                        if r.is_ok() && !Self::next_is_varargprep(state) {
+                        if r.is_ok() && !next_is_varargprep_at!(pc) {
                             // 冷门 opcode 收尾: OP_CONCAT / OP_TFORCALL / OP_SETLIST / OP_CLOSE
                             // 等都可能把 live top 压到结果末尾或只写 mret_end; 抬回边界
                             // (见 LuaState::sync_live_top)。例外: 帧入口 (TFORCALL 的 Lua
