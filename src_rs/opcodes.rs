@@ -7,7 +7,7 @@
 // ============================================================================
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
+#[repr(u32)]
 pub enum OpCode {
     MOVE = 0,
     LOADI = 1,
@@ -103,7 +103,7 @@ impl OpCode {
     #[cfg_attr(not(size_optimized), inline)]
     pub fn from_u8(v: u8) -> Option<OpCode> {
         if (v as usize) < NUM_OPCODES {
-            Some(unsafe { std::mem::transmute::<u8, OpCode>(v) })
+            Some(unsafe { std::mem::transmute::<u32, OpCode>(v as u32) })
         } else {
             None
         }
@@ -193,9 +193,9 @@ pub fn get_opcode(i: Instruction) -> OpCode {
     // perf: 直接 transmute 跳过 Option/unwrap_or 开销 (get_opcode 占 5.84% + unwrap_or 占 2.68% = 8.52%)
     // 编译器保证字节码中的 opcode 总是有效 (0..NUM_OPCODES-1), 无需运行时检查。
     // debug 模式下保留断言捕获损坏的字节码。
-    let v = ((i >> POS_OP) & mask1(SIZE_OP, 0)) as u8;
+    let v: u32 = (i >> POS_OP) & mask1(SIZE_OP, 0);
     debug_assert!((v as usize) < NUM_OPCODES, "invalid opcode: {}", v);
-    unsafe { std::mem::transmute::<u8, OpCode>(v) }
+    unsafe { std::mem::transmute::<u32, OpCode>(v) }
 }
 #[inline(always)]
 pub fn getarg_a(i: Instruction) -> i32 {

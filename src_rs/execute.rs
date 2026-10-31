@@ -1146,6 +1146,24 @@ impl VmExecutor {
         );
     }
 
+    #[cold]
+    #[inline(never)]
+    fn run_hooks<'a>(
+        state: &mut LuaState<'a>,
+        pc: usize,
+        trace_level: u8,
+    ) -> Result<i32, VmError<'a>> {
+        state.pc = pc - 1; // 只有 hook 真的激活时才 sync
+        if state.hook_mask & (4 | 8) != 0 {
+            Self::traceexec_hooks(state)?;
+        }
+        #[cfg(debug_assertions)]
+        if trace_level >= 1 {
+            Self::trace_exec(state, trace_level);
+        }
+        Ok(state.hook_mask)
+    }
+
     pub fn execute_loop<'a>(state: &mut LuaState<'a>) -> Result<VmResult<'a>, VmError<'a>> {
         // call_stack 已提升为 state.call_stack 字段，以支持协程挂起/恢复
         // 补齐帧寄存器 scratch (write_stack 无分支写的前提)
@@ -1184,16 +1202,6 @@ impl VmExecutor {
             let mut code_ptr: *const Instruction = state.code.as_ptr();
             #[cfg(not(feature = "fast_unsafe"))]
             let mut code_rc: Rc<Vec<Instruction>> = Rc::clone(&state.code);
-            // perf: constants Vec 数据指针缓存 — K 常量指令 (ADDK/MULK/MODK/GETFIELD/
-            // GETTABUP 等) 原每指令 Rc→Vec 双 deref 取常量。与 code_ptr 同点刷新
-            // (帧切换 9 点), 帧内 constants Vec 不被整体替换 (与 code 相同的 Rc 写点
-            // 审计结论)。K 越界由 len 检查兜底 (constants_len)。
-            #[cfg(feature = "fast_unsafe")]
-            let mut constants_ptr: *const TValue = state.constants.as_ptr();
-            #[cfg(feature = "fast_unsafe")]
-            let mut constants_len: usize = state.constants.len();
-            #[cfg(not(feature = "fast_unsafe"))]
-            let mut constants_rc: Rc<Vec<TValue<'a>>> = Rc::clone(&state.constants);
 
             // perf: base 寄存器化 — 与 pc 同帧不变式。帧切换点经 reload_istream!
             // 从 state.base 重载; CALL 的 Fast 分支 (pure builtin, 帧未切) 跳过
@@ -1250,13 +1258,10 @@ impl VmExecutor {
                     #[cfg(feature = "fast_unsafe")]
                     {
                         code_ptr = $st.code.as_ptr();
-                        constants_ptr = $st.constants.as_ptr();
-                        constants_len = $st.constants.len();
                     }
                     #[cfg(not(feature = "fast_unsafe"))]
                     {
                         code_rc = Rc::clone(&$st.code);
-                        constants_rc = Rc::clone(&$st.constants);
                     }
                     base = $st.base;
                     trap = $st.hook_mask;
@@ -1281,11 +1286,6 @@ impl VmExecutor {
                                 core::hint::cold_path();
                                 match Self::handle_instruction_error(state, e)? {
                                     ErrOutcome::Continue => {
-                                        pc = state.pc;
-                                        reload_istream!(state);
-                                        if !next_is_varargprep_at!(pc) {
-                                            state.sync_live_top();
-                                        }
                                         continue 'outer;
                                     }
                                     ErrOutcome::Return(r) => return Ok(r),
@@ -1301,13 +1301,16 @@ impl VmExecutor {
                 // 顶部 assert!(code.last() 是 RETURN) 提供 release 下的损坏字节码防线。
                 debug_assert!(pc < state.code.len());
 
-                // perf: constants 缓存切片 — 由常量指针构建, LLVM 可将其 ptr+len
-                // 驻留寄存器传递给内联 K-handler (原 state.constants 每指令双 deref)
-                #[cfg(feature = "fast_unsafe")]
-                let constants_slice: &[TValue] =
-                    unsafe { std::slice::from_raw_parts(constants_ptr, constants_len) };
-                #[cfg(not(feature = "fast_unsafe"))]
-                let constants_slice: &[TValue] = &constants_rc[..];
+                macro_rules! constants_slice {
+                    ($st:expr) => {{
+                        #[cfg(feature = "fast_unsafe")]
+                        unsafe {
+                            std::slice::from_raw_parts($st.constants.as_ptr(), $st.constants.len())
+                        }
+                        #[cfg(not(feature = "fast_unsafe"))]
+                        &$st.constants[..]
+                    }};
+                }
 
                 // perf: get_unchecked 跳过边界检查 (上方已检查 pc < code_len)
                 #[cfg(feature = "fast_unsafe")]
@@ -1413,16 +1416,7 @@ impl VmExecutor {
                 // debug.sethook("l"/"c") 静默失效。C 的 luaG_traceexec 同样每指令判读。
                 if trace_level | trap as u8 != 0 && op != OpCode::VARARGPREP {
                     core::hint::cold_path();
-                    state.pc = pc - 1; // sync: 行 hook/trace 需要 state.pc = 当前指令 (C savepc)
-                                       // 对应 C 的 luaG_traceexec: count hook + line hook
-                    if trap & (4 | 8) != 0 {
-                        Self::traceexec_hooks(state)?;
-                        trap = state.hook_mask;
-                    }
-                    #[cfg(debug_assertions)]
-                    if trace_level >= 1 {
-                        Self::trace_exec(state, trace_level);
-                    }
+                    trap = Self::run_hooks(state, pc, trace_level)?;
                 }
 
                 #[cfg(not(feature = "fast_unsafe"))]
@@ -1472,7 +1466,7 @@ impl VmExecutor {
                     OpCode::LOADK => try_inst!(Self::op_loadk(
                         &mut state.drop_queue,
                         &mut state.stack,
-                        constants_slice,
+                        constants_slice!(state),
                         base,
                         state.top,
                         inst,
@@ -1630,7 +1624,7 @@ impl VmExecutor {
                     OpCode::ADDK => try_inst!(match Self::op_addk(
                         &mut state.drop_queue,
                         &mut state.stack,
-                        constants_slice,
+                        constants_slice!(state),
                         base,
                         state.top,
                         inst,
@@ -1651,7 +1645,7 @@ impl VmExecutor {
                     OpCode::SUBK => try_inst!(match Self::op_subk(
                         &mut state.drop_queue,
                         &mut state.stack,
-                        constants_slice,
+                        constants_slice!(state),
                         base,
                         state.top,
                         inst,
@@ -1672,7 +1666,7 @@ impl VmExecutor {
                     OpCode::MULK => try_inst!(match Self::op_mulk(
                         &mut state.drop_queue,
                         &mut state.stack,
-                        constants_slice,
+                        constants_slice!(state),
                         base,
                         state.top,
                         inst,
@@ -1693,7 +1687,7 @@ impl VmExecutor {
                     OpCode::MODK => try_inst!(match Self::op_modk(
                         &mut state.drop_queue,
                         &mut state.stack,
-                        constants_slice,
+                        constants_slice!(state),
                         base,
                         state.top,
                         inst,
@@ -1714,7 +1708,7 @@ impl VmExecutor {
                     OpCode::POWK => try_inst!(match Self::op_powk(
                         &mut state.drop_queue,
                         &mut state.stack,
-                        constants_slice,
+                        constants_slice!(state),
                         base,
                         state.top,
                         inst,
@@ -1735,7 +1729,7 @@ impl VmExecutor {
                     OpCode::DIVK => try_inst!(match Self::op_divk(
                         &mut state.drop_queue,
                         &mut state.stack,
-                        constants_slice,
+                        constants_slice!(state),
                         base,
                         state.top,
                         inst,
@@ -1756,7 +1750,7 @@ impl VmExecutor {
                     OpCode::IDIVK => try_inst!(match Self::op_idivk(
                         &mut state.drop_queue,
                         &mut state.stack,
-                        constants_slice,
+                        constants_slice!(state),
                         base,
                         state.top,
                         inst,
@@ -2101,8 +2095,7 @@ impl VmExecutor {
                     }),
                     // === 热门 opcode: 调用/返回 (flow 类: sync → handler → 重载) ===
                     OpCode::CALL => try_inst!({
-                        state.pc = pc - 1;
-                        let r = Self::op_call(base, state, inst);
+                        let r = Self::op_call(base, state, inst, pc);
                         // 帧边界排空（判定与 match 结果无关 → 提到 match 之前，分支漏不掉）
                         state.drain_drop_queue_if_full();
                         trap = state.hook_mask;
@@ -2126,8 +2119,7 @@ impl VmExecutor {
                         }
                     }),
                     OpCode::TAILCALL => try_inst!({
-                        state.pc = pc - 1;
-                        let r = Self::op_tailcall(base, state, inst);
+                        let r = Self::op_tailcall(base, state, inst, pc);
                         if r.is_ok() {
                             state.drain_drop_queue_if_full();
                             continue 'outer;
@@ -2135,8 +2127,7 @@ impl VmExecutor {
                         r
                     }),
                     OpCode::RETURN => try_inst!({
-                        state.pc = pc - 1;
-                        let r = Self::op_return(base, state, inst);
+                        let r = Self::op_return(base, state, inst, pc);
                         pc = state.pc;
                         Self::tick_check_interrupted(state, pc)?;
                         state.drain_drop_queue_if_full();
@@ -2154,8 +2145,7 @@ impl VmExecutor {
                         }
                     }),
                     OpCode::RETURN0 => try_inst!({
-                        state.pc = pc - 1;
-                        let r = Self::op_return0(state, inst);
+                        let r = Self::op_return0(state, inst, pc);
                         pc = state.pc;
                         Self::tick_check_interrupted(state, pc)?;
                         state.drain_drop_queue_if_full();
@@ -2173,8 +2163,7 @@ impl VmExecutor {
                         }
                     }),
                     OpCode::RETURN1 => try_inst!({
-                        state.pc = pc - 1;
-                        let r = Self::op_return1(base, state, inst);
+                        let r = Self::op_return1(base, state, inst, pc);
                         Self::tick_check_interrupted(state, pc)?;
                         state.drain_drop_queue_if_full();
                         match r {
@@ -2213,8 +2202,7 @@ impl VmExecutor {
                         }
                     }),
                     OpCode::FORPREP => try_inst!({
-                        state.pc = pc - 1;
-                        let r = Self::op_forprep(state, base, inst);
+                        let r = Self::op_forprep(state, base, inst, pc);
                         if r.is_ok() {
                             continue 'outer;
                         }
@@ -6895,6 +6883,7 @@ impl VmExecutor {
         base: usize,
         state: &mut LuaState<'a>,
         inst: Instruction,
+        pc: usize,
     ) -> Result<CallOutcome, VmError<'a>> {
         let a = Self::ra(base, inst);
         let b = opcodes::getarg_b(inst) as usize;
@@ -6904,6 +6893,7 @@ impl VmExecutor {
         if b != 0 {
             state.top = a + b;
         }
+        state.pc = pc - 1;
 
         // perf: LClosure 快速路径 — 避免 TValue clone (Rc incq + discriminant match)
         // LClosure 是最常见的调用对象, 且不经过 __call 元方法循环。
@@ -7774,6 +7764,7 @@ impl VmExecutor {
         base: usize,
         state: &mut LuaState<'a>,
         inst: Instruction,
+        pc: usize,
     ) -> Result<(), VmError<'a>> {
         let a = Self::ra(base, inst);
         let mut b = opcodes::getarg_b(inst) as usize;
@@ -7788,6 +7779,8 @@ impl VmExecutor {
         } else {
             b = state.mret_payload_end(a).saturating_sub(a);
         }
+        state.pc = pc - 1;
+
         // 对应 C 的 OP_TAILCALL: if (TESTARG_k(i)) luaF_closeupval(L, base);
         // K 标志位表示可能有 open upvalues,必须在移动栈数据之前关闭,
         // 否则 open upvalue 指向的栈位置会被覆盖,导致 upvalue 值错误
@@ -8138,6 +8131,7 @@ impl VmExecutor {
         base: usize,
         state: &mut LuaState<'a>,
         inst: Instruction,
+        pc: usize,
     ) -> Result<Option<VmResult<'a>>, VmError<'a>> {
         let a = Self::ra(base, inst);
         let n = opcodes::getarg_b(inst) as i32 - 1;
@@ -8148,6 +8142,7 @@ impl VmExecutor {
         } else {
             n as usize
         };
+        state.pc = pc - 1;
         // C 在 OP_RETURN 里把 `L->top = ra + n` (isIT 时 = 解析出的实际个数) —— 这是
         // 该帧的「返回栈顶」, 关闭 to-be-closed / return hook / poscall 都按它算。本实现
         // 用 `mret_end` 承载这个语义, 且**必须在此刻写入**: 随后触发的 __close 若 yield,
@@ -8306,7 +8301,9 @@ impl VmExecutor {
     fn op_return0<'a>(
         state: &mut LuaState<'a>,
         _inst: Instruction,
+        pc: usize,
     ) -> Result<Option<VmResult<'a>>, VmError<'a>> {
+        state.pc = pc - 1;
         // perf: 快速路径 — 无 pcall 保护且无 open upvalue 时跳过 continuation 检查
         if state.pcall_protection_stack.is_empty() && !Self::need_close_upvals(state, state.base) {
             state.g_mut().twups_linked = false;
@@ -8412,10 +8409,12 @@ impl VmExecutor {
         base: usize,
         state: &mut LuaState<'a>,
         inst: Instruction,
+        pc: usize,
     ) -> Result<Option<VmResult<'a>>, VmError<'a>> {
         let a = Self::ra(base, inst);
         // 对应 C 的 OP_RETURN1: L->top = ra + 1 (寄存器槽位恒已初始化)
         state.top = a + 1;
+        state.pc = pc - 1;
         // perf: 快速路径 — 无 pcall 保护且无 open upvalue 时跳过 continuation 检查
         if state.pcall_protection_stack.is_empty() && !Self::need_close_upvals(state, state.base) {
             state.g_mut().twups_linked = false;
@@ -8614,8 +8613,10 @@ impl VmExecutor {
         state: &mut LuaState<'a>,
         base: usize,
         inst: Instruction,
+        pc: usize,
     ) -> Result<(), VmError<'a>> {
         let ra = Self::ra(base, inst);
+        state.pc = pc - 1;
 
         let init_val = Self::read_stack_state(state, ra).clone();
         let limit_val = Self::read_stack_state(state, ra + 1).clone();
