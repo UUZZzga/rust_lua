@@ -311,7 +311,9 @@ impl<'a> Table<'a> {
     /// 取代此前 BuiltinFn/Table 各自探测的双查找
     /// (GETTABUP(math) 会 miss 一次 BuiltinFn 再 hit Table, 两次探测)。
     ///
-    /// 元表存在时返回 None (__index 可能拦截, 不能绕过)。
+    /// 语义 = 原始读 (rawget): 命中即返回, **与表是否有元表无关** —— `__index` 只在
+    /// 原始读未命中时才参与 (`luaV_finishget` 首轮语义), 故有元表也不影响命中结果。
+    /// 未命中时返回 None, 由调用方检查元表走 `__index` (可能拦截)。
     ///
     /// fast_unsafe: 读路径经 data_ro() 绕过 RefCell borrow, 返回命中槽引用
     /// (调用方决定 clone/位拷贝)。
@@ -319,9 +321,6 @@ impl<'a> Table<'a> {
     #[cfg_attr(not(size_optimized), inline(always))]
     pub fn find_str_ref<'b>(&'b self, key: &TValue<'a>) -> Option<&'b TValue<'a>> {
         let data = self.data_ro();
-        if data.metatable.is_some() {
-            return None;
-        }
         let ktb = data.key_to_bucket.as_ref()?;
         match key {
             TValue::ShortStr(_) => {}
@@ -348,9 +347,6 @@ impl<'a> Table<'a> {
     #[cfg_attr(not(size_optimized), inline)]
     pub fn find_str_ref(&self, key: &TValue<'a>) -> Option<TValue<'a>> {
         let data = self.data.borrow();
-        if data.metatable.is_some() {
-            return None;
-        }
         let ktb = data.key_to_bucket.as_ref()?;
         match key {
             TValue::ShortStr(_) => {}

@@ -1516,7 +1516,7 @@ impl VmExecutor {
                         trap = state.hook_mask;
                         r
                     }),
-                    // 表读族一律热/冷分离: 快路径 (无元表 Table) 在 handler 内写完返回
+                    // 表读族一律热/冷分离: 快路径 (原始读命中, 有元表也可) 在 handler 内写完返回
                     // Ok(true) —— 它不回调 Lua、不分配, 故**不刷新** `trap` (hook_mask
                     // 缓存, 见循环头注释); 未命中交 `#[cold]` 版本, 那里可能跑 __index /
                     // 报错, 返回后刷新。
@@ -4545,7 +4545,7 @@ impl VmExecutor {
         let b = opcodes::getarg_b(inst) as usize;
         let kb_idx = opcodes::getarg_c(inst) as usize;
         let key = unsafe { state.constants.get_unchecked(kb_idx) };
-        // perf 快速路径: table 无元表时用引用避免 key 和 upval_val 的 clone
+        // perf 快速路径: 原始读 (命中即返回, 有无元表皆可) 用引用避免 key 和 upval_val 的 clone
         // (类似 op_getfield 优化)。
         // Split borrowing: 显式取 state 各字段引用,允许同时借用 stack/constants/closure_upvals。
         // uv_ref (RefCell::borrow) 在 block 内存活; get_and_metatable 返回 owned,
@@ -4716,7 +4716,8 @@ impl VmExecutor {
                 match table_ref {
                     TValue::Table(t) => {
                         let (val, has_mt) = t.get_and_metatable(key);
-                        if !has_mt {
+                        // perf: 原始读命中 → __index 不参与, 有元表也直接返回 (同 op_getfield)
+                        if !has_mt || val.is_some() {
                             Some(val)
                         } else {
                             None
@@ -4736,7 +4737,7 @@ impl VmExecutor {
         Ok(false)
     }
 
-    /// GETTABUP 冷路径: 有元表或非 Table 类型, 需要走 table_get 查 __index。
+    /// GETTABUP 冷路径: 原始读未命中且有元表 / 非 Table 类型, 需要走 table_get 查 __index。
     #[cold]
     fn op_gettabup_cold<'a>(
         base: usize,
@@ -4747,7 +4748,7 @@ impl VmExecutor {
         let a = Self::ra(base, inst);
         let b = opcodes::getarg_b(inst) as usize;
         let kb_idx = opcodes::getarg_c(inst) as usize;
-        // 慢速路径: 有元表或非 Table 类型 — 此处才 clone
+        // 慢速路径: 原始读未命中且有元表 / 非 Table 类型 — 此处才 clone
         let key = unsafe { state.constants.get_unchecked(kb_idx) }.clone();
         let upval_val = if b < state.closure_upvals.borrow().len() {
             let upvals = state.closure_upvals.borrow();
@@ -4766,10 +4767,10 @@ impl VmExecutor {
         Ok(())
     }
 
-    /// GETTABLE 热路径 (同 [`Self::op_geti`]): 只做「无元表 Table」的直查,
-    /// 命中即写槽并返回 `Ok(true)`; 有元表 / 非 Table 返回 `Ok(false)`, 由
-    /// [`Self::op_gettable_cold`] 走 `__index` / 报错。分离的收益: 主循环内联体
-    /// 只剩快路径 (慢路径的 clone / `state.pc` sync / 元方法调用全部移出),
+    /// GETTABLE 热路径 (同 [`Self::op_geti`]): 只做「原始读」的直查 (命中即返回,
+    /// 有元表也可), 命中即写槽并返回 `Ok(true)`; 原始读未命中且有元表 / 非 Table
+    /// 返回 `Ok(false)`, 由 [`Self::op_gettable_cold`] 走 `__index` / 报错。分离的收益:
+    /// 主循环内联体只剩快路径 (慢路径的 clone / `state.pc` sync / 元方法调用全部移出),
     /// 且快路径不可能回调 Lua ⇒ 分发表无需在此刷新 `trap` (hook_mask 缓存)。
     #[inline]
     fn op_gettable<'a>(
@@ -4782,12 +4783,14 @@ impl VmExecutor {
         let c = Self::rc(base, inst);
         let table_val = Self::read_stack_state(state, b);
         let key = Self::read_stack_state(state, c);
-        // perf 快速路径: table 无元表时直接用 get_and_metatable, 跳过 table_get 包装层
+        // perf 快速路径: 原始读 (命中即返回, 有无元表皆可) 直接用 get_and_metatable,
+        // 跳过 table_get 包装层
         // + table_val/key 两次 clone。直接用栈索引访问避免 read_stack 借用冲突。
         let fast_result: Option<Option<TValue>> = {
             if let TValue::Table(t) = table_val {
                 let (val, has_mt) = t.get_and_metatable(key);
-                if !has_mt {
+                // perf: 原始读命中 → __index 不参与, 有元表也直接返回 (同 op_getfield)
+                if !has_mt || val.is_some() {
                     Some(val)
                 } else {
                     None
@@ -4806,7 +4809,7 @@ impl VmExecutor {
         }
     }
 
-    /// GETTABLE 冷路径: 有元表或非 Table 类型, 需要走 table_get 查 __index。
+    /// GETTABLE 冷路径: 原始读未命中且有元表 / 非 Table 类型, 需要走 table_get 查 __index。
     #[cold]
     fn op_gettable_cold<'a>(
         base: usize,
@@ -4841,13 +4844,15 @@ impl VmExecutor {
         let c = opcodes::getarg_c(inst) as LuaInteger;
         let table_val = Self::read_stack_state(state, b);
         let key = TValue::Integer(c);
-        // perf 快速路径: table 无元表时直接用 get_and_metatable, 跳过 table_get 包装层
+        // perf 快速路径: 原始读 (命中即返回, 有无元表皆可) 直接用 get_and_metatable,
+        // 跳过 table_get 包装层
         // (current.take/unwrap_or/match Table/MAXTAGLOOP 循环 + table_val clone)。
         // 大量数组访问 (t[i]) 操作普通数组表 (无 __index), 命中路径省去 TValue clone+drop。
         let fast_result: Option<Option<TValue>> = {
             if let TValue::Table(t) = table_val {
                 let (val, has_mt) = t.get_and_metatable(&key);
-                if !has_mt {
+                // perf: 原始读命中 → __index 不参与, 有元表也直接返回 (同 op_getfield)
+                if !has_mt || val.is_some() {
                     Some(val)
                 } else {
                     None
@@ -4864,7 +4869,7 @@ impl VmExecutor {
         Ok(false)
     }
 
-    /// GETI 冷路径: 有元表或非 Table 类型, 需要走 table_get 查 __index。
+    /// GETI 冷路径: 原始读未命中且有元表 / 非 Table 类型, 需要走 table_get 查 __index。
     #[cold]
     fn op_geti_cold<'a>(
         base: usize,
@@ -4877,7 +4882,7 @@ impl VmExecutor {
         let c = opcodes::getarg_c(inst) as LuaInteger;
         let table_val = Self::read_stack_state(state, b);
         let key = TValue::Integer(c);
-        // 慢速路径: 有元表或非 Table 类型, 需要走 table_get 查 __index
+        // 慢速路径: 原始读未命中且有元表 / 非 Table 类型, 需要走 table_get 查 __index
         let table_val = table_val.clone();
         state.pc = pc - 1; // sync (C savepc): 慢路径元方法/错误需要当前指令
         let result = Self::table_get(
@@ -4902,15 +4907,16 @@ impl VmExecutor {
         let c_key = opcodes::getarg_c(inst) as usize;
         let table_val = Self::read_stack_state(state, b);
         let key = unsafe { state.constants.get_unchecked(c_key) };
-        // perf 快速路径: table 无元表时直接用 get_and_metatable, 跳过 table_get 包装层
+        // perf 快速路径: 原始读 (命中即返回, 有无元表皆可) 直接用 get_and_metatable,
+        // 跳过 table_get 包装层
         // + table_val clone。大量表字段访问 (t.field) 操作普通表 (无 __index)。
         //
         // perf 优化: 快速路径用 state.constants.get(c_key) 返回的 &TValue 引用,
         // 避免每次都 clone key (Str 类型 → Rc inc/dec)。state.constants 是 Rc<Vec<TValue>>,
         // get 返回 Option<&TValue>, 与 read_stack 的 &state.stack 借用兼容 (均不可变借用)。
         // get_and_metatable 返回 owned Option<TValue>, block 结束后借用释放, 再调 write_stack。
-        // perf: 单次探测特化 — find_str_ref 一次哈希查找, BuiltinFn (Copy) /
-        // Table (结构 copy) 直取免 TValue::clone; 其他/元表/非短串键走原路径。
+        // perf: 单次探测特化 — find_str_ref 一次哈希查找 (原始读, 与元表无关),
+        // BuiltinFn (Copy) / Table (结构 copy) 直取免 TValue::clone; 其他/非短串键走原路径。
         let spec: Option<SpecValue> = {
             if let TValue::Table(t) = table_val {
                 #[cfg(feature = "fast_unsafe")]
@@ -4972,7 +4978,11 @@ impl VmExecutor {
         let fast_result: Option<Option<TValue>> = {
             if let TValue::Table(t) = table_val {
                 let (val, has_mt) = t.get_and_metatable(key);
-                if !has_mt {
+                // perf: 原始读命中时 __index 不会参与 (`luaV_finishget` 先做原始读,
+                // 命中即返回), 所以有元表也能直接返回。原先「有元表一律交冷路径」会把
+                // OOP 实例字段读 (`setmetatable` 的 table, 字段直接存在) 全部推给
+                // table_get (key/table clone + pc sync + 二次查找), 是最常见形态。
+                if !has_mt || val.is_some() {
                     Some(val)
                 } else {
                     None
@@ -4989,7 +4999,7 @@ impl VmExecutor {
         Ok(false)
     }
 
-    /// GETFIELD 冷路径: 有元表或非 Table 类型, 需要走 table_get 查 __index。
+    /// GETFIELD 冷路径: 原始读未命中且有元表 / 非 Table 类型, 需要走 table_get 查 __index。
     #[cold]
     fn op_getfield_cold<'a>(
         base: usize,
@@ -5000,7 +5010,7 @@ impl VmExecutor {
         let a = Self::ra(base, inst);
         let b = Self::rb(base, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
-        // 慢速路径: 有元表或非 Table 类型 — 此处才 clone key
+        // 慢速路径: 原始读未命中且有元表 / 非 Table 类型 — 此处才 clone key
         let key = unsafe { state.constants.get_unchecked(c_key) }.clone();
         let table_val = Self::read_stack_state(state, b).clone();
         state.pc = pc - 1; // sync (C savepc): 慢路径元方法/错误需要当前指令
@@ -5326,7 +5336,8 @@ impl VmExecutor {
             .get(opcodes::getarg_c(inst) as usize)
             .cloned()
             .unwrap_or(TValue::Nil(NilKind::Strict));
-        // perf 快速路径: table 无元表时直接用 get_and_metatable, 跳过 table_get 包装层。
+        // perf 快速路径: 原始读 (命中即返回, 有无元表皆可) 直接用 get_and_metatable,
+        // 跳过 table_get 包装层。
         // obj 只需 clone 一次 (写入 a+1), 慢速路径需两次 (obj + obj.clone for table_get)。
         let fast_result: Option<Option<TValue>> = {
             let stack = &state.stack;
@@ -5334,7 +5345,8 @@ impl VmExecutor {
                 let obj = &stack[b];
                 if let TValue::Table(t) = obj {
                     let (val, has_mt) = t.get_and_metatable(&key);
-                    if !has_mt {
+                    // perf: 原始读命中 → __index 不参与, 有元表也直接返回 (同 op_getfield)
+                    if !has_mt || val.is_some() {
                         Some(val)
                     } else {
                         None
@@ -5355,7 +5367,7 @@ impl VmExecutor {
             state.pc += 1;
             return Ok(());
         }
-        // 慢速路径: 有元表或非 Table 类型
+        // 慢速路径: 原始读未命中且有元表 / 非 Table 类型
         let obj = Self::read_stack_state(state, b).clone();
         Self::write_stack_state(state, a + 1, obj.clone());
         let result = Self::table_get(
