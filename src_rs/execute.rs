@@ -1521,9 +1521,13 @@ impl VmExecutor {
                     // 缓存, 见循环头注释); 未命中交 `#[cold]` 版本, 那里可能跑 __index /
                     // 报错, 返回后刷新。
                     OpCode::GETTABUP => {
-                        try_inst!(match Self::op_gettabup(base, state, inst, &mut pc) {
-                            Ok(true) => Ok(()),
-                            Ok(false) => {
+                        try_inst!(match Self::op_gettabup(base, state, inst, pc) {
+                            Ok((true, new_pc)) => {
+                                pc = new_pc;
+                                Ok(())
+                            }
+                            Ok((false, new_pc)) => {
+                                pc = new_pc;
                                 let r = Self::op_gettabup_cold(base, state, inst, pc);
                                 trap = state.hook_mask;
                                 r
@@ -1550,9 +1554,13 @@ impl VmExecutor {
                         Err(err) => Err(err),
                     }),
                     OpCode::GETFIELD => {
-                        try_inst!(match Self::op_getfield(base, state, inst, &mut pc) {
-                            Ok(true) => Ok(()),
-                            Ok(false) => {
+                        try_inst!(match Self::op_getfield(base, state, inst, pc) {
+                            Ok((true, new_pc)) => {
+                                pc = new_pc;
+                                Ok(())
+                            }
+                            Ok((false, new_pc)) => {
+                                pc = new_pc;
                                 let r = Self::op_getfield_cold(base, state, inst, pc);
                                 trap = state.hook_mask;
                                 r
@@ -1927,9 +1935,15 @@ impl VmExecutor {
                     }),
                     OpCode::EQ => try_inst!(match Self::op_eq(base, state, inst, pc) {
                         Ok(usize::MAX) => {
-                            let r = Self::equal_jump_cold(state, base, inst, &mut pc);
+                            let r = Self::equal_jump_cold(state, base, inst, pc);
                             trap = state.hook_mask;
-                            r
+                            match r {
+                                Ok(new_pc) => {
+                                    pc = new_pc;
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            }
                         }
                         Ok(new_pc) => {
                             pc = new_pc;
@@ -1940,10 +1954,15 @@ impl VmExecutor {
                     }),
                     OpCode::LT => try_inst!(match Self::op_lt(base, state, inst, pc) {
                         Ok(usize::MAX) => {
-                            let r =
-                                Self::order_jump_cold(state, base, inst, &mut pc, TagMethod::Lt);
+                            let r = Self::order_jump_cold(state, base, inst, pc, TagMethod::Lt);
                             trap = state.hook_mask;
-                            r
+                            match r {
+                                Ok(new_pc) => {
+                                    pc = new_pc;
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            }
                         }
                         Ok(new_pc) => {
                             pc = new_pc;
@@ -1954,10 +1973,15 @@ impl VmExecutor {
                     }),
                     OpCode::LE => try_inst!(match Self::op_le(base, state, inst, pc) {
                         Ok(usize::MAX) => {
-                            let r =
-                                Self::order_jump_cold(state, base, inst, &mut pc, TagMethod::Le);
+                            let r = Self::order_jump_cold(state, base, inst, pc, TagMethod::Le);
                             trap = state.hook_mask;
-                            r
+                            match r {
+                                Ok(new_pc) => {
+                                    pc = new_pc;
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            }
                         }
                         Ok(new_pc) => {
                             pc = new_pc;
@@ -1988,12 +2012,18 @@ impl VmExecutor {
                                 state,
                                 base,
                                 inst,
-                                &mut pc,
+                                pc,
                                 false,
                                 TagMethod::Lt,
                             );
                             trap = state.hook_mask;
-                            r
+                            match r {
+                                Ok(new_pc) => {
+                                    pc = new_pc;
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            }
                         }
                         Ok(new_pc) => {
                             pc = new_pc;
@@ -2008,12 +2038,18 @@ impl VmExecutor {
                                 state,
                                 base,
                                 inst,
-                                &mut pc,
+                                pc,
                                 false,
                                 TagMethod::Le,
                             );
                             trap = state.hook_mask;
-                            r
+                            match r {
+                                Ok(new_pc) => {
+                                    pc = new_pc;
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            }
                         }
                         Ok(new_pc) => {
                             pc = new_pc;
@@ -2028,12 +2064,18 @@ impl VmExecutor {
                                 state,
                                 base,
                                 inst,
-                                &mut pc,
+                                pc,
                                 true,
                                 TagMethod::Lt,
                             );
                             trap = state.hook_mask;
-                            r
+                            match r {
+                                Ok(new_pc) => {
+                                    pc = new_pc;
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            }
                         }
                         Ok(new_pc) => {
                             pc = new_pc;
@@ -2048,12 +2090,18 @@ impl VmExecutor {
                                 state,
                                 base,
                                 inst,
-                                &mut pc,
+                                pc,
                                 true,
                                 TagMethod::Le,
                             );
                             trap = state.hook_mask;
-                            r
+                            match r {
+                                Ok(new_pc) => {
+                                    pc = new_pc;
+                                    Ok(())
+                                }
+                                Err(e) => Err(e),
+                            }
                         }
                         Ok(new_pc) => {
                             pc = new_pc;
@@ -4539,8 +4587,8 @@ impl VmExecutor {
         base: usize,
         state: &mut LuaState<'a>,
         inst: Instruction,
-        pc: &mut usize,
-    ) -> Result<bool, VmError<'a>> {
+        pc: usize,
+    ) -> Result<(bool, usize), VmError<'a>> {
         let a = Self::ra(base, inst);
         let b = opcodes::getarg_b(inst) as usize;
         let kb_idx = opcodes::getarg_c(inst) as usize;
@@ -4648,9 +4696,8 @@ impl VmExecutor {
                 // 窄 superblock: `sin(i)` 直取字段后接 MOVE+CALL 连缀 → 在本
                 // handler 内完成参数装载与纯调用, 省 2 次 dispatch。mv_idx =
                 // GETFIELD 位 (cur+1); 命中返回 2 → 跳过 MOVE+CALL。
-                let n = Self::fuse_pure_call(base, state, a, bf, *pc)?;
-                *pc += n;
-                return Ok(true);
+                let n = Self::fuse_pure_call(base, state, a, bf, pc)?;
+                return Ok((true, pc + n));
             }
             Some(SpecValue::Table(t)) => {
                 // perf: 融合紧随的 GETFIELD (B == A) — `_ENV.math.sin` 连读是
@@ -4659,7 +4706,7 @@ impl VmExecutor {
                 // 写表槽, 最后写字段值 — GETFIELD 的 A' 常等于 GETTABUP 的 A
                 // (`GETTABUP 4 0 math; GETFIELD 4 4 sin`), 后写覆盖先写, 顺序即语义。
                 // 未命中/非短串键 → 走原 GETFIELD 全路径 (元表语义由原指令保证)。
-                let fused: Option<TValue<'a>> = Self::try_fuse_getfield(state, a, &t, *pc - 1);
+                let fused: Option<TValue<'a>> = Self::try_fuse_getfield(state, a, &t, pc - 1);
                 if let Some(v) = fused {
                     // 中间表写会被字段值覆写 (a2 == table_slot) — 直写终值。
                     // 旧槽为同 BuiltinFn 时跳过覆写: 判别式+函数指针位级相等
@@ -4682,26 +4729,26 @@ impl VmExecutor {
                                 // 不能裸 ptr::write (泄漏)。
                                 Self::write_stack_state(state, a, v);
                             }
-                            skip += Self::fuse_pure_call(base, state, a, nf, *pc + 1)?;
+                            skip += Self::fuse_pure_call(base, state, a, nf, pc + 1)?;
                         }
                         other => {
                             Self::write_stack_state(state, a, TValue::Table(t));
                             Self::write_stack_state(state, a, other);
                         }
                     }
-                    *pc += skip;
+                    return Ok((true, pc + skip));
                 } else {
                     Self::write_stack_state(state, a, TValue::Table(t));
+                    return Ok((true, pc));
                 }
-                return Ok(true);
             }
             Some(SpecValue::Trivial(v)) => {
                 Self::write_stack_state(state, a, v);
-                return Ok(true);
+                return Ok((true, pc));
             }
             Some(SpecValue::Skip) => {
                 // 目标槽已持同对象: 槽内容即期望值, 只推进 pc (循环头已覆盖)
-                return Ok(true);
+                return Ok((true, pc));
             }
             None => {} // fall through
         }
@@ -4732,9 +4779,9 @@ impl VmExecutor {
         if let Some(get_result) = fast_result {
             let val = get_result.unwrap_or(TValue::Nil(NilKind::Strict));
             Self::write_stack_state(state, a, val);
-            return Ok(true);
+            return Ok((true, pc));
         }
-        Ok(false)
+        Ok((false, pc))
     }
 
     /// GETTABUP 冷路径: 原始读未命中且有元表 / 非 Table 类型, 需要走 table_get 查 __index。
@@ -4900,8 +4947,8 @@ impl VmExecutor {
         base: usize,
         state: &mut LuaState<'a>,
         inst: Instruction,
-        pc: &mut usize,
-    ) -> Result<bool, VmError<'a>> {
+        pc: usize,
+    ) -> Result<(bool, usize), VmError<'a>> {
         let a = Self::ra(base, inst);
         let b = Self::rb(base, inst);
         let c_key = opcodes::getarg_c(inst) as usize;
@@ -4957,21 +5004,20 @@ impl VmExecutor {
                 }
                 // 窄 superblock: `f(i)` 全局直取 (GETTABUP _ENV f + 此处融合) 或
                 // 任意表字段 pure 函数后接 MOVE+CALL → 省 2 次 dispatch。
-                let n = Self::fuse_pure_call(base, state, a, bf, *pc)?;
-                *pc += n;
-                return Ok(true);
+                let n = Self::fuse_pure_call(base, state, a, bf, pc)?;
+                return Ok((true, pc + n));
             }
             Some(SpecValue::Table(t)) => {
                 Self::write_stack_state(state, a, TValue::Table(t));
-                return Ok(true);
+                return Ok((true, pc));
             }
             Some(SpecValue::Trivial(v)) => {
                 Self::write_stack_state(state, a, v);
-                return Ok(true);
+                return Ok((true, pc));
             }
             Some(SpecValue::Skip) => {
                 // 目标槽已持同对象: 槽内容即期望值, 只推进 pc (循环头已覆盖)
-                return Ok(true);
+                return Ok((true, pc));
             }
             None => {} // fall through
         }
@@ -4994,9 +5040,9 @@ impl VmExecutor {
         if let Some(get_result) = fast_result {
             let val = get_result.unwrap_or(TValue::Nil(NilKind::Strict));
             Self::write_stack_state(state, a, val);
-            return Ok(true);
+            return Ok((true, pc));
         }
-        Ok(false)
+        Ok((false, pc))
     }
 
     /// GETFIELD 冷路径: 原始读未命中且有元表 / 非 Table 类型, 需要走 table_get 查 __index。
@@ -6656,18 +6702,18 @@ impl VmExecutor {
         state: &mut LuaState<'a>,
         base: usize,
         inst: Instruction,
-        pc: &mut usize,
-    ) -> Result<(), VmError<'a>> {
+        pc: usize,
+    ) -> Result<usize, VmError<'a>> {
         let a = Self::ra(base, inst);
         let b = Self::rb(base, inst);
 
         // cold path：clone 后调用 __eq 元方法
         let v1 = Self::read_stack_state(state, a).clone();
         let v2 = Self::read_stack_state(state, b).clone();
-        state.pc = *pc - 1; // sync (C savepc): 元方法/错误需要当前指令
+        state.pc = pc - 1; // sync (C savepc): 元方法/错误需要当前指令
         let cond = equal_obj(state, &v1, &v2)?;
-        *pc = Self::do_conditional_jump_state(state, inst, cond, *pc - 1)?;
-        Ok(())
+        let pc = Self::do_conditional_jump_state(state, inst, cond, pc - 1)?;
+        Ok(pc)
     }
 
     #[cold]
@@ -6676,18 +6722,18 @@ impl VmExecutor {
         state: &mut LuaState<'a>,
         base: usize,
         inst: Instruction,
-        pc: &mut usize,
+        pc: usize,
         tm: TagMethod,
-    ) -> Result<(), VmError<'a>> {
+    ) -> Result<usize, VmError<'a>> {
         let a = Self::ra(base, inst);
         let b = Self::rb(base, inst);
 
-        state.pc = *pc - 1; // sync (C savepc): 元方法/错误需要当前指令
+        state.pc = pc - 1; // sync (C savepc): 元方法/错误需要当前指令
         let v1 = Self::read_stack_state(state, a).clone();
         let v2 = Self::read_stack_state(state, b).clone();
         let cond = call_order_tm(state, &v1, &v2, tm)?;
-        *pc = Self::do_conditional_jump_state(state, inst, cond, *pc - 1)?;
-        Ok(())
+        let pc = Self::do_conditional_jump_state(state, inst, cond, pc - 1)?;
+        Ok(pc)
     }
 
     #[cold]
@@ -6696,19 +6742,19 @@ impl VmExecutor {
         state: &mut LuaState<'a>,
         base: usize,
         inst: Instruction,
-        pc: &mut usize,
+        pc: usize,
         flip: bool,
         tm: TagMethod,
-    ) -> Result<(), VmError<'a>> {
+    ) -> Result<usize, VmError<'a>> {
         let a = Self::ra(base, inst);
         let im = opcodes::getarg_sb(inst) as LuaInteger;
         let isfloat = opcodes::getarg_c(inst) != 0;
 
-        state.pc = *pc - 1; // sync (C savepc): 元方法/错误需要当前指令
+        state.pc = pc - 1; // sync (C savepc): 元方法/错误需要当前指令
         let v = Self::read_stack_state(state, a).clone();
         let cond = call_orderi_tm(state, &v, im, flip, isfloat, tm)?;
-        *pc = Self::do_conditional_jump_state(state, inst, cond, *pc - 1)?;
-        Ok(())
+        let pc = Self::do_conditional_jump_state(state, inst, cond, pc - 1)?;
+        Ok(pc)
     }
 
     #[inline]
