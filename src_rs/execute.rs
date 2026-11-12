@@ -86,12 +86,11 @@ enum Next {
 // 整数运算用方法形式（wrapping_add 等），浮点用运算符（+/ -/ *）。
 // ============================================================================
 macro_rules! arith_float_bin {
-    ($drop_queue:expr, $stack:expr, $top:expr, $a:expr, $v1:expr, $v2:expr, $float_method:expr) => {{
+    ($drop_queue:expr, $stack:expr, $a:expr, $v1:expr, $v2:expr, $float_method:expr) => {{
         if let (Some(n1), Some(n2)) = (to_number_ns($v1), to_number_ns($v2)) {
             Self::write_stack(
                 $drop_queue,
                 $stack,
-                $top,
                 $a,
                 TValue::Float($float_method(n1, n2)),
             );
@@ -104,31 +103,30 @@ macro_rules! arith_float_bin {
 }
 
 macro_rules! arith_bin2 {
-    ($drop_queue:expr, $stack:expr, $top:expr, $a:expr, $v1:expr, $v2:expr, $int_method:expr, $float_method:expr) => {{
+    ($drop_queue:expr, $stack:expr, $a:expr, $v1:expr, $v2:expr, $int_method:expr, $float_method:expr) => {{
         match ($v1, $v2) {
             (TValue::Integer(i1), TValue::Integer(i2)) => {
                 Self::write_stack(
                     $drop_queue,
                     $stack,
-                    $top,
                     $a,
                     TValue::Integer($int_method(*i1, *i2)),
                 );
                 Ok(Next::Skip) // skip MMBIN
             }
             _ => {
-                arith_float_bin!($drop_queue, $stack, $top, $a, $v1, $v2, $float_method)
+                arith_float_bin!($drop_queue, $stack, $a, $v1, $v2, $float_method)
             }
         }
     }};
 }
 
 macro_rules! arith_bin3 {
-    ($drop_queue:expr, $stack:expr, $top:expr, $a:expr, $v1:expr, $v2:expr, $int_method:expr, $int_vmerr:expr, $float_method:expr) => {{
+    ($drop_queue:expr, $stack:expr, $a:expr, $v1:expr, $v2:expr, $int_method:expr, $int_vmerr:expr, $float_method:expr) => {{
         match ($v1, $v2) {
             (TValue::Integer(i1), TValue::Integer(i2)) => {
                 if let Ok(i) = $int_method(*i1, *i2) {
-                    Self::write_stack($drop_queue, $stack, $top, $a, TValue::Integer(i));
+                    Self::write_stack($drop_queue, $stack, $a, TValue::Integer(i));
                     Ok(Next::Skip) // skip MMBIN
                 } else {
                     core::hint::cold_path();
@@ -140,7 +138,6 @@ macro_rules! arith_bin3 {
                     Self::write_stack(
                         $drop_queue,
                         $stack,
-                        $top,
                         $a,
                         TValue::Float($float_method(n1, n2)),
                     );
@@ -1216,6 +1213,36 @@ impl VmExecutor {
             // 从 state.base 重载; CALL 的 Fast 分支 (pure builtin, 帧未切) 跳过
             // 重载, 与 code/constants 缓存的前提一致。
             let mut base: usize = state.base;
+            // perf: 帧内栈切片基址 — op_* 收到以 base 为 0 号槽、长度 = live top
+            // 的切片, 直接按 A/B/C 字段索引, 省去 Self::ra/rb/rc 的 base 加法与
+            // top 形参 (边界即 stack.len())。帧切换
+            // (reload_istream!)、栈扩容点 (VARARG/VARARGPREP) 与 hook 回调后刷新。
+            // fast_unsafe 下用裸指针拼接切片 (省去每指令 sub-slice 边界检查);
+            // 关闭时退回安全检查的 sub-slice。
+            #[cfg(feature = "fast_unsafe")]
+            let mut stack_base: *mut TValue<'a> = unsafe { state.stack.as_mut_ptr().add(base) };
+            #[cfg(feature = "fast_unsafe")]
+            macro_rules! stack_slice {
+                () => {
+                    unsafe { std::slice::from_raw_parts_mut(stack_base, state.top - base) }
+                };
+            }
+            #[cfg(not(feature = "fast_unsafe"))]
+            macro_rules! stack_slice {
+                () => {
+                    &mut state.stack[base..state.top]
+                };
+            }
+            #[cfg(feature = "fast_unsafe")]
+            macro_rules! sync_stack_base {
+                ($st:expr) => {
+                    stack_base = unsafe { $st.stack.as_mut_ptr().add(base) };
+                };
+            }
+            #[cfg(not(feature = "fast_unsafe"))]
+            macro_rules! sync_stack_base {
+                ($st:expr) => {};
+            }
             let mut trap: i32 = state.hook_mask;
 
             // C 形状 pc 寄存器化 — 对应 C luaV_execute 的局部 pc (vmfetch: i = *(pc++))。
@@ -1331,6 +1358,8 @@ impl VmExecutor {
                         pc = $st.pc;
                     }
                     base = $st.base;
+                    // 帧切换 / 冷分发后栈可能已扩容移动, 重新取基址
+                    sync_stack_base!($st);
                     trap = $st.hook_mask;
                 };
             }
@@ -1493,6 +1522,8 @@ impl VmExecutor {
                 if trace_level | trap as u8 != 0 && op != OpCode::VARARGPREP {
                     core::hint::cold_path();
                     trap = Self::run_hooks(state, next_pc!(), trace_level)?;
+                    // hook 可能嵌套执行 Lua 导致栈扩容/移动
+                    sync_stack_base!(state);
                 }
 
                 #[cfg(not(feature = "fast_unsafe"))]
@@ -1522,42 +1553,22 @@ impl VmExecutor {
                     // === deleted 类: 直线指令 — 零 pc 内存操作 (循环头 pc+=1 覆盖推进) ===
                     // 数据移动/加载
                     OpCode::MOVE => {
-                        try_inst!(Self::op_move(
-                            &mut state.drop_queue,
-                            &mut state.stack,
-                            base,
-                            state.top,
-                            inst,
-                        ));
+                        try_inst!(Self::op_move(&mut state.drop_queue, stack_slice!(), inst,));
                         Next::Continue
                     }
                     OpCode::LOADI => {
-                        try_inst!(Self::op_loadi(
-                            &mut state.drop_queue,
-                            &mut state.stack,
-                            base,
-                            state.top,
-                            inst,
-                        ));
+                        try_inst!(Self::op_loadi(&mut state.drop_queue, stack_slice!(), inst,));
                         Next::Continue
                     }
                     OpCode::LOADF => {
-                        try_inst!(Self::op_loadf(
-                            &mut state.drop_queue,
-                            &mut state.stack,
-                            base,
-                            state.top,
-                            inst,
-                        ));
+                        try_inst!(Self::op_loadf(&mut state.drop_queue, stack_slice!(), inst,));
                         Next::Continue
                     }
                     OpCode::LOADK => {
                         try_inst!(Self::op_loadk(
                             &mut state.drop_queue,
-                            &mut state.stack,
+                            stack_slice!(),
                             constants_slice!(state),
-                            base,
-                            state.top,
                             inst,
                         ));
                         Next::Continue
@@ -1565,26 +1576,20 @@ impl VmExecutor {
                     OpCode::LOADFALSE => {
                         try_inst!(Self::op_loadfalse(
                             &mut state.drop_queue,
-                            &mut state.stack,
-                            base,
-                            state.top,
+                            stack_slice!(),
                             inst,
                         ));
                         Next::Continue
                     }
                     OpCode::LFALSESKIP => try_inst!(sync_err!(Self::op_lfalseskip(
                         &mut state.drop_queue,
-                        &mut state.stack,
-                        base,
-                        state.top,
+                        stack_slice!(),
                         inst,
                     ))),
                     OpCode::LOADTRUE => {
                         try_inst!(Self::op_loadtrue(
                             &mut state.drop_queue,
-                            &mut state.stack,
-                            base,
-                            state.top,
+                            stack_slice!(),
                             inst,
                         ));
                         Next::Continue
@@ -1592,9 +1597,7 @@ impl VmExecutor {
                     OpCode::LOADNIL => {
                         try_inst!(Self::op_loadnil(
                             &mut state.drop_queue,
-                            &mut state.stack,
-                            base,
-                            state.top,
+                            stack_slice!(),
                             inst,
                         ));
                         Next::Continue
@@ -1602,19 +1605,32 @@ impl VmExecutor {
                     // === 热门 opcode: 表读 (GETTABUP/GETTABLE/GETI/GETFIELD 为 param-cur:
                     //     慢路径 sync state.pc = cur, 对应 C 的 savepc) ===
                     OpCode::GETUPVAL => {
-                        let upvals: &UpValVec<'a> = unsafe { &*state.closure_upvals.as_ptr() };
-                        #[cfg(not(feature = "fast_unsafe"))]
-                        let upvals_guard = state.closure_upvals.borrow();
-                        #[cfg(not(feature = "fast_unsafe"))]
-                        let upvals: &UpValVec<'a> = &upvals_guard;
-                        let r = Self::op_getupval(
-                            &mut state.drop_queue,
-                            &mut state.stack,
-                            base,
-                            state.top,
-                            inst,
-                            upvals,
-                        );
+                        let r = {
+                            // safe 构建的 RefGuard 必须在 try_inst! (冷错误路径借用 &mut state)
+                            // 之前释放, 故把整个取值过程收进块内。
+                            #[cfg(not(feature = "fast_unsafe"))]
+                            let upvals_guard = state.closure_upvals.borrow();
+                            #[cfg(feature = "fast_unsafe")]
+                            let upvals: &UpValVec<'a> = unsafe { &*state.closure_upvals.as_ptr() };
+                            #[cfg(not(feature = "fast_unsafe"))]
+                            let upvals: &UpValVec<'a> = &upvals_guard;
+                            // open upvalue 使用绝对槽位 (非帧内相对下标), 故不能用 stack_slice!:
+                            // 取 [0, live top) —— 指令边界处 live top 覆盖当前帧全部寄存器,
+                            // 而被捕获的外层局部必在更低的槽位 (闭包创建时已存在)。
+                            #[cfg(feature = "fast_unsafe")]
+                            let upval_stack: &mut [TValue<'a>] = unsafe {
+                                std::slice::from_raw_parts_mut(state.stack.as_mut_ptr(), state.top)
+                            };
+                            #[cfg(not(feature = "fast_unsafe"))]
+                            let upval_stack: &mut [TValue<'a>] = &mut state.stack[..state.top];
+                            Self::op_getupval(
+                                &mut state.drop_queue,
+                                upval_stack,
+                                base,
+                                inst,
+                                upvals,
+                            )
+                        };
                         trap = state.hook_mask;
                         try_inst!(r.map(|_| Next::Continue))
                     }
@@ -1641,9 +1657,7 @@ impl VmExecutor {
                     }
                     OpCode::GETTABLE => try_inst!(match Self::op_gettable(
                         &mut state.drop_queue,
-                        &mut state.stack,
-                        base,
-                        state.top,
+                        stack_slice!(),
                         inst
                     ) {
                         Ok(true) => Ok(Next::Continue),
@@ -1656,23 +1670,21 @@ impl VmExecutor {
                         }
                         Err(err) => Err(err),
                     }),
-                    OpCode::GETI => try_inst!(match Self::op_geti(
-                        &mut state.drop_queue,
-                        &mut state.stack,
-                        base,
-                        state.top,
-                        inst
-                    ) {
-                        Ok(true) => Ok(Next::Continue),
-                        Ok(false) => {
-                            // savepc: 慢路径入口前同步当前指令
-                            state.pc = cur_pc!();
-                            let r = Self::op_geti_cold(base, state, inst);
-                            trap = state.hook_mask;
-                            r
-                        }
-                        Err(err) => Err(err),
-                    }),
+                    OpCode::GETI => {
+                        try_inst!(
+                            match Self::op_geti(&mut state.drop_queue, stack_slice!(), inst) {
+                                Ok(true) => Ok(Next::Continue),
+                                Ok(false) => {
+                                    // savepc: 慢路径入口前同步当前指令
+                                    state.pc = cur_pc!();
+                                    let r = Self::op_geti_cold(base, state, inst);
+                                    trap = state.hook_mask;
+                                    r
+                                }
+                                Err(err) => Err(err),
+                            }
+                        )
+                    }
                     OpCode::GETFIELD => {
                         try_inst!(match Self::op_getfield(base, state, inst, next_pc!()) {
                             Ok((true, new_pc)) => {
@@ -1748,125 +1760,89 @@ impl VmExecutor {
                     // === 热门 opcode: 算术运算 (param-pc: 成功 *pc += 1 跳过 MMBIN) ===
                     OpCode::ADDI => try_inst!(sync_err!(Self::op_addi(
                         &mut state.drop_queue,
-                        &mut state.stack,
-                        base,
-                        state.top,
+                        stack_slice!(),
                         inst,
                     ))),
                     OpCode::ADDK => try_inst!(sync_err!(Self::op_addk(
                         &mut state.drop_queue,
-                        &mut state.stack,
+                        stack_slice!(),
                         constants_slice!(state),
-                        base,
-                        state.top,
                         inst,
                     ))),
                     OpCode::SUBK => try_inst!(sync_err!(Self::op_subk(
                         &mut state.drop_queue,
-                        &mut state.stack,
+                        stack_slice!(),
                         constants_slice!(state),
-                        base,
-                        state.top,
                         inst,
                     ))),
                     OpCode::MULK => try_inst!(sync_err!(Self::op_mulk(
                         &mut state.drop_queue,
-                        &mut state.stack,
+                        stack_slice!(),
                         constants_slice!(state),
-                        base,
-                        state.top,
                         inst,
                     ))),
                     OpCode::MODK => try_inst!(sync_err!(Self::op_modk(
                         &mut state.drop_queue,
-                        &mut state.stack,
+                        stack_slice!(),
                         constants_slice!(state),
-                        base,
-                        state.top,
                         inst,
                     ))),
                     OpCode::POWK => try_inst!(sync_err!(Self::op_powk(
                         &mut state.drop_queue,
-                        &mut state.stack,
+                        stack_slice!(),
                         constants_slice!(state),
-                        base,
-                        state.top,
                         inst,
                     ))),
                     OpCode::DIVK => try_inst!(sync_err!(Self::op_divk(
                         &mut state.drop_queue,
-                        &mut state.stack,
+                        stack_slice!(),
                         constants_slice!(state),
-                        base,
-                        state.top,
                         inst,
                     ))),
                     OpCode::IDIVK => try_inst!(sync_err!(Self::op_idivk(
                         &mut state.drop_queue,
-                        &mut state.stack,
+                        stack_slice!(),
                         constants_slice!(state),
-                        base,
-                        state.top,
                         inst,
                     ))),
                     OpCode::ADD => try_inst!(sync_err!(Self::op_add(
                         &mut state.drop_queue,
-                        &mut state.stack,
-                        base,
-                        state.top,
+                        stack_slice!(),
                         inst,
                     ))),
                     OpCode::SUB => try_inst!(sync_err!(Self::op_sub(
                         &mut state.drop_queue,
-                        &mut state.stack,
-                        base,
-                        state.top,
+                        stack_slice!(),
                         inst,
                     ))),
                     OpCode::MUL => try_inst!(sync_err!(Self::op_mul(
                         &mut state.drop_queue,
-                        &mut state.stack,
-                        base,
-                        state.top,
+                        stack_slice!(),
                         inst,
                     ))),
                     OpCode::MOD => try_inst!(sync_err!(Self::op_mod(
                         &mut state.drop_queue,
-                        &mut state.stack,
-                        base,
-                        state.top,
+                        stack_slice!(),
                         inst,
                     ))),
                     OpCode::POW => try_inst!(sync_err!(Self::op_pow(
                         &mut state.drop_queue,
-                        &mut state.stack,
-                        base,
-                        state.top,
+                        stack_slice!(),
                         inst,
                     ))),
                     OpCode::DIV => try_inst!(sync_err!(Self::op_div(
                         &mut state.drop_queue,
-                        &mut state.stack,
-                        base,
-                        state.top,
+                        stack_slice!(),
                         inst,
                     ))),
                     OpCode::IDIV => try_inst!(sync_err!(Self::op_idiv(
                         &mut state.drop_queue,
-                        &mut state.stack,
-                        base,
-                        state.top,
+                        stack_slice!(),
                         inst,
                     ))),
                     // === 热门 opcode: 逻辑非 (deleted) ===
                     OpCode::NOT => {
-                        try_inst!(Self::op_not(
-                            &mut state.drop_queue,
-                            &mut state.stack,
-                            base,
-                            state.top,
-                            inst,
-                        ));
+                        try_inst!(Self::op_not(&mut state.drop_queue, stack_slice!(), inst,));
                         Next::Continue
                     }
                     // === 热门 opcode: 跳转/比较 (param-pc; 比较冷路径带 cur sync) ===
@@ -1933,20 +1909,13 @@ impl VmExecutor {
                         ),
                         r => r,
                     }),
-                    OpCode::TEST => try_inst!(Self::op_test(
-                        &mut state.stack,
-                        &state.code,
-                        base,
-                        state.top,
-                        inst,
-                        next_pc!(),
-                    )),
+                    OpCode::TEST => {
+                        try_inst!(Self::op_test(stack_slice!(), &state.code, inst, next_pc!(),))
+                    }
                     OpCode::TESTSET => try_inst!(Self::op_testset(
                         &mut state.drop_queue,
-                        &mut state.stack,
+                        stack_slice!(),
                         &state.code,
-                        base,
-                        state.top,
                         inst,
                         next_pc!(),
                     )),
@@ -2041,9 +2010,7 @@ impl VmExecutor {
                     // sync/reload, 内部错误路径天然持有正确 state.pc, 零内部改动)
                     OpCode::FORLOOP => try_inst!(Ok(Self::op_forloop(
                         &mut state.drop_queue,
-                        &mut state.stack,
-                        base,
-                        state.top,
+                        stack_slice!(),
                         inst,
                         next_pc!(),
                     ))),
@@ -2082,6 +2049,7 @@ impl VmExecutor {
                             // 收尾处抬回边界 (见 LuaState::sync_live_top); 紧跟的
                             // OP_CALL/OP_RETURN b==0 与 OP_SETLIST c==0 按 mret_end 取个数。
                             state.sync_live_top();
+                            sync_stack_base!(state);
                         }
                         trap = state.hook_mask;
                         r
@@ -2093,6 +2061,7 @@ impl VmExecutor {
                             // func 上移 `totalargs + 1`) — 唯一不经帧切换的 base 写点,
                             // 返回后同步缓存 (单次 load; code/constants 不变, 免整 reload)。
                             base = state.base;
+                            sync_stack_base!(state);
                             // 帧入口把 live top 压成「实参末尾」供本指令消费; 之后恢复边界
                             // 上界 (抬升不能放在本指令之前 —— 见 VARARGPREP 例外的说明)。
                             state.sync_live_top();
@@ -2872,7 +2841,7 @@ impl VmExecutor {
     /// (上界 = `max(len, top)`, 见 [`Self::write_stack`] 的不变量说明)。
     /// 越界写意味着某个补齐点漏了 —— release 下会静默踩未初始化内存, 故诊断构建必须拦下。
     #[cfg(feature = "probe_wstack")]
-    fn probe_write_slot(limit: usize, idx: usize, len: usize, top: usize, base: usize) {
+    fn probe_write_slot(limit: usize, idx: usize, len: usize, base: usize) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         static OOB: AtomicUsize = AtomicUsize::new(0);
         if idx >= len {
@@ -2885,7 +2854,7 @@ impl VmExecutor {
         if idx >= limit {
             let n = OOB.fetch_add(1, Ordering::Relaxed);
             if n < 10 {
-                eprintln!("[WSOOB #{n}] idx={idx} limit={limit} len={len} base={base} top={top}");
+                eprintln!("[WSOOB #{n}] idx={idx} limit={limit} len={len} base={base}");
             }
         }
     }
@@ -2920,7 +2889,6 @@ impl VmExecutor {
             TValue<'a>,
         >,
         stack: &mut [TValue<'a>],
-        #[cfg_attr(not(feature = "fast_unsafe"), allow(unused_variables))] top: usize,
         idx: usize,
         val: TValue<'a>,
     ) {
@@ -2931,20 +2899,13 @@ impl VmExecutor {
         #[cfg(feature = "fast_unsafe")]
         unsafe {
             #[cfg(feature = "probe_wstack")]
-            Self::probe_write_slot(
-                if stack.len() > top { stack.len() } else { top },
-                idx,
-                stack.len(),
-                top,
-                0,
-            );
+            Self::probe_write_slot(stack.len(), idx, stack.len(), 0);
             let slot: *mut TValue<'a> = stack.as_mut_ptr().add(idx);
             debug_assert!(
-                idx < stack.len() || idx < top,
-                "write_stack 越界: idx={} len={} top={}",
+                idx < stack.len(),
+                "write_stack 越界: idx={} len={}",
                 idx,
-                stack.len(),
-                top
+                stack.len()
             );
             if Self::old_slot_holds_ref(&*slot) {
                 let old = std::ptr::read(slot);
@@ -2970,7 +2931,22 @@ impl VmExecutor {
     pub(crate) fn write_stack_state<'a>(state: &mut LuaState<'a>, idx: usize, val: TValue<'a>) {
         debug_assert!(state.stack.len() <= state.stack.capacity());
         debug_assert!(idx < state.stack.len());
-        Self::write_stack(&mut state.drop_queue, &mut state.stack, state.top, idx, val);
+        // 写边界 = live top: 寄存器写必须落在 live top 之内 (与字节码侧
+        // stack_slice! 的长度语义一致)。想在 live top 之上写帧内寄存器
+        // (如 CALL 补缺失定参、VARARGPREP 写变参表槽) 的调用点, 必须先抬
+        // live top —— 而不是让本函数把边界放宽到整个栈。
+        debug_assert!(
+            idx < state.top,
+            "write_stack_state 越过 live top: idx={} top={}",
+            idx,
+            state.top
+        );
+        Self::write_stack(
+            &mut state.drop_queue,
+            &mut state.stack[..state.top],
+            idx,
+            val,
+        );
         debug_assert!(state.top <= state.stack.capacity());
     }
 
@@ -3029,8 +3005,6 @@ impl VmExecutor {
     pub(crate) fn copy_stack_slot<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        #[cfg_attr(not(feature = "fast_unsafe"), allow(unused_variables))] base: usize,
-        top: usize,
         dst_idx: usize,
         src_idx: usize,
     ) {
@@ -3044,31 +3018,28 @@ impl VmExecutor {
             let dst: *mut TValue<'a> = stack_ptr.add(dst_idx);
             if !(Self::old_slot_holds_ref(&*src) | Self::old_slot_holds_ref(&*dst)) {
                 #[cfg(feature = "probe_wstack")]
-                Self::probe_write_slot(stack.len(), dst_idx, stack.len(), top, 0);
+                Self::probe_write_slot(stack.len(), dst_idx, stack.len(), 0);
                 debug_assert!(
-                    dst_idx < stack.len() || dst_idx < top,
-                    "copy_stack_slot 越界: dst={} len={} top={} base={}",
+                    dst_idx < stack.len(),
+                    "copy_stack_slot 越界: dst={} len={}",
                     dst_idx,
                     stack.len(),
-                    top,
-                    base
                 );
                 std::ptr::write(dst, std::ptr::read(src));
                 return;
             }
         }
         // 冷路径 / 安全等价实现: 源持有引用 (或旧槽持有引用) → 常规 clone + write_stack。
-        let val = Self::read_stack(stack, top, src_idx).clone();
-        Self::write_stack(drop_queue, stack, top, dst_idx, val);
+        let val = Self::read_stack(stack, src_idx).clone();
+        Self::write_stack(drop_queue, stack, dst_idx, val);
     }
 
     /// 读取栈槽 — VM 字节码路径专用 (idx 保证在范围内)
     /// perf: unsafe get_unchecked 跳过边界检查
     #[inline(always)]
-    fn read_stack<'a, 'b>(stack: &'b [TValue<'a>], top: usize, idx: usize) -> &'b TValue<'a> {
+    fn read_stack<'a, 'b>(stack: &'b [TValue<'a>], idx: usize) -> &'b TValue<'a> {
         #[cfg(feature = "fast_unsafe")]
         {
-            let _ = top;
             unsafe { stack.get_unchecked(idx) }
         }
         #[cfg(not(feature = "fast_unsafe"))]
@@ -3076,14 +3047,20 @@ impl VmExecutor {
             // 不变量: 任何被读取的寄存器都小于 live top —— 帧入口把 top 置为 `ci->top`,
             // 之后只有「调用完成」把 top 收到返回值末尾 (此时后面的寄存器尚未被定义),
             // 而定义新寄存器的指令又都在自己的 handler 里把 top 推到该寄存器之后。
-            // 破坏这条不变量就是模型错误, 所以这里用 top 而不是物理长度做边界。
-            if idx < top {
+            // 破坏这条不变量就是模型错误, 所以这里用切片长度 (帧切片 = live top) 做边界。
+            if idx < stack.len() {
                 &stack[idx]
             } else {
                 let ctx = DISPATCH_CTX.with(|c| c.get());
                 unreachable!(
-                    "read_stack 越界: idx={} top={} ctx=(top,base,pc,op,fsize)=({},{},{},{:?},{})",
-                    idx, top, ctx.0, ctx.1, ctx.2, ctx.3, ctx.4
+                    "read_stack 越界: idx={} len={} ctx=(top,base,pc,op,fsize)=({},{},{},{:?},{})",
+                    idx,
+                    stack.len(),
+                    ctx.0,
+                    ctx.1,
+                    ctx.2,
+                    ctx.3,
+                    ctx.4
                 )
             }
         }
@@ -3128,7 +3105,9 @@ impl VmExecutor {
                 );
             }
         }
-        Self::read_stack(&state.stack, state.top, idx)
+        // 与 write_stack_state 同一模型: 指令边界处 live top 恒 >= 帧上界,
+        // 帧内寄存器读都在 live top 之内。
+        Self::read_stack(&state.stack[..state.top], idx)
     }
 
     /// 智能栈清除 — 不截断 Vec, 仅设置 state.top, 避免 write_stack_grow 开销。
@@ -4149,15 +4128,13 @@ impl VmExecutor {
     fn op_move<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<(), VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
         // 对应 C 的 `setobjs2s(L, ra, RB(i))`: 无条件 16B 覆盖写, 引用计数修正
         // (新值 inc / 旧值 release) 合并为单次判定并出线到冷路径 —— 见 copy_stack_slot。
-        Self::copy_stack_slot(drop_queue, stack, base, top, a, b);
+        Self::copy_stack_slot(drop_queue, stack, a, b);
         Ok(())
     }
 
@@ -4165,13 +4142,11 @@ impl VmExecutor {
     fn op_loadi<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<(), VmError<'a>> {
-        let a = Self::ra(base, inst);
+        let a = opcodes::getarg_a(inst) as usize;
         let val = opcodes::getarg_sbx(inst) as LuaInteger;
-        Self::write_stack(drop_queue, stack, top, a, TValue::Integer(val));
+        Self::write_stack(drop_queue, stack, a, TValue::Integer(val));
         Ok(())
     }
 
@@ -4179,13 +4154,11 @@ impl VmExecutor {
     fn op_loadf<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<(), VmError<'a>> {
-        let a = Self::ra(base, inst);
+        let a = opcodes::getarg_a(inst) as usize;
         let val = opcodes::getarg_sbx(inst) as LuaNumber;
-        Self::write_stack(drop_queue, stack, top, a, TValue::Float(val));
+        Self::write_stack(drop_queue, stack, a, TValue::Float(val));
         Ok(())
     }
 
@@ -4194,14 +4167,12 @@ impl VmExecutor {
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
         constants: &[TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<(), VmError<'a>> {
-        let a = Self::ra(base, inst);
+        let a = opcodes::getarg_a(inst) as usize;
         let idx = opcodes::getarg_bx(inst) as usize;
         let val = unsafe { constants.get_unchecked(idx) }.clone();
-        Self::write_stack(drop_queue, stack, top, a, val);
+        Self::write_stack(drop_queue, stack, a, val);
         Ok(())
     }
 
@@ -4225,12 +4196,10 @@ impl VmExecutor {
     fn op_loadfalse<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<(), VmError<'a>> {
-        let a = Self::ra(base, inst);
-        Self::write_stack(drop_queue, stack, top, a, TValue::Boolean(false));
+        let a = opcodes::getarg_a(inst) as usize;
+        Self::write_stack(drop_queue, stack, a, TValue::Boolean(false));
         Ok(())
     }
 
@@ -4238,12 +4207,10 @@ impl VmExecutor {
     fn op_lfalseskip<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<Next, VmError<'a>> {
-        let a = Self::ra(base, inst);
-        Self::write_stack(drop_queue, stack, top, a, TValue::Boolean(false));
+        let a = opcodes::getarg_a(inst) as usize;
+        Self::write_stack(drop_queue, stack, a, TValue::Boolean(false));
         // 跳过紧随其后的一条指令 (C: state.pc += 2, cur 基准)
         Ok(Next::Skip)
     }
@@ -4252,12 +4219,10 @@ impl VmExecutor {
     fn op_loadtrue<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<(), VmError<'a>> {
-        let a = Self::ra(base, inst);
-        Self::write_stack(drop_queue, stack, top, a, TValue::Boolean(true));
+        let a = opcodes::getarg_a(inst) as usize;
+        Self::write_stack(drop_queue, stack, a, TValue::Boolean(true));
         Ok(())
     }
 
@@ -4265,17 +4230,14 @@ impl VmExecutor {
     fn op_loadnil<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<(), VmError<'a>> {
-        let a = Self::ra(base, inst);
+        let a = opcodes::getarg_a(inst) as usize;
         let b = opcodes::getarg_b(inst);
         for i in 0..=b {
             Self::write_stack(
                 drop_queue,
                 stack,
-                top,
                 a + i as usize,
                 TValue::Nil(NilKind::Strict),
             );
@@ -4288,7 +4250,6 @@ impl VmExecutor {
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
         base: usize,
-        top: usize,
         inst: Instruction,
         upvals: &UpValVec<'a>,
     ) -> Result<(), VmError<'a>> {
@@ -4305,11 +4266,11 @@ impl VmExecutor {
             let uv: &UpVal<'a> = &uv_guard;
             match uv {
                 UpVal::Closed { value } => value,
-                UpVal::Open { stack_index, .. } => Self::read_stack(stack, top, *stack_index),
+                UpVal::Open { stack_index, .. } => Self::read_stack(stack, *stack_index),
             }
             .clone()
         };
-        Self::write_stack(drop_queue, stack, top, a, val);
+        Self::write_stack(drop_queue, stack, a, val);
         Ok(())
     }
 
@@ -4632,15 +4593,13 @@ impl VmExecutor {
     fn op_gettable<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<bool, VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
-        let c = Self::rc(base, inst);
-        let table_val = Self::read_stack(stack, top, b);
-        let key = Self::read_stack(stack, top, c);
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
+        let c = opcodes::getarg_c(inst) as usize;
+        let table_val = Self::read_stack(stack, b);
+        let key = Self::read_stack(stack, c);
         // perf 快速路径: 原始读 (命中即返回, 有无元表皆可) 直接用 get_and_metatable,
         // 跳过 table_get 包装层
         // + table_val/key 两次 clone。直接用栈索引访问避免 read_stack 借用冲突。
@@ -4660,7 +4619,7 @@ impl VmExecutor {
         match fast_result {
             Some(get_result) => {
                 let val = get_result.unwrap_or(TValue::Nil(NilKind::Strict));
-                Self::write_stack(drop_queue, stack, top, a, val);
+                Self::write_stack(drop_queue, stack, a, val);
                 Ok(true)
             }
             None => Ok(false),
@@ -4693,14 +4652,12 @@ impl VmExecutor {
     fn op_geti<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<bool, VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
         let c = opcodes::getarg_c(inst) as LuaInteger;
-        let table_val = Self::read_stack(stack, top, b);
+        let table_val = Self::read_stack(stack, b);
         let key = TValue::Integer(c);
         // perf 快速路径: 原始读 (命中即返回, 有无元表皆可) 直接用 get_and_metatable,
         // 跳过 table_get 包装层
@@ -4721,7 +4678,7 @@ impl VmExecutor {
         };
         if let Some(get_result) = fast_result {
             let val = get_result.unwrap_or(TValue::Nil(NilKind::Strict));
-            Self::write_stack(drop_queue, stack, top, a, val);
+            Self::write_stack(drop_queue, stack, a, val);
             return Ok(true);
         }
         Ok(false)
@@ -5232,15 +5189,13 @@ impl VmExecutor {
     fn op_addi<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<Next, VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
         let imm = opcodes::getarg_sc(inst) as LuaInteger;
         let (has_imm_result, result) = {
-            let val = Self::read_stack(stack, top, b);
+            let val = Self::read_stack(stack, b);
             match val {
                 TValue::Integer(iv) => (true, TValue::Integer(iv.wrapping_add(imm))),
                 TValue::Float(fv) => (true, TValue::Float(fv + imm as LuaNumber)),
@@ -5248,7 +5203,7 @@ impl VmExecutor {
             }
         };
         if has_imm_result {
-            Self::write_stack(drop_queue, stack, top, a, result);
+            Self::write_stack(drop_queue, stack, a, result);
             Ok(Next::Skip) // skip MMBINI
         } else {
             Ok(Next::Continue)
@@ -5259,19 +5214,16 @@ impl VmExecutor {
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
         constants: &[TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<Next, VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
         let c_key = opcodes::getarg_c(inst) as usize;
-        let v1 = Self::read_stack(stack, top, b);
+        let v1 = Self::read_stack(stack, b);
         let v2 = unsafe { constants.get_unchecked(c_key) };
         arith_bin2!(
             drop_queue,
             stack,
-            top,
             a,
             v1,
             v2,
@@ -5285,19 +5237,16 @@ impl VmExecutor {
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
         constants: &[TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<Next, VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
         let c_key = opcodes::getarg_c(inst) as usize;
-        let v1 = Self::read_stack(stack, top, b);
+        let v1 = Self::read_stack(stack, b);
         let v2 = unsafe { constants.get_unchecked(c_key) };
         arith_bin2!(
             drop_queue,
             stack,
-            top,
             a,
             v1,
             v2,
@@ -5311,19 +5260,16 @@ impl VmExecutor {
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
         constants: &[TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<Next, VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
         let c_key = opcodes::getarg_c(inst) as usize;
-        let v1 = Self::read_stack(stack, top, b);
+        let v1 = Self::read_stack(stack, b);
         let v2 = unsafe { constants.get_unchecked(c_key) };
         arith_bin2!(
             drop_queue,
             stack,
-            top,
             a,
             v1,
             v2,
@@ -5336,20 +5282,17 @@ impl VmExecutor {
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
         constants: &[TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<Next, VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
         let c_key = opcodes::getarg_c(inst) as usize;
         // perf: K 常量免 clone — 引用展开
-        let v1 = Self::read_stack(stack, top, b);
+        let v1 = Self::read_stack(stack, b);
         let v2 = unsafe { constants.get_unchecked(c_key) };
         arith_bin3!(
             drop_queue,
             stack,
-            top,
             a,
             v1,
             v2,
@@ -5364,16 +5307,14 @@ impl VmExecutor {
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
         constants: &[TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<Next, VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
         let c_key = opcodes::getarg_c(inst) as usize;
-        let v1 = Self::read_stack(stack, top, b);
+        let v1 = Self::read_stack(stack, b);
         let v2 = unsafe { constants.get_unchecked(c_key) };
-        arith_float_bin!(drop_queue, stack, top, a, v1, v2, crate::config::float_pow)
+        arith_float_bin!(drop_queue, stack, a, v1, v2, crate::config::float_pow)
     }
 
     #[inline]
@@ -5381,16 +5322,14 @@ impl VmExecutor {
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
         constants: &[TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<Next, VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
         let c_key = opcodes::getarg_c(inst) as usize;
-        let v1 = Self::read_stack(stack, top, b);
+        let v1 = Self::read_stack(stack, b);
         let v2 = unsafe { constants.get_unchecked(c_key) };
-        arith_float_bin!(drop_queue, stack, top, a, v1, v2, LuaNumber::algebraic_div)
+        arith_float_bin!(drop_queue, stack, a, v1, v2, LuaNumber::algebraic_div)
     }
 
     #[inline]
@@ -5398,19 +5337,16 @@ impl VmExecutor {
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
         constants: &[TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<Next, VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
         let c_key = opcodes::getarg_c(inst) as usize;
-        let v1 = Self::read_stack(stack, top, b);
+        let v1 = Self::read_stack(stack, b);
         let v2 = unsafe { constants.get_unchecked(c_key) };
         arith_bin3!(
             drop_queue,
             stack,
-            top,
             a,
             v1,
             v2,
@@ -5536,20 +5472,17 @@ impl VmExecutor {
     fn op_add<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<Next, VmError<'a>> {
         // C: op_arith — if both numbers, compute and pc++ (skip MMBIN); else fall through
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
-        let c = Self::rc(base, inst);
-        let v1 = Self::read_stack(stack, top, b);
-        let v2 = Self::read_stack(stack, top, c);
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
+        let c = opcodes::getarg_c(inst) as usize;
+        let v1 = Self::read_stack(stack, b);
+        let v2 = Self::read_stack(stack, c);
         arith_bin2!(
             drop_queue,
             stack,
-            top,
             a,
             v1,
             v2,
@@ -5562,19 +5495,16 @@ impl VmExecutor {
     fn op_sub<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<Next, VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
-        let c = Self::rc(base, inst);
-        let v1 = Self::read_stack(stack, top, b);
-        let v2 = Self::read_stack(stack, top, c);
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
+        let c = opcodes::getarg_c(inst) as usize;
+        let v1 = Self::read_stack(stack, b);
+        let v2 = Self::read_stack(stack, c);
         arith_bin2!(
             drop_queue,
             stack,
-            top,
             a,
             v1,
             v2,
@@ -5587,19 +5517,16 @@ impl VmExecutor {
     fn op_mul<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<Next, VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
-        let c = Self::rc(base, inst);
-        let v1 = Self::read_stack(stack, top, b);
-        let v2 = Self::read_stack(stack, top, c);
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
+        let c = opcodes::getarg_c(inst) as usize;
+        let v1 = Self::read_stack(stack, b);
+        let v2 = Self::read_stack(stack, c);
         arith_bin2!(
             drop_queue,
             stack,
-            top,
             a,
             v1,
             v2,
@@ -5612,19 +5539,16 @@ impl VmExecutor {
     fn op_mod<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<Next, VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
-        let c = Self::rc(base, inst);
-        let v1 = Self::read_stack(stack, top, b);
-        let v2 = Self::read_stack(stack, top, c);
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
+        let c = opcodes::getarg_c(inst) as usize;
+        let v1 = Self::read_stack(stack, b);
+        let v2 = Self::read_stack(stack, c);
         arith_bin3!(
             drop_queue,
             stack,
-            top,
             a,
             v1,
             v2,
@@ -5638,51 +5562,44 @@ impl VmExecutor {
     fn op_pow<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<Next, VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
-        let c = Self::rc(base, inst);
-        let v1 = Self::read_stack(stack, top, b);
-        let v2 = Self::read_stack(stack, top, c);
-        arith_float_bin!(drop_queue, stack, top, a, v1, v2, crate::config::float_pow)
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
+        let c = opcodes::getarg_c(inst) as usize;
+        let v1 = Self::read_stack(stack, b);
+        let v2 = Self::read_stack(stack, c);
+        arith_float_bin!(drop_queue, stack, a, v1, v2, crate::config::float_pow)
     }
 
     #[inline]
     fn op_div<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<Next, VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
-        let c = Self::rc(base, inst);
-        let v1 = Self::read_stack(stack, top, b);
-        let v2 = Self::read_stack(stack, top, c);
-        arith_float_bin!(drop_queue, stack, top, a, v1, v2, LuaNumber::algebraic_div)
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
+        let c = opcodes::getarg_c(inst) as usize;
+        let v1 = Self::read_stack(stack, b);
+        let v2 = Self::read_stack(stack, c);
+        arith_float_bin!(drop_queue, stack, a, v1, v2, LuaNumber::algebraic_div)
     }
 
     #[inline]
     fn op_idiv<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<Next, VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
-        let c = Self::rc(base, inst);
-        let v1 = Self::read_stack(stack, top, b);
-        let v2 = Self::read_stack(stack, top, c);
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
+        let c = opcodes::getarg_c(inst) as usize;
+        let v1 = Self::read_stack(stack, b);
+        let v2 = Self::read_stack(stack, c);
         arith_bin3!(
             drop_queue,
             stack,
-            top,
             a,
             v1,
             v2,
@@ -5968,15 +5885,13 @@ impl VmExecutor {
     fn op_not<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
     ) -> Result<(), VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
-        let v = Self::read_stack(stack, top, b);
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
+        let v = Self::read_stack(stack, b);
         let result = TValue::Boolean(is_false(v));
-        Self::write_stack(drop_queue, stack, top, a, result);
+        Self::write_stack(drop_queue, stack, a, result);
         Ok(())
     }
 
@@ -6518,13 +6433,11 @@ impl VmExecutor {
     fn op_test<'a>(
         stack: &mut [TValue<'a>],
         code: &[Instruction],
-        base: usize,
-        top: usize,
         inst: Instruction,
         pc: usize,
     ) -> Result<Next, VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let v = Self::read_stack(stack, top, a);
+        let a = opcodes::getarg_a(inst) as usize;
+        let v = Self::read_stack(stack, a);
         let cond = !is_false(v);
         Ok(Next::Jump(Self::do_conditional_jump(
             code,
@@ -6539,20 +6452,18 @@ impl VmExecutor {
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
         code: &[Instruction],
-        base: usize,
-        top: usize,
         inst: Instruction,
         pc: usize,
     ) -> Result<Next, VmError<'a>> {
-        let a = Self::ra(base, inst);
-        let b = Self::rb(base, inst);
-        let v = Self::read_stack(stack, top, b);
+        let a = opcodes::getarg_a(inst) as usize;
+        let b = opcodes::getarg_b(inst) as usize;
+        let v = Self::read_stack(stack, b);
         let cond = !is_false(v);
         let expected = opcodes::testarg_k(inst);
         let cur = pc - 1; // 当前 TESTSET 指令索引
         let new_pc = if cond == expected {
             // 对应 C: setobj2s(L, ra, rb); donextjump(ci);
-            Self::write_stack(drop_queue, stack, top, a, v.clone());
+            Self::write_stack(drop_queue, stack, a, v.clone());
             Self::do_conditional_jump(code, inst, cond, cur)
         } else {
             // 对应 C: pc++ (跳过 JMP) — TESTSET 和 JMP 共 2 条, pc 已 = cur+1
@@ -6603,7 +6514,13 @@ impl VmExecutor {
             && call_ok(i1)
         {
             // 参数装载: 复用 op_move (恒 Ok; 越界走其 grow 分支, 与原指令逐位相同)
-            Self::op_move(&mut state.drop_queue, &mut state.stack, base, state.top, i0)?;
+            #[cfg(feature = "fast_unsafe")]
+            let stack = unsafe {
+                std::slice::from_raw_parts_mut(state.stack.as_mut_ptr().add(base), state.top - base)
+            };
+            #[cfg(not(feature = "fast_unsafe"))]
+            let stack = &mut state.stack[base..state.top];
+            Self::op_move(&mut state.drop_queue, stack, i0)?;
             state.top = a2 + 2;
             state.pc = mv_idx + 1; // CALL 索引 (C savepc 同形)
             Self::call_pure_builtin(state, a2, 2, 2, bf)?;
@@ -6958,16 +6875,18 @@ impl VmExecutor {
             state.truncate_live(a + 1 + nargs);
             if nargs < nfixparams {
                 Self::fast_resize_stack_nil(state, a + 1 + nfixparams);
-                // truncate_live 只保证逻辑上界, 槽位里的旧值(整数等 trivial 值)仍在;
-                // 对应 C luaD_precall 的补 nil 循环, 必须显式写 nil
-                for i in nargs..nfixparams {
-                    Self::write_stack_state(state, a + 1 + i, TValue::Nil(NilKind::Strict));
-                }
             }
-            // 设置 state.top 供 VARARGPREP 计算 totalargs
-            // (对应 C 的 luaD_precall: 缺失的固定参数补 nil 并计入 L->top,
-            //  故 top = func + 1 + max(nargs, nfixparams))
+            // 设置 state.top 供 VARARGPREP 计算 totalargs, 同时把 live top 推到补齐后的
+            // 实参末尾 (对应 C 的 luaD_precall: 补 nil 循环里 L->top 随之逐格前移,
+            // 故 top = func + 1 + max(nargs, nfixparams))。
+            // 顺序关键: 补 nil 写的是**帧内寄存器**, 必须先落在 live top 之内 ——
+            // 抬 top 在前, 写在后, 写边界不必也不应放宽。
             state.top = a + 1 + nargs.max(nfixparams);
+            for i in nargs..nfixparams {
+                // truncate_live 只保证逻辑上界, 槽位里的旧值(整数等 trivial 值)仍在;
+                // 对应 C luaD_precall 的补 nil 循环, 必须显式写 nil。
+                Self::write_stack_state(state, a + 1 + i, TValue::Nil(NilKind::Strict));
+            }
             state.reset_mret(); // 新帧: 丢弃上一帧遗留的产出末尾 (C: precall 重设 L->top)
         } else {
             let frame_end = a + 1 + fsize;
@@ -7795,6 +7714,10 @@ impl VmExecutor {
                 if proto_is_vararg {
                     // vararg 函数: 截断栈到实际参数末尾，VARARGPREP 会处理
                     state.truncate_live(func_slot + 1 + nargs);
+                    // 设置 state.top 供 VARARGPREP 计算 totalargs (对应 C 的 L->top = ra + b)。
+                    // 先抬 top 再补缺失定参: 补 nil 写的是帧内寄存器, 必须落在 live top
+                    // 之内 (放宽写边界不是解 —— 见 write_stack_state 的不变量说明)。
+                    state.top = func_slot + 1 + nargs.max(nfixparams);
                     for i in nargs..nfixparams {
                         Self::write_stack_state(
                             state,
@@ -7802,9 +7725,6 @@ impl VmExecutor {
                             TValue::Nil(NilKind::Strict),
                         );
                     }
-                    // 设置 state.top 供 VARARGPREP 计算 totalargs (对应 C 的 L->top = ra + b)
-                    // 缺失固定参数已补 nil 并计入 live top, 与 C luaD_precall 一致
-                    state.top = func_slot + 1 + nargs.max(nfixparams);
                     state.reset_mret(); // 新帧 (尾调用, C: precall 重设 L->top)
                                         // call hook 对 vararg 函数在 VARARGPREP 中触发 (tail call 事件)
                 } else {
@@ -8374,18 +8294,16 @@ impl VmExecutor {
     fn op_forloop<'a>(
         drop_queue: &mut Vec<TValue<'a>>,
         stack: &mut [TValue<'a>],
-        base: usize,
-        top: usize,
         inst: Instruction,
         pc: usize,
     ) -> Next {
-        let ra = Self::ra(base, inst);
+        let ra = opcodes::getarg_a(inst) as usize;
 
         // perf: 单次借用读三槽 (count/step/idx) — 原实现三次 read_stack 各带
         // bounds 检查 + Option 解包。for 循环体必然走此处, 直接切片访问。
-        let count_val = Self::read_stack(stack, top, ra);
-        let step_val = Self::read_stack(stack, top, ra + 1);
-        let idx_val = Self::read_stack(stack, top, ra + 2);
+        let count_val = Self::read_stack(stack, ra);
+        let step_val = Self::read_stack(stack, ra + 1);
+        let idx_val = Self::read_stack(stack, ra + 2);
         match (count_val, step_val, idx_val) {
             (TValue::Integer(i), TValue::Integer(step), TValue::Integer(idx)) => {
                 // ra+1, ra+2 相邻槽; FORPREP 保证三槽均为 Integer
@@ -8397,13 +8315,12 @@ impl VmExecutor {
                     Self::write_stack(
                         drop_queue,
                         stack,
-                        top,
                         ra,
                         TValue::Integer((count - 1) as LuaInteger),
                     );
                     let new_idx =
                         (idx as LuaUnsigned).wrapping_add(step as LuaUnsigned) as LuaInteger;
-                    Self::write_stack(drop_queue, stack, top, ra + 2, TValue::Integer(new_idx));
+                    Self::write_stack(drop_queue, stack, ra + 2, TValue::Integer(new_idx));
                     let bx = opcodes::getarg_bx(inst);
                     // 回跳: pc 已 = cur+1, 目标 = cur+1-bx (对应 C 的 pc -= bx)
                     let target = ((pc as i32) - bx) as usize;
@@ -8418,7 +8335,7 @@ impl VmExecutor {
                     new_idx >= *limit
                 };
                 if should_continue {
-                    Self::write_stack(drop_queue, stack, top, ra + 2, TValue::Float(new_idx));
+                    Self::write_stack(drop_queue, stack, ra + 2, TValue::Float(new_idx));
                     let bx = opcodes::getarg_bx(inst);
                     let target = ((pc as i32) - bx) as usize;
                     return Next::Jump(target);
@@ -9000,6 +8917,14 @@ impl VmExecutor {
             };
 
             state.ensure_scratch_to(ra + touse + need_fill + 1);
+            // 先落 live top 到变参写出末尾 (对应 C 的 luaT_getvarargs: 写完
+            // where+i 后置 L->top = where + wanted)。MULTRET 时写出区可以越过
+            // 帧上界 (C 用 luaD_checkstack 保证空间, 之后由 OP_CALL/OP_RETURN
+            // b==0 消费) —— 把 top 一并推过去, 保持「寄存器写 idx < live top」
+            // 不变量, 而不是放宽写边界。
+            if state.top < ra + touse + need_fill {
+                state.top = ra + touse + need_fill;
+            }
             // 扩容点已过: 取表克隆供元素读取 (此时再取, 即使 raise 也不再持有它)
             let table_val = state.stack[table_pos].clone();
             for i in 0..touse {
@@ -9282,15 +9207,16 @@ impl VmExecutor {
             // 里就是 "(vararg table)" 变量（`compile.rs` 的 param_names），
             // `debug.getlocal` 会按名字读到它 —— 不写就是上一条指令留下的陈旧栈值
             // （实测 db.lua「return hook 里访问局部变量」用例：读到 1 / 函数值）。
-            // 与 C 一致地**不推进 L->top**（写的是 L->top 之上、ci->top 之内的槽）。
+            // 对应 C 的 `setnilvalue(s2v(ci->func.p + nfixparams + 1))`（写的是
+            // L->top 之上、ci->top 之内的槽）。本实现的寄存器写不变量是 idx < live top,
+            // 故先把 scratch 备到该槽、把 live top 推过该槽再写 —— 随后的 `savestate`
+            // 会把 live top 复位到帧上界, 净效果与 C 一致。
             let vatab_slot = state.base + nfixparams;
-            VmExecutor::write_stack(
-                &mut state.drop_queue,
-                &mut state.stack,
-                state.top,
-                vatab_slot,
-                TValue::Nil(NilKind::Strict),
-            );
+            state.ensure_scratch_to(vatab_slot + 1);
+            if state.top < vatab_slot + 1 {
+                state.top = vatab_slot + 1;
+            }
+            Self::write_stack_state(state, vatab_slot, TValue::Nil(NilKind::Strict));
         }
 
         // 扩展 L->top 到帧上界（对应 C 的 `L->top.p = ci->top.p`，ci->top = func+1+fsize）:
