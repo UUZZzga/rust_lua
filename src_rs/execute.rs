@@ -1854,7 +1854,7 @@ impl VmExecutor {
                         Next::Continue
                     }
                     // === 热门 opcode: 跳转/比较 (param-pc; 比较冷路径带 cur sync) ===
-                    OpCode::JMP => try_inst!(Ok(Self::op_jmp(inst, next_pc!()))),
+                    OpCode::JMP => Self::op_jmp(inst, next_pc!()),
                     OpCode::EQ => try_inst!(match Self::op_eq(base, state, inst, next_pc!()) {
                         // 快路径未决出 → 慢路径 (元方法/错误); 结果统一由分发后的 pc 分支落地
                         // (冷路径内已 sync state.pc = cur)
@@ -1871,8 +1871,8 @@ impl VmExecutor {
                             Self::order_jump_cold(state, base, inst, next_pc!(), TagMethod::Le),
                         r => Ok(r),
                     }),
-                    OpCode::EQK => try_inst!(Ok(Self::op_eqk(base, state, inst, next_pc!()))),
-                    OpCode::EQI => try_inst!(Ok(Self::op_eqi(base, state, inst, next_pc!()))),
+                    OpCode::EQK => Self::op_eqk(base, state, inst, next_pc!()),
+                    OpCode::EQI => Self::op_eqi(base, state, inst, next_pc!()),
                     OpCode::LTI => try_inst!(match Self::op_lti(base, state, inst, next_pc!()) {
                         Next::Continue => Self::order_int_jump_cold(
                             state,
@@ -1921,19 +1921,14 @@ impl VmExecutor {
                             r => Ok(r),
                         })
                     }
-                    OpCode::TEST => try_inst!(Ok(Self::op_test(
-                        stack_slice!(),
-                        &state.code,
-                        inst,
-                        next_pc!()
-                    ))),
-                    OpCode::TESTSET => try_inst!(Ok(Self::op_testset(
+                    OpCode::TEST => Self::op_test(stack_slice!(), &state.code, inst, next_pc!()),
+                    OpCode::TESTSET => Self::op_testset(
                         &mut state.drop_queue,
                         stack_slice!(),
                         &state.code,
                         inst,
                         next_pc!(),
-                    ))),
+                    ),
                     // === 热门 opcode: 调用/返回 (flow 类: sync → handler → 重载) ===
                     OpCode::CALL => try_inst!({
                         let r = Self::op_call(base, state, inst, next_pc!());
@@ -2029,12 +2024,9 @@ impl VmExecutor {
                     // FORLOOP 每迭代执行 (param-pc, 不产生错误); FORPREP 每循环一次
                     // (flow-lite: 成功直接写 state.pc = new_pc 后 continue 'outer,
                     //  失败经 sync_err! 回写 state.pc = cur 供报错行号使用)
-                    OpCode::FORLOOP => try_inst!(Ok(Self::op_forloop(
-                        &mut state.drop_queue,
-                        stack_slice!(),
-                        inst,
-                        next_pc!(),
-                    ))),
+                    OpCode::FORLOOP => {
+                        Self::op_forloop(&mut state.drop_queue, stack_slice!(), inst, next_pc!())
+                    }
                     OpCode::FORPREP => try_inst!({
                         let r = Self::op_forprep(state, base, inst, next_pc!());
                         if r.is_ok() {
@@ -8263,11 +8255,13 @@ impl VmExecutor {
         let ra = opcodes::getarg_a(inst) as usize;
         let bx = opcodes::getarg_bx(inst);
 
-        // perf: 单次借用读三槽 (count/step/idx) — 原实现三次 read_stack 各带
-        // bounds 检查 + Option 解包。for 循环体必然走此处, 直接切片访问。
-        let count_val = Self::read_stack(stack, ra);
-        let step_val = Self::read_stack(stack, ra + 1);
-        let idx_val = Self::read_stack(stack, ra + 2);
+        #[cfg(feature = "fast_unsafe")]
+        let (count_val, step_val, idx_val) = unsafe {
+            let p = stack.as_ptr().add(ra);
+            (&*p, &*p.add(1), &*p.add(2))
+        };
+        #[cfg(not(feature = "fast_unsafe"))]
+        let (count_val, step_val, idx_val) = (&stack[ra], &stack[ra + 1], &stack[ra + 2]);
         match (count_val, step_val, idx_val) {
             (TValue::Integer(i), TValue::Integer(step), TValue::Integer(idx)) => {
                 // ra+1, ra+2 相邻槽; FORPREP 保证三槽均为 Integer
