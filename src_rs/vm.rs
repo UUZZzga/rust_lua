@@ -510,9 +510,15 @@ pub fn idiv(m: LuaInteger, n: LuaInteger) -> Result<LuaInteger, &'static str> {
 #[inline]
 pub fn modulus(m: LuaInteger, n: LuaInteger) -> Result<LuaInteger, &'static str> {
     if n == 0 {
+        core::hint::cold_path();
         return Err("attempt to divide by zero");
     }
+    // fast path: 正操作数 (hash/索引取模的常见形态)
+    if (m | n) >= 0 && n > 0 {
+        return Ok(m % n);
+    }
     if n == -1 {
+        core::hint::cold_path();
         return Ok(0);
     }
     // 快速路径：n 是 2 的幂。m & (n-1) 直接给出 [0, n-1] 的非负余数,

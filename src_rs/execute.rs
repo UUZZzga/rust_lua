@@ -2034,11 +2034,6 @@ impl VmExecutor {
                         }
                         r.map(|_| Next::Continue)
                     }),
-                    // === SETUPVAL: 写 upvalue (deleted) ===
-                    OpCode::SETUPVAL => {
-                        Self::op_setupval(base, state, inst);
-                        Next::Continue
-                    }
                     // === MMBIN/MMBINI/MMBINK: 元方法占位 (param-cur: pi = code[cur-1],
                     //     try_*_tm 前 sync state.pc = cur) ===
                     OpCode::MMBIN => try_inst!({
@@ -2086,6 +2081,7 @@ impl VmExecutor {
                         r
                     }),
                     OpCode::LOADKX
+                    | OpCode::SETUPVAL
                     | OpCode::NEWTABLE
                     | OpCode::SELF
                     | OpCode::BANDK
@@ -2444,6 +2440,12 @@ impl VmExecutor {
         match op {
             // === 冷门: 扩展常量加载 / 写 upvalue / 建表 / method 调用 ===
             OpCode::LOADKX => Self::op_loadkx(base, state, inst),
+            // === SETUPVAL: 写 upvalue (deleted) ===
+            OpCode::SETUPVAL => {
+                Self::op_setupval(base, state, inst);
+                state.pc += 1;
+                Ok(())
+            }
             // SETUPVAL 已移至主分发循环
             OpCode::NEWTABLE => Self::op_newtable(base, state, inst),
             OpCode::SELF => Self::op_self(base, state, inst),
