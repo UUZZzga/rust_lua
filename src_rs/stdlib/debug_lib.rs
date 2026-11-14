@@ -852,15 +852,16 @@ struct DebugInfo<'a> {
 
 /// 从闭包填充调试信息
 fn fill_info_from_closure<'a>(
-    state: &mut LuaState<'a>,
+    _state: &mut LuaState<'a>,
     info: &mut DebugInfo<'a>,
-    closure: &LClosure<'a>,
+    closure: &MyRc<LClosure<'a>, SlotAlloc>,
     what: &str,
 ) -> Result<(), VmError<'a>> {
     let proto = &closure.proto;
     // 注意: 不在此设置 info.func, 由 call_getinfo 直接从栈上获取原始值
     // 以确保 b.func == 原始函数 (引用语义)
-    info.closure = Some(state.new_object(closure.clone())?);
+    // 共享同一闭包句柄 —— 对应 C 中 TValue 指向同一个堆分配 Closure 对象
+    info.closure = Some(closure.clone());
 
     if what.contains('S') {
         info.source = proto
@@ -3601,18 +3602,16 @@ mod tests {
             loc_vars: vec![],
             source: None,
         };
-        let upvals = Rc::new(RefCell::new(UpValVec::new()));
-        upvals
-            .borrow_mut()
-            .push(Rc::new(RefCell::new(UpVal::Closed {
-                value: TValue::Integer(42),
-            })));
+        let mut upvals = UpValVec::new();
+        upvals.push(Rc::new(RefCell::new(UpVal::Closed {
+            value: TValue::Integer(42),
+        })));
         let closure = MyRc::new_in(
             alloc.slot(),
             LClosure {
                 gc_header: GCObjectHeader::new(),
                 proto: Rc::new(proto),
-                upvals,
+                upvals: RefCell::new(upvals),
             },
         );
         state.top = 0;
@@ -3640,7 +3639,7 @@ mod tests {
             LClosure {
                 gc_header: GCObjectHeader::new(),
                 proto: Rc::new(crate::func::new_proto()),
-                upvals: Rc::new(RefCell::new(UpValVec::new())),
+                upvals: RefCell::new(UpValVec::new()),
             },
         );
         state.top = 0;
@@ -3831,18 +3830,16 @@ mod tests {
         let alloc = crate::mem::TestAlloc::new();
         use crate::gc::GCObjectHeader;
         let mut state = LuaState::default();
-        let upvals = Rc::new(RefCell::new(UpValVec::new()));
-        upvals
-            .borrow_mut()
-            .push(Rc::new(RefCell::new(UpVal::Closed {
-                value: TValue::Integer(42),
-            })));
+        let mut upvals = UpValVec::new();
+        upvals.push(Rc::new(RefCell::new(UpVal::Closed {
+            value: TValue::Integer(42),
+        })));
         let closure = MyRc::new_in(
             alloc.slot(),
             LClosure {
                 gc_header: GCObjectHeader::new(),
                 proto: Rc::new(crate::func::new_proto()),
-                upvals,
+                upvals: RefCell::new(upvals),
             },
         );
         state.top = 0;
@@ -3862,7 +3859,7 @@ mod tests {
             LClosure {
                 gc_header: GCObjectHeader::new(),
                 proto: Rc::new(crate::func::new_proto()),
-                upvals: Rc::new(RefCell::new(UpValVec::new())),
+                upvals: RefCell::new(UpValVec::new()),
             },
         );
         state.top = 0;

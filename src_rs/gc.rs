@@ -591,7 +591,11 @@ impl<'a> GCState<'a> {
             mode: Cell::new(mode),
             current_white: Cell::new(1 << 0),
             next_id: Cell::new(1),
-            objects: RefCell::new(GcObjects::default()),
+            objects: RefCell::new(GcObjects {
+                metas: Vec::with_capacity(1024),
+                all_objects: Vec::with_capacity(1024),
+                free_ids: Vec::with_capacity(256),
+            }),
             gray: RefCell::new(VecDeque::with_capacity(256)),
             gray_again: RefCell::new(VecDeque::with_capacity(64)),
             weak: RefCell::new(VecDeque::with_capacity(64)),
@@ -1673,7 +1677,15 @@ impl<'a> LuaState<'a> {
             }
         }
 
-        for uv_ref in self.closure_upvals.borrow().iter() {
+        // 当前闭包本身也作为根（pcall 关闭 upvalue 期间栈上函数槽会被临时置 nil，
+        // 此时仅 state.closure 持有它）
+        if let Some(cl) = &self.closure {
+            let tv = TValue::LClosure(cl.clone());
+            unsafe { worklist.push(raw_from_tvalue(&tv)) };
+            drop(tv);
+        }
+
+        for uv_ref in self.closure_upvals().borrow().iter() {
             let uv = uv_ref.borrow();
             match &*uv {
                 UpVal::Closed { value } => {
@@ -1698,11 +1710,13 @@ impl<'a> LuaState<'a> {
                     unsafe { worklist.push(raw_from_tvalue(val)) };
                 }
             }
-            for uv_ref in frame.closure_upvals.borrow().iter() {
-                let uv = uv_ref.borrow();
-                if let UpVal::Closed { value } = &*uv {
-                    if needs_gc_mark(value) {
-                        unsafe { worklist.push(raw_from_tvalue(value)) };
+            if let Some(caller) = &frame.caller_closure {
+                for uv_ref in caller.upvals.borrow().iter() {
+                    let uv = uv_ref.borrow();
+                    if let UpVal::Closed { value } = &*uv {
+                        if needs_gc_mark(value) {
+                            unsafe { worklist.push(raw_from_tvalue(value)) };
+                        }
                     }
                 }
             }
@@ -1762,7 +1776,14 @@ impl<'a> LuaState<'a> {
                 unsafe { worklist.push(raw_from_tvalue(val)) };
             }
         }
-        for uv_ref in exec.closure_upvals.borrow().iter() {
+        // 当前闭包本身也作为根（见 collect_roots_into 同名逻辑）
+        if let Some(cl) = &exec.closure {
+            let tv = TValue::LClosure(cl.clone());
+            unsafe { worklist.push(raw_from_tvalue(&tv)) };
+            drop(tv);
+        }
+
+        for uv_ref in exec.closure_upvals().borrow().iter() {
             let uv = uv_ref.borrow();
             match &*uv {
                 UpVal::Closed { value } => {
@@ -1786,11 +1807,13 @@ impl<'a> LuaState<'a> {
                     unsafe { worklist.push(raw_from_tvalue(val)) };
                 }
             }
-            for uv_ref in frame.closure_upvals.borrow().iter() {
-                let uv = uv_ref.borrow();
-                if let UpVal::Closed { value } = &*uv {
-                    if needs_gc_mark(value) {
-                        unsafe { worklist.push(raw_from_tvalue(value)) };
+            if let Some(caller) = &frame.caller_closure {
+                for uv_ref in caller.upvals.borrow().iter() {
+                    let uv = uv_ref.borrow();
+                    if let UpVal::Closed { value } = &*uv {
+                        if needs_gc_mark(value) {
+                            unsafe { worklist.push(raw_from_tvalue(value)) };
+                        }
                     }
                 }
             }
@@ -2215,7 +2238,7 @@ impl<'a> LuaState<'a> {
             let stack_base = self.top;
             let saved_base = self.base;
             let saved_pc = self.pc;
-            let saved_closure_upvals = Rc::clone(&self.closure_upvals);
+            let saved_closure = self.closure.clone();
             let saved_proto_flag = self.proto_flag;
             let saved_nextraargs = self.nextraargs;
             self.push_value(gc_func);
@@ -2254,7 +2277,7 @@ impl<'a> LuaState<'a> {
             self.top = stack_base;
             self.base = saved_base;
             self.pc = saved_pc;
-            self.closure_upvals = saved_closure_upvals;
+            self.closure = saved_closure;
             self.proto_flag = saved_proto_flag;
             self.nextraargs = saved_nextraargs;
 

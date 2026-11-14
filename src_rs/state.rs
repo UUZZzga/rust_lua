@@ -93,7 +93,7 @@ pub struct PcallProtection<'a> {
     pub saved_is_vararg: bool,
     pub saved_proto_flag: u8,
     pub saved_nextraargs: i32,
-    pub saved_closure_upvals: Rc<RefCell<UpValVec<'a>>>,
+    pub saved_closure: Option<MyRc<LClosure<'a>, SlotAlloc>>,
     pub saved_tbc_list: Option<usize>,
     /// pcall 的 func 位置（栈索引）— 用于截断栈和放置返回值
     pub func_idx: usize,
@@ -203,7 +203,9 @@ pub struct LuaState<'a> {
     pub proto_flag: u8,
     /// PF_VAHID 模式下隐藏变参的数量（对应 C 的 ci->u.l.nextraargs）
     pub nextraargs: i32,
-    pub closure_upvals: Rc<RefCell<UpValVec<'a>>>,
+    /// 当前执行闭包（对应 C 的 `cl = ci_func(ci)` 指针；`None` 表示无闭包上下文）。
+    /// 上值通过内联在闭包对象中的 `LClosure.upvals` 访问，无独立堆分配。
+    pub closure: Option<MyRc<LClosure<'a>, SlotAlloc>>,
     /// 全局 open upvalue 存储 — 不随函数调用/返回保存/恢复（对应 C 的 L->openupval 链表节点存储）
     /// open_upval 链表索引此 vec，tbc_list 也索引此 vec。
     ///
@@ -382,6 +384,9 @@ pub struct LuaState<'a> {
     /// 上界由入队侧保证 ([`DROP_QUEUE_LIMIT`]), GC 入口无条件排空, 保证标记阶段前
     /// 死对象已归还 (外部字符串 `falloc` 的「不可达即释放」语义依赖这一点)。
     pub drop_queue: Vec<TValue<'a>>,
+
+    /// 空 UpVal 列表 — `closure` 为 `None` 时的回退（无堆分配，内联存储）
+    pub empty_upvals: RefCell<UpValVec<'a>>,
 }
 
 /// `drop_queue` 的长度上界 (`execute.rs` 的 `push_drop` 维护)。
@@ -407,7 +412,7 @@ impl<'a> LuaState<'a> {
             is_vararg: false,
             proto_flag: 0,
             nextraargs: 0,
-            closure_upvals: Rc::new(RefCell::new(UpValVec::new())),
+            closure: None,
             open_upvals: Vec::new(),
             free_upvals: Vec::new(),
             open_upval: None,
@@ -451,6 +456,17 @@ impl<'a> LuaState<'a> {
             l_g: std::ptr::null_mut(),
             owner: None,
             drop_queue: Vec::with_capacity(DROP_QUEUE_LIMIT),
+            empty_upvals: RefCell::new(UpValVec::new()),
+        }
+    }
+
+    /// 当前执行闭包的上值列表（对应 C 的 `cl->upvals`）。
+    /// `closure` 为 `None` 时返回内联空列表。
+    #[inline(always)]
+    pub fn closure_upvals(&self) -> &RefCell<UpValVec<'a>> {
+        match &self.closure {
+            Some(cl) => &cl.upvals,
+            None => &self.empty_upvals,
         }
     }
 
@@ -1593,10 +1609,10 @@ impl<'a> LuaState<'a> {
                 let nfixparams = closure.proto.num_params as usize;
                 let proto_is_vararg = closure.proto.is_vararg();
 
-                // 提前提取 proto 和 upvals 的 Rc 引用，使后续可以 move closure（而非 clone）
+                // 提前提取 proto 和闭包引用，使后续可以 move closure（而非 clone）
                 // perf: 消除 CallInfoEntry.closure 的 Box 堆分配
                 let proto = Rc::clone(&closure.proto);
-                let upvals = Rc::clone(&closure.upvals);
+                let callee_closure = closure.clone();
 
                 let saved_code = std::mem::take(&mut self.code);
                 let saved_constants = std::mem::take(&mut self.constants);
@@ -1607,10 +1623,7 @@ impl<'a> LuaState<'a> {
                 let saved_is_vararg = self.is_vararg;
                 let saved_proto_flag = self.proto_flag;
                 let saved_nextraargs = self.nextraargs;
-                let saved_closure_upvals = std::mem::replace(
-                    &mut self.closure_upvals,
-                    Rc::new(RefCell::new(UpValVec::new())),
-                );
+                let saved_closure = self.closure.take();
                 let saved_tbc_list = self.tbc_list.take();
 
                 // 推入 call_info — 对应 C 的 luaD_precall 创建新 CallInfo
@@ -1676,9 +1689,8 @@ impl<'a> LuaState<'a> {
                 self.is_vararg = proto.is_vararg();
                 self.proto_flag = proto.flag;
                 self.nextraargs = 0;
-                // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
-                // upvals 是 Rc<RefCell<Vec>>，这里 clone 出 Vec 供执行期使用
-                self.closure_upvals = Rc::clone(&upvals);
+                // 关键: 将闭包转移到 state，供 GETUPVAL/SETUPVAL 使用
+                self.closure = Some(callee_closure);
                 self.tbc_list = None;
                 // 不清空 state.exec.open_upval: 全局链表机制下，open_upval 不随函数调用/返回保存/恢复
                 // (对应 C 的 L->openupval 全局链表，luaD_precall 不修改它)
@@ -1730,7 +1742,7 @@ impl<'a> LuaState<'a> {
                             saved_is_vararg: false,
                             saved_proto_flag: 0,
                             saved_nextraargs: 0,
-                            saved_closure_upvals: Rc::new(RefCell::new(UpValVec::new())),
+                            saved_closure: None,
                             saved_tbc_list: None,
                             func_idx: 0,
                             logical_top: 0,
@@ -1937,7 +1949,7 @@ impl<'a> LuaState<'a> {
                         top.saved_is_vararg = saved_is_vararg;
                         top.saved_proto_flag = saved_proto_flag;
                         top.saved_nextraargs = saved_nextraargs;
-                        top.saved_closure_upvals = Rc::clone(&saved_closure_upvals);
+                        top.saved_closure = saved_closure.clone();
                         top.saved_tbc_list = saved_tbc_list;
                         top.func_idx = func_idx;
                         // 不覆盖 nresults: PcallProtection.nresults 保存的是
@@ -2049,7 +2061,7 @@ impl<'a> LuaState<'a> {
                         top.saved_is_vararg = saved_is_vararg;
                         top.saved_proto_flag = saved_proto_flag;
                         top.saved_nextraargs = saved_nextraargs;
-                        top.saved_closure_upvals = Rc::clone(&saved_closure_upvals);
+                        top.saved_closure = saved_closure.clone();
                         top.saved_tbc_list = saved_tbc_list;
                         top.func_idx = func_idx;
                         top.saved_filled = true;
@@ -2071,7 +2083,7 @@ impl<'a> LuaState<'a> {
                     self.is_vararg = saved_is_vararg;
                     self.proto_flag = saved_proto_flag;
                     self.nextraargs = saved_nextraargs;
-                    self.closure_upvals = saved_closure_upvals;
+                    self.closure = saved_closure;
                     self.tbc_list = saved_tbc_list;
                 }
 
@@ -2461,7 +2473,7 @@ impl<'a> LuaState<'a> {
                     top.saved_is_vararg = self.is_vararg;
                     top.saved_proto_flag = self.proto_flag;
                     top.saved_nextraargs = self.nextraargs;
-                    top.saved_closure_upvals = Rc::clone(&self.closure_upvals);
+                    top.saved_closure = self.closure.clone();
                     top.saved_tbc_list = self.tbc_list;
                     top.func_idx = func_idx;
                     top.saved_filled = true;
@@ -2687,18 +2699,14 @@ impl<'a> LuaState<'a> {
         match crate::compiler::compile(self, code, chunk_name) {
             Ok(proto) => {
                 let nup = proto.size_upvalues as usize;
-                let upvals = Rc::new(RefCell::new(UpValVec::new()));
-                upvals
-                    .borrow_mut()
-                    .push(Rc::new(RefCell::new(UpVal::Closed {
-                        value: TValue::Table(self.globals.clone()),
-                    })));
+                let mut upvals = UpValVec::new();
+                upvals.push(Rc::new(RefCell::new(UpVal::Closed {
+                    value: TValue::Table(self.globals.clone()),
+                })));
                 for _ in 1..nup {
-                    upvals
-                        .borrow_mut()
-                        .push(Rc::new(RefCell::new(UpVal::Closed {
-                            value: TValue::Nil(NilKind::Strict),
-                        })));
+                    upvals.push(Rc::new(RefCell::new(UpVal::Closed {
+                        value: TValue::Nil(NilKind::Strict),
+                    })));
                 }
                 // new_closure 完成「构造 + 对象块分配 + GC 登记 + id 写回」；
                 // 失败同样按内存错误上报（对应 C 的 lua_load：返回 LUA_ERRMEM，
@@ -2749,18 +2757,14 @@ impl<'a> LuaState<'a> {
                     // 驻留化字符串 (LongString → ShortString)
                     crate::stdlib::base_lib::intern_proto_strings(&mut proto, self);
                     let nup = proto.size_upvalues as usize;
-                    let upvals = Rc::new(RefCell::new(UpValVec::new()));
-                    upvals
-                        .borrow_mut()
-                        .push(Rc::new(RefCell::new(UpVal::Closed {
-                            value: TValue::Table(self.globals.clone()),
-                        })));
+                    let mut upvals = UpValVec::new();
+                    upvals.push(Rc::new(RefCell::new(UpVal::Closed {
+                        value: TValue::Table(self.globals.clone()),
+                    })));
                     for _ in 1..nup {
-                        upvals
-                            .borrow_mut()
-                            .push(Rc::new(RefCell::new(UpVal::Closed {
-                                value: TValue::Nil(NilKind::Strict),
-                            })));
+                        upvals.push(Rc::new(RefCell::new(UpVal::Closed {
+                            value: TValue::Nil(NilKind::Strict),
+                        })));
                     }
                     // 见 load_buffer：new_closure 含 GC 登记，失败走 LUA_ERRMEM 语义
                     let closure = match self.new_closure(Rc::new(proto), upvals) {

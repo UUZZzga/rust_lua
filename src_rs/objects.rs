@@ -1400,17 +1400,17 @@ impl<'a> TableDataRc<'a> {
 /// Given: 一个 Proto 和 3 个 UpValue
 /// When: 构造 LClosure
 /// Then: nupvalues = 3, p 指向该 Proto
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct LClosure<'a> {
     pub gc_header: GCObjectHeader,
     /// 函数原型（Rc 共享，clone 为 O(1)，避免每次 OP_CALL 深拷贝整个 Proto）
     pub proto: Rc<Proto<'a>>,
-    /// 上值列表（共享引用，多个闭包可共享同一个 UpVal）。
+    /// 上值列表（内联存储，对应 C 的 `LClosure.upvals` 柔性数组）。
     ///
-    /// 使用 Rc<RefCell<Vec>> 包装，使 LClosure clone 时所有副本共享同一个 upvals Vec。
-    /// 这样 debug.upvaluejoin 修改栈上副本的 upvals 会影响所有共享同一 Rc 的闭包
-    /// （对应 C 中 Closure 是堆分配对象、栈上存 Closure* 指针的语义）。
-    pub upvals: Rc<RefCell<UpValVec<'a>>>,
+    /// LClosure 本身经 `MyRc` 堆分配，栈上/调用帧持有的是同一个 `MyRc` 句柄，
+    /// 因此对 upvals 的修改（如 `debug.upvaluejoin`）对所有引用可见 ——
+    /// 与 C 中 Closure 是堆分配对象、栈上存 `Closure*` 指针的语义一致。
+    pub upvals: RefCell<UpValVec<'a>>,
 }
 
 /// C 闭包 —— C 函数 + 捕获的上值
@@ -1433,13 +1433,13 @@ impl<'a> LClosure<'a> {
     /// Proto 由 gc_extra_estimate 单独跟踪（共享，避免重复计费）。
     pub fn gc_mem_size(&self) -> usize {
         // MyRc<LClosure> 路由块 = RcHeader(16) + SlotAlloc(8) + LClosure 自身
-        // upvals: Rc<RefCell<UpValVec>>，Vec 堆分配 = capacity * size_of::<UpValRef>()
-        let upvals_cap = self.upvals.borrow().capacity();
+        // （内联 upvals 已在 size_of::<LClosure>() 中计入）
+        // 仅当 upvals 溢出到堆时额外计费其 buffer
+        let upvals_heap_cap = self.upvals.borrow().heap_capacity();
         RC_HEADER_SIZE
             + std::mem::size_of::<crate::mem::SlotAlloc>()
             + std::mem::size_of::<LClosure>()
-            + upvals_cap * std::mem::size_of::<UpValRef>()
-            + 16 // Rc<RefCell<Vec>> 分配头估算
+            + upvals_heap_cap * std::mem::size_of::<UpValRef>()
     }
 }
 
@@ -1519,7 +1519,7 @@ impl<'a> UpVal<'a> {
 pub struct UpValVec<'a> {
     len: u8,
     inline: [std::mem::MaybeUninit<UpValRef<'a>>; 4],
-    heap: Option<Box<[UpValRef<'a>]>>,
+    heap: Option<Vec<UpValRef<'a>>>,
 }
 
 impl<'a> Clone for UpValVec<'a> {
@@ -1541,12 +1541,24 @@ impl<'a> UpValVec<'a> {
         }
     }
 
-    /// 存储容量：内联为固定 4，堆为实际长度。
-    /// （GC 内存计费用，见 `LClosure::gc_mem_size`。）
-    pub fn capacity(&self) -> usize {
+    pub fn with_capacity(capacity: usize) -> Self {
+        if capacity <= 4 {
+            UpValVec::new()
+        } else {
+            UpValVec {
+                len: 0,
+                inline: std::array::from_fn(|_| std::mem::MaybeUninit::uninit()),
+                heap: Some(Vec::with_capacity(capacity)),
+            }
+        }
+    }
+
+    /// 堆缓冲区容量（内联存储时为 0）。
+    /// （GC 内存计费用，见 `LClosure::gc_mem_size`；内联部分已计入 LClosure 自身大小。）
+    pub fn heap_capacity(&self) -> usize {
         match &self.heap {
-            Some(h) => h.len(),
-            None => 4,
+            Some(h) => h.capacity(),
+            None => 0,
         }
     }
 
@@ -1559,15 +1571,13 @@ impl<'a> UpValVec<'a> {
                 v.push(unsafe { self.inline[i].assume_init_read() });
             }
             v.push(val);
-            self.heap = Some(v.into_boxed_slice());
+            self.heap = Some(v);
             self.len += 1;
             return;
         }
         match &mut self.heap {
             Some(h) => {
-                let mut v = h.to_vec();
-                v.push(val);
-                *h = v.into_boxed_slice();
+                h.push(val);
             }
             None => {
                 // SAFETY: len < 4, 槽位未初始化, ptr::write 语义
@@ -1622,7 +1632,7 @@ impl<'a> From<Vec<UpValRef<'a>>> for UpValVec<'a> {
             UpValVec {
                 len: v.len() as u8,
                 inline: std::array::from_fn(|_| std::mem::MaybeUninit::uninit()),
-                heap: Some(v.into_boxed_slice()),
+                heap: Some(v),
             }
         }
     }
@@ -2052,7 +2062,7 @@ unsafe impl<'a> crate::alloc::RcPayload for Udata<'a> {
 /// - `base`: 调用者的基址（返回时写回 `state.base`；**不是**本帧的 `func + 1`）；
 /// - `code`/`constants`/`protos`/`return_pc`（调用者被中断处的下一条 pc，
 ///   对应 C 的 `ci->u.l.savedpc`）/`num_params`/`is_vararg`/`proto_flag`/
-///   `nextraargs`/`closure_upvals`/`tbc_list`；
+///   `nextraargs`/`caller_closure`/`tbc_list`；
 /// - `return_base`: 返回值落点 = 调用者寄存器空间里本次调用的函数槽（op_call 的
 ///   `a`）。定参帧 = `func`；**变参帧 ≠ `func`**（`func` 被上移，调用者槽位不动；
 ///   C 用 `ci->func.p - delta` 现算，`delta = nextraargs + numparams + 1`）。
@@ -2081,9 +2091,9 @@ pub struct CallFrame<'a> {
     pub is_vararg: bool,
     pub proto_flag: u8,
     pub nextraargs: i32,
-    /// perf: Rc 共享避免 op_call 中 Vec 深拷贝 (N 个 UpValRef 各 1 次 atomic inc)
-    /// 对应 C Lua 的 ci->u.l.upvals = cl->upvals (指针共享, O(1))
-    pub closure_upvals: Rc<RefCell<UpValVec<'a>>>,
+    /// 调用者闭包句柄（C 的 `ci_func(ci)` 指针）。
+    /// 返回时写回 `state.closure`，恢复调用者的 GETUPVAL/SETUPVAL 上下文。
+    pub caller_closure: Option<MyRc<LClosure<'a>, SlotAlloc>>,
     pub tbc_list: Option<usize>,
 }
 

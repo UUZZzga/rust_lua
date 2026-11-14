@@ -14,8 +14,8 @@
 
 use crate::execute::{VmError, VmExecutor, VmResult};
 use crate::objects::{
-    BuiltinFn, LuaThread, NilKind, TValue, Table, ThreadContext, ThreadStatus, UpVal, UpValRef,
-    UpValVec,
+    BuiltinFn, LClosure, LuaThread, NilKind, TValue, Table, ThreadContext, ThreadStatus, UpVal,
+    UpValRef,
 };
 use crate::state::LuaState;
 use crate::strings::lua_string_as_str;
@@ -268,12 +268,12 @@ fn scan_stack_for_closures<'a>(
     let mut visited_tables =
         std::collections::HashSet::with_hasher(crate::objects::FxBuildHasher::default());
     // 先 clone 栈上的 LClosure/Table 引用（避免遍历时借用 state.stack）
-    let closures: Vec<Rc<RefCell<UpValVec>>> = state
+    let closures: Vec<crate::alloc::MyRc<LClosure<'a>, crate::mem::SlotAlloc>> = state
         .stack
         .iter()
         .filter_map(|v| {
             if let TValue::LClosure(closure) = v {
-                Some(closure.upvals.clone())
+                Some(closure.clone())
             } else {
                 None
             }
@@ -292,7 +292,7 @@ fn scan_stack_for_closures<'a>(
         .collect();
     for upvals in &closures {
         collect_and_close_upvals_impl(
-            &upvals.borrow(),
+            &upvals.upvals.borrow(),
             state,
             result,
             visited,
@@ -1593,7 +1593,7 @@ fn setup_first_resume<'a>(
         co.is_vararg = closure.proto.is_vararg();
         co.proto_flag = closure.proto.flag;
         co.nextraargs = 0;
-        co.closure_upvals = Rc::clone(&closure.upvals);
+        co.closure = Some(closure.clone());
         co.open_upval = None;
         co.tbc_list = None;
         // 入口帧（协程体）没有 ci 记录：其身份由 co.base 决定
@@ -1668,7 +1668,7 @@ fn setup_first_resume<'a>(
         co.is_vararg = false;
         co.proto_flag = 0;
         co.nextraargs = 0;
-        co.closure_upvals = Rc::new(RefCell::new(UpValVec::new()));
+        co.closure = None;
         co.open_upval = None;
         co.tbc_list = None;
         co.call_stack = Vec::new();

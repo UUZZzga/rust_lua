@@ -23,11 +23,11 @@ use crate::objects::{
 };
 use crate::opcodes::{self, OpCode};
 use crate::state::{LuaState, LUAI_MAXCCALLS, LUA_MINSTACK, MAX_CALL_CHAIN};
-use crate::strings::{lua_string_as_str, StringTable};
+use crate::strings::lua_string_as_str;
 use crate::table::Table;
 use crate::tm::{
-    call_order_tm, call_orderi_tm, equal_obj, obj_len, obj_type_name, obj_type_name_,
-    try_bin_assoc_tm, try_bin_tm, try_bini_tm, try_concat_tm, TagMethod,
+    call_order_tm, call_orderi_tm, equal_obj, obj_len, obj_type_name, try_bin_assoc_tm, try_bin_tm,
+    try_bini_tm, try_concat_tm, TagMethod,
 };
 use crate::vm::{
     concat_stack, float_to_integer, idiv, is_false, modulus, modulus_float, raw_equal, shiftl,
@@ -1198,6 +1198,13 @@ impl VmExecutor {
             #[cfg(not(feature = "fast_unsafe"))]
             let mut code_rc: Rc<Vec<Instruction>> = Rc::clone(&state.code);
 
+            // perf: 当前闭包上值表寄存器化 — 对应 C luaV_execute 的局部 `cl`
+            // (src/lvm.c:1199 `LClosure *cl;` / 1210 `cl = ci_func(ci);`)。帧内不变,
+            // 帧切换点经 reload_istream! 重载; 上值访问直接解引用本指针, 免去每指令
+            // 经 state.closure 分支 + RefCell 指针派生。
+            #[cfg(feature = "fast_unsafe")]
+            let mut cl_upvals: *const UpValVec<'a> = state.closure_upvals().as_ptr();
+
             // perf: base 寄存器化 — 与 pc 同帧不变式。帧切换点经 reload_istream!
             // (内部的 sync_base_top!) 从 state.base 重载; CALL 的 Fast 分支
             // (pure builtin, 帧未切) 跳过重载, 与 code/constants 缓存的前提一致。
@@ -1376,6 +1383,8 @@ impl VmExecutor {
                         code_base = $st.code.as_ptr();
                         // pc_ptr 同步到新指令流 (对应 C 的 pc = ci->u.l.savedpc)
                         pc_ptr = unsafe { code_base.add($st.pc) };
+                        // 当前闭包已随帧切换 — 重载上值表指针 (对应 C 的 cl = ci_func(ci))
+                        cl_upvals = $st.closure_upvals().as_ptr();
                     }
                     #[cfg(not(feature = "fast_unsafe"))]
                     {
@@ -1618,11 +1627,16 @@ impl VmExecutor {
                     //     慢路径 sync state.pc = cur, 对应 C 的 savepc) ===
                     OpCode::GETUPVAL => try_inst!({
                         // safe 构建的 RefGuard 必须在 try_inst! (冷错误路径借用 &mut state)
-                        // 之前释放, 故把整个取值过程收进块内。
+                        // 之前释放, 故把整个取值过程收进块内。直接匹配字段取得 RefCell ——
+                        // 借用仅覆盖 closure/empty_upvals 字段, 与后续 &mut
+                        // state.stack/drop_queue 不冲突 (走 closure_upvals() 访问器会借用整个 state)。
                         #[cfg(not(feature = "fast_unsafe"))]
-                        let upvals_guard = state.closure_upvals.borrow();
+                        let upvals_guard = match &state.closure {
+                            Some(cl) => cl.upvals.borrow(),
+                            None => state.empty_upvals.borrow(),
+                        };
                         #[cfg(feature = "fast_unsafe")]
-                        let upvals: &UpValVec<'a> = unsafe { &*state.closure_upvals.as_ptr() };
+                        let upvals: &UpValVec<'a> = unsafe { &*cl_upvals };
                         #[cfg(not(feature = "fast_unsafe"))]
                         let upvals: &UpValVec<'a> = &upvals_guard;
                         // open upvalue 使用绝对槽位 (非帧内相对下标), 故不能用 stack_slice!:
@@ -1641,7 +1655,12 @@ impl VmExecutor {
                     // 缓存, 见循环头注释); 未命中交 `#[cold]` 版本, 那里可能跑 __index /
                     // 报错, 返回后刷新。
                     OpCode::GETTABUP => {
-                        try_inst!(match Self::op_gettabup(base, state, inst, next_pc!()) {
+                        // fast_unsafe: 传入主循环缓存的闭包上值表指针 (对应 C 的 cl->upvals)
+                        #[cfg(feature = "fast_unsafe")]
+                        let r = Self::op_gettabup(base, state, inst, next_pc!(), cl_upvals);
+                        #[cfg(not(feature = "fast_unsafe"))]
+                        let r = Self::op_gettabup(base, state, inst, next_pc!());
+                        try_inst!(match r {
                             Ok((true, new_pc)) => {
                                 // 快路径可能已融合 pure 调用 (fuse_pure_call →
                                 // call_pure_builtin 收尾的 sync_live_top 会压低 top)
@@ -2196,7 +2215,7 @@ impl VmExecutor {
                 state.is_vararg = pp.saved_is_vararg;
                 state.proto_flag = pp.saved_proto_flag;
                 state.nextraargs = pp.saved_nextraargs;
-                state.closure_upvals = pp.saved_closure_upvals;
+                state.closure = pp.saved_closure;
                 state.tbc_list = pp.saved_tbc_list;
                 // 截断栈，移除 __close 函数的帧
                 state.truncate_live(pp.func_idx);
@@ -2275,10 +2294,8 @@ impl VmExecutor {
                 // 若 call_stack 为空（inner_func 直接 error），使用当前 state 的上下文。
                 let pp_func_idx = state.pcall_protection_stack.last().unwrap().func_idx;
                 let saved_ctx = if let Some(frame) = state.call_stack.last().cloned() {
-                    let saved_cu = std::mem::replace(
-                        &mut state.closure_upvals,
-                        Rc::clone(&frame.closure_upvals),
-                    );
+                    let saved_cu =
+                        std::mem::replace(&mut state.closure, frame.caller_closure.clone());
                     let saved_tl = std::mem::replace(&mut state.tbc_list, frame.tbc_list);
                     Some((saved_cu, saved_tl))
                 } else {
@@ -2289,7 +2306,7 @@ impl VmExecutor {
                     Ok(()) => {}
                     Err(VmError::Yield(values)) => {
                         if let Some((cu, tl)) = saved_ctx {
-                            state.closure_upvals = cu;
+                            state.closure = cu;
                             state.tbc_list = tl;
                         }
                         return Ok(ErrOutcome::Return(VmResult::Yield { values }));
@@ -2333,7 +2350,7 @@ impl VmExecutor {
                     state.is_vararg = protection.saved_is_vararg;
                     state.proto_flag = protection.saved_proto_flag;
                     state.nextraargs = protection.saved_nextraargs;
-                    state.closure_upvals = protection.saved_closure_upvals;
+                    state.closure = protection.saved_closure;
                     state.tbc_list = protection.saved_tbc_list;
                     // open_upval is now global, not saved/restored per-function
 
@@ -3242,12 +3259,12 @@ impl VmExecutor {
             eprintln!("  是否可变参数: {}", state.is_vararg);
             eprintln!("  代码长度: {} 条指令", state.code.len());
 
-            if !state.closure_upvals.borrow().is_empty() {
+            if !state.closure_upvals().borrow().is_empty() {
                 eprintln!(
                     "\n--- Upval 信息 (共 {} 个) ---",
-                    state.closure_upvals.borrow().len()
+                    state.closure_upvals().borrow().len()
                 );
-                for (i, upval) in state.closure_upvals.borrow().iter().enumerate() {
+                for (i, upval) in state.closure_upvals().borrow().iter().enumerate() {
                     let uv_ref = upval.borrow();
                     match &*uv_ref {
                         UpVal::Closed { value } => {
@@ -3428,7 +3445,7 @@ impl VmExecutor {
         state.is_vararg = protection.saved_is_vararg;
         state.proto_flag = protection.saved_proto_flag;
         state.nextraargs = protection.saved_nextraargs;
-        state.closure_upvals = protection.saved_closure_upvals;
+        state.closure = protection.saved_closure;
         state.tbc_list = protection.saved_tbc_list;
         // open_upval is now global, not saved/restored per-function
 
@@ -3700,7 +3717,7 @@ impl VmExecutor {
         state.is_vararg = protection.saved_is_vararg;
         state.proto_flag = protection.saved_proto_flag;
         state.nextraargs = protection.saved_nextraargs;
-        state.closure_upvals = protection.saved_closure_upvals;
+        state.closure = protection.saved_closure;
         state.tbc_list = protection.saved_tbc_list;
         // open_upval is now global, not saved/restored per-function
 
@@ -3828,7 +3845,7 @@ impl VmExecutor {
         state.is_vararg = protection.saved_is_vararg;
         state.proto_flag = protection.saved_proto_flag;
         state.nextraargs = protection.saved_nextraargs;
-        state.closure_upvals = protection.saved_closure_upvals;
+        state.closure = protection.saved_closure;
         state.tbc_list = protection.saved_tbc_list;
         // 恢复外层 call_stack 帧（yield 时保存到 PcallProtection.saved_call_stack）
         // 这些帧持有 Rc 引用（code/constants/protos 等），恢复后 pcall 调用者
@@ -4295,7 +4312,7 @@ impl VmExecutor {
         // 安全性: VM 单线程, &mut state 保证无并发借用
         #[cfg(feature = "fast_unsafe")]
         {
-            let upvals = unsafe { &*state.closure_upvals.as_ptr() };
+            let upvals = unsafe { &*state.closure_upvals().as_ptr() };
             if b < upvals.len() {
                 let uv = unsafe { &mut *upvals[b].as_ptr() };
                 match uv {
@@ -4336,13 +4353,19 @@ impl VmExecutor {
         #[cfg(not(feature = "fast_unsafe"))]
         {
             let needs_barrier =
-                matches!(state.closure_upvals.borrow().get(b), Some(u) if !u.borrow().is_open());
+                matches!(state.closure_upvals().borrow().get(b), Some(u) if !u.borrow().is_open());
             if needs_barrier {
                 unsafe {
                     state.gc_mut().cond_gc();
                 }
             }
-            let upvals = state.closure_upvals.borrow_mut();
+            // safe 构建: 直接匹配字段 (借用仅覆盖 closure/empty_upvals, 与
+            // 下方 &mut state.stack 不冲突)。
+            let upvals_cell = match &state.closure {
+                Some(cl) => &cl.upvals,
+                None => &state.empty_upvals,
+            };
+            let upvals = upvals_cell.borrow_mut();
             if b < upvals.len() {
                 let mut uv = upvals[b].borrow_mut();
                 match &mut *uv {
@@ -4366,6 +4389,7 @@ impl VmExecutor {
         state: &mut LuaState<'a>,
         inst: Instruction,
         pc: usize,
+        #[cfg(feature = "fast_unsafe")] cl_upvals: *const UpValVec<'a>,
     ) -> Result<(bool, usize), VmError<'a>> {
         let a = Self::ra(base, inst);
         let b = opcodes::getarg_b(inst) as usize;
@@ -4382,10 +4406,11 @@ impl VmExecutor {
         // 借用冲突处理: BuiltinFn/Table 分支先提取 owned 值 (Copy/clone)
         // 后结束借用, 再调 write_stack (需要 &mut state)。
         let spec: Option<SpecValue<'a>> = {
+            // fast_unsafe: 复用主循环缓存的闭包上值表指针 (对应 C 的 cl->upvals)
             #[cfg(feature = "fast_unsafe")]
-            let upvals: &UpValVec<'a> = unsafe { &*state.closure_upvals.as_ptr() };
+            let upvals: &UpValVec<'a> = unsafe { &*cl_upvals };
             #[cfg(not(feature = "fast_unsafe"))]
-            let upvals_guard = state.closure_upvals.borrow();
+            let upvals_guard = state.closure_upvals().borrow();
             #[cfg(not(feature = "fast_unsafe"))]
             let upvals: &UpValVec<'a> = &upvals_guard;
             if b < upvals.len() {
@@ -4531,7 +4556,10 @@ impl VmExecutor {
             None => {} // fall through
         }
         let fast_result: Option<Option<TValue>> = {
-            let closure_upvals = state.closure_upvals.borrow();
+            #[cfg(feature = "fast_unsafe")]
+            let closure_upvals: &UpValVec<'a> = unsafe { &*cl_upvals };
+            #[cfg(not(feature = "fast_unsafe"))]
+            let closure_upvals = state.closure_upvals().borrow();
             if b < closure_upvals.len() {
                 let uv_ref = closure_upvals[b].borrow();
                 let table_ref = match &*uv_ref {
@@ -4574,8 +4602,8 @@ impl VmExecutor {
         let kb_idx = opcodes::getarg_c(inst) as usize;
         // 慢速路径: 原始读未命中且有元表 / 非 Table 类型 — 此处才 clone
         let key = unsafe { state.constants.get_unchecked(kb_idx) }.clone();
-        let upval_val = if b < state.closure_upvals.borrow().len() {
-            let upvals = state.closure_upvals.borrow();
+        let upval_val = if b < state.closure_upvals().borrow().len() {
+            let upvals = state.closure_upvals().borrow();
             let uv_ref = upvals[b].borrow();
             match &*uv_ref {
                 UpVal::Closed { value } => value,
@@ -4856,7 +4884,7 @@ impl VmExecutor {
         let c = opcodes::getarg_c(inst);
         // 热路径不 clone 常量键 / upvalue 表: 命中才取表句柄 (Rc +1) 与解析值。
         let fast_t = {
-            let upvals = state.closure_upvals.borrow();
+            let upvals = state.closure_upvals().borrow();
             if a < upvals.len() {
                 let uv_ref = upvals[a].borrow();
                 match &*uv_ref {
@@ -4909,8 +4937,8 @@ impl VmExecutor {
         let c = opcodes::getarg_c(inst);
         let key = unsafe { state.constants.get_unchecked(b_key) }.clone();
         let val = Self::resolve_val(base, state, inst, c);
-        let upval_val = if a < state.closure_upvals.borrow().len() {
-            let upvals = state.closure_upvals.borrow();
+        let upval_val = if a < state.closure_upvals().borrow().len() {
+            let upvals = state.closure_upvals().borrow();
             let uv_ref = upvals[a].borrow();
             match &*uv_ref {
                 UpVal::Closed { value } => value.clone(),
@@ -6746,7 +6774,7 @@ impl VmExecutor {
         let nresults = c - 1; // -1 表示 MULTRET (对应 C 的 nresults = GETARG_C(i) - 1)
                               // perf: 不再 Rc::clone(&closure.proto) — 直接访问 closure.proto 字段
                               // closure 在下方被 move 进 CallInfoEntry, 移动后需要的值提前缓存
-        let upvals = Rc::clone(&closure.upvals);
+        let callee_closure = closure.clone();
         let fsize = closure.proto.max_stack_size as usize;
         let nfixparams = closure.proto.num_params as usize;
         let proto_is_vararg = closure.proto.is_vararg();
@@ -6777,9 +6805,9 @@ impl VmExecutor {
         let saved_constants =
             std::mem::replace(&mut state.constants, Rc::clone(&closure.proto.constants));
         let saved_protos = std::mem::replace(&mut state.protos, Rc::clone(&closure.proto.protos));
-        // perf: mem::replace closure_upvals — move old to frame, move new to state
+        // perf: mem::replace closure — move old to frame, move new to state
         // 省 1 次 Rc::clone (旧: clone old → frame) + 1 次 Rc::drop (old state value)
-        let saved_closure_upvals = std::mem::replace(&mut state.closure_upvals, upvals);
+        let saved_closure = std::mem::replace(&mut state.closure, Some(callee_closure));
 
         state.call_stack.push(CallFrame {
             code: saved_code,
@@ -6796,7 +6824,7 @@ impl VmExecutor {
             is_vararg: state.is_vararg,
             proto_flag: state.proto_flag,
             nextraargs: state.nextraargs,
-            closure_upvals: saved_closure_upvals,
+            caller_closure: saved_closure,
             tbc_list: state.tbc_list.take(),
         });
 
@@ -6824,7 +6852,7 @@ impl VmExecutor {
         state.is_vararg = proto_is_vararg_val;
         state.proto_flag = proto_flag;
         state.nextraargs = 0;
-        // state.closure_upvals 已通过 mem::replace 设置
+        // state.closure 已通过 mem::replace 设置
         state.tbc_list = None;
         state.hook_old_pc = 0;
 
@@ -6946,10 +6974,10 @@ impl VmExecutor {
                 let nfixparams = closure.proto.num_params as usize;
                 let proto_is_vararg = closure.proto.is_vararg();
 
-                // 提前提取 proto 和 upvals 的 Rc 引用，使后续可以 move closure（而非 clone）
+                // 提前提取 proto 和闭包引用，使后续可以 move closure（而非 clone）
                 // perf: 消除 CallInfoEntry.closure 的 Box 堆分配
                 let proto = Rc::clone(&closure.proto);
-                let upvals = Rc::clone(&closure.upvals);
+                let callee_closure = closure.clone();
 
                 // perf: caller_proto 延迟计算 (同 fast path), 从 state.stack[entry.func] 获取
 
@@ -7005,7 +7033,7 @@ impl VmExecutor {
                     is_vararg: state.is_vararg,
                     proto_flag: state.proto_flag,
                     nextraargs: state.nextraargs,
-                    closure_upvals: Rc::clone(&state.closure_upvals),
+                    caller_closure: state.closure.clone(),
                     tbc_list: state.tbc_list.take(),
                 });
 
@@ -7027,9 +7055,9 @@ impl VmExecutor {
                 });
 
                 state.base = a + 1;
-                // 安全: 上值同样在扩容点之前交给 state (move, 不再留克隆) —— 失败时
-                // 本帧不持有它; 出错由最近的 pcall 保护点按 saved_closure_upvals 复原。
-                state.closure_upvals = upvals;
+                // 安全: 闭包同样在扩容点之前交给 state (move, 不再留克隆) —— 失败时
+                // 本帧不持有它; 出错由最近的 pcall 保护点按 saved_closure 复原。
+                state.closure = Some(callee_closure);
                 state.pad_frame_scratch();
                 state.pc = 0;
                 state.num_params = callee_num_params;
@@ -7619,10 +7647,10 @@ impl VmExecutor {
                 // 本帧函数槽（被调函数下移到此处，复用当前帧的 ci）
                 let func_slot = state.cur_func();
                 let proto_is_vararg = closure.proto.is_vararg();
-                // 提前提取 proto 和 upvals 的 Rc 引用，使后续可以 move closure（而非 clone）
+                // 提前提取 proto 和闭包引用，使后续可以 move closure（而非 clone）
                 // perf: 消除 CallInfoEntry.closure 的 Box 堆分配
                 let proto = Rc::clone(&closure.proto);
-                let upvals = Rc::clone(&closure.upvals);
+                let callee_closure = closure.clone();
 
                 for i in 0..nargs_total {
                     let src = a + i;
@@ -7643,9 +7671,9 @@ impl VmExecutor {
                 state.proto_flag = proto.flag;
                 state.nextraargs = 0;
                 // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
-                // 安全: proto / upvals 在此之后立即释放 —— 本臂尾部的 call hook 等
+                // 安全: proto / closure 在此之后立即释放 —— 本臂尾部的 call hook 等
                 // 可能 raise 的路径不得再持有 Rc 克隆 (longjmp / panic 跳过本帧即泄漏)。
-                state.closure_upvals = upvals;
+                state.closure = Some(callee_closure);
                 drop(proto);
                 state.tbc_list = None;
 
@@ -7928,7 +7956,7 @@ impl VmExecutor {
             state.is_vararg = frame.is_vararg;
             state.proto_flag = frame.proto_flag;
             state.nextraargs = frame.nextraargs;
-            state.closure_upvals = frame.closure_upvals;
+            state.closure = frame.caller_closure;
             state.tbc_list = frame.tbc_list;
             // 对应 C 的 rethook: L->oldpc = pcRel(ci->u.l.savedpc, ci_func(ci)->p)
             // C 的 pcRel 宏为 (cast_int((pc) - (p)->code) - 1)，有 -1 偏移
@@ -8062,7 +8090,7 @@ impl VmExecutor {
             state.is_vararg = frame.is_vararg;
             state.proto_flag = frame.proto_flag;
             state.nextraargs = frame.nextraargs;
-            state.closure_upvals = frame.closure_upvals;
+            state.closure = frame.caller_closure;
             state.tbc_list = frame.tbc_list;
             // 对应 C 的 rethook: L->oldpc = pcRel(ci->u.l.savedpc, ci_func(ci)->p)
             state.hook_old_pc = state.pc as i32 - 1;
@@ -8188,7 +8216,7 @@ impl VmExecutor {
             state.is_vararg = frame.is_vararg;
             state.proto_flag = frame.proto_flag;
             state.nextraargs = frame.nextraargs;
-            state.closure_upvals = frame.closure_upvals;
+            state.closure = frame.caller_closure;
             state.tbc_list = frame.tbc_list;
             // 对应 C 的 rethook: L->oldpc = pcRel(ci->u.l.savedpc, ci_func(ci)->p)
             state.hook_old_pc = state.pc as i32 - 1;
@@ -8558,7 +8586,7 @@ impl VmExecutor {
                     is_vararg: state.is_vararg,
                     proto_flag: state.proto_flag,
                     nextraargs: state.nextraargs,
-                    closure_upvals: Rc::clone(&state.closure_upvals),
+                    caller_closure: state.closure.clone(),
                     tbc_list: state.tbc_list.take(),
                 });
 
@@ -8585,8 +8613,8 @@ impl VmExecutor {
                 state.is_vararg = proto_is_vararg;
                 state.proto_flag = proto_flag;
                 state.nextraargs = 0;
-                // 关键: 将闭包的上值转移到 state，供 GETUPVAL/SETUPVAL 使用
-                state.closure_upvals = Rc::clone(&closure.upvals);
+                // 关键: 将闭包转移到 state，供 GETUPVAL/SETUPVAL 使用
+                state.closure = Some(closure.clone());
                 state.tbc_list = None;
 
                 if proto_is_vararg {
@@ -8762,8 +8790,8 @@ impl VmExecutor {
         if bx < state.protos.len() {
             let proto = state.protos[bx].clone();
             let nup = proto.size_upvalues as usize;
-            // perf: UpValVec 内联存储 (≤4 上值零堆分配), 替代 Vec::with_capacity + 二次 move
-            let upvals = Rc::new(RefCell::new(UpValVec::new()));
+            // perf: UpValVec 内联存储 (≤4 上值零堆分配), 直接内联进 LClosure 对象
+            let mut upvals = UpValVec::with_capacity(nup);
             for i in 0..nup {
                 if i < proto.upvalues.len() {
                     let desc = &proto.upvalues[i];
@@ -8775,29 +8803,23 @@ impl VmExecutor {
                         let uv_ref = crate::func::upval_slot(state, uv_idx)
                             .expect("find_upval returns a live slot")
                             .clone();
-                        upvals.borrow_mut().push(uv_ref);
+                        upvals.push(uv_ref);
                     } else {
                         // 上值来自外层闭包: 共享同一个 Rc<RefCell<UpVal>>
                         // 对应 C: upv[i] = cl->upvals[p->upvalues[i].idx];
                         let parent_idx = desc.idx as usize;
-                        if parent_idx < state.closure_upvals.borrow().len() {
-                            upvals
-                                .borrow_mut()
-                                .push(state.closure_upvals.borrow()[parent_idx].clone());
-                        } else {
-                            upvals
-                                .borrow_mut()
-                                .push(Rc::new(RefCell::new(UpVal::Closed {
-                                    value: TValue::Nil(NilKind::Strict),
-                                })));
+                        let parent_uv = state.closure_upvals().borrow().get(parent_idx).cloned();
+                        match parent_uv {
+                            Some(uv_ref) => upvals.push(uv_ref),
+                            None => upvals.push(Rc::new(RefCell::new(UpVal::Closed {
+                                value: TValue::Nil(NilKind::Strict),
+                            }))),
                         }
                     }
                 } else {
-                    upvals
-                        .borrow_mut()
-                        .push(Rc::new(RefCell::new(UpVal::Closed {
-                            value: TValue::Nil(NilKind::Strict),
-                        })));
+                    upvals.push(Rc::new(RefCell::new(UpVal::Closed {
+                        value: TValue::Nil(NilKind::Strict),
+                    })));
                 }
             }
             // GC: 在创建新闭包前检查 GC 阈值，回收不可达的旧闭包。
@@ -10431,7 +10453,7 @@ mod tests {
             LClosure {
                 gc_header: GCObjectHeader::new(),
                 proto: Rc::new(inner_proto),
-                upvals: Rc::new(RefCell::new(UpValVec::new())),
+                upvals: RefCell::new(UpValVec::new()),
             },
         );
 
@@ -10454,7 +10476,7 @@ mod tests {
             LClosure {
                 gc_header: GCObjectHeader::new(),
                 proto: Rc::new(inner_proto),
-                upvals: Rc::new(RefCell::new(UpValVec::new())),
+                upvals: RefCell::new(UpValVec::new()),
             },
         );
 

@@ -11,7 +11,6 @@
 //! - Vararg 处理用 Rust enum + Vec，消除 C 的手动栈操作
 //! - 错误处理使用 `Result<(), VmError>` 替代 C 的 longjmp
 
-use std::cell::RefCell;
 use std::fmt;
 use std::rc::Rc;
 
@@ -20,7 +19,7 @@ use bitflags::bitflags;
 use crate::config::{LuaInteger, LuaNumber};
 use crate::debug::{concaterror, opinterror, ordererror, tointerror};
 use crate::execute::VmError;
-use crate::objects::{LuaType, NilKind, TValue, Table, UpValVec};
+use crate::objects::{LuaType, NilKind, TValue, Table};
 use crate::state::LuaState;
 use crate::strings::{lua_string_as_str, lua_string_len, StringTable};
 
@@ -425,7 +424,7 @@ pub(crate) fn call_tm_res<'a>(
     let caller_is_vararg = state.is_vararg;
     let caller_proto_flag = state.proto_flag;
     let caller_nextraargs = state.nextraargs;
-    let caller_closure_upvals = Rc::clone(&state.closure_upvals);
+    let caller_closure = state.closure.clone();
     let caller_tbc_list = state.tbc_list;
     // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[entry.func] 获取
     state.call_info.push(crate::state::CallInfoEntry {
@@ -459,7 +458,7 @@ pub(crate) fn call_tm_res<'a>(
             saved_is_vararg: caller_is_vararg,
             saved_proto_flag: caller_proto_flag,
             saved_nextraargs: caller_nextraargs,
-            saved_closure_upvals: Rc::clone(&caller_closure_upvals),
+            saved_closure: caller_closure.clone(),
             saved_tbc_list: caller_tbc_list,
             func_idx: func_idx,
             logical_top: logical_top,
@@ -592,7 +591,7 @@ pub(crate) fn call_tm<'a>(
     let caller_is_vararg = state.is_vararg;
     let caller_proto_flag = state.proto_flag;
     let caller_nextraargs = state.nextraargs;
-    let caller_closure_upvals = Rc::clone(&state.closure_upvals);
+    let caller_closure = state.closure.clone();
     let caller_tbc_list = state.tbc_list;
     // perf: caller_proto 延迟计算 (同 op_call), 从 state.stack[entry.func] 获取
     state.call_info.push(crate::state::CallInfoEntry {
@@ -625,7 +624,7 @@ pub(crate) fn call_tm<'a>(
             saved_is_vararg: caller_is_vararg,
             saved_proto_flag: caller_proto_flag,
             saved_nextraargs: caller_nextraargs,
-            saved_closure_upvals: Rc::clone(&caller_closure_upvals),
+            saved_closure: caller_closure.clone(),
             saved_tbc_list: caller_tbc_list,
             func_idx: func_idx,
             logical_top: logical_top,
@@ -800,7 +799,7 @@ pub fn call_close_method<'a>(
             saved_is_vararg: false,
             saved_proto_flag: 0,
             saved_nextraargs: 0,
-            saved_closure_upvals: Rc::new(RefCell::new(UpValVec::new())),
+            saved_closure: None,
             saved_tbc_list: None,
             func_idx: 0,
             logical_top: 0,

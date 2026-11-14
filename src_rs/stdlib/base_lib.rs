@@ -483,7 +483,7 @@ pub(crate) fn call_pcall<'a>(
             saved_is_vararg: state.is_vararg,
             saved_proto_flag: state.proto_flag,
             saved_nextraargs: state.nextraargs,
-            saved_closure_upvals: Rc::clone(&state.closure_upvals),
+            saved_closure: state.closure.clone(),
             saved_tbc_list: state.tbc_list,
             func_idx: a,
             logical_top: a,
@@ -1234,7 +1234,7 @@ fn call_pairs<'a>(
                 saved_is_vararg: state.is_vararg,
                 saved_proto_flag: state.proto_flag,
                 saved_nextraargs: state.nextraargs,
-                saved_closure_upvals: Rc::clone(&state.closure_upvals),
+                saved_closure: state.closure.clone(),
                 saved_tbc_list: state.tbc_list,
                 func_idx: a,
                 logical_top: a,
@@ -1337,7 +1337,7 @@ pub(crate) fn call_xpcall<'a>(
             saved_is_vararg: state.is_vararg,
             saved_proto_flag: state.proto_flag,
             saved_nextraargs: state.nextraargs,
-            saved_closure_upvals: Rc::clone(&state.closure_upvals),
+            saved_closure: state.closure.clone(),
             saved_tbc_list: state.tbc_list,
             func_idx: a,
             logical_top: a,
@@ -2708,18 +2708,14 @@ fn call_load<'a>(
             if is_binary {
                 intern_proto_strings(&mut proto, state);
             }
-            let upvals = Rc::new(std::cell::RefCell::new(UpValVec::new()));
-            upvals
-                .borrow_mut()
-                .push(Rc::new(std::cell::RefCell::new(UpVal::Closed {
-                    value: env_val,
-                })));
+            let mut upvals = UpValVec::new();
+            upvals.push(Rc::new(std::cell::RefCell::new(UpVal::Closed {
+                value: env_val,
+            })));
             for _ in 1..nup {
-                upvals
-                    .borrow_mut()
-                    .push(Rc::new(std::cell::RefCell::new(UpVal::Closed {
-                        value: TValue::Nil(NilKind::Strict),
-                    })));
+                upvals.push(Rc::new(std::cell::RefCell::new(UpVal::Closed {
+                    value: TValue::Nil(NilKind::Strict),
+                })));
             }
             // new_closure 完成「构造 + 对象块分配 + GC 登记 + id 写回」。
             // 此前该路径未登记：闭包不计入 `gc_estimate`（GC 阈值/`collectgarbage("count")`

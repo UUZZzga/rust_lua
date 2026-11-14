@@ -8,7 +8,6 @@
 use crate::execute::VmError;
 use crate::objects::{NilKind, TValue};
 use std::alloc::{self, Layout};
-use std::cell::RefCell;
 use std::ptr::NonNull;
 use std::rc::Rc;
 
@@ -562,17 +561,19 @@ impl<'a> crate::state::LuaState<'a> {
         value: T,
     ) -> Result<crate::alloc::MyRc<T, SlotAlloc>, VmError<'a>> {
         let slot = self.alloc_slot();
-        let mut pending = Some(value);
-        self.retry_alloc(move || {
-            let v = pending.take().ok_or(AllocFailed)?;
-            match crate::alloc::MyRc::try_new_in(slot, v) {
-                Ok(rc) => Ok(rc),
-                Err(v) => {
-                    pending = Some(v);
-                    Err(AllocFailed)
+        match crate::alloc::MyRc::try_new_in(slot, value) {
+            Ok(rc) => Ok(rc),
+            Err(value) => {
+                core::hint::cold_path();
+                if self.can_retry_alloc() {
+                    self.emergency_gc();
+                    if let Ok(rc) = crate::alloc::MyRc::try_new_in(slot, value) {
+                        return Ok(rc);
+                    }
                 }
+                Err(VmError::MemoryError)
             }
-        })
+        }
     }
 
     /// 建空表漏斗 —— 对应 C 的 `luaH_new`（块经 `luaM_newobject`）。
@@ -673,12 +674,12 @@ impl<'a> crate::state::LuaState<'a> {
     pub fn new_closure(
         &mut self,
         proto: Rc<crate::objects::Proto<'a>>,
-        upvals: Rc<RefCell<crate::objects::UpValVec<'a>>>,
+        upvals: crate::objects::UpValVec<'a>,
     ) -> Result<crate::alloc::MyRc<crate::objects::LClosure<'a>, SlotAlloc>, VmError<'a>> {
         let closure = self.new_object(crate::objects::LClosure {
             gc_header: crate::gc::GCObjectHeader::new(),
             proto,
-            upvals,
+            upvals: std::cell::RefCell::new(upvals),
         })?;
         // 用 gc_mem_size() 计费含 upvals 容量，比 size_of::<LClosure>() 更接近真实占用
         let id = self.register_object(
