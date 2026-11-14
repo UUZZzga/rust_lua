@@ -155,28 +155,15 @@ impl<'a> GCObjectMeta<'a> {
 // GCObjectHeader — 可嵌入的 GC 对象头部
 // ============================================================================
 
-/// 全局指针 ID 计数器 — 用于 %p 格式输出稳定的唯一标识符。
-/// 对应 C 实现中对象的堆地址。
-static PTR_ID_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
-
-/// 分配一个新的唯一指针 ID（对应 C 中堆对象的地址）
-pub fn new_ptr_id() -> u32 {
-    PTR_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-}
-
 #[derive(Debug, Clone)]
 pub struct GCObjectHeader {
     id: Cell<Option<NonZeroU32>>,
-    /// 稳定的唯一标识符，用于 %p 格式输出。
-    /// 克隆时保留同一值（表示同一个对象）。
-    pub ptr_id: u32,
 }
 
 impl GCObjectHeader {
     pub fn new() -> Self {
         GCObjectHeader {
             id: Cell::new(None),
-            ptr_id: new_ptr_id(),
         }
     }
 
@@ -498,21 +485,21 @@ pub(crate) fn is_marked<'a>(val: &TValue<'a>, gc: &GCState) -> bool {
             if let Some(id) = t.data.borrow().gc_header.id() {
                 !gc.is_white(id)
             } else {
-                gc.aux_is_marked(t.data.borrow().gc_header.ptr_id as usize)
+                gc.aux_is_marked(t.data.as_raw_ptr() as usize)
             }
         }
         TValue::LClosure(c) => {
             if let Some(id) = c.gc_header.id() {
                 !gc.is_white(id)
             } else {
-                gc.aux_is_marked(c.gc_header.ptr_id as usize)
+                gc.aux_is_marked(c.as_raw_ptr() as usize)
             }
         }
         TValue::UserData(u) => {
             if let Some(id) = u.gc_header.id() {
                 !gc.is_white(id)
             } else {
-                gc.aux_is_marked(u.gc_header.ptr_id as usize)
+                gc.aux_is_marked(u.as_raw_ptr() as usize)
             }
         }
         TValue::RustClosure(rc) => gc.aux_is_marked(rc.as_raw_ptr() as usize),
@@ -1840,7 +1827,7 @@ impl<'a> LuaState<'a> {
     /// 链同级；顺带减少重复出队，标记更快。
     ///
     /// 认领键与各变体的判定口径一致（见 `mark_tvalue` / `mark_tvalue` 的 aux 键）：
-    /// 表/闭包/userdata 用 `ptr_id`，CClosure/RustClosure 用自身块地址，
+    /// 表/闭包/userdata 用对象块地址，CClosure/RustClosure 用自身块地址，
     /// Thread 用 `Rc::as_ptr(&context)`。
     fn push_mark(&self, _gc: &GCState, val: &TValue<'a>, worklist: &mut Vec<RawTValue<'a>>) {
         // 只做「值得标记」的过滤并入队；**去重仍由 mark_tvalue 内的 aux_mark 负责**
@@ -1864,9 +1851,9 @@ impl<'a> LuaState<'a> {
         let gc: &GCState = unsafe { &*self.gc_ptr() };
         match val {
             TValue::Table(t) => {
-                let ptr_id = t.data.borrow().gc_header.ptr_id as usize;
+                let addr = t.data.as_raw_ptr() as usize;
                 // 去重: 已标记对象不再重复遍历 (aux_marked 同时是 is_marked 的判定集)
-                if !gc.aux_mark(ptr_id) {
+                if !gc.aux_mark(addr) {
                     return;
                 }
 
@@ -1910,16 +1897,14 @@ impl<'a> LuaState<'a> {
                     }
                 }
                 if let Some(ref mt) = data.metatable {
-                    let mt_ptr = mt.data.borrow().gc_header.ptr_id as usize;
-                    let _ = mt_ptr;
                     let tv = TValue::Table((**mt).clone());
                     self.push_mark(gc, &tv, worklist);
                     drop(tv);
                 }
             }
             TValue::LClosure(c) => {
-                let ptr_id = c.gc_header.ptr_id as usize;
-                if !gc.aux_mark(ptr_id) {
+                let addr = c.as_raw_ptr() as usize;
+                if !gc.aux_mark(addr) {
                     return;
                 }
                 if let Some(id) = c.gc_header.id() {
@@ -1980,8 +1965,8 @@ impl<'a> LuaState<'a> {
                 }
             }
             TValue::UserData(u) => {
-                let ptr_id = u.gc_header.ptr_id as usize;
-                if !gc.aux_mark(ptr_id) {
+                let addr = u.as_raw_ptr() as usize;
+                if !gc.aux_mark(addr) {
                     return;
                 }
                 if let Some(id) = u.gc_header.id() {
@@ -2345,12 +2330,12 @@ impl<'a> GlobalState<'a> {
         if self.gc_closing {
             return;
         }
-        let ptr_id = t.data.borrow().gc_header.ptr_id;
+        let addr = t.data.as_raw_ptr();
         let already = self
             .finobj_list
             .borrow()
             .iter()
-            .any(|x| x.data.borrow().gc_header.ptr_id == ptr_id);
+            .any(|x| std::ptr::addr_eq(x.data.as_raw_ptr(), addr));
         if !already {
             self.finobj_list.borrow_mut().push(t.clone());
         }
@@ -2361,12 +2346,12 @@ impl<'a> GlobalState<'a> {
         if self.gc_closing {
             return;
         }
-        let ptr_id = u.gc_header.ptr_id;
+        let addr = u.as_raw_ptr();
         let already = self
             .ud_finobj_list
             .borrow()
             .iter()
-            .any(|x| x.gc_header.ptr_id == ptr_id);
+            .any(|x| std::ptr::addr_eq(x.as_raw_ptr(), addr));
         if !already {
             self.ud_finobj_list.borrow_mut().push(u.clone());
         }

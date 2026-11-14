@@ -45,7 +45,7 @@ use crate::state::LuaState;
 // ============================================================================
 //
 // Rust 默认 HashMap 使用 SipHash（抗碰撞攻击），但 Lua 表的 key 已包含足够熵
-// （Integer/Float 直接哈希，String 有预计算哈希，Table 用 ptr_id），
+// （Integer/Float 直接哈希，String 有预计算哈希，Table 用 Rc 地址），
 // 不需要 SipHash 的加密强度。FxHash 速度快 5-10 倍，显著降低哈希开销。
 // 对应 C Lua 的 luaH_hashstr 等使用简单哈希的策略。
 //
@@ -506,7 +506,7 @@ mod builtin_names {
 /// `BuiltinFn` 是无状态的（仅函数指针 + 名字），适用于 `math.sin`、`string.len` 等
 /// 纯函数。`RustClosure` 携带 `upvalues`，适用于需要绑定状态的场景：
 /// - `coroutine.wrap(f)` 返回 `RustClosure { upvalues: [Thread] }`
-/// - `io.lines(file)` 返回 `RustClosure { upvalues: [file_ptr_id, formats, ...] }`
+/// - `io.lines(file)` 返回 `RustClosure { upvalues: [file_addr, formats, ...] }`
 ///
 /// ## upvalues 可变性
 ///
@@ -998,7 +998,7 @@ impl<'a> PartialEq for TValue<'a> {
                 // (borrow_mut 作用域内比较键相等性会 double-borrow panic)
                 std::ptr::addr_eq(a.data.as_ptr(), b.data.as_ptr())
             }
-            (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
+            (TValue::LClosure(a), TValue::LClosure(b)) => MyRc::ptr_eq(a, b),
             (TValue::CClosure(a), TValue::CClosure(b)) => MyRc::ptr_eq(a, b),
             (TValue::LCFn(a), TValue::LCFn(b)) => {
                 std::ptr::eq(a.func as *const (), b.func as *const ())
@@ -1007,7 +1007,7 @@ impl<'a> PartialEq for TValue<'a> {
                 std::ptr::eq(a.func as *const (), b.func as *const ())
             }
             (TValue::RustClosure(a), TValue::RustClosure(b)) => MyRc::ptr_eq(a, b),
-            (TValue::UserData(a), TValue::UserData(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
+            (TValue::UserData(a), TValue::UserData(b)) => MyRc::ptr_eq(a, b),
             (TValue::Thread(a), TValue::Thread(b)) => Rc::ptr_eq(&a.context, &b.context),
             _ => false,
         }
@@ -1054,18 +1054,17 @@ impl<'a> Hash for TValue<'a> {
                 state.write_u64(lua_string_hash(s));
             }
             TValue::Table(t) => {
-                // 身份哈希用 Rc 地址而非 gc_header.ptr_id: gc_header 已移入
-                // TableData (Rc 内), 读它需 borrow — 若哈希发生在宿主表自身的
-                // borrow_mut 作用域内 (如 t[t]=x 触发 rehash 对键 t 求哈希) 会
-                // double-borrow panic (CI #78 all.lua attrib 复现)。
-                // Rc 地址与 ptr_id 同为唯一身份: 同一表的所有 clone 共享同一
-                // Rc → 同地址; 活表键持有 Rc 强引用, 地址不会复用。
+                // 身份哈希用 Rc 地址: gc_header 已在 TableData (Rc 内), 读它需 borrow —
+                // 若哈希发生在宿主表自身的 borrow_mut 作用域内 (如 t[t]=x 触发 rehash
+                // 对键 t 求哈希) 会 double-borrow panic (CI #78 all.lua attrib 复现)。
+                // Rc 地址是唯一身份: 同一表的所有 clone 共享同一 Rc → 同地址;
+                // 活表键持有 Rc 强引用, 地址不会复用。
                 6u8.hash(state);
                 (t.data.as_raw_ptr() as usize).hash(state);
             }
             TValue::LClosure(c) => {
                 7u8.hash(state);
-                c.gc_header.ptr_id.hash(state);
+                (c.as_raw_ptr() as usize).hash(state);
             }
             TValue::CClosure(c) => {
                 8u8.hash(state);
@@ -1085,7 +1084,7 @@ impl<'a> Hash for TValue<'a> {
             }
             TValue::UserData(u) => {
                 10u8.hash(state);
-                u.gc_header.ptr_id.hash(state);
+                (u.as_raw_ptr() as usize).hash(state);
             }
             TValue::Thread(t) => {
                 11u8.hash(state);
@@ -1308,7 +1307,8 @@ impl<'a> Drop for TableData<'a> {
 /// 数据字段包装在 [`TableDataRc`]（Rc 语义）中，克隆 `Table` 时共享同一份数据，
 /// 而非深拷贝。这保证了 `_ENV` upvalue 与 `state.globals` 始终同步。
 ///
-/// `gc_header` 保留在 `Table` 上（不在 `TableData` 中），因为 `ptr_id` 需要在克隆时保持一致。
+/// `gc_header` 随数据保存在 `TableData` 内；对象身份由 `data` 的 Rc 地址表示，
+/// 克隆时自然保持一致。
 ///
 /// 方法实现见 [crate::table]。
 pub struct Table<'a> {
@@ -1317,7 +1317,7 @@ pub struct Table<'a> {
 }
 
 impl<'a> Clone for Table<'a> {
-    /// 克隆 Table：仅克隆 `Rc`（共享数据），并克隆 `gc_header`（保持同一 `ptr_id`）。
+    /// 克隆 Table：仅克隆 `Rc`（共享数据）。
     fn clone(&self) -> Self {
         Table {
             data: self.data.clone(),
@@ -1328,7 +1328,7 @@ impl<'a> Clone for Table<'a> {
 impl<'a> fmt::Debug for Table<'a> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Table")
-            .field("ptr_id", &self.data.borrow().gc_header.ptr_id)
+            .field("addr", &self.data.as_raw_ptr())
             .finish_non_exhaustive()
     }
 }
@@ -1339,7 +1339,7 @@ pub struct WeakTable<'a> {
 }
 
 impl<'a> Clone for WeakTable<'a> {
-    /// 克隆 Table：仅克隆 `Rc`（共享数据），并克隆 `gc_header`（保持同一 `ptr_id`）。
+    /// 克隆 Table：仅克隆 `Rc`（共享数据）。
     fn clone(&self) -> Self {
         WeakTable {
             data: self.data.clone(),
@@ -1824,12 +1824,12 @@ pub const PF_VATAB: u8 = 2;
 ///
 /// 与 C 的差异：GC 头的宽度与字段构成不同（C 的 `CommonHeader` 是
 /// `GCObject *next; lu_byte tt; lu_byte marked` = 16 字节，另加 `gclist`；
-/// 这里是 8 字节的 `GCObjectHeader`），故固定头之后的偏移与 C 不同。
+/// 这里是 4 字节的 `GCObjectHeader`），故固定头之后的偏移与 C 不同。
 /// 但 C 侧只通过 `getudatamem`（= [`Udata::data_ptr`]）、`lua_rawlen`（`len`）
 /// 与 `lua_get/setiuservalue`（用户值）观察 userdata，故不构成 ABI 差异。
 #[repr(C)]
 pub struct Udata<'a> {
-    /// GC 对象头 — ptr_id 在克隆时保持一致，用于哈希和相等性比较
+    /// GC 对象头
     pub gc_header: GCObjectHeader,
     /// 用户值数量（对应 C `Udata.nuvalue`）
     pub nuvalue: u16,

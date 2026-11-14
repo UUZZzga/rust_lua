@@ -327,7 +327,7 @@ pub struct LexState<'a, 'b> {
     pub errors: Vec<String>,
     pub nesting_level: u32, // recursion depth counter (like C's nCcalls)
     /// Scanner string table — 对应 C 的 `ls->h`。
-    /// 锚定长字符串字面量,确保同一源码中的长字符串返回同一 `LuaString` (相同 ptr_id)。
+    /// 锚定长字符串字面量,确保同一源码中的长字符串返回同一个 `LuaString` 对象。
     /// 短字符串已通过全局 `StringTable` 内部化去重,无需在此重复。
     /// 用 FxBuildHasher 替代默认 SipHash,减少哈希开销
     scanner_strings: HashMap<String, LLuaString, FxBuildHasher>,
@@ -399,7 +399,7 @@ impl<'a, 'b> LexState<'a, 'b> {
 
     /// 锚定字符串字面量,对应 C 的 `anchorstr` (llex.cpp)。
     /// 短字符串走全局 `StringTable` 内部化;长字符串走 scanner table 去重,
-    /// 确保同一源码字面量跨 proto 返回同一 `LuaString` (相同 `ptr_id`)。
+    /// 确保同一源码字面量跨 proto 返回同一个 `LuaString` 对象。
     /// perf: 短字符串先查 4 路标识符缓存, 命中时跳过 hashbrown 查找 (节省 ~7%)。
     pub fn anchor_string(&mut self, s: &str) -> TValue<'b> {
         if s.len() <= crate::strings::LUAI_MAXSHORTLEN {

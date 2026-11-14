@@ -2979,23 +2979,23 @@ pub struct GlobalState<'a> {
     /// 对应 C liolib 中存储在 registry[IO_OUTPUT] 的默认输出文件句柄
     /// Rc 共享：默认输出流是 state 级共享状态，所有 thread 共享
     pub io_output: Rc<RefCell<Option<Box<dyn Write>>>>,
-    /// 文件句柄注册表 — key 是 UserData 的 gc_header.ptr_id，value 是 FILE* 指针
+    /// 文件句柄注册表 — key 是 UserData 对象的内存地址，value 是 FILE* 指针
     /// 对应 C 的 luaL_Stream 中存储的 FILE*。UserData 本身不存数据，通过此 map 关联。
     /// Rc 共享：所有 thread 共享同一份句柄表（对应 C 中 FILE* 存于 userdata/registry）
     pub file_handles:
-        Rc<RefCell<std::collections::HashMap<u32, TValue<'a>, crate::objects::FxBuildHasher>>>,
+        Rc<RefCell<std::collections::HashMap<usize, TValue<'a>, crate::objects::FxBuildHasher>>>,
     /// 标记哪些文件句柄是 io.popen 创建的（关闭时用 pclose 而非 fclose）
     /// 对应 C 的 LStream.closef = &io_pclose
     /// Rc 共享：同 file_handles
-    pub popen_handles: Rc<RefCell<std::collections::HashSet<u32, crate::objects::FxBuildHasher>>>,
-    /// 当前默认输入流的 UserData ptr_id — None 表示使用 io.stdin
+    pub popen_handles: Rc<RefCell<std::collections::HashSet<usize, crate::objects::FxBuildHasher>>>,
+    /// 当前默认输入流的 UserData 地址 — None 表示使用 io.stdin
     /// 对应 C 的 registry[IO_INPUT]
     /// Rc 共享：默认输入流是 state 级共享状态
-    pub io_input_handle: Rc<std::cell::Cell<Option<u32>>>,
-    /// 当前默认输出流的 UserData ptr_id — None 表示使用 io.stdout
+    pub io_input_handle: Rc<std::cell::Cell<Option<usize>>>,
+    /// 当前默认输出流的 UserData 地址 — None 表示使用 io.stdout
     /// 对应 C 的 registry[IO_OUTPUT]
     /// Rc 共享：默认输出流是 state 级共享状态
-    pub io_output_handle: Rc<std::cell::Cell<Option<u32>>>,
+    pub io_output_handle: Rc<std::cell::Cell<Option<usize>>>,
     pub global_state: Rc<RefCell<GlobalShared<'a>>>,
     /// 当前正在调用的 C 函数名（用于 traceback）— None 表示不在 C 函数中
     pub last_c_function: Option<String>,

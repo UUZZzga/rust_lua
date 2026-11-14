@@ -2091,13 +2091,9 @@ pub extern "C-unwind" fn lua_rawequal(L: *mut lua_State, idx1: c_int, idx2: c_in
                 (TValue::Table(a), TValue::Table(b)) => {
                     std::ptr::addr_eq(a.data.as_ptr(), b.data.as_ptr()) as c_int
                 }
-                (TValue::UserData(a), TValue::UserData(b)) => {
-                    (a.gc_header.ptr_id == b.gc_header.ptr_id) as c_int
-                }
+                (TValue::UserData(a), TValue::UserData(b)) => MyRc::ptr_eq(&a, &b) as c_int,
                 (TValue::LightUserData(a), TValue::LightUserData(b)) => (a == b) as c_int,
-                (TValue::LClosure(a), TValue::LClosure(b)) => {
-                    (a.gc_header.ptr_id == b.gc_header.ptr_id) as c_int
-                }
+                (TValue::LClosure(a), TValue::LClosure(b)) => MyRc::ptr_eq(&a, &b) as c_int,
                 (TValue::CClosure(a), TValue::CClosure(b)) => MyRc::ptr_eq(&a, &b) as c_int,
                 (TValue::Thread(a), TValue::Thread(b)) => {
                     Rc::ptr_eq(&a.context, &b.context) as c_int
@@ -2150,9 +2146,7 @@ pub extern "C-unwind" fn lua_compare(
                         std::ptr::addr_eq(a.data.as_ptr(), b.data.as_ptr())
                     }
                     (TValue::LightUserData(a), TValue::LightUserData(b)) => a == b,
-                    (TValue::LClosure(a), TValue::LClosure(b)) => {
-                        a.gc_header.ptr_id == b.gc_header.ptr_id
-                    }
+                    (TValue::LClosure(a), TValue::LClosure(b)) => MyRc::ptr_eq(&a, &b),
                     (TValue::CClosure(a), TValue::CClosure(b)) => MyRc::ptr_eq(&a, &b),
                     (TValue::Thread(a), TValue::Thread(b)) => Rc::ptr_eq(&a.context, &b.context),
                     _ => false,

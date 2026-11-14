@@ -12,7 +12,7 @@
 //! ## 迁移说明
 //! - 已从 LightUserData(tag) 迁移到 BuiltinFn 函数指针方案
 //! - io.lines / file:lines 返回的迭代器使用 RustClosure 携带 upvalues
-//!   (file_ptr_id, to_close, finished, formats...)
+//!   (file_addr, to_close, finished, formats...)
 
 use crate::config::{LuaInteger, LuaNumber, LuaUnsigned};
 use crate::execute::VmError;
@@ -170,14 +170,14 @@ fn get_arg<'a>(state: &LuaState<'a>, a: usize, idx: usize) -> TValue<'a> {
 // 文件句柄辅助函数
 // ============================================================================
 
-/// 检查参数是否是 FILE* userdata 并返回其 ptr_id
+/// 检查参数是否是 FILE* userdata 并返回其对象地址
 /// 对应 C 的 tolstream -> luaL_checkudata
 fn check_file_arg<'a>(
     state: &LuaState<'a>,
     a: usize,
     nargs: usize,
     fname: &str,
-) -> Result<u32, VmError<'a>> {
+) -> Result<usize, VmError<'a>> {
     if nargs < 1 {
         return Err(VmError::RuntimeError(format!(
             "bad argument #1 to '{}' (FILE* expected, got no value)",
@@ -198,7 +198,7 @@ fn check_file_arg<'a>(
                     fname
                 )));
             }
-            Ok(u.gc_header.ptr_id)
+            Ok(u.as_raw_ptr() as usize)
         }
         _ => {
             let typearg = crate::tm::obj_type_name(state, &arg);
@@ -220,17 +220,17 @@ fn ud_stream<'a>(
     unsafe { *(u.data_ptr() as *const u64) as *mut libc::FILE }
 }
 
-/// 从 UserData ptr_id 获取 FILE* — 不检查是否已关闭
-fn get_file_ptr(state: &LuaState, ptr_id: u32) -> Option<*mut libc::FILE> {
-    match state.file_handles.borrow().get(&ptr_id) {
+/// 从 UserData 对象地址获取 FILE* — 不检查是否已关闭
+fn get_file_ptr(state: &LuaState, addr: usize) -> Option<*mut libc::FILE> {
+    match state.file_handles.borrow().get(&addr) {
         Some(TValue::UserData(u)) => Some(ud_stream(u)),
         _ => None,
     }
 }
 
-/// 判断文件是否已关闭 (file_handles 中无对应 ptr_id)
-fn is_closed(state: &LuaState, ptr_id: u32) -> bool {
-    !state.file_handles.borrow().contains_key(&ptr_id)
+/// 判断文件是否已关闭 (file_handles 中无对应地址)
+fn is_closed(state: &LuaState, addr: usize) -> bool {
+    !state.file_handles.borrow().contains_key(&addr)
 }
 
 /// 创建 FILE* userdata — 对应 C 的 newfile
@@ -254,12 +254,9 @@ fn new_file_userdata<'a>(
     if has_gc {
         state.g_mut().register_ud_finobj(&ud_rc);
     }
-    let ptr_id = ud_rc.gc_header.ptr_id;
+    let addr = ud_rc.as_raw_ptr() as usize;
     let value = TValue::UserData(ud_rc);
-    state
-        .file_handles
-        .borrow_mut()
-        .insert(ptr_id, value.clone());
+    state.file_handles.borrow_mut().insert(addr, value.clone());
     Ok(value)
 }
 
@@ -565,7 +562,10 @@ fn call_io_popen<'a>(
             let ud = new_file_userdata(state, f, &file_mt)?;
             // 标记为 popen 文件，关闭时用 pclose
             if let TValue::UserData(ref u) = ud {
-                state.popen_handles.borrow_mut().insert(u.gc_header.ptr_id);
+                state
+                    .popen_handles
+                    .borrow_mut()
+                    .insert(u.as_raw_ptr() as usize);
             }
             results.push(ud);
         } else {
@@ -692,7 +692,7 @@ fn call_io_output<'a>(
                             "bad argument #1 to 'output' (FILE* expected, got userdata)"
                         )));
                     }
-                    state.io_output_handle.set(Some(u.gc_header.ptr_id));
+                    state.io_output_handle.set(Some(u.as_raw_ptr() as usize));
                     *state.io_output.borrow_mut() = None; // 清除 Box<dyn Write>
                                                           // 保存到 io 表的 _current_output 字段
                     let io_key = state.intern_str("io");
@@ -726,7 +726,7 @@ fn call_io_output<'a>(
                     if let Some(TValue::Table(file_mt)) = file_mt {
                         let udata = new_file_userdata(state, f, &file_mt)?;
                         if let TValue::UserData(ref u) = udata {
-                            state.io_output_handle.set(Some(u.gc_header.ptr_id));
+                            state.io_output_handle.set(Some(u.as_raw_ptr() as usize));
                         }
                         *state.io_output.borrow_mut() = None;
                         // 保存到 io 表的 _current_output 字段
@@ -785,7 +785,7 @@ fn call_io_input<'a>(
                             "bad argument #1 to 'input' (FILE* expected, got userdata)"
                         )));
                     }
-                    state.io_input_handle.set(Some(u.gc_header.ptr_id));
+                    state.io_input_handle.set(Some(u.as_raw_ptr() as usize));
                 }
                 s @ (TValue::LongStr(_) | TValue::ShortStr(_)) => {
                     let filename = lua_string_as_str(s).to_string();
@@ -808,7 +808,7 @@ fn call_io_input<'a>(
                     if let Some(TValue::Table(file_mt)) = file_mt {
                         let udata = new_file_userdata(state, f, &file_mt)?;
                         if let TValue::UserData(ref u) = udata {
-                            state.io_input_handle.set(Some(u.gc_header.ptr_id));
+                            state.io_input_handle.set(Some(u.as_raw_ptr() as usize));
                         }
                     } else {
                         return Err(VmError::RuntimeError(format!(
@@ -845,15 +845,15 @@ fn call_io_close<'a>(
 ) -> Result<(), VmError<'a>> {
     if nargs == 0 {
         // 关闭默认输出流 (对应 C: io_close 无参数时取 IO_OUTPUT 再调用 f_close)
-        let ptr_id = state.io_output_handle.get();
-        if let Some(pid) = ptr_id {
+        let handle = state.io_output_handle.get();
+        if let Some(addr) = handle {
             // 检查是否是标准文件 (stdin/stdout/stderr) — 对应 C 的 io_noclose
             let io_key = state.intern_str("io");
             let is_standard = if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
                 ["stdin", "stdout", "stderr"].iter().any(|name| {
                     let key = state.intern_str(name);
                     if let Some(TValue::UserData(u2)) = io_table.get(&key) {
-                        u2.gc_header.ptr_id == pid
+                        u2.as_raw_ptr() as usize == addr
                     } else {
                         false
                     }
@@ -870,10 +870,10 @@ fn call_io_close<'a>(
                 state.adjust_results(a, nresults, __results);
                 return Ok(());
             }
-            let f_value_opt = state.file_handles.borrow().get(&pid).cloned();
+            let f_value_opt = state.file_handles.borrow().get(&addr).cloned();
             if let Some(TValue::UserData(u)) = f_value_opt {
                 let f = ud_stream(&u);
-                let is_popen = state.popen_handles.borrow_mut().remove(&pid);
+                let is_popen = state.popen_handles.borrow_mut().remove(&addr);
                 unsafe {
                     *compat::errno_ptr() = 0;
                 }
@@ -885,7 +885,7 @@ fn call_io_close<'a>(
                     let res = unsafe { libc::fclose(f) };
                     file_result(state, &mut results, res == 0, None);
                 }
-                state.file_handles.borrow_mut().remove(&pid);
+                state.file_handles.borrow_mut().remove(&addr);
                 // 保留 io_output_handle 指向已关闭的文件（对应 C 的 registry[IO_OUTPUT] 保留已关闭 userdata）
                 // 这样后续 io.write 会检测到文件已关闭并报错 "default output file is closed"
                 state.adjust_results(a, nresults, results);
@@ -918,7 +918,7 @@ fn close_file_handle<'a>(
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError<'a>> {
-    let ptr_id = check_file_arg(state, a, nargs, "close")?;
+    let addr = check_file_arg(state, a, nargs, "close")?;
 
     // 检查是否是标准文件 (stdin/stdout/stderr)
     let io_key = state.intern_str("io");
@@ -926,7 +926,7 @@ fn close_file_handle<'a>(
         ["stdin", "stdout", "stderr"].iter().any(|name| {
             let key = state.intern_str(name);
             if let Some(TValue::UserData(u)) = io_table.get(&key) {
-                u.gc_header.ptr_id == ptr_id
+                u.as_raw_ptr() as usize == addr
             } else {
                 false
             }
@@ -945,18 +945,18 @@ fn close_file_handle<'a>(
     }
 
     // 已关闭文件: 报错 "attempt to use a closed file" (对应 C 的 tofile -> luaL_error)
-    if is_closed(state, ptr_id) {
+    if is_closed(state, addr) {
         return Err(VmError::RuntimeError(
             "attempt to use a closed file".to_string(),
         ));
     }
 
     // 关闭文件
-    let f_value = state.file_handles.borrow_mut().remove(&ptr_id).unwrap();
+    let f_value = state.file_handles.borrow_mut().remove(&addr).unwrap();
     match f_value {
         TValue::UserData(u) => {
             let f = ud_stream(&u);
-            let is_popen = state.popen_handles.borrow_mut().remove(&ptr_id);
+            let is_popen = state.popen_handles.borrow_mut().remove(&addr);
             unsafe {
                 *compat::errno_ptr() = 0;
             }
@@ -1002,7 +1002,7 @@ fn call_io_type<'a>(
                 mt.get(&name_key) == Some(state.intern_str(crate::config::FILEHANDLE))
             });
             if is_file {
-                if is_closed(state, u.gc_header.ptr_id) {
+                if is_closed(state, u.as_raw_ptr() as usize) {
                     state.intern_str("closed file")
                 } else {
                     state.intern_str("file")
@@ -1487,8 +1487,8 @@ fn call_file_read<'a>(
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError<'a>> {
-    let ptr_id = check_file_arg(state, a, nargs, "read")?;
-    let f = match get_file_ptr(state, ptr_id) {
+    let addr = check_file_arg(state, a, nargs, "read")?;
+    let f = match get_file_ptr(state, addr) {
         Some(f) => f,
         None => {
             return Err(VmError::RuntimeError(
@@ -1513,8 +1513,8 @@ fn call_file_write<'a>(
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError<'a>> {
-    let ptr_id = check_file_arg(state, a, nargs, "write")?;
-    let f = match get_file_ptr(state, ptr_id) {
+    let addr = check_file_arg(state, a, nargs, "write")?;
+    let f = match get_file_ptr(state, addr) {
         Some(f) => f,
         None => {
             return Err(VmError::RuntimeError(
@@ -1545,8 +1545,8 @@ fn call_file_seek<'a>(
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError<'a>> {
-    let ptr_id = check_file_arg(state, a, nargs, "seek")?;
-    let f = match get_file_ptr(state, ptr_id) {
+    let addr = check_file_arg(state, a, nargs, "seek")?;
+    let f = match get_file_ptr(state, addr) {
         Some(f) => f,
         None => {
             return Err(VmError::RuntimeError(
@@ -1646,8 +1646,8 @@ fn call_file_flush<'a>(
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError<'a>> {
-    let ptr_id = check_file_arg(state, a, nargs, "flush")?;
-    let f = match get_file_ptr(state, ptr_id) {
+    let addr = check_file_arg(state, a, nargs, "flush")?;
+    let f = match get_file_ptr(state, addr) {
         Some(f) => f,
         None => {
             return Err(VmError::RuntimeError(
@@ -1693,8 +1693,8 @@ fn call_file_setvbuf<'a>(
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError<'a>> {
-    let ptr_id = check_file_arg(state, a, nargs, "setvbuf")?;
-    let f = match get_file_ptr(state, ptr_id) {
+    let addr = check_file_arg(state, a, nargs, "setvbuf")?;
+    let f = match get_file_ptr(state, addr) {
         Some(f) => f,
         None => {
             return Err(VmError::RuntimeError(
@@ -1765,7 +1765,7 @@ fn call_file_setvbuf<'a>(
 // ============================================================================
 
 /// lines 迭代器的 RustClosure upvalues 布局
-///   upvalues[0]: Integer(file_ptr_id)
+///   upvalues[0]: Integer(file_addr)
 ///   upvalues[1]: Boolean(to_close)     — 完成后是否关闭文件
 ///   upvalues[2]: Boolean(finished)     — 是否已完成（可变，EOF/错误时设为 true）
 ///   upvalues[3..]: formats             — 读取格式（TValue::Str）
@@ -1777,12 +1777,12 @@ const LINES_UP_FORMATS_BASE: usize = 3;
 /// 构造 lines 迭代器的 RustClosure
 fn new_lines_iterator<'a>(
     state: &mut LuaState<'a>,
-    file_ptr_id: u32,
+    file_addr: usize,
     to_close: bool,
     formats: Vec<TValue<'a>>,
 ) -> Result<TValue<'a>, VmError<'a>> {
     let mut upvalues = Vec::with_capacity(LINES_UP_FORMATS_BASE + formats.len());
-    upvalues.push(TValue::Integer(file_ptr_id as LuaInteger));
+    upvalues.push(TValue::Integer(file_addr as LuaInteger));
     upvalues.push(TValue::Boolean(to_close));
     upvalues.push(TValue::Boolean(false)); // finished = false
     for fmt in formats {
@@ -1817,13 +1817,13 @@ fn call_io_lines<'a>(
 
     if nargs == 0 {
         // 无参数: 使用默认输入流，不关闭
-        let ptr_id = state.io_input_handle.get().unwrap_or_else(|| {
-            // 默认是 stdin 的 ptr_id
-            get_stdin_ptr_id(state)
+        let addr = state.io_input_handle.get().unwrap_or_else(|| {
+            // 默认是 stdin 的地址
+            get_stdin_addr(state)
         });
         // io.lines() 默认格式 "l"
         let formats = vec![(state.intern_str("l"))];
-        results.push(new_lines_iterator(state, ptr_id, false, formats)?);
+        results.push(new_lines_iterator(state, addr, false, formats)?);
         state.adjust_results(a, nresults, results);
         return Ok(());
     }
@@ -1831,16 +1831,16 @@ fn call_io_lines<'a>(
     let first = get_arg(state, a, 0);
     if first.is_nil() {
         // nil 参数: 使用默认输入流，读取后续格式参数
-        let ptr_id = state
+        let addr = state
             .io_input_handle
             .get()
-            .unwrap_or_else(|| get_stdin_ptr_id(state));
+            .unwrap_or_else(|| get_stdin_addr(state));
         let formats = if nargs >= 2 {
             (1..nargs).map(|i| get_arg(state, a, i)).collect::<Vec<_>>()
         } else {
             vec![(state.intern_str("l"))]
         };
-        results.push(new_lines_iterator(state, ptr_id, false, formats)?);
+        results.push(new_lines_iterator(state, addr, false, formats)?);
         state.adjust_results(a, nresults, results);
         return Ok(());
     }
@@ -1874,8 +1874,8 @@ fn call_io_lines<'a>(
                 )));
             };
 
-            let ptr_id = if let TValue::UserData(ref u) = udata {
-                u.gc_header.ptr_id
+            let addr = if let TValue::UserData(ref u) = udata {
+                u.as_raw_ptr() as usize
             } else {
                 unreachable!()
             };
@@ -1885,7 +1885,7 @@ fn call_io_lines<'a>(
             } else {
                 vec![(state.intern_str("l"))]
             };
-            let iter = new_lines_iterator(state, ptr_id, true, formats)?;
+            let iter = new_lines_iterator(state, addr, true, formats)?;
             // toclose=1: 返回 4 个值 (迭代器, nil state, nil control, file to-be-closed)
             // 对应 C 的 io_lines: lua_pushnil(state); lua_pushnil(control);
             // lua_pushvalue(file); return 4;
@@ -1920,13 +1920,13 @@ fn call_file_lines<'a>(
             MAXARGLINE + 2
         )));
     }
-    let ptr_id = check_file_arg(state, a, nargs, "lines")?;
+    let addr = check_file_arg(state, a, nargs, "lines")?;
     let formats = if nargs >= 2 {
         (1..nargs).map(|i| get_arg(state, a, i)).collect::<Vec<_>>()
     } else {
         vec![(state.intern_str("l"))]
     };
-    let result = new_lines_iterator(state, ptr_id, false, formats)?;
+    let result = new_lines_iterator(state, addr, false, formats)?;
     state.adjust_results(a, nresults, vec![result]);
     Ok(())
 }
@@ -1944,7 +1944,7 @@ fn call_lines_iterator_fn<'a>(
     let _ = nargs; // lines 迭代器无参数
 
     // 从 state.stack[a] 取出 RustClosure，提取状态
-    let (file_ptr_id, to_close, finished, formats) = {
+    let (file_addr, to_close, finished, formats) = {
         let func_val = state
             .stack
             .get(a)
@@ -1959,11 +1959,11 @@ fn call_lines_iterator_fn<'a>(
             }
         };
         let upvals = rc.upvalues.borrow();
-        let file_ptr_id = match upvals.get(LINES_UP_FILE) {
-            Some(TValue::Integer(i)) => *i as u32,
+        let file_addr = match upvals.get(LINES_UP_FILE) {
+            Some(TValue::Integer(i)) => *i as usize,
             _ => {
                 return Err(VmError::RuntimeError(
-                    "lines iterator: bad file_ptr_id upvalue".to_string(),
+                    "lines iterator: bad file_addr upvalue".to_string(),
                 ));
             }
         };
@@ -1974,7 +1974,7 @@ fn call_lines_iterator_fn<'a>(
             .skip(LINES_UP_FORMATS_BASE)
             .cloned()
             .collect::<Vec<_>>();
-        (file_ptr_id, to_close, finished, formats)
+        (file_addr, to_close, finished, formats)
     };
 
     if finished {
@@ -1982,7 +1982,7 @@ fn call_lines_iterator_fn<'a>(
     }
 
     // 检查文件是否已关闭
-    let f_opt = get_file_ptr(state, file_ptr_id);
+    let f_opt = get_file_ptr(state, file_addr);
     let f = match f_opt {
         Some(f) => f,
         None => {
@@ -2014,7 +2014,7 @@ fn call_lines_iterator_fn<'a>(
             // 关闭文件（如果需要）
             if to_close {
                 if let Some(TValue::UserData(u)) =
-                    state.file_handles.borrow_mut().remove(&file_ptr_id)
+                    state.file_handles.borrow_mut().remove(&file_addr)
                 {
                     unsafe {
                         libc::fclose(ud_stream(&u));
@@ -2026,8 +2026,7 @@ fn call_lines_iterator_fn<'a>(
         }
         // EOF: 关闭文件
         if to_close {
-            if let Some(TValue::UserData(u)) = state.file_handles.borrow_mut().remove(&file_ptr_id)
-            {
+            if let Some(TValue::UserData(u)) = state.file_handles.borrow_mut().remove(&file_addr) {
                 unsafe {
                     libc::fclose(ud_stream(&u));
                 }
@@ -2061,8 +2060,8 @@ fn mark_lines_finished<'a>(state: &mut LuaState<'a>, a: usize) {
 /// 获取默认输出流的 FILE* — 对应 C 的 getiofile(L, IO_OUTPUT)
 fn get_default_output<'a>(state: &mut LuaState<'a>) -> Result<*mut libc::FILE, VmError<'a>> {
     // 优先检查 io_output_handle
-    if let Some(pid) = state.io_output_handle.get() {
-        if let Some(f) = get_file_ptr(state, pid) {
+    if let Some(addr) = state.io_output_handle.get() {
+        if let Some(f) = get_file_ptr(state, addr) {
             return Ok(f);
         }
         return Err(VmError::RuntimeError(
@@ -2085,8 +2084,8 @@ fn get_default_output<'a>(state: &mut LuaState<'a>) -> Result<*mut libc::FILE, V
 
 /// 获取默认输入流的 FILE* — 对应 C 的 getiofile(L, IO_INPUT)
 fn get_default_input<'a>(state: &mut LuaState<'a>) -> Result<*mut libc::FILE, VmError<'a>> {
-    if let Some(pid) = state.io_input_handle.get() {
-        if let Some(f) = get_file_ptr(state, pid) {
+    if let Some(addr) = state.io_input_handle.get() {
+        if let Some(f) = get_file_ptr(state, addr) {
             return Ok(f);
         }
         return Err(VmError::RuntimeError(" input file is closed".to_string()));
@@ -2099,12 +2098,12 @@ fn get_default_input<'a>(state: &mut LuaState<'a>) -> Result<*mut libc::FILE, Vm
 fn get_current_output_userdata<'a>(state: &mut LuaState<'a>) -> TValue<'a> {
     let io_key = state.intern_str("io");
     if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
-        if let Some(pid) = state.io_output_handle.get() {
+        if let Some(addr) = state.io_output_handle.get() {
             // 先检查 _current_output 字段
             let cur_key = state.intern_str("_current_output");
             if let Some(v) = io_table.get(&cur_key) {
                 if let TValue::UserData(u) = &v {
-                    if u.gc_header.ptr_id == pid {
+                    if u.as_raw_ptr() as usize == addr {
                         return v;
                     }
                 }
@@ -2113,7 +2112,7 @@ fn get_current_output_userdata<'a>(state: &mut LuaState<'a>) -> TValue<'a> {
             let stdout_key = state.intern_str("stdout");
             if let Some(stdout_val) = io_table.get(&stdout_key) {
                 if let TValue::UserData(u) = &stdout_val {
-                    if u.gc_header.ptr_id == pid {
+                    if u.as_raw_ptr() as usize == addr {
                         return stdout_val;
                     }
                 }
@@ -2131,11 +2130,11 @@ fn get_current_output_userdata<'a>(state: &mut LuaState<'a>) -> TValue<'a> {
 
 /// 获取当前输入流的 UserData (用于 io.input() 返回值)
 fn get_current_input_userdata<'a>(state: &mut LuaState<'a>) -> TValue<'a> {
-    if let Some(pid) = state.io_input_handle.get() {
+    if let Some(addr) = state.io_input_handle.get() {
         return state
             .file_handles
             .borrow()
-            .get(&pid)
+            .get(&addr)
             .cloned()
             .unwrap_or(TValue::Nil(NilKind::Strict));
     }
@@ -2150,13 +2149,13 @@ fn get_current_input_userdata<'a>(state: &mut LuaState<'a>) -> TValue<'a> {
     TValue::Nil(NilKind::Strict)
 }
 
-/// 获取 io.stdin 的 ptr_id
-fn get_stdin_ptr_id(state: &LuaState) -> u32 {
+/// 获取 io.stdin 的对象地址
+fn get_stdin_addr(state: &LuaState) -> usize {
     let io_key = state.intern_str("io");
     if let Some(TValue::Table(io_table)) = state.globals.get(&io_key) {
         let stdin_key = state.intern_str("stdin");
         if let Some(TValue::UserData(u)) = io_table.get(&stdin_key) {
-            return u.gc_header.ptr_id;
+            return u.as_raw_ptr() as usize;
         }
     }
     0
@@ -2172,8 +2171,8 @@ fn call_file_gc<'a>(
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError<'a>> {
-    let ptr_id = check_file_arg(state, a, nargs, "__gc")?;
-    let f_opt = get_file_ptr(state, ptr_id);
+    let addr = check_file_arg(state, a, nargs, "__gc")?;
+    let f_opt = get_file_ptr(state, addr);
     if let Some(f) = f_opt {
         // 检查是否是标准文件
         let io_key = state.intern_str("io");
@@ -2181,7 +2180,7 @@ fn call_file_gc<'a>(
             ["stdin", "stdout", "stderr"].iter().any(|name| {
                 let key = state.intern_str(name);
                 if let Some(TValue::UserData(u2)) = io_table.get(&key) {
-                    u2.gc_header.ptr_id == ptr_id
+                    u2.as_raw_ptr() as usize == addr
                 } else {
                     false
                 }
@@ -2190,7 +2189,7 @@ fn call_file_gc<'a>(
             false
         };
         if !is_standard {
-            let is_popen = state.popen_handles.borrow_mut().remove(&ptr_id);
+            let is_popen = state.popen_handles.borrow_mut().remove(&addr);
             if is_popen {
                 unsafe {
                     libc::pclose(f);
@@ -2200,7 +2199,7 @@ fn call_file_gc<'a>(
                     libc::fclose(f);
                 }
             }
-            state.file_handles.borrow_mut().remove(&ptr_id);
+            state.file_handles.borrow_mut().remove(&addr);
         }
     }
     state.adjust_results(a, nresults, vec![]);
@@ -2223,8 +2222,8 @@ fn call_file_tostring<'a>(
     nargs: usize,
     nresults: i32,
 ) -> Result<(), VmError<'a>> {
-    let ptr_id = check_file_arg(state, a, nargs, "__tostring")?;
-    let result = if is_closed(state, ptr_id) {
+    let addr = check_file_arg(state, a, nargs, "__tostring")?;
+    let result = if is_closed(state, addr) {
         state.intern_str("file (closed)")
     } else {
         // 简化: 返回 "file (0x0)"
@@ -2292,9 +2291,9 @@ pub fn open_io_lib<'a>(state: &mut LuaState<'a>) -> Result<(), VmError<'a>> {
             unsafe {
                 *(crate::objects::Udata::data_ptr_of(ud.as_raw_ptr()) as *mut u64) = file as u64;
             }
-            let ptr_id = ud.gc_header.ptr_id;
+            let addr = ud.as_raw_ptr() as usize;
             let val = TValue::UserData(ud);
-            state.file_handles.borrow_mut().insert(ptr_id, val.clone());
+            state.file_handles.borrow_mut().insert(addr, val.clone());
             Ok(val)
         };
 

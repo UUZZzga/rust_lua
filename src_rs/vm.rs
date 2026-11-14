@@ -441,7 +441,7 @@ pub fn raw_equal<'a>(t1: &TValue<'a>, t2: &TValue<'a>) -> bool {
         ) => lua_string_eq(a, b),
         (TValue::LightUserData(a), TValue::LightUserData(b)) => std::ptr::eq(*a, *b),
         (TValue::Table(a), TValue::Table(b)) => std::ptr::addr_eq(a.data.as_ptr(), b.data.as_ptr()),
-        (TValue::LClosure(a), TValue::LClosure(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
+        (TValue::LClosure(a), TValue::LClosure(b)) => MyRc::ptr_eq(a, b),
         (TValue::CClosure(a), TValue::CClosure(b)) => MyRc::ptr_eq(a, b),
         (TValue::LCFn(a), TValue::LCFn(b)) => {
             std::ptr::eq(a.func as *const (), b.func as *const ())
@@ -449,7 +449,7 @@ pub fn raw_equal<'a>(t1: &TValue<'a>, t2: &TValue<'a>) -> bool {
         (TValue::BuiltinFn(a), TValue::BuiltinFn(b)) => {
             std::ptr::eq(a.func as *const (), b.func as *const ())
         }
-        (TValue::UserData(a), TValue::UserData(b)) => a.gc_header.ptr_id == b.gc_header.ptr_id,
+        (TValue::UserData(a), TValue::UserData(b)) => MyRc::ptr_eq(a, b),
         (TValue::Thread(a), TValue::Thread(b)) => Rc::ptr_eq(&a.context, &b.context),
         _ => false,
     }

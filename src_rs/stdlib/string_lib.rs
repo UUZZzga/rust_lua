@@ -2377,7 +2377,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                 // 指针格式 — 对应 C 的 lua_topointer
                 // 对于 nil、boolean、number:返回 "(null)"
                 // 对于 table、function、userdata、thread、string:返回唯一标识符
-                // 使用 GCObjectHeader::ptr_id 作为稳定标识符（对应 C 中堆对象的地址）
+                // 使用对象的内存地址作为稳定标识符（对应 C 中堆对象的地址）
                 let p_str = match arg {
                     TValue::Nil(_) | TValue::Boolean(_) | TValue::Integer(_) | TValue::Float(_) => {
                         "(null)".to_string()
@@ -2388,15 +2388,15 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                         format!("0x{:x}", ptr)
                     }
                     TValue::LongStr(ls) => {
-                        // 长字符串：使用 ptr_id（每个实例唯一，克隆保留同一值）
+                        // 长字符串：使用堆地址（每个实例唯一，克隆保留同一地址）
                         let ptr = SimpleRc::as_ptr(ls) as *const u8 as usize;
                         format!("0x{:x}", ptr)
                     }
                     TValue::Table(t) => {
-                        format!("0x{:x}", t.data.borrow().gc_header.ptr_id)
+                        format!("0x{:x}", t.data.as_raw_ptr() as usize)
                     }
                     TValue::LClosure(l) => {
-                        format!("0x{:x}", l.gc_header.ptr_id)
+                        format!("0x{:x}", l.as_raw_ptr() as usize)
                     }
                     TValue::CClosure(c) => {
                         // CClosure 没有 gc_header，使用结构体地址
@@ -2419,7 +2419,7 @@ pub fn str_format(fmt: &str, args: &[TValue]) -> Result<String, String> {
                         format!("0x{:x}", ptr)
                     }
                     TValue::UserData(u) => {
-                        format!("0x{:x}", u.gc_header.ptr_id)
+                        format!("0x{:x}", u.as_raw_ptr() as usize)
                     }
                     TValue::Thread(t) => {
                         let ptr = t as *const _ as usize;
@@ -3374,7 +3374,7 @@ fn tostring_for_format<'a>(state: &mut LuaState<'a>, val: &TValue<'a>) -> Option
     Some(format!(
         "{}: 0x{:x}",
         type_name,
-        table.data.borrow().gc_header.ptr_id
+        table.data.as_raw_ptr() as usize
     ))
 }
 
